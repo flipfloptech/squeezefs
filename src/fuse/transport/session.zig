@@ -1551,7 +1551,8 @@ pub const Session = struct {
         try field(w, "transport_sq_full", worker.sq_full.load());
         try field(w, "transport_park_backstop_ticks", worker.park_backstop_ticks.load());
         try field(w, "transport_park_tick_commit_rescues", worker.park_tick_commit_rescues.load());
-        try field(w, "transport_park_tick_cqe_rescues", worker.park_tick_cqe_rescues.load());
+        try field(w, "transport_park_tick_cqe_lost_wakes", worker.park_tick_cqe_lost_wakes.load());
+        try field(w, "transport_park_tick_late_cqes", worker.park_tick_late_cqes.load());
         try field(w, "transport_enters", worker.enters.load());
         try field(w, "transport_passes", worker.passes.load());
         try field(w, "transport_residency_replies", worker.residency_replies.load());
@@ -1736,7 +1737,8 @@ const Snapshot = struct {
     overflows: u64,
     ticks: u64,
     commit_rescues: u64,
-    cqe_rescues: u64,
+    cqe_lost_wakes: u64,
+    late_cqes: u64,
     writes: u64,
     elided: u64,
     enters: u64,
@@ -1810,7 +1812,8 @@ const Snapshot = struct {
             .overflows = worker.cq_overflows.load(),
             .ticks = worker.park_backstop_ticks.load(),
             .commit_rescues = worker.park_tick_commit_rescues.load(),
-            .cqe_rescues = worker.park_tick_cqe_rescues.load(),
+            .cqe_lost_wakes = worker.park_tick_cqe_lost_wakes.load(),
+            .late_cqes = worker.park_tick_late_cqes.load(),
             .writes = slot.wake_writes.load(),
             .elided = slot.wakes_elided.load(),
             .enters = worker.enters.load(),
@@ -2198,7 +2201,7 @@ test "e2e: a 10 s random-op storm from 4 threads never needs the 100 ms backstop
     const after = Snapshot.take();
     try expectLaws(before, after);
     try testing.expectEqual(before.commit_rescues, after.commit_rescues);
-    try testing.expectEqual(before.cqe_rescues, after.cqe_rescues);
+    try testing.expectEqual(before.cqe_lost_wakes, after.cqe_lost_wakes);
     try testing.expectEqual(after.parked - before.parked, after.unparked - before.unparked);
     try testing.expect(after.demotes - before.demotes > 0);
     try testing.expectEqual(@as(u64, 0), slot.leases_outstanding.load());
@@ -2206,11 +2209,11 @@ test "e2e: a 10 s random-op storm from 4 threads never needs the 100 ms backstop
     const reqs = after.requests - before.requests;
     const writes = after.writes - before.writes;
     const elided = after.elided - before.elided;
-    std.debug.print("\nstorm: {d} syscalls, {d} ring requests, {d} enters ({d}.{d:0>2} per request), wake writes {d} / elided {d} ({d} % elided), backstop ticks {d}, rescues {d}/{d}\n", .{ ops.load(.monotonic), reqs, after.enters - before.enters, (after.enters - before.enters) / @max(reqs, 1), ((after.enters - before.enters) * 100 / @max(reqs, 1)) % 100, writes, elided, elided * 100 / @max(writes + elided, 1), worker.park_backstop_ticks.load(), after.commit_rescues - before.commit_rescues, after.cqe_rescues - before.cqe_rescues });
+    std.debug.print("\nstorm: {d} syscalls, {d} ring requests, {d} enters ({d}.{d:0>2} per request), wake writes {d} / elided {d} ({d} % elided), backstop ticks {d}, commit rescues {d}, lost CQE wakes {d}, late CQEs {d}\n", .{ ops.load(.monotonic), reqs, after.enters - before.enters, (after.enters - before.enters) / @max(reqs, 1), ((after.enters - before.enters) * 100 / @max(reqs, 1)) % 100, writes, elided, elided * 100 / @max(writes + elided, 1), worker.park_backstop_ticks.load(), after.commit_rescues - before.commit_rescues, after.cqe_lost_wakes - before.cqe_lost_wakes, after.late_cqes - before.late_cqes });
     try testing.expect(writes + elided >= after.replies - before.replies - (after.serves - before.serves));
 }
 
-test "e2e: a completion that lands after a backstop tick's timeout and before the worker's re-check (the seam holds the worker between the two) is a LATE arrival — the kernel's -ETIME says the CQ was empty when the wait gave up — never a lost wake: the must-stay-0 rescue ledger does not count it" {
+test "e2e: a completion that lands after a backstop tick's timeout and before the worker's re-check (the seam holds the worker between the two) is a LATE arrival — the kernel's -ETIME says the CQ was empty when the wait gave up — counted transport_park_tick_late_cqes, never the lost-wake tripwire" {
     if (venueMissing()) |why| return testkit.skipWhy(@src(), why);
     const rig = try Rig.init(testing.allocator, 10, &.{});
     defer rig.deinit();
@@ -2241,7 +2244,8 @@ test "e2e: a completion that lands after a backstop tick's timeout and before th
     _ = try result;
     const after = Snapshot.take();
     try testing.expect(after.ticks > before.ticks);
-    try testing.expectEqual(before.cqe_rescues, after.cqe_rescues);
+    try testing.expect(after.late_cqes > before.late_cqes);
+    try testing.expectEqual(before.cqe_lost_wakes, after.cqe_lost_wakes);
     try testing.expectEqual(before.commit_rescues, after.commit_rescues);
 }
 

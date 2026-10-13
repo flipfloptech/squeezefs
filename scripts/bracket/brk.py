@@ -156,11 +156,19 @@ RECLAIM = ["terminal_frees", "block_free_reclaim_queued", "block_free_reclaim_el
 WIRE_RPCS = ["cluster_wire_frames_sent", "joined_wire_verbs", "xv_cross_owner_steps_shipped",
              "slot_resolve_rpcs", "xv_cross_owner_guard_rpcs", "dlm_token_grants",
              "slot_ships", "free_shipped_blocks"]
-TICK_RESCUES = ["transport_park_tick_commit_rescues", "transport_park_tick_cqe_rescues",
+# The tick ledgers. RESCUES: work a backstop tick found that a wake should
+# have delivered — each stays 0 on a healthy leg (the transport's CQE half is
+# the lost-wake tripwire: completions a tick's own wait left in a CQ that was
+# empty at the park). LATE: completions that landed after a tick's deadline,
+# before the worker's re-check — the kernel's -ETIME says the CQ was empty
+# when the wait gave up, so they are late, never lost; read beside, never a
+# rescue (`bench.zig` `tick_rescue_keys` / `tick_late_keys` name the same).
+TICK_RESCUES = ["transport_park_tick_commit_rescues", "transport_park_tick_cqe_lost_wakes",
                 "journal_lane_park_tick_rescues", "meta_conveyor_park_tick_rescues",
                 "block_free_reclaim_park_tick_wakes", "exec_lane_tick_rescues",
                 "lock_ticked_reregisters", "channel_ticked_reregisters",
                 "write_pipeline_admission_tick_wakes"]
+TICK_LATE = ["transport_park_tick_late_cqes"]
 MUST_STAY_0 = ["invariant_tripwires", "tripwire_sites_overflow", "meta_io_unaligned_refusals",
                "meta_io_buffered_fallback", "fuse_replies_synthesized", "fuse_reply_twice",
                "fuse_replies_oversize", "ipc_sessions_poisoned", "journal_lane_write_failures",
@@ -209,7 +217,7 @@ FSYNC_PHASES = ["intent_barrier", "data_flush", "staged_promote", "data_barrier"
 OP_CLASSES = ["lookup", "getattr", "setattr", "mkdir", "create", "unlink", "rename", "readdir", "read", "write", "other"]
 
 ALL_COUNTERS = (DEVICE_WRITE_ARMS + DEVICE_WRITE_BESIDE + DEVICE_WRITE_REQS + ADMISSION_ARMS + READ_COPY_ARMS + READ_COPY_BESIDE + RECLAIM
-                + WIRE_RPCS + TICK_RESCUES + MUST_STAY_0 + IPC + JOURNAL + FUSE + MISC + STAGED_APPEND + DEVICE_READ_ARMS + DEVICE_READ_BESIDE + META_READ
+                + WIRE_RPCS + TICK_RESCUES + TICK_LATE + MUST_STAY_0 + IPC + JOURNAL + FUSE + MISC + STAGED_APPEND + DEVICE_READ_ARMS + DEVICE_READ_BESIDE + META_READ
                 + META_WRITE_ARMS + META_WRITE)
 
 
@@ -463,6 +471,7 @@ def leg(args):
     meta_records = op_counts["lookup"] + op_counts["getattr"] + d["fuse_readdir_entries"]
     wire = sum(d[k] for k in WIRE_RPCS)
     ticks = {k: d[k] for k in TICK_RESCUES}
+    ticks_late = {k: d[k] for k in TICK_LATE}
     must0 = {k: d[k] for k in MUST_STAY_0}
     reclaim = {k: d[k] for k in RECLAIM}
     reclaim_abs = {k: after[k] for k in RECLAIM}
@@ -654,7 +663,7 @@ def leg(args):
             "meta_node_reads_per_record": (d["node_reads"] / meta_records) if meta_records else None,
             "reclaim": reclaim, "reclaim_absolute": reclaim_abs,
             "wire_rpcs": wire, "wire_arms": {k: d[k] for k in WIRE_RPCS},
-            "tick_rescues": ticks, "must_stay_0": must0,
+            "tick_rescues": ticks, "tick_late": ticks_late, "must_stay_0": must0,
             "ipc": {k: d[k] for k in IPC},
             "journal": {k: d[k] for k in JOURNAL},
             "fuse": {k: d[k] for k in FUSE},
@@ -1026,7 +1035,7 @@ def dead_leg(args):
            "ledgers": {"device_write_bytes_stats": 0, "device_write_arms": {}, "device_writes_stats": 0, "wareq_sz_stats": 0,
                        "device_div_user_stats": None, "admission_bytes": 0, "admission_arms": {}, "read_copy_bytes": 0,
                        "read_copy_arms": {}, "reclaim": {"terminal_frees": 0, "block_free_reclaim_queued": 0, "block_free_reclaim_elided": 0},
-                       "reclaim_absolute": {}, "wire_rpcs": 0, "wire_arms": {}, "tick_rescues": {}, "must_stay_0": {"invariant_tripwires": 0},
+                       "reclaim_absolute": {}, "wire_rpcs": 0, "wire_arms": {}, "tick_rescues": {}, "tick_late": {}, "must_stay_0": {"invariant_tripwires": 0},
                        "ipc": {}, "journal": {}, "fuse": {}, "fsync_phase_ns": {"total": {"count": 0, "sum_ns": 0}}, "daemon_cpu_ns": 0,
                        "misc": {}, "posture": {}, "absent_keys": [],
                        "device_read_bytes_stats": 0, "device_read_arms": {}, "device_read_beside": {}, "user_read_bytes_stats": 0,

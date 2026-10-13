@@ -998,14 +998,14 @@ fn expectSameNames(gpa: std.mem.Allocator, label: []const u8, ours: []const []co
     }
 }
 
-test "bracket ledger pin: bench.zig's device-write, request, admission, read-copy and device-read term lists equal brk.py's (the harness's lists were checked against /proc/diskstats; bench follows them)" {
+test "bracket ledger pin: bench.zig's device-write, request, admission, read-copy, device-read and tick term lists equal brk.py's (the harness's lists were checked against /proc/diskstats; bench follows them)" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     const text = try std.Io.Dir.cwd().readFileAlloc(io, brk_path, gpa, .limited(1 << 20));
     defer gpa.free(text);
     var violations: std.Io.Writer.Allocating = .init(gpa);
     defer violations.deinit();
-    const Pin = struct { label: []const u8, ours: []const []const u8 };
+    const Pin = struct { label: []const u8, ours: []const []const u8, min: usize = 2 };
     const pins = [_]Pin{
         .{ .label = "DEVICE_WRITE_ARMS", .ours = &bench.StatsTerms.device_write_keys },
         .{ .label = "DEVICE_WRITE_REQS", .ours = &bench.StatsTerms.device_write_req_keys },
@@ -1014,11 +1014,15 @@ test "bracket ledger pin: bench.zig's device-write, request, admission, read-cop
         .{ .label = "DEVICE_READ_ARMS", .ours = &bench.StatsTerms.device_read_keys },
         // The META device's two write arms (decision 0003 §L).
         .{ .label = "META_WRITE_ARMS", .ours = &bench.StatsTerms.meta_write_keys },
+        // The tick ledgers: the rescues (the transport's CQE lost-wake
+        // tripwire among them) and the late arrivals read beside.
+        .{ .label = "TICK_RESCUES", .ours = &bench.StatsTerms.tick_rescue_keys },
+        .{ .label = "TICK_LATE", .ours = &bench.StatsTerms.tick_late_keys, .min = 1 },
     };
     for (pins) |p| {
         const theirs = try pyListNames(gpa, text, p.label);
         defer gpa.free(theirs);
-        try std.testing.expect(theirs.len >= 2);
+        try std.testing.expect(theirs.len >= p.min);
         try expectSameNames(gpa, p.label, p.ours, theirs, &violations.writer);
     }
     // The rewrite epoch's gauge and the dest-lease gauge are BESIDE in both.

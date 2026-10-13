@@ -344,6 +344,12 @@ pub const StatsTerms = struct {
     zc_direct_legs: u64 = 0,
     zc_serve_bytes: u64 = 0,
     invariant_tripwires: u64 = 0,
+    /// The tick ledgers (brk.py `TICK_RESCUES` / `TICK_LATE`): Σ the work
+    /// backstop ticks found that a wake should have delivered (0 on a healthy
+    /// run) and, beside, Σ the completions that landed after a tick's
+    /// deadline (late, never lost).
+    tick_rescues: u64 = 0,
+    tick_late: u64 = 0,
     /// The metadata-WRITE ledger (decision 0003 §L): Σ `meta_write_keys`
     /// (the META device's bytes), the journal's device bytes and pad, its
     /// windows and entries, the conveyor's pad-majority windows under the
@@ -397,6 +403,11 @@ pub const StatsTerms = struct {
     /// read choke point (`data_device_read_bytes`, read beside); the
     /// transport's direct device leg, the zcrx lane and fsck's scrub DMA
     /// outside the plane and are summed in.
+    /// The tick RESCUES (brk.py `TICK_RESCUES`): every lane's lost-wake
+    /// count — the transport's CQE half is its tripwire.
+    pub const tick_rescue_keys = [_][]const u8{ "transport_park_tick_commit_rescues", "transport_park_tick_cqe_lost_wakes", "journal_lane_park_tick_rescues", "meta_conveyor_park_tick_rescues", "block_free_reclaim_park_tick_wakes", "exec_lane_tick_rescues", "lock_ticked_reregisters", "channel_ticked_reregisters", "write_pipeline_admission_tick_wakes" };
+    /// The tick LATE arrivals (brk.py `TICK_LATE`): beside the rescues.
+    pub const tick_late_keys = [_][]const u8{"transport_park_tick_late_cqes"};
     pub const device_read_keys = [_][]const u8{ "read_dma_ranged_bytes", "read_dma_block_demand_bytes", "read_dma_block_prefetch_bytes", "read_dma_block_lane_bytes", "read_dma_image_bytes", "read_dma_window_bytes", "write_side_read_dma_bytes", "compose_read_dma_bytes", "pack_read_dma_bytes", "transport_zc_direct_leg_dma_bytes", "zcrx_fill_bytes", "fsck_scrub_read_bytes" };
 
     pub fn parse(text: []const u8) StatsTerms {
@@ -423,6 +434,8 @@ pub const StatsTerms = struct {
         t.zc_direct_legs = json_scan.number(text, "transport_zc_direct_legs") orelse 0;
         t.zc_serve_bytes = json_scan.number(text, "transport_zc_serve_bytes") orelse 0;
         t.invariant_tripwires = json_scan.number(text, "invariant_tripwires") orelse 0;
+        for (tick_rescue_keys) |k| t.tick_rescues += json_scan.number(text, k) orelse 0;
+        for (tick_late_keys) |k| t.tick_late += json_scan.number(text, k) orelse 0;
         for (meta_write_keys) |k| t.meta_write_bytes += json_scan.number(text, k) orelse 0;
         t.journal_device_bytes = json_scan.number(text, "meta_kv_journal_device_bytes") orelse 0;
         t.journal_pad_bytes = json_scan.number(text, "meta_kv_journal_pad_bytes") orelse 0;
@@ -441,7 +454,7 @@ pub const StatsTerms = struct {
 
     pub fn delta(after: StatsTerms, before: StatsTerms) StatsTerms {
         var d: StatsTerms = .{ .present = after.present and before.present, .direct_device_true = after.direct_device_true };
-        inline for (.{ "fuse_ops", "transport_ring_requests", "transport_enters", "device_write_bytes", "rewrite_device_write_bytes", "device_writes", "admission_bytes", "read_copy_bytes", "device_read_bytes", "terminal_frees", "reclaim_queued", "reclaim_elided", "discard_bytes", "held_stores", "patch_writes", "hot_block_hits", "fast_dispatch_serves", "zc_write_direct_bytes", "zc_write_extract_bytes", "zc_direct_legs", "zc_serve_bytes", "invariant_tripwires", "meta_write_bytes", "journal_device_bytes", "journal_pad_bytes", "journal_windows", "journal_entries", "paced_windows", "hold_deadlines", "strict_barriers", "window_rtt_count", "window_rtt_sum_ns" }) |f| {
+        inline for (.{ "fuse_ops", "transport_ring_requests", "transport_enters", "device_write_bytes", "rewrite_device_write_bytes", "device_writes", "admission_bytes", "read_copy_bytes", "device_read_bytes", "terminal_frees", "reclaim_queued", "reclaim_elided", "discard_bytes", "held_stores", "patch_writes", "hot_block_hits", "fast_dispatch_serves", "zc_write_direct_bytes", "zc_write_extract_bytes", "zc_direct_legs", "zc_serve_bytes", "invariant_tripwires", "tick_rescues", "tick_late", "meta_write_bytes", "journal_device_bytes", "journal_pad_bytes", "journal_windows", "journal_entries", "paced_windows", "hold_deadlines", "strict_barriers", "window_rtt_count", "window_rtt_sum_ns" }) |f| {
             @field(d, f) = @field(after, f) -| @field(before, f);
         }
         return d;
@@ -578,12 +591,13 @@ pub const Row = struct {
             quantileNs(self.lat, 990),             quantileNs(self.lat, 999),                      quantileNs(self.lat, 1000),
         });
         const s = self.stats;
-        try w.print(",\"stats_present\":{},\"user_bytes\":{d},\"device_write_bytes\":{d},\"rewrite_device_write_bytes\":{d},\"device_writes\":{d},\"amplification_ppm\":{d},\"amplification_bound_ppm\":{d},\"within_amplification_bound\":{},\"wareq_sz\":{d},\"admission_bytes\":{d},\"read_copy_bytes\":{d},\"read_copy_ppm\":{d},\"device_read_bytes\":{d},\"read_amplification_ppm\":{d},\"reclaim\":{{\"terminal_frees\":{d},\"queued\":{d},\"elided\":{d},\"discard_bytes\":{d}}},\"fuse_ops\":{d},\"transport_ring_requests\":{d},\"transport_enters\":{d},\"engagement\":{{\"held_stores\":{d},\"patch_writes\":{d},\"hot_block_hits\":{d},\"fast_dispatch_serves\":{d},\"zc_write_direct_bytes\":{d},\"zc_write_extract_bytes\":{d},\"zc_direct_legs\":{d},\"zc_serve_bytes\":{d}}},\"invariant_tripwires\":{d}", .{
+        try w.print(",\"stats_present\":{},\"user_bytes\":{d},\"device_write_bytes\":{d},\"rewrite_device_write_bytes\":{d},\"device_writes\":{d},\"amplification_ppm\":{d},\"amplification_bound_ppm\":{d},\"within_amplification_bound\":{},\"wareq_sz\":{d},\"admission_bytes\":{d},\"read_copy_bytes\":{d},\"read_copy_ppm\":{d},\"device_read_bytes\":{d},\"read_amplification_ppm\":{d},\"reclaim\":{{\"terminal_frees\":{d},\"queued\":{d},\"elided\":{d},\"discard_bytes\":{d}}},\"fuse_ops\":{d},\"transport_ring_requests\":{d},\"transport_enters\":{d},\"engagement\":{{\"held_stores\":{d},\"patch_writes\":{d},\"hot_block_hits\":{d},\"fast_dispatch_serves\":{d},\"zc_write_direct_bytes\":{d},\"zc_write_extract_bytes\":{d},\"zc_direct_legs\":{d},\"zc_serve_bytes\":{d}}},\"invariant_tripwires\":{d},\"tick_rescues\":{d},\"tick_late\":{d}", .{
             s.present,                    self.bytes,                      s.device_write_bytes,     s.rewrite_device_write_bytes, s.device_writes,   self.amplificationPpm(),
             self.amplificationBoundPpm(), self.withinAmplificationBound(), self.wareqSz(),           s.admission_bytes,            s.read_copy_bytes, self.readCopyPpm(),
             s.device_read_bytes,          self.readAmplificationPpm(),     s.terminal_frees,         s.reclaim_queued,             s.reclaim_elided,  s.discard_bytes,
             s.fuse_ops,                   s.transport_ring_requests,       s.transport_enters,       s.held_stores,                s.patch_writes,    s.hot_block_hits,
             s.fast_dispatch_serves,       s.zc_write_direct_bytes,         s.zc_write_extract_bytes, s.zc_direct_legs,             s.zc_serve_bytes,  s.invariant_tripwires,
+            s.tick_rescues,               s.tick_late,
         });
         try w.print(",\"meta_write\":{{\"meta_write_bytes\":{d},\"meta_device_div_user_ppm\":{d},\"journal_device_bytes\":{d},\"journal_pad_bytes\":{d},\"journal_windows\":{d},\"journal_entries\":{d},\"meta_pad_fraction_ppm\":{d},\"paced_windows\":{d},\"paced_windows_bound\":{d},\"hold_deadlines\":{d},\"meta_pad_fraction_bound\":{}}}}}\n", .{
             s.meta_write_bytes,        self.metaDeviceDivUserPpm(), s.journal_device_bytes,       s.journal_pad_bytes, s.journal_windows,            s.journal_entries,
@@ -603,7 +617,7 @@ pub const Row = struct {
             try w.print("|   read copy ledger Σ arms ÷ user bytes {d}.{d:0>3} (Σ {d} B / user {d} B); direct-leg serves {d} ({d} B); device read bytes ÷ user bytes {d}.{d:0>3} (device {d} B)\n", .{ ratioParts(self.readCopyPpm()).whole, ratioParts(self.readCopyPpm()).milli, self.stats.read_copy_bytes, self.bytes, self.stats.zc_direct_legs, self.stats.zc_serve_bytes, ratioParts(self.readAmplificationPpm()).whole, ratioParts(self.readAmplificationPpm()).milli, self.stats.device_read_bytes });
         }
         if (self.stats.present) {
-            try w.print("|   ring requests {d} (handler-lane fuse_ops {d}, direct-leg serves {d}), enters {d}; engagement held_stores {d} patch_writes {d} hot_block_hits {d} fast_dispatch {d} zc direct {d} B extract {d} B; invariant_tripwires +{d}\n", .{ self.stats.transport_ring_requests, self.stats.fuse_ops, self.stats.zc_direct_legs, self.stats.transport_enters, self.stats.held_stores, self.stats.patch_writes, self.stats.hot_block_hits, self.stats.fast_dispatch_serves, self.stats.zc_write_direct_bytes, self.stats.zc_write_extract_bytes, self.stats.invariant_tripwires });
+            try w.print("|   ring requests {d} (handler-lane fuse_ops {d}, direct-leg serves {d}), enters {d}; engagement held_stores {d} patch_writes {d} hot_block_hits {d} fast_dispatch {d} zc direct {d} B extract {d} B; invariant_tripwires +{d}; tick rescues +{d} (late completions {d} beside)\n", .{ self.stats.transport_ring_requests, self.stats.fuse_ops, self.stats.zc_direct_legs, self.stats.transport_enters, self.stats.held_stores, self.stats.patch_writes, self.stats.hot_block_hits, self.stats.fast_dispatch_serves, self.stats.zc_write_direct_bytes, self.stats.zc_write_extract_bytes, self.stats.invariant_tripwires, self.stats.tick_rescues, self.stats.tick_late });
         }
     }
 };
@@ -1339,7 +1353,7 @@ test "rows: quantiles are the bucket's UPPER bound over exact counts; MiB/s and 
     var out: Io.Writer.Allocating = .init(testing.allocator);
     defer out.deinit();
     try row.writeJson(&out.writer);
-    for ([_][]const u8{ "\"pass\":\"write\"", "\"access\":\"rand\"", "\"io\":\"direct\"", "\"mib_per_s\":2", "\"iops\":512", "\"scoping_only\":true", "\"p99\":4096000", "\"amplification_ppm\":2000000", "\"amplification_bound_ppm\":1000000", "\"within_amplification_bound\":false", "\"wareq_sz\":2097152", "\"reclaim\":{\"terminal_frees\":3,\"queued\":1,\"elided\":2,\"discard_bytes\":0}", "\"invariant_tripwires\":0" }) |needle| {
+    for ([_][]const u8{ "\"pass\":\"write\"", "\"access\":\"rand\"", "\"io\":\"direct\"", "\"mib_per_s\":2", "\"iops\":512", "\"scoping_only\":true", "\"p99\":4096000", "\"amplification_ppm\":2000000", "\"amplification_bound_ppm\":1000000", "\"within_amplification_bound\":false", "\"wareq_sz\":2097152", "\"reclaim\":{\"terminal_frees\":3,\"queued\":1,\"elided\":2,\"discard_bytes\":0}", "\"invariant_tripwires\":0,\"tick_rescues\":0,\"tick_late\":0" }) |needle| {
         if (std.mem.indexOf(u8, out.written(), needle) == null) {
             std.debug.print("\n--- missing {s} in {s} ---\n", .{ needle, out.written() });
             return error.TestExpectedNeedle;
@@ -1355,6 +1369,13 @@ test "rows: quantiles are the bucket's UPPER bound over exact counts; MiB/s and 
     try testing.expect(!long.scopingOnly());
     const stat_row: Row = .{ .pass = .{ .phase = .stat, .block = 4096, .rand = false, .direct = false, .time_box_s = 0 }, .shape = row.shape, .iteration = 1, .ops = 2, .bytes = 0, .elapsed_ns = 1000, .expected_ops = 2, .boxed_out = false, .lat = .{}, .stats = .{} };
     try testing.expect(!stat_row.scopingOnly());
+}
+
+test "the tick ledgers: the rescues sum every lane's lost-wake count (the transport's CQE tripwire among them); a late completion rides beside, never in the rescues" {
+    const t = StatsTerms.parse("{\"transport\":{\"transport_park_tick_commit_rescues\":1,\"transport_park_tick_cqe_lost_wakes\":0,\"transport_park_tick_late_cqes\":2},\"exec\":{\"exec_lane_tick_rescues\":3}}");
+    try testing.expectEqual(@as(u64, 4), t.tick_rescues);
+    try testing.expectEqual(@as(u64, 2), t.tick_late);
+    for (StatsTerms.tick_rescue_keys) |k| for (StatsTerms.tick_late_keys) |l| try testing.expect(!std.mem.eql(u8, k, l));
 }
 
 test "the stats delta reads the terms by key name across the families; absent keys read 0; the delta saturates; the rewrite epoch's bytes ride beside the device arms, never in them; the read ledger sums the plane's and the transport's serve arms" {

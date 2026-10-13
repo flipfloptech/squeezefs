@@ -719,6 +719,13 @@ Loop while `active`:
     fou.rs:2312–2340: wrapping delta of `cq.overflow()`, charged to `transport_cq_overflows`); `completed =
     deferred_cqes ‖ fresh CQEs`; `tick_rescue_pending ∧ !completed.is_empty()` ⇒ `transport_park_tick_cqe_rescues
     += len` (posted kernel-side, the worker never woken).
+    PORT DIVERGENCE (decision 0002 row 511): the reference's CQE half counts only LATE completions —
+    `io_cqring_wait` returns -ETIME only after it ran the deferred completions past its timer and found the CQ
+    empty (0 otherwise), so a CQE the reap surfaces after a tick landed after the deadline. The port splits it:
+    the tick's RE-CHECK (the CQ read at the verdict, before any further enter) finding completions in a CQ that
+    was empty at the park, on a `DEFER_TASKRUN` ring (its CQ moves only inside the worker's own enters), fires
+    the must-stay-0 tripwire `transport_park_tick_cqe_lost_wakes`; the reap's remainder is
+    `transport_park_tick_late_cqes` (a plain counter, read beside).
 15. **Per CQE** (fou.rs:6527–7734): poll marker ⇒ `need_repoll_sticky = wake_cqe_seen = true`; out-of-range gent
     ⇒ warn; `res < 0` ⇒ the error ladder (§8.2); else Cancel/Release ⇒ debug; Fetch ⇒ bridge resolution (§10);
     Register/Commit ⇒ DELIVERY (§5).
@@ -769,7 +776,7 @@ loop while pool.active:
     if verdict == tick and backstop: park_backstop_ticks++; tick_rescue_pending = true
     on EINTR: continue; on disconnect errno: shutdown; break; on other error: return err
   settle bridge submits; cq.sync; overflow watch; completed = deferred ++ cq
-  if tick_rescue_pending and completed.len > 0: park_tick_cqe_rescues += completed.len
+  if tick_rescue_pending and completed.len > 0: park_tick_cqe_rescues += completed.len   // port: lost (re-check) + late (reap), §8 step 14
   resubmit = []; disconnect = false
   for (ud, res, flags) in completed:
     if ud == wake_ud: need_repoll = true; wake_cqe_seen = true; continue
@@ -946,7 +953,8 @@ protocol rejection, every ent of a member retired, `Drop`, the session's disconn
 `fuse3_zc_bridge_orphans`, `fuse3_zc_release_failures` (fou.rs:6743–6753), `fuse3_zc_retain_refused`
 (fou.rs:6754–6779), `read_dest_overruns` and `open_count_stranded` (charter §4 — filesystem-side, rung 4).
 ≈ 0 (lost-wake tripwires, benign only in the µs race between tick expiry and the pump):
-`transport_park_tick_commit_rescues`, `transport_park_tick_cqe_rescues` (fou.rs:2191–2203),
+`transport_park_tick_commit_rescues`, `transport_park_tick_cqe_rescues` (fou.rs:2191–2203; the port's CQE half
+is the tripwire `transport_park_tick_cqe_lost_wakes` beside the plain `transport_park_tick_late_cqes`, §8 step 14),
 `transport_slots_overdue`, `transport_ents_retired`, `fuse3_zc_write_fusion_demotions`,
 `fuse3_zc_read_fusion_demotions`, `fuse3_zc_write_lazy_extractions`. Closure identities: `parked_commits ≡
 unparked_commits` at quiesce; `leases_outstanding → 0` at quiesce; `serves + fusions + demotes ≡ READs`;
@@ -1007,7 +1015,9 @@ default by construction.
 | `transport_slots_overdue` | counter | slots seen owing ≥ 5 s by the watchdog |
 | `transport_cq_overflows` / `transport_cq_nodrop` | **must-stay-0** / probe | kernel-dropped CQEs; `IORING_FEAT_NODROP` probed |
 | `transport_park_backstop_ticks` | counter | bounded parks that ticked out (nonzero under traffic = backstop WORKING) |
-| `transport_park_tick_commit_rescues` / `_cqe_rescues` | ≈ 0 tripwires | messages pumped / CQEs surfaced by a tick with no wake delivered |
+| `transport_park_tick_commit_rescues` | ≈ 0 tripwire | messages pumped by the pass after a tick with no wake delivered |
+| `transport_park_tick_cqe_lost_wakes` | **must-stay-0** (port) | a tick's re-check found completions in a CQ empty at the park (`DEFER_TASKRUN`) |
+| `transport_park_tick_late_cqes` | counter (port) | completions the reap after a tick surfaced: landed after the deadline (the reference's `_cqe_rescues`) |
 | `transport_fast_dispatch_serves` / `_demotes` | sharded counters | READ law arms (a) / (c) |
 | `fuse3_zc_read_fusions` / `_demotions`, `fuse3_zc_write_fusions` / `_bytes` / `_demotions`, `fuse3_zc_write_lazy_extractions` | counters | fused lane engagement (§9) |
 | `fuse3_fused_midpass_reaps` / `_passbottom_reaps` / `fuse3_fused_timeline_ns` | counters / histogram | where handler bridges resolved; issue→resolution spans |

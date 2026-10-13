@@ -190,10 +190,23 @@ pub var dispatch_refused: counters.ShardedCounter = .{};
 /// `transport_park_backstop_ticks`: bounded parks that ticked out
 /// (non-zero under traffic = the backstop WORKING).
 pub var park_backstop_ticks: counters.ShardedCounter = .{};
-/// `transport_park_tick_commit_rescues` / `_cqe_rescues` (≈ 0): messages
-/// pumped / CQEs surfaced by a tick with no wake delivered.
+/// `transport_park_tick_commit_rescues` (≈ 0): messages pumped by the pass
+/// after a tick with no wake delivered.
 pub var park_tick_commit_rescues: counters.ShardedCounter = .{};
-pub var park_tick_cqe_rescues: counters.ShardedCounter = .{};
+/// `transport_park_tick_cqe_lost_wakes` (must-stay-0): a backstop tick
+/// whose re-check — the CQ read at the verdict, before any further enter —
+/// finds completions no wake announced while the CQ was empty at the park,
+/// on a ring whose CQ moves only inside the worker's own enters
+/// (`DEFER_TASKRUN`: every completion is posted by the issuer's task work).
+/// `io_cqring_wait` answers -ETIME only after it ran the deferred
+/// completions past its timer and found the CQ empty (0 otherwise), so a
+/// completion there is one the kernel's wait never woke for (`tickLostCqes`).
+pub var park_tick_cqe_lost_wakes: counters.Tripwire = .init("transport_park_tick_cqe_lost_wakes");
+/// `transport_park_tick_late_cqes`: completions the reap after a backstop
+/// tick surfaced beyond the re-check's — queued after the wait's exit check
+/// (the worker descheduled between its timed-out enter and its reap, or a
+/// completion a hair past the deadline): late, never lost, not a fault.
+pub var park_tick_late_cqes: counters.ShardedCounter = .{};
 /// `transport_enters`: `io_uring_enter` calls by the workers (the
 /// enters-per-op instrument).
 pub var enters: counters.ShardedCounter = .{};
@@ -725,6 +738,9 @@ pub const Group = struct {
     // ---- pass state (worker thread only) ----
     wake_cqe_seen: bool = false,
     tick_rescue_pending: bool = false,
+    /// The tick's re-check classed this many CQEs lost (the reap after the
+    /// tick counts only the rest late).
+    tick_lost_cqes: u32 = 0,
     commits_pushed: u32 = 0,
     rescue_log_last_s: u64 = 0,
     cq_overflow_seen: u32 = 0,
@@ -1960,10 +1976,15 @@ pub const Group = struct {
                 // 13. THE enter: every SQE pushed this pass and the wait.
                 var bound: ?u64 = backstop;
                 if (retry_left) |r| bound = if (bound) |b| @min(b, r) else r;
+                const cq_at_park = self.ring.cqReady();
                 const verdict = self.park(bound);
                 if (verdict == .tick and backstop != null and (retry_left == null or backstop.? <= retry_left.?)) {
                     park_backstop_ticks.inc();
                     self.tick_rescue_pending = true;
+                    // The re-check first: nothing may enter between the
+                    // verdict and this read.
+                    self.tick_lost_cqes = tickLostCqes(self.ring.ring.flags & linux.IORING_SETUP_DEFER_TASKRUN != 0, cq_at_park, self.ring.cqReady());
+                    if (self.tick_lost_cqes > 0) park_tick_cqe_lost_wakes.fire("a backstop tick's wait gave up (-ETIME) with completions in the CQ it had found empty at the park");
                     self.tickAwaitSeam();
                 }
             }
@@ -1982,6 +2003,8 @@ pub const Group = struct {
     /// it has ticks left, a tick parks unbounded until a completion lands —
     /// the worker descheduled between its timed-out enter and its reap.
     fn tickAwaitSeam(self: *Group) void {
+        // The acq_rel spend pairs with the test's release arm and its
+        // acquire read of 0 (its cue that this worker holds).
         var left = self.shared.tick_await_cqe_remaining.load(.monotonic);
         while (left > 0) {
             left = self.shared.tick_await_cqe_remaining.cmpxchgWeak(left, left - 1, .acq_rel, .monotonic) orelse {
@@ -1989,6 +2012,18 @@ pub const Group = struct {
                 return;
             };
         }
+    }
+
+    /// The tick's re-check: the completions a tick's own wait left in the CQ
+    /// (read at the verdict) that were not there at the park. Exact only on
+    /// a ring whose CQ moves inside the worker's own enters alone
+    /// (`cq_exact`: `DEFER_TASKRUN`), where -ETIME promises an empty CQ —
+    /// every one is a lost wake. On another posture a completion may post
+    /// between the wait's exit check and this read (task work run on the
+    /// syscall's way out, another context's direct post): late, so none is
+    /// classed lost there.
+    fn tickLostCqes(cq_exact: bool, cq_at_park: u32, cq_at_verdict: u32) u32 {
+        return if (cq_exact and cq_at_park == 0) cq_at_verdict else 0;
     }
 
     fn rescueWarn(self: *Group, what: []const u8, n: u32) void {
@@ -2067,9 +2102,10 @@ pub const Group = struct {
             cq_overflows.fire("kernel dropped CQEs on a transport ring");
             self.cq_overflow_seen = overflow;
         }
-        if (self.tick_rescue_pending and total > 0) {
-            park_tick_cqe_rescues.add(total);
-            self.rescueWarn("cqe", total);
+        if (self.tick_rescue_pending) {
+            const late = total -| self.tick_lost_cqes;
+            if (late > 0) park_tick_late_cqes.add(late);
+            self.tick_lost_cqes = 0;
         }
     }
 
@@ -2735,6 +2771,13 @@ test "tags: every op kind round-trips for ents 0, 1, 31, 255 and 16383; the wake
     try testing.expectEqual(@as(u32, 512 << 10), fusionCeiling(4 << 20));
     try testing.expectEqual(@as(u32, 4096), fusionCeiling(8192));
     try testing.expect(isDisconnect(.NOTCONN) and isDisconnect(.NODEV) and !isDisconnect(.AGAIN));
+}
+
+test "the tick's re-check: on a DEFER_TASKRUN ring a completion in the CQ at a -ETIME verdict that was empty at the park is a lost wake; a CQ that already held work at the park, or a posture whose CQ moves outside the worker's enters, classes nothing lost (late, counted beside)" {
+    try testing.expectEqual(@as(u32, 0), Group.tickLostCqes(true, 0, 0));
+    try testing.expectEqual(@as(u32, 2), Group.tickLostCqes(true, 0, 2));
+    try testing.expectEqual(@as(u32, 0), Group.tickLostCqes(true, 1, 3));
+    try testing.expectEqual(@as(u32, 0), Group.tickLostCqes(false, 0, 2));
 }
 
 test "the commit-batch histogram buckets: 1–8 exact, ≤ 16, ≤ 32, > 32" {

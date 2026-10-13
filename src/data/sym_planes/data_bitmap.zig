@@ -431,13 +431,15 @@ pub const DataBitmap = struct {
         }
     }
 
-    /// The finish-free sink's body: bit 1→0 and the CLEAR queued in ONE
-    /// critical section; `false` ⇒ already clear (a double free).
+    /// The finish-free sink's body: bit 1→0, its credit and the CLEAR
+    /// queued in ONE critical section — the carve's lock, so a carve never
+    /// meets the clear bit before the credit (`block_alloc.holderPublishFree`);
+    /// `false` ⇒ already clear (a double free).
     pub fn noteFinishFree(self: *DataBitmap, idx: u64) bool {
         assert(idx < self.cfg.blocks);
         self.mutations.lock();
         defer self.mutations.unlock();
-        if (!self.alloc.holderClearBitRaw(idx)) return false;
+        if (!self.alloc.holderPublishFree(idx)) return false;
         _ = self.population.fetchSub(1, .acq_rel);
         stats.data_alloc_bitmap_population.set(self.population.load(.monotonic));
         stats.data_alloc_bitmap_clear_bits.inc();

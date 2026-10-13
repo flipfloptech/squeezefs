@@ -26,6 +26,14 @@
 //! is already visible when its scan runs. A lost race rescans (never falls
 //! to the fresh mint: the reference's lost race on a cursor-at-cap store
 //! fired the ENOSPC valve per allocation and cost −33 % rewrite, BA:L2387).
+//! Every release path also stores the cell's STATE BEFORE the bit: the
+//! clear's acq_rel is the release a claimant's acq_rel take acquires, so
+//! the claimant's own state store lands after it (the reverse order let a
+//! claim between the two end at `free` on a live block). Every consumer
+//! wins its entitlement BEFORE it takes a bit (a bit taken first could
+//! debit a credit not yet landed) — except the holder's carve, which takes
+//! its bits under the holder's ordering lock, the lock the publication's
+//! bit and credit move under (`free_list_model.zig`, 0003 §W.1).
 //!
 //! The incarnation word (`gen << 1 | stable`) is a seqlock per block
 //! (`IC:L1-83`). Zig 0.17 has no standalone fence (`@fence` left in 0.14),
@@ -1209,15 +1217,26 @@ pub const BlockAllocator = struct {
         stats.del_obj.inc();
     }
 
-    /// `publish_free_list`: holder sink (the bit CLEARED and its kind-5 CLEAR
-    /// delta queued in ONE critical section under the holder's ordering
-    /// lock — the bitmap IS the free list, 0002 row 237; `false` ⇒ double
-    /// free) → the forensics tape → clear the bit (unarmed) → credit the
-    /// budget (bit BEFORE budget, the invariant every release path keeps). A
-    /// bit already clear ⇒ ERROR "DOUBLE FREE" + `block_double_frees`.
+    /// `publish_free_list`: the word re-stabilized → the STATE (`free`
+    /// below the cursor; a never-minted block — a quarantined grant
+    /// released — reads `virgin`: a clear bit at/above the cursor is never
+    /// a free-list entry) → the bit → the credit (module doc). Armed, the
+    /// holder's sink clears the bit, credits and queues the kind-5 CLEAR in
+    /// ONE critical section under the holder's ordering lock (the bitmap IS
+    /// the free list, 0002 row 237) — the lock every carve takes, so a
+    /// carve meeting the clear bit reads `free` with its credit landed.
+    /// The state store is ordered before the bit by the clear's acq_rel
+    /// (paired with the claimant's acq_rel take: `tryTakeBit`); stored
+    /// after it, a carve + mint between the two ended at `free` on the
+    /// minted block with a phantom credit, and a quarantine of it asserted
+    /// on its lost take (0002 row 512). A bit already clear ⇒ ERROR
+    /// "DOUBLE FREE" + `block_double_frees` (the state stored reads what a
+    /// clear bit means).
     fn publishFreeList(self: *BlockAllocator, idx: u64, site: Site) void {
         const c = self.cell(idx);
         endLifetime(c);
+        const listed = idx < self.highest.load(.acquire);
+        c.setState(if (listed) .free else .virgin);
         if (self.finish_free_sink) |s| {
             if (!s.noteFinishFree(s.ctx, self.cfg.vol_tag, idx)) {
                 stats.block_double_frees.fire("holder bitmap bit already clear");
@@ -1225,23 +1244,22 @@ pub const BlockAllocator = struct {
                 return;
             }
             if (self.forensics) |*t| t.record(idx, site);
-        } else {
-            if (self.forensics) |*t| t.record(idx, site);
-            if (!self.clearBit(idx)) {
-                stats.block_double_frees.fire("free-list bit already clear");
-                log.err("block allocator vol {d}: DOUBLE FREE of block {d} (already on the free list)", .{ self.cfg.vol, idx });
-                return;
-            }
+            return;
         }
-        if (idx < self.highest.load(.acquire)) {
-            c.setState(.free);
-            self.creditFree();
-            _ = self.hint.fetchMin(idx, .monotonic);
-        } else {
-            // A never-minted block (a quarantined grant released): a clear
-            // bit at/above the cursor is VIRGIN, never a free-list entry.
-            c.setState(.virgin);
+        if (self.forensics) |*t| t.record(idx, site);
+        if (!self.clearBit(idx)) {
+            stats.block_double_frees.fire("free-list bit already clear");
+            log.err("block allocator vol {d}: DOUBLE FREE of block {d} (already on the free list)", .{ self.cfg.vol, idx });
+            return;
         }
+        if (listed) self.creditListed(idx);
+    }
+
+    /// A clear bit below the cursor joins the budget: AFTER the bit, so a
+    /// claim that wins this credit finds a clear bit on its scan.
+    fn creditListed(self: *BlockAllocator, idx: u64) void {
+        self.creditFree();
+        _ = self.hint.fetchMin(idx, .monotonic);
     }
 
     /// The local lifetime is over: the word re-stabilizes under the
@@ -1339,17 +1357,25 @@ pub const BlockAllocator = struct {
     // ---- the trim claim window (KD-4.4, BA:L1290-1340) ----
 
     /// `claim_free_for_trim`: `trim_claimed += 1` (SeqCst) BEFORE the bit
-    /// leaves the free list; a lost claim (reused, or a racing trim) closes
-    /// the window at once. The caller holds the returned registration
-    /// (fsck visibility) until `returnFromTrim`.
+    /// leaves the free list; a lost claim (reused, a racing trim, or a
+    /// publication whose credit has not landed) closes the window at once.
+    /// The entitlement is won BEFORE the bit, like every claim: the bit
+    /// taken first debited a credit the publication had not yet made (an
+    /// underflow — `free_list_model.zig` model 1, `trim_bit_first`). The
+    /// caller holds the returned registration (fsck visibility) until
+    /// `returnFromTrim`.
     pub fn claimFreeForTrim(self: *BlockAllocator, idx: u64) ?InflightAllocGuard {
         _ = self.trim_claimed.fetchAdd(1, .seq_cst);
         const c = self.cell(idx);
-        if (c.getState() != .free or !self.tryTakeBit(idx)) {
+        if (c.getState() != .free or !self.winEntitlement()) {
             self.endTrimClaim();
             return null;
         }
-        self.debitFree();
+        if (!self.tryTakeBit(idx)) {
+            self.creditFree();
+            self.endTrimClaim();
+            return null;
+        }
         _ = self.trim_windowed.fetchAdd(1, .acq_rel);
         c.setState(.trim_windowed);
         if (self.forensics) |*t| t.record(idx, .trim_claim);
@@ -1358,16 +1384,16 @@ pub const BlockAllocator = struct {
 
     /// `return_from_trim`: membership back BEFORE the window closes, so a
     /// parked allocation that reads the window closed finds the block on
-    /// its rescan.
+    /// its rescan; the state before the bit, the credit after it (the
+    /// publication's order, module doc).
     pub fn returnFromTrim(self: *BlockAllocator, idx: u64, guard: *InflightAllocGuard) void {
         const c = self.cell(idx);
         assert(c.getState() == .trim_windowed);
         _ = self.trim_windowed.fetchSub(1, .acq_rel);
+        c.setState(.free);
         const cleared = self.clearBit(idx);
         assert(cleared);
-        c.setState(.free);
-        self.creditFree();
-        _ = self.hint.fetchMin(idx, .monotonic);
+        self.creditListed(idx);
         guard.deinit();
         self.endTrimClaim();
     }
@@ -1492,7 +1518,10 @@ pub const BlockAllocator = struct {
     /// A carve's SET of one block, called under the holder's ordering lock:
     /// the bit 0→1; a free-listed block leaves the list (budget debited, its
     /// elided debt cancelled — a reused block owes no discard) and reads
-    /// `virgin` until a mint claims it. `false` ⇒ already set (not carvable).
+    /// `virgin` until a mint claims it. The one bit-before-budget consumer:
+    /// every publication's bit and credit move under the same lock
+    /// (`holderPublishFree`, `holderReturnBit`), so the credit is there.
+    /// `false` ⇒ already set (not carvable).
     pub fn holderTakeBit(self: *BlockAllocator, idx: u64) bool {
         if (!self.tryTakeBit(idx)) return false;
         const c = self.cell(idx);
@@ -1504,24 +1533,28 @@ pub const BlockAllocator = struct {
         return true;
     }
 
-    /// The finish-free sink's bit half, under the holder's ordering lock:
-    /// the bit 1→0 ONLY — `publishFreeList` does the state and the budget
-    /// after the sink returns. `false` ⇒ already clear (a double free).
-    pub fn holderClearBitRaw(self: *BlockAllocator, idx: u64) bool {
-        return self.clearBit(idx);
+    /// The finish-free sink's half, under the holder's ordering lock: the
+    /// bit 1→0, then the credit when the cell reads `free` (the state
+    /// `publishFreeList` stored before calling the sink) — both inside the
+    /// lock a carve takes, so the carve's debit always finds its credit
+    /// (`free_list_model.zig` model 2). `false` ⇒ already clear (a double
+    /// free; nothing credited).
+    pub fn holderPublishFree(self: *BlockAllocator, idx: u64) bool {
+        if (!self.clearBit(idx)) return false;
+        if (self.cell(idx).getState() == .free) self.creditListed(idx);
+        return true;
     }
 
     /// A `ReturnBlocks` / adopt-release CLEAR of a block never minted here:
-    /// the bit 1→0 plus the bookkeeping — free below the cursor (the local
-    /// list sees it), virgin at/above. `false` ⇒ already clear.
+    /// the state (free below the cursor — the local list sees it — virgin
+    /// at/above), then the bit 1→0, then the credit (the publication's
+    /// order, module doc). `false` ⇒ already clear: the state stored reads
+    /// what a clear bit means.
     pub fn holderReturnBit(self: *BlockAllocator, idx: u64) bool {
+        const listed = idx < self.highest.load(.acquire);
+        self.cell(idx).setState(if (listed) .free else .virgin);
         if (!self.clearBit(idx)) return false;
-        const c = self.cell(idx);
-        if (idx < self.highest.load(.acquire)) {
-            c.setState(.free);
-            self.creditFree();
-            _ = self.hint.fetchMin(idx, .monotonic);
-        } else c.setState(.virgin);
+        if (listed) self.creditListed(idx);
         return true;
     }
 
@@ -1570,9 +1603,16 @@ pub const BlockAllocator = struct {
         stats.dlm_quarantined_offsets.inc();
         switch (c.getState()) {
             .free => {
-                const took = self.tryTakeBit(idx);
-                assert(took);
-                self.debitFree();
+                // Entitlement, then the bit (module doc). A lost take is a
+                // claim that won the block (a live owner: the flag alone)
+                // or a publication between its state store and its bit —
+                // the flag alone, as the limbo arm it read a moment ago
+                // (that finish is past its quarantine gate either way).
+                if (!self.winEntitlement()) return true;
+                if (!self.tryTakeBit(idx)) {
+                    self.creditFree();
+                    return true;
+                }
                 self.cancelElidedDebt(idx);
                 c.stamp.store(dead_epoch, .release);
                 c.setState(.quarantined);
@@ -1746,12 +1786,12 @@ pub const BlockAllocator = struct {
                     self.publishFreeList(idx, .seed_free);
                     out.frees_completed += 1;
                 },
-                .free => if (tracked) {
+                .free => if (tracked and self.winEntitlement()) {
+                    // Entitlement, then the bit (module doc).
                     if (self.tryTakeBit(idx)) {
-                        self.debitFree();
                         c.setState(.allocated);
                         out.free_list_evictions += 1;
-                    }
+                    } else self.creditFree();
                 },
                 else => {},
             }
@@ -2298,7 +2338,10 @@ test "seams: a grant window is the ONE mint source when armed; a finish-free sin
     try testing.expectEqual(BeginFree.terminal, try a.freeBlock(8));
     try log.testing.expectAllFired();
     try testing.expectEqual(dbl + 1, counters.tripwireCount("block_double_frees"));
-    try testing.expectEqual(State.limbo, a.stateOf(8)); // nothing inserted locally either
+    // Nothing credited; the state, stored before the bit (0003 §W.1),
+    // reads what the holder's already-clear bit means.
+    try testing.expectEqual(State.free, a.stateOf(8));
+    try testing.expectEqual(@as(u64, 0), a.freeBlocksCount());
 }
 
 test "the holder's free-list publication: a carve and a mint landing the instant the sink's critical section ends find the block published — the minted block reads allocated, the carve debited the one credit, nothing is clobbered (0003 §W.1)" {
@@ -2342,7 +2385,7 @@ test "the holder's free-list publication: a carve and a mint landing the instant
         reminted: ?u64 = null,
         fn note(ctx: ?*anyopaque, _: u64, idx: u64) bool {
             const s: *@This() = @ptrCast(@alignCast(ctx.?));
-            if (!s.alloc.holderClearBitRaw(idx)) return false;
+            if (!s.alloc.holderPublishFree(idx)) return false;
             if (!s.alloc.holderTakeBit(idx)) return true;
             s.window.* = .{ .next = idx, .end = idx + 1 };
             s.reminted = (s.alloc.allocateBlock() catch return true).idx;
@@ -2453,9 +2496,11 @@ test "rung 6 holder faces: a carve's take leaves the free list and cancels debt,
     try testing.expectEqual(State.virgin, a.stateOf(40));
     try testing.expectEqual(@as(u64, 2), a.freeBlocksCount());
     try testing.expectEqual(@as(usize, 2), a.bitmapWords().len);
-    // The raw clear is the bit alone.
-    try testing.expect(a.holderClearBitRaw(9));
-    try testing.expect(!a.holderClearBitRaw(9));
+    // The finish-free sink's half: the bit, and a credit only for a cell
+    // its publication stored `free` (9 still reads allocated: none).
+    try testing.expect(a.holderPublishFree(9));
+    try testing.expect(!a.holderPublishFree(9));
+    try testing.expectEqual(@as(u64, 2), a.freeBlocksCount());
 }
 
 test "rung 6 quarantine: a free block leaves the list under the epoch, a live block's finish defers, the cohort release hands the owed publishes back and nothing else" {

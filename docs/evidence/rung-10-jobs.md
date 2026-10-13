@@ -153,6 +153,9 @@ set stage asserts 0 findings on the UNQUIESCED set again (the members' `sync -f`
 `names_declined == 1`); 10/10 venue runs green, 0 findings each (foreign-dentry scoped 10 or
 104 by which slot B's leases land on, slots covered 65,472).
 
+The row's strict law is back (`9c59671`'s tolerance of the coordinator's `fsck_findings`
+tripwire reverted): both daemons' `invariant_tripwires` 0, 10/10 venue runs green with it.
+
 **Also.** `data.accumulate`'s "two flushes of one parked block (a RELEASE racing an fsync)"
 flaked once in a venue gate (`.discarded` for `.joined`): 200 runs of the row under 8-way
 `yes` load passed 200/200 — no reproduction. By inspection the row's rendezvous was a
@@ -163,13 +166,54 @@ the correct word for an entry gone (every caller treats `.discarded` and `.joine
 The rendezvous is now the joiner's OBSERVATION of the in-flight upload
 (`write_pipeline_join_waits`, counted before the wait; in `.stats`).
 
+## 3b. The merged block census (the data-loss class `1f802d6` fixed; fsck must REPORT it)
+
+**Why.** A joiner shipped a NONTERMINAL free (a pack seal's pin drop, one tenant's delete) to
+the manager, whose untracked arm seeded one reference and freed the block under the joiner's
+live tenants — and fsck read clean throughout: the coordinator cannot see a live lessee's
+layouts, so no arm had the reference. The coordinator's declined arms (§2) were honest and
+blind; the law is the members' censuses merged at the coordinator.
+
+**Design.** A member's custody proposal carries its derived census — `Report.owners`:
+`[[ino,[[vol_tag,block_idx,block_index],…]],…]` through the ONE decoder (the fuzz row and a
+round-trip row; `merge` drops it — an input, never an output). The coordinator's local run
+ships its own owners too; `classes.crossMemberBlockPlane` runs the LOST arm (a block a
+member's layout binds that the holder tracks no more) and C3 (the holder's count against the
+merged references) over every member-referenced block, with the holder's bitmap bit (a
+lessee's fresh carve) and the in-flight registry as exemptions. The holder's bitmaps reach
+the online binding at every pass (`BitmapFace` over the wire plane's holder plane — the
+Linux binding had `bitmap = null`, the flat arm, since rung 8a). A suspect is CONFIRMED
+against a SECOND census round from the members (`queueCustodies(base = shards)`; the ladder's
+re-check with the member's own fresh evidence — a reference deleted between the rounds or a
+block the holder tracks again is cleared and counted); a member silent between the rounds
+leaves its suspects unconfirmed (cleared, counted, logged). The leaked arm and C8 stay the
+whole-view run's (a leak is space; C8 compares durable refs the holder cannot read).
+
+**Red first.** `the fleet's MERGED block census …` (RAM: the member's census binding a block
+the holder tracks no more → C2 lost naming the member's ino; a tracked block at refcount 1
+against two references → C3; the second census without the C3's reference clears it, the
+lost stands). The venue row `smoke: THE FLEET'S MERGED BLOCK CENSUS` reverts `1f802d6`
+behind `SQUEEZEFS_TEST_SHIP_EVERY_FREE` (B ships every release): B promotes 8 × 64 KiB
+staged files into a pack by the fsync lever, `rm`s one tenant → A's
+`block_free_file_punches` 0 → 1 → `fsck --online <A>` while B is live: **1 C2 lost**
+(`vol-… block 1 ← ino 74766790688770 index 0 — lost: referenced but untracked by the
+allocator`, the punched pack and B's first live tenant), 14 member bindings merged, 0
+suspects cleared, exit 1 → B remounted (its RAM caches gone) reads its 7 remaining tenants
+off the device: `seam/f1..f7: FAILED` (the loss, made visible) → the seam off: the same `rm`
+stays local (punches unchanged), `fsck --online` 0 findings with 8 bindings merged, B
+remounted reads its tenants sha-equal. Found on the way and left for its owner: the manager
+reads a live joiner's PACKED tenants with EIO whether or not the block is intact (the row
+reads the device truth on B after a remount instead).
+
 ## 4. Owed (stated)
 
-- **The block plane over a live set.** The coordinator's C3/leaked/C8 arms decline while a
-  lessee is live, and so do the name arms (§3a); the complete law is the members' censuses
-  merged at the coordinator (the custody report carrying its names and per-block
-  references). The storm row's 0-false-positive law holds on a single daemon; the set stage
-  holds 0 findings with the arms declined and counted.
+- **The block plane over a live set.** The lost arm and C3 run over the merged census
+  (§3b); the leaked arm and C8 still decline while a lessee is live (a carve between two
+  censuses would read as a leak; the durable refs of a member's blocks live in its tree), and
+  so do the name arms (§3a). The storm row's 0-false-positive law holds on a single daemon;
+  the set stage holds 0 findings on the unquiesced set with the arms declined and counted.
+- **A manager's read of a live joiner's packed tenant answers EIO** (intact or not): the
+  data plane's owner's row (seen by the merged-census row).
 - **C13's live-appender arm and C16 on a real set** stay as `rung-08a1-fsck.md` left them
   (0003 §R): C13 needs a member-side census verb (the lessee's own SMO serialization), C16 a
   product index home.

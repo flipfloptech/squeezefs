@@ -7527,20 +7527,14 @@ test "smoke: ONLINE FSCK THROUGH THE ADMIN LANE — the fill (dirs, 200 packed f
     }
     try b.expectAlive("the set's fsck");
     {
-        // Neither daemon tripped an invariant across the set's runs — but
-        // the coordinator's `fsck_findings` site, which the stated gap's own
-        // confirmed finding fires (a C9 over a joiner's cross-owner mint,
-        // `rung-10-jobs.md` §4: the set's report above is read for its
-        // scoping counters, on pristine dev 2 runs in 3).
+        // Neither daemon tripped an invariant across the set's runs (the
+        // coordinator's `fsck_findings` site included: 0 findings is the law).
         const sb = try b.stats();
         defer gpa.free(sb);
         try testing.expectEqual(@as(u64, 0), numberAfter(sb, "\"invariant_tripwires\":") orelse 0);
         const sa = try rig.stats();
         defer gpa.free(sa);
-        const sites_at = std.mem.indexOf(u8, sa, "\"invariant_tripwire_sites\":{") orelse return error.NoTripwireSites;
-        const sites = sa[sites_at .. std.mem.indexOfScalarPos(u8, sa, sites_at, '}') orelse sa.len];
-        const gap_fires = numberAfter(sites, "\"fsck_findings\":") orelse 0;
-        try testing.expectEqual(gap_fires, numberAfter(sa, "\"invariant_tripwires\":") orelse 0);
+        try testing.expectEqual(@as(u64, 0), numberAfter(sa, "\"invariant_tripwires\":") orelse 0);
     }
     const mark_b_dismount = blk: {
         const t = try b.readLog();
@@ -7630,6 +7624,159 @@ fn awaitPeerAtLeast(b: *Peer, k: []const u8, want: u64, bound_ns: u64) !u64 {
         }
         sleepMs(100);
     }
+}
+
+/// The merged-census row's pack: 8 × 64 KiB staged files promoted by the
+/// fsync lever into ONE pack block (the §J small-file pack of a 4 MiB block).
+const merged_pack_files: usize = 8;
+
+fn mergedPackScript(gpa: std.mem.Allocator, dir: []const u8, base_skip: usize) ![]u8 {
+    var w: std.Io.Writer.Allocating = .init(gpa);
+    defer w.deinit();
+    try w.writer.print("mkdir -p {s}; i=0; while [ $i -lt {d} ]; do dd if=\"$1/image\" of={s}/f$i bs=64k skip=$(({d} + i)) count=1 conv=fsync status=none; i=$((i + 1)); done; sha256sum {s}/f* > \"$1/{s}.sha\"; echo filled", .{ dir, merged_pack_files, dir, base_skip, dir, dir });
+    return w.toOwnedSlice();
+}
+
+test "smoke: THE FLEET'S MERGED BLOCK CENSUS — mount A + B JOINED with the fleet on and B under the `SQUEEZEFS_TEST_SHIP_EVERY_FREE` seam (the reference's shape, 0002 row 500): B promotes 8 staged files into ONE pack by the fsync lever, `rm`s one tenant → the NONTERMINAL free ships to A, whose untracked arm frees and punches the pack under B's 7 live tenants (A: punches +1) → `fsck --online <A>` REPORTS it: B's custody census rides its proposal, the coordinator's merged lost arm names the freed-while-referenced block and its tenant, confirmed by a second census round (C2 lost, exit 1) → B remounted (its caches gone): the 7 tenants read back WRONG off the device → the seam OFF: the same `rm` stays local (A: punches unchanged), B remounted reads its 7 tenants sha-equal, `fsck --online` 0 findings" {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    try rig.env.put("SQUEEZEFS_MW_BIND", "127.0.0.1:0");
+    var t_owner_text: [8]u8 = undefined;
+    try rig.env.put("SQUEEZEFS_TEST_MEMBERSHIP_T_OWNER_MS", try std.fmt.bufPrint(&t_owner_text, "{d}", .{smoke_t_owner_ms}));
+    try rig.env.put("SQUEEZEFS_FLEET_JOBS", "1");
+    try rig.formatSet(true);
+    try rig.createImage();
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(0);
+    // B: the fsync lever (its staged files pack at the fsync) and the seam.
+    var env_seam = try envWith(gpa, &rig.env, &.{ .{ "SQUEEZEFS_FSYNC_PROMOTE_STAGED", "1" }, .{ "SQUEEZEFS_TEST_SHIP_EVERY_FREE", "1" } });
+    defer env_seam.deinit();
+    var env_fixed = try envWith(gpa, &rig.env, &.{.{ "SQUEEZEFS_FSYNC_PROMOTE_STAGED", "1" }});
+    defer env_fixed.deinit();
+    const b = try Peer.init(rig, "b");
+    defer b.deinit();
+    b.env = &env_seam;
+    try b.spawn(&.{});
+    _ = try b.awaitReady();
+    _ = try b.awaitLog("enrolled at the coordinator as a fleet READ worker", 0, 30 * std.time.ns_per_s);
+    // 1. The seam ON: the pack, the rm, the punch.
+    {
+        const script = try mergedPackScript(gpa, "seam", 0);
+        defer gpa.free(script);
+        const out = try b.onMount(script);
+        defer gpa.free(out);
+        try testing.expectEqualStrings("filled\n", out);
+        const sb = try b.stats();
+        defer gpa.free(sb);
+        try testing.expect((numberAfter(sb, "\"fsync_promoted_files\":") orelse 0) >= merged_pack_files);
+    }
+    const punches0 = blk: {
+        const sa = try rig.stats();
+        defer gpa.free(sa);
+        break :blk numberAfter(sa, "\"block_free_file_punches\":") orelse 0;
+    };
+    {
+        const out = try b.onMount("rm seam/f0 && echo removed");
+        defer gpa.free(out);
+        try testing.expectEqualStrings("removed\n", out);
+    }
+    {
+        // A executed the shipped nonterminal free: the pack punched under
+        // B's seven live tenants.
+        const sa = try awaitAtLeast(rig, "\"block_free_file_punches\":", punches0 + 1, 60 * std.time.ns_per_s);
+        defer gpa.free(sa);
+        const punches = numberAfter(sa, "\"block_free_file_punches\":") orelse 0;
+        std.debug.print("smoke[merged-census]: the seam ON — B rm'd one of 8 tenants; A: block_free_file_punches {d} → {d}\n", .{ punches0, punches });
+        try testing.expect(punches >= punches0 + 1);
+    }
+    {
+        // The merged census REPORTS it while B is live (its slot trees
+        // are out of A's forest; only its proposal carries the references).
+        var got = try fsckJsonTarget(rig, rig.mp, &.{"--online"});
+        defer got.report.deinit(gpa);
+        const c = got.report.counters;
+        var lost: u32 = 0;
+        for (got.report.findings) |f| if (f == .c2_lost) {
+            lost += 1;
+        };
+        std.debug.print("smoke[merged-census]: fsck --online on A: {d} finding(s), {d} C2 lost; {d} member binding(s) merged, {d} suspect(s) cleared by the second round; exit {d}\n", .{ got.report.findings.len, lost, c.block_plane_member_bindings, c.suspects_cleared, got.code });
+        for (got.report.findings[0..@min(got.report.findings.len, 8)]) |f| std.debug.print("  reported: {f}\n", .{f});
+        // One row per punched block (the arm names the block and its first
+        // live tenant), at least the block the rm'd tenant shared.
+        try testing.expect(lost >= 1);
+        try testing.expectEqual(got.report.findings.len, lost);
+        try testing.expectEqual(@as(u8, 1), got.code);
+        try testing.expect(c.block_plane_member_bindings >= merged_pack_files - 1);
+        try testing.expectEqual(@as(u64, 0), c.suspects_cleared);
+    }
+    try b.expectAlive("the seam arm");
+    // 2. B remounted (its RAM caches gone; the seam OFF from here): the
+    // loss is on the device.
+    try b.umount();
+    try b.expectCleanExit("B's unmount after the seam arm");
+    b.env = &env_fixed;
+    var b_mark = try b.logLen();
+    try b.spawn(&.{});
+    _ = try b.awaitLog("ready: ", b_mark, ready_wait_ns);
+    _ = try b.awaitLog("enrolled at the coordinator as a fleet READ worker", b_mark, 30 * std.time.ns_per_s);
+    {
+        const r = try std.process.run(gpa, io, .{ .argv = &.{ "sh", "-c", "grep -v '/f0$' \"$1/seam.sha\" | sha256sum --quiet -c - 2>&1 | head -3; echo \"rc=${PIPESTATUS[1]}\"", "smoke", rig.work }, .cwd = .{ .path = b.mp }, .environ_map = &rig.env });
+        defer gpa.free(r.stdout);
+        defer gpa.free(r.stderr);
+        std.debug.print("smoke[merged-census]: the seam ON — B remounted reads its 7 remaining tenants off the device:\n{s}", .{r.stdout});
+        try testing.expect(std.mem.indexOf(u8, r.stdout, "rc=0") == null);
+    }
+    // 3. The seam OFF: the same shape on the shipped law.
+    {
+        const script = try mergedPackScript(gpa, "fixed", merged_pack_files);
+        defer gpa.free(script);
+        const out = try b.onMount(script);
+        defer gpa.free(out);
+        try testing.expectEqualStrings("filled\n", out);
+    }
+    const punches1 = blk: {
+        const sa = try rig.stats();
+        defer gpa.free(sa);
+        break :blk numberAfter(sa, "\"block_free_file_punches\":") orelse 0;
+    };
+    {
+        const out = try b.onMount("rm fixed/f0 && sync -f . && echo removed");
+        defer gpa.free(out);
+        try testing.expectEqualStrings("removed\n", out);
+    }
+    {
+        var got = try fsckJsonTarget(rig, rig.mp, &.{"--online"});
+        defer got.report.deinit(gpa);
+        const sa = try rig.stats();
+        defer gpa.free(sa);
+        std.debug.print("smoke[merged-census]: the seam OFF — the rm stayed local (A punches {d} → {d}); fsck --online on A while B is live: {d} finding(s), {d} member binding(s) merged\n", .{ punches1, numberAfter(sa, "\"block_free_file_punches\":") orelse 0, got.report.findings.len, got.report.counters.block_plane_member_bindings });
+        for (got.report.findings[0..@min(got.report.findings.len, 6)]) |f| std.debug.print("  unexpected: {f}\n", .{f});
+        try testing.expectEqual(punches1, numberAfter(sa, "\"block_free_file_punches\":") orelse 0);
+        try testing.expectEqual(@as(usize, 0), got.report.findings.len);
+        try testing.expectEqual(@as(u8, 0), got.code);
+        try testing.expect(got.report.counters.block_plane_member_bindings >= merged_pack_files - 1);
+    }
+    // B remounted once more: the fixed tenants intact on the device.
+    try b.umount();
+    try b.expectCleanExit("B's unmount after the fixed arm");
+    b_mark = try b.logLen();
+    try b.spawn(&.{});
+    _ = try b.awaitLog("ready: ", b_mark, ready_wait_ns);
+    {
+        const r = try std.process.run(gpa, io, .{ .argv = &.{ "sh", "-c", "grep -v '/f0$' \"$1/fixed.sha\" | sha256sum --quiet -c - && echo ok", "smoke", rig.work }, .cwd = .{ .path = b.mp }, .environ_map = &rig.env });
+        defer gpa.free(r.stdout);
+        defer gpa.free(r.stderr);
+        if (!std.mem.eql(u8, r.stdout, "ok\n")) std.debug.print("--- B remounted reads its fixed tenants ---\n{s}{s}\n", .{ r.stdout, r.stderr });
+        try testing.expectEqualStrings("ok\n", r.stdout);
+    }
+    try b.umount();
+    try b.expectCleanExit("B's last unmount");
+    try rig.expectAlive("the merged census row");
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
 }
 
 test "smoke: THE FLEET READ SHARD — mount A (the coordinator) + B JOINED with the fleet on: B enrolls at A as a READ worker over its own manager link (job_remote_workers 1 on A) → 1 GiB of fsync'd files, 512 MiB written on each side → `scrub --online <A>` partitions 2 ways: shard 0 on A online, shard 1 LEASED to B, run by B's engine over B's own plane (B's scrub_blocks_scanned grows, job_fleet_worker_shards 1), PROPOSED as read_shard_result and merged on A (dispatched 1 = completed 1, relocal 0; every block scanned, 0 findings) → `scrub --online --throttle 5` again: B's residue stretched by the duty cycle, kill -9 B inside it → A's departure expires the lease (fencing +1), the residue is LOST and the local view re-run (relocal 1), the job completes whole, 0 findings; the engagement counters per side" {

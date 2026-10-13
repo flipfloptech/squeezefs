@@ -1314,6 +1314,7 @@ pub const Node = struct {
     /// manager link, pulling READ shards for the fsck engine over this
     /// mount's binding. Null on the coordinator and on a wire-less mount.
     fleet_caller: ?wire_mod.Caller,
+    bitmaps: ?fsck_runner.linux.BitmapFace,
     fleet_worker: ?*wire_mod.Worker = null,
     fleet_task: ?Io.Future(void) = null,
     /// The admin lane (registered beside the job block).
@@ -1361,6 +1362,9 @@ pub const Node = struct {
         /// session, so the member's death expires its shards): the fleet
         /// worker enrolls over it. Null on the manager and without a wire.
         fleet_caller: ?wire_mod.Caller = null,
+        /// The allocation holder's bitmaps for the online fsck (resolved
+        /// at every pass; null without a wire plane).
+        bitmaps: ?fsck_runner.linux.BitmapFace = null,
     };
 
     pub fn create(gpa: Allocator, io: Io, opts: Options, in: Init) Allocator.Error!*Node {
@@ -1396,6 +1400,7 @@ pub const Node = struct {
             .admin_ = undefined,
             .admin_svc = undefined,
             .fleet_caller = in.fleet_caller,
+            .bitmaps = in.bitmaps,
         };
         n.fabric = Fabric.init(gpa, n.store.store(), .{ .identity = in.identity, .pid = in.pid, .default_throttle_pct = opts.cpu_limit, .park_delay_ns = opts.park_delay_ns, .held = in.held, .random = in.random });
         n.table = lease_mod.ShardTable.init(seams.LEASE_TTL_MS, n.sink.sink(), null);
@@ -1444,10 +1449,10 @@ pub const Node = struct {
     /// pass = one online run; the admin lane reads its last report). The
     /// filesystem's 4a manager is the ladder's exclusive lease.
     pub fn bindFsck(self: *Node, be: *meta_set.MetaSet, fs: ?*fsck_runner.linux.BackendFs, env: *const std.process.Environ.Map, mem_budget: u64) !void {
-        const b = try fsck_runner.linux.bind(self.gpa, self.io, be, self.plane, .{ .env = env, .mode = .online, .mem_budget = mem_budget, .fs = fs });
+        const b = try fsck_runner.linux.bind(self.gpa, self.io, be, self.plane, .{ .env = env, .mode = .online, .mem_budget = mem_budget, .fs = fs, .bitmaps = self.bitmaps });
         errdefer fsck_runner.linux.destroy(b);
         const body = try self.gpa.create(fsck_runner.linux.JobBody);
-        body.* = .{ .gpa = self.gpa, .be = be, .plane = self.plane, .env = env, .mem_budget = mem_budget, .fs = fs, .bound = b, .fleet = if (self.opts.fleet_jobs) self.coord.fleet() else seams.FleetDispatch.none };
+        body.* = .{ .gpa = self.gpa, .be = be, .plane = self.plane, .env = env, .mem_budget = mem_budget, .fs = fs, .bound = b, .fleet = if (self.opts.fleet_jobs) self.coord.fleet() else seams.FleetDispatch.none, .bitmaps = self.bitmaps };
         self.fsck_body = body;
         self.fabric.registerBody(.fsck, body.body());
     }

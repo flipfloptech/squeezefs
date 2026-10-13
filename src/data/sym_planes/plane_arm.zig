@@ -534,6 +534,13 @@ pub const HolderPlane = struct {
         return null;
     }
 
+    /// The holder's live bitmap of `vol_tag` (the fsck's C6 arm and the
+    /// lessee-carve exemption of its block plane); null = not this holder's.
+    pub fn bitmapOf(self: *HolderPlane, vol_tag: u64) ?*data_bitmap.DataBitmap {
+        const v = self.volOf(vol_tag) orelse return null;
+        return v.bitmap;
+    }
+
     // ONE handler per verb over every volume (the wire plane registers
     // them before its listener): dispatch by the request's `vol_tag`.
 

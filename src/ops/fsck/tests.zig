@@ -114,6 +114,55 @@ test "the fleet member's residue is its custody: `custody_only` takes the block 
     try testing.expectEqual(@as(u64, 0), theirs.counters.inodes_scanned);
 }
 
+test "the fleet's MERGED block census: a member's proposal carries its custody's owners; the coordinator's lost arm names a block the member's layout binds that the holder tracks no more (a nonterminal free executed under live tenants — the data-loss shape fsck read as clean), C3 the holder's count against the merged references; a fresh carve (the bitmap's bit) and an in-flight mint are exempt; a suspect stands only when the member's SECOND census names it the same way" {
+    const gpa = testing.allocator;
+    const set = try RamSet.init(gpa);
+    defer set.deinit();
+    _ = try populate(set);
+    var h = set.host(.online);
+    // The coordinator's own view ships its owners too.
+    var local = try ram.runHost(set, &h, .{ .ship_owners = true });
+    defer local.deinit(gpa);
+    try ram.expectClasses(local, &.{});
+    try testing.expect(local.owners.len >= 4);
+    // The member's census: ino (slot 7, raw 5) binds block 40 of A — a
+    // block this holder freed under it (untracked) — and block 1 of A,
+    // which the holder tracks at refcount 1 (its own file's).
+    const theirs_binds = [_]finding.BindingRef{
+        .{ .vol_tag = VOL_A, .block_idx = 40, .block_index = 0 },
+        .{ .vol_tag = VOL_A, .block_idx = 1, .block_index = 1 },
+    };
+    const theirs = [_]finding.OwnerRef{.{ .ino = key.guestLocalIno(7, 5), .bindings = &theirs_binds }};
+    var c: finding.Counters = .{};
+    var first: std.ArrayList(Finding) = .empty;
+    defer first.deinit(gpa);
+    try classes.crossMemberBlockPlane(gpa, &h, local.owners, &theirs, &c, &first);
+    try testing.expectEqual(@as(u64, 2), c.block_plane_member_bindings);
+    try testing.expectEqual(@as(usize, 2), first.items.len);
+    var seen_lost = false;
+    var seen_c3 = false;
+    for (first.items) |f| switch (f) {
+        .c2_lost => |x| seen_lost = x.block_idx == 40 and x.ino == key.guestLocalIno(7, 5) and x.block_index == 0 and !x.unrepairable_shape,
+        .c3_refcount => |x| seen_c3 = x.block_idx == 1 and x.actual == 1 and x.expected == 2,
+        else => return error.TestUnexpectedResult,
+    };
+    try testing.expect(seen_lost and seen_c3);
+    // The second census: the member deleted the file that bound block 1
+    // (its reference gone) and still binds block 40 → the lost stands, the
+    // C3 clears.
+    const theirs2_binds = [_]finding.BindingRef{.{ .vol_tag = VOL_A, .block_idx = 40, .block_index = 0 }};
+    const theirs2 = [_]finding.OwnerRef{.{ .ino = key.guestLocalIno(7, 5), .bindings = &theirs2_binds }};
+    var second: std.ArrayList(Finding) = .empty;
+    defer second.deinit(gpa);
+    try classes.crossMemberBlockPlane(gpa, &h, local.owners, &theirs2, &c, &second);
+    var confirmed: std.ArrayList(Finding) = .empty;
+    defer confirmed.deinit(gpa);
+    try classes.confirmCrossMember(gpa, first.items, second.items, &c, &confirmed);
+    try testing.expectEqual(@as(usize, 1), confirmed.items.len);
+    try testing.expect(confirmed.items[0] == .c2_lost);
+    try testing.expectEqual(@as(u64, 1), c.suspects_cleared);
+}
+
 test "the block plane under a live lessee: a block a lessee's record references is the lessee's (its ring lags this census — the first N-daemon fleet run read every pack B shared as `refcount 64 vs 63`), so C2/C3/C8 scope it out and count it; the member's custody run judges no allocator arm at all (a non-holder's allocator is not the truth)" {
     const gpa = testing.allocator;
     const set = try RamSet.init(gpa);

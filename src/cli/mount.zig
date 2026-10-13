@@ -126,6 +126,8 @@ const mount_fabric = @import("../ops/nvmet/mount_fabric.zig");
 const proc = @import("../meta/guard/proc.zig");
 const sym_join = @import("../meta/sym/join.zig");
 const sym_joined = @import("../meta/sym/joined.zig");
+const fsck_runner = @import("../ops/fsck/runner.zig");
+const data_bitmap = @import("../data/sym_planes/data_bitmap.zig");
 const checkpoint = @import("../meta/checkpoint.zig");
 const clock = @import("../core/clock.zig");
 
@@ -541,6 +543,7 @@ fn mountMain(ctx: *Ctx) u8 {
             .meta_set = be,
             // A joined member is a fleet READ worker over its own manager link.
             .fleet_caller = if (be.volumes[0].joined) |js| jobs.wire.Caller{ .ctx = &js.link, .call = &sym_joined.SharedLink.callFn } else null,
+            .bitmaps = if (wire) |wp| fsck_runner.linux.BitmapFace{ .ctx = wp, .bitmapOf = &holderBitmapOf } else null,
         }) catch return ctx.failed("out of memory (job fabric)", .{});
         node = n;
         n.setManager(if (wire) |wp| wp.posture == .manager else true);
@@ -829,6 +832,14 @@ fn jobRandom() u64 {
 }
 
 /// The online `volume add-data`'s grant-plane arm (the wire plane's).
+/// The online fsck's bitmap face over the wire plane: the holder plane's
+/// bitmap while this mount holds the allocation lease, null else.
+fn holderBitmapOf(ctx: *anyopaque, vol_tag: u64) ?*data_bitmap.DataBitmap {
+    const wp: *sym_wire.WirePlane = @ptrCast(@alignCast(ctx));
+    const hp = wp.holder_plane.load(.acquire) orelse return null;
+    return hp.bitmapOf(vol_tag);
+}
+
 const DataArmCtx = struct {
     wire: ?*sym_wire.WirePlane,
 

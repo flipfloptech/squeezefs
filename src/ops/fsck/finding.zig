@@ -336,6 +336,7 @@ pub const Counters = struct {
     c4_custody_scoped: u64 = 0,
     block_plane_foreign_scoped: u64 = 0,
     inode_plane_names_declined: u64 = 0,
+    block_plane_member_bindings: u64 = 0,
     inode_plane_foreign_slot_scoped: u64 = 0,
     inode_plane_window_scoped: u64 = 0,
     inode_plane_foreign_dentry_scoped: u64 = 0,
@@ -419,6 +420,7 @@ pub const Counters = struct {
         s.fsck_c4_custody_scoped.add(self.c4_custody_scoped);
         s.fsck_block_plane_foreign_scoped.add(self.block_plane_foreign_scoped);
         s.fsck_inode_plane_names_declined.add(self.inode_plane_names_declined);
+        s.fsck_block_plane_member_bindings.add(self.block_plane_member_bindings);
         s.fsck_inode_plane_foreign_slot_scoped.add(self.inode_plane_foreign_slot_scoped);
         s.fsck_inode_plane_window_scoped.add(self.inode_plane_window_scoped);
         s.fsck_inode_plane_foreign_dentry_scoped.add(self.inode_plane_foreign_dentry_scoped);
@@ -514,6 +516,13 @@ pub const Shard = struct {
     }
 };
 
+/// One block a layout binds: the fleet member's derived census row
+/// (`block_refs.Binding` on the wire).
+pub const BindingRef = struct { vol_tag: u64, block_idx: u64, block_index: u32 };
+
+/// One inode's bindings in a member's derived census (its key ino).
+pub const OwnerRef = struct { ino: u64, bindings: []const BindingRef };
+
 pub const Report = struct {
     schema: u32 = fsck.REPORT_SCHEMA,
     mode: Mode,
@@ -524,11 +533,23 @@ pub const Report = struct {
     repair: ?RepairReport = null,
     /// Findings the bounded view dropped (they ARE findings for the verdict).
     findings_elided: u64 = 0,
+    /// A fleet member's derived block census over its custody — the inos
+    /// of the slots it leases and every block their layouts bind — shipped
+    /// in its proposal for the coordinator's merged reference arms (§8:
+    /// the holder cannot read a live lessee's layouts); empty on every
+    /// published report (`merge` drops it: an input, never an output).
+    owners: []const OwnerRef = &.{},
 
     pub fn deinit(self: *Report, gpa: Allocator) void {
         gpa.free(self.findings);
         if (self.repair) |*r| r.deinit(gpa);
+        freeOwners(gpa, self.owners);
         self.* = undefined;
+    }
+
+    pub fn freeOwners(gpa: Allocator, owners: []const OwnerRef) void {
+        for (owners) |o| gpa.free(o.bindings);
+        gpa.free(owners);
     }
 
     pub fn hasFindings(self: Report) bool {
@@ -565,6 +586,22 @@ pub const Report = struct {
         try self.counters.writeJson(w);
         try w.writeAll(",\"repair\":");
         if (self.repair) |r| try r.writeJson(w) else try w.writeAll("null");
+        if (self.owners.len != 0) {
+            // `[[ino,[[vol_tag,block_idx,block_index],…]],…]` — the compact
+            // row shape (a custody of 100 k bindings is ~4 MB, inside the
+            // proposal cap).
+            try w.writeAll(",\"owners\":[");
+            for (self.owners, 0..) |o, i| {
+                if (i != 0) try w.writeByte(',');
+                try w.print("[{d},[", .{o.ino});
+                for (o.bindings, 0..) |b, j| {
+                    if (j != 0) try w.writeByte(',');
+                    try w.print("[{d},{d},{d}]", .{ b.vol_tag, b.block_idx, b.block_index });
+                }
+                try w.writeAll("]]");
+            }
+            try w.writeByte(']');
+        }
         try w.writeByte('}');
     }
 
@@ -681,7 +718,31 @@ pub const Report = struct {
             counters = try Counters.fromJson(cv.object);
         }
         const elided = if (obj.get("findings_elided")) |ev| try jsonInt(u64, ev) else 0;
-        return .{ .mode = mode, .shard = shard, .findings = findings, .counters = counters, .findings_elided = elided };
+        var owners: []OwnerRef = &.{};
+        errdefer freeOwners(gpa, owners);
+        if (obj.get("owners")) |ov| {
+            if (ov != .array) return error.Corrupt;
+            owners = try gpa.alloc(OwnerRef, ov.array.items.len);
+            var built: usize = 0;
+            errdefer {
+                for (owners[0..built]) |o| gpa.free(o.bindings);
+                gpa.free(owners);
+                owners = &.{};
+            }
+            for (ov.array.items) |row| {
+                if (row != .array or row.array.items.len != 2 or row.array.items[1] != .array) return error.Corrupt;
+                const bl = row.array.items[1].array.items;
+                const bindings = try gpa.alloc(BindingRef, bl.len);
+                errdefer gpa.free(bindings);
+                for (bl, 0..) |bv, k| {
+                    if (bv != .array or bv.array.items.len != 3) return error.Corrupt; // a binding row is `[vol_tag, block_idx, block_index]`
+                    bindings[k] = .{ .vol_tag = try jsonInt(u64, bv.array.items[0]), .block_idx = try jsonInt(u64, bv.array.items[1]), .block_index = try jsonInt(u32, bv.array.items[2]) };
+                }
+                owners[built] = .{ .ino = try jsonInt(u64, row.array.items[0]), .bindings = bindings };
+                built += 1;
+            }
+        }
+        return .{ .mode = mode, .shard = shard, .findings = findings, .counters = counters, .findings_elided = elided, .owners = owners };
     }
 };
 
@@ -818,6 +879,31 @@ test "report JSON round-trips every arm (hex key buffers, enum tags, u64 fields 
     txt.clearRetainingCapacity();
     try clean.writeText(&txt.writer);
     try testing.expect(std.mem.indexOf(u8, txt.written(), "findings: 0 (clean)") != null);
+}
+
+test "a member's derived census rides its proposal: the owners round-trip through the ONE decoder (ino, every binding's volume/block/index), a malformed row refuses, and a merge carries none (an input, never an output)" {
+    const gpa = testing.allocator;
+    const binds_a = [_]BindingRef{ .{ .vol_tag = 0x10, .block_idx = 75, .block_index = 0 }, .{ .vol_tag = 0x20, .block_idx = 46, .block_index = 1 } };
+    const binds_b = [_]BindingRef{.{ .vol_tag = 0x10, .block_idx = 75, .block_index = 0 }};
+    const owners = [_]OwnerRef{ .{ .ino = key.guestLocalIno(65, 2), .bindings = &binds_a }, .{ .ino = key.guestLocalIno(65, 3), .bindings = &binds_b } };
+    const r: Report = .{ .mode = .online, .findings = &.{}, .owners = &owners };
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    try r.writeJson(&out.writer);
+    try testing.expect(std.mem.indexOf(u8, out.written(), "\"owners\":[[") != null);
+    var back = try Report.parse(gpa, out.written());
+    defer back.deinit(gpa);
+    try testing.expectEqual(@as(usize, 2), back.owners.len);
+    try testing.expectEqual(owners[0].ino, back.owners[0].ino);
+    try testing.expectEqualSlices(BindingRef, &binds_a, back.owners[0].bindings);
+    try testing.expectEqualSlices(BindingRef, &binds_b, back.owners[1].bindings);
+    // The merge drops the census.
+    var merged = try merge(gpa, &.{back});
+    defer merged.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), merged.owners.len);
+    // A row that is not `[ino, [...]]` refuses.
+    try testing.expectError(error.Corrupt, Report.parse(gpa, "{\"schema\":1,\"mode\":\"online\",\"findings\":[],\"owners\":[[7]]}"));
+    try testing.expectError(error.Corrupt, Report.parse(gpa, "{\"schema\":1,\"mode\":\"online\",\"findings\":[],\"owners\":[[7,[[1,2]]]]}"));
 }
 
 test "Shard.parse: k/N with 0 ≤ k < N; the residue partition is total and disjoint" {

@@ -1626,6 +1626,81 @@ pub fn recordSatisfiesSchema(kind: u8, k: []const u8, v: []const u8, geo: layout
     return true;
 }
 
+/// §8's merged reference arms over a LIVE set: the coordinator's own
+/// derived census and every member's (its custody's owners, shipped in its
+/// proposal) against THIS mount's allocators — the lost arm (a block a
+/// member's layout binds that the holder tracks no more: the data-loss
+/// shape, a nonterminal free the holder executed under live tenants) and
+/// C3 (the holder's count ≠ the merged references). The bitmap's SET bit
+/// exempts a lessee's fresh carve (its reference follows), the in-flight
+/// registry a mint mid-publish. The leaked arm and C8 stay the whole-view
+/// run's: a leak is space (a member's carve between two censuses would read
+/// as one), C8 compares durable refs the holder cannot read. The suspects
+/// are the caller's to CONFIRM against a second member census (the ladder's
+/// re-check with the member's own fresh evidence).
+pub fn crossMemberBlockPlane(gpa: Allocator, host: *const Host, local: []const finding.OwnerRef, members: []const finding.OwnerRef, counters: *finding.Counters, out: *std.ArrayList(Finding)) Allocator.Error!void {
+    const Key = struct { vol_tag: u64, block_idx: u64 };
+    const Row = struct { count: u32, member_ino: u64, member_block_index: u32, member_refs: u32 };
+    var rows: std.AutoHashMapUnmanaged(Key, Row) = .empty;
+    defer rows.deinit(gpa);
+    for (local) |o| for (o.bindings) |b| {
+        const gop = try rows.getOrPutValue(gpa, .{ .vol_tag = b.vol_tag, .block_idx = b.block_idx }, .{ .count = 0, .member_ino = 0, .member_block_index = 0, .member_refs = 0 });
+        gop.value_ptr.count += 1;
+    };
+    for (members) |o| for (o.bindings) |b| {
+        const gop = try rows.getOrPutValue(gpa, .{ .vol_tag = b.vol_tag, .block_idx = b.block_idx }, .{ .count = 0, .member_ino = 0, .member_block_index = 0, .member_refs = 0 });
+        gop.value_ptr.count += 1;
+        gop.value_ptr.member_refs += 1;
+        if (gop.value_ptr.member_refs == 1) {
+            gop.value_ptr.member_ino = o.ino;
+            gop.value_ptr.member_block_index = b.block_index;
+        }
+        counters.block_plane_member_bindings += 1;
+    };
+    var it = rows.iterator();
+    while (it.next()) |e| {
+        // Only blocks a MEMBER references are this arm's: the holder's own
+        // view judged its own blocks in its whole run (or declined).
+        if (e.value_ptr.member_refs == 0) continue;
+        const k = e.key_ptr.*;
+        const v = host.volume(k.vol_tag) orelse {
+            try out.append(gpa, .{ .c2_lost = .{ .vol_tag = k.vol_tag, .block_idx = k.block_idx, .ino = e.value_ptr.member_ino, .block_index = e.value_ptr.member_block_index, .unrepairable_shape = true } });
+            continue;
+        };
+        const out_of_range = k.block_idx >= v.alloc.capacityBlocks();
+        if (!out_of_range and v.alloc.inflightContains(k.block_idx)) {
+            counters.inflight_exempted += 1;
+            continue;
+        }
+        if (!out_of_range) if (v.alloc.refcount(k.block_idx)) |rc| {
+            counters.refcounts_checked += 1;
+            if (rc != e.value_ptr.count) try out.append(gpa, .{ .c3_refcount = .{ .vol_tag = k.vol_tag, .block_idx = k.block_idx, .expected = e.value_ptr.count, .actual = rc } });
+            continue;
+        };
+        if (!out_of_range) if (v.bitmap) |bm| if (bm.isSet(k.block_idx)) {
+            counters.alloc_bitmap_tracked_exempted += 1;
+            continue;
+        };
+        try out.append(gpa, .{ .c2_lost = .{ .vol_tag = k.vol_tag, .block_idx = k.block_idx, .ino = e.value_ptr.member_ino, .block_index = e.value_ptr.member_block_index, .unrepairable_shape = out_of_range } });
+    }
+}
+
+/// The merged arms' re-check: a suspect stands only when the second
+/// member census (and the allocator, re-read by the second evaluation)
+/// name the same block the same way; a block whose reference vanished in
+/// between (a delete after the first census) or that the holder tracks
+/// again is cleared and counted.
+pub fn confirmCrossMember(gpa: Allocator, first: []const Finding, second: []const Finding, counters: *finding.Counters, out: *std.ArrayList(Finding)) Allocator.Error!void {
+    for (first) |f| {
+        var stands = false;
+        for (second) |g| if (Finding.eql(f, g)) {
+            stands = true;
+            break;
+        };
+        if (stands) try out.append(gpa, f) else counters.suspects_cleared += 1;
+    }
+}
+
 fn firstOwner(cen: *const census.Census, vol_tag: u64, block_idx: u64) struct { ino: u64, block_index: u32 } {
     for (cen.owners.items) |o| for (o.bindings) |b| if (b.vol_tag == vol_tag and b.block_idx == block_idx) return .{ .ino = o.ino, .block_index = b.block_index };
     return .{ .ino = 0, .block_index = 0 };

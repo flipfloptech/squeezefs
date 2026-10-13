@@ -467,6 +467,9 @@ pub const Config = struct {
     elision: bool = true,
     /// `SQUEEZEFS_TEST_RECLAIM_STALL_MS`.
     test_stall_ms: u64 = 0,
+    /// `SQUEEZEFS_TEST_SHIP_EVERY_FREE`: a non-holder ships its nonterminal
+    /// releases too (the data-loss shape the fleet's merged census reports).
+    test_ship_every_free: bool = false,
     /// Test seam: every substrate elides (the file-backed rigs).
     elision_class_all: bool = false,
     /// The R5 budget: the cap ceiling's input.
@@ -488,6 +491,7 @@ pub const Config = struct {
             .explicit_park_bound_ms = knobs.optIntKnob("SQUEEZEFS_RECLAIM_CAP_PARK_MS", u64, env),
             .elision = knobs.boolKnob("SQUEEZEFS_DISCARD_ELISION", env),
             .test_stall_ms = knobs.intKnob("SQUEEZEFS_TEST_RECLAIM_STALL_MS", u64, env),
+            .test_ship_every_free = knobs.boolKnob("SQUEEZEFS_TEST_SHIP_EVERY_FREE", env),
             .budget_bytes = budget_bytes,
         };
     }
@@ -673,7 +677,7 @@ pub const Reclaimer = struct {
         // untracked one ship. The holder's own executor (authority active)
         // runs the ladder here.
         if (row.free_target) |t| if (!t.authorityActive(t.ctx)) {
-            if (alloc.releaseUnlessLast(idx)) return .nonterminal;
+            if (!self.cfg.test_ship_every_free and alloc.releaseUnlessLast(idx)) return .nonterminal;
             return if (t.ship(t.ctx, alloc.volTag(), idx)) .nonterminal else .refused;
         };
         // Step 5: `begin_free` (the SHARED gate and the untracked gate

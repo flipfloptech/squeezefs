@@ -45,6 +45,10 @@ pub const Options = struct {
     /// Fold the report into the instruments (`Report.publish`); a fleet
     /// run publishes its MERGED report once instead of every residue's.
     publish: bool = true,
+    /// Carry the census's owners (ino → bindings) in the report: a fleet
+    /// member's proposal and the coordinator's own view, the merged
+    /// reference arms' inputs (`classes.crossMemberBlockPlane`).
+    ship_owners: bool = false,
 };
 
 /// `SQUEEZEFS_FSCK_SETTLE_MS` as nanoseconds (the §5.6 step-2 window).
@@ -74,6 +78,7 @@ pub fn run(host: *const Host, opts: Options, verifier: ?*scrub.Verifier) Error!f
     }
     var report = try pass.report(host.gpa);
     errdefer report.deinit(host.gpa);
+    if (opts.ship_owners) report.owners = try ownerRefs(host.gpa, &pass.cen);
     if (opts.repair) |ropts| {
         var r = ropts;
         // The scrub's verifier is C2-lost's content arm too.
@@ -84,6 +89,23 @@ pub fn run(host: *const Host, opts: Options, verifier: ?*scrub.Verifier) Error!f
     report.counters.scan_ms = (clock.monotonicNs() -| t0) / std.time.ns_per_ms;
     if (opts.publish) report.publish();
     return report;
+}
+
+/// The census's owners as the report's rows (every binding of every ino).
+fn ownerRefs(gpa: Allocator, cen: *const census.Census) Allocator.Error![]finding.OwnerRef {
+    const out = try gpa.alloc(finding.OwnerRef, cen.owners.items.len);
+    var built: usize = 0;
+    errdefer {
+        for (out[0..built]) |o| gpa.free(o.bindings);
+        gpa.free(out);
+    }
+    for (cen.owners.items) |o| {
+        const bs = try gpa.alloc(finding.BindingRef, o.bindings.len);
+        for (o.bindings, bs) |b, *r| r.* = .{ .vol_tag = b.vol_tag, .block_idx = b.block_idx, .block_index = b.block_index };
+        out[built] = .{ .ino = o.ino, .bindings = bs };
+        built += 1;
+    }
+    return out;
 }
 
 /// The online submission seam the job fabric binds: the daemon's admin
@@ -101,6 +123,7 @@ pub const linux = if (builtin.os.tag == .linux) struct {
     const linux_os = std.os.linux;
     const meta_set = @import("../../meta/meta_set.zig");
     const plane_mod = @import("../../data/plane.zig");
+    const data_bitmap = @import("../../data/sym_planes/data_bitmap.zig");
     const handler = @import("../../fuse/handler.zig");
     const staging = @import("../../data/staging.zig");
     const transform = @import("../../data/transform.zig");
@@ -135,6 +158,12 @@ pub const linux = if (builtin.os.tag == .linux) struct {
         forest: ForestBind,
         host: Host,
 
+        /// The holder's bitmaps NOW: a volume's bitmap is the holder
+        /// plane's while this mount holds the allocation lease, null else.
+        pub fn refreshBitmaps(self: *Bound, face: ?BitmapFace) void {
+            for (self.vols) |*v| v.bitmap = if (face) |f| f.bitmapOf(f.ctx, v.vol_tag) else null;
+        }
+
         pub fn deinit(self: *Bound) void {
             if (self.verifier) |*v| v.deinit();
             self.gpa.free(self.xform_scratch);
@@ -145,6 +174,14 @@ pub const linux = if (builtin.os.tag == .linux) struct {
         }
     };
 
+    /// The allocation holder's live bitmaps, resolved at EVERY pass (the
+    /// holder plane comes with the allocation lease and goes with a
+    /// failover): the C6 bitmap arm and the lessee-carve exemption.
+    pub const BitmapFace = struct {
+        ctx: *anyopaque,
+        bitmapOf: *const fn (ctx: *anyopaque, vol_tag: u64) ?*data_bitmap.DataBitmap,
+    };
+
     pub const BindOptions = struct {
         env: *const std.process.Environ.Map,
         mode: finding.Mode,
@@ -152,6 +189,8 @@ pub const linux = if (builtin.os.tag == .linux) struct {
         shard: ?finding.Shard = null,
         /// The live filesystem (its 4a manager): online only.
         fs: ?*BackendFs = null,
+        /// The holder's bitmaps (online, the manager): null = the flat arm.
+        bitmaps: ?BitmapFace = null,
         cancel: ?*const std.atomic.Value(bool) = null,
     };
 
@@ -197,6 +236,7 @@ pub const linux = if (builtin.os.tag == .linux) struct {
             }
         }
         b.vols = try vols.toOwnedSlice(gpa);
+        b.refreshBitmaps(opts.bitmaps);
         b.xforms = try xforms.toOwnedSlice(gpa);
         if (plane) |pl| {
             b.verifier = try scrub.Verifier.init(gpa, .{ .ctx = pl, .read = &readBlock }, pl.chunk, b.xforms);
@@ -681,6 +721,8 @@ pub const linux = if (builtin.os.tag == .linux) struct {
         /// The fleet READ-shard dispatcher (the coordinator's; `none`
         /// without a wire): a pass with read capacity ships residues.
         fleet: job_seams.FleetDispatch = job_seams.FleetDispatch.none,
+        /// The holder's bitmaps, read at every pass (null = the flat arm).
+        bitmaps: ?BitmapFace = null,
 
         pub fn deinit(self: *JobBody) void {
             if (self.last) |*r| r.deinit(self.gpa);
@@ -693,7 +735,7 @@ pub const linux = if (builtin.os.tag == .linux) struct {
         }
 
         fn bindOptions(self: *const JobBody) BindOptions {
-            return .{ .env = self.env, .mode = .online, .mem_budget = self.mem_budget, .fs = self.fs };
+            return .{ .env = self.env, .mode = .online, .mem_budget = self.mem_budget, .fs = self.fs, .bitmaps = self.bitmaps };
         }
 
         /// The binding is REBUILT when the plane's volume population
@@ -709,6 +751,7 @@ pub const linux = if (builtin.os.tag == .linux) struct {
             self.bound.host.io = io;
             self.bound.host.cancel = cancel;
             self.bound.host.pause = pause;
+            self.bound.refreshBitmaps(self.bitmaps);
             try refreshLiveScope(self.bound);
         }
 
@@ -755,22 +798,25 @@ pub const linux = if (builtin.os.tag == .linux) struct {
         /// (its trees leave the coordinator's forest at the grant), so the
         /// residues are the members' custodies, never ino residues — `n − 1`
         /// member shards QUEUED for the read-capable workers first (each
-        /// runs its engine over its own leased slots alone), the whole of
-        /// THIS mount's view run HERE online with the suspect/settle
-        /// machinery armed, then every shipped residue collected: a
-        /// proposal merges (its report parsed by the ONE decoder); a lost
-        /// one is counted (`job_fleet_shards_relocal`) and the local view
-        /// re-run once — a dead member's slots are the manager's again
-        /// after its recovery, a live-but-silent member's stay its own. The
-        /// shards retire at the pass end; the MERGED report publishes once.
+        /// runs its engine over its own leased slots alone and ships its
+        /// derived census), the whole of THIS mount's view run HERE online
+        /// with the suspect/settle machinery armed, then every shipped
+        /// residue collected: a proposal merges (its report parsed by the
+        /// ONE decoder); a lost one is counted (`job_fleet_shards_relocal`)
+        /// and the local view re-run once — a dead member's slots are the
+        /// manager's again after its recovery, a live-but-silent member's
+        /// stay its own. The MERGED reference arms (`crossMemberBlockPlane`)
+        /// run over the coordinator's owners and the members': a suspect
+        /// is CONFIRMED against a second census round from the members (the
+        /// ladder's re-check with their own fresh evidence) and lands as a
+        /// finding; an unconfirmable one (a member lost between the rounds)
+        /// is cleared and counted. The shards retire at the pass end; the
+        /// MERGED report publishes once, its census rows dropped.
         fn runFleet(self: *JobBody, io: Io, job: *fabric.JobCtl, opts: Options, n: u32) Error!finding.Report {
             const gpa = self.gpa;
-            var queued: [wire_mod.MAX_READ_SHARDS]bool = @splat(false);
             const shards: u32 = @min(n, @as(u32, @intCast(wire_mod.MAX_READ_SHARDS)));
-            var k: u32 = 1;
-            while (k < shards) : (k += 1) {
-                queued[k] = self.fleet.queueReadShard(.{ .id = .{ .job_id = job.id(), .shard = k }, .fleet_k = k, .fleet_n = shards, .inode_plane = 0, .throttle_pct = job.ctl.loadPct() }, job.rec.arg0);
-            }
+            var queued: [wire_mod.MAX_READ_SHARDS]bool = @splat(false);
+            self.queueCustodies(job, shards, 0, &queued);
             defer self.fleet.retireFleetShards(job.id());
             var parts: std.ArrayList(finding.Report) = .empty;
             defer {
@@ -779,19 +825,27 @@ pub const linux = if (builtin.os.tag == .linux) struct {
             }
             var local = opts;
             local.publish = false;
+            local.ship_owners = true;
             self.bound.host.shard = null;
             self.bound.host.custody_only = false;
             try parts.append(gpa, try run(&self.bound.host, local, if (self.bound.verifier) |*v| v else null));
+            var member_owners: std.ArrayList(finding.OwnerRef) = .empty;
+            defer {
+                for (member_owners.items) |o| gpa.free(o.bindings);
+                member_owners.deinit(gpa);
+            }
             var remote: u32 = 0;
             var lost: u32 = 0;
-            k = 1;
+            var k: u32 = 1;
             while (k < shards) : (k += 1) {
                 var landed = false;
                 if (queued[k]) switch (self.fleet.collectReadShard(io, gpa, .{ .job_id = job.id(), .shard = k })) {
                     .payload => |p| {
                         defer self.fleet.release(gpa, p);
                         if (finding.Report.parse(gpa, p)) |rep| {
-                            try parts.append(gpa, rep);
+                            var r = rep;
+                            try takeOwners(gpa, &r, &member_owners);
+                            try parts.append(gpa, r);
                             landed = true;
                             remote += 1;
                         } else |_| log.warn("fsck fleet: residue {d}/{d} of job-{x:0>16} proposed a report that does not parse — lost", .{ k, shards, job.id() });
@@ -808,11 +862,87 @@ pub const linux = if (builtin.os.tag == .linux) struct {
                 parts.items[0] = again;
                 again = undefined;
             }
+            // The merged reference arms, confirmed by a second census round.
+            var cross: finding.Counters = .{};
+            var confirmed: std.ArrayList(finding.Finding) = .empty;
+            defer confirmed.deinit(gpa);
+            if (member_owners.items.len != 0 and !self.bound.host.cancelled()) {
+                var first: std.ArrayList(finding.Finding) = .empty;
+                defer first.deinit(gpa);
+                try classes.crossMemberBlockPlane(gpa, &self.bound.host, parts.items[0].owners, member_owners.items, &cross, &first);
+                if (first.items.len != 0) {
+                    self.fleet.retireFleetShards(job.id());
+                    var queued2: [wire_mod.MAX_READ_SHARDS]bool = @splat(false);
+                    self.queueCustodies(job, shards, shards, &queued2);
+                    var owners2: std.ArrayList(finding.OwnerRef) = .empty;
+                    defer {
+                        for (owners2.items) |o| gpa.free(o.bindings);
+                        owners2.deinit(gpa);
+                    }
+                    var whole = true;
+                    k = 1;
+                    while (k < shards) : (k += 1) {
+                        var landed = false;
+                        if (queued2[k]) switch (self.fleet.collectReadShard(io, gpa, .{ .job_id = job.id(), .shard = shards + k })) {
+                            .payload => |p| {
+                                defer self.fleet.release(gpa, p);
+                                if (finding.Report.parse(gpa, p)) |rep| {
+                                    var r = rep;
+                                    defer r.deinit(gpa);
+                                    try takeOwners(gpa, &r, &owners2);
+                                    landed = true;
+                                } else |_| {}
+                            },
+                            .lost => {},
+                        };
+                        if (!landed) whole = false;
+                    }
+                    var second: std.ArrayList(finding.Finding) = .empty;
+                    defer second.deinit(gpa);
+                    if (whole) {
+                        try classes.crossMemberBlockPlane(gpa, &self.bound.host, parts.items[0].owners, owners2.items, &cross, &second);
+                        try classes.confirmCrossMember(gpa, first.items, second.items, &cross, &confirmed);
+                    } else {
+                        // A member silent between the rounds: nothing to
+                        // confirm against; its slots are the manager's once
+                        // it is recovered, and the next run judges them.
+                        cross.suspects_cleared += @intCast(first.items.len);
+                        log.warn("fsck fleet: job-{x:0>16}: {d} merged-census suspect(s) could not be confirmed — a member's second census did not land", .{ job.id(), first.items.len });
+                    }
+                }
+            }
             var merged = try finding.merge(gpa, parts.items);
+            errdefer merged.deinit(gpa);
+            if (confirmed.items.len != 0) {
+                const all = try gpa.alloc(finding.Finding, merged.findings.len + confirmed.items.len);
+                @memcpy(all[0..merged.findings.len], merged.findings);
+                @memcpy(all[merged.findings.len..], confirmed.items);
+                gpa.free(merged.findings);
+                const nn = finding.Report.normalize(all);
+                merged.findings = try gpa.realloc(all, nn);
+            }
+            merged.counters.merge(cross);
             merged.mode = .online;
             merged.publish();
-            log.info("fsck fleet: job-{x:0>16} judged {d} residue(s): {d} proposed by the fleet, {d} run here", .{ job.id(), shards, remote, shards - remote });
+            log.info("fsck fleet: job-{x:0>16} judged {d} residue(s): {d} proposed by the fleet, {d} run here; {d} member binding(s) merged, {d} confirmed cross-member finding(s)", .{ job.id(), shards, remote, shards - remote, cross.block_plane_member_bindings, confirmed.items.len });
             return merged;
+        }
+
+        /// Queue one custody residue per read-capable member, shard ids
+        /// `base + k` (the second census round takes `base = shards`).
+        fn queueCustodies(self: *JobBody, job: *fabric.JobCtl, shards: u32, base: u32, queued: *[wire_mod.MAX_READ_SHARDS]bool) void {
+            var k: u32 = 1;
+            while (k < shards) : (k += 1) {
+                queued[k] = self.fleet.queueReadShard(.{ .id = .{ .job_id = job.id(), .shard = base + k }, .fleet_k = k, .fleet_n = shards, .inode_plane = 0, .throttle_pct = job.ctl.loadPct() }, job.rec.arg0);
+            }
+        }
+
+        /// Move a proposal's census rows out of the report (the report's
+        /// deinit then frees none of them).
+        fn takeOwners(gpa: Allocator, r: *finding.Report, into: *std.ArrayList(finding.OwnerRef)) Allocator.Error!void {
+            try into.appendSlice(gpa, r.owners);
+            gpa.free(r.owners);
+            r.owners = &.{};
         }
 
         /// The worker side (`wire.ReadRunner`): THIS member's engine over
@@ -830,7 +960,10 @@ pub const linux = if (builtin.os.tag == .linux) struct {
             self.bound.host.shard = null;
             self.bound.host.custody_only = true;
             var pacer: FixedThrottle = .{ .pct = d.throttle_pct };
-            var report = run(&self.bound.host, .{ .scrub = d.arg0 & fsck.JOB_ARG_SCRUB != 0, .scrub_only = d.arg0 & fsck.JOB_ARG_SCRUB_ONLY != 0, .throttle = pacer.throttle() }, if (self.bound.verifier) |*v| v else null) catch |e| return switch (e) {
+            // The member's census rides the proposal (the merged arms'
+            // input at the coordinator); its counters fold into this
+            // member's own instruments (the work was done here).
+            var report = run(&self.bound.host, .{ .scrub = d.arg0 & fsck.JOB_ARG_SCRUB != 0, .scrub_only = d.arg0 & fsck.JOB_ARG_SCRUB_ONLY != 0, .throttle = pacer.throttle(), .ship_owners = true }, if (self.bound.verifier) |*v| v else null) catch |e| return switch (e) {
                 error.OutOfMemory => error.OutOfMemory,
                 else => error.Io,
             };

@@ -1034,6 +1034,26 @@ pub const BlockAllocator = struct {
         return Incarnation.still(w, before);
     }
 
+    /// May a validated fill of this block DEPOSIT into the read tiers? A
+    /// tier entry lives exactly one LOCAL lifetime (the claim's publish
+    /// and the free's purge bound it); a cell outside one (`limbo` once
+    /// the free began, then free / virgin after a give-back or a carve /
+    /// trim-windowed — word ≠ 0) is dying, in another member's custody or
+    /// nobody's: a deposit there could be its own dead bytes, and no
+    /// foreign publish purges this member's tiers. A never-touched cell
+    /// (word 0) deposits as before: its foreign lifetime's end is the
+    /// token recall's purge (decision 0003 §V). Called after the fill's
+    /// `still` passed; a claim racing it moves the word, so the tiers'
+    /// insert-time validate refuses.
+    pub fn fillDepositable(self: *BlockAllocator, idx: u64) bool {
+        const c = self.cell(idx);
+        if (c.incarnation.load(.acquire) == 0) return true;
+        return switch (c.getState()) {
+            .free, .virgin, .trim_windowed, .limbo => false,
+            .allocated, .quarantined => true,
+        };
+    }
+
     pub fn incarnationWord(self: *BlockAllocator, idx: u64) u64 {
         return self.cell(idx).incarnation.load(.acquire);
     }
@@ -1197,6 +1217,7 @@ pub const BlockAllocator = struct {
     /// bit already clear ⇒ ERROR "DOUBLE FREE" + `block_double_frees`.
     fn publishFreeList(self: *BlockAllocator, idx: u64, site: Site) void {
         const c = self.cell(idx);
+        endLifetime(c);
         if (self.finish_free_sink) |s| {
             if (!s.noteFinishFree(s.ctx, self.cfg.vol_tag, idx)) {
                 stats.block_double_frees.fire("holder bitmap bit already clear");
@@ -1223,6 +1244,19 @@ pub const BlockAllocator = struct {
         }
     }
 
+    /// The local lifetime is over: the word re-stabilizes under the
+    /// generation the retire minted. Unstable means a transition IN
+    /// FLIGHT here; left unstable, a block another member re-minted from a
+    /// wrapped carve read as mid-write on this member forever (every read
+    /// EIO). Called with the cell already OUT of a lifetime (`limbo` after
+    /// `beginFree`, `virgin` after a give-back) and before the free list
+    /// can hand the block to a claim: `publish`'s release orders that state
+    /// store before the stable bit a snapshot acquires, so `fillDepositable`
+    /// refuses the deposit (model 7, `incarnation_model.zig`).
+    fn endLifetime(c: *Cell) void {
+        Incarnation.publish(&c.incarnation);
+    }
+
     /// `free_block`: gate + `beginFree` + `finishFree` with nothing between.
     pub fn freeBlock(self: *BlockAllocator, idx: u64) AllocError!BeginFree {
         const v = try self.beginFree(idx);
@@ -1240,15 +1274,22 @@ pub const BlockAllocator = struct {
         stats.unpublished_mint_abandons.inc();
         if (self.forensics) |*t| t.record(idx, .abandon);
         if (self.grant_source) |g| {
-            if (g.vtable.giveBack(g.ctx, idx)) {
-                // Back in the window = unminted again; the window owns the
-                // bit (set at the carve), so the local list never sees it.
-                const c = self.cell(idx);
-                _ = Refcount.release(&c.refcount);
-                Incarnation.retire(&c.incarnation);
-                c.setState(.virgin);
-                return;
-            }
+            // Back in the window = unminted again; the window owns the bit
+            // (set at the carve), so the local list never sees it. The cell
+            // leaves its lifetime FIRST: the window's head is the next mint,
+            // and a claim taking it before these stores met a live count
+            // (`block_claim_anomalies`) that the release then zeroed.
+            const c = self.cell(idx);
+            _ = Refcount.release(&c.refcount);
+            Incarnation.retire(&c.incarnation);
+            c.setState(.virgin);
+            endLifetime(c);
+            if (g.vtable.giveBack(g.ctx, idx)) return;
+            // Not taken back (already unconsumed, or no room): the mint is
+            // still this thread's alone — its count and state return for
+            // the terminal free.
+            c.refcount.store(1, .release);
+            c.setState(.allocated);
         }
         _ = self.freeBlock(idx) catch {};
     }
@@ -1877,6 +1918,81 @@ test "claim ordering law: the stamp and the word move before the refcount; a rea
     try testing.expect(a.fillIncarnationStill(3, UNKNOWN_STABLE));
 }
 
+test "a local lifetime that ENDED leaves the word stable under its retired generation: another member's re-mint of the block validates here (never a tier deposit), a local re-claim retires it under the racing fill, a never-touched cell keeps its deposit" {
+    const a = try testAlloc(4);
+    defer a.deinit();
+    const m = try a.allocateBlock();
+    a.publishBlock(m.idx);
+    const live = a.fillIncarnation(m.idx).?;
+    try testing.expect(a.fillDepositable(m.idx));
+    try testing.expectEqual(BeginFree.terminal, try a.freeBlock(m.idx));
+    try testing.expect(!a.fillIncarnationStill(m.idx, live));
+    // The free list holds it: no transition runs here, and a wrapped carve
+    // may hand it to another member whose mint this word never sees — the
+    // snapshot validates (the binding proves the serve).
+    const foreign = a.fillIncarnation(m.idx) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(Incarnation.generation(live) + 1, Incarnation.generation(foreign));
+    try testing.expect(a.fillIncarnationStill(m.idx, foreign));
+    try testing.expect(!a.fillDepositable(m.idx));
+    // This member's own re-claim retires the word: the racing fill fails.
+    const m2 = try a.allocateBlock();
+    try testing.expectEqual(m.idx, m2.idx);
+    try testing.expectEqual(@as(?u64, null), a.fillIncarnation(m2.idx));
+    try testing.expect(!a.fillIncarnationStill(m2.idx, foreign));
+    a.publishBlock(m2.idx);
+    try testing.expect(a.fillDepositable(m2.idx));
+    try testing.expectEqual(UNKNOWN_STABLE, a.fillIncarnation(3).?);
+    try testing.expect(a.fillDepositable(3));
+}
+
+test "an abandoned mint leaves its lifetime BEFORE the grant window can hand it out: a mint that takes it from the window head at once claims a clean cell (refcount 1, allocated, unstable) and nothing clobbers it after" {
+    const a = try testAlloc(16);
+    defer a.deinit();
+    const Window = struct {
+        alloc: *BlockAllocator,
+        next: u64 = 4,
+        end: u64 = 8,
+        racer: ?Minted = null,
+        fn mint(ctx: *anyopaque) MintAnswer {
+            const w: *@This() = @ptrCast(@alignCast(ctx));
+            if (w.next >= w.end) return .full;
+            w.next += 1;
+            return .{ .minted = w.next - 1 };
+        }
+        /// The block is back at the window head; another minter takes it
+        /// before the abandoning thread returns (the window's lock is all
+        /// that orders them).
+        fn giveBack(ctx: *anyopaque, idx: u64) bool {
+            const w: *@This() = @ptrCast(@alignCast(ctx));
+            w.next = idx;
+            w.racer = w.alloc.allocateBlock() catch unreachable;
+            return true;
+        }
+        fn remaining(ctx: *anyopaque) u64 {
+            const w: *@This() = @ptrCast(@alignCast(ctx));
+            return w.end - w.next;
+        }
+        fn wantsTopup(_: *anyopaque) bool {
+            return false;
+        }
+        fn noteExhausted(_: *anyopaque) void {}
+        const vtable: GrantSource.VTable = .{ .mint = &mint, .giveBack = &giveBack, .remaining = &remaining, .wantsTopup = &wantsTopup, .noteExhausted = &noteExhausted };
+    };
+    var w: Window = .{ .alloc = a };
+    a.grant_source = .{ .ctx = &w, .vtable = &Window.vtable };
+    const m = try a.allocateBlock();
+    const anomalies = counters.tripwireCount("block_claim_anomalies");
+    var g = MintedBlockGuard.init(a, m);
+    g.abandon();
+    const r = w.racer orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(m.idx, r.idx);
+    try testing.expectEqual(anomalies, counters.tripwireCount("block_claim_anomalies"));
+    try testing.expectEqual(@as(?u32, 1), a.refcount(r.idx));
+    try testing.expectEqual(State.allocated, a.stateOf(r.idx));
+    try testing.expectEqual(@as(?u64, null), a.fillIncarnation(r.idx)); // the racer's DMA is in flight
+    try testing.expect(a.liveIncarnation(r.idx, r.stamp));
+}
+
 test "double release: the second begin_free is refused loud and frees nothing; a double finish is a tripwire" {
     const a = try testAlloc(4);
     defer a.deinit();
@@ -2164,6 +2280,10 @@ test "seams: a grant window is the ONE mint source when armed; a finish-free sin
     g.abandon();
     try testing.expectEqual(@as(u64, 1), w.given_back);
     try testing.expectEqual(State.virgin, a.stateOf(9)); // back in the window: unminted
+    // The abandoned mint is no local lifetime: stable, never a deposit
+    // (the window may return to the holder and another member mint it).
+    try testing.expect(a.fillIncarnation(9) != null);
+    try testing.expect(!a.fillDepositable(9));
     try testing.expectError(error.NotFree, a.allocateSpecificBlock(12)); // Q9: no runtime gap fill on an armed allocator
     a.grant_source = null;
     const Sink = struct {

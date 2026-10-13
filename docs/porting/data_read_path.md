@@ -780,6 +780,10 @@ serve_valid = still(key, before)               // the completion check after the
 * Why finding 17 (`routing.rs:12566–12572`): the put-then-revalidate-then-undo shape exposed its undo window — a blocking-pool deschedule across a W1 patch deposited the dead incarnation and a post-ACK read served it (the ~5 %/run `data_path_correctness` flake).
 * Untracked keys (legacy `…/part_N`, unknown backends) are vacuously valid and never cache-published (`:12486–12489, 5157–5165`).
 * The device leg REFUSES a dead-lifetime key before the DMA (`:4028–4033, 4066–4071`).
+* Port (0003 §V.1): an unstable word means a transition in flight on THIS member only (a freed
+  block's word re-stabilizes when its local lifetime ends); a snapshot of a cell outside a local
+  lifetime with a non-zero word serves on `still` + the binding and deposits into no tier. The
+  packed window leg carries the binding recheck (the reference validated it by the word alone).
 * Waiters re-run `still(key, verdict_word)` at THEIR serve instant (generic/209, `:12392–12416`).
 
 ### 7.2 The binding-validated walk (`get_block_for_index_class`, `:14379–14596`)

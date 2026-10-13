@@ -21,6 +21,7 @@
 //! | 4 `refcount_exactly_one_terminal_release` | two releases from 2 | exactly one observes 1→0 | `release_load_store` |
 //! | 5 `patch_clone_composed_never_mutates_a_validated_pin` | patch retire→fence→peek; clone acquire→fence→snapshot | ¬(pinned ∧ stable ∧ patched); re-stabilized; refcount conserved | `patch_fence`, `clone_fence` (store buffering admits the stale clone) |
 //! | 6 `validated_fill_never_serves_mid_patch_bytes` | in-place two-half patch vs a validated fill | a validated fill never reads a TORN payload | `writer_fence`, `reader_fence` |
+//! | 7 `an_ended_lifetime_never_deposits_under_its_restabilized_word` | free retire→purge→limbo→publish→free list; fill snapshot→payload→still→state→validated insert | a deposit carries its snapshot generation's bytes | `publish_relaxed` |
 
 const std = @import("std");
 const explorer = @import("../model/explorer.zig");
@@ -476,6 +477,129 @@ pub fn PatchCloneModel(comptime weakening: PairWeakening) type {
 }
 
 // ---------------------------------------------------------------------------
+// Model 7: an ENDED lifetime's re-stabilized word against the deposit gate.
+// ---------------------------------------------------------------------------
+
+pub const LifetimeWeakening = enum {
+    none,
+    /// `endLifetime`'s publish without its release: the `limbo` store may
+    /// still sit in the freer's buffer when the stable bit lands.
+    publish_relaxed,
+};
+
+/// The free path of a block whose lifetime held generation-1 bytes —
+/// retire → purge → the `limbo` store (buffered) → the re-stabilizing
+/// publish (an RMW: it drains the buffer) → the free list — against a fill:
+/// snapshot → payload → still → the state load (`fillDepositable`) → the
+/// tiers' insert-time validate (the word under the tier lock). A stable
+/// generation-2 word covers generation-1 bytes by design (no lifetime
+/// runs; the binding proves a serve), so only the deposit gate keeps those
+/// bytes out of the tiers.
+pub fn EndedLifetimeModel(comptime weakening: LifetimeWeakening) type {
+    return struct {
+        const Self = @This();
+        pub const thread_count: usize = 2;
+        const FREER = 0;
+        const FILL = 1;
+        const ALLOCATED = 1;
+        const LIMBO = 2;
+        const FREE = 3;
+
+        word: u8 = 3, // gen 1, stable
+        payload: u8 = 1,
+        state: u8 = ALLOCATED,
+        /// The freer's buffered state store (0 = none).
+        pending_state: u8 = 0,
+        tier: u8 = 0,
+        f_pc: u8 = 0,
+        r_pc: u8 = 0,
+        snap: u8 = 0,
+        seen: u8 = 0,
+        depositable: u8 = 0,
+        deposited: u8 = 0,
+        deposit_gen: u8 = 0,
+
+        pub fn init() Self {
+            return .{};
+        }
+
+        fn drain(self: *Self) void {
+            if (self.pending_state != 0) {
+                self.state = self.pending_state;
+                self.pending_state = 0;
+            }
+        }
+
+        pub fn done(self: *const Self, t: usize) bool {
+            return switch (t) {
+                FREER => self.f_pc == 6,
+                FILL => self.r_pc == 5,
+                else => unreachable,
+            };
+        }
+
+        pub fn step(self: *Self, t: usize) void {
+            switch (t) {
+                FREER => self.stepFreer(),
+                FILL => self.stepFill(),
+                else => unreachable,
+            }
+        }
+
+        fn stepFreer(self: *Self) void {
+            switch (self.f_pc) {
+                0 => self.word = ((self.word >> 1) + 1) << 1, // retire (SeqCst RMW)
+                1 => self.tier = 0, // the ONE purge
+                2 => self.pending_state = LIMBO,
+                3 => {
+                    if (weakening != .publish_relaxed) self.drain();
+                    self.word |= 1;
+                },
+                4 => self.drain(),
+                5 => self.state = FREE, // the free list (after the bit clears)
+                else => unreachable,
+            }
+            self.f_pc += 1;
+        }
+
+        fn stepFill(self: *Self) void {
+            switch (self.r_pc) {
+                0 => {
+                    if (self.word & 1 == 0) {
+                        self.r_pc = 5; // unstable: no fill
+                        return;
+                    }
+                    self.snap = self.word;
+                },
+                1 => self.seen = self.payload,
+                2 => if (self.word != self.snap) {
+                    self.r_pc = 5; // `still` failed
+                    return;
+                },
+                3 => self.depositable = if (self.state == ALLOCATED) 1 else 0,
+                4 => if (self.depositable == 1 and self.word == self.snap) {
+                    self.tier = self.seen;
+                    self.deposited = 1;
+                    self.deposit_gen = self.snap >> 1;
+                },
+                else => unreachable,
+            }
+            self.r_pc += 1;
+        }
+
+        pub fn invariant(self: *const Self) !void {
+            // A deposit carries its snapshot's generation's bytes: never an
+            // ended lifetime's residue under the re-stabilized word.
+            if (self.deposited == 1 and self.seen != self.deposit_gen) return error.DepositedEndedLifetime;
+        }
+
+        pub fn final(self: *const Self) !void {
+            if (self.word != 5 or self.state != FREE or self.pending_state != 0) return error.FreeNotStable;
+        }
+    };
+}
+
+// ---------------------------------------------------------------------------
 // Tests: every model holds; every recorded weakening fails.
 // ---------------------------------------------------------------------------
 
@@ -511,6 +635,11 @@ test "6 incarnation_validated_fill_never_serves_mid_patch_bytes — holds; both 
     try explorer.expectHolds(FillModel(.{ .cycles = 1, .halves = 2 }), .{});
     try explorer.expectFails(FillModel(.{ .cycles = 1, .halves = 2, .weakening = .writer_fence }), .{}, error.InvariantViolated);
     try explorer.expectFails(FillModel(.{ .cycles = 1, .halves = 2, .weakening = .reader_fence }), .{}, error.InvariantViolated);
+}
+
+test "7 an_ended_lifetime_never_deposits_under_its_restabilized_word — holds; a publish without its release fails" {
+    try explorer.expectHolds(EndedLifetimeModel(.none), .{});
+    try explorer.expectFails(EndedLifetimeModel(.publish_relaxed), .{}, error.InvariantViolated);
 }
 
 test "state counts: the models are small enough to re-run on every gate" {

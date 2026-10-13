@@ -854,6 +854,21 @@ pub const ReadPath = struct {
         return a.fillIncarnationStill(key.blockIdx(self.stride()), before);
     }
 
+    /// A validated fill may deposit into the tiers (`fillDepositable`): a
+    /// block outside this member's lifetimes serves binding-validated and
+    /// stays out of every tier.
+    fn depositable(self: *ReadPath, key: BlockKey) bool {
+        const a = self.allocatorOf(key) orelse return true;
+        return a.fillDepositable(key.blockIdx(self.stride()));
+    }
+
+    /// The deposit-only paths' snapshot (the hold-serve ceremony, a
+    /// victim's dehydration): null unless stable AND depositable.
+    fn depositIncarnation(self: *ReadPath, key: BlockKey) ?u64 {
+        const before = self.fillIncarnation(key) orelse return null;
+        return if (self.depositable(key)) before else null;
+    }
+
     /// The warm ladder's direct-leg pair: the pre-DMA snapshot (null =
     /// unstable: never DMA) and the post-DMA `still`.
     pub fn incarnationSnapshot(self: *ReadPath, key: BlockKey) ?u64 {
@@ -924,7 +939,7 @@ pub const ReadPath = struct {
         const n = switch (info.kind) {
             .inline_ => self.readInline(ino, offset, out),
             .staged => try self.readStaged(io, ino, info, offset, out),
-            .packed_ => try self.readPacked(ino, info, offset, out),
+            .packed_ => try self.readPacked(io, ino, info, offset, out),
             .striped => try self.readStriped(io, ino, info, offset, out, dest, flags),
         };
         stats.read_user_bytes.add(n);
@@ -961,10 +976,14 @@ pub const ReadPath = struct {
             }
             if (cur.durable_copy) |m| {
                 // ONE ranged routed window on the mapping's own volume.
-                const n = try self.readMappingWindow(m, offset, out);
+                const got = try self.readMappingWindow(m, offset, out);
                 // Still bound to this identity after the bytes are in hand?
                 const fresh = self.meta.file(self.meta.ctx, ino) orelse return error.FileNotFound;
-                if (fresh.kind == .staged and std.mem.eql(u8, &fresh.file_id, &cur.file_id) and fresh.durable_copy != null and fresh.durable_copy.?.eql(m)) return n;
+                if (fresh.kind == .staged and std.mem.eql(u8, &fresh.file_id, &cur.file_id) and fresh.durable_copy != null and fresh.durable_copy.?.eql(m)) switch (got) {
+                    .served => |n| return n,
+                    .corrupt => return error.InputOutput,
+                    .moved => {},
+                };
                 stats.staged_identity_retries.inc();
                 cur = fresh;
                 if (cur.kind != .staged) return self.read(io, ino, offset, out.len, .{ .buf = out }, .{});
@@ -982,21 +1001,28 @@ pub const ReadPath = struct {
         return error.InputOutput;
     }
 
+    /// A window read's verdict before the caller's binding recheck: the
+    /// bytes; `moved` — the block's word moved under the read (a local
+    /// claim or free: the mapping was stale); `corrupt` — the frame did
+    /// not decode (a stale mapping's foreign bytes, or a real corruption
+    /// when the binding stands).
+    const WindowRead = union(enum) { served: usize, moved, corrupt };
+
     /// A packed tenant / durable copy: the window on the mapping's OWN
     /// volume through the ONE choke point. The window law runs under the
     /// volume's stride (`chunk` on a transformed volume: a tenant's block
     /// offset is a chunk multiple, and `block_size` refused every block
     /// past index 0 as a window-law breach); a transformed tenant is ONE
     /// frame, decoded whole on this lane's codec before the slice.
-    fn readMappingWindow(self: *ReadPath, m: Mapping, rel_start: u64, out: []u8) Error!usize {
+    fn readMappingWindow(self: *ReadPath, m: Mapping, rel_start: u64, out: []u8) Error!WindowRead {
         const key = BlockKey.fromMapping(m);
         if (self.decode) |d| return self.readMappingFramed(d, m, key, rel_start, out);
         const w = m.readWindow(self.stride(), .{ .start = rel_start, .end = rel_start + out.len }) catch return error.InputOutput;
-        const before = self.fillIncarnation(key) orelse return error.InputOutput;
+        const before = self.fillIncarnation(key) orelse return .moved;
         const got = w.hi - w.lo;
         if (got == 0) {
             @memset(out, 0);
-            return out.len;
+            return .{ .served = out.len };
         }
         // The window into a bounce (≤ 64 KiB slab, else the fill pool), then the slice.
         const b = try self.acquireBounce(w.len);
@@ -1005,11 +1031,11 @@ pub const ReadPath = struct {
             stats.read_fill_dma_bytes.add(w.len);
             stats.read_dma_window_bytes.add(w.len);
         }
-        if (!self.still(key, before)) return error.InputOutput;
+        if (!self.still(key, before)) return .moved;
         @memcpy(out[0..got], b.bytes[w.lo..w.hi]);
         @memset(out[got..], 0);
         stats.read_copy_dest_bytes.add(out.len);
-        return out.len;
+        return .{ .served = out.len };
     }
 
     /// The transformed tenant: the stored frame `[rel_off, rel_off +
@@ -1017,31 +1043,51 @@ pub const ReadPath = struct {
     /// decoded into a fill-pool slot (≥ `scratchLen` = the chunk), then
     /// `[rel_start, rel_start + out.len)` of the plaintext; past its end,
     /// zeros (the entry already clipped the request to the file size).
-    fn readMappingFramed(self: *ReadPath, d: Decode, m: Mapping, key: BlockKey, rel_start: u64, out: []u8) Error!usize {
+    fn readMappingFramed(self: *ReadPath, d: Decode, m: Mapping, key: BlockKey, rel_start: u64, out: []u8) Error!WindowRead {
         const w = m.readWindow(d.chunk, null) catch return error.InputOutput;
-        const before = self.fillIncarnation(key) orelse return error.InputOutput;
+        const before = self.fillIncarnation(key) orelse return .moved;
         const img = try self.acquireBounce(w.len);
         defer self.releaseBounce(img);
         if (try self.vols.read_range(self.vols.ctx, w.vol_tag, w.device_off, img.bytes[0..@intCast(w.len)], .pooled) == .dma) {
             stats.read_fill_dma_bytes.add(w.len);
             stats.read_dma_window_bytes.add(w.len);
         }
-        if (!self.still(key, before)) return error.InputOutput;
+        if (!self.still(key, before)) return .moved;
         const target = try self.acquireBounce(self.pool.slot_size);
         defer self.releaseBounce(target);
-        const view = d.decode(d.ctx, img.bytes[0..@intCast(w.len)], target.bytes) catch return error.InputOutput;
+        const view = d.decode(d.ctx, img.bytes[0..@intCast(w.len)], target.bytes) catch return .corrupt;
         const start: usize = @intCast(@min(rel_start, view.len));
         const end: usize = @intCast(@min(rel_start + out.len, view.len));
         @memcpy(out[0 .. end - start], view[start..end]);
         @memset(out[end - start ..], 0);
         stats.read_copy_dest_bytes.add(out.len);
-        return out.len;
+        return .{ .served = out.len };
     }
 
-    fn readPacked(self: *ReadPath, ino: u64, info: FileInfo, offset: u64, out: []u8) Error!usize {
-        _ = ino;
-        const m = info.durable_copy orelse return error.InputOutput;
-        return self.readMappingWindow(m, offset, out);
+    /// A packed tenant: the window, then the binding recheck — the same
+    /// mapping still current AFTER the bytes are in hand (the module's (a)
+    /// ∧ (b): a freed block's word is stable once its lifetime ended, and
+    /// another member's tenant lives in a block this member's word never
+    /// ledgered, so the incarnation alone proves nothing). A move
+    /// re-resolves (`stale_binding_rebinds`); a kind change re-enters.
+    fn readPacked(self: *ReadPath, io: Io, ino: u64, info: FileInfo, offset: u64, out: []u8) Error!usize {
+        var cur = info;
+        var attempt: u32 = 0;
+        while (attempt < IDENTITY_LOOP) : (attempt += 1) {
+            const m = cur.durable_copy orelse return error.InputOutput;
+            const got = try self.readMappingWindow(m, offset, out);
+            const fresh = self.meta.file(self.meta.ctx, ino) orelse return error.FileNotFound;
+            if (fresh.kind == .packed_ and fresh.durable_copy != null and fresh.durable_copy.?.eql(m)) switch (got) {
+                .served => |n| return n,
+                .corrupt => return error.InputOutput,
+                .moved => {},
+            };
+            stats.stale_binding_rebinds.inc();
+            cur = fresh;
+            if (cur.kind != .packed_) return self.read(io, ino, offset, out.len, .{ .buf = out }, .{});
+        }
+        log.err("read of ino {d}: the packed tenant kept moving across {d} re-resolves", .{ ino, IDENTITY_LOOP });
+        return error.InputOutput;
     }
 
     const Bounce = struct { bytes: []align(fill_pool.SLOT_ALIGN) u8, pool: *fill_pool.Pool, slot: u32 };
@@ -1664,8 +1710,11 @@ pub const ReadPath = struct {
         const is_tracked = self.tracked(key);
         var serve_valid = !is_tracked;
         var publishable: ?u64 = null;
+        // A block outside this member's lifetimes serves on its `still`
+        // (the caller's binding recheck is the proof) and deposits nowhere.
+        var undeposited: ?u64 = null;
         if (before) |bf| if (self.still(key, bf)) {
-            publishable = bf;
+            if (self.depositable(key)) publishable = bf else undeposited = bf;
         };
         var publish_to_nvme = false;
         var still_ctx: StillCtx = .{ .rp = self, .key = key, .before = publishable orelse 0 };
@@ -1701,8 +1750,9 @@ pub const ReadPath = struct {
             pc.mark(&stats.read_fill_admission_ns);
             pc.mark(&stats.read_fill_deposit_ns);
         }
+        if (undeposited != null) serve_valid = true;
         blk.serve_valid = serve_valid;
-        const verdict: ?u64 = if (serve_valid) publishable else null;
+        const verdict: ?u64 = if (serve_valid) publishable orelse undeposited else null;
         // The cohort is served from the carried result; the publish rides.
         if (publish_to_nvme) g.hold(io);
         g.publish(io, .{ .slot = if (blk.where == .pool) blk.slot else null, .len = blk.len, .serve_valid = serve_valid, .verdict_word = verdict });
@@ -1729,7 +1779,7 @@ pub const ReadPath = struct {
     /// paid, so it runs the admission arm — no `noteForeground` (zero device
     /// bytes), no re-deposit.
     fn holdServeAdmission(self: *ReadPath, key: BlockKey, slot: u32, len: u32, class: FillClass, now: u64) void {
-        const before = self.fillIncarnation(key) orelse return;
+        const before = self.depositIncarnation(key) orelse return;
         if (!self.still(key, before)) return;
         stats.hold_serve_admissions.inc();
         const decision = self.adm.decideFill(key, len, class, now);
@@ -1770,7 +1820,7 @@ pub const ReadPath = struct {
     /// A validated publish of a victim: the CURRENT stable word is the
     /// fill's (a retire would have purged the entry through the ONE purge).
     fn dehydrate(self: *ReadPath, key: BlockKey, data: []const u8) void {
-        const before = self.fillIncarnation(key) orelse return;
+        const before = self.depositIncarnation(key) orelse return;
         var still_ctx: StillCtx = .{ .rp = self, .key = key, .before = before };
         _ = self.nvme.putValidated(key, data, before, .{ .ctx = &still_ctx, .call = &stillValidate }, self.publishPaused());
     }
@@ -1876,6 +1926,9 @@ const Fixture = struct {
     device_reads: Atomic(u64) = .init(0),
     device_read_bytes: Atomic(u64) = .init(0),
     fail_reads: Atomic(u32) = .init(0),
+    /// Runs after a device read lands its bytes (a mutation between the
+    /// DMA and the read path's recheck).
+    after_read: ?*const fn (*Fixture) void = null,
     rp: *ReadPath = undefined,
 
     pub fn init(gpa: Allocator, cfg_over: struct { passthrough: bool = true, ranged_threshold: u64 = 256 * derive.KiB, direct_device_true: bool = false, read_lane: bool = true, rebind_cap: u32 = MAX_REBINDS, hot_budget: u64 = 4 * bs, policy: admission.Policy = .second_touch, compression: ?transform.Compression = null }) !*Fixture {
@@ -1940,6 +1993,13 @@ const Fixture = struct {
     /// Bind block `b` to device block `dev_idx` (published stable).
     pub fn bind(self: *Fixture, b: usize, dev_idx: u64) void {
         self.bindings[b] = Mapping.wholeBlock(vol_tag, dev_idx * self.chunk, 1);
+        self.mint(dev_idx);
+    }
+
+    /// `dev_idx` as THIS member's minted, published block (claimed once:
+    /// a local lifetime, so its fills deposit).
+    pub fn mint(self: *Fixture, dev_idx: u64) void {
+        if (self.alloc.stateOf(dev_idx) != .allocated) _ = self.alloc.allocateSpecificBlock(dev_idx) catch unreachable;
         self.alloc.publishBlock(dev_idx);
     }
 
@@ -2007,6 +2067,7 @@ const Fixture = struct {
         _ = self.device_reads.fetchAdd(1, .monotonic);
         _ = self.device_read_bytes.fetchAdd(dest.len, .monotonic);
         @memcpy(dest, self.device[@intCast(device_off)..][0..dest.len]);
+        if (self.after_read) |f| f(self);
         return .dma;
     }
     fn volFd(_: *anyopaque, _: u64) ?std.os.linux.fd_t {
@@ -2441,7 +2502,7 @@ test "the device-read ledger: every READ-side DMA byte lands in exactly one PURP
     // A packed tenant's window.
     f.kind = .packed_;
     f.bindings[0] = Mapping.tenant(Fixture.vol_tag, 5 * Fixture.bs, 1, 4096, 300);
-    f.alloc.publishBlock(5);
+    f.mint(5);
     f.size = 300;
     _ = try f.rp.read(io, 8, 0, 300, .{ .buf = buf[0..300] }, .{});
     l = DmaLedger.snap();
@@ -2673,7 +2734,7 @@ test "inline and packed layouts: inline from the record zero-padded; a packed te
     f.kind = .packed_;
     f.size = 6000;
     f.bindings[0] = Mapping.tenant(Fixture.vol_tag, 1 * Fixture.bs, 1, 8192, 6000);
-    f.alloc.publishBlock(1);
+    f.mint(1);
     var out: [1000]u8 = undefined;
     const m = try f.rp.read(io, 7, 5000, 1000, .{ .buf = &out }, .{});
     try testing.expectEqual(@as(usize, 1000), m);
@@ -2702,7 +2763,7 @@ test "a packed tenant on a TRANSFORMED volume: the window law runs under the chu
     f.kind = .packed_;
     f.size = plain.len;
     f.bindings[0] = Mapping.tenant(Fixture.vol_tag, 3 * f.chunk, 1, 8192, @intCast(img.len));
-    f.alloc.publishBlock(3);
+    f.mint(3);
     const before = layout.stats.packed_mapping_refusals.load();
     var out: [1000]u8 = undefined;
     try testing.expectEqual(@as(usize, 1000), try f.rp.read(io, 7, 5000, 1000, .{ .buf = &out }, .{}));
@@ -2713,6 +2774,79 @@ test "a packed tenant on a TRANSFORMED volume: the window law runs under the chu
     // raw grain of ciphertext.
     try testing.expectEqual(2 * layout.ceilGrain(@intCast(img.len)), f.device_read_bytes.load(.monotonic));
     try testing.expectEqual(before, layout.stats.packed_mapping_refusals.load());
+}
+
+test "two members over one volume: blocks THIS member freed and ANOTHER member re-minted (a wrapped carve, its lifetime on its own allocator) serve here byte-exact — each of its 8 packed tenants and its striped block whole and ranged; never EIO, never a tier deposit, no settle tripwire" {
+    const io = testing.io;
+    const f = try Fixture.init(testing.allocator, .{});
+    defer f.deinit();
+    const b_alloc = try block_alloc.BlockAllocator.init(testing.allocator, .{ .vol_tag = Fixture.vol_tag, .vol = 0, .block_size = Fixture.bs, .capacity_bytes = Fixture.dev_blocks * Fixture.bs });
+    defer b_alloc.deinit();
+    // A minted blocks 5 and 6 for files of its own and deleted them.
+    for ([_]u64{ 5, 6 }) |idx| {
+        _ = try f.alloc.allocateSpecificBlock(idx);
+        f.alloc.publishBlock(idx);
+        try testing.expectEqual(block_alloc.BeginFree.terminal, try f.alloc.freeBlock(idx));
+    }
+    // B's grant wrapped onto them: B packs 8 tenants into block 5 and
+    // writes block 6 whole, minted and published on B's allocator.
+    const pack = try b_alloc.allocateSpecificBlock(5);
+    b_alloc.publishBlock(5);
+    const own = try b_alloc.allocateSpecificBlock(6);
+    b_alloc.publishBlock(6);
+    const buf = try alignedBuf(testing.allocator, 1 << 20);
+    defer testing.allocator.free(buf);
+    const settle0 = stats.read_settle_lost_serialized.load();
+    const tenant_len: u32 = 100_000;
+    const tenant_slot: u64 = 128 * derive.KiB;
+    f.kind = .packed_;
+    f.size = tenant_len;
+    for (0..8) |i| {
+        f.bindings[0] = Mapping.tenant(Fixture.vol_tag, 5 * Fixture.bs, pack.stamp, @intCast(i * tenant_slot), tenant_len);
+        try testing.expectEqual(@as(usize, tenant_len), try f.rp.read(io, 7, 0, tenant_len, .{ .buf = buf[0..tenant_len] }, .{}));
+        try Fixture.expected(5 * Fixture.bs + i * tenant_slot, buf[0..tenant_len]);
+    }
+    f.kind = .striped;
+    f.size = Fixture.bs;
+    f.bindings[0] = Mapping.wholeBlock(Fixture.vol_tag, 6 * Fixture.bs, own.stamp);
+    const key6 = BlockKey.init(Fixture.vol_tag, 6 * Fixture.bs);
+    try testing.expectEqual(@as(usize, 1 << 20), try f.rp.read(io, 7, 0, 1 << 20, .{ .buf = buf }, .{}));
+    try Fixture.expected(6 * Fixture.bs, buf);
+    try testing.expectEqual(@as(usize, 4096), try f.rp.read(io, 7, 64 * 4096, 4096, .{ .buf = buf[0..4096] }, .{}));
+    try Fixture.expected(6 * Fixture.bs + 64 * 4096, buf[0..4096]);
+    // Never deposited: the next whole read fetches again.
+    try testing.expect(!f.rp.hot.contains(key6) and !f.rp.hold.contains(key6) and !f.rp.nvme.has(key6));
+    const reads0 = f.device_reads.load(.monotonic);
+    try testing.expectEqual(@as(usize, 1 << 20), try f.rp.read(io, 7, 0, 1 << 20, .{ .buf = buf }, .{}));
+    try Fixture.expected(6 * Fixture.bs, buf);
+    try testing.expectEqual(reads0 + 1, f.device_reads.load(.monotonic));
+    try testing.expectEqual(settle0, stats.read_settle_lost_serialized.load());
+}
+
+test "a packed tenant whose binding moves between its window DMA and the recheck re-resolves: the old tenant's bytes are never served (the read path's (a) ∧ (b) on the window leg)" {
+    const io = testing.io;
+    const f = try Fixture.init(testing.allocator, .{});
+    defer f.deinit();
+    f.kind = .packed_;
+    f.size = 6000;
+    f.bindings[0] = Mapping.tenant(Fixture.vol_tag, 1 * Fixture.bs, 1, 0, 6000);
+    f.mint(1);
+    f.mint(2);
+    const Move = struct {
+        var moves: u32 = 0;
+        fn run(fx: *Fixture) void {
+            if (moves == 0) return;
+            moves -= 1;
+            fx.bindings[0] = Mapping.tenant(Fixture.vol_tag, 2 * Fixture.bs, 1, 8192, 6000);
+        }
+    };
+    Move.moves = 1;
+    f.after_read = &Move.run;
+    const rebinds0 = stats.stale_binding_rebinds.load();
+    var out: [6000]u8 = undefined;
+    try testing.expectEqual(@as(usize, 6000), try f.rp.read(io, 7, 0, 6000, .{ .buf = &out }, .{}));
+    try Fixture.expected(2 * Fixture.bs + 8192, &out);
+    try testing.expectEqual(rebinds0 + 1, stats.stale_binding_rebinds.load());
 }
 
 test "the write side outranks every tier: an overlay serve returns its bytes; full extent runs serve without a base; partial runs compose over the fetched base; a staged custody block serves from the ring" {
@@ -2871,6 +3005,8 @@ const DeviceFixture = if (builtin.os.tag == .linux) struct {
 
     fn bind(self: *DeviceFixture, b: usize, dev_idx: u64) void {
         self.bindings[b] = Mapping.wholeBlock(vol_tag, dev_idx * bs, 1);
+        // This member's minted block: a local lifetime, so its fills deposit.
+        if (self.alloc.stateOf(dev_idx) != .allocated) _ = self.alloc.allocateSpecificBlock(dev_idx) catch unreachable;
         self.alloc.publishBlock(dev_idx);
     }
 

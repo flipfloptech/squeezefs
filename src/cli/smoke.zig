@@ -7765,6 +7765,18 @@ fn mergedPackScript(gpa: std.mem.Allocator, dir: []const u8, base_skip: usize) !
     return w.toOwnedSlice();
 }
 
+/// `sha256sum -c` of the row's `<sha>` list minus the rm'd `f0` through
+/// the mount at `mp`; the row fails with the reader's lines on a mismatch.
+fn mergedPackReadOn(rig: *Rig, mp: []const u8, who: []const u8, sha: []const u8) !void {
+    const gpa = rig.gpa;
+    const r = try std.process.run(gpa, rig.io, .{ .argv = &.{ "sh", "-c", "grep -v '/f0$' \"$1/$2\" | sha256sum --quiet -c - 2>&1 && echo ok", "smoke", rig.work, sha }, .cwd = .{ .path = mp }, .environ_map = &rig.env });
+    defer gpa.free(r.stdout);
+    defer gpa.free(r.stderr);
+    if (!std.mem.eql(u8, r.stdout, "ok\n")) std.debug.print("--- {s} reads the packed tenants of {s} ---\n{s}{s}\n", .{ who, sha, r.stdout, r.stderr });
+    try testing.expectEqualStrings("ok\n", r.stdout);
+    std.debug.print("smoke[merged-census]: {s}: {d} packed tenant(s) of {s} sha-equal\n", .{ who, merged_pack_files - 1, sha });
+}
+
 test "smoke: THE FLEET'S MERGED BLOCK CENSUS — mount A + B JOINED with the fleet on and B under the `SQUEEZEFS_TEST_SHIP_EVERY_FREE` seam (the reference's shape, 0002 row 500): B promotes 8 staged files into ONE pack by the fsync lever, `rm`s one tenant → the NONTERMINAL free ships to A, whose untracked arm frees and punches the pack under B's 7 live tenants (A: punches +1) → `fsck --online <A>` REPORTS it: B's custody census rides its proposal, the coordinator's merged lost arm names the freed-while-referenced block and its tenant, confirmed by a second census round (C2 lost, exit 1) → B remounted (its caches gone): the 7 tenants read back WRONG off the device → the seam OFF: the same `rm` stays local (A: punches unchanged), B remounted reads its 7 tenants sha-equal, `fsck --online` 0 findings" {
     const io = testing.io;
     if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
@@ -7887,6 +7899,9 @@ test "smoke: THE FLEET'S MERGED BLOCK CENSUS — mount A + B JOINED with the fle
         try testing.expectEqual(@as(u8, 0), got.code);
         try testing.expect(got.report.counters.block_plane_member_bindings >= merged_pack_files - 1);
     }
+    // A reader on any member reads any member's committed file: A (the
+    // manager) reads B's seven remaining packed tenants while B is live.
+    try mergedPackReadOn(rig, rig.mp, "A while B is live", "fixed.sha");
     // B remounted once more: the fixed tenants intact on the device.
     try b.umount();
     try b.expectCleanExit("B's unmount after the fixed arm");

@@ -87,6 +87,13 @@ insert `{STABLE_FIRST, NONE}` (`BA:L1571-1583`); `fill_incarnation(offset)` = `s
 cell ⇒ `Some(UNKNOWN_STABLE)` (`BA:L1718-1726`); `fill_incarnation_still(offset, before)` =
 `still`, absent cell ⇒ `before == UNKNOWN_STABLE` (`BA:L1730-1738`).
 
+**Port divergence (decision 0002 row 510, 0003 §V.1):** the reference leaves a freed offset's
+word unstable until this process re-mints it; on a set another member re-mints it from a wrapped
+carve and this member's reads of it refused forever. The port's `endLifetime` re-stabilizes the
+word under the retired generation at the free-list publication (before the bit clears) and at a
+give-back (before the window takes the block back); `fillDepositable` keeps a cell outside a
+local lifetime with a non-zero word out of every read tier.
+
 Refcount cell protocol (`RC:L1-62`): `peek` = `load(Acquire)` (`RC:L25-32`); `try_acquire` = CAS
 loop from NONZERO only (`AcqRel`/`Acquire`), `false` at 0 (`RC:L34-46`); `release` = CAS loop,
 `true` exactly on the 1→0 transition, saturates at 0 (`RC:L48-62`). `cross_word_fence()` =

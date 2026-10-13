@@ -95,11 +95,11 @@ src/core/thread_name.zig:41 | 15 | OWED: derive it or document it on the line (c
 src/data/block_alloc.zig:659 | 64 | a percentage — OWED: derive it (charter §1.5) or document the measured reason
 src/data/block_alloc.zig:686 | 64 | OWED: derive it or document it on the line (charter §1.5)
 src/data/block_alloc.zig:688 | 64 | OWED: derive it or document it on the line (charter §1.5)
-src/data/block_alloc.zig:1288 | 64 | OWED: derive it or document it on the line (charter §1.5)
-src/data/block_alloc.zig:1436 | 64 | a percentage — OWED: derive it (charter §1.5) or document the measured reason
-src/data/block_alloc.zig:1436 | 64 | a percentage — OWED: derive it (charter §1.5) or document the measured reason
-src/data/block_alloc.zig:1503 | 64 | OWED: derive it or document it on the line (charter §1.5)
-src/data/block_alloc.zig:1503 | 64 | OWED: derive it or document it on the line (charter §1.5)
+src/data/block_alloc.zig:1329 | 64 | OWED: derive it or document it on the line (charter §1.5)
+src/data/block_alloc.zig:1477 | 64 | a percentage — OWED: derive it (charter §1.5) or document the measured reason
+src/data/block_alloc.zig:1477 | 64 | a percentage — OWED: derive it (charter §1.5) or document the measured reason
+src/data/block_alloc.zig:1544 | 64 | OWED: derive it or document it on the line (charter §1.5)
+src/data/block_alloc.zig:1544 | 64 | OWED: derive it or document it on the line (charter §1.5)
 src/data/device_overlay.zig:259 | 64 | a percentage — OWED: derive it (charter §1.5) or document the measured reason
 src/data/device_overlay.zig:259 | 64 | a percentage — OWED: derive it (charter §1.5) or document the measured reason
 src/data/extent_overlay.zig:522 | 8 | OWED: derive it or document it on the line (charter §1.5)
@@ -144,7 +144,7 @@ src/data/prefetch.zig:499 | 4 | OWED: derive it or document it on the line (char
 src/data/prefetch.zig:563 | 8 | OWED: derive it or document it on the line (charter §1.5)
 src/data/read_path.zig:135 | 512 | OWED: derive it or document it on the line (charter §1.5)
 src/data/read_path.zig:135 | 64 | OWED: derive it or document it on the line (charter §1.5)
-src/data/read_path.zig:955 | 4 | a timing/retry constant — OWED: its measured WHY on the line or a derivation (charter §1.5)
+src/data/read_path.zig:970 | 4 | a timing/retry constant — OWED: its measured WHY on the line or a derivation (charter §1.5)
 src/data/router.zig:165 | 1_000_000 | OWED: derive it or document it on the line (charter §1.5)
 src/data/set_config.zig:253 | 8 | OWED: derive it or document it on the line (charter §1.5)
 src/data/set_config.zig:415 | 20 | a size — OWED: derive from derive.Facts or document the physical/format reason

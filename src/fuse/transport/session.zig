@@ -1734,6 +1734,7 @@ const Snapshot = struct {
     unparked: u64,
     abandoned: u64,
     overflows: u64,
+    ticks: u64,
     commit_rescues: u64,
     cqe_rescues: u64,
     writes: u64,
@@ -1807,6 +1808,7 @@ const Snapshot = struct {
             .unparked = slot.unparked_commits.load(),
             .abandoned = slot.requests_abandoned.load(),
             .overflows = worker.cq_overflows.load(),
+            .ticks = worker.park_backstop_ticks.load(),
             .commit_rescues = worker.park_tick_commit_rescues.load(),
             .cqe_rescues = worker.park_tick_cqe_rescues.load(),
             .writes = slot.wake_writes.load(),
@@ -2206,6 +2208,41 @@ test "e2e: a 10 s random-op storm from 4 threads never needs the 100 ms backstop
     const elided = after.elided - before.elided;
     std.debug.print("\nstorm: {d} syscalls, {d} ring requests, {d} enters ({d}.{d:0>2} per request), wake writes {d} / elided {d} ({d} % elided), backstop ticks {d}, rescues {d}/{d}\n", .{ ops.load(.monotonic), reqs, after.enters - before.enters, (after.enters - before.enters) / @max(reqs, 1), ((after.enters - before.enters) * 100 / @max(reqs, 1)) % 100, writes, elided, elided * 100 / @max(writes + elided, 1), worker.park_backstop_ticks.load(), after.commit_rescues - before.commit_rescues, after.cqe_rescues - before.cqe_rescues });
     try testing.expect(writes + elided >= after.replies - before.replies - (after.serves - before.serves));
+}
+
+test "e2e: a completion that lands after a backstop tick's timeout and before the worker's re-check (the seam holds the worker between the two) is a LATE arrival — the kernel's -ETIME says the CQ was empty when the wait gave up — never a lost wake: the must-stay-0 rescue ledger does not count it" {
+    if (venueMissing()) |why| return testkit.skipWhy(@src(), why);
+    const rig = try Rig.init(testing.allocator, 10, &.{});
+    defer rig.deinit();
+    const s = try rig.mountIt(.{ .mem_budget_bytes = 0 });
+    var pb: [256]u8 = undefined;
+    const Helper = struct {
+        fn run(path: [*:0]const u8, result: *anyerror!usize) void {
+            var buf: [64]u8 = undefined;
+            result.* = readWhole(path, &buf);
+        }
+    };
+    var result: anyerror!usize = 0;
+    const t = try std.Thread.spawn(.{}, Helper.run, .{ rig.child(&pb, "park").ptr, &result });
+    // The handler parks on its lane: its group owes a reply, so its worker
+    // parks bounded by the backstop.
+    const deadline = clock.monotonicNs() + 5 * std.time.ns_per_s;
+    while (rig.fs.parked_readers.load(.monotonic) == 0 and clock.monotonicNs() < deadline) std.Thread.yield() catch {};
+    try testing.expectEqual(@as(u32, 1), rig.fs.parked_readers.load(.monotonic));
+    const before = Snapshot.take();
+    // The next tick spends the seam and holds its worker before the reap.
+    s.shared.tick_await_cqe_remaining.store(1, .release);
+    while (s.shared.tick_await_cqe_remaining.load(.acquire) != 0 and clock.monotonicNs() < deadline + 5 * std.time.ns_per_s) std.Thread.yield() catch {};
+    try testing.expectEqual(@as(u32, 0), s.shared.tick_await_cqe_remaining.load(.acquire));
+    // The reply's wake READ completes now — after the tick's timeout,
+    // before the worker's reap.
+    rig.fs.releaseParked();
+    t.join();
+    _ = try result;
+    const after = Snapshot.take();
+    try testing.expect(after.ticks > before.ticks);
+    try testing.expectEqual(before.cqe_rescues, after.cqe_rescues);
+    try testing.expectEqual(before.commit_rescues, after.commit_rescues);
 }
 
 test "e2e: the REGISTER refusal seam — the first 5 pushes are refused, back off 1 ms doubling, every ent is eventually registered, nothing retires, the mount arms and serves" {

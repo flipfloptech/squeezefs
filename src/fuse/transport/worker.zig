@@ -539,6 +539,9 @@ pub const Shared = struct {
     /// pipe with no writer (`stall_pipe[0]`) and never complete.
     bridge_stall_remaining: std.atomic.Value(u32) = .init(0),
     stall_pipe: [2]linux.fd_t = .{ -1, -1 },
+    /// Test seam (in-process; the late-completion pin): the next N backstop
+    /// ticks hold their worker in an unbounded park before the reap.
+    tick_await_cqe_remaining: std.atomic.Value(u32) = .init(0),
     /// Error logs each worker thread expects in a test (`log.testing`).
     test_error_logs: usize = 0,
 
@@ -1961,6 +1964,7 @@ pub const Group = struct {
                 if (verdict == .tick and backstop != null and (retry_left == null or backstop.? <= retry_left.?)) {
                     park_backstop_ticks.inc();
                     self.tick_rescue_pending = true;
+                    self.tickAwaitSeam();
                 }
             }
             if (self.ring.isDead()) {
@@ -1971,6 +1975,19 @@ pub const Group = struct {
             self.reap();
             // 16. Backoff retries due.
             self.pushRetriesDue();
+        }
+    }
+
+    /// The late-completion seam (`Shared.tick_await_cqe_remaining`): while
+    /// it has ticks left, a tick parks unbounded until a completion lands —
+    /// the worker descheduled between its timed-out enter and its reap.
+    fn tickAwaitSeam(self: *Group) void {
+        var left = self.shared.tick_await_cqe_remaining.load(.monotonic);
+        while (left > 0) {
+            left = self.shared.tick_await_cqe_remaining.cmpxchgWeak(left, left - 1, .acq_rel, .monotonic) orelse {
+                _ = self.park(null);
+                return;
+            };
         }
     }
 

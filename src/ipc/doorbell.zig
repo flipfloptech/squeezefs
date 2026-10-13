@@ -415,6 +415,11 @@ test "submit doorbell: the bump is paid every time; the wake only while the daem
     var h: SessionHeader = .{ .geometry = layout.Geometry.default };
     try testing.expect(!ringSubmit(&h));
     try testing.expectEqual(@as(u32, 1), h.doorbell.load(.monotonic));
+    // A parked daemon's wake is a Linux futex syscall: elsewhere the raw
+    // trap is some other host's syscall, chosen by whatever a previous test
+    // left in its number register (SIGSYS under one shard plan, a pass under
+    // another).
+    if (@import("builtin").os.tag != .linux) return testkit.skip(@src(), .no_linux, "doorbell: the parked daemon's wake is a Linux futex");
     h.daemon_parked.store(1, .seq_cst);
     try testing.expect(ringSubmit(&h));
     try testing.expectEqual(@as(u32, 2), h.doorbell.load(.monotonic));
@@ -429,12 +434,14 @@ test "service park: arm sets every parked flag then snapshots; a submission afte
     try testing.expectEqual(@as(u32, 1), a.daemon_parked.load(.monotonic));
     try testing.expectEqual(@as(u32, 1), b.daemon_parked.load(.monotonic));
     try testing.expect(!park.anyMoved());
+    try testing.expectEqual(@as(u64, 5 * std.time.ns_per_ms), SERVICE_PARK_MAX_NS);
+    // The submission wakes the parked owner: a Linux futex (the submit test's note).
+    if (@import("builtin").os.tag != .linux) return testkit.skip(@src(), .no_linux, "doorbell: the parked daemon's wake is a Linux futex");
     try testing.expect(ringSubmit(&b));
     try testing.expect(park.anyMoved());
     park.disarm();
     try testing.expectEqual(@as(u32, 0), a.daemon_parked.load(.monotonic));
     try testing.expectEqual(@as(u32, 0), b.daemon_parked.load(.monotonic));
-    try testing.expectEqual(@as(u64, 5 * std.time.ns_per_ms), SERVICE_PARK_MAX_NS);
 }
 
 test "service park on Linux: a parked owner is woken by a client's submit on ANY owned session within the bound" {

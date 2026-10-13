@@ -474,3 +474,91 @@ matrix, kill rows (a) on daemon B's `kmbuf ring registration ENOMEM
   alone (`docs/gates/release.md`'s "written by hand before the act" no longer
   applies to this fixture; `wire.zig`'s and `version.zig`'s "today's set is
   {1}" pins stay the act's deliberate edits).
+
+## 10. Rung 10 — the gate's three intermittent rows (2026-10-13)
+
+Each row was red in another agent's gate on a change that did not touch
+it; the release gate's three-consecutive-runs rule (charter §11) cannot
+hold with any of them. Each was reproduced, attributed (the test's
+schedule or the product), pinned red where the window can be held, fixed,
+and looped under an 8- or 16-way `yes` load on the venue (load 6–10, other
+agents' suites alongside).
+
+- **The fleet-jobs unit row** ("a fleet READ shard whose worker dies
+  mid-walk"; the striping agent's 2 of 30): **7 of 1,000** on pristine `dev`
+  under a 16-way load, as `expected .refused, found .abandoned` (the
+  zombie's proposal) and `expected .done, found .abandoned` (the fresh
+  pull, which runs its engine inline). PRODUCT: the read shard's heartbeat
+  fiber parked with the recheck-before-enable shape `sync/notify.zig`
+  retired — a `stopRequested` between its `stop` read and its registration
+  inside `waitUntil` was lost, the fiber parked its whole 10 s period,
+  `hb_task.cancel` waited it out and the worker's own lease clock (the
+  row's 1 s TTL) ran out before the proposal. Red: `Worker.heartbeat_station`
+  holds the fiber's first park in its window while the walk's end raises
+  the stop; `wake.waiters` at the station read 0 (unregistered). Fix
+  (`fix(jobs): the fleet worker registers on its wake before it re-reads
+  the stop`): every park a worker's stop or release notifies registers
+  first (the heartbeat, `parkUnlessStopped` for the task pacing, `serve` and
+  the member's `fleetMain` retries, `holdForRelease` for the zombie seam,
+  whose unbounded park could miss its release forever); the "lease expiry
+  reassigns" row sweeps two TTLs ahead on the charter's TTL. (`dev`'s
+  `752836b..fc80046` widened the dying row's TTL to a minute, which hid the
+  abandonment but not the 10 s late proposal.) Loop: **0 of 1,000** under the
+  same load (the four fleet/zombie rows), **0 of 300** on the landed tree.
+- **The KVDA page-sink smoke row's daemon B "ended by a signal at umount"**
+  (the budget agent's gate run 2; the jobs agent's gates met the same
+  `expected .exited, found .signal` twice in the MutualTls rows): not the
+  busy-umount contract racing a kill — two PRODUCT crashes after the
+  daemon had detached its mount (so the verb read an orderly exit):
+  (a) `SIGSEGV` in `std.mem.eql` under a `.stats` LOOKUP racing the
+  teardown — the verb's own read on its signal's heels; `Session.close`
+  joins the workers while handler fibers are mid-request, and each worker's
+  exit unmapped its kmbuf payload region (the request's name lives there);
+  1 of 60 mount/umount cycles, 1 of 40 KVDA loops. Red: an EchoFs LOOKUP
+  parked across `close` judges its name with `msync` — unmapped. Fix
+  (`fix(transport): the kmbuf region outlives every handler`): the teardown
+  runs at `Group.deinit`, after the session awaited every handler.
+  (b) `SIGSEGV` in `plane_arm.declareWindows` on the `sqz-member` beat — the
+  joiner's `WirePlane.stop` destroyed the writer plane before joining the
+  beat whose every renewal declares its windows; 1 of 40 KVDA loops (no
+  in-process pin: the writer plane needs a joined data plane; the loop's
+  trace is the red). Fix (`fix(sym): a joiner's teardown joins its
+  membership beat before the writer plane the beat declares goes`). Rig:
+  a daemon that dies by a signal now prints the signal and its log's tail
+  (`test(smoke): a daemon that dies by a signal leaves its name and log
+  tail`). Loops: **0 of 100** mount/umount cycles; **0 of 25** runs of the
+  KVDA row and its fallback (50 row runs) with the matrix, the busy and lazy
+  rows and the pin below, under an 8-way load (pre-fix: 3 of 40).
+- **The two-daemon matrix's umount answered BUSY** (the budget agent's gate
+  run 3: `is busy (0 holder(s))`): not a rig helper — the census named the
+  VERB. `squeezefs umount` polls `.stats` right after its SIGTERM; when the
+  daemon's census walked /proc while that fd was open it refused (`1
+  holder(s): pid N (squeezefs) fd 3`), and the verb's census, which skips
+  itself, found nobody; 1 of 40 mount/umount cycles. PRODUCT (the census).
+  Red: a forked sender opens `.stats` and SIGTERMs the daemon with it open —
+  refused. Fix (`fix(umount): the daemon's holder census exempts its stop's
+  sender's control-document reads`): `holders.Exempt` (one pid's fds on
+  inodes a predicate accepts, by fdinfo's `ino:`), the daemon latching its
+  stop's sender from `si_pid` (`SA_SIGINFO`) and exempting its fds on the
+  control documents' generation inos; a sender holding the mount any other
+  way is still refused. The alert printer matched `warn(` — the sink writes
+  `warning(` — which is why the daemon's own refusal never reached the gate
+  log. Loops: **0 of 100** self-refusals in the mount/umount cycles; the
+  matrix row **25 of 25**.
+- Found on the way, not owned by anyone active: two transport e2e rows read
+  a counter on a reply's heels (`EchoFs mounts over the ring`: `requests ≡
+  replies` before the helper's background RELEASE was answered, `expected
+  13, found 12`; `teardown with an in-flight request`: the dropped-reply
+  baseline read after releasing the handler) — both read in this branch's
+  loaded runs; fixed test-side (`test(transport): two e2e rows read a
+  counter on a reply's heels`).
+- Seen once and NOT fixed (its owner's call): the KVDA fallback row's
+  must-stay-0 `transport_park_tick_cqe_rescues = 1` on daemon B (1 of 40
+  pre-fix loops, 0 of 25 after, never in a gate log). By the kernel's
+  `io_cqring_wait` contract a timed GETEVENTS that returns `-ETIME` ran the
+  deferred completions after its timer and found the CQ empty (it returns 0
+  otherwise), so a CQE the next reap surfaces arrived after the deadline:
+  the CQE half of the rescue ledger can only count late arrivals (the
+  worker preempted between the enter and the reap), never a lost wake.
+  Owed: retire or redefine that half (it is in `brk.py`'s tick ledger and
+  the smoke's must-stay-0 list).

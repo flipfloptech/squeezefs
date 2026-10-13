@@ -54,6 +54,7 @@ const knobs = @import("../core/knobs.zig");
 const json_scan = @import("../core/json_scan.zig");
 const handler = @import("../fuse/handler.zig");
 const transport = @import("../fuse/transport.zig");
+const fuse_geometry = @import("../fuse/geometry.zig");
 const status_verb = @import("status.zig");
 const cli_supervisor = @import("supervisor.zig");
 const uring_fs = @import("../io/uring_fs.zig");
@@ -6777,11 +6778,11 @@ test "smoke: `sync -f` IS A DURABILITY POINT FOR THE DAEMON'S WRITE CUSTODY — 
 
 /// The frozen-daemon row's request timeout (the seam): the kernel's floor
 /// — it raises any shorter timeout to its check period.
-const frozen_timeout_s: u64 = 15;
-/// The kernel's request-timeout check period (`FUSE_TIMEOUT_TIMER_FREQ`,
-/// fs/fuse/dev.c): a request is aborted at the first check at or after its
-/// age reaches the timeout — at most one period late.
-const frozen_check_s: u64 = 15;
+const frozen_timeout_s: u64 = fuse_geometry.REQUEST_TIMEOUT_CHECK_S;
+/// The kernel's request-timeout check period: a request is aborted at the
+/// first check at or after its age reaches the timeout — at most one
+/// period late.
+const frozen_check_s: u64 = fuse_geometry.REQUEST_TIMEOUT_CHECK_S;
 /// What the host-wide sync may take once our FUSE_SYNCFS is aborted: the
 /// abort's wake and the superblocks the sync visits after ours, judged at
 /// the kernel's own cadence (one more check period).
@@ -6912,8 +6913,8 @@ test "smoke: A FROZEN DAEMON NEVER HANGS THE HOST'S `sync` (0003 §Z) — format
     {
         const st = try rig.stats();
         defer gpa.free(st);
-        const lattice_ms = lease_clock.T_OWNER_MS + membership.park_reclaim.tParkMaxMs(extent_grant.failoverBoundMs(0, 0), membership.park_reclaim.graceMs(lease_clock.T_OWNER_MS));
-        try testing.expectEqual(@as(?u64, lattice_ms / 1000), numberAfter(st, "\"transport_request_timeout_s\":"));
+        const lattice_s = fuse_geometry.requestTimeoutS(lease_clock.T_OWNER_MS, membership.park_reclaim.tParkMaxMs(extent_grant.failoverBoundMs(0, 0), membership.park_reclaim.graceMs(lease_clock.T_OWNER_MS)));
+        try testing.expectEqual(@as(?u64, lattice_s), numberAfter(st, "\"transport_request_timeout_s\":"));
         const out = try rig.onMount("cat f");
         defer gpa.free(out);
         try testing.expectEqualStrings("frozen\n", out);

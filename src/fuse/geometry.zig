@@ -213,9 +213,9 @@ pub fn desiredMaxWrite(block_size: u64, explicit: ?u32) u32 {
     return @intCast(derive.clamp(@max(block_size, PAYLOAD_BASE), MIN_MAX_WRITE, std.math.maxInt(u32)));
 }
 
-/// `/proc/sys/fs/fuse/max_pages_limit` text → value; null on junk (the
-/// caller then takes the fallback, exactly as for an absent sysctl).
-pub fn parseMaxPagesLimit(text: []const u8) ?u32 {
+/// A `/proc/sys/fs/fuse/*` sysctl's text → value; null on junk (the caller
+/// then takes the fallback, exactly as for an absent sysctl).
+pub fn parseSysctlU32(text: []const u8) ?u32 {
     return std.fmt.parseInt(u32, std.mem.trim(u8, text, " \t\r\n"), 10) catch null;
 }
 
@@ -227,7 +227,68 @@ pub fn readMaxPagesLimit(io: std.Io) ?u32 {
     if (builtin.os.tag != .linux) return null;
     var buf: [64]u8 = undefined;
     const text = std.Io.Dir.cwd().readFile(io, max_pages_limit_path, &buf) catch return null;
-    return parseMaxPagesLimit(text);
+    return parseSysctlU32(text);
+}
+
+// ---------------------------------------------------------------------------
+// The request timeout (decision 0003 §Z): the INIT reply's `request_timeout`.
+// A request the kernel has waited on longer ends the connection
+// (`fuse_check_timeout` → `fuse_abort_conn`: ENOTCONN to every caller, the
+// mount fail-stopped), so a stopped or wedged daemon never holds the host's
+// `sync` (FUSE_SYNCFS reaches every FUSE superblock) or any caller forever —
+// the kernel's half of the supervisor's abort rung, armed with or without a
+// supervisor.
+// ---------------------------------------------------------------------------
+
+/// The kernel's check period (`FUSE_TIMEOUT_TIMER_FREQ`, fs/fuse/dev.c): the
+/// timeout work runs every 15 s and `init_server_timeout` raises a shorter
+/// timeout to it — a request is aborted between T and T + 15 s of its
+/// creation.
+pub const REQUEST_TIMEOUT_CHECK_S: u16 = 15;
+
+/// `T_req = T_owner + T_park_max` (ms → whole seconds rounded up; the u16
+/// field saturates). The longest a HEALTHY daemon holds a request is a wait
+/// on a peer the lattice is giving up: up to `T_owner` for the set to declare
+/// it dead (a member's own park starts at `T_self < T_owner`), then the park
+/// that follows, `T_park_max` (failover + grace), past which the op answers
+/// the terminal EIO (§X.1). Every other bounded wait a handler can sit in is
+/// shorter: the journal's FAILED latch (3 × `PARK_ESCALATION_NS` = 90 s), the
+/// coherence hold (20 s), a token recall (≤ one lease TTL), the zc bridges
+/// (30 s). A request older than that waits on nothing the lattice sanctions.
+pub fn requestTimeoutS(t_owner_ms: u64, t_park_max_ms: u64) u16 {
+    const s = (t_owner_ms +| t_park_max_ms) / 1000 + @intFromBool((t_owner_ms +| t_park_max_ms) % 1000 != 0);
+    return @intCast(@min(s, std.math.maxInt(u16)));
+}
+
+/// `SQUEEZEFS_TEST_FUSE_REQUEST_TIMEOUT_S` (the frozen-daemon row's window).
+pub fn requestTimeoutOverride(env: *const std.process.Environ.Map) ?u16 {
+    return knobs.optIntKnob("SQUEEZEFS_TEST_FUSE_REQUEST_TIMEOUT_S", u16, env);
+}
+
+/// explicit > derived.
+pub fn resolveRequestTimeoutS(explicit: ?u16, derived: u16) u16 {
+    return explicit orelse derived;
+}
+
+/// The timeout the kernel applies to a nonzero request
+/// (`init_server_timeout`): the `max_request_timeout` sysctl caps it (0 =
+/// no cap), then the check period floors it.
+pub fn kernelRequestTimeoutS(requested: u16, max_sysctl: ?u32) u16 {
+    std.debug.assert(requested != 0);
+    const cap = max_sysctl orelse 0;
+    const capped: u32 = if (cap != 0) @min(requested, cap) else requested;
+    return @intCast(@max(capped, REQUEST_TIMEOUT_CHECK_S));
+}
+
+pub const max_request_timeout_path = "/proc/sys/fs/fuse/max_request_timeout";
+
+/// The host's cap on every server's request timeout; null off-Linux or on a
+/// kernel without the sysctl.
+pub fn readMaxRequestTimeout(io: std.Io) ?u32 {
+    if (builtin.os.tag != .linux) return null;
+    var buf: [64]u8 = undefined;
+    const text = std.Io.Dir.cwd().readFile(io, max_request_timeout_path, &buf) catch return null;
+    return parseSysctlU32(text);
 }
 
 // ---------------------------------------------------------------------------
@@ -626,16 +687,33 @@ test "mount-option overrides: mb/ct 96/80 verbatim; mb 100 alone → ct 75; 0/0 
     try testing.expectEqual(@as(u16, 768), p.congestion_threshold);
 }
 
+test "request timeout (decision 0003 §Z): T_owner + T_park_max in whole seconds rounded up — 135 s at the lattice's constants (45 s + 45 s failover + 45 s grace); the field saturates; the seam wins; the kernel caps by its sysctl (0 = none) and floors at its 15 s check period" {
+    try testing.expectEqual(@as(u16, 135), requestTimeoutS(45_000, 45_000 + 45_000));
+    try testing.expectEqual(@as(u16, 136), requestTimeoutS(45_000, 90_001));
+    try testing.expectEqual(@as(u16, 1), requestTimeoutS(0, 1));
+    try testing.expectEqual(@as(u16, 0), requestTimeoutS(0, 0));
+    try testing.expectEqual(@as(u16, std.math.maxInt(u16)), requestTimeoutS(std.math.maxInt(u64), 1));
+    try testing.expectEqual(@as(u16, 15), resolveRequestTimeoutS(15, 135));
+    try testing.expectEqual(@as(u16, 135), resolveRequestTimeoutS(null, 135));
+    try testing.expectEqual(@as(u16, 135), kernelRequestTimeoutS(135, null));
+    try testing.expectEqual(@as(u16, 135), kernelRequestTimeoutS(135, 0));
+    try testing.expectEqual(@as(u16, 60), kernelRequestTimeoutS(135, 60));
+    try testing.expectEqual(@as(u16, 135), kernelRequestTimeoutS(135, 1000));
+    try testing.expectEqual(REQUEST_TIMEOUT_CHECK_S, kernelRequestTimeoutS(135, 5));
+    try testing.expectEqual(REQUEST_TIMEOUT_CHECK_S, kernelRequestTimeoutS(1, null));
+    try testing.expectEqual(@as(u16, 15), REQUEST_TIMEOUT_CHECK_S);
+}
+
 test "page and sysctl inputs: a sub-512 page is floored, the sysctl fallback is 256 and clamps to [1, 65535]; the text parser is total" {
     try testing.expectEqual(@as(u32, 256), pagesLimit(null));
     try testing.expectEqual(@as(u32, 1), pagesLimit(0));
     try testing.expectEqual(@as(u32, 65535), pagesLimit(1 << 20));
     try testing.expectEqual(@as(u32, 1024), pagesLimit(1024));
-    try testing.expectEqual(@as(?u32, 256), parseMaxPagesLimit("256\n"));
-    try testing.expectEqual(@as(?u32, 65535), parseMaxPagesLimit(" 65535 "));
-    try testing.expectEqual(@as(?u32, null), parseMaxPagesLimit(""));
-    try testing.expectEqual(@as(?u32, null), parseMaxPagesLimit("lots"));
-    try testing.expectEqual(@as(?u32, null), parseMaxPagesLimit("-1"));
+    try testing.expectEqual(@as(?u32, 256), parseSysctlU32("256\n"));
+    try testing.expectEqual(@as(?u32, 65535), parseSysctlU32(" 65535 "));
+    try testing.expectEqual(@as(?u32, null), parseSysctlU32(""));
+    try testing.expectEqual(@as(?u32, null), parseSysctlU32("lots"));
+    try testing.expectEqual(@as(?u32, null), parseSysctlU32("-1"));
     const p = plan(.{ .kernel_nqueues = 8, .desired_max_write = 1 * MiB, .max_pages_limit = null, .page_size = 64, .buffer_cap = 1 * GiB });
     try testing.expectEqual(MIN_PAGE, p.page);
     try testing.expectEqual(@as(u32, 256), p.max_pages_limit);
@@ -896,7 +974,7 @@ test "the plan is total over a sweep of shapes and every result satisfies the ke
 fn maxPagesFuzz(_: void, smith: *std.testing.Smith) !void {
     var buf: [64]u8 = undefined;
     const len = smith.slice(&buf);
-    _ = parseMaxPagesLimit(buf[0..len]);
+    _ = parseSysctlU32(buf[0..len]);
 }
 
 test "fuzz: the max_pages_limit sysfs parser is total on arbitrary text" {

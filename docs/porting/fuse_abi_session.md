@@ -248,8 +248,10 @@ log line; still answer `-ENOSYS` (the kernel latches `fc->no_<op>` on ENOSYS for
 8. **Serialize** `fuse_init_out` (:1895–1914): `major 7, minor reply_minor, max_readahead = kernel's
    verbatim` (`negotiate_max_readahead`, :6441–6444 — never clamped, never consulted; published as
    `transport_max_readahead`), `flags, max_background, congestion_threshold, max_write (negotiated),
-   time_gran 1, max_pages (negotiated), map_alignment 0, flags2, max_stack_depth 0, request_timeout 0,
-   unused [0;3], time_min, time_max`; out header `len = 16 + 64`.
+   time_gran 1, max_pages (negotiated), map_alignment 0, flags2, max_stack_depth 0, request_timeout,
+   unused [0;3], time_min, time_max`; out header `len = 16 + 64`. `request_timeout` (Zig, decision
+   0003 §Z; the reference sends 0) = `T_owner + T_park_max` in whole seconds (135 s) with
+   FUSE_REQUEST_TIMEOUT iff offered; FUSE_HAS_SYNCFS rides only beside it.
 9. **`fuse.enable_uring=Y`** (:1933–1956 → fuse_over_uring.rs:2953–2976): read
    `/sys/module/fuse/parameters/enable_uring`; if not `y|1|yes|true|on`, write `Y`, re-read; warn on
    failure. WHY the order: since 7.2.4 (stable 303b6eeedf29) the kernel creates the connection's ring at

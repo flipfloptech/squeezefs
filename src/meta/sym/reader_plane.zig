@@ -426,8 +426,13 @@ pub const ReaderPlane = struct {
     /// membership clocks a live set granted this reader (the shipped
     /// `T_owner` before any grant — a quiescent reader's).
     pub fn moveDeadlineMs(self: *const ReaderPlane) u64 {
-        const t_owner = if (self.member.clocks) |c| c.t_owner_ms else lease_clock.T_OWNER_MS;
-        return park.tParkMaxMs(@import("extent_grant.zig").failoverBoundMs(0, 0), park.graceMs(t_owner));
+        return park.tParkMaxMs(@import("extent_grant.zig").failoverBoundMs(0, 0), park.graceMs(self.tOwnerMs()));
+    }
+
+    /// The home shard's `T_owner` this member reads by (the constant before
+    /// its grant).
+    pub fn tOwnerMs(self: *const ReaderPlane) u64 {
+        return if (self.member.clocks) |c| c.t_owner_ms else lease_clock.T_OWNER_MS;
     }
 
     /// The fail-stop gate the FUSE layer wraps the filesystem with.

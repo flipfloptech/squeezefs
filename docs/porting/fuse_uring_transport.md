@@ -249,7 +249,8 @@ desired_max_write, max_pages_limit, page, buffer_cap, mb_override, ct_override)`
 - `max_readahead` echoed VERBATIM and published as `transport_max_readahead` (session.rs:6441–6445); the R2
   prefetch window is deliberately independent of it.
 - `max_write / max_pages / max_background / congestion_threshold` from the plan (§1.7); `time_gran`,
-  `map_alignment` defaults; `max_stack_depth = request_timeout = 0`.
+  `map_alignment` defaults; `max_stack_depth = 0`; `request_timeout = T_owner + T_park_max` (135 s,
+  decision 0003 §Z — the reference sends 0).
 - Port: the INIT codec is an `extern struct fuse_init_in/out` with the `flags2` word read at byte 16 only when
   `FUSE_INIT_EXT` is set (session.rs:1780–1784); `KernelInit` and `NEGOTIATED_REPLY_FLAGS` are published BEFORE
   the filesystem's init hook so capability probes can read them (session.rs:1776–1790, :1825–1829).

@@ -154,6 +154,10 @@ pub var zc_bounce_slab_bytes: counters.Gauge = .{};
 /// `transport_time_limits`: 1 when FUSE_TIME_LIMITS was echoed with our
 /// i64-ns whole-second range.
 pub var time_limits_gauge: counters.Gauge = .{};
+/// `transport_request_timeout_s`: the request timeout the kernel applies to
+/// this connection (the INIT reply's, capped by `max_request_timeout`,
+/// floored at the check period), seconds; 0 = none negotiated.
+pub var request_timeout_gauge: counters.Gauge = .{};
 /// `transport_kernel_max_background`: fusectl's `max_background` for this
 /// connection (0 when fusectl is not mounted) — the per-queue background
 /// budget is `this / nr_queues` kernel-side.
@@ -244,6 +248,12 @@ pub const Config = struct {
     /// Written with a typed refusal's detail before `mount` returns its
     /// error (the daemon's refusal line names it).
     refusal: ?*Refusal = null,
+    /// The INIT reply's request timeout, seconds: the fail-stop lattice's
+    /// `geometry.requestTimeoutS` (decision 0003 §Z), the
+    /// `SQUEEZEFS_TEST_FUSE_REQUEST_TIMEOUT_S` seam wins. 0 asks for none —
+    /// and so declines FUSE_SYNCFS (the session tests' EchoFs); the product
+    /// mount always derives one.
+    request_timeout_s: u16 = 0,
     /// Error logs each worker/sideband thread expects in a test.
     test_error_logs: usize = 0,
 };
@@ -476,7 +486,8 @@ const Sideband = struct {
         // A connection gone without DESTROY (a lazy umount, a sysfs abort,
         // a dead ring): the session ends here too.
         if (self.disconnected or self.ring.isDead()) {
-            self.session.mounted.store(false, .release);
+            // release pairs with `endedUnderLiveMount`'s acquire.
+            self.session.lost_while_mounted.store(self.session.mounted.swap(false, .acq_rel), .release);
             self.session.shutdown();
         }
         self.finish();
@@ -683,6 +694,12 @@ pub const Session = struct {
     time_limits: probes.Verdict = .absent,
     /// `SQUEEZEFS_READ_ZC_SERVE` ∧ zero-copy: what INIT told the filesystem.
     read_zc_serve: bool = false,
+    /// The request timeout the kernel applies, seconds (0 = none).
+    request_timeout_s: u16 = 0,
+    /// The connection ended (not by DESTROY) while the session still held
+    /// the mount attached — the sideband's verdict, judged against the
+    /// mount table by `endedUnderLiveMount`.
+    lost_while_mounted: std.atomic.Value(bool) = .init(false),
     /// The zc bounce slab (one per session) and its budget component.
     slab: ?worker.Slab = null,
     slab_component: mem_budget.Component = undefined,
@@ -982,7 +999,8 @@ pub const Session = struct {
         errdefer self.drain_groups.deinit(gpa);
 
         // 4. The reply word; the filesystem's init hook sees the negotiation.
-        const wants: codec.InitWants = .{ .writeback_cache = cfg.opts.write_back and !cfg.opts.read_only };
+        const asked_timeout_s = geometry.resolveRequestTimeoutS(geometry.requestTimeoutOverride(env), cfg.request_timeout_s);
+        const wants: codec.InitWants = .{ .writeback_cache = cfg.opts.write_back and !cfg.opts.read_only, .request_timeout_s = asked_timeout_s };
         self.init_reply = codec.buildInitReply(init_in, self.plan, wants) catch {
             log.err("transport: unsupported FUSE protocol {d}.{d} (need 7.{d}+)", .{ init_in.major, init_in.minor, codec.MIN_SUPPORTED_MINOR });
             self.sideband.replyInline(codec.replyError(self.init_unique, .INVAL));
@@ -992,6 +1010,9 @@ pub const Session = struct {
         geometry.gauges.publishDrainGroups(&self.drain_groups);
         self.time_limits = probes.timeLimitsVerdict(init_in.folded());
         time_limits_gauge.set(@intFromBool(self.init_reply.timeLimits()));
+        self.request_timeout_s = if (self.init_reply.requestTimeoutS() != 0) geometry.kernelRequestTimeoutS(self.init_reply.requestTimeoutS(), geometry.readMaxRequestTimeout(self.io)) else 0;
+        request_timeout_gauge.set(self.request_timeout_s);
+        if (asked_timeout_s != 0) self.warnRequestTimeout(asked_timeout_s, init_in.folded());
         const read_zc_serve = knobs.boolKnob("SQUEEZEFS_READ_ZC_SERVE", env) and self.mode == .zero_copy;
         self.read_zc_serve = read_zc_serve;
 
@@ -1011,7 +1032,7 @@ pub const Session = struct {
         probes.publish(self.verdicts, self.retention, self.time_limits, probes.driver.capSysAdmin(self.io, env), self.mode);
         fs.init(.{ .negotiated = self.init_reply.negotiated, .minor = self.init_reply.minor(), .plan = self.plan, .io = self.io, .buffer_mode = self.mode, .read_zc_serve = read_zc_serve, .retention = self.retention == .present });
         errdefer self.destroyOnce();
-        log.info("transport: INIT 7.{d} → 7.{d}: flags 0x{x} (over_io_uring={}, time_limits={}), max_write {d}, max_pages {d}, max_background {d}, queues {d} × depth {d}, payload {d} B, {d} drain group(s) (width {d}), buffer mode {t} (kmbuf {?d}, retention {t})", .{ init_in.minor, self.init_reply.minor(), self.init_reply.negotiated, self.init_reply.has(abi.FUSE_OVER_IO_URING), self.init_reply.timeLimits(), self.plan.max_write, self.plan.max_pages, self.plan.max_background, self.plan.nqueues, self.plan.depth, self.plan.payload_sz, self.drain_groups.count(), self.drain_groups.maxWidth(), self.mode, if (self.verdicts.kmbuf.opcodes()) |p| p.register else null, self.retention });
+        log.info("transport: INIT 7.{d} → 7.{d}: flags 0x{x} (over_io_uring={}, time_limits={}, request_timeout {d} s), max_write {d}, max_pages {d}, max_background {d}, queues {d} × depth {d}, payload {d} B, {d} drain group(s) (width {d}), buffer mode {t} (kmbuf {?d}, retention {t})", .{ init_in.minor, self.init_reply.minor(), self.init_reply.negotiated, self.init_reply.has(abi.FUSE_OVER_IO_URING), self.init_reply.timeLimits(), self.request_timeout_s, self.plan.max_write, self.plan.max_pages, self.plan.max_background, self.plan.nqueues, self.plan.depth, self.plan.payload_sz, self.drain_groups.count(), self.drain_groups.maxWidth(), self.mode, if (self.verdicts.kmbuf.opcodes()) |p| p.register else null, self.retention });
 
         // 6. The zc bounce slab (ONE memfd for every queue; a non-sheddable
         //    budget component), then the workers: one per drain group, the
@@ -1233,6 +1254,37 @@ pub const Session = struct {
     /// unmounted it or `close` detached it).
     pub fn isMounted(self: *const Session) bool {
         return self.mounted.load(.acquire);
+    }
+
+    /// The request timeout the kernel applies to this connection, seconds
+    /// (0 = none).
+    pub fn requestTimeoutS(self: *const Session) u16 {
+        return self.request_timeout_s;
+    }
+
+    /// The kernel ended the connection while THIS mount is still in the
+    /// table — the request timeout or a fusectl abort, never an unmount
+    /// (an `umount2`, lazy or not, removes the entry before the superblock
+    /// ends the connection): the mount is fail-stopped, every access
+    /// ENOTCONN until it is unmounted. Reads the mount table (the caller's
+    /// thread, after the session ended).
+    pub fn endedUnderLiveMount(self: *Session) bool {
+        // acquire pairs with the sideband's release.
+        if (!self.lost_while_mounted.load(.acquire)) return false;
+        const want = self.mount_id orelse return false;
+        const e = self.mountEntry() orelse return false;
+        return e.id == want;
+    }
+
+    /// The INIT's loud lines about the bound it asked for: a kernel without
+    /// FUSE_REQUEST_TIMEOUT (no bound at all, FUSE_SYNCFS declined), or a
+    /// host sysctl that caps it below the lattice's.
+    fn warnRequestTimeout(self: *const Session, asked_s: u16, offered: u64) void {
+        if (self.request_timeout_s == 0) {
+            log.warn("transport: FUSE_REQUEST_TIMEOUT is not negotiated on this kernel — a stopped or wedged daemon holds its callers forever{s} (decision 0003 §Z)", .{if (offered & abi.FUSE_HAS_SYNCFS != 0) "; FUSE_SYNCFS declined (every host-wide sync would wait on it)" else ""});
+            return;
+        }
+        if (self.request_timeout_s < asked_s) log.warn("transport: the host caps FUSE request timeouts ({s}) at {d} s, below this mount's {d} s (T_owner + T_park_max, decision 0003 §Z): a request a healthy daemon holds longer — parked on a peer the lattice is still giving up — ends the mount ENOTCONN", .{ geometry.max_request_timeout_path, self.request_timeout_s, asked_s });
     }
 
     // ---- teardown ----
@@ -1463,6 +1515,7 @@ pub const Session = struct {
         try field(w, "transport_probe_time_limits", probes.time_limits_gauge.load());
         try field(w, "transport_probe_cap_sys_admin", probes.cap_gauge.load());
         try field(w, "transport_time_limits", time_limits_gauge.load());
+        try field(w, "transport_request_timeout_s", request_timeout_gauge.load());
         try field(w, "transport_kernel_max_background", kernel_max_background.load());
         try field(w, "transport_kmbuf_pinned_bytes", kmbuf.pinned_bytes.load());
         try field(w, "transport_kmbuf_register_retries", kmbuf.register_retries.load());

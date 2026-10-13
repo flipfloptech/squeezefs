@@ -229,9 +229,10 @@ pub var fuse_killpriv_clears: counters.ShardedCounter = .{};
 /// `fuse_killpriv_negotiated`: 0/1 from the INIT reply.
 pub var fuse_killpriv_negotiated: counters.Gauge = .{};
 /// `fuse_syncfs_armed`: 1 when INIT negotiated `FUSE_HAS_SYNCFS` (the
-/// kernel forwards syncfs(2)/sync(2)); 0 = `sync -f` never reaches the
-/// daemon on this kernel and fsync/fdatasync/fsyncdir are the only
-/// durability points of its write custody.
+/// kernel forwards syncfs(2)/sync(2); only beside the request timeout,
+/// decision 0003 §Z); 0 = `sync -f` never reaches the daemon and
+/// fsync/fdatasync/fsyncdir are the only durability points of its write
+/// custody.
 pub var fuse_syncfs_armed: counters.Gauge = .{};
 /// `fuse_syncfs`: FUSE_SYNCFS served; `fuse_syncfs_phase_ns`: its legs,
 /// exact-sum (`fsync.SyncfsPhase`).
@@ -1416,7 +1417,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             fuse_killpriv_negotiated.set(@intFromBool(self.killpriv_v2));
             const syncfs_armed = a.has(abi.FUSE_HAS_SYNCFS);
             fuse_syncfs_armed.set(@intFromBool(syncfs_armed));
-            log.info("kv_fs: FUSE 7.{d}; KILLPRIV_V2 {s}; SYNCFS {s}; inline_max {d} B; block {d} B; data volumes {s}; staging {s}", .{ self.minor, if (self.killpriv_v2) "negotiated" else "absent", if (syncfs_armed) "negotiated (sync -f drains the write custody)" else "NOT offered by this kernel (FUSE_HAS_SYNCFS absent: syncfs(2)/sync never reach the daemon — fsync/fdatasync/fsyncdir are the durability points)", self.inline_max, self.block_size, if (self.data.hasVolumes()) "yes" else "NONE (inline only)", if (self.data.stagingOn()) "on" else "off" });
+            log.info("kv_fs: FUSE 7.{d}; KILLPRIV_V2 {s}; SYNCFS {s}; inline_max {d} B; block {d} B; data volumes {s}; staging {s}", .{ self.minor, if (self.killpriv_v2) "negotiated" else "absent", if (syncfs_armed) "negotiated (sync -f drains the write custody)" else "NOT negotiated (FUSE_HAS_SYNCFS not offered, or declined without a request timeout — decision 0003 §Z: syncfs(2)/sync never reach the daemon; fsync/fdatasync/fsyncdir are the durability points)", self.inline_max, self.block_size, if (self.data.hasVolumes()) "yes" else "NONE (inline only)", if (self.data.stagingOn()) "on" else "off" });
         }
 
         pub fn destroy(self: *Self, c: *Ctx, _: filesystem.DestroyArgs) void {

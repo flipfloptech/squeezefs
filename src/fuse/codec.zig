@@ -870,6 +870,10 @@ pub const InitWants = struct {
     handle_killpriv_v2: bool = true,
     /// Answer plain READDIR with ENOSYS so every listing is READDIRPLUS.
     force_readdirplus: bool = false,
+    /// The kernel's request timeout, seconds (`geometry.requestTimeoutS`,
+    /// decision 0003 §Z): sent with FUSE_REQUEST_TIMEOUT iff the kernel
+    /// offers it; 0 asks for none (and so for no FUSE_SYNCFS either).
+    request_timeout_s: u16 = 0,
 };
 
 /// Echoed iff offered, unconditionally.
@@ -900,7 +904,7 @@ pub const never_advertised: u64 = abi.FUSE_POSIX_LOCKS | abi.FUSE_FLOCK_LOCKS | 
     abi.FUSE_SPLICE_READ | abi.FUSE_POSIX_ACL | abi.FUSE_ABORT_ERROR | abi.FUSE_EXPLICIT_INVAL_DATA | abi.FUSE_AUTO_INVAL_DATA | abi.FUSE_MAP_ALIGNMENT |
     abi.FUSE_SETXATTR_EXT | abi.FUSE_INIT_RESERVED | abi.FUSE_SECURITY_CTX | abi.FUSE_HAS_INODE_DAX | abi.FUSE_CREATE_SUPP_GROUP |
     abi.FUSE_HAS_EXPIRE_ONLY | abi.FUSE_DIRECT_IO_ALLOW_MMAP | abi.FUSE_PASSTHROUGH | abi.FUSE_NO_EXPORT_SUPPORT |
-    abi.FUSE_HAS_RESEND | abi.FUSE_ALLOW_IDMAP | abi.FUSE_REQUEST_TIMEOUT;
+    abi.FUSE_HAS_RESEND | abi.FUSE_ALLOW_IDMAP;
 
 pub const InitReply = struct {
     out: abi.fuse_init_out,
@@ -920,6 +924,12 @@ pub const InitReply = struct {
     /// The kernel will send FUSE_SYNCFS on syncfs(2)/sync(2).
     pub fn syncfs(self: InitReply) bool {
         return self.has(abi.FUSE_HAS_SYNCFS);
+    }
+
+    /// The timeout the reply asked the kernel for, seconds (0 = none): a
+    /// request it waits on longer aborts the connection.
+    pub fn requestTimeoutS(self: InitReply) u16 {
+        return if (self.has(abi.FUSE_REQUEST_TIMEOUT)) self.out.request_timeout else 0;
     }
 
     pub fn minor(self: InitReply) u32 {
@@ -958,12 +968,18 @@ pub fn buildInitReply(in: abi.fuse_init_in, p: geometry.Plan, wants: InitWants) 
     std.debug.assert(reply_flags & never_advertised == 0);
 
     // flags2: the ring transport always (no opt-out: the mount fails if it
-    // cannot arm); the time range iff the kernel can apply it; syncfs iff
-    // offered (the kernel offers it only to a privileged opener).
+    // cannot arm); the time range iff the kernel can apply it; the request
+    // timeout iff offered and asked; syncfs iff offered (the kernel offers
+    // it only to a privileged opener) AND beside the request timeout —
+    // FUSE_SYNCFS reaches this daemon from EVERY host-wide sync, and only
+    // the timeout keeps a frozen daemon from holding them all forever
+    // (decision 0003 §Z).
     var flags2: u64 = abi.FUSE_OVER_IO_URING;
     const time_limits = offered & abi.FUSE_TIME_LIMITS != 0;
     if (time_limits) flags2 |= abi.FUSE_TIME_LIMITS;
-    if (offered & abi.FUSE_HAS_SYNCFS != 0) flags2 |= abi.FUSE_HAS_SYNCFS;
+    const request_timeout = offered & abi.FUSE_REQUEST_TIMEOUT != 0 and wants.request_timeout_s != 0;
+    if (request_timeout) flags2 |= abi.FUSE_REQUEST_TIMEOUT;
+    if (offered & abi.FUSE_HAS_SYNCFS != 0 and request_timeout) flags2 |= abi.FUSE_HAS_SYNCFS;
 
     const reply_minor = @min(in.minor, abi.FUSE_KERNEL_MINOR_VERSION);
     const init_ext = offered & abi.FUSE_INIT_EXT != 0 and flags2 != 0 and reply_minor >= 36;
@@ -982,7 +998,7 @@ pub fn buildInitReply(in: abi.fuse_init_in, p: geometry.Plan, wants: InitWants) 
         .map_alignment = abi.DEFAULT_MAP_ALIGNMENT,
         .flags2 = abi.flags2Of(flags2),
         .max_stack_depth = 0,
-        .request_timeout = 0,
+        .request_timeout = if (request_timeout) wants.request_timeout_s else 0,
         .unused = @splat(0),
         .time_min = if (time_limits) abi.TIME_LIMITS_MIN_SEC else 0,
         .time_max = if (time_limits) abi.TIME_LIMITS_MAX_SEC else 0,
@@ -1664,14 +1680,20 @@ test "INIT reply never advertises POSIX_LOCKS, FLOCK_LOCKS, SPLICE_*, POSIX_ACL 
     const rnd = prng.random();
     for (0..2000) |_| {
         const offered = rnd.int(u64);
-        const r = try buildInitReply(initIn(rnd.intRangeAtMost(u32, 23, 60), offered), test_plan, .{ .export_support = rnd.boolean(), .writeback_cache = rnd.boolean(), .dont_mask = rnd.boolean(), .handle_killpriv = rnd.boolean(), .handle_killpriv_v2 = rnd.boolean(), .force_readdirplus = rnd.boolean() });
+        const timeout_s: u16 = if (rnd.boolean()) 0 else rnd.int(u16);
+        const r = try buildInitReply(initIn(rnd.intRangeAtMost(u32, 23, 60), offered), test_plan, .{ .export_support = rnd.boolean(), .writeback_cache = rnd.boolean(), .dont_mask = rnd.boolean(), .handle_killpriv = rnd.boolean(), .handle_killpriv_v2 = rnd.boolean(), .force_readdirplus = rnd.boolean(), .request_timeout_s = timeout_s });
         try testing.expectEqual(@as(u64, 0), r.negotiated & never_advertised);
         try testing.expectEqual(@as(u64, 0), r.out.folded() & never_advertised);
         // Every classical reply bit except INIT_EXT was offered.
         try testing.expectEqual(@as(u64, 0), (@as(u64, r.out.flags) & ~abi.FUSE_INIT_EXT) & ~offered);
-        // flags2 carries only the ring bit and (iff offered) the time and syncfs bits.
-        try testing.expectEqual(@as(u64, 0), (@as(u64, r.out.flags2) << 32) & ~(abi.FUSE_OVER_IO_URING | abi.FUSE_TIME_LIMITS | abi.FUSE_HAS_SYNCFS));
-        try testing.expectEqual(offered & abi.FUSE_HAS_SYNCFS, (@as(u64, r.out.flags2) << 32) & abi.FUSE_HAS_SYNCFS);
+        // flags2 carries only the ring bit and (iff offered) the time, the
+        // request timeout (iff asked) and syncfs (only beside the timeout).
+        const f2 = @as(u64, r.out.flags2) << 32;
+        try testing.expectEqual(@as(u64, 0), f2 & ~(abi.FUSE_OVER_IO_URING | abi.FUSE_TIME_LIMITS | abi.FUSE_REQUEST_TIMEOUT | abi.FUSE_HAS_SYNCFS));
+        const timed = offered & abi.FUSE_REQUEST_TIMEOUT != 0 and timeout_s != 0;
+        try testing.expectEqual(timed, f2 & abi.FUSE_REQUEST_TIMEOUT != 0);
+        try testing.expectEqual(if (timed) timeout_s else 0, r.out.request_timeout);
+        try testing.expectEqual(timed and offered & abi.FUSE_HAS_SYNCFS != 0, f2 & abi.FUSE_HAS_SYNCFS != 0);
         try testing.expect(r.out.minor <= 36);
     }
     const all = try buildInitReply(initIn(44, std.math.maxInt(u64)), test_plan, .{});
@@ -1708,18 +1730,42 @@ test "INIT reply echoes the time range iff FUSE_TIME_LIMITS (bit 62) was offered
     try testing.expect(!stranded.timeLimits());
 }
 
-test "INIT reply asks for FUSE_SYNCFS (FUSE_HAS_SYNCFS, flags2 bit 12) iff the kernel offered it — offered only to a /dev/fuse opener with CAP_SYS_ADMIN in the initial user namespace; without INIT_EXT it is not negotiated" {
+test "INIT reply asks for FUSE_SYNCFS (FUSE_HAS_SYNCFS, flags2 bit 12) iff the kernel offered it — offered only to a /dev/fuse opener with CAP_SYS_ADMIN in the initial user namespace — and only beside the request timeout (0003 §Z); without INIT_EXT it is not negotiated" {
     const has_syncfs = abi.FUSE_HAS_SYNCFS;
     try testing.expectEqual(@as(u64, 1 << 44), has_syncfs);
-    const with = try buildInitReply(initIn(45, kernel_6_14_offer | has_syncfs), test_plan, .{});
+    const offer = kernel_6_14_offer | abi.FUSE_REQUEST_TIMEOUT;
+    const with = try buildInitReply(initIn(45, offer | has_syncfs), test_plan, .{ .request_timeout_s = 135 });
     try testing.expect(with.syncfs());
-    try testing.expectEqual(abi.flags2Of(abi.FUSE_OVER_IO_URING | has_syncfs), with.out.flags2);
-    try testing.expectEqual(@as(u32, (1 << 9) | (1 << 12)), with.out.flags2);
-    const without = try buildInitReply(initIn(45, kernel_6_14_offer), test_plan, .{});
+    try testing.expectEqual(abi.flags2Of(abi.FUSE_OVER_IO_URING | abi.FUSE_REQUEST_TIMEOUT | has_syncfs), with.out.flags2);
+    try testing.expectEqual(@as(u32, (1 << 9) | (1 << 10) | (1 << 12)), with.out.flags2);
+    const without = try buildInitReply(initIn(45, offer), test_plan, .{ .request_timeout_s = 135 });
     try testing.expect(!without.syncfs());
-    try testing.expectEqual(abi.flags2Of(abi.FUSE_OVER_IO_URING), without.out.flags2);
-    const stranded = try buildInitReply(initIn(45, (kernel_6_14_offer | has_syncfs) & ~abi.FUSE_INIT_EXT), test_plan, .{});
+    try testing.expectEqual(abi.flags2Of(abi.FUSE_OVER_IO_URING | abi.FUSE_REQUEST_TIMEOUT), without.out.flags2);
+    const stranded = try buildInitReply(initIn(45, (offer | has_syncfs) & ~abi.FUSE_INIT_EXT), test_plan, .{ .request_timeout_s = 135 });
     try testing.expect(!stranded.syncfs());
+    // Unbounded, the host's sync would wait on this daemon forever: no syncfs.
+    const unasked = try buildInitReply(initIn(45, offer | has_syncfs), test_plan, .{});
+    try testing.expect(!unasked.syncfs());
+    const unoffered = try buildInitReply(initIn(45, kernel_6_14_offer | has_syncfs), test_plan, .{ .request_timeout_s = 135 });
+    try testing.expect(!unoffered.syncfs());
+}
+
+test "INIT reply carries the request timeout (FUSE_REQUEST_TIMEOUT, bit 42 = flags2 bit 10; `request_timeout` at byte 40) iff the kernel offered it and the session asked one; else 0 and the bit clear" {
+    try testing.expectEqual(@as(u64, 1 << 42), abi.FUSE_REQUEST_TIMEOUT);
+    const offer = kernel_6_14_offer | abi.FUSE_REQUEST_TIMEOUT;
+    const r = try buildInitReply(initIn(45, offer), test_plan, .{ .request_timeout_s = 135 });
+    try testing.expect(r.has(abi.FUSE_REQUEST_TIMEOUT));
+    try testing.expectEqual(@as(u16, 135), r.requestTimeoutS());
+    try testing.expectEqual(@as(u16, 135), std.mem.readInt(u16, abi.encode(r.out)[40..42], .little));
+    const unasked = try buildInitReply(initIn(45, offer), test_plan, .{});
+    try testing.expectEqual(@as(u16, 0), unasked.requestTimeoutS());
+    try testing.expectEqual(@as(u16, 0), unasked.out.request_timeout);
+    try testing.expectEqual(abi.flags2Of(abi.FUSE_OVER_IO_URING), unasked.out.flags2);
+    const unoffered = try buildInitReply(initIn(45, kernel_6_14_offer), test_plan, .{ .request_timeout_s = 135 });
+    try testing.expectEqual(@as(u16, 0), unoffered.requestTimeoutS());
+    try testing.expectEqual(@as(u16, 0), unoffered.out.request_timeout);
+    const stranded = try buildInitReply(initIn(45, offer & ~abi.FUSE_INIT_EXT), test_plan, .{ .request_timeout_s = 135 });
+    try testing.expectEqual(@as(u16, 0), stranded.requestTimeoutS());
 }
 
 test "INIT reply option gates: KILLPRIV_V2 iff offered ∧ wanted (v1 never rides along unless asked); writeback/dont_mask/no_open/no_opendir/export iff wanted; force_readdirplus drops READDIRPLUS_AUTO" {

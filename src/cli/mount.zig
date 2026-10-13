@@ -99,6 +99,9 @@ const sym_slots = @import("../meta/sym/slots.zig");
 const sym_wire = @import("../meta/sym/wire_plane.zig");
 const wire_tls = @import("../wire/tls.zig");
 const sym_reader = @import("../meta/sym/reader_plane.zig");
+const sym_park = @import("../meta/sym/membership/park_reclaim.zig");
+const extent_grant = @import("../meta/sym/extent_grant.zig");
+const lease_clock = @import("../meta/guard/lease_clock.zig");
 const ro_mount = @import("../meta/sym/tokens/ro_mount.zig");
 const wire_endpoint = @import("../wire/endpoint.zig");
 const handler = @import("../fuse/handler.zig");
@@ -175,6 +178,9 @@ const Ctx = struct {
     /// tick beats it for the mount's whole life, teardown included.
     heartbeat: ?*cli.supervisor.Heartbeat = null,
     session_ended: std.atomic.Value(bool) = .init(false),
+    /// The kernel ended the FUSE connection under the live mount (the
+    /// request timeout or a fusectl abort): fail-stopped, the exit is 1.
+    connection_aborted: bool = false,
     /// The verified volume key of an encrypted set (zeroized once the plane
     /// holds its crypto state).
     derived_key: ?transform.DerivedKey = null,
@@ -611,6 +617,12 @@ fn mountMain(ctx: *Ctx) u8 {
         fuse_fd = fusermount.mount(gpa, io, env, ctx.mountpoint, ow.buffered()) catch |e| return ctx.failed("fusermount3 could not mount {s} ({s})", .{ ctx.mountpoint, @errorName(e) });
         unmounter = .{ .ctx = &unmount_ctx, .call = UnmountCtx.call };
     }
+    // The request timeout (decision 0003 §Z): the lattice's whole deadline
+    // for one request — T_owner for the set to give a peer up, then the
+    // park that follows (the move gate's T_park_max; a `--single-writer`
+    // mount has no park and takes the same bound at the constant T_owner).
+    const lattice_t_owner_ms: u64 = if (wire) |wp| wp.t_owner_ms else if (rplane) |rp| rp.tOwnerMs() else lease_clock.T_OWNER_MS;
+    const lattice_park_max_ms: u64 = move_deadline_ms orelse sym_park.tParkMaxMs(extent_grant.failoverBoundMs(0, 0), sym_park.graceMs(lease_clock.T_OWNER_MS));
     var session_refusal: transport.session.Refusal = .none;
     const session = Session.mount(gpa, ctx.sqz, binding.filesystem(), ctx.mountpoint, env, facts, .{
         .opts = ctx.opts,
@@ -621,6 +633,7 @@ fn mountMain(ctx: *Ctx) u8 {
         .unmounter = unmounter,
         .on_shutdown = .{ .ctx = ctx, .call = onSessionShutdown },
         .refusal = &session_refusal,
+        .request_timeout_s = fuse_geometry.requestTimeoutS(lattice_t_owner_ms, lattice_park_max_ms),
     }) catch |e| {
         if (fuse_fd) |fd| {
             _ = fusermount.unmount(io, ctx.mountpoint);
@@ -818,6 +831,10 @@ fn mountMain(ctx: *Ctx) u8 {
     wd_fut.cancel(io);
     if (failed) {
         log.err("a member of {s} latched FAILED during this mount (EIO until remount) — exiting 1", .{ctx.meta_uri});
+        return cli.exit_failed;
+    }
+    if (ctx.connection_aborted) {
+        log.err("the FUSE connection of {s} was aborted under its live mount (fail-stopped) — exiting 1", .{ctx.mountpoint});
         return cli.exit_failed;
     }
     return cli.exit_ok;
@@ -1212,6 +1229,11 @@ fn serve(ctx: *Ctx, session: *Session, vs: *VirtualSource) void {
         }
         // acquire pairs with the hook's release.
         if (ctx.session_ended.load(.acquire) or !session.isReady()) {
+            if (session.endedUnderLiveMount()) {
+                ctx.connection_aborted = true;
+                log.err("the kernel ended the FUSE connection under the live mount at {s} — a request outlived the {d} s request timeout (this daemon was stopped or wedged past the fail-stop lattice's deadline, decision 0003 §Z) or the connection was aborted through fusectl: the mount is fail-stopped (ENOTCONN) until it is unmounted and mounted again; tearing down", .{ ctx.mountpoint, session.requestTimeoutS() });
+                return;
+            }
             log.info("the FUSE session ended ({s}): tearing down", .{if (session.isMounted()) "shutdown" else "unmounted"});
             return;
         }

@@ -588,3 +588,19 @@ agents' suites alongside).
   later applies it) surfaces a retryable refusal to the client, and a
   create retried across the move meets its own first attempt. Owned by the
   handover/intent design (`src/meta/sym/xv`, `slots/`); not changed here.
+- **The full gates of this branch** (`timeout 3900 zig build --cache-dir
+  /build/zig-cache gate --summary all`, uncached by a `clock.zig` touch;
+  other agents' smoke loops alongside): gate 1 (load 1.7) **46/46, 2746/2813**
+  (unit 2511 / 65 skip, smoke 84 / 2 skip, bench-smoke 41, shim-smoke 40,
+  nvmet-smoke 53, rails 16, shim census 1); gate 2 (load 7.9) smoke 83 / 2 /
+  **1 fail — the handover row** (above); after the rebase onto `2118f55`
+  three consecutive: gate A (load 9.4) shim-smoke **1 fail** — row 4b's
+  `sessions1 > sessions0`: the staged `libsqueezefs_il.so` in that gate's
+  directory carries identity `e1cdb245aca7` and `.wt-packtls` source paths
+  (the concurrent agent's shim through the shared `/build/zig-cache`, so the
+  pairing refused; the same staged pair fails 3 of 3 by hand, gate B's pair
+  passes 3 of 3) — external; gate B (load 0.9) **46/46, 2753/2822** (unit
+  2517 / 67 skip, smoke 85 / 2 skip); gate C (load 0.5) smoke 84 / 2 / **1
+  fail — the handover row** (B's chmod EAGAIN, the attributed class). The
+  online fsck row passed in all five. macOS `zig build gate` on the landed
+  tree: **28/28, 2157/2184** (27 skipped; unit 2049).

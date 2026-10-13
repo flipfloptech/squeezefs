@@ -588,6 +588,14 @@ pub const MetaSet = struct {
         for (self.volumes) |be| be.slots.bindMemo(memo);
     }
 
+    /// The mount's slot-move epoch into every member's lease table
+    /// (decision 0003 §X.1). A `-o ro` reader has no slot plane: nothing
+    /// it holds moves, its move gate re-polls.
+    pub fn bindMoves(self: *MetaSet, m: *routing_slots.moves.Moves) void {
+        if (self.posture == .reader) return;
+        for (self.volumes) |be| be.slots.table.bindMoves(m);
+    }
+
     /// The handover's step-0 drain over every member's plane (the
     /// filesystem's parked stamps of a slot, committed before its door
     /// closes).

@@ -95,6 +95,7 @@ const guard = @import("../meta/guard.zig");
 const node_cache = @import("../meta/node_cache.zig");
 const dlm = @import("../meta/dlm.zig");
 const sym_xv = @import("../meta/sym/xv.zig");
+const sym_slots = @import("../meta/sym/slots.zig");
 const sym_wire = @import("../meta/sym/wire_plane.zig");
 const wire_tls = @import("../wire/tls.zig");
 const sym_reader = @import("../meta/sym/reader_plane.zig");
@@ -573,9 +574,22 @@ fn mountMain(ctx: *Ctx) u8 {
     op_trace.arm(env);
     var reader_gate: handler.reader_gate.ReaderGate = .{ .inner = filesystem.Filesystem.of(BackendFs, &fs), .gate = undefined };
     if (rplane) |rp| reader_gate.gate = rp.gate();
+    // THE MOVE GATE (decision 0003 §X.1) outermost over the filesystem the
+    // FUSE session and the interception host call: every op an in-flight
+    // slot move refuses is re-issued by the daemon — parked on the mount's
+    // move epoch (every member's lease table bumps it), bounded by the
+    // lattice's T_park_max — never answered EAGAIN. A `--single-writer`
+    // mount has no wire and no move: the gate is not armed.
+    // The set's tables keep the pointer to the end: this frame outlives
+    // the set's close on every exit.
+    var moves = sym_slots.moves.Moves.init(io);
+    be.bindMoves(&moves);
+    const move_deadline_ms: ?u64 = if (wire) |wp| wp.moveDeadlineMs() else if (rplane) |rp| rp.moveDeadlineMs() else null;
+    var move_gate: handler.move_gate.MoveGate = .{ .inner = if (rplane != null) reader_gate.filesystem() else filesystem.Filesystem.of(BackendFs, &fs), .moves = &moves, .deadline_ns = sym_slots.moves.deadlineNs(move_deadline_ms orelse 0) };
+    const served_fs: filesystem.Filesystem = if (move_deadline_ms != null) move_gate.filesystem() else move_gate.inner;
     var binding: handler.ring.Binding = .{};
     binding.bind(.{
-        .fs = if (rplane != null) reader_gate.filesystem() else filesystem.Filesystem.of(BackendFs, &fs),
+        .fs = served_fs,
         .io = io,
         .registry = &registry,
         .guards = &guards,
@@ -619,6 +633,9 @@ fn mountMain(ctx: *Ctx) u8 {
     };
     var session_live = true;
     defer if (session_live) session.deinit();
+    // An early exit from here on ends every move park BEFORE the session's
+    // teardown joins its handlers (the serve path closes it explicitly).
+    defer moves.close();
     vs.renderer.sources.session = session;
     // A recalled token's kernel view rides the session's notify seam; so
     // does a served record verb's (the holder's own kernel view).
@@ -648,7 +665,7 @@ fn mountMain(ctx: *Ctx) u8 {
             .facts = facts,
             .budget_bytes = ctx.budget_bytes,
             .plane = plane,
-            .fs = filesystem.Filesystem.of(BackendFs, &fs),
+            .fs = served_fs,
             .il0_bind = &bindIl0Thunk,
             .il0_ctx = &fs,
             .guards = &guards,
@@ -722,6 +739,9 @@ fn mountMain(ctx: *Ctx) u8 {
 
     // 7. Serve until a stop latches or the session ends.
     serve(ctx, session, &vs);
+    // Every op parked on a slot move answers now (EIO, counted): nothing
+    // the teardown joins waits out the lattice's deadline.
+    moves.close();
 
     // 8. Teardown in order: the budget sampler first (stopped and joined
     //    while every source it reads is still live — step 4's law), then

@@ -657,6 +657,67 @@ test "a holder that cannot be reached is re-resolved before the ship is given up
     try f.noOpenIntents();
 }
 
+/// A's create of `name` in B's directory with its insert meeting slot 3
+/// MID-MOVE (nobody leases it once the guards travelled): the execute
+/// fails and, held, names the intent it left open.
+fn createMidMove(f: *TwoHolders, name: []const u8, child: u64) !ops.HeldOpen {
+    const plan = steps.planCreate(.{ .parent = DIR_B, .name = name, .child = child, .mode = S.IFREG | 0o644, .uid = 1, .gid = 2, .now = 1_000 });
+    const scope = f.a.plane.mintScope();
+    var guards_held = try f.a.plane.acquirePlanGuards(&plan, scope, false);
+    defer guards_held.release(f.gpa);
+    const i = std.mem.indexOfScalar(u16, f.b.store.leased.items, 3).?;
+    _ = f.b.store.leased.swapRemove(i);
+    var left: ?ops.HeldOpen = null;
+    try testing.expectError(error.ShipFailed, f.a.plane.executeHeld(&plan, scope, 1_000, &left));
+    return left orelse error.TestNotHeld;
+}
+
+test "a create whose insert met a slot MID-MOVE stays the LIVE op's (decision 0003 §X.2): the intent held in flight — the cadence never takes it while the op may resume — and the op's re-issue resumes THAT intent once the move lands: the same child, one name, no orphan, the closure; a resume that finds the name taken meanwhile compensates (the first attempt's child destroyed) and answers EEXIST; a give-up hands the held intent to the cadence" {
+    const gpa = testing.allocator;
+    const f = try TwoHolders.init(gpa, testing.io, .{}, .{});
+    defer f.deinit();
+    try f.b.seedDir(DIR_B);
+    const s0 = Snapshot.take();
+    const held0 = ops.stats.xv_held_open.load();
+    // The re-issue resumes: the same child, named once.
+    const child = f.a.mint();
+    const open = try createMidMove(f, "x", child);
+    try testing.expectEqual(held0 + 1, ops.stats.xv_held_open.load());
+    try testing.expectEqual(intent.IntentState.in_flight, f.a.plane.register.stateOf(open.tx_id).?);
+    try testing.expect(!f.a.plane.register.anyAbandoned());
+    try testing.expectEqual(@as(u32, 0), try f.a.plane.cadenceTick(clock.monotonicNs()));
+    try testing.expect((try f.a.inode(child)) != null);
+    try f.b.store.leased.append(gpa, 3);
+    var again: ?ops.HeldOpen = null;
+    const done = try f.a.plane.resumeHeld(open, 1_000, &again);
+    try testing.expect(done.refused == null);
+    try testing.expect(again == null);
+    try testing.expectEqual(child, (try f.b.dentry(DIR_B, "x")).?.child);
+    try testing.expectEqual(@as(u32, 1), (try f.a.inode(child)).?.nlink);
+    try f.noOpenIntents();
+    // A resume that meets the name taken meanwhile: compensated, EEXIST.
+    const child2 = f.a.mint();
+    const open2 = try createMidMove(f, "y", child2);
+    try f.b.store.leased.append(gpa, 3);
+    const other = try f.b.create(DIR_B, "y", S.IFREG | 0o644);
+    const destroyed0 = applier.stats.xv_cross_owner_mints_destroyed.load();
+    const done2 = try f.a.plane.resumeHeld(open2, 1_000, &again);
+    try testing.expectEqual(errors.Error.PathAlreadyExists, done2.refused.?);
+    try testing.expectEqual(destroyed0 + 1, applier.stats.xv_cross_owner_mints_destroyed.load());
+    try testing.expect((try f.a.inode(child2)) == null);
+    try testing.expectEqual(other, (try f.b.dentry(DIR_B, "y")).?.child);
+    try f.noOpenIntents();
+    // The op gives up (the gate's deadline): the cadence completes it.
+    const child3 = f.a.mint();
+    const open3 = try createMidMove(f, "z", child3);
+    try f.b.store.leased.append(gpa, 3);
+    f.a.plane.abandonHeld(open3.tx_id);
+    try testing.expectEqual(@as(u32, 1), try f.a.plane.cadenceTick(clock.monotonicNs()));
+    try testing.expectEqual(child3, (try f.b.dentry(DIR_B, "z")).?.child);
+    try f.noOpenIntents();
+    try f.closureHolds(s0.minted, s0.retired, s0.open);
+}
+
 test "a live witness refusal at the shipped step (a racing creator's name landed first) COMPENSATES: the ABORTING flip, the minted child destroyed, the intent retired, EEXIST answered; and an ABORTING intent met by the roll-forward runs the INVERSE plan" {
     const gpa = testing.allocator;
     const f = try TwoHolders.init(gpa, testing.io, .{}, .{});

@@ -594,7 +594,10 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         }
 
         /// Run `plan` as ONE intent under its travelling guards; a live
-        /// refusal answers the refused step's errno.
+        /// refusal answers the refused step's errno. An intent left open at
+        /// a slot move stays this op's under a move gate (`c.move`): the
+        /// gate's re-issue resumes it (decision 0003 §X.2); without a gate
+        /// it is the cadence's.
         fn runPlan(self: *Self, c: *Ctx, plan: *const sym_xv.steps.Plan) Error!sym_xv.ops.Done {
             const p = self.xv.?;
             c.stage(.meta_backend_start);
@@ -602,9 +605,76 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             const scope = p.mintScope();
             var held = p.acquirePlanGuards(plan, scope, false) catch |e| return xvErr(e);
             defer held.release(self.gpa);
-            const done = p.execute(plan, scope, now()) catch |e| return xvErr(e);
+            var left: ?sym_xv.ops.HeldOpen = null;
+            const done = p.executeHeld(plan, scope, now(), if (c.move != null) &left else null) catch |e| {
+                if (left) |l| self.holdOpen(c, l);
+                return xvErr(e);
+            };
             if (done.refused) |e| return e;
             return done;
+        }
+
+        /// The open intent named in the op's attempt state, with the
+        /// give-up that hands it to the cadence.
+        fn holdOpen(self: *Self, c: *Ctx, l: sym_xv.ops.HeldOpen) void {
+            c.move.?.open = .{ .home = l.home, .tx_id = l.tx_id, .abandon = &abandonHeldFn, .ctx = self };
+        }
+
+        fn abandonHeldFn(ctx: *anyopaque, tx_id: u64) void {
+            const self: *Self = @ptrCast(@alignCast(ctx));
+            if (self.xv) |p| p.abandonHeld(tx_id);
+        }
+
+        /// The re-issue of an op whose earlier attempt left its intent open
+        /// (decision 0003 §X.2): THAT intent resumed under the op — its
+        /// outcomes, or the live refusal's errno. Null = nothing to resume
+        /// (the op runs from the top), or the record another roller retired
+        /// meanwhile (the op runs from the top against that outcome).
+        fn resumeOpen(self: *Self, c: *Ctx) Error!?sym_xv.ops.Done {
+            const m = c.move orelse return null;
+            const oi = m.open orelse return null;
+            m.open = null;
+            const p = self.xv.?;
+            c.stage(.meta_backend_start);
+            defer c.stage(.meta_backend_done);
+            var left: ?sym_xv.ops.HeldOpen = null;
+            const done = p.resumeHeld(.{ .home = oi.home, .tx_id = oi.tx_id }, now(), &left) catch |e| switch (e) {
+                error.Gone => return null,
+                else => |ee| {
+                    if (left) |l| self.holdOpen(c, l);
+                    return xvErr(ee);
+                },
+            };
+            if (done.refused) |e| return e;
+            return done;
+        }
+
+        /// The op's first attempt names what it is about (the resume's
+        /// reply and memo updates read it back).
+        fn noteSubjects(c: *Ctx, subject: u64, subject2: ?u64) void {
+            const m = c.move orelse return;
+            m.subject = subject;
+            m.subject2 = subject2;
+        }
+
+        /// A create whose child is the op's OWN (its intent resumed, or its
+        /// first attempt's name found landed): the first attempt's child
+        /// answered — the same ino, never EEXIST against itself — with the
+        /// memo and the shape `xvCreate` leaves.
+        fn ownCreate(self: *Self, global: u64, logical_parent: u64) Error!filesystem.Entry {
+            const local = try localOf(global);
+            const v = (try self.readInodeOpt(local)) orelse return error.InputOutput;
+            if (economy.isDirMode(v.mode)) self.rememberParent(global, logical_parent);
+            if (v.mode & S.IFMT == S.IFREG) self.data.noteShape(local, 0, .inline_);
+            return self.entryOf(global, v);
+        }
+
+        /// The child this op minted on an earlier attempt, when `found` is
+        /// it (its name landed before the move refused the reply).
+        fn isOwnChild(c: *const Ctx, found: u64) bool {
+            const m = c.move orelse return false;
+            const own = m.subject orelse return false;
+            return own == found;
         }
 
         /// A locally dispatched op whose commit door answered `SlotBusy`
@@ -1816,6 +1886,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         /// STRIPE (`hash54 % K`), the `..` memo keeps the directory.
         fn createChild(self: *Self, c: *Ctx, parent_global: u64, name: []const u8, child: NewChild) Error!filesystem.Entry {
             try checkMutableName(parent_global, name);
+            if (try self.resumeOpen(c)) |_| return self.ownCreate(c.move.?.subject orelse return error.InputOutput, parent_global);
             const key_parent = try self.insertParentOf(parent_global, name);
             return self.createChildAt(c, key_parent, parent_global, name, child);
         }
@@ -1824,9 +1895,12 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             const is_dir = economy.isDirMode(child.mode);
             const parent = try localOf(parent_global);
             // The mint first: the child's home decides the arm (a foreign
-            // parent or a rotor on another member ⇒ ONE intent).
-            const local = self.store.allocateIno(parent, false, try self.gatherOptIn(parent)) catch |e| return storeErr(e);
+            // parent or a rotor on another member ⇒ ONE intent). A re-issue
+            // reuses the ino its first attempt minted (decision 0003 §X.2).
+            const reused: ?u64 = if (c.move) |m| m.subject else null;
+            const local = if (reused) |g| try localOf(g) else self.store.allocateIno(parent, false, try self.gatherOptIn(parent)) catch |e| return storeErr(e);
             const global = globalOf(local);
+            noteSubjects(c, global, null);
             if (self.spansHomes(&.{ parent_global, global })) return self.xvCreate(c, parent_global, logical_parent, name, child, local, global);
             var plan: economy.GuardPlan = .{};
             plan.inode_reqs[0] = .{ .ino = parent, .mode = if (is_dir) .exclusive else .shared };
@@ -1841,7 +1915,12 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             var chain: ChainBuf = .{};
             var kvs: std.ArrayList(tree.KeyValue) = .empty;
             defer tree.deinitKeyValues(self.gpa, &kvs);
-            if (try self.scanChain(parent, name, &chain, &kvs) != null) return error.PathAlreadyExists;
+            if (try self.scanChain(parent, name, &chain, &kvs)) |f| {
+                t_owned = false;
+                self.store.abandon(t);
+                if (isOwnChild(c, f.global)) return self.ownCreate(f.global, logical_parent);
+                return error.PathAlreadyExists;
+            }
             const stamp = now();
             const out = if (child.target) |target|
                 economy.stageSymlink(t, .{ .name_key = self.store.nameKey(), .now = stamp, .parent = parent, .parent_value = pv, .name = name, .uid = c.uid, .gid = c.gid, .local_ino = local, .global_ino = global, .target = target, .chain = chain.slice() }) catch |e| return switch (e) {
@@ -1875,7 +1954,10 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             const parent = try localOf(parent_global);
             const pv = try self.readDir(parent);
             if (pv.nlink == 0) return error.FileNotFound;
-            if (try self.findDentry(parent, name) != null) return error.PathAlreadyExists;
+            if (try self.findDentry(parent, name)) |f| {
+                if (isOwnChild(c, f.global)) return self.ownCreate(f.global, logical_parent);
+                return error.PathAlreadyExists;
+            }
             var mode = child.mode;
             var gid = c.gid;
             if (pv.mode & S.ISGID != 0) {
@@ -1926,6 +2008,10 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         /// and every stripe (`Stripes.rmdir`).
         fn removeChild(self: *Self, c: *Ctx, logical_parent: u64, name: []const u8, want_dir: bool) Error!void {
             try checkMutableName(logical_parent, name);
+            if (try self.resumeOpen(c)) |_| {
+                if (want_dir) if (c.move.?.subject) |child| self.forgetParent(child);
+                return;
+            }
             const parent_global = try self.mutationParentOf(logical_parent, name);
             const parent = try localOf(parent_global);
             const probe = (try self.findDentry(parent, name)) orelse return error.FileNotFound;
@@ -1974,6 +2060,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             if (cv == null) sym_xv.ops.stats.xv_cross_owner_dangling_names.fire("a name whose child has no record at its holder");
             if (want_dir and try self.dirHasEntriesAt(found)) return error.DirectoryNotEmpty;
             const plan = sym_xv.steps.planUnlink(.{ .parent = parent_global, .name = name, .child = found.global, .child_value = cv, .is_dir = want_dir, .now = now() });
+            noteSubjects(c, found.global, null);
             _ = try self.runPlan(c, &plan);
             if (want_dir) self.forgetParent(found.global);
         }
@@ -1995,6 +2082,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         pub fn rename(self: *Self, c: *Ctx, a0: filesystem.RenameArgs) Error!void {
             try checkMutableName(a0.parent, a0.name);
             try checkMutableName(a0.newparent, a0.newname);
+            if (try self.resumeOpen(c)) |_| return self.ownRename(c, a0);
             var a = a0;
             a.parent = try self.mutationParentOf(a0.parent, a0.name);
             a.newparent = try self.mutationParentOf(a0.newparent, a0.newname);
@@ -2144,6 +2232,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 const n = new0.?;
                 const nv = (try self.readInodeOpt(n.local)) orelse return error.FileNotFound;
                 const plan = sym_xv.steps.planExchange(.{ .old_parent = a.parent, .old_name = a.name, .new_parent = a.newparent, .new_name = a.newname, .a = old0.global, .a_mode = cv.mode, .b = n.global, .b_mode = nv.mode, .now = stamp });
+                noteSubjects(c, old0.global, n.global);
                 _ = try self.runPlan(c, &plan);
                 if (old0.isDir()) self.rememberParent(old0.global, logical.new);
                 if (n.isDir()) self.rememberParent(n.global, logical.old);
@@ -2157,9 +2246,23 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 wo = globalOf(l);
             }
             const plan = sym_xv.steps.planRename(.{ .old_parent = a.parent, .old_name = a.name, .new_parent = a.newparent, .new_name = a.newname, .child = old0.global, .child_mode = cv.mode, .dest = if (dest) |d| .{ .ino = d.ino, .value = d.value } else null, .whiteout = wo, .now = stamp });
+            noteSubjects(c, old0.global, if (new0) |n| n.global else null);
             _ = try self.runPlan(c, &plan);
             if (old0.isDir()) self.rememberParent(old0.global, logical.new);
             if (new0) |n| if (n.isDir()) self.forgetParent(n.global);
+        }
+
+        /// A rename whose intent its re-issue completed: the `..` memo as
+        /// `xvRename` leaves it, off the subjects its first attempt named
+        /// (the moved inode; a replaced or exchanged destination).
+        fn ownRename(self: *Self, c: *Ctx, a0: filesystem.RenameArgs) Error!void {
+            const m = c.move.?;
+            const moved = m.subject orelse return error.InputOutput;
+            const exchange = a0.flags & RENAME_EXCHANGE != 0;
+            if (try self.readInodeOpt(try localOf(moved))) |v| if (economy.isDirMode(v.mode)) self.rememberParent(moved, a0.newparent);
+            const dest = m.subject2 orelse return;
+            if (!exchange) return self.forgetParent(dest);
+            if (try self.readInodeOpt(try localOf(dest))) |v| if (economy.isDirMode(v.mode)) self.rememberParent(dest, a0.parent);
         }
 
         /// The ancestry walk's seams over this filesystem: the `..` memo
@@ -2248,6 +2351,11 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         pub fn link(self: *Self, c: *Ctx, a0: filesystem.LinkArgs) Error!filesystem.Entry {
             try checkMutableName(a0.newparent, a0.newname);
             if (virtual_inodes.isVirtualIno(a0.ino)) return error.PermissionDenied;
+            if (try self.resumeOpen(c)) |_| {
+                const child = try localOf(a0.ino);
+                _ = self.pending.retire(child);
+                return self.entryOf(a0.ino, try self.readInode(child));
+            }
             // The striped prelude: the new name keys its stripe.
             var a = a0;
             a.newparent = try self.insertParentOf(a0.newparent, a0.newname);
@@ -2296,6 +2404,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             if (economy.isDirMode(cv.mode)) return error.AccessDenied;
             if (try self.findDentry(parent, a.newname) != null) return error.PathAlreadyExists;
             const plan = sym_xv.steps.planLink(.{ .parent = a.newparent, .name = a.newname, .ino = a.ino, .child_value = cv, .now = now() }) catch return error.TooManyLinks;
+            noteSubjects(c, a.ino, null);
             const done = try self.runPlan(c, &plan);
             _ = self.pending.retire(child);
             return self.entryOf(a.ino, done.inode(0) orelse cv);
@@ -2390,6 +2499,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         /// to its own block DURABLY first.
         pub fn write(self: *Self, c: *Ctx, a: filesystem.WriteArgs) Error!filesystem.Written {
             const local = try localOf(a.ino);
+            if (c.move) |m| if (m.write_landed) |wl| return self.shipSizeClaim(c, local, wl);
             const len: u64 = if (a.held) |h| h.src.len else a.data.len;
             const end = std.math.add(u64, a.offset, len) catch return error.FileTooBig;
             // (3.7) BEFORE the layout read, held across the arm's commit
@@ -2563,6 +2673,26 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             c.stage(.write_parked_pool);
         }
 
+        /// A foreign-slot file's postlude: the size claim as ONE shipped
+        /// record verb after the pieces were acked. A move-class refusal
+        /// records the landed write in the op's attempt state, so the move
+        /// gate's re-issue re-runs this claim alone (decision 0003 §X.2).
+        fn shipSizeClaim(self: *Self, c: *Ctx, local: u64, wl: filesystem.MoveAttempt.WriteLanded) Error!filesystem.Written {
+            if (c.move) |m| m.write_landed = null;
+            const held = try self.readInode(local);
+            const size = @max(held.size, wl.size_claim);
+            const stamp = now();
+            _ = self.shipRecord(globalOf(local), .{ .setattr = .{ .size = size, .mtime = stamp, .ctime = stamp } }) catch |e| {
+                if (errors.isMoveClass(e)) if (c.move) |m| {
+                    m.write_landed = wl;
+                };
+                return e;
+            };
+            self.data.noteShape(local, size, .striped);
+            fuse_write_striped.inc();
+            return .{ .size = @intCast(wl.written) };
+        }
+
         /// The striped arm: a non-striped file promotes first (its resident
         /// payload DMA'd to its own block, the striped layout naming it
         /// published — block I/O before the type flip), then the data
@@ -2604,15 +2734,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             // pieces were acked by their arms. A foreign-slot file's claim
             // is ONE shipped record verb (its stamp never parks here: the
             // holder's record is the fold's authority).
-            if (self.foreignSlot(globalOf(local))) {
-                const held = try self.readInode(local);
-                const size = @max(held.size, outcome.size_claim);
-                const stamp = now();
-                _ = try self.shipRecord(globalOf(local), .{ .setattr = .{ .size = size, .mtime = stamp, .ctime = stamp } });
-                self.data.noteShape(local, size, .striped);
-                fuse_write_striped.inc();
-                return .{ .size = @intCast(outcome.written) };
-            }
+            if (self.foreignSlot(globalOf(local))) return self.shipSizeClaim(c, local, .{ .size_claim = outcome.size_claim, .written = outcome.written });
             const t = try self.beginExclusive(local, @src());
             var t_owned = true;
             errdefer if (t_owned) self.store.abandon(t);
@@ -3620,6 +3742,8 @@ test "the must-implement set is bound; the rung-4 ops default to ENOSYS" {
 // ---------------------------------------------------------------------------
 
 const lifecycle = @import("lifecycle.zig");
+const move_gate = @import("move_gate.zig");
+const sym_slots = @import("../../meta/sym/slots.zig");
 const seam = @import("transport_seam.zig");
 const watchdog = @import("watchdog.zig");
 const open_table = @import("open_table.zig");
@@ -5098,7 +5222,7 @@ test "POSIX: fsync reaches the store's barrier; statfs reports the heap in pages
     h.release(f);
 }
 
-test "the parked joiner's `.stats` under a dead manager (rung 10 item 5a): getattr(1) whose token serve refuses retryable (the root's holder dead) is served off the divert's last root entry — the exemption the -o ro fail-stop gate grants getattr(1); with no root ever served the refusal stands (EAGAIN); another ino never falls back" {
+test "the parked joiner's `.stats` under a dead manager (rung 10 item 5a): getattr(1) whose token serve refuses retryable (the root's holder dead) is served off the divert's last root entry — the exemption the -o ro fail-stop gate grants getattr(1); with no root ever served the move gate retries the refusal and answers EIO past the lattice's deadline (decision 0003 §X.1: never EAGAIN); another ino never falls back" {
     const H = HarnessOf(NoData);
     var h: H = undefined;
     try h.init();
@@ -5120,8 +5244,13 @@ test "the parked joiner's `.stats` under a dead manager (rung 10 item 5a): getat
     var d = read_divert.Divert.init(testing.allocator, testing.io, .{ .ctx = &marker, .homeOf = &Dead.homeOf, .refresh = &Dead.refresh, .dial = &Dead.dial }, 1, 0, read_divert.cache.RecallSink.none, read_divert.cache.SelfLease.always, read_divert.cache.recordsBudgetBytes(0));
     defer d.deinit();
     h.fs.bindDivert(&d);
-    // No root ever served under a token: the refusal stands, typed EAGAIN.
-    try testing.expectEqual(@as(?linux.E, .AGAIN), h.call(.{ .getattr = .{ .flags = 0, .fh = null } }, 1).errno());
+    // The product's move gate in front: a dead holder that never resolves
+    // within the lattice's deadline is EIO, loud.
+    var mv = sym_slots.moves.Moves.init(testing.io);
+    var gate: move_gate.MoveGate = .{ .inner = filesystem.Filesystem.of(H.Fs, &h.fs), .moves = &mv, .deadline_ns = 3 * sym_slots.moves.REPOLL_MIN_NS };
+    h.d = LoopDispatcher.init(&h.lb, .{ .fs = gate.filesystem(), .io = testing.io, .registry = &h.reg, .guards = &h.guards, .opens = &h.opens });
+    // No root ever served under a token: retried, then EIO.
+    try testing.expectEqual(@as(?linux.E, .IO), h.call(.{ .getattr = .{ .flags = 0, .fh = null } }, 1).errno());
     // The last root entry: served, with its words.
     d.last_root = .{ .mode = S.IFDIR | 0o755, .nlink = 9, .mtime = 777 * std.time.ns_per_s, .ctime = 777 * std.time.ns_per_s };
     const served0 = read_divert.stats.dlm_token_root_served_last.load();
@@ -5129,8 +5258,8 @@ test "the parked joiner's `.stats` under a dead manager (rung 10 item 5a): getat
     try testing.expectEqual(@as(u32, 9), a.nlink);
     try testing.expectEqual(@as(u64, 777), a.mtime);
     try testing.expectEqual(served0 + 1, read_divert.stats.dlm_token_root_served_last.load());
-    // Any other ino under the dead holder refuses as before.
-    try testing.expectEqual(@as(?linux.E, .AGAIN), h.call(.{ .getattr = .{ .flags = 0, .fh = null } }, 2).errno());
+    // Any other ino under the dead holder: retried, then EIO.
+    try testing.expectEqual(@as(?linux.E, .IO), h.call(.{ .getattr = .{ .flags = 0, .fh = null } }, 2).errno());
     try testing.expectEqual(served0 + 1, read_divert.stats.dlm_token_root_served_last.load());
 }
 

@@ -132,6 +132,7 @@ pub const SlotHolderCache = struct {
     /// A grant observed (a reply, a redirect, tree 0's refresh): kept iff
     /// not below the known `g`.
     pub fn learn(self: *SlotHolderCache, slot: u16, h: SlotHolder) Allocator.Error!void {
+        defer self.table.noteMoved();
         self.lock.lock();
         defer self.lock.unlock();
         if (self.learnt.get(slot)) |l| if (l.g > h.g) return;
@@ -143,6 +144,7 @@ pub const SlotHolderCache = struct {
     /// A release observed (or the manager's "unleased"): the view drops
     /// (the table is the truth again) and the slot is known unleased.
     pub fn forget(self: *SlotHolderCache, slot: u16) void {
+        defer self.table.noteMoved();
         self.lock.lock();
         defer self.lock.unlock();
         _ = self.learnt.remove(slot);

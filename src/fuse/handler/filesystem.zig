@@ -58,12 +58,52 @@ pub const Ctx = struct {
     wd_slot: ?*watchdog.OpSlot,
     /// The reply window.
     window: []u8,
+    /// The op's state across the move gate's re-issues (null outside a
+    /// gate: a tool, a test calling the filesystem directly).
+    move: ?*MoveAttempt = null,
 
     /// Stamp a stage: the trace moves (a clock read only under profiling)
     /// and the watchdog station follows (one relaxed store).
     pub fn stage(self: *Ctx, s: op_trace.Stage) void {
         self.trace.stamp(s);
         if (self.wd_slot) |sl| sl.setStation(s);
+    }
+};
+
+/// One op's state across the move gate's attempts (decision 0003 §X.2):
+/// the cross-owner intent an attempt left OPEN at a slot move — the
+/// re-issue resumes THAT intent (its id is the op id; the intent stays the
+/// live op's, never the cadence's, between the attempts) — and the inos the
+/// op is about, recorded by its first attempt: `subject` the child it
+/// minted (a re-issue reuses it rather than minting another), the name's
+/// child it removes or the inode it links or moves; `subject2` a rename's
+/// replaced (or exchanged) destination. A resumed intent's reply and memo
+/// updates are derived from them.
+pub const MoveAttempt = struct {
+    open: ?OpenIntent = null,
+    subject: ?u64 = null,
+    subject2: ?u64 = null,
+    /// A write whose pieces its arms acked before the move refused its
+    /// size claim (a foreign-slot file's shipped postlude): the re-issue
+    /// re-runs the claim alone — the payload is never admitted twice.
+    write_landed: ?WriteLanded = null,
+
+    pub const WriteLanded = struct { size_claim: u64, written: u64 };
+
+    pub const OpenIntent = struct {
+        home: u64,
+        tx_id: u64,
+        /// The give-up: the intent is handed to the roll-forward cadence.
+        abandon: *const fn (ctx: *anyopaque, tx_id: u64) void,
+        ctx: *anyopaque,
+    };
+
+    /// The op ended without resuming its open intent (it answered another
+    /// error, or the gate gave up): the cadence completes it.
+    pub fn abandonOpen(self: *MoveAttempt) void {
+        const oi = self.open orelse return;
+        self.open = null;
+        oi.abandon(oi.ctx, oi.tx_id);
     }
 };
 

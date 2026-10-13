@@ -22,6 +22,7 @@ pub const handover = @import("slots/handover.zig");
 pub const page_budget = @import("slots/page_budget.zig");
 pub const resolve = @import("slots/resolve.zig");
 pub const tails_spill = @import("slots/tails_spill.zig");
+pub const moves = @import("slots/moves.zig");
 
 pub const LeaseTable = lease_table.LeaseTable;
 pub const Door = door.Door;
@@ -89,6 +90,8 @@ test {
     _ = page_budget;
     _ = resolve;
     _ = tails_spill;
+    _ = moves;
+    _ = @import("slots/move_epoch_model.zig");
 }
 
 test "the tree gauges fold a sorted census: p50/p99/max of inos and bytes; empty reads 0" {

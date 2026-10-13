@@ -40,6 +40,7 @@ const inos = @import("../../inos.zig");
 const route_table = @import("../../routing/route_table.zig");
 const cr = @import("../control_records.zig");
 const page = @import("../appender_page.zig");
+const moves_mod = @import("moves.zig");
 
 const assert = std.debug.assert;
 
@@ -211,6 +212,10 @@ pub const LeaseTable = struct {
     /// generation and every leaf's tail; a release REPLACES the set): the
     /// frame screen's rule 2 input, read on the load miss path.
     tails: std.AutoHashMapUnmanaged(u16, SlotTailSet) = .empty,
+    /// The mount's slot-move epoch (decision 0003 §X.1), bumped after every
+    /// transition below lands (outside the lock); null = no move-retried
+    /// caller observes this table (a RAM harness, a tool).
+    moves: std.atomic.Value(?*moves_mod.Moves) = .init(null),
 
     pub fn init(gpa: Allocator) Allocator.Error!*LeaseTable {
         const self = try gpa.create(LeaseTable);
@@ -231,6 +236,18 @@ pub const LeaseTable = struct {
         self.tails.deinit(self.gpa);
         self.gpa.free(self.cells);
         self.gpa.destroy(self);
+    }
+
+    /// Bind the mount's move epoch (the release pairs with `noteMoved`'s
+    /// acquire).
+    pub fn bindMoves(self: *LeaseTable, m: *moves_mod.Moves) void {
+        self.moves.store(m, .release);
+    }
+
+    /// A transition this table published (or a view a caller acts on, the
+    /// holder cache's): the parked move-retried callers re-resolve.
+    pub fn noteMoved(self: *LeaseTable) void {
+        if (self.moves.load(.acquire)) |m| m.bump();
     }
 
     // ---- the recorded tails (rule 2's input) ----
@@ -323,6 +340,7 @@ pub const LeaseTable = struct {
     /// the durable word verbatim. A `releasing` record is the recovery's
     /// structural mark: `dead` (first touches refused).
     pub fn load(self: *LeaseTable, slot: u16, s: cr.SlotState) Allocator.Error!void {
+        defer self.noteMoved();
         self.lock.lock();
         defer self.lock.unlock();
         const prev = self.view(slot);
@@ -351,6 +369,7 @@ pub const LeaseTable = struct {
     /// word drops to unleased at `g`. A word that changed meanwhile, or a
     /// generation newer than the answer, is left.
     pub fn dropForeign(self: *LeaseTable, slot: u16, holder: AppenderId, g: u32) void {
+        defer self.noteMoved();
         self.lock.lock();
         defer self.lock.unlock();
         const v = self.view(slot);
@@ -366,6 +385,7 @@ pub const LeaseTable = struct {
     /// naming its holder and `g` (the same holder = the idempotent replay
     /// the caller answers `already`); `releasing{dead}` refuses as dead.
     pub fn acquire(self: *LeaseTable, slot: u16, holder: AppenderId, rotor: bool) Allocator.Error!AcquireOutcome {
+        defer self.noteMoved();
         self.lock.lock();
         defer self.lock.unlock();
         const v = self.view(slot);
@@ -383,6 +403,7 @@ pub const LeaseTable = struct {
     /// minted `g` (one ahead of tree 0 is harmless: `g` need only be
     /// monotone) and `last_written = 0`.
     pub fn rollbackUnwritten(self: *LeaseTable, slot: u16) void {
+        defer self.noteMoved();
         self.lock.lock();
         defer self.lock.unlock();
         const v = self.view(slot);
@@ -506,6 +527,12 @@ pub const LeaseTable = struct {
     /// lapsed ones are reported for the counters and a wire recall's
     /// withdrawal. Bounded by `out`.
     pub fn expireOffers(self: *LeaseTable, now_ns: u64, out: []LapsedOffer) usize {
+        const n = self.expireOffersLocked(now_ns, out);
+        if (n != 0) self.noteMoved();
+        return n;
+    }
+
+    fn expireOffersLocked(self: *LeaseTable, now_ns: u64, out: []LapsedOffer) usize {
         self.lock.lock();
         defer self.lock.unlock();
         var n: usize = 0;
@@ -545,6 +572,7 @@ pub const LeaseTable = struct {
     /// The abort: the slot accepts commits again; the parkers wake (the
     /// door's business, not the table's).
     pub fn abortRelease(self: *LeaseTable, slot: u16) void {
+        defer self.noteMoved();
         self.lock.lock();
         defer self.lock.unlock();
         const v = self.view(slot);
@@ -561,6 +589,7 @@ pub const LeaseTable = struct {
     /// once, a replay at the same `g` of an already-unleased slot is
     /// `already`. Records the words and `last_written`.
     pub fn release(self: *LeaseTable, slot: u16, holder: AppenderId, g: u32, words: SlotWords, now_ns: u64) Allocator.Error!ReleaseOutcome {
+        defer self.noteMoved();
         self.lock.lock();
         defer self.lock.unlock();
         const v = self.view(slot);
@@ -595,6 +624,7 @@ pub const LeaseTable = struct {
     /// the lease forgotten whatever its state; tree 0's record is the
     /// engine's teardown.
     pub fn evict(self: *LeaseTable, slot: u16) void {
+        defer self.noteMoved();
         self.lock.lock();
         defer self.lock.unlock();
         const v = self.view(slot);
@@ -619,6 +649,7 @@ pub const LeaseTable = struct {
     }
 
     pub fn reopenCutover(self: *LeaseTable, slot: u16) void {
+        defer self.noteMoved();
         self.lock.lock();
         defer self.lock.unlock();
         const w = self.cells[slot].word.load(.seq_cst);

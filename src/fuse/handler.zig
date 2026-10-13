@@ -34,6 +34,7 @@ pub const kv_fs = @import("handler/kv_fs.zig");
 pub const kv_fs_stripes = @import("handler/kv_fs_stripes.zig");
 pub const virtual_inodes = @import("handler/virtual_inodes.zig");
 pub const reader_gate = @import("handler/reader_gate.zig");
+pub const move_gate = @import("handler/move_gate.zig");
 
 pub const Filesystem = filesystem.Filesystem;
 pub const Ctx = filesystem.Ctx;
@@ -197,6 +198,7 @@ test {
     _ = kv_fs_stripes;
     _ = virtual_inodes;
     _ = reader_gate;
+    _ = move_gate;
     if (builtin.os.tag == .linux) _ = backend_e2e;
 }
 

@@ -1160,6 +1160,15 @@ pub const WirePlane = struct {
         return plane_arm.HolderPlane.serveFrees(hp, req, scratch);
     }
 
+    /// The move gate's bound (decision 0003 §X.1): `T_park_max` at this
+    /// mount's membership clocks — the fail-stop lattice's longest
+    /// legitimate wait on an unresolved holder (a joiner's park gate holds
+    /// it; the manager derives it from its shard's grace).
+    pub fn moveDeadlineMs(self: *const WirePlane) u64 {
+        if (self.joined) |j| return j.js.park_gate.t_park_max_ms;
+        return membership.park_reclaim.tParkMaxMs(@import("extent_grant.zig").failoverBoundMs(0, 0), self.mgr.?.owner.clocks.grace_ms);
+    }
+
     pub fn endpointText(self: *const WirePlane) []const u8 {
         return self.endpoint_buf[0..self.endpoint_len];
     }

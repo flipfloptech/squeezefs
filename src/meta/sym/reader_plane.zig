@@ -44,6 +44,7 @@ const key = @import("../key.zig");
 const backend = @import("../backend.zig");
 const meta_set = @import("../meta_set.zig");
 const claim = @import("../guard/claim.zig");
+const lease_clock = @import("../guard/lease_clock.zig");
 const guard_gate = @import("../guard/gate.zig");
 const proc = @import("../guard/proc.zig");
 const cr = @import("control_records.zig");
@@ -419,6 +420,14 @@ pub const ReaderPlane = struct {
 
     pub fn endpointText(self: *const ReaderPlane) []const u8 {
         return self.endpoint_buf[0..self.endpoint_len];
+    }
+
+    /// The move gate's bound (decision 0003 §X.1): `T_park_max` at the
+    /// membership clocks a live set granted this reader (the shipped
+    /// `T_owner` before any grant — a quiescent reader's).
+    pub fn moveDeadlineMs(self: *const ReaderPlane) u64 {
+        const t_owner = if (self.member.clocks) |c| c.t_owner_ms else lease_clock.T_OWNER_MS;
+        return park.tParkMaxMs(@import("extent_grant.zig").failoverBoundMs(0, 0), park.graceMs(t_owner));
     }
 
     /// The fail-stop gate the FUSE layer wraps the filesystem with.

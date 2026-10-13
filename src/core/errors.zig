@@ -130,6 +130,10 @@ pub const Terminal = error{
     /// The cluster-wire session's transport failed (EOF, reset, a poisoned
     /// mux): every call parked on it fails; the caller re-dials.
     ConnectionLost,
+    /// A slot move the system retried did not resolve within the fail-stop
+    /// lattice's deadline (`T_park_max`; decision 0003 §X.1): the holder is
+    /// gone for this op — EIO, loud, never EAGAIN.
+    HolderUnresolved,
     /// The peer's storage-trust gate refused our proof (we do not hold the
     /// set's `job:enroll` secret, or its schema is not ours).
     HandshakeRefused,
@@ -198,6 +202,18 @@ pub const Refusal = error{
 pub const Error = Retryable || Terminal || Refusal;
 
 pub const Class = enum { retryable, terminal, refusal };
+
+/// The MOVE classes (decision 0003 §X.1): the cluster wire's typed
+/// retryable answers — a slot moved or moving, a holder not yet resolved or
+/// unreachable, a verb deferred, a channel mid re-point. The system retries
+/// every one of them across the move (the FUSE/IPC boundary's move gate);
+/// none may reach an application as EAGAIN.
+pub fn isMoveClass(err: Error) bool {
+    return switch (err) {
+        error.Deferred, error.SlotMoved, error.StaleHolderView, error.HolderUnreachable, error.MembershipPending, error.ListenerRefused, error.StaleOwnerEra, error.NotManager, error.GrantExhausted, error.TokenChannelStale => true,
+        else => false,
+    };
+}
 
 pub fn classOf(err: Error) Class {
     return switch (err) {
@@ -284,7 +300,7 @@ pub fn toErrno(err: Error) linux.E {
         error.HandshakeRefused => .ACCES,
         // The fence, a dead lane, a lost op, a short transfer, a poisoned
         // wire session: EIO.
-        error.WriterGuardFenced, error.VolumeFailed, error.LaneStopped, error.RingFailed, error.WorkerClosed, error.WorkerShutdown, error.ShortWrite, error.ShortRead, error.SubmissionQueueOverflow, error.HoleCheckpointFailed, error.Unexpected, error.MacInvalid, error.ConnectionLost => .IO,
+        error.WriterGuardFenced, error.VolumeFailed, error.LaneStopped, error.RingFailed, error.WorkerClosed, error.WorkerShutdown, error.ShortWrite, error.ShortRead, error.SubmissionQueueOverflow, error.HoleCheckpointFailed, error.Unexpected, error.MacInvalid, error.ConnectionLost, error.HolderUnresolved => .IO,
         else => unreachable, // every table row returned above
     };
 }
@@ -318,6 +334,16 @@ test "every table row round-trips; aliases map to the first row's errno" {
     try testing.expectEqual(linux.E.LOOP, toErrno(error.TooManySymlinks));
     try testing.expectEqual(Class.terminal, classOf(error.TooManySymlinks));
     try testing.expectEqual(error.InputOutput, fromCqeRes(-@as(i32, @backingInt(linux.E.IO))));
+}
+
+test "the move classes are exactly the wire's typed retryable answers (the system retries them across a slot move); backpressure, an interrupt and a would-block are not; an unresolved move is TERMINAL EIO" {
+    for ([_]Error{ error.Deferred, error.SlotMoved, error.StaleHolderView, error.HolderUnreachable, error.MembershipPending, error.ListenerRefused, error.StaleOwnerEra, error.NotManager, error.GrantExhausted, error.TokenChannelStale }) |e| {
+        try testing.expect(isMoveClass(e));
+        try testing.expectEqual(Class.retryable, classOf(e));
+    }
+    for ([_]Error{ error.QueueFull, error.LaneQueueFull, error.Interrupted, error.WouldBlock, error.InputOutput, error.Busy, error.HolderUnresolved }) |e| try testing.expect(!isMoveClass(e));
+    try testing.expectEqual(Class.terminal, classOf(error.HolderUnresolved));
+    try testing.expectEqual(linux.E.IO, toErrno(error.HolderUnresolved));
 }
 
 test "an errno outside the table is Unexpected and replies EIO" {

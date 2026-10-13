@@ -116,11 +116,38 @@ pub const stats = struct {
     pub var xv_midplan_escalations: counters.Tripwire = .init("xv_midplan_escalations");
     /// Roll-forward passes the cadence ran.
     pub var xv_cadence_passes: counters.ShardedCounter = .{};
+    /// Intents a live op left open at a slot move and kept for its own
+    /// re-issue / resumed by that re-issue / of those completed (the rest
+    /// compensated or held again).
+    pub var xv_held_open: counters.ShardedCounter = .{};
+    pub var xv_resumed: counters.ShardedCounter = .{};
+    pub var xv_resumed_completed: counters.ShardedCounter = .{};
+    /// A held intent whose record its resume found gone: retired by
+    /// another roller (its home slot moved and the new holder's cadence
+    /// adopted it) — the op re-runs against the outcome.
+    pub var xv_resumed_gone: counters.ShardedCounter = .{};
 };
 
 /// One legal move + one re-move; a third stale answer is the retryable
 /// class the caller sees (the intent stays open).
 pub const SLOT_MOVED_RETRIES: u32 = 2;
+
+/// An intent an execute left OPEN at a retryable failure (a slot moved, a
+/// holder unreachable, a step deferred) that stays the LIVE op's
+/// (decision 0003 §X.2): the op's re-issue resumes it (`resumeHeld` — the
+/// op id is the intent's id), its give-up abandons it (`abandonHeld`);
+/// until either, the cadence never takes it (the register keeps it in
+/// flight).
+pub const HeldOpen = struct { home: u64, tx_id: u64 };
+
+/// The retryable failures a live op re-issues across a move (the intent
+/// left open, its applied prefix attested).
+fn retryableStep(e: Error) bool {
+    return switch (e) {
+        error.ShipFailed, error.SlotMoved, error.Deferred, error.GuardRefused => true,
+        else => false,
+    };
+}
 
 /// The cadence tick: the checkpoint LANDING ceiling (≈ 1.1 s) — an
 /// abandoned intent completes within a few ceilings of the holder
@@ -490,8 +517,28 @@ pub fn Plane(comptime Store: type) type {
         }
 
         /// Execute `plan` under the op's held guards (`scope` is the
-        /// travelling scope; 0 = none travelled).
+        /// travelling scope; 0 = none travelled). An intent left open is
+        /// the cadence's.
         pub fn execute(self: *Self, plan: *const Plan, scope: guards.Scope, now: u64) Error!Done {
+            return self.executeHeld(plan, scope, now, null);
+        }
+
+        /// `execute` whose intent, left open at a retryable failure after
+        /// it became durable, stays the live op's: named in `held` (null =
+        /// the cadence's, as `execute`).
+        pub fn executeHeld(self: *Self, plan: *const Plan, scope: guards.Scope, now: u64, held: ?*?HeldOpen) Error!Done {
+            var reg: Registered = .{};
+            return self.executeInner(plan, scope, now, &reg) catch |e| {
+                if (reg.home) |home| self.leaveOpen(home, reg.tx_id, reg.durable and retryableStep(e), held);
+                return e;
+            };
+        }
+
+        /// What a failed execute leaves in the register: the intent's home
+        /// once registered in flight, and whether its record is durable.
+        const Registered = struct { home: ?u64 = null, tx_id: u64 = 0, durable: bool = false };
+
+        fn executeInner(self: *Self, plan: *const Plan, scope: guards.Scope, now: u64, reg: *Registered) Error!Done {
             assert(plan.len > 0);
             const t0 = clock.monotonicNs();
             stats.xv_started.inc();
@@ -508,7 +555,7 @@ pub fn Plane(comptime Store: type) type {
             stats.xv_cross_owner_phase_plan.record(t1 - t0);
             // Step 0 + the intent, then the initiator's barrier.
             self.register.noteInFlight(tx_id, home, t0);
-            errdefer self.register.noteAbandoned(tx_id);
+            reg.* = .{ .home = home, .tx_id = tx_id };
             const rider: applier.Rider = .{ .put = .{ .home = home, .tx_id = tx_id, .image = image } };
             var first: usize = 0;
             if (self.homeOfIno(plan.steps[0].homeIno()) == .local and route_table.slotOf(plan.steps[0].homeIno()) == intent.slotOfHome(home)) {
@@ -519,6 +566,7 @@ pub fn Plane(comptime Store: type) type {
                 self.apply.commitRiderAlone(rider, .none) catch |e| return mapApply(e);
             }
             self.register.noteDurable(tx_id);
+            reg.durable = true;
             self.apply.barrier() catch |e| return mapApply(e);
             const t2 = clock.monotonicNs();
             stats.xv_cross_owner_phase_intent_barrier.record(t2 - t1);
@@ -542,10 +590,7 @@ pub fn Plane(comptime Store: type) type {
                     // Left open: the steps before `i` are this intent's
                     // (the op held their guards) — attested in the record
                     // for the roll-forward's compensation.
-                    switch (e) {
-                        error.ShipFailed, error.SlotMoved, error.Deferred, error.GuardRefused => if (i > 0) self.attestApplied(home, tx_id, plan, i),
-                        else => {},
-                    }
+                    if (retryableStep(e) and i > 0) self.attestApplied(home, tx_id, plan, i);
                     return e;
                 };
                 const out = d.out;
@@ -596,6 +641,46 @@ pub fn Plane(comptime Store: type) type {
                 return;
             };
             stats.xv_applied_attested.inc();
+        }
+
+        /// An execute that failed with its intent possibly on the device:
+        /// kept for the live op's re-issue when `keep` (durable, a
+        /// retryable failure, a `held` slot to name it in), else the
+        /// cadence's.
+        fn leaveOpen(self: *Self, home: u64, tx_id: u64, keep: bool, held: ?*?HeldOpen) void {
+            if (keep) if (held) |h| {
+                h.* = .{ .home = home, .tx_id = tx_id };
+                stats.xv_held_open.inc();
+                return;
+            };
+            self.register.noteAbandoned(tx_id);
+        }
+
+        /// The live op gave up on the intent it held: the cadence's now.
+        pub fn abandonHeld(self: *Self, tx_id: u64) void {
+            self.register.noteAbandoned(tx_id);
+        }
+
+        /// The op's re-issue resumes the intent its earlier attempt left
+        /// open (decision 0003 §X.2): the roll-forward of exactly that
+        /// intent, under the op — the plan's guards re-taken, the record
+        /// re-read, the steps past its attested prefix dispatched, a live
+        /// refusal compensated (its errno in `Done.refused`), the
+        /// retirement. Failing again with a retryable class it stays held
+        /// (`held`); any other failure hands it to the cadence. A record
+        /// another roller already retired answers `error.Gone`.
+        pub fn resumeHeld(self: *Self, open: HeldOpen, now: u64, held: *?HeldOpen) (Error || error{Gone})!Done {
+            stats.xv_resumed.inc();
+            const done = self.rollOne(open.home, open.tx_id, now, held) catch |e| {
+                if (held.* == null) self.register.noteAbandoned(open.tx_id);
+                return e;
+            };
+            const out = done orelse {
+                stats.xv_resumed_gone.inc();
+                return error.Gone;
+            };
+            if (out.refused == null) stats.xv_resumed_completed.inc();
+            return out;
         }
 
         fn crashSeam(self: *Self, after_step: u32) Error!void {
@@ -897,27 +982,41 @@ pub fn Plane(comptime Store: type) type {
         /// acquisition, the record RE-READ under them, forward (or the
         /// inverse under ABORTING), barrier, retire.
         fn recoverOne(self: *Self, home: u64, tx_id: u64, now: u64) Error!void {
+            _ = try self.rollOne(home, tx_id, now, null);
+        }
+
+        /// The roll-forward of ONE intent — the cadence's and the mount's
+        /// (`held` null), or a live op's resume (`held` names it again on
+        /// a retryable failure, after attesting the steps this roll put in
+        /// effect). Answers the outcomes, null when the record is gone.
+        fn rollOne(self: *Self, home: u64, tx_id: u64, now: u64, held: ?*?HeldOpen) Error!?Done {
             const k = intent.recordKey(home, tx_id);
             const bytes0 = (self.apply.readIntentBytes(home, tx_id) catch |e| return mapApply(e)) orelse {
                 self.register.forget(tx_id);
-                return;
+                return null;
             };
             defer self.gpa.free(bytes0);
             var out: [intent.XV_MAX_STEPS]intent.StepRec = undefined;
             var plan = Plan.fromIntent(intent.decodeStored(&k, bytes0, &out) catch return error.Corrupt);
             const scope = self.mintScope();
-            var held = try self.acquirePlanGuards(&plan, scope, false);
-            defer held.release(self.gpa);
+            var plan_guards = self.acquirePlanGuards(&plan, scope, false) catch |e| {
+                if (held) |h| if (retryableStep(e)) {
+                    h.* = .{ .home = home, .tx_id = tx_id };
+                };
+                return e;
+            };
+            defer plan_guards.release(self.gpa);
             // Re-read under the guards: gone ⇒ retired meanwhile.
             const bytes = (self.apply.readIntentBytes(home, tx_id) catch |e| return mapApply(e)) orelse {
                 self.register.forget(tx_id);
-                return;
+                return null;
             };
             defer self.gpa.free(bytes);
             var out2: [intent.XV_MAX_STEPS]intent.StepRec = undefined;
             const it = intent.decodeStored(&k, bytes, &out2) catch return error.Corrupt;
             if (it.steps.len != plan.len) return error.Corrupt;
             plan = Plan.fromIntent(it);
+            var done: Done = .{ .tx_id = tx_id };
             if (it.aborting()) {
                 var i = plan.len;
                 while (i > 0) {
@@ -925,7 +1024,6 @@ pub fn Plane(comptime Store: type) type {
                     try self.invertOne(tx_id, i, plan.steps[i], scope, now);
                 }
             } else {
-                var done: Done = .{ .tx_id = tx_id };
                 for (plan.slice(), 0..) |s, i| {
                     if (i < it.applied) {
                         // Attested by the initiator that left it open:
@@ -934,7 +1032,15 @@ pub fn Plane(comptime Store: type) type {
                         done.len = i + 1;
                         continue;
                     }
-                    const d = try self.dispatch(tx_id, i, s, .none, scope, now, .any);
+                    const d = self.dispatch(tx_id, i, s, .none, scope, now, .any) catch |e| {
+                        if (held) |h| if (retryableStep(e)) {
+                            // The resume's own progress attested, the
+                            // intent the op's again.
+                            if (i > it.applied) self.attestApplied(home, tx_id, &plan, i);
+                            h.* = .{ .home = home, .tx_id = tx_id };
+                        };
+                        return e;
+                    };
                     done.outcomes[i] = d.out;
                     done.len = i + 1;
                     if (d.out.status != .foreign_skipped) continue;
@@ -953,12 +1059,14 @@ pub fn Plane(comptime Store: type) type {
                     try self.compensate(tx_id, home, &plan, i, &done, scope, now);
                     self.register.forget(tx_id);
                     stats.xv_recovered_compensated.inc();
-                    return;
+                    done.refused = plan.steps[i].foreignSkippedError();
+                    return done;
                 }
             }
             self.apply.barrier() catch |e| return mapApply(e);
             try self.retire(home, tx_id);
             stats.xv_recovered.inc();
+            return done;
         }
 
         /// A dead appender's recovery landed (charter §5.5 "Death and

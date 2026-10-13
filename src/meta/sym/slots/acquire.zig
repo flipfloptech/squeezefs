@@ -213,9 +213,17 @@ pub const MintChoice = union(enum) {
     }
 };
 
+/// Step 1 of `mintChoice` alone: the parent's own tree below the soft
+/// ceiling. The plane asks it BEFORE it builds the rotor census (the held
+/// slots and every rotor tree's bytes) — the census only the later steps
+/// read, which a create under a leased directory never reaches.
+pub fn affinityHolds(parent_leased_non_native: bool, parent_tree_bytes: u64, a_max: u64) bool {
+    return parent_leased_non_native and parent_tree_bytes < a_max;
+}
+
 pub fn mintChoice(in: MintInputs) MintChoice {
     // 1. Affinity: the parent's own tree below the soft ceiling.
-    if (in.parent_leased_non_native and in.parent_tree_bytes < in.a_max) return .{ .affinity = in.parent_slot };
+    if (affinityHolds(in.parent_leased_non_native, in.parent_tree_bytes, in.a_max)) return .{ .affinity = in.parent_slot };
     if (in.rotor.len == 0) return .none;
     // 2. Every rotor tree STRICTLY over the cap by ≥ 1 extent (exact
     // equality is NOT over).

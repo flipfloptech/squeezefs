@@ -1315,6 +1315,16 @@ pub const Plane = struct {
         const be = self.be;
         const native = be.stamp.native_slot == parent_slot;
         if (acquire.gatherMintSlot(parent_on_this_volume, native, gather, parent_slot)) |s| return s;
+        const pv = self.table.view(parent_slot);
+        // `A_max(t)` is DYNAMIC: the live leaf census at every decision
+        // (the static knob, when set, is the whole law).
+        const a_max = if (self.affinity_mib) |_| self.a_max else acquire.affinityCeiling(self.usedLeafBytes(), be.sb.node_size);
+        const parent_leased_non_native = parent_on_this_volume and !native and pv.leasedBy(self.me) and pv.state != .releasing;
+        const parent_tree_bytes = self.treeBytes(parent_slot);
+        if (acquire.affinityHolds(parent_leased_non_native, parent_tree_bytes, a_max)) {
+            acquire.countChoice(.{ .affinity = parent_slot }, true);
+            return parent_slot;
+        }
         var rotor: [lt.LeaseTable.PICK_MAX]acquire.RotorTree = undefined;
         var n: usize = 0;
         var held: std.ArrayList(u16) = .empty;
@@ -1326,14 +1336,10 @@ pub const Plane = struct {
             rotor[n] = .{ .slot = s, .bytes = self.treeBytes(s) };
             n += 1;
         }
-        const pv = self.table.view(parent_slot);
-        // `A_max(t)` is DYNAMIC: the live leaf census at every decision
-        // (the static knob, when set, is the whole law).
-        const a_max = if (self.affinity_mib) |_| self.a_max else acquire.affinityCeiling(self.usedLeafBytes(), be.sb.node_size);
         const in: acquire.MintInputs = .{
             .parent_slot = parent_slot,
-            .parent_leased_non_native = parent_on_this_volume and !native and pv.leasedBy(self.me) and pv.state != .releasing,
-            .parent_tree_bytes = self.treeBytes(parent_slot),
+            .parent_leased_non_native = parent_leased_non_native,
+            .parent_tree_bytes = parent_tree_bytes,
             .a_max = a_max,
             .node_size = be.sb.node_size,
             .rotor = rotor[0..n],

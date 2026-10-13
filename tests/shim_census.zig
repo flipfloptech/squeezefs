@@ -4,12 +4,17 @@
 //! carry the SONAME, `DT_FLAGS_1 NODELETE`, a `DT_NEEDED` set of libc alone,
 //! and a defined dynamic symbol set EQUAL to the ONE table in
 //! `src/shim/interpose.zig` (every interposition present, nothing of Zig's
-//! or the client library's exported).
+//! or the client library's exported) — and the staged pair must be ONE
+//! build's: the .so names the train and commit `./squeezefs --version`
+//! names (the daemon and shim refuse to pair across builds, charter §11, so
+//! a neighbour's .so staged here fails the shim smoke's engagement rows
+//! with no name; this row names it).
 
 const std = @import("std");
 const elf = std.elf;
 const squeezefs = @import("squeezefs");
 const interpose = squeezefs.shim.interpose;
+const lifecycle = squeezefs.shim.lifecycle;
 
 const SO_NAME = "libsqueezefs_il.so";
 
@@ -116,4 +121,72 @@ test "libsqueezefs_il.so: SONAME, DT_FLAGS_1 NODELETE, libc the only DT_NEEDED, 
         return error.ExportCensusViolated;
     }
     try std.testing.expectEqual(interpose.table.len, c.exports.items.len);
+}
+
+/// A build identity: the train and the commit (`gitCommit` in build.zig:
+/// 12 hex digits, `-dirty`, or `unknown`).
+const Identity = struct { train: []const u8, commit: []const u8 };
+
+fn token(bytes: []const u8, start: usize) []const u8 {
+    var end = start;
+    while (end < bytes.len) : (end += 1) switch (bytes[end]) {
+        '0'...'9', 'a'...'z', 'A'...'Z', '.', '-' => {},
+        else => break,
+    };
+    return bytes[start..end];
+}
+
+/// The first `lifecycle.identity` in the .so's bytes (the constant itself;
+/// later copies sit in formatted strings and carry the same text).
+fn shimIdentity(bytes: []const u8) ?Identity {
+    const at = std.mem.indexOf(u8, bytes, lifecycle.identity_prefix) orelse return null;
+    const train = token(bytes, at + lifecycle.identity_prefix.len);
+    const sep = at + lifecycle.identity_prefix.len + train.len;
+    if (!std.mem.startsWith(u8, bytes[sep..], lifecycle.identity_commit_sep)) return null;
+    return .{ .train = train, .commit = token(bytes, sep + lifecycle.identity_commit_sep.len) };
+}
+
+/// `squeezefs <train> (<commit>, <profile> profile, zig <version>)` — the
+/// line `squeezefs.Version.write` prints.
+fn binaryIdentity(line: []const u8) ?Identity {
+    const lead = "squeezefs ";
+    if (!std.mem.startsWith(u8, line, lead)) return null;
+    const train = token(line, lead.len);
+    const rest = line[lead.len + train.len ..];
+    if (!std.mem.startsWith(u8, rest, " (")) return null;
+    return .{ .train = train, .commit = token(rest, 2) };
+}
+
+test "the identity parsers read what lifecycle.identity and Version.write print (a clean and a -dirty commit stay distinct)" {
+    const so_bytes = "\x00junk" ++ lifecycle.identity_prefix ++ "0.1.0" ++ lifecycle.identity_commit_sep ++ "441d1be401ab-dirty\x00Out";
+    const s = shimIdentity(so_bytes) orelse return error.NoIdentity;
+    try std.testing.expectEqualStrings("0.1.0", s.train);
+    try std.testing.expectEqualStrings("441d1be401ab-dirty", s.commit);
+    var buf: [128]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try (squeezefs.Version{ .train = "0.1.0", .git_commit = "441d1be401ab", .profile = "gate" }).write(&w);
+    const b = binaryIdentity(w.buffered()) orelse return error.NoIdentity;
+    try std.testing.expectEqualStrings("0.1.0", b.train);
+    try std.testing.expectEqualStrings("441d1be401ab", b.commit);
+    try std.testing.expect(!std.mem.eql(u8, s.commit, b.commit));
+}
+
+test "libsqueezefs_il.so and ./squeezefs are ONE build's pair: the .so's identity names the train and commit the binary's --version names" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, SO_NAME, gpa, .limited(64 << 20)) catch |err| switch (err) {
+        error.FileNotFound => return squeezefs.testkit.skip(@src(), .other_step, SO_NAME ++ " is not staged in the cwd (the shim census runs under `zig build rails` on Linux)"),
+        else => return err,
+    };
+    defer gpa.free(bytes);
+    const so = shimIdentity(bytes) orelse return error.NoShimIdentity;
+    const r = try std.process.run(gpa, io, .{ .argv = &.{ "./squeezefs", "--version" } });
+    defer gpa.free(r.stdout);
+    defer gpa.free(r.stderr);
+    try std.testing.expect(r.term.success());
+    const bin = binaryIdentity(r.stdout) orelse return error.NoBinaryIdentity;
+    if (!std.mem.eql(u8, so.train, bin.train) or !std.mem.eql(u8, so.commit, bin.commit)) {
+        std.debug.print("the staged pair is two builds': {s} carries train {s} commit {s}, ./squeezefs names train {s} commit {s}\n", .{ SO_NAME, so.train, so.commit, bin.train, bin.commit });
+        return error.StagedPairIsTwoBuilds;
+    }
 }

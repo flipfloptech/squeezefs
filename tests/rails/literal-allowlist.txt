@@ -549,7 +549,7 @@ src/ops/jobs/records.zig:363 | 8 | OWED: derive it or document it on the line (c
 src/ops/jobs/records.zig:380 | 8 | OWED: derive it or document it on the line (charter §1.5)
 src/ops/jobs/wire.zig:61 | 1000 | a table entry (switch/range arm) — the codec or classification table
 src/ops/jobs/wire.zig:165 | 1000 | OWED: derive it or document it on the line (charter §1.5)
-src/ops/jobs/wire.zig:942 | 4 | a timing/retry constant — OWED: its measured WHY on the line or a derivation (charter §1.5)
+src/ops/jobs/wire.zig:954 | 4 | a timing/retry constant — OWED: its measured WHY on the line or a derivation (charter §1.5)
 src/ops/keys.zig:48 | 4096 | OWED: derive it or document it on the line (charter §1.5)
 src/ops/lifecycle/lattice.zig:179 | 100 | a percentage — OWED: derive it (charter §1.5) or document the measured reason
 src/ops/lifecycle/lattice.zig:331 | 1_800_000_000 | OWED: derive it or document it on the line (charter §1.5)

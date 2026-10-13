@@ -735,6 +735,8 @@ pub const Worker = struct {
     hold_submission: bool = false,
     release_hold: sync.Notify = .init,
     held: Atomic(bool) = .init(false),
+    /// The read shard heartbeat fiber's park station (null in the product).
+    heartbeat_station: ?HeartbeatStation = null,
     /// Instruments the loopback tests read.
     shards_done: u64 = 0,
     shards_refused: u64 = 0,
@@ -753,6 +755,15 @@ pub const Worker = struct {
     }
 
     pub const Pulled = enum { none, done, refused, abandoned };
+
+    /// The heartbeat fiber's station seam: `parking` runs on the fiber once
+    /// per park, after it decided to park (its `stop` read false) and
+    /// before the park begins — the lost-wake pin's rendezvous (a test
+    /// raises the stop inside that window and reads `wake.waiters`).
+    pub const HeartbeatStation = struct {
+        ctx: *anyopaque,
+        parking: *const fn (ctx: *anyopaque, wake: *sync.Notify, stop: *const Atomic(bool)) void,
+    };
 
     /// ONE pull: a descriptor or none; execute; propose.
     pub fn pullOnce(self: *Worker) WorkerError!Pulled {
@@ -897,6 +908,7 @@ pub const Worker = struct {
             const period_ns = @as(u64, w.heartbeat_ms) * std.time.ns_per_ms;
             while (!self.stop.load(.acquire)) {
                 var n = self.wake.notified();
+                if (w.heartbeat_station) |s| s.parking(s.ctx, &self.wake, &self.stop);
                 _ = n.waitUntilUncancelable(w.io, clock.monotonicNs() + period_ns);
                 if (self.stop.load(.acquire)) return;
                 if (w.stop.load(.acquire)) {
@@ -1335,6 +1347,77 @@ test "a fleet READ shard whose worker dies mid-walk: the lease expires at the sw
     try testing.expectEqual(cancelled0 + 1, engine.cancelled);
     try testing.expect(r.worker.heartbeats >= 1);
     fd.retireFleetShards(0x903);
+}
+
+/// A worker's pull on its own thread (the shard "mid-walk" while the test
+/// drives the window).
+const PullOnce = struct {
+    fn run(w: *Worker, out: *Worker.Pulled) void {
+        out.* = w.pullOnce() catch .refused;
+    }
+};
+
+/// The heartbeat station that holds the fiber's FIRST park inside its
+/// window — after the fiber decided to park, before the park — until the
+/// read shard's stop is raised, recording how many waiters `wake` had at
+/// the station (the fiber's own registration, or none).
+const StopInWindow = struct {
+    io: Io,
+    /// Set at the first park's station (release; the test's acquire pairs).
+    reached: Atomic(bool) = .init(false),
+    /// `wake.waiters` at the station, before the hold registers its own
+    /// (read by the test after the pull's join).
+    waiters_at_station: u32 = 0,
+
+    fn station(self: *StopInWindow) Worker.HeartbeatStation {
+        return .{ .ctx = self, .parking = &parking };
+    }
+
+    fn parking(ctx: *anyopaque, wake: *sync.Notify, stop: *const Atomic(bool)) void {
+        const self: *StopInWindow = @ptrCast(@alignCast(ctx));
+        if (self.reached.load(.acquire)) return;
+        self.waiters_at_station = wake.waiters(self.io);
+        self.reached.store(true, .release);
+        while (true) {
+            var n = wake.notified();
+            _ = n.enable(self.io);
+            if (stop.load(.acquire)) {
+                n.cancel(self.io);
+                return;
+            }
+            n.waitUncancelable(self.io);
+        }
+    }
+};
+
+test "a read shard's stop raised between the heartbeat fiber's decision to park and its park ends the fiber on the wake: the fiber is registered on its wake BEFORE it re-reads the stop (`sync/notify.zig`'s law), so the walk's end proposes at once — never a lost wake that parks the fiber its whole period while the worker's lease clock runs out (the gate's `expected .done, found .abandoned`)" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    const r = try Rig.init(gpa, io, seams.LEASE_TTL_MS);
+    defer r.deinit(gpa);
+    defer r.coord.deinit();
+    var engine: RamReadRunner = .{ .io = io, .hold = true };
+    r.worker.read_runner = engine.runner();
+    r.worker.caps = frames.CAP_FLEET_READ;
+    _ = try r.worker.enroll();
+    var window: StopInWindow = .{ .io = io };
+    r.worker.heartbeat_station = window.station();
+    const fd = r.coord.fleet();
+    const d: seams.FleetDispatch.Descriptor = .{ .id = .{ .job_id = 0x904, .shard = 1 }, .fleet_k = 1, .fleet_n = 2, .inode_plane = 0, .throttle_pct = 100 };
+    try testing.expect(fd.queueReadShard(d, 0));
+    var out: Worker.Pulled = .none;
+    const th = try std.Thread.spawn(.{}, PullOnce.run, .{ &r.worker, &out });
+    // The walk is held and the fiber sits in its first park's window.
+    while (!engine.holding.load(.acquire) or !window.reached.load(.acquire)) std.atomic.spinLoopHint();
+    // The walk ends: the worker raises the stop inside the window.
+    engine.releaseHold(io);
+    th.join();
+    try testing.expectEqual(@as(u32, 1), window.waiters_at_station);
+    try testing.expectEqual(Worker.Pulled.done, out);
+    const got = fd.collectReadShard(io, gpa, d.id);
+    try testing.expect(got == .payload);
+    fd.release(gpa, got.payload);
+    fd.retireFleetShards(0x904);
 }
 
 test "a non-coordinator answers the job block not_manager; the worker's enroll reports it as refused" {

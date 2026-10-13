@@ -833,9 +833,12 @@ pub const VolumeBinding = struct {
         be.smo_ctx.retire_hold = &self.retire_hold.?;
     }
 
-    /// `park`: every held extent into the coverage clock at ring 0's
-    /// reservation head — every gate the FIFO took so far is a position
-    /// below it, and so is every held extent's own free record.
+    /// `park`: every held extent no tree reaches NOW into the coverage
+    /// clock at ring 0's reservation head — every gate the FIFO took so
+    /// far is a position below it, and so is every held extent's own free
+    /// record. A held extent a tree reaches again (a root install that
+    /// re-adopted an image an earlier SMO had retired off the cache) is a
+    /// live image and stays allocated.
     fn endRetirementHoldFn(ctx: *anyopaque, park: bool) void {
         const self = self_(ctx);
         const be = self.be;
@@ -845,27 +848,31 @@ pub const VolumeBinding = struct {
         var hold = self.retire_hold orelse return;
         self.retire_hold = null;
         defer hold.deinit();
-        if (!park) return;
-        const gate = be.core.headPos();
-        for (hold.held.items) |e| be.alloc.freePendingForced(e, gate) catch {
-            log.warn("recovery: a retired image extent ({d}) of appender {d}'s grant could not park (out of memory) — it stays allocated; fsck C13 reclaims", .{ e, self.recovering_id });
+        if (!park or hold.held.items.len == 0) return;
+        var images: std.ArrayList(u64) = .empty;
+        defer images.deinit(self.gpa);
+        self.maintainedImages(self.gpa, &images) catch |e| {
+            log.warn("recovery: appender {d}'s {d} retired image extent(s) stay allocated — the trees could not be walked to prove them unreached ({s}); fsck C13 reclaims", .{ self.recovering_id, hold.held.items.len, @errorName(e) });
+            return;
         };
+        std.mem.sort(u64, images.items, {}, std.sort.asc(u64));
+        const gate = be.core.headPos();
+        for (hold.held.items) |e| {
+            if (recovery.sortedContains(images.items, e)) continue;
+            be.alloc.freePendingForced(e, gate) catch {
+                log.warn("recovery: a retired image extent ({d}) of appender {d}'s grant could not park (out of memory) — it stays allocated; fsck C13 reclaims", .{ e, self.recovering_id });
+            };
+        }
     }
 
-    /// Every extent of `grant_runs` the volume holds, in ONE SMO-lock
-    /// window (no SMO retires, claims or drains while it reads): the
-    /// images of every tree this process maintains — the recovered slots',
-    /// the unleased ones, its own regions', the control and native trees —
-    /// and the hold's. A live foreign lessee's tree is a projection here,
+    /// The images of every tree this process maintains — the recovered
+    /// slots', the unleased ones, its own regions', the control and
+    /// native trees. A live foreign lessee's tree is a projection here,
     /// its nodes its lessee's to judge (its interior may name extents the
-    /// lessee retired long ago): never walked.
-    fn keptExtentsFn(ctx: *anyopaque, gpa: Allocator, grant_runs: []const GrantRun, out: *std.ArrayList(u64)) Error!void {
-        const self = self_(ctx);
+    /// lessee retired long ago): never walked. The caller holds the SMO
+    /// lock.
+    fn maintainedImages(self: *VolumeBinding, gpa: Allocator, out: *std.ArrayList(u64)) Error!void {
         const be = self.be;
-        be.smo_lock.lockUncancelable(be.io);
-        defer be.smo_lock.unlock(be.io);
-        var images: std.ArrayList(u64) = .empty;
-        defer images.deinit(gpa);
         for (be.trees.load()) |t| {
             // An empty slot owns no extent.
             if (t.rootPtr().addr < be.sb.heap.start) continue;
@@ -873,8 +880,21 @@ pub const VolumeBinding = struct {
                 const v = be.slots.table.view(route_table.slotOfForestSlot(fs));
                 if (v.state != .unleased and v.state != .migrating and v.holder != self.recovering_id and !self.ownsRegion(v.holder)) continue;
             };
-            try self.walkTree(gpa, t, .{ .extents = &images });
+            try self.walkTree(gpa, t, .{ .extents = out });
         }
+    }
+
+    /// Every extent of `grant_runs` the volume holds, in ONE SMO-lock
+    /// window (no SMO retires, claims or drains while it reads): the
+    /// images of every tree this process maintains, and the hold's.
+    fn keptExtentsFn(ctx: *anyopaque, gpa: Allocator, grant_runs: []const GrantRun, out: *std.ArrayList(u64)) Error!void {
+        const self = self_(ctx);
+        const be = self.be;
+        be.smo_lock.lockUncancelable(be.io);
+        defer be.smo_lock.unlock(be.io);
+        var images: std.ArrayList(u64) = .empty;
+        defer images.deinit(gpa);
+        try self.maintainedImages(gpa, &images);
         for (images.items) |e| {
             for (grant_runs) |r| if (r.contains(e)) {
                 try out.append(gpa, e);

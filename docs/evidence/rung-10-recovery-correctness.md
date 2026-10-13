@@ -70,6 +70,13 @@ gates stay monotone. A rollback drops the hold: the extents stay allocated, sinc
 may still reach them. Every return keeps only the extents the record names and clears exactly those
 bits (`recovery_return_mismatches` must-stay-0).
 
+A follow-up (`volume_bind.endRetirementHoldFn`): 7b parks only the held extents NO maintained tree
+reaches at that instant, walked under the same SMO-lock window. A root install discards the slot's
+cached nodes and stores the page's root; an SMO that retired one of that root's images off the
+cache before the install would otherwise see the image parked and freed while the installed tree
+still reaches it. Not reproduced (the flush pass touches no clean projection node); the walk is the
+law's own check, not a guess.
+
 **The ownership law:** an extent of a dead grant has ONE custodian at every instant — the grant
 (named by the record), a tree (reached), the recovery's hold, or the coverage clock — and moves
 between them only under the volume's SMO lock. Lock order: the SMO lock, then the manager's verbs

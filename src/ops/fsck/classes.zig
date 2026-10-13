@@ -980,6 +980,10 @@ pub const Pass = struct {
 
     fn c9(self: *Pass) Error!void {
         if (!self.host.scope.inodePlaneJudges() or !self.cen.complete or !self.dentries.complete) return;
+        if (!self.dentries.names_complete) {
+            self.counters.inode_plane_names_declined += 1;
+            return;
+        }
         const V = struct {
             pass: *Pass,
             err: ?Error = null,
@@ -1017,6 +1021,7 @@ pub const Pass = struct {
                     for (p.cen.owners.items) |o| if (o.ino == census.keyInoOf(sl)) break :blk @intCast(o.bindings.len);
                     break :blk 0;
                 };
+                log.debug("fsck C9 candidate: ino {d} (slot {d}, raw {d}) live, prior-era, absent from the referenced set", .{ global, sl.slot, sl.raw });
                 p.suspect(.{ .c9_unreferenced = .{ .ino = global, .blocks = blocks } }) catch |e| {
                     ctx.err = e;
                     return false;
@@ -1035,7 +1040,7 @@ pub const Pass = struct {
         if (!self.host.scope.inodePlaneJudges()) return;
         const gpa = self.gpa;
         // The count arms (gated on completeness).
-        if (self.dentries.multi_complete and self.cen.odd_nlink_complete and self.dentries.complete) {
+        if (self.dentries.multi_complete and self.cen.odd_nlink_complete and self.dentries.complete and self.dentries.names_complete) {
             var it = self.cen.odd_nlink.iterator();
             while (it.next()) |e| {
                 const global = e.key_ptr.*;

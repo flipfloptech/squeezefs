@@ -335,6 +335,7 @@ pub const Counters = struct {
     c1_projection_slots_scoped: u64 = 0,
     c4_custody_scoped: u64 = 0,
     block_plane_foreign_scoped: u64 = 0,
+    inode_plane_names_declined: u64 = 0,
     inode_plane_foreign_slot_scoped: u64 = 0,
     inode_plane_window_scoped: u64 = 0,
     inode_plane_foreign_dentry_scoped: u64 = 0,
@@ -417,6 +418,7 @@ pub const Counters = struct {
         s.fsck_c1_projection_slots_scoped.add(self.c1_projection_slots_scoped);
         s.fsck_c4_custody_scoped.add(self.c4_custody_scoped);
         s.fsck_block_plane_foreign_scoped.add(self.block_plane_foreign_scoped);
+        s.fsck_inode_plane_names_declined.add(self.inode_plane_names_declined);
         s.fsck_inode_plane_foreign_slot_scoped.add(self.inode_plane_foreign_slot_scoped);
         s.fsck_inode_plane_window_scoped.add(self.inode_plane_window_scoped);
         s.fsck_inode_plane_foreign_dentry_scoped.add(self.inode_plane_foreign_dentry_scoped);

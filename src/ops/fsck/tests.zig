@@ -151,6 +151,36 @@ test "the block plane under a live lessee: a block a lessee's record references 
     try ram.expectClasses(custody, &.{});
 }
 
+test "C9 and the C10 counts under a live lessee: a judged inode whose only name lives in a directory of a live lessee's slot is NOT unreferenced — the referenced set is incomplete by construction while any slot is foreign-live, so the name-dependent arms take no verdict (counted), and judge again once the slot is nobody's" {
+    const gpa = testing.allocator;
+    const set = try RamSet.init(gpa);
+    defer set.deinit();
+    const p = try populate(set);
+    // A directory in slot 1 — this mount's own rotor slot once, a joiner's
+    // lease now (its tree, with every name it holds, left this forest) —
+    // naming a file whose record sits in slot 0 (the two-daemon row's
+    // `d/e`, read as C9 on A).
+    const lessee: u16 = 1;
+    const theirs_dir = try set.mkdirGuest(lessee, 2, p.dir, "theirs");
+    const mine = try set.mkfile(theirs_dir, "mine", VOL_A, &.{21});
+    try set.setNlink(mine, 2);
+    try set.freezeEra();
+    try set.scope.foreign_live.put(gpa, lessee, {});
+    var scoped = try ram.run(set, .online, .{});
+    defer scoped.deinit(gpa);
+    try ram.expectClasses(scoped, &.{});
+    try testing.expect(scoped.counters.inode_plane_names_declined >= 1);
+    try testing.expect(scoped.counters.inode_plane_foreign_dentry_scoped >= 1);
+    // The slot nobody's: the name is in view, the file referenced, and its
+    // nlink 2 against one name is the count arm's (C10 nlink too high).
+    _ = set.scope.foreign_live.remove(lessee);
+    try set.scope.unleased.put(gpa, lessee, {});
+    var judged = try ram.run(set, .online, .{});
+    defer judged.deinit(gpa);
+    try ram.expectClasses(judged, &.{.c10});
+    try testing.expectEqual(@as(u64, 0), judged.counters.inode_plane_names_declined);
+}
+
 test "C9: a prior-era unreferenced inode with blocks is ONE finding; dry-run plans and mutates nothing; apply destroys it, releases its references and frees its blocks; the next run is clean; a current-era one is never reported" {
     const gpa = testing.allocator;
     const set = try RamSet.init(gpa);
@@ -949,7 +979,9 @@ test "forest scoping: a slot a LIVE foreign lessee holds is never judged (its or
     var scoped = try ram.run(set, .offline, .{});
     defer scoped.deinit(gpa);
     try ram.expectClasses(scoped, &.{});
-    try testing.expect(scoped.counters.inode_plane_foreign_slot_scoped >= 1);
+    // The orphan is its lessee's; the name arms took no verdict at all (a
+    // lessee's names are out of this forest).
+    try testing.expect(scoped.counters.inode_plane_names_declined >= 1);
     _ = set.scope.foreign_live.remove(0);
     set.scope.reader_uncovered = true;
     var reader = try ram.run(set, .offline, .{});

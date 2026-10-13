@@ -193,9 +193,9 @@ src/data/sym_planes/records.zig:87 | 0x12 | an encoding constant (magic, mask, f
 src/data/sym_planes/records.zig:153 | 4 | OWED: derive it or document it on the line (charter §1.5)
 src/data/transform.zig:689 | 255 | OWED: derive it or document it on the line (charter §1.5)
 src/data/transform.zig:819 | 255 | OWED: derive it or document it on the line (charter §1.5)
-src/data/write_pipeline.zig:375 | 16 | OWED: derive it or document it on the line (charter §1.5)
-src/data/write_pipeline.zig:394 | 8 | OWED: derive it or document it on the line (charter §1.5)
-src/data/write_pipeline.zig:409 | 4 | OWED: derive it or document it on the line (charter §1.5)
+src/data/write_pipeline.zig:379 | 16 | OWED: derive it or document it on the line (charter §1.5)
+src/data/write_pipeline.zig:398 | 8 | OWED: derive it or document it on the line (charter §1.5)
+src/data/write_pipeline.zig:413 | 4 | OWED: derive it or document it on the line (charter §1.5)
 src/data/write_seams.zig:230 | 64 | OWED: derive it or document it on the line (charter §1.5)
 src/data/write_seams.zig:380 | 32 | OWED: derive it or document it on the line (charter §1.5)
 src/exec/cpu_class.zig:165 | 10 | OWED: derive it or document it on the line (charter §1.5)
@@ -497,24 +497,24 @@ src/meta/sym/xv/stripe.zig:1033 | 12 | a size — OWED: derive from derive.Facts
 src/meta/sym/xv/stripe.zig:1035 | 12 | a size — OWED: derive from derive.Facts or document the physical/format reason
 src/meta/tx.zig:235 | 64 | OWED: derive it or document it on the line (charter §1.5)
 src/ops/defrag/metrics.zig:33 | 1000 | OWED: derive it or document it on the line (charter §1.5)
-src/ops/fsck/census.zig:257 | 64 | OWED: derive it or document it on the line (charter §1.5)
-src/ops/fsck/census.zig:257 | 64 | OWED: derive it or document it on the line (charter §1.5)
-src/ops/fsck/census.zig:291 | 64 | a percentage — OWED: derive it (charter §1.5) or document the measured reason
-src/ops/fsck/census.zig:306 | 64 | OWED: derive it or document it on the line (charter §1.5)
-src/ops/fsck/census.zig:499 | 8 | OWED: derive it or document it on the line (charter §1.5)
-src/ops/fsck/census.zig:800 | 16 | OWED: derive it or document it on the line (charter §1.5)
-src/ops/fsck/census.zig:805 | 4 | OWED: derive it or document it on the line (charter §1.5)
-src/ops/fsck/census.zig:807 | 4 | OWED: derive it or document it on the line (charter §1.5)
+src/ops/fsck/census.zig:262 | 64 | OWED: derive it or document it on the line (charter §1.5)
+src/ops/fsck/census.zig:262 | 64 | OWED: derive it or document it on the line (charter §1.5)
+src/ops/fsck/census.zig:296 | 64 | a percentage — OWED: derive it (charter §1.5) or document the measured reason
+src/ops/fsck/census.zig:311 | 64 | OWED: derive it or document it on the line (charter §1.5)
+src/ops/fsck/census.zig:504 | 8 | OWED: derive it or document it on the line (charter §1.5)
+src/ops/fsck/census.zig:805 | 16 | OWED: derive it or document it on the line (charter §1.5)
+src/ops/fsck/census.zig:810 | 4 | OWED: derive it or document it on the line (charter §1.5)
+src/ops/fsck/census.zig:812 | 4 | OWED: derive it or document it on the line (charter §1.5)
 src/ops/fsck/classes.zig:706 | 64 | OWED: derive it or document it on the line (charter §1.5)
 src/ops/fsck/classes.zig:707 | 64 | a percentage — OWED: derive it (charter §1.5) or document the measured reason
 src/ops/fsck/classes.zig:714 | 64 | a percentage — OWED: derive it (charter §1.5) or document the measured reason
-src/ops/fsck/classes.zig:1347 | 8 | a size — OWED: derive from derive.Facts or document the physical/format reason
-src/ops/fsck/classes.zig:1414 | 256 | OWED: derive it or document it on the line (charter §1.5)
-src/ops/fsck/classes.zig:1644 | 16 | OWED: derive it or document it on the line (charter §1.5)
-src/ops/fsck/classes.zig:1648 | 4 | OWED: derive it or document it on the line (charter §1.5)
-src/ops/fsck/classes.zig:1650 | 4 | OWED: derive it or document it on the line (charter §1.5)
+src/ops/fsck/classes.zig:1352 | 8 | a size — OWED: derive from derive.Facts or document the physical/format reason
+src/ops/fsck/classes.zig:1419 | 256 | OWED: derive it or document it on the line (charter §1.5)
+src/ops/fsck/classes.zig:1649 | 16 | OWED: derive it or document it on the line (charter §1.5)
+src/ops/fsck/classes.zig:1653 | 4 | OWED: derive it or document it on the line (charter §1.5)
+src/ops/fsck/classes.zig:1655 | 4 | OWED: derive it or document it on the line (charter §1.5)
 src/ops/fsck/finding.zig:308 | 10 | a table entry (switch/range arm) — the codec or classification table
-src/ops/fsck/finding.zig:711 | 0x20 | an encoding constant (magic, mask, flag bit, hash seed) — OWED: name it or document the table
+src/ops/fsck/finding.zig:713 | 0x20 | an encoding constant (magic, mask, flag bit, hash seed) — OWED: name it or document the table
 src/ops/fsck/runner.zig:906 | 0o700 | a file mode (POSIX permission bits)
 src/ops/fsck/runner.zig:908 | 0o700 | a file mode (POSIX permission bits)
 src/ops/jobs/admin_frames.zig:112 | 100 | a percentage — OWED: derive it (charter §1.5) or document the measured reason

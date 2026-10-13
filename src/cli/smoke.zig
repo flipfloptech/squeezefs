@@ -7474,14 +7474,6 @@ test "smoke: ONLINE FSCK THROUGH THE ADMIN LANE — the fill (dirs, 200 packed f
         const tree_out = try b.onMount("cd a-dir && i=0; while [ $i -lt 100 ]; do printf 'x%s\\n' $i > x$i; i=$((i + 1)); done; ls | wc -l");
         defer gpa.free(tree_out);
         try testing.expectEqualStrings("100\n", tree_out);
-        // The set quiesced: both members' barriers (the cross-owner
-        // intents' halves land on both sides before the census).
-        const sb = try b.onMount("sync -f . && echo synced");
-        defer gpa.free(sb);
-        try testing.expectEqualStrings("synced\n", sb);
-        const sa = try rig.onMount("sync -f . && echo synced");
-        defer gpa.free(sa);
-        try testing.expectEqualStrings("synced\n", sa);
     }
     {
         // The live set's block plane from A: `scrub --online` (C7 alone)
@@ -7502,21 +7494,29 @@ test "smoke: ONLINE FSCK THROUGH THE ADMIN LANE — the fill (dirs, 200 packed f
         try testing.expect(c.scrub_blocks_scanned >= 15);
     }
     {
-        // The whole inode plane from A over the live set: the census
-        // scopes what is a lessee's (its slots, the names its directories
-        // hold, the blocks its records reference; the reference-count
-        // arms decline while a lessee is live). The verdict over a joiner's
-        // cross-owner mints is this rung's stated gap (`rung-10-jobs.md`
-        // §owed): the report is read for its scoping counters here.
+        // The whole inode plane from A over the live, UNQUIESCED set: the
+        // census scopes what is a lessee's (its slots, the names its
+        // directories hold — a predecessor's directories included, the
+        // slot being the container —, the blocks its records reference);
+        // the name arms and the reference-count arms decline while a
+        // lessee is live. 0 findings is the law (the zero-FP ladder).
         var got = try fsckOnline(rig, rig.mp, null);
         defer got.report.deinit(gpa);
         const c = got.report.counters;
-        std.debug.print("smoke[fsck-online]: the two-daemon set from A: fsck --online {d} inode(s), {d} dentry ref(s), {d} finding(s) (the stated gap); foreign-slot scoped {d}, foreign-dentry scoped {d}, window scoped {d}, slots covered {d}, block-plane foreign scoped {d}, alloc census declined {d}\n", .{ c.inodes_scanned, c.dentry_refs_indexed, got.report.findings.len, c.inode_plane_foreign_slot_scoped, c.inode_plane_foreign_dentry_scoped, c.inode_plane_window_scoped, c.inode_plane_slots_covered, c.block_plane_foreign_scoped, c.alloc_census_declined });
-        for (got.report.findings[0..@min(got.report.findings.len, 6)]) |f| std.debug.print("  set (stated gap): {f}\n", .{f});
+        std.debug.print("smoke[fsck-online]: the two-daemon set from A: fsck --online {d} inode(s), {d} dentry ref(s), {d} finding(s); foreign-slot scoped {d}, foreign-dentry scoped {d}, window scoped {d}, slots covered {d}, block-plane foreign scoped {d}, alloc census declined {d}, name arms declined {d}\n", .{ c.inodes_scanned, c.dentry_refs_indexed, got.report.findings.len, c.inode_plane_foreign_slot_scoped, c.inode_plane_foreign_dentry_scoped, c.inode_plane_window_scoped, c.inode_plane_slots_covered, c.block_plane_foreign_scoped, c.alloc_census_declined, c.inode_plane_names_declined });
+        if (got.report.findings.len != 0) {
+            for (got.report.findings[0..@min(got.report.findings.len, 6)]) |f| std.debug.print("  set unexpected: {f}\n", .{f});
+            const la = try rig.onMount("ls -lai . | head -20; echo ---; stat -c '%i %h %n' b0 b1 b2 b3");
+            defer gpa.free(la);
+            std.debug.print("--- A's root ---\n{s}\n", .{la});
+        }
+        try testing.expectEqual(@as(usize, 0), got.report.findings.len);
+        try testing.expectEqual(@as(u8, 0), got.code);
         // B's slots are its own: A's census scopes them out rather than
-        // judging a tree that changes under it.
-        try testing.expect(c.inode_plane_foreign_dentry_scoped > 0 or c.inode_plane_foreign_slot_scoped > 0);
+        // judging a tree that changes under it; the name arms declined.
+        try testing.expect(c.inode_plane_foreign_dentry_scoped > 0);
         try testing.expect(c.inode_plane_slots_covered < inos.ROUTING_WIDTH);
+        try testing.expectEqual(@as(u64, 1), c.inode_plane_names_declined);
     }
     {
         // B is not the coordinator: its lane answers by verdict.

@@ -249,6 +249,23 @@ pub const RamSet = struct {
         return global(l);
     }
 
+    /// `mkdir` minted in guest slot `slot` at raw local `raw`: the directory's
+    /// record AND the names it will hold live in the slot's tree (a lessee's
+    /// directory under this mount's). Returns the global.
+    pub fn mkdirGuest(self: *RamSet, slot: u16, raw: u64, parent: u64, name: []const u8) !u64 {
+        const l = key.guestLocalIno(slot, raw);
+        const g = inos.makeGlobalIno(raw, slot, inos.ROUTING_WIDTH);
+        const t = try self.mem.begin(@src());
+        errdefer self.mem.abandon(t);
+        try self.putInode(t, l, .{ .mode = economy.S.IFDIR | 0o755, .nlink = 2, .ctime = 7 });
+        try self.putDentry(t, local(parent), name, g, economy.S.IFDIR);
+        var pv = (try self.readInode(local(parent))).?;
+        pv.nlink += 1;
+        try self.putInode(t, local(parent), pv);
+        try self.commitTx(t);
+        return g;
+    }
+
     /// `mkfile` minted in guest slot `slot` at raw local `raw` (a lessee's
     /// record under this mount's directory): the records keyed by the
     /// guest key ino, the dentry naming the GLOBAL ino. Returns the global.

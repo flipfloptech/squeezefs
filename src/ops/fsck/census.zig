@@ -19,6 +19,7 @@ const assert = std.debug.assert;
 
 const derive = @import("../../core/derive.zig");
 const key = @import("../../meta/key.zig");
+const log = @import("../../core/log.zig");
 const record = @import("../../meta/record.zig");
 const tree = @import("../../meta/tree.zig");
 const tx = @import("../../meta/tx.zig");
@@ -189,6 +190,10 @@ pub fn keyInoOf(sl: SlotLocal) u64 {
 // ---------------------------------------------------------------------------
 // §2.6 Derived budgets (pure functions of the memory budget).
 // ---------------------------------------------------------------------------
+
+/// The scoped names the debug log spells out per pass (the rest are
+/// the counter's).
+const DEBUG_SCOPED_NAMES: u64 = 12;
 
 /// `max(mem_budget / 64, 16 MiB)`: a scan holds two sets (≈ 3 % of the
 /// budget transiently); the floor is the design cap's own requirement —
@@ -857,6 +862,13 @@ pub const DentryPass = struct {
     refs_indexed: u64 = 0,
     foreign_dentry_scoped: u64 = 0,
     window_scoped: u64 = 0,
+    /// Every name of the set is in this pass: no slot is a live lessee's.
+    /// A lessee's slot tree (the names its directories hold — a
+    /// predecessor's directories included, the slot being the container)
+    /// left this forest at the grant, so the referenced set is incomplete
+    /// by construction while any slot is foreign-live: the reverse
+    /// difference (C9) and the name counts (C10) take no verdict then.
+    names_complete: bool = true,
     complete: bool = true,
 
     pub fn deinit(self: *DentryPass) void {
@@ -920,6 +932,10 @@ pub fn dentryPass(gpa: Allocator, store: Store, opts: DentryOptions) Error!Dentr
         const parent = dk.parentIno();
         const psl = ofKeyIno(parent);
         if (opts.scope.unjudged(psl.slot)) {
+            if (p.foreign_dentry_scoped < DEBUG_SCOPED_NAMES) {
+                const dvs = record.DentryValue.decode(kv.value) catch null;
+                log.debug("fsck census: dentry of parent {d} (slot {d}) → child {?d} scoped (the parent's slot is a live lessee's)", .{ globalOfKeyIno(parent), psl.slot, if (dvs) |x| x.child_ino else null });
+            }
             p.foreign_dentry_scoped += 1;
             continue;
         }
@@ -951,6 +967,7 @@ pub fn dentryPass(gpa: Allocator, store: Store, opts: DentryOptions) Error!Dentr
         // joiner's file under this mount's directory), so its record is
         // the lessee's to judge — scoped like a dentry of its own tree.
         if (opts.scope.unjudged(csl.slot)) {
+            if (p.foreign_dentry_scoped < DEBUG_SCOPED_NAMES) log.debug("fsck census: dentry of parent {d} → child {d} (slot {d}) scoped (the child's slot is a live lessee's)", .{ globalOfKeyIno(parent), dv.child_ino, csl.slot });
             p.foreign_dentry_scoped += 1;
             continue;
         }
@@ -974,6 +991,7 @@ pub fn dentryPass(gpa: Allocator, store: Store, opts: DentryOptions) Error!Dentr
         };
     }
     if (p.referenced.truncated) p.complete = false;
+    p.names_complete = opts.scope.foreign_live.count() == 0 and p.foreign_dentry_scoped == 0;
     return p;
 }
 

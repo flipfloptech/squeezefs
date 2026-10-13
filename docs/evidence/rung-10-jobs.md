@@ -127,14 +127,49 @@ completed 1, remote workers 0, the job completes whole with exit 0 (0 findings),
 tripwires 0 → the offline `fsck --scrub` after the row: 256 blocks checked, 0 findings (B's
 unrecovered slots scoped foreign-live by the offline open).
 
+## 3a. The C9 on the two-daemon set (the row red on `dev`, 2/2) — a census scoping gap
+
+**Root cause.** A's forest scope at fsck time read `64 leased, 65 foreign-live`: B's 64 rotor
+slots and **slot 1**. Slot 1 was one of A's rotor slots before A's remount (the row's stage 4
+remounts A so its dismount promotes every resident); A's dismount released it, B's join
+leased it. A slot is the container: its tree carries every record ever minted in it — here
+A's own `d` (ino 3), `a-dir`, `f`, `g` and the NAMES `d` holds (`d → e`). At the grant the
+tree left A's forest (`forgetTree`), while `e`'s record (ino 4, slot 2) stayed A's: the
+census saw `e` live and prior-era with no name in view → `[C9] ino 4 — named by no dentry`.
+The filesystem itself is consistent (both mounts list `d/e`); the census's referenced set
+is incomplete BY CONSTRUCTION whenever any slot is a live lessee's — a judged inode may be
+named only from a directory in that slot. Class: **scoping gap** (the charter allows the
+lessee to hold a slot carrying another member's records; the reverse difference needs every
+name).
+
+**Law.** `DentryPass.names_complete` = no slot foreign-live and no dentry scoped; the
+name-dependent arms — C9's reverse difference and C10's count arms — take no verdict without
+it (`inode_plane_names_declined`); C10's dangling arm over a judged parent and child stays.
+Red first: `C9 and the C10 counts under a live lessee: …` (`RamSet.mkdirGuest`: a directory
+in a lessee's slot naming a file whose record is slot 0's — C9 before the law, 0 findings
+and `names_declined ≥ 1` after; the slot nobody's again → the name is in view and the file's
+`nlink 2` against one name is C10's); `forest scoping …` re-pinned to the law. The row's
+set stage asserts 0 findings on the UNQUIESCED set again (the members' `sync -f` is gone;
+`names_declined == 1`); 10/10 venue runs green, 0 findings each (foreign-dentry scoped 10 or
+104 by which slot B's leases land on, slots covered 65,472).
+
+**Also.** `data.accumulate`'s "two flushes of one parked block (a RELEASE racing an fsync)"
+flaked once in a venue gate (`.discarded` for `.joined`): 200 runs of the row under 8-way
+`yes` load passed 200/200 — no reproduction. By inspection the row's rendezvous was a
+schedule assumption: the joiner registers on `upload_settled` (`Notified.enable`) BEFORE it
+takes the lock and reads `upload_inflight`, so a hold released on `waiters() != 0` lets the
+first upload publish and retire the entry ahead of the joiner's first look — `.discarded`,
+the correct word for an entry gone (every caller treats `.discarded` and `.joined` alike).
+The rendezvous is now the joiner's OBSERVATION of the in-flight upload
+(`write_pipeline_join_waits`, counted before the wait; in `.stats`).
+
 ## 4. Owed (stated)
 
 - **The block plane over a live set.** The coordinator's C3/leaked/C8 arms decline while a
-  lessee is live; the complete law is the members' derived censuses merged at the coordinator
-  (the custody report carrying per-block references). The inode plane's verdict over a
-  joiner's cross-owner mints under churn (a C9 of a cross-owner-minted directory appeared on
-  one unquiesced run and not on the quiesced one) is read for its scoping counters on the
-  set stage; the storm row's 0-false-positive law holds on a single daemon.
+  lessee is live, and so do the name arms (§3a); the complete law is the members' censuses
+  merged at the coordinator (the custody report carrying its names and per-block
+  references). The storm row's 0-false-positive law holds on a single daemon; the set stage
+  holds 0 findings with the arms declined and counted.
 - **C13's live-appender arm and C16 on a real set** stay as `rung-08a1-fsck.md` left them
   (0003 §R): C13 needs a member-side census verb (the lessee's own SMO serialization), C16 a
   product index home.

@@ -1248,10 +1248,19 @@ test "a fleet READ shard end to end over the loopback: the coordinator queues sh
     try testing.expectEqual(Worker.Pulled.none, try r.worker.pullOnce());
 }
 
+/// The dying-worker row's lease TTL (ms): a minute, so no wall-clock
+/// stall of a loaded gate reaches it; the row's expiries are explicit
+/// sweeps past it.
+const ROW_TTL_MS: u32 = 60_000;
+
 test "a fleet READ shard whose worker dies mid-walk: the lease expires at the sweeper (fencing +1), the shard RE-QUEUES for the next capable pull, the zombie's late proposal is refused stale and nothing merges, the fresh pull runs it under fencing 1 and the collector gets exactly one payload; a second loss spends the attempts and the shard is LOST to the local run; a worker whose heartbeat reads stale cancels its walk and abandons" {
     const gpa = testing.allocator;
     const io = testing.io;
-    const r = try Rig.init(gpa, io, 1000);
+    // The lease TTL is a minute: every expiry below is the sweeper's clock
+    // advanced EXPLICITLY (`sweep(now + TTL + 1 s)`), never the wall clock
+    // — a 1 s TTL let a scheduling stall under a loaded gate expire the
+    // fresh pull's OWN lease clock before its proposal (`.abandoned`).
+    const r = try Rig.init(gpa, io, ROW_TTL_MS);
     defer r.deinit(gpa);
     defer r.coord.deinit();
     var engine: RamReadRunner = .{ .io = io, .hold = true };
@@ -1273,7 +1282,7 @@ test "a fleet READ shard whose worker dies mid-walk: the lease expires at the sw
     // The worker "dies": the sweeper past the TTL expires the lease; the
     // shard re-queues (attempt 1 of 2, a capable session stands).
     const exp0 = stats.job_remote_lease_expiries.load();
-    try testing.expectEqual(@as(usize, 1), r.coord.sweep(clock.monotonicNs() + 3 * std.time.ns_per_s));
+    try testing.expectEqual(@as(usize, 1), r.coord.sweep(clock.monotonicNs() + @as(u64, ROW_TTL_MS + 1000) * std.time.ns_per_ms));
     try testing.expectEqual(exp0 + 1, stats.job_remote_lease_expiries.load());
     try testing.expectEqual(@as(?u64, 1), r.table.fencingOf(d.id));
     // The zombie wakes and proposes under fencing 0: refused stale.
@@ -1299,7 +1308,7 @@ test "a fleet READ shard whose worker dies mid-walk: the lease expires at the sw
         var out: Worker.Pulled = .none;
         const t = try std.Thread.spawn(.{}, Pull.run, .{ &r.worker, &out });
         while (!engine.holding.load(.acquire)) std.atomic.spinLoopHint();
-        _ = r.coord.sweep(clock.monotonicNs() + 3 * std.time.ns_per_s);
+        _ = r.coord.sweep(clock.monotonicNs() + @as(u64, ROW_TTL_MS + 1000) * std.time.ns_per_ms);
         engine.releaseHold(io);
         t.join();
         try testing.expectEqual(Worker.Pulled.refused, out);
@@ -1317,7 +1326,7 @@ test "a fleet READ shard whose worker dies mid-walk: the lease expires at the sw
     var out3: Worker.Pulled = .none;
     const t3 = try std.Thread.spawn(.{}, Pull.run, .{ &r.worker, &out3 });
     while (!engine.holding.load(.acquire)) std.atomic.spinLoopHint();
-    _ = r.coord.sweep(clock.monotonicNs() + 3 * std.time.ns_per_s);
+    _ = r.coord.sweep(clock.monotonicNs() + @as(u64, ROW_TTL_MS + 1000) * std.time.ns_per_ms);
     // The next heartbeat (50 ms) reads stale and raises the cancel; the
     // engine sees it at its next step and answers null — never released
     // by the test, the walk ends on the lease alone.

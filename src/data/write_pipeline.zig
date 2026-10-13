@@ -102,6 +102,10 @@ pub const stats = struct {
     /// A second flush of a block whose upload was already in flight waited
     /// for that upload's settle instead of minting a second block.
     pub var write_pipeline_joins: counters.ShardedCounter = .{};
+    /// A flush OBSERVED another task's upload of its block in flight and
+    /// parked on the table's settle (counted at the observation, before the
+    /// wait: the deterministic rendezvous of "the joiner is in the join").
+    pub var write_pipeline_join_waits: counters.ShardedCounter = .{};
     /// `write_pipeline_phase_ns[phase]`: the exact-sum residence family.
     pub var write_pipeline_phase_ns: [Phase.count]counters.ShardedLatencyHistogram = @splat(.{});
 };
@@ -111,7 +115,7 @@ pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
     inline for (.{ "write_pipeline_inflight_bytes", "write_pipeline_inflight_blocks", "write_pipeline_depth_target", "write_pipeline_depth_target_base" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, @field(stats, name).load() });
     }
-    inline for (.{ "write_pipeline_admission_waits", "write_pipeline_admission_tick_wakes", "write_pipeline_depth_probe_ups", "write_pipeline_depth_probe_backoffs", "write_pipeline_supersessions", "write_pipeline_superseded_bytes", "write_pipeline_stay_parked", "write_pipeline_published", "write_pipeline_discards", "write_pipeline_joins" }) |name| {
+    inline for (.{ "write_pipeline_admission_waits", "write_pipeline_admission_tick_wakes", "write_pipeline_depth_probe_ups", "write_pipeline_depth_probe_backoffs", "write_pipeline_supersessions", "write_pipeline_superseded_bytes", "write_pipeline_stay_parked", "write_pipeline_published", "write_pipeline_discards", "write_pipeline_joins", "write_pipeline_join_waits" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, @field(stats, name).load() });
     }
     try w.print("\"write_pipeline_fence_drops\":{d},\"write_pipeline_phase_ns\":{{", .{counters.tripwireCount("write_pipeline_fence_drops")});

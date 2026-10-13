@@ -111,6 +111,7 @@ pub const stats = struct {
     pub var fsck_c1_projection_slots_scoped: counters.ShardedCounter = .{};
     pub var fsck_c4_custody_scoped: counters.ShardedCounter = .{};
     pub var fsck_block_plane_foreign_scoped: counters.ShardedCounter = .{};
+    pub var fsck_inode_plane_names_declined: counters.ShardedCounter = .{};
     pub var fsck_inode_plane_foreign_slot_scoped: counters.ShardedCounter = .{};
     pub var fsck_inode_plane_window_scoped: counters.ShardedCounter = .{};
     pub var fsck_inode_plane_foreign_dentry_scoped: counters.ShardedCounter = .{};

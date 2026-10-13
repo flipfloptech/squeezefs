@@ -960,6 +960,7 @@ pub fn uploadParkedBlock(table: *Table, deps: UploadDeps, io: Io, ino: u64, bloc
             }
             if (inflight_elsewhere) {
                 joined = true;
+                pipeline.stats.write_pipeline_join_waits.inc();
                 if (settle.waitUntilUncancelable(io, clock.monotonicNs() + UPLOAD_JOIN_BARK_NS) == .deadline) {
                     stats.upload_join_overlong.fire("a flush waited 30 s on another task's upload of the same block");
                     log.err("ino {d} block {d}: an upload has been in flight for 30 s while a second flush waits on it", .{ ino, block });
@@ -1734,6 +1735,7 @@ test "two flushes of one parked block (a RELEASE racing an fsync): the second JO
     const used0 = w.f.alloc_a.usedBlocks();
     const abandons0 = block_alloc.stats.unpublished_mint_abandons.load();
     const joins0 = pipeline.stats.write_pipeline_joins.load();
+    const join_waits0 = pipeline.stats.write_pipeline_join_waits.load();
     var first: Disposition = .stay_parked;
     const th = try std.Thread.spawn(.{}, Uploader.run, .{ io, &w.table, w.deps(), &first });
     while (!Gate.in_dma.load(.acquire)) try std.Thread.yield();
@@ -1745,7 +1747,13 @@ test "two flushes of one parked block (a RELEASE racing an fsync): the second JO
     };
     var second: Disposition = .stay_parked;
     const tj = try std.Thread.spawn(.{}, Joiner.run, .{ io, &w.table, w.deps(), &second });
-    while (w.table.upload_settled.waiters(io) == 0) try std.Thread.yield();
+    // The rendezvous is the joiner's OBSERVATION of the in-flight upload
+    // (`write_pipeline_join_waits`), never its settle registration: the
+    // waiter registers BEFORE it takes the lock, so a hold released on
+    // `waiters() != 0` let the first upload publish and retire the entry
+    // ahead of the joiner's first look — `.discarded`, a correct word for
+    // an entry gone, where this row asserts the join.
+    while (pipeline.stats.write_pipeline_join_waits.load() == join_waits0) try std.Thread.yield();
     Gate.hold.store(false, .release);
     th.join();
     tj.join();

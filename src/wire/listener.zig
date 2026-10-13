@@ -294,12 +294,19 @@ pub const Listener = struct {
         self.unlockConns();
     }
 
+    /// The connection's last act. Everything it needs of the listener is
+    /// read BEFORE the decrement: from the decrement on, `stop` may see 0
+    /// and free the listener, so the gauge takes the decrement's own result
+    /// and the wake names the word by its address alone (a private futex
+    /// is keyed by the address; the kernel reads nothing there — the
+    /// waker-after-free shape every futex-backed release has).
     fn retire(self: *Listener) void {
         const station = self.retire_station;
-        _ = self.live.fetchSub(1, .acq_rel);
+        const word = &self.live;
+        const prev = word.fetchSub(1, .acq_rel);
         if (station) |st| st.decremented(st.ctx);
-        stats.cluster_wire_live_connections.set(self.live.load(.acquire));
-        futex.wakeAll(&self.live);
+        stats.cluster_wire_live_connections.set(prev - 1);
+        futex.wakeAll(word);
         if (station) |st| st.retired(st.ctx);
     }
 

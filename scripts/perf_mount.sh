@@ -28,7 +28,7 @@
 #     scripts/perf_mount.sh --mdt /dev/nvme0n1 [--mdt /dev/nvme1n1] \
 #                           --ost /dev/nvme2n1 [--ost …] [--cache-dir DIR]
 #   Format refuses a device carrying another filesystem unless --fresh (which
-#   formats with -f). The staging ring lives under --cache-dir (default
+#   formats with --force). The staging ring lives under --cache-dir (default
 #   /var/tmp/sqz-perf-cache — put it on NVMe). fio/ior/mdtest come from PATH.
 #
 # One mount at a time per host: macOS `/mnt/sqz` inside sqz-bench; Linux
@@ -147,7 +147,7 @@ mountpoint -q "$MNT" 2>/dev/null && [ "$FRESH" = 1 ] && "$BIN" umount "$MNT"
 want="$layout $(for m in "${metas[@]}" "${datas[@]}"; do printf '%s=%s ' "$(basename "$m")" "$(blockdev --getsize64 "$m")"; done)"
 if [ "$FRESH" = 1 ] || [ ! -f "$STATE/formatted" ] || [ "$(cat "$STATE/formatted")" != "$want" ]; then
   [ -f "$STATE/formatted" ] && [ "$FRESH" != 1 ] && die "the targets changed since the set was formatted ($(cat "$STATE/formatted") → $want); run with --fresh to reformat"
-  force=(); [ "$FRESH" = 1 ] && force=(-f)
+  force=(); [ "$FRESH" = 1 ] && force=(--force)
   [ "${#metas[@]}" = 1 ] && force+=(--single-writer)
   echo "perf_mount: formatting $layout …"
   "$BIN" format ${force[@]+"${force[@]}"} --disk-cache-paths "$CACHE" "$META" "$DATA" > "$STATE/format.log" 2>&1 \

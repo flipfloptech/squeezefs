@@ -224,7 +224,7 @@ prep_target mdt0 256M; prep_target mdt1 256M; prep_target ost0 1G; prep_target o
 
 if [ ! -f "$DEV/formatted" ]; then
   echo "dev_mount: formatting 2 MDTs + 2 OSTs ($(readlink "$TGT/mdt0" | sed 's|/dev/.*|raw virtio-blk partitions|; s|^/build.*|sparse image files|')) …"
-  force=(); [ "$FRESH" = 1 ] && force=(-f)
+  force=(); [ "$FRESH" = 1 ] && force=(--force)
   "$BIN" format ${force[@]+"${force[@]}"} --disk-cache-paths "$SET/cache" "$META" "$DATA" > "$DEV/format.log" 2>&1 \
     || { cat "$DEV/format.log" >&2; die "format failed"; }
   touch "$DEV/formatted"

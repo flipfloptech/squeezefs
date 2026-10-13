@@ -5154,6 +5154,66 @@ test "smoke: umount of a BUSY mount (another process's cwd inside it) — the ve
     try testing.expect(!status_verb.writerGuardHeld(rig.img));
 }
 
+test "smoke: the stop's own sender reading `.stats` is no holder — a process opens `<mp>/.stats` and SIGTERMs the daemon with the fd open (what `squeezefs umount` does: its verdict poll opens `.stats` on its signal's heels — the matrix row's `is busy (0 holder(s))`): the daemon's census exempts the sender's control-document fds and unmounts — never `is busy`, never the lazy detach — and exits 0" {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    try rig.formatSet(false);
+    try rig.spawnMount(&.{});
+    const ready = try rig.awaitReady(0);
+    const stats_path = try std.fmt.allocPrintSentinel(gpa, "{s}/.stats", .{rig.mp}, 0);
+    defer gpa.free(stats_path);
+    var opened: [2]linux.fd_t = undefined;
+    var go: [2]linux.fd_t = undefined;
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.pipe2(&opened, .{ .CLOEXEC = true })));
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.pipe2(&go, .{ .CLOEXEC = true })));
+    const daemon_pid = rig.child_pid;
+    const rc = linux.fork();
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(rc));
+    if (rc == 0) {
+        // The sender, dumpable so the daemon's census can read its fds (a
+        // hardened test process is not): `.stats` open across its own
+        // SIGTERM until the parent says go.
+        _ = linux.close(opened[0]);
+        _ = linux.close(go[1]);
+        _ = linux.prctl(@backingInt(linux.PR.SET_DUMPABLE), 1, 0, 0, 0);
+        const fd_rc = linux.open(stats_path.ptr, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+        if (linux.errno(fd_rc) != .SUCCESS) linux.exit(2);
+        _ = linux.kill(daemon_pid, .TERM);
+        var one: u8 = 1;
+        _ = linux.write(opened[1], @ptrCast(&one), 1);
+        _ = linux.read(go[0], @ptrCast(&one), 1);
+        _ = linux.close(@intCast(fd_rc));
+        linux.exit(0);
+    }
+    const sender: linux.pid_t = @intCast(rc);
+    _ = linux.close(opened[1]);
+    _ = linux.close(go[0]);
+    var byte: u8 = 0;
+    _ = linux.read(opened[0], @ptrCast(&byte), 1);
+    _ = linux.close(opened[0]);
+    // The daemon logs its verdict after its census; the sender closes then.
+    const verdict = rig.awaitLog("stop requested", ready, 10 * std.time.ns_per_s);
+    _ = linux.close(go[1]);
+    var status: i32 = 0;
+    _ = linux.waitpid(sender, &status, 0);
+    _ = try verdict;
+    {
+        const text = try rig.readLog();
+        defer gpa.free(text);
+        if (std.mem.indexOf(u8, text[ready..], "is busy")) |i| std.debug.print("\n--- the daemon refused its own sender's stop ---\n{s}\n", .{text[ready + i - @min(i, 120) .. @min(text.len, ready + i + 300)]});
+        try testing.expect(std.mem.indexOf(u8, text[ready..], "is busy") == null);
+    }
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+    const after = try rig.readLog();
+    defer gpa.free(after);
+    try testing.expect(std.mem.indexOf(u8, after[ready..], "unmounting") != null);
+    try testing.expect(std.mem.indexOf(u8, after[ready..], "detaching lazily") == null);
+    try testing.expectEqual(@as(usize, 0), try fuseMountsOf(gpa, io, rig.mp));
+}
+
 /// The reads a holder completed on its cwd (`<work>/count`), 0 before its
 /// first.
 fn holderCount(rig: *Rig) u64 {

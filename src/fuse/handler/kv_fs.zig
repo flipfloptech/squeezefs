@@ -580,6 +580,16 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             return p.spans(globals);
         }
 
+        /// Must a namespace op run as ONE intent: its objects span homes, or
+        /// every one is ANOTHER holder's (decision 0003 §X.7 — a local commit
+        /// of records this mount does not hold is its door's refusal at
+        /// best, and the reads it revalidates under its guards are this
+        /// mount's view, never the holder's: a rename found its source
+        /// absent and answered ENOENT).
+        fn needsIntent(self: *Self, globals: []const u64) bool {
+            return self.spansHomes(globals) or self.foreignSlot(globals[0]);
+        }
+
         /// Does another appender lease `global`'s slot (the record ship's
         /// resolver: a flat mount never says yes)?
         fn foreignSlot(self: *Self, global: u64) bool {
@@ -1901,7 +1911,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             const local = if (reused) |g| try localOf(g) else self.store.allocateIno(parent, false, try self.gatherOptIn(parent)) catch |e| return storeErr(e);
             const global = globalOf(local);
             noteSubjects(c, global, null);
-            if (self.spansHomes(&.{ parent_global, global })) return self.xvCreate(c, parent_global, logical_parent, name, child, local, global);
+            if (self.needsIntent(&.{ parent_global, global })) return self.xvCreate(c, parent_global, logical_parent, name, child, local, global);
             var plan: economy.GuardPlan = .{};
             plan.inode_reqs[0] = .{ .ino = parent, .mode = if (is_dir) .exclusive else .shared };
             plan.inode_len = 1;
@@ -2024,7 +2034,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 self.forgetParent(probe.global);
                 return;
             };
-            if (self.spansHomes(&.{ parent_global, probe.global })) return self.xvRemove(c, parent_global, name, probe, want_dir);
+            if (self.needsIntent(&.{ parent_global, probe.global })) return self.xvRemove(c, parent_global, name, probe, want_dir);
             var plan: economy.GuardPlan = .{};
             const shared = economy.unlinkParentShared(want_dir, parent, probe.local);
             plan.inode_reqs[0] = .{ .ino = parent, .mode = if (shared) .shared else .exclusive };
@@ -2111,7 +2121,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                     homes[3] = d.global;
                     n = 4;
                 }
-                if (self.spansHomes(homes[0..n])) return self.xvRename(c, a, logical, flags, whiteout, old0, new0);
+                if (self.needsIntent(homes[0..n])) return self.xvRename(c, a, logical, flags, whiteout, old0, new0);
             }
             // The conservative set: both parents exclusive (≥ what the
             // staged records require), both inodes, both names.
@@ -2361,7 +2371,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             a.newparent = try self.insertParentOf(a0.newparent, a0.newname);
             const parent = try localOf(a.newparent);
             const child = try localOf(a.ino);
-            if (self.spansHomes(&.{ a.newparent, a.ino })) return self.xvLink(c, a);
+            if (self.needsIntent(&.{ a.newparent, a.ino })) return self.xvLink(c, a);
             var plan: economy.GuardPlan = .{};
             plan.inode_reqs[0] = .{ .ino = parent, .mode = .exclusive };
             plan.inode_reqs[1] = .{ .ino = child, .mode = .exclusive };

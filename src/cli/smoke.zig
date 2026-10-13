@@ -1542,7 +1542,16 @@ const Peer = struct {
             std.debug.print("\n--- daemon {s} did not exit within {d} s; killing ---\n", .{ self.name, exit_wait_ns / std.time.ns_per_s });
             _ = linux.kill(self.pid, .KILL);
         }
-        return c.wait(self.rig.io);
+        const term = try c.wait(self.rig.io);
+        // A death by signal this test did not send: the log's tail (a
+        // panic's trace starts no `error(` line) before the caller judges.
+        if (term == .signal and !self.killed) {
+            const text = self.readLog() catch null;
+            defer if (text) |t| self.rig.gpa.free(t);
+            const tail = if (text) |t| t[t.len -| 6000..] else "";
+            std.debug.print("\n--- daemon {s} exited by {f} at its unmount; its log's tail ---\n{s}\n", .{ self.name, term, tail });
+        }
+        return term;
     }
 
     /// `waitExit` judged: a clean exit 0, else the log (a panic's trace

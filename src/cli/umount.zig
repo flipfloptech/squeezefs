@@ -30,7 +30,8 @@
 //! refuses the same way, counting `transport_umount_busy_refusals`; the
 //! verb reads that counter back through `.stats` so a holder that arrived
 //! between the two censuses is still answered `EBUSY` with its name, not
-//! a 30 s wait. `--lazy` is the explicit opt-in to the other shape: the
+//! a 30 s wait (the daemon's census exempts its stop's sender's fds on
+//! the control documents: that very read is no holder). `--lazy` is the explicit opt-in to the other shape: the
 //! daemon detaches the mountpoint now (`MNT_DETACH`) and serves every
 //! holder until the kernel ends the connection, then tears down; the verb
 //! names the holders it leaves behind and waits for the exit only when
@@ -224,7 +225,7 @@ const Watched = struct {
     /// still reference its id), everyone but this verb and the daemon.
     fn census(self: *const Watched, daemon_pid: linux.pid_t) holders.Census {
         const t = self.target orelse return .{};
-        return holders.census(self.gpa, self.io, t, self.text, &.{ linux.getpid(), daemon_pid });
+        return holders.census(self.gpa, self.io, t, self.text, &.{ linux.getpid(), daemon_pid }, null);
     }
 };
 

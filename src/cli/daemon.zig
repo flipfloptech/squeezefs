@@ -290,6 +290,9 @@ pub const SIG_STOP_LAZY: u32 = 1 << 2;
 pub const Signals = struct {
     var pending: std.atomic.Value(u32) = .init(0);
     var efd: std.atomic.Value(i32) = .init(-1);
+    /// The last stop's sender (`si_pid` of SIGTERM/SIGINT/SIGUSR2; 0 before
+    /// any stop or for a kernel-raised one): its census exemption.
+    var stop_sender: std.atomic.Value(i32) = .init(0);
 
     /// The eventfd the main task waits on (`SqzIo.readable`).
     pub fn eventfd() linux.fd_t {
@@ -308,7 +311,7 @@ pub const Signals = struct {
     }
 
     fn installHandlers() void {
-        var act: linux.Sigaction = .{ .handler = .{ .handler = handle }, .mask = linux.sigemptyset(), .flags = linux.SA.RESTART };
+        var act: linux.Sigaction = .{ .handler = .{ .sigaction = handleInfo }, .mask = linux.sigemptyset(), .flags = linux.SA.RESTART | linux.SA.SIGINFO };
         _ = linux.sigaction(.TERM, &act, null);
         _ = linux.sigaction(.INT, &act, null);
         _ = linux.sigaction(.USR1, &act, null);
@@ -320,6 +323,12 @@ pub const Signals = struct {
     /// Swap out the pending bits (the main task, after its wake).
     pub fn take() u32 {
         return pending.swap(0, .acq_rel);
+    }
+
+    /// Who sent the stop `take` returned (acquire pairs with the handler's
+    /// release store, which precedes its bit's release `fetchOr`).
+    pub fn stopSender() linux.pid_t {
+        return stop_sender.load(.acquire);
     }
 
     /// Ring the eventfd from any context (the session's `on_shutdown` hook
@@ -337,6 +346,14 @@ pub const Signals = struct {
         if (fd < 0) return;
         var v: u64 = 0;
         _ = linux.read(fd, @ptrCast(&v), 8);
+    }
+
+    fn handleInfo(sig: linux.SIG, info: *const linux.siginfo_t, _: ?*anyopaque) callconv(.c) void {
+        switch (sig) {
+            .TERM, .INT, .USR2 => stop_sender.store(info.fields.common.first.piduid.pid, .release),
+            else => {},
+        }
+        handle(sig);
     }
 
     fn handle(sig: linux.SIG) callconv(.c) void {
@@ -424,4 +441,23 @@ test "signals: the handler latches TERM as stop and USR1 as the stats bit, rings
     try testing.expectEqual(SIG_STOP_LAZY, Signals.take());
     Signals.handle(.HUP);
     try testing.expectEqual(@as(u32, 0), Signals.take());
+}
+
+test "signals: a stop's sender is latched from its siginfo (the census exemption); the stats signal leaves it" {
+    try Signals.initEventfd();
+    var info = std.mem.zeroes(linux.siginfo_t);
+    info.fields.common.first.piduid.pid = 4242;
+    Signals.handleInfo(.TERM, &info, null);
+    Signals.drain();
+    try testing.expectEqual(SIG_STOP, Signals.take());
+    try testing.expectEqual(@as(linux.pid_t, 4242), Signals.stopSender());
+    info.fields.common.first.piduid.pid = 7;
+    Signals.handleInfo(.USR1, &info, null);
+    Signals.drain();
+    try testing.expectEqual(SIG_STATS, Signals.take());
+    try testing.expectEqual(@as(linux.pid_t, 4242), Signals.stopSender());
+    Signals.handleInfo(.USR2, &info, null);
+    Signals.drain();
+    try testing.expectEqual(SIG_STOP_LAZY, Signals.take());
+    try testing.expectEqual(@as(linux.pid_t, 7), Signals.stopSender());
 }

@@ -21,7 +21,12 @@
 //! non-dumpable one (a hardened daemon, a setuid program) when the caller
 //! lacks CAP_SYS_PTRACE (root on a host has it; a container may not): the
 //! kernel's `umount2` stays the authority on "busy"; this census is the
-//! NAMES and the early answer.
+//! NAMES and the early answer. One process may be EXEMPT for its fds on
+//! named inodes (`Exempt`): the daemon's census exempts the stop's own
+//! sender's control-document reads — `squeezefs umount` opens `.stats` on
+//! its signal's heels for the daemon's verdict, and that read must not be
+//! the holder that refuses its own unmount (its cwd, root, exe, mappings
+//! and every other fd still hold).
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -139,6 +144,25 @@ pub fn parseFdinfoMountId(text: []const u8) ?u64 {
     return null;
 }
 
+/// `ino:\t<n>` out of a `/proc/<pid>/fdinfo/<fd>` document (the open
+/// file's inode number); null when the kernel prints none.
+pub fn parseFdinfoIno(text: []const u8) ?u64 {
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        if (!std.mem.startsWith(u8, line, "ino:")) continue;
+        const v = std.mem.trim(u8, line["ino:".len..], " \t\r");
+        return std.fmt.parseInt(u64, v, 10) catch null; // decimal, as proc(5) prints it
+    }
+    return null;
+}
+
+/// The one process whose fds on the inodes `fd_ino` accepts hold nothing
+/// (module doc); an fd whose fdinfo names no inode still holds.
+pub const Exempt = struct {
+    pid: linux.pid_t,
+    fd_ino: *const fn (ino: u64) bool,
+};
+
 /// The device of one `/proc/<pid>/maps` line (`addr perms offset
 /// MAJ:MIN inode [path]`, the device in hex); null for an anonymous or
 /// malformed line.
@@ -185,7 +209,7 @@ fn readComm(io: Io, pid: linux.pid_t, h: *Holder) void {
 
 /// The process's first reference into the target, in the module doc's
 /// order; null when it holds nothing (or nothing readable).
-fn processHolds(gpa: std.mem.Allocator, io: Io, pid: linux.pid_t, target: Target) ?Holder {
+fn processHolds(gpa: std.mem.Allocator, io: Io, pid: linux.pid_t, target: Target, exempt_ino: ?*const fn (ino: u64) bool) ?Holder {
     var pb: [64:0]u8 = undefined;
     inline for (.{ .cwd, .root, .exe }) |via| {
         const link = std.fmt.bufPrintSentinel(&pb, "/proc/{d}/{s}", .{ pid, @tagName(via) }, 0) catch return null;
@@ -204,7 +228,10 @@ fn processHolds(gpa: std.mem.Allocator, io: Io, pid: linux.pid_t, target: Target
                 var fb: [512]u8 = undefined;
                 const info = std.fmt.bufPrint(&ib, "/proc/{d}/fdinfo/{d}", .{ pid, fd }) catch continue;
                 const text = Io.Dir.cwd().readFile(io, info, &fb) catch continue;
-                if (parseFdinfoMountId(text)) |id| if (id == target.mount_id) return .{ .pid = pid, .via = .fd, .fd = fd };
+                const id = parseFdinfoMountId(text) orelse continue;
+                if (id != target.mount_id) continue;
+                if (exempt_ino) |exempt| if (parseFdinfoIno(text)) |ino| if (exempt(ino)) continue;
+                return .{ .pid = pid, .via = .fd, .fd = fd };
             }
         } else |_| {}
     }
@@ -223,9 +250,10 @@ fn processHolds(gpa: std.mem.Allocator, io: Io, pid: linux.pid_t, target: Target
 }
 
 /// The census of `target` over every process but `skip` (the caller, the
-/// daemon), plus the mounts stacked inside it (`mountinfo_text` is the
-/// table the target was read from; a submount's path slices into it).
-pub fn census(gpa: std.mem.Allocator, io: Io, target: Target, mountinfo_text: []const u8, skip: []const linux.pid_t) Census {
+/// daemon), `exempt`'s named fds aside, plus the mounts stacked inside it
+/// (`mountinfo_text` is the table the target was read from; a submount's
+/// path slices into it).
+pub fn census(gpa: std.mem.Allocator, io: Io, target: Target, mountinfo_text: []const u8, skip: []const linux.pid_t, exempt: ?Exempt) Census {
     var out: Census = .{};
     {
         var lines = std.mem.splitScalar(u8, mountinfo_text, '\n');
@@ -240,7 +268,8 @@ pub fn census(gpa: std.mem.Allocator, io: Io, target: Target, mountinfo_text: []
     while (it.next(io) catch null) |ent| {
         const pid = std.fmt.parseInt(linux.pid_t, ent.name, 10) catch continue; // a pid directory, decimal
         if (skipped(skip, pid)) continue;
-        if (processHolds(gpa, io, pid, target)) |held| {
+        const exempt_ino: ?*const fn (ino: u64) bool = if (exempt) |e| (if (e.pid == pid) e.fd_ino else null) else null;
+        if (processHolds(gpa, io, pid, target, exempt_ino)) |held| {
             var h = held;
             readComm(io, pid, &h);
             out.add(h);
@@ -251,12 +280,12 @@ pub fn census(gpa: std.mem.Allocator, io: Io, target: Target, mountinfo_text: []
 
 /// The census of the mount at `mountpoint` (null when nothing is mounted
 /// there): the table is read once, the target taken from it.
-pub fn censusAt(gpa: std.mem.Allocator, io: Io, mountpoint: []const u8, skip: []const linux.pid_t) ?Census {
+pub fn censusAt(gpa: std.mem.Allocator, io: Io, mountpoint: []const u8, skip: []const linux.pid_t, exempt: ?Exempt) ?Census {
     const buf = gpa.alloc(u8, mountinfo.READ_BYTES) catch return null;
     defer gpa.free(buf);
     const text = mountinfo.read(io, buf);
     const e = mountinfo.entryAt(text, mountpoint) orelse return null;
-    return census(gpa, io, Target.of(e), text, skip);
+    return census(gpa, io, Target.of(e), text, skip, exempt);
 }
 
 // ---------------------------------------------------------------------------
@@ -269,6 +298,12 @@ test "fdinfo: the mnt_id line; a document without one is null" {
     try testing.expectEqual(@as(?u64, 45), parseFdinfoMountId("pos:\t0\nflags:\t02100002\nmnt_id:\t45\nino:\t1\n"));
     try testing.expectEqual(@as(?u64, null), parseFdinfoMountId("pos:\t0\nflags:\t02\n"));
     try testing.expectEqual(@as(?u64, null), parseFdinfoMountId("mnt_id:\tx\n"));
+}
+
+test "fdinfo: the ino line (a control document's generation ino is 2⁶⁴ − 2³² and up); a document without one is null" {
+    try testing.expectEqual(@as(?u64, 18446744069414584320), parseFdinfoIno("pos:\t0\nflags:\t0400000\nmnt_id:\t46\nino:\t18446744069414584320\n"));
+    try testing.expectEqual(@as(?u64, null), parseFdinfoIno("pos:\t0\nmnt_id:\t46\n"));
+    try testing.expectEqual(@as(?u64, null), parseFdinfoIno("ino:\t-1\n"));
 }
 
 test "maps: the device in hex; an anonymous mapping (00:00 inode 0) and a short line are null" {
@@ -309,14 +344,22 @@ fn linesFuzz(_: void, smith: *std.testing.Smith) !void {
     var buf: [512]u8 = undefined;
     const len = smith.slice(&buf);
     _ = parseFdinfoMountId(buf[0..len]);
+    _ = parseFdinfoIno(buf[0..len]);
     _ = parseMapsDevice(buf[0..len]);
 }
 
 test "fuzz: the fdinfo and maps line parsers are total on arbitrary text" {
-    try fuzzkit.fuzz({}, linesFuzz, .{ .corpus = &.{ fuzzkit.slice("mnt_id:\t45\n"), fuzzkit.slice("a-b r-xp 0 00:2f 1 /x") } });
+    try fuzzkit.fuzz({}, linesFuzz, .{ .corpus = &.{ fuzzkit.slice("mnt_id:\t45\n"), fuzzkit.slice("ino:\t18446744069414584320\n"), fuzzkit.slice("a-b r-xp 0 00:2f 1 /x") } });
 }
 
-test "the census over a real mount: a child whose cwd is a tmpfs we mount is found by cwd (then by fd once it leaves the directory); nobody holds it after the child dies and umount2 succeeds" {
+/// The exemption row's inode (its predicate is a plain function pointer).
+var exempt_ino_for_test: u64 = 0;
+
+fn isExemptInoForTest(ino: u64) bool {
+    return ino == exempt_ino_for_test;
+}
+
+test "the census over a real mount: a child whose cwd is a tmpfs we mount is found by cwd (then by fd once it leaves the directory); an exempt process's fd on its named inode holds nothing while its other fd does; nobody holds it after the child dies and umount2 succeeds" {
     if (linux.geteuid() != 0) return testkit.skip(@src(), .no_root, "mount(2) of a tmpfs needs root");
     const io = testing.io;
     const gpa = testing.allocator;
@@ -330,7 +373,7 @@ test "the census over a real mount: a child whose cwd is a tmpfs we mount is fou
     const self_pid = linux.getpid();
     // Nobody yet.
     {
-        const c = censusAt(gpa, io, mp, &.{self_pid}).?;
+        const c = censusAt(gpa, io, mp, &.{self_pid}, null).?;
         try testing.expectEqual(@as(usize, 0), c.total);
     }
     // A child parks with the tmpfs as its cwd; a pipe tells us it is there.
@@ -363,7 +406,7 @@ test "the census over a real mount: a child whose cwd is a tmpfs we mount is fou
     _ = linux.read(fds[0], @ptrCast(&byte), 1);
     _ = linux.close(fds[0]);
     {
-        const c = censusAt(gpa, io, mp, &.{self_pid}).?;
+        const c = censusAt(gpa, io, mp, &.{self_pid}, null).?;
         try testing.expectEqual(@as(usize, 1), c.total);
         try testing.expectEqual(child, c.named[0].pid);
         try testing.expectEqual(Via.cwd, c.named[0].via);
@@ -380,13 +423,32 @@ test "the census over a real mount: a child whose cwd is a tmpfs we mount is fou
         const frc = linux.open(fpath.ptr, .{ .ACCMODE = .RDWR, .CREAT = true, .CLOEXEC = true }, 0o600);
         try testing.expectEqual(linux.E.SUCCESS, linux.errno(frc));
         const fd: linux.fd_t = @intCast(frc);
-        const c = censusAt(gpa, io, mp, &.{}).?;
+        const c = censusAt(gpa, io, mp, &.{}, null).?;
         try testing.expectEqual(@as(usize, 2), c.total);
         var saw_fd = false;
         for (c.named[0..c.n_named]) |h| if (h.pid == self_pid and h.via == .fd and h.fd == @as(u32, @intCast(fd))) {
             saw_fd = true;
         };
         try testing.expect(saw_fd);
+        // Exempt for its fds on THAT inode, we hold nothing through it — a
+        // second file's fd still holds; the child's cwd holds regardless.
+        var st: linux.Statx = undefined;
+        try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.statx(fd, "", linux.AT.EMPTY_PATH, .{ .INO = true }, &st)));
+        exempt_ino_for_test = st.ino;
+        const exempt: Exempt = .{ .pid = self_pid, .fd_ino = &isExemptInoForTest };
+        try testing.expectEqual(@as(usize, 1), censusAt(gpa, io, mp, &.{}, exempt).?.total);
+        var gb: [96:0]u8 = undefined;
+        const gpath = try std.fmt.bufPrintSentinel(&gb, "{s}/g", .{mp}, 0);
+        const grc = linux.open(gpath.ptr, .{ .ACCMODE = .RDWR, .CREAT = true, .CLOEXEC = true }, 0o600);
+        try testing.expectEqual(linux.E.SUCCESS, linux.errno(grc));
+        const c2 = censusAt(gpa, io, mp, &.{}, exempt).?;
+        try testing.expectEqual(@as(usize, 2), c2.total);
+        var saw_g = false;
+        for (c2.named[0..c2.n_named]) |h| if (h.pid == self_pid and h.via == .fd and h.fd == @as(u32, @intCast(grc))) {
+            saw_g = true;
+        };
+        try testing.expect(saw_g);
+        _ = linux.close(@intCast(grc));
         _ = linux.close(fd);
     }
     // The child leaves: nobody holds it, the plain umount succeeds.
@@ -395,9 +457,9 @@ test "the census over a real mount: a child whose cwd is a tmpfs we mount is fou
     var status: i32 = 0;
     _ = linux.waitpid(child, &status, 0);
     {
-        const c = censusAt(gpa, io, mp, &.{self_pid}).?;
+        const c = censusAt(gpa, io, mp, &.{self_pid}, null).?;
         try testing.expectEqual(@as(usize, 0), c.total);
     }
     try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.umount2(mp.ptr, 0)));
-    try testing.expect(censusAt(gpa, io, mp, &.{}) == null);
+    try testing.expect(censusAt(gpa, io, mp, &.{}, null) == null);
 }

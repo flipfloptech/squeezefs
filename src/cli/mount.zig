@@ -1163,8 +1163,11 @@ fn serve(ctx: *Ctx, session: *Session, vs: *VirtualSource) void {
             const lazy = bits & daemon.SIG_STOP_LAZY != 0;
             const what: []const u8 = if (lazy) "lazy stop requested (SIGUSR2)" else "stop requested (SIGTERM/SIGINT)";
             // The census over everyone but this process (its own fds are
-            // the devices and the staging segments, never the mount).
-            const c = holders.censusAt(ctx.p.gpa, ctx.p.io, ctx.mountpoint, &.{linux.getpid()});
+            // the devices and the staging segments, never the mount); the
+            // stop's own sender reading `.stats`/`.config`/`.trace` holds
+            // nothing (`squeezefs umount` polls `.stats` for this verdict).
+            const exempt: holders.Exempt = .{ .pid = daemon.Signals.stopSender(), .fd_ino = &handler.virtual_inodes.isVirtualIno };
+            const c = holders.censusAt(ctx.p.gpa, ctx.p.io, ctx.mountpoint, &.{linux.getpid()}, exempt);
             if (c != null and c.?.busy()) {
                 if (!lazy) {
                     log.warn("{s} but {s} is busy ({f}) — not unmounting; still serving (`squeezefs umount` retries when they are gone; `--lazy` detaches now and serves them to the end)", .{ what, ctx.mountpoint, c.? });

@@ -38,7 +38,7 @@ whole table and names what remains and why.
 
 | op (owner's row) | requests per user op (tracepoints) | where the time goes |
 |---|---|---|
-| file create (mdtest, 4 ranks, ONE shared directory) | `CREATE` + an async `RELEASE` (`FLUSH` elided by `FOPEN_NOFLUSH`); a `LOOKUP` first for `O_CREAT` without `O_EXCL` | The kernel serializes creates in one directory on its `i_rwsem`, so the rate is `1 / CREATE round trip`: mean 254 µs (p50 355 µs). Daemon create latency 266 µs mean. **Half the creates were cross-member intents**: `xv_cross_owner_intents_minted` 20,003 over 40 k namespace ops, each `intent_barrier` 191 µs + `local_steps` 56 µs + `retire` 166 µs (the second barrier) = 424 µs — two device flushes per create. A single-member create: 82 µs in the daemon (`handler_to_backend` 11.4, `backend` 66.8 = queue wait 10.6 + pass 13.0 (leaf locks 8.3) + the journal write landing ≈ 38 + the ack hop; `backend_to_reply` 4.1) + ≈ 28 µs of transport. Daemon CPU 112 µs per create. |
+| file create (mdtest, 4 ranks, ONE shared directory) | a negative `LOOKUP` + `CREATE` + an async `RELEASE` (`FLUSH` elided by `FOPEN_NOFLUSH`) | The kernel serializes creates in one directory on its `i_rwsem` and runs the `LOOKUP` and the `CREATE` both under it (`atomic_open`), so the rate is `1 / (LOOKUP + CREATE round trips)`; the `CREATE` round trip: mean 254 µs (p50 355 µs). Daemon create latency 266 µs mean. **Half the creates were cross-member intents**: `xv_cross_owner_intents_minted` 20,003 over 40 k namespace ops, each `intent_barrier` 191 µs + `local_steps` 56 µs + `retire` 166 µs (the second barrier) = 424 µs — two device flushes per create. A single-member create: 82 µs in the daemon (`handler_to_backend` 11.4, `backend` 66.8 = queue wait 10.6 + pass 13.0 (leaf locks 8.3) + the journal write landing ≈ 38 + the ack hop; `backend_to_reply` 4.1) + ≈ 28 µs of transport. Daemon CPU 112 µs per create. |
 | directory create / rename / remove | `MKDIR` / `RENAME` / `UNLINK` (+ `LOOKUP` when the dentry expired) | The same intent split: mkdir 298 µs, unlink 241 µs mean in the daemon. |
 | 1-MDT controls, same disks | — | `--single-writer` 1 MDT: 5,973 creates/s; symmetric 1 MDT: 5,628 — the symmetric plane's own cost is ≈ 6 %; the 2-MDT set's 3.0 k is the intents. |
 | file stat | one `LOOKUP` per stat whose dentry expired | Entry and attr TTLs are 1 s (charter §4 default); the create phase lasts longer than 1 s, so most dentries had expired: one round trip each, 55 µs under 4 ranks. A cached dentry costs no request. |
@@ -116,49 +116,150 @@ recheck). **Effect**: rand-4k 96 k → 158–166 k IOPS (fio mean latency 332 �
 v5 act (0003 §M): both now print `superblock.version_v5`. Red test: `format` "the summary and the
 too-small refusal name the format version the superblock writes…".
 
+### 3.6 The create and lookup paths' CPU (`7e1eff7`, `81ff635`, `2826904`, `3261ea4`)
+
+Profiled under the mdtest create phase (`perf record -g`, all daemon threads): the create handler's
+cycles went to the commit's park and resume (32 %), the mint (15 %: `Plane.mintSlot` built the
+held-slot list — an allocation and a walk of every lease — and every rotor tree's byte count before
+its first step, the parent's affinity, decided alone), the gather opt-in xattr read (13.5 %), the
+parent's inode read (12 %), the guard plan (7 %) and the dentry chain scan (7 %); ReleaseSafe's fill
+of `undefined` arrays was 5–6 % of the handler lane and of the journal lane: the 256-slot dentry
+`ChainBuf` (4 KiB per lookup and per create) and `std.sort.block`'s 512-element scratch, which it
+declares before its small-array return (4–16 KiB per lock-set, guard-plan, write-op and range-page
+sort). Fixes: the mint asks `acquire.affinityHolds` before the census (`mintChoice`'s step 1, one
+predicate for both); `ChainBuf` keeps four keys inline and spills past them; `core/sort.stable`
+(insertion up to 32 elements, block above) on the conveyor's lock sets, the guard plan, the
+journal's write ops and spans and the set's range merges; and the warm ladder's probe reads the file
+facts and the request's binding from ONE layout read (`read_path.Meta.file_at`; node-cache probes
+per cold direct-leg read 4 → 3). Behaviour-preserving (the mint's tie test `acquire` "mint_choice",
+the sort's stability test `core.sort`, the ladder's resolution test above). **Effect**: the QD1 local
+create's handler time before the commit 11.4 → 6.6 µs, its daemon total 82 → 65 µs; the shared
+directory's rate moved only to 6.0–6.2 k/s — the create is bounded by its thread handoffs, not its
+CPU (§5).
+
+### 3.7 Where a create's 90 µs go now (QD1, one bash loop, `SQUEEZEFS_OP_PROFILE=1`, 3,000 creates)
+
+| span | µs | source |
+|---|---|---|
+| kernel → drain worker → handler lane (dispatch) + lane → worker → kernel (reply) | ≈ 25 | `CREATE` round trip 90.1 µs (tracepoints) − daemon total 64.8 µs |
+| handler before the commit (mint, guards, parent read, chain scan, stage) | 6.6 | `fuse_op_phase_ns.create.handler_to_backend` |
+| enqueue → the journal lane's pass begins (its wake) | 10.3 | `meta_tx_queue_wait` |
+| the pass (admission, leaf locks 5.8, apply, reservation) | 7.5 | `meta_pass_total` |
+| the journal write landing | ≈ 19 | `meta_window_total` 26.4 − the pass |
+| the ack → the committer fiber resumed on its lane | ≈ 17.5 | `backend` 54.2 − the three above |
+| the reply built | 4.0 | `backend_to_reply` |
+
+Three cross-thread handoff pairs (worker ↔ handler lane, lane → journal lane, journal lane → lane)
+cost ≈ 52 µs of the 90; the device write the charter owes is ≈ 19 µs. A `LOOKUP` is the same shape
+without the journal: 27 µs round trip against a 5.0 µs handler.
+
 ## 4. The table, before and after (same container, same commands)
 
-Before = `b652702` (the owner's build) on its first mount after the container's boot (`buf_ring`, the
-owner's posture); after = `7f51e85`. Two runs of each where the host was shared with other agents'
-gates: the spread is shown (the host is 11 cores shared by the venue, the owner's container and this
-one; `uptime` 3.6–4.6 during the after runs).
+"Before" is the owner's build `b652702` as the owner ran it — its first mount after the container's
+boot, so `buf_ring` (§3.1) — and, in the A-B-B-A column, the same build on a later mount
+(`zero_copy`), interleaved with the final build `e837153` on ONE freshly formatted 2-MDT + 2-OST set
+per leg (`scripts/perf/reset.sh sym2 <bin>; scripts/perf/table.sh … mdtest,randread`, 21:44–21:47
+UTC): the A-B-B-A pair is the code's own effect under the same host load. The host (11 cores) is
+shared with the venue, the owner's container and this one; a single after run moved by up to 20 %
+with the other agents' load (two final runs shown).
 
-| workload | owner (`sqz-dev`) | before (`sqz-perf`) | after | ext4 (`/build`) | tmpfs |
-|---|---|---|---|---|---|
-| mdtest file create (4 ranks × 2000, one dir) | 3,163/s | 2,994/s | 5,958–6,084/s | 26,682/s | 545,663/s |
-| mdtest dir create | 3,175/s | 2,759/s | 6,016–6,119/s | 7,312/s | 331,484/s |
-| mdtest file stat | 128,349/s | 114,966/s | 188,595–245,302/s | 5,041,231/s | 5,034,423/s |
-| mdtest file read (open/close) | 76,350/s | 71,717/s | 57,755–77,876/s | 5,895,016/s | 4,725,311/s |
-| mdtest file remove | 3,126/s | 3,401/s | 6,173–6,287/s | 134,673/s | 1,296,990/s |
-| fio randread 4k O_DIRECT QD32 io_uring | 16.7 k | 17.4 k | 157.6–168.4 k | 334.0 k | — |
-| fio randwrite 4k O_DIRECT QD32 | 94.5 k | 29.0 k | 98.8–102.3 k | 257.4 k | — |
-| IOR 4 × 1 MiB write / read | 2.04 / 47.8 GB/s | 2.97 / 26.6 GB/s | 2.46–2.86 / 18.2–32.3 GB/s | — | — |
+| workload | owner (`sqz-dev`) | before, first mount (`buf_ring`) | A-B-B-A old (`zero_copy`) | A-B-B-A new | final runs (new) | ext4 (`/build`) | tmpfs |
+|---|---|---|---|---|---|---|---|
+| mdtest file create (4 ranks × 2000, one dir) | 3,163/s | 2,994/s | 2,919 / 3,134 | 5,625 / 5,844 | 5,602–5,740 | 26,682/s | 545,663/s |
+| mdtest dir create | 3,175/s | 2,759/s | 2,939 / 2,724 | 5,887 / 6,254 | 5,927–6,304 | 7,312/s | 331,484/s |
+| mdtest file stat | 128,349/s | 114,966/s | 76,944 / 106,613 | 186,298 / 209,572 | 170,238–181,327 | 5,041,231/s | 5,034,423/s |
+| mdtest file read (open/close) | 76,350/s | 71,717/s | 51,540 / 65,623 | 63,720 / 63,776 | 61,715–65,487 | 5,895,016/s | 4,725,311/s |
+| mdtest file remove | 3,126/s | 3,401/s | 2,982 / 3,104 | 6,300 / 6,439 | 6,033–6,272 | 134,673/s | 1,296,990/s |
+| fio randread 4k O_DIRECT QD32 io_uring | 16.7 k | 17.4 k | 46.5 k / 51.7 k | 172.5 k / 170.8 k | 172.7–174.2 k | 334.0 k | — |
+| fio randwrite 4k O_DIRECT QD32 | 94.5 k | 29.0 k | — | — | 106.8–109.1 k | 257.4 k | — |
+| IOR 4 × 1 MiB write / read (GB/s) | 2.04 / 47.8 | 2.97 / 26.6 | — | — | 2.48–3.70 / 16.5–26.9 | — | — |
 
-Daemon-side, the same mdtest: cross-owner intents 20,003 → 0; daemon create latency 266 → 76 µs,
-mkdir 298 → 79 µs, unlink 241 → 83 µs, rename 273 → 78 µs. The random read: node-cache probes per
-direct-leg read 7.00 → 4.00, drain-worker CPU per read 17.2 → 5.4 µs, kernel READ round trip at
-QD32 424 → ≈ 190 µs.
+Ratios, new over old on the same mounts (A-B-B-A): creates 1.9×, dir creates 2.2×, stats 2.2×,
+reads 1.1×, removes 2.1×, random reads 3.4× (9.9× over the owner's first-mount `buf_ring` posture).
+The daemon's side of the same mdtest: cross-owner intents 20,003 → 0; daemon latency create 266 →
+76 µs, mkdir 298 → 79 µs, unlink 241 → 83 µs, rename 273 → 78 µs. The random read: node-cache
+probes per direct-leg read 7.00 → 3.00 (`Δmeta_kv_node_cache_hits ÷ Δtransport_zc_direct_legs`),
+drain-worker CPU per read 17.2 → 5.5 µs, kernel READ round trip at QD32 424 → ≈ 185 µs.
 
-Postures on the same disks (before → after): 1-MDT `--single-writer` 5,973 creates/s, 1-MDT
-symmetric 5,628 → the 2-MDT set now matches them (6.0–6.1 k): the plane's own cost is inside the
-noise and the cross-member price is gone from a directory's children.
+Requests per user op on the final build (`scripts/perf/phases.sh`, mdtest's file phases one at a
+time, kernel tracepoints): create = `LOOKUP` 38 µs + `CREATE` 108 µs + async `RELEASE`; stat =
+`LOOKUP` 62 µs when the dentry expired (the phases run seconds apart); read = `LOOKUP` 46 µs +
+`OPEN` 45 µs + async `RELEASE`; remove = `LOOKUP` 42 µs + `UNLINK` 103 µs. Postures on the same
+disks before the fixes: 1-MDT `--single-writer` 5,973 creates/s, 1-MDT symmetric 5,628 — the 2-MDT
+set's creates now match them: the cross-member price is gone from a directory's children.
 
 ## 5. The remaining gap per op, and its cause
 
-| op | after | ext4 | gap | cause (measured) |
+| op | final | ext4 | gap | cause (measured) |
 |---|---|---|---|---|
-| file create, one shared directory | 6.0 k/s | 26.7 k/s | 4.4× | The kernel serializes the 4 ranks on the directory's `i_rwsem`: the rate is `1 / CREATE round trip` ≈ 1 / 110 µs (kernel send → end; daemon 76 µs). §AA.2's bound `R + W` ≈ 52 µs (≤ 19 k/s): the journal write landing the charter owes (≈ 38 µs) plus one bare round trip. The rest is software: four cross-thread wakes per create (worker → handler lane → journal lane → lane → worker; `wakeFromForeign` is 12–28 % of each of the three threads' cycles) and ≈ 100 µs of daemon CPU per create across the threads (the journal lane's per-tx undo capture and leaf locks, the handler's gather opt-in xattr read, the mint's held-slot census). ext4 journals in RAM and acks before any device write. |
-| dir create | 6.0 k/s | 7.3 k/s | 1.2× | As above; ext4's own mkdir is slower than its create. |
-| file stat | 0.19–0.25 M/s | 5.0 M/s | 20–27× | A stat of a dentry under 1 s old is served by the kernel (no request); the create phase outlives the 1 s entry TTL, so the older dentries cost one LOOKUP each (13 µs at QD1, ≈ 55 µs under 4 ranks: the rank, the drain worker and the handler lane share the rank's CPU — qid = CPU). §AA.6: the TTL is the staleness bound for remote namespace changes no recall names; raising it needs entry-grained invalidation. A faster create phase also shrinks the expired share. |
-| file read (open + close) | 58–78 k/s | 5.9 M/s | 75–100× | `LOOKUP` (expired dentry) + `OPEN` per file, two round trips (`RELEASE` is asynchronous, `FLUSH` elided). ext4 and tmpfs open in the dcache. |
-| file remove | 6.2 k/s | 135 k/s | 22× | `LOOKUP` + `UNLINK`; the unlink is a commit (the journal write landing) and the shared directory serializes it like the create. |
-| random 4 KiB read, QD32, one job | 158–168 k | 334 k | 2.0–2.1× | ONE drain worker carries the job (the kernel picks the queue by the submitting CPU): at 5.4 µs of worker CPU per read it is ≈ 90 % busy; the remaining worker time is the kernel's `io_uring_enter` work (35 %) and the four node-cache resolutions (≈ 35 %). The devices themselves give 207 k each at QD32. |
-| random 4 KiB write, QD32 | 99–102 k | 257 k | 2.5× | Not decomposed in this pass (W1 patches; the same single-worker shape). |
+| file create, one shared directory | 5.6–5.8 k/s | 26.7 k/s | 4.6× | The kernel serializes the 4 ranks on the directory's `i_rwsem` across BOTH round trips (`LOOKUP` 38 µs + `CREATE` 108 µs under 4 ranks ⇒ ≤ 6.8 k/s). §AA.2's bound `2R + W ≈ 46 µs` (≤ 21 k/s): two bare round trips and the journal write landing the charter owes. The rest is the thread handoffs (§3.7: three handoff pairs ≈ 52 µs of a QD1 create's 90; a QD1 `LOOKUP` 27 µs against a 5 µs handler) — on this VM a cross-thread wake of an idle vCPU costs 10–20 µs. ext4 journals in RAM and never waits on the device inside a create. |
+| dir create | 5.9–6.3 k/s | 7.3 k/s | 1.2× | As above; ext4's own mkdir is slower than its create. |
+| file stat | 0.17–0.21 M/s | 5.0 M/s | 24–30× | The stats whose dentry expired (entry TTL 1 s; the create phase outlasts it) pay one `LOOKUP` round trip each (62 µs under 4 ranks: the rank, its drain worker and its handler lane share the rank's CPU — qid = CPU — so each request is a chain of context switches there). A dentry younger than 1 s costs no request. §AA.6: the TTL stays until entry-grained invalidation exists. |
+| file read (open + close) | 62–65 k/s | 5.9 M/s | 90–95× | `LOOKUP` (expired) + `OPEN`, two round trips per file (`RELEASE` asynchronous, `FLUSH` elided); ext4 and tmpfs open in the dcache. |
+| file remove | 6.0–6.4 k/s | 135 k/s | 21× | `LOOKUP` + `UNLINK` under the shared directory's lock; the unlink is a commit (one journal write landing) and three handoff pairs like the create. |
+| random 4 KiB read, QD32, one job | 171–174 k | 334 k | 1.9–2.0× | ONE drain worker carries the job (the kernel picks the queue by the submitting CPU): 5.5 µs of worker time per read, ≈ 95 % busy — the kernel's `io_uring_enter` work for the FUSE commit and the device read (≈ 35 %) and the three node-cache resolutions (≈ 30 %). The devices give 207 k each at QD32. |
+| random 4 KiB write, QD32 | 107–109 k | 257 k | 2.4× | Not decomposed in this pass (W1 patches through the same single drain worker). |
 
-## 6. Gates
+## 6. The levers this pass did not pull (each needs a design call; measured price stated)
 
-At `7f51e85` before landing: Linux venue gate 43/46 steps — every step green except the literal
-rail (two allowlist rows shifted by the read path's and the probes' edits; rebased by
-`scripts/rails-literal-rebase`, then `zig build rails` 16/16 on both venues): unit 2,570 pass / 69
-skip, smoke 87 pass / 2 skip, bench-smoke 41, shim-smoke 40, nvmet-smoke 53, suites-smoke (pjdfstest
-141 files) PASS; macOS gate unit 2,086 pass / 27 skip, the same rail fixed.
+1. **A metadata warm ladder** — LOOKUP and GETATTR answered on the drain worker by a try-only
+   resolution (a node-cache hit, a local slot, no token, no stripe map; anything else demotes to the
+   lane exactly as the READ law's arm (a) does). It removes the worker ↔ lane handoff pair from the
+   most frequent requests: a `LOOKUP` is 27 µs at QD1 and 38–62 µs under 4 ranks against a 5 µs
+   handler, and every create, stat, open and unlink of mdtest pays one. Needs: a thread-local
+   try-only mode in `KvTree.fetch` (a miss is a demotion, never a demand load on the worker), the
+   lookup census (`OpenTable.noteLookup`) on the worker, a partition law
+   (`inline + demotes ≡ LOOKUP + GETATTR`) and its model of the try-only guard.
+2. **Entry-grained invalidation, then a longer entry TTL** (§AA.6): `FUSE_NOTIFY_INVAL_ENTRY` from
+   the holder's served namespace steps and from a reader's recall of a directory's dentry set
+   (the reader knows the names its kernel looked up); the TTL then derives from the recall's
+   bound instead of the charter's fixed 1 s. On mdtest's shape every stat, open and unlink would
+   meet a cached dentry — the stat row is the kernel's rate (5 M/s) when it does.
+3. **The drain worker as the handler lane** — the lane's fiber scheduler parked IN the FUSE ring,
+   as the journal lane and the conveyor pass already share one thread and one ring (charter §5.2's
+   "a task wake and a device CQE are one `io_uring_enter` wait"). It removes the handoff pair from
+   EVERY request, the create's included (≈ 25 µs of its 90); the cost is the transport's slot law
+   and the arm (b)/(c) dispatch law rewritten around it.
+4. **The conveyor's two hops** (enqueue → the journal lane 10 µs, the ack → the committer's lane
+   17.5 µs): a committer whose lane is idle could spin on its completion for one predicted device
+   round trip before parking (the IL doorbell's spin-then-park law), trading CPU for the wake.
+
+## 7. The venue's bracket rows
+
+`scripts/bracket/bracket.sh --scoping --substrate file --budget-mb 7168 <row> <A> <B>`,
+`BRK_FILE_SIZE=512m`, A = `e837153` (this pass), B = `b652702` (before), A → B → B → A, 60 s legs
+(+10 s warm-up), numjobs 4 × iodepth 32 for the fio row; records under
+`bench/brackets/7.2.6-sqz_aarch64_apple-vm_9c_virtio-blk/{rand-4k-read-20261013T214836Z,
+creates-mdtest-20261013T215344Z,stat-mdtest-20261013T221451Z}`. SCOPING; ONE metadata volume
+(the harness's set), so §3.3's member placement is not in these rows.
+
+| row | A legs | B legs | A ÷ B | §3.1 ReleaseSafe row (nvmet-loop, `585152f`) |
+|---|---|---|---|---|
+| rand-4k-read | 272,815 / 271,111 IOPS | 53,391 / 46,138 IOPS | 5.1–5.9× | 39,630 / 47,130 |
+| creates-mdtest | 14,755 / 12,014 creates/s | 12,425 / 11,494 creates/s | 1.0–1.3× | 7,556 / 9,722 |
+| stat-mdtest | 40,998 / 46,004 stats/s | 45,696 / 45,460 stats/s | 0.9–1.0× | 50,703 / 52,582 |
+
+The random read is the read path's resolution (§3.4) and the allocator (§3.2) — 4 jobs on 4
+queues, so 4 drain workers carry it. The create row (many directories per task, one volume) moves
+only by the CPU fixes: its rate is handoff-bound like the dev container's. The stat row is its
+`LOOKUP` round trips (§6's first lever), unchanged by this pass. Every leg the harness marked
+INVALID carries `meta_device_div_user` alone: on the FILE substrate the META device is the venue's
+shared `/dev/vdc`, whose diskstats counted the other agents' traffic beside the leg's (leg 1 of the
+read row: stats 125,952 B against diskstats 124 MB) — a substrate artifact, not a ledger break.
+
+The nvmet-loop substrate the §3.1 rows used does not mount at `dev` HEAD, for either binary: `mount:
+fabric: data volume …: refused: a data volume under an explicit identity needs a fabric_endpoint
+record (squeezefs config set-fabric-endpoints)` — the harness predates the daemon-owned connect
+(0003 §O.1) and still pre-connects the data namespaces. Owed to the harness: format the set with
+`config set-fabric-endpoints` and let the daemon connect.
+
+## 8. Gates
+
+- Landing 1 (`93fdfae`, fixes §3.1–§3.5): Linux venue gate 46 steps — every step green but the
+  literal rail (two allowlist rows shifted; rebased by `scripts/rails-literal-rebase`, `zig build
+  rails` then 16/16 on both venues): unit 2,570 pass / 69 skip, smoke 87 / 2 skip, bench-smoke 41,
+  shim-smoke 40, nvmet-smoke 53, suites-smoke PASS; macOS unit 2,086 / 27 skip, the same rail fixed.
+- Landing 2 (`e837153`, §3.6): Linux venue gate 46/46 steps, 2,811 / 2,882 (71 skipped) before the
+  rebase onto the sync-posture landing and 46/46, 2,816 / 2,888 (72 skipped) after it (unit 2,573 /
+  70 skip, rails 18, smoke 88 / 2 skip, bench-smoke 41, shim-smoke 40, nvmet-smoke 53, suites-smoke
+  PASS); macOS 28/28, 2,197 / 2,224 (27 skipped).

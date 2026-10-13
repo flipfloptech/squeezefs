@@ -1,0 +1,23 @@
+21:48:36 bracket[rand-4k-read]: venue 7.2.6-sqz_aarch64_apple-vm_9c_virtio-blk; A={"raw": "squeezefs 0.1.0 (e83715389b42, gate profile, zig 0.17.0)", "binary": "/build/brk-553384/A/bin/squeezefs", "source": "/Users/joberdorf/Source/squeezefs-zig/.wt-perf/zig-out-perf/bin/squeezefs", "sha256": "552d8f0cb20bcfd7c70bef65e3e281e03a61a5d064c6f8e98d21c4779b7e58f0", "shim_sha256": "6059815cf2c33e94f9c87991f735a77432357bd7caf97fbe94556dbfc12abf03", "train": "0.1.0", "commit": "e83715389b42", "profile": "gate", "zig": "0.17.0", "dirty": false}; B={"raw": "squeezefs 0.1.0 (b652702df09c, gate profile, zig 0.17.0)", "binary": "/build/brk-553384/B/bin/squeezefs", "source": "/Users/joberdorf/Source/squeezefs-zig/.wt-perf-old/zig-out-perf/bin/squeezefs", "sha256": "3adcb118ec5a07b97295750247ccd9b95aea5a5fc3cca363fd9c83e67023920a", "shim_sha256": "a5a22685fd745aa4d63615ba16f6f71582b21548598b3654d7708aa1c3e4d9e5", "train": "0.1.0", "commit": "b652702df09c", "profile": "gate", "zig": "0.17.0", "dirty": false}; substrate file; lever binary; posture symmetric; 60s legs (+10s warm-up); numjobs 4 iodepth 32; scratch /build/brk-553384
+21:48:36 bracket[rand-4k-read]: format set 0 (symmetric):  sqmeta:///build/brk-553384/set0-meta.img sqdata:///build/brk-553384/set0-data0.img,/build/brk-553384/set0-data1.img
+21:48:36 bracket[rand-4k-read]: leg 1 arm A: /build/brk-553384/A/bin/squeezefs (set 0, symmetric) -o ''
+21:48:36 bracket[rand-4k-read]: mounted /build/brk-553384/mnt (daemon pid 553471)
+21:48:36 bracket[rand-4k-read]: leg 1: preparing the aging store's dataset (once per set)
+21:48:38 bracket[rand-4k-read]: leg 1: warm-up 10s (excluded)
+21:48:50 bracket[rand-4k-read]: leg 1: measured span 60s
+21:49:53 bracket[rand-4k-read]: leg 1: IOPS 272815.0 INVALID ['meta_device_div_user']
+21:49:54 bracket[rand-4k-read]: leg 2 arm B: /build/brk-553384/B/bin/squeezefs (set 0, symmetric) -o ''
+21:49:55 bracket[rand-4k-read]: mounted /build/brk-553384/mnt (daemon pid 553684)
+21:49:55 bracket[rand-4k-read]: leg 2: warm-up 10s (excluded)
+21:50:07 bracket[rand-4k-read]: leg 2: measured span 60s
+21:51:10 bracket[rand-4k-read]: leg 2: IOPS 53391.0 INVALID ['meta_device_div_user']
+21:51:11 bracket[rand-4k-read]: leg 3 arm B: /build/brk-553384/B/bin/squeezefs (set 0, symmetric) -o ''
+21:51:12 bracket[rand-4k-read]: mounted /build/brk-553384/mnt (daemon pid 553871)
+21:51:12 bracket[rand-4k-read]: leg 3: warm-up 10s (excluded)
+21:51:24 bracket[rand-4k-read]: leg 3: measured span 60s
+21:52:27 bracket[rand-4k-read]: leg 3: IOPS 46138.0 INVALID ['meta_device_div_user']
+21:52:28 bracket[rand-4k-read]: leg 4 arm A: /build/brk-553384/A/bin/squeezefs (set 0, symmetric) -o ''
+21:52:28 bracket[rand-4k-read]: mounted /build/brk-553384/mnt (daemon pid 554056)
+21:52:28 bracket[rand-4k-read]: leg 4: warm-up 10s (excluded)
+21:52:41 bracket[rand-4k-read]: leg 4: measured span 60s
+21:53:43 bracket[rand-4k-read]: leg 4: IOPS 271111.3 INVALID ['meta_device_div_user']

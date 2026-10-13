@@ -72,6 +72,9 @@ pub const stats = struct {
     /// A commit refused because the slot left this volume (the cutover
     /// flipped it while the commit parked, or it was never hosted here).
     pub var slot_door_moved: counters.ShardedCounter = .{};
+    /// A commit refused `SlotBusy` at a recovered slot's coherence hold
+    /// (decision 0003 §U.2).
+    pub var slot_door_coherence_refusals: counters.ShardedCounter = .{};
 };
 
 /// Slots per transaction: a namespace op's ≤ 6 (rename's two parents, two
@@ -155,6 +158,10 @@ pub const Door = struct {
         refuse: struct { holder: AppenderId, g: u32, dead: bool },
         /// Unleased on an armed volume: the committer acquires.
         first_touch,
+        /// Unleased, a recovered slot inside its coherence hold (0003
+        /// §U.2): no first touch until it ends — SlotBusy, the EAGAIN
+        /// class the recovery's own window answers.
+        held,
         /// An offer stands for this committer: the accept.
         offered_to_me,
         /// Not hosted here.
@@ -181,7 +188,8 @@ pub const Door = struct {
             .unleased => {
                 if (!self.armed) return .admitted;
                 _ = self.table.leaveToken(slot);
-                return if (self.hostsSlot(slot)) .first_touch else .moved;
+                if (!self.hostsSlot(slot)) return .moved;
+                return if (self.table.coherenceHeldUntil(slot, now_ns) != null) .held else .first_touch;
             },
             .leased, .offered => {
                 if (v.holder == me) return .admitted;
@@ -242,6 +250,11 @@ pub const Door = struct {
                     stats.slot_door_refusals.inc();
                     if (parked != null) stats.slot_door_park_refused.inc();
                     if (self.foreign_touch) |ft| ft.note(ft.ctx, slot, r.holder, me);
+                    return error.SlotBusy;
+                },
+                .held => {
+                    n.cancel(self.io);
+                    stats.slot_door_coherence_refusals.inc();
                     return error.SlotBusy;
                 },
                 .moved => {

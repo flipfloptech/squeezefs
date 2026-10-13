@@ -50,6 +50,8 @@ const cr = @import("../control_records.zig");
 const grant = @import("../extent_grant.zig");
 const lt = @import("../slots/lease_table.zig");
 const slots_plane = @import("../slots/plane.zig");
+const slots_acquire = @import("../slots/acquire.zig");
+const slots_door = @import("../slots/door.zig");
 const tails_spill = @import("../slots/tails_spill.zig");
 const xv_set_bind = @import("../xv/set_bind.zig");
 const smo = @import("../../smo.zig");
@@ -129,8 +131,9 @@ pub const VolumeBinding = struct {
     };
 
     /// `census` = the home shard's owner (step 0's "listed LIVE again");
-    /// `skew_max_ms` the shard's clock skew bound (the quarantine's term).
-    pub fn create(gpa: Allocator, be: *KvBackend, ledger: *death_ledger.Ledger, census: ?*const shard.Owner, skew_max_ms: u64) Allocator.Error!*VolumeBinding {
+    /// `skew_max_ms` the shard's clock skew bound (the quarantine's term),
+    /// `renew_ms` its renew interval (the coherence hold's).
+    pub fn create(gpa: Allocator, be: *KvBackend, ledger: *death_ledger.Ledger, census: ?*const shard.Owner, skew_max_ms: u64, renew_ms: u64) Allocator.Error!*VolumeBinding {
         const aset = be.sym orelse unreachable;
         const self = try gpa.create(VolumeBinding);
         errdefer gpa.destroy(self);
@@ -152,6 +155,7 @@ pub const VolumeBinding = struct {
                 .ledger = ledger,
                 .census = census,
                 .skew_max_ms = skew_max_ms,
+                .coherence_hold_ms = recovery.coherenceHoldMs(renew_ms, skew_max_ms),
             },
         };
         self.poll = .{ .driver = &self.driver, .named_ctx = self, .namedAsHolder = &namedAsHolderFn };
@@ -1014,6 +1018,13 @@ pub const VolumeBinding = struct {
         if (!gop.found_existing or gop.value_ptr.* < until_realtime_ns) gop.value_ptr.* = until_realtime_ns;
     }
 
+    /// The realtime deadline on this volume's monotonic clock.
+    fn holdCoherenceFn(ctx: *anyopaque, slot: u16, until_realtime_ns: u64) Error!void {
+        const left = until_realtime_ns -| @as(u64, @intCast(clock.realtimeCoarseNs()));
+        if (left == 0) return;
+        try self_(ctx).be.slots.table.holdCoherence(slot, clock.monotonicNs() + left);
+    }
+
     fn notifyHandoverDoneFn(ctx: *anyopaque) void {
         self_(ctx).be.slots.door.wakeParkers();
     }
@@ -1065,6 +1076,7 @@ pub const VolumeBinding = struct {
         .ring0Head = &ring0HeadFn,
         .writerTerm = &writerTermFn,
         .quarantineCustody = &quarantineCustodyFn,
+        .holdCoherence = &holdCoherenceFn,
         .notifyHandoverDone = &notifyHandoverDoneFn,
     };
 };
@@ -1926,4 +1938,61 @@ test "linux: THE RECOVERY'S CENSUS AGAINST THE MANAGER'S OWN SMO — a dead wire
     try testing.expect(!be.alloc.isAllocated(x));
     try expectBudgetConserved(be);
     try expectAllPresent(live.set, keys.items);
+}
+
+// ---- the coherence hold (rung 10 recovery item 2) ----
+
+test "linux: THE COHERENCE HOLD — a write into a recovered slot right after the recovery is refused (SlotBusy, the EAGAIN class) until every live member's census pull has retired the dead holder (the death record's ts + VALIDITY_RENEWALS × renew + 2 × skew_max): before it a joiner may still serve the dead holder's cached token, and the write would contradict it; a death recorded that long ago admits the write at once (red: the successor served the write the instant the slot was Unleased)" {
+    const gpa = testing.allocator;
+    const s = try meta_set.TestSet.create(gpa, "recover-hold", 1);
+    defer s.destroy();
+    try s.env.put("SQUEEZEFS_MW_BIND", "127.0.0.1:0");
+    var kill_buf: [160]u8 = undefined;
+    const kill = try std.fmt.bufPrint(&kill_buf, "{s}.kill", .{s.paths[0]});
+    defer unlinkPath(kill);
+    var dst_buf: [160]u8 = undefined;
+    const dst = try std.fmt.bufPrint(&dst_buf, "{s}.cut", .{s.paths[0]});
+    defer unlinkPath(dst);
+    var keys: std.ArrayList([]const u8) = .empty;
+    defer freeKeys(&keys);
+    const dead = try killWithDeadRegion(s, kill, &keys, 6);
+    for ([_]bool{ true, false }) |fresh| {
+        try snapshotImage(kill, dst);
+        var live = try Live.open(s, dst);
+        defer live.close();
+        const be = live.set.volumes[0];
+        const clocks = live.plane.mgr.?.owner.clocks;
+        const hold_ms = recovery.coherenceHoldMs(clocks.renew_ms, clocks.skew_max_ms);
+        const now_rt: u64 = @intCast(clock.realtimeCoarseNs());
+        // The eviction's instant: now (the window open), or one hold and
+        // a second ago (every member's pull has retired the holder).
+        const ts = if (fresh) now_rt else now_rt - (hold_ms + 1000) * std.time.ns_per_ms;
+        live.plane.deathLedger().?.recordDeath(dead.identity, .{ .epoch = 1, .ts_realtime_ns = ts, .pr_key = 0, .early = false });
+        const recoveries0 = recovery.stats.appender_recoveries.load();
+        live.plane.tick();
+        try testing.expectEqual(recoveries0 + 1, recovery.stats.appender_recoveries.load());
+        try testing.expectEqual(lt.State.unleased, be.slots.table.view(DEAD_SLOT).state);
+        try expectDeadWindowRecovered(live.set, keys.items);
+        const k = try slotKey(be, DEAD_SLOT, 5000);
+        defer gpa.free(k);
+        const t = try be.begin(@src());
+        try t.stagePut(key.TREE_INODES, k, &iv_value);
+        if (fresh) {
+            const refusals0 = slots_door.stats.slot_door_coherence_refusals.load();
+            try testing.expectError(error.SlotBusy, be.commit(t));
+            try testing.expectEqual(refusals0 + 1, slots_door.stats.slot_door_coherence_refusals.load());
+            // A joiner's first touch over the wire meets the same hold.
+            const wire0 = slots_acquire.stats.slot_acquire_coherence_refusals.load();
+            const out = try be.slots.verbs.acquireSlot(gpa, 5, DEAD_SLOT, .park);
+            try testing.expect(out == .refused and out.refused.holder == lt.MANAGER);
+            try testing.expectEqual(wire0 + 1, slots_acquire.stats.slot_acquire_coherence_refusals.load());
+            try testing.expectEqual(lt.State.unleased, be.slots.table.view(DEAD_SLOT).state);
+        } else {
+            try be.commit(t);
+            try testing.expect(be.slots.table.view(DEAD_SLOT).leasedBy(0));
+            const got = try live.set.lookup(gpa, key.TREE_INODES, k);
+            defer if (got) |g| gpa.free(g);
+            try testing.expect(got != null);
+        }
+    }
 }

@@ -62,6 +62,7 @@ const lt = @import("../slots/lease_table.zig");
 const inos = @import("../../inos.zig");
 const custody = @import("../../../data/sym_planes/custody.zig");
 const records = @import("../../../data/sym_planes/records.zig");
+const census_view = @import("census_view.zig");
 const death_ledger = @import("death_ledger.zig");
 const fencing = @import("fencing.zig");
 const shard = @import("shard.zig");
@@ -129,6 +130,19 @@ pub const LEAF_LOAD_US: u64 = 120;
 pub const LEAF_PASSES: u64 = 3;
 /// A per-key LWW insert.
 pub const FOLD_US_PER_ENTRY: u64 = 1;
+
+/// The successor's coherence hold past a death record's ts (decision 0003
+/// §U.2): a joiner drops the tokens a dead holder granted it only at the
+/// census commit that retires the holder, and every member pulls the
+/// owner's census once per renew interval with a view answering for
+/// `VALIDITY_RENEWALS` of them — so by `ts + VALIDITY_RENEWALS × renew`
+/// every member whose view stands has committed one that names the death
+/// (a pull starts ≤ renew + one beat after the last and walks in RTTs:
+/// two intervals cover one late pull); `2 × skew_max` absorbs the
+/// recorder's wall clock against ours (the custody quarantine's term).
+pub fn coherenceHoldMs(renew_ms: u64, skew_max_ms: u64) u64 {
+    return census_view.VALIDITY_RENEWALS * renew_ms + 2 * skew_max_ms;
+}
 
 pub fn recoveryBoundMs(ring_bytes: u64, node_size: u64) u64 {
     const entries = ring_bytes / ENTRY_BYTES;
@@ -273,6 +287,10 @@ pub const Volume = struct {
         writerTerm: *const fn (ctx: *anyopaque) u64,
         /// The RAM custody quarantine (keyed by slot on this volume).
         quarantineCustody: *const fn (ctx: *anyopaque, slot: u16, until_realtime_ns: u64) void,
+        /// The coherence hold (0003 §U.2): no first touch of the recovered
+        /// slot before `until_realtime_ns` (the realtime deadline the
+        /// record's clock set; the volume holds it on its own clock).
+        holdCoherence: *const fn (ctx: *anyopaque, slot: u16, until_realtime_ns: u64) Error!void,
         /// The parked doors woken (`handover_done`).
         notifyHandoverDone: *const fn (ctx: *anyopaque) void,
         /// A slot's tails past the inline cap SPILLED into claimed extents
@@ -296,6 +314,9 @@ pub const Mount = struct {
     /// The home shard's owner (step 0's "listed LIVE again").
     census: ?*const shard.Owner = null,
     skew_max_ms: u64,
+    /// `coherenceHoldMs` of the shard's clocks: the recovered slots take
+    /// no write before the record's ts + this.
+    coherence_hold_ms: u64,
 };
 
 /// The crash-window seam: the driver fails right AFTER the named step's
@@ -567,6 +588,7 @@ pub const Driver = struct {
         try self.vol.vt.keptExtents(self.vol.ctx, gpa, grant.items, &kept);
         std.mem.sort(u64, kept.items, {}, std.sort.asc(u64));
         const quarantine_until: ?u64 = if (standing.early) custody.custodyQuarantineUntilNs(standing.ts_realtime_ns, self.mount.skew_max_ms * std.time.ns_per_ms) else null;
+        const coherence_until = standing.ts_realtime_ns +| self.mount.coherence_hold_ms * std.time.ns_per_ms;
         var tails_buf: [TAILS_INLINE_MAX * cr.TailEntryWire.LEN + cr.SlotTailsHead.LEN]u8 = undefined;
         for (plans.items, 0..) |*pl, i| {
             const flushed = try self.vol.vt.flushedRoot(self.vol.ctx, pl.slot);
@@ -624,6 +646,7 @@ pub const Driver = struct {
                 },
             }
             self.vol.vt.raiseSeqFloor(self.vol.ctx, pl.seq_floor);
+            try self.vol.vt.holdCoherence(self.vol.ctx, pl.slot, coherence_until);
             if (quarantine_until) |u| {
                 self.vol.vt.quarantineCustody(self.vol.ctx, pl.slot, u);
                 stats.slot_custody_quarantines_installed.inc();
@@ -981,6 +1004,17 @@ test "the recovery bound derives from the ring: ≈ 1,105 ms at the 512 KiB floo
     try testing.expectEqual(@as(u64, 1312), stats.appender_recovery_bound_ms.load());
 }
 
+test "the coherence hold derives from the census law: VALIDITY_RENEWALS × renew + 2 × skew_max past the record — 20,044 ms at the shipped T_owner of 45 s (renew 10 s, skew 22 ms), 534 ms at the smoke's 3 s (renew 266 ms, skew 1 ms)" {
+    for ([_]u64{ 45_000, 3_000 }) |t_owner| {
+        const c = try shard.LeaseClocks.derive(t_owner, 0, shard.CHECKPOINT_LANDING_CEILING_MS);
+        try testing.expectEqual(census_view.VALIDITY_RENEWALS * c.renew_ms + 2 * c.skew_max_ms, coherenceHoldMs(c.renew_ms, c.skew_max_ms));
+    }
+    const shipped = try shard.LeaseClocks.derive(45_000, 0, shard.CHECKPOINT_LANDING_CEILING_MS);
+    try testing.expectEqual(@as(u64, 20_044), coherenceHoldMs(shipped.renew_ms, shipped.skew_max_ms));
+    const smoke = try shard.LeaseClocks.derive(3_000, 0, shard.CHECKPOINT_LANDING_CEILING_MS);
+    try testing.expectEqual(@as(u64, 534), coherenceHoldMs(smoke.renew_ms, smoke.skew_max_ms));
+}
+
 test "grant − reached is normalized runs" {
     var out: std.ArrayList(GrantRun) = .empty;
     defer out.deinit(testing.allocator);
@@ -1018,6 +1052,8 @@ const RamVolume = struct {
     seq_floor_raised: u64 = 0,
     writer_term: u64 = 7,
     quarantined: std.ArrayList(u16) = .empty,
+    /// The coherence holds installed: slot → realtime deadline.
+    coherence: std.AutoHashMapUnmanaged(u16, u64) = .empty,
     handover_notifies: u32 = 0,
     /// Seam: the pointer's seq lies (the install must refuse).
     stale_pointer: bool = false,
@@ -1076,6 +1112,7 @@ const RamVolume = struct {
         self.held.deinit(self.gpa);
         if (self.hold) |h| self.gpa.free(h);
         self.quarantined.deinit(self.gpa);
+        self.coherence.deinit(self.gpa);
         self.data_deltas.deinit(self.gpa);
         self.table.deinit();
         self.gpa.destroy(self);
@@ -1369,8 +1406,12 @@ const RamVolume = struct {
     fn notifyFn(ctx: *anyopaque) void {
         self_(ctx).handover_notifies += 1;
     }
+    fn holdCoherenceFn(ctx: *anyopaque, slot: u16, until: u64) Error!void {
+        const self = self_(ctx);
+        self.coherence.put(self.gpa, slot, until) catch return error.OutOfMemory;
+    }
 
-    const vtable: Volume.VTable = .{ .vol = &volFn, .readPage = &readPageFn, .writePage = &writePageFn, .readRing = &readRingFn, .slotState = &slotStateFn, .leasedTo = &leasedToFn, .grantRecord = &grantRecordFn, .controlEntry = &controlEntryFn, .noteUnleased = &noteUnleasedFn, .table = &tableFn, .treeState = &treeStateFn, .installRoot = &installRootFn, .restoreTree = &restoreTreeFn, .replay = &replayFn, .replayDataDeltas = &replayDataFn, .cycleUntilClean = &cycleFn, .flushedRoot = &flushedRootFn, .leafTails = &leafTailsFn, .holdRetirements = &holdFn, .endRetirementHold = &endHoldFn, .keptExtents = &keptFn, .returnExtents = &returnExtentsFn, .freeRing = &freeRingFn, .orphanImages = &orphanImagesFn, .raiseSeqFloor = &raiseFloorFn, .ring0Head = &ring0HeadFn, .writerTerm = &writerTermFn, .quarantineCustody = &quarantineFn, .notifyHandoverDone = &notifyFn };
+    const vtable: Volume.VTable = .{ .vol = &volFn, .readPage = &readPageFn, .writePage = &writePageFn, .readRing = &readRingFn, .slotState = &slotStateFn, .leasedTo = &leasedToFn, .grantRecord = &grantRecordFn, .controlEntry = &controlEntryFn, .noteUnleased = &noteUnleasedFn, .table = &tableFn, .treeState = &treeStateFn, .installRoot = &installRootFn, .restoreTree = &restoreTreeFn, .replay = &replayFn, .replayDataDeltas = &replayDataFn, .cycleUntilClean = &cycleFn, .flushedRoot = &flushedRootFn, .leafTails = &leafTailsFn, .holdRetirements = &holdFn, .endRetirementHold = &endHoldFn, .keptExtents = &keptFn, .returnExtents = &returnExtentsFn, .freeRing = &freeRingFn, .orphanImages = &orphanImagesFn, .raiseSeqFloor = &raiseFloorFn, .ring0Head = &ring0HeadFn, .writerTerm = &writerTermFn, .quarantineCustody = &quarantineFn, .holdCoherence = &holdCoherenceFn, .notifyHandoverDone = &notifyFn };
 
     fn volume(self: *RamVolume) Volume {
         return .{ .ctx = self, .vt = &vtable };
@@ -1404,7 +1445,7 @@ const Fixture = struct {
         // their g off the table's `Releasing{dead}` mark — the structural
         // class — with nothing learned.
         try f.stamps.prime(f.rv.table, &.{}, &.{});
-        f.driver = .{ .gpa = gpa, .vol = f.rv.volume(), .mount = .{ .identity = ME, .meta_pr = null, .screen = &f.screen, .stamps = &f.stamps, .ledger = &f.ledger, .skew_max_ms = 22 } };
+        f.driver = .{ .gpa = gpa, .vol = f.rv.volume(), .mount = .{ .identity = ME, .meta_pr = null, .screen = &f.screen, .stamps = &f.stamps, .ledger = &f.ledger, .skew_max_ms = 22, .coherence_hold_ms = coherenceHoldMs(300, 22) } };
         return f;
     }
 
@@ -1451,6 +1492,8 @@ const Fixture = struct {
         try testing.expect(try self.ledger.isRecovered(DEAD, 1));
         try testing.expect(!self.screen.isRecovering(2));
         try testing.expect(self.rv.seq_floor_raised >= 4990);
+        // The coherence hold: no write before the record's ts + the hold.
+        for ([_]u16{ 10, 11 }) |s| try testing.expectEqual(1_000 * std.time.ns_per_ms + coherenceHoldMs(300, 22) * std.time.ns_per_ms, self.rv.coherence.get(s).?);
         // The grant record minus the trees' images (100..102) = 103..109; the
         // unclaimed page runs minus the window's alloc (104) returned (103,
         // 105..107), then the record's remainder beyond the page by content:

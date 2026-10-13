@@ -608,7 +608,7 @@ pub const WirePlane = struct {
         errdefer for (bindings[0..n_bound]) |b| b.destroy();
         for (set.volumes) |be| {
             if (be.sym == null) continue;
-            bindings[n_bound] = try volume_bind.VolumeBinding.create(gpa, be, &m.ledger, &m.owner, clocks.skew_max_ms);
+            bindings[n_bound] = try volume_bind.VolumeBinding.create(gpa, be, &m.ledger, &m.owner, clocks.skew_max_ms, clocks.renew_ms);
             hooks[n_bound] = bindings[n_bound].hook();
             n_bound += 1;
         }

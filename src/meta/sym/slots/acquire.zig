@@ -59,6 +59,10 @@ pub const stats = struct {
     /// slot reserved for its accepter (the requester's own served ships
     /// at the releasing holder used to take the slot back).
     pub var slot_acquire_reserved_refusals: counters.ShardedCounter = .{};
+    /// Of those: a first touch of a recovered slot inside its coherence
+    /// hold (decision 0003 §U.2: a live member may still serve the dead
+    /// holder's cached token until its census pull retires the holder).
+    pub var slot_acquire_coherence_refusals: counters.ShardedCounter = .{};
     /// A rotor ask past `2 × M` (legal).
     pub var slot_rotor_cap_refusals: counters.ShardedCounter = .{};
     /// Releases that landed (`ReleaseSlot` and the in-process accept's).
@@ -522,6 +526,14 @@ pub const Verbs = struct {
                     stats.slot_acquire_reserved_refusals.inc();
                     return .{ .refused = .{ .slot = s, .holder = to, .g = v.g } };
                 };
+                // A recovered slot inside its coherence hold: no write
+                // until every member's census retired the dead holder;
+                // the refusal names the manager (its maintainer).
+                if (self.table.coherenceHeldUntil(s, clock.monotonicNs()) != null) {
+                    stats.slot_acquire_refusals.inc();
+                    stats.slot_acquire_coherence_refusals.inc();
+                    return .{ .refused = .{ .slot = s, .holder = lt.MANAGER, .g = v.g } };
+                }
                 try picked.append(gpa, s);
             } else if (v.holder == req.appender_id and v.state != .migrating) {
                 already += 1;

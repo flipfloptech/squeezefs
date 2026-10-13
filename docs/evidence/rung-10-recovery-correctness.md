@@ -91,3 +91,59 @@ hold is read and written under the SMO lock alone), so no model was added.
   cycles journal on ring 0 still carry `free` records of held extents; a manager crash before 7b
   replays them as parked frees while tree 0 still leases the slots to the dead appender. The hold is
   RAM; the durable side is the stash 5d owes.
+
+## 2. Stale reads after a recovery (item 2)
+
+### 2.1 The window
+
+`rung-10-striping-wire.md` §3.6: a joiner C drops the tokens a dead holder B granted it only at its
+census commit that retires B (fix 11 of that note); the commit comes with C's next census pull, once
+per renew interval (10 s at the shipped `T_owner` of 45 s: `renew = clamp(T_self / 3, 1 ms,
+10 s)`). B's grant table died with B, so nobody recalls those tokens. The manager A recovers B's
+slots ≈ 2.4 s after the eviction (the poll's 1.1 s tick + the 1.3 s bound) and the slots are
+`Unleased` — A's first write to an object C still caches from B is served at once, and C keeps
+answering the pre-recovery value from its cache until its pull.
+
+### 2.2 The law chosen (0003 §U.2)
+
+The successor holds every recovered slot's WRITES until the death record's ts +
+`VALIDITY_RENEWALS × renew + 2 × skew_max` (`recovery.coherenceHoldMs`): every member pulls the
+owner's census once per renew interval and a view answers for two of them, so by then every member
+whose view stands has committed one that names the death and dropped B's tokens; `2 × skew_max`
+absorbs the recorder's wall clock (the custody quarantine's term). The hold is installed at the
+table release (7b) on the volume's monotonic clock (`LeaseTable.holdCoherence`); the door answers a
+commit's first touch `.held` → `SlotBusy` (EAGAIN, the class the recovery's own window answers),
+`AcquireSlot` refuses a joiner's first touch naming the manager, and the rotor pick skips the slot.
+Reads are never held. The derivation that rejects the alternative — pushing the eviction on the
+renewal carriage — is in 0003 §U.2: the carriage reaches a member at its next renewal, after the
+recovery has landed at the shipped clocks.
+
+Tie: `recovery` "the coherence hold derives from the census law" (20,044 ms at `T_owner` 45 s:
+renew 10,000 ms, skew 22 ms; 534 ms at the smoke's 3 s: renew 266 ms, skew 1 ms), restating the
+formula over `shard.LeaseClocks.derive`. The RAM end-to-end row asserts the hold installed on both
+recovered slots at the record's ts + the hold.
+
+### 2.3 The red row
+
+`volume_bind` "linux: THE COHERENCE HOLD" — the dead in-process region's copy recovered by the
+manager's poll with the death recorded NOW: a commit into the recovered slot right after the
+recovery answers `SlotBusy` (`slot_door_coherence_refusals` + 1, the slot still `Unleased`), and a
+joiner's first touch over `AcquireSlot` is refused naming the manager
+(`slot_acquire_coherence_refusals` + 1); the same copy with the death recorded one hold and a
+second ago admits the commit at once (the slot leased by the manager, the record readable). Red on
+the item-1 tree: `expected error.SlotBusy, found void` — the write landed the instant the slot was
+`Unleased`. A first draft refused only at `AcquireSlot`: the manager's own door re-read the slot
+`Unleased`, re-tried the first touch, and SPUN until the hold ended (the debug trace showed the
+refusal repeating for 20 s) — hence the door's own `.held` verdict.
+
+### 2.4 Not covered (stated)
+
+- **A member whose census pulls keep failing** keeps the dead holder's cached tokens past the hold
+  (its view goes `unknown` after two intervals, but nothing drops the tokens). Its renewals ride
+  the same link, so it parks at `T_self` — and a parked member still serves reads (§2.6 of the
+  recovery spec). Closing it is a reader-side law: a cached token of a non-manager holder is served
+  only while the member's census view is valid. Owed.
+- **The early end:** the owner sees every member's renewals; ending the hold once every live member
+  renewed after the eviction with the departure aboard would cut the shipped ≈ 17.6 s to ≈ one
+  renew interval. Owed as an availability refinement (it needs the departure on the carriage and
+  the recovering manager to be the census owner, which a multi-volume set does not guarantee).

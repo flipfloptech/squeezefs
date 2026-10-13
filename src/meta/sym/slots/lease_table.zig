@@ -149,6 +149,9 @@ pub const Cold = struct {
     words: SlotWords = .{},
     /// A handover landed here at this monotonic time (the cooldown's base).
     handover_at_ns: u64 = 0,
+    /// A recovered slot's coherence hold (decision 0003 §U.2): no first
+    /// touch before this monotonic instant (0 = none).
+    coherence_until_ns: u64 = 0,
 };
 
 /// One leaf's recorded log tail for generation `g` (tree 0's `slot_tails`
@@ -469,6 +472,25 @@ pub const LeaseTable = struct {
         return if (c.offered_to != 0) c.offered_to else null;
     }
 
+    /// A recovered slot is held from writes until `until_ns` (monotonic):
+    /// a member may still serve the dead holder's cached token until its
+    /// census pull retires the holder. A longer hold extends, a shorter
+    /// never shortens.
+    pub fn holdCoherence(self: *LeaseTable, slot: u16, until_ns: u64) Allocator.Error!void {
+        self.lock.lock();
+        defer self.lock.unlock();
+        const c = try self.coldOf(slot);
+        c.coherence_until_ns = @max(c.coherence_until_ns, until_ns);
+    }
+
+    /// The instant `slot`'s coherence hold ends, while it stands.
+    pub fn coherenceHeldUntil(self: *LeaseTable, slot: u16, now_ns: u64) ?u64 {
+        self.lock.lock();
+        defer self.lock.unlock();
+        const c = self.cold.get(slot) orelse return null;
+        return if (now_ns < c.coherence_until_ns) c.coherence_until_ns else null;
+    }
+
     /// A kept stand ends (under the lock, as every write of the count
     /// is): its words cleared, the gate's count released — saturating,
     /// so a stand some other path left on an unleased slot never wraps
@@ -766,6 +788,7 @@ pub const LeaseTable = struct {
             if (self.view(s).state != .unleased) continue;
             const lw = if (self.cold.get(s)) |c| blk: {
                 if (c.offered_to != 0 and now_ns < c.offer_expires_ns) continue;
+                if (now_ns < c.coherence_until_ns) continue;
                 break :blk c.last_written;
             } else 0;
             // Insertion into the bounded best-`out.len` list (want ≤ 128).

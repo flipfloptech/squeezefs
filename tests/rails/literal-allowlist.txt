@@ -457,10 +457,10 @@ src/meta/sym/extent_grant.zig:491 | 3 | OWED: derive it or document it on the li
 src/meta/sym/extent_grant.zig:514 | 3 | OWED: derive it or document it on the line (charter §1.5)
 src/meta/sym/manager.zig:138 | 100 | a percentage — OWED: derive it (charter §1.5) or document the measured reason
 src/meta/sym/manager.zig:138 | 100 | a percentage — OWED: derive it (charter §1.5) or document the measured reason
-src/meta/sym/membership/recovery.zig:135 | 10 | a size — OWED: derive from derive.Facts or document the physical/format reason
-src/meta/sym/membership/recovery.zig:135 | 256 | a size — OWED: derive from derive.Facts or document the physical/format reason
-src/meta/sym/membership/recovery.zig:137 | 1000 | a timing/retry constant — OWED: its measured WHY on the line or a derivation (charter §1.5)
-src/meta/sym/membership/recovery.zig:138 | 1000 | a timing/retry constant — OWED: its measured WHY on the line or a derivation (charter §1.5)
+src/meta/sym/membership/recovery.zig:149 | 10 | a size — OWED: derive from derive.Facts or document the physical/format reason
+src/meta/sym/membership/recovery.zig:149 | 256 | a size — OWED: derive from derive.Facts or document the physical/format reason
+src/meta/sym/membership/recovery.zig:151 | 1000 | a timing/retry constant — OWED: its measured WHY on the line or a derivation (charter §1.5)
+src/meta/sym/membership/recovery.zig:152 | 1000 | a timing/retry constant — OWED: its measured WHY on the line or a derivation (charter §1.5)
 src/meta/sym/membership/shard.zig:799 | 1000 | a timing/retry constant — OWED: its measured WHY on the line or a derivation (charter §1.5)
 src/meta/sym/region.zig:325 | 64 | OWED: derive it or document it on the line (charter §1.5)
 src/meta/sym/region.zig:429 | 3 | OWED: derive it or document it on the line (charter §1.5)
@@ -473,8 +473,8 @@ src/meta/sym/slots/lease_table.zig:98 | 0xFFFF_FFFF | an encoding constant (magi
 src/meta/sym/slots/lease_table.zig:99 | 32 | OWED: derive it or document it on the line (charter §1.5)
 src/meta/sym/slots/lease_table.zig:100 | 40 | a size — OWED: derive from derive.Facts or document the physical/format reason
 src/meta/sym/slots/lease_table.zig:101 | 41 | a size — OWED: derive from derive.Facts or document the physical/format reason
-src/meta/sym/slots/lease_table.zig:604 | 48 | a size — OWED: derive from derive.Facts or document the physical/format reason
-src/meta/sym/slots/lease_table.zig:683 | 32 | a size — OWED: derive from derive.Facts or document the physical/format reason
+src/meta/sym/slots/lease_table.zig:626 | 48 | a size — OWED: derive from derive.Facts or document the physical/format reason
+src/meta/sym/slots/lease_table.zig:705 | 32 | a size — OWED: derive from derive.Facts or document the physical/format reason
 src/meta/sym/tokens/token_table.zig:149 | 8 | OWED: derive it or document it on the line (charter §1.5)
 src/meta/sym/tokens/token_table.zig:150 | 16 | OWED: derive it or document it on the line (charter §1.5)
 src/meta/sym/tokens/token_table.zig:150 | 8 | OWED: derive it or document it on the line (charter §1.5)

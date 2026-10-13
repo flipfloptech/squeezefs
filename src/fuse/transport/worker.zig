@@ -555,6 +555,10 @@ pub const Shared = struct {
     /// Test seam (in-process; the late-completion pin): the next N backstop
     /// ticks hold their worker in an unbounded park before the reap.
     tick_await_cqe_remaining: std.atomic.Value(u32) = .init(0),
+    /// Test seam (in-process; the late-publication pin): the pass after the
+    /// next N backstop ticks holds before its pump until a reply is
+    /// published — after the post-tick reap, before the pump.
+    tick_await_publish_remaining: std.atomic.Value(u32) = .init(0),
     /// Error logs each worker thread expects in a test (`log.testing`).
     test_error_logs: usize = 0,
 
@@ -1920,6 +1924,7 @@ pub const Group = struct {
             // 1. Rescue capture.
             const after_tick = self.tick_rescue_pending;
             self.tick_rescue_pending = false;
+            if (after_tick) self.tickPublishSeam();
             const tick_wake_seen = self.wake_cqe_seen;
             self.wake_cqe_seen = false;
             // 2–3. The READ CQE already drained the counter; disarm, then scan.
@@ -2009,6 +2014,23 @@ pub const Group = struct {
         while (left > 0) {
             left = self.shared.tick_await_cqe_remaining.cmpxchgWeak(left, left - 1, .acq_rel, .monotonic) orelse {
                 _ = self.park(null);
+                return;
+            };
+        }
+    }
+
+    /// The late-publication seam (`Shared.tick_await_publish_remaining`):
+    /// while it has ticks left, the pass after a tick holds before its pump
+    /// until a producer arms the coalescer — its push came first, so the
+    /// reply is published — the window between the post-tick reap and the
+    /// pump. Test-only: the product never arms it.
+    fn tickPublishSeam(self: *Group) void {
+        // The acq_rel spend pairs with the test's release arm and its
+        // acquire read of 0 (its cue that this worker holds).
+        var left = self.shared.tick_await_publish_remaining.load(.monotonic);
+        while (left > 0) {
+            left = self.shared.tick_await_publish_remaining.cmpxchgWeak(left, left - 1, .acq_rel, .monotonic) orelse {
+                while (!self.ring.coalescer.armed.load(.seq_cst)) std.Thread.yield() catch {};
                 return;
             };
         }

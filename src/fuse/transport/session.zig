@@ -2249,6 +2249,39 @@ test "e2e: a completion that lands after a backstop tick's timeout and before th
     try testing.expectEqual(before.commit_rescues, after.commit_rescues);
 }
 
+test "e2e: a reply published after a backstop tick's reap and before the next pass's pump (the seam holds the worker between the two) is a LATE commit — its producer armed and wrote the wake, whose READ is still deferred — never a lost wake: the must-stay-0 commit ledger does not count it" {
+    if (venueMissing()) |why| return testkit.skipWhy(@src(), why);
+    const rig = try Rig.init(testing.allocator, 10, &.{});
+    defer rig.deinit();
+    const s = try rig.mountIt(.{ .mem_budget_bytes = 0 });
+    var pb: [256]u8 = undefined;
+    const Helper = struct {
+        fn run(path: [*:0]const u8, result: *anyerror!usize) void {
+            var buf: [64]u8 = undefined;
+            result.* = readWhole(path, &buf);
+        }
+    };
+    var result: anyerror!usize = 0;
+    const t = try std.Thread.spawn(.{}, Helper.run, .{ rig.child(&pb, "park").ptr, &result });
+    // The handler parks on its lane: its group owes a reply, so its worker
+    // parks bounded by the backstop and ticks.
+    const deadline = clock.monotonicNs() + 5 * std.time.ns_per_s;
+    while (rig.fs.parked_readers.load(.monotonic) == 0 and clock.monotonicNs() < deadline) std.Thread.yield() catch {};
+    try testing.expectEqual(@as(u32, 1), rig.fs.parked_readers.load(.monotonic));
+    const before = Snapshot.take();
+    // The pass after the next tick spends the seam and holds before its pump.
+    s.shared.tick_await_publish_remaining.store(1, .release);
+    while (s.shared.tick_await_publish_remaining.load(.acquire) != 0 and clock.monotonicNs() < deadline + 5 * std.time.ns_per_s) std.Thread.yield() catch {};
+    try testing.expectEqual(@as(u32, 0), s.shared.tick_await_publish_remaining.load(.acquire));
+    // The reply is published now: after the tick's reap, before the pump.
+    rig.fs.releaseParked();
+    t.join();
+    _ = try result;
+    const after = Snapshot.take();
+    try testing.expect(after.ticks > before.ticks);
+    try testing.expectEqual(before.commit_rescues, after.commit_rescues);
+}
+
 test "e2e: the REGISTER refusal seam — the first 5 pushes are refused, back off 1 ms doubling, every ent is eventually registered, nothing retires, the mount arms and serves" {
     if (venueMissing()) |why| return testkit.skipWhy(@src(), why);
     const rig = try Rig.init(testing.allocator, 6, &.{.{ "SQUEEZEFS_TEST_FUSE_REGISTER_REFUSE", "5" }});

@@ -771,6 +771,22 @@ pub fn settleEntry(tree0: ?cr.SlotState, entry: page.SlotEntry, page_owner: Appe
     }
 }
 
+/// The JOINED arm's projection law (0003 §T.2): a tree-0 projection row
+/// naming the joiner's OWN appender id is a previous incarnation's lease —
+/// the joined open refuses a `Live` page under its identity
+/// (`PredecessorLive`) and the hint hands a rejoin the same id, so this
+/// incarnation holds exactly what the manager grants it over the wire. The
+/// row loads `unleased` (its words the cold floor): a first touch asks the
+/// manager, the live truth. Every other row is the projection verbatim.
+pub fn joinedProjectionRow(row: cr.SlotState, me: AppenderId) cr.SlotState {
+    if (row.variant == .unleased or row.appender_id != me) return row;
+    var s = row;
+    s.variant = .unleased;
+    s.appender_id = MANAGER;
+    s.page_addr = 0;
+    return s;
+}
+
 /// C14's other face: ONE slot `Live` on TWO pages refuses the mount. The
 /// pages' entries are passed as `(owner, entries)` rows; the first slot
 /// seen twice is answered.
@@ -872,6 +888,37 @@ test "the Dekker words: a token enters and leaves exactly once; the closer's sto
     t.reopenCutover(3);
     try testing.expect(t.view(3).leasedBy(1));
     try testing.expectEqual(@as(?u16, null), t.closedSlot());
+}
+
+test "the joined projection law (0003 §T.2): a row naming the joiner's own id — leased or releasing — loads unleased with its words as the cold floor; another lessee's row and an unleased row are verbatim; loaded, the joiner holds nothing it was not granted" {
+    const gpa = testing.allocator;
+    const me: AppenderId = 1;
+    const root: cr.Root = .{ .addr = 0x40000, .seq = 9 };
+    const mine: cr.SlotState = .{ .variant = .leased, .appender_id = me, .g = 1, .page_addr = 0x9000, .root = root, .cursor = 77, .slot_tree_extents = 2, .seq_floor = 5 };
+    const demoted = joinedProjectionRow(mine, me);
+    try testing.expectEqual(cr.SlotVariant.unleased, demoted.variant);
+    try testing.expectEqual(MANAGER, demoted.appender_id);
+    try testing.expectEqual(@as(u64, 0), demoted.page_addr);
+    try testing.expectEqual(@as(u32, 1), demoted.g);
+    try testing.expectEqual(root, demoted.root);
+    try testing.expectEqual(@as(u64, 77), demoted.cursor);
+    try testing.expectEqual(@as(u64, 5), demoted.seq_floor);
+    var dying = mine;
+    dying.variant = .releasing;
+    try testing.expectEqual(cr.SlotVariant.unleased, joinedProjectionRow(dying, me).variant);
+    var other = mine;
+    other.appender_id = 2;
+    try testing.expectEqual(other, joinedProjectionRow(other, me));
+    const free: cr.SlotState = .{ .variant = .unleased, .g = 3, .root = root, .cursor = 10 };
+    try testing.expectEqual(free, joinedProjectionRow(free, me));
+    const t = try LeaseTable.init(gpa);
+    defer t.deinit();
+    try t.load(4, joinedProjectionRow(mine, me));
+    try t.load(5, joinedProjectionRow(other, me));
+    try testing.expectEqual(@as(usize, 0), t.heldCount(me));
+    try testing.expectEqual(State.unleased, t.view(4).state);
+    try testing.expect(t.view(5).leasedBy(2));
+    try testing.expectEqual(@as(u64, 77), t.wordsOf(4).cursor);
 }
 
 test "holder ops over two half-window buckets: counts inside the window, cur → prev at one rotation, zeroed at two; load from tree 0 mirrors every variant; dead marks refuse" {

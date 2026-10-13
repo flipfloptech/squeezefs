@@ -469,7 +469,7 @@ pub const Plane = struct {
             }
             kvs.deinit(gpa);
         }
-        try self.loadTree0Population(&kvs);
+        _ = try self.loadTree0Population(&kvs, null);
         // 2. Region 0's page settled against tree 0 (the backend adopted
         // the live entries' roots at open; here rows 5/6 and the stale
         // drops take their durable effect).
@@ -575,8 +575,10 @@ pub const Plane = struct {
     /// Tree 0's `slot_state` population into the table (the manager's
     /// live truth; a joiner's checkpointed projection — fresher words
     /// arrive through the wire's replies and redirects, learnt into the
-    /// holder cache).
-    fn loadTree0Population(self: *Plane, kvs: *std.ArrayList(manager.KeyValue)) ArmError!void {
+    /// holder cache). `projection_self` is the joined arm's own appender
+    /// id: its rows go through `lt.joinedProjectionRow`; the count of rows
+    /// that law demoted is returned.
+    fn loadTree0Population(self: *Plane, kvs: *std.ArrayList(manager.KeyValue), projection_self: ?AppenderId) ArmError!u64 {
         const gpa = self.gpa;
         const r = cr.rangeOf(.slot_state);
         var raw: std.ArrayList(tree.KeyValue) = .empty;
@@ -589,12 +591,17 @@ pub const Plane = struct {
         errdefer tree.deinitKeyValues(gpa, &raw);
         for (raw.items) |kv| try kvs.append(gpa, .{ .key = kv.key, .value = kv.value });
         raw.items.len = 0;
+        var demoted: u64 = 0;
         for (kvs.items) |kv| {
             const slot = cr.slotOfKey(kv.key) orelse continue;
-            const s = cr.SlotStateWire.decode(kv.value) catch return error.Corrupt;
+            const row = cr.SlotStateWire.decode(kv.value) catch return error.Corrupt;
+            const s = if (projection_self) |me| lt.joinedProjectionRow(row, me) else row;
+            demoted += @intFromBool(s.variant != row.variant);
             try self.table.load(slot, s);
             if (s.variant == .leased) try self.cache.learn(slot, .{ .appender_id = s.appender_id, .g = s.g });
         }
+        acquire.stats.slot_projection_stale_self_rows.add(demoted);
+        return demoted;
     }
 
     /// The JOINED arm (charter §5.7; spec §5.2 rung 6): tree 0's
@@ -625,7 +632,8 @@ pub const Plane = struct {
             }
             kvs.deinit(gpa);
         }
-        try self.loadTree0Population(&kvs);
+        const stale_self = try self.loadTree0Population(&kvs, self.me);
+        if (stale_self != 0) log.info("meta volume {s}: {d} row(s) of tree 0's projection name appender {d} — a previous incarnation's leases (the rejoin's id is the hint's); loaded unleased, a first touch asks the manager", .{ be.path, stale_self, self.me });
         // The manager's slots resolve to its listener (the native slot
         // among them: `/`'s dentries are read under its tokens); any other
         // appender's through `ResolveEndpoint` at the manager.

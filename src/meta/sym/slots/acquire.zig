@@ -79,6 +79,10 @@ pub const stats = struct {
     pub var slot_region_releases: counters.ShardedCounter = .{};
     /// `Live` page entries below tree 0's `g` dropped at the arm.
     pub var slot_lease_stale_entries: counters.ShardedCounter = .{};
+    /// A joiner's tree-0 projection rows naming its OWN appender id at the
+    /// joined arm — a previous incarnation's leases (the hint hands a
+    /// rejoin the same id), loaded unleased (0003 §T.2).
+    pub var slot_projection_stale_self_rows: counters.ShardedCounter = .{};
     /// Two live attestations of one slot (C14's live face): must stay 0.
     pub var slot_lease_conflicts: counters.Tripwire = .init("slot_lease_conflicts");
 };

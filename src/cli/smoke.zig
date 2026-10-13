@@ -2237,6 +2237,100 @@ test "smoke: `volume enable-symmetric` — format --single-writer (meta + 2 data
     _ = try fsckClean(rig, "the conversion and the two-daemon pass");
 }
 
+/// The rejoin row's cycles: each one a clean umount of B and its remount
+/// under the same mount point while A stays up — the window the rejoin's
+/// stale projection needs is B's remount inside A's 1 s cadence, which a
+/// cycle hits most times; three cycles make a miss of the race vanishing.
+const rejoin_cycles: usize = 3;
+
+/// B's fill for one cycle under `r<k>/`: 1 KiB files (inline), 64 KiB files
+/// (staged in B's ring, promoted at B's dismount into packs; A reads them
+/// only after it — charter §6.1 "until promoted, other clients read
+/// size-consistent zeros"), one fsync'd 8 MiB file (two blocks: striped) —
+/// each cut from the rig's random image at its own offset — then every
+/// path's sha256 appended to `$1/rejoin.sha` (relative to the mount root,
+/// the list every later read checks).
+fn rejoinFillScript(gpa: std.mem.Allocator, k: usize) ![]u8 {
+    var w: std.Io.Writer.Allocating = .init(gpa);
+    defer w.deinit();
+    try w.writer.print("mkdir r{[k]d} && i=0; while [ $i -lt 40 ]; do dd if=\"$1/image\" of=r{[k]d}/s$i bs=1k skip=$(({[k]d} * 64 + i)) count=1 status=none; i=$((i + 1)); done; i=0; while [ $i -lt 8 ]; do dd if=\"$1/image\" of=r{[k]d}/p$i bs=64k skip=$(({[k]d} * 16 + i)) count=1 status=none; i=$((i + 1)); done; dd if=\"$1/image\" of=r{[k]d}/big bs=1M skip={[k]d} count=8 conv=fsync status=none; sha256sum r{[k]d}/* >> \"$1/rejoin.sha\"; ls r{[k]d} | wc -l", .{ .k = k });
+    return w.toOwnedSlice();
+}
+
+test "smoke: A JOINER'S CLEAN UNMOUNT AND REJOIN while the manager stays up — mount A (the manager) → B JOINED writes inline, staged and striped files (sha list) → `umount` B (clean: every lease released, the page Free, every staged file promoted; A reads every file sha-equal) → B mounts again at the same mount point: JOINED as appender 1 again (its projection's rows naming appender 1 are a previous incarnation's — loaded unleased), every file of every cycle sha-equal on B, B writes more; three cycles → umount B, every file sha-equal on A → umount A → `fsck --offline --scrub` 0 findings" {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    try rig.env.put("SQUEEZEFS_MW_BIND", "127.0.0.1:0");
+    var t_owner_text: [8]u8 = undefined;
+    try rig.env.put("SQUEEZEFS_TEST_MEMBERSHIP_T_OWNER_MS", try std.fmt.bufPrint(&t_owner_text, "{d}", .{smoke_t_owner_ms}));
+    try rig.formatSet(true);
+    try rig.createImage();
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(0);
+    const b = try Peer.init(rig, "b");
+    defer b.deinit();
+    try b.spawn(&.{});
+    _ = try b.awaitReady();
+    {
+        const text = try b.readLog();
+        defer gpa.free(text);
+        try testing.expect(std.mem.indexOf(u8, text, "mounted JOINED as appender 1") != null);
+        const script = try rejoinFillScript(gpa, 0);
+        defer gpa.free(script);
+        const out = try b.onMount(script);
+        defer gpa.free(out);
+        try testing.expectEqualStrings("49\n", out);
+    }
+    var stale_rows: u64 = 0;
+    for (1..rejoin_cycles + 1) |k| {
+        try b.umount();
+        try b.expectCleanExit("B's clean unmount before its rejoin");
+        // B's dismount promoted its staged files: A reads every one.
+        const from_a = try rig.onMount("sha256sum --quiet -c \"$1/rejoin.sha\" && echo ok");
+        defer gpa.free(from_a);
+        try testing.expectEqualStrings("ok\n", from_a);
+        const mark = try b.logLen();
+        try b.spawn(&.{});
+        const ready = try b.awaitLog("ready: ", mark, ready_wait_ns);
+        const text = try b.readLog();
+        defer gpa.free(text);
+        try testing.expect(std.mem.indexOf(u8, text[mark..ready], "mounted JOINED as appender 1") != null);
+        // Every file of every earlier cycle, then B's next fill.
+        const back = try b.onMount("sha256sum --quiet -c \"$1/rejoin.sha\" && echo ok");
+        defer gpa.free(back);
+        try testing.expectEqualStrings("ok\n", back);
+        const script = try rejoinFillScript(gpa, k);
+        defer gpa.free(script);
+        const out = try b.onMount(script);
+        defer gpa.free(out);
+        try testing.expectEqualStrings("49\n", out);
+        const tb = try b.stats();
+        defer gpa.free(tb);
+        try testing.expectEqual(@as(?u64, 0), numberAfter(tb, "\"slot_lease_conflicts\":"));
+        try expectMustStayZero(tb);
+        const stale = numberAfter(tb, "\"slot_projection_stale_self_rows\":") orelse 0;
+        stale_rows += stale;
+        std.debug.print("smoke: rejoin cycle {d}: B JOINED as appender 1 again, {d} stale projection row(s) of its previous incarnation loaded unleased; {d} files sha-equal\n", .{ k, stale, k * 49 });
+    }
+    try b.umount();
+    try b.expectCleanExit("B's last unmount");
+    {
+        const from_a = try rig.onMount("sha256sum --quiet -c \"$1/rejoin.sha\" && echo ok");
+        defer gpa.free(from_a);
+        try testing.expectEqualStrings("ok\n", from_a);
+        const ta = try rig.stats();
+        defer gpa.free(ta);
+        try expectMustStayZero(ta);
+    }
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+    _ = try fsckClean(rig, "the joiner's rejoin cycles");
+    std.debug.print("smoke: rejoin: {d} cycles, {d} files, {d} stale projection row(s) loaded unleased in all\n", .{ rejoin_cycles, (rejoin_cycles + 1) * 49, stale_rows });
+}
+
 // ---------------------------------------------------------------------------
 // THE KILL ROWS (charter §5.5 "Death and recovery", "PARK-AND-RECLAIM",
 // §8 `appender clear`): two daemons over real TCP, `kill -9` of either.

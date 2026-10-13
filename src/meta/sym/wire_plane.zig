@@ -1772,6 +1772,7 @@ const dialer = @import("../../wire/dialer.zig");
 const page = @import("appender_page.zig");
 const join = @import("join.zig");
 const node_seq = @import("../node_seq.zig");
+const slots_acquire = @import("slots/acquire.zig");
 
 const DevicePages = struct {
     be: *KvBackend,
@@ -1911,6 +1912,86 @@ test "linux: the daemon's wire plane over a real symmetric set — the listener 
         try testing.expectEqual(pubs0 + 2, stats.wire_endpoint_publications.load());
         try testing.expect(plane.mgr.?.owner.grace == null);
         try testing.expect(!std.mem.eql(u8, ep_text_buf[0..ep_text_len], plane.endpointText()));
+    }
+}
+
+test "linux: A JOINER'S CLEAN UNMOUNT AND REJOIN while the manager stays up — B joins over TCP (its rotor slot leased as appender 1) and writes into it, the manager checkpoints (tree 0's projection names B's lease), B unmounts clean (the lease released, the page Free: the live tree 0 Unleased, the projection on the device still Leased{1}), B mounts again under the same identity before the manager's next record: the hint hands it appender 1 again, the projection's row naming appender 1 is a previous incarnation's and loads unleased — the rejoin holds exactly its new grant, its first cycle publishes nothing the manager refuses, it mounts and writes" {
+    const gpa = testing.allocator;
+    const s = try meta_set.TestSet.create(gpa, "rejoin", 1);
+    defer s.destroy();
+    try s.env.put("SQUEEZEFS_MW_BIND", "127.0.0.1:0");
+    // The manager's cadence held past the row: its one record below is the
+    // row's own, so the projection B reads at its rejoin is the stale one
+    // by construction (the venue's race: B remounting inside the manager's
+    // 1 s cadence).
+    try s.env.put("SQUEEZEFS_CHECKPOINT_MAX_AGE_MS", "600000");
+    // One rotor slot: one grant, one release — no tree-0 split carries the
+    // released row's leaf onto the device between the manager's records.
+    try s.env.put("SQUEEZEFS_SYM_MINT_SLOTS", "1");
+    const set = try s.open();
+    defer set.close();
+    var locks = try dlm.Manager.init(gpa, 64);
+    defer locks.deinit();
+    const bound = try xv.set_bind.Bound.create(gpa, s.io(), set, &locks, &s.env);
+    defer bound.destroy(gpa);
+    const plane = (try WirePlane.start(gpa, s.io(), set, &s.env, 4, 1 << 30, &bound.plane, false)).?;
+    defer plane.stop();
+    const be0 = set.volumes[0];
+    const join_opts: backend.JoinOptions = .{ .mountpoint = "/build/tmp/mnt-rejoin-b", .endpoint = plane.advertised };
+    const open_opts: meta_set.OpenOptions = .{ .env = &s.env, .cache_budget_bytes = 64 << 20, .cpus = 4, .join = join_opts };
+    var first: std.ArrayList(u16) = .empty;
+    defer first.deinit(gpa);
+    var me: u32 = 0;
+    {
+        const b = try meta_set.MetaSet.open(gpa, s.io(), s.pathList(), open_opts);
+        defer b.close();
+        const bj = b.volumes[0];
+        try testing.expectEqual(backend.Posture.joined, bj.posture);
+        me = bj.joined.?.appenderId();
+        try bj.slots.table.heldBy(me, &first);
+        try testing.expectEqual(@as(usize, 1), first.items.len);
+        // B writes into its slot (the tree its release names).
+        const local = try bj.allocateInoInSlot(first.items[0]);
+        const t = try bj.begin(@src());
+        try t.stagePut(key.TREE_INODES, &key.inodeKey(key.guestLocalIno(first.items[0], local)), "first");
+        try bj.commit(t);
+        try bj.checkpointNow();
+        // The manager's record: tree 0's projection names B's lease.
+        try be0.checkpointNow();
+    }
+    // The precondition: the live tree 0 Unleased, the projection on the
+    // device (what a rejoin reads) still Leased{appender 1}.
+    try testing.expectEqual(slots_lt.State.unleased, be0.slots.table.view(first.items[0]).state);
+    {
+        const rd = try KvBackend.openReader(gpa, s.io(), s.paths[0], .{ .env = &s.env, .cache_budget_bytes = 16 << 20 });
+        defer rd.close();
+        const row = (try rd.lookup(gpa, key.TREE_CONTROL, cr.slotStateKey(first.items[0]).slice())).?;
+        defer gpa.free(row);
+        const st = try cr.SlotStateWire.decode(row);
+        try testing.expect(st.variant == .leased and st.appender_id == me);
+    }
+    const stale0 = slots_acquire.stats.slot_projection_stale_self_rows.load();
+    {
+        const b = try meta_set.MetaSet.open(gpa, s.io(), s.pathList(), open_opts);
+        defer b.close();
+        const bj = b.volumes[0];
+        try testing.expectEqual(me, bj.joined.?.appenderId());
+        try testing.expectEqual(stale0 + 1, slots_acquire.stats.slot_projection_stale_self_rows.load());
+        // Exactly this incarnation's grant is held — the previous one's row
+        // reads unleased to the door (a first touch asks the manager).
+        var held: std.ArrayList(u16) = .empty;
+        defer held.deinit(gpa);
+        try bj.slots.table.heldBy(me, &held);
+        try testing.expectEqual(@as(usize, 1), held.items.len);
+        try testing.expect(be0.slots.table.view(held.items[0]).leasedBy(me));
+        if (held.items[0] != first.items[0]) try testing.expectEqual(slots_lt.State.unleased, bj.slots.table.view(first.items[0]).state);
+        // It writes: a record in its new slot commits and the next cycle's
+        // publication passes the manager's screen.
+        const local = try bj.allocateInoInSlot(held.items[0]);
+        const t = try bj.begin(@src());
+        try t.stagePut(key.TREE_INODES, &key.inodeKey(key.guestLocalIno(held.items[0], local)), "rejoined");
+        try bj.commit(t);
+        try bj.checkpointNow();
     }
 }
 

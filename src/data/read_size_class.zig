@@ -82,17 +82,21 @@ pub const KeySelect = struct {
     }
 };
 
-/// A census cursor over a sharded tier: `shard << 32 | slot`.
+/// A census cursor over a sharded tier: the shard above, the slot below.
+/// A shard's tables are u32-indexed slabs, so the slot takes the low half.
+const CURSOR_SLOT_BITS: u6 = 32;
+const CURSOR_SLOT_MASK: u64 = (@as(u64, 1) << CURSOR_SLOT_BITS) - 1;
+
 pub fn cursorShard(cursor: u64) usize {
-    return @intCast(cursor >> 32);
+    return @intCast(cursor >> CURSOR_SLOT_BITS);
 }
 
 pub fn cursorSlot(cursor: u64) usize {
-    return @intCast(cursor & 0xFFFF_FFFF);
+    return @intCast(cursor & CURSOR_SLOT_MASK);
 }
 
 pub fn cursorAt(shard: usize, slot: usize) u64 {
-    return (@as(u64, shard) << 32) | slot;
+    return (@as(u64, shard) << CURSOR_SLOT_BITS) | slot;
 }
 
 /// The `std.AutoHashMap` context for `BlockKey` (hash64, not the default

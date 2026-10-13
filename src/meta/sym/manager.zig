@@ -70,6 +70,9 @@ pub const stats = struct {
     pub var manager_service_ns: [Phase.count]counters.ShardedLatencyHistogram = @splat(.{});
     /// A verb answered from durable state it had already produced.
     pub var manager_verb_replays: counters.ShardedCounter = .{};
+    /// Endpoint rows retired with their appender's death (the eviction,
+    /// the page written away from Live).
+    pub var manager_endpoints_retired: counters.ShardedCounter = .{};
     /// The durable witness contradicts the caller: must stay 0.
     pub var manager_verb_refusals: counters.Tripwire = .init("manager_verb_refusals");
     /// A wire integer names what durable state cannot — the buggy/hostile
@@ -467,7 +470,9 @@ pub const Volume = struct {
 
 pub const Lease = enum { held, peer, vacant };
 
-pub const EndpointRow = struct { appender_id: u32, endpoint: Endpoint, pr_key: u64 };
+/// An appender's listener as it published it, under the identity whose
+/// Live page the publish was bound to.
+pub const EndpointRow = struct { appender_id: u32, identity: cr.StableIdentity, endpoint: Endpoint, pr_key: u64 };
 
 pub const Manager = struct {
     gpa: Allocator,
@@ -771,7 +776,21 @@ pub const Manager = struct {
     /// slots this mount never writes.
     pub fn writeForeignPage(self: *Manager, p: *page.Page) VerbError!void {
         const slots = (try self.dirSlotsOf(p.appender_id)) orelse return error.Rejected;
-        return self.writeBothDirSlots(p, slots);
+        try self.writeBothDirSlots(p, slots);
+        // A page written away from Live (a recovery's Recovering, Recovered,
+        // a region released Free) ends the listener it published: never
+        // resolved again, its port any other process's next.
+        if (p.state != .live) self.retireEndpointRow(p.appender_id);
+    }
+
+    fn retireEndpointRow(self: *Manager, appender_id: u32) void {
+        self.verbs_lock.lockUncancelable(self.io);
+        defer self.verbs_lock.unlock(self.io);
+        for (self.endpoints.items, 0..) |row, i| if (row.appender_id == appender_id) {
+            _ = self.endpoints.swapRemove(i);
+            stats.manager_endpoints_retired.inc();
+            return;
+        };
     }
 
     /// Write `p` into BOTH directory slots (generations +1, +2), one
@@ -1481,11 +1500,12 @@ pub const Manager = struct {
                 return .{ .already = true };
             }
             row.endpoint = req.endpoint;
+            row.identity = .{ .node_token = req.identity.node_token, .mount_slot = req.identity.mount_slot };
             row.pr_key = req.pr_key;
             self.ledger.record(clock.monotonicNs(), t_admit - t0, clock.monotonicNs() - t_admit, 0);
             return .{ .already = false };
         };
-        try self.endpoints.append(self.gpa, .{ .appender_id = req.appender_id, .endpoint = req.endpoint, .pr_key = req.pr_key });
+        try self.endpoints.append(self.gpa, .{ .appender_id = req.appender_id, .identity = .{ .node_token = req.identity.node_token, .mount_slot = req.identity.mount_slot }, .endpoint = req.endpoint, .pr_key = req.pr_key });
         const t_done = clock.monotonicNs();
         self.ledger.record(t_done, t_admit - t0, t_done - t_admit, 0);
         return .{ .already = false };
@@ -1497,6 +1517,23 @@ pub const Manager = struct {
         defer self.verbs_lock.unlock(self.io);
         for (self.endpoints.items) |row| if (row.appender_id == req.appender_id) return .{ .endpoint = row.endpoint };
         return .{ .endpoint = null };
+    }
+
+    /// The eviction's retirement (the home shard owner's death fan-out):
+    /// every row published under the dead member's identity goes — the
+    /// listener it names belongs to a corpse, and the port may be any
+    /// other process's next.
+    pub fn retireEndpointOf(self: *Manager, identity: cr.StableIdentity) void {
+        self.verbs_lock.lockUncancelable(self.io);
+        defer self.verbs_lock.unlock(self.io);
+        var i: usize = 0;
+        while (i < self.endpoints.items.len) {
+            const row = self.endpoints.items[i];
+            if (row.identity.node_token == identity.node_token and row.identity.mount_slot == identity.mount_slot) {
+                _ = self.endpoints.swapRemove(i);
+                stats.manager_endpoints_retired.inc();
+            } else i += 1;
+        }
     }
 
     /// Drop a left appender's endpoint row.
@@ -2110,6 +2147,40 @@ test "publish roots: a word for a slot the appender does not lease, a cursor bel
     try testing.expect(s.variant == .leased and s.appender_id == 1);
     const pub2 = try m.publishRoots(.{ .appender_id = 1, .roots = &.{.{ .slot = 5, .g = 3, .root = .{ .addr = in_grant, .seq = 44 }, .cursor = 9, .slot_tree_extents = 1 }} });
     try testing.expectEqual(RootsPublished{ .published = 0, .already = 1 }, pub2);
+}
+
+test "endpoints: a dead appender's row is retired — its page written away from Live (the recovery's Recovering) drops it, and so does the eviction by identity; ResolveEndpoint never names a corpse's port again and a publish under the dead page refuses (red: the row stood after the recovery and named the dead daemon's port)" {
+    const gpa = testing.allocator;
+    const tv = try TestVolume.init(gpa, 1 << 30, 65_536, 4000);
+    defer tv.deinit();
+    try tv.liveManagerPage();
+    var m = newManager(gpa, tv);
+    defer m.deinit();
+    _ = try m.joinAppender(.{ .identity = ident_a });
+    var ep: Endpoint = .{};
+    @memcpy(ep.bytes[0..6], "\x02\x00\x1f\x90\x7f\x00");
+    ep.len = 6;
+    _ = try m.publishEndpoint(.{ .identity = ident_a, .appender_id = 1, .endpoint = ep, .pr_key = 1 });
+    try testing.expect((try m.resolveEndpoint(.{ .appender_id = 1 })).endpoint.?.eql(ep));
+    // The recovery's step 2: the page Live → Recovering.
+    const retired0 = stats.manager_endpoints_retired.load();
+    var p = (try m.readPageOf(1)).?;
+    p.state = .recovering;
+    p.generation += 1;
+    try m.writeForeignPage(&p);
+    try testing.expect((try m.resolveEndpoint(.{ .appender_id = 1 })).endpoint == null);
+    try testing.expectEqual(retired0 + 1, stats.manager_endpoints_retired.load());
+    try testing.expectError(error.Rejected, m.publishEndpoint(.{ .identity = ident_a, .appender_id = 1, .endpoint = ep, .pr_key = 1 }));
+    // The eviction's retirement by identity (the owner's death fan-out),
+    // before any recovery wrote the page: a second appender.
+    _ = try m.joinAppender(.{ .identity = ident_b });
+    _ = try m.publishEndpoint(.{ .identity = ident_b, .appender_id = 2, .endpoint = ep, .pr_key = 2 });
+    m.retireEndpointOf(.{ .node_token = ident_b.node_token, .mount_slot = ident_b.mount_slot });
+    try testing.expect((try m.resolveEndpoint(.{ .appender_id = 2 })).endpoint == null);
+    try testing.expectEqual(retired0 + 2, stats.manager_endpoints_retired.load());
+    // Retiring an identity that publishes nothing is nothing.
+    m.retireEndpointOf(.{ .node_token = 0xDEAD, .mount_slot = 9 });
+    try testing.expectEqual(retired0 + 2, stats.manager_endpoints_retired.load());
 }
 
 test "endpoints: publish binds identity ↔ page strictly, is idempotent on the same address, re-points on a new one; resolve answers the table; forget drops it" {

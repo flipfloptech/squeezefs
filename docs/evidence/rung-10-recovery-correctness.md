@@ -231,3 +231,25 @@ count refuses); the decoder's fuzz target re-encodes it.
   — the dentry carries no intent stamp. Treating it as the intent's own is the safe reading (a count
   too high is a leak C10 reports; one too low would let a later unlink free a file a name still
   reaches).
+
+## 5. A dead daemon's address in the manager's endpoint table (item 5)
+
+`Manager.forgetEndpoint` ran on an in-process leave only, so after a member's death
+`ResolveEndpoint` kept naming the dead daemon's port (`rung-10-striping-wire.md` §3.6) — a port any
+other process may bind next. The rows now carry the identity they were published under; the home
+shard's eviction retires every row of the evicted identity on every volume manager in the process
+(the death fan-out), and the manager's own page write away from Live retires the appender's row —
+the recovery's Recovering for a volume whose manager is not the shard's owner (0003 §U.5,
+`manager_endpoints_retired`).
+
+Red rows: `manager` "endpoints: a dead appender's row is retired" (the page written Recovering ⇒
+`ResolveEndpoint` answers none, a publish under the dead page refuses; a second appender's row
+retired by identity at the eviction; an identity that published nothing retires nothing) — red on
+`dev`: the resolve after Recovering still named the port. `wire_plane` "THE SAME-NODE SUCCESSOR IS
+REACHED" now asserts the corpse's row gone at the eviction (`expireDue`) and the successor's publish
+resolving again.
+
+Stated: a dial still trusts the address it resolved — the handshake proves the DIALER to the
+listener (the enrolment secret), never the listener's identity to the dialer, so a stranger at a
+recycled port that holds the secret is the set's own member anyway; a listener identity proof is a
+protocol change, not made here.

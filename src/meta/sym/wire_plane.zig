@@ -202,6 +202,9 @@ const DeathFanout = struct {
         const self: *DeathFanout = @ptrCast(@alignCast(ctx.?));
         self.plane.holder.noteMemberDeparted(self.plane.io, clientIdOf(dead.id));
         self.plane.peers.forgetMember(clientIdOf(dead.id));
+        // Every volume this process manages stops resolving the corpse's
+        // listener at the eviction, not at its recovery.
+        if (dead.identity) |w| for (self.plane.set.volumes) |be| if (be.sym) |aset| aset.manager.retireEndpointOf(.{ .node_token = w.node_token, .mount_slot = w.mount_slot });
         self.ledger.noteDeath(self.ledger.ctx, dead);
     }
 };
@@ -2158,7 +2161,7 @@ fn deadEndpoint() endpoint.EndpointWire {
     return e;
 }
 
-test "linux: THE SAME-NODE SUCCESSOR IS REACHED — a member joins at a dead incarnation's port and the plane's links to it (by token client id and by holder appender id) dial that port; its eviction retires the sessions through the death fan-out; the successor joins under the SAME member id and appender id at a new port and the next call on either link re-resolves off the roster / the RAM endpoint table and lands — never a frame into the dead port, never the lease TTL" {
+test "linux: THE SAME-NODE SUCCESSOR IS REACHED — a member joins at a dead incarnation's port and the plane's links to it (by token client id and by holder appender id) dial that port; its eviction retires the sessions and the manager's endpoint row through the death fan-out; the successor joins under the SAME member id and appender id at a new port and the next call on either link re-resolves off the roster / the RAM endpoint table and lands — never a frame into the dead port, never the lease TTL" {
     const gpa = testing.allocator;
     const s = try meta_set.TestSet.create(gpa, "wire-succ", 1);
     defer s.destroy();
@@ -2194,10 +2197,16 @@ test "linux: THE SAME-NODE SUCCESSOR IS REACHED — a member joins at a dead inc
     try testing.expectError(error.HolderUnreachable, by_client.call(by_client.ctx, .{ .ping = .{} }));
     try testing.expectError(error.HolderUnreachable, by_holder.call(by_holder.ctx, .{ .ping = .{} }));
     try testing.expectEqual(@as(usize, 2), plane.peers.count());
-    // The eviction at T_owner: the fan-out retires both sessions.
+    // The eviction at T_owner: the fan-out retires both sessions — and
+    // the manager's row of the corpse's listener (rung 10 recovery item 5:
+    // it stood until the region was recovered, naming the dead port).
     const invalidated0 = joined.stats.peer_links_invalidated.load();
+    const retired0 = manager.stats.manager_endpoints_retired.load();
+    try testing.expect((try be0.sym.?.manager.resolveEndpoint(.{ .appender_id = r1.appenderId() })).endpoint != null);
     try testing.expectEqual(@as(u32, 1), m.owner.expireDue(now + m.owner.clocks.t_owner_ms + 1));
     try testing.expectEqual(invalidated0 + 2, joined.stats.peer_links_invalidated.load());
+    try testing.expect((try be0.sym.?.manager.resolveEndpoint(.{ .appender_id = r1.appenderId() })).endpoint == null);
+    try testing.expectEqual(retired0 + 1, manager.stats.manager_endpoints_retired.load());
     // The successor: the same member id and appender id, the plane's own
     // listener as its port (a listener that answers).
     try testing.expect(m.owner.join(.{ .id = id, .role = .writer, .endpoint = plane.advertised, .pid = 4243, .boot = @splat(1), .prior_epoch = null, .pr_key = 0, .mount = "/mnt-b", .row = null }, now + m.owner.clocks.t_owner_ms + 2) == .granted);

@@ -1993,6 +1993,11 @@ const Fixture = struct {
     /// Runs after a device read lands its bytes (a mutation between the
     /// DMA and the read path's recheck).
     after_read: ?*const fn (*Fixture) void = null,
+    /// Meta seam calls (the per-read resolution cost the warm ladder pins).
+    file_calls: Atomic(u64) = .init(0),
+    binding_calls: Atomic(u64) = .init(0),
+    /// The device fd the volumes seam answers (null = no direct leg).
+    dev_fd: ?std.os.linux.fd_t = null,
     rp: *ReadPath = undefined,
 
     pub fn init(gpa: Allocator, cfg_over: struct { passthrough: bool = true, ranged_threshold: u64 = 256 * derive.KiB, direct_device_true: bool = false, read_lane: bool = true, rebind_cap: u32 = MAX_REBINDS, hot_budget: u64 = 4 * bs, policy: admission.Policy = .second_touch, compression: ?transform.Compression = null }) !*Fixture {
@@ -2097,10 +2102,12 @@ const Fixture = struct {
     // Meta seam.
     fn metaFile(ctx: *anyopaque, _: u64) ?FileInfo {
         const self: *Fixture = @ptrCast(@alignCast(ctx));
+        _ = self.file_calls.fetchAdd(1, .monotonic);
         return .{ .size = self.size, .kind = self.kind, .durable_copy = if (self.kind == .packed_) self.bindings[0] else null };
     }
     fn metaBinding(ctx: *anyopaque, _: u64, block: u64) ?Mapping {
         const self: *Fixture = @ptrCast(@alignCast(ctx));
+        _ = self.binding_calls.fetchAdd(1, .monotonic);
         if (block >= MaxBlocks) return null;
         return self.bindings[block];
     }
@@ -2134,8 +2141,9 @@ const Fixture = struct {
         if (self.after_read) |f| f(self);
         return .dma;
     }
-    fn volFd(_: *anyopaque, _: u64) ?std.os.linux.fd_t {
-        return null;
+    fn volFd(ctx: *anyopaque, _: u64) ?std.os.linux.fd_t {
+        const self: *Fixture = @ptrCast(@alignCast(ctx));
+        return self.dev_fd;
     }
     fn vols(self: *Fixture) Volumes {
         return .{ .ctx = self, .allocator_of = &volAlloc, .read_range = &volRead, .device_fd = &volFd };

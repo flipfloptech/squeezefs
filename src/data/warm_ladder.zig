@@ -133,6 +133,26 @@ pub fn directLegEligible(passthrough: bool, device_true: bool, offset: u64, size
     return offset / block_size == (offset + size - 1) / block_size;
 }
 
+/// The probe's resolution of a cold striped single-block request, handed to
+/// the direct leg the transport asks next for the SAME request on the SAME
+/// thread (`deliverParsed`: `probe_read` declines, then `direct_leg`, back
+/// to back): the leg's pre-DMA reads of the file and the binding are the
+/// probe's, microseconds old — no fetch between them, and the post-DMA
+/// recheck re-reads the binding as before (charter §6.3's validation after
+/// the bytes are in hand). Re-reading both cost two layout-record lookups
+/// and an inode lookup per cold read (`docs/evidence/rung-10-dev-perf.md`
+/// §3.4). Taken by the leg, cleared by every probe; a request that does not
+/// match resolves fresh.
+const Resolved = struct {
+    ladder: *const WarmLadder,
+    ino: u64,
+    offset: u64,
+    size: u32,
+    info: read_path.FileInfo,
+    binding: layout.Mapping,
+};
+threadlocal var resolved: ?Resolved = null;
+
 pub const WarmLadder = struct {
     rp: *read_path.ReadPath,
     guards: *op_guard.Table,
@@ -156,6 +176,7 @@ pub const WarmLadder = struct {
 
     /// The probe: serve `[offset, offset + size)` of `ino` INTO `window`.
     pub fn probe(self: *WarmLadder, ino: u64, offset: u64, size: u32, odirect: bool, window: []u8) Verdict {
+        resolved = null;
         const rp = self.rp;
         // 0. Pre-screen.
         if (size == 0) return self.demote(.pre_screen);
@@ -321,6 +342,7 @@ pub const WarmLadder = struct {
                     if (odirect) read_path.stats.read_odirect_tier_serves.inc();
                     return .{ .n = out.len, .arm = .cache };
                 }
+                if (out.len <= std.math.maxInt(u32)) resolved = .{ .ladder = self, .ino = ino, .offset = offset, .size = @intCast(out.len), .info = info, .binding = key };
                 return error.Miss;
             },
         }
@@ -334,7 +356,9 @@ pub const WarmLadder = struct {
         const rp = self.rp;
         const device_true = rp.cfg.direct_device_true and odirect;
         if (!directLegEligible(rp.cfg.passthrough, device_true, offset, size, rp.cfg.block_size)) return null;
-        const info = rp.meta.file(rp.meta.ctx, ino) orelse return null;
+        const memo: ?Resolved = if (resolved) |r| (if (r.ladder == self and r.ino == ino and r.offset == offset and r.size == size) r else null) else null;
+        resolved = null;
+        const info = if (memo) |r| r.info else rp.meta.file(rp.meta.ctx, ino) orelse return null;
         if (offset + size > info.size or info.kind != .striped) return null;
         const b = offset / rp.cfg.block_size;
         // The write side's custody outranks the device (charter §6.3: a
@@ -345,7 +369,7 @@ pub const WarmLadder = struct {
             stats.direct_leg_custody_declines.inc();
             return null;
         }
-        const m = rp.meta.binding(rp.meta.ctx, ino, b) orelse return null;
+        const m = if (memo) |r| r.binding else rp.meta.binding(rp.meta.ctx, ino, b) orelse return null;
         const k = BlockKey.fromMapping(m);
         if (rp.hot.contains(k) or rp.hold.contains(k) or rp.nvme.has(k) or rp.flights.inFlight(self.io, k)) return null;
         const fd = rp.vols.device_fd(rp.vols.ctx, k.vol_tag) orelse return null;
@@ -521,6 +545,48 @@ test "the warm ladder asks the write side TRY-ONLY: a `busy` custody station is 
     // the offer itself stays null — the custody counter is what moved).
     try testing.expect(ladder.directLeg(7, 0, 4096, false) == null);
     try testing.expectEqual(declines0 + 1, stats.direct_leg_custody_declines.load());
+}
+
+test "a cold direct-leg read resolves its file ONCE and its binding TWICE — the probe's reads before the DMA, the recheck's after the bytes: the leg reuses the probe's resolution of the same request; a moved binding still fails the recheck; another request resolves fresh" {
+    const F = read_path.TestFixture;
+    const f = try F.init(testing.allocator, .{});
+    defer f.deinit();
+    f.size = 2 * F.bs;
+    f.bind(0, 2);
+    f.bind(1, 3);
+    // Described, never executed: the leg carries the fd to the transport.
+    f.dev_fd = 3;
+    var guards = try op_guard.Table.init(testing.allocator, 64);
+    defer guards.deinit();
+    var ladder: WarmLadder = .{ .rp = f.rp, .guards = &guards, .io = testing.io, .direct_leg_armed = true };
+    const window = try testing.allocator.alignedAlloc(u8, .fromByteUnits(4096), 1 << 20);
+    defer testing.allocator.free(window);
+    // The transport's order for ONE request: probe → decline → leg → CQE hook.
+    const files0 = f.file_calls.load(.monotonic);
+    const binds0 = f.binding_calls.load(.monotonic);
+    try testing.expectEqual(Verdict{ .demote = .miss }, ladder.probe(7, 8192, 4096, true, window));
+    const leg = ladder.directLeg(7, 8192, 4096, true) orelse return error.TestExpectedEqual;
+    try testing.expectEqual(@as(u64, 2 * F.bs + 8192), leg.off);
+    const hook = leg.hook.?;
+    try testing.expect(hook.call(hook.ctx, &hook.token, true));
+    try testing.expectEqual(files0 + 1, f.file_calls.load(.monotonic));
+    try testing.expectEqual(binds0 + 2, f.binding_calls.load(.monotonic));
+    // The binding moves between the probe and the bytes: the leg DMAs the
+    // probe's key and the post-DMA recheck withdraws the reply.
+    try testing.expectEqual(Verdict{ .demote = .miss }, ladder.probe(7, 4096, 4096, true, window));
+    const leg2 = ladder.directLeg(7, 4096, 4096, true) orelse return error.TestExpectedEqual;
+    f.bind(0, 5);
+    const failures0 = stats.direct_leg_recheck_failures.load();
+    try testing.expect(!leg2.hook.?.call(leg2.hook.?.ctx, &leg2.hook.?.token, true));
+    try testing.expectEqual(failures0 + 1, stats.direct_leg_recheck_failures.load());
+    // A leg for another request than the probe's resolves fresh.
+    try testing.expectEqual(Verdict{ .demote = .miss }, ladder.probe(7, 0, 4096, true, window));
+    const files1 = f.file_calls.load(.monotonic);
+    const binds1 = f.binding_calls.load(.monotonic);
+    const leg3 = ladder.directLeg(7, F.bs, 4096, true) orelse return error.TestExpectedEqual;
+    try testing.expectEqual(@as(u64, 3 * F.bs), leg3.off);
+    try testing.expectEqual(files1 + 1, f.file_calls.load(.monotonic));
+    try testing.expectEqual(binds1 + 1, f.binding_calls.load(.monotonic));
 }
 
 test "the warm ladder never blocks: a cold block demotes (miss), a held guard demotes (contended) without waiting, a tier-resident block serves byte-exact and EOF-clamped into the window, oversize and device-true O_DIRECT pre-screen; serves + demotes ≡ probes" {

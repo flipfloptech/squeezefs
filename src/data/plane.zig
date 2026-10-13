@@ -2105,10 +2105,25 @@ pub const DataPlane = struct {
             // is read, never republished from here (the publish ships).
             .foreign => |x| return if (x.layout) |v| .{ .value = v, .coll_seq = 0 } else null,
         };
-        var kvs: std.ArrayList(tree.KeyValue) = .empty;
-        defer tree.deinitKeyValues(self.gpa, &kvs);
         const h = key.xattrNameHash56(layout.LAYOUT_XATTR_NAME, self.name_key);
         const start = key.xattrKey(ino, h, 0);
+        // The chain's first slot holds the record unless another name of
+        // the same 56-bit hash took it first (or took it and was removed):
+        // ONE point lookup — one owned copy — answers the common case; the
+        // chain range (a list, a copy of every key and value, then this
+        // record's copy again) only when slot 0 is not `layout`. The read
+        // path resolves a layout per cold read (`docs/evidence/rung-10-
+        // dev-perf.md` §3.4).
+        if (self.backend.lookup(self.gpa, key.TREE_XATTRS, &start) catch |e| return KvBackend.coreError(e)) |v| {
+            const xv = record.XattrValue.decode(v) catch {
+                self.gpa.free(v);
+                return error.InputOutput;
+            };
+            if (std.mem.eql(u8, xv.name, layout.LAYOUT_XATTR_NAME)) return .{ .value = v, .coll_seq = 0 };
+            self.gpa.free(v);
+        }
+        var kvs: std.ArrayList(tree.KeyValue) = .empty;
+        defer tree.deinitKeyValues(self.gpa, &kvs);
         const end = key.xattrKey(ino, h, std.math.maxInt(u8));
         self.backend.range(self.gpa, key.TREE_XATTRS, &start, &end, 256, &kvs) catch |e| return KvBackend.coreError(e);
         for (kvs.items) |kv| {

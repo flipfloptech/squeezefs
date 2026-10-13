@@ -637,6 +637,20 @@ const Stream = struct {
     }
 };
 
+/// `lookup(D/name)` over a reader of one directory's dentries
+/// (`reader.find(dir, name) !?Found`): the name's stripe first, then
+/// `D`'s own tree (the permanent secondary home, LWW), and on a miss in
+/// both the stripe AGAIN: every move out of `D` (the lazy migration, a
+/// mutation's re-home — possible whenever `D` holds a name, a stale
+/// route's late insert included) inserts into the stripe and then removes
+/// from `D`, the reads' own order, so a name moved between the two reads
+/// is in the stripe by the time `D` is seen without it.
+pub fn locateName(comptime Found: type, reader: anytype, stripe_ino: u64, dir: u64, name: []const u8) !?Found {
+    if (try reader.find(stripe_ino, name)) |f| return f;
+    if (try reader.find(dir, name)) |f| return f;
+    return reader.find(stripe_ino, name);
+}
+
 /// One merged page of a striped directory from `offset`: `K + 1` streams
 /// (every stripe + `D`'s own tree) refilled only when consumed, in pages
 /// of `max(max / (K + 1), floor)`; the smallest head cookie pops; an
@@ -1357,4 +1371,39 @@ test "fsck C17 finds every planted shape and nothing else: multiply-mapped, miss
     const cv = [_]DirView{ .{ .dir = 9, .markers = &.{ good[0], good[1], .{ .name = MIGRATING, .child = 100 }, good[2] }, .names = &d_names }, .{ .dir = 100, .markers = &.{}, .names = &.{} }, .{ .dir = 101, .markers = &.{}, .names = &.{} } };
     try verifyStripes(gpa, &cv, &Has.has, &seed, &clean);
     try testing.expectEqual(@as(usize, 0), clean.items.len);
+}
+
+test "locateName: a name the lazy migration MOVES between the lookup's two reads — inserted into its stripe, then removed from D (the migration's order and the re-home's) — is found: never ENOENT for a name that existed throughout (found by the shared hot directory row: C's `stat` of a phase-1 name A was migrating answered ENOENT in 2 of 10 runs while `ls` listed it)" {
+    const Found = u64;
+    // D = 1, the stripe = 2; the name "n" → child 77, in D at first.
+    const Tree = struct {
+        in_d: bool = true,
+        in_s: bool = false,
+        reads: u32 = 0,
+        /// The migration lands right after the reader's FIRST stripe read.
+        move_after_first_stripe_read: bool = true,
+        pub fn find(self: *@This(), dir: u64, _: []const u8) !?Found {
+            self.reads += 1;
+            const hit = if (dir == 2) self.in_s else self.in_d;
+            if (dir == 2 and self.move_after_first_stripe_read) {
+                self.move_after_first_stripe_read = false;
+                self.in_s = true; // the migration's insert into the stripe
+                self.in_d = false; // then its remove from D
+            }
+            return if (hit) 77 else null;
+        }
+    };
+    var t: Tree = .{};
+    try testing.expectEqual(@as(?Found, 77), try locateName(Found, &t, 2, 1, "n"));
+    // No move: a name in D is found there, a name nowhere is absent.
+    var still: Tree = .{ .move_after_first_stripe_read = false };
+    try testing.expectEqual(@as(?Found, 77), try locateName(Found, &still, 2, 1, "n"));
+    var none: Tree = .{ .in_d = false, .move_after_first_stripe_read = false };
+    try testing.expectEqual(@as(?Found, null), try locateName(Found, &none, 2, 1, "n"));
+    // A name in the stripe (migrated) is the stripe's, one read.
+    var moved: Tree = .{ .in_d = false, .in_s = true, .move_after_first_stripe_read = false };
+    try testing.expectEqual(@as(?Found, 77), try locateName(Found, &moved, 2, 1, "n"));
+    try testing.expectEqual(@as(u32, 1), moved.reads);
+    // A name nowhere costs the stripe twice and D once.
+    try testing.expectEqual(@as(u32, 3), none.reads);
 }

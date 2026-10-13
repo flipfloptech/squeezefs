@@ -281,13 +281,23 @@ pub fn Stripes(comptime Fs: type) type {
 
         // ---- the routes ----
 
-        /// `lookup(D/name)`: the stripe first, then `D`'s own tree (LWW).
+        /// `lookup(D/name)`: the stripe first, then `D`'s own tree (LWW),
+        /// then the stripe again (a name moved between the two reads,
+        /// `stripe.locateName`).
         pub fn locate(self: *Self, map: *const StripeMap, name: []const u8) Error!?Fs.Found {
             stats.dir_stripe_routed_lookups.inc();
             const r = map.routeName(name, self.fs.store.nameKey());
-            if (try self.fs.findDentry(try Fs.localOf(r.stripe), name)) |f| return f;
-            return self.fs.findDentry(try Fs.localOf(map.dir), name);
+            const reader: DentryReader = .{ .fs = self.fs };
+            return stripe.locateName(Fs.Found, reader, r.stripe, map.dir, name);
         }
+
+        /// One directory's dentries by name, global inos in.
+        const DentryReader = struct {
+            fs: *Fs,
+            pub fn find(self: DentryReader, dir: u64, name: []const u8) Error!?Fs.Found {
+                return self.fs.findDentry(try Fs.localOf(dir), name);
+            }
+        };
 
         /// A NEW name's key parent: EEXIST over `D`'s own tree, the
         /// insert keys the stripe; a dying stripe (no record / nlink 0)

@@ -103,7 +103,7 @@ while :; do
     echo "$(date +%s) mount $dir: kmbuf ENOMEM (fragmented venue); compacting memory, retry $attempt/3" >> "$SET_DIR/mounts.log"
     # /proc/sys is read-only in the container venue: best effort, the
     # retry itself is the recovery.
-    sync; { echo 3 > /proc/sys/vm/drop_caches; echo 1 > /proc/sys/vm/compact_memory; } 2>/dev/null || true; sleep 2
+    sync -f "$SET_DIR"; { echo 3 > /proc/sys/vm/drop_caches; echo 1 > /proc/sys/vm/compact_memory; } 2>/dev/null || true; sleep 2
     continue
   fi
   # A stale writer claim whose holder is DEAD: the previous daemon of this

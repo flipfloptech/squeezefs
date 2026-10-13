@@ -170,7 +170,7 @@ suite_mount() {
     "$SQZ_BIN" mount --daemon --supervise --log-file "$log" -o "$SUITE_MOUNT_OPTS" "$@" "${SUITE_META[$tag]}" "$mnt" && break
     if [ "$attempt" -lt 3 ] && grep -q 'ENOMEM (order-8' "$log"; then
       suite_log "mount $tag: kmbuf ENOMEM (fragmented venue); compacting memory and retrying ($attempt/3)"
-      sync; { echo 3 > /proc/sys/vm/drop_caches; echo 1 > /proc/sys/vm/compact_memory; } 2>/dev/null || true; sleep 2
+      sync -f "${SUITE_SETDIR[$tag]}"; { echo 3 > /proc/sys/vm/drop_caches; echo 1 > /proc/sys/vm/compact_memory; } 2>/dev/null || true; sleep 2
       continue
     fi
     tail -40 "$log" >&2; suite_die "mount failed ($tag)"
@@ -264,7 +264,9 @@ suite_cleanup() {
   [ -z "$live" ] || suite_log "note: live squeezefs daemons not ours: $live"
   # The data volumes are the bulk: drop them, keep the logs and reports.
   if [ -n "${RESULTS:-}" ] && [ "${SUITE_KEEP_SET:-0}" != 1 ]; then rm -f "$RESULTS"/set-*/d?.img "$RESULTS"/set-*/meta.img; rm -rf "$RESULTS"/set-*/cache; fi
-  sync
+  # The run's own filesystem only: a host-wide sync waits on every FUSE
+  # mount on the venue, another run's frozen daemon included (0003 §Z).
+  if [ -n "${RESULTS:-}" ] && [ -d "$RESULTS" ]; then sync -f "$RESULTS"; fi
 }
 
 # Delete a clone's build artefacts once a suite run is over (`make clean`

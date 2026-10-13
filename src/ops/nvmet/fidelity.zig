@@ -909,7 +909,7 @@ fn mountLeg(transport: configfs.Trtype) !void {
     try testing.expectEqualStrings(pr_key, json_scan.string(rr, "holder_key").?);
     try testing.expectEqual(@as(?u64, 1), json_scan.number(rr, "regctl"));
     // 8 MiB written and synced; its checksum.
-    const sum = try rig.onMount(a, "head -c 8388608 /dev/urandom > payload && sync && cksum payload | cut -d' ' -f1");
+    const sum = try rig.onMount(a, "head -c 8388608 /dev/urandom > payload && sync -f . && cksum payload | cut -d' ' -f1");
     defer gpa.free(sum);
     // A second mount under a SECOND identity pair (its own connect of the
     // meta share): refused — the claim is fresh (the ladder's first rung).
@@ -1021,7 +1021,7 @@ fn daemonConnectLeg(transport: configfs.Trtype) !void {
     try testing.expect(std.mem.indexOf(u8, st, try std.fmt.bufPrint(&needle, "\"subnqn\":\"{s}\",\"instance\":", .{data_nqn})) != null);
     try testing.expect(std.mem.indexOf(u8, st, "\"reused\":false") != null);
     try testing.expectEqual(@as(u32, 1), try rig.controllersOf(data_nqn, ident_a));
-    const sum = try rig.onMount(a, "head -c 8388608 /dev/urandom > payload && sync && cksum payload | cut -d' ' -f1");
+    const sum = try rig.onMount(a, "head -c 8388608 /dev/urandom > payload && sync -f . && cksum payload | cut -d' ' -f1");
     defer gpa.free(sum);
     const during = try rig.controllerCensus();
     defer gpa.free(during);
@@ -1084,7 +1084,7 @@ test "nvmet fidelity: sigstop-preempt — a SIGSTOPped holder is preempted by a 
     const meta_uri = set.metaUri();
     const a = try rig.spawnMount("sa", meta_uri, null, &.{});
     try rig.awaitLog(a, "ready: ", ready_wait_ns);
-    const w0 = try rig.onMount(a, "echo before > f && sync");
+    const w0 = try rig.onMount(a, "echo before > f && sync -f .");
     gpa.free(w0);
     // Stop A: its claim ages past T_owner (45 s) and its beats stop.
     _ = linux.kill(rig.daemons.items[a].pid, .STOP);
@@ -1099,7 +1099,7 @@ test "nvmet fidelity: sigstop-preempt — a SIGSTOPped holder is preempted by a 
     const stb = try rig.stats(b);
     defer gpa.free(stb);
     try testing.expectEqual(@as(?u64, 1), json_scan.number(stb, "writer_guard_preempts"));
-    const wb = try rig.onMount(b, "echo after > g && sync && cat f");
+    const wb = try rig.onMount(b, "echo after > g && sync -f . && cat f");
     defer gpa.free(wb);
     try testing.expectEqualStrings("before\n", wb);
     // Resume A: its next beat finds a foreign holder — fenced; the latch
@@ -1110,7 +1110,7 @@ test "nvmet fidelity: sigstop-preempt — a SIGSTOPped holder is preempted by a 
     try testing.expectEqual(@as(?u64, 1), json_scan.number(sta, "writer_guard_fenced"));
     // The latch's verdict: FAILED by the fence class (`fenced`).
     try testing.expectEqualStrings("fenced", json_scan.string(sta, "writer_guard_verdict").?);
-    const wb2 = try rig.onMount(b, "echo again > h && sync && cat h");
+    const wb2 = try rig.onMount(b, "echo again > h && sync -f . && cat h");
     defer gpa.free(wb2);
     try testing.expectEqualStrings("again\n", wb2);
     // A's own writes are refused (EIO: the volume is FAILED).
@@ -1147,7 +1147,7 @@ test "nvmet fidelity: g2-restore-tcp — the PTPL lapse: the subsystem wiped by 
     const meta_uri = set.metaUri();
     const a = try rig.spawnMount("ga", meta_uri, null, &.{});
     try rig.awaitLog(a, "ready: ", ready_wait_ns);
-    const sum = try rig.onMount(a, "head -c 4194304 /dev/urandom > payload && sync && cksum payload | cut -d' ' -f1");
+    const sum = try rig.onMount(a, "head -c 4194304 /dev/urandom > payload && sync -f . && cksum payload | cut -d' ' -f1");
     defer gpa.free(sum);
     var rec = (try rig.ledgerRecord(meta_nqn)).?;
     defer rec.deinit(gpa);

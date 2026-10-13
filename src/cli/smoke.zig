@@ -6946,7 +6946,7 @@ test "smoke: FSCK AND SCRUB — format (a cache path) → fill (dirs, 200 packed
     // met the carved window's SET bit): the rung-8 dismount defect's
     // Linux pin.
     {
-        const out = try rig.onMount("mkdir -p d/e/f g && i=0; while [ $i -lt 20 ]; do dd if=\"$1/image\" of=d/e/small$i bs=64k skip=$i count=1 status=none; i=$((i + 1)); done; for n in 0 1 2; do dd if=\"$1/image\" of=big$n bs=1M skip=$((n * 20)) count=20 conv=fsync status=none; done; while [ $i -lt 200 ]; do dd if=\"$1/image\" of=d/e/small$i bs=64k skip=$i count=1 status=none; i=$((i + 1)); done; ln d/e/small1 g/link1; ln d/e/small2 g/link2; sync; echo filled");
+        const out = try rig.onMount("mkdir -p d/e/f g && i=0; while [ $i -lt 20 ]; do dd if=\"$1/image\" of=d/e/small$i bs=64k skip=$i count=1 status=none; i=$((i + 1)); done; for n in 0 1 2; do dd if=\"$1/image\" of=big$n bs=1M skip=$((n * 20)) count=20 conv=fsync status=none; done; while [ $i -lt 200 ]; do dd if=\"$1/image\" of=d/e/small$i bs=64k skip=$i count=1 status=none; i=$((i + 1)); done; ln d/e/small1 g/link1; ln d/e/small2 g/link2; sync -f .; echo filled");
         defer gpa.free(out);
         try testing.expect(std.mem.indexOf(u8, out, "filled") != null);
     }
@@ -7374,7 +7374,7 @@ test "smoke: THE JOBS MATRIX — format (1 MiB blocks, a cache path) → fill (p
     //    unlinked (every pack ≤ ¼ live), the compactor copies the live
     //    windows once into fewer blocks; the kept files stay byte-exact.
     {
-        const out = try rig.onMount("i=0; while [ $i -lt 80 ]; do if [ $((i % 4)) -ne 0 ]; then rm p/small$i; fi; i=$((i + 1)); done; sync; echo rm-ok");
+        const out = try rig.onMount("i=0; while [ $i -lt 80 ]; do if [ $((i % 4)) -ne 0 ]; then rm p/small$i; fi; i=$((i + 1)); done; sync -f .; echo rm-ok");
         defer gpa.free(out);
         // The unlinked files are corpses until the reclaim cadence destroys
         // them (≤ one watchdog tick, 5 s): the census names their tenants
@@ -8518,7 +8518,7 @@ test "smoke: THE REKEY ROW — format (1 MiB blocks, lz4 + aes-256-gcm, key A, a
     try rig.spawnMount(&.{});
     _ = try rig.awaitReady(0);
     {
-        const out = try rig.onMount("mkdir -p p && i=0; while [ $i -lt 40 ]; do dd if=\"$1/image\" of=p/small$i bs=64k skip=$i count=1 status=none; i=$((i + 1)); done; for n in 0 1 2; do dd if=\"$1/image\" of=big$n bs=1M skip=$((n * 20)) count=20 conv=fsync status=none; done; yes compressible-rotation-row | head -c 8388608 > zeroish && sync; echo filled");
+        const out = try rig.onMount("mkdir -p p && i=0; while [ $i -lt 40 ]; do dd if=\"$1/image\" of=p/small$i bs=64k skip=$i count=1 status=none; i=$((i + 1)); done; for n in 0 1 2; do dd if=\"$1/image\" of=big$n bs=1M skip=$((n * 20)) count=20 conv=fsync status=none; done; yes compressible-rotation-row | head -c 8388608 > zeroish && sync -f .; echo filled");
         defer gpa.free(out);
         try testing.expect(std.mem.indexOf(u8, out, "filled") != null);
     }

@@ -91,7 +91,7 @@ leg_umount() {
 # moment later) — bounded.
 settle() {
   local mnt=$1 i prev="" cur
-  sync -f "$mnt" 2>/dev/null || sync
+  sync -f "$mnt" || echo "settle: sync -f $mnt failed — the reclaim snapshot follows an unflushed mount" >&2
   for i in $(seq 1 25); do
     cur=$(python3 - "$mnt/.stats" <<'EOF'
 import json,sys

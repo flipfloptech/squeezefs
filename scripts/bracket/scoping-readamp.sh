@@ -21,6 +21,6 @@ for spec in "${ROWS[@]}"; do
   [ -n "$fopts" ] && args+=(--format-opts "$fopts")
   echo "=== $(date -u +%H:%M:%S) $row ${fopts:+(format $fopts)} ==="
   timeout 3000 "$HERE/bracket.sh" "${args[@]}" "$row" "$A" "$B" 2>&1 | grep -E "bracket\[|^\| [0-9]|read device|INVALID|verdict" || true
-  sync; fstrim -v /build > /dev/null 2>&1 || true
+  sync -f /build; fstrim -v /build > /dev/null 2>&1 || true
 done
 python3 "$HERE/brk.py" summary "$OUT"/*/

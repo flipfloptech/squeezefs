@@ -192,7 +192,7 @@ const Rig = struct {
         var it = std.mem.splitScalar(u8, text, '\n');
         var n: usize = 0;
         while (it.next()) |line| {
-            if (std.mem.startsWith(u8, line, "error(") or std.mem.startsWith(u8, line, "warn(") or std.mem.indexOf(u8, line, "TRIPWIRE") != null) {
+            if (std.mem.startsWith(u8, line, "error(") or std.mem.startsWith(u8, line, "warning(") or std.mem.indexOf(u8, line, "TRIPWIRE") != null) {
                 if (n == 0) std.debug.print("\n--- daemon alerts ---\n", .{});
                 std.debug.print("{s}\n", .{line[0..@min(line.len, 400)]});
                 n += 1;
@@ -521,13 +521,16 @@ const Rig = struct {
             std.debug.print("\n--- the daemon did not exit within {d} s; killing ---\n", .{exit_wait_ns / std.time.ns_per_s});
             _ = linux.kill(self.child_pid, .KILL);
         }
-        return c.wait(self.io);
+        const term = try c.wait(self.io);
+        if (!self.killed) printUncleanExit("A", term, self.readLog() catch null, self.gpa);
+        return term;
     }
 
     fn umount(self: *Rig) !void {
         const r = try self.squeezefs(&.{ "umount", self.mp });
         defer self.freeRun(r);
-        if (!r.term.success()) std.debug.print("\numount: {s}\n", .{r.stderr});
+        // An orderly unmount is silent; a fallback says why even at rc 0.
+        if (!r.term.success() or r.stderr.len != 0) std.debug.print("\numount ({f}): {s}\n", .{ r.term, r.stderr });
         try testing.expect(r.term.success());
     }
 
@@ -549,6 +552,19 @@ fn alive(pid: linux.pid_t) bool {
     const close = std.mem.lastIndexOfScalar(u8, text, ')') orelse return false;
     if (close + 2 >= text.len) return false;
     return text[close + 2] != 'Z' and text[close + 2] != 'X';
+}
+
+/// A daemon the test did not kill ended by a signal: the signal's name and
+/// the log's tail — a panic's trace starts no `error(` line and the log
+/// dies with the work dir, so this is the only record a failing row keeps
+/// (an `exit N` is a refusal the rows judge themselves). `log_text`
+/// (owned) is freed.
+fn printUncleanExit(name: []const u8, term: std.process.Child.Term, log_text: ?[]u8, gpa: std.mem.Allocator) void {
+    defer if (log_text) |t| gpa.free(t);
+    if (term == .exited) return;
+    const text = log_text orelse "";
+    const tail_bytes: usize = 6 << 10;
+    std.debug.print("\n--- daemon {s} ended {f}; its log's last {d} B ---\n{s}\n--- end of daemon {s}'s log ---\n", .{ name, term, @min(text.len, tail_bytes), text[text.len - @min(text.len, tail_bytes) ..], name });
 }
 
 fn sleepMs(ms: u64) void {
@@ -1403,7 +1419,7 @@ const Peer = struct {
         var it = std.mem.splitScalar(u8, text, '\n');
         var n: usize = 0;
         while (it.next()) |line| {
-            if (std.mem.startsWith(u8, line, "error(") or std.mem.startsWith(u8, line, "warn(") or std.mem.indexOf(u8, line, "TRIPWIRE") != null) {
+            if (std.mem.startsWith(u8, line, "error(") or std.mem.startsWith(u8, line, "warning(") or std.mem.indexOf(u8, line, "TRIPWIRE") != null) {
                 if (n == 0) std.debug.print("\n--- daemon {s} alerts ---\n", .{self.name});
                 std.debug.print("{s}\n", .{line[0..@min(line.len, 400)]});
                 n += 1;
@@ -1529,7 +1545,8 @@ const Peer = struct {
     fn umount(self: *Peer) !void {
         const r = try self.rig.squeezefs(&.{ "umount", self.mp });
         defer self.rig.freeRun(r);
-        if (!r.term.success()) std.debug.print("\numount {s}: {s}\n", .{ self.name, r.stderr });
+        // An orderly unmount is silent; a fallback says why even at rc 0.
+        if (!r.term.success() or r.stderr.len != 0) std.debug.print("\numount {s} ({f}): {s}\n", .{ self.name, r.term, r.stderr });
         try testing.expect(r.term.success());
     }
 
@@ -1543,14 +1560,7 @@ const Peer = struct {
             _ = linux.kill(self.pid, .KILL);
         }
         const term = try c.wait(self.rig.io);
-        // A death by signal this test did not send: the log's tail (a
-        // panic's trace starts no `error(` line) before the caller judges.
-        if (term == .signal and !self.killed) {
-            const text = self.readLog() catch null;
-            defer if (text) |t| self.rig.gpa.free(t);
-            const tail = if (text) |t| t[t.len -| 6000..] else "";
-            std.debug.print("\n--- daemon {s} exited by {f} at its unmount; its log's tail ---\n{s}\n", .{ self.name, term, tail });
-        }
+        if (!self.killed) printUncleanExit(self.name, term, self.readLog() catch null, self.rig.gpa);
         return term;
     }
 

@@ -236,20 +236,38 @@ pub const Volume = struct {
         /// Every leaf's tail (non-PR: every leaf, a non-resident one costs
         /// one extent read — the bytes answered; PR: the resident ones).
         leafTails: *const fn (ctx: *anyopaque, gpa: Allocator, slot: u16, pr_fenced: bool, out: *std.ArrayList(cr.TailEntry)) Error!u64,
-        /// The image extents the trees reach (the grant minus them).
-        treeImages: *const fn (ctx: *anyopaque, gpa: Allocator, slots: []const u16, out: *std.ArrayList(u64)) Error!void,
+        /// From the first root install to the table release (steps 4–7b;
+        /// decision 0003 §U.1): every image extent of `grant` an SMO on
+        /// this volume retires is HELD by the recovery — its bit set, never
+        /// parked in the coverage clock (`smo.RetireHold`) — installed
+        /// under the SMO lock, so no retirement slips past it.
+        holdRetirements: *const fn (ctx: *anyopaque, grant: []const GrantRun) Error!void,
+        /// The hold ends. `park` (7b, nothing rolls back from here): every
+        /// held extent parks in the coverage clock, gated on ring 0's head
+        /// — at or past its own free record, and never below a gate the
+        /// FIFO already took. A rollback drops the hold instead: the
+        /// extents stay allocated (the restored tree may reach them).
+        endRetirementHold: *const fn (ctx: *anyopaque, park: bool) void,
+        /// Every extent of `grant` the volume still holds, read in ONE SMO
+        /// lock window: the images ANY tree on the volume reaches (the
+        /// recovered slots' and every other — the record keeps naming
+        /// the images of a slot the dead appender released before dying),
+        /// and the hold's retirements. The record keeps none of them and
+        /// the census returns none of them.
+        keptExtents: *const fn (ctx: *anyopaque, gpa: Allocator, grant: []const GrantRun, out: *std.ArrayList(u64)) Error!void,
         returnExtents: *const fn (ctx: *anyopaque, extents: []const u64) Error!void,
         /// A released region's ring segments back to the heap (RAM bits
         /// + `free` deltas), AFTER its page went Free.
         freeRing: *const fn (ctx: *anyopaque, segments: []const page.Extent) Error!void,
-        /// The census of the grant's remainder no root reaches (every
+        /// The census of the grant's remainder outside `kept` (sorted:
+        /// `keptExtents`'s answer) — every
         /// extent read once, the node-seq handle floored above every stamp
         /// it carries), judged by CONTENT: `orphans` = the extents carrying
         /// an image `appender_id` wrote (fsck C13 for a dead appender);
         /// `unwritten` = the rest — extents the appender never drew on (a
         /// grant after its last page write, a RAM claim, a run past the
         /// page's cap). Both are the caller's to return.
-        orphanImages: *const fn (ctx: *anyopaque, gpa: Allocator, appender_id: u32, grant: []const GrantRun, reached: []const u64, orphans: *std.ArrayList(u64), unwritten: *std.ArrayList(u64)) Error!void,
+        orphanImages: *const fn (ctx: *anyopaque, gpa: Allocator, appender_id: u32, grant: []const GrantRun, kept: []const u64, orphans: *std.ArrayList(u64), unwritten: *std.ArrayList(u64)) Error!void,
         raiseSeqFloor: *const fn (ctx: *anyopaque, seq_floor: u64) void,
         ring0Head: *const fn (ctx: *anyopaque) u64,
         writerTerm: *const fn (ctx: *anyopaque) u64,
@@ -483,6 +501,13 @@ pub const Driver = struct {
         };
         var rollback: Rollback = .{ .driver = self, .plans = plans.items };
         errdefer rollback.run();
+        // The dead grant's retirements are the recovery's from the first
+        // install on: an SMO the volume runs on a recovered tree (the
+        // flush cycles' compactions, the checkpoint task's maintenance,
+        // the D4 arm) never hands a grant extent to the coverage clock
+        // behind the census's back.
+        try self.vol.vt.holdRetirements(self.vol.ctx, grant.items);
+        rollback.hold = true;
         for (plans.items) |*pl| {
             if (table.beginRelease(pl.slot, p.appender_id, true) == null) {
                 const v = table.view(pl.slot);
@@ -535,9 +560,12 @@ pub const Driver = struct {
         try self.fail(.tails);
         // ---- 7. tree 0: one entry per slot ----
         const t_tree0 = clock.monotonicNs();
-        var reached: std.ArrayList(u64) = .empty;
-        defer reached.deinit(gpa);
-        try self.vol.vt.treeImages(self.vol.ctx, gpa, slot_list.items, &reached);
+        // What the grant no longer owns: every tree's images and the
+        // hold's retirements, sorted for the census's probes.
+        var kept: std.ArrayList(u64) = .empty;
+        defer kept.deinit(gpa);
+        try self.vol.vt.keptExtents(self.vol.ctx, gpa, grant.items, &kept);
+        std.mem.sort(u64, kept.items, {}, std.sort.asc(u64));
         const quarantine_until: ?u64 = if (standing.early) custody.custodyQuarantineUntilNs(standing.ts_realtime_ns, self.mount.skew_max_ms * std.time.ns_per_ms) else null;
         var tails_buf: [TAILS_INLINE_MAX * cr.TailEntryWire.LEN + cr.SlotTailsHead.LEN]u8 = undefined;
         for (plans.items, 0..) |*pl, i| {
@@ -572,10 +600,10 @@ pub const Driver = struct {
             // The frame screen's rule 2 reads the tails just made durable.
             try table.recordTails(pl.slot, pl.g, tails);
         }
-        // The grant record minus the trees' images.
+        // The grant record minus what it no longer owns.
         var remaining: std.ArrayList(GrantRun) = .empty;
         defer remaining.deinit(gpa);
-        try subtractExtents(gpa, grant.items, reached.items, &remaining);
+        try subtractExtents(gpa, grant.items, kept.items, &remaining);
         var grant_buf: [GRANT_RUNS_INLINE_MAX * cr.GrantRunWire.LEN + cr.ExtentGrantHead.LEN]u8 = undefined;
         if (remaining.items.len > GRANT_RUNS_INLINE_MAX) return error.Corrupt;
         if (remaining.items.len == 0) {
@@ -603,13 +631,17 @@ pub const Driver = struct {
             }
         }
         rollback.disarm();
+        self.vol.vt.endRetirementHold(self.vol.ctx, true);
         self.vol.vt.notifyHandoverDone(self.vol.ctx);
         phase(.tree0, t_tree0);
         try self.fail(.table_release);
         // ---- 7c. the unclaimed grant and the orphans returned ----
+        // Every return is an extent the record step 7 wrote still names:
+        // the page's word is the appender's attestation at its last write,
+        // never proof the extent is still the grant's.
         var unclaimed: std.ArrayList(u64) = .empty;
         defer unclaimed.deinit(gpa);
-        try self.unclaimedOf(&p, window.items, &unclaimed);
+        try self.unclaimedOf(&p, window.items, remaining.items, &unclaimed);
         self.vol.vt.returnExtents(self.vol.ctx, unclaimed.items) catch |e| log.warn("recovery: {d} unclaimed extent(s) of appender {d} could not be returned ({s}) — the region release retries, fsck C13 reclaims", .{ unclaimed.items.len, p.appender_id, @errorName(e) });
         // The page's word is the appender's attestation of its unclaimed
         // pool AT ITS LAST WRITE; the record is the manager's attestation
@@ -623,7 +655,7 @@ pub const Driver = struct {
         defer orphans.deinit(gpa);
         var unwritten: std.ArrayList(u64) = .empty;
         defer unwritten.deinit(gpa);
-        try self.vol.vt.orphanImages(self.vol.ctx, gpa, p.appender_id, remaining.items, reached.items, &orphans, &unwritten);
+        try self.vol.vt.orphanImages(self.vol.ctx, gpa, p.appender_id, remaining.items, kept.items, &orphans, &unwritten);
         if (orphans.items.len != 0) {
             stats.dead_appender_orphans.add(orphans.items.len);
             try self.vol.vt.returnExtents(self.vol.ctx, orphans.items);
@@ -722,14 +754,17 @@ pub const Driver = struct {
         for (ordered.items) |r| try self.vol.vt.replay(self.vol.ctx, r, self.mount.stamps.stampFor(r.slot, table));
     }
 
-    /// The page's runs minus every extent the window's `alloc` records claimed.
-    fn unclaimedOf(self: *Driver, p: *const page.Page, window: []const WindowRecord, out: *std.ArrayList(u64)) Error!void {
+    /// The page's runs minus every extent the window's `alloc` records
+    /// claimed, within the record's `remaining` runs.
+    fn unclaimedOf(self: *Driver, p: *const page.Page, window: []const WindowRecord, remaining: []const GrantRun, out: *std.ArrayList(u64)) Error!void {
         for (p.grants.slice()) |run| {
             var e = run.start;
             while (e < run.start + run.len) : (e += 1) {
                 var claimed = false;
                 for (window) |r| claimed = claimed or (r.kind == .alloc and r.extent == e);
-                if (!claimed) try out.append(self.gpa, e);
+                var named = false;
+                for (remaining) |r| named = named or r.contains(e);
+                if (!claimed and named) try out.append(self.gpa, e);
             }
         }
     }
@@ -748,16 +783,13 @@ pub const GRANT_RUNS_INLINE_MAX: usize = 256;
 /// a region may lease (the rotor cap is 128).
 pub const ABSORBED_MAX: usize = 256;
 
-/// `grant − reached`, as normalized runs.
-fn subtractExtents(gpa: Allocator, grant: []const GrantRun, reached: []const u64, out: *std.ArrayList(GrantRun)) Allocator.Error!void {
+/// `grant − kept` (`kept` sorted ascending), as normalized runs.
+fn subtractExtents(gpa: Allocator, grant: []const GrantRun, kept: []const u64, out: *std.ArrayList(GrantRun)) Allocator.Error!void {
     for (grant) |run| {
         var start: ?u64 = null;
         var e = run.start;
         while (e <= run.end()) : (e += 1) {
-            var hit = e == run.end();
-            if (!hit) for (reached) |r| {
-                hit = hit or r == e;
-            };
+            const hit = e == run.end() or sortedContains(kept, e);
             if (hit) {
                 if (start) |s| {
                     try out.append(gpa, .{ .start = s, .len = @intCast(e - s) });
@@ -768,11 +800,23 @@ fn subtractExtents(gpa: Allocator, grant: []const GrantRun, reached: []const u64
     }
 }
 
+/// Whether the ascending `sorted` holds `e`.
+pub fn sortedContains(sorted: []const u64, e: u64) bool {
+    return std.sort.binarySearch(u64, sorted, e, struct {
+        fn order(ctx: u64, item: u64) std.math.Order {
+            return std.math.order(ctx, item);
+        }
+    }.order) != null;
+}
+
 /// §3.1: the RAII rollback's exact scope.
 const Rollback = struct {
     driver: *Driver,
     plans: []SlotPlan,
     armed: bool = true,
+    /// The retirement hold is installed (dropped, never parked, on a
+    /// rollback).
+    hold: bool = false,
 
     fn disarm(self: *Rollback) void {
         self.armed = false;
@@ -789,6 +833,9 @@ const Rollback = struct {
             // (4) the slot's RAM tree discarded and restored (or removed).
             self.driver.vol.vt.restoreTree(self.driver.vol.ctx, pl.slot, pl.prior);
         }
+        // The held retirements stay allocated: the restored tree may reach
+        // them, and the re-run's census judges them afresh.
+        if (self.hold) self.driver.vol.vt.endRetirementHold(self.driver.vol.ctx, false);
         // (5) the parked doors woken.
         self.driver.vol.vt.notifyHandoverDone(self.driver.vol.ctx);
     }
@@ -974,6 +1021,17 @@ const RamVolume = struct {
     handover_notifies: u32 = 0,
     /// Seam: the pointer's seq lies (the install must refuse).
     stale_pointer: bool = false,
+    /// Seam: the volume's own SMO on a recovered tree during the flush
+    /// cycles (the checkpoint task's maintenance, the D4 arm): `old`'s
+    /// image replaced by `new` (claimed from the volume's pool), `old`
+    /// retired.
+    smo_on_cycle: ?struct { slot: u16, old: u64, new: u64 } = null,
+    /// The coverage clock's parked retirements (the pending-free FIFO).
+    fifo: std.ArrayList(u64) = .empty,
+    /// The recovery's retirement hold: the grant's runs while installed,
+    /// and what it took.
+    hold: ?[]const GrantRun = null,
+    held: std.ArrayList(u64) = .empty,
 
     const Tree = struct {
         root: cr.Root,
@@ -1014,6 +1072,9 @@ const RamVolume = struct {
         self.grant_bits.deinit(self.gpa);
         self.stamped.deinit(self.gpa);
         self.returned.deinit(self.gpa);
+        self.fifo.deinit(self.gpa);
+        self.held.deinit(self.gpa);
+        if (self.hold) |h| self.gpa.free(h);
         self.quarantined.deinit(self.gpa);
         self.data_deltas.deinit(self.gpa);
         self.table.deinit();
@@ -1208,7 +1269,34 @@ const RamVolume = struct {
             t.dirty.clearRetainingCapacity();
             t.root.seq += 1;
         }
+        if (self.smo_on_cycle) |op| {
+            self.smo_on_cycle = null;
+            const t = self.trees.getPtr(op.slot) orelse return error.Corrupt;
+            const at = std.mem.indexOfScalar(u64, t.images.items, op.old) orelse return error.Corrupt;
+            t.images.items[at] = op.new;
+            self.retire(op.old) catch return error.OutOfMemory;
+        }
         return 1;
+    }
+    /// An SMO's retirement: the hold takes a dead grant's extent, the
+    /// coverage clock parks anything else.
+    fn retire(self: *RamVolume, extent: u64) Allocator.Error!void {
+        if (self.hold) |runs| for (runs) |r| if (r.contains(extent)) return self.held.append(self.gpa, extent);
+        try self.fifo.append(self.gpa, extent);
+    }
+    fn holdFn(ctx: *anyopaque, grant: []const GrantRun) Error!void {
+        const self = self_(ctx);
+        if (self.hold) |h| self.gpa.free(h);
+        self.hold = self.gpa.dupe(GrantRun, grant) catch return error.OutOfMemory;
+        self.held.clearRetainingCapacity();
+    }
+    fn endHoldFn(ctx: *anyopaque, park: bool) void {
+        const self = self_(ctx);
+        const runs = self.hold orelse return;
+        self.gpa.free(runs);
+        self.hold = null;
+        if (park) self.fifo.appendSlice(self.gpa, self.held.items) catch {};
+        self.held.clearRetainingCapacity();
     }
     fn flushedRootFn(ctx: *anyopaque, slot: u16) Error!FlushedRoot {
         const t = self_(ctx).trees.get(slot) orelse return error.Corrupt;
@@ -1226,9 +1314,14 @@ const RamVolume = struct {
         if (pr_fenced) out.clearRetainingCapacity();
         return bytes;
     }
-    fn treeImagesFn(_: *anyopaque, gpa: Allocator, _: []const u16, out: *std.ArrayList(u64)) Error!void {
+    fn keptFn(ctx: *anyopaque, gpa: Allocator, _: []const GrantRun, out: *std.ArrayList(u64)) Error!void {
+        const self = self_(ctx);
         // Every root tree 0 names reaches its images, leased or not.
-        for ([_]u16{ 10, 11 }) |s| out.appendSlice(gpa, deviceImages(s)) catch return error.OutOfMemory;
+        for ([_]u16{ 10, 11 }) |s| {
+            const imgs: []const u64 = if (self.trees.get(s)) |t| t.images.items else deviceImages(s);
+            out.appendSlice(gpa, imgs) catch return error.OutOfMemory;
+        }
+        out.appendSlice(gpa, self.held.items) catch return error.OutOfMemory;
     }
     fn returnExtentsFn(ctx: *anyopaque, extents: []const u64) Error!void {
         const self = self_(ctx);
@@ -1277,7 +1370,7 @@ const RamVolume = struct {
         self_(ctx).handover_notifies += 1;
     }
 
-    const vtable: Volume.VTable = .{ .vol = &volFn, .readPage = &readPageFn, .writePage = &writePageFn, .readRing = &readRingFn, .slotState = &slotStateFn, .leasedTo = &leasedToFn, .grantRecord = &grantRecordFn, .controlEntry = &controlEntryFn, .noteUnleased = &noteUnleasedFn, .table = &tableFn, .treeState = &treeStateFn, .installRoot = &installRootFn, .restoreTree = &restoreTreeFn, .replay = &replayFn, .replayDataDeltas = &replayDataFn, .cycleUntilClean = &cycleFn, .flushedRoot = &flushedRootFn, .leafTails = &leafTailsFn, .treeImages = &treeImagesFn, .returnExtents = &returnExtentsFn, .freeRing = &freeRingFn, .orphanImages = &orphanImagesFn, .raiseSeqFloor = &raiseFloorFn, .ring0Head = &ring0HeadFn, .writerTerm = &writerTermFn, .quarantineCustody = &quarantineFn, .notifyHandoverDone = &notifyFn };
+    const vtable: Volume.VTable = .{ .vol = &volFn, .readPage = &readPageFn, .writePage = &writePageFn, .readRing = &readRingFn, .slotState = &slotStateFn, .leasedTo = &leasedToFn, .grantRecord = &grantRecordFn, .controlEntry = &controlEntryFn, .noteUnleased = &noteUnleasedFn, .table = &tableFn, .treeState = &treeStateFn, .installRoot = &installRootFn, .restoreTree = &restoreTreeFn, .replay = &replayFn, .replayDataDeltas = &replayDataFn, .cycleUntilClean = &cycleFn, .flushedRoot = &flushedRootFn, .leafTails = &leafTailsFn, .holdRetirements = &holdFn, .endRetirementHold = &endHoldFn, .keptExtents = &keptFn, .returnExtents = &returnExtentsFn, .freeRing = &freeRingFn, .orphanImages = &orphanImagesFn, .raiseSeqFloor = &raiseFloorFn, .ring0Head = &ring0HeadFn, .writerTerm = &writerTermFn, .quarantineCustody = &quarantineFn, .notifyHandoverDone = &notifyFn };
 
     fn volume(self: *RamVolume) Volume {
         return .{ .ctx = self, .vt = &vtable };
@@ -1547,6 +1640,21 @@ test "an EARLY record quarantines the recovered slots' custody for T_owner + 2 �
     try f7.rv.window.append(gpa, .{ .slot = 10, .level = 0, .seq = 4101, .kind = .delete, .local_ino = 0, .home = true });
     try testing.expectEqual(Outcome.acted, f7.driver.recoverDead(f7.death()));
     try testing.expectEqual(kv0 + 1, stats.meta_kv_replay_key_violations.load());
+}
+
+test "the volume's own SMO retires a dead grant's image mid-recovery (found by the shared hot directory row: daemon A aborted in `alloc_core.freePending` recovering B): the extent leaves the grant by ONE path — never returned by the census, never named by the record, parked in the coverage clock exactly once" {
+    const gpa = testing.allocator;
+    const f = try Fixture.init(gpa, false);
+    defer f.deinit();
+    // Slot 10's image 101 (the dead grant's) is compacted into 120 (the
+    // volume's own pool) by the flush cycle.
+    f.rv.smo_on_cycle = .{ .slot = 10, .old = 101, .new = 120 };
+    try testing.expectEqual(Outcome.acted, f.driver.recoverDead(f.death()));
+    for (f.rv.returned.items) |e| try testing.expect(e != 101);
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u64, f.rv.fifo.items, &.{101}));
+    const g = cr.decodeExtentGrant(f.rv.get0(cr.extentGrantKey(2).slice()).?) catch unreachable;
+    var runs: [16]GrantRun = undefined;
+    for (g.collect(&runs)) |r| try testing.expect(!r.contains(101));
 }
 
 test "a release of recovered regions frees a Recovered page no lease names (identity and term kept) and leaves one a lease still names; the poll binding composes the hooks" {

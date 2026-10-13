@@ -96,6 +96,9 @@ pub const stats = struct {
     /// Pre-lock image barriers that failed: the SMO is abandoned whole
     /// (nothing published) and the failure counts on the FAILED latch.
     pub var meta_kv_smo_barrier_failures: counters.ShardedCounter = .{};
+    /// A dead grant's image extent retired twice under a recovery's hold
+    /// (must-stay-0: the held bit stays set, no tree can claim it back).
+    pub var meta_kv_retire_hold_breaches: counters.Tripwire = .init("meta_kv_retire_hold_breaches");
 };
 
 pub const Error = tree.Error || node_cache.FreezeError || node_cache.AppendError || journal.Error || error{
@@ -243,6 +246,80 @@ pub const Refusal = union(enum) {
     pending_free_full: struct { pending: u64 },
 };
 
+/// A dead appender's grant under recovery (charter §5.9 steps 4–7b;
+/// decision 0003 §U.1): every image extent of that grant an SMO on this
+/// volume retires while the hold is installed is HELD here — its bit stays
+/// set, it never enters the coverage clock — so the extent leaves the
+/// grant by ONE path: the recovery's tree-0 step names it gone from the
+/// record, then the table release parks it in the FIFO (`SmoContext.
+/// freePending` consults the hold first). A rollback drops the hold and
+/// the extents stay allocated: the restored tree may still reach them.
+/// Installed, read and removed under the volume's SMO lock — the FIFO's
+/// own producer law — so no retirement slips between a reading and a
+/// removal.
+pub const RetireHold = struct {
+    gpa: Allocator,
+    /// The grant's runs, sorted by start, disjoint.
+    runs: []const Run,
+    /// The held extents; capacity = the runs' total, reserved at `init`:
+    /// a held extent's bit stays set, so it is never claimed into a tree
+    /// again and is retired at most once — `take` never allocates (an SMO
+    /// allocates nothing after its swap).
+    held: std.ArrayList(u64),
+
+    pub const Run = struct { start: u64, len: u64 };
+
+    pub fn init(gpa: Allocator, runs: []const Run) Allocator.Error!RetireHold {
+        const owned = try gpa.dupe(Run, runs);
+        errdefer gpa.free(owned);
+        std.mem.sort(Run, owned, {}, struct {
+            fn lt(_: void, a: Run, b: Run) bool {
+                return a.start < b.start;
+            }
+        }.lt);
+        var total: usize = 0;
+        for (owned) |r| total += @intCast(r.len);
+        var held: std.ArrayList(u64) = .empty;
+        try held.ensureTotalCapacity(gpa, total);
+        return .{ .gpa = gpa, .runs = owned, .held = held };
+    }
+
+    pub fn deinit(self: *RetireHold) void {
+        self.held.deinit(self.gpa);
+        self.gpa.free(self.runs);
+        self.* = undefined;
+    }
+
+    pub fn covers(self: *const RetireHold, extent: u64) bool {
+        var lo: usize = 0;
+        var hi: usize = self.runs.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            const r = self.runs[mid];
+            if (extent < r.start) {
+                hi = mid;
+            } else if (extent >= r.start + r.len) {
+                lo = mid + 1;
+            } else return true;
+        }
+        return false;
+    }
+
+    /// The SMO's retirement of `extent`: held iff the grant covers it.
+    /// A grant extent retired twice is a protocol breach (the bit stayed
+    /// set, so no tree could have claimed it back): counted, and the
+    /// second retirement parks in the FIFO as any other would.
+    fn take(self: *RetireHold, extent: u64) bool {
+        if (!self.covers(extent)) return false;
+        if (std.mem.indexOfScalar(u64, self.held.items, extent) != null or self.held.items.len == self.held.capacity) {
+            stats.meta_kv_retire_hold_breaches.fire("a dead grant's image extent retired twice under the recovery's hold");
+            return false;
+        }
+        self.held.appendAssumeCapacity(extent);
+        return true;
+    }
+};
+
 /// The serialized SMO execution context: ONE per volume, passed `*` into
 /// every SMO entry point by the task that owns it.
 pub const SmoContext = struct {
@@ -265,6 +342,9 @@ pub const SmoContext = struct {
     /// claim is the manager dependency (`GrantExhausted`, EAGAIN-class,
     /// refilled over the wire), never the heap's `NoSpace`.
     grant_fed: bool = false,
+    /// A recovery's hold over a dead grant's retirements (`RetireHold`);
+    /// set and cleared under the SMO lock.
+    retire_hold: ?*RetireHold = null,
 
     pub fn init(alloc: *const alloc_ext.ExtentAllocator) SmoContext {
         return .{ .alloc = alloc };
@@ -326,8 +406,10 @@ pub const SmoContext = struct {
     /// unconditionally through the unbounded overflow (the §4.7 cycle-
     /// break); otherwise the pre-swap headroom check makes a refusal here
     /// unreachable on the serialized task (a second producer would be a
-    /// protocol bug, surfaced typed).
+    /// protocol bug, surfaced typed). A recovery's hold takes a dead
+    /// grant's extent first (`RetireHold`).
     pub fn freePending(self: *SmoContext, extent: u64, gate_seq: u64, forced: bool) Error!void {
+        if (self.retire_hold) |h| if (h.take(extent)) return;
         if (forced) return self.alloc.freePendingForced(extent, gate_seq);
         self.alloc.freePending(extent, gate_seq) catch {
             self.last_refusal = .{ .pending_free_full = .{ .pending = self.alloc.pendingCount() } };

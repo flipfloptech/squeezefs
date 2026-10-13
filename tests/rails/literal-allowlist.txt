@@ -389,9 +389,9 @@ src/meta/record.zig:1055 | 4 | OWED: derive it or document it on the line (chart
 src/meta/record.zig:1074 | 8 | OWED: derive it or document it on the line (charter §1.5)
 src/meta/record.zig:1114 | 16 | OWED: derive it or document it on the line (charter §1.5)
 src/meta/routing/migration_tee.zig:56 | 16 | OWED: derive it or document it on the line (charter §1.5)
-src/meta/smo.zig:1353 | 1024 | OWED: derive it or document it on the line (charter §1.5)
-src/meta/smo.zig:1630 | 7 | a percentage — OWED: derive it (charter §1.5) or document the measured reason
-src/meta/smo.zig:1630 | 8 | a percentage — OWED: derive it (charter §1.5) or document the measured reason
+src/meta/smo.zig:1435 | 1024 | OWED: derive it or document it on the line (charter §1.5)
+src/meta/smo.zig:1712 | 7 | a percentage — OWED: derive it (charter §1.5) or document the measured reason
+src/meta/smo.zig:1712 | 8 | a percentage — OWED: derive it (charter §1.5) or document the measured reason
 src/meta/superblock.zig:148 | 3 | OWED: derive it or document it on the line (charter §1.5)
 src/meta/superblock.zig:450 | 64 | OWED: derive it or document it on the line (charter §1.5)
 src/meta/sym/appender_dir.zig:24 | 8 | encoding offset/width of a fixed layout (the module's layout table; the comptime size asserts pin it)

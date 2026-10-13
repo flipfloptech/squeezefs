@@ -31,6 +31,7 @@ const Allocator = std.mem.Allocator;
 
 const counters = @import("../../../core/counters.zig");
 const clock = @import("../../../core/clock.zig");
+const knobs = @import("../../../core/knobs.zig");
 const log = @import("../../../core/log.zig");
 const checkpoint = @import("../../checkpoint.zig");
 const backend = @import("../../backend.zig");
@@ -51,6 +52,7 @@ const lt = @import("../slots/lease_table.zig");
 const slots_plane = @import("../slots/plane.zig");
 const tails_spill = @import("../slots/tails_spill.zig");
 const xv_set_bind = @import("../xv/set_bind.zig");
+const smo = @import("../../smo.zig");
 const block_alloc = @import("../../../data/block_alloc.zig");
 const data_bitmap = @import("../../../data/sym_planes/data_bitmap.zig");
 const records = @import("../../../data/sym_planes/records.zig");
@@ -75,6 +77,10 @@ pub const stats = struct {
     pub var recovery_data_bitmap_pages_written: counters.ShardedCounter = .{};
     /// Dead holders' allocation leases whose deltas a recovery folded.
     pub var recovery_data_bitmaps_replayed: counters.ShardedCounter = .{};
+    /// A dead grant's return whose cleared count differs from the extents
+    /// its record named (must-stay-0: nothing else writes a dead
+    /// appender's record) — nothing released, the leak direction.
+    pub var recovery_return_mismatches: counters.Tripwire = .init("recovery_return_mismatches");
 };
 
 /// One record of the dead ring's window as the replay resolves it: the
@@ -106,8 +112,21 @@ pub const VolumeBinding = struct {
     install_floor: u64 = 0,
     /// Slots whose tree this run adopted fresh (the rollback removes it).
     adopted: std.ArrayList(u16) = .empty,
+    /// The run's hold over the dead grant's retirements, installed on
+    /// the backend's SMO context (`holdRetirementsFn`).
+    retire_hold: ?smo.RetireHold = null,
     /// The RAM custody quarantine: slot → realtime-ns deadline.
     quarantines: std.AutoHashMapUnmanaged(u16, u64) = .empty,
+    /// `SQUEEZEFS_TEST_RECOVERY_HOLD`, read once here.
+    hold: Hold = .{},
+
+    /// The recovery's test hold: `park_after_flush` parks the run at the
+    /// end of step 6 until the harness sets `release`.
+    pub const Hold = struct {
+        at: enum { off, park_after_flush } = .off,
+        reached: std.Io.Event = .unset,
+        release: std.Io.Event = .unset,
+    };
 
     /// `census` = the home shard's owner (step 0's "listed LIVE again");
     /// `skew_max_ms` the shard's clock skew bound (the quarantine's term).
@@ -116,6 +135,7 @@ pub const VolumeBinding = struct {
         const self = try gpa.create(VolumeBinding);
         errdefer gpa.destroy(self);
         self.* = .{ .gpa = gpa, .be = be, .ledger = ledger, .driver = undefined, .poll = undefined };
+        if (std.mem.eql(u8, knobs.enumKnob("SQUEEZEFS_TEST_RECOVERY_HOLD", be.env), "park_after_flush")) self.hold.at = .park_after_flush;
         const identity: WriterIdentity = .{ .node_token = aset.identity.node_token, .mount_slot = aset.identity.mount_slot, .writer_id = aset.identity.writer_id };
         self.driver = .{
             .gpa = gpa,
@@ -169,6 +189,13 @@ pub const VolumeBinding = struct {
 
     fn set(self: *VolumeBinding) *bind.AppenderSet {
         return self.be.sym.?;
+    }
+
+    /// A region of THIS process (the manager's region 0, an in-process
+    /// joiner) — read under the SMO lock, the regions list's own.
+    fn ownsRegion(self: *VolumeBinding, appender_id: u32) bool {
+        for (self.set().regions.items) |r| if (r.appenderId() == appender_id) return true;
+        return false;
     }
 
     fn self_(ctx: *anyopaque) *VolumeBinding {
@@ -693,7 +720,13 @@ pub const VolumeBinding = struct {
             cycles += 1;
             var dirty = false;
             for (slots) |s| dirty = dirty or self.be.cache.slotHasDirty(self.forestSlotOf(s));
-            if (!dirty) return cycles;
+            if (!dirty) {
+                if (self.hold.at == .park_after_flush) {
+                    self.hold.reached.set(self.be.io);
+                    self.hold.release.waitUncancelable(self.be.io);
+                }
+                return cycles;
+            }
         }
         log.err("recovery: {d} cycles left a recovered slot tree dirty — refusing (a stuck tail is a defect)", .{cycles});
         return error.Corrupt;
@@ -781,36 +814,109 @@ pub const VolumeBinding = struct {
         return bytes;
     }
 
-    fn treeImagesFn(ctx: *anyopaque, gpa: Allocator, slots: []const u16, out: *std.ArrayList(u64)) Error!void {
+    // ---- the dead grant's retirements (decision 0003 §U.1) ----
+
+    fn holdRetirementsFn(ctx: *anyopaque, grant_runs: []const GrantRun) Error!void {
         const self = self_(ctx);
-        for (slots) |s| {
-            const t = self.be.slotTree(s) orelse continue;
-            try self.walkTree(gpa, t, .{ .extents = out });
+        const be = self.be;
+        const runs = try self.gpa.alloc(smo.RetireHold.Run, grant_runs.len);
+        defer self.gpa.free(runs);
+        for (grant_runs, runs) |g, *r| r.* = .{ .start = g.start, .len = g.len };
+        be.smo_lock.lockUncancelable(be.io);
+        defer be.smo_lock.unlock(be.io);
+        std.debug.assert(self.retire_hold == null and be.smo_ctx.retire_hold == null);
+        self.retire_hold = try smo.RetireHold.init(self.gpa, runs);
+        be.smo_ctx.retire_hold = &self.retire_hold.?;
+    }
+
+    /// `park`: every held extent into the coverage clock at ring 0's
+    /// reservation head — every gate the FIFO took so far is a position
+    /// below it, and so is every held extent's own free record.
+    fn endRetirementHoldFn(ctx: *anyopaque, park: bool) void {
+        const self = self_(ctx);
+        const be = self.be;
+        be.smo_lock.lockUncancelable(be.io);
+        defer be.smo_lock.unlock(be.io);
+        be.smo_ctx.retire_hold = null;
+        var hold = self.retire_hold orelse return;
+        self.retire_hold = null;
+        defer hold.deinit();
+        if (!park) return;
+        const gate = be.core.headPos();
+        for (hold.held.items) |e| be.alloc.freePendingForced(e, gate) catch {
+            log.warn("recovery: a retired image extent ({d}) of appender {d}'s grant could not park (out of memory) — it stays allocated; fsck C13 reclaims", .{ e, self.recovering_id });
+        };
+    }
+
+    /// Every extent of `grant_runs` the volume holds, in ONE SMO-lock
+    /// window (no SMO retires, claims or drains while it reads): the
+    /// images of every tree this process maintains — the recovered slots',
+    /// the unleased ones, its own regions', the control and native trees —
+    /// and the hold's. A live foreign lessee's tree is a projection here,
+    /// its nodes its lessee's to judge (its interior may name extents the
+    /// lessee retired long ago): never walked.
+    fn keptExtentsFn(ctx: *anyopaque, gpa: Allocator, grant_runs: []const GrantRun, out: *std.ArrayList(u64)) Error!void {
+        const self = self_(ctx);
+        const be = self.be;
+        be.smo_lock.lockUncancelable(be.io);
+        defer be.smo_lock.unlock(be.io);
+        var images: std.ArrayList(u64) = .empty;
+        defer images.deinit(gpa);
+        for (be.trees.load()) |t| {
+            // An empty slot owns no extent.
+            if (t.rootPtr().addr < be.sb.heap.start) continue;
+            if (t.forest_slot) |fs| if (fs != key.NATIVE_FOREST_SLOT) {
+                const v = be.slots.table.view(route_table.slotOfForestSlot(fs));
+                if (v.state != .unleased and v.state != .migrating and v.holder != self.recovering_id and !self.ownsRegion(v.holder)) continue;
+            };
+            try self.walkTree(gpa, t, .{ .extents = &images });
         }
+        for (images.items) |e| {
+            for (grant_runs) |r| if (r.contains(e)) {
+                try out.append(gpa, e);
+                break;
+            };
+        }
+        if (self.retire_hold) |*h| try out.appendSlice(gpa, h.held.items);
     }
 
     // ---- the returns ----
 
     /// Through the manager's own verb (the record minus the runs, one
     /// `free(retire 0)` delta per extent), then the RAM bits released: a
-    /// retire-0 free is immediately reusable (the leave's own order).
+    /// retire-0 free is immediately reusable (the leave's own order). Only
+    /// what the record names leaves it, and exactly those bits clear: an
+    /// extent the record does not name is not the dead grant's to give.
     fn returnExtentsFn(ctx: *anyopaque, extents: []const u64) Error!void {
         const self = self_(ctx);
         if (extents.len == 0) return;
         const gpa = self.gpa;
-        const sorted = try gpa.dupe(u64, extents);
-        defer gpa.free(sorted);
-        std.mem.sort(u64, sorted, {}, std.sort.asc(u64));
+        var grant_record: std.ArrayList(GrantRun) = .empty;
+        defer grant_record.deinit(gpa);
+        try grantRecordFn(ctx, gpa, self.recovering_id, &grant_record);
+        var named: std.ArrayList(u64) = .empty;
+        defer named.deinit(gpa);
+        for (extents) |e| {
+            for (grant_record.items) |r| if (r.contains(e)) {
+                try named.append(gpa, e);
+                break;
+            };
+        }
+        if (named.items.len == 0) return;
+        std.mem.sort(u64, named.items, {}, std.sort.asc(u64));
         var runs: std.ArrayList(GrantRun) = .empty;
         defer runs.deinit(gpa);
-        for (sorted) |e| {
+        for (named.items) |e| {
             if (runs.items.len > 0 and runs.items[runs.items.len - 1].end() == e) {
                 runs.items[runs.items.len - 1].len += 1;
             } else try runs.append(gpa, .{ .start = e, .len = 1 });
         }
         const out = self.set().manager.returnExtents(.{ .appender_id = self.recovering_id, .runs = runs.items }) catch |e| return mapVerb(e);
-        if (out.cleared == 0) return;
-        for (sorted) |e| if (self.be.alloc.isAllocated(e)) self.be.alloc.releaseUnpublished(e);
+        if (out.cleared != named.items.len) {
+            stats.recovery_return_mismatches.fire("a dead grant's return cleared other than the extents its record named");
+            return error.Corrupt;
+        }
+        for (named.items) |e| self.be.alloc.releaseUnpublished(e);
     }
 
     /// A released region's ring back to the heap (the leave's own order:
@@ -839,7 +945,7 @@ pub const VolumeBinding = struct {
     /// content: a residue the dead appender stamped is an orphan IMAGE;
     /// anything else it never wrote (a refill after its last page write, a
     /// RAM claim, a run past the page's four) is unclaimed.
-    fn orphanImagesFn(ctx: *anyopaque, gpa: Allocator, appender_id: u32, remaining: []const GrantRun, reached: []const u64, orphans: *std.ArrayList(u64), unwritten: *std.ArrayList(u64)) Error!void {
+    fn orphanImagesFn(ctx: *anyopaque, gpa: Allocator, appender_id: u32, remaining: []const GrantRun, kept: []const u64, orphans: *std.ArrayList(u64), unwritten: *std.ArrayList(u64)) Error!void {
         const self = self_(ctx);
         const be = self.be;
         var bitmap_extents: std.ArrayList(u64) = .empty;
@@ -849,8 +955,7 @@ pub const VolumeBinding = struct {
             var e = run.start;
             while (e < run.end()) : (e += 1) {
                 if (!be.alloc.isAllocated(e)) continue;
-                var hit = false;
-                for (reached) |r| hit = hit or r == e;
+                var hit = recovery.sortedContains(kept, e);
                 for (bitmap_extents.items) |b| hit = hit or b == e;
                 if (hit) continue;
                 const img = be.dev.readRange(gpa, be.cache.extentAddr(e), @intCast(be.sb.node_size)) catch |err| return switch (err) {
@@ -950,7 +1055,9 @@ pub const VolumeBinding = struct {
         .cycleUntilClean = &cycleUntilCleanFn,
         .flushedRoot = &flushedRootFn,
         .leafTails = &leafTailsFn,
-        .treeImages = &treeImagesFn,
+        .holdRetirements = &holdRetirementsFn,
+        .endRetirementHold = &endRetirementHoldFn,
+        .keptExtents = &keptExtentsFn,
         .returnExtents = &returnExtentsFn,
         .freeRing = &freeRingFn,
         .orphanImages = &orphanImagesFn,
@@ -1674,4 +1781,149 @@ test "linux: the data-bitmap deltas of a dead holder's allocation lease homed he
     // The lease still names the holder: the region stays Recovered.
     live.plane.tick();
     try testing.expectEqual(page.State.recovered, (try be.sym.?.manager.readPageOf(1)).?.state);
+}
+
+// ---- the recovery against the manager's own SMOs (rung 10 recovery item 1) ----
+
+/// Every extent's bit and the free budget agree: `free = total − set bits`
+/// (a pending-free extent keeps its bit and is not credited) — read under
+/// the SMO lock, so no cycle claims or drains between the two reads.
+fn expectBudgetConserved(be: *KvBackend) !void {
+    const gpa = testing.allocator;
+    be.smo_lock.lockUncancelable(be.io);
+    defer be.smo_lock.unlock(be.io);
+    const core = &be.alloc.core;
+    const words = try gpa.alloc(u64, core.wordCount());
+    defer gpa.free(words);
+    core.snapshotWords(words);
+    var set: u64 = 0;
+    for (words) |w| set += @popCount(w);
+    try testing.expectEqual(core.total - set, be.alloc.freeExtents());
+}
+
+/// A wire joiner B (a second `MetaSet` joined over loopback TCP) writes
+/// into its one rotor slot — the tree minted on its first touch in ITS
+/// grant — cycles, writes a window more, and dies (the image copied at
+/// `kill` with its page Live). Answers B's identity, appender id, slot.
+const WireDead = struct { identity: WriterIdentity, appender_id: u32, slot: u16 };
+
+fn killWireJoiner(s: *meta_set.TestSet, kill: []const u8, keys: *std.ArrayList([]const u8)) !WireDead {
+    const gpa = testing.allocator;
+    const set = try s.open();
+    defer set.close();
+    var locks = try dlm.Manager.init(gpa, 64);
+    defer locks.deinit();
+    const bound = try xv.set_bind.Bound.create(gpa, s.io(), set, &locks, &s.env);
+    defer bound.destroy(gpa);
+    const plane = (try wire_plane.WirePlane.start(gpa, s.io(), set, &s.env, 4, 1 << 30, &bound.plane, false)).?;
+    defer plane.stop();
+    const be0 = set.volumes[0];
+    const b = try meta_set.MetaSet.open(gpa, s.io(), s.pathList(), .{ .env = &s.env, .cache_budget_bytes = 64 << 20, .cpus = 4, .join = .{ .mountpoint = "/build/tmp/mnt-recover-smo-b", .endpoint = plane.advertised } });
+    defer b.close();
+    const bj = b.volumes[0];
+    try testing.expectEqual(backend.Posture.joined, bj.posture);
+    const me = bj.joined.?.appenderId();
+    var held: std.ArrayList(u16) = .empty;
+    defer held.deinit(gpa);
+    try bj.slots.table.heldBy(me, &held);
+    try testing.expectEqual(@as(usize, 1), held.items.len);
+    const slot = held.items[0];
+    for (0..16) |i| {
+        if (i == 12) try bj.checkpointNow();
+        const local = try bj.allocateInoInSlot(slot);
+        const k = try gpa.dupe(u8, &key.inodeKey(key.guestLocalIno(slot, local)));
+        try keys.append(gpa, k);
+        const t = try bj.begin(@src());
+        try t.stagePut(key.TREE_INODES, k, &iv_value);
+        try bj.commit(t);
+    }
+    try bj.fsync();
+    try be0.checkpointNow();
+    try be0.fsync();
+    try snapshotImage(s.paths[0], kill);
+    const id = bj.joined.?.identity;
+    return .{ .identity = .{ .node_token = id.node_token, .mount_slot = id.mount_slot, .writer_id = id.writer_id }, .appender_id = me, .slot = slot };
+}
+
+test "linux: THE RECOVERY'S CENSUS AGAINST THE MANAGER'S OWN SMO — a dead wire joiner's slot tree has its root image in the joiner's grant; the recovery parks after its flush (SQUEEZEFS_TEST_RECOVERY_HOLD) while the manager's D4 compaction retires that image; the recovery completes and the retired extent leaves the grant by ONE path: never returned by the census (no orphan), allocated until the coverage clock covers its free, then free — the budget conserved (red: the census judged it an orphan and released it while the pending-free FIFO still held it, the shared hot directory row's `alloc_core.freePending` abort)" {
+    const gpa = testing.allocator;
+    const s = try meta_set.TestSet.create(gpa, "recover-smo", 1);
+    defer s.destroy();
+    try s.env.put("SQUEEZEFS_MW_BIND", "127.0.0.1:0");
+    try s.env.put("SQUEEZEFS_SYM_MINT_SLOTS", "1");
+    var kill_buf: [160]u8 = undefined;
+    const kill = try std.fmt.bufPrint(&kill_buf, "{s}.kill", .{s.paths[0]});
+    defer unlinkPath(kill);
+    var keys: std.ArrayList([]const u8) = .empty;
+    defer freeKeys(&keys);
+    const dead = try killWireJoiner(s, kill, &keys);
+    try s.env.put("SQUEEZEFS_TEST_RECOVERY_HOLD", "park_after_flush");
+    var live = try Live.open(s, kill);
+    defer live.close();
+    const be = live.set.volumes[0];
+    const binding = live.binding();
+    try testing.expect(be.sym.?.isUnrecovered(dead.appender_id));
+    // The precondition: the dead slot's root image — the page's entry, the
+    // root the recovery installs — lives in B's grant.
+    var grant_runs: std.ArrayList(GrantRun) = .empty;
+    defer grant_runs.deinit(gpa);
+    try VolumeBinding.grantRecordFn(binding, gpa, dead.appender_id, &grant_runs);
+    const dead_page = (try be.sym.?.manager.readPageOf(dead.appender_id)).?;
+    var root_addr: u64 = 0;
+    for (dead_page.slotEntries()) |e| if (e.slot == dead.slot) {
+        root_addr = e.root_addr;
+    };
+    try testing.expect(root_addr >= be.sb.heap.start);
+    const x = be.cache.addrExtent(root_addr);
+    var in_grant = false;
+    for (grant_runs.items) |r| in_grant = in_grant or r.contains(x);
+    try testing.expect(in_grant);
+    const recoveries0 = recovery.stats.appender_recoveries.load();
+    const orphans0 = recovery.stats.dead_appender_orphans.load();
+    live.recordDeath(dead.identity, false);
+    const Ticker = struct {
+        fn run(l: *Live) void {
+            l.plane.tick();
+        }
+    };
+    const th = try std.Thread.spawn(.{}, Ticker.run, .{&live});
+    var joined = false;
+    defer if (!joined) {
+        binding.hold.release.set(be.io);
+        th.join();
+    };
+    binding.hold.reached.waitUncancelable(be.io);
+    // The manager's own SMO on the recovered tree mid-recovery: the D4 arm
+    // compacts its root leaf into a fresh image from the manager's pool.
+    const t = be.slotTree(dead.slot).?;
+    try testing.expectEqual(x, be.cache.addrExtent(t.rootPtr().addr));
+    {
+        be.smo_lock.lockUncancelable(be.io);
+        defer be.smo_lock.unlock(be.io);
+        const n = try t.getNode(t.rootPtr().addr);
+        defer n.release();
+        var out: smo.MaintenanceOutcome = .{};
+        try testing.expect(try smo.compactForDefrag(t, &be.smo_ctx, n, &out));
+    }
+    try testing.expect(be.cache.addrExtent(t.rootPtr().addr) != x);
+    binding.hold.release.set(be.io);
+    th.join();
+    joined = true;
+    try testing.expectEqual(recoveries0 + 1, recovery.stats.appender_recoveries.load());
+    try expectAllPresent(live.set, keys.items);
+    // The retired image is no orphan of the dead grant: the coverage clock
+    // holds it, its bit set until a durable tail covers its free.
+    try testing.expectEqual(orphans0, recovery.stats.dead_appender_orphans.load());
+    try testing.expect(be.alloc.isAllocated(x));
+    try expectBudgetConserved(be);
+    // The grant record no longer names it.
+    grant_runs.clearRetainingCapacity();
+    try VolumeBinding.grantRecordFn(binding, gpa, dead.appender_id, &grant_runs);
+    for (grant_runs.items) |r| try testing.expect(!r.contains(x));
+    // Covered: free exactly once, the budget conserved.
+    try be.checkpointNow();
+    try be.checkpointNow();
+    try testing.expect(!be.alloc.isAllocated(x));
+    try expectBudgetConserved(be);
+    try expectAllPresent(live.set, keys.items);
 }

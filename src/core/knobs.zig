@@ -348,6 +348,7 @@ pub const registry = [_]Knob{
 
     // ---- membership, the death ledger and recovery: the venue legs' seam (read ONCE at the shard's arm by meta/sym/membership/shard.zig; never a process static) ----
     .{ .key = "SQUEEZEFS_TEST_MEMBERSHIP_T_OWNER_MS", .kind = .{ .int = .{ .lo = 1000, .hi = MS_MAX } }, .default = "derived", .class = .test_seam, .doc = "Test seam: the membership lease's T_owner in ms instead of the ONE staleness TTL (45,000 ms), so the two-daemon legs (kill -9 a joiner ⇒ the home shard evicts ⇒ RecordDeath ⇒ recovery ⇒ its slots Unleased; a dead manager ⇒ park-and-reclaim) complete inside a test's budget. Every derived clock (skew_max, T_self, renew, grace, the retirement at 2 × T_owner, the custody quarantine) follows it; absent = the constant." },
+    .{ .key = "SQUEEZEFS_TEST_RECOVERY_HOLD", .kind = .{ .enumeration = .{ .allowed = &.{ "off", "park_after_flush" } } }, .default = "off", .class = .test_seam, .doc = "Test seam: a dead appender's recovery parks after its flush cycles (§5.9 step 6: the recovered slot trees installed, replayed and clean; tree 0 still Leased) until the harness releases it — the window in which the manager's own SMOs (the checkpoint task's maintenance, the D4 arm) retire images of the dead grant before its census runs. Read once at the volume binding's create (meta/sym/membership/volume_bind.zig); `off` = no hold." },
 };
 
 pub fn lookup(key: []const u8) ?*const Knob {

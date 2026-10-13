@@ -76,9 +76,18 @@ pub const stats = struct {
     /// `staging_generation_discards`: a ring bound to a dead identity was
     /// wiped at bind.
     pub var staging_generation_discards: counters.ShardedCounter = .{};
-    /// `staging_foreign_scope_refusals`: a PEER mount's live custody of the
-    /// ring refused ours.
+    /// `staging_foreign_scope_refusals`: a root whose marker names ANOTHER
+    /// member (its owner dead) refused ours — never adopted, never wiped
+    /// (0003 §T.1).
     pub var staging_foreign_scope_refusals: counters.ShardedCounter = .{};
+    /// `staging_owner_live_refusals`: a root whose live claim another
+    /// process holds refused ours — two mounts presenting one member scope.
+    pub var staging_owner_live_refusals: counters.ShardedCounter = .{};
+    /// `staging_member_residue_roots`: other members' roots under this
+    /// mount's cache path with no live owner and ring bytes on disk at its
+    /// bind — residue only that member's successor recovers (reported loud,
+    /// never touched).
+    pub var staging_member_residue_roots: counters.Gauge = .{};
     /// `staged_payload_lost_reads`: zeros served for an unreachable staged
     /// payload (another client's live custody, or a crash discarded it).
     /// 0 on any client of a cleanly unmounted set (gate G-PK2).
@@ -108,7 +117,7 @@ pub const stats = struct {
 };
 
 pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
-    try w.print("{{\"current_staged_write_bytes\":{d},\"staged_writes_in_flight\":{d},\"staging_cell_state_bytes\":{d},\"staging_tables_bytes\":{d},\"staging_over_cap_refusals\":{d},\"staging_ring_full_refusals\":{d},\"staging_pressure_kicks\":{d},\"staging_recovery_records\":{d},\"staging_recovery_torn_records\":{d},\"staging_generation_discards\":{d},\"staging_foreign_scope_refusals\":{d},\"staged_payload_lost_reads\":{d},\"dismount_promoted_files\":{d},\"dismount_promoted_bytes\":{d},\"dismount_promote_failures\":{d},\"fsync_promoted_files\":{d},\"staging_appends\":{d},\"staging_append_bytes\":{d},\"staging_restages\":{d},\"staging_restage_bytes\":{d}}}", .{
+    try w.print("{{\"current_staged_write_bytes\":{d},\"staged_writes_in_flight\":{d},\"staging_cell_state_bytes\":{d},\"staging_tables_bytes\":{d},\"staging_over_cap_refusals\":{d},\"staging_ring_full_refusals\":{d},\"staging_pressure_kicks\":{d},\"staging_recovery_records\":{d},\"staging_recovery_torn_records\":{d},\"staging_generation_discards\":{d},\"staging_foreign_scope_refusals\":{d},\"staging_owner_live_refusals\":{d},\"staging_member_residue_roots\":{d},\"staged_payload_lost_reads\":{d},\"dismount_promoted_files\":{d},\"dismount_promoted_bytes\":{d},\"dismount_promote_failures\":{d},\"fsync_promoted_files\":{d},\"staging_appends\":{d},\"staging_append_bytes\":{d},\"staging_restages\":{d},\"staging_restage_bytes\":{d}}}", .{
         stats.current_staged_write_bytes.load(),
         stats.staged_writes_in_flight.load(),
         stats.staging_cell_state_bytes.load(),
@@ -120,6 +129,8 @@ pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
         stats.staging_recovery_torn_records.load(),
         stats.staging_generation_discards.load(),
         stats.staging_foreign_scope_refusals.load(),
+        stats.staging_owner_live_refusals.load(),
+        stats.staging_member_residue_roots.load(),
         stats.staged_payload_lost_reads.load(),
         stats.dismount_promoted_files.load(),
         stats.dismount_promoted_bytes.load(),
@@ -1290,15 +1301,17 @@ pub fn resolveStagedRead(pool: *Pool, seg: *Segment, key: StagingKey, offset: u6
 // ---------------------------------------------------------------------------
 
 pub const MARKER_MAGIC = "SQZM".*;
-/// v2: the v1 marker under sqzhash128's low 64 bits (0003 §M); a v1 marker
-/// is Corrupt to this binary and the ring is wiped loud.
-pub const MARKER_VERSION: u16 = 2;
+/// v3: the v2 marker (sqzhash128's low 64 bits, 0003 §M) naming its OWNER —
+/// the member's appender id and the incarnation's pid beside the `(node,
+/// mount slot)` pair (0003 §T.1); a v1/v2 marker is Corrupt to this binary
+/// and its ring is wiped loud.
+pub const MARKER_VERSION: u16 = 3;
 /// The marker names the previous set epoch too (an `add-meta` rebind in
 /// flight).
 pub const MARKER_FLAG_DUAL: u16 = 1 << 0;
 const MARKER_FLAGS_KNOWN: u16 = MARKER_FLAG_DUAL;
 
-/// 72 B, checksummed; compared as BYTES.
+/// 80 B, checksummed; compared as BYTES.
 pub const StagingMarkerWire = extern struct {
     magic: [4]u8,
     version_le: [2]u8,
@@ -1310,6 +1323,8 @@ pub const StagingMarkerWire = extern struct {
     content_version_le: [4]u8,
     identity_le: [8]u8,
     prev_set_epoch_le: [8]u8,
+    appender_id_le: [4]u8,
+    owner_pid_le: [4]u8,
     csum_le: [8]u8,
 };
 
@@ -1317,8 +1332,8 @@ pub const MARKER_LEN: usize = @sizeOf(StagingMarkerWire);
 const MARKER_CHECKSUM_OFF: usize = @offsetOf(StagingMarkerWire, "csum_le");
 
 comptime {
-    assert(MARKER_LEN == 72);
-    assert(MARKER_CHECKSUM_OFF == 64);
+    assert(MARKER_LEN == 80);
+    assert(MARKER_CHECKSUM_OFF == 72);
 }
 
 /// The ring's identity: `hash64(set_uuid ‖ "staging")`. WHY: a ring binds to
@@ -1341,8 +1356,14 @@ pub const MarkerError = error{Corrupt};
 pub const Marker = struct {
     set_uuid: [16]u8,
     set_epoch: u64,
+    /// The owner (0003 §T.1): the member's `(node, mount slot)` — the mount
+    /// slot IS the member scope (the root's directory name); the node token
+    /// names the incarnation's boot — its appender id and the pid of the
+    /// incarnation that stamped it (the refusal names them).
     node_token: u64,
     mount_slot: u32,
+    appender_id: u32 = 0,
+    owner_pid: u32 = 0,
     content_version: u32 = 1,
     /// Present iff dual: the epoch this ring was bound to before a rebind.
     prev_set_epoch: ?u64 = null,
@@ -1363,6 +1384,8 @@ pub const Marker = struct {
             .content_version_le = undefined,
             .identity_le = undefined,
             .prev_set_epoch_le = undefined,
+            .appender_id_le = undefined,
+            .owner_pid_le = undefined,
             .csum_le = @splat(0),
         };
         std.mem.writeInt(u16, &w.version_le, MARKER_VERSION, .little);
@@ -1373,6 +1396,8 @@ pub const Marker = struct {
         std.mem.writeInt(u32, &w.content_version_le, self.content_version, .little);
         std.mem.writeInt(u64, &w.identity_le, self.identity(), .little);
         std.mem.writeInt(u64, &w.prev_set_epoch_le, self.prev_set_epoch orelse 0, .little);
+        std.mem.writeInt(u32, &w.appender_id_le, self.appender_id, .little);
+        std.mem.writeInt(u32, &w.owner_pid_le, self.owner_pid, .little);
         var bytes = std.mem.toBytes(w);
         checksum.stamp(&bytes, MARKER_CHECKSUM_OFF);
         return bytes;
@@ -1394,6 +1419,8 @@ pub const Marker = struct {
             .set_epoch = std.mem.readInt(u64, &w.set_epoch_le, .little),
             .node_token = std.mem.readInt(u64, &w.node_token_le, .little),
             .mount_slot = std.mem.readInt(u32, &w.mount_slot_le, .little),
+            .appender_id = std.mem.readInt(u32, &w.appender_id_le, .little),
+            .owner_pid = std.mem.readInt(u32, &w.owner_pid_le, .little),
             .content_version = std.mem.readInt(u32, &w.content_version_le, .little),
             .prev_set_epoch = if (flags & MARKER_FLAG_DUAL != 0) std.mem.readInt(u64, &w.prev_set_epoch_le, .little) else null,
         };
@@ -1403,31 +1430,38 @@ pub const Marker = struct {
     }
 };
 
-/// What a bind found.
+/// What a bind found under the claim (0003 §T.1: the root's live claim is
+/// held before its marker is read, so nothing here is a live owner's).
 pub const BindVerdict = enum {
-    /// No marker: a fresh dir — stamp ours.
+    /// No marker: a fresh root — stamp ours.
     absent,
-    /// Our set, our epoch (or a dual marker naming it), our scope: keep.
+    /// Our set, our epoch (or a dual marker naming it), our member: adopt
+    /// the ring (a predecessor incarnation's residue is ours to recover)
+    /// and restamp the owner.
     match,
-    /// Our set and scope, an unscoped or older-epoch marker: adopt and
-    /// restamp (the upgrade path).
+    /// Our set and member under an older epoch, or a dual marker: adopt and
+    /// restamp canonical (the KD-8 rebind path).
     upgrade,
-    /// Another mount's live scope on the same set: REFUSE the mount loud.
-    foreign_scope,
-    /// Another set, or an unreadable marker: wipe both segment trees and
-    /// restamp.
+    /// Our set, ANOTHER member's root (its owner dead — the claim proved
+    /// it): REFUSE the mount loud; never adopted, never wiped — its
+    /// residue is that member's successor's.
+    foreign_owner,
+    /// Another set, a newer epoch than ours, or an unreadable marker: wipe
+    /// the segment tree and restamp.
     dead,
 };
 
-/// §3.1 `bind_staging_generation`'s ladder as a pure verdict.
-pub fn bindVerdict(found: ?Marker, ours: Marker, peer_live: bool) BindVerdict {
+/// §3.1 `bind_staging_generation`'s ladder as a pure verdict, member-scoped
+/// (0003 §T.1): the member is the mount slot (the root's name); a different
+/// node token under the same slot is that member's next incarnation — a
+/// reboot's successor — never a peer.
+pub fn bindVerdict(found: ?Marker, ours: Marker) BindVerdict {
     const f = found orelse return .absent;
     if (f.identity() != ours.identity()) return .dead;
     const same_epoch = f.set_epoch == ours.set_epoch or (f.prev_set_epoch != null and f.prev_set_epoch.? == ours.set_epoch);
     if (!same_epoch and f.set_epoch > ours.set_epoch) return .dead;
-    const same_scope = f.node_token == ours.node_token and f.mount_slot == ours.mount_slot;
-    if (!same_scope and f.node_token != 0 and peer_live) return .foreign_scope;
-    if (same_epoch and same_scope and f.prev_set_epoch == null) return .match;
+    if (f.mount_slot != ours.mount_slot) return .foreign_owner;
+    if (same_epoch and f.prev_set_epoch == null) return .match;
     return .upgrade;
 }
 
@@ -1574,6 +1608,12 @@ pub const Ring = if (builtin.os.tag == .linux) struct {
             return .{ .ctx = self, .sync = sync, .reclaim = reclaim, .nextData = nextData };
         }
 
+        /// The census face of an `inspectSegment` view: hole-skipping
+        /// only — no flush, no punch (the file is another member's).
+        pub fn inspectBacking(self: *MappedSegment) Backing {
+            return .{ .ctx = self, .nextData = nextData };
+        }
+
         pub fn close(self: *MappedSegment) void {
             _ = linux.munmap(self.map.ptr, self.map.len);
             _ = linux.close(self.fd);
@@ -1581,7 +1621,7 @@ pub const Ring = if (builtin.os.tag == .linux) struct {
         }
     };
 
-    fn zPath(buf: *[linux.PATH_MAX]u8, path: []const u8) Error![:0]const u8 {
+    fn zPath(buf: *[linux.PATH_MAX]u8, path: []const u8) error{NameTooLong}![:0]const u8 {
         if (path.len >= buf.len) return error.NameTooLong;
         @memcpy(buf[0..path.len], path);
         buf[path.len] = 0;
@@ -1638,6 +1678,31 @@ pub const Ring = if (builtin.os.tag == .linux) struct {
         return .{ .fd = fd, .map = ptr[0..@intCast(len)] };
     }
 
+    /// A PRIVATE read-only view of `staging_segment/<name>` (`O_RDONLY`,
+    /// `MAP_PRIVATE`): a recovery scan over it (the `staging list` census)
+    /// tombstones superseded copies in its own pages only — never a byte of
+    /// the member's file. Null when absent or empty.
+    pub fn inspectSegment(root_fd: linux.fd_t, name: [:0]const u8) ?MappedSegment {
+        const dir = linux.openat(root_fd, SEGMENT_DIR, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .NOFOLLOW = true, .CLOEXEC = true }, 0);
+        if (linux.errno(dir) != .SUCCESS) return null;
+        defer _ = linux.close(@intCast(dir));
+        const rc = linux.openat(@intCast(dir), name, .{ .ACCMODE = .RDONLY, .NOFOLLOW = true, .CLOEXEC = true }, 0);
+        if (linux.errno(rc) != .SUCCESS) return null;
+        const fd: linux.fd_t = @intCast(rc);
+        var st: linux.Statx = undefined;
+        if (linux.errno(linux.statx(fd, "", linux.AT.EMPTY_PATH, .{ .SIZE = true }, &st)) != .SUCCESS or st.size == 0) {
+            _ = linux.close(fd);
+            return null;
+        }
+        const m = linux.mmap(null, @intCast(st.size), .{ .READ = true, .WRITE = true }, .{ .TYPE = .PRIVATE }, fd, 0);
+        if (linux.errno(m) != .SUCCESS) {
+            _ = linux.close(fd);
+            return null;
+        }
+        const ptr: [*]align(4096) u8 = @ptrFromInt(m);
+        return .{ .fd = fd, .map = ptr[0..@intCast(st.size)] };
+    }
+
     /// Two-phase marker write: the bytes to a temp file + `fdatasync`, a
     /// `rename` over the marker, `fsync` of the directory — a crash leaves
     /// either the old marker or the new one, never a torn one (the decode's
@@ -1664,6 +1729,204 @@ pub const Ring = if (builtin.os.tag == .linux) struct {
         };
         defer r.deinit();
         return Marker.decode(r.bytes()) catch null;
+    }
+
+    /// A member's root under the format's cache path (0003 §T.1):
+    /// `<cache path>/member-<mount slot as 8 hex>` — its marker, its staging
+    /// segment and its NVMe read-cache segments. The mount slot is the
+    /// member scope a mount presents (the manager's home-volume index, a
+    /// joiner's mount-point derivation), stable across its incarnations.
+    pub const MEMBER_DIR_PREFIX = "member-";
+    const MEMBER_DIR_LEN = MEMBER_DIR_PREFIX.len + 8;
+
+    pub fn memberRootPath(buf: []u8, container: []const u8, mount_slot: u32) error{NameTooLong}![]const u8 {
+        return std.fmt.bufPrint(buf, "{s}/" ++ MEMBER_DIR_PREFIX ++ "{x:0>8}", .{ container, mount_slot }) catch error.NameTooLong;
+    }
+
+    /// The mount slot a member root's directory name carries; null for any
+    /// other entry.
+    pub fn memberSlotOf(name: []const u8) ?u32 {
+        if (name.len != MEMBER_DIR_LEN or !std.mem.startsWith(u8, name, MEMBER_DIR_PREFIX)) return null;
+        return std.fmt.parseInt(u32, name[MEMBER_DIR_PREFIX.len..], 16) catch null;
+    }
+
+    pub const BindError = error{ OpenFailed, NameTooLong, OwnerLive, ForeignOwner, MarkerFailed };
+
+    /// What a refused bind found: the root's owner as its marker names it
+    /// (null when the marker is absent or unreadable).
+    pub const BindRefusal = struct { owner: ?Marker = null };
+
+    /// A bound member root: the directory fd whose exclusive `flock` IS the
+    /// live claim (held until `release`; the kernel drops it at the
+    /// process's death, a `kill -9` included), its path, the marker found
+    /// and the verdict that admitted it.
+    pub const Bound = struct {
+        fd: linux.fd_t,
+        path_buf: [linux.PATH_MAX]u8,
+        path_len: usize,
+        verdict: BindVerdict,
+        found: ?Marker,
+
+        pub fn path(self: *const Bound) []const u8 {
+            return self.path_buf[0..self.path_len];
+        }
+
+        pub fn release(self: *Bound) void {
+            _ = linux.close(self.fd);
+            self.* = undefined;
+        }
+    };
+
+    /// The live claim: `flock(LOCK_EX | LOCK_NB)` on the root's fd; false =
+    /// another open file description holds it (another process, or another
+    /// bind of this one).
+    fn claim(fd: linux.fd_t) BindError!bool {
+        return switch (linux.errno(linux.flock(fd, std.posix.LOCK.EX | std.posix.LOCK.NB))) {
+            .SUCCESS => true,
+            .AGAIN => false,
+            else => error.OpenFailed,
+        };
+    }
+
+    /// A marker file is present (an unreadable one binds `dead`, never
+    /// `absent` — its ring is not ours to adopt).
+    fn markerPresent(root_fd: linux.fd_t) bool {
+        var st: linux.Statx = undefined;
+        return linux.errno(linux.statx(root_fd, MARKER_NAME, linux.AT.SYMLINK_NOFOLLOW, .{ .TYPE = true }, &st)) == .SUCCESS;
+    }
+
+    /// The container (the format's cache path): created 0700, the mode
+    /// re-asserted (plaintext payload under every member root).
+    fn openContainer(path: []const u8) BindError!void {
+        var zbuf: [linux.PATH_MAX]u8 = undefined;
+        const z = try zPath(&zbuf, path);
+        _ = linux.mkdir(z, DIR_MODE);
+        const rc = linux.open(z, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .NOFOLLOW = true, .CLOEXEC = true }, 0);
+        if (linux.errno(rc) != .SUCCESS) return error.OpenFailed;
+        _ = linux.fchmod(@intCast(rc), DIR_MODE);
+        _ = linux.close(@intCast(rc));
+    }
+
+    /// Bind THIS member's root under `container` (`ours.mount_slot` names
+    /// it): two mounts of one set on one host bind two roots, never one.
+    pub fn bindMember(pool: *uring_fs.Pool, container: []const u8, ours: Marker, segments: []const [:0]const u8, refusal: *BindRefusal) BindError!Bound {
+        try openContainer(container);
+        var buf: [linux.PATH_MAX]u8 = undefined;
+        return bindRoot(pool, try memberRootPath(&buf, container, ours.mount_slot), ours, segments, refusal);
+    }
+
+    /// Bind `root` for `ours` (0003 §T.1): the live claim taken BEFORE the
+    /// marker is read — a root another process holds is refused
+    /// `OwnerLive`, never adopted; then the ladder — another member's dead
+    /// root refused `ForeignOwner` (never adopted, never wiped), a dead ring
+    /// wiped; ours stamped two-phase (the owner's pid and appender id).
+    pub fn bindRoot(pool: *uring_fs.Pool, root: []const u8, ours: Marker, segments: []const [:0]const u8, refusal: *BindRefusal) BindError!Bound {
+        refusal.* = .{};
+        if (root.len > linux.PATH_MAX) return error.NameTooLong;
+        const fd = openRoot(root) catch |e| return switch (e) {
+            error.NameTooLong => error.NameTooLong,
+            else => error.OpenFailed,
+        };
+        errdefer _ = linux.close(fd);
+        if (!try claim(fd)) {
+            refusal.owner = readMarker(pool, root) catch null;
+            stats.staging_owner_live_refusals.inc();
+            return error.OwnerLive;
+        }
+        const found = readMarker(pool, root) catch null;
+        const verdict: BindVerdict = if (found == null and markerPresent(fd)) .dead else bindVerdict(found, ours);
+        switch (verdict) {
+            .absent, .match, .upgrade => {},
+            .dead => wipeSegments(fd, segments),
+            .foreign_owner => {
+                refusal.owner = found;
+                stats.staging_foreign_scope_refusals.inc();
+                return error.ForeignOwner;
+            },
+        }
+        writeMarker(pool, root, fd, ours) catch return error.MarkerFailed;
+        var b: Bound = .{ .fd = fd, .path_buf = undefined, .path_len = root.len, .verdict = verdict, .found = found };
+        @memcpy(b.path_buf[0..root.len], root);
+        return b;
+    }
+
+    /// Is another process's live claim held on the member root at `path`
+    /// (read off `/proc/locks` — the probe takes NO lock: a transient one
+    /// would refuse a member's own bind racing it).
+    pub fn ownerLive(path: []const u8) bool {
+        return @import("../meta/guard/proc.zig").writerFlockHeld(path);
+    }
+
+    /// The member roots under a container, straight off `getdents64`.
+    pub const MemberIter = struct {
+        fd: linux.fd_t,
+        buf: [4096]u8 = undefined,
+        len: usize = 0,
+        off: usize = 0,
+
+        /// Null when the container cannot be opened (absent: no roots).
+        pub fn open(container: []const u8) ?MemberIter {
+            var zbuf: [linux.PATH_MAX]u8 = undefined;
+            const z = zPath(&zbuf, container) catch return null;
+            const rc = linux.open(z, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .NOFOLLOW = true, .CLOEXEC = true }, 0);
+            if (linux.errno(rc) != .SUCCESS) return null;
+            return .{ .fd = @intCast(rc) };
+        }
+
+        /// The next member root's mount slot; null at the end.
+        pub fn next(self: *MemberIter) ?u32 {
+            while (true) {
+                if (self.off >= self.len) {
+                    const n = linux.getdents64(self.fd, &self.buf, self.buf.len);
+                    if (linux.errno(n) != .SUCCESS or n == 0) return null;
+                    self.len = n;
+                    self.off = 0;
+                }
+                const d: *align(1) linux.dirent64 = @ptrCast(&self.buf[self.off]);
+                self.off += d.reclen;
+                const name = std.mem.sliceTo(@as([*:0]u8, @ptrCast(&d.name)), 0);
+                if (memberSlotOf(name)) |slot| return slot;
+            }
+        }
+
+        pub fn close(self: *MemberIter) void {
+            _ = linux.close(self.fd);
+            self.* = undefined;
+        }
+    };
+
+    /// `statx(2)`'s `stx_blocks` unit: 512 B whatever the filesystem's
+    /// block size (the kernel ABI's sector count).
+    const STATX_BLOCK_BYTES: u64 = 512;
+
+    /// The other members' roots under `container` with no live owner and
+    /// ring bytes on disk (`segment` allocated past 0 blocks: a cleanly
+    /// unmounted ring is all punched holes): each logged loud with its
+    /// owner, the count published as `staging_member_residue_roots`. Never
+    /// touched — that member's successor recovers it.
+    pub fn residueCensus(pool: *uring_fs.Pool, container: []const u8, ours_slot: u32, segment: [:0]const u8) u32 {
+        var it = MemberIter.open(container) orelse return 0;
+        defer it.close();
+        var n: u32 = 0;
+        while (it.next()) |slot| {
+            if (slot == ours_slot) continue;
+            var rbuf: [linux.PATH_MAX]u8 = undefined;
+            const root = memberRootPath(&rbuf, container, slot) catch continue;
+            if (ownerLive(root)) continue;
+            var sbuf: [linux.PATH_MAX:0]u8 = undefined;
+            const seg_path = std.fmt.bufPrintSentinel(&sbuf, "{s}/{s}/{s}", .{ root, SEGMENT_DIR, segment }, 0) catch continue;
+            var st: linux.Statx = undefined;
+            if (linux.errno(linux.statx(linux.AT.FDCWD, seg_path.ptr, 0, .{ .BLOCKS = true }, &st)) != .SUCCESS or st.blocks == 0) continue;
+            n += 1;
+            const owner = readMarker(pool, root) catch null;
+            if (owner) |o| {
+                log.warn("staging root {s}: member slot {x:0>8} (appender {d}, node {x:0>16}, last pid {d}) holds {d} B of ring on disk and no live owner — its unpromoted custody is that member's: a mount presenting its member scope recovers it (the same mount point; the manager's for slot 0); nothing here touches it", .{ root, slot, o.appender_id, o.node_token, o.owner_pid, st.blocks * STATX_BLOCK_BYTES });
+            } else {
+                log.warn("staging root {s}: member slot {x:0>8} holds {d} B of ring on disk, no live owner and no readable marker — nothing here touches it", .{ root, slot, st.blocks * STATX_BLOCK_BYTES });
+            }
+        }
+        stats.staging_member_residue_roots.set(n);
+        return n;
     }
 
     /// `dead`: wipe the segment tree (every file under it) before restamping.
@@ -2278,11 +2541,13 @@ test "the reader's view: resident ⇒ the bytes; ledger-only ⇒ in flight; neit
     try testing.expectEqual(@as(u64, 300), lostStagedRangeLen(0, std.math.maxInt(u64), 300));
 }
 
-test "the marker: 72 B, checksummed, identity = hash64(set_uuid ‖ \"staging\") and checked against its own uuid; every refusal; the bind ladder's verdicts" {
+test "the marker: 80 B, checksummed, names its owner (node, mount slot, appender, pid), identity = hash64(set_uuid ‖ \"staging\") and checked against its own uuid; every refusal; the member-scoped bind ladder's verdicts (0003 §T.1)" {
     const uuid: [16]u8 = .{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 };
-    const m: Marker = .{ .set_uuid = uuid, .set_epoch = 3, .node_token = 0xABC, .mount_slot = 2 };
+    const m: Marker = .{ .set_uuid = uuid, .set_epoch = 3, .node_token = 0xABC, .mount_slot = 2, .appender_id = 5, .owner_pid = 31337 };
     const bytes = m.encode();
-    try testing.expectEqual(@as(usize, 72), bytes.len);
+    try testing.expectEqual(@as(usize, 80), bytes.len);
+    try testing.expectEqual(@as(u32, 5), std.mem.readInt(u32, bytes[64..68], .little));
+    try testing.expectEqual(@as(u32, 31337), std.mem.readInt(u32, bytes[68..72], .little));
     try testing.expectEqualSlices(u8, "SQZM", bytes[0..4]);
     try testing.expectEqualSlices(u8, &uuid, bytes[8..24]);
     var want: checksum.Hasher = .init();
@@ -2294,7 +2559,7 @@ test "the marker: 72 B, checksummed, identity = hash64(set_uuid ‖ \"staging\")
     const back = try Marker.decode(&bytes);
     try testing.expectEqual(m, back);
     // Refusals: length, a flipped byte, a foreign identity for the carried uuid, an unknown flag, a non-dual prev epoch.
-    try testing.expectError(error.Corrupt, Marker.decode(bytes[0..71]));
+    try testing.expectError(error.Corrupt, Marker.decode(bytes[0..79]));
     var bad = bytes;
     bad[20] ^= 1;
     try testing.expectError(error.Corrupt, Marker.decode(&bad));
@@ -2314,30 +2579,39 @@ test "the marker: 72 B, checksummed, identity = hash64(set_uuid ‖ \"staging\")
     var dual = m;
     dual.prev_set_epoch = 2;
     try testing.expectEqual(dual, try Marker.decode(&dual.encode()));
-    // The bind ladder.
-    try testing.expectEqual(BindVerdict.absent, bindVerdict(null, m, false));
-    try testing.expectEqual(BindVerdict.match, bindVerdict(m, m, true));
+    // The bind ladder: the member is the mount slot.
+    try testing.expectEqual(BindVerdict.absent, bindVerdict(null, m));
+    try testing.expectEqual(BindVerdict.match, bindVerdict(m, m));
     var other_set = m;
     other_set.set_uuid[0] = 99;
-    try testing.expectEqual(BindVerdict.dead, bindVerdict(other_set, m, false));
+    try testing.expectEqual(BindVerdict.dead, bindVerdict(other_set, m));
+    // The same member's next incarnation (a new boot's node token, a new
+    // pid, another appender id): its predecessor's ring is ours to adopt.
+    var predecessor = m;
+    predecessor.node_token = 0xDEF;
+    predecessor.owner_pid = 4242;
+    predecessor.appender_id = 9;
+    try testing.expectEqual(BindVerdict.match, bindVerdict(predecessor, m));
+    // Another member's root: never ours, whatever its node.
     var peer = m;
-    peer.node_token = 0xDEF;
-    try testing.expectEqual(BindVerdict.foreign_scope, bindVerdict(peer, m, true));
-    try testing.expectEqual(BindVerdict.upgrade, bindVerdict(peer, m, false));
-    var unscoped = m;
-    unscoped.node_token = 0;
-    try testing.expectEqual(BindVerdict.upgrade, bindVerdict(unscoped, m, true));
+    peer.mount_slot = 0x8000_0003;
+    try testing.expectEqual(BindVerdict.foreign_owner, bindVerdict(peer, m));
+    peer.node_token = m.node_token;
+    try testing.expectEqual(BindVerdict.foreign_owner, bindVerdict(peer, m));
     // A dual marker naming our epoch as its previous one matches the set (upgrade restamps it canonical).
     var ours_next = m;
     ours_next.set_epoch = 4;
     var dual_to_4 = m;
     dual_to_4.set_epoch = 4;
     dual_to_4.prev_set_epoch = 3;
-    try testing.expectEqual(BindVerdict.upgrade, bindVerdict(dual_to_4, ours_next, false));
+    try testing.expectEqual(BindVerdict.upgrade, bindVerdict(dual_to_4, ours_next));
+    var older = m;
+    older.set_epoch = 2;
+    try testing.expectEqual(BindVerdict.upgrade, bindVerdict(older, m));
     // A newer epoch than ours on the same set is dead to us (we are the stale mount).
     var newer = m;
     newer.set_epoch = 9;
-    try testing.expectEqual(BindVerdict.dead, bindVerdict(newer, m, false));
+    try testing.expectEqual(BindVerdict.dead, bindVerdict(newer, m));
 }
 
 test "shard plan: max(next_pow2(cores), 16) halved to fit two copies + slack; a tiny pool takes one shard; the key hashes to a shard" {
@@ -2386,6 +2660,89 @@ fn recordFuzz(_: void, smith: *std.testing.Smith) !void {
 
 test "fuzz: the record header reader, the verifier and the marker decoder are total" {
     try fuzzkit.fuzz({}, recordFuzz, .{});
+}
+
+test "linux: the member scope (0003 §T.1) — two owners over ONE cache path: each binds its own member root and B never adopts A's residents; a second claim on A's LIVE root refuses naming A; A dead, a FOREIGN member on A's root refuses (never adopted, never wiped); A's successor (the same member, a new incarnation) adopts every resident" {
+    if (builtin.os.tag != .linux) return testkit.skip(@src(), .no_linux, "staging: Linux only");
+    const gpa = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(testing.io, &path_buf);
+    var c_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const container = try std.fmt.bufPrint(&c_buf, "{s}/cache", .{path_buf[0..n]});
+    const uring_fs = @import("../io/uring_fs.zig");
+    const pool = try uring_fs.Pool.init(gpa, uring_fs.Config.fixed(1, 1024));
+    defer pool.deinit();
+    const segs: []const [:0]const u8 = &.{"seg-0"};
+    const cap: u64 = 64 * 4096;
+    const uuid: [16]u8 = @splat(0x5A);
+    // A = the manager (mount slot 0, appender 0), B = a joiner on the same
+    // node (its mount-point slot, appender 1).
+    const a_owner: Marker = .{ .set_uuid = uuid, .set_epoch = 1, .node_token = 0xA0, .mount_slot = 0, .appender_id = 0, .owner_pid = 1111 };
+    const b_owner: Marker = .{ .set_uuid = uuid, .set_epoch = 1, .node_token = 0xA0, .mount_slot = 0x8000_1234, .appender_id = 1, .owner_pid = 2222 };
+    const live0 = stats.staging_owner_live_refusals.load();
+    const foreign0 = stats.staging_foreign_scope_refusals.load();
+    var refusal: Ring.BindRefusal = .{};
+    var a = try Ring.bindMember(pool, container, a_owner, segs, &refusal);
+    var a_open = true;
+    defer if (a_open) a.release();
+    {
+        var ms = try Ring.openSegment(a.fd, "seg-0", cap);
+        defer ms.close();
+        var seg = try Segment.init(gpa, ms.map, ms.backing());
+        defer seg.deinit();
+        for (1..4) |i| try seg.put(tkey(@intCast(i), i), "a resident", 1, 0, 0);
+        _ = linux.fsync(ms.fd);
+    }
+    // B over the same cache path: its own root; A's residents are never B's.
+    {
+        var b = try Ring.bindMember(pool, container, b_owner, segs, &refusal);
+        defer b.release();
+        try testing.expect(!std.mem.eql(u8, a.path(), b.path()));
+        var ms = try Ring.openSegment(b.fd, "seg-0", cap);
+        defer ms.close();
+        var seg = try Segment.init(gpa, ms.map, ms.backing());
+        defer seg.deinit();
+        try testing.expectEqual(@as(u64, 0), seg.recover().adopted);
+    }
+    // A second claim on A's LIVE root refuses naming A: B forced onto it,
+    // and A's own member identity presented by a second incarnation.
+    try testing.expectError(error.OwnerLive, Ring.bindRoot(pool, a.path(), b_owner, segs, &refusal));
+    try testing.expectEqual(a_owner, refusal.owner.?);
+    var a_next = a_owner;
+    a_next.node_token = 0xA1;
+    a_next.owner_pid = 3333;
+    try testing.expectError(error.OwnerLive, Ring.bindMember(pool, container, a_next, segs, &refusal));
+    try testing.expectEqual(@as(u32, 1111), refusal.owner.?.owner_pid);
+    try testing.expectEqual(live0 + 2, stats.staging_owner_live_refusals.load());
+    try testing.expect(Ring.ownerLive(a.path()));
+    // A dies (its claim goes with its process); the residents stay.
+    var a_root_buf: [linux.PATH_MAX]u8 = undefined;
+    const a_root = a_root_buf[0..a.path().len];
+    @memcpy(a_root, a.path());
+    a.release();
+    a_open = false;
+    try testing.expect(!Ring.ownerLive(a_root));
+    // The census from B's side: A's root, ownerless, holds ring bytes.
+    try testing.expectEqual(@as(u32, 1), Ring.residueCensus(pool, container, b_owner.mount_slot, "seg-0"));
+    // A foreign member on A's dead root: refused, never adopted, never wiped.
+    try testing.expectError(error.ForeignOwner, Ring.bindRoot(pool, a_root, b_owner, segs, &refusal));
+    try testing.expectEqual(a_owner, refusal.owner.?);
+    try testing.expectEqual(foreign0 + 1, stats.staging_foreign_scope_refusals.load());
+    // A's successor adopts every resident (the same member, a new boot's
+    // node token and pid); its marker now names it.
+    var succ = try Ring.bindMember(pool, container, a_next, segs, &refusal);
+    defer succ.release();
+    try testing.expectEqualStrings(a_root, succ.path());
+    try testing.expectEqual(BindVerdict.match, succ.verdict);
+    try testing.expectEqual(a_owner, succ.found.?);
+    try testing.expectEqual(a_next, (try Ring.readMarker(pool, a_root)).?);
+    var ms = try Ring.openSegment(succ.fd, "seg-0", cap);
+    defer ms.close();
+    var seg = try Segment.init(gpa, ms.map, ms.backing());
+    defer seg.deinit();
+    try testing.expectEqual(@as(u64, 3), seg.recover().adopted);
 }
 
 test "linux: a ring under a tmp dir — 0700/0600 modes, mmap put/get, a remount recovers the entries, the marker round-trips two-phase through the io_uring file layer" {
@@ -2451,10 +2808,10 @@ test "linux: a ring under a tmp dir — 0700/0600 modes, mmap put/get, a remount
     const m: Marker = .{ .set_uuid = @splat(7), .set_epoch = 1, .node_token = 5, .mount_slot = 0 };
     try Ring.writeMarker(pool, root, root_fd, m);
     try testing.expectEqual(m, (try Ring.readMarker(pool, root)).?);
-    try testing.expectEqual(BindVerdict.match, bindVerdict(try Ring.readMarker(pool, root), m, true));
+    try testing.expectEqual(BindVerdict.match, bindVerdict(try Ring.readMarker(pool, root), m));
     var other = m;
     other.set_uuid[0] = 8;
-    try testing.expectEqual(BindVerdict.dead, bindVerdict(try Ring.readMarker(pool, root), other, false));
+    try testing.expectEqual(BindVerdict.dead, bindVerdict(try Ring.readMarker(pool, root), other));
     const d0 = stats.staging_generation_discards.load();
     Ring.wipeSegments(root_fd, &.{"seg-00"});
     try testing.expectEqual(d0 + 1, stats.staging_generation_discards.load());

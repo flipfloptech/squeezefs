@@ -152,8 +152,6 @@ pub const linux = if (builtin.os.tag == .linux) struct {
         shard: ?finding.Shard = null,
         /// The live filesystem (its 4a manager): online only.
         fs: ?*BackendFs = null,
-        /// The set's first cache path (the staging root the marker lives in).
-        staging_root: ?[]const u8 = null,
         cancel: ?*const std.atomic.Value(bool) = null,
     };
 
@@ -202,9 +200,9 @@ pub const linux = if (builtin.os.tag == .linux) struct {
         b.xforms = try xforms.toOwnedSlice(gpa);
         if (plane) |pl| {
             b.verifier = try scrub.Verifier.init(gpa, .{ .ctx = pl, .read = &readBlock }, pl.chunk, b.xforms);
-            if (pl.stage != null) if (opts.staging_root) |root| {
-                b.staging_face = .{ .plane = pl, .root = root };
-            };
+            // C4/C5 over THIS member's root (0003 §T.1): the plane's ring
+            // and the marker its bind stamped.
+            if (pl.stagingRoot()) |root| b.staging_face = .{ .plane = pl, .root = root };
         }
         b.host = .{
             .gpa = gpa,
@@ -493,12 +491,11 @@ pub const linux = if (builtin.os.tag == .linux) struct {
         fn markerFn(ctx: *anyopaque) ?finding.StagingVerdict {
             const self: *StagingBind = @ptrCast(@alignCast(ctx));
             const pl = self.plane;
-            const ours: staging.Marker = .{ .set_uuid = pl.backend.setUuid(), .set_epoch = pl.backend.setEpoch(), .node_token = 0, .mount_slot = 0 };
             const found = staging.Ring.readMarker(pl.backend.pool, self.root) catch return .unreadable;
-            return switch (staging.bindVerdict(found, ours, false)) {
+            return switch (staging.bindVerdict(found, pl.stage.?.marker)) {
                 .absent, .match, .upgrade => null,
                 .dead => .dead,
-                .foreign_scope => .foreign_scope,
+                .foreign_owner => .foreign_scope,
             };
         }
 
@@ -679,7 +676,6 @@ pub const linux = if (builtin.os.tag == .linux) struct {
         env: *const std.process.Environ.Map,
         mem_budget: u64,
         fs: ?*BackendFs,
-        staging_root: ?[]const u8,
         bound: *Bound,
         last: ?finding.Report = null,
         /// The fleet READ-shard dispatcher (the coordinator's; `none`
@@ -697,7 +693,7 @@ pub const linux = if (builtin.os.tag == .linux) struct {
         }
 
         fn bindOptions(self: *const JobBody) BindOptions {
-            return .{ .env = self.env, .mode = .online, .mem_budget = self.mem_budget, .fs = self.fs, .staging_root = self.staging_root };
+            return .{ .env = self.env, .mode = .online, .mem_budget = self.mem_budget, .fs = self.fs };
         }
 
         /// The binding is REBUILT when the plane's volume population

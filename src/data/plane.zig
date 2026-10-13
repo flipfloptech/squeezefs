@@ -124,6 +124,8 @@ const fsync_mod = @import("fsync.zig");
 const read_path = @import("read_path.zig");
 const read_size_class = @import("read_size_class.zig");
 const nvme_read_cache = @import("nvme_read_cache.zig");
+const sym_join = @import("../meta/sym/join.zig");
+const guard_proc = @import("../meta/guard/proc.zig");
 const purge = @import("purge.zig");
 const warm_ladder = @import("warm_ladder.zig");
 const admission = @import("admission.zig");
@@ -159,6 +161,35 @@ pub const STAGING_BUDGET_DIVISOR: u64 = 8;
 pub const STAGING_FLOOR: u64 = 64 * derive.MiB;
 /// The sole staging segment of this wave (per-path shards are owed).
 pub const STAGING_SEGMENT_NAME: [:0]const u8 = "seg-0";
+
+/// THIS mount's staging owner (0003 §T.1): volume 0's appender identity —
+/// the manager's `(node, home-volume index)` at appender 0, a joiner's
+/// `(node, mount-point slot)` at its appender id, a `--single-writer` D0
+/// winner's `(node, 0)` — on the set's identity, with this incarnation's
+/// pid. The mount slot is the member scope (its root's name).
+fn stagingOwnerMarker(be: *KvBackend) staging.Marker {
+    const v0 = be.volumes[0];
+    var node: u64 = undefined;
+    var slot: u32 = undefined;
+    var appender: u32 = undefined;
+    if (v0.sym) |set| {
+        node = set.identity.node_token;
+        slot = set.identity.mount_slot;
+        appender = manager_appender_id;
+    } else if (v0.joined) |j| {
+        node = j.identity.node_token;
+        slot = j.identity.mount_slot;
+        appender = j.appenderId();
+    } else {
+        node = sym_join.nodeToken(guard_proc.localIdentity());
+        slot = 0;
+        appender = manager_appender_id;
+    }
+    return .{ .set_uuid = be.setUuid(), .set_epoch = be.setEpoch(), .node_token = node, .mount_slot = slot, .appender_id = appender, .owner_pid = @intCast(linux.getpid()) };
+}
+
+/// The manager's appender id (the format-time fixed ring's).
+const manager_appender_id: u32 = @import("../meta/journal.zig").FIXED_RING_APPENDER;
 /// The shape-snapshot table the W1 hold gate and the shared-mode probe
 /// read on the queue thread: the op-guard width (one row per stripe).
 pub const SHAPE_STRIPES: usize = op_guard.INODE_GUARD_STRIPES;
@@ -323,7 +354,11 @@ pub const HeldStoreFace = struct {
 };
 
 const Staging = struct {
-    root_fd: linux.fd_t,
+    /// THIS member's root under the cache path, its live claim held for
+    /// the ring's life (0003 §T.1).
+    root: staging.Ring.Bound,
+    /// The marker the bind stamped (the online fsck's C5 re-reads against it).
+    marker: staging.Marker,
     mapped: staging.Ring.MappedSegment,
     seg: staging.Segment,
     pool: staging.Pool,
@@ -356,7 +391,7 @@ pub const Options = struct {
     guards: *op_guard.Table,
 };
 
-pub const OpenError = error{ OutOfMemory, DeviceRefused, IdentityMismatch, Io, StagingRefused, TransformRefused, ReclaimRefused, InlineMaxAboveFormatBound };
+pub const OpenError = error{ OutOfMemory, DeviceRefused, IdentityMismatch, Io, StagingRefused, StagingOwnerLive, StagingForeignOwner, TransformRefused, ReclaimRefused, InlineMaxAboveFormatBound };
 
 pub const DataPlane = struct {
     /// The (3.7) guard kv_fs holds across a truncate / corpse transaction.
@@ -574,11 +609,15 @@ pub const DataPlane = struct {
         if (!self.passthrough) try self.openTransform(gpa, io, cfg, tcfg, opts);
         errdefer self.closeTransform();
 
-        // 4. Staging + the NVMe tier under the cache paths (or OFF, loud).
+        // 4. Staging + the NVMe tier under THIS member's root of the cache
+        //    path (or OFF, loud). A `-o ro` reader stages nothing and binds
+        //    no member's root (0003 §T.1).
         var nvme: nvme_read_cache.Cache = nvme_read_cache.Cache.initDisabled(gpa);
-        if (cfg.cache_paths.len > 0 and opened > 0) {
+        if (cfg.cache_paths.len > 0 and opened > 0 and be.isReader()) {
+            log.info("data plane: a `-o ro` reader binds no member's staging root — staging and the NVMe read tier are OFF on this mount", .{});
+        } else if (cfg.cache_paths.len > 0 and opened > 0) {
             try self.openStaging(gpa, io, cfg, opts);
-            nvme = self.openNvmeTier(gpa, cfg, opts);
+            nvme = self.openNvmeTier(gpa, opts);
         } else {
             log.info("data plane: the set declares NO cache paths — staging and the NVMe read tier are OFF: a write ≤ inline_max ({d} B) stays inline, anything larger goes STRIPED (no packed layout, no promotion pass at dismount)", .{inline_max});
         }
@@ -938,38 +977,51 @@ pub const DataPlane = struct {
         }
     }
 
-    /// The staging ring under the first cache path: the identity marker
-    /// (bind / dead-wipe / fresh), the segment sized from the root's free
-    /// space, the recovery scan seeding the pool's ledger.
+    /// The staging ring under THIS member's root of the first cache path
+    /// (0003 §T.1): the root bound with its live claim (a live owner's root
+    /// refused, another member's never adopted), the segment sized from the
+    /// root's free space, the recovery scan seeding the pool's ledger; the
+    /// other members' ownerless residue reported loud.
     fn openStaging(self: *DataPlane, gpa: Allocator, io: Io, cfg: *const set_config.Config, opts: Options) OpenError!void {
         _ = io;
-        const root = cfg.cache_paths[0];
-        const root_fd = staging.Ring.openRoot(root) catch |e| {
-            log.err("staging root {s}: cannot open ({s})", .{ root, @errorName(e) });
-            return error.StagingRefused;
-        };
-        errdefer _ = linux.close(root_fd);
-        const ours: staging.Marker = .{ .set_uuid = self.backend.setUuid(), .set_epoch = self.backend.setEpoch(), .node_token = 0, .mount_slot = 0 };
-        const found = staging.Ring.readMarker(self.backend.pool, root) catch null;
-        switch (staging.bindVerdict(found, ours, false)) {
-            .absent, .match, .upgrade => {},
-            .dead => staging.Ring.wipeSegments(root_fd, &.{STAGING_SEGMENT_NAME}),
-            .foreign_scope => {
-                log.err("staging root {s}: a PEER mount's live custody — refusing", .{root});
+        const container = cfg.cache_paths[0];
+        const ours = stagingOwnerMarker(self.backend);
+        var refusal: staging.Ring.BindRefusal = .{};
+        var root = staging.Ring.bindMember(self.backend.pool, container, ours, &.{STAGING_SEGMENT_NAME}, &refusal) catch |e| switch (e) {
+            error.OwnerLive => {
+                if (refusal.owner) |o| {
+                    if (o.identity() == ours.identity()) {
+                        log.err("staging root {s}/{s}{x:0>8}: held LIVE by another mount of this member scope (appender {d}, node {x:0>16}, pid {d}) — two mounts present one member (mount slot {x:0>8}); refusing (never adopted): unmount the other, or mount at another mount point (a joiner's member scope derives from it)", .{ container, staging.Ring.MEMBER_DIR_PREFIX, ours.mount_slot, o.appender_id, o.node_token, o.owner_pid, ours.mount_slot });
+                    } else {
+                        log.err("staging root {s}/{s}{x:0>8}: held LIVE by a mount of ANOTHER SET on this cache path (staging identity {x:0>16}, appender {d}, node {x:0>16}, pid {d}) — refusing (never adopted, never wiped): give each set its own cache path (`config set-cache-paths`)", .{ container, staging.Ring.MEMBER_DIR_PREFIX, ours.mount_slot, o.identity(), o.appender_id, o.node_token, o.owner_pid });
+                    }
+                } else {
+                    log.err("staging root {s}/{s}{x:0>8}: held LIVE by another process (no readable marker) — refusing (never adopted)", .{ container, staging.Ring.MEMBER_DIR_PREFIX, ours.mount_slot });
+                }
+                return error.StagingOwnerLive;
+            },
+            error.ForeignOwner => {
+                const o = refusal.owner.?;
+                log.err("staging root {s}/{s}{x:0>8}: its marker names ANOTHER member (mount slot {x:0>8}, appender {d}, node {x:0>16}, last pid {d}) — its ring is that member's custody; refusing (never adopted, never wiped)", .{ container, staging.Ring.MEMBER_DIR_PREFIX, ours.mount_slot, o.mount_slot, o.appender_id, o.node_token, o.owner_pid });
+                return error.StagingForeignOwner;
+            },
+            else => {
+                log.err("staging root under {s}: cannot bind this member's root ({s})", .{ container, @errorName(e) });
                 return error.StagingRefused;
             },
-        }
-        staging.Ring.writeMarker(self.backend.pool, root, root_fd, ours) catch |e| {
-            log.err("staging root {s}: cannot write the identity marker ({s})", .{ root, @errorName(e) });
-            return error.StagingRefused;
         };
-        const capacity = stagingCapacity(root_fd, opts.budget_bytes);
-        var mapped = staging.Ring.openSegment(root_fd, STAGING_SEGMENT_NAME, capacity) catch |e| {
-            log.err("staging root {s}: cannot open the segment ({s})", .{ root, @errorName(e) });
+        errdefer root.release();
+        if (root.verdict == .match) if (root.found) |f| if (f.owner_pid != ours.owner_pid or f.node_token != ours.node_token) {
+            log.info("staging root {s}: this member's previous incarnation (appender {d}, node {x:0>16}, pid {d}) is dead — its ring recovers here as the successor's", .{ root.path(), f.appender_id, f.node_token, f.owner_pid });
+        };
+        _ = staging.Ring.residueCensus(self.backend.pool, container, ours.mount_slot, STAGING_SEGMENT_NAME);
+        const capacity = stagingCapacity(root.fd, opts.budget_bytes);
+        var mapped = staging.Ring.openSegment(root.fd, STAGING_SEGMENT_NAME, capacity) catch |e| {
+            log.err("staging root {s}: cannot open the segment ({s})", .{ root.path(), @errorName(e) });
             return error.StagingRefused;
         };
         errdefer mapped.close();
-        self.stage = .{ .root_fd = root_fd, .mapped = mapped, .seg = undefined, .pool = undefined };
+        self.stage = .{ .root = root, .marker = ours, .mapped = mapped, .seg = undefined, .pool = undefined };
         const st = &self.stage.?;
         st.seg = staging.Segment.init(gpa, st.mapped.map, st.mapped.backing()) catch return error.OutOfMemory;
         errdefer st.seg.deinit();
@@ -981,7 +1033,14 @@ pub const DataPlane = struct {
         // and the segment's fixed per-cell tables (= `tablesBound(capacity)`).
         budget.authority.register(staging.cellStateComponent());
         budget.authority.register(staging.tablesComponent());
-        log.info("staging ring {s}/{s}/{s}: {d} MiB, recovered {d} record(s) ({d} B), {d} torn, {d} superseded", .{ root, staging.Ring.SEGMENT_DIR, STAGING_SEGMENT_NAME, capacity >> 20, rep.adopted, rep.bytes, rep.torn, rep.superseded });
+        log.info("staging ring {s}/{s}/{s}: {d} MiB, recovered {d} record(s) ({d} B), {d} torn, {d} superseded", .{ st.root.path(), staging.Ring.SEGMENT_DIR, STAGING_SEGMENT_NAME, capacity >> 20, rep.adopted, rep.bytes, rep.torn, rep.superseded });
+    }
+
+    /// The member root this plane's staging ring and NVMe tier live under;
+    /// null with staging off.
+    pub fn stagingRoot(self: *const DataPlane) ?[]const u8 {
+        const st = &(self.stage orelse return null);
+        return st.root.path();
     }
 
     /// `struct statfs` of the 64-bit ABIs (`fstatfs(2)`; std carries no
@@ -1015,7 +1074,8 @@ pub const DataPlane = struct {
         return stagingCapacityFor(free, budget_bytes);
     }
 
-    fn openNvmeTier(self: *DataPlane, gpa: Allocator, cfg: *const set_config.Config, opts: Options) nvme_read_cache.Cache {
+    /// The NVMe read tier under this member's root (`openStaging` bound it).
+    fn openNvmeTier(self: *DataPlane, gpa: Allocator, opts: Options) nvme_read_cache.Cache {
         var aggregate: u64 = 0;
         for (self.vols.rows[0..self.vols.n()]) |r| aggregate += r.?.alloc.capacityBlocks() * self.block_size;
         const tier_budget = nvme_read_cache.budgetFromEnv(opts.env, aggregate);
@@ -1023,8 +1083,9 @@ pub const DataPlane = struct {
         const shards = nvme_read_cache.shardPlan(tier_budget, opts.facts.cpus, self.chunk);
         const per_shard = derive.alignDown(tier_budget / @max(shards, 1), nvme_read_cache.GRAIN);
         if (per_shard < self.chunk + nvme_read_cache.GRAIN) return nvme_read_cache.Cache.initDisabled(gpa);
-        return nvme_read_cache.Ring.open(gpa, cfg.cache_paths[0], shards, per_shard) catch |e| {
-            log.err("NVMe read tier under {s}: cannot open ({s}) — the tier is OFF", .{ cfg.cache_paths[0], @errorName(e) });
+        const root = self.stagingRoot().?;
+        return nvme_read_cache.Ring.open(gpa, root, shards, per_shard) catch |e| {
+            log.err("NVMe read tier under {s}: cannot open ({s}) — the tier is OFF", .{ root, @errorName(e) });
             return nvme_read_cache.Cache.initDisabled(gpa);
         };
     }
@@ -1034,7 +1095,7 @@ pub const DataPlane = struct {
             st.pool.deinit();
             st.seg.deinit();
             st.mapped.close();
-            _ = linux.close(st.root_fd);
+            st.root.release();
             self.stage = null;
         }
     }

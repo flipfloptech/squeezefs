@@ -544,7 +544,7 @@ fn mountMain(ctx: *Ctx) u8 {
         }) catch return ctx.failed("out of memory (job fabric)", .{});
         node = n;
         n.setManager(if (wire) |wp| wp.posture == .manager else true);
-        n.bindFsck(be, &fs, env, ctx.budget_bytes, if (cfg.cache_paths.len > 0) cfg.cache_paths[0] else null) catch |e| return ctx.failed("the fsck engine could not bind over the live set ({s})", .{@errorName(e)});
+        n.bindFsck(be, &fs, env, ctx.budget_bytes) catch |e| return ctx.failed("the fsck engine could not bind over the live set ({s})", .{@errorName(e)});
         mem_budget.authority.register(n.budgetComponent());
         n.start(if (wire) |wp| &wp.svc else null) catch |e| return ctx.failed("the job fabric could not start ({s}) — see the log", .{@errorName(e)});
         // A remote worker's connection ending expires its shard leases.

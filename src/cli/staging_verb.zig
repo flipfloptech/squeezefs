@@ -2,11 +2,14 @@
 //! promote <sqmeta uri>` (charter §8 `staging`; `docs/porting/stats_cli.md`
 //! §4.4 — the port adds `list`, which the reference lacked).
 //!
-//! `list`: this node's staging roots for the set as the set config records
-//! them, each with its marker (the set uuid, epoch, mount slot — `bound`
-//! / `foreign` / `none`), the ring segment's size, and the live custody
-//! units a recovery scan finds (records, bytes, torn) — read-only, no
-//! guard (the scan maps the segment and adopts nothing).
+//! `list`: this node's staging roots for the set — every MEMBER root
+//! (`<cache path>/member-<mount slot>`, 0003 §T.1) under each cache path
+//! the set config records — each with its marker (the set uuid, epoch, the
+//! owner's mount slot, appender id and last pid — `bound` / `foreign` /
+//! `none`), whether its owner's claim is LIVE (read off `/proc/locks`, no
+//! lock taken), the ring segment's size, and the custody units a recovery
+//! scan finds (records, bytes, torn) — read-only, no guard (the scan maps
+//! the segment and adopts nothing).
 //!
 //! `promote`: the DISMOUNT PASS run offline — the set opened through the
 //! writer door with the data plane, which recovers the ring's residue (a
@@ -49,6 +52,10 @@ pub const RootRow = struct {
     path: []const u8,
     binding: Binding,
     mount_slot: u32,
+    appender_id: u32 = 0,
+    owner_pid: u32 = 0,
+    /// The owner's claim is held (a mounted member).
+    owner_live: bool = false,
     set_epoch: u64,
     segment_bytes: u64,
     live_units: u64,
@@ -56,13 +63,14 @@ pub const RootRow = struct {
     torn: u64,
 
     pub fn writeJson(self: RootRow, w: *Io.Writer) Io.Writer.Error!void {
-        try w.print("{{\"dir\":\"{s}\",\"binding\":\"{s}\",\"mount_slot\":{d},\"set_epoch\":{d},\"segment_bytes\":{d},\"live_units\":{d},\"live_bytes\":{d},\"torn\":{d}}}", .{ self.path, @tagName(self.binding), self.mount_slot, self.set_epoch, self.segment_bytes, self.live_units, self.live_bytes, self.torn });
+        try w.print("{{\"dir\":\"{s}\",\"binding\":\"{s}\",\"mount_slot\":{d},\"appender_id\":{d},\"owner_pid\":{d},\"owner_live\":{},\"set_epoch\":{d},\"segment_bytes\":{d},\"live_units\":{d},\"live_bytes\":{d},\"torn\":{d}}}", .{ self.path, @tagName(self.binding), self.mount_slot, self.appender_id, self.owner_pid, self.owner_live, self.set_epoch, self.segment_bytes, self.live_units, self.live_bytes, self.torn });
     }
 
     pub fn writeText(self: RootRow, w: *Io.Writer) Io.Writer.Error!void {
         try w.print("{s}: {s}", .{ self.path, @tagName(self.binding) });
-        if (self.binding == .bound) try w.print(" (mount slot {d}, set epoch {d})", .{ self.mount_slot, self.set_epoch });
-        try w.print("; segment {d} MiB; {d} live custody unit(s), {d} B; {d} torn\n", .{ self.segment_bytes >> 20, self.live_units, self.live_bytes, self.torn });
+        if (self.binding == .bound) try w.print(" (mount slot {x:0>8}, appender {d}, {s} pid {d}, set epoch {d})", .{ self.mount_slot, self.appender_id, if (self.owner_live) "LIVE" else "last", self.owner_pid, self.set_epoch });
+        if (self.owner_live) return w.print("; segment {d} MiB; custody the live owner's (its .stats)\n", .{self.segment_bytes / derive.MiB});
+        try w.print("; segment {d} MiB; {d} live custody unit(s), {d} B; {d} torn\n", .{ self.segment_bytes / derive.MiB, self.live_units, self.live_bytes, self.torn });
     }
 };
 
@@ -89,16 +97,26 @@ pub fn inspectRoot(gpa: std.mem.Allocator, pool: *uring_fs.Pool, root: []const u
         return row;
     };
     row.binding = bindingOf(marker, set_uuid);
+    row.owner_live = staging.Ring.ownerLive(root);
     if (marker) |m| {
         row.mount_slot = m.mount_slot;
+        row.appender_id = m.appender_id;
+        row.owner_pid = m.owner_pid;
         row.set_epoch = m.set_epoch;
     }
-    if (row.segment_bytes == 0) return row;
-    const root_fd = staging.Ring.openRoot(root) catch return row;
+    // A LIVE member's ring is its owner's alone (its `.stats` is the
+    // census); a dead one is scanned over a private mapping — no byte of a
+    // member's file is ever written from here (0003 §T.1).
+    if (row.segment_bytes == 0 or row.owner_live) return row;
+    var zbuf: [linux.PATH_MAX:0]u8 = undefined;
+    const z = std.fmt.bufPrintSentinel(&zbuf, "{s}", .{root}, 0) catch return row;
+    const rc = linux.open(z.ptr, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .NOFOLLOW = true, .CLOEXEC = true }, 0);
+    if (linux.errno(rc) != .SUCCESS) return row;
+    const root_fd: linux.fd_t = @intCast(rc);
     defer _ = linux.close(root_fd);
-    var mapped = staging.Ring.openSegment(root_fd, plane_mod.STAGING_SEGMENT_NAME, row.segment_bytes) catch return row;
+    var mapped = staging.Ring.inspectSegment(root_fd, plane_mod.STAGING_SEGMENT_NAME) orelse return row;
     defer mapped.close();
-    var seg = staging.Segment.init(gpa, mapped.map, mapped.backing()) catch return row;
+    var seg = staging.Segment.init(gpa, mapped.map, mapped.inspectBacking()) catch return row;
     defer seg.deinit();
     const rep = seg.recover();
     row.live_units = rep.adopted;
@@ -161,13 +179,22 @@ fn list(p: cli.Process, tgt: args.Target, json: bool) u8 {
     defer cfg.deinit(p.gpa);
     if (json) p.stdout.writeAll("{\"staging_roots\":[") catch {};
     if (!json and cfg.cache_paths.len == 0) p.stdout.writeAll("cache-less set: no staging roots\n") catch {};
-    for (cfg.cache_paths, 0..) |root, i| {
-        const row = inspectRoot(p.gpa, pool, root, sb.set_uuid);
-        if (json) {
-            if (i != 0) p.stdout.writeAll(",") catch {};
-            row.writeJson(p.stdout) catch return cli.exit_failed;
-        } else row.writeText(p.stdout) catch return cli.exit_failed;
+    var rows: usize = 0;
+    for (cfg.cache_paths) |container| {
+        var it = staging.Ring.MemberIter.open(container) orelse continue;
+        defer it.close();
+        while (it.next()) |slot| {
+            var buf: [linux.PATH_MAX]u8 = undefined;
+            const root = staging.Ring.memberRootPath(&buf, container, slot) catch continue;
+            const row = inspectRoot(p.gpa, pool, root, sb.set_uuid);
+            if (json) {
+                if (rows != 0) p.stdout.writeAll(",") catch {};
+                row.writeJson(p.stdout) catch return cli.exit_failed;
+            } else row.writeText(p.stdout) catch return cli.exit_failed;
+            rows += 1;
+        }
     }
+    if (!json and cfg.cache_paths.len != 0 and rows == 0) p.stdout.writeAll("no member staging roots yet (no mount has bound one)\n") catch {};
     if (json) p.stdout.writeAll("]}\n") catch {};
     p.stdout.flush() catch {};
     return cli.exit_ok;
@@ -202,18 +229,23 @@ fn promote(p: cli.Process, meta_uri: []const u8) u8 {
 
 const testing = std.testing;
 
-test "the binding verdict: no marker → none; the set's uuid → bound; another → foreign; the rows render" {
+test "the binding verdict: no marker → none; the set's uuid → bound; another → foreign; the member rows render (the owner, its claim)" {
     const u: [16]u8 = @splat(7);
     try testing.expectEqual(Binding.none, bindingOf(null, u));
     try testing.expectEqual(Binding.bound, bindingOf(.{ .set_uuid = u, .set_epoch = 3, .node_token = 1, .mount_slot = 2 }, u));
     try testing.expectEqual(Binding.foreign, bindingOf(.{ .set_uuid = @splat(9), .set_epoch = 3, .node_token = 1, .mount_slot = 2 }, u));
     var out: Io.Writer.Allocating = .init(testing.allocator);
     defer out.deinit();
-    const row: RootRow = .{ .path = "/c", .binding = .bound, .mount_slot = 2, .set_epoch = 3, .segment_bytes = 64 << 20, .live_units = 5, .live_bytes = 4096, .torn = 0 };
+    const row: RootRow = .{ .path = "/c/member-80001234", .binding = .bound, .mount_slot = 0x8000_1234, .appender_id = 1, .owner_pid = 4242, .owner_live = true, .set_epoch = 3, .segment_bytes = 64 << 20, .live_units = 5, .live_bytes = 4096, .torn = 0 };
     try row.writeJson(&out.writer);
-    try testing.expectEqualStrings("{\"dir\":\"/c\",\"binding\":\"bound\",\"mount_slot\":2,\"set_epoch\":3,\"segment_bytes\":67108864,\"live_units\":5,\"live_bytes\":4096,\"torn\":0}", out.written());
+    try testing.expectEqualStrings("{\"dir\":\"/c/member-80001234\",\"binding\":\"bound\",\"mount_slot\":2147488308,\"appender_id\":1,\"owner_pid\":4242,\"owner_live\":true,\"set_epoch\":3,\"segment_bytes\":67108864,\"live_units\":5,\"live_bytes\":4096,\"torn\":0}", out.written());
     out.clearRetainingCapacity();
     try row.writeText(&out.writer);
-    try testing.expectEqualStrings("/c: bound (mount slot 2, set epoch 3); segment 64 MiB; 5 live custody unit(s), 4096 B; 0 torn\n", out.written());
+    try testing.expectEqualStrings("/c/member-80001234: bound (mount slot 80001234, appender 1, LIVE pid 4242, set epoch 3); segment 64 MiB; custody the live owner's (its .stats)\n", out.written());
+    out.clearRetainingCapacity();
+    var dead = row;
+    dead.owner_live = false;
+    try dead.writeText(&out.writer);
+    try testing.expectEqualStrings("/c/member-80001234: bound (mount slot 80001234, appender 1, last pid 4242, set epoch 3); segment 64 MiB; 5 live custody unit(s), 4096 B; 0 torn\n", out.written());
     try testing.expectEqual(@as(u64, 0), segmentBytes("/build/tmp/no-such-staging-root"));
 }

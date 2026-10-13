@@ -95,13 +95,12 @@ const linux_arm = if (is_linux) struct {
             inject(p.env, set) catch |e| return self.failed("the injection seam failed ({s})", .{@errorName(e)});
             const facts = derive.facts();
             const budget_bytes = mem_budget.authority.resolveBudgetNow(.{ .io = set.io, .env = p.env, .facts = facts });
-            const staging_root: ?[]const u8 = if (set.cfg.cache_paths.len != 0) set.cfg.cache_paths[0] else null;
+            const cache_root: ?[]const u8 = if (set.cfg.cache_paths.len != 0) set.cfg.cache_paths[0] else null;
             const bound = runner.linux.bind(gpa, set.io, set.be, set.plane, .{
                 .env = p.env,
                 .mode = .offline,
                 .mem_budget = budget_bytes,
                 .shard = if (a.shards) |s| .{ .k = s.k, .n = s.n } else null,
-                .staging_root = staging_root,
             }) catch |e| return self.failed("cannot bind the set ({s})", .{@errorName(e)});
             defer runner.linux.destroy(bound);
             // The quarantine home: `--quarantine-dir`, else `<first cache
@@ -113,7 +112,7 @@ const linux_arm = if (is_linux) struct {
             if (a.repair and a.apply) {
                 var home_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
                 const home: []const u8 = a.quarantine_dir orelse blk: {
-                    const root = staging_root orelse return self.failed("--apply needs a quarantine home: the set has no cache path — pass --quarantine-dir DIR", .{});
+                    const root = cache_root orelse return self.failed("--apply needs a quarantine home: the set has no cache path — pass --quarantine-dir DIR", .{});
                     break :blk std.fmt.bufPrint(&home_buf, "{s}/quarantine", .{root}) catch return self.failed("the quarantine path is too long", .{});
                 };
                 sink = runner.linux.DirSink.init(gpa, set.be.pool, home) catch return self.failed("out of memory", .{});

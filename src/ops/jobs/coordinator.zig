@@ -1443,11 +1443,11 @@ pub const Node = struct {
     /// The fsck engine over the LIVE binding: the `JobType.fsck` body (one
     /// pass = one online run; the admin lane reads its last report). The
     /// filesystem's 4a manager is the ladder's exclusive lease.
-    pub fn bindFsck(self: *Node, be: *meta_set.MetaSet, fs: ?*fsck_runner.linux.BackendFs, env: *const std.process.Environ.Map, mem_budget: u64, staging_root: ?[]const u8) !void {
-        const b = try fsck_runner.linux.bind(self.gpa, self.io, be, self.plane, .{ .env = env, .mode = .online, .mem_budget = mem_budget, .fs = fs, .staging_root = staging_root });
+    pub fn bindFsck(self: *Node, be: *meta_set.MetaSet, fs: ?*fsck_runner.linux.BackendFs, env: *const std.process.Environ.Map, mem_budget: u64) !void {
+        const b = try fsck_runner.linux.bind(self.gpa, self.io, be, self.plane, .{ .env = env, .mode = .online, .mem_budget = mem_budget, .fs = fs });
         errdefer fsck_runner.linux.destroy(b);
         const body = try self.gpa.create(fsck_runner.linux.JobBody);
-        body.* = .{ .gpa = self.gpa, .be = be, .plane = self.plane, .env = env, .mem_budget = mem_budget, .fs = fs, .staging_root = staging_root, .bound = b, .fleet = if (self.opts.fleet_jobs) self.coord.fleet() else seams.FleetDispatch.none };
+        body.* = .{ .gpa = self.gpa, .be = be, .plane = self.plane, .env = env, .mem_budget = mem_budget, .fs = fs, .bound = b, .fleet = if (self.opts.fleet_jobs) self.coord.fleet() else seams.FleetDispatch.none };
         self.fsck_body = body;
         self.fabric.registerBody(.fsck, body.body());
     }

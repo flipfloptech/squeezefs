@@ -281,7 +281,8 @@ pub fn classifyDir(io: Io, path: []const u8) DirVerdict {
     var it = d.iterate();
     var any = false;
     while (it.next(io) catch null) |entry| {
-        if (std.mem.eql(u8, entry.name, staging.Ring.MARKER_NAME)) return .empty_or_ours;
+        // A member root (0003 §T.1) or a root-level marker: ours.
+        if (std.mem.eql(u8, entry.name, staging.Ring.MARKER_NAME) or staging.Ring.memberSlotOf(entry.name) != null) return .empty_or_ours;
         any = true;
     }
     return if (any) .stranger else .empty_or_ours;
@@ -377,8 +378,16 @@ fn setCachePaths(p: cli.Process, tgt: args.Target, raw_paths: []const u8, force:
 
 const testing = std.testing;
 
-test "the directory precheck: absent, empty, a marker-bearing root (ours) pass; a non-empty stranger and a file do not" {
+test "the directory precheck: absent, empty, a marker-bearing root and a cache path holding member roots (ours) pass; a non-empty stranger and a file do not" {
     try testing.expectEqual(DirVerdict.absent, classifyDir(testing.io, "/build/tmp/config-verb-absent-dir"));
     try testing.expectEqual(DirVerdict.not_a_directory, classifyDir(testing.io, "/proc/self/status"));
     try testing.expectEqual(DirVerdict.stranger, classifyDir(testing.io, "/proc/self"));
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(testing.io, "member-80001234");
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(testing.io, &buf);
+    try testing.expectEqual(DirVerdict.empty_or_ours, classifyDir(testing.io, buf[0..n]));
+    try tmp.dir.createDirPath(testing.io, "member-not-hex");
+    try testing.expectEqual(DirVerdict.empty_or_ours, classifyDir(testing.io, buf[0..n]));
 }

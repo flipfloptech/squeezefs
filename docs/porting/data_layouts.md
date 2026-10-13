@@ -319,6 +319,13 @@ unchanged, design §5.7).
   custody ⇒ REFUSE the mount loud (`staging_foreign_scope_refusals`); otherwise dead generation ⇒ WIPE both segment
   trees + gds files (`staging_generation_discards`) and restamp. Marker I/O = io_uring + `fdatasync` (never adopted
   volatile).
+* **Port law (0003 §T.1, 0002 row 501):** the root is the MEMBER's — `<cache path>/member-<mount slot as 8
+  hex>` holds its marker, `staging_segment/` and `cache_segment/`; the mount slot is the member scope of the
+  identity the mount presents (the manager's 0, a joiner's mount-point derivation), stable across its
+  incarnations. The owner's exclusive `flock` on the root dir is the LIVE claim, taken before the marker is
+  read: a held claim refuses `StagingOwnerLive` (whatever the set), another member's marker refuses
+  `StagingForeignOwner` (never adopted, never wiped), only the member's own successor adopts; the binary
+  marker is v3 (80 B: + `appender_id u32 ‖ owner_pid u32`). Liveness is the claim, never the ring's content.
 * `.squeezefs_staging_format` = `"squeezefs-staging-format-v1\n" ‖ version` (`:451-466`); `STAGING_FORMAT_VERSION = 3`
   read ceiling, write version 3 iff writer-scoped else 2 (`:50-64`); a FUTURE version refuses the root as a unit
   (`:493-508`) — the forward-only downgrade fence.

@@ -2331,6 +2331,181 @@ test "smoke: A JOINER'S CLEAN UNMOUNT AND REJOIN while the manager stays up — 
     std.debug.print("smoke: rejoin: {d} cycles, {d} files, {d} stale projection row(s) loaded unleased in all\n", .{ rejoin_cycles, (rejoin_cycles + 1) * 49, stale_rows });
 }
 
+/// The member-scope row's residents: A's 64 KiB files (staged in A's ring,
+/// one block each well under it) and B's.
+const scope_a_files: usize = 200;
+const scope_b_files: usize = 8;
+
+/// The last line a bring-up logged for its staging ring under a root whose
+/// path contains `member_root_tail` (`<cache>/member-<slot>`): its
+/// `recovered N record(s)` count.
+fn stagingRecoveredOf(log_text: []const u8, member_root_tail: []const u8) ?u64 {
+    var it = std.mem.splitScalar(u8, log_text, '\n');
+    var last: ?u64 = null;
+    while (it.next()) |line| {
+        if (std.mem.indexOf(u8, line, "staging ring ") == null or std.mem.indexOf(u8, line, member_root_tail) == null) continue;
+        last = numberAfter(line, "recovered ");
+    }
+    return last;
+}
+
+test "smoke: TWO MOUNTS OF ONE SET ON ONE HOST, one cache path — each member binds its OWN staging root (0003 §T.1): A (the manager) stages 200 files, B joins beside A's LIVE ring and recovers 0 records; `staging list` shows both roots live; a SECOND SET formatted on the same cache path is refused at its mount naming A's live claim (never wiping A's ring); B's dismount promotes its own 8 files, A's dismount A's 200 — every one sha-equal after a remount; fsck --offline --scrub 0 findings" {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    try rig.env.put("SQUEEZEFS_MW_BIND", "127.0.0.1:0");
+    var t_owner_text: [8]u8 = undefined;
+    try rig.env.put("SQUEEZEFS_TEST_MEMBERSHIP_T_OWNER_MS", try std.fmt.bufPrint(&t_owner_text, "{d}", .{smoke_t_owner_ms}));
+    try rig.formatSet(true);
+    try rig.createImage();
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(0);
+    var script: std.Io.Writer.Allocating = .init(gpa);
+    defer script.deinit();
+    // A stages its residents (the ring holds them until A's dismount).
+    {
+        try script.writer.print("mkdir a && i=0; while [ $i -lt {d} ]; do dd if=\"$1/image\" of=a/p$i bs=64k skip=$i count=1 status=none; i=$((i + 1)); done; sha256sum a/* > \"$1/scope.sha\"; ls a | wc -l", .{scope_a_files});
+        const out = try rig.onMount(script.written());
+        defer gpa.free(out);
+        try testing.expectEqual(scope_a_files, try std.fmt.parseInt(usize, std.mem.trimEnd(u8, out, "\n"), 10));
+    }
+    // A's ring holds them (the pool's charged footprint; a 64 KiB image is
+    // one record each).
+    const a_staged = blk: {
+        const sa = try rig.stats();
+        defer gpa.free(sa);
+        break :blk numberAfter(sa, "\"current_staged_write_bytes\":") orelse 0;
+    };
+    try testing.expect(a_staged >= scope_a_files * 64 * 1024);
+    // B joins beside A's LIVE ring: its own root, nothing recovered.
+    const b = try Peer.init(rig, "b");
+    defer b.deinit();
+    try b.spawn(&.{});
+    _ = try b.awaitReady();
+    {
+        const text = try b.readLog();
+        defer gpa.free(text);
+        try testing.expect(std.mem.indexOf(u8, text, "mounted JOINED as appender 1") != null);
+        try testing.expectEqual(@as(?u64, 0), stagingRecoveredOf(text, "/member-"));
+        const sb = try b.stats();
+        defer gpa.free(sb);
+        try testing.expectEqual(@as(?u64, 0), numberAfter(sb, "\"staging_recovery_records\":"));
+        try testing.expectEqual(@as(?u64, 0), numberAfter(sb, "\"staging_member_residue_roots\":"));
+        const sa = try rig.stats();
+        defer gpa.free(sa);
+        try testing.expectEqual(a_staged, numberAfter(sa, "\"current_staged_write_bytes\":") orelse 0);
+        const at = try rig.readLog();
+        defer gpa.free(at);
+        try testing.expectEqual(@as(?u64, 0), stagingRecoveredOf(at, "/member-00000000"));
+        std.debug.print("smoke: member scope: A stages {d} files ({d} B charged) in member-00000000; B joined beside them and recovered {d} record(s) in its own root\n", .{ scope_a_files, a_staged, stagingRecoveredOf(text, "/member-") orelse 0 });
+    }
+    // Both roots under the cache path, both owners live.
+    {
+        const r = try rig.squeezefs(&.{ "staging", "list", "--json", rig.meta_uri });
+        defer rig.freeRun(r);
+        try testing.expect(r.term.success());
+        try testing.expect(std.mem.indexOf(u8, r.stdout, "/member-00000000\",\"binding\":\"bound\",\"mount_slot\":0,\"appender_id\":0,") != null);
+        try testing.expectEqual(@as(usize, 2), std.mem.count(u8, r.stdout, "\"owner_live\":true"));
+        std.debug.print("smoke: member scope: staging list: {s}", .{r.stdout});
+    }
+    // B's own residents.
+    {
+        script.clearRetainingCapacity();
+        try script.writer.print("mkdir b && i=0; while [ $i -lt {d} ]; do dd if=\"$1/image\" of=b/q$i bs=64k skip=$((i + {d})) count=1 status=none; i=$((i + 1)); done; sha256sum b/* >> \"$1/scope.sha\"; ls b | wc -l", .{ scope_b_files, scope_a_files });
+        const out = try b.onMount(script.written());
+        defer gpa.free(out);
+        try testing.expectEqual(scope_b_files, try std.fmt.parseInt(usize, std.mem.trimEnd(u8, out, "\n"), 10));
+    }
+    // A SECOND SET on the same cache path: its manager's root IS A's
+    // member root name — the live claim refuses it (the old ladder read
+    // A's marker as another set's and WIPED A's live ring).
+    {
+        const c_img = try std.fmt.allocPrint(gpa, "{s}/c-vol.img", .{rig.work});
+        defer gpa.free(c_img);
+        const c_uri = try std.fmt.allocPrint(gpa, "sqmeta://{s}", .{c_img});
+        defer gpa.free(c_uri);
+        const c_data = try std.fmt.allocPrint(gpa, "sqdata://{s}/c-d0.img,{s}/c-d1.img", .{ rig.work, rig.work });
+        defer gpa.free(c_data);
+        const c_log = try std.fmt.allocPrint(gpa, "{s}/daemon-c.log", .{rig.work});
+        defer gpa.free(c_log);
+        const c_mp = try std.fmt.allocPrintSentinel(gpa, "/build/tmp/mnt-{d}-c", .{linux.getpid()}, 0);
+        defer gpa.free(c_mp);
+        _ = linux.mkdir(c_mp.ptr, 0o755);
+        defer _ = linux.rmdir(c_mp.ptr);
+        defer _ = linux.umount2(c_mp.ptr, linux.MNT.DETACH);
+        script.clearRetainingCapacity();
+        try script.writer.print("truncate -s {d} c-vol.img && truncate -s {d} c-d0.img && truncate -s {d} c-d1.img && echo ok", .{ volume_len, data_len, data_len });
+        const made = try rig.shOk(rig.work, script.written());
+        gpa.free(made);
+        {
+            const r = try rig.squeezefs(&.{ "format", "--disk-cache-paths", rig.cache, c_uri, c_data });
+            defer rig.freeRun(r);
+            if (!r.term.success()) std.debug.print("\nformat C: {s}\n", .{r.stderr});
+            try testing.expect(r.term.success());
+        }
+        const r = try rig.squeezefs(&.{ "mount", "--daemon", "--log-file", c_log, c_uri, c_mp });
+        defer rig.freeRun(r);
+        if (r.term.success()) _ = rig.squeezefs(&.{ "umount", c_mp }) catch {};
+        try testing.expectEqual(std.process.Child.Term{ .exited = 1 }, r.term);
+        try testing.expect(std.mem.indexOf(u8, r.stderr, "StagingOwnerLive") != null);
+        const c_text = try Io.Dir.cwd().readFileAlloc(io, c_log, gpa, .limited(1 << 20));
+        defer gpa.free(c_text);
+        try testing.expect(std.mem.indexOf(u8, c_text, "held LIVE by a mount of ANOTHER SET on this cache path") != null);
+        try testing.expectEqual(@as(usize, 0), try fuseMountsOf(gpa, io, c_mp));
+        const sa = try rig.stats();
+        defer gpa.free(sa);
+        try testing.expectEqual(a_staged, numberAfter(sa, "\"current_staged_write_bytes\":") orelse 0);
+        try testing.expectEqual(@as(?u64, 0), numberAfter(sa, "\"staging_generation_discards\":"));
+        std.debug.print("smoke: member scope: a second set on the same cache path refused at its mount (StagingOwnerLive); A's ring intact ({d} B charged), 0 discards\n", .{a_staged});
+    }
+    // B's dismount promotes ITS residents; A's ring is untouched.
+    const mark_b = try b.logLen();
+    try b.umount();
+    try b.expectCleanExit("B's unmount");
+    {
+        const text = try b.readLog();
+        defer gpa.free(text);
+        var want_buf: [64]u8 = undefined;
+        try testing.expect(std.mem.indexOf(u8, text[mark_b..], try std.fmt.bufPrint(&want_buf, "dismount promotion: {d} staged file(s)", .{scope_b_files})) != null);
+        try testing.expect(std.mem.indexOf(u8, text[mark_b..], ", 0 failed") != null);
+        const sa = try rig.stats();
+        defer gpa.free(sa);
+        try testing.expectEqual(a_staged, numberAfter(sa, "\"current_staged_write_bytes\":") orelse 0);
+        // A reads B's promoted files.
+        script.clearRetainingCapacity();
+        try script.writer.print("grep ' b/' \"$1/scope.sha\" | sha256sum --quiet -c && echo ok", .{});
+        const out = try rig.onMount(script.written());
+        defer gpa.free(out);
+        try testing.expectEqualStrings("ok\n", out);
+    }
+    // A's dismount promotes ITS residents — all of them.
+    const mark_a = try rig.logLen();
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+    {
+        const text = try rig.readLog();
+        defer gpa.free(text);
+        var want_buf: [64]u8 = undefined;
+        const want = try std.fmt.bufPrint(&want_buf, "dismount promotion: {d} staged file(s)", .{scope_a_files});
+        try testing.expect(std.mem.indexOf(u8, text[mark_a..], want) != null);
+    }
+    _ = try fsckClean(rig, "the member-scope row");
+    // Every file of both members after a remount.
+    const mark_r = try rig.logLen();
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(mark_r);
+    {
+        const out = try rig.onMount("sha256sum --quiet -c \"$1/scope.sha\" && echo ok");
+        defer gpa.free(out);
+        try testing.expectEqualStrings("ok\n", out);
+    }
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+    std.debug.print("smoke: member scope: B promoted its {d}, A its {d}; every file sha-equal after the remount; fsck clean\n", .{ scope_b_files, scope_a_files });
+}
+
 // ---------------------------------------------------------------------------
 // THE KILL ROWS (charter §5.5 "Death and recovery", "PARK-AND-RECLAIM",
 // §8 `appender clear`): two daemons over real TCP, `kill -9` of either.
@@ -6950,19 +7125,15 @@ test "smoke: ONLINE FSCK THROUGH THE ADMIN LANE — the fill (dirs, 200 packed f
         std.debug.print("smoke[fsck-online]: 3 online runs inside the 8-way cp storm: 0 findings; shield engagement over the runs {d} (current-era + epoch + in-flight exemptions + suspects cleared)\n", .{exempted});
     }
     try rig.expectAlive("the storm");
-    // 4. The two-daemon set. The rig's daemons share ONE cache root (the
-    // paths are the set's format decision), and the staging marker is
-    // scoped to the set alone today — a second mount on the host adopts
-    // the first's live residents as its own and promotes them at ITS
-    // dismount (through slots it does not hold: 197 commits refused, the
-    // pack's pin arithmetic tripped). A is remounted first: its dismount
-    // promotes every resident (charter §8 `umount`), and B's recovery
-    // must find nothing.
-    try rig.umount();
-    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
-    const remount_mark = try rig.logLen();
-    try rig.spawnMount(&.{});
-    _ = try rig.awaitReady(remount_mark);
+    // 4. The two-daemon set. The rig's daemons share ONE cache path (the
+    // set's format decision) but never one ring: each member binds its own
+    // root under it (0003 §T.1) — B joins beside A's LIVE residents (the
+    // fill's packed files, still staged) and recovers none of them.
+    const a_staged = blk: {
+        const sa = try rig.stats();
+        defer gpa.free(sa);
+        break :blk numberAfter(sa, "\"current_staged_write_bytes\":") orelse 0;
+    };
     const b = try Peer.init(rig, "b");
     defer b.deinit();
     try b.spawn(&.{});
@@ -6971,6 +7142,9 @@ test "smoke: ONLINE FSCK THROUGH THE ADMIN LANE — the fill (dirs, 200 packed f
         const sb = try b.stats();
         defer gpa.free(sb);
         try testing.expectEqual(@as(u64, 0), numberAfter(sb, "\"staging_recovery_records\":") orelse 1);
+        const sa = try rig.stats();
+        defer gpa.free(sa);
+        try testing.expectEqual(a_staged, numberAfter(sa, "\"current_staged_write_bytes\":") orelse 0);
     }
     {
         const script = try matrixCreateScript(gpa);

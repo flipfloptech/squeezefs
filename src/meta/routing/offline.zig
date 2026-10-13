@@ -18,9 +18,10 @@
 //! home — is never retired and slot 0 never moves (`ledger.nativeSlotOf`).
 //!
 //! KD-8: a membership change changes the set epoch, never the set uuid, so
-//! the staging roots are rebound in two phases: refuse while any staged
-//! custody is live, write the DUAL marker `{E, prev = E_old}`, flip, then
-//! `{E}` (`staging.bindVerdict` reads a dual marker as same-epoch).
+//! every member's staging root (0003 §T.1) is rebound in two phases: refuse
+//! while any member is live or any staged custody is pending, write the
+//! DUAL marker `{E, prev = E_old}` (the owner kept), flip, then `{E}`
+//! (`staging.bindVerdict` reads a dual marker as same-epoch).
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -85,7 +86,8 @@ pub const Options = struct {
     pool: *uring_fs.Pool,
     cache_budget_bytes: u64,
     cpus: u32,
-    /// The set config's cache paths (the KD-8 roots); empty on a cache-less set.
+    /// The set config's cache paths (the KD-8 rebind walks every member
+    /// root under each); empty on a cache-less set.
     staging_roots: []const []const u8 = &.{},
 };
 
@@ -177,31 +179,60 @@ pub const Rebind = struct {
     new_epoch: u64,
 };
 
-/// Phase 1: every root bound to this set must hold NO live staged custody
-/// (a unit a mount has yet to drain would be discarded by the rebind);
-/// then the DUAL marker.
-pub fn stagingRebindPrepare(gpa: Allocator, pool: *uring_fs.Pool, roots: []const []const u8, r: Rebind) Error!void {
-    const staging_verb = @import("../../cli/staging_verb.zig");
-    for (roots) |root| {
-        const row = staging_verb.inspectRoot(gpa, pool, root, r.set_uuid);
-        if (row.binding == .foreign or row.binding == .none) continue;
-        if (row.live_units != 0) {
-            log.err("staging drain barrier refused (KD-8): {d} pending write-custody unit(s) remain under {s} — mount the filesystem, let writeback drain (sync + clean unmount), then re-run; nothing was changed", .{ row.live_units, root });
-            return error.StagingCustodyLive;
+/// Phase 1: every MEMBER root (0003 §T.1) under every cache path bound to
+/// this set must have no live owner and hold NO staged custody (a unit a
+/// member has yet to drain would be discarded by the rebind); then the
+/// DUAL marker, its owner kept.
+pub fn stagingRebindPrepare(gpa: Allocator, pool: *uring_fs.Pool, containers: []const []const u8, r: Rebind) Error!void {
+    for (containers) |container| {
+        var it = staging.Ring.MemberIter.open(container) orelse continue;
+        defer it.close();
+        while (it.next()) |slot| {
+            var buf: [linux.PATH_MAX]u8 = undefined;
+            const root = staging.Ring.memberRootPath(&buf, container, slot) catch return error.StagingRefused;
+            const m = (try boundMarker(gpa, pool, root, r)) orelse continue;
+            var next = m;
+            next.set_epoch = r.new_epoch;
+            next.prev_set_epoch = r.old_epoch;
+            try writeMarker(pool, root, next);
         }
-        try writeMarker(pool, root, .{ .set_uuid = r.set_uuid, .set_epoch = r.new_epoch, .node_token = 0, .mount_slot = 0, .prev_set_epoch = r.old_epoch });
     }
 }
 
-/// Phase 2: the single new-epoch marker on every rebound root.
-pub fn stagingRebindFinalize(gpa: Allocator, pool: *uring_fs.Pool, roots: []const []const u8, r: Rebind) Error!void {
-    const staging_verb = @import("../../cli/staging_verb.zig");
-    for (roots) |root| {
-        const row = staging_verb.inspectRoot(gpa, pool, root, r.set_uuid);
-        if (row.binding == .foreign or row.binding == .none) continue;
-        try writeMarker(pool, root, .{ .set_uuid = r.set_uuid, .set_epoch = r.new_epoch, .node_token = 0, .mount_slot = 0 });
+/// Phase 2: the single new-epoch marker on every rebound member root.
+pub fn stagingRebindFinalize(gpa: Allocator, pool: *uring_fs.Pool, containers: []const []const u8, r: Rebind) Error!void {
+    for (containers) |container| {
+        var it = staging.Ring.MemberIter.open(container) orelse continue;
+        defer it.close();
+        while (it.next()) |slot| {
+            var buf: [linux.PATH_MAX]u8 = undefined;
+            const root = staging.Ring.memberRootPath(&buf, container, slot) catch return error.StagingRefused;
+            const m = (try boundMarker(gpa, pool, root, r)) orelse continue;
+            var next = m;
+            next.set_epoch = r.new_epoch;
+            next.prev_set_epoch = null;
+            try writeMarker(pool, root, next);
+        }
     }
     rstats.staging_rebind_barriers.inc();
+}
+
+/// A member root's marker iff it is bound to this set: a live owner or a
+/// pending custody unit refuses the rebind; another set's root (or none)
+/// is not this rebind's.
+fn boundMarker(gpa: Allocator, pool: *uring_fs.Pool, root: []const u8, r: Rebind) Error!?staging.Marker {
+    const staging_verb = @import("../../cli/staging_verb.zig");
+    const row = staging_verb.inspectRoot(gpa, pool, root, r.set_uuid);
+    if (row.binding == .foreign or row.binding == .none) return null;
+    if (row.owner_live) {
+        log.err("staging drain barrier refused (KD-8): the member root {s} is held LIVE (appender {d}, pid {d}) — unmount every member of the set first; nothing was changed", .{ root, row.appender_id, row.owner_pid });
+        return error.StagingCustodyLive;
+    }
+    if (row.live_units != 0) {
+        log.err("staging drain barrier refused (KD-8): {d} pending write-custody unit(s) remain under {s} — mount the filesystem as that member (mount slot {x:0>8}), let writeback drain (sync + clean unmount), then re-run; nothing was changed", .{ row.live_units, root, row.mount_slot });
+        return error.StagingCustodyLive;
+    }
+    return (staging.Ring.readMarker(pool, root) catch return error.StagingRefused) orelse null;
 }
 
 fn writeMarker(pool: *uring_fs.Pool, root: []const u8, m: staging.Marker) Error!void {

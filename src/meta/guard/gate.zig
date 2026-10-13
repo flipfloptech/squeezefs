@@ -578,7 +578,10 @@ pub const Guard = struct {
     /// Stop the beat (joined) — before anything else of the dismount.
     pub fn stopHeartbeat(g: *Guard) void {
         const fut = &(g.hb_fut orelse return);
-        g.hb_stop.store(1, .release);
+        // The wake IS the store: `tick.wake` swaps the token in (release) and
+        // wakes only a word that held none — a store before it made the swap
+        // read a token and skip the futex wake, and the parked beat waited
+        // out the 2 s liveness tick on every clean dismount.
         tick.wake(g.io, &g.hb_stop);
         fut.await(g.io);
         g.hb_fut = null;

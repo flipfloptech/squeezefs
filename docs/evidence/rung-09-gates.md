@@ -604,3 +604,94 @@ agents' suites alongside).
   fail — the handover row** (B's chmod EAGAIN, the attributed class). The
   online fsck row passed in all five. macOS `zig build gate` on the landed
   tree: **28/28, 2157/2184** (27 skipped; unit 2049).
+
+## 11. Rung 10 — the gates' artifact identity, the tick CQE ledger, the fleet heartbeat's stop (2026-10-13)
+
+The three items §10 left open. Each was pinned red first, fixed, and looped
+on the venue under an 8-way `yes` load (loadavg 6–8, another agent's smoke
+rows alongside).
+
+- **Every gate step runs its own build's artifact** (§10 gate A's shim-smoke
+  failure). ROOT CAUSE (build graph): the shim's `zig build-lib` was a
+  `has_side_effects` Run step, and Zig 0.17's maker names a side-effect
+  step's output directory `o/<hash of its argv strings>` — input files join
+  the manifest but not that hash (`Maker/Step/Run.zig`: `man.hash.final()`
+  when `has_side_effects`). Every worktree on `--cache-dir /build/zig-cache`
+  computes the same argv (the zig path, the cache dirs, the target, the
+  `-Mroot=`/`-Mbuild_options=` prefixes), so every worktree's shim landed at
+  ONE path (`o/aabfdf97…/libsqueezefs_il.so`, the only build-lib directory in
+  the cache), and the staging step copied it when the graph's binary was
+  ready — minutes after its build-lib on an LTO rebuild: a neighbour's
+  build-lib in between staged the neighbour's .so. The cache held the
+  history: of 55 staged pairs, 4 named two builds (gate A's `e1cdb245aca7`
+  beside `441d1be401ab-dirty` among them). Red: the census row
+  `tests/shim_census.zig` "libsqueezefs_il.so and ./squeezefs are ONE build's
+  pair" (the .so's `lifecycle.identity` against `./squeezefs --version`) and
+  the repro — worktree A (`7e6fca1`, an exe rebuild in flight) built its
+  shim, worktree B (`88723bf`) then ran `zig build shim` with the same cache
+  dir, A's build-lib output named `88723bf2b86e` and A's census answered "the
+  staged pair is two builds': libsqueezefs_il.so carries train 0.1.0 commit
+  88723bf2b86e, ./squeezefs names train 0.1.0 commit 1ebf48d27f8d-dirty".
+  Fix (`fix(build): the shim's build-lib is cached on its inputs …`): the
+  step is CACHED, its inputs the compiler and every file under `src/` (a
+  superset of the shim's imports, sorted; the configure re-walks the tree)
+  beside `build_options`, so its output directory is the content digest of
+  everything the shim can read. Green: the same repro twice — B on the old
+  tree (it still wrote the shared `aabfdf97…`) and B on a second fixed
+  commit (`eac2ce2f…`) — A's build-lib wrote its own directory (`6686fe…`,
+  then `e0558349…` after the next touch), A's rails 16/16 steps, 19/19
+  tests both times. The other steps, checked: `smoke`, `bench-smoke` and
+  `nvmet-smoke` run in `exe.getEmittedBinDirectory()` (a Compile output the
+  compiler's manifest names by content); `sdk-smoke` links Compile-step
+  libraries (the shared one through an rpath to its own Compile output);
+  `suites-smoke` takes the emitted binary by `--bin` — but its results
+  directory (`/build/tmp/suites-<suite>-<date to the second>`, the sets and
+  their mountpoints under it) was shared by two gates that started a suite
+  in the same second: two concurrent `suite_prepare`s made ONE directory 5 of
+  5 times; with `-<pid>` (and the cleanup's mount match anchored at
+  `<results>/`) two, 5 of 5. Not an artifact, left as found:
+  `nvmet-smoke`'s fixed TCP port base (54000) is shared by concurrent nvmet
+  smokes.
+- **The tick CQE ledger** (`transport_park_tick_cqe_rescues = 1` on the KVDA
+  row's daemon B). The gate agent's reading holds: `io_cqring_wait` returns
+  `head == tail ? -ETIME : 0` after running the deferred completions past its
+  timer, so a CQE the reap surfaces after a backstop tick landed after the
+  deadline — the counter could only count late arrivals. Red:
+  `session.zig` "e2e: a completion that lands after a backstop tick's
+  timeout and before the worker's re-check …" — a parked `/park` reader keeps
+  its group owed (bounded parks), an in-process seam
+  (`Shared.tick_await_cqe_remaining`) holds the next tick's worker in an
+  unbounded park before its reap, the handler's release completes the wake
+  READ in that window: the must-stay-0 counter read `expected 0, found 1`, 3
+  of 3 (`bab8784`). Redefinition (`fix(transport): the tick's CQE ledger
+  splits …`; decision 0002 row 511): the tick's RE-CHECK — the CQ read at
+  the verdict, before any further enter — finding completions in a CQ that
+  was empty at the park, on a `DEFER_TASKRUN` ring (its CQ moves only inside
+  the worker's own enters, so the read is exact), fires the TRIPWIRE
+  `transport_park_tick_cqe_lost_wakes` (the kernel's wait did not wake for
+  them; on another posture nothing is classed lost); the reap's remainder is
+  the plain `transport_park_tick_late_cqes`. `brk.py` `TICK_RESCUES` names
+  the tripwire and a new `TICK_LATE` the late counter (in `ALL_COUNTERS`,
+  recorded as `tick_late` beside `tick_rescues`); `bench.zig`
+  `tick_rescue_keys`/`tick_late_keys` mirror them (the row carries
+  `tick_rescues` and `tick_late`); the rails' bracket ledger pin equates
+  both pairs; the smoke's must-stay-0 list and its teardown line name the
+  tripwire alone. Green: the pin **0 of 50** under the load (late +1, the
+  tripwire 0, the commit half 0); the 10 s storm: 0 ticks, 0 rescues, 0
+  late. Still open: the commit half (`transport_park_tick_commit_rescues`)
+  keeps a narrower late window of its own — a reply published between the
+  post-tick reap and the pump, its wake READ still deferred — not redefined
+  here.
+- **A stop reaches the fleet read shard's heartbeat at once.** ROOT CAUSE:
+  the heartbeat fiber parked on its own `Heartbeat.wake`, which only the
+  walk's end notifies; `Worker.requestStop` notified the worker's `wake` and
+  `release_hold`, and the fiber read the worker's stop only after its park —
+  a stop mid-scan raised the walk's cancel at the next beat (`HEARTBEAT_MS`,
+  10 s). Red: `wire.zig` "a requestStop during a read shard's scan WAKES the
+  heartbeat fiber …" — "the stop took 10007 ms (bound 1000 ms; the heartbeat
+  period is 10000 ms)". Fix (`fix(jobs): a worker's stop wakes the read
+  shard's heartbeat fiber …`): the fiber parks on the WORKER's wake and,
+  registered, re-reads both stops (`Heartbeat.ended`: the worker's stop
+  raises the cancel); the walk's end notifies the same wake. Loops: **0 of
+  500** (200 + 300) under the load, the slowest run 75 ms whole (the rig
+  included); the read-shard rows 0 of 100, the fleet rows 0 of 100.

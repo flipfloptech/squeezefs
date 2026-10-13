@@ -680,6 +680,21 @@ pub const Stats = struct {
     windows_unshadowed: counters.ShardedCounter = .{},
     windows_pipelined: counters.ShardedCounter = .{},
     hold_bound_ns: counters.Gauge = .{},
+    /// The committer's ack spin (decision 0003 §AB.4): acks that landed
+    /// inside the spin (no park, no wake), spins that fell through to the
+    /// park, parks with no spin: no bound (no wake measured yet, or an ack
+    /// predicted past it) / work queued on the caller's lane (or off a
+    /// lane); the bound last used. Closure: hits + falls + skips + busy ≡
+    /// parks.
+    ack_spin_hits: counters.ShardedCounter = .{},
+    ack_spin_falls: counters.ShardedCounter = .{},
+    ack_spin_skips: counters.ShardedCounter = .{},
+    ack_spin_busy: counters.ShardedCounter = .{},
+    ack_spin_bound_ns: counters.Gauge = .{},
+    /// The rule's two inputs (RFC 6298 means): ack → resumed on an idle
+    /// park (W) and enqueue → ack.
+    ack_spin_wake_ns: counters.Gauge = .{},
+    ack_spin_ack_ns: counters.Gauge = .{},
     /// `meta_conveyor_pass_panics` ★: a window abandoned without its
     /// outcome observed (every member failed loud, the reservation
     /// completed as abandoned).
@@ -707,7 +722,7 @@ pub const Stats = struct {
         for (GroupSizeHistogram.labels, 0..) |l, i| {
             try w.print("{s}\"{s}\":{d}", .{ if (i == 0) "" else ",", l, self.group_size.load(i) });
         }
-        try w.print("}},\"meta_commit_group_bytes\":{d},\"meta_conveyor_leader_passes\":{d},\"meta_conveyor_group_commits\":{d},\"meta_conveyor_group_txs\":{d},\"meta_conveyor_lane_handoffs\":{d},\"meta_conveyor_windows_inflight\":{d},\"meta_conveyor_windows_inflight_hwm\":{d},\"meta_conveyor_queued\":{d},\"meta_commit_parked\":{d},\"meta_conveyor_drained_txs\":{d},\"meta_conveyor_acks\":{d},\"meta_conveyor_refusals\":{d},\"meta_kv_journal_full_stalls\":{d},\"meta_conveyor_park_tick_rescues\":{d},\"manager_dependency_stalls\":{d},\"meta_conveyor_rollbacks\":{d},\"meta_conveyor_compensations\":{d},\"meta_conveyor_pass_panics\":{d},\"meta_conveyor_holds\":{d},\"meta_conveyor_hold_landings\":{d},\"meta_conveyor_hold_deadlines\":{d},\"meta_conveyor_holds_not_worth\":{d},\"meta_conveyor_hold_probes\":{d},\"meta_conveyor_hold_gain_milli\":{d},\"meta_conveyor_windows_held\":{d},\"meta_conveyor_windows_unshadowed\":{d},\"meta_conveyor_windows_pipelined\":{d},\"meta_conveyor_hold_bound_ns\":{d}}}", .{
+        try w.print("}},\"meta_commit_group_bytes\":{d},\"meta_conveyor_leader_passes\":{d},\"meta_conveyor_group_commits\":{d},\"meta_conveyor_group_txs\":{d},\"meta_conveyor_lane_handoffs\":{d},\"meta_conveyor_windows_inflight\":{d},\"meta_conveyor_windows_inflight_hwm\":{d},\"meta_conveyor_queued\":{d},\"meta_commit_parked\":{d},\"meta_conveyor_drained_txs\":{d},\"meta_conveyor_acks\":{d},\"meta_conveyor_refusals\":{d},\"meta_kv_journal_full_stalls\":{d},\"meta_conveyor_park_tick_rescues\":{d},\"manager_dependency_stalls\":{d},\"meta_conveyor_rollbacks\":{d},\"meta_conveyor_compensations\":{d},\"meta_conveyor_pass_panics\":{d},\"meta_conveyor_holds\":{d},\"meta_conveyor_hold_landings\":{d},\"meta_conveyor_hold_deadlines\":{d},\"meta_conveyor_holds_not_worth\":{d},\"meta_conveyor_hold_probes\":{d},\"meta_conveyor_hold_gain_milli\":{d},\"meta_conveyor_windows_held\":{d},\"meta_conveyor_windows_unshadowed\":{d},\"meta_conveyor_windows_pipelined\":{d},\"meta_conveyor_hold_bound_ns\":{d}", .{
             self.group_bytes.load(),
             self.leader_passes.load(),
             self.group_commits.load(),
@@ -736,6 +751,15 @@ pub const Stats = struct {
             self.windows_unshadowed.load(),
             self.windows_pipelined.load(),
             self.hold_bound_ns.load(),
+        });
+        try w.print(",\"meta_commit_ack_spin_hits\":{d},\"meta_commit_ack_spin_falls\":{d},\"meta_commit_ack_spin_skips\":{d},\"meta_commit_ack_spin_busy\":{d},\"meta_commit_ack_spin_bound_ns\":{d},\"meta_commit_ack_spin_wake_ns\":{d},\"meta_commit_ack_spin_ack_ns\":{d}}}", .{
+            self.ack_spin_hits.load(),
+            self.ack_spin_falls.load(),
+            self.ack_spin_skips.load(),
+            self.ack_spin_busy.load(),
+            self.ack_spin_bound_ns.load(),
+            self.ack_spin_wake_ns.load(),
+            self.ack_spin_ack_ns.load(),
         });
     }
 
@@ -790,7 +814,76 @@ pub var test_seams: TestSeams = .{};
 pub const Outcome = Error!void;
 /// The completion channel per tx: the committer parks on it; the lane
 /// sends the terminal outcome after dropping the guards.
-pub const Done = sync.Oneshot(Outcome);
+/// A committer's channel: the outcome, and the instant the lane answered
+/// (stored AFTER the send — non-zero ⇒ the outcome is in the channel). The
+/// committer's spin polls it lock-free; its park learns the ack → resume
+/// wake from it (decision 0003 §AB.4).
+pub const Done = struct {
+    ch: sync.Oneshot(Outcome) = .init,
+    acked_ns: std.atomic.Value(u64) = .init(0),
+
+    pub const init: Done = .{};
+
+    pub fn send(self: *Done, io: Io, outcome: Outcome) error{ReceiverGone}!void {
+        try self.ch.send(io, outcome);
+        // Release: pairs with the spinner's acquire — a non-zero stamp is a
+        // sent outcome (the channel's own lock orders the value).
+        self.acked_ns.store(@max(clock.monotonicNs(), 1), .release);
+    }
+
+    pub fn recvUncancelable(self: *Done, io: Io) error{SenderGone}!Outcome {
+        return self.ch.recvUncancelable(io);
+    }
+};
+
+/// The committer's bounded spin before it parks on its ack (decision 0003
+/// §AB.4). A park costs one cross-thread wake when the ack lands (the
+/// journal lane writes the committer lane's eventfd, the lane is scheduled
+/// — measured 17.5 µs of a 90 µs QD1 create on the dev container); a spin
+/// costs CPU. The bound is the classic spin-then-park competitive rule on
+/// the MEASURED costs: spin at most `2 × W` (W = the ack → resume wake's
+/// RFC 6298 mean — the CPU a spin may burn is at most twice the wake it
+/// saves), and only while the ack's predicted latency (`srtt` of enqueue →
+/// ack) is inside that bound — an ack predicted later would make every spin
+/// a fall-through. No wake measured yet (W = 0) ⇒ no spin: the first parks
+/// measure it. W is sampled only on a park that left its lane idle and
+/// whose resume was the lane's next poll (another fiber run between puts
+/// its work in the gap — measured: W read 252 µs instead of 18 µs and the
+/// bound let a committer burn half a millisecond); fall-through parks keep
+/// measuring it.
+pub const AckSpin = struct {
+    /// Enqueue → ack (sampled by the lane at the answer).
+    ack: RttEstimator = .{},
+    /// Ack → the committer resumed after a park.
+    wake: RttEstimator = .{},
+
+    pub const Reading = struct { wake_ns: u64, ack_ns: u64, bound_ns: u64 };
+
+    /// The two means (0 before a sample) and the bound they give.
+    pub fn read(self: *const AckSpin) Reading {
+        const w = self.wake.mean() orelse 0;
+        const a = self.ack.mean() orelse 0;
+        return .{ .wake_ns = w, .ack_ns = a, .bound_ns = spinBound(w, a) };
+    }
+};
+
+/// Spin on `done` for at most `bound_ns`; true = the ack landed inside it
+/// (its outcome is in the channel: a `recv` returns at once).
+pub fn spinForAck(done: *const Done, bound_ns: u64) bool {
+    const t0 = clock.monotonicNs();
+    while (done.acked_ns.load(.acquire) == 0) {
+        if (clock.monotonicNs() -% t0 >= bound_ns) return done.acked_ns.load(.acquire) != 0;
+        std.atomic.spinLoopHint();
+    }
+    return true;
+}
+
+/// The pure rule (tie-tested): `2·W` when the ack's mean is within it, else 0.
+pub fn spinBound(wake_srtt_ns: u64, ack_srtt_ns: u64) u64 {
+    if (wake_srtt_ns == 0) return 0;
+    const s = 2 * wake_srtt_ns;
+    return if (ack_srtt_ns <= s) s else 0;
+}
 
 /// One queue entry: the tx, its channel, its enqueue instant.
 pub const Queued = struct {
@@ -981,6 +1074,20 @@ pub const Deps = struct {
     /// backend passes the flush interval as the deadline's ceiling); null
     /// on the strict cadence and in the portable contracts' default.
     window_hold: ?WindowHold = null,
+    /// The committer's executor (decision 0003 §AB.4); null = never spin
+    /// (the portable contracts' inline pass, a thread off any lane).
+    caller: ?CallerSeam = null,
+};
+
+/// The committer's thread as the ack spin sees it (the backend binds the
+/// lane's two reads).
+pub const CallerSeam = struct {
+    /// Parking would leave the thread idle (no other ready fiber, nothing
+    /// in its inbox) — the only posture where a spin can beat the park.
+    idle: *const fn () bool,
+    /// The thread's poll count: one more at the resume than at the park ⇔
+    /// nothing else ran between, so `ack → resumed` is the wake alone.
+    polls: *const fn () u64,
 };
 
 /// The pre-admission gate's seam (`park_reclaim.ParkGate.preAdmission`).
@@ -994,6 +1101,8 @@ pub const PreAdmission = struct {
 // ---------------------------------------------------------------------------
 
 pub const Conveyor = struct {
+    /// The committer's ack spin estimators (decision 0003 §AB.4).
+    ack_spin: AckSpin = .{},
     deps: Deps,
     slots: []Core.Entry,
     core: Core,
@@ -1270,7 +1379,39 @@ pub const Conveyor = struct {
     fn park(self: *Conveyor, done: *Done) Error!void {
         self.stats.commit_parked.add(1);
         defer self.stats.commit_parked.sub(1);
-        return done.recvUncancelable(self.deps.io) catch error.Corrupt;
+        const rd = self.ack_spin.read();
+        const bound = rd.bound_ns;
+        // Published on change only: a store per park would bounce the
+        // gauges' lines between every committing lane.
+        inline for (.{ .{ &self.stats.ack_spin_bound_ns, bound }, .{ &self.stats.ack_spin_wake_ns, rd.wake_ns }, .{ &self.stats.ack_spin_ack_ns, rd.ack_ns } }) |g| {
+            if (g[0].load() != g[1]) g[0].set(g[1]);
+        }
+        // The wake is learned only from a park on an IDLE lane: a lane with
+        // queued work resumes the committer after that work, which is the
+        // work's latency, not the wake's.
+        const caller = self.deps.caller;
+        const idle = if (caller) |c| c.idle() else false;
+        const polls0 = if (idle) caller.?.polls() else 0;
+        if (!idle) {
+            self.stats.ack_spin_busy.inc();
+        } else if (bound == 0) {
+            self.stats.ack_spin_skips.inc();
+        } else {
+            if (spinForAck(done, bound)) {
+                self.stats.ack_spin_hits.inc();
+                return done.recvUncancelable(self.deps.io) catch error.Corrupt;
+            }
+            self.stats.ack_spin_falls.inc();
+        }
+        const r = done.recvUncancelable(self.deps.io) catch return error.Corrupt;
+        if (idle) {
+            const acked = done.acked_ns.load(.acquire);
+            const resumed = clock.monotonicNs();
+            // Another fiber polled between the park and this resume: the
+            // gap holds its work, not the wake's cost.
+            if (acked != 0 and resumed > acked and caller.?.polls() == polls0 +% 1) self.ack_spin.wake.sample(resumed - acked);
+        }
+        return r;
     }
 
     // ---- the pass (stage A) ----
@@ -1398,6 +1539,7 @@ pub const Conveyor = struct {
     fn answer(self: *Conveyor, m: *Queued, outcome: Outcome) void {
         m.q.guards.release();
         if (outcome) |_| self.stats.acks.inc() else |_| self.stats.refusals.inc();
+        self.ack_spin.ack.sample(clock.monotonicNs() -| m.enqueued_ns);
         m.done.send(self.deps.io, outcome) catch {};
         m.q.deinit();
     }
@@ -2902,6 +3044,88 @@ test "a single commit: the pass drains one, the lane lands it and acks after the
     var n: usize = 0;
     while (it.next()) |_| n += 1;
     try testing.expectEqual(@as(usize, 3), n);
+}
+
+test "the ack spin's bound (decision 0003 §AB.4): no measured wake ⇒ no spin; 2·W when the ack's mean is within it; an ack predicted past 2·W ⇒ no spin (every spin would fall through)" {
+    try testing.expectEqual(@as(u64, 0), spinBound(0, 10_000));
+    try testing.expectEqual(@as(u64, 20_000), spinBound(10_000, 15_000));
+    try testing.expectEqual(@as(u64, 20_000), spinBound(10_000, 20_000));
+    try testing.expectEqual(@as(u64, 0), spinBound(10_000, 20_001));
+    var a: AckSpin = .{};
+    try testing.expectEqual(@as(u64, 0), a.read().bound_ns);
+    a.ack.sample(30_000);
+    try testing.expectEqual(@as(u64, 0), a.read().bound_ns);
+    a.wake.sample(17_500);
+    try testing.expectEqual(@as(u64, 35_000), a.read().bound_ns);
+}
+
+test "the ack spin: an ack landing inside the bound is a hit (the outcome is already in the channel); none inside is a fall-through after the whole bound" {
+    var done: Done = .init;
+    const Sender = struct {
+        fn run(d: *Done) void {
+            const t0 = clock.monotonicNs();
+            while (clock.monotonicNs() - t0 < 2 * std.time.ns_per_ms) std.atomic.spinLoopHint();
+            d.send(testing.io, {}) catch {};
+        }
+    };
+    const t = try std.Thread.spawn(.{}, Sender.run, .{&done});
+    try testing.expect(spinForAck(&done, 5 * std.time.ns_per_s));
+    t.join();
+    try (try done.recvUncancelable(testing.io));
+    var never: Done = .init;
+    const t0 = clock.monotonicNs();
+    try testing.expect(!spinForAck(&never, 200 * std.time.ns_per_us));
+    try testing.expect(clock.monotonicNs() - t0 >= 200 * std.time.ns_per_us);
+}
+
+test "the ack spin's ledger: every park is a hit, a fall-through, a skip (no bound) or busy (work on the lane, or off a lane: never a spin); every answer feeds the ack estimator once" {
+    const h = try Harness.create(.{}, null, false);
+    defer h.destroy();
+    var i: usize = 0;
+    while (i < 5) : (i += 1) {
+        const t = try h.gpa.create(tx.KvTx);
+        defer h.gpa.destroy(t);
+        t.* = tx.KvTx.init(h.gpa, @src());
+        var nb: [8]u8 = undefined;
+        _ = try h.stageCreate(t, try std.fmt.bufPrint(&nb, "s{d}", .{i}));
+        try h.cv.commit(t);
+    }
+    const st = &h.cv.stats;
+    try testing.expectEqual(@as(u64, 5), st.ack_spin_hits.load() + st.ack_spin_falls.load() + st.ack_spin_skips.load() + st.ack_spin_busy.load());
+    // Off a lane every park is `busy`: never a spin, never a wake sample.
+    try testing.expectEqual(@as(u64, 5), st.ack_spin_busy.load());
+    try testing.expectEqual(@as(u64, 0), h.cv.ack_spin.wake.samples.load(.monotonic));
+    try testing.expectEqual(st.acks.load(), h.cv.ack_spin.ack.samples.load(.monotonic));
+
+    // An idle caller: the first park has no measured wake (a skip) and
+    // teaches one; a hit returns without a wake sample; a park after a
+    // skip or a fall-through samples the wake.
+    const Idle = struct {
+        var polls: u64 = 0;
+        fn yes() bool {
+            return true;
+        }
+        /// Each read one more: the inline pass's resume ran alone.
+        fn tick() u64 {
+            polls += 1;
+            return polls;
+        }
+    };
+    h.cv.deps.caller = .{ .idle = Idle.yes, .polls = Idle.tick };
+    while (i < 10) : (i += 1) {
+        const t = try h.gpa.create(tx.KvTx);
+        defer h.gpa.destroy(t);
+        t.* = tx.KvTx.init(h.gpa, @src());
+        var nb: [8]u8 = undefined;
+        _ = try h.stageCreate(t, try std.fmt.bufPrint(&nb, "s{d}", .{i}));
+        try h.cv.commit(t);
+    }
+    try testing.expectEqual(@as(u64, 5), st.ack_spin_busy.load());
+    try testing.expectEqual(@as(u64, 5), st.ack_spin_hits.load() + st.ack_spin_falls.load() + st.ack_spin_skips.load());
+    try testing.expect(st.ack_spin_skips.load() >= 1);
+    const wakes = h.cv.ack_spin.wake.samples.load(.monotonic);
+    try testing.expect(wakes >= 1 and wakes <= st.ack_spin_skips.load() + st.ack_spin_falls.load());
+    try testing.expectEqual(st.acks.load(), h.cv.ack_spin.ack.samples.load(.monotonic));
 }
 
 test "a group of 8 is ONE pass with 8 acks in journal order; every record present; the lane wrote one window; identities hold" {

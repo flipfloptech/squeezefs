@@ -720,6 +720,7 @@ pub const KvBackend = struct {
             .park_escalation_ns = conveyor.PARK_ESCALATION_NS,
             .door = be.slots.doorSeam(),
             .window_hold = conveyor.windowHoldFor(flush_ms),
+            .caller = .{ .idle = exec.lane.laneIdleBesidesCaller, .polls = exec.lane.lanePolls },
         });
         errdefer be.cv.deinit();
         try be.startPass();
@@ -1093,6 +1094,7 @@ pub const KvBackend = struct {
             .park_escalation_ns = conveyor.PARK_ESCALATION_NS,
             .door = be.slots.doorSeam(),
             .grant_fed = true,
+            .caller = .{ .idle = exec.lane.laneIdleBesidesCaller, .polls = exec.lane.lanePolls },
             .pre_admission = .{ .ctx = &js.park_gate, .wait = joinedPreAdmission },
             .window_hold = conveyor.windowHoldFor(flush_ms),
         });

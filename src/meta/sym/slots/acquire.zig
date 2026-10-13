@@ -93,6 +93,22 @@ pub const stats = struct {
     pub var slot_projection_stale_self_rows: counters.ShardedCounter = .{};
     /// Two live attestations of one slot (C14's live face): must stay 0.
     pub var slot_lease_conflicts: counters.Tripwire = .init("slot_lease_conflicts");
+    /// Node mappings dropped by the cache barrier of a lease crossing
+    /// processes (0003 §X.5): the manager's adoption of a released slot,
+    /// its grant away, a joiner's install and its release.
+    pub var slot_move_nodes_discarded: counters.ShardedCounter = .{};
+    /// A joiner's own grant installed by its resolver's replayed first
+    /// touch (the cache named it before the table did — an accept in
+    /// flight or one whose reply was lost): 0003 §X.4.
+    pub var slot_own_grants_settled: counters.ShardedCounter = .{};
+    /// Wire-grant installs that waited behind another install of the same
+    /// plane (the carriage's accept and a resolver's replayed first touch
+    /// of one grant racing — the second lands idempotent): 0003 §X.4.
+    pub var slot_install_waits: counters.ShardedCounter = .{};
+    /// A fresh grant found the grantee holding a tree of the slot at
+    /// another root — a shadow that would hide every record the departing
+    /// holder wrote (0003 §X.5): must stay 0.
+    pub var slot_install_shadow_trees: counters.Tripwire = .init("slot_install_shadow_trees");
 };
 
 // ---------------------------------------------------------------------------
@@ -405,10 +421,23 @@ pub const AcquireReq = struct {
 };
 
 pub const AcquireOutcome = union(enum) {
-    granted: struct { grants: []Grant, already: u16 },
+    /// `grants`: newly written (owned by `gpa`); `replayed`: explicit slots
+    /// the requester already holds, at their generation with tree 0's
+    /// words (owned by `gpa`; empty = `&.{}`).
+    granted: struct { grants: []Grant, already: u16, replayed: []Grant = &.{} },
     /// An explicit slot another appender holds (naming it) — the typed
     /// `SlotBusy` the door answers.
     refused: struct { slot: u16, holder: AppenderId, g: u32 },
+
+    pub fn deinit(self: AcquireOutcome, gpa: Allocator) void {
+        switch (self) {
+            .granted => |g| {
+                gpa.free(g.grants);
+                gpa.free(g.replayed);
+            },
+            .refused => {},
+        }
+    }
 };
 
 pub const Resolved = union(enum) {
@@ -513,6 +542,12 @@ pub const Verbs = struct {
         var picked: std.ArrayList(u16) = .empty;
         defer picked.deinit(gpa);
         var already: u16 = 0;
+        // The requester's own leases among the explicit slots: answered with
+        // their words so a requester that has not installed them (an accept
+        // in flight) installs what tree 0 names (idempotent against durable
+        // state, charter §5.5) instead of re-asking.
+        var replays: std.ArrayList(Grant) = .empty;
+        defer replays.deinit(gpa);
         // Explicit slots first: a held one by the requester is a replay; by
         // another appender a refusal naming it.
         for (req.explicit) |s| {
@@ -537,6 +572,7 @@ pub const Verbs = struct {
                 try picked.append(gpa, s);
             } else if (v.holder == req.appender_id and v.state != .migrating) {
                 already += 1;
+                try replays.append(gpa, .{ .slot = s, .g = v.g, .words = self.table.wordsOf(s) });
             } else {
                 stats.slot_acquire_refusals.inc();
                 return .{ .refused = .{ .slot = s, .holder = v.holder, .g = v.g } };
@@ -559,11 +595,13 @@ pub const Verbs = struct {
                 if (!dup) try picked.append(gpa, s);
             }
         }
+        const replayed = try replays.toOwnedSlice(gpa);
+        errdefer gpa.free(replayed);
         const grants = try gpa.alloc(Grant, picked.items.len);
         errdefer gpa.free(grants);
         if (picked.items.len == 0) {
             if (already != 0) manager.stats.manager_verb_replays.inc();
-            return .{ .granted = .{ .grants = grants, .already = already } };
+            return .{ .granted = .{ .grants = grants, .already = already, .replayed = replayed } };
         }
         // The structural door: a grant to any appender but the manager
         // cycles ring 0's window clear of the granted slots first.
@@ -616,7 +654,7 @@ pub const Verbs = struct {
         }
         const t1 = clock.monotonicNs();
         self.mgr.ledger.record(t1, 0, t1 - t0, 0);
-        return .{ .granted = .{ .grants = grants, .already = already } };
+        return .{ .granted = .{ .grants = grants, .already = already, .replayed = replayed } };
     }
 
     /// ONE slot for `requester`: an offer standing for it is THE ACCEPT —
@@ -845,8 +883,10 @@ pub const Verbs = struct {
         var head: verbs.AcquireHead = .{ .kind = 0, .reserved = 0, .n = 0, .already = 0, .slot = 0, .holder = 0, .g = 0 };
         switch (out) {
             .granted => |g| {
-                defer gpa.free(g.grants);
-                for (g.grants) |gr| items.append(gpa, .{ .words = .{ .root = .{ .addr = gr.words.root.addr, .seq = gr.words.root.seq }, .cursor = gr.words.cursor, .seq_floor = gr.words.seq_floor, .slot_tree_extents = gr.words.extents, .reserved = 0 }, .g = gr.g, .slot = gr.slot, .reserved = 0 }) catch return .{ .status = .refused, .reason = .io };
+                defer out.deinit(gpa);
+                // The replayed leases ride after the fresh grants: a joiner
+                // installs every item (idempotently at a generation it holds).
+                for ([_][]const Grant{ g.grants, g.replayed }) |list| for (list) |gr| items.append(gpa, .{ .words = .{ .root = .{ .addr = gr.words.root.addr, .seq = gr.words.root.seq }, .cursor = gr.words.cursor, .seq_floor = gr.words.seq_floor, .slot_tree_extents = gr.words.extents, .reserved = 0 }, .g = gr.g, .slot = gr.slot, .reserved = 0 }) catch return .{ .status = .refused, .reason = .io };
                 head.n = @intCast(items.items.len);
                 head.already = g.already;
             },
@@ -1159,10 +1199,8 @@ pub const TestPlane = struct {
             error.Corrupt => error.Corrupt,
             error.OutOfMemory => error.OutOfMemory,
         };
-        switch (out) {
-            .granted => |g| s.gpa.free(g.grants),
-            .refused => return error.SlotBusy,
-        }
+        defer out.deinit(s.gpa);
+        if (out == .refused) return error.SlotBusy;
     }
 
     pub fn state(self: *TestPlane, slot: u16) ?cr.SlotState {
@@ -1177,7 +1215,7 @@ test "AcquireSlots: a rotor ask grants unleased-then-idle candidates in ONE barr
     defer p.deinit();
     const entries0 = p.tv.control_entries;
     const out = try p.verbs.acquireSlots(gpa, .{ .appender_id = 0, .want = 3, .admit = .park });
-    defer gpa.free(out.granted.grants);
+    defer out.deinit(gpa);
     try testing.expectEqual(@as(usize, 3), out.granted.grants.len);
     try testing.expectEqualSlices(u16, &.{ 1, 2, 3 }, &.{ out.granted.grants[0].slot, out.granted.grants[1].slot, out.granted.grants[2].slot });
     try testing.expectEqual(entries0 + 1, p.tv.control_entries);
@@ -1188,7 +1226,7 @@ test "AcquireSlots: a rotor ask grants unleased-then-idle candidates in ONE barr
     try testing.expect(p.table.view(1).leasedBy(0) and p.table.view(1).rotor);
     // Explicit: 1 again by 0 is a replay; by 2 a refusal naming 0; 4 fresh.
     const rep = try p.verbs.acquireSlots(gpa, .{ .appender_id = 0, .explicit = &.{1} });
-    defer gpa.free(rep.granted.grants);
+    defer rep.deinit(gpa);
     try testing.expectEqual(@as(u16, 1), rep.granted.already);
     const ref = try p.verbs.acquireSlots(gpa, .{ .appender_id = 2, .explicit = &.{1} });
     try testing.expectEqual(@as(u32, 0), ref.refused.holder);
@@ -1204,7 +1242,7 @@ test "AcquireSlots: a rotor ask grants unleased-then-idle candidates in ONE barr
     try testing.expect(p.state(7) == null);
     // The next grant of 7 carries g = 2 (one ahead of the rollback).
     const g7 = try p.verbs.acquireSlots(gpa, .{ .appender_id = 0, .explicit = &.{7} });
-    defer gpa.free(g7.granted.grants);
+    defer g7.deinit(gpa);
     try testing.expectEqual(@as(u32, 2), g7.granted.grants[0].g);
     try testing.expectEqual(@as(u32, 2), p.state(7).?.g);
 }
@@ -1217,7 +1255,7 @@ test "a grant to a non-manager appender takes the structural door: a window nami
     try p.tv.window_names.append(gpa, 5);
     p.tv.cycles_until_clear = 3;
     const out = try p.verbs.acquireSlots(gpa, .{ .appender_id = 1, .explicit = &.{5} });
-    defer gpa.free(out.granted.grants);
+    defer out.deinit(gpa);
     try testing.expectEqual(@as(u32, 3), p.tv.cycles_run);
     try testing.expect(p.table.view(5).leasedBy(1));
     try p.tv.window_names.append(gpa, 6);
@@ -1234,7 +1272,7 @@ test "ReleaseSlot: the words are screened before any effect (a floor at the gran
     const p = try TestPlane.init(gpa);
     defer p.deinit();
     const g = try p.verbs.acquireSlots(gpa, .{ .appender_id = 0, .explicit = &.{3} });
-    gpa.free(g.granted.grants);
+    g.deinit(gpa);
     const in_heap = p.tv.g.heap.start + 7 * p.tv.g.node_size;
     const ok: SlotWords = .{ .root = .{ .addr = in_heap, .seq = 5 }, .cursor = 40, .extents = 2, .seq_floor = 10 };
     const entries0 = p.tv.control_entries;
@@ -1267,7 +1305,7 @@ test "ReleaseSlot: the words are screened before any effect (a floor at the gran
     try testing.expectEqual(lt.State.unleased, p.table.view(3).state);
     try testing.expectEqual(Verbs.ReleaseResult.already, try p.verbs.releaseSlot(gpa, .{ .appender_id = 0, .slot = 3, .g = 1, .words = ok }));
     const g2 = try p.verbs.acquireSlots(gpa, .{ .appender_id = 0, .explicit = &.{3} });
-    defer gpa.free(g2.granted.grants);
+    defer g2.deinit(gpa);
     try testing.expectEqual(@as(u32, 2), g2.granted.grants[0].g);
     try testing.expectEqual(@as(u64, 40), g2.granted.grants[0].words.cursor);
     try testing.expectEqual(@as(u64, 10), g2.granted.grants[0].words.seq_floor);
@@ -1278,7 +1316,7 @@ test "ReleaseSlot past the inline cap SPILLS (rung 10 item 5b): 1,100 tails at t
     const p = try TestPlane.init(gpa);
     defer p.deinit();
     const g = try p.verbs.acquireSlots(gpa, .{ .appender_id = 0, .explicit = &.{5} });
-    gpa.free(g.granted.grants);
+    g.deinit(gpa);
     const in_heap = p.tv.g.heap.start + 7 * p.tv.g.node_size;
     const ok: SlotWords = .{ .root = .{ .addr = in_heap, .seq = 5 }, .cursor = 40, .extents = 2, .seq_floor = 10 };
     const cap = cr.slotTailsInlineCap(geometry.recordValueCap(p.tv.g.node_size));
@@ -1307,7 +1345,7 @@ test "ReleaseSlot past the inline cap SPILLS (rung 10 item 5b): 1,100 tails at t
     try testing.expectEqual(n, back.items.len);
     // Re-leased, then released with two tails: inline, the spill extent back.
     const g2 = try p.verbs.acquireSlots(gpa, .{ .appender_id = 0, .explicit = &.{5} });
-    gpa.free(g2.granted.grants);
+    g2.deinit(gpa);
     const small = [_]cr.TailEntry{ .{ .leaf_addr = in_heap, .tail = 1 }, .{ .leaf_addr = in_heap + p.tv.g.node_size, .tail = 2 } };
     try testing.expectEqual(Verbs.ReleaseResult.released, try p.verbs.releaseSlot(gpa, .{ .appender_id = 0, .slot = 5, .g = 2, .words = .{ .root = ok.root, .cursor = 41, .extents = 2, .seq_floor = 11 }, .tails = &small }));
     try testing.expectEqual(claimed0, p.tv.allocatedExtents());
@@ -1321,13 +1359,13 @@ test "the in-process accept: an offer standing for the requester runs the holder
     defer p.deinit();
     p.own_n = 2;
     const g = try p.verbs.acquireSlots(gpa, .{ .appender_id = 0, .explicit = &.{4} });
-    gpa.free(g.granted.grants);
+    g.deinit(gpa);
     try testing.expectEqual(Verbs.OfferResult.offered, try p.verbs.offerSlot(0, 4, 1, std.math.maxInt(u64)));
     try testing.expectEqual(Verbs.OfferResult.busy, try p.verbs.offerSlot(0, 4, 1, std.math.maxInt(u64)));
     try testing.expectError(error.Refused, p.verbs.offerSlot(1, 4, 0, std.math.maxInt(u64)));
     try testing.expectError(error.Rejected, p.verbs.offerSlot(0, 4, 0, std.math.maxInt(u64)));
     const acc = try p.verbs.acquireSlot(gpa, 1, 4, .try_);
-    defer gpa.free(acc.granted.grants);
+    defer acc.deinit(gpa);
     try testing.expectEqual(@as(u32, 1), p.transfers);
     try testing.expectEqual(@as(u32, 2), acc.granted.grants[0].g);
     try testing.expect(p.table.view(4).leasedBy(1));
@@ -1383,7 +1421,7 @@ test "the release → grant gap of an accept: the released slot stays RESERVED f
     defer p.deinit();
     p.own_n = 3;
     const g = try p.verbs.acquireSlots(gpa, .{ .appender_id = 0, .explicit = &.{4} });
-    gpa.free(g.granted.grants);
+    g.deinit(gpa);
     // The offer stands for 1; the holder's own transfer (the accept's first
     // half) releases the slot with the stand kept.
     try testing.expectEqual(Verbs.OfferResult.offered, try p.verbs.offerSlot(0, 4, 1, std.math.maxInt(u64)));
@@ -1406,16 +1444,101 @@ test "the release → grant gap of an accept: the released slot stays RESERVED f
     for (p.table.pickUnleased(&.{ 4, 5, 6 }, picked[0..2])) |s| try testing.expect(s != 4);
     // The accepter's grant lands and clears the reservation.
     const acc = try p.verbs.acquireSlots(gpa, .{ .appender_id = 1, .explicit = &.{4} });
-    defer gpa.free(acc.granted.grants);
+    defer acc.deinit(gpa);
     try testing.expect(p.table.view(4).leasedBy(1));
     try testing.expectEqual(@as(?AppenderId, null), p.table.reservedFor(4, clock.monotonicNs()));
     // A lapsed stand: the released slot is anyone's.
     const g5 = try p.verbs.acquireSlots(gpa, .{ .appender_id = 0, .explicit = &.{5} });
-    gpa.free(g5.granted.grants);
+    g5.deinit(gpa);
     try testing.expectEqual(Verbs.OfferResult.offered, try p.verbs.offerSlot(0, 5, 1, clock.monotonicNs() + 1));
     try TestPlane.transfer(p, 5, 0, 1);
     try testing.expectEqual(@as(?AppenderId, null), p.table.reservedFor(5, clock.monotonicNs() + 2));
     const g5b = try p.verbs.acquireSlots(gpa, .{ .appender_id = 2, .explicit = &.{5} });
-    gpa.free(g5b.granted.grants);
+    g5b.deinit(gpa);
     try testing.expect(p.table.view(5).leasedBy(2));
+}
+
+test "the door in a handover's release → grant gap (0003 §X.3; found by the online fsck row: 1,324–1,775 reserved refusals at A per run): a commit of any appender but the accepter is REFUSED naming the accepter at once — the door never re-asks a first touch the reservation refuses (the spin that held the holder's served session until the grant); the accepter's own touch is the first touch that takes the slot" {
+    const gpa = testing.allocator;
+    const p = try TestPlane.init(gpa);
+    defer p.deinit();
+    p.own_n = 3;
+    const g = try p.verbs.acquireSlots(gpa, .{ .appender_id = 0, .explicit = &.{4} });
+    g.deinit(gpa);
+    try testing.expectEqual(Verbs.OfferResult.offered, try p.verbs.offerSlot(0, 4, 1, std.math.maxInt(u64)));
+    try TestPlane.transfer(p, 4, 0, 1);
+    try testing.expectEqual(@as(?AppenderId, 1), p.table.reservedFor(4, clock.monotonicNs()));
+    // The holder's commit (a served ship of the accepter's, landing in the
+    // gap) on a thread: refused at once, no first touch asked.
+    const Committer = struct {
+        fn run(d: *Door, res: *door_mod.Error!void, done: *std.atomic.Value(bool)) void {
+            var tok: door_mod.Tokens = .{};
+            res.* = d.enter(&.{4}, 0, &tok);
+            if (res.*) |_| d.exit(&tok) else |_| {}
+            done.store(true, .release);
+        }
+    };
+    const reserved0 = stats.slot_acquire_reserved_refusals.load();
+    const refusals0 = door_mod.stats.slot_door_refusals.load();
+    var res: door_mod.Error!void = {};
+    var done = std.atomic.Value(bool).init(false);
+    const th = try std.Thread.spawn(.{}, Committer.run, .{ &p.door, &res, &done });
+    // Either the door answered, or it is spinning on first touches the
+    // reservation refuses (two of them prove the loop).
+    while (!done.load(.acquire) and stats.slot_acquire_reserved_refusals.load() < reserved0 + 2) std.Thread.yield() catch {};
+    const spun = stats.slot_acquire_reserved_refusals.load() - reserved0;
+    // Unstick a spinning door before judging: the accepter's grant lands.
+    const acc = try p.verbs.acquireSlots(gpa, .{ .appender_id = 1, .explicit = &.{4} });
+    acc.deinit(gpa);
+    th.join();
+    try testing.expectEqual(@as(u64, 0), spun);
+    try testing.expectError(error.SlotBusy, res);
+    try testing.expectEqual(refusals0 + 1, door_mod.stats.slot_door_refusals.load());
+    // The accepter's own first touch takes a reserved slot.
+    const g6 = try p.verbs.acquireSlots(gpa, .{ .appender_id = 0, .explicit = &.{6} });
+    g6.deinit(gpa);
+    try testing.expectEqual(Verbs.OfferResult.offered, try p.verbs.offerSlot(0, 6, 1, std.math.maxInt(u64)));
+    try TestPlane.transfer(p, 6, 0, 1);
+    var tok: door_mod.Tokens = .{};
+    try p.door.enter(&.{6}, 1, &tok);
+    try testing.expect(p.table.view(6).leasedBy(1));
+    p.door.exit(&tok);
+}
+
+test "an AcquireSlot REPLAYED by the slot's holder answers the grant's words (0003 §X.4; the requester whose accept landed at the manager but whose install has not yet — the carriage's accept in flight while its own door first-touches — re-installs what tree 0 names instead of re-asking forever): `already` counts it, `replayed` carries the slot at its generation with the grant-time words, nothing is written or installed again" {
+    const gpa = testing.allocator;
+    const p = try TestPlane.init(gpa);
+    defer p.deinit();
+    p.own_n = 2;
+    const g = try p.verbs.acquireSlots(gpa, .{ .appender_id = 3, .explicit = &.{5} });
+    defer g.deinit(gpa);
+    try testing.expectEqual(@as(usize, 1), g.granted.grants.len);
+    const entries0 = p.tv.control_entries;
+    const installs0 = p.installs;
+    const grants0 = stats.slot_grants.load();
+    const rep = try p.verbs.acquireSlot(gpa, 3, 5, .try_);
+    defer rep.deinit(gpa);
+    try testing.expectEqual(@as(u16, 1), rep.granted.already);
+    try testing.expectEqual(@as(usize, 0), rep.granted.grants.len);
+    try testing.expectEqual(@as(usize, 1), rep.granted.replayed.len);
+    try testing.expectEqual(@as(u16, 5), rep.granted.replayed[0].slot);
+    try testing.expectEqual(g.granted.grants[0].g, rep.granted.replayed[0].g);
+    try testing.expectEqual(g.granted.grants[0].words.cursor, rep.granted.replayed[0].words.cursor);
+    try testing.expectEqual(entries0, p.tv.control_entries);
+    try testing.expectEqual(installs0, p.installs);
+    try testing.expectEqual(grants0, stats.slot_grants.load());
+    // The wire reply carries the replayed lease as an item the joiner
+    // installs (its install is idempotent at the generation it holds).
+    var table: manager.HandlerTable = .{};
+    Verbs.bindHandlers(&table);
+    var buf: [256]u8 = undefined;
+    var b: codec.Builder = .init(&buf);
+    try verbs.encodeRequest(.{ .acquire_slot = .{ .volume = 0, .slot = 5, .appender_id = 3 } }, &b);
+    const wire = table.dispatch(&p.mgr, gpa, .acquire_slot, b.written());
+    defer gpa.free(wire.payload);
+    const dec = try verbs.decodeReply(.acquire_slot, wire.payload);
+    try testing.expectEqual(@as(u8, 0), dec.acquire_slot.head.kind);
+    try testing.expectEqual(@as(u16, 1), dec.acquire_slot.head.already);
+    try testing.expectEqual(@as(usize, 1), dec.acquire_slot.items.len);
+    try testing.expectEqual(@as(u16, 5), dec.acquire_slot.items[0].slot);
 }

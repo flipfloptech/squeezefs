@@ -89,6 +89,8 @@ pub const Plane = struct {
     /// One handover at a time per volume on a joiner (the manager's verbs
     /// carry their own lock).
     handover_lock: Io.Mutex = .init,
+    /// A joiner's wire-grant installs, one at a time (`installWireGrant`).
+    install_lock: Io.Mutex = .init,
     armed: bool = false,
     /// The process-wide `slot_leases_held` gauge counts this plane's leases
     /// once the arm folded them in (the arm's own grants are in the fold).
@@ -534,20 +536,15 @@ pub const Plane = struct {
         // 5. The native slot (KD-SYM-2), then the rotor topped up to M.
         if (be.stamp.native_slot) |ns| {
             const out = self.verbs.acquireSlots(gpa, .{ .appender_id = journal.FIXED_RING_APPENDER, .explicit = &.{ns} }) catch |e| return mapVerb(e);
-            switch (out) {
-                .granted => |g| gpa.free(g.grants),
-                .refused => return error.Corrupt,
-            }
+            defer out.deinit(gpa);
+            if (out == .refused) return error.Corrupt;
         }
         if (rotor_now < m) {
             const out = self.verbs.acquireSlots(gpa, .{ .appender_id = journal.FIXED_RING_APPENDER, .want = @intCast(m - rotor_now), .rotor = true }) catch |e| switch (e) {
                 error.RotorAtCap => acquire.AcquireOutcome{ .granted = .{ .grants = &.{}, .already = 0 } },
                 else => return mapVerb(e),
             };
-            switch (out) {
-                .granted => |g| if (g.grants.len != 0) gpa.free(g.grants),
-                .refused => {},
-            }
+            out.deinit(gpa);
         }
         // 6. N_floor's cold start before any measurement: a device barrier
         // of 1 ms and the fleet's ≈ 0.3 ms ship (spec §4.4) — N_floor 17;
@@ -649,7 +646,7 @@ pub const Plane = struct {
             else => error.Io,
         };
         for (grants) |g| {
-            try self.installWireGrant(g.slot, g.g, g.words);
+            try self.installWireGrant(g.slot, g.g, g.words, false);
             self.table.setRotor(g.slot, true);
         }
         self.judge.seed(COLD_BARRIER_NS, COLD_SHIP_NS);
@@ -705,9 +702,88 @@ pub const Plane = struct {
 
     /// A lease the wire granted THIS region: the table word (tree 0 names
     /// it from this reply on), the words installed as a fresh grant.
-    fn installWireGrant(self: *Plane, slot: u16, g: u32, words: lt.SlotWords) ArmError!void {
-        try self.table.load(slot, .{ .variant = .leased, .appender_id = self.me, .g = g, .root = words.root, .cursor = words.cursor, .slot_tree_extents = words.extents, .seq_floor = words.seq_floor });
+    ///
+    /// The tree FIRST, the word LAST (0003 §X.5): the table word is what
+    /// every reader of the lease acts on — the resolver's `local`, the
+    /// door's admit, the applier's witness — so it is published only once
+    /// the transferred root is in place (the word first let the accepter
+    /// read its new slot as EMPTY: a create's parent `dying`, a stat
+    /// ENOENT, and a commit in the gap minted an empty tree the install
+    /// then kept, shadowing every record the holder wrote). `touch`: the
+    /// grant answers this mount's first touch, so a virgin slot's tree is
+    /// minted here (a rotor grant stays lazy until its first commit).
+    /// Idempotent at the generation held (the carriage's accept and the
+    /// door's replayed first touch may both land); serialized.
+    fn installWireGrant(self: *Plane, slot: u16, g: u32, words: lt.SlotWords, touch: bool) ArmError!void {
+        if (!self.install_lock.tryLock()) {
+            acquire.stats.slot_install_waits.inc();
+            self.install_lock.lockUncancelable(self.io);
+        }
+        defer self.install_lock.unlock(self.io);
+        const v = self.table.view(slot);
+        if (v.leasedBy(self.me) and v.g >= g) return;
+        // A joiner holds a slot's tree only while it leases the slot (its
+        // release forgets it): one here at another root than the grant's is
+        // a shadow no path may make any more (a commit's mint for a slot
+        // this mount did not lease) — replaced, never written into over the
+        // departing holder's records.
+        if (self.be.slotTree(slot)) |t| if (words.root.addr != 0) {
+            const r = t.rootPtr();
+            if (r.addr != words.root.addr or r.seq != words.root.seq) {
+                acquire.stats.slot_install_shadow_trees.fire("a wire grant found this joiner holding a tree of the slot at another root");
+                self.be.forgetTree(slot);
+            }
+        };
+        // Whatever this mount cached of the slot before (a former lease,
+        // its leaves since appended by others in place) goes before the
+        // grant's root is opened.
+        if (self.be.slotTree(slot) == null) self.discardMovedNodes(slot);
         self.install(slot, self.me, g, words, true) catch |e| return mapVerb(e);
+        if (touch and words.root.addr == 0 and self.be.slotTree(slot) == null) _ = self.be.mintGuestTree(slot) catch |e| return switch (e) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.Io => error.Io,
+            else => error.Corrupt,
+        };
+        self.parkMidInstall();
+        try self.table.load(slot, .{ .variant = .leased, .appender_id = self.me, .g = g, .root = words.root, .cursor = words.cursor, .slot_tree_extents = words.extents, .seq_floor = words.seq_floor });
+    }
+
+    /// A joiner whose holder cache names ITSELF for `slot` while its table
+    /// does not (the manager granted it — an accept in flight, or one
+    /// whose reply was lost): the grant's words installed through a
+    /// replayed first touch (the manager answers the holder's own lease
+    /// with tree 0's words; a concurrent install is serialized and
+    /// idempotent). True once the table names this mount.
+    pub fn settleOwnGrant(self: *Plane, slot: u16) bool {
+        const j = self.joined orelse return false;
+        self.firstTouchWire(j, slot) catch return false;
+        const settled = self.table.view(slot).leasedBy(self.me);
+        if (settled) acquire.stats.slot_own_grants_settled.inc();
+        return settled;
+    }
+
+    /// May a commit staging a record of `slot` mint its missing tree before
+    /// the door decides (`MetaSet.commit`)? Unarmed: yes (no lease
+    /// verdicts). Armed: a slot this mount leases; on the manager an
+    /// unleased one too (its own table is the truth and it maintains every
+    /// unleased tree). Never a slot another appender leases or a handover
+    /// reserved for another, and never a joiner's unleased view (its
+    /// first touch's install opens the grant's root or mints the virgin).
+    pub fn mayMintAtCommit(self: *Plane, slot: u16) bool {
+        if (!self.armed) return true;
+        const v = self.table.view(slot);
+        if (v.leasedBy(self.me)) return true;
+        if (self.joined != null or v.state != .unleased) return false;
+        const to = self.table.reservedFor(slot, clock.monotonicNs()) orelse return true;
+        return to == self.me;
+    }
+
+    /// `park_mid_install`: the harness holds the accepter between the two
+    /// halves of its install.
+    fn parkMidInstall(self: *Plane) void {
+        if (self.seam.hold != .park_mid_install) return;
+        self.seam.reached.set(self.io);
+        self.seam.release.waitUncancelable(self.io);
     }
 
     /// `used_leaf_bytes`: Σ of every slot tree's node census × node_size.
@@ -802,6 +878,10 @@ pub const Plane = struct {
         if (be.stamp.native_slot == slot or !be.stamp.hosts(slot)) return;
         const words = self.table.wordsOf(slot);
         if (be.slotTree(slot) != null) be.forgetTree(slot);
+        // The cache barrier (0003 §X.5): the lessee appended into the
+        // slot's leaves IN PLACE under the root pointer it returns — every
+        // image this process cached before the grant is stale.
+        self.discardMovedNodes(slot);
         if (words.root.addr == 0) return;
         const opened = tree.KvTree.open(self.gpa, be.cache, .{ .slot = key.guestForestSlot(slot) }, .{ .addr = words.root.addr, .seq = words.root.seq }, &be.seq) catch |e| {
             log.err("meta volume {s}: the tree of released slot {d} could not open at its recorded root 0x{x} ({s}) — its records serve only after a remount", .{ be.path, slot, words.root.addr, @errorName(e) });
@@ -821,6 +901,20 @@ pub const Plane = struct {
     fn foreignGrantedFn(ctx: *anyopaque, slot: u16) void {
         const self = self_(ctx);
         self.be.forgetTree(slot);
+        self.discardMovedNodes(slot);
+    }
+
+    /// THE CACHE BARRIER of a lease that crosses processes (0003 §X.5): a
+    /// slot's lessee appends frames into its leaf images IN PLACE under an
+    /// unchanged root pointer (the node's address and seq stay), so a node
+    /// image cached while another process held — or before it took — the
+    /// slot reads as current and is not: every mapping of the slot's nodes
+    /// goes (clean ones: the departing holder flushed before its release;
+    /// a reader of an evicted image re-resolves through the installed
+    /// root), counted.
+    fn discardMovedNodes(self: *Plane, slot: u16) void {
+        const dropped = self.be.cache.discardSlotNodes(key.guestForestSlot(slot));
+        acquire.stats.slot_move_nodes_discarded.add(dropped);
     }
 
     fn transferFn(ctx: *anyopaque, slot: u16, holder: AppenderId, _: AppenderId) acquire.Error!void {
@@ -849,10 +943,8 @@ pub const Plane = struct {
             error.Corrupt => error.Corrupt,
             error.OutOfMemory => error.OutOfMemory,
         };
-        switch (out) {
-            .granted => |g| if (g.grants.len != 0) self.gpa.free(g.grants),
-            .refused => return error.SlotBusy,
-        }
+        defer out.deinit(self.gpa);
+        if (out == .refused) return error.SlotBusy;
     }
 
     /// A joiner's first touch: `AcquireSlot` over the wire. Granted ⇒
@@ -870,7 +962,7 @@ pub const Plane = struct {
             .granted => |g| {
                 defer self.gpa.free(g.grants);
                 for (g.grants) |grant| {
-                    self.installWireGrant(grant.slot, grant.g, grant.words) catch |e| return switch (e) {
+                    self.installWireGrant(grant.slot, grant.g, grant.words, true) catch |e| return switch (e) {
                         error.OutOfMemory => error.OutOfMemory,
                         error.Io => error.Io,
                         error.Deferred => error.Deferred,
@@ -1032,6 +1124,7 @@ pub const Plane = struct {
             // The tree is the manager's now: its nodes leave this cache
             // (a successor rewrites them; nothing here frees an extent).
             self.be.forgetTree(slot);
+            self.discardMovedNodes(slot);
             return;
         }
         _ = self.verbs.releaseSlot(self.gpa, .{ .appender_id = holder, .slot = slot, .g = g, .words = words, .tails = tails }) catch |e| return switch (e) {
@@ -1249,7 +1342,7 @@ pub const Plane = struct {
                     defer self.gpa.free(g.grants);
                     if (g.grants.len == 0) return smallestOf(rotor);
                     const grant = g.grants[0];
-                    self.installWireGrant(grant.slot, grant.g, grant.words) catch return smallestOf(rotor);
+                    self.installWireGrant(grant.slot, grant.g, grant.words, false) catch return smallestOf(rotor);
                     self.table.setRotor(grant.slot, true);
                     acquire.stats.affinity_ceiling_overflows.inc();
                     return grant.slot;
@@ -1260,7 +1353,7 @@ pub const Plane = struct {
         const out = self.verbs.acquireSlots(self.gpa, .{ .appender_id = journal.FIXED_RING_APPENDER, .want = 1, .admit = .park }) catch return smallestOf(rotor);
         switch (out) {
             .granted => |g| {
-                defer if (g.grants.len != 0) self.gpa.free(g.grants);
+                defer out.deinit(self.gpa);
                 if (g.grants.len == 0) return smallestOf(rotor);
                 acquire.stats.affinity_ceiling_overflows.inc();
                 return g.grants[0].slot;

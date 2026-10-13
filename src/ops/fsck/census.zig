@@ -182,6 +182,18 @@ pub fn globalOfKeyIno(key_ino: u64) u64 {
     return route_table.globalOfEffective(key_ino);
 }
 
+/// The global ino of a key ino that an INODE may own; null for a slot's
+/// reserved locals below the mint base (a cross-owner intent's home is
+/// local 0 of its slot — "guest cursors mint from 2, so no inode ever owns
+/// it"; slot 0's local 0 likewise). The root pin (native local 1) is the
+/// root's.
+pub fn globalOfOwnedKeyIno(key_ino: u64) ?u64 {
+    const sl = ofKeyIno(key_ino);
+    if (sl.slot == 0 and sl.raw == inos.ROOT_INO) return inos.ROOT_INO;
+    if (sl.raw < inos.LOCAL_INO_BASE) return null;
+    return route_table.globalOfEffective(key_ino);
+}
+
 pub fn keyInoOf(sl: SlotLocal) u64 {
     if (sl.slot == 0) return sl.raw;
     return key.guestLocalIno(sl.slot, sl.raw);
@@ -1068,6 +1080,16 @@ test "ino arithmetic: a key ino and the global ino it encodes decompose to the S
     try testing.expectEqual(SlotLocal{ .slot = 0, .raw = 1 }, ofGlobalIno(1).?);
     try testing.expect(ofGlobalIno(0) == null);
     try testing.expect(ofGlobalIno(std.math.maxInt(u64)) == null);
+}
+
+test "an inode-owned key ino has a global ino; a slot's reserved locals below the mint base — the cross-owner intent HOME (local 0) and the root pin's slot-0 siblings — own none (0003 §X.6; found by the online fsck row: the live window scan of a joiner's ring met an intent record and A's daemon died on the arithmetic's assertion — the admin lane's `HolderUnreachable, AGAIN`)" {
+    const w = inos.ROUTING_WIDTH;
+    const eff = route_table.effectiveIno(inos.makeGlobalIno(77, 5, w));
+    try testing.expectEqual(inos.makeGlobalIno(77, 5, w), globalOfOwnedKeyIno(eff).?);
+    try testing.expectEqual(@as(?u64, 1), globalOfOwnedKeyIno(1));
+    try testing.expectEqual(@as(?u64, null), globalOfOwnedKeyIno(key.guestLocalIno(5, 0)));
+    try testing.expectEqual(@as(?u64, null), globalOfOwnedKeyIno(key.guestLocalIno(5, 1)));
+    try testing.expectEqual(@as(?u64, null), globalOfOwnedKeyIno(0));
 }
 
 test "SlotScope: the unjudged predicate per posture; the era floor is three-valued with tree 0 as the witness; the inode plane abstains on an unreadable window or a reader's uncovered ring" {

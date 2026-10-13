@@ -88,6 +88,16 @@ pub const Bound = struct {
                     if (!be.slots.cache.knows(slot)) {
                         if (be.slots.cache.resolveViaManager(.{ .ctx = &js.link, .call = &@import("../joined.zig").SharedLink.callFn }, be.index, slot) catch null) |h| return self.foreign(h.appender_id);
                     }
+                    // This joiner's OWN grant learnt (the manager named it,
+                    // or the install began) before its table word names it:
+                    // the move completes HERE — the grant's words installed
+                    // through a replayed first touch (idempotent with the
+                    // carriage's accept), never a ship to the manager that
+                    // granted the slot away (decision 0003 §X.4).
+                    if (be.slots.cache.holderOf(slot)) |h| if (h.appender_id == be.slots.me) {
+                        if (be.slots.settleOwnGrant(slot)) return .{ .local = .{ .volume = v, .g = be.slots.table.view(slot).g } };
+                        return .{ .unreachable_ = .{ .holder = h.appender_id } };
+                    };
                     return self.foreign(0);
                 };
                 return .{ .local = .{ .volume = v, .g = view.g } };

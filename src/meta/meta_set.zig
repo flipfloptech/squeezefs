@@ -439,8 +439,12 @@ pub const MetaSet = struct {
             };
             // A record of a slot with no tree yet (a Delete of a never-
             // minted slot; a Put by a caller that minted elsewhere): the
-            // tree is minted here so the conveyor's routing finds it.
-            if (s.tree_id != key.TREE_CONTROL and h.be.slotTree(h.slot) == null) _ = h.be.mintGuestTree(h.slot) catch {
+            // tree is minted here so the conveyor's routing finds it — only
+            // for a slot this mount may write (0003 §X.5). A slot another
+            // appender leases is the door's to refuse, and a tree minted
+            // for it would shadow the root a later grant transfers; a
+            // joiner's unleased slot is minted by its first touch's install.
+            if (s.tree_id != key.TREE_CONTROL and h.be.slotTree(h.slot) == null and h.be.slots.mayMintAtCommit(h.slot)) _ = h.be.mintGuestTree(h.slot) catch {
                 self.abandon(t);
                 return error.Io;
             };

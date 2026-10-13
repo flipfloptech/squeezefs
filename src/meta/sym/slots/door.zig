@@ -20,7 +20,9 @@
 //! resumes on the transfer's completion or its abort); another appender's
 //! (`leased`/`offered`/`releasing`/`releasing{dead}`) ⇒ `SlotBusy`
 //! (`errors.SlotMoved` = EAGAIN); an offer standing FOR this committer ⇒
-//! the accept, through the same first-touch seam; `unleased` ⇒ the
+//! the accept, through the same first-touch seam; `unleased` reserved for
+//! another appender (a handover's release → grant gap) ⇒ `SlotBusy`
+//! naming the accepter; `unleased` ⇒ the
 //! first touch (the manager's in-process `AcquireSlot` with a PARKING
 //! admission — the seam parks for ring space HOLDING NOTHING of the door;
 //! `Deferred` ⇒ EAGAIN); `migrating` ⇒ park (rung 5's cutover park, its
@@ -189,7 +191,13 @@ pub const Door = struct {
                 if (!self.armed) return .admitted;
                 _ = self.table.leaveToken(slot);
                 if (!self.hostsSlot(slot)) return .moved;
-                return if (self.table.coherenceHeldUntil(slot, now_ns) != null) .held else .first_touch;
+                if (self.table.coherenceHeldUntil(slot, now_ns) != null) return .held;
+                // A handover's release → grant gap: the slot is its
+                // ACCEPTER's (0003 §Q.11, §X.3) — any other committer is
+                // refused naming it, never sent to a first touch the
+                // reservation refuses (the loop that spun until the grant).
+                if (self.table.reservedFor(slot, now_ns)) |to| if (to != me) return .{ .refuse = .{ .holder = to, .g = v.g, .dead = false } };
+                return .first_touch;
             },
             .leased, .offered => {
                 if (v.holder == me) return .admitted;

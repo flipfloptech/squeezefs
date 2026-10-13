@@ -430,8 +430,10 @@ pub const Error = error{
 };
 
 /// The kill-matrix seams (`SQUEEZEFS_TEST_HANDOVER_HOLD`): die or park
-/// after a named step. A field of the plane, never a static.
-pub const Hold = enum(u8) { off, after_page, after_tree0, park_after_page };
+/// after a named step; `park_mid_install` is the accepter's (a joiner's
+/// wire-grant install parks between its tree and its lease word). A field
+/// of the plane, never a static.
+pub const Hold = enum(u8) { off, after_page, after_tree0, park_after_page, park_mid_install };
 
 pub const Seam = struct {
     hold: Hold = .off,

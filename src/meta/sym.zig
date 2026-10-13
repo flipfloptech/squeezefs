@@ -101,6 +101,7 @@ test {
     if (builtin.os.tag == .linux) _ = bind;
     if (builtin.os.tag == .linux) _ = wire_plane;
     if (builtin.os.tag == .linux) _ = reader_plane;
+    if (builtin.os.tag == .linux) _ = @import("sym/handover_moves.zig");
     _ = tokens;
     _ = membership;
     _ = xv;

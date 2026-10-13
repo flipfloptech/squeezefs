@@ -454,7 +454,10 @@ pub const linux = if (builtin.os.tag == .linux) struct {
                 if (tag.level != 0 or !key.isSlotTreeKind(tag.tree_id)) continue;
                 _ = key.checkSlotTreeKey(tag.tree_id, f.key) catch continue;
                 const key_ino = std.mem.readInt(u64, f.key[key.routeOff(tag.tree_id)..][0..8], .big);
-                try b.scope.window_inos.put(gpa, census.globalOfKeyIno(key_ino), {});
+                // A record under a slot's reserved local (a cross-owner
+                // intent's home, local 0) names no inode (0003 §X.6).
+                const owned = census.globalOfOwnedKeyIno(key_ino) orelse continue;
+                try b.scope.window_inos.put(gpa, owned, {});
                 named += 1;
                 if (tag.tree_id != key.TREE_DENTRIES) continue;
                 // The child: off a Put's value, else (a DELETE) the tree's

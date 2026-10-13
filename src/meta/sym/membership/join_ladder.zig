@@ -1050,7 +1050,7 @@ test "two in-process daemons over the hub: B joins A's volume over the wire (the
     manual_now_ms = 1000;
     // A (appender 0) leases slots 1 and 2 (its rotor).
     const a_grant = try d.plane.verbs.acquireSlots(gpa, .{ .appender_id = 0, .explicit = &.{ 1, 2 }, .rotor = true });
-    gpa.free(a_grant.granted.grants);
+    a_grant.deinit(gpa);
     var wire: ManagerWire = .{ .gpa = gpa, .link = d.link(), .volume = 0, .identity = identityOf(1), .pages = d.pages() };
     var b = Joiner.init(gpa, &wire);
     defer b.deinit();

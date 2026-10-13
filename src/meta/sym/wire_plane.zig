@@ -769,14 +769,21 @@ pub const WirePlane = struct {
         // A joiner's pending shipped frees reach the holder while its link
         // and membership stand; then its clean leave of the shard FIRST
         // (the manager's owner deletes the member row; a leave over a park
-        // is refused — the crash shape, the ledger's to judge).
+        // is refused — the crash shape, the ledger's to judge). The beat is
+        // joined BEFORE the writer plane goes: every tick declares that
+        // plane's windows (`declareWindows` on a destroyed plane was the
+        // joiner's SIGSEGV at umount); the membership stands until the
+        // leave — a few wire calls without a renewal sit far inside T_self.
+        if (self.joined) |j| {
+            j.stop.store(true, .release);
+            j.beat.join();
+            j.windows.store(null, .release);
+        }
         if (self.writer_plane) |w| {
             w.destroy();
             self.writer_plane = null;
         }
         if (self.joined) |j| {
-            j.stop.store(true, .release);
-            j.beat.join();
             j.member.leave() catch log.err("cluster wire: the membership leave was refused over a standing park — the home shard records this mount's death", .{});
         }
         self.listener.stop();

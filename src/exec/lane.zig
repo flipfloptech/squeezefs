@@ -207,6 +207,10 @@ pub const Lane = struct {
     /// The idle clock the recycled slots are stamped with: the budget
     /// sampler's tick count (a test points it at its own).
     clock: *const std.atomic.Value(u64) = &mem_budget.authority.tick_count,
+    /// The idle trim's station seam (null in the product): `holding` runs
+    /// once per slot a trim pass has taken, before its trim — the pool
+    /// pin's rendezvous.
+    trim_station: ?TrimStation = null,
     /// `exec_lane_queue_depth`: ready + inbox depth as of the last pass.
     queue_depth: counters.Gauge = .{},
     tick_rescues: std.atomic.Value(u64) = .init(0),
@@ -226,6 +230,11 @@ pub const Lane = struct {
 
     pub const InitError = std.mem.Allocator.Error;
     pub const StartError = error{ RingSetupFailed, ThreadSpawnFailed };
+
+    pub const TrimStation = struct {
+        ctx: *anyopaque,
+        holding: *const fn (ctx: *anyopaque, f: *Fiber) void,
+    };
     pub const SpawnError = error{ConcurrencyUnavailable};
 
     /// Allocate the lane and its fiber table (stacks map lazily at first
@@ -470,6 +479,7 @@ pub const Lane = struct {
         var seen: u32 = 0;
         while (seen < self.fiber_capacity) : (seen += 1) {
             const f = self.free.tryPop() orelse break;
+            if (self.trim_station) |st| st.holding(st.ctx, f);
             if (f.stack) |*s| if (!s.trimmed and now -| f.idle_tick >= min_idle_ticks) {
                 s.trim();
                 trimmed += 1;
@@ -1213,6 +1223,33 @@ test "the idle-trim law on a lane's stacks: every slot a spawn ever touched stay
         if (!s.trimmed) rearmed += 1;
     };
     try testing.expectEqual(@as(u32, 1), rearmed);
+}
+
+test "the idle trim never takes a slot out of the spawn pool: while a pass holds a free slot for its trim, every slot no fiber lives on is still where a spawn looks (0003 §W.4)" {
+    const l = try testLane(.meta, 2, false);
+    defer l.deinit();
+    const Station = struct {
+        lane: *Lane,
+        held: u32 = 0,
+        /// The fewest slots a spawn could pop while a trim held one.
+        least_poppable: u32 = std.math.maxInt(u32),
+        fn holding(ctx: *anyopaque, _: *Fiber) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.held += 1;
+            var got: [2]*Fiber = undefined;
+            var n: u32 = 0;
+            while (self.lane.free.tryPop()) |g| : (n += 1) got[n] = g;
+            for (got[0..n]) |g| self.lane.free.pushSpin(g);
+            self.least_poppable = @min(self.least_poppable, n);
+        }
+    };
+    var st: Station = .{ .lane = l };
+    l.trim_station = .{ .ctx = &st, .holding = &Station.holding };
+    defer l.trim_station = null;
+    // No fiber lives: both slots are free and the pass takes each in turn.
+    _ = l.trimIdleStacks(0);
+    try testing.expect(st.held >= 1);
+    try testing.expectEqual(@as(u32, 2), st.least_poppable);
 }
 
 test "the stack trimmer races spawns and recycles: a foreign thread trims at min 0 in a tight loop while fibers spawn, park, are woken and finish; every state transition holds and every spawn lands" {

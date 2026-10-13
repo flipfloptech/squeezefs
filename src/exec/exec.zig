@@ -18,6 +18,7 @@ pub const stats = @import("stats.zig");
 pub const futex_table_model = @import("futex_table_model.zig");
 pub const group_model = @import("group_model.zig");
 pub const wake_core_model = @import("wake_core_model.zig");
+pub const slot_pool_model = @import("slot_pool_model.zig");
 
 // ---- Linux only ----
 pub const fiber = if (is_linux) @import("fiber.zig") else struct {};
@@ -44,6 +45,7 @@ test {
     _ = futex_table_model;
     _ = group_model;
     _ = wake_core_model;
+    _ = slot_pool_model;
     if (is_linux) {
         _ = fiber;
         _ = lane;

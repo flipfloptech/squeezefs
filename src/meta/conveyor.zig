@@ -1687,6 +1687,7 @@ pub const Conveyor = struct {
             }
             // A6.
             var refused: std.ArrayList(heap_law.Refused) = .empty;
+            defer refused.deinit(self.deps.gpa);
             self.admitHeap(arena, members.items, &r, dirties, &refused) catch |e| {
                 self.unlockAll(r.lock_set);
                 r.releaseRefs();

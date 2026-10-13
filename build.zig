@@ -33,7 +33,14 @@
 //!   zig build fmt          — `zig fmt --check` over the tree.
 //!   zig build gate         — fmt + test + rails + smoke + bench-smoke + the
 //!                            shim/nvmet/sdk smokes + suites-smoke: the
-//!                            per-commit gate.
+//!                            per-commit gate. Its test steps run side by
+//!                            side (each stages its own pid-tagged rig); the
+//!                            unit tests and the smoke run as shard sets of
+//!                            one compiled binary each (`-Dunit-shards`,
+//!                            `-Dsmoke-shards`; derived from the host), and a
+//!                            `[venue-exclusive]` test runs after all of them.
+//!   zig build costs        — regenerate the shard sets' cost tables
+//!                            (tests/costs/) from this venue's gate runs.
 //!   zig build suites-smoke — the ~2-minute pjdfstest subset against a fresh
 //!                            mount (scripts/suites/pjdfstest.sh; Linux, root).
 //!   zig build gate-release — pjdfstest + LTP + fstests -g auto, three clean
@@ -168,24 +175,51 @@ pub fn build(b: *std.Build) void {
     //      the classes a venue cannot honestly satisfy (`core/testkit.zig`) ----
     const release_gate = b.option(bool, "release-gate", "Release-gate mode: environment skips fail the gate (except needs_reference_hardware / other_step)") orelse false;
 
-    // ---- unit tests over the library module ----
+    // ---- the project test runner and the shard sets
+    //      (docs/evidence/rung-10-gate-speed.md): every test binary but the
+    //      rails' runs under tests/test_runner.zig — the stock runner plus
+    //      `--shard`, the committed cost table (tests/costs/) and the
+    //      heartbeat — and the two long runs, the unit tests and the smoke,
+    //      run as N processes of ONE compiled binary the build runner
+    //      executes side by side. A `[venue-exclusive]` test runs in its
+    //      binary's exclusive step, after every other test step
+    //      (`Shards.wireGate`). ----
+    const test_runner: std.Build.Step.Compile.TestRunner = .{ .path = b.path("tests/test_runner.zig"), .mode = .server };
     const test_filters = b.option([]const []const u8, "test-filter", "Only run tests whose names contain this text (repeatable)") orelse &.{};
+    const host = HostFacts.read();
+    var shards: Shards = .{
+        .b = b,
+        .release_gate = release_gate,
+        // A filtered run is a developer's loop over a few tests: one process,
+        // every test (exclusive ones too), no table to judge.
+        .sharded = test_filters.len == 0,
+        .costs_step = b.step("costs", "Regenerate tests/costs/<binary>.<os>.tsv from this venue's shard runs (the partition's cost table; commit the result)"),
+    };
+    const unit_shard_count = b.option(u32, "unit-shards", "Processes for the unit tests (default: derived from this host's cores and memory)") orelse host.unitShards();
+    const smoke_shard_count = b.option(u32, "smoke-shards", "Processes for the smoke (default: derived from this host's memory and cores)") orelse host.smokeShards();
+
+    // ---- unit tests over the library module ----
     const unit_tests = b.addTest(.{
         .name = "squeezefs-unit",
         .root_module = squeezefs_mod,
         .filters = test_filters,
+        .test_runner = test_runner,
     });
-    const run_unit_tests = gated(b.addRunArtifact(unit_tests), release_gate);
-    // The fuzz campaign's replay seam (`core/fuzzkit.zig`): the artefact path
-    // rides the step's own environment so a replay is part of the run's
-    // cache manifest — a probe with a new artefact is never a cached pass.
-    if (b.graph.environ_map.get("SQUEEZEFS_TEST_FUZZ_REPLAY")) |p| run_unit_tests.setEnvironmentVariable("SQUEEZEFS_TEST_FUZZ_REPLAY", p);
+    // `.exclusive`: the unit binary holds every test, the smoke's
+    // `[venue-exclusive]` rows too (there they skip, `other_step`).
+    const unit_runs = shards.add(unit_tests, unit_shard_count, .{ .exclusive = true, .balanced = true });
+    for (unit_runs.all) |run_unit_tests| {
+        // The fuzz campaign's replay seam (`core/fuzzkit.zig`): the artefact path
+        // rides the step's own environment so a replay is part of the run's
+        // cache manifest — a probe with a new artefact is never a cached pass.
+        if (b.graph.environ_map.get("SQUEEZEFS_TEST_FUZZ_REPLAY")) |p| run_unit_tests.setEnvironmentVariable("SQUEEZEFS_TEST_FUZZ_REPLAY", p);
+    }
     const test_step = b.step("test", "Run unit tests");
-    test_step.dependOn(&run_unit_tests.step);
+    unit_runs.wire(test_step);
 
     // The gate steps are declared here so the steps below can hang off them;
     // their dependencies are wired where each piece lands.
-    const gate_step = b.step("gate", "fmt + unit tests + rails + smoke + bench-smoke + sdk-smoke + suites-smoke (the per-commit gate)");
+    const gate_step = b.step("gate", "fmt + unit tests + rails + smoke + bench-smoke + shim/nvmet/sdk smokes + suites-smoke, side by side (the per-commit gate)");
     const gate_release_step = b.step("gate-release", "gate + bench-compare against the committed baseline + the external suites (pjdfstest, LTP, fstests -g auto; 3 clean runs each, adjudicated; Linux venue, root, hours) — run with -Drelease-gate=true: skips fail");
 
     // ---- static rails: source-scanning convention tests (charter §11) ----
@@ -199,6 +233,9 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "squeezefs", .module = squeezefs_mod },
             },
         }),
+        // The stock runner: the rails test the shard plan
+        // (tests/shard_plan.zig), which the project runner imports, and a
+        // file belongs to one module.
     });
     const run_rails_tests = gated(b.addRunArtifact(rails_tests), release_gate);
     // The rails scan the source tree relative to the repository root.
@@ -220,6 +257,7 @@ pub fn build(b: *std.Build) void {
                     .{ .name = "squeezefs", .module = squeezefs_mod },
                 },
             }),
+            .test_runner = test_runner,
         });
         const run_census = gated(b.addRunArtifact(census_tests), release_gate);
         run_census.setCwd(dir);
@@ -235,14 +273,19 @@ pub fn build(b: *std.Build) void {
         .name = "squeezefs-smoke",
         .root_module = squeezefs_mod,
         .filters = if (test_filters.len != 0) test_filters else &.{"smoke:"},
+        .test_runner = test_runner,
     });
-    const run_smoke_tests = gated(b.addRunArtifact(smoke_tests), release_gate);
-    run_smoke_tests.setCwd(exe.getEmittedBinDirectory());
-    // The smoke drives a real mount on the venue's kernel: its outcome is
-    // not a function of the build inputs, so every gate run re-runs it.
-    run_smoke_tests.has_side_effects = true;
+    // Off Linux every row skips (charter §1.2): one part, nothing to balance.
+    const smoke_on_venue = target.result.os.tag == .linux;
+    const smoke_runs = shards.add(smoke_tests, if (smoke_on_venue) smoke_shard_count else 1, .{ .exclusive = true, .balanced = smoke_on_venue });
+    for (smoke_runs.all) |run_smoke_tests| {
+        run_smoke_tests.setCwd(exe.getEmittedBinDirectory());
+        // The smoke drives a real mount on the venue's kernel: its outcome is
+        // not a function of the build inputs, so every gate run re-runs it.
+        run_smoke_tests.has_side_effects = true;
+    }
     const smoke_step = b.step("smoke", "Run the smoke (format/mount/umount/status against a real mount)");
-    smoke_step.dependOn(&run_smoke_tests.step);
+    smoke_runs.wire(smoke_step);
 
     // ---- the bench smoke (charter §11: one iteration of every workload
     //      per commit): `squeezefs bench --smoke` against a mount the smoke
@@ -251,15 +294,15 @@ pub fn build(b: *std.Build) void {
         .name = "squeezefs-bench-smoke",
         .root_module = squeezefs_mod,
         .filters = &.{"bench gate:"},
+        .test_runner = test_runner,
     });
-    const run_bench_smoke = gated(b.addRunArtifact(bench_smoke_tests), release_gate);
-    run_bench_smoke.setCwd(exe.getEmittedBinDirectory());
-    run_bench_smoke.has_side_effects = true;
-    // After the smoke: the two drive real mounts on one venue and must
-    // never share it (the build graph runs independent steps in parallel).
-    run_bench_smoke.step.dependOn(&run_smoke_tests.step);
+    const bench_smoke_runs = shards.add(bench_smoke_tests, 1, .{});
+    for (bench_smoke_runs.all) |run_bench_smoke| {
+        run_bench_smoke.setCwd(exe.getEmittedBinDirectory());
+        run_bench_smoke.has_side_effects = true;
+    }
     const bench_smoke_step = b.step("bench-smoke", "Run `squeezefs bench --smoke` against a mount the step creates (one iteration of every workload)");
-    bench_smoke_step.dependOn(&run_bench_smoke.step);
+    bench_smoke_runs.wire(bench_smoke_step);
 
     // ---- the microbench baseline (charter §11 "a committed microbench
     //      baseline with per-group regression thresholds"): the rig is its
@@ -272,13 +315,13 @@ pub fn build(b: *std.Build) void {
         // The rig drives the INSTALLED binary (`<prefix>/bin/squeezefs`): the
         // prefix and the repo's bench/ dir reach it through `bench_options`
         // (untracked paths: no step the library could cycle on).
-        const record = b.addTest(.{ .name = "squeezefs-bench-baseline", .root_module = squeezefs_mod, .filters = &.{"bench baseline:"} });
+        const record = b.addTest(.{ .name = "squeezefs-bench-baseline", .root_module = squeezefs_mod, .filters = &.{"bench baseline:"}, .test_runner = test_runner });
         const run_record = gated(b.addRunArtifact(record), release_gate);
         run_record.setEnvironmentVariable("SQUEEZEFS_TEST_BENCH_RIG", "1");
         run_record.has_side_effects = true;
         run_record.step.dependOn(b.getInstallStep());
         bench_baseline_step.dependOn(&run_record.step);
-        const compare = b.addTest(.{ .name = "squeezefs-bench-compare", .root_module = squeezefs_mod, .filters = &.{"bench compare:"} });
+        const compare = b.addTest(.{ .name = "squeezefs-bench-compare", .root_module = squeezefs_mod, .filters = &.{"bench compare:"}, .test_runner = test_runner });
         const run_compare = gated(b.addRunArtifact(compare), release_gate);
         run_compare.setEnvironmentVariable("SQUEEZEFS_TEST_BENCH_RIG", "1");
         run_compare.has_side_effects = true;
@@ -298,46 +341,47 @@ pub fn build(b: *std.Build) void {
     }
 
     // ---- the shim smoke (Linux): the LD_PRELOAD battery with the staged
-    //      .so beside the binary under test; after the bench smoke (one
-    //      mount on the venue at a time) ----
+    //      .so beside the binary under test (its rig pid-tagged: it runs
+    //      beside the other test steps) ----
     const shim_smoke_step = b.step("shim-smoke", "Run the LD_PRELOAD shim battery against a mount the step creates");
     if (shim_dir) |dir| {
         const shim_smoke_tests = b.addTest(.{
             .name = "squeezefs-shim-smoke",
             .root_module = squeezefs_mod,
             .filters = &.{"shim smoke:"},
+            .test_runner = test_runner,
         });
-        const run_shim_smoke = gated(b.addRunArtifact(shim_smoke_tests), release_gate);
-        run_shim_smoke.setCwd(dir);
-        run_shim_smoke.has_side_effects = true;
-        run_shim_smoke.step.dependOn(&run_bench_smoke.step);
-        shim_smoke_step.dependOn(&run_shim_smoke.step);
+        const shim_smoke_runs = shards.add(shim_smoke_tests, 1, .{});
+        for (shim_smoke_runs.all) |run_shim_smoke| {
+            run_shim_smoke.setCwd(dir);
+            run_shim_smoke.has_side_effects = true;
+        }
+        shim_smoke_runs.wire(shim_smoke_step);
     }
 
     // ---- the nvmeof fidelity tier (charter §8, §11 release gate): the
     //      `nvmet fidelity:` legs through the binary against the venue's
-    //      kernel nvmet target (loop + tcp), zero mocks; after the shim
-    //      smoke (one mount on the venue at a time); skips loudly off the
-    //      venue ----
+    //      kernel nvmet target (loop + tcp), zero mocks; its subsystems,
+    //      ports and namespace uuids are the run's own (`ops/nvmet/
+    //      fidelity.zig`), so it runs beside the other test steps; skips
+    //      loudly off the venue ----
     // `-Dnvmet-filter=<text>` narrows the tier to the legs whose name
     // contains the text (filters OR together, so the text replaces the
-    // tier's prefix — spell `nvmet fidelity: <leg>`) and drops the gate's
-    // ordering (a developer's single leg, not the per-commit run).
-    const nvmet_filter = b.option([]const u8, "nvmet-filter", "Run only the nvmet fidelity legs whose name contains this text (skips the gate's smoke ordering)");
+    // tier's prefix — spell `nvmet fidelity: <leg>`).
+    const nvmet_filter = b.option([]const u8, "nvmet-filter", "Run only the nvmet fidelity legs whose name contains this text");
     const nvmet_smoke_tests = b.addTest(.{
         .name = "squeezefs-nvmet-smoke",
         .root_module = squeezefs_mod,
         .filters = &.{nvmet_filter orelse "nvmet fidelity:"},
+        .test_runner = test_runner,
     });
-    const run_nvmet_smoke = gated(b.addRunArtifact(nvmet_smoke_tests), release_gate);
-    run_nvmet_smoke.setCwd(exe.getEmittedBinDirectory());
-    run_nvmet_smoke.has_side_effects = true;
-    if (nvmet_filter == null) {
-        run_nvmet_smoke.step.dependOn(&run_bench_smoke.step);
-        if (shim_dir != null) run_nvmet_smoke.step.dependOn(shim_smoke_step);
+    const nvmet_smoke_runs = shards.add(nvmet_smoke_tests, 1, .{});
+    for (nvmet_smoke_runs.all) |run_nvmet_smoke| {
+        run_nvmet_smoke.setCwd(exe.getEmittedBinDirectory());
+        run_nvmet_smoke.has_side_effects = true;
     }
     const nvmet_smoke_step = b.step("nvmet-smoke", "Run the nvmeof fidelity tier (share/connect/format/mount/PR legs on the kernel nvmet target)");
-    nvmet_smoke_step.dependOn(&run_nvmet_smoke.step);
+    nvmet_smoke_runs.wire(nvmet_smoke_step);
 
     // ---- the nightly fuzz campaign (charter §11 "nightly fuzz"): the
     //      driver runs the build runner's fuzzer on every census target for
@@ -377,13 +421,11 @@ pub fn build(b: *std.Build) void {
     fmt_step.dependOn(&fmt.step);
 
     // ---- the per-commit gate ----
+    // The test binaries' runs come in through `shards.wireGate` below (the
+    // exclusive class after every other test step); the top-level `test`,
+    // `smoke`, … steps are a developer's.
     gate_step.dependOn(fmt_step);
-    gate_step.dependOn(test_step);
     gate_step.dependOn(rails_step);
-    gate_step.dependOn(smoke_step);
-    gate_step.dependOn(bench_smoke_step);
-    gate_step.dependOn(shim_smoke_step);
-    gate_step.dependOn(nvmet_smoke_step);
 
     // ---- the release gate (charter §11): the per-commit gate plus the
     //      microbench compare against the committed baseline (wired above,
@@ -406,8 +448,9 @@ pub fn build(b: *std.Build) void {
         smoke.setEnvironmentVariable("PJD_SMOKE", "1");
         smoke.setEnvironmentVariable("SUITE_RUNS", "1");
         smoke.has_side_effects = true;
-        // After the nvmet smoke: one mount on the venue at a time.
-        smoke.step.dependOn(&run_nvmet_smoke.step);
+        // Beside the test steps (its set dir and mountpoint are pid-tagged),
+        // before the exclusive class.
+        shards.venue_steps.append(b.allocator, &smoke.step) catch @panic("OOM");
         suites_smoke_step.dependOn(&smoke.step);
         gate_step.dependOn(suites_smoke_step);
         inline for (.{ "pjdfstest.sh", "ltp.sh", "fstests.sh" }) |script| {
@@ -507,6 +550,8 @@ pub fn build(b: *std.Build) void {
         sdk_smoke_step.dependOn(&b.addFail("the SDK's C smoke is Linux-only (charter §1.2): run it on the venue").step);
     }
 
+    shards.wireGate(gate_step);
+
     // ---- dist: split debug info with a debuglink ----
     // objcopy --only-keep-debug squeezefs squeezefs.debug
     // objcopy --strip-debug --add-gnu-debuglink=squeezefs.debug squeezefs
@@ -603,6 +648,153 @@ fn gated(run: *std.Build.Step.Run, release_gate: bool) *std.Build.Step.Run {
     if (release_gate) run.setEnvironmentVariable("SQUEEZEFS_TEST_RELEASE_GATE", "1");
     return run;
 }
+
+/// The host the build runs on, read at configure time: the shard counts are a
+/// function of it (`-Dunit-shards` / `-Dsmoke-shards` win). The per-process
+/// figures are the venue's measured peaks (docs/evidence/rung-10-gate-speed.md).
+const HostFacts = struct {
+    cpus: u32,
+    ram_bytes: u64,
+
+    /// A unit shard's resident bound: the whole unsharded unit run peaked at
+    /// 1 GiB (one test's working set; a shard runs a subset), ×2 headroom.
+    const unit_shard_rss: u64 = 2 << 30;
+    /// A smoke shard's resident bound: the test process (≤ 0.8 GiB measured)
+    /// plus a three-daemon row's daemons (≤ 0.6 GiB each measured), rounded up.
+    const smoke_shard_rss: u64 = 3 << 30;
+
+    fn read() HostFacts {
+        return .{
+            .cpus = @intCast(std.Thread.getCpuCount() catch 1),
+            .ram_bytes = std.process.totalSystemMemory() catch 0,
+        };
+    }
+
+    /// One unit shard per two cores: the heavy Debug tests (the property
+    /// and scale suites) each keep a core busy, and past half the cores
+    /// they stretch one another — 11 shards on the 11-core dev box ran its
+    /// longest test 2.3× slower than alone and timing-bounded tests met an
+    /// oversubscribed host — while beside them the binary's compile (the
+    /// venue's critical path) needs its core; and no more than the RAM
+    /// holds at `unit_shard_rss` each.
+    fn unitShards(h: HostFacts) u32 {
+        return @max(1, @min(h.cpus / 2, ramShare(h.ram_bytes, unit_shard_rss)));
+    }
+
+    /// One smoke shard per two cores: a storm row drives two daemons that
+    /// each keep a core busy; and no more than the RAM holds at
+    /// `smoke_shard_rss` each.
+    fn smokeShards(h: HostFacts) u32 {
+        return @max(1, @min(h.cpus / 2, ramShare(h.ram_bytes, smoke_shard_rss)));
+    }
+
+    fn ramShare(ram: u64, per: u64) u32 {
+        return @intCast(@min(ram / per, std.math.maxInt(u32)));
+    }
+};
+
+/// The shard sets (the test-runner section of `build`): `count` run steps of
+/// ONE compiled test binary, each `--shard=I/N` of it, plus — for a binary
+/// that declares the class — its exclusive step (`--shard=exclusive`: its
+/// `[venue-exclusive]` tests). The exclusive step comes twice: once in the
+/// binary's own top-level step, after its parts (a developer's
+/// `zig build smoke`), once in the gate, after EVERY other test step of the
+/// gate (`wireGate`). Each run balances by the binary's cost table for this
+/// OS (`tests/costs/<binary>.<os>.tsv`, when committed) and writes what it
+/// measured; `zig build costs` merges a binary's files into its table.
+const Shards = struct {
+    b: *std.Build,
+    release_gate: bool,
+    sharded: bool,
+    costs_step: *std.Build.Step,
+    /// Every non-exclusive test step of the gate.
+    venue_steps: std.ArrayList(*std.Build.Step) = .empty,
+    /// The gate's exclusive steps: after every venue step.
+    gate_exclusive: std.ArrayList(*std.Build.Step.Run) = .empty,
+
+    const Options = struct {
+        /// The binary holds `[venue-exclusive]` tests: give it the steps.
+        /// Without them a marked test refuses the run by name (it would
+        /// otherwise run in no step at all).
+        exclusive: bool = false,
+        /// The parts balance by the binary's cost table and `costs`
+        /// regenerates it (a set of one part has nothing to balance).
+        balanced: bool = false,
+    };
+
+    const Set = struct {
+        parts: []*std.Build.Step.Run,
+        local_exclusive: ?*std.Build.Step.Run,
+        gate_exclusive: ?*std.Build.Step.Run,
+        all: []*std.Build.Step.Run,
+
+        /// The binary's own top-level step: its parts and, after them, its
+        /// exclusive step.
+        fn wire(set: Set, step: *std.Build.Step) void {
+            for (set.parts) |r| step.dependOn(&r.step);
+            if (set.local_exclusive) |x| step.dependOn(&x.step);
+        }
+    };
+
+    /// The caller configures every run in `all` alike (cwd, environment,
+    /// side effects).
+    fn add(s: *Shards, compile: *std.Build.Step.Compile, count: u32, options: Options) Set {
+        const b = s.b;
+        if (count == 0) std.debug.panic("{s}: a shard count of 0 runs nothing", .{compile.name});
+        if (!s.sharded) {
+            const run = gated(b.addRunArtifact(compile), s.release_gate);
+            const runs = b.allocator.dupe(*std.Build.Step.Run, &.{run}) catch @panic("OOM");
+            s.venue_steps.append(b.allocator, &run.step) catch @panic("OOM");
+            return .{ .parts = runs, .local_exclusive = null, .gate_exclusive = null, .all = runs };
+        }
+        const table = b.fmt("tests/costs/{s}.{t}.tsv", .{ compile.name, compile.rootModuleTarget().os.tag });
+        const have_table = options.balanced and if (b.root.access(b.graph.io, table, .{})) |_| true else |_| false;
+        // The table's rows in byte order: one stable diff whichever host merges.
+        const merge: ?*std.Build.Step.Run = if (options.balanced) b.addSystemCommand(&.{"sort"}) else null;
+        if (merge) |m| m.setEnvironmentVariable("LC_ALL", "C");
+        const n_exclusive: u32 = if (options.exclusive) 2 else 0;
+        const all = b.allocator.alloc(*std.Build.Step.Run, count + n_exclusive) catch @panic("OOM");
+        for (all, 0..) |*slot, i| {
+            const run = gated(b.addRunArtifact(compile), s.release_gate);
+            if (i < count) {
+                run.addArg(b.fmt("--shard={d}/{d}", .{ i + 1, count }));
+                if (!options.exclusive) run.addArg("--no-exclusive-step");
+                if (count > 1) run.setName(b.fmt("run test {s} {d}/{d}", .{ compile.name, i + 1, count }));
+                s.venue_steps.append(b.allocator, &run.step) catch @panic("OOM");
+            } else {
+                run.addArg("--shard=exclusive");
+                run.setName(b.fmt("run test {s} exclusive", .{compile.name}));
+            }
+            if (have_table) run.addPrefixedFileArg("--costs=", b.path(table));
+            // The local exclusive step is a developer's re-run of the gate's.
+            if (merge) |m| if (i <= count) m.addFileArg(run.addPrefixedOutputFileArg("--costs-out=", "costs.tsv"));
+            slot.* = run;
+        }
+        if (merge) |m| {
+            const update = b.addUpdateSourceFiles();
+            update.addCopyFileToSource(m.captureStdOut(.{}), table);
+            s.costs_step.dependOn(&update.step);
+        }
+        const parts = all[0..count];
+        var set: Set = .{ .parts = parts, .local_exclusive = null, .gate_exclusive = null, .all = all };
+        if (options.exclusive) {
+            set.gate_exclusive = all[count];
+            set.local_exclusive = all[count + 1];
+            for (parts) |p| set.local_exclusive.?.step.dependOn(&p.step);
+            s.gate_exclusive.append(b.allocator, all[count]) catch @panic("OOM");
+        }
+        return set;
+    }
+
+    /// The gate runs every venue step, then the exclusive class alone.
+    fn wireGate(s: *Shards, gate_step: *std.Build.Step) void {
+        for (s.venue_steps.items) |v| gate_step.dependOn(v);
+        for (s.gate_exclusive.items) |x| {
+            for (s.venue_steps.items) |v| x.step.dependOn(v);
+            gate_step.dependOn(&x.step);
+        }
+    }
+};
 
 /// The release train. Bumped only as a release act (`scripts/release.sh`)
 /// across all first-party components (charter §11 "Versioning"): this

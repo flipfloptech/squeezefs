@@ -6920,7 +6920,11 @@ fn stackHas(pid: linux.pid_t, needle: []const u8) bool {
     return std.mem.indexOf(u8, text, needle) != null;
 }
 
-test "smoke: A FROZEN DAEMON NEVER HANGS THE HOST'S `sync` (0003 §Z) — format → mount under the request-timeout seam (15 s) → SIGSTOP the daemon → a host-wide `sync` from another process: the kernel aborts its FUSE_SYNCFS to the frozen mount within the timeout + one check period and the sync returns → the frozen mount is fail-stopped (ENOTCONN, `sync -f` reports it, still in the mount table) → SIGCONT: the daemon names the abort loudly, tears down and exits 1 → a remount without the seam negotiates the lattice's T_owner + T_park_max" {
+// [venue-exclusive] (tests/shard_plan.zig): the row's host-wide `sync`
+// visits every FUSE mount on the host and SIGSTOPs a daemon — beside another
+// shard's rows it would flush their parked state mid-row and wait on their
+// daemons, and another row's stopped task voids it (`otherStoppedTask`).
+test "smoke: [venue-exclusive] A FROZEN DAEMON NEVER HANGS THE HOST'S `sync` (0003 §Z) — format → mount under the request-timeout seam (15 s) → SIGSTOP the daemon → a host-wide `sync` from another process: the kernel aborts its FUSE_SYNCFS to the frozen mount within the timeout + one check period and the sync returns → the frozen mount is fail-stopped (ENOTCONN, `sync -f` reports it, still in the mount table) → SIGCONT: the daemon names the abort loudly, tears down and exits 1 → a remount without the seam negotiates the lattice's T_owner + T_park_max" {
     const io = testing.io;
     if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
     const gpa = testing.allocator;

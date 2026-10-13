@@ -620,11 +620,13 @@ test "the header census parsers: a Zig export and a C prototype of the same shap
 // ---------------------------------------------------------------------------
 // The skip rail (charter §11: every environment skip routed through one
 // testkit): the identifier `SkipZigTest` appears nowhere in the tree but in
-// `src/core/testkit.zig`. A bare skip has no class, no ledger row and no
+// `src/core/testkit.zig` (and the runner that counts it). A bare skip has no class, no ledger row and no
 // release-gate verdict.
 // ---------------------------------------------------------------------------
 
 const testkit_path = "src/core/testkit.zig";
+/// The test runner is the skip's other side: it counts what the kit returns.
+const runner_path = "tests/test_runner.zig";
 
 /// Does the file name `SkipZigTest` as an identifier token (`error.SkipZigTest`,
 /// an error-set member)? Prose in a comment or a string does not count.
@@ -655,6 +657,7 @@ test "skip rail: no bare error.SkipZigTest outside the testkit" {
     var violations: std.Io.Writer.Allocating = .init(gpa);
     defer violations.deinit();
     var kit_seen = false;
+    var runner_seen = false;
     for (files.items) |path| {
         const text = try readWalked(gpa, io, cwd, path) orelse continue;
         defer gpa.free(text);
@@ -663,10 +666,14 @@ test "skip rail: no bare error.SkipZigTest outside the testkit" {
             kit_seen = true;
             continue;
         }
+        if (std.mem.eql(u8, path, runner_path)) {
+            runner_seen = true;
+            continue;
+        }
         try violations.writer.print("  {s}:{d}: a bare SkipZigTest — route it through testkit.skip(@src(), .<class>, \"why\")\n", .{ path, line });
     }
-    // The kit itself names the error (a broken scanner passes vacuously otherwise).
-    try std.testing.expect(kit_seen);
+    // The kit and the runner name the error (a broken scanner passes vacuously otherwise).
+    try std.testing.expect(kit_seen and runner_seen);
     if (violations.written().len != 0) {
         std.debug.print("bare skip(s):\n{s}", .{violations.written()});
         return error.BareSkip;
@@ -1442,4 +1449,10 @@ test "the stats key scanner: a declared instrument, a tripwire site, a format-st
     try std.testing.expectEqual(@as(usize, 3), lists.len);
     try std.testing.expectEqualStrings("BAR", lists[1]);
     try std.testing.expectError(error.PyListNotFound, pyListNames(gpa, py, "NOPE"));
+}
+
+test {
+    // The test runner's shard plan is a pure function with its own tests;
+    // the runner (a test binary's root) cannot carry tests, so they run here.
+    _ = @import("shard_plan.zig");
 }

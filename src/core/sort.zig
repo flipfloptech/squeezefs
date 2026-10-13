@@ -14,6 +14,8 @@
 
 const std = @import("std");
 
+/// The insertion arm's ceiling: n(n−1)/2 = 496 comparisons at 32, under one
+/// 512-element scratch fill of the block arm (module doc).
 pub const INSERTION_MAX = 32;
 
 pub fn stable(comptime T: type, items: []T, context: anytype, comptime lessThan: fn (@TypeOf(context), lhs: T, rhs: T) bool) void {

@@ -82,6 +82,9 @@ pub const stats = struct {
     /// Creates into a striped directory keyed to a FOREIGN stripe.
     pub var dir_stripe_ships: counters.ShardedCounter = .{};
     pub var dir_stripe_readdir_merges: counters.ShardedCounter = .{};
+    /// A stripe stream read again after `D`'s next page (its loaded page
+    /// predated `D`'s snapshot of the range: the merge's move law).
+    pub var dir_stripe_readdir_restarts: counters.ShardedCounter = .{};
     /// Names moved from `D`'s tree into their stripe (the lazy re-home).
     pub var dir_stripe_migrated_names: counters.ShardedCounter = .{};
     /// Names re-homed by the mutation that touched them.
@@ -620,11 +623,20 @@ const Stream = struct {
     dir: u64,
     recs: std.ArrayList(DirRec) = .empty,
     pos: usize = 0,
+    /// The last cookie LOADED: the next page starts after it.
     after: u64,
+    /// The last cookie CONSUMED: a restart's start.
+    popped: u64,
     more: bool = true,
 
     fn head(self: *const Stream) ?DirRec {
         return if (self.pos < self.recs.items.len) self.recs.items[self.pos] else null;
+    }
+
+    /// Does this stream's snapshot answer for `cookie` (loaded through
+    /// it, or exhausted)?
+    fn covers(self: *const Stream, cookie: u64) bool {
+        return !self.more or cookie <= self.after;
     }
 
     fn refill(self: *Stream, src: DirSource, arena: Allocator, page: usize) errors.Error!void {
@@ -635,7 +647,29 @@ const Stream = struct {
         if (self.recs.items.len > 0) self.after = self.recs.items[self.recs.items.len - 1].cookie;
         if (self.recs.items.len == 0) self.more = false;
     }
+
+    /// The loaded entries past the last consumed one are dropped and read
+    /// again: their snapshot predates a later snapshot of `D`.
+    fn restart(self: *Stream, src: DirSource, arena: Allocator, page: usize) errors.Error!void {
+        self.after = self.popped;
+        self.more = true;
+        try self.refill(src, arena, page);
+    }
+
+    /// The merge's order: by cookie, a stripe's entry before `D`'s at
+    /// the same cookie (the stripe's copy is the LWW winner).
+    fn before(a: DirRec, a_is_d: bool, b: DirRec, b_is_d: bool) bool {
+        if (a.cookie != b.cookie) return a.cookie < b.cookie;
+        return !a_is_d and b_is_d;
+    }
 };
+
+/// The hash group of a dentry cookie: every copy of one name shares it
+/// (the cookie is `3 + (hash54 << 8 | coll)`; `coll` alone may differ
+/// between `D`'s tree and the stripe).
+fn cookieGroup(cookie: u64) u64 {
+    return (cookie -| key.READDIR_COOKIE_BIAS) >> 8;
+}
 
 /// `lookup(D/name)` over a reader of one directory's dentries
 /// (`reader.find(dir, name) !?Found`): the name's stripe first, then
@@ -653,35 +687,65 @@ pub fn locateName(comptime Found: type, reader: anytype, stripe_ino: u64, dir: u
 
 /// One merged page of a striped directory from `offset`: `K + 1` streams
 /// (every stripe + `D`'s own tree) refilled only when consumed, in pages
-/// of `max(max / (K + 1), floor)`; the smallest head cookie pops; an
-/// entry from `D`'s own stream whose stripe holds the same name is the
-/// LWW loser and skipped; markers never show. The returned cookie is the
-/// exact continuation.
-pub fn readdirMerged(src: DirSource, arena: Allocator, map: *const StripeMap, offset: u64, max: usize, name_key: *const key.NameKey, out: *std.ArrayList(DirRec)) errors.Error!void {
+/// of `max(max / (K + 1), floor)`; the smallest head cookie pops; markers
+/// never show. The returned cookie is the exact continuation.
+///
+/// The move law makes it exact under the lazy migration: every move out
+/// of `D` (the migration, a mutation's re-home) inserts into the stripe
+/// and THEN removes from `D`, so over each cookie range the merge reads
+/// `D`'s own tree BEFORE any stripe — a name `D`'s snapshot lacks was
+/// already in its stripe, and every stripe snapshot of the range is
+/// later. A stripe's entry past `D`'s loaded range waits for `D`'s next
+/// page, and a stripe whose loaded page reached past `D`'s old range is
+/// read again from its last consumed cookie after it (the two-stream
+/// form of `locateName`'s second stripe read; found by the shared hot
+/// directory row's defect 13). A name both snapshots hold meets itself
+/// in one hash group and is listed once, the stripe's copy first.
+pub fn readdirMerged(src: DirSource, arena: Allocator, map: *const StripeMap, offset: u64, max: usize, out: *std.ArrayList(DirRec)) errors.Error!void {
     stats.dir_stripe_readdir_merges.inc();
     const page = @max(max / (@as(usize, map.k) + 1), MERGE_STREAM_PAGE_FLOOR);
     var streams: [K_MAX + 1]Stream = undefined;
     const n = @as(usize, map.k) + 1;
-    for (0..map.k) |i| streams[i] = .{ .dir = map.stripes[i], .after = offset };
-    streams[map.k] = .{ .dir = map.dir, .after = offset };
-    for (streams[0..n]) |*s| try s.refill(src, arena, page);
+    const d = &streams[map.k];
+    d.* = .{ .dir = map.dir, .after = offset, .popped = offset };
+    try d.refill(src, arena, page);
+    for (0..map.k) |i| {
+        streams[i] = .{ .dir = map.stripes[i], .after = offset, .popped = offset };
+        try streams[i].refill(src, arena, page);
+    }
+    var group: ?u64 = null;
+    var group_names: std.ArrayList([]const u8) = .empty;
     while (out.items.len < max) {
+        if (d.head() == null and d.more) {
+            const old_cover = d.after;
+            try d.refill(src, arena, page);
+            for (streams[0..map.k]) |*s| if (s.after > old_cover) {
+                stats.dir_stripe_readdir_restarts.inc();
+                try s.restart(src, arena, page);
+            };
+        }
         var best: ?usize = null;
         for (streams[0..n], 0..) |*s, i| {
             const h = s.head() orelse continue;
-            if (best == null or h.cookie < streams[best.?].head().?.cookie) best = i;
+            if (i != map.k and !d.covers(h.cookie)) continue;
+            if (best == null or Stream.before(h, i == map.k, streams[best.?].head().?, best.? == map.k)) best = i;
         }
         const bi = best orelse break;
         const s = &streams[bi];
         const rec = s.head().?;
         s.pos += 1;
-        if (s.head() == null) try s.refill(src, arena, page);
+        s.popped = rec.cookie;
+        if (bi != map.k and s.head() == null) try s.refill(src, arena, page);
         if (isMarkerName(rec.name)) continue;
-        if (bi == map.k) {
-            // D's own tree: the LWW loser when its stripe holds the name.
-            const r = map.routeName(rec.name, name_key);
-            if (try findName(src, arena, r.stripe, rec.name) != null) continue;
+        const g = cookieGroup(rec.cookie);
+        if (group != g) {
+            group = g;
+            group_names.clearRetainingCapacity();
         }
+        var dup = false;
+        for (group_names.items) |nm| dup = dup or std.mem.eql(u8, nm, rec.name);
+        if (dup) continue;
+        try group_names.append(arena, rec.name);
         try out.append(arena, rec);
     }
 }
@@ -1406,4 +1470,107 @@ test "locateName: a name the lazy migration MOVES between the lookup's two reads
     try testing.expectEqual(@as(u32, 1), moved.reads);
     // A name nowhere costs the stripe twice and D once.
     try testing.expectEqual(@as(u32, 3), none.reads);
+}
+
+/// A RAM dentry source whose `move_at`-th page read (1-based) is preceded
+/// by one lazy-migration move — `name` inserted into its stripe, then
+/// removed from `D` (the migration's order and the re-home's) — the
+/// window between two of the merge's stream reads.
+const MoveSource = struct {
+    gpa: Allocator,
+    dirs: std.AutoHashMapUnmanaged(u64, std.ArrayList(DirRec)) = .empty,
+    reads: u32 = 0,
+    move_at: u32,
+    moving: []const u8,
+    from: u64,
+    to: u64,
+
+    fn deinit(self: *MoveSource) void {
+        var it = self.dirs.valueIterator();
+        while (it.next()) |l| l.deinit(self.gpa);
+        self.dirs.deinit(self.gpa);
+    }
+
+    fn put(self: *MoveSource, dir: u64, rec: DirRec) !void {
+        const gop = try self.dirs.getOrPut(self.gpa, dir);
+        if (!gop.found_existing) gop.value_ptr.* = .empty;
+        const l = gop.value_ptr;
+        var i: usize = 0;
+        while (i < l.items.len and l.items[i].cookie < rec.cookie) : (i += 1) {}
+        try l.insert(self.gpa, i, rec);
+    }
+
+    fn remove(self: *MoveSource, dir: u64, name: []const u8) ?DirRec {
+        const l = self.dirs.getPtr(dir) orelse return null;
+        for (l.items, 0..) |r, i| if (std.mem.eql(u8, r.name, name)) return l.orderedRemove(i);
+        return null;
+    }
+
+    fn page(ctx: *anyopaque, arena: Allocator, dir: u64, after: u64, max: usize, out: *std.ArrayList(DirRec)) errors.Error!bool {
+        const self: *MoveSource = @ptrCast(@alignCast(ctx));
+        self.reads += 1;
+        if (self.reads == self.move_at) {
+            const rec = self.remove(self.from, self.moving).?;
+            self.put(self.to, rec) catch return error.OutOfMemory;
+        }
+        const l = self.dirs.get(dir) orelse return false;
+        var n: usize = 0;
+        for (l.items) |r| {
+            if (r.cookie <= after) continue;
+            if (n == max) return true;
+            out.append(arena, .{ .cookie = r.cookie, .child = r.child, .file_type = r.file_type, .name = arena.dupe(u8, r.name) catch return error.OutOfMemory }) catch return error.OutOfMemory;
+            n += 1;
+        }
+        return false;
+    }
+
+    fn inode(_: *anyopaque, _: u64) errors.Error!?InodeValue {
+        return null;
+    }
+
+    fn source(self: *MoveSource) DirSource {
+        return .{ .ctx = self, .page = &page, .inode = &inode };
+    }
+};
+
+test "readdirMerged: a name the lazy migration MOVES between any two of the merge's stream reads — before the first, between D's page and its stripe's, across D's pages and the stripes' restarts — is listed exactly once, and so is every other name (the merge reads D's own tree BEFORE any stripe over each cookie range: every move inserts into the stripe and then removes from D, so a name absent from D's snapshot is in every later stripe snapshot; the two copies of a name meet at the merge and one is listed)" {
+    const gpa = testing.allocator;
+    const nk: key.NameKey = .init(0x5EED);
+    const D: u64 = 10;
+    var stripes: [K_MAX]u64 = @splat(0);
+    stripes[0] = 11;
+    stripes[1] = 12;
+    const map: StripeMap = .{ .dir = D, .k = 2, .stripes = stripes, .migrating = true };
+    // 40 names: the even ones migrated into their stripes, the odd ones
+    // still in D's own tree (D spans several merge pages).
+    var names: [40][8]u8 = undefined;
+    var name_slices: [40][]const u8 = undefined;
+    for (&names, &name_slices, 0..) |*b, *sl, i| sl.* = try std.fmt.bufPrint(b, "n{d:0>3}", .{i});
+    var max_reads: u32 = 0;
+    for (name_slices, 0..) |moving, mi| {
+        if (mi % 2 == 0) continue;
+        var move_at: u32 = 1;
+        while (move_at <= max_reads + 2) : (move_at += 1) {
+            var src: MoveSource = .{ .gpa = gpa, .move_at = move_at, .moving = moving, .from = D, .to = map.routeName(moving, &nk).stripe };
+            defer src.deinit();
+            for (name_slices, 0..) |nm, i| {
+                const rec: DirRec = .{ .cookie = key.encodeReaddirCookie(key.dentryNameHash54(nm, &nk), 0), .child = 100 + i, .file_type = 8, .name = nm };
+                try src.put(if (i % 2 == 0) map.routeName(nm, &nk).stripe else D, rec);
+            }
+            var arena_state = std.heap.ArenaAllocator.init(gpa);
+            defer arena_state.deinit();
+            const arena = arena_state.allocator();
+            var seen: [40]u32 = @splat(0);
+            var offset: u64 = 0;
+            while (true) {
+                var out: std.ArrayList(DirRec) = .empty;
+                try readdirMerged(src.source(), arena, &map, offset, 6, &out);
+                if (out.items.len == 0) break;
+                for (out.items) |r| seen[@intCast(r.child - 100)] += 1;
+                offset = out.items[out.items.len - 1].cookie;
+            }
+            for (seen) |c| try testing.expectEqual(@as(u32, 1), c);
+            max_reads = @max(max_reads, src.reads);
+        }
+    }
 }

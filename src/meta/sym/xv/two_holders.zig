@@ -1090,7 +1090,7 @@ test "striping: a flip supplied by the other creator OVER THE WIRE (`SupplyStrip
     // readdir across the flip: the same four names, markers never shown,
     // cookie order, a stable continuation.
     var merged: std.ArrayList(stripe.DirRec) = .empty;
-    try stripe.readdirMerged(src_b.src(), arena, &map, 0, 64, f.b.store.nameKey(), &merged);
+    try stripe.readdirMerged(src_b.src(), arena, &map, 0, 64, &merged);
     try testing.expectEqual(@as(usize, 4), merged.items.len);
     for (merged.items, 0..) |r, i| {
         try testing.expect(!stripe.isMarkerName(r.name));
@@ -1121,11 +1121,11 @@ test "striping: a flip supplied by the other creator OVER THE WIRE (`SupplyStrip
     // The merge still lists five names once each, in cookie order, and a
     // continuation from the second cookie resumes strictly after it.
     merged.clearRetainingCapacity();
-    try stripe.readdirMerged(src_b.src(), arena, &map, 0, 64, seed, &merged);
+    try stripe.readdirMerged(src_b.src(), arena, &map, 0, 64, &merged);
     try testing.expectEqual(@as(usize, 5), merged.items.len);
     for (merged.items[1..], 1..) |r, i| try testing.expect(r.cookie > merged.items[i - 1].cookie);
     var rest: std.ArrayList(stripe.DirRec) = .empty;
-    try stripe.readdirMerged(src_b.src(), arena, &map, merged.items[1].cookie, 64, seed, &rest);
+    try stripe.readdirMerged(src_b.src(), arena, &map, merged.items[1].cookie, 64, &rest);
     try testing.expectEqual(@as(usize, 3), rest.items.len);
     try testing.expectEqual(merged.items[2].cookie, rest.items[0].cookie);
     // The background migration moves the rest; `migrating` clears.

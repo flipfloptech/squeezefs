@@ -334,7 +334,7 @@ pub fn Stripes(comptime Fs: type) type {
         /// One merged page of `D` strictly after `offset` (markers never
         /// show; the cookie order is the continuation).
         pub fn readdir(self: *Self, arena: Allocator, map: *const StripeMap, offset: u64, max: usize, out: *std.ArrayList(stripe.DirRec)) Error!void {
-            return stripe.readdirMerged(.{ .ctx = self, .page = &pageFn, .inode = &inodeFn }, arena, map, offset, max, self.fs.store.nameKey(), out);
+            return stripe.readdirMerged(.{ .ctx = self, .page = &pageFn, .inode = &inodeFn }, arena, map, offset, max, out);
         }
 
         /// `rmdir` of a striped directory named `name` under `parent`:

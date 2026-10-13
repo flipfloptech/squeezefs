@@ -147,3 +147,39 @@ refusal repeating for 20 s) — hence the door's own `.held` verdict.
   renewed after the eviction with the departure aboard would cut the shipped ≈ 17.6 s to ≈ one
   renew interval. Owed as an availability refinement (it needs the departure on the carriage and
   the recovering manager to be the census owner, which a multi-volume set does not guarantee).
+
+## 3. The merged `readdir`'s window (item 3)
+
+### 3.1 The defect
+
+`rung-10-striping-wire.md` §3.6 / §Q.20: the K-way merge filled every stripe's stream first and
+`D`'s own last, and dropped `D`'s copy of a name when a FRESH scan of its stripe found it. A name the
+lazy migration moved between its stripe's read and `D`'s read (the move inserts into the stripe, then
+removes from `D`) was in neither snapshot and missing from the listing; a name moved after the
+stripe's snapshot but before `D`'s copy popped was dropped from `D` by the fresh scan while the
+stripe's stale snapshot lacked it — missing again. The reference's merge has the same order (0002
+row 509).
+
+### 3.2 The red row and the fix (0003 §U.3)
+
+`stripe` "readdirMerged: a name the lazy migration MOVES between any two of the merge's stream
+reads": a RAM dentry source (`MoveSource`) with K = 2 stripes and 40 names — the even ones in their
+stripes, the odd ones still in `D` (`D` spans several merge pages at `max` = 6) — runs the move of
+each odd name before EVERY page read index in turn (1 … the run's read count + 2), lists the
+directory to its end through the continuations, and asserts every name exactly once. Red on `dev`:
+`expected 1, found 0`.
+
+The fix: `D`'s stream is read first; a stripe's entry past `D`'s loaded range waits for `D`'s next
+page; on that page every stripe whose loaded page reached past `D`'s old range is read again from its
+last consumed cookie (`dir_stripe_readdir_restarts`); the order is (cookie, the stripe's copy first)
+and a name listed once in its hash group is not listed again — so the copy `D`'s snapshot and a
+stripe's both hold is listed once, and a name `D`'s snapshot lacks is in every later stripe
+snapshot. The fresh per-entry stripe scan (one stripe walk per `D` name) is gone, and with it the
+merge's `name_key` argument.
+
+### 3.3 Residual (stated)
+
+The dedupe meets two copies of a name in one HASH GROUP (`cookie >> 8`): their cookies differ only
+when the name's collision index differs between `D` and its stripe — a 54-bit keyed-hash collision
+inside the directory. If such a pair also straddles a reply boundary with the stripe's copy first,
+the next reply can list `D`'s copy again (a duplicate, never a miss). Not met; stated.

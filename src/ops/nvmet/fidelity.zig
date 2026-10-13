@@ -279,6 +279,17 @@ const Rig = struct {
         return std.fmt.bufPrint(buf, "nqn.2026-10.io.squeezefs:fideli-{d}-{s}", .{ self.pid, name }) catch unreachable;
     }
 
+    /// A subsystem this run made (its harness NQNs and its hand-built
+    /// one): the host-global censuses judge only these — a concurrent
+    /// run's objects come and go beside them.
+    fn ownsNqn(self: *Rig, nqn: []const u8) bool {
+        var b: [64]u8 = undefined;
+        const harness = std.fmt.bufPrint(&b, "nqn.2026-10.io.squeezefs:fideli-{d}-", .{self.pid}) catch unreachable;
+        var hb: [64]u8 = undefined;
+        const hand = std.fmt.bufPrint(&hb, "nqn.2026-10.example:hand-{d}", .{self.pid}) catch unreachable;
+        return std.mem.startsWith(u8, nqn, harness) or std.mem.eql(u8, nqn, hand);
+    }
+
     /// A TCP service port of this run's own: the kernel's ephemeral choice
     /// (`bind(127.0.0.1:0)` + `getsockname`), its probe socket held bound —
     /// SO_REUSEADDR, never listening — until the rig ends, so no concurrent
@@ -462,7 +473,10 @@ const Rig = struct {
         defer self.gpa.free(ctrls);
         var out: Io.Writer.Allocating = .init(self.gpa);
         errdefer out.deinit();
-        for (ctrls) |c| try out.writer.print("{s}:{s}:{s}\n", .{ c.nameOf(), c.subsysnqnOf(), c.hostnqnOf() });
+        for (ctrls) |c| {
+            if (!self.ownsNqn(c.subsysnqnOf())) continue;
+            try out.writer.print("{s}:{s}:{s}\n", .{ c.nameOf(), c.subsysnqnOf(), c.hostnqnOf() });
+        }
         return out.toOwnedSlice();
     }
 
@@ -649,6 +663,26 @@ fn venue(gpa: Allocator, io: Io) !*Rig {
 
 /// The zero-residue census for a NQN: no subsystem, no record, no
 /// controller of it.
+/// After our last link left, the port is gone — or it carries only links
+/// another run made (a concurrent run's share on the shared loop port).
+fn expectPortLastOut(rig: *Rig, port_id: u16) !void {
+    var walk = try configfs.walkLive(configfs.RealFs.face(), rig.gpa);
+    defer walk.deinit(rig.gpa);
+    const p = walk.ports.find(port_id) orelse return;
+    try testing.expect(p.links.len > 0);
+    for (p.links) |l| try testing.expect(!rig.ownsNqn(l));
+}
+
+/// `"subnqn":"<nqn>"` inside the list's `foreign_live` array (its entries
+/// carry arrays of their own: the array ends where the next key begins).
+fn foreignLiveNames(lj: []const u8, nqn: []const u8) bool {
+    const at = std.mem.indexOf(u8, lj, "\"foreign_live\":[") orelse return false;
+    const end = std.mem.indexOfPos(u8, lj, at, "],\"connected_fabric_disks\":") orelse lj.len;
+    var nb: [320]u8 = undefined;
+    const needle = std.fmt.bufPrint(&nb, "\"subnqn\":\"{s}\"", .{nqn}) catch return false;
+    return std.mem.indexOf(u8, lj[at..end], needle) != null;
+}
+
 fn expectNoResidue(rig: *Rig, nqn: []const u8) !void {
     var walk = try configfs.walkLive(configfs.RealFs.face(), rig.gpa);
     defer walk.deinit(rig.gpa);
@@ -716,8 +750,9 @@ fn roundtripLeg(transport: configfs.Trtype) !void {
     try rig.disconnect(&c);
     try rig.unshare(nqn);
     try expectNoResidue(rig, nqn);
-    // The port object went last-out (no other link rode it).
-    try testing.expect(!configfs.RealFs.face().exists(try std.fmt.bufPrint(&pb, "ports/{d}", .{rec.listeners[0].port_id})));
+    // The port object went last-out unless another run's link rides it
+    // (the host's ONE loop port is every loop share's).
+    try expectPortLastOut(rig, rec.listeners[0].port_id);
 }
 
 test "nvmet fidelity: roundtrip-loop — share → list managed+live → connect → the namespace carries the ledger's uuid → 64 MiB O_DIRECT round trip → resv-report → disconnect → unshare → zero residue" {
@@ -1247,14 +1282,18 @@ test "nvmet fidelity: adopt — A1: a hand-built foreign share with a small-int 
     hl.port_id = try smallPortId(fs, rig.pid);
     var hand_dir_b: [32]u8 = undefined;
     const hand_dir = try std.fmt.bufPrint(&hand_dir_b, "ports/{d}", .{hl.port_id});
-    const hand_uuid: [16]u8 = .{ 0x7a, 0x7a, 0x7a, 0x7a, 0x11, 0x11, 0x41, 0x11, 0x81, 0x11, 1, 2, 3, 4, 5, 6 };
+    // The run's own namespace uuid: the host's nvme core ignores a
+    // namespace whose uuid another subsystem already shows (a concurrent
+    // run's hand share), so the pid rides its last four bytes.
+    var hand_uuid: [16]u8 = .{ 0x7a, 0x7a, 0x7a, 0x7a, 0x11, 0x11, 0x41, 0x11, 0x81, 0x11, 1, 2, 0, 0, 0, 0 };
+    std.mem.writeInt(u32, hand_uuid[12..16], @intCast(rig.pid), .big);
     _ = try configfs.apply(fs, .{ .subnqn = hand, .backing_path = backing, .ns_uuid = hand_uuid, .allow_hosts = &.{}, .listeners = &.{hl} });
     const hand_owned = try gpa.dupe(u8, hand);
     try rig.shares.append(gpa, hand_owned);
     const c = try rig.connect(hand, .tcp, hand_port, null, &.{});
     const lj = try rig.listJson();
     defer gpa.free(lj);
-    try testing.expect(std.mem.indexOf(u8, lj, "\"foreign_live\":[{\"subnqn\":\"nqn.2026-10.example:hand-") != null);
+    try testing.expect(foreignLiveNames(lj, hand));
     var before = try configfs.walkLive(fs, gpa);
     defer before.deinit(gpa);
     const ao = try rig.sqzOk(&.{ "nvmeof", "adopt", hand });
@@ -1262,8 +1301,13 @@ test "nvmet fidelity: adopt — A1: a hand-built foreign share with a small-int 
     try testing.expect(std.mem.indexOf(u8, ao, "adopted ") != null and std.mem.indexOf(u8, ao, "foreign") != null);
     var after = try configfs.walkLive(fs, gpa);
     defer after.deinit(gpa);
-    try testing.expectEqual(before.shares.len, after.shares.len);
-    try testing.expectEqual(before.ports.entries.len, after.ports.entries.len);
+    // configfs untouched: the share and its port read as before.
+    const hs_before = before.find(hand).?;
+    const hs_after = after.find(hand).?;
+    try testing.expectEqual(hs_before.listeners.len, hs_after.listeners.len);
+    try testing.expectEqual(hs_before.listeners[0].port_id, hs_after.listeners[0].port_id);
+    try testing.expectEqualSlices(u32, hs_before.nsids, hs_after.nsids);
+    try testing.expect(before.ports.find(hl.port_id) != null and after.ports.find(hl.port_id) != null);
     var rec = (try rig.ledgerRecord(hand)).?;
     defer rec.deinit(gpa);
     try testing.expect(rec.adopted and rec.adopt_class == .foreign);
@@ -1283,7 +1327,7 @@ test "nvmet fidelity: adopt — A1: a hand-built foreign share with a small-int 
     _ = linux.unlink(try std.fmt.bufPrintSentinel(&lp, "{s}/{s}", .{ rig.state, ledger.FILE_NAME }, 0));
     const lj2 = try rig.listJson();
     defer gpa.free(lj2);
-    try testing.expect(std.mem.indexOf(u8, lj2, "\"foreign_live\":[{\"subnqn\":\"nqn.2026-10.io.squeezefs:fideli-") != null);
+    try testing.expect(foreignLiveNames(lj2, own));
     // A3: the harness marker refuses adoption.
     const r3 = try rig.sqz(&.{ "nvmeof", "adopt", own });
     defer rig.freeRun(r3);

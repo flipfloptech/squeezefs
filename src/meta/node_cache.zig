@@ -350,7 +350,13 @@ pub const FreezeError = error{
     OutOfMemory,
 };
 
-pub const LoadError = node.Error || LoaderError || error{ FlightTableFull, Canceled };
+pub const LoadError = node.Error || LoaderError || error{ FlightTableFull, Canceled, WouldBlock };
+
+/// The calling thread reads TRY-ONLY (decision 0003 §AB.1): a node the cache
+/// does not hold is `error.WouldBlock`, never a demand page — set by the
+/// FUSE drain worker around a `probe_meta` resolution, which must not touch
+/// a device (the READ dispatch law's arm (a) for the metadata reads).
+pub threadlocal var try_only: bool = false;
 /// `getChild`: the pointer's `child_node_seq` does not match the loaded
 /// image — a concurrent SMO; reload the parent and retry (bounded).
 pub const ChildError = LoadError || error{ ReloadParent, RetiredExtent };

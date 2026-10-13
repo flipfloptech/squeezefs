@@ -74,8 +74,9 @@ pub const MoveGate = struct {
         const Args = info.param_types[2].?;
         const R = info.return_type.?;
         // The no-reply ops (destroy, forget) and INIT pass: nothing a move
-        // could refuse is answered there.
-        const gated = @typeInfo(R) == .error_union and !std.mem.eql(u8, name, "init");
+        // could refuse is answered there. The try-only probes pass too: a
+        // refusal is the lane's to retry, never a park on the worker.
+        const gated = @typeInfo(R) == .error_union and !std.mem.eql(u8, name, "init") and !std.mem.startsWith(u8, name, "probe_");
         return struct {
             fn call(impl: *anyopaque, c: *fs_mod.Ctx, args: Args) R {
                 const self: *MoveGate = @ptrCast(@alignCast(impl));

@@ -236,6 +236,13 @@ pub const Filesystem = struct {
         /// DMA from a device fd into the app's pages, else null (the bounce
         /// leg or the lane).
         direct_leg: *const fn (ctx: *anyopaque, req: Request) ?DirectLeg,
+        /// The metadata twin of `probe_read` (decision 0003 §AB.1), ON THE
+        /// WORKER THREAD at a LOOKUP's or GETATTR's delivery: SYNC,
+        /// try-only, non-blocking — answered from RAM (a node-cache hit on
+        /// a slot this mount holds) into `out`, or null to decline (the
+        /// request then takes the lane). Null = every metadata request
+        /// takes the lane.
+        probe_meta: ?*const fn (ctx: *anyopaque, req: Request, out: *codec.OutBuf) ?codec.Reply = null,
     };
 
     pub fn init(self: Filesystem, caps: InitCaps) void {
@@ -255,6 +262,10 @@ pub const Filesystem = struct {
     }
     pub fn writeHoldEligible(self: Filesystem, hint: HoldHint) bool {
         return self.vtable.write_hold_eligible(self.ctx, hint);
+    }
+    pub fn probeMeta(self: Filesystem, req: Request, out: *codec.OutBuf) ?codec.Reply {
+        const f = self.vtable.probe_meta orelse return null;
+        return f(self.ctx, req, out);
     }
     pub fn directLeg(self: Filesystem, req: Request) ?DirectLeg {
         return self.vtable.direct_leg(self.ctx, req);
@@ -290,6 +301,10 @@ const EchoFsImpl = struct {
 
     /// Every READ declines the probe (arm (a)) and takes the lane (arm (c)).
     probe_declines: bool = false,
+    /// LOOKUP and GETATTR are answered by `probe_meta` on the worker (the
+    /// in-RAM tree); off = they take the lane like every other request.
+    meta_probe: bool = false,
+    meta_probes_served: std.atomic.Value(u64) = .init(0),
     /// The probe declines the FIRST poll of each READ and serves the next:
     /// the fused frame's re-poll (arm (b)) is what serves it.
     probe_declines_first: bool = false,
@@ -363,6 +378,7 @@ const EchoFsImpl = struct {
         .forget = fsForget,
         .write_hold_eligible = fsWriteHoldEligible,
         .direct_leg = fsDirectLeg,
+        .probe_meta = fsProbeMeta,
     };
 
     pub fn filesystem(self: *Self) Filesystem {
@@ -502,6 +518,27 @@ const EchoFsImpl = struct {
             else => return null,
         }
         return n;
+    }
+
+    /// The tree is static RAM: every LOOKUP under the root and every
+    /// GETATTR answers here when `meta_probe` is on (`/park-lookup` parks:
+    /// the lane's).
+    fn fsProbeMeta(ctx: *anyopaque, req: Request, out: *codec.OutBuf) ?codec.Reply {
+        const self = of(ctx);
+        if (!self.meta_probe) return null;
+        const u = req.unique();
+        const ino = req.nodeid();
+        const reply: codec.Reply = switch (req.op) {
+            .lookup => |l| blk: {
+                if (ino != ino_root or std.mem.eql(u8, l.name, park_lookup_name)) return null;
+                const child = lookupName(l.name) orelse break :blk codec.replyEntry(out, u, codec.EntryReply.negative(std.time.ns_per_s));
+                break :blk codec.replyEntry(out, u, self.entry(child).?);
+            },
+            .getattr => codec.replyAttr(out, u, .{ .attr_ttl_ns = std.time.ns_per_s, .attr = self.attrOf(ino) orelse return null }),
+            else => return null,
+        };
+        _ = self.meta_probes_served.fetchAdd(1, .monotonic);
+        return reply;
     }
 
     fn fsProbeRead(ctx: *anyopaque, req: Request, window: []u8) ?ProbeReply {

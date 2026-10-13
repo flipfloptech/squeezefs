@@ -103,6 +103,7 @@ const key = @import("../../meta/key.zig");
 const record = @import("../../meta/record.zig");
 const tx = @import("../../meta/tx.zig");
 const tree = @import("../../meta/tree.zig");
+const node_cache = @import("../../meta/node_cache.zig");
 const dlm = @import("../../meta/dlm.zig");
 const lock_order = @import("../../sync/lock_order.zig");
 const sync = @import("../../sync/sync.zig");
@@ -741,6 +742,10 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         /// token entry (released by the caller) or `gone`.
         fn tokenServe(self: *Self, object: u64, wants: read_divert.cache.Wants) Error!?read_divert.cache.Serve {
             const d = self.divert orelse return null;
+            // A try-only read (§AB.1) never asks a holder: a foreign object
+            // is the lane's (a cached token's serve included — its refresh
+            // may dial).
+            if (node_cache.try_only and d.isForeign(object)) return error.WouldBlock;
             return d.serve(self.io, object, wants) catch |e| return read_divert.coreError(e);
         }
 
@@ -1491,7 +1496,11 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         /// striped parent routes the name to its stripe (the stripe first,
         /// `D`'s own tree second — LWW).
         pub fn findChild(self: *Self, parent_global: u64, name: []const u8) Error!?Found {
-            if (self.stripes) |st| if (try st.mapOf(parent_global)) |map| return st.locate(&map, name);
+            if (self.stripes) |st| if (try st.mapOf(parent_global)) |map| {
+                // A striped parent's name may live at another holder's stripe.
+                if (node_cache.try_only) return error.WouldBlock;
+                return st.locate(&map, name);
+            };
             return self.findDentry(try localOf(parent_global), name);
         }
 
@@ -1501,6 +1510,8 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         fn foldIfStriped(self: *Self, global: u64, v: InodeValue) Error!InodeValue {
             const st = self.stripes orelse return v;
             const map = (try st.mapOf(global)) orelse return v;
+            // The fold reads every stripe, foreign ones included.
+            if (node_cache.try_only) return error.WouldBlock;
             return st.fold(&map, v);
         }
 
@@ -1818,6 +1829,29 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             _ = self.pending.retire(ino);
             fuse_reclaim_destroys.inc();
             self.destroys.noteCommitted(1);
+        }
+
+        /// The try-only `lookup` the FUSE drain worker asks first (decision
+        /// 0003 §AB.1): the same resolution under `node_cache.try_only` — a
+        /// node the cache does not hold, a foreign slot, a striped parent,
+        /// a virtual or dot name is `WouldBlock`, and the lane asks
+        /// `lookup`. The answer is the lane's answer: one code path.
+        pub fn probe_lookup(self: *Self, c: *Ctx, a: filesystem.LookupArgs) Error!filesystem.Entry {
+            if (a.parent == inos.ROOT_INO and virtual_inodes.classOfName(a.name) != null) return error.WouldBlock;
+            if (std.mem.eql(u8, a.name, ".") or std.mem.eql(u8, a.name, "..")) return error.WouldBlock;
+            const was = node_cache.try_only;
+            node_cache.try_only = true;
+            defer node_cache.try_only = was;
+            return self.lookup(c, a);
+        }
+
+        /// The try-only `getattr` (as `probe_lookup`).
+        pub fn probe_getattr(self: *Self, c: *Ctx, a: filesystem.GetattrArgs) Error!filesystem.Attr {
+            if (virtual_inodes.isVirtualIno(a.ino)) return error.WouldBlock;
+            const was = node_cache.try_only;
+            node_cache.try_only = true;
+            defer node_cache.try_only = was;
+            return self.getattr(c, a);
         }
 
         pub fn getattr(self: *Self, c: *Ctx, a: filesystem.GetattrArgs) Error!filesystem.Attr {
@@ -3767,6 +3801,30 @@ test "a file carrying S_ISUID/S_ISGID is served with attr TTL 0 on GETATTR, LOOK
     const a2 = abi.decodeExact(abi.fuse_attr_out, g2.outBytes()) orelse return error.TestBadReply;
     try testing.expectEqual(@as(u32, S.IFREG | 0o755), a2.attr.mode);
     try testing.expectEqual(ttl / std.time.ns_per_s, a2.attr_valid);
+}
+
+test "the drain worker's try-only LOOKUP / GETATTR (decision 0003 §AB.1) answers exactly what the lane answers — a present name's entry with its lookup reference noted, an absent name's negative entry, a GETATTR's attrs; a virtual or dot name declines to the lane" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    const ino = try h.create(1, "f", 0o644);
+    const lane = try h.entry(h.lookup(1, "f"));
+    var out: codec.OutBuf = undefined;
+    const meta: lifecycle.Meta = .{ .unique = 77, .nodeid = 1, .uid = 0, .gid = 0, .pid = 1 };
+    const refs0 = h.opens.get(ino).?.lookups;
+    const r = h.d.probeMeta(.{ .lookup = .{ .name = "f" } }, meta, &out) orelse return error.TestExpectedEqual;
+    const e = abi.decodePrefix(abi.fuse_entry_out, r.out) orelse return error.TestBadReply;
+    try testing.expectEqual(lane.nodeid, e.nodeid);
+    try testing.expectEqual(lane.attr.size, e.attr.size);
+    try testing.expectEqual(refs0 + 1, h.opens.get(ino).?.lookups);
+    const neg = h.d.probeMeta(.{ .lookup = .{ .name = "absent" } }, meta, &out) orelse return error.TestExpectedEqual;
+    try testing.expectEqual(@as(u64, 0), (abi.decodePrefix(abi.fuse_entry_out, neg.out) orelse return error.TestBadReply).nodeid);
+    var gm = meta;
+    gm.nodeid = ino;
+    const g = h.d.probeMeta(.{ .getattr = .{ .flags = 0, .fh = null } }, gm, &out) orelse return error.TestExpectedEqual;
+    try testing.expectEqual(ino, (abi.decodeExact(abi.fuse_attr_out, g.out) orelse return error.TestBadReply).attr.ino);
+    try testing.expect(h.d.probeMeta(.{ .lookup = .{ .name = "." } }, meta, &out) == null);
+    try testing.expect(h.d.probeMeta(.{ .lookup = .{ .name = ".stats" } }, meta, &out) == null);
 }
 
 test "KILLPRIV_V2 mode law: suid always; sgid iff group-exec" {

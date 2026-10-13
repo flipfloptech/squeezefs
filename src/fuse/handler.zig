@@ -109,7 +109,14 @@ pub const ring = struct {
             .forget = fsForget,
             .write_hold_eligible = fsWriteHoldEligible,
             .direct_leg = fsDirectLeg,
+            .probe_meta = fsProbeMeta,
         };
+
+        /// The metadata reads' arm (a) (decision 0003 §AB.1): the
+        /// lifecycle layer's try-only LOOKUP / GETATTR on the queue thread.
+        fn fsProbeMeta(ctx: *anyopaque, req: fsv.Request, out: *codec.OutBuf) ?codec.Reply {
+            return of(ctx).d.probeMeta(req.op, .{ .unique = req.header.unique, .nodeid = req.header.nodeid, .uid = req.header.uid, .gid = req.header.gid, .pid = req.header.pid }, out);
+        }
 
         fn of(ctx: *anyopaque) *Binding {
             return @ptrCast(@alignCast(ctx));

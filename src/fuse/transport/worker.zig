@@ -169,6 +169,12 @@ pub var cqe_errors: counters.ShardedCounter = .{};
 /// by the worker; `transport_forget_entries` the nlookup records inside them.
 pub var forget_autocommits: counters.ShardedCounter = .{};
 pub var forget_entries: counters.ShardedCounter = .{};
+/// `transport_meta_inline_serves` / `_demotes`: LOOKUPs and GETATTRs the
+/// filesystem's try-only `probe_meta` answered on this thread / declined to
+/// the lane (decision 0003 §AB.1). Partition: `serves + demotes ≡ LOOKUP +
+/// GETATTR deliveries`.
+pub var meta_inline_serves: counters.ShardedCounter = .{};
+pub var meta_inline_demotes: counters.ShardedCounter = .{};
 /// `transport_fast_dispatch_serves` / `_demotes`: the READ law's arms (a) / (c).
 pub var fast_dispatch_serves: counters.ShardedCounter = .{};
 pub var fast_dispatch_demotes: counters.ShardedCounter = .{};
@@ -713,6 +719,9 @@ pub const Group = struct {
     deadlines: zc.Deadlines,
     bridge_parked: []ParkedReply,
     local_msgs: []commit_queue.Msg,
+    /// The fixed-size body a `probe_meta` reply is encoded into (copied
+    /// into the slot by `commitReady` before the next delivery).
+    meta_out: codec.OutBuf = undefined,
     held_len: []u32,
     /// Per gent: the bounce window's page-rounded high-water since its
     /// last punch (0 = no pages), and the budget tick the ent last went
@@ -2364,6 +2373,7 @@ pub const Group = struct {
             // No-reply opcodes that reached the ring: the ent must still be re-armed.
             .interrupt, .notify_reply => self.autoCommit(gent, unique, commit_id),
             .read => |in| self.dispatchRead(gent, req, in, sref),
+            .lookup, .getattr => self.dispatchMeta(gent, req, sref),
             .write => |w| {
                 const lease = held orelse slot.PayloadLease.acquire(&ent.lease, w.data, self.waker());
                 self.dispatch(gent, req, sref, lease);
@@ -2381,6 +2391,23 @@ pub const Group = struct {
         hdr.ring_ent_in_out.payload_sz = 0;
         forget_autocommits.inc();
         self.pushCommit(gent, commit_id);
+    }
+
+    /// A LOOKUP or GETATTR: the filesystem's try-only `probe_meta` answers
+    /// on this thread (no handler-lane handoff, no reply wake), else the
+    /// lane homed on the queue's CPU — the READ law's arms (a) and (c) for
+    /// the metadata reads (decision 0003 §AB.1).
+    fn dispatchMeta(self: *Group, gent: u32, req: fsv.Request, sref: slot.SlotRef) void {
+        if (self.shared.fs.probeMeta(req, &self.meta_out)) |reply| {
+            meta_inline_serves.inc();
+            const m = self.memberOf(gent);
+            const e = self.entIdxOf(gent);
+            self.local_msgs[gent] = commit_queue.Msg.reply(.{ .qid = m.qid, .ent_idx = e, .commit_id = m.slots.ent(e).owing().?.commit_id }, reply);
+            self.commitReady(gent, &self.local_msgs[gent], .local);
+            return;
+        }
+        meta_inline_demotes.inc();
+        self.dispatch(gent, req, sref, null);
     }
 
     /// A served READ reply: into the window (UserEnts/BufRing — the arena

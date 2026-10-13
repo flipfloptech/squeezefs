@@ -300,6 +300,12 @@ pub const VTable = struct {
     lseek: Op(LseekArgs, Lseek) = &defaults.enosys(LseekArgs, Lseek),
     copy_file_range: Op(CopyFileRangeArgs, Written) = &defaults.enosys(CopyFileRangeArgs, Written),
     syncfs: Op(SyncfsArgs, void) = &defaults.enosys(SyncfsArgs, void),
+    /// The try-only twins of `lookup` / `getattr` the FUSE drain worker asks
+    /// first (decision 0003 §AB.1): answer from RAM or fail — any error,
+    /// `WouldBlock` above all, sends the request to the lane, which asks
+    /// the blocking op. Never a device touch, a wire verb or a park.
+    probe_lookup: Op(LookupArgs, Entry) = &defaults.enosys(LookupArgs, Entry),
+    probe_getattr: Op(GetattrArgs, Attr) = &defaults.enosys(GetattrArgs, Attr),
 };
 
 const defaults = struct {

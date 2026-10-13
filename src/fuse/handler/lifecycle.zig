@@ -268,6 +268,30 @@ pub fn Dispatcher(comptime Transport: type) type {
             ctx.stage(.reply_commit);
         }
 
+        /// The FUSE drain worker's try-only answer to a LOOKUP or GETATTR
+        /// (decision 0003 §AB.1), on the worker thread: the filesystem's
+        /// `probe_lookup` / `probe_getattr`, the lookup reference noted as
+        /// the lane would; null = any refusal (the lane re-asks the
+        /// blocking op and answers it, errors included). Counted in
+        /// `fuse_ops` and the class's latency like a lane answer.
+        pub fn probeMeta(self: *Self, req: codec.Request, meta: Meta, out: *codec.OutBuf) ?codec.Reply {
+            const op = opcodeOf(req);
+            var trace = op_trace.OpTrace.begin(meta.unique, op_trace.OpClass.of(op));
+            var ctx: Ctx = .{ .unique = meta.unique, .uid = meta.uid, .gid = meta.gid, .pid = meta.pid, .io = self.io, .trace = &trace, .wd_slot = null, .window = &.{} };
+            const reply: codec.Reply = switch (req) {
+                .lookup => |a| blk: {
+                    const e = self.fs.vtable.probe_lookup(self.fs.impl, &ctx, .{ .parent = meta.nodeid, .name = a.name }) catch return null;
+                    self.noteEntry(e) catch return null;
+                    break :blk codec.replyEntry(out, meta.unique, e);
+                },
+                .getattr => |a| codec.replyAttr(out, meta.unique, self.fs.vtable.probe_getattr(self.fs.impl, &ctx, .{ .ino = meta.nodeid, .fh = a.fh }) catch return null),
+                else => return null,
+            };
+            fuse_ops.inc();
+            trace.finish();
+            return reply;
+        }
+
         fn releaseLease(self: *Self, lease: ?Transport.PayloadLease) void {
             if (lease) |l| self.transport.releaseLease(l);
         }

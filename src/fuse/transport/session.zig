@@ -1577,6 +1577,8 @@ pub const Session = struct {
         try field(w, "transport_ents_retired", slot.ents_retired.load());
         try field(w, "transport_cqe_errors", worker.cqe_errors.load());
         try field(w, "transport_forget_autocommits", worker.forget_autocommits.load());
+        try field(w, "transport_meta_inline_serves", worker.meta_inline_serves.load());
+        try field(w, "transport_meta_inline_demotes", worker.meta_inline_demotes.load());
         try field(w, "transport_fast_dispatch_serves", worker.fast_dispatch_serves.load());
         try field(w, "transport_fast_dispatch_demotes", worker.fast_dispatch_demotes.load());
         try field(w, "transport_fused_read_fusions", worker.fused_read_fusions.load());
@@ -2011,6 +2013,55 @@ const TeardownWatchdog = struct {
         self.thread.join();
     }
 };
+
+test "e2e: a LOOKUP and a GETATTR the filesystem answers from RAM never leave the worker — zero handler-lane dispatches, the probe served each, `serves + demotes ≡ LOOKUP + GETATTR`; a declining probe still answers through the lane (decision 0003 §AB.1)" {
+    if (venueMissing()) |why| return testkit.skipWhy(@src(), why);
+    const rig = try Rig.init(testing.allocator, 7, &.{});
+    defer rig.deinit();
+    rig.fs.meta_probe = true;
+    _ = try rig.mountIt(.{ .mem_budget_bytes = 0 });
+    const Helper = struct {
+        fn run(r: *Rig, result: *anyerror!void) void {
+            result.* = body(r);
+        }
+        fn body(r: *Rig) !void {
+            var pb: [256]u8 = undefined;
+            try testing.expectEqual(@as(u64, EchoFs.hello_text.len), try statSize(r.child(&pb, "hello")));
+            try testing.expectEqual(@as(u64, EchoFs.big_len), try statSize(r.child(&pb, "big")));
+            try testing.expectError(error.StatFailed, statSize(r.child(&pb, "nope")));
+        }
+    };
+    const d0 = rig.fs.dispatches.load(.monotonic);
+    const p0 = rig.fs.meta_probes_served.load(.monotonic);
+    const s0 = worker.meta_inline_serves.load();
+    const m0 = worker.meta_inline_demotes.load();
+    var result: anyerror!void = {};
+    const t = try std.Thread.spawn(.{}, Helper.run, .{ rig, &result });
+    t.join();
+    try result;
+    const served = rig.fs.meta_probes_served.load(.monotonic) - p0;
+    try testing.expect(served >= 3);
+    try testing.expectEqual(d0, rig.fs.dispatches.load(.monotonic));
+    try testing.expectEqual(served, worker.meta_inline_serves.load() - s0);
+    try testing.expectEqual(m0, worker.meta_inline_demotes.load());
+    try testing.expectEqual(@as(u64, 1), rig.fs.lookups[@intCast(EchoFs.ino_hello)].load(.monotonic));
+    // The probe off: the same requests take the lane, counted demotes.
+    rig.fs.meta_probe = false;
+    const Helper2 = struct {
+        fn run(r: *Rig, result2: *anyerror!void) void {
+            var pb: [256]u8 = undefined;
+            result2.* = if (statSize(r.child(&pb, "nope2"))) |_| error.TestUnexpectedResult else |_| {};
+        }
+    };
+    const d1 = rig.fs.dispatches.load(.monotonic);
+    const m1 = worker.meta_inline_demotes.load();
+    var result2: anyerror!void = {};
+    const t2 = try std.Thread.spawn(.{}, Helper2.run, .{ rig, &result2 });
+    t2.join();
+    try result2;
+    try testing.expect(rig.fs.dispatches.load(.monotonic) > d1);
+    try testing.expect(worker.meta_inline_demotes.load() > m1);
+}
 
 test "e2e: EchoFs mounts over the ring — INIT negotiated FUSE_OVER_IO_URING, enable_uring reads Y, every queue armed, stat/open/read from a helper thread arrive over the RING (the sideband saw no request), replies byte-exact, the geometry the kernel accepted equals the plan" {
     if (venueMissing()) |why| return testkit.skipWhy(@src(), why);

@@ -599,6 +599,7 @@ pub const KvTree = struct {
     /// `tryGet` then the demand page; `null` = a retired extent (stale route).
     fn fetch(self: *KvTree, addr: u64) node_cache.LoadError!?*CachedNode {
         if (self.cache.tryGet(addr)) |n| return n;
+        if (node_cache.try_only) return error.WouldBlock;
         return self.cache.loadForSlot(addr, self.forest_slot);
     }
 
@@ -617,7 +618,11 @@ pub const KvTree = struct {
             // synchronously, so a spinning walker would burn the whole
             // budget inside one held window; yielding turns the budget
             // into 256 scheduling opportunities, not 256 spins.
-            if (attempt > 0) std.Thread.yield() catch std.atomic.spinLoopHint();
+            if (attempt > 0) {
+                // A try-only reader never waits out an SMO's window.
+                if (node_cache.try_only) return error.WouldBlock;
+                std.Thread.yield() catch std.atomic.spinLoopHint();
+            }
             const root = self.rootPtr();
             var cur = (try self.fetch(root.addr)) orelse {
                 reasons[0] += 1;

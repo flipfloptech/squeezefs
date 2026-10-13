@@ -485,6 +485,9 @@ pub const Error = error{
     HoleCheckpointFailed,
     /// A device read failed resolving a leaf.
     Io,
+    /// A try-only read (`node_cache.try_only`, decision 0003 §AB.1) met a
+    /// node the cache does not hold: the caller asks again blocking.
+    WouldBlock,
     /// A routing/protocol inconsistency.
     Corrupt,
     /// The lock-revalidate budget exhausted (an SMO protocol bug).
@@ -522,6 +525,7 @@ pub fn coreError(e: Error) errors.Error {
         error.Deferred => error.Deferred,
         error.GrantExhausted => error.GrantExhausted,
         error.JournalWriteFailed, error.Io, error.Corrupt, error.RetryBudgetExhausted => error.InputOutput,
+        error.WouldBlock => error.WouldBlock,
     };
 }
 
@@ -549,6 +553,7 @@ fn mapTreeError(e: tree.Error) Error {
         error.RetryBudgetExhausted => error.RetryBudgetExhausted,
         error.PartitionRefused => error.PartitionRefused,
         error.ValueTooLarge => error.ValueTooLarge,
+        error.WouldBlock => error.WouldBlock,
         else => error.Corrupt,
     };
 }

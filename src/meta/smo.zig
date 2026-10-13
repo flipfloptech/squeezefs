@@ -1918,6 +1918,35 @@ test "the D4 nudge (defrag --meta): a leaf whose serialized log is mostly dead (
     while (i < 200) : (i += 13) try expectLookup(t, &ikey(i), tree.testValue(i * 7 + rounds, 24, &buf));
 }
 
+test "try-only reads (decision 0003 §AB.1): a lookup whose leaf the cache does not hold is WouldBlock — never a demand page — while a resident path serves; the blocking lookup then pages the leaf in and the try-only repeat serves it" {
+    const gpa = testing.allocator;
+    var vol = try TestVolume.init(gpa, .{ .extents = 512 });
+    defer vol.deinit();
+    const t = try vol.createTree(.native);
+    const n = try vol.growToRootLevel(t, 1, 32, 4096, 4_000);
+    try vol.flushDirty(t);
+    const vbuf = try gpa.alloc(u8, 4096);
+    defer gpa.free(vbuf);
+    var fresh = try vol.freshCache();
+    defer fresh.deinit();
+    // The reopen pages in the root (an interior node) alone.
+    const reopened = try KvTree.open(gpa, fresh, .native, t.rootPtr(), vol.seq);
+    defer reopened.destroy();
+    var kb: [32]u8 = undefined;
+    const k = wideKey(n / 2, 32, &kb);
+    {
+        node_cache.try_only = true;
+        defer node_cache.try_only = false;
+        try testing.expectError(error.WouldBlock, reopened.lookup(gpa, k));
+    }
+    try expectLookup(reopened, k, tree.testValue(n / 2, 4096, vbuf));
+    node_cache.try_only = true;
+    defer node_cache.try_only = false;
+    const got = (try reopened.lookup(gpa, k)).?;
+    defer gpa.free(got);
+    try testing.expectEqualSlices(u8, tree.testValue(n / 2, 4096, vbuf), got);
+}
+
 test "interior_recursion_grows_root_to_depth_three: the level-1 root splits itself; every key resolves through two interior levels and streams in order" {
     const gpa = testing.allocator;
     var vol = try TestVolume.init(gpa, .{ .extents = 2048 });

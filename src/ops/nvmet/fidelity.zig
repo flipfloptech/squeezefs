@@ -9,7 +9,10 @@
 //! `nvme`/`jq` is made through `nvmeof list --json`, `nvmeof resv-report
 //! --json`, `.stats` and the ledger (quirk Q14). Every object carries the
 //! harness marker `:fideli-` (refused by `adopt`) and rides the port-id
-//! slice 54000–54099; teardown removes ONLY what the leg made; a leg ends
+//! slice 54000–54999 (the allocator probes past another run's ports); every
+//! tcp listener takes a TCP port of the run's own (`Rig.tcpPort`, the
+//! kernel's ephemeral choice held by a probe socket), so concurrent gate
+//! runs on one venue never meet; teardown removes ONLY what the leg made; a leg ends
 //! with a zero-residue census (none of its subsystems, ports, controllers
 //! or records survive). Root, `/dev/nvme-fabrics`, `/dev/fuse` and the
 //! 7.2.6-sqz venue are required; anything less skips LOUDLY.
@@ -70,6 +73,8 @@ const hostid_knob = "SQUEEZEFS_HOSTID";
 const ident_a: initiator.HostPair = .{ .hostnqn = "nqn.2014-08.org.nvmexpress:uuid:a0a0a0a0-a0a0-4a0a-8a0a-a0a0a0a0a0a0", .hostid = "a0a0a0a0-a0a0-4a0a-8a0a-a0a0a0a0a0a0" };
 const ident_b: initiator.HostPair = .{ .hostnqn = "nqn.2014-08.org.nvmexpress:uuid:b0b0b0b0-b0b0-4b0b-8b0b-b0b0b0b0b0b0", .hostid = "b0b0b0b0-b0b0-4b0b-8b0b-b0b0b0b0b0b0" };
 
+/// 127.0.0.1, the address every tcp leg listens and connects on.
+const loopback_v4: u32 = 0x7f00_0001;
 /// A meta volume of 1 GiB and a data volume of 2 GiB (sparse on ext4).
 const meta_len: u64 = 1 << 30;
 const data_len: u64 = 2 << 30;
@@ -126,6 +131,8 @@ const Rig = struct {
     connects: std.ArrayList(Connected) = .empty,
     /// Live daemons (foreground mounts) with their log files.
     daemons: std.ArrayList(Daemon) = .empty,
+    /// The probe sockets holding this run's TCP service ports (`tcpPort`).
+    port_probes: std.ArrayList(linux.fd_t) = .empty,
 
     const Daemon = struct {
         child: std.process.Child,
@@ -197,6 +204,8 @@ const Rig = struct {
             self.gpa.free(s);
         }
         self.shares.deinit(self.gpa);
+        for (self.port_probes.items) |fd| _ = linux.close(fd);
+        self.port_probes.deinit(self.gpa);
         self.pool.deinit();
         Io.Dir.cwd().deleteTree(self.io, self.root) catch {};
         self.env.deinit();
@@ -268,6 +277,34 @@ const Rig = struct {
 
     fn nqnFor(self: *Rig, buf: *[256]u8, name: []const u8) []const u8 {
         return std.fmt.bufPrint(buf, "nqn.2026-10.io.squeezefs:fideli-{d}-{s}", .{ self.pid, name }) catch unreachable;
+    }
+
+    /// A TCP service port of this run's own: the kernel's ephemeral choice
+    /// (`bind(127.0.0.1:0)` + `getsockname`), its probe socket held bound —
+    /// SO_REUSEADDR, never listening — until the rig ends, so no concurrent
+    /// run's `bind(0)` is handed it; nvmet-tcp's listener binds it beside
+    /// the probe (`nvmet_tcp_add_port` sets SO_REUSEADDR, and only a
+    /// LISTENING holder conflicts). Two gate runs on one venue (several
+    /// worktrees) never meet on a port — the fixed ports they shared did.
+    fn tcpPort(self: *Rig) !u16 {
+        const rc = linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
+        if (linux.errno(rc) != .SUCCESS) return error.PortProbeFailed;
+        const fd: linux.fd_t = @intCast(rc);
+        errdefer _ = linux.close(fd);
+        const on: c_int = 1;
+        if (linux.errno(linux.setsockopt(fd, linux.SOL.SOCKET, linux.SO.REUSEADDR, std.mem.asBytes(&on), @sizeOf(c_int))) != .SUCCESS) return error.PortProbeFailed;
+        var addr: linux.sockaddr.in = .{ .port = 0, .addr = std.mem.nativeToBig(u32, loopback_v4) };
+        if (linux.errno(linux.bind(fd, @ptrCast(&addr), @sizeOf(linux.sockaddr.in))) != .SUCCESS) return error.PortProbeFailed;
+        var len: linux.socklen_t = @sizeOf(linux.sockaddr.in);
+        if (linux.errno(linux.getsockname(fd, @ptrCast(&addr), &len)) != .SUCCESS) return error.PortProbeFailed;
+        try self.port_probes.append(self.gpa, fd);
+        return std.mem.bigToNative(u16, addr.port);
+    }
+
+    /// This run's meta and data service ports on tcp; 0 (unused) on loop.
+    fn servicePorts(self: *Rig, transport: configfs.Trtype) ![2]u16 {
+        if (transport == .loop) return .{ 0, 0 };
+        return .{ try self.tcpPort(), try self.tcpPort() };
     }
 
     /// `share --create-size` under the harness NQN; recorded in the manifest.
@@ -623,11 +660,27 @@ fn expectNoResidue(rig: *Rig, nqn: []const u8) !void {
     for (ctrls) |c| try testing.expect(!std.mem.eql(u8, c.subsysnqnOf(), nqn));
 }
 
+/// A small configfs port id of this run's own for a hand-built foreign
+/// share: below the product's and the harness's ranges, keyed by the pid
+/// so two runs start apart, the first id no port holds (the probe — a
+/// concurrent run's port is skipped, never reused).
+fn smallPortId(fs: configfs.Fs, pid: linux.pid_t) !u16 {
+    const span: u16 = configfs.PORT_ID_BASE_DEFAULT - 1;
+    var id: u16 = 1 + @as(u16, @intCast(@mod(pid, span)));
+    var tries: u16 = 0;
+    var pb: [32]u8 = undefined;
+    while (tries < span) : (tries += 1) {
+        if (!fs.exists(try std.fmt.bufPrint(&pb, "ports/{d}", .{id}))) return id;
+        id = if (id == span) 1 else id + 1;
+    }
+    return error.PortRangeExhausted;
+}
+
 fn roundtripLeg(transport: configfs.Trtype) !void {
     const gpa = testing.allocator;
     var rig = try venue(gpa, testing.io);
     defer rig.deinit();
-    const port: u16 = if (transport == .tcp) 4433 else 0;
+    const port = (try rig.servicePorts(transport))[0];
     const nqn = try rig.share("rt", meta_len, transport, port);
     // The live tree: resv_enable 1, the uuid the ledger recorded.
     var walk = try configfs.walkLive(configfs.RealFs.face(), gpa);
@@ -679,7 +732,7 @@ fn prMatrixLeg(transport: configfs.Trtype) !void {
     const gpa = testing.allocator;
     var rig = try venue(gpa, testing.io);
     defer rig.deinit();
-    const port: u16 = if (transport == .tcp) 4434 else 0;
+    const port = (try rig.servicePorts(transport))[0];
     const nqn = try rig.share("pr", meta_len, transport, port);
     const a = try rig.connect(nqn, transport, port, null, &.{});
     const b = try rig.connect(nqn, transport, port, ident_b, &.{});
@@ -752,13 +805,13 @@ const DaemonSet = struct {
     }
 };
 
-fn daemonSet(rig: *Rig, prefix: []const u8, transport: configfs.Trtype, port_base: u16, format_extra: []const []const u8) !DaemonSet {
+fn daemonSet(rig: *Rig, prefix: []const u8, transport: configfs.Trtype, ports: [2]u16, format_extra: []const []const u8) !DaemonSet {
     var mb: [64]u8 = undefined;
     var db: [64]u8 = undefined;
-    const meta_nqn = try rig.share(try std.fmt.bufPrint(&mb, "{s}meta", .{prefix}), meta_len, transport, port_base);
-    const data_nqn = try rig.share(try std.fmt.bufPrint(&db, "{s}data", .{prefix}), data_len, transport, port_base + 1);
-    const cm = try rig.connect(meta_nqn, transport, port_base, null, &.{});
-    const cd = try rig.connect(data_nqn, transport, port_base + 1, null, &.{});
+    const meta_nqn = try rig.share(try std.fmt.bufPrint(&mb, "{s}meta", .{prefix}), meta_len, transport, ports[0]);
+    const data_nqn = try rig.share(try std.fmt.bufPrint(&db, "{s}data", .{prefix}), data_len, transport, ports[1]);
+    const cm = try rig.connect(meta_nqn, transport, ports[0], null, &.{});
+    const cd = try rig.connect(data_nqn, transport, ports[1], null, &.{});
     var out: DaemonSet = .{ .meta_nqn = meta_nqn, .data_nqn = data_nqn, .cm = cm };
     out.meta_uri_len = (try std.fmt.bufPrint(&out.meta_uri_buf, "sqmeta://{s}", .{cm.dev()})).len;
     var du: [64]u8 = undefined;
@@ -778,7 +831,7 @@ fn daemonSet(rig: *Rig, prefix: []const u8, transport: configfs.Trtype, port_bas
     const fmt_out = try rig.sqzOk(argv[0..n]);
     defer rig.gpa.free(fmt_out);
     try testing.expect(std.mem.indexOf(u8, fmt_out, "data volumes 1") != null);
-    try rig.setDataEndpoint(out.metaUri(), transport, port_base + 1, data_nqn);
+    try rig.setDataEndpoint(out.metaUri(), transport, ports[1], data_nqn);
     try rig.disconnect(&cd);
     return out;
 }
@@ -789,11 +842,12 @@ fn daemonSet(rig: *Rig, prefix: []const u8, transport: configfs.Trtype, port_bas
 /// identity refused → kill -9 → remount through the own-stale ladder
 /// (the data association REUSED) → umount → regctl 0, the association
 /// released.
-fn mountLeg(transport: configfs.Trtype, port_base: u16) !void {
+fn mountLeg(transport: configfs.Trtype) !void {
     const gpa = testing.allocator;
     var rig = try venue(gpa, testing.io);
     defer rig.deinit();
-    const set = try daemonSet(rig, "", transport, port_base, &.{});
+    const ports = try rig.servicePorts(transport);
+    const set = try daemonSet(rig, "", transport, ports, &.{});
     const meta_nqn = set.meta_nqn;
     const data_nqn = set.data_nqn;
     const cm = set.cm;
@@ -824,7 +878,7 @@ fn mountLeg(transport: configfs.Trtype, port_base: u16) !void {
     defer gpa.free(sum);
     // A second mount under a SECOND identity pair (its own connect of the
     // meta share): refused — the claim is fresh (the ladder's first rung).
-    const cm_b = try rig.connect(meta_nqn, transport, port_base, ident_b, &.{});
+    const cm_b = try rig.connect(meta_nqn, transport, ports[0], ident_b, &.{});
     var mu_b: [64]u8 = undefined;
     const meta_uri_b = try std.fmt.bufPrint(&mu_b, "sqmeta://{s}", .{cm_b.dev()});
     const b = try rig.spawnMount("b", meta_uri_b, ident_b, &.{});
@@ -883,14 +937,15 @@ fn mountLeg(transport: configfs.Trtype, port_base: u16) !void {
 /// disconnects leaving `/sys/class/nvme` as it was; without the record the
 /// §5.2 ladder refuses the mount naming the verb; a namespace ANOTHER
 /// identity connected is never touched by the daemon's release.
-fn daemonConnectLeg(transport: configfs.Trtype, port_base: u16) !void {
+fn daemonConnectLeg(transport: configfs.Trtype) !void {
     const gpa = testing.allocator;
     var rig = try venue(gpa, testing.io);
     defer rig.deinit();
-    const meta_nqn = try rig.share("dcmeta", meta_len, transport, port_base);
-    const data_nqn = try rig.share("dcdata", data_len, transport, port_base + 1);
-    const cm = try rig.connect(meta_nqn, transport, port_base, null, &.{});
-    const cd = try rig.connect(data_nqn, transport, port_base + 1, null, &.{});
+    const ports = try rig.servicePorts(transport);
+    const meta_nqn = try rig.share("dcmeta", meta_len, transport, ports[0]);
+    const data_nqn = try rig.share("dcdata", data_len, transport, ports[1]);
+    const cm = try rig.connect(meta_nqn, transport, ports[0], null, &.{});
+    const cd = try rig.connect(data_nqn, transport, ports[1], null, &.{});
     var mu: [64]u8 = undefined;
     var du: [64]u8 = undefined;
     const meta_uri = try std.fmt.bufPrint(&mu, "sqmeta://{s}", .{cm.dev()});
@@ -913,7 +968,7 @@ fn daemonConnectLeg(transport: configfs.Trtype, port_base: u16) !void {
         defer gpa.free(text);
         try testing.expect(std.mem.indexOf(u8, text, "set-fabric-endpoints") != null);
     }
-    try rig.setDataEndpoint(meta_uri, transport, port_base + 1, data_nqn);
+    try rig.setDataEndpoint(meta_uri, transport, ports[1], data_nqn);
     // The operator's data association released: NO pre-connected namespace.
     try rig.disconnect(&cd);
     try testing.expectEqual(@as(u32, 0), try rig.controllersOf(data_nqn, null));
@@ -947,7 +1002,7 @@ fn daemonConnectLeg(transport: configfs.Trtype, port_base: u16) !void {
     // daemon's to release: the mount connects its OWN beside it and its
     // umount leaves B's standing; the payload reads back through the
     // daemon's fresh association.
-    const cd_b = try rig.connect(data_nqn, transport, port_base + 1, ident_b, &.{});
+    const cd_b = try rig.connect(data_nqn, transport, ports[1], ident_b, &.{});
     const a2 = try rig.spawnMount("dc-a2", meta_uri, null, &.{});
     try rig.awaitLog(a2, "ready: ", ready_wait_ns);
     try testing.expectEqual(@as(u32, 2), try rig.controllersOf(data_nqn, null));
@@ -967,19 +1022,19 @@ fn daemonConnectLeg(transport: configfs.Trtype, port_base: u16) !void {
 }
 
 test "nvmet fidelity: daemon-connect-loop — a mount by endpoint record with NO pre-connected namespace connects the data volume itself (fabric_daemon_connects 1, the bound row names the subsystem), serves, and its umount releases exactly its own association (/sys/class/nvme as it was); without the record the ladder refuses naming set-fabric-endpoints; a namespace another identity connected survives the daemon's release" {
-    try daemonConnectLeg(.loop, 0);
+    try daemonConnectLeg(.loop);
 }
 
 test "nvmet fidelity: daemon-connect-tcp — the same over nvmet-tcp on 127.0.0.1" {
-    try daemonConnectLeg(.tcp, 4490);
+    try daemonConnectLeg(.tcp);
 }
 
 test "nvmet fidelity: fidelity-mount (loop) — THE row: the metadata and data volumes ARE connected namespaces (the data volume the daemon's own connect from its endpoint record); format → mount → PR armed for real (holder == pr_key, regctl 1) → a second identity refused → kill -9 → remount recovers via the own-stale ladder (pr_own_stale_recoveries 1, payload intact) and REUSES the data association → umount → regctl 0, the association released → disconnect → unshare" {
-    try mountLeg(.loop, 0);
+    try mountLeg(.loop);
 }
 
 test "nvmet fidelity: guard-tcp — the kill -9 remount row on nvmet-tcp" {
-    try mountLeg(.tcp, 4440);
+    try mountLeg(.tcp);
 }
 
 test "nvmet fidelity: sigstop-preempt — a SIGSTOPped holder is preempted by a second identity past T_owner; resumed, its next beat reads the usurpation (writer_guard_fenced 1, the latch FAILED by the fence class) while the second mount's writes land and its own answer EIO" {
@@ -987,7 +1042,7 @@ test "nvmet fidelity: sigstop-preempt — a SIGSTOPped holder is preempted by a 
     var rig = try venue(gpa, testing.io);
     defer rig.deinit();
     const transport: configfs.Trtype = .loop;
-    const set = try daemonSet(rig, "s", transport, 0, &.{});
+    const set = try daemonSet(rig, "s", transport, try rig.servicePorts(transport), &.{});
     const meta_nqn = set.meta_nqn;
     const data_nqn = set.data_nqn;
     const cm = set.cm;
@@ -1049,8 +1104,8 @@ test "nvmet fidelity: g2-restore-tcp — the PTPL lapse: the subsystem wiped by 
     const gpa = testing.allocator;
     var rig = try venue(gpa, testing.io);
     defer rig.deinit();
-    const port: u16 = 4450;
-    const set = try daemonSet(rig, "g", .tcp, port, &.{});
+    const ports = try rig.servicePorts(.tcp);
+    const set = try daemonSet(rig, "g", .tcp, ports, &.{});
     const meta_nqn = set.meta_nqn;
     const data_nqn = set.data_nqn;
     const cm = set.cm;
@@ -1109,7 +1164,9 @@ test "nvmet fidelity: crash-window — W-N1: a share with a TEST-NET-1 listener 
     try rig.shares.append(gpa, nqn);
     var bb: [linux.PATH_MAX]u8 = undefined;
     const backing = try std.fmt.bufPrint(&bb, "{s}/cw1.img", .{rig.root});
-    const r = try rig.sqz(&.{ "nvmeof", "share", "--subnqn", nqn, "--ip", "127.0.0.1", "--ip", "192.0.2.55", "--port", "4460", "--create-size", "67108864", backing });
+    var p1b: [8]u8 = undefined;
+    const p1 = try std.fmt.bufPrint(&p1b, "{d}", .{try rig.tcpPort()});
+    const r = try rig.sqz(&.{ "nvmeof", "share", "--subnqn", nqn, "--ip", "127.0.0.1", "--ip", "192.0.2.55", "--port", p1, "--create-size", "67108864", backing });
     defer rig.freeRun(r);
     try testing.expect(!r.term.success());
     try testing.expect(std.mem.indexOf(u8, r.stderr, "PENDING record claims what exists") != null);
@@ -1138,7 +1195,9 @@ test "nvmet fidelity: crash-window — W-N1: a share with a TEST-NET-1 listener 
     const nqn2 = try gpa.dupe(u8, rig.nqnFor(&nb, "cw2"));
     try rig.shares.append(gpa, nqn2);
     const backing2 = try std.fmt.bufPrint(&bb, "{s}/cw2.img", .{rig.root});
-    const r3 = try rig.sqz(&.{ "nvmeof", "share", "--subnqn", nqn2, "--ip", "192.0.2.66", "--port", "4461", "--create-size", "67108864", backing2 });
+    var p2b: [8]u8 = undefined;
+    const p2 = try std.fmt.bufPrint(&p2b, "{d}", .{try rig.tcpPort()});
+    const r3 = try rig.sqz(&.{ "nvmeof", "share", "--subnqn", nqn2, "--ip", "192.0.2.66", "--port", p2, "--create-size", "67108864", backing2 });
     defer rig.freeRun(r3);
     try testing.expect(!r3.term.success());
     var rec2 = (try rig.ledgerRecord(nqn2)).?;
@@ -1169,7 +1228,8 @@ test "nvmet fidelity: adopt — A1: a hand-built foreign share with a small-int 
     var rig = try venue(gpa, testing.io);
     defer rig.deinit();
     const fs = configfs.RealFs.face();
-    // A1: hand-built through configfs (not the product's verb), port id 7.
+    // A1: hand-built through configfs (not the product's verb) on a small
+    // port id outside both ranges — the run's own (`smallPortId`).
     var nb: [256]u8 = undefined;
     const hand = try std.fmt.bufPrint(&nb, "nqn.2026-10.example:hand-{d}", .{rig.pid});
     var bb: [linux.PATH_MAX]u8 = undefined;
@@ -1182,13 +1242,16 @@ test "nvmet fidelity: adopt — A1: a hand-built foreign share with a small-int 
     // A tcp listener: a loop connect reaches only the FIRST loop port on
     // the host, so a hand-built loop port would be unreachable beside any
     // other (a concurrent run's); tcp addresses the port by ip:port.
-    var hl = try configfs.Listener.tcp("127.0.0.1", 4480);
-    hl.port_id = 7;
+    const hand_port = try rig.tcpPort();
+    var hl = try configfs.Listener.tcp("127.0.0.1", hand_port);
+    hl.port_id = try smallPortId(fs, rig.pid);
+    var hand_dir_b: [32]u8 = undefined;
+    const hand_dir = try std.fmt.bufPrint(&hand_dir_b, "ports/{d}", .{hl.port_id});
     const hand_uuid: [16]u8 = .{ 0x7a, 0x7a, 0x7a, 0x7a, 0x11, 0x11, 0x41, 0x11, 0x81, 0x11, 1, 2, 3, 4, 5, 6 };
     _ = try configfs.apply(fs, .{ .subnqn = hand, .backing_path = backing, .ns_uuid = hand_uuid, .allow_hosts = &.{}, .listeners = &.{hl} });
     const hand_owned = try gpa.dupe(u8, hand);
     try rig.shares.append(gpa, hand_owned);
-    const c = try rig.connect(hand, .tcp, 4480, null, &.{});
+    const c = try rig.connect(hand, .tcp, hand_port, null, &.{});
     const lj = try rig.listJson();
     defer gpa.free(lj);
     try testing.expect(std.mem.indexOf(u8, lj, "\"foreign_live\":[{\"subnqn\":\"nqn.2026-10.example:hand-") != null);
@@ -1205,14 +1268,14 @@ test "nvmet fidelity: adopt — A1: a hand-built foreign share with a small-int 
     defer rec.deinit(gpa);
     try testing.expect(rec.adopted and rec.adopt_class == .foreign);
     try testing.expectEqual(hand_uuid, rec.ns_uuid);
-    try testing.expectEqual(@as(u16, 7), rec.listeners[0].port_id);
+    try testing.expectEqual(hl.port_id, rec.listeners[0].port_id);
     const ra = try rig.sqz(&.{ "nvmeof", "adopt", hand });
     defer rig.freeRun(ra);
     try testing.expect(!ra.term.success() and std.mem.indexOf(u8, ra.stderr, "[adopt_already_ledgered]") != null);
     try rig.roundTrip(c.dev());
     try rig.disconnect(&c);
     try rig.unshare(hand);
-    try testing.expect(!fs.exists("ports/7"));
+    try testing.expect(!fs.exists(hand_dir));
     try expectNoResidue(rig, hand);
     // A2: a product share, the ledger file deleted, adopt as ledger_loss.
     const own = try rig.share("lost", 64 << 20, .loop, 0);
@@ -1245,7 +1308,9 @@ test "nvmet fidelity: adopt — A1: a hand-built foreign share with a small-int 
     const plain_owned = try gpa.dupe(u8, plain);
     try rig.shares.append(gpa, plain_owned);
     {
-        const r = try rig.sqzEnv(&.{ "nvmeof", "share", "--subnqn", plain, "--ip", "127.0.0.1", "--port", "4470", "--create-size", "67108864", plain_backing }, &env_prod);
+        var ppb: [8]u8 = undefined;
+        const pp = try std.fmt.bufPrint(&ppb, "{d}", .{try rig.tcpPort()});
+        const r = try rig.sqzEnv(&.{ "nvmeof", "share", "--subnqn", plain, "--ip", "127.0.0.1", "--port", pp, "--create-size", "67108864", plain_backing }, &env_prod);
         defer rig.freeRun(r);
         if (!r.term.success()) std.debug.print("\n--- plain share failed ---\n{s}\n", .{r.stderr});
         try testing.expect(r.term.success());

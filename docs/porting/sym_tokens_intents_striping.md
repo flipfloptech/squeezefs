@@ -374,6 +374,11 @@ pages install after the recall removed the old entry.
    `dlm_token_recall_purged_keys/_scoped_purges`. An object whose keys cannot be enumerated (no entry
    held — shed or never granted — or an off-record kvmap head) falls back to the WHOLE census ONCE
    per call (`purge_reader_block_keys`, `dlm_token_recall_census_purges`, :3936–3951).
+   Z/ (0003 §W.2, 0002 row 513): the revoked `Entry` stays pinned through the purge and the sink
+   enumerates its carried `layout` (`DataPlane.recallPurgeLayout`); the census drops FOREIGN keys only
+   (a cell this member never touched) through `purge.purgeCensus`; instead of stamping every block
+   fill, a binding loss after a fetch that may have deposited a foreign key purges it, and the
+   deposit-only paths (dehydration, the hold-serve ceremony) never deposit one.
 3. **A DIRTY layout entry is KEPT** (:3857–3882, PR 13b — the `sym-foreign-file` leg's acked-write
    loss): under the divert a WRITER is a token client of the holders it writes to, and its
    `layout_dirty` entry IS the pending write ("an inline write's `data_key` is the ONLY copy of the

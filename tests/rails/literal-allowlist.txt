@@ -221,23 +221,23 @@ src/fuse/handler/kv_fs.zig:3163 | 4096 | OWED: derive it or document it on the l
 src/fuse/handler/op_trace.zig:279 | 10 | a size — OWED: derive from derive.Facts or document the physical/format reason
 src/fuse/mount_options.zig:265 | 10 | OWED: derive it or document it on the line (charter §1.5)
 src/fuse/mount_options.zig:266 | 10 | OWED: derive it or document it on the line (charter §1.5)
-src/fuse/transport/filesystem_vtable.zig:447 | 0o100444 | a file mode (POSIX permission bits)
-src/fuse/transport/filesystem_vtable.zig:447 | 0o100644 | a file mode (POSIX permission bits)
-src/fuse/transport/filesystem_vtable.zig:447 | 0o40755 | a file mode (POSIX permission bits)
-src/fuse/transport/filesystem_vtable.zig:448 | 1_700_000_000 | OWED: derive it or document it on the line (charter §1.5)
-src/fuse/transport/filesystem_vtable.zig:452 | 511 | OWED: derive it or document it on the line (charter §1.5)
-src/fuse/transport/filesystem_vtable.zig:452 | 512 | OWED: derive it or document it on the line (charter §1.5)
-src/fuse/transport/filesystem_vtable.zig:453 | 1_700_000_000 | OWED: derive it or document it on the line (charter §1.5)
-src/fuse/transport/filesystem_vtable.zig:455 | 1_700_000_000 | OWED: derive it or document it on the line (charter §1.5)
-src/fuse/transport/filesystem_vtable.zig:464 | 4096 | OWED: derive it or document it on the line (charter §1.5)
-src/fuse/transport/filesystem_vtable.zig:649 | 0o100444 | a file mode (POSIX permission bits)
-src/fuse/transport/filesystem_vtable.zig:671 | 1024 | a table entry (switch/range arm) — the codec or classification table
-src/fuse/transport/filesystem_vtable.zig:671 | 255 | a table entry (switch/range arm) — the codec or classification table
-src/fuse/transport/filesystem_vtable.zig:671 | 4096 | a table entry (switch/range arm) — the codec or classification table
-src/fuse/transport/filesystem_vtable.zig:671 | 4096 | a table entry (switch/range arm) — the codec or classification table
-src/fuse/transport/filesystem_vtable.zig:671 | 512 | a table entry (switch/range arm) — the codec or classification table
-src/fuse/transport/filesystem_vtable.zig:671 | 512 | a table entry (switch/range arm) — the codec or classification table
-src/fuse/transport/filesystem_vtable.zig:671 | 8 | a table entry (switch/range arm) — the codec or classification table
+src/fuse/transport/filesystem_vtable.zig:456 | 0o100444 | a file mode (POSIX permission bits)
+src/fuse/transport/filesystem_vtable.zig:456 | 0o100644 | a file mode (POSIX permission bits)
+src/fuse/transport/filesystem_vtable.zig:456 | 0o40755 | a file mode (POSIX permission bits)
+src/fuse/transport/filesystem_vtable.zig:457 | 1_700_000_000 | OWED: derive it or document it on the line (charter §1.5)
+src/fuse/transport/filesystem_vtable.zig:461 | 511 | OWED: derive it or document it on the line (charter §1.5)
+src/fuse/transport/filesystem_vtable.zig:461 | 512 | OWED: derive it or document it on the line (charter §1.5)
+src/fuse/transport/filesystem_vtable.zig:462 | 1_700_000_000 | OWED: derive it or document it on the line (charter §1.5)
+src/fuse/transport/filesystem_vtable.zig:464 | 1_700_000_000 | OWED: derive it or document it on the line (charter §1.5)
+src/fuse/transport/filesystem_vtable.zig:473 | 4096 | OWED: derive it or document it on the line (charter §1.5)
+src/fuse/transport/filesystem_vtable.zig:659 | 0o100444 | a file mode (POSIX permission bits)
+src/fuse/transport/filesystem_vtable.zig:681 | 1024 | a table entry (switch/range arm) — the codec or classification table
+src/fuse/transport/filesystem_vtable.zig:681 | 255 | a table entry (switch/range arm) — the codec or classification table
+src/fuse/transport/filesystem_vtable.zig:681 | 4096 | a table entry (switch/range arm) — the codec or classification table
+src/fuse/transport/filesystem_vtable.zig:681 | 4096 | a table entry (switch/range arm) — the codec or classification table
+src/fuse/transport/filesystem_vtable.zig:681 | 512 | a table entry (switch/range arm) — the codec or classification table
+src/fuse/transport/filesystem_vtable.zig:681 | 512 | a table entry (switch/range arm) — the codec or classification table
+src/fuse/transport/filesystem_vtable.zig:681 | 8 | a table entry (switch/range arm) — the codec or classification table
 src/fuse/transport/probes.zig:106 | 4096 | OWED: derive it or document it on the line (charter §1.5)
 src/fuse/transport/probes.zig:194 | 16 | OWED: derive it or document it on the line (charter §1.5)
 src/fuse/transport/session.zig:268 | 32 | a size — OWED: derive from derive.Facts or document the physical/format reason

@@ -2106,6 +2106,35 @@ test "e2e: teardown with an in-flight request — the drain synthesizes the erro
     try testing.expect(replies_dropped_no_slot.load() >= dropped_before + 1);
 }
 
+test "e2e: teardown with a LOOKUP parked in its handler — the request's bytes (its name, in the payload buffer) stay mapped until every handler has finished: the handler released after `close` joined the workers reads its name intact, never a fault in an unmapped buffer region (the daemon's SIGSEGV in a `.stats` lookup racing `squeezefs umount`)" {
+    if (venueMissing()) |why| return testkit.skipWhy(@src(), why);
+    const rig = try Rig.init(testing.allocator, 9, &.{});
+    defer rig.deinit();
+    const s = try rig.mountIt(.{ .mem_budget_bytes = 0 });
+    var pb: [256]u8 = undefined;
+    const Helper = struct {
+        fn run(path: [*:0]const u8, result: *anyerror!u64) void {
+            result.* = statSize(path);
+        }
+    };
+    var result: anyerror!u64 = 0;
+    const t = try std.Thread.spawn(.{}, Helper.run, .{ rig.child(&pb, EchoFs.park_lookup_name).ptr, &result });
+    const deadline = clock.monotonicNs() + 5 * std.time.ns_per_s;
+    while (rig.fs.parked_lookups.load(.monotonic) == 0 and clock.monotonicNs() < deadline) std.Thread.yield() catch {};
+    try testing.expectEqual(@as(u32, 1), rig.fs.parked_lookups.load(.monotonic));
+    // Phase 1 with the handler mid-request: the drain answers the caller,
+    // the workers are joined.
+    s.close();
+    t.join();
+    try testing.expectError(error.StatFailed, result);
+    // The handler resumes on a closed session, then phase 2 awaits it.
+    rig.fs.releaseParked();
+    s.deinit();
+    rig.session = null;
+    try testing.expectEqual(@as(u64, 0), rig.fs.names_unmapped_after_park.load(.monotonic));
+    try testing.expectEqual(@as(u64, 1), rig.fs.names_intact_after_park.load(.monotonic));
+}
+
 test "e2e: a 10 s random-op storm from 4 threads never needs the 100 ms backstop (tick rescues stay 0), abandons nothing, overflows nothing; the partition law and parked ≡ unparked hold; the coalescer elides" {
     if (venueMissing()) |why| return testkit.skipWhy(@src(), why);
     const rig = try Rig.init(testing.allocator, 5, &.{});

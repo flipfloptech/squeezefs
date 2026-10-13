@@ -284,6 +284,9 @@ const EchoFsImpl = struct {
     pub const scratch_cap: usize = 1 << 16;
     pub const names = [_][]const u8{ "hello", "big", "park", "scratch" };
     pub const inos = [_]u64{ ino_hello, ino_big, ino_park, ino_scratch };
+    /// A name outside the tree whose LOOKUP parks in its handler (answered
+    /// negative once released).
+    pub const park_lookup_name = "park-lookup";
 
     /// Every READ declines the probe (arm (a)) and takes the lane (arm (c)).
     probe_declines: bool = false,
@@ -311,6 +314,12 @@ const EchoFsImpl = struct {
     /// fibers through the `Io` futex, never the lane thread.
     park_gate: std.Io.Event = .unset,
     parked_readers: std.atomic.Value(u32) = .init(0),
+    /// `park_lookup_name` lookups park on `park_gate` too; released, the
+    /// handler first judges whether its request's name (the payload
+    /// buffer's bytes) is still mapped, then reads it.
+    parked_lookups: std.atomic.Value(u32) = .init(0),
+    names_unmapped_after_park: std.atomic.Value(u64) = .init(0),
+    names_intact_after_park: std.atomic.Value(u64) = .init(0),
     /// A retaining WRITE handler waits here between its ACK-early reply and
     /// its extraction + release.
     retain_gate: std.Io.Event = .unset,
@@ -572,6 +581,7 @@ const EchoFsImpl = struct {
         switch (req.op) {
             .lookup => |l| {
                 if (ino != ino_root) return h.fail(.NOTDIR);
+                if (std.mem.eql(u8, l.name, park_lookup_name)) return self.parkedLookup(h, u, l.name, &out);
                 const child = lookupName(l.name) orelse return h.reply(codec.replyEntry(&out, u, codec.EntryReply.negative(std.time.ns_per_s)));
                 h.reply(codec.replyEntry(&out, u, self.entry(child).?));
             },
@@ -681,6 +691,24 @@ const EchoFsImpl = struct {
             .unsupported => h.reply(codec.replyEnosys(u)),
             else => h.reply(codec.replyEnosys(u)),
         }
+    }
+
+    /// A lookup parked until `park_gate` opens, then the mapping law on its
+    /// own request: `msync` answers ENOMEM over a range with an unmapped
+    /// page, so the name is judged before a byte of it is read.
+    fn parkedLookup(self: *Self, h: Handle, u: u64, name: []const u8, out: *codec.OutBuf) void {
+        _ = self.parked_lookups.fetchAdd(1, .monotonic);
+        self.park_gate.wait(self.io.?) catch {};
+        _ = self.parked_lookups.fetchSub(1, .monotonic);
+        const page = std.heap.pageSize();
+        const lo = std.mem.alignBackward(usize, @intFromPtr(name.ptr), page);
+        const hi = std.mem.alignForward(usize, @intFromPtr(name.ptr) + name.len, page);
+        if (linux.errno(linux.msync(@ptrFromInt(lo), hi - lo, linux.MSF.ASYNC)) != .SUCCESS) {
+            _ = self.names_unmapped_after_park.fetchAdd(1, .monotonic);
+            return h.fail(.IO);
+        }
+        if (std.mem.eql(u8, name, park_lookup_name)) _ = self.names_intact_after_park.fetchAdd(1, .monotonic);
+        h.reply(codec.replyEntry(out, u, codec.EntryReply.negative(std.time.ns_per_s)));
     }
 
     /// Release every parked `/park` reader.

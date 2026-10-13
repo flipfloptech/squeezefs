@@ -187,6 +187,19 @@ pub const Refcount = struct {
             cur = cell.cmpxchgWeak(cur, cur - 1, .acq_rel, .monotonic) orelse return cur == 1;
         }
     }
+
+    /// CAS down from ≥ 2 only; false (the cell untouched) at 1 or 0 — the
+    /// caller's reference is the LAST one (or none is tracked), so the
+    /// terminal decision is not this caller's to take alone. Same orderings
+    /// as `release` (the decrement publishes the caller's prior writes to
+    /// the eventual 1→0 releaser).
+    pub fn releaseUnlessLast(cell: *Atomic(u32)) bool {
+        var cur = cell.load(.monotonic);
+        while (true) {
+            if (cur <= 1) return false;
+            cur = cell.cmpxchgWeak(cur, cur - 1, .acq_rel, .monotonic) orelse return true;
+        }
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -1038,6 +1051,16 @@ pub const BlockAllocator = struct {
     pub fn refcount(self: *BlockAllocator, idx: u64) ?u32 {
         const n = Refcount.peek(&self.cell(idx).refcount);
         return if (n == 0) null else n;
+    }
+
+    /// A reference released while another still holds the block: true =
+    /// decremented (nonterminal by construction); false = this is the last
+    /// tracked reference, a SHARED block (its terminality is the share
+    /// home's) or an untracked one — nothing changed, the full ladder
+    /// decides.
+    pub fn releaseUnlessLast(self: *BlockAllocator, idx: u64) bool {
+        if (self.isShared(idx)) return false;
+        return Refcount.releaseUnlessLast(&self.cell(idx).refcount);
     }
 
     /// The clone side of W1: pin (SeqCst CAS) → snapshot (SeqCst load).

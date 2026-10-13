@@ -569,6 +569,13 @@ local leak: `Ok(())` with nothing freed anywhere, forever"). The split (`SF:L6-1
 effect (the `TREE_BLOCK_REFS` delete) already rode the displacing layout publish, whole-tx; what ships
 is the ACCOUNTING ladder whose durable home is the holder's ledger.
 
+**Port departure (0002 row 500, 0003 §T.3):** the reference ships EVERY release, and the holder's
+untracked arm (below) seeds one reference — but the holder cannot read the references a LIVE lessee's
+slot trees carry, so a nonterminal release of a lessee-minted block (a pack seal's pin drop, one
+tenant's delete) freed the block under its live tenants. The port's non-holder releases LOCALLY while
+its RAM count covers another reference (`BlockAllocator.releaseUnlessLast`, SHARED excluded); only the
+last reference, a SHARED block and an untracked one ship.
+
 The verb: `PublishCall::FreeBlocks{vol_tag, blocks: Vec<u64> (dense indices), lease_epoch,
 request_id}` (`PUB:L463-474`) — RETRIED, "safe here alone": the holder's dedup window keys `(lease_
 epoch, request_id)`, and a retry NEVER re-keys under a fresh epoch ("that is what closes the freed-then-

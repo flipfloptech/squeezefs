@@ -662,10 +662,18 @@ pub const Reclaimer = struct {
             stats.block_key_incarnation_refusals.fire("terminal free of a block under a stale lifetime stamp");
             return .refused;
         }
-        // Step 1 (rung 6): a non-holder SHIPS the accounting ladder to the
-        // holder — "the pre-branch shape was a silent local leak". The
-        // holder's own executor (authority active) runs the ladder here.
+        // Step 1 (rung 6): a non-holder SHIPS its TERMINAL frees to the
+        // holder (charter §5.5) — "the pre-branch shape was a silent local
+        // leak". A reference its own RAM count still covers past this one
+        // is released HERE: the block's other references live in this
+        // writer's slot trees, which the holder cannot read while they are
+        // leased, so its untracked arm would seed ONE reference and free a
+        // block with live tenants (a joiner's pack seal punched its own
+        // tenants at the holder). The last reference, a SHARED block and an
+        // untracked one ship. The holder's own executor (authority active)
+        // runs the ladder here.
         if (row.free_target) |t| if (!t.authorityActive(t.ctx)) {
+            if (alloc.releaseUnlessLast(idx)) return .nonterminal;
             return if (t.ship(t.ctx, alloc.volTag(), idx)) .nonterminal else .refused;
         };
         // Step 5: `begin_free` (the SHARED gate and the untracked gate
@@ -1672,6 +1680,42 @@ test "terminal_free_on_file_backing_is_one_counted_punch; nonterminal_free_recla
     try log.testing.expectAllFired();
     try testing.expectEqual(refusals + 1, counters.tripwireCount("block_key_incarnation_refusals"));
     try testing.expectEqual(block_alloc.State.allocated, f.alloc.stateOf(3));
+}
+
+test "a NON-holder ships only its TERMINAL frees (charter §5.5): a release its RAM count still covers past this reference stays local (nonterminal, nothing shipped — the holder cannot read the references a live lessee's slot trees carry); the last reference ships and the local word stays for the shipper's verdict" {
+    const io = testing.io;
+    var f = try Fixture.init(.{ .budget_bytes = test_budget, .batch_ms = 0 }, .file_punch, 16);
+    defer f.deinit();
+    try f.mintPublished(4);
+    const Holder = struct {
+        shipped: [8]u64 = undefined,
+        n: usize = 0,
+        fn ship(ctx: *anyopaque, _: u64, idx: u64) bool {
+            const h: *@This() = @ptrCast(@alignCast(ctx));
+            h.shipped[h.n] = idx;
+            h.n += 1;
+            return true;
+        }
+        fn active(_: *anyopaque) bool {
+            return false;
+        }
+    };
+    var holder: Holder = .{};
+    f.r.setFreeTarget(0, .{ .ctx = &holder, .ship = &Holder.ship, .authorityActive = &Holder.active });
+    // Block 1 carries three references (a pack's pin + two tenants).
+    try testing.expect(f.alloc.incrementRefcount(1));
+    try testing.expect(f.alloc.incrementRefcount(1));
+    try testing.expectEqual(FreeOutcome.nonterminal, f.r.freeBlock(io, 0, 1, f.alloc.stampOf(1)));
+    try testing.expectEqual(FreeOutcome.nonterminal, f.r.freeBlock(io, 0, 1, f.alloc.stampOf(1)));
+    try testing.expectEqual(@as(usize, 0), holder.n);
+    try testing.expectEqual(@as(?u32, 1), f.alloc.refcount(1));
+    try testing.expectEqual(block_alloc.State.allocated, f.alloc.stateOf(1));
+    // The last reference ships; the local word is the shipper's to retire
+    // on the holder's verdict, never this reclaimer's.
+    try testing.expectEqual(FreeOutcome.nonterminal, f.r.freeBlock(io, 0, 1, f.alloc.stampOf(1)));
+    try testing.expectEqualSlices(u64, &.{1}, holder.shipped[0..holder.n]);
+    try testing.expectEqual(@as(?u32, 1), f.alloc.refcount(1));
+    try testing.expectEqual(@as(u64, 0), f.r.population());
 }
 
 test "elided_terminal_free_is_reallocatable_with_zero_device_commands; the lever off restores the queued reclaim verbatim" {

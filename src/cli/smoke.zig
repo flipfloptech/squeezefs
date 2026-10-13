@@ -259,11 +259,17 @@ const Rig = struct {
 
     /// `formatSet` with extra format flags (`--block-size`).
     fn formatSetWith(self: *Rig, cache: bool, extra: []const []const u8) !void {
+        return self.formatSetSized(cache, extra, data_len);
+    }
+
+    /// `formatSetWith` over data volumes of `data_bytes` each (a row that
+    /// fills the set to ENOSPC wants it small).
+    fn formatSetSized(self: *Rig, cache: bool, extra: []const []const u8, data_bytes: u64) !void {
         try self.createMetaVolume();
         for ([_][]const u8{ self.d0, self.d1 }) |dp| {
             const f = try Io.Dir.cwd().createFile(self.io, dp, .{ .truncate = true });
             defer f.close(self.io);
-            try f.setLength(self.io, data_len);
+            try f.setLength(self.io, data_bytes);
         }
         if (cache) _ = linux.mkdir(self.cache.ptr, 0o700);
         var argv: [12][]const u8 = undefined;
@@ -7990,6 +7996,113 @@ test "smoke: THE FLEET'S MERGED BLOCK CENSUS — mount A + B JOINED with the fle
     try b.umount();
     try b.expectCleanExit("B's last unmount");
     try rig.expectAlive("the merged census row");
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+}
+
+/// The re-use row's set: two data volumes of three grant floors of 1 MiB
+/// blocks each (`block_grant.BLOCK_GRANT_FLOOR` = 64: a smaller volume
+/// cannot hold one member's window beside another's) — the fill to
+/// ENOSPC is ~384 MiB, seconds on the venue.
+const reuse_row_block: u64 = 1 << 20;
+const reuse_row_data_bytes: u64 = 3 * 64 * reuse_row_block;
+
+/// The re-use row's read: ONE 1 MiB O_DIRECT request straddling the two
+/// blocks of a two-block file — a multi-block request the queue thread's
+/// warm ladder demotes (its direct device leg serves single blocks and
+/// deposits nothing); on B, with the dest lease off
+/// (`SQUEEZEFS_READ_DEST_LEASE=0` — an aligned sub-block window would
+/// otherwise DMA straight into the reply and deposit nothing), each
+/// 512 KiB half is the lane's whole-block fill, which deposits. `$2` =
+/// the file.
+const reuse_row_window_read = "dd if=\"$2\" iflag=direct,skip_bytes skip=524288 bs=1048576 count=1 status=none | sha256sum";
+
+test "smoke: A MEMBER'S CACHED COPY OF ANOTHER MEMBER'S BLOCKS NEVER OUTLIVES THE BLOCKS' RE-USE (0003 §W.2) — two 192 MiB data volumes of 1 MiB blocks, no cache path (every write beyond inline striped) → mount A (the manager) + B JOINED (the dest lease off: its window reads are whole-block fills that deposit) → A writes `f` (two blocks, fsync'd) → B reads it until its tiers hold its blocks → A fills the set to ENOSPC → A `rm f`: the delete recalls B's token and B purges the blocks' keys before it acks (scoped purges ≥ 1 on B) → A writes `g` (two blocks, fsync'd) into the blocks the rm freed → B reads `g`: sha-equal to A's, never `f`'s bytes" {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    try rig.env.put("SQUEEZEFS_MW_BIND", "127.0.0.1:0");
+    var t_owner_text: [8]u8 = undefined;
+    try rig.env.put("SQUEEZEFS_TEST_MEMBERSHIP_T_OWNER_MS", try std.fmt.bufPrint(&t_owner_text, "{d}", .{smoke_t_owner_ms}));
+    var bs_buf: [16]u8 = undefined;
+    try rig.formatSetSized(false, &.{ "--block-size", try std.fmt.bufPrint(&bs_buf, "{d}", .{reuse_row_block}) }, reuse_row_data_bytes);
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(0);
+    var env_b = try envWith(gpa, &rig.env, &.{.{ "SQUEEZEFS_READ_DEST_LEASE", "0" }});
+    defer env_b.deinit();
+    const b = try Peer.init(rig, "b");
+    defer b.deinit();
+    b.env = &env_b;
+    try b.spawn(&.{});
+    _ = try b.awaitReady();
+    // 1. A's file `f`: two blocks; the sha of the straddling window.
+    {
+        const out = try rig.onMount("dd if=/dev/urandom of=f bs=1048576 count=2 iflag=fullblock conv=fsync status=none && set -- \"$1\" f && " ++ reuse_row_window_read ++ " > \"$1/f.sha\" && echo written");
+        defer gpa.free(out);
+        try testing.expectEqualStrings("written\n", out);
+    }
+    // 2. B reads the window (under A's token) until its tiers hold both
+    //    blocks.
+    {
+        var deposited = false;
+        var pass: u32 = 0;
+        while (pass < 4 and !deposited) : (pass += 1) {
+            const out = try b.onMount("set -- \"$1\" f && " ++ reuse_row_window_read ++ " > \"$1/f.b.sha\"; if cmp -s \"$1/f.b.sha\" \"$1/f.sha\"; then echo equal; else cat \"$1/f.b.sha\" \"$1/f.sha\"; fi");
+            defer gpa.free(out);
+            if (!std.mem.eql(u8, out, "equal\n")) std.debug.print("smoke[reuse]: B's read of `f` differs:\n{s}", .{out});
+            try testing.expectEqualStrings("equal\n", out);
+            const sb = try b.stats();
+            defer gpa.free(sb);
+            deposited = (numberAfter(sb, "\"hot_block_current_bytes\":") orelse 0) + (numberAfter(sb, "\"read_lane_hold_bytes\":") orelse 0) >= 2 * reuse_row_block;
+        }
+        std.debug.print("smoke[reuse]: B read A's `f` {d} time(s); its tiers hold both blocks: {}\n", .{ pass, deposited });
+        try testing.expect(deposited);
+    }
+    // 3. A fills the set to ENOSPC one block per file (B's tiers keep
+    //    `f`'s blocks): a refused one-block write allocated nothing, so no
+    //    free lands later to give `g` a block other than `f`'s.
+    {
+        const out = try rig.onMountTimed("j=0; while dd if=/dev/zero of=fill$j bs=1048576 count=1 conv=fsync status=none 2>/dev/null; do j=$((j+1)); done; rm -f fill$j; echo $j", 900);
+        defer gpa.free(out);
+        std.debug.print("smoke[reuse]: A filled the set with {s} MiB to ENOSPC\n", .{std.mem.trimEnd(u8, out, "\n")});
+    }
+    const sb0 = try b.stats();
+    const scoped0 = numberAfter(sb0, "\"dlm_token_recall_scoped_purges\":") orelse 0;
+    const keys0 = numberAfter(sb0, "\"dlm_token_recall_purged_keys\":") orelse 0;
+    gpa.free(sb0);
+    // 4. A deletes `f` (B holds its token: the recall), then writes `g`:
+    //    the only clear blocks are the ones `f` held. The delete's frees
+    //    land asynchronously (seconds on the venue) and a write on a
+    //    latched-full set answers ENOSPC until they do: the write is
+    //    polled until it lands, bounded at 60 s.
+    {
+        const out = try rig.onMountTimed("rm f && n=0; until dd if=/dev/urandom of=g bs=1048576 count=2 iflag=fullblock conv=fsync status=none 2>/dev/null; do n=$((n+1)); [ $n -lt 120 ] || exit 1; rm -f g; sleep 0.5; done; set -- \"$1\" g && " ++ reuse_row_window_read ++ " > \"$1/g.sha\" && echo written", 600);
+        defer gpa.free(out);
+        try testing.expectEqualStrings("written\n", out);
+    }
+    // 5. B reads `g`'s window: A's bytes, never the cached `f` — then the
+    //    recall's purge on B, the counters that name it.
+    {
+        const out = try b.onMount("set -- \"$1\" g && " ++ reuse_row_window_read ++ " > \"$1/g.b.sha\"; if cmp -s \"$1/g.b.sha\" \"$1/g.sha\"; then echo equal; elif cmp -s \"$1/g.b.sha\" \"$1/f.sha\"; then echo stale-f; else echo other; fi");
+        defer gpa.free(out);
+        std.debug.print("smoke[reuse]: B reads A's `g` (the re-used blocks): {s}", .{out});
+        try testing.expectEqualStrings("equal\n", out);
+    }
+    {
+        const sb = try b.stats();
+        defer gpa.free(sb);
+        const scoped = numberAfter(sb, "\"dlm_token_recall_scoped_purges\":") orelse 0;
+        const keys = numberAfter(sb, "\"dlm_token_recall_purged_keys\":") orelse 0;
+        std.debug.print("smoke[reuse]: B's recall of `f`: scoped purges {d} → {d}, purged keys {d} → {d}, census purges {d}\n", .{ scoped0, scoped, keys0, keys, numberAfter(sb, "\"dlm_token_recall_census_purges\":") orelse 0 });
+        try testing.expect(scoped >= scoped0 + 1);
+        try testing.expect(keys >= keys0 + 2);
+    }
+    try b.expectAlive("the re-use row");
+    try rig.expectAlive("the re-use row");
+    try b.umount();
+    try b.expectCleanExit("B's unmount after the re-use row");
     try rig.umount();
     try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
 }

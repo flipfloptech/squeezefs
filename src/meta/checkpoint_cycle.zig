@@ -2083,11 +2083,16 @@ test "the tick: a due tick with the park mark records the decision words on the 
     try testing.expectEqual(ckpt.checkpointTriggerMs(100, ckpt.anticipatedTermMs(tape.anticipated_ms, tape.projected_ms)), tape.trigger_ms);
     try testing.expect(tape.trigger_ms <= 100);
     try testing.expectEqual(@as(u64, 1), tape.dirty_at_decision);
-    // ≈ 150 ms late (below the 200 ms landing-ceiling cap): the lateness
-    // beyond one 50 ms tick rides the term on top of the landing wall.
-    try testing.expect(tape.late_ms >= 250 - 100 and tape.late_ms < 200);
+    // ≈ 150 ms late: the lateness beyond one 50 ms tick rides the term on
+    // top of the landing wall, capped at the landing ceiling (100 + 2 × 50 =
+    // 200 ms). The lateness is the real time from the test's clock read to
+    // the tick's decision, so a host that stalls the test past 50 ms lands
+    // it past the cap: the term is asserted in whichever regime it fell
+    // (an upper bound on the lateness asserted the host's speed and failed
+    // under sharded load).
+    try testing.expect(tape.late_ms >= 250 - 100);
     try testing.expect(tape.landing_ns >= tape.collect_ns + tape.flush_ns + tape.pages_ns + tape.barrier_ns);
-    try testing.expectEqual(tape.late_ms - 50, (tape.term_ns - tape.landing_ns) / ns_per_ms);
+    try testing.expectEqual(@min(tape.late_ms, ckpt.checkpointLandingCeilingMs(v.cp.cfg.max_age_ms, v.cp.cfg.flush_interval_ms)) - 50, (tape.term_ns - tape.landing_ns) / ns_per_ms);
     try testing.expect(v.cp.lates.anticipatedNs() >= 150 * ns_per_ms);
     try testing.expect(v.cp.late_max_ms.load() >= 150);
     // The decision words were consumed: a direct cycle's tape reads 0.

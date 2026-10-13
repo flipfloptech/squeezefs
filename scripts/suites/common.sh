@@ -25,7 +25,7 @@
 #
 # Scratch is bounded: one metadata volume (1 GiB sparse) + two data volumes
 # (8 GiB sparse each) + a staging/cache path per set, all under
-# `/build/tmp/suites-<suite>-<date>/` on the venue's ext4 (sparse files,
+# `/build/tmp/suites-<suite>-<date>-<pid>/` on the venue's ext4 (sparse files,
 # real block semantics; never /build/ext — AGENTS.md "Test data and disk").
 # `scripts/venue trim` returns the blocks after a run.
 set -euo pipefail
@@ -105,14 +105,17 @@ suite_packages() {
   fi
 }
 
-# Results dir: /build/tmp/suites-<suite>-<date>/ (the daemon logs, every
-# run's raw output, the fsck reports, the verdicts). `SUITE_RESULTS`
-# overrides for a resumed multi-run count.
+# Results dir: /build/tmp/suites-<suite>-<date>-<pid>/ (the daemon logs,
+# every run's raw output, the fsck reports, the verdicts; the sets and their
+# mountpoints live under it). The pid: two worktrees' gates that start a
+# suite in the same second would otherwise format, mount and judge ONE set
+# (docs/evidence/rung-09-gates.md §11). `SUITE_RESULTS` overrides for a
+# resumed multi-run count.
 suite_prepare() {
   local suite=$1
   suite_require_venue
   mkdir -p "$SUITES_TMP" "$SUITES_ROOT"
-  RESULTS=${SUITE_RESULTS:-"$SUITES_TMP/suites-$suite-$(date +%Y%m%d-%H%M%S)"}
+  RESULTS=${SUITE_RESULTS:-"$SUITES_TMP/suites-$suite-$(date +%Y%m%d-%H%M%S)-$$"}
   mkdir -p "$RESULTS"
   export RESULTS
   suite_log "results: $RESULTS; binary: $("$SQZ_BIN" --version)"
@@ -256,7 +259,7 @@ suite_cleanup() {
   # agents' daemons are theirs: listed, never signalled).
   local pid
   for pid in "${SUITE_PID[@]}"; do [ -n "$pid" ] && suite_alive "$pid" && { suite_log "daemon $pid (ours) still alive; SIGKILL"; kill -9 "$pid" || true; }; done
-  for m in $(awk -v r="$RESULTS" '$3 == "fuse.squeezefs" && index($2, r) == 1 {print $2}' /proc/mounts); do umount -l "$m" || true; done
+  for m in $(awk -v r="$RESULTS" '$3 == "fuse.squeezefs" && index($2, r "/") == 1 {print $2}' /proc/mounts); do umount -l "$m" || true; done
   local live; live=$(suite_live_daemons | tr '\n' ' ')
   [ -z "$live" ] || suite_log "note: live squeezefs daemons not ours: $live"
   # The data volumes are the bulk: drop them, keep the logs and reports.

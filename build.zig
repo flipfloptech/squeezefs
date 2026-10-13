@@ -140,9 +140,18 @@ pub fn build(b: *std.Build) void {
         build_lib.addPrefixedFileArg("-Mroot=", b.path("src/shim_so.zig"));
         build_lib.addPrefixedFileArg("-Mbuild_options=", build_options.getOutput());
         const so = build_lib.addPrefixedOutputFileArg("-femit-bin=", "libsqueezefs_il.so");
-        // The compiler's own cache makes the re-run cheap; the step cannot
-        // enumerate the shim's transitive sources as inputs.
-        build_lib.has_side_effects = true;
+        // A CACHED step, so its output directory (`o/<digest>`) is a
+        // function of every byte the shim can read: the compiler, the build
+        // identity (`build_options`, an argument above) and every file under
+        // src/ (a superset of the shim's transitive imports, which no
+        // `zig build-lib` flag reports). Never `has_side_effects`: a
+        // side-effect step's directory is the hash of its argv alone, which
+        // every worktree sharing a cache dir computes alike — a neighbour's
+        // build-lib rewrote the .so between this graph's build-lib and its
+        // staging, and the shim smoke paired the daemon with another
+        // build's shim (docs/evidence/rung-09-gates.md §11).
+        build_lib.addFileInput(.zig_exe);
+        addTreeInputs(b, build_lib, "src");
         shim_step.dependOn(&b.addInstallLibFile(so, "libsqueezefs_il.so").step);
         b.getInstallStep().dependOn(shim_step);
         // The census and the shim smoke find the artifacts in their cwd: a
@@ -561,6 +570,31 @@ fn libraryModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.
     zstd_mod.addCSourceFile(.{ .file = b.path("vendor/zstd/zstd.c"), .flags = &.{ "-DZSTD_STATIC_LINKING_ONLY", "-std=c99" } });
     mod.linkLibrary(b.addLibrary(.{ .name = "zstd", .linkage = .static, .root_module = zstd_mod }));
     return mod;
+}
+
+/// Every file under `sub` (relative to the build root) as a file input of
+/// `run`, sorted (the cache manifest compares its file list in order, so a
+/// walk order that moved would only cost a miss — sorted, it never does).
+fn addTreeInputs(b: *std.Build, run: *std.Build.Step.Run, sub: []const u8) void {
+    // The list is a function of the tree, which the configure cache cannot
+    // track (a new file must join it): re-run this configure logic.
+    b.graph.poisonCache();
+    const io = b.graph.io;
+    var dir = b.root.openDir(io, sub, .{ .iterate = true }) catch |e| std.debug.panic("cannot open {s}/ to list a step's inputs: {t}", .{ sub, e });
+    defer dir.close(io);
+    var walker = dir.walk(b.allocator) catch @panic("OOM");
+    defer walker.deinit();
+    var paths: std.ArrayList([]const u8) = .empty;
+    while (walker.next(io) catch |e| std.debug.panic("cannot walk {s}/ to list a step's inputs: {t}", .{ sub, e })) |entry| {
+        if (entry.kind != .file) continue;
+        paths.append(b.allocator, b.pathJoin(&.{ sub, entry.path })) catch @panic("OOM");
+    }
+    std.mem.sort([]const u8, paths.items, {}, struct {
+        fn lessThan(_: void, l: []const u8, r: []const u8) bool {
+            return std.mem.lessThan(u8, l, r);
+        }
+    }.lessThan);
+    for (paths.items) |p| run.addFileInput(b.path(p));
 }
 
 /// A test run step under the release-gate option: the harness knob the ONE

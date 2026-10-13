@@ -129,7 +129,23 @@ The guard added last (`--lazy` only to a daemon of this build: SIGUSR2's default
 process without our handler, so the verb compares `.stats`' `build.commit` with its own first) rode runs
 3–20.
 
-## 6. Owed
+## 6. What the full gate found (and the rows it changed)
+
+- The two census unit rows passed alone and failed inside the full unit binary: their forked holder
+  (fork without exec) inherited `PR_SET_DUMPABLE 0` from an earlier test (`transform`'s key hardening),
+  and the magic links of a non-dumpable task need `CAP_SYS_PTRACE` — which the venue container does not
+  grant root (`CapEff a82465fb`, bit 19 clear). The rows make the child dumpable; the census doc states
+  the limit (0003 §S "Not walked"). On a host, root has the capability; the smoke's holders (`sleep`,
+  `sh`) are exec'd and dumpable either way.
+- `smoke: THE INTERCEPTION HOST` ran `umount` while its own process held `ring.dat` (and four screen fds)
+  open on the mount — a holder under the new law. The row now asserts the refusal by name (`pid <self>
+  (squeezefs-smoke) fd N`, exit 1, the mount still there), closes every fd, and only then runs the
+  umount "with the live session" (the socket and its bindings, which the host poisons at its disarm).
+- `smoke: ONLINE FSCK THROUGH THE ADMIN LANE` (landed on `dev` by the jobs rung during this work) failed
+  once in the first full gate with a C9 "stated gap" finding on the two-daemon set (`invariant_tripwires`
+  1) and passed on the re-run and in the second gate: not touched by this rung, noted for its owner.
+
+## 7. Owed
 
 - The census does not walk a per-thread cwd/root (`unshare(CLONE_FS)`) nor another mount namespace;
   mappings of a bind of the same superblock elsewhere match by device (an over-count the operator's retry

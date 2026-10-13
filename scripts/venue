@@ -78,8 +78,14 @@ ensure_running() {
 
 run_in() {
   ensure_running
+  # -t only when our stdin is a terminal: zig's build runner draws its live
+  # progress tree only on a TTY (without one a gate is silent until each step
+  # ends; the test runner's heartbeat lines are what a scripted run sees).
+  # Scripted runs and agents have no TTY — `-t` there would fail the exec.
+  local tty=()
+  if [ -t 0 ]; then tty=(-t); fi
   # -lc so PATH picks up /usr/local/bin/zig; cd into the repo at the same path.
-  container exec -i "$NAME" bash -lc "$export_cache; cd '$REPO' && $*"
+  container exec -i ${tty[@]+"${tty[@]}"} "$NAME" bash -lc "$export_cache; cd '$REPO' && $*"
 }
 
 case "${1:-}" in

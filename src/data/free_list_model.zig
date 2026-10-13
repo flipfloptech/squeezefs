@@ -19,6 +19,8 @@
 //! |---|---|---|---|
 //! | 1 `a_claim_between_the_publication_stores_is_never_clobbered` (local free list) | publisher state→bit→budget; a budget-then-bit claim; a trim claim of the published block | the budget never underflows; at the end a clear bit reads `free`, a taken bit reads its taker's state, the budget equals the clear bits | `bit_first` (the shipped order: the claim's `allocated` is overwritten by `free`), `state_buffered` (the state store not ordered before the bit clear), `trim_bit_first` (the trim takes the bit then debits a credit not yet landed: underflow) |
 //! | 2 `a_carve_between_the_publication_stores_is_never_clobbered` (holder) | publisher state→lock{bit, budget}; the carve lock{take, debit if free, virgin} then the mint's `allocated` | the budget never underflows; the minted block reads `allocated` with no phantom credit | `bit_first` (the shipped order: lock{bit} → state → budget — a carve between the state and the credit underflows, a carve + mint between the bit and the state is clobbered to `free` with a phantom credit), `credit_outside_lock` (the carve debits before the credit lands: underflow) |
+//! | 3 `a_quarantine_racing_a_finish_never_leaves_a_flagged_block_on_the_free_list` (0003 §Y.3) | the finish: its gate, the publication (state → bit → budget), then the RE-CHECK of the flag and, set, the take-back (entitlement → bit → `limbo` OWED); the admission: the flag, then the state read and, `free`, its own take (entitlement → bit → `quarantined` OWED); a claimant (entitlement → bit → `allocated`) | at the end the flagged block is off the free list (its bit set, no credit) and owned: `allocated` by the claimant, or `limbo`/`quarantined` with its publish OWED to the release | `no_recheck` (the shipped finish: an admission reading `limbo` between the gate and the publication leaves the block free-listed with the flag), `recheck_before_state` (the re-check before the publication's state store: the same window) |
+//! | 4 `a_holders_carve_never_meets_a_bit_taken_between_its_scan_and_its_take` (0003 §Y.4) | the carve lock{scan the lowest clear bit; take it — the assert; debit if `free`; `virgin`} then the mint; a non-carve taker (the trim claim; the quarantine's free arm is the same take) lock{state `free`, entitlement, bit} → `trim_windowed` → its return: the state `free`, then lock{bit, credit} | the carve's take never finds its scanned bit set; the budget never underflows; at the end the block is the carve's (`allocated`, no credit) or back on the list (`free`, one credit) | `take_outside_lock` (the shipped trim claim and quarantine: a take between the carve's scan and its take — the carve's assert), `return_outside_lock` (the trim's bit cleared outside the lock: the carve debits a credit not yet landed) |
 
 const std = @import("std");
 const explorer = @import("../model/explorer.zig");
@@ -348,6 +350,383 @@ pub fn HolderModel(comptime weakening: HolderWeakening) type {
 }
 
 // ---------------------------------------------------------------------------
+// Model 3: a quarantine admission racing a finish (the Dekker pair).
+// ---------------------------------------------------------------------------
+
+const QUARANTINED: u8 = 6;
+
+pub const QuarantineWeakening = enum {
+    none,
+    /// The shipped finish: the gate, then the publication — no re-check.
+    no_recheck,
+    /// A re-check placed BEFORE the publication's state store: the
+    /// admission's state read can still meet `limbo` after it.
+    recheck_before_state,
+};
+
+/// Block X is in limbo (its bit set, no credit) and its finish is running;
+/// an admission and a claimant race it. The finish's state store and its
+/// flag re-check are seq_cst, as are the admission's flag RMW and state
+/// read (block_alloc.zig: the Dekker pair) — the model's SC steps.
+pub fn QuarantineFinishModel(comptime weakening: QuarantineWeakening) type {
+    return struct {
+        const Self = @This();
+        pub const thread_count: usize = 3;
+        const P = 0;
+        const Q = 1;
+        const C = 2;
+        const END: u8 = 0xff;
+
+        flag: u8 = 0,
+        owed: u8 = 0,
+        state: u8 = LIMBO,
+        bit: u8 = 1,
+        budget: u8 = 0,
+        p_pc: u8 = 0,
+        q_pc: u8 = 0,
+        c_pc: u8 = 0,
+        c_took: u8 = 0,
+
+        pub fn init() Self {
+            return .{};
+        }
+
+        pub fn done(self: *const Self, t: usize) bool {
+            return switch (t) {
+                P => self.p_pc == END,
+                Q => self.q_pc == END,
+                C => self.c_pc == END,
+                else => unreachable,
+            };
+        }
+
+        pub fn step(self: *Self, t: usize) void {
+            switch (t) {
+                P => self.stepFinish(),
+                Q => self.stepAdmit(),
+                C => self.stepClaim(),
+                else => unreachable,
+            }
+        }
+
+        /// `finishFree`: the gate; the publication; the re-check; the take-back.
+        fn stepFinish(self: *Self) void {
+            switch (self.p_pc) {
+                0 => {
+                    if (self.flag != 0) {
+                        self.owed = 1;
+                        self.p_pc = END;
+                        return;
+                    }
+                    self.p_pc = if (weakening == .recheck_before_state) 10 else 1;
+                },
+                10 => {
+                    // The misplaced re-check: nothing published yet.
+                    if (self.flag != 0) {
+                        self.owed = 1;
+                        self.p_pc = END;
+                        return;
+                    }
+                    self.p_pc = 1;
+                },
+                1 => {
+                    self.state = FREE;
+                    self.p_pc = 2;
+                },
+                2 => {
+                    self.bit = 0;
+                    self.p_pc = 3;
+                },
+                3 => {
+                    self.budget += 1;
+                    self.p_pc = if (weakening == .none) 4 else END;
+                },
+                4 => self.p_pc = if (self.flag != 0) 5 else END,
+                5 => {
+                    // The take-back: the entitlement first (a claim or the
+                    // admission that won it took the block).
+                    if (self.budget == 0) {
+                        self.p_pc = END;
+                        return;
+                    }
+                    self.budget -= 1;
+                    self.p_pc = 6;
+                },
+                6 => {
+                    if (self.bit != 0) {
+                        self.budget += 1;
+                        self.p_pc = END;
+                        return;
+                    }
+                    self.bit = 1;
+                    self.p_pc = 7;
+                },
+                7 => {
+                    self.state = LIMBO;
+                    self.owed = 1;
+                    self.p_pc = END;
+                },
+                else => unreachable,
+            }
+        }
+
+        /// `quarantineBlock`: the flag, then the state read; `free` takes
+        /// the block out (entitlement → bit); anything else is the flag alone.
+        fn stepAdmit(self: *Self) void {
+            switch (self.q_pc) {
+                0 => {
+                    self.flag = 1;
+                    self.q_pc = 1;
+                },
+                1 => self.q_pc = if (self.state == FREE) 2 else END,
+                2 => {
+                    if (self.budget == 0) {
+                        self.q_pc = END;
+                        return;
+                    }
+                    self.budget -= 1;
+                    self.q_pc = 3;
+                },
+                3 => {
+                    if (self.bit != 0) {
+                        self.budget += 1;
+                        self.q_pc = END;
+                        return;
+                    }
+                    self.bit = 1;
+                    self.q_pc = 4;
+                },
+                4 => {
+                    self.state = QUARANTINED;
+                    self.owed = 1;
+                    self.q_pc = END;
+                },
+                else => unreachable,
+            }
+        }
+
+        /// A free-list claim: entitlement → bit → `allocated`.
+        fn stepClaim(self: *Self) void {
+            switch (self.c_pc) {
+                0 => {
+                    if (self.budget == 0) {
+                        self.c_pc = END;
+                        return;
+                    }
+                    self.budget -= 1;
+                    self.c_pc = 1;
+                },
+                1 => {
+                    if (self.bit != 0) {
+                        self.budget += 1;
+                        self.c_pc = END;
+                        return;
+                    }
+                    self.bit = 1;
+                    self.c_pc = 2;
+                },
+                2 => {
+                    self.state = ALLOCATED;
+                    self.c_took = 1;
+                    self.c_pc = END;
+                },
+                else => unreachable,
+            }
+        }
+
+        pub fn invariant(_: *const Self) !void {}
+
+        pub fn final(self: *const Self) !void {
+            if (self.bit == 0) return error.FlaggedBlockOnFreeList;
+            if (self.budget != 0) return error.BudgetDrift;
+            switch (self.state) {
+                ALLOCATED => if (self.c_took == 0) return error.Unowned,
+                LIMBO, QUARANTINED => if (self.owed == 0) return error.LostBlock,
+                else => return error.Unowned,
+            }
+        }
+    };
+}
+
+// ---------------------------------------------------------------------------
+// Model 4: the holder's non-carve takers under its ordering lock.
+// ---------------------------------------------------------------------------
+
+pub const HolderTakerWeakening = enum {
+    none,
+    /// The shipped trim claim and quarantine: the entitlement and the bit
+    /// taken without the holder's lock.
+    take_outside_lock,
+    /// The trim's return clears its bit and credits outside the lock.
+    return_outside_lock,
+};
+
+/// Block X is free on the holder (bit clear, one credit). The carve wants
+/// one block; the taker trims X and returns it. `lock` = 0 free, 1 the
+/// carve, 2 the taker; a thread meeting a held lock spins (its step
+/// changes nothing).
+pub fn HolderTakerModel(comptime weakening: HolderTakerWeakening) type {
+    return struct {
+        const Self = @This();
+        pub const thread_count: usize = 2;
+        const K = 0;
+        const T = 1;
+        const END: u8 = 0xff;
+
+        bit: u8 = 0,
+        state: u8 = FREE,
+        budget: u8 = 1,
+        lock: u8 = 0,
+        underflow: u8 = 0,
+        carve_assert: u8 = 0,
+        k_pc: u8 = 0,
+        k_pick: u8 = 0,
+        t_pc: u8 = 0,
+
+        pub fn init() Self {
+            return .{};
+        }
+
+        pub fn done(self: *const Self, t: usize) bool {
+            return switch (t) {
+                K => self.k_pc == END,
+                T => self.t_pc == END,
+                else => unreachable,
+            };
+        }
+
+        pub fn step(self: *Self, t: usize) void {
+            switch (t) {
+                K => self.stepCarve(),
+                T => self.stepTaker(),
+                else => unreachable,
+            }
+        }
+
+        fn acquire(self: *Self, who: u8) bool {
+            if (self.lock != 0) return false;
+            self.lock = who;
+            return true;
+        }
+
+        /// `DataBitmap.carveRun` over one block, then the mint.
+        fn stepCarve(self: *Self) void {
+            switch (self.k_pc) {
+                0 => {
+                    if (self.acquire(1)) self.k_pc = 1;
+                },
+                1 => {
+                    if (self.bit == 0) {
+                        self.k_pick = 1;
+                        self.k_pc = 2;
+                    } else {
+                        self.lock = 0; // Full
+                        self.k_pc = END;
+                    }
+                },
+                2 => {
+                    // `holderTakeBit` and its `assert(ok)`.
+                    if (self.bit != 0) {
+                        self.carve_assert = 1;
+                    } else {
+                        self.bit = 1;
+                        if (self.state == FREE) {
+                            if (self.budget == 0) self.underflow = 1 else self.budget -= 1;
+                        }
+                        self.state = VIRGIN;
+                    }
+                    self.k_pc = 3;
+                },
+                3 => {
+                    self.lock = 0;
+                    self.k_pc = 4;
+                },
+                4 => {
+                    self.state = ALLOCATED;
+                    self.k_pc = END;
+                },
+                else => unreachable,
+            }
+        }
+
+        /// `claimFreeForTrim` then `returnFromTrim`.
+        fn stepTaker(self: *Self) void {
+            const locked_take = weakening != .take_outside_lock;
+            const locked_return = weakening != .return_outside_lock;
+            switch (self.t_pc) {
+                0 => {
+                    if (!locked_take) {
+                        self.t_pc = 1;
+                    } else if (self.acquire(2)) self.t_pc = 1;
+                },
+                1 => {
+                    if (self.state != FREE or self.budget == 0) {
+                        if (locked_take) self.lock = 0;
+                        self.t_pc = END;
+                        return;
+                    }
+                    self.budget -= 1;
+                    self.t_pc = 2;
+                },
+                2 => {
+                    if (self.bit != 0) {
+                        self.budget += 1;
+                        if (locked_take) self.lock = 0;
+                        self.t_pc = END;
+                        return;
+                    }
+                    self.bit = 1;
+                    self.t_pc = 3;
+                },
+                3 => {
+                    if (locked_take) self.lock = 0;
+                    self.t_pc = 4;
+                },
+                4 => {
+                    self.state = TRIM;
+                    self.t_pc = 5;
+                },
+                5 => {
+                    self.state = FREE; // the return: the state first
+                    self.t_pc = 6;
+                },
+                6 => {
+                    if (!locked_return) {
+                        self.bit = 0;
+                        self.t_pc = 7;
+                    } else if (self.acquire(2)) self.t_pc = 7;
+                },
+                7 => {
+                    if (locked_return) self.bit = 0;
+                    self.budget += 1;
+                    self.t_pc = 8;
+                },
+                8 => {
+                    if (locked_return) self.lock = 0;
+                    self.t_pc = END;
+                },
+                else => unreachable,
+            }
+        }
+
+        pub fn invariant(self: *const Self) !void {
+            if (self.carve_assert != 0) return error.CarveTookASetBit;
+            if (self.underflow != 0) return error.BudgetUnderflow;
+        }
+
+        pub fn final(self: *const Self) !void {
+            if (self.k_pick != 0) {
+                if (self.bit != 1 or self.state != ALLOCATED) return error.CarveLost;
+                if (self.budget != 0) return error.PhantomCredit;
+            } else {
+                if (self.bit != 0 or self.state != FREE) return error.TrimNotReturned;
+                if (self.budget != 1) return error.BudgetDrift;
+            }
+        }
+    };
+}
+
+// ---------------------------------------------------------------------------
 // Tests: every model holds; every recorded weakening fails.
 // ---------------------------------------------------------------------------
 
@@ -381,10 +760,33 @@ test "2 a_carve_between_the_publication_stores_is_never_clobbered — holds; the
     try m.final();
 }
 
+test "3 a_quarantine_racing_a_finish_never_leaves_a_flagged_block_on_the_free_list — holds; the shipped finish (no re-check) and a re-check before the publication each fail" {
+    try explorer.expectHolds(QuarantineFinishModel(.none), .{});
+    try explorer.expectFails(QuarantineFinishModel(.no_recheck), .{}, error.FinalViolated);
+    try explorer.expectFails(QuarantineFinishModel(.recheck_before_state), .{}, error.FinalViolated);
+    // The shipped window by hand: the gate passes, the admission reads
+    // `limbo` (the flag alone), the publication lists the flagged block.
+    try std.testing.expectError(error.FlaggedBlockOnFreeList, replay(QuarantineFinishModel(.no_recheck), &.{ 0, 1, 1, 0, 0, 0, 2 }).final());
+    // The same schedule on the law: the re-check takes it back OWED.
+    var m = replay(QuarantineFinishModel(.none), &.{ 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 2 });
+    try m.final();
+}
+
+test "4 a_holders_carve_never_meets_a_bit_taken_between_its_scan_and_its_take — holds; a take outside the holder's lock (the carve's assert) and a return outside it (an underflow) each fail" {
+    try explorer.expectHolds(HolderTakerModel(.none), .{});
+    try explorer.expectFails(HolderTakerModel(.take_outside_lock), .{}, error.InvariantViolated);
+    try std.testing.expectError(error.CarveTookASetBit, replay(HolderTakerModel(.take_outside_lock), &.{ 0, 0, 1, 1, 1, 0 }).invariant());
+    try explorer.expectFails(HolderTakerModel(.return_outside_lock), .{}, error.InvariantViolated);
+}
+
 test "state counts: the models are small enough to re-run on every gate" {
     var report: explorer.Report = undefined;
     try explorer.explore(LocalModel(.none), std.testing.allocator, .{}, &report);
     try std.testing.expect(report.states > 20 and report.states < 20_000);
     try explorer.explore(HolderModel(.none), std.testing.allocator, .{}, &report);
     try std.testing.expect(report.states > 3 and report.states < 200);
+    try explorer.explore(QuarantineFinishModel(.none), std.testing.allocator, .{}, &report);
+    try std.testing.expect(report.states > 20 and report.states < 20_000);
+    try explorer.explore(HolderTakerModel(.none), std.testing.allocator, .{}, &report);
+    try std.testing.expect(report.states > 10 and report.states < 5_000);
 }

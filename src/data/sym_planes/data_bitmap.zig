@@ -324,6 +324,21 @@ pub const DataBitmap = struct {
     /// `SQUEEZEFS_TEST_HOLDER_GRANT_EXHAUST_N`: the next N drains answer the
     /// window-full class.
     test_exhaust_drains: Atomic(u32) = .init(0),
+    /// Test seams (null in the product): the carve calls `test_carve_station`
+    /// between its run's scan and its first take, the ordering lock held; a
+    /// non-carve take that finds the lock held calls `test_contended_station`
+    /// before it waits.
+    test_carve_station: ?CarveStation = null,
+    test_contended_station: ?ContendedStation = null,
+
+    pub const CarveStation = struct {
+        ctx: *anyopaque,
+        afterScan: *const fn (ctx: *anyopaque, run_start: u64) void,
+    };
+    pub const ContendedStation = struct {
+        ctx: *anyopaque,
+        contended: *const fn (ctx: *anyopaque) void,
+    };
 
     pub fn init(gpa: Allocator, alloc: *BlockAllocator, cfg: Config) Allocator.Error!*DataBitmap {
         assert(cfg.blocks == alloc.capacityBlocks());
@@ -472,6 +487,7 @@ pub const DataBitmap = struct {
         self.mutations.lock();
         defer self.mutations.unlock();
         const run = self.alloc.lowestClearRun(frontier, cap) orelse self.alloc.lowestClearRun(0, cap) orelse return null;
+        if (self.test_carve_station) |st| st.afterScan(st.ctx, run.start);
         var taken: u64 = 0;
         while (taken < run.len) : (taken += 1) {
             // Every bit of the run read clear under the lock and only this
@@ -1138,6 +1154,7 @@ pub const RamJournal = struct {
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
+const sync_notify = @import("../../sync/notify.zig");
 
 fn testAlloc(blocks: u64) !*BlockAllocator {
     return BlockAllocator.init(testing.allocator, .{ .vol_tag = 0xDA7A, .vol = 0, .block_size = 4096, .capacity_bytes = blocks * 4096 });
@@ -1615,6 +1632,89 @@ fn dataBitmapPageFuzz(_: void, smith: *std.testing.Smith) !void {
             try std.testing.expectEqualSlices(u8, img, &re);
         } else |_| {}
     }
+}
+
+test "a trim claim and a quarantine on an armed holder take their bit under the holder's ordering lock: a claim landing while the carve holds the lock between its scan and its take waits the carve out (its run stays whole, the claim finds the block carved); the quarantine's take moves the population with its bit (0003 §Y.4)" {
+    const a = try testAlloc(256);
+    defer a.deinit();
+    var i: u64 = 0;
+    while (i < 10) : (i += 1) _ = try a.allocateBlock();
+    const bm = try testBitmap(a, 3);
+    defer bm.deinit();
+    a.finish_free_sink = bm.finishFreeSink();
+    // Block 4 back on the holder's free list: state free, bit clear, one credit.
+    try testing.expectEqual(block_alloc.BeginFree.terminal, try a.freeBlock(4));
+    try testing.expectEqual(block_alloc.State.free, a.stateOf(4));
+    const Race = struct {
+        a: *BlockAllocator,
+        done: Atomic(u32) = .init(0),
+        waiting: Atomic(u32) = .init(0),
+        seen: sync_notify.Notify = .init,
+        thread: ?std.Thread = null,
+        guard: ?block_alloc.InflightAllocGuard = null,
+        took_in_window: bool = false,
+
+        fn claim(self: *@This()) void {
+            self.guard = self.a.claimFreeForTrim(4);
+            self.done.store(1, .release);
+            self.seen.notifyWaiters(testing.io);
+        }
+
+        fn contended(ctx: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.waiting.store(1, .release);
+            self.seen.notifyWaiters(testing.io);
+        }
+
+        fn afterScan(ctx: *anyopaque, run_start: u64) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            std.debug.assert(run_start == 4);
+            self.thread = std.Thread.spawn(.{}, claim, .{self}) catch @panic("spawn");
+            // Until the claim returned, or announced it waits for the lock.
+            while (true) {
+                var n = self.seen.notified();
+                _ = n.enable(testing.io);
+                if (self.done.load(.acquire) != 0 or self.waiting.load(.acquire) != 0) {
+                    n.cancel(testing.io);
+                    break;
+                }
+                n.waitUncancelable(testing.io);
+            }
+            if (self.done.load(.acquire) == 0) return;
+            if (self.guard) |*g| {
+                // Taken inside the carve's critical section: handed back so
+                // the carve's take holds (the defect is recorded).
+                self.took_in_window = true;
+                self.a.returnFromTrim(4, g);
+                self.guard = null;
+            }
+        }
+    };
+    var race: Race = .{ .a = a };
+    bm.test_carve_station = .{ .ctx = &race, .afterScan = &Race.afterScan };
+    bm.test_contended_station = .{ .ctx = &race, .contended = &Race.contended };
+    const run = bm.carveRun(0, 1).?;
+    bm.test_carve_station = null;
+    race.thread.?.join();
+    bm.test_contended_station = null;
+    try testing.expect(!race.took_in_window);
+    try testing.expectEqual(@as(u64, 4), run.start);
+    try testing.expect(race.guard == null);
+    try testing.expectEqual(block_alloc.State.virgin, a.stateOf(4));
+    try testing.expectEqual(@as(u64, 0), a.freeBlocksCount());
+    try testing.expect(bm.populationDriftCheck());
+    // The quarantine's free arm: block 5 back on the list, then admitted —
+    // its bit stays set in the holder's bitmap and the population says so.
+    try testing.expectEqual(block_alloc.BeginFree.terminal, try a.freeBlock(5));
+    try testing.expect(a.quarantineBlock(5, 7));
+    try testing.expect(a.bitIsSet(5));
+    try testing.expect(bm.populationDriftCheck());
+    var out: [4]u64 = undefined;
+    const n = a.releaseQuarantine(7, &.{}, &out);
+    try testing.expectEqual(@as(usize, 1), n);
+    a.finishFree(out[0]);
+    try testing.expect(!a.bitIsSet(5));
+    try testing.expect(bm.populationDriftCheck());
 }
 
 test "fuzz: the data bitmap page decoder is total on arbitrary and restamped pages; a decoded page re-encodes byte-identically" {

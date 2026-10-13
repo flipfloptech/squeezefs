@@ -324,6 +324,12 @@ pub const PlaneGate = struct {
 /// BIT and journals the kind-5 CLEAR delta instead of (as well as, in the
 /// dense shape) the local insert; `false` ⇒ the bit was already clear — a
 /// DOUBLE FREE.
+/// `test_finish_station`'s hook: the finish of `idx` is past its gate.
+pub const FinishStation = struct {
+    ctx: *anyopaque,
+    passedGate: *const fn (ctx: *anyopaque, idx: u64) void,
+};
+
 pub const FinishFreeSink = struct {
     ctx: ?*anyopaque,
     noteFinishFree: *const fn (?*anyopaque, vol_tag: u64, idx: u64) bool,
@@ -579,6 +585,10 @@ pub const BlockAllocator = struct {
     shared_gate: ?SharedFreeGate = null,
     untracked_gate: ?UntrackedFreeGate = null,
     space_pending: ?SpacePending = null,
+    /// Test seam (null in the product): `finishFree` calls it once its
+    /// quarantine gate passed, before the publication — the window a
+    /// concurrent admission lands in.
+    test_finish_station: ?FinishStation = null,
 
     /// Sizes the table from `capacity_bytes / block_size`; every block
     /// virgin. The table bytes are the budget charge (`tableBytes`).
@@ -1209,6 +1219,7 @@ pub const BlockAllocator = struct {
             stats.block_quarantine_deferred_frees.inc();
             return;
         }
+        if (self.test_finish_station) |st| st.passedGate(st.ctx, idx);
         if (self.grace) |g| if (g.vtable.defer_(g.ctx, idx, self.cfg.block_size)) {
             stats.del_obj.inc();
             return;
@@ -2556,6 +2567,43 @@ test "rung 6 quarantine: a free block leaves the list under the epoch, a live bl
     try testing.expectEqual(@as(u64, 1), a.quarantine_count.load(.monotonic));
     try testing.expectEqual(@as(usize, 1), a.releaseQuarantine(11, &.{}, &one));
     try testing.expectEqual(@as(u64, 0), a.quarantine_count.load(.monotonic));
+}
+
+test "a quarantine admitted between a finish's quarantine gate and its publication leaves no flagged block on the free list: the finish takes it back OWED and the cohort's release publishes it (0003 §Y.3)" {
+    const a = try BlockAllocator.init(testing.allocator, .{ .vol_tag = 1, .vol = 0, .block_size = 4096, .capacity_bytes = 32 * 4096 });
+    defer a.deinit();
+    var i: u64 = 0;
+    while (i < 4) : (i += 1) _ = try a.allocateBlock();
+    const Admit = struct {
+        a: *BlockAllocator,
+        epoch: u64,
+        fired: bool = false,
+        fn passed(ctx: *anyopaque, idx: u64) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.fired = true;
+            // The block reads `limbo` here: the admission is the flag alone.
+            _ = self.a.quarantineBlock(idx, self.epoch);
+        }
+    };
+    var adm: Admit = .{ .a = a, .epoch = 9 };
+    a.test_finish_station = .{ .ctx = &adm, .passedGate = &Admit.passed };
+    const free0 = a.freeBlocksCount();
+    try testing.expectEqual(BeginFree.terminal, try a.freeBlock(2));
+    a.test_finish_station = null;
+    try testing.expect(adm.fired and a.isQuarantined(2));
+    // The law: a quarantined block is never reallocatable.
+    try testing.expect(a.bitIsSet(2));
+    try testing.expect(a.stateOf(2) != .free);
+    try testing.expectEqual(free0, a.freeBlocksCount());
+    // The cohort's release (a live-owner admission: the caller names it) publishes it.
+    var out: [4]u64 = undefined;
+    const n = a.releaseQuarantine(9, &.{2}, &out);
+    try testing.expectEqual(@as(usize, 1), n);
+    for (out[0..n]) |idx| a.finishFree(idx);
+    try testing.expectEqual(State.free, a.stateOf(2));
+    try testing.expect(!a.bitIsSet(2) and !a.isQuarantined(2));
+    try testing.expectEqual(free0 + 1, a.freeBlocksCount());
+    try testing.expectEqual(@as(u64, 0), a.quarantine_count.load(.acquire));
 }
 
 test "stats JSON names every family" {

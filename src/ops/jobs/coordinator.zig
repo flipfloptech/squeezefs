@@ -32,6 +32,7 @@ const block_alloc = @import("../../data/block_alloc.zig");
 const custody = @import("../../data/sym_planes/custody.zig");
 const layout = @import("../../data/layout.zig");
 const plane_mod = @import("../../data/plane.zig");
+const write_seams = @import("../../data/write_seams.zig");
 const records = @import("records.zig");
 const fabric_mod = @import("fabric.zig");
 const lease_mod = @import("lease.zig");
@@ -208,7 +209,8 @@ pub const DataWero = struct {
 // ---------------------------------------------------------------------------
 
 pub const AllocSink = struct {
-    plane: *plane_mod.DataPlane,
+    /// The plane's volume table (each row's allocator).
+    vols: *const write_seams.Volumes,
     epochs: custody.DeadEpochSequence = .{},
     wero: ?*DataWero,
     /// The enrolled table (the holder's `pr_key`).
@@ -221,7 +223,7 @@ pub const AllocSink = struct {
     const vt: lease_mod.QuarantineSink.VTable = .{ .mintEpoch = &mintEpoch, .admit = &admit, .preempt = &preemptFn, .release = &releaseFn, .isQuarantined = &isQuarantined };
 
     fn allocOf(self: *AllocSink, vol_tag: u64) ?*block_alloc.BlockAllocator {
-        const v = self.plane.vols.byTag(vol_tag) orelse return null;
+        const v = self.vols.byTag(vol_tag) orelse return null;
         return v.alloc;
     }
     fn mintEpoch(ctx: *anyopaque) u64 {
@@ -242,7 +244,7 @@ pub const AllocSink = struct {
     fn releaseFn(ctx: *anyopaque, epoch: u64, _: u32) void {
         const self: *AllocSink = @ptrCast(@alignCast(ctx));
         var out: [records.SHARD_DEST_MAX]u64 = undefined;
-        for (self.plane.vols.rows[0..self.plane.vols.n()]) |*r| {
+        for (self.vols.rows[0..self.vols.n()]) |*r| {
             const a = r.*.?.alloc;
             _ = a.releaseQuarantine(epoch, &.{}, &out);
         }
@@ -1377,7 +1379,7 @@ pub const Node = struct {
             .store = .{ .be = in.backend },
             .plane = in.plane,
             .fabric = undefined,
-            .sink = .{ .plane = in.plane, .wero = in.wero },
+            .sink = .{ .vols = &in.plane.vols, .wero = in.wero },
             .table = undefined,
             .coord = undefined,
             .verify = .{ .plane = in.plane },
@@ -1617,4 +1619,35 @@ test "Options.fromEnv: the derived worker count, the defaults, the seams; the co
     try testing.expectEqual(@as(u32, 3), o2.workers);
     try testing.expectEqual(@as(u8, 25), o2.cpu_limit);
     try testing.expectEqual(@as(u64, 250 * std.time.ns_per_ms), o2.park_delay_ns);
+}
+
+test "the quarantine sink returns an expired lease's cohort to the free list at the drain proof: two pre-allocated unpublished destinations (minted, never published — flagged alone) and a free-listed one (taken out, OWED) leave the quarantine and read free; nothing stays allocated, in limbo or flagged — fsck's leaked arm has nothing to find (0003 §Y.2)" {
+    const wt = @import("../../data/write_testing.zig");
+    const f = try wt.Fixture.init(testing.allocator, 32);
+    defer f.deinit();
+    const a = f.alloc_a;
+    // Blocks 0..3 minted; 3 published and terminal-freed: on the free list.
+    var mints: [4]block_alloc.Minted = undefined;
+    for (&mints) |*m| m.* = try a.allocateBlock();
+    a.publishBlock(mints[3].idx);
+    try testing.expectEqual(block_alloc.BeginFree.terminal, try a.freeBlock(mints[3].idx));
+    const free0 = a.freeBlocksCount();
+    var sink: AllocSink = .{ .vols = &f.vols, .wero = null };
+    const q = sink.sink();
+    const dests = [_]DestTuple{ .{ .vol_tag = wt.VOL_A, .block_idx = mints[0].idx }, .{ .vol_tag = wt.VOL_A, .block_idx = mints[1].idx }, .{ .vol_tag = wt.VOL_A, .block_idx = mints[3].idx } };
+    const epoch = q.vtable.mintEpoch(q.ctx);
+    for (dests) |d| q.vtable.admit(q.ctx, d, epoch);
+    for (dests) |d| try testing.expect(q.vtable.isQuarantined(q.ctx, d));
+    try testing.expectEqual(free0 - 1, a.freeBlocksCount()); // the free-listed one left the list
+    // The landed preempt is the drain proof.
+    q.vtable.release(q.ctx, epoch, 1);
+    for (dests) |d| {
+        try testing.expect(!q.vtable.isQuarantined(q.ctx, d));
+        try testing.expectEqual(block_alloc.State.free, a.stateOf(d.block_idx));
+        try testing.expect(!a.bitIsSet(d.block_idx));
+    }
+    try testing.expectEqual(free0 + 2, a.freeBlocksCount());
+    try testing.expectEqual(@as(u64, 0), a.quarantine_count.load(.acquire));
+    // The block never admitted keeps its owner.
+    try testing.expectEqual(block_alloc.State.allocated, a.stateOf(mints[2].idx));
 }

@@ -3,7 +3,7 @@
 Charter §5.5 "Death and recovery (§5.9)", §5.3 "Space" (the pending-free coverage gate), "Tokens",
 "Directory striping", "Cross-owner namespace ops". The items close what
 `docs/evidence/rung-10-striping-wire.md` §3.6 left owed around a dead member's recovery. Decision
-rows: 0002 row 508; 0003 §U. Venue: the macOS `container` (`7.2.6-sqz`, 9 vCPU, 16 GiB), shared
+rows: 0002 rows 508, 509; 0003 §U. Venue: the macOS `container` (`7.2.6-sqz`, 9 vCPU, 16 GiB), shared
 live with the `.wt-jobs2` and `.wt-gatefix` agents.
 
 ## 1. The recovering manager's abort (item 1)
@@ -320,3 +320,22 @@ mutations) → open intents 0, stuck 0; `ls` = `find` and the stat digest equal 
 counted name listed (at most one more) → umount B, A → `fsck --offline --scrub` 0 findings. The run:
 B parked 626 ms after A's kill, reclaimed 827 ms after it, 753 creates across the death, 753 entries
 listed, fsck 819 inodes, 0 findings.
+
+## 7. Gates
+
+Items 1–4 landed at `da080b7`: Linux 33/46 steps, 2,604/2,673 tests (66 skipped, 3 failed), macOS
+28/28 steps, 2,164/2,191 (27 skipped). The three Linux failures were `dev`'s own at the time
+(`tcp_e2e_linux` "listener" and fsck "zero false positives" failed identically on `39590f0`; the
+ONLINE FSCK row below).
+
+Items 1 (the structure law), 5 and 6 land at `dc7d0e7`: macOS `zig build gate` 28/28 steps,
+2,151/2,178 tests (27 skipped). Linux `zig build gate` 35/46 steps (1 failed), 2,608/2,677 tests (68
+skipped, 1 failed): unit 2,508 pass / 66 skip, rails 16, smoke 83 pass / 2 skip / 1 fail. The one
+failure is `smoke: ONLINE FSCK THROUGH THE ADMIN LANE` (this run: `scrub --online` read the live
+job table as `HolderUnreachable, AGAIN` and printed no report; the earlier run: `cannot create x53:
+File exists`), a single-daemon admin-lane row this work does not touch. It fails the same way on
+`dev` from the main checkout (`/build/tmp/fsck-online-dev-{1,2}.log`) and in the `.wt-stripe` and
+`.wt-umount` gates; the row belongs to the `.wt-jobs2` agent's assignment. In that gate the item-6
+rows ran green: phase 4 recovered C 11,398 ms after its kill, A created 28,980 more across C's
+death, 50,230 entries listed; the dead manager row parked B 616 ms after A's kill and reclaimed 828
+ms after it, 982 creates across the death, fsck 1,048 inodes, 0 findings.

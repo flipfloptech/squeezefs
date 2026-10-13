@@ -2823,6 +2823,56 @@ test "two members over one volume: blocks THIS member freed and ANOTHER member r
     try testing.expectEqual(settle0, stats.read_settle_lost_serialized.load());
 }
 
+/// Member A's side of the two-member rows below: A's own allocator over
+/// the fixture's volume. A mints `idx` for a file of its own and writes
+/// `fill` over the block (the DMA), and publishes it.
+const ForeignWriter = struct {
+    alloc: *block_alloc.BlockAllocator,
+
+    fn init() !ForeignWriter {
+        return .{ .alloc = try block_alloc.BlockAllocator.init(testing.allocator, .{ .vol_tag = Fixture.vol_tag, .vol = 0, .block_size = Fixture.bs, .capacity_bytes = Fixture.dev_blocks * Fixture.bs }) };
+    }
+
+    fn deinit(self: *ForeignWriter) void {
+        self.alloc.deinit();
+    }
+
+    fn mintAndWrite(self: *ForeignWriter, f: *Fixture, idx: u64, fill: ?u8) !Mapping {
+        const m = try self.alloc.allocateSpecificBlock(idx);
+        if (fill) |byte| @memset(f.device[@intCast(idx * Fixture.bs)..][0..@intCast(Fixture.bs)], byte);
+        self.alloc.publishBlock(idx);
+        return Mapping.wholeBlock(Fixture.vol_tag, idx * Fixture.bs, m.stamp);
+    }
+};
+
+test "two members over one volume: B caches A's block (a cell B never touched), A deletes the file, frees the block and re-mints it with new bytes for another file — B's read of the new file serves the NEW bytes, never the stale cached ones (0003 §W.2)" {
+    const io = testing.io;
+    const f = try Fixture.init(testing.allocator, .{});
+    defer f.deinit();
+    var a: ForeignWriter = try .init();
+    defer a.deinit();
+    const buf = try alignedBuf(testing.allocator, 1 << 20);
+    defer testing.allocator.free(buf);
+    // A's file F: block 9 (the fixture's pattern bytes). B reads it twice:
+    // the cold fill deposits it, the second read is a tier hit.
+    f.size = Fixture.bs;
+    f.bindings[0] = try a.mintAndWrite(f, 9, null);
+    const key9 = BlockKey.init(Fixture.vol_tag, 9 * Fixture.bs);
+    for (0..2) |_| {
+        try testing.expectEqual(@as(usize, 1 << 20), try f.rp.read(io, 7, 0, 1 << 20, .{ .buf = buf }, .{}));
+        try Fixture.expected(9 * Fixture.bs, buf);
+    }
+    try testing.expect(f.rp.hot.contains(key9));
+    // A deletes F (the token recall reaches B — today it purges nothing),
+    // frees block 9 and re-mints it for F2 with new bytes.
+    f.bindings[0] = null;
+    try testing.expectEqual(block_alloc.BeginFree.terminal, try a.alloc.freeBlock(9));
+    f.bindings[0] = try a.mintAndWrite(f, 9, 0xC3);
+    // B reads F2: the new bytes.
+    try testing.expectEqual(@as(usize, 1 << 20), try f.rp.read(io, 8, 0, 1 << 20, .{ .buf = buf }, .{}));
+    for (buf) |byte| try testing.expectEqual(@as(u8, 0xC3), byte);
+}
+
 test "a packed tenant whose binding moves between its window DMA and the recheck re-resolves: the old tenant's bytes are never served (the read path's (a) ∧ (b) on the window leg)" {
     const io = testing.io;
     const f = try Fixture.init(testing.allocator, .{});

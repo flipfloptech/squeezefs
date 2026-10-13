@@ -504,6 +504,34 @@ test "a ship that fails leaves the intent OPEN (abandoned on the register, never
     try testing.expectEqual(passes, ops.stats.xv_cadence_passes.load());
 }
 
+test "an abandoned create whose name a retry took meanwhile is COMPENSATED by the roll-forward (found by the shared hot directory row: fsck C9 found a live inode named by no dentry after kill -9 of a stripes' holder — a create's ship failed against the corpse, the shell retried the SAME name and won it after the recovery, and the roll-forward skipped the refused insert and retired, orphaning the first attempt's child): the minted child destroyed, the intent retired, the retry's name intact, counted" {
+    const gpa = testing.allocator;
+    const f = try TwoHolders.init(gpa, testing.io, .{ .ship_fail_at = 1 }, .{});
+    defer f.deinit();
+    try f.b.seedDir(DIR_B);
+    const s0 = Snapshot.take();
+    // The first attempt: the child minted at A, the insert's ship fails —
+    // the intent stays open, the caller answered EAGAIN.
+    const first = f.a.mint();
+    const plan = steps.planCreate(.{ .parent = DIR_B, .name = "f", .child = first, .mode = S.IFREG | 0o644, .uid = 1, .gid = 2, .now = 1_000 });
+    try testing.expectError(error.ShipFailed, f.a.run(&plan));
+    try testing.expect((try f.a.inode(first)) != null);
+    try testing.expect(f.a.plane.register.anyAbandoned());
+    // The caller's retry of the same name lands with a NEW child.
+    const second = try f.a.create(DIR_B, "f", S.IFREG | 0o644);
+    try testing.expectEqual(second, (try f.b.dentry(DIR_B, "f")).?.child);
+    // The roll-forward re-meets the refusal: it compensates instead of
+    // skipping — the first child goes, the intent retires.
+    const comp0 = ops.stats.xv_recovered_compensated.load();
+    try testing.expectEqual(@as(u32, 1), try f.a.plane.cadenceTick(clock.monotonicNs()));
+    try testing.expectEqual(comp0 + 1, ops.stats.xv_recovered_compensated.load());
+    try testing.expect((try f.a.inode(first)) == null);
+    try testing.expectEqual(second, (try f.b.dentry(DIR_B, "f")).?.child);
+    try testing.expect((try f.a.inode(second)) != null);
+    try f.noOpenIntents();
+    try f.closureHolds(s0.minted, s0.retired, s0.open);
+}
+
 test "every initiator crash window of a foreign create rolls forward to exactly ONE outcome: after step 0 (+ the intent), after the foreign step, before the retirement — the next mount's recovery completes the plan and retires; recovery is idempotent across repeated mounts" {
     const gpa = testing.allocator;
     for ([_]u32{ 0, 1, 2 }) |window| {

@@ -102,6 +102,10 @@ pub const stats = struct {
     pub var xv_completed: counters.ShardedCounter = .{};
     pub var xv_recovered: counters.ShardedCounter = .{};
     pub var xv_compensated: counters.ShardedCounter = .{};
+    /// Roll-forwards that re-met a LIVE refusal (the caller's retry took
+    /// the name while the intent stood open) and compensated what this
+    /// intent alone had put in effect.
+    pub var xv_recovered_compensated: counters.ShardedCounter = .{};
     /// A ship that failed left the intent open for the cadence.
     pub var xv_abandoned: counters.ShardedCounter = .{};
     /// A LOCAL step's device error mid-plan (the fail-stop class): must
@@ -867,8 +871,28 @@ pub fn Plane(comptime Store: type) type {
                     try self.invertOne(tx_id, i, plan.steps[i], scope, now);
                 }
             } else {
+                var done: Done = .{ .tx_id = tx_id };
                 for (plan.slice(), 0..) |s, i| {
-                    _ = try self.dispatch(tx_id, i, s, .none, scope, now, .any);
+                    const d = try self.dispatch(tx_id, i, s, .none, scope, now, .any);
+                    done.outcomes[i] = d.out;
+                    done.len = i + 1;
+                    if (d.out.status != .foreign_skipped) continue;
+                    // A LIVE refusal re-met by the roll-forward: the op
+                    // answered EAGAIN when this intent was abandoned, and
+                    // the caller's retry took the name meanwhile. Skipping
+                    // the step and retiring would orphan what this intent
+                    // put in effect, so it compensates like the live
+                    // path — inverting the steps applied now and the fresh
+                    // mints found applied (an ino minted for this intent is
+                    // its alone; any other step's earlier effect cannot be
+                    // told from a later op's and stands).
+                    for (plan.steps[0..i], done.outcomes[0..i]) |step, *o| {
+                        if (o.status == .already_applied and step.isFreshMint()) o.status = .applied;
+                    }
+                    try self.compensate(tx_id, home, &plan, i, &done, scope, now);
+                    self.register.forget(tx_id);
+                    stats.xv_recovered_compensated.inc();
+                    return;
                 }
             }
             self.apply.barrier() catch |e| return mapApply(e);

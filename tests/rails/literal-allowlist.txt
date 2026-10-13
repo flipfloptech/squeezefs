@@ -488,7 +488,7 @@ src/meta/sym/wire_plane.zig:263 | 4 | a table entry (switch/range arm) — the c
 src/meta/sym/xv/applier.zig:295 | 12 | a size — OWED: derive from derive.Facts or document the physical/format reason
 src/meta/sym/xv/intent.zig:160 | 8 | OWED: derive it or document it on the line (charter §1.5)
 src/meta/sym/xv/intent.zig:191 | 8 | OWED: derive it or document it on the line (charter §1.5)
-src/meta/sym/xv/ops.zig:310 | 1024 | OWED: derive it or document it on the line (charter §1.5)
+src/meta/sym/xv/ops.zig:314 | 1024 | OWED: derive it or document it on the line (charter §1.5)
 src/meta/sym/xv/record_ship.zig:535 | 256 | OWED: derive it or document it on the line (charter §1.5)
 src/meta/sym/xv/stripe.zig:152 | 10 | OWED: derive it or document it on the line (charter §1.5)
 src/meta/sym/xv/stripe.zig:153 | 10 | a percentage — OWED: derive it (charter §1.5) or document the measured reason

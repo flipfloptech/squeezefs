@@ -7,6 +7,8 @@ set -euo pipefail
 P=$1; B=${2:-$(cd "$(dirname "$0")/../.." && pwd)/zig-out-dev/bin/squeezefs}
 # The target layout: dev_mount.sh by default; perf_mount.sh with SQZ_TGT=/build/perf/targets SQZ_STATE=/build/perf.
 T=${SQZ_TGT:-/build/dev/targets}; SET=${SQZ_STATE:-/build/dev/set}; MNT=/mnt/sqz; LOG=$SET/daemon.log
+# The layout words are this script's, not the daemon's (its knob screen warns on every SQZ_*).
+unset SQZ_TGT SQZ_STATE
 cd /
 if mountpoint -q $MNT; then $B umount $MNT; fi
 while pgrep -x squeezefs >/dev/null; do sleep 0.2; done

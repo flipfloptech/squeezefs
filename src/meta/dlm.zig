@@ -37,6 +37,7 @@
 //! guards outlived the answer (`dlm_inode_key_waits` p50 ≤ 16 µs).
 
 const std = @import("std");
+const core_sort = @import("../core/sort.zig");
 const testkit = @import("../core/testkit.zig");
 const Io = std.Io;
 const assert = std.debug.assert;
@@ -314,7 +315,7 @@ fn PlanOf(comptime cap: usize) type {
         }
 
         fn canonical(self: *Self) []const Entry {
-            std.mem.sort(Entry, self.entries[0..self.len], {}, lessThan);
+            core_sort.stable(Entry, self.entries[0..self.len], {}, lessThan);
             var out: usize = 0;
             for (self.entries[0..self.len]) |e| {
                 if (out > 0 and self.entries[out - 1].stripe == e.stripe) continue;

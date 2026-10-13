@@ -34,6 +34,7 @@
 //! `journal_core.CoreGeometry` mapping places the bytes.
 
 const std = @import("std");
+const core_sort = @import("../core/sort.zig");
 const fuzzkit = @import("../core/fuzzkit.zig");
 const Allocator = std.mem.Allocator;
 const checksum = @import("../core/checksum.zig");
@@ -676,7 +677,7 @@ pub fn alignedOps(arena: Allocator, layout: RingLayout, geo: CoreGeometry, start
     for (runs.items) |run| {
         if (run.lo % grain != 0 or run.hi % grain != 0) return error.Corrupt;
     }
-    std.mem.sort(WriteOp, ops, {}, opLessThan);
+    core_sort.stable(WriteOp, ops, {}, opLessThan);
     const out = try arena.alloc(WriteOp, runs.items.len);
     for (runs.items, 0..) |run, i| {
         // Grain-aligned so a direct write needs no bounce; the io layer's
@@ -761,7 +762,7 @@ pub const Span = struct { lo: u64, hi: u64 };
 pub fn rmwSpans(arena: Allocator, grain: u64, ops: []const WriteOp) Allocator.Error![]Span {
     const spans = try arena.alloc(Span, ops.len);
     for (ops, 0..) |op, i| spans[i] = .{ .lo = op.offset - op.offset % grain, .hi = derive.ceilDiv(op.end(), grain) * grain };
-    std.mem.sort(Span, spans, {}, struct {
+    core_sort.stable(Span, spans, {}, struct {
         fn lt(_: void, a: Span, b: Span) bool {
             return a.lo < b.lo or (a.lo == b.lo and a.hi < b.hi);
         }

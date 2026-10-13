@@ -71,6 +71,7 @@
 //! The kill matrix below pins both.
 
 const std = @import("std");
+const core_sort = @import("../core/sort.zig");
 const testkit = @import("../core/testkit.zig");
 const builtin = @import("builtin");
 const linux = std.os.linux;
@@ -2295,7 +2296,7 @@ pub const KvBackend = struct {
             }
         }
         const page = out.items[first..];
-        std.mem.sort(tree.KeyValue, page, {}, struct {
+        core_sort.stable(tree.KeyValue, page, {}, struct {
             fn lt(_: void, a: tree.KeyValue, b: tree.KeyValue) bool {
                 return key.lessThan(a.key, b.key);
             }

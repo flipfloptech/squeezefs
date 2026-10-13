@@ -24,6 +24,7 @@
 //! backend, slot 0 native and 63 rotor slots as guest trees on it.
 
 const std = @import("std");
+const core_sort = @import("../core/sort.zig");
 const builtin = @import("builtin");
 const linux = std.os.linux;
 const Allocator = std.mem.Allocator;
@@ -403,7 +404,7 @@ pub const MetaSet = struct {
                 try rangeIn(t, gpa, start, end, max, &merged);
             }
         }
-        std.mem.sort(tree.KeyValue, merged.items, {}, struct {
+        core_sort.stable(tree.KeyValue, merged.items, {}, struct {
             fn lt(_: void, a: tree.KeyValue, b: tree.KeyValue) bool {
                 return key.lessThan(a.key, b.key);
             }

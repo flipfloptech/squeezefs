@@ -75,6 +75,7 @@
 //! admission dropped on the floor leaks ring budget forever.
 
 const std = @import("std");
+const core_sort = @import("../core/sort.zig");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const counters = @import("../core/counters.zig");
@@ -1434,7 +1435,7 @@ pub const Conveyor = struct {
             }
         }
         const lock_set = try arena.dupe(*CachedNode, all);
-        std.mem.sort(*CachedNode, lock_set, {}, addrLess);
+        core_sort.stable(*CachedNode, lock_set, {}, addrLess);
         var out: usize = 0;
         for (lock_set) |l| {
             if (out > 0 and lock_set[out - 1].addr == l.addr) continue;
@@ -2130,7 +2131,7 @@ pub const Conveyor = struct {
                 n += 1;
             }
             const lock_set = arena.dupe(*CachedNode, leaves) catch return self.divergedFromReplay(site, "out of memory building the rollback's lock set; the window's records stay applied");
-            std.mem.sort(*CachedNode, lock_set, {}, addrLess);
+            core_sort.stable(*CachedNode, lock_set, {}, addrLess);
             var out: usize = 0;
             for (lock_set) |l| {
                 if (out > 0 and lock_set[out - 1].addr == l.addr) continue;
@@ -2206,7 +2207,7 @@ pub const Conveyor = struct {
             }
             if (n != comps.len) break;
             const lock_set = arena.dupe(*CachedNode, leaves) catch break;
-            std.mem.sort(*CachedNode, lock_set, {}, addrLess);
+            core_sort.stable(*CachedNode, lock_set, {}, addrLess);
             var out: usize = 0;
             for (lock_set) |l| {
                 if (out > 0 and lock_set[out - 1].addr == l.addr) continue;

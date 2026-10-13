@@ -873,7 +873,9 @@ pub const Worker = struct {
     /// The read shard's heartbeat fiber: a renewal every `heartbeat_ms`
     /// (the lease clock extended by each ack); a non-live verdict or a dead
     /// wire raises `cancel`. Parks on the worker's own notify (never a
-    /// sleep); `stopRequested` ends it.
+    /// sleep), so both ends wake it at once: `stopRequested` (the walk's
+    /// end) ends it, and the worker's `requestStop` raises the walk's
+    /// cancel (the walk ends at its next step, not a heartbeat period later).
     const Heartbeat = struct {
         worker: *Worker,
         ref: frames.ShardRef,
@@ -882,34 +884,37 @@ pub const Worker = struct {
         deadline_ns: Atomic(u64),
         cancel: Atomic(bool) = .init(false),
         stop: Atomic(bool) = .init(false),
-        wake: sync.Notify = .init,
         beats: u64 = 0,
 
         fn stopRequested(self: *Heartbeat, io: Io) void {
             self.stop.store(true, .release);
-            self.wake.notifyWaiters(io);
+            self.worker.wake.notifyWaiters(io);
+        }
+
+        /// The walk's end, or the worker's stop (which cancels the walk).
+        fn ended(self: *Heartbeat) bool {
+            if (self.stop.load(.acquire)) return true;
+            if (!self.worker.stop.load(.acquire)) return false;
+            self.cancel.store(true, .release);
+            return true;
         }
 
         fn run(self: *Heartbeat) void {
             const w = self.worker;
             const period_ns = @as(u64, w.heartbeat_ms) * std.time.ns_per_ms;
             while (true) {
-                var n = self.wake.notified();
-                // Registered BEFORE the stop is re-read (`sync/notify.zig`'s
-                // law): a `stopRequested` from here on bumps this waiter's
-                // epoch, so the park below ends on it.
+                var n = w.wake.notified();
+                // Registered BEFORE both stops are re-read (`sync/notify.zig`'s
+                // law): a `stopRequested` or a `requestStop` from here on
+                // bumps this waiter's epoch, so the park below ends on it.
                 _ = n.enable(w.io);
-                if (self.stop.load(.acquire)) {
+                if (self.ended()) {
                     n.cancel(w.io);
                     return;
                 }
-                if (w.heartbeat_station) |s| s.parking(s.ctx, &self.wake, &self.stop);
+                if (w.heartbeat_station) |s| s.parking(s.ctx, &w.wake, &self.stop);
                 _ = n.waitUntilUncancelable(w.io, clock.monotonicNs() + period_ns);
-                if (self.stop.load(.acquire)) return;
-                if (w.stop.load(.acquire)) {
-                    self.cancel.store(true, .release);
-                    return;
-                }
+                if (self.ended()) return;
                 const rep = w.caller.call(w.caller.ctx, .{ .heartbeat = self.ref }) catch {
                     self.cancel.store(true, .release);
                     return;
@@ -973,6 +978,9 @@ pub const Worker = struct {
         self.held.store(false, .release);
     }
 
+    /// Raise the stop and wake every park that reads it: the serve loop's
+    /// and a noop shard's (`parkUnlessStopped`), a read shard's heartbeat
+    /// fiber (which then cancels the walk) and the zombie seam's hold.
     pub fn requestStop(self: *Worker) void {
         self.stop.store(true, .release);
         self.wake.notifyWaiters(self.io);
@@ -1443,6 +1451,65 @@ test "a read shard's stop raised between the heartbeat fiber's decision to park 
     try testing.expect(got == .payload);
     fd.release(gpa, got.payload);
     fd.retireFleetShards(0x904);
+}
+
+/// The heartbeat station that only records the fiber's first park (it has
+/// decided to park and registered on its wake) and lets the park begin.
+const ParkSeen = struct {
+    /// Set at the first park's station (release; the test's acquire pairs).
+    reached: Atomic(bool) = .init(false),
+
+    fn station(self: *ParkSeen) Worker.HeartbeatStation {
+        return .{ .ctx = self, .parking = &parking };
+    }
+
+    fn parking(ctx: *anyopaque, _: *sync.Notify, _: *const Atomic(bool)) void {
+        const self: *ParkSeen = @ptrCast(@alignCast(ctx));
+        self.reached.store(true, .release);
+    }
+};
+
+/// A stop's bound in the row below: a tenth of the heartbeat period a stop
+/// used to wait out (the defect's cost), a hundred engine steps
+/// (`RamReadRunner.STEP_NS`) of headroom for a loaded venue's scheduling.
+const STOP_BOUND_NS: u64 = @as(u64, seams.HEARTBEAT_MS) * std.time.ns_per_ms / 10;
+
+test "a requestStop during a read shard's scan WAKES the heartbeat fiber: the fiber raises the walk's cancel at once, the engine ends at its next step and the pull abandons (stopped) within a step and the venue's scheduling — never the heartbeat's whole period (10 s)" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    const r = try Rig.init(gpa, io, ROW_TTL_MS);
+    defer r.deinit(gpa);
+    defer r.coord.deinit();
+    var engine: RamReadRunner = .{ .io = io, .hold = true };
+    r.worker.read_runner = engine.runner();
+    r.worker.caps = frames.CAP_FLEET_READ;
+    _ = try r.worker.enroll();
+    // The product's period: the stop must not depend on it.
+    try testing.expectEqual(seams.HEARTBEAT_MS, r.worker.heartbeat_ms);
+    var seen: ParkSeen = .{};
+    r.worker.heartbeat_station = seen.station();
+    const fd = r.coord.fleet();
+    const d: seams.FleetDispatch.Descriptor = .{ .id = .{ .job_id = 0x905, .shard = 1 }, .fleet_k = 1, .fleet_n = 2, .inode_plane = 0, .throttle_pct = 100 };
+    try testing.expect(fd.queueReadShard(d, 0));
+    var out: Worker.Pulled = .none;
+    const th = try std.Thread.spawn(.{}, PullOnce.run, .{ &r.worker, &out });
+    // Mid-scan, the fiber in its first park.
+    while (!engine.holding.load(.acquire) or !seen.reached.load(.acquire)) std.atomic.spinLoopHint();
+    const cancelled0 = engine.cancelled;
+    const t0 = clock.monotonicNs();
+    r.worker.requestStop();
+    th.join();
+    const elapsed = clock.monotonicNs() - t0;
+    try testing.expectEqual(Worker.Pulled.abandoned, out);
+    // The walk ended on the cancel (the test never releases it), with no
+    // renewal in between.
+    try testing.expectEqual(cancelled0 + 1, engine.cancelled);
+    try testing.expectEqual(@as(u64, 0), r.worker.heartbeats);
+    if (elapsed >= STOP_BOUND_NS) {
+        std.debug.print("the stop took {d} ms (bound {d} ms; the heartbeat period is {d} ms)\n", .{ elapsed / std.time.ns_per_ms, STOP_BOUND_NS / std.time.ns_per_ms, seams.HEARTBEAT_MS });
+        return error.StopWaitedOutTheHeartbeat;
+    }
+    fd.retireFleetShards(0x905);
 }
 
 test "a non-coordinator answers the job block not_manager; the worker's enroll reports it as refused" {

@@ -5,6 +5,7 @@
 //! the process naming every offender (charter §1.6). Then `cli.run`.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const squeezefs = @import("squeezefs");
 const build_options = @import("build_options");
 
@@ -25,7 +26,8 @@ fn writeVersion(w: *std.Io.Writer) std.Io.Writer.Error!void {
 
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
-    const gpa = init.gpa;
+    // std's default is a SafeAllocator in ReleaseSafe too (mem/process_allocator.zig).
+    const gpa = squeezefs.process_allocator.select(builtin.mode, init.gpa);
 
     var stderr_buf: [4096]u8 = undefined;
     var stderr_writer: std.Io.File.Writer = .init(.stderr(), io, &stderr_buf);

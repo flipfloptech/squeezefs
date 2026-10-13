@@ -726,7 +726,11 @@ the trees is in flight while their custody moves):
    by `SmoContext.freePending`), step 7's record is the grant minus the images of every tree this
    process maintains (a live foreign lessee's projection excluded) and minus the held, read in ONE
    SMO-lock window; 7b parks the held extents in the FIFO at ring 0's reservation head; a rollback keeps
-   them allocated; every return is filtered by the record and clears exactly its hits.
+   them allocated; every return is filtered by the record and clears exactly its hits. The SMO lock is
+   held from the first root install to the replay's last record, ring 0's seq floor is raised above
+   the dead frontier BEFORE the install (not at 7b: a manager flip stamped below the dead window's
+   interior record loses the LWW and routes to a retired image), and the tails/images walks run under
+   the SMO lock.
 7b. **The RAM lease table LAST** (REC:1935-1983): `table.release(slot, id, g, words, lease_seq)` must
    answer `Released | Already` (else `Corrupt`: "the RAM table and tree 0 disagree"); `gate.revoke(slot)`;
    `ring.raise_seq_floor(words.seq_floor)` (ring 0's offset above the dead ring's frontier — the round-5

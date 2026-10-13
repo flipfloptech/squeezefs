@@ -83,7 +83,38 @@ between them only under the volume's SMO lock. Lock order: the SMO lock, then th
 lock; the returns run after the hold ends and outside the SMO lock. No lock-free core changed (the
 hold is read and written under the SMO lock alone), so no model was added.
 
-### 1.4 Not covered by this item (stated)
+### 1.4 The stage under the manager's maintenance, looped — and what it found
+
+The red row pins ONE interleaving with a seam. The narrowed stage drives the same recovery under a
+racing maintenance stream instead: `volume_bind` "linux: THE RECOVERY UNDER THE MANAGER'S
+MAINTENANCE, looped" (`SQUEEZEFS_TEST_RECOVERY_RACE_LOOPS=N`, a harness row; skipped unarmed). Per
+pass: a fresh set; a WIRE joiner B writes 1,500 records in batches of 100 into its rotor slot (its
+splits draw its own grant: a multi-leaf tree whose images are the grant's), cycles after 1,200, and
+dies with a 300-record window; the manager reopens the copy, records the death, and recovers it
+while a racer thread runs the D4 compaction over every resident leaf of the recovered tree (two
+rounds, under the SMO lock, from the root install to the table release). Checked every pass: the
+recovery acted, every acked record readable, the budget conserved (`free = total − set bits`), and
+ONE custodian per extent (every image any maintained tree reaches is allocated; every claimable
+extent — all of them claimed and handed back — is reached by none) before and after two covered
+checkpoints. The first 20-pass runs met four more defects of the same law, in order:
+
+| # | Met as | Cause | Fix |
+|---|---|---|---|
+| 1 | `failed at Corrupt` after step 6 (the debug trace: `walkTree` of the dead slot) | step 6b's tails walk ran without the SMO lock: an SMO between its level read and its pointer read handed it a node of the wrong level | `leafTailsFn` under the SMO lock (as `keptExtents` already was) |
+| 2 | `failed at Corrupt` in the walk again — a `RetiredExtent` route | ring 0's seq floor was raised above the dead ring's frontier only at 7b; a pointer flip the manager stamped before it LOST the per-key LWW to the dead window's interior record for the same separator (applied at its own, higher seq): the tree routed to the image the SMO had retired | the raise moved to step 4, before the root install (monotone: a rollback keeps it) |
+| 3 | acked records MISSING after the recovery | no SMO lock between the root install and the replay: an SMO on the installed tree before the dead window's interior records mixed a pre-split image with the split's children | the run holds the SMO lock from the first root install to the replay's last record (`Volume.holdStructure`; `installRoot`/`restoreTree` run inside it) — the charter's "from the root install on — the SMO mutex" |
+| 4 | the testing allocator's leak report under heap pressure | the conveyor's heap-admission refusal list (`refused`, step A6) was never freed | `defer refused.deinit` |
+
+(A first racer that compacted clean leaves without end met `64 cycles left a recovered slot tree
+dirty` — a stream no product SMO produces; the racer runs two rounds.)
+
+The loops on the fixed tree: 20 passes green (20 recoveries, 145 racing compactions), then **150
+passes green: 150 recoveries, 1,065 racing compactions, 0 custody breaches, 0 rollbacks, 0 aborts**
+(`SQUEEZEFS_TEST_RECOVERY_RACE_LOOPS=150`, 10 min on the shared venue). A test-result cache note
+for whoever repeats it: the harness knob is not part of zig's test cache key — a green run re-run
+with a larger N answers `cached` unless a source input changed.
+
+### 1.5 Not covered by this item (stated)
 
 - **A slot release does not move the tree's images out of the releaser's grant record.**
   `slots.acquire.Verbs.releaseSlot` writes `Unleased` + the tails and never touches `extent_grant:`;

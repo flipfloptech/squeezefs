@@ -240,6 +240,12 @@ pub const Volume = struct {
         restoreTree: *const fn (ctx: *anyopaque, slot: u16, prior: ?TreeState) void,
         /// The record applied in the structural class under the stamp.
         replay: *const fn (ctx: *anyopaque, rec: WindowRecord, stamp: fencing.FrameStamp) Error!void,
+        /// The volume's SMO lock held (`true`) or released, from the first
+        /// root install to the replay's last record: no SMO of the
+        /// volume's own (the checkpoint task's maintenance and merge sweep,
+        /// the D4 arm) reshapes a recovered tree in between. `installRoot`
+        /// and `restoreTree` run inside it or take it themselves.
+        holdStructure: *const fn (ctx: *anyopaque, held: bool) void,
         /// `data_bitmap.replay` for the dead identity's leases homed here.
         replayDataDeltas: *const fn (ctx: *anyopaque, identity: WriterIdentity, recs: []const WindowRecord) Error!void,
         /// Barriered cycles until no named slot holds a dirty node; the
@@ -529,6 +535,14 @@ pub const Driver = struct {
         // behind the census's back.
         try self.vol.vt.holdRetirements(self.vol.ctx, grant.items);
         rollback.hold = true;
+        // The structure is the recovery's from the first root install to
+        // the replay's last record (the charter's "from the root install on
+        // — the SMO mutex"): an SMO of the volume's own between the install
+        // and the dead window's interior records would mix a pre-split
+        // image with the split's children.
+        self.vol.vt.holdStructure(self.vol.ctx, true);
+        var structure_held = true;
+        defer if (structure_held) self.vol.vt.holdStructure(self.vol.ctx, false);
         for (plans.items) |*pl| {
             if (table.beginRelease(pl.slot, p.appender_id, true) == null) {
                 const v = table.view(pl.slot);
@@ -548,6 +562,14 @@ pub const Driver = struct {
             pl.cursor = @max(@max(pl.lease.cursor, page_cursor), if (pl.window_max_ino != 0) pl.window_max_ino + 1 else 0);
             pl.cursor = @max(pl.cursor, inos.LOCAL_INO_BASE);
             pl.seq_floor = @max(pl.lease.seq_floor, ring.seq_frontier);
+            // Ring 0 stamps above the dead frontier BEFORE the volume writes
+            // the recovered tree: the replay applies the dead window's
+            // records at their own seqs, and an SMO's pointer flip stamped
+            // below them (the flush cycles', the checkpoint task's) would
+            // lose the per-key LWW to the dead appender's interior record
+            // and route to the image it retired. Monotone: a rollback keeps
+            // it.
+            self.vol.vt.raiseSeqFloor(self.vol.ctx, pl.seq_floor);
         }
         try self.fail(.mark_dead);
         // ---- 5. two-phase replay + the data deltas ----
@@ -555,6 +577,8 @@ pub const Driver = struct {
         defer slot_list.deinit(gpa);
         for (plans.items) |pl| try slot_list.append(gpa, pl.slot);
         try self.replayWindow(window.items, slot_list.items);
+        self.vol.vt.holdStructure(self.vol.ctx, false);
+        structure_held = false;
         try self.vol.vt.replayDataDeltas(self.vol.ctx, death.identity, window.items);
         phase(.replay, t_replay);
         try self.fail(.replay);
@@ -645,7 +669,6 @@ pub const Driver = struct {
                     return error.Corrupt;
                 },
             }
-            self.vol.vt.raiseSeqFloor(self.vol.ctx, pl.seq_floor);
             try self.vol.vt.holdCoherence(self.vol.ctx, pl.slot, coherence_until);
             if (quarantine_until) |u| {
                 self.vol.vt.quarantineCustody(self.vol.ctx, pl.slot, u);
@@ -1052,6 +1075,8 @@ const RamVolume = struct {
     seq_floor_raised: u64 = 0,
     writer_term: u64 = 7,
     quarantined: std.ArrayList(u16) = .empty,
+    /// The structural hold (the SMO lock) around the replay.
+    structure_held: bool = false,
     /// The coherence holds installed: slot → realtime deadline.
     coherence: std.AutoHashMapUnmanaged(u16, u64) = .empty,
     handover_notifies: u32 = 0,
@@ -1288,6 +1313,7 @@ const RamVolume = struct {
         const self = self_(ctx);
         // The recoverer's own frames on the dead lessee's slots: stamped (0, g).
         if (stamp.appender_id != 0 or stamp.g != self.table.gOf(rec.slot)) return error.Violation;
+        if (!self.structure_held) return error.Corrupt;
         const t = self.trees.getPtr(rec.slot) orelse return error.Corrupt;
         // LWW by seq: a record the base already holds folds to itself.
         for (t.flushed.items) |h| if (h == rec.handle) return;
@@ -1406,12 +1432,17 @@ const RamVolume = struct {
     fn notifyFn(ctx: *anyopaque) void {
         self_(ctx).handover_notifies += 1;
     }
+    fn holdStructureFn(ctx: *anyopaque, held: bool) void {
+        const self = self_(ctx);
+        std.debug.assert(self.structure_held != held);
+        self.structure_held = held;
+    }
     fn holdCoherenceFn(ctx: *anyopaque, slot: u16, until: u64) Error!void {
         const self = self_(ctx);
         self.coherence.put(self.gpa, slot, until) catch return error.OutOfMemory;
     }
 
-    const vtable: Volume.VTable = .{ .vol = &volFn, .readPage = &readPageFn, .writePage = &writePageFn, .readRing = &readRingFn, .slotState = &slotStateFn, .leasedTo = &leasedToFn, .grantRecord = &grantRecordFn, .controlEntry = &controlEntryFn, .noteUnleased = &noteUnleasedFn, .table = &tableFn, .treeState = &treeStateFn, .installRoot = &installRootFn, .restoreTree = &restoreTreeFn, .replay = &replayFn, .replayDataDeltas = &replayDataFn, .cycleUntilClean = &cycleFn, .flushedRoot = &flushedRootFn, .leafTails = &leafTailsFn, .holdRetirements = &holdFn, .endRetirementHold = &endHoldFn, .keptExtents = &keptFn, .returnExtents = &returnExtentsFn, .freeRing = &freeRingFn, .orphanImages = &orphanImagesFn, .raiseSeqFloor = &raiseFloorFn, .ring0Head = &ring0HeadFn, .writerTerm = &writerTermFn, .quarantineCustody = &quarantineFn, .holdCoherence = &holdCoherenceFn, .notifyHandoverDone = &notifyFn };
+    const vtable: Volume.VTable = .{ .vol = &volFn, .readPage = &readPageFn, .writePage = &writePageFn, .readRing = &readRingFn, .slotState = &slotStateFn, .leasedTo = &leasedToFn, .grantRecord = &grantRecordFn, .controlEntry = &controlEntryFn, .noteUnleased = &noteUnleasedFn, .table = &tableFn, .treeState = &treeStateFn, .installRoot = &installRootFn, .restoreTree = &restoreTreeFn, .replay = &replayFn, .holdStructure = &holdStructureFn, .replayDataDeltas = &replayDataFn, .cycleUntilClean = &cycleFn, .flushedRoot = &flushedRootFn, .leafTails = &leafTailsFn, .holdRetirements = &holdFn, .endRetirementHold = &endHoldFn, .keptExtents = &keptFn, .returnExtents = &returnExtentsFn, .freeRing = &freeRingFn, .orphanImages = &orphanImagesFn, .raiseSeqFloor = &raiseFloorFn, .ring0Head = &ring0HeadFn, .writerTerm = &writerTermFn, .quarantineCustody = &quarantineFn, .holdCoherence = &holdCoherenceFn, .notifyHandoverDone = &notifyFn };
 
     fn volume(self: *RamVolume) Volume {
         return .{ .ctx = self, .vt = &vtable };

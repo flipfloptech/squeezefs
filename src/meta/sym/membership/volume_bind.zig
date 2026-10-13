@@ -117,6 +117,9 @@ pub const VolumeBinding = struct {
     /// The run's hold over the dead grant's retirements, installed on
     /// the backend's SMO context (`holdRetirementsFn`).
     retire_hold: ?smo.RetireHold = null,
+    /// The run holds the SMO lock from its first root install to its
+    /// replay's last record (`holdStructureFn`).
+    structure_held: bool = false,
     /// The RAM custody quarantine: slot → realtime-ns deadline.
     quarantines: std.AutoHashMapUnmanaged(u16, u64) = .empty,
     /// `SQUEEZEFS_TEST_RECOVERY_HOLD`, read once here.
@@ -524,8 +527,8 @@ pub const VolumeBinding = struct {
         const self = self_(ctx);
         const be = self.be;
         const fs = self.forestSlotOf(slot);
-        be.smo_lock.lockUncancelable(be.io);
-        defer be.smo_lock.unlock(be.io);
+        const took = self.lockStructure();
+        defer self.unlockStructure(took);
         _ = be.cache.discardSlotNodes(fs);
         self.install_floor = floor;
         if (be.slotTree(slot)) |t| {
@@ -584,8 +587,8 @@ pub const VolumeBinding = struct {
     fn restoreTreeFn(ctx: *anyopaque, slot: u16, prior: ?recovery.TreeState) void {
         const self = self_(ctx);
         const be = self.be;
-        be.smo_lock.lockUncancelable(be.io);
-        defer be.smo_lock.unlock(be.io);
+        const took = self.lockStructure();
+        defer self.unlockStructure(took);
         _ = be.cache.discardSlotNodes(self.forestSlotOf(slot));
         const t = be.slotTree(slot) orelse return;
         if (prior) |p| {
@@ -628,6 +631,25 @@ pub const VolumeBinding = struct {
             return;
         }
         t.applyReplayed(ref.frame.key, ref.frame.seq, kind, ref.frame.value, self.install_floor) catch |e| return mapTree(e);
+    }
+
+    fn holdStructureFn(ctx: *anyopaque, held: bool) void {
+        const self = self_(ctx);
+        const be = self.be;
+        if (held) be.smo_lock.lockUncancelable(be.io) else be.smo_lock.unlock(be.io);
+        self.structure_held = held;
+    }
+
+    /// The SMO lock for one structural act of the recovery: taken here
+    /// unless the run already holds it (`holdStructureFn`).
+    fn lockStructure(self: *VolumeBinding) bool {
+        if (self.structure_held) return false;
+        self.be.smo_lock.lockUncancelable(self.be.io);
+        return true;
+    }
+
+    fn unlockStructure(self: *VolumeBinding, took: bool) void {
+        if (took) self.be.smo_lock.unlock(self.be.io);
     }
 
     // ---- the data-bitmap deltas ----
@@ -812,6 +834,11 @@ pub const VolumeBinding = struct {
     /// ones only — the preempt made the scan unnecessary.
     fn leafTailsFn(ctx: *anyopaque, gpa: Allocator, slot: u16, pr_fenced: bool, out: *std.ArrayList(cr.TailEntry)) Error!u64 {
         const self = self_(ctx);
+        // Under the SMO lock: a split or a root swap the flush pass runs
+        // on the recovered tree between the walk's level read and its
+        // pointer read would hand it a node of the wrong level.
+        self.be.smo_lock.lockUncancelable(self.be.io);
+        defer self.be.smo_lock.unlock(self.be.io);
         const t = self.be.slotTree(slot) orelse return 0;
         var bytes: u64 = 0;
         try self.walkTree(gpa, t, .{ .tails = .{ .out = out, .bytes = &bytes, .resident_only = pr_fenced } });
@@ -1082,6 +1109,7 @@ pub const VolumeBinding = struct {
         .installRoot = &installRootFn,
         .restoreTree = &restoreTreeFn,
         .replay = &replayFn,
+        .holdStructure = &holdStructureFn,
         .replayDataDeltas = &replayDataDeltasFn,
         .cycleUntilClean = &cycleUntilCleanFn,
         .flushedRoot = &flushedRootFn,
@@ -2015,4 +2043,169 @@ test "linux: THE COHERENCE HOLD — a write into a recovered slot right after th
             try testing.expect(got != null);
         }
     }
+}
+
+// ---- the recovery under the manager's maintenance, looped (rung 10 recovery item 1's stage) ----
+
+const testkit = @import("../../../core/testkit.zig");
+const recovery_loops_knob = "SQUEEZEFS_TEST_RECOVERY_RACE_LOOPS";
+
+/// The manager's maintenance racing a recovery: the D4 compaction of
+/// every resident leaf of the recovered slot's tree, round after round,
+/// under the SMO lock, from the slot's dead mark (`Releasing`) until the
+/// recovery is done — the window the shared hot directory row's abort met.
+const MaintenanceRacer = struct {
+    be: *KvBackend,
+    binding: *VolumeBinding,
+    slot: u16,
+    stop: std.atomic.Value(bool) = .init(false),
+    compactions: u64 = 0,
+    rounds: u32 = 0,
+
+    /// Two rounds: a maintenance pass compacts a leaf and is done with it
+    /// (an endless stream re-dirties the parents faster than the flush's
+    /// bounded cycles can land them — no product SMO behaves so).
+    const ROUNDS: u32 = 2;
+
+    fn run(self: *MaintenanceRacer) void {
+        const gpa = testing.allocator;
+        while (!self.stop.load(.acquire) and self.rounds < ROUNDS) {
+            self.be.smo_lock.lockUncancelable(self.be.io);
+            defer self.be.smo_lock.unlock(self.be.io);
+            // From the root install (the recovered tree is the manager's
+            // to maintain) to the table release.
+            const v = self.be.slots.table.view(self.slot);
+            if (v.state != .releasing or !v.dead or self.binding.install_floor == 0) continue;
+            const t = self.be.slotTree(self.slot) orelse continue;
+            var tails: std.ArrayList(cr.TailEntry) = .empty;
+            defer tails.deinit(gpa);
+            self.be.collectLeafTails(t, &tails) catch continue;
+            for (tails.items) |tl| {
+                const n = t.getNode(tl.leaf_addr) catch continue;
+                defer n.release();
+                var out: smo.MaintenanceOutcome = .{};
+                if (smo.compactForDefrag(t, &self.be.smo_ctx, n, &out) catch false) self.compactions += 1;
+            }
+            self.rounds += 1;
+        }
+    }
+};
+
+/// One custodian per extent after a recovery: every extent a maintained
+/// tree reaches is allocated, and no free one is reached — checked by
+/// claiming every claimable extent (none may be a live node), the claims
+/// handed back.
+fn expectOneCustodian(binding: *VolumeBinding) !void {
+    const gpa = testing.allocator;
+    const be = binding.be;
+    be.smo_lock.lockUncancelable(be.io);
+    defer be.smo_lock.unlock(be.io);
+    var images: std.ArrayList(u64) = .empty;
+    defer images.deinit(gpa);
+    try binding.maintainedImages(gpa, &images);
+    for (images.items) |e| try testing.expect(be.alloc.isAllocated(e));
+    std.mem.sort(u64, images.items, {}, std.sort.asc(u64));
+    var claimed: std.ArrayList(u64) = .empty;
+    defer {
+        for (claimed.items) |e| be.alloc.releaseUnpublished(e);
+        claimed.deinit(gpa);
+    }
+    while (be.alloc.claimInternal()) |e| {
+        try claimed.append(gpa, e);
+        try testing.expect(!recovery.sortedContains(images.items, e));
+    } else |_| {}
+}
+
+test "linux: THE RECOVERY UNDER THE MANAGER'S MAINTENANCE, looped (SQUEEZEFS_TEST_RECOVERY_RACE_LOOPS=N; skipped unarmed): a wire joiner whose slot tree spans several leaves of its grant dies with a window; the manager recovers it while a racer compacts every resident leaf of the recovered tree round after round — every acked record readable, the budget conserved, one custodian per extent before and after the coverage clock drains, every pass" {
+    const gpa = testing.allocator;
+    const raw = std.testing.environ.getPosix(recovery_loops_knob) orelse return testkit.skip(@src(), .no_seam, recovery_loops_knob ++ " unset: the looped recovery stage runs only when the harness arms it");
+    const loops = std.fmt.parseInt(u32, std.mem.trim(u8, raw, " \t"), 10) catch return testkit.skip(@src(), .no_seam, recovery_loops_knob ++ " is not an integer");
+    if (loops == 0) return testkit.skip(@src(), .no_seam, recovery_loops_knob ++ " is 0");
+    var held_total: u64 = 0;
+    var compactions_total: u64 = 0;
+    var pass: u32 = 0;
+    while (pass < loops) : (pass += 1) {
+        const s = try meta_set.TestSet.create(gpa, "recover-race", 1);
+        defer s.destroy();
+        try s.env.put("SQUEEZEFS_MW_BIND", "127.0.0.1:0");
+        try s.env.put("SQUEEZEFS_SYM_MINT_SLOTS", "1");
+        // B's splits draw its grant: a pool past the derived floor keeps
+        // the fill off the refill's wire round trips.
+        try s.env.put("SQUEEZEFS_SYM_GRANT_EXTENTS", "64");
+        var kill_buf: [160]u8 = undefined;
+        const kill = try std.fmt.bufPrint(&kill_buf, "{s}.kill", .{s.paths[0]});
+        defer unlinkPath(kill);
+        var keys: std.ArrayList([]const u8) = .empty;
+        defer freeKeys(&keys);
+        // B: 1,200 records over several leaves (its own splits draw its
+        // grant), a cycle, then a 300-record window — and dies.
+        var dead: WireDead = undefined;
+        {
+            const set = try s.open();
+            defer set.close();
+            var locks = try dlm.Manager.init(gpa, 64);
+            defer locks.deinit();
+            const bound = try xv.set_bind.Bound.create(gpa, s.io(), set, &locks, &s.env);
+            defer bound.destroy(gpa);
+            const plane = (try wire_plane.WirePlane.start(gpa, s.io(), set, &s.env, 4, 1 << 30, &bound.plane, false)).?;
+            defer plane.stop();
+            const be0 = set.volumes[0];
+            const b = try meta_set.MetaSet.open(gpa, s.io(), s.pathList(), .{ .env = &s.env, .cache_budget_bytes = 64 << 20, .cpus = 4, .join = .{ .mountpoint = "/build/tmp/mnt-recover-race-b", .endpoint = plane.advertised } });
+            defer b.close();
+            const bj = b.volumes[0];
+            const me = bj.joined.?.appenderId();
+            var held: std.ArrayList(u16) = .empty;
+            defer held.deinit(gpa);
+            try bj.slots.table.heldBy(me, &held);
+            const slot = held.items[0];
+            for (0..15) |batch| {
+                if (batch == 12) try bj.checkpointNow();
+                const t = try bj.begin(@src());
+                for (0..100) |_| {
+                    const local = try bj.allocateInoInSlot(slot);
+                    const k = try gpa.dupe(u8, &key.inodeKey(key.guestLocalIno(slot, local)));
+                    try keys.append(gpa, k);
+                    try t.stagePut(key.TREE_INODES, k, &iv_value);
+                }
+                try bj.commit(t);
+            }
+            try bj.fsync();
+            try be0.checkpointNow();
+            try be0.fsync();
+            try snapshotImage(s.paths[0], kill);
+            const id = bj.joined.?.identity;
+            dead = .{ .identity = .{ .node_token = id.node_token, .mount_slot = id.mount_slot, .writer_id = id.writer_id }, .appender_id = me, .slot = slot };
+        }
+        var live = try Live.open(s, kill);
+        defer live.close();
+        const be = live.set.volumes[0];
+        const binding = live.binding();
+        const recoveries0 = recovery.stats.appender_recoveries.load();
+        var racer: MaintenanceRacer = .{ .be = be, .binding = binding, .slot = dead.slot };
+        const th = try std.Thread.spawn(.{}, MaintenanceRacer.run, .{&racer});
+        var joined = false;
+        defer if (!joined) {
+            racer.stop.store(true, .release);
+            th.join();
+        };
+        const held0 = smo.stats.meta_kv_retire_hold_breaches.load();
+        live.recordDeath(dead.identity, false);
+        live.plane.tick();
+        racer.stop.store(true, .release);
+        th.join();
+        joined = true;
+        try testing.expectEqual(held0, smo.stats.meta_kv_retire_hold_breaches.load());
+        try testing.expectEqual(recoveries0 + 1, recovery.stats.appender_recoveries.load());
+        try expectAllPresent(live.set, keys.items);
+        try expectBudgetConserved(be);
+        try expectOneCustodian(binding);
+        try be.checkpointNow();
+        try be.checkpointNow();
+        try expectBudgetConserved(be);
+        try expectOneCustodian(binding);
+        try expectAllPresent(live.set, keys.items);
+        compactions_total += racer.compactions;
+        held_total += recovery.stats.appender_recoveries.load() - recoveries0;
+    }
+    std.debug.print("\nrecovery under maintenance: {d} pass(es), {d} recoveries, {d} racing compactions, 0 custody breaches\n", .{ loops, held_total, compactions_total });
 }

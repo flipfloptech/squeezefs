@@ -956,6 +956,20 @@ test "claim written at mount (this identity, beat 0, a fresh ts) and deleted on 
     try testing.expectEqual(@as(usize, 0), none.len);
 }
 
+test "a clean dismount wakes the parked heartbeat: the close never waits out the liveness tick (a stop whose own store pre-set the word made `tick.wake`'s swap read a token and skip the futex wake — every clean unmount, `fsck --offline` and offline verb waited up to 2 s)" {
+    const gpa = testing.allocator;
+    const v = try Vol.create(gpa, "hb-stop", null);
+    defer v.destroy();
+    const be = try v.open(.{ .test_identity = ident(boot_a, 4000, 777), .test_pid_probe = PidTable.probe }, 0);
+    const t0 = clock.monotonicNs();
+    be.close();
+    const close_ns = clock.monotonicNs() - t0;
+    // The heartbeat parked at the open for its 10 s beat; only a delivered
+    // wake ends that park before the tick rescues it.
+    if (close_ns >= tick.tick_ns / 2) std.debug.print("\nthe dismount took {d} ms (the liveness tick is {d} ms)\n", .{ close_ns / std.time.ns_per_ms, tick.tick_ns / std.time.ns_per_ms });
+    try testing.expect(close_ns < tick.tick_ns / 2);
+}
+
 test "the ordering law: the claim is committed and barriered before the checkpoint thread spawns — the first ledger record of the mount already covers the claim entry (reusable_upto == head at return)" {
     const gpa = testing.allocator;
     const v = try Vol.create(gpa, "order", "600000");

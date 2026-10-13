@@ -62,6 +62,8 @@ const ledger = @import("../meta/ledger.zig");
 const device_loader = @import("../meta/device_loader.zig");
 const node_seq = @import("../meta/node_seq.zig");
 const proc = @import("../meta/guard/proc.zig");
+const lease_clock = @import("../meta/guard/lease_clock.zig");
+const extent_grant = @import("../meta/sym/extent_grant.zig");
 const cr = @import("../meta/sym/control_records.zig");
 const route_table = @import("../meta/routing/route_table.zig");
 const appender_page = @import("../meta/sym/appender_page.zig");
@@ -6769,6 +6771,153 @@ test "smoke: `sync -f` IS A DURABILITY POINT FOR THE DAEMON'S WRITE CUSTODY — 
     try testing.expect(std.mem.indexOf(u8, out, "f-whole") != null);
     try testing.expect(std.mem.indexOf(u8, out, "g-whole") != null);
     try testing.expect(std.mem.indexOf(u8, out, seen_mtime) != null);
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+}
+
+/// The frozen-daemon row's request timeout (the seam): the kernel's floor
+/// — it raises any shorter timeout to its check period.
+const frozen_timeout_s: u64 = 15;
+/// The kernel's request-timeout check period (`FUSE_TIMEOUT_TIMER_FREQ`,
+/// fs/fuse/dev.c): a request is aborted at the first check at or after its
+/// age reaches the timeout — at most one period late.
+const frozen_check_s: u64 = 15;
+/// What the host-wide sync may take once our FUSE_SYNCFS is aborted: the
+/// abort's wake and the superblocks the sync visits after ours, judged at
+/// the kernel's own cadence (one more check period).
+const frozen_after_abort_s: u64 = frozen_check_s;
+/// The host's own writeback before the sync reaches the FUSE superblocks
+/// (every dirty page of every filesystem on the venue — not this row's to
+/// bound); past it the row fails rather than hang.
+const frozen_writeback_wait_ns: u64 = 120 * std.time.ns_per_s;
+
+/// Does `/proc/<pid>/stack` name `needle` — a kernel function the task is
+/// blocked in (root reads it)?
+fn stackHas(pid: linux.pid_t, needle: []const u8) bool {
+    var pb: [64]u8 = undefined;
+    var buf: [4096]u8 = undefined;
+    const path = std.fmt.bufPrint(&pb, "/proc/{d}/stack", .{pid}) catch return false;
+    const text = Io.Dir.cwd().readFile(testing.io, path, &buf) catch return false;
+    return std.mem.indexOf(u8, text, needle) != null;
+}
+
+test "smoke: A FROZEN DAEMON NEVER HANGS THE HOST'S `sync` (0003 §Z) — format → mount under the request-timeout seam (15 s) → SIGSTOP the daemon → a host-wide `sync` from another process: the kernel aborts its FUSE_SYNCFS to the frozen mount within the timeout + one check period and the sync returns → the frozen mount is fail-stopped (ENOTCONN, `sync -f` reports it, still in the mount table) → SIGCONT: the daemon names the abort loudly, tears down and exits 1 → a remount without the seam negotiates the lattice's T_owner + T_park_max" {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    try rig.formatSet(false);
+    var seam_buf: [8]u8 = undefined;
+    try rig.env.put("SQUEEZEFS_TEST_FUSE_REQUEST_TIMEOUT_S", try std.fmt.bufPrint(&seam_buf, "{d}", .{frozen_timeout_s}));
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(0);
+    // A kernel that never forwards syncfs leaves a frozen daemon out of the
+    // host's sync altogether: nothing to judge.
+    const negotiated_s = blk: {
+        const st = try rig.stats();
+        defer gpa.free(st);
+        if (numberAfter(st, "\"fuse_syncfs_armed\":") != 1) {
+            const rel = try rig.shOk(rig.work, "uname -r");
+            defer gpa.free(rel);
+            try rig.umount();
+            _ = try rig.waitChild();
+            var detail: [192]u8 = undefined;
+            return testkit.skip(@src(), .no_kernel_feature, std.fmt.bufPrint(&detail, "kernel {s}: FUSE_HAS_SYNCFS not offered — the host's sync never reaches a plain /dev/fuse server", .{std.mem.trimEnd(u8, rel, "\n")}) catch "a kernel without FUSE_HAS_SYNCFS");
+        }
+        break :blk numberAfter(st, "\"transport_request_timeout_s\":");
+    };
+    {
+        const out = try rig.onMount("echo frozen > f && sync -f . && echo written");
+        defer gpa.free(out);
+        try testing.expect(std.mem.indexOf(u8, out, "written") != null);
+    }
+    // Freeze: every thread of the daemon stops; nothing answers the kernel.
+    _ = linux.kill(rig.child_pid, .STOP);
+    var resumed = false;
+    defer if (!resumed) {
+        _ = linux.kill(rig.child_pid, .CONT);
+    };
+    // The host-wide sync from another process. Its FUSE_SYNCFS to the frozen
+    // mount is created once the host's writeback is done: the bound runs
+    // from the first instant the sync is seen waiting in `fuse_sync_fs`.
+    var sync_child = try std.process.spawn(io, .{ .argv = &.{"sync"}, .stdin = .ignore, .stdout = .ignore, .stderr = .inherit });
+    const sync_pid = sync_child.id.?;
+    const spawned_at = clock.monotonicNs();
+    var waiting_at: ?u64 = null;
+    var returned_at: ?u64 = null;
+    while (true) {
+        const now = clock.monotonicNs();
+        if (!alive(sync_pid)) {
+            returned_at = now;
+            break;
+        }
+        if (waiting_at == null and stackHas(sync_pid, "fuse_sync_fs")) waiting_at = now;
+        const deadline = if (waiting_at) |w| w + (frozen_timeout_s + frozen_check_s + frozen_after_abort_s) * std.time.ns_per_s else spawned_at + frozen_writeback_wait_ns;
+        if (now >= deadline) break;
+        sleepMs(20);
+    }
+    if (returned_at == null) {
+        // Only the daemon's answer frees a sync whose request it was handed
+        // (the wait is uninterruptible): resume it, then fail.
+        _ = linux.kill(rig.child_pid, .CONT);
+        resumed = true;
+        _ = try sync_child.wait(io);
+        std.debug.print("\nsmoke[frozen]: the host-wide sync was still held {d} ms after it began waiting on the frozen mount (spawned {d} ms before that; waiting seen: {})\n", .{ (clock.monotonicNs() - (waiting_at orelse spawned_at)) / std.time.ns_per_ms, ((waiting_at orelse spawned_at) - spawned_at) / std.time.ns_per_ms, waiting_at != null });
+        return error.HostSyncHeld;
+    }
+    _ = try sync_child.wait(io);
+    const waited_from = waiting_at orelse {
+        std.debug.print("\nsmoke[frozen]: the sync returned without ever waiting on the frozen mount\n", .{});
+        return error.SyncNeverReachedTheMount;
+    };
+    const held_ms = (returned_at.? - waited_from) / std.time.ns_per_ms;
+    std.debug.print("\nsmoke[frozen]: the host-wide sync returned {d} ms after it began waiting on the frozen mount ({d} ms after its spawn; bound {d} s)\n", .{ held_ms, (returned_at.? - spawned_at) / std.time.ns_per_ms, frozen_timeout_s + frozen_check_s + frozen_after_abort_s });
+    // The kernel never aborts a request younger than the timeout (one poll
+    // of slack: the request was created just before it was seen waiting).
+    try testing.expect(held_ms + 1000 >= frozen_timeout_s * 1000);
+    // The frozen mount is fail-stopped by the kernel: every access answers
+    // ENOTCONN — and it stays in the table, the failure visible.
+    try testing.expectEqual(@as(usize, 1), try fuseMountsOf(gpa, io, rig.mp));
+    {
+        var pb: [linux.PATH_MAX]u8 = undefined;
+        const p = try std.fmt.bufPrintSentinel(&pb, "{s}/.stats", .{rig.mp}, 0);
+        const rc = linux.open(p.ptr, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+        if (linux.errno(rc) == .SUCCESS) _ = linux.close(@intCast(rc));
+        try testing.expectEqual(linux.E.NOTCONN, linux.errno(rc));
+        var cmd: [linux.PATH_MAX + 16]u8 = undefined;
+        const r = try rig.sh(rig.work, try std.fmt.bufPrint(&cmd, "sync -f {s}", .{rig.mp}));
+        defer rig.freeRun(r);
+        try testing.expect(!r.term.success());
+        try testing.expect(std.mem.indexOf(u8, r.stderr, "Transport endpoint is not connected") != null);
+    }
+    // Resumed, the daemon finds its connection ended under its live mount:
+    // it says so loudly, tears down and exits 1 (fail-stopped).
+    _ = linux.kill(rig.child_pid, .CONT);
+    resumed = true;
+    try testing.expectEqual(std.process.Child.Term{ .exited = 1 }, try rig.waitChild());
+    {
+        const text = try rig.readLog();
+        defer gpa.free(text);
+        try testing.expect(std.mem.indexOf(u8, text, "the kernel ended the FUSE connection under the live mount") != null);
+    }
+    _ = linux.umount2(rig.mp.ptr, linux.MNT.DETACH);
+    try testing.expectEqual(@as(usize, 0), try fuseMountsOf(gpa, io, rig.mp));
+    try testing.expectEqual(@as(?u64, frozen_timeout_s), negotiated_s);
+    // Without the seam the INIT reply carries the lattice's own bound.
+    _ = rig.env.swapRemove("SQUEEZEFS_TEST_FUSE_REQUEST_TIMEOUT_S");
+    const mark = try rig.logLen();
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(mark);
+    {
+        const st = try rig.stats();
+        defer gpa.free(st);
+        const lattice_ms = lease_clock.T_OWNER_MS + membership.park_reclaim.tParkMaxMs(extent_grant.failoverBoundMs(0, 0), membership.park_reclaim.graceMs(lease_clock.T_OWNER_MS));
+        try testing.expectEqual(@as(?u64, lattice_ms / 1000), numberAfter(st, "\"transport_request_timeout_s\":"));
+        const out = try rig.onMount("cat f");
+        defer gpa.free(out);
+        try testing.expectEqualStrings("frozen\n", out);
+    }
     try rig.umount();
     try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
 }

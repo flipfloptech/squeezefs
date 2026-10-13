@@ -325,6 +325,10 @@ pub const FileInfo = struct {
     durable_copy: ?Mapping = null,
 };
 
+/// The file facts and ONE block's binding (null = hole, or not striped)
+/// from ONE layout read.
+pub const FileAt = struct { info: FileInfo, binding: ?Mapping };
+
 /// The live layout map. `binding` is the CURRENT `block → mapping` (null =
 /// hole); it is re-read at every binding check, never cached across a
 /// fetch.
@@ -334,6 +338,11 @@ pub const Meta = struct {
     binding: *const fn (ctx: *anyopaque, ino: u64, block: u64) ?Mapping,
     /// The inline payload copied into `out`; bytes copied.
     inline_data: *const fn (ctx: *anyopaque, ino: u64, offset: u64, out: []u8) usize,
+    /// `file` and `binding(block)` from one layout read — the warm
+    /// ladder's probe asks both for one request (each was a layout-record
+    /// lookup and decode: `docs/evidence/rung-10-dev-perf.md` §3.6); null =
+    /// the probe asks them apart.
+    file_at: ?*const fn (ctx: *anyopaque, ino: u64, block: u64) ?FileAt = null,
 };
 
 pub const DeviceError = errors.Error;
@@ -2118,8 +2127,12 @@ const Fixture = struct {
         @memcpy(out[0..n], self.inline_data[offset..][0..n]);
         return n;
     }
+    fn metaFileAt(ctx: *anyopaque, ino: u64, block: u64) ?FileAt {
+        const info = metaFile(ctx, ino) orelse return null;
+        return .{ .info = info, .binding = metaBinding(ctx, ino, block) };
+    }
     fn meta(self: *Fixture) Meta {
-        return .{ .ctx = self, .file = &metaFile, .binding = &metaBinding, .inline_data = &metaInline };
+        return .{ .ctx = self, .file = &metaFile, .binding = &metaBinding, .inline_data = &metaInline, .file_at = &metaFileAt };
     }
 
     // Volumes seam.

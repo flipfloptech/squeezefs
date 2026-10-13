@@ -186,15 +186,21 @@ pub const WarmLadder = struct {
         // 1. The per-inode TRY-lock: a contended stripe is a Demote.
         const guard = self.guards.tryAcquire(self.io, ino, .shared) orelse return self.demote(.contended);
         defer guard.release(self.io);
-        // 2. Size authority.
-        const info = rp.meta.file(rp.meta.ctx, ino) orelse return self.demote(.miss);
+        // 2. Size authority (and, from the same layout read, the binding of
+        //    the request's first block — under the guard writers take).
+        var pre: ??layout.Mapping = null;
+        const info = if (rp.meta.file_at) |fa| blk: {
+            const at = fa(rp.meta.ctx, ino, offset / rp.cfg.block_size) orelse return self.demote(.miss);
+            pre = at.binding;
+            break :blk at.info;
+        } else rp.meta.file(rp.meta.ctx, ino) orelse return self.demote(.miss);
         if (offset >= info.size) {
             stats.fast_dispatch_eof.inc();
             return .eof;
         }
         const want: usize = @intCast(@min(size, info.size - offset));
         const out = window[0..want];
-        const v = self.serve(ino, info, offset, out, odirect) catch |e| return self.demote(switch (e) {
+        const v = self.serve(ino, info, pre, offset, out, odirect) catch |e| return self.demote(switch (e) {
             error.Miss => .miss,
             error.WriteSide => .write_side,
         });
@@ -257,7 +263,9 @@ pub const WarmLadder = struct {
 
     /// Rungs 3–4 by layout; `Miss` = nothing resident, `WriteSide` = the
     /// write side holds custody the probe may not wait for.
-    fn serve(self: *WarmLadder, ino: u64, info: read_path.FileInfo, offset: u64, out: []u8, odirect: bool) error{ Miss, WriteSide }!Served {
+    /// `pre` = the first block's binding the probe resolved with the file
+    /// facts (null = not resolved: read it here).
+    fn serve(self: *WarmLadder, ino: u64, info: read_path.FileInfo, pre: ??layout.Mapping, offset: u64, out: []u8, odirect: bool) error{ Miss, WriteSide }!Served {
         const rp = self.rp;
         const bs = rp.cfg.block_size;
         switch (info.kind) {
@@ -298,7 +306,7 @@ pub const WarmLadder = struct {
                     .none => {},
                 }
                 if (rp.cfg.direct_device_true and odirect) return error.Miss;
-                const key = rp.meta.binding(rp.meta.ctx, ino, b) orelse return error.Miss;
+                const key = (if (pre) |p| p else rp.meta.binding(rp.meta.ctx, ino, b)) orelse return error.Miss;
                 const k = BlockKey.fromMapping(key);
                 // The payback credit is the device bytes the hit avoided
                 // (the ranged window), as on the lane (`readSingleBlock`).

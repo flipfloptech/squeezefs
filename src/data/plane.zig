@@ -2927,7 +2927,7 @@ pub const DataPlane = struct {
     // ---- the read path's seams ----
 
     fn meta(self: *DataPlane) read_path.Meta {
-        return .{ .ctx = self, .file = &metaFile, .binding = &metaBinding, .inline_data = &metaInlineData };
+        return .{ .ctx = self, .file = &metaFile, .binding = &metaBinding, .inline_data = &metaInlineData, .file_at = &metaFileAt };
     }
 
     fn metaFile(ctx: *anyopaque, ino: u64) ?read_path.FileInfo {
@@ -2937,6 +2937,19 @@ pub const DataPlane = struct {
         defer self.gpa.free(rec.value);
         const l = layout.XattrLayout.decode(rec.value, self.geo) catch return null;
         return .{ .size = size, .kind = l.kind, .file_id = l.file_id, .durable_copy = l.durableCopy() };
+    }
+
+    /// `metaFile` + `metaBinding(block)` over ONE layout-record read.
+    fn metaFileAt(ctx: *anyopaque, ino: u64, block: u64) ?read_path.FileAt {
+        const self: *DataPlane = @ptrCast(@alignCast(ctx));
+        const size = (self.inodeSize(ino) catch return null) orelse return null;
+        const rec = (self.layoutRecord(ino) catch return null) orelse return .{ .info = .{ .size = size, .kind = .inline_ }, .binding = null };
+        defer self.gpa.free(rec.value);
+        const l = layout.XattrLayout.decode(rec.value, self.geo) catch return null;
+        const info: read_path.FileInfo = .{ .size = size, .kind = l.kind, .file_id = l.file_id, .durable_copy = l.durableCopy() };
+        if (l.kind != .striped or block > std.math.maxInt(u32)) return .{ .info = info, .binding = null };
+        const b: u32 = @intCast(block);
+        return .{ .info = info, .binding = if (!l.isKvmap()) l.lookup(self.chunk, b) else self.kvmapLookup(ino, l, b) };
     }
 
     fn metaBinding(ctx: *anyopaque, ino: u64, block: u64) ?Mapping {

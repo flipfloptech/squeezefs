@@ -185,6 +185,22 @@ pub fn zcVerdict(kmbuf: KmbufVerdict, cap_sys_admin: bool, sparse_ok: bool) Verd
     return .present;
 }
 
+/// Will the connection HAVE its ring when the INIT reply lands — the zc
+/// surface's precondition? Since 7.2.4 the kernel creates the ring at
+/// reply time iff `fuse.enable_uring` reads Y then, and the daemon writes
+/// Y itself before replying (charter §3). The INIT request's
+/// FUSE_OVER_IO_URING offer is the parameter's value when the kernel SENT
+/// it: N on the first mount after every boot (the default), although that
+/// mount arms its ring all the same — gating zc on the offer silently put
+/// that mount on the slower buf_ring rung (`docs/evidence/rung-10-dev-
+/// perf.md` §3.1: rand-4k 17.4 k IOPS instead of 58 k). The parameter as
+/// read AFTER the daemon's write is the verdict; unreadable (a kernel
+/// without FUSE_IO_URING exposes no parameter) falls back to the offer.
+pub fn ringAtReply(offered_flags: u64, enable_uring_after_write: ?bool) bool {
+    if (enable_uring_after_write) |on| return on;
+    return offered_flags & abi.FUSE_OVER_IO_URING != 0;
+}
+
 /// `CapEff` from a `/proc/self/status` text: bit 21.
 pub fn capSysAdminFromStatus(text: []const u8) ?bool {
     var it = std.mem.splitScalar(u8, text, '\n');
@@ -417,6 +433,15 @@ test "the zc surface is a conjunction of kmbuf, CapEff bit 21 and the sparse tab
     try testing.expectEqual(@as(?bool, true), capSysAdminFromStatus("CapEff: 0000000000200000"));
     try testing.expectEqual(@as(?bool, null), capSysAdminFromStatus("CapPrm:\t00000000a82465fb\n"));
     try testing.expectEqual(@as(?bool, null), capSysAdminFromStatus("CapEff:\tzz\n"));
+}
+
+test "the ring exists at reply time iff enable_uring reads Y after the daemon's write: the first mount after boot (offer absent, parameter N when INIT was sent) still arms zc; an unreadable parameter falls back to the offer" {
+    try testing.expect(ringAtReply(0, true));
+    try testing.expect(ringAtReply(abi.FUSE_OVER_IO_URING, true));
+    try testing.expect(!ringAtReply(abi.FUSE_OVER_IO_URING, false));
+    try testing.expect(!ringAtReply(0, false));
+    try testing.expect(ringAtReply(abi.FUSE_OVER_IO_URING, null));
+    try testing.expect(!ringAtReply(0, null));
 }
 
 test "FUSE_TIME_LIMITS: bit 62 offered is the probe" {

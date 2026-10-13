@@ -969,16 +969,17 @@ pub const Session = struct {
         self.plan = geometry.plan(geometry.resolveInputs(facts, env, cfg.block_size, cfg.mem_budget_bytes, max_pages_limit, cfg.opts.max_background, cfg.opts.congestion_threshold));
         self.topo = placement.Topology.probe(self.io);
         const qid_is_cpu = self.plan.nqueues == facts.possible_cpus;
+        // 3. `fuse.enable_uring=Y` BEFORE the reply lands: since 7.2.4 the
+        //    kernel creates the connection's ring at INIT-reply time iff the
+        //    parameter reads Y then; a later REGISTER on a ring-less
+        //    connection is -EINVAL. Written BEFORE the probes: the zc verdict
+        //    needs the ring the reply will create, not the INIT request's
+        //    offer (`probes.ringAtReply`).
+        ensureKernelUringEnabled(self.io);
         try self.resolveMode(env, init_in.folded());
         const topology: geometry.Topology = .{ .ctx = &self.topo, .node_of = nodeOfCpu };
         self.drain_groups = try geometry.drainGroupPlan(gpa, self.plan.nqueues, qid_is_cpu, topology, geometry.forcedWidth(self.mode, geometry.drainGroupWidthOverride(env)));
         errdefer self.drain_groups.deinit(gpa);
-
-        // 3. `fuse.enable_uring=Y` BEFORE the reply lands: since 7.2.4 the
-        //    kernel creates the connection's ring at INIT-reply time iff the
-        //    parameter reads Y then; a later REGISTER on a ring-less
-        //    connection is -EINVAL.
-        ensureKernelUringEnabled(self.io);
 
         // 4. The reply word; the filesystem's init hook sees the negotiation.
         const wants: codec.InitWants = .{ .writeback_cache = cfg.opts.write_back and !cfg.opts.read_only };
@@ -1140,10 +1141,11 @@ pub const Session = struct {
         const page: u32 = @intCast(self.facts.page_size);
         const kmbuf_v = probes.driver.probeKmbuf(page);
         const cap = probes.driver.capSysAdmin(self.io, env);
-        // The ring exists only when the kernel offered FUSE_OVER_IO_URING;
-        // the sparse table is the zc slot shape (depth + the headers slot).
-        const ring_offered = offered & abi.FUSE_OVER_IO_URING != 0;
-        const sparse_ok = ring_offered and probes.driver.probeSparse(self.plan.depth + 1);
+        // The ring the reply will create (the parameter after our write,
+        // `probes.ringAtReply`); the sparse table is the zc slot shape
+        // (depth + the headers slot).
+        const ring_at_reply = probes.ringAtReply(offered, readEnableUring(self.io));
+        const sparse_ok = ring_at_reply and probes.driver.probeSparse(self.plan.depth + 1);
         self.verdicts = .{ .kmbuf = kmbuf_v, .zc = probes.zcVerdict(kmbuf_v, cap, sparse_ok) };
         const lever = probes.leverFromKnob(knobs.enumKnob("SQUEEZEFS_FUSE_BUFFER_MODE", env));
         self.mode = probes.resolveBufferMode(self.verdicts, lever) catch |e| {

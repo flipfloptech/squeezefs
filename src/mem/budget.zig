@@ -151,10 +151,10 @@ pub fn effectiveParkedCap(cap: u64, level_now: Level) u64 {
 
 /// The fleet share in force: the `SQUEEZEFS_TEST_FLEET_SHARE` seam when
 /// present, else the per-tick census of squeezefs daemons sharing this
-/// process's cgroup (`censusFleetShare`); 1 off-cgroup or off-Linux.
-pub fn fleetShare(io: std.Io, env: *const std.process.Environ.Map) u32 {
+/// process's cgroup (`readFleetShare` over `roots`); 1 off-cgroup/off-Linux.
+pub fn fleetShare(io: std.Io, env: *const std.process.Environ.Map, roots: CensusRoots) u32 {
     if (knobs.optIntKnob("SQUEEZEFS_TEST_FLEET_SHARE", u32, env)) |pinned| return pinned;
-    return readFleetShare(io);
+    return readFleetShare(io, roots);
 }
 
 /// `SQUEEZEFS_MEM_BUDGET_MB` × 1 MiB; null when absent.
@@ -308,45 +308,83 @@ pub fn readCgroupUnreclaimable(io: std.Io) ?u64 {
     return parseUnreclaimableMemoryStat(text);
 }
 
-/// The fleet share census: the pids of `<cgroup_root><path>/cgroup.procs`
-/// whose `<proc_root>/<pid>/comm` equals `my_comm` — the squeezefs daemons
-/// sharing this cage. Floor 1 (this process is one of them). Pure over the
-/// two roots so a synthetic tree tests it; null when the cgroup's process
-/// list is unreadable (the caller falls back to 1, loudly).
-pub fn censusFleetShare(io: std.Io, cgroup_root_dir: []const u8, path: []const u8, proc_root: []const u8, my_comm: []const u8) ?u32 {
+/// Where the fleet census reads: `<proc>/self/{cgroup,stat}` name this
+/// process, its cage's `<cgroup><path>/cgroup.procs` lists the pids, and
+/// `<proc>/<pid>/stat` gives each one's comm and state. Production reads
+/// the live trees; a test roots both in a fixture, so the share it pins
+/// never counts another process on the box.
+pub const CensusRoots = struct {
+    proc: []const u8 = "/proc",
+    cgroup: []const u8 = cgroup_root,
+};
+
+/// The fields of `/proc/<pid>/stat` the census reads.
+pub const ProcStat = struct { pid: []const u8, comm: []const u8, state: u8 };
+
+/// The head of `/proc/<pid>/stat` the census parses: a pid (≤ 7 digits at
+/// the kernel's 2^22 `pid_max`) + ` (` + the comm (≤ 64 B, the kernel's
+/// `%.64s`) + `) ` + the state: ≤ 76 B; the numeric fields after it go unread.
+const proc_stat_head_bytes = 128;
+
+/// `<pid> (<comm>) <state> …`: the comm may itself hold spaces and
+/// parentheses, so it ends at the LAST `) ` (every later field is numeric).
+/// Null on any other shape.
+pub fn parseProcStat(text: []const u8) ?ProcStat {
+    const open = std.mem.indexOf(u8, text, " (") orelse return null;
+    const close = std.mem.lastIndexOf(u8, text, ") ") orelse return null;
+    if (close < open + 2 or close + 2 >= text.len) return null;
+    return .{ .pid = text[0..open], .comm = text[open + 2 .. close], .state = text[close + 2] };
+}
+
+/// The fleet share census of the cage at `path`: the pids of its
+/// `cgroup.procs` whose stat names a live process with this process's comm
+/// — a zombie (exited, unreaped, listed in the window between the two
+/// reads) holds no memory and never counts. Pure over `roots`. Null when the
+/// list is unreadable or does not list this process (a view of another cage
+/// or pid namespace, whose count means nothing here; the caller falls back
+/// to 1, loudly) — so a census is ≥ 1 by construction.
+pub fn censusFleetShare(io: std.Io, roots: CensusRoots, path: []const u8) ?u32 {
     var file_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const procs_path = std.fmt.bufPrint(&file_buf, "{s}{s}/cgroup.procs", .{ cgroup_root_dir, std.mem.trimEnd(u8, path, "/") }) catch return null;
+    var self_buf: [proc_stat_head_bytes]u8 = undefined;
+    const self_path = std.fmt.bufPrint(&file_buf, "{s}/self/stat", .{roots.proc}) catch return null;
+    const me = parseProcStat(readSmallFile(io, self_path, &self_buf) orelse return null) orelse return null;
+    const procs_path = std.fmt.bufPrint(&file_buf, "{s}{s}/cgroup.procs", .{ roots.cgroup, std.mem.trimEnd(u8, path, "/") }) catch return null;
     // A cage with thousands of pids is not a daemon's: 64 KiB of pids
     // (~8k entries) is the most this census needs to see.
     var procs_buf: [64 * 1024]u8 = undefined;
     const procs = readSmallFile(io, procs_path, &procs_buf) orelse return null;
     var n: u32 = 0;
-    var lines = std.mem.tokenizeAny(u8, procs, " \t\r\n");
-    while (lines.next()) |pid| {
-        var comm_path: [std.Io.Dir.max_path_bytes]u8 = undefined;
-        const cp = std.fmt.bufPrint(&comm_path, "{s}/{s}/comm", .{ proc_root, pid }) catch continue;
-        var comm_buf: [64]u8 = undefined;
-        const comm = readSmallFile(io, cp, &comm_buf) orelse continue;
-        if (std.mem.eql(u8, std.mem.trim(u8, comm, " \t\r\n"), my_comm)) n += 1;
+    var self_listed = false;
+    var pids = std.mem.tokenizeAny(u8, procs, " \t\r\n");
+    while (pids.next()) |pid| {
+        if (std.mem.eql(u8, pid, me.pid)) {
+            self_listed = true;
+            n += 1;
+            continue;
+        }
+        const stat_path = std.fmt.bufPrint(&file_buf, "{s}/{s}/stat", .{ roots.proc, pid }) catch continue;
+        var stat_buf: [proc_stat_head_bytes]u8 = undefined;
+        const st = parseProcStat(readSmallFile(io, stat_path, &stat_buf) orelse continue) orelse continue;
+        if (st.state != 'Z' and st.state != 'X' and std.mem.eql(u8, st.comm, me.comm)) n += 1;
     }
-    return @max(n, 1);
+    return if (self_listed) n else null;
 }
 
 var fleet_census_warned: std.atomic.Value(bool) = .init(false);
 
-/// This process's fleet share from the census of its own cgroup; 1 off-Linux
-/// or off-cgroup (the cage already divides); 1 with ONE warning when the
-/// process list is unreadable.
-pub fn readFleetShare(io: std.Io) u32 {
-    if (builtin.os.tag != .linux) return 1;
+/// This process's fleet share from the census of its own cgroup over
+/// `roots`; 1 off-cgroup (no `0::` line in `<proc>/self/cgroup`, as
+/// off-Linux: the cage, if any, already divides); 1 with ONE warning when
+/// the census is null.
+pub fn readFleetShare(io: std.Io, roots: CensusRoots) u32 {
+    var file_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const cg_path = std.fmt.bufPrint(&file_buf, "{s}/self/cgroup", .{roots.proc}) catch return 1;
     var cg_buf: [4096]u8 = undefined;
-    const cg = readSmallFile(io, "/proc/self/cgroup", &cg_buf) orelse return 1;
+    const cg = readSmallFile(io, cg_path, &cg_buf) orelse return 1;
     const path = parseCgroupV2Path(cg) orelse return 1;
-    var comm_buf: [64]u8 = undefined;
-    const my_comm = std.mem.trim(u8, readSmallFile(io, "/proc/self/comm", &comm_buf) orelse return 1, " \t\r\n");
-    return censusFleetShare(io, cgroup_root, path, "/proc", my_comm) orelse {
+    return censusFleetShare(io, roots, path) orelse {
         if (!fleet_census_warned.swap(true, .monotonic)) {
-            log.warn("mem_budget: {s}{s}/cgroup.procs is unreadable — fleet share falls back to 1 (the whole-machine posture; co-located daemons will not divide the roots)", .{ cgroup_root, path });
+            log.warn("mem_budget: {s}{s}/cgroup.procs is unreadable or does not list this process — fleet share falls back to 1 (the whole-machine posture; co-located daemons will not divide the roots)", .{ roots.cgroup, path });
         }
         return 1;
     };
@@ -474,11 +512,14 @@ pub const Component = struct {
 };
 
 /// What the live `tick` needs from the process: the Io handle (the sampler's
-/// timed wait), the environment (knobs re-read every tick) and the machine.
+/// timed wait), the environment (knobs re-read every tick), the machine and
+/// the fleet census's process source (the live trees unless a test roots it
+/// in a fixture).
 pub const Host = struct {
     io: std.Io,
     env: *const std.process.Environ.Map,
     facts: derive.Facts,
+    census: CensusRoots = .{},
 };
 
 // ---------------------------------------------------------------------------
@@ -794,11 +835,17 @@ pub const MemBudget = struct {
     /// footprint agrees with what the sampler will enforce. The binding
     /// cgroup level is logged when it changes.
     pub fn resolveBudgetNow(self: *MemBudget, host: Host) u64 {
+        return self.resolveBudgetShared(host, fleetShare(host.io, host.env, host.census));
+    }
+
+    /// `resolveBudgetNow` for a share the caller already read: the tick
+    /// divides its budget and its unreclaimable sample by ONE census.
+    fn resolveBudgetShared(self: *MemBudget, host: Host, share: u32) u64 {
         const flag = self.flag_budget.load(.monotonic);
         var level_buf: [2][std.Io.Dir.max_path_bytes]u8 = undefined;
         const cage = readCgroupCage(host.io, &level_buf);
         self.noteCage(cage);
-        return resolveBudgetFromShared(if (flag == 0) null else flag, envBudgetBytes(host.env), if (cage) |c| c.effective() else null, host.facts.total_ram, fleetShare(host.io, host.env));
+        return resolveBudgetFromShared(if (flag == 0) null else flag, envBudgetBytes(host.env), if (cage) |c| c.effective() else null, host.facts.total_ram, share);
     }
 
     /// Publish the cage and log the level that binds it on every change
@@ -827,15 +874,16 @@ pub const MemBudget = struct {
     /// The mount-time face of `sizing.fleetShareFloorRefusal`; null = mount
     /// proceeds.
     pub fn fleetShareMountRefusal(self: *const MemBudget, host: Host, buf: *sizing.RefusalBuf) ?[]const u8 {
-        const share = fleetShare(host.io, host.env);
+        const share = fleetShare(host.io, host.env, host.census);
         if (share <= 1 or self.explicitBudgetEngaged(host.env)) return null;
         const divided = resolveBudgetFromShared(null, null, readCgroupMemoryMax(host.io), host.facts.total_ram, share);
         return sizing.fleetShareFloorRefusal(share, divided, host.facts.possible_cpus, buf);
     }
 
-    /// Production tick: resolve + probe + `tickInputs` + `tickInner`.
+    /// Production tick: census + resolve + probe + `tickInputs` + `tickInner`.
     pub fn tick(self: *MemBudget, host: Host) void {
-        const in = tickInputs(self.resolveBudgetNow(host), readRssBytes(host.io, host.facts.page_size), readCgroupUnreclaimable(host.io) orelse 0, fleetShare(host.io, host.env));
+        const share = fleetShare(host.io, host.env, host.census);
+        const in = tickInputs(self.resolveBudgetShared(host, share), readRssBytes(host.io, host.facts.page_size), readCgroupUnreclaimable(host.io) orelse 0, share);
         self.tickInner(in.budget, in.rss, in.unreclaimable);
     }
 
@@ -1602,17 +1650,104 @@ test "stats JSON carries every spec key with live values" {
 
 // ---- §6 knob faces ----
 
+/// A census fixture in a tmp dir: `proc/` and `cgroup/` trees holding this
+/// process (pid 4242, comm `squeezefs-unit`, in `cage`) plus `others` — the
+/// census tests' ONLY process source, so no co-tenant on the box (another
+/// agent's unit run) moves a share they pin. `init` in place: `roots()`
+/// slices the fixture's own buffers.
+const CensusFixture = struct {
+    tmp: testing.TmpDir,
+    proc_buf: [std.Io.Dir.max_path_bytes]u8,
+    proc_len: usize,
+    cgroup_buf: [std.Io.Dir.max_path_bytes]u8,
+    cgroup_len: usize,
+
+    const self_pid: u32 = 4242;
+    const comm = "squeezefs-unit";
+    const cage = "/sqz.slice/a.service";
+    const cage_procs = "cgroup" ++ cage ++ "/cgroup.procs";
+
+    const Proc = struct {
+        pid: u32,
+        comm: []const u8 = comm,
+        /// The stat state; null = listed in `cgroup.procs` but reaped before
+        /// the census read its stat (no `/proc` entry).
+        state: ?u8 = 'S',
+        cgroup: []const u8 = cage,
+    };
+
+    fn init(fx: *CensusFixture, others: []const Proc) !void {
+        fx.tmp = testing.tmpDir(.{});
+        errdefer fx.tmp.cleanup();
+        var root_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const root = root_buf[0..try fx.tmp.dir.realPath(testing.io, &root_buf)];
+        fx.proc_len = (try std.fmt.bufPrint(&fx.proc_buf, "{s}/proc", .{root})).len;
+        fx.cgroup_len = (try std.fmt.bufPrint(&fx.cgroup_buf, "{s}/cgroup", .{root})).len;
+        // The kernel's `/proc/self` links to `/proc/<pid>`; a copy reads the same.
+        try fx.writeStat("self", self_pid, comm, 'R');
+        try fx.writeStat(std.fmt.comptimePrint("{d}", .{self_pid}), self_pid, comm, 'R');
+        try fx.tmp.dir.writeFile(testing.io, .{ .sub_path = "proc/self/cgroup", .data = "0::" ++ cage ++ "\n" });
+        for (others) |p| if (p.state) |state| {
+            var name_buf: [16]u8 = undefined;
+            try fx.writeStat(try std.fmt.bufPrint(&name_buf, "{d}", .{p.pid}), p.pid, p.comm, state);
+        };
+        try fx.writeProcs(cage, true, others);
+        for (others, 0..) |p, i| {
+            if (std.mem.eql(u8, p.cgroup, cage)) continue;
+            const first = for (others[0..i]) |q| {
+                if (std.mem.eql(u8, q.cgroup, p.cgroup)) break false;
+            } else true;
+            if (first) try fx.writeProcs(p.cgroup, false, others);
+        }
+    }
+
+    fn deinit(fx: *CensusFixture) void {
+        fx.tmp.cleanup();
+    }
+
+    fn roots(fx: *const CensusFixture) CensusRoots {
+        return .{ .proc = fx.proc_buf[0..fx.proc_len], .cgroup = fx.cgroup_buf[0..fx.cgroup_len] };
+    }
+
+    fn writeStat(fx: *CensusFixture, dir: []const u8, pid: u32, c: []const u8, state: u8) !void {
+        var path_buf: [64]u8 = undefined;
+        try fx.tmp.dir.createDirPath(testing.io, try std.fmt.bufPrint(&path_buf, "proc/{s}", .{dir}));
+        var text_buf: [256]u8 = undefined;
+        const text = try std.fmt.bufPrint(&text_buf, "{d} ({s}) {c} 1 {d} {d} 0 -1 4194560 211 0 0 0\n", .{ pid, c, state, pid, pid });
+        try fx.tmp.dir.writeFile(testing.io, .{ .sub_path = try std.fmt.bufPrint(&path_buf, "proc/{s}/stat", .{dir}), .data = text });
+    }
+
+    /// `cgroup<cgroup>/cgroup.procs`: every `others` pid in that cgroup, this
+    /// process's first when `with_self`.
+    fn writeProcs(fx: *CensusFixture, cgroup: []const u8, with_self: bool, others: []const Proc) !void {
+        var text_buf: [1024]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&text_buf);
+        if (with_self) try w.print("{d}\n", .{self_pid});
+        for (others) |p| if (std.mem.eql(u8, p.cgroup, cgroup)) try w.print("{d}\n", .{p.pid});
+        var dir_buf: [128]u8 = undefined;
+        const dir = try std.fmt.bufPrint(&dir_buf, "cgroup{s}", .{std.mem.trimEnd(u8, cgroup, "/")});
+        try fx.tmp.dir.createDirPath(testing.io, dir);
+        var file_buf: [160]u8 = undefined;
+        try fx.tmp.dir.writeFile(testing.io, .{ .sub_path = try std.fmt.bufPrint(&file_buf, "{s}/cgroup.procs", .{dir}), .data = w.buffered() });
+    }
+};
+
 test "knob faces: SQUEEZEFS_MEM_BUDGET_MB wins verbatim and undivided; absent falls to the derived tier" {
     const gpa = testing.allocator;
     var env = std.process.Environ.Map.init(gpa);
     defer env.deinit();
     var b: MemBudget = .{};
-    const host = Host{ .io = testing.io, .env = &env, .facts = derive.Facts.synthetic(8, 10 * GiB) };
+    // One co-tenant daemon in the fixture's cage: a census of 2.
+    var fx: CensusFixture = undefined;
+    try fx.init(&.{.{ .pid = 100 }});
+    defer fx.deinit();
+    const host = Host{ .io = testing.io, .env = &env, .facts = derive.Facts.synthetic(8, 10 * GiB), .census = fx.roots() };
     try testing.expect(!b.explicitBudgetEngaged(&env));
-    // Off a cgroup the derived tier is 70 % of RAM (on Linux the venue's cage may win; both are the pure form).
-    try testing.expectEqual(resolveBudgetFromShared(null, null, readCgroupMemoryMax(testing.io), 10 * GiB, 1), b.resolveBudgetNow(host));
+    // The derived tier divides the system roots by the census (off a cgroup 70 % of RAM; on Linux the venue's cage may win; both are the pure form).
+    try testing.expectEqual(resolveBudgetFromShared(null, null, readCgroupMemoryMax(testing.io), 10 * GiB, 2), b.resolveBudgetNow(host));
     try env.put("SQUEEZEFS_MEM_BUDGET_MB", "3072");
     try testing.expect(b.explicitBudgetEngaged(&env));
+    // Undivided by the census's 2 and by the seam's 4.
     try testing.expectEqual(3 * GiB, b.resolveBudgetNow(host));
     try env.put("SQUEEZEFS_TEST_FLEET_SHARE", "4");
     try testing.expectEqual(3 * GiB, b.resolveBudgetNow(host));
@@ -1630,41 +1765,84 @@ test "knob faces: the fleet share is the census unless the SQUEEZEFS_TEST_FLEET_
     const gpa = testing.allocator;
     var env = std.process.Environ.Map.init(gpa);
     defer env.deinit();
-    // Absent: the census (this test process alone in its cage, or off-cgroup) — never 0.
-    try testing.expect(fleetShare(testing.io, &env) >= 1);
-    try testing.expectEqual(readFleetShare(testing.io), fleetShare(testing.io, &env));
+    var fx: CensusFixture = undefined;
+    try fx.init(&.{ .{ .pid = 100 }, .{ .pid = 101 } });
+    defer fx.deinit();
+    // Absent: the census — the fixture's three daemons.
+    try testing.expectEqual(@as(u32, 3), fleetShare(testing.io, &env, fx.roots()));
     try env.put("SQUEEZEFS_TEST_FLEET_SHARE", "4");
-    try testing.expectEqual(@as(u32, 4), fleetShare(testing.io, &env));
+    try testing.expectEqual(@as(u32, 4), fleetShare(testing.io, &env, fx.roots()));
     try env.put("SQUEEZEFS_TEST_FLEET_SHARE", "0");
     log.testing.expectErrorLogs(1);
-    try testing.expectEqual(readFleetShare(testing.io), fleetShare(testing.io, &env));
+    try testing.expectEqual(@as(u32, 3), fleetShare(testing.io, &env, fx.roots()));
     try log.testing.expectAllFired();
 }
 
-test "fleet census over a synthetic tree: only pids whose comm is ours count; floor 1; an unreadable list is null" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var root_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const root_len = try tmp.dir.realPath(testing.io, &root_buf);
-    const root = root_buf[0..root_len];
-    var cg_root_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const cg_root = try std.fmt.bufPrint(&cg_root_buf, "{s}/cgroup", .{root});
-    var proc_root_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const proc_root = try std.fmt.bufPrint(&proc_root_buf, "{s}/proc", .{root});
-    try tmp.dir.createDirPath(testing.io, "cgroup/sqz.slice/a.service");
-    try tmp.dir.writeFile(testing.io, .{ .sub_path = "cgroup/sqz.slice/a.service/cgroup.procs", .data = "100\n101\n102\n7\n" });
-    for ([_]struct { pid: []const u8, comm: []const u8 }{ .{ .pid = "100", .comm = "squeezefs\n" }, .{ .pid = "101", .comm = "squeezefs\n" }, .{ .pid = "102", .comm = "bash\n" } }) |e| {
-        var dir_buf: [64]u8 = undefined;
-        try tmp.dir.createDirPath(testing.io, try std.fmt.bufPrint(&dir_buf, "proc/{s}", .{e.pid}));
-        var file_buf: [64]u8 = undefined;
-        try tmp.dir.writeFile(testing.io, .{ .sub_path = try std.fmt.bufPrint(&file_buf, "proc/{s}/comm", .{e.pid}), .data = e.comm });
+test "fleet census over fixtures: 0, 1, 2 and 8 co-tenant daemons are a share of 1, 2, 3 and 9" {
+    for ([_]u32{ 0, 1, 2, 8 }) |co_tenants| {
+        var others: [8]CensusFixture.Proc = undefined;
+        for (others[0..co_tenants], 0..) |*p, i| p.* = .{ .pid = 100 + @as(u32, @intCast(i)) };
+        var fx: CensusFixture = undefined;
+        try fx.init(others[0..co_tenants]);
+        defer fx.deinit();
+        try testing.expectEqual(@as(?u32, co_tenants + 1), censusFleetShare(testing.io, fx.roots(), CensusFixture.cage));
+        try testing.expectEqual(co_tenants + 1, readFleetShare(testing.io, fx.roots()));
     }
-    // Two squeezefs daemons, one bash, one pid without a /proc entry (exited).
-    try testing.expectEqual(@as(?u32, 2), censusFleetShare(testing.io, cg_root, "/sqz.slice/a.service", proc_root, "squeezefs"));
-    // Nobody with our comm: the floor is 1 (this process is one).
-    try testing.expectEqual(@as(?u32, 1), censusFleetShare(testing.io, cg_root, "/sqz.slice/a.service", proc_root, "nothing"));
-    // An unreadable process list is null: the caller falls back to 1 loudly.
-    try testing.expectEqual(@as(?u32, null), censusFleetShare(testing.io, cg_root, "/sqz.slice/missing", proc_root, "squeezefs"));
+}
+
+test "fleet census over a fixture: a zombie, a reaped pid, another comm and our comm in another cgroup never count" {
+    var fx: CensusFixture = undefined;
+    try fx.init(&.{
+        .{ .pid = 100 }, // a co-tenant daemon: counts
+        .{ .pid = 101, .state = 'Z' }, // exited, unreaped: listed in the window between the two reads
+        .{ .pid = 102, .state = 'X' }, // dead
+        .{ .pid = 103, .state = null }, // reaped between the two reads: no /proc entry
+        .{ .pid = 104, .comm = "bash" },
+        .{ .pid = 105, .comm = "squeezefs-unit2" },
+        .{ .pid = 106, .cgroup = "/other.slice/b.service" }, // our comm, another cage
+    });
+    defer fx.deinit();
+    try testing.expectEqual(@as(?u32, 2), censusFleetShare(testing.io, fx.roots(), CensusFixture.cage));
+    try testing.expectEqual(@as(u32, 2), readFleetShare(testing.io, fx.roots()));
+    // A trailing slash names the same cage.
+    try testing.expectEqual(@as(?u32, 2), censusFleetShare(testing.io, fx.roots(), CensusFixture.cage ++ "/"));
+    // The root cgroup (`0::/`, the venue container's own line) reads `<cgroup>/cgroup.procs`.
+    try fx.tmp.dir.writeFile(testing.io, .{ .sub_path = "proc/self/cgroup", .data = "0::/\n" });
+    try fx.tmp.dir.writeFile(testing.io, .{ .sub_path = "cgroup/cgroup.procs", .data = "100\n4242\n106\n101\n" });
+    try testing.expectEqual(@as(u32, 3), readFleetShare(testing.io, fx.roots()));
+}
+
+test "fleet census over a fixture: a list that is unreadable or does not list this process is null (share 1, warned); off-cgroup is 1" {
+    var fx: CensusFixture = undefined;
+    try fx.init(&.{ .{ .pid = 100 }, .{ .pid = 101 } });
+    defer fx.deinit();
+    try testing.expectEqual(@as(?u32, 3), censusFleetShare(testing.io, fx.roots(), CensusFixture.cage));
+    // A list without this process is a view of another cage or pid namespace: its count means nothing here.
+    try fx.tmp.dir.writeFile(testing.io, .{ .sub_path = CensusFixture.cage_procs, .data = "100\n101\n" });
+    try testing.expectEqual(@as(?u32, null), censusFleetShare(testing.io, fx.roots(), CensusFixture.cage));
+    try testing.expectEqual(@as(u32, 1), readFleetShare(testing.io, fx.roots()));
+    try fx.tmp.dir.deleteFile(testing.io, CensusFixture.cage_procs);
+    try testing.expectEqual(@as(?u32, null), censusFleetShare(testing.io, fx.roots(), CensusFixture.cage));
+    try testing.expectEqual(@as(u32, 1), readFleetShare(testing.io, fx.roots()));
+    // Off-cgroup (no `0::` line, as off-Linux): 1 — the cage, if any, already divides.
+    try fx.tmp.dir.writeFile(testing.io, .{ .sub_path = "proc/self/cgroup", .data = "4:memory:/x\n" });
+    try testing.expectEqual(@as(u32, 1), readFleetShare(testing.io, fx.roots()));
+    try fx.tmp.dir.deleteFile(testing.io, "proc/self/cgroup");
+    try testing.expectEqual(@as(u32, 1), readFleetShare(testing.io, fx.roots()));
+}
+
+test "proc stat head: the comm ends at the LAST `) ` (a comm may hold spaces and parentheses); any other shape is null" {
+    const st = parseProcStat("4242 (squeezefs-unit) S 1 4242 4242 0 -1\n").?;
+    try testing.expectEqualStrings("4242", st.pid);
+    try testing.expectEqualStrings("squeezefs-unit", st.comm);
+    try testing.expectEqual(@as(u8, 'S'), st.state);
+    const odd = parseProcStat("7 (a) (b) c) Z 1 7").?;
+    try testing.expectEqualStrings("a) (b) c", odd.comm);
+    try testing.expectEqual(@as(u8, 'Z'), odd.state);
+    try testing.expectEqualStrings("", parseProcStat("9 () R 1").?.comm);
+    for ([_][]const u8{ "", "4242", "4242 (squeezefs-unit)", "4242 (squeezefs-unit) ", "(x) S 1", "1 (x S 1" }) |bad| {
+        try testing.expect(parseProcStat(bad) == null);
+    }
 }
 
 test "cgroup cage walks the ancestor chain: a slice cap binds over an uncapped leaf; memory.high tightens; the binding level is named" {
@@ -1722,9 +1900,20 @@ test "fleet share mount refusal: share 1 or an explicit tier stands down; a divi
     defer env.deinit();
     var buf: sizing.RefusalBuf = undefined;
     var b: MemBudget = .{};
-    // 4096 possible CPUs × 4 × 1 MiB = 16 GiB floor against a 1 GiB RAM root.
-    const tiny = Host{ .io = testing.io, .env = &env, .facts = .{ .cpus = 4096, .possible_cpus = 4096, .page_size = 4096, .total_ram = GiB } };
+    var solo: CensusFixture = undefined;
+    try solo.init(&.{});
+    defer solo.deinit();
+    var paired: CensusFixture = undefined;
+    try paired.init(&.{.{ .pid = 100 }});
+    defer paired.deinit();
+    // 4096 possible CPUs × 4 × 1 MiB = 16 GiB floor against a 1 GiB RAM root (the venue's 16 GiB cage × 0.8 ÷ 2 is below it too).
+    var tiny = Host{ .io = testing.io, .env = &env, .facts = .{ .cpus = 4096, .possible_cpus = 4096, .page_size = 4096, .total_ram = GiB }, .census = solo.roots() };
+    // Alone in the cage: share 1 stands down.
     try testing.expectEqual(@as(?[]const u8, null), b.fleetShareMountRefusal(tiny, &buf));
+    // A co-tenant in the census divides the root below the floor.
+    tiny.census = paired.roots();
+    try testing.expect(b.fleetShareMountRefusal(tiny, &buf) != null);
+    tiny.census = solo.roots();
     try env.put("SQUEEZEFS_TEST_FLEET_SHARE", "2");
     try testing.expect(b.fleetShareMountRefusal(tiny, &buf) != null);
     try env.put("SQUEEZEFS_MEM_BUDGET_MB", "1");
@@ -1746,8 +1935,11 @@ test "linux: cgroup/proc readers return plausible values" {
     // 16 GiB cap); an uncapped one as null. Either way the unreclaimable set
     // of a running process is non-zero (its own anon pages) and plausible.
     if (readCgroupMemoryMax(testing.io)) |max| try testing.expect(max > 0);
-    // The census sees at least this process.
-    try testing.expect(readFleetShare(testing.io) >= 1);
+    // The ONE live census read: other agents' unit runs share the venue's
+    // cage, so only what holds under any co-tenancy is asserted. Non-null =
+    // this process's own pid was listed and counted, so N >= 1.
+    const n = censusFleetShare(testing.io, .{}, parseCgroupV2Path(readSmallFile(testing.io, "/proc/self/cgroup", &cg_buf).?).?).?;
+    try testing.expect(n >= 1);
     const unreclaimable = readCgroupUnreclaimable(testing.io).?;
     try testing.expect(unreclaimable > 0 and unreclaimable < derive.TiB);
     const gpa = testing.allocator;
@@ -1756,7 +1948,8 @@ test "linux: cgroup/proc readers return plausible values" {
     var b: MemBudget = .{};
     const facts = derive.Facts.probe();
     const host = Host{ .io = testing.io, .env = &env, .facts = facts };
-    try testing.expectEqual(resolveBudgetFromShared(null, null, readCgroupMemoryMax(testing.io), facts.total_ram, 1), b.resolveBudgetNow(host));
+    // The derived tier for the N it read is exactly the system root ÷ N form.
+    try testing.expectEqual(resolveBudgetFromShared(null, null, readCgroupMemoryMax(testing.io), facts.total_ram, n), b.resolveBudgetShared(host, n));
     try testing.expect(b.resolveBudgetNow(host) > 0);
     b.tick(host);
     try testing.expect(b.budgetBytes() > 0);
@@ -1770,8 +1963,11 @@ test "sampler thread: idempotent spawn, ticks on its period, stops" {
     var env = std.process.Environ.Map.init(gpa);
     defer env.deinit();
     try env.put("SQUEEZEFS_MEM_BUDGET_MB", "1");
+    var fx: CensusFixture = undefined;
+    try fx.init(&.{});
+    defer fx.deinit();
     var b: MemBudget = .{};
-    const host = Host{ .io = testing.io, .env = &env, .facts = derive.Facts.synthetic(2, GiB) };
+    const host = Host{ .io = testing.io, .env = &env, .facts = derive.Facts.synthetic(2, GiB), .census = fx.roots() };
     try testing.expect(try b.spawnSampler(host, 1 * std.time.ns_per_ms));
     try testing.expect(!try b.spawnSampler(host, 1 * std.time.ns_per_ms));
     // Bounded wait for two ticks: a wait on a condition, not a timed assumption.
@@ -1806,11 +2002,14 @@ test "sampler thread: SQUEEZEFS_TEST_MEM_SAMPLER_TICK_ON_STOP reads every source
     try env.put("SQUEEZEFS_MEM_BUDGET_MB", "1048576");
     // A period no test outlives: the only tick is the stop's.
     const never: u64 = 3600 * std.time.ns_per_s;
+    var fx: CensusFixture = undefined;
+    try fx.init(&.{});
+    defer fx.deinit();
     {
         var src: CountingSource = .{};
         var b: MemBudget = .{};
         b.register(Component.init("counting", 0, 0, .{ .func = .{ .ctx = &src, .call = CountingSource.current } }, null));
-        const host = Host{ .io = testing.io, .env = &env, .facts = derive.Facts.synthetic(2, GiB) };
+        const host = Host{ .io = testing.io, .env = &env, .facts = derive.Facts.synthetic(2, GiB), .census = fx.roots() };
         try testing.expect(try b.spawnSampler(host, never));
         b.stopSampler(testing.io);
         try testing.expectEqual(@as(u64, 0), src.reads.load(.monotonic));
@@ -1820,7 +2019,7 @@ test "sampler thread: SQUEEZEFS_TEST_MEM_SAMPLER_TICK_ON_STOP reads every source
         var src: CountingSource = .{};
         var b: MemBudget = .{};
         b.register(Component.init("counting", 0, 0, .{ .func = .{ .ctx = &src, .call = CountingSource.current } }, null));
-        const host = Host{ .io = testing.io, .env = &env, .facts = derive.Facts.synthetic(2, GiB) };
+        const host = Host{ .io = testing.io, .env = &env, .facts = derive.Facts.synthetic(2, GiB), .census = fx.roots() };
         try testing.expect(try b.spawnSampler(host, never));
         b.stopSampler(testing.io);
         // The stop's tick ran (the budget published) and read the source once
@@ -1839,8 +2038,10 @@ fn procTextFuzz(_: void, smith: *std.testing.Smith) !void {
     if (parseCgroupV2Path(text)) |p| try std.testing.expect(p.len <= text.len);
     _ = parseMemoryMax(text);
     _ = parseStatmResidentPages(text);
+    // pid + ` (` + comm + `) ` + state: every field a disjoint slice of the text.
+    if (parseProcStat(text)) |st| try std.testing.expect(st.pid.len + st.comm.len + 5 <= text.len);
 }
 
 test "fuzz: the cgroup and proc text readers are total on arbitrary text" {
-    try fuzzkit.fuzz({}, procTextFuzz, .{ .corpus = &.{ fuzzkit.slice("anon 4096\nkernel_stack 8192\nslab_unreclaimable 1\n"), fuzzkit.slice("0::/user.slice/x\n"), fuzzkit.slice("max\n"), fuzzkit.slice("12 34 5 6 0 7 0\n") } });
+    try fuzzkit.fuzz({}, procTextFuzz, .{ .corpus = &.{ fuzzkit.slice("anon 4096\nkernel_stack 8192\nslab_unreclaimable 1\n"), fuzzkit.slice("0::/user.slice/x\n"), fuzzkit.slice("max\n"), fuzzkit.slice("12 34 5 6 0 7 0\n"), fuzzkit.slice("4242 (squeezefs-unit) S 1 4242 4242 0 -1\n") } });
 }

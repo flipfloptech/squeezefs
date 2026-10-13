@@ -261,6 +261,18 @@ pub const Cell = struct {
     fn setState(self: *Cell, s: State) void {
         self.state.store(@backingInt(s), .release);
     }
+
+    /// The quarantine gate's Dekker pair (0003 §Y.3): the publication's
+    /// state store then its flag re-check, against the admission's flag RMW
+    /// then its state read — all four seq_cst, so at least one side sees
+    /// the other (the store-buffering outcome is forbidden).
+    fn setStateSeqCst(self: *Cell, s: State) void {
+        self.state.store(@backingInt(s), .seq_cst);
+    }
+
+    fn getStateSeqCst(self: *const Cell) State {
+        return @fromBackingInt(@intCast(self.state.load(.seq_cst)));
+    }
 };
 
 comptime {
@@ -333,6 +345,17 @@ pub const FinishStation = struct {
 pub const FinishFreeSink = struct {
     ctx: ?*anyopaque,
     noteFinishFree: *const fn (?*anyopaque, vol_tag: u64, idx: u64) bool,
+    /// A non-carve take — the trim claim, the quarantine's free and virgin
+    /// arms, a publication's take-back — run under the holder's ordering
+    /// lock: `holderTakeOutOfList` inside the lock the carve takes, so the
+    /// carve never meets a bit taken between its scan and its take nor an
+    /// entitlement won ahead of its debit (0003 §Y.4). `holds` = the bit
+    /// stays set in the holder's bitmap (its population and a SET delta
+    /// move with it); a trim window's transient take moves neither. Null =
+    /// the allocator takes in place (a sink with no lock to share).
+    takeOutOfList: ?*const fn (?*anyopaque, vol_tag: u64, idx: u64, listed: bool, holds: bool) bool = null,
+    /// A trim window's return under the same lock: `holderReturnTrim`.
+    returnTrim: ?*const fn (?*anyopaque, vol_tag: u64, idx: u64) bool = null,
 };
 
 /// A grant-armed mint's answer: the block, or WHY the window is empty —
@@ -452,6 +475,9 @@ pub const stats = struct {
     pub var dlm_quarantined_offsets: counters.ShardedCounter = .{};
     pub var dlm_quarantine_releases: counters.ShardedCounter = .{};
     pub var block_quarantine_deferred_frees: counters.ShardedCounter = .{};
+    /// A publication's re-check found its block admitted after the gate
+    /// and took it back OWED (0003 §Y.3).
+    pub var block_quarantine_takebacks: counters.ShardedCounter = .{};
     /// Levels.
     pub var alloc_fresh_supply_exhausted_latched: counters.Gauge = .{};
     pub var alloc_fresh_supply_exhausted_candidates: counters.Gauge = .{};
@@ -464,7 +490,7 @@ pub var fresh_supply_latched: Atomic(usize) = .init(0);
 
 pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
     try w.writeAll("{");
-    inline for (.{ "alloc_from_freelist", "alloc_fresh_mints", "del_obj", "block_pin_stale_keys", "block_key_incarnation_unknown", "unpublished_offsets_recovered", "block_untracked_free_adjudicated", "shared_release_failures", "meta_kv_block_refs_recovered", "unpublished_mint_abandons", "dlm_quarantined_offsets", "dlm_quarantine_releases", "block_quarantine_deferred_frees" }) |name| {
+    inline for (.{ "alloc_from_freelist", "alloc_fresh_mints", "del_obj", "block_pin_stale_keys", "block_key_incarnation_unknown", "unpublished_offsets_recovered", "block_untracked_free_adjudicated", "shared_release_failures", "meta_kv_block_refs_recovered", "unpublished_mint_abandons", "dlm_quarantined_offsets", "dlm_quarantine_releases", "block_quarantine_deferred_frees", "block_quarantine_takebacks" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, @field(stats, name).load() });
     }
     inline for (.{ "block_double_frees", "block_untracked_free_refusals", "block_claim_anomalies", "block_key_incarnation_exhausted", "block_live_free_refusals", "alloc_trim_window_parks" }) |name| {
@@ -1213,9 +1239,7 @@ pub const BlockAllocator = struct {
     /// cohort's release — "a quarantine never force-drains") → grace defer
     /// → the free list. The block is reallocatable only NOW.
     pub fn finishFree(self: *BlockAllocator, idx: u64) void {
-        const c = self.cell(idx);
-        if (self.quarantine_count.load(.acquire) != 0 and c.flags.load(.acquire) & FLAG_QUARANTINED != 0) {
-            _ = c.flags.fetchOr(FLAG_QUARANTINE_OWED, .acq_rel);
+        if (self.quarantine_count.load(.acquire) != 0 and self.oweToCohort(idx)) {
             stats.block_quarantine_deferred_frees.inc();
             return;
         }
@@ -1247,7 +1271,7 @@ pub const BlockAllocator = struct {
         const c = self.cell(idx);
         endLifetime(c);
         const listed = idx < self.highest.load(.acquire);
-        c.setState(if (listed) .free else .virgin);
+        c.setStateSeqCst(if (listed) .free else .virgin);
         if (self.finish_free_sink) |s| {
             if (!s.noteFinishFree(s.ctx, self.cfg.vol_tag, idx)) {
                 stats.block_double_frees.fire("holder bitmap bit already clear");
@@ -1255,6 +1279,7 @@ pub const BlockAllocator = struct {
                 return;
             }
             if (self.forensics) |*t| t.record(idx, site);
+            self.recheckQuarantine(idx, listed);
             return;
         }
         if (self.forensics) |*t| t.record(idx, site);
@@ -1264,6 +1289,55 @@ pub const BlockAllocator = struct {
             return;
         }
         if (listed) self.creditListed(idx);
+        self.recheckQuarantine(idx, listed);
+    }
+
+    /// The publication's half of the quarantine gate's Dekker pair (0003
+    /// §Y.3; `free_list_model.zig` model 3): an admission that read the cell
+    /// before the publication's state store (`limbo` — the gate long passed,
+    /// or the block parked in the grace ring) took the flag alone; this
+    /// re-check, AFTER the state store (both seq_cst), sees its flag and
+    /// takes the block back out of the list — the entitlement, then the bit
+    /// (a claim, or the admission's own free arm, that won it owns the
+    /// block) — leaving it `limbo` with its publish OWED to the cohort's
+    /// release (`oweOrRepublish`).
+    fn recheckQuarantine(self: *BlockAllocator, idx: u64, listed: bool) void {
+        const c = self.cell(idx);
+        if (c.flags.load(.seq_cst) & FLAG_QUARANTINED == 0) return;
+        if (!self.takeOutOfList(idx, listed, true)) return;
+        c.setState(.limbo);
+        stats.block_quarantine_takebacks.inc();
+        self.oweOrRepublish(idx);
+    }
+
+    /// A taken-back block's publish is OWED to its cohort's release —
+    /// only while the cohort holds it: a release that cleared the cohort
+    /// first leaves the block nobody's, so the take-back publishes it again
+    /// itself.
+    fn oweOrRepublish(self: *BlockAllocator, idx: u64) void {
+        if (!self.oweToCohort(idx)) self.publishFreeList(idx, .terminal_free);
+    }
+
+    /// OWED is set by a CAS that REQUIRES the flag, against the release's
+    /// ONE `fetchAnd` of both (`releaseQuarantinedCell`): a mark after the
+    /// release cleared the cohort would leave the block in limbo with
+    /// nobody to publish it (model 3, `owe_unconditional`, `gate_two_steps`).
+    /// False ⇒ the cell is not quarantined (the caller publishes).
+    fn oweToCohort(self: *BlockAllocator, idx: u64) bool {
+        const c = self.cell(idx);
+        var f = c.flags.load(.acquire);
+        while (true) {
+            if (f & FLAG_QUARANTINED == 0) return false;
+            f = c.flags.cmpxchgWeak(f, f | FLAG_QUARANTINE_OWED, .acq_rel, .acquire) orelse return true;
+        }
+    }
+
+    /// A non-carve take (the trim claim, the quarantine's arms, the
+    /// re-check's take-back): under the holder's ordering lock when the
+    /// sink shares it (0003 §Y.4), else in place. False = lost.
+    fn takeOutOfList(self: *BlockAllocator, idx: u64, listed: bool, holds: bool) bool {
+        if (self.finish_free_sink) |s| if (s.takeOutOfList) |f| return f(s.ctx, self.cfg.vol_tag, idx, listed, holds);
+        return self.holderTakeOutOfList(idx, listed);
     }
 
     /// A clear bit below the cursor joins the budget: AFTER the bit, so a
@@ -1378,12 +1452,9 @@ pub const BlockAllocator = struct {
     pub fn claimFreeForTrim(self: *BlockAllocator, idx: u64) ?InflightAllocGuard {
         _ = self.trim_claimed.fetchAdd(1, .seq_cst);
         const c = self.cell(idx);
-        if (c.getState() != .free or !self.winEntitlement()) {
-            self.endTrimClaim();
-            return null;
-        }
-        if (!self.tryTakeBit(idx)) {
-            self.creditFree();
+        // The take (state, entitlement, bit — under the holder's lock when
+        // armed, 0003 §Y.4).
+        if (!self.takeOutOfList(idx, true, false)) {
             self.endTrimClaim();
             return null;
         }
@@ -1396,15 +1467,16 @@ pub const BlockAllocator = struct {
     /// `return_from_trim`: membership back BEFORE the window closes, so a
     /// parked allocation that reads the window closed finds the block on
     /// its rescan; the state before the bit, the credit after it (the
-    /// publication's order, module doc).
+    /// publication's order, module doc) — the bit and the credit under the
+    /// holder's lock when armed (a carve meeting the clear bit finds its
+    /// credit, 0003 §Y.4).
     pub fn returnFromTrim(self: *BlockAllocator, idx: u64, guard: *InflightAllocGuard) void {
         const c = self.cell(idx);
         assert(c.getState() == .trim_windowed);
         _ = self.trim_windowed.fetchSub(1, .acq_rel);
         c.setState(.free);
-        const cleared = self.clearBit(idx);
+        const cleared = if (self.finish_free_sink) |s| (if (s.returnTrim) |f| f(s.ctx, self.cfg.vol_tag, idx) else self.holderReturnTrim(idx)) else self.holderReturnTrim(idx);
         assert(cleared);
-        self.creditListed(idx);
         guard.deinit();
         self.endTrimClaim();
     }
@@ -1556,6 +1628,29 @@ pub const BlockAllocator = struct {
         return true;
     }
 
+    /// The non-carve take's body, under the holder's ordering lock when
+    /// armed (the sink calls it with the lock held), in place otherwise:
+    /// the cell still `free` (`virgin` for an unlisted block, a clear bit
+    /// at/above the cursor), an entitlement won for a listed block, then
+    /// the bit 0→1 — entitlement before bit, a lost take refunded. False ⇒
+    /// lost (the state moved, no credit, or the bit already set).
+    pub fn holderTakeOutOfList(self: *BlockAllocator, idx: u64, listed: bool) bool {
+        if (self.cell(idx).getStateSeqCst() != (if (listed) State.free else State.virgin)) return false;
+        if (listed and !self.winEntitlement()) return false;
+        if (self.tryTakeBit(idx)) return true;
+        if (listed) self.creditFree();
+        return false;
+    }
+
+    /// A trim window's return of its bit and credit (the state stored
+    /// `free` before), under the holder's lock when armed. False ⇒ the bit
+    /// was already clear.
+    pub fn holderReturnTrim(self: *BlockAllocator, idx: u64) bool {
+        if (!self.clearBit(idx)) return false;
+        self.creditListed(idx);
+        return true;
+    }
+
     /// A `ReturnBlocks` / adopt-release CLEAR of a block never minted here:
     /// the state (free below the cursor — the local list sees it — virgin
     /// at/above), then the bit 1→0, then the credit (the publication's
@@ -1609,28 +1704,29 @@ pub const BlockAllocator = struct {
     pub fn quarantineBlock(self: *BlockAllocator, idx: u64, dead_epoch: u64) bool {
         assert(idx < self.capacity_blocks);
         const c = self.cell(idx);
-        if (c.flags.fetchOr(FLAG_QUARANTINED, .acq_rel) & FLAG_QUARANTINED != 0) return false;
+        // The admission's half of the gate's Dekker pair (0003 §Y.3): the
+        // flag RMW, then the state read, both seq_cst.
+        if (c.flags.fetchOr(FLAG_QUARANTINED, .seq_cst) & FLAG_QUARANTINED != 0) return false;
         _ = self.quarantine_count.fetchAdd(1, .acq_rel);
         stats.dlm_quarantined_offsets.inc();
-        switch (c.getState()) {
+        switch (c.getStateSeqCst()) {
             .free => {
-                // Entitlement, then the bit (module doc). A lost take is a
-                // claim that won the block (a live owner: the flag alone)
-                // or a publication between its state store and its bit —
-                // the flag alone, as the limbo arm it read a moment ago
-                // (that finish is past its quarantine gate either way).
-                if (!self.winEntitlement()) return true;
-                if (!self.tryTakeBit(idx)) {
-                    self.creditFree();
-                    return true;
-                }
+                // The take: entitlement, then the bit (under the holder's
+                // lock when armed). A lost take is a claim that won the
+                // block (a live owner: the flag alone) or a publication
+                // between its state store and its credit — the flag alone,
+                // and that publication's re-check takes the block back.
+                if (!self.takeOutOfList(idx, true, true)) return true;
                 self.cancelElidedDebt(idx);
                 c.stamp.store(dead_epoch, .release);
                 c.setState(.quarantined);
                 _ = c.flags.fetchOr(FLAG_QUARANTINE_OWED, .acq_rel);
             },
             .virgin => {
-                _ = self.tryTakeBit(idx);
+                // A granted, never-minted block keeps the set bit its grant
+                // took; a clear one is taken (the take's lost verdict on a
+                // set bit is that case).
+                _ = self.takeOutOfList(idx, false, true);
                 c.stamp.store(dead_epoch, .release);
                 c.setState(.quarantined);
                 _ = c.flags.fetchOr(FLAG_QUARANTINE_OWED, .acq_rel);

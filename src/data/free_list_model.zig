@@ -19,7 +19,7 @@
 //! |---|---|---|---|
 //! | 1 `a_claim_between_the_publication_stores_is_never_clobbered` (local free list) | publisher state→bit→budget; a budget-then-bit claim; a trim claim of the published block | the budget never underflows; at the end a clear bit reads `free`, a taken bit reads its taker's state, the budget equals the clear bits | `bit_first` (the shipped order: the claim's `allocated` is overwritten by `free`), `state_buffered` (the state store not ordered before the bit clear), `trim_bit_first` (the trim takes the bit then debits a credit not yet landed: underflow) |
 //! | 2 `a_carve_between_the_publication_stores_is_never_clobbered` (holder) | publisher state→lock{bit, budget}; the carve lock{take, debit if free, virgin} then the mint's `allocated` | the budget never underflows; the minted block reads `allocated` with no phantom credit | `bit_first` (the shipped order: lock{bit} → state → budget — a carve between the state and the credit underflows, a carve + mint between the bit and the state is clobbered to `free` with a phantom credit), `credit_outside_lock` (the carve debits before the credit lands: underflow) |
-//! | 3 `a_quarantine_racing_a_finish_never_leaves_a_flagged_block_on_the_free_list` (0003 §Y.3) | the finish: its gate, the publication (state → bit → budget), then the RE-CHECK of the flag and, set, the take-back (entitlement → bit → `limbo` OWED); the admission: the flag, then the state read and, `free`, its own take (entitlement → bit → `quarantined` OWED); a claimant (entitlement → bit → `allocated`) | at the end the flagged block is off the free list (its bit set, no credit) and owned: `allocated` by the claimant, or `limbo`/`quarantined` with its publish OWED to the release | `no_recheck` (the shipped finish: an admission reading `limbo` between the gate and the publication leaves the block free-listed with the flag), `recheck_before_state` (the re-check before the publication's state store: the same window) |
+//! | 3 `a_quarantine_racing_a_finish_never_leaves_a_flagged_block_on_the_free_list` (0003 §Y.3) | the finish: its gate (OWED by a CAS that requires the flag), the publication (state → bit → budget), then the RE-CHECK of the flag and, set, the take-back (entitlement → bit → `limbo`, OWED by the same CAS — else published again); the admission: the flag, then the state read and, `free`, its own take (entitlement → bit → `quarantined` OWED); a claimant (entitlement → bit → `allocated`); optionally the cohort's release after the admission (ONE `fetchAnd` of the flag and OWED; an owed publish runs) | without the release: the flagged block ends off the free list (its bit set, no credit) and owned — `allocated` by the claimant, or `limbo`/`quarantined` with its publish OWED; with it: the block ends on the free list exactly once or the claimant's, nothing left OWED | `no_recheck` (the shipped finish: an admission reading `limbo` between the gate and the publication leaves the block free-listed with the flag), `recheck_before_state` (the re-check before the publication's state store: the same window), `owe_unconditional` (the take-back's plain OWED after the release cleared the cohort: an orphan), `gate_two_steps` (the shipped gate: the flag read, the release, then the OWED mark — the same orphan) |
 //! | 4 `a_holders_carve_never_meets_a_bit_taken_between_its_scan_and_its_take` (0003 §Y.4) | the carve lock{scan the lowest clear bit; take it — the assert; debit if `free`; `virgin`} then the mint; a non-carve taker (the trim claim; the quarantine's free arm is the same take) lock{state `free`, entitlement, bit} → `trim_windowed` → its return: the state `free`, then lock{bit, credit} | the carve's take never finds its scanned bit set; the budget never underflows; at the end the block is the carve's (`allocated`, no credit) or back on the list (`free`, one credit) | `take_outside_lock` (the shipped trim claim and quarantine: a take between the carve's scan and its take — the carve's assert), `return_outside_lock` (the trim's bit cleared outside the lock: the carve debits a credit not yet landed) |
 
 const std = @import("std");
@@ -350,7 +350,8 @@ pub fn HolderModel(comptime weakening: HolderWeakening) type {
 }
 
 // ---------------------------------------------------------------------------
-// Model 3: a quarantine admission racing a finish (the Dekker pair).
+// Model 3: a quarantine admission racing a finish (the Dekker pair), and the
+// cohort's release racing the OWED marks.
 // ---------------------------------------------------------------------------
 
 const QUARANTINED: u8 = 6;
@@ -362,19 +363,28 @@ pub const QuarantineWeakening = enum {
     /// A re-check placed BEFORE the publication's state store: the
     /// admission's state read can still meet `limbo` after it.
     recheck_before_state,
+    /// The take-back marks OWED by a plain RMW: a release that cleared the
+    /// cohort first leaves the block nobody's.
+    owe_unconditional,
+    /// The finish's gate reads the flag, then marks OWED in a second step
+    /// (the shipped gate): the same orphan.
+    gate_two_steps,
 };
 
 /// Block X is in limbo (its bit set, no credit) and its finish is running;
-/// an admission and a claimant race it. The finish's state store and its
+/// an admission and a claimant race it; with `with_release`, the cohort's
+/// release follows the admission (the jobs sink's admit → preempt →
+/// release) and races the OWED marks. The finish's state store and its
 /// flag re-check are seq_cst, as are the admission's flag RMW and state
 /// read (block_alloc.zig: the Dekker pair) — the model's SC steps.
-pub fn QuarantineFinishModel(comptime weakening: QuarantineWeakening) type {
+pub fn QuarantineFinishModel(comptime weakening: QuarantineWeakening, comptime with_release: bool) type {
     return struct {
         const Self = @This();
-        pub const thread_count: usize = 3;
+        pub const thread_count: usize = if (with_release) 4 else 3;
         const P = 0;
         const Q = 1;
         const C = 2;
+        const R = 3;
         const END: u8 = 0xff;
 
         flag: u8 = 0,
@@ -382,10 +392,16 @@ pub fn QuarantineFinishModel(comptime weakening: QuarantineWeakening) type {
         state: u8 = LIMBO,
         bit: u8 = 1,
         budget: u8 = 0,
+        double_free: u8 = 0,
         p_pc: u8 = 0,
         q_pc: u8 = 0,
         c_pc: u8 = 0,
+        r_pc: u8 = 0,
         c_took: u8 = 0,
+        /// The publication's re-check runs once per publication; `pub_n`
+        /// counts publications (the finish's, a take-back's re-publish,
+        /// the release's).
+        pub_n: u8 = 0,
 
         pub fn init() Self {
             return .{};
@@ -396,6 +412,7 @@ pub fn QuarantineFinishModel(comptime weakening: QuarantineWeakening) type {
                 P => self.p_pc == END,
                 Q => self.q_pc == END,
                 C => self.c_pc == END,
+                R => self.r_pc == END,
                 else => unreachable,
             };
         }
@@ -405,23 +422,38 @@ pub fn QuarantineFinishModel(comptime weakening: QuarantineWeakening) type {
                 P => self.stepFinish(),
                 Q => self.stepAdmit(),
                 C => self.stepClaim(),
+                R => self.stepRelease(),
                 else => unreachable,
             }
         }
 
-        /// `finishFree`: the gate; the publication; the re-check; the take-back.
+        fn clearBit(self: *Self) void {
+            if (self.bit == 0) self.double_free = 1;
+            self.bit = 0;
+        }
+
+        /// `finishFree`: the gate; the publication; the re-check; the
+        /// take-back; its OWED mark (or the re-publish).
         fn stepFinish(self: *Self) void {
             switch (self.p_pc) {
                 0 => {
+                    // The gate: OWED by a CAS that requires the flag.
                     if (self.flag != 0) {
+                        if (weakening == .gate_two_steps) {
+                            self.p_pc = 20;
+                            return;
+                        }
                         self.owed = 1;
                         self.p_pc = END;
                         return;
                     }
                     self.p_pc = if (weakening == .recheck_before_state) 10 else 1;
                 },
+                20 => {
+                    self.owed = 1; // the shipped second step
+                    self.p_pc = END;
+                },
                 10 => {
-                    // The misplaced re-check: nothing published yet.
                     if (self.flag != 0) {
                         self.owed = 1;
                         self.p_pc = END;
@@ -434,17 +466,16 @@ pub fn QuarantineFinishModel(comptime weakening: QuarantineWeakening) type {
                     self.p_pc = 2;
                 },
                 2 => {
-                    self.bit = 0;
+                    self.clearBit();
                     self.p_pc = 3;
                 },
                 3 => {
                     self.budget += 1;
-                    self.p_pc = if (weakening == .none) 4 else END;
+                    self.pub_n += 1;
+                    self.p_pc = if (weakening == .no_recheck or weakening == .recheck_before_state) END else 4;
                 },
                 4 => self.p_pc = if (self.flag != 0) 5 else END,
                 5 => {
-                    // The take-back: the entitlement first (a claim or the
-                    // admission that won it took the block).
                     if (self.budget == 0) {
                         self.p_pc = END;
                         return;
@@ -463,8 +494,16 @@ pub fn QuarantineFinishModel(comptime weakening: QuarantineWeakening) type {
                 },
                 7 => {
                     self.state = LIMBO;
-                    self.owed = 1;
-                    self.p_pc = END;
+                    self.p_pc = 8;
+                },
+                8 => {
+                    // `oweOrRepublish`: OWED only while the cohort holds it.
+                    if (weakening == .owe_unconditional or self.flag != 0) {
+                        self.owed = 1;
+                        self.p_pc = END;
+                        return;
+                    }
+                    self.p_pc = 1; // released meanwhile: publish again
                 },
                 else => unreachable,
             }
@@ -534,15 +573,56 @@ pub fn QuarantineFinishModel(comptime weakening: QuarantineWeakening) type {
             }
         }
 
-        pub fn invariant(_: *const Self) !void {}
+        /// The cohort's release after the admission (`releaseQuarantinedCell`):
+        /// ONE `fetchAnd` of the flag and OWED; an owed publish runs (its
+        /// re-check finds the flag gone).
+        fn stepRelease(self: *Self) void {
+            switch (self.r_pc) {
+                0 => {
+                    if (self.q_pc != END) return;
+                    const was_owed = self.flag != 0 and self.owed != 0;
+                    self.flag = 0;
+                    self.owed = 0;
+                    self.r_pc = if (was_owed) 1 else END;
+                },
+                1 => {
+                    self.state = FREE;
+                    self.r_pc = 2;
+                },
+                2 => {
+                    self.clearBit();
+                    self.r_pc = 3;
+                },
+                3 => {
+                    self.budget += 1;
+                    self.pub_n += 1;
+                    self.r_pc = END;
+                },
+                else => unreachable,
+            }
+        }
+
+        pub fn invariant(self: *const Self) !void {
+            if (self.double_free != 0) return error.DoubleFree;
+        }
 
         pub fn final(self: *const Self) !void {
-            if (self.bit == 0) return error.FlaggedBlockOnFreeList;
-            if (self.budget != 0) return error.BudgetDrift;
+            if (!with_release) {
+                if (self.bit == 0) return error.FlaggedBlockOnFreeList;
+                if (self.budget != 0) return error.BudgetDrift;
+                switch (self.state) {
+                    ALLOCATED => if (self.c_took == 0) return error.Unowned,
+                    LIMBO, QUARANTINED => if (self.owed == 0) return error.LostBlock,
+                    else => return error.Unowned,
+                }
+                return;
+            }
+            // Released: the block is on the free list once, or the claim's.
+            if (self.owed != 0) return error.StuckOwed;
             switch (self.state) {
-                ALLOCATED => if (self.c_took == 0) return error.Unowned,
-                LIMBO, QUARANTINED => if (self.owed == 0) return error.LostBlock,
-                else => return error.Unowned,
+                ALLOCATED => if (self.c_took == 0 or self.bit != 1 or self.budget != 0) return error.Unowned,
+                FREE => if (self.bit != 0 or self.budget != 1) return error.BudgetDrift,
+                else => return error.LostBlock,
             }
         }
     };
@@ -760,16 +840,22 @@ test "2 a_carve_between_the_publication_stores_is_never_clobbered — holds; the
     try m.final();
 }
 
-test "3 a_quarantine_racing_a_finish_never_leaves_a_flagged_block_on_the_free_list — holds; the shipped finish (no re-check) and a re-check before the publication each fail" {
-    try explorer.expectHolds(QuarantineFinishModel(.none), .{});
-    try explorer.expectFails(QuarantineFinishModel(.no_recheck), .{}, error.FinalViolated);
-    try explorer.expectFails(QuarantineFinishModel(.recheck_before_state), .{}, error.FinalViolated);
+test "3 a_quarantine_racing_a_finish_never_leaves_a_flagged_block_on_the_free_list — holds with and without the cohort's release; the shipped finish (no re-check), a re-check before the publication, an unconditional OWED mark and the two-step gate each fail" {
+    try explorer.expectHolds(QuarantineFinishModel(.none, false), .{});
+    try explorer.expectHolds(QuarantineFinishModel(.none, true), .{});
+    try explorer.expectFails(QuarantineFinishModel(.no_recheck, false), .{}, error.FinalViolated);
+    try explorer.expectFails(QuarantineFinishModel(.recheck_before_state, false), .{}, error.FinalViolated);
+    try explorer.expectFails(QuarantineFinishModel(.owe_unconditional, true), .{}, error.FinalViolated);
+    try explorer.expectFails(QuarantineFinishModel(.gate_two_steps, true), .{}, error.FinalViolated);
     // The shipped window by hand: the gate passes, the admission reads
     // `limbo` (the flag alone), the publication lists the flagged block.
-    try std.testing.expectError(error.FlaggedBlockOnFreeList, replay(QuarantineFinishModel(.no_recheck), &.{ 0, 1, 1, 0, 0, 0, 2 }).final());
+    try std.testing.expectError(error.FlaggedBlockOnFreeList, replay(QuarantineFinishModel(.no_recheck, false), &.{ 0, 1, 1, 0, 0, 0, 2 }).final());
     // The same schedule on the law: the re-check takes it back OWED.
-    var m = replay(QuarantineFinishModel(.none), &.{ 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 2 });
+    var m = replay(QuarantineFinishModel(.none, false), &.{ 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 2 });
     try m.final();
+    // The orphan: the take-back's block is limbo when the release clears
+    // the cohort, then a plain OWED mark lands on nobody's block.
+    try std.testing.expectError(error.StuckOwed, replay(QuarantineFinishModel(.owe_unconditional, true), &.{ 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 3, 0, 2 }).final());
 }
 
 test "4 a_holders_carve_never_meets_a_bit_taken_between_its_scan_and_its_take — holds; a take outside the holder's lock (the carve's assert) and a return outside it (an underflow) each fail" {
@@ -785,8 +871,8 @@ test "state counts: the models are small enough to re-run on every gate" {
     try std.testing.expect(report.states > 20 and report.states < 20_000);
     try explorer.explore(HolderModel(.none), std.testing.allocator, .{}, &report);
     try std.testing.expect(report.states > 3 and report.states < 200);
-    try explorer.explore(QuarantineFinishModel(.none), std.testing.allocator, .{}, &report);
-    try std.testing.expect(report.states > 20 and report.states < 20_000);
+    try explorer.explore(QuarantineFinishModel(.none, true), std.testing.allocator, .{}, &report);
+    try std.testing.expect(report.states > 20 and report.states < 50_000);
     try explorer.explore(HolderTakerModel(.none), std.testing.allocator, .{}, &report);
     try std.testing.expect(report.states > 10 and report.states < 5_000);
 }

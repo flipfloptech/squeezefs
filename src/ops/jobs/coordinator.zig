@@ -212,6 +212,8 @@ pub const AllocSink = struct {
     /// The plane's volume table (each row's allocator).
     vols: *const write_seams.Volumes,
     epochs: custody.DeadEpochSequence = .{},
+    /// The expired lease's cohort in flight (its live admissions; 0003 §Y.2).
+    cohort: custody.DestinationCohort = .{},
     wero: ?*DataWero,
     /// The enrolled table (the holder's `pr_key`).
     coord: ?*wire_mod.Coordinator = null,
@@ -230,10 +232,11 @@ pub const AllocSink = struct {
         const self: *AllocSink = @ptrCast(@alignCast(ctx));
         return self.epochs.mint();
     }
+    /// The lease table's expiry admits, preempts and releases one cohort
+    /// under its lock: the destination is quarantined and relinquished.
     fn admit(ctx: *anyopaque, d: DestTuple, epoch: u64) void {
         const self: *AllocSink = @ptrCast(@alignCast(ctx));
-        const a = self.allocOf(d.vol_tag) orelse return;
-        _ = a.quarantineBlock(d.block_idx, epoch);
+        self.cohort.admit(self.vols, d.vol_tag, d.block_idx, epoch);
     }
     fn preemptFn(ctx: *anyopaque, holder: StableIdentity) u32 {
         const self: *AllocSink = @ptrCast(@alignCast(ctx));
@@ -241,13 +244,12 @@ pub const AllocSink = struct {
         const c = self.coord orelse return 0;
         return w.preempt(c.prKeyOf(holder) orelse 0);
     }
-    fn releaseFn(ctx: *anyopaque, epoch: u64, _: u32) void {
+    /// The landed preempt is the drain proof: every owed publish of the
+    /// cohort finished, its live admissions released.
+    fn releaseFn(ctx: *anyopaque, epoch: u64, namespaces: u32) void {
         const self: *AllocSink = @ptrCast(@alignCast(ctx));
-        var out: [records.SHARD_DEST_MAX]u64 = undefined;
-        for (self.vols.rows[0..self.vols.n()]) |*r| {
-            const a = r.*.?.alloc;
-            _ = a.releaseQuarantine(epoch, &.{}, &out);
-        }
+        const proof = custody.DrainProof.preemptLanded(namespaces) orelse return;
+        _ = self.cohort.release(self.vols, epoch, proof);
     }
     fn isQuarantined(ctx: *anyopaque, d: DestTuple) bool {
         const self: *AllocSink = @ptrCast(@alignCast(ctx));

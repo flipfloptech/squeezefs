@@ -32,6 +32,7 @@ const log = @import("../../core/log.zig");
 const explorer = @import("../../model/explorer.zig");
 const jc = @import("../../meta/journal_core.zig");
 const block_alloc = @import("../block_alloc.zig");
+const write_seams = @import("../write_seams.zig");
 const sole_owner_patch = @import("../sole_owner_patch.zig");
 const records = @import("records.zig");
 
@@ -64,6 +65,9 @@ pub const stats = struct {
     pub var accounting_plane_refusals: counters.ShardedCounter = .{};
     pub var custody_revokes: counters.ShardedCounter = .{};
     pub var custody_handler_reacquires: counters.ShardedCounter = .{};
+    /// Blocks a released cohort handed back to the free list (every owed
+    /// publish finished, 0003 §Y.2).
+    pub var custody_cohort_frees: counters.ShardedCounter = .{};
     /// Must-stay-0: the custody generation saturated (poison).
     pub var custody_generation_poisoned: counters.Tripwire = .init("custody_generation_poisoned");
     /// Levels.
@@ -274,6 +278,91 @@ pub const BlockQuarantine = struct {
         }
         self.lock.unlock();
         return self.alloc.releaseQuarantine(epoch, live_idx[0..n], out);
+    }
+};
+
+/// One allocator's cohort release with every owed publish FINISHED: the
+/// publishes `releaseQuarantine` hands back are `finishFree`d (grace ring,
+/// then the free list or the holder's sink), `out` drained in passes — a
+/// full pass leaves the rest in the cohort for the next. Returns the
+/// blocks handed back.
+pub fn releaseCohort(alloc: *BlockAllocator, epoch: DeadEpoch, live: []const u64) u64 {
+    var out: [LIVE_ADMISSIONS_MAX]u64 = undefined;
+    var total: u64 = 0;
+    while (true) {
+        const n = alloc.releaseQuarantine(epoch, live, &out);
+        for (out[0..n]) |idx| alloc.finishFree(idx);
+        total += n;
+        stats.custody_cohort_frees.add(n);
+        if (n < out.len) return total;
+    }
+}
+
+/// The job fabric's expired-lease cohort over the plane's volumes (the
+/// coordinator's `QuarantineSink`, 0003 §Y.2). A shard's destinations are
+/// pre-allocated UNPUBLISHED mints — live when the lease expires, so the
+/// allocator flags them alone and keeps no epoch — and the shard's next
+/// assignment takes fresh ones: this cohort is their last owner. `admit`
+/// quarantines each and RELINQUISHES a minted one — its terminal free runs
+/// at once and the quarantine defers its publish (OWED); `release`, under
+/// the drain proof, names the live admissions to every volume's release
+/// and finishes every owed publish. The lease table admits a whole cohort,
+/// preempts and releases it under its one lock, so one cohort is in flight
+/// at a time: a cohort no preempt released (the deferred-reclaim class)
+/// stays quarantined when the next begins — its blocks are fsck's.
+pub const DestinationCohort = struct {
+    epoch: DeadEpoch = 0,
+    dests: [LIVE_ADMISSIONS_MAX]Dest = undefined,
+    n: usize = 0,
+
+    pub const Dest = struct { vol_tag: u64, idx: u64 };
+
+    pub fn admit(self: *DestinationCohort, vols: *const write_seams.Volumes, vol_tag: u64, idx: u64, epoch: DeadEpoch) void {
+        assert(epoch != 0);
+        const v = vols.byTag(vol_tag) orelse return;
+        const a = v.alloc;
+        if (epoch != self.epoch) {
+            self.epoch = epoch;
+            self.n = 0;
+        }
+        const st = a.stateOf(idx);
+        if (!a.quarantineBlock(idx, epoch)) return;
+        stats.custody_quarantined.inc();
+        // A free-listed or never-minted block carries the epoch in its cell.
+        if (st != .allocated and st != .limbo and st != .trim_windowed) return;
+        if (self.n == self.dests.len) {
+            log.warn("destination cohort {d}: {d} live admissions already held; block {d} of vol {x} stays flagged until fsck reconciles it", .{ epoch, self.n, idx, vol_tag });
+            return;
+        }
+        self.dests[self.n] = .{ .vol_tag = vol_tag, .idx = idx };
+        self.n += 1;
+        if (st != .allocated) return;
+        // Relinquished: the terminal free now, its publish OWED to the release.
+        const verdict = a.freeBlock(idx) catch |e| {
+            log.warn("destination cohort {d}: block {d} of vol {x} could not be relinquished ({t}); it stays allocated under the flag until fsck reconciles it", .{ epoch, idx, vol_tag, e });
+            return;
+        };
+        if (verdict != .terminal) log.warn("destination cohort {d}: block {d} of vol {x} still referenced after its relinquish ({t}) — not an unpublished mint", .{ epoch, idx, vol_tag, verdict });
+    }
+
+    /// Release `epoch` on every volume under its proof; the blocks handed
+    /// back to the free list.
+    pub fn release(self: *DestinationCohort, vols: *const write_seams.Volumes, epoch: DeadEpoch, proof: DrainProof) u64 {
+        _ = proof;
+        const mine = epoch == self.epoch;
+        var total: u64 = 0;
+        for (vols.rows[0..vols.n()]) |*r| {
+            const v = &r.*.?;
+            var live: [LIVE_ADMISSIONS_MAX]u64 = undefined;
+            var k: usize = 0;
+            if (mine) for (self.dests[0..self.n]) |d| if (d.vol_tag == v.vol_tag) {
+                live[k] = d.idx;
+                k += 1;
+            };
+            total += releaseCohort(v.alloc, epoch, live[0..k]);
+        }
+        if (mine) self.n = 0;
+        return total;
     }
 };
 
@@ -741,6 +830,52 @@ test "the block quarantine keeps the live cohort's epoch the allocator cannot: a
     try testing.expectEqual(block_alloc.State.free, a.stateOf(2));
     try testing.expectEqual(block_alloc.State.virgin, a.stateOf(20));
     try testing.expectEqual(@as(usize, 0), q.live_n);
+}
+
+test "the destination cohort hands an expired lease's destinations back at the drain proof: minted unpublished ones are relinquished (OWED) and a free-listed one taken out; the release finishes every owed publish in passes; a cohort no proof released stays quarantined when the next begins (0003 §Y.2)" {
+    const wt = @import("../write_testing.zig");
+    const f = try wt.Fixture.init(testing.allocator, 2 * LIVE_ADMISSIONS_MAX);
+    defer f.deinit();
+    const a = f.alloc_a;
+    var mints: [6]block_alloc.Minted = undefined;
+    for (&mints) |*m| m.* = try a.allocateBlock();
+    a.publishBlock(mints[5].idx);
+    try testing.expectEqual(block_alloc.BeginFree.terminal, try a.freeBlock(mints[5].idx));
+    const free0 = a.freeBlocksCount();
+    var c: DestinationCohort = .{};
+    const frees0 = stats.custody_cohort_frees.load();
+    // Cohort 1: never released (no preempt landed).
+    c.admit(&f.vols, wt.VOL_A, mints[4].idx, 1);
+    try testing.expect(a.isQuarantined(mints[4].idx));
+    try testing.expectEqual(block_alloc.State.limbo, a.stateOf(mints[4].idx)); // relinquished, OWED
+    // Cohort 2: two minted destinations and the free-listed block.
+    for ([_]u64{ mints[0].idx, mints[1].idx, mints[5].idx }) |idx| c.admit(&f.vols, wt.VOL_A, idx, 2);
+    try testing.expectEqual(@as(usize, 2), c.n); // the free-listed one rides its cell's epoch
+    try testing.expectEqual(free0 - 1, a.freeBlocksCount());
+    try testing.expectEqual(@as(u64, 3), c.release(&f.vols, 2, DrainProof.preemptLanded(1).?));
+    for ([_]u64{ mints[0].idx, mints[1].idx, mints[5].idx }) |idx| {
+        try testing.expectEqual(block_alloc.State.free, a.stateOf(idx));
+        try testing.expect(!a.isQuarantined(idx) and !a.bitIsSet(idx));
+    }
+    try testing.expectEqual(free0 + 2, a.freeBlocksCount());
+    try testing.expectEqual(frees0 + 3, stats.custody_cohort_frees.load());
+    // Cohort 1 stays held; a late proof for it (not the cohort in flight)
+    // releases nothing the allocator cannot find by itself.
+    try testing.expect(a.isQuarantined(mints[4].idx));
+    try testing.expectEqual(@as(u64, 0), c.release(&f.vols, 1, DrainProof.provenDead(1)));
+    try testing.expect(a.isQuarantined(mints[4].idx));
+    try testing.expectEqual(block_alloc.State.allocated, a.stateOf(mints[2].idx));
+    // The passes: a cohort larger than one `out` drains whole.
+    const b = f.alloc_b;
+    var many: [LIVE_ADMISSIONS_MAX + 3]u64 = undefined;
+    for (&many) |*idx| idx.* = (try b.allocateBlock()).idx;
+    for (many) |idx| {
+        b.publishBlock(idx);
+        _ = try b.freeBlock(idx);
+    }
+    for (many) |idx| try testing.expect(b.quarantineBlock(idx, 9)); // free-listed: the cell keeps epoch 9
+    try testing.expectEqual(@as(u64, many.len), releaseCohort(b, 9, &.{}));
+    for (many) |idx| try testing.expectEqual(block_alloc.State.free, b.stateOf(idx));
 }
 
 test "a_handler_that_serves_the_cached_lease_is_counted_before_the_release_departs / two_handlers_against_one_recall: pair 1 holds with both fences; EITHER fence removed fails (the recorded weakening — the pair needs BOTH)" {

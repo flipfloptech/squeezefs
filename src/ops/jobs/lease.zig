@@ -3,8 +3,9 @@
 //! unpublished-destination law in both halves, coordinator WERO +
 //! preempt-on-expiry"; spec §1.6). The coordinator-side table every remote
 //! (and fleet read) shard rides, PORTABLE over two seams: the quarantine
-//! sink (the allocator's `BlockQuarantine.admit` under a fresh dead epoch)
-//! and the PR preempt (`guard/pr.zig` under the standing WERO).
+//! sink (`custody.DestinationCohort` under a fresh dead epoch: admitted
+//! and relinquished, its owed publishes finished at the release) and the
+//! PR preempt (`guard/pr.zig` under the standing WERO).
 //!
 //! The law per shard: `assign` reuses the shard state with a BUMPED
 //! fencing or starts at 0 — every assignment gets FRESH destinations (an

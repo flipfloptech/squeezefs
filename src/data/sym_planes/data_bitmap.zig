@@ -463,6 +463,42 @@ pub const DataBitmap = struct {
         return true;
     }
 
+    /// A non-carve take under THE lock (0003 §Y.4; `free_list_model.zig`
+    /// model 4): the allocator's `holderTakeOutOfList` inside the critical
+    /// section every carve runs its scan and its takes in, so the carve
+    /// never meets a bit taken between the two nor an entitlement won ahead
+    /// of its debit. `holds` (a quarantine, a publication's take-back): the
+    /// bit stays set here — the population and a SET delta move with it; a
+    /// trim window's transient take moves neither (the population excludes
+    /// the windows).
+    pub fn takeOutOfList(self: *DataBitmap, idx: u64, listed: bool, holds: bool) bool {
+        assert(idx < self.cfg.blocks);
+        self.lockContended();
+        defer self.mutations.unlock();
+        if (!self.alloc.holderTakeOutOfList(idx, listed)) return false;
+        if (!holds) return true;
+        _ = self.population.fetchAdd(1, .acq_rel);
+        stats.data_alloc_bitmap_population.set(self.population.load(.monotonic));
+        stats.data_alloc_bitmap_set_bits.inc();
+        self.markDirty(idx);
+        self.queueLocked(.{ .set = true, .start = idx, .len = 1, .term = self.cfg.term });
+        return true;
+    }
+
+    /// A trim window's return under THE lock: the bit and its credit
+    /// together (`block_alloc.holderReturnTrim`).
+    pub fn returnTrim(self: *DataBitmap, idx: u64) bool {
+        assert(idx < self.cfg.blocks);
+        self.lockContended();
+        defer self.mutations.unlock();
+        return self.alloc.holderReturnTrim(idx);
+    }
+
+    fn lockContended(self: *DataBitmap) void {
+        if (self.test_contended_station) |st| if (self.mutations.locked.load(.monotonic)) st.contended(st.ctx);
+        self.mutations.lock();
+    }
+
     /// `block_alloc.FinishFreeSink` over this bitmap.
     pub fn finishFreeSink(self: *DataBitmap) block_alloc.FinishFreeSink {
         const S = struct {
@@ -470,8 +506,16 @@ pub const DataBitmap = struct {
                 const b: *DataBitmap = @ptrCast(@alignCast(ctx.?));
                 return b.noteFinishFree(idx);
             }
+            fn take(ctx: ?*anyopaque, _: u64, idx: u64, listed: bool, holds: bool) bool {
+                const b: *DataBitmap = @ptrCast(@alignCast(ctx.?));
+                return b.takeOutOfList(idx, listed, holds);
+            }
+            fn ret(ctx: ?*anyopaque, _: u64, idx: u64) bool {
+                const b: *DataBitmap = @ptrCast(@alignCast(ctx.?));
+                return b.returnTrim(idx);
+            }
         };
-        return .{ .ctx = self, .noteFinishFree = &S.note };
+        return .{ .ctx = self, .noteFinishFree = &S.note, .takeOutOfList = &S.take, .returnTrim = &S.ret };
     }
 
     pub const Run = struct { start: u64, len: u32 };

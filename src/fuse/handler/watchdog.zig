@@ -497,12 +497,17 @@ test "the watchdog never cancels: a slot that stays claimed across many ticks is
     const s = reg.claim(.fsync, 5, 55).?;
     // The first tick after the claim knows only that the op is younger
     // than one tick: nothing reported.
-    const r0 = wd.tickOnce(t0 + 6 * std.time.ns_per_s);
+    const first = t0 + 6 * std.time.ns_per_s;
+    const r0 = wd.tickOnce(first);
     try testing.expectEqual(@as(u32, 0), r0.overdue);
+    // The class's threshold derives from the process-wide latency
+    // histogram, which earlier tests in this process fed (the floor alone
+    // when none did): the later ticks sit past it, whatever ran before.
+    const thr = deriveThresholds()[@backingInt(op_trace.OpClass.of(.fsync))];
     var i: u64 = 1;
     while (i < 6) : (i += 1) {
         log.testing.expectErrorLogs(2);
-        _ = wd.tickOnce(t0 + (6 + 5 * i) * std.time.ns_per_s);
+        _ = wd.tickOnce(first + thr + (i - 1) * TICK_NS);
         try log.testing.expectAllFired();
         try testing.expectEqual(@as(u32, 1), s.state.load(.acquire));
     }

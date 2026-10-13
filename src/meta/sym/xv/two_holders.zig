@@ -657,6 +657,39 @@ test "a holder that cannot be reached is re-resolved before the ship is given up
     try f.noOpenIntents();
 }
 
+test "the plan's guards meeting a DEAD view of a key's holder re-resolve the slot before they are given up (decision 0003 §X.8; found by the shared hot directory row under the move gate: C's create into a stripe of the killed B asked its guards of the dead holder for the lattice's whole deadline, 48 s, then answered EIO): the guards travel to the holder the re-resolve names, the create lands in the same attempt; a slot nobody leases through the retries answers the move class with every retry re-resolved" {
+    const gpa = testing.allocator;
+    const f = try TwoHolders.init(gpa, testing.io, .{}, .{});
+    defer f.deinit();
+    try f.b.seedDir(DIR_B);
+    const reresolves0 = guards.stats.xv_cross_owner_guard_stale_reresolves.load();
+    {
+        const plan = steps.planCreate(.{ .parent = DIR_B, .name = "f", .child = f.a.mint(), .mode = S.IFREG | 0o644, .uid = 1, .gid = 2, .now = 1_000 });
+        const scope = f.a.plane.mintScope();
+        f.a.unreachable_once = 3;
+        const refreshes0 = f.refreshes;
+        var held = try f.a.plane.acquirePlanGuards(&plan, scope, false);
+        defer held.release(gpa);
+        try testing.expectEqual(refreshes0 + 1, f.refreshes);
+        try testing.expectEqual(reresolves0 + 1, guards.stats.xv_cross_owner_guard_stale_reresolves.load());
+        const done = try f.a.plane.execute(&plan, scope, 1_000);
+        try testing.expect(done.refused == null);
+    }
+    try testing.expect((try f.b.dentry(DIR_B, "f")) != null);
+    try f.noOpenIntents();
+    // Nobody leases the slot: every retry re-resolves, then the move class.
+    const i = std.mem.indexOfScalar(u16, f.b.store.leased.items, 3).?;
+    _ = f.b.store.leased.swapRemove(i);
+    {
+        const plan = steps.planCreate(.{ .parent = DIR_B, .name = "g", .child = f.a.mint(), .mode = S.IFREG | 0o644, .uid = 1, .gid = 2, .now = 1_000 });
+        const refreshes1 = f.refreshes;
+        try testing.expectError(error.ShipFailed, f.a.plane.acquirePlanGuards(&plan, f.a.plane.mintScope(), false));
+        try testing.expectEqual(refreshes1 + ops.SLOT_MOVED_RETRIES, f.refreshes);
+        try testing.expect(errors.isMoveClass(ops.coreError(error.ShipFailed)));
+    }
+    try f.b.store.leased.append(gpa, 3);
+}
+
 /// A's create of `name` in B's directory with its insert meeting slot 3
 /// MID-MOVE (nobody leases it once the guards travelled): the execute
 /// fails and, held, names the intent it left open.

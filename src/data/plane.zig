@@ -1468,6 +1468,27 @@ pub const DataPlane = struct {
         };
     }
 
+    /// syncfs (FUSE_SYNCFS) through `fsync.zig`'s mount-wide ladder: every
+    /// write-side authority of this mount drained, the data barrier, the
+    /// epochs' saves. The meta barrier is the filesystem's (store-wide).
+    pub fn syncfs(self: *DataPlane, io: Io, prof: *fsync_mod.SyncfsProf) Error!void {
+        var ctx = self.wp.fsyncCtx();
+        if (self.stage) |*st| {
+            ctx.promotion = st.pool.hooks;
+            ctx.staged_segment = &st.seg;
+        }
+        fsync_mod.syncfs(ctx, self.gpa, io, prof) catch |e| return switch (e) {
+            error.NoSpaceLeft => error.NoSpaceLeft,
+            error.InputOutput, error.IntentBarrierFailed, error.MetaBarrierFailed => blk: {
+                log.err("syncfs: a leg failed ({s}) — EIO to the application, the custody it could not land stays parked", .{@errorName(e)});
+                break :blk error.InputOutput;
+            },
+            error.WriterGuardFenced => error.WriterGuardFenced,
+            error.VolumeFailed => error.VolumeFailed,
+            error.OutOfMemory => error.OutOfMemory,
+        };
+    }
+
     fn metaSync(ctx: ?*anyopaque, _: Io, _: u64) anyerror!void {
         const self: *DataPlane = @ptrCast(@alignCast(ctx.?));
         try self.backend.fsync();

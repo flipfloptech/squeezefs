@@ -6708,6 +6708,22 @@ test "smoke: `sync -f` IS A DURABILITY POINT FOR THE DAEMON'S WRITE CUSTODY — 
     try rig.env.put("SQUEEZEFS_BLOCK_REFS_VERIFY", "1");
     try rig.spawnMount(&.{});
     _ = try rig.awaitReady(0);
+    // The kernel forwards syncfs to a plain /dev/fuse server only once INIT
+    // negotiated FUSE_HAS_SYNCFS (upstream 7.47; the venue's 7.2.6-sqz
+    // through scripts/kernel/patches-7.2/0027): without it `sync -f` never
+    // reaches the daemon and the row has nothing to judge.
+    {
+        const st = try rig.stats();
+        defer gpa.free(st);
+        if (numberAfter(st, "\"fuse_syncfs_armed\":") != 1) {
+            const rel = try rig.shOk(rig.work, "uname -r");
+            defer gpa.free(rel);
+            try rig.umount();
+            _ = try rig.waitChild();
+            var detail: [192]u8 = undefined;
+            return testkit.skip(@src(), .no_kernel_feature, std.fmt.bufPrint(&detail, "kernel {s}: FUSE_HAS_SYNCFS not offered — syncfs(2) never reaches a plain /dev/fuse server", .{std.mem.trimEnd(u8, rel, "\n")}) catch "a kernel without FUSE_HAS_SYNCFS");
+        }
+    }
     {
         var script: [256]u8 = undefined;
         const out = try rig.onMount(try std.fmt.bufPrint(&script, "dd if=\"$1/image\" of=g bs={d} count=1 conv=fsync status=none && echo base-ok", .{syncfs_base_bytes}));
@@ -6729,6 +6745,14 @@ test "smoke: `sync -f` IS A DURABILITY POINT FOR THE DAEMON'S WRITE CUSTODY — 
             try rig.expectAlive("the holder's sync -f");
             sleepMs(5);
         }
+    }
+    // The daemon served the syncfs and its census found the parked block.
+    {
+        const st = try rig.stats();
+        defer gpa.free(st);
+        std.debug.print("\nsmoke[sync -f]: fuse_syncfs {d}, custody inos {d}, parked blocks flushed {d}\n", .{ numberAfter(st, "\"fuse_syncfs\":") orelse 0, numberAfter(st, "\"syncfs_custody_inos\":") orelse 0, numberAfter(st, "\"syncfs_parked_blocks\":") orelse 0 });
+        try testing.expect((numberAfter(st, "\"fuse_syncfs\":") orelse 0) >= 1);
+        try testing.expect((numberAfter(st, "\"syncfs_parked_blocks\":") orelse 0) >= 1);
     }
     try rig.kill();
     holder.kill(io);

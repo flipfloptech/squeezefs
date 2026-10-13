@@ -483,6 +483,10 @@ pub fn Dispatcher(comptime Transport: type) type {
                     try fs.vtable.fsyncdir(fs.impl, c, .{ .ino = ino, .fh = a.fh, .datasync = a.datasync });
                     return codec.replyOk(u);
                 },
+                .syncfs => {
+                    try fs.vtable.syncfs(fs.impl, c, .{ .ino = ino });
+                    return codec.replyOk(u);
+                },
                 .readdir => |r| {
                     const d = try fs.vtable.readdir(fs.impl, c, .{ .ino = ino, .fh = r.fh, .offset = r.offset, .size = r.size });
                     return codec.replyData(u, c.window[0..d.len]);
@@ -648,7 +652,7 @@ const Scripted = struct {
         w.add(e2, 4, "two") catch return error.InputOutput;
         return .{ .len = w.len };
     }
-    pub fn syncfs(self: *Scripted, _: *Ctx, a: anytype) Error!void {
+    pub fn syncfs(self: *Scripted, _: *Ctx, a: filesystem.SyncfsArgs) Error!void {
         try self.verdict;
         self.syncfs_inos[self.syncfs_calls % self.syncfs_inos.len] = a.ino;
         self.syncfs_calls += 1;

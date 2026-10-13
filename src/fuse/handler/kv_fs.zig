@@ -123,6 +123,7 @@ const block_refs = @import("../../data/block_refs.zig");
 const pack = @import("../../data/pack.zig");
 const write_admit = @import("../../data/write_admit.zig");
 const seams = @import("../../data/write_seams.zig");
+const fsync_mod = @import("../../data/fsync.zig");
 const ipc_wire = @import("../../ipc/wire.zig");
 
 const Ctx = filesystem.Ctx;
@@ -227,6 +228,15 @@ pub var fuse_truncate_zero_tail_bytes: counters.ShardedCounter = .{};
 pub var fuse_killpriv_clears: counters.ShardedCounter = .{};
 /// `fuse_killpriv_negotiated`: 0/1 from the INIT reply.
 pub var fuse_killpriv_negotiated: counters.Gauge = .{};
+/// `fuse_syncfs_armed`: 1 when INIT negotiated `FUSE_HAS_SYNCFS` (the
+/// kernel forwards syncfs(2)/sync(2)); 0 = `sync -f` never reaches the
+/// daemon on this kernel and fsync/fdatasync/fsyncdir are the only
+/// durability points of its write custody.
+pub var fuse_syncfs_armed: counters.Gauge = .{};
+/// `fuse_syncfs`: FUSE_SYNCFS served; `fuse_syncfs_phase_ns`: its legs,
+/// exact-sum (`fsync.SyncfsPhase`).
+pub var fuse_syncfs: counters.ShardedCounter = .{};
+pub var fuse_syncfs_phase_ns: fsync_mod.SyncfsPhaseNs = .{};
 /// `fuse_reclaim_destroys`: corpses destroyed; `fuse_reclaim_drains`:
 /// destroy entries committed (the batched-destroy economy's two words);
 /// `fuse_reclaim_blocks_freed`: bindings the destroy riders released.
@@ -1324,7 +1334,9 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             // The handover's step 0 drains the departing slot's parked stamps.
             if (@hasDecl(Store, "bindTimesDrain")) self.store.bindTimesDrain(.{ .ctx = self, .drainSlot = timesDrainSeam });
             fuse_killpriv_negotiated.set(@intFromBool(self.killpriv_v2));
-            log.info("kv_fs: FUSE 7.{d}; KILLPRIV_V2 {s}; inline_max {d} B; block {d} B; data volumes {s}; staging {s}", .{ self.minor, if (self.killpriv_v2) "negotiated" else "absent", self.inline_max, self.block_size, if (self.data.hasVolumes()) "yes" else "NONE (inline only)", if (self.data.stagingOn()) "on" else "off" });
+            const syncfs_armed = a.has(abi.FUSE_HAS_SYNCFS);
+            fuse_syncfs_armed.set(@intFromBool(syncfs_armed));
+            log.info("kv_fs: FUSE 7.{d}; KILLPRIV_V2 {s}; SYNCFS {s}; inline_max {d} B; block {d} B; data volumes {s}; staging {s}", .{ self.minor, if (self.killpriv_v2) "negotiated" else "absent", if (syncfs_armed) "negotiated (sync -f drains the write custody)" else "NOT offered by this kernel (FUSE_HAS_SYNCFS absent: syncfs(2)/sync never reach the daemon — fsync/fdatasync/fsyncdir are the durability points)", self.inline_max, self.block_size, if (self.data.hasVolumes()) "yes" else "NONE (inline only)", if (self.data.stagingOn()) "on" else "off" });
         }
 
         pub fn destroy(self: *Self, c: *Ctx, _: filesystem.DestroyArgs) void {
@@ -2861,6 +2873,32 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             self.store.fsync() catch |e| return storeErr(e);
         }
 
+        /// syncfs (FUSE_SYNCFS — the kernel sends it on syncfs(2)/sync(2)
+        /// once INIT negotiated `FUSE_HAS_SYNCFS`): a per-file fsync for the
+        /// WHOLE mount — every parked stamp journaled, every write-side
+        /// authority of the plane drained (the accumulation, the W2 and
+        /// device overlays, the staged arm by its lever, the rewrite
+        /// epochs, the uploads in flight), the data barrier on every
+        /// namespace, the epochs' saves, then the store-wide meta barrier
+        /// (every member's coalesced barrier; the strict cadence's per
+        /// commit). Custody born after it began is a later write's.
+        pub fn syncfs(self: *Self, c: *Ctx, _: filesystem.SyncfsArgs) Error!void {
+            fuse_syncfs.inc();
+            var prof = fsync_mod.SyncfsProf.start();
+            defer prof.finish(&fuse_syncfs_phase_ns);
+            _ = try self.drainPendingTimes(c);
+            prof.mark(.times_drain);
+            if (self.data.hasVolumes()) {
+                c.stage(.write_admitted);
+                try self.data.syncfs(self.io, &prof);
+                c.stage(.write_done);
+            }
+            c.stage(.meta_backend_start);
+            defer c.stage(.meta_backend_done);
+            self.store.fsync() catch |e| return storeErr(e);
+            prof.mark(.meta_barrier);
+        }
+
         pub fn opendir(self: *Self, _: *Ctx, a: filesystem.OpenArgs) Error!filesystem.Opened {
             _ = try self.readDir(try localOf(a.ino));
             return .{ .fh = self.mintFh(), .open_flags = 0 };
@@ -3270,6 +3308,7 @@ pub const NoData = struct {
         return error.HolderUnreachable;
     }
     pub fn fsync(_: *NoData, _: Io, _: u64, _: ?staging.StagingKey) Error!void {}
+    pub fn syncfs(_: *NoData, _: Io, _: *fsync_mod.SyncfsProf) Error!void {}
     pub fn statfs(_: *NoData) ?Space {
         return null;
     }
@@ -3789,6 +3828,10 @@ const SettlingData = struct {
     /// segment, its pool, and the image they live over.
     ring: ?*RamRing = null,
 
+    /// The mount-wide drains (`syncfs`) and the store's counts each found.
+    syncfs_calls: u32 = 0,
+    commits_at_syncfs: u64 = 0,
+    fsyncs_at_syncfs: u64 = 0,
     /// The own-block promotions: the largest image DMA'd (≤ one block).
     own_block_max: u64 = 0,
     own_blocks: u32 = 0,
@@ -3936,6 +3979,17 @@ const SettlingData = struct {
         return error.HolderUnreachable;
     }
     pub fn fsync(_: *SettlingData, _: Io, _: u64, _: ?staging.StagingKey) Error!void {}
+    /// The mount-wide drain: counted, with the store's commit and barrier
+    /// counts it found (the parked stamps journaled BEFORE it, the meta
+    /// barrier AFTER it) and a data-leg span marked.
+    pub fn syncfs(self: *SettlingData, _: Io, prof: *fsync_mod.SyncfsProf) Error!void {
+        self.syncfs_calls += 1;
+        if (self.store) |st| {
+            self.commits_at_syncfs = st.commits;
+            self.fsyncs_at_syncfs = st.fsyncs;
+        }
+        prof.mark(.data_flush);
+    }
     pub fn statfs(_: *SettlingData) ?Space {
         return null;
     }
@@ -4316,6 +4370,64 @@ test "§L.6 the write-stamp park (repro-port: frag-512b-write — 533 k size-neu
     try testing.expectEqual(@as(u64, 0), h.fs.pending.len());
     for (crowd) |f| h.release(f);
     for (files) |f| h.release(f);
+}
+
+test "FUSE_SYNCFS is a per-file fsync for the whole mount: every parked stamp journaled in ONE Δ entry BEFORE the plane's drain, the plane's mount-wide drain once, the store-wide meta barrier AFTER it; counted, its phases exact-sum; a volume-less set journals and barriers alone" {
+    const H = HarnessOf(SettlingData);
+    var h: H = undefined;
+    try h.init();
+    defer h.deinit();
+    defer h.data.deinit();
+    h.data.store = &h.store;
+    const image: []u8 = try testing.allocator.alloc(u8, 8192);
+    defer testing.allocator.free(image);
+    @memset(image, 'I');
+    var files: [2]u64 = undefined;
+    for (&files, [_][]const u8{ "s0", "s1" }) |*f, name| {
+        f.* = try h.create(1, name, 0o644);
+        try testing.expectEqual(@as(?linux.E, null), h.write(f.*, 0, image, 0).errno());
+    }
+    awaitCoarseTickAfter((try h.fs.readInodeStored(try H.Fs.localOf(files[1]))).?.mtime);
+    var sector: [512]u8 = @splat('s');
+    for (files) |f| try testing.expectEqual(@as(?linux.E, null), h.write(f, 512, &sector, 0).errno());
+    try testing.expectEqual(@as(u64, 2), h.fs.pending.len());
+    const commits0 = h.store.commits;
+    const fsyncs0 = h.store.fsyncs;
+    const calls0 = fuse_syncfs.load();
+    const total0 = fuse_syncfs_phase_ns.total.snapshot();
+    var legs0: [fsync_mod.SyncfsPhase.legs]counters.LatencyHistogram.Snapshot = undefined;
+    inline for (@typeInfo(fsync_mod.SyncfsPhase).@"enum".field_names[0..fsync_mod.SyncfsPhase.legs], 0..) |name, i| legs0[i] = @field(fuse_syncfs_phase_ns, name).snapshot();
+    try testing.expectEqual(@as(?linux.E, null), h.call(.syncfs, 1).errno());
+    try testing.expectEqual(@as(u64, 0), h.fs.pending.len());
+    try testing.expectEqual(commits0 + 1, h.store.commits);
+    try testing.expectEqual(@as(u32, 1), h.data.syncfs_calls);
+    try testing.expectEqual(commits0 + 1, h.data.commits_at_syncfs);
+    try testing.expectEqual(fsyncs0, h.data.fsyncs_at_syncfs);
+    try testing.expectEqual(fsyncs0 + 1, h.store.fsyncs);
+    for (files) |f| {
+        const a = try h.getattr(f);
+        try testing.expectEqual(a.mtime * std.time.ns_per_s + a.mtimensec, (try h.fs.readInodeStored(try H.Fs.localOf(f))).?.mtime);
+    }
+    try testing.expectEqual(calls0 + 1, fuse_syncfs.load());
+    const total1 = fuse_syncfs_phase_ns.total.snapshot();
+    try testing.expectEqual(total0.count + 1, total1.count);
+    var legs_sum: u64 = 0;
+    inline for (@typeInfo(fsync_mod.SyncfsPhase).@"enum".field_names[0..fsync_mod.SyncfsPhase.legs], 0..) |name, i| {
+        const now = @field(fuse_syncfs_phase_ns, name).snapshot();
+        try testing.expectEqual(legs0[i].count + 1, now.count);
+        legs_sum += now.sum_ns - legs0[i].sum_ns;
+    }
+    try testing.expectEqual(total1.sum_ns - total0.sum_ns, legs_sum);
+    for (files) |f| h.release(f);
+    // A volume-less set: the stamps and the barrier, nothing else.
+    var m: HarnessOf(NoData) = undefined;
+    try m.init();
+    defer m.deinit();
+    const mf = try m.create(1, "m", 0o644);
+    const mfsyncs0 = m.store.fsyncs;
+    try testing.expectEqual(@as(?linux.E, null), m.call(.syncfs, 1).errno());
+    try testing.expectEqual(mfsyncs0 + 1, m.store.fsyncs);
+    m.release(mf);
 }
 
 test "the handover's step 0 (rung 10 item 4): drainPendingTimesOfSlot commits the parked stamps of ONE routing slot in one Δ entry — the stored records of that slot carry their served mtimes, another slot's stamp stays parked for the cadence, a slot with nothing to refine commits nothing; the binding is the plane's TimesDrain seam" {

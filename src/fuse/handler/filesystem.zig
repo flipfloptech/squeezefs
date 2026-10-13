@@ -18,7 +18,9 @@
 //! release, fsync, opendir, readdir, readdirplus, releasedir, fsyncdir,
 //! statfs, {set,get,list,remove}xattr, create, access (ENOSYS under
 //! `default_permissions` is honest). Rung 4 adds fallocate, lseek,
-//! copy_file_range, ioctl, bmap, poll. Never: getlk/setlk (POSIX_LOCKS is
+//! copy_file_range, ioctl, bmap, poll; rung 10 syncfs (the kernel sends it
+//! only once INIT negotiated `FUSE_HAS_SYNCFS`; its ENOSYS default clears
+//! `fc->sync_fs`). Never: getlk/setlk (POSIX_LOCKS is
 //! never advertised — the kernel arbitrates), notify_reply (no RETRIEVE is
 //! ever sent), interrupt (decoded, counted, ignored by the lifecycle: a hook
 //! with no effect is dead code — ledger L3).
@@ -195,6 +197,8 @@ pub const HeldPayload = struct {
 pub const FlushArgs = struct { ino: u64, fh: u64, lock_owner: u64 };
 pub const ReleaseArgs = struct { ino: u64, fh: u64, flags: u32, lock_owner: u64, flush: bool };
 pub const FsyncArgs = struct { ino: u64, fh: u64, datasync: bool };
+/// `ino` = the request's nodeid (the root's): the op names the mount.
+pub const SyncfsArgs = struct { ino: u64 };
 pub const ReaddirArgs = struct { ino: u64, fh: u64, offset: u64, size: u32 };
 pub const StatfsArgs = struct { ino: u64 };
 pub const SetxattrArgs = struct { ino: u64, name: []const u8, value: []const u8, flags: u32 };
@@ -255,6 +259,7 @@ pub const VTable = struct {
     fallocate: Op(FallocateArgs, void) = &defaults.enosys(FallocateArgs, void),
     lseek: Op(LseekArgs, Lseek) = &defaults.enosys(LseekArgs, Lseek),
     copy_file_range: Op(CopyFileRangeArgs, Written) = &defaults.enosys(CopyFileRangeArgs, Written),
+    syncfs: Op(SyncfsArgs, void) = &defaults.enosys(SyncfsArgs, void),
 };
 
 const defaults = struct {
@@ -367,6 +372,7 @@ test "binding: a declared op is wrapped, an undeclared one answers ENOSYS, destr
     try testing.expectError(error.NotImplemented, fs.vtable.getattr(fs.impl, &c, .{ .ino = 1, .fh = null }));
     try testing.expectError(error.NotImplemented, fs.vtable.fsync(fs.impl, &c, .{ .ino = 1, .fh = 0, .datasync = false }));
     try testing.expectError(error.NotImplemented, fs.vtable.copy_file_range(fs.impl, &c, .{ .ino_in = 1, .fh_in = 0, .off_in = 0, .ino_out = 2, .fh_out = 0, .off_out = 0, .len = 1, .flags = 0 }));
+    try testing.expectError(error.NotImplemented, fs.vtable.syncfs(fs.impl, &c, .{ .ino = 1 }));
     try fs.vtable.init(fs.impl, &c, .{ .negotiated = 0, .minor = abi.FUSE_KERNEL_MINOR_VERSION });
     fs.vtable.forget(fs.impl, &c, .{ .ino = 5, .nlookup = 1, .evicted = true });
     fs.vtable.destroy(fs.impl, &c, .{});

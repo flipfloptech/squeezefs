@@ -92,6 +92,7 @@ pub fn opInfo(op: abi.Opcode) ?OpInfo {
         .statfs => .{ .in_size = 0 },
         .release, .releasedir => .{ .in_size = @sizeOf(abi.fuse_release_in) },
         .fsync, .fsyncdir => .{ .in_size = @sizeOf(abi.fuse_fsync_in) },
+        .syncfs => .{ .in_size = @sizeOf(abi.fuse_syncfs_in) },
         .setxattr => .{ .in_size = @sizeOf(abi.fuse_setxattr_in) },
         .getxattr, .listxattr => .{ .in_size = @sizeOf(abi.fuse_getxattr_in) },
         .removexattr => .{ .in_size = 0 },
@@ -111,7 +112,7 @@ pub fn opInfo(op: abi.Opcode) ?OpInfo {
         .rename2 => .{ .in_size = @sizeOf(abi.fuse_rename2_in) },
         .lseek => .{ .in_size = @sizeOf(abi.fuse_lseek_in) },
         .copy_file_range => .{ .in_size = @sizeOf(abi.fuse_copy_file_range_in) },
-        .setupmapping, .removemapping, .syncfs, .tmpfile, .statx, _ => null,
+        .setupmapping, .removemapping, .tmpfile, .statx, _ => null,
     };
 }
 
@@ -320,6 +321,8 @@ pub const Request = union(enum) {
     rename2: Rename,
     lseek: Lseek,
     copy_file_range: abi.fuse_copy_file_range_in,
+    /// The mount-wide durability point (`fuse_syncfs_in` is padding).
+    syncfs,
     /// Known past what we serve, or unknown: header-only -ENOSYS.
     unsupported: abi.Opcode,
 };
@@ -474,7 +477,11 @@ fn parseInner(d: Delivery) ParseError!Request {
             break :blk .{ .lseek = .{ .fh = in.fh, .offset = in.offset, .whence = in.whence } };
         },
         .copy_file_range => .{ .copy_file_range = try opIn(abi.fuse_copy_file_range_in, d) },
-        .setupmapping, .removemapping, .syncfs, .tmpfile, .statx, _ => |op| .{ .unsupported = op },
+        .syncfs => blk: {
+            _ = try opIn(abi.fuse_syncfs_in, d);
+            break :blk .syncfs;
+        },
+        .setupmapping, .removemapping, .tmpfile, .statx, _ => |op| .{ .unsupported = op },
     };
 }
 
@@ -910,6 +917,11 @@ pub const InitReply = struct {
         return self.has(abi.FUSE_TIME_LIMITS);
     }
 
+    /// The kernel will send FUSE_SYNCFS on syncfs(2)/sync(2).
+    pub fn syncfs(self: InitReply) bool {
+        return self.has(abi.FUSE_HAS_SYNCFS);
+    }
+
     pub fn minor(self: InitReply) u32 {
         return self.out.minor;
     }
@@ -946,10 +958,12 @@ pub fn buildInitReply(in: abi.fuse_init_in, p: geometry.Plan, wants: InitWants) 
     std.debug.assert(reply_flags & never_advertised == 0);
 
     // flags2: the ring transport always (no opt-out: the mount fails if it
-    // cannot arm); the time range iff the kernel can apply it.
+    // cannot arm); the time range iff the kernel can apply it; syncfs iff
+    // offered (the kernel offers it only to a privileged opener).
     var flags2: u64 = abi.FUSE_OVER_IO_URING;
     const time_limits = offered & abi.FUSE_TIME_LIMITS != 0;
     if (time_limits) flags2 |= abi.FUSE_TIME_LIMITS;
+    if (offered & abi.FUSE_HAS_SYNCFS != 0) flags2 |= abi.FUSE_HAS_SYNCFS;
 
     const reply_minor = @min(in.minor, abi.FUSE_KERNEL_MINOR_VERSION);
     const init_ext = offered & abi.FUSE_INIT_EXT != 0 and flags2 != 0 and reply_minor >= 36;
@@ -1655,8 +1669,9 @@ test "INIT reply never advertises POSIX_LOCKS, FLOCK_LOCKS, SPLICE_*, POSIX_ACL 
         try testing.expectEqual(@as(u64, 0), r.out.folded() & never_advertised);
         // Every classical reply bit except INIT_EXT was offered.
         try testing.expectEqual(@as(u64, 0), (@as(u64, r.out.flags) & ~abi.FUSE_INIT_EXT) & ~offered);
-        // flags2 carries only the ring bit and (iff offered) the time bit.
-        try testing.expectEqual(@as(u64, 0), (@as(u64, r.out.flags2) << 32) & ~(abi.FUSE_OVER_IO_URING | abi.FUSE_TIME_LIMITS));
+        // flags2 carries only the ring bit and (iff offered) the time and syncfs bits.
+        try testing.expectEqual(@as(u64, 0), (@as(u64, r.out.flags2) << 32) & ~(abi.FUSE_OVER_IO_URING | abi.FUSE_TIME_LIMITS | abi.FUSE_HAS_SYNCFS));
+        try testing.expectEqual(offered & abi.FUSE_HAS_SYNCFS, (@as(u64, r.out.flags2) << 32) & abi.FUSE_HAS_SYNCFS);
         try testing.expect(r.out.minor <= 36);
     }
     const all = try buildInitReply(initIn(44, std.math.maxInt(u64)), test_plan, .{});
@@ -1694,16 +1709,17 @@ test "INIT reply echoes the time range iff FUSE_TIME_LIMITS (bit 62) was offered
 }
 
 test "INIT reply asks for FUSE_SYNCFS (FUSE_HAS_SYNCFS, flags2 bit 12) iff the kernel offered it — offered only to a /dev/fuse opener with CAP_SYS_ADMIN in the initial user namespace; without INIT_EXT it is not negotiated" {
-    const has_syncfs: u64 = 1 << 44;
+    const has_syncfs = abi.FUSE_HAS_SYNCFS;
+    try testing.expectEqual(@as(u64, 1 << 44), has_syncfs);
     const with = try buildInitReply(initIn(45, kernel_6_14_offer | has_syncfs), test_plan, .{});
-    try testing.expect(with.has(has_syncfs));
+    try testing.expect(with.syncfs());
     try testing.expectEqual(abi.flags2Of(abi.FUSE_OVER_IO_URING | has_syncfs), with.out.flags2);
     try testing.expectEqual(@as(u32, (1 << 9) | (1 << 12)), with.out.flags2);
     const without = try buildInitReply(initIn(45, kernel_6_14_offer), test_plan, .{});
-    try testing.expect(!without.has(has_syncfs));
+    try testing.expect(!without.syncfs());
     try testing.expectEqual(abi.flags2Of(abi.FUSE_OVER_IO_URING), without.out.flags2);
     const stranded = try buildInitReply(initIn(45, (kernel_6_14_offer | has_syncfs) & ~abi.FUSE_INIT_EXT), test_plan, .{});
-    try testing.expect(!stranded.has(has_syncfs));
+    try testing.expect(!stranded.syncfs());
 }
 
 test "INIT reply option gates: KILLPRIV_V2 iff offered ∧ wanted (v1 never rides along unless asked); writeback/dont_mask/no_open/no_opendir/export iff wanted; force_readdirplus drops READDIRPLUS_AUTO" {

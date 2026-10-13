@@ -122,6 +122,16 @@ pub const FUSE_ALLOW_IDMAP: u64 = 1 << 40;
 /// "no opt-out" (charter §4).
 pub const FUSE_OVER_IO_URING: u64 = 1 << 41;
 pub const FUSE_REQUEST_TIMEOUT: u64 = 1 << 42;
+/// uapi 7.47 (flags2 bit 12; `scripts/kernel/patches-7.2/0027-sqz-fuse-
+/// allow-FUSE_SYNCFS-…` backports it to the venue's 7.2.6-sqz at
+/// upstream's bit): the server asks for syncfs(2)/sync(2) as
+/// FUSE_SYNCFS. The kernel OFFERS it only to a `/dev/fuse` opener with
+/// CAP_SYS_ADMIN in the initial user namespace (an untrusted server could
+/// stall `sync`) and honors the echo only there; without it a plain
+/// `fuse` mount never sees a syncfs (only virtiofs and fuseblk set
+/// `fc->sync_fs`). Echoed iff offered — the daemon's write custody makes
+/// `sync -f` a durability point only through it.
+pub const FUSE_HAS_SYNCFS: u64 = 1 << 44;
 /// sqz patch 0027 (flags2 bit 30): the daemon advertises its i64-ns
 /// timestamp range in `fuse_init_out.time_min/time_max` so the VFS clamps
 /// where the daemon does. The bit IS the probe (fuse_kmbuf_zc.md §2.4).
@@ -498,6 +508,9 @@ pub const fuse_read_in = extern struct { fh: u64, offset: u64, size: u32, read_f
 /// Payload (`size` bytes) follows.
 pub const fuse_write_in = extern struct { fh: u64, offset: u64, size: u32, write_flags: u32, lock_owner: u64, flags: u32, padding: u32 };
 pub const fuse_fsync_in = extern struct { fh: u64, fsync_flags: u32, padding: u32 };
+/// FUSE_SYNCFS's body: padding alone (the request names no file — its
+/// nodeid is the root's).
+pub const fuse_syncfs_in = extern struct { padding: u64 };
 /// The 8-byte form (`FUSE_SETXATTR_EXT` never negotiated); `name\0value` follow.
 pub const fuse_setxattr_in = extern struct { size: u32, flags: u32 };
 /// Name follows for GETXATTR, nothing for LISTXATTR.
@@ -720,6 +733,7 @@ comptime {
     assertLayout(fuse_read_in, 40, .{ .{ "fh", 0 }, .{ "offset", 8 }, .{ "size", 16 }, .{ "read_flags", 20 }, .{ "lock_owner", 24 }, .{ "flags", 32 }, .{ "padding", 36 } });
     assertLayout(fuse_write_in, 40, .{ .{ "fh", 0 }, .{ "offset", 8 }, .{ "size", 16 }, .{ "write_flags", 20 }, .{ "lock_owner", 24 }, .{ "flags", 32 }, .{ "padding", 36 } });
     assertLayout(fuse_fsync_in, 16, .{ .{ "fh", 0 }, .{ "fsync_flags", 8 }, .{ "padding", 12 } });
+    assertLayout(fuse_syncfs_in, 8, .{.{ "padding", 0 }});
     assertLayout(fuse_setxattr_in, 8, .{ .{ "size", 0 }, .{ "flags", 4 } });
     assertLayout(fuse_getxattr_in, 8, .{ .{ "size", 0 }, .{ "padding", 4 } });
     assertLayout(fuse_lk_in, 48, .{ .{ "fh", 0 }, .{ "owner", 8 }, .{ "lk", 16 }, .{ "lk_flags", 40 }, .{ "padding", 44 } });
@@ -813,19 +827,19 @@ const testing = std.testing;
 
 /// Every wire struct, for the totality sweeps.
 const all_structs = .{
-    fuse_in_header,              fuse_out_header,             fuse_attr,                   fuse_kstatfs,            fuse_entry_out,
-    fuse_attr_out,               fuse_statfs_out,             fuse_file_lock,              fuse_init_in,            fuse_init_out,
-    fuse_forget_in,              fuse_forget_one,             fuse_batch_forget_in,        fuse_getattr_in,         fuse_mknod_in,
-    fuse_mkdir_in,               fuse_rename_in,              fuse_rename2_in,             fuse_link_in,            fuse_setattr_in,
-    fuse_open_in,                fuse_create_in,              fuse_release_in,             fuse_flush_in,           fuse_read_in,
-    fuse_write_in,               fuse_fsync_in,               fuse_setxattr_in,            fuse_getxattr_in,        fuse_lk_in,
-    fuse_access_in,              fuse_interrupt_in,           fuse_bmap_in,                fuse_ioctl_in,           fuse_poll_in,
-    fuse_fallocate_in,           fuse_notify_retrieve_in,     fuse_lseek_in,               fuse_copy_file_range_in, fuse_open_out,
-    fuse_write_out,              fuse_getxattr_out,           fuse_lk_out,                 fuse_bmap_out,           fuse_ioctl_out,
-    fuse_ioctl_iovec,            fuse_poll_out,               fuse_lseek_out,              fuse_dirent,             fuse_direntplus,
-    fuse_notify_poll_wakeup_out, fuse_notify_inval_inode_out, fuse_notify_inval_entry_out, fuse_notify_store_out,   fuse_notify_retrieve_out,
-    fuse_notify_delete_out,      fuse_notify_prune_out,       fuse_uring_ent_in_out,       fuse_uring_req_header,   fuse_uring_cmd_req,
-    io_uring_buf_reg,
+    fuse_in_header,           fuse_out_header,             fuse_attr,                   fuse_kstatfs,                fuse_entry_out,
+    fuse_attr_out,            fuse_statfs_out,             fuse_file_lock,              fuse_init_in,                fuse_init_out,
+    fuse_forget_in,           fuse_forget_one,             fuse_batch_forget_in,        fuse_getattr_in,             fuse_mknod_in,
+    fuse_mkdir_in,            fuse_rename_in,              fuse_rename2_in,             fuse_link_in,                fuse_setattr_in,
+    fuse_open_in,             fuse_create_in,              fuse_release_in,             fuse_flush_in,               fuse_read_in,
+    fuse_write_in,            fuse_fsync_in,               fuse_syncfs_in,              fuse_setxattr_in,            fuse_getxattr_in,
+    fuse_lk_in,               fuse_access_in,              fuse_interrupt_in,           fuse_bmap_in,                fuse_ioctl_in,
+    fuse_poll_in,             fuse_fallocate_in,           fuse_notify_retrieve_in,     fuse_lseek_in,               fuse_copy_file_range_in,
+    fuse_open_out,            fuse_write_out,              fuse_getxattr_out,           fuse_lk_out,                 fuse_bmap_out,
+    fuse_ioctl_out,           fuse_ioctl_iovec,            fuse_poll_out,               fuse_lseek_out,              fuse_dirent,
+    fuse_direntplus,          fuse_notify_poll_wakeup_out, fuse_notify_inval_inode_out, fuse_notify_inval_entry_out, fuse_notify_store_out,
+    fuse_notify_retrieve_out, fuse_notify_delete_out,      fuse_notify_prune_out,       fuse_uring_ent_in_out,       fuse_uring_req_header,
+    fuse_uring_cmd_req,       io_uring_buf_reg,
 };
 
 test "the wire is little-endian native: a u32 at offset 0 lands low byte first" {

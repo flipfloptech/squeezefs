@@ -502,6 +502,17 @@ pub const Registry = struct {
         stats.overlay_open.sub(1);
     }
 
+    /// The syncfs census: every live record's ino appended to `out`
+    /// (duplicates are the caller's). The room is the registry's fixed
+    /// capacity, reserved OUTSIDE the lock.
+    pub fn censusInos(self: *Registry, gpa: Allocator, out: *std.ArrayList(u64)) Allocator.Error!void {
+        try out.ensureUnusedCapacity(gpa, self.records.len);
+        self.lock.lock();
+        defer self.lock.unlock();
+        var it = self.index.keyIterator();
+        while (it.next()) |k| out.appendAssumeCapacity(k.ino);
+    }
+
     /// Every live record of `ino` (for fsync / release / truncate drains).
     pub fn blocksOf(self: *Registry, ino: u64, out: []u32) []u32 {
         self.lock.lock();

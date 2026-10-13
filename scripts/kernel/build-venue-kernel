@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# The venue kernel (7.2.6-sqz for the macOS `container` VM, charter §1.2)
+# rebuilt from the reference's recipe — squeezefs@44752ce5 docker/kernel-sqz,
+# read-only, the series and the build image — plus THIS repo's deltas:
+#
+#   config-fragment-container-arm64.delta  appended to the fragment (kTLS and
+#                                          the ARMv8 CE crypto, owner 2026-10-12)
+#   patches-7.2/*.patch                    appended to the 7.2 series, in name
+#                                          order (0027: FUSE_HAS_SYNCFS)
+#
+#   scripts/kernel/build-venue-kernel [WORKDIR]     (default /tmp/ksqz-venue)
+#
+# Artifacts: WORKDIR/dist/kernel-sqz-container-arm64/{Image,vmlinux,System.map,
+# config}-7.2.6-sqz + SHA256SUMS. Boot-test one container with
+# `container run -k <Image> …` before `container system kernel set`; a
+# container keeps its creation kernel, so the venue takes a new one only when
+# it is recreated (`container rm -f sqz-zig && scripts/venue up`).
+set -euo pipefail
+
+here=$(cd "$(dirname "$0")" && pwd)
+ref=${SQZ_REF_REPO:-$HOME/Source/squeezefs}
+recipe=44752ce5
+work=${1:-/tmp/ksqz-venue}
+
+git -C "$ref" cat-file -e "$recipe^{commit}" || { echo "the reference recipe $recipe is not in $ref (SQZ_REF_REPO)"; exit 1; }
+rm -rf "$work"
+mkdir -p "$work"
+git -C "$ref" archive "$recipe" docker/kernel-sqz | tar -x -C "$work"
+k="$work/docker/kernel-sqz"
+{ echo; cat "$here/config-fragment-container-arm64.delta"; } >> "$k/config-fragment-container-arm64"
+for p in "$here"/patches-7.2/*.patch; do
+	[ -e "$k/patches-7.2/$(basename "$p")" ] && { echo "$(basename "$p") collides with the reference series"; exit 1; }
+	cp "$p" "$k/patches-7.2/"
+done
+cd "$k"
+TRACK=7.2 exec bash build-container-arm64.sh --cpus "${SQZ_KERNEL_CPUS:-4}" --memory "${SQZ_KERNEL_MEMORY:-8g}"

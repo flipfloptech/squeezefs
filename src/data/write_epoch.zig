@@ -191,6 +191,31 @@ pub const Epochs = struct {
         self.* = undefined;
     }
 
+    /// The syncfs census: the ino of every open epoch and of every save in
+    /// flight (`close` of the latter waits it out) appended to `out`. The
+    /// maps grow without bound, so the room is reserved OUTSIDE the lock at
+    /// the count last read and the fill re-checks it under the lock — maps
+    /// that grew in between are re-reserved (never an allocation under the
+    /// spin lock, never a truncated census).
+    pub fn censusInos(self: *Epochs, gpa: Allocator, out: *std.ArrayList(u64)) Allocator.Error!void {
+        var want: usize = 0;
+        while (true) {
+            try out.ensureUnusedCapacity(gpa, want);
+            self.lock.lock();
+            defer self.lock.unlock();
+            const n = self.table.count() + self.closing.count();
+            if (n > want) {
+                want = n;
+                continue;
+            }
+            for ([_]*std.AutoHashMapUnmanaged(u64, *Epoch){ &self.table, &self.closing }) |t| {
+                var it = t.keyIterator();
+                while (it.next()) |k| out.appendAssumeCapacity(k.*);
+            }
+            return;
+        }
+    }
+
     /// Open epochs (a save in flight is not open: its ino's next record
     /// opens a fresh one).
     pub fn openCount(self: *Epochs) usize {

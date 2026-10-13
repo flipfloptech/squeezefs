@@ -73,11 +73,16 @@ pub const stats = struct {
     pub var fsync_promote_failures: counters.ShardedCounter = .{};
     /// Should stay 0: an ordinal above `MAX_ORDINAL` fell to `ALL_BIT`.
     pub var fsync_touched_unresolved: counters.ShardedCounter = .{};
+    /// The mount-wide ladder (`syncfs`): its calls, the distinct inos its
+    /// census found holding write custody, the parked blocks it flushed.
+    pub var syncfs_calls: counters.ShardedCounter = .{};
+    pub var syncfs_custody_inos: counters.ShardedCounter = .{};
+    pub var syncfs_parked_blocks: counters.ShardedCounter = .{};
 };
 
 pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
     try w.writeAll("{");
-    inline for (.{ "fsync_calls", "fsync_data_namespaces_touched", "fsync_data_namespaces_flushed", "fsync_write_through_skips", "fsync_noop_clean", "fsync_parallel_joins", "fsync_flush_enospc_retries", "fsync_promote_noops", "fsync_promote_failures", "fsync_touched_unresolved" }) |name| {
+    inline for (.{ "fsync_calls", "fsync_data_namespaces_touched", "fsync_data_namespaces_flushed", "fsync_write_through_skips", "fsync_noop_clean", "fsync_parallel_joins", "fsync_flush_enospc_retries", "fsync_promote_noops", "fsync_promote_failures", "fsync_touched_unresolved", "syncfs_calls", "syncfs_custody_inos", "syncfs_parked_blocks" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, @field(stats, name).load() });
     }
     try w.writeAll("\"fsync_phase_ns\":{");
@@ -123,6 +128,77 @@ pub const Prof = struct {
     }
 
     pub fn total(self: *const Prof) u64 {
+        return self.last - self.t0;
+    }
+};
+
+/// The syncfs family (`fuse_syncfs_phase_ns`): the per-file ladder's legs
+/// for the whole mount, framed by the filesystem's own two (the parked
+/// stamps first, the store-wide meta barrier last). Exact-sum like `Phase`.
+pub const SyncfsPhase = enum(u8) {
+    times_drain,
+    data_flush,
+    staged_promote,
+    data_barrier,
+    meta_publish,
+    meta_barrier,
+    total,
+
+    pub const count = @typeInfo(SyncfsPhase).@"enum".field_names.len;
+    pub const legs = count - 1;
+};
+
+/// One histogram per `SyncfsPhase`, by name (the `.stats` keys).
+pub const SyncfsPhaseNs = struct {
+    times_drain: counters.ShardedLatencyHistogram = .{},
+    data_flush: counters.ShardedLatencyHistogram = .{},
+    staged_promote: counters.ShardedLatencyHistogram = .{},
+    data_barrier: counters.ShardedLatencyHistogram = .{},
+    meta_publish: counters.ShardedLatencyHistogram = .{},
+    meta_barrier: counters.ShardedLatencyHistogram = .{},
+    total: counters.ShardedLatencyHistogram = .{},
+
+    comptime {
+        const names = @typeInfo(SyncfsPhase).@"enum".field_names;
+        const fields = @typeInfo(SyncfsPhaseNs).@"struct".field_names;
+        assert(names.len == fields.len);
+        for (names, fields) |n, f| assert(std.mem.eql(u8, n, f));
+    }
+};
+
+/// `Prof`'s law over `SyncfsPhase`: `finish` records 0 ns for every
+/// unmarked leg and `total = last − t0`, so Σ legs ≡ total on every exit.
+pub const SyncfsProf = struct {
+    t0: u64,
+    last: u64,
+    legs: [SyncfsPhase.legs]u64 = @splat(0),
+
+    pub fn start() SyncfsProf {
+        return startAt(clock.monotonicNs());
+    }
+
+    pub fn startAt(now: u64) SyncfsProf {
+        return .{ .t0 = now, .last = now };
+    }
+
+    pub fn mark(self: *SyncfsProf, p: SyncfsPhase) void {
+        self.markAt(p, clock.monotonicNs());
+    }
+
+    pub fn markAt(self: *SyncfsProf, p: SyncfsPhase, now: u64) void {
+        assert(p != .total);
+        const t = @max(now, self.last);
+        self.legs[@backingInt(p)] += t - self.last;
+        self.last = t;
+    }
+
+    pub fn finish(self: *SyncfsProf, into: *SyncfsPhaseNs) void {
+        inline for (@typeInfo(SyncfsPhase).@"enum".field_names, 0..) |name, i| {
+            @field(into, name).record(if (i == SyncfsPhase.legs) self.last - self.t0 else self.legs[i]);
+        }
+    }
+
+    pub fn total(self: *const SyncfsProf) u64 {
         return self.last - self.t0;
     }
 };
@@ -192,6 +268,20 @@ pub const TouchedTable = struct {
 
     pub fn bitsOf(observed: u64) u64 {
         return observed & BITS_MASK;
+    }
+
+    /// The syncfs snapshot: every stripe word read BEFORE the barriers
+    /// start (`out.len == words.len`).
+    pub fn observeAll(self: *TouchedTable, out: []u64) void {
+        assert(out.len == self.words.len);
+        for (self.words, out) |*w, *o| o.* = w.load(.acquire);
+    }
+
+    /// After the all-namespace barrier: each word clears iff no stamp
+    /// landed since its snapshot (`clearObserved`'s law, word by word).
+    pub fn clearAllObserved(self: *TouchedTable, observed: []const u64) void {
+        assert(observed.len == self.words.len);
+        for (self.words, observed) |*w, o| _ = w.cmpxchgStrong(o, o & ~BITS_MASK, .acq_rel, .monotonic);
     }
 };
 
@@ -268,6 +358,8 @@ pub const Ctx = struct {
     /// The staged file's key when the ino is staged (the promote lever).
     staged_key: ?staging.StagingKey = null,
     promotion: staging.PromotionHooks = .none,
+    /// The staging ring's residents (syncfs's promote leg; null = staging off).
+    staged_segment: ?*staging.Segment = null,
 };
 
 pub const Error = error{ InputOutput, NoSpaceLeft, WriterGuardFenced, VolumeFailed, OutOfMemory, IntentBarrierFailed, MetaBarrierFailed };
@@ -321,6 +413,107 @@ pub fn fsync(ctx: Ctx, io: Io, ino: u64, prof: *Prof) Error!void {
     // EXTENT BARRIER.
     if (ctx.extent_barrier) |eb| eb.sync(eb.ctx, io, ino) catch return error.MetaBarrierFailed;
     prof.mark(.extent_barrier);
+}
+
+/// syncfs (FUSE_SYNCFS): `fsync`'s data legs for EVERY ino holding write
+/// custody when the census runs — the accumulation table's parked blocks
+/// (by key: no per-ino page bound), the device overlay's open records, the
+/// rewrite epochs open or saving — then the staged promote (lever), ONE
+/// data barrier over every volatile namespace, every census ino's epoch
+/// closed (the meta publish). DUR-1 holds mount-wide: the data barrier
+/// completes before any epoch save names a block. The meta barrier is the
+/// caller's (the store-wide one, after its own legs). Custody born after
+/// the census is a write the syncfs did not see begin.
+pub fn syncfs(ctx: Ctx, gpa: Allocator, io: Io, prof: *SyncfsProf) Error!void {
+    stats.syncfs_calls.inc();
+    var keys: std.ArrayList(accumulate.Key) = .empty;
+    defer keys.deinit(gpa);
+    try ctx.table.censusKeys(gpa, &keys);
+    var inos: std.ArrayList(u64) = .empty;
+    defer inos.deinit(gpa);
+    try inos.ensureUnusedCapacity(gpa, keys.items.len);
+    for (keys.items) |k| inos.appendAssumeCapacity(k.ino);
+    try ctx.overlay.registry.censusInos(gpa, &inos);
+    try ctx.epochs.censusInos(gpa, &inos);
+    std.mem.sort(u64, inos.items, {}, std.sort.asc(u64));
+    const distinct = dedupeSorted(inos.items);
+    stats.syncfs_custody_inos.add(distinct.len);
+    // DATA FLUSH: every overlay drained with its barrier; every parked
+    // block escalated to one durable upload (the ENOSPC ladder once).
+    for (distinct) |ino| {
+        const left = ctx.overlay.drainForIno(io, ctx.locks, ino, std.math.maxInt(u64), true, ctx.close_seams);
+        if (left != 0) device_overlay.stats.overlay_unpublished_at_fsync.fire("overlay records left open after the syncfs drain");
+    }
+    try flushParkedKeys(ctx, io, keys.items);
+    if (ctx.worker) |w| if (ctx.wb_deps) |d| {
+        _ = w.drainOnce(io, d);
+    };
+    prof.mark(.data_flush);
+    // STAGED PROMOTE (lever OFF by default: the ring is the staged class's
+    // durability, exactly as at a per-file fsync).
+    if (ctx.staged_segment) |seg| try staging.promoteAllAtSyncfs(gpa, ctx.levers.promote_staged, seg, ctx.promotion);
+    prof.mark(.staged_promote);
+    // DATA BARRIER: every volatile namespace; the stripe words snapshotted
+    // before it clear after it (a stamp since keeps its bits).
+    const observed = try gpa.alloc(u64, ctx.touched.words.len);
+    defer gpa.free(observed);
+    ctx.touched.observeAll(observed);
+    var plan_buf: [256]u32 = undefined;
+    const plan = planBarriers(TouchedTable.ALL_BIT, ctx.vols, &plan_buf);
+    try runBarrierLegs(ctx, io, plan);
+    stats.fsync_data_namespaces_flushed.add(plan.len);
+    ctx.touched.clearAllObserved(observed);
+    prof.mark(.data_barrier);
+    // META PUBLISH: every census ino's ONE save (a save in flight awaited).
+    for (distinct) |ino| switch (ctx.epochs.close(io, ino, ctx.close_seams)) {
+        .fence_dropped => return error.WriterGuardFenced,
+        .transient => return error.InputOutput,
+        else => {},
+    };
+    prof.mark(.meta_publish);
+}
+
+/// The unique prefix of an ascending slice, in place.
+fn dedupeSorted(xs: []u64) []u64 {
+    if (xs.len == 0) return xs;
+    var n: usize = 1;
+    for (xs[1..]) |x| {
+        if (x == xs[n - 1]) continue;
+        xs[n] = x;
+        n += 1;
+    }
+    return xs[0..n];
+}
+
+/// `flushParked`'s ladder over census keys: each key one durable upload; a
+/// key left parked (the pool's ENOSPC) gets the ladder once — flush the
+/// data devices, close every epoch for its supply — then one retry; a
+/// second wall is the honest ENOSPC.
+fn flushParkedKeys(ctx: Ctx, io: Io, keys: []const accumulate.Key) Error!void {
+    var parked_after: usize = 0;
+    for (keys) |k| {
+        switch (accumulate.flushParkedBlock(ctx.table, ctx.upload, io, k.ino, k.block)) {
+            .published => stats.syncfs_parked_blocks.inc(),
+            .discarded, .superseded, .joined => {},
+            .fence_drop => return error.WriterGuardFenced,
+            .stay_parked => parked_after += 1,
+        }
+    }
+    if (parked_after == 0) return;
+    stats.fsync_flush_enospc_retries.inc();
+    var vb: [256]u32 = undefined;
+    for (planBarriers(TouchedTable.ALL_BIT, ctx.vols, &vb)) |ord| {
+        if (ctx.vols.byOrdinal(ord)) |v| ctx.device.flush(v.vol_tag) catch {};
+    }
+    _ = ctx.epochs.closeAllForSpace(io, ctx.close_seams);
+    for (keys) |k| {
+        switch (accumulate.flushParkedBlock(ctx.table, ctx.upload, io, k.ino, k.block)) {
+            .published => stats.syncfs_parked_blocks.inc(),
+            .discarded, .superseded, .joined => {},
+            .fence_drop => return error.WriterGuardFenced,
+            .stay_parked => return error.NoSpaceLeft,
+        }
+    }
 }
 
 fn flushParked(ctx: Ctx, io: Io, ino: u64, retried: bool) Error!void {
@@ -641,6 +834,71 @@ test "clean_fsync_is_a_counted_data_noop_and_keeps_the_meta_barrier; a_failed_da
     var prof4 = Prof.start();
     try testing.expectError(error.MetaBarrierFailed, fsync(w.mkCtx(), io, 3, &prof4));
     prof4.finish();
+}
+
+test "syncfs is fsync's data ladder for EVERY ino holding custody: parked blocks on two inos (three keys) uploaded and published, an open overlay record on a third published, every byte on the device before ONE barrier over every volatile namespace that follows the last write, every stripe word's bits cleared; a crash after it (the RAM custody dropped) reads every byte off the map; phases exact-sum" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+    const w = try FsyncWorld.init(gpa);
+    defer w.deinit(gpa);
+    for ([_]u64{ 1, 2, 4 }) |ino| try w.f.map.create(ino, .striped, 0);
+    const half: [wt.BS / 2]u8 = @splat(0x21);
+    const quarter: [wt.BS / 4]u8 = @splat(0x42);
+    _ = try w.table.recordWrite(w.table.checkout(1, 0, false, null).?, 0, &half);
+    _ = try w.table.recordWrite(w.table.checkout(2, 0, false, null).?, 0, &quarter);
+    _ = try w.table.recordWrite(w.table.checkout(2, 1, false, null).?, wt.BS / 2, &quarter);
+    var p: [wt.BS / 2]u8 align(4096) = @splat(0x61);
+    _ = try w.ov.store(io, .{ .ino = 4, .block = 0, .rel = 0, .vehicle = .{ .bytes = &p }, .file = .{ .kind = .striped, .size = 0, .map_resident = true }, .overwrite = false });
+    w.touched.stampOrdinal(7, 0);
+    const calls0 = stats.syncfs_calls.load();
+    const inos0 = stats.syncfs_custody_inos.load();
+    const blocks0 = stats.syncfs_parked_blocks.load();
+    var prof = SyncfsProf.start();
+    try syncfs(w.mkCtx(), gpa, io, &prof);
+    var phases: SyncfsPhaseNs = .{};
+    prof.finish(&phases);
+    try testing.expectEqual(calls0 + 1, stats.syncfs_calls.load());
+    try testing.expectEqual(inos0 + 3, stats.syncfs_custody_inos.load());
+    try testing.expectEqual(blocks0 + 3, stats.syncfs_parked_blocks.load());
+    // Nothing of the custody is left in RAM.
+    try testing.expectEqual(@as(u32, 0), w.table.parkedCount());
+    try testing.expect(!w.ov.hasCustody(4, 0));
+    // The data barrier follows the last data write and covers volume A.
+    var last_write: ?usize = null;
+    var last_flush: ?usize = null;
+    for (w.f.dev.trace.items, 0..) |t, i| switch (t) {
+        .write, .write_fixed => last_write = i,
+        .flush => last_flush = i,
+        .read => {},
+    };
+    try testing.expect(last_flush.? > last_write.?);
+    try testing.expectEqual(wt.VOL_A, w.f.dev.flushes.items[w.f.dev.flushes.items.len - 1]);
+    try testing.expectEqual(@as(u64, 0), TouchedTable.bitsOf(w.touched.observe(7)));
+    // The crash: every byte reads back through the map off the device.
+    var got: [wt.BS]u8 = undefined;
+    const b1 = w.f.map.seam().lookup(1, 0).?;
+    w.f.dev.peek(wt.VOL_A, b1.offset, &got);
+    try testing.expect(std.mem.allEqual(u8, got[0 .. wt.BS / 2], 0x21));
+    try testing.expect(std.mem.allEqual(u8, got[wt.BS / 2 ..], 0));
+    const b20 = w.f.map.seam().lookup(2, 0).?;
+    w.f.dev.peek(wt.VOL_A, b20.offset, &got);
+    try testing.expect(std.mem.allEqual(u8, got[0 .. wt.BS / 4], 0x42));
+    const b21 = w.f.map.seam().lookup(2, 1).?;
+    w.f.dev.peek(wt.VOL_A, b21.offset, &got);
+    try testing.expect(std.mem.allEqual(u8, got[wt.BS / 2 ..][0 .. wt.BS / 4], 0x42));
+    try testing.expect(w.f.map.seam().lookup(4, 0) != null);
+    // Exact-sum.
+    var sum: u64 = 0;
+    inline for (@typeInfo(SyncfsPhase).@"enum".field_names[0..SyncfsPhase.legs]) |name| sum += @field(phases, name).snapshot().sum_ns;
+    try testing.expectEqual(phases.total.snapshot().sum_ns, sum);
+    try testing.expectEqual(prof.total(), sum);
+    // A second syncfs over a clean mount: an empty census, still the barrier.
+    const flushes0 = w.f.dev.flushes.items.len;
+    var prof2 = SyncfsProf.start();
+    try syncfs(w.mkCtx(), gpa, io, &prof2);
+    prof2.finish(&phases);
+    try testing.expectEqual(inos0 + 3, stats.syncfs_custody_inos.load());
+    try testing.expectEqual(flushes0 + 1, w.f.dev.flushes.items.len);
 }
 
 test "in_place_dma_shapes_stamp_their_namespace and parallel legs pay the join: two touched volatile namespaces barrier as joined legs (both awaited); the overlay drain publishes before the barrier" {

@@ -1263,6 +1263,16 @@ pub fn promoteAtFsync(lever: FsyncLever, hooks: PromotionHooks, key: StagingKey)
     if (promote(hooks.ctx, key)) stats.fsync_promoted_files.inc();
 }
 
+/// The syncfs point: `promoteAtFsync` for EVERY resident entry (the lever
+/// gates it the same way; a failure leaves the entry resident).
+pub fn promoteAllAtSyncfs(gpa: Allocator, lever: FsyncLever, seg: *Segment, hooks: PromotionHooks) Allocator.Error!void {
+    if (!lever.on) return;
+    if (hooks.promote == null) return;
+    const out = try gpa.alloc(Resident, seg.live());
+    defer gpa.free(out);
+    for (seg.residents(out)) |r| promoteAtFsync(lever, hooks, r.key);
+}
+
 // ---------------------------------------------------------------------------
 // §3.7 The reader's view of an unpromoted entry.
 // ---------------------------------------------------------------------------

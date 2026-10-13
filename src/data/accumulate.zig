@@ -826,6 +826,17 @@ pub const Table = struct {
         return out[0..n];
     }
 
+    /// The syncfs census: every parked key appended to `out`. The room is
+    /// the table's fixed capacity, reserved OUTSIDE the lock, so the fill
+    /// under it never allocates and never truncates.
+    pub fn censusKeys(self: *Table, gpa: Allocator, out: *std.ArrayList(Key)) Allocator.Error!void {
+        try out.ensureUnusedCapacity(gpa, self.entries.len);
+        self.lock.lock();
+        defer self.lock.unlock();
+        var it = self.index.keyIterator();
+        while (it.next()) |k| out.appendAssumeCapacity(k.*);
+    }
+
     /// Every parked EXTENT entry's key (the D3 fold targets: the W2
     /// overlays charged as `parked_extent_bytes`), owned by `gpa`. A
     /// snapshot under the table lock: an entry that escalates or retires

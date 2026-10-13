@@ -209,48 +209,48 @@ src/fuse/abi.zig:149 | 32 | a size — OWED: derive from derive.Facts or documen
 src/fuse/abi.zig:571 | 7 | OWED: derive it or document it on the line (charter §1.5)
 src/fuse/abi.zig:571 | 7 | OWED: derive it or document it on the line (charter §1.5)
 src/fuse/codec.zig:531 | 512 | OWED: derive it or document it on the line (charter §1.5)
-src/fuse/handler/kv_fs.zig:356 | 12 | a size — OWED: derive from derive.Facts or document the physical/format reason
-src/fuse/handler/kv_fs.zig:1052 | 256 | OWED: derive it or document it on the line (charter §1.5)
-src/fuse/handler/kv_fs.zig:1708 | 1024 | OWED: derive it or document it on the line (charter §1.5)
-src/fuse/handler/kv_fs.zig:2029 | 0o777 | a file mode (POSIX permission bits)
-src/fuse/handler/kv_fs.zig:2151 | 3 | OWED: derive it or document it on the line (charter §1.5)
-src/fuse/handler/kv_fs.zig:2154 | 4 | OWED: derive it or document it on the line (charter §1.5)
-src/fuse/handler/kv_fs.zig:2167 | 4 | OWED: derive it or document it on the line (charter §1.5)
-src/fuse/handler/kv_fs.zig:2353 | 512 | OWED: derive it or document it on the line (charter §1.5)
-src/fuse/handler/kv_fs.zig:3368 | 4096 | OWED: derive it or document it on the line (charter §1.5)
+src/fuse/handler/kv_fs.zig:357 | 12 | a size — OWED: derive from derive.Facts or document the physical/format reason
+src/fuse/handler/kv_fs.zig:1057 | 256 | OWED: derive it or document it on the line (charter §1.5)
+src/fuse/handler/kv_fs.zig:1719 | 1024 | OWED: derive it or document it on the line (charter §1.5)
+src/fuse/handler/kv_fs.zig:2063 | 0o777 | a file mode (POSIX permission bits)
+src/fuse/handler/kv_fs.zig:2185 | 3 | OWED: derive it or document it on the line (charter §1.5)
+src/fuse/handler/kv_fs.zig:2188 | 4 | OWED: derive it or document it on the line (charter §1.5)
+src/fuse/handler/kv_fs.zig:2201 | 4 | OWED: derive it or document it on the line (charter §1.5)
+src/fuse/handler/kv_fs.zig:2387 | 512 | OWED: derive it or document it on the line (charter §1.5)
+src/fuse/handler/kv_fs.zig:3402 | 4096 | OWED: derive it or document it on the line (charter §1.5)
 src/fuse/handler/op_trace.zig:279 | 10 | a size — OWED: derive from derive.Facts or document the physical/format reason
 src/fuse/mount_options.zig:265 | 10 | OWED: derive it or document it on the line (charter §1.5)
 src/fuse/mount_options.zig:266 | 10 | OWED: derive it or document it on the line (charter §1.5)
-src/fuse/transport/filesystem_vtable.zig:456 | 0o100444 | a file mode (POSIX permission bits)
-src/fuse/transport/filesystem_vtable.zig:456 | 0o100644 | a file mode (POSIX permission bits)
-src/fuse/transport/filesystem_vtable.zig:456 | 0o40755 | a file mode (POSIX permission bits)
-src/fuse/transport/filesystem_vtable.zig:457 | 1_700_000_000 | OWED: derive it or document it on the line (charter §1.5)
-src/fuse/transport/filesystem_vtable.zig:461 | 511 | OWED: derive it or document it on the line (charter §1.5)
-src/fuse/transport/filesystem_vtable.zig:461 | 512 | OWED: derive it or document it on the line (charter §1.5)
-src/fuse/transport/filesystem_vtable.zig:462 | 1_700_000_000 | OWED: derive it or document it on the line (charter §1.5)
-src/fuse/transport/filesystem_vtable.zig:464 | 1_700_000_000 | OWED: derive it or document it on the line (charter §1.5)
-src/fuse/transport/filesystem_vtable.zig:473 | 4096 | OWED: derive it or document it on the line (charter §1.5)
-src/fuse/transport/filesystem_vtable.zig:659 | 0o100444 | a file mode (POSIX permission bits)
-src/fuse/transport/filesystem_vtable.zig:681 | 1024 | a table entry (switch/range arm) — the codec or classification table
-src/fuse/transport/filesystem_vtable.zig:681 | 255 | a table entry (switch/range arm) — the codec or classification table
-src/fuse/transport/filesystem_vtable.zig:681 | 4096 | a table entry (switch/range arm) — the codec or classification table
-src/fuse/transport/filesystem_vtable.zig:681 | 4096 | a table entry (switch/range arm) — the codec or classification table
-src/fuse/transport/filesystem_vtable.zig:681 | 512 | a table entry (switch/range arm) — the codec or classification table
-src/fuse/transport/filesystem_vtable.zig:681 | 512 | a table entry (switch/range arm) — the codec or classification table
-src/fuse/transport/filesystem_vtable.zig:681 | 8 | a table entry (switch/range arm) — the codec or classification table
+src/fuse/transport/filesystem_vtable.zig:472 | 0o100444 | a file mode (POSIX permission bits)
+src/fuse/transport/filesystem_vtable.zig:472 | 0o100644 | a file mode (POSIX permission bits)
+src/fuse/transport/filesystem_vtable.zig:472 | 0o40755 | a file mode (POSIX permission bits)
+src/fuse/transport/filesystem_vtable.zig:473 | 1_700_000_000 | OWED: derive it or document it on the line (charter §1.5)
+src/fuse/transport/filesystem_vtable.zig:477 | 511 | OWED: derive it or document it on the line (charter §1.5)
+src/fuse/transport/filesystem_vtable.zig:477 | 512 | OWED: derive it or document it on the line (charter §1.5)
+src/fuse/transport/filesystem_vtable.zig:478 | 1_700_000_000 | OWED: derive it or document it on the line (charter §1.5)
+src/fuse/transport/filesystem_vtable.zig:480 | 1_700_000_000 | OWED: derive it or document it on the line (charter §1.5)
+src/fuse/transport/filesystem_vtable.zig:489 | 4096 | OWED: derive it or document it on the line (charter §1.5)
+src/fuse/transport/filesystem_vtable.zig:696 | 0o100444 | a file mode (POSIX permission bits)
+src/fuse/transport/filesystem_vtable.zig:718 | 1024 | a table entry (switch/range arm) — the codec or classification table
+src/fuse/transport/filesystem_vtable.zig:718 | 255 | a table entry (switch/range arm) — the codec or classification table
+src/fuse/transport/filesystem_vtable.zig:718 | 4096 | a table entry (switch/range arm) — the codec or classification table
+src/fuse/transport/filesystem_vtable.zig:718 | 4096 | a table entry (switch/range arm) — the codec or classification table
+src/fuse/transport/filesystem_vtable.zig:718 | 512 | a table entry (switch/range arm) — the codec or classification table
+src/fuse/transport/filesystem_vtable.zig:718 | 512 | a table entry (switch/range arm) — the codec or classification table
+src/fuse/transport/filesystem_vtable.zig:718 | 8 | a table entry (switch/range arm) — the codec or classification table
 src/fuse/transport/probes.zig:106 | 4096 | OWED: derive it or document it on the line (charter §1.5)
 src/fuse/transport/probes.zig:210 | 16 | OWED: derive it or document it on the line (charter §1.5)
 src/fuse/transport/session.zig:278 | 32 | a size — OWED: derive from derive.Facts or document the physical/format reason
 src/fuse/transport/session.zig:627 | 64 | OWED: derive it or document it on the line (charter §1.5)
-src/fuse/transport/worker.zig:351 | 10 | OWED: derive it or document it on the line (charter §1.5)
-src/fuse/transport/worker.zig:351 | 16 | OWED: derive it or document it on the line (charter §1.5)
-src/fuse/transport/worker.zig:351 | 32 | OWED: derive it or document it on the line (charter §1.5)
-src/fuse/transport/worker.zig:351 | 8 | OWED: derive it or document it on the line (charter §1.5)
-src/fuse/transport/worker.zig:351 | 8 | OWED: derive it or document it on the line (charter §1.5)
-src/fuse/transport/worker.zig:351 | 9 | OWED: derive it or document it on the line (charter §1.5)
-src/fuse/transport/worker.zig:476 | 4096 | OWED: derive it or document it on the line (charter §1.5)
-src/fuse/transport/worker.zig:1087 | 3 | OWED: derive it or document it on the line (charter §1.5)
-src/fuse/transport/worker.zig:1112 | 3 | OWED: derive it or document it on the line (charter §1.5)
+src/fuse/transport/worker.zig:357 | 10 | OWED: derive it or document it on the line (charter §1.5)
+src/fuse/transport/worker.zig:357 | 16 | OWED: derive it or document it on the line (charter §1.5)
+src/fuse/transport/worker.zig:357 | 32 | OWED: derive it or document it on the line (charter §1.5)
+src/fuse/transport/worker.zig:357 | 8 | OWED: derive it or document it on the line (charter §1.5)
+src/fuse/transport/worker.zig:357 | 8 | OWED: derive it or document it on the line (charter §1.5)
+src/fuse/transport/worker.zig:357 | 9 | OWED: derive it or document it on the line (charter §1.5)
+src/fuse/transport/worker.zig:482 | 4096 | OWED: derive it or document it on the line (charter §1.5)
+src/fuse/transport/worker.zig:1096 | 3 | OWED: derive it or document it on the line (charter §1.5)
+src/fuse/transport/worker.zig:1121 | 3 | OWED: derive it or document it on the line (charter §1.5)
 src/gates/fuzz_campaign.zig:128 | 72 | OWED: derive it or document it on the line (charter §1.5)
 src/gates/fuzz_campaign.zig:185 | 16 | a size — OWED: derive from derive.Facts or document the physical/format reason
 src/gates/fuzz_campaign.zig:185 | 20 | a size — OWED: derive from derive.Facts or document the physical/format reason
@@ -298,14 +298,14 @@ src/meta/alloc_ext.zig:687 | 64 | OWED: derive it or document it on the line (ch
 src/meta/bset.zig:628 | 4 | OWED: derive it or document it on the line (charter §1.5)
 src/meta/checkpoint_cycle.zig:685 | 1000 | OWED: derive it or document it on the line (charter §1.5)
 src/meta/checkpoint_cycle.zig:686 | 1000 | OWED: derive it or document it on the line (charter §1.5)
-src/meta/conveyor.zig:569 | 8 | OWED: derive it or document it on the line (charter §1.5)
-src/meta/conveyor.zig:570 | 16 | OWED: derive it or document it on the line (charter §1.5)
-src/meta/conveyor.zig:570 | 8 | OWED: derive it or document it on the line (charter §1.5)
-src/meta/conveyor.zig:571 | 32 | OWED: derive it or document it on the line (charter §1.5)
-src/meta/conveyor.zig:571 | 9 | OWED: derive it or document it on the line (charter §1.5)
-src/meta/conveyor.zig:572 | 10 | OWED: derive it or document it on the line (charter §1.5)
-src/meta/conveyor.zig:572 | 64 | OWED: derive it or document it on the line (charter §1.5)
-src/meta/conveyor.zig:573 | 11 | OWED: derive it or document it on the line (charter §1.5)
+src/meta/conveyor.zig:574 | 8 | OWED: derive it or document it on the line (charter §1.5)
+src/meta/conveyor.zig:575 | 16 | OWED: derive it or document it on the line (charter §1.5)
+src/meta/conveyor.zig:575 | 8 | OWED: derive it or document it on the line (charter §1.5)
+src/meta/conveyor.zig:576 | 32 | OWED: derive it or document it on the line (charter §1.5)
+src/meta/conveyor.zig:576 | 9 | OWED: derive it or document it on the line (charter §1.5)
+src/meta/conveyor.zig:577 | 10 | OWED: derive it or document it on the line (charter §1.5)
+src/meta/conveyor.zig:577 | 64 | OWED: derive it or document it on the line (charter §1.5)
+src/meta/conveyor.zig:578 | 11 | OWED: derive it or document it on the line (charter §1.5)
 src/meta/economy.zig:397 | 0o777 | a file mode (POSIX permission bits)
 src/meta/geometry.zig:167 | 1024 | OWED: derive it or document it on the line (charter §1.5)
 src/meta/geometry.zig:167 | 128 | OWED: derive it or document it on the line (charter §1.5)

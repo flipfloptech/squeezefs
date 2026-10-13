@@ -297,10 +297,25 @@ const RecordingSink = struct {
     /// The object whose layout entry is DIRTY (the writer's acked bytes).
     dirty_object: u64 = 0,
     keys_per_entry: u32 = 3,
+    /// The revoked entry's carried `layout` value at the last discard
+    /// (copied: the entry is unpinned after the call); null = no entry or
+    /// no layout carried.
+    last_layout: ?[64]u8 = null,
+    last_layout_len: usize = 0,
+    entries_seen: u32 = 0,
 
-    fn discardLayout(ctx: *anyopaque, object: u64) cache.DiscardVerdict {
+    fn discardLayout(ctx: *anyopaque, object: u64, entry: ?*const cache.Entry) cache.DiscardVerdict {
         const self: *RecordingSink = @ptrCast(@alignCast(ctx));
         if (object == self.dirty_object) return .dirty_kept;
+        self.last_layout = null;
+        const e = entry orelse return .no_entry;
+        self.entries_seen += 1;
+        if (e.xattr("layout")) |v| {
+            var copy: [64]u8 = @splat(0);
+            self.last_layout_len = @min(v.len, copy.len);
+            @memcpy(copy[0..self.last_layout_len], v[0..self.last_layout_len]);
+            self.last_layout = copy;
+        }
         self.discards += 1;
         return .{ .discarded = self.keys_per_entry };
     }
@@ -645,6 +660,63 @@ test "a recall during an in-flight DMA read is acked only after it lands: the pu
     s = (try b.serve(io, objectOf(3), .{})).?;
     try testing.expectEqual(@as(u64, 200), s.entry.?.attrs.mtime);
     s.release(io);
+}
+
+test "the recall's purge reads the REVOKED entry's carried `layout` (held pinned through the sink's call): the inline ack, the drain lane's deferred ack and a voluntary release each hand it over; a recall of an object whose entry the reader shed answers the census once (0003 §W.2)" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    const f = try TwoMembers.init(gpa, io, 1);
+    defer f.deinit();
+    try f.records.putXattr(objectOf(3), "layout", "LAYOUT-OF-THREE");
+    const b = f.reader(0);
+    const plane = b.planeOf(io, A_ID) orelse blk: {
+        const s = (try b.serve(io, objectOf(3), .{})).?;
+        s.release(io);
+        break :blk b.planeOf(io, A_ID).?;
+    };
+    const sink = &f.sinks[0];
+    const want = "LAYOUT-OF-THREE";
+    // 1. The inline ack.
+    var s = (try b.serve(io, objectOf(3), .{})).?;
+    s.release(io);
+    var sum = try f.commit(&.{objectOf(3)}, &bumpMtime);
+    try testing.expectEqual(@as(u32, 1), sum.acked);
+    try testing.expectEqual(@as(u32, 1), sink.entries_seen);
+    try testing.expectEqualStrings(want, sink.last_layout.?[0..sink.last_layout_len]);
+    // 2. The drain lane's deferred ack: a serve in flight below the step.
+    s = (try b.serve(io, objectOf(3), .{})).?;
+    s.release(io);
+    const stamp = plane.stamps.begin();
+    var rig: InFlightRig = .{ .f = f };
+    const t = try std.Thread.spawn(.{}, InFlightRig.run, .{&rig});
+    var spins: u32 = 0;
+    while (plane.deferredCount(io) == 0) : (spins += 1) {
+        try testing.expect(spins < 1_000_000);
+        std.Thread.yield() catch {};
+    }
+    try testing.expectEqual(@as(u32, 1), sink.entries_seen);
+    plane.stamps.end(io, stamp);
+    try testing.expectEqual(@as(u32, 1), plane.pumpDeferred(io));
+    t.join();
+    try testing.expectEqual(@as(u32, 1), rig.summary.acked);
+    try testing.expectEqual(@as(u32, 2), sink.entries_seen);
+    try testing.expectEqualStrings(want, sink.last_layout.?[0..sink.last_layout_len]);
+    // 3. A voluntary release: drained and purged over the entry it drops.
+    s = (try b.serve(io, objectOf(3), .{})).?;
+    s.release(io);
+    plane.release(io, objectOf(3));
+    try testing.expectEqual(@as(u32, 3), sink.entries_seen);
+    try testing.expectEqualStrings(want, sink.last_layout.?[0..sink.last_layout_len]);
+    // 4. An entry the reader shed (the holder still lists the grant): the
+    //    recall finds none and runs the census once.
+    s = (try b.serve(io, objectOf(4), .{})).?;
+    s.release(io);
+    _ = plane.cache.shedAll(io);
+    const census0 = sink.census;
+    sum = try f.commit(&.{objectOf(4)}, &bumpFour);
+    try testing.expectEqual(@as(u32, 1), sum.acked);
+    try testing.expectEqual(census0 + 1, sink.census);
+    try testing.expectEqual(@as(u32, 3), sink.entries_seen);
 }
 
 test "a DIRTY local layout entry survives a recall: the writer's acked bytes are kept, only clean entries are discarded, the ack still travels" {

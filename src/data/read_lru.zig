@@ -163,6 +163,11 @@ pub const ReadLru = struct {
         return self.cache.contains(key);
     }
 
+    /// The census face (`purge.zig`).
+    pub fn nextKey(self: *ReadLru, cursor: *u64, select: rsc.KeySelect) ?BlockKey {
+        return self.cache.nextKey(cursor, select);
+    }
+
     /// The purge arm.
     pub fn purge(self: *ReadLru, key: BlockKey) bool {
         const v = self.cache.remove(key) orelse return false;

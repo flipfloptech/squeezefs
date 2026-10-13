@@ -487,6 +487,9 @@ fn mountMain(ctx: *Ctx) u8 {
     if (rplane) |rp| {
         fs.bindDivert(&rp.divert);
         plane.bindForeignLayout(rp.foreignLayout());
+        // A recall purges the plane's tiers of the object's blocks before
+        // it acks (the plane outlives the reader plane).
+        rp.sink.bindPlane(plane);
         vs.renderer.sources.reader = rp;
         vs.renderer.sources.mount.wire_endpoint = rp.endpointText();
     }
@@ -514,6 +517,9 @@ fn mountMain(ctx: *Ctx) u8 {
         plane.bindForeignLayout(wp.foreignLayout());
         plane.bindForeignPublish(wp.foreignPublish());
         wp.bindServedPublish(plane.servedPublishFace());
+        // A recall purges the plane's tiers of the object's blocks before
+        // it acks (the plane outlives the wire).
+        wp.sink.bindPlane(plane);
         // The data planes' arms: the manager holds the allocation lease
         // and serves the grants; a joiner mints from pulled grants and
         // ships its terminal frees.

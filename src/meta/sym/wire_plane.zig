@@ -1444,29 +1444,51 @@ const RenameStore = struct {
     }
 };
 
-/// The reader side's ack half (`token_cache.RecallSink`): the kernel view
-/// of a recalled object invalidated through the session's notify seam
-/// once the session is up (a recall before it owes no kernel view). The
-/// data plane's layout-entry discard and block-key census purge are not
-/// bound (the planes' device-path arm is owed): a recalled object answers
-/// `no_entry`, which purges nothing and keeps nothing — this mount holds
-/// no foreign layout entries until its divert can dial.
+/// The reader side's ack half (`token_cache.RecallSink`; spec §1.7 step
+/// 2): the kernel view of a recalled object invalidated through the
+/// session's notify seam once the session is up (a recall before it owes
+/// no kernel view), and the data plane's read tiers purged of every block
+/// key the recalled object's carried `layout` names — before the ack, so
+/// the holder's free (and any member's re-mint) of those blocks follows
+/// it (`DataPlane.recallPurgeLayout`). An object with no entry held, or a
+/// layout that names its references elsewhere, answers `no_entry`: the
+/// census over every foreign key, once per recall. This mount keeps no
+/// write-side state the recall could discard (a foreign file's publish
+/// ships to its holder), so nothing is ever `dirty_kept` here.
 pub const RecallSink = struct {
     notify: ?tokens.divert.NotifySeam = null,
+    /// The data plane whose tiers a recall purges: bound once it is open
+    /// (release here, acquire at the recall); a recall before it purges
+    /// nothing — no read has deposited yet.
+    plane: std.atomic.Value(?*DataPlane) = .init(null),
 
     pub fn bindSession(self: *RecallSink, seam: tokens.divert.NotifySeam) void {
         self.notify = seam;
+    }
+
+    pub fn bindPlane(self: *RecallSink, dp: *DataPlane) void {
+        self.plane.store(dp, .release);
     }
 
     pub fn sink(self: *RecallSink) tokens.cache.RecallSink {
         return .{ .ctx = self, .discardLayout = &discardLayout, .purgeCensus = &purgeCensus, .noteRecalled = &noteRecalled };
     }
 
-    fn discardLayout(_: *anyopaque, _: u64) tokens.cache.DiscardVerdict {
-        return .no_entry;
+    fn discardLayout(ctx: *anyopaque, _: u64, entry: ?*const tokens.cache.Entry) tokens.cache.DiscardVerdict {
+        const self: *RecallSink = @ptrCast(@alignCast(ctx));
+        const dp = self.plane.load(.acquire) orelse return .{ .discarded = 0 };
+        const e = entry orelse return .no_entry;
+        // No layout carried: a directory, a symlink, a never-written file —
+        // it names no block.
+        const value = e.xattr(@import("../../data/layout.zig").LAYOUT_XATTR_NAME) orelse return .{ .discarded = 0 };
+        return if (dp.recallPurgeLayout(value)) |n| .{ .discarded = n } else .no_entry;
     }
 
-    fn purgeCensus(_: *anyopaque) void {}
+    fn purgeCensus(ctx: *anyopaque) void {
+        const self: *RecallSink = @ptrCast(@alignCast(ctx));
+        const dp = self.plane.load(.acquire) orelse return;
+        _ = dp.recallPurgeCensus();
+    }
 
     fn noteRecalled(ctx: *anyopaque, object: u64) void {
         const self: *RecallSink = @ptrCast(@alignCast(ctx));

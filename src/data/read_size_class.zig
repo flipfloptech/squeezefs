@@ -71,6 +71,30 @@ comptime {
     std.debug.assert(@sizeOf(BlockKey) == 16);
 }
 
+/// A key census's selector (`purge.purgeCensus`): which keys it drops.
+/// Called under a tier's shard lock — a few atomic loads, never a lock.
+pub const KeySelect = struct {
+    ctx: *anyopaque,
+    call: *const fn (ctx: *anyopaque, key: BlockKey) bool,
+
+    pub fn picks(self: KeySelect, key: BlockKey) bool {
+        return self.call(self.ctx, key);
+    }
+};
+
+/// A census cursor over a sharded tier: `shard << 32 | slot`.
+pub fn cursorShard(cursor: u64) usize {
+    return @intCast(cursor >> 32);
+}
+
+pub fn cursorSlot(cursor: u64) usize {
+    return @intCast(cursor & 0xFFFF_FFFF);
+}
+
+pub fn cursorAt(shard: usize, slot: usize) u64 {
+    return (@as(u64, shard) << 32) | slot;
+}
+
 /// The `std.AutoHashMap` context for `BlockKey` (hash64, not the default
 /// Wyhash: one hash function per key across every tier and the ghost).
 pub const KeyContext = struct {

@@ -394,6 +394,22 @@ pub const Shard = struct {
         return true;
     }
 
+    /// The census face over one shard: the next indexed cell's key at or
+    /// after `slot` that `select` picks (a retired cell — removed while
+    /// pinned — is no entry).
+    fn nextKeyFrom(self: *Shard, slot: *usize, select: rsc.KeySelect) ?BlockKey {
+        self.lock.lock();
+        defer self.lock.unlock();
+        while (slot.* < self.cells.len) : (slot.* += 1) {
+            const c = &self.cells[slot.*];
+            if (c.live and !c.retired and select.picks(c.key)) {
+                slot.* += 1;
+                return c.key;
+            }
+        }
+        return null;
+    }
+
     pub fn live(self: *Shard) usize {
         self.lock.lock();
         defer self.lock.unlock();
@@ -479,6 +495,26 @@ pub const Cache = struct {
     pub fn getRange(self: *Cache, key: BlockKey, lo: u64, hi: u64, out: []u8) ?usize {
         if (!self.enabled) return null;
         return self.shardOf(key).getRange(key, lo, hi, out);
+    }
+
+    /// The census face (`purge.zig`): the next entry's key at or after
+    /// `cursor` that `select` picks, the cursor moved past it; null at the
+    /// end (a cache-less mount holds none).
+    pub fn nextKey(self: *Cache, cursor: *u64, select: rsc.KeySelect) ?BlockKey {
+        if (!self.enabled) return null;
+        var si = rsc.cursorShard(cursor.*);
+        var slot = rsc.cursorSlot(cursor.*);
+        while (si < self.shards.len) : ({
+            si += 1;
+            slot = 0;
+        }) {
+            if (self.shards[si].nextKeyFrom(&slot, select)) |k| {
+                cursor.* = rsc.cursorAt(si, slot);
+                return k;
+            }
+        }
+        cursor.* = rsc.cursorAt(si, 0);
+        return null;
     }
 
     /// The purge arm.

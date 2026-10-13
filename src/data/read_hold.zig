@@ -314,6 +314,24 @@ pub const Hold = struct {
         return true;
     }
 
+    /// The census face (`purge.zig`): the next live key at or after
+    /// `cursor` (a cell index) that `select` picks, the cursor moved past
+    /// it; null at the end. Nothing allocated.
+    pub fn nextKey(self: *Hold, cursor: *u64, select: rsc.KeySelect) ?BlockKey {
+        self.lock.lock();
+        defer self.lock.unlock();
+        var i: usize = @intCast(cursor.*);
+        while (i < self.cells.len) : (i += 1) {
+            const c = &self.cells[i];
+            if (c.live and select.picks(c.key)) {
+                cursor.* = i + 1;
+                return c.key;
+            }
+        }
+        cursor.* = i;
+        return null;
+    }
+
     /// Oldest-first trim to `target` bytes: an unconsumed victim counts
     /// `evicted_unconsumed`; a lane-fetch victim additionally `ahead_evictions`.
     pub fn trimTo(self: *Hold, target: u64) void {

@@ -490,6 +490,24 @@ pub const DataPlane = struct {
         self.foreign_layout = f;
     }
 
+    /// The token recall's data-plane half (`wire_plane.RecallSink`; spec
+    /// `sym_tokens_intents_striping.md` §1.7 step 2): the recalled
+    /// object's carried `layout` value (the raw layout, as the token
+    /// carries it) — every block key it names leaves the read tiers through
+    /// the ONE purge. Null when it cannot be enumerated (it does not
+    /// decode, or a block-map tree head names its references elsewhere):
+    /// the caller runs the census.
+    pub fn recallPurgeLayout(self: *DataPlane, value: []const u8) ?u32 {
+        const l = layout.Layout.decode(value, self.geo) catch return null;
+        return self.rp.purgeRecalledLayout(&l);
+    }
+
+    /// The recall's census fallback: every FOREIGN key the tiers hold
+    /// (`ReadPath.purgeForeignCensus`).
+    pub fn recallPurgeCensus(self: *DataPlane) u32 {
+        return self.rp.purgeForeignCensus();
+    }
+
     /// A foreign-slot file's layout publish shipped to its holder as ONE
     /// record verb: the encoded layout record and the writer's DMA proofs
     /// behind every block it newly names.

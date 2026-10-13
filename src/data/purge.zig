@@ -14,6 +14,13 @@
 //! Invalidations deliberately do NOT report to the admission governor
 //! (`lru.rs:76–77`): a purge is a correctness event, not a waste signal.
 //! `PurgeSeam` is the write side's face onto it (W1 purges through it).
+//!
+//! The CENSUS (`purgeCensus`) is the token recall's fallback when a
+//! recalled object's keys cannot be enumerated (spec
+//! `sym_tokens_intents_striping.md` §1.7 step 2): every tier's census face
+//! (`nextKey`, structural like the purge arm) names the keys a selector
+//! picks and each goes through `purgeBlockKey` — still the one way a key
+//! leaves the tiers, never a per-tier drop.
 
 const std = @import("std");
 const counters = @import("../core/counters.zig");
@@ -47,6 +54,8 @@ comptime {
         if (!@hasDecl(T, "purge")) @compileError(@typeName(T) ++ " is a block-key store without a purge arm");
         const P = @TypeOf(@field(T, "purge"));
         if (P != fn (*T, BlockKey) bool) @compileError(@typeName(T) ++ ".purge must be `fn (*Self, BlockKey) bool`");
+        if (!@hasDecl(T, "nextKey")) @compileError(@typeName(T) ++ " is a block-key store without a census face");
+        if (@TypeOf(@field(T, "nextKey")) != fn (*T, *u64, rsc.KeySelect) ?BlockKey) @compileError(@typeName(T) ++ ".nextKey must be `fn (*Self, *u64, KeySelect) ?BlockKey`");
     }
 }
 
@@ -71,6 +80,25 @@ pub fn purgeBlockKey(t: Tiers, key: BlockKey) u32 {
     }
     if (hits > 0) stats.read_tier_purge_hits.add(hits);
     return hits;
+}
+
+/// The census: every key some tier holds that `select` picks, dropped
+/// from EVERY tier through `purgeBlockKey`; returns the keys dropped. One
+/// walk per tier behind its cursor (a key two tiers hold is purged once,
+/// the second tier's walk no longer finds it); nothing allocated, so the
+/// recall's fallback cannot fail half-done. A key deposited behind a
+/// cursor that already passed is the depositor's to settle (its binding
+/// recheck), exactly as against a scoped purge.
+pub fn purgeCensus(t: Tiers, select: rsc.KeySelect) u32 {
+    var n: u32 = 0;
+    inline for (tiers_info.field_names) |name| {
+        var cursor: u64 = 0;
+        while (@field(t, name).nextKey(&cursor, select)) |k| {
+            _ = purgeBlockKey(t, k);
+            n += 1;
+        }
+    }
+    return n;
 }
 
 /// The write side's face: `purge(ctx, key)`.
@@ -141,10 +169,54 @@ test "the ONE purge drops a key from every tier that holds it and counts the hit
     try testing.expect(!hot.contains(k));
 }
 
-test "the census is structural: every tier type's purge arm has the one signature" {
+test "the census is structural: every tier type's purge arm and census face have the one signature" {
     inline for (tiers_info.field_types) |FT| {
         const T = @typeInfo(FT).pointer.child;
         try testing.expect(@TypeOf(@field(T, "purge")) == fn (*T, BlockKey) bool);
+        try testing.expect(@TypeOf(@field(T, "nextKey")) == fn (*T, *u64, rsc.KeySelect) ?BlockKey);
     }
     try testing.expectEqual(@as(usize, 4), tier_names.len);
+}
+
+test "the census purge drops exactly the keys its selector picks, from every tier, through the ONE purge; the rest keep their entries" {
+    const bs: usize = 4096;
+    const pool = try fill_pool.Pool.initRam(testing.allocator, bs, 16);
+    defer pool.deinit();
+    const hot = try hot_tier.HotTier.init(testing.allocator, pool, bs, 8 * bs, 2);
+    defer hot.deinit();
+    const lru = try read_lru.ReadLru.init(testing.allocator, 4 * rsc.SMALL_FILL_MAX, 2);
+    defer lru.deinit();
+    const hold = try read_hold.Hold.init(testing.allocator, pool, 8);
+    defer hold.deinit();
+    hold.setBudget(8 * bs);
+    var nvme = try nvme_read_cache.Cache.initRam(testing.allocator, 2, 16 * nvme_read_cache.GRAIN);
+    defer nvme.deinit();
+    const tiers: Tiers = .{ .hot = hot, .lru = lru, .hold = hold, .nvme = &nvme };
+    // Volume 1 is "foreign" (picked), volume 2 is not; each key in a
+    // different mix of tiers.
+    const Pick = struct {
+        fn call(_: *anyopaque, k: BlockKey) bool {
+            return k.vol_tag == 1;
+        }
+    };
+    var dummy: u8 = 0;
+    const select: rsc.KeySelect = .{ .ctx = &dummy, .call = &Pick.call };
+    const keys = [_]BlockKey{ .init(1, 0), .init(1, bs), .init(2, 0), .init(2, bs) };
+    for (keys, 0..) |k, i| {
+        const s = pool.acquire().?;
+        @memset(pool.bytes(s), @intCast(i));
+        if (i != 1) try testing.expectEqual(hot_tier.PutOutcome.inserted, hot.putClassValidated(k, s, @intCast(bs), .protected, .always, false));
+        if (i != 0) try testing.expectEqual(read_hold.InsertOutcome.inserted, hold.insert(k, s, @intCast(bs), true, .always));
+        _ = pool.unpin(s);
+        try testing.expectEqual(hot_tier.PutOutcome.inserted, lru.putValidated(k, pool.bytes(s)[0..bs], .always, false));
+        try testing.expectEqual(nvme_read_cache.PutOutcome.published, nvme.putValidated(k, pool.bytes(s)[0..bs], 1, .always, false));
+    }
+    const calls0 = stats.read_tier_purges.load();
+    try testing.expectEqual(@as(u32, 2), purgeCensus(tiers, select));
+    try testing.expectEqual(calls0 + 2, stats.read_tier_purges.load());
+    for (keys[0..2]) |k| try testing.expect(!hot.contains(k) and !lru.contains(k) and !hold.contains(k) and !nvme.has(k));
+    try testing.expect(hot.contains(keys[2]) and lru.contains(keys[2]) and nvme.has(keys[2]));
+    try testing.expect(hot.contains(keys[3]) and hold.contains(keys[3]) and lru.contains(keys[3]) and nvme.has(keys[3]));
+    // A second census finds nothing left to drop.
+    try testing.expectEqual(@as(u32, 0), purgeCensus(tiers, select));
 }

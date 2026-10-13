@@ -863,10 +863,69 @@ pub const ReadPath = struct {
     }
 
     /// The deposit-only paths' snapshot (the hold-serve ceremony, a
-    /// victim's dehydration): null unless stable AND depositable.
+    /// victim's dehydration): null unless stable AND depositable — and
+    /// never for a FOREIGN key: no binding recheck follows these deposits,
+    /// so one landing after the token recall's purge would outlive the
+    /// block's re-use (`foreignKey`; 0003 §W.2).
     fn depositIncarnation(self: *ReadPath, key: BlockKey) ?u64 {
+        if (self.foreignKey(key)) return null;
         const before = self.fillIncarnation(key) orelse return null;
         return if (self.depositable(key)) before else null;
+    }
+
+    /// A key whose cell this member never touched (word 0) — or on a
+    /// volume it tracks no allocator for: the block's lifetime is ANOTHER
+    /// member's, minted and freed on that member's allocator, and nothing
+    /// here moves when it ends. Its tier entries are dropped by the token
+    /// recall's purge (`purgeRecalledLayout`, `purgeForeignCensus`) and by
+    /// a binding loss after a fetch that may have deposited it
+    /// (`loseForeign`).
+    fn foreignKey(self: *ReadPath, key: BlockKey) bool {
+        const a = self.allocatorOf(key) orelse return true;
+        return a.incarnationWord(key.blockIdx(self.stride())) == 0;
+    }
+
+    /// A binding loss after a fetch that may have deposited `key`: a
+    /// FOREIGN key leaves every tier. Its fill validated by the word alone
+    /// (0 here whatever the owner does), so the only witness of the
+    /// block's end is the token: the binding that just moved may have been
+    /// revoked by a recall whose purge ran between this fill's DMA and its
+    /// deposit — and the recheck after the deposit is the read that sees
+    /// the revocation (a revoked token misses and refetches).
+    fn loseForeign(self: *ReadPath, key: BlockKey) void {
+        if (self.foreignKey(key)) _ = purge.purgeBlockKey(self.tiers, key);
+    }
+
+    /// The token recall's scoped purge (charter §5.5; `docs/porting/
+    /// sym_tokens_intents_striping.md` §1.7 step 2): every block key the
+    /// recalled object's layout NAMES (its durable copy or tenant, every
+    /// inline-map entry) through the ONE purge — before the reader acks,
+    /// so the holder's free of those blocks follows it. Null when the
+    /// layout names its references elsewhere (a block-map tree head): the
+    /// caller falls back to the census.
+    pub fn purgeRecalledLayout(self: *ReadPath, l: *const layout.Layout) ?u32 {
+        if (l.isKvmap()) return null;
+        var n: u32 = 0;
+        var it = l.named(self.stride());
+        while (it.next()) |e| {
+            _ = purge.purgeBlockKey(self.tiers, BlockKey.fromMapping(e.mapping));
+            n += 1;
+        }
+        return n;
+    }
+
+    /// The census fallback (a recalled object whose keys cannot be
+    /// enumerated: no entry held — shed, never granted — or a block-map
+    /// tree head): every FOREIGN key the tiers hold, through the ONE
+    /// purge. A key inside a local lifetime keeps its entry — its own free
+    /// purges it and the incarnation guards it until then.
+    pub fn purgeForeignCensus(self: *ReadPath) u32 {
+        return purge.purgeCensus(self.tiers, .{ .ctx = self, .call = &selectForeign });
+    }
+
+    fn selectForeign(ctx: *anyopaque, key: BlockKey) bool {
+        const self: *ReadPath = @ptrCast(@alignCast(ctx));
+        return self.foreignKey(key);
     }
 
     /// The warm ladder's direct-leg pair: the pre-DMA snapshot (null =
@@ -1524,6 +1583,7 @@ pub const ReadPath = struct {
             };
             if (fetched.serve_valid and self.bindingIs(ino, b, k)) return fetched;
             fetched.release(self);
+            self.loseForeign(k);
             losses += 1;
             stats.stale_binding_rebinds.inc();
             key = self.currentBinding(ino, b);
@@ -1869,6 +1929,10 @@ pub const ReadPath = struct {
         if (envResident(@ptrCast(&env_ctx), block)) return;
         const blk = self.getCachedOrFetch(io, key, class) catch return;
         blk.release(self);
+        // No serve follows a speculative fill: a FOREIGN deposit is settled
+        // by the recheck a serve would make (`loseForeign`); a local one is
+        // the incarnation's.
+        if (self.foreignKey(key) and !self.bindingIs(ino, block, key)) _ = purge.purgeBlockKey(self.tiers, key);
     }
 
     /// The hold-serve ceremony DEFERRED from the warm ladder's probe (the
@@ -2863,14 +2927,90 @@ test "two members over one volume: B caches A's block (a cell B never touched), 
         try Fixture.expected(9 * Fixture.bs, buf);
     }
     try testing.expect(f.rp.hot.contains(key9));
-    // A deletes F (the token recall reaches B — today it purges nothing),
-    // frees block 9 and re-mints it for F2 with new bytes.
+    // A deletes F: the delete recalls B's token on F, and B's recall
+    // purges the keys F's layout names before it acks (the sink's call);
+    // only then does A free block 9 — and re-mint it for F2.
+    const f_entries = [_]layout.MapEntryWire{(layout.MapEntry{ .block = 0, .mapping = f.bindings[0].? }).encode()};
+    const f_layout = layout.Layout.stripedInline(Fixture.bs, &f_entries);
     f.bindings[0] = null;
+    try testing.expectEqual(@as(?u32, 1), f.rp.purgeRecalledLayout(&f_layout));
+    try testing.expect(!f.rp.hot.contains(key9) and !f.rp.hold.contains(key9) and !f.rp.nvme.has(key9) and !f.rp.lru.contains(key9));
     try testing.expectEqual(block_alloc.BeginFree.terminal, try a.alloc.freeBlock(9));
     f.bindings[0] = try a.mintAndWrite(f, 9, 0xC3);
     // B reads F2: the new bytes.
     try testing.expectEqual(@as(usize, 1 << 20), try f.rp.read(io, 8, 0, 1 << 20, .{ .buf = buf }, .{}));
     for (buf) |byte| try testing.expectEqual(@as(u8, 0xC3), byte);
+}
+
+test "two members over one volume: a fill of A's block whose DMA lands BEFORE the recall's purge and whose deposit lands AFTER it — the binding recheck after the deposit sees the revoked binding and drops the key; B's read of the block's next lifetime serves its new bytes (0003 §W.2)" {
+    const io = testing.io;
+    const f = try Fixture.init(testing.allocator, .{});
+    defer f.deinit();
+    var a: ForeignWriter = try .init();
+    defer a.deinit();
+    const buf = try alignedBuf(testing.allocator, 1 << 20);
+    defer testing.allocator.free(buf);
+    f.size = Fixture.bs;
+    f.bindings[0] = try a.mintAndWrite(f, 9, null);
+    const key9 = BlockKey.init(Fixture.vol_tag, 9 * Fixture.bs);
+    // The recall lands inside B's fill: after the DMA, before the deposit
+    // (A's delete revoked B's token — the binding resolves to nothing —
+    // and the purge ran over a tier that did not hold the key yet).
+    const Recall = struct {
+        var armed: bool = false;
+        var purged: ?u32 = null;
+        fn run(fx: *Fixture) void {
+            if (!armed) return;
+            armed = false;
+            const entries = [_]layout.MapEntryWire{(layout.MapEntry{ .block = 0, .mapping = fx.bindings[0].? }).encode()};
+            const l = layout.Layout.stripedInline(Fixture.bs, &entries);
+            fx.bindings[0] = null;
+            purged = fx.rp.purgeRecalledLayout(&l);
+        }
+    };
+    Recall.armed = true;
+    f.after_read = &Recall.run;
+    defer f.after_read = null;
+    const rebinds0 = stats.stale_binding_rebinds.load();
+    // F was deleted under the read: a hole, never F's bytes deposited.
+    try testing.expectEqual(@as(usize, 1 << 20), try f.rp.read(io, 7, 0, 1 << 20, .{ .buf = buf }, .{}));
+    try testing.expectEqual(@as(?u32, 1), Recall.purged);
+    try testing.expectEqual(rebinds0 + 1, stats.stale_binding_rebinds.load());
+    try testing.expect(!f.rp.hot.contains(key9) and !f.rp.hold.contains(key9) and !f.rp.nvme.has(key9) and !f.rp.lru.contains(key9));
+    // A frees block 9 and re-mints it for F2: B reads the new bytes.
+    try testing.expectEqual(block_alloc.BeginFree.terminal, try a.alloc.freeBlock(9));
+    f.bindings[0] = try a.mintAndWrite(f, 9, 0x5A);
+    try testing.expectEqual(@as(usize, 1 << 20), try f.rp.read(io, 8, 0, 1 << 20, .{ .buf = buf }, .{}));
+    for (buf) |byte| try testing.expectEqual(@as(u8, 0x5A), byte);
+}
+
+test "the recall's census fallback drops every FOREIGN key and keeps every key of this member's lifetimes; a block-map tree head is not enumerable (the census); the deposit-only paths never deposit a foreign key" {
+    const io = testing.io;
+    const f = try Fixture.init(testing.allocator, .{});
+    defer f.deinit();
+    var a: ForeignWriter = try .init();
+    defer a.deinit();
+    const buf = try alignedBuf(testing.allocator, 1 << 20);
+    defer testing.allocator.free(buf);
+    f.size = Fixture.bs;
+    // Block 9 is A's (foreign here), block 3 this member's own.
+    f.bindings[0] = try a.mintAndWrite(f, 9, null);
+    try testing.expectEqual(@as(usize, 1 << 20), try f.rp.read(io, 7, 0, 1 << 20, .{ .buf = buf }, .{}));
+    f.bind(0, 3);
+    try testing.expectEqual(@as(usize, 1 << 20), try f.rp.read(io, 7, 0, 1 << 20, .{ .buf = buf }, .{}));
+    const key9 = BlockKey.init(Fixture.vol_tag, 9 * Fixture.bs);
+    const key3 = BlockKey.init(Fixture.vol_tag, 3 * Fixture.bs);
+    try testing.expect(f.rp.hot.contains(key9) and f.rp.hot.contains(key3));
+    // The deposit-only paths (a victim's dehydration, the hold-serve
+    // ceremony): no snapshot for a foreign key, one for a local key.
+    try testing.expectEqual(@as(?u64, null), f.rp.depositIncarnation(key9));
+    try testing.expect(f.rp.depositIncarnation(key3) != null);
+    // A recalled block-map tree head names its references elsewhere.
+    const head = layout.Layout.stripedKvmap(64 * Fixture.bs, null, 1);
+    try testing.expectEqual(@as(?u32, null), f.rp.purgeRecalledLayout(&head));
+    try testing.expectEqual(@as(u32, 1), f.rp.purgeForeignCensus());
+    try testing.expect(!f.rp.hot.contains(key9) and !f.rp.hold.contains(key9));
+    try testing.expect(f.rp.hot.contains(key3));
 }
 
 test "a packed tenant whose binding moves between its window DMA and the recheck re-resolves: the old tenant's bytes are never served (the read path's (a) ∧ (b) on the window leg)" {

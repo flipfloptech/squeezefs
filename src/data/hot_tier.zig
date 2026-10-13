@@ -582,6 +582,31 @@ pub fn ClockCache(comptime Store: type) type {
             return v;
         }
 
+        /// The census face (`purge.purgeCensus`): the next indexed key at or
+        /// after `cursor` that `select` picks, the cursor moved past it;
+        /// null at the end. One shard lock at a time, nothing allocated.
+        pub fn nextKey(self: *Self, cursor: *u64, select: rsc.KeySelect) ?BlockKey {
+            var si = rsc.cursorShard(cursor.*);
+            var slot = rsc.cursorSlot(cursor.*);
+            while (si < self.shards.len) : ({
+                si += 1;
+                slot = 0;
+            }) {
+                const s = &self.shards[si];
+                s.lock.lock();
+                defer s.lock.unlock();
+                while (slot < s.entries.len) : (slot += 1) {
+                    const e = &s.entries[slot];
+                    if (e.live and select.picks(e.key)) {
+                        cursor.* = rsc.cursorAt(si, slot + 1);
+                        return e.key;
+                    }
+                }
+            }
+            cursor.* = rsc.cursorAt(si, 0);
+            return null;
+        }
+
         /// Ring population of `key`'s shard (the reclaim law's observable).
         pub fn ringLenOf(self: *Self, key: BlockKey) usize {
             const s = self.shardOf(key);
@@ -715,6 +740,12 @@ pub const HotTier = struct {
         }
         stats.hot_block_current_bytes.set(self.cache.currentBytes());
         return out;
+    }
+
+    /// The census face (`purge.zig`).
+    pub fn nextKey(self: *HotTier, cursor: *u64, select: rsc.KeySelect) ?BlockKey {
+        if (!self.enabled()) return null;
+        return self.cache.nextKey(cursor, select);
     }
 
     /// The purge arm (`purge.zig`): true when an entry was dropped.

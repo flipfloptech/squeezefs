@@ -283,7 +283,10 @@ pub const DiscardVerdict = union(enum) {
 
 pub const RecallSink = struct {
     ctx: *anyopaque,
-    discardLayout: *const fn (ctx: *anyopaque, object: Object) DiscardVerdict,
+    /// `entry` is the object's revoked entry (its carried records, the
+    /// `layout` xattr among them — what the scoped purge enumerates), held
+    /// pinned through the call; null when none was held.
+    discardLayout: *const fn (ctx: *anyopaque, object: Object, entry: ?*const Entry) DiscardVerdict,
     purgeCensus: *const fn (ctx: *anyopaque) void,
     /// The FUSE-layer hook: the recalled object's kernel view is invalidated
     /// (`FUSE_NOTIFY_INVAL_INODE` + `PRUNE` through the session).
@@ -292,7 +295,7 @@ pub const RecallSink = struct {
     /// A reader with no data plane bound (the contracts): nothing to purge.
     pub const none: RecallSink = .{ .ctx = @ptrFromInt(1), .discardLayout = &noDiscard, .purgeCensus = &noPurge, .noteRecalled = &noNote };
 
-    fn noDiscard(_: *anyopaque, _: Object) DiscardVerdict {
+    fn noDiscard(_: *anyopaque, _: Object, _: ?*const Entry) DiscardVerdict {
         return .no_entry;
     }
     fn noPurge(_: *anyopaque) void {}
@@ -533,18 +536,24 @@ pub const Cache = struct {
     }
 
     /// The recall's first half, per object: `revoke_gens[o] += 1` FIRST,
-    /// then the entry leaves (REVOKED, bytes credited). Answers how many
+    /// then the entry leaves (REVOKED, bytes credited) — pinned into
+    /// `kept[i]` (null when none was held), so the purge after it still
+    /// reads its carried records; the caller unpins. Answers how many
     /// entries were held.
-    pub fn revoke(self: *Cache, io: Io, objects: []align(1) const Object) Allocator.Error!u32 {
+    pub fn revoke(self: *Cache, io: Io, objects: []align(1) const Object, kept: []?*Entry) Allocator.Error!u32 {
+        assert(kept.len == objects.len);
+        @memset(kept, null);
         self.lock.lockUncancelable(io);
         defer self.lock.unlock(io);
         var held: u32 = 0;
-        for (objects) |o| {
+        for (objects, kept) |o, *k| {
             const gop = try self.revoke_gens.getOrPut(self.gpa, o);
             if (!gop.found_existing) gop.value_ptr.* = 0;
             gop.value_ptr.* += 1;
             if (self.entries.get(o)) |e| {
+                e.pins += 1;
                 self.removeLocked(e);
+                k.* = e;
                 held += 1;
             }
         }
@@ -552,8 +561,9 @@ pub const Cache = struct {
     }
 
     /// Voluntary room: second-chance `used` bit, then any; the retired
-    /// objects go to `out` for the caller's drain + purge + `Release`.
-    pub fn evictToBudget(self: *Cache, io: Io, need: u64, out: *std.ArrayList(Object)) Allocator.Error!void {
+    /// objects go to `out` and their entries, pinned, to `kept` (the
+    /// caller's drain + purge + `Release`, then the unpin).
+    pub fn evictToBudget(self: *Cache, io: Io, need: u64, out: *std.ArrayList(Object), kept: *std.ArrayList(?*Entry)) Allocator.Error!void {
         self.lock.lockUncancelable(io);
         defer self.lock.unlock(io);
         var pass: u8 = 0;
@@ -571,7 +581,11 @@ pub const Cache = struct {
             }
             for (victims.items) |e| {
                 if (self.bytes + need <= self.budget_bytes) break;
-                try out.append(self.gpa, e.object);
+                try out.ensureUnusedCapacity(self.gpa, 1);
+                try kept.ensureUnusedCapacity(self.gpa, 1);
+                out.appendAssumeCapacity(e.object);
+                e.pins += 1;
+                kept.appendAssumeCapacity(e);
                 self.removeLocked(e);
             }
         }
@@ -661,6 +675,8 @@ const Deferred = struct {
     frame_id: u64,
     holder_volume: u16,
     objects: []Object,
+    /// The revoked entries, pinned until the drain lane's purge read them.
+    kept: []?*Entry,
     gen: u64,
 };
 
@@ -702,7 +718,11 @@ pub const Reader = struct {
     pub fn deinit(self: *Reader) void {
         self.cache.deinit();
         self.fetching.deinit(self.gpa);
-        for (self.deferred.items) |d| self.gpa.free(d.objects);
+        for (self.deferred.items) |d| {
+            for (d.kept) |e| if (e) |x| x.destroy();
+            self.gpa.free(d.kept);
+            self.gpa.free(d.objects);
+        }
         self.deferred.deinit(self.gpa);
     }
 
@@ -893,8 +913,13 @@ pub const Reader = struct {
         // Room by voluntary releases, drained + purged THEN released.
         var retired: std.ArrayList(Object) = .empty;
         defer retired.deinit(self.gpa);
-        self.cache.evictToBudget(io, e.bytes, &retired) catch return error.OutOfMemory;
-        if (retired.items.len != 0) self.releaseRetired(io, retired.items);
+        var retired_kept: std.ArrayList(?*Entry) = .empty;
+        defer {
+            for (retired_kept.items) |k| if (k) |x| self.cache.unpin(io, x);
+            retired_kept.deinit(self.gpa);
+        }
+        self.cache.evictToBudget(io, e.bytes, &retired, &retired_kept) catch return error.OutOfMemory;
+        if (retired.items.len != 0) self.releaseRetired(io, retired.items, retired_kept.items);
         consumed = true;
         return switch (self.cache.install(io, e, gen0)) {
             .installed => |served| .{ .installed = served },
@@ -925,22 +950,26 @@ pub const Reader = struct {
     /// no serve below the step is in flight the reply is the ack; else the
     /// frame goes to the drain lane.
     pub fn handleRecall(self: *Reader, io: Io, frame_id: u64, objects: []align(1) const Object) Allocator.Error!RecallVerdict {
-        _ = try self.cache.revoke(io, objects);
+        const kept = try self.revokeKeeping(io, objects);
+        var kept_owned = true;
+        defer if (kept_owned) self.releaseKept(io, kept);
         stats.dlm_token_recalls_received.add(@intCast(objects.len));
         self.noteRound();
         const gen = self.stamps.step();
         if (self.stamps.inflightBelow(gen) == 0) {
-            self.purge(objects);
+            self.purge(objects, kept);
             stats.dlm_token_recalls_acked.add(@intCast(objects.len));
             return .acked;
         }
         const owned = try self.gpa.alloc(Object, objects.len);
+        errdefer self.gpa.free(owned);
         for (owned, objects) |*o, src| o.* = src;
         {
             self.deferred_lock.lockUncancelable(io);
             defer self.deferred_lock.unlock(io);
-            try self.deferred.append(self.gpa, .{ .frame_id = frame_id, .holder_volume = self.volume, .objects = owned, .gen = gen });
+            try self.deferred.append(self.gpa, .{ .frame_id = frame_id, .holder_volume = self.volume, .objects = owned, .kept = kept, .gen = gen });
         }
+        kept_owned = false;
         self.deferred_wake.notifyWaiters(io);
         return .deferred;
     }
@@ -957,8 +986,9 @@ pub const Reader = struct {
                 break :blk self.deferred.orderedRemove(0);
             } orelse return acked;
             defer self.gpa.free(d.objects);
+            defer self.releaseKept(io, d.kept);
             self.stamps.drainBelow(io, d.gen);
-            self.purge(d.objects);
+            self.purge(d.objects, d.kept);
             _ = self.link.call(self.link.ctx, .{ .token_recall_ack = .{ .volume = d.holder_volume, .reserved = 0, .reserved2 = 0, .client_id = self.client_id, .frame_id = d.frame_id } }) catch {
                 self.noteRoundFailed();
                 continue;
@@ -976,15 +1006,35 @@ pub const Reader = struct {
         return self.deferred.items.len;
     }
 
+    /// The revoke that keeps each revoked entry pinned for the purge
+    /// (`Cache.revoke`); the caller hands the result to `releaseKept`.
+    fn revokeKeeping(self: *Reader, io: Io, objects: []align(1) const Object) Allocator.Error![]?*Entry {
+        const kept = try self.gpa.alloc(?*Entry, objects.len);
+        errdefer self.gpa.free(kept);
+        _ = self.cache.revoke(io, objects, kept) catch |e| {
+            for (kept) |k| if (k) |x| self.cache.unpin(io, x);
+            return e;
+        };
+        return kept;
+    }
+
+    fn releaseKept(self: *Reader, io: Io, kept: []?*Entry) void {
+        for (kept) |k| if (k) |x| self.cache.unpin(io, x);
+        self.gpa.free(kept);
+    }
+
     /// The scoped purge (spec §1.7 step 2): per recalled object the clean
-    /// layout entry discarded with its keys, DIRTY kept, a held stripe
-    /// skipped; an object with no entry falls back to the whole census ONCE
-    /// per call.
-    fn purge(self: *Reader, objects: []align(1) const Object) void {
+    /// layout entry discarded with its keys — the sink reads them off the
+    /// revoked entry (`kept[i]`; null `kept` = none known) — DIRTY kept, a
+    /// held stripe skipped; an object with no entry falls back to the
+    /// whole census ONCE per call.
+    fn purge(self: *Reader, objects: []align(1) const Object, kept: ?[]const ?*Entry) void {
+        if (kept) |ks| assert(ks.len == objects.len);
         var census_done = false;
-        for (objects) |o| {
+        for (objects, 0..) |o, i| {
             self.sink.noteRecalled(self.sink.ctx, o);
-            switch (self.sink.discardLayout(self.sink.ctx, o)) {
+            const k: ?*const Entry = if (kept) |ks| ks[i] else null;
+            switch (self.sink.discardLayout(self.sink.ctx, o, k)) {
                 .discarded => |n| {
                     stats.dlm_token_recall_purged_keys.add(n);
                     stats.dlm_token_recall_scoped_purges.inc();
@@ -1004,10 +1054,10 @@ pub const Reader = struct {
 
     /// Voluntary: drained + purged first, then `Release` (best effort — a
     /// lost release costs the holder one needless recall).
-    fn releaseRetired(self: *Reader, io: Io, objects: []const Object) void {
+    fn releaseRetired(self: *Reader, io: Io, objects: []const Object, kept: []const ?*Entry) void {
         const gen = self.stamps.step();
         self.stamps.drainBelow(io, gen);
-        self.purge(objects);
+        self.purge(objects, kept);
         var off: usize = 0;
         while (off < objects.len) {
             const n = @min(objects.len - off, std.math.maxInt(u16));
@@ -1021,8 +1071,9 @@ pub const Reader = struct {
     /// release; the eviction path is `evictToBudget`'s).
     pub fn release(self: *Reader, io: Io, object: Object) void {
         const objs = [_]Object{object};
-        _ = self.cache.revoke(io, &objs) catch return;
-        self.releaseRetired(io, &objs);
+        const kept = self.revokeKeeping(io, &objs) catch return;
+        defer self.releaseKept(io, kept);
+        self.releaseRetired(io, &objs, kept);
     }
 
     /// The clean leave: every held token released when the channel is ok.
@@ -1036,8 +1087,9 @@ pub const Reader = struct {
             while (it.next()) |k| held.append(self.gpa, k.*) catch break;
         }
         if (held.items.len == 0 or !self.channel_ok.load(.acquire)) return;
-        _ = self.cache.revoke(io, held.items) catch return;
-        self.releaseRetired(io, held.items);
+        const kept = self.revokeKeeping(io, held.items) catch return;
+        defer self.releaseKept(io, kept);
+        self.releaseRetired(io, held.items, kept);
     }
 
     /// A holder that MOVED its listener: the link re-pointed in place, the
@@ -1056,10 +1108,13 @@ pub const Reader = struct {
             var it = self.cache.entries.keyIterator();
             while (it.next()) |k| held.append(self.gpa, k.*) catch break;
         }
-        _ = self.cache.revoke(io, held.items) catch {};
+        // A revoke that could not allocate kept nothing: the purge runs
+        // over no entries — the census, the fail-safe direction.
+        const kept = self.revokeKeeping(io, held.items) catch null;
+        defer if (kept) |k| self.releaseKept(io, k);
         const gen = self.stamps.step();
         self.stamps.drainBelow(io, gen);
-        self.purge(held.items);
+        self.purge(held.items, kept);
         self.channel_ok.store(false, .release);
         stats.dlm_token_holder_repoints.inc();
         if (self.link.call(self.link.ctx, .{ .ping = .{} })) |_| self.noteRound() else |_| self.noteRoundFailed();
@@ -1089,10 +1144,13 @@ pub const Reader = struct {
             var it = self.cache.entries.keyIterator();
             while (it.next()) |k| held.append(self.gpa, k.*) catch break;
         }
-        _ = self.cache.revoke(io, held.items) catch {};
+        // A revoke that could not allocate kept nothing: the purge runs
+        // over no entries — the census, the fail-safe direction.
+        const kept = self.revokeKeeping(io, held.items) catch null;
+        defer if (kept) |k| self.releaseKept(io, k);
         const gen = self.stamps.step();
         self.stamps.drainBelow(io, gen);
-        self.purge(held.items);
+        self.purge(held.items, kept);
         self.noteRound();
         return true;
     }
@@ -1154,7 +1212,9 @@ test "the cache: install under gen0 is refused by a bump the check sees and foun
     const gpa = testing.allocator;
     // A bump the check sees: aborted.
     const gen0 = c.revokeGen(io, 7);
-    _ = try c.revoke(io, &.{7});
+    var none: [1]?*Entry = undefined;
+    try testing.expectEqual(@as(u32, 0), try c.revoke(io, &.{7}, &none));
+    try testing.expectEqual(@as(?*Entry, null), none[0]);
     const e1 = try mk(gpa, 7, false);
     try testing.expect(c.install(io, e1, gen0) == .recalled_mid_fetch);
     // Installed under the current generation; a later bump finds it.
@@ -1170,12 +1230,16 @@ test "the cache: install under gen0 is refused by a bump the check sees and foun
     try testing.expectEqual(e2, c.install(io, e3, gen1).installed);
     c.unpin(io, e2);
     try testing.expect(c.probe(io, 7, .{ .dentries = true }) != null);
-    // Revoked while pinned (twice): alive until the last unpin.
+    // Revoked while pinned (twice): alive until the last unpin — the
+    // revoke's own pin (the purge's read of the carried records) included.
     c.unpin(io, e2);
-    try testing.expectEqual(@as(u32, 1), try c.revoke(io, &.{7}));
+    var kept: [1]?*Entry = undefined;
+    try testing.expectEqual(@as(u32, 1), try c.revoke(io, &.{7}, &kept));
+    try testing.expectEqual(e2, kept[0].?);
     try testing.expectEqual(@as(usize, 0), c.count(io));
     try testing.expectEqual(State.revoked, e2.state);
     c.unpin(io, e2);
+    c.unpin(io, kept[0].?);
 }
 
 test "the budget: ONE oversize entry is refused loud; eviction gives the used bit a second chance; the shed drops everything" {
@@ -1206,9 +1270,17 @@ test "the budget: ONE oversize entry is refused loud; eviction gives the used bi
     c.unpin(io, es[1]);
     var out: std.ArrayList(Object) = .empty;
     defer out.deinit(gpa);
-    try c.evictToBudget(io, table.TOKEN_ENTRY_BYTES, &out);
+    var kept: std.ArrayList(?*Entry) = .empty;
+    defer kept.deinit(gpa);
+    try c.evictToBudget(io, table.TOKEN_ENTRY_BYTES, &out, &kept);
     try testing.expectEqual(@as(usize, 1), out.items.len);
     try testing.expect(out.items[0] != 2);
+    // The victim's entry stays pinned (REVOKED) for the purge; the unpin
+    // destroys it.
+    try testing.expectEqual(@as(usize, 1), kept.items.len);
+    try testing.expectEqual(out.items[0], kept.items[0].?.object);
+    try testing.expectEqual(State.revoked, kept.items[0].?.state);
+    c.unpin(io, kept.items[0].?);
     try testing.expectEqual(@as(usize, 2), c.count(io));
     const before = stats.dlm_token_sheds.load();
     try testing.expectEqual(@as(u32, 2), c.shedAll(io));

@@ -562,3 +562,29 @@ agents' suites alongside).
   worker preempted between the enter and the reap), never a lost wake.
   Owed: retire or redefine that half (it is in `brk.py`'s tick ledger and
   the smoke's must-stay-0 list).
+- **Attributed, not fixed here — the slot handover's served ops under load**
+  (the orchestrator's request: `smoke: ONLINE FSCK THROUGH THE ADMIN LANE`,
+  red in the recovery agent's gates at `da080b7`/`dc7d0e7`; and `THE
+  HANDOVER DRAINS PARKED STAMPS`, red in this branch's gate 2). Both rows
+  pass on a quiet venue and fail under load on every tree tried, the
+  recovery commits included or not — NOT a regression of `77c552a..dc7d0e7`:
+  online fsck **9 of 12** on `39590f0` and **9 of 12** on `2e071ea` (4 + 4
+  `yes` load, run concurrently), **5 of 10** on this branch (8-way, load
+  ~12); the handover row **12 of 20** on `53b9a9b` (its landing, before
+  every recovery commit), **34 of 40** on `da080b7`, **12 of 20** on this
+  branch (8-way). The findings: B's `printf > xN` into A's directory —
+  the slot A hands to B mid-loop (`slot 24 released by appender 0` in
+  every run) — answers `cannot create xN: File exists` (open without
+  `O_EXCL`; 5/12, 3/12, 3/10) or `Resource temporarily unavailable`; the
+  closing `fsck --offline` finds `[C9] ino … live (nlink > 0), prior-era,
+  named by no dentry` (3/12, 3/12, 2/10) — an inode a cross-owner create put
+  in effect whose dentry never landed; `scrub` once answered `the live
+  table could not be read (HolderUnreachable, AGAIN)` (1/12, 2/12); the
+  handover row's B `chmod` of A's file answers EAGAIN (once ENOENT) between
+  A's transfer and B's grant — the window `595a16b` narrowed. One class: a
+  shipped verb or cross-owner step that meets the slot mid-handover
+  (`record_ship.ship` follows one redirect and returns `Deferred` at once;
+  a step abandoned live answers EAGAIN and the cadence's roll-forward
+  later applies it) surfaces a retryable refusal to the client, and a
+  create retried across the move meets its own first attempt. Owned by the
+  handover/intent design (`src/meta/sym/xv`, `slots/`); not changed here.

@@ -284,3 +284,39 @@ Stated: a dial still trusts the address it resolved — the handshake proves the
 listener (the enrolment secret), never the listener's identity to the dialer, so a stranger at a
 recycled port that holds the secret is the set's own member anyway; a listener identity proof is a
 protocol change, not made here.
+
+## 6. The untested shapes (item 6)
+
+### 6.1 A supplier of stripes killed — the supplied stripes' durability
+
+`smoke: THE SHARED HOT DIRECTORY ACROSS DAEMONS` gains phase 4: after phase 3 (B, the holder, killed
+and recovered), A storms again and C — a SUPPLIER: 21 of `hot`'s stripes are records in C's slot,
+minted at its `SupplyStripeInos` and barriered before its reply (fix 9's third arm) — is killed -9
+mid-storm. Asserted: C served exactly one supply; A evicts C and recovers its region (evictions 2,
+recoveries 2, rollbacks 0); A's storm keeps keying into the stripes C supplied (its routed mutations
+move 50 past the recovery); open intents 0 and stuck 0; `ls` = `find`, every counted name listed (at
+most three uncounted across the two deaths); then `fsck --offline --scrub` finds every mapped
+stripe's record (C17's missing-stripe is the loss this phase guards) with 0 findings. The run:
+phase 3 recovered B 8,671 ms after its kill, phase 4 recovered C 8,657 ms after its kill, A created
+26,830 more across C's death, 44,166 entries listed, fsck walked 44,232 inodes, 0 findings; no storm
+writer left behind (`pgrep -fc 'true > "hot/'` 0).
+
+Not covered: a supplier killed BETWEEN its barrier and its reply (truly mid-supply). The holder then
+meets a failed call, keeps the share and mints it itself, and the supplier's durable stripe records
+are named by no map — nameless directory records in the dead supplier's slot that its recovery
+keeps. Whether the census judges them (C9's "named by no dentry") and how a flip should retire them
+(an intent over the supply, or the census exempting a stripe-flagged record no map names) is owed;
+it needs a self-kill seam inside the served supply, not built here.
+
+### 6.2 A dead MANAGER holding the striped hot directory
+
+`smoke: A DEAD MANAGER HOLDING A STRIPED HOT DIRECTORY (rung 10 recovery item 6)`: A (the manager)
+mkdirs `hot` and flips it over K = 64 by the explicit command (A holds the map and every stripe); B
+joined storms creates into it — every one shipped to A, keyed to its stripe; kill -9 A mid-storm ⇒
+B parks at `T_self` (its log's park line) → remount A (the D0 ladder's same-host successor at term 2;
+its mount replays its own region: the map, the stripes, the shipped inserts) → B's reclaim lands
+(`appender_parked` 0, park expiries 0) and the storm resumes into the same stripes (50 more routed
+mutations) → open intents 0, stuck 0; `ls` = `find` and the stat digest equal from A and B, every
+counted name listed (at most one more) → umount B, A → `fsck --offline --scrub` 0 findings. The run:
+B parked 626 ms after A's kill, reclaimed 827 ms after it, 753 creates across the death, 753 entries
+listed, fsck 819 inodes, 0 findings.

@@ -4002,7 +4002,7 @@ fn awaitExactly(host: anytype, key: []const u8, want: u64, deadline_ns: u64) ![]
 /// pipeline by its last command) with its stderr instead of counting 0.
 const hot_view_script = "ls hot > \"$1/view.ls\"; wc -l < \"$1/view.ls\"; find hot -type f > \"$1/view.find\"; wc -l < \"$1/view.find\"; find hot -type f -exec stat -c '%n %i %h %s' {} + > \"$1/view.stat\"; sort \"$1/view.stat\" | sha256sum | cut -d' ' -f1; stat -c %h hot";
 
-test "smoke: THE SHARED HOT DIRECTORY ACROSS DAEMONS — A (the manager) mkdirs `hot`; B JOINED storms creates into it ⇒ A's judge: B dominates past N_floor, the OFFER rides B's renewal grant, B accepts, the slot MOVES (slot_offers_pushed ≥ 1, slot_handovers 1 at A; A's census flips nothing — one creator) → A and a THIRD daemon C storm into `hot`, now B's ⇒ two creators past N_floor: B FLIPS it over K = 64 stripes, 21 supplied by A and 21 by C over `SupplyStripeInos` (one batch each), 22 minted by B; every later create keys a stripe and ships into a striping domain feed no window (handovers stay 1) → `ls | wc -l`, `find` and the (name, ino) digest of every entry EQUAL from A, B and C → kill -9 B (the holder of `hot` and 22 stripes) mid-storm ⇒ A evicts B at T_owner and recovers its region (hot's slot and B's stripes the manager's), every open intent rolls forward (stuck 0), the storms continue → the view equal from A and C → umount C, A → fsck --offline --scrub 0 findings (C17 clean)" {
+test "smoke: THE SHARED HOT DIRECTORY ACROSS DAEMONS — A (the manager) mkdirs `hot`; B JOINED storms creates into it ⇒ A's judge: B dominates past N_floor, the OFFER rides B's renewal grant, B accepts, the slot MOVES (slot_offers_pushed ≥ 1, slot_handovers 1 at A; A's census flips nothing — one creator) → A and a THIRD daemon C storm into `hot`, now B's ⇒ two creators past N_floor: B FLIPS it over K = 64 stripes, 21 supplied by A and 21 by C over `SupplyStripeInos` (one batch each), 22 minted by B; every later create keys a stripe and ships into a striping domain feed no window (handovers stay 1) → `ls | wc -l`, `find` and the (name, ino) digest of every entry EQUAL from A, B and C → kill -9 B (the holder of `hot` and 22 stripes) mid-storm ⇒ A evicts B at T_owner and recovers its region (hot's slot and B's stripes the manager's), every open intent rolls forward (stuck 0), the storms continue → the view equal from A and C → kill -9 C (a SUPPLIER: 21 stripes are records in its slot) mid-storm ⇒ A recovers its region, the supplied stripes stand, every name listed → umount A → fsck --offline --scrub 0 findings (C17 clean: no mapped stripe lost)" {
     const io = testing.io;
     if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
     const gpa = testing.allocator;
@@ -4213,11 +4213,130 @@ test "smoke: THE SHARED HOT DIRECTORY ACROSS DAEMONS — A (the manager) mkdirs 
         try testing.expectEqualStrings(std.mem.trim(u8, lines.next().?, " "), std.mem.trim(u8, std.mem.sliceTo(va, '\n'), " "));
         std.debug.print("smoke: shared hot dir: phase 3 — B killed; A recovered its region {d} ms after (evictions 1, recoveries 1, rollbacks 0); A created {d} and C {d} more across the death (retried, never counted twice); {d} entries listed (ls = find), digests equal from A and C; open intents 0 on both {d} ms after the storms stopped, stuck 0\n", .{ recovered_ms, na2, nc2, listed, open_ms });
     }
-    try c.umount();
-    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try c.waitExit());
+    // Phase 4: kill -9 C — a SUPPLIER: 21 of `hot`'s stripes are records
+    // in C's slot, minted at its `SupplyStripeInos` and durable before its
+    // reply. A evicts C and recovers its region; the supplied stripes
+    // stand as the manager's: A's storm keeps keying into them, every
+    // name stays listed, and the offline census finds every mapped stripe's
+    // record (C17's missing-stripe is the loss this phase guards).
+    var storm_a3 = try Storm.start(rig, rig.mp, "a3", "z");
+    defer storm_a3.deinit(rig);
+    {
+        const tc = try c.stats();
+        defer gpa.free(tc);
+        try testing.expectEqual(@as(?u64, 1), numberAfter(tc, "\"dir_stripe_supplies_served\":"));
+        const ta = try rig.stats();
+        defer gpa.free(ta);
+        const warm = try awaitAtLeast(rig, "\"dir_stripe_routed_mutations\":", (numberAfter(ta, "\"dir_stripe_routed_mutations\":") orelse 0) + 50, kill_row_wait_ns);
+        gpa.free(warm);
+    }
+    const t_kill_c = clock.monotonicNs();
+    try c.kill();
+    const ta_rec2 = try awaitStats(rig, &.{ .{ .key = "\"appender_recoveries\":", .want = 2 }, .{ .key = "\"recovered_regions_released\":", .want = 2 } }, kill_row_wait_ns);
+    defer gpa.free(ta_rec2);
+    const recovered_c_ms = (clock.monotonicNs() - t_kill_c) / std.time.ns_per_ms;
+    try testing.expectEqual(@as(?u64, 2), numberAfter(ta_rec2, "\"membership_evictions\":"));
+    try testing.expectEqual(@as(?u64, 0), numberAfter(ta_rec2, "\"appender_recovery_rollbacks\":"));
+    {
+        const settled = try awaitAtLeast(rig, "\"dir_stripe_routed_mutations\":", (numberAfter(ta_rec2, "\"dir_stripe_routed_mutations\":") orelse 0) + 50, kill_row_wait_ns);
+        gpa.free(settled);
+    }
+    const na3 = try storm_a3.finish(rig);
+    {
+        const oa = try awaitExactly(rig, "\"xv_cross_owner_intents_open\":", 0, 2 * kill_row_wait_ns);
+        defer gpa.free(oa);
+        try testing.expectEqual(@as(?u64, 0), numberAfter(oa, "\"xv_cross_owner_intents_open\":"));
+        try testing.expectEqual(@as(?u64, 0), numberAfter(oa, "\"xv_cross_owner_intents_stuck\":"));
+        const va = try rig.onMountTimed(hot_view_script, 300);
+        defer gpa.free(va);
+        var lines = std.mem.splitScalar(u8, va, '\n');
+        const listed = try std.fmt.parseInt(u64, std.mem.trim(u8, lines.next().?, " "), 10);
+        // Phase 3's names (≤ 2 uncounted) and A's new ones (≤ 1 more).
+        try testing.expect(listed >= total1 + na2 + nc2 + na3 and listed <= total1 + na2 + nc2 + na3 + 3);
+        try testing.expectEqualStrings(std.mem.trim(u8, lines.next().?, " "), std.mem.trim(u8, std.mem.sliceTo(va, '\n'), " "));
+        std.debug.print("smoke: shared hot dir: phase 4 — C (a supplier of 21 stripes) killed; A recovered its region {d} ms after (evictions 2, recoveries 2, rollbacks 0); A created {d} more into the stripes C supplied and its own; {d} entries listed (ls = find); open intents 0\n", .{ recovered_c_ms, na3, listed });
+    }
     try rig.umount();
     try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
     _ = try fsckClean(rig, "the shared hot directory row");
+}
+
+test "smoke: A DEAD MANAGER HOLDING A STRIPED HOT DIRECTORY (rung 10 recovery item 6) — A (the manager) mkdirs `hot` and flips it over K = 64 stripes (the explicit command: A holds the map and every stripe); B JOINED storms creates into it (every one shipped to A, keyed to its stripe) → kill -9 A mid-storm ⇒ B PARKS at T_self (park expiries 0) → remount A (the D0 ladder's same-host successor, term 2; its mount replays its own region — the map, the stripes, the shipped inserts) → B's reclaim lands in the grace window, the storm resumes into the same stripes → `ls` = `find` and the stat digest equal from A and B, every counted name listed → umount B, A → fsck --offline --scrub 0 findings (C17 clean)" {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    try rig.env.put("SQUEEZEFS_MW_BIND", "127.0.0.1:0");
+    var t_owner_text: [8]u8 = undefined;
+    try rig.env.put("SQUEEZEFS_TEST_MEMBERSHIP_T_OWNER_MS", try std.fmt.bufPrint(&t_owner_text, "{d}", .{smoke_t_owner_ms}));
+    try rig.formatSetWith(false, &.{});
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(0);
+    const b = try Peer.init(rig, "b");
+    defer b.deinit();
+    b.node = kill_peer_node;
+    try b.spawn(&.{});
+    _ = try b.awaitReady();
+    {
+        const mk = try rig.onMount("mkdir hot");
+        gpa.free(mk);
+        var sbuf: [256]u8 = undefined;
+        const out = try rig.onMount(try setStripesScript(&sbuf, "hot", 64));
+        gpa.free(out);
+        const ta = try rig.stats();
+        defer gpa.free(ta);
+        try testing.expectEqual(@as(?u64, 1), numberAfter(ta, "\"dir_stripe_flips\":"));
+    }
+    var storm_b = try Storm.start(rig, b.mp, "b", "b");
+    defer storm_b.deinit(rig);
+    {
+        const warm = try awaitAtLeast(b, "\"dir_stripe_routed_mutations\":", stripe_matrix_phase_floor, kill_row_wait_ns);
+        gpa.free(warm);
+    }
+    const t_kill = clock.monotonicNs();
+    try rig.kill();
+    _ = try b.awaitLog("appender park: T_self reached with the home volume 0's manager unreachable — parked", 0, kill_row_wait_ns);
+    const parked_ms = (clock.monotonicNs() - t_kill) / std.time.ns_per_ms;
+    const mark = try rig.logLen();
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(mark);
+    {
+        const text = try rig.readLog();
+        defer gpa.free(text);
+        try testing.expect(std.mem.indexOf(u8, text[mark..], "appender 0 Live as the manager (term 2") != null);
+    }
+    const reclaimed = try awaitStats(b, &.{.{ .key = "\"appender_parked\":", .want = 0 }}, kill_row_wait_ns);
+    defer gpa.free(reclaimed);
+    const reclaim_ms = (clock.monotonicNs() - t_kill) / std.time.ns_per_ms;
+    try testing.expectEqual(@as(?u64, 0), numberAfter(reclaimed, "\"appender_park_expiries\":"));
+    {
+        const settled = try awaitAtLeast(b, "\"dir_stripe_routed_mutations\":", (numberAfter(reclaimed, "\"dir_stripe_routed_mutations\":") orelse 0) + 50, kill_row_wait_ns);
+        gpa.free(settled);
+    }
+    const nb = try storm_b.finish(rig);
+    {
+        const ob = try awaitExactly(b, "\"xv_cross_owner_intents_open\":", 0, 2 * kill_row_wait_ns);
+        defer gpa.free(ob);
+        try testing.expectEqual(@as(?u64, 0), numberAfter(ob, "\"xv_cross_owner_intents_stuck\":"));
+        const va = try rig.onMountTimed(hot_view_script, 300);
+        defer gpa.free(va);
+        const vb = try b.onMount(hot_view_script);
+        defer gpa.free(vb);
+        try testing.expectEqualStrings(va, vb);
+        var lines = std.mem.splitScalar(u8, va, '\n');
+        const listed = try std.fmt.parseInt(u64, std.mem.trim(u8, lines.next().?, " "), 10);
+        // Every counted name; at most one more (a create whose reply the
+        // death lost, counted only when its retry met it).
+        try testing.expect(listed >= nb and listed <= nb + 1);
+        try testing.expectEqualStrings(std.mem.trim(u8, lines.next().?, " "), std.mem.trim(u8, std.mem.sliceTo(va, '\n'), " "));
+        std.debug.print("\nsmoke: dead manager holding a striped dir: B parked {d} ms after A's kill, reclaimed {d} ms after it (park expiries 0); B created {d} across the death; {d} entries listed (ls = find), the digest equal from A and B; open intents 0\n", .{ parked_ms, reclaim_ms, nb, listed });
+    }
+    try b.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try b.waitExit());
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+    _ = try fsckClean(rig, "the dead manager holding a striped directory");
 }
 
 /// The striped directory's population: 10,000 names over K = 64 stripes

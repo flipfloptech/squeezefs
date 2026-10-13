@@ -927,6 +927,18 @@ pub const NodeSnapshot = struct {
             assert(self.newestSeqOf(k).? == cell.horizon);
             return .{ .live = .{ .value = cell.value.slice(), .held = null } };
         }
+        // The newest record decides alone unless it is a Delta (the fold
+        // stops at the first Put or Delete — `rec.foldNewestFirst`): the
+        // common base-resident key folds with no gather scratch, whose 64
+        // record refs ReleaseSafe fills on every from-scratch fold (13 % of
+        // the FUSE worker's cycles on rand-4k, `docs/evidence/rung-10-dev-
+        // perf.md` §3.4).
+        const top: RecordRef = if (newest) |n| n.recordRef() else if (g.bg.hi > g.bg.lo) self.base.value.recordRef(g.bg.lo) else return .absent;
+        switch (top.kind) {
+            .put => return .{ .live = .{ .value = top.value, .held = null } },
+            .delete => return .tombstone,
+            .delta => {},
+        }
         var scratch: Gather = .{};
         defer scratch.deinit(gpa);
         try self.gather(gpa, g, &scratch);

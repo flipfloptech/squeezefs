@@ -10,8 +10,8 @@ B (joined) packs 8 staged 64 KiB files by the fsync lever, `rm`s one and `fsck -
 0 findings, A (the manager) reads B's seven remaining tenants while B is live
 (`mergedPackReadOn`). On `dev` every one answered `Input/output error`; B's own reads after a
 remount were sha-equal — the bytes were intact. A two-daemon set WITHOUT the row's seam-on half
-(the same fill, `rm`, `fsck --online`, B's remount) read sha-equal on A every time: the EIO
-needed history.
+(the same fill, `rm`, `fsck --online`, B's remount; two diagnostic runs) read sha-equal on A
+at every stage: the EIO needed history.
 
 **Root cause.** The incarnation word is a member's own transition ledger: `gen << 1 | stable`,
 unstable while a transition runs HERE (a claim before its publish, a W1 patch, a free in
@@ -28,7 +28,7 @@ escalates, the serialized settle reads `serve_valid = false` four times, fires
 `read_settle_lost_serialized` (must-stay-0) and answers EIO. A write into such a packed file
 from the other member fails the same way (`DataPlane.readMappingImage`, the re-stage source).
 Not candidates after all: the tenant's layout (A reads B's record through the token, the right
-version), the window table (the window law ran clean, `packed_mapping_refusals` 0), custody
+version), the window table (the window law ran clean: `packed_mapping_refusals` never fired), custody
 (no foreign-custody refusal exists on the read leg).
 
 A second gap rode along: the packed read validated the window by the word ALONE — no binding
@@ -88,6 +88,16 @@ word, generation-1 bytes, an `allocated` state, and deposits an ended lifetime's
 - The read-path fixtures' `bind` modelled a block as published-never-claimed (a cell state the
   product never makes); it now claims first (`Fixture.mint`), so their fills keep depositing.
 
+**Gates at the landing (`2118f55`).** macOS `zig build gate`: 2156 / 2183 passed, 27 skipped.
+Venue (three full runs while two other agents' gates and loops shared it, load 2–10): the
+smoke's merged-census row green every run (smoke 83 pass / 2 skip in run 1); the reds were
+rows this change does not touch — `wire.tcp_e2e_linux`'s 10k-verb row (runs 1, 3: it asserts the
+accept thread's name right after `Listener.start`, before the thread has named itself — a
+schedule assumption under load), `smoke: ONLINE FSCK THROUGH THE ADMIN LANE` (runs 2, 3: B's
+cross-owner creates in A's directory answer `cannot create x55: File exists`; pristine `dev`
+`2e071ea` reproduces it, 2 of 3 runs of the row alone), and `exec.lane`'s stack-trimmer row
+(run 3: terminated by SIGABRT once). Stated for their owners; none was looped here.
+
 ### Found on the way, stated, not changed
 
 - **A never-touched cell's tier entry outlives the foreign lifetime it holds.** A member caches
@@ -103,3 +113,46 @@ word, generation-1 bytes, an `allocated` state, and deposits an ended lifetime's
   budget: a carve and a claim in between leave an allocated block reading `free` and one extra
   budget credit (pre-existing; the give-back's twin above is fixed). `endLifetime` runs before
   the bit clears, so the word never re-stabilizes a racing claim's mid-DMA lifetime there.
+
+## 2. MutualTls daemons exiting by a signal at unmount
+
+**The hunt.** The two kTLS rows (`smoke: MutualTls on this kernel …` and `smoke: THE TWO-DAEMON
+MATRIX over MutualTls on KERNEL TLS …`) built alone into one smoke binary and looped on the
+venue under an 8-way `yes` load beside a looping wire-filtered unit binary (whose own smoke rows
+and kTLS e2e rows ran alongside) and other agents' gates (load 10–21), each run's output kept on
+a failure:
+
+| tree | runs | signal deaths | the death |
+|---|---|---|---|
+| `dev` `2118f55` | 60 | **1** (run 11, ≈ 1 in 60) | the matrix row's joiner B, `terminated with signal ABRT` at its unmount |
+| `2118f55` + the two teardown fixes below (cherry-picked, never landed from here) | 60 | **0** | — |
+
+**The death, named by the rig's log tail** (`39590f0`): B's log ends `stop requested
+(SIGTERM/SIGINT): unmounting …` then `Segmentation fault at address 0xfffeac4cd000` in
+`std.mem.eqlBytes` ← `filesystem.zig:306` (the vtable's `lookup`) ← `lifecycle.zig:352`
+(`fs.vtable.lookup(…, .name = a.name)`) ← `filesystem_vtable.zig:248` dispatch ← a handler fiber
+(`exec/fiber.zig:556`). A LOOKUP handler was still comparing its request's NAME — a slice into
+the worker's kmbuf payload region — after the SIGTERM teardown unmapped that region: `squeezefs
+umount` reads the mount's `.stats` to find the daemon's pid and then signals it, so its own
+LOOKUP races its own stop. `Session.close` joins the workers while handler fibers are mid-request
+and each worker's exit ran `Kmbuf.teardown`; the segfault handler's abort is the SIGABRT the rig
+reported. Nothing in it is TLS: every verb-driven unmount can meet it, and the kTLS rows were
+where it struck in those gates. None of the task's candidate classes (a kTLS socket closed under
+a fiber's `recvmsg` with a control record pending, KeyUpdate/close_notify racing the umount, the
+supervisor's escalation — these rows run no supervisor — or SIGUSR2) appeared in 120 runs.
+
+**The fix is the gate agent's** (`.wt-gatefix`, `docs/evidence/rung-09-gates.md` §10, branch
+`gatefix`, not on `dev` when this note landed): `test(transport): red repro — a handler still
+running after close reads a request whose payload buffer was unmapped` → `fix(transport): the
+kmbuf region outlives every handler — unmapped at the group's deinit, never at the worker's exit`;
+and the joiner's other teardown crash the same rows can meet, `fix(sym): a joiner's teardown joins
+its membership beat before the writer plane the beat declares goes` (`declareWindows` on a
+destroyed writer plane from the `sqz-member` beat). The second loop above ran exactly those two
+commits on top of `2118f55`. No product change for this defect lands from this note; the
+instrumentation the task held in reserve is not needed — the rig's tail named the station.
+
+**Found on the way, stated, not changed.** `Listener.retire` (`src/wire/listener.zig`) reads
+`self.live` for the gauge and wakes the futex AFTER the `fetchSub` that lets a concurrent
+`Listener.stop` see 0 and free the listener: a connection thread retiring during the stop reads
+freed memory (the gauge takes a garbage value; a fault only if the page was unmapped). Plaintext
+and TLS alike; it did not appear in these loops.

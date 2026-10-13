@@ -82,6 +82,15 @@ pub fn BoundedMpmc(comptime T: type) type {
             while (!self.tryPush(item)) std.atomic.spinLoopHint();
         }
 
+        /// No item at the consumer's position — a HINT (relaxed: a push may
+        /// land a moment later; the lane's ack-spin asks it before spinning,
+        /// decision 0003 §AB.4).
+        pub fn isEmpty(self: *const Self) bool {
+            const pos = self.dequeue_pos.load(.monotonic);
+            const seq = self.cells[pos & self.mask].seq.load(.monotonic);
+            return seq != pos +% 1;
+        }
+
         /// Null when empty. The release store of `seq` hands the cell back
         /// to the producer at `pos + cap`, paired with its acquire load.
         pub fn tryPop(self: *Self) ?T {

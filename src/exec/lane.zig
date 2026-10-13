@@ -165,6 +165,25 @@ pub const Options = struct {
 /// Set on a lane thread for its lifetime.
 pub threadlocal var current_lane: ?*Lane = null;
 
+/// Whether the calling fiber's lane has NOTHING else to run — no ready
+/// fiber, no message in its inbox (a hint: the inbox may fill a moment
+/// later). False off a lane. A fiber that would spin before it parks asks
+/// this first: a spin on a lane with queued work delays that work
+/// (decision 0003 §AB.4).
+pub fn laneIdleBesidesCaller() bool {
+    const l = current_lane orelse return false;
+    return l.ready_head == null and l.inbox.isEmpty();
+}
+
+/// The calling thread's lane's poll count (0 off a lane): a fiber that
+/// reads it before a park and after its resume sees exactly one more iff
+/// its own resume was the only poll between — the wake ran alone
+/// (decision 0003 §AB.4).
+pub fn lanePolls() u64 {
+    const l = current_lane orelse return 0;
+    return l.polls_run;
+}
+
 /// The fiber running on this thread, if this thread is a lane running one.
 pub fn currentFiber() ?*Fiber {
     const l = current_lane orelse return null;
@@ -205,6 +224,8 @@ pub const Lane = struct {
     idle_ctx: Io.fiber.Context = undefined,
     /// The fiber on the CPU (lane thread only).
     current: ?*Fiber = null,
+    /// Fiber polls run (lane thread only; `lanePolls`).
+    polls_run: u64 = 0,
     /// Armed ring ops whose CQE has not landed: the owed completions that
     /// engage the 100 ms backstop.
     in_flight: u32 = 0,
@@ -675,6 +696,7 @@ pub const Lane = struct {
             const f = self.popReady() orelse break;
             if (!f.state.beginPoll()) continue;
             self.current = f;
+            self.polls_run +%= 1;
             stats.polls.of(self.class).inc();
             const t0 = clock.monotonicNs();
             f.switchIn();

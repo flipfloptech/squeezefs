@@ -590,6 +590,8 @@ const Scripted = struct {
     writes: u32 = 0,
     /// A READ serves this many bytes (the window beyond is left as found).
     short_read: ?usize = null,
+    syncfs_calls: u32 = 0,
+    syncfs_inos: [2]u64 = @splat(0),
 
     fn entry(self: *Scripted) filesystem.Entry {
         var a = abi.zeroed(abi.fuse_attr);
@@ -645,6 +647,11 @@ const Scripted = struct {
         w.add(e1, 3, "one") catch return error.InputOutput;
         w.add(e2, 4, "two") catch return error.InputOutput;
         return .{ .len = w.len };
+    }
+    pub fn syncfs(self: *Scripted, _: *Ctx, a: anytype) Error!void {
+        try self.verdict;
+        self.syncfs_inos[self.syncfs_calls % self.syncfs_inos.len] = a.ino;
+        self.syncfs_calls += 1;
     }
     pub fn forget(self: *Scripted, _: *Ctx, a: filesystem.ForgetArgs) void {
         self.forgets += 1;
@@ -719,6 +726,44 @@ test "every reply-owing arm commits exactly once: success, a handler errno throu
     try testing.expectEqual(@as(u32, 0), rig.reg.inFlight());
     try testing.expectEqual(@as(u64, 0), counters.tripwireCount("fuse_replies_synthesized"));
     try testing.expectEqual(@as(u64, 0), counters.tripwireCount("fuse_reply_twice"));
+}
+
+/// A classical device read of FUSE_SYNCFS (opcode 50): the header on the
+/// root's nodeid and `fuse_syncfs_in{padding}` — what `fuse_sync_fs` sends
+/// on syncfs(2) once the connection propagates it.
+fn syncfsRequest(buf: *[64]u8, unique: u64) !codec.Request {
+    const body_len = 8;
+    buf[0..40].* = abi.encode(abi.fuse_in_header{ .len = 40 + body_len, .opcode = 50, .unique = unique, .nodeid = abi.FUSE_ROOT_ID, .uid = 0, .gid = 0, .pid = 4242, .total_extlen = 0, .padding = 0 });
+    @memset(buf[40..][0..body_len], 0);
+    return codec.parse(try codec.Delivery.fromClassical(buf, 40 + body_len));
+}
+
+test "FUSE_SYNCFS (opcode 50) decodes and reaches the filesystem's syncfs once with the request's nodeid, replying OK; a handler error is its errno; a filesystem without syncfs answers ENOSYS (the kernel clears fc->sync_fs and stops asking)" {
+    var rig: Rig = undefined;
+    try rig.init();
+    defer rig.deinit();
+    const s = Loopback.slot(2);
+    var buf: [64]u8 = undefined;
+    const un0 = fuse_unsupported_opcodes.load();
+    rig.d.dispatch(try syncfsRequest(&buf, 2), Rig.meta(2, abi.FUSE_ROOT_ID), s, null);
+    try testing.expectEqual(@as(u32, 1), rig.lb.replyCount(s));
+    try testing.expectEqual(@as(?linux.E, null), rig.lb.captured(s).?.errno());
+    try testing.expectEqual(@as(u32, 1), rig.fsi.syncfs_calls);
+    try testing.expectEqual(abi.FUSE_ROOT_ID, rig.fsi.syncfs_inos[0]);
+    try testing.expectEqual(un0, fuse_unsupported_opcodes.load());
+    // A failed drain is the application's syncfs(2) errno.
+    rig.fsi.verdict = error.InputOutput;
+    rig.d.dispatch(try syncfsRequest(&buf, 4), Rig.meta(4, abi.FUSE_ROOT_ID), s, null);
+    try testing.expectEqual(linux.E.IO, rig.lb.captured(s).?.errno().?);
+    rig.fsi.verdict = {};
+    // No syncfs in the filesystem: ENOSYS.
+    const Bare = struct {};
+    var bare: Bare = .{};
+    var d2 = LoopDispatcher.init(&rig.lb, .{ .fs = Filesystem.of(Bare, &bare), .io = testing.io, .registry = &rig.reg, .guards = &rig.guards, .opens = &rig.opens });
+    d2.dispatch(try syncfsRequest(&buf, 6), Rig.meta(6, abi.FUSE_ROOT_ID), s, null);
+    try testing.expectEqual(linux.E.NOSYS, rig.lb.captured(s).?.errno().?);
+    try testing.expectEqual(@as(u32, 3), rig.lb.replyCount(s));
+    try testing.expectEqual(@as(u32, 0), rig.reg.inFlight());
 }
 
 test "FORGET and BATCH_FORGET never reply; the filesystem's forget runs once per entry with the table's verdict; INTERRUPT is counted and ignored; NOTIFY_REPLY is silent" {

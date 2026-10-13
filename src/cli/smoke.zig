@@ -6685,6 +6685,69 @@ fn fsckJson(rig: *Rig, extra: []const []const u8) !FsckOutcome {
 
 const json_scan_report = @import("../ops/fsck/finding.zig");
 
+/// The fresh file of the `sync -f` row: one MiB and a 1000-byte sub-page
+/// tail — a partial first block at every legal block size ≥ 2 MiB (the
+/// default 4 MiB here), so the bytes sit parked in the accumulation table
+/// until a drain; the tail ends off any page boundary.
+const syncfs_fresh_bytes: u64 = (1 << 20) + 1000;
+/// The fsync'd file the row overwrites in place: one default block.
+const syncfs_base_bytes: u64 = 4 << 20;
+/// The in-place overwrite at the base file's head: two pages, size-neutral
+/// (its mtime is a parked stamp under the coalesced cadence, §L.6).
+const syncfs_patch_bytes: u64 = 8192;
+
+test "smoke: `sync -f` IS A DURABILITY POINT FOR THE DAEMON'S WRITE CUSTODY — format (no cache path: every write beyond inline striped) → mount → a holder keeps `f` and `g` OPEN (no RELEASE ever drains them): 1 MiB + 1000 B into the fresh `f` (a partial block parked in RAM), 8 KiB over the head of the fsync'd `g` (a size-neutral write: its mtime parked) → `sync -f <mnt>` returns → kill -9 the daemon → fsck --offline clean → remount → `f` is the image byte for byte, `g` carries the overwrite and the mtime the holder saw" {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    try rig.formatSet(false);
+    try rig.createImage();
+    // The C8 oracle at every mount (the remount after the kill judges it).
+    try rig.env.put("SQUEEZEFS_BLOCK_REFS_VERIFY", "1");
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(0);
+    {
+        var script: [256]u8 = undefined;
+        const out = try rig.onMount(try std.fmt.bufPrint(&script, "dd if=\"$1/image\" of=g bs={d} count=1 conv=fsync status=none && echo base-ok", .{syncfs_base_bytes}));
+        defer gpa.free(out);
+        try testing.expect(std.mem.indexOf(u8, out, "base-ok") != null);
+    }
+    // The holder: both fds stay open past the kill; `sync -f` is the only
+    // drain the bytes can meet before it.
+    var holder_script: [768]u8 = undefined;
+    const holder_cmd = try std.fmt.bufPrint(&holder_script, "cd {s} && exec 3>f 4<>g && head -c {d} {s}/image >&3 && tail -c {d} {s}/image >&4 && stat -c %Y.%y g > {s}/g.mtime && sync -f . && echo synced > {s}/synced && exec sleep 600", .{ rig.mp, syncfs_fresh_bytes, rig.work, syncfs_patch_bytes, rig.work, rig.work, rig.work });
+    var holder = try std.process.spawn(io, .{ .argv = &.{ "sh", "-e", "-c", holder_cmd }, .environ_map = &rig.env, .stdin = .ignore, .stdout = .ignore, .stderr = .inherit });
+    defer holder.kill(io);
+    var flag_buf: [256]u8 = undefined;
+    const flag = try std.fmt.bufPrintSentinel(&flag_buf, "{s}/synced", .{rig.work}, 0);
+    {
+        const deadline = clock.monotonicNs() + 60 * std.time.ns_per_s;
+        while (fileSize(flag) == 0) {
+            if (clock.monotonicNs() >= deadline) return error.Timeout;
+            try rig.expectAlive("the holder's sync -f");
+            sleepMs(5);
+        }
+    }
+    try rig.kill();
+    holder.kill(io);
+    const recovered = try fsckClean(rig, "the kill after sync -f");
+    _ = try remountAfterKill(rig, recovered);
+    var mtime_buf: [128]u8 = undefined;
+    var mtime_path_buf: [256]u8 = undefined;
+    const seen_mtime = std.mem.trimEnd(u8, try Io.Dir.cwd().readFile(io, try std.fmt.bufPrint(&mtime_path_buf, "{s}/g.mtime", .{rig.work}), &mtime_buf), "\n");
+    var check: [768]u8 = undefined;
+    const out = try rig.onMount(try std.fmt.bufPrint(&check, "if head -c {d} \"$1/image\" | cmp -s - f; then echo f-whole; else echo f-LOST; fi; if {{ tail -c {d} \"$1/image\"; head -c {d} \"$1/image\" | tail -c +{d}; }} | cmp -s - g; then echo g-whole; else echo g-LOST; fi; stat -c %Y.%y g", .{ syncfs_fresh_bytes, syncfs_patch_bytes, syncfs_base_bytes, syncfs_patch_bytes + 1 }));
+    defer gpa.free(out);
+    std.debug.print("\nsmoke[sync -f]: after the kill and the remount: {s} (the holder saw g's mtime {s})\n", .{ std.mem.trimEnd(u8, out, "\n"), seen_mtime });
+    try testing.expect(std.mem.indexOf(u8, out, "f-whole") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "g-whole") != null);
+    try testing.expect(std.mem.indexOf(u8, out, seen_mtime) != null);
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+}
+
 test "smoke: FSCK AND SCRUB — format (a cache path) → fill (dirs, 200 packed small files, hard links, three fsync'd 20 MiB files, a clone) → umount → `fsck --offline --scrub` 0 findings over every block → mount, 8-way storm, kill -9 → `fsck --offline` 0 findings → remount, clean umount → a planted stray reference is exactly [C3]+[C8] on its block (exit 1), `--repair` plans, `--repair --apply` releases it, clean → a planted orphan inode is exactly [C9], destroyed on apply, clean → `merge-reports` of two residue shards ≡ the whole run" {
     const io = testing.io;
     if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);

@@ -1693,6 +1693,19 @@ test "INIT reply echoes the time range iff FUSE_TIME_LIMITS (bit 62) was offered
     try testing.expect(!stranded.timeLimits());
 }
 
+test "INIT reply asks for FUSE_SYNCFS (FUSE_HAS_SYNCFS, flags2 bit 12) iff the kernel offered it — offered only to a /dev/fuse opener with CAP_SYS_ADMIN in the initial user namespace; without INIT_EXT it is not negotiated" {
+    const has_syncfs: u64 = 1 << 44;
+    const with = try buildInitReply(initIn(45, kernel_6_14_offer | has_syncfs), test_plan, .{});
+    try testing.expect(with.has(has_syncfs));
+    try testing.expectEqual(abi.flags2Of(abi.FUSE_OVER_IO_URING | has_syncfs), with.out.flags2);
+    try testing.expectEqual(@as(u32, (1 << 9) | (1 << 12)), with.out.flags2);
+    const without = try buildInitReply(initIn(45, kernel_6_14_offer), test_plan, .{});
+    try testing.expect(!without.has(has_syncfs));
+    try testing.expectEqual(abi.flags2Of(abi.FUSE_OVER_IO_URING), without.out.flags2);
+    const stranded = try buildInitReply(initIn(45, (kernel_6_14_offer | has_syncfs) & ~abi.FUSE_INIT_EXT), test_plan, .{});
+    try testing.expect(!stranded.has(has_syncfs));
+}
+
 test "INIT reply option gates: KILLPRIV_V2 iff offered ∧ wanted (v1 never rides along unless asked); writeback/dont_mask/no_open/no_opendir/export iff wanted; force_readdirplus drops READDIRPLUS_AUTO" {
     const on = try buildInitReply(initIn(44, kernel_6_14_offer), test_plan, .{ .handle_killpriv_v2 = true });
     try testing.expect(on.has(abi.FUSE_HANDLE_KILLPRIV_V2));

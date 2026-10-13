@@ -718,6 +718,15 @@ the trees is in flight while their custody moves):
    every stamp they carry (`residue_seq_ceiling`, one extent read per orphan); a `GrowRing` segment the
    manager carved that the page never named is settled (`settle_dead_pending_segment`; a refusal ABORTS
    the step — the page stays `Recovering`, the re-run resumes; REC:2070-2087).
+   **Port (0003 §U.1, 0002 row 508): the hold.** The flush cycles of step 6 (and the checkpoint task's
+   maintenance and the D4 arm, which the reference's held mutex excludes but the port's per-step locks
+   do not) run SMOs on the recovered trees whose retirements are images the dead grant still names; the
+   census above would return them as orphans while the coverage clock still parks them. From the first
+   root install the recovery HOLDS every retirement of a grant extent (`smo.RetireHold`, consulted first
+   by `SmoContext.freePending`), step 7's record is the grant minus the images of every tree this
+   process maintains (a live foreign lessee's projection excluded) and minus the held, read in ONE
+   SMO-lock window; 7b parks the held extents in the FIFO at ring 0's reservation head; a rollback keeps
+   them allocated; every return is filtered by the record and clears exactly its hits.
 7b. **The RAM lease table LAST** (REC:1935-1983): `table.release(slot, id, g, words, lease_seq)` must
    answer `Released | Already` (else `Corrupt`: "the RAM table and tree 0 disagree"); `gate.revoke(slot)`;
    `ring.raise_seq_floor(words.seq_floor)` (ring 0's offset above the dead ring's frontier — the round-5

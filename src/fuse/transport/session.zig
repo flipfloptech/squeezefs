@@ -1989,6 +1989,15 @@ test "e2e: EchoFs mounts over the ring — INIT negotiated FUSE_OVER_IO_URING, e
     t.join();
     try result;
 
+    // The helper's last close returns before its RELEASE (a background
+    // request) is answered: the requests ≡ replies law is read once the
+    // worker pushed a reply for every request it delivered (bounded).
+    const Settled = struct {
+        fn pred(b: *const Snapshot) bool {
+            return worker.ring_replies.load() - b.replies == worker.ring_requests.load() - b.requests;
+        }
+    };
+    _ = waitUntil(&before, Settled.pred, 5 * std.time.ns_per_s);
     const after = Snapshot.take();
     try expectLaws(before, after);
     try testing.expect(after.requests - before.requests > 0);
@@ -2098,9 +2107,10 @@ test "e2e: teardown with an in-flight request — the drain synthesizes the erro
     try testing.expect(after.synthetic - before.synthetic >= 1);
     try testing.expectEqual(@as(u32, 0), s.owedCount());
     // Release the parked handler: its late reply is dropped (the session
-    // owes nothing), then phase 2 joins it.
-    rig.fs.releaseParked();
+    // owes nothing), then phase 2 joins it. The baseline is read before
+    // the release (the handler's drop may land at once).
     const dropped_before = replies_dropped_no_slot.load();
+    rig.fs.releaseParked();
     s.deinit();
     rig.session = null;
     try testing.expect(replies_dropped_no_slot.load() >= dropped_before + 1);

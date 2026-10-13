@@ -549,16 +549,18 @@ test "SecretBuf: zeroized on deinit whatever happened; the material slice is a p
     b.deinit();
     if (!is_linux) return;
     _ = linux.mkdir("/build/tmp", 0o755);
-    const path = "/build/tmp/keys-stash-test.key";
+    // Pid-tagged: two test processes on the venue never share the stash.
+    var path_buf: [64]u8 = undefined;
+    const path = try std.fmt.bufPrintSentinel(&path_buf, "/build/tmp/keys-stash-test-{d}.key", .{linux.getpid()}, 0);
     {
-        const rc = linux.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .CLOEXEC = true }, 0o600);
+        const rc = linux.open(path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .CLOEXEC = true }, 0o600);
         try testing.expect(linux.errno(rc) == .SUCCESS);
         const fd: linux.fd_t = @intCast(rc);
         defer _ = linux.close(fd);
         const text = "  0123456789abcdef0123456789abcdef0123456789abcdef  \n";
         _ = linux.write(fd, text, text.len);
     }
-    defer _ = linux.unlink(path);
+    defer _ = linux.unlink(path.ptr);
     var s = try linux_verbs.readStash(gpa, path);
     defer s.deinit();
     try testing.expectEqualStrings("0123456789abcdef0123456789abcdef0123456789abcdef", s.material());
@@ -569,7 +571,7 @@ test "SecretBuf: zeroized on deinit whatever happened; the material slice is a p
     var ok = try linux_verbs.deriveFromStash(&s, &salt, d.key_id);
     ok.zeroize();
     try testing.expectError(error.KeyMismatch, linux_verbs.deriveFromStash(&s, &salt, @splat(0)));
-    _ = linux.chmod(path, 0o644);
+    _ = linux.chmod(path.ptr, 0o644);
     try testing.expectError(error.KeyFilePermissions, linux_verbs.readStash(gpa, path));
     var pb: [128]u8 = undefined;
     try testing.expectEqualStrings("/etc/squeezefs/keys/0102030405060708.key", keyPath(&pb, .{ 1, 2, 3, 4, 5, 6, 7, 8 }));

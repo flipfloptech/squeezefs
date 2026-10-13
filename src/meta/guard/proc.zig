@@ -233,15 +233,17 @@ test "/proc/locks: an exclusive FLOCK line on the file's (major, minor, inode) i
     try testing.expect(flockHeldIn(table, 0, 0x1f, 9));
     try testing.expect(!flockHeldIn(table, 0xfd, 2, 131074));
     try testing.expect(!flockHeldIn("garbage\n\n: : :\n", 1, 1, 1));
-    // A real file: no lock, then our exclusive flock, then released.
-    const path = "/build/tmp/proc-flock-probe";
+    // A real file: no lock, then our exclusive flock, then released. Pid-
+    // tagged: two test processes on the venue never share the probe.
+    var path_buf: [64]u8 = undefined;
+    const path = try std.fmt.bufPrintSentinel(&path_buf, "/build/tmp/proc-flock-probe-{d}", .{linux.getpid()}, 0);
     _ = linux.mkdir("/build/tmp", 0o755);
-    const rc = linux.open(path, .{ .ACCMODE = .RDWR, .CLOEXEC = true, .CREAT = true }, 0o600);
+    const rc = linux.open(path.ptr, .{ .ACCMODE = .RDWR, .CLOEXEC = true, .CREAT = true }, 0o600);
     if (linux.errno(rc) != .SUCCESS) return testkit.skip(@src(), .no_device, "/build/tmp is not writable on this host (the venue's cache volume)");
     const fd: linux.fd_t = @intCast(rc);
     defer {
         _ = linux.close(fd);
-        _ = linux.unlink(path);
+        _ = linux.unlink(path.ptr);
     }
     try testing.expect(!writerFlockHeld(path));
     try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.flock(fd, std.posix.LOCK.EX | std.posix.LOCK.NB)));

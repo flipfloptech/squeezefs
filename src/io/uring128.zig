@@ -808,13 +808,28 @@ pub const ParkedRing128 = ring_park.Parked(ParkFace);
 
 const testing = std.testing;
 
-fn openScratch(path: [*:0]const u8) !linux.fd_t {
-    // ext4 under /build (the venue's cache volume), never the virtiofs mount.
-    _ = linux.mkdir("/build/tmp", 0o755);
-    const rc = linux.open(path, .{ .ACCMODE = .RDWR, .CREAT = true, .TRUNC = true, .CLOEXEC = true }, 0o644);
-    try testing.expectEqual(linux.E.SUCCESS, linux.errno(rc));
-    return @intCast(rc);
-}
+/// A scratch file `/build/tmp/uring128-<pid>-<stem>.dat`: ext4 under /build
+/// (the venue's cache volume), never the virtiofs mount; pid-tagged, so two
+/// test processes on the venue (a gate's shards, another agent's run) never
+/// share one. The caller closes `fd` and unlinks `path`.
+const Scratch = struct {
+    fd: linux.fd_t,
+    path: [:0]const u8,
+    buf: [64]u8,
+
+    fn open(self: *Scratch, stem: []const u8) !void {
+        _ = linux.mkdir("/build/tmp", 0o755);
+        self.path = try std.fmt.bufPrintSentinel(&self.buf, "/build/tmp/uring128-{d}-{s}.dat", .{ linux.getpid(), stem }, 0);
+        const rc = linux.open(self.path.ptr, .{ .ACCMODE = .RDWR, .CREAT = true, .TRUNC = true, .CLOEXEC = true }, 0o644);
+        try testing.expectEqual(linux.E.SUCCESS, linux.errno(rc));
+        self.fd = @intCast(rc);
+    }
+
+    fn close(self: *const Scratch) void {
+        _ = linux.close(self.fd);
+        _ = linux.unlink(self.path.ptr);
+    }
+};
 
 fn newEventfd() !linux.fd_t {
     const rc = linux.eventfd(0, linux.EFD.CLOEXEC | linux.EFD.NONBLOCK);
@@ -964,9 +979,10 @@ test "1024 NOPs ride one enter and complete in order through 32 B CQEs whose ext
 test "a sparse fixed-buffer table: an empty slot is -EFAULT, a filled slot round-trips WRITE_FIXED (fixed file) and READ_FIXED (raw fd) through an ext4 file" {
     var ring = try Ring128.init(16, 0);
     defer ring.deinit();
-    const fd = try openScratch("/build/tmp/uring128-fixed.dat");
-    defer _ = linux.close(fd);
-    defer _ = linux.unlink("/build/tmp/uring128-fixed.dat");
+    var scratch: Scratch = undefined;
+    try scratch.open("fixed");
+    defer scratch.close();
+    const fd = scratch.fd;
     try ring.registerFiles(&.{fd});
 
     const buf = try testing.allocator.alignedAlloc(u8, .fromByteUnits(4096), 8192);
@@ -1128,9 +1144,10 @@ test "getProbe: URING_CMD and every op this binding builds are supported" {
 test "a URING_CMD on an impossible fd completes -EBADF, on a regular file -EOPNOTSUPP (raw and through fixed file 0): the cmd-area SQE is parsed as a command without a FUSE fd" {
     var ring = try Ring128.init(16, 0);
     defer ring.deinit();
-    const fd = try openScratch("/build/tmp/uring128-cmd.dat");
-    defer _ = linux.close(fd);
-    defer _ = linux.unlink("/build/tmp/uring128-cmd.dat");
+    var scratch: Scratch = undefined;
+    try scratch.open("cmd");
+    defer scratch.close();
+    const fd = scratch.fd;
     try ring.registerFiles(&.{fd});
 
     var cmd: [cmd_len]u8 = undefined;
@@ -1334,9 +1351,10 @@ test "the wake protocol on the 128 ring: 8 publishers between two passes pay ONE
 test "an owner's op completes through the park beside the standing READ; the fdatasync barrier rides fixed file 0; deinit cancels the armed READ" {
     var pr = try ParkedRing128.init(testing.allocator, 16, 0);
     defer pr.deinit();
-    const fd = try openScratch("/build/tmp/uring128-park.dat");
-    defer _ = linux.close(fd);
-    defer _ = linux.unlink("/build/tmp/uring128-park.dat");
+    var scratch: Scratch = undefined;
+    try scratch.open("park");
+    defer scratch.close();
+    const fd = scratch.fd;
     try testing.expect(pr.registerFile(fd));
     try testing.expect(pr.armWake());
 

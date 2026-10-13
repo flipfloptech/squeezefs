@@ -86,7 +86,10 @@ pub const IntentHeaderWire = extern struct {
     flags: u8,
     tx_id_le: [8]u8,
     step_count_le: [2]u8,
-    reserved_le: [2]u8,
+    /// The leading steps the initiator ATTESTED applied when it left the
+    /// intent open (0 = none attested; ≤ `step_count`): the roll-forward's
+    /// compensation inverts them however a later op moved their objects.
+    applied_le: [2]u8,
     csum_le: [8]u8,
 
     pub const LEN: usize = 32;
@@ -116,6 +119,8 @@ pub const Intent = struct {
     op: Op,
     flags: u8,
     tx_id: u64,
+    /// `applied_le` (see the header).
+    applied: u16 = 0,
     steps: []const StepRec,
 
     pub fn aborting(self: Intent) bool {
@@ -137,8 +142,9 @@ pub fn encodedLen(steps: []const StepRec) usize {
 /// `XV_MAX_STEPS` steps, and an image past `cap` (the volume's record
 /// cap `min(64 KiB, node_size/4)` — charter §5.1; the widest plan encodes
 /// to ≈ 8.6 KiB, inside the 16 KiB cap at 64 KiB nodes).
-pub fn encode(op: Op, flags: u8, tx_id: u64, steps: []const StepRec, cap: usize, out: []u8) EncodeError![]u8 {
+pub fn encode(op: Op, flags: u8, tx_id: u64, applied: u16, steps: []const StepRec, cap: usize, out: []u8) EncodeError![]u8 {
     if (steps.len == 0 or steps.len > XV_MAX_STEPS) return error.TooManySteps;
+    assert(applied <= steps.len);
     const n = encodedLen(steps);
     if (n > cap or n > out.len) return error.ValueTooLarge;
     var h: IntentHeaderWire = undefined;
@@ -148,7 +154,7 @@ pub fn encode(op: Op, flags: u8, tx_id: u64, steps: []const StepRec, cap: usize,
     h.flags = flags;
     std.mem.writeInt(u64, &h.tx_id_le, tx_id, .little);
     std.mem.writeInt(u16, &h.step_count_le, @intCast(steps.len), .little);
-    std.mem.writeInt(u16, &h.reserved_le, 0, .little);
+    std.mem.writeInt(u16, &h.applied_le, applied, .little);
     @memset(&h.csum_le, 0);
     out[0..IntentHeaderWire.LEN].* = std.mem.toBytes(h);
     var off: usize = IntentHeaderWire.LEN;
@@ -175,10 +181,11 @@ pub fn decode(bytes: []const u8, steps_out: []StepRec) DecodeError!Intent {
     if (!std.mem.eql(u8, &h.magic, &MAGIC)) return error.Corrupt;
     if (std.mem.readInt(u16, &h.version_le, .little) != VERSION) return error.Corrupt;
     if (h.flags & ~FLAGS_KNOWN != 0) return error.Corrupt;
-    if (std.mem.readInt(u16, &h.reserved_le, .little) != 0) return error.Corrupt;
     const op = std.enums.fromInt(Op, h.op) orelse return error.Corrupt;
     const n = std.mem.readInt(u16, &h.step_count_le, .little);
     if (n == 0 or n > XV_MAX_STEPS or n > steps_out.len) return error.Corrupt;
+    const applied = std.mem.readInt(u16, &h.applied_le, .little);
+    if (applied > n) return error.Corrupt;
     if (!checksum.verify(bytes, IntentHeaderWire.CSUM_OFF)) return error.Corrupt;
     var off: usize = IntentHeaderWire.LEN;
     var i: usize = 0;
@@ -196,7 +203,7 @@ pub fn decode(bytes: []const u8, steps_out: []StepRec) DecodeError!Intent {
         off += padded;
     }
     if (off != bytes.len) return error.Corrupt;
-    return .{ .op = op, .flags = h.flags, .tx_id = std.mem.readInt(u64, &h.tx_id_le, .little), .steps = steps_out[0..n] };
+    return .{ .op = op, .flags = h.flags, .tx_id = std.mem.readInt(u64, &h.tx_id_le, .little), .applied = applied, .steps = steps_out[0..n] };
 }
 
 /// Every unused word of a step is zero (spec §2.1's per-kind field
@@ -519,10 +526,10 @@ fn sampleSteps() [3]StepRec {
     };
 }
 
-test "the intent image round-trips: 32 B header + 48 B steps + padded names, hash64 over the field-zeroed image; every refusal class — magic, version, flags, reserved, checksum, 0 or 137 steps, a bad step word, a trailing byte, a non-zero pad, a record past the cap" {
+test "the intent image round-trips: 32 B header + 48 B steps + padded names, hash64 over the field-zeroed image; the attested applied prefix survives; every refusal class — magic, version, flags, an applied prefix past the steps, checksum, 0 or 137 steps, a bad step word, a trailing byte, a non-zero pad, a record past the cap" {
     var buf: [4096]u8 = undefined;
     const steps = sampleSteps();
-    const img = try encode(.create, 0, (3 << 40) | 42, &steps, 16 << 10, &buf);
+    const img = try encode(.create, 0, (3 << 40) | 42, 0, &steps, 16 << 10, &buf);
     try testing.expectEqual(@as(usize, 32 + 48 + 56 + 48), img.len);
     var out: [XV_MAX_STEPS]StepRec = undefined;
     const it = try decode(img, &out);
@@ -531,9 +538,13 @@ test "the intent image round-trips: 32 B header + 48 B steps + padded names, has
     try testing.expectEqual(@as(usize, 3), it.steps.len);
     try testing.expectEqualStrings("hello", it.steps[1].name);
     try testing.expect(!it.aborting());
+    try testing.expectEqual(@as(u16, 0), it.applied);
     // The ABORTING flag survives.
-    const img2 = try encode(.create, FLAG_ABORTING, 7, &steps, 16 << 10, &buf);
+    const img2 = try encode(.create, FLAG_ABORTING, 7, 0, &steps, 16 << 10, &buf);
     try testing.expect((try decode(img2, &out)).aborting());
+    // The attested prefix survives, up to every step.
+    var buf3: [4096]u8 = undefined;
+    try testing.expectEqual(@as(u16, 3), (try decode(try encode(.create, 0, 7, 3, &steps, 16 << 10, &buf3), &out)).applied);
     // Refusals.
     var bad: [4096]u8 = undefined;
     const mk = struct {
@@ -546,7 +557,12 @@ test "the intent image round-trips: 32 B header + 48 B steps + padded names, has
     try testing.expectError(error.Corrupt, decode(mk.flip(img, &bad, 0, 'x'), &out)); // magic
     try testing.expectError(error.Corrupt, decode(mk.flip(img, &bad, 8, 2), &out)); // version (checksum would also fail)
     try testing.expectError(error.Corrupt, decode(mk.flip(img, &bad, 11, 2), &out)); // unknown flag
-    try testing.expectError(error.Corrupt, decode(mk.flip(img, &bad, 22, 1), &out)); // reserved
+    // An applied prefix past the step count (re-stamped so only the
+    // bound refuses).
+    @memcpy(bad[0..img.len], img);
+    bad[22] = 4;
+    checksum.stamp(bad[0..img.len], IntentHeaderWire.CSUM_OFF);
+    try testing.expectError(error.Corrupt, decode(bad[0..img.len], &out));
     try testing.expectError(error.Corrupt, decode(mk.flip(img, &bad, 40, 0xFF), &out)); // a step byte: checksum
     try testing.expectError(error.Corrupt, decode(img[0 .. img.len - 1], &out));
     @memcpy(bad[0..img.len], img);
@@ -563,14 +579,14 @@ test "the intent image round-trips: 32 B header + 48 B steps + padded names, has
     checksum.stamp(bad[0..img.len], IntentHeaderWire.CSUM_OFF);
     try testing.expectError(error.Corrupt, decode(bad[0..img.len], &out));
     // The step bounds and the cap.
-    try testing.expectError(error.TooManySteps, encode(.create, 0, 1, &.{}, 16 << 10, &buf));
+    try testing.expectError(error.TooManySteps, encode(.create, 0, 1, 0, &.{}, 16 << 10, &buf));
     var many: [XV_MAX_STEPS + 1]StepRec = undefined;
     for (&many) |*s| s.* = steps[0];
-    try testing.expectError(error.TooManySteps, encode(.create, 0, 1, &many, 1 << 20, &buf));
+    try testing.expectError(error.TooManySteps, encode(.create, 0, 1, 0, &many, 1 << 20, &buf));
     var big: [XV_MAX_STEPS * 64 + 64]u8 = undefined;
-    const wide = try encode(.rmdir, 0, 1, many[0..XV_MAX_STEPS], 1 << 20, &big);
+    const wide = try encode(.rmdir, 0, 1, 0, many[0..XV_MAX_STEPS], 1 << 20, &big);
     try testing.expectEqual(@as(usize, 32 + 48 * XV_MAX_STEPS), wide.len);
-    try testing.expectError(error.ValueTooLarge, encode(.rmdir, 0, 1, many[0..XV_MAX_STEPS], 4096, &big));
+    try testing.expectError(error.ValueTooLarge, encode(.rmdir, 0, 1, 0, many[0..XV_MAX_STEPS], 4096, &big));
     try testing.expectEqual(XV_MAX_STEPS, (try decode(wide, &out)).steps.len);
 }
 
@@ -585,14 +601,14 @@ fn decodeTotalFuzz(_: void, smith: *std.testing.Smith) anyerror!void {
     _ = decodeStored(input[0..split], input[split..], &stored_steps) catch {};
     const it = decode(input, &out) catch return;
     var buf: [XV_MAX_STEPS * 56 + 64]u8 = undefined;
-    const re = try encode(it.op, it.flags, it.tx_id, it.steps, 1 << 20, &buf);
+    const re = try encode(it.op, it.flags, it.tx_id, it.applied, it.steps, 1 << 20, &buf);
     try testing.expectEqualSlices(u8, input, re);
 }
 
 test "fuzz: the intent decoder and its stored form are total and encode∘decode is the identity" {
     var buf: [1024]u8 = undefined;
     const steps = sampleSteps();
-    const img = try encode(.create, 0, 42, &steps, 16 << 10, &buf);
+    const img = try encode(.create, 0, 42, 0, &steps, 16 << 10, &buf);
     var framed: [4 + 1024]u8 = undefined;
     std.mem.writeInt(u32, framed[0..4], @intCast(img.len), .little);
     @memcpy(framed[4..][0..img.len], img);
@@ -611,7 +627,7 @@ test "fuzz: the intent decoder and its stored form are total and encode∘decode
         var out: [XV_MAX_STEPS]StepRec = undefined;
         const it = decode(m[0..cut], &out) catch continue;
         var re_buf: [1024]u8 = undefined;
-        const re = try encode(it.op, it.flags, it.tx_id, it.steps, 1 << 20, &re_buf);
+        const re = try encode(it.op, it.flags, it.tx_id, it.applied, it.steps, 1 << 20, &re_buf);
         try testing.expectEqualSlices(u8, m[0..cut], re);
     }
 }
@@ -629,7 +645,7 @@ test "the key law and the home law: the id is the key injectively; a home is loc
     try testing.expect(!key.lessThan(&k, &r.start) and !key.lessThan(&r.end, &k));
     var buf: [1024]u8 = undefined;
     const steps = sampleSteps();
-    const img = try encode(.unlink, 0, id, &steps, 16 << 10, &buf);
+    const img = try encode(.unlink, 0, id, 0, &steps, 16 << 10, &buf);
     var vbuf: [1024]u8 = undefined;
     const v = storedValue(id, img, &vbuf);
     try testing.expectEqual(storedValueLen(img.len), v.len);

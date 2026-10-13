@@ -1334,7 +1334,7 @@ test "the plans: the flip is K + 2 inserts with the commit marker LAST under the
         try testing.expectEqual(@as(usize, 1 + 1 + 1 + K_MAX + K_MAX + 1), wp.len);
         var recs: [intent.XV_MAX_STEPS]intent.StepRec = undefined;
         var img: [intent.IMAGE_MAX]u8 = undefined;
-        const image = try intent.encode(.rmdir, 0, 1, wp.recs(&recs), 16 << 10, &img);
+        const image = try intent.encode(.rmdir, 0, 1, 0, wp.recs(&recs), 16 << 10, &img);
         try testing.expect(image.len <= intent.IMAGE_MAX);
     }
     const folded = foldAttrs(.{ .nlink = 2, .mtime = 5, .ctime = 5 }, &.{ .{ .nlink = 4, .mtime = 9, .ctime = 1 }, null, .{ .nlink = 2, .mtime = 1, .ctime = 12 }, .{ .nlink = 1 } });

@@ -106,6 +106,9 @@ pub const stats = struct {
     /// the name while the intent stood open) and compensated what this
     /// intent alone had put in effect.
     pub var xv_recovered_compensated: counters.ShardedCounter = .{};
+    /// An intent left open with its applied steps attested in the record
+    /// (the roll-forward's compensation inverts them).
+    pub var xv_applied_attested: counters.ShardedCounter = .{};
     /// A ship that failed left the intent open for the cadence.
     pub var xv_abandoned: counters.ShardedCounter = .{};
     /// A LOCAL step's device error mid-plan (the fail-stop class): must
@@ -496,7 +499,7 @@ pub fn Plane(comptime Store: type) type {
             var done: Done = .{ .tx_id = tx_id };
             var recs: [intent.XV_MAX_STEPS]intent.StepRec = undefined;
             var img_buf: [intent.IMAGE_MAX]u8 = undefined;
-            const image = intent.encode(plan.op, 0, tx_id, plan.recs(&recs), self.record_cap, &img_buf) catch |e| return switch (e) {
+            const image = intent.encode(plan.op, 0, tx_id, 0, plan.recs(&recs), self.record_cap, &img_buf) catch |e| return switch (e) {
                 error.TooManySteps => error.PlanTooLarge,
                 error.ValueTooLarge => error.ValueTooLarge,
             };
@@ -535,7 +538,16 @@ pub fn Plane(comptime Store: type) type {
             var i: usize = first;
             var prev = t2;
             while (i < plan.len) : (i += 1) {
-                const d = try self.dispatch(tx_id, i, plan.steps[i], .none, scope, now, .any);
+                const d = self.dispatch(tx_id, i, plan.steps[i], .none, scope, now, .any) catch |e| {
+                    // Left open: the steps before `i` are this intent's
+                    // (the op held their guards) — attested in the record
+                    // for the roll-forward's compensation.
+                    switch (e) {
+                        error.ShipFailed, error.SlotMoved, error.Deferred, error.GuardRefused => if (i > 0) self.attestApplied(home, tx_id, plan, i),
+                        else => {},
+                    }
+                    return e;
+                };
                 const out = d.out;
                 done.outcomes[i] = out;
                 done.len = i + 1;
@@ -563,6 +575,27 @@ pub fn Plane(comptime Store: type) type {
             stats.xv_cross_owner_phase_total.record(t4 - t0);
             stats.xv_completed.inc();
             return done;
+        }
+
+        /// The intent left open after `applied` steps: the record
+        /// rewritten with the attested prefix and barriered. Best effort —
+        /// a record that keeps 0 compensates fresh mints alone, as an
+        /// initiator crash before this point leaves it (loud).
+        fn attestApplied(self: *Self, home: u64, tx_id: u64, plan: *const Plan, applied: usize) void {
+            var recs: [intent.XV_MAX_STEPS]intent.StepRec = undefined;
+            var img_buf: [intent.IMAGE_MAX]u8 = undefined;
+            // The very plan `execute` encoded at its start: same steps, same
+            // cap — only the header's word differs.
+            const image = intent.encode(plan.op, 0, tx_id, @intCast(applied), plan.recs(&recs), self.record_cap, &img_buf) catch unreachable;
+            const landed = blk: {
+                self.apply.commitRiderAlone(.{ .put = .{ .home = home, .tx_id = tx_id, .image = image } }, .none) catch |e| break :blk e;
+                self.apply.barrier() catch |e| break :blk e;
+            };
+            landed catch |e| {
+                log.warn("cross-owner intent 0x{x}: the {d} applied step(s) could not be attested ({s}) — its roll-forward compensates fresh mints alone", .{ tx_id, applied, @errorName(e) });
+                return;
+            };
+            stats.xv_applied_attested.inc();
         }
 
         fn crashSeam(self: *Self, after_step: u32) Error!void {
@@ -732,10 +765,31 @@ pub fn Plane(comptime Store: type) type {
         /// The live refusal's compensation: the ABORTING flip (one entry,
         /// barriered), every applied step before `refused_idx` inverted in
         /// REVERSE through the same applier, the retirement.
-        fn compensate(self: *Self, tx_id: u64, home: u64, plan: *const Plan, refused_idx: usize, done: *Done, scope: guards.Scope, now: u64) Error!void {
+        fn compensate(self: *Self, tx_id: u64, home: u64, plan_in: *const Plan, refused_idx: usize, done: *Done, scope: guards.Scope, now: u64) Error!void {
+            // An applied count step is undone RELATIVE to the count found
+            // under the plan's guards: its witness rebased so `post` is
+            // the count now (a later op — the caller's retry — may have
+            // moved it past this intent's `post`); the ABORTING record
+            // carries the rebased witness, so a re-run after a crash
+            // inverts it exactly once.
+            var p = plan_in.*;
+            const plan = &p;
+            for (plan.steps[0..refused_idx], done.outcomes[0..refused_idx]) |*step, o| {
+                if (o.status != .applied) continue;
+                switch (step.*) {
+                    .set_nlink => |x| {
+                        const cur = (try self.readWitness(x.ino)) orelse continue;
+                        const delta: i64 = @as(i64, x.post) - @as(i64, x.pre);
+                        const pre: i64 = @as(i64, cur.nlink) - delta;
+                        if (pre < 0 or pre > economy.NLINK_MAX) continue;
+                        step.* = .{ .set_nlink = .{ .ino = x.ino, .pre = @intCast(pre), .post = cur.nlink, .ctime = x.ctime } };
+                    },
+                    else => {},
+                }
+            }
             var recs: [intent.XV_MAX_STEPS]intent.StepRec = undefined;
             var img_buf: [intent.IMAGE_MAX]u8 = undefined;
-            const image = intent.encode(plan.op, intent.FLAG_ABORTING, tx_id, plan.recs(&recs), self.record_cap, &img_buf) catch return error.ValueTooLarge;
+            const image = intent.encode(plan.op, intent.FLAG_ABORTING, tx_id, 0, plan.recs(&recs), self.record_cap, &img_buf) catch return error.ValueTooLarge;
             self.apply.commitRiderAlone(.{ .put = .{ .home = home, .tx_id = tx_id, .image = image } }, .none) catch |e| return mapApply(e);
             self.apply.barrier() catch |e| return mapApply(e);
             var i = refused_idx;
@@ -873,6 +927,13 @@ pub fn Plane(comptime Store: type) type {
             } else {
                 var done: Done = .{ .tx_id = tx_id };
                 for (plan.slice(), 0..) |s, i| {
+                    if (i < it.applied) {
+                        // Attested by the initiator that left it open:
+                        // in effect, this intent's own.
+                        done.outcomes[i] = .{ .status = .applied };
+                        done.len = i + 1;
+                        continue;
+                    }
                     const d = try self.dispatch(tx_id, i, s, .none, scope, now, .any);
                     done.outcomes[i] = d.out;
                     done.len = i + 1;

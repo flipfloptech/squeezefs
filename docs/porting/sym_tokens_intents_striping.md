@@ -715,6 +715,18 @@ and the roll-forward applies the FORWARD plan, re-meeting the refusal — the C9
 an abort marker on the record is the recovery-side answer the rung does not build (Z/ should: a
 `flags` bit `ABORTING` on the header makes the roll-forward run the INVERSE plan — §7 Q6).
 
+**Port (0003 §U.4): the abandonment attests, the compensation rebases.** An intent left open by a
+ship-class failure at step `i` (ShipFailed, SlotMoved, Deferred, GuardRefused) rewrites its record with
+the header's `applied` word = `i` (the op held every earlier step's guards, so steps `0..i` are its
+own) and barriers it (`xv_applied_attested`); the roll-forward takes those steps as applied without
+re-dispatching them (a later op may have moved their objects on). A compensation rebases every applied
+`SetNlink`'s witness onto the count it finds under the plan's guards (`post` = the count now, `pre` =
+now − the step's delta) and writes the ABORTING record with the rebased witness, so the inverse undoes
+exactly this intent's delta, once, whatever a retry or another link did meanwhile. Two classes stay
+undecidable and keep the leak direction (a count too HIGH, fsck C10 reports): an initiator crash
+before the attestation, and the failing step `i` itself when a later op made the SAME effect (a retry
+linking the same file to the same name: the dentry's witness cannot tell whose insert it is).
+
 ### 2.8 Roll-forward: at mount, the cadence, the register, the closure
 
 - **Recovery at mount, before the mount serves** (`recover_open_intents` :3348–3365; `scan_open`

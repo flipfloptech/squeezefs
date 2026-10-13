@@ -430,7 +430,7 @@ test "the per-op plans restate §2.5: create = [CreateInode, InsertDentry]; unli
     // A plan round-trips through the record image.
     var recs: [intent.XV_MAX_STEPS]intent.StepRec = undefined;
     var buf: [4096]u8 = undefined;
-    const img = try intent.encode(r.op, 0, 77, r.recs(&recs), 16 << 10, &buf);
+    const img = try intent.encode(r.op, 0, 77, 0, r.recs(&recs), 16 << 10, &buf);
     var out: [intent.XV_MAX_STEPS]intent.StepRec = undefined;
     const back = Plan.fromIntent(try intent.decode(img, &out));
     try testing.expectEqual(r.len, back.len);

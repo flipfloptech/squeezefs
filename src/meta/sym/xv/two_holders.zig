@@ -532,6 +532,47 @@ test "an abandoned create whose name a retry took meanwhile is COMPENSATED by th
     try f.closureHolds(s0.minted, s0.retired, s0.open);
 }
 
+test "an abandoned LINK whose name another object took meanwhile is compensated by the roll-forward INCLUDING its count (owed by the shared hot directory row's fix 10: the undo attributed only fresh mints, so the abandoned link's nlink step stood — the C10 class): the abandonment attests the steps it applied in the record, the roll-forward never re-witnesses them and inverts the count RELATIVE to what it finds (a later link of the same file moved it on) — nlink equals the names, in the same incarnation's cadence and after a remount" {
+    const gpa = testing.allocator;
+    for ([_]bool{ false, true }) |remount| {
+        const f = try TwoHolders.init(gpa, testing.io, .{ .ship_fail_at = 1 }, .{});
+        defer f.deinit();
+        try f.a.seedDir(DIR_A);
+        try f.b.seedDir(DIR_B);
+        const s0 = Snapshot.take();
+        const file = try f.a.create(DIR_A, "orig", S.IFREG | 0o644);
+        // The first attempt: the count at A (+1), the name's ship to B
+        // fails — the intent stays open, the caller answered EAGAIN.
+        const attested0 = ops.stats.xv_applied_attested.load();
+        try testing.expectError(error.ShipFailed, f.a.link(DIR_B, "l", file));
+        try testing.expectEqual(attested0 + 1, ops.stats.xv_applied_attested.load());
+        try testing.expectEqual(@as(u32, 2), (try f.a.inode(file)).?.nlink);
+        try testing.expect((try f.b.dentry(DIR_B, "l")) == null);
+        // Meanwhile: the file is linked again elsewhere (count 3), and a
+        // NEW file takes the name the open intent wanted.
+        try f.a.link(DIR_A, "again", file);
+        try testing.expectEqual(@as(u32, 3), (try f.a.inode(file)).?.nlink);
+        const other = try f.a.create(DIR_B, "l", S.IFREG | 0o644);
+        // The roll-forward re-meets the refused name and compensates the
+        // count its abandonment attested: one count per name.
+        const comp0 = ops.stats.xv_recovered_compensated.load();
+        if (remount) {
+            try f.remount(&f.a, .{});
+            try testing.expectEqual(@as(u32, 1), try f.a.plane.recoverOpen(clock.monotonicNs()));
+        } else {
+            try testing.expectEqual(@as(u32, 1), try f.a.plane.cadenceTick(clock.monotonicNs()));
+        }
+        try testing.expectEqual(comp0 + 1, ops.stats.xv_recovered_compensated.load());
+        try testing.expectEqual(@as(u32, 2), (try f.a.inode(file)).?.nlink);
+        try testing.expectEqual(file, (try f.a.dentry(DIR_A, "orig")).?.child);
+        try testing.expectEqual(file, (try f.a.dentry(DIR_A, "again")).?.child);
+        try testing.expectEqual(other, (try f.b.dentry(DIR_B, "l")).?.child);
+        try testing.expectEqual(@as(u32, 1), (try f.a.inode(other)).?.nlink);
+        try f.noOpenIntents();
+        try f.closureHolds(s0.minted, s0.retired, s0.open);
+    }
+}
+
 test "every initiator crash window of a foreign create rolls forward to exactly ONE outcome: after step 0 (+ the intent), after the foreign step, before the retirement — the next mount's recovery completes the plan and retires; recovery is idempotent across repeated mounts" {
     const gpa = testing.allocator;
     for ([_]u32{ 0, 1, 2 }) |window| {
@@ -642,7 +683,7 @@ test "a live witness refusal at the shipped step (a racing creator's name landed
     _ = try f.a.plane.apply.apply(plan2.steps[0], .none, .none, 1_000);
     var recs: [intent.XV_MAX_STEPS]intent.StepRec = undefined;
     var img_buf: [4096]u8 = undefined;
-    const img = try intent.encode(.create, intent.FLAG_ABORTING, (7 << 40) | 500, plan2.recs(&recs), 16 << 10, &img_buf);
+    const img = try intent.encode(.create, intent.FLAG_ABORTING, (7 << 40) | 500, 0, plan2.recs(&recs), 16 << 10, &img_buf);
     try f.a.plane.apply.commitRiderAlone(.{ .put = .{ .home = intent.homeIno(1), .tx_id = (7 << 40) | 500, .image = img } }, .none);
     try testing.expect((try f.a.inode(child2)) != null);
     try f.remount(&f.a, .{});

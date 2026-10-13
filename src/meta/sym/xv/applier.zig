@@ -486,7 +486,7 @@ test "every step kind is idempotent under its witness (apply twice ⇒ once) and
     var out: [intent.XV_MAX_STEPS]intent.StepRec = undefined;
     var img_buf: [512]u8 = undefined;
     const sr = [_]intent.StepRec{cr.toRec()};
-    const img = try intent.encode(.create, 0, 78, &sr, 16 << 10, &img_buf);
+    const img = try intent.encode(.create, 0, 78, 0, &sr, 16 << 10, &img_buf);
     try a.commitRiderAlone(.{ .put = .{ .home = intent.homeIno(3), .tx_id = 78, .image = img } }, .none);
     const stored = (try a.readIntentBytes(intent.homeIno(3), 78)).?;
     defer gpa.free(stored);

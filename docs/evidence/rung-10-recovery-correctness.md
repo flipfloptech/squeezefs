@@ -183,3 +183,44 @@ The dedupe meets two copies of a name in one HASH GROUP (`cookie >> 8`): their c
 when the name's collision index differs between `D` and its stripe — a 54-bit keyed-hash collision
 inside the directory. If such a pair also straddles a reply boundary with the stripe's copy first,
 the next reply can list `D`'s copy again (a duplicate, never a miss). Not met; stated.
+
+## 4. An abandoned `link`'s undo (item 4)
+
+### 4.1 The defect
+
+`rung-10-striping-wire.md` §3.6: the roll-forward that re-meets a live refusal compensates (§Q.19,
+fix 10) — inverting the steps applied NOW and the fresh mints found applied, because "any other
+step's earlier effect cannot be told from a later op's". A `link` is `set_nlink(n → n + 1)` then the
+insert; its ship of the insert fails against a dead holder, the intent stays open, the caller gets
+EAGAIN — and its `+1` stands. When the roll-forward later meets the name taken by another object,
+the re-dispatched count step answers `already_applied` (not a fresh mint: not inverted) or, if a
+later link moved the count on, a witness refusal at step 0 — either way the count stays one too
+high (fsck C10).
+
+### 4.2 The red row and the fix (0003 §U.4)
+
+`two_holders` "an abandoned LINK whose name another object took meanwhile is compensated by the
+roll-forward INCLUDING its count": A's file (`orig`, nlink 1); A links it into B's directory as `l`
+with the insert's ship failing (`ship_fail_at = 1`) — nlink 2, no name; meanwhile A links it again
+as `again` (nlink 3) and creates a NEW file named `l` in B's directory; the roll-forward (the
+cadence tick, and — the second pass — a remount's `recoverOpen`) re-meets `l`, compensates: nlink 2
+= `orig` + `again`, `l` the new file's, no open intent, the closure holding. Red on the item-3 tree:
+`expected 2, found 3`.
+
+The fix: the op that leaves an intent open at step `i` attests `applied = i` in the record's header
+(the former reserved u16) and barriers it; the roll-forward takes attested steps as applied without
+re-dispatching them; a compensation rebases every applied count onto the count it reads under the
+plan's guards before writing the ABORTING image, so the inverse removes exactly this intent's delta,
+once (a re-run after a crash mid-compensation inverts the rebased witness and finds it done).
+`intent` "the intent image round-trips" pins the word (it survives the codec; a prefix past the step
+count refuses); the decoder's fuzz target re-encodes it.
+
+### 4.3 Not decidable (stated, the leak direction)
+
+- An initiator crash between the failing step and the attestation's barrier leaves `applied = 0`:
+  the roll-forward knows fresh mints alone, as before.
+- The failing step itself: a ship that failed after the holder applied (the reply lost) and a LATER
+  op with the same effect (the same file linked to the same name) answer the same `already_applied`
+  — the dentry carries no intent stamp. Treating it as the intent's own is the safe reading (a count
+  too high is a leak C10 reports; one too low would let a later unlink free a file a name still
+  reaches).

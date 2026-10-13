@@ -193,6 +193,12 @@ pub const Lane = struct {
     /// The slot pool (any thread pops at spawn, any thread pushes at recycle).
     free: mpmc.BoundedMpmc(*Fiber),
     fibers: []Fiber,
+    /// One claim word per slot (`fibers[i]` ↔ `claims[i]`): `CLAIM_FREE`
+    /// (quiescent — in the free ring or on its way back), `CLAIM_ARMED` (a
+    /// spawn owns the stack), `CLAIM_TRIMMING` (the idle trim is returning
+    /// its pages). Outside the `Fiber` so a recycle's reset never writes
+    /// it under a trimmer's CAS (`slot_pool_model.zig`).
+    claims: []std.atomic.Value(u8),
     fiber_capacity: u32,
     stack_size: usize,
     page: usize,
@@ -231,6 +237,10 @@ pub const Lane = struct {
     pub const InitError = std.mem.Allocator.Error;
     pub const StartError = error{ RingSetupFailed, ThreadSpawnFailed };
 
+    pub const CLAIM_FREE: u8 = 0;
+    pub const CLAIM_ARMED: u8 = 1;
+    pub const CLAIM_TRIMMING: u8 = 2;
+
     pub const TrimStation = struct {
         ctx: *anyopaque,
         holding: *const fn (ctx: *anyopaque, f: *Fiber) void,
@@ -256,6 +266,7 @@ pub const Lane = struct {
             .timers = undefined,
             .free = undefined,
             .fibers = &.{},
+            .claims = &.{},
             .fiber_capacity = options.fiber_capacity,
             .stack_size = options.stack_size,
             .page = options.page,
@@ -272,6 +283,9 @@ pub const Lane = struct {
         errdefer self.free.deinit(gpa);
         self.timers = try timer_heap.TimerHeap(Fiber).init(gpa, options.fiber_capacity);
         errdefer self.timers.deinit(gpa);
+        self.claims = try gpa.alloc(std.atomic.Value(u8), options.fiber_capacity);
+        errdefer gpa.free(self.claims);
+        @memset(self.claims, .init(CLAIM_FREE));
         self.fibers = try gpa.alloc(Fiber, options.fiber_capacity);
         for (self.fibers, 0..) |*f, i| {
             f.stack = null;
@@ -288,6 +302,7 @@ pub const Lane = struct {
         self.stopAndJoin();
         for (self.fibers) |*f| if (f.stack) |s| s.unmap();
         self.gpa.free(self.fibers);
+        self.gpa.free(self.claims);
         self.timers.deinit(self.gpa);
         self.free.deinit(self.gpa);
         self.inbox.deinit(self.gpa);
@@ -429,8 +444,10 @@ pub const Lane = struct {
             stats.spawn_refused.of(self.class).inc();
             return error.ConcurrencyUnavailable;
         };
+        self.claimForSpawn(f);
         const group_canceled = if (group) |g| group_mod.isCanceled(g) else false;
         f.arm(kind, start_fn, context, group, group_canceled, protection, self.stack_size, self.page) catch {
+            self.claims[f.slot].store(CLAIM_FREE, .release);
             self.free.pushSpin(f);
             stats.spawn_refused.of(self.class).inc();
             return error.ConcurrencyUnavailable;
@@ -441,19 +458,38 @@ pub const Lane = struct {
         return f;
     }
 
+    /// The popped slot's claim, FREE → ARMED (acquire: pairs with the
+    /// trim's release, so a trimmed stack reads `trimmed` and re-arms). A
+    /// slot the idle trim holds is waited out — one madvise, counted
+    /// (`exec_spawn_trim_waits`) — never refused: the trim never took it
+    /// out of the pool.
+    fn claimForSpawn(self: *Lane, f: *Fiber) void {
+        const c = &self.claims[f.slot];
+        var waited = false;
+        while (c.cmpxchgWeak(CLAIM_FREE, CLAIM_ARMED, .acquire, .monotonic)) |cur| {
+            assert(cur == CLAIM_TRIMMING);
+            if (!waited) stats.spawn_trim_waits.inc();
+            waited = true;
+            std.atomic.spinLoopHint();
+        }
+    }
+
     /// Return a finished fiber's slot to the pool (any thread; the fiber's
-    /// stack is quiescent: the lane published `finished` after it switched out).
+    /// stack is quiescent: the lane published `finished` after it switched
+    /// out). The claim goes FREE only now (release: the reset and the idle
+    /// stamp are what a trimmer's claim acquires), then the push, and the
+    /// live count LAST: `live == 0` means every slot is back in the pool
+    /// (the quiescence barrier `finalize` and the tests' waits read).
     pub fn recycle(self: *Lane, f: *Fiber) void {
         f.recordHighWater();
         f.reset(self, f.slot);
-        // Stamp the idle clock BEFORE the push: a trimmer that pops the slot
-        // reads a stamp no older than the recycle.
         f.idle_tick = self.clock.load(.monotonic);
         stats.fibers_live.of(self.class).sub(1);
-        _ = self.live.fetchSub(1, .monotonic);
-        // The ring holds the whole population; a refusal is the trimmer's
-        // (or a spawner's) pop mid-flight on the wrap cell (`mpmc.pushSpin`).
+        self.claims[f.slot].store(CLAIM_FREE, .release);
+        // The ring holds the whole population; a refusal is a spawner's pop
+        // mid-flight on the wrap cell (`mpmc.pushSpin`).
         self.free.pushSpin(f);
+        _ = self.live.fetchSub(1, .monotonic);
     }
 
     /// The pages the kernel holds for this lane's stacks, measured
@@ -469,22 +505,25 @@ pub const Lane = struct {
 
     /// The idle-trim law over this lane's slot pool (any thread; the
     /// sampler's): return the stack pages of every FREE slot idle for
-    /// ≥ `min_idle_ticks` ticks. A slot is popped, trimmed and pushed back
-    /// before the next, so a concurrent spawn is at most one slot short
-    /// for the microseconds of one madvise; one lap over the capacity
-    /// bounds the pass. Returns the stacks trimmed.
+    /// ≥ `min_idle_ticks` ticks. Each slot is claimed IN PLACE (FREE →
+    /// TRIMMING, acquire: the recycle's reset and stamp are visible) and
+    /// released after its madvise (release: the spawn's claim sees
+    /// `trimmed`) — never popped out of the ring: a popped slot's push in
+    /// flight hid every slot queued behind it from spawn (the ring's head
+    /// answered empty; 121 of 300 loops refused a spawn under load). A
+    /// spawn that pops a slot under trim waits out the one madvise.
+    /// Returns the stacks trimmed.
     pub fn trimIdleStacks(self: *Lane, min_idle_ticks: u64) u32 {
         const now = self.clock.load(.monotonic);
         var trimmed: u32 = 0;
-        var seen: u32 = 0;
-        while (seen < self.fiber_capacity) : (seen += 1) {
-            const f = self.free.tryPop() orelse break;
+        for (self.fibers, self.claims) |*f, *c| {
+            if (c.cmpxchgStrong(CLAIM_FREE, CLAIM_TRIMMING, .acquire, .monotonic) != null) continue;
+            defer c.store(CLAIM_FREE, .release);
             if (self.trim_station) |st| st.holding(st.ctx, f);
             if (f.stack) |*s| if (!s.trimmed and now -| f.idle_tick >= min_idle_ticks) {
                 s.trim();
                 trimmed += 1;
             };
-            self.free.pushSpin(f);
         }
         return trimmed;
     }
@@ -1265,6 +1304,14 @@ test "the stack trimmer races spawns and recycles: a foreign thread trims at min
     };
     var sh: Shared = .{ .lane = l };
     const t = try std.Thread.spawn(.{}, Shared.trimmer, .{&sh});
+    // The trimmer stops and joins on EVERY exit: a failing spawn's early
+    // return used to free the lane under it (its `tryPop` on the freed
+    // ring — the gate's SIGABRT).
+    var joined = false;
+    defer if (!joined) {
+        sh.stop.store(true, .release);
+        t.join();
+    };
     const S = struct {
         fn run(context: *const anyopaque) void {
             const c = ctxOf(context);
@@ -1292,8 +1339,71 @@ test "the stack trimmer races spawns and recycles: a foreign thread trims at min
     }
     sh.stop.store(true, .release);
     t.join();
+    joined = true;
     try testing.expect(sh.trims.load(.monotonic) > 0);
     try testing.expectEqual(@as(u32, 0), l.live.load(.monotonic));
+}
+
+test "a spawn that pops a slot the idle trim holds waits the trim out and lands (counted), never refused; the trim's release re-arms nothing it should not (0003 §W.4)" {
+    const l = try testLane(.meta, 1, false);
+    defer l.deinit();
+    const Station = struct {
+        held: std.atomic.Value(u32) = .init(0),
+        go: std.atomic.Value(u32) = .init(0),
+        fn holding(ctx: *anyopaque, _: *Fiber) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.held.store(1, .release);
+            futex.wakeAll(&self.held);
+            while (self.go.load(.acquire) == 0) futex.wait(&self.go, 0);
+        }
+    };
+    var st: Station = .{};
+    l.trim_station = .{ .ctx = &st, .holding = &Station.holding };
+    defer l.trim_station = null;
+    const Trim = struct {
+        fn run(lane: *Lane) void {
+            _ = lane.trimIdleStacks(0);
+        }
+    };
+    const t = try std.Thread.spawn(.{}, Trim.run, .{l});
+    var t_joined = false;
+    defer if (!t_joined) {
+        st.go.store(1, .release);
+        futex.wakeAll(&st.go);
+        t.join();
+    };
+    while (st.held.load(.acquire) == 0) futex.wait(&st.held, 0);
+    // The lane's one slot is under trim: a spawn pops it and waits.
+    const S = struct {
+        fn run(context: *const anyopaque) void {
+            ctxOf(context).probe.finish();
+        }
+        fn spawner(lane: *Lane, g: *Io.Group, p: *Probe, out: *?anyerror, returned: *std.atomic.Value(u32)) void {
+            _ = spawnTest(lane, g, run, .{ .probe = p, .lane = lane }) catch |e| {
+                out.* = e;
+            };
+            returned.store(1, .release);
+        }
+    };
+    const waits0 = stats.spawn_trim_waits.load();
+    var g = membersGroup(1);
+    var p: Probe = .{};
+    var spawn_err: ?anyerror = null;
+    var returned: std.atomic.Value(u32) = .init(0);
+    const sp = try std.Thread.spawn(.{}, S.spawner, .{ l, &g, &p, &spawn_err, &returned });
+    // The rendezvous: the spawner is waiting on the claim (or returned —
+    // the shipped trimmer's refusal).
+    while (stats.spawn_trim_waits.load() == waits0 and returned.load(.acquire) == 0) std.Thread.yield() catch {};
+    st.go.store(1, .release);
+    futex.wakeAll(&st.go);
+    t.join();
+    t_joined = true;
+    sp.join();
+    try testing.expectEqual(@as(?anyerror, null), spawn_err);
+    p.waitDone();
+    waitQuiescent(l);
+    try testing.expectEqual(waits0 + 1, stats.spawn_trim_waits.load());
+    try testing.expectEqual(Lane.CLAIM_FREE, l.claims[0].load(.acquire));
 }
 
 test "ring entries derivation: power of two above the fiber population + wake + cancels, floor 8, ceiling 4096" {

@@ -878,7 +878,15 @@ pub const Group = struct {
     /// could hold a lease has finished.
     pub fn deinit(self: *Group) void {
         assert(self.thread == null);
-        if (self.started.load(.acquire) == 1) self.ring.deinit();
+        if (self.started.load(.acquire) == 1) {
+            // The kmbuf region holds every in-flight request's payload (a
+            // LOOKUP's name, a WRITE's data): unmapped only here, once no
+            // handler can still read it — never at the worker's exit, which
+            // `close` reaches with handlers mid-request.
+            if (self.kmb) |*k| k.teardown(&self.ring.ring);
+            self.kmb = null;
+            self.ring.deinit();
+        }
         self.gpa.free(self.release_teardown);
         self.release_inbox.deinit(self.gpa);
         self.store_inbox.deinit(self.gpa);
@@ -1077,8 +1085,6 @@ pub const Group = struct {
         futex.wakeAll(&self.started);
         self.runLoop();
         self.drain();
-        if (self.kmb) |*k| k.teardown(&self.ring.ring);
-        self.kmb = null;
         self.ring.quiesce();
     }
 
@@ -1121,6 +1127,11 @@ pub const Group = struct {
                 return error.RingSetupFailed;
             };
         }
+        // A worker that never starts never reaches `deinit`'s teardown.
+        errdefer if (self.kmb) |*k| {
+            k.teardown(&self.ring.ring);
+            self.kmb = null;
+        };
         if (!self.ring.armWake()) return error.RingSetupFailed;
         const posture = if (self.shared.sqpoll) "sqpoll" else uring128.taskrun_ladder[self.ring_rung].name;
         log.info("transport: group {d} (qids {d}..{d}, {d} members × depth {d}, {t}) ring armed on rung {d} ({s}), sq {d}, payload {d} B, arena {d} B, kmbuf {d} B", .{ self.index, self.members[0].qid, self.members[self.members.len - 1].qid, self.members.len, self.depth, self.shared.mode, self.ring_rung, posture, entries, self.payload_len, self.arena.len, if (self.kmb) |k| k.pinnedBytes() else 0 });

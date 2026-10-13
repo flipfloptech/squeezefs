@@ -249,8 +249,8 @@ src/fuse/transport/worker.zig:330 | 8 | OWED: derive it or document it on the li
 src/fuse/transport/worker.zig:330 | 8 | OWED: derive it or document it on the line (charter §1.5)
 src/fuse/transport/worker.zig:330 | 9 | OWED: derive it or document it on the line (charter §1.5)
 src/fuse/transport/worker.zig:455 | 4096 | OWED: derive it or document it on the line (charter §1.5)
-src/fuse/transport/worker.zig:1046 | 3 | OWED: derive it or document it on the line (charter §1.5)
-src/fuse/transport/worker.zig:1071 | 3 | OWED: derive it or document it on the line (charter §1.5)
+src/fuse/transport/worker.zig:1054 | 3 | OWED: derive it or document it on the line (charter §1.5)
+src/fuse/transport/worker.zig:1079 | 3 | OWED: derive it or document it on the line (charter §1.5)
 src/gates/fuzz_campaign.zig:128 | 72 | OWED: derive it or document it on the line (charter §1.5)
 src/gates/fuzz_campaign.zig:185 | 16 | a size — OWED: derive from derive.Facts or document the physical/format reason
 src/gates/fuzz_campaign.zig:185 | 20 | a size — OWED: derive from derive.Facts or document the physical/format reason

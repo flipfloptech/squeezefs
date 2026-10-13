@@ -162,10 +162,12 @@ pub const Kmbuf = struct {
     }
 
     /// Teardown: unmap the region, drop the fixed-buffer table and ask the
-    /// kernel to release the kmbuf ring. The FUSE connection pins the ring
-    /// for its life, so the unregister is accepted only once that pin is
-    /// gone (the connection died before the worker drained) — a refusal is
-    /// expected and quiet: the pin releases with the ring fd regardless.
+    /// kernel to release the kmbuf ring — only once no handler can still
+    /// read a request's payload in the region (`Group.deinit`, after the
+    /// session awaited every handler). The FUSE connection pins the ring
+    /// for its life and a single-issuer ring refuses another thread's
+    /// register, so either unregister may be refused — expected and quiet:
+    /// the pin releases with the ring fd regardless.
     pub fn teardown(self: *Kmbuf, ring: *uring128.Ring128) void {
         uring128.Ring128.munmapRegion(self.region);
         pinned_bytes.sub(@as(u64, self.ring_entries) * self.buf_size);

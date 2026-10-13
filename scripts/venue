@@ -15,7 +15,10 @@
 set -euo pipefail
 
 NAME=${SQZ_VENUE_NAME:-sqz-zig}
-IMAGE=${SQZ_VENUE_IMAGE:-squeezefs-build:ubuntu2404}
+# The build image plus the benchmark instruments (fio, OpenMPI, IOR/mdtest) baked
+# in (scripts/dev/Containerfile): a recreate drops anything apt put in the
+# container's root fs, so the instruments live in the image.
+IMAGE=${SQZ_VENUE_IMAGE:-squeezefs-dev:ubuntu2404}
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REF=${SQZ_REFERENCE:-"$HOME/Source/squeezefs"}
 CACHE_VOL=${SQZ_VENUE_CACHE_VOLUME:-squeezefs-zig-cache}
@@ -45,6 +48,10 @@ up() {
   # CAP_SYS_ADMIN: the FUSE transport tests mount(2)/umount2 real EchoFs
   # mounts (rung 3) and write fuse.enable_uring; without it mount(2) is EPERM
   # and every e2e test skips its venue.
+  if ! container image inspect "$IMAGE" >/dev/null 2>&1 && [ "$IMAGE" = squeezefs-dev:ubuntu2404 ]; then
+    echo "venue: building $IMAGE (the build image + fio, OpenMPI, IOR/mdtest) …"
+    container build -t "$IMAGE" -f "$REPO/scripts/dev/Containerfile" "$REPO/scripts/dev" >/dev/null
+  fi
   local ext_mount=()
   if [ -d "$EXT_DIR" ]; then ext_mount=(--mount "type=virtiofs,source=$EXT_DIR,target=/build/ext"); fi
   # --init: PID 1 reaps orphans (with `sleep infinity` as PID 1 the venue piled

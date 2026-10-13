@@ -1,0 +1,32 @@
+# The dev/venue image with the benchmark instruments baked in: the build image
+# (Ubuntu 24.04, Zig 0.17, fuse3) plus fio, OpenMPI and IOR/mdtest at io500's
+# pinned hash. Baked into the image so a container recreate can never lose
+# them (a recreate drops everything apt put in the container's root fs).
+#
+#   container build -t squeezefs-dev:ubuntu2404 -f scripts/dev/Containerfile scripts/dev
+#   (scripts/dev_mount.sh builds it on first use)
+FROM squeezefs-build:ubuntu2404
+
+# fio 3.36 (≥ the bracket harness's floor), OpenMPI 4.1 for IOR/mdtest, and the
+# autotools IOR's bootstrap needs.
+RUN apt-get update \
+ && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      fio openmpi-bin libopenmpi-dev \
+      autoconf automake libtool pkg-config git ca-certificates make gcc \
+      fdisk e2fsprogs util-linux \
+ && rm -rf /var/lib/apt/lists/*
+
+# IOR and mdtest from one tree, at the hash io500 sc26 pins (docs/gates/brackets.md).
+ARG IOR_COMMIT=5528b3619236d475
+RUN git clone https://github.com/hpc/ior.git /tmp/ior \
+ && cd /tmp/ior && git checkout "$IOR_COMMIT" \
+ && ./bootstrap && ./configure --prefix=/opt/sqz-tools \
+ && make -j"$(nproc)" && make install \
+ && cd / && rm -rf /tmp/ior
+
+# The container runs as root; OpenMPI refuses root without these two.
+ENV PATH=/opt/sqz-tools/bin:$PATH \
+    OMPI_ALLOW_RUN_AS_ROOT=1 \
+    OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1
+
+RUN fio --version && ior -h >/dev/null 2>&1; mdtest -h >/dev/null 2>&1; command -v ior mdtest mpirun

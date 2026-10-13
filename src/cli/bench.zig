@@ -404,10 +404,10 @@ pub const StatsTerms = struct {
     /// transport's direct device leg, the zcrx lane and fsck's scrub DMA
     /// outside the plane and are summed in.
     /// The tick RESCUES (brk.py `TICK_RESCUES`): every lane's lost-wake
-    /// count — the transport's CQE half is its tripwire.
-    pub const tick_rescue_keys = [_][]const u8{ "transport_park_tick_commit_rescues", "transport_park_tick_cqe_lost_wakes", "journal_lane_park_tick_rescues", "meta_conveyor_park_tick_rescues", "block_free_reclaim_park_tick_wakes", "exec_lane_tick_rescues", "lock_ticked_reregisters", "channel_ticked_reregisters", "write_pipeline_admission_tick_wakes" };
+    /// count — the transport's commit and CQE halves are its tripwires.
+    pub const tick_rescue_keys = [_][]const u8{ "transport_park_tick_commit_lost_wakes", "transport_park_tick_cqe_lost_wakes", "journal_lane_park_tick_rescues", "meta_conveyor_park_tick_rescues", "block_free_reclaim_park_tick_wakes", "exec_lane_tick_rescues", "lock_ticked_reregisters", "channel_ticked_reregisters", "write_pipeline_admission_tick_wakes" };
     /// The tick LATE arrivals (brk.py `TICK_LATE`): beside the rescues.
-    pub const tick_late_keys = [_][]const u8{"transport_park_tick_late_cqes"};
+    pub const tick_late_keys = [_][]const u8{ "transport_park_tick_late_commits", "transport_park_tick_late_cqes" };
     pub const device_read_keys = [_][]const u8{ "read_dma_ranged_bytes", "read_dma_block_demand_bytes", "read_dma_block_prefetch_bytes", "read_dma_block_lane_bytes", "read_dma_image_bytes", "read_dma_window_bytes", "write_side_read_dma_bytes", "compose_read_dma_bytes", "pack_read_dma_bytes", "transport_zc_direct_leg_dma_bytes", "zcrx_fill_bytes", "fsck_scrub_read_bytes" };
 
     pub fn parse(text: []const u8) StatsTerms {
@@ -1371,10 +1371,10 @@ test "rows: quantiles are the bucket's UPPER bound over exact counts; MiB/s and 
     try testing.expect(!stat_row.scopingOnly());
 }
 
-test "the tick ledgers: the rescues sum every lane's lost-wake count (the transport's CQE tripwire among them); a late completion rides beside, never in the rescues" {
-    const t = StatsTerms.parse("{\"transport\":{\"transport_park_tick_commit_rescues\":1,\"transport_park_tick_cqe_lost_wakes\":0,\"transport_park_tick_late_cqes\":2},\"exec\":{\"exec_lane_tick_rescues\":3}}");
+test "the tick ledgers: the rescues sum every lane's lost-wake count (the transport's commit and CQE tripwires among them); late commits and completions ride beside, never in the rescues" {
+    const t = StatsTerms.parse("{\"transport\":{\"transport_park_tick_commit_lost_wakes\":1,\"transport_park_tick_late_commits\":5,\"transport_park_tick_cqe_lost_wakes\":0,\"transport_park_tick_late_cqes\":2},\"exec\":{\"exec_lane_tick_rescues\":3}}");
     try testing.expectEqual(@as(u64, 4), t.tick_rescues);
-    try testing.expectEqual(@as(u64, 2), t.tick_late);
+    try testing.expectEqual(@as(u64, 7), t.tick_late);
     for (StatsTerms.tick_rescue_keys) |k| for (StatsTerms.tick_late_keys) |l| try testing.expect(!std.mem.eql(u8, k, l));
 }
 

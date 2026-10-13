@@ -697,7 +697,11 @@ Loop while `active`:
     not local ledgers (a pend was pool-visible with every local ledger reading 0). Idle workers keep the
     zero-cost unbounded park.
 11. **Rescue ledger, commit half** (fou.rs:6308–6325): `after_tick ∧ pass_msgs > 0 ∧ !tick_wake_seen` ⇒
-    `transport_park_tick_commit_rescues += pass_msgs` + the attribution WARN (once per 60 s per worker).
+    `transport_park_tick_commit_rescues += pass_msgs` + the attribution WARN (once per 60 s per worker). (Port: the
+    commit half splits like the CQE half — the TRIPWIRE `transport_park_tick_commit_lost_wakes` when the park
+    was owed a wake (an arm winner's eventfd write completed, no reaped READ consumed it, the READ standing —
+    `ring_park.wakeOwed`, read before the park, `DEFER_TASKRUN`), else the pump's messages are the plain
+    `transport_park_tick_late_commits`; no WARN.)
 12. **Work in hand?** `work_in_hand = !deferred_cqes.is_empty() ∨ pass_polls > 0 ∨ pass_msgs > 0`
     (fou.rs:6326). Spin-before-park (§8.4) only when nothing is in hand.
 13. **THE ENTER** (fou.rs:6396–6449): `work_in_hand ∨ spin_caught` ⇒ non-blocking `submit_with_args(1, ts=0)`
@@ -767,6 +771,7 @@ loop while pool.active:
   next_retry = min over members of slots.next_retry_deadline()
   backstop = (lane.len > 0 or pool.zc_bridge_pends > 0 or group_owed > 0) ? 100 ms : null
   if after_tick and pass_msgs > 0 and !tick_wake_seen: park_tick_commit_rescues += pass_msgs; warn (≤ 1/60 s)
+    (port: the lost wake fired at the verdict; else park_tick_late_commits += pass_msgs)
   work_in_hand = deferred.len > 0 or pass_polls > 0 or pass_msgs > 0
   spin_caught = !work_in_hand and spin_window(...)                                  // §8.4, off by default
   if work_in_hand or spin_caught: submit_getevents_nonblocking()                    // and loop
@@ -1015,7 +1020,8 @@ default by construction.
 | `transport_slots_overdue` | counter | slots seen owing ≥ 5 s by the watchdog |
 | `transport_cq_overflows` / `transport_cq_nodrop` | **must-stay-0** / probe | kernel-dropped CQEs; `IORING_FEAT_NODROP` probed |
 | `transport_park_backstop_ticks` | counter | bounded parks that ticked out (nonzero under traffic = backstop WORKING) |
-| `transport_park_tick_commit_rescues` | ≈ 0 tripwire | messages pumped by the pass after a tick with no wake delivered |
+| `transport_park_tick_commit_lost_wakes` | **must-stay-0** (port) | a tick whose park was owed a completed wake write no READ had consumed (`DEFER_TASKRUN`) |
+| `transport_park_tick_late_commits` | counter (port) | messages the pass after a tick pumped with no wake CQE when the park was owed none: published after the park began (the reference's `_commit_rescues`) |
 | `transport_park_tick_cqe_lost_wakes` | **must-stay-0** (port) | a tick's re-check found completions in a CQ empty at the park (`DEFER_TASKRUN`) |
 | `transport_park_tick_late_cqes` | counter (port) | completions the reap after a tick surfaced: landed after the deadline (the reference's `_cqe_rescues`) |
 | `transport_fast_dispatch_serves` / `_demotes` | sharded counters | READ law arms (a) / (c) |

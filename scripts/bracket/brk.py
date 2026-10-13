@@ -157,18 +157,19 @@ WIRE_RPCS = ["cluster_wire_frames_sent", "joined_wire_verbs", "xv_cross_owner_st
              "slot_resolve_rpcs", "xv_cross_owner_guard_rpcs", "dlm_token_grants",
              "slot_ships", "free_shipped_blocks"]
 # The tick ledgers. RESCUES: work a backstop tick found that a wake should
-# have delivered — each stays 0 on a healthy leg (the transport's CQE half is
-# the lost-wake tripwire: completions a tick's own wait left in a CQ that was
-# empty at the park). LATE: completions that landed after a tick's deadline,
-# before the worker's re-check — the kernel's -ETIME says the CQ was empty
-# when the wait gave up, so they are late, never lost; read beside, never a
+# have delivered — each stays 0 on a healthy leg (the transport's two halves
+# are lost-wake tripwires: a park owed a completed wake write no READ had
+# consumed; completions a tick's own wait left in a CQ that was empty at the
+# park). LATE: replies published and completions landed after a tick's park
+# began — their wakes in flight (the kernel's -ETIME says the CQ was empty
+# when the wait gave up), so they are late, never lost; read beside, never a
 # rescue (`bench.zig` `tick_rescue_keys` / `tick_late_keys` name the same).
-TICK_RESCUES = ["transport_park_tick_commit_rescues", "transport_park_tick_cqe_lost_wakes",
+TICK_RESCUES = ["transport_park_tick_commit_lost_wakes", "transport_park_tick_cqe_lost_wakes",
                 "journal_lane_park_tick_rescues", "meta_conveyor_park_tick_rescues",
                 "block_free_reclaim_park_tick_wakes", "exec_lane_tick_rescues",
                 "lock_ticked_reregisters", "channel_ticked_reregisters",
                 "write_pipeline_admission_tick_wakes"]
-TICK_LATE = ["transport_park_tick_late_cqes"]
+TICK_LATE = ["transport_park_tick_late_commits", "transport_park_tick_late_cqes"]
 MUST_STAY_0 = ["invariant_tripwires", "tripwire_sites_overflow", "meta_io_unaligned_refusals",
                "meta_io_buffered_fallback", "fuse_replies_synthesized", "fuse_reply_twice",
                "fuse_replies_oversize", "ipc_sessions_poisoned", "journal_lane_write_failures",

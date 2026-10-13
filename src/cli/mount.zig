@@ -781,7 +781,7 @@ fn mountMain(ctx: *Ctx) u8 {
     const failed = be.isFailed();
     const stranded = counters.tripwireCount("open_count_stranded");
     const abandoned = transport.slot.requests_abandoned.load();
-    log.info("teardown: session closed; open_count_stranded={d} transport_requests_abandoned={d} tick_commit_rescues={d} tick_cqe_lost_wakes={d} tick_late_cqes={d}", .{ stranded, abandoned, transport.worker.park_tick_commit_rescues.load(), transport.worker.park_tick_cqe_lost_wakes.load(), transport.worker.park_tick_late_cqes.load() });
+    log.info("teardown: session closed; open_count_stranded={d} transport_requests_abandoned={d} tick_commit_lost_wakes={d} tick_cqe_lost_wakes={d} tick_late_commits={d} tick_late_cqes={d}", .{ stranded, abandoned, transport.worker.park_tick_commit_lost_wakes.load(), transport.worker.park_tick_cqe_lost_wakes.load(), transport.worker.park_tick_late_commits.load(), transport.worker.park_tick_late_cqes.load() });
     session_live = false;
     vs.renderer.sources.session = null;
     session.deinit();

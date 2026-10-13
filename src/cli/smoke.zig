@@ -811,7 +811,7 @@ test "smoke: format → mount → the POSIX pass through the shell → umount �
         try testing.expect(std.mem.indexOf(u8, tail, "stats mem_budget: {") != null);
         try testing.expect(std.mem.indexOf(u8, tail, "\"transport_requests_abandoned\":0,") != null);
         try testing.expect(std.mem.indexOf(u8, tail, "\"open_count_stranded\":0,") != null);
-        try testing.expect(std.mem.indexOf(u8, tail, "\"transport_park_tick_commit_rescues\":0,") != null);
+        try testing.expect(std.mem.indexOf(u8, tail, "\"transport_park_tick_commit_lost_wakes\":0,") != null);
         try testing.expect(std.mem.indexOf(u8, tail, "\"transport_park_tick_cqe_lost_wakes\":0,") != null);
         try testing.expect(std.mem.indexOf(u8, tail, "\"exec_lane_tick_rescues\":0,") != null);
         try testing.expect((numberAfter(tail, "\"fuse_write_no_data_volume_refused\":") orelse 0) >= 1);
@@ -857,7 +857,7 @@ test "smoke: format → mount → the POSIX pass through the shell → umount �
         try testing.expect(std.mem.indexOf(u8, text[ready_at..], "stop requested (SIGTERM/SIGINT): unmounting") != null);
         try testing.expect(std.mem.indexOf(u8, text[ready_at..], "the FUSE session ended") == null);
         try testing.expect(std.mem.indexOf(u8, text[ready_at..], "clean unmount") != null);
-        try testing.expect(std.mem.indexOf(u8, text[ready_at..], "open_count_stranded=0 transport_requests_abandoned=0 tick_commit_rescues=0 tick_cqe_lost_wakes=0 ") != null);
+        try testing.expect(std.mem.indexOf(u8, text[ready_at..], "open_count_stranded=0 transport_requests_abandoned=0 tick_commit_lost_wakes=0 tick_cqe_lost_wakes=0 ") != null);
     }
     const mark2 = try rig.logLen();
     try rig.spawnMount(&.{});
@@ -5797,9 +5797,10 @@ fn mbPerS(out: []const u8, key: []const u8, bytes: u64) u64 {
 const must_stay_zero = [_][]const u8{
     "\"transport_requests_abandoned\":",
     "\"open_count_stranded\":",
-    "\"transport_park_tick_commit_rescues\":",
-    // The CQE half's TRIPWIRE only: `transport_park_tick_late_cqes` counts
-    // completions that landed after a tick's deadline (late, not a fault).
+    // The commit and CQE halves' TRIPWIRES only: `transport_park_tick_late_
+    // commits` / `_late_cqes` count replies and completions that arrived
+    // after a tick's deadline (late, not a fault).
+    "\"transport_park_tick_commit_lost_wakes\":",
     "\"transport_park_tick_cqe_lost_wakes\":",
     "\"exec_lane_tick_rescues\":",
     "\"lock_ticked_reregisters\":",

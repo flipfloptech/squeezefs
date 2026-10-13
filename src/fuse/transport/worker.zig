@@ -109,8 +109,6 @@ pub const SqzIo = exec.SqzIo;
 /// min while every worker slept in cq-wait, generic/795); idle workers keep
 /// the zero-cost unbounded park.
 pub const PARK_BACKSTOP_NS: u64 = 100 * std.time.ns_per_ms;
-/// The attribution WARN rate limit for a tick rescue (per worker).
-pub const RESCUE_LOG_INTERVAL_S: u64 = 60;
 /// The whole-group wait for live leases at the drain (was 1 ms…100 ms PER
 /// ENT in series = 3.2 s at depth 32).
 pub const DRAIN_LEASE_BUDGET_NS: u64 = 100 * std.time.ns_per_ms;
@@ -190,9 +188,19 @@ pub var dispatch_refused: counters.ShardedCounter = .{};
 /// `transport_park_backstop_ticks`: bounded parks that ticked out
 /// (non-zero under traffic = the backstop WORKING).
 pub var park_backstop_ticks: counters.ShardedCounter = .{};
-/// `transport_park_tick_commit_rescues` (≈ 0): messages pumped by the pass
-/// after a tick with no wake delivered.
-pub var park_tick_commit_rescues: counters.ShardedCounter = .{};
+/// `transport_park_tick_commit_lost_wakes` (must-stay-0): a backstop tick
+/// whose park was OWED a wake — an arm winner's eventfd write had completed
+/// and no reaped READ had consumed it, the READ standing (`wakeOwed`, read
+/// before the park) — on a `DEFER_TASKRUN` ring, where the standing READ's
+/// completion runs inside the worker's own wait: the kernel's wait timed
+/// out on a wake it held. The reply that wake announced is the tick's.
+pub var park_tick_commit_lost_wakes: counters.Tripwire = .init("transport_park_tick_commit_lost_wakes");
+/// `transport_park_tick_late_commits`: messages the pass after a tick
+/// pumped with no wake CQE reaped, when the park was owed none — published
+/// after the park began (between the post-tick reap and the pump, or a
+/// producer descheduled between its push and its write): their wakes are
+/// in flight, late, never lost, not a fault.
+pub var park_tick_late_commits: counters.ShardedCounter = .{};
 /// `transport_park_tick_cqe_lost_wakes` (must-stay-0): a backstop tick
 /// whose re-check — the CQ read at the verdict, before any further enter —
 /// finds completions no wake announced while the CQ was empty at the park,
@@ -742,11 +750,13 @@ pub const Group = struct {
     // ---- pass state (worker thread only) ----
     wake_cqe_seen: bool = false,
     tick_rescue_pending: bool = false,
+    /// The tick classed its park's owed wake lost (the next pass's pump
+    /// counts nothing late).
+    tick_commit_lost: bool = false,
     /// The tick's re-check classed this many CQEs lost (the reap after the
     /// tick counts only the rest late).
     tick_lost_cqes: u32 = 0,
     commits_pushed: u32 = 0,
-    rescue_log_last_s: u64 = 0,
     cq_overflow_seen: u32 = 0,
     disconnected: bool = false,
     protocol_rejected: bool = false,
@@ -1964,11 +1974,10 @@ pub const Group = struct {
             //     bridge is pending or a fused frame waits.
             const owed = self.owedCount();
             const backstop: ?u64 = if (owed > 0 or self.deadlines.outstanding > 0 or !self.fused.isEmpty() or !armed) PARK_BACKSTOP_NS else null;
-            // 11. Rescue ledger, commit half.
-            if (after_tick and pass_msgs > 0 and !tick_wake_seen) {
-                park_tick_commit_rescues.add(pass_msgs);
-                self.rescueWarn("commit", pass_msgs);
-            }
+            // 11. The tick ledger, commit half: the lost wake fired at the
+            //     verdict; what else the pump found arrived late.
+            if (after_tick and pass_msgs > 0 and !tick_wake_seen and !self.tick_commit_lost) park_tick_late_commits.add(pass_msgs);
+            self.tick_commit_lost = false;
             // 12. Work in hand ⇒ a non-blocking flush and loop.
             var retry_left: ?u64 = null;
             for (self.members) |*m| if (m.slots.nextRetryDeadline()) |d| {
@@ -1982,14 +1991,18 @@ pub const Group = struct {
                 var bound: ?u64 = backstop;
                 if (retry_left) |r| bound = if (bound) |b| @min(b, r) else r;
                 const cq_at_park = self.ring.cqReady();
+                const owed_at_park = self.ring.wakeOwed();
                 const verdict = self.park(bound);
                 if (verdict == .tick and backstop != null and (retry_left == null or backstop.? <= retry_left.?)) {
                     park_backstop_ticks.inc();
                     self.tick_rescue_pending = true;
+                    const cq_exact = self.ring.ring.flags & linux.IORING_SETUP_DEFER_TASKRUN != 0;
                     // The re-check first: nothing may enter between the
                     // verdict and this read.
-                    self.tick_lost_cqes = tickLostCqes(self.ring.ring.flags & linux.IORING_SETUP_DEFER_TASKRUN != 0, cq_at_park, self.ring.cqReady());
+                    self.tick_lost_cqes = tickLostCqes(cq_exact, cq_at_park, self.ring.cqReady());
                     if (self.tick_lost_cqes > 0) park_tick_cqe_lost_wakes.fire("a backstop tick's wait gave up (-ETIME) with completions in the CQ it had found empty at the park");
+                    self.tick_commit_lost = cq_exact and owed_at_park;
+                    if (self.tick_commit_lost) park_tick_commit_lost_wakes.fire("a backstop tick's wait gave up (-ETIME) holding a completed wake write no READ had consumed");
                     self.tickAwaitSeam();
                 }
             }
@@ -2046,13 +2059,6 @@ pub const Group = struct {
     /// classed lost there.
     fn tickLostCqes(cq_exact: bool, cq_at_park: u32, cq_at_verdict: u32) u32 {
         return if (cq_exact and cq_at_park == 0) cq_at_verdict else 0;
-    }
-
-    fn rescueWarn(self: *Group, what: []const u8, n: u32) void {
-        const now_s = clock.realtimeCoarseS();
-        if (now_s -| self.rescue_log_last_s < RESCUE_LOG_INTERVAL_S) return;
-        self.rescue_log_last_s = now_s;
-        log.warn("transport: group {d}: the 100 ms park backstop rescued {d} {s}(s) with no wake delivered — a lost wake in the chain (counted transport_park_tick_{s}_rescues)", .{ self.index, n, what, what });
     }
 
     /// The eager non-blocking GETEVENTS flush (a `DEFER_TASKRUN` ring runs

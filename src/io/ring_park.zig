@@ -78,12 +78,17 @@ pub const InitError = error{ OutOfMemory, RingSetupFailed };
 pub const Wake = struct {
     fd: linux.fd_t,
     coalescer: *nd.WakeCoalescer,
+    /// The arm winners' COMPLETED eventfd writes (`Parked.written`).
+    written: *std.atomic.Value(u64),
 
     /// True ⇒ this call paid the eventfd write; false ⇒ elided (a wake is
     /// already pending and its consumer will scan after this caller's push).
     pub fn wake(self: Wake) bool {
         if (!self.coalescer.arm()) return false;
         writeEventfd(self.fd);
+        // seq_cst AFTER the write returned: a lane reading the count before
+        // its park knows these writes landed in the eventfd (`wakeOwed`).
+        _ = self.written.fetchAdd(1, .seq_cst);
         return true;
     }
 
@@ -127,6 +132,11 @@ pub fn Parked(comptime F: type) type {
         /// owner moves this struct between `init` and the first park.
         wake_buf: *u64,
         coalescer: nd.WakeCoalescer = .{},
+        /// The arm winners' completed eventfd writes (any thread; `Wake`).
+        written: std.atomic.Value(u64) = .init(0),
+        /// The eventfd counts the wake READs this lane reaped consumed
+        /// (owner thread only; `consumeWake`).
+        consumed: u64 = 0,
         wake_armed: bool = false,
         /// A wake CQE was reaped and not yet disarmed (`service` closes it).
         wake_consumed: bool = false,
@@ -207,7 +217,18 @@ pub fn Parked(comptime F: type) type {
         }
 
         pub fn wakeHandle(self: *Self) Wake {
-            return .{ .fd = self.event_fd, .coalescer = &self.coalescer };
+            return .{ .fd = self.event_fd, .coalescer = &self.coalescer, .written = &self.written };
+        }
+
+        /// Read before a park: a wake is OWED to it — an arm winner's eventfd
+        /// write completed (`written`, counted after the write returned) that
+        /// no reaped READ consumed yet, with the READ standing. Its count sits
+        /// in the eventfd (the standing READ completes inside the wait) or in
+        /// a READ's CQE not yet reaped (the CQ is not empty): either way the
+        /// wait cannot time out. `force` writes go uncounted (a READ that
+        /// consumed one only lowers the verdict — never a false owed).
+        pub fn wakeOwed(self: *const Self) bool {
+            return self.wake_armed and !self.dead and self.written.load(.seq_cst) > self.consumed;
         }
 
         /// `wakeHandle().wake()` from the owner's own API face.
@@ -345,6 +366,8 @@ pub fn Parked(comptime F: type) type {
         /// owner skips it), false ⇒ it is the owner's.
         pub fn consumeWake(self: *Self, cqe: Cqe) bool {
             if (cqe.user_data != wake_ud) return false;
+            // A completed READ of the eventfd took its whole count.
+            if (cqe.res == @sizeOf(u64)) self.consumed += self.wake_buf.*;
             self.wake_consumed = true;
             self.wake_armed = false;
             return true;
@@ -493,6 +516,32 @@ test "a timed park returns .tick when nothing completes; a wake from another thr
     try testing.expect(pr.consumeWake(cqes[0]));
     try testing.expect(pr.service());
     // Unarmed at teardown: nothing to cancel.
+}
+
+test "wakeOwed: a completed arm-winning write no reaped READ consumed is owed to the next park (the park returns .event, never .tick); the READ's count clears it; a forced write is never counted owed; an unarmed READ owes nothing" {
+    var pr = try ParkedRing.init(testing.allocator, 8, 0);
+    defer pr.deinit();
+    try testing.expect(!pr.wakeOwed()); // nothing armed
+    try testing.expect(pr.armWake());
+    try testing.expect(!pr.wakeOwed());
+    try testing.expect(pr.wake());
+    try testing.expect(pr.wakeOwed());
+    try testing.expectEqual(Verdict.event, pr.park(10 * std.time.ns_per_s));
+    var cqes: [4]linux.io_uring_cqe = undefined;
+    try testing.expectEqual(@as(u32, 1), try pr.ring.copy_cqes(&cqes, 0));
+    try testing.expect(pr.consumeWake(cqes[0]));
+    try testing.expect(!pr.wakeOwed()); // consumed (and the READ no longer stands)
+    try testing.expect(pr.service());
+    try testing.expect(pr.armWake());
+    try testing.expect(!pr.wakeOwed());
+    // A forced write lands uncounted: its READ raises `consumed` past `written`.
+    pr.forceWake();
+    try testing.expect(!pr.wakeOwed());
+    try testing.expectEqual(Verdict.event, pr.park(10 * std.time.ns_per_s));
+    try testing.expectEqual(@as(u32, 1), try pr.ring.copy_cqes(&cqes, 0));
+    try testing.expect(pr.consumeWake(cqes[0]));
+    try testing.expect(pr.consumed > pr.written.load(.acquire));
+    try testing.expect(!pr.wakeOwed());
 }
 
 test "an owner's SQE completes through the park beside the standing wake READ; deinit cancels an armed READ cleanly" {

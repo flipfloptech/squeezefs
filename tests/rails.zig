@@ -1014,10 +1014,10 @@ test "bracket ledger pin: bench.zig's device-write, request, admission, read-cop
         .{ .label = "DEVICE_READ_ARMS", .ours = &bench.StatsTerms.device_read_keys },
         // The META device's two write arms (decision 0003 §L).
         .{ .label = "META_WRITE_ARMS", .ours = &bench.StatsTerms.meta_write_keys },
-        // The tick ledgers: the rescues (the transport's CQE lost-wake
-        // tripwire among them) and the late arrivals read beside.
+        // The tick ledgers: the rescues (the transport's commit and CQE
+        // lost-wake tripwires among them) and the late arrivals read beside.
         .{ .label = "TICK_RESCUES", .ours = &bench.StatsTerms.tick_rescue_keys },
-        .{ .label = "TICK_LATE", .ours = &bench.StatsTerms.tick_late_keys, .min = 1 },
+        .{ .label = "TICK_LATE", .ours = &bench.StatsTerms.tick_late_keys },
     };
     for (pins) |p| {
         const theirs = try pyListNames(gpa, text, p.label);

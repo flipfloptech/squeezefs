@@ -10,6 +10,7 @@ const builtin = @import("builtin");
 const linux = std.os.linux;
 const errors = @import("../core/errors.zig");
 const log = @import("../core/log.zig");
+const clock = @import("../core/clock.zig");
 const thread_name = @import("../core/thread_name.zig");
 const futex = @import("../sync/futex.zig");
 const verbs = @import("verbs.zig");
@@ -159,6 +160,68 @@ test "tcp e2e: a listener and two dialers run 10k verbs pipelined on two connect
     // Still exactly two connections: K in flight costs ONE connection.
     try testing.expectEqual(@as(u32, 2), l.liveConnections());
     try testing.expect(!c1.mux.?.deadOnArrival());
+}
+
+/// The retire station's rendezvous: the retiring thread parks at
+/// `decremented` until the test has stopped (and freed) the listener.
+const RetireRendezvous = struct {
+    /// 0 idle → 1 decremented → 2 released → 3 retired.
+    phase: futex.Word = .init(0),
+
+    /// A bound on every wait here: the connection's handshake gives up on
+    /// a closed peer at once; ten dial bounds is a wedge, never a schedule.
+    const BOUND_NS: u64 = 10 * @as(u64, session.DIAL_TIMEOUT_MS) * std.time.ns_per_ms;
+
+    fn station(self: *RetireRendezvous) listener.Listener.RetireStation {
+        return .{ .ctx = self, .decremented = &decremented, .retired = &retired };
+    }
+
+    fn decremented(ctx: *anyopaque) void {
+        const self: *RetireRendezvous = @ptrCast(@alignCast(ctx));
+        self.advance(1);
+        _ = self.awaitPhase(2);
+    }
+
+    fn retired(ctx: *anyopaque) void {
+        const self: *RetireRendezvous = @ptrCast(@alignCast(ctx));
+        self.advance(3);
+    }
+
+    fn advance(self: *RetireRendezvous, to: u32) void {
+        self.phase.store(to, .release);
+        futex.wakeAll(&self.phase);
+    }
+
+    /// Park until the phase reaches `at`, bounded; false on the bound.
+    fn awaitPhase(self: *RetireRendezvous, at: u32) bool {
+        const deadline = clock.monotonicNs() + BOUND_NS;
+        while (true) {
+            const p = self.phase.load(.acquire);
+            if (p >= at) return true;
+            const now = clock.monotonicNs();
+            if (now >= deadline) return false;
+            _ = futex.waitTimeout(&self.phase, p, deadline - now);
+        }
+    }
+};
+
+test "tcp e2e: a connection retiring while the listener stops reads nothing of the freed listener — the retire's station holds the thread past its decrement until `stop` has freed the listener; the live gauge reads 0, never the freed bytes" {
+    var svc: service.Service = .init;
+    const l = try startListener(&svc);
+    var rv: RetireRendezvous = .{};
+    l.retire_station = rv.station();
+    // A peer that connects and leaves before the handshake: its connection
+    // thread retires.
+    const addr = l.advertised.toIp().?;
+    const s = try std.Io.net.IpAddress.connect(&addr, testing.io, .{ .mode = .stream });
+    s.close(testing.io);
+    try testing.expect(rv.awaitPhase(1));
+    // live is 0: the stop frees the listener while the retiring thread is
+    // parked past its decrement.
+    l.stop();
+    rv.advance(2);
+    try testing.expect(rv.awaitPhase(3));
+    try testing.expectEqual(@as(u64, 0), stats.cluster_wire_live_connections.load());
 }
 
 test "tcp e2e: a severed connection surfaces HolderUnreachable (EAGAIN) to the caller whose reply was lost, poisons the session, and the client re-dials on its next call" {

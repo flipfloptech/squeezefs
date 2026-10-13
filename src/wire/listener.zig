@@ -171,6 +171,7 @@ pub const Listener = struct {
     /// after `start` by the owner; read with acquire at each departure
     /// (pairs with `bindDeparture`'s release store).
     departure: std.atomic.Value(?*const Departure) = .init(null),
+    retire_station: ?RetireStation = null,
 
     pub const Departure = struct {
         ctx: *anyopaque,
@@ -180,6 +181,17 @@ pub const Listener = struct {
     pub fn bindDeparture(self: *Listener, d: ?*const Departure) void {
         self.departure.store(d, .release);
     }
+
+    /// The retire's station seam (null in the product; set before the first
+    /// connection): `decremented` runs on the retiring thread right after
+    /// its decrement — from there a concurrent `stop` may free this
+    /// listener — and `retired` after its last act. The use-after-free
+    /// pin's rendezvous.
+    pub const RetireStation = struct {
+        ctx: *anyopaque,
+        decremented: *const fn (ctx: *anyopaque) void,
+        retired: *const fn (ctx: *anyopaque) void,
+    };
 
     /// Bind and start accepting. `bind` is the ONE bind knob's posture.
     pub fn start(gpa: std.mem.Allocator, io: Io, bind: endpoint.Bind, svc: *service.Service, secret: auth.Secret, opts: Options) StartError!*Listener {
@@ -283,9 +295,12 @@ pub const Listener = struct {
     }
 
     fn retire(self: *Listener) void {
+        const station = self.retire_station;
         _ = self.live.fetchSub(1, .acq_rel);
+        if (station) |st| st.decremented(st.ctx);
         stats.cluster_wire_live_connections.set(self.live.load(.acquire));
         futex.wakeAll(&self.live);
+        if (station) |st| st.retired(st.ctx);
     }
 
     fn acceptMain(self: *Listener) void {

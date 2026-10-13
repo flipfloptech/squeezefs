@@ -69,7 +69,7 @@ pub const PlanRefusal = union(enum) {
         switch (self) {
             .invalid_node_size => |n| try w.print("invalid node_size {d}: must be a 4 KiB multiple in [65536, 1048576]", .{n}),
             .invalid_journal_override => |o| try w.print("journal ring override {d} bytes is invalid: must be a 4 KiB multiple of at least {d} bytes (reserve + one max entry{s})", .{ o.len, o.floor, if (o.floor != journal_override_floor) " + appender 0's four page slots" else "" }),
-            .volume_too_small => |v| try w.print("metadata volume too small for format v4: {d} bytes leaves {d} heap extents of {d} bytes after the fixed structures (superblock + ledger + {d}-byte journal + bitmap end at {d}); at least {d} extents are required — grow the volume or pass a smaller --meta-journal-mb / --meta-node-kib", .{ v.volume_len, v.total, v.node_size, v.journal_len, v.heap_start, v.min }),
+            .volume_too_small => |v| try w.print("metadata volume too small for format v{d}: {d} bytes leaves {d} heap extents of {d} bytes after the fixed structures (superblock + ledger + {d}-byte journal + bitmap end at {d}); at least {d} extents are required — grow the volume or pass a smaller --meta-journal-mb / --meta-node-kib", .{ superblock.version_v5, v.volume_len, v.total, v.node_size, v.journal_len, v.heap_start, v.min }),
         }
     }
 };
@@ -392,7 +392,7 @@ test "plan: default = the clamp (8 MiB on 64 MiB); an override is honoured; SB|l
     var buf: [512]u8 = undefined;
     try testing.expectError(error.VolumeTooSmall, plan(4 * MiB, 65536, null, test_uuid, test_set, .single_writer, &diag));
     // 4 MiB: journal 8 MiB already exceeds the volume ⇒ 0 extents, min 12.
-    try testing.expectEqualStrings("metadata volume too small for format v4: 4194304 bytes leaves 0 heap extents of 65536 bytes after the fixed structures (superblock + ledger + 8388608-byte journal + bitmap end at 8585216); at least 12 extents are required — grow the volume or pass a smaller --meta-journal-mb / --meta-node-kib", planMsg(&buf, diag));
+    try testing.expectEqualStrings("metadata volume too small for format v5: 4194304 bytes leaves 0 heap extents of 65536 bytes after the fixed structures (superblock + ledger + 8388608-byte journal + bitmap end at 8585216); at least 12 extents are required — grow the volume or pass a smaller --meta-journal-mb / --meta-node-kib", planMsg(&buf, diag));
     // The override floor and alignment.
     _ = try plan(64 * MiB, 65536, journal_override_floor, test_uuid, test_set, .single_writer, &diag);
     _ = try plan(64 * MiB, 65536, journal_override_floor + appender0_reserved_bytes, test_uuid, test_set, .symmetric, &diag);

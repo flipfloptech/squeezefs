@@ -1,9 +1,9 @@
-//! `squeezefs format` (charter §8; §5.1 the v4 image; §6.5 the transform
+//! `squeezefs format` (charter §8; §5.1 the v5 image; §6.5 the transform
 //! declared at format; `docs/porting/kv_alloc_superblock.md` §2.2–§2.4;
 //! `docs/porting/data_transform_config.md` §5.6 f): the set format. Linux
 //! only.
 //!
-//! ONE OR MORE metadata volumes as a v4 set (decision 0003 Q2; charter
+//! ONE OR MORE metadata volumes as a v5 set (decision 0003 Q2, §M; charter
 //! §5.4: member `p` of `n` stamps the stride run `{p, n, ceil((W − p)/n)}`
 //! — the identity distribution, one run per member; member 0 hosts slot
 //! 0's native keyspace and the `set_config` record; the SYMMETRIC plane is
@@ -381,7 +381,7 @@ pub fn run(p: cli.Process, f: args.Format) u8 {
 
     // The summary.
     const vlen = device_loader.volumeLength(path) catch 0;
-    p.stdout.print("formatted {s}: SqueezeFS format v4, {d}-member set ({s}), member 0 {d} B, node {d} B, journal {s}, root owner {d}:{d}\n", .{
+    p.stdout.print("formatted {s}: " ++ format_banner ++ ", {d}-member set ({s}), member 0 {d} B, node {d} B, journal {s}, root owner {d}:{d}\n", .{
         f.meta_uri,
         meta.paths.len,
         if (f.single_writer) "--single-writer: the flat class, no appender region" else "the symmetric plane: SYMMETRIC_PLANE stamped, the appender directory and appender 0's page written",
@@ -397,10 +397,15 @@ pub fn run(p: cli.Process, f: args.Format) u8 {
     return cli.exit_ok;
 }
 
+/// The metadata format this binary writes, named from the superblock's
+/// version word (the summary said "v4" through the v5 act, decision 0003 §M).
+const format_name = std.fmt.comptimePrint("format v{d}", .{superblock.version_v5});
+const format_banner = "SqueezeFS " ++ format_name;
+
 fn formatErrorText(e: backend.FormatError) []const u8 {
     return switch (e) {
         error.DeviceRefused => "the device refused registration (O_DIRECT posture) or does not exist",
-        error.VolumeTooSmall => "the volume is too small for format v4 (see the log for the geometry)",
+        error.VolumeTooSmall => "the volume is too small for " ++ format_name ++ " (see the log for the geometry)",
         error.InvalidNodeSize => "invalid node size",
         error.InvalidJournalOverride => "invalid --meta-journal-mb (below the floor — 384 KiB, plus 16 KiB for appender 0's page slots on the symmetric class — or not a 4 KiB multiple)",
         error.CannotStat, error.NotADeviceOrFile => "not a regular file or block device",
@@ -415,6 +420,12 @@ fn formatErrorText(e: backend.FormatError) []const u8 {
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
+
+test "the summary and the too-small refusal name the format version the superblock writes (v5 since sqzhash128, never the stale v4)" {
+    try testing.expectEqual(@as(u16, 5), superblock.version_v5);
+    try testing.expectEqualStrings("SqueezeFS format v5", format_banner);
+    try testing.expectEqualStrings("the volume is too small for format v5 (see the log for the geometry)", formatErrorText(error.VolumeTooSmall));
+}
 
 test "the force gate: Blank formats; formatted/legacy/refused need --force and say so" {
     var buf: [512]u8 = undefined;

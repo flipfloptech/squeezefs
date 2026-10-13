@@ -47,7 +47,9 @@ up() {
   # and every e2e test skips its venue.
   local ext_mount=()
   if [ -d "$EXT_DIR" ]; then ext_mount=(--mount "type=virtiofs,source=$EXT_DIR,target=/build/ext"); fi
-  container run -d --name "$NAME" -c "$CPUS" -m "$MEM" \
+  # --init: PID 1 reaps orphans (with `sleep infinity` as PID 1 the venue piled
+  # up ~890 zombies from exited supervisors and test helpers).
+  container run -d --init --name "$NAME" -c "$CPUS" -m "$MEM" \
     --cap-add CAP_IPC_LOCK --cap-add CAP_SYS_ADMIN --ulimit memlock=-1:-1 \
     "${ext_mount[@]}" \
     --mount "type=virtiofs,source=$REPO,target=$REPO" \

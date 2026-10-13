@@ -95,7 +95,8 @@ if ! exists; then
     container)
       # CAP_SYS_ADMIN: mount(2) and the fuse.enable_uring write. CAP_IPC_LOCK +
       # unlimited memlock: io_uring fixed buffers pin pages (REGISTER_BUFFERS).
-      container run -d --name "$NAME" -c "$CPUS" -m "$MEM" \
+      # --init: PID 1 reaps the exited supervisors (sleep infinity never does).
+      container run -d --init --name "$NAME" -c "$CPUS" -m "$MEM" \
         --cap-add CAP_IPC_LOCK --cap-add CAP_SYS_ADMIN --ulimit memlock=-1:-1 \
         --mount "type=virtiofs,source=$REPO,target=$REPO" \
         -v "$VOL:/build" \

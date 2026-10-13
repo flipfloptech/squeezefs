@@ -444,12 +444,47 @@ pub fn Plane(comptime Store: type) type {
                     else => pushInode(&inodes, &ni, s.homeIno()),
                 }
             }
-            return guards.acquire(self.gpa, self.io, self.locks, self.tables(), .{ .own_id = self.own_id, .volume = self.volume, .scope = scope, .inodes = inodes[0..ni], .dentries = dents[0..nd], .discovery = discovery }) catch |e| switch (e) {
-                error.OutOfMemory => error.OutOfMemory,
-                error.PlanTooLarge => error.PlanTooLarge,
-                error.GuardRefused, error.StaleHolderView => error.GuardRefused,
-                error.HolderUnreachable => error.ShipFailed,
-            };
+            // A DEAD or stale view of a key's holder re-resolves the plan's
+            // foreign slots before the guards are given up, ≤
+            // `SLOT_MOVED_RETRIES` (the guards' half of §Q.16 — 0003 §X.8:
+            // the dead holder was asked for the lattice's whole deadline); a
+            // refusal or a lost ask at the holder the view names is asked
+            // again only where the re-resolve names another holder.
+            var tries: u32 = 0;
+            while (true) : (tries += 1) {
+                if (guards.acquire(self.gpa, self.io, self.locks, self.tables(), .{ .own_id = self.own_id, .volume = self.volume, .scope = scope, .inodes = inodes[0..ni], .dentries = dents[0..nd], .discovery = discovery })) |t| return t else |e| {
+                    const given_up: Error = switch (e) {
+                        error.OutOfMemory => return error.OutOfMemory,
+                        error.PlanTooLarge => return error.PlanTooLarge,
+                        error.GuardRefused, error.StaleHolderView => error.GuardRefused,
+                        error.HolderUnreachable => error.ShipFailed,
+                    };
+                    if (tries == SLOT_MOVED_RETRIES) return given_up;
+                    const moved = self.refreshGuardHomes(inodes[0..ni], dents[0..nd]);
+                    if (!moved and e == error.GuardRefused) return given_up;
+                }
+            }
+        }
+
+        /// Re-resolve every foreign slot of a plan's guard keys at the
+        /// manager; answers whether any names another home than the view.
+        fn refreshGuardHomes(self: *Self, inodes: []const dlm.InodeReq, dents: []const dlm.DentryReq) bool {
+            guards.stats.xv_cross_owner_guard_stale_reresolves.inc();
+            var seen: [dlm.wide_requests * 2]u16 = undefined;
+            var n: usize = 0;
+            var moved = false;
+            for (inodes) |r| moved = self.refreshGuardSlot(route_table.slotOf(r.ino), &seen, &n) or moved;
+            for (dents) |r| moved = self.refreshGuardSlot(route_table.slotOf(r.parent), &seen, &n) or moved;
+            return moved;
+        }
+
+        fn refreshGuardSlot(self: *Self, slot: u16, seen: []u16, n: *usize) bool {
+            for (seen[0..n.*]) |s| if (s == slot) return false;
+            seen[n.*] = slot;
+            n.* += 1;
+            const before = self.resolver.homeOf(self.resolver.ctx, slot);
+            if (before == .local) return false;
+            return !sameHome(before, self.resolver.refresh(self.resolver.ctx, slot));
         }
 
         fn pushInode(buf: []dlm.InodeReq, n: *usize, ino: u64) void {

@@ -791,21 +791,13 @@ pub const Worker = struct {
                     return .abandoned;
                 },
             };
-            if (task_ns > 0) {
-                var n = self.wake.notified();
-                _ = n.waitUntilUncancelable(self.io, clock.monotonicNs() + task_ns);
-            }
+            if (task_ns > 0) self.parkUnlessStopped(clock.monotonicNs() + task_ns);
             if (self.stop.load(.acquire)) {
                 _ = try self.caller.call(self.caller.ctx, .{ .shard_abandon = .{ .ref = ref, .reason = @backingInt(frames.AbandonReason.stopped), .reserved = @splat(0) } });
                 return .abandoned;
             }
         }
-        if (self.hold_submission) {
-            self.held.store(true, .release);
-            var n = self.release_hold.notified();
-            n.waitUncancelable(self.io);
-            self.held.store(false, .release);
-        }
+        if (self.hold_submission) self.holdForRelease();
         if (clock.monotonicNs() >= deadline) {
             _ = try self.caller.call(self.caller.ctx, .{ .shard_abandon = .{ .ref = ref, .reason = @backingInt(frames.AbandonReason.lease_expired), .reserved = @splat(0) } });
             return .abandoned;
@@ -847,12 +839,7 @@ pub const Worker = struct {
         hb_task.cancel(self.io);
         self.heartbeats += hb.beats;
         defer if (payload) |p| self.gpa.free(p);
-        if (self.hold_submission) {
-            self.held.store(true, .release);
-            var n = self.release_hold.notified();
-            n.waitUncancelable(self.io);
-            self.held.store(false, .release);
-        }
+        if (self.hold_submission) self.holdForRelease();
         if (payload == null or hb.cancel.load(.acquire) or clock.monotonicNs() >= hb.deadline_ns.load(.acquire) or self.stop.load(.acquire)) {
             // Expired, stopped, or the engine failed: abandon, never a
             // proposal under a lease this worker cannot vouch for.
@@ -906,8 +893,16 @@ pub const Worker = struct {
         fn run(self: *Heartbeat) void {
             const w = self.worker;
             const period_ns = @as(u64, w.heartbeat_ms) * std.time.ns_per_ms;
-            while (!self.stop.load(.acquire)) {
+            while (true) {
                 var n = self.wake.notified();
+                // Registered BEFORE the stop is re-read (`sync/notify.zig`'s
+                // law): a `stopRequested` from here on bumps this waiter's
+                // epoch, so the park below ends on it.
+                _ = n.enable(w.io);
+                if (self.stop.load(.acquire)) {
+                    n.cancel(w.io);
+                    return;
+                }
                 if (w.heartbeat_station) |s| s.parking(s.ctx, &self.wake, &self.stop);
                 _ = n.waitUntilUncancelable(w.io, clock.monotonicNs() + period_ns);
                 if (self.stop.load(.acquire)) return;
@@ -949,11 +944,33 @@ pub const Worker = struct {
     pub fn serve(self: *Worker) WorkerError!void {
         while (!self.stop.load(.acquire)) {
             const r = try self.pullOnce();
-            if (r == .none) {
-                var n = self.wake.notified();
-                _ = n.waitUntilUncancelable(self.io, clock.monotonicNs() + @as(u64, self.heartbeat_ms) * std.time.ns_per_ms / 4);
-            }
+            if (r == .none) self.parkUnlessStopped(clock.monotonicNs() + @as(u64, self.heartbeat_ms) * std.time.ns_per_ms / 4);
         }
+    }
+
+    /// Park on `wake` until `deadline_ns` unless the stop is raised:
+    /// registered before the stop is re-read (`sync/notify.zig`'s law), so
+    /// a `requestStop` landing anywhere ends the park.
+    pub fn parkUnlessStopped(self: *Worker, deadline_ns: u64) void {
+        var n = self.wake.notified();
+        _ = n.enable(self.io);
+        if (self.stop.load(.acquire)) {
+            n.cancel(self.io);
+            return;
+        }
+        _ = n.waitUntilUncancelable(self.io, deadline_ns);
+    }
+
+    /// The zombie-window seam's park: registered on `release_hold` BEFORE
+    /// `held` is published (the test's cue to release) and the stop is
+    /// re-read, so neither the release nor a `requestStop` can land in a
+    /// window the park misses (an unbounded park otherwise).
+    fn holdForRelease(self: *Worker) void {
+        var n = self.release_hold.notified();
+        _ = n.enable(self.io);
+        self.held.store(true, .release);
+        if (self.stop.load(.acquire)) n.cancel(self.io) else n.waitUncancelable(self.io);
+        self.held.store(false, .release);
     }
 
     pub fn requestStop(self: *Worker) void {
@@ -998,6 +1015,14 @@ const ConnCaller = struct {
         return self.conn.call(req);
     }
 };
+
+/// The sweeper's clock two TTLs ahead: every lease the rig holds has
+/// expired there, while a worker's own lease clock runs on the wall from
+/// its assignment (a whole TTL) — a zombie row's window never depends on
+/// the venue's pace.
+fn pastTtl() u64 {
+    return clock.monotonicNs() + 2 * @as(u64, seams.LEASE_TTL_MS) * std.time.ns_per_ms;
+}
 
 const Rig = struct {
     hub: loopback.LoopbackHub,
@@ -1086,7 +1111,7 @@ test "remote worker executes a noop shard end to end over the loopback: enroll (
 test "lease expiry reassigns to the pool and refuses the late submit: a worker held before its submit loses the lease to the sweeper; the job re-queues; the late proposal is refused stale; a fresh pull re-leases at fencing 1" {
     const gpa = testing.allocator;
     const io = testing.io;
-    const r = try Rig.init(gpa, io, 1000);
+    const r = try Rig.init(gpa, io, seams.LEASE_TTL_MS);
     defer r.deinit(gpa);
     _ = try r.worker.enroll();
     const id = try r.fabric.submit(io, .{ .job_type = .noop, .arg0 = 1, .arg1 = 0 });
@@ -1103,7 +1128,7 @@ test "lease expiry reassigns to the pool and refuses the late submit: a worker h
     try testing.expectEqual(@as(u64, 1), r.table.inFlight());
     // Past the TTL the sweeper expires it; the job is Queued for any population.
     const exp0 = stats.job_remote_lease_expiries.load();
-    try testing.expectEqual(@as(usize, 1), r.coord.sweep(clock.monotonicNs() + 2 * std.time.ns_per_s));
+    try testing.expectEqual(@as(usize, 1), r.coord.sweep(pastTtl()));
     try testing.expectEqual(exp0 + 1, stats.job_remote_lease_expiries.load());
     try testing.expectEqual(records.JobState.queued, r.fabric.snapshot(io, id).?.state);
     try testing.expect(!r.fabric.find(id).?.claimed.load(.acquire));

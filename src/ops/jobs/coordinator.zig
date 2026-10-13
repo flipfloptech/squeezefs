@@ -1473,8 +1473,7 @@ pub const Node = struct {
                     log.info("job fabric: this member enrolled at the coordinator as a fleet READ worker (heartbeat {d} ms, lease TTL {d} ms)", .{ en.heartbeat_ms, en.lease_ttl_ms });
                 } else |e| {
                     log.debug("job fabric: fleet enrollment refused ({s}); retrying at the heartbeat cadence", .{@errorName(e)});
-                    var n = w.wake.notified();
-                    _ = n.waitUntilUncancelable(self.io, clock.monotonicNs() + @as(u64, w.heartbeat_ms) * std.time.ns_per_ms);
+                    w.parkUnlessStopped(clock.monotonicNs() + @as(u64, w.heartbeat_ms) * std.time.ns_per_ms);
                     continue;
                 }
             }
@@ -1482,8 +1481,7 @@ pub const Node = struct {
                 if (w.stop.load(.acquire)) break;
                 log.warn("job fabric: the fleet worker's link to the coordinator ended ({s}) after {d} read shard(s); re-enrolling", .{ @errorName(e), w.read_shards_run });
                 enrolled = false;
-                var n = w.wake.notified();
-                _ = n.waitUntilUncancelable(self.io, clock.monotonicNs() + @as(u64, w.heartbeat_ms) * std.time.ns_per_ms);
+                w.parkUnlessStopped(clock.monotonicNs() + @as(u64, w.heartbeat_ms) * std.time.ns_per_ms);
             };
         }
     }

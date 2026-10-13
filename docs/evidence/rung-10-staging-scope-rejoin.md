@@ -174,6 +174,16 @@ read-only mapping; `config set-cache-paths` recognises a cache path holding memb
 - The `.repro` on the fixed binary: the second set's mount refused (rc 1, `StagingOwnerLive`);
   `kill -9` A, remount: "recovered 200 record(s)", 0 of 200 wrong.
 
+## 5. Gates (landing 2: §4, on dev a72b9f2)
+
+- Linux (venue, `zig build gate`): 43/46 steps; 2,710 / 2,777 tests passed, 64 skipped, 3 failed —
+  the three `mem.budget` fleet-share rows (`expected 13743895344, found 6871947672`: the census of
+  the ONE container cgroup counted another agent's `squeezefs-unit` run beside ours, the documented
+  venue artifact). Re-run in a quiet window (no foreign `squeezefs-unit` in `cgroup.procs`): every
+  `mem.budget` row green, 78/78. The rest of unit 2,478 pass / 62 skip; smoke **81 pass / 2 skip**
+  (the member-scope row, the online fsck row with B beside A's live residents, the rejoin row).
+- macOS (`zig build gate`): **28/28 steps; 2,126 / 2,153 passed, 27 skipped**.
+
 ## 6. Owed (stated)
 
 - A dead member's residue whose member scope never mounts again on this host (a joiner moved to

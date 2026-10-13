@@ -198,6 +198,12 @@ pub const LeaseTable = struct {
     /// The manager's lease seq: +1 per release — `last_written`'s clock.
     lease_seq: u64 = 0,
     leased_count: std.atomic.Value(u64) = .init(0),
+    /// Unleased slots whose release kept an offer's stand (a handover's
+    /// accepter not granted yet): the lock-free gate in front of
+    /// `reservedFor`, so a table with none (every joiner's) pays nothing
+    /// on the resolution path. Released by the accepter's grant, a load,
+    /// or the first `reservedFor` that finds the stand over.
+    stands: std.atomic.Value(u32) = .init(0),
     /// The RAM index of tree 0's `slot_tails` (per slot: the release's
     /// generation and every leaf's tail; a release REPLACES the set): the
     /// frame screen's rule 2 input, read on the load miss path.
@@ -321,7 +327,7 @@ pub const LeaseTable = struct {
         const cold = try self.coldOf(slot);
         cold.words = .{ .root = s.root, .cursor = s.cursor, .extents = s.slot_tree_extents, .seq_floor = s.seq_floor };
         cold.last_written = s.last_written;
-        cold.offer_expires_ns = 0;
+        if (prev.state == .unleased and cold.offer_expires_ns != 0) self.dropStand(cold) else cold.offer_expires_ns = 0;
         self.cells[slot].g.store(s.g, .release);
         switch (s.variant) {
             .unleased => self.storeWord(slot, .unleased, MANAGER, false, false),
@@ -362,7 +368,7 @@ pub const LeaseTable = struct {
         const v = self.view(slot);
         if (v.state != .unleased) return .{ .refused = .{ .holder = v.holder, .g = v.g, .state = v.state, .dead = v.dead } };
         const c = try self.coldOf(slot);
-        c.offer_expires_ns = 0;
+        if (c.offer_expires_ns != 0) self.dropStand(c);
         try self.addHeld(holder, slot);
         const g = v.g +% 1;
         self.cells[slot].g.store(g, .release);
@@ -448,11 +454,30 @@ pub const LeaseTable = struct {
     /// requester's OWN ships, served at the releasing holder, used to
     /// first-touch the slot back to the holder and refuse the accept.
     pub fn reservedFor(self: *LeaseTable, slot: u16, now_ns: u64) ?AppenderId {
+        // acquire pairs with the release's increment (made under the lock
+        // after the stand's words): a count of 0 means no stand to read.
+        if (self.stands.load(.acquire) == 0) return null;
         self.lock.lock();
         defer self.lock.unlock();
         if (self.view(slot).state != .unleased) return null;
-        const c = self.cold.get(slot) orelse return null;
-        return if (c.offered_to != 0 and now_ns < c.offer_expires_ns) c.offered_to else null;
+        const c = self.cold.getPtr(slot) orelse return null;
+        if (c.offer_expires_ns == 0) return null;
+        if (now_ns >= c.offer_expires_ns) {
+            self.dropStand(c);
+            return null;
+        }
+        return if (c.offered_to != 0) c.offered_to else null;
+    }
+
+    /// A kept stand ends (under the lock, as every write of the count
+    /// is): its words cleared, the gate's count released — saturating,
+    /// so a stand some other path left on an unleased slot never wraps
+    /// the gate open.
+    fn dropStand(self: *LeaseTable, c: *Cold) void {
+        c.offer_expires_ns = 0;
+        c.offered_to = 0;
+        const n = self.stands.load(.monotonic);
+        if (n != 0) self.stands.store(n - 1, .release);
     }
 
     /// Every offer whose stand ended goes back to `leased` (T3); the
@@ -527,6 +552,7 @@ pub const LeaseTable = struct {
         c.last_written = self.lease_seq;
         c.handover_at_ns = now_ns;
         self.storeWord(slot, .unleased, MANAGER, false, false);
+        if (c.offered_to != 0 and c.offer_expires_ns != 0) _ = self.stands.fetchAdd(1, .release);
         return .released;
     }
 
@@ -551,7 +577,9 @@ pub const LeaseTable = struct {
         defer self.lock.unlock();
         const v = self.view(slot);
         if (v.state != .unleased and v.state != .migrating) self.dropHeld(v.holder, slot);
-        if (self.cold.getPtr(slot)) |c| c.offer_expires_ns = 0;
+        if (self.cold.getPtr(slot)) |c| {
+            if (v.state == .unleased and c.offer_expires_ns != 0) self.dropStand(c) else c.offer_expires_ns = 0;
+        }
         self.storeWord(slot, .unleased, MANAGER, false, false);
     }
 

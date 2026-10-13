@@ -14,6 +14,7 @@
 //! whose view is warm never issues a `ResolveSlot`.
 
 const std = @import("std");
+const clock = @import("../../../core/clock.zig");
 const Allocator = std.mem.Allocator;
 const counters = @import("../../../core/counters.zig");
 const errors = @import("../../../core/errors.zig");
@@ -114,6 +115,12 @@ pub const SlotHolderCache = struct {
     pub fn holderOf(self: *SlotHolderCache, slot: u16) ?SlotHolder {
         const v = self.table.view(slot);
         var out: ?SlotHolder = if (v.state == .unleased or v.state == .migrating) null else .{ .appender_id = v.holder, .g = v.g };
+        // A handover's released slot is its accepter's while the stand
+        // holds (only the manager's table keeps stands): every touch goes
+        // where the accepter's first touch takes it.
+        if (v.state == .unleased) if (self.table.reservedFor(slot, clock.monotonicNs())) |to| {
+            out = .{ .appender_id = to, .g = v.g };
+        };
         self.lock.lock();
         defer self.lock.unlock();
         if (self.learnt.get(slot)) |l| {
@@ -379,4 +386,31 @@ test "a joiner's table drops a FOREIGN lease the manager answers unleased (found
     try t.load(9, .{ .variant = .leased, .appender_id = 3, .g = 5, .root = .{ .addr = 0, .seq = 0 }, .cursor = 2 });
     _ = try c.resolveViaManager(.{ .ctx = &dummy, .call = Mgr.call }, 0, 9);
     try testing.expectEqual(@as(u32, 3), c.stepHome(9).foreign.holder);
+}
+
+test "a slot a handover released stays its ACCEPTER's for routing while the stand holds (found by the full gate's handover row: with the release reserved for B, A's own touch and every other appender's were refused, and B's chmods shipped to the manager met that refusal — EAGAIN): `stepHome` names the accepter until its grant lands; a lapsed stand routes as unleased again" {
+    const gpa = testing.allocator;
+    const t = try lt.LeaseTable.init(gpa);
+    defer t.deinit();
+    var dummy: u8 = 0;
+    var c = SlotHolderCache.init(gpa, t, &dummy, ownsOne);
+    defer c.deinit();
+    try c.setEndpoint(5, endpointOfByte(5));
+    // Appender 2 holds slot 4, offers it to 5, and releases it (the
+    // flush-then-transfer); 5's grant has not landed yet.
+    _ = try t.acquire(4, 2, false);
+    _ = try t.offer(4, 2, 5, std.math.maxInt(u64));
+    const g = t.beginRelease(4, 2, false).?;
+    _ = try t.release(4, 2, g, .{}, 1);
+    try testing.expectEqual(lt.State.unleased, t.view(4).state);
+    try testing.expectEqual(@as(u32, 5), c.stepHome(4).foreign.holder);
+    // The accepter's grant lands: still the accepter, now by its lease.
+    _ = try t.acquire(4, 5, false);
+    try testing.expectEqual(@as(u32, 5), c.stepHome(4).foreign.holder);
+    // A stand that lapses: the slot routes as unleased (local first touch).
+    _ = try t.acquire(6, 2, false);
+    _ = try t.offer(6, 2, 5, 2);
+    const g6 = t.beginRelease(6, 2, false).?;
+    _ = try t.release(6, 2, g6, .{}, 1);
+    try testing.expectEqual(StepHome.local, c.stepHome(6));
 }

@@ -789,7 +789,11 @@ pub const Verbs = struct {
         stats.slot_resolve_rpcs.inc();
         const v = self.table.view(slot);
         return switch (v.state) {
-            .unleased, .migrating => .{ .unleased = .{ .g = v.g } },
+            // A handover's released slot answers its accepter while the
+            // stand holds: the asker's touch goes where the accepter's
+            // first touch takes the slot (the accepter itself applies).
+            .unleased => if (self.table.reservedFor(slot, clock.monotonicNs())) |to| .{ .holder = .{ .appender_id = to, .g = v.g, .dead = false } } else .{ .unleased = .{ .g = v.g } },
+            .migrating => .{ .unleased = .{ .g = v.g } },
             .leased, .offered, .releasing => .{ .holder = .{ .appender_id = v.holder, .g = v.g, .dead = v.dead } },
         };
     }
@@ -1374,6 +1378,9 @@ test "the release → grant gap of an accept: the released slot stays RESERVED f
     try TestPlane.transfer(p, 4, 0, 1);
     try testing.expectEqual(lt.State.unleased, p.table.view(4).state);
     try testing.expectEqual(@as(?AppenderId, 1), p.table.reservedFor(4, clock.monotonicNs()));
+    // `ResolveSlot` answers the accepter: every asker's touch goes where
+    // the accepter's own first touch takes the slot.
+    try testing.expectEqual(@as(AppenderId, 1), (try p.verbs.resolveSlot(4)).holder.appender_id);
     // The holder's first touch (a served ship of 1 landing in the gap) and
     // a third appender's are refused naming the accepter.
     const refusals0 = stats.slot_acquire_reserved_refusals.load();

@@ -695,3 +695,14 @@ rows alongside).
   raises the cancel); the walk's end notifies the same wake. Loops: **0 of
   500** (200 + 300) under the load, the slowest run 75 ms whole (the rig
   included); the read-shard rows 0 of 100, the fleet rows 0 of 100.
+- **The gates of these items** (`timeout 3900 zig build --cache-dir
+  /build/zig-cache gate --summary all`, uncached by a `clock.zig` touch):
+  on item 1 alone (`9d3b27d`, load 1.3) smoke 84 / 2 skip / **1 fail — the
+  handover row** (B's chmod EAGAIN, §10's attributed class), which held
+  bench-, shim-, nvmet- and suites-smoke back (35/46 steps); on the landed
+  tree (`8bf8742`; `e950c7b` adds a two-line comment; load 4.5 → 9.5 with
+  another agent's smoke rows alongside) **46/46, 2759/2828** (unit 2521 /
+  67 skip, smoke 85 / 2 skip, bench-smoke 41, shim-smoke 40, nvmet-smoke 53,
+  rails 16, shim census 3 — the identity row among them; suites-smoke under
+  `/build/tmp/suites-pjdfstest-20261013-103548-854379`, 1 clean run). macOS
+  `zig build gate` on the same tree: **28/28, 2159/2186** (27 skipped).

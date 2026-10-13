@@ -181,3 +181,291 @@ test "linux: THE CACHE BARRIER AT A LEASE MOVE (0003 §X.5; found by the online 
         try testing.expectEqualStrings(want.v, got);
     }
 }
+
+// ---------------------------------------------------------------------------
+// THE MOVE MATRIX (0003 §X.1, §X.2): the filesystem over both members — A's
+// and B's planes bound the way `mount` binds them, B's behind the product's
+// move gate — and a directory of A's moving to B by a holder-decided
+// handover held at one step while B runs one op of each kind into it.
+// Every op answers what ONE successful call answers, and both members read
+// the same tree afterwards.
+// ---------------------------------------------------------------------------
+
+const kv_fs = @import("../../fuse/handler/kv_fs.zig");
+const filesystem = @import("../../fuse/handler/filesystem.zig");
+const op_trace = @import("../../fuse/handler/op_trace.zig");
+const move_gate = @import("../../fuse/handler/move_gate.zig");
+const moves = @import("slots/moves.zig");
+const door = @import("slots/door.zig");
+const inos = @import("../inos.zig");
+const route_table = @import("../routing/route_table.zig");
+const clock = @import("../../core/clock.zig");
+
+const SetFs = kv_fs.KvFs(MetaSet, kv_fs.NoData);
+
+/// One member's filesystem with its cross-owner plane and wire plane bound
+/// in `mount`'s order.
+const Member = struct {
+    nodata: kv_fs.NoData = .{},
+    fs: SetFs,
+    bound: *xv.set_bind.Bound,
+    plane: *wire_plane.WirePlane,
+
+    fn arm(self: *Member, gpa: std.mem.Allocator, io: std.Io, set: *MetaSet, env: *std.process.Environ.Map) !void {
+        self.nodata = .{};
+        self.fs = try SetFs.mount(gpa, io, set, &self.nodata, .{ .dlm_stripes = 64 });
+        errdefer self.fs.unmount();
+        self.bound = try xv.set_bind.Bound.create(gpa, io, set, &self.fs.locks, env);
+        errdefer self.bound.destroy(gpa);
+        _ = try self.fs.bindXv(&self.bound.plane);
+        self.plane = (try wire_plane.WirePlane.start(gpa, io, set, env, 4, 1 << 30, &self.bound.plane, false)).?;
+        self.fs.bindDivert(&self.plane.divert);
+        self.bound.bindDialer(self.plane.peers.xvDialer());
+    }
+
+    fn disarm(self: *Member, gpa: std.mem.Allocator) void {
+        self.plane.stop();
+        self.bound.destroy(gpa);
+        self.fs.unmount();
+    }
+
+    fn face(self: *Member) filesystem.Filesystem {
+        return filesystem.Filesystem.of(SetFs, &self.fs);
+    }
+};
+
+/// The handover step B's ops meet.
+const Step = enum {
+    /// A's offer pushed, the reservation's stand raised for B; A still holds.
+    offered,
+    /// A's transfer parked past step 0's drain, the door's gate and the
+    /// page `Releasing` (`park_after_page`): A's door closed on the slot.
+    drained,
+    /// A released and granted; B's install parked between its tree and its
+    /// lease word (`park_mid_install`).
+    granted,
+    /// The move done: B's door open on the slot.
+    reopened,
+};
+
+const Kind = enum { create, chmod, unlink, rename, setattr };
+
+/// The `setattr` op's times (whole seconds: the kernel's attr words).
+const TIMES_S: u64 = 1_234_567;
+
+const Op = struct {
+    kind: Kind,
+    fs: filesystem.Filesystem,
+    io: std.Io,
+    dir: u64,
+    target: u64 = 0,
+    got: u64 = 0,
+    err: ?anyerror = null,
+    done: *std.atomic.Value(u32),
+
+    fn run(op: *Op) void {
+        // Paired with the release-hold loop's acquire load.
+        defer _ = op.done.fetchAdd(1, .release);
+        var tr = op_trace.OpTrace.begin(0, .other);
+        defer tr.finish();
+        var window: [4096]u8 = undefined;
+        var c: filesystem.Ctx = .{ .unique = 1, .uid = 0, .gid = 0, .pid = 1, .io = op.io, .trace = &tr, .wd_slot = null, .window = &window };
+        op.got = op.call(&c) catch |e| {
+            op.err = e;
+            return;
+        };
+    }
+
+    fn call(op: *Op, c: *filesystem.Ctx) !u64 {
+        const v = op.fs.vtable;
+        const impl = op.fs.impl;
+        switch (op.kind) {
+            .create => return (try v.create(impl, c, .{ .parent = op.dir, .name = "made", .mode = 0o644, .flags = 0, .umask = 0, .open_flags = 0 })).entry.nodeid,
+            .chmod => _ = try v.setattr(impl, c, .{ .ino = op.target, .attr = .{ .mode = 0o600 } }),
+            .unlink => try v.unlink(impl, c, .{ .parent = op.dir, .name = "f.unlink" }),
+            .rename => try v.rename(impl, c, .{ .parent = op.dir, .name = "f.rename", .newparent = op.dir, .newname = "f.renamed", .flags = 0 }),
+            .setattr => _ = try v.setattr(impl, c, .{ .ino = op.target, .attr = .{ .atime = TIMES_S * std.time.ns_per_s, .mtime = TIMES_S * std.time.ns_per_s } }),
+        }
+        return op.target;
+    }
+};
+
+fn testCtx(io: std.Io, tr: *op_trace.OpTrace, window: []u8) filesystem.Ctx {
+    return .{ .unique = 1, .uid = 0, .gid = 0, .pid = 1, .io = io, .trace = tr, .wd_slot = null, .window = window };
+}
+
+fn lookupIno(f: filesystem.Filesystem, c: *filesystem.Ctx, parent: u64, name: []const u8) !u64 {
+    return (try f.vtable.lookup(f.impl, c, .{ .parent = parent, .name = name })).nodeid;
+}
+
+/// The ops' "in the window" verdict: every op finished, parked at A's door
+/// (a served commit meeting A's own release), parked on B's move epoch, or
+/// waiting behind B's held install (its resolver's replayed first touch of
+/// the same grant). Bounded: past the bound the step answers the miss (a
+/// pin whose window was never met proves nothing).
+const REACH_BOUND_NS: u64 = 30 * std.time.ns_per_s;
+
+const Marks = struct {
+    door_parks: u64,
+    gate_parks: u64,
+    install_waits: u64,
+
+    fn now() Marks {
+        return .{ .door_parks = door.stats.slot_door_parks.load(), .gate_parks = move_gate.stats.slot_move_parks.load(), .install_waits = acquire.stats.slot_install_waits.load() };
+    }
+
+    fn since(m: Marks) u64 {
+        const n = now();
+        return (n.door_parks - m.door_parks) + (n.gate_parks - m.gate_parks) + (n.install_waits - m.install_waits);
+    }
+};
+
+fn awaitInWindow(n: u32, done: *std.atomic.Value(u32), marks: Marks) bool {
+    const until = clock.monotonicNs() + REACH_BOUND_NS;
+    while (clock.monotonicNs() < until) {
+        if (done.load(.acquire) + marks.since() >= n) return true;
+        std.Thread.yield() catch {};
+    }
+    return false;
+}
+
+fn moveOne(comptime step: Step, comptime kind: Kind) !void {
+    const gpa = testing.allocator;
+    const s = try meta_set.TestSet.create(gpa, "move-matrix-" ++ @tagName(step) ++ "-" ++ @tagName(kind), 1);
+    defer s.destroy();
+    try s.env.put("SQUEEZEFS_MW_BIND", "127.0.0.1:0");
+    const io = s.io();
+    const set = try s.open();
+    defer set.close();
+    var a: Member = undefined;
+    try a.arm(gpa, io, set, &s.env);
+    defer a.disarm(gpa);
+    const be0 = set.volumes[0];
+    var tr = op_trace.OpTrace.begin(0, .other);
+    defer tr.finish();
+    var window: [4096]u8 = undefined;
+    var c = testCtx(io, &tr, &window);
+    // A's directory in one of A's rotor slots, its files beside it.
+    var nb: [16]u8 = undefined;
+    var dir: u64 = 0;
+    var dir_idx: usize = 0;
+    var slot: u16 = 0;
+    for (0..64) |i| {
+        const e = try a.fs.mkdir(&c, .{ .parent = inos.ROOT_INO, .name = try std.fmt.bufPrint(&nb, "d{d}", .{i}), .mode = 0o755, .umask = 0 });
+        const sl = route_table.slotOf(e.nodeid);
+        if (sl != be0.stamp.native_slot and be0.slots.table.view(sl).leasedBy(lt.MANAGER)) {
+            dir = e.nodeid;
+            dir_idx = i;
+            slot = sl;
+            break;
+        }
+    } else return error.NoRotorDirectory;
+    var files: [4]u64 = undefined;
+    for (&files, [_][]const u8{ "f.chmod", "f.unlink", "f.rename", "f.times" }) |*f, name| {
+        f.* = (try a.fs.create(&c, .{ .parent = dir, .name = name, .mode = 0o644, .flags = 0, .umask = 0, .open_flags = 0 })).entry.nodeid;
+    }
+    try be0.checkpointNow();
+    // B joins with its filesystem behind the product's move gate.
+    const b = try MetaSet.open(gpa, io, s.pathList(), .{ .env = &s.env, .cache_budget_bytes = 64 << 20, .cpus = 4, .join = .{ .mountpoint = "/build/tmp/mnt-move-matrix-b", .endpoint = a.plane.advertised } });
+    defer b.close();
+    var mv = moves.Moves.init(io);
+    b.bindMoves(&mv);
+    defer mv.close();
+    var bm: Member = undefined;
+    try bm.arm(gpa, io, b, &s.env);
+    defer bm.disarm(gpa);
+    var gate: move_gate.MoveGate = .{ .inner = bm.face(), .moves = &mv, .deadline_ns = moves.deadlineNs(bm.plane.moveDeadlineMs()) };
+    const bfs = gate.filesystem();
+    const bj = b.volumes[0];
+    const me = bj.joined.?.appenderId();
+    try testing.expectEqual(dir, try lookupIno(bfs, &c, inos.ROOT_INO, try std.fmt.bufPrint(&nb, "d{d}", .{dir_idx})));
+    var done = std.atomic.Value(u32).init(0);
+    var op: Op = .{ .kind = kind, .fs = bfs, .io = io, .dir = dir, .done = &done, .target = switch (kind) {
+        .create => 0,
+        .chmod => files[0],
+        .unlink => files[1],
+        .rename => files[2],
+        .setattr => files[3],
+    } };
+    const Accept = struct {
+        fn run(p: anytype, sl: u16) void {
+            const sink = p.carriageSink();
+            sink.offered(sink.ctx, sl, lt.MANAGER);
+        }
+    };
+    // The step's window, the op issued inside it.
+    var reached = true;
+    try testing.expectEqual(acquire.Verbs.OfferResult.offered, try be0.slots.verbs.offerSlot(lt.MANAGER, slot, me, std.math.maxInt(u64)));
+    switch (step) {
+        .offered => {
+            op.run();
+            Accept.run(bj.slots, slot);
+        },
+        .drained, .granted => {
+            const seam = if (step == .drained) &be0.slots.seam else &bj.slots.seam;
+            seam.hold = if (step == .drained) .park_after_page else .park_mid_install;
+            const accept = try std.Thread.spawn(.{}, Accept.run, .{ bj.slots, slot });
+            seam.reached.waitUncancelable(io);
+            const marks = Marks.now();
+            const t = try std.Thread.spawn(.{}, Op.run, .{&op});
+            reached = awaitInWindow(1, &done, marks);
+            seam.hold = .off;
+            seam.release.set(io);
+            accept.join();
+            t.join();
+        },
+        .reopened => {
+            Accept.run(bj.slots, slot);
+            op.run();
+        },
+    }
+    try testing.expect(reached);
+    if (op.err) |e| {
+        std.debug.print("move matrix {t}: {t} answered {t}\n", .{ step, kind, e });
+        return e;
+    }
+    // The move landed: the slot is B's on both tables.
+    try testing.expect(bj.slots.table.view(slot).leasedBy(me));
+    try testing.expect(be0.slots.table.view(slot).leasedBy(me));
+    // Both members read what one successful call leaves.
+    for ([_]filesystem.Filesystem{ a.face(), bfs }) |f| switch (kind) {
+        .create => {
+            try testing.expect(op.got != 0);
+            try testing.expectEqual(op.got, try lookupIno(f, &c, dir, "made"));
+        },
+        .chmod => try testing.expectEqual(@as(u32, 0o600), (try f.vtable.getattr(f.impl, &c, .{ .ino = files[0], .fh = null })).attr.mode & 0o7777),
+        .unlink => {
+            try testing.expectEqual(@as(u64, 0), try lookupIno(f, &c, dir, "f.unlink"));
+            try testing.expectEqual(@as(u32, 0), (try f.vtable.getattr(f.impl, &c, .{ .ino = files[1], .fh = null })).attr.nlink);
+        },
+        .rename => {
+            try testing.expectEqual(@as(u64, 0), try lookupIno(f, &c, dir, "f.rename"));
+            try testing.expectEqual(files[2], try lookupIno(f, &c, dir, "f.renamed"));
+        },
+        .setattr => {
+            const tm = try f.vtable.getattr(f.impl, &c, .{ .ino = files[3], .fh = null });
+            try testing.expectEqual(TIMES_S, tm.attr.mtime);
+            try testing.expectEqual(TIMES_S, tm.attr.atime);
+        },
+    };
+}
+
+fn moveMatrix(comptime step: Step) !void {
+    inline for (comptime std.enums.values(Kind)) |kind| try moveOne(step, kind);
+}
+
+test "linux: THE MOVE MATRIX — offer pushed, stand raised (0003 §X.1): B's create / chmod / unlink / rename / setattr into A's directory while A's offer of its slot to B stands each answer one successful call's result; the accept then moves the slot and both members read the same tree" {
+    try moveMatrix(.offered);
+}
+
+test "linux: THE MOVE MATRIX — step 0 drained, A's door closed (0003 §X.1, §X.2): B's five ops issued while A's transfer of the slot to B is parked past its drain, its gate and its page each answer one successful call's result — the system parks and re-issues every refusal the move answers, never EAGAIN, a create never EEXIST against its own first attempt" {
+    try moveMatrix(.drained);
+}
+
+test "linux: THE MOVE MATRIX — grant landed, B's install mid-way (0003 §X.1, §X.4): B's five ops issued while B's install of the grant is parked between its tree and its lease word each answer one successful call's result" {
+    try moveMatrix(.granted);
+}
+
+test "linux: THE MOVE MATRIX — door re-opened (0003 §X.1): B's five ops into the directory it now holds land locally, each one successful call's result, and A reads them through B" {
+    try moveMatrix(.reopened);
+}

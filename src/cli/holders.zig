@@ -17,7 +17,9 @@
 //! number (the anon `0:<minor>` of the superblock). One entry per process
 //! (its first reference, in that order), one per stacked mount. A
 //! per-thread cwd (`unshare(CLONE_FS)`) is not walked. Unreadable
-//! processes (another user's, under an unprivileged verb) are skipped: the
+//! processes are skipped — another user's under an unprivileged verb; a
+//! non-dumpable one (a hardened daemon, a setuid program) when the caller
+//! lacks CAP_SYS_PTRACE (root on a host has it; a container may not): the
 //! kernel's `umount2` stays the authority on "busy"; this census is the
 //! NAMES and the early answer.
 
@@ -340,9 +342,13 @@ test "the census over a real mount: a child whose cwd is a tmpfs we mount is fou
     try testing.expectEqual(linux.E.SUCCESS, linux.errno(rc));
     if (rc == 0) {
         // The child drops its copies of the ends it does not use, else its
-        // own `done[1]` keeps the pipe from ever reading EOF.
+        // own `done[1]` keeps the pipe from ever reading EOF. Dumpable
+        // again: an earlier test hardened this process (`PR_SET_DUMPABLE`
+        // 0), and the magic links of a non-dumpable task need
+        // CAP_SYS_PTRACE, which the venue container does not grant root.
         _ = linux.close(fds[0]);
         _ = linux.close(done[1]);
+        _ = linux.prctl(@backingInt(linux.PR.SET_DUMPABLE), 1, 0, 0, 0);
         _ = linux.chdir(mp.ptr);
         var one: u8 = 1;
         _ = linux.write(fds[1], @ptrCast(&one), 1);

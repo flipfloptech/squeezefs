@@ -459,6 +459,9 @@ test "a tmpfs held by a child's cwd: the pre-signal census refuses it by name (t
     if (rc == 0) {
         _ = linux.close(ready[0]);
         _ = linux.close(done[1]);
+        // Readable by the census under a hardened (non-dumpable) test
+        // process without CAP_SYS_PTRACE (`holders.zig`'s row says why).
+        _ = linux.prctl(@backingInt(linux.PR.SET_DUMPABLE), 1, 0, 0, 0);
         _ = linux.chdir(mp.ptr);
         var one: u8 = 1;
         _ = linux.write(ready[1], @ptrCast(&one), 1);

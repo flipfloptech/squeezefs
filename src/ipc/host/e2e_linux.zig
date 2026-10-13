@@ -348,9 +348,13 @@ test "smoke: THE INTERCEPTION HOST — format → mount -o interception → the 
         try testing.expect(std.mem.indexOf(u8, text, "\"interception\":true") != null);
         try testing.expect(std.mem.indexOf(u8, text, "\"writeback\":false") != null);
     }
-    // The credential + the bound file: a regular file on the mount.
+    // The credential + the bound file: a regular file on the mount (closed
+    // by step 8 before the orderly umount — an open fd is a holder).
     const fd = try rig.openOnMount("ring.dat", .{ .ACCMODE = .RDWR, .CREAT = true, .CLOEXEC = true });
-    defer _ = linux.close(fd);
+    var fd_open = true;
+    defer if (fd_open) {
+        _ = linux.close(fd);
+    };
     const blob = try rig.il0Blob();
     var env = std.process.Environ.Map.init(gpa);
     defer env.deinit();
@@ -375,9 +379,13 @@ test "smoke: THE INTERCEPTION HOST — format → mount -o interception → the 
     try testing.expectEqual(BLOCK, try served(s.pwrite(b.id, block0, 0)));
     try testing.expectEqual(@as(u64, 4), try rig.stat("ipc_ops_write"));
     try testing.expectEqual(@as(u64, 4), try rig.stat("ipc_severs"));
-    // Read back through the KERNEL path (a second fd, buffered).
+    // Read back through the KERNEL path (a second fd, buffered; closed by
+    // step 8 with `fd` — every fd on the mount is a holder).
     const kfd = try rig.openOnMount("ring.dat", .{ .ACCMODE = .RDONLY, .CLOEXEC = true });
-    defer _ = linux.close(kfd);
+    var kfd_open = true;
+    defer if (kfd_open) {
+        _ = linux.close(kfd);
+    };
     const back = try gpa.alloc(u8, BLOCK);
     defer gpa.free(back);
     try testing.expectEqual(BLOCK, linux.pread(kfd, back.ptr, back.len, 0));
@@ -528,32 +536,34 @@ test "smoke: THE INTERCEPTION HOST — format → mount -o interception → the 
 
     // 6. The fd screen through the real session: a read-only binding's
     //    write is EBADF; O_PATH, a directory, O_APPEND ⇒ flags; a memfd
-    //    (a foreign device) ⇒ mount.
-    const ro = try rig.openOnMount("ring.dat", .{ .ACCMODE = .RDONLY, .CLOEXEC = true });
-    defer _ = linux.close(ro);
-    const rob = try s.bind(ro, .mount);
-    try testing.expect(rob.rights.read and !rob.rights.write);
-    switch (s.pwrite(rob.id, &page, 0)) {
-        .errno => |e| try testing.expectEqual(linux.E.BADF, e),
-        else => return error.TestExpectedEbadf,
+    //    (a foreign device) ⇒ mount. Every fd closes with the block.
+    {
+        const ro = try rig.openOnMount("ring.dat", .{ .ACCMODE = .RDONLY, .CLOEXEC = true });
+        defer _ = linux.close(ro);
+        const rob = try s.bind(ro, .mount);
+        defer s.unbind(rob.id);
+        try testing.expect(rob.rights.read and !rob.rights.write);
+        switch (s.pwrite(rob.id, &page, 0)) {
+            .errno => |e| try testing.expectEqual(linux.E.BADF, e),
+            else => return error.TestExpectedEbadf,
+        }
+        const op = try rig.openOnMount("ring.dat", .{ .ACCMODE = .RDONLY, .PATH = true, .CLOEXEC = true });
+        defer _ = linux.close(op);
+        try testing.expectError(error.Refused, s.bind(op, .mount));
+        try testing.expectEqual(wire.RefuseClass.flags, s.last_refusal.?);
+        const dfd = try rig.openOnMount("", .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true });
+        defer _ = linux.close(dfd);
+        try testing.expectError(error.Refused, s.bind(dfd, .mount));
+        try testing.expectEqual(wire.RefuseClass.flags, s.last_refusal.?);
+        const ap = try rig.openOnMount("ring.dat", .{ .ACCMODE = .WRONLY, .APPEND = true, .CLOEXEC = true });
+        defer _ = linux.close(ap);
+        try testing.expectError(error.Refused, s.bind(ap, .mount));
+        try testing.expectEqual(wire.RefuseClass.flags, s.last_refusal.?);
+        const mfd: linux.fd_t = @intCast(linux.memfd_create("sqz-foreign", linux.MFD.CLOEXEC));
+        defer _ = linux.close(mfd);
+        try testing.expectError(error.Refused, s.bind(mfd, .mount));
+        try testing.expectEqual(wire.RefuseClass.mount, s.last_refusal.?);
     }
-    const op = try rig.openOnMount("ring.dat", .{ .ACCMODE = .RDONLY, .PATH = true, .CLOEXEC = true });
-    defer _ = linux.close(op);
-    try testing.expectError(error.Refused, s.bind(op, .mount));
-    try testing.expectEqual(wire.RefuseClass.flags, s.last_refusal.?);
-    const dfd = try rig.openOnMount("", .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true });
-    defer _ = linux.close(dfd);
-    try testing.expectError(error.Refused, s.bind(dfd, .mount));
-    try testing.expectEqual(wire.RefuseClass.flags, s.last_refusal.?);
-    const ap = try rig.openOnMount("ring.dat", .{ .ACCMODE = .WRONLY, .APPEND = true, .CLOEXEC = true });
-    defer _ = linux.close(ap);
-    try testing.expectError(error.Refused, s.bind(ap, .mount));
-    try testing.expectEqual(wire.RefuseClass.flags, s.last_refusal.?);
-    const mfd: linux.fd_t = @intCast(linux.memfd_create("sqz-foreign", linux.MFD.CLOEXEC));
-    defer _ = linux.close(mfd);
-    try testing.expectError(error.Refused, s.bind(mfd, .mount));
-    try testing.expectEqual(wire.RefuseClass.mount, s.last_refusal.?);
-    s.unbind(rob.id);
 
     // 7. fsync through the kernel after the ring writes (the §5.6.3 order).
     try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.fsync(fd)));
@@ -566,8 +576,26 @@ test "smoke: THE INTERCEPTION HOST — format → mount -o interception → the 
         try testing.expect((numberAfter(text, "\"ipc_inval_notifies\":") orelse 0) >= 1);
     }
 
-    // 8. `umount` with the LIVE session: the host poisons it (the client
-    //    sees the generation bump), the daemon exits 0, no mount is left.
+    // 8. `umount` while THIS process still holds `ring.dat` open: refused
+    //    by name (decision 0003 §S — an open fd is a holder; the verb names
+    //    the pid and the fd), the mount serving on. Then the fd closed and
+    //    `umount` with the LIVE session (the socket, its bindings): the
+    //    host poisons it (the client sees the generation bump), the daemon
+    //    exits 0, no mount is left.
+    {
+        const r = try std.process.run(gpa, io, .{ .argv = &.{ rig.bin, "umount", rig.mp }, .environ_map = &rig.env });
+        defer gpa.free(r.stdout);
+        defer gpa.free(r.stderr);
+        try testing.expectEqual(std.process.Child.Term{ .exited = 1 }, r.term);
+        var want: [64]u8 = undefined;
+        try testing.expect(std.mem.indexOf(u8, r.stderr, try std.fmt.bufPrint(&want, "pid {d} (", .{linux.getpid()})) != null);
+        try testing.expect(std.mem.indexOf(u8, r.stderr, try std.fmt.bufPrint(&want, ") fd {d}", .{fd})) != null);
+        try testing.expectEqual(@as(usize, 1), try fuseMountsOf(gpa, io, rig.mp));
+    }
+    kfd_open = false;
+    _ = linux.close(kfd);
+    fd_open = false;
+    _ = linux.close(fd);
     try rig.umount();
     const term = try rig.waitChild();
     try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);

@@ -113,6 +113,12 @@ pub fn FlightTable(comptime max_flights: usize) type {
 
         interior: Io.Mutex = .init,
         slots: [max_flights]Slot = @splat(.{}),
+        /// Open flights, written under `interior` at every open and close:
+        /// `inFlight`'s miss answers from it without the lock and the
+        /// `max_flights`-slot scan (the direct device leg asks per cold
+        /// read — 4.4 % of the FUSE worker's cycles on rand-4k). A hint like
+        /// the locked answer, which is stale the moment the lock drops.
+        open: std.atomic.Value(u32) = .init(0),
         pool: *fill_pool.Pool,
 
         pub fn init(pool: *fill_pool.Pool) Self {
@@ -163,6 +169,7 @@ pub fn FlightTable(comptime max_flights: usize) type {
                 }
                 assert(s.holds == 1);
                 s.* = .{};
+                _ = t.open.fetchSub(1, .monotonic);
                 stats.fill_cohort_inflight.sub(1);
             }
 
@@ -188,6 +195,7 @@ pub fn FlightTable(comptime max_flights: usize) type {
                     if (s.holds != 0) return;
                     unpin = s.result.slot;
                     s.* = .{};
+                    _ = t.open.fetchSub(1, .monotonic);
                     stats.fill_cohort_inflight.sub(1);
                 }
                 if (unpin) |sl| _ = t.pool.unpin(sl);
@@ -247,8 +255,11 @@ pub fn FlightTable(comptime max_flights: usize) type {
             }
         }
 
-        /// `key ∈ inflight_block_reads`: one lock, no park.
+        /// `key ∈ inflight_block_reads`: no flight open ⇒ no (one relaxed
+        /// load — the count is a hint paired with no fence, as the locked
+        /// scan's answer is); else one lock, no park.
         pub fn inFlight(self: *Self, io: Io, key: BlockKey) bool {
+            if (self.open.load(.monotonic) == 0) return false;
             self.interior.lockUncancelable(io);
             defer self.interior.unlock(io);
             return self.findLocked(key) != null;
@@ -282,6 +293,7 @@ pub fn FlightTable(comptime max_flights: usize) type {
         fn claimLocked(self: *Self, key: BlockKey) ?usize {
             for (&self.slots, 0..) |*s, i| if (s.state == .free) {
                 s.* = .{ .key = key, .state = .leading, .holds = 1 };
+                _ = self.open.fetchAdd(1, .monotonic);
                 return i;
             };
             return null;
@@ -470,8 +482,13 @@ fn tableFullBody(io: Io) !void {
     const full_before = stats.fill_cohort_table_full.load();
     try testing.expect(table.enter(io, .init(4, 99 * 4096)) == .table_full);
     try testing.expectEqual(full_before + 1, stats.fill_cohort_table_full.load());
+    // The lock-free open count tracks the slots: a refused enter opens none.
+    try testing.expectEqual(@as(u32, 4), table.open.load(.monotonic));
+    try testing.expect(table.inFlight(io, .init(4, 2 * 4096)) and !table.inFlight(io, .init(4, 99 * 4096)));
     for (guards) |g| g.fail(io);
     try testing.expectEqual(@as(usize, 0), table.openCount(io));
+    try testing.expectEqual(@as(u32, 0), table.open.load(.monotonic));
+    try testing.expect(!table.inFlight(io, .init(4, 0)));
 }
 
 test "a full flight table is a counted refusal, never a park" {

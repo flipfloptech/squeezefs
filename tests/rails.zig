@@ -679,6 +679,221 @@ test "the skip scanner: an identifier counts, prose in a comment or a string doe
 }
 
 // ---------------------------------------------------------------------------
+// The rig sync rail (decision 0003 §Z): a rig syncs only what it wrote —
+// `sync -f <its mount>`, `sync <file>`, fsync. A host-wide `sync` sends
+// FUSE_SYNCFS to EVERY FUSE superblock on the host and waits for each: a
+// mount another row (or another run on the venue) froze holds it for that
+// daemon's whole request timeout, and an older binary's frozen daemon holds
+// it forever (the nvmet sigstop-preempt row hung a gate 23 min). Scanned:
+// every string literal (a rig's shell script) in `src/` and `tests/`, and
+// every shell script under `scripts/`. A lone `"sync"` literal is a name or
+// an argv the scanner cannot judge (the frozen-daemon smoke row's host-wide
+// sync is that argv: the claim under test). This file's scanner fixture is
+// not a rig.
+// ---------------------------------------------------------------------------
+
+const script_root = "scripts";
+const sync_rail_fixture = "tests/rails.zig";
+
+/// The offset of a host-wide `sync` in shell text: the word `sync` in
+/// command position (text start, or after `;` `&` `|` `(` `{` a newline,
+/// `then`, `do`, `else`) with no operand (followed by the end, a newline,
+/// a separator or a redirection). `sync -f x`, `sync file`, `fsync`,
+/// `conv=fsync` and `syncfs` are scoped or other words.
+fn globalSyncAt(text: []const u8) ?usize {
+    var from: usize = 0;
+    while (std.mem.indexOfPos(u8, text, from, "sync")) |at| {
+        from = at + 4;
+        if (!syncInCommandPosition(text, at)) continue;
+        var i = at + 4;
+        if (i < text.len) switch (text[i]) {
+            ' ', '\t' => {},
+            ';', '&', '|', ')', '}', '\n', '>', '<' => return at,
+            else => continue,
+        };
+        while (i < text.len and (text[i] == ' ' or text[i] == '\t')) i += 1;
+        if (i == text.len) return at;
+        switch (text[i]) {
+            ';', '&', '|', ')', '}', '\n', '>', '<' => return at,
+            '0'...'9' => if (i + 1 < text.len and text[i + 1] == '>') return at,
+            else => {},
+        }
+    }
+    return null;
+}
+
+fn syncInCommandPosition(text: []const u8, at: usize) bool {
+    var j = at;
+    while (j > 0 and (text[j - 1] == ' ' or text[j - 1] == '\t')) j -= 1;
+    if (j == 0) return true;
+    switch (text[j - 1]) {
+        ';', '&', '|', '(', '{', '\n' => return true,
+        else => {},
+    }
+    inline for (.{ "then", "do", "else" }) |kw| {
+        if (j >= kw.len and std.mem.eql(u8, text[j - kw.len .. j], kw) and (j == kw.len or !std.ascii.isAlphanumeric(text[j - kw.len - 1]) and text[j - kw.len - 1] != '_')) {
+            // A keyword ends where the `sync` begins only across whitespace.
+            if (j != at) return true;
+        }
+    }
+    return false;
+}
+
+/// A shell line without its comment: from the first `#` that starts a word
+/// (`$#`, `${#…}` and `a#b` are not comments).
+fn shellCode(line: []const u8) []const u8 {
+    var i: usize = 0;
+    while (std.mem.indexOfScalarPos(u8, line, i, '#')) |h| {
+        if (h == 0 or line[h - 1] == ' ' or line[h - 1] == '\t') return line[0..h];
+        i = h + 1;
+    }
+    return line;
+}
+
+fn isShellScript(name: []const u8, text: []const u8) bool {
+    if (std.mem.endsWith(u8, name, ".sh")) return true;
+    if (!std.mem.startsWith(u8, text, "#!")) return false;
+    const first = text[0 .. std.mem.indexOfScalar(u8, text, '\n') orelse text.len];
+    return std.mem.endsWith(u8, first, "sh") or std.mem.indexOf(u8, first, "bash") != null or std.mem.indexOf(u8, first, "/sh ") != null;
+}
+
+/// Every host-wide `sync` in a Zig file's string literals (one line per
+/// multiline-literal token).
+fn zigGlobalSyncs(path: []const u8, text: [:0]const u8, out: *std.Io.Writer) !usize {
+    var n: usize = 0;
+    var tok = std.zig.Tokenizer.init(text);
+    while (true) {
+        const t = tok.next();
+        const lit: []const u8 = switch (t.tag) {
+            .eof => break,
+            .string_literal => lit: {
+                const s = text[t.loc.start + 1 .. t.loc.end - 1];
+                if (std.mem.eql(u8, s, "sync")) continue;
+                break :lit s;
+            },
+            .multiline_string_literal_line => text[t.loc.start + 2 .. t.loc.end],
+            else => continue,
+        };
+        if (globalSyncAt(lit) != null) {
+            try out.print("  {s}:{d}: a host-wide `sync` in a rig's script\n", .{ path, lineOf(text, t.loc.start) });
+            n += 1;
+        }
+    }
+    return n;
+}
+
+fn walkAll(gpa: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, prefix: []const u8, files: *std.ArrayList([]u8)) !void {
+    var it = dir.iterate();
+    while (try it.next(io)) |entry| {
+        const sub = try std.fs.path.join(gpa, &.{ prefix, entry.name });
+        switch (entry.kind) {
+            .directory => {
+                defer gpa.free(sub);
+                var child = try dir.openDir(io, entry.name, .{ .iterate = true });
+                defer child.close(io);
+                try walkAll(gpa, io, child, sub, files);
+            },
+            .file => try files.append(gpa, sub),
+            else => gpa.free(sub),
+        }
+    }
+}
+
+test "rig sync rail: no rig script runs a host-wide `sync` — every sync names the rig's own mount or file" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const cwd = std.Io.Dir.cwd();
+    var violations: std.Io.Writer.Allocating = .init(gpa);
+    defer violations.deinit();
+    var zig_files: std.ArrayList([]u8) = .empty;
+    defer {
+        for (zig_files.items) |f| gpa.free(f);
+        zig_files.deinit(gpa);
+    }
+    for (roots) |root| {
+        var d = try cwd.openDir(io, root, .{ .iterate = true });
+        defer d.close(io);
+        try walk(gpa, io, d, root, &zig_files);
+    }
+    try std.testing.expect(zig_files.items.len >= min_files);
+    var fixture_seen = false;
+    for (zig_files.items) |path| {
+        if (std.mem.eql(u8, path, sync_rail_fixture)) {
+            fixture_seen = true;
+            continue;
+        }
+        const text = try readWalked(gpa, io, cwd, path) orelse continue;
+        defer gpa.free(text);
+        _ = try zigGlobalSyncs(path, text, &violations.writer);
+    }
+    try std.testing.expect(fixture_seen);
+    var script_files: std.ArrayList([]u8) = .empty;
+    defer {
+        for (script_files.items) |f| gpa.free(f);
+        script_files.deinit(gpa);
+    }
+    {
+        var d = try cwd.openDir(io, script_root, .{ .iterate = true });
+        defer d.close(io);
+        try walkAll(gpa, io, d, script_root, &script_files);
+    }
+    var scripts: usize = 0;
+    for (script_files.items) |path| {
+        const text = try readWalked(gpa, io, cwd, path) orelse continue;
+        defer gpa.free(text);
+        if (!isShellScript(std.fs.path.basename(path), text)) continue;
+        scripts += 1;
+        var it = std.mem.splitScalar(u8, text, '\n');
+        var line: usize = 0;
+        while (it.next()) |l| {
+            line += 1;
+            if (globalSyncAt(shellCode(l)) != null) try violations.writer.print("  {s}:{d}: a host-wide `sync`\n", .{ path, line });
+        }
+    }
+    // The venue wrapper and the suites' helpers are shell: a scanner that
+    // recognizes none passes vacuously.
+    try std.testing.expect(scripts >= min_files);
+    if (violations.written().len != 0) {
+        std.debug.print("host-wide sync(s) in rigs — sync the rig's own mount (`sync -f <mnt>`) or file (`sync <file>`, fsync) instead; a host-wide sync waits on every FUSE mount on the host, a frozen one included (0003 §Z):\n{s}", .{violations.written()});
+        return error.HostWideSync;
+    }
+}
+
+test "the sync scanner: a bare `sync` in command position counts; an operand, an option, fsync, syncfs, prose and a lone name do not" {
+    try std.testing.expect(globalSyncAt("sync") != null);
+    try std.testing.expect(globalSyncAt("echo a > f && sync && cat f") != null);
+    try std.testing.expect(globalSyncAt("rm x; sync; echo ok") != null);
+    try std.testing.expect(globalSyncAt("  sync") != null);
+    try std.testing.expect(globalSyncAt("sync -f \"$mnt\" 2>/dev/null || sync") != null);
+    try std.testing.expect(globalSyncAt("if true; then sync; fi") != null);
+    try std.testing.expect(globalSyncAt("sync 2>/dev/null") != null);
+    try std.testing.expect(globalSyncAt("( sync )") != null);
+    try std.testing.expect(globalSyncAt("echo a > f && sync -f . && cat f") == null);
+    try std.testing.expect(globalSyncAt("dd if=x of=y conv=fsync && sync big") == null);
+    try std.testing.expect(globalSyncAt("sync d; stat d") == null);
+    try std.testing.expect(globalSyncAt("syncfs and fsync and fdatasync") == null);
+    try std.testing.expect(globalSyncAt("echo \"sync\"") == null);
+    try std.testing.expect(globalSyncAt("resync; async") == null);
+    try std.testing.expect(globalSyncAt("thensync;") == null);
+    try std.testing.expectEqualStrings("sync -f x ", shellCode("sync -f x # then sync"));
+    try std.testing.expectEqualStrings("echo $# ${#a}", shellCode("echo $# ${#a}"));
+    try std.testing.expect(isShellScript("venue", "#!/usr/bin/env bash\nset -e\n"));
+    try std.testing.expect(isShellScript("x.sh", ""));
+    try std.testing.expect(!isShellScript("brk.py", "#!/usr/bin/env python3\n"));
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try std.testing.expectEqual(@as(usize, 2), try zigGlobalSyncs("f.zig",
+        \\const a = "x && sync && y";
+        \\const b = "sync";
+        \\const c = "sync -f .";
+        \\const d =
+        \\    \\rm f
+        \\    \\sync
+        \\;
+    , &out.writer));
+}
+
+// ---------------------------------------------------------------------------
 // The fuzz census rail (charter §11 "Fuzz every untrusted decoder"): every
 // public decoder under the naming law (`src/gates/census.zig`) is NAMED by a
 // `test "fuzz: …"` in its own file; every fuzz test calls the ONE entry

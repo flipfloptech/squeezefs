@@ -126,7 +126,6 @@ test "tcp e2e: a listener and two dialers run 10k verbs pipelined on two connect
     const l = try startListener(&svc);
     defer l.stop();
     try testing.expect(l.advertised.port != 0);
-    try testing.expect(try threadNamed(listener.ACCEPT_THREAD_NAME));
 
     var c1 = dialer.Client.init(testing.allocator, testing.io, l.advertised, secret, identityOf(1));
     defer c1.deinit();
@@ -136,6 +135,12 @@ test "tcp e2e: a listener and two dialers run 10k verbs pipelined on two connect
     var out: [256]u8 = undefined;
     const r1 = try c1.callTyped(.{ .resolve_slot = .{ .volume = 0, .slot = 1, .reserved = 0 } }, &out);
     try testing.expectEqual(@as(u32, 1), r1.resolve_slot.appender_id);
+    // The rendezvous for every name below: the accept thread names itself
+    // before its first `accept`, a connection thread before its handshake,
+    // a mux reader before its first read — c1's reply happened after all
+    // three. Read right after `start`, the accept thread's name raced the
+    // thread's first instruction (the gates' load lost it).
+    try testing.expect(try threadNamed(listener.ACCEPT_THREAD_NAME));
     const r2 = try c2.callTyped(.{ .resolve_slot = .{ .volume = 0, .slot = 2, .reserved = 0 } }, &out);
     try testing.expectEqual(@as(u32, 2), r2.resolve_slot.appender_id);
     try testing.expectEqual(@as(u32, 2), l.liveConnections());

@@ -59,6 +59,26 @@ Rigs stay run-scoped (pid-tagged paths, `127.0.0.1:0` ports); a test that cannot
 the venue says `[venue-exclusive]` in its name. When the runner refuses a stale cost
 table, `scripts/venue zig build costs` regenerates `tests/costs/` — commit it.
 
+## Landing (the gate train owns the full gate)
+
+`scripts/gate-train` gates `dev`'s head on both venues, re-gates a green head until it has
+three consecutive greens (charter §11's release criterion), and reports one line per run
+(`.gate-train/ledger.tsv`). So a change lands like this:
+
+- **Light tier** (tests, accounting, small defects, docs): the red test, the fix, the
+  targeted runs (`scripts/venue test "<filter>"`, the affected smoke rows), `zig build gate`
+  on macOS (~3 min); rebase, `--ff-only`, done. No full venue gate of your own.
+- **Full tier** (on-disk format, wire protocol, a lock-free core or its model, the FUSE
+  contract, the durability or coherence laws): the light tier plus ONE full venue gate
+  before landing (`scripts/venue 'timeout 3900 zig build --cache-dir /build/zig-cache-v2
+  gate --summary all'` — serialized by `flock /build/.gate.lock`; never launched from a
+  script inside the container, never under extra load). No post-landing gates: the train
+  runs them.
+- **The train goes red on your commit**: fix it within the hour or revert it — `dev` stays
+  green. A row in `docs/gates/flakes.md` failing is reported, not yours to chase: its owner
+  has it.
+- Evidence notes stay under a page: what changed, why, the red test, the numbers.
+
 ## Conventions (Zig 0.17)
 
 - **Allocators explicit**; hot paths own pools and allocate nothing per op.

@@ -1073,42 +1073,44 @@ test "SQUEEZEFS_TEST_EXEC_DROP_WAKE: a dropped eventfd write is healed by the pa
 test "a timer deadline's timeout that finds a fresh inbox message is NOT a rescue: 1 ms timer parks under a foreign spawn storm count 0 tick rescues (the phantom exec_lane_tick_rescues under the smoke's storm)" {
     const l = try testLane(.meta, 64, false);
     defer l.deinit();
+    // Spawns, not seconds: the ticker keeps every park timer-bounded until
+    // the producer has finished its LAST spawn — push and wake — so no park
+    // runs the full tick while a producer can be between the two (a
+    // producer starved past the 2 s tick there read as a rescue under 8 ×
+    // `yes`: the ticker's 300 ms had run out while the producer still
+    // stormed).
+    const spawns = 2_000;
     const Timed = struct {
-        /// A fiber keeping a 1 ms timer armed on the lane for ~300 ms: every
-        /// park's bound is the timer, never the full tick.
         fn ticker(context: *const anyopaque) void {
             const c = ctxOf(context);
             const f = currentFiber().?;
-            const until = clock.monotonicNs() + 300 * std.time.ns_per_ms;
-            while (clock.monotonicNs() < until) {
+            while (c.probe.done.load(.acquire) == 0) {
                 c.lane.timers.arm(f, clock.monotonicNs() + std.time.ns_per_ms);
                 f.park();
                 _ = c.lane.timers.cancel(f);
             }
-            c.probe.finish();
         }
         fn noop(context: *const anyopaque) void {
             _ = ctxOf(context).probe.hits.fetchAdd(1, .monotonic);
         }
-        fn producer(lane: *Lane, grp: *Io.Group, probe: *Probe, stop: *std.atomic.Value(bool)) void {
-            while (!stop.load(.acquire)) {
-                _ = spawnTest(lane, grp, noop, .{ .probe = probe, .lane = lane }) catch {};
+        fn producer(lane: *Lane, grp: *Io.Group, probe: *Probe, finished: *Probe) void {
+            var n: usize = 0;
+            while (n < spawns) {
+                if (spawnTest(lane, grp, noop, .{ .probe = probe, .lane = lane })) |_| n += 1 else |_| {}
                 std.Thread.yield() catch {};
             }
+            finished.finish();
         }
     };
     var gt = membersGroup(1);
-    var pt: Probe = .{};
-    _ = try spawnTest(l, &gt, Timed.ticker, .{ .probe = &pt, .lane = l });
+    var finished: Probe = .{};
+    _ = try spawnTest(l, &gt, Timed.ticker, .{ .probe = &finished, .lane = l });
     var gp = membersGroup(1 << 20);
     var pp: Probe = .{};
-    var stop: std.atomic.Value(bool) = .init(false);
-    const t = try std.Thread.spawn(.{}, Timed.producer, .{ l, &gp, &pp, &stop });
-    pt.waitDone();
-    stop.store(true, .release);
+    const t = try std.Thread.spawn(.{}, Timed.producer, .{ l, &gp, &pp, &finished });
     t.join();
     waitQuiescent(l);
-    try testing.expect(pp.hits.load(.monotonic) > 100);
+    try testing.expectEqual(@as(u32, spawns), pp.hits.load(.monotonic));
     try testing.expectEqual(@as(u64, 0), l.tick_rescues.load(.monotonic));
 }
 

@@ -4135,7 +4135,7 @@ fn awaitIntentsClosed(host: anytype, tag: []const u8) ![]u8 {
     const tail = try awaitExactly(host, "\"xv_cross_owner_intents_open\":", 0, 2 * kill_row_wait_ns);
     if ((numberAfter(tail, "\"xv_cross_owner_intents_open\":") orelse 0) != 0) {
         std.debug.print("\n--- {s}: cross-owner intents still open ---\n", .{tag});
-        for ([_][]const u8{ "xv_cross_owner_intents_open", "xv_cross_owner_intents_stuck", "xv_cross_owner_intents_minted", "xv_cross_owner_intents_retired", "xv_started", "xv_completed", "xv_recovered", "xv_compensated", "xv_recovered_compensated", "xv_abandoned", "xv_cadence_passes", "xv_held_open", "xv_resumed", "xv_resumed_completed", "xv_resumed_gone", "xv_applied_attested", "slot_move_unresolved", "slot_move_reissues", "slot_door_coherence_refusals", "appender_recoveries", "membership_evictions" }) |k| {
+        for ([_][]const u8{ "xv_cross_owner_intents_open", "xv_cross_owner_intents_stuck", "xv_cross_owner_intents_minted", "xv_cross_owner_intents_retired", "xv_started", "xv_completed", "xv_recovered", "xv_compensated", "xv_recovered_compensated", "xv_abandoned", "xv_cadence_passes", "xv_held_open", "xv_resumed", "xv_resumed_completed", "xv_resumed_gone", "xv_applied_attested", "slot_move_unresolved", "slot_move_reissues", "slot_door_coherence_refusals", "appender_recoveries", "membership_evictions", "recovery_ledger_polls", "recovery_intents_rolled_forward", "xv_cross_owner_guards_parked", "xv_cross_owner_guards_swept_dead", "fuse_op_watchdog_overdue", "dir_stripe_migrated_names", "dir_stripe_migration_rounds" }) |k| {
             var kbuf: [64]u8 = undefined;
             std.debug.print("{s} {?d}\n", .{ k, numberAfter(tail, std.fmt.bufPrint(&kbuf, "\"{s}\":", .{k}) catch unreachable) });
         }
@@ -4179,7 +4179,7 @@ fn lsEqualsFind(view: []const u8) bool {
     return std.mem.eql(u8, ls_n, find_n);
 }
 
-test "smoke: THE SHARED HOT DIRECTORY ACROSS DAEMONS — A (the manager) mkdirs `hot`; B JOINED storms creates into it ⇒ A's judge: B dominates past N_floor, the OFFER rides B's renewal grant, B accepts, the slot MOVES (slot_offers_pushed ≥ 1, slot_handovers 1 at A; A's census flips nothing — one creator) → A and a THIRD daemon C storm into `hot`, now B's ⇒ two creators past N_floor: B FLIPS it over K = 64 stripes, 21 supplied by A and 21 by C over `SupplyStripeInos` (one batch each), 22 minted by B; every later create keys a stripe and ships into a striping domain feed no window (handovers stay 1) → `ls | wc -l`, `find` and the (name, ino) digest of every entry EQUAL from A, B and C → kill -9 B (the holder of `hot` and 22 stripes) mid-storm ⇒ A evicts B at T_owner and recovers its region (hot's slot and B's stripes the manager's), every open intent rolls forward (stuck 0), the storms continue → the view equal from A and C → kill -9 C (a SUPPLIER: 21 stripes are records in its slot) mid-storm ⇒ A recovers its region, the supplied stripes stand, every name listed → umount A → fsck --offline --scrub 0 findings (C17 clean: no mapped stripe lost)" {
+test "smoke: THE SHARED HOT DIRECTORY ACROSS DAEMONS — A (the manager) mkdirs `hot`; B JOINED storms creates into it ⇒ A's judge: B dominates past N_floor, the OFFER rides B's renewal grant, B accepts, the slot MOVES (slot_offers_pushed ≥ 1, slot_handovers 1 at A; A's census flips nothing — one creator) → A and a THIRD daemon C storm into `hot`, now B's ⇒ two creators past N_floor: B FLIPS it over K = 64 stripes, 21 supplied by A and 21 by C over `SupplyStripeInos` (one batch each), 22 minted by B; every later create keys a stripe and ships into a striping domain feed no window (handovers stay 1) → `ls | wc -l`, `find` and the (name, ino) digest of every entry EQUAL from A, B and C → kill -9 B (the holder of `hot` and 22 stripes) mid-storm ⇒ A evicts B at T_owner and recovers its region (hot's slot and B's stripes the manager's), every open intent rolls forward (stuck 0), the storms continue → the view equal from A and C → kill -9 C (a SUPPLIER: 21 stripes are records in its slot) mid-storm, C storming too (it dies holding guard scopes parked at A) ⇒ A evicts it, sweeps its scopes and recovers its region, the supplied stripes stand, every name listed → umount A → fsck --offline --scrub 0 findings (C17 clean: no mapped stripe lost)" {
     const io = testing.io;
     if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
     const gpa = testing.allocator;
@@ -4400,6 +4400,11 @@ test "smoke: THE SHARED HOT DIRECTORY ACROSS DAEMONS — A (the manager) mkdirs 
     // record (C17's missing-stripe is the loss this phase guards).
     var storm_a3 = try Storm.start(rig, rig.mp, "a3", "z");
     defer storm_a3.deinit(rig);
+    // C storms too, through its kill: it dies holding travelling guard
+    // scopes parked at A (its creates into A's stripes) and A must still
+    // evict it, sweep the scopes and recover its region.
+    var storm_c3 = try Storm.start(rig, c.mp, "c3", "w");
+    defer storm_c3.deinit(rig);
     {
         const tc = try c.stats();
         defer gpa.free(tc);
@@ -4411,6 +4416,9 @@ test "smoke: THE SHARED HOT DIRECTORY ACROSS DAEMONS — A (the manager) mkdirs 
     }
     const t_kill_c = clock.monotonicNs();
     try c.kill();
+    // C's creates fail on its detached mount from here; the count is what
+    // landed before the kill.
+    const nc3 = try storm_c3.finish(rig);
     const ta_rec2 = try awaitStats(rig, &.{ .{ .key = "\"appender_recoveries\":", .want = 2 }, .{ .key = "\"recovered_regions_released\":", .want = 2 } }, kill_row_wait_ns);
     defer gpa.free(ta_rec2);
     const recovered_c_ms = (clock.monotonicNs() - t_kill_c) / std.time.ns_per_ms;
@@ -4431,10 +4439,12 @@ test "smoke: THE SHARED HOT DIRECTORY ACROSS DAEMONS — A (the manager) mkdirs 
         if (!lsEqualsFind(va)) reportHotViews(rig, &.{.{ .tag = "a", .mp = rig.mp }});
         var lines = std.mem.splitScalar(u8, va, '\n');
         const listed = try std.fmt.parseInt(u64, std.mem.trim(u8, lines.next().?, " "), 10);
-        // Phase 3's names (≤ 2 uncounted) and A's new ones (≤ 1 more).
-        try testing.expect(listed >= total1 + na2 + nc2 + na3 and listed <= total1 + na2 + nc2 + na3 + 3);
+        // Phase 3's names (≤ 2 uncounted), A's and C's new ones (≤ 1 more
+        // each: C's create in flight at its kill lands if its step reached
+        // A before the death).
+        try testing.expect(listed >= total1 + na2 + nc2 + na3 + nc3 and listed <= total1 + na2 + nc2 + na3 + nc3 + 4);
         try testing.expectEqualStrings(std.mem.trim(u8, lines.next().?, " "), std.mem.trim(u8, std.mem.sliceTo(va, '\n'), " "));
-        std.debug.print("smoke: shared hot dir: phase 4 — C (a supplier of 21 stripes) killed; A recovered its region {d} ms after (evictions 2, recoveries 2, rollbacks 0); A created {d} more into the stripes C supplied and its own; {d} entries listed (ls = find); open intents 0\n", .{ recovered_c_ms, na3, listed });
+        std.debug.print("smoke: shared hot dir: phase 4 — C (a supplier of 21 stripes) killed mid-storm; A recovered its region {d} ms after (evictions 2, recoveries 2, rollbacks 0); A created {d} more and C {d} before its kill; {d} entries listed (ls = find); open intents 0\n", .{ recovered_c_ms, na3, nc3, listed });
     }
     try rig.umount();
     try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());

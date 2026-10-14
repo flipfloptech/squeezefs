@@ -4,7 +4,7 @@ The five items `rung-10-dev-perf.md` left open: §9.4's "host's disk filled" par
 the handover MOVE MATRIX panicking in the allocator) and §9.8's "Owed" and "not this lever's"
 paragraphs (the negative-dentry coherence question AB.2 left open, the macOS online fsck false
 positive, `KmbufRingEnomem` after hours of gates, the `-o ro` reader's refused remount). Decision
-0003 §AE. Every row below was red before its fix on the tree it landed on.
+0003 §AG. Every row below was red before its fix on the tree it landed on.
 
 ## 1. A device EIO under the handover move matrix panicked instead of failing loud
 
@@ -261,3 +261,33 @@ The shield is the producer's: the in-flight registry (`InflightAllocGuard`, Phas
 `inflightContains`, today held only from a mint to its publish) held from before every releasing
 commit until its terminal free, at every release site (the destroy and corpse sweep, truncate, the
 overwrite's old block, the pack release). Not done here; 4/150 under 14 × `yes` (0 in 100 idle).
+
+## The queued sideband abort (`Sideband.completeCell → recycle`, `session.zig:642` on `5ababa8`)
+
+Not reproduced, and no log of it was reachable (none under `/build/tmp`, `/build` or the Mac's
+`/tmp`). On `5ababa8` line 642 is `completeCell`'s `self.recycle(idx)`: the abort is `recycle`'s
+`assert(free.tryPush(idx))` (or `nb_free`'s) — a cell recycled while already free, so its queue
+fills one push early. Every path that recycles a cell was audited: the fire-and-forget CQE (one
+recycle per write), a blocking reply (its waiter recycles after `done`; the loop never does), the
+no-SQE `EAGAIN` completion, `finish()`'s drains (each cell either in flight or in `ready`, never
+both), `fillNotify`'s own recycle on a refused frame (its callers do not recycle again — except
+`writeOwedEpoch`'s `catch return self.recycle(idx)`, a double recycle reachable only when
+`notifyIncEpoch` refuses a frame, which it cannot: a 16 B header into a cell). The SQ cannot
+overflow (`sidebandEntries(cells)` = 2 × the power-of-two pool ≥ pool + the 8 reserved cells + 3).
+Owed: the next occurrence's stack and test name; the item-2 change (`notify_pending`) adds a counter
+on these paths and moves no recycle.
+
+## Gates
+
+Item 1 (`5ababa8`): venue 49/49 steps, 2,870 / 2,943 passed (73 skipped), 9 m 43 s; macOS 29/29,
+2,258 / 2,287 (29 skipped). Item 2 (`695973b`, rebased over the symdefects agent's membership
+change): venue 49/49, 2,875 / 2,948 (73 skipped), 8 m 21 s; macOS 29/29, 2,263 / 2,292 (29
+skipped); an earlier run of the same change failed the cache-path data smoke's promotion count
+(`smoke.zig:6329`, `promotions ≥ 1 + 1 + storm_files`) under load and passed 3/3 alone and on the
+rerun. Items 5, 4 and 3 (`26f6c15`, `db3ae04`, `9259378`, one tree): venue 49/49, 2,877 / 2,950
+(73 skipped), 8 m 49 s; macOS 29/29 (2,262 / 2,294 with 29 skipped on the full run). Their first
+runs met load: the venue's unit compile was OOM-killed (`signal KILL`, load 10) and the cache-path
+data smoke's promotion count failed again (`smoke.zig:6352`); on macOS (load 18–20 from parallel
+gates) the write-pipeline admission row, the conveyor's §L window-fill row and the fsck storm's
+`[C2] leaked` (the owed window above) failed; every one passed on the rerun of the same tree.
+

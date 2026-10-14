@@ -819,7 +819,7 @@ pub const Outcome = Error!void;
 /// The completion channel per tx: the committer parks on it; the lane
 /// sends the terminal outcome after dropping the guards.
 /// A committer's channel: the outcome, and the instant the lane answered
-/// (stored AFTER the send — non-zero ⇒ the outcome is in the channel). The
+/// (stored BEFORE the send — non-zero ⇒ the outcome is on its way). The
 /// committer's spin polls it lock-free; its park learns the ack → resume
 /// wake from it (decision 0003 §AB.4).
 pub const Done = struct {
@@ -829,11 +829,14 @@ pub const Done = struct {
     pub const init: Done = .{};
 
     pub fn send(self: *Done, io: Io, outcome: Outcome) error{ReceiverGone}!void {
+        // The stamp BEFORE the send: once the channel holds the outcome the
+        // receiver may take it and return, and its Done (a frame of its
+        // stack) is no longer ours to write. Release: pairs with the
+        // spinner's acquire — a non-zero stamp is an outcome on its way
+        // (the receiver's recv waits out the channel's lock for it).
+        self.acked_ns.store(@max(clock.monotonicNs(), 1), .release);
         try self.ch.send(io, outcome);
         holdAfterSend();
-        // Release: pairs with the spinner's acquire — a non-zero stamp is a
-        // sent outcome (the channel's own lock orders the value).
-        self.acked_ns.store(@max(clock.monotonicNs(), 1), .release);
     }
 
     fn holdAfterSend() void {
@@ -879,7 +882,8 @@ pub const AckSpin = struct {
 };
 
 /// Spin on `done` for at most `bound_ns`; true = the ack landed inside it
-/// (its outcome is in the channel: a `recv` returns at once).
+/// (its outcome is on its way: a `recv` takes it, at worst after the
+/// sender's channel lock).
 pub fn spinForAck(done: *const Done, bound_ns: u64) bool {
     const t0 = clock.monotonicNs();
     while (done.acked_ns.load(.acquire) == 0) {
@@ -3224,7 +3228,7 @@ test "the ack spin's bound (decision 0003 §AB.4): no measured wake ⇒ no spin;
     try testing.expectEqual(@as(u64, 35_000), a.read().bound_ns);
 }
 
-test "the ack spin: an ack landing inside the bound is a hit (the outcome is already in the channel); none inside is a fall-through after the whole bound" {
+test "the ack spin: an ack landing inside the bound is a hit (the outcome on its way: the recv takes it); none inside is a fall-through after the whole bound" {
     var done: Done = .init;
     const Sender = struct {
         fn run(d: *Done) void {

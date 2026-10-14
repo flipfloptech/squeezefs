@@ -948,7 +948,7 @@ const Storm = struct {
     }
 };
 
-test "zero false positives: a live writer storm (creates, publishes, unlinks, destroys) during ten online runs ⇒ 0 findings; the suspects clear through the era floor, the epoch map, the in-flight registry and the fresh re-reads" {
+test "zero false positives: a live writer storm (creates, publishes, unlinks, destroys) during ten online runs that each overlap its progress ⇒ 0 findings; the suspects clear through the era floor, the epoch map, the in-flight registry and the fresh re-reads" {
     const gpa = testing.allocator;
     const set = try RamSet.init(gpa);
     defer set.deinit();
@@ -957,9 +957,16 @@ test "zero false positives: a live writer storm (creates, publishes, unlinks, de
     var storm: Storm = .{ .set = set };
     const t1 = try std.Thread.spawn(.{}, Storm.run, .{ &storm, 1 });
     const t2 = try std.Thread.spawn(.{}, Storm.run, .{ &storm, 2 });
+    // A run counts when the storm completed an op during it (a run that
+    // met no progress — the storm's threads not yet scheduled on a loaded
+    // host — judged a quiet set and proves nothing), and the runs go on
+    // until the shields engaged: ten overlapping runs, then the first
+    // exemption or clear (the storm's in-flight windows are the shields'
+    // object).
     var total_suspects: u64 = 0;
-    var runs: u32 = 0;
-    while (runs < 10) : (runs += 1) {
+    var overlapping: u32 = 0;
+    while (overlapping < 10 or total_suspects == 0) {
+        const ops0 = storm.ops.load(.acquire);
         var r = try ram.run(set, .online, .{ .scrub = true });
         defer r.deinit(gpa);
         if (r.findings.len != 0) {
@@ -969,20 +976,18 @@ test "zero false positives: a live writer storm (creates, publishes, unlinks, de
             t2.join();
             return error.FalsePositive;
         }
+        if (storm.ops.load(.acquire) != ops0) overlapping += 1;
         total_suspects += r.counters.suspects + r.counters.current_era_exempted + r.counters.epoch_exempted + r.counters.inflight_exempted + r.counters.nlink_transient_cleared;
     }
     storm.stop.store(true, .release);
     t1.join();
     t2.join();
     try testing.expect(storm.err == null);
-    try testing.expect(storm.ops.load(.monotonic) > 20);
     // The storm's residue (a half-created lane at stop) is current-era:
     // still no verdict, and a later era sees it as the next mount's.
     var r = try ram.run(set, .online, .{});
     defer r.deinit(gpa);
     try ram.expectClasses(r, &.{});
-    // The shields did work: the exemption and clear counters moved.
-    try testing.expect(total_suspects > 0);
 }
 
 /// The C8 race the macOS gate's storm met (`[C8] durable refs 0 vs derived

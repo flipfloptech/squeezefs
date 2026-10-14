@@ -1095,6 +1095,60 @@ test "CustodyGrant: ONE round trip carries the custody epoch and the file's read
     try testing.expect(!f.holder.holdsGrant(io, objectOf(3), 77));
 }
 
+test "a grant ask from a member whose lease lapsed before its eviction ran — a frame it sent while live, served after its deadline (the shared hot directory row: the killed holder's asks queued behind its own grant parked on its own recall) — is refused NotMember and counted, a state the protocol handles, never a tripwire; nothing is registered and the member's next ask after the eviction is refused the same" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    const f = try TwoMembers.init(gpa, io, 1);
+    defer f.deinit();
+    const c = &f.b_to_a[0];
+    const ask: verbs.Request = .{ .token_grant = .{ .head = .{ .volume = 0, .wants = verbs.WANT_RECORDS, .mode = 0, .xattr_after_len = 0, .client_id = 1, .object = objectOf(3), .after = 0 }, .bytes = "" } };
+    // Live: granted.
+    const rep = try c.call(ask);
+    try testing.expectEqual(@as(u8, @backingInt(verbs.GrantPageKind.granted)), rep.token_grant.head.kind);
+    _ = f.holder.serveRelease(io, 1, &.{objectOf(3)});
+    // The owner's deadline for member 1 passed; its eviction has not run.
+    try f.leases.grant(1, clock.monotonicNs() - table.T_OWNER_NS - 1);
+    const refused0 = table.stats.dlm_token_nonmember_refusals.load();
+    const trips0 = counters.invariantTripwires();
+    try testing.expectError(error.MembershipPending, c.call(ask));
+    try testing.expectEqual(refused0 + 1, table.stats.dlm_token_nonmember_refusals.load());
+    try testing.expectEqual(trips0, counters.invariantTripwires());
+    try testing.expect(!f.holder.holdsGrant(io, objectOf(3), 1));
+    // Evicted: not listed — refused the same.
+    f.leases.remove(1);
+    try testing.expectError(error.MembershipPending, c.call(ask));
+    try testing.expectEqual(refused0 + 2, table.stats.dlm_token_nonmember_refusals.load());
+    try testing.expectEqual(trips0, counters.invariantTripwires());
+}
+
+test "a grant ask parked on the member's OWN pending recall whose lease lapses during the wait (the recall completes at the lease's expiry) is refused NotMember at its registration — never registered to an expired member; the frame queued behind it the same" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    const f = try TwoMembers.init(gpa, io, 1);
+    defer f.deinit();
+    var s = (try f.reader(0).serve(io, objectOf(3), .{})).?;
+    s.release(io);
+    // The member stops acking (killed): its lease ends 400 ms from now.
+    f.peers.unreachable_[0] = true;
+    try f.leases.grant(1, (clock.monotonicNs() -| table.T_OWNER_NS) + 400 * std.time.ns_per_ms);
+    const recalls0 = table.stats.dlm_token_recalls.load();
+    var pass: PassThread = .{ .f = f, .object = objectOf(3) };
+    const th = try std.Thread.spawn(.{}, PassThread.run, .{&pass});
+    defer th.join();
+    // The ask arrives while the recall to it is pending (bounded wait for
+    // the recall's frame).
+    const deadline = clock.monotonicNs() + 5 * std.time.ns_per_s;
+    while (table.stats.dlm_token_recalls.load() == recalls0 and clock.monotonicNs() < deadline) try io.sleep(.fromMilliseconds(1), .awake);
+    try testing.expect(table.stats.dlm_token_recalls.load() > recalls0);
+    const waits0 = table.stats.dlm_token_regrant_under_recall_waits.load();
+    const refused0 = table.stats.dlm_token_nonmember_refusals.load();
+    const c = &f.b_to_a[0];
+    try testing.expectError(error.MembershipPending, c.call(.{ .token_grant = .{ .head = .{ .volume = 0, .wants = verbs.WANT_RECORDS, .mode = 0, .xattr_after_len = 0, .client_id = 1, .object = objectOf(3), .after = 0 }, .bytes = "" } }));
+    try testing.expect(table.stats.dlm_token_regrant_under_recall_waits.load() > waits0);
+    try testing.expectEqual(refused0 + 1, table.stats.dlm_token_nonmember_refusals.load());
+    try testing.expect(!f.holder.holdsGrant(io, objectOf(3), 1));
+}
+
 test "a grant on a slot another appender leases is answered NotHolder and the reader follows the redirect ONCE inside the op" {
     const gpa = testing.allocator;
     const io = testing.io;

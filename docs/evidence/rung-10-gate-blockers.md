@@ -184,6 +184,16 @@ Three consecutive green on each venue: venue F2–F4, macOS 5–7. In F1–F4 th
   df (`8192 KiB used vs 0` with 6 + 5 promotions), then a census run before the rm'd files'
   destroys (181 blocks in use, 0 findings) — both restated in §2, neither a product defect.
 
+**On the landed tree** (`352a16f`: the above rebased over the second wave of gate-blocker fixes,
+`0003 §AI`). macOS: 183 s, 208 s, 200 s — 29/29, 2,282 / 2,311 (29 skipped), three consecutive
+green. Venue: F1 401 s red on "CUSTODY NO CLOSE COVERS IS DRAINED ONCE IDLE" (the zero-message
+opens' §AF row, `smoke.zig:7263`: `parked_buffers` 0 read in the same stats tail as the idle drain's
+count — not a path this work changed, whose write-path edit drops the merge's holds after the
+frees), F2 384 s and F3 377 s green (49/49, 2,904 / 2,983, 79 skipped), F4 541 s red on "THE SHARED
+HOT DIRECTORY ACROSS DAEMONS" (`expected 0, found 11` open intents after B's kill with
+`xv_cross_owner_intent_stuck` — the signature `rung-10-symmetric-defects.md` item 2 recorded on its
+tree). Three consecutive venue greens stand on `2b2409c` (F2–F4 above), not yet on the landed tree.
+
 **The venue livelock.** Concurrent full gates (this agent's under 4 × `yes`, and others')
 over-committed the VM's 16 GiB until not even `exec echo` started; the orchestrator stopped
 `sqz-zig` from the host (venue gate 7 on `dc130f2` died with it) and serialized full gates

@@ -112,8 +112,12 @@ pub const stats = struct {
     /// never a dial.
     pub var dlm_token_holder_dead_redirects: counters.ShardedCounter = .{};
     /// A member whose lease the owner says EXPIRED reached a token verb:
-    /// `NotMember`, nothing registered (must-stay-0 on a healthy fleet).
-    pub var dlm_token_nonmember_refusals: counters.Tripwire = .init("dlm_token_nonmember_refusals");
+    /// `NotMember`, nothing registered. A state the protocol answers, not
+    /// a fault (decision 0003 §AE.3): a frame the member sent while live is
+    /// served after its deadline whenever its session queued it — behind
+    /// its own grant parked on its own pending recall, which completes only
+    /// at the lease's expiry (the shared hot directory row's killed holder).
+    pub var dlm_token_nonmember_refusals: counters.ShardedCounter = .{};
     /// A `CustodyGrant` whose words the screen refused (must-stay-0).
     pub var dlm_token_custody_rejected: counters.Tripwire = .init("dlm_token_custody_rejected");
     pub var dlm_token_releases: counters.ShardedCounter = .{};
@@ -748,17 +752,25 @@ pub const Holder = struct {
             var n = self.ack_wake.notified();
             const pre = n.enable(io);
             var wake_at: u64 = 0;
+            var done = false;
+            const retired0 = summary.expired_with_lease + summary.timeouts_live;
             {
                 self.lock.lockUncancelable(io);
                 defer self.lock.unlock(io);
                 const now = clock.monotonicNs();
                 self.sweepExpiredLocked(now, &summary);
                 self.expireOverdueLocked(now, &summary);
-                if (self.outstandingLocked(objects) == 0) {
-                    n.cancel(io);
-                    break;
-                }
-                wake_at = self.nextWakeLocked(now);
+                done = self.outstandingLocked(objects) == 0;
+                if (!done) wake_at = self.nextWakeLocked(now);
+            }
+            // A frame this pass retired at a lease's expiry or past the
+            // deadline frees every grant parked on that recall (a serve
+            // waits on the same wake an ack posts) — never left to its own
+            // park deadline.
+            if (summary.expired_with_lease + summary.timeouts_live != retired0) self.ack_wake.notifyWaiters(io);
+            if (done) {
+                n.cancel(io);
+                break;
             }
             if (!pre) _ = n.waitUntilUncancelable(io, wake_at) else n.cancel(io);
         }
@@ -861,10 +873,7 @@ pub const Holder = struct {
     /// `scratch` (the session's).
     pub fn serveGrant(self: *Holder, io: Io, ask: GrantAsk, source: RecordSource, scratch: []u8) Error!GrantReply {
         const now = clock.monotonicNs();
-        if (self.oracle.verdict(self.oracle.ctx, ask.client, now, now) == .expired) {
-            stats.dlm_token_nonmember_refusals.fire("a member whose lease the owner lists EXPIRED asked for a grant");
-            return .not_member;
-        }
+        if (self.refuseExpired(ask.client)) return .not_member;
         const park_deadline = now + self.recallDeadlineNs();
         var attempt: u32 = 0;
         while (true) : (attempt += 1) {
@@ -890,6 +899,10 @@ pub const Holder = struct {
                 }
                 if (n.waitUntilUncancelable(io, park_deadline) == .deadline) return error.ParkExpired;
             }
+            // The membership lease again at every registration: the wait
+            // for the member's own recall above ends at its lease's expiry
+            // when the member stopped acking.
+            if (self.refuseExpired(ask.client)) return .not_member;
             // Register FIRST (the lane's lock), THEN check the gate.
             {
                 self.lock.lockUncancelable(io);
@@ -924,6 +937,16 @@ pub const Holder = struct {
             stats.dlm_token_grants_served.inc();
             return .{ .granted = page };
         }
+    }
+
+    /// The membership lease FIRST (the frame law): a client the owner lists
+    /// EXPIRED is refused `NotMember` and counted, nothing registered.
+    fn refuseExpired(self: *Holder, client: ClientId) bool {
+        const now = clock.monotonicNs();
+        if (self.oracle.verdict(self.oracle.ctx, client, now, now) != .expired) return false;
+        stats.dlm_token_nonmember_refusals.inc();
+        log.warn("tokens: a grant ask from client {x} refused NotMember — the membership owner lists its lease EXPIRED (a frame it sent while live, served after its deadline)", .{client});
+        return true;
     }
 
     fn retract(self: *Holder, io: Io, object: Object, client: ClientId) void {

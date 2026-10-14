@@ -1087,10 +1087,7 @@ test "CustodyGrant: ONE round trip carries the custody epoch and the file's read
     try testing.expectEqual(rejected0 + 1, table.stats.dlm_token_custody_rejected.load());
     // A member the owner does not list: NotMember, nothing registered.
     const ghost0 = table.stats.dlm_token_nonmember_refusals.load();
-    table.stats.dlm_token_nonmember_refusals.resetLogBudgetForTest();
-    log.testing.expectErrorLogs(1);
     try testing.expectError(error.MembershipPending, c.call(.{ .token_grant = .{ .head = .{ .volume = 0, .wants = verbs.WANT_RECORDS, .mode = 0, .xattr_after_len = 0, .client_id = 77, .object = objectOf(3), .after = 0 }, .bytes = "" } }));
-    try log.testing.expectAllFired();
     try testing.expectEqual(ghost0 + 1, table.stats.dlm_token_nonmember_refusals.load());
     try testing.expect(!f.holder.holdsGrant(io, objectOf(3), 77));
 }

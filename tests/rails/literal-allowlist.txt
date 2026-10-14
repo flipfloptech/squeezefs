@@ -475,14 +475,14 @@ src/meta/sym/slots/lease_table.zig:101 | 40 | a size — OWED: derive from deriv
 src/meta/sym/slots/lease_table.zig:102 | 41 | a size — OWED: derive from derive.Facts or document the physical/format reason
 src/meta/sym/slots/lease_table.zig:657 | 48 | a size — OWED: derive from derive.Facts or document the physical/format reason
 src/meta/sym/slots/lease_table.zig:736 | 32 | a size — OWED: derive from derive.Facts or document the physical/format reason
-src/meta/sym/tokens/token_table.zig:149 | 8 | OWED: derive it or document it on the line (charter §1.5)
-src/meta/sym/tokens/token_table.zig:150 | 16 | OWED: derive it or document it on the line (charter §1.5)
-src/meta/sym/tokens/token_table.zig:150 | 8 | OWED: derive it or document it on the line (charter §1.5)
-src/meta/sym/tokens/token_table.zig:151 | 32 | OWED: derive it or document it on the line (charter §1.5)
-src/meta/sym/tokens/token_table.zig:151 | 9 | OWED: derive it or document it on the line (charter §1.5)
-src/meta/sym/tokens/token_table.zig:152 | 10 | OWED: derive it or document it on the line (charter §1.5)
-src/meta/sym/tokens/token_table.zig:152 | 64 | OWED: derive it or document it on the line (charter §1.5)
-src/meta/sym/tokens/token_table.zig:153 | 11 | OWED: derive it or document it on the line (charter §1.5)
+src/meta/sym/tokens/token_table.zig:153 | 8 | OWED: derive it or document it on the line (charter §1.5)
+src/meta/sym/tokens/token_table.zig:154 | 16 | OWED: derive it or document it on the line (charter §1.5)
+src/meta/sym/tokens/token_table.zig:154 | 8 | OWED: derive it or document it on the line (charter §1.5)
+src/meta/sym/tokens/token_table.zig:155 | 32 | OWED: derive it or document it on the line (charter §1.5)
+src/meta/sym/tokens/token_table.zig:155 | 9 | OWED: derive it or document it on the line (charter §1.5)
+src/meta/sym/tokens/token_table.zig:156 | 10 | OWED: derive it or document it on the line (charter §1.5)
+src/meta/sym/tokens/token_table.zig:156 | 64 | OWED: derive it or document it on the line (charter §1.5)
+src/meta/sym/tokens/token_table.zig:157 | 11 | OWED: derive it or document it on the line (charter §1.5)
 src/meta/sym/wire_plane.zig:267 | 3 | a table entry (switch/range arm) — the codec or classification table
 src/meta/sym/wire_plane.zig:268 | 4 | a table entry (switch/range arm) — the codec or classification table
 src/meta/sym/xv/applier.zig:296 | 12 | a size — OWED: derive from derive.Facts or document the physical/format reason

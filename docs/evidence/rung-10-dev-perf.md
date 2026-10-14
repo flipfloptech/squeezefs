@@ -756,11 +756,29 @@ under a moving load; the second census's A ran beside a gate); its counts are ex
 
 ### 10.6 Gates
 
-Pre-landing on the first commit: venue 49/49 steps, 2,864 / 2,942 (78 skipped), 6 m 53 s (an
-earlier run of the same tree: 2 failed — the defrag `--fold` row, §10.3's held fds, and one
-"data plane WITH a cache path" run that passed 2/2 alone after); macOS 25/29 steps with one
-failure, `ops.jobs.fabric` "duty cycle adheres within ten percent" (a wall-clock duty cycle under
-host load; passed alone).
+Pre-landing, on the rebased tree: venue 49/49 steps, 2,893 / 2,972 (79 skipped); macOS 29/29,
+2,246 / 2,275 (29 skipped) — the shard that met `ops.jobs.fabric` "duty cycle adheres within ten
+percent" (a wall-clock duty cycle on a host at load 15–40) re-run green. Landed as `fa45731` +
+`acdc7dc`.
+
+Post-landing, a venue just rebooted (19 minutes up) turned two rows red that a long-lived venue
+never had: the lifecycle burst row aged its drain stamp by setting it to 1 ns since boot — inside
+its one-hour window on a young venue, so the close coalesced instead of draining; and the smoke
+burst row read owed 0 while the cadence's harvested drain was still landing (parked 1). Both
+now judge their own clocks (`2814113`: the window shrinks to 1 ns; the row awaits both words at
+once). Then three consecutive full venue gates on landed `dev` (`2814113`), each uncached:
+**49/49 steps, 2,893 / 2,972 passed (79 skipped)** each — 5 m 46 s, 6 m 02 s, 7 m 05 s. The run
+before them met `wire.tcp_e2e_linux` "a severed connection surfaces HolderUnreachable" once (the
+cluster wire's TCP sever, not this lever's).
+
+Rows the gates met that are not this lever's, attributed: the data-plane "WITH a cache path" row
+read promotions 3–7 (≥ 10 asserted) in five full gates run while a peer's CPU-saturation loop
+held the venue — 0 staging-ring refusals; standalone and in the smoke step alone it reads 11 in
+both open postures under the same load, and it failed the same way in a gate of 2026-10-13
+before this lever (`.wt-syncfs`); a peer is restating it (both promotion arms counted). The `-o
+ro` reader row read "a writer appeared (same_host_lock)" where it asserts `ledger_advance`
+(which detection fires first); the rejoin row met its successor's claim race; kmbuf ENOMEM
+refused mounts while a peer's load loop drained the free lists.
 
 ### Owed
 

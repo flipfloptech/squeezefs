@@ -2056,8 +2056,8 @@ test "smoke: THE ONLINE VOLUME ROW ACROSS DAEMONS — mount A (the manager) + B 
     try rig.env.put("SQUEEZEFS_FSYNC_PROMOTE_STAGED", "1");
     // A holds the online arm of d2 until its holder answered a data-plane
     // verb for a volume it has not armed (or T_owner passed): a joiner that
-    // learnt d2 before A's arm asks A for it inside the window, and the
-    // closure below judges A's answer.
+    // learnt d2 before A's arm would ask A for it inside the window — A's
+    // log names which ended the hold, the closure judges A's answers.
     try rig.env.put("SQUEEZEFS_TEST_ONLINE_ARM_HOLD", "1");
     try rig.formatSet(true);
     const d2 = try std.fmt.allocPrintSentinel(gpa, "{s}/d2.img", .{rig.work}, 0);
@@ -2126,6 +2126,11 @@ test "smoke: THE ONLINE VOLUME ROW ACROSS DAEMONS — mount A (the manager) + B 
         const text = try b.readLog();
         defer gpa.free(text);
         try testing.expect(std.mem.indexOf(u8, text, "joined this mount ONLINE as ordinal 2 (active)") != null);
+        // The generation moves at A's step 7 (decision 0003 §AI.3): nothing
+        // asked A for d2 before its arm.
+        const at = try rig.readLog();
+        defer gpa.free(at);
+        try testing.expect(std.mem.indexOf(u8, at, "held until T_owner passed with no data-plane verb for an unarmed volume") != null);
     }
     // 3. B writes 4 MiB files (one block each, promoted at their fsync
     //    through the router's round-robin band of three) until d2 holds

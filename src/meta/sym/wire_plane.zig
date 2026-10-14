@@ -82,6 +82,7 @@ const xv = @import("xv.zig");
 const dir_rename = xv.dir_rename;
 const alloc_lease = @import("../../data/sym_planes/alloc_lease.zig");
 const plane_arm = @import("../../data/sym_planes/plane_arm.zig");
+const wire_bind = @import("../../data/sym_planes/wire_bind.zig");
 const block_grant = @import("../../data/sym_planes/block_grant.zig");
 const data_bitmap = @import("../../data/sym_planes/data_bitmap.zig");
 const sym_records = @import("../../data/sym_planes/records.zig");
@@ -92,6 +93,7 @@ const DataPlane = @import("../../data/plane.zig").DataPlane;
 const router = @import("../../data/router.zig");
 const set_config = @import("../../data/set_config.zig");
 const lifecycle_stats = @import("../../ops/lifecycle/stats.zig").stats;
+const lattice = @import("../../ops/lifecycle/lattice.zig");
 const joined = @import("joined.zig");
 const wire_auth = @import("../../wire/auth.zig");
 const listener = @import("../../wire/listener.zig");
@@ -423,9 +425,9 @@ pub const WirePlane = struct {
     /// holder's grant plane is published with a release store and read by
     /// the pre-registered grant verb handlers with an acquire load (the
     /// pair: `bindDataPlanes` store / `serveBlockGrant` load), so a verb
-    /// arriving between the listener and the arm meets a `Busy` refusal,
-    /// never a torn handler; a joiner's writer plane is the cadence's and
-    /// the stop's alone.
+    /// arriving between the listener and the arm meets `not_holder`
+    /// (`grantPlane`), never a torn handler; a joiner's writer plane is the
+    /// cadence's and the stop's alone.
     holder_plane: std.atomic.Value(?*plane_arm.HolderPlane) = .init(null),
     writer_plane: ?*plane_arm.WriterPlane = null,
     /// The holder's page sink home (`kvda_home.zig`): volume 0's heap and
@@ -833,7 +835,7 @@ pub const WirePlane = struct {
 
     /// The owner's grant carries this daemon's `set_config` generation
     /// (`lifecycle_stats.volume_config_generation`: set at the mount's read
-    /// and at every lifecycle commit).
+    /// and published at every lifecycle op's step 7).
     fn configGenerationFn(_: ?*anyopaque) u64 {
         return lifecycle_stats.volume_config_generation.load();
     }
@@ -841,7 +843,10 @@ pub const WirePlane = struct {
     /// `ResolveSetConfig` (the manager's face): volume 0's `set_config`
     /// record as this manager reads it off tree 0 — a joiner's pull at the
     /// generation bump its renewal grant carried. The bytes travel in the
-    /// reply scratch (the record's own total codec decodes them there).
+    /// reply scratch (the record's own total codec decodes them there). A
+    /// record AHEAD of the published word (a lifecycle op between its
+    /// commit and its runtime act) is not served: `Deferred`, the joiner
+    /// pulls again at its next renewal (decision 0003 §AI.3).
     fn serveResolveSetConfig(ctx: *anyopaque, req: *const service.Request, scratch: []u8) service.Answer {
         const self: *WirePlane = @ptrCast(@alignCast(ctx));
         const r = req.payload.resolve_set_config;
@@ -850,6 +855,7 @@ pub const WirePlane = struct {
             return .{ .ok = .{ .resolve_set_config = .{ .head = .{ .generation = 0, .len = 0, .reserved = 0 }, .bytes = &.{} } } };
         defer self.gpa.free(bytes);
         const generation = set_config.peekGeneration(bytes) orelse return service.Answer.refused(error.InputOutput, "set_config head");
+        if (lattice.recordAhead(generation, lifecycle_stats.volume_config_generation.load())) return service.Answer.deferred("set_config: a lifecycle op is between its record and its runtime act");
         if (bytes.len > scratch.len or bytes.len > verbs.SET_CONFIG_MAX) return service.Answer.refused(error.ValueTooLarge, "set_config record exceeds the reply scratch");
         @memcpy(scratch[0..bytes.len], bytes);
         return .{ .ok = .{ .resolve_set_config = .{ .head = .{ .generation = generation, .len = @intCast(bytes.len), .reserved = 0 }, .bytes = scratch[0..bytes.len] } } };
@@ -889,6 +895,7 @@ pub const WirePlane = struct {
         const wp = self.writer_plane orelse return;
         const dp = wp.plane;
         const rep = js.link.call(.{ .resolve_set_config = .{ .volume = 0, .reserved = @splat(0) } }) catch |e| {
+            if (e == error.Deferred) return lifecycle_stats.volume_config_pull_deferrals.inc();
             lifecycle_stats.volume_config_pull_failures.inc();
             log.warn("set config: the manager's record at generation {d} could not be pulled ({s}) — the next renewal retries", .{ generation, @errorName(e) });
             return;
@@ -959,8 +966,8 @@ pub const WirePlane = struct {
     /// predecessor's succession once recovered) and stands the holder's
     /// grant plane up; a joiner stands its writer plane up over the
     /// manager link. A lease refused `busy` or `deferred` arms NO holder
-    /// plane: the grant verbs answer `Busy` and the joiners' writes wait
-    /// (EAGAIN) — never two mints over one volume.
+    /// plane: the grant verbs answer `not_holder` and the joiners' writes
+    /// wait (EAGAIN) — never two mints over one volume.
     pub fn bindDataPlanes(self: *WirePlane, dp: *DataPlane) BindDataError!void {
         const gpa = self.gpa;
         if (self.mgr) |m| {
@@ -1047,10 +1054,47 @@ pub const WirePlane = struct {
         log.warn("data planes: SQUEEZEFS_TEST_ONLINE_ARM_HOLD — the online arm of vol {x} held until {s}", .{ vol_tag, why });
     }
 
-    /// The hold's token: a data-plane verb named a volume the holder has
-    /// not armed.
-    fn noteUnarmed(self: *WirePlane, hp: *plane_arm.HolderPlane, vol_tag: u64) void {
-        if (self.online_arm_hold and !hp.holdsVolume(vol_tag)) sync_tick.wake(self.io, &self.unarmed_answered);
+    /// A data-plane verb named a volume this holder has not armed. The
+    /// protocol's transient (decision 0003 §AI.3): volume 0's record names
+    /// it AHEAD of the published word — an online add between its record
+    /// and its arm, which a joiner mounting inside that window read off
+    /// tree 0's projection — answers `not_holder` (counted; the writer asks
+    /// again at its next mint). A volume no record ahead of the word names
+    /// is a request durable state cannot explain: refused, the tripwire.
+    fn unarmedVolume(self: *WirePlane, vol_tag: u64) service.Answer {
+        if (self.online_arm_hold) sync_tick.wake(self.io, &self.unarmed_answered);
+        if (self.arming(vol_tag)) {
+            plane_arm.stats.block_grant_unarmed_answers.inc();
+            return .{ .status = .{ .status = .not_holder, .reason = "the volume's grant plane arms with its online add" } };
+        }
+        return service.Answer.refused(error.Busy, "this mount does not hold the lease of that volume");
+    }
+
+    /// Volume 0's record names `vol_tag` (not retired) at a generation
+    /// ahead of the published word (a refusal path: one tree-0 read).
+    fn arming(self: *WirePlane, vol_tag: u64) bool {
+        const bytes = (self.set.volumes[0].lookup(self.gpa, key.TREE_CONTROL, set_config.CONTROL_KEY) catch return false) orelse return false;
+        defer self.gpa.free(bytes);
+        const generation = set_config.peekGeneration(bytes) orelse return false;
+        if (!lattice.recordAhead(generation, lifecycle_stats.volume_config_generation.load())) return false;
+        var diag: set_config.Refusal = undefined;
+        var cfg = set_config.decode(self.gpa, bytes, &diag) catch return false;
+        defer cfg.deinit(self.gpa);
+        const d = cfg.find(vol_tag) orelse return false;
+        return d.state != .retired;
+    }
+
+    /// The grant plane of this manager, or the answer to a data-plane verb
+    /// that met none: before `bindDataPlanes` (the listener precedes the
+    /// arm) or with a lease refused `busy` / `deferred` (no plane — never
+    /// two mints over one volume), `not_holder` (counted; the writer asks
+    /// again at its next mint); on a joiner, which holds no allocation
+    /// lease, a misrouted verb: refused.
+    fn grantPlane(self: *WirePlane) union(enum) { plane: *plane_arm.HolderPlane, answer: service.Answer } {
+        if (self.holder_plane.load(.acquire)) |hp| return .{ .plane = hp };
+        if (self.mgr == null) return .{ .answer = service.Answer.refused(error.Busy, "a data-plane verb reached a joiner (not the allocation holder)") };
+        plane_arm.stats.block_grant_unarmed_answers.inc();
+        return .{ .answer = .{ .status = .{ .status = .not_holder, .reason = "no grant plane armed on this mount yet" } } };
     }
 
     fn leaseScreen(self: *WirePlane, dp: *DataPlane) alloc_lease.Screen {
@@ -1077,8 +1121,8 @@ pub const WirePlane = struct {
     /// its pages' window the fixed ring this open already replayed, the
     /// granted ranges re-learnt from the live writers' declarations. Null
     /// = `busy` / `deferred`: NO grant plane armed (logged); the grant verbs
-    /// answer `Busy` and the joiners' writes wait (EAGAIN) — never two mints
-    /// over one volume.
+    /// answer `not_holder` and the joiners' writes wait (EAGAIN) — never two
+    /// mints over one volume.
     fn acquireAllocLease(self: *WirePlane, dp: *DataPlane, vol_tag: u64, blocks: u64) BindDataError!?alloc_lease.Granted {
         const gpa = self.gpa;
         const m = self.mgr orelse return error.Io;
@@ -1186,23 +1230,35 @@ pub const WirePlane = struct {
 
     fn serveBlockGrant(ctx: *anyopaque, req: *const service.Request, scratch: []u8) service.Answer {
         const self: *WirePlane = @ptrCast(@alignCast(ctx));
-        const hp = self.holder_plane.load(.acquire) orelse return service.Answer.refused(error.Busy, "no grant plane armed on this mount (not the allocation holder)");
-        self.noteUnarmed(hp, req.payload.block_grant.vol_tag);
-        return plane_arm.HolderPlane.serveGrant(hp, req, scratch);
+        const hp = switch (self.grantPlane()) {
+            .plane => |hp| hp,
+            .answer => |a| return a,
+        };
+        const tag = req.payload.block_grant.vol_tag;
+        const h = hp.handlersOf(tag) orelse return self.unarmedVolume(tag);
+        return wire_bind.HolderHandlers.serveGrant(h, req, scratch);
     }
 
     fn serveReturnBlocks(ctx: *anyopaque, req: *const service.Request, scratch: []u8) service.Answer {
         const self: *WirePlane = @ptrCast(@alignCast(ctx));
-        const hp = self.holder_plane.load(.acquire) orelse return service.Answer.refused(error.Busy, "no grant plane armed on this mount (not the allocation holder)");
-        self.noteUnarmed(hp, req.payload.return_blocks.vol_tag);
-        return plane_arm.HolderPlane.serveReturn(hp, req, scratch);
+        const hp = switch (self.grantPlane()) {
+            .plane => |hp| hp,
+            .answer => |a| return a,
+        };
+        const tag = req.payload.return_blocks.vol_tag;
+        const h = hp.handlersOf(tag) orelse return self.unarmedVolume(tag);
+        return wire_bind.HolderHandlers.serveReturn(h, req, scratch);
     }
 
     fn serveFreeBlocks(ctx: *anyopaque, req: *const service.Request, scratch: []u8) service.Answer {
         const self: *WirePlane = @ptrCast(@alignCast(ctx));
-        const hp = self.holder_plane.load(.acquire) orelse return service.Answer.refused(error.Busy, "no grant plane armed on this mount (not the allocation holder)");
-        self.noteUnarmed(hp, req.payload.free_blocks.head.vol_tag);
-        return plane_arm.HolderPlane.serveFrees(hp, req, scratch);
+        const hp = switch (self.grantPlane()) {
+            .plane => |hp| hp,
+            .answer => |a| return a,
+        };
+        const tag = req.payload.free_blocks.head.vol_tag;
+        const h = hp.handlersOf(tag) orelse return self.unarmedVolume(tag);
+        return wire_bind.HolderHandlers.serveFrees(h, req, scratch);
     }
 
     /// The move gate's bound (decision 0003 §X.1): `T_park_max` at this

@@ -36,9 +36,12 @@ pub const stats = struct {
     pub var volume_draining: counters.Gauge = .{};
 
     // ---- the set config's generation across the fleet ----
-    /// This daemon's `set_config` generation (the record it last read or
-    /// committed). The manager's membership grants carry it; a joiner's
-    /// word trails the manager's by at most one renewal.
+    /// This daemon's `set_config` generation: the record its mount read, or
+    /// the last one it acted on — a manager publishes a lifecycle record's
+    /// generation after its runtime act (step 7, decision 0003 §AI.3), a
+    /// joiner once it applied the pulled record. The manager's membership
+    /// grants carry it; a joiner's word trails the manager's by at most one
+    /// renewal.
     pub var volume_config_generation: counters.Gauge = .{};
     /// A joiner pulled the record at a bump the grant carried.
     pub var volume_config_pulls: counters.ShardedCounter = .{};
@@ -49,7 +52,18 @@ pub const stats = struct {
     /// A pull, a decode or an attach that failed (logged loud; the next
     /// bump or the next mount retries).
     pub var volume_config_pull_failures: counters.ShardedCounter = .{};
+    /// A pull the manager answered `Deferred`: its record was AHEAD of its
+    /// word (a lifecycle op between its commit and its runtime act); the
+    /// joiner's word stays and the next renewal pulls again.
+    pub var volume_config_pull_deferrals: counters.ShardedCounter = .{};
 };
+
+/// A manager's step 7: `generation` becomes the word its grants carry —
+/// raised, never lowered (two lifecycle ops publishing out of order never
+/// move the fleet's word back).
+pub fn publishConfigGeneration(generation: u64) void {
+    stats.volume_config_generation.raise(generation);
+}
 
 pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
     try counters.writeNamespaceJson(stats, w);

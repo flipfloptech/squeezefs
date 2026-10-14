@@ -48,7 +48,6 @@ const counters = @import("../../core/counters.zig");
 const knobs = @import("../../core/knobs.zig");
 const checksum = @import("../../core/checksum.zig");
 const log = @import("../../core/log.zig");
-const service = @import("../../wire/service.zig");
 const verbs = @import("../../wire/verbs.zig");
 const codec = @import("../../wire/codec.zig");
 const block_alloc = @import("../block_alloc.zig");
@@ -84,6 +83,11 @@ pub const stats = struct {
     /// Renewals this writer declared its windows on (the joiner side of
     /// the grant ledger: the holder retires what the word no longer names).
     pub var block_grant_windows_declared_by_writer: counters.ShardedCounter = .{};
+    /// Data-plane verbs the manager answered `not_holder`: no grant plane
+    /// armed yet (the listener precedes the arm; a lease refused busy), or
+    /// a volume whose online add is between its record and its arm
+    /// (decision 0003 §AI.3). The writer asks again at its next mint.
+    pub var block_grant_unarmed_answers: counters.ShardedCounter = .{};
 };
 
 /// The grant ledger's writer key of a wire identity: `(node_token,
@@ -223,9 +227,12 @@ pub const HolderPlane = struct {
     dir: WriterDirectory,
     /// The page sink's home (null = the RAM posture of a rig with none).
     home: ?Home,
-    /// `router.MAX_VOLUMES` rows, `n_vols` armed (module law above).
+    /// `router.MAX_VOLUMES` rows, `n_vols` armed (module law above). The
+    /// online arm fills row `n_vols` and THEN publishes the count (release;
+    /// `armedVols`' acquire): the wire, cadence and stats threads read a
+    /// row only once it is whole.
     vols: []Vol,
-    n_vols: usize,
+    n_vols: std.atomic.Value(usize),
     /// The declaration protocol's lock: a renewal's declaration lands
     /// from a wire thread while the tick converges on the reclaim fiber
     /// (a spin lock: every section is one pass over a window's ranges and
@@ -277,8 +284,8 @@ pub const HolderPlane = struct {
         std.debug.assert(terms.len == n and holds.len == n);
         const vols = try gpa.alloc(Vol, router.MAX_VOLUMES);
         errdefer gpa.free(vols);
-        self.* = .{ .gpa = gpa, .io = io, .plane = plane, .dir = dir, .home = home, .vols = vols, .n_vols = 0 };
-        errdefer for (vols[0..self.n_vols]) |*v| self.disarm(v);
+        self.* = .{ .gpa = gpa, .io = io, .plane = plane, .dir = dir, .home = home, .vols = vols, .n_vols = .init(0) };
+        errdefer for (self.armedVols()) |*v| self.disarm(v);
         for (terms, holds, 0..) |term, hold, i| try self.armVolume(@intCast(i), term, hold, writers_known);
         log.info("data planes: the grant plane armed as the HOLDER of {d} data volume(s) (the bitmap over the allocator, its pages {s}; grants carve at the frontier; the own window is the mint source)", .{ n, if (home != null) "held on the home volume and journaled into ring 0" else "RAM (no home bound)" });
         return self;
@@ -295,7 +302,7 @@ pub const HolderPlane = struct {
     pub fn armVolume(self: *HolderPlane, ordinal: u16, term: u64, hold: HoldInput, writers_known: u64) ArmError!void {
         const gpa = self.gpa;
         const plane = self.plane;
-        std.debug.assert(ordinal == self.n_vols and ordinal < router.MAX_VOLUMES);
+        std.debug.assert(ordinal == self.n_vols.load(.monotonic) and ordinal < router.MAX_VOLUMES);
         const r = plane.vols.rows[ordinal].?;
         const v = &self.vols[ordinal];
         v.* = .{
@@ -341,8 +348,14 @@ pub const HolderPlane = struct {
         r.alloc.grant_source = v.own_src.source();
         r.alloc.lease = .{ .ctx = v, .vtable = &holder_lease_vtable };
         plane.reclaimer.setFreeTarget(v.ordinal, v.frees.localTarget());
-        self.n_vols += 1;
-        stats.alloc_lease_held_volumes.set(@intCast(self.n_vols));
+        // Release pairs with `armedVols`' acquire: the row is whole first.
+        self.n_vols.store(ordinal + 1, .release);
+        stats.alloc_lease_held_volumes.set(ordinal + 1);
+    }
+
+    /// The armed rows (acquire pairs with `armVolume`'s release).
+    fn armedVols(self: *HolderPlane) []Vol {
+        return self.vols[0..self.n_vols.load(.acquire)];
     }
 
     /// The page sink's arm (module doc): the predecessor's pages loaded
@@ -444,7 +457,7 @@ pub const HolderPlane = struct {
         // set's: no live writer, and every slot tree another appender held
         // adopted (a clean leave's release) or recovered (a death).
         const exact = live == 0 and self.dir.foreignSlots(self.dir.ctx) == 0;
-        for (self.vols[0..self.n_vols]) |*v| {
+        for (self.armedVols()) |*v| {
             _ = v.bitmap.drain();
             self.decl_lock.lock();
             defer self.decl_lock.unlock();
@@ -472,7 +485,7 @@ pub const HolderPlane = struct {
     pub fn writeKvdaPages(ctx: *anyopaque, generation: u64) error{Io}!void {
         const self: *HolderPlane = @ptrCast(@alignCast(ctx));
         const home = self.home orelse return;
-        for (self.vols[0..self.n_vols]) |*v| {
+        for (self.armedVols()) |*v| {
             if (v.refs.items.len == 0) continue;
             _ = data_bitmap.writeDirtyPagesThroughRefs(v.bitmap, home.io, v.refs.items, generation) catch |e| switch (e) {
                 error.Io => return error.Io,
@@ -511,7 +524,7 @@ pub const HolderPlane = struct {
     const holder_lease_vtable: block_alloc.AllocationLease.VTable = .{ .holderView = &holderViewFn, .noteMountSeed = &noteMountSeedFn };
 
     pub fn destroy(self: *HolderPlane) void {
-        for (self.vols[0..self.n_vols]) |*v| self.disarm(v);
+        for (self.armedVols()) |*v| self.disarm(v);
         stats.alloc_lease_held_volumes.set(0);
         self.gpa.free(self.vols);
         self.gpa.destroy(self);
@@ -519,7 +532,7 @@ pub const HolderPlane = struct {
 
     /// Volumes armed (the release walks them).
     pub fn armed(self: *const HolderPlane) usize {
-        return self.n_vols;
+        return self.n_vols.load(.acquire);
     }
 
     /// The per-volume words (`vol_tag`, lease term) for the release.
@@ -530,13 +543,8 @@ pub const HolderPlane = struct {
     }
 
     fn volOf(self: *HolderPlane, vol_tag: u64) ?*Vol {
-        for (self.vols[0..self.n_vols]) |*v| if (v.vol_tag == vol_tag) return v;
+        for (self.armedVols()) |*v| if (v.vol_tag == vol_tag) return v;
         return null;
-    }
-
-    /// This holder armed `vol_tag`.
-    pub fn holdsVolume(self: *HolderPlane, vol_tag: u64) bool {
-        return self.volOf(vol_tag) != null;
     }
 
     /// The holder's live bitmap of `vol_tag` (the fsck's C6 arm and the
@@ -546,25 +554,12 @@ pub const HolderPlane = struct {
         return v.bitmap;
     }
 
-    // ONE handler per verb over every volume (the wire plane registers
-    // them before its listener): dispatch by the request's `vol_tag`.
-
-    pub fn serveGrant(ctx: *anyopaque, req: *const service.Request, scratch: []u8) service.Answer {
-        const self: *HolderPlane = @ptrCast(@alignCast(ctx));
-        const v = self.volOf(req.payload.block_grant.vol_tag) orelse return service.Answer.refused(error.Busy, "this mount does not hold the lease of that volume");
-        return wire_bind.HolderHandlers.serveGrant(&v.handlers, req, scratch);
-    }
-
-    pub fn serveReturn(ctx: *anyopaque, req: *const service.Request, scratch: []u8) service.Answer {
-        const self: *HolderPlane = @ptrCast(@alignCast(ctx));
-        const v = self.volOf(req.payload.return_blocks.vol_tag) orelse return service.Answer.refused(error.Busy, "this mount does not hold the lease of that volume");
-        return wire_bind.HolderHandlers.serveReturn(&v.handlers, req, scratch);
-    }
-
-    pub fn serveFrees(ctx: *anyopaque, req: *const service.Request, scratch: []u8) service.Answer {
-        const self: *HolderPlane = @ptrCast(@alignCast(ctx));
-        const v = self.volOf(req.payload.free_blocks.head.vol_tag) orelse return service.Answer.refused(error.Busy, "this mount does not hold the lease of that volume");
-        return wire_bind.HolderHandlers.serveFrees(&v.handlers, req, scratch);
+    /// The wire handlers of `vol_tag`'s row (the wire plane's ONE handler
+    /// per verb dispatches by the request's `vol_tag`); null = a volume
+    /// this holder has not armed — the wire plane's answer.
+    pub fn handlersOf(self: *HolderPlane, vol_tag: u64) ?*wire_bind.HolderHandlers {
+        const v = self.volOf(vol_tag) orelse return null;
+        return &v.handlers;
     }
 
     fn writerIdFn(ctx: *anyopaque, id: records.WriterIdentity) ?u32 {
@@ -589,7 +584,7 @@ pub const HolderPlane = struct {
     /// `df` per the rule: the population minus the own unconsumed window.
     pub fn writeStatsJson(self: *HolderPlane, w: *Io.Writer) Io.Writer.Error!void {
         try w.writeAll("[");
-        for (self.vols[0..self.n_vols], 0..) |*v, i| {
+        for (self.armedVols(), 0..) |*v, i| {
             if (i != 0) try w.writeByte(',');
             const word = v.grants.word();
             try w.print("{{\"vol_tag\":\"{x:0>16}\",\"population\":{d},\"frontier\":{d},\"open_grants\":{d},\"writers\":{d},\"own_window_remaining\":{d},\"used_blocks\":{d},\"page_refs\":{d},\"leaks_pending\":{d},\"writers_declared\":{d}}}", .{ v.vol_tag, word.population, word.frontier, v.grants.ledger.openCount(), v.grants.writers(), v.own.window.remaining(), word.population -| v.own.window.remaining(), v.refs.items.len, if (v.leaks) |*l| l.pendingCount() else 0, v.declared.count() });
@@ -611,9 +606,11 @@ pub const WriterPlane = struct {
     identity: verbs.WireIdentity,
     /// `router.MAX_VOLUMES` rows, `n_vols` armed (the holder's law: every
     /// `Vol` is pointed to by the allocator's seams, so a row never moves
-    /// — a volume the manager added online arms the NEXT row in place).
+    /// — a volume the manager added online arms the NEXT row in place). The
+    /// beat's online arm publishes the count after the row (release;
+    /// `armedVols`' acquire), as the holder's.
     vols: []Vol,
-    n_vols: usize,
+    n_vols: std.atomic.Value(usize),
 
     const Vol = struct {
         vol_tag: u64,
@@ -638,7 +635,7 @@ pub const WriterPlane = struct {
         const n = plane.vols.n();
         const vols = try gpa.alloc(Vol, router.MAX_VOLUMES);
         errdefer gpa.free(vols);
-        self.* = .{ .gpa = gpa, .io = io, .plane = plane, .link = link, .identity = identity, .vols = vols, .n_vols = 0 };
+        self.* = .{ .gpa = gpa, .io = io, .plane = plane, .link = link, .identity = identity, .vols = vols, .n_vols = .init(0) };
         for (0..n) |i| self.armVolume(@intCast(i));
         log.info("data planes: {d} data volume(s) armed as a NON-holder — every mint from a ranged grant pulled from the lease holder, every terminal free shipped to it", .{n});
         return self;
@@ -650,7 +647,7 @@ pub const WriterPlane = struct {
     /// bump its renewal grant carried.
     pub fn armVolume(self: *WriterPlane, ordinal: u16) void {
         const plane = self.plane;
-        std.debug.assert(ordinal == self.n_vols and ordinal < router.MAX_VOLUMES);
+        std.debug.assert(ordinal == self.n_vols.load(.monotonic) and ordinal < router.MAX_VOLUMES);
         const r = plane.vols.rows[ordinal].?;
         const v = &self.vols[ordinal];
         v.* = .{
@@ -670,8 +667,9 @@ pub const WriterPlane = struct {
         r.alloc.grant_source = v.src.source();
         r.alloc.lease = .{ .ctx = v, .vtable = &writer_lease_vtable };
         plane.reclaimer.setFreeTarget(v.ordinal, v.shipper.freeTarget());
-        self.n_vols += 1;
-        stats.block_grant_writer_volumes.set(@intCast(self.n_vols));
+        // Release pairs with `armedVols`' acquire: the row is whole first.
+        self.n_vols.store(ordinal + 1, .release);
+        stats.block_grant_writer_volumes.set(ordinal + 1);
         // The first PULL at the arm: an empty window is below the 50 %
         // mark, and the reply's holder word is what `df` reads before
         // this mount writes a byte. A holder not yet serving answers
@@ -681,7 +679,12 @@ pub const WriterPlane = struct {
 
     /// Volumes armed.
     pub fn armed(self: *const WriterPlane) usize {
-        return self.n_vols;
+        return self.n_vols.load(.acquire);
+    }
+
+    /// The armed rows (acquire pairs with `armVolume`'s release).
+    fn armedVols(self: *WriterPlane) []Vol {
+        return self.vols[0..self.n_vols.load(.acquire)];
     }
 
     /// A volume this joiner learnt Draining / Retired: its pending frees
@@ -690,7 +693,7 @@ pub const WriterPlane = struct {
     /// the holder would hold the retire — the drain's "used 0" — forever).
     /// An `undrain` re-pulls at the first mint. False = no such row.
     pub fn returnWindowOf(self: *WriterPlane, vol_tag: u64) bool {
-        for (self.vols[0..self.n_vols]) |*v| {
+        for (self.armedVols()) |*v| {
             if (v.vol_tag != vol_tag) continue;
             _ = v.shipper.flush();
             self.returnWindow(v);
@@ -700,7 +703,7 @@ pub const WriterPlane = struct {
     }
 
     pub fn destroy(self: *WriterPlane) void {
-        for (self.vols[0..self.n_vols]) |*v| {
+        for (self.armedVols()) |*v| {
             // The pending frees ship; every unconsumed run of the window
             // RETURNS to the holder (its bits clear again) — a leave never
             // leaves a granted run SET at the holder.
@@ -744,7 +747,7 @@ pub const WriterPlane = struct {
 
     /// The cadence: every volume's pending shipped frees flushed.
     pub fn tick(self: *WriterPlane) void {
-        for (self.vols[0..self.n_vols]) |*v| {
+        for (self.armedVols()) |*v| {
             if (v.shipper.flush() == .served) stats.free_ship_cadence_flushes.inc();
         }
     }
@@ -762,7 +765,7 @@ pub const WriterPlane = struct {
         const gpa = self.gpa;
         var b: codec.Builder = .init(buf);
         var n: u16 = 0;
-        for (self.vols[0..self.n_vols]) |*v| {
+        for (self.armedVols()) |*v| {
             var held: std.ArrayList(block_grant.BlockGrant) = .empty;
             defer held.deinit(gpa);
             block_grant.heldBlockRanges(&v.arm.window, v.alloc, gpa, &held) catch return .{ .bytes = "", .n_windows = 0 };
@@ -857,7 +860,7 @@ pub const WriterPlane = struct {
 
     pub fn writeStatsJson(self: *WriterPlane, w: *Io.Writer) Io.Writer.Error!void {
         try w.writeAll("[");
-        for (self.vols[0..self.n_vols], 0..) |*v, i| {
+        for (self.armedVols(), 0..) |*v, i| {
             if (i != 0) try w.writeByte(',');
             try w.print("{{\"vol_tag\":\"{x:0>16}\",\"window_remaining\":{d},\"installed\":{d},\"consumed\":{d},\"pending_frees\":{d}}}", .{ v.vol_tag, v.arm.window.remaining(), v.arm.window.installed.load(.monotonic), v.arm.window.consumed.load(.monotonic), v.shipper.pending_n });
         }

@@ -83,6 +83,10 @@ pub const Gauge = struct {
     pub fn set(self: *Gauge, n: u64) void {
         self.v.store(n, .monotonic);
     }
+    /// `max(current, n)`: a monotone word several publishers raise.
+    pub fn raise(self: *Gauge, n: u64) void {
+        _ = self.v.fetchMax(n, .monotonic);
+    }
     pub fn add(self: *Gauge, n: u64) void {
         _ = self.v.fetchAdd(n, .monotonic);
     }

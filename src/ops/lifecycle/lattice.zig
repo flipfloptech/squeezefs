@@ -19,7 +19,10 @@
 //!      add's queued rebalance record rides the SAME tx);
 //!   7. runtime: placement enabled strictly AFTER the ack (placement-after-
 //!      ack); the retire deregisters the runtime AFTER the durable commit
-//!      (retire-then-deregister).
+//!      (retire-then-deregister). The record's generation is PUBLISHED here,
+//!      after the runtime act — the word the membership grants carry and a
+//!      joiner pulls the record at (decision 0003 §AI.3): a joiner never
+//!      learns a volume before its holder armed it.
 //!
 //! Identity: `vol-{16 hex}` minted once, never reused — a Retired record
 //! is kept FOREVER with its uri cleared, so a stale key fails loud instead
@@ -97,8 +100,9 @@ pub const World = struct {
         /// ONE tx: the config record (+ the optional queued job record).
         commit: *const fn (ctx: *anyopaque, cfg: *const Config, job: ?records.JobRecord) Error!void,
         /// Placement: enable `vol_tag` (after the ack) / retire the runtime
-        /// (after the durable commit).
-        publishPlacement: *const fn (ctx: *anyopaque, vol_tag: u64, state: State) Error!void,
+        /// (after the durable commit); then publish `generation` (the
+        /// committed record's) as the word the fleet learns.
+        publishPlacement: *const fn (ctx: *anyopaque, vol_tag: u64, state: State, generation: u64) Error!void,
         /// Cancel every non-terminal evacuate job naming `vol_tag` (undrain).
         cancelEvacuations: *const fn (ctx: *anyopaque, vol_tag: u64) Error!void,
         now_s: *const fn (ctx: *anyopaque) u64,
@@ -146,7 +150,7 @@ pub fn addData(gpa: Allocator, w: World, dev: Device, queue_rebalance: bool) Err
         job = .{ .job_id = job_id, .job_type = .rebalance, .state = .queued, .throttle_pct = rebalance.REBALANCE_DEFAULT_THROTTLE_PCT, .created_realtime_s = now, .created_by = .{ .node_token = 0, .mount_slot = 0 }, .created_pid = 0, .updated_realtime_s = now };
     }
     try w.vtable.commit(w.ctx, &next, job); // 6
-    try w.vtable.publishPlacement(w.ctx, tag, .active); // 7
+    try w.vtable.publishPlacement(w.ctx, tag, .active, next.config_generation); // 7
     return .{ .vol_tag = tag, .config_generation = next.config_generation, .rebalance_job = job_id };
 }
 
@@ -179,7 +183,7 @@ pub fn removeData(gpa: Allocator, w: World, vol_tag: u64, pf: preflight.Capacity
         job = .{ .job_id = job_id, .job_type = .evacuate_volume, .state = .queued, .throttle_pct = 100, .created_realtime_s = now, .created_by = .{ .node_token = 0, .mount_slot = 0 }, .created_pid = 0, .arg0 = vol_tag, .updated_realtime_s = now };
     }
     try w.vtable.commit(w.ctx, &next, job);
-    try w.vtable.publishPlacement(w.ctx, vol_tag, .draining);
+    try w.vtable.publishPlacement(w.ctx, vol_tag, .draining, next.config_generation);
     return job_id;
 }
 
@@ -199,7 +203,7 @@ pub fn retire(gpa: Allocator, w: World, vol_tag: u64) Error!void {
     defer next.deinit(gpa);
     if (mutation.lifecycle_bit_needed) try w.vtable.stampLifecycleBit(w.ctx);
     try w.vtable.commit(w.ctx, &next, null);
-    try w.vtable.publishPlacement(w.ctx, vol_tag, .retired);
+    try w.vtable.publishPlacement(w.ctx, vol_tag, .retired, next.config_generation);
 }
 
 /// `volume undrain`: refuse unless `Draining`; the DURABLE flip to Active
@@ -219,8 +223,15 @@ pub fn undrain(gpa: Allocator, w: World, vol_tag: u64) Error!void {
     defer next.deinit(gpa);
     if (mutation.lifecycle_bit_needed) try w.vtable.stampLifecycleBit(w.ctx);
     try w.vtable.commit(w.ctx, &next, null);
-    try w.vtable.publishPlacement(w.ctx, vol_tag, .active);
+    try w.vtable.publishPlacement(w.ctx, vol_tag, .active, next.config_generation);
     try w.vtable.cancelEvacuations(w.ctx, vol_tag);
+}
+
+/// A record AHEAD of the published word: a lifecycle op between its record
+/// commit (step 6) and its runtime act (step 7) — what it names is not yet
+/// the fleet's to act on (decision 0003 §AI.3).
+pub fn recordAhead(record_generation: u64, published_generation: u64) bool {
+    return record_generation > published_generation;
 }
 
 /// `vol-{16 hex}` of a tag.
@@ -249,6 +260,9 @@ pub const RamWorld = struct {
     devices: std.AutoHashMapUnmanaged([16]u8, u64) = .empty,
     /// The RUNTIME (lost at a crash): placement rows.
     placement: std.AutoHashMapUnmanaged(u64, State) = .empty,
+    /// The generation the fleet learns (the runtime's; a remount re-reads
+    /// it off the record).
+    published_generation: u64 = 0,
     live_writer: bool = false,
     /// Crash AFTER this step (the step's own effect lands).
     crash_after: ?Step = null,
@@ -258,7 +272,7 @@ pub const RamWorld = struct {
     cancelled: std.ArrayList(u64) = .empty,
 
     pub fn init(gpa: Allocator, cfg: Config) RamWorld {
-        return .{ .gpa = gpa, .config = cfg };
+        return .{ .gpa = gpa, .config = cfg, .published_generation = cfg.config_generation };
     }
 
     pub fn deinit(self: *RamWorld) void {
@@ -315,9 +329,10 @@ pub const RamWorld = struct {
         self.commits += 1;
         try self.crashAt(.record_tx);
     }
-    fn publish(ctx: *anyopaque, vol_tag: u64, state: State) Error!void {
+    fn publish(ctx: *anyopaque, vol_tag: u64, state: State, generation: u64) Error!void {
         const self: *RamWorld = @ptrCast(@alignCast(ctx));
         if (state == .retired) _ = self.placement.remove(vol_tag) else self.placement.put(self.gpa, vol_tag, state) catch return error.OutOfMemory;
+        self.published_generation = @max(self.published_generation, generation);
         try self.crashAt(.runtime);
     }
     fn cancelEvac(ctx: *anyopaque, vol_tag: u64) Error!void {
@@ -343,6 +358,7 @@ pub const RamWorld = struct {
         self.placement.clearRetainingCapacity();
         self.crashed = false;
         self.crash_after = null;
+        self.published_generation = self.config.config_generation;
         for (self.config.data) |d| {
             if (d.state == .retired) {
                 // A retired record keeps its tag forever and names no device.
@@ -446,6 +462,32 @@ test "the lattice's durability order over RAM seams: a crash after EVERY step of
             try w.remount();
         }
     }
+}
+
+test "the fleet's word moves at step 7, never at the record's commit (decision 0003 §AI.3): a crash after the record tx leaves the word behind the durable record — the record is AHEAD until the runtime act publishes it; every verb publishes its record's generation; a remount re-reads the word off the record" {
+    const gpa = testing.allocator;
+    var w = try birthWorld(gpa);
+    defer w.deinit();
+    const born = w.config.config_generation;
+    try testing.expectEqual(born, w.published_generation);
+    try testing.expect(!recordAhead(w.config.config_generation, w.published_generation));
+    w.crash_after = .record_tx;
+    try testing.expectError(error.Io, addData(gpa, w.world(), dev2, false));
+    try testing.expectEqual(born + 1, w.config.config_generation);
+    try testing.expectEqual(born, w.published_generation);
+    try testing.expect(recordAhead(w.config.config_generation, w.published_generation));
+    try w.remount();
+    try testing.expectEqual(born + 1, w.published_generation);
+    const tag = w.config.data[1].vol_tag;
+    const ok: preflight.CapacityPreflight = .{ .avail = 1 << 40, .needed = 1 << 30, .transient = 1 << 28, .headroom = 1 << 30 };
+    _ = try removeData(gpa, w.world(), tag, ok, false);
+    try testing.expectEqual(born + 2, w.published_generation);
+    try undrain(gpa, w.world(), tag);
+    try testing.expectEqual(born + 3, w.published_generation);
+    _ = try removeData(gpa, w.world(), tag, ok, false);
+    try retire(gpa, w.world(), tag);
+    try testing.expectEqual(w.config.config_generation, w.published_generation);
+    try testing.expect(!recordAhead(w.config.config_generation, w.published_generation));
 }
 
 test "remove-data → draining (preflight refuses loud) → retire (uri cleared, tag kept forever, runtime deregistered after the commit); undrain flips Active FIRST then cancels the evacuation; retired never comes back; a crash at each retire step converges" {

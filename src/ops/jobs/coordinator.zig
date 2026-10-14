@@ -428,7 +428,7 @@ pub const PlaneMover = struct {
 
 const census = @import("../lifecycle/census.zig");
 const lattice = @import("../lifecycle/lattice.zig");
-const lifecycle_stats = @import("../lifecycle/stats.zig").stats;
+const lifecycle_stats_mod = @import("../lifecycle/stats.zig");
 const drain_mod = @import("../lifecycle/drain.zig");
 const preflight = @import("preflight.zig");
 const set_config = @import("../../data/set_config.zig");
@@ -533,11 +533,11 @@ pub const PlaneWorld = struct {
         }
         self.be.commit(t) catch return error.Io;
         self.be.fsync() catch return error.Io;
-        // The generation the membership grants carry from now on (a
-        // joiner behind it pulls the record at its next renewal).
-        lifecycle_stats.volume_config_generation.set(cfg.config_generation);
     }
-    fn publish(ctx: *anyopaque, vol_tag: u64, state: set_config.State) lattice.Error!void {
+    /// Step 7: the router, then the record's generation becomes the word
+    /// the membership grants carry (a joiner behind it pulls the record at
+    /// its next renewal) — only once this mount acted on it.
+    fn publish(ctx: *anyopaque, vol_tag: u64, state: set_config.State, generation: u64) lattice.Error!void {
         const self = self_(ctx);
         const to: router.VolumeState = switch (state) {
             .active => .active,
@@ -549,6 +549,7 @@ pub const PlaneWorld = struct {
             error.OutOfMemory => error.OutOfMemory,
             else => error.UnknownVolume,
         };
+        lifecycle_stats_mod.publishConfigGeneration(generation);
     }
     fn cancelEvac(ctx: *anyopaque, vol_tag: u64) lattice.Error!void {
         const self = self_(ctx);
@@ -1055,8 +1056,8 @@ pub const PlaneRekey = struct {
         };
         self.be.commit(t) catch return error.Io;
         self.be.fsync() catch return error.Io;
-        lifecycle_stats.volume_config_generation.set(m.next.config_generation);
         self.plane.closeRekey(self.io) catch |e| log.err("defrag --rekey: the record flipped to key id {x} (generation {d}) but the plane's wrap did not close ({s}) — the previous key stays an unwrap arm until the next mount", .{ &m.next.key_id, m.next.config_generation, @errorName(e) });
+        lifecycle_stats_mod.publishConfigGeneration(m.next.config_generation);
         log.info("defrag --rekey: the primary key is now id {x} (config generation {d})", .{ &m.next.key_id, m.next.config_generation });
     }
     fn chunk(ctx: *anyopaque) u64 {
@@ -1159,8 +1160,9 @@ pub const PlaneAdmin = struct {
             self.cfg_after = cfg.clone(gpa) catch return error.OutOfMemory;
         }
         /// Step 7 for the NEW volume: attach to the plane (router row
-        /// DISABLED), arm the grant plane, THEN Active.
-        fn publish(ctx: *anyopaque, vol_tag: u64, state: set_config.State) lattice.Error!void {
+        /// DISABLED), arm the grant plane, THEN Active and the word — a
+        /// joiner learns the volume only once this holder serves it.
+        fn publish(ctx: *anyopaque, vol_tag: u64, state: set_config.State, generation: u64) lattice.Error!void {
             const self: *OnlineAdd = @ptrCast(@alignCast(ctx));
             const plane = self.admin.node.plane;
             const cfg = self.cfg_after orelse return error.Io;
@@ -1173,7 +1175,7 @@ pub const PlaneAdmin = struct {
                 log.err("admin lane: vol {x} attached but the grant plane could not arm over it — no placement on it until the next mount", .{vol_tag});
                 return error.Io;
             };
-            return PlaneWorld.vt.publishPlacement(inner(ctx), vol_tag, state);
+            return PlaneWorld.vt.publishPlacement(inner(ctx), vol_tag, state, generation);
         }
         fn cancelEvac(ctx: *anyopaque, vol_tag: u64) lattice.Error!void {
             return PlaneWorld.vt.cancelEvacuations(inner(ctx), vol_tag);
@@ -1257,6 +1259,7 @@ pub const PlaneAdmin = struct {
             error.OutOfMemory => return error.OutOfMemory,
             error.NotEncrypted, error.RandomFailed => return error.Plane,
         };
+        lifecycle_stats_mod.publishConfigGeneration(generation);
         const job_id = node.fabric.submit(node.io, .{ .job_type = .rekey, .throttle_pct = req.throttle_pct, .arg0 = std.mem.readInt(u64, &req.key_id, .little) }) catch |e| return switch (e) {
             error.OutOfMemory => error.OutOfMemory,
             error.NotCoordinator => error.NotCoordinator,

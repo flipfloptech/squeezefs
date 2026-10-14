@@ -114,8 +114,9 @@ pub const OfflineWorld = struct {
         self.be.fsync() catch return error.Io;
         stats.volume_lifecycle_commits.inc();
     }
-    /// No runtime offline: the next mount's discovery is the placement.
-    fn publish(_: *anyopaque, _: u64, _: set_config.State) lattice.Error!void {}
+    /// No runtime offline: the next mount's discovery is the placement and
+    /// its read of the record the word.
+    fn publish(_: *anyopaque, _: u64, _: set_config.State, _: u64) lattice.Error!void {}
     fn cancelEvac(ctx: *anyopaque, vol_tag: u64) lattice.Error!void {
         const self = self_(ctx);
         var jobs = try listJobs(self.gpa, self.be);

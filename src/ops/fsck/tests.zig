@@ -998,26 +998,27 @@ const C8Racer = struct {
     destroy_waited: bool = false,
     err: ?anyerror = null,
 
-    fn hook(self: *C8Racer) classes.Host.C8Hook {
+    fn hook(self: *C8Racer) classes.Host.RecheckHook {
         return .{ .ctx = self, .at = &at };
     }
 
-    fn at(ctx: *anyopaque, point: classes.Host.C8Point, block_idx: u64) void {
+    fn at(ctx: *anyopaque, point: classes.Host.RecheckPoint, block_idx: u64) void {
         const self: *C8Racer = @ptrCast(@alignCast(ctx));
         self.step(point, block_idx) catch |e| {
             self.err = e;
         };
     }
 
-    fn step(self: *C8Racer, point: classes.Host.C8Point, block_idx: u64) !void {
+    fn step(self: *C8Racer, point: classes.Host.RecheckPoint, block_idx: u64) !void {
         switch (point) {
-            .round1_refs => _ = try self.destroy(self.first, "racer", true),
-            .recheck_start => if (block_idx == self.blk and self.second == 0) {
+            .c8_round1_refs => _ = try self.destroy(self.first, "racer", true),
+            .c8_recheck_start => if (block_idx == self.blk and self.second == 0) {
                 self.second = try self.set.mkfile(inos.ROOT_INO, "racer2", VOL_A, &.{self.blk});
             },
-            .recheck_between_reads => if (block_idx == self.blk and self.second != 0 and !self.second_destroyed) {
+            .c8_recheck_between_reads => if (block_idx == self.blk and self.second != 0 and !self.second_destroyed) {
                 if (try self.destroy(self.second, "racer2", false)) self.second_destroyed = true else self.destroy_waited = true;
             },
+            .phase_a_registry, .count_recheck_derived => {},
         }
     }
 
@@ -1053,7 +1054,7 @@ test "C8's online re-check reads a block's durable references and its owners' la
     const blk: u64 = 40;
     var racer: C8Racer = .{ .set = set, .blk = blk, .first = try set.mkfile(inos.ROOT_INO, "racer", VOL_A, &.{blk}) };
     var h = set.host(.online);
-    h.c8_hook = racer.hook();
+    h.recheck_hook = racer.hook();
     var r = try ram.runHost(set, &h, .{});
     defer r.deinit(gpa);
     try testing.expect(racer.err == null);
@@ -1089,6 +1090,185 @@ test "Phase A: a block minted under the scan with a live in-flight owner is epoc
     defer offline.deinit(gpa);
     try ram.expectClasses(offline, &.{.c2});
     try testing.expectEqual(minted.idx, offline.findings[0].c2_leaked.block_idx);
+}
+
+/// The unlink + destroy of a one-block file in ONE tx under its exclusive
+/// lease — the dentry, the record, the layout and the block's reference —
+/// with the block's terminal free left to the caller (the window between
+/// a releasing commit and its free).
+fn commitDestroy(set: *RamSet, global: u64, name: []const u8, blk: u64) !void {
+    const io = testing.io;
+    const l = RamSet.local(global);
+    var guards = try set.locks.lockMany(io, &.{.{ .ino = l, .mode = .exclusive }}, &.{});
+    defer guards.release(io);
+    const t = try set.mem.begin(@src());
+    {
+        errdefer set.mem.abandon(t);
+        try t.stageDelete(key.TREE_DENTRIES, &key.dentryKey(inos.ROOT_INO, key.dentryNameHash54(name, set.mem.nameKey()), 0));
+        try block_refs.stageOps(t, &.{block_refs.released(.{ .vol_tag = VOL_A, .block_idx = blk, .owner_ino = l, .block_index = 0 })});
+        const xk = key.xattrKey(l, key.xattrNameHash56(layout.LAYOUT_XATTR_NAME, set.mem.nameKey()), 0);
+        try inos.stageDestroy(t, l, &.{&xk});
+    }
+    try set.mem.commit(t);
+}
+
+test "a release is a live owner of its block from before its releasing commit until its free (decision 0003 §AH.1; the macOS gate's `[C2] leaked` under the live writer storm): an online run inside the window — the destroy committed, the free not yet run — reads the block tracked and referenced by nothing, a leak unless the release holds it in flight; held, the run is clean, the free lands and the next run is clean; a release that drops its hold without the free is a genuine leak online and offline" {
+    const gpa = testing.allocator;
+    const set = try RamSet.init(gpa);
+    defer set.deinit();
+    _ = try populate(set);
+    const a = set.allocs[0];
+    // The window, unheld: the run inside it reports the gate's line.
+    const bare = try set.mkfile(inos.ROOT_INO, "bare", VOL_A, &.{40});
+    try commitDestroy(set, bare, "bare", 40);
+    {
+        var r = try ram.run(set, .online, .{});
+        defer r.deinit(gpa);
+        try ram.expectClasses(r, &.{.c2});
+        try testing.expectEqual(@as(u64, 40), r.findings[0].c2_leaked.block_idx);
+    }
+    _ = try a.freeBlock(40);
+    // The window, held from before the releasing commit until after the free.
+    const held = try set.mkfile(inos.ROOT_INO, "held", VOL_A, &.{41});
+    var release = block_alloc.InflightAllocGuard.register(a, 41);
+    try commitDestroy(set, held, "held", 41);
+    {
+        var r = try ram.run(set, .online, .{});
+        defer r.deinit(gpa);
+        try ram.expectClasses(r, &.{});
+        try testing.expect(r.counters.inflight_exempted >= 1);
+    }
+    try testing.expectEqual(block_alloc.BeginFree.terminal, try a.freeBlock(41));
+    release.deinit();
+    {
+        var r = try ram.run(set, .online, .{});
+        defer r.deinit(gpa);
+        try ram.expectClasses(r, &.{});
+    }
+    // A hold dropped without the free shields nothing: the block is leaked.
+    const lost = try set.mkfile(inos.ROOT_INO, "lost", VOL_A, &.{42});
+    var dropped = block_alloc.InflightAllocGuard.register(a, 42);
+    try commitDestroy(set, lost, "lost", 42);
+    dropped.deinit();
+    for ([_]finding.Mode{ .online, .offline }) |mode| {
+        var r = try ram.run(set, mode, .{});
+        defer r.deinit(gpa);
+        try ram.expectClasses(r, &.{.c2});
+        try testing.expectEqual(@as(u64, 42), r.findings[0].c2_leaked.block_idx);
+    }
+}
+
+/// A mint whose publish lands at a chosen suspect's Phase-A registry check:
+/// block `blk` minted to `owner` (its record and name committed, its layout
+/// not), held in flight until the hook publishes it.
+const LatePublish = struct {
+    set: *RamSet,
+    owner: u64,
+    blk: u64,
+    guard: block_alloc.InflightAllocGuard,
+    published: bool = false,
+    err: ?anyerror = null,
+
+    fn hook(self: *LatePublish) classes.Host.RecheckHook {
+        return .{ .ctx = self, .at = &at };
+    }
+
+    fn at(ctx: *anyopaque, point: classes.Host.RecheckPoint, block_idx: u64) void {
+        const self: *LatePublish = @ptrCast(@alignCast(ctx));
+        if (point != .phase_a_registry or block_idx != self.blk or self.published) return;
+        self.publish() catch |e| {
+            self.err = e;
+        };
+    }
+
+    fn publish(self: *LatePublish) !void {
+        const set = self.set;
+        const t = try set.mem.begin(@src());
+        {
+            errdefer set.mem.abandon(t);
+            const m = layout.Mapping.wholeBlock(VOL_A, self.blk * CHUNK, 0);
+            const entries = [_]layout.MapEntryWire{(layout.MapEntry{ .block = 0, .mapping = m }).encode()};
+            try layout.publishLayout(t, .{ .ino = RamSet.local(self.owner), .name_key = set.mem.nameKey(), .prev = null, .layout = layout.Layout.stripedInline(CHUNK, &entries), .proofs = &.{.{ .vol_tag = VOL_A, .offset = self.blk * CHUNK, .len = CHUNK, .completed_ns = 1 }} }, classes.refs_seam, set.geo);
+        }
+        try set.mem.commit(t);
+        set.allocs[0].publishBlock(self.blk);
+        self.guard.deinit();
+        self.published = true;
+    }
+};
+
+test "the ladder reads its fresh evidence after EVERY suspect's registry check (decision 0003 §AH.2): a mint in flight across the census whose publish lands at its own Phase-A check is its owner's block — the fresh census memoized for the suspect before it (a genuine leak) predated the publish and confirmed the mint as `[C2] leaked`; the genuine leak is still the one finding" {
+    const gpa = testing.allocator;
+    const set = try RamSet.init(gpa);
+    defer set.deinit();
+    _ = try populate(set);
+    const a = set.allocs[0];
+    set.leak(VOL_A, 50);
+    // The owner's record and name, then its block minted and in flight.
+    const owner = try set.mkfile(inos.ROOT_INO, "late", VOL_A, &.{});
+    _ = try a.allocateSpecificBlock(55);
+    var late: LatePublish = .{ .set = set, .owner = owner, .blk = 55, .guard = block_alloc.InflightAllocGuard.register(a, 55) };
+    var h = set.host(.online);
+    h.recheck_hook = late.hook();
+    var r = try ram.runHost(set, &h, .{});
+    defer r.deinit(gpa);
+    try testing.expect(late.err == null and late.published);
+    for (r.findings) |f| if (f != .c2_leaked or f.c2_leaked.block_idx != 50) std.debug.print("FALSE POSITIVE: {f}\n", .{f});
+    try ram.expectClasses(r, &.{.c2});
+    try testing.expectEqual(@as(u64, 50), r.findings[0].c2_leaked.block_idx);
+}
+
+/// A leaked block freed and minted again (by a writer that relies on the
+/// scan's epoch map, no registry entry) between the re-check's fresh
+/// derivation and its verdict.
+const ReMint = struct {
+    alloc: *block_alloc.BlockAllocator,
+    blk: u64,
+    reminted: bool = false,
+    err: ?anyerror = null,
+
+    fn hook(self: *ReMint) classes.Host.RecheckHook {
+        return .{ .ctx = self, .at = &at };
+    }
+
+    fn at(ctx: *anyopaque, point: classes.Host.RecheckPoint, block_idx: u64) void {
+        const self: *ReMint = @ptrCast(@alignCast(ctx));
+        if (point != .count_recheck_derived or block_idx != self.blk or self.reminted) return;
+        self.step() catch |e| {
+            self.err = e;
+        };
+    }
+
+    fn step(self: *ReMint) !void {
+        try testing.expectEqual(block_alloc.BeginFree.terminal, try self.alloc.freeBlock(self.blk));
+        _ = try self.alloc.allocateSpecificBlock(self.blk);
+        self.reminted = true;
+    }
+};
+
+test "the C2-leaked re-check reads the allocator AFTER its fresh derivation (decision 0003 §AH.2): a leaked block freed and minted to a new writer between the derivation and the verdict is the writer's mint (epoch-young), never a leak — read before, the stale tracking confirmed the new owner's block" {
+    const gpa = testing.allocator;
+    const set = try RamSet.init(gpa);
+    defer set.deinit();
+    _ = try populate(set);
+    const a = set.allocs[0];
+    set.leak(VOL_A, 50);
+    var remint: ReMint = .{ .alloc = a, .blk = 50 };
+    var h = set.host(.online);
+    h.recheck_hook = remint.hook();
+    {
+        var r = try ram.runHost(set, &h, .{});
+        defer r.deinit(gpa);
+        try testing.expect(remint.err == null and remint.reminted);
+        for (r.findings) |f| std.debug.print("FALSE POSITIVE: {f}\n", .{f});
+        try ram.expectClasses(r, &.{});
+        try testing.expect(r.counters.suspects_cleared >= 1);
+    }
+    // The writer abandons its mint: the next run is clean.
+    a.abandonUnpublished(50);
+    var again = try ram.run(set, .online, .{});
+    defer again.deinit(gpa);
+    try ram.expectClasses(again, &.{});
 }
 
 test "the pack-open ledger shields an open pack's +1 pin from C2/C3/C8; an open cross-volume intent shields C9/C10" {

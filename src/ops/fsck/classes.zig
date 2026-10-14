@@ -194,19 +194,19 @@ pub const Host = struct {
     /// paused detection re-runs whole — a stop latch, never an abort).
     pause: ?*const std.atomic.Value(bool) = null,
     hold: ?*const std.atomic.Value(bool) = null,
-    /// The pre-registry test hook: fires at the Phase-A registry boundary.
-    pre_registry_hook: ?*const fn () void = null,
-    /// The C8 test hook: fires before the first round's refs scan, at a
-    /// re-check round's start, and between the re-check's durable read
-    /// and its derived read (the window a live writer's tx must not split).
-    c8_hook: ?C8Hook = null,
+    /// The ladder's test hook: fires at the points a live writer's step
+    /// must not split — C8 before the first round's refs scan, at a
+    /// re-check round's start and between the re-check's durable and
+    /// derived reads; Phase A at its registry boundary; the C2-leaked / C3
+    /// re-checks between the fresh derivation and the allocator's re-read.
+    recheck_hook: ?RecheckHook = null,
 
-    pub const C8Point = enum { round1_refs, recheck_start, recheck_between_reads };
-    pub const C8Hook = struct {
+    pub const RecheckPoint = enum { c8_round1_refs, c8_recheck_start, c8_recheck_between_reads, phase_a_registry, count_recheck_derived };
+    pub const RecheckHook = struct {
         ctx: *anyopaque,
-        at: *const fn (ctx: *anyopaque, point: C8Point, block_idx: u64) void,
+        at: *const fn (ctx: *anyopaque, point: RecheckPoint, block_idx: u64) void,
 
-        fn fire(self: C8Hook, point: C8Point, block_idx: u64) void {
+        fn fire(self: RecheckHook, point: RecheckPoint, block_idx: u64) void {
             self.at(self.ctx, point, block_idx);
         }
     };
@@ -806,7 +806,7 @@ pub const Pass = struct {
         // The durable-vs-derived drift needs every reference in view (the
         // live-lessee law of `c2c3c6`).
         if (self.host.residue() or self.host.scope.foreign_live.count() != 0) return;
-        if (self.host.c8_hook) |h| h.fire(.round1_refs, 0);
+        if (self.host.recheck_hook) |h| h.fire(.c8_round1_refs, 0);
         for (self.host.volumes) |v| {
             var x: C8Exempt = .{ .pass = self, .vol_tag = v.vol_tag };
             var rep = block_refs.verifyRefs(self.gpa, self.host.store.refStore(), v.vol_tag, self.cen.owners.items, x.exemptions()) catch |e| switch (e) {
@@ -1323,7 +1323,7 @@ pub const Pass = struct {
             self.counters.epoch_exempted += 1;
             return false;
         }
-        if (self.host.pre_registry_hook) |h| h();
+        if (self.host.recheck_hook) |h| h.fire(.phase_a_registry, b.idx);
         if (v.alloc.inflightContains(b.idx)) {
             self.counters.inflight_exempted += 1;
             return false;
@@ -1367,7 +1367,9 @@ pub const Pass = struct {
             .c2_leaked => |f| {
                 const v = host.volume(f.vol_tag) orelse return false;
                 if (v.alloc.refcount(f.block_idx) == null) return false;
-                return !(try self.recheckDerived(f.vol_tag)).contains(f.block_idx);
+                const derived = try self.recheckDerived(f.vol_tag);
+                if (host.recheck_hook) |h| h.fire(.count_recheck_derived, f.block_idx);
+                return !derived.contains(f.block_idx);
             },
             .c2_lost => |f| {
                 if (f.unrepairable_shape) return true; // permanent by construction
@@ -1646,7 +1648,7 @@ pub const Pass = struct {
         defer refs.deinit(gpa);
         var round: u32 = 0;
         while (round < C8_SETTLE_ROUNDS) : (round += 1) {
-            if (host.c8_hook) |h| h.fire(.recheck_start, block_idx);
+            if (host.recheck_hook) |h| h.fire(.c8_recheck_start, block_idx);
             refs.clearRetainingCapacity();
             try block_refs.blockRecords(host.store.refStore(), gpa, vol_tag, block_idx, &refs);
             for (refs.items) |r| try addCandidate(gpa, &cands, r.owner_ino);
@@ -1659,7 +1661,7 @@ pub const Pass = struct {
                 grew = true;
             };
             if (grew) continue;
-            if (host.c8_hook) |h| h.fire(.recheck_between_reads, block_idx);
+            if (host.recheck_hook) |h| h.fire(.c8_recheck_between_reads, block_idx);
             var derived: usize = 0;
             var binds: std.ArrayList(census.MappingRef) = .empty;
             defer binds.deinit(gpa);

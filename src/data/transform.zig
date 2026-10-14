@@ -551,18 +551,24 @@ pub fn frameSpan(h: Header, t: Table, rel_s: u64, rel_e: u64) DecodeError!FrameS
     return .{ .first = first, .last = last, .lo = derive.alignDown(a.off, DMA_GRAIN), .hi = @min(derive.alignUp(@as(u64, b.off) + b.body_len, DMA_GRAIN), image_end), .plain_base = @as(u64, first) * FRAME_GRAIN, .plain_end = end };
 }
 
-/// The plaintext a block's framed image must carry: through the last frame
-/// holding a non-zero byte — every frame past it reads back as zeros past
-/// the image's plaintext (`FrameSpan.plain_end`, the seeds' zero fill), so
-/// storing it buys nothing. A tail block's upload transforms only this
-/// (decision 0003 §AK): the stored image is then bounded by the live
-/// frames (`storedImageBound`), never the whole block — an encrypted
-/// set's zero frames are stored raw at 64 KiB + a tag each.
-pub fn liveFramedLen(plain: []const u8) usize {
+/// The plaintext a block's framed image must carry: through its last
+/// non-zero byte — every byte past it reads back as zeros past the image's
+/// plaintext (`FrameSpan.plain_end`, the fill's zero completion, the seeds'
+/// zero fill), and a short last frame is the format's own shape. A tail
+/// block's upload transforms only this (decision 0003 §AK): the stored
+/// image is then `storedImageBound(liveLen)`, never the whole block — an
+/// encrypted set stored every zero frame raw at 64 KiB + a tag. The scan
+/// skips whole zero frames, then walks the last live frame's tail.
+pub fn liveLen(plain: []const u8) usize {
     var end = std.mem.alignForward(usize, plain.len, FRAME_GRAIN);
     while (end != 0) {
         const start = end - FRAME_GRAIN;
-        if (start < plain.len and !std.mem.allEqual(u8, plain[start..@min(end, plain.len)], 0)) return @min(end, plain.len);
+        const frame = plain[@min(start, plain.len)..@min(end, plain.len)];
+        if (!std.mem.allEqual(u8, frame, 0)) {
+            var n = frame.len;
+            while (frame[n - 1] == 0) n -= 1;
+            return start + n;
+        }
         end = start;
     }
     return 0;
@@ -2186,20 +2192,21 @@ test "decodeHeader refuses by class in order: len, plain_len FIRST (before magic
     try testing.expectError(error.FrameTable, frameSpan(eh0, et, 5, 5));
 }
 
-test "liveFramedLen: the plaintext through the last frame holding a non-zero byte — an all-zero block is 0, a byte in frame k is (k + 1) frames, a short last frame ends at the payload; the trimmed image round-trips and its stored bytes meet storedImageBound (decision 0003 §AK)" {
+test "liveLen: the plaintext through its last non-zero byte — an all-zero block is 0, the last live byte ends it whichever frame holds it; the trimmed image round-trips and its stored bytes meet storedImageBound (decision 0003 §AK)" {
     const gpa = testing.allocator;
     const block: u32 = 4 * FRAME_GRAIN;
     const plain = try gpa.alloc(u8, block);
     defer gpa.free(plain);
     @memset(plain, 0);
-    try testing.expectEqual(@as(usize, 0), liveFramedLen(plain));
+    try testing.expectEqual(@as(usize, 0), liveLen(plain));
     plain[0] = 1;
-    try testing.expectEqual(@as(usize, FRAME_GRAIN), liveFramedLen(plain));
+    try testing.expectEqual(@as(usize, 1), liveLen(plain));
+    plain[FRAME_GRAIN - 1] = 3;
+    try testing.expectEqual(@as(usize, FRAME_GRAIN), liveLen(plain));
     plain[2 * FRAME_GRAIN + 77] = 9;
-    try testing.expectEqual(@as(usize, 3 * FRAME_GRAIN), liveFramedLen(plain));
-    try testing.expectEqual(@as(usize, 3 * FRAME_GRAIN), liveFramedLen(plain[0 .. 3 * FRAME_GRAIN]));
-    try testing.expectEqual(@as(usize, 2 * FRAME_GRAIN + 100), liveFramedLen(plain[0 .. 2 * FRAME_GRAIN + 100]));
-    try testing.expectEqual(@as(usize, FRAME_GRAIN), liveFramedLen(plain[0 .. 2 * FRAME_GRAIN + 50]));
+    try testing.expectEqual(@as(usize, 2 * FRAME_GRAIN + 78), liveLen(plain));
+    try testing.expectEqual(@as(usize, 2 * FRAME_GRAIN + 78), liveLen(plain[0 .. 2 * FRAME_GRAIN + 100]));
+    try testing.expectEqual(@as(usize, FRAME_GRAIN), liveLen(plain[0 .. 2 * FRAME_GRAIN + 50]));
     var env = testEnv();
     defer env.deinit();
     var d = deriveVolumeKey("a-32-byte-or-longer-key-material-string!!", &(@as([32]u8, @splat(5))));
@@ -2214,7 +2221,7 @@ test "liveFramedLen: the plaintext through the last frame holding a non-zero byt
         const xf = try Transform.init(&env, cfg, if (cfg.encryption == .none) null else gcm);
         var t = try Codec.init(gpa, &xf);
         defer t.deinit(gpa);
-        const live = liveFramedLen(plain);
+        const live = liveLen(plain);
         const image = try gpa.dupe(u8, try t.processWrite(plain[0..live], scratch));
         defer gpa.free(image);
         try testing.expect(std.mem.alignForward(usize, image.len, DMA_GRAIN) <= storedImageBound(cfg, live));

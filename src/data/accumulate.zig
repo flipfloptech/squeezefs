@@ -1054,11 +1054,11 @@ pub fn uploadParkedBlock(table: *Table, deps: UploadDeps, io: Io, ino: u64, bloc
         const proof = blk: {
             const scratch: []align(PAGE) u8 = if (scratch_pool) |sp| sp.acquire(io) else &.{};
             defer if (scratch_pool) |sp| sp.release(io, scratch);
-            // A transformed image carries the block's live frames only
-            // (decision 0003 §AK): the frames past the last non-zero byte
+            // A transformed image carries the block's live bytes only
+            // (decision 0003 §AK): the bytes past the last non-zero one
             // read back as zeros, and storing them cost a tail append's
             // drain the whole block on an encrypted set.
-            const plain = if (scratch_pool != null) snap.bytes()[0..transform.liveFramedLen(snap.bytes())] else snap.bytes();
+            const plain = if (scratch_pool != null) snap.bytes()[0..transform.liveLen(snap.bytes())] else snap.bytes();
             const image = deps.transform.process_write(deps.transform.ctx, vol_tag, plain, scratch) catch {
                 fsck_guard.deinit();
                 mint.abandon();

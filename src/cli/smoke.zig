@@ -5827,7 +5827,7 @@ const bench_terms = @import("bench.zig").StatsTerms;
 /// O_APPEND write (one drain per append).
 const xform_appends = 40;
 
-test "smoke: THE TRANSFORMED APPEND on a set without a cache path (decision 0003 §AK) — lz4, then aes-256-gcm: a file past the inline bound grows by 40 fsync'd 72 B appends and reads back exact (the write side seeded a transformed block's image through a block-sized buffer the chunk-sized read window refused: EIO at the first write past 4 KiB); a transformed block cannot be patched in place, so each drain lands the block's framed image whole — trimmed to its live frames: ≤ the stored bound of ONE frame per drain for a file under 64 KiB, where the untrimmed image of an encrypted set was the whole block; a read past the image's plaintext within EOF serves zeros" {
+test "smoke: THE TRANSFORMED APPEND on a set without a cache path (decision 0003 §AK) — lz4, then aes-256-gcm: a file past the inline bound grows by 40 fsync'd 72 B appends and reads back exact (the write side seeded a transformed block's image through a block-sized buffer the chunk-sized read window refused: EIO at the first write past 4 KiB); a transformed block cannot be patched in place, so each drain lands the block's framed image whole — trimmed to its live bytes: ≤ the stored bound of the file's bytes per drain (12,288 B on aes-256-gcm for a 7,880 B file), where the untrimmed image of an encrypted set was the whole block; a read past the image's plaintext within EOF serves zeros" {
     const io = testing.io;
     if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
     const gpa = testing.allocator;
@@ -5866,7 +5866,7 @@ test "smoke: THE TRANSFORMED APPEND on a set without a cache path (decision 0003
         const st1 = try rig.stats();
         defer gpa.free(st1);
         const device = bench_terms.parse(st1).device_write_bytes - bench_terms.parse(st0).device_write_bytes;
-        const per_drain = transform_mod.storedImageBound(cfg, transform_mod.FRAME_GRAIN);
+        const per_drain = transform_mod.storedImageBound(cfg, 5000 + xform_appends * 72);
         std.debug.print("\nsmoke[xform append {t}]: {d} appends of 72 B drained as {d} B of images (×{d} per appended byte; the bound {d} B per drain)\n", .{ enc, xform_appends, device, device / (xform_appends * 72), per_drain });
         try testing.expect(device > 0);
         try testing.expect(device <= xform_appends * per_drain);

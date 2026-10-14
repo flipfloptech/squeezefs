@@ -1618,6 +1618,7 @@ const matrix_files_per_dir: usize = 500;
 /// The matrix's `dd` on B: 200 MiB over the set's 4 MiB data blocks (the
 /// format default the rig's set declares) = 50 blocks, every one a grant.
 const matrix_dd_blocks: u64 = 50;
+/// The format default data block (4 MiB) in KiB — every rig set's.
 const matrix_block_kib: u64 = 4096;
 
 fn matrixCreateScript(gpa: std.mem.Allocator) ![]u8 {
@@ -6385,8 +6386,20 @@ fn dataPlanePass(rig: *Rig, cache: bool) !void {
         const out = try rig.onMount("rm -f big big100 shrunk storm0 storm1 storm2 storm3 storm4 storm5 storm6 storm7 && echo rm-ok");
         defer gpa.free(out);
     }
+    // What stays is the small files: striped on the set without staging;
+    // in the ring on the staging set — except the ones the plane's
+    // dispatch packed at the storm's ring pressure (the same schedule as
+    // the promotions above), whose live pack blocks are used space.
     const small_kib: u64 = if (cache) 0 else small_n * (4 << 10);
-    try rig.awaitUsedKib(baseline + small_kib);
+    const packs_kib: u64 = blk: {
+        const tail = try rig.statsTail();
+        defer gpa.free(tail);
+        const opened = numberAfter(tail, "\"pack_blocks_opened\":") orelse 0;
+        const gone = (numberAfter(tail, "\"pack_blocks_abandoned\":") orelse 0) + (numberAfter(tail, "\"pack_terminal_frees\":") orelse 0);
+        std.debug.print("smoke[{s}]: after rm: {d} pack block(s) live of {d} opened\n", .{ label, opened -| gone, opened });
+        break :blk (opened -| gone) * matrix_block_kib;
+    };
+    try rig.awaitUsedKib(baseline + small_kib + packs_kib);
     // umount: the dismount promotion; the census through `status`.
     try rig.umount();
     try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());

@@ -210,6 +210,23 @@ pub fn subtractExtents(gpa: Allocator, grant: []const GrantRun, kept: []const u6
     }
 }
 
+/// `record − hits` (both normalized), as normalized runs appended to
+/// `out` — one merge walk, bounded by the two lists' run counts.
+pub fn subtractRuns(gpa: Allocator, record: []const GrantRun, hits: []const GrantRun, out: *std.ArrayList(GrantRun)) Allocator.Error!void {
+    var j: usize = 0;
+    for (record) |r| {
+        var cur = r.start;
+        const end = r.end();
+        while (j < hits.len and hits[j].end() <= cur) j += 1;
+        var k = j;
+        while (k < hits.len and hits[k].start < end) : (k += 1) {
+            if (hits[k].start > cur) try out.append(gpa, .{ .start = cur, .len = @intCast(hits[k].start - cur) });
+            cur = @max(cur, hits[k].end());
+        }
+        if (cur < end) try out.append(gpa, .{ .start = cur, .len = @intCast(end - cur) });
+    }
+}
+
 /// A slot lease's custody move of its tree's live images (charter §5.5
 /// "Extent grants" — every extent has exactly one custodian; decision 0003
 /// §AD.1): the record of the lessee the lease moves to GAINS the tree's
@@ -875,4 +892,16 @@ test "property: the closure holds under a random walk of claim / free / advance 
 test "model: a claim and a return of one extent under the grant lock never produce a claimed-and-returned extent; the lockless return fails" {
     try explorer.expectHolds(ClaimReturnModel(false), .{});
     try explorer.expectFails(ClaimReturnModel(true), .{}, error.InvariantViolated);
+}
+
+test "subtractRuns: a record less the runs it holds, one merge walk — a hit inside a run splits it, a hit across two runs trims both, a whole run vanishes" {
+    const gpa = std.testing.allocator;
+    var out: std.ArrayList(GrantRun) = .empty;
+    defer out.deinit(gpa);
+    const record = [_]GrantRun{ .{ .start = 10, .len = 10 }, .{ .start = 30, .len = 5 }, .{ .start = 40, .len = 2 } };
+    try subtractRuns(gpa, &record, &.{ .{ .start = 12, .len = 2 }, .{ .start = 19, .len = 1 }, .{ .start = 30, .len = 5 }, .{ .start = 41, .len = 1 } }, &out);
+    try std.testing.expectEqualSlices(GrantRun, &.{ .{ .start = 10, .len = 2 }, .{ .start = 14, .len = 5 }, .{ .start = 40, .len = 1 } }, out.items);
+    out.clearRetainingCapacity();
+    try subtractRuns(gpa, &record, &.{}, &out);
+    try std.testing.expectEqualSlices(GrantRun, &record, out.items);
 }

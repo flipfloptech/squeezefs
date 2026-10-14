@@ -541,10 +541,12 @@ pub const Verbs = struct {
 
     // ---- the custody move of the trees' images (T1 / T5) ----
 
-    /// The record rewrite a lease's custody move over `slots`' trees adds
-    /// to the lease's entry (0003 §AD.1); null when nothing moves (the
-    /// manager's own lease — its images are untracked — or empty trees).
-    fn custodyRewrite(self: *Verbs, gpa: Allocator, appender_id: AppenderId, slots: []const u16, words: []const SlotWords, fresh: bool, dir: manager.Manager.ImagesMove) Error!?manager.Manager.RecordRewrite {
+    /// The record change a lease's custody move over `slots`' trees adds
+    /// to the lease's entry (0003 §AD.1; staged before it when the moved
+    /// chunks do not fit beside the lease's own records, `own_payload`
+    /// bytes — §AE.4); null when nothing moves (the manager's own lease —
+    /// its images are untracked — or empty trees).
+    fn custodyRewrite(self: *Verbs, gpa: Allocator, appender_id: AppenderId, slots: []const u16, words: []const SlotWords, fresh: bool, dir: manager.Manager.ImagesMove, own_payload: u64) Error!?manager.Manager.ImagesCustody {
         if (appender_id == journal.FIXED_RING_APPENDER) return null;
         const walk = self.seams.treeImages orelse return null;
         var images: std.ArrayList(u64) = .empty;
@@ -557,12 +559,26 @@ pub const Verbs = struct {
             images.items[n] = e;
             n += 1;
         }
-        return try self.mgr.rewriteForImages(appender_id, images.items[0..n], dir);
+        return try self.mgr.custodyForImages(appender_id, images.items[0..n], dir, own_payload);
+    }
+
+    /// The custody move's staged entries (none when it rides the lease's
+    /// entry), written before that entry.
+    fn custodyStage(self: *Verbs, c: *const manager.Manager.ImagesCustody) Error!void {
+        self.mgr.writeStaged(&c.change) catch |e| return switch (e) {
+            error.JournalReserveExhausted => blk: {
+                self.mgr.vol.vt.kickCheckpoint(self.mgr.vol.ctx);
+                break :blk error.Deferred;
+            },
+            error.ValueTooLarge, error.Corrupt => error.Corrupt,
+            error.Io => error.Io,
+            error.OutOfMemory => error.OutOfMemory,
+        };
     }
 
     /// The entry landed: an in-process region's RAM grant follows (a wire
     /// lessee follows at its own install / release), the moves counted.
-    fn custodyLanded(self: *Verbs, appender_id: AppenderId, c: *const manager.Manager.RecordRewrite, dir: manager.Manager.ImagesMove) void {
+    fn custodyLanded(self: *Verbs, appender_id: AppenderId, c: *const manager.Manager.ImagesCustody, dir: manager.Manager.ImagesMove) void {
         if (self.seams.ownsRegion(self.seams.ctx, appender_id)) if (self.seams.regionImagesMoved) |f| f(self.seams.ctx, appender_id, c.move.moved.items, dir) catch {
             log.err("slot leases: appender {d}'s RAM grant could not follow its record's custody move of {d} image(s) (out of memory) — its closure reads them unaccounted until the region's next open", .{ appender_id, c.move.moved.items.len });
         };
@@ -672,10 +688,13 @@ pub const Verbs = struct {
         // The custody move (T1, 0003 §AD.1): the grantee's record gains
         // every live image of the granted trees in THIS entry, so an image
         // it later retires through its own SMO context is one its grant
-        // holds. Decided before any RAM effect: a record the move would take
-        // past the run cap refuses the grant whole.
-        var custody = try self.custodyRewrite(gpa, req.appender_id, picked.items, granted_words, false, .gain);
+        // holds — a move whose chunks do not fit beside the slot states is
+        // staged first (§AE.4). Decided and staged before any RAM effect.
+        const own_payload = picked.items.len * journal.recordFrameLen(cr.Tag.slot_state.keyLen(), cr.SlotStateWire.LEN);
+        var custody = try self.custodyRewrite(gpa, req.appender_id, picked.items, granted_words, false, .gain, own_payload);
         defer if (custody) |*c| c.deinit(gpa);
+        if (custody) |*c| try self.custodyStage(c);
+        errdefer if (custody) |*c| self.mgr.abandonStaged(req.appender_id, &c.change);
         // RAM first (g += 1), the words, then ONE control entry.
         var recs: std.ArrayList(manager.ControlRecord) = .empty;
         defer recs.deinit(gpa);
@@ -701,7 +720,7 @@ pub const Verbs = struct {
             keys[i] = cr.slotStateKey(s);
             try recs.append(gpa, .{ .put = .{ .key = keys[i].slice(), .value = &values[i] } });
         }
-        if (custody) |*c| try recs.append(gpa, c.record());
+        if (custody) |*c| try c.change.appendFinal(gpa, &recs);
         try self.control(recs.items);
         stats.slot_grants.add(grants.len);
         if (custody) |*c| self.custodyLanded(req.appender_id, c, .gain);
@@ -821,13 +840,6 @@ pub const Verbs = struct {
                 return error.Rejected;
             },
         }
-        // The custody move (T5, 0003 §AD.1): the departing record loses the
-        // released tree's live images in THIS entry — the tree's next
-        // maintainer retires them through its own context. A wire lessee
-        // wrote the tree: its nodes are read from the device at the
-        // released root.
-        var custody = try self.custodyRewrite(gpa, req.appender_id, &.{req.slot}, &.{req.words}, !self.seams.ownsRegion(self.seams.ctx, req.appender_id), .lose);
-        defer if (custody) |*c| c.deinit(gpa);
         // ONE entry: Unleased + the tails stamped with the g they attest.
         const next: cr.SlotState = .{ .variant = .unleased, .g = req.g, .root = req.words.root, .cursor = @max(req.words.cursor, cur.cursor), .slot_tree_extents = req.words.extents, .last_written = self.table.lease_seq + 1, .seq_floor = @max(req.words.seq_floor, cur.seq_floor) };
         const value = next.encode();
@@ -879,9 +891,27 @@ pub const Verbs = struct {
                 }
             } else |_| {}
         }
-        if (custody) |*c| try recs.append(gpa, c.record());
+        // The custody move (T5, 0003 §AD.1): the departing record loses the
+        // released tree's live images in THIS entry — the tree's next
+        // maintainer retires them through its own context; chunks that do
+        // not fit beside the release's own records are staged first
+        // (§AE.4). A wire lessee wrote the tree: its nodes are read from the
+        // device at the released root.
+        var custody = self.custodyRewrite(gpa, req.appender_id, &.{req.slot}, &.{req.words}, !self.seams.ownsRegion(self.seams.ctx, req.appender_id), .lose, manager.controlPayloadLen(recs.items)) catch |e| {
+            if (spilled) |sp| for (sp.extents) |x| self.mgr.vol.vt.releaseUnpublished(self.mgr.vol.ctx, x);
+            return e;
+        };
+        defer if (custody) |*c| c.deinit(gpa);
+        if (custody) |*c| {
+            self.custodyStage(c) catch |e| {
+                if (spilled) |sp| for (sp.extents) |x| self.mgr.vol.vt.releaseUnpublished(self.mgr.vol.ctx, x);
+                return e;
+            };
+            try c.change.appendFinal(gpa, &recs);
+        }
         self.control(recs.items) catch |e| {
             if (spilled) |sp| for (sp.extents) |x| self.mgr.vol.vt.releaseUnpublished(self.mgr.vol.ctx, x);
+            if (custody) |*c| self.mgr.abandonStaged(req.appender_id, &c.change);
             return e;
         };
         if (custody) |*c| self.custodyLanded(req.appender_id, c, .lose);
@@ -1409,15 +1439,21 @@ test "a slot whose tree holds more images than one tree-0 value carries MOVES (0
     try testing.expect(p.state(5).?.variant == .leased and p.state(5).?.appender_id == 2);
     try testing.expectEqual(in0 + 1500, manager.stats.extent_grant_images_transferred_in.load());
     {
-        const rec = cr.decodeExtentGrant(p.tv.get(cr.extentGrantKey(2).slice()).?) catch unreachable;
+        var rec = try p.tv.grantRecord(2);
+        defer rec.deinit();
         var e: u64 = 1000;
         while (e < 4000) : (e += 1) try testing.expectEqual(e % 2 == 0, rec.contains(e));
+        // A family of chunks, each within one 4 KiB value.
+        try testing.expectEqual(@as(usize, (1500 + cr.GRANT_CHUNK_RUNS - 1) / cr.GRANT_CHUNK_RUNS), rec.chunks.len);
     }
     // T5: the release takes every image back out.
     const out0 = manager.stats.extent_grant_images_transferred_out.load();
     try testing.expectEqual(Verbs.ReleaseResult.released, try p.verbs.releaseSlot(gpa, .{ .appender_id = 2, .slot = 5, .g = out.granted.grants[0].g, .words = .{ .root = words.root, .cursor = 41, .extents = 2, .seq_floor = 11 } }));
     try testing.expectEqual(out0 + 1500, manager.stats.extent_grant_images_transferred_out.load());
-    try testing.expect(p.tv.get(cr.extentGrantKey(2).slice()) == null);
+    var gone = try p.tv.grantRecord(2);
+    defer gone.deinit();
+    try testing.expectEqual(@as(usize, 0), gone.chunks.len);
+    try testing.expectEqual(@as(usize, 0), gone.staged.len);
 }
 
 test "ReleaseSlot past the inline cap SPILLS (rung 10 item 5b): 1,100 tails at the 64 KiB node (cap 1,039) land in one claimed extent named by a spilled record with the extent's alloc delta in the SAME entry; the RAM index holds every tail; the next release of the slot with a small set goes inline and gives the spill extent back (the free delta, the bit)" {

@@ -47,6 +47,7 @@ const page = @import("../appender_page.zig");
 const dir = @import("../appender_dir.zig");
 const manager = @import("../manager.zig");
 const cr = @import("../control_records.zig");
+const grant_record = @import("../grant_record.zig");
 const grant = @import("../extent_grant.zig");
 const lt = @import("../slots/lease_table.zig");
 const slots_plane = @import("../slots/plane.zig");
@@ -442,13 +443,25 @@ pub const VolumeBinding = struct {
         std.mem.sort(u16, out.items, {}, std.sort.asc(u16));
     }
 
-    fn grantRecordFn(ctx: *anyopaque, gpa: Allocator, appender_id: u32, out: *std.ArrayList(GrantRun)) Error!void {
+    /// `appender_id`'s grant record as tree 0 holds it.
+    fn grantOf(self: *VolumeBinding, gpa: Allocator, appender_id: u32) Error!grant_record.Family {
+        const r = cr.extentGrantFamily(appender_id);
+        var kvs: std.ArrayList(tree.KeyValue) = .empty;
+        defer tree.deinitKeyValues(gpa, &kvs);
+        self.be.range(gpa, key.TREE_CONTROL, r.start.slice(), r.end.slice(), std.math.maxInt(usize), &kvs) catch |e| return mapBackend(e);
+        return grant_record.Family.load(gpa, appender_id, kvs.items);
+    }
+
+    fn grantFamilyFn(ctx: *anyopaque, gpa: Allocator, appender_id: u32, out: *std.ArrayList(manager.KeyValue)) Error!void {
         const self = self_(ctx);
-        const v = (self.be.lookup(gpa, key.TREE_CONTROL, cr.extentGrantKey(appender_id).slice()) catch |e| return mapBackend(e)) orelse return;
-        defer gpa.free(v);
-        const d = cr.decodeExtentGrant(v) catch return error.Corrupt;
-        try out.resize(gpa, d.n_runs);
-        _ = d.collect(out.items);
+        const r = cr.extentGrantFamily(appender_id);
+        var kvs: std.ArrayList(tree.KeyValue) = .empty;
+        defer tree.deinitKeyValues(gpa, &kvs);
+        self.be.range(gpa, key.TREE_CONTROL, r.start.slice(), r.end.slice(), std.math.maxInt(usize), &kvs) catch |e| return mapBackend(e);
+        try out.ensureUnusedCapacity(gpa, kvs.items.len);
+        // The slices move to `out` (the caller frees them).
+        for (kvs.items) |kv| out.appendAssumeCapacity(.{ .key = kv.key, .value = kv.value });
+        kvs.clearRetainingCapacity();
     }
 
     /// ONE ring-0 control entry in the USER class, DRAIN-AND-RETRY on a
@@ -942,17 +955,11 @@ pub const VolumeBinding = struct {
         const self = self_(ctx);
         if (extents.len == 0) return;
         const gpa = self.gpa;
-        var grant_record: std.ArrayList(GrantRun) = .empty;
-        defer grant_record.deinit(gpa);
-        try grantRecordFn(ctx, gpa, self.recovering_id, &grant_record);
+        var family = try self.grantOf(gpa, self.recovering_id);
+        defer family.deinit();
         var named: std.ArrayList(u64) = .empty;
         defer named.deinit(gpa);
-        for (extents) |e| {
-            for (grant_record.items) |r| if (r.contains(e)) {
-                try named.append(gpa, e);
-                break;
-            };
-        }
+        for (extents) |e| if (family.contains(e)) try named.append(gpa, e);
         if (named.items.len == 0) return;
         std.mem.sort(u64, named.items, {}, std.sort.asc(u64));
         var runs: std.ArrayList(GrantRun) = .empty;
@@ -1100,7 +1107,7 @@ pub const VolumeBinding = struct {
         .readRing = &readRingFn,
         .slotState = &slotStateFn,
         .leasedTo = &leasedToFn,
-        .grantRecord = &grantRecordFn,
+        .grantFamily = &grantFamilyFn,
         .controlEntry = &controlEntryFn,
         .spillTails = &spillTailsFn,
         .noteUnleased = &noteUnleasedFn,
@@ -1653,14 +1660,16 @@ test "linux: a dead in-process region recovered over the real backend by the man
         try testing.expectEqual(unwritten0 + 1, recovery.stats.dead_appender_unwritten_returned.load());
         try testing.expect(!be.alloc.isAllocated(dead.orphan));
         try testing.expect(!be.alloc.isAllocated(dead.unwritten));
-        const graw = try be.lookup(gpa, key.TREE_CONTROL, cr.extentGrantKey(1).slice());
-        defer if (graw) |g| gpa.free(g);
-        if (graw) |g| {
-            const d = try cr.decodeExtentGrant(g);
-            var i: usize = 0;
-            while (i < d.n_runs) : (i += 1) {
-                var e = d.runAt(i).start;
-                while (e < d.runAt(i).end()) : (e += 1) try testing.expect(be.alloc.isAllocated(e));
+        {
+            const r = cr.extentGrantFamily(1);
+            var kvs: std.ArrayList(tree.KeyValue) = .empty;
+            defer tree.deinitKeyValues(gpa, &kvs);
+            try be.range(gpa, key.TREE_CONTROL, r.start.slice(), r.end.slice(), std.math.maxInt(usize), &kvs);
+            var fam = try grant_record.Family.load(gpa, 1, kvs.items);
+            defer fam.deinit();
+            for (fam.record) |run| {
+                var e = run.start;
+                while (e < run.end()) : (e += 1) try testing.expect(be.alloc.isAllocated(e));
             }
         }
         // recovered:{id, vol} stands; the bound in force covers the run.
@@ -1925,9 +1934,8 @@ test "linux: THE RECOVERY'S CENSUS AGAINST THE MANAGER'S OWN SMO — a dead wire
     try testing.expect(be.sym.?.isUnrecovered(dead.appender_id));
     // The precondition: the dead slot's root image — the page's entry, the
     // root the recovery installs — lives in B's grant.
-    var grant_runs: std.ArrayList(GrantRun) = .empty;
-    defer grant_runs.deinit(gpa);
-    try VolumeBinding.grantRecordFn(binding, gpa, dead.appender_id, &grant_runs);
+    var grant_fam = try binding.grantOf(gpa, dead.appender_id);
+    defer grant_fam.deinit();
     const dead_page = (try be.sym.?.manager.readPageOf(dead.appender_id)).?;
     var root_addr: u64 = 0;
     for (dead_page.slotEntries()) |e| if (e.slot == dead.slot) {
@@ -1935,9 +1943,7 @@ test "linux: THE RECOVERY'S CENSUS AGAINST THE MANAGER'S OWN SMO — a dead wire
     };
     try testing.expect(root_addr >= be.sb.heap.start);
     const x = be.cache.addrExtent(root_addr);
-    var in_grant = false;
-    for (grant_runs.items) |r| in_grant = in_grant or r.contains(x);
-    try testing.expect(in_grant);
+    try testing.expect(grant_fam.contains(x));
     const recoveries0 = recovery.stats.appender_recoveries.load();
     const orphans0 = recovery.stats.dead_appender_orphans.load();
     live.recordDeath(dead.identity, false);
@@ -1977,9 +1983,11 @@ test "linux: THE RECOVERY'S CENSUS AGAINST THE MANAGER'S OWN SMO — a dead wire
     try testing.expect(be.alloc.isAllocated(x));
     try expectBudgetConserved(be);
     // The grant record no longer names it.
-    grant_runs.clearRetainingCapacity();
-    try VolumeBinding.grantRecordFn(binding, gpa, dead.appender_id, &grant_runs);
-    for (grant_runs.items) |r| try testing.expect(!r.contains(x));
+    {
+        var after = try binding.grantOf(gpa, dead.appender_id);
+        defer after.deinit();
+        try testing.expect(!after.contains(x));
+    }
     // Covered: free exactly once, the budget conserved.
     try be.checkpointNow();
     try be.checkpointNow();

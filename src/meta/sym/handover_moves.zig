@@ -194,17 +194,21 @@ test "linux: THE CACHE BARRIER AT A LEASE MOVE (0003 §X.5; found by the online 
 // ---------------------------------------------------------------------------
 
 const cr = @import("control_records.zig");
+const grant_record = @import("grant_record.zig");
+const tree = @import("../tree.zig");
 const smo = @import("../smo.zig");
 
 /// The manager's record of `appender_id`'s grant as runs (empty: none).
 fn grantRecordOf(gpa: std.mem.Allocator, be: *KvBackend, appender_id: u32) !std.ArrayList(cr.GrantRun) {
     var runs: std.ArrayList(cr.GrantRun) = .empty;
     errdefer runs.deinit(gpa);
-    const raw = (try be.lookup(gpa, key.TREE_CONTROL, cr.extentGrantKey(appender_id).slice())) orelse return runs;
-    defer gpa.free(raw);
-    const d = try cr.decodeExtentGrant(raw);
-    try runs.resize(gpa, d.n_runs);
-    _ = d.collect(runs.items);
+    const r = cr.extentGrantFamily(appender_id);
+    var kvs: std.ArrayList(tree.KeyValue) = .empty;
+    defer tree.deinitKeyValues(gpa, &kvs);
+    try be.range(gpa, key.TREE_CONTROL, r.start.slice(), r.end.slice(), std.math.maxInt(usize), &kvs);
+    var fam = try grant_record.Family.load(gpa, appender_id, kvs.items);
+    defer fam.deinit();
+    try runs.appendSlice(gpa, fam.record);
     return runs;
 }
 

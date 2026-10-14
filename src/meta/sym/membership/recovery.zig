@@ -54,8 +54,10 @@ const counters = @import("../../../core/counters.zig");
 const clock = @import("../../../core/clock.zig");
 const log = @import("../../../core/log.zig");
 const checkpoint = @import("../../checkpoint.zig");
+const journal = @import("../../journal.zig");
 const cr = @import("../control_records.zig");
 const extent_grant = @import("../extent_grant.zig");
+const grant_record = @import("../grant_record.zig");
 const page = @import("../appender_page.zig");
 const manager = @import("../manager.zig");
 const tails_spill = @import("../slots/tails_spill.zig");
@@ -222,7 +224,10 @@ pub const Volume = struct {
         slotState: *const fn (ctx: *anyopaque, slot: u16) Error!?cr.SlotState,
         /// Slots tree 0 leases to `appender_id` (`leased` or `releasing`).
         leasedTo: *const fn (ctx: *anyopaque, gpa: Allocator, appender_id: u32, out: *std.ArrayList(u16)) Error!void,
-        grantRecord: *const fn (ctx: *anyopaque, gpa: Allocator, appender_id: u32, out: *std.ArrayList(GrantRun)) Error!void,
+        /// `appender_id`'s grant record: every key/value of its chunk family
+        /// (`cr.extentGrantFamily`) appended to `out` (the caller's `gpa`
+        /// owns both slices).
+        grantFamily: *const fn (ctx: *anyopaque, gpa: Allocator, appender_id: u32, out: *std.ArrayList(manager.KeyValue)) Error!void,
         /// ONE control entry, admitted DRAIN-AND-RETRY under the SMO hold.
         controlEntry: *const fn (ctx: *anyopaque, recs: []const manager.ControlRecord) Error!void,
         /// Step 7 landed `Unleased` for the slot: the volume's own mirrors
@@ -478,10 +483,10 @@ pub const Driver = struct {
         var leased: std.ArrayList(u16) = .empty;
         defer leased.deinit(gpa);
         try self.vol.vt.leasedTo(self.vol.ctx, gpa, p.appender_id, &leased);
-        var grant: std.ArrayList(GrantRun) = .empty;
-        defer grant.deinit(gpa);
-        try self.vol.vt.grantRecord(self.vol.ctx, gpa, p.appender_id, &grant);
-        try self.screenWindow(window.items, leased.items, grant.items);
+        var family = try self.loadGrant(p.appender_id);
+        defer family.deinit();
+        const grant = family.record;
+        try self.screenWindow(window.items, leased.items, grant);
         // The RAM table follows tree 0 for the dead id's slots: a re-run
         // past its tree-0 step finds slots the rollback left `Leased{dead}`
         // in RAM that tree 0 already holds `Unleased` (absorbed above) —
@@ -534,7 +539,7 @@ pub const Driver = struct {
         // flush cycles' compactions, the checkpoint task's maintenance,
         // the D4 arm) never hands a grant extent to the coverage clock
         // behind the census's back.
-        try self.vol.vt.holdRetirements(self.vol.ctx, grant.items);
+        try self.vol.vt.holdRetirements(self.vol.ctx, grant);
         rollback.hold = true;
         // The structure is the recovery's from the first root install to
         // the replay's last record (the charter's "from the root install on
@@ -610,7 +615,7 @@ pub const Driver = struct {
         // hold's retirements, sorted for the census's probes.
         var kept: std.ArrayList(u64) = .empty;
         defer kept.deinit(gpa);
-        try self.vol.vt.keptExtents(self.vol.ctx, gpa, grant.items, &kept);
+        try self.vol.vt.keptExtents(self.vol.ctx, gpa, grant, &kept);
         std.mem.sort(u64, kept.items, {}, std.sort.asc(u64));
         const quarantine_until: ?u64 = if (standing.early) custody.custodyQuarantineUntilNs(standing.ts_realtime_ns, self.mount.skew_max_ms * std.time.ns_per_ms) else null;
         const coherence_until = standing.ts_realtime_ns +| self.mount.coherence_hold_ms * std.time.ns_per_ms;
@@ -650,18 +655,8 @@ pub const Driver = struct {
         // The grant record minus what it no longer owns.
         var remaining: std.ArrayList(GrantRun) = .empty;
         defer remaining.deinit(gpa);
-        try extent_grant.subtractExtents(gpa, grant.items, kept.items, &remaining);
-        if (remaining.items.len == 0) {
-            try self.vol.vt.controlEntry(self.vol.ctx, &.{.{ .delete = cr.extentGrantKey(p.appender_id).slice() }});
-        } else {
-            // Sized to the runs (the record's own bound is the tree-0 value
-            // cap the entry enforces): the custody moves leave recycled
-            // tree images as single-extent runs, past any fixed count.
-            const grant_buf = try gpa.alloc(u8, cr.extentGrantEncodedLen(remaining.items.len));
-            defer gpa.free(grant_buf);
-            const gv = cr.encodeExtentGrant(remaining.items, grant_buf) catch return error.Corrupt;
-            try self.vol.vt.controlEntry(self.vol.ctx, &.{.{ .put = .{ .key = cr.extentGrantKey(p.appender_id).slice(), .value = gv } }});
-        }
+        try extent_grant.subtractExtents(gpa, grant, kept.items, &remaining);
+        try self.writeGrant(&family, remaining.items);
         try self.fail(.tree0);
         // ---- 7b. the RAM table LAST; the rollback disarmed ----
         for (plans.items) |pl| {
@@ -743,6 +738,65 @@ pub const Driver = struct {
     /// slot's intent HOME is local 0 by law and is exempt: the kill rows'
     /// B, killed with a cross-owner mkdir's intent still inside its ring
     /// window, was refused every poll — "no local ino").
+    /// The dead appender's grant record: a marker of a staged change that
+    /// never landed (a manager that died mid-change, or a recovery's own
+    /// earlier run) is swept first — its chunks count for no reader.
+    fn loadGrant(self: *Driver, appender_id: u32) Error!grant_record.Family {
+        var fam = try self.readGrant(appender_id);
+        if (fam.marker == null) return fam;
+        defer fam.deinit();
+        const ops = try fam.sweepOps(self.gpa);
+        defer self.gpa.free(ops);
+        try self.writeOps(&.{ops});
+        return self.readGrant(appender_id);
+    }
+
+    fn readGrant(self: *Driver, appender_id: u32) Error!grant_record.Family {
+        var kvs: std.ArrayList(manager.KeyValue) = .empty;
+        defer {
+            for (kvs.items) |kv| {
+                self.gpa.free(kv.key);
+                self.gpa.free(kv.value);
+            }
+            kvs.deinit(self.gpa);
+        }
+        try self.vol.vt.grantFamily(self.vol.ctx, self.gpa, appender_id, &kvs);
+        return grant_record.Family.load(self.gpa, appender_id, kvs.items);
+    }
+
+    /// The record replaced by `target` (decision 0003 §AE.4): the chunks
+    /// whose share changed, staged behind the marker when they do not fit
+    /// one entry. A re-run after a crash between the entries finds the
+    /// marker and sweeps it (`loadGrant`): the record never names less
+    /// than the old or more than the new.
+    fn writeGrant(self: *Driver, family: *const grant_record.Family, target: []const GrantRun) Error!void {
+        var plan = try family.plan(self.gpa, target, cr.GRANT_CHUNK_RUNS);
+        defer plan.deinit();
+        if (plan.empty()) return;
+        var w = grant_record.Writes.build(self.gpa, &plan, journal.entryPayloadCap(), grant_record.stagedEntryRoom()) catch |e| return switch (e) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.EntryTooLarge => error.Corrupt,
+        };
+        defer w.deinit();
+        try self.writeOps(w.staged);
+        try self.writeOps(&.{w.final});
+    }
+
+    /// Each op list as ONE control entry, in order.
+    fn writeOps(self: *Driver, entries: []const []const grant_record.Op) Error!void {
+        var recs: std.ArrayList(manager.ControlRecord) = .empty;
+        defer recs.deinit(self.gpa);
+        for (entries) |ops| {
+            if (ops.len == 0) continue;
+            recs.clearRetainingCapacity();
+            for (ops) |*op| try recs.append(self.gpa, switch (op.*) {
+                .put => |*pt| .{ .put = .{ .key = pt.key.slice(), .value = pt.value } },
+                .delete => |*k| .{ .delete = k.slice() },
+            });
+            try self.vol.vt.controlEntry(self.vol.ctx, recs.items);
+        }
+    }
+
     fn screenWindow(self: *Driver, window: []const WindowRecord, leased: []const u16, grant: []const GrantRun) Error!void {
         var absorbed: [ABSORBED_MAX]u16 = undefined;
         var n_absorbed: usize = 0;
@@ -1153,8 +1207,8 @@ const RamVolume = struct {
         try self.table.load(10, s10);
         try self.table.load(11, s11);
         var gbuf: [256]u8 = undefined;
-        const g = try cr.encodeExtentGrant(&.{.{ .start = 100, .len = 10 }}, &gbuf);
-        try self.put0(cr.extentGrantKey(2).slice(), g);
+        const g = try cr.encodeGrantChunk(2, 0, &.{.{ .start = 100, .len = 10 }}, &gbuf);
+        try self.put0(cr.extentGrantKey(2, 0).slice(), g);
         var e: u64 = 100;
         while (e < 110) : (e += 1) try self.grant_bits.put(self.gpa, e, {});
         try self.stamped.put(self.gpa, 109, {});
@@ -1211,12 +1265,36 @@ const RamVolume = struct {
         }
         std.mem.sort(u16, out.items, {}, std.sort.asc(u16));
     }
-    fn grantRecordFn(ctx: *anyopaque, gpa: Allocator, id: u32, out: *std.ArrayList(GrantRun)) Error!void {
+    fn grantFamilyFn(ctx: *anyopaque, gpa: Allocator, id: u32, out: *std.ArrayList(manager.KeyValue)) Error!void {
         const self = self_(ctx);
-        const v = self.get0(cr.extentGrantKey(id).slice()) orelse return;
-        const d = cr.decodeExtentGrant(v) catch return error.Corrupt;
-        out.resize(gpa, d.n_runs) catch return error.OutOfMemory;
-        _ = d.collect(out.items);
+        var it = self.tree0.iterator();
+        while (it.next()) |kv| {
+            if (cr.tagOfKey(kv.key_ptr.*) != .extent_grant or cr.appenderOfKey(kv.key_ptr.*) != id) continue;
+            const k = gpa.dupe(u8, kv.key_ptr.*) catch return error.OutOfMemory;
+            const v = gpa.dupe(u8, kv.value_ptr.*) catch {
+                gpa.free(k);
+                return error.OutOfMemory;
+            };
+            out.append(gpa, .{ .key = k, .value = v }) catch {
+                gpa.free(k);
+                gpa.free(v);
+                return error.OutOfMemory;
+            };
+        }
+    }
+
+    /// The fixture's record of `id` as the recovery reads it.
+    fn grantOf(self: *RamVolume, id: u32) !grant_record.Family {
+        var kvs: std.ArrayList(manager.KeyValue) = .empty;
+        defer {
+            for (kvs.items) |kv| {
+                self.gpa.free(kv.key);
+                self.gpa.free(kv.value);
+            }
+            kvs.deinit(self.gpa);
+        }
+        try grantFamilyFn(self, self.gpa, id, &kvs);
+        return grant_record.Family.load(self.gpa, id, kvs.items);
     }
     fn controlEntryFn(ctx: *anyopaque, recs: []const manager.ControlRecord) Error!void {
         const self = self_(ctx);
@@ -1408,7 +1486,7 @@ const RamVolume = struct {
         self.coherence.put(self.gpa, slot, until) catch return error.OutOfMemory;
     }
 
-    const vtable: Volume.VTable = .{ .vol = &volFn, .readPage = &readPageFn, .writePage = &writePageFn, .readRing = &readRingFn, .slotState = &slotStateFn, .leasedTo = &leasedToFn, .grantRecord = &grantRecordFn, .controlEntry = &controlEntryFn, .noteUnleased = &noteUnleasedFn, .table = &tableFn, .treeState = &treeStateFn, .installRoot = &installRootFn, .restoreTree = &restoreTreeFn, .replay = &replayFn, .holdStructure = &holdStructureFn, .replayDataDeltas = &replayDataFn, .cycleUntilClean = &cycleFn, .flushedRoot = &flushedRootFn, .leafTails = &leafTailsFn, .holdRetirements = &holdFn, .endRetirementHold = &endHoldFn, .keptExtents = &keptFn, .returnExtents = &returnExtentsFn, .freeRing = &freeRingFn, .orphanImages = &orphanImagesFn, .raiseSeqFloor = &raiseFloorFn, .ring0Head = &ring0HeadFn, .writerTerm = &writerTermFn, .quarantineCustody = &quarantineFn, .holdCoherence = &holdCoherenceFn, .notifyHandoverDone = &notifyFn };
+    const vtable: Volume.VTable = .{ .vol = &volFn, .readPage = &readPageFn, .writePage = &writePageFn, .readRing = &readRingFn, .slotState = &slotStateFn, .leasedTo = &leasedToFn, .grantFamily = &grantFamilyFn, .controlEntry = &controlEntryFn, .noteUnleased = &noteUnleasedFn, .table = &tableFn, .treeState = &treeStateFn, .installRoot = &installRootFn, .restoreTree = &restoreTreeFn, .replay = &replayFn, .holdStructure = &holdStructureFn, .replayDataDeltas = &replayDataFn, .cycleUntilClean = &cycleFn, .flushedRoot = &flushedRootFn, .leafTails = &leafTailsFn, .holdRetirements = &holdFn, .endRetirementHold = &endHoldFn, .keptExtents = &keptFn, .returnExtents = &returnExtentsFn, .freeRing = &freeRingFn, .orphanImages = &orphanImagesFn, .raiseSeqFloor = &raiseFloorFn, .ring0Head = &ring0HeadFn, .writerTerm = &writerTermFn, .quarantineCustody = &quarantineFn, .holdCoherence = &holdCoherenceFn, .notifyHandoverDone = &notifyFn };
 
     fn volume(self: *RamVolume) Volume {
         return .{ .ctx = self, .vt = &vtable };
@@ -1496,8 +1574,9 @@ const Fixture = struct {
         // 105..107), then the record's remainder beyond the page by content:
         // 108 (never written) returned unnamed, 109 (the appender's stamped
         // residue) returned as the one orphan image.
-        const g = cr.decodeExtentGrant(self.rv.get0(cr.extentGrantKey(2).slice()).?) catch unreachable;
-        try testing.expectEqual(@as(u64, 7), g.totalExtents());
+        var g = try self.rv.grantOf(2);
+        defer g.deinit();
+        try testing.expectEqual(@as(u64, 7), g.total());
         std.mem.sort(u64, self.rv.returned.items, {}, std.sort.asc(u64));
         try testing.expectEqualSlices(u64, &.{ 103, 105, 106, 107, 108, 109 }, self.rv.returned.items);
         try testing.expectEqual(@as(u32, 1), self.rv.data_deltas.count());
@@ -1692,9 +1771,9 @@ test "the volume's own SMO retires a dead grant's image mid-recovery (found by t
     try testing.expectEqual(Outcome.acted, f.driver.recoverDead(f.death()));
     for (f.rv.returned.items) |e| try testing.expect(e != 101);
     try testing.expectEqual(@as(usize, 1), std.mem.count(u64, f.rv.fifo.items, &.{101}));
-    const g = cr.decodeExtentGrant(f.rv.get0(cr.extentGrantKey(2).slice()).?) catch unreachable;
-    var runs: [16]GrantRun = undefined;
-    for (g.collect(&runs)) |r| try testing.expect(!r.contains(101));
+    var g = try f.rv.grantOf(2);
+    defer g.deinit();
+    try testing.expect(!g.contains(101));
 }
 
 test "a release of recovered regions frees a Recovered page no lease names (identity and term kept) and leaves one a lease still names; the poll binding composes the hooks" {

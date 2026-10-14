@@ -49,6 +49,8 @@ const page = @import("appender_page.zig");
 const dir = @import("appender_dir.zig");
 const region = @import("region.zig");
 const grant = @import("extent_grant.zig");
+const grant_record = @import("grant_record.zig");
+const alloc_ext = @import("../alloc_ext.zig");
 
 const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
@@ -101,15 +103,17 @@ pub const stats = struct {
     pub var extent_grant_stale_page_words: counters.ShardedCounter = .{};
     /// Two custodians of one extent: must stay 0.
     pub var extent_grant_conflicts: counters.Tripwire = .init("extent_grant_conflicts");
-    /// A return that would split a record run past the cap (capacity class).
-    pub var extent_return_run_cap_refusals: counters.ShardedCounter = .{};
     /// Live images a slot lease's custody move carried into the grantee's
     /// record (T1) and out of the departing lessee's (T5) — 0003 §AD.1.
     pub var extent_grant_images_transferred_in: counters.ShardedCounter = .{};
     pub var extent_grant_images_transferred_out: counters.ShardedCounter = .{};
-    /// A custody move whose record would pass the run cap: the lease does
-    /// not move (capacity class, like `extent_return_run_cap_refusals`).
-    pub var extent_grant_custody_cap_refusals: counters.ShardedCounter = .{};
+    /// Record changes too large for their own control entry, staged behind
+    /// the family's move marker (`grant_record.zig`), and the chunks those
+    /// staged entries wrote.
+    pub var extent_grant_staged_changes: counters.ShardedCounter = .{};
+    pub var extent_grant_staged_chunks: counters.ShardedCounter = .{};
+    /// Markers of staged changes that never landed, cleared at the next load.
+    pub var extent_grant_markers_swept: counters.ShardedCounter = .{};
     /// Cycles the structural door ran; doors deferred on a moving tail.
     pub var slot_grant_door_cycles: counters.ShardedCounter = .{};
     pub var slot_grant_deferrals: counters.ShardedCounter = .{};
@@ -417,6 +421,24 @@ pub const ControlRecord = union(enum) {
     data_delta: struct { key: []const u8, value: []const u8 },
 };
 
+/// The journal payload one control record costs in its entry (the frame
+/// `bind.controlEntryFn` builds for it).
+pub fn controlRecordFrameLen(r: ControlRecord) u64 {
+    return switch (r) {
+        .put => |p| journal.recordFrameLen(p.key.len, p.value.len),
+        .delete => |k| journal.recordFrameLen(k.len, 0),
+        .alloc => journal.recordFrameLen(alloc_ext.extent_key_len, alloc_ext.allocRecordValue().len),
+        .free => journal.recordFrameLen(alloc_ext.extent_key_len, alloc_ext.freeRecordValue(0).len),
+        .data_delta => |d| journal.recordFrameLen(d.key.len, d.value.len),
+    };
+}
+
+pub fn controlPayloadLen(recs: []const ControlRecord) u64 {
+    var n: u64 = 0;
+    for (recs) |r| n += controlRecordFrameLen(r);
+    return n;
+}
+
 pub const KeyValue = struct { key: []u8, value: []u8 };
 
 pub const ControlError = error{ JournalReserveExhausted, ValueTooLarge, Io, Corrupt, OutOfMemory };
@@ -618,34 +640,166 @@ pub const Manager = struct {
         return cr.SlotStateWire.decode(raw) catch return error.Corrupt;
     }
 
+    /// An appender's grant record: its chunk family as loaded (the runs are
+    /// the family's merged record).
     const GrantRecord = struct {
-        runs: std.ArrayList(GrantRun) = .empty,
+        family: grant_record.Family,
 
         fn deinit(self: *GrantRecord, gpa: Allocator) void {
-            self.runs.deinit(gpa);
+            _ = gpa;
+            self.family.deinit();
+        }
+
+        fn runs(self: *const GrantRecord) []const GrantRun {
+            return self.family.record;
         }
 
         fn contains(self: *const GrantRecord, extent: u64) bool {
-            for (self.runs.items) |r| if (r.contains(extent)) return true;
-            return false;
+            return self.family.contains(extent);
         }
 
         fn total(self: *const GrantRecord) u64 {
-            var n: u64 = 0;
-            for (self.runs.items) |r| n += r.len;
-            return n;
+            return self.family.total();
         }
     };
 
+    /// `appender_id`'s chunk family as tree 0 holds it (one range walk).
+    fn readFamily(self: *Manager, appender_id: u32) VerbError!grant_record.Family {
+        const r = cr.extentGrantFamily(appender_id);
+        var kvs: std.ArrayList(KeyValue) = .empty;
+        defer freeKvs(self.gpa, &kvs);
+        try self.vol.vt.range(self.vol.ctx, self.gpa, r.start.slice(), r.end.slice(), &kvs);
+        return grant_record.Family.load(self.gpa, appender_id, kvs.items) catch |e| return switch (e) {
+            error.Corrupt => error.Corrupt,
+            error.OutOfMemory => error.OutOfMemory,
+        };
+    }
+
+    /// The record a change is planned against: a marker a staged change
+    /// left (it never landed — its chunks count for no reader) is swept
+    /// first. The caller holds the verb mutex.
     fn readGrantRecord(self: *Manager, appender_id: u32) VerbError!GrantRecord {
-        var rec: GrantRecord = .{};
-        errdefer rec.deinit(self.gpa);
-        const raw = (try self.vol.vt.lookup(self.vol.ctx, self.gpa, cr.extentGrantKey(appender_id).slice())) orelse return rec;
-        defer self.gpa.free(raw);
-        const d = cr.decodeExtentGrant(raw) catch return error.Corrupt;
-        try rec.runs.resize(self.gpa, d.n_runs);
-        _ = d.collect(rec.runs.items);
-        return rec;
+        var fam = try self.readFamily(appender_id);
+        if (fam.marker != null) {
+            defer fam.deinit();
+            try self.sweepMarker(&fam);
+            return .{ .family = try self.readFamily(appender_id) };
+        }
+        return .{ .family = fam };
+    }
+
+    /// Delete a marker's staged chunks, then the marker, in entries of the
+    /// staged size (any prefix is safe: staged chunks count for nobody).
+    fn sweepMarker(self: *Manager, fam: *const grant_record.Family) VerbError!void {
+        const ops = try fam.sweepOps(self.gpa);
+        defer self.gpa.free(ops);
+        var recs: std.ArrayList(ControlRecord) = .empty;
+        defer recs.deinit(self.gpa);
+        var bytes: u64 = 0;
+        for (ops) |*op| {
+            if (bytes + op.frameLen() > grant_record.stagedEntryRoom()) {
+                try self.control(recs.items);
+                recs.clearRetainingCapacity();
+                bytes = 0;
+            }
+            try recs.append(self.gpa, recordOfOp(op));
+            bytes += op.frameLen();
+        }
+        try self.control(recs.items);
+        stats.extent_grant_markers_swept.inc();
+        log.warn("manager: appender {d}'s grant record carried the marker of a staged change that never landed ({d} chunk(s)) — swept", .{ fam.appender_id, fam.staged.len });
+    }
+
+    /// The control record of one family op (its key and value live in the
+    /// op: `op` must outlive the record).
+    fn recordOfOp(op: *const grant_record.Op) ControlRecord {
+        return switch (op.*) {
+            .put => |*pt| .{ .put = .{ .key = pt.key.slice(), .value = pt.value } },
+            .delete => |*k| .{ .delete = k.slice() },
+        };
+    }
+
+    /// A planned record change: the entries staged before the change's own
+    /// entry and the ops that entry carries (decision 0003 §AE.4). Keys
+    /// and values live in `writes`.
+    pub const RecordChange = struct {
+        writes: grant_record.Writes,
+
+        pub fn deinit(self: *RecordChange) void {
+            self.writes.deinit();
+        }
+
+        /// The ops for the change's own entry, appended as control records.
+        pub fn appendFinal(self: *const RecordChange, gpa: Allocator, recs: *std.ArrayList(ControlRecord)) Allocator.Error!void {
+            for (self.writes.final) |*op| try recs.append(gpa, recordOfOp(op));
+        }
+    };
+
+    /// The change that turns `rec` into `target`, its own entry's other
+    /// records costing `own_payload` bytes. `Rejected` = the change's entry
+    /// cannot carry the deletes of the chunks it replaces (≈ 500 k runs
+    /// touched — the stated envelope).
+    pub fn planRecordChange(self: *Manager, rec: *const GrantRecord, target: []const GrantRun, own_payload: u64) VerbError!RecordChange {
+        var p = rec.family.plan(self.gpa, target, cr.GRANT_CHUNK_RUNS) catch |e| return switch (e) {
+            error.Corrupt => error.Corrupt,
+            error.OutOfMemory => error.OutOfMemory,
+        };
+        defer p.deinit();
+        const room = journal.entryPayloadCap() -| own_payload;
+        const w = grant_record.Writes.build(self.gpa, &p, room, grant_record.stagedEntryRoom()) catch |e| return switch (e) {
+            error.EntryTooLarge => blk: {
+                log.warn("manager: appender {d}'s record change replaces {d} chunk(s): their deletes do not fit the change's entry — refused", .{ rec.family.appender_id, p.deletes.len });
+                break :blk error.Rejected;
+            },
+            error.OutOfMemory => error.OutOfMemory,
+        };
+        return .{ .writes = w };
+    }
+
+    /// Write a change's staged entries (none when it rides its own entry):
+    /// the marker first. A failure leaves the marker, which the next load
+    /// sweeps.
+    pub fn writeStaged(self: *Manager, c: *const RecordChange) ControlError!void {
+        if (c.writes.staged.len == 0) return;
+        var recs: std.ArrayList(ControlRecord) = .empty;
+        defer recs.deinit(self.gpa);
+        var chunks: u64 = 0;
+        for (c.writes.staged) |entry| {
+            recs.clearRetainingCapacity();
+            for (entry) |*op| try recs.append(self.gpa, recordOfOp(op));
+            try self.vol.vt.controlEntry(self.vol.ctx, recs.items);
+            chunks += entry.len;
+        }
+        stats.extent_grant_staged_changes.inc();
+        stats.extent_grant_staged_chunks.add(chunks - 1);
+    }
+
+    /// The change's own entry failed after its staged entries landed: the
+    /// marker swept now (best effort — a failure leaves it for the next
+    /// load, and it counts for no reader meanwhile).
+    pub fn abandonStaged(self: *Manager, appender_id: u32, c: *const RecordChange) void {
+        if (c.writes.staged.len == 0) return;
+        var fam = self.readFamily(appender_id) catch return;
+        defer fam.deinit();
+        if (fam.marker != null) self.sweepMarker(&fam) catch {};
+    }
+
+    /// Plan, stage and land `rec` → `target` with `own` in the same entry;
+    /// `rec` reloaded after.
+    fn commitRecord(self: *Manager, appender_id: u32, rec: *GrantRecord, target: []const GrantRun, own: []const ControlRecord) VerbError!void {
+        var c = try self.planRecordChange(rec, target, controlPayloadLen(own));
+        defer c.deinit();
+        self.writeStaged(&c) catch |e| return mapControl(e);
+        var recs: std.ArrayList(ControlRecord) = .empty;
+        defer recs.deinit(self.gpa);
+        try recs.appendSlice(self.gpa, own);
+        try c.appendFinal(self.gpa, &recs);
+        self.control(recs.items) catch |e| {
+            self.abandonStaged(appender_id, &c);
+            return e;
+        };
+        rec.deinit(self.gpa);
+        rec.* = .{ .family = try self.readFamily(appender_id) };
     }
 
     fn readHint(self: *Manager, id: cr.StableIdentity) VerbError!cr.AppenderHint {
@@ -661,17 +815,16 @@ pub const Manager = struct {
     }
 
     fn control(self: *Manager, recs: []const ControlRecord) VerbError!void {
-        self.vol.vt.controlEntry(self.vol.ctx, recs) catch |e| return switch (e) {
+        self.vol.vt.controlEntry(self.vol.ctx, recs) catch |e| return mapControl(e);
+    }
+
+    fn mapControl(e: ControlError) VerbError {
+        return switch (e) {
             error.JournalReserveExhausted => error.JournalReserveExhausted,
             error.ValueTooLarge, error.Corrupt => error.Corrupt,
             error.Io => error.Io,
             error.OutOfMemory => error.OutOfMemory,
         };
-    }
-
-    /// The record's run cap under the volume's tree-0 value cap.
-    fn runCap(self: *Manager) u32 {
-        return cr.extentGrantMaxRuns(geometry.recordValueCap(self.vol.geo().node_size));
     }
 
     /// Every OTHER appender's record: a custodian of `extent` elsewhere is
@@ -681,11 +834,20 @@ pub const Manager = struct {
         var kvs: std.ArrayList(KeyValue) = .empty;
         defer freeKvs(self.gpa, &kvs);
         try self.vol.vt.range(self.vol.ctx, self.gpa, r.start.slice(), r.end.slice(), &kvs);
-        for (kvs.items) |kv| {
-            const id = cr.appenderOfKey(kv.key) orelse continue;
+        // The walk is in key order: one appender's family is a contiguous run.
+        var i: usize = 0;
+        while (i < kvs.items.len) {
+            const id = cr.appenderOfKey(kvs.items[i].key) orelse return error.Corrupt;
+            var j = i + 1;
+            while (j < kvs.items.len and cr.appenderOfKey(kvs.items[j].key) == id) j += 1;
+            defer i = j;
             if (id == appender_id) continue;
-            const d = cr.decodeExtentGrant(kv.value) catch return error.Corrupt;
-            for (extents) |e| if (d.contains(e)) return true;
+            var fam = grant_record.Family.load(self.gpa, id, kvs.items[i..j]) catch |e| return switch (e) {
+                error.Corrupt => error.Corrupt,
+                error.OutOfMemory => error.OutOfMemory,
+            };
+            defer fam.deinit();
+            for (extents) |e| if (fam.contains(e)) return true;
         }
         return false;
     }
@@ -942,7 +1104,7 @@ pub const Manager = struct {
             var out: Joined = .{ .appender_id = ex.p.appender_id, .page_addr = ex.slots[0], .term = ex.p.term, .generation = ex.p.generation, .head_hint = ex.p.head_hint, .ring_segments = ex.p.segments, .grant = undefined, .n_grant = 0, .already = true, .node_seq_base = minted.base };
             var rec = try self.readGrantRecord(ex.p.appender_id);
             defer rec.deinit(self.gpa);
-            if (ex.p.grants.len == 0 and rec.runs.items.len == 0) {
+            if (ex.p.grants.len == 0 and rec.runs().len == 0) {
                 // The first join died before its grant: complete it here.
                 const want = @max(grant.joinedPoolFloor(g.mint_slots), hint.grant_extents);
                 const granted = try self.carveGrant(ex.p.appender_id, want, &rec);
@@ -1022,7 +1184,7 @@ pub const Manager = struct {
         // 10. A Free page's residue returned; the initial grant.
         var rec = try self.readGrantRecord(appender_id);
         defer rec.deinit(self.gpa);
-        if (rec.runs.items.len != 0) {
+        if (rec.runs().len != 0) {
             try self.returnWhole(appender_id, &rec);
             stats.appender_join_residue_returned.inc();
         }
@@ -1196,7 +1358,7 @@ pub const Manager = struct {
             errdefer out.deinit(self.gpa);
             const copy = try self.gpa.dupe(GrantRun, req.page_word);
             defer self.gpa.free(copy);
-            try grant.intersectWithRecord(self.gpa, grant.coalesceRuns(copy), rec.runs.items, &out);
+            try grant.intersectWithRecord(self.gpa, grant.coalesceRuns(copy), rec.runs(), &out);
             self.ledger.record(clock.monotonicNs(), t_admit - t0, clock.monotonicNs() - t_admit, 0);
             return .{ .runs = try out.toOwnedSlice(self.gpa), .replayed = true };
         }
@@ -1206,15 +1368,27 @@ pub const Manager = struct {
         return granted;
     }
 
+    /// The most extents one carve claims: each costs its `alloc` delta and,
+    /// at worst, the delete of the record chunk owning it — both ride the
+    /// ONE entry that lands the carve (the fresh chunks are staged when they
+    /// do not fit beside them). A carve past it is cut; the joiner's next
+    /// refill asks again.
+    pub fn carveExtentsMax() u64 {
+        const per_extent = journal.recordFrameLen(alloc_ext.extent_key_len, alloc_ext.allocRecordValue().len) + journal.recordFrameLen(cr.Tag.extent_grant.keyLen(), 0);
+        return (journal.entryPayloadCap() - journal.recordFrameLen(cr.Tag.extent_grant.keyLen(), 0)) / per_extent;
+    }
+
     /// Carve `want` extents in the internal class (partial on `NoSpace`;
-    /// nothing ⇒ `NoSpace` — the SPACE class), cut to the record's run cap,
+    /// nothing ⇒ `NoSpace` — the SPACE class), cut to `carveExtentsMax`,
     /// refused if held elsewhere, ONE control entry with the alloc deltas
-    /// and the merged record. The caller owns the returned runs.
+    /// and the record's change (its fresh chunks staged first when they do
+    /// not fit it). The caller owns the returned runs.
     fn carveGrant(self: *Manager, appender_id: u32, want: u64, rec: *GrantRecord) VerbError!Granted {
         var claimed: std.ArrayList(u64) = .empty;
         defer claimed.deinit(self.gpa);
+        const n = @min(want, carveExtentsMax());
         var i: u64 = 0;
-        while (i < want) : (i += 1) {
+        while (i < n) : (i += 1) {
             const e = self.vol.vt.claimInternal(self.vol.ctx) catch break;
             try claimed.append(self.gpa, e);
         }
@@ -1224,48 +1398,22 @@ pub const Manager = struct {
             stats.extent_grant_conflicts.fire("a grant carve landed inside another appender's extent grant");
             return error.Refused;
         }
-        // Merge into the record; cut fragments past the run cap.
+        std.mem.sort(u64, claimed.items, {}, std.sort.asc(u64));
         var merged: std.ArrayList(GrantRun) = .empty;
         defer merged.deinit(self.gpa);
-        try merged.appendSlice(self.gpa, rec.runs.items);
-        std.mem.sort(u64, claimed.items, {}, std.sort.asc(u64));
-        for (claimed.items) |e| try merged.append(self.gpa, .{ .start = e, .len = 1 });
-        const normalized = grant.coalesceRuns(merged.items);
-        const cap = self.runCap();
-        var kept: std.ArrayList(GrantRun) = .empty;
-        defer kept.deinit(self.gpa);
-        var dropped: std.ArrayList(u64) = .empty;
-        defer dropped.deinit(self.gpa);
-        for (normalized, 0..) |r, idx| {
-            if (idx < cap) try kept.append(self.gpa, r) else {
-                var e = r.start;
-                while (e < r.end()) : (e += 1) try dropped.append(self.gpa, e);
-            }
-        }
+        try merged.appendSlice(self.gpa, rec.runs());
         var granted: std.ArrayList(GrantRun) = .empty;
         errdefer granted.deinit(self.gpa);
-        var final_claimed: std.ArrayList(u64) = .empty;
-        defer final_claimed.deinit(self.gpa);
         for (claimed.items) |e| {
-            var cut = false;
-            for (dropped.items) |d| if (d == e) {
-                cut = true;
-            };
-            if (cut) self.vol.vt.releaseUnpublished(self.vol.ctx, e) else try final_claimed.append(self.gpa, e);
-        }
-        if (final_claimed.items.len == 0) return error.NoSpace;
-        // The record as it stands after the carve.
-        const buf = try self.gpa.alloc(u8, cr.extentGrantEncodedLen(kept.items.len));
-        defer self.gpa.free(buf);
-        const enc = cr.encodeExtentGrant(kept.items, buf) catch return error.Corrupt;
-        try self.journalCarve(final_claimed.items, &.{.{ .put = .{ .key = cr.extentGrantKey(appender_id).slice(), .value = enc } }});
-        rec.runs.clearRetainingCapacity();
-        try rec.runs.appendSlice(self.gpa, kept.items);
-        for (final_claimed.items) |e| {
+            try merged.append(self.gpa, .{ .start = e, .len = 1 });
             if (granted.items.len > 0 and granted.items[granted.items.len - 1].end() == e) granted.items[granted.items.len - 1].len += 1 else try granted.append(self.gpa, .{ .start = e, .len = 1 });
         }
+        var allocs: std.ArrayList(ControlRecord) = .empty;
+        defer allocs.deinit(self.gpa);
+        for (claimed.items) |e| try allocs.append(self.gpa, .{ .alloc = e });
+        try self.commitRecord(appender_id, rec, grant.coalesceRuns(merged.items), allocs.items);
         stats.extent_grants.inc();
-        stats.extent_grant_extents.add(final_claimed.items.len);
+        stats.extent_grant_extents.add(claimed.items.len);
         return .{ .runs = try granted.toOwnedSlice(self.gpa), .replayed = false };
     }
 
@@ -1286,16 +1434,16 @@ pub const Manager = struct {
     }
 
     /// `coalesce` (bounded by the frame) → `∩ record` (bounded by the
-    /// record) → the own-region RAM screen → the run-cap screen → ONE
-    /// control entry: `free(extent, retire 0)` + the record WITHOUT them.
-    /// `cleared + already ≡ named`.
+    /// record) → the own-region RAM screen → ONE control entry: `free(extent,
+    /// retire 0)` + the record WITHOUT them (the chunks the hits touch
+    /// rewritten). `cleared + already ≡ named`.
     fn returnInner(self: *Manager, appender_id: u32, runs: []GrantRun, rec: *GrantRecord) VerbError!Returned {
         const coalesced = grant.coalesceRuns(runs);
         var named: u64 = 0;
         for (coalesced) |r| named += r.len;
         var hit: std.ArrayList(GrantRun) = .empty;
         defer hit.deinit(self.gpa);
-        try grant.intersectWithRecord(self.gpa, coalesced, rec.runs.items, &hit);
+        try grant.intersectWithRecord(self.gpa, coalesced, rec.runs(), &hit);
         var cleared: u64 = 0;
         for (hit.items) |r| cleared += r.len;
         if (cleared == 0) {
@@ -1312,55 +1460,23 @@ pub const Manager = struct {
                 };
             }
         }
-        // The record without the hits.
         var rest: std.ArrayList(GrantRun) = .empty;
         defer rest.deinit(self.gpa);
-        for (rec.runs.items) |r| {
-            var cur: ?GrantRun = null;
-            var e = r.start;
-            while (e < r.end()) : (e += 1) {
-                var returned = false;
-                for (hit.items) |h| if (h.contains(e)) {
-                    returned = true;
-                };
-                if (returned) {
-                    if (cur) |c| try rest.append(self.gpa, c);
-                    cur = null;
-                } else if (cur) |*c| {
-                    c.len += 1;
-                } else cur = .{ .start = e, .len = 1 };
-            }
-            if (cur) |c| try rest.append(self.gpa, c);
-        }
-        if (rest.items.len > self.runCap()) {
-            stats.extent_return_run_cap_refusals.inc();
-            return error.Refused;
-        }
+        try grant.subtractRuns(self.gpa, rec.runs(), hit.items, &rest);
         var recs: std.ArrayList(ControlRecord) = .empty;
         defer recs.deinit(self.gpa);
         for (hit.items) |r| {
             var e = r.start;
             while (e < r.end()) : (e += 1) try recs.append(self.gpa, .{ .free = e });
         }
-        const buf = try self.gpa.alloc(u8, cr.extentGrantEncodedLen(rest.items.len));
-        defer self.gpa.free(buf);
-        const k = cr.extentGrantKey(appender_id);
-        if (rest.items.len == 0) {
-            try recs.append(self.gpa, .{ .delete = k.slice() });
-        } else {
-            const enc = cr.encodeExtentGrant(rest.items, buf) catch return error.Corrupt;
-            try recs.append(self.gpa, .{ .put = .{ .key = k.slice(), .value = enc } });
-        }
-        try self.control(recs.items);
-        rec.runs.clearRetainingCapacity();
-        try rec.runs.appendSlice(self.gpa, rest.items);
+        try self.commitRecord(appender_id, rec, rest.items, recs.items);
         stats.extent_returns.inc();
         stats.extent_grant_returned.add(cleared);
         return .{ .cleared = cleared, .already = named - cleared };
     }
 
     fn returnWhole(self: *Manager, appender_id: u32, rec: *GrantRecord) VerbError!void {
-        const copy = try self.gpa.dupe(GrantRun, rec.runs.items);
+        const copy = try self.gpa.dupe(GrantRun, rec.runs());
         defer self.gpa.free(copy);
         _ = try self.returnInner(appender_id, copy, rec);
     }
@@ -1371,59 +1487,52 @@ pub const Manager = struct {
 
     pub const CustodyError = error{ Rejected, Io, Corrupt, OutOfMemory };
 
-    /// The control record a slot lease's custody move adds to the lease's
-    /// ONE entry (charter §5.5 "Extent grants": every extent has exactly
-    /// one custodian; 0003 §AD.1): `appender_id`'s record after its tree
-    /// images moved in (T1, the grant) or out (T5, the release) — a put, or
-    /// a delete when nothing remains — and the extents that moved.
-    pub const RecordRewrite = struct {
+    /// A slot lease's custody move (charter §5.5 "Extent grants": every
+    /// extent has exactly one custodian; 0003 §AD.1): `appender_id`'s record
+    /// after its tree images moved in (T1, the grant) or out (T5, the
+    /// release), as the change the lease's entry carries (staged entries
+    /// first when the moved chunks do not fit it — decision 0003 §AE.4),
+    /// and the extents that moved.
+    pub const ImagesCustody = struct {
         move: grant.RecordMove,
-        key: cr.ControlKey,
-        /// The encoded record (empty for a delete).
-        value: []u8,
+        change: RecordChange,
 
-        pub fn record(self: *const RecordRewrite) ControlRecord {
-            return if (self.move.runs.items.len == 0) .{ .delete = self.key.slice() } else .{ .put = .{ .key = self.key.slice(), .value = self.value } };
-        }
-
-        pub fn deinit(self: *RecordRewrite, gpa: Allocator) void {
+        pub fn deinit(self: *ImagesCustody, gpa: Allocator) void {
             self.move.deinit(gpa);
-            gpa.free(self.value);
+            self.change.deinit();
         }
     };
 
     /// `images` (ascending, deduplicated) into or out of `appender_id`'s
-    /// record. Null = nothing moves: the manager's own region (its images
+    /// record, the lease's own records costing `own_payload` bytes of its
+    /// entry. Null = nothing moves: the manager's own region (its images
     /// are untracked — the bitmap is its record) or no image changes hands.
-    /// A record the move would take past the run cap refuses typed
-    /// (`Rejected`): the lease does not move. The caller holds the verb
-    /// mutex (the record it reads is the one its entry replaces).
-    pub fn rewriteForImages(self: *Manager, appender_id: u32, images: []const u64, way: ImagesMove) CustodyError!?RecordRewrite {
+    /// The caller holds the verb mutex (the record it reads is the one its
+    /// entry replaces).
+    pub fn custodyForImages(self: *Manager, appender_id: u32, images: []const u64, way: ImagesMove, own_payload: u64) CustodyError!?ImagesCustody {
         if (appender_id == journal.FIXED_RING_APPENDER or images.len == 0) return null;
-        var rec = self.readGrantRecord(appender_id) catch |e| return switch (e) {
-            error.OutOfMemory => error.OutOfMemory,
-            error.Io => error.Io,
-            else => error.Corrupt,
-        };
+        var rec = self.readGrantRecord(appender_id) catch |e| return custodyError(e);
         defer rec.deinit(self.gpa);
         var move = switch (way) {
-            .gain => try grant.RecordMove.gain(self.gpa, rec.runs.items, images),
-            .lose => try grant.RecordMove.lose(self.gpa, rec.runs.items, images),
+            .gain => try grant.RecordMove.gain(self.gpa, rec.runs(), images),
+            .lose => try grant.RecordMove.lose(self.gpa, rec.runs(), images),
         };
         errdefer move.deinit(self.gpa);
         if (move.moved.items.len == 0) {
             move.deinit(self.gpa);
             return null;
         }
-        if (move.runs.items.len > self.runCap()) {
-            stats.extent_grant_custody_cap_refusals.inc();
-            log.warn("manager: moving {d} tree image(s) {s} appender {d}'s grant record would take it to {d} runs, past the {d}-run cap of a tree-0 value — the slot lease does not move", .{ move.moved.items.len, if (way == .gain) "into" else "out of", appender_id, move.runs.items.len, self.runCap() });
-            return error.Rejected;
-        }
-        const value = try self.gpa.alloc(u8, if (move.runs.items.len == 0) 0 else cr.extentGrantEncodedLen(move.runs.items.len));
-        errdefer self.gpa.free(value);
-        if (move.runs.items.len != 0) _ = cr.encodeExtentGrant(move.runs.items, value) catch return error.Corrupt;
-        return .{ .move = move, .key = cr.extentGrantKey(appender_id), .value = value };
+        const change = self.planRecordChange(&rec, move.runs.items, own_payload) catch |e| return custodyError(e);
+        return .{ .move = move, .change = change };
+    }
+
+    fn custodyError(e: VerbError) CustodyError {
+        return switch (e) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.Io => error.Io,
+            error.Rejected => error.Rejected,
+            else => error.Corrupt,
+        };
     }
 
     // ---- GrowRing (§3.3) ----
@@ -1796,6 +1905,21 @@ pub const TestVolume = struct {
         return null;
     }
 
+    /// `appender_id`'s grant record as tree 0 holds it.
+    pub fn grantRecord(self: *TestVolume, appender_id: u32) !grant_record.Family {
+        var kvs: std.ArrayList(KeyValue) = .empty;
+        defer {
+            for (kvs.items) |kv| {
+                self.gpa.free(kv.key);
+                self.gpa.free(kv.value);
+            }
+            kvs.deinit(self.gpa);
+        }
+        const r = cr.extentGrantFamily(appender_id);
+        try rangeFn(self, self.gpa, r.start.slice(), r.end.slice(), &kvs);
+        return grant_record.Family.load(self.gpa, appender_id, kvs.items);
+    }
+
     /// The manager's own page made Live (what `bind.zig`'s join does).
     pub fn liveManagerPage(self: *TestVolume) !void {
         var p = page.Page.free(0, 1, page.SegmentTable.one(.{ .start = self.g.journal.start, .len = self.g.journal.len }));
@@ -1839,11 +1963,18 @@ pub const TestVolume = struct {
         return try gpa.dupe(u8, v);
     }
 
+    /// Key order, as a tree walk answers.
     fn rangeFn(ctx: *anyopaque, gpa: Allocator, start: []const u8, end: []const u8, out: *std.ArrayList(KeyValue)) error{ Io, OutOfMemory }!void {
+        const from = out.items.len;
         for (self_(ctx).tree0.items) |kv| {
             if (key.lessThan(kv.key, start) or key.lessThan(end, kv.key)) continue;
             try out.append(gpa, .{ .key = try gpa.dupe(u8, kv.key), .value = try gpa.dupe(u8, kv.value) });
         }
+        std.mem.sort(KeyValue, out.items[from..], {}, struct {
+            fn lt(_: void, a: KeyValue, b: KeyValue) bool {
+                return key.lessThan(a.key, b.key);
+            }
+        }.lt);
     }
 
     fn put(self: *TestVolume, k: []const u8, v: []const u8) !void {
@@ -1994,8 +2125,9 @@ test "join: allocates the lowest free page, carves + zeroes a ring at the floor,
     try testing.expect(p.head_hint >= 1000 and p.ledger_tail_seq == p.head_hint and p.ckpt_seq == 0);
     try testing.expectEqual(@as(u64, 2), p.generation);
     // Tree 0: the record, the counter.
-    const rec = cr.decodeExtentGrant(tv.get(cr.extentGrantKey(1).slice()).?) catch unreachable;
-    try testing.expectEqual(@as(u64, 12), rec.totalExtents());
+    var rec = try tv.grantRecord(1);
+    defer rec.deinit();
+    try testing.expectEqual(@as(u64, 12), rec.total());
     try testing.expectEqual(@as(u64, 1), try cr.decodeNodeSeqIncarnations(tv.get(cr.nodeSeqIncarnationsKey().slice()).?));
     // Bits: dir + 8 ring + 12 grant.
     try testing.expectEqual(@as(u64, 1 + 8 + 12), tv.allocatedExtents());
@@ -2070,7 +2202,11 @@ test "leave: screens (own region, unknown id, a foreign identity, a Free page = 
     try testing.expect(p.state == .free and p.term == 1 and p.identity.eql(.none) and p.segments.len == 0 and p.ledger_tail_seq == p.head_hint);
     try testing.expectEqual(@as(u64, 4), p.generation);
     try testing.expectEqual(bits_live - 8 - 12, tv.allocatedExtents());
-    try testing.expect(tv.get(cr.extentGrantKey(1).slice()) == null);
+    {
+        var gone = try tv.grantRecord(1);
+        defer gone.deinit();
+        try testing.expectEqual(@as(usize, 0), gone.chunks.len);
+    }
     // Replay: a Free page answers already, nothing written.
     const entries = tv.control_entries;
     const again = try m.leaveAppender(.{ .identity = ident_a, .appender_id = 1, .unclaimed = &.{} });
@@ -2109,8 +2245,9 @@ test "grants: the manager never grants itself; want is screened against the heap
     n = 0;
     for (g1.runs) |r| n += r.len;
     try testing.expectEqual(@as(u64, 8), n);
-    const rec = cr.decodeExtentGrant(tv.get(cr.extentGrantKey(1).slice()).?) catch unreachable;
-    try testing.expectEqual(@as(u64, 20), rec.totalExtents());
+    var rec = try tv.grantRecord(1);
+    defer rec.deinit();
+    try testing.expectEqual(@as(u64, 20), rec.total());
     try testing.expectEqual(granted_before + 8, stats.extent_grant_extents.load());
     // A stale page word (an extent the record never held) is counted, not granted.
     const stale_before = stats.extent_grant_stale_page_words.load();
@@ -2131,7 +2268,8 @@ test "grants: the manager never grants itself; want is screened against the heap
     try testing.expectEqual(@as(u64, first.len), r1.cleared);
     try testing.expectEqual(@as(u64, 1), r1.already);
     try testing.expectEqual(bits_before - first.len, tv.allocatedExtents());
-    const rec2 = cr.decodeExtentGrant(tv.get(cr.extentGrantKey(1).slice()).?) catch unreachable;
+    var rec2 = try tv.grantRecord(1);
+    defer rec2.deinit();
     try testing.expect(!rec2.contains(first.start));
     // Replayed: nothing held ⇒ already.
     const r2 = try m.returnExtents(.{ .appender_id = 1, .runs = &runs });
@@ -2147,6 +2285,76 @@ test "grants: the manager never grants itself; want is screened against the heap
     try testing.expectError(error.Refused, m.returnExtents(.{ .appender_id = 1, .runs = &held_run }));
     try log.testing.expectAllFired();
     try testing.expectEqual(refusals_before + 1, stats.manager_verb_refusals.load());
+}
+
+test "a custody move whose chunks do not fit the lease's entry is STAGED (0003 §AE.4): the marker and the fresh chunks land first and no reader counts them; the lease's entry (its own records, the replaced chunks' deletes, the marker's) makes the whole new record effective at once; a change whose entry never lands is swept and the record stands as it was" {
+    const gpa = testing.allocator;
+    const tv = try TestVolume.init(gpa, 1 << 30, 65_536, 4000);
+    defer tv.deinit();
+    try tv.liveManagerPage();
+    var m = newManager(gpa, tv);
+    defer m.deinit();
+    _ = try m.joinAppender(.{ .identity = ident_a });
+    var before = try tv.grantRecord(1);
+    defer before.deinit();
+    var images: std.ArrayList(u64) = .empty;
+    defer images.deinit(gpa);
+    var e: u64 = 1000;
+    while (e < 3800) : (e += 2) try images.append(gpa, e);
+    // The lease's own records leave 8 KiB of its entry: 1,400 runs (six
+    // chunks) do not fit beside them.
+    const own = journal.entryPayloadCap() - 8192;
+    m.verbs_lock.lockUncancelable(m.io);
+    defer m.verbs_lock.unlock(m.io);
+    var c = (try m.custodyForImages(1, images.items, .gain, own)).?;
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 1400), c.move.moved.items.len);
+    try testing.expect(c.change.writes.staged.len >= 1);
+    const staged0 = stats.extent_grant_staged_changes.load();
+    try m.writeStaged(&c.change);
+    try testing.expectEqual(staged0 + 1, stats.extent_grant_staged_changes.load());
+    {
+        var mid = try tv.grantRecord(1);
+        defer mid.deinit();
+        try testing.expect(mid.marker != null and mid.staged.len >= 6);
+        try testing.expectEqualSlices(GrantRun, before.record, mid.record);
+    }
+    // The lease's entry lands: everything at once.
+    var recs: std.ArrayList(ControlRecord) = .empty;
+    defer recs.deinit(gpa);
+    try c.change.appendFinal(gpa, &recs);
+    try m.control(recs.items);
+    {
+        var after = try tv.grantRecord(1);
+        defer after.deinit();
+        try testing.expect(after.marker == null and after.staged.len == 0);
+        for (images.items) |x| try testing.expect(after.contains(x));
+        try testing.expectEqual(before.total() + 1400, after.total());
+    }
+    // A second move whose lease entry never lands (scattered below the
+    // first, 4 KiB of room): swept, the record as it was.
+    var more: std.ArrayList(u64) = .empty;
+    defer more.deinit(gpa);
+    e = 101;
+    while (e < 991) : (e += 2) if (!before.contains(e)) try more.append(gpa, e);
+    var c2 = (try m.custodyForImages(1, more.items, .gain, journal.entryPayloadCap() - 4096)).?;
+    defer c2.deinit(gpa);
+    try testing.expect(c2.change.writes.staged.len >= 1);
+    try m.writeStaged(&c2.change);
+    const swept0 = stats.extent_grant_markers_swept.load();
+    m.abandonStaged(1, &c2.change);
+    try testing.expectEqual(swept0 + 1, stats.extent_grant_markers_swept.load());
+    var last = try tv.grantRecord(1);
+    defer last.deinit();
+    try testing.expect(last.marker == null and last.staged.len == 0);
+    try testing.expectEqual(before.total() + 1400, last.total());
+    for (more.items) |x| try testing.expect(!last.contains(x));
+    // A marker a crash left is swept at the next record read of a verb.
+    try m.writeStaged(&c2.change);
+    var again = try m.readGrantRecord(1);
+    defer again.deinit(gpa);
+    try testing.expectEqual(swept0 + 2, stats.extent_grant_markers_swept.load());
+    try testing.expect(again.family.marker == null and !again.contains(more.items[0]));
 }
 
 test "grow ring: screens; a pending witness this incarnation's page does not name replays verbatim; a short run declines on its own counter; a real growth carves the longest run, zeroes it, writes the hint with the pending word; eight segments decline" {

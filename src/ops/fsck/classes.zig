@@ -119,12 +119,18 @@ pub const PageView = struct {
 
 pub const Tree0Row = struct { vol: u16, slot: u16, state: cr.SlotState };
 
+/// One appender's grant record as the census read it: every chunk of its
+/// family decoded and assembled (`grant_record.Family.load`), or not.
+pub const GrantView = struct { vol: u16, appender: u32, assembles: bool };
+
 /// The forest's custody census (C14/C15): every volume's pages, every
-/// volume's tree-0 `slot_state` rows, volume 0's death ledger.
+/// volume's tree-0 `slot_state` rows, volume 0's death ledger, every
+/// volume's grant records.
 pub const ForestCensus = struct {
     pages: []const PageView,
     tree0: []const Tree0Row,
     deaths: []const cr.StableIdentity,
+    grants: []const GrantView = &.{},
 };
 
 pub const ForestFace = struct {
@@ -1502,7 +1508,7 @@ pub const Pass = struct {
                 for (l) |x| if (x.eql(s)) return true;
                 return false;
             },
-            .c14_slot_custody_conflict, .c15_unrecovered_appender => {
+            .c14_slot_custody_conflict, .c14_grant_record_corrupt, .c15_unrecovered_appender => {
                 const fc = try self.freshForest();
                 var out: std.ArrayList(Finding) = .empty;
                 defer out.deinit(gpa);
@@ -1877,6 +1883,7 @@ const PairKey = struct { vol: u16, slot: u16, lo: u32, hi: u32 };
 pub const ForeignBlock = struct { vol_tag: u64, block_idx: u64 };
 
 pub fn custodyFindings(gpa: Allocator, fc: ForestCensus, out: *std.ArrayList(Finding)) Error!void {
+    for (fc.grants) |g| if (!g.assembles) try out.append(gpa, .{ .c14_grant_record_corrupt = .{ .vol = g.vol, .appender = g.appender } });
     var seen: std.AutoHashMapUnmanaged(PairKey, void) = .empty;
     defer seen.deinit(gpa);
     for (fc.pages) |p| {

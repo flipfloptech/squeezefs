@@ -19,6 +19,7 @@ const builtin = @import("builtin");
 const counters = @import("../core/counters.zig");
 
 pub const control_records = @import("sym/control_records.zig");
+pub const grant_record = @import("sym/grant_record.zig");
 pub const appender_page = @import("sym/appender_page.zig");
 pub const appender_dir = @import("sym/appender_dir.zig");
 pub const region = @import("sym/region.zig");
@@ -89,6 +90,7 @@ pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
 
 test {
     _ = control_records;
+    _ = grant_record;
     _ = appender_page;
     _ = appender_dir;
     _ = region;

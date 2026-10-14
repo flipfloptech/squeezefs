@@ -656,11 +656,37 @@ pub const linux = if (builtin.os.tag == .linux) struct {
             }
         }
 
+        /// Every grant record on `be`'s tree 0: each appender's chunk
+        /// family read whole and assembled (stamps, keys, disjointness).
+        fn readGrants(gpa: Allocator, arena: Allocator, be: *meta_set.KvBackend, vol: u16, out: *std.ArrayList(classes.GrantView)) Error!void {
+            const r = cr.rangeOf(.extent_grant);
+            var kvs: std.ArrayList(tree.KeyValue) = .empty;
+            defer tree.deinitKeyValues(gpa, &kvs);
+            be.range(gpa, key.TREE_CONTROL, r.start.slice(), r.end.slice(), std.math.maxInt(usize), &kvs) catch return error.Io;
+            var i: usize = 0;
+            while (i < kvs.items.len) {
+                const id = cr.appenderOfKey(kvs.items[i].key) orelse return error.Corrupt;
+                var j = i + 1;
+                while (j < kvs.items.len and cr.appenderOfKey(kvs.items[j].key) == id) j += 1;
+                const ok = if (sym.grant_record.Family.load(gpa, id, kvs.items[i..j])) |loaded| blk: {
+                    var fam = loaded;
+                    fam.deinit();
+                    break :blk true;
+                } else |e| switch (e) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.Corrupt => false,
+                };
+                try out.append(arena, .{ .vol = vol, .appender = id, .assembles = ok });
+                i = j;
+            }
+        }
+
         fn custodyFn(ctx: *anyopaque, arena: Allocator) Error!classes.ForestCensus {
             const self: *ForestBind = @ptrCast(@alignCast(ctx));
             var pages: std.ArrayList(classes.PageView) = .empty;
             var tree0: std.ArrayList(classes.Tree0Row) = .empty;
             var deaths: std.ArrayList(cr.StableIdentity) = .empty;
+            var grants: std.ArrayList(classes.GrantView) = .empty;
             for (self.be.volumes, 0..) |be, vi| {
                 const vol: u16 = @intCast(vi);
                 // The flat class (`--single-writer`): no SYMMETRIC_PLANE bit,
@@ -675,6 +701,7 @@ pub const linux = if (builtin.os.tag == .linux) struct {
                 try readPages(self.gpa, be, &raw);
                 for (raw.items) |p| try pages.append(arena, try view(arena, vol, p));
                 try readTree0(self.gpa, arena, be, vol, &tree0);
+                try readGrants(self.gpa, arena, be, vol, &grants);
             }
             // Volume 0's death ledger.
             {
@@ -687,7 +714,7 @@ pub const linux = if (builtin.os.tag == .linux) struct {
                     try deaths.append(arena, .{ .node_token = id.node_token, .mount_slot = id.mount_slot });
                 }
             }
-            return .{ .pages = pages.items, .tree0 = tree0.items, .deaths = deaths.items };
+            return .{ .pages = pages.items, .tree0 = tree0.items, .deaths = deaths.items, .grants = grants.items };
         }
 
         fn view(arena: Allocator, vol: u16, p: page.Page) Allocator.Error!classes.PageView {

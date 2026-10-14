@@ -84,6 +84,9 @@ pub const Finding = union(enum) {
     c12_overrun: struct { vol_tag: u64, block_idx: u64, ino: u64, block_index: u32 },
     c13_orphan_image: struct { vol: u16, appender: u32, extent: u64 },
     c14_slot_custody_conflict: struct { vol: u16, slot: u16, appender_a: u32, appender_b: u32 },
+    /// An appender's grant record whose chunks do not assemble (a stamp
+    /// that fails, a chunk under another key, two chunks naming one extent).
+    c14_grant_record_corrupt: struct { vol: u16, appender: u32 },
     c15_unrecovered_appender: struct { vol: u16, appender: u32, node_token: u64, mount_slot: u32, window_entries: u64 },
     c16_shared_index_drift: struct { vol_tag: u64, flag_without_entry: u64, entry_without_flag: u64 },
     c17_stripe: struct { shape: stripe.C17Shape, dir: u64, ino: u64 },
@@ -105,7 +108,7 @@ pub const Finding = union(enum) {
             .c11_orphan_map_records, .c11_empty_kvmap_head, .c11_run_foreign_shadow => .c11,
             .c12_overlap, .c12_overrun => .c12,
             .c13_orphan_image => .c13,
-            .c14_slot_custody_conflict => .c14,
+            .c14_slot_custody_conflict, .c14_grant_record_corrupt => .c14,
             .c15_unrecovered_appender => .c15,
             .c16_shared_index_drift => .c16,
             .c17_stripe => .c17,
@@ -141,7 +144,7 @@ pub const Finding = union(enum) {
             .c10_nlink_too_high => .lower_nlink_to_counted_names,
             .c10_nlink_too_low, .c10_zero_nlink_named => .raise_nlink_to_counted_names,
             .c10_dangling => .remove_dangling_dentry,
-            .c11_orphan_map_records, .c11_empty_kvmap_head, .c11_run_foreign_shadow, .c12_overlap, .c12_overrun, .c14_slot_custody_conflict, .c16_shared_index_drift, .c17_stripe => .report_only,
+            .c11_orphan_map_records, .c11_empty_kvmap_head, .c11_run_foreign_shadow, .c12_overlap, .c12_overrun, .c14_slot_custody_conflict, .c14_grant_record_corrupt, .c16_shared_index_drift, .c17_stripe => .report_only,
             .c13_orphan_image => .return_orphan_image_extent,
             .c15_unrecovered_appender => .recover_dead_appender,
         };
@@ -205,6 +208,7 @@ pub const Finding = union(enum) {
             .c12_overrun => |f| try w.print("vol-{x:0>16} block {d} ← ino {d} index {d} — a tenant window the window law refuses (report-only)", .{ f.vol_tag, f.block_idx, f.ino, f.block_index }),
             .c13_orphan_image => |f| try w.print("meta vol {d} appender {d} extent {d} — an image a grant claims that no root reaches", .{ f.vol, f.appender, f.extent }),
             .c14_slot_custody_conflict => |f| try w.print("meta vol {d} slot {d} — Live on two pages: appenders {d} and {d}; the mount refuses; remedy `squeezefs appender clear`", .{ f.vol, f.slot, f.appender_a, f.appender_b }),
+            .c14_grant_record_corrupt => |f| try w.print("meta vol {d} appender {d} — its extent grant record's chunks do not assemble; the manager refuses every verb on it", .{ f.vol, f.appender }),
             .c15_unrecovered_appender => |f| try w.print("meta vol {d} appender {d} ({x}/{d}) — dead, {d} window entr(ies) un-recovered; the mount path recovers it before serving", .{ f.vol, f.appender, f.node_token, f.mount_slot, f.window_entries }),
             .c16_shared_index_drift => |f| try w.print("vol-{x:0>16} — shared index: {d} flag(s) without entry, {d} entr(ies) without flag (report-only)", .{ f.vol_tag, f.flag_without_entry, f.entry_without_flag }),
             .c17_stripe => |f| try w.print("dir {d} ino {d} — stripe map {t} (report-only)", .{ f.dir, f.ino, f.shape }),

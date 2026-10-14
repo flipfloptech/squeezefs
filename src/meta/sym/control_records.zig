@@ -1,5 +1,5 @@
 //! Tree 0's control records (charter §5.5 "The forest": `slot_state:{s}`,
-//! `slot_tails:{s}`, `extent_grant:{a}`, `appender_hint:{identity}`,
+//! `slot_tails:{s}`, `extent_grant:{a}:{chunk}`, `appender_hint:{identity}`,
 //! `node_seq_incarnations`; on VOLUME 0 only `alloc_lease:{vol}`,
 //! `dead_member:{id}`, `recovered:{id, vol}`, `dir_rename`,
 //! `custody_quarantine:{slot}`; `docs/porting/sym_appenders_manager.md` §1).
@@ -73,7 +73,8 @@ pub const Tag = enum(u8) {
     pub fn idLen(self: Tag) usize {
         return switch (self) {
             .slot_state, .slot_tails, .custody_quarantine => 2,
-            .extent_grant, .endpoint => 4,
+            .extent_grant => @sizeOf(u32) + @sizeOf(u64),
+            .endpoint => 4,
             .appender_hint, .dead_member, .member, .job_shard => 12,
             .recovered => 14,
             .alloc_lease, .job => 8,
@@ -154,12 +155,6 @@ pub fn slotTailsKey(slot: u16) ControlKey {
 pub fn custodyQuarantineKey(slot: u16) ControlKey {
     var k = ControlKey.prefix(.custody_quarantine);
     k.putBe(u16, slot);
-    return k;
-}
-
-pub fn extentGrantKey(appender_id: u32) ControlKey {
-    var k = ControlKey.prefix(.extent_grant);
-    k.putBe(u32, appender_id);
     return k;
 }
 
@@ -588,16 +583,58 @@ pub fn spillChecksum(images: []const []const u8) u64 {
 }
 
 // ---------------------------------------------------------------------------
-// extent_grant:{a}
+// extent_grant:{a}:{id} — the grant record as a family of chunks
 // ---------------------------------------------------------------------------
 
-pub const ExtentGrantHead = extern struct {
-    version_le: [2]u8,
-    reserved_le: [2]u8,
-    n_runs_le: [4]u8,
+/// The key of chunk `id` of appender `appender_id`'s grant record. One
+/// appender's chunks share the prefix `kind ‖ tag ‖ a`, so ONE range walk
+/// (`extentGrantFamily`) yields them all in id order, the move marker
+/// (`GRANT_MARKER_ID`) last.
+pub fn extentGrantKey(appender_id: u32, id: u64) ControlKey {
+    var k = ControlKey.prefix(.extent_grant);
+    k.putBe(u32, appender_id);
+    k.putBe(u64, id);
+    return k;
+}
 
-    pub const VERSION: u16 = 1;
-    pub const LEN: usize = 8;
+/// Every chunk key of one appender's record (marker included).
+pub fn extentGrantFamily(appender_id: u32) KeyRange {
+    return .{ .start = extentGrantKey(appender_id, 0), .end = extentGrantKey(appender_id, GRANT_MARKER_ID) };
+}
+
+/// The chunk id of an `extent_grant` key.
+pub fn chunkOfKey(k: []const u8) ?u64 {
+    const tag = tagOfKey(k) orelse return null;
+    return if (tag == .extent_grant) idBe(u64, k, 4) else null;
+}
+
+/// The id of a family's MOVE MARKER: present only while a record change
+/// too large for one control entry is staged (`grant_record.zig`) — every
+/// chunk id inside its `[staged_lo, staged_hi]` is ineffective until the
+/// entry that deletes the marker lands. The largest id: it sorts last.
+pub const GRANT_MARKER_ID: u64 = std.math.maxInt(u64);
+
+pub const GrantChunkKind = enum(u8) { runs = 1, marker = 2 };
+
+/// A chunk's head: the key's appender and id repeated (the checksum binds
+/// the value to its key — a chunk read under another key is `Corrupt`),
+/// the stamp over the whole value (`checksum.stamp` at `CSUM_OFF`).
+pub const ExtentGrantChunkHead = extern struct {
+    version_le: [2]u8,
+    kind: u8,
+    reserved0: u8,
+    n_runs_le: [4]u8,
+    appender_le: [4]u8,
+    reserved1_le: [4]u8,
+    id_le: [8]u8,
+    /// A marker's staged range (inclusive); 0 on a runs chunk.
+    staged_lo_le: [8]u8,
+    staged_hi_le: [8]u8,
+    csum_le: [8]u8,
+
+    pub const VERSION: u16 = 2;
+    pub const LEN: usize = 48;
+    pub const CSUM_OFF: usize = 40;
 };
 
 /// One run of granted extents (indices): `[start, start + len)`. `len` is
@@ -624,21 +661,25 @@ pub const GrantRun = struct {
     }
 };
 
-/// The run cap under a tree-0 value cap — the ONE bound on the pool's
-/// fragmentation: a carve whose fragments would push the merged record
-/// past it is cut; a return that would split a run past it is refused on
-/// `extent_return_run_cap_refusals`. 4,111 at the 256 KiB node.
-pub fn extentGrantMaxRuns(value_cap: u64) u32 {
-    return @intCast(@min((value_cap -| ExtentGrantHead.LEN) / GrantRunWire.LEN, std.math.maxInt(u32)));
-}
+/// A chunk's byte bound: one 4 KiB page — the journal's write grain. A
+/// carve, a return or a custody move rewrites only the chunks whose
+/// extents it changes, so a one-run change costs one page of entry bytes
+/// (a whole-record rewrite cost up to the tree-0 value cap, 64 KiB, per
+/// change), and a record of any size is a set of tree-0 values below the
+/// smallest node's value cap (16,640 B at 64 KiB — `grant_record.zig`
+/// asserts it).
+pub const GRANT_CHUNK_BYTES_MAX: usize = 4096;
 
-pub fn extentGrantEncodedLen(n_runs: usize) usize {
-    return ExtentGrantHead.LEN + n_runs * GrantRunWire.LEN;
+/// The runs one chunk carries: 253.
+pub const GRANT_CHUNK_RUNS: u32 = (GRANT_CHUNK_BYTES_MAX - ExtentGrantChunkHead.LEN) / GrantRunWire.LEN;
+
+pub fn grantChunkLen(n_runs: usize) usize {
+    return ExtentGrantChunkHead.LEN + n_runs * GrantRunWire.LEN;
 }
 
 /// Runs are NORMALIZED — ascending, non-empty, non-adjacent, no overflow —
 /// and the decoder refuses any other spelling (one canonical image per
-/// set of extents).
+/// set of extents inside a chunk).
 pub fn runsNormalized(runs: []const GrantRun) bool {
     var prev_end: ?u64 = null;
     for (runs) |r| {
@@ -650,82 +691,110 @@ pub fn runsNormalized(runs: []const GrantRun) bool {
     return true;
 }
 
-pub fn encodeExtentGrant(runs: []const GrantRun, out: []u8) error{ NotNormalized, Overflow, BufferTooSmall }![]u8 {
-    if (!runsNormalized(runs)) return error.NotNormalized;
-    if (runs.len > std.math.maxInt(u32)) return error.Overflow;
-    const len = extentGrantEncodedLen(runs.len);
+fn chunkHead(kind: GrantChunkKind, appender_id: u32, id: u64, n_runs: u32, lo: u64, hi: u64) ExtentGrantChunkHead {
+    var h: ExtentGrantChunkHead = undefined;
+    wr(u16, &h.version_le, ExtentGrantChunkHead.VERSION);
+    h.kind = @backingInt(kind);
+    h.reserved0 = 0;
+    wr(u32, &h.n_runs_le, n_runs);
+    wr(u32, &h.appender_le, appender_id);
+    wr(u32, &h.reserved1_le, 0);
+    wr(u64, &h.id_le, id);
+    wr(u64, &h.staged_lo_le, lo);
+    wr(u64, &h.staged_hi_le, hi);
+    wr(u64, &h.csum_le, 0);
+    return h;
+}
+
+/// Chunk `id` of `appender_id`'s record: a non-empty normalized run list of
+/// at most `GRANT_CHUNK_RUNS`, stamped. `id` is never the marker's.
+pub fn encodeGrantChunk(appender_id: u32, id: u64, runs: []const GrantRun, out: []u8) error{ NotNormalized, BufferTooSmall }![]u8 {
+    if (runs.len == 0 or runs.len > GRANT_CHUNK_RUNS or !runsNormalized(runs) or id == GRANT_MARKER_ID) return error.NotNormalized;
+    const len = grantChunkLen(runs.len);
     if (out.len < len) return error.BufferTooSmall;
-    var head: ExtentGrantHead = undefined;
-    wr(u16, &head.version_le, ExtentGrantHead.VERSION);
-    wr(u16, &head.reserved_le, 0);
-    wr(u32, &head.n_runs_le, @intCast(runs.len));
-    @memcpy(out[0..ExtentGrantHead.LEN], &std.mem.toBytes(head));
+    @memcpy(out[0..ExtentGrantChunkHead.LEN], &std.mem.toBytes(chunkHead(.runs, appender_id, id, @intCast(runs.len), 0, 0)));
     for (runs, 0..) |r, i| {
         var w: GrantRunWire = undefined;
         wr(u64, &w.start_le, r.start);
         wr(u32, &w.len_le, r.len);
         wr(u32, &w.reserved_le, 0);
-        @memcpy(out[ExtentGrantHead.LEN + i * GrantRunWire.LEN ..][0..GrantRunWire.LEN], &std.mem.toBytes(w));
+        @memcpy(out[ExtentGrantChunkHead.LEN + i * GrantRunWire.LEN ..][0..GrantRunWire.LEN], &std.mem.toBytes(w));
     }
+    checksum.stamp(out[0..len], ExtentGrantChunkHead.CSUM_OFF);
     return out[0..len];
 }
 
-/// A decoded record: a borrowed view; `runAt(i)` decodes one run. Decoding
-/// checks normalization across the whole list, so `runAt` never answers an
-/// unnormalized run.
-pub const DecodedExtentGrant = struct {
-    n_runs: u32,
-    runs: []const u8,
+/// The family's move marker staging the chunk ids `[lo, hi]`.
+pub fn encodeGrantMarker(appender_id: u32, lo: u64, hi: u64, out: *[ExtentGrantChunkHead.LEN]u8) error{NotNormalized}![]u8 {
+    if (lo > hi or hi >= GRANT_MARKER_ID) return error.NotNormalized;
+    out.* = std.mem.toBytes(chunkHead(.marker, appender_id, GRANT_MARKER_ID, 0, lo, hi));
+    checksum.stamp(out, ExtentGrantChunkHead.CSUM_OFF);
+    return out;
+}
 
-    pub fn runAt(self: DecodedExtentGrant, i: usize) GrantRun {
+/// A decoded chunk: a borrowed run list or a marker's staged range.
+pub const GrantChunk = union(GrantChunkKind) {
+    runs: GrantChunkRuns,
+    marker: struct { lo: u64, hi: u64 },
+};
+
+pub const GrantChunkRuns = struct {
+    n_runs: u32,
+    bytes: []const u8,
+
+    pub fn runAt(self: GrantChunkRuns, i: usize) GrantRun {
         assert(i < self.n_runs);
-        const w = std.mem.bytesToValue(GrantRunWire, self.runs[i * GrantRunWire.LEN ..][0..GrantRunWire.LEN]);
+        const w = std.mem.bytesToValue(GrantRunWire, self.bytes[i * GrantRunWire.LEN ..][0..GrantRunWire.LEN]);
         return .{ .start = rd(u64, &w.start_le), .len = rd(u32, &w.len_le) };
     }
 
-    /// The manager's custody probe.
-    pub fn contains(self: DecodedExtentGrant, extent: u64) bool {
-        var i: usize = 0;
-        while (i < self.n_runs) : (i += 1) if (self.runAt(i).contains(extent)) return true;
-        return false;
-    }
-
-    pub fn totalExtents(self: DecodedExtentGrant) u64 {
-        var n: u64 = 0;
-        var i: usize = 0;
-        while (i < self.n_runs) : (i += 1) n += self.runAt(i).len;
-        return n;
-    }
-
-    /// Decode every run into `out` (caller sizes it to `n_runs`).
-    pub fn collect(self: DecodedExtentGrant, out: []GrantRun) []GrantRun {
-        var i: usize = 0;
-        while (i < self.n_runs) : (i += 1) out[i] = self.runAt(i);
+    /// Every run into `out` (caller sizes it to `n_runs`).
+    pub fn collect(self: GrantChunkRuns, out: []GrantRun) []GrantRun {
+        for (out[0..self.n_runs], 0..) |*r, i| r.* = self.runAt(i);
         return out[0..self.n_runs];
     }
 };
 
-pub fn decodeExtentGrant(bytes: []const u8) DecodeError!DecodedExtentGrant {
-    if (bytes.len < ExtentGrantHead.LEN) return error.Corrupt;
-    const head = std.mem.bytesToValue(ExtentGrantHead, bytes[0..ExtentGrantHead.LEN]);
-    if (rd(u16, &head.version_le) != ExtentGrantHead.VERSION) return error.Corrupt;
-    if (rd(u16, &head.reserved_le) != 0) return error.Corrupt;
-    const n = rd(u32, &head.n_runs_le);
-    const avail = bytes.len - ExtentGrantHead.LEN;
-    if (avail / GrantRunWire.LEN != n or avail % GrantRunWire.LEN != 0) return error.Corrupt;
-    const d: DecodedExtentGrant = .{ .n_runs = n, .runs = bytes[ExtentGrantHead.LEN..] };
-    var prev_end: ?u64 = null;
-    var i: usize = 0;
-    while (i < n) : (i += 1) {
-        const w = std.mem.bytesToValue(GrantRunWire, d.runs[i * GrantRunWire.LEN ..][0..GrantRunWire.LEN]);
-        if (rd(u32, &w.reserved_le) != 0) return error.Corrupt;
-        const r = d.runAt(i);
-        if (r.len == 0) return error.Corrupt;
-        const e = std.math.add(u64, r.start, r.len) catch return error.Corrupt;
-        if (prev_end) |pe| if (r.start <= pe) return error.Corrupt;
-        prev_end = e;
+/// The chunk stored under `extent_grant:{appender_id}:{id}`: the stamp
+/// verified, the head's appender and id equal to the key's, every
+/// reserved word zero, the run list non-empty, normalized and at most
+/// `GRANT_CHUNK_RUNS` long; a marker
+/// lives only at `GRANT_MARKER_ID` and stages a non-empty range below it.
+pub fn decodeGrantChunk(appender_id: u32, id: u64, bytes: []const u8) DecodeError!GrantChunk {
+    if (bytes.len < ExtentGrantChunkHead.LEN) return error.Corrupt;
+    if (!checksum.verify(bytes, ExtentGrantChunkHead.CSUM_OFF)) return error.Corrupt;
+    const h = std.mem.bytesToValue(ExtentGrantChunkHead, bytes[0..ExtentGrantChunkHead.LEN]);
+    if (rd(u16, &h.version_le) != ExtentGrantChunkHead.VERSION or h.reserved0 != 0 or rd(u32, &h.reserved1_le) != 0) return error.Corrupt;
+    if (rd(u32, &h.appender_le) != appender_id or rd(u64, &h.id_le) != id) return error.Corrupt;
+    const n = rd(u32, &h.n_runs_le);
+    const lo = rd(u64, &h.staged_lo_le);
+    const hi = rd(u64, &h.staged_hi_le);
+    const kind = std.enums.fromInt(GrantChunkKind, h.kind) orelse return error.Corrupt;
+    switch (kind) {
+        .marker => {
+            if (id != GRANT_MARKER_ID or n != 0 or bytes.len != ExtentGrantChunkHead.LEN) return error.Corrupt;
+            if (lo > hi or hi >= GRANT_MARKER_ID) return error.Corrupt;
+            return .{ .marker = .{ .lo = lo, .hi = hi } };
+        },
+        .runs => {
+            if (id == GRANT_MARKER_ID or lo != 0 or hi != 0 or n == 0 or n > GRANT_CHUNK_RUNS) return error.Corrupt;
+            // Bound BEFORE multiplying: a count near u32::MAX must not wrap.
+            const avail = bytes.len - ExtentGrantChunkHead.LEN;
+            if (avail / GrantRunWire.LEN != n or avail % GrantRunWire.LEN != 0) return error.Corrupt;
+            const d: GrantChunkRuns = .{ .n_runs = n, .bytes = bytes[ExtentGrantChunkHead.LEN..] };
+            var prev_end: ?u64 = null;
+            for (0..n) |i| {
+                const w = std.mem.bytesToValue(GrantRunWire, d.bytes[i * GrantRunWire.LEN ..][0..GrantRunWire.LEN]);
+                if (rd(u32, &w.reserved_le) != 0) return error.Corrupt;
+                const r = d.runAt(i);
+                if (r.len == 0) return error.Corrupt;
+                const e = std.math.add(u64, r.start, r.len) catch return error.Corrupt;
+                if (prev_end) |pe| if (r.start <= pe) return error.Corrupt;
+                prev_end = e;
+            }
+            return .{ .runs = d };
+        },
     }
-    return d;
 }
 
 // ---------------------------------------------------------------------------
@@ -1150,7 +1219,8 @@ comptime {
     assert(@sizeOf(SlotStateWire) == SlotStateWire.LEN);
     assert(@sizeOf(SlotTailsHead) == SlotTailsHead.LEN);
     assert(@sizeOf(TailEntryWire) == TailEntryWire.LEN and @sizeOf(SpillRunWire) == SpillRunWire.LEN);
-    assert(@sizeOf(ExtentGrantHead) == ExtentGrantHead.LEN and @sizeOf(GrantRunWire) == GrantRunWire.LEN);
+    assert(@sizeOf(ExtentGrantChunkHead) == ExtentGrantChunkHead.LEN and @sizeOf(GrantRunWire) == GrantRunWire.LEN);
+    assert(@offsetOf(ExtentGrantChunkHead, "csum_le") == ExtentGrantChunkHead.CSUM_OFF);
     assert(@sizeOf(AppenderHintWire) == AppenderHintWire.LEN);
     assert(@sizeOf(CustodyQuarantineWire) == CustodyQuarantineWire.LEN);
     assert(@sizeOf(DirRenameWire) == DirRenameWire.LEN);
@@ -1184,8 +1254,16 @@ test "control keys: kind ‖ tag ‖ BE id, inside the tag's range, index order;
     try testing.expectEqual(@as(?Tag, null), tagOfKey(&.{ 8, 1, 0 }));
     try testing.expectEqual(@as(?Tag, null), tagOfKey(&.{ 8, 99, 0, 0 }));
     try testing.expectEqual(@as(?Tag, null), tagOfKey(&.{ 1, 1, 0, 0 }));
-    try testing.expectEqual(@as(?u16, null), slotOfKey(extentGrantKey(3).slice()));
-    try testing.expectEqual(@as(?u32, 0x01020304), appenderOfKey(extentGrantKey(0x01020304).slice()));
+    try testing.expectEqual(@as(?u16, null), slotOfKey(extentGrantKey(3, 0).slice()));
+    try testing.expectEqual(@as(?u32, 0x01020304), appenderOfKey(extentGrantKey(0x01020304, 9).slice()));
+    try testing.expectEqual(@as(?u64, 0x0506070809), chunkOfKey(extentGrantKey(1, 0x0506070809).slice()));
+    try testing.expectEqual(@as(usize, 14), extentGrantKey(1, 0).len);
+    // One appender's family: its chunks in id order, the marker last, no
+    // other appender's chunk inside.
+    const fam = extentGrantFamily(7);
+    try testing.expect(key.lessThan(fam.start.slice(), extentGrantKey(7, 1).slice()) and key.lessThan(extentGrantKey(7, 1).slice(), fam.end.slice()));
+    try testing.expectEqualSlices(u8, extentGrantKey(7, GRANT_MARKER_ID).slice(), fam.end.slice());
+    try testing.expect(key.lessThan(extentGrantKey(6, GRANT_MARKER_ID).slice(), fam.start.slice()) and key.lessThan(fam.end.slice(), extentGrantKey(8, 0).slice()));
     const id: StableIdentity = .{ .node_token = 0xAABB, .mount_slot = 0x5001 };
     try testing.expectEqual(@as(usize, 14), appenderHintKey(id).len);
     try testing.expectEqual(id, identityOfKey(appenderHintKey(id).slice()).?);
@@ -1276,43 +1354,71 @@ test "slot_tails: inline and spilled round-trip behind the flag bit; the count i
     try testing.expectEqual(@as(u32, 16384), spillEntriesPerExtent(262_144));
 }
 
-test "extent_grant: normalized runs round-trip; ascending/non-empty/non-adjacent/overflow each refuse in both directions; contains, totals and the run cap tie" {
-    var buf: [256]u8 = undefined;
+test "extent_grant chunks: normalized runs round-trip stamped and bound to their key; ascending/non-empty/non-adjacent/overflow each refuse in both directions; a marker stages a range at the marker id only; the chunk run cap ties" {
+    var buf: [512]u8 = undefined;
     const runs = [_]GrantRun{ .{ .start = 10, .len = 2 }, .{ .start = 13, .len = 1 }, .{ .start = 100, .len = 50 } };
-    const enc = try encodeExtentGrant(&runs, &buf);
-    try testing.expectEqual(@as(usize, 8 + 48), enc.len);
-    const d = try decodeExtentGrant(enc);
+    const enc = try encodeGrantChunk(4, 9, &runs, &buf);
+    try testing.expectEqual(@as(usize, 48 + 48), enc.len);
+    const d = (try decodeGrantChunk(4, 9, enc)).runs;
     try testing.expectEqual(@as(u32, 3), d.n_runs);
     try testing.expectEqual(runs[2], d.runAt(2));
-    try testing.expect(d.contains(11) and d.contains(13) and !d.contains(12) and !d.contains(150) and d.contains(149));
-    try testing.expectEqual(@as(u64, 53), d.totalExtents());
     var out: [3]GrantRun = undefined;
     try testing.expectEqualSlices(GrantRun, &runs, d.collect(&out));
-    const empty = try encodeExtentGrant(&.{}, &buf);
-    try testing.expectEqual(@as(u32, 0), (try decodeExtentGrant(empty)).n_runs);
-    try testing.expectError(error.NotNormalized, encodeExtentGrant(&.{ .{ .start = 10, .len = 2 }, .{ .start = 12, .len = 1 } }, &buf)); // adjacent
-    try testing.expectError(error.NotNormalized, encodeExtentGrant(&.{.{ .start = 10, .len = 0 }}, &buf));
-    try testing.expectError(error.NotNormalized, encodeExtentGrant(&.{ .{ .start = 20, .len = 1 }, .{ .start = 10, .len = 1 } }, &buf));
-    try testing.expectError(error.NotNormalized, encodeExtentGrant(&.{.{ .start = std.math.maxInt(u64), .len = 1 }}, &buf));
-    // The decoder refuses the same spellings byte-wise.
-    var adj = buf;
-    @memcpy(adj[0..enc.len], enc);
-    std.mem.writeInt(u64, adj[8 + 16 ..][0..8], 12, .little);
-    try testing.expectError(error.Corrupt, decodeExtentGrant(adj[0..enc.len]));
-    var zero = buf;
-    @memcpy(zero[0..enc.len], enc);
-    std.mem.writeInt(u32, zero[8 + 8 ..][0..4], 0, .little);
-    try testing.expectError(error.Corrupt, decodeExtentGrant(zero[0..enc.len]));
-    var reserved = buf;
-    @memcpy(reserved[0..enc.len], enc);
-    reserved[8 + 12] = 1;
-    try testing.expectError(error.Corrupt, decodeExtentGrant(reserved[0..enc.len]));
-    var count = buf;
-    @memcpy(count[0..enc.len], enc);
-    std.mem.writeInt(u32, count[4..8], 2, .little);
-    try testing.expectError(error.Corrupt, decodeExtentGrant(count[0..enc.len]));
-    try testing.expectError(error.Corrupt, decodeExtentGrant(enc[0..7]));
-    try testing.expectEqual(@as(u32, 4111), extentGrantMaxRuns(65_792));
+    // Bound to its key: another appender's or another id's key refuses.
+    try testing.expectError(error.Corrupt, decodeGrantChunk(5, 9, enc));
+    try testing.expectError(error.Corrupt, decodeGrantChunk(4, 10, enc));
+    try testing.expectError(error.NotNormalized, encodeGrantChunk(4, 9, &.{}, &buf));
+    try testing.expectError(error.NotNormalized, encodeGrantChunk(4, 9, &.{ .{ .start = 10, .len = 2 }, .{ .start = 12, .len = 1 } }, &buf)); // adjacent
+    try testing.expectError(error.NotNormalized, encodeGrantChunk(4, 9, &.{.{ .start = 10, .len = 0 }}, &buf));
+    try testing.expectError(error.NotNormalized, encodeGrantChunk(4, 9, &.{ .{ .start = 20, .len = 1 }, .{ .start = 10, .len = 1 } }, &buf));
+    try testing.expectError(error.NotNormalized, encodeGrantChunk(4, 9, &.{.{ .start = std.math.maxInt(u64), .len = 1 }}, &buf));
+    try testing.expectError(error.NotNormalized, encodeGrantChunk(4, GRANT_MARKER_ID, &runs, &buf));
+    try testing.expectError(error.BufferTooSmall, encodeGrantChunk(4, 9, &runs, buf[0..60]));
+    // The decoder refuses the same spellings byte-wise — even re-stamped.
+    const Mut = struct {
+        fn refused(src: []const u8, off: usize, v: u64, width: u8) !void {
+            var m: [512]u8 = undefined;
+            @memcpy(m[0..src.len], src);
+            switch (width) {
+                1 => m[off] = @truncate(v),
+                4 => std.mem.writeInt(u32, m[off..][0..4], @truncate(v), .little),
+                else => std.mem.writeInt(u64, m[off..][0..8], v, .little),
+            }
+            try testing.expectError(error.Corrupt, decodeGrantChunk(4, 9, m[0..src.len]));
+            checksum.stamp(m[0..src.len], ExtentGrantChunkHead.CSUM_OFF);
+            try testing.expectError(error.Corrupt, decodeGrantChunk(4, 9, m[0..src.len]));
+        }
+    };
+    try Mut.refused(enc, 48 + 16, 12, 8); // the second run adjacent to the first
+    try Mut.refused(enc, 48 + 8, 0, 4); // a zero-length run
+    try Mut.refused(enc, 48 + 12, 1, 4); // a run's reserved word
+    try Mut.refused(enc, 4, 2, 4); // the count
+    try Mut.refused(enc, 3, 1, 1); // reserved0
+    try Mut.refused(enc, 12, 1, 4); // reserved1
+    try Mut.refused(enc, 2, 3, 1); // an unknown kind
+    try Mut.refused(enc, 24, 1, 8); // a staged range on a runs chunk
+    // A flipped byte anywhere fails the stamp.
+    var flip: [512]u8 = undefined;
+    @memcpy(flip[0..enc.len], enc);
+    flip[60] ^= 1;
+    try testing.expectError(error.Corrupt, decodeGrantChunk(4, 9, flip[0..enc.len]));
+    try testing.expectError(error.Corrupt, decodeGrantChunk(4, 9, enc[0..47]));
+    // The marker.
+    var mbuf: [ExtentGrantChunkHead.LEN]u8 = undefined;
+    const m = try encodeGrantMarker(4, 20, 30, &mbuf);
+    const md = (try decodeGrantChunk(4, GRANT_MARKER_ID, m)).marker;
+    try testing.expectEqual(@as(u64, 20), md.lo);
+    try testing.expectEqual(@as(u64, 30), md.hi);
+    try testing.expectError(error.Corrupt, decodeGrantChunk(4, 3, m));
+    try testing.expectError(error.NotNormalized, encodeGrantMarker(4, 31, 30, &mbuf));
+    try testing.expectError(error.NotNormalized, encodeGrantMarker(4, 1, GRANT_MARKER_ID, &mbuf));
+    try testing.expectEqual(@as(u32, 253), GRANT_CHUNK_RUNS);
+    try testing.expectEqual(GRANT_CHUNK_BYTES_MAX, grantChunkLen(GRANT_CHUNK_RUNS));
+    var many: [GRANT_CHUNK_RUNS + 1]GrantRun = undefined;
+    for (&many, 0..) |*r, i| r.* = .{ .start = 2 * i, .len = 1 };
+    var big: [GRANT_CHUNK_BYTES_MAX + 16]u8 = undefined;
+    try testing.expectError(error.NotNormalized, encodeGrantChunk(4, 9, &many, &big));
+    _ = try encodeGrantChunk(4, 9, many[0..GRANT_CHUNK_RUNS], &big);
 }
 
 test "appender_hint: a pending segment rides the flag; the clear form checks every pending word zero; a zero-length or overflowing segment refuses" {
@@ -1405,7 +1511,7 @@ test "endpoint: a v4 and a v6 listener round-trip at 32 B keyed by appender id; 
     try testing.expectEqual(@as(usize, 6), endpointKey(1).len);
     try testing.expectEqual(@as(?u32, 0x0A0B0C0D), appenderOfKey(endpointKey(0x0A0B0C0D).slice()));
     try testing.expectEqual(@as(?Tag, .endpoint), tagOfKey(endpointKey(1).slice()));
-    try testing.expect(!std.mem.eql(u8, endpointKey(1).slice(), extentGrantKey(1).slice()));
+    try testing.expect(!std.mem.eql(u8, endpointKey(1).slice()[0..2], extentGrantKey(1, 0).slice()[0..2]));
 }
 
 fn checkDecodersTotal(bytes: []const u8) !void {
@@ -1418,13 +1524,21 @@ fn checkDecodersTotal(bytes: []const u8) !void {
     if (decodeSlotTails(bytes)) |d| {
         try testing.expectEqual(bytes.len, SlotTailsHead.LEN + @as(usize, d.count) * 16 + @as(usize, if (d.spilled) 8 else 0));
     } else |_| {}
-    if (decodeExtentGrant(bytes)) |d| {
-        var out: [64]GrantRun = undefined;
-        if (d.n_runs <= out.len) {
-            var buf: [8 + 64 * 16]u8 = undefined;
-            const re = try encodeExtentGrant(d.collect(&out), &buf);
-            try testing.expectEqualSlices(u8, bytes, re);
-        }
+    const grant_appender: u32 = if (bytes.len >= 12) std.mem.readInt(u32, bytes[8..12], .little) else 0;
+    const grant_id: u64 = if (bytes.len >= 24) std.mem.readInt(u64, bytes[16..24], .little) else 0;
+    if (decodeGrantChunk(grant_appender, grant_id, bytes)) |c| switch (c) {
+        .runs => |d| {
+            var out: [32]GrantRun = undefined;
+            if (d.n_runs <= out.len) {
+                var buf: [48 + 32 * 16]u8 = undefined;
+                const re = try encodeGrantChunk(grant_appender, grant_id, d.collect(&out), &buf);
+                try testing.expectEqualSlices(u8, bytes, re);
+            }
+        },
+        .marker => |mk| {
+            var buf: [ExtentGrantChunkHead.LEN]u8 = undefined;
+            try testing.expectEqualSlices(u8, bytes, try encodeGrantMarker(grant_appender, mk.lo, mk.hi, &buf));
+        },
     } else |_| {}
     if (AppenderHintWire.decode(bytes)) |h| {
         try testing.expectEqualSlices(u8, bytes, &h.encode());
@@ -1471,8 +1585,8 @@ test "property: total under a PRNG, including mutations of valid encodings" {
         r.bytes(buf[0..len]);
         try checkDecodersTotal(buf[0..len]);
     }
-    var gbuf: [64]u8 = undefined;
-    const grant = try encodeExtentGrant(&.{ .{ .start = 1, .len = 2 }, .{ .start = 5, .len = 1 } }, &gbuf);
+    var gbuf: [96]u8 = undefined;
+    const grant = try encodeGrantChunk(3, 1, &.{ .{ .start = 1, .len = 2 }, .{ .start = 5, .len = 1 } }, &gbuf);
     var tbuf: [64]u8 = undefined;
     const tails = try encodeSlotTails(.{ .inline_tails = .{ .g = 1, .tails = &.{.{ .leaf_addr = 9, .tail = 1 }} } }, &tbuf);
     const valid = [_][]const u8{

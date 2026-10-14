@@ -604,6 +604,20 @@ test "C14/C15 over ONE forest census: a slot Live on two pages and a Live entry 
     try testing.expectEqual(lt.Settle.conflict, lt.settleEntry(tree0[1].state, e.entry(8, 1), 1));
 }
 
+test "C14 reads every grant record whole: a record whose chunks do not assemble is one report-only row naming its appender (decision 0003 §AE.4); one that assembles is none" {
+    const gpa = testing.allocator;
+    var out: std.ArrayList(Finding) = .empty;
+    defer out.deinit(gpa);
+    const grants = [_]classes.GrantView{ .{ .vol = 0, .appender = 5, .assembles = false }, .{ .vol = 0, .appender = 6, .assembles = true }, .{ .vol = 1, .appender = 5, .assembles = true } };
+    try classes.custodyFindings(gpa, .{ .pages = &.{}, .tree0 = &.{}, .deaths = &.{}, .grants = &grants }, &out);
+    try testing.expectEqual(@as(usize, 1), out.items.len);
+    const f = out.items[0];
+    try testing.expectEqual(@as(u32, 5), f.c14_grant_record_corrupt.appender);
+    try testing.expectEqual(@as(u16, 0), f.c14_grant_record_corrupt.vol);
+    try testing.expectEqual(finding.Class.c14, f.class());
+    try testing.expectEqual(finding.Verb.report_only, f.verb());
+}
+
 test "C13 / C16 / C17 through their faces: an orphan image is planned to return and healed on the second pass; shared-index drift is report-only and verified twice; a stripe map with a misrouted name is one C17 row" {
     const gpa = testing.allocator;
     const set = try RamSet.init(gpa);

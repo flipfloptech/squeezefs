@@ -593,6 +593,7 @@ fn reportOnlyReason(f: Finding) []const u8 {
         .c12_overlap => "at least one tenant is wrong and nothing on the volume says which — quarantining both would destroy the right one",
         .c12_overrun => "an unreadable window's base IS referenced; restating the window would fabricate a mapping",
         .c14_slot_custody_conflict => "the mount refuses on it; the remedy is the operator's attestation `squeezefs appender clear <uri> <id>`",
+        .c14_grant_record_corrupt => "the record is the manager's only attestation of the grant: no chunk can be told right from wrong, and a rewritten record would name extents another custodian holds",
         .c16_shared_index_drift => "the flag and the index are two durable homes of one fact; restating one from the other would erase the evidence of which side lied",
         .c17_stripe => "stripe maps are report-only (the C8 fabricate-direction posture)",
         else => "report-only",

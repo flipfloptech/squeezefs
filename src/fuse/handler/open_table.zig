@@ -103,6 +103,31 @@ pub const OpenTable = struct {
         self.* = undefined;
     }
 
+    /// Every ino the kernel holds a lookup reference on, copied out one
+    /// stripe at a time (the caller notifies with no stripe lock held) —
+    /// the kernel view's whole-cache invalidation (decision 0003 §AB.2).
+    pub fn trackedInos(self: *OpenTable, gpa: std.mem.Allocator) std.mem.Allocator.Error![]u64 {
+        var out: std.ArrayList(u64) = .empty;
+        errdefer out.deinit(gpa);
+        for (&self.stripes) |*s| {
+            // The room is taken with no lock held (a spin lock never covers
+            // an allocation); a stripe that grew between retries.
+            while (true) {
+                s.lock.lock();
+                const n = s.map.count();
+                if (out.unusedCapacitySlice().len >= n) {
+                    var it = s.map.keyIterator();
+                    while (it.next()) |k| out.appendAssumeCapacity(k.*);
+                    s.lock.unlock();
+                    break;
+                }
+                s.lock.unlock();
+                try out.ensureUnusedCapacity(gpa, n + 16);
+            }
+        }
+        return out.toOwnedSlice(gpa);
+    }
+
     fn stripeOf(self: *OpenTable, ino: u64) *Stripe {
         // Fibonacci hashing: consecutive mints spread over the stripes.
         return &self.stripes[@intCast((ino *% 0x9E3779B97F4A7C15) >> 60)];
@@ -232,6 +257,16 @@ pub const OpenTable = struct {
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
+
+test "the tracked inos (decision 0003 §AB.2's whole-view invalidation): every ino a lookup reference holds, the root never" {
+    var t = try OpenTable.init(testing.allocator, 64);
+    defer t.deinit();
+    for ([_]u64{ 1, 2, 3, 500, 2, 77 }) |ino| try t.noteLookup(ino);
+    const got = try t.trackedInos(testing.allocator);
+    defer testing.allocator.free(got);
+    std.mem.sort(u64, got, {}, std.sort.asc(u64));
+    try testing.expectEqualSlices(u64, &.{ 2, 3, 77, 500 }, got);
+}
 
 test "capacity derivation: four per delivered slot, floor 4096" {
     try testing.expectEqual(@as(u32, 4096), derivedCapacity(1, 4));

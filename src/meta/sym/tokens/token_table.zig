@@ -196,12 +196,36 @@ pub const PushVerdict = enum {
     unreachable_,
 };
 
+/// The names a recall carries (decision 0003 §AB.2): the dentries the
+/// batch changes, each under its parent object; `unnamed` = the batch
+/// changed a dentry no note names (the reader drops every dentry).
+pub const RecallNames = struct {
+    notes: []const tx.NameNote = &.{},
+    unnamed: bool = false,
+};
+
 /// The wire: ONE push of one frame to one reader (the holder dials the
-/// reader's listener).
+/// reader's listener). `names` are the frame's: those under its objects.
 pub const Pusher = struct {
     ctx: *anyopaque,
-    push: *const fn (ctx: *anyopaque, client: ClientId, frame_id: u64, objects: []const Object) PushVerdict,
+    push: *const fn (ctx: *anyopaque, client: ClientId, frame_id: u64, objects: []const Object, names: RecallNames) PushVerdict,
 };
+
+/// The notes whose parent is one of `objects` (sorted ascending): a
+/// reader is told only the names under the objects it held.
+fn namesUnder(gpa: Allocator, objects: []const Object, names: RecallNames) Allocator.Error!RecallNames {
+    var out: std.ArrayListUnmanaged(tx.NameNote) = .empty;
+    errdefer out.deinit(gpa);
+    for (names.notes) |n| {
+        if (std.sort.binarySearch(Object, objects, n.parent, orderObject) == null) continue;
+        try out.append(gpa, n);
+    }
+    return .{ .notes = try out.toOwnedSlice(gpa), .unnamed = names.unnamed };
+}
+
+fn orderObject(a: Object, b: Object) std.math.Order {
+    return std.math.order(a, b);
+}
 
 pub const SourceError = error{ Io, Corrupt, OutOfMemory };
 
@@ -654,7 +678,7 @@ pub const Holder = struct {
     /// dead readers' grants, recall every holder ONCE, push ONE frame per
     /// reader, wait on every ack or the reader's lease expiry. The caller
     /// settles the SAME union at the window's terminal outcome.
-    pub fn recallAndWait(self: *Holder, io: Io, objects: []const Object, pusher: Pusher) Allocator.Error!RecallSummary {
+    pub fn recallAndWait(self: *Holder, io: Io, objects: []const Object, names: RecallNames, pusher: Pusher) Allocator.Error!RecallSummary {
         var summary: RecallSummary = .{};
         const t0 = clock.monotonicNs();
         try self.gate.passBegin(io, objects);
@@ -709,7 +733,9 @@ pub const Holder = struct {
                 objs = self.gpa.dupe(Object, f.objects.items) catch continue;
             }
             defer self.gpa.free(objs);
-            const verdict = pusher.push(pusher.ctx, c, frame_id, objs);
+            const own = namesUnder(self.gpa, objs, names) catch RecallNames{ .unnamed = names.unnamed or names.notes.len != 0 };
+            defer self.gpa.free(own.notes);
+            const verdict = pusher.push(pusher.ctx, c, frame_id, objs, own);
             self.last_send_ns = clock.monotonicNs();
             if (verdict == .acked) _ = self.serveAck(io, c, frame_id);
         }

@@ -72,6 +72,11 @@ pub const stats = struct {
     /// The kernel view invalidated for a recalled object (+ the prune).
     pub var dlm_token_kernel_invals: counters.ShardedCounter = .{};
     pub var dlm_token_kernel_prunes: counters.ShardedCounter = .{};
+    /// A recalled name dropped from this kernel's dentry cache, and a
+    /// recall that named none of its changed dentries (the whole cache
+    /// dropped) — decision 0003 §AB.2.
+    pub var dlm_token_kernel_name_invals: counters.ShardedCounter = .{};
+    pub var dlm_token_kernel_epochs: counters.ShardedCounter = .{};
     /// A notify the sideband could not queue (the kernel re-walks on the
     /// zero TTL regardless).
     pub var dlm_token_kernel_notify_dropped: counters.ShardedCounter = .{};
@@ -184,6 +189,13 @@ pub const Divert = struct {
         };
         stats.dlm_token_reader_holder_planes.add(1);
         return r;
+    }
+
+    /// A pushed recall's changed names into the sink (decision 0003 §AB.2).
+    pub fn noteRecallNames(self: *Divert, r: verbs.TokenRecallReq) void {
+        var it = r.names();
+        while (it.next()) |n| self.sink.noteName(self.sink.ctx, n.parent, n.name);
+        if (r.head.unnamed != 0) self.sink.noteUnnamed(self.sink.ctx);
     }
 
     /// The plane already bound for `identity` (the pushed recall's route).
@@ -502,6 +514,11 @@ pub const ReaderService = struct {
         // A frame for a holder this reader never bound names tokens it
         // never held: acked at once (nothing to drain, nothing to purge).
         const plane = self.divert.planeOf(self.io, r.head.holder) orelse return .{ .ok = .{ .token_recall = .acked } };
+        // The changed names leave this kernel before the ack (decision
+        // 0003 §AB.2): the holder's change lands only after it. A lookup in
+        // flight on a parent holds the parent's `i_rwsem`, so its dentry is
+        // installed before the invalidation takes it — never after.
+        self.divert.noteRecallNames(r);
         const verdict = plane.handleRecall(self.io, r.head.frame_id, r.items) catch return Answer.refused(error.OutOfMemory, "out of memory queueing the recall frame");
         return .{ .ok = .{ .token_recall = switch (verdict) {
             .acked => verbs.RecallVerdict.acked,
@@ -530,18 +547,26 @@ pub const LinkPusher = struct {
         return .{ .ctx = self, .push = &push };
     }
 
-    fn push(ctx: *anyopaque, client: ClientId, frame_id: u64, objects: []const Object) table.PushVerdict {
+    fn push(ctx: *anyopaque, client: ClientId, frame_id: u64, objects: []const Object, names: table.RecallNames) table.PushVerdict {
         const self: *LinkPusher = @ptrCast(@alignCast(ctx));
         const link = self.peers.linkFor(self.peers.ctx, client) orelse return .unreachable_;
+        // The names ride the first push; more than a frame carries makes
+        // the frame UNNAMED (the reader drops every dentry instead).
+        const fits = names.notes.len <= verbs.RECALL_NAMES_MAX;
+        var name_list: []const verbs.RecallName = if (fits) names.notes else &.{};
+        var unnamed = names.unnamed or !fits;
         var off: usize = 0;
         var verdict: table.PushVerdict = .acked;
         // A union wider than one frame's cap goes in several pushes under
         // ONE frame id; the ack covers them all.
         while (off < objects.len) {
             const n = @min(objects.len - off, verbs.RECALL_BATCH_MAX);
-            const rep = link.call(link.ctx, .{ .token_recall = .{ .head = .{ .volume = self.volume, .reserved = 0, .n = @intCast(n), .frame_id = frame_id, .holder = self.identity }, .items = objects[off .. off + n] } }) catch return .unreachable_;
+            const head: verbs.RecallFrameHead = .{ .volume = self.volume, .n_names = @intCast(name_list.len), .n = @intCast(n), .frame_id = frame_id, .holder = self.identity, .unnamed = @intFromBool(unnamed), .reserved = @splat(0) };
+            const rep = link.call(link.ctx, .{ .token_recall = .{ .head = head, .items = objects[off .. off + n], .name_list = name_list } }) catch return .unreachable_;
             if (rep.token_recall.kind == @backingInt(verbs.RecallVerdictKind.deferred)) verdict = .deferred;
             off += n;
+            name_list = &.{};
+            unnamed = false;
         }
         return verdict;
     }
@@ -556,6 +581,11 @@ pub const NotifySeam = struct {
     ctx: *anyopaque,
     invalInode: *const fn (ctx: *anyopaque, ino: u64, off: i64, len: i64) error{QueueFull}!void,
     prune: *const fn (ctx: *anyopaque, nodeids: []const u64) error{QueueFull}!void,
+    /// `FUSE_NOTIFY_INVAL_ENTRY` of `(parent, name)`; never dropped — a
+    /// full sideband owes the kernel an epoch instead (decision 0003 §AB.2).
+    invalEntry: *const fn (ctx: *anyopaque, parent: u64, name: []const u8) void,
+    /// `FUSE_NOTIFY_INC_EPOCH`: every dentry the kernel holds goes stale.
+    incEpoch: *const fn (ctx: *anyopaque) void,
 };
 
 /// `note_recalled_object`: the whole inode invalidated (`(0, 0)` = every
@@ -577,6 +607,20 @@ pub const KernelInvalidator = struct {
             return;
         };
         stats.dlm_token_kernel_prunes.inc();
+    }
+
+    /// A recalled name (decision 0003 §AB.2): the parent is a local key
+    /// ino; the kernel knows the GLOBAL one.
+    pub fn noteName(self: *KernelInvalidator, parent: Object, name: []const u8) void {
+        const global = route_table.kernelGlobalOf(parent) orelse return;
+        self.notify.invalEntry(self.notify.ctx, global, name);
+        stats.dlm_token_kernel_name_invals.inc();
+    }
+
+    /// A recall that could not name a changed dentry.
+    pub fn noteUnnamed(self: *KernelInvalidator) void {
+        self.notify.incEpoch(self.notify.ctx);
+        stats.dlm_token_kernel_epochs.inc();
     }
 };
 
@@ -680,6 +724,10 @@ test "the kernel invalidator: INVAL_INODE then PRUNE on the GLOBAL ino; a full s
         whole: bool = true,
         pruned_one: bool = true,
         full: bool = false,
+        entries: u32 = 0,
+        entry_parent: u64 = 0,
+        entry_ok: bool = false,
+        epochs: u32 = 0,
         fn inval(ctx: *anyopaque, ino: u64, off: i64, len: i64) error{QueueFull}!void {
             const self: *@This() = @ptrCast(@alignCast(ctx));
             if (self.full) return error.QueueFull;
@@ -692,9 +740,19 @@ test "the kernel invalidator: INVAL_INODE then PRUNE on the GLOBAL ino; a full s
             self.pruned_one = self.pruned_one and nodeids.len == 1;
             self.prunes += 1;
         }
+        fn entry(ctx: *anyopaque, parent: u64, name: []const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.entries += 1;
+            self.entry_parent = parent;
+            self.entry_ok = std.mem.eql(u8, name, "five");
+        }
+        fn epoch(ctx: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.epochs += 1;
+        }
     };
     var rec: Rec = .{};
-    var k: KernelInvalidator = .{ .notify = .{ .ctx = &rec, .invalInode = &Rec.inval, .prune = &Rec.prune } };
+    var k: KernelInvalidator = .{ .notify = .{ .ctx = &rec, .invalInode = &Rec.inval, .prune = &Rec.prune, .invalEntry = &Rec.entry, .incEpoch = &Rec.epoch } };
     const global = inos.makeGlobalIno(7, 2, inos.ROUTING_WIDTH);
     k.noteRecalled(route_table.effectiveIno(global));
     try testing.expectEqual(@as(u32, 1), rec.invals);
@@ -706,4 +764,12 @@ test "the kernel invalidator: INVAL_INODE then PRUNE on the GLOBAL ino; a full s
     k.noteRecalled(route_table.effectiveIno(global));
     try testing.expectEqual(dropped + 1, stats.dlm_token_kernel_notify_dropped.load());
     try testing.expectEqual(@as(u32, 1), rec.invals);
+    // A recalled name (decision 0003 §AB.2) on the parent's GLOBAL ino; an
+    // unnamed recall drops every dentry.
+    k.noteName(route_table.effectiveIno(global), "five");
+    try testing.expectEqual(@as(u32, 1), rec.entries);
+    try testing.expectEqual(global, rec.entry_parent);
+    try testing.expect(rec.entry_ok);
+    k.noteUnnamed();
+    try testing.expectEqual(@as(u32, 1), rec.epochs);
 }

@@ -121,12 +121,12 @@ const TwoPlaneHook = struct {
     fn hook(self: *TwoPlaneHook) conveyor.TokenHook {
         return .{ .ctx = self, .recall = &recall, .settle = &settle };
     }
-    fn recall(ctx: *anyopaque, objects: []const u64) Allocator.Error!void {
+    fn recall(ctx: *anyopaque, objects: []const u64, names: conveyor.BatchNames) Allocator.Error!void {
         const self: *TwoPlaneHook = @ptrCast(@alignCast(ctx));
         const ha = self.a.hook();
         const hb = self.b.hook();
-        try ha.recall(ha.ctx, objects);
-        try hb.recall(hb.ctx, objects);
+        try ha.recall(ha.ctx, objects, names);
+        try hb.recall(hb.ctx, objects, names);
     }
     fn settle(ctx: *anyopaque, objects: []const u64) void {
         const self: *TwoPlaneHook = @ptrCast(@alignCast(ctx));

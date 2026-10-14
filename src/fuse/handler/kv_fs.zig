@@ -313,6 +313,8 @@ pub fn assertData(comptime T: type) void {
 
 pub const Options = struct {
     ttls: mount_options.Ttls = .{},
+    /// The mount's TTL law (decision 0003 §AB.2); null = `ttls` always.
+    ttl_law: ?*const mount_options.TtlLaw = null,
     /// The page: `fuse_attr.blksize`.
     page_size: u32 = 4096,
     /// The 4a stripe width (`dlm.resolveWidth` at the daemon).
@@ -442,6 +444,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         store: *Store,
         data: *Data,
         ttls: mount_options.Ttls,
+        ttl_law: ?*const mount_options.TtlLaw,
         inline_max: u64,
         block_size: u64,
         geo: layout.Geometry,
@@ -503,6 +506,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 .store = store,
                 .data = data,
                 .ttls = opts.ttls,
+                .ttl_law = opts.ttl_law,
                 .inline_max = data.inlineMax(),
                 .block_size = data.blockSize(),
                 .geo = data.geometry(),
@@ -964,7 +968,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         }
 
         fn entryOf(self: *Self, global: u64, v: InodeValue) filesystem.Entry {
-            return .{ .nodeid = global, .entry_ttl_ns = self.ttls.entryTtlFor(economy.isDirMode(v.mode)), .attr_ttl_ns = self.attrTtlFor(v), .attr = self.attrOf(global, v) };
+            return .{ .nodeid = global, .entry_ttl_ns = self.ttlsNow().entryTtlFor(economy.isDirMode(v.mode)), .attr_ttl_ns = self.attrTtlFor(v), .attr = self.attrOf(global, v) };
         }
 
         fn attrReply(self: *Self, global: u64, v: InodeValue) filesystem.Attr {
@@ -979,7 +983,12 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         /// -rwSr-Sr--). 0 = every stat of such a file asks; they are rare.
         fn attrTtlFor(self: *const Self, v: InodeValue) u64 {
             if (v.mode & (S.ISUID | S.ISGID) != 0 and v.mode & S.IFMT == S.IFREG) return 0;
-            return self.ttls.attr_ns;
+            return self.ttlsNow().attr_ns;
+        }
+
+        /// The classes a reply takes now (the law's posture, else `ttls`).
+        fn ttlsNow(self: *const Self) *const mount_options.Ttls {
+            return if (self.ttl_law) |l| l.current() else &self.ttls;
         }
 
         /// The live chain of `(parent, hash54(name))`: keys into `buf`, the
@@ -1137,6 +1146,9 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             // The 4a set leaves this frame with the tx (the conveyor drops it
             // at the terminal outcome, on its thread).
             lock_order.handedOff(.object);
+            // A request the kernel sent (the move gate carries every one):
+            // its caches follow the reply (decision 0003 §AB.2).
+            t.kernel_origin = t.kernel_origin or c.move != null;
             self.store.commit(t) catch |e| return storeErr(e);
         }
 
@@ -1479,8 +1491,9 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             c.stage(.meta_backend_start);
             const found = (try self.findChild(a.parent, a.name)) orelse {
                 c.stage(.meta_backend_done);
-                if (!self.ttls.negativeEnabled()) return error.FileNotFound;
-                return filesystem.Entry.negative(self.ttls.negative_ns);
+                const t = self.ttlsNow();
+                if (!t.negativeEnabled()) return error.FileNotFound;
+                return filesystem.Entry.negative(t.negative_ns);
             };
             var v = (try self.readInodeOpt(found.local)) orelse {
                 dentry_without_inode.fire("lookup found a dentry whose inode record is absent");
@@ -1796,6 +1809,10 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 _ = self.pending.retire(p.ino);
                 destroyed += 1;
             }
+            // A corpse is an inode no kernel holds (its last FORGET evicted
+            // it, or the mount's sweep found it before any lookup): nothing
+            // of it to invalidate (decision 0003 §AB.2).
+            t.kernel_origin = true;
             t_owned = false;
             try self.commit(c, t);
             fuse_reclaim_destroys.add(destroyed);

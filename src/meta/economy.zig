@@ -279,6 +279,7 @@ pub const DentryError = tx.DentryInsertError || Allocator.Error;
 /// into the slot they vacated). Single-copy: the value encodes straight
 /// into a stack frame the tx dupes once.
 fn stageDentryPut(t: *tx.KvTx, name_key: *const key.NameKey, parent: u64, name: []const u8, chain: []const []const u8, child_global: u64, file_type: u8) DentryError![key.DENTRY_KEY_LEN]u8 {
+    t.noteName(parent, name);
     const dk = try tx.dentryInsertKey(t, name_key, parent, name, chain);
     var buf: [DENTRY_VALUE_MAX]u8 = undefined;
     const dv = (record.DentryValue{ .child_ino = child_global, .file_type = file_type, .name = name }).encodeInto(&buf) catch unreachable;
@@ -498,6 +499,7 @@ pub fn unlinkParentShared(is_dir: bool, parent: u64, child: u64) bool {
 /// `.` self-link and its parent entry vanish together; `ctime = now`).
 pub fn stageUnlink(t: *tx.KvTx, p: Unlink) Allocator.Error!UnlinkOutcome {
     const shared = unlinkParentShared(p.is_dir, p.parent, p.child);
+    t.noteName(p.parent, p.name);
     try t.stageDelete(key.TREE_DENTRIES, &p.pos.key);
     const rec = try stageParentUpdate(t, p.parent, shared, if (p.is_dir) -1 else 0, p.now, p.parent_value);
     var child = p.child_value;
@@ -600,6 +602,8 @@ pub fn stageRename(t: *tx.KvTx, p: Rename) RenameError!RenameOutcome {
     if (p.flags.noreplace and p.flags.exchange) return error.InvalidFlags;
     if (p.whiteout != null and p.flags.exchange) return error.InvalidFlags;
     const cross_dir = p.old_parent != p.new_parent;
+    t.noteName(p.old_parent, p.old_name);
+    t.noteName(p.new_parent, p.new_name);
     var plan: GuardPlan = .{};
     plan.dentry(p.old_parent, p.old_name);
     plan.dentry(p.new_parent, p.new_name);

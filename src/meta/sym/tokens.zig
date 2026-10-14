@@ -20,6 +20,7 @@ const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const counters = @import("../../core/counters.zig");
 const conveyor = @import("../conveyor.zig");
+const tx = @import("../tx.zig");
 
 pub const table = @import("tokens/token_table.zig");
 pub const cache = @import("tokens/token_cache.zig");
@@ -46,9 +47,9 @@ pub const ConveyorBinding = struct {
         return .{ .ctx = self, .recall = &recall, .settle = &settle };
     }
 
-    fn recall(ctx: *anyopaque, objects: []const u64) Allocator.Error!void {
+    fn recall(ctx: *anyopaque, objects: []const u64, names: conveyor.BatchNames) Allocator.Error!void {
         const self: *ConveyorBinding = @ptrCast(@alignCast(ctx));
-        _ = try self.holder.recallAndWait(self.io, objects, self.pusher);
+        _ = try self.holder.recallAndWait(self.io, objects, names, self.pusher);
     }
 
     fn settle(ctx: *anyopaque, objects: []const u64) void {
@@ -303,6 +304,10 @@ const RecordingSink = struct {
     last_layout: ?[64]u8 = null,
     last_layout_len: usize = 0,
     entries_seen: u32 = 0,
+    /// The recalled names the kernel sink saw (decision 0003 §AB.2).
+    names: [8]struct { parent: u64 = 0, bytes: [32]u8 = undefined, len: usize = 0 } = @splat(.{}),
+    names_len: usize = 0,
+    unnamed: u32 = 0,
 
     fn discardLayout(ctx: *anyopaque, object: u64, entry: ?*const cache.Entry) cache.DiscardVerdict {
         const self: *RecordingSink = @ptrCast(@alignCast(ctx));
@@ -327,8 +332,27 @@ const RecordingSink = struct {
         const self: *RecordingSink = @ptrCast(@alignCast(ctx));
         self.noted += 1;
     }
+    fn noteName(ctx: *anyopaque, parent: u64, name: []const u8) void {
+        const self: *RecordingSink = @ptrCast(@alignCast(ctx));
+        if (self.names_len < self.names.len) {
+            const n = &self.names[self.names_len];
+            n.parent = parent;
+            n.len = @min(name.len, n.bytes.len);
+            @memcpy(n.bytes[0..n.len], name[0..n.len]);
+            self.names_len += 1;
+        }
+    }
+    fn noteUnnamed(ctx: *anyopaque) void {
+        const self: *RecordingSink = @ptrCast(@alignCast(ctx));
+        self.unnamed += 1;
+    }
     fn sink(self: *RecordingSink) cache.RecallSink {
-        return .{ .ctx = self, .discardLayout = &discardLayout, .purgeCensus = &purgeCensus, .noteRecalled = &noteRecalled };
+        return .{ .ctx = self, .discardLayout = &discardLayout, .purgeCensus = &purgeCensus, .noteRecalled = &noteRecalled, .noteName = &noteName, .noteUnnamed = &noteUnnamed };
+    }
+    /// Whether `(parent, name)` reached this reader's kernel sink.
+    fn sawName(self: *const RecordingSink, parent: u64, name: []const u8) bool {
+        for (self.names[0..self.names_len]) |n| if (n.parent == parent and std.mem.eql(u8, n.bytes[0..n.len], name)) return true;
+        return false;
     }
 };
 
@@ -442,7 +466,7 @@ const TwoMembers = struct {
     /// The holder's commit of `objects`: the A1½ recall, the apply, the
     /// settle at the terminal outcome.
     fn commit(self: *TwoMembers, objects: []const u64, apply: *const fn (*TwoMembers) anyerror!void) !table.RecallSummary {
-        const s = try self.holder.recallAndWait(self.io, objects, self.pusher.pusher());
+        const s = try self.holder.recallAndWait(self.io, objects, .{}, self.pusher.pusher());
         try apply(self);
         self.holder.settle(self.io, objects);
         return s;
@@ -546,6 +570,45 @@ test "a directory's token carries its dentry set paged by cookie: lookup by name
     try testing.expect(s.gone());
     s.release(io);
     try testing.expect(!f.holder.holdsGrant(io, objectOf(99), 1));
+}
+
+test "invalidation coherence (decision 0003 §AB.2): a peer's create, unlink and rename in a directory a reader holds reach the reader's KERNEL by name before the recall is acked — the negative dentry of a created name and the positive dentry of an unlinked or renamed one; a batch that changed a dentry it could not name drops the reader's whole dentry cache; a reader holding nothing under the parent hears none of it" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    const f = try TwoMembers.init(gpa, io, 2);
+    defer f.deinit();
+    var binding: ConveyorBinding = .{ .io = io, .holder = &f.holder, .pusher = f.pusher.pusher() };
+    const hook = binding.hook();
+    // B1 looked up in the directory (its kernel may hold "four" and a
+    // negative "five"); B2 holds only the file object 3.
+    var s = (try f.reader(0).serve(io, objectOf(2), .{ .dentries = true })).?;
+    s.release(io);
+    s = (try f.reader(1).serve(io, objectOf(3), .{})).?;
+    s.release(io);
+    // A's batch: create "five", unlink "three", rename "four" → "renamed",
+    // all under the directory; the file 3's inode changes too.
+    const notes = [_]tx.NameNote{
+        .{ .parent = objectOf(2), .name = "five" },
+        .{ .parent = objectOf(2), .name = "three" },
+        .{ .parent = objectOf(2), .name = "four" },
+        .{ .parent = objectOf(2), .name = "renamed" },
+    };
+    const objects = [_]u64{ objectOf(2), objectOf(3) };
+    try hook.recall(hook.ctx, &objects, .{ .notes = &notes });
+    // The recall returned: every reader acked — B1's kernel heard every
+    // name BEFORE its ack.
+    for (notes) |n| try testing.expect(f.sinks[0].sawName(n.parent, n.name));
+    try testing.expectEqual(@as(u32, 0), f.sinks[0].unnamed);
+    // B2 held nothing under the directory: no name reached it.
+    try testing.expectEqual(@as(usize, 0), f.sinks[1].names_len);
+    hook.settle(hook.ctx, &objects);
+    // An unnamed batch (a dentry change no note names): B1 drops every
+    // dentry.
+    s = (try f.reader(0).serve(io, objectOf(2), .{ .dentries = true })).?;
+    s.release(io);
+    try hook.recall(hook.ctx, &.{objectOf(2)}, .{ .unnamed = true });
+    try testing.expectEqual(@as(u32, 1), f.sinks[0].unnamed);
+    hook.settle(hook.ctx, &.{objectOf(2)});
 }
 
 test "the paged-resident dentry set (rung 10 item 5c, spec Q13): a directory larger than the reader's window is never refused — the entry holds one cookie WINDOW from the serve's `after`, a readdir pages window after window (each a fetch, dir_complete false until the last), a lookup by name fetches the window around the name's cookies and judges absence only inside it (a cut mid-run re-serves from the window's end); a cached window is a hit; oversize refusals stay 0" {
@@ -762,7 +825,7 @@ const HoldingCommitRig = struct {
     fn run(self: *HoldingCommitRig) void {
         // The recall (nobody holds object 4 yet), then the seam's hold
         // BEFORE the apply: the window a first touch must park in.
-        self.summary = self.f.holder.recallAndWait(self.f.io, &.{objectOf(4)}, self.f.pusher.pusher()) catch unreachable;
+        self.summary = self.f.holder.recallAndWait(self.f.io, &.{objectOf(4)}, .{}, self.f.pusher.pusher()) catch unreachable;
     }
 };
 
@@ -1262,7 +1325,7 @@ test "the seams read their registry rows once (default-inert); the conveyor bind
     var s = (try f.reader(0).serve(io, objectOf(3), .{})).?;
     s.release(io);
     const objects = [_]u64{objectOf(3)};
-    try hook.recall(hook.ctx, &objects);
+    try hook.recall(hook.ctx, &objects, .{});
     try testing.expect(!f.holder.holdsGrant(io, objectOf(3), 1));
     try testing.expectEqual(@as(usize, 1), f.holder.gate.inflightCount(io));
     hook.settle(hook.ctx, &objects);

@@ -95,6 +95,67 @@ pub const Ttls = struct {
     }
 };
 
+/// The classes whose `_TTL_MS` knob the environment sets (bit per
+/// `TtlClass`, as `MountOptions.explicit_ttls`).
+pub fn envExplicitTtls(env: *const std.process.Environ.Map) u4 {
+    const keys = [_][]const u8{ "SQUEEZEFS_FUSE_ATTR_TTL_MS", "SQUEEZEFS_FUSE_ENTRY_TTL_MS", "SQUEEZEFS_FUSE_DIR_ENTRY_TTL_MS", "SQUEEZEFS_FUSE_NEGATIVE_TTL_MS" };
+    var bits: u4 = 0;
+    inline for (keys, 0..) |k, i| {
+        comptime std.debug.assert(@backingInt(@as(TtlClass, @fromBackingInt(i))) == i);
+        if (env.get(k) != null) bits |= @as(u4, 1) << i;
+    }
+    return bits;
+}
+
+/// THE TTL LAW (decision 0003 §AB.2). The kernel's entry and attr caches
+/// go stale only through a change the kernel did not make; every such
+/// change is now named to the kernel before it is acked — a peer's through
+/// the recall (`INVAL_ENTRY` per name, `INVAL_INODE` per object), this
+/// daemon's own non-kernel changes (a served step or ship, a job, a tool)
+/// at the conveyor's terminal outcome. On an ISOLATED mount — no peer
+/// writer (a `--single-writer` set; a manager no member has joined) and no
+/// interception host (its limiter's window IS the attr TTL) — the TTL so
+/// bounds no live path, only an invalidation that could not be delivered,
+/// which the law makes impossible (a full sideband owes an `INC_EPOCH`; the
+/// attrs notifies wait for their reserved cells). Each class no knob or
+/// `-o` names derives to `isolated_ns` = `T_owner`: the longest any
+/// coherence protocol of the set waits without an answer (the token
+/// recall's deadline), so no kernel view outlives the protocols' own
+/// window. A PEERED mount keeps the charter's classes (1 s): a peer that
+/// loses its lease, or a recall that cannot reach this mount, is bounded
+/// by them as before — the names make every live path stricter. The
+/// posture is one-way: the first join flips it (`enterPeered`, which then
+/// invalidates the kernel's whole view).
+pub const TtlLaw = struct {
+    peered_ttls: Ttls,
+    isolated_ttls: Ttls,
+    peered: std.atomic.Value(bool),
+
+    pub fn init(base: Ttls, explicit: u4, isolated_ns: u64, peered: bool) TtlLaw {
+        var iso = base;
+        inline for (@typeInfo(TtlClass).@"enum".field_names, 0..) |_, i| {
+            if (explicit & (@as(u4, 1) << i) == 0) iso.set(@fromBackingInt(i), isolated_ns);
+        }
+        return .{ .peered_ttls = base, .isolated_ttls = iso, .peered = .init(peered) };
+    }
+
+    /// The classes a reply takes now (acquire pairs with `enterPeered`'s
+    /// swap: a reply after the flip takes the peered classes).
+    pub fn current(self: *const TtlLaw) *const Ttls {
+        return if (self.peered.load(.acquire)) &self.peered_ttls else &self.isolated_ttls;
+    }
+
+    /// The flip; true = this call made it.
+    pub fn enterPeered(self: *TtlLaw) bool {
+        return !self.peered.swap(true, .acq_rel);
+    }
+};
+
+/// `isolated_ns` = `T_owner` (the recall's deadline; `TtlLaw`).
+pub fn isolatedTtlNs(t_owner_ms: u64) u64 {
+    return t_owner_ms * ns_per_ms;
+}
+
 /// The canonical options value. Kernel-facing fields map one-to-one onto
 /// the mount strings; daemon-level fields never leave the process.
 pub const MountOptions = struct {
@@ -583,6 +644,33 @@ test "TTL precedence: 1 s default → env _TTL_MS rows → -o *_timeout=; the en
     // The env row refuses a fraction and a unit at the gate like every knob.
     try testing.expect(knobs.parseIntIn(u64, "SQUEEZEFS_FUSE_ATTR_TTL_MS", "1.5", 0, knobs.MS_MAX) == .invalid);
     try testing.expect(knobs.parseIntIn(u64, "SQUEEZEFS_FUSE_ATTR_TTL_MS", "5s", 0, knobs.MS_MAX) == .invalid);
+}
+
+test "the TTL law (decision 0003 §AB.2): an isolated mount derives every class no knob or -o names to T_owner; a peered one keeps the charter's classes; the first join flips it once; an explicit class is the operator's in both postures" {
+    const gpa = testing.allocator;
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    try testing.expectEqual(@as(u4, 0), envExplicitTtls(&env));
+    try env.put("SQUEEZEFS_FUSE_NEGATIVE_TTL_MS", "5");
+    const env_bits = envExplicitTtls(&env);
+    try testing.expectEqual(@as(u4, 1) << @intCast(@backingInt(TtlClass.negative)), env_bits);
+    var o: MountOptions = .{ .ttls = Ttls.fromEnv(&env) };
+    try testing.expectEqual(Outcome.ok, parseOptionString(&o, "attr_timeout=2"));
+    const iso = isolatedTtlNs(45_000);
+    try testing.expectEqual(@as(u64, 45 * ns_per_s), iso);
+    var law = TtlLaw.init(o.ttls, o.explicit_ttls | env_bits, iso, false);
+    const t = law.current();
+    try testing.expectEqual(@as(u64, 2 * ns_per_s), t.attr_ns);
+    try testing.expectEqual(iso, t.entry_ns);
+    try testing.expectEqual(iso, t.dir_entry_ns);
+    try testing.expectEqual(@as(u64, 5 * ns_per_ms), t.negative_ns);
+    try testing.expect(law.enterPeered());
+    try testing.expect(!law.enterPeered());
+    const p = law.current();
+    try testing.expectEqual(@as(u64, 2 * ns_per_s), p.attr_ns);
+    try testing.expectEqual(DEFAULT_TTL_NS, p.entry_ns);
+    try testing.expectEqual(DEFAULT_TTL_NS, p.dir_entry_ns);
+    try testing.expectEqual(@as(u64, 5 * ns_per_ms), p.negative_ns);
 }
 
 test "the parser is total on arbitrary option strings" {

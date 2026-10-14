@@ -266,6 +266,7 @@ pub fn Applier(comptime Store: type) type {
                     const parent_key = route_table.effectiveIno(s.parent);
                     const found = (try self.findDentry(s.parent, s.name)) orelse return .{ .status = .already_applied };
                     if (found.child != s.expect_child) return .{ .status = .foreign_skipped };
+                    t.noteName(parent_key, s.name);
                     try t.stageDelete(key.TREE_DENTRIES, &found.key);
                     try self.stageParent(t, parent_key, s.parent_update, -1, now);
                     return .{ .status = .applied };
@@ -293,6 +294,7 @@ pub fn Applier(comptime Store: type) type {
                     };
                     var vbuf: [@sizeOf(record.DentryValueHeader) + record.NAME_MAX]u8 = undefined;
                     const dv = (record.DentryValue{ .child_ino = s.child, .file_type = @intCast(s.ft_bits >> 12), .name = s.name }).encodeInto(&vbuf) catch return error.Corrupt;
+                    t.noteName(parent_key, s.name);
                     try t.stagePut(key.TREE_DENTRIES, &dk, dv);
                     try self.stageParentWith(t, parent_key, pv.?, s.parent_update, 1, now);
                     return .{ .status = .applied };

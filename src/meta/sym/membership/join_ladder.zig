@@ -297,6 +297,9 @@ pub const ManagerHandlers = struct {
             .ok => {},
             .rejected => |why| return service.Answer.rejected(@tagName(why)),
         }
+        // The kernel's posture before the joiner can write (decision 0003
+        // §AB.2).
+        if (self.mgr.peer_gate) |g| g.enter(g.ctx);
         const out = self.mgr.joinAppender(.{ .identity = pageIdentity(r.identity), .ring_want_bytes = r.ring_want_bytes, .home_volume = r.volume }) catch |e| return classifyVerb(e);
         // The tails ride the scratch: the segments, then the grant runs.
         const segs: []align(1) verbs.RunWire = @ptrCast(scratch[0 .. out.ring_segments.len * @sizeOf(verbs.RunWire)]);

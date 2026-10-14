@@ -1480,7 +1480,7 @@ pub const RecallSink = struct {
     }
 
     pub fn sink(self: *RecallSink) tokens.cache.RecallSink {
-        return .{ .ctx = self, .discardLayout = &discardLayout, .purgeCensus = &purgeCensus, .noteRecalled = &noteRecalled };
+        return .{ .ctx = self, .discardLayout = &discardLayout, .purgeCensus = &purgeCensus, .noteRecalled = &noteRecalled, .noteName = &noteName, .noteUnnamed = &noteUnnamed };
     }
 
     fn discardLayout(ctx: *anyopaque, _: u64, entry: ?*const tokens.cache.Entry) tokens.cache.DiscardVerdict {
@@ -1504,6 +1504,20 @@ pub const RecallSink = struct {
         const seam = self.notify orelse return;
         var inval: tokens.divert.KernelInvalidator = .{ .notify = seam };
         inval.noteRecalled(object);
+    }
+
+    fn noteName(ctx: *anyopaque, parent: u64, name: []const u8) void {
+        const self: *RecallSink = @ptrCast(@alignCast(ctx));
+        const seam = self.notify orelse return;
+        var inval: tokens.divert.KernelInvalidator = .{ .notify = seam };
+        inval.noteName(parent, name);
+    }
+
+    fn noteUnnamed(ctx: *anyopaque) void {
+        const self: *RecallSink = @ptrCast(@alignCast(ctx));
+        const seam = self.notify orelse return;
+        var inval: tokens.divert.KernelInvalidator = .{ .notify = seam };
+        inval.noteUnnamed();
     }
 };
 

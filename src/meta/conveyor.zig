@@ -988,8 +988,36 @@ pub const DoorSeam = struct {
 /// pass (the null probe).
 pub const TokenHook = struct {
     ctx: *anyopaque,
-    recall: *const fn (ctx: *anyopaque, objects: []const u64) Allocator.Error!void,
+    /// `names`: the dentries the batch changes, so a reader drops exactly
+    /// those from its kernel (decision 0003 §AB.2).
+    recall: *const fn (ctx: *anyopaque, objects: []const u64, names: BatchNames) Allocator.Error!void,
     settle: *const fn (ctx: *anyopaque, objects: []const u64) void,
+};
+
+/// The names a batch changes (decision 0003 §AB.2): every member's notes;
+/// `unnamed` = a member changed a dentry its notes do not name.
+pub const BatchNames = token_table.RecallNames;
+
+/// Whether a member changes a dentry its notes do not name.
+fn unnamedDentries(q: *const tx.QueuedTx) bool {
+    if (q.names.overflow) return true;
+    if (q.names.len != 0) return false;
+    for (q.recs) |r| if (r.tree_id == key.TREE_DENTRIES) return true;
+    return false;
+}
+
+/// THIS mount's kernel as the conveyor sees it (decision 0003 §AB.2): a
+/// change the kernel did not ask for — a peer's served step or ship, a job,
+/// a tool (`!kernel_origin`) — and every member of a window that failed
+/// (its records were readable in RAM until the rollback) is invalidated in
+/// it at the window's terminal outcome: after the RAM apply, so a lookup
+/// that follows reads the new records, and before the member's ack. The
+/// FUSE layer arms it once its session is up.
+pub const KernelView = struct {
+    ctx: *anyopaque,
+    /// One member: its names (`unnamed` ⇒ the whole dentry cache) and the
+    /// objects whose inode or xattrs it changed (their attributes).
+    invalidate: *const fn (ctx: *anyopaque, names: []const tx.NameNote, unnamed: bool, objects: []const u64) void,
 };
 
 /// The pass's venue: `wake` is called by the committer that won the
@@ -1129,6 +1157,9 @@ pub const Conveyor = struct {
     /// per pass. The plane keeps the hook alive until it disarmed and no
     /// window is in flight.
     tokens: std.atomic.Value(?*const TokenHook) = .init(null),
+    /// The armed kernel view (null before the FUSE session is up, and in
+    /// the portable contracts): one acquire load per window.
+    kernel: std.atomic.Value(?*const KernelView) = .init(null),
     /// The window-fill hold's wake: every window's terminal outcome
     /// notifies (`finishWindow`, after `untrack`); the pass registers
     /// BEFORE it re-reads the in-flight count (`sync/notify.zig`'s law —
@@ -1213,6 +1244,15 @@ pub const Conveyor = struct {
 
     pub fn disarmTokens(self: *Conveyor) void {
         self.tokens.store(null, .release);
+    }
+
+    /// Arm the kernel view (release pairs with `finishWindow`'s acquire).
+    pub fn armKernel(self: *Conveyor, view: *const KernelView) void {
+        self.kernel.store(view, .release);
+    }
+
+    pub fn disarmKernel(self: *Conveyor) void {
+        self.kernel.store(null, .release);
     }
 
     // ---- committers ----
@@ -1777,13 +1817,23 @@ pub const Conveyor = struct {
         defer if (!union_settled) tokens.?.settle(tokens.?.ctx, token_union);
         if (tokens) |hook| {
             var u: token_table.ObjectUnion = .{};
-            for (members.items) |*m| u.addMember(arena, &m.q) catch {
-                self.failBatch(members.items, error.OutOfMemory);
-                return;
-            };
+            var notes: std.ArrayList(tx.NameNote) = .empty;
+            var unnamed = false;
+            for (members.items) |*m| {
+                u.addMember(arena, &m.q) catch {
+                    self.failBatch(members.items, error.OutOfMemory);
+                    return;
+                };
+                if (m.q.token_quiet) continue;
+                notes.appendSlice(arena, m.q.names.slice()) catch {
+                    self.failBatch(members.items, error.OutOfMemory);
+                    return;
+                };
+                unnamed = unnamed or unnamedDentries(&m.q);
+            }
             token_union = u.finish();
             const t_recall = clock.monotonicNs();
-            hook.recall(hook.ctx, token_union) catch {
+            hook.recall(hook.ctx, token_union, .{ .notes = notes.items, .unnamed = unnamed }) catch {
                 self.failBatch(members.items, error.OutOfMemory);
                 return;
             };
@@ -2227,13 +2277,45 @@ pub const Conveyor = struct {
                 for (w.members, w.failed) |*m, f| if (f == null) tee.note(tee.ctx, m.q.recs);
             } else |_| {}
         }
+        const kernel = self.kernel.load(.acquire);
         for (w.members, w.failed) |*m, f| {
             const outcome: Outcome = if (f) |e| e else result;
+            if (kernel) |view| noteKernel(view, &m.q, if (outcome) |_| false else |_| true);
             self.answer(m, outcome);
         }
         if (w.image) |*img| img.deinit();
         w.arena.deinit();
         self.deps.gpa.destroy(w);
+    }
+
+    /// One member's invalidation in this mount's kernel (`KernelView`): a
+    /// change its kernel asked for and got is its reply's to tell; the
+    /// migration engine's delta copy re-homes records without changing a
+    /// name or an attribute; a `token_quiet` control record is no kernel's.
+    fn noteKernel(view: *const KernelView, q: *const tx.QueuedTx, failed: bool) void {
+        // `token_quiet`: a control record no kernel caches.
+        if (q.door_bypass or q.token_quiet) return;
+        if (q.kernel_origin and !failed) return;
+        // The objects in chunks through a stack buffer (no allocation on
+        // the lane); adjacent duplicates folded (a member's records are
+        // grouped by object).
+        var buf: [32]u64 = undefined;
+        var n: usize = 0;
+        var named = false;
+        const unnamed = unnamedDentries(q);
+        for (q.recs) |r| {
+            if (r.tree_id != key.TREE_INODES and r.tree_id != key.TREE_XATTRS) continue;
+            const o = token_table.recordObjectIno(r.tree_id, r.key) orelse continue;
+            if (n != 0 and buf[n - 1] == o) continue;
+            if (n == buf.len) {
+                view.invalidate(view.ctx, if (named) &.{} else q.names.slice(), unnamed and !named, buf[0..n]);
+                named = true;
+                n = 0;
+            }
+            buf[n] = o;
+            n += 1;
+        }
+        if (n != 0 or (!named and (q.names.len != 0 or unnamed))) view.invalidate(view.ctx, if (named) &.{} else q.names.slice(), unnamed and !named, buf[0..n]);
     }
 
     // ---- the seq-conditional rollback (§5.2 "Failure") ----
@@ -3046,6 +3128,78 @@ test "a single commit: the pass drains one, the lane lands it and acks after the
     try testing.expectEqual(@as(usize, 3), n);
 }
 
+test "the kernel view (decision 0003 §AB.2): a change this mount's kernel did not ask for — a peer's served step, a job, a tool — is invalidated in it by name and by object after the RAM apply and BEFORE its ack; the kernel's own change is its reply's to tell (nothing invalidated); a dentry change no note names drops the whole dentry cache" {
+    const h = try Harness.create(.{}, null, false);
+    defer h.destroy();
+    const View = struct {
+        calls: u32 = 0,
+        names: u32 = 0,
+        saw_name: bool = false,
+        unnamed: u32 = 0,
+        objects: u32 = 0,
+        /// The ack count at the call: the invalidation precedes the ack.
+        acks_at_call: u64 = 0,
+        /// The child's record readable at the call: after the RAM apply.
+        applied_at_call: bool = false,
+        child: u64 = 0,
+        h: *Harness,
+        fn invalidate(ctx: *anyopaque, names: []const tx.NameNote, unnamed: bool, objects: []const u64) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.calls += 1;
+            self.names += @intCast(names.len);
+            for (names) |n| if (n.parent == 1 and std.mem.eql(u8, n.name, "peer-made")) {
+                self.saw_name = true;
+            };
+            if (unnamed) self.unnamed += 1;
+            self.objects += @intCast(objects.len);
+            self.acks_at_call = self.h.cv.stats.acks.load();
+            if (self.child != 0) self.applied_at_call = self.h.present(self.child) catch false;
+        }
+    };
+    var v: View = .{ .h = h };
+    const kv: KernelView = .{ .ctx = &v, .invalidate = &View.invalidate };
+    h.cv.armKernel(&kv);
+    defer h.cv.disarmKernel();
+    // The kernel's own create: nothing to invalidate.
+    {
+        const t = try h.gpa.create(tx.KvTx);
+        defer h.gpa.destroy(t);
+        t.* = tx.KvTx.init(h.gpa, @src());
+        _ = try h.stageCreate(t, "kernel-made");
+        t.kernel_origin = true;
+        try h.cv.commit(t);
+    }
+    try testing.expectEqual(@as(u32, 0), v.calls);
+    // A peer's create (no kernel origin): ONE call naming it, its inode and
+    // the parent's, before the ack, after the apply.
+    const acks0 = h.cv.stats.acks.load();
+    {
+        const t = try h.gpa.create(tx.KvTx);
+        defer h.gpa.destroy(t);
+        t.* = tx.KvTx.init(h.gpa, @src());
+        v.child = try h.stageCreate(t, "peer-made");
+        try h.cv.commit(t);
+    }
+    try testing.expectEqual(@as(u32, 1), v.calls);
+    try testing.expect(v.saw_name);
+    try testing.expectEqual(@as(u32, 1), v.names);
+    try testing.expectEqual(@as(u32, 0), v.unnamed);
+    try testing.expectEqual(@as(u32, 2), v.objects);
+    try testing.expectEqual(acks0, v.acks_at_call);
+    try testing.expect(v.applied_at_call);
+    // A dentry change no note names: the whole dentry cache.
+    v.child = 0;
+    {
+        const t = try h.gpa.create(tx.KvTx);
+        defer h.gpa.destroy(t);
+        t.* = tx.KvTx.init(h.gpa, @src());
+        try t.stagePut(key.TREE_DENTRIES, &key.dentryKey(1, 0x77, 0), "x");
+        try h.cv.commit(t);
+    }
+    try testing.expectEqual(@as(u32, 2), v.calls);
+    try testing.expectEqual(@as(u32, 1), v.unnamed);
+}
+
 test "the ack spin's bound (decision 0003 §AB.4): no measured wake ⇒ no spin; 2·W when the ack's mean is within it; an ack predicted past 2·W ⇒ no spin (every spin would fall through)" {
     try testing.expectEqual(@as(u64, 0), spinBound(0, 10_000));
     try testing.expectEqual(@as(u64, 20_000), spinBound(10_000, 15_000));
@@ -3172,7 +3326,7 @@ test "A1½: an armed token hook sees the batch's union (sorted, deduped, token_q
         /// The lane's handoff count at the recall: the recall precedes it.
         handoffs_at_recall: u64 = 0,
         cv: *Conveyor,
-        fn recall(ctx: *anyopaque, objects: []const u64) Allocator.Error!void {
+        fn recall(ctx: *anyopaque, objects: []const u64, _: BatchNames) Allocator.Error!void {
             const self: *@This() = @ptrCast(@alignCast(ctx));
             self.recalls += 1;
             self.handoffs_at_recall = self.cv.stats.lane_handoffs.load();

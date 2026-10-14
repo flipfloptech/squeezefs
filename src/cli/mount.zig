@@ -124,6 +124,15 @@ const ipc_rl = @import("../ipc/rendezvous_linux.zig");
 const derive = @import("../core/derive.zig");
 const errors = @import("../core/errors.zig");
 const log = @import("../core/log.zig");
+const futex = @import("../sync/futex.zig");
+const mpmc = @import("../sync/mpmc.zig");
+const tick_law = @import("../sync/tick.zig");
+const thread_name = @import("../core/thread_name.zig");
+const record_mod = @import("../meta/record.zig");
+const conveyor = @import("../meta/conveyor.zig");
+const tx = @import("../meta/tx.zig");
+const route_table = @import("../meta/routing/route_table.zig");
+const sym_manager = @import("../meta/sym/manager.zig");
 const keys = @import("../ops/keys.zig");
 const jobs = @import("../ops/jobs.zig");
 const mount_fabric = @import("../ops/nvmet/mount_fabric.zig");
@@ -442,8 +451,23 @@ fn mountMain(ctx: *Ctx) u8 {
     var plane_open = true;
     defer if (plane_open) plane.close();
     const flush_interval_ms = checkpoint.flushIntervalMsFromEnv(env);
+    // The TTL law (decision 0003 §AB.2): a joiner, a reader and an
+    // interception mount start (and stay) PEERED; a manager or a
+    // `--single-writer` set starts ISOLATED until a member joins.
+    var coherence: KernelCoherence = .{
+        .io = io,
+        .gpa = gpa,
+        .law = mount_options.TtlLaw.init(ctx.opts.ttls, ctx.opts.explicit_ttls | mount_options.envExplicitTtls(env), mount_options.isolatedTtlNs(lease_clock.T_OWNER_MS), reader or be.volumes[0].joined != null or ctx.opts.interception),
+        .opens = &opens,
+    };
+    coherence.init() catch return ctx.failed("out of memory (the kernel view's queue)", .{});
+    defer coherence.deinit();
+    for (be.volumes) |vol| if (vol.sym) |s| {
+        s.manager.peer_gate = &coherence.gate;
+    };
     var fs = BackendFs.mount(gpa, io, be, plane, .{
         .ttls = ctx.opts.ttls,
+        .ttl_law = &coherence.law,
         .page_size = facts.page_size,
         .dlm_stripes = dlm.resolveWidth(env, facts, fuse_geometry.Q_DEPTH_DESIRED),
         .uid = ctx.opts.uid,
@@ -658,6 +682,16 @@ fn mountMain(ctx: *Ctx) u8 {
         wp.record_svc.sink.kernel = .{ .ctx = seam.ctx, .invalInode = seam.invalInode, .prune = seam.prune };
     }
     if (rplane) |rp| rp.sink.bindSession(session.tokenNotifySeam());
+    // The kernel view on every writer's conveyor (decision 0003 §AB.2):
+    // disarmed and detached before the session goes (LIFO: this `defer`
+    // runs before `session.deinit`).
+    coherence.attach(session) catch return ctx.failed("the kernel view's notifier thread could not start", .{});
+    if (!reader) for (be.volumes) |vol| vol.cv.armKernel(&coherence.view);
+    var kernel_view_live = true;
+    defer if (kernel_view_live) {
+        if (!reader) for (be.volumes) |vol| vol.cv.disarmKernel();
+        coherence.detach();
+    };
     // The zc legs: the held-slot direct store on a zero-copy session, the
     // direct device leg, the fd-source probe serve.
     var held_store: HeldStore = .{ .session = session };
@@ -815,6 +849,9 @@ fn mountMain(ctx: *Ctx) u8 {
     const stranded = counters.tripwireCount("open_count_stranded");
     const abandoned = transport.slot.requests_abandoned.load();
     log.info("teardown: session closed; open_count_stranded={d} transport_requests_abandoned={d} tick_commit_lost_wakes={d} tick_cqe_lost_wakes={d} tick_late_commits={d} tick_late_cqes={d}", .{ stranded, abandoned, transport.worker.park_tick_commit_lost_wakes.load(), transport.worker.park_tick_cqe_lost_wakes.load(), transport.worker.park_tick_late_commits.load(), transport.worker.park_tick_late_cqes.load() });
+    if (!reader) for (be.volumes) |vol| vol.cv.disarmKernel();
+    coherence.detach();
+    kernel_view_live = false;
     session_live = false;
     vs.renderer.sources.session = null;
     session.deinit();
@@ -1178,6 +1215,145 @@ const HeldStore = struct {
     fn store(ctx: *anyopaque, src: slot.HeldSource, fd: linux.fd_t, off: u64, io: Io) slot.ExtractError!void {
         const self: *HeldStore = @ptrCast(@alignCast(ctx));
         return self.session.storeHeld(src, fd, off, io);
+    }
+};
+
+/// THE KERNEL'S COHERENCE (decision 0003 §AB.2): the mount's TTL law, the
+/// conveyors' kernel view (a change this kernel did not ask for, named to
+/// it) and the managers' peer gate (the first join flips the law to PEERED
+/// and invalidates the kernel's whole view). A producer — the journal lane
+/// at a window's terminal outcome — NEVER waits: it queues the names and
+/// the objects before the member's ack and the NOTIFIER thread writes them
+/// (the sideband thread itself commits — a FORGET's destroy — so a lane
+/// waiting on a sideband cell is a deadlock; measured: the first cut wedged
+/// an rmdir for 75 s). A full queue owes the kernel a whole-view flush
+/// (`INC_EPOCH` + attrs-only `INVAL_INODE` of every ino it holds): lossless.
+const KernelCoherence = struct {
+    io: Io,
+    gpa: std.mem.Allocator,
+    law: mount_options.TtlLaw,
+    opens: *open_table.OpenTable,
+    queue: mpmc.BoundedMpmc(Item) = undefined,
+    /// Bumped at every push; the notifier parks on it.
+    kick: futex.Word = .init(0),
+    flush_owed: std.atomic.Value(bool) = .init(false),
+    /// Whole-view flushes written (a `enterPeered` waits for the next).
+    flushes: futex.Word = .init(0),
+    stop: std.atomic.Value(bool) = .init(false),
+    session: ?*Session = null,
+    thread: ?std.Thread = null,
+    name_buf: thread_name.CommBuf = undefined,
+    view: conveyor.KernelView = undefined,
+    gate: sym_manager.PeerGate = undefined,
+
+    /// The queue: a full terminal outcome's worth of names and objects for
+    /// every lane at once — 1,024 items (64 members × 16), 272 KiB.
+    const QUEUE_CAP: usize = 1024;
+
+    const Item = struct {
+        /// A global ino: the parent of `name`, or the object whose
+        /// attributes go (`name_len` 0).
+        ino: u64,
+        name_len: u8,
+        name: [record_mod.NAME_MAX]u8,
+    };
+
+    fn init(self: *KernelCoherence) std.mem.Allocator.Error!void {
+        self.queue = try mpmc.BoundedMpmc(Item).init(self.gpa, QUEUE_CAP);
+        self.view = .{ .ctx = self, .invalidate = &invalidate };
+        self.gate = .{ .ctx = self, .enter = &enterPeered };
+    }
+
+    fn deinit(self: *KernelCoherence) void {
+        std.debug.assert(self.thread == null);
+        self.queue.deinit(self.gpa);
+    }
+
+    /// The session is up: the notifier starts writing into it.
+    fn attach(self: *KernelCoherence, session: *Session) std.Thread.SpawnError!void {
+        self.session = session;
+        self.thread = try std.Thread.spawn(.{}, notifierMain, .{self});
+    }
+
+    /// Before the session goes (every conveyor disarmed first): the
+    /// notifier stops; what it had not written dies with the session.
+    fn detach(self: *KernelCoherence) void {
+        const t = self.thread orelse return;
+        self.stop.store(true, .release);
+        _ = self.kick.fetchAdd(1, .release);
+        futex.wakeAll(&self.kick);
+        futex.wakeAll(&self.flushes);
+        t.join();
+        self.thread = null;
+        self.session = null;
+    }
+
+    fn push(self: *KernelCoherence, ino: u64, name: []const u8) void {
+        var it: Item = .{ .ino = ino, .name_len = @intCast(name.len), .name = undefined };
+        @memcpy(it.name[0..name.len], name);
+        if (!self.queue.tryPush(it)) self.flush_owed.store(true, .release);
+    }
+
+    fn wakeNotifier(self: *KernelCoherence) void {
+        // release pairs with the notifier's acquire of `kick`: the pushes
+        // (and an owed flush) are visible when it wakes.
+        _ = self.kick.fetchAdd(1, .release);
+        futex.wakeOne(&self.kick);
+    }
+
+    fn invalidate(ctx: *anyopaque, names: []const tx.NameNote, unnamed: bool, objects: []const u64) void {
+        const self: *KernelCoherence = @ptrCast(@alignCast(ctx));
+        for (names) |n| if (route_table.kernelGlobalOf(n.parent)) |g| self.push(g, n.name);
+        for (objects) |o| if (route_table.kernelGlobalOf(o)) |g| self.push(g, "");
+        if (unnamed) if (self.session) |s| s.notifyIncEpoch();
+        self.wakeNotifier();
+    }
+
+    /// The first join: replies take the peered classes from here on, then
+    /// the kernel's whole view goes stale — no entry cached under the
+    /// isolated posture outlives the first peer writer. The join is
+    /// answered after the flush is written.
+    fn enterPeered(ctx: *anyopaque) void {
+        const self: *KernelCoherence = @ptrCast(@alignCast(ctx));
+        if (!self.law.enterPeered()) return;
+        log.info("mount: a member joined — the kernel's TTLs take the peered classes (decision 0003 §AB.2); its whole view is invalidated", .{});
+        if (self.thread == null) return;
+        const f0 = self.flushes.load(.acquire);
+        self.flush_owed.store(true, .release);
+        self.wakeNotifier();
+        while (self.flushes.load(.acquire) == f0 and !self.stop.load(.acquire)) {
+            _ = futex.waitTimeout(&self.flushes, f0, tick_law.tick_ns);
+        }
+    }
+
+    fn notifierMain(self: *KernelCoherence) void {
+        _ = thread_name.nameCurrentThread(&self.name_buf, "sqz-kview");
+        const s = self.session.?;
+        while (!self.stop.load(.acquire)) {
+            const k = self.kick.load(.acquire);
+            if (self.flush_owed.swap(false, .acq_rel)) self.flushAll(s);
+            while (self.queue.tryPop()) |it| {
+                if (it.name_len != 0) s.notifyInvalEntryOwed(it.ino, it.name[0..it.name_len]) else s.notifyAttrs(it.ino);
+            }
+            if (self.flush_owed.load(.acquire)) continue;
+            _ = futex.waitTimeout(&self.kick, k, tick_law.tick_ns);
+        }
+    }
+
+    /// Every dentry (one epoch) and every attribute the kernel holds.
+    fn flushAll(self: *KernelCoherence, s: *Session) void {
+        s.notifyIncEpoch();
+        if (self.opens.trackedInos(self.gpa)) |inos| {
+            defer self.gpa.free(inos);
+            for (inos) |ino| s.notifyAttrs(ino);
+        } else |_| {
+            // No room to list them: owed again (the dentries went with the
+            // epoch); the next round retries.
+            log.err("mount: out of memory listing the kernel's inodes for a whole-view flush — retried", .{});
+            self.flush_owed.store(true, .release);
+        }
+        _ = self.flushes.fetchAdd(1, .release);
+        futex.wakeAll(&self.flushes);
     }
 };
 

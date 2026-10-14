@@ -474,12 +474,24 @@ pub const Lease = enum { held, peer, vacant };
 /// Live page the publish was bound to.
 pub const EndpointRow = struct { appender_id: u32, identity: cr.StableIdentity, endpoint: Endpoint, pr_key: u64 };
 
+/// The mount's kernel posture as a join changes it (decision 0003 §AB.2):
+/// `enter` runs before every admitted join — the first flips the mount's
+/// TTL law to PEERED and invalidates its kernel's whole view, so no entry
+/// cached under the isolated posture outlives the first peer writer.
+pub const PeerGate = struct {
+    ctx: *anyopaque,
+    enter: *const fn (ctx: *anyopaque) void,
+};
+
 pub const Manager = struct {
     gpa: Allocator,
     /// The verbs lock's executor (a lane fiber parks; `std.testing.io` in
     /// tests).
     io: std.Io,
     vol: Volume,
+    /// The mount's `PeerGate` (null = no kernel: the contracts, a tool);
+    /// set before the wire serves its first join.
+    peer_gate: ?*const PeerGate = null,
     /// The lease posture word: `held | peer:<node> | vacant`.
     lease: Lease = .vacant,
     peer_node: u64 = 0,

@@ -1163,16 +1163,89 @@ pub const GrantPage = struct {
 /// monotone frame number the ack names.
 pub const RecallFrameHead = extern struct {
     volume: u16,
-    reserved: u16,
+    /// `RecallNameHead` records after the objects: the dentries the batch
+    /// changes under them (decision 0003 §AB.2).
+    n_names: u16,
     n: u32,
     frame_id: u64,
     holder: u64,
+    /// 1 = the batch changed a dentry no record names: the reader drops its
+    /// kernel's whole dentry cache.
+    unnamed: u8,
+    reserved: [7]u8,
 
     pub fn check(self: RecallFrameHead) bool {
-        return self.n != 0 and self.n <= RECALL_BATCH_MAX;
+        return self.n != 0 and self.n <= RECALL_BATCH_MAX and self.n_names <= RECALL_NAMES_MAX and self.unnamed <= 1 and std.mem.allEqual(u8, &self.reserved, 0);
     }
 };
-pub const RecallFrame = HeadWithArray(RecallFrameHead, u64, "n", OBJECTS_MAX);
+
+/// One changed name: its parent object; the name bytes follow, padded to
+/// the tail alignment.
+pub const RecallNameHead = extern struct {
+    parent: u64,
+    name_len: u8,
+    reserved: [7]u8,
+
+    pub fn check(self: RecallNameHead) bool {
+        return self.name_len != 0 and std.mem.allEqual(u8, &self.reserved, 0);
+    }
+};
+pub const RecallName = record.NameRef;
+
+/// A frame carries at most this many names: the control cap's other half
+/// over a name record's worst case (16 B head + 255 B padded = 272 B).
+pub const RECALL_NAMES_MAX: u16 = (1 << 20) / 2 / 272;
+
+pub const RecallNameIterator = struct {
+    c: Cursor,
+    left: usize,
+    pub fn next(self: *RecallNameIterator) ?RecallName {
+        if (self.left == 0) return null;
+        self.left -= 1;
+        const h = self.c.take(RecallNameHead) catch unreachable;
+        const name = self.c.takeBytes(h.name_len) catch unreachable;
+        self.c.takePadding(h.name_len, codec.TAIL_ALIGN) catch unreachable;
+        return .{ .parent = h.parent, .name = name };
+    }
+};
+
+/// The recall push: the head, the objects, the names. Encoded from
+/// `name_list`; decoded into `names_bytes` (read through `names()`).
+pub const RecallFrame = struct {
+    head: RecallFrameHead,
+    items: []align(1) const u64,
+    name_list: []const RecallName = &.{},
+    names_bytes: []const u8 = "",
+
+    pub fn encode(self: RecallFrame, b: *Builder) codec.BuildError!void {
+        std.debug.assert(self.head.n == self.items.len and self.head.n_names == self.name_list.len);
+        try b.put(RecallFrameHead, self.head);
+        try b.putView(u64, self.items);
+        for (self.name_list) |n| {
+            try b.put(RecallNameHead, .{ .parent = n.parent, .name_len = @intCast(n.name.len), .reserved = @splat(0) });
+            try b.putBytes(n.name);
+            try b.putPadding(n.name.len, codec.TAIL_ALIGN);
+        }
+    }
+
+    pub fn decode(c: *Cursor) Error!RecallFrame {
+        const head = try c.take(RecallFrameHead);
+        const n = try codec.countAtMost(head.n, OBJECTS_MAX);
+        const items = try c.takeArray(u64, n);
+        const start = c.pos;
+        var i: usize = 0;
+        while (i < head.n_names) : (i += 1) {
+            const h = try c.take(RecallNameHead);
+            _ = try c.takeBytes(h.name_len);
+            try c.takePadding(h.name_len, codec.TAIL_ALIGN);
+        }
+        return .{ .head = head, .items = items, .names_bytes = c.bytes[start..c.pos] };
+    }
+
+    pub fn names(self: RecallFrame) RecallNameIterator {
+        return .{ .c = .init(self.names_bytes), .left = self.head.n_names };
+    }
+};
 pub const TokenRecallReq = RecallFrame;
 
 /// A frame carries at most `CONTROL_CAP / 2 / 32` = 16 384 objects: half
@@ -2073,11 +2146,25 @@ test "token payloads: the grant ask, a page with xattrs and a dentry page, recal
     try testing.expectEqual(@as(?DirEntry, null), ds.next());
     _ = try roundTrip(GrantPage, .{ .head = .{ .kind = 1, .flags = 0, .reserved = 0, .n_xattrs = 0, .n_dir = 0, .holder = 9, .attrs = attrs, .reserved2 = @splat(0) }, .xattrs_bytes = "", .dir_bytes = "" });
     const objs = [_]u64{ 1000, 1001 };
-    _ = try roundTrip(RecallFrame, .{ .head = .{ .volume = 0, .reserved = 0, .n = 2, .frame_id = 3, .holder = 77 }, .items = &objs });
+    _ = try roundTrip(RecallFrame, .{ .head = .{ .volume = 0, .n_names = 0, .n = 2, .frame_id = 3, .holder = 77, .unnamed = 0, .reserved = @splat(0) }, .items = &objs });
+    // The changed names ride after the objects (decision 0003 §AB.2).
+    const rnames = [_]RecallName{ .{ .parent = 1000, .name = "five" }, .{ .parent = 1001, .name = "a-name-longer-than-eight" } };
+    var rb: [256]u8 = undefined;
+    var rbb: Builder = .init(&rb);
+    try codec.encodePayload(RecallFrame, .{ .head = .{ .volume = 0, .n_names = 2, .n = 2, .frame_id = 4, .holder = 77, .unnamed = 1, .reserved = @splat(0) }, .items = &objs, .name_list = &rnames }, &rbb);
+    const rf = try codec.decodePayload(RecallFrame, rbb.written());
+    try testing.expectEqual(@as(u8, 1), rf.head.unnamed);
+    var rit = rf.names();
+    for (rnames) |want| {
+        const got = rit.next().?;
+        try testing.expectEqual(want.parent, got.parent);
+        try testing.expectEqualStrings(want.name, got.name);
+    }
+    try testing.expectEqual(@as(?RecallName, null), rit.next());
     // A frame naming no object or more than the batch cap does not decode.
     var fb: [64]u8 = undefined;
     var fbb: Builder = .init(&fb);
-    try codec.encodePayload(RecallFrame, .{ .head = .{ .volume = 0, .reserved = 0, .n = 0, .frame_id = 1, .holder = 1 }, .items = &.{} }, &fbb);
+    try codec.encodePayload(RecallFrame, .{ .head = .{ .volume = 0, .n_names = 0, .n = 0, .frame_id = 1, .holder = 1, .unnamed = 0, .reserved = @splat(0) }, .items = &.{} }, &fbb);
     try testing.expectError(error.Malformed, codec.decodePayload(RecallFrame, fbb.written()));
     _ = try roundTrip(RecallVerdict, RecallVerdict.deferred);
     _ = try roundTrip(TokenRecallAckReq, .{ .volume = 0, .reserved = 0, .reserved2 = 0, .client_id = 77, .frame_id = 3 });

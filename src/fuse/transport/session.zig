@@ -101,6 +101,14 @@ pub fn sidebandCells(nqueues: u32) usize {
     return @intCast(derive.nextPow2(nqueues + 16));
 }
 
+/// Cells reserved for the notifies that never wait in the kernel —
+/// attrs-only `INVAL_INODE` (a spinlock and a counter) and `INC_EPOCH` (an
+/// atomic increment) — so a caller may WAIT for one (decision 0003 §AB.2:
+/// such a cell recycles at its own CQE, never behind an `INVAL_ENTRY`
+/// queued on a directory a request holds). Eight: the notify fan-out
+/// floor's eight concurrent mutators, one attrs frame each in flight.
+pub const SIDEBAND_NB_CELLS: usize = 8;
+
 /// Sideband ring entries: the standing READ, the wake READ, one WRITE per
 /// cell and a cancel.
 pub fn sidebandEntries(cells: usize) u16 {
@@ -133,6 +141,14 @@ pub var notify_sent: counters.ShardedCounter = .{};
 pub var notify_enoent: counters.ShardedCounter = .{};
 pub var notify_failed: counters.ShardedCounter = .{};
 pub var notify_dropped: counters.ShardedCounter = .{};
+/// `transport_notify_epochs_owed` / `_epochs_sent`: an `INVAL_ENTRY` that
+/// found no cell owes the kernel an `INC_EPOCH` instead (never dropped —
+/// decision 0003 §AB.2); the epochs written (owed or asked).
+pub var notify_epochs_owed: counters.ShardedCounter = .{};
+pub var notify_epochs_sent: counters.ShardedCounter = .{};
+/// `transport_notify_nb_waits`: a caller of a non-blocking notify waited
+/// for a reserved cell.
+pub var notify_nb_waits: counters.ShardedCounter = .{};
 /// `transport_sideband_cells_exhausted` (must-stay-0): the sideband itself
 /// had no cell for an inline reply.
 pub var sideband_cells_exhausted: counters.Tripwire = .init("transport_sideband_cells_exhausted");
@@ -287,6 +303,12 @@ const Sideband = struct {
     ready: mpmc.BoundedMpmc(u32),
     /// Bumped at every recycle; a submitter out of cells waits on it.
     freed: futex.Word = .init(0),
+    /// Cells `[nb_base, cells.len)`: the non-blocking class's own pool.
+    nb_base: u32,
+    nb_free: mpmc.BoundedMpmc(u32),
+    nb_freed: futex.Word = .init(0),
+    /// An `INVAL_ENTRY` found no cell: the loop writes an `INC_EPOCH`.
+    epoch_owed: std.atomic.Value(bool) = .init(false),
     read_armed: bool = false,
     stop: std.atomic.Value(bool) = .init(false),
     disconnected: bool = false,
@@ -299,21 +321,26 @@ const Sideband = struct {
         const fixed = ring.registerFile(fuse_fd);
         const buf = try gpa.alloc(u8, buf_len);
         errdefer gpa.free(buf);
-        const cells = try gpa.alloc(SbCell, ncells);
+        const total = ncells + SIDEBAND_NB_CELLS;
+        const cells = try gpa.alloc(SbCell, total);
         errdefer gpa.free(cells);
         for (cells) |*c| c.* = .{};
         var free = try mpmc.BoundedMpmc(u32).init(gpa, ncells);
         errdefer free.deinit(gpa);
-        var ready = try mpmc.BoundedMpmc(u32).init(gpa, ncells);
+        var nb_free = try mpmc.BoundedMpmc(u32).init(gpa, SIDEBAND_NB_CELLS);
+        errdefer nb_free.deinit(gpa);
+        var ready = try mpmc.BoundedMpmc(u32).init(gpa, total);
         errdefer ready.deinit(gpa);
         for (0..ncells) |i| assert(free.tryPush(@intCast(i)));
-        return .{ .session = session, .ring = ring, .fuse_fd = fuse_fd, .fixed = fixed, .buf = buf, .cells = cells, .free = free, .ready = ready };
+        for (ncells..total) |i| assert(nb_free.tryPush(@intCast(i)));
+        return .{ .session = session, .ring = ring, .fuse_fd = fuse_fd, .fixed = fixed, .buf = buf, .cells = cells, .free = free, .ready = ready, .nb_base = @intCast(ncells), .nb_free = nb_free };
     }
 
     fn deinit(self: *Sideband, gpa: std.mem.Allocator) void {
         assert(self.thread == null);
         self.ring.deinit();
         self.ready.deinit(gpa);
+        self.nb_free.deinit(gpa);
         self.free.deinit(gpa);
         gpa.free(self.cells);
         gpa.free(self.buf);
@@ -387,9 +414,93 @@ const Sideband = struct {
     }
 
     fn recycle(self: *Sideband, idx: u32) void {
+        if (idx >= self.nb_base) {
+            assert(self.nb_free.tryPush(idx));
+            _ = self.nb_freed.fetchAdd(1, .release);
+            futex.wakeAll(&self.nb_freed);
+            return;
+        }
         assert(self.free.tryPush(idx));
         _ = self.freed.fetchAdd(1, .release);
         futex.wakeAll(&self.freed);
+    }
+
+    /// A reserved cell for a non-blocking notify; `wait` parks on the
+    /// class's recycle word (a reserved cell's write never waits in the
+    /// kernel, so the park is one sideband round) until the session ends.
+    fn takeNbCell(self: *Sideband, wait: bool) ?u32 {
+        var waited = false;
+        while (true) {
+            if (self.nb_free.tryPop()) |i| {
+                self.cells[i].done.reset();
+                return i;
+            }
+            if (!wait or self.disconnected or self.stop.load(.acquire)) return null;
+            if (!waited) notify_nb_waits.inc();
+            waited = true;
+            const gen = self.nb_freed.load(.acquire);
+            if (self.nb_free.tryPop()) |i| {
+                self.cells[i].done.reset();
+                return i;
+            }
+            _ = futex.waitTimeout(&self.nb_freed, gen, tick_law.tick_ns);
+        }
+    }
+
+    /// A non-blocking-class notify (attrs-only `INVAL_INODE`, `INC_EPOCH`)
+    /// from a reserved cell, waiting for one; false = the session ended.
+    fn notifyNb(self: *Sideband, comptime build: anytype, args: anytype) bool {
+        if (self.disconnected or self.stop.load(.acquire)) return false;
+        const idx = self.takeNbCell(true) orelse return false;
+        self.fillNotify(idx, build, args) catch return false;
+        self.publish(idx);
+        return true;
+    }
+
+    /// `INVAL_ENTRY` from the shared pool, never waiting (its write waits
+    /// on the parent's `i_rwsem`, which a request may hold while it waits
+    /// on this very caller); no cell ⇒ the loop owes the kernel an epoch.
+    fn notifyEntryOrEpoch(self: *Sideband, parent: u64, name: []const u8) void {
+        if (self.disconnected or self.stop.load(.acquire)) return;
+        if (self.takeCell(false)) |idx| {
+            if (self.fillNotify(idx, codec.notifyInvalEntry, .{ parent, name, @as(u32, 0) })) |_| {
+                self.publish(idx);
+                return;
+            } else |_| {}
+        }
+        notify_epochs_owed.inc();
+        self.oweEpoch();
+    }
+
+    /// The loop writes an `INC_EPOCH` at its next turn.
+    fn oweEpoch(self: *Sideband) void {
+        if (self.disconnected or self.stop.load(.acquire)) return;
+        self.epoch_owed.store(true, .release);
+        if (self.ring.wake()) slot.wake_writes.inc() else slot.wakes_elided.inc();
+    }
+
+    /// The loop's half of an owed epoch: a reserved cell without waiting
+    /// (the loop recycles them itself); none free ⇒ owed still, retried at
+    /// the next CQE.
+    fn writeOwedEpoch(self: *Sideband) void {
+        if (!self.epoch_owed.load(.acquire)) return;
+        const idx = self.takeNbCell(false) orelse return;
+        self.epoch_owed.store(false, .release);
+        self.fillNotify(idx, codec.notifyIncEpoch, .{}) catch return self.recycle(idx);
+        notify_epochs_sent.inc();
+        self.pushWrite(idx);
+    }
+
+    fn fillNotify(self: *Sideband, idx: u32, comptime build: anytype, args: anytype) codec.NotifyError!void {
+        const c = &self.cells[idx];
+        const frame: codec.NotifyFrame = @call(.auto, build, .{@as([]u8, &c.buf)} ++ args) catch |e| {
+            self.recycle(idx);
+            notify_dropped.inc();
+            return e;
+        };
+        c.head_len = frame.head.len;
+        c.body = frame.body;
+        c.fire_and_forget = true;
     }
 
     fn publish(self: *Sideband, idx: u32) void {
@@ -478,6 +589,7 @@ const Sideband = struct {
         while (!self.stop.load(.acquire) and !self.disconnected and !self.ring.isDead()) {
             _ = self.ring.service();
             while (self.ready.tryPop()) |idx| self.pushWrite(idx);
+            self.writeOwedEpoch();
             if (!self.read_armed) self.armRead();
             _ = self.ring.armWake();
             _ = self.ring.park(null);
@@ -878,10 +990,41 @@ pub const Session = struct {
         return self.sideband.notify(codec.notifyPrune, .{nodeids});
     }
 
+    /// `FUSE_NOTIFY_INVAL_ENTRY` that is never dropped (decision 0003
+    /// §AB.2): no free cell ⇒ the sideband writes an `INC_EPOCH` instead.
+    pub fn notifyInvalEntryOwed(self: *Session, parent: u64, name: []const u8) void {
+        self.sideband.notifyEntryOrEpoch(parent, name);
+    }
+
+    /// `FUSE_NOTIFY_INC_EPOCH` (every dentry stale at its next walk):
+    /// owed to the sideband loop, which writes it from a reserved cell —
+    /// the caller never waits (a recall handler, a journal lane).
+    pub fn notifyIncEpoch(self: *Session) void {
+        self.sideband.oweEpoch();
+    }
+
+    /// Attrs-only `FUSE_NOTIFY_INVAL_INODE`, WAITING for a reserved cell:
+    /// for a caller nothing waits on (the kernel view's notifier) — the
+    /// sideband thread itself may wait on a commit (a FORGET's destroy).
+    pub fn notifyAttrs(self: *Session, ino: u64) void {
+        _ = self.sideband.notifyNb(codec.notifyInvalInode, .{ ino, @as(i64, -1), @as(i64, 0) });
+    }
+
     /// The token plane's kernel-invalidation face (a recalled object's
-    /// `INVAL_INODE` + `PRUNE` ride the sideband like every notify).
+    /// `INVAL_INODE` + `PRUNE`, a recalled name's `INVAL_ENTRY`, an unnamed
+    /// recall's `INC_EPOCH` ride the sideband like every notify).
     pub fn tokenNotifySeam(self: *Session) read_divert.NotifySeam {
-        return .{ .ctx = self, .invalInode = &notifyInvalInodeFn, .prune = &notifyPruneFn };
+        return .{ .ctx = self, .invalInode = &notifyInvalInodeFn, .prune = &notifyPruneFn, .invalEntry = &notifyInvalEntryFn, .incEpoch = &notifyIncEpochFn };
+    }
+
+    fn notifyInvalEntryFn(ctx: *anyopaque, parent: u64, name: []const u8) void {
+        const self: *Session = @ptrCast(@alignCast(ctx));
+        self.notifyInvalEntryOwed(parent, name);
+    }
+
+    fn notifyIncEpochFn(ctx: *anyopaque) void {
+        const self: *Session = @ptrCast(@alignCast(ctx));
+        self.notifyIncEpoch();
     }
 
     fn notifyInvalInodeFn(ctx: *anyopaque, ino: u64, off: i64, len: i64) error{QueueFull}!void {
@@ -1633,6 +1776,9 @@ pub const Session = struct {
         try field(w, "transport_notify_sent", notify_sent.load());
         try field(w, "transport_notify_enoent", notify_enoent.load());
         try field(w, "transport_notify_failed", notify_failed.load());
+        try field(w, "transport_notify_epochs_owed", notify_epochs_owed.load());
+        try field(w, "transport_notify_epochs_sent", notify_epochs_sent.load());
+        try field(w, "transport_notify_nb_waits", notify_nb_waits.load());
         try w.print("\"transport_notify_dropped\":{d}", .{notify_dropped.load()});
         try w.writeAll("}");
     }

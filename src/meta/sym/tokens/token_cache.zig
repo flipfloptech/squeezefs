@@ -291,9 +291,17 @@ pub const RecallSink = struct {
     /// The FUSE-layer hook: the recalled object's kernel view is invalidated
     /// (`FUSE_NOTIFY_INVAL_INODE` + `PRUNE` through the session).
     noteRecalled: *const fn (ctx: *anyopaque, object: Object) void,
+    /// A name the recalled batch changes under `parent` (decision 0003
+    /// §AB.2): `FUSE_NOTIFY_INVAL_ENTRY` before the ack.
+    noteName: *const fn (ctx: *anyopaque, parent: Object, name: []const u8) void,
+    /// The batch changed a dentry it could not name: every dentry goes.
+    noteUnnamed: *const fn (ctx: *anyopaque) void,
 
     /// A reader with no data plane bound (the contracts): nothing to purge.
-    pub const none: RecallSink = .{ .ctx = @ptrFromInt(1), .discardLayout = &noDiscard, .purgeCensus = &noPurge, .noteRecalled = &noNote };
+    pub const none: RecallSink = .{ .ctx = @ptrFromInt(1), .discardLayout = &noDiscard, .purgeCensus = &noPurge, .noteRecalled = &noNote, .noteName = &noName, .noteUnnamed = &noUnnamed };
+
+    fn noName(_: *anyopaque, _: Object, _: []const u8) void {}
+    fn noUnnamed(_: *anyopaque) void {}
 
     fn noDiscard(_: *anyopaque, _: Object, _: ?*const Entry) DiscardVerdict {
         return .no_entry;

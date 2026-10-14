@@ -216,6 +216,11 @@ comptime {
 /// The one length a `name_len u8` can frame.
 pub const NAME_MAX: usize = std.math.maxInt(u8);
 
+/// A dentry by its parent's key ino and its name — what a change names to
+/// the kernels that may cache it (decision 0003 §AB.2: the tx's notes, the
+/// recall's names).
+pub const NameRef = struct { parent: u64, name: []const u8 };
+
 pub const DentryValue = struct {
     child_ino: u64,
     /// Directory-entry type byte (`DT_*`).

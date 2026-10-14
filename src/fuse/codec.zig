@@ -1114,6 +1114,14 @@ pub fn notifyPrune(buf: []u8, nodeids: []const u64) NotifyError!NotifyFrame {
     return notifyFrameInPlace(buf, .prune, abi.fuse_notify_prune_out{ .count = @intCast(nodeids.len), .padding = 0, .spare = 0 }, tail_len);
 }
 
+/// `FUSE_NOTIFY_INC_EPOCH` (uapi 7.44): the header alone — every dentry
+/// the kernel holds goes stale at its next walk (decision 0003 §AB.2).
+pub fn notifyIncEpoch(buf: []u8) NotifyError!NotifyFrame {
+    if (buf.len < OUT_HEADER_LEN) return error.BufferTooSmall;
+    buf[0..OUT_HEADER_LEN].* = abi.encode(abi.fuse_out_header{ .len = OUT_HEADER_LEN, .@"error" = @intCast(@backingInt(abi.NotifyCode.inc_epoch)), .unique = 0 });
+    return .{ .head = buf[0..OUT_HEADER_LEN], .body = &.{} };
+}
+
 pub fn notifyPollWakeup(buf: []u8, kh: u64) NotifyError!NotifyFrame {
     return notifyFrame(buf, .poll, abi.fuse_notify_poll_wakeup_out{ .kh = kh }, &.{}, 0);
 }
@@ -1827,6 +1835,11 @@ test "notify frames (Q13): len covers struct AND tail, names carry the NUL, uniq
     try testing.expectEqual(@as(u64, 42), iio.ino);
     try testing.expectEqual(@as(i64, -1), iio.off);
     try testing.expectEqual(@as(usize, 40), ii.totalLen());
+
+    const ep = try notifyIncEpoch(&buf);
+    try testing.expectEqual(@as(usize, OUT_HEADER_LEN), ep.totalLen());
+    try testing.expectEqual(@as(i32, @intCast(@backingInt(abi.NotifyCode.inc_epoch))), ep.header().@"error");
+    try testing.expectEqual(@as(u32, OUT_HEADER_LEN), ep.header().len);
 
     const ie = try notifyInvalEntry(&buf, 1, "name", abi.FUSE_EXPIRE_ONLY);
     try expectNotifyLaw(ie, .inval_entry, 16, 5);

@@ -65,6 +65,8 @@ pub const Reason = enum {
     window_range_past_blocks,
     window_not_ascending,
     object_zero,
+    /// A recalled name carrying a `/` or a NUL (never a dentry's).
+    name_invalid,
     wait_past_t_owner,
     step_unused_word,
     step_ino_zero,
@@ -395,6 +397,11 @@ pub fn tokenGrant(req: verbs.TokenGrantReq) Verdict {
 /// count at the batch cap).
 pub fn tokenRecall(req: verbs.TokenRecallReq) Verdict {
     for (req.items) |o| if (o == 0) return reject(.object_zero);
+    var it = req.names();
+    while (it.next()) |n| {
+        if (n.parent == 0) return reject(.object_zero);
+        if (std.mem.indexOfAny(u8, n.name, "/\x00") != null) return reject(.name_invalid);
+    }
     return .ok;
 }
 
@@ -662,8 +669,24 @@ test "membership: member ids, the renewal's window declarations" {
 test "tokens, steps, guards, the record ship" {
     try expectRejected(.object_zero, tokenGrant(.{ .head = .{ .volume = 0, .wants = 0, .mode = 0, .xattr_after_len = 0, .client_id = 1, .object = 0, .after = 0 }, .bytes = "" }));
     const objs = [_]u64{ 1, 0 };
-    try expectRejected(.object_zero, tokenRecall(.{ .head = .{ .volume = 0, .reserved = 0, .n = 2, .frame_id = 1, .holder = 7 }, .items = &objs }));
-    try testing.expect(tokenRecall(.{ .head = .{ .volume = 0, .reserved = 0, .n = 1, .frame_id = 1, .holder = 7 }, .items = objs[0..1] }).isOk());
+    try expectRejected(.object_zero, tokenRecall(.{ .head = .{ .volume = 0, .n_names = 0, .n = 2, .frame_id = 1, .holder = 7, .unnamed = 0, .reserved = @splat(0) }, .items = &objs }));
+    try testing.expect(tokenRecall(.{ .head = .{ .volume = 0, .n_names = 0, .n = 1, .frame_id = 1, .holder = 7, .unnamed = 0, .reserved = @splat(0) }, .items = objs[0..1] }).isOk());
+    // A recalled name (decision 0003 §AB.2): a parent object ≥ 1, a name a
+    // dentry could carry.
+    const wcodec = @import("codec.zig");
+    const rows = [_]struct { name: verbs.RecallName, why: ?Reason }{
+        .{ .name = .{ .parent = 1, .name = "ok" }, .why = null },
+        .{ .name = .{ .parent = 0, .name = "x" }, .why = .object_zero },
+        .{ .name = .{ .parent = 1, .name = "a/b" }, .why = .name_invalid },
+    };
+    for (rows) |row| {
+        var nb: [64]u8 = undefined;
+        var b: wcodec.Builder = .init(&nb);
+        const one = [_]verbs.RecallName{row.name};
+        try wcodec.encodePayload(verbs.RecallFrame, .{ .head = .{ .volume = 0, .n_names = 1, .n = 1, .frame_id = 1, .holder = 7, .unnamed = 0, .reserved = @splat(0) }, .items = objs[0..1], .name_list = &one }, &b);
+        const fr = try wcodec.decodePayload(verbs.RecallFrame, b.written());
+        if (row.why) |why| try expectRejected(why, tokenRecall(fr)) else try testing.expect(tokenRecall(fr).isOk());
+    }
     try expectRejected(.object_zero, tokenRelease(.{ .head = .{ .volume = 0, .n = 2, .reserved = 0, .client_id = 1 }, .items = &objs }));
     try expectRejected(.object_zero, custodyGrant(.{ .volume = 0, .concurrent_write = 0, .reserved = 0, .wait_ms = 0, .client_id = 1, .object = 0, .span_start = 0, .span_len = 0, .lease_epoch = 0, .reserved2 = 0 }));
     const insert: verbs.XvStepWire = .{ .kind = 2, .parent_update = 1, .name_len = 1, .flags = 0, .ft_bits = 0o100000, .a = 5, .b = 6, .c = 0, .w0 = 0, .w1 = 0, .w2 = 0, .w3 = 0 };

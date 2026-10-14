@@ -1899,6 +1899,104 @@ test "smoke: THE TWO-DAEMON MATRIX — mount A (the manager) → mount B as a SE
     try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
 }
 
+test "smoke: INVALIDATION COHERENCE ACROSS DAEMONS (decision 0003 §AB.2) — every TTL class at 60 s on both (a stale entry would outlive the row): mount A, B JOINS (A's TTL law flips to PEERED, logged) → A caches a NEGATIVE `d/x`, B creates it in A's directory (a served step at A) ⇒ A sees it at once → B caches a negative `d/y`, A creates it ⇒ B sees it at once (the recalled name) → B caches `d/x`, A unlinks it ⇒ B misses it at once → B caches `d/y` and a negative `d/z`, A renames y → z ⇒ B sees both at once → B caches z's mode, A chmods it ⇒ B's stat is fresh at once → B counts the recalled names, no epoch owed on either" {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    try rig.env.put("SQUEEZEFS_MW_BIND", "127.0.0.1:0");
+    var t_owner_text: [8]u8 = undefined;
+    try rig.env.put("SQUEEZEFS_TEST_MEMBERSHIP_T_OWNER_MS", try std.fmt.bufPrint(&t_owner_text, "{d}", .{smoke_t_owner_ms}));
+    // Every class far past the row's length: only an invalidation can make
+    // a cached entry fresh here.
+    for ([_][]const u8{ "SQUEEZEFS_FUSE_ATTR_TTL_MS", "SQUEEZEFS_FUSE_ENTRY_TTL_MS", "SQUEEZEFS_FUSE_DIR_ENTRY_TTL_MS", "SQUEEZEFS_FUSE_NEGATIVE_TTL_MS" }) |k| try rig.env.put(k, "60000");
+    try rig.formatSet(true);
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(0);
+    const mk = try rig.onMount("mkdir d && echo ok");
+    gpa.free(mk);
+    const b = try Peer.init(rig, "b");
+    defer b.deinit();
+    try b.spawn(&.{});
+    _ = try b.awaitReady();
+    {
+        const text = try rig.readLog();
+        defer gpa.free(text);
+        try testing.expect(std.mem.indexOf(u8, text, "a member joined — the kernel's TTLs take the peered classes") != null);
+    }
+    // A served step at the holder: A's kernel held the negative.
+    {
+        const before = try rig.onMount("test -e d/x && echo yes || echo no");
+        defer gpa.free(before);
+        try testing.expectEqualStrings("no\n", before);
+        const made = try b.onMount("touch d/x && echo ok");
+        gpa.free(made);
+        const after = try rig.onMount("test -e d/x && echo yes || echo no");
+        defer gpa.free(after);
+        try testing.expectEqualStrings("yes\n", after);
+    }
+    // The recalled name: B's kernel held the negative.
+    {
+        const before = try b.onMount("test -e d/y && echo yes || echo no");
+        defer gpa.free(before);
+        try testing.expectEqualStrings("no\n", before);
+        const made = try rig.onMount("touch d/y && echo ok");
+        gpa.free(made);
+        const after = try b.onMount("test -e d/y && echo yes || echo no");
+        defer gpa.free(after);
+        try testing.expectEqualStrings("yes\n", after);
+    }
+    // An unlink: B's kernel held the positive.
+    {
+        const before = try b.onMount("test -e d/x && echo yes || echo no");
+        defer gpa.free(before);
+        try testing.expectEqualStrings("yes\n", before);
+        const gone = try rig.onMount("rm d/x && echo ok");
+        gpa.free(gone);
+        const after = try b.onMount("test -e d/x && echo yes || echo no");
+        defer gpa.free(after);
+        try testing.expectEqualStrings("no\n", after);
+    }
+    // A rename: both names.
+    {
+        const before = try b.onMount("test -e d/y && echo yes || echo no; test -e d/z && echo yes || echo no");
+        defer gpa.free(before);
+        try testing.expectEqualStrings("yes\nno\n", before);
+        const moved = try rig.onMount("mv d/y d/z && echo ok");
+        gpa.free(moved);
+        const after = try b.onMount("test -e d/y && echo yes || echo no; test -e d/z && echo yes || echo no");
+        defer gpa.free(after);
+        try testing.expectEqualStrings("no\nyes\n", after);
+    }
+    // A setattr: B's kernel held the mode.
+    {
+        const before = try b.onMount("stat -c %a d/z");
+        defer gpa.free(before);
+        try testing.expectEqualStrings("644\n", before);
+        const ch = try rig.onMount("chmod 600 d/z && echo ok");
+        gpa.free(ch);
+        const after = try b.onMount("stat -c %a d/z");
+        defer gpa.free(after);
+        try testing.expectEqualStrings("600\n", after);
+    }
+    {
+        const tb = try b.stats();
+        defer gpa.free(tb);
+        const ta = try rig.onMount("cat .stats");
+        defer gpa.free(ta);
+        const names_b = numberAfter(tb, "\"dlm_token_kernel_name_invals\":") orelse 0;
+        try testing.expect(names_b >= 4);
+        try testing.expectEqual(@as(?u64, 0), numberAfter(tb, "\"transport_notify_epochs_owed\":"));
+        try testing.expectEqual(@as(?u64, 0), numberAfter(ta, "\"transport_notify_epochs_owed\":"));
+        std.debug.print("smoke: coherence: B's recalled names {d}, epochs {d}; A's epochs sent {d}\n", .{ names_b, numberAfter(tb, "\"dlm_token_kernel_epochs\":") orelse 0, numberAfter(ta, "\"transport_notify_epochs_sent\":") orelse 0 });
+    }
+    try b.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try b.waitExit());
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+}
+
 /// The grant-plane row of `vol_tag` in a `.stats` text (`block_grant_holder`
 /// / `block_grant_writer`): the JSON from its `"vol_tag"` on, or null.
 fn grantRowOf(stats_text: []const u8, family: []const u8, tag_hex: []const u8) ?[]const u8 {

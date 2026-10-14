@@ -87,6 +87,15 @@ pub fn globalOfEffective(eff: u64) u64 {
     return inos.makeGlobalIno(eff, 0, inos.ROUTING_WIDTH);
 }
 
+/// `globalOfEffective` for an ino the KERNEL can know (decision 0003
+/// §AB.2's invalidations): null for a reserved local below the mint base
+/// (a control object no FUSE reply names), the root excepted.
+pub fn kernelGlobalOf(eff: u64) ?u64 {
+    const local = if (key.splitGuestLocal(eff)) |g| g.local else eff;
+    if (local != inos.ROOT_INO and local < inos.LOCAL_INO_BASE) return null;
+    return globalOfEffective(eff);
+}
+
 /// The routing slot of a key ino (native ⇒ slot 0; guest ⇒ its slot).
 pub fn slotOfEffective(eff: u64) u16 {
     if (key.splitGuestLocal(eff)) |g| return g.slot;

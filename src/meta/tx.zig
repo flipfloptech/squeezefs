@@ -136,6 +136,29 @@ pub const Staged = struct {
 /// decompose into NAMED committers (`meta_kv_commit_sites`).
 pub const Site = std.builtin.SourceLocation;
 
+/// A name a tx changes (decision 0003 §AB.2): the parent's key ino and the
+/// name (tx-arena bytes). The conveyor names it to every kernel that may
+/// cache it — the token readers' through the recall, this mount's own when
+/// the tx is not its kernel's.
+pub const NameNote = record.NameRef;
+
+/// The names one namespace op changes: a rename's two (a create, link,
+/// unlink, rmdir name one; an exchange or a whiteout re-names the same two).
+pub const NAME_NOTES_MAX = 2;
+
+/// The notes a tx carries into its queue entry. `overflow`: a dentry the
+/// notes do not name (a third name, an arena refusal) — its readers drop
+/// every dentry instead (FUSE_NOTIFY_INC_EPOCH).
+pub const NameNotes = struct {
+    buf: [NAME_NOTES_MAX]NameNote = undefined,
+    len: u8 = 0,
+    overflow: bool = false,
+
+    pub fn slice(self: *const NameNotes) []const NameNote {
+        return self.buf[0..self.len];
+    }
+};
+
 pub const KvTx = struct {
     arena: std.heap.ArenaAllocator,
     staged: std.ArrayList(Staged) = .empty,
@@ -153,6 +176,12 @@ pub const KvTx = struct {
     /// The tx mutates no record a read token carries (a control xattr on
     /// its own), so the conveyor pass recalls nothing for it.
     token_quiet: bool = false,
+    /// This mount's kernel asked for the change (a FUSE request) — or holds
+    /// nothing it changes (a forgotten corpse): its own dentry and attr
+    /// caches follow the reply. Any other origin — a peer's served step or
+    /// ship, a job, a tool — is invalidated in it (§AB.2).
+    kernel_origin: bool = false,
+    names: NameNotes = .{},
 
     /// `site` is the committer's `@src()`.
     pub fn init(gpa: Allocator, site: Site) KvTx {
@@ -169,6 +198,22 @@ pub const KvTx = struct {
 
     pub fn isEmpty(self: *const KvTx) bool {
         return self.staged.items.len == 0;
+    }
+
+    /// Note a name this tx changes (deduplicated: a rename's re-insert
+    /// names what its delete did).
+    pub fn noteName(self: *KvTx, parent: u64, name: []const u8) void {
+        for (self.names.slice()) |n| if (n.parent == parent and std.mem.eql(u8, n.name, name)) return;
+        if (self.names.len == NAME_NOTES_MAX) {
+            self.names.overflow = true;
+            return;
+        }
+        const copy = self.arena.allocator().dupe(u8, name) catch {
+            self.names.overflow = true;
+            return;
+        };
+        self.names.buf[self.names.len] = .{ .parent = parent, .name = copy };
+        self.names.len += 1;
     }
 
     /// Attach the op's held guard set; multi-commit ops hand the same set
@@ -366,6 +411,8 @@ pub const QueuedTx = struct {
     len: u64,
     class: AdmissionClass,
     token_quiet: bool,
+    kernel_origin: bool = false,
+    names: NameNotes = .{},
     site: Site,
     /// Never read, only owned: the hold IS the same-key exclusion. Released
     /// at the terminal outcome BEFORE the ack (a committer re-entering on
@@ -457,6 +504,8 @@ pub fn buildQueuedTx(tx: *KvTx, node_size: usize, diag: ?*BuildRefusal) BuildErr
     const staged = tx.staged.items;
     const class = tx.class;
     const token_quiet = tx.token_quiet;
+    const kernel_origin = tx.kernel_origin;
+    const names = tx.names;
     const site = tx.site;
     const door_bypass = tx.door_bypass;
     tx.* = undefined;
@@ -491,6 +540,8 @@ pub fn buildQueuedTx(tx: *KvTx, node_size: usize, diag: ?*BuildRefusal) BuildErr
         .len = len,
         .class = class,
         .token_quiet = token_quiet,
+        .kernel_origin = kernel_origin,
+        .names = names,
         .site = site,
         .guards = guards,
         .door_bypass = door_bypass,

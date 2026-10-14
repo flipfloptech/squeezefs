@@ -1602,3 +1602,50 @@ test "readdirMerged: a name the lazy migration MOVES between any two of the merg
         }
     }
 }
+
+test "readdirMerged: a reply WIDER than D's stream page lists a name the lazy migration moves mid-reply exactly once — D's page drains inside one reply, D refills, every stripe whose page reached past D's old range restarts from its last consumed cookie, and a name D's old snapshot already listed is in the restarted stripe's fresh snapshot (the shared hot directory row's C listing one name more than its `find`)" {
+    const gpa = testing.allocator;
+    const nk: key.NameKey = .init(0x5EED);
+    const D: u64 = 10;
+    var stripes: [K_MAX]u64 = @splat(0);
+    stripes[0] = 11;
+    stripes[1] = 12;
+    const map: StripeMap = .{ .dir = D, .k = 2, .stripes = stripes, .migrating = true };
+    var names: [40][8]u8 = undefined;
+    var name_slices: [40][]const u8 = undefined;
+    for (&names, &name_slices, 0..) |*b, *sl, i| sl.* = try std.fmt.bufPrint(b, "n{d:0>3}", .{i});
+    // Replies of 30 and 64 entries over stream pages of 10 and 21: D's 20
+    // names span two pages inside one reply.
+    for ([_]usize{ 30, 64 }) |max| {
+        var max_reads: u32 = 0;
+        for (name_slices, 0..) |moving, mi| {
+            if (mi % 2 == 0) continue;
+            var move_at: u32 = 1;
+            while (move_at <= max_reads + 2) : (move_at += 1) {
+                var src: MoveSource = .{ .gpa = gpa, .move_at = move_at, .moving = moving, .from = D, .to = map.routeName(moving, &nk).stripe };
+                defer src.deinit();
+                for (name_slices, 0..) |nm, i| {
+                    const rec: DirRec = .{ .cookie = key.encodeReaddirCookie(key.dentryNameHash54(nm, &nk), 0), .child = 100 + i, .file_type = 8, .name = nm };
+                    try src.put(if (i % 2 == 0) map.routeName(nm, &nk).stripe else D, rec);
+                }
+                var arena_state = std.heap.ArenaAllocator.init(gpa);
+                defer arena_state.deinit();
+                const arena = arena_state.allocator();
+                var seen: [40]u32 = @splat(0);
+                var offset: u64 = 0;
+                while (true) {
+                    var out: std.ArrayList(DirRec) = .empty;
+                    try readdirMerged(src.source(), arena, &map, offset, max, &out);
+                    if (out.items.len == 0) break;
+                    // The reply is in cookie order: its last cookie is the
+                    // exact continuation.
+                    for (out.items[1..], out.items[0 .. out.items.len - 1]) |b, a| try testing.expect(a.cookie < b.cookie);
+                    for (out.items) |r| seen[@intCast(r.child - 100)] += 1;
+                    offset = out.items[out.items.len - 1].cookie;
+                }
+                for (seen) |c| try testing.expectEqual(@as(u32, 1), c);
+                max_reads = @max(max_reads, src.reads);
+            }
+        }
+    }
+}

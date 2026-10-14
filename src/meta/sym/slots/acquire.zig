@@ -1383,6 +1383,43 @@ test "ReleaseSlot: the words are screened before any effect (a floor at the gran
     try testing.expectEqual(@as(u64, 10), g2.granted.grants[0].words.seq_floor);
 }
 
+test "a slot whose tree holds more images than one tree-0 value carries MOVES (0003 §AE.4): the grant's custody move of 1,500 scattered images — past the 1,039 runs one 64 KiB-node value carries — lands, the grantee's record holds every image, and the release takes every one back out" {
+    const gpa = testing.allocator;
+    const p = try TestPlane.init(gpa);
+    defer p.deinit();
+    const Images = struct {
+        /// Every other extent of [1000, 4000): 1,500 single-extent runs.
+        fn walk(_: *anyopaque, a: Allocator, _: u16, _: cr.Root, _: bool, out: *std.ArrayList(u64)) Error!void {
+            var e: u64 = 1000;
+            while (e < 4000) : (e += 2) try out.append(a, e);
+        }
+    };
+    p.verbs.seams.treeImages = &Images.walk;
+    // The slot's tree: unleased under a root (the manager's lease released).
+    const g = try p.verbs.acquireSlots(gpa, .{ .appender_id = 0, .explicit = &.{5} });
+    g.deinit(gpa);
+    const in_heap = p.tv.g.heap.start + 7 * p.tv.g.node_size;
+    const words: SlotWords = .{ .root = .{ .addr = in_heap, .seq = 5 }, .cursor = 40, .extents = 2, .seq_floor = 10 };
+    try testing.expectEqual(Verbs.ReleaseResult.released, try p.verbs.releaseSlot(gpa, .{ .appender_id = 0, .slot = 5, .g = 1, .words = words }));
+    // T1: the grant to appender 2 (a wire lessee) carries every image.
+    const in0 = manager.stats.extent_grant_images_transferred_in.load();
+    const out = try p.verbs.acquireSlots(gpa, .{ .appender_id = 2, .explicit = &.{5} });
+    defer out.deinit(gpa);
+    try testing.expectEqual(@as(usize, 1), out.granted.grants.len);
+    try testing.expect(p.state(5).?.variant == .leased and p.state(5).?.appender_id == 2);
+    try testing.expectEqual(in0 + 1500, manager.stats.extent_grant_images_transferred_in.load());
+    {
+        const rec = cr.decodeExtentGrant(p.tv.get(cr.extentGrantKey(2).slice()).?) catch unreachable;
+        var e: u64 = 1000;
+        while (e < 4000) : (e += 1) try testing.expectEqual(e % 2 == 0, rec.contains(e));
+    }
+    // T5: the release takes every image back out.
+    const out0 = manager.stats.extent_grant_images_transferred_out.load();
+    try testing.expectEqual(Verbs.ReleaseResult.released, try p.verbs.releaseSlot(gpa, .{ .appender_id = 2, .slot = 5, .g = out.granted.grants[0].g, .words = .{ .root = words.root, .cursor = 41, .extents = 2, .seq_floor = 11 } }));
+    try testing.expectEqual(out0 + 1500, manager.stats.extent_grant_images_transferred_out.load());
+    try testing.expect(p.tv.get(cr.extentGrantKey(2).slice()) == null);
+}
+
 test "ReleaseSlot past the inline cap SPILLS (rung 10 item 5b): 1,100 tails at the 64 KiB node (cap 1,039) land in one claimed extent named by a spilled record with the extent's alloc delta in the SAME entry; the RAM index holds every tail; the next release of the slot with a small set goes inline and gives the spill extent back (the free delta, the bit)" {
     const gpa = testing.allocator;
     const p = try TestPlane.init(gpa);

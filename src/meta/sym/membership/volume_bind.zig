@@ -947,10 +947,10 @@ pub const VolumeBinding = struct {
     // ---- the returns ----
 
     /// Through the manager's own verb (the record minus the runs, one
-    /// `free(retire 0)` delta per extent), then the RAM bits released: a
-    /// retire-0 free is immediately reusable (the leave's own order). Only
-    /// what the record names leaves it, and exactly those bits clear: an
-    /// extent the record does not name is not the dead grant's to give.
+    /// `free(retire 0)` delta per extent, the RAM bits released when the
+    /// entry lands — the verb's law). Only what the record names leaves it,
+    /// and exactly those bits clear: an extent the record does not name is
+    /// not the dead grant's to give.
     fn returnExtentsFn(ctx: *anyopaque, extents: []const u64) Error!void {
         const self = self_(ctx);
         if (extents.len == 0) return;
@@ -974,7 +974,6 @@ pub const VolumeBinding = struct {
             stats.recovery_return_mismatches.fire("a dead grant's return cleared other than the extents its record named");
             return error.Corrupt;
         }
-        for (named.items) |e| self.be.alloc.releaseUnpublished(e);
     }
 
     /// A released region's ring back to the heap (the leave's own order:

@@ -1233,11 +1233,16 @@ pub const Manager = struct {
         }
         var recs: std.ArrayList(ControlRecord) = .empty;
         defer recs.deinit(self.gpa);
-        var e = (p.start - g.heap.start) / g.node_size;
-        const end = e + p.len / g.node_size;
+        const first = (p.start - g.heap.start) / g.node_size;
+        const end = first + p.len / g.node_size;
+        var e = first;
         while (e < end) : (e += 1) try recs.append(self.gpa, .{ .free = e });
         try recs.append(self.gpa, .{ .put = .{ .key = cr.appenderHintKey(stable).slice(), .value = &hv } });
         try self.control(recs.items);
+        // The entry journals the frees; the heap gets the bits back now
+        // (decision 0003 §AI.1).
+        e = first;
+        while (e < end) : (e += 1) self.vol.vt.releaseUnpublished(self.vol.ctx, e);
         stats.appender_pending_segments_returned.inc();
     }
 
@@ -1436,7 +1441,11 @@ pub const Manager = struct {
     /// `coalesce` (bounded by the frame) → `∩ record` (bounded by the
     /// record) → the own-region RAM screen → ONE control entry: `free(extent,
     /// retire 0)` + the record WITHOUT them (the chunks the hits touch
-    /// rewritten). `cleared + already ≡ named`.
+    /// rewritten) → the RAM bits released: the entry only JOURNALS the
+    /// deltas, and a retire-0 free is immediately reusable (the appender's
+    /// own tail covered its retirement) — without the release every extent
+    /// a joiner hands back stays allocated until the next mount (decision
+    /// 0003 §AI.1). `cleared + already ≡ named`.
     fn returnInner(self: *Manager, appender_id: u32, runs: []GrantRun, rec: *GrantRecord) VerbError!Returned {
         const coalesced = grant.coalesceRuns(runs);
         var named: u64 = 0;
@@ -1470,6 +1479,10 @@ pub const Manager = struct {
             while (e < r.end()) : (e += 1) try recs.append(self.gpa, .{ .free = e });
         }
         try self.commitRecord(appender_id, rec, rest.items, recs.items);
+        for (hit.items) |r| {
+            var e = r.start;
+            while (e < r.end()) : (e += 1) self.vol.vt.releaseUnpublished(self.vol.ctx, e);
+        }
         stats.extent_returns.inc();
         stats.extent_grant_returned.add(cleared);
         return .{ .cleared = cleared, .already = named - cleared };
@@ -2293,14 +2306,13 @@ test "grants: the manager never grants itself; want is screened against the heap
     try testing.expectEqual(refusals_before + 1, stats.manager_verb_refusals.load());
 }
 
-test "a joiner's returns reach the manager's FREE heap when their entry lands (decision 0003 §AI.1) — a mid-life ReturnExtents, the leave's unclaimed runs, the next join's residue and a GrowRing segment no page names each release their extents from the RAM allocator (the product's control entry only journals the free deltas): four join → top-up → return → leave cycles over a heap of 64 extents end every cycle at the baseline — the journaled-only frees held each cycle's grant until the next mount (the rejoin row's heap full)" {
+test "a joiner's returns reach the manager's FREE heap when their entry lands (decision 0003 §AI.1) — a mid-life ReturnExtents, the leave's unclaimed runs, the next join's residue and a GrowRing segment no page names each release their extents from the RAM allocator (the product's control entry only journals the free deltas): four join → top-up → return → leave cycles end every cycle at the heap's baseline — the journaled-only frees held each cycle's grant until the next mount (the rejoin row's heap full)" {
     const gpa = testing.allocator;
     const node: u64 = 65_536;
-    // 64 extents: a ring of 8 or 16 (the floor at 64 KiB, the hinted
-    // growth), the pool floor's 12 (8 + mint_slots 4) topped up to 24 —
-    // under 40 a cycle, so a heap that never gets its returns back is
-    // exhausted by the third join.
-    const tv = try TestVolume.init(gpa, 1 << 30, node, 64);
+    // 512 extents: the ring budget (heap / 16 = 2 MiB) admits the hinted
+    // ring of 16 extents after the growth; a cycle holds a ring of 8 or 16
+    // and the pool floor's 12 (8 + mint_slots 4) topped up to 24.
+    const tv = try TestVolume.init(gpa, 1 << 30, node, 512);
     defer tv.deinit();
     try tv.liveManagerPage();
     var m = newManager(gpa, tv);

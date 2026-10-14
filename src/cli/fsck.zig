@@ -155,8 +155,11 @@ const linux_arm = if (is_linux) struct {
             if (kvs.items.len == 0) return error.NothingToInject;
             const k = try key.BlockRefKey.decode(kvs.items[0].key);
             const t = try be.begin(@src());
-            errdefer be.abandon(t);
-            try block_refs.stageOps(t, &.{block_refs.taken(.{ .vol_tag = k.volTag(), .block_idx = k.blockIdx(), .owner_ino = k.ownerIno(), .block_index = k.blockIndex() +| 1000 })});
+            {
+                errdefer be.abandon(t);
+                // 1000 past the reference's block index: an index no layout names.
+                try block_refs.stageOps(t, &.{block_refs.taken(.{ .vol_tag = k.volTag(), .block_idx = k.blockIdx(), .owner_ino = k.ownerIno(), .block_index = k.blockIndex() +| 1000 })});
+            }
             try be.commit(t);
             return;
         }
@@ -170,8 +173,10 @@ const linux_arm = if (is_linux) struct {
             const dv = record.DentryValue.decode(kv.value) catch continue;
             if (dv.file_type != economy.ftByte(economy.S.IFREG)) continue;
             const t = try be.begin(@src());
-            errdefer be.abandon(t);
-            try t.stageDelete(key.TREE_DENTRIES, kv.key);
+            {
+                errdefer be.abandon(t);
+                try t.stageDelete(key.TREE_DENTRIES, kv.key);
+            }
             try be.commit(t);
             return;
         }

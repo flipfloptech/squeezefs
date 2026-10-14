@@ -14,6 +14,7 @@ const Io = std.Io;
 const testing = std.testing;
 const errors = @import("../../../core/errors.zig");
 const clock = @import("../../../core/clock.zig");
+const log = @import("../../../core/log.zig");
 const verbs = @import("../../../wire/verbs.zig");
 const service = @import("../../../wire/service.zig");
 const loopback = @import("../../../wire/loopback.zig");
@@ -55,6 +56,9 @@ pub const HolderStore = struct {
     leased: std.ArrayListUnmanaged(u16) = .empty,
     refusals: u32 = 0,
     commits: u32 = 0,
+    /// The next N commits fail as a device EIO would (the tx consumed,
+    /// nothing applied).
+    fail_commits: u32 = 0,
     /// The commits the last barrier covered (what a crash keeps).
     durable: u32 = 0,
 
@@ -80,6 +84,11 @@ pub const HolderStore = struct {
     }
 
     pub fn commit(self: *HolderStore, t: *tx.KvTx) StoreError!void {
+        if (self.fail_commits > 0) {
+            self.fail_commits -= 1;
+            self.mem.abandon(t);
+            return error.Io;
+        }
         for (t.staged.items) |s| {
             const fs = key.slotTreeKeySlot(s.key) catch return error.Io;
             const slot = route_table.slotOfForestSlot(fs);
@@ -502,6 +511,50 @@ test "a ship that fails leaves the intent OPEN (abandoned on the register, never
     const passes = ops.stats.xv_cadence_passes.load();
     try testing.expectEqual(@as(u32, 0), try f.a.plane.cadenceTick(clock.monotonicNs()));
     try testing.expectEqual(passes, ops.stats.xv_cadence_passes.load());
+}
+
+test "an intent whose step-0 commit fails EIO (the record never durable) leaves NOTHING on the register — never an abandoned ghost only a cadence scan reconciles: an op the move gate re-issued against a failing device minted one per attempt and the 1,025th overran the register's reserved map (`integer overflow`, a panic in a handler); a full register refuses the insert (Deferred), counted" {
+    const gpa = testing.allocator;
+    const f = try TwoHolders.init(gpa, testing.io, .{}, .{});
+    defer f.deinit();
+    try f.b.seedDir(DIR_B);
+    const s0 = Snapshot.take();
+    // Twice the register's reservation: every attempt fails at step 0.
+    const attempts = 2 * f.a.plane.register.capacity;
+    f.a.store.fail_commits = attempts;
+    // Each attempt's local step-0 device error is the fail-stop class's
+    // tripwire (counted every time, logged once per site per second).
+    const esc0 = ops.stats.xv_midplan_escalations.load();
+    ops.stats.xv_midplan_escalations.resetLogBudgetForTest();
+    log.testing.expectErrorLogs(attempts);
+    const t0_s = clock.realtimeCoarseS();
+    for (0..attempts) |_| {
+        try testing.expectError(error.Io, f.a.create(DIR_B, "f", S.IFREG | 0o644));
+        try testing.expectEqual(@as(usize, 0), f.a.plane.register.count());
+    }
+    const logged = log.testing.capturedErrorLogs();
+    log.testing.expectErrorLogs(0);
+    try testing.expect(logged >= 1 and logged <= clock.realtimeCoarseS() - t0_s + 1);
+    try testing.expectEqual(esc0 + attempts, ops.stats.xv_midplan_escalations.load());
+    try testing.expect(!f.a.plane.register.anyAbandoned());
+    try testing.expect((try f.b.dentry(DIR_B, "f")) == null);
+    try f.closureHolds(s0.minted, s0.retired, s0.open);
+    // The device back: the op lands, one intent minted and retired.
+    _ = try f.a.create(DIR_B, "f", S.IFREG | 0o644);
+    try testing.expect((try f.b.dentry(DIR_B, "f")) != null);
+    try f.noOpenIntents();
+    // A register at its reservation refuses the next insert, never overruns.
+    var r = try intent.Register.init(gpa, testing.io, 2);
+    defer r.deinit(gpa);
+    try r.noteInFlight(1, 0, 0);
+    try r.noteInFlight(2, 0, 0);
+    const full0 = intent.stats.xv_register_full_refusals.load();
+    try testing.expectError(error.RegisterFull, r.noteInFlight(3, 0, 0));
+    try testing.expectError(error.RegisterFull, r.adopt(4, 0, 0));
+    try r.adopt(2, 0, 0);
+    try testing.expectEqual(full0 + 2, intent.stats.xv_register_full_refusals.load());
+    r.forget(1);
+    r.forget(2);
 }
 
 test "an abandoned create whose name a retry took meanwhile is COMPENSATED by the roll-forward (found by the shared hot directory row: fsck C9 found a live inode named by no dentry after kill -9 of a stripes' holder — a create's ship failed against the corpse, the shell retried the SAME name and won it after the recovery, and the roll-forward skipped the refused insert and retired, orphaning the first attempt's child): the minted child destroyed, the intent retired, the retry's name intact, counted" {

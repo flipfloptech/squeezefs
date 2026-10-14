@@ -4130,9 +4130,11 @@ const SettlingData = struct {
         const store = self.store.?;
         const entries = [_]layout.MapEntryWire{(layout.MapEntry{ .block = 0, .mapping = m }).encode()};
         const t = try store.begin(@src());
-        errdefer store.abandon(t);
-        const proof: layout.DmaProof = .{ .vol_tag = m.vol_tag, .offset = m.offset, .len = layout.DEFAULT_CHUNK, .completed_ns = 1 };
-        try layout.publishLayout(t, .{ .ino = ino, .name_key = store.nameKey(), .prev = prev, .layout = Layout.stripedInline(size, &entries), .proofs = &.{proof} }, self.refsSeam(), .default);
+        {
+            errdefer store.abandon(t);
+            const proof: layout.DmaProof = .{ .vol_tag = m.vol_tag, .offset = m.offset, .len = layout.DEFAULT_CHUNK, .completed_ns = 1 };
+            try layout.publishLayout(t, .{ .ino = ino, .name_key = store.nameKey(), .prev = prev, .layout = Layout.stripedInline(size, &entries), .proofs = &.{proof} }, self.refsSeam(), .default);
+        }
         try store.commit(t);
     }
 

@@ -406,8 +406,10 @@ pub const Guard = struct {
 
     fn commitClaim(g: *Guard) backend.OpenError!void {
         const t = try g.be.begin(@src());
-        errdefer g.be.abandon(t);
-        try g.stageClaimPut(t, g.ourClaim());
+        {
+            errdefer g.be.abandon(t);
+            try g.stageClaimPut(t, g.ourClaim());
+        }
         g.be.commit(t) catch |e| {
             log.err("meta volume {s}: the writer claim could not be committed ({s}) — refusing the mount", .{ g.be.path, @errorName(e) });
             return mapCommit(e);
@@ -452,8 +454,10 @@ pub const Guard = struct {
             .stale_foreign => |c| c,
         };
         const t = try g.be.begin(@src());
-        errdefer g.be.abandon(t);
-        try t.stageDelete(key.TREE_XATTRS, &g.xkey);
+        {
+            errdefer g.be.abandon(t);
+            try t.stageDelete(key.TREE_XATTRS, &g.xkey);
+        }
         g.be.commit(t) catch |e| return mapCommit(e);
         try g.barrier();
         guard.stats.clear_cleared.inc();
@@ -1385,6 +1389,23 @@ test "THE FENCE LATCH on the device path: an injected reservation conflict on (a
         try testing.expectEqual(@as(u32, 0), journal_lane.test_seams.fail_barriers.load(.acquire));
         try testing.expectEqual(@as(u32, 0), device_loader.test_seams.fail_barriers.load(.acquire));
     }
+}
+
+test "the writer claim's commit failing EIO at open refuses the mount loud (Io), its transaction freed exactly once — `commit` consumes the tx on every path, so the staging errdefer must not span it (the handover move matrix crashed through a freed guard set under a device EIO)" {
+    const gpa = testing.allocator;
+    const v = try Vol.create(gpa, "claim-eio", "600000");
+    defer v.destroy();
+    journal_lane.test_seams.fail_windows.store(1, .release);
+    defer journal_lane.test_seams.fail_windows.store(0, .release);
+    // The refusal's one line, on this thread.
+    log.testing.expectErrorLogs(1);
+    try testing.expectError(error.Io, v.open(.{ .test_identity = ident(boot_a, 4000, 777), .test_pid_probe = PidTable.probe }, 0));
+    try log.testing.expectAllFired();
+    try testing.expectEqual(@as(u32, 0), journal_lane.test_seams.fail_windows.load(.acquire));
+    // Nothing landed: the next open claims the volume.
+    try testing.expectEqual(@as(?claim.Claim, null), try v.probe());
+    const be = try v.open(.{ .test_identity = ident(boot_a, 4000, 777), .test_pid_probe = PidTable.probe }, 0);
+    be.close();
 }
 
 test "a generic (EIO) barrier failure is NOT the fence: three in a row latch FAILED (not fenced) with a success reset in between" {

@@ -178,8 +178,10 @@ pub const Engine = struct {
         try self.q.putRecord(.c1, "record-value", v);
         if (self.hook(f)) return .{ .refused = "aborted after the quarantine (re-detected next run)" };
         const t = try host.store.begin(@src());
-        errdefer host.store.abandon(t);
-        try t.stageDelete(kind, k.slice());
+        {
+            errdefer host.store.abandon(t);
+            try t.stageDelete(kind, k.slice());
+        }
         try host.store.commit(t);
         return .{ .applied = "deleted after quarantine" };
     }
@@ -331,8 +333,10 @@ pub const Engine = struct {
         for (plan.releases) |r| try self.q.putRecord(.c8, "block-ref", &r.encodeKey());
         if (self.hook(f)) return .{ .refused = "aborted after the quarantine (re-detected next run)" };
         const t = try host.store.begin(@src());
-        errdefer host.store.abandon(t);
-        try block_refs.stageRepair(t, plan);
+        {
+            errdefer host.store.abandon(t);
+            try block_refs.stageRepair(t, plan);
+        }
         try host.store.commit(t);
         return .{ .applied = "stale durable references released (one-directional)" };
     }
@@ -386,9 +390,11 @@ pub const Engine = struct {
         }
         if (self.hook(f)) return .{ .refused = "aborted after the quarantine (re-detected next run)" };
         const t = try host.store.begin(@src());
-        errdefer host.store.abandon(t);
-        for (binds.items) |b| try block_refs.stageOps(t, &.{block_refs.released(.{ .vol_tag = b.mapping.vol_tag, .block_idx = b.mapping.blockIdx(host.geo.chunk), .owner_ino = kino, .block_index = b.block_index })});
-        try inos.stageDestroy(t, kino, xkeys.items);
+        {
+            errdefer host.store.abandon(t);
+            for (binds.items) |b| try block_refs.stageOps(t, &.{block_refs.released(.{ .vol_tag = b.mapping.vol_tag, .block_idx = b.mapping.blockIdx(host.geo.chunk), .owner_ino = kino, .block_index = b.block_index })});
+            try inos.stageDestroy(t, kino, xkeys.items);
+        }
         try host.store.commit(t);
         for (binds.items) |b| if (host.volume(b.mapping.vol_tag)) |vol| {
             const idx = b.mapping.blockIdx(host.geo.chunk);
@@ -433,8 +439,10 @@ pub const Engine = struct {
         if (self.hook(f)) return .{ .refused = "aborted after the quarantine (re-detected next run)" };
         v.nlink = names;
         const t = try host.store.begin(@src());
-        errdefer host.store.abandon(t);
-        try t.stagePut(key.TREE_INODES, &key.inodeKey(kino), &v.encode());
+        {
+            errdefer host.store.abandon(t);
+            try t.stagePut(key.TREE_INODES, &key.inodeKey(kino), &v.encode());
+        }
         try host.store.commit(t);
         if (!lowering) self.census_stale = true;
         return .{ .applied = if (lowering) "nlink lowered to the counted names" else "nlink raised to the counted names" };
@@ -459,8 +467,10 @@ pub const Engine = struct {
         try self.q.putRecord(.c10, "dentry-value", v);
         if (self.hook(f)) return .{ .refused = "aborted after the quarantine (re-detected next run)" };
         const t = try host.store.begin(@src());
-        errdefer host.store.abandon(t);
-        try t.stageDelete(key.TREE_DENTRIES, &dk);
+        {
+            errdefer host.store.abandon(t);
+            try t.stageDelete(key.TREE_DENTRIES, &dk);
+        }
         try host.store.commit(t);
         return .{ .applied = "dangling dentry removed after quarantine" };
     }
@@ -518,11 +528,18 @@ pub const Engine = struct {
         try self.quarantineBlockBytes(f.class(), vol_tag, idx);
         if (self.hook(f)) return .{ .refused = "aborted after the quarantine (re-detected next run)" };
         const t = try host.store.begin(@src());
-        errdefer host.store.abandon(t);
-        layout.publishLayout(t, .{ .ino = ino, .name_key = host.name_key, .coll_seq = rec.coll_seq, .prev = rec.layout, .layout = flipped, .proofs = &.{} }, classes.refs_seam, host.geo) catch |e| return switch (e) {
-            error.OutOfMemory => error.OutOfMemory,
-            else => .{ .refused = "the flipped layout was refused by the publish law" },
-        };
+        {
+            errdefer host.store.abandon(t);
+            layout.publishLayout(t, .{ .ino = ino, .name_key = host.name_key, .coll_seq = rec.coll_seq, .prev = rec.layout, .layout = flipped, .proofs = &.{} }, classes.refs_seam, host.geo) catch |e| switch (e) {
+                error.OutOfMemory => return error.OutOfMemory,
+                // A refusal is an outcome, not an error: the errdefer does
+                // not run, so the tx goes here.
+                else => {
+                    host.store.abandon(t);
+                    return .{ .refused = "the flipped layout was refused by the publish law" };
+                },
+            };
+        }
         try host.store.commit(t);
         return .{ .applied = "mapping flipped to DAMAGED after quarantine (reads EIO; the block stays for forensics)" };
     }

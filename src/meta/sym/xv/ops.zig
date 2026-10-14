@@ -564,7 +564,7 @@ pub fn Plane(comptime Store: type) type {
         pub fn executeHeld(self: *Self, plan: *const Plan, scope: guards.Scope, now: u64, held: ?*?HeldOpen) Error!Done {
             var reg: Registered = .{};
             return self.executeInner(plan, scope, now, &reg) catch |e| {
-                if (reg.home) |home| self.leaveOpen(home, reg.tx_id, reg.durable and retryableStep(e), held);
+                if (reg.home) |home| self.leaveOpen(home, reg.tx_id, reg.durable, reg.durable and retryableStep(e), held);
                 return e;
             };
         }
@@ -588,8 +588,9 @@ pub fn Plane(comptime Store: type) type {
             const home = self.intentHomeFor(plan.steps[0]);
             const t1 = clock.monotonicNs();
             stats.xv_cross_owner_phase_plan.record(t1 - t0);
-            // Step 0 + the intent, then the initiator's barrier.
-            self.register.noteInFlight(tx_id, home, t0);
+            // Step 0 + the intent, then the initiator's barrier. A full
+            // register is the cadence's backlog: nothing exists yet.
+            self.register.noteInFlight(tx_id, home, t0) catch return error.Deferred;
             reg.* = .{ .home = home, .tx_id = tx_id };
             const rider: applier.Rider = .{ .put = .{ .home = home, .tx_id = tx_id, .image = image } };
             var first: usize = 0;
@@ -682,7 +683,12 @@ pub fn Plane(comptime Store: type) type {
         /// kept for the live op's re-issue when `keep` (durable, a
         /// retryable failure, a `held` slot to name it in), else the
         /// cadence's.
-        fn leaveOpen(self: *Self, home: u64, tx_id: u64, keep: bool, held: ?*?HeldOpen) void {
+        fn leaveOpen(self: *Self, home: u64, tx_id: u64, durable: bool, keep: bool, held: ?*?HeldOpen) void {
+            // A record that never landed has nothing to roll forward: the
+            // register forgets it (an abandoned ghost is reconciled only by
+            // a cadence scan, and an op the move gate re-issues against a
+            // failing device mints one per attempt).
+            if (!durable) return self.register.forget(tx_id);
             if (keep) if (held) |h| {
                 h.* = .{ .home = home, .tx_id = tx_id };
                 stats.xv_held_open.inc();
@@ -992,11 +998,13 @@ pub fn Plane(comptime Store: type) type {
                 // Adoption by register STATE, never by elapsed time: a live
                 // op's intent is its own however long it runs; one the
                 // register never saw (another incarnation's) is adopted.
+                // A full register ends this home's pass: the records stay
+                // durable and the next cadence pass adopts them.
                 switch (pass) {
-                    .mount => self.register.adopt(id, home, now),
+                    .mount => self.register.adopt(id, home, now) catch break,
                     .cadence => if (self.register.stateOf(id)) |st| {
                         if (st == .in_flight) continue;
-                    } else self.register.adopt(id, home, now),
+                    } else self.register.adopt(id, home, now) catch break,
                 }
                 self.register.noteTaken(id);
                 self.recoverOne(home, id, now) catch |e| {

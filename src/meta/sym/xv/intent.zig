@@ -338,6 +338,11 @@ pub const stats = struct {
     /// slot's dead holder is evicted and its slot recovered inside it.
     pub var xv_cross_owner_intents_stuck: counters.Gauge = .{};
     pub var xv_cross_owner_intent_stuck: counters.Tripwire = .init("xv_cross_owner_intent_stuck");
+    /// Inserts the full register refused (`Deferred` to the op — the
+    /// cadence's backlog is the backpressure; the adoption resumes at the
+    /// next pass). Never a hash-map overrun: a failing device once filled
+    /// it with ghosts of intents that never became durable.
+    pub var xv_register_full_refusals: counters.ShardedCounter = .{};
 };
 
 /// `stuck_grace = T_owner` (45 s): a slot's dead holder is evicted and its
@@ -363,11 +368,22 @@ pub const Register = struct {
     io: Io,
     lock: sync.Mutex = .init,
     map: std.AutoHashMapUnmanaged(u64, Entry) = .empty,
+    /// The entries `init` reserved room for: an insert past it refuses.
+    capacity: u32,
+
+    pub const InsertError = error{RegisterFull};
 
     pub fn init(gpa: Allocator, io: Io, capacity: u32) Allocator.Error!Register {
-        var r: Register = .{ .io = io };
+        var r: Register = .{ .io = io, .capacity = capacity };
         try r.map.ensureTotalCapacity(gpa, capacity);
         return r;
+    }
+
+    /// Under the lock: room for one more new entry.
+    fn admitLocked(self: *Register) InsertError!void {
+        if (self.map.count() < self.capacity) return;
+        stats.xv_register_full_refusals.inc();
+        return error.RegisterFull;
     }
 
     pub fn deinit(self: *Register, gpa: Allocator) void {
@@ -376,9 +392,10 @@ pub const Register = struct {
 
     /// Registered IN FLIGHT before the record exists: a cadence scan that
     /// sees the record always finds its owner.
-    pub fn noteInFlight(self: *Register, tx_id: u64, home: u64, now_ns: u64) void {
+    pub fn noteInFlight(self: *Register, tx_id: u64, home: u64, now_ns: u64) InsertError!void {
         self.lock.lockUncancelable(self.io);
         defer self.lock.unlock(self.io);
+        try self.admitLocked();
         self.map.putAssumeCapacity(tx_id, .{ .since_ns = now_ns, .state = .in_flight, .counted = false, .home = home });
     }
 
@@ -394,7 +411,7 @@ pub const Register = struct {
     }
 
     /// Adopted by a roll-forward scan: counted at adoption, abandoned.
-    pub fn adopt(self: *Register, tx_id: u64, home: u64, now_ns: u64) void {
+    pub fn adopt(self: *Register, tx_id: u64, home: u64, now_ns: u64) InsertError!void {
         self.lock.lockUncancelable(self.io);
         defer self.lock.unlock(self.io);
         if (self.map.getPtr(tx_id)) |e| {
@@ -405,6 +422,7 @@ pub const Register = struct {
             }
             return;
         }
+        try self.admitLocked();
         self.map.putAssumeCapacity(tx_id, .{ .since_ns = now_ns, .state = .abandoned, .counted = true, .home = home });
         stats.xv_cross_owner_intents_minted.inc();
         stats.xv_cross_owner_intents_open.add(1);
@@ -670,17 +688,17 @@ test "the register: minted ≡ retired + open; in-flight → durable → retired
     const minted0 = stats.xv_cross_owner_intents_minted.load();
     const retired0 = stats.xv_cross_owner_intents_retired.load();
     const open0 = stats.xv_cross_owner_intents_open.load();
-    r.noteInFlight(10, 0, 1000);
+    try r.noteInFlight(10, 0, 1000);
     try testing.expectEqual(IntentState.in_flight, r.stateOf(10).?);
     try testing.expectEqual(minted0, stats.xv_cross_owner_intents_minted.load());
     r.noteDurable(10);
     r.noteDurable(10);
     try testing.expectEqual(minted0 + 1, stats.xv_cross_owner_intents_minted.load());
     try testing.expectEqual(open0 + 1, stats.xv_cross_owner_intents_open.load());
-    r.noteInFlight(12, 0, 1000);
+    try r.noteInFlight(12, 0, 1000);
     r.noteDurable(12);
     r.noteAbandoned(12);
-    r.noteInFlight(11, 0, 1000);
+    try r.noteInFlight(11, 0, 1000);
     r.noteDurable(11);
     r.noteAbandoned(11);
     try testing.expect(r.anyAbandoned());
@@ -691,7 +709,7 @@ test "the register: minted ≡ retired + open; in-flight → durable → retired
     try testing.expectEqual(@as(?IntentState, null), r.stateOf(12));
     try testing.expectEqual(retired0 + 1, stats.xv_cross_owner_intents_retired.load());
     // An uncounted in-flight entry forgotten counts nothing.
-    r.noteInFlight(13, 0, 1000);
+    try r.noteInFlight(13, 0, 1000);
     r.forget(13);
     try testing.expectEqual(retired0 + 1, stats.xv_cross_owner_intents_retired.load());
     // Taken back by the live op.
@@ -712,8 +730,8 @@ test "the register: minted ≡ retired + open; in-flight → durable → retired
     r.publish(2000 + STUCK_GRACE_NS);
     try testing.expectEqual(@as(u64, 0), stats.xv_cross_owner_intents_stuck.load());
     // Adoption counts once and lands abandoned.
-    r.adopt(20, 0, 5);
-    r.adopt(20, 0, 5);
+    try r.adopt(20, 0, 5);
+    try r.adopt(20, 0, 5);
     try testing.expectEqual(IntentState.abandoned, r.stateOf(20).?);
     r.forget(20);
     const minted = stats.xv_cross_owner_intents_minted.load() - minted0;

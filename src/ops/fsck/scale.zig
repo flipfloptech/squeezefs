@@ -61,10 +61,12 @@ const Dir = struct {
         for (&d.stripes) |*s| s.* = set.globalIno(try set.allocateIno(dir_eff, false, false));
         try stripe.writeStripeRecords(meta_set.MetaSet, set, &d.stripes, .{ .mode = economy.S.IFDIR | 0o755, .uid = 0, .gid = 0, .ts_ns = 1000 });
         const t = try set.begin(@src());
-        errdefer set.abandon(t);
-        var names: [stripe.K_MAX][stripe.MARKER_NAME_LEN]u8 = undefined;
-        for (d.stripes, 0..) |s, i| try putName(set, t, dir_eff, stripe.markerName(@intCast(i), &names[i]), s);
-        try putName(set, t, dir_eff, stripe.STRIPED, d.stripes[0]);
+        {
+            errdefer set.abandon(t);
+            var names: [stripe.K_MAX][stripe.MARKER_NAME_LEN]u8 = undefined;
+            for (d.stripes, 0..) |s, i| try putName(set, t, dir_eff, stripe.markerName(@intCast(i), &names[i]), s);
+            try putName(set, t, dir_eff, stripe.STRIPED, d.stripes[0]);
+        }
         try set.commit(t);
         return d;
     }

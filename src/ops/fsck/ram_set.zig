@@ -215,12 +215,14 @@ pub const RamSet = struct {
     pub fn mkdir(self: *RamSet, parent: u64, name: []const u8) !u64 {
         const l = self.mint();
         const t = try self.mem.begin(@src());
-        errdefer self.mem.abandon(t);
-        try self.putInode(t, l, .{ .mode = economy.S.IFDIR | 0o755, .nlink = 2, .ctime = 7 });
-        try self.putDentry(t, local(parent), name, global(l), economy.S.IFDIR);
-        var pv = (try self.readInode(local(parent))).?;
-        pv.nlink += 1;
-        try self.putInode(t, local(parent), pv);
+        {
+            errdefer self.mem.abandon(t);
+            try self.putInode(t, l, .{ .mode = economy.S.IFDIR | 0o755, .nlink = 2, .ctime = 7 });
+            try self.putDentry(t, local(parent), name, global(l), economy.S.IFDIR);
+            var pv = (try self.readInode(local(parent))).?;
+            pv.nlink += 1;
+            try self.putInode(t, local(parent), pv);
+        }
         try self.commitTx(t);
         return global(l);
     }
@@ -233,22 +235,24 @@ pub const RamSet = struct {
     pub fn mkfile(self: *RamSet, parent: u64, name: []const u8, vol_tag: u64, blocks: []const u64) !u64 {
         const l = self.mint();
         const t = try self.mem.begin(@src());
-        errdefer self.mem.abandon(t);
-        try self.putInode(t, l, .{ .mode = economy.S.IFREG | 0o644, .nlink = 1, .size = CHUNK * blocks.len, .ctime = 7 });
-        try self.putDentry(t, local(parent), name, global(l), economy.S.IFREG);
-        var entries: std.ArrayList(layout.MapEntryWire) = .empty;
-        defer entries.deinit(self.gpa);
-        var proofs: std.ArrayList(layout.DmaProof) = .empty;
-        defer proofs.deinit(self.gpa);
-        for (blocks, 0..) |b, i| {
-            const m = layout.Mapping.wholeBlock(vol_tag, b * CHUNK, 0);
-            try entries.append(self.gpa, (layout.MapEntry{ .block = @intCast(i), .mapping = m }).encode());
-            try proofs.append(self.gpa, .{ .vol_tag = vol_tag, .offset = b * CHUNK, .len = CHUNK, .completed_ns = 1 });
-            self.trackBlock(vol_tag, b);
-            @memset(self.devs[if (vol_tag == VOL_A) 0 else 1][@intCast(b * CHUNK)..][0..@intCast(CHUNK)], @truncate(b + 1));
+        {
+            errdefer self.mem.abandon(t);
+            try self.putInode(t, l, .{ .mode = economy.S.IFREG | 0o644, .nlink = 1, .size = CHUNK * blocks.len, .ctime = 7 });
+            try self.putDentry(t, local(parent), name, global(l), economy.S.IFREG);
+            var entries: std.ArrayList(layout.MapEntryWire) = .empty;
+            defer entries.deinit(self.gpa);
+            var proofs: std.ArrayList(layout.DmaProof) = .empty;
+            defer proofs.deinit(self.gpa);
+            for (blocks, 0..) |b, i| {
+                const m = layout.Mapping.wholeBlock(vol_tag, b * CHUNK, 0);
+                try entries.append(self.gpa, (layout.MapEntry{ .block = @intCast(i), .mapping = m }).encode());
+                try proofs.append(self.gpa, .{ .vol_tag = vol_tag, .offset = b * CHUNK, .len = CHUNK, .completed_ns = 1 });
+                self.trackBlock(vol_tag, b);
+                @memset(self.devs[if (vol_tag == VOL_A) 0 else 1][@intCast(b * CHUNK)..][0..@intCast(CHUNK)], @truncate(b + 1));
+            }
+            const lay = layout.Layout.stripedInline(CHUNK * blocks.len, entries.items);
+            try layout.publishLayout(t, .{ .ino = l, .name_key = self.mem.nameKey(), .prev = null, .layout = lay, .proofs = proofs.items }, classes.refs_seam, self.geo);
         }
-        const lay = layout.Layout.stripedInline(CHUNK * blocks.len, entries.items);
-        try layout.publishLayout(t, .{ .ino = l, .name_key = self.mem.nameKey(), .prev = null, .layout = lay, .proofs = proofs.items }, classes.refs_seam, self.geo);
         try self.commitTx(t);
         return global(l);
     }
@@ -260,12 +264,14 @@ pub const RamSet = struct {
         const l = key.guestLocalIno(slot, raw);
         const g = inos.makeGlobalIno(raw, slot, inos.ROUTING_WIDTH);
         const t = try self.mem.begin(@src());
-        errdefer self.mem.abandon(t);
-        try self.putInode(t, l, .{ .mode = economy.S.IFDIR | 0o755, .nlink = 2, .ctime = 7 });
-        try self.putDentry(t, local(parent), name, g, economy.S.IFDIR);
-        var pv = (try self.readInode(local(parent))).?;
-        pv.nlink += 1;
-        try self.putInode(t, local(parent), pv);
+        {
+            errdefer self.mem.abandon(t);
+            try self.putInode(t, l, .{ .mode = economy.S.IFDIR | 0o755, .nlink = 2, .ctime = 7 });
+            try self.putDentry(t, local(parent), name, g, economy.S.IFDIR);
+            var pv = (try self.readInode(local(parent))).?;
+            pv.nlink += 1;
+            try self.putInode(t, local(parent), pv);
+        }
         try self.commitTx(t);
         return g;
     }
@@ -277,22 +283,24 @@ pub const RamSet = struct {
         const l = key.guestLocalIno(slot, raw);
         const g = inos.makeGlobalIno(raw, slot, inos.ROUTING_WIDTH);
         const t = try self.mem.begin(@src());
-        errdefer self.mem.abandon(t);
-        try self.putInode(t, l, .{ .mode = economy.S.IFREG | 0o644, .nlink = 1, .size = CHUNK * blocks.len, .ctime = 7 });
-        try self.putDentry(t, local(parent), name, g, economy.S.IFREG);
-        var entries: std.ArrayList(layout.MapEntryWire) = .empty;
-        defer entries.deinit(self.gpa);
-        var proofs: std.ArrayList(layout.DmaProof) = .empty;
-        defer proofs.deinit(self.gpa);
-        for (blocks, 0..) |b, i| {
-            const m = layout.Mapping.wholeBlock(vol_tag, b * CHUNK, 0);
-            try entries.append(self.gpa, (layout.MapEntry{ .block = @intCast(i), .mapping = m }).encode());
-            try proofs.append(self.gpa, .{ .vol_tag = vol_tag, .offset = b * CHUNK, .len = CHUNK, .completed_ns = 1 });
-            self.trackBlock(vol_tag, b);
-            @memset(self.devs[if (vol_tag == VOL_A) 0 else 1][@intCast(b * CHUNK)..][0..@intCast(CHUNK)], @truncate(b + 1));
+        {
+            errdefer self.mem.abandon(t);
+            try self.putInode(t, l, .{ .mode = economy.S.IFREG | 0o644, .nlink = 1, .size = CHUNK * blocks.len, .ctime = 7 });
+            try self.putDentry(t, local(parent), name, g, economy.S.IFREG);
+            var entries: std.ArrayList(layout.MapEntryWire) = .empty;
+            defer entries.deinit(self.gpa);
+            var proofs: std.ArrayList(layout.DmaProof) = .empty;
+            defer proofs.deinit(self.gpa);
+            for (blocks, 0..) |b, i| {
+                const m = layout.Mapping.wholeBlock(vol_tag, b * CHUNK, 0);
+                try entries.append(self.gpa, (layout.MapEntry{ .block = @intCast(i), .mapping = m }).encode());
+                try proofs.append(self.gpa, .{ .vol_tag = vol_tag, .offset = b * CHUNK, .len = CHUNK, .completed_ns = 1 });
+                self.trackBlock(vol_tag, b);
+                @memset(self.devs[if (vol_tag == VOL_A) 0 else 1][@intCast(b * CHUNK)..][0..@intCast(CHUNK)], @truncate(b + 1));
+            }
+            const lay = layout.Layout.stripedInline(CHUNK * blocks.len, entries.items);
+            try layout.publishLayout(t, .{ .ino = l, .name_key = self.mem.nameKey(), .prev = null, .layout = lay, .proofs = proofs.items }, classes.refs_seam, self.geo);
         }
-        const lay = layout.Layout.stripedInline(CHUNK * blocks.len, entries.items);
-        try layout.publishLayout(t, .{ .ino = l, .name_key = self.mem.nameKey(), .prev = null, .layout = lay, .proofs = proofs.items }, classes.refs_seam, self.geo);
         try self.commitTx(t);
         return g;
     }
@@ -302,18 +310,20 @@ pub const RamSet = struct {
     pub fn mkpacked(self: *RamSet, parent: u64, name: []const u8, vol_tag: u64, blk: u64, rel_off: u32, len: u32) !u64 {
         const l = self.mint();
         const t = try self.mem.begin(@src());
-        errdefer self.mem.abandon(t);
-        try self.putInode(t, l, .{ .mode = economy.S.IFREG | 0o644, .nlink = 1, .size = len, .ctime = 7 });
-        try self.putDentry(t, local(parent), name, global(l), economy.S.IFREG);
-        const m = layout.Mapping.tenant(vol_tag, blk * CHUNK, 0, rel_off, len);
-        const file_id: layout.FileId = @splat(@as(u8, @truncate(l)));
-        // Packed is reached only by promotion of a staged file: the staged
-        // record first, the tenant as its promotion (one tx, the later Put wins).
-        const staged = layout.Layout.staged(len, file_id, null);
-        try layout.publishLayout(t, .{ .ino = l, .name_key = self.mem.nameKey(), .prev = null, .layout = staged, .proofs = &.{} }, classes.refs_seam, self.geo);
-        const lay = layout.Layout.packedTenant(len, file_id, m);
-        self.trackBlock(vol_tag, blk);
-        try layout.publishLayout(t, .{ .ino = l, .name_key = self.mem.nameKey(), .prev = staged, .layout = lay, .proofs = &.{.{ .vol_tag = vol_tag, .offset = blk * CHUNK, .len = CHUNK, .completed_ns = 1 }} }, classes.refs_seam, self.geo);
+        {
+            errdefer self.mem.abandon(t);
+            try self.putInode(t, l, .{ .mode = economy.S.IFREG | 0o644, .nlink = 1, .size = len, .ctime = 7 });
+            try self.putDentry(t, local(parent), name, global(l), economy.S.IFREG);
+            const m = layout.Mapping.tenant(vol_tag, blk * CHUNK, 0, rel_off, len);
+            const file_id: layout.FileId = @splat(@as(u8, @truncate(l)));
+            // Packed is reached only by promotion of a staged file: the staged
+            // record first, the tenant as its promotion (one tx, the later Put wins).
+            const staged = layout.Layout.staged(len, file_id, null);
+            try layout.publishLayout(t, .{ .ino = l, .name_key = self.mem.nameKey(), .prev = null, .layout = staged, .proofs = &.{} }, classes.refs_seam, self.geo);
+            const lay = layout.Layout.packedTenant(len, file_id, m);
+            self.trackBlock(vol_tag, blk);
+            try layout.publishLayout(t, .{ .ino = l, .name_key = self.mem.nameKey(), .prev = staged, .layout = lay, .proofs = &.{.{ .vol_tag = vol_tag, .offset = blk * CHUNK, .len = CHUNK, .completed_ns = 1 }} }, classes.refs_seam, self.geo);
+        }
         try self.commitTx(t);
         return global(l);
     }
@@ -332,11 +342,13 @@ pub const RamSet = struct {
     /// A hard link `name` under `parent` to `child`: the dentry + `nlink + 1`.
     pub fn link(self: *RamSet, parent: u64, name: []const u8, child: u64) !void {
         const t = try self.mem.begin(@src());
-        errdefer self.mem.abandon(t);
-        var v = (try self.readInode(local(child))).?;
-        v.nlink += 1;
-        try self.putInode(t, local(child), v);
-        try self.putDentry(t, local(parent), name, child, v.mode);
+        {
+            errdefer self.mem.abandon(t);
+            var v = (try self.readInode(local(child))).?;
+            v.nlink += 1;
+            try self.putInode(t, local(child), v);
+            try self.putDentry(t, local(parent), name, child, v.mode);
+        }
         try self.commitTx(t);
     }
 
@@ -355,26 +367,32 @@ pub const RamSet = struct {
     /// C9: drop the name, keep the live record.
     pub fn orphan(self: *RamSet, parent: u64, name: []const u8) !void {
         const t = try self.mem.begin(@src());
-        errdefer self.mem.abandon(t);
-        try t.stageDelete(key.TREE_DENTRIES, &self.dentryKeyFor(local(parent), name));
+        {
+            errdefer self.mem.abandon(t);
+            try t.stageDelete(key.TREE_DENTRIES, &self.dentryKeyFor(local(parent), name));
+        }
         try self.commitTx(t);
     }
 
     /// C10: the record's nlink set to `n` with no name change.
     pub fn setNlink(self: *RamSet, child: u64, n: u32) !void {
         const t = try self.mem.begin(@src());
-        errdefer self.mem.abandon(t);
-        var v = (try self.readInode(local(child))).?;
-        v.nlink = n;
-        try self.putInode(t, local(child), v);
+        {
+            errdefer self.mem.abandon(t);
+            var v = (try self.readInode(local(child))).?;
+            v.nlink = n;
+            try self.putInode(t, local(child), v);
+        }
         try self.commitTx(t);
     }
 
     /// C10 dangling: a name under `parent` naming a child with no record.
     pub fn dangle(self: *RamSet, parent: u64, name: []const u8, child_global: u64) !void {
         const t = try self.mem.begin(@src());
-        errdefer self.mem.abandon(t);
-        try self.putDentry(t, local(parent), name, child_global, economy.S.IFREG);
+        {
+            errdefer self.mem.abandon(t);
+            try self.putDentry(t, local(parent), name, child_global, economy.S.IFREG);
+        }
         try self.commitTx(t);
     }
 
@@ -397,37 +415,45 @@ pub const RamSet = struct {
     /// C8 (durable < derived): drop the reference record of `(child, index)`.
     pub fn dropRef(self: *RamSet, child: u64, index: u32, vol_tag: u64, blk: u64) !void {
         const t = try self.mem.begin(@src());
-        errdefer self.mem.abandon(t);
-        try t.stageDelete(key.TREE_BLOCK_REFS, &key.blockRefKey(vol_tag, blk, local(child), index));
+        {
+            errdefer self.mem.abandon(t);
+            try t.stageDelete(key.TREE_BLOCK_REFS, &key.blockRefKey(vol_tag, blk, local(child), index));
+        }
         try self.commitTx(t);
     }
 
     /// C8 (durable > derived): a stray reference record.
     pub fn strayRef(self: *RamSet, owner_local: u64, index: u32, vol_tag: u64, blk: u64) !void {
         const t = try self.mem.begin(@src());
-        errdefer self.mem.abandon(t);
-        try block_refs.stageOps(t, &.{block_refs.taken(.{ .vol_tag = vol_tag, .block_idx = blk, .owner_ino = owner_local, .block_index = index })});
+        {
+            errdefer self.mem.abandon(t);
+            try block_refs.stageOps(t, &.{block_refs.taken(.{ .vol_tag = vol_tag, .block_idx = blk, .owner_ino = owner_local, .block_index = index })});
+        }
         try self.commitTx(t);
     }
 
     /// C1 semantic: an inode record whose value is one byte short.
     pub fn tearInode(self: *RamSet, child: u64) !void {
         const t = try self.mem.begin(@src());
-        errdefer self.mem.abandon(t);
-        const v = (try self.readInode(local(child))).?;
-        const enc = v.encode();
-        try t.stagePut(key.TREE_INODES, &key.inodeKey(local(child)), enc[0 .. enc.len - 1]);
+        {
+            errdefer self.mem.abandon(t);
+            const v = (try self.readInode(local(child))).?;
+            const enc = v.encode();
+            try t.stagePut(key.TREE_INODES, &key.inodeKey(local(child)), enc[0 .. enc.len - 1]);
+        }
         try self.commitTx(t);
     }
 
     /// C1 raw key: a kind-1 row whose key is the inode key plus a byte.
     pub fn rawKey(self: *RamSet) !void {
         const t = try self.mem.begin(@src());
-        errdefer self.mem.abandon(t);
-        var k: [key.INODE_KEY_LEN + 1]u8 = undefined;
-        k[0..key.INODE_KEY_LEN].* = key.inodeKey(99);
-        k[key.INODE_KEY_LEN] = 0;
-        try t.stagePut(key.TREE_INODES, &k, &(record.InodeValue{ .mode = economy.S.IFREG, .nlink = 1 }).encode());
+        {
+            errdefer self.mem.abandon(t);
+            var k: [key.INODE_KEY_LEN + 1]u8 = undefined;
+            k[0..key.INODE_KEY_LEN].* = key.inodeKey(99);
+            k[key.INODE_KEY_LEN] = 0;
+            try t.stagePut(key.TREE_INODES, &k, &(record.InodeValue{ .mode = economy.S.IFREG, .nlink = 1 }).encode());
+        }
         try self.commitTx(t);
     }
 
@@ -447,23 +473,25 @@ pub const RamSet = struct {
     pub fn overrunTenant(self: *RamSet, parent: u64, name: []const u8, vol_tag: u64, blk: u64) !u64 {
         const l = self.mint();
         const t = try self.mem.begin(@src());
-        errdefer self.mem.abandon(t);
-        try self.putInode(t, l, .{ .mode = economy.S.IFREG | 0o644, .nlink = 1, .size = 100, .ctime = 7 });
-        try self.putDentry(t, local(parent), name, global(l), economy.S.IFREG);
-        var m = layout.Mapping.tenant(vol_tag, blk * CHUNK, 0, 4096, 100);
-        const lay = layout.Layout.packedTenant(100, @splat(1), m);
-        var buf: [256]u8 = undefined;
-        const enc = lay.encodeInto(&buf);
-        self.trackBlock(vol_tag, blk);
-        // Patch the window: rel_off 4097 (off the grain) in place.
-        m.rel_off = 4097;
-        const off = layout.LAYOUT_HEADER_LEN + 16;
-        enc[off..][0..layout.MAPPING_WIRE_LEN].* = std.mem.toBytes(m.encode());
-        const xv: record.XattrValue = .{ .name = layout.LAYOUT_XATTR_NAME, .value = enc };
-        var xbuf: [300]u8 = undefined;
-        try t.stagePut(key.TREE_XATTRS, &key.xattrKey(l, key.xattrNameHash56(layout.LAYOUT_XATTR_NAME, self.mem.nameKey()), 0), try xv.encodeInto(&xbuf));
-        // The base IS referenced: its durable record exists as any publish's would.
-        try block_refs.stageOps(t, &.{block_refs.taken(.{ .vol_tag = vol_tag, .block_idx = blk, .owner_ino = l, .block_index = 0 })});
+        {
+            errdefer self.mem.abandon(t);
+            try self.putInode(t, l, .{ .mode = economy.S.IFREG | 0o644, .nlink = 1, .size = 100, .ctime = 7 });
+            try self.putDentry(t, local(parent), name, global(l), economy.S.IFREG);
+            var m = layout.Mapping.tenant(vol_tag, blk * CHUNK, 0, 4096, 100);
+            const lay = layout.Layout.packedTenant(100, @splat(1), m);
+            var buf: [256]u8 = undefined;
+            const enc = lay.encodeInto(&buf);
+            self.trackBlock(vol_tag, blk);
+            // Patch the window: rel_off 4097 (off the grain) in place.
+            m.rel_off = 4097;
+            const off = layout.LAYOUT_HEADER_LEN + 16;
+            enc[off..][0..layout.MAPPING_WIRE_LEN].* = std.mem.toBytes(m.encode());
+            const xv: record.XattrValue = .{ .name = layout.LAYOUT_XATTR_NAME, .value = enc };
+            var xbuf: [300]u8 = undefined;
+            try t.stagePut(key.TREE_XATTRS, &key.xattrKey(l, key.xattrNameHash56(layout.LAYOUT_XATTR_NAME, self.mem.nameKey()), 0), try xv.encodeInto(&xbuf));
+            // The base IS referenced: its durable record exists as any publish's would.
+            try block_refs.stageOps(t, &.{block_refs.taken(.{ .vol_tag = vol_tag, .block_idx = blk, .owner_ino = l, .block_index = 0 })});
+        }
         try self.commitTx(t);
         return global(l);
     }
@@ -471,9 +499,11 @@ pub const RamSet = struct {
     /// C11 (a): kind-7 records under an owner with no kvmap head.
     pub fn orphanMapRecords(self: *RamSet, owner_local: u64, n: u32) !void {
         const t = try self.mem.begin(@src());
-        errdefer self.mem.abandon(t);
-        var i: u32 = 0;
-        while (i < n) : (i += 1) try kvmap.stagePut(t, owner_local, kvmap.Rec.point(i, layout.Mapping.wholeBlock(VOL_A, (40 + i) * CHUNK, 0)));
+        {
+            errdefer self.mem.abandon(t);
+            var i: u32 = 0;
+            while (i < n) : (i += 1) try kvmap.stagePut(t, owner_local, kvmap.Rec.point(i, layout.Mapping.wholeBlock(VOL_A, (40 + i) * CHUNK, 0)));
+        }
         try self.commitTx(t);
     }
 
@@ -481,11 +511,13 @@ pub const RamSet = struct {
     pub fn emptyKvmapHead(self: *RamSet, parent: u64, name: []const u8) !u64 {
         const l = self.mint();
         const t = try self.mem.begin(@src());
-        errdefer self.mem.abandon(t);
-        try self.putInode(t, l, .{ .mode = economy.S.IFREG | 0o644, .nlink = 1, .size = CHUNK * 100, .ctime = 7 });
-        try self.putDentry(t, local(parent), name, global(l), economy.S.IFREG);
-        const lay = layout.Layout.stripedKvmap(CHUNK * 100, null, 1);
-        try layout.publishLayout(t, .{ .ino = l, .name_key = self.mem.nameKey(), .prev = null, .layout = lay, .proofs = &.{} }, classes.refs_seam, self.geo);
+        {
+            errdefer self.mem.abandon(t);
+            try self.putInode(t, l, .{ .mode = economy.S.IFREG | 0o644, .nlink = 1, .size = CHUNK * 100, .ctime = 7 });
+            try self.putDentry(t, local(parent), name, global(l), economy.S.IFREG);
+            const lay = layout.Layout.stripedKvmap(CHUNK * 100, null, 1);
+            try layout.publishLayout(t, .{ .ino = l, .name_key = self.mem.nameKey(), .prev = null, .layout = lay, .proofs = &.{} }, classes.refs_seam, self.geo);
+        }
         try self.commitTx(t);
         return global(l);
     }

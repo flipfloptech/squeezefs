@@ -686,6 +686,146 @@ test "the skip scanner: an identifier counts, prose in a comment or a string doe
 }
 
 // ---------------------------------------------------------------------------
+// The transaction ownership rail (docs/evidence/rung-10-coherence-defects.md
+// item 1): every store's `commit(t)` CONSUMES the transaction on every path,
+// its refusals included (`KvBackend.commit` destroys it in a `defer`). An
+// unconditional `errdefer <store>.abandon(t);` whose scope still holds the
+// `commit(t)` frees the transaction a second time when the commit fails —
+// the writer claim's commit under a device EIO jumped through a freed
+// guard-set pointer in the handover move matrix. The errdefer covers the
+// staging only (a block that closes before the commit), or carries the
+// ownership flag the commit clears (`errdefer if (owned) …`).
+// ---------------------------------------------------------------------------
+
+/// The first violation's line (the fixtures' face of `abandonSpansCommitAll`).
+fn abandonSpansCommit(text: [:0]const u8) ?usize {
+    var one: [1]usize = undefined;
+    return if (abandonSpansCommitAll(text, &one) != 0) one[0] else null;
+}
+
+/// The lines of every unconditional `errdefer X.abandon(t);` whose
+/// enclosing block reaches a `commit…(t)` of the same transaction (up to
+/// `out.len`); answers how many were found.
+fn abandonSpansCommitAll(text: [:0]const u8, out: []usize) usize {
+    var found: usize = 0;
+    var tok = std.zig.Tokenizer.init(text);
+    var depth: usize = 0;
+    // One armed errdefer per nesting level suffices: a nested one shadows
+    // nothing the scan needs, and the first violation is reported.
+    var armed: ?struct { depth: usize, ident: []const u8, line: usize } = null;
+    var prev: [4]std.zig.Token = undefined;
+    var n: usize = 0;
+    while (true) {
+        const t = tok.next();
+        if (t.tag == .eof) return found;
+        switch (t.tag) {
+            .l_brace => depth += 1,
+            .r_brace => {
+                if (armed) |a| if (depth == a.depth) {
+                    armed = null;
+                };
+                depth -|= 1;
+            },
+            .keyword_errdefer => {
+                const st = unconditionalAbandon(text, &tok);
+                if (st.opened_brace) depth += 1;
+                if (armed == null) if (st.ident) |ident| {
+                    armed = .{ .depth = depth, .ident = ident, .line = lineOf(text, t.loc.start) };
+                };
+            },
+            .r_paren => if (armed) |a| if (n >= 3) {
+                // `commit…` `(` ident `)`
+                const name = prev[(n - 3) % prev.len];
+                const lp = prev[(n - 2) % prev.len];
+                const id = prev[(n - 1) % prev.len];
+                if (name.tag == .identifier and lp.tag == .l_paren and id.tag == .identifier and
+                    std.mem.startsWith(u8, text[name.loc.start..name.loc.end], "commit") and
+                    std.mem.eql(u8, text[id.loc.start..id.loc.end], a.ident))
+                {
+                    if (found < out.len) out[found] = a.line;
+                    found += 1;
+                    armed = null;
+                }
+            },
+            else => {},
+        }
+        prev[n % prev.len] = t;
+        n += 1;
+    }
+}
+
+/// After an `errdefer` token: `X.….abandon(ident);` with no `if`, no block
+/// and no capture answers `ident`; anything else answers null at the token
+/// that decided it (an opening brace is reported: the caller counts it).
+fn unconditionalAbandon(text: [:0]const u8, tok: *std.zig.Tokenizer) struct { ident: ?[]const u8 = null, opened_brace: bool = false } {
+    var last_ident: ?[]const u8 = null;
+    var saw_abandon = false;
+    var arg: ?[]const u8 = null;
+    var first = true;
+    while (true) {
+        const t = tok.next();
+        switch (t.tag) {
+            .l_brace => return .{ .opened_brace = true },
+            .eof, .keyword_if, .pipe => return .{},
+            .semicolon => return .{ .ident = if (saw_abandon) arg else null },
+            .identifier => {
+                const s = text[t.loc.start..t.loc.end];
+                if (saw_abandon and arg == null) arg = s;
+                last_ident = s;
+            },
+            .l_paren => if (!saw_abandon) {
+                saw_abandon = if (last_ident) |li| std.mem.eql(u8, li, "abandon") else false;
+                if (!saw_abandon) return .{};
+            },
+            .period, .r_paren => {},
+            else => if (first) return .{},
+        }
+        first = false;
+    }
+}
+
+test "tx ownership rail: no unconditional errdefer abandon(t) spans the commit(t) that consumes t" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var files: std.ArrayList([]u8) = .empty;
+    defer {
+        for (files.items) |f| gpa.free(f);
+        files.deinit(gpa);
+    }
+    const cwd = std.Io.Dir.cwd();
+    for (roots) |root| {
+        var d = try cwd.openDir(io, root, .{ .iterate = true });
+        defer d.close(io);
+        try walk(gpa, io, d, root, &files);
+    }
+    try std.testing.expect(files.items.len >= min_files);
+    var violations: std.Io.Writer.Allocating = .init(gpa);
+    defer violations.deinit();
+    for (files.items) |path| {
+        if (std.mem.eql(u8, path, sync_rail_fixture)) continue;
+        const text = try readWalked(gpa, io, cwd, path) orelse continue;
+        defer gpa.free(text);
+        var lines: [64]usize = undefined;
+        const found = abandonSpansCommitAll(text, &lines);
+        for (lines[0..@min(found, lines.len)]) |line| try violations.writer.print("  {s}:{d}: an unconditional errdefer abandon spans the commit that consumes the tx — close the staging block before the commit\n", .{ path, line });
+    }
+    if (violations.written().len != 0) {
+        std.debug.print("double-owned transaction(s):\n{s}", .{violations.written()});
+        return error.TxDoubleOwned;
+    }
+}
+
+test "the tx ownership scanner: an errdefer spanning the commit is caught; a staging block, an ownership flag, another tx and a later scope are not" {
+    try std.testing.expectEqual(@as(?usize, 3), abandonSpansCommit("fn f() !void {\n    const t = try be.begin(@src());\n    errdefer be.abandon(t);\n    try t.stagePut(1);\n    try be.commit(t);\n}\n"));
+    try std.testing.expectEqual(@as(?usize, 3), abandonSpansCommit("fn f() !void {\n    const t = try be.begin(@src());\n    errdefer g.be.abandon(t);\n    {\n        g.be.commit(t) catch |e| return e;\n    }\n}\n"));
+    try std.testing.expectEqual(@as(?usize, null), abandonSpansCommit("fn f() !void {\n    const t = try be.begin(@src());\n    {\n        errdefer be.abandon(t);\n        try t.stagePut(1);\n    }\n    try be.commit(t);\n}\n"));
+    try std.testing.expectEqual(@as(?usize, null), abandonSpansCommit("fn f() !void {\n    var owned = true;\n    errdefer if (owned) be.abandon(t);\n    owned = false;\n    try be.commit(t);\n}\n"));
+    try std.testing.expectEqual(@as(?usize, null), abandonSpansCommit("fn f() !void {\n    errdefer be.abandon(u);\n    try be.commit(t);\n}\n"));
+    try std.testing.expectEqual(@as(?usize, null), abandonSpansCommit("fn f() !void {\n    {\n        errdefer be.abandon(t);\n    }\n}\nfn g() !void {\n    try be.commitTx(t);\n}\n"));
+    try std.testing.expectEqual(@as(?usize, 2), abandonSpansCommit("fn f() !void {\n    errdefer self.mem.abandon(t);\n    try self.commitTx(t);\n}\n"));
+}
+
+// ---------------------------------------------------------------------------
 // The rig sync rail (decision 0003 §Z): a rig syncs only what it wrote —
 // `sync -f <its mount>`, `sync <file>`, fsync. A host-wide `sync` sends
 // FUSE_SYNCFS to EVERY FUSE superblock on the host and waits for each: a

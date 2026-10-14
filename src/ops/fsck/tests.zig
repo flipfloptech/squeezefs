@@ -879,17 +879,21 @@ const Storm = struct {
             // 1. The record first.
             {
                 const t = try set.mem.begin(@src());
-                errdefer set.mem.abandon(t);
-                try t.stagePut(key.TREE_INODES, &key.inodeKey(l), &(record.InodeValue{ .mode = economy.S.IFREG | 0o644, .nlink = 1, .ctime = i }).encode());
+                {
+                    errdefer set.mem.abandon(t);
+                    try t.stagePut(key.TREE_INODES, &key.inodeKey(l), &(record.InodeValue{ .mode = economy.S.IFREG | 0o644, .nlink = 1, .ctime = i }).encode());
+                }
                 try set.mem.commit(t);
             }
             // 2. The name.
             {
                 const t = try set.mem.begin(@src());
-                errdefer set.mem.abandon(t);
-                const dv: record.DentryValue = .{ .child_ino = g, .file_type = economy.ftByte(economy.S.IFREG), .name = name };
-                var buf: [64]u8 = undefined;
-                try t.stagePut(key.TREE_DENTRIES, &key.dentryKey(inos.ROOT_INO, key.dentryNameHash54(name, set.mem.nameKey()), 0), try dv.encodeInto(&buf));
+                {
+                    errdefer set.mem.abandon(t);
+                    const dv: record.DentryValue = .{ .child_ino = g, .file_type = economy.ftByte(economy.S.IFREG), .name = name };
+                    var buf: [64]u8 = undefined;
+                    try t.stagePut(key.TREE_DENTRIES, &key.dentryKey(inos.ROOT_INO, key.dentryNameHash54(name, set.mem.nameKey()), 0), try dv.encodeInto(&buf));
+                }
                 try set.mem.commit(t);
             }
             // 3. A block: minted, in flight, published with its reference.
@@ -897,10 +901,12 @@ const Storm = struct {
             var inflight = block_alloc.InflightAllocGuard.register(a, minted.idx);
             {
                 const t = try set.mem.begin(@src());
-                errdefer set.mem.abandon(t);
-                const m = layout.Mapping.wholeBlock(VOL_A, minted.offset, 0);
-                const entries = [_]layout.MapEntryWire{(layout.MapEntry{ .block = 0, .mapping = m }).encode()};
-                try layout.publishLayout(t, .{ .ino = l, .name_key = set.mem.nameKey(), .prev = null, .layout = layout.Layout.stripedInline(CHUNK, &entries), .proofs = &.{.{ .vol_tag = VOL_A, .offset = minted.offset, .len = CHUNK, .completed_ns = 1 }} }, classes.refs_seam, set.geo);
+                {
+                    errdefer set.mem.abandon(t);
+                    const m = layout.Mapping.wholeBlock(VOL_A, minted.offset, 0);
+                    const entries = [_]layout.MapEntryWire{(layout.MapEntry{ .block = 0, .mapping = m }).encode()};
+                    try layout.publishLayout(t, .{ .ino = l, .name_key = set.mem.nameKey(), .prev = null, .layout = layout.Layout.stripedInline(CHUNK, &entries), .proofs = &.{.{ .vol_tag = VOL_A, .offset = minted.offset, .len = CHUNK, .completed_ns = 1 }} }, classes.refs_seam, set.geo);
+                }
                 try set.mem.commit(t);
             }
             a.publishBlock(minted.idx);
@@ -912,19 +918,23 @@ const Storm = struct {
             var guards2 = try set.locks.lockMany(io, &.{ .{ .ino = inos.ROOT_INO, .mode = .exclusive }, .{ .ino = l, .mode = .exclusive } }, &.{});
             {
                 const t = try set.mem.begin(@src());
-                errdefer set.mem.abandon(t);
-                try t.stageDelete(key.TREE_DENTRIES, &key.dentryKey(inos.ROOT_INO, key.dentryNameHash54(name, set.mem.nameKey()), 0));
-                try t.stagePut(key.TREE_INODES, &key.inodeKey(l), &(record.InodeValue{ .mode = economy.S.IFREG | 0o644, .nlink = 0, .ctime = i + 1 }).encode());
+                {
+                    errdefer set.mem.abandon(t);
+                    try t.stageDelete(key.TREE_DENTRIES, &key.dentryKey(inos.ROOT_INO, key.dentryNameHash54(name, set.mem.nameKey()), 0));
+                    try t.stagePut(key.TREE_INODES, &key.inodeKey(l), &(record.InodeValue{ .mode = economy.S.IFREG | 0o644, .nlink = 0, .ctime = i + 1 }).encode());
+                }
                 try set.mem.commit(t);
             }
             // 5. The destroy: the record + the layout + the reference, then
             // the block's terminal free.
             {
                 const t = try set.mem.begin(@src());
-                errdefer set.mem.abandon(t);
-                try block_refs.stageOps(t, &.{block_refs.released(.{ .vol_tag = VOL_A, .block_idx = minted.idx, .owner_ino = l, .block_index = 0 })});
-                const xk = key.xattrKey(l, key.xattrNameHash56(layout.LAYOUT_XATTR_NAME, set.mem.nameKey()), 0);
-                try inos.stageDestroy(t, l, &.{&xk});
+                {
+                    errdefer set.mem.abandon(t);
+                    try block_refs.stageOps(t, &.{block_refs.released(.{ .vol_tag = VOL_A, .block_idx = minted.idx, .owner_ino = l, .block_index = 0 })});
+                    const xk = key.xattrKey(l, key.xattrNameHash56(layout.LAYOUT_XATTR_NAME, set.mem.nameKey()), 0);
+                    try inos.stageDestroy(t, l, &.{&xk});
+                }
                 try set.mem.commit(t);
             }
             _ = try a.freeBlock(minted.idx);

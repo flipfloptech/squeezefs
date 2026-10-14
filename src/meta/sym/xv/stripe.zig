@@ -625,8 +625,6 @@ const Stream = struct {
     pos: usize = 0,
     /// The last cookie LOADED: the next page starts after it.
     after: u64,
-    /// The last cookie CONSUMED: a restart's start.
-    popped: u64,
     more: bool = true,
 
     fn head(self: *const Stream) ?DirRec {
@@ -648,10 +646,13 @@ const Stream = struct {
         if (self.recs.items.len == 0) self.more = false;
     }
 
-    /// The loaded entries past the last consumed one are dropped and read
-    /// again: their snapshot predates a later snapshot of `D`.
-    fn restart(self: *Stream, src: DirSource, arena: Allocator, page: usize) errors.Error!void {
-        self.after = self.popped;
+    /// The loaded entries past `D`'s old cover are dropped and read again
+    /// from it: their snapshot predates `D`'s new page. Nothing at or
+    /// below the cover is read again — `D`'s old page and the stripe
+    /// snapshots taken after it answered that range, and every entry of it
+    /// this stream held was consumed before `D`'s last (cookie order).
+    fn restart(self: *Stream, src: DirSource, arena: Allocator, page: usize, cover: u64) errors.Error!void {
+        self.after = cover;
         self.more = true;
         try self.refill(src, arena, page);
     }
@@ -697,20 +698,24 @@ pub fn locateName(comptime Found: type, reader: anytype, stripe_ino: u64, dir: u
 /// already in its stripe, and every stripe snapshot of the range is
 /// later. A stripe's entry past `D`'s loaded range waits for `D`'s next
 /// page, and a stripe whose loaded page reached past `D`'s old range is
-/// read again from its last consumed cookie after it (the two-stream
-/// form of `locateName`'s second stripe read; found by the shared hot
-/// directory row's defect 13). A name both snapshots hold meets itself
-/// in one hash group and is listed once, the stripe's copy first.
+/// read again FROM THAT RANGE'S END after it (the two-stream form of
+/// `locateName`'s second stripe read; found by the shared hot directory
+/// row's defect 13) — never from its last consumed cookie: a name the
+/// migration moved into the range `D` already answered was listed from
+/// `D`'s snapshot, and a reply wider than `D`'s stream page listed it
+/// again, behind its frontier (decision 0003 §AE.1). A name both
+/// snapshots hold meets itself in one hash group and is listed once, the
+/// stripe's copy first.
 pub fn readdirMerged(src: DirSource, arena: Allocator, map: *const StripeMap, offset: u64, max: usize, out: *std.ArrayList(DirRec)) errors.Error!void {
     stats.dir_stripe_readdir_merges.inc();
     const page = @max(max / (@as(usize, map.k) + 1), MERGE_STREAM_PAGE_FLOOR);
     var streams: [K_MAX + 1]Stream = undefined;
     const n = @as(usize, map.k) + 1;
     const d = &streams[map.k];
-    d.* = .{ .dir = map.dir, .after = offset, .popped = offset };
+    d.* = .{ .dir = map.dir, .after = offset };
     try d.refill(src, arena, page);
     for (0..map.k) |i| {
-        streams[i] = .{ .dir = map.stripes[i], .after = offset, .popped = offset };
+        streams[i] = .{ .dir = map.stripes[i], .after = offset };
         try streams[i].refill(src, arena, page);
     }
     var group: ?u64 = null;
@@ -721,7 +726,7 @@ pub fn readdirMerged(src: DirSource, arena: Allocator, map: *const StripeMap, of
             try d.refill(src, arena, page);
             for (streams[0..map.k]) |*s| if (s.after > old_cover) {
                 stats.dir_stripe_readdir_restarts.inc();
-                try s.restart(src, arena, page);
+                try s.restart(src, arena, page, old_cover);
             };
         }
         var best: ?usize = null;
@@ -734,7 +739,6 @@ pub fn readdirMerged(src: DirSource, arena: Allocator, map: *const StripeMap, of
         const s = &streams[bi];
         const rec = s.head().?;
         s.pos += 1;
-        s.popped = rec.cookie;
         if (bi != map.k and s.head() == null) try s.refill(src, arena, page);
         if (isMarkerName(rec.name)) continue;
         const g = cookieGroup(rec.cookie);

@@ -196,6 +196,20 @@ pub const Host = struct {
     hold: ?*const std.atomic.Value(bool) = null,
     /// The pre-registry test hook: fires at the Phase-A registry boundary.
     pre_registry_hook: ?*const fn () void = null,
+    /// The C8 test hook: fires before the first round's refs scan, at a
+    /// re-check round's start, and between the re-check's durable read
+    /// and its derived read (the window a live writer's tx must not split).
+    c8_hook: ?C8Hook = null,
+
+    pub const C8Point = enum { round1_refs, recheck_start, recheck_between_reads };
+    pub const C8Hook = struct {
+        ctx: *anyopaque,
+        at: *const fn (ctx: *anyopaque, point: C8Point, block_idx: u64) void,
+
+        fn fire(self: C8Hook, point: C8Point, block_idx: u64) void {
+            self.at(self.ctx, point, block_idx);
+        }
+    };
 
     /// A residue of the set — an ino shard or a fleet member's custody:
     /// the whole-set classes (C8, C11–C17) and the allocator-truth arms
@@ -792,6 +806,7 @@ pub const Pass = struct {
         // The durable-vs-derived drift needs every reference in view (the
         // live-lessee law of `c2c3c6`).
         if (self.host.residue() or self.host.scope.foreign_live.count() != 0) return;
+        if (self.host.c8_hook) |h| h.fire(.round1_refs, 0);
         for (self.host.volumes) |v| {
             var x: C8Exempt = .{ .pass = self, .vol_tag = v.vol_tag };
             var rep = block_refs.verifyRefs(self.gpa, self.host.store.refStore(), v.vol_tag, self.cen.owners.items, x.exemptions()) catch |e| switch (e) {
@@ -1391,11 +1406,7 @@ pub const Pass = struct {
                 return still;
             },
             .c7_scrub => return true, // the scrub's own ladder ran already
-            .c8_drift => |f| {
-                const rep = try self.freshC8(f.vol_tag);
-                for (rep.rows) |r| if (r.block_idx == f.block_idx) return true;
-                return false;
-            },
+            .c8_drift => |f| return self.c8Settled(f.vol_tag, f.block_idx),
             .c9_unreferenced => |f| {
                 if (host.intents) |i| if (i.isOpen(i.ctx, f.ino)) {
                     self.counters.unreferenced_intent_exempted += 1;
@@ -1607,6 +1618,79 @@ pub const Pass = struct {
         defer binds.deinit(self.gpa);
         if (!(try self.host.currentBindings(self.gpa, key_ino, &binds))) return false;
         for (binds.items) |b| if (b.block_index == block_index and b.mapping.vol_tag == vol_tag and b.mapping.blockIdx(self.host.geo.chunk) == block_idx) return true;
+        return false;
+    }
+
+    /// C8's Phase C, per block: the block's durable references and every
+    /// candidate owner's CURRENT bindings read under the owners' exclusive
+    /// leases held TOGETHER. A publish and a destroy each move a block's
+    /// reference and its layout in ONE tx under the owner's lease, so the
+    /// two reads see one state. An owner that appeared between the
+    /// candidate read and the acquisition (a re-mint of the block) is added
+    /// and the round repeats, bounded. The whole-view re-check (a fresh
+    /// census, then a refs scan: two walks) raced a live writer: a destroy
+    /// between them read `durable 0 vs derived 1`, a publish `1 vs 0`.
+    /// Rounds a C8 re-check may grow its owner set: a round grows only
+    /// when the block was freed and minted to a new owner between its
+    /// unlocked read and the acquisition — four in a row is a storm on ONE
+    /// block, which the next online run re-judges (counted, cleared).
+    const C8_SETTLE_ROUNDS: u32 = 4;
+
+    fn c8Settled(self: *Pass, vol_tag: u64, block_idx: u64) Error!bool {
+        const gpa = self.gpa;
+        const host = self.host;
+        var cands: std.ArrayList(u64) = .empty;
+        defer cands.deinit(gpa);
+        for (self.cen.owners.items) |o| for (o.bindings) |b| if (b.vol_tag == vol_tag and b.block_idx == block_idx) try addCandidate(gpa, &cands, o.ino);
+        var refs: std.ArrayList(block_refs.Reference) = .empty;
+        defer refs.deinit(gpa);
+        var round: u32 = 0;
+        while (round < C8_SETTLE_ROUNDS) : (round += 1) {
+            if (host.c8_hook) |h| h.fire(.recheck_start, block_idx);
+            refs.clearRetainingCapacity();
+            try block_refs.blockRecords(host.store.refStore(), gpa, vol_tag, block_idx, &refs);
+            for (refs.items) |r| try addCandidate(gpa, &cands, r.owner_ino);
+            var guards = host.lockInos(cands.items) catch return self.c8Whole(vol_tag, block_idx);
+            defer host.unlockInos(&guards);
+            refs.clearRetainingCapacity();
+            try block_refs.blockRecords(host.store.refStore(), gpa, vol_tag, block_idx, &refs);
+            var grew = false;
+            for (refs.items) |r| if (std.mem.indexOfScalar(u64, cands.items, r.owner_ino) == null) {
+                grew = true;
+            };
+            if (grew) continue;
+            if (host.c8_hook) |h| h.fire(.recheck_between_reads, block_idx);
+            var derived: usize = 0;
+            var binds: std.ArrayList(census.MappingRef) = .empty;
+            defer binds.deinit(gpa);
+            for (cands.items) |ino| {
+                binds.clearRetainingCapacity();
+                _ = host.currentBindings(gpa, ino, &binds) catch |e| switch (e) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    // A layout the codec refuses (C12's object): the
+                    // census's raw-base reading is the whole view's.
+                    else => return self.c8Whole(vol_tag, block_idx),
+                };
+                for (binds.items) |b| {
+                    if (b.mapping.vol_tag == vol_tag and b.mapping.blockIdx(host.geo.chunk) == block_idx) derived += 1;
+                }
+            }
+            return refs.items.len != derived;
+        }
+        self.counters.c8_owner_set_moving += 1;
+        return false;
+    }
+
+    fn addCandidate(gpa: Allocator, cands: *std.ArrayList(u64), ino: u64) Allocator.Error!void {
+        if (std.mem.indexOfScalar(u64, cands.items, ino) == null) try cands.append(gpa, ino);
+    }
+
+    /// The whole-view re-check: a fresh census against a fresh refs scan
+    /// (offline-equivalent; the arm for an owner set wider than one lock
+    /// plan or a layout the codec refuses).
+    fn c8Whole(self: *Pass, vol_tag: u64, block_idx: u64) Error!bool {
+        const rep = try self.freshC8(vol_tag);
+        for (rep.rows) |r| if (r.block_idx == block_idx) return true;
         return false;
     }
 

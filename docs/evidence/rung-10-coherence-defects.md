@@ -212,3 +212,52 @@ here.
 asserts the region's pages (`regionPages(buffers, buf_size, page)`) and every lever in the detail
 and that it never claims a contiguous-page shortage — red against the old detail
 (`kmbuf ring registration ENOMEM (order-8 contiguous pages); retry, or …`). `kmbuf` "regionPages".
+
+## 3. The macOS online fsck false positive under a live writer storm
+
+**What §9.8 saw.** `fsck` "zero false positives: a live writer storm …" reported
+`[C8] durable refs 0 vs derived 1` on one shard of one macOS gate.
+
+**Reproduced.** The test binary looped on macOS: 0/100 on an idle Mac, **11/60 on pristine `dev`
+and 8/60 on the item-1 tree under 14 × `yes`** (the earlier 50/200 ran beside a gate) — 46 of the
+first 50 failures `[C8] … durable refs N vs derived M`, 4 `[C2] leaked`.
+
+**Root cause.** C8's Phase C re-checked a suspect with the WHOLE-VIEW comparison: a fresh census
+(one walk of every layout), then a fresh refs scan (a second walk), compared per block. The storm
+moves a block's reference and its layout together in ONE tx under the owner's exclusive lease
+(the publish: layout + `taken`; the destroy: `released` + the layout's destroy) and re-mints a freed
+block to the next file at once — so a destroy between the two re-check walks reads `durable 0 vs
+derived 1`, a publish `1 vs 0`, exactly as in the first round: the "confirmation" re-ran the race.
+
+**Fix (decision 0003 §AG.3).** C8's Phase C is per block and consistent: the candidate owners
+(the first round's census owners binding the block, plus the owners its durable references name
+now) are locked TOGETHER under their exclusive 4a leases (`Host.lockInos`, one canonical
+acquisition), the block's durable references are re-read under them — an owner that appeared
+since (a re-mint) joins the set and the round repeats, bounded at 4 (`C8_SETTLE_ROUNDS`; past it
+the suspect clears, counted `c8_owner_set_moving`) — and every candidate's CURRENT bindings
+(`Host.currentBindings`) are counted under the same leases. A writer's tx on the block cannot fall
+between the two reads. An owner set wider than one lock plan, or a layout the codec refuses, keeps
+the whole-view comparison.
+
+**Red row.** `fsck` "C8's online re-check reads a block's durable references and its owners'
+layouts in ONE state …" schedules the race through the pass's C8 hook (`Host.c8_hook`): the owner of
+block 40 destroyed between the first round's census and refs scan (the suspect), the block
+re-minted to a second owner as the re-check starts, that owner destroyed between the re-check's
+two reads try-only (a writer meeting the owner's lease). Red on the whole-view re-check:
+`FALSE POSITIVE: [C8] vol-0000000000000010 block 40 — durable refs 0 vs derived 1` — the gate's
+line. Green: the re-check holds the second owner's lease, the destroy waits (it lands after the run,
+and the next run is clean), the suspect clears.
+
+**Loops after the fix** (the storm test, macOS, 14 × `yes`): **0/60** C8 (was 11/60 on pristine
+`dev`); a 150-run loop: **0 C8, 4 `[C2] leaked`**.
+
+**Owed — the second window, `[C2] leaked`.** A release's tx (the destroy: `released` + the layout's
+destroy) commits, and the block's terminal free (`freeBlock` / `Reclaimer.freeBlock`) runs after it
+— in the product exactly as in the storm. Between them the allocator still tracks a block nothing
+references, and the owner that could be locked is gone with its records: a census and its re-check
+that both fall inside that window (the destroyer preempted for their whole length) confirm a leak
+that the free resolves a moment later. Census scoping cannot close it — no record names the owner.
+The shield is the producer's: the in-flight registry (`InflightAllocGuard`, Phase A's
+`inflightContains`, today held only from a mint to its publish) held from before every releasing
+commit until its terminal free, at every release site (the destroy and corpse sweep, truncate, the
+overwrite's old block, the pack release). Not done here; 4/150 under 14 × `yes` (0 in 100 idle).

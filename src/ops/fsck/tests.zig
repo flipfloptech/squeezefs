@@ -982,6 +982,93 @@ test "zero false positives: a live writer storm (creates, publishes, unlinks, de
     try testing.expect(total_suspects > 0);
 }
 
+/// The C8 race the macOS gate's storm met (`[C8] durable refs 0 vs derived
+/// 1`), scheduled exactly through the pass's C8 hook: one block, its owner
+/// destroyed between the first round's two walks (the suspect), the block
+/// re-minted to a second owner as the re-check starts, and that owner
+/// destroyed between the re-check's durable and derived reads — try-only,
+/// as a writer meeting the owner's lease.
+const C8Racer = struct {
+    set: *RamSet,
+    blk: u64,
+    first: u64,
+    second: u64 = 0,
+    second_destroyed: bool = false,
+    /// The re-check held the second owner's lease: its destroy waited.
+    destroy_waited: bool = false,
+    err: ?anyerror = null,
+
+    fn hook(self: *C8Racer) classes.Host.C8Hook {
+        return .{ .ctx = self, .at = &at };
+    }
+
+    fn at(ctx: *anyopaque, point: classes.Host.C8Point, block_idx: u64) void {
+        const self: *C8Racer = @ptrCast(@alignCast(ctx));
+        self.step(point, block_idx) catch |e| {
+            self.err = e;
+        };
+    }
+
+    fn step(self: *C8Racer, point: classes.Host.C8Point, block_idx: u64) !void {
+        switch (point) {
+            .round1_refs => _ = try self.destroy(self.first, "racer", true),
+            .recheck_start => if (block_idx == self.blk and self.second == 0) {
+                self.second = try self.set.mkfile(inos.ROOT_INO, "racer2", VOL_A, &.{self.blk});
+            },
+            .recheck_between_reads => if (block_idx == self.blk and self.second != 0 and !self.second_destroyed) {
+                if (try self.destroy(self.second, "racer2", false)) self.second_destroyed = true else self.destroy_waited = true;
+            },
+        }
+    }
+
+    /// The unlink + destroy of a one-block file in ONE tx under its
+    /// exclusive lease (blocking, or try-only), then the block's terminal
+    /// free. False = the lease was held.
+    fn destroy(self: *C8Racer, global: u64, name: []const u8, blocking: bool) !bool {
+        const set = self.set;
+        const io = testing.io;
+        const l = RamSet.local(global);
+        const req = [_]@import("../../meta/dlm.zig").InodeReq{.{ .ino = l, .mode = .exclusive }};
+        var guards = if (blocking) try set.locks.lockMany(io, &req, &.{}) else (try set.locks.tryLockMany(io, &req, &.{})) orelse return false;
+        defer guards.release(io);
+        const t = try set.mem.begin(@src());
+        {
+            errdefer set.mem.abandon(t);
+            try t.stageDelete(key.TREE_DENTRIES, &key.dentryKey(inos.ROOT_INO, key.dentryNameHash54(name, set.mem.nameKey()), 0));
+            try block_refs.stageOps(t, &.{block_refs.released(.{ .vol_tag = VOL_A, .block_idx = self.blk, .owner_ino = l, .block_index = 0 })});
+            const xk = key.xattrKey(l, key.xattrNameHash56(layout.LAYOUT_XATTR_NAME, set.mem.nameKey()), 0);
+            try inos.stageDestroy(t, l, &.{&xk});
+        }
+        try set.mem.commit(t);
+        set.untrack(VOL_A, self.blk);
+        return true;
+    }
+};
+
+test "C8's online re-check reads a block's durable references and its owners' layouts in ONE state (the macOS gate's `[C8] durable refs 0 vs derived 1` under the live writer storm): the owner destroyed between the first round's two walks makes the suspect, the block re-minted to a second owner as the re-check starts and destroyed between the re-check's reads confirmed it on the whole-view re-check (a fresh census, then a refs scan) — the per-block re-check holds the owners' leases, the destroy waits, the suspect clears" {
+    const gpa = testing.allocator;
+    const set = try RamSet.init(gpa);
+    defer set.deinit();
+    _ = try populate(set);
+    const blk: u64 = 40;
+    var racer: C8Racer = .{ .set = set, .blk = blk, .first = try set.mkfile(inos.ROOT_INO, "racer", VOL_A, &.{blk}) };
+    var h = set.host(.online);
+    h.c8_hook = racer.hook();
+    var r = try ram.runHost(set, &h, .{});
+    defer r.deinit(gpa);
+    try testing.expect(racer.err == null);
+    for (r.findings) |f| std.debug.print("FALSE POSITIVE: {f}\n", .{f});
+    try ram.expectClasses(r, &.{});
+    // The schedule ran: a suspect, the re-mint, the destroy held off.
+    try testing.expect(r.counters.suspects >= 1 and r.counters.suspects_cleared >= 1);
+    try testing.expect(racer.second != 0 and racer.destroy_waited and !racer.second_destroyed);
+    // The held-off destroy lands after the run; the next run is clean.
+    try testing.expect(try racer.destroy(racer.second, "racer2", true));
+    var again = try ram.run(set, .online, .{});
+    defer again.deinit(gpa);
+    try ram.expectClasses(again, &.{});
+}
+
 test "Phase A: a block minted under the scan with a live in-flight owner is epoch/registry-exempt online and never a C2 finding; dropping the guard with no publish is a genuine leak the next OFFLINE run reports" {
     const gpa = testing.allocator;
     const set = try RamSet.init(gpa);

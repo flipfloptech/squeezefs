@@ -333,6 +333,10 @@ pub const Counters = struct {
     current_era_exempted: u64 = 0,
     unreferenced_intent_exempted: u64 = 0,
     nlink_transient_cleared: u64 = 0,
+    /// C8 suspects whose owner set kept growing through every bounded
+    /// round of the per-block re-check (cleared: online confirms only what
+    /// it can read in one state; the offline run judges it).
+    c8_owner_set_moving: u64 = 0,
     crossing_exempted: u64 = 0,
     alloc_bitmap_tracked_exempted: u64 = 0,
     alloc_census_declined: u64 = 0,
@@ -448,6 +452,7 @@ pub const Counters = struct {
         s.fsck_current_era_exempted.add(self.current_era_exempted);
         s.fsck_unreferenced_intent_exempted.add(self.unreferenced_intent_exempted);
         s.fsck_nlink_transient_cleared.add(self.nlink_transient_cleared);
+        s.fsck_c8_owner_set_moving.add(self.c8_owner_set_moving);
         s.fsck_crossing_exempted.add(self.crossing_exempted);
         s.fsck_alloc_bitmap_tracked_exempted.add(self.alloc_bitmap_tracked_exempted);
         s.fsck_alloc_census_declined.add(self.alloc_census_declined);

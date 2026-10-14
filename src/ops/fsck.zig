@@ -110,6 +110,7 @@ pub const stats = struct {
     pub var fsck_current_era_exempted: counters.ShardedCounter = .{};
     pub var fsck_unreferenced_intent_exempted: counters.ShardedCounter = .{};
     pub var fsck_nlink_transient_cleared: counters.ShardedCounter = .{};
+    pub var fsck_c8_owner_set_moving: counters.ShardedCounter = .{};
     pub var fsck_crossing_exempted: counters.ShardedCounter = .{};
     pub var fsck_alloc_bitmap_tracked_exempted: counters.ShardedCounter = .{};
     pub var fsck_alloc_census_declined: counters.ShardedCounter = .{};

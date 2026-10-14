@@ -505,16 +505,16 @@ src/ops/fsck/census.zig:608 | 8 | OWED: derive it or document it on the line (ch
 src/ops/fsck/census.zig:909 | 16 | OWED: derive it or document it on the line (charter §1.5)
 src/ops/fsck/census.zig:914 | 4 | OWED: derive it or document it on the line (charter §1.5)
 src/ops/fsck/census.zig:916 | 4 | OWED: derive it or document it on the line (charter §1.5)
-src/ops/fsck/classes.zig:756 | 64 | a percentage — OWED: derive it (charter §1.5) or document the measured reason
-src/ops/fsck/classes.zig:757 | 64 | OWED: derive it or document it on the line (charter §1.5)
-src/ops/fsck/classes.zig:764 | 64 | a percentage — OWED: derive it (charter §1.5) or document the measured reason
-src/ops/fsck/classes.zig:1418 | 8 | a size — OWED: derive from derive.Facts or document the physical/format reason
-src/ops/fsck/classes.zig:1485 | 256 | OWED: derive it or document it on the line (charter §1.5)
-src/ops/fsck/classes.zig:1797 | 16 | OWED: derive it or document it on the line (charter §1.5)
-src/ops/fsck/classes.zig:1801 | 4 | OWED: derive it or document it on the line (charter §1.5)
-src/ops/fsck/classes.zig:1803 | 4 | OWED: derive it or document it on the line (charter §1.5)
+src/ops/fsck/classes.zig:770 | 64 | a percentage — OWED: derive it (charter §1.5) or document the measured reason
+src/ops/fsck/classes.zig:771 | 64 | OWED: derive it or document it on the line (charter §1.5)
+src/ops/fsck/classes.zig:778 | 64 | a percentage — OWED: derive it (charter §1.5) or document the measured reason
+src/ops/fsck/classes.zig:1429 | 8 | a size — OWED: derive from derive.Facts or document the physical/format reason
+src/ops/fsck/classes.zig:1496 | 256 | OWED: derive it or document it on the line (charter §1.5)
+src/ops/fsck/classes.zig:1881 | 16 | OWED: derive it or document it on the line (charter §1.5)
+src/ops/fsck/classes.zig:1885 | 4 | OWED: derive it or document it on the line (charter §1.5)
+src/ops/fsck/classes.zig:1887 | 4 | OWED: derive it or document it on the line (charter §1.5)
 src/ops/fsck/finding.zig:312 | 10 | a table entry (switch/range arm) — the codec or classification table
-src/ops/fsck/finding.zig:811 | 0x20 | an encoding constant (magic, mask, flag bit, hash seed) — OWED: name it or document the table
+src/ops/fsck/finding.zig:816 | 0x20 | an encoding constant (magic, mask, flag bit, hash seed) — OWED: name it or document the table
 src/ops/fsck/runner.zig:1084 | 0o700 | a file mode (POSIX permission bits)
 src/ops/fsck/runner.zig:1086 | 0o700 | a file mode (POSIX permission bits)
 src/ops/jobs/admin_frames.zig:112 | 100 | a percentage — OWED: derive it (charter §1.5) or document the measured reason

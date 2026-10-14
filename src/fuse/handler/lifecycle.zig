@@ -1115,8 +1115,10 @@ test "no-open close bursts (decision 0003 §AF): a FLUSH with custody drains on 
     rig.d.dispatch(fl, Rig.meta(6, 50), s, null);
     try testing.expectEqual(@as(u32, 1), rig.fsi.flush_drains);
     try testing.expectEqual(def0 + 2, fuse_flush_drains_deferred.load());
-    // Past the window (stamp aged out): the close drains again.
-    rig.opens.markDrained(50, 1);
+    // Past the window: the stamp ages out of a 1 ns window (never a stamp
+    // set to the clock's past — a venue booted minutes ago reads every
+    // stamp younger than an hour).
+    rig.d.drain_coalesce_ns = 1;
     rig.d.dispatch(fl, Rig.meta(8, 50), s, null);
     try testing.expectEqual(@as(u32, 2), rig.fsi.flush_drains);
     // No window: every close with custody drains.

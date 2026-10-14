@@ -7250,9 +7250,11 @@ test "smoke: A CLOSE BURST COALESCES ITS DRAINS (decision 0003 §AF) — no-open
         try testing.expect(drains + deferred >= burst_children);
     }
     // The deferred custody lands — the cadence's next tick, or the last
-    // close's own drain once a window passed.
+    // close's own drain once a window passed. Both words at once: the
+    // cadence harvests an owed ino BEFORE its drain lands, so owed reads 0
+    // while the block is still parked for the drain's length.
     {
-        const st = try awaitExactly(rig, "\"fuse_owed_drain_inos\":", 0, 30 * std.time.ns_per_s);
+        const st = try awaitStats(rig, &.{ .{ .key = "\"fuse_owed_drain_inos\":", .want = 0 }, .{ .key = "\"parked_buffers\":", .want = 0 } }, 30 * std.time.ns_per_s);
         defer gpa.free(st);
         try testing.expectEqual(@as(?u64, 0), numberAfter(st, "\"fuse_owed_drain_inos\":"));
         try testing.expectEqual(@as(?u64, 0), numberAfter(st, "\"parked_buffers\":"));

@@ -30,7 +30,13 @@ if [ ! -d "$TRAIN" ]; then
 fi
 
 summary() { grep -E '^Build Summary' "$1" | tail -1 | sed 's/^Build Summary: //'; }
-failures() { grep -E "^error: '|^error: while executing test '" "$1" | sed -E "s/^error: (while executing test )?'([^']*)'.*/\2/" | sort -u | head -6 | paste -sd ';' -; }
+failures() {  # failed tests by name, else the steps that failed on their own (not transitively)
+  {
+    grep -E "^error: '|^error: while executing test '" "$1" | sed -E "s/^error: (while executing test )?'([^']*)'.*/\2/"
+    awk '/^Build Summary/{f=1} f' "$1" | grep -E ' (failure|[0-9]+ errors?|[0-9]+ failed)' | grep -v transitive | sed -E 's/^[ |+-]*//; s/ (failure|[0-9]+ errors?|[0-9]+ failed).*//' | sed 's/^/step: /'
+    grep -q 'terminated with signal KILL' "$1" && echo "a compiler was OOM-killed (signal KILL)"
+  } | sort -u | head -8 | paste -sd ';' -
+}
 
 reds_of() {  # consecutive reds on $1 at the end of the ledger
   awk -F'\t' -v s="$1" 'NR>1 { if ($2==s && ($3=="red" || $5=="red")) n++; else n=0 } END { print n+0 }' "$STATE/ledger.tsv"

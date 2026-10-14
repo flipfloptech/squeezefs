@@ -226,11 +226,43 @@ pub const MergeOutcome = struct {
     /// guard drops (RES-1).
     displaced: [max_displaced]Binding = undefined,
     n_displaced: u8 = 0,
+    /// The registrations the merge took on `displaced` before its commit
+    /// (decision 0003 §AH.1); the caller drops them AFTER its frees
+    /// (`dropHolds`). Null = nothing held (a merge that displaced nothing,
+    /// a fake map).
+    holds: ?ReleaseHolds = null,
 
     pub const max_displaced = 64;
 
     pub fn slice(self: *const MergeOutcome) []const Binding {
         return self.displaced[0..self.n_displaced];
+    }
+
+    /// The displaced releases are over: every binding freed.
+    pub fn dropHolds(self: *MergeOutcome) void {
+        const h = self.holds orelse return;
+        h.drop(self.slice());
+        self.holds = null;
+    }
+};
+
+/// A RELEASE is a live owner of its block from before its releasing commit
+/// until its free (decision 0003 §AH.1): between the two the allocator
+/// still tracks a block no durable reference names and no record names the
+/// departed owner, so an online census reads it as leaked unless the
+/// in-flight registry holds it. `hold` before the commit, `drop` after the
+/// free (or on the path that abandons the release), one pairing per binding.
+pub const ReleaseHolds = struct {
+    ctx: *anyopaque,
+    hold_fn: *const fn (ctx: *anyopaque, binding: Binding) void,
+    drop_fn: *const fn (ctx: *anyopaque, binding: Binding) void,
+
+    pub fn hold(self: ReleaseHolds, bindings: []const Binding) void {
+        for (bindings) |b| self.hold_fn(self.ctx, b);
+    }
+
+    pub fn drop(self: ReleaseHolds, bindings: []const Binding) void {
+        for (bindings) |b| self.drop_fn(self.ctx, b);
     }
 };
 
@@ -306,6 +338,24 @@ pub const ReclaimFree = struct {
 
     pub fn seam(self: *ReclaimFree) FreeSeam {
         return .{ .ctx = self, .free_fn = &free };
+    }
+
+    /// The in-flight registrations of releases on these volumes (decision
+    /// 0003 §AH.1); a binding on no mounted volume holds nothing.
+    pub fn holds(self: *ReclaimFree) ReleaseHolds {
+        return .{ .ctx = self, .hold_fn = &holdOne, .drop_fn = &dropOne };
+    }
+
+    fn holdOne(ctx: *anyopaque, b: Binding) void {
+        const self: *ReclaimFree = @ptrCast(@alignCast(ctx));
+        const v = self.vols.byTag(b.vol_tag) orelse return;
+        v.alloc.holdInflight(v.alloc.idxOf(b.offset));
+    }
+
+    fn dropOne(ctx: *anyopaque, b: Binding) void {
+        const self: *ReclaimFree = @ptrCast(@alignCast(ctx));
+        const v = self.vols.byTag(b.vol_tag) orelse return;
+        v.alloc.dropInflight(v.alloc.idxOf(b.offset));
     }
 
     fn free(ctx: *anyopaque, io: Io, b: Binding) FreeVerdict {

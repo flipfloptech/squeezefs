@@ -234,6 +234,10 @@ pub const RamMap = struct {
     /// Order of merges against the device trace (an fsync's DUR-1 pin).
     on_merge: ?*const fn (*RamMap) void = null,
     before_merge: ?MergeHook = null,
+    /// The product merge's law (decision 0003 §AH.1): every displaced
+    /// binding held in flight from before the publish, the outcome carrying
+    /// the holds for the caller to drop after its frees. Null = none.
+    holds: ?seams.ReleaseHolds = null,
 
     pub fn init(gpa: Allocator) RamMap {
         return .{ .gpa = gpa };
@@ -327,6 +331,10 @@ pub const RamMap = struct {
         }
         if (req.min_size > f.size) f.size = req.min_size;
         f.kind = .striped;
+        if (self.holds) |h| {
+            h.hold(out.slice());
+            out.holds = h;
+        }
         self.merges.append(self.gpa, .{ .ino = req.ino, .blocks = @intCast(req.inserts.len), .min_size = req.min_size, .fencing = req.fencing, .displaced = out.n_displaced }) catch return error.OutOfMemory;
         if (self.on_merge) |h| h(self);
         return out;
@@ -346,6 +354,10 @@ pub const RamFrees = struct {
     gpa: Allocator,
     vols: *const seams.Volumes,
     freed: std.ArrayList(Binding) = .empty,
+    /// Frees whose block no live owner held in flight (decision 0003
+    /// §AH.1: a released binding is held until after its free, an
+    /// unpublished mint by its guard).
+    unheld: u32 = 0,
 
     pub fn init(gpa: Allocator, vols: *const seams.Volumes) RamFrees {
         return .{ .gpa = gpa, .vols = vols };
@@ -359,10 +371,29 @@ pub const RamFrees = struct {
         return .{ .ctx = self, .free_fn = &free };
     }
 
+    /// The in-flight registrations on these volumes (the product's
+    /// `ReclaimFree.holds`).
+    pub fn holds(self: *RamFrees) seams.ReleaseHolds {
+        return .{ .ctx = self, .hold_fn = &holdOne, .drop_fn = &dropOne };
+    }
+
+    fn holdOne(ctx: *anyopaque, b: Binding) void {
+        const self: *RamFrees = @ptrCast(@alignCast(ctx));
+        const v = self.vols.byTag(b.vol_tag) orelse return;
+        v.alloc.holdInflight(v.alloc.idxOf(b.offset));
+    }
+
+    fn dropOne(ctx: *anyopaque, b: Binding) void {
+        const self: *RamFrees = @ptrCast(@alignCast(ctx));
+        const v = self.vols.byTag(b.vol_tag) orelse return;
+        v.alloc.dropInflight(v.alloc.idxOf(b.offset));
+    }
+
     fn free(ctx: *anyopaque, _: Io, b: Binding) seams.FreeVerdict {
         const self: *RamFrees = @ptrCast(@alignCast(ctx));
         self.freed.append(self.gpa, b) catch return .refused;
         const v = self.vols.byTag(b.vol_tag) orelse return .refused;
+        if (!v.alloc.inflightContains(v.alloc.idxOf(b.offset))) self.unheld += 1;
         const verdict = v.alloc.freeBlock(v.alloc.idxOf(b.offset)) catch return .refused;
         return switch (verdict) {
             .terminal => .terminal,
@@ -398,6 +429,7 @@ pub const Fixture = struct {
         f.vols.add(.{ .vol_tag = VOL_A, .ordinal = 0, .alloc = f.alloc_a, .passthrough = true, .write_cache_volatile = true });
         f.vols.add(.{ .vol_tag = VOL_B, .ordinal = 1, .alloc = f.alloc_b, .passthrough = false, .write_cache_volatile = false });
         f.frees = RamFrees.init(gpa, &f.vols);
+        f.map.holds = f.frees.holds();
         return f;
     }
 

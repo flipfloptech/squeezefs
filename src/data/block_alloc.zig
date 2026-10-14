@@ -454,6 +454,9 @@ pub const stats = struct {
     pub var block_key_incarnation_exhausted: counters.Tripwire = .init("block_key_incarnation_exhausted");
     pub var block_live_free_refusals: counters.Tripwire = .init("block_live_free_refusals");
     pub var alloc_trim_window_parks: counters.Tripwire = .init("alloc_trim_window_parks");
+    /// An in-flight registration dropped with none held (decision 0003
+    /// §AH.1: a release's hold and its drop are one pairing).
+    pub var block_inflight_unheld_drops: counters.Tripwire = .init("block_inflight_unheld_drops");
     /// An unpublished mint returned by its rollback owner: a failed DMA, a
     /// publish refused, or a write-through SUPERSEDED by a newer write
     /// landing during its DMA (latest-wins — a healthy storm's outcome, so
@@ -493,7 +496,7 @@ pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
     inline for (.{ "alloc_from_freelist", "alloc_fresh_mints", "del_obj", "block_pin_stale_keys", "block_key_incarnation_unknown", "unpublished_offsets_recovered", "block_untracked_free_adjudicated", "shared_release_failures", "meta_kv_block_refs_recovered", "unpublished_mint_abandons", "dlm_quarantined_offsets", "dlm_quarantine_releases", "block_quarantine_deferred_frees", "block_quarantine_takebacks" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, @field(stats, name).load() });
     }
-    inline for (.{ "block_double_frees", "block_untracked_free_refusals", "block_claim_anomalies", "block_key_incarnation_exhausted", "block_live_free_refusals", "alloc_trim_window_parks" }) |name| {
+    inline for (.{ "block_double_frees", "block_untracked_free_refusals", "block_claim_anomalies", "block_key_incarnation_exhausted", "block_live_free_refusals", "alloc_trim_window_parks", "block_inflight_unheld_drops" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, counters.tripwireCount(name) });
     }
     try w.print("\"alloc_fresh_supply_exhausted\":[{d},{d}]}}", .{ stats.alloc_fresh_supply_exhausted_latched.load(), stats.alloc_fresh_supply_exhausted_candidates.load() });
@@ -1867,6 +1870,30 @@ pub const BlockAllocator = struct {
         return self.cell(idx).inflight.load(.acquire) != 0;
     }
 
+    /// One registration in the in-flight registry — the list-shaped twin
+    /// of `InflightAllocGuard` for a site that carries its released
+    /// bindings from before its commit to after their frees (decision
+    /// 0003 §AH.1). acq_rel like the guard's: ordered before the releasing
+    /// commit a census may read.
+    pub fn holdInflight(self: *BlockAllocator, idx: u64) void {
+        _ = self.cell(idx).inflight.fetchAdd(1, .acq_rel);
+    }
+
+    /// The registration `holdInflight` took. A drop with none held is a
+    /// pairing break upstream: refused (the count never wraps into a
+    /// shield nobody drops) and counted.
+    pub fn dropInflight(self: *BlockAllocator, idx: u64) void {
+        const c = self.cell(idx);
+        var cur = c.inflight.load(.monotonic);
+        while (true) {
+            if (cur == 0) {
+                stats.block_inflight_unheld_drops.fire("an in-flight registration dropped with none held");
+                return;
+            }
+            cur = c.inflight.cmpxchgWeak(cur, cur - 1, .acq_rel, .monotonic) orelse return;
+        }
+    }
+
     pub fn fsckSetRefcount(self: *BlockAllocator, idx: u64, count: u32) void {
         assert(count != 0);
         self.cell(idx).refcount.store(count, .release);
@@ -1920,9 +1947,12 @@ pub const BlockAllocator = struct {
 // Guards (§5).
 // ---------------------------------------------------------------------------
 
-/// fsck VISIBILITY ONLY: a live owner of an allocated-but-unpublished block.
-/// Dropping it frees NOTHING (KD-OV-11); a crashed owner drops it on unwind
-/// so a genuinely leaked block is never shielded.
+/// fsck VISIBILITY ONLY: a live owner of a block whose tracking and durable
+/// references disagree by construction — a mint before its publish lands,
+/// a RELEASE from before its releasing commit until its free (decision
+/// 0003 §AH.1), a queued free. Dropping it frees NOTHING (KD-OV-11); a
+/// crashed owner drops it on unwind so a genuinely leaked block is never
+/// shielded.
 pub const InflightAllocGuard = struct {
     alloc: *BlockAllocator,
     idx: u64,
@@ -2283,6 +2313,31 @@ test "guards: the in-flight guard is visibility only; the mint guard's abandon r
     g2.disarm();
     g2.abandon();
     try testing.expectEqual(State.allocated, a.stateOf(m2.idx));
+}
+
+test "a release's in-flight registrations (decision 0003 §AH.1): holds stack with the guard's on one cell, each drop ends one, and a drop with none held is refused (the count never wraps into a shield nobody drops) and counted" {
+    const a = try testAlloc(4);
+    defer a.deinit();
+    const m = try a.allocateBlock();
+    var mint = InflightAllocGuard.register(a, m.idx);
+    a.holdInflight(m.idx);
+    a.holdInflight(m.idx);
+    mint.deinit();
+    a.dropInflight(m.idx);
+    try testing.expect(a.inflightContains(m.idx));
+    a.dropInflight(m.idx);
+    try testing.expect(!a.inflightContains(m.idx));
+    const before = counters.tripwireCount("block_inflight_unheld_drops");
+    stats.block_inflight_unheld_drops.resetLogBudgetForTest();
+    log.testing.expectErrorLogs(1);
+    a.dropInflight(m.idx);
+    try log.testing.expectAllFired();
+    try testing.expectEqual(before + 1, counters.tripwireCount("block_inflight_unheld_drops"));
+    try testing.expect(!a.inflightContains(m.idx));
+    a.holdInflight(m.idx);
+    try testing.expect(a.inflightContains(m.idx));
+    a.dropInflight(m.idx);
+    try testing.expectEqual(State.allocated, a.stateOf(m.idx)); // visibility only
 }
 
 test "mount seed: recover_block gap-fills quiescently, counts references, and the runtime specific claim refuses a taken block" {

@@ -1731,6 +1731,9 @@ test "live_mapped_overwrite_rides_the_overlay_end_to_end: the install captures t
     try testing.expectEqual(@as(usize, 1), w.f.map.merges.items.len);
     try testing.expectEqual(@as(usize, 1), w.f.frees.freed.items.len);
     try testing.expect(w.f.frees.freed.items[0].eql(a));
+    // Held across its free, not after (decision 0003 §AH.1).
+    try testing.expectEqual(@as(u32, 0), w.f.frees.unheld);
+    try testing.expect(!w.f.alloc_a.inflightContains(w.f.alloc_a.idxOf(a.offset)));
     const nb = w.f.map.seam().lookup(42, 0).?;
     var got: [wt.BS]u8 = undefined;
     w.f.dev.peek(wt.VOL_A, nb.offset, &got);

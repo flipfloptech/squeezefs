@@ -671,9 +671,36 @@ test "epoch_records_are_ram_only_until_the_one_save_swap; full_coverage_auto_clo
     try testing.expect(f.map.seam().lookup(10, 1).?.eql(b1));
     try testing.expectEqual(@as(usize, 2), f.frees.freed.items.len);
     try testing.expect(!f.alloc_a.inflightContains(m0.idx));
+    // The A keys the save released were held across their frees and are
+    // not after (decision 0003 §AH.1).
+    try testing.expectEqual(@as(u32, 0), f.frees.unheld);
+    try testing.expect(!f.alloc_a.inflightContains(f.alloc_a.idxOf(a0.offset)));
+    try testing.expect(!f.alloc_a.inflightContains(f.alloc_a.idxOf(a1.offset)));
     try testing.expectEqual(@as(usize, 0), ep.openCount());
     try testing.expectEqual(CloseOutcome.absent, ep.close(io, 10, cs));
     try testing.expectEqual(parked0, stats.rewrite_shadow_parked_bytes.load());
+}
+
+test "the save's frees are live owners' (decision 0003 §AH.1): an intermediate B the epoch superseded stays an unpublished mint under its guard until its free, the A key the save displaced stays held from before the save until after its free; nothing is left in flight" {
+    const io = testing.io;
+    const f = try wt.Fixture.init(testing.allocator, 16);
+    defer f.deinit();
+    var ep = Epochs.init(testing.allocator, wt.BS, true);
+    defer ep.deinit();
+    const a = try f.publishBlock(11, 0, 0xAA);
+    const m1 = try f.alloc_a.allocateBlock();
+    const m2 = try f.alloc_a.allocateBlock();
+    const b1 = Binding.wholeBlock(wt.VOL_A, m1.offset, m1.stamp);
+    const b2 = Binding.wholeBlock(wt.VOL_A, m2.offset, m2.stamp);
+    _ = try ep.record(11, 0, a, b1, proofFor(b1, wt.BS), 2 * wt.BS, block_alloc.InflightAllocGuard.register(f.alloc_a, m1.idx), true);
+    const v2 = try ep.record(11, 0, a, b2, proofFor(b2, wt.BS), 2 * wt.BS, block_alloc.InflightAllocGuard.register(f.alloc_a, m2.idx), true);
+    try testing.expect(v2.shadowed.displaced_prev.?.eql(b1)); // B1 superseded, parked as ours
+    const cs: Epochs.CloseSeams = .{ .map = f.map.seam(), .free = f.frees.seam(), .purge = .none };
+    try testing.expect(ep.close(io, 11, cs) == .swapped);
+    try testing.expect(f.map.seam().lookup(11, 0).?.eql(b2));
+    try testing.expectEqual(@as(usize, 2), f.frees.freed.items.len); // A and B1
+    try testing.expectEqual(@as(u32, 0), f.frees.unheld);
+    for ([_]u64{ f.alloc_a.idxOf(a.offset), m1.idx, m2.idx }) |idx| try testing.expect(!f.alloc_a.inflightContains(idx));
 }
 
 test "fenced_close_publishes_nothing_and_frees_nothing; a_process_local_lease_rotation_converges_the_close; a transient re-registers never-lossy; a reclaimed ino discards orphans" {

@@ -70,15 +70,33 @@ const Dir = struct {
         try t.stagePut(key.TREE_DENTRIES, &key.dentryKey(parent_eff, key.dentryNameHash54(name, set.nameKey()), 0), v);
     }
 
+    /// Creates per entry: the fixture is the shape fsck walks, not the
+    /// commit path's (one create per entry cost 10 k journal round trips in
+    /// a Debug test); a parent staged twice in one entry keeps the last.
+    const FILL_BATCH: usize = 128;
+
     fn fill(self: *const Dir, set: *meta_set.MetaSet, from: usize, to: usize) !void {
-        var buf: [16]u8 = undefined;
-        for (from..to) |i| {
-            const nm = nameOf(i, &buf);
-            const parent = switch (self.shape) {
-                .flat => self.dir,
-                .striped => self.stripes[stripe.stripeOf(key.dentryNameHash54(nm, set.nameKey()), stripe.K_MAX)],
-            };
-            _ = try meta_set.createFile(set, parent, nm);
+        var names: [FILL_BATCH][16]u8 = undefined;
+        var i = from;
+        while (i < to) {
+            const t = try set.begin(@src());
+            var owned = true;
+            errdefer if (owned) set.abandon(t);
+            const end = @min(to, i + FILL_BATCH);
+            while (i < end) : (i += 1) {
+                const nm = nameOf(i, &names[i % FILL_BATCH]);
+                const parent = switch (self.shape) {
+                    .flat => self.dir,
+                    .striped => self.stripes[stripe.stripeOf(key.dentryNameHash54(nm, set.nameKey()), stripe.K_MAX)],
+                };
+                const parent_eff = set.effectiveIno(parent);
+                const pv_bytes = (try set.lookup(set.gpa, key.TREE_INODES, &key.inodeKey(parent_eff))) orelse return error.ParentMissing;
+                defer set.gpa.free(pv_bytes);
+                const child = try set.allocateIno(parent_eff, false, false);
+                _ = try economy.stageCreate(t, .{ .name_key = set.nameKey(), .now = 1000, .parent = parent_eff, .parent_value = try record.InodeValue.decode(pv_bytes), .name = nm, .mode = economy.S.IFREG | 0o644, .uid = 0, .gid = 0, .local_ino = child, .global_ino = set.globalIno(child) });
+            }
+            owned = false;
+            try set.commit(t);
         }
     }
 };

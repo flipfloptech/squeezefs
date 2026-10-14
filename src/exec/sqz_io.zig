@@ -135,6 +135,12 @@ pub const SqzIo = struct {
     fuse_alive: []*const std.atomic.Value(bool),
     fuse_homes: []placement.Placement.LaneHome,
     stack_component: mem_budget.Component,
+    /// The DRIVEN lanes (decision 0003 §AB.3): owned and run by the FUSE
+    /// drain workers, listed here for the stats, the stack gauge and the
+    /// idle trim — one slot per queue (a group drives at most one).
+    driven: []?*Lane = &.{},
+    /// Held for a list edit or one walk of it (never across a park).
+    driven_lock: std.atomic.Value(bool) = .init(false),
 
     fn fiberContext() usize {
         return @intFromPtr(lane_mod.currentFiber() orelse return 0);
@@ -144,8 +150,42 @@ pub const SqzIo = struct {
         const self: *SqzIo = @ptrCast(@alignCast(ctx));
         var n: u64 = 0;
         for (self.lanes) |l| n += l.residentStackBytes();
+        self.lockDriven();
+        defer self.unlockDriven();
+        for (self.driven) |d| if (d) |l| {
+            n += l.residentStackBytes();
+        };
         stats.fiber_stack_resident_bytes.set(n);
         return n;
+    }
+
+    fn lockDriven(self: *SqzIo) void {
+        // acquire pairs with `unlockDriven`'s release.
+        while (self.driven_lock.swap(true, .acquire)) std.atomic.spinLoopHint();
+    }
+
+    fn unlockDriven(self: *SqzIo) void {
+        self.driven_lock.store(false, .release);
+    }
+
+    /// List a driven lane (its owner keeps it); false = no slot left.
+    pub fn adoptDriven(self: *SqzIo, lane: *Lane) bool {
+        self.lockDriven();
+        defer self.unlockDriven();
+        for (self.driven) |*d| if (d.* == null) {
+            d.* = lane;
+            return true;
+        };
+        return false;
+    }
+
+    /// Before its owner frees it.
+    pub fn releaseDriven(self: *SqzIo, lane: *Lane) void {
+        self.lockDriven();
+        defer self.unlockDriven();
+        for (self.driven) |*d| if (d.* == lane) {
+            d.* = null;
+        };
     }
 
     /// The idle-trim hook (`mem_budget.TrimFn`): every lane's free slots.
@@ -159,6 +199,11 @@ pub const SqzIo = struct {
     pub fn trimIdleStacks(self: *SqzIo, min_idle_ticks: u64) u32 {
         var n: u32 = 0;
         for (self.lanes) |l| n += l.trimIdleStacks(min_idle_ticks);
+        self.lockDriven();
+        defer self.unlockDriven();
+        for (self.driven) |d| if (d) |l| {
+            n += l.trimIdleStacks(min_idle_ticks);
+        };
         return n;
     }
 
@@ -314,6 +359,11 @@ pub const SqzIo = struct {
         }
         self.fuse_alive = alive;
         self.fuse_homes = homes;
+        if (options.fuse) |g| {
+            self.driven = try gpa.alloc(?*Lane, g.nqueues);
+            @memset(self.driven, null);
+        }
+        errdefer gpa.free(self.driven);
         self.fuse_placement = try placement.Placement.init(gpa, homes, alive, self.topo.node_count);
 
         // Non-sheddable (the live frames are the handlers'), but the idle
@@ -334,6 +384,7 @@ pub const SqzIo = struct {
         self.fuse_placement.deinit(self.gpa);
         self.gpa.free(self.fuse_homes);
         self.gpa.free(self.fuse_alive);
+        self.gpa.free(self.driven);
         for (self.lanes) |l| l.deinit();
         self.gpa.free(self.lanes);
         self.threaded.deinit();
@@ -553,6 +604,15 @@ pub const SqzIo = struct {
             if (n == views.len) break;
             views[n] = l.view();
             n += 1;
+        }
+        {
+            self.lockDriven();
+            defer self.unlockDriven();
+            for (self.driven) |d| if (d) |l| {
+                if (n == views.len) break;
+                views[n] = l.view();
+                n += 1;
+            };
         }
         try stats.writeStatsJson(w, views[0..n]);
     }

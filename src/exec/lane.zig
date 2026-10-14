@@ -132,6 +132,13 @@ const setup_ladder = [_]u32{
     0,
 };
 
+/// A driven lane's ladder: no `DEFER_TASKRUN` (its completions would post
+/// only inside an enter of this ring, which its owner never waits on).
+const driven_ladder = [_]u32{
+    linux.IORING_SETUP_SINGLE_ISSUER | linux.IORING_SETUP_COOP_TASKRUN,
+    0,
+};
+
 /// Cross-thread messages. The bound is 2 × fiber_capacity: a fiber is queued
 /// at most once (`task_state` law 2) plus at most one pending cancel.
 pub const Msg = union(enum) {
@@ -160,6 +167,10 @@ pub const Options = struct {
     /// sizes the ring from its own population.
     ring_entries: ?u16 = null,
     resident: ?Resident = null,
+    /// A DRIVEN lane (decision 0003 §AB.3): no thread of its own — the
+    /// owner thread (a FUSE drain worker) `attachDriven`s it and runs it
+    /// from its pass (`pumpDriven`).
+    driven: bool = false,
 };
 
 /// Set on a lane thread for its lifetime.
@@ -172,6 +183,8 @@ pub threadlocal var current_lane: ?*Lane = null;
 /// (decision 0003 §AB.4).
 pub fn laneIdleBesidesCaller() bool {
     const l = current_lane orelse return false;
+    // A driven lane's owner serves a ring beside it: never idle.
+    if (l.driven) return false;
     return l.ready_head == null and l.inbox.isEmpty();
 }
 
@@ -253,6 +266,7 @@ pub const Lane = struct {
     drop_next_wake: std.atomic.Value(bool),
     ring_entries: u16,
     resident: ?Resident,
+    driven: bool,
     ring_dead_logged: bool = false,
 
     pub const InitError = std.mem.Allocator.Error;
@@ -296,6 +310,7 @@ pub const Lane = struct {
             .drop_next_wake = .init(options.drop_first_wake),
             .ring_entries = options.ring_entries orelse ringEntriesFor(options.fiber_capacity),
             .resident = options.resident,
+            .driven = options.driven,
         };
         self.name = commNameFor(&self.name_src, options.class, options.index);
         self.inbox = try mpmc.BoundedMpmc(Msg).init(gpa, 2 * options.fiber_capacity);
@@ -407,6 +422,82 @@ pub const Lane = struct {
     /// `io_uring_enter` calls this lane's ring paid so far.
     pub fn enters(self: *const Lane) u64 {
         return self.ring.enters.load(.monotonic);
+    }
+
+    // ---- the driven lane (decision 0003 §AB.3) ----
+
+    /// On the OWNER thread (the drain worker at its start): the ring is
+    /// built here — a ladder without `DEFER_TASKRUN`, whose completions post
+    /// only inside an enter of THIS ring, which the owner never waits on —
+    /// and every CQE it posts writes the wake eventfd
+    /// (`IORING_REGISTER_EVENTFD`). The owner's ring holds the standing
+    /// READ of that eventfd (`wakeFd`), so its ONE wait covers a foreign
+    /// enqueue and the lane's own ring ops alike.
+    pub fn attachDriven(self: *Lane) StartError!void {
+        assert(self.driven and self.thread == null and current_lane == null);
+        var rung: usize = undefined;
+        self.ring = ring_park.ParkedRing.initProbing(self.gpa, self.ring_entries, &driven_ladder, &rung) catch return error.RingSetupFailed;
+        self.ring.ring.register_eventfd(self.ring.event_fd) catch {
+            log.err("exec: driven lane {d} ({s}): IORING_REGISTER_EVENTFD refused — the lane's ring ops could not wake its owner", .{ self.index, self.name });
+            self.ring.deinit();
+            return error.RingSetupFailed;
+        };
+        self.started.store(1, .release);
+        current_lane = self;
+    }
+
+    /// The eventfd the owner's standing READ watches.
+    pub fn wakeFd(self: *const Lane) linux.fd_t {
+        return self.ring.event_fd;
+    }
+
+    /// The owner's READ of `wakeFd` completed: the next pump DISARMS
+    /// before it scans the inbox (`wake_core_model`'s order).
+    pub fn drivenWakeConsumed(self: *Lane) void {
+        self.ring.wake_consumed = true;
+    }
+
+    /// ONE non-blocking pass on the owner thread: reap the ring → DISARM →
+    /// scan the inbox → timers → run the fibers ready at entry (one made
+    /// ready during the run waits for the owner's next pass, so the owner's
+    /// own completions interleave) → submit what they pushed.
+    pub fn pumpDriven(self: *Lane) void {
+        assert(self.driven and current_lane == self);
+        self.passTop();
+        self.runReadyBudget(self.ready_len);
+        if (!self.ring.isDead() and self.ring.ring.sq_ready() > 0) self.ring.flush();
+    }
+
+    /// A fiber is runnable: the owner must not park.
+    pub fn drivenRunnable(self: *const Lane) bool {
+        return self.ready_head != null;
+    }
+
+    /// The owner's wait bound for this lane: its next timer, and the
+    /// backstop while a ring op is owed (a lost CQE wake is a hiccup);
+    /// null = nothing to bound.
+    pub fn drivenBoundNs(self: *Lane) ?u64 {
+        var bound: ?u64 = if (self.in_flight > 0) backstop_ns else null;
+        if (self.timers.peekDeadline()) |d| {
+            const left = d -| clock.monotonicNs();
+            bound = if (bound) |b| @min(b, left) else left;
+        }
+        return bound;
+    }
+
+    /// Fibers between spawn and recycle.
+    pub fn liveFibers(self: *const Lane) u32 {
+        return self.live.load(.acquire);
+    }
+
+    /// On the owner thread at its exit, every fiber recycled: the ring
+    /// goes here (a single-issuer ring refuses another thread's enter).
+    pub fn detachDriven(self: *Lane) void {
+        assert(self.driven and current_lane == self);
+        self.ring.deinit();
+        self.alive.store(false, .release);
+        self.started.store(0, .release);
+        current_lane = null;
     }
 
     /// The `main` class: the CALLING thread is the lane (`SqzIo.run`'s
@@ -691,7 +782,11 @@ pub const Lane = struct {
     }
 
     fn runReady(self: *Lane) void {
-        var budget: u32 = if (self.poll_budget == 0) std.math.maxInt(u32) else self.poll_budget;
+        self.runReadyBudget(if (self.poll_budget == 0) std.math.maxInt(u32) else self.poll_budget);
+    }
+
+    fn runReadyBudget(self: *Lane, polls: u32) void {
+        var budget = polls;
         while (budget > 0) : (budget -= 1) {
             const f = self.popReady() orelse break;
             if (!f.state.beginPoll()) continue;
@@ -900,6 +995,100 @@ fn spawnTest(l: *Lane, g: *Io.Group, start_fn: *const fn (*const anyopaque) void
 
 fn waitQuiescent(l: *Lane) void {
     while (l.live.load(.monotonic) != 0) std.Thread.yield() catch {};
+}
+
+test "a DRIVEN lane (decision 0003 §AB.3): no thread of its own — its owner's ONE wait (a standing READ of the lane's eventfd on the owner's ring) wakes for a foreign enqueue AND for the lane ring's own CQE (a 20 ms timeout: its completion is task work that must interrupt the owner's wait on its OTHER ring, never wait for the 1 s bound); each pump runs what is ready; a same-thread spawn writes no eventfd" {
+    const page = std.heap.pageSize();
+    const l = try Lane.init(testing.allocator, .{ .index = 0, .class = .fuse_ur, .fiber_capacity = 8, .stack_size = fiber_mod.stackSizeFor(.fuse_ur, page), .page = page, .driven = true });
+    defer l.deinit();
+    const Owner = struct {
+        lane: *Lane,
+        p_park: Probe = .{},
+        p_op: Probe = .{},
+        parked_fiber: std.atomic.Value(?*Fiber) = .init(null),
+        events: u32 = 0,
+        ticks: u32 = 0,
+        writes_before: u64 = 0,
+        writes_after_spawn: u64 = 0,
+        result: anyerror!void = {},
+
+        fn parkRun(context: *const anyopaque) void {
+            const c = ctxOf(context);
+            const f = currentFiber().?;
+            _ = c.probe.polled.fetchAdd(1, .acq_rel);
+            f.park();
+            _ = c.probe.polled.fetchAdd(1, .acq_rel);
+            c.probe.finish();
+        }
+        fn timeoutRun(context: *const anyopaque) void {
+            const c = ctxOf(context);
+            const f = currentFiber().?;
+            _ = c.probe.polled.fetchAdd(1, .acq_rel);
+            const ts: linux.kernel_timespec = .{ .sec = 0, .nsec = 20 * std.time.ns_per_ms };
+            std.debug.assert(c.lane.armRingOp(f, linux.io_uring_sqe.prep_timeout, .{ &ts, 0, 0 }));
+            f.park();
+            _ = c.probe.polled.fetchAdd(1, .acq_rel);
+            c.probe.finish();
+        }
+        /// The owner's ONE wait: its own ring, a READ of the lane's eventfd.
+        fn waitOnce(self: *@This(), ring: *ring_park.ParkedRing, buf: *u64) !void {
+            const sqe = ring.getSqe() orelse return error.SqFull;
+            sqe.prep_read(self.lane.wakeFd(), std.mem.asBytes(buf), 0);
+            sqe.user_data = 7;
+            switch (ring.park(std.time.ns_per_s)) {
+                .event => self.events += 1,
+                .tick => self.ticks += 1,
+            }
+            var cqes: [8]linux.io_uring_cqe = undefined;
+            const n = try ring.ring.copy_cqes(&cqes, 0);
+            for (cqes[0..n]) |cqe| if (cqe.user_data == 7) self.lane.drivenWakeConsumed();
+            self.lane.pumpDriven();
+        }
+        fn main(self: *@This()) void {
+            self.result = self.body();
+        }
+        fn body(self: *@This()) !void {
+            try self.lane.attachDriven();
+            defer self.lane.detachDriven();
+            // The owner's ring in the drain worker's posture.
+            var ring = try ring_park.ParkedRing.init(testing.allocator, 8, linux.IORING_SETUP_SINGLE_ISSUER | linux.IORING_SETUP_DEFER_TASKRUN);
+            defer ring.deinit();
+            var buf: u64 = 0;
+            var g1 = membersGroup(1);
+            var g2 = membersGroup(1);
+            // A same-thread spawn: the ready FIFO, no eventfd write.
+            self.writes_before = stats.wake_writes.load();
+            const f = try spawnTest(self.lane, &g1, parkRun, .{ .probe = &self.p_park, .lane = self.lane });
+            self.writes_after_spawn = stats.wake_writes.load();
+            self.lane.pumpDriven();
+            if (self.p_park.polled.load(.acquire) != 1) return error.NotRun;
+            self.parked_fiber.store(f, .release);
+            // The foreign wake (another thread) reaches this ONE wait.
+            while (self.p_park.done.load(.acquire) == 0) try self.waitOnce(&ring, &buf);
+            // The lane ring's own CQE reaches the same wait through the
+            // registered eventfd — a timer's completion runs as task work,
+            // which must interrupt this thread's wait on the other ring.
+            _ = try spawnTest(self.lane, &g2, timeoutRun, .{ .probe = &self.p_op, .lane = self.lane });
+            self.lane.pumpDriven();
+            while (self.p_op.done.load(.acquire) == 0) try self.waitOnce(&ring, &buf);
+            while (self.lane.liveFibers() != 0) self.lane.pumpDriven();
+        }
+    };
+    var o: Owner = .{ .lane = l };
+    const t = try std.Thread.spawn(.{}, Owner.main, .{&o});
+    // Wake the parked fiber from THIS (foreign) thread.
+    while (o.parked_fiber.load(.acquire) == null) try std.Thread.yield();
+    const f = o.parked_fiber.load(.acquire).?;
+    while (f.state.load() != .idle) try std.Thread.yield();
+    try testing.expect(f.state.wake());
+    l.enqueue(f);
+    t.join();
+    try o.result;
+    try testing.expectEqual(@as(u32, 2), o.p_park.polled.load(.acquire));
+    try testing.expectEqual(@as(u32, 2), o.p_op.polled.load(.acquire));
+    try testing.expectEqual(o.writes_before, o.writes_after_spawn);
+    try testing.expect(o.events >= 2);
+    try testing.expectEqual(@as(u32, 0), o.ticks);
 }
 
 test "spawn_runs_to_completion: a foreign spawn completes and its slot returns to the pool; the thread carries the class name" {

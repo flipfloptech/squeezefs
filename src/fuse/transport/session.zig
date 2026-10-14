@@ -1218,6 +1218,8 @@ pub const Session = struct {
             .io = self.io,
             .slab = if (self.slab) |*s| s else null,
             .test_error_logs = cfg.test_error_logs,
+            .handlers_on_worker = knobs.boolKnob("SQUEEZEFS_FUSE_HANDLERS_ON_WORKER", env),
+            .budget_bytes = cfg.mem_budget_bytes,
         };
         if (read_fusion_lever and !self.shared.read_fusion_on) log.info("transport: SQUEEZEFS_FUSE_READ_FUSION=1 accepted; inert on a {t} session (the fused poll is the zero-copy mode's)", .{self.mode});
         if (self.shared.sqpoll) log.info("transport: SQUEEZEFS_FUSE_SQPOLL=1 — the kernel submission poller (measured not recommended: the A/B control arm)", .{});
@@ -1727,6 +1729,9 @@ pub const Session = struct {
         try field(w, "transport_fused_read_fusions", worker.fused_read_fusions.load());
         try field(w, "transport_fused_read_demotions", worker.fused_read_demotions.load());
         try field(w, "transport_dispatch_refused", worker.dispatch_refused.load());
+        try field(w, "transport_handler_dispatches_own", worker.handler_dispatches_own.load());
+        try field(w, "transport_handler_dispatches_foreign", worker.handler_dispatches_foreign.load());
+        try field(w, "transport_lane_pumps", worker.lane_pumps.load());
         try field(w, "transport_payload_leases", slot.payload_leases.load());
         try field(w, "transport_dest_dma_leases", slot.dest_dma_leases.load());
         try field(w, "transport_leases_outstanding", slot.leases_outstanding.load());
@@ -2209,6 +2214,89 @@ test "e2e: a LOOKUP and a GETATTR the filesystem answers from RAM never leave th
     try testing.expect(worker.meta_inline_demotes.load() > m1);
 }
 
+test "e2e: a namespace request's handler runs on the thread that delivered it — the worker drives its own lane: every OPENDIR / READDIR / RELEASEDIR / OPEN lands on it, the handler's thread IS a drain worker's, the reply commits with no cross-thread wake; the data class (RELEASE, a demoted READ) stays on the handler lane; the control arm (SQUEEZEFS_FUSE_HANDLERS_ON_WORKER=0) crosses a thread each way (decision 0003 §AB.3)" {
+    if (venueMissing()) |why| return testkit.skipWhy(@src(), why);
+    const Helper = struct {
+        fn listRoot(r: *Rig, result: *anyerror!void) void {
+            result.* = listBody(r);
+        }
+        fn listBody(r: *Rig) !void {
+            var buf: [4096]u8 align(8) = undefined;
+            var i: usize = 0;
+            while (i < 64) : (i += 1) {
+                const rc = linux.open(r.path.ptr, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true }, 0);
+                if (linux.errno(rc) != .SUCCESS) return error.OpenFailed;
+                const fd: linux.fd_t = @intCast(rc);
+                defer _ = linux.close(fd);
+                while (true) {
+                    const n = linux.getdents64(fd, &buf, buf.len);
+                    if (linux.errno(n) != .SUCCESS) return error.ReaddirFailed;
+                    if (n == 0) break;
+                }
+            }
+        }
+        fn readFiles(r: *Rig, result: *anyerror!void) void {
+            result.* = readBody(r);
+        }
+        fn readBody(r: *Rig) !void {
+            var pb: [256]u8 = undefined;
+            var buf: [64]u8 = undefined;
+            var i: usize = 0;
+            while (i < 16) : (i += 1) _ = try readWhole(r.child(&pb, "hello"), &buf);
+        }
+        /// The handler's thread is one of the session's drain workers.
+        fn onWorker(r: *Rig, s: *Session) bool {
+            const tid = r.fs.handler_tid.load(.acquire);
+            for (s.groups) |g| if (g.tid.load(.acquire) == tid) return true;
+            return false;
+        }
+        fn run(r: *Rig, comptime f: fn (*Rig, *anyerror!void) void) !void {
+            var result: anyerror!void = {};
+            const t = try std.Thread.spawn(.{}, f, .{ r, &result });
+            t.join();
+            try result;
+        }
+    };
+    {
+        const rig = try Rig.init(testing.allocator, 38, &.{});
+        defer rig.deinit();
+        const s = try rig.mountIt(.{ .mem_budget_bytes = 0 });
+        // The namespace class: every handler on the delivering worker.
+        const own0 = worker.handler_dispatches_own.load();
+        const foreign0 = worker.handler_dispatches_foreign.load();
+        const d0 = rig.fs.dispatches.load(.monotonic);
+        const w0 = slot.wake_writes.load();
+        try Helper.run(rig, Helper.listRoot);
+        const dispatched = rig.fs.dispatches.load(.monotonic) - d0;
+        try testing.expect(dispatched >= 128);
+        try testing.expectEqual(dispatched, worker.handler_dispatches_own.load() - own0);
+        try testing.expectEqual(foreign0, worker.handler_dispatches_foreign.load());
+        try testing.expect(Helper.onWorker(rig, s));
+        // No reply crossed a thread: not one eventfd write to a worker.
+        try testing.expectEqual(w0, slot.wake_writes.load());
+        // The data class: each file's RELEASE on the handler lane, its OPEN
+        // on the worker (a READ the worker answers inline under the READ
+        // law's arm (a) dispatches nothing; a demoted one is foreign too).
+        const own1 = worker.handler_dispatches_own.load();
+        const foreign1 = worker.handler_dispatches_foreign.load();
+        try Helper.run(rig, Helper.readFiles);
+        try testing.expect(worker.handler_dispatches_foreign.load() - foreign1 >= 16);
+        try testing.expect(worker.handler_dispatches_own.load() - own1 >= 16);
+    }
+    {
+        const rig = try Rig.init(testing.allocator, 39, &.{.{ "SQUEEZEFS_FUSE_HANDLERS_ON_WORKER", "0" }});
+        defer rig.deinit();
+        const s = try rig.mountIt(.{ .mem_budget_bytes = 0 });
+        const own0 = worker.handler_dispatches_own.load();
+        const w0 = slot.wake_writes.load();
+        try Helper.run(rig, Helper.listRoot);
+        try testing.expectEqual(own0, worker.handler_dispatches_own.load());
+        try testing.expect(!Helper.onWorker(rig, s));
+        // The lane thread's replies wake the worker across threads.
+        try testing.expect(slot.wake_writes.load() > w0);
+    }
+}
+
 test "e2e: EchoFs mounts over the ring — INIT negotiated FUSE_OVER_IO_URING, enable_uring reads Y, every queue armed, stat/open/read from a helper thread arrive over the RING (the sideband saw no request), replies byte-exact, the geometry the kernel accepted equals the plan" {
     if (venueMissing()) |why| return testkit.skipWhy(@src(), why);
     const rig = try Rig.init(testing.allocator, 1, &.{});
@@ -2506,7 +2594,10 @@ test "e2e: a completion that lands after a backstop tick's timeout and before th
 
 test "e2e: a reply published after a backstop tick's reap and before the next pass's pump (the seam holds the worker between the two) is a LATE commit — its producer armed and wrote the wake, whose READ is still deferred — counted transport_park_tick_late_commits, never the lost-wake tripwire" {
     if (venueMissing()) |why| return testkit.skipWhy(@src(), why);
-    const rig = try Rig.init(testing.allocator, 10, &.{});
+    // A cross-thread race: on the merged arm the handler publishes on the
+    // worker's own thread and arms no coalescer (decision 0003 §AB.3), so
+    // the pin runs on the handler-lane arm, where the race lives.
+    const rig = try Rig.init(testing.allocator, 10, &.{.{ "SQUEEZEFS_FUSE_HANDLERS_ON_WORKER", "0" }});
     defer rig.deinit();
     const s = try rig.mountIt(.{ .mem_budget_bytes = 0 });
     var pb: [256]u8 = undefined;

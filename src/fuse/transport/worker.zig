@@ -72,6 +72,7 @@ const assert = std.debug.assert;
 
 const uring128 = @import("../../io/uring128.zig");
 const ring_park = @import("../../io/ring_park.zig");
+const tick_law = @import("../../sync/tick.zig");
 const abi = @import("../abi.zig");
 const codec = @import("../codec.zig");
 const geometry = @import("../geometry.zig");
@@ -191,6 +192,15 @@ pub var fused_polls: counters.ShardedCounter = .{};
 /// `transport_dispatch_refused`: a handler lane refused the spawn (its
 /// capacity); the request was answered EAGAIN-class (0002 row 10).
 pub var dispatch_refused: counters.ShardedCounter = .{};
+/// `transport_handler_dispatches_{own,foreign}` (decision 0003 §AB.3): a
+/// handler spawned on the worker's OWN lane (it runs on this thread; its
+/// reply is a same-thread commit cell) vs on a handler lane's thread (the
+/// data class, and every request on the control arm: one cross-thread
+/// handoff each way).
+pub var handler_dispatches_own: counters.ShardedCounter = .{};
+pub var handler_dispatches_foreign: counters.ShardedCounter = .{};
+/// `transport_lane_pumps`: passes that ran the worker's lane.
+pub var lane_pumps: counters.ShardedCounter = .{};
 /// `transport_park_backstop_ticks`: bounded parks that ticked out
 /// (non-zero under traffic = the backstop WORKING).
 pub var park_backstop_ticks: counters.ShardedCounter = .{};
@@ -575,6 +585,12 @@ pub const Shared = struct {
     tick_await_publish_remaining: std.atomic.Value(u32) = .init(0),
     /// Error logs each worker thread expects in a test (`log.testing`).
     test_error_logs: usize = 0,
+    /// `SQUEEZEFS_FUSE_HANDLERS_ON_WORKER` (decision 0003 §AB.3): each
+    /// worker DRIVES a lane of its own and every handler it dispatches runs
+    /// on it — on this thread.
+    handlers_on_worker: bool = false,
+    /// The executor's budget the driven lane's fiber reserve derives from.
+    budget_bytes: u64 = 0,
 
     pub fn nodeOf(self: *const Shared, qid: u16) ?u16 {
         const n = self.node_of(self.node_ctx, qid) orelse return null;
@@ -767,6 +783,20 @@ pub const Group = struct {
     tick_lost_cqes: u32 = 0,
     commits_pushed: u32 = 0,
     cq_overflow_seen: u32 = 0,
+    /// The DRIVEN handler lane (decision 0003 §AB.3; null on the control
+    /// arm): owned here, attached on this thread, pumped by the pass; its
+    /// wake eventfd is read by a standing READ on THIS ring.
+    lane: ?*exec.Lane = null,
+    lane_wake_buf: u64 = 0,
+    lane_wake_armed: bool = false,
+    /// The worker's FUSE side ended (drained, resident, quiesced): the
+    /// session's `close` waits for this word; the thread itself keeps
+    /// running its lane until every handler on it has finished.
+    transport_done: futex.Word = .init(0),
+    /// The worker thread's id (the tests' thread-boundary probe).
+    tid: std.atomic.Value(std.Thread.Id) = .init(0),
+    /// `wakeSelf` elided a wake on this thread since the last park check.
+    self_kick: bool = false,
     disconnected: bool = false,
     protocol_rejected: bool = false,
     /// This group's RELEASE SQEs pushed and not yet answered (the drain
@@ -912,14 +942,42 @@ pub const Group = struct {
         self.release_inbox = try mpmc.BoundedMpmc(u32).init(gpa, gents);
         errdefer self.release_inbox.deinit(gpa);
         self.release_teardown = try gpa.alloc(bool, gents);
+        errdefer gpa.free(self.release_teardown);
         @memset(self.release_teardown, false);
+        if (shared.handlers_on_worker) {
+            // One fiber per owed slot (RES-18: the kernel's backpressure)
+            // plus the lane's slack for a handler's own helpers.
+            const stack_size = exec.fiber.stackSizeFor(.fuse_ur, shared.page);
+            const l = try exec.Lane.init(gpa, .{
+                .index = index,
+                .class = .fuse_ur,
+                .home_cpu = if (shared.qid_is_cpu) qids[0] else null,
+                .fiber_capacity = exec.sqz_io.capacityFromBudget(@intCast(gents + exec.sqz_io.spawn_slack), shared.budget_bytes, stack_size),
+                .stack_size = stack_size,
+                .page = shared.page,
+                .driven = true,
+            });
+            errdefer l.deinit();
+            if (!shared.exec.adoptDriven(l)) return error.OutOfMemory;
+            self.lane = l;
+        }
         return self;
     }
 
     /// After `join` (or a never-started group) and after every handler that
     /// could hold a lease has finished.
     pub fn deinit(self: *Group) void {
-        assert(self.thread == null);
+        // A driven lane's worker outlives `join`: it runs its lane until
+        // every handler finished (the session awaited them before this).
+        if (self.thread) |t| {
+            t.join();
+            self.thread = null;
+        }
+        if (self.lane) |l| {
+            self.shared.exec.releaseDriven(l);
+            l.deinit();
+            self.lane = null;
+        }
         if (self.started.load(.acquire) == 1) {
             // The kmbuf region holds every in-flight request's payload (a
             // LOOKUP's name, a WRITE's data): unmapped only here, once no
@@ -1071,7 +1129,27 @@ pub const Group = struct {
 
     fn wakeFromForeign(ctx: ?*anyopaque) bool {
         const self: *Group = @ptrCast(@alignCast(ctx.?));
+        return self.wakeSelf();
+    }
+
+    /// The worker's wake for a publication: elided on the worker's own
+    /// thread (a handler on its driven lane), whose pass then loops instead
+    /// of parking (`selfPending`); the coalesced eventfd write otherwise.
+    fn wakeSelf(self: *Group) bool {
+        if (current_group == self) {
+            self.self_kick = true;
+            return false;
+        }
         return self.ring.wake();
+    }
+
+    /// A wake this thread elided for itself (a reply cell, a bridge
+    /// request, a release, a payload lease dropped): the pass loops instead
+    /// of parking. Consumed here.
+    fn selfPending(self: *Group) bool {
+        const k = self.self_kick;
+        self.self_kick = false;
+        return k;
     }
 
     /// The unconditional wake (shutdown): the worker must wake to read
@@ -1099,8 +1177,14 @@ pub const Group = struct {
     }
 
     /// Join the worker (the session flipped `active` and force-woke it).
+    /// A driven lane's worker is joined at `deinit`: here the FUSE side's
+    /// end is the wait (the thread runs on until its handlers finish).
     pub fn join(self: *Group) void {
         const t = self.thread orelse return;
+        if (self.lane != null) {
+            while (self.transport_done.load(.acquire) == 0) futex.wait(&self.transport_done, 0);
+            return;
+        }
         t.join();
         self.thread = null;
     }
@@ -1115,6 +1199,7 @@ pub const Group = struct {
         var base: [24]u8 = undefined;
         _ = thread_name.nameCurrentThread(&self.name_buf, std.fmt.bufPrint(&base, "sqz-fuse-ur{d}", .{self.members[0].qid}) catch unreachable);
         if (builtin.is_test) log.testing.expectErrorLogs(self.shared.test_error_logs);
+        self.tid.store(std.Thread.getCurrentId(), .release);
         self.applyAffinity();
         self.initRing() catch |e| {
             _ = self.shared.barrier.complete(.failed);
@@ -1122,12 +1207,129 @@ pub const Group = struct {
             futex.wakeAll(&self.started);
             return;
         };
+        if (self.lane) |l| {
+            l.attachDriven() catch {
+                log.err("transport: group {d}: its driven handler lane's ring could not be built — the mount fails", .{self.index});
+                if (self.kmb) |*k| k.teardown(&self.ring.ring);
+                self.kmb = null;
+                _ = self.shared.barrier.complete(.failed);
+                self.started.store(2, .release);
+                futex.wakeAll(&self.started);
+                return;
+            };
+        }
+        current_group = self;
+        defer current_group = null;
         self.registerAll();
         self.started.store(1, .release);
         futex.wakeAll(&self.started);
         self.runLoop();
         self.drain();
+        // The FUSE side is done; a driven lane's handlers still run here.
+        self.transport_done.store(1, .release);
+        futex.wakeAll(&self.transport_done);
+        if (self.lane) |l| {
+            self.drainLane();
+            l.detachDriven();
+        }
         self.ring.quiesce();
+    }
+
+    // ---- the driven handler lane (decision 0003 §AB.3) ----
+
+    /// The tag of this ring's READ of the lane's wake eventfd: a reserved
+    /// value no request tag reaches (`uring128.Tag`'s reserved kind).
+    const lane_wake_ud: u64 = ring_park.reserved_ud - 1;
+
+    /// Push the standing READ of the lane's wake eventfd unless it stands.
+    fn armLaneWake(self: *Group) bool {
+        const l = self.lane orelse return true;
+        if (self.lane_wake_armed) return true;
+        if (self.ring.isDead()) return false;
+        const sqe = self.ring.getSqe() orelse return false;
+        uring128.prepRead(sqe, .{ .raw = l.wakeFd() }, std.mem.asBytes(&self.lane_wake_buf), 0);
+        sqe.user_data = lane_wake_ud;
+        self.lane_wake_armed = true;
+        return true;
+    }
+
+    /// Fold the lane-wake READ's CQE: true ⇒ it was (the next pump disarms).
+    fn consumeLaneWake(self: *Group, cqe: uring128.Cqe32) bool {
+        if (cqe.user_data != lane_wake_ud) return false;
+        self.lane_wake_armed = false;
+        if (self.lane) |l| l.drivenWakeConsumed();
+        return true;
+    }
+
+    /// One pump of the lane (its wake disarmed → its inbox → timers → the
+    /// fibers ready at entry → their SQEs).
+    fn pumpLane(self: *Group) void {
+        const l = self.lane orelse return;
+        lane_pumps.inc();
+        l.pumpDriven();
+    }
+
+    /// The lane's bound on this pass's wait (its timers, its owed ring ops).
+    fn laneBound(self: *Group) ?u64 {
+        const l = self.lane orelse return null;
+        return l.drivenBoundNs();
+    }
+
+    /// After the FUSE side ended: run the lane until every handler on it
+    /// finished. Their late replies meet slots that owe nothing (dropped,
+    /// counted); a bridge request answers at once (`isActive` is false);
+    /// the session's phase 2 awaits the handlers and then joins here.
+    fn drainLane(self: *Group) void {
+        const l = self.lane.?;
+        var last_log = clock.monotonicNs();
+        while (true) {
+            self.pumpLane();
+            while (self.cells.pop()) |gent| self.handleCommitCell(gent);
+            self.pumpExtracts();
+            self.pumpStores();
+            while (self.release_inbox.tryPop()) |_| {}
+            if (l.liveFibers() == 0) return;
+            if (l.drivenRunnable() or self.selfPending()) continue;
+            const now = clock.monotonicNs();
+            if (now - last_log >= tick_law.tick_ns) {
+                last_log = now;
+                log.info("transport: group {d}: {d} handler fiber(s) still running after the session closed", .{ self.index, l.liveFibers() });
+            }
+            if (self.ring.isDead()) {
+                // No ring to wait on: the lane's own eventfd by poll(2).
+                var pfd = [_]linux.pollfd{.{ .fd = l.wakeFd(), .events = linux.POLL.IN, .revents = 0 }};
+                _ = linux.poll(&pfd, 1, @intCast(PARK_BACKSTOP_NS / std.time.ns_per_ms));
+                var count: u64 = 0;
+                _ = linux.read(l.wakeFd(), std.mem.asBytes(&count), @sizeOf(u64));
+                l.drivenWakeConsumed();
+                continue;
+            }
+            _ = self.ring.armWake();
+            _ = self.armLaneWake();
+            var bound: u64 = PARK_BACKSTOP_NS;
+            if (self.laneBound()) |b| bound = @min(bound, b);
+            _ = self.park(bound);
+            self.reapLaneOnly();
+            _ = self.ring.service();
+        }
+    }
+
+    /// The reap after the FUSE side ended: the two wakes and nothing else
+    /// (a late delivery is impossible past the residency; a stray CQE is
+    /// dropped).
+    fn reapLaneOnly(self: *Group) void {
+        var cqes: [64]uring128.Cqe32 = undefined;
+        while (true) {
+            const n = self.ring.ring.copyCqes(&cqes, 0) catch {
+                self.ring.markDead();
+                return;
+            };
+            for (cqes[0..n]) |cqe| {
+                if (self.ring.consumeWake(cqe)) continue;
+                _ = self.consumeLaneWake(cqe);
+            }
+            if (n < cqes.len) return;
+        }
     }
 
     fn applyAffinity(self: *Group) void {
@@ -1581,7 +1783,7 @@ pub const Group = struct {
         cell.event.reset();
         cell.res = 0;
         if (!self.extract_inbox.tryPush(gent)) return error.BridgeFailed;
-        if (self.ring.wake()) slot.wake_writes.inc() else slot.wakes_elided.inc();
+        if (self.wakeSelf()) slot.wake_writes.inc() else slot.wakes_elided.inc();
         cell.event.wait(io) catch return error.SessionClosed;
         if (cell.done_len != 0) return self.bounce(gent)[0..cell.done_len];
         return error.BridgeFailed;
@@ -1605,7 +1807,7 @@ pub const Group = struct {
         cell.off = off;
         cell.len = len;
         if (!self.store_inbox.tryPush(gent)) return error.BridgeFailed;
-        if (self.ring.wake()) slot.wake_writes.inc() else slot.wakes_elided.inc();
+        if (self.wakeSelf()) slot.wake_writes.inc() else slot.wakes_elided.inc();
         cell.event.wait(io) catch return error.SessionClosed;
         if (cell.res >= 0 and @as(u32, @intCast(cell.res)) == len) return;
         return error.BridgeFailed;
@@ -1636,7 +1838,7 @@ pub const Group = struct {
     /// A RELEASE from the handler (`Session.releaseRetained`): any thread.
     pub fn requestRelease(self: *Group, gent: u32) void {
         if (!self.release_inbox.tryPush(gent)) return;
-        if (self.ring.wake()) slot.wake_writes.inc() else slot.wakes_elided.inc();
+        if (self.wakeSelf()) slot.wake_writes.inc() else slot.wakes_elided.inc();
     }
 
     /// Pump the lazy extractions: `WRITE_FIXED(slot → slab)` for a held
@@ -1958,6 +2160,22 @@ pub const Group = struct {
             self.pumpExtracts();
             self.pumpStores();
             self.pumpReleases();
+            // 4a. The driven handler lane (decision 0003 §AB.3): its wake
+            //     DISARMED → its inbox → its timers → the fibers ready at
+            //     entry run HERE.
+            self.pumpLane();
+            // 4a'. What those fibers published (reply cells, bridge
+            //      requests, releases) goes through the gate in THIS pass:
+            //      its SQEs ride this pass's enter. These pops are not
+            //      `pass_msgs` (they owe no loop): a cell a foreign thread
+            //      published meanwhile carries its own coalesced wake.
+            if (self.lane != null) {
+                self.self_kick = false;
+                while (self.cells.pop()) |gent| self.handleCommitCell(gent);
+                self.pumpExtracts();
+                self.pumpStores();
+                self.pumpReleases();
+            }
             // 4b. The idle-trim request, if the sampler left one.
             self.trimIdleWindows();
             // 5. Mid-pass reap of finished bridges, then ONE fused frame.
@@ -1973,10 +2191,15 @@ pub const Group = struct {
             const now = clock.monotonicNs();
             // 8. The bridge deadline scan.
             self.deadlineScan(now);
-            // 9. Re-arm the standing READ.
+            // 9. Re-arm the standing READs: this ring's wake and the
+            //    driven lane's.
             var armed = true;
             if (!self.ring.armWake()) {
                 sq_full.fire("no SQE for the wake READ");
+                armed = false;
+            }
+            if (!self.armLaneWake()) {
+                sq_full.fire("no SQE for the lane-wake READ");
                 armed = false;
             }
             // 10. The backstop iff the group owes any reply (slot states), a
@@ -1993,12 +2216,16 @@ pub const Group = struct {
                 const left = d -| now;
                 retry_left = if (retry_left) |r| @min(r, left) else left;
             };
-            if (pass_msgs > 0 or !self.fused.isEmpty()) {
+            // A fiber runnable on the lane, or a publication a handler on
+            // this thread made without a wake, is work in hand too.
+            const lane_runnable = if (self.lane) |l| l.drivenRunnable() else false;
+            if (pass_msgs > 0 or !self.fused.isEmpty() or lane_runnable or self.selfPending()) {
                 self.flushNonBlocking();
             } else {
                 // 13. THE enter: every SQE pushed this pass and the wait.
                 var bound: ?u64 = backstop;
                 if (retry_left) |r| bound = if (bound) |b| @min(b, r) else r;
+                if (self.laneBound()) |l| bound = if (bound) |b| @min(b, l) else l;
                 const cq_at_park = self.ring.cqReady();
                 const owed_at_park = self.ring.wakeOwed();
                 const verdict = self.park(bound);
@@ -2151,6 +2378,7 @@ pub const Group = struct {
             self.wake_cqe_seen = true;
             return;
         }
+        if (self.consumeLaneWake(cqe)) return;
         if (uring128.Tag.isReserved(cqe.user_data)) return;
         const tag = decodeTag(cqe.user_data) orelse {
             cqe_tag_unknown.fire("CQE tag no transport push produced");
@@ -2509,7 +2737,10 @@ pub const Group = struct {
         const m = self.memberOf(gent);
         const handle: fsv.Handle = .{ .tx = self.shared.tx, .slot = .{ .ring = sref }, .unique = req.unique(), .window = self.window(gent) };
         const cpu: ?u16 = if (self.shared.qid_is_cpu) m.qid else null;
-        const lane = self.shared.exec.homeLane(cpu, self.shared.nodeOf(m.qid));
+        // The worker's own lane: the handler runs on this thread (§AB.3).
+        const own = if (onWorkerLane(req.op)) self.lane else null;
+        const lane = own orelse self.shared.exec.homeLane(cpu, self.shared.nodeOf(m.qid));
+        if (own != null) handler_dispatches_own.inc() else handler_dispatches_foreign.inc();
         self.shared.exec.spawnGroupOn(lane, self.shared.handler_group, handlerMain, .{ self.shared.fs, req, handle, lease }) catch {
             dispatch_refused.inc();
             // Nothing is parked yet: the drop wakes nobody.
@@ -2625,8 +2856,10 @@ pub const Group = struct {
                 return;
             }
             _ = self.ring.armWake();
+            _ = self.armLaneWake();
             _ = self.park(@min(RESIDENCY_PARK_NS, deadline - now));
             _ = self.ring.service();
+            self.pumpLane();
         }
     }
 
@@ -2645,7 +2878,11 @@ pub const Group = struct {
             const now = clock.monotonicNs();
             if (now >= deadline) return;
             if (self.ring.isDead()) return;
+            // A lease holder on this thread's lane drops it only when run.
+            self.pumpLane();
+            if (self.lane) |l| if (l.drivenRunnable()) continue;
             _ = self.ring.armWake();
+            _ = self.armLaneWake();
             _ = self.park(deadline - now);
             self.reapQuiet();
             _ = self.ring.service();
@@ -2669,6 +2906,7 @@ pub const Group = struct {
                     self.wake_cqe_seen = true;
                     continue;
                 }
+                if (self.consumeLaneWake(cqe)) continue;
                 if (uring128.Tag.isReserved(cqe.user_data)) continue;
                 const tag = decodeTag(cqe.user_data) orelse continue;
                 if (tag.gent >= self.headers.depth) continue;
@@ -2720,12 +2958,41 @@ pub const Group = struct {
                 return;
             }
             _ = self.ring.armWake();
+            _ = self.armLaneWake();
             _ = self.park(@min(RESIDENCY_PARK_NS, deadline - now));
             self.reapQuiet();
             _ = self.ring.service();
+            // The handlers keep running through the residency.
+            self.pumpLane();
+            while (self.cells.pop()) |gent| self.handleCommitCell(gent);
         }
     }
 };
+
+/// The group whose worker runs on this thread (null off a worker): a
+/// publication from a handler on its driven lane writes no eventfd.
+threadlocal var current_group: ?*Group = null;
+
+/// Whether a request's handler may run on the worker's own lane (decision
+/// 0003 §AB.3): the namespace and attribute class. The data class — READ,
+/// WRITE, the syncs, RELEASE (a close drains the file's write-back), a
+/// truncating SETATTR / OPEN / CREATE, FALLOCATE, COPY_FILE_RANGE, LSEEK,
+/// IOCTL, POLL, the locks, BMAP, the forgets (an eviction reclaims) — stays
+/// on the CPU's handler lane: its handler waits on a data device through a
+/// completion that parks the calling THREAD (`sync/completion.zig`, 0003
+/// WP-C row 14), and on the worker that wait would stall the queue's ring.
+pub fn onWorkerLane(op: codec.Request) bool {
+    const o_trunc: u32 = @bitCast(linux.O{ .TRUNC = true });
+    return switch (op) {
+        .lookup, .getattr, .readlink, .symlink, .mknod, .mkdir, .unlink, .rmdir, .rename, .rename2, .link => true,
+        .statfs, .access, .setxattr, .getxattr, .listxattr, .removexattr, .flush => true,
+        .opendir, .readdir, .readdirplus, .releasedir => true,
+        .setattr => |s| s.valid & abi.FATTR_SIZE == 0,
+        .open => |o| o.flags & o_trunc == 0,
+        .create => |c| c.flags & o_trunc == 0,
+        else => false,
+    };
+}
 
 /// The handler fiber: the filesystem answers the handle exactly once.
 fn handlerMain(fs: fsv.Filesystem, req: fsv.Request, handle: fsv.Handle, lease: ?slot.PayloadLease) void {

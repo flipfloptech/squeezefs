@@ -343,6 +343,9 @@ const EchoFsImpl = struct {
     forgets: std.atomic.Value(u64) = .init(0),
     forget_nlookup: std.atomic.Value(u64) = .init(0),
     dispatches: std.atomic.Value(u64) = .init(0),
+    /// The thread the last dispatched handler ran on (decision 0003 §AB.3:
+    /// the delivering worker's, on the merged arm).
+    handler_tid: std.atomic.Value(std.Thread.Id) = .init(0),
     probes_served: std.atomic.Value(u64) = .init(0),
     probes_declined: std.atomic.Value(u64) = .init(0),
     /// Daemon copy passes over READ bodies (`readInto`): the side-by-side
@@ -612,6 +615,7 @@ const EchoFsImpl = struct {
     fn fsDispatch(ctx: *anyopaque, req: Request, h: Handle, lease: ?slot.PayloadLease) void {
         const self = of(ctx);
         _ = self.dispatches.fetchAdd(1, .monotonic);
+        self.handler_tid.store(std.Thread.getCurrentId(), .release);
         var out: codec.OutBuf = undefined;
         const u = req.unique();
         const ino = req.nodeid();
@@ -679,10 +683,13 @@ const EchoFsImpl = struct {
                 h.reply(codec.replyWrite(&out, u, w.in.size));
                 if (self.hold_lease_across_reply) {
                     // Hold the lease until the worker's gate parked the
-                    // commit (a bounded poll, never a sleep), so the
-                    // Parked → Replied arm is exercised deterministically.
+                    // commit (a bounded poll), so the Parked → Replied arm
+                    // is exercised deterministically. The poll yields its
+                    // fiber: on the merged arm this handler runs on the
+                    // worker's own thread, whose pass must run to park the
+                    // commit (decision 0003 §AB.3).
                     const deadline = clock.monotonicNs() + 2 * std.time.ns_per_s;
-                    while (!l.state.isParked() and clock.monotonicNs() < deadline) std.atomic.spinLoopHint();
+                    while (!l.state.isParked() and clock.monotonicNs() < deadline) self.io.?.sleep(.fromMicroseconds(50), .awake) catch {};
                     if (l.state.isParked()) _ = self.lease_waits_parked.fetchAdd(1, .monotonic);
                 }
             },

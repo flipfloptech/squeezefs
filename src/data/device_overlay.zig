@@ -1232,6 +1232,7 @@ pub const Overlay = struct {
             self.deps.purge.purge(d);
             _ = self.deps.free.free(io, d);
         }
+        displaced.dropHolds();
         return .published;
     }
 

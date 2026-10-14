@@ -1166,6 +1166,7 @@ pub fn uploadParkedBlock(table: *Table, deps: UploadDeps, io: Io, ino: u64, bloc
         // Displaced frees OUTSIDE the guard (RES-1), then the epoch close
         // hint OUTSIDE the guard.
         for (displaced.slice()) |d| _ = deps.free.free(io, d);
+        displaced.dropHolds();
         prof.mark(.displaced_free);
         if (fed_hint) _ = deps.epochs.close(io, ino, .{ .map = deps.map, .free = deps.free, .purge = deps.purge });
         return .published;

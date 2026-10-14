@@ -291,6 +291,7 @@ pub fn flushOne(deps: Deps, io: Io, unit: *Unit) Disposition {
             deps.purge.purge(d);
             _ = deps.free.free(io, d);
         }
+        displaced.dropHolds();
         _ = staging.releaseStaged(deps.pool, deps.seg, key, staged_gen);
         stats.writeback_flushed.inc();
         return .flushed;

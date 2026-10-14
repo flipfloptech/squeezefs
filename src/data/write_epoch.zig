@@ -533,17 +533,20 @@ pub const Epochs = struct {
         stats.rewrite_shadow_bytes.add(e.recorded_bytes);
         const bytes = e.recorded_bytes;
         const freed: u32 = @intCast(e.displaced.items.len);
-        // Pop every B guard (the map owns the offsets now), then free the
-        // parked keys with no lock held (RES-1 — "the worst park amplifier
-        // in the tree"). The epoch leaves sight only now: the map binds B,
-        // so a write landing between the save and here bases on B either
-        // way.
-        for (e.guards.items) |*g| g.deinit();
-        e.guards.clearRetainingCapacity();
+        // Free the parked keys with no lock held (RES-1 — "the worst park
+        // amplifier in the tree"), then drop the live-owner registrations:
+        // the merge's on the keys it displaced, every B guard (an
+        // intermediate B among the parked keys is an unpublished mint until
+        // its free — decision 0003 §AH.1). The epoch leaves sight only now:
+        // the map binds B, so a write landing between the save and here
+        // bases on B either way.
         for (e.displaced.items) |d| {
             cs.purge.purge(d.binding);
             _ = cs.free.free(io, d.binding);
         }
+        outcome.dropHolds();
+        for (e.guards.items) |*g| g.deinit();
+        e.guards.clearRetainingCapacity();
         self.dropEpoch(io, e);
         return .{ .swapped = .{ .bytes = bytes, .freed = freed } };
     }

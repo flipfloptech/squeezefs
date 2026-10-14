@@ -389,6 +389,16 @@ pub const Engine = struct {
             try self.q.putRecord(.c9, s, &.{});
         }
         if (self.hook(f)) return .{ .refused = "aborted after the quarantine (re-detected next run)" };
+        // The releases are live owners from before the commit until after
+        // the frees (decision 0003 §AH.1).
+        for (binds.items) |b| if (host.volume(b.mapping.vol_tag)) |vol| {
+            const idx = b.mapping.blockIdx(host.geo.chunk);
+            if (idx < vol.alloc.capacityBlocks()) vol.alloc.holdInflight(idx);
+        };
+        defer for (binds.items) |b| if (host.volume(b.mapping.vol_tag)) |vol| {
+            const idx = b.mapping.blockIdx(host.geo.chunk);
+            if (idx < vol.alloc.capacityBlocks()) vol.alloc.dropInflight(idx);
+        };
         const t = try host.store.begin(@src());
         {
             errdefer host.store.abandon(t);

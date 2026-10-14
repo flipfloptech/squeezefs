@@ -240,6 +240,10 @@ pub const stats = struct {
     pub var hold_ceremony_fibers: counters.ShardedCounter = .{};
     /// Terminal frees handed to the reclaimer by the filesystem.
     pub var bindings_freed: counters.ShardedCounter = .{};
+    /// A released binding freed with no in-flight registration (decision
+    /// 0003 §AH.1: every release site holds its blocks from before its
+    /// commit until after their frees; must stay 0).
+    pub var release_free_unheld: counters.Tripwire = .init("release_free_unheld");
     /// The mount-time C8 oracle's verdict (0 = clean).
     pub var block_refs_drift_rows: counters.Gauge = .{};
     /// Device reads the plane bounced for an unaligned window.
@@ -281,7 +285,7 @@ pub fn writeStatsJson(w: *Io.Writer) Io.Writer.Error!void {
     inline for (.{ "layout_map_merges", "layout_map_merge_blocks", "layout_map_merge_failures", "layout_map_merges_shipped", "foreign_publish_kvmap_refusals", "layout_publishes_served", "kvmap_sweep_spawn_refusals", "promotions_run", "promotions_stale", "promotions_failed", "own_block_dmas", "own_block_dma_bytes", "held_stores", "held_store_failures", "hold_gate_admits", "hold_gate_declines", "prefetch_fibers", "prefetch_fiber_refusals", "hold_ceremony_fibers", "bindings_freed", "device_read_bounces", "data_device_read_bytes", "write_side_read_dma_bytes", "compose_read_dma_bytes", "pack_read_dma_bytes" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, @field(stats, name).load() });
     }
-    try w.print("\"data_unresolved_volume\":{d},\"kvmap_resolve_failures\":{d},\"kvmap_head_put_unlocked\":{d}}}", .{ counters.tripwireCount("data_unresolved_volume"), counters.tripwireCount("kvmap_resolve_failures"), counters.tripwireCount("kvmap_head_put_unlocked") });
+    try w.print("\"data_unresolved_volume\":{d},\"kvmap_resolve_failures\":{d},\"kvmap_head_put_unlocked\":{d},\"release_free_unheld\":{d}}}", .{ counters.tripwireCount("data_unresolved_volume"), counters.tripwireCount("kvmap_resolve_failures"), counters.tripwireCount("kvmap_head_put_unlocked"), counters.tripwireCount("release_free_unheld") });
 }
 
 // ---------------------------------------------------------------------------
@@ -1298,6 +1302,10 @@ pub const DataPlane = struct {
             error.ReadOnly => error.ReadOnlyFileSystem,
             error.PlaneRefused, error.NotFree => error.InputOutput,
         };
+        // A live owner until the caller's publish lands or the mint returns
+        // (decision 0003 §AH.1): `ownBlockPublished` / `abandonOwnBlock`.
+        v.alloc.holdInflight(minted.idx);
+        errdefer v.alloc.dropInflight(minted.idx);
         var guard = block_alloc.MintedBlockGuard.init(v.alloc, minted);
         errdefer guard.abandon();
         self.deviceWrite(tag, minted.offset, stored) catch |e| return mapDma(e);
@@ -1315,10 +1323,19 @@ pub const DataPlane = struct {
         return .{ .mapping = Mapping.wholeBlock(tag, minted.offset, minted.stamp), .proof = .{ .vol_tag = tag, .offset = minted.offset, .len = layout.ceilGrain(stored.len), .completed_ns = clock.monotonicNs() }, .alloc = v.alloc, .idx = minted.idx };
     }
 
-    /// The publish failed: the never-published mint returns.
+    /// The publish failed: the never-published mint returns, then its
+    /// in-flight registration drops.
     pub fn abandonOwnBlock(self: *DataPlane, ob: OwnBlock) void {
         _ = self;
         ob.alloc.abandonUnpublished(ob.idx);
+        ob.alloc.dropInflight(ob.idx);
+    }
+
+    /// The publish naming the own block landed: the mint's in-flight
+    /// registration drops (the layout references the block now).
+    pub fn ownBlockPublished(self: *DataPlane, ob: OwnBlock) void {
+        _ = self;
+        ob.alloc.dropInflight(ob.idx);
     }
 
     // @anchor:ops_jobs_republish — the ONE mover's layout primitive (rung 8).
@@ -1423,15 +1440,45 @@ pub const DataPlane = struct {
     }
 
     /// Terminal frees AFTER a landed transaction (RES-1): displaced and
-    /// destroyed bindings through the reclaimer's ladder.
+    /// destroyed bindings through the reclaimer's ladder. Each is a release
+    /// its site holds in flight from before its commit until after this
+    /// free (decision 0003 §AH.1) — one reaching here unheld was a window an
+    /// online census read as leaked.
     pub fn freeBindings(self: *DataPlane, io: Io, bindings: []const Mapping) void {
         for (bindings) |b| {
             stats.bindings_freed.inc();
+            if (self.vols.byTag(b.vol_tag)) |v| if (!v.alloc.inflightContains(v.alloc.idxOf(b.offset))) {
+                stats.release_free_unheld.fire("a released binding reached its free with no in-flight registration");
+            };
             // A tenant of a pack still OPEN leaves through the packer (the
             // pin arithmetic counts it); everything else runs the ladder.
             if (self.packer) |*p| if (p.releaseOpenTenant(b)) continue;
             _ = self.reclaim_free.seam().free(io, b);
         }
+    }
+
+    /// The in-flight registrations of releases on this mount's volumes
+    /// (decision 0003 §AH.1): taken before a releasing commit, dropped after
+    /// the frees (`dropReleases`) or on the path that abandons the release.
+    pub fn releaseHolds(self: *DataPlane) seams.ReleaseHolds {
+        return self.reclaim_free.holds();
+    }
+
+    pub fn holdReleases(self: *DataPlane, entries: []const layout.MapEntry) void {
+        const h = self.releaseHolds();
+        for (entries) |e| h.hold_fn(h.ctx, e.mapping);
+    }
+
+    pub fn dropReleases(self: *DataPlane, entries: []const layout.MapEntry) void {
+        const h = self.releaseHolds();
+        for (entries) |e| h.drop_fn(h.ctx, e.mapping);
+    }
+
+    /// The bindings a release frees after its commit, freed then their
+    /// holds dropped (the holds were taken before the commit).
+    fn freeReleased(self: *DataPlane, io: Io, bindings: []const Mapping) void {
+        self.freeBindings(io, bindings);
+        self.releaseHolds().drop(bindings);
     }
 
     /// A truncate or destroy begins: every write-side custody of `ino`
@@ -1638,7 +1685,10 @@ pub const DataPlane = struct {
         const locks = self.locks.lockPromotion(io, ino);
         const out = self.promoteLocked(io, ino, k, generation, image);
         locks.release(io);
-        if (out.displaced) |d| if (self.packer) |*p| p.releaseTenantRef(d);
+        if (out.displaced) |d| {
+            if (self.packer) |*p| p.releaseTenantRef(d);
+            self.releaseHolds().drop(&.{d});
+        }
         return out.ok;
     }
 
@@ -1687,7 +1737,15 @@ pub const DataPlane = struct {
         const out: Promoted = switch (d) {
             .inline_ => .{ .ok = self.promoteInline(ino, cur, cur_bytes.coll_seq, image, k, generation) },
             .own_block => .{ .ok = self.promoteOwnBlock(io, ino, cur, cur_bytes.coll_seq, tag, stored.bytes, image.len, k, generation) },
-            .packed_ => self.promotePacked(io, ino, cur_bytes.coll_seq, tag, stored.bytes, k, generation),
+            .packed_ => blk: {
+                // The durable copy the pack commit displaces is a live owner
+                // until `promoteStaged` releases it (decision 0003 §AH.1).
+                const copy = cur.durableCopy();
+                if (copy) |m| self.releaseHolds().hold(&.{m});
+                const p = self.promotePacked(io, ino, cur_bytes.coll_seq, tag, stored.bytes, k, generation);
+                if (copy) |m| if (p.displaced == null) self.releaseHolds().drop(&.{m});
+                break :blk p;
+            },
         };
         if (out.ok) self.noteShape(ino, cur.size, if (d == .own_block) .striped else if (d == .inline_) .inline_ else .packed_) else {
             stats.promotions_failed.inc();
@@ -1728,6 +1786,7 @@ pub const DataPlane = struct {
             self.abandonOwnBlock(ob);
             return false;
         };
+        self.ownBlockPublished(ob);
         self.releaseStaged(k, generation);
         pack.stats.layout_promoted_block.inc();
         return true;
@@ -2337,7 +2396,12 @@ pub const DataPlane = struct {
                 else => error.Transient,
             };
         };
+        // The displaced bindings are live owners until the caller's frees
+        // (decision 0003 §AH.1).
+        const holds = self.releaseHolds();
+        holds.hold(out.slice());
         self.backend.commit(t) catch |e| {
+            holds.drop(out.slice());
             stats.layout_map_merge_failures.inc();
             log.err("ino {d}: the block-map commit of {d} binding(s) failed ({s})", .{ req.ino, req.inserts.len, @errorName(e) });
             return switch (e) {
@@ -2346,6 +2410,7 @@ pub const DataPlane = struct {
                 else => error.Transient,
             };
         };
+        out.holds = holds;
         stats.layout_map_merges.inc();
         stats.layout_map_merge_blocks.add(req.inserts.len);
         // The shape is NOT published here (fstests generic/013: `write_
@@ -2439,6 +2504,11 @@ pub const DataPlane = struct {
         // The kill seam separates the flip from the records so the pre-flip
         // state is reachable on a small map too.
         const flip_alone = self.crossing_kill_after != 0;
+        // The window's displaced bindings (released at the flip) are live
+        // owners until the caller's frees (decision 0003 §AH.1).
+        const holds = self.releaseHolds();
+        holds.hold(out.slice());
+        errdefer holds.drop(out.slice());
         var pos: usize = 0;
         var chunks: u32 = 0;
         var flipped = false;
@@ -2492,6 +2562,7 @@ pub const DataPlane = struct {
         stats.layout_map_merge_blocks.add(req.inserts.len);
         self.windows.invalidate(ino);
         log.info("ino {d}: block-map-tree crossing — {d} inline entries → {d} records ({d} ops over {d} tx), {d} preexisting record(s) reconciled; head flipped at size {d}, gen {d}", .{ ino, merged.len, plan.records, plan.ops.len, chunks + 1, plan.preexisting, size, kvmap.FIRST_MAP_GEN });
+        out.holds = holds;
         return out.*;
     }
 
@@ -2536,8 +2607,11 @@ pub const DataPlane = struct {
         const size = @max(prev.size, req.min_size);
         const floor_blocks = self.blocksOf(size);
         var cursor: ?u32 = head.sweep;
+        // The barrier's freed bindings are held from before each sweep
+        // page's commit (decision 0003 §AH.1) until the deferred frees.
         var barrier_frees: std.ArrayList(Mapping) = .empty;
         defer barrier_frees.deinit(gpa);
+        errdefer self.releaseHolds().drop(barrier_frees.items);
         if (cursor) |k| if (floor_blocks > k) {
             cursor = try self.barrierSweep(ino, k, floor_blocks, &barrier_frees);
         };
@@ -2564,7 +2638,12 @@ pub const DataPlane = struct {
                 };
             };
         }
+        // The window's displaced bindings are live owners until the
+        // caller's frees (decision 0003 §AH.1).
+        const holds = self.releaseHolds();
+        holds.hold(out.slice());
         self.backend.commit(t) catch |e| {
+            holds.drop(out.slice());
             stats.layout_map_merge_failures.inc();
             log.err("ino {d}: the block-map commit of {d} binding(s) failed ({s})", .{ ino, window.len, @errorName(e) });
             return switch (e) {
@@ -2573,13 +2652,20 @@ pub const DataPlane = struct {
                 else => error.Transient,
             };
         };
+        out.holds = holds;
         stats.layout_map_merges.inc();
         stats.layout_map_merge_blocks.add(window.len);
         kvmap.stats.kvmap_window_saves.inc();
         self.windows.invalidate(ino);
         // The barrier's frees: the caller holds its (3.5) stripe across this
         // merge, so they run on the meta pool after it returns (RES-1).
-        if (barrier_frees.items.len != 0) self.deferFrees(barrier_frees.toOwnedSlice(gpa) catch return out);
+        if (barrier_frees.items.len != 0) {
+            const owned = barrier_frees.toOwnedSlice(gpa) catch {
+                self.releaseHolds().drop(barrier_frees.items);
+                return out;
+            };
+            self.deferFrees(owned);
+        }
         return out;
     }
 
@@ -2637,31 +2723,45 @@ pub const DataPlane = struct {
                 self.backend.abandon(t);
                 return error.Transient;
             };
-            self.backend.commit(t) catch |e| return switch (e) {
-                error.OutOfMemory => error.OutOfMemory,
-                error.VolumeFailed, error.VolumeClosed => error.WriterGuardFenced,
-                else => error.Transient,
+            // The page's freed bindings join the caller's list (held) before
+            // the commit releases them (decision 0003 §AH.1).
+            const before = frees.items.len;
+            frees.ensureUnusedCapacity(gpa, page.freed.items.len) catch {
+                self.backend.abandon(t);
+                return error.OutOfMemory;
+            };
+            for (page.freed.items) |f| frees.appendAssumeCapacity(f.binding);
+            self.releaseHolds().hold(frees.items[before..]);
+            self.backend.commit(t) catch |e| {
+                self.releaseHolds().drop(frees.items[before..]);
+                frees.shrinkRetainingCapacity(before);
+                return switch (e) {
+                    error.OutOfMemory => error.OutOfMemory,
+                    error.VolumeFailed, error.VolumeClosed => error.WriterGuardFenced,
+                    else => error.Transient,
+                };
             };
             kvmap.stats.map_sweep_chunks.inc();
             self.windows.invalidate(ino);
-            for (page.freed.items) |f| try frees.append(gpa, f.binding);
             if (next == null) break;
             start = next.?;
         }
         return end;
     }
 
+    /// Held releases (decision 0003 §AH.1) freed on the meta pool, their
+    /// holds dropped after.
     fn deferFrees(self: *DataPlane, bindings: []Mapping) void {
         self.tasks.spawn(self.io, deferredFreeTask, .{ self, bindings }) catch {
             // Never leaked: the frees run here (the one RES-1 exception the
             // executor's refusal forces).
-            self.freeBindings(self.io, bindings);
+            self.freeReleased(self.io, bindings);
             self.gpa.free(bindings);
         };
     }
 
     fn deferredFreeTask(self: *DataPlane, bindings: []Mapping) Io.Cancelable!void {
-        self.freeBindings(self.io, bindings);
+        self.freeReleased(self.io, bindings);
         self.gpa.free(bindings);
     }
 
@@ -2825,14 +2925,23 @@ pub const DataPlane = struct {
                     return e;
                 };
             }
-            self.backend.commit(t) catch |e| return KvBackend.coreError(e);
+            // The page's freed bindings are live owners from before the
+            // commit until after their frees (decision 0003 §AH.1).
+            frees.ensureTotalCapacity(gpa, page.freed.items.len) catch {
+                self.backend.abandon(t);
+                return error.OutOfMemory;
+            };
+            for (page.freed.items) |f| frees.appendAssumeCapacity(f.binding);
+            self.releaseHolds().hold(frees.items);
+            self.backend.commit(t) catch |e| {
+                self.releaseHolds().drop(frees.items);
+                return KvBackend.coreError(e);
+            };
             kvmap.stats.map_sweep_chunks.inc();
             if (outcome == .done and nlink == 0 and inode != null) kvmap.stats.kvmap_corpses_destroyed.inc();
             self.windows.invalidate(ino);
-            try frees.ensureTotalCapacity(gpa, page.freed.items.len);
-            for (page.freed.items) |f| frees.appendAssumeCapacity(f.binding);
         }
-        self.freeBindings(io, frees.items);
+        self.freeReleased(io, frees.items);
         return outcome;
     }
 
@@ -3544,7 +3653,7 @@ test "stats JSON names every plane instrument" {
     var w: Io.Writer = .fixed(&buf);
     try writeStatsJson(&w);
     const s = w.buffered();
-    inline for (.{ "\"data_volumes\":", "\"layout_map_merges\":", "\"kvmap_sweep_spawn_refusals\":", "\"held_stores\":", "\"hold_gate_admits\":", "\"prefetch_fibers\":", "\"bindings_freed\":", "\"data_unresolved_volume\":", "\"kvmap_head_put_unlocked\":" }) |k| {
+    inline for (.{ "\"data_volumes\":", "\"layout_map_merges\":", "\"kvmap_sweep_spawn_refusals\":", "\"held_stores\":", "\"hold_gate_admits\":", "\"prefetch_fibers\":", "\"bindings_freed\":", "\"data_unresolved_volume\":", "\"kvmap_head_put_unlocked\":", "\"release_free_unheld\":" }) |k| {
         try testing.expect(std.mem.indexOf(u8, s, k) != null);
     }
 }

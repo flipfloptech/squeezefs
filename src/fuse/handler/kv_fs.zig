@@ -305,7 +305,7 @@ pub fn assertStore(comptime T: type) void {
 /// the product; `NoData` is the volume-less set).
 pub fn assertData(comptime T: type) void {
     comptime {
-        for ([_][]const u8{ "hasVolumes", "stagingOn", "blockSize", "inlineMax", "geometry", "refsSeam", "noteShape", "forgetShape", "isPassthrough", "canStoreHeld", "write", "read", "ownBlock", "abandonOwnBlock", "freeBindings", "flushCustody", "releaseIno", "hasWriteCustody", "fsync", "statfs", "mintFileId", "stageImage", "appendStaged", "releaseStaged", "stagedLease", "readMappingImage", "lockLayout", "stageKvmapShrink", "stageKvmapCorpse", "drainKvmapSweep", "publishForeign" }) |name| {
+        for ([_][]const u8{ "hasVolumes", "stagingOn", "blockSize", "inlineMax", "geometry", "refsSeam", "noteShape", "forgetShape", "isPassthrough", "canStoreHeld", "write", "read", "ownBlock", "abandonOwnBlock", "ownBlockPublished", "holdReleases", "dropReleases", "freeBindings", "flushCustody", "releaseIno", "hasWriteCustody", "fsync", "statfs", "mintFileId", "stageImage", "appendStaged", "releaseStaged", "stagedLease", "readMappingImage", "lockLayout", "stageKvmapShrink", "stageKvmapCorpse", "drainKvmapSweep", "publishForeign" }) |name| {
             if (!@hasDecl(T, name)) @compileError(@typeName(T) ++ " is not a kv_fs Data face: lacks `" ++ name ++ "`");
         }
     }
@@ -416,8 +416,12 @@ pub const AfterCommit = struct {
     /// `removed` blocks (synchronously under the threshold, else on the
     /// meta pool).
     kvmap_sweep: ?struct { ino: u64, removed: u64 } = null,
+    /// `bindings` are held in flight (decision 0003 §AH.1): set by
+    /// `holdAfter` before the commit, cleared by `dropAfter` after the frees.
+    held: bool = false,
 
     fn push(self: *AfterCommit, block: u32, m: Mapping) void {
+        assert(!self.held);
         if (self.n < self.bindings.len) {
             self.bindings[self.n] = .{ .block = block, .mapping = m };
             self.n += 1;
@@ -1318,6 +1322,25 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             self.data.freeBindings(self.io, maps[0..after.n]);
         }
 
+        /// The bindings `after` frees are releases: live owners from before
+        /// the commit that releases them until after their frees (decision
+        /// 0003 §AH.1) — between the two the allocator tracks blocks no
+        /// record names, which an online census reads as leaked.
+        fn holdAfter(self: *Self, after: *AfterCommit) void {
+            assert(!after.held);
+            self.data.holdReleases(after.slice());
+            after.held = true;
+        }
+
+        /// The holds `holdAfter` took, after the frees — or on any path
+        /// that leaves without them (a release that never freed is then a
+        /// leak the census sees, never a shield).
+        fn dropAfter(self: *Self, after: *AfterCommit) void {
+            if (!after.held) return;
+            self.data.dropReleases(after.slice());
+            after.held = false;
+        }
+
         /// `min(i64::MAX, block × u32::MAX)`: the striped file ceiling
         /// (`fuse_write_u32_index_refused`'s doc).
         fn maxFileSize(self: *const Self) u64 {
@@ -1731,7 +1754,10 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             // (3) The plans, from the records as they stand under the locks.
             var plans: std.ArrayList(Corpse) = .empty;
             defer {
-                for (plans.items) |*p| tree.deinitKeyValues(gpa, &p.kvs);
+                for (plans.items) |*p| {
+                    self.dropAfter(&p.after);
+                    tree.deinitKeyValues(gpa, &p.kvs);
+                }
                 plans.deinit(gpa);
             }
             var payloads: std.ArrayList(u64) = .empty;
@@ -1777,7 +1803,9 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 }
                 payloads.appendAssumeCapacity(p.bytes);
             }
-            // (4) The commits, under the locks.
+            // (4) The commits, under the locks: every plan's bindings held
+            // in flight from before its commit until after (5)'s frees.
+            for (plans.items) |*p| self.holdAfter(&p.after);
             if (plans.items.len != 0) {
                 const ranges = try inos.packDestroyEntries(gpa, payloads.items);
                 defer gpa.free(ranges);
@@ -1918,6 +1946,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 return self.attrReply(a.ino, rep.inode orelse return error.FileNotFound);
             }
             var after: AfterCommit = .{};
+            defer self.dropAfter(&after);
             var old_size: u64 = 0;
             var kind: layout.Kind = .inline_;
             var layout_lock: ?Data.LayoutGuard = null;
@@ -1961,6 +1990,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                     try t.stagePut(key.TREE_INODES, &key.inodeKey(local), &v.encode());
                 }
             }
+            self.holdAfter(&after);
             t_owned = false;
             try self.commit(c, t);
             if (layout_lock) |g| g.release(self.io);
@@ -2542,6 +2572,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 self.freeLayout(rec);
                 self.settleCustody(local, kind);
                 var after: AfterCommit = .{};
+                defer self.dropAfter(&after);
                 // (3.7) before the 4a set, held across the commit (module doc).
                 var layout_lock: ?Data.LayoutGuard = self.data.lockLayout(self.io, local);
                 errdefer if (layout_lock) |g| g.release(self.io);
@@ -2556,6 +2587,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 stored.ctime = stamp;
                 if (a.open_flags & abi.FUSE_OPEN_KILL_SUIDGID != 0) try self.killpriv(t, local, &stored);
                 try t.stagePut(key.TREE_INODES, &key.inodeKey(local), &stored.encode());
+                self.holdAfter(&after);
                 t_owned = false;
                 try self.commit(c, t);
                 layout_lock.?.release(self.io);
@@ -2758,6 +2790,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 };
             }
             var after: AfterCommit = .{};
+            defer self.dropAfter(&after);
             if (!keep_identity) noteDisplaced(local, rec, &after);
             const t = try self.beginExclusive(local, @src());
             var t_owned = true;
@@ -2765,6 +2798,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             var v = try self.readInode(local);
             try self.publish(t, local, rec, Layout.staged(size, file_id, null), &.{});
             try self.stageInodePostlude(t, local, &v, size, a.write_flags);
+            self.holdAfter(&after);
             t_owned = false;
             self.commit(c, t) catch |e| {
                 // A whole image that will never be named leaves; an in-place
@@ -3013,6 +3047,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         /// EFBIG: fstests generic/030).
         fn promoteToStriped(self: *Self, c: *Ctx, local: u64, rec: ?LayoutRec, size: u64) Error!u64 {
             var after: AfterCommit = .{};
+            defer self.dropAfter(&after);
             var entries: [1]layout.MapEntryWire = undefined;
             var n_entries: usize = 0;
             var ob: ?Data.OwnBlock = null;
@@ -3027,6 +3062,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             }
             errdefer if (ob) |o| self.data.abandonOwnBlock(o);
             noteDisplaced(local, rec, &after);
+            self.holdAfter(&after);
             const proofs: []const layout.DmaProof = if (ob) |o| &.{o.proof} else &.{};
             const new = Layout.stripedInline(size, entries[0..n_entries]);
             if (self.foreignSlot(globalOf(local))) {
@@ -3044,6 +3080,10 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 t_owned = false;
                 try self.commit(c, t);
             }
+            // The layout names the own block now: its mint's live-owner
+            // registration drops (decision 0003 §AH.1).
+            if (ob) |o| self.data.ownBlockPublished(o);
+            ob = null;
             self.afterCommit(&after);
             fuse_write_promotions_to_striped.inc();
             return size;
@@ -3555,6 +3595,10 @@ pub const NoData = struct {
         unreachable;
     }
     pub fn abandonOwnBlock(_: *NoData, _: OwnBlock) void {}
+    pub fn ownBlockPublished(_: *NoData, _: OwnBlock) void {}
+    /// A volume-less set frees nothing, so no release holds a block.
+    pub fn holdReleases(_: *NoData, _: []const layout.MapEntry) void {}
+    pub fn dropReleases(_: *NoData, _: []const layout.MapEntry) void {}
     pub fn freeBindings(_: *NoData, _: Io, _: []const Mapping) void {}
     pub fn flushCustody(_: *NoData, _: Io, _: u64) void {}
     pub fn releaseIno(_: *NoData, _: Io, _: u64) void {}
@@ -4489,12 +4533,12 @@ test "a release is a live owner of its block from before its releasing commit un
     try testing.expectEqual(@as(?linux.E, null), h.call(.{ .open = .{ .flags = O_TRUNC, .open_flags = 0 } }, k).errno());
     h.release(k);
     // (d) A promotion to an own block (an empty file grown past the block,
-    // then written through the striped arm).
+    // then written past the inline bound through the striped arm).
     const p = try h.create(1, "p", 0o644);
     sa.size = 2 * bs;
     try testing.expectEqual(@as(?linux.E, null), h.setattr(p, sa).errno());
-    const page: [4096]u8 = @splat('P');
-    try testing.expectEqual(@as(?linux.E, null), h.write(p, 0, &page, 0).errno());
+    const two_pages: [8192]u8 = @splat('P');
+    try testing.expectEqual(@as(?linux.E, null), h.write(p, 0, &two_pages, 0).errno());
     h.release(p);
     tr.finish();
     // Every free: `from` (the custody's merge), `to` (the destroy), `mg`

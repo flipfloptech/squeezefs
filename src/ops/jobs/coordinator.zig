@@ -397,18 +397,27 @@ pub const PlaneMover = struct {
     fn releaseRef(ctx: *anyopaque, vol_tag: u64, idx: u64) void {
         self_(ctx).releaseThroughLadder(vol_tag, idx);
     }
+    /// The republish releases `expected`: held in flight from before its
+    /// commit until `freeBinding` (the mover's next step on success) frees
+    /// it (decision 0003 §AH.1); a republish that lands nothing drops it.
     fn republish(ctx: *anyopaque, ino: u64, block_index: u32, expected: layout.Mapping, new: layout.Mapping) mover.RepublishError!void {
         const self = self_(ctx);
         const proof: layout.DmaProof = .{ .vol_tag = new.vol_tag, .offset = new.offset, .len = self.plane.chunk, .completed_ns = clock.monotonicNs() };
-        self.plane.republishBinding(self.io, ino, block_index, expected, new, proof) catch |e| return switch (e) {
-            error.Superseded => error.Superseded,
-            error.OutOfMemory => error.OutOfMemory,
-            error.InputOutput => error.Io,
+        const holds = self.plane.releaseHolds();
+        holds.hold(&.{expected});
+        self.plane.republishBinding(self.io, ino, block_index, expected, new, proof) catch |e| {
+            holds.drop(&.{expected});
+            return switch (e) {
+                error.Superseded => error.Superseded,
+                error.OutOfMemory => error.OutOfMemory,
+                error.InputOutput => error.Io,
+            };
         };
     }
     fn freeBinding(ctx: *anyopaque, old: layout.Mapping) void {
         const self = self_(ctx);
         self.plane.freeBindings(self.io, &.{old});
+        self.plane.releaseHolds().drop(&.{old});
     }
     /// The plane never crashes on cue; the pre-publish HOLD seam parks here.
     fn kill(ctx: *anyopaque, at: mover.KillPoint) mover.SeamError!void {

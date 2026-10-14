@@ -1142,6 +1142,14 @@ test "a release is a live owner of its block from before its releasing commit un
         try testing.expect(r.counters.inflight_exempted >= 1);
     }
     try testing.expectEqual(block_alloc.BeginFree.terminal, try a.freeBlock(41));
+    {
+        // Freed, the hold not yet dropped: the block is the free list's,
+        // counted once by C6's arithmetic — never a second time as in flight.
+        var r = try ram.run(set, .online, .{});
+        defer r.deinit(gpa);
+        for (r.findings) |f| std.debug.print("FALSE POSITIVE: {f}\n", .{f});
+        try ram.expectClasses(r, &.{});
+    }
     release.deinit();
     {
         var r = try ram.run(set, .online, .{});

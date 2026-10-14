@@ -150,7 +150,9 @@ pub var notify_epochs_sent: counters.ShardedCounter = .{};
 /// for a reserved cell.
 pub var notify_nb_waits: counters.ShardedCounter = .{};
 /// `transport_sideband_recycle_respins`: a sideband cell given back met its
-/// free list's cell still held by a taker mid-pop.
+/// free list's cell still held by a taker between its dequeue CAS and its
+/// sequence store (the ring holds the pool's whole population, so the
+/// refusal is never "full"): the give-back retried (decision 0003 §AI.4).
 pub var sideband_recycle_respins: counters.ShardedCounter = .{};
 /// `transport_notify_pending`: fire-and-forget writes (notifies, inline
 /// replies) filled and not yet answered by the kernel — what "at notify
@@ -325,9 +327,17 @@ const CellPool = struct {
         self.free.deinit(gpa);
     }
 
-    /// Give a cell back and wake a taker out of cells.
+    /// Give a cell back and wake a taker out of cells. The ring holds the
+    /// pool's whole population, so a refused push is never "full": it is a
+    /// taker between its dequeue CAS and its sequence store, with a second
+    /// taker's pop and this give-back run past it — retried until that
+    /// taker stores (`mpmc.pushSpin`; the model `sync/mpmc_pool_model.zig`,
+    /// decision 0003 §AI.4).
     fn give(self: *CellPool, idx: u32) void {
-        assert(self.free.tryPush(idx));
+        if (!self.free.tryPush(idx)) {
+            sideband_recycle_respins.inc();
+            self.free.pushSpin(idx);
+        }
         _ = self.freed.fetchAdd(1, .release);
         futex.wakeAll(&self.freed);
     }

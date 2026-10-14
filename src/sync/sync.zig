@@ -40,6 +40,7 @@ pub const Completion = completion.Completion;
 test {
     _ = futex;
     _ = mpmc;
+    _ = @import("mpmc_pool_model.zig");
     _ = completion;
     _ = tick;
     _ = rwlock;

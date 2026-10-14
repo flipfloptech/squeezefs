@@ -48,6 +48,7 @@ pub const gates = struct {
 // ---- model checking: the exhaustive interleaving explorer (portable) ----
 pub const model = struct {
     pub const explorer = @import("model/explorer.zig");
+    pub const worker_pass_model = @import("model/worker_pass_model.zig");
 };
 
 // ---- the metadata plane: MetaLV (portable codecs + cores; device I/O via io/) ----
@@ -221,6 +222,7 @@ test {
     _ = testkit;
     _ = fuzzkit;
     _ = model.explorer;
+    _ = model.worker_pass_model;
     _ = gates.census;
     _ = gates.literals;
     _ = ops.fsck;

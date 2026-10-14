@@ -319,3 +319,73 @@ within two wakes (a RAM or nvme-fast journal), and it never spins where it canno
 sampled the wake on every idle-lane park and read `w` = 252 µs — other fibers had run in the gap —
 which set a 503 µs bound and burned CPU on 9,259 spins; the poll-count rule (`lanePolls` one more at
 the resume) is that measurement's fix.
+
+### 9.3 AB.2 — entry-grained invalidation and the isolated TTL
+
+A = the lever (`e37ee89`, run 1; `d65a300` with the two follow-up fixes, run 2), B = AB.4's tip
+(`121c5d4`). The perf set is ONE mount of a symmetric 2-MDT set — the ISOLATED posture: every class
+derives to `T_owner` (45 s).
+
+| op | run 1 A (leg 1 / 4) | run 1 B (leg 2 / 3) | A ÷ B | run 2 A (leg 1 / 4) | run 2 B (leg 2 / 3) |
+|---|---|---|---|---|---|
+| file stat | 5.02 M / 5.91 M | 0.91 M / 0.78 M | 6.4× | 5.60 M / 3.34 M | 0.22 M / 0.23 M |
+| dir stat | 4.82 M / 6.06 M | 1.00 M / 1.17 M | 5.0× | 2.87 M / 3.86 M | 0.09 M / 0.27 M |
+| file remove | 7,354 / 7,925 | 6,470 / 6,639 | 1.17× | 7,361 / 4,993 | 4,778 / 5,434 |
+| dir rename | 8,018 / 7,977 | 7,000 / 6,901 | 1.15× | 5,575 / 5,630 | 2,996 / 4,921 |
+| dir remove | 7,444 / 7,843 | 6,128 / 6,820 | 1.18× | 6,869 / 4,581 | 3,233 / 5,378 |
+| file create | 6,593 / 6,557 | 6,594 / 6,695 | 0.99× | 6,457 / 4,494 | 4,394 / 4,751 |
+| file read (open/close) | 59.2 k / 78.5 k | 66.8 k / 73.9 k | 0.98× | 64.6 k / 42.3 k | 52.3 k / 46.0 k |
+| randread 4 KiB QD32 | — | — | — | 167.1 k / 139.1 k | 158.3 k / 158.8 k |
+
+The stat rows are the kernel's rate now — ext4 on the same disks measured 5.04 M/s (§5): a stat of a
+dentry younger than 45 s costs no request. Removes and renames gain the `LOOKUP` their path walk no
+longer sends. Creates and opens are unchanged: a create's name is new (one negative `LOOKUP`, then
+`CREATE`), an open is an `OPEN` round trip whatever the dentry. Run 2's B legs ran beside another
+agent's build (every B row low); its A/B order still separates the lever. The `creates-mdtest`
+shape (−C −F −u −z 2 −b 8, the bracket's) on the same container: A 11,211 / 10,705, B 11,097 / 11,858
+(0.96×, inside the run's spread); the venue's brackets (§9.5): 1.075× (file) and 1.034× (nvmet-loop).
+
+The coherence it costs nothing on the isolated mount: the A legs' `transport_notify_*` deltas are 0 —
+every create, unlink and rename is the kernel's own and names nothing to it. The first cut DID name
+the corpse destroys (16,000 `ENOENT` notifies per mdtest: the inode the last FORGET evicted); a
+corpse is no kernel's (`kernel_origin` on the destroy) — and it WEDGED the first A-B-B-A: the
+journal lane waited for a reserved sideband cell while the sideband thread itself waited on a
+commit (a FORGET's destroy) — an `rmdir` parked 75 s. The producer now only queues and the mount's
+notifier thread writes (0003 §AB.2 (2)). The cross-daemon row (`smoke: INVALIDATION COHERENCE
+ACROSS DAEMONS`, every class at 60 s on both daemons): B's recalled names 5, epochs 0; A's one
+epoch is the join's whole-view flush. The shared hot directory row found the second defect: a
+stripe flip's NUL-led marker names rode the recall and the reader's screen refused the frame (the
+live recall deadline tripped) — markers are never noted.
+
+### 9.4 AB.3 — the drain worker as the handler lane: not landed
+
+See 0003 §AB.3: the design is stated with what it must preserve; this pass did not land it.
+
+### 9.5 The bracket harness's two substrates
+
+Two defects the dev-perf pass found (§7) are fixed: the `file` substrate's metadata volume is a
+dedicated loop device per set (`losetup --direct-io=on` over its image), so `meta_device_div_user`
+reads this daemon's bytes alone — stats ≡ diskstats ×1.0000 on every leg, where every `file` leg was
+INVALID before; the `nvmet` substrates record each data volume's `fabric_endpoint` after the format
+(`config set-fabric-endpoints`) and release the format-time association, so each leg's daemon
+connects its own data volumes (0003 §O.1) and the harness reads their names back from
+`/sys/class/nvme` after the mount (the leg's diskstats name `nvme1n1` beside the metadata
+`nvme0n1`). One VALID row on each (`creates-mdtest`, SCOPING, 4 × 20 s + 5 s warm-up, A =
+`d65a300` (AB.2), B = AB.4's code; `--budget-mb 12288` — at 7,168 the venue's shared cgroup pushed
+two legs to Yellow, `mem_budget_green` INVALID; records under
+`bench/brackets/7.2.6-sqz_aarch64_apple-vm_9c_virtio-blk/creates-mdtest-20261014T{025426Z,030117Z}`):
+
+| substrate | A legs | B legs | A ÷ B | spread | META stats ≡ diskstats | verdict |
+|---|---|---|---|---|---|---|
+| file (meta on `/dev/loop0`) | 14,877 / 15,481 | 14,115 / 14,133 | 1.075 | 9.3 % | ×1.0000 every leg | SCOPING-VALID, 4/4 legs |
+| nvmet-loop (data by the daemon) | 16,110 / 15,659 | 14,694 / 16,037 | 1.034 | 9.1 % | ×1.0000 every leg | SCOPING-VALID, 4/4 legs |
+
+### 9.6 The remaining gap per op (after AB.1, AB.2, AB.4)
+
+| op | now | ext4 | gap | cause |
+|---|---|---|---|---|
+| file stat | 5.0–5.9 M/s | 5.04 M/s | parity | served by the kernel's caches (AB.2) |
+| file create | 6.5–6.6 k/s | 26.7 k/s | 4.0× | the kernel serializes `LOOKUP` + `CREATE` under the directory's `i_rwsem` (§AA.2's `2R + W`), and each round trip pays the worker ↔ lane handoff pair (AB.3, not landed) and the journal write landing |
+| file remove | 7.4–7.9 k/s | 135 k/s | 17× | `UNLINK` is a commit (the write landing) plus the handoff pair; its `LOOKUP` is gone |
+| file read (open/close) | 59–79 k/s | 5.9 M/s | 75–100× | an `OPEN` round trip per open (the kernel asks the daemon for every open; `RELEASE` is asynchronous) — the next lever is `FUSE_NO_OPEN_SUPPORT` for a mount whose opens need no daemon state |
+| random 4 KiB read, QD32, one job | 139–167 k | 334 k | 2.0–2.4× | one drain worker carries the job (§5) |

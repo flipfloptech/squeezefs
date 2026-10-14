@@ -463,7 +463,11 @@ Durability order of EVERY lifecycle commit (port `set_config.zig:21-37`; referen
 6. `add-data` only: the data device's superblock was written BEFORE this tx (device-before-record) and
    placement is enabled strictly AFTER the ack (`D:290-292`: "runtime registration is completed only
    after the durable commit acks — a crash between build and commit must not leave blocks persisted
-   with an id the next mount does not know").
+   with an id the next mount does not know"). Online, the record's generation is PUBLISHED only after
+   this runtime act (the attach, the grant-plane arm, Active): it is the word the membership grants
+   carry and a joiner pulls the record at, so a joiner never learns a volume before its holder serves
+   it; `ResolveSetConfig` answers `Deferred` for a record ahead of the word (decision 0003 §AI.3 — a
+   port feature; the reference learns a new volume at the next mount).
 7. the retire: `state = Retired`, uri cleared, in ONE tx; runtime deregistration AFTER the durable
    commit (`J:3088-3132`, `RT:3256-3273`: dropping the last device handle joins its io_uring worker —
    off the serving lanes).

@@ -886,7 +886,10 @@ CLAIMED (a live image) or PENDING (its free parked on the region's tail — the 
 the_tail_covers_its_free`, `T-M:2601`); unclaimed/returnable dropped from RAM BEFORE the durable return
 (an SMO claiming one between the screen and the bit clear would write into an extent the manager
 re-grants); the deltas are `free(extent, retire 0)` — immediately reusable since the appender's own tail
-covered the free (`B:9794-9800`) — plus the record WITHOUT them, ONE control entry; a live node of THIS
+covered the free (`B:9794-9800`) — plus the record WITHOUT them, ONE control entry; once it lands every
+returned extent's RAM bit is released (`release_unpublished` per landed chunk, `B:10001-10006`; the entry
+only JOURNALS the deltas — decision 0003 §AI.1), as `settle_pending_ring_segment` does for an unnamed
+segment (`B:10812-10815`); a live node of THIS
 mount at a returned extent keeps it claimed (`extent_return_live_refusals`, must-stay-0, `A:3008-3011`).
 
 ### 5.4 The STRUCTURAL door (`B:5907-5988`, `D:304`)

@@ -4120,8 +4120,64 @@ fn awaitExactly(host: anytype, key: []const u8, want: u64, deadline_ns: u64) ![]
 /// (name, ino, links, size) — equal on every daemon when the striped
 /// directory is one directory. The listings land in the work directory
 /// (`$1`) first so a failed `ls`/`find` fails the script (`sh -e` judges a
-/// pipeline by its last command) with its stderr instead of counting 0.
-const hot_view_script = "ls hot > \"$1/view.ls\"; wc -l < \"$1/view.ls\"; find hot -type f > \"$1/view.find\"; wc -l < \"$1/view.find\"; find hot -type f -exec stat -c '%n %i %h %s' {} + > \"$1/view.stat\"; sort \"$1/view.stat\" | sha256sum | cut -d' ' -f1; stat -c %h hot";
+/// pipeline by its last command) with its stderr instead of counting 0;
+/// each daemon's under its own `tag`, so a disagreement can be shown
+/// (`reportHotViews`).
+fn hotView(host: anytype, tag: []const u8) ![]u8 {
+    var buf: [640]u8 = undefined;
+    const script = try std.fmt.bufPrint(&buf, "ls hot > \"$1/view-{0s}.ls\"; wc -l < \"$1/view-{0s}.ls\"; find hot -type f > \"$1/view-{0s}.find\"; wc -l < \"$1/view-{0s}.find\"; find hot -type f -exec stat -c '%n %i %h %s' {{}} + > \"$1/view-{0s}.stat\"; sort \"$1/view-{0s}.stat\" | sha256sum | cut -d' ' -f1; stat -c %h hot", .{tag});
+    return host.onMountTimed(script, 300);
+}
+
+/// Wait for `host`'s open cross-owner intents to reach 0 (owned tail); a
+/// wait that ends above 0 names the cross-owner ledger first.
+fn awaitIntentsClosed(host: anytype, tag: []const u8) ![]u8 {
+    const tail = try awaitExactly(host, "\"xv_cross_owner_intents_open\":", 0, 2 * kill_row_wait_ns);
+    if ((numberAfter(tail, "\"xv_cross_owner_intents_open\":") orelse 0) != 0) {
+        std.debug.print("\n--- {s}: cross-owner intents still open ---\n", .{tag});
+        for ([_][]const u8{ "xv_cross_owner_intents_open", "xv_cross_owner_intents_stuck", "xv_cross_owner_intents_minted", "xv_cross_owner_intents_retired", "xv_started", "xv_completed", "xv_recovered", "xv_compensated", "xv_recovered_compensated", "xv_abandoned", "xv_cadence_passes", "xv_held_open", "xv_resumed", "xv_resumed_completed", "xv_resumed_gone", "xv_applied_attested", "slot_move_unresolved", "slot_move_reissues", "slot_door_coherence_refusals", "appender_recoveries", "membership_evictions" }) |k| {
+            var kbuf: [64]u8 = undefined;
+            std.debug.print("{s} {?d}\n", .{ k, numberAfter(tail, std.fmt.bufPrint(&kbuf, "\"{s}\":", .{k}) catch unreachable) });
+        }
+    }
+    return tail;
+}
+
+/// One daemon's view for `reportHotViews`: its tag and mountpoint.
+const HotViewOf = struct { tag: []const u8, mp: []const u8 };
+
+/// A disagreement between views — two daemons', or `ls` against `find` on
+/// one — named before the row fails: per daemon the names `ls` lists twice
+/// or `find` does not reach (and the reverse), the names one daemon lists
+/// and another does not, and `stat` of each such name on every mount now.
+fn reportHotViews(rig: *Rig, views: []const HotViewOf) void {
+    var script: std.Io.Writer.Allocating = .init(rig.gpa);
+    defer script.deinit();
+    const w = &script.writer;
+    w.writeAll("odd=\"\"; for t in") catch return;
+    for (views) |v| w.print(" {s}", .{v.tag}) catch return;
+    w.writeAll("; do sort view-$t.ls > sorted-$t.ls; sed 's|^hot/||' view-$t.find | sort > sorted-$t.find; d=$(uniq -d sorted-$t.ls | head -20 | tr '\\n' ' '); lo=$(comm -23 sorted-$t.ls sorted-$t.find | head -20 | tr '\\n' ' '); fo=$(comm -13 sorted-$t.ls sorted-$t.find | head -20 | tr '\\n' ' '); echo \"$t: ls $(wc -l < sorted-$t.ls), find $(wc -l < sorted-$t.find); listed twice by ls: $d; ls not find: $lo; find not ls: $fo\"; odd=\"$odd $d $lo $fo\"; done; ") catch return;
+    if (views.len >= 2) {
+        w.print("for t in", .{}) catch return;
+        for (views[1..]) |v| w.print(" {s}", .{v.tag}) catch return;
+        w.print("; do uniq sorted-{0s}.ls > u-{0s}; uniq sorted-$t.ls > u-$t; x=$(comm -23 u-{0s} u-$t | head -20 | tr '\\n' ' '); y=$(comm -13 u-{0s} u-$t | head -20 | tr '\\n' ' '); echo \"{0s} lists, $t does not: $x; $t lists, {0s} does not: $y\"; odd=\"$odd $x $y\"; done; ", .{views[0].tag}) catch return;
+    }
+    w.writeAll("for n in $(echo $odd | tr ' ' '\\n' | sort -u); do for m in") catch return;
+    for (views) |v| w.print(" {s}", .{v.mp}) catch return;
+    w.writeAll("; do echo \"$m: $(stat -c '%n %i %h %s %Y' \"$m/hot/$n\" 2>&1)\"; done; done") catch return;
+    const r = rig.sh(rig.work, script.written()) catch return;
+    defer rig.gpa.free(r.stderr);
+    defer rig.gpa.free(r.stdout);
+    std.debug.print("\n--- hot views disagree ---\n{s}{s}\n", .{ r.stdout, r.stderr });
+}
+
+/// `ls` = `find` on one view (its first two lines).
+fn lsEqualsFind(view: []const u8) bool {
+    var lines = std.mem.splitScalar(u8, view, '\n');
+    const ls_n = std.mem.trim(u8, lines.next() orelse return false, " ");
+    const find_n = std.mem.trim(u8, lines.next() orelse return false, " ");
+    return std.mem.eql(u8, ls_n, find_n);
+}
 
 test "smoke: THE SHARED HOT DIRECTORY ACROSS DAEMONS — A (the manager) mkdirs `hot`; B JOINED storms creates into it ⇒ A's judge: B dominates past N_floor, the OFFER rides B's renewal grant, B accepts, the slot MOVES (slot_offers_pushed ≥ 1, slot_handovers 1 at A; A's census flips nothing — one creator) → A and a THIRD daemon C storm into `hot`, now B's ⇒ two creators past N_floor: B FLIPS it over K = 64 stripes, 21 supplied by A and 21 by C over `SupplyStripeInos` (one batch each), 22 minted by B; every later create keys a stripe and ships into a striping domain feed no window (handovers stay 1) → `ls | wc -l`, `find` and the (name, ino) digest of every entry EQUAL from A, B and C → kill -9 B (the holder of `hot` and 22 stripes) mid-storm ⇒ A evicts B at T_owner and recovers its region (hot's slot and B's stripes the manager's), every open intent rolls forward (stuck 0), the storms continue → the view equal from A and C → kill -9 C (a SUPPLIER: 21 stripes are records in its slot) mid-storm ⇒ A recovers its region, the supplied stripes stand, every name listed → umount A → fsck --offline --scrub 0 findings (C17 clean: no mapped stripe lost)" {
     const io = testing.io;
@@ -4259,12 +4315,13 @@ test "smoke: THE SHARED HOT DIRECTORY ACROSS DAEMONS — A (the manager) mkdirs 
     // The view from every daemon: one directory.
     const total1 = nb + na1 + nc1 + 1;
     {
-        const va = try rig.onMountTimed(hot_view_script, 300);
+        const va = try hotView(rig, "a");
         defer gpa.free(va);
-        const vb = try b.onMount(hot_view_script);
+        const vb = try hotView(b, "b");
         defer gpa.free(vb);
-        const vc = try c.onMount(hot_view_script);
+        const vc = try hotView(c, "c");
         defer gpa.free(vc);
+        if (!std.mem.eql(u8, va, vb) or !std.mem.eql(u8, va, vc) or !lsEqualsFind(va)) reportHotViews(rig, &.{ .{ .tag = "a", .mp = rig.mp }, .{ .tag = "b", .mp = b.mp }, .{ .tag = "c", .mp = c.mp } });
         try testing.expectEqualStrings(va, vb);
         try testing.expectEqualStrings(va, vc);
         var lines = std.mem.splitScalar(u8, va, '\n');
@@ -4305,11 +4362,11 @@ test "smoke: THE SHARED HOT DIRECTORY ACROSS DAEMONS — A (the manager) mkdirs 
     // intent_stuck` is a must-stay-0 tripwire at each creator).
     const t_open = clock.monotonicNs();
     {
-        const oa = try awaitExactly(rig, "\"xv_cross_owner_intents_open\":", 0, 2 * kill_row_wait_ns);
+        const oa = try awaitIntentsClosed(rig, "a");
         defer gpa.free(oa);
         try testing.expectEqual(@as(?u64, 0), numberAfter(oa, "\"xv_cross_owner_intents_open\":"));
         try testing.expectEqual(@as(?u64, 0), numberAfter(oa, "\"xv_cross_owner_intents_stuck\":"));
-        const oc = try awaitExactly(c, "\"xv_cross_owner_intents_open\":", 0, 2 * kill_row_wait_ns);
+        const oc = try awaitIntentsClosed(c, "c");
         defer gpa.free(oc);
         try testing.expectEqual(@as(?u64, 0), numberAfter(oc, "\"xv_cross_owner_intents_open\":"));
         try testing.expectEqual(@as(?u64, 0), numberAfter(oc, "\"xv_cross_owner_intents_stuck\":"));
@@ -4319,10 +4376,11 @@ test "smoke: THE SHARED HOT DIRECTORY ACROSS DAEMONS — A (the manager) mkdirs 
     // landed present (the recovered stripes read locally at A, under A's
     // tokens at C).
     {
-        const va = try rig.onMountTimed(hot_view_script, 300);
+        const va = try hotView(rig, "a");
         defer gpa.free(va);
-        const vc = try c.onMountTimed(hot_view_script, 300);
+        const vc = try hotView(c, "c");
         defer gpa.free(vc);
+        if (!std.mem.eql(u8, va, vc) or !lsEqualsFind(va)) reportHotViews(rig, &.{ .{ .tag = "a", .mp = rig.mp }, .{ .tag = "c", .mp = c.mp } });
         try testing.expectEqualStrings(va, vc);
         var lines = std.mem.splitScalar(u8, va, '\n');
         const listed = try std.fmt.parseInt(u64, std.mem.trim(u8, lines.next().?, " "), 10);
@@ -4364,12 +4422,13 @@ test "smoke: THE SHARED HOT DIRECTORY ACROSS DAEMONS — A (the manager) mkdirs 
     }
     const na3 = try storm_a3.finish(rig);
     {
-        const oa = try awaitExactly(rig, "\"xv_cross_owner_intents_open\":", 0, 2 * kill_row_wait_ns);
+        const oa = try awaitIntentsClosed(rig, "a");
         defer gpa.free(oa);
         try testing.expectEqual(@as(?u64, 0), numberAfter(oa, "\"xv_cross_owner_intents_open\":"));
         try testing.expectEqual(@as(?u64, 0), numberAfter(oa, "\"xv_cross_owner_intents_stuck\":"));
-        const va = try rig.onMountTimed(hot_view_script, 300);
+        const va = try hotView(rig, "a");
         defer gpa.free(va);
+        if (!lsEqualsFind(va)) reportHotViews(rig, &.{.{ .tag = "a", .mp = rig.mp }});
         var lines = std.mem.splitScalar(u8, va, '\n');
         const listed = try std.fmt.parseInt(u64, std.mem.trim(u8, lines.next().?, " "), 10);
         // Phase 3's names (≤ 2 uncounted) and A's new ones (≤ 1 more).
@@ -4440,10 +4499,11 @@ test "smoke: A DEAD MANAGER HOLDING A STRIPED HOT DIRECTORY (rung 10 recovery it
         const ob = try awaitExactly(b, "\"xv_cross_owner_intents_open\":", 0, 2 * kill_row_wait_ns);
         defer gpa.free(ob);
         try testing.expectEqual(@as(?u64, 0), numberAfter(ob, "\"xv_cross_owner_intents_stuck\":"));
-        const va = try rig.onMountTimed(hot_view_script, 300);
+        const va = try hotView(rig, "a");
         defer gpa.free(va);
-        const vb = try b.onMount(hot_view_script);
+        const vb = try hotView(b, "b");
         defer gpa.free(vb);
+        if (!std.mem.eql(u8, va, vb) or !lsEqualsFind(va)) reportHotViews(rig, &.{ .{ .tag = "a", .mp = rig.mp }, .{ .tag = "b", .mp = b.mp } });
         try testing.expectEqualStrings(va, vb);
         var lines = std.mem.splitScalar(u8, va, '\n');
         const listed = try std.fmt.parseInt(u64, std.mem.trim(u8, lines.next().?, " "), 10);

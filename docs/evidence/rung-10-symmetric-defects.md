@@ -6,6 +6,44 @@ intents still open at A after C's kill in phase 4, `dlm_token_nonmember_refusals
 passing run, and the owed chunked `extent_grant:` record behind the custody move's refusal past one
 tree-0 value. Decisions: 0003 §AE; 0002 row 525.
 
+## 1. C's `ls` listing one name more than its `find` (item 1)
+
+### 1.1 The defect
+
+`rung-10-tripwire-hunt.md` §5: in one run of the shared hot directory row on the post-perf3 base
+(phase 3, after B's death), C's `ls hot | wc -l` read 10,365 where `find` and A read 10,364. The
+row's view compares the two counts from every survivor; one more name from `ls` than from `find` on
+the same mount, seconds apart, is a listing that names a file twice.
+
+The merged readdir (`stripe.readdirMerged`, 0003 §U.3) reads `D`'s own stream before its stripes
+over every cookie range; a stripe's entry past `D`'s loaded range waits for `D`'s next page, and at
+that refill every stripe whose loaded page reached past `D`'s old range is read again — from its
+LAST CONSUMED cookie. The range between that cookie and `D`'s old cover had already been answered:
+by `D`'s old page and by the stripe snapshots taken after it. A name the lazy migration moved into
+that range after the stripe's snapshot (the move inserts into the stripe, then removes from `D`) was
+listed from `D`'s old snapshot — and the restarted stripe's fresh snapshot listed it AGAIN, behind
+the reply's frontier: out of cookie order, so when it ended a reply the kernel's continuation from
+its cookie re-listed what followed it too. The U.3 red row never drained `D`'s page inside one reply
+(6-entry replies over 8-entry stream pages); the daemon's replies are a page of dirents (tens to
+hundreds of entries) over 8-entry stream pages at K = 64, so `D` drains and refills inside every
+reply while it still holds names — exactly while the migration runs. In phase 3 A, the directory's
+new holder after B's recovery, migrates the phase-1 names; C's `ls` crossed one of those moves.
+
+### 1.2 The red row and the fix (0003 §AE.1)
+
+- **Red** (`c6bef64`, portable, `stripe.zig` "a reply WIDER than D's stream page lists a name the
+  lazy migration moves mid-reply exactly once"): the U.3 fixture (K = 2, 40 names, the odd ones in
+  `D`) at replies of 30 and 64 entries — `D`'s 20 names span two stream pages inside one reply —
+  every odd name moved before every page read index in turn. On `dev`: a reply out of cookie order
+  (the moved name re-listed behind the frontier).
+- **Fix** (`1b37957`): a restart re-reads the stripe from `D`'s old cover (`Stream.restart(…,
+  cover)`), never from its last consumed cookie: every entry of the range the stream held was
+  consumed before `D`'s last (cookie order), a name moved into it was listed from `D`'s snapshot,
+  and a create that landed there landed behind the listing (POSIX leaves an entry created during a
+  listing unspecified). The range past the cover — unconsumed, ineligible until `D`'s next page —
+  is read again as before, so U.3's no-miss argument stands. The stream's consumed-cookie word is
+  gone. Both rows green (the U.3 row and the wide-reply row), every stripe row green.
+
 ## 4. The grant record as a family of chunks (item 4)
 
 ### 4.1 The limit

@@ -41,7 +41,9 @@ streak_of() {  # consecutive greens on $1 at the end of the ledger (both venues)
 }
 
 run_once() {
-  local sha=$1 vlog=$STATE/venue-$sha.log mlog=$STATE/macos-$sha.log t0 t1 vres mres vwall mwall fails
+  # (One word per `local`: bash expands every word of a `local` before assigning any.)
+  local sha=$1
+  local vlog=$STATE/venue-$sha.log mlog=$STATE/macos-$sha.log t0 t1 vres mres vwall mwall fails
   git -C "$TRAIN" checkout -q --detach "$sha" || return 1
   echo "// gate-train run $(date +%s%N)" >> "$TRAIN/src/core/clock.zig"
   t0=$(date +%s)

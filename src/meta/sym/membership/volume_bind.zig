@@ -885,7 +885,7 @@ pub const VolumeBinding = struct {
         std.mem.sort(u64, images.items, {}, std.sort.asc(u64));
         const gate = be.core.headPos();
         for (hold.held.items) |e| {
-            if (recovery.sortedContains(images.items, e)) continue;
+            if (grant.sortedContains(images.items, e)) continue;
             be.alloc.freePendingForced(e, gate) catch {
                 log.warn("recovery: a retired image extent ({d}) of appender {d}'s grant could not park (out of memory) — it stays allocated; fsck C13 reclaims", .{ e, self.recovering_id });
             };
@@ -1006,7 +1006,7 @@ pub const VolumeBinding = struct {
             var e = run.start;
             while (e < run.end()) : (e += 1) {
                 if (!be.alloc.isAllocated(e)) continue;
-                var hit = recovery.sortedContains(kept, e);
+                var hit = grant.sortedContains(kept, e);
                 for (bitmap_extents.items) |b| hit = hit or b == e;
                 if (hit) continue;
                 const img = be.dev.readRange(gpa, be.cache.extentAddr(e), @intCast(be.sb.node_size)) catch |err| return switch (err) {
@@ -2112,7 +2112,7 @@ fn expectOneCustodian(binding: *VolumeBinding) !void {
     }
     while (be.alloc.claimInternal()) |e| {
         try claimed.append(gpa, e);
-        try testing.expect(!recovery.sortedContains(images.items, e));
+        try testing.expect(!grant.sortedContains(images.items, e));
     } else |_| {}
 }
 

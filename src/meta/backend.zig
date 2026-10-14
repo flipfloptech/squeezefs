@@ -1041,6 +1041,7 @@ pub const KvBackend = struct {
         be.smo_journal.retire_seq.store(standing.ckpt_seq + 1, .release);
         be.smo_ctx = smo.SmoContext.withJournal(&be.alloc, &be.smo_journal);
         be.smo_ctx.grant_fed = true;
+        be.smo_ctx.grant_holds = js.grantHolds();
         be.ckpt_seam = .{ .ctx = &be.smo_ctx, .trees = &be.trees };
         be.flusher = .{ .cache = be.cache, .smo = be.ckpt_seam.seam() };
         const flush_ms = checkpoint.flushIntervalMsFromEnv(opts.env);
@@ -2010,21 +2011,32 @@ pub const KvBackend = struct {
     }
 
     /// Every node of `t` (the root, every interior, every leaf) as heap
-    /// extents, through the tree's own latch-free snapshots.
+    /// extents, through the tree's own latch-free snapshots. Only interior
+    /// nodes are read: a leaf's extent is its parent's pointer (a slot
+    /// lease's custody move walks a tree it may have to read from the
+    /// device — the interior share is < 1 % of the images at the shipped
+    /// fan-out).
     pub fn collectTreeExtents(be: *KvBackend, t: *KvTree, out: *std.ArrayList(u64)) Error!void {
         const gpa = be.gpa;
-        var stack: std.ArrayList(u64) = .empty;
+        const Frame = struct { addr: u64, level: u8 };
+        var stack: std.ArrayList(Frame) = .empty;
         defer stack.deinit(gpa);
-        try stack.append(gpa, t.rootPtr().addr);
-        while (stack.pop()) |addr| {
-            try out.append(gpa, be.cache.addrExtent(addr));
-            const n = t.getNode(addr) catch |e| return switch (e) {
+        const root_level = t.rootLevel() catch |e| return switch (e) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.Io => error.Io,
+            else => error.Corrupt,
+        };
+        try stack.append(gpa, .{ .addr = t.rootPtr().addr, .level = root_level });
+        while (stack.pop()) |f| {
+            try out.append(gpa, be.cache.addrExtent(f.addr));
+            if (f.level == 0) continue;
+            const n = t.getNode(f.addr) catch |e| return switch (e) {
                 error.OutOfMemory => error.OutOfMemory,
                 error.Io => error.Io,
                 else => error.Corrupt,
             };
             defer n.release();
-            if (n.level == 0) continue;
+            if (n.level != f.level) return error.Corrupt;
             const snap = n.snapshotLoad();
             defer snap.release();
             var pos = key.KeyBuf.fromSlice("");
@@ -2035,7 +2047,7 @@ pub const KvBackend = struct {
                 }) orelse break;
                 defer live.deinit();
                 const iv = key.InteriorValue.decode(live.value) catch return error.Corrupt;
-                try stack.append(gpa, iv.childAddr());
+                try stack.append(gpa, .{ .addr = iv.childAddr(), .level = f.level - 1 });
                 if (!key.lessThan(live.key, &tree.KEY_SPACE_MAX)) break;
                 pos = key.keySuccessor(live.key);
             }

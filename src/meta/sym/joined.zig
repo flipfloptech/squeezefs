@@ -49,6 +49,7 @@ const backend = @import("../backend.zig");
 const key = @import("../key.zig");
 const ledger = @import("../ledger.zig");
 const node_seq = @import("../node_seq.zig");
+const smo = @import("../smo.zig");
 const checkpoint_cycle = @import("../checkpoint_cycle.zig");
 const claim = @import("../guard/claim.zig");
 const proc = @import("../guard/proc.zig");
@@ -313,6 +314,12 @@ pub const JoinedSet = struct {
     granted: u64 = 0,
     returned: u64 = 0,
     granted_bits: std.DynamicBitSetUnmanaged,
+    /// Guards `granted_bits`, `granted` and `returned` across bit
+    /// operations only — never across a wire call — so the SMO context's
+    /// retirement guard (`grantHolds`) reads under it without waiting on
+    /// the manager. Order: `pool_lock` → `bits_lock`; the SMO lock →
+    /// `bits_lock`.
+    bits_lock: Io.Mutex = .init,
     pool_lock: Io.Mutex = .init,
     /// The measured SMO rate (milli-images/s; charter §5.5 "a WIRE joiner
     /// measures its own SMO rate and names its size"), folded per cadence
@@ -554,6 +561,8 @@ pub const JoinedSet = struct {
     /// The pool's unclaimed runs as extent indices (granted ∧ free in the
     /// mirror), coalesced ascending.
     pub fn unclaimedRuns(self: *JoinedSet, out: *std.ArrayList(grant.GrantRun)) Allocator.Error!void {
+        self.bits_lock.lockUncancelable(self.be.io);
+        defer self.bits_lock.unlock(self.be.io);
         var it = self.granted_bits.iterator(.{});
         while (it.next()) |idx| {
             if (self.be.alloc.isAllocated(idx)) continue;
@@ -564,6 +573,12 @@ pub const JoinedSet = struct {
     }
 
     fn unclaimedCount(self: *JoinedSet) u64 {
+        self.bits_lock.lockUncancelable(self.be.io);
+        defer self.bits_lock.unlock(self.be.io);
+        return self.unclaimedCountLocked();
+    }
+
+    fn unclaimedCountLocked(self: *JoinedSet) u64 {
         var n: u64 = 0;
         var it = self.granted_bits.iterator(.{});
         while (it.next()) |idx| {
@@ -575,9 +590,63 @@ pub const JoinedSet = struct {
     /// `held + unclaimed + returned ≡ granted` over the mirror: held = the
     /// granted extents the mirror shows claimed (images, pending frees).
     fn checkClosure(self: *JoinedSet) void {
-        const unclaimed = self.unclaimedCount();
+        if (!self.closureHolds()) stats.extent_grant_closure_violations.fire("the joiner's grant pool lost or gained an extent outside a grant or a return");
+    }
+
+    pub fn closureHolds(self: *JoinedSet) bool {
+        self.bits_lock.lockUncancelable(self.be.io);
+        defer self.bits_lock.unlock(self.be.io);
+        const unclaimed = self.unclaimedCountLocked();
         const held = self.granted_bits.count() - unclaimed;
-        if (held + unclaimed + self.returned != self.granted) stats.extent_grant_closure_violations.fire("the joiner's grant pool lost or gained an extent outside a grant or a return");
+        return held + unclaimed + self.returned == self.granted;
+    }
+
+    /// A slot lease's custody move as this mount's grant sees it (0003
+    /// §AD.1; the manager's entry moved the record): IN — the installed
+    /// tree's live images join the grant as HELD (the mirror shows them
+    /// claimed: they are images), so an SMO of ours that retires one
+    /// recycles an extent the record grants; OUT — the released tree's
+    /// images leave it (the closure reads them as returned; the mirror
+    /// keeps them claimed — the tree's next maintainer owns them).
+    pub fn transferImages(self: *JoinedSet, images: []const u64, way: manager.Manager.ImagesMove) void {
+        {
+            self.bits_lock.lockUncancelable(self.be.io);
+            defer self.bits_lock.unlock(self.be.io);
+            var n: u64 = 0;
+            for (images) |e| {
+                const idx: usize = @intCast(e);
+                switch (way) {
+                    .gain => if (!self.granted_bits.isSet(idx)) {
+                        self.granted_bits.set(idx);
+                        n += 1;
+                    },
+                    .lose => if (self.granted_bits.isSet(idx)) {
+                        self.granted_bits.unset(idx);
+                        n += 1;
+                    },
+                }
+            }
+            switch (way) {
+                .gain => self.granted += n,
+                .lose => self.returned += n,
+            }
+        }
+        self.checkClosure();
+    }
+
+    /// The SMO context's retirement guard (`smo.GrantHolds`): an image this
+    /// mount's SMO retires recycles into the pool only if the grant holds
+    /// it — after the custody moves every image of a tree this mount
+    /// leases does.
+    pub fn grantHolds(self: *JoinedSet) smo.GrantHolds {
+        return .{ .ctx = self, .holds = &holdsFn };
+    }
+
+    fn holdsFn(ctx: *anyopaque, extent: u64) bool {
+        const self: *JoinedSet = @ptrCast(@alignCast(ctx));
+        self.bits_lock.lockUncancelable(self.be.io);
+        defer self.bits_lock.unlock(self.be.io);
+        return extent < self.granted_bits.bit_length and self.granted_bits.isSet(@intCast(extent));
     }
 
     /// The pool's target (charter §5.5 "Extent grants"): the explicit
@@ -667,11 +736,15 @@ pub const JoinedSet = struct {
                 },
             };
             for (runs.items) |r| {
-                var e = r.start;
-                while (e < r.end()) : (e += 1) {
-                    if (self.granted_bits.isSet(@intCast(e))) continue;
-                    self.granted_bits.set(@intCast(e));
-                    self.granted += 1;
+                {
+                    self.bits_lock.lockUncancelable(self.be.io);
+                    defer self.bits_lock.unlock(self.be.io);
+                    var e = r.start;
+                    while (e < r.end()) : (e += 1) {
+                        if (self.granted_bits.isSet(@intCast(e))) continue;
+                        self.granted_bits.set(@intCast(e));
+                        self.granted += 1;
+                    }
                 }
                 self.be.alloc.absorbGranted(.{ .start = r.start, .len = r.len });
             }
@@ -702,8 +775,12 @@ pub const JoinedSet = struct {
                 for (surplus.items) |e| self.be.alloc.absorbGranted(.{ .start = e, .len = 1 });
                 return;
             };
-            for (surplus.items) |e| self.granted_bits.unset(@intCast(e));
-            self.returned += surplus.items.len;
+            {
+                self.bits_lock.lockUncancelable(self.be.io);
+                defer self.bits_lock.unlock(self.be.io);
+                for (surplus.items) |e| self.granted_bits.unset(@intCast(e));
+                self.returned += surplus.items.len;
+            }
             stats.extent_grant_returns.inc();
             sym.stats.extent_grant_recycled.add(surplus.items.len);
             self.checkClosure();

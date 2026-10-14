@@ -390,9 +390,9 @@ src/meta/record.zig:1060 | 4 | OWED: derive it or document it on the line (chart
 src/meta/record.zig:1079 | 8 | OWED: derive it or document it on the line (charter §1.5)
 src/meta/record.zig:1119 | 16 | OWED: derive it or document it on the line (charter §1.5)
 src/meta/routing/migration_tee.zig:56 | 16 | OWED: derive it or document it on the line (charter §1.5)
-src/meta/smo.zig:1435 | 1024 | OWED: derive it or document it on the line (charter §1.5)
-src/meta/smo.zig:1712 | 7 | a percentage — OWED: derive it (charter §1.5) or document the measured reason
-src/meta/smo.zig:1712 | 8 | a percentage — OWED: derive it (charter §1.5) or document the measured reason
+src/meta/smo.zig:1454 | 1024 | OWED: derive it or document it on the line (charter §1.5)
+src/meta/smo.zig:1731 | 7 | a percentage — OWED: derive it (charter §1.5) or document the measured reason
+src/meta/smo.zig:1731 | 8 | a percentage — OWED: derive it (charter §1.5) or document the measured reason
 src/meta/superblock.zig:148 | 3 | OWED: derive it or document it on the line (charter §1.5)
 src/meta/superblock.zig:450 | 64 | OWED: derive it or document it on the line (charter §1.5)
 src/meta/sym/appender_dir.zig:24 | 8 | encoding offset/width of a fixed layout (the module's layout table; the comptime size asserts pin it)
@@ -453,15 +453,15 @@ src/meta/sym/control_records.zig:1061 | 24 | OWED: derive it or document it on t
 src/meta/sym/control_records.zig:1108 | 32 | OWED: derive it or document it on the line (charter §1.5)
 src/meta/sym/control_records.zig:1109 | 4 | OWED: derive it or document it on the line (charter §1.5)
 src/meta/sym/control_records.zig:1110 | 6 | OWED: derive it or document it on the line (charter §1.5)
-src/meta/sym/extent_grant.zig:474 | 3 | OWED: derive it or document it on the line (charter §1.5)
-src/meta/sym/extent_grant.zig:491 | 3 | OWED: derive it or document it on the line (charter §1.5)
-src/meta/sym/extent_grant.zig:514 | 3 | OWED: derive it or document it on the line (charter §1.5)
-src/meta/sym/manager.zig:141 | 100 | a percentage — OWED: derive it (charter §1.5) or document the measured reason
-src/meta/sym/manager.zig:141 | 100 | a percentage — OWED: derive it (charter §1.5) or document the measured reason
-src/meta/sym/membership/recovery.zig:149 | 10 | a size — OWED: derive from derive.Facts or document the physical/format reason
-src/meta/sym/membership/recovery.zig:149 | 256 | a size — OWED: derive from derive.Facts or document the physical/format reason
-src/meta/sym/membership/recovery.zig:151 | 1000 | a timing/retry constant — OWED: its measured WHY on the line or a derivation (charter §1.5)
+src/meta/sym/extent_grant.zig:581 | 3 | OWED: derive it or document it on the line (charter §1.5)
+src/meta/sym/extent_grant.zig:598 | 3 | OWED: derive it or document it on the line (charter §1.5)
+src/meta/sym/extent_grant.zig:621 | 3 | OWED: derive it or document it on the line (charter §1.5)
+src/meta/sym/manager.zig:148 | 100 | a percentage — OWED: derive it (charter §1.5) or document the measured reason
+src/meta/sym/manager.zig:148 | 100 | a percentage — OWED: derive it (charter §1.5) or document the measured reason
+src/meta/sym/membership/recovery.zig:150 | 10 | a size — OWED: derive from derive.Facts or document the physical/format reason
+src/meta/sym/membership/recovery.zig:150 | 256 | a size — OWED: derive from derive.Facts or document the physical/format reason
 src/meta/sym/membership/recovery.zig:152 | 1000 | a timing/retry constant — OWED: its measured WHY on the line or a derivation (charter §1.5)
+src/meta/sym/membership/recovery.zig:153 | 1000 | a timing/retry constant — OWED: its measured WHY on the line or a derivation (charter §1.5)
 src/meta/sym/membership/shard.zig:799 | 1000 | a timing/retry constant — OWED: its measured WHY on the line or a derivation (charter §1.5)
 src/meta/sym/region.zig:325 | 64 | OWED: derive it or document it on the line (charter §1.5)
 src/meta/sym/region.zig:429 | 3 | OWED: derive it or document it on the line (charter §1.5)

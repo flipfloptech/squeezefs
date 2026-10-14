@@ -414,6 +414,17 @@ pub const Seams = struct {
     /// control entry admits again under the mutex; the reservation made
     /// the room). `null` = the volume has no park seam (tests).
     parkForRoom: ?*const fn (ctx: *anyopaque, bytes: u64) Error!void = null,
+    /// The live images of `slot`'s tree at `root` — every node's extent,
+    /// ascending, deduplicated (appended to `out`): the set a lease's
+    /// custody move carries (0003 §AD.1). `fresh`: another process wrote
+    /// the tree (a wire lessee's release) — its nodes are read from the
+    /// device, never from this process's cache. Null = the RAM harnesses,
+    /// whose trees own no extent.
+    treeImages: ?*const fn (ctx: *anyopaque, gpa: Allocator, slot: u16, root: cr.Root, fresh: bool, out: *std.ArrayList(u64)) Error!void = null,
+    /// An in-process region's RAM grant follows its record's custody move
+    /// (the closure reads the images as granted on the way in, returned on
+    /// the way out). Null = no in-process region besides the manager's.
+    regionImagesMoved: ?*const fn (ctx: *anyopaque, appender_id: AppenderId, extents: []const u64, dir: manager.Manager.ImagesMove) Allocator.Error!void = null,
 };
 
 pub const Grant = struct { slot: u16, g: u32, words: SlotWords };
@@ -528,6 +539,39 @@ pub const Verbs = struct {
         return .{ .root = s.root, .cursor = @max(s.cursor, inos.LOCAL_INO_BASE), .extents = s.slot_tree_extents, .seq_floor = s.seq_floor };
     }
 
+    // ---- the custody move of the trees' images (T1 / T5) ----
+
+    /// The record rewrite a lease's custody move over `slots`' trees adds
+    /// to the lease's entry (0003 §AD.1); null when nothing moves (the
+    /// manager's own lease — its images are untracked — or empty trees).
+    fn custodyRewrite(self: *Verbs, gpa: Allocator, appender_id: AppenderId, slots: []const u16, words: []const SlotWords, fresh: bool, dir: manager.Manager.ImagesMove) Error!?manager.Manager.RecordRewrite {
+        if (appender_id == journal.FIXED_RING_APPENDER) return null;
+        const walk = self.seams.treeImages orelse return null;
+        var images: std.ArrayList(u64) = .empty;
+        defer images.deinit(gpa);
+        for (slots, words) |s, w| if (w.root.addr != 0) try walk(self.seams.ctx, gpa, s, w.root, fresh, &images);
+        std.mem.sort(u64, images.items, {}, std.sort.asc(u64));
+        var n: usize = 0;
+        for (images.items) |e| {
+            if (n > 0 and images.items[n - 1] == e) continue;
+            images.items[n] = e;
+            n += 1;
+        }
+        return try self.mgr.rewriteForImages(appender_id, images.items[0..n], dir);
+    }
+
+    /// The entry landed: an in-process region's RAM grant follows (a wire
+    /// lessee follows at its own install / release), the moves counted.
+    fn custodyLanded(self: *Verbs, appender_id: AppenderId, c: *const manager.Manager.RecordRewrite, dir: manager.Manager.ImagesMove) void {
+        if (self.seams.ownsRegion(self.seams.ctx, appender_id)) if (self.seams.regionImagesMoved) |f| f(self.seams.ctx, appender_id, c.move.moved.items, dir) catch {
+            log.err("slot leases: appender {d}'s RAM grant could not follow its record's custody move of {d} image(s) (out of memory) — its closure reads them unaccounted until the region's next open", .{ appender_id, c.move.moved.items.len });
+        };
+        switch (dir) {
+            .gain => manager.stats.extent_grant_images_transferred_in.add(c.move.moved.items.len),
+            .lose => manager.stats.extent_grant_images_transferred_out.add(c.move.moved.items.len),
+        }
+    }
+
     // ---- AcquireSlots / AcquireSlot (T1) ----
 
     /// Screen → the PARKING admission (holding nothing) → the verb mutex
@@ -622,6 +666,16 @@ pub const Verbs = struct {
                 .deferred => return error.Deferred,
             }
         }
+        const granted_words = try gpa.alloc(SlotWords, picked.items.len);
+        defer gpa.free(granted_words);
+        for (picked.items, granted_words) |s, *w| w.* = try self.grantWords(s);
+        // The custody move (T1, 0003 §AD.1): the grantee's record gains
+        // every live image of the granted trees in THIS entry, so an image
+        // it later retires through its own SMO context is one its grant
+        // holds. Decided before any RAM effect: a record the move would take
+        // past the run cap refuses the grant whole.
+        var custody = try self.custodyRewrite(gpa, req.appender_id, picked.items, granted_words, false, .gain);
+        defer if (custody) |*c| c.deinit(gpa);
         // RAM first (g += 1), the words, then ONE control entry.
         var recs: std.ArrayList(manager.ControlRecord) = .empty;
         defer recs.deinit(gpa);
@@ -631,8 +685,7 @@ pub const Verbs = struct {
         defer gpa.free(keys);
         var minted: usize = 0;
         errdefer for (picked.items[0..minted]) |s| self.table.rollbackUnwritten(s);
-        for (picked.items, 0..) |s, i| {
-            const words = try self.grantWords(s);
+        for (picked.items, granted_words, 0..) |s, words, i| {
             const rotor = req.rotor or i >= req.explicit.len;
             const g = switch (try self.table.acquire(s, req.appender_id, rotor)) {
                 .granted => |g| g,
@@ -648,8 +701,10 @@ pub const Verbs = struct {
             keys[i] = cr.slotStateKey(s);
             try recs.append(gpa, .{ .put = .{ .key = keys[i].slice(), .value = &values[i] } });
         }
+        if (custody) |*c| try recs.append(gpa, c.record());
         try self.control(recs.items);
         stats.slot_grants.add(grants.len);
+        if (custody) |*c| self.custodyLanded(req.appender_id, c, .gain);
         // The install: this process's regions adopt now; a wire grantee's
         // install is its own (the reply carries the words) and the tree
         // leaves THIS process's custody (`foreignGranted`).
@@ -766,6 +821,13 @@ pub const Verbs = struct {
                 return error.Rejected;
             },
         }
+        // The custody move (T5, 0003 §AD.1): the departing record loses the
+        // released tree's live images in THIS entry — the tree's next
+        // maintainer retires them through its own context. A wire lessee
+        // wrote the tree: its nodes are read from the device at the
+        // released root.
+        var custody = try self.custodyRewrite(gpa, req.appender_id, &.{req.slot}, &.{req.words}, !self.seams.ownsRegion(self.seams.ctx, req.appender_id), .lose);
+        defer if (custody) |*c| c.deinit(gpa);
         // ONE entry: Unleased + the tails stamped with the g they attest.
         const next: cr.SlotState = .{ .variant = .unleased, .g = req.g, .root = req.words.root, .cursor = @max(req.words.cursor, cur.cursor), .slot_tree_extents = req.words.extents, .last_written = self.table.lease_seq + 1, .seq_floor = @max(req.words.seq_floor, cur.seq_floor) };
         const value = next.encode();
@@ -817,10 +879,12 @@ pub const Verbs = struct {
                 }
             } else |_| {}
         }
+        if (custody) |*c| try recs.append(gpa, c.record());
         self.control(recs.items) catch |e| {
             if (spilled) |sp| for (sp.extents) |x| self.mgr.vol.vt.releaseUnpublished(self.mgr.vol.ctx, x);
             return e;
         };
+        if (custody) |*c| self.custodyLanded(req.appender_id, c, .lose);
         for (old_extents) |e| self.mgr.vol.vt.releaseUnpublished(self.mgr.vol.ctx, e);
         // The frame screen's rule 2 reads the tails the entry just made
         // durable (the RAM index follows the durable word).

@@ -103,6 +103,13 @@ pub const stats = struct {
     pub var extent_grant_conflicts: counters.Tripwire = .init("extent_grant_conflicts");
     /// A return that would split a record run past the cap (capacity class).
     pub var extent_return_run_cap_refusals: counters.ShardedCounter = .{};
+    /// Live images a slot lease's custody move carried into the grantee's
+    /// record (T1) and out of the departing lessee's (T5) — 0003 §AD.1.
+    pub var extent_grant_images_transferred_in: counters.ShardedCounter = .{};
+    pub var extent_grant_images_transferred_out: counters.ShardedCounter = .{};
+    /// A custody move whose record would pass the run cap: the lease does
+    /// not move (capacity class, like `extent_return_run_cap_refusals`).
+    pub var extent_grant_custody_cap_refusals: counters.ShardedCounter = .{};
     /// Cycles the structural door ran; doors deferred on a moving tail.
     pub var slot_grant_door_cycles: counters.ShardedCounter = .{};
     pub var slot_grant_deferrals: counters.ShardedCounter = .{};
@@ -1356,6 +1363,67 @@ pub const Manager = struct {
         const copy = try self.gpa.dupe(GrantRun, rec.runs.items);
         defer self.gpa.free(copy);
         _ = try self.returnInner(appender_id, copy, rec);
+    }
+
+    // ---- the custody move of a slot tree's images (T1 / T5) ----
+
+    pub const ImagesMove = enum { gain, lose };
+
+    pub const CustodyError = error{ Rejected, Io, Corrupt, OutOfMemory };
+
+    /// The control record a slot lease's custody move adds to the lease's
+    /// ONE entry (charter §5.5 "Extent grants": every extent has exactly
+    /// one custodian; 0003 §AD.1): `appender_id`'s record after its tree
+    /// images moved in (T1, the grant) or out (T5, the release) — a put, or
+    /// a delete when nothing remains — and the extents that moved.
+    pub const RecordRewrite = struct {
+        move: grant.RecordMove,
+        key: cr.ControlKey,
+        /// The encoded record (empty for a delete).
+        value: []u8,
+
+        pub fn record(self: *const RecordRewrite) ControlRecord {
+            return if (self.move.runs.items.len == 0) .{ .delete = self.key.slice() } else .{ .put = .{ .key = self.key.slice(), .value = self.value } };
+        }
+
+        pub fn deinit(self: *RecordRewrite, gpa: Allocator) void {
+            self.move.deinit(gpa);
+            gpa.free(self.value);
+        }
+    };
+
+    /// `images` (ascending, deduplicated) into or out of `appender_id`'s
+    /// record. Null = nothing moves: the manager's own region (its images
+    /// are untracked — the bitmap is its record) or no image changes hands.
+    /// A record the move would take past the run cap refuses typed
+    /// (`Rejected`): the lease does not move. The caller holds the verb
+    /// mutex (the record it reads is the one its entry replaces).
+    pub fn rewriteForImages(self: *Manager, appender_id: u32, images: []const u64, way: ImagesMove) CustodyError!?RecordRewrite {
+        if (appender_id == journal.FIXED_RING_APPENDER or images.len == 0) return null;
+        var rec = self.readGrantRecord(appender_id) catch |e| return switch (e) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.Io => error.Io,
+            else => error.Corrupt,
+        };
+        defer rec.deinit(self.gpa);
+        var move = switch (way) {
+            .gain => try grant.RecordMove.gain(self.gpa, rec.runs.items, images),
+            .lose => try grant.RecordMove.lose(self.gpa, rec.runs.items, images),
+        };
+        errdefer move.deinit(self.gpa);
+        if (move.moved.items.len == 0) {
+            move.deinit(self.gpa);
+            return null;
+        }
+        if (move.runs.items.len > self.runCap()) {
+            stats.extent_grant_custody_cap_refusals.inc();
+            log.warn("manager: moving {d} tree image(s) {s} appender {d}'s grant record would take it to {d} runs, past the {d}-run cap of a tree-0 value — the slot lease does not move", .{ move.moved.items.len, if (way == .gain) "into" else "out of", appender_id, move.runs.items.len, self.runCap() });
+            return error.Rejected;
+        }
+        const value = try self.gpa.alloc(u8, if (move.runs.items.len == 0) 0 else cr.extentGrantEncodedLen(move.runs.items.len));
+        errdefer self.gpa.free(value);
+        if (move.runs.items.len != 0) _ = cr.encodeExtentGrant(move.runs.items, value) catch return error.Corrupt;
+        return .{ .move = move, .key = cr.extentGrantKey(appender_id), .value = value };
     }
 
     // ---- GrowRing (§3.3) ----

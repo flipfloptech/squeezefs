@@ -454,6 +454,8 @@ pub const Plane = struct {
             .foreignGranted = foreignGrantedFn,
             .transfer = transferFn,
             .parkForRoom = null,
+            .treeImages = treeImagesFn,
+            .regionImagesMoved = regionImagesMovedFn,
         }, m, a_max);
         self.m = m;
         self.a_max = a_max;
@@ -557,6 +559,14 @@ pub const Plane = struct {
         self.frames.setFenced(if (be.guard) |g| g.prClient() != null else false);
         self.frames.noteArmed();
         log.info("meta volume {s}: slot leases armed — M {d}, A_max {d} B, {d} leases held, T_idle {d} ms, N_floor {d}", .{ be.path, m, a_max, self.table.leasedCount(), self.t_idle_ns / std.time.ns_per_ms, self.judge.nFloorNow() });
+    }
+
+    fn mapBe(e: backend.Error) acquire.Error {
+        return switch (e) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.Io => error.Io,
+            else => error.Corrupt,
+        };
     }
 
     fn mapVerb(e: acquire.Error) ArmError {
@@ -739,6 +749,11 @@ pub const Plane = struct {
         // grant's root is opened.
         if (self.be.slotTree(slot) == null) self.discardMovedNodes(slot);
         self.install(slot, self.me, g, words, true) catch |e| return mapVerb(e);
+        // The custody move's second half (T1, 0003 §AD.1): the manager's
+        // grant entry moved the tree's live images into this appender's
+        // record; its grant takes them as held before the word names this
+        // mount the holder (no SMO of ours reaches the tree before it).
+        if (self.joined) |j| try self.joinedImagesMoved(j, slot, .gain);
         if (touch and words.root.addr == 0 and self.be.slotTree(slot) == null) _ = self.be.mintGuestTree(slot) catch |e| return switch (e) {
             error.OutOfMemory => error.OutOfMemory,
             error.Io => error.Io,
@@ -776,6 +791,25 @@ pub const Plane = struct {
         if (self.joined != null or v.state != .unleased) return false;
         const to = self.table.reservedFor(slot, clock.monotonicNs()) orelse return true;
         return to == self.me;
+    }
+
+    /// A joiner's half of a lease's custody move (0003 §AD.1): the images of
+    /// its OWN tree of `slot` (the grant's root just installed, or the
+    /// root just released) into or out of its grant, walked under the SMO
+    /// lock (no SMO of this mount moves a node mid-walk).
+    fn joinedImagesMoved(self: *Plane, j: *joined.JoinedSet, slot: u16, dir: manager.Manager.ImagesMove) error{ OutOfMemory, Io, Corrupt }!void {
+        const be = self.be;
+        const t = be.slotTree(slot) orelse return;
+        var images: std.ArrayList(u64) = .empty;
+        defer images.deinit(be.gpa);
+        be.smo_lock.lockUncancelable(be.io);
+        defer be.smo_lock.unlock(be.io);
+        be.collectTreeExtents(t, &images) catch |e| return switch (e) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.Io => error.Io,
+            else => error.Corrupt,
+        };
+        j.transferImages(images.items, dir);
     }
 
     /// `park_mid_install`: the harness holds the accepter between the two
@@ -893,6 +927,51 @@ pub const Plane = struct {
         };
         opened.seedNodeCount(words.extents);
         be.stamp.installFloor(slot, words.cursor) catch {};
+    }
+
+    /// `Seams.treeImages` (0003 §AD.1): the images of `slot`'s tree at
+    /// `root`, walked under the SMO lock (no SMO of this process moves a
+    /// node mid-walk) — this process's own tree when it holds the slot's
+    /// tree at that root and wrote it; else a transient tree over the
+    /// device's images, the slot's cached nodes dropped first when another
+    /// process wrote them (`fresh`: a lessee appends into its leaves and
+    /// interiors IN PLACE under an unchanged pointer — the cache barrier).
+    fn treeImagesFn(ctx: *anyopaque, gpa: Allocator, slot: u16, root: cr.Root, fresh: bool, out: *std.ArrayList(u64)) acquire.Error!void {
+        const self = self_(ctx);
+        const be = self.be;
+        var images: std.ArrayList(u64) = .empty;
+        defer images.deinit(be.gpa);
+        {
+            be.smo_lock.lockUncancelable(be.io);
+            defer be.smo_lock.unlock(be.io);
+            const live = if (fresh) null else if (be.slotTree(slot)) |t| blk: {
+                const r = t.rootPtr();
+                break :blk if (r.addr == root.addr and r.seq == root.seq) t else null;
+            } else null;
+            if (live) |t| {
+                be.collectTreeExtents(t, &images) catch |e| return mapBe(e);
+            } else {
+                if (fresh) self.discardMovedNodes(slot);
+                const t = tree.KvTree.open(self.gpa, be.cache, .{ .slot = key.guestForestSlot(slot) }, .{ .addr = root.addr, .seq = root.seq }, &be.seq) catch |e| return switch (e) {
+                    error.OutOfMemory => error.OutOfMemory,
+                    error.Io => error.Io,
+                    else => error.Corrupt,
+                };
+                defer t.destroy();
+                be.collectTreeExtents(t, &images) catch |e| return mapBe(e);
+            }
+        }
+        try out.appendSlice(gpa, images.items);
+    }
+
+    /// `Seams.regionImagesMoved`: an in-process region's RAM grant follows
+    /// its record.
+    fn regionImagesMovedFn(ctx: *anyopaque, appender_id: AppenderId, extents: []const u64, dir: manager.Manager.ImagesMove) Allocator.Error!void {
+        const r = self_(ctx).regionOf(appender_id) orelse return;
+        switch (dir) {
+            .gain => _ = try r.grant.transferIn(extents),
+            .lose => _ = r.grant.transferOut(extents),
+        }
     }
 
     /// A wire appender took `slot`: the unleased tree this process kept
@@ -1119,6 +1198,11 @@ pub const Plane = struct {
                 error.Rejected, error.NotManager => error.Corrupt,
                 else => error.Io,
             };
+            // The custody move's second half (T5, 0003 §AD.1): the release's
+            // entry took the tree's images off this appender's record. The
+            // release has landed — a failed walk is loud, never an abort
+            // that would reopen the door of a slot no longer ours.
+            self.joinedImagesMoved(j, slot, .lose) catch |e| log.err("slot leases: slot {d} released, but this mount's grant could not drop the tree's images ({s}) — its closure keeps them held", .{ slot, @errorName(e) });
             _ = self.table.release(slot, holder, g, words, clock.monotonicNs()) catch return error.OutOfMemory;
             releasedFn(self, slot);
             // The tree is the manager's now: its nodes leave this cache

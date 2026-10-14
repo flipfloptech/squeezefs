@@ -55,6 +55,7 @@ const clock = @import("../../../core/clock.zig");
 const log = @import("../../../core/log.zig");
 const checkpoint = @import("../../checkpoint.zig");
 const cr = @import("../control_records.zig");
+const extent_grant = @import("../extent_grant.zig");
 const page = @import("../appender_page.zig");
 const manager = @import("../manager.zig");
 const tails_spill = @import("../slots/tails_spill.zig");
@@ -649,13 +650,16 @@ pub const Driver = struct {
         // The grant record minus what it no longer owns.
         var remaining: std.ArrayList(GrantRun) = .empty;
         defer remaining.deinit(gpa);
-        try subtractExtents(gpa, grant.items, kept.items, &remaining);
-        var grant_buf: [GRANT_RUNS_INLINE_MAX * cr.GrantRunWire.LEN + cr.ExtentGrantHead.LEN]u8 = undefined;
-        if (remaining.items.len > GRANT_RUNS_INLINE_MAX) return error.Corrupt;
+        try extent_grant.subtractExtents(gpa, grant.items, kept.items, &remaining);
         if (remaining.items.len == 0) {
             try self.vol.vt.controlEntry(self.vol.ctx, &.{.{ .delete = cr.extentGrantKey(p.appender_id).slice() }});
         } else {
-            const gv = cr.encodeExtentGrant(remaining.items, &grant_buf) catch return error.Corrupt;
+            // Sized to the runs (the record's own bound is the tree-0 value
+            // cap the entry enforces): the custody moves leave recycled
+            // tree images as single-extent runs, past any fixed count.
+            const grant_buf = try gpa.alloc(u8, cr.extentGrantEncodedLen(remaining.items.len));
+            defer gpa.free(grant_buf);
+            const gv = cr.encodeExtentGrant(remaining.items, grant_buf) catch return error.Corrupt;
             try self.vol.vt.controlEntry(self.vol.ctx, &.{.{ .put = .{ .key = cr.extentGrantKey(p.appender_id).slice(), .value = gv } }});
         }
         try self.fail(.tree0);
@@ -824,36 +828,9 @@ pub const APPENDER_SCAN_MAX: u32 = 4096;
 /// → 16,640 B, `geometry.recordValueCap`) and the stack buffer's size; a
 /// tree with more leaves spills (`slots/tails_spill`).
 pub const TAILS_INLINE_MAX: usize = 1024;
-pub const GRANT_RUNS_INLINE_MAX: usize = 256;
 /// Slots one re-run can absorb: the page budget's entries + the overflow
 /// a region may lease (the rotor cap is 128).
 pub const ABSORBED_MAX: usize = 256;
-
-/// `grant − kept` (`kept` sorted ascending), as normalized runs.
-fn subtractExtents(gpa: Allocator, grant: []const GrantRun, kept: []const u64, out: *std.ArrayList(GrantRun)) Allocator.Error!void {
-    for (grant) |run| {
-        var start: ?u64 = null;
-        var e = run.start;
-        while (e <= run.end()) : (e += 1) {
-            const hit = e == run.end() or sortedContains(kept, e);
-            if (hit) {
-                if (start) |s| {
-                    try out.append(gpa, .{ .start = s, .len = @intCast(e - s) });
-                    start = null;
-                }
-            } else if (start == null) start = e;
-        }
-    }
-}
-
-/// Whether the ascending `sorted` holds `e`.
-pub fn sortedContains(sorted: []const u64, e: u64) bool {
-    return std.sort.binarySearch(u64, sorted, e, struct {
-        fn order(ctx: u64, item: u64) std.math.Order {
-            return std.math.order(ctx, item);
-        }
-    }.order) != null;
-}
 
 /// §3.1: the RAII rollback's exact scope.
 const Rollback = struct {
@@ -1036,17 +1013,6 @@ test "the coherence hold derives from the census law: VALIDITY_RENEWALS × renew
     try testing.expectEqual(@as(u64, 20_044), coherenceHoldMs(shipped.renew_ms, shipped.skew_max_ms));
     const smoke = try shard.LeaseClocks.derive(3_000, 0, shard.CHECKPOINT_LANDING_CEILING_MS);
     try testing.expectEqual(@as(u64, 534), coherenceHoldMs(smoke.renew_ms, smoke.skew_max_ms));
-}
-
-test "grant − reached is normalized runs" {
-    var out: std.ArrayList(GrantRun) = .empty;
-    defer out.deinit(testing.allocator);
-    try subtractExtents(testing.allocator, &.{ .{ .start = 10, .len = 6 }, .{ .start = 30, .len = 2 } }, &.{ 12, 13, 30, 31 }, &out);
-    try testing.expectEqual(@as(usize, 2), out.items.len);
-    try testing.expectEqual(@as(u64, 10), out.items[0].start);
-    try testing.expectEqual(@as(u32, 2), out.items[0].len);
-    try testing.expectEqual(@as(u64, 14), out.items[1].start);
-    try testing.expectEqual(@as(u32, 2), out.items[1].len);
 }
 
 /// The RAM volume: pages, the dead ring's window, tree 0, the lease

@@ -168,6 +168,85 @@ pub fn coalesceRuns(runs: []GrantRun) []GrantRun {
     return runs[0..n];
 }
 
+/// Whether the ascending `sorted` holds `e`.
+pub fn sortedContains(sorted: []const u64, e: u64) bool {
+    return std.sort.binarySearch(u64, sorted, e, struct {
+        fn order(ctx: u64, item: u64) std.math.Order {
+            return std.math.order(ctx, item);
+        }
+    }.order) != null;
+}
+
+/// Whether the normalized `runs` (ascending, disjoint) hold `e` — one
+/// binary search.
+pub fn runsContain(runs: []const GrantRun, e: u64) bool {
+    var lo: usize = 0;
+    var hi: usize = runs.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        if (e < runs[mid].start) {
+            hi = mid;
+        } else if (e >= runs[mid].end()) {
+            lo = mid + 1;
+        } else return true;
+    }
+    return false;
+}
+
+/// `grant − kept` (`kept` ascending), as normalized runs appended to `out`.
+pub fn subtractExtents(gpa: Allocator, grant: []const GrantRun, kept: []const u64, out: *std.ArrayList(GrantRun)) Allocator.Error!void {
+    for (grant) |run| {
+        var start: ?u64 = null;
+        var e = run.start;
+        while (e <= run.end()) : (e += 1) {
+            const hit = e == run.end() or sortedContains(kept, e);
+            if (hit) {
+                if (start) |s| {
+                    try out.append(gpa, .{ .start = s, .len = @intCast(e - s) });
+                    start = null;
+                }
+            } else if (start == null) start = e;
+        }
+    }
+}
+
+/// A slot lease's custody move of its tree's live images (charter §5.5
+/// "Extent grants" — every extent has exactly one custodian; decision 0003
+/// §AD.1): the record of the lessee the lease moves to GAINS the tree's
+/// images in the grant's own entry (T1), the record of the lessee it moves
+/// from LOSES them in the release's (T5). `moved` = the extents that changed
+/// hands (ascending; for a gain those the record did not yet hold, for a
+/// loss those it did); `runs` = the record after the move, normalized.
+/// `images` ascending and deduplicated.
+pub const RecordMove = struct {
+    runs: std.ArrayList(GrantRun) = .empty,
+    moved: std.ArrayList(u64) = .empty,
+
+    pub fn deinit(self: *RecordMove, gpa: Allocator) void {
+        self.runs.deinit(gpa);
+        self.moved.deinit(gpa);
+    }
+
+    pub fn gain(gpa: Allocator, record: []const GrantRun, images: []const u64) Allocator.Error!RecordMove {
+        var m: RecordMove = .{};
+        errdefer m.deinit(gpa);
+        for (images) |e| if (!runsContain(record, e)) try m.moved.append(gpa, e);
+        try m.runs.ensureTotalCapacity(gpa, record.len + m.moved.items.len);
+        m.runs.appendSliceAssumeCapacity(record);
+        for (m.moved.items) |e| m.runs.appendAssumeCapacity(.{ .start = e, .len = 1 });
+        m.runs.items.len = coalesceRuns(m.runs.items).len;
+        return m;
+    }
+
+    pub fn lose(gpa: Allocator, record: []const GrantRun, images: []const u64) Allocator.Error!RecordMove {
+        var m: RecordMove = .{};
+        errdefer m.deinit(gpa);
+        for (images) |e| if (runsContain(record, e)) try m.moved.append(gpa, e);
+        try subtractExtents(gpa, record, m.moved.items, &m.runs);
+        return m;
+    }
+};
+
 /// The merge walk: `coalesced ∩ record`, output bounded by the RECORD's
 /// run count (appended to `out`). Both inputs normalized.
 pub fn intersectWithRecord(gpa: Allocator, coalesced: []const GrantRun, record: []const GrantRun, out: *std.ArrayList(GrantRun)) Allocator.Error!void {
@@ -279,6 +358,34 @@ pub const RegionGrant = struct {
         if (added != 0) self.refill_reference = self.unclaimedCount();
         self.checkClosure();
         return added;
+    }
+
+    /// A slot lease's custody move (0003 §AD.1) as the RAM grant sees it:
+    /// IN — the granted tree's live images become CLAIMED (granted by the
+    /// transfer); OUT — the released tree's images leave the claimed set
+    /// (the closure reads them as returned). Answers the extents that
+    /// moved here.
+    pub fn transferIn(self: *RegionGrant, images: []const u64) Allocator.Error!u64 {
+        try self.claimed.ensureUnusedCapacity(self.gpa, @intCast(images.len));
+        var n: u64 = 0;
+        for (images) |e| {
+            if (self.holdsExtent(e)) continue;
+            self.claimed.putAssumeCapacity(e, {});
+            n += 1;
+        }
+        self.granted += n;
+        self.checkClosure();
+        return n;
+    }
+
+    pub fn transferOut(self: *RegionGrant, images: []const u64) u64 {
+        var n: u64 = 0;
+        for (images) |e| {
+            if (self.claimed.remove(e)) n += 1;
+        }
+        self.returned += n;
+        self.checkClosure();
+        return n;
     }
 
     fn holdsExtent(self: *const RegionGrant, e: u64) bool {
@@ -600,6 +707,51 @@ test "a wire joiner's derived size, its SMO-rate fold and its refill mark: the s
     try testing.expectEqual(@as(u64, 45), joinedRefillMark(72, 10));
     try testing.expect(joinedRefillDue(45 - 10, 72) and !joinedRefillDue(46 - 10, 72));
     try testing.expectEqual(@as(u64, 0), joinedRefillMark(1, 0));
+}
+
+test "grant − reached is normalized runs" {
+    var out: std.ArrayList(GrantRun) = .empty;
+    defer out.deinit(testing.allocator);
+    try subtractExtents(testing.allocator, &.{ .{ .start = 10, .len = 6 }, .{ .start = 30, .len = 2 } }, &.{ 12, 13, 30, 31 }, &out);
+    try testing.expectEqual(@as(usize, 2), out.items.len);
+    try testing.expectEqual(@as(u64, 10), out.items[0].start);
+    try testing.expectEqual(@as(u32, 2), out.items[0].len);
+    try testing.expectEqual(@as(u64, 14), out.items[1].start);
+    try testing.expectEqual(@as(u32, 2), out.items[1].len);
+}
+
+test "a lease's custody move (0003 §AD.1): a gain adds exactly the images the record did not hold and normalizes (an image adjacent to a run joins it); a loss removes exactly the images it held, splitting runs; gain then lose of the same images restores the record; runsContain is the runs' membership" {
+    const gpa = testing.allocator;
+    const record = [_]GrantRun{ .{ .start = 10, .len = 4 }, .{ .start = 40, .len = 2 } };
+    for ([_]u64{ 9, 14, 39, 42 }) |e| try testing.expect(!runsContain(&record, e));
+    for ([_]u64{ 10, 13, 40, 41 }) |e| try testing.expect(runsContain(&record, e));
+    // T1: 12 is held already; 14 joins [10, 14); 20 and 50 are new runs.
+    var g = try RecordMove.gain(gpa, &record, &.{ 12, 14, 20, 50 });
+    defer g.deinit(gpa);
+    try testing.expectEqualSlices(u64, &.{ 14, 20, 50 }, g.moved.items);
+    try testing.expectEqualSlices(GrantRun, &.{ .{ .start = 10, .len = 5 }, .{ .start = 20, .len = 1 }, .{ .start = 40, .len = 2 }, .{ .start = 50, .len = 1 } }, g.runs.items);
+    // T5 of the same images off the gained record: back to the record.
+    var l = try RecordMove.lose(gpa, g.runs.items, &.{ 14, 20, 50 });
+    defer l.deinit(gpa);
+    try testing.expectEqualSlices(u64, &.{ 14, 20, 50 }, l.moved.items);
+    try testing.expectEqualSlices(GrantRun, &record, l.runs.items);
+    // A loss of an image the record never held moves nothing; one inside a
+    // run splits it.
+    var s = try RecordMove.lose(gpa, &record, &.{ 11, 77 });
+    defer s.deinit(gpa);
+    try testing.expectEqualSlices(u64, &.{11}, s.moved.items);
+    try testing.expectEqualSlices(GrantRun, &.{ .{ .start = 10, .len = 1 }, .{ .start = 12, .len = 2 }, .{ .start = 40, .len = 2 } }, s.runs.items);
+    // The RAM grant follows: IN claims the images it does not hold, OUT
+    // returns the claimed ones it held; the closure holds across both.
+    var rg = RegionGrant.init(gpa);
+    defer rg.deinit();
+    _ = try rg.absorb(&record);
+    const c = try rg.claim();
+    try testing.expectEqual(@as(u64, 2), try rg.transferIn(&.{ c, 50, 51 }));
+    try testing.expect(rg.closureHolds());
+    try testing.expectEqual(@as(u64, 1), rg.transferOut(&.{ 50, 99 }));
+    try testing.expect(rg.closureHolds());
+    try testing.expectEqual(rg.granted, rg.held() + rg.unclaimedCount() + rg.returned);
 }
 
 test "the return law's screens: a run past the volume or overflowing is rejected at the first offender; coalesce is bounded by the frame; the intersection by the record" {

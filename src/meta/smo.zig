@@ -99,6 +99,11 @@ pub const stats = struct {
     /// A dead grant's image extent retired twice under a recovery's hold
     /// (must-stay-0: the held bit stays set, no tree can claim it back).
     pub var meta_kv_retire_hold_breaches: counters.Tripwire = .init("meta_kv_retire_hold_breaches");
+    /// A grant-fed context retired an image its grant does not hold (0003
+    /// §AD.1: a lease's custody move carries every image of a leased tree
+    /// into the lessee's grant) — kept allocated, never recycled into the
+    /// pool: a leaked extent, never one two custodians hand out.
+    pub var extent_grant_foreign_retirements: counters.Tripwire = .init("extent_grant_foreign_retirements");
 };
 
 pub const Error = tree.Error || node_cache.FreezeError || node_cache.AppendError || journal.Error || error{
@@ -320,6 +325,13 @@ pub const RetireHold = struct {
     }
 };
 
+/// Whether a grant-fed context's grant holds `extent` (the JOINED
+/// appender's census of its grant: `sym/joined.zig` `grantHolds`).
+pub const GrantHolds = struct {
+    ctx: *anyopaque,
+    holds: *const fn (ctx: *anyopaque, extent: u64) bool,
+};
+
 /// The serialized SMO execution context: ONE per volume, passed `*` into
 /// every SMO entry point by the task that owns it.
 pub const SmoContext = struct {
@@ -345,6 +357,9 @@ pub const SmoContext = struct {
     /// A recovery's hold over a dead grant's retirements (`RetireHold`);
     /// set and cleared under the SMO lock.
     retire_hold: ?*RetireHold = null,
+    /// A JOINED appender's grant (the mirror's free set is its pool): a
+    /// retired image recycles only if the grant holds it.
+    grant_holds: ?GrantHolds = null,
 
     pub fn init(alloc: *const alloc_ext.ExtentAllocator) SmoContext {
         return .{ .alloc = alloc };
@@ -410,6 +425,10 @@ pub const SmoContext = struct {
     /// grant's extent first (`RetireHold`).
     pub fn freePending(self: *SmoContext, extent: u64, gate_seq: u64, forced: bool) Error!void {
         if (self.retire_hold) |h| if (h.take(extent)) return;
+        if (self.grant_holds) |g| if (!g.holds(g.ctx, extent)) {
+            stats.extent_grant_foreign_retirements.fire("a joiner's SMO retired an image its grant does not hold — kept allocated, never recycled into its pool");
+            return;
+        };
         if (forced) return self.alloc.freePendingForced(extent, gate_seq);
         self.alloc.freePending(extent, gate_seq) catch {
             self.last_refusal = .{ .pending_free_full = .{ .pending = self.alloc.pendingCount() } };

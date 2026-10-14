@@ -173,6 +173,17 @@ pub fn deinitKeyValues(gpa: Allocator, list: *std.ArrayList(KeyValue)) void {
     list.deinit(gpa);
 }
 
+/// What a read cost the trees: `nodes` fetched on the walk's descents
+/// (root to leaf, once per leaf a range enters, restarts included),
+/// `entries` copied out of the leaves — the read amplification's
+/// numerator (a merged range reads entries it then drops) — and `sources`,
+/// the trees the read consulted.
+pub const WalkCost = struct {
+    nodes: u64 = 0,
+    entries: u64 = 0,
+    sources: u64 = 0,
+};
+
 // ---------------------------------------------------------------------------
 // The maintenance queue — a bounded lock-free MPMC ring of node addresses.
 // ---------------------------------------------------------------------------
@@ -607,6 +618,12 @@ pub const KvTree = struct {
     /// range holds `k` — latch-free (module doc). The caller releases the
     /// returned reference.
     pub fn descend(self: *KvTree, k: []const u8, target_level: u8) Error!*CachedNode {
+        var nodes: u64 = 0;
+        return self.descendCounted(k, target_level, &nodes);
+    }
+
+    /// `descend`, adding every node it fetched (restarts included) to `nodes`.
+    fn descendCounted(self: *KvTree, k: []const u8, target_level: u8, nodes: *u64) Error!*CachedNode {
         const gpa = self.cache.gpa;
         // Restart-reason tallies `[root-retired, root-seq, routing-hole,
         // child-retired, child-seq]`, carried into the exhaustion error.
@@ -628,6 +645,7 @@ pub const KvTree = struct {
                 reasons[0] += 1;
                 continue :restart;
             };
+            nodes.* += 1;
             // A device error mid-walk drops the reference the walk holds.
             errdefer cur.release();
             if (cur.node_seq != root.seq) {
@@ -661,6 +679,7 @@ pub const KvTree = struct {
                     reasons[3] += 1;
                     continue :restart; // retired extent: stale route
                 };
+                nodes.* += 1;
                 if (child.node_seq != iv.childSeq()) {
                     child.release();
                     cur.release();
@@ -694,13 +713,20 @@ pub const KvTree = struct {
     /// fold. `null` for tombstoned and never-written keys alike; the
     /// value is an OWNED copy (`gpa.free`).
     pub fn lookup(self: *KvTree, gpa: Allocator, k: []const u8) Error!?[]u8 {
-        const leaf = try self.resolveLeaf(k);
+        var cost: WalkCost = .{};
+        return self.lookupCounted(gpa, k, &cost);
+    }
+
+    /// `lookup`, adding its descent to `cost`.
+    pub fn lookupCounted(self: *KvTree, gpa: Allocator, k: []const u8, cost: *WalkCost) Error!?[]u8 {
+        const leaf = try self.descendCounted(k, 0, &cost.nodes);
         defer leaf.release();
         const snap = leaf.snapshotLoad();
         defer snap.release();
         var l = try snap.value.lookup(gpa, k);
         defer l.deinit();
         const v = l.liveValue() orelse return null;
+        cost.entries += 1;
         return try gpa.dupe(u8, v);
     }
 
@@ -869,11 +895,18 @@ pub const KvTree = struct {
     /// snapshots — latch-free; a concurrent SMO at worst retries the NEXT
     /// leaf's resolution. Resume with `start = key_successor(last key)`.
     pub fn range(self: *KvTree, gpa: Allocator, start: []const u8, end: []const u8, max: usize, out: *std.ArrayList(KeyValue)) Error!void {
+        var cost: WalkCost = .{};
+        return self.rangeCounted(gpa, start, end, max, out, &cost);
+    }
+
+    /// `range`, adding its descents and the entries it copied to `cost`.
+    pub fn rangeCounted(self: *KvTree, gpa: Allocator, start: []const u8, end: []const u8, max: usize, out: *std.ArrayList(KeyValue), cost: *WalkCost) Error!void {
         if (max == 0 or key.lessThan(end, start)) return;
         var cursor = key.KeyBuf.fromSlice(start);
         var got: usize = 0;
+        defer cost.entries += got;
         while (true) {
-            const leaf = try self.descend(cursor.slice(), 0);
+            const leaf = try self.descendCounted(cursor.slice(), 0, &cost.nodes);
             defer leaf.release();
             const snap = leaf.snapshotLoad();
             defer snap.release();

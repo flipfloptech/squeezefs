@@ -411,9 +411,13 @@ pub const Pass = struct {
         const tags = host.knownTags(&tags_buf);
         var p: Pass = .{ .host = host, .gpa = gpa, .arena = std.heap.ArenaAllocator.init(gpa), .cen = undefined, .dentries = undefined, .scan_epoch = epochs, .ceiling = census.candidateCeiling(host.mem_budget) };
         errdefer p.arena.deinit();
+        const t0 = clock.monotonicNs();
         p.cen = try census.run(gpa, host.store, p.censusOptions(tags));
         errdefer p.cen.deinit();
+        const t1 = clock.monotonicNs();
         p.dentries = try census.dentryPass(gpa, host.store, .{ .scope = host.scope, .shard = host.shard, .mem_budget = host.mem_budget, .ceiling = p.cen.rawCeiling(), .hold = host.hold });
+        p.counters.census_ms = msBetween(t0, t1);
+        p.counters.dentries_ms = msBetween(t1, clock.monotonicNs());
         // A member's custody names live in OTHER members' directories (a
         // joiner's tree under the manager's root, every cross-owner name),
         // which this mount does not read: its referenced set is incomplete
@@ -484,7 +488,11 @@ pub const Pass = struct {
     /// → C8 → C11 → C12 → C13 → C16 → C17 → C14/C15 → C9 → C10. C7 (the
     /// scrub) is the caller's, after the settle.
     pub fn nominate(self: *Pass) Error!void {
+        const t0 = clock.monotonicNs();
         try self.c1();
+        const t1 = clock.monotonicNs();
+        self.counters.c1_ms = msBetween(t0, t1);
+        defer self.counters.classes_ms = msBetween(t1, clock.monotonicNs());
         try self.c2c3c6();
         try self.c4c5();
         try self.c8();
@@ -1577,6 +1585,11 @@ pub const Pass = struct {
 // ---------------------------------------------------------------------------
 // Helpers shared by the nominations and the ladder.
 // ---------------------------------------------------------------------------
+
+/// Whole milliseconds between two monotonic readings (a pass's report row).
+pub fn msBetween(t0: u64, t1: u64) u64 {
+    return (t1 -| t0) / std.time.ns_per_ms;
+}
 
 /// The deduped `(parent, name)` identities the fresh pass collected for
 /// `global` (records may only NOMINATE; a VL5b migration mid-copy has one

@@ -61,12 +61,16 @@ pub fn settleNsFromEnv(env: *const std.process.Environ.Map) u64 {
 /// scrub possible (the report says so through its counters).
 pub fn run(host: *const Host, opts: Options, verifier: ?*scrub.Verifier) Error!finding.Report {
     const t0 = clock.monotonicNs();
+    if (host.store.tally) |t| t.* = .{};
     var pass = try classes.Pass.begin(host);
     defer pass.deinit();
     defer pass.end();
     if (!opts.scrub_only) try pass.nominate();
     pass.settle();
+    const t_recheck = clock.monotonicNs();
     try pass.recheck();
+    const t_scrub = clock.monotonicNs();
+    pass.counters.recheck_ms = classes.msBetween(t_recheck, t_scrub);
     if ((opts.scrub or opts.scrub_only) and verifier != null) {
         // A FRESH census post-settle: the mappings the scrub reads are the
         // ones that stood after the window.
@@ -75,6 +79,14 @@ pub fn run(host: *const Host, opts: Options, verifier: ?*scrub.Verifier) Error!f
         var fresh = try census.run(host.gpa, host.store, .{ .scope = host.scope, .shard = host.shard, .custody_only = host.custody_only, .mem_budget = host.mem_budget, .geo = host.geo, .known_vol_tags = tags });
         defer fresh.deinit();
         try scrub.run(&pass, &fresh, verifier.?, opts.throttle);
+        pass.counters.scrub_ms = classes.msBetween(t_scrub, clock.monotonicNs());
+    }
+    if (host.store.tally) |t| {
+        pass.counters.nodes_walked = t.nodes;
+        pass.counters.entries_visited = t.visited;
+        pass.counters.entries_read = t.read;
+        pass.counters.store_calls = t.calls;
+        pass.counters.trees_consulted = t.sources;
     }
     var report = try pass.report(host.gpa);
     errdefer report.deinit(host.gpa);
@@ -156,6 +168,8 @@ pub const linux = if (builtin.os.tag == .linux) struct {
         verifier: ?scrub.Verifier,
         staging_face: ?StagingBind,
         forest: ForestBind,
+        /// The run's walk accounting the host's store face adds to.
+        tally: census.WalkTally = .{},
         host: Host,
 
         /// The holder's bitmaps NOW: a volume's bitmap is the holder
@@ -250,6 +264,7 @@ pub const linux = if (builtin.os.tag == .linux) struct {
             .store = blk: {
                 var st = census.Store.from(meta_set.MetaSet, be);
                 st.merged_kinds = true;
+                st.tally = &b.tally;
                 break :blk st;
             },
             .geo = if (plane) |pl| pl.geo else .{},

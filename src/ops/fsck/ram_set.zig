@@ -84,6 +84,8 @@ pub const RamSet = struct {
     intents: std.AutoHashMapUnmanaged(u64, void) = .empty,
     /// The pack-open ledger the tests arm: `(vol_tag, block_idx)`.
     open_packs: std.AutoHashMapUnmanaged(u64, void) = .empty,
+    /// The hosts' walk accounting.
+    tally: census.WalkTally = .{},
 
     pub fn init(gpa: Allocator) !*RamSet {
         const self = try gpa.create(RamSet);
@@ -122,7 +124,9 @@ pub const RamSet = struct {
     }
 
     pub fn store(self: *RamSet) census.Store {
-        return census.Store.from(FaultStore, &self.fault);
+        var st = census.Store.from(FaultStore, &self.fault);
+        st.tally = &self.tally;
+        return st;
     }
 
     pub fn host(self: *RamSet, mode: finding.Mode) classes.Host {

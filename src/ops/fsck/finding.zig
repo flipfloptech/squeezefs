@@ -352,16 +352,33 @@ pub const Counters = struct {
     scrub_readability_only: u64 = 0,
     scrub_failures: u64 = 0,
     scrub_pin_unstable_cleared: u64 = 0,
-    // MAX across shards (per-run gauges).
+    // MAX across shards (per-run gauges: every shard walks the whole
+    // space). The walk's cost (`census.WalkTally`): tree nodes fetched,
+    // entries delivered, entries the trees copied to deliver them, store
+    // calls, trees the calls consulted — `ops_fsck.md` §6.1's bound.
     nodes_walked: u64 = 0,
+    entries_visited: u64 = 0,
+    entries_read: u64 = 0,
+    store_calls: u64 = 0,
+    trees_consulted: u64 = 0,
     scan_ms: u64 = 0,
+    // The wall clock per pass: the census (inode + layout kinds), the
+    // dentry pass, C1's raw walk, the other classes' nominations, the
+    // ladder's re-check, the scrub (its fresh census included).
+    census_ms: u64 = 0,
+    dentries_ms: u64 = 0,
+    c1_ms: u64 = 0,
+    classes_ms: u64 = 0,
+    recheck_ms: u64 = 0,
+    scrub_ms: u64 = 0,
     inode_plane_slots_covered: u64 = 0,
     // Candidates past the ceiling, said loudly (batching is convergent).
     deferred: u64 = 0,
 
-    const max_fields = [_][]const u8{ "nodes_walked", "scan_ms", "inode_plane_slots_covered" };
+    const max_fields = [_][]const u8{ "nodes_walked", "entries_visited", "entries_read", "store_calls", "trees_consulted", "scan_ms", "census_ms", "dentries_ms", "c1_ms", "classes_ms", "recheck_ms", "scrub_ms", "inode_plane_slots_covered" };
 
     fn isMaxField(comptime name: []const u8) bool {
+        @setEvalBranchQuota(10_000);
         inline for (max_fields) |m| if (comptime std.mem.eql(u8, m, name)) return true;
         return false;
     }
@@ -400,6 +417,8 @@ pub const Counters = struct {
         const s = &fsck.stats;
         s.fsck_inodes_scanned.add(self.inodes_scanned);
         s.fsck_nodes_walked.add(self.nodes_walked);
+        s.fsck_entries_visited.add(self.entries_visited);
+        s.fsck_entries_read.add(self.entries_read);
         s.fsck_dentry_refs_indexed.add(self.dentry_refs_indexed);
         s.fsck_blocks_checked.add(self.blocks_checked);
         s.fsck_refcounts_checked.add(self.refcounts_checked);
@@ -637,6 +656,7 @@ pub const Report = struct {
         try w.print("fsck ({s}", .{@tagName(self.mode)});
         if (self.shard) |s| try w.print(", shard {f}", .{s});
         try w.print("): {d} inode(s), {d} dentry ref(s), {d} block(s) checked, {d} refcount(s) checked, {d} node(s) walked in {d}.{d:0>3} s\n", .{ c.inodes_scanned, c.dentry_refs_indexed, c.blocks_checked, c.refcounts_checked, c.nodes_walked, c.scan_ms / 1000, c.scan_ms % 1000 });
+        try w.print("walk: {d} entr(ies) visited, {d} read, {d} node(s), {d} store call(s), {d} tree(s) consulted; census {d} ms, dentries {d} ms, C1 {d} ms, classes {d} ms, re-check {d} ms, scrub {d} ms\n", .{ c.entries_visited, c.entries_read, c.nodes_walked, c.store_calls, c.trees_consulted, c.census_ms, c.dentries_ms, c.c1_ms, c.classes_ms, c.recheck_ms, c.scrub_ms });
         try w.print("suspects: {d} ({d} cleared; epoch {d}, in-flight {d}, pack {d}, era {d}, intent {d}, nlink-transient {d}, crossing {d})\n", .{ c.suspects, c.suspects_cleared, c.epoch_exempted, c.inflight_exempted, c.pack_ledger_exempted, c.current_era_exempted, c.unreferenced_intent_exempted, c.nlink_transient_cleared, c.crossing_exempted });
         if (c.scrub_blocks_scanned != 0 or c.scrub_failures != 0) {
             try w.print("scrub: {d} block(s), {d} byte(s); aead {d}, frame {d}, readability-only {d}, failures {d}\n", .{ c.scrub_blocks_scanned, c.scrub_bytes_scanned, c.scrub_aead_verified, c.scrub_frame_verified, c.scrub_readability_only, c.scrub_failures });

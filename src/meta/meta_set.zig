@@ -360,8 +360,15 @@ pub const MetaSet = struct {
 
     /// Point lookup through the key's home tree (latch-free); an owned copy.
     pub fn lookup(self: *MetaSet, gpa: Allocator, kind: u8, k: []const u8) Error!?[]u8 {
+        var cost: tree.WalkCost = .{};
+        return self.lookupCounted(gpa, kind, k, &cost);
+    }
+
+    /// `lookup`, adding its descent to `cost` (fsck's walk accounting).
+    pub fn lookupCounted(self: *MetaSet, gpa: Allocator, kind: u8, k: []const u8, cost: *tree.WalkCost) Error!?[]u8 {
         const t = (try self.treeOfKey(kind, k)) orelse return null;
-        return t.lookup(gpa, k) catch |e| switch (e) {
+        cost.sources += 1;
+        return t.lookupCounted(gpa, k, cost) catch |e| switch (e) {
             error.OutOfMemory => error.OutOfMemory,
             error.Io => error.Io,
             else => error.Corrupt,
@@ -377,17 +384,23 @@ pub const MetaSet = struct {
     /// slot tree of every member in key order, `max` smallest first — so a
     /// caller resuming at `successor(last)` pages through the whole set.
     pub fn range(self: *MetaSet, gpa: Allocator, kind: u8, start: []const u8, end: []const u8, max: usize, out: *std.ArrayList(tree.KeyValue)) Error!void {
+        var cost: tree.WalkCost = .{};
+        return self.rangeCounted(gpa, kind, start, end, max, out, &cost);
+    }
+
+    /// `range`, adding what the trees read to `cost` (fsck's walk accounting).
+    pub fn rangeCounted(self: *MetaSet, gpa: Allocator, kind: u8, start: []const u8, end: []const u8, max: usize, out: *std.ArrayList(tree.KeyValue), cost: *tree.WalkCost) Error!void {
         if (max == 0 or key.lessThan(end, start)) return;
         if (kind == key.TREE_CONTROL) {
             const t = self.volumes[0].treeOf(.control) orelse return error.Corrupt;
-            return rangeIn(t, gpa, start, end, max, out);
+            return rangeIn(t, gpa, start, end, max, out, cost);
         }
         if (kind != key.TREE_BLOCK_REFS) {
             const s0 = route_table.slotOfKey(start) catch null;
             const s1 = route_table.slotOfKey(end) catch null;
             if (s0 != null and s1 != null and s0.? == s1.?) {
                 const t = self.volumeOfSlot(s0.?).slotTree(s0.?) orelse return;
-                return rangeIn(t, gpa, start, end, max, out);
+                return rangeIn(t, gpa, start, end, max, out, cost);
             }
         }
         var merged: std.ArrayList(tree.KeyValue) = .empty;
@@ -401,7 +414,7 @@ pub const MetaSet = struct {
                 // volume's own control home (its writer claim at local
                 // ino 1), never set content.
                 if (t.forest_slot == key.NATIVE_FOREST_SLOT and v != native_volume) continue;
-                try rangeIn(t, gpa, start, end, max, &merged);
+                try rangeIn(t, gpa, start, end, max, &merged, cost);
             }
         }
         core_sort.stable(tree.KeyValue, merged.items, {}, struct {
@@ -420,8 +433,9 @@ pub const MetaSet = struct {
         merged.items.len = 0;
     }
 
-    fn rangeIn(t: *tree.KvTree, gpa: Allocator, start: []const u8, end: []const u8, max: usize, out: *std.ArrayList(tree.KeyValue)) Error!void {
-        t.range(gpa, start, end, max, out) catch |e| return switch (e) {
+    fn rangeIn(t: *tree.KvTree, gpa: Allocator, start: []const u8, end: []const u8, max: usize, out: *std.ArrayList(tree.KeyValue), cost: *tree.WalkCost) Error!void {
+        cost.sources += 1;
+        t.rangeCounted(gpa, start, end, max, out, cost) catch |e| return switch (e) {
             error.OutOfMemory => error.OutOfMemory,
             error.Io => error.Io,
             else => error.Corrupt,

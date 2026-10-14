@@ -39,6 +39,23 @@ pub const Error = error{ OutOfMemory, Io, Corrupt };
 // The store face.
 // ---------------------------------------------------------------------------
 
+/// A run's walk accounting — what every store read the passes made cost
+/// (the report's `nodes_walked`, `entries_visited`, `entries_read`,
+/// `store_calls`; `ops_fsck.md` §6.1's bound).
+pub const WalkTally = struct {
+    /// Range and lookup calls.
+    calls: u64 = 0,
+    /// Entries the store delivered (a lookup's hit counts one).
+    visited: u64 = 0,
+    /// Entries the trees copied out of their leaves to deliver them.
+    read: u64 = 0,
+    /// Tree nodes the descents fetched.
+    nodes: u64 = 0,
+    /// Trees the calls consulted (a merged range consults one per slot
+    /// tree it fetched from).
+    sources: u64 = 0,
+};
+
 /// What fsck needs of a store (the `KvBackend`/`MetaSet`/`MemStore` shape):
 /// the inclusive range scan and the point lookup of one kind, a tx for the
 /// repair engine. The merged `range` of a set returns EVERY kind inside the
@@ -51,10 +68,13 @@ pub const Store = struct {
     /// ino-major space; a kind-partitioned store (the RAM store) needs one
     /// pass per kind.
     merged_kinds: bool = false,
+    /// The run's accounting every read through this face adds to (null =
+    /// uncounted).
+    tally: ?*WalkTally = null,
 
     pub const VTable = struct {
-        range: *const fn (*anyopaque, Allocator, kind: u8, start: []const u8, end: []const u8, max: usize, out: *std.ArrayList(tree.KeyValue)) Error!void,
-        lookup: *const fn (*anyopaque, Allocator, kind: u8, k: []const u8) Error!?[]u8,
+        range: *const fn (*anyopaque, Allocator, kind: u8, start: []const u8, end: []const u8, max: usize, out: *std.ArrayList(tree.KeyValue), cost: *tree.WalkCost) Error!void,
+        lookup: *const fn (*anyopaque, Allocator, kind: u8, k: []const u8, cost: *tree.WalkCost) Error!?[]u8,
         begin: *const fn (*anyopaque, site: tx.Site) Error!*tx.KvTx,
         commit: *const fn (*anyopaque, *tx.KvTx) Error!void,
         abandon: *const fn (*anyopaque, *tx.KvTx) void,
@@ -63,13 +83,26 @@ pub const Store = struct {
 
     pub fn from(comptime S: type, s: *S) Store {
         const Adapter = struct {
-            fn rangeFn(ctx: *anyopaque, gpa: Allocator, kind: u8, start: []const u8, end: []const u8, max: usize, out: *std.ArrayList(tree.KeyValue)) Error!void {
+            // A store with trees counts its descents; one without counts the
+            // entries it delivered as read.
+            fn rangeFn(ctx: *anyopaque, gpa: Allocator, kind: u8, start: []const u8, end: []const u8, max: usize, out: *std.ArrayList(tree.KeyValue), cost: *tree.WalkCost) Error!void {
                 const st: *S = @ptrCast(@alignCast(ctx));
-                st.range(gpa, kind, start, end, max, out) catch |e| return mapErr(e);
+                if (@hasDecl(S, "rangeCounted")) {
+                    st.rangeCounted(gpa, kind, start, end, max, out, cost) catch |e| return mapErr(e);
+                } else {
+                    const before = out.items.len;
+                    st.range(gpa, kind, start, end, max, out) catch |e| return mapErr(e);
+                    cost.entries += out.items.len - before;
+                    cost.sources += 1;
+                }
             }
-            fn lookupFn(ctx: *anyopaque, gpa: Allocator, kind: u8, k: []const u8) Error!?[]u8 {
+            fn lookupFn(ctx: *anyopaque, gpa: Allocator, kind: u8, k: []const u8, cost: *tree.WalkCost) Error!?[]u8 {
                 const st: *S = @ptrCast(@alignCast(ctx));
-                return st.lookup(gpa, kind, k) catch |e| return mapErr(e);
+                if (@hasDecl(S, "lookupCounted")) return st.lookupCounted(gpa, kind, k, cost) catch |e| return mapErr(e);
+                const v = st.lookup(gpa, kind, k) catch |e| return mapErr(e);
+                if (v != null) cost.entries += 1;
+                cost.sources += 1;
+                return v;
             }
             fn beginFn(ctx: *anyopaque, site: tx.Site) Error!*tx.KvTx {
                 const st: *S = @ptrCast(@alignCast(ctx));
@@ -101,11 +134,29 @@ pub const Store = struct {
     }
 
     pub fn range(self: Store, gpa: Allocator, kind: u8, start: []const u8, end: []const u8, max: usize, out: *std.ArrayList(tree.KeyValue)) Error!void {
-        return self.vtable.range(self.ctx, gpa, kind, start, end, max, out);
+        var cost: tree.WalkCost = .{};
+        const before = out.items.len;
+        defer if (self.tally) |t| {
+            t.calls += 1;
+            t.visited += out.items.len - before;
+            t.read += cost.entries;
+            t.nodes += cost.nodes;
+            t.sources += cost.sources;
+        };
+        return self.vtable.range(self.ctx, gpa, kind, start, end, max, out, &cost);
     }
 
     pub fn lookup(self: Store, gpa: Allocator, kind: u8, k: []const u8) Error!?[]u8 {
-        return self.vtable.lookup(self.ctx, gpa, kind, k);
+        var cost: tree.WalkCost = .{};
+        const v = try self.vtable.lookup(self.ctx, gpa, kind, k, &cost);
+        if (self.tally) |t| {
+            t.calls += 1;
+            if (v != null) t.visited += 1;
+            t.read += cost.entries;
+            t.nodes += cost.nodes;
+            t.sources += cost.sources;
+        }
+        return v;
     }
 
     pub fn begin(self: Store, site: tx.Site) Error!*tx.KvTx {
@@ -234,6 +285,28 @@ pub fn candidateCeiling(mem_budget: u64) u64 {
 /// two-lane pool wedged the loader's bucket lock (FSCK:L1820-1831).
 pub fn c1Wave(meta_lanes: u32) u32 {
     return @max(meta_lanes, 1) * 4;
+}
+
+// ---------------------------------------------------------------------------
+// §6.1 The walk's bound: what a run may read for what it visits.
+// ---------------------------------------------------------------------------
+
+/// Entries a run's store may copy out of its trees to deliver the tally's
+/// `visited`: the merged walk's per-call bound (`meta/merged_walk.
+/// readBound`: `3e + p` for a call that filled its `max` consulting `p`
+/// trees, exactly `e` for one that reached its window's end) summed over
+/// the calls — `3 × visited + sources`. Linear in what the run visits: a
+/// walk that read `max` from every tree per page (T × the page) ran
+/// quadratic up to `T × SCAN_PAGE` entries.
+pub fn walkReadBound(t: WalkTally) u64 {
+    return 3 * t.visited + t.sources;
+}
+
+/// Tree nodes a run may fetch: `height` per entry it visits and per call
+/// (a call that delivers nothing still descends once) — node reads per
+/// entry within the tree height.
+pub fn walkNodeBound(t: WalkTally, height: u64) u64 {
+    return height * (t.visited + t.calls);
 }
 
 // ---------------------------------------------------------------------------
@@ -503,7 +576,6 @@ pub const KindPager = struct {
         if (self.pages == 1) if (self.hold) |h| while (h.load(.acquire)) std.Thread.yield() catch std.atomic.spinLoopHint();
         try self.store.range(self.gpa, self.kind, self.cursor.slice(), self.end.slice(), fsck.SCAN_PAGE, &self.page);
         self.pages += 1;
-        fsck.stats.fsck_nodes_walked.inc();
         if (self.page.items.len == 0) {
             self.done = true;
             return;
@@ -1067,6 +1139,14 @@ test "the derived budgets restate their formulas (drift is red)" {
     try testing.expectEqual(@as(u32, 4), c1Wave(0));
     // 100 M inodes / 8 = 12.5 MB of bits fit the 16 MiB floor.
     try testing.expect(100_000_000 / 8 < inoSetByteBudget(0));
+}
+
+test "the walk bounds restate their formulas (drift is red): reads within 3 × visited + the trees consulted, node reads within the height per entry visited and per call" {
+    const t: WalkTally = .{ .calls = 10, .visited = 5_000, .read = 0, .nodes = 0, .sources = 70 };
+    try testing.expectEqual(@as(u64, 3 * 5_000 + 70), walkReadBound(t));
+    try testing.expectEqual(@as(u64, 3 * (5_000 + 10)), walkNodeBound(t, 3));
+    // A store without trees reads what it delivers: inside the bound.
+    try testing.expect(t.visited <= walkReadBound(t));
 }
 
 test "ino arithmetic: a key ino and the global ino it encodes decompose to the SAME (slot, raw); the root is slot 0 raw 1; an unroutable global is no index" {

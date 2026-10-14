@@ -88,6 +88,11 @@ test "a healthy populated set reports zero findings offline and online, with eve
         try testing.expect(r.counters.scrub_blocks_scanned >= 7);
         try testing.expect(r.counters.scrub_readability_only == r.counters.scrub_blocks_scanned);
         try testing.expectEqual(@as(u64, 0), r.counters.scrub_failures);
+        // The walk's cost rides the report: a store without trees reads
+        // exactly what it delivers and fetches no node.
+        try testing.expect(r.counters.entries_visited > 0 and r.counters.store_calls > 0);
+        try testing.expectEqual(r.counters.entries_visited, r.counters.entries_read);
+        try testing.expectEqual(@as(u64, 0), r.counters.nodes_walked);
     }
 }
 

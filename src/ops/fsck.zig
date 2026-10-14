@@ -84,7 +84,13 @@ pub fn jobShardOf(arg1: u64) ?finding.Shard {
 pub const stats = struct {
     // ---- the census ----
     pub var fsck_inodes_scanned: counters.ShardedCounter = .{};
+    /// Tree nodes the runs' walks fetched, entries the store delivered to
+    /// them, entries the trees copied to deliver those (the read
+    /// amplification `fsck_entries_read / fsck_entries_visited`, bounded
+    /// by `census.walkReadBound`).
     pub var fsck_nodes_walked: counters.ShardedCounter = .{};
+    pub var fsck_entries_visited: counters.ShardedCounter = .{};
+    pub var fsck_entries_read: counters.ShardedCounter = .{};
     pub var fsck_dentry_refs_indexed: counters.ShardedCounter = .{};
     pub var fsck_blocks_checked: counters.ShardedCounter = .{};
     pub var fsck_refcounts_checked: counters.ShardedCounter = .{};

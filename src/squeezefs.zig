@@ -64,6 +64,7 @@ pub const meta = struct {
     pub const device_loader = if (builtin.os.tag == .linux) @import("meta/device_loader.zig") else struct {};
     pub const backend = if (builtin.os.tag == .linux) @import("meta/backend.zig") else struct {};
     pub const tree = @import("meta/tree.zig");
+    pub const merged_walk = @import("meta/merged_walk.zig");
     pub const smo = @import("meta/smo.zig");
     pub const leaf_merge = @import("meta/leaf_merge.zig");
     pub const checkpoint = @import("meta/checkpoint.zig");
@@ -298,6 +299,7 @@ test {
     if (builtin.os.tag == .linux) _ = meta.device_loader;
     if (builtin.os.tag == .linux) _ = meta.backend;
     _ = meta.tree;
+    _ = meta.merged_walk;
     _ = meta.smo;
     _ = meta.leaf_merge;
     _ = meta.checkpoint;

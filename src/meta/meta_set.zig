@@ -24,7 +24,6 @@
 //! backend, slot 0 native and 63 rotor slots as guest trees on it.
 
 const std = @import("std");
-const core_sort = @import("../core/sort.zig");
 const builtin = @import("builtin");
 const linux = std.os.linux;
 const Allocator = std.mem.Allocator;
@@ -37,6 +36,7 @@ const derive = @import("../core/derive.zig");
 const uring_fs = @import("../io/uring_fs.zig");
 const key = @import("key.zig");
 const tree = @import("tree.zig");
+const merged_walk = @import("merged_walk.zig");
 const tx = @import("tx.zig");
 const ledger = @import("ledger.zig");
 const inos = @import("inos.zig");
@@ -380,9 +380,12 @@ pub const MetaSet = struct {
     /// corpse sweep, the layout census) and EVERY refs range (a ref key
     /// leads with the volume and the block — its owner, the routing
     /// component, varies freely inside any block or volume range, so the
-    /// bounds' slots say nothing about the keys between them) merge every
-    /// slot tree of every member in key order, `max` smallest first — so a
+    /// bounds' slots say nothing about the keys between them) merge the
+    /// slot trees of every member in key order, `max` smallest first — so a
     /// caller resuming at `successor(last)` pages through the whole set.
+    /// The merge (`merged_walk`) fetches a tree only once its front reaches
+    /// the least key the routing law lets the tree hold, in chunks: a page
+    /// reads O(max + the trees it consults), never `max` from every tree.
     pub fn range(self: *MetaSet, gpa: Allocator, kind: u8, start: []const u8, end: []const u8, max: usize, out: *std.ArrayList(tree.KeyValue)) Error!void {
         var cost: tree.WalkCost = .{};
         return self.rangeCounted(gpa, kind, start, end, max, out, &cost);
@@ -393,6 +396,7 @@ pub const MetaSet = struct {
         if (max == 0 or key.lessThan(end, start)) return;
         if (kind == key.TREE_CONTROL) {
             const t = self.volumes[0].treeOf(.control) orelse return error.Corrupt;
+            cost.sources += 1;
             return rangeIn(t, gpa, start, end, max, out, cost);
         }
         if (kind != key.TREE_BLOCK_REFS) {
@@ -400,41 +404,55 @@ pub const MetaSet = struct {
             const s1 = route_table.slotOfKey(end) catch null;
             if (s0 != null and s1 != null and s0.? == s1.?) {
                 const t = self.volumeOfSlot(s0.?).slotTree(s0.?) orelse return;
+                cost.sources += 1;
                 return rangeIn(t, gpa, start, end, max, out, cost);
             }
         }
-        var merged: std.ArrayList(tree.KeyValue) = .empty;
-        defer tree.deinitKeyValues(gpa, &merged);
+        return self.mergedRange(gpa, start, end, max, out, cost, true);
+    }
+
+    /// The law-free merged walk (fsck C1's raw view): every slot tree's
+    /// records in `[start, end]` with each tree's bound the start itself,
+    /// so a record a tree holds outside its slot's window is visited too —
+    /// at the cost of consulting every tree per call.
+    pub fn rangeRawCounted(self: *MetaSet, gpa: Allocator, start: []const u8, end: []const u8, max: usize, out: *std.ArrayList(tree.KeyValue), cost: *tree.WalkCost) Error!void {
+        if (max == 0 or key.lessThan(end, start)) return;
+        return self.mergedRange(gpa, start, end, max, out, cost, false);
+    }
+
+    /// Every member's slot trees as the merge's sources, each bounded by
+    /// the routing law (`law`) or by the start.
+    fn mergedRange(self: *MetaSet, gpa: Allocator, start: []const u8, end: []const u8, max: usize, out: *std.ArrayList(tree.KeyValue), cost: *tree.WalkCost, law: bool) Error!void {
+        var sources: std.ArrayList(TreeSource) = .empty;
+        defer sources.deinit(gpa);
         const native_volume = self.route.volumeOf(0);
         for (self.volumes, 0..) |be, v| {
             for (be.trees.load()) |t| {
-                if (t.identity == .control) continue;
+                const slot = t.forest_slot orelse continue; // the control tree
                 // A member's forest-slot-0 tree holds the SET's native
                 // keyspace only on slot 0's host; elsewhere it is the
                 // volume's own control home (its writer claim at local
                 // ino 1), never set content.
-                if (t.forest_slot == key.NATIVE_FOREST_SLOT and v != native_volume) continue;
-                try rangeIn(t, gpa, start, end, max, &merged, cost);
+                if (slot == key.NATIVE_FOREST_SLOT and v != native_volume) continue;
+                const lb = if (law) key.slotTreeLowerBound(slot, start) else key.KeyBuf.fromSlice(start);
+                if (key.lessThan(end, lb.slice())) continue;
+                try sources.append(gpa, .{ .t = t, .lb = lb });
             }
         }
-        core_sort.stable(tree.KeyValue, merged.items, {}, struct {
-            fn lt(_: void, a: tree.KeyValue, b: tree.KeyValue) bool {
-                return key.lessThan(a.key, b.key);
-            }
-        }.lt);
-        const n = @min(max, merged.items.len);
-        try out.ensureUnusedCapacity(gpa, n);
-        for (merged.items[0..n]) |kv| out.appendAssumeCapacity(kv);
-        // The moved entries are the caller's now.
-        for (merged.items[n..]) |kv| {
-            gpa.free(kv.key);
-            gpa.free(kv.value);
-        }
-        merged.items.len = 0;
+        try merged_walk.merge(TreeSource, gpa, sources.items, end, max, out, cost);
     }
 
+    /// One slot tree as a merged walk's source.
+    const TreeSource = struct {
+        t: *tree.KvTree,
+        lb: key.KeyBuf,
+
+        pub fn fetch(self: *TreeSource, gpa: Allocator, from: []const u8, end: []const u8, max: usize, out: *std.ArrayList(tree.KeyValue), cost: *tree.WalkCost) Error!void {
+            return rangeIn(self.t, gpa, from, end, max, out, cost);
+        }
+    };
+
     fn rangeIn(t: *tree.KvTree, gpa: Allocator, start: []const u8, end: []const u8, max: usize, out: *std.ArrayList(tree.KeyValue), cost: *tree.WalkCost) Error!void {
-        cost.sources += 1;
         t.rangeCounted(gpa, start, end, max, out, cost) catch |e| return switch (e) {
             error.OutOfMemory => error.OutOfMemory,
             error.Io => error.Io,

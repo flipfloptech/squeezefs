@@ -541,6 +541,23 @@ pub fn checkedForestSlot(key_ino: u64) error{SlotOutOfNamespace}!ForestSlot {
     return slot;
 }
 
+/// The least key the slot tree of forest slot `slot` can hold at or after
+/// `start` — the routing law read backwards: its ino-major keys lie in
+/// `[slot << 40, (slot + 1) << 40)` by their leading key ino, its refs keys
+/// (owners of this slot) lead with 0x06, above every ino-major key (the
+/// comptime above). A merged walk fetches the tree only once its front
+/// reaches this key.
+pub fn slotTreeLowerBound(slot: ForestSlot, start: []const u8) KeyBuf {
+    var lo: [8]u8 = undefined;
+    std.mem.writeInt(u64, &lo, @as(u64, slot) << GUEST_NS_SHIFT, .big);
+    if (lessThan(start, &lo)) return KeyBuf.fromSlice(&lo);
+    var hi: [8]u8 = undefined;
+    std.mem.writeInt(u64, &hi, (@as(u64, slot) + 1) << GUEST_NS_SHIFT, .big);
+    if (lessThan(start, &hi)) return KeyBuf.fromSlice(start);
+    const refs_lo = [_]u8{TREE_BLOCK_REFS};
+    return KeyBuf.fromSlice(if (lessThan(start, &refs_lo)) &refs_lo else start);
+}
+
 // ---------------------------------------------------------------------------
 // §1.3 The slot-tree key codec: kind and slot of a raw key.
 // ---------------------------------------------------------------------------
@@ -1364,4 +1381,27 @@ fn keyDecodersFuzz(_: void, smith: *std.testing.Smith) !void {
 
 test "fuzz: every key decoder and the interior value decoder are total on arbitrary bytes; whatever decodes is byte-identical to its encoding" {
     try fuzzkit.fuzz({}, keyDecodersFuzz, .{});
+}
+
+test "slotTreeLowerBound: below the slot it is the slot's first key ino, inside it the start itself, past it the refs kind byte, inside the refs it is the start — and no key the tree can hold sorts below it" {
+    const g5 = guestForestSlot(5);
+    const lo5 = @as(u64, g5) << GUEST_NS_SHIFT;
+    // From the space's start: slot 5's first possible key ino.
+    const b0 = slotTreeLowerBound(g5, &inodeKey(0));
+    try testing.expectEqual(lo5, readBe64(b0.slice(), 0));
+    try testing.expectEqual(@as(usize, 8), b0.len);
+    // Every kind of slot 5's least ino sorts at/above it.
+    for ([_][]const u8{ &inodeKey(lo5), &dentryKey(lo5, 0, 0), &xattrKey(lo5, 0, 0) }) |k| try testing.expect(!lessThan(k, b0.slice()));
+    // Inside the slot: the start.
+    const mid = dentryKey(lo5 + 77, 123, 0);
+    try testing.expectEqualSlices(u8, &mid, slotTreeLowerBound(g5, &mid).slice());
+    // Past the slot (a start in slot 9): only the tree's refs remain.
+    const past = inodeKey(@as(u64, guestForestSlot(9)) << GUEST_NS_SHIFT);
+    try testing.expectEqualSlices(u8, &.{TREE_BLOCK_REFS}, slotTreeLowerBound(g5, &past).slice());
+    try testing.expect(lessThan(slotTreeLowerBound(g5, &past).slice(), &blockRefKey(0, 0, lo5, 0)));
+    // Inside the refs: the start.
+    const r = blockRefKey(7, 9, lo5, 0);
+    try testing.expectEqualSlices(u8, &r, slotTreeLowerBound(g5, &r).slice());
+    // The native slot from the start: key ino 0.
+    try testing.expectEqual(@as(u64, 0), readBe64(slotTreeLowerBound(NATIVE_FOREST_SLOT, &inodeKey(0)).slice(), 0));
 }

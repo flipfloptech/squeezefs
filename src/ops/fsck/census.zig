@@ -74,6 +74,9 @@ pub const Store = struct {
 
     pub const VTable = struct {
         range: *const fn (*anyopaque, Allocator, kind: u8, start: []const u8, end: []const u8, max: usize, out: *std.ArrayList(tree.KeyValue), cost: *tree.WalkCost) Error!void,
+        /// C1's raw view: a merged store's law-free walk (a record a tree
+        /// holds outside its slot's window included); `range` elsewhere.
+        range_raw: *const fn (*anyopaque, Allocator, kind: u8, start: []const u8, end: []const u8, max: usize, out: *std.ArrayList(tree.KeyValue), cost: *tree.WalkCost) Error!void,
         lookup: *const fn (*anyopaque, Allocator, kind: u8, k: []const u8, cost: *tree.WalkCost) Error!?[]u8,
         begin: *const fn (*anyopaque, site: tx.Site) Error!*tx.KvTx,
         commit: *const fn (*anyopaque, *tx.KvTx) Error!void,
@@ -95,6 +98,11 @@ pub const Store = struct {
                     cost.entries += out.items.len - before;
                     cost.sources += 1;
                 }
+            }
+            fn rangeRawFn(ctx: *anyopaque, gpa: Allocator, kind: u8, start: []const u8, end: []const u8, max: usize, out: *std.ArrayList(tree.KeyValue), cost: *tree.WalkCost) Error!void {
+                if (!@hasDecl(S, "rangeRawCounted")) return rangeFn(ctx, gpa, kind, start, end, max, out, cost);
+                const st: *S = @ptrCast(@alignCast(ctx));
+                st.rangeRawCounted(gpa, start, end, max, out, cost) catch |e| return mapErr(e);
             }
             fn lookupFn(ctx: *anyopaque, gpa: Allocator, kind: u8, k: []const u8, cost: *tree.WalkCost) Error!?[]u8 {
                 const st: *S = @ptrCast(@alignCast(ctx));
@@ -120,7 +128,7 @@ pub const Store = struct {
                 const st: *S = @ptrCast(@alignCast(ctx));
                 return st.nameKey();
             }
-            const vtable: VTable = .{ .range = &rangeFn, .lookup = &lookupFn, .begin = &beginFn, .commit = &commitFn, .abandon = &abandonFn, .nameKey = &nameKeyFn };
+            const vtable: VTable = .{ .range = &rangeFn, .range_raw = &rangeRawFn, .lookup = &lookupFn, .begin = &beginFn, .commit = &commitFn, .abandon = &abandonFn, .nameKey = &nameKeyFn };
         };
         return .{ .ctx = s, .vtable = &Adapter.vtable };
     }
@@ -134,6 +142,15 @@ pub const Store = struct {
     }
 
     pub fn range(self: Store, gpa: Allocator, kind: u8, start: []const u8, end: []const u8, max: usize, out: *std.ArrayList(tree.KeyValue)) Error!void {
+        return self.rangeVia(self.vtable.range, gpa, kind, start, end, max, out);
+    }
+
+    /// C1's raw view of `[start, end]` (`VTable.range_raw`).
+    pub fn rangeRaw(self: Store, gpa: Allocator, kind: u8, start: []const u8, end: []const u8, max: usize, out: *std.ArrayList(tree.KeyValue)) Error!void {
+        return self.rangeVia(self.vtable.range_raw, gpa, kind, start, end, max, out);
+    }
+
+    fn rangeVia(self: Store, f: @FieldType(VTable, "range"), gpa: Allocator, kind: u8, start: []const u8, end: []const u8, max: usize, out: *std.ArrayList(tree.KeyValue)) Error!void {
         var cost: tree.WalkCost = .{};
         const before = out.items.len;
         defer if (self.tally) |t| {
@@ -143,7 +160,7 @@ pub const Store = struct {
             t.nodes += cost.nodes;
             t.sources += cost.sources;
         };
-        return self.vtable.range(self.ctx, gpa, kind, start, end, max, out, &cost);
+        return f(self.ctx, gpa, kind, start, end, max, out, &cost);
     }
 
     pub fn lookup(self: Store, gpa: Allocator, kind: u8, k: []const u8) Error!?[]u8 {
@@ -544,8 +561,9 @@ pub const KindPager = struct {
     /// The test seam: park after the FIRST page until released (the
     /// census-hold contract: a creator mints past the start watermarks).
     hold: ?*const std.atomic.Value(bool) = null,
-    /// The C1 raw walk: yield EVERY record the bounds return, whatever its
-    /// shape (a key the codec refuses is exactly what it must see).
+    /// The C1 raw walk: the store's law-free view, yielding EVERY record
+    /// the bounds return, whatever its shape (a key the codec refuses is
+    /// exactly what it must see).
     raw: bool = false,
 
     pub fn init(store: Store, gpa: Allocator, kind: u8, from_ino: u64) KindPager {
@@ -574,7 +592,9 @@ pub const KindPager = struct {
         self.clearPage();
         if (self.done) return;
         if (self.pages == 1) if (self.hold) |h| while (h.load(.acquire)) std.Thread.yield() catch std.atomic.spinLoopHint();
-        try self.store.range(self.gpa, self.kind, self.cursor.slice(), self.end.slice(), fsck.SCAN_PAGE, &self.page);
+        if (self.raw) {
+            try self.store.rangeRaw(self.gpa, self.kind, self.cursor.slice(), self.end.slice(), fsck.SCAN_PAGE, &self.page);
+        } else try self.store.range(self.gpa, self.kind, self.cursor.slice(), self.end.slice(), fsck.SCAN_PAGE, &self.page);
         self.pages += 1;
         if (self.page.items.len == 0) {
             self.done = true;

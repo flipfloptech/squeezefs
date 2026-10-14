@@ -1832,6 +1832,8 @@ pub const TestVolume = struct {
     control_entries: u64 = 0,
     /// Kind-5 data deltas the entries carried (the page sink's ring).
     data_deltas: u64 = 0,
+    /// Kind-4 `free` deltas the entries journaled.
+    journaled_frees: u64 = 0,
     barriers: u64 = 0,
     zeroed_bytes: u64 = 0,
     /// Seams: refuse the next N control entries with a full window; the
@@ -2001,11 +2003,15 @@ pub const TestVolume = struct {
             self.window_full_next -= 1;
             return error.JournalReserveExhausted;
         }
+        // The product's entry (`bind.zig`'s `controlEntryFn`) JOURNALS the
+        // allocator deltas; the RAM bits move by `claimInternal` and
+        // `releaseUnpublished` alone — a fake that applied them here would
+        // hide a free that never reaches the heap.
         for (recs) |r| switch (r) {
             .put => |p| try self.put(p.key, p.value),
             .delete => |k| self.del(k),
-            .alloc => |e| self.bits[@intCast(e)] = true,
-            .free => |e| self.bits[@intCast(e)] = false,
+            .alloc => |e| std.debug.assert(self.bits[@intCast(e)]),
+            .free => self.journaled_frees += 1,
             .data_delta => self.data_deltas += 1,
         };
         self.control_entries += 1;
@@ -2285,6 +2291,52 @@ test "grants: the manager never grants itself; want is screened against the heap
     try testing.expectError(error.Refused, m.returnExtents(.{ .appender_id = 1, .runs = &held_run }));
     try log.testing.expectAllFired();
     try testing.expectEqual(refusals_before + 1, stats.manager_verb_refusals.load());
+}
+
+test "a joiner's returns reach the manager's FREE heap when their entry lands (decision 0003 §AI.1) — a mid-life ReturnExtents, the leave's unclaimed runs, the next join's residue and a GrowRing segment no page names each release their extents from the RAM allocator (the product's control entry only journals the free deltas): four join → top-up → return → leave cycles over a heap of 64 extents end every cycle at the baseline — the journaled-only frees held each cycle's grant until the next mount (the rejoin row's heap full)" {
+    const gpa = testing.allocator;
+    const node: u64 = 65_536;
+    // 64 extents: a ring of 8 or 16 (the floor at 64 KiB, the hinted
+    // growth), the pool floor's 12 (8 + mint_slots 4) topped up to 24 —
+    // under 40 a cycle, so a heap that never gets its returns back is
+    // exhausted by the third join.
+    const tv = try TestVolume.init(gpa, 1 << 30, node, 64);
+    defer tv.deinit();
+    try tv.liveManagerPage();
+    var m = newManager(gpa, tv);
+    defer m.deinit();
+    const baseline = tv.allocatedExtents();
+    var residue: u64 = 0;
+    for (0..4) |cycle| {
+        const j = try m.joinAppender(.{ .identity = ident_a });
+        const ring = j.ring_segments.totalBytes() / node;
+        // The join returned the last leave's residue before it carved.
+        try testing.expectEqual(baseline + ring + 12, tv.allocatedExtents());
+        const top = try m.extentGrant(.{ .appender_id = j.appender_id, .want = 24, .page_word = j.grantRuns() });
+        defer gpa.free(top.runs);
+        try testing.expectEqual(baseline + ring + 24, tv.allocatedExtents());
+        // A mid-life return (the pool's surplus).
+        var mid = [_]GrantRun{.{ .start = top.runs[0].start, .len = 1 }};
+        try testing.expectEqual(@as(u64, 1), (try m.returnExtents(.{ .appender_id = j.appender_id, .runs = &mid })).cleared);
+        try testing.expectEqual(baseline + ring + 23, tv.allocatedExtents());
+        // A GrowRing whose reply was lost (no page names the segment): the
+        // leave's settle returns it.
+        if (cycle == 0) {
+            const grown = try m.growRing(.{ .appender_id = j.appender_id, .want_bytes = region.RING_FLOOR_BYTES });
+            try testing.expectEqual(baseline + ring + 23 + grown.segment.?.len / node, tv.allocatedExtents());
+        }
+        var rec = try tv.grantRecord(j.appender_id);
+        defer rec.deinit();
+        // Cycle 0 leaves its last run behind (the residue the next join
+        // returns); the others return the whole record.
+        const kept: usize = if (cycle == 0) 1 else 0;
+        residue = 0;
+        for (rec.record[rec.record.len - kept ..]) |r| residue += r.len;
+        const left = try m.leaveAppender(.{ .identity = ident_a, .appender_id = j.appender_id, .unclaimed = rec.record[0 .. rec.record.len - kept] });
+        try testing.expect(!left.already);
+        try testing.expectEqual(baseline + residue, tv.allocatedExtents());
+    }
+    try testing.expectEqual(baseline, tv.allocatedExtents());
 }
 
 test "a custody move whose chunks do not fit the lease's entry is STAGED (0003 §AE.4): the marker and the fresh chunks land first and no reader counts them; the lease's entry (its own records, the replaced chunks' deletes, the marker's) makes the whole new record effective at once; a change whose entry never lands is swept and the record stands as it was" {

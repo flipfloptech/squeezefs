@@ -357,9 +357,142 @@ epoch is the join's whole-view flush. The shared hot directory row found the sec
 stripe flip's NUL-led marker names rode the recall and the reader's screen refused the frame (the
 live recall deadline tripped) — markers are never noted.
 
-### 9.4 AB.3 — the drain worker as the handler lane: not landed
+### 9.4 AB.3 — the drain worker drives a handler lane of its own
 
-See 0003 §AB.3: the design is stated with what it must preserve; this pass did not land it.
+**The mechanism** (0003 §AB.3). Each drain worker builds a DRIVEN `exec.Lane` (`Options.driven`: no
+thread; its 64 B `ParkedRing` and coalescer unchanged) and attaches it on its own thread
+(`attachDriven`: a ring without `DEFER_TASKRUN`, `IORING_REGISTER_EVENTFD` on the lane's wake
+eventfd). The worker's SQE128 ring holds a standing READ of that eventfd beside its own wake READ, so
+its ONE `io_uring_enter` wait covers a foreign enqueue on the lane and the lane ring's own
+completions; the lane's next timer and in-flight backstop fold into the wait's bound. The pass pumps
+the lane after the commit cells and the bridge pumps (step 4a: disarm → inbox → timers → the fibers
+ready at entry) and puts what those fibers published through the gate in the same pass (4a': the
+reply cells, the bridge requests, the releases — their SQEs ride the pass's enter). A publication
+from the worker's own thread elides the eventfd write (`wakeSelf`, `self_kick`); a runnable fiber or
+an elided wake is work in hand (no park). Dispatch spawns the NAMESPACE and ATTRIBUTE class there
+(`worker.onWorkerLane`); the DATA class stays on the CPU's handler lane (below).
+`SQUEEZEFS_FUSE_HANDLERS_ON_WORKER` (default 1; 0 = every handler on the CPU's lane, the control arm).
+
+**Why the data class stays on the lane — the all-on-worker cut.** The first cut ran every handler on
+the worker. A-B-B-A, 3 rounds on `sqz-perf3` (§9's recipe; `scripts/perf/abba.sh … mdtest,randread,randwrite,ior`; A = dev
+`d3a7845`, B = every handler on the worker):
+
+| op | A legs 1/4, rounds 1–3 | B legs 2/3, rounds 1–3 | A mean | B mean | B ÷ A |
+|---|---|---|---|---|---|
+| file create | 6,738 / 6,568; 6,540 / 6,693; 6,782 / 5,798 | 8,720 / 8,051; 7,935 / 8,208; 6,840 / 6,750 | 6,520 | 7,751 | 1.19 |
+| file remove | 7,779 / 7,600; 7,587 / 7,593; 7,472 / 6,424 | 9,273 / 8,916; 8,899 / 9,139; 7,923 / 7,748 | 7,409 | 8,650 | 1.17 |
+| dir create | 7,223 / 6,961; 7,115 / 7,176; 7,037 / 6,588 | 8,010 / 8,528; 8,396 / 8,441; 6,855 / 7,750 | 7,017 | 7,997 | 1.14 |
+| dir rename | 8,256 / 7,582; 7,992 / 7,898; 8,051 / 7,181 | 8,967 / 9,257; 9,014 / 9,267; 7,296 / 7,528 | 7,827 | 8,555 | 1.09 |
+| dir remove | 7,976 / 7,092; 7,636 / 7,802; 8,244 / 6,517 | 9,511 / 8,051; 9,361 / 9,394; 7,774 / 7,496 | 7,545 | 8,598 | 1.14 |
+| file read (open/close) | 81.8 k / 79.6 k; 80.1 k / 80.6 k; 81.1 k / 53.8 k | 293.9 k / 153.8 k; 151.9 k / 349.2 k; 137.1 k / 128.8 k | 76.2 k | 202.4 k | 2.66 |
+| randread 4 KiB QD32 | 169.4 k / 179.4 k; 183.3 k / 178.2 k; 145.5 k / 156.1 k | 177.7 k / 179.0 k; 182.2 k / 167.2 k; 162.0 k / 160.8 k | 168.6 k | 171.5 k | 1.02 |
+| randwrite 4 KiB QD32 | 110.1 k / 109.7 k; 110.2 k / 108.3 k; 100.2 k / 100.2 k | 63.3 k / 62.6 k; 63.5 k / 63.4 k; 65.2 k / 64.9 k | 106.5 k | 63.8 k | **0.60** |
+| IOR write (MiB/s) | 2,905 / 3,063; 2,896 / 3,546; 2,334 / 1,866 | 3,694 / 3,239; 3,332 / 3,756; 2,269 / 2,258 | 2,768 | 3,091 | 1.12 |
+| IOR read (MiB/s) | 7,854 / 5,322; 6,550 / 6,554; 2,925 / 2,847 | 6,392 / 7,017; 6,196 / 6,611; 4,108 / 3,196 | 5,342 | 5,587 | 1.05 |
+
+The random writes lost 40 % on every B leg. The data plane's device completions park the CALLING
+THREAD (`sync/completion.zig` — "the waiter a caller thread parked on the raw futex", 0003 WP-C row
+14; `nvme_dev.Lane.wait`, `WriteWatermark.waitCompleted`, `uring_fs`): on a handler lane that blocks
+the lane, on the worker it blocks the queue's whole ring — no delivery, commit, extraction or
+release while a patch write is on the device. The `.stats` of one randwrite phase show the cascade:
+in-place patch writes 121 k → 207 k (the accumulation behind the blocked ring drains before the next
+write finds its overlay), `dlm_inode_key_waits` 53 k → 822 k. The worker must never wait on a device
+(AB.1's try-only rule says the same for its inline serves), so the data class — READ, WRITE, the
+syncs, RELEASE (a close drains the file's write-back), a truncating SETATTR / OPEN / CREATE,
+FALLOCATE, COPY_FILE_RANGE, LSEEK, IOCTL, POLL, the locks, BMAP, the forgets — keeps its lane.
+
+**The table** (A-B-B-A, 3 rounds; A = dev `d3a7845`, B = the lever with the dispatch law; these legs
+ran beside other agents' gates and load storms — A's legs 14, 21, 31 and B's 32/33 read low on every
+row, so the quiet series above is the cleaner ratio for the namespace rows, which the two cuts
+dispatch identically but for RELEASE):
+
+| op | A legs 1/4, rounds 1–3 | B legs 2/3, rounds 1–3 | A mean | B mean | B ÷ A |
+|---|---|---|---|---|---|
+| file create | 5,419 / 3,188; 3,246 / 6,086; 3,475 / 5,915 | 7,280 / 4,483; 7,615 / 7,039; 3,749 / 3,991 | 4,555 | 5,693 | 1.25 |
+| file remove | 6,119 / 3,752; 3,951 / 6,936; 4,637 / 6,822 | 8,682 / 4,308; 8,242 / 8,251; 4,132 / 4,924 | 5,370 | 6,423 | 1.20 |
+| dir create | 6,673 / 3,235; 3,853 / 6,534; 4,159 / 6,739 | 7,399 / 8,017; 7,867 / 8,292; 4,388 / 4,349 | 5,199 | 6,719 | 1.29 |
+| dir rename | 8,093 / 3,380; 3,618 / 6,762; 3,187 / 7,273 | 8,566 / 8,789; 8,934 / 8,000; 4,947 / 4,150 | 5,385 | 7,231 | 1.34 |
+| dir remove | 7,376 / 4,272; 3,840 / 7,131; 3,700 / 6,778 | 8,749 / 9,112; 9,276 / 7,971; 4,817 / 4,790 | 5,516 | 7,452 | 1.35 |
+| file stat | 4.75 M / 2.92 M; 2.99 M / 2.19 M; 3.22 M / 5.73 M | 5.94 M / 2.72 M; 5.83 M / 5.37 M; 3.07 M / 3.14 M | 3.63 M | 4.35 M | 1.20 |
+| dir stat | 5.33 M / 2.87 M; 3.23 M / 3.24 M; 3.11 M / 5.99 M | 4.91 M / 5.59 M; 5.72 M / 5.03 M; 4.22 M / 3.17 M | 3.96 M | 4.77 M | 1.20 |
+| file read (open/close) | 52.5 k / 42.3 k; 42.1 k / 52.9 k; 40.5 k / 64.9 k | 254.5 k / 114.5 k; 262.4 k / 207.5 k; 155.5 k / 102.4 k | 49.2 k | 182.8 k | 3.72 |
+| randread 4 KiB QD32 | 163.3 k / 113.1 k; 120.3 k / 170.2 k; 107.0 k / 181.7 k | 168.1 k / 105.3 k; 178.0 k / 166.4 k; 114.6 k / 134.0 k | 142.6 k | 144.4 k | 1.01 |
+| randwrite 4 KiB QD32 | 102.5 k / 75.7 k; 105.2 k / 108.6 k; 68.8 k / 110.1 k | 104.8 k / 79.1 k; 105.9 k / 106.9 k; 69.8 k / 110.2 k | 95.2 k | 96.1 k | 1.01 |
+| IOR write (MiB/s) | 1,864 / 1,879; 2,803 / 2,873; 2,003 / 2,938 | 2,806 / 1,896; 2,297 / 2,787; 1,865 / 3,121 | 2,393 | 2,462 | 1.03 |
+| IOR read (MiB/s) | 3,271 / 4,049; 3,840 / 3,918; 3,289 / 5,327 | 4,270 / 2,418; 3,793 / 4,141; 3,102 / 4,370 | 3,949 | 3,682 | 0.93 |
+
+Stats are the kernel's caches in both arms (AB.2); their ratio is the host's drift. The data rows
+are the control arm's dispatch and read as such (randwrite 1.01, randread 1.01; IOR inside its
+spread).
+
+**The request's price, kernel-side** (`scripts/perf/opcount.sh`: `fuse_request_send → end`, the
+same clock as §1's floor; A-B-B-A-A-B legs, `sqzmicro` from one thread, 20,000 calls each):
+
+| request | A (legs 1 / 4 / 5) | B (legs 2 / 3 / 6) | what B is |
+|---|---|---|---|
+| GETXATTR (one round trip, the kernel caches no xattr) | 44.7 / 31.2 / 30.4 µs | 26.7 (p50 15.0) / 12.0 / 12.3 µs | the bare round trip `R` (13–14 µs, §1) |
+| OPEN (QD1 open/close loop) | 44.9 / 32.4 / 34.6 µs | 19.6 / 19.5 / 18.9 µs | `R` + the open's handler |
+| RELEASE (data class: the lane in both) | 49.7 / 36.2 / 38.2 µs | 47.0 / 46.8 / 45.2 µs | unchanged |
+
+In mdtest (4 ranks, the census: LOOKUP 24,004, RELEASE 16,000, MKDIR 8,002, RMDIR 8,002, RENAME
+8,000, CREATE 8,000, OPEN 8,000, UNLINK 8,000 — 88,013 requests) every namespace request lost the
+pair: MKDIR 108.5 → 88.8 µs, RMDIR 136.5 → 103.0, RENAME 109.5 → 86.6, CREATE 113.1 → 92.3, UNLINK
+125.0 → 100.0, OPEN 52.9 → 8.7 (p50 6.0); LOOKUP 17.8 → 16.6 (AB.1 already answered it on the
+worker). The new floor for a request whose handler runs on the worker is `R` itself — 12 µs
+send → end for a GETXATTR against §1's 13–14 µs for a negative LOOKUP — where the control arm paid
+`R` + 18–33 µs for the two handoffs. User-visible (the syscall included, `sqzmicro`, 8 legs each):
+GETXATTR from one thread 18–41 µs (median 35) against 49–87 µs (median 75); from four threads
+233 k/s against 51 k/s; an open/close pair 31–49 µs against 60–81 µs.
+
+The pass economy (mdtest `.stats`): passes per request 2.21 → 1.62, enters per request 2.24 → 1.75,
+worker eventfd writes 57,710 → 13,833 (the RELEASEs' replies, from the lane), `handler_dispatches_own`
+48,018 / `_foreign` 16,003 (the RELEASEs).
+
+**The model** (`src/model/worker_pass_model.zig`): two foreign producers and the worker; the pass in
+the shipped order — reap the lane-wake READ → the cells → lane DISARM → its inbox → the fibers ready
+at entry (a same-lane wake; a reply cell published with no eventfd write) → the cells they published
+→ arm the lane READ → park only with no runnable fiber and no unpopped cell. Holds over every
+schedule (< 20,000 states). Each weakening fails: the park ignoring the ready FIFO (a fiber made
+runnable during the run, no eventfd for it — the lost fiber); neither the post-run pump nor the park
+check taking a same-thread cell (the lost reply); the lane disarmed after its scan (two producers: the
+lost foreign wake); no READ of the lane's eventfd on the worker's ring (the wake lost between the
+lane's queue and the worker's CQ wait).
+
+**The red rows.** `session` e2e "a namespace request's handler runs on the thread that delivered it":
+64 directory listings (OPENDIR / READDIR / RELEASEDIR) — every dispatch `own`, none foreign, the
+handler's thread id one of the workers', zero worker eventfd writes; 16 file reads — each RELEASE
+foreign, each OPEN own; the control arm's handlers on another thread with eventfd writes. On the
+cross-thread dispatch (today's, the knob's default flipped) it fails: "expected 256, found 0". `lane`
+"a DRIVEN lane": an owner thread's one wait on its own `DEFER_TASKRUN` ring wakes for a foreign
+enqueue and for a 20 ms timeout armed on the lane's ring (a completion that is task work, never the
+1 s bound); a same-thread spawn writes no eventfd.
+
+**The laws that did not move, and their rows** (green in every gate below):
+
+| law | how the merge keeps it | rows |
+|---|---|---|
+| teardown releases every retained slot | the worker's FUSE side drains and releases exactly as before; `transport_done` ends the session's `join`, then the thread runs its lane until every fiber has finished (late replies dropped), detaches it, quiesces the ring | `e2e retention teardown: N slots RETAINED at close …`, `e2e: teardown with an in-flight request …` |
+| the kmbuf region outlives every handler (`f326cbc`) | `Group.deinit` joins the thread (its lane drained), frees the lane, THEN tears the kmbuf region down — after `Session.deinit` awaited the handler group | `e2e: teardown with a LOOKUP parked in its handler — the request's bytes … stay mapped until every handler has finished` |
+| the request-timeout fail-stop (§Z, kernel 0028) | the worker's ring and its abort handling are unchanged; a handler that could park on a device runs on a lane, so a frozen device never wedges the worker | smoke `A FROZEN DAEMON NEVER HANGS THE HOST'S sync` [venue-exclusive] |
+| zero-copy retention | WRITE (the only retaining request) is the data class: its lease, RETAIN commit and RELEASE run as before | `retain commit parks the slot until RELEASE re-arms it …`, `e2e retention: a held page-cache WRITE replies RETAIN …`, `e2e: a FUSE_WRITE payload is a zero-copy lease …` |
+| the watchdog / supervisor probes | the op slots and the probe cadence are untouched; the merged lane's fibers are watched like any handler's | `watchdog tick: …`, `the watchdog never cancels: …`, `the reclaim cadence is one watchdog tick; the supervisor's probe interval is that tick …`, smoke `--daemon --supervise --log-file: …` |
+| the move gate's parks | a parked namespace op parks its FIBER on the worker's lane (the epoch wake enqueues it there) | `the move gate re-issues an op refused by a move class …`, `the move park: observe → attempt → register → recheck → park …`, the handover MOVE MATRIX rows |
+| the journal-ack spin's accounting (§AB.4) | `laneIdleBesidesCaller` is false on a driven lane (its owner serves a ring): a committer there counts `busy` and parks; the ledger stays exact (every park one class) | `conveyor` "the ack spin's ledger"; mdtest A: hits 1 / falls 1 / skips 39,997 / busy 257, B: skips 1 / busy 40,255 (the bound was 0 at this posture in both) |
+| the per-name invalidation sideband (§AB.2) | the notifier thread stays its own thread and writes from its own cells; nothing on the merged lane waits on it | smoke `INVALIDATION COHERENCE ACROSS DAEMONS`, `conveyor` "the kernel view", `tokens` "invalidation coherence" |
+
+**The host's disk filled during this pass.** Between 06:00 and 07:20 the Mac had 116 MiB free; the
+venue's sparse images returned EIO (`I/O error, dev vdc`, `EXT4-fs (vdb): Remounting filesystem
+read-only` at 40,497 s). Two venue gates in that window failed in rows the lever does not reach —
+the handover MOVE MATRIX panicking `incorrect alignment` in the allocator under a node write's EIO,
+the cache-path data smoke's FUSE_WRITE leases living 2–3.5 s behind EIO'd staging writes, `ring_park`
+fdatasync answering −5 — and the same binaries passed 12/12 (move matrix) and the full gate on
+healthy disks. An EIO under the move matrix panicking instead of failing loud is a defect of its
+own (owed, not this lever's).
+
+**Gates.** Pre-landing, on the rebased tree: macOS 29/29 steps, 2,233 / 2,262 (29 skipped); Linux
+on the agent's container (same image, kernel 7.2.6-sqz, 5 vCPU / 12 GiB — the venue's root
+filesystem was read-only after the disk event) 45/45 steps, 2,841 / 2,914 (73 skipped). Post-landing
+venue gates: §9.8.
 
 ### 9.5 The bracket harness's two substrates
 
@@ -380,12 +513,75 @@ two legs to Yellow, `mem_budget_green` INVALID; records under
 | file (meta on `/dev/loop0`) | 14,877 / 15,481 | 14,115 / 14,133 | 1.075 | 9.3 % | ×1.0000 every leg | SCOPING-VALID, 4/4 legs |
 | nvmet-loop (data by the daemon) | 16,110 / 15,659 | 14,694 / 16,037 | 1.034 | 9.1 % | ×1.0000 every leg | SCOPING-VALID, 4/4 legs |
 
-### 9.6 The remaining gap per op (after AB.1, AB.2, AB.4)
+### 9.6 The remaining gap per op (after AB.1–AB.4)
 
 | op | now | ext4 | gap | cause |
 |---|---|---|---|---|
-| file stat | 5.0–5.9 M/s | 5.04 M/s | parity | served by the kernel's caches (AB.2) |
-| file create | 6.5–6.6 k/s | 26.7 k/s | 4.0× | the kernel serializes `LOOKUP` + `CREATE` under the directory's `i_rwsem` (§AA.2's `2R + W`), and each round trip pays the worker ↔ lane handoff pair (AB.3, not landed) and the journal write landing |
-| file remove | 7.4–7.9 k/s | 135 k/s | 17× | `UNLINK` is a commit (the write landing) plus the handoff pair; its `LOOKUP` is gone |
-| file read (open/close) | 59–79 k/s | 5.9 M/s | 75–100× | an `OPEN` round trip per open (the kernel asks the daemon for every open; `RELEASE` is asynchronous) — the next lever is `FUSE_NO_OPEN_SUPPORT` for a mount whose opens need no daemon state |
-| random 4 KiB read, QD32, one job | 139–167 k | 334 k | 2.0–2.4× | one drain worker carries the job (§5) |
+| file stat | 5.0–6.2 M/s | 5.04 M/s | parity | served by the kernel's caches (AB.2) |
+| file create | 7.3–8.7 k/s | 26.7 k/s | 3.1–3.7× | the kernel serializes `LOOKUP` + `CREATE` under the directory's `i_rwsem` (§AA.2's `2R + W`); a CREATE is 92 µs send → end, the journal write landing most of it — the handoff pair is gone (AB.3) |
+| file remove | 8.2–9.3 k/s | 135 k/s | 15–16× | `UNLINK` is a commit (the write landing, 100 µs send → end) |
+| file read (open/close) | 103–349 k/s (median ≈ 180 k) | 5.9 M/s | 17–57× | an `OPEN` round trip per open — 8.7 µs send → end on the worker now — and a `RELEASE` per close on the lane; `FUSE_NO_OPEN_SUPPORT` removes both (§9.7 (a), the owner's call) |
+| random 4 KiB write, QD32, one job | 96–110 k | — | — | the data class on the CPU's lane (its device waits park the thread); unchanged by AB.3 |
+| random 4 KiB read, QD32, one job | 143–172 k | 334 k | 1.9–2.3× | io-wq spreads one io_uring job over every queue; the 5-vCPU container is the ceiling, not one worker (§9.7 (b)) |
+
+### 9.7 Two more levers, measured — the owner's call (0003 §AB.5, §AB.6)
+
+**(a) `FUSE_NO_OPEN_SUPPORT` / `FUSE_NO_OPENDIR_SUPPORT`.** The kernel (7.2.6 `fs/fuse/file.c`
+`fuse_file_open`) enters no-open mode the first time an OPEN answers `ENOSYS` (`fc->no_open = 1`,
+connection-wide, never undone); from then every open is local: `fh = 0`, `open_flags =
+FOPEN_KEEP_CACHE` (a directory: `| FOPEN_CACHE_DIR`), and `fuse_file_put` ends the release locally —
+no RELEASE is ever sent, for a CREATE-opened file too. What the daemon keeps per open today, and what
+the mode does to each:
+
+| state today | where | under no-open |
+|---|---|---|
+| the open count per ino (`addOpen` at OPEN / OPENDIR / CREATE, `removeOpen` at RELEASE) and the `open_count_stranded` tripwire | `open_table.zig`, `lifecycle.zig` | gone; the unlink-while-open custody needs only the kernel's lookup count (it cannot evict an inode a file holds, so the last FORGET already certifies no open file) — the tripwire loses its meaning |
+| the write-back drain at last close ("flush at release", charter §6.2) | `kv_fs.release` → `data.releaseIno` | loses its hook: no RELEASE, and a FLUSH arrives on every close only while `FOPEN_NOFLUSH` is unset and the clean-FLUSH fast path does NOT answer `ENOSYS` (an `ENOSYS` sets `fc->no_flush` forever) — the drain moves to a synchronous FLUSH per close or to eviction / a timer: a durability-posture change |
+| `ATOMIC_O_TRUNC`: the truncate rides the OPEN under the size setter's exclusive guard | `kv_fs.open`, `lifecycle.zig` | **lost**: with `atomic_o_trunc` set, `fuse_setattr` skips the SETATTR for `ATTR_OPEN` (dir.c "actual truncation has already been done by OPEN") and no OPEN is sent — the mode requires dropping `FUSE_ATOMIC_O_TRUNC` from INIT (an O_TRUNC open then costs a SETATTR(size = 0)) |
+| the virtual inodes (`.stats`, `.config`, `.trace`): OPEN pins the frozen generation (`fh` = the generation ino) and answers `FOPEN_DIRECT_IO` (a short read is EOF, no cached `i_size`) | `kv_fs.open`, `virtual_inodes.zig` | **lost** for every file of the connection: no pin, no `DIRECT_IO` — the stats file would need its exact size at LOOKUP/GETATTR and an `INVAL_INODE` per generation |
+| `FOPEN_KEEP_CACHE | FOPEN_NOFLUSH | FOPEN_PARALLEL_DIRECT_WRITES` on every regular open | `regularOpenFlags` | KEEP_CACHE stays (the mode's default), NOFLUSH goes (see the drain), PARALLEL_DIRECT_WRITES is inert today (the kernel reads it only with `FOPEN_DIRECT_IO`: `fuse_dio_wr_exclusive_lock`; a user `O_DIRECT` write takes `fuse_cache_write_iter`'s exclusive `inode_lock` either way) |
+| OPENDIR's existence check and `open_flags = 0` (no readdir cache) | `kv_fs.opendir` | the kernel CACHES readdir pages (`FOPEN_CACHE_DIR`); a peer's create/unlink in a directory reaches a cached listing only through an `INVAL_INODE` of the directory — AB.2's `INVAL_ENTRY` per name drops the dentry, not the page — so no-opendir needs the directory's own invalidation on every remote namespace change (owed), or OPENDIR stays |
+
+Unchanged by the mode: page-cache coherence of regular files (KEEP_CACHE is already every open's
+flag; coherence rides the explicit `INVAL_INODE` / `INVAL_ENTRY` of AB.2); `O_DIRECT` / `O_SYNC` (the
+file's flags ride every READ and WRITE — `fuse_read_in.flags`, the write flags — and `O_SYNC` is the
+kernel's FSYNC after the write); the shim's session handoff (the bind travels the control socket
+with `SCM_RIGHTS` and the daemon screens the fd by `fstat`/`F_GETFL`; the bootstrap is a GETXATTR —
+neither touches OPEN or `fh`); the token leases (granted per object by the namespace and data ops;
+`kv_fs.open` takes none).
+
+The estimate from the opcode census (§9.4's mdtest, 88,013 requests): OPEN 8,000 and RELEASE 16,000
+— 27 % of the requests — disappear. The file-read phase sends 2 requests per file today and none
+under the mode: its per-file cost falls from ≈ 23 µs per rank (180 k/s on 4 ranks, the OPEN 8.7 µs
+send → end on the worker plus the RELEASE's load on the queue) to the kernel's local open + close
+(≈ 1–2 µs: a stat is 0.3 µs from one thread) — 1–2 M opens/s, 5–10× today (ext4 5.9 M/s). A create
+drops its asynchronous RELEASE (≈ 47 µs of lane time each, off the caller's path): ≤ 5–10 %. The
+price is the four "lost / loses" rows above.
+
+**(b) One drain worker per kernel queue.** The kernel (7.2.6 `fs/fuse/dev_uring.c`) builds one
+queue per possible CPU (`nr_queues = num_possible_cpus()`) and picks it by the SUBMITTING task's CPU
+(`fuse_uring_task_to_queue`: `qid = task_cpu(current)`), with no fallback: a request waits in that
+queue's `fuse_req_queue` when none of its entries is free. The daemon drains each queue with one
+worker (width 1 under kmbuf / zero-copy). Measured (`threadcpu`: the workers' CPU over 10 s; fio 4 KiB
+O_DIRECT randread):
+
+| fio | IOPS (A medians, 4 legs) | the workers it lands on |
+|---|---|---|
+| io_uring QD32, 1 job | 167 k | all five (24 / 19 / 14 / 12 / 11 % — or 61 / 24 % when io-wq bunches): a FUSE O_DIRECT read cannot issue NOWAIT, so io-wq workers submit it and their CPUs pick the queues |
+| io_uring QD32, 2 jobs | 228 k | all five, 17–45 % |
+| io_uring QD32, 4 jobs | 244 k | all five, 29–50 % — none saturated; fio, io-wq, the kernel's FUSE work and the workers share 5 vCPUs |
+| psync, 1 job (QD1) | 16 k (62 µs) | the job's CPU (14–20 %) and the CPU it migrates to |
+| psync, 4 jobs | 43 k (92 µs) | all five, ≈ 20 % each |
+
+So numjobs > 1 already scales, and one io_uring job already spreads: the "one job → one queue → one
+worker at 5.5 µs per read" ceiling binds only for a job whose submissions stay on one CPU (a
+synchronous thread, which is latency-bound at QD1, or a job pinned by `taskset`). The two designs and
+their price: (1) **several workers per queue** — the 7.2.6 code admits it without a patch (an
+entry belongs to the io_uring whose command registered it; `fuse_uring_queue_fuse_req` takes the
+first free entry), untested here: N workers each registering `depth / N` entries share a queue; the
+price is N rings contending on `queue->lock` at every commit (0026's per-queue background ledger
+lives under that lock), N kmbuf regions where the zero-copy posture keeps one per group today
+(pinned memory × N), and N − 1 workers off the queue's CPU; (2) **work stealing** between workers'
+lanes re-introduces the cross-thread handoff (≈ 18–33 µs, §9.4) for every stolen request — worth it
+only for a saturated worker, which no row here shows. A kernel-side alternative (a queue choice that
+falls back to an idle CPU's queue) is not in 7.2.6.

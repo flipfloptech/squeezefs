@@ -2297,26 +2297,50 @@ test "wake coalescing: N publishes between two lane passes cost ONE eventfd writ
             b.release();
         }
     };
+    const Writes = struct {
+        /// THIS device's lanes' completed eventfd writes: the process-wide
+        /// `dev_wake_writes` also counts a lane an earlier test left.
+        fn of(d: *Device) u64 {
+            var n: u64 = 0;
+            for (d.lanes) |l| if (l) |lane| {
+                n += lane.park.written.load(.seq_cst);
+            };
+            return n;
+        }
+    };
     var failed: std.atomic.Value(u32) = .init(0);
     var threads: [9]std.Thread = undefined;
+    var spawned: usize = 0;
+    // A failed check below still releases the held pass and joins every
+    // reader: the device's deinit would otherwise wait on the held lane.
+    defer {
+        seams.hold_before_park.store(0, .release);
+        futex.wakeAll(&seams.hold_before_park);
+        for (threads[0..spawned]) |t| t.join();
+    }
     // The first arrival wakes the parked lane; the pass pumps it and holds
     // BEFORE its park.
     threads[0] = try std.Thread.spawn(.{}, Reader.run, .{ dev, &failed });
+    spawned = 1;
     while (seams.held.load(.acquire) == 0) futex.wait(&seams.held, 0);
-    const w0 = stats.dev_wake_writes.load();
+    const w0 = Writes.of(dev);
     const e0 = stats.dev_wakes_elided.load();
+    const p0 = stats.dev_wake_writes.load() + e0;
     // N publishes between this pass and the next: the first pays the
     // write (the pass disarmed), every other elides.
-    for (threads[1..]) |*t| t.* = try std.Thread.spawn(.{}, Reader.run, .{ dev, &failed });
+    for (threads[1..]) |*t| {
+        t.* = try std.Thread.spawn(.{}, Reader.run, .{ dev, &failed });
+        spawned += 1;
+    }
     const held_publishes: u64 = threads.len - 1;
-    while (stats.dev_wake_writes.load() + stats.dev_wakes_elided.load() - (w0 + e0) < held_publishes) std.atomic.spinLoopHint();
-    try testing.expectEqual(w0 + 1, stats.dev_wake_writes.load());
-    try testing.expectEqual(e0 + held_publishes - 1, stats.dev_wakes_elided.load());
+    while (stats.dev_wake_writes.load() + stats.dev_wakes_elided.load() - p0 < held_publishes) std.atomic.spinLoopHint();
+    try testing.expectEqual(w0 + 1, Writes.of(dev));
     seams.hold_before_park.store(0, .release);
     futex.wakeAll(&seams.hold_before_park);
-    for (threads) |t| t.join();
+    for (threads[0..spawned]) |t| t.join();
+    spawned = 0;
     try testing.expectEqual(@as(u32, 0), failed.load(.monotonic));
-    std.debug.print("\nmeasurement: {d} publishes between two lane passes: eventfd writes {d}, elided {d}\n", .{ held_publishes, stats.dev_wake_writes.load() - w0, stats.dev_wakes_elided.load() - e0 });
+    std.debug.print("\nmeasurement: {d} publishes between two lane passes: this device's eventfd writes {d}, elided (process-wide) {d}\n", .{ held_publishes, Writes.of(dev) - w0, stats.dev_wakes_elided.load() - e0 });
 }
 
 /// Counts allocation CALLS through to `inner` (the per-op allocation pin).

@@ -2834,6 +2834,41 @@ test "inline and packed layouts: inline from the record zero-padded; a packed te
     try log.testing.expectAllFired();
 }
 
+test "a framed image SHORTER than its block (a promoted sub-block image, a tail block's image trimmed to its live frames — decision 0003 §AK) reads zeros past its plaintext: a ranged read wholly past it DMAs the header page alone and serves zeros, one straddling its end serves the plaintext then zeros, one inside it is exact — never an EIO under the current binding" {
+    const io = testing.io;
+    const f = try Fixture.init(testing.allocator, .{ .compression = .lz4, .read_lane = false, .ranged_threshold = derivedRangedThreshold(Fixture.bs) });
+    defer f.deinit();
+    // Device blocks 5, 6, 7 each hold a ONE-frame image (the pattern's
+    // first 64 KiB), bound as file blocks 0, 1, 2: each read below is a
+    // block's first touch (the ranged arm, never the second touch's whole
+    // image).
+    const plain = try testing.allocator.alloc(u8, transform.FRAME_GRAIN);
+    defer testing.allocator.free(plain);
+    for (plain, 0..) |*b, j| b.* = @truncate((j / 4096) * 31 + j);
+    const img = try f.codec.?.processWrite(plain, f.xscratch);
+    for (0..3) |i| {
+        @memcpy(f.device[(5 + i) * f.chunk ..][0..img.len], img);
+        f.bind(i, @intCast(5 + i));
+    }
+    f.size = 3 * Fixture.bs;
+    const buf = try alignedBuf(testing.allocator, 1 << 20);
+    defer testing.allocator.free(buf);
+    // Wholly past the plaintext: zeros, the header page the only DMA.
+    @memset(buf[0..4096], 0xEE);
+    const dev0 = f.device_read_bytes.load(.monotonic);
+    try testing.expectEqual(@as(usize, 4096), try f.rp.read(io, 7, 3 * transform.FRAME_GRAIN + 8192, 4096, .{ .buf = buf[0..4096] }, .{}));
+    try testing.expect(std.mem.allEqual(u8, buf[0..4096], 0));
+    try testing.expectEqual(HEADER_PAGE_LEN, f.device_read_bytes.load(.monotonic) - dev0);
+    // Straddling its end: the plaintext, then zeros.
+    @memset(buf[0..8192], 0xEE);
+    _ = try f.rp.read(io, 7, Fixture.bs + transform.FRAME_GRAIN - 4096, 8192, .{ .buf = buf[0..8192] }, .{});
+    for (buf[0..4096], transform.FRAME_GRAIN - 4096..) |b, j| try testing.expectEqual(@as(u8, @truncate((j / 4096) * 31 + j)), b);
+    try testing.expect(std.mem.allEqual(u8, buf[4096..8192], 0));
+    // Inside it: exact.
+    _ = try f.rp.read(io, 7, 2 * Fixture.bs + 4096, 4096, .{ .buf = buf[0..4096] }, .{});
+    for (buf[0..4096], 4096..) |b, j| try testing.expectEqual(@as(u8, @truncate((j / 4096) * 31 + j)), b);
+}
+
 test "a packed tenant on a TRANSFORMED volume: the window law runs under the chunk stride (block + 4 KiB — `block_size` refused every tenant past index 0 and tripped packed_mapping_refusals), the whole frame decodes on the lane's codec, the plaintext slice serves byte-exact" {
     const io = testing.io;
     const f = try Fixture.init(testing.allocator, .{ .compression = .lz4 });

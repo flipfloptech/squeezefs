@@ -552,6 +552,17 @@ pub fn maxStoredImageLen(cfg: VolumeTransform) u64 {
     return tableLen(frames) + @as(u64, cfg.block_size) + (if (cfg.encryption != .none) @as(u64, frames) * TAG_LEN else 0);
 }
 
+/// The device bytes a framed image of `plain_len` plaintext can occupy:
+/// the table (inside the first DMA grain), the payload — every frame's raw
+/// escape bounds its body by its plaintext — and one AEAD tag per frame on
+/// an encrypted volume, padded to the DMA grain the write lands at
+/// (`maxStoredImageLen` is the whole block's, unpadded). A tail block's
+/// upload trimmed to its live frames lands at most this (decision 0003 §AK).
+pub fn storedImageBound(cfg: VolumeTransform, plain_len: u64) u64 {
+    const frames = framesFor(@intCast(plain_len));
+    return derive.alignUp(tableLen(frames) + plain_len + (if (cfg.encryption != .none) @as(u64, frames) * TAG_LEN else 0), DMA_GRAIN);
+}
+
 /// The worst-case non-payload bytes of an image (the 64-frame table 1,136
 /// + 64 tags 1,024 = 2,160) rounded to the DMA grain so chunk-interior
 /// windows stay O_DIRECT-aligned: 4096 (the reference's 547 B incl. the
@@ -2704,6 +2715,29 @@ test "processWrite/processRead: passthrough is the identity (same pointer, no fr
     try testing.expectError(error.KeyPostureMismatch, Transform.init(&env, .{ .encryption = .aes256gcm, .block_size = block }, null));
     try testing.expectError(error.KeyPostureMismatch, Transform.init(&env, .{ .encryption = .aes256gcm, .block_size = block }, cha));
     try testing.expectError(error.KeyPostureMismatch, Transform.init(&env, .{ .block_size = block }, gcm));
+}
+
+test "processRead decodes into a destination exactly the image's plaintext long — the write side's seed decodes a block's image into a block-sized buffer (decision 0003 §AK: every write into a mapped block of a transformed set without a cache path answered EIO); a destination one byte short refuses ScratchTooSmall" {
+    const gpa = testing.allocator;
+    var env = testEnv();
+    defer env.deinit();
+    const block: u32 = 4 * FRAME_GRAIN;
+    const plain = try gpa.alloc(u8, block);
+    defer gpa.free(plain);
+    fillCompressible(plain, 7);
+    const scratch = try gpa.alloc(u8, @intCast(scratchLen(block)));
+    defer gpa.free(scratch);
+    const out = try gpa.alloc(u8, block);
+    defer gpa.free(out);
+    for ([_]Compression{ .lz4, .zstd }) |comp| {
+        const xf = try Transform.init(&env, .{ .compression = comp, .block_size = block }, null);
+        var t = try Codec.init(gpa, &xf);
+        defer t.deinit(gpa);
+        const image = try gpa.dupe(u8, try t.processWrite(plain, scratch));
+        defer gpa.free(image);
+        try testing.expectEqualSlices(u8, plain, try t.processRead(image, out));
+        try testing.expectError(error.ScratchTooSmall, t.processRead(image, out[0 .. block - 1]));
+    }
 }
 
 test "the force-raw seam stores a compressible block raw (the raw bit, the headroom and the window widening exercised with compressible data)" {

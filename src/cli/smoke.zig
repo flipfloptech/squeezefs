@@ -5784,6 +5784,65 @@ test "smoke: a SET format — meta + 2 data files + lz4 + aes-256-gcm + a cache 
     std.debug.print("\nsmoke: set format ok (2 data volumes, lz4 + aes-256-gcm, key gate, renumbered/blank refusals)\n", .{});
 }
 
+const transform_mod = @import("../data/transform.zig");
+const bench_terms = @import("bench.zig").StatsTerms;
+
+/// The transformed append row's appends: 72 B lines, each its own fsync'd
+/// O_APPEND write (one drain per append).
+const xform_appends = 40;
+
+test "smoke: THE TRANSFORMED APPEND on a set without a cache path (decision 0003 §AK) — lz4, then aes-256-gcm: a file past the inline bound grows by 40 fsync'd 72 B appends and reads back exact (the write side seeded a transformed block's image through a block-sized buffer the chunk-sized read window refused: EIO at the first write past 4 KiB); a transformed block cannot be patched in place, so each drain lands the block's framed image whole — trimmed to its live frames: ≤ the stored bound of ONE frame per drain for a file under 64 KiB, where the untrimmed image of an encrypted set was the whole block; a read past the image's plaintext within EOF serves zeros" {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    for ([_]transform_mod.Encryption{ .none, .aes256gcm }) |enc| {
+        const rig = try Rig.init(gpa, io);
+        defer rig.deinit();
+        var kp_buf: [160]u8 = undefined;
+        const kp = try std.fmt.bufPrint(&kp_buf, "{s}/set.key", .{rig.work});
+        const cfg: transform_mod.VolumeTransform = .{ .compression = if (enc == .none) .lz4 else .none, .encryption = enc, .block_size = @intCast(4 * derive.MiB) };
+        if (enc == .none) {
+            try rig.formatSetWith(false, &.{ "--compress", "lz4" });
+            try rig.spawnMount(&.{});
+        } else {
+            const out = try rig.shOk(rig.work, "umask 077; head -c 48 /dev/urandom | base64 > set.key; chmod 600 set.key");
+            gpa.free(out);
+            try rig.formatSetWith(false, &.{ "--encrypt", "aes-256-gcm", "--encrypt-key", kp });
+            try rig.spawnMount(&.{ "--encrypt-key", kp });
+        }
+        _ = try rig.awaitReady(0);
+        // Past the inline bound: 4,096 B inline, then 904 B that promote the file.
+        {
+            const out = try rig.onMountTimed("head -c 5000 /dev/urandom > \"$1/ref\" && dd if=\"$1/ref\" of=f bs=4096 status=none && cmp f \"$1/ref\" && echo same", 60);
+            defer gpa.free(out);
+            try testing.expectEqualStrings("same\n", out);
+        }
+        const st0 = try rig.stats();
+        defer gpa.free(st0);
+        {
+            var script: std.Io.Writer.Allocating = .init(gpa);
+            defer script.deinit();
+            try script.writer.print("i=0; while [ $i -lt {d} ]; do printf '%071d\\n' $i >> \"$1/ref\"; printf '%071d\\n' $i | dd of=f oflag=append conv=notrunc,fsync status=none; i=$((i+1)); done; cmp f \"$1/ref\" && echo same", .{xform_appends});
+            const out = try rig.onMountTimed(script.written(), 120);
+            defer gpa.free(out);
+            try testing.expectEqualStrings("same\n", out);
+        }
+        const st1 = try rig.stats();
+        defer gpa.free(st1);
+        const device = bench_terms.parse(st1).device_write_bytes - bench_terms.parse(st0).device_write_bytes;
+        const per_drain = transform_mod.storedImageBound(cfg, transform_mod.FRAME_GRAIN);
+        std.debug.print("\nsmoke[xform append {t}]: {d} appends of 72 B drained as {d} B of images (×{d} per appended byte; the bound {d} B per drain)\n", .{ enc, xform_appends, device, device / (xform_appends * 72), per_drain });
+        try testing.expect(device > 0);
+        try testing.expect(device <= xform_appends * per_drain);
+        // A read past the image's plaintext within EOF: zeros.
+        {
+            const out = try rig.onMountTimed("truncate -s 300000 f && cp \"$1/ref\" \"$1/ref2\" && truncate -s 300000 \"$1/ref2\" && dd if=f of=\"$1/tail\" bs=4096 skip=60 count=1 iflag=direct status=none && cmp -n 4096 \"$1/tail\" /dev/zero && cmp f \"$1/ref2\" && echo same", 60);
+            defer gpa.free(out);
+            try testing.expectEqualStrings("same\n", out);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Rung 4: the data plane bound to the mount (charter §6, §13 rung 4).
 // ---------------------------------------------------------------------------

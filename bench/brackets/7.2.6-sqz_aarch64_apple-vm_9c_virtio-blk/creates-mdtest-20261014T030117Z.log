@@ -1,0 +1,25 @@
+03:01:17 bracket[creates-mdtest]: venue 7.2.6-sqz_aarch64_apple-vm_9c_virtio-blk; A={"raw": "squeezefs 0.1.0 (d65a300db7cf-dirty, dist profile, zig 0.17.0)", "binary": "/build/brk-3420761/A/bin/squeezefs", "source": "/Users/joberdorf/Source/squeezefs-zig/.wt-perf2/zig-out-l2f/bin/squeezefs", "sha256": "46cb95e2c4da392e1dab247a881121f2b8fee13ac27b73654bf6aa2e157a0a02", "train": "0.1.0", "commit": "d65a300db7cf-dirty", "profile": "dist", "zig": "0.17.0", "dirty": true}; B={"raw": "squeezefs 0.1.0 (f246494d8c39-dirty, dist profile, zig 0.17.0)", "binary": "/build/brk-3420761/B/bin/squeezefs", "source": "/Users/joberdorf/Source/squeezefs-zig/.wt-perf2/zig-out-l4/bin/squeezefs", "sha256": "16c178e76fa76daf9b6df9cc933f30e6ba4d1e0eacbe780ad3d0035bd1cc27ac", "train": "0.1.0", "commit": "f246494d8c39-dirty", "profile": "dist", "zig": "0.17.0", "dirty": true}; substrate nvmet-loop; lever binary; posture symmetric; 20s legs (+5s warm-up); numjobs 4 iodepth 32; scratch /build/brk-3420761
+03:01:17 bracket[creates-mdtest]: substrate: nvmet-loop: 3 kernel nvmet namespaces (resv_enable=1), the metadata connected through `nvmeof connect`, the data volumes by the DAEMON from their fabric_endpoint records; backed by sparse files on /build (/dev/vdc); meta /dev/nvme0n1; data (format-time) /dev/nvme1n1,/dev/nvme2n1
+03:01:17 bracket[creates-mdtest]: format set 0 (symmetric):  sqmeta:///dev/nvme0n1 sqdata:///dev/nvme1n1,/dev/nvme2n1
+03:01:20 bracket[creates-mdtest]: set 0: data endpoints recorded (vol-d1d0f0c9486403db=loop:::nqn.2026-10.io.squeezefs:brk-3420761-set0-data0 vol-1c2e96f5586fbc26=loop:::nqn.2026-10.io.squeezefs:brk-3420761-set0-data1); the format-time data associations released
+03:01:20 bracket[creates-mdtest]: leg 1 arm A: /build/brk-3420761/A/bin/squeezefs (set 0, symmetric) -o ''
+03:01:20 bracket[creates-mdtest]: mounted /build/brk-3420761/mnt (daemon pid 3421040)
+03:01:20 bracket[creates-mdtest]: leg 1: preparing the aging store's dataset (once per set)
+03:01:20 bracket[creates-mdtest]: leg 1: warm-up 5s (excluded)
+03:01:25 bracket[creates-mdtest]: leg 1: measured span 20s
+03:01:52 bracket[creates-mdtest]: leg 1: creates/s 16109.6 valid
+03:03:07 bracket[creates-mdtest]: leg 2 arm B: /build/brk-3420761/B/bin/squeezefs (set 0, symmetric) -o ''
+03:03:08 bracket[creates-mdtest]: mounted /build/brk-3420761/mnt (daemon pid 3424850)
+03:03:08 bracket[creates-mdtest]: leg 2: warm-up 5s (excluded)
+03:03:12 bracket[creates-mdtest]: leg 2: measured span 20s
+03:03:36 bracket[creates-mdtest]: leg 2: creates/s 14694.0 valid
+03:04:42 bracket[creates-mdtest]: leg 3 arm B: /build/brk-3420761/B/bin/squeezefs (set 0, symmetric) -o ''
+03:04:44 bracket[creates-mdtest]: mounted /build/brk-3420761/mnt (daemon pid 3435339)
+03:04:44 bracket[creates-mdtest]: leg 3: warm-up 5s (excluded)
+03:04:49 bracket[creates-mdtest]: leg 3: measured span 20s
+03:05:15 bracket[creates-mdtest]: leg 3: creates/s 16037.1 valid
+03:06:36 bracket[creates-mdtest]: leg 4 arm A: /build/brk-3420761/A/bin/squeezefs (set 0, symmetric) -o ''
+03:06:37 bracket[creates-mdtest]: mounted /build/brk-3420761/mnt (daemon pid 3439055)
+03:06:37 bracket[creates-mdtest]: leg 4: warm-up 5s (excluded)
+03:06:42 bracket[creates-mdtest]: leg 4: measured span 20s
+03:07:07 bracket[creates-mdtest]: leg 4: creates/s 15658.6 valid

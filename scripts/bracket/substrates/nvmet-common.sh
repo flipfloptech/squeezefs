@@ -17,6 +17,11 @@ DATA_DEVICES_EXCLUSIVE=1
 NVMET_PORT_BASE=$(( 4500 + ($$ % 400) ))
 NVMET_SHARES=()
 NVMET_CONNECTS=()
+# Per set: the data subsystems (space list) and their ports (tcp), in the
+# format's data-volume order; the meta + base disks every leg samples.
+DATA_NQNS_BY_SET=()
+DATA_PORTS_BY_SET=()
+NVMET_BASE_DISKS=()
 
 nvmet_env() {
   # The venue has an empty /etc/machine-id, so the derived host identity
@@ -65,6 +70,18 @@ nvmet_connect() {
   NVMET_LAST=$dev
 }
 
+# The namespace block device (nvme<N>n<Y>) of any live controller of `nqn`.
+nvmet_ns_name() {
+  local c n
+  for c in /sys/class/nvme/nvme*; do
+    [ "$(cat "$c/subsysnqn" 2>/dev/null)" = "$1" ] || continue
+    for n in "$c"/nvme*n*; do
+      [ -e "$n" ] && { basename "$n"; return 0; }
+    done
+  done
+  return 1
+}
+
 substrate_up() {   # bin nsets
   local bin=$1 nsets=$2 s v port=$NVMET_PORT_BASE disk
   nvmet_env
@@ -78,20 +95,67 @@ substrate_up() {   # bin nsets
     META_DEV[$s]=$dev
     META_DISK_DEVS_BY_SET[$s]=$(basename "$dev")
     DISK_DEVS+=("$(basename "$dev")")
-    local list="" names=""
+    # The data namespaces are connected for the FORMAT only; the endpoint
+    # record then hands them to the daemon (`substrate_after_format`).
+    local list="" names="" nqns="" ports=""
     for v in $(seq 0 $((DATA_VOLUMES - 1))); do
       nvmet_share "$bin" "set$s-data$v" "$DATA_SIZE" "$port"; nqn=$NVMET_LAST
-      nvmet_connect "$bin" "$nqn" "$port"; dev=$NVMET_LAST; port=$((port + 1))
+      nvmet_connect "$bin" "$nqn" "$port"; dev=$NVMET_LAST
+      nqns="${nqns:+$nqns }$nqn"; ports="${ports:+$ports }$port"; port=$((port + 1))
       list="${list:+$list,}$dev"
       names="${names:+$names }$(basename "$dev")"
-      DISK_DEVS+=("$(basename "$dev")")
     done
     DATA_DEVS_BY_SET[$s]=$list
     DATA_DISK_DEVS_BY_SET[$s]=$names
+    DATA_NQNS_BY_SET[$s]=$nqns
+    DATA_PORTS_BY_SET[$s]=$ports
   done
+  NVMET_BASE_DISKS=("${DISK_DEVS[@]}")
   local tr="nvmet-loop"; [ "$NVMET_TRTYPE" = tcp ] && tr="nvmet-tcp on 127.0.0.1"
-  SUBSTRATE_DESC="$tr: $((nsets * (1 + DATA_VOLUMES))) kernel nvmet namespaces (resv_enable=1) connected through \`nvmeof connect\`, backed by sparse files on /build (/dev/$disk)"
-  log "substrate: $SUBSTRATE_DESC; meta ${META_DEV[*]}; data ${DATA_DEVS_BY_SET[*]}"
+  SUBSTRATE_DESC="$tr: $((nsets * (1 + DATA_VOLUMES))) kernel nvmet namespaces (resv_enable=1), the metadata connected through \`nvmeof connect\`, the data volumes by the DAEMON from their fabric_endpoint records; backed by sparse files on /build (/dev/$disk)"
+  log "substrate: $SUBSTRATE_DESC; meta ${META_DEV[*]}; data (format-time) ${DATA_DEVS_BY_SET[*]}"
+}
+
+# After a set's format (decision 0003 §O.1, the daemon-owned connect): a
+# data volume under an explicit identity mounts only by its
+# `fabric_endpoint` record, so the set records every data volume's endpoint
+# (`config set-fabric-endpoints`, the tags in the format's order) and the
+# operator's format-time association is released — each leg's daemon
+# connects its own at mount and releases it at umount.
+substrate_after_format() {   # bin set
+  local bin=$1 s=$2 meta_uri="sqmeta://${META_DEV[$2]}" tags=() words=() i=0 nqn port out
+  mapfile -t tags < <("$bin" config show --json "$meta_uri" | grep -o '"vol_tag":"vol-[0-9a-f]*","state"' | sed 's/^"vol_tag":"\(vol-[0-9a-f]*\)".*/\1/')
+  local ports_arr=(${DATA_PORTS_BY_SET[$s]})
+  for nqn in ${DATA_NQNS_BY_SET[$s]}; do
+    [ -n "${tags[$i]:-}" ] || { log "set $s: no vol_tag for data volume $i in config show"; exit 1; }
+    if [ "$NVMET_TRTYPE" = loop ]; then words+=("${tags[$i]}=loop:::$nqn"); else port=${ports_arr[$i]}; words+=("${tags[$i]}=tcp:127.0.0.1:$port:$nqn"); fi
+    i=$((i + 1))
+  done
+  out=$("$bin" config set-fabric-endpoints "$meta_uri" "${words[@]}" 2>&1) || { echo "$out" >&2; log "set $s: set-fabric-endpoints failed"; exit 1; }
+  echo "$out" >> "$SCRATCH/nvmet.log"
+  local keep=()
+  for nqn in "${NVMET_CONNECTS[@]}"; do
+    if printf ' %s ' " ${DATA_NQNS_BY_SET[$s]} " | grep -q " $nqn "; then
+      "$bin" nvmeof disconnect "$nqn" >> "$SCRATCH/nvmet.log" 2>&1 || { log "set $s: disconnect $nqn failed"; exit 1; }
+    else
+      keep+=("$nqn")
+    fi
+  done
+  NVMET_CONNECTS=("${keep[@]}")
+  log "set $s: data endpoints recorded (${words[*]}); the format-time data associations released"
+}
+
+# After a leg's mount: the data namespaces are the daemon's connects —
+# their names are read back from /sys/class/nvme for the leg's diskstats.
+substrate_after_mount() {   # set
+  local s=$1 nqn n names=""
+  for nqn in ${DATA_NQNS_BY_SET[$s]}; do
+    n=$(nvmet_ns_name "$nqn") || { log "set $s: no namespace of $nqn after the mount"; n=""; }
+    names="${names:+$names }$n"
+  done
+  DATA_DISK_DEVS_BY_SET[$s]=$names
+  # shellcheck disable=SC2206
+  DISK_DEVS=("${NVMET_BASE_DISKS[@]}" $names)
 }
 
 substrate_down() {

@@ -1,0 +1,24 @@
+02:54:26 bracket[creates-mdtest]: venue 7.2.6-sqz_aarch64_apple-vm_9c_virtio-blk; A={"raw": "squeezefs 0.1.0 (d65a300db7cf-dirty, dist profile, zig 0.17.0)", "binary": "/build/brk-3376597/A/bin/squeezefs", "source": "/Users/joberdorf/Source/squeezefs-zig/.wt-perf2/zig-out-l2f/bin/squeezefs", "sha256": "46cb95e2c4da392e1dab247a881121f2b8fee13ac27b73654bf6aa2e157a0a02", "train": "0.1.0", "commit": "d65a300db7cf-dirty", "profile": "dist", "zig": "0.17.0", "dirty": true}; B={"raw": "squeezefs 0.1.0 (f246494d8c39-dirty, dist profile, zig 0.17.0)", "binary": "/build/brk-3376597/B/bin/squeezefs", "source": "/Users/joberdorf/Source/squeezefs-zig/.wt-perf2/zig-out-l4/bin/squeezefs", "sha256": "16c178e76fa76daf9b6df9cc933f30e6ba4d1e0eacbe780ad3d0035bd1cc27ac", "train": "0.1.0", "commit": "f246494d8c39-dirty", "profile": "dist", "zig": "0.17.0", "dirty": true}; substrate file; lever binary; posture symmetric; 20s legs (+5s warm-up); numjobs 4 iodepth 32; scratch /build/brk-3376597
+02:54:26 bracket[creates-mdtest]: substrate: file-backed sparse volumes on /build (ext4 on /dev/vdc, shared disk: the data diskstats ratio is an upper bound); metadata on a dedicated loop device per set (/dev/loop0, exclusive diskstats)
+02:54:26 bracket[creates-mdtest]: format set 0 (symmetric):  sqmeta:///dev/loop0 sqdata:///build/brk-3376597/set0-data0.img,/build/brk-3376597/set0-data1.img
+02:54:26 bracket[creates-mdtest]: leg 1 arm A: /build/brk-3376597/A/bin/squeezefs (set 0, symmetric) -o ''
+02:54:26 bracket[creates-mdtest]: mounted /build/brk-3376597/mnt (daemon pid 3376687)
+02:54:26 bracket[creates-mdtest]: leg 1: preparing the aging store's dataset (once per set)
+02:54:26 bracket[creates-mdtest]: leg 1: warm-up 5s (excluded)
+02:54:31 bracket[creates-mdtest]: leg 1: measured span 20s
+02:54:55 bracket[creates-mdtest]: leg 1: creates/s 14877.3 valid
+02:56:00 bracket[creates-mdtest]: leg 2 arm B: /build/brk-3376597/B/bin/squeezefs (set 0, symmetric) -o ''
+02:56:01 bracket[creates-mdtest]: mounted /build/brk-3376597/mnt (daemon pid 3378944)
+02:56:01 bracket[creates-mdtest]: leg 2: warm-up 5s (excluded)
+02:56:08 bracket[creates-mdtest]: leg 2: measured span 20s
+02:56:31 bracket[creates-mdtest]: leg 2: creates/s 14115.5 valid
+02:57:35 bracket[creates-mdtest]: leg 3 arm B: /build/brk-3376597/B/bin/squeezefs (set 0, symmetric) -o ''
+02:57:37 bracket[creates-mdtest]: mounted /build/brk-3376597/mnt (daemon pid 3398693)
+02:57:37 bracket[creates-mdtest]: leg 3: warm-up 5s (excluded)
+02:57:41 bracket[creates-mdtest]: leg 3: measured span 20s
+02:58:12 bracket[creates-mdtest]: leg 3: creates/s 14133.4 valid
+02:59:34 bracket[creates-mdtest]: leg 4 arm A: /build/brk-3376597/A/bin/squeezefs (set 0, symmetric) -o ''
+02:59:36 bracket[creates-mdtest]: mounted /build/brk-3376597/mnt (daemon pid 3402561)
+02:59:36 bracket[creates-mdtest]: leg 4: warm-up 5s (excluded)
+02:59:40 bracket[creates-mdtest]: leg 4: measured span 20s
+03:00:05 bracket[creates-mdtest]: leg 4: creates/s 15481.1 valid

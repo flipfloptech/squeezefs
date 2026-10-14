@@ -242,6 +242,7 @@ format_set() {  # $1 = set index, $2 = posture
   [ -n "$FORMAT_OPTS" ] && flags+=($FORMAT_OPTS)
   log "format set $1 ($2): ${flags[*]} $META_URI $DATA_URI$staging_note"
   "$BIN_A" format "${flags[@]}" "$META_URI" "$DATA_URI" > "$SCRATCH/format-$1.log" 2>&1 || { cat "$SCRATCH/format-$1.log" >&2; exit 1; }
+  substrate_after_format "$BIN_A" "$1"
 }
 if [ "$LEVER" = posture ]; then
   format_set 0 symmetric
@@ -292,6 +293,7 @@ for arm in "${ORDER[@]}"; do
   export BRK_PRELOAD_ENV
   log "leg $leg_n arm $arm: $BIN (set $set_idx, $leg_posture) -o '${opts:-}'"
   leg_mount "$BIN" "$META_URI" "$MNT" "$LEG_DIR/daemon.log" "$opts" "${MOUNT_ARGS[@]}"
+  substrate_after_mount "$set_idx"
   if ! printf '%s' "$PREPARED_SETS" | grep -q ":$set_idx:"; then
     log "leg $leg_n: preparing the aging store's dataset (once per set)"
     row_prepare "$MNT" >> "$LEG_DIR/prepare.log" 2>&1

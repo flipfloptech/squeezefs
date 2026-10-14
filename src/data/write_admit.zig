@@ -1820,6 +1820,40 @@ test "the extending append's drain on a cache-less set (rung-10 dev perf §10.4:
     try testing.expect(w.f.map.seam().lookup(44, 0).?.eql(a));
 }
 
+test "a held-open appender's ONE drain lands its touched pages (rung-10 dev perf §10.4's fork appender in the control arm: 4.2 MB for 144 KB): the first append parks a W2 page overlay over the mapped tail (not stream-adjacent), the 39 stream-adjacent appends after it CONTINUE that overlay instead of escalating it (a whole-block seed read), and the close's drain folds the touched pages in place — device bytes = the touched pages, seed ≤ written, no whole-block upload, the binding unchanged, every byte exact" {
+    const io = testing.io;
+    const w = try World.init(testing.allocator, .sync_inline, false);
+    defer w.deinit(testing.allocator);
+    const a = try w.f.publishBlock(46, 0, 0xAA);
+    const wt0 = accumulate.stats.write_through_bytes.load();
+    const eof0: u64 = 10_000;
+    var size = eof0;
+    var line: [72]u8 = undefined;
+    var i: u8 = 0;
+    while (i < 40) : (i += 1) {
+        fill(&line, i);
+        const o = try w.wp.write(io, .{ .ino = 46, .offset = size, .payload = .{ .bytes = &line }, .class = .entire_op, .file = World.striped(size) });
+        try testing.expectEqual(@as(u32, 1), o.count(.extent));
+        size += line.len;
+    }
+    try testing.expectEqual(@as(u64, 0), w.f.dev.read_bytes); // nothing seeded at a write
+    w.wp.flushIno(io, 46); // the close's drain
+    try testing.expect(!w.wp.table.has(46, 0));
+    try testing.expectEqual(pagesTouched(eof0, size - eof0) * PAGE, w.f.dev.writeBytesTotal());
+    try testing.expect(w.f.dev.read_bytes <= w.f.dev.writeBytesTotal());
+    try testing.expectEqual(wt0, accumulate.stats.write_through_bytes.load());
+    try testing.expect(w.f.map.seam().lookup(46, 0).?.eql(a));
+    var got: [wt.BS]u8 = undefined;
+    w.f.dev.peek(a.vol_tag, a.offset, &got);
+    try testing.expect(std.mem.allEqual(u8, got[0..eof0], 0xAA));
+    i = 0;
+    while (i < 40) : (i += 1) {
+        fill(&line, i);
+        try testing.expectEqualSlices(u8, &line, got[eof0 + @as(u64, i) * line.len ..][0..line.len]);
+    }
+    try testing.expect(std.mem.allEqual(u8, got[size..], 0xAA));
+}
+
 test "the in-place drain's crash law (the kill rows): a drain killed at every grain of its DMA leaves the file's old bytes intact and each appended byte old or new — never a torn old byte, never a recycled pool byte on the device; the entry stays parked and the next drain lands it (never lossy)" {
     const io = testing.io;
     const w = try World.init(testing.allocator, .sync_inline, false);

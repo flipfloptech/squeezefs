@@ -141,3 +141,39 @@ not yet answered by the kernel) is what the change still owes.
   read 0, then asserts at once. Red without the pin law: the second step's `yes` (smoke.zig:1960 —
   B's negative stood). Green: **20/20** consecutive venue runs; B's recalled names 5, epochs 0,
   `dlm_token_kernel_pinned_drops` ≥ 4.
+
+## 5. The `-o ro` reader's remount refused by the home shard's join
+
+**What §9.8 saw.** The smoke `THE -o ro READER OF A LIVE SET`: after A and B left and A mounted
+again, C's remount (`-o ro`) was refused by the home shard's join, once.
+
+**Root cause.** A manager's successor arms its membership shard with the predecessor's writer
+roster — every `member:` row in tree 0 — as the grace window's expectation; while any expected
+member has not re-asserted, the window's fresh half refuses every stranger (`grace_refused`,
+`MembershipPending`), and both the reader plane and a joiner refuse the MOUNT on it. A row outlives
+its member when the clean leave does not land: `Member.leave` is best effort (a failed call is
+ignored) and the owner's row delete is too (`a departed member's row could not be deleted`). B's row
+survived, A's successor expected B — a process that had exited and could never re-assert — and the
+fresh half held C out for the whole window. Reproduced deterministically with
+`SQUEEZEFS_TEST_MEMBERSHIP_LEAVE_LOST` (B's clean stop sends no leave): C's remount answered
+`reader plane: the home shard refused the reader's join (grace_refused)` →
+`the reader plane could not arm` — §9.8's line.
+
+**Fix (decision 0003 §AG.5).** The successor's roster applies the clients classifier's dead-pid
+proof: a same-host row whose pid is proven dead (`MemberRow.pidAlive` false — the pid absent, or
+another incarnation of it) is not expected (`MemberRow.expectsReassertion`,
+`membership_grace_dead_rows`); its next mount is a new incarnation (recovered through the death
+ledger), never a re-assertion. A live row, another host's row (unknowable here) and an undecodable
+one stay expected. This is the reference's law the port had missed: its roster PRUNES same-host
+provably-dead writer entries (`src/membership.rs` :464, "Rung-8 finding #3"), so no 0002 row. A lost leave of a member on ANOTHER host still holds the fresh half to the
+deadline — the window the grace exists for; the mount's typed refusal names it ("retry the mount").
+
+**Red rows.**
+- The smoke row now runs B with the lost-leave seam and asserts A's successor excluded B's dead
+  row (`membership_grace_dead_rows ≥ 1`) before C's remount. Red without the exclusion (the counter
+  bumped, the row still expected): C's remount refused `grace_refused` (smoke.zig:4803, C exited
+  code 1). Green with it.
+- `shard` "a successor's grace expects no same-host predecessor whose pid is proven dead …": a dead
+  row is not expected, a live one, another host's and a torn one are; a roster of dead rows opens no
+  grace and a reader's fresh join is granted, where the roster that expected the dead row refuses
+  the same reader.

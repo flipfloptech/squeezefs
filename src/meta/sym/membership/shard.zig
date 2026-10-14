@@ -78,6 +78,10 @@ pub const stats = struct {
     pub var membership_self_fences: counters.ShardedCounter = .{};
     pub var membership_census_serves: counters.ShardedCounter = .{};
     pub var membership_grace_refusals: counters.ShardedCounter = .{};
+    /// Predecessor rows a successor's grace does not expect: a same-host
+    /// member whose pid is proven dead can never re-assert (its next mount
+    /// is a new incarnation, recovered through the death ledger).
+    pub var membership_grace_dead_rows: counters.ShardedCounter = .{};
     pub var membership_grace_reclaims: counters.ShardedCounter = .{};
     pub var membership_reclaim_refusals: counters.ShardedCounter = .{};
     /// Grows per CHANGE only — growth per beat is the regression.
@@ -191,6 +195,18 @@ pub const MemberRow = struct {
         if (self.pid == 0) return false;
         if (self.start_ticks == 0) return probe.startTicksOf(probe.ctx, self.pid) != null;
         return !probe.provablyDead(self.pid, self.start_ticks);
+    }
+
+    /// Does a successor's grace wait for this predecessor row to re-assert?
+    /// Not when the row is a same-host member proven dead by its pid (the
+    /// clients classifier's `dead`): nothing can re-assert its lease, and
+    /// an expectation nobody meets holds the window's fresh half shut for
+    /// every stranger to its deadline. A row that does not decode is
+    /// expected (the conservative answer).
+    pub fn expectsReassertion(row_bytes: []const u8, local: claim.Identity, probe: claim.PidProbe) bool {
+        const row = decode(row_bytes) catch return true;
+        const alive = row.pidAlive(local, probe) orelse return true;
+        return alive or row.pid == local.pid;
     }
 
     /// The `clients` row of a member (the writer-claim classifier's law,
@@ -1563,6 +1579,45 @@ test "the clients seam lists every member of the shard: a writer through its row
     // The writer's pid is provably dead on this host: the row reads dead.
     try testing.expectEqual(claim.RegistrationState.dead, rows.items[0].state);
     try testing.expectEqual(claim.RegistrationState.live, rows.items[1].state);
+}
+
+test "a successor's grace expects no same-host predecessor whose pid is proven dead (the `-o ro` row's remount refused once: a joiner's row outlived its clean leave, the manager's successor expected it, and the fresh half held every stranger to its deadline): a dead row is not expected, a live one, another host's and an undecodable one are; with only dead rows no grace opens and a reader's fresh join is granted" {
+    const gpa = testing.allocator;
+    const local: claim.Identity = .{ .boot_id = "boot-boot-boot-0".*, .pid = 1, .start_ticks = 1, .hostname_hash = 1 };
+    // pid 102's process is alive (start ticks 7); every other pid is gone.
+    const probe: claim.PidProbe = .{ .ctx = null, .startTicksOf = struct {
+        fn f(_: ?*anyopaque, pid: u32) ?u64 {
+            return if (pid == 102) 7 else null;
+        }
+    }.f };
+    const dead = rowOf(1).encode();
+    const live = rowOf(2).encode();
+    var foreign_row = rowOf(3);
+    foreign_row.boot_id = "boot-other-host!".*;
+    const foreign = foreign_row.encode();
+    try testing.expect(!MemberRow.expectsReassertion(&dead, local, probe));
+    try testing.expect(MemberRow.expectsReassertion(&live, local, probe));
+    try testing.expect(MemberRow.expectsReassertion(&foreign, local, probe));
+    try testing.expect(MemberRow.expectsReassertion("torn", local, probe));
+    // The roster the successor arms from: the dead row dropped.
+    var roster: std.ArrayList(MemberId) = .empty;
+    defer roster.deinit(gpa);
+    for ([_]struct { n: u32, bytes: []const u8 }{.{ .n = 1, .bytes = &dead }}) |r| {
+        if (MemberRow.expectsReassertion(r.bytes, local, probe)) try roster.append(gpa, writerMemberId(testIdentity(r.n)));
+    }
+    try testing.expectEqual(@as(usize, 0), roster.items.len);
+    const clocks = try LeaseClocks.derive(45_000, 0, 100);
+    var reader = joinReqOf(9, null, "/ro");
+    reader.id = @splat(0x99);
+    reader.role = .reader;
+    reader.row = null;
+    var succ = try Owner.arm(gpa, clocks, 0, 2, 1, roster.items, 10_000);
+    defer succ.deinit();
+    _ = succ.join(reader, 10_001).granted;
+    // The roster that expected the dead row: the same reader is refused.
+    var stale = try Owner.arm(gpa, clocks, 0, 2, 1, &.{writerMemberId(testIdentity(1))}, 10_000);
+    defer stale.deinit();
+    try testing.expect(stale.join(reader, 10_001) == .grace_refused);
 }
 
 fn memberRowFuzz(_: void, smith: *std.testing.Smith) !void {

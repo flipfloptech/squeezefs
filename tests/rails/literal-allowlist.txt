@@ -461,7 +461,7 @@ src/meta/sym/membership/recovery.zig:152 | 10 | a size — OWED: derive from der
 src/meta/sym/membership/recovery.zig:152 | 256 | a size — OWED: derive from derive.Facts or document the physical/format reason
 src/meta/sym/membership/recovery.zig:154 | 1000 | a timing/retry constant — OWED: its measured WHY on the line or a derivation (charter §1.5)
 src/meta/sym/membership/recovery.zig:155 | 1000 | a timing/retry constant — OWED: its measured WHY on the line or a derivation (charter §1.5)
-src/meta/sym/membership/shard.zig:799 | 1000 | a timing/retry constant — OWED: its measured WHY on the line or a derivation (charter §1.5)
+src/meta/sym/membership/shard.zig:815 | 1000 | a timing/retry constant — OWED: its measured WHY on the line or a derivation (charter §1.5)
 src/meta/sym/region.zig:325 | 64 | OWED: derive it or document it on the line (charter §1.5)
 src/meta/sym/region.zig:429 | 3 | OWED: derive it or document it on the line (charter §1.5)
 src/meta/sym/region.zig:430 | 100 | OWED: derive it or document it on the line (charter §1.5)

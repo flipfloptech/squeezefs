@@ -4662,7 +4662,7 @@ test "smoke: A STRIPED DIRECTORY ON ONE DAEMON — mkdir hot → the explicit fl
     _ = try fsckClean(rig, "the striped directory row");
 }
 
-test "smoke: THE `-o ro` READER OF A LIVE SET — C mounts `-o ro` beside A (the manager) and B (joined): no flock, no claim, no region; a member-reader + token client (TTLs 0, reader_staleness_bound_ms 0) reading B's 2,000 files and A's tree under tokens (0 local reads) → B writes ⇒ C's next read is fresh → A and B leave ⇒ C becomes the QUIESCENT reader of their last checkpoint → A mounts again ⇒ C fail-stops ESTALE at its next op (`.stats` still readable) → remount C ⇒ a token reader again" {
+test "smoke: THE `-o ro` READER OF A LIVE SET — C mounts `-o ro` beside A (the manager) and B (joined): no flock, no claim, no region; a member-reader + token client (TTLs 0, reader_staleness_bound_ms 0) reading B's 2,000 files and A's tree under tokens (0 local reads) → B writes ⇒ C's next read is fresh → A and B leave ⇒ C becomes the QUIESCENT reader of their last checkpoint → A mounts again ⇒ C fail-stops ESTALE at its next op (`.stats` still readable) → remount C ⇒ a token reader again — B's membership leave is LOST (`SQUEEZEFS_TEST_MEMBERSHIP_LEAVE_LOST`): its row outlives it, and A's successor must not expect a member whose pid is proven dead (decision 0003 §AG.5), or its grace refuses C's remount" {
     const io = testing.io;
     if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
     const gpa = testing.allocator;
@@ -4674,8 +4674,11 @@ test "smoke: THE `-o ro` READER OF A LIVE SET — C mounts `-o ro` beside A (the
     try rig.formatSet(true);
     try rig.spawnMount(&.{});
     _ = try rig.awaitReady(0);
+    var env_b = try envWith(gpa, &rig.env, &.{.{ "SQUEEZEFS_TEST_MEMBERSHIP_LEAVE_LOST", "1" }});
+    defer env_b.deinit();
     const b = try Peer.init(rig, "b");
     defer b.deinit();
+    b.env = &env_b;
     try b.spawn(&.{});
     _ = try b.awaitReady();
     {
@@ -4784,6 +4787,13 @@ test "smoke: THE `-o ro` READER OF A LIVE SET — C mounts `-o ro` beside A (the
         defer gpa.free(text);
         try testing.expect(std.mem.indexOf(u8, text, "a writer appeared (ledger_advance) under the quiescent reader — every metadata op now answers ESTALE") != null);
         std.debug.print("smoke: -o ro: A mounted again — C fail-stopped (ESTALE on ls and cat; .stats readable)\n", .{});
+    }
+    // B's row outlived its lost leave; A's successor proved its pid dead
+    // and opened no grace for it (the remount below is a fresh join).
+    {
+        const ta = try rig.onMount("cat .stats");
+        defer gpa.free(ta);
+        try testing.expect((numberAfter(ta, "\"membership_grace_dead_rows\":") orelse 0) >= 1);
     }
     // Remount C: a token reader of the live set again.
     try c.umount();

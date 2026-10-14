@@ -407,6 +407,10 @@ pub const WirePlane = struct {
     /// — never off this mount's cache. Bound into the filesystem by
     /// `mount`; its kernel-invalidation half joins once the session is up.
     divert: tokens.Divert,
+    /// `SQUEEZEFS_TEST_MEMBERSHIP_LEAVE_LOST`: the clean stop sends no
+    /// membership leave (a leave lost on the wire: the home shard keeps
+    /// the row for its successor's roster).
+    leave_lost: bool = false,
     sink: RecallSink,
     /// The data planes' arms (`bindDataPlanes`, after the listener): the
     /// holder's grant plane is published with a release store and read by
@@ -486,6 +490,7 @@ pub const WirePlane = struct {
         const lease: tokens.cache.SelfLease = if (self.joined) |j| j.selfLease() else .always;
         self.divert = tokens.Divert.init(gpa, io, self.resolver_ctx.resolver(), clientIdOf(shard.writerMemberId(identity)), 0, self.sink.sink(), lease, tokens.cache.recordsBudgetBytes(mem_budget_bytes));
         self.divert.evict_after_serve = knobs.boolKnob("SQUEEZEFS_TEST_TOKEN_EVICT_AFTER_SERVE", env);
+        self.leave_lost = knobs.boolKnob("SQUEEZEFS_TEST_MEMBERSHIP_LEAVE_LOST", env);
         // The token holder over this daemon's trees; the pusher over the
         // peers' dialled links.
         self.holder = tokens.table.Holder.init(gpa, io, identity.writer_id, self.oracle.oracle(), TOKEN_OBJECTS_CAP, listener.deriveMaxConnections(raw_cpus, listener.raiseNofile())) catch return error.OutOfMemory;
@@ -786,7 +791,9 @@ pub const WirePlane = struct {
             self.writer_plane = null;
         }
         if (self.joined) |j| {
-            j.member.leave() catch log.err("cluster wire: the membership leave was refused over a standing park — the home shard records this mount's death", .{});
+            if (self.leave_lost) {
+                log.warn("cluster wire: SQUEEZEFS_TEST_MEMBERSHIP_LEAVE_LOST — the membership leave is not sent (the home shard keeps this member's row)", .{});
+            } else j.member.leave() catch log.err("cluster wire: the membership leave was refused over a standing park — the home shard records this mount's death", .{});
         }
         self.listener.stop();
         stats.wire_listener_up.set(0);
@@ -1297,8 +1304,13 @@ pub const WirePlane = struct {
         var kvs: std.ArrayList(tree.KeyValue) = .empty;
         defer tree.deinitKeyValues(self.gpa, &kvs);
         try self.set.volumes[0].range(self.gpa, key.TREE_CONTROL, r.start.slice(), r.end.slice(), std.math.maxInt(usize), &kvs);
+        const local = @import("../guard/proc.zig").localIdentity();
         for (kvs.items) |kv| {
             const id = cr.identityOfKey(kv.key) orelse continue;
+            if (!shard.MemberRow.expectsReassertion(kv.value, local, @import("../guard/proc.zig").probe)) {
+                shard.stats.membership_grace_dead_rows.inc();
+                continue;
+            }
             try out.append(self.gpa, shard.writerMemberId(.{ .node_token = id.node_token, .writer_id = 0, .mount_slot = id.mount_slot, .reserved = 0 }));
         }
     }

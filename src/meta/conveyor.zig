@@ -4022,7 +4022,61 @@ test "§L tie: the worth gate — OFF declines 159 eligible windows then probes 
 // cohorts sum to N per pair of windows whatever the split, so the pad
 // fraction over the run is `1 − N·s/(2·g)` up to the first and last
 // windows.
-test "§L: the window-fill hold — 48 closed-loop committers of 76 B entries against a 4 ms device: pad fraction ≤ 1 − N·s/(2·g) + slack past the gate's first probe period, two windows per committer round, every entry acked once, zero tick rescues" {
+/// The window-fill row's committers: each its own inode's closed loop —
+/// a simulated data DMA (a per-committer latency spread over the journal's
+/// round trip: 16 distinct instants under D, so arrivals spread over a
+/// window's flight instead of bursting with its landing), then ONE Δ
+/// commit acked before the next.
+const WindowFillCommitters = struct {
+    const n = 48;
+    const device_ns: u64 = 4 * std.time.ns_per_ms;
+
+    fn run(hh: *Harness, sim: *Harness.DmaSim, ino: u64, index: usize, first: usize, rounds: usize, err_out: *?anyerror) void {
+        const dma_ns: u64 = ((index * 7) % 16) * (device_ns / 16);
+        for (first..first + rounds) |k| {
+            var dma_done: sync.Oneshot(void) = .init;
+            sim.submit(clock.monotonicNs() + dma_ns, &dma_done) catch |e| {
+                err_out.* = e;
+                return;
+            };
+            dma_done.recvUncancelable(testing.io) catch |e| {
+                err_out.* = e;
+                return;
+            };
+            var t = tx.KvTx.init(hh.gpa, @src());
+            t.stageDelta(key.TREE_INODES, &key.inodeKey(ino), .{ .mask = record.DELTA_SIZE | record.DELTA_TIMES, .fields = .{ .size = 512 * (k + 1), .mtime = 2000 + k, .ctime = 2000 + k } }) catch |e| {
+                err_out.* = e;
+                return;
+            };
+            hh.cv.commit(&t) catch |e| {
+                err_out.* = e;
+                return;
+            };
+        }
+    }
+
+    /// `rounds` commits per committer from round `first`, every committer
+    /// joined, every window at its terminal outcome.
+    fn phase(h: *Harness, sim: *Harness.DmaSim, inos: *const [n]u64, first: usize, rounds: usize) !void {
+        var errs: [n]?anyerror = @splat(null);
+        var handles: [n]std.Thread = undefined;
+        for (&handles, 0..) |*hd, i| hd.* = try std.Thread.spawn(.{}, run, .{ h, sim, inos[i], i, first, rounds, &errs[i] });
+        for (handles) |hd| hd.join();
+        for (errs, 0..) |e, i| if (e) |err| {
+            std.debug.print("§L: committer {d} failed: {s}\n", .{ i, @errorName(err) });
+            return err;
+        };
+        h.cv.quiesce();
+    }
+
+    /// The worth gate paid a hold of its own (a `.hold` verdict, not a
+    /// probe's): it opened.
+    fn gateOpened(h: *Harness) bool {
+        return h.cv.stats.holds.load() > h.cv.stats.hold_probes.load();
+    }
+};
+
+test "§L: the window-fill hold — 48 closed-loop committers of 76 B entries against a 4 ms device: once the worth gate opened (the rendezvous), the steady pairs' pad fraction ≤ 1 − N·s/(2·g) + slack, two windows per committer round, every entry acked once, zero tick rescues" {
     // Leak-checked, no stack traces: `testing.allocator`'s trace capture
     // made a one-record apply cost ~0.5 ms in Debug — the pass latency
     // the shape measures against must stay far under the round trip.
@@ -4032,16 +4086,15 @@ test "§L: the window-fill hold — 48 closed-loop committers of 76 B entries ag
     const h = try Harness.createWithAllocators(.{ .extents = 1024, .ring_grain = 4096 }, null, false, gpa, gpa);
     defer h.destroy();
     const io = testing.io;
-    const n_committers = 48;
-    // Enough rounds that the gate's first probe period (128 unpaced
-    // one-entry windows) is a minority of the run.
+    const C = WindowFillCommitters;
+    const n_committers = C.n;
     const per_committer = 96;
     // The simulated journal device's round trip: long against the pass
     // latency AND the device thread's own delivery grain (a futex wake per
     // completion, tens of µs on macOS: the 16 arrival phases, 250 µs
     // apart, must stay distinct), short for the gate (≈ 96 × 2 × 4 ms ≈
-    // 0.8 s of paced landings + the probe period's).
-    const device_ns: u64 = 4 * std.time.ns_per_ms;
+    // 0.8 s of paced landings + the learning rounds').
+    const device_ns = C.device_ns;
     h.cv.deps.window_hold = .{ .ceiling_ns = 50 * std.time.ns_per_ms };
     h.lane.hold = true;
     h.threaded_pass = true;
@@ -4072,58 +4125,42 @@ test "§L: the window-fill hold — 48 closed-loop committers of 76 B entries ag
         ino.* = try h.commitCreate(try std.fmt.bufPrint(&nb, "w{d}", .{i}));
     }
     h.cv.quiesce();
+    // THE RENDEZVOUS: rounds until the worth gate opened. The gate starts
+    // OFF and probes at its `HOLD_PROBE_PERIOD`th eligible window; WHEN it
+    // opens is the schedule's (a probe burst whose holds meet a stalled
+    // host collects too little, and the gate stays off for another
+    // period) — its learning law is the worth-gate tie row's. Four probe
+    // periods' worth of rounds without an open gate is the gate failing
+    // 48 committers, never the schedule.
+    const learn_rounds = 16;
+    var first: usize = 0;
+    while (!C.gateOpened(h)) {
+        if (first >= 4 * learn_rounds) return error.WorthGateNeverOpened;
+        try C.phase(h, &dma, &inos, first, learn_rounds);
+        first += learn_rounds;
+    }
     const st = &h.vol.journal.stats;
     const pad0 = st.written_pad_bytes.load();
     const dev0 = st.written_device_bytes.load();
     const win0 = st.written_windows.load();
     const ent0 = st.written_entries.load();
     const acks0 = h.cv.stats.acks.load();
-
-    const Committer = struct {
-        fn run(hh: *Harness, sim: *Harness.DmaSim, ino: u64, index: usize, err_out: *?anyerror) void {
-            // The op's data DMA before its commit: a per-committer latency
-            // spread over the journal's round trip (16 distinct instants
-            // under D), so arrivals spread over a window's flight instead
-            // of bursting with its landing.
-            const dma_ns: u64 = ((index * 7) % 16) * (device_ns / 16);
-            for (0..per_committer) |k| {
-                var dma_done: sync.Oneshot(void) = .init;
-                sim.submit(clock.monotonicNs() + dma_ns, &dma_done) catch |e| {
-                    err_out.* = e;
-                    return;
-                };
-                dma_done.recvUncancelable(testing.io) catch |e| {
-                    err_out.* = e;
-                    return;
-                };
-                var t = tx.KvTx.init(hh.gpa, @src());
-                t.stageDelta(key.TREE_INODES, &key.inodeKey(ino), .{ .mask = record.DELTA_SIZE | record.DELTA_TIMES, .fields = .{ .size = 512 * (k + 1), .mtime = 2000 + k, .ctime = 2000 + k } }) catch |e| {
-                    err_out.* = e;
-                    return;
-                };
-                hh.cv.commit(&t) catch |e| {
-                    err_out.* = e;
-                    return;
-                };
-            }
-        }
-    };
-    var errs: [n_committers]?anyerror = @splat(null);
-    var handles: [n_committers]std.Thread = undefined;
-    for (&handles, 0..) |*hd, i| hd.* = try std.Thread.spawn(.{}, Committer.run, .{ h, &dma, inos[i], i, &errs[i] });
-    for (handles) |hd| hd.join();
-    for (errs, 0..) |e, i| if (e) |err| {
-        std.debug.print("§L: committer {d} failed: {s}\n", .{ i, @errorName(err) });
-        return err;
-    };
-    // Every window reached its terminal outcome: the ledger is final (the
-    // venue's threads are stopped by the defers).
-    h.cv.quiesce();
+    const holds0 = h.cv.stats.holds.load();
+    const landings0 = h.cv.stats.hold_landings.load();
+    const deadlines0 = h.cv.stats.hold_deadlines.load();
+    const not_worth0 = h.cv.stats.holds_not_worth.load();
+    const handoffs0 = h.cv.stats.lane_handoffs.load();
+    const classed0 = h.cv.stats.windows_held.load() + h.cv.stats.windows_unshadowed.load() + h.cv.stats.windows_pipelined.load();
+    // THE MEASUREMENT: the steady pairs past the rendezvous.
+    try C.phase(h, &dma, &inos, first, per_committer);
 
     const entries = st.written_entries.load() - ent0;
     const windows = st.written_windows.load() - win0;
     const pad = st.written_pad_bytes.load() - pad0;
     const device = st.written_device_bytes.load() - dev0;
+    const holds = h.cv.stats.holds.load() - holds0;
+    const landings = h.cv.stats.hold_landings.load() - landings0;
+    const deadlines = h.cv.stats.hold_deadlines.load() - deadlines0;
     // Every Δ landed as an entry (a structural entry — a leaf's compaction
     // under the growing overlay — may ride beside them).
     try testing.expect(entries >= n_committers * per_committer);
@@ -4131,41 +4168,40 @@ test "§L: the window-fill hold — 48 closed-loop committers of 76 B entries ag
     try testing.expectEqual(@as(u64, 0), h.cv.stats.refusals.load());
     try testing.expectEqual(@as(u64, 0), h.cv.stats.park_tick_rescues.load());
     // The identity: Σ journal device bytes ≡ entries + pad + headers + holes
-    // (asserted per window in `noteWritten`); the §L reading.
+    // (asserted per window in `noteWritten`); the §L reading over the
+    // steady pairs at `1 − N·s/(2·g)`.
     const s: u64 = 76;
     const geo = h.vol.journal.geo;
     const pair = windowCost(geo, n_committers / 2, s);
-    // The expected pad over the run: the steady pairs at `1 − N·s/(2·g)`
-    // plus the gate's learning period — it starts OFF and pays its first
-    // probe burst at the `HOLD_PROBE_PERIOD`th eligible window, so that
-    // many one-entry windows land unpaced first (the shape's ≈ 97.6 %).
-    const steady_windows: u64 = 2 * per_committer;
-    const probe_windows: u64 = HOLD_PROBE_PERIOD - 1;
-    const bound_ppm = (pair.padFractionPpm() * steady_windows + windowCost(geo, 1, s).padFractionPpm() * probe_windows) / (steady_windows + probe_windows);
+    const bound_ppm = pair.padFractionPpm();
     const pad_ppm = (pad * WindowCost.PPM) / device;
-    // 12 pp of slack: the first windows (the cohorts forming) and the
-    // last (committers finishing) carry more pad than the steady pairs.
-    const slack_ppm = 12 * WindowCost.PPM / 100;
-    std.debug.print("\n§L red test: {d} entries in {d} windows, pad {d} B of {d} B device = {d}.{d:0>1} % (bound {d}.{d:0>1} % + 12 pp); holds {d} (landings {d}, deadlines {d}, probes {d}, not worth {d}; gain {d}/1000); held {d}, unshadowed {d}, pipelined {d}; hold bound {d} µs\n", .{ entries, windows, pad, device, pad_ppm / 10_000, (pad_ppm % 10_000) / 1000, bound_ppm / 10_000, (bound_ppm % 10_000) / 1000, h.cv.stats.holds.load(), h.cv.stats.hold_landings.load(), h.cv.stats.hold_deadlines.load(), h.cv.stats.hold_probes.load(), h.cv.stats.holds_not_worth.load(), h.cv.stats.hold_gain_milli.load(), h.cv.stats.windows_held.load(), h.cv.stats.windows_unshadowed.load(), h.cv.stats.windows_pipelined.load(), h.cv.stats.hold_bound_ns.load() / 1000 });
+    // The slack for the cohorts forming and finishing (their windows
+    // carry more pad than the steady pairs): the row's 12 pp over a run of
+    // `2K` steady windows plus the gate's `P − 1` one-entry learning
+    // windows (at their cost by construction) — restricted to the steady
+    // windows now judged alone, the same tolerance is 12 pp × (2K + P − 1)
+    // / 2K, neither loosened nor tightened by the rendezvous.
+    const steady_windows: u64 = 2 * per_committer;
+    const slack_ppm = (12 * WindowCost.PPM / 100) * (steady_windows + HOLD_PROBE_PERIOD - 1) / steady_windows;
+    std.debug.print("\n§L red test: {d} learning rounds; {d} entries in {d} windows, pad {d} B of {d} B device = {d}.{d:0>1} % (bound {d}.{d:0>1} % + {d}.{d:0>1} pp); holds {d} (landings {d}, deadlines {d}; probes {d}, not worth {d}; gain {d}/1000); held {d}, unshadowed {d}, pipelined {d}; hold bound {d} µs\n", .{ first, entries, windows, pad, device, pad_ppm / 10_000, (pad_ppm % 10_000) / 1000, bound_ppm / 10_000, (bound_ppm % 10_000) / 1000, slack_ppm / 10_000, (slack_ppm % 10_000) / 1000, holds, landings, deadlines, h.cv.stats.hold_probes.load(), h.cv.stats.holds_not_worth.load(), h.cv.stats.hold_gain_milli.load(), h.cv.stats.windows_held.load(), h.cv.stats.windows_unshadowed.load(), h.cv.stats.windows_pipelined.load(), h.cv.stats.hold_bound_ns.load() / 1000 });
     try testing.expect(pad_ppm <= bound_ppm + slack_ppm);
     // The pacing law's counts: every handoff is one class; a hold ended by
     // the landing's wake or the deadline; one window per round trip means
     // TWO windows per committer round (the alternating cohorts), plus the
-    // forming/finishing transient and the gate's first probe period —
-    // against entries/2 ≈ 768 unpaced.
-    const handoffs = h.cv.stats.lane_handoffs.load();
-    try testing.expectEqual(handoffs, h.cv.stats.windows_held.load() + h.cv.stats.windows_unshadowed.load() + h.cv.stats.windows_pipelined.load());
-    try testing.expectEqual(h.cv.stats.holds.load(), h.cv.stats.hold_landings.load() + h.cv.stats.hold_deadlines.load());
-    try testing.expect(h.cv.stats.holds.load() >= per_committer);
+    // forming/finishing transient — against entries/2 ≈ 2,300 unpaced.
+    const classed = h.cv.stats.windows_held.load() + h.cv.stats.windows_unshadowed.load() + h.cv.stats.windows_pipelined.load();
+    try testing.expectEqual(h.cv.stats.lane_handoffs.load() - handoffs0, classed - classed0);
+    try testing.expectEqual(holds, landings + deadlines);
+    try testing.expect(holds >= per_committer);
     // Two windows per round, a third when the re-drain races a cohort's
     // tail (the device thread lands and completes DMAs from one clock),
-    // plus the probe period and the forming/finishing transient.
-    try testing.expect(windows <= (5 * per_committer) / 2 + HOLD_PROBE_PERIOD + 8);
-    // The gate learned: one probe turned it on and it stayed on.
-    try testing.expect(h.cv.stats.hold_probes.load() >= HOLD_PROBE_FORMING + HOLD_PROBE_BURST);
-    try testing.expect(h.cv.stats.holds_not_worth.load() < 2 * HOLD_PROBE_PERIOD);
+    // plus the forming/finishing transient.
+    try testing.expect(windows <= (5 * per_committer) / 2 + 8);
+    // The gate stayed open — or, closed by a stall's thin holds, opened
+    // again at its next probe burst.
+    try testing.expect(h.cv.stats.holds_not_worth.load() - not_worth0 < HOLD_PROBE_PERIOD);
     try testing.expect(holdWorthIt(h.cv.stats.hold_gain_milli.load() * GAIN_UNIT / 1000, true));
-    try testing.expect(h.cv.stats.hold_landings.load() >= h.cv.stats.hold_deadlines.load());
+    try testing.expect(landings >= deadlines);
     // Every Δ landed: the fold's newest size per inode is the last write's.
     for (inos) |ino| try testing.expect(try h.present(ino));
 }

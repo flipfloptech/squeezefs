@@ -332,7 +332,7 @@ pub fn run(p: cli.Process, m: args.Mount) u8 {
         };
         const log_fd = daemon.openLogFile(lfz, p.stderr) catch return cli.exit_failed;
         p.stderr.flush() catch {};
-        switch (daemon.detach(p.gpa, p.io, .{ .supervise = m.supervise, .mountpoint = mountpoint, .log_fd = log_fd, .scrub = if (stash) |st| st.bytes else null }, p.stderr)) {
+        switch (daemon.detach(p.gpa, p.io, .{ .supervise = m.supervise, .mountpoint = mountpoint, .log_fd = log_fd, .policy = cli.supervisor.Policy.fromEnv(p.env), .scrub = if (stash) |st| st.bytes else null }, p.stderr)) {
             // The parent zeroizes its copy right after the fork returns
             // (the `defer` above): the child owns the key material now.
             .parent => |code| return code,

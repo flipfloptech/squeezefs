@@ -5352,6 +5352,10 @@ test "smoke: `umount --lazy` of a BUSY mount — the verb returns at once naming
     const rig = try Rig.init(gpa, io);
     defer rig.deinit();
     try rig.formatSet(true);
+    // The supervisor looks every quarter second (the probe seam): step 3's
+    // switch to the heartbeat lands at its first look past the detach,
+    // never after up to three 5 s intervals.
+    try rig.env.put("SQUEEZEFS_TEST_SUPERVISOR_PROBE_MS", "250");
     {
         const r = try rig.squeezefs(&.{ "mount", "--daemon", "--supervise", "--log-file", rig.log_path, "-o", "default_permissions,allow_other", rig.meta_uri, rig.mp });
         defer rig.freeRun(r);

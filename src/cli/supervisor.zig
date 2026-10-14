@@ -56,6 +56,7 @@ const fuzzkit = @import("../core/fuzzkit.zig");
 const builtin = @import("builtin");
 const tick_law = @import("../sync/tick.zig");
 const clock = @import("../core/clock.zig");
+const knobs = @import("../core/knobs.zig");
 const mountinfo = @import("../core/mountinfo.zig");
 
 pub const PROBE_INTERVAL_NS: u64 = 5 * std.time.ns_per_s;
@@ -65,9 +66,20 @@ pub const ABORT_GRACE_NS: u64 = tick_law.tick_ns;
 
 pub const Policy = struct {
     probe_interval_ns: u64 = PROBE_INTERVAL_NS,
+    /// A control-inode probe's answer window: one watchdog tick whatever
+    /// the cadence (a seam's faster cadence must not read a slow stat on a
+    /// loaded host as a miss).
+    probe_timeout_ns: u64 = PROBE_INTERVAL_NS,
     unresponsive_after_ns: u64 = UNRESPONSIVE_NS,
     heartbeat_stale_ns: u64 = HEARTBEAT_STALE_NS,
     write_abort: bool = true,
+
+    /// The policy a `--supervise` mount runs: the constants, the probe
+    /// cadence `SQUEEZEFS_TEST_SUPERVISOR_PROBE_MS` when a suite sets it.
+    pub fn fromEnv(env: *const std.process.Environ.Map) Policy {
+        const ms = knobs.intKnob("SQUEEZEFS_TEST_SUPERVISOR_PROBE_MS", u64, env);
+        return .{ .probe_interval_ns = if (ms == 0) PROBE_INTERVAL_NS else ms * std.time.ns_per_ms };
+    }
 };
 
 pub const Verdict = union(enum) {
@@ -360,7 +372,7 @@ pub const linux_loop = if (builtin.os.tag == .linux) struct {
         _ = thread_name.nameCurrentThread(&name_buf, "sqz-supervise");
         const conn = connectionId(mountpoint);
         const mount_id = mountIdAt(gpa, io, mountpoint);
-        if (conn) |c| log.info("supervisor: watching daemon {d} at {s} (fuse connection {d}, mount id {?d}; probe every {d} s, escalate after {d} s)", .{ pid, mountpoint, c, mount_id, policy.probe_interval_ns / std.time.ns_per_s, policy.unresponsive_after_ns / std.time.ns_per_s }) else log.warn("supervisor: stat({s}) failed at start — the connection id is unknown, the abort rung is disabled", .{mountpoint});
+        if (conn) |c| log.info("supervisor: watching daemon {d} at {s} (fuse connection {d}, mount id {?d}; probe every {d} ms, escalate after {d} s)", .{ pid, mountpoint, c, mount_id, policy.probe_interval_ns / std.time.ns_per_ms, policy.unresponsive_after_ns / std.time.ns_per_s }) else log.warn("supervisor: stat({s}) failed at start — the connection id is unknown, the abort rung is disabled", .{mountpoint});
         if (heartbeat == null) log.warn("supervisor: no shared heartbeat page — a detached mount's liveness cannot be judged; the escalation fires {d} s after its detach", .{policy.unresponsive_after_ns / std.time.ns_per_s});
         var state = State.init(clock.monotonicNs());
         var escalated = false;
@@ -376,7 +388,7 @@ pub const linux_loop = if (builtin.os.tag == .linux) struct {
             var is_attached = attached(gpa, io, mountpoint, mount_id);
             var kind = probeKind(is_attached);
             var ok = switch (kind) {
-                .control_inode => probe(gpa, mountpoint, policy.probe_interval_ns),
+                .control_inode => probe(gpa, mountpoint, policy.probe_timeout_ns),
                 .heartbeat => if (heartbeat) |h| h.fresh(clock.monotonicNs(), policy.heartbeat_stale_ns) else false,
             };
             // A stat that failed on a mount that left the table meanwhile
@@ -424,6 +436,20 @@ test "state machine: escalates exactly once after the threshold; a success re-ar
     try testing.expectEqual(Verdict.healthy, s.observe(1000 + 406 * std.time.ns_per_s, true, p));
     try testing.expectEqual(Verdict{ .grace = 5 * std.time.ns_per_s }, s.observe(1000 + 411 * std.time.ns_per_s, false, p));
     try testing.expectEqual(Verdict{ .escalate = 30 * std.time.ns_per_s }, s.observe(1000 + 436 * std.time.ns_per_s, false, p));
+}
+
+test "the policy from the env: the constants unset; the probe seam changes the cadence alone — the probe's answer window and the heartbeat's staleness stay the watchdog tick's" {
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+    const d = Policy.fromEnv(&env);
+    try testing.expectEqual(PROBE_INTERVAL_NS, d.probe_interval_ns);
+    try testing.expectEqual(PROBE_INTERVAL_NS, d.probe_timeout_ns);
+    try env.put("SQUEEZEFS_TEST_SUPERVISOR_PROBE_MS", "250");
+    const s = Policy.fromEnv(&env);
+    try testing.expectEqual(250 * std.time.ns_per_ms, s.probe_interval_ns);
+    try testing.expectEqual(PROBE_INTERVAL_NS, s.probe_timeout_ns);
+    try testing.expectEqual(HEARTBEAT_STALE_NS, s.heartbeat_stale_ns);
+    try testing.expectEqual(UNRESPONSIVE_NS, s.unresponsive_after_ns);
 }
 
 test "constants: the probe reaches the daemon past the 1 s attr TTL; six probes to escalation; a heartbeat is stale after two ticks; the abort grace is one lock-plane tick" {

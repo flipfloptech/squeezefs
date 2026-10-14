@@ -43,13 +43,18 @@ SECTOR = 512
 # complement); `durable_upload_bytes_escalation` is its flush-time-complement
 # SUBSET (measured on generic/074's growing-file shape: 825 write-through
 # blocks, 0 escalation bytes — summing the subset alone read 0 device bytes
-# against 3.5 GB on diskstats) and is reported beside.
+# against 3.5 GB on diskstats) and is reported beside. The two in-place arms
+# land pages at a mapping the file owns alone: the W2 fold's (§J.1 landing 2)
+# and the deferred full buffer's drain (§AK: an extending append's drain).
 DEVICE_WRITE_ARMS = [
     "overlay_store_bytes", "patch_write_bytes", "own_block_dma_bytes",
     "write_through_bytes", "durable_upload_bytes_writeback",
-    "fold_inplace_write_bytes",
+    "fold_inplace_write_bytes", "drain_inplace_write_bytes",
 ]
-DEVICE_WRITE_BESIDE = ["rewrite_device_write_bytes", "rewrite_shadow_bytes", "rewrite_user_bytes", "durable_upload_bytes_escalation"]
+# `drain_inplace_dmas` is beside: the drain's page DMAs ride the block layer's
+# put (`put_obj` counts each one — the e2e row pins `put_obj + 1` per drain).
+DEVICE_WRITE_BESIDE = ["rewrite_device_write_bytes", "rewrite_shadow_bytes", "rewrite_user_bytes", "durable_upload_bytes_escalation",
+                       "drain_inplace_dmas"]
 # The device-write REQUEST counters beside the byte arms (the stats-side
 # `wareq-sz`; the substrate's diskstats is the ruler — these are the daemon's view).
 # `put_obj` is the block device layer's put (an overlay store IS a put — not
@@ -75,10 +80,25 @@ PAGE = 4096
 AMP_SLACK = 0.1
 # §J.2: `1 + 2(1 + ¼)/¼` over the geometric re-stage chain at a quarter slack.
 STAGED_APPEND_BOUND = 11.0
+# §AK: an append drained at its close lands its touched pages in place, and
+# each block the appends reach lands whole ONCE at its first drain (write-
+# before-publish; at most one block per block of appended bytes, so ≤ 1 per
+# appended byte), plus the promotion's own-block DMA of the inline image
+# (≤ one page per file): `device ≤ (pages(bs, a) × P / bs + 1) × appended +
+# files × P`.
+APPEND_DRAIN_HOLE_TERM = 1.0
 
 
 def pages_worst(length, offset_align):
     return 1 + (length + PAGE - offset_align - 1) // PAGE
+
+
+def append_drain_bound(bs, appended, files):
+    """Device bytes an append-per-drain row may write (§AK), or None."""
+    b = write_amp_bound(bs)
+    if b is None or not appended:
+        return None
+    return (b + APPEND_DRAIN_HOLE_TERM) * appended + files * PAGE
 
 
 def write_amp_bound(bs):
@@ -518,6 +538,16 @@ def leg(args):
         entries = d["meta_kv_journal_entries"]
         per_op = entries / ops if ops else 0.0
         verdicts.append(("journal_entries_per_append", per_op <= 1.05, "journal entries %d ÷ appends %d = %.3f/op (gate ≤ 1.05)" % (entries, ops, per_op)))
+        # 3d. the append drain law (§AK): on a set without staging every
+        #     append lands at its drain — the touched pages in place, each
+        #     block once whole at its first; a staged set moves ring bytes.
+        files = int(metrics.get("writers", 1) or 1)
+        cap = append_drain_bound(int(metrics.get("bs", 0) or 0), user_w, files)
+        if cap is not None:
+            ok = device_write_stats <= cap * (1 + AMP_SLACK)
+            verdicts.append(("append_drain_bound", ok, "device bytes %d ÷ appended %d = ×%.3f vs the §AK bound ×%.3f (+%.0f %% slack) for bs %d over %d file(s); in-place drains %d B over %d DMAs, whole-block uploads %d B" % (
+                device_write_stats, user_w, device_write_stats / user_w, cap / user_w, AMP_SLACK * 100, int(metrics.get("bs", 0) or 0), files,
+                d["drain_inplace_write_bytes"], d["drain_inplace_dmas"], d["write_through_bytes"])))
     # 4. engagement: the ops reach the mechanism under test.
     if meta.get("shim"):
         # The hybrid lane gate (charter §7): ops above `memBW × 2.3 µs / 2 copies`
@@ -864,7 +894,7 @@ def markdown(rec):
     # The §J and §L laws, per leg, when the row engaged them.
     for l in legs:
         for v in l["verdicts"]:
-            if v["check"] in ("write_amplification_bound", "staged_append_bound", "journal_entries_per_append", "meta_pad_fraction_bound", "meta_device_div_user"):
+            if v["check"] in ("write_amplification_bound", "staged_append_bound", "append_drain_bound", "journal_entries_per_append", "meta_pad_fraction_bound", "meta_device_div_user"):
                 lines.append("- leg %s/%s `%s` %s: %s" % (l["leg"], l["arm"], v["check"], "ok" if v["ok"] else "FAILED", v["detail"]))
     fs = legs[0]["ledgers"]["fsync_phase_ns"] if legs else None
     if fs and fs["total"]["count"]:

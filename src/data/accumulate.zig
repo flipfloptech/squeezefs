@@ -131,6 +131,22 @@ pub const stats = struct {
     /// A merge whose bytes already lived in the entry's cell (a placed
     /// payload of an adopted assembly — the pointer proof): the copy elided.
     pub var placed_merge_elides: counters.ShardedCounter = .{};
+    /// The in-place drain (decision 0003 §AK): a partial deferred full
+    /// buffer over a sole-owner passthrough mapping lands its touched pages
+    /// at the mapping — `drain_inplace_write_bytes` is a device-write arm of
+    /// the bracket ledger (`brk.py` `DEVICE_WRITE_ARMS`, `bench.zig`), its
+    /// DMAs a request arm; the seed is the partial pages' other bytes read
+    /// back from the mapping (`≤` the bytes written, by construction).
+    pub var drain_inplace_drains: counters.ShardedCounter = .{};
+    pub var drain_inplace_pages: counters.ShardedCounter = .{};
+    pub var drain_inplace_dmas: counters.ShardedCounter = .{};
+    pub var drain_inplace_write_bytes: counters.ShardedCounter = .{};
+    pub var drain_inplace_seed_bytes: counters.ShardedCounter = .{};
+    /// Asked and declined (a CoW base: transformed, shared, epoch-bound, an
+    /// open overlay record, unmapped): the whole-block upload.
+    pub var drain_inplace_declines: counters.ShardedCounter = .{};
+    /// A failed seed read or DMA: the entry stays parked (never lossy), loud.
+    pub var drain_inplace_dma_errors: counters.ShardedCounter = .{};
     // Tripwires.
     pub var coverage_complete_buffer_not_content_valid: counters.Tripwire = .init("coverage_complete_buffer_not_content_valid");
     pub var complete_union_with_extra_runs: counters.Tripwire = .init("complete_union_with_extra_runs");
@@ -140,7 +156,7 @@ pub const stats = struct {
 
 pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
     try w.writeAll("{");
-    inline for (.{ "write_through_blocks", "write_through_bytes", "write_through_fallbacks", "nt_copy_bytes", "active_block_cow_copies", "active_block_memset_elided_bytes", "active_block_ooo_runs", "active_block_run_table_completions", "overwrite_seed_deferred", "overwrite_seed_materialized", "overwrite_seed_skipped", "write_block_revisits", "parked_pool_refusals", "parked_pool_trimmed_cells", "durable_upload_bytes_escalation", "placed_merge_elides" }) |name| {
+    inline for (.{ "write_through_blocks", "write_through_bytes", "write_through_fallbacks", "nt_copy_bytes", "active_block_cow_copies", "active_block_memset_elided_bytes", "active_block_ooo_runs", "active_block_run_table_completions", "overwrite_seed_deferred", "overwrite_seed_materialized", "overwrite_seed_skipped", "write_block_revisits", "parked_pool_refusals", "parked_pool_trimmed_cells", "durable_upload_bytes_escalation", "placed_merge_elides", "drain_inplace_drains", "drain_inplace_pages", "drain_inplace_dmas", "drain_inplace_write_bytes", "drain_inplace_seed_bytes", "drain_inplace_declines", "drain_inplace_dma_errors" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, @field(stats, name).load() });
     }
     try w.print("\"parked_full_buffer_bytes\":{d},\"parked_buffers\":{d},", .{ stats.parked_full_buffer_bytes.load(), stats.parked_buffers.load() });
@@ -1187,6 +1203,9 @@ fn clearInflight(table: *Table, deps: UploadDeps, io: Io, ino: u64, block: u32) 
 /// An extent entry folds IN PLACE when its block is a sole-owner
 /// passthrough mapping (§J.1 landing 2: the touched pages, nothing else,
 /// no upload); else it escalates (seeded whole for a CoW base) and uploads.
+/// A deferred full buffer over the same kind of mapping drains IN PLACE
+/// the same way (`drainInPlaceLocked`, decision 0003 §AK): an extending
+/// append's drain is its 1–2 touched pages, never the block.
 pub fn flushParkedBlock(table: *Table, deps: UploadDeps, io: Io, ino: u64, block: u32) Disposition {
     const bs: u64 = table.block_size;
     {
@@ -1208,6 +1227,10 @@ pub fn flushParkedBlock(table: *Table, deps: UploadDeps, io: Io, ino: u64, block
             stats.durable_upload_bytes_escalation.add(bs);
         }
         if (!e.content_valid) {
+            if (drainInPlaceLocked(table, deps, e)) |d| {
+                if (d == .published) table.capacity.notifyWaiters(io);
+                return d;
+            }
             // The complement's base is the write-side authority's key NOW
             // (module doc): an epoch's newest shadow, else the map's.
             const base: ?Binding = if (e.seed == .deferred) deps.epochs.baseBinding(deps.map, ino, block) else null;
@@ -1362,6 +1385,104 @@ fn foldInPlaceLocked(table: *Table, deps: UploadDeps, e: *Entry) ?Disposition {
     extent.stats.fold_inplace_pages.add(x.pageCount());
     extent.stats.fold_inplace_write_bytes.add(written);
     extent.noteFold(x.count());
+    table.retire(e);
+    return .published;
+}
+
+/// Decision 0003 §AK, under the caller's (3): a DEFERRED full buffer (its
+/// complement still the device's — a stream-adjacent append into a mapped
+/// tail block, a partial sequential overwrite) over a block W1's state half
+/// passes for drains IN PLACE at the page grain, as the W2 fold does: the
+/// covered runs widened to pages, each partial page's other bytes read back
+/// from the mapping into the cell (the edge seed: a page at each end of a
+/// run at most, `seed ≤ written`), ONE DMA per contiguous page run from the
+/// cell, then the W1 postlude; the entry retires. Device bytes = the touched
+/// pages, so an extending append of `u` bytes costs `pages(u, 1) × P` —
+/// against `B` written + `B` read by the whole-block upload this replaces
+/// (rung-10 dev perf §10.4: 1,602 MB for 36 KB). The crash law is W1's: an
+/// edge page's untouched bytes are rewritten with themselves, so a kill at
+/// any grain leaves every old byte intact and each written byte old or new;
+/// the cell's uncovered (recycled) bytes never reach the device. Null =
+/// declined (`drain_inplace_declines`: transformed, shared, epoch-bound, an
+/// open overlay record, unmapped, no custody probe bound) — the whole-block
+/// arm. A failed seed read or DMA leaves the entry PARKED, counted and loud.
+fn drainInPlaceLocked(table: *Table, deps: UploadDeps, e: *Entry) ?Disposition {
+    assert(e.repr == .full);
+    if (e.content_valid or e.seed != .deferred) return null;
+    const probe = deps.custody orelse return null;
+    const pdeps: sole_owner_patch.Deps = .{ .device = deps.device, .map = deps.map, .vols = deps.vols, .purge = deps.purge, .custody = probe, .touched = if (deps.touched) |t| .{ .ctx = deps.touched_ctx, .stamp = t } else null };
+    const begun = switch (sole_owner_patch.beginInPlace(pdeps, e.key.ino, e.key.block, 0) catch {
+        stats.drain_inplace_declines.inc();
+        return null;
+    }) {
+        .begun => |b| b,
+        .declined => {
+            stats.drain_inplace_declines.inc();
+            return null;
+        },
+    };
+    // The edge seed writes into the cell's gaps: the cell must be ours alone
+    // (a reader's snapshot keeps its own; it never reads a gap).
+    const cell = table.pool.uniqueOrCopy(e.repr.full, &e.coverage) orelse {
+        sole_owner_patch.abandonInPlace(pdeps, begun);
+        return .stay_parked;
+    };
+    e.repr = .{ .full = cell };
+    var runs_buf: [CoverageUnion.max_runs]cov.Run = undefined;
+    const runs = e.coverage.runsSorted(&runs_buf);
+    // A page run per run of touched pages (ascending; abutting runs merge).
+    var page_runs: [CoverageUnion.max_runs]cov.Run = undefined;
+    var n_runs: usize = 0;
+    var last_edge: ?u32 = null;
+    var seeded: u64 = 0;
+    var page: [PAGE]u8 align(PAGE) = undefined;
+    for (runs) |r| {
+        if (r.len() == 0) continue;
+        const ps: u32 = @intCast(derive.alignDown(r.start, PAGE));
+        const pe: u32 = @intCast(derive.alignUp(r.end, PAGE));
+        for ([2]u32{ ps, pe - PAGE }) |pg| {
+            if (last_edge != null and last_edge.? >= pg) continue;
+            last_edge = pg;
+            if (e.coverage.contains(pg, pg + PAGE)) continue;
+            deps.device.read(begun.vol_tag, begun.dest + pg, &page) catch |err| {
+                sole_owner_patch.abandonInPlace(pdeps, begun);
+                stats.drain_inplace_dma_errors.inc();
+                log.err("in-place drain ino {d} block {d}: the edge seed read of page {d} failed ({s}) — the block stays parked", .{ e.key.ino, e.key.block, pg / PAGE, @errorName(err) });
+                return .stay_parked;
+            };
+            var covered_buf: [CoverageUnion.max_runs]cov.Run = undefined;
+            var cursor = pg;
+            for (e.coverage.coveredRunsIn(pg, pg + PAGE, &covered_buf)) |c| {
+                if (c.start > cursor) @memcpy(cell.data[cursor..c.start], page[cursor - pg .. c.start - pg]);
+                cursor = @max(cursor, c.end);
+            }
+            if (cursor < pg + PAGE) @memcpy(cell.data[cursor .. pg + PAGE], page[cursor - pg ..]);
+            seeded += PAGE;
+        }
+        if (n_runs != 0 and page_runs[n_runs - 1].end >= ps) {
+            page_runs[n_runs - 1].end = @max(page_runs[n_runs - 1].end, pe);
+        } else {
+            page_runs[n_runs] = .{ .start = ps, .end = pe };
+            n_runs += 1;
+        }
+    }
+    stats.drain_inplace_seed_bytes.add(seeded);
+    var written: u64 = 0;
+    var dma: seams.DmaError!void = {};
+    for (page_runs[0..n_runs]) |pr| {
+        dma = if (deps.device.write(begun.vol_tag, begun.dest + pr.start, cell.data[pr.start..pr.end])) |_| {} else |err| err;
+        if (dma) |_| {
+            written += pr.len();
+            stats.drain_inplace_dmas.inc();
+        } else |_| break;
+    }
+    stats.drain_inplace_write_bytes.add(written);
+    sole_owner_patch.finishInPlace(pdeps, begun, dma, "in-place drain") catch {
+        stats.drain_inplace_dma_errors.inc();
+        return .stay_parked;
+    };
+    stats.drain_inplace_drains.inc();
+    stats.drain_inplace_pages.add(written / PAGE);
     table.retire(e);
     return .published;
 }

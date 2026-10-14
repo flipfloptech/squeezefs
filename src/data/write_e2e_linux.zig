@@ -300,7 +300,7 @@ test "e2e(nvme_dev): a 4 MiB sequential write through accumulation is 1 copy + 1
 /// never engages; `durable_upload_bytes_escalation` is a subset of
 /// `write_through_bytes` and is not summed twice).
 fn deviceWriteBytes() u64 {
-    return accumulate.stats.write_through_bytes.load() + extent.stats.fold_inplace_write_bytes.load() + sole_owner_patch.stats.patch_write_bytes.load() + device_overlay.stats.overlay_store_bytes.load();
+    return accumulate.stats.write_through_bytes.load() + extent.stats.fold_inplace_write_bytes.load() + accumulate.stats.drain_inplace_write_bytes.load() + sole_owner_patch.stats.patch_write_bytes.load() + device_overlay.stats.overlay_store_bytes.load();
 }
 
 test "e2e(nvme_dev): the W2 amplification law at the 4 MiB block (repro-port: fstests generic/074 `fstest -F -b 512`, 128× on c36b531): 512 B writes at a 1 KiB stride extending a fresh file land each block ONCE at release (device bytes == blocks × 4 MiB = 2× the user bytes, one DMA per block, zero reads) and read back byte-exact; sector writes into 4 scattered pages of a published block fold IN PLACE as 4 page DMAs (16 KiB, the 8× bound) with the binding unchanged" {
@@ -379,6 +379,56 @@ test "e2e(nvme_dev): the W2 amplification law at the 4 MiB block (repro-port: fs
         fillPattern(&sector, pg * PAGE); // the page's first sector: the row-1 pattern, seeded back in place
         try testing.expectEqualSlices(u8, &sector, got[pg * PAGE .. pg * PAGE + 512]);
     }
+}
+
+test "e2e(nvme_dev): an extending append's drain on a cache-less set (rung-10 dev perf §10.4: 1.6 GB of device writes for 36 KB of appends) — a 10,000 B file's tail block lands once whole (the hole law), then 200 stream-adjacent 72 B appends, each drained at its close, land as ONE DMA of their touched pages: device bytes per drain = pages × 4 KiB (≤ the §J in-place bound for 72 B) against the 4 MiB block per drain before, the binding unchanged, every byte exact on the device" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+    var e: E2E = .{};
+    e.init(gpa, false) catch |err| switch (err) {
+        error.DirectIoUnsupported, error.DirectOpenRefused => return testkit.skip(@src(), .no_device, "the venue's filesystem refuses O_DIRECT"),
+        else => return err,
+    };
+    defer e.deinit();
+    const got = try gpa.alloc(u8, BS);
+    defer gpa.free(got);
+    try e.map.create(3, .striped, 0);
+    var head: [10_000]u8 = undefined;
+    fillPattern(&head, 77);
+    _ = try e.wp.write(io, .{ .ino = 3, .offset = 0, .payload = .{ .bytes = &head }, .class = .entire_op, .file = E2E.striped(0) });
+    const hole0 = deviceWriteBytes();
+    e.wp.flushIno(io, 3);
+    try testing.expectEqual(BS, deviceWriteBytes() - hole0); // the hole block's one landing
+    const m = e.map.seam().lookup(3, 0).?;
+    var size: u64 = head.len;
+    var line: [72]u8 = undefined;
+    const appends = 200;
+    var device: u64 = 0;
+    var i: u64 = 0;
+    while (i < appends) : (i += 1) {
+        fillPattern(&line, 1000 + i);
+        const o = try e.wp.write(io, .{ .ino = 3, .offset = size, .payload = .{ .bytes = &line }, .class = .entire_op, .file = E2E.striped(size) });
+        try testing.expectEqual(@as(u32, 1), o.count(.accumulate_park));
+        const dev0 = deviceWriteBytes();
+        const puts0 = nvme_dev.stats.put_obj.load();
+        e.wp.flushIno(io, 3); // the close's drain
+        const pages = (std.mem.alignForward(u64, size + line.len, PAGE) - std.mem.alignBackward(u64, size, PAGE)) / PAGE;
+        try testing.expectEqual(pages * PAGE, deviceWriteBytes() - dev0);
+        try testing.expectEqual(puts0 + 1, nvme_dev.stats.put_obj.load());
+        try testing.expect((deviceWriteBytes() - dev0) * 1_000_000 / line.len <= extent.inPlaceBoundPpm(line.len, 1));
+        device += deviceWriteBytes() - dev0;
+        size += line.len;
+    }
+    std.debug.print("\ne2e[append drain]: {d} appends of {d} B ({d} B) drained as {d} B of page DMAs (×{d:.1} per appended byte; the whole-block drain was ×{d})\n", .{ appends, line.len, appends * line.len, device, @as(f64, @floatFromInt(device)) / @as(f64, @floatFromInt(appends * line.len)), BS / line.len });
+    try testing.expect(e.map.seam().lookup(3, 0).?.eql(m));
+    try e.readAt(got, m.offset);
+    try testing.expectEqualSlices(u8, &head, got[0..head.len]);
+    i = 0;
+    while (i < appends) : (i += 1) {
+        fillPattern(&line, 1000 + i);
+        try testing.expectEqualSlices(u8, &line, got[head.len + i * line.len ..][0..line.len]);
+    }
+    try testing.expect(std.mem.allEqual(u8, got[size..], 0)); // the hole landing's zeros past EOF
 }
 
 test "e2e(nvme_dev): the overlay arm — four 1 MiB page-aligned pieces of a fresh block ride the overlay with ZERO userspace copies and four DMAs; the drain publishes once; an aligned 1 MiB overwrite of the published block installs an overwrite record, seeds the gaps RANGED and feeds the epoch" {

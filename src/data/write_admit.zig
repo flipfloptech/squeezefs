@@ -1758,10 +1758,14 @@ test "the extending append's drain on a cache-less set (rung-10 dev perf §10.4:
     const used = w.f.alloc_a.usedBlocks();
     const merges = w.f.map.merges.items.len;
     const wt0 = accumulate.stats.write_through_bytes.load();
+    const ip0 = accumulate.stats.drain_inplace_write_bytes.load();
+    const seed0 = accumulate.stats.drain_inplace_seed_bytes.load();
+    const drains0 = accumulate.stats.drain_inplace_drains.load();
     // EOF inside the tail block: the bytes past it are the old image's.
     const eof0: u64 = 10_000;
     var size = eof0;
     var line: [72]u8 = undefined;
+    var device: u64 = 0;
     var i: u8 = 0;
     while (i < 60) : (i += 1) {
         fill(&line, i);
@@ -1774,6 +1778,7 @@ test "the extending append's drain on a cache-less set (rung-10 dev perf §10.4:
         try testing.expectEqual(pages * PAGE, w.f.dev.writeBytesTotal());
         try testing.expect(w.f.dev.read_bytes <= w.f.dev.writeBytesTotal());
         try testing.expect(w.f.dev.writeBytesTotal() * 1_000_000 / line.len <= extent.inPlaceBoundPpm(line.len, 1));
+        if (i != 0) device += w.f.dev.writeBytesTotal();
         size += line.len;
     }
     try testing.expectEqual(wt0, accumulate.stats.write_through_bytes.load());
@@ -1782,6 +1787,12 @@ test "the extending append's drain on a cache-less set (rung-10 dev perf §10.4:
     try testing.expectEqual(@as(usize, 0), w.f.frees.freed.items.len);
     try testing.expect(w.f.map.seam().lookup(44, 0).?.eql(a));
     try testing.expect(block_alloc.Incarnation.isStable(w.f.alloc_a.incarnationWord(w.f.alloc_a.idxOf(a.offset))));
+    // The first append is not stream-adjacent (the W2 fold's arm); the 59
+    // after it are the accumulation arm's, each drained in place: the
+    // closure `drain_inplace_write_bytes ≡` their device bytes.
+    try testing.expectEqual(drains0 + 59, accumulate.stats.drain_inplace_drains.load());
+    try testing.expectEqual(device, accumulate.stats.drain_inplace_write_bytes.load() - ip0);
+    try testing.expect(accumulate.stats.drain_inplace_seed_bytes.load() - seed0 <= device);
     var got: [wt.BS]u8 = undefined;
     w.f.dev.peek(a.vol_tag, a.offset, &got);
     try testing.expect(std.mem.allEqual(u8, got[0..eof0], 0xAA));

@@ -376,12 +376,15 @@ pub const StatsTerms = struct {
     /// 6.09 GB against diskstats 1.025 × user on a 22.28 GB row) and is
     /// read BESIDE, never summed. `write_through_bytes` is EVERY parked
     /// full buffer's upload; `durable_upload_bytes_escalation` is its
-    /// flush-time-complement subset (beside).
-    pub const device_write_keys = [_][]const u8{ "overlay_store_bytes", "patch_write_bytes", "own_block_dma_bytes", "write_through_bytes", "durable_upload_bytes_writeback", "fold_inplace_write_bytes" };
+    /// flush-time-complement subset (beside). The two in-place arms land
+    /// pages at a mapping the file owns alone: the W2 fold's and the
+    /// deferred full buffer's drain (decision 0003 §AK).
+    pub const device_write_keys = [_][]const u8{ "overlay_store_bytes", "patch_write_bytes", "own_block_dma_bytes", "write_through_bytes", "durable_upload_bytes_writeback", "fold_inplace_write_bytes", "drain_inplace_write_bytes" };
     /// The device-write REQUEST arms (brk.py `DEVICE_WRITE_REQS`): `put_obj`
     /// is the block layer's put (an overlay store IS a put, never summed
     /// twice); a W1 patch DMA, a W2 in-place page DMA and an own-block DMA
-    /// bypass it.
+    /// bypass it. The in-place drain's page DMAs ride the put (`put_obj`
+    /// counts each; brk.py reads `drain_inplace_dmas` beside).
     pub const device_write_req_keys = [_][]const u8{ "patch_writes", "own_block_dmas", "put_obj", "fold_inplace_dmas" };
     pub const admission_keys = [_][]const u8{ "admit_write_overlay_bytes", "admit_write_inplace_bytes", "admit_write_accumulate_bytes", "admit_write_inline_bytes" };
     /// The META device's write arms (decision 0003 §L; brk.py

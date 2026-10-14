@@ -1360,7 +1360,7 @@ fn expectSameNames(gpa: std.mem.Allocator, label: []const u8, ours: []const []co
     }
 }
 
-test "bracket ledger pin: bench.zig's device-write, request, admission, read-copy, device-read and tick term lists equal brk.py's (the harness's lists were checked against /proc/diskstats; bench follows them)" {
+test "bracket ledger pin: bench.zig's device-write, request, admission, read-copy, device-read and tick term lists equal brk.py's (the harness's lists were checked against /proc/diskstats; bench follows them); both in-place arms are device-write byte arms and the drain's page DMAs are read beside the put" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     const text = try std.Io.Dir.cwd().readFileAlloc(io, brk_path, gpa, .limited(1 << 20));
@@ -1399,6 +1399,18 @@ test "bracket ledger pin: bench.zig's device-write, request, admission, read-cop
     try std.testing.expect(rewrite_beside and lease_beside);
     for (bench.StatsTerms.device_write_keys) |k| try std.testing.expect(!std.mem.eql(u8, k, "rewrite_device_write_bytes"));
     for (bench.StatsTerms.read_copy_keys) |k| try std.testing.expect(!std.mem.eql(u8, k, "read_dest_lease_bytes"));
+    // Both in-place arms are byte arms (decision 0003 §J.1 landing 2, §AK):
+    // an arm the ledger omits reads its device bytes as zero. The drain's
+    // page DMAs ride the block layer's put, so its request count is beside.
+    for ([_][]const u8{ "fold_inplace_write_bytes", "drain_inplace_write_bytes" }) |arm| {
+        var named = false;
+        for (bench.StatsTerms.device_write_keys) |k| named = named or std.mem.eql(u8, k, arm);
+        try std.testing.expect(named);
+    }
+    var drain_dmas_beside = false;
+    for (beside_w) |n| drain_dmas_beside = drain_dmas_beside or std.mem.eql(u8, n, "drain_inplace_dmas");
+    try std.testing.expect(drain_dmas_beside);
+    for (bench.StatsTerms.device_write_req_keys) |k| try std.testing.expect(!std.mem.eql(u8, k, "drain_inplace_dmas"));
     // The device-read ledger's TOTAL (the plane's choke point) and the WHERE
     // partition are BESIDE in both: summing them would double every byte.
     const beside_dr = try pyListNames(gpa, text, "DEVICE_READ_BESIDE");

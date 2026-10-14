@@ -6357,12 +6357,18 @@ fn dataPlanePass(rig: *Rig, cache: bool) !void {
         printRates(label, tail);
         const striped = numberAfter(tail, "\"fuse_write_striped\":") orelse 0;
         const staged = numberAfter(tail, "\"fuse_write_staged\":") orelse 0;
-        const promotions = numberAfter(tail, "\"fuse_write_promotions_to_striped\":") orelse 0;
+        const promotions = promotionsToStriped(tail);
         const clips = numberAfter(tail, "\"fuse_truncate_striped_clips\":") orelse 0;
-        // Two striped shrinks in stage C: `big` 200 → 150 MiB and `shrunk` 8 MiB → 1.3 MB.
-        std.debug.print("smoke[{s}]: write routing striped {d} / staged {d}, promotions to striped {d}, striped clips {d}\n", .{ label, striped, staged, promotions, clips });
+        // Every big file (`big`, the cp, the storm's) left the ring for its
+        // own block exactly once — by its next write past the block (the
+        // filesystem's promotion) or by the plane's promotion dispatch at
+        // ring pressure or fsync, whichever ran first (the race is the
+        // schedule's: the storm's ring pressure promotes residents before
+        // their writers' next write). Two striped shrinks in stage C: `big`
+        // 200 → 150 MiB and `shrunk` 8 MiB → 1.3 MB.
+        std.debug.print("smoke[{s}]: write routing striped {d} / staged {d}, promotions to striped {d} by the write path + {d} by the plane's dispatch, striped clips {d}\n", .{ label, striped, staged, promotions.by_write, promotions.by_plane, clips });
         try testing.expect(striped > 0);
-        try testing.expect(promotions >= 1 + 1 + storm_files);
+        try testing.expect(promotions.total() >= 1 + 1 + storm_files);
         try testing.expectEqual(@as(u64, 2), clips);
         if (cache) {
             try testing.expect(staged >= small_files_staged);
@@ -6575,6 +6581,22 @@ test "smoke: KERNEL AIO on the plain mount (no shim): io_submit of 8 × 4 KiB PW
     }
 }
 
+/// The promotions a file takes out of the ring (or inline) to its own
+/// block: the filesystem's at a write past the block, the plane's dispatch
+/// (ring pressure, fsync, dismount) onto its own-block arm.
+const Promotions = struct {
+    by_write: u64,
+    by_plane: u64,
+
+    fn total(self: Promotions) u64 {
+        return self.by_write + self.by_plane;
+    }
+};
+
+fn promotionsToStriped(tail: []const u8) Promotions {
+    return .{ .by_write = numberAfter(tail, "\"fuse_write_promotions_to_striped\":") orelse 0, .by_plane = numberAfter(tail, "\"layout_promoted_block\":") orelse 0 };
+}
+
 // The looped single-stage repro (`SQUEEZEFS_TEST_SMOKE_STAGE_LOOPS=N`):
 // the cache-path set, `big` laid down and shaped once, then N passes of
 // the 4 KiB overwrite stage (distinct source pages each pass, `cmp`
@@ -6622,8 +6644,18 @@ test "smoke: the cache-path overwrite and storm stages LOOPED — 0 lost overwri
         try expectOpLatencyWithin(tail, op_latency_bound);
         std.debug.print("smoke[loop]: overwrite pass {d}/{d}: image-exact in {d} ms; drift {d}, untracked frees {d}, channel ticks {d}, watchdog overdue {d}\n", .{ pass + 1, loops, (clock.monotonicNs() - t0) / std.time.ns_per_ms, numberAfter(tail, "\"rewrite_shadow_displaced_drift\":") orelse 0, numberAfter(tail, "\"block_untracked_free_refusals\":") orelse 0, numberAfter(tail, "\"channel_ticked_reregisters\":") orelse 0, numberAfter(tail, "\"fuse_op_watchdog_overdue\":") orelse 0 });
     }
+    // Every storm pass writes FRESH files (the previous pass's removed
+    // first: the storm's destroys ride the loop too), so each pass takes
+    // its eight promotions out of the ring, by either arm.
     pass = 0;
+    var promoted = blk: {
+        const tail = try rig.quiescentStatsTail();
+        defer gpa.free(tail);
+        break :blk promotionsToStriped(tail);
+    };
     while (pass < loops) : (pass += 1) {
+        const rm = try rig.onMountTimed("rm -f storm0 storm1 storm2 storm3 storm4 storm5 storm6 storm7\nsync -f .\n", stage_loop_timeout_s);
+        gpa.free(rm);
         const t0 = clock.monotonicNs();
         const out = try rig.onMountTimed(stage_storm_script, stage_loop_timeout_s);
         defer gpa.free(out);
@@ -6633,7 +6665,10 @@ test "smoke: the cache-path overwrite and storm stages LOOPED — 0 lost overwri
         try expectMustStayZero(tail);
         try expectLedgersClosed(tail);
         try expectOpLatencyWithin(tail, op_latency_bound);
-        std.debug.print("smoke[loop]: storm pass {d}/{d}: {d} MB/s aggregate in {d} ms; channel ticks {d}, watchdog overdue {d}, joins {d}, close waits {d}\n", .{ pass + 1, loops, mbPerS(out, "storm_ns=", storm_files * (storm_mib << 20)), (clock.monotonicNs() - t0) / std.time.ns_per_ms, numberAfter(tail, "\"channel_ticked_reregisters\":") orelse 0, numberAfter(tail, "\"fuse_op_watchdog_overdue\":") orelse 0, numberAfter(tail, "\"write_pipeline_joins\":") orelse 0, numberAfter(tail, "\"rewrite_shadow_close_waits\":") orelse 0 });
+        const now = promotionsToStriped(tail);
+        try testing.expect(now.total() - promoted.total() >= storm_files);
+        std.debug.print("smoke[loop]: storm pass {d}/{d}: {d} MB/s aggregate in {d} ms; promotions {d} by the write path + {d} by the plane; channel ticks {d}, watchdog overdue {d}, joins {d}, close waits {d}\n", .{ pass + 1, loops, mbPerS(out, "storm_ns=", storm_files * (storm_mib << 20)), (clock.monotonicNs() - t0) / std.time.ns_per_ms, now.by_write - promoted.by_write, now.by_plane - promoted.by_plane, numberAfter(tail, "\"channel_ticked_reregisters\":") orelse 0, numberAfter(tail, "\"fuse_op_watchdog_overdue\":") orelse 0, numberAfter(tail, "\"write_pipeline_joins\":") orelse 0, numberAfter(tail, "\"rewrite_shadow_close_waits\":") orelse 0 });
+        promoted = now;
     }
     try rig.umount();
     try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());

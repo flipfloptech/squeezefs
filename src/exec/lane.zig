@@ -1033,8 +1033,19 @@ test "pluggable_park_never_loses_a_wake: 2000 spawns from 4 threads all complete
 }
 
 test "SQUEEZEFS_TEST_EXEC_DROP_WAKE: a dropped eventfd write is healed by the park tick, counted once, and the lane stays responsive afterwards" {
+    const rescues_before = stats.lane_tick_rescues.load();
+    // Timed from BEFORE the lane exists: its park (and so its tick) starts
+    // after this read, so a test thread descheduled between the lane's
+    // start and the spawn only lengthens the wait (timed from the spawn,
+    // such a stall read as an early tick).
+    const t0 = clock.monotonicNs();
     const l = try testLane(.meta, 8, true);
     defer l.deinit();
+    // The spawn must find the lane IN its park: an idle lane's first two
+    // enters are its park's submit and wait, both past its inbox scan. A
+    // spawn landing before (a loaded host delays the lane's first pass) is
+    // handled by that scan and never needs the tick.
+    while (l.enters() < 2) std.Thread.yield() catch {};
     var g = membersGroup(2);
     var p: Probe = .{};
     const S = struct {
@@ -1042,8 +1053,6 @@ test "SQUEEZEFS_TEST_EXEC_DROP_WAKE: a dropped eventfd write is healed by the pa
             ctxOf(context).probe.finish();
         }
     };
-    const rescues_before = stats.lane_tick_rescues.load();
-    const t0 = clock.monotonicNs();
     _ = try spawnTest(l, &g, S.run, .{ .probe = &p, .lane = l });
     p.waitDone();
     const waited = clock.monotonicNs() - t0;

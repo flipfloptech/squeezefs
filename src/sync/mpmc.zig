@@ -227,23 +227,29 @@ test "a pool free list at its population: two threads cycling pop → push over 
     defer q.deinit(testing.allocator);
     var i: u32 = 0;
     while (i < 8) : (i += 1) try testing.expect(q.tryPush(i));
+    // Each thread cycles its 200 k rounds, then keeps cycling until a
+    // refusal has been seen by either (at most 50× the rounds): the race
+    // needs both threads ON CPU together, which a loaded host can deny for
+    // a whole 200 k-round run (a shard of the sharded gate saw zero).
     const Cycler = struct {
         refused: std.atomic.Value(u64) = .init(0),
-        fn run(self: *@This(), queue: *Q, rounds: u32) void {
+        fn run(self: *@This(), queue: *Q, rounds: u32, any: *std.atomic.Value(u64)) void {
             var r: u32 = 0;
-            while (r < rounds) : (r += 1) {
+            while (r < rounds or (any.load(.monotonic) == 0 and r < 50 * rounds)) : (r += 1) {
                 const v = queue.tryPop() orelse continue;
                 if (!queue.tryPush(v)) {
                     _ = self.refused.fetchAdd(1, .monotonic);
+                    _ = any.fetchAdd(1, .monotonic);
                     queue.pushSpin(v);
                 }
             }
         }
     };
+    var any: std.atomic.Value(u64) = .init(0);
     var a: Cycler = .{};
     var b: Cycler = .{};
-    const ta = try std.Thread.spawn(.{}, Cycler.run, .{ &a, &q, 200_000 });
-    const tb = try std.Thread.spawn(.{}, Cycler.run, .{ &b, &q, 200_000 });
+    const ta = try std.Thread.spawn(.{}, Cycler.run, .{ &a, &q, 200_000, &any });
+    const tb = try std.Thread.spawn(.{}, Cycler.run, .{ &b, &q, 200_000, &any });
     ta.join();
     tb.join();
     // Nothing lost: all eight slots are back.

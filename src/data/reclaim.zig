@@ -1955,11 +1955,18 @@ test "the debt drainer: idle drains elided debt past the watermark to zero with 
     var f = try Fixture.init(.{ .budget_bytes = test_budget, .batch_ms = 0 }, .bdev_discard, 8);
     defer f.deinit();
     try f.mintPublished(8);
-    try f.r.start(io);
     const passes0 = stats.block_free_debt_drain_passes.load();
+    // Both frees land BEFORE the drainer starts (the first free's wake is a
+    // stored permit): its first pass finds [2,3] whole. Started first, a
+    // drainer scheduled between the two frees trimmed [2] alone — the one
+    // command below then read two under a loaded host.
     for ([_]u64{ 2, 3 }) |idx| try testing.expectEqual(FreeOutcome.terminal, f.r.freeBlock(io, 0, idx, f.alloc.stampOf(idx)));
+    try f.r.start(io);
+    // Settled = the debt cancelled AND the claims returned: a pass cancels
+    // the debt BEFORE it issues the command and returns the claims after,
+    // so a wait on the debt alone read the command list mid-pass.
     var spins: u32 = 0;
-    while (f.alloc.elidedDebtBytes() != 0 and spins < 2000) : (spins += 1) stallMs(io, 5);
+    while ((f.alloc.elidedDebtBytes() != 0 or f.alloc.trimClaimed() != 0) and spins < 2000) : (spins += 1) stallMs(io, 5);
     try testing.expectEqual(@as(u64, 0), f.alloc.elidedDebtBytes());
     try testing.expect(stats.block_free_debt_drain_passes.load() > passes0);
     try testing.expectEqual(@as(usize, 1), f.rec.commands.items.len); // [2,3] as one trim command
@@ -1970,7 +1977,7 @@ test "the debt drainer: idle drains elided debt past the watermark to zero with 
     // the volume's first free alone.
     try testing.expectEqual(FreeOutcome.terminal, f.r.freeBlock(io, 0, 5, f.alloc.stampOf(5)));
     spins = 0;
-    while (f.alloc.elidedDebtBytes() != 0 and spins < 2000) : (spins += 1) stallMs(io, 5);
+    while ((f.alloc.elidedDebtBytes() != 0 or f.alloc.trimClaimed() != 0) and spins < 2000) : (spins += 1) stallMs(io, 5);
     f.r.stopAndJoin(io);
     try testing.expectEqual(@as(u64, 0), f.alloc.elidedDebtBytes());
     try testing.expectEqual(@as(usize, 2), f.rec.commands.items.len);

@@ -5827,7 +5827,7 @@ const bench_terms = @import("bench.zig").StatsTerms;
 /// O_APPEND write (one drain per append).
 const xform_appends = 40;
 
-test "smoke: THE TRANSFORMED APPEND on a set without a cache path (decision 0003 §AK) — lz4, then aes-256-gcm: a file past the inline bound grows by 40 fsync'd 72 B appends and reads back exact (the write side seeded a transformed block's image through a block-sized buffer the chunk-sized read window refused: EIO at the first write past 4 KiB); a transformed block cannot be patched in place, so each drain lands the block's framed image whole — trimmed to its live bytes: ≤ the stored bound of the file's bytes per drain (12,288 B on aes-256-gcm for a 7,880 B file), where the untrimmed image of an encrypted set was the whole block; a read past the image's plaintext within EOF serves zeros" {
+test "smoke: THE TRANSFORMED APPEND on a set without a cache path (decision 0003 §AK) — lz4, then aes-256-gcm: a file past the inline bound grows by 40 fsync'd 72 B appends and reads back exact (the write side seeded a transformed block's image through a block-sized buffer the chunk-sized read window refused: EIO at the first write past 4 KiB); a transformed block cannot be patched in place, so each drain lands the block's framed image whole — trimmed to its live bytes: ≤ the stored bound of the file's bytes per drain (8,192 B on aes-256-gcm for a 7,880 B file), where the untrimmed image of an encrypted set was the whole block; a read past the image's plaintext within EOF serves zeros" {
     const io = testing.io;
     if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
     const gpa = testing.allocator;

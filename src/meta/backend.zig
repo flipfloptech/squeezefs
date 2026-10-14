@@ -2011,7 +2011,7 @@ pub const KvBackend = struct {
 
     /// Every node of `t` (the root, every interior, every leaf) as heap
     /// extents, through the tree's own latch-free snapshots.
-    fn collectTreeExtents(be: *KvBackend, t: *KvTree, out: *std.ArrayList(u64)) Error!void {
+    pub fn collectTreeExtents(be: *KvBackend, t: *KvTree, out: *std.ArrayList(u64)) Error!void {
         const gpa = be.gpa;
         var stack: std.ArrayList(u64) = .empty;
         defer stack.deinit(gpa);

@@ -183,6 +183,138 @@ test "linux: THE CACHE BARRIER AT A LEASE MOVE (0003 §X.5; found by the online 
 }
 
 // ---------------------------------------------------------------------------
+// THE CUSTODY OF A MOVED TREE'S IMAGES (charter §5.5 "Extent grants": the
+// grant is a POOL, retired images recycle; 0003 §AD). Found by the shared
+// hot directory row: B took `hot`'s slot by handover, its SMOs retired the
+// images A had written the tree with, and B's grant mirror recycled them
+// into B's pool — extents B's record never held. B's next claim of one was
+// an `alloc` its recovery refused (`meta_kv_replay_extent_violations`); a
+// surplus withdrawal of one returned an extent the record did not name
+// (`extent_grant_closure_violations`, and the extent lost to every pool).
+// ---------------------------------------------------------------------------
+
+const cr = @import("control_records.zig");
+const smo = @import("../smo.zig");
+
+/// The manager's record of `appender_id`'s grant as runs (empty: none).
+fn grantRecordOf(gpa: std.mem.Allocator, be: *KvBackend, appender_id: u32) !std.ArrayList(cr.GrantRun) {
+    var runs: std.ArrayList(cr.GrantRun) = .empty;
+    errdefer runs.deinit(gpa);
+    const raw = (try be.lookup(gpa, key.TREE_CONTROL, cr.extentGrantKey(appender_id).slice())) orelse return runs;
+    defer gpa.free(raw);
+    const d = try cr.decodeExtentGrant(raw);
+    try runs.resize(gpa, d.n_runs);
+    _ = d.collect(runs.items);
+    return runs;
+}
+
+fn runsContain(runs: []const cr.GrantRun, e: u64) bool {
+    for (runs) |r| if (r.contains(e)) return true;
+    return false;
+}
+
+/// `n` records of `slot` committed by its lessee `be`, 64 to an entry.
+fn fillSlot(be: *KvBackend, slot: u16, n: usize, value: []const u8) !void {
+    var done: usize = 0;
+    while (done < n) {
+        const t = try be.begin(@src());
+        var i: usize = 0;
+        while (i < 64 and done < n) : ({
+            i += 1;
+            done += 1;
+        }) {
+            const local = try be.allocateInoInSlot(slot);
+            try t.stagePut(key.TREE_INODES, &key.inodeKey(key.guestLocalIno(slot, local)), value);
+        }
+        try be.commit(t);
+    }
+}
+
+test "linux: THE CUSTODY OF A MOVED TREE'S IMAGES (charter §5.5 'Extent grants', 0003 §AD; found by the shared hot directory row — a joiner's recovery refused an `alloc` outside its grant, a joiner's surplus return named an extent its grant did not hold): A grows a tree in a slot it leases; B takes the slot and its grant record gains every image of the tree in the grant's entry; B compacts one of A's leaves and its pool recycles the retired image — every extent B's pool can hand out (a claim, a surplus withdrawal) is one B's record grants; B leaves and its record names no image of the tree it released" {
+    const gpa = testing.allocator;
+    const s = try meta_set.TestSet.create(gpa, "image-custody", 1);
+    defer s.destroy();
+    try s.env.put("SQUEEZEFS_MW_BIND", "127.0.0.1:0");
+    const set = try s.open();
+    defer set.close();
+    var locks = try dlm.Manager.init(gpa, 64);
+    defer locks.deinit();
+    const bound = try xv.set_bind.Bound.create(gpa, s.io(), set, &locks, &s.env);
+    defer bound.destroy(gpa);
+    const plane = (try wire_plane.WirePlane.start(gpa, s.io(), set, &s.env, 4, 1 << 30, &bound.plane, false)).?;
+    defer plane.stop();
+    const be0 = set.volumes[0];
+    const slot = try managerRotorSlot(gpa, be0);
+    // A's tree of the slot: leaves under an interior root (1,500 records
+    // of 200 B over 64 KiB nodes), every image claimed from A's heap.
+    try fillSlot(be0, slot, 1500, &@as([200]u8, @splat('a')));
+    try be0.checkpointNow();
+    var images_a: std.ArrayList(u64) = .empty;
+    defer images_a.deinit(gpa);
+    try be0.collectTreeExtents(be0.slotTree(slot).?, &images_a);
+    try testing.expect(images_a.items.len >= 3);
+    var me: u32 = undefined;
+    {
+        const b = try MetaSet.open(gpa, s.io(), s.pathList(), .{ .env = &s.env, .cache_budget_bytes = 64 << 20, .cpus = 4, .join = .{ .mountpoint = "/build/tmp/mnt-image-custody-b", .endpoint = plane.advertised } });
+        defer b.close();
+        const bj = b.volumes[0];
+        me = bj.joined.?.appenderId();
+        try testing.expectEqual(acquire.Verbs.OfferResult.offered, try be0.slots.verbs.offerSlot(lt.MANAGER, slot, me, std.math.maxInt(u64)));
+        const sink = bj.slots.carriageSink();
+        sink.offered(sink.ctx, slot, lt.MANAGER);
+        try testing.expect(bj.slots.table.view(slot).leasedBy(me));
+        // The grant's entry moved the tree's images into B's record.
+        {
+            var rec = try grantRecordOf(gpa, be0, me);
+            defer rec.deinit(gpa);
+            for (images_a.items) |e| try testing.expect(runsContain(rec.items, e));
+        }
+        // B compacts one of A's leaves: A's image retires through B's SMO
+        // context, the fresh image comes from B's pool.
+        const t = bj.slotTree(slot).?;
+        var tails: std.ArrayList(cr.TailEntry) = .empty;
+        defer tails.deinit(gpa);
+        try bj.collectLeafTails(t, &tails);
+        const leaf = tails.items[0].leaf_addr;
+        const retired = bj.cache.addrExtent(leaf);
+        {
+            bj.smo_lock.lockUncancelable(bj.io);
+            defer bj.smo_lock.unlock(bj.io);
+            const n = try t.getNode(leaf);
+            defer n.release();
+            var out: smo.MaintenanceOutcome = .{};
+            try testing.expect(try smo.compactForDefrag(t, &bj.smo_ctx, n, &out));
+        }
+        // B's checkpoints cover the free: the retired image leaves the
+        // coverage clock into B's pool.
+        var cycles: u32 = 0;
+        while (bj.alloc.pendingCount() != 0 and cycles < 4) : (cycles += 1) try bj.checkpointNow();
+        try testing.expectEqual(@as(u64, 0), bj.alloc.pendingCount());
+        try testing.expect(!bj.alloc.isAllocated(retired));
+        // What recovery's screen and the closure judge: every extent B's
+        // pool can hand out is one B's record grants.
+        var rec = try grantRecordOf(gpa, be0, me);
+        defer rec.deinit(gpa);
+        var e: u64 = 0;
+        while (e < bj.alloc.totalExtents()) : (e += 1) {
+            if (bj.alloc.isAllocated(e)) continue;
+            if (!runsContain(rec.items, e)) {
+                std.debug.print("\nB's pool holds extent {d} (the retired image of A's leaf is {d}) — B's record does not grant it\n", .{ e, retired });
+                return error.TestUnexpectedResult;
+            }
+        }
+    }
+    // B left (every slot released through its transfer): the tree is the
+    // manager's again, and B's record names none of its images.
+    var images_now: std.ArrayList(u64) = .empty;
+    defer images_now.deinit(gpa);
+    try be0.collectTreeExtents(be0.slotTree(slot).?, &images_now);
+    var rec = try grantRecordOf(gpa, be0, me);
+    defer rec.deinit(gpa);
+    for (images_now.items) |e| try testing.expect(!runsContain(rec.items, e));
+}
+
+// ---------------------------------------------------------------------------
 // THE MOVE MATRIX (0003 §X.1, §X.2): the filesystem over both members — A's
 // and B's planes bound the way `mount` binds them, B's behind the product's
 // move gate — and a directory of A's moving to B by a holder-decided

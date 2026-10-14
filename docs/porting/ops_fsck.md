@@ -894,7 +894,8 @@ walk's per-call law summed — `meta/merged_walk.readBound`: a call that fills i
 `walkNodeBound = height × (visited + calls)` (node reads per entry within the tree height; a call
 that delivers nothing still descends once). An fsck over N entries in D directories is therefore
 O(N) entries read and O(N × height / page) node reads for its walks plus O(height) per point probe
-(C11's owner skip-scan, one per ino) — linear, whatever D and however the names are striped.
+(a suspect's re-read; C11's owners come off a walk too, §6.2) — linear, whatever D and however the
+names are striped.
 
 Measured (venue, one flat directory, `fsck --offline`): before, the set's merged range read `max`
 from EVERY slot tree per page and kept `max` (64 trees × 512) — 29 / 235 / 2,713 / 5,736 / 9,435 ms
@@ -903,6 +904,21 @@ visited (the cap: T × page past 32 k); after, 8 / 34 / 152 / 319 / 510 ms, 0.18
 1.07 entries read per entry visited. The shared-hot-directory row's closing fsck over 52,871
 entries in one 64-stripe directory: 83.5 s → 0.79 s. Rows: `fsck/scale.zig` (2 k → 8 k names, flat
 and striped, within both bounds, 4N ≤ 4.5 × N on reads and nodes).
+
+### 6.2 The per-suspect lookups and their bound (port; decision 0003 §AC.6)
+
+A class that names something per suspect resolves it through an index built once, never a scan of
+a census list per suspect: C2-lost's owner (the derived census carries each block's first owner),
+C9's block count (an ino → bindings index of the census's owners, built at the first candidate),
+C10's distinct names (one pass over the fresh dentry pass's collected names), C17's routing check
+(every decoded map's stripes, sorted, each view looked up once), the ladder's C2-leaked / C3 / C6
+re-checks (one derivation of the fresh census per volume). C11's owners come off ONE paged walk of
+the map kind (§6.1's pager), where its owner skip-scan probed once per inode. The bound: each lookup's work ≤ 3 × its inputs
+(owners or bindings, names, views + mapped stripes + routed names, plus the suspects); C11's store
+calls ≤ the entries its walk visits / `SCAN_PAGE` + 2, plus each owner's own reads. The report:
+`c2_owner_steps`, `c9_owner_steps`, `c10_name_steps`, `c11_store_calls`, `c17_route_steps`,
+`recheck_derived_steps` (SUM-merged), the text form's `lookups:` line. Rows: `fsck/tests.zig`
+"… is linear (0003 §AC.6)" (400 fill + 60 damaged each) and `fsck/scale.zig`'s C11 bound.
 
 ## 7. Online fsck as a JOB vs offline
 

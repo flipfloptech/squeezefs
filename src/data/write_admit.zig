@@ -1745,6 +1745,121 @@ test "W2 amplification law, a mapped sole-owner passthrough block folds IN PLACE
     try testing.expectEqual(ip0 + 4 * PAGE + 4 * PAGE + PAGE, extent.stats.fold_inplace_write_bytes.load());
 }
 
+/// The pages `[off, off + len)` touches.
+fn pagesTouched(off: u64, len: u64) u64 {
+    return (std.mem.alignForward(u64, off + len, PAGE) - std.mem.alignBackward(u64, off, PAGE)) / PAGE;
+}
+
+test "the extending append's drain on a cache-less set (rung-10 dev perf §10.4: 1.6 GB of device writes for 36 KB of appends): stream-adjacent 72 B appends into a mapped sole-owner passthrough tail block, each drained at its close, land the TOUCHED pages in place — device bytes per drain = pages × P ≤ pages(u, 1) × P / u per appended byte, the partial pages' other bytes seeded back from the mapping (seed ≤ written), no whole-block upload, no map merge, no free, the binding unchanged; a page-aligned 4 KiB append lands as exactly its page with no seed" {
+    const io = testing.io;
+    const w = try World.init(testing.allocator, .sync_inline, false);
+    defer w.deinit(testing.allocator);
+    const a = try w.f.publishBlock(44, 0, 0xAA);
+    const used = w.f.alloc_a.usedBlocks();
+    const merges = w.f.map.merges.items.len;
+    const wt0 = accumulate.stats.write_through_bytes.load();
+    // EOF inside the tail block: the bytes past it are the old image's.
+    const eof0: u64 = 10_000;
+    var size = eof0;
+    var line: [72]u8 = undefined;
+    var i: u8 = 0;
+    while (i < 60) : (i += 1) {
+        fill(&line, i);
+        w.f.dev.resetLedger();
+        const o = try w.wp.write(io, .{ .ino = 44, .offset = size, .payload = .{ .bytes = &line }, .class = .entire_op, .file = World.striped(size) });
+        try testing.expectEqual(@as(u64, line.len), o.written);
+        w.wp.flushIno(io, 44); // the close's drain
+        try testing.expect(!w.wp.table.has(44, 0));
+        const pages = pagesTouched(size, line.len);
+        try testing.expectEqual(pages * PAGE, w.f.dev.writeBytesTotal());
+        try testing.expect(w.f.dev.read_bytes <= w.f.dev.writeBytesTotal());
+        try testing.expect(w.f.dev.writeBytesTotal() * 1_000_000 / line.len <= extent.inPlaceBoundPpm(line.len, 1));
+        size += line.len;
+    }
+    try testing.expectEqual(wt0, accumulate.stats.write_through_bytes.load());
+    try testing.expectEqual(used, w.f.alloc_a.usedBlocks());
+    try testing.expectEqual(merges, w.f.map.merges.items.len);
+    try testing.expectEqual(@as(usize, 0), w.f.frees.freed.items.len);
+    try testing.expect(w.f.map.seam().lookup(44, 0).?.eql(a));
+    try testing.expect(block_alloc.Incarnation.isStable(w.f.alloc_a.incarnationWord(w.f.alloc_a.idxOf(a.offset))));
+    var got: [wt.BS]u8 = undefined;
+    w.f.dev.peek(a.vol_tag, a.offset, &got);
+    try testing.expect(std.mem.allEqual(u8, got[0..eof0], 0xAA));
+    i = 0;
+    while (i < 60) : (i += 1) {
+        fill(&line, i);
+        try testing.expectEqualSlices(u8, &line, got[eof0 + @as(u64, i) * line.len ..][0..line.len]);
+    }
+    try testing.expect(std.mem.allEqual(u8, got[size..], 0xAA));
+    // Up to the page edge, then a page-aligned 4 KiB append: exactly its page, no seed.
+    var pad: [PAGE]u8 = undefined;
+    const to_edge = std.mem.alignForward(u64, size, PAGE) - size;
+    fill(pad[0..to_edge], 0x61);
+    _ = try w.wp.write(io, .{ .ino = 44, .offset = size, .payload = .{ .bytes = pad[0..to_edge] }, .class = .entire_op, .file = World.striped(size) });
+    w.wp.flushIno(io, 44);
+    size += to_edge;
+    w.f.dev.resetLedger();
+    fill(&pad, 0x62);
+    _ = try w.wp.write(io, .{ .ino = 44, .offset = size, .payload = .{ .bytes = &pad }, .class = .entire_op, .file = World.striped(size) });
+    w.wp.flushIno(io, 44);
+    try testing.expectEqual(@as(u64, PAGE), w.f.dev.writeBytesTotal());
+    try testing.expectEqual(@as(u64, 0), w.f.dev.read_bytes);
+    w.f.dev.peek(a.vol_tag, a.offset, &got);
+    try testing.expectEqualSlices(u8, &pad, got[size..][0..PAGE]);
+    try testing.expect(w.f.map.seam().lookup(44, 0).?.eql(a));
+}
+
+test "the in-place drain's crash law (the kill rows): a drain killed at every grain of its DMA leaves the file's old bytes intact and each appended byte old or new — never a torn old byte, never a recycled pool byte on the device; the entry stays parked and the next drain lands it (never lossy)" {
+    const io = testing.io;
+    const w = try World.init(testing.allocator, .sync_inline, false);
+    defer w.deinit(testing.allocator);
+    const a = try w.f.publishBlock(45, 0, 0xAA);
+    // A first append (the W2 arm) makes the next one stream-adjacent.
+    const eof0: u64 = 3 * PAGE + 1000;
+    var head: [100]u8 = undefined;
+    fill(&head, 0x11);
+    _ = try w.wp.write(io, .{ .ino = 45, .offset = eof0, .payload = .{ .bytes = &head }, .class = .entire_op, .file = World.striped(eof0) });
+    w.wp.flushIno(io, 45);
+    const eof = eof0 + head.len;
+    var before: [wt.BS]u8 = undefined;
+    w.f.dev.peek(a.vol_tag, a.offset, &before);
+    // A 5,000 B append from inside page 3 spans pages 3 and 4: ONE DMA of two grains.
+    var body: [5000]u8 = undefined;
+    fill(&body, 0x22);
+    try testing.expectEqual(@as(u64, 2), pagesTouched(eof, body.len));
+    var kill_at: usize = 0;
+    while (kill_at < 2) : (kill_at += 1) {
+        _ = w.wp.last_write_end.note(45, eof, 0); // the append is stream-adjacent
+        const o = try w.wp.write(io, .{ .ino = 45, .offset = eof, .payload = .{ .bytes = &body }, .class = .entire_op, .file = World.striped(eof) });
+        try testing.expectEqual(@as(u32, 1), o.count(.accumulate_park));
+        log.testing.expectErrorLogs(1);
+        w.f.dev.fail_next = error.InputOutput;
+        w.f.dev.torn_grains = kill_at;
+        w.wp.flushIno(io, 45);
+        try log.testing.expectAllFired();
+        try testing.expect(w.wp.table.has(45, 0)); // never lossy: still parked
+        var crash: [wt.BS]u8 = undefined;
+        w.f.dev.peek(a.vol_tag, a.offset, &crash);
+        try testing.expectEqualSlices(u8, before[0..eof], crash[0..eof]);
+        for (crash[eof..][0..body.len], before[eof..][0..body.len], body) |c, old, new| try testing.expect(c == old or c == new);
+        try testing.expectEqualSlices(u8, before[eof + body.len ..], crash[eof + body.len ..]);
+        // The next drain lands it.
+        w.wp.flushIno(io, 45);
+        try testing.expect(!w.wp.table.has(45, 0));
+        w.f.dev.peek(a.vol_tag, a.offset, &crash);
+        try testing.expectEqualSlices(u8, before[0..eof], crash[0..eof]);
+        try testing.expectEqualSlices(u8, &body, crash[eof..][0..body.len]);
+        try testing.expectEqualSlices(u8, before[eof + body.len ..], crash[eof + body.len ..]);
+        // Reset the tail for the next kill point (a non-adjacent rewrite of the old bytes).
+        _ = w.wp.last_write_end.note(45, 0, 0);
+        _ = try w.wp.write(io, .{ .ino = 45, .offset = eof, .payload = .{ .bytes = before[eof..][0..body.len] }, .class = .shared, .file = World.striped(eof + body.len) });
+        w.wp.flushIno(io, 45);
+        w.f.dev.peek(a.vol_tag, a.offset, &crash);
+        try testing.expectEqualSlices(u8, &before, &crash);
+    }
+    try testing.expect(w.f.map.seam().lookup(45, 0).?.eql(a));
+}
+
 test "the D3 fold seam (defrag --fold): `foldTargets` names the inos holding parked W2 extents (ascending, deduped — a full-buffer park is not a target), `foldParked` kicks each through the EXISTING fold — sole-owner passthrough blocks land in place at the page grain and retire, device ÷ user ≤ the §J in-place bound, the bindings unchanged, bytes exact; nothing left parked as an extent; a second census is empty" {
     const io = testing.io;
     const w = try World.init(testing.allocator, .sync_inline, false);

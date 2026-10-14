@@ -1290,12 +1290,12 @@ pub const DataPlane = struct {
         const tag = (self.rt.pickVolume() catch return error.OutOfMemory) orelse return error.NoSpaceLeft;
         const stored = try self.transformWrite(tag, image);
         defer stored.release(self);
-        return self.ownBlockStored(io, ino, tag, stored.bytes, image.len);
+        return self.ownBlockStored(io, ino, tag, stored.bytes);
     }
 
     /// `ownBlock` from an image already transformed for `tag` (the
     /// promotion transforms ONCE to pick its arm, then lands that image).
-    fn ownBlockStored(self: *DataPlane, io: Io, ino: u64, tag: u64, stored: []const u8, plain_len: usize) Error!OwnBlock {
+    fn ownBlockStored(self: *DataPlane, io: Io, ino: u64, tag: u64, stored: []const u8) Error!OwnBlock {
         const v = self.vols.byTag(tag) orelse return error.InputOutput;
         const minted = enospc.allocateWithValve(v.alloc, io, enospc.Valve.fromReclaimer(self.reclaimer)) catch |e| return switch (e) {
             error.StorageFull => error.NoSpaceLeft,
@@ -1312,7 +1312,9 @@ pub const DataPlane = struct {
         v.alloc.publishBlock(minted.idx);
         guard.disarm();
         stats.own_block_dmas.inc();
-        stats.own_block_dma_bytes.add(plain_len);
+        // The bytes the DMA landed — a transformed image's stored length,
+        // grain-padded — so the device-write ledger closes (decision 0003 §AK.6).
+        stats.own_block_dma_bytes.add(layout.ceilGrain(stored.len));
         self.wp.touched.stampOrdinal(ino, v.ordinal);
         // The proof names what the DMA landed: a whole-block DMA is the
         // complete payload or image by construction, so `DmaProof.covers`
@@ -1756,7 +1758,7 @@ pub const DataPlane = struct {
         };
         const out: Promoted = switch (d) {
             .inline_ => .{ .ok = self.promoteInline(ino, cur, cur_bytes.coll_seq, image, k, generation) },
-            .own_block => .{ .ok = self.promoteOwnBlock(io, ino, cur, cur_bytes.coll_seq, tag, stored.bytes, image.len, k, generation) },
+            .own_block => .{ .ok = self.promoteOwnBlock(io, ino, cur, cur_bytes.coll_seq, tag, stored.bytes, k, generation) },
             .packed_ => blk: {
                 // The durable copy the pack commit displaces is a live owner
                 // until `promoteStaged` releases it (decision 0003 §AH.1).
@@ -1787,8 +1789,8 @@ pub const DataPlane = struct {
         return true;
     }
 
-    fn promoteOwnBlock(self: *DataPlane, io: Io, ino: u64, prev: layout.Layout, coll_seq: u8, tag: u64, stored: []const u8, plain_len: usize, k: staging.StagingKey, generation: u64) bool {
-        const ob = self.ownBlockStored(io, ino, tag, stored, plain_len) catch |e| {
+    fn promoteOwnBlock(self: *DataPlane, io: Io, ino: u64, prev: layout.Layout, coll_seq: u8, tag: u64, stored: []const u8, k: staging.StagingKey, generation: u64) bool {
+        const ob = self.ownBlockStored(io, ino, tag, stored) catch |e| {
             log.debug("promotion ino {d}: own block refused ({t})", .{ ino, e });
             return false;
         };
@@ -3162,7 +3164,7 @@ pub const DataPlane = struct {
 
     /// DEVICE-byte movement (never op counts): the manners law's signal.
     fn foregroundBytes(_: ?*anyopaque) u64 {
-        return accumulate.stats.write_through_bytes.load() +% sole_owner_patch.stats.patch_write_bytes.load() +% device_overlay.stats.overlay_store_bytes.load() +% read_path.stats.ranged_read_bytes.load() +% read_path.stats.read_fill_dma_bytes.load() +% stats.own_block_dma_bytes.load();
+        return accumulate.stats.write_through_bytes.load() +% sole_owner_patch.stats.patch_write_bytes.load() +% device_overlay.stats.overlay_store_bytes.load() +% extent_overlay.stats.fold_inplace_write_bytes.load() +% accumulate.stats.drain_inplace_write_bytes.load() +% read_path.stats.ranged_read_bytes.load() +% read_path.stats.read_fill_dma_bytes.load() +% stats.own_block_dma_bytes.load();
     }
 
     // ---- the read seam over the write side ----

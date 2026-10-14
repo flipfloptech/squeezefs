@@ -991,6 +991,90 @@ fn scanJson(gpa: Allocator, text: []const u8, keys: *std.ArrayList([]const u8)) 
     if (depth != 0 or in_str) return error.Unbalanced;
 }
 
+/// Every object key that repeats inside its own object, as `/path/key`
+/// (owned by `gpa`): what a strict parser refuses (`DuplicateField`). The
+/// rail's census of one document — the render test's and the smoke's
+/// strict reader's.
+pub fn duplicateKeys(gpa: Allocator, text: []const u8, out: *std.ArrayList([]u8)) !void {
+    const Frame = struct { object: bool, expect_key: bool = true, keys: std.StringHashMapUnmanaged(void) = .empty, key: []const u8 = "" };
+    var stack: std.ArrayList(Frame) = .empty;
+    defer {
+        for (stack.items) |*f| f.keys.deinit(gpa);
+        stack.deinit(gpa);
+    }
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    var scanner = std.json.Scanner.initCompleteInput(arena.allocator(), text);
+    defer scanner.deinit();
+    while (true) {
+        const tok = try scanner.nextAlloc(arena.allocator(), .alloc_always);
+        switch (tok) {
+            .object_begin, .array_begin => try stack.append(gpa, .{ .object = tok == .object_begin }),
+            .object_end, .array_end => {
+                var f = stack.pop().?;
+                f.keys.deinit(gpa);
+                if (stack.items.len != 0) stack.items[stack.items.len - 1].expect_key = true;
+            },
+            .allocated_string => |s| {
+                const top = &stack.items[stack.items.len - 1];
+                if (top.object and top.expect_key) {
+                    top.expect_key = false;
+                    top.key = s;
+                    const gop = try top.keys.getOrPut(gpa, s);
+                    if (gop.found_existing) {
+                        var path: std.Io.Writer.Allocating = .init(gpa);
+                        defer path.deinit();
+                        for (stack.items[0 .. stack.items.len - 1]) |p| if (p.object) try path.writer.print("/{s}", .{p.key});
+                        try path.writer.print("/{s}", .{s});
+                        try out.append(gpa, try path.toOwnedSlice());
+                    }
+                } else if (top.object) top.expect_key = true;
+            },
+            .allocated_number => if (stack.items.len != 0 and stack.items[stack.items.len - 1].object) {
+                stack.items[stack.items.len - 1].expect_key = true;
+            },
+            .true, .false, .null => if (stack.items.len != 0 and stack.items[stack.items.len - 1].object) {
+                stack.items[stack.items.len - 1].expect_key = true;
+            },
+            .end_of_document => return,
+            else => return error.UnexpectedToken,
+        }
+    }
+}
+
+test "the document parses STRICTLY — no key repeats inside its object across every family (a strict parser refuses DuplicateField; brk.py, the smoke and every tool read ONE document)" {
+    var r = Renderer.init(testing.allocator, .{ .build = .{ .train = "0.1.0", .commit = "abc", .profile = "gate" }, .mount = .{ .uid = 7, .pid = 4242, .mountpoint = "/mnt/x", .wire_endpoint = "10.0.0.7:39123" } });
+    defer r.deinit();
+    const p = try r.render();
+    defer p.deinit(testing.allocator);
+    var dups: std.ArrayList([]u8) = .empty;
+    defer {
+        for (dups.items) |d| testing.allocator.free(d);
+        dups.deinit(testing.allocator);
+    }
+    try duplicateKeys(testing.allocator, p.bytes(), &dups);
+    for (dups.items) |d| std.debug.print("\n--- .stats repeats {s} ---", .{d});
+    try testing.expectEqual(@as(usize, 0), dups.items.len);
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, p.bytes(), .{ .duplicate_field_behavior = .@"error" });
+    parsed.deinit();
+}
+
+test "duplicateKeys names a repeated key by its path, nested and at the top, and nothing in a clean document" {
+    var dups: std.ArrayList([]u8) = .empty;
+    defer {
+        for (dups.items) |d| testing.allocator.free(d);
+        dups.deinit(testing.allocator);
+    }
+    try duplicateKeys(testing.allocator, "{\"a\":{\"x\":1,\"y\":[1,{\"x\":2}],\"x\":true},\"b\":\"s\",\"b\":null,\"c\":{\"x\":1}}", &dups);
+    try testing.expectEqual(@as(usize, 2), dups.items.len);
+    try testing.expectEqualStrings("/a/x", dups.items[0]);
+    try testing.expectEqualStrings("/b", dups.items[1]);
+    for (dups.items) |d| testing.allocator.free(d);
+    dups.clearRetainingCapacity();
+    try duplicateKeys(testing.allocator, "{\"a\":{\"x\":1},\"b\":{\"x\":1}}", &dups);
+    try testing.expectEqual(@as(usize, 0), dups.items.len);
+}
+
 test "render: the document parses, names every family in the schema's order with daemon last, ends with ONE newline, and the size is exactly the served bytes" {
     var r = Renderer.init(testing.allocator, .{ .build = .{ .train = "0.1.0", .commit = "abc", .profile = "gate" }, .mount = .{ .uid = 7, .pid = 4242, .mountpoint = "/mnt/x", .wire_endpoint = "10.0.0.7:39123" } });
     defer r.deinit();

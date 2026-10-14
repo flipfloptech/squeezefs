@@ -1648,6 +1648,34 @@ test "stats JSON carries every spec key with live values" {
     try testing.expectEqual(@as(i64, 0), hot.get("trims").?.integer);
 }
 
+test "stats JSON: components registered under ONE name (a table per data volume, a cache per member) render as ONE entry — the instances counted, current / floor / weight / sheds / trims summed — so the document parses strictly (a strict parser refused `block_alloc_table` twice on a two-volume mount)" {
+    var b: MemBudget = .{};
+    var shed_log: ShedLog = .{};
+    var a = TestComp.init("block_alloc_table", 300, &shed_log);
+    var c = TestComp.init("block_alloc_table", 500, &shed_log);
+    var h = TestComp.init("hot_block_tier", 40, &shed_log);
+    b.register(a.recording(10, 0));
+    b.register(h.recording(5, 4));
+    b.register(c.recording(20, 0));
+    b.tickInner(1 << 30, 0, 0);
+    var buf: [4096]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try b.writeStatsJson(&w);
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, w.buffered(), .{ .duplicate_field_behavior = .@"error" });
+    defer parsed.deinit();
+    const comps = parsed.value.object.get("mem_budget_components").?.object;
+    try testing.expectEqual(@as(usize, 2), comps.count());
+    const t = comps.get("block_alloc_table").?.object;
+    try testing.expectEqual(@as(i64, 2), t.get("instances").?.integer);
+    try testing.expectEqual(@as(i64, 800), t.get("current").?.integer);
+    try testing.expectEqual(@as(i64, 30), t.get("floor").?.integer);
+    try testing.expectEqual(@as(i64, 0), t.get("weight").?.integer);
+    const hot = comps.get("hot_block_tier").?.object;
+    try testing.expectEqual(@as(i64, 1), hot.get("instances").?.integer);
+    try testing.expectEqual(@as(i64, 40), hot.get("current").?.integer);
+    try testing.expectEqual(@as(i64, 4), hot.get("weight").?.integer);
+}
+
 // ---- §6 knob faces ----
 
 /// A census fixture in a tmp dir: `proc/` and `cgroup/` trees holding this

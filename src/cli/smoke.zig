@@ -364,10 +364,15 @@ const Rig = struct {
         return r.stdout;
     }
 
-    /// The mount's `.stats` by its absolute path (`Peer.stats`'s law).
+    /// The mount's `.stats` by its absolute path (`Peer.stats`'s law),
+    /// parsed STRICTLY: every smoke row that reads the document is a rail
+    /// that it is ONE document every tool can parse.
     fn stats(self: *Rig) ![]u8 {
         var script: [160]u8 = undefined;
-        return self.shOk(self.work, try std.fmt.bufPrint(&script, "cat {s}/.stats", .{self.mp}));
+        const text = try self.shOk(self.work, try std.fmt.bufPrint(&script, "cat {s}/.stats", .{self.mp}));
+        errdefer self.gpa.free(text);
+        try expectStrictStats(self.gpa, text);
+        return text;
     }
 
     /// `stats` that answers null instead of failing (the poll's read).
@@ -375,7 +380,11 @@ const Rig = struct {
         var script: [160]u8 = undefined;
         const r = try self.sh(self.work, try std.fmt.bufPrint(&script, "cat {s}/.stats", .{self.mp}));
         defer self.gpa.free(r.stderr);
-        if (r.term.success()) return r.stdout;
+        if (r.term.success()) {
+            errdefer self.gpa.free(r.stdout);
+            try expectStrictStats(self.gpa, r.stdout);
+            return r.stdout;
+        }
         self.gpa.free(r.stdout);
         return null;
     }
@@ -612,6 +621,26 @@ fn judgeDeath(name: []const u8, term: std.process.Child.Term, killed_by_us: bool
 /// Root, `/dev/fuse`, `CAP_SYS_ADMIN`, the binary beside us.
 /// The venue law (`testkit.venue.mount`): the binary beside us, root,
 /// `/dev/fuse`, CAP_SYS_ADMIN — each absence its own ledgered class.
+const stats_doc = @import("../stats/stats.zig");
+
+/// A `.stats` document a STRICT parser accepts — no key repeats inside its
+/// object (`DuplicateField`); the repeated keys named by path when one does.
+fn expectStrictStats(gpa: std.mem.Allocator, text: []const u8) !void {
+    var parsed = std.json.parseFromSlice(std.json.Value, gpa, text, .{ .duplicate_field_behavior = .@"error" }) catch |e| {
+        var dups: std.ArrayList([]u8) = .empty;
+        defer {
+            for (dups.items) |d| gpa.free(d);
+            dups.deinit(gpa);
+        }
+        stats_doc.duplicateKeys(gpa, text, &dups) catch {};
+        std.debug.print("\n--- .stats refused by a strict parser ({t}; {d} B):", .{ e, text.len });
+        for (dups.items) |d| std.debug.print(" {s}", .{d});
+        std.debug.print(" ---\n", .{});
+        return e;
+    };
+    parsed.deinit();
+}
+
 fn venueMissing(io: Io) ?testkit.Why {
     return testkit.venue.mount(io, &.{"squeezefs"});
 }
@@ -1522,7 +1551,10 @@ const Peer = struct {
     /// of a parked daemon are exactly what the kill rows read.
     fn stats(self: *Peer) ![]u8 {
         var script: [160]u8 = undefined;
-        return self.rig.shOk(self.rig.work, try std.fmt.bufPrint(&script, "cat {s}/.stats", .{self.mp}));
+        const text = try self.rig.shOk(self.rig.work, try std.fmt.bufPrint(&script, "cat {s}/.stats", .{self.mp}));
+        errdefer self.rig.gpa.free(text);
+        try expectStrictStats(self.rig.gpa, text);
+        return text;
     }
 
     /// `stats` that answers null instead of failing: the root's attributes
@@ -1533,7 +1565,11 @@ const Peer = struct {
         var script: [160]u8 = undefined;
         const r = try self.rig.sh(self.rig.work, try std.fmt.bufPrint(&script, "cat {s}/.stats", .{self.mp}));
         defer self.rig.gpa.free(r.stderr);
-        if (r.term.success()) return r.stdout;
+        if (r.term.success()) {
+            errdefer self.rig.gpa.free(r.stdout);
+            try expectStrictStats(self.rig.gpa, r.stdout);
+            return r.stdout;
+        }
         self.rig.gpa.free(r.stdout);
         return null;
     }
@@ -7519,13 +7555,12 @@ test "smoke: THE VIRTUAL INODES WITHOUT AN OPEN (decision 0003 §AF) — under n
         const r = try readVirtualWhole(gpa, path);
         errdefer gpa.free(r.bytes);
         try testing.expectEqual(r.size, @as(u64, r.bytes.len));
-        // A torn or cut document fails the parse; `.stats` repeats a few
-        // keys across families, which a JSON object tolerates.
-        var parsed = std.json.parseFromSlice(std.json.Value, gpa, r.bytes, .{ .duplicate_field_behavior = .use_first }) catch |e| {
+        // A torn or cut document fails the parse — a STRICT one: no key
+        // repeats inside its object.
+        expectStrictStats(gpa, r.bytes) catch |e| {
             std.debug.print("\n--- a torn .stats generation ({d} of {d} B): {t} ---\n{s}\n", .{ r.bytes.len, r.size, e, r.bytes[r.bytes.len -| 200..] });
             return e;
         };
-        parsed.deinit();
         if (prev) |p| {
             if (p.ino != r.ino) generations += 1;
             gpa.free(p.bytes);

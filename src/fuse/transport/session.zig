@@ -2250,6 +2250,12 @@ test "e2e: a namespace request's handler runs on the thread that delivered it â€
             for (s.groups) |g| if (g.tid.load(.acquire) == tid) return true;
             return false;
         }
+        /// Until every own dispatch since `own0` has run its handler
+        /// (bounded: a stuck one fails the equality below).
+        fn settle(r: *Rig, own0: u64, d0: u64) void {
+            const deadline = clock.monotonicNs() + 2 * std.time.ns_per_s;
+            while (worker.handler_dispatches_own.load() - own0 != r.fs.dispatches.load(.monotonic) - d0 and clock.monotonicNs() < deadline) std.Thread.yield() catch {};
+        }
         fn run(r: *Rig, comptime f: fn (*Rig, *anyerror!void) void) !void {
             var result: anyerror!void = {};
             const t = try std.Thread.spawn(.{}, f, .{ r, &result });
@@ -2267,6 +2273,9 @@ test "e2e: a namespace request's handler runs on the thread that delivered it â€
         const d0 = rig.fs.dispatches.load(.monotonic);
         const w0 = slot.wake_writes.load();
         try Helper.run(rig, Helper.listRoot);
+        // The last RELEASEDIR is asynchronous (close(2) returns before it
+        // is answered): wait until every counted dispatch has run.
+        Helper.settle(rig, own0, d0);
         const dispatched = rig.fs.dispatches.load(.monotonic) - d0;
         try testing.expect(dispatched >= 128);
         try testing.expectEqual(dispatched, worker.handler_dispatches_own.load() - own0);
@@ -2280,6 +2289,9 @@ test "e2e: a namespace request's handler runs on the thread that delivered it â€
         const own1 = worker.handler_dispatches_own.load();
         const foreign1 = worker.handler_dispatches_foreign.load();
         try Helper.run(rig, Helper.readFiles);
+        // The RELEASEs are asynchronous too: wait for the sixteenth.
+        const deadline = clock.monotonicNs() + 2 * std.time.ns_per_s;
+        while (worker.handler_dispatches_foreign.load() - foreign1 < 16 and clock.monotonicNs() < deadline) std.Thread.yield() catch {};
         try testing.expect(worker.handler_dispatches_foreign.load() - foreign1 >= 16);
         try testing.expect(worker.handler_dispatches_own.load() - own1 >= 16);
     }

@@ -383,8 +383,8 @@ src/meta/record.zig:1022 | 8 | OWED: derive it or document it on the line (chart
 src/meta/record.zig:1022 | 8 | OWED: derive it or document it on the line (charter §1.5)
 src/meta/record.zig:1025 | 8 | OWED: derive it or document it on the line (charter §1.5)
 src/meta/record.zig:1029 | 8 | OWED: derive it or document it on the line (charter §1.5)
-src/meta/record.zig:1030 | 8 | OWED: derive it or document it on the line (charter §1.5)
 src/meta/record.zig:1030 | 4 | OWED: derive it or document it on the line (charter §1.5)
+src/meta/record.zig:1030 | 8 | OWED: derive it or document it on the line (charter §1.5)
 src/meta/record.zig:1057 | 8 | OWED: derive it or document it on the line (charter §1.5)
 src/meta/record.zig:1060 | 4 | OWED: derive it or document it on the line (charter §1.5)
 src/meta/record.zig:1079 | 8 | OWED: derive it or document it on the line (charter §1.5)
@@ -496,7 +496,7 @@ src/meta/sym/xv/stripe.zig:156 | 10 | a percentage — OWED: derive it (charter 
 src/meta/sym/xv/stripe.zig:461 | 64 | OWED: derive it or document it on the line (charter §1.5)
 src/meta/sym/xv/stripe.zig:1097 | 12 | a size — OWED: derive from derive.Facts or document the physical/format reason
 src/meta/sym/xv/stripe.zig:1099 | 12 | a size — OWED: derive from derive.Facts or document the physical/format reason
-src/meta/tx.zig:280 | 64 | OWED: derive it or document it on the line (charter §1.5)
+src/meta/tx.zig:283 | 64 | OWED: derive it or document it on the line (charter §1.5)
 src/ops/defrag/metrics.zig:33 | 1000 | OWED: derive it or document it on the line (charter §1.5)
 src/ops/fsck/census.zig:274 | 64 | OWED: derive it or document it on the line (charter §1.5)
 src/ops/fsck/census.zig:274 | 64 | OWED: derive it or document it on the line (charter §1.5)

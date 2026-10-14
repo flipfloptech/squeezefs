@@ -1078,3 +1078,127 @@ test "the census is bounded at its start watermarks: an ino at/past a slot's wat
     try testing.expect(back.findings[0].eql(r2.findings[0]));
     try testing.expectEqual(r2.counters.inodes_scanned, back.counters.inodes_scanned);
 }
+
+// ---------------------------------------------------------------------------
+// The per-suspect lookups are linear (0003 §AC.6): every lookup a class makes
+// per suspect resolves through an index built once — the work examined is at
+// most LOOKUP_LINEAR × the inputs (owners or names or views, plus the
+// suspects), where a scan per suspect examined their product. Counters, not
+// wall time.
+// ---------------------------------------------------------------------------
+
+/// The bound's factor: one pass to build the index and one probe per suspect
+/// is 2 × the inputs; 3 leaves room for a duplicate's second look.
+const LOOKUP_LINEAR: u64 = 3;
+/// The fixtures' fill (files no suspect names, minted first so a scan per
+/// suspect walks past them) and their damage count.
+const LOOKUP_FILL: usize = 400;
+const LOOKUP_DAMAGE: usize = 60;
+
+fn fillNamed(set: *RamSet, comptime prefix: []const u8, n: usize, vol_tag: u64, block: ?u64) !void {
+    var nb: [32]u8 = undefined;
+    for (0..n) |i| {
+        const nm = try std.fmt.bufPrint(&nb, prefix ++ "{d}", .{i});
+        _ = try set.mkfile(inos.ROOT_INO, nm, vol_tag, if (block) |b| &.{b} else &.{@as(u64, i) % ram.BLOCKS});
+    }
+}
+
+fn expectLinear(what: []const u8, steps: u64, inputs: u64) !void {
+    if (steps <= LOOKUP_LINEAR * inputs) return;
+    std.debug.print("\n{s}: {d} element(s) examined for {d} input(s) — bound {d}\n", .{ what, steps, inputs, LOOKUP_LINEAR * inputs });
+    return error.TestUnexpectedResult;
+}
+
+test "C9's block count per candidate is linear (0003 §AC.6): 400 files with blocks, then 60 whose names are gone — the 60 C9 findings name each candidate's block count examining ≤ 3 × (owners + candidates) owners, where a scan per candidate walked past every owner minted before it" {
+    const gpa = testing.allocator;
+    const set = try RamSet.init(gpa);
+    defer set.deinit();
+    try fillNamed(set, "fill", LOOKUP_FILL, VOL_A, 0);
+    try fillNamed(set, "gone", LOOKUP_DAMAGE, VOL_B, null);
+    var nb: [32]u8 = undefined;
+    for (0..LOOKUP_DAMAGE) |i| try set.orphan(inos.ROOT_INO, try std.fmt.bufPrint(&nb, "gone{d}", .{i}));
+    try set.freezeEra();
+    var r = try ram.run(set, .offline, .{});
+    defer r.deinit(gpa);
+    var c9: usize = 0;
+    for (r.findings) |f| if (f == .c9_unreferenced) {
+        c9 += 1;
+        try testing.expectEqual(@as(u32, 1), f.c9_unreferenced.blocks);
+    };
+    try testing.expectEqual(LOOKUP_DAMAGE, c9);
+    try expectLinear("C9 owner lookups", r.counters.c9_owner_steps, LOOKUP_FILL + 2 * LOOKUP_DAMAGE);
+}
+
+test "C2-lost's owner per block is linear (0003 §AC.6): 400 files on one block of A, then 60 files on 60 blocks of B the allocator forgets — the 60 lost findings name their owners examining ≤ 3 × (bindings + suspects) bindings, where a scan per lost block walked every binding before its owner" {
+    const gpa = testing.allocator;
+    const set = try RamSet.init(gpa);
+    defer set.deinit();
+    try fillNamed(set, "fill", LOOKUP_FILL, VOL_A, 0);
+    try fillNamed(set, "lost", LOOKUP_DAMAGE, VOL_B, null);
+    for (0..LOOKUP_DAMAGE) |i| set.untrack(VOL_B, @as(u64, i) % ram.BLOCKS);
+    try set.freezeEra();
+    var r = try ram.run(set, .offline, .{});
+    defer r.deinit(gpa);
+    var lost: usize = 0;
+    for (r.findings) |f| if (f == .c2_lost) {
+        lost += 1;
+        try testing.expect(f.c2_lost.ino != 0);
+    };
+    try testing.expectEqual(LOOKUP_DAMAGE, lost);
+    try expectLinear("C2 owner lookups", r.counters.c2_owner_steps, LOOKUP_FILL + 2 * LOOKUP_DAMAGE);
+}
+
+test "C10's distinct names per candidate are linear (0003 §AC.6): 60 files with two names each and nlink 5, online — the ladder's re-check counts each candidate's deduplicated names examining ≤ 3 × (names + candidates) names, where a scan per candidate walked every collected name (and every earlier one per match)" {
+    const gpa = testing.allocator;
+    const set = try RamSet.init(gpa);
+    defer set.deinit();
+    var nb: [32]u8 = undefined;
+    for (0..LOOKUP_DAMAGE) |i| {
+        const f = try set.mkfile(inos.ROOT_INO, try std.fmt.bufPrint(&nb, "multi{d}", .{i}), VOL_B, &.{});
+        try set.link(inos.ROOT_INO, try std.fmt.bufPrint(&nb, "multi{d}-link", .{i}), f);
+        try set.setNlink(f, 5);
+    }
+    try set.freezeEra();
+    var r = try ram.run(set, .online, .{});
+    defer r.deinit(gpa);
+    var high: usize = 0;
+    for (r.findings) |f| if (f == .c10_nlink_too_high) {
+        high += 1;
+        try testing.expectEqual(@as(u32, 2), f.c10_nlink_too_high.names);
+    };
+    try testing.expectEqual(LOOKUP_DAMAGE, high);
+    try expectLinear("C10 name lookups", r.counters.c10_name_steps, 2 * LOOKUP_DAMAGE + LOOKUP_DAMAGE);
+}
+
+test "C17's routing check is linear in the views (0003 §AC.6): 20 directories striped over 4 stripes each, a name in every stripe where its hash routes it — 0 findings, the routing check examining ≤ 3 × (views + stripes + names), where every striped directory scanned every view's place in its map" {
+    const gpa = testing.allocator;
+    const set = try RamSet.init(gpa);
+    defer set.deinit();
+    const stripe_mod = @import("../../meta/sym/xv/stripe.zig");
+    const DIRS = 20;
+    const K = 4;
+    const seed = set.mem.nameKey();
+    var nb: [32]u8 = undefined;
+    var markers: [K][stripe_mod.MARKER_NAME_LEN]u8 = undefined;
+    for (0..DIRS) |d| {
+        const sd = try set.mkdir(inos.ROOT_INO, try std.fmt.bufPrint(&nb, "striped{d}", .{d}));
+        var stripes: [K]u64 = undefined;
+        for (&stripes, 0..) |*s, i| s.* = try set.mkdir(inos.ROOT_INO, try std.fmt.bufPrint(&nb, "s{d}-{d}", .{ d, i }));
+        for (stripes, 0..) |s, i| try set.dangle(sd, stripe_mod.markerName(@intCast(i), &markers[i]), s);
+        try set.dangle(sd, stripe_mod.STRIPED, stripes[0]);
+        for (0..K) |i| {
+            const nm = try std.fmt.bufPrint(&nb, "n{d}-{d}", .{ d, i });
+            _ = try set.mkdir(stripes[stripe_mod.stripeOf(key.dentryNameHash54(nm, seed), K)], nm);
+        }
+    }
+    try set.freezeEra();
+    var r = try ram.run(set, .offline, .{});
+    defer r.deinit(gpa);
+    for (r.findings) |f| if (f == .c17_stripe) {
+        std.debug.print("unexpected: {f}\n", .{f});
+        return error.TestUnexpectedResult;
+    };
+    // The views: the root, every striped directory, every stripe.
+    const views = 1 + DIRS + DIRS * K;
+    try expectLinear("C17 routing", r.counters.c17_route_steps, views + DIRS * K + DIRS * K);
+}

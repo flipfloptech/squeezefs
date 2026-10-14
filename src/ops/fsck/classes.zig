@@ -678,7 +678,7 @@ pub const Pass = struct {
                     self.counters.alloc_bitmap_tracked_exempted += 1;
                     continue;
                 };
-                const owner = firstOwner(&self.cen, v.vol_tag, idx);
+                const owner = firstOwner(&self.cen, v.vol_tag, idx, &self.counters.c2_owner_steps);
                 try self.suspect(.{ .c2_lost = .{ .vol_tag = v.vol_tag, .block_idx = idx, .ino = owner.ino, .block_index = owner.block_index, .unrepairable_shape = out_of_range } });
             }
             // Leaked: tracked with zero referencers (allocator truth is
@@ -813,6 +813,8 @@ pub const Pass = struct {
         if (self.host.residue()) return;
         const gpa = self.gpa;
         const host = self.host;
+        const calls0 = if (host.store.tally) |t| t.calls else 0;
+        defer self.counters.c11_store_calls += (if (host.store.tally) |t| t.calls else 0) - calls0;
         const ms = host.store.mapStore();
         // (a) + (c): the owner skip-scan.
         var from: u64 = 0;
@@ -1026,7 +1028,10 @@ pub const Pass = struct {
                     return true;
                 };
                 const blocks: u32 = blk: {
-                    for (p.cen.owners.items) |o| if (o.ino == census.keyInoOf(sl)) break :blk @intCast(o.bindings.len);
+                    for (p.cen.owners.items) |o| {
+                        p.counters.c9_owner_steps += 1;
+                        if (o.ino == census.keyInoOf(sl)) break :blk @intCast(o.bindings.len);
+                    }
                     break :blk 0;
                 };
                 log.debug("fsck C9 candidate: ino {d} (slot {d}, raw {d}) live, prior-era, absent from the referenced set", .{ global, sl.slot, sl.raw });
@@ -1501,7 +1506,7 @@ pub const Pass = struct {
             self.counters.nlink_transient_cleared += 1;
             return false;
         }
-        const names = dedupedNames(d, global);
+        const names = dedupedNames(d, global, &self.counters.c10_name_steps);
         if (names == 0) return false; // C9's
         if (after.nlink == names) {
             self.counters.nlink_transient_cleared += 1;
@@ -1594,14 +1599,16 @@ pub fn msBetween(t0: u64, t1: u64) u64 {
 /// The deduped `(parent, name)` identities the fresh pass collected for
 /// `global` (records may only NOMINATE; a VL5b migration mid-copy has one
 /// dentry on two volumes).
-fn dedupedNames(d: *const census.DentryPass, global: u64) u32 {
+fn dedupedNames(d: *const census.DentryPass, global: u64, steps: *u64) u32 {
     var n: u32 = 0;
     for (d.names.items, 0..) |a, i| {
+        steps.* += 1;
         if (a.child != global) continue;
         var dup = false;
-        for (d.names.items[0..i]) |b| if (b.child == global and b.parent == a.parent and b.suffix == a.suffix) {
-            dup = true;
-        };
+        for (d.names.items[0..i]) |b| {
+            steps.* += 1;
+            if (b.child == global and b.parent == a.parent and b.suffix == a.suffix) dup = true;
+        }
         if (!dup) n += 1;
     }
     return n;
@@ -1714,8 +1721,11 @@ pub fn confirmCrossMember(gpa: Allocator, first: []const Finding, second: []cons
     }
 }
 
-fn firstOwner(cen: *const census.Census, vol_tag: u64, block_idx: u64) struct { ino: u64, block_index: u32 } {
-    for (cen.owners.items) |o| for (o.bindings) |b| if (b.vol_tag == vol_tag and b.block_idx == block_idx) return .{ .ino = o.ino, .block_index = b.block_index };
+fn firstOwner(cen: *const census.Census, vol_tag: u64, block_idx: u64, steps: *u64) struct { ino: u64, block_index: u32 } {
+    for (cen.owners.items) |o| for (o.bindings) |b| {
+        steps.* += 1;
+        if (b.vol_tag == vol_tag and b.block_idx == block_idx) return .{ .ino = o.ino, .block_index = b.block_index };
+    };
     return .{ .ino = 0, .block_index = 0 };
 }
 
@@ -1809,7 +1819,7 @@ fn stripeFindings(p: *Pass, cen: *const census.Census, d: *const census.DentryPa
         Has.census_ptr = null;
         Has.scope_ptr = null;
     }
-    try stripe.verifyStripes(gpa, views.items, &Has.has, p.host.name_key, out);
+    try stripe.verifyStripes(gpa, views.items, &Has.has, p.host.name_key, out, &p.counters.c17_route_steps);
 }
 
 /// C14 + C15 over ONE forest census: a slot `Live` on two pages, a `Live`

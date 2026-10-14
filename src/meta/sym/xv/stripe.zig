@@ -769,7 +769,7 @@ pub const DirView = struct {
 /// The five shapes over ONE dentry walk: `dirs` = every directory with a
 /// NUL-led name (the nomination), `records` = the inode census (an ino
 /// → present), `names_of(stripe)` the stripes' own names.
-pub fn verifyStripes(gpa: Allocator, views: []const DirView, hasRecord: *const fn (ino: u64) bool, name_key: *const key.NameKey, out: *std.ArrayList(Finding)) Allocator.Error!void {
+pub fn verifyStripes(gpa: Allocator, views: []const DirView, hasRecord: *const fn (ino: u64) bool, name_key: *const key.NameKey, out: *std.ArrayList(Finding), route_steps: *u64) Allocator.Error!void {
     var mapped: std.AutoHashMapUnmanaged(u64, u64) = .empty;
     defer mapped.deinit(gpa);
     for (views) |v| {
@@ -791,13 +791,15 @@ pub fn verifyStripes(gpa: Allocator, views: []const DirView, hasRecord: *const f
         // Every stripe's names route to it.
         for (views) |sv| {
             var idx: ?u8 = null;
-            for (map.slice(), 0..) |s, i| if (s == sv.dir) {
-                idx = @intCast(i);
-            };
+            for (map.slice(), 0..) |s, i| {
+                route_steps.* += 1;
+                if (s == sv.dir) idx = @intCast(i);
+            }
             const i = idx orelse continue;
-            for (sv.names) |nm| if (stripeOf(key.dentryNameHash54(nm.name, name_key), map.k) != i) {
-                try out.append(gpa, .{ .shape = .misrouted_name, .dir = sv.dir, .ino = nm.child });
-            };
+            for (sv.names) |nm| {
+                route_steps.* += 1;
+                if (stripeOf(key.dentryNameHash54(nm.name, name_key), map.k) != i) try out.append(gpa, .{ .shape = .misrouted_name, .dir = sv.dir, .ino = nm.child });
+            }
         }
     }
     if (out.items.len != 0) stats.fsck_stripe_findings.fire("a stripe map shape fsck C17 names");
@@ -1419,7 +1421,8 @@ test "fsck C17 finds every planted shape and nothing else: multiply-mapped, miss
     defer out.deinit(gpa);
     stats.fsck_stripe_findings.resetLogBudgetForTest();
     @import("../../../core/log.zig").testing.expectErrorLogs(1);
-    try verifyStripes(gpa, &views, &Has.has, &seed, &out);
+    var route_steps: u64 = 0;
+    try verifyStripes(gpa, &views, &Has.has, &seed, &out, &route_steps);
     try @import("../../../core/log.zig").testing.expectAllFired();
     var seen: [5]u32 = @splat(0);
     for (out.items) |f| seen[@backingInt(f.shape)] += 1;
@@ -1433,7 +1436,7 @@ test "fsck C17 finds every planted shape and nothing else: multiply-mapped, miss
     var clean: std.ArrayList(Finding) = .empty;
     defer clean.deinit(gpa);
     const cv = [_]DirView{ .{ .dir = 9, .markers = &.{ good[0], good[1], .{ .name = MIGRATING, .child = 100 }, good[2] }, .names = &d_names }, .{ .dir = 100, .markers = &.{}, .names = &.{} }, .{ .dir = 101, .markers = &.{}, .names = &.{} } };
-    try verifyStripes(gpa, &cv, &Has.has, &seed, &clean);
+    try verifyStripes(gpa, &cv, &Has.has, &seed, &clean, &route_steps);
     try testing.expectEqual(@as(usize, 0), clean.items.len);
 }
 

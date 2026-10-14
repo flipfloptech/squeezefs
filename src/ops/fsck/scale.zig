@@ -21,6 +21,7 @@ const economy = @import("../../meta/economy.zig");
 const meta_set = @import("../../meta/meta_set.zig");
 const stripe = @import("../../meta/sym/xv/stripe.zig");
 const census = @import("census.zig");
+const fsck = @import("../fsck.zig");
 const finding = @import("finding.zig");
 const runner = @import("runner.zig");
 
@@ -32,6 +33,10 @@ comptime {
 /// quadratic walk costs 16 ×; fixed per-run costs only lower the ratio).
 const LINEAR_SLACK_NUM: u64 = 9;
 const LINEAR_SLACK_DEN: u64 = 2;
+
+/// A paged walk's calls past `visited / SCAN_PAGE`: its last, short page
+/// and the empty one that ends a walk ending on a full page.
+const C11_PAGER_TAIL: u64 = 2;
 
 const Shape = enum { flat, striped };
 
@@ -106,6 +111,8 @@ const Row = struct {
     tally: census.WalkTally,
     height: u64,
     trees: u64,
+    /// The store calls C11's owner scan made (0003 §AC.6).
+    c11_calls: u64,
 };
 
 fn fsckRow(gpa: Allocator, s: *meta_set.TestSet, set: *meta_set.MetaSet) !Row {
@@ -118,7 +125,7 @@ fn fsckRow(gpa: Allocator, s: *meta_set.TestSet, set: *meta_set.MetaSet) !Row {
         return error.TestUnexpectedResult;
     }
     const c = r.counters;
-    var row: Row = .{ .tally = .{ .calls = c.store_calls, .visited = c.entries_visited, .read = c.entries_read, .nodes = c.nodes_walked, .sources = c.trees_consulted }, .height = 0, .trees = 0 };
+    var row: Row = .{ .tally = .{ .calls = c.store_calls, .visited = c.entries_visited, .read = c.entries_read, .nodes = c.nodes_walked, .sources = c.trees_consulted }, .height = 0, .trees = 0, .c11_calls = c.c11_store_calls };
     for (set.volumes[0].trees.load()) |t| if (t.forest_slot != null) {
         row.trees += 1;
         row.height = @max(row.height, @as(u64, try t.rootLevel()) + 1);
@@ -132,6 +139,14 @@ fn expectWithinBounds(shape: Shape, n: usize, row: Row) !void {
     const node_bound = census.walkNodeBound(t, row.height);
     if (t.read > read_bound or t.nodes > node_bound) {
         std.debug.print("fsck {t} at {d} names over {d} slot trees (height {d}): {d} entries visited in {d} calls consulting {d} trees — read {d} (bound {d}), nodes {d} (bound {d})\n", .{ shape, n, row.trees, row.height, t.visited, t.calls, t.sources, t.read, read_bound, t.nodes, node_bound });
+        return error.TestUnexpectedResult;
+    }
+    // C11's owners come off ONE paged walk of the map kind (the fixture has
+    // no block-map owner): a page per SCAN_PAGE entries the walk delivers,
+    // never a probe per ino (0003 §AC.6).
+    const c11_bound = t.visited / fsck.SCAN_PAGE + C11_PAGER_TAIL;
+    if (row.c11_calls > c11_bound) {
+        std.debug.print("fsck {t} at {d} names: C11's owner scan made {d} store calls for {d} entries visited (bound {d})\n", .{ shape, n, row.c11_calls, t.visited, c11_bound });
         return error.TestUnexpectedResult;
     }
 }

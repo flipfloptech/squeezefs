@@ -1304,7 +1304,8 @@ test "striping: a flip supplied by the other creator OVER THE WIRE (`SupplyStrip
         Has.holders = f;
         var findings: std.ArrayList(stripe.Finding) = .empty;
         defer findings.deinit(gpa);
-        try stripe.verifyStripes(gpa, views.items, &Has.has, seed, &findings);
+        var route_steps: u64 = 0;
+        try stripe.verifyStripes(gpa, views.items, &Has.has, seed, &findings, &route_steps);
         try testing.expectEqual(@as(usize, 0), findings.items.len);
     }
     // rmdir refuses while names remain; after they go it is ONE intent

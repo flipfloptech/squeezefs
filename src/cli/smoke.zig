@@ -6386,20 +6386,27 @@ fn dataPlanePass(rig: *Rig, cache: bool) !void {
         const out = try rig.onMount("rm -f big big100 shrunk storm0 storm1 storm2 storm3 storm4 storm5 storm6 storm7 && echo rm-ok");
         defer gpa.free(out);
     }
-    // What stays is the small files: striped on the set without staging;
-    // in the ring on the staging set — except the ones the plane's
-    // dispatch packed at the storm's ring pressure (the same schedule as
-    // the promotions above), whose live pack blocks are used space.
-    const small_kib: u64 = if (cache) 0 else small_n * (4 << 10);
-    const packs_kib: u64 = blk: {
-        const tail = try rig.statsTail();
-        defer gpa.free(tail);
-        const opened = numberAfter(tail, "\"pack_blocks_opened\":") orelse 0;
-        const gone = (numberAfter(tail, "\"pack_blocks_abandoned\":") orelse 0) + (numberAfter(tail, "\"pack_terminal_frees\":") orelse 0);
-        std.debug.print("smoke[{s}]: after rm: {d} pack block(s) live of {d} opened\n", .{ label, opened -| gone, opened });
-        break :blk (opened -| gone) * matrix_block_kib;
-    };
-    try rig.awaitUsedKib(baseline + small_kib + packs_kib);
+    // What stays is the small files: striped on the set without staging
+    // (df returns to the baseline plus them, exactly); in the ring on the
+    // staging set — EXCEPT the ones the plane's dispatch packed at the
+    // storm's ring pressure (the schedule that wins the promotions above),
+    // whose pack blocks are used space. There the rm's frees are judged
+    // by the online census once the reclaim drained — a big file's block
+    // left tracked is `[C2] leaked`, a count off is C3/C6 — and df by the
+    // pack census's bound.
+    if (cache) {
+        const tail = try rig.quiescentStatsTail();
+        gpa.free(tail);
+        var got = try fsckJsonTarget(rig, rig.mp, &.{"--online"});
+        defer got.report.deinit(gpa);
+        if (got.report.findings.len != 0) for (got.report.findings) |f| std.debug.print("  unexpected: {f}\n", .{f});
+        try testing.expectEqual(@as(usize, 0), got.report.findings.len);
+        const used = try rig.usedKib();
+        std.debug.print("smoke[{s}]: after rm: fsck --online 0 findings over {d} block(s); {d} KiB used above the baseline (the packs the dispatch filled, bound {d} blocks)\n", .{ label, got.report.counters.blocks_checked, used -| baseline, pack_census_bound });
+        try testing.expect(used >= baseline and used - baseline <= pack_census_bound * matrix_block_kib);
+    } else {
+        try rig.awaitUsedKib(baseline + small_n * (4 << 10));
+    }
     // umount: the dismount promotion; the census through `status`.
     try rig.umount();
     try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());

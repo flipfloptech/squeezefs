@@ -1202,3 +1202,20 @@ test "C17's routing check is linear in the views (0003 §AC.6): 20 directories s
     const views = 1 + DIRS + DIRS * K;
     try expectLinear("C17 routing", r.counters.c17_route_steps, views + DIRS * K + DIRS * K);
 }
+
+test "the ladder's C2-leaked / C3 / C6 re-checks derive the fresh census's references once per volume (0003 §AC.6): 400 files on one block of A and 60 leaked blocks of B, online — the 60 C2-leaked findings re-check examining ≤ 3 × (bindings + suspects) bindings, where each suspect re-derived every binding of the fresh census" {
+    const gpa = testing.allocator;
+    const set = try RamSet.init(gpa);
+    defer set.deinit();
+    try fillNamed(set, "fill", LOOKUP_FILL, VOL_A, 0);
+    for (0..LOOKUP_DAMAGE) |i| set.leak(VOL_B, @as(u64, i) % ram.BLOCKS);
+    try set.freezeEra();
+    var r = try ram.run(set, .online, .{});
+    defer r.deinit(gpa);
+    var leaked: usize = 0;
+    for (r.findings) |f| if (f == .c2_leaked) {
+        leaked += 1;
+    };
+    try testing.expectEqual(LOOKUP_DAMAGE, leaked);
+    try expectLinear("re-check derivations", r.counters.recheck_derived_steps, LOOKUP_FILL + LOOKUP_DAMAGE);
+}

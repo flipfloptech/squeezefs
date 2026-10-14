@@ -354,13 +354,16 @@ pub const Counters = struct {
     scrub_pin_unstable_cleared: u64 = 0,
     // The per-suspect lookups' work (0003 §AC.6): elements examined to name
     // a C2-lost block's owner, a C9 candidate's block count, a C10
-    // candidate's distinct names, the C17 routing check's stripes — and the
-    // store calls C11's owner scan made. Each is linear in its inputs.
+    // candidate's distinct names, the C17 routing check's stripes, the
+    // bindings the ladder's C2-leaked/C3/C6 re-checks derive references
+    // from — and the store calls C11's owner scan made. Each is linear in
+    // its inputs.
     c2_owner_steps: u64 = 0,
     c9_owner_steps: u64 = 0,
     c10_name_steps: u64 = 0,
     c11_store_calls: u64 = 0,
     c17_route_steps: u64 = 0,
+    recheck_derived_steps: u64 = 0,
     // MAX across shards (per-run gauges: every shard walks the whole
     // space). The walk's cost (`census.WalkTally`): tree nodes fetched,
     // entries delivered, entries the trees copied to deliver them, store
@@ -667,7 +670,7 @@ pub const Report = struct {
         try w.print("): {d} inode(s), {d} dentry ref(s), {d} block(s) checked, {d} refcount(s) checked, {d} node(s) walked in {d}.{d:0>3} s\n", .{ c.inodes_scanned, c.dentry_refs_indexed, c.blocks_checked, c.refcounts_checked, c.nodes_walked, c.scan_ms / 1000, c.scan_ms % 1000 });
         try w.print("walk: {d} entr(ies) visited, {d} read, {d} node(s), {d} store call(s), {d} tree(s) consulted; census {d} ms, dentries {d} ms, C1 {d} ms, classes {d} ms, re-check {d} ms, scrub {d} ms\n", .{ c.entries_visited, c.entries_read, c.nodes_walked, c.store_calls, c.trees_consulted, c.census_ms, c.dentries_ms, c.c1_ms, c.classes_ms, c.recheck_ms, c.scrub_ms });
         try w.print("suspects: {d} ({d} cleared; epoch {d}, in-flight {d}, pack {d}, era {d}, intent {d}, nlink-transient {d}, crossing {d})\n", .{ c.suspects, c.suspects_cleared, c.epoch_exempted, c.inflight_exempted, c.pack_ledger_exempted, c.current_era_exempted, c.unreferenced_intent_exempted, c.nlink_transient_cleared, c.crossing_exempted });
-        try w.print("lookups: C2 owners {d}, C9 owners {d}, C10 names {d}, C11 calls {d}, C17 routes {d}\n", .{ c.c2_owner_steps, c.c9_owner_steps, c.c10_name_steps, c.c11_store_calls, c.c17_route_steps });
+        try w.print("lookups: C2 owners {d}, C9 owners {d}, C10 names {d}, C11 calls {d}, C17 routes {d}, re-check bindings {d}\n", .{ c.c2_owner_steps, c.c9_owner_steps, c.c10_name_steps, c.c11_store_calls, c.c17_route_steps, c.recheck_derived_steps });
         if (c.scrub_blocks_scanned != 0 or c.scrub_failures != 0) {
             try w.print("scrub: {d} block(s), {d} byte(s); aead {d}, frame {d}, readability-only {d}, failures {d}\n", .{ c.scrub_blocks_scanned, c.scrub_bytes_scanned, c.scrub_aead_verified, c.scrub_frame_verified, c.scrub_readability_only, c.scrub_failures });
         }

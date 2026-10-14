@@ -471,6 +471,17 @@ pub const Pass = struct {
         return &self.fresh.cen.?;
     }
 
+    /// The fresh census's derived references of one volume (the C2-leaked,
+    /// C3 and C6 re-checks), its bindings examined counted.
+    fn recheckDerived(self: *Pass, vol_tag: u64) Error!std.AutoHashMapUnmanaged(u64, Derived) {
+        const c = try self.freshCensus();
+        var derived: std.AutoHashMapUnmanaged(u64, Derived) = .empty;
+        errdefer derived.deinit(self.gpa);
+        try self.derivedCounts(c, vol_tag, &derived);
+        for (c.owners.items) |o| self.counters.recheck_derived_steps += o.bindings.len;
+        return derived;
+    }
+
     /// The fresh dentry pass with the inode-plane suspects' identities
     /// collected (ONE, memoized). Null = INCOMPLETE: the inode-plane
     /// suspects CLEAR (a name may exist beyond the tear).
@@ -1324,10 +1335,8 @@ pub const Pass = struct {
             .c2_leaked => |f| {
                 const v = host.volume(f.vol_tag) orelse return false;
                 if (v.alloc.refcount(f.block_idx) == null) return false;
-                const c = try self.freshCensus();
-                var derived: std.AutoHashMapUnmanaged(u64, Derived) = .empty;
+                var derived = try self.recheckDerived(f.vol_tag);
                 defer derived.deinit(gpa);
-                try self.derivedCounts(c, f.vol_tag, &derived);
                 return !derived.contains(f.block_idx);
             },
             .c2_lost => |f| {
@@ -1341,10 +1350,8 @@ pub const Pass = struct {
             .c3_refcount => |f| {
                 const v = host.volume(f.vol_tag) orelse return false;
                 const rc = v.alloc.refcount(f.block_idx) orelse return false;
-                const c = try self.freshCensus();
-                var derived: std.AutoHashMapUnmanaged(u64, Derived) = .empty;
+                var derived = try self.recheckDerived(f.vol_tag);
                 defer derived.deinit(gpa);
-                try self.derivedCounts(c, f.vol_tag, &derived);
                 const n = (derived.get(f.block_idx) orelse return false).count;
                 return n > 0 and rc != n;
             },
@@ -1363,10 +1370,8 @@ pub const Pass = struct {
             },
             .c6_drift => |f| {
                 const v = host.volume(f.vol_tag) orelse return false;
-                const c = try self.freshCensus();
-                var derived: std.AutoHashMapUnmanaged(u64, Derived) = .empty;
+                var derived = try self.recheckDerived(f.vol_tag);
                 defer derived.deinit(gpa);
-                try self.derivedCounts(c, f.vol_tag, &derived);
                 const before = self.suspects.items.len;
                 try self.c6(v.*, &derived);
                 const still = self.suspects.items.len > before;

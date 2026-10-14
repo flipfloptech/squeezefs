@@ -4,7 +4,15 @@
 C's `ls` listing one more name than `find` in the shared hot directory row's phase 3, 11 cross-owner
 intents still open at A after C's kill in phase 4, `dlm_token_nonmember_refusals` firing in a
 passing run, and the owed chunked `extent_grant:` record behind the custody move's refusal past one
-tree-0 value. Decisions: 0003 §AE; 0002 row 525.
+tree-0 value. Decisions: 0003 §AE.1–§AE.4; 0002 rows 525–526.
+
+Attribution: all three defects predate perf3. Items 1 and 3's red rows fail on the pre-perf3 base
+(`05f9fd2` with the custody fix) as on `dev`, and item 2's fiber is the same code there
+(`ReclaimCadence.run`: `xvCadenceTick`, then `wp.tick()`; `cadenceTick` sweeping first). Each
+cause is older: the merged readdir's restart came with `cd5a9d3` (2026-10-13), the token holder's
+single lease judgement and its unwoken parked grant with `8798f10` (2026-10-08), and the one meta
+fiber for the cross-owner passes and the membership work with `a4ca3c0` and `1433a48`
+(2026-10-08).
 
 ## 1. C's `ls` listing one name more than its `find` (item 1)
 
@@ -43,6 +51,73 @@ new holder after B's recovery, migrates the phase-1 names; C's `ls` crossed one 
   listing unspecified). The range past the cover — unconsumed, ineligible until `D`'s next page —
   is read again as before, so U.3's no-miss argument stands. The stream's consumed-cookie word is
   gone. Both rows green (the U.3 row and the wide-reply row), every stripe row green.
+- **Attribution**: the red row fails on `05f9fd2` too. The restart from the consumed cookie came
+  with `cd5a9d3` (2026-10-13, "the merged readdir reads D before its stripes over every cookie
+  range"), which predates perf3.
+
+## 2. Open intents that never rolled forward after C's death (item 2)
+
+### 2.1 The defect
+
+`rung-10-tripwire-hunt.md` §5: once, in phase 4 of the shared hot directory row, 11 cross-owner
+intents stood open at A for the row's whole 120 s wait after C's kill — and no
+`xv_cross_owner_intent_stuck` fired, although an abandoned intent older than 45 s fires it at the
+register's next publish. So the publish never ran again: the fiber that runs it had stopped.
+
+The mount ran ONE meta fiber for all of its background cadence (`cli/mount.zig` `ReclaimCadence`):
+the corpse reclaim, the cross-owner cadence — `Plane.cadenceTick`: the parked guard scopes' expiry
+sweep, the register's publish, the roll-forward of abandoned intents, then the stripe migration —
+and the cluster wire's tick: evictions at `T_owner`, the grace reap, the death ledger's poll with
+the recoveries it acts and, after a recovery, the roll-forward of the recovered slots' intents
+(`rollForwardRecovered`). The roll-forward and the migration take the plan's guards in this
+process's table with a WAITING `lockManyWide`; a served `XvGuards` from another member parks a
+scope in that same table (`guards.ParkedScopes`), released by the member's `XvRelease` — or, for a
+member that died holding it, only by the expiry sweep after the owner evicts it. Both the sweep and
+the eviction ran on the fiber that was waiting: a pass that met a dead member's scope waited for
+ever (and with it every later eviction, recovery, sweep and publish; every op of the process on the
+same stripe waited too, until the kernel's request timeout ended the connection).
+
+### 2.2 The red row
+
+Waiting for the 1-in-~100 recurrence would not pin the cause, so the row was made to meet it: phase
+4 now storms C too, through its kill (`f839d5f`) — C dies holding scopes parked at A by its own
+creates into A's stripes, the contract the row states ("kill -9 C … mid-storm"). On the tree
+before the fix (`dev` with items 4, 1 and 3) the row failed **5 of 10** runs (one manual run, 1 of
+3 in a first loop, 3 of 6 interleaved with the fixed build, half of each under 4 × `yes`):
+A never evicted C (`appender_recoveries` stuck at 1; A's log has no second `tick — 1 evicted`
+line), A's create into `hot` parked at `handler_entry` with `lock_ticked_reregisters` climbing for
+50 s until the kernel's 51 s request timeout ended A's connection (`StatsUnreadable` at the
+recovery wait). The original failure is the same stall entered later: after C's recovery, with its
+11 intents adopted, a pass met a scope C had parked, and the publish (the stuck tripwire's only
+caller) rode the stalled fiber.
+
+All five failures carry the same signature: A's watchdog names one `create` (ino 3, the hot
+directory) parked at `handler_entry` with `lock_ticked_reregisters` climbing.
+
+### 2.3 The fix (0003 §AE.2, `d2413bd`)
+
+- **The membership cadence on a fiber of its own** (`MembershipCadence`, spawned on a symmetric
+  set): the wire's tick, then the parked scopes' expiry sweep and the register's publish
+  (`kv_fs.xvSweepTick` → `Plane.sweepParked`). Nothing it runs waits on a DLM guard — it is what
+  dooms a dead member's lease and frees the scopes it parked — so a pass on the reclaim cadence
+  waiting on such a scope resumes within a tick of the eviction, and evictions and recoveries never
+  wait behind a roll-forward's ship timeouts.
+- **The poll adopts; the cadence rolls forward**: after a recovery the death ledger's poll hands the
+  recovered slots' open intents to the cross-owner register (`Plane.adoptRecovered`: the homes
+  scanned, every unknown intent adopted abandoned — reads only, no guard, no dispatch;
+  `recovery_intents_adopted`) and the reclaim cadence's next pass completes them.
+  `rollForwardRecovered` is gone; `Plane.cadenceTick` no longer sweeps.
+- **The plane row** (`two_holders` "a roll-forward waiting on a guard scope a DEAD member parked is
+  freed by the membership cadence's sweep, which never waits behind it"): A's abandoned create, a
+  scope parked at A over its child by a member the owner lists live, the pass on its own thread —
+  the sweep keeps the live member's scope; once the owner lists it dead the sweep releases it at
+  once (`swept_dead` + 1) and the pass completes the create; then a new incarnation's
+  `adoptRecovered` adopts an intent on the store (counted open, nothing dispatched) and the pass
+  completes it.
+- **Attribution**: the stall predates perf3. On `05f9fd2` `ReclaimCadence.run` already calls
+  `xvCadenceTick` and then `wp.tick()` on one fiber, and `Plane.cadenceTick` sweeps the parked
+  scopes before the roll-forward. The parked scopes and the waiting roll-forward came with
+  `a4ca3c0`, and the wire's tick joined that fiber with `1433a48` (both 2026-10-08).
 
 ## 3. `dlm_token_nonmember_refusals` in a passing run (item 3)
 
@@ -82,18 +157,21 @@ fires in a green run is a defect of the instrument.
 
 ### 3.3 The red rows and the fix (0003 §AE.3, 0002 row 526)
 
-- **Red** (`34ca8b0`, portable, `tokens.zig`): "a grant ask from a member whose lease lapsed before
+- **Red** (`64e99c4`, portable, `tokens.zig`): "a grant ask from a member whose lease lapsed before
   its eviction ran … is refused NotMember and counted … never a tripwire" — on `dev` the tripwire's
   error log (the test runner fails it) and `invariant_tripwires` + 1; "a grant ask parked on the
   member's OWN pending recall whose lease lapses during the wait … is refused NotMember at its
   registration" (the member unreachable for pushes, its lease 400 ms from expiry, the pass on its
   own thread) — on `dev` the ask was never woken at the expiry: the client's call answered
   `Deferred` at its reply bound.
-- **Fix** (`bd0bc6e`): `dlm_token_nonmember_refusals` is a `ShardedCounter` with a warning naming
+- **Fix** (`b95574c`): `dlm_token_nonmember_refusals` is a `ShardedCounter` with a warning naming
   the client (its reason on its declaration); the lease is judged at the ask AND before every
   registration (`Holder.refuseExpired`); a frame the pass retires at a lease's expiry or past the
   deadline posts the ack's wake (`ack_wake.notifyWaiters`) so every grant parked on that recall
   re-judges at once. Both rows green; the ghost-member row keeps its refusal, now counted.
+- **Attribution**: both red rows fail on `05f9fd2` too (the tripwire's error log; `Deferred`). The
+  holder's grant table with its single lease judgement came with `8798f10` (2026-10-08), which
+  predates perf3.
 
 ## 4. The grant record as a family of chunks (item 4)
 
@@ -164,7 +242,7 @@ cap had no room for a 64 KiB record beside it (the entry refused `ValueTooLarge`
   tree-0 value carries MOVES"): the manager's RAM volume at 64 KiB nodes; slot 5's tree unleased
   under a root; a `treeImages` seam answering 1,500 scattered extents (every other one of
   [1000, 4000)); appender 2's `AcquireSlots`. On `dev`: `error.Rejected` — the custody cap. Green
-  (`ea8ed23`): the grant lands, `extent_grant_images_transferred_in` + 1,500, the record holds
+  (`3046b79`): the grant lands, `extent_grant_images_transferred_in` + 1,500, the record holds
   exactly the even extents in ⌈1,500 / 253⌉ = 6 chunks, and appender 2's `ReleaseSlot` takes all
   1,500 back out (`_out` + 1,500, the family empty).
 - `manager` "a custody move whose chunks do not fit the lease's entry is STAGED": 1,400 scattered

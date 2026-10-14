@@ -84,8 +84,18 @@ run_in() {
   # Scripted runs and agents have no TTY — `-t` there would fail the exec.
   local tty=()
   if [ -t 0 ]; then tty=(-t); fi
+  local cmd="$*"
+  # ONE full gate at a time on the venue: a gate derives its shard counts from
+  # the whole VM (4 unit shards × ~2 GiB + 4 smoke shards with daemons + the
+  # compile), so two or three concurrent gates over-commit its 16 GiB until the
+  # kernel livelocks reclaiming page cache — on 2026-10-14 not even an `exec`
+  # of `echo` could start for 5 minutes and the VM had to be stopped from the
+  # host. A gate waits here (flock on the shared /build volume) and says so.
+  if printf '%s' "$cmd" | grep -Eq 'zig build[^;&|]*[[:space:]]gate([[:space:]]|$)'; then
+    cmd="flock -E 75 -n /build/.gate.lock true 2>/dev/null || echo 'venue: another full gate is running — waiting for /build/.gate.lock' >&2; flock /build/.gate.lock bash -lc $(printf '%q' "$cmd")"
+  fi
   # -lc so PATH picks up /usr/local/bin/zig; cd into the repo at the same path.
-  container exec -i ${tty[@]+"${tty[@]}"} "$NAME" bash -lc "$export_cache; cd '$REPO' && $*"
+  container exec -i ${tty[@]+"${tty[@]}"} "$NAME" bash -lc "$export_cache; cd '$REPO' && $cmd"
 }
 
 case "${1:-}" in

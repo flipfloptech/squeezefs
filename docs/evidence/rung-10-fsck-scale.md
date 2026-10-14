@@ -145,7 +145,24 @@ sender's channel lock). 0003 §AC.4.
 
 ## 5. Gates
 
-(filled below)
+| gate | venue | result | wall |
+|---|---|---|---|
+| Linux, the code commits, dev's cost tables | venue | 49/49 steps, 2,846 / 2,919 passed (73 skipped) | 6 m 11 s |
+| macOS, the same tree | dev box | 29/29 steps, 2,213 / 2,242 passed (29 skipped) | 2 m 57 s |
+| Linux, uncached, the final tree (regenerated cost tables) | venue (recreated, below) | 49/49 steps, **2,846 / 2,919 passed (73 skipped)** | **6 m 37 s** |
+| macOS, the final tree | dev box | 29/29 steps, **2,238 / 2,267 passed (29 skipped)** | **3 m 00 s** |
+
+In between, four Linux gates on the final tree failed on heavy smoke rows — the shared hot
+directory (an intent stuck past the membership TTL after the metadata heap refused a commit; the
+joiner's grant-closure and the recovery's extent tripwires once each in standalone runs) and the
+block-map tree (`lock_ticked_reregisters` 2 with its 1.5 GiB rewrite at 47 MB/s against its usual
+142–187) — while the host's disk filled: `/build` is a sparse image whose freed blocks return only
+on `fstrim`, the session's curves, loops and gates grew it to 116 MiB free on the host, and the
+venue's root fs went `emergency_ro` (the last two gates: every socket/memfd e2e `OpenFailed`).
+After `fstrim /build` (107 GiB returned) and the container's recreation the uncached gate is
+green; the hot-directory row passed 12 of 14 standalone runs on this branch (both failures in
+that window) and 13 of 13 on pristine `dev`, interleaved, idle and under 4 × `yes`. An auto-trim
+monitor (`fstrim /build` below 40 GiB free on the host) now runs beside the session.
 
 ## 6. Owed
 

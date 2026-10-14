@@ -91,8 +91,16 @@ run_in() {
   # kernel livelocks reclaiming page cache — on 2026-10-14 not even an `exec`
   # of `echo` could start for 5 minutes and the VM had to be stopped from the
   # host. A gate waits here (flock on the shared /build volume) and says so.
+  # And at most TWO builds at once otherwise: an LTO link of the product takes several GB, and
+  # four agents' targeted builds beside the gate train got the compiler OOM-killed (signal
+  # KILL) the same day. Two build slots (flock /build/.build-slot.{0,1}); a full gate holds
+  # the gate lock AND both slots, so it runs alone. A command whose own exit status is 75
+  # (EX_TEMPFAIL) is indistinguishable from "slot busy" — none of ours uses it.
+  local q; q=$(printf '%q' "$cmd")
   if printf '%s' "$cmd" | grep -Eq 'zig build[^;&|]*[[:space:]]gate([[:space:]]|$)'; then
-    cmd="flock -E 75 -n /build/.gate.lock true 2>/dev/null || echo 'venue: another full gate is running — waiting for /build/.gate.lock' >&2; flock /build/.gate.lock bash -lc $(printf '%q' "$cmd")"
+    cmd="flock -n /build/.gate.lock true 2>/dev/null || echo 'venue: another full gate is running — waiting for /build/.gate.lock' >&2; flock /build/.gate.lock flock /build/.build-slot.0 flock /build/.build-slot.1 bash -lc $q"
+  elif printf '%s' "$cmd" | grep -Eq 'zig build'; then
+    cmd="r=75; for s in 0 1; do flock -n -E 75 /build/.build-slot.\$s bash -lc $q; r=\$?; [ \$r -ne 75 ] && break; done; if [ \$r -eq 75 ]; then echo 'venue: two builds are running — waiting for a build slot' >&2; flock /build/.build-slot.0 bash -lc $q; r=\$?; fi; exit \$r"
   fi
   # -lc so PATH picks up /usr/local/bin/zig; cd into the repo at the same path.
   container exec -i ${tty[@]+"${tty[@]}"} "$NAME" bash -lc "$export_cache; cd '$REPO' && $cmd"

@@ -262,6 +262,9 @@ pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
 pub const LaneSnapshot = struct {
     lane_writes: u64,
     structural_writes: u64,
+    /// Write runs pushed to the ring (a short write's re-push included):
+    /// one CQE each, so one fiber wake at most each.
+    runs: u64,
     parks: u64,
     tick_rescues: u64,
     backstop_ticks: u64,
@@ -279,6 +282,7 @@ pub const LaneSnapshot = struct {
 const LaneStats = struct {
     lane_writes: std.atomic.Value(u64) = .init(0),
     structural_writes: std.atomic.Value(u64) = .init(0),
+    runs: std.atomic.Value(u64) = .init(0),
     parks: std.atomic.Value(u64) = .init(0),
     tick_rescues: std.atomic.Value(u64) = .init(0),
     backstop_ticks: std.atomic.Value(u64) = .init(0),
@@ -298,6 +302,7 @@ const LaneStats = struct {
         return .{
             .lane_writes = self.lane_writes.load(.monotonic),
             .structural_writes = self.structural_writes.load(.monotonic),
+            .runs = self.runs.load(.monotonic),
             .parks = self.parks.load(.monotonic),
             .tick_rescues = self.tick_rescues.load(.monotonic),
             .backstop_ticks = self.backstop_ticks.load(.monotonic),
@@ -1073,6 +1078,7 @@ pub const JournalLane = struct {
         sqe.prep_write(self.sqeFd(), r.data[r.written..], r.offset + r.written);
         if (self.fixed_file) sqe.flags |= linux.IOSQE_FIXED_FILE;
         sqe.user_data = ud_slot_base + i;
+        LaneStats.bump(&self.stats.runs);
         return true;
     }
 

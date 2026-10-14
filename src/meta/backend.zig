@@ -3347,9 +3347,20 @@ test "ONE thread per volume: the pass runs on sqz-jrnl<N>; a 4-thread storm of s
     try testing.expectEqual(cs.lane_handoffs.load(), snap.lane_writes);
     try testing.expectEqual(@as(u64, 0), snap.tick_rescues);
     try testing.expectEqual(@as(u64, 0), journal_lane.stats.ack_out_of_order.load());
-    // Parks per window: the wake (admit) and the CQE (group + ack) at most;
-    // + 1 for the idle park after the last window.
-    try testing.expect(snap.parks <= 2 * snap.lane_writes + 1);
+    // Parks per window: the wake (admit) and the CQE (group + ack) at most.
+    // Every park ends on one wake, and every wake has a cause the lane
+    // counts: a publish (a window, a structural entry — the storm's leaf
+    // splits — or a barrier request), a CQE (one per run pushed, one per
+    // barrier), the completion kick a structural entry owes, the backstop
+    // tick; + 1 for the idle park after the last window. The bound was
+    // `2 × windows + 1`: it held only while the storm's windows coalesced
+    // enough to absorb the splits' entries and the barrier — under 8-way
+    // load the windows grew, each cost its 2 wakes, and 2 splits + 1
+    // barrier tipped it (256 parks over 125 windows, 3/100 runs red).
+    const barriers = snap.barriers_coalesced + snap.barriers_strict;
+    const publishes = snap.lane_writes + snap.structural_writes + barriers;
+    const cqes = snap.runs + barriers;
+    try testing.expect(snap.parks <= publishes + cqes + snap.structural_writes + snap.backstop_ticks + snap.tick_rescues + 1);
     // THE venue pin: stage A ran on the journal lane's thread.
     try testing.expect(cs.leader_passes.load() > 0);
     try testing.expectEqual(@as(u64, @intCast(be.lane.threadId())), be.cv.passThread());

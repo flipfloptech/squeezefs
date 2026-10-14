@@ -160,6 +160,7 @@ pub const data = struct {
 // ---- operations: fsck/scrub, the job fabric + lifecycle + defrag, nvmet targets, the zcrx lane (charter §8) ----
 pub const ops = struct {
     pub const fsck = @import("ops/fsck.zig");
+    pub const fsck_scale = if (builtin.os.tag == .linux) @import("ops/fsck/scale.zig") else struct {};
     pub const jobs = @import("ops/jobs.zig");
     pub const lifecycle = @import("ops/lifecycle.zig");
     pub const defrag = @import("ops/defrag.zig");
@@ -222,6 +223,7 @@ test {
     _ = gates.census;
     _ = gates.literals;
     _ = ops.fsck;
+    if (builtin.os.tag == .linux) _ = ops.fsck_scale;
     _ = ops.jobs;
     _ = ops.lifecycle;
     _ = ops.defrag;

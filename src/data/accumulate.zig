@@ -1841,6 +1841,35 @@ test "the device-write ledger closes on a superseded upload (decision 0003 §AK.
     try testing.expectEqual(@as(u64, PAGE), pipeline.stats.write_pipeline_superseded_bytes.load() - sb0);
 }
 
+test "a transformed tail's upload transforms its LIVE bytes only (decision 0003 §AK.4): a 100 B tail in a block lands ONE grain (the XOR transform's image is its plaintext's length), never the block nor its whole first frame — the bytes past it read back as zeros past the image's plaintext" {
+    const io = testing.io;
+    const w = try UploadWorld.init(testing.allocator);
+    defer w.deinit(testing.allocator);
+    try w.f.map.create(8, .striped, 0);
+    const e = w.table.checkout(8, 0, false, null).?;
+    var tail: [100]u8 = undefined;
+    for (&tail, 0..) |*b, i| b.* = @truncate(i + 1);
+    _ = try w.table.recordWrite(e, 0, &tail);
+    w.table.zeroComplete(e);
+    var pool = try transform.ScratchPool.init(testing.allocator, 1, wt.BS);
+    defer pool.deinit(testing.allocator);
+    var deps = w.deps();
+    deps.transform = XorSeam.seam;
+    deps.scratch = &pool;
+    w.f.dev.resetLedger();
+    const wt0 = stats.write_through_bytes.load();
+    var prof = pipeline.Prof.start();
+    try testing.expectEqual(Disposition.published, uploadParkedBlock(&w.table, deps, io, 8, 0, &prof));
+    prof.finish();
+    // The image is the live bytes; the DMA pads it to the grain.
+    try testing.expectEqual(@as(u64, tail.len), w.f.dev.writeBytesTotal());
+    try testing.expectEqual(@as(u64, PAGE), stats.write_through_bytes.load() - wt0);
+    const b = w.f.map.seam().lookup(8, 0).?;
+    var got: [PAGE]u8 = undefined;
+    w.f.dev.peek(b.vol_tag, b.offset, &got);
+    for (got[0..tail.len], tail) |g, t| try testing.expectEqual(t ^ XorSeam.MARK, g);
+}
+
 test "the overwrite write-through FEEDS the rewrite epoch (no per-block merge); a full-coverage feed closes the epoch; ENOSPC early-close frees parked supply and the upload lands; a fenced merge is a counted fence drop freeing nothing" {
     const io = testing.io;
     const w = try UploadWorld.init(testing.allocator);

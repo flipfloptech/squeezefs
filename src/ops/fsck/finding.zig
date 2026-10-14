@@ -378,7 +378,7 @@ pub const Counters = struct {
     const max_fields = [_][]const u8{ "nodes_walked", "entries_visited", "entries_read", "store_calls", "trees_consulted", "scan_ms", "census_ms", "dentries_ms", "c1_ms", "classes_ms", "recheck_ms", "scrub_ms", "inode_plane_slots_covered" };
 
     fn isMaxField(comptime name: []const u8) bool {
-        @setEvalBranchQuota(10_000);
+        @setEvalBranchQuota(10_000); // comptime: the field-name match over the max list per counter (the default 1 000 branches ran out at 13 max fields)
         inline for (max_fields) |m| if (comptime std.mem.eql(u8, m, name)) return true;
         return false;
     }

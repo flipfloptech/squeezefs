@@ -557,6 +557,89 @@ test "an intent whose step-0 commit fails EIO (the record never durable) leaves 
     r.forget(2);
 }
 
+test "a roll-forward waiting on a guard scope a DEAD member parked is freed by the membership cadence's sweep, which never waits behind it (decision 0003 §AE.2; the shared hot directory row: C killed mid-storm with scopes parked at A, A's reclaim fiber waiting on one of them while the same fiber's sweep and eviction never ran again); the recovered slots' open intents are ADOPTED by the poll, reads only, and completed by the pass" {
+    const gpa = testing.allocator;
+    const f = try TwoHolders.init(gpa, testing.io, .{ .ship_fail_at = 1 }, .{});
+    defer f.deinit();
+    try f.b.seedDir(DIR_B);
+    const s0 = Snapshot.take();
+    const child = f.a.mint();
+    const plan = steps.planCreate(.{ .parent = DIR_B, .name = "f", .child = child, .mode = S.IFREG | 0o644, .uid = 1, .gid = 2, .now = 1_000 });
+    try testing.expectError(error.ShipFailed, f.a.run(&plan));
+    try testing.expect(f.a.plane.register.anyAbandoned());
+    // A dead member's scope parked at A over a key the plan takes in A's
+    // own table; the owner's word on it: dead.
+    const Owner = struct {
+        dead: std.atomic.Value(bool) = .init(false),
+        fn verdict(ctx: *anyopaque, _: u64, _: u64, _: u64) guards.Verdict {
+            const o: *@This() = @ptrCast(@alignCast(ctx));
+            return if (o.dead.load(.acquire)) .dead else .live;
+        }
+    };
+    var owner: Owner = .{};
+    f.a.plane.parked.bindLiveness(.{ .ctx = &owner, .verdict = &Owner.verdict }, guards.SCOPE_GRACE_NS);
+    defer f.a.plane.parked.bindLiveness(null, guards.SCOPE_GRACE_NS);
+    const scope = guards.mintScope(77);
+    try f.a.plane.parked.serve(scope, 0xC0, &.{.{ .ino = child, .mode = .exclusive }}, &.{});
+    // The pass on the reclaim cadence's stand-in thread: it waits on the
+    // scope.
+    const Pass = struct {
+        f: *TwoHolders,
+        done: std.atomic.Value(bool) = .init(false),
+        n: u32 = 0,
+        failed: bool = false,
+        fn run(self: *@This()) void {
+            self.n = self.f.a.plane.cadenceTick(clock.monotonicNs()) catch blk: {
+                self.failed = true;
+                break :blk 0;
+            };
+            self.done.store(true, .release);
+        }
+    };
+    var pass: Pass = .{ .f = f };
+    const th = try std.Thread.spawn(.{}, Pass.run, .{&pass});
+    var joined = false;
+    defer if (!joined) {
+        _ = f.a.plane.parked.release(scope);
+        th.join();
+    };
+    // While the member lives its scope stands: the sweep keeps it.
+    try testing.expectEqual(@as(u32, 0), f.a.plane.sweepParked(clock.monotonicNs()));
+    try testing.expect(f.a.plane.parked.isParked(scope));
+    // Evicted: the membership cadence's sweep frees it at once — it never
+    // waits on the pass — and the pass completes.
+    owner.dead.store(true, .release);
+    const swept0 = guards.stats.xv_cross_owner_guards_swept_dead.load();
+    try testing.expectEqual(@as(u32, 1), f.a.plane.sweepParked(clock.monotonicNs()));
+    try testing.expectEqual(swept0 + 1, guards.stats.xv_cross_owner_guards_swept_dead.load());
+    const deadline = clock.monotonicNs() + 10 * std.time.ns_per_s;
+    while (!pass.done.load(.acquire) and clock.monotonicNs() < deadline) try testing.io.sleep(.fromMilliseconds(1), .awake);
+    try testing.expect(pass.done.load(.acquire));
+    th.join();
+    joined = true;
+    try testing.expect(!pass.failed);
+    try testing.expectEqual(@as(u32, 1), pass.n);
+    try testing.expectEqual(child, (try f.b.dentry(DIR_B, "f")).?.child);
+    try f.closureHolds(s0.minted, s0.retired, s0.open);
+    try f.noOpenIntents();
+    // The poll's hand-off: an intent no register knows (a new incarnation
+    // over the store) is adopted — counted open, nothing dispatched — and
+    // the pass completes it.
+    const child2 = f.a.mint();
+    const plan2 = steps.planCreate(.{ .parent = DIR_B, .name = "g", .child = child2, .mode = S.IFREG | 0o644, .uid = 1, .gid = 2, .now = 1_000 });
+    f.a.plane.seams.ship_fail_at = f.a.plane.ships.load(.monotonic) + 1;
+    try testing.expectError(error.ShipFailed, f.a.run(&plan2));
+    try f.remount(&f.a, .{});
+    const s1 = Snapshot.take();
+    try testing.expectEqual(@as(u32, 1), try f.a.plane.adoptRecovered(clock.monotonicNs()));
+    try testing.expect((try f.b.dentry(DIR_B, "g")) == null);
+    try testing.expectEqual(s1.open + 1, intent.stats.xv_cross_owner_intents_open.load());
+    try testing.expectEqual(@as(u32, 0), try f.a.plane.adoptRecovered(clock.monotonicNs()));
+    try testing.expectEqual(@as(u32, 1), try f.a.plane.cadenceTick(clock.monotonicNs()));
+    try testing.expectEqual(child2, (try f.b.dentry(DIR_B, "g")).?.child);
+    try f.noOpenIntents();
+}
+
 test "an abandoned create whose name a retry took meanwhile is COMPENSATED by the roll-forward (found by the shared hot directory row: fsck C9 found a live inode named by no dentry after kill -9 of a stripes' holder — a create's ship failed against the corpse, the shell retried the SAME name and won it after the recovery, and the roll-forward skipped the refused insert and retired, orphaning the first attempt's child): the minted child destroyed, the intent retired, the retry's name intact, counted" {
     const gpa = testing.allocator;
     const f = try TwoHolders.init(gpa, testing.io, .{ .ship_fail_at = 1 }, .{});

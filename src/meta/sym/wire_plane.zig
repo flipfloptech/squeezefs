@@ -178,7 +178,7 @@ const ManagerHalf = struct {
     /// volumes is recovered by its poll.
     bindings: []*volume_bind.VolumeBinding,
     hooks: []death_ledger.VolumeHook,
-    roll_forward: volume_bind.RollForwardBinding,
+    adoption: volume_bind.AdoptionBinding,
     rename_store: RenameStore,
     rename_lease: dir_rename.Lease,
     rename_svc: dir_rename.LeaseService,
@@ -571,7 +571,7 @@ pub const WirePlane = struct {
             .projection = undefined,
             .bindings = &.{},
             .hooks = &.{},
-            .roll_forward = .{ .plane = self.steps.plane },
+            .adoption = .{ .plane = self.steps.plane },
             .rename_store = .{ .plane = self },
             .rename_lease = undefined,
             .rename_svc = undefined,
@@ -617,7 +617,7 @@ pub const WirePlane = struct {
         }
         m.bindings = bindings;
         m.hooks = hooks;
-        m.projection = .{ .ledger = &m.ledger, .volumes = hooks[0..n_bound], .vol_tags = &.{}, .roll_forward = m.roll_forward.seam() };
+        m.projection = .{ .ledger = &m.ledger, .volumes = hooks[0..n_bound], .vol_tags = &.{}, .adoption = m.adoption.seam() };
         m.rename_lease = .{ .io = self.io, .store = m.rename_store.store(), .term = term, .own_id = sym0.region0().appenderId() };
         m.rename_svc = .{ .lease = &m.rename_lease };
         // The holder-decided handover over the wire (charter §5.5): every

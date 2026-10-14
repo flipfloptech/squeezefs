@@ -756,12 +756,23 @@ fn mountMain(ctx: *Ctx) u8 {
     var wd = watchdog.Watchdog.init(&registry);
     if (ctx.heartbeat) |h| wd.on_tick = .{ .ctx = h, .call = &beatHeartbeat };
     var wd_fut = ctx.sqz.spawnMeta(watchdogMain, .{ &wd, io }) catch return ctx.failed("cannot spawn the watchdog", .{});
-    var reclaim: ReclaimCadence = .{ .fs = &fs, .io = io, .wire = wire, .plane = plane, .node = node };
+    var reclaim: ReclaimCadence = .{ .fs = &fs, .io = io, .plane = plane, .node = node };
     var reclaim_fut = ctx.sqz.spawnMeta(ReclaimCadence.run, .{&reclaim}) catch {
         wd.requestStop();
         wd_fut.cancel(io);
         return ctx.failed("cannot spawn the reclaim cadence", .{});
     };
+    // The membership cadence on a fiber of its own (decision 0003 §AE.2):
+    // a symmetric set's evictions, death-ledger poll and parked-scope sweep
+    // never wait behind the reclaim cadence's guard-taking passes.
+    var membership: ?MembershipCadence = if (wire) |wp| .{ .fs = &fs, .io = io, .wire = wp } else null;
+    var membership_fut: ?@TypeOf(reclaim_fut) = if (membership) |*m| ctx.sqz.spawnMeta(MembershipCadence.run, .{m}) catch {
+        wd.requestStop();
+        wd_fut.cancel(io);
+        reclaim.requestStop();
+        reclaim_fut.cancel(io);
+        return ctx.failed("cannot spawn the membership cadence", .{});
+    } else null;
     // The times drain (decision 0003 §L.6): the parked write stamps and
     // SETATTR echoes journaled once per flush interval; strict mode parks
     // nothing and runs no cadence.
@@ -771,6 +782,10 @@ fn mountMain(ctx: *Ctx) u8 {
         wd_fut.cancel(io);
         reclaim.requestStop();
         reclaim_fut.cancel(io);
+        if (membership_fut) |*f| {
+            membership.?.requestStop();
+            f.cancel(io);
+        }
         return ctx.failed("cannot spawn the times drain cadence", .{});
     };
 
@@ -805,6 +820,10 @@ fn mountMain(ctx: *Ctx) u8 {
     session.close();
     reclaim.requestStop();
     reclaim_fut.cancel(io);
+    if (membership_fut) |*f| {
+        membership.?.requestStop();
+        f.cancel(io);
+    }
     if (times_drain_fut) |*f| {
         times_drain.requestStop();
         f.cancel(io);
@@ -1109,13 +1128,11 @@ fn beatHeartbeat(ctx: *anyopaque) void {
     h.beat();
 }
 
-/// The periodic drain of the corpse gather (module doc).
+/// The periodic drain of the corpse gather (module doc), the cross-owner
+/// roll-forward and stripe migration — passes that may wait on a DLM guard.
 const ReclaimCadence = struct {
     fs: *BackendFs,
     io: Io,
-    /// The cluster wire's cadence (eviction, grace reap, the ledger poll)
-    /// rides the same fiber; null on a `--single-writer` set.
-    wire: ?*sym_wire.WirePlane,
     /// The plane's fill census + the fabric's write-rate sample ride the
     /// same tick (the "health-worker cadence" of the router).
     plane: *plane_mod.DataPlane,
@@ -1134,12 +1151,40 @@ const ReclaimCadence = struct {
             defer trace.finish();
             var ctx: filesystem.Ctx = .{ .unique = 0, .uid = 0, .gid = 0, .pid = 0, .io = self.io, .trace = &trace, .wd_slot = null, .window = &.{} };
             self.fs.reclaimDrain(&ctx) catch |e| log.err("reclaim cadence: drain failed: {t}", .{e});
-            // The cross-owner cadence rides the same meta fiber: the expiry
-            // sweep, the roll-forward of abandoned intents, the gauges.
+            // The cross-owner cadence rides the same meta fiber: the
+            // roll-forward of abandoned intents, the stripe migration.
             self.fs.xvCadenceTick();
-            if (self.wire) |wp| wp.tick();
             self.plane.refreshCensus() catch |e| log.err("reclaim cadence: the fill census could not refresh: {t}", .{e});
             if (self.node) |n| n.sampleWriteRate(write_admit.stats.ledgerSum());
+        }
+    }
+};
+
+/// The membership cadence (decision 0003 §AE.2): the cluster wire's tick —
+/// evictions at `T_owner`, the grace reap, the death ledger's poll with the
+/// recoveries it acts and the open intents it hands to the cross-owner
+/// cadence — then the parked guard scopes' expiry sweep. Nothing it runs
+/// waits on a DLM guard: it is what dooms a dead member's lease and frees
+/// the scopes that member parked, so a roll-forward or a migration waiting
+/// on one (the reclaim cadence) resumes within a tick of the eviction —
+/// on one fiber they waited on each other for ever (the shared hot
+/// directory row: C killed mid-storm, never evicted).
+const MembershipCadence = struct {
+    fs: *BackendFs,
+    io: Io,
+    wire: *sym_wire.WirePlane,
+    stop: std.atomic.Value(bool) = .init(false),
+
+    fn requestStop(self: *MembershipCadence) void {
+        self.stop.store(true, .release);
+    }
+
+    fn run(self: *MembershipCadence) void {
+        while (!self.stop.load(.acquire)) {
+            self.io.sleep(.fromNanoseconds(RECLAIM_CADENCE_NS), .awake) catch return;
+            if (self.stop.load(.acquire)) return;
+            self.wire.tick();
+            self.fs.xvSweepTick();
         }
     }
 };

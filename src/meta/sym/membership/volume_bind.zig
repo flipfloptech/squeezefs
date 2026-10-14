@@ -1136,20 +1136,21 @@ pub const VolumeBinding = struct {
     };
 };
 
-/// The set-level roll-forward the poll runs after a recovery acted: the
-/// cross-owner plane adopts and completes the recovered slots' open
-/// intents (`xv.ops.Plane.rollForwardRecovered`).
-pub const RollForwardBinding = struct {
+/// The hand-off the poll runs after a recovery acted: the cross-owner
+/// plane ADOPTS the recovered slots' open intents (`xv.ops.Plane.
+/// adoptRecovered` — reads only) and its cadence completes them; the poll
+/// rides the membership cadence, which never waits on a guard.
+pub const AdoptionBinding = struct {
     plane: *xv_set_bind.SetPlane,
 
-    pub fn seam(self: *RollForwardBinding) death_ledger.RollForward {
-        return .{ .ctx = self, .rollForward = &rollForward };
+    pub fn seam(self: *AdoptionBinding) death_ledger.IntentAdoption {
+        return .{ .ctx = self, .adopt = &adopt };
     }
 
-    fn rollForward(ctx: ?*anyopaque) u32 {
-        const self: *RollForwardBinding = @ptrCast(@alignCast(ctx.?));
-        return self.plane.rollForwardRecovered(clock.monotonicNs()) catch |e| blk: {
-            log.warn("recovery: the recovered slots' open intents could not be rolled forward ({s}) — the cadence retries", .{@errorName(e)});
+    fn adopt(ctx: ?*anyopaque) u32 {
+        const self: *AdoptionBinding = @ptrCast(@alignCast(ctx.?));
+        return self.plane.adoptRecovered(clock.monotonicNs()) catch |e| blk: {
+            log.warn("recovery: the recovered slots' open intents could not be read for the roll-forward ({s}) — the next pass adopts them", .{@errorName(e)});
             break :blk 0;
         };
     }

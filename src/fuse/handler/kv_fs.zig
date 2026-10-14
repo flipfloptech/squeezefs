@@ -587,13 +587,22 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             st.destroy();
         }
 
-        /// The cadence tick the daemon's meta fiber drives: the expiry
-        /// sweep, the roll-forward of abandoned intents, the gauges, the
-        /// striped directories' lazy migration.
+        /// The cross-owner cadence the daemon's reclaim fiber drives: the
+        /// roll-forward of abandoned intents, the gauges, the striped
+        /// directories' lazy migration — passes that may wait on a guard.
         pub fn xvCadenceTick(self: *Self) void {
             const p = self.xv orelse return;
             _ = p.cadenceTick(clock.monotonicNs()) catch |e| log.warn("cross-owner cadence: a roll-forward pass failed ({t}); the next tick retries", .{e});
             if (self.stripes) |st| st.tick();
+        }
+
+        /// The membership cadence's cross-owner half (decision 0003 §AE.2):
+        /// the parked guard scopes' expiry sweep and the register's gauges —
+        /// never a wait on a guard (it frees the guards the reclaim fiber's
+        /// passes may wait on).
+        pub fn xvSweepTick(self: *Self) void {
+            const p = self.xv orelse return;
+            _ = p.sweepParked(clock.monotonicNs());
         }
 
         /// The wall-clock stamp every record mutation carries.

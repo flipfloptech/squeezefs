@@ -62,7 +62,9 @@ pub const stats = struct {
     /// A manager that released its role under the vol-0 rule.
     pub var manager_role_releases: counters.ShardedCounter = .{};
     pub var recovered_regions_released: counters.ShardedCounter = .{};
-    pub var recovery_intents_rolled_forward: counters.ShardedCounter = .{};
+    /// Open intents of recovered slots the poll handed to the cross-owner
+    /// cadence (adopted into its register; its next pass completes them).
+    pub var recovery_intents_adopted: counters.ShardedCounter = .{};
 };
 
 /// The ledger poll tick = the checkpoint landing ceiling (1,100 ms):
@@ -272,11 +274,13 @@ pub const VolumeHook = struct {
     regionPending: *const fn (ctx: *anyopaque, identity: WriterIdentity) bool,
 };
 
-/// The set-level roll-forward of recovered slots' open intents (the
-/// cross-owner plane's register; null until it is armed).
-pub const RollForward = struct {
+/// The hand-off of recovered slots' open intents to the cross-owner
+/// cadence (its register adopts them; null until the plane is armed). The
+/// poll runs on the membership cadence and never waits on a guard, so it
+/// adopts and the cadence rolls forward (decision 0003 §AE.2).
+pub const IntentAdoption = struct {
     ctx: ?*anyopaque,
-    rollForward: *const fn (ctx: ?*anyopaque) u32,
+    adopt: *const fn (ctx: ?*anyopaque) u32,
 };
 
 pub const Report = struct {
@@ -285,7 +289,7 @@ pub const Report = struct {
     released: u32 = 0,
     retired: u32 = 0,
     drained: u32 = 0,
-    rolled_forward: u32 = 0,
+    intents_adopted: u32 = 0,
     role_released: bool = false,
 };
 
@@ -294,7 +298,7 @@ pub const Projection = struct {
     volumes: []const VolumeHook,
     /// The data volumes' tags (`namedAsHolder`'s walk).
     vol_tags: []const u64,
-    roll_forward: ?RollForward = null,
+    adoption: ?IntentAdoption = null,
 
     /// `recover_dead_appenders_set` (REC:3486-3569).
     pub fn run(self: *Projection, now_ms: u64, now_realtime_ns: u64) Report {
@@ -327,9 +331,9 @@ pub const Projection = struct {
         }
         stats.recovered_regions_released.add(rep.released);
         rep.retired = self.retire(deaths.items, now_realtime_ns);
-        if (rep.acted != 0) if (self.roll_forward) |rf| {
-            rep.rolled_forward = rf.rollForward(rf.ctx);
-            stats.recovery_intents_rolled_forward.add(rep.rolled_forward);
+        if (rep.acted != 0) if (self.adoption) |a| {
+            rep.intents_adopted = a.adopt(a.ctx);
+            stats.recovery_intents_adopted.add(rep.intents_adopted);
         };
         return rep;
     }
@@ -496,9 +500,9 @@ const FakeVolume = struct {
     }
 };
 
-var rolled: u32 = 0;
-fn rollForwardFn(_: ?*anyopaque) u32 {
-    rolled += 1;
+var adoptions: u32 = 0;
+fn adoptFn(_: ?*anyopaque) u32 {
+    adoptions += 1;
     return 3;
 }
 
@@ -608,8 +612,8 @@ test "the poll: release-recovered first, then every death on every volume (acted
     try v1.pending.append(gpa, wid(1));
     try v1.pending.append(gpa, wid(2));
     const hooks = [_]VolumeHook{ v0.hook(), v1.hook() };
-    rolled = 0;
-    var p: Projection = .{ .ledger = &l, .volumes = &hooks, .vol_tags = &.{}, .roll_forward = .{ .ctx = null, .rollForward = &rollForwardFn } };
+    adoptions = 0;
+    var p: Projection = .{ .ledger = &l, .volumes = &hooks, .vol_tags = &.{}, .adoption = .{ .ctx = null, .adopt = &adoptFn } };
     const acted0 = stats.dead_members_acted.load();
     const polls0 = stats.recovery_ledger_polls.load();
     const r = p.run(2_000, ts + 1_500 * std.time.ns_per_ms);
@@ -617,8 +621,8 @@ test "the poll: release-recovered first, then every death on every volume (acted
     try testing.expectEqual(@as(u32, 3), r.acted);
     try testing.expectEqual(@as(u32, 2), r.released);
     try testing.expectEqual(@as(u32, 0), r.retired);
-    try testing.expectEqual(@as(u32, 3), r.rolled_forward);
-    try testing.expectEqual(@as(u32, 1), rolled);
+    try testing.expectEqual(@as(u32, 3), r.intents_adopted);
+    try testing.expectEqual(@as(u32, 1), adoptions);
     try testing.expectEqual(acted0 + 3, stats.dead_members_acted.load());
     try testing.expectEqual(polls0 + 1, stats.recovery_ledger_polls.load());
     try testing.expect(stats.dead_member_propagation_ms.load() >= 1_500);
@@ -628,9 +632,9 @@ test "the poll: release-recovered first, then every death on every volume (acted
     // Nothing left to act on; no roll-forward; not yet retirable.
     const r2 = p.run(3_000, ts + 2 * 45_000 * std.time.ns_per_ms - 1);
     try testing.expectEqual(@as(u32, 0), r2.acted);
-    try testing.expectEqual(@as(u32, 0), r2.rolled_forward);
+    try testing.expectEqual(@as(u32, 0), r2.intents_adopted);
     try testing.expectEqual(@as(u32, 0), r2.retired);
-    try testing.expectEqual(@as(u32, 1), rolled);
+    try testing.expectEqual(@as(u32, 1), adoptions);
     // A page still Recovering under wid(2) on v0 blocks its retirement; wid(1) retires.
     try v0.pending.append(gpa, wid(2));
     v0.outcome = .failed;

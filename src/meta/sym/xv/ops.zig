@@ -1114,22 +1114,53 @@ pub fn Plane(comptime Store: type) type {
 
         /// A dead appender's recovery landed (charter §5.5 "Death and
         /// recovery … roll forward open intents"): the recovered slots are
-        /// local homes now, so every home is scanned as a cadence pass —
-        /// an intent the dead appender left open is adopted and completed.
-        pub fn rollForwardRecovered(self: *Self, now: u64) Error!u32 {
+        /// local homes now; every intent their homes hold that the register
+        /// does not know is ADOPTED (abandoned, counted open) for the
+        /// cadence's next pass to complete. Reads only — no guard, no
+        /// dispatch: the death ledger's poll calls it on the membership
+        /// cadence, the fiber that must never wait on a guard (decision
+        /// 0003 §AE.2). Answers the intents adopted.
+        pub fn adoptRecovered(self: *Self, now: u64) Error!u32 {
             const slots_buf = self.gpa.alloc(u16, route_table.W) catch return error.OutOfMemory;
             defer self.gpa.free(slots_buf);
             const slots_ = self.resolver.localSlots(self.resolver.ctx, slots_buf);
-            var recovered: u32 = 0;
-            for (slots_) |s| recovered += try self.recoverHome(intent.homeIno(s), now, .cadence);
+            var adopted: u32 = 0;
+            for (slots_) |s| {
+                const home = intent.homeIno(s);
+                var kvs: std.ArrayList(tree.KeyValue) = .empty;
+                defer tree.deinitKeyValues(self.gpa, &kvs);
+                self.apply.scanHome(home, &kvs) catch |e| return mapApply(e);
+                for (kvs.items) |kv| {
+                    const id = intent.txIdOfKey(kv.key) orelse return error.Corrupt;
+                    if (self.register.stateOf(id) != null) continue;
+                    self.minter.recover(id);
+                    // A full register ends this home's hand-off: the record
+                    // stays durable and a cadence pass adopts it.
+                    self.register.adopt(id, home, now) catch break;
+                    adopted += 1;
+                }
+            }
             self.register.publish(now);
-            return recovered;
+            return adopted;
         }
 
-        /// The cadence tick: the expiry sweep; a roll-forward pass only
-        /// while the register holds an abandoned intent; the gauges.
+        /// The membership cadence's half (decision 0003 §AE.2): the parked
+        /// guard scopes' expiry sweep — a client the owner lists DEAD loses
+        /// its scopes now — and the register's gauges (the stuck tripwire
+        /// stays live whatever the roll-forward is waiting on). Never waits
+        /// on a guard: it is what frees the guards a roll-forward or a
+        /// migration may be waiting on.
+        pub fn sweepParked(self: *Self, now: u64) u32 {
+            const n = self.parked.sweepExpired(now);
+            self.register.publish(now);
+            return n;
+        }
+
+        /// The cross-owner cadence's pass: a roll-forward only while the
+        /// register holds an abandoned intent; the gauges. It may wait on a
+        /// guard — a live client's scope, or a dead one's until the
+        /// membership cadence sweeps it.
         pub fn cadenceTick(self: *Self, now: u64) Error!u32 {
-            _ = self.parked.sweepExpired(now);
             self.register.publish(now);
             if (!self.register.anyAbandoned()) return 0;
             stats.xv_cadence_passes.inc();

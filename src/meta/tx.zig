@@ -201,8 +201,11 @@ pub const KvTx = struct {
     }
 
     /// Note a name this tx changes (deduplicated: a rename's re-insert
-    /// names what its delete did).
+    /// names what its delete did). A NUL-led name — the stripe map's
+    /// reserved markers (`xv/stripe.zig`) — is no kernel's: never noted
+    /// (and never on the wire: a recalled name carries no NUL).
     pub fn noteName(self: *KvTx, parent: u64, name: []const u8) void {
+        if (name.len == 0 or name[0] == 0) return;
         for (self.names.slice()) |n| if (n.parent == parent and std.mem.eql(u8, n.name, name)) return;
         if (self.names.len == NAME_NOTES_MAX) {
             self.names.overflow = true;
@@ -582,6 +585,23 @@ fn stageCreate(tx: *KvTx, parent: u64, child: u64, name: []const u8, seed: u64) 
     const dk = try dentryInsertKey(tx, &name_key, parent, name, &.{});
     try tx.stagePut(key.TREE_DENTRIES, &dk, dv);
     try tx.stageDelta(key.TREE_INODES, &key.inodeKey(parent), record.InodeDelta.times(7, 7));
+}
+
+test "the name notes (decision 0003 §AB.2): deduplicated, two at most (a third overflows), a NUL-led stripe marker never noted; they ride into the queue entry" {
+    var t = KvTx.init(testing.allocator, @src());
+    t.noteName(5, "a");
+    t.noteName(5, "a");
+    t.noteName(5, "\x00sqz.stripe:00");
+    t.noteName(6, "b");
+    try testing.expectEqual(@as(usize, 2), t.names.slice().len);
+    try testing.expect(!t.names.overflow);
+    t.noteName(7, "c");
+    try testing.expect(t.names.overflow);
+    try t.stagePut(key.TREE_INODES, &key.inodeKey(5), "v");
+    var q = try buildQueuedTx(&t, 4096, null);
+    defer q.deinit();
+    try testing.expectEqualStrings("b", q.names.slice()[1].name);
+    try testing.expect(q.names.overflow);
 }
 
 test "staging keeps stage order, kinds and bytes; seqs are unassigned until the pass stamps them" {

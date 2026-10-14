@@ -263,3 +263,59 @@ record (squeezefs config set-fabric-endpoints)` — the harness predates the dae
   rebase onto the sync-posture landing and 46/46, 2,816 / 2,888 (72 skipped) after it (unit 2,573 /
   70 skip, rails 18, smoke 88 / 2 skip, bench-smoke 41, shim-smoke 40, nvmet-smoke 53, suites-smoke
   PASS); macOS 28/28, 2,197 / 2,224 (27 skipped).
+
+## 9. The four levers (0003 §AB)
+
+The owner approved §6's four levers. Every row below is a same-mount A-B-B-A on this agent's own
+container (`sqz-perf2`, 4 vCPU, 12 GiB, the venue kernel; `scripts/perf_mount.sh` with
+`SQZ_PERF_NAME=sqz-perf2`, the dist profile): `scripts/perf/abba.sh <label> <A> <B> <phases>` runs
+legs A B B A, each `scripts/perf/reset.sh sym2 <bin>` (a freshly formatted 2-MDT + 2-OST set on the
+raw partitions) then `scripts/perf/table.sh` (mdtest 4 ranks × 2,000 in one directory; fio 4 KiB
+O_DIRECT randread QD32). The host (11 cores) is shared with the venue gate and the other agents'
+containers: a leg that ran beside a gate reads low across EVERY row (the A-B-B-A's order is what
+separates the code's effect from that drift).
+
+### 9.1 AB.1 — LOOKUP and GETATTR on the drain worker
+
+A = `71f6767` (the lever), B = `d520a8a` (dev before it). Two runs; leg 1 of the second ran beside
+another agent's build (every row low, A and B alike).
+
+| op | run 1 A (leg 1 / 4) | run 1 B (leg 2 / 3) | run 2 A (leg 1 / 4) | run 2 B (leg 2 / 3) |
+|---|---|---|---|---|
+| file stat | 283.8 k / 219.6 k | 194.4 k / 36.9 k | 127.3 k / 426.6 k | 104.5 k / 132.7 k |
+| dir stat | — | — | 106.8 k / 377.0 k | 62.4 k / 87.7 k |
+| file create | 5,881 / 3,891 | 5,905 / 1,825 | 2,603 / 6,297 | 3,955 / 5,342 |
+| file read (open/close) | 57.8 k / 46.7 k | 68.4 k / 35.7 k | 32.7 k / 62.7 k | 50.1 k / 50.8 k |
+| file remove | 5,798 / 5,181 | 5,979 / 1,921 | 2,912 / 6,466 | 5,141 / 5,226 |
+| randread 4 KiB QD32 | 164 k / 136 k | 145 k / 80.6 k | 121.7 k / 166.7 k | 137.4 k / 140.8 k |
+
+The stat rows carry the lever: an expired dentry's `LOOKUP` (and a GETATTR) is answered on the
+worker — `Δtransport_meta_inline_serves ≡ ΔLOOKUP + ΔGETATTR − Δdemotes`, demotes only for the
+virtual names and the first touch of a cold node — so a stat is ONE round trip with no handoff (the
+undisturbed legs: 2.2–3.2× B). Creates, opens and removes still pay a `CREATE` / `OPEN` / `UNLINK`
+on the lane (AB.3's lever) and are within the host's drift.
+
+### 9.2 AB.4 — the committer's bounded ack spin
+
+A = the lever (`b70fbc0`), B = AB.1 (`f246494`). The rule's inputs, read from the A legs' `.stats`:
+
+| A leg | `w` (wake, µs) | ack mean (µs) | bound | hits | fall-throughs | skips | busy |
+|---|---|---|---|---|---|---|---|
+| leg 1 | 8.5 | 147.8 | 0 | 674 | 12 | 39,318 | 251 |
+| leg 4 | 8.6 | 308.5 | 0 | 0 | 0 | 40,003 | 251 |
+
+| op | A leg 1 | B leg 2 | B leg 3 | A leg 4 |
+|---|---|---|---|---|
+| file create | 4,610 | 5,957 | 6,230 | 6,334 |
+| dir create | 4,022 | 4,584 | 6,767 | 6,811 |
+| file remove | 3,985 | 6,547 | 6,455 | 6,033 |
+| file stat | 409.4 k | 408.6 k | 461.9 k | 461.0 k |
+
+The ack's mean at this posture is the §L window-fill hold plus the write landing — 17–36 × the wake
+— so the derived bound is 0 and the committer parks (98 % skips; the 674 hits are a phase start,
+while the estimator still read short acks). Leg 1 ran beside a gate (every row low); legs 3 and 4
+are equal within 2 %. The lever is neutral here BY ITS DERIVATION: it would engage where the ack is
+within two wakes (a RAM or nvme-fast journal), and it never spins where it cannot win. An earlier cut
+sampled the wake on every idle-lane park and read `w` = 252 µs — other fibers had run in the gap —
+which set a 503 µs bound and burned CPU on 9,259 spins; the poll-count rule (`lanePolls` one more at
+the resume) is that measurement's fix.

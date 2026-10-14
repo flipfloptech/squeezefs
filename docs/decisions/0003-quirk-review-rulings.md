@@ -884,7 +884,7 @@ QD1).
 | AA.5 The process allocator | `mem/process_allocator.select`: every release build takes `std.heap.smp_allocator`; Debug keeps std's SafeAllocator; tie test `process_allocator` "a release product never runs on std's SafeAllocator" | Zig 0.17 gives ReleaseSafe the debugging SafeAllocator (`start.zig` `use_safe_allocator`); ReleaseSafe is the product's build — 38 % of the FUSE worker's cycles on rand-4k, every allocation of every op |
 | AA.6 The kernel's entry and attr caches stay at the charter's 1 s | Not raised here. A stat of a dentry younger than 1 s costs no request (a cached mdtest stat phase runs at the kernel's rate); an expired one costs one LOOKUP | The TTL is the staleness bound for the remote namespace changes no recall names: a reader's kernel learns of a peer's create (a cached NEGATIVE dentry) or rename only through it — the recall invalidates and prunes an object's inode, never a `(parent, name)`. Raising it needs entry-grained invalidation (`FUSE_NOTIFY_INVAL_ENTRY` from the served namespace steps and the dentry-set recall) — the owed lever, stated in the evidence note with its measured price |
 
-## AB. The four levers §AA left open (2026-10-13; `docs/evidence/rung-10-dev-perf.md` §8)
+## AB. The four levers §AA left open (2026-10-13; `docs/evidence/rung-10-dev-perf.md` §9)
 
 The owner approved the four levers the dev-perf pass stated with their measured price (§AA, the
 evidence note's §6), in order: the metadata warm ladder (AB.1), entry-grained invalidation and the

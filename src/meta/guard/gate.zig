@@ -1305,6 +1305,40 @@ test "the heartbeat's PR re-check: a PTPL lapse (power cycle) is re-acquired and
     try testing.expect((try v.probe()) != null);
 }
 
+test "a stats render is no atomic cut across the fence: the volume's verdict (`meta.set`) renders BEFORE the process-wide writer_guard_fenced (`meta.guard`), so a fence landing between the two sections reads `healthy` beside the count — a render begun after the count was seen reads `fenced` (the nvmet sigstop-preempt row's law)" {
+    const gpa = testing.allocator;
+    const v = try Vol.create(gpa, "render", "600000");
+    defer v.destroy();
+    var ns = fake.Namespace.init(gpa);
+    defer ns.deinit();
+    var host: fake.Host = .{ .ns = &ns, .host_id = host_a_id };
+    const be = try v.open(.{ .test_identity = ident(boot_a, 4000, 777), .test_namespace = host.face(), .test_pid_probe = PidTable.probe }, 0);
+    defer be.close();
+    const g = be.guard.?;
+    const fenced0 = guard.stats.fenced.load();
+    var vol_buf: [2048]u8 = undefined;
+    var vol_w: Io.Writer = .fixed(&vol_buf);
+    try g.writeStatsJson(&vol_w);
+    // The usurper's fence lands between the two sections of one render.
+    ns.powerCycle();
+    try ns.seedHolder(0xbad);
+    log.testing.expectErrorLogs(2);
+    g.beat();
+    try log.testing.expectAllFired();
+    var proc_buf: [2048]u8 = undefined;
+    var proc_w: Io.Writer = .fixed(&proc_buf);
+    try guard.writeStatsJson(&proc_w);
+    try testing.expect(std.mem.indexOf(u8, vol_w.buffered(), "\"writer_guard_verdict\":\"healthy\"") != null);
+    var want_buf: [64]u8 = undefined;
+    try testing.expect(std.mem.indexOf(u8, proc_w.buffered(), try std.fmt.bufPrint(&want_buf, "\"writer_guard_fenced\":{d},", .{fenced0 + 1})) != null);
+    // A render begun after the count: the latch is set before the count is
+    // paid, and never clears.
+    vol_w = .fixed(&vol_buf);
+    try g.writeStatsJson(&vol_w);
+    try testing.expect(std.mem.indexOf(u8, vol_w.buffered(), "\"writer_guard_verdict\":\"fenced\"") != null);
+    log.testing.expectErrorLogs(0);
+}
+
 test "host identity stability: a changed SQUEEZEFS_HOSTNQN/HOSTID under a live PR mount fail-stops and fires the tripwire; exactly one of the pair refuses the mount (InvalidIdentity)" {
     const gpa = testing.allocator;
     const v = try Vol.create(gpa, "identity", "600000");

@@ -1105,7 +1105,15 @@ test "nvmet fidelity: sigstop-preempt — a SIGSTOPped holder is preempted by a 
     // Resume A: its next beat finds a foreign holder — fenced; the latch
     // reads failed and B's writes keep landing.
     _ = linux.kill(rig.daemons.items[a].pid, .CONT);
-    const sta = try rig.awaitStat(a, "writer_guard_fenced", 1, 30 * std.time.ns_per_s);
+    const seen = try rig.awaitStat(a, "writer_guard_fenced", 1, 30 * std.time.ns_per_s);
+    gpa.free(seen);
+    // A render writes the volume's verdict (`meta.set`) BEFORE the
+    // process-wide counter (`meta.guard`), and the fence latches the verdict
+    // before it counts: the render that first shows the count may have read
+    // the verdict ahead of the latch. Both are judged on a render begun
+    // after the count was seen — the latch never clears, the count is paid
+    // once per latch.
+    const sta = try rig.stats(a);
     defer gpa.free(sta);
     try testing.expectEqual(@as(?u64, 1), json_scan.number(sta, "writer_guard_fenced"));
     // The latch's verdict: FAILED by the fence class (`fenced`).

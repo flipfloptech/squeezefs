@@ -612,3 +612,162 @@ the TTL) is AB.2's open question, not yet reproduced standalone.
 Three consecutive full venue gates on landed `dev` (`f344862`), each with a fresh local cache (every
 binary rebuilt, every row run): **49/49 steps, 2,851 / 2,924 passed (73 skipped)** each — 6 m 32 s,
 7 m 18 s, 7 m 57 s.
+
+## 10. Zero-message opens (0003 §AF)
+
+§9.7 (a) measured the mode and left it open; this pass implemented the orchestrator's posture —
+no-open for regular files, OPENDIR stays, every durability law kept — with the knob
+`SQUEEZEFS_FUSE_NO_OPEN` (default 1; 0 = the OPEN/RELEASE control arm, tested beside it).
+
+### 10.1 The kernel contract, read off 7.2.6 (`fs/fuse/{file,dir,inode}.c`)
+
+| fact | where | what the posture does with it |
+|---|---|---|
+| the first OPEN answered ENOSYS sets `fc->no_open`, never undone | `fuse_file_open` | the lifecycle answers OPEN ENOSYS; the daemon opens its own `.stats` before it reports ready (`latchNoOpen`) |
+| with `no_open` set, `fuse_file_put` ends every `FUSE_RELEASE` locally — a CREATE-opened file's and one opened before the latch alike | `fuse_file_put` | until the latch a CREATE-opened file still sends RELEASE (served: the control arm's drain); after it none |
+| FLUSH is sent on every `filp_close` — every close of every copy of an fd (a dup, a forked child's at exit, its exec under `O_CLOEXEC` too) — unless `FOPEN_NOFLUSH` (no writeback cache) or `fc->no_flush`; an ENOSYS sets `no_flush` for good | `fuse_flush` | a CREATE's reply drops `FOPEN_NOFLUSH`; no FLUSH is ever ENOSYS; FLUSH carries the drain; bursts coalesce (§10.4) |
+| the only FORGET of a live inode is at eviction, after every `struct file` let go of it | `fuse_evict_inode` | the unlinked-open custody keys on the lookup count; the open count is OPENDIR's |
+| with `atomic_o_trunc`, `fuse_do_setattr` skips the ATTR_OPEN truncate ("done by OPEN") | `fuse_do_setattr` | INIT drops `FUSE_ATOMIC_O_TRUNC`: the O_TRUNC open is a SETATTR(size 0) under the size setter's guard |
+| a shared mapping is written back at munmap, after its fd's close | `fuse_vma_close` | a write no FLUSH follows is owed and drained once idle (§10.2 item 2) |
+
+### 10.2 The posture, item by item
+
+1. **No-open for regular files, OPENDIR stays.** `lifecycle` answers OPEN `ENOSYS` before any
+   guard (`fuse_open_enosys`: 1 per mount — the daemon's own latch); CREATE counts no open. A
+   readdir stays OPENDIR's: no-opendir would let the kernel cache listing pages that only a
+   directory's own `INVAL_INODE` reaches (owed).
+2. **The drain rides FLUSH.** The worker probes every FLUSH (`worker.dispatchFlush` →
+   `probe_meta` → `probe_flush` → `DataPlane.hasWriteCustody`: the parked table, the overlay
+   registry, the rewrite epochs, each O(1) on an empty set and one spin-locked scan otherwise) and
+   answers it when nothing is held; custody demotes it to the CPU's lane (the data class), which
+   drains — `data.releaseIno`, the RELEASE drain — before the reply. A write the FLUSH could not see
+   is owed: every WRITE notes its ino after its custody is recorded, a FLUSH covers the notes made
+   before it began (the stripe sequence orders the two under the stripe lock), and the reclaim
+   cadence drains an owed ino once idle for TTI/10 (30 s). The drain is complete: a close drains
+   at once (synchronously — the control arm's RELEASE was asynchronous); a held-open writer, a
+   mapping written back after its fd closed, an async write landing after its close drain within
+   TTI/10 + one tick; fsync, syncfs, truncate and the unmount drain as before.
+3. **The open count / unlink-while-open custody.** The custody was already the kernel's lookup
+   count (the corpse destroy keys on the last FORGET's `evicted`, never on the count);
+   `open_count_stranded` is re-defined, not retired — a lost RELEASE in the control arm, a lost
+   RELEASEDIR under no-open (0002 row 530).
+4. **`FUSE_ATOMIC_O_TRUNC` dropped** under no-open (0002 row 529): the O_TRUNC open is the
+   kernel's SETATTR(size 0), whose guard is the size setter's exclusive one, shipped to a foreign
+   holder like any truncate.
+5. **The virtual inodes** keep their per-lookup generations: the kernel's lookup reference pins a
+   generation while a file holds it, its exact size at LOOKUP / GETATTR and TTL 0 bound every
+   page-cache read to one document, and a new generation is a new ino — so no `INVAL_INODE` is owed
+   (the reference itself calls `FOPEN_DIRECT_IO` "a belt" for generation inos). With no OPEN to
+   refuse a write-intent open, a write or truncating open by root answers EACCES at the WRITE /
+   SETATTR (0002 row 531).
+6. **Shim / IPC.** The session handoff touches neither OPEN nor `fh` (the bind over the control
+   socket, the `fstat` / `F_GETFL` screen, a GETXATTR bootstrap); an IPC write notes its ino owed
+   like a FUSE write; the gate's shim smoke ran on the no-open default.
+7. **The knob** `SQUEEZEFS_FUSE_NO_OPEN` (default 1); the control arm keeps its rows (the
+   lifecycle and kv_fs rows' control halves, the smoke "THE CONTROL ARM'S CLOSE DRAIN").
+
+### 10.3 The red rows
+
+| row | pins | red when |
+|---|---|---|
+| `codec` "INIT reply carries FUSE_ATOMIC_O_TRUNC iff offered and wanted" | the INIT word | the flag echoed unconditionally (dev) |
+| `session` e2e "a no-open session" | on the real kernel: ONE OPEN for 16 opens, no RELEASE, 16 FLUSHes answered on the worker, a custody FLUSH on the CPU's lane (off every worker), the O_TRUNC open's SETATTR(size 0) | with the flag kept: zero size-setting SETATTRs — the truncate lost |
+| `open_table` "no-open … OWED", "the idle harvest", "close bursts coalesce" | the owed set's order law, harvest, deferral | — (new structure) |
+| `lifecycle` "no-open", "no-open close bursts"; `kv_fs` "no-open through the POSIX layer"; `write_admit` "the no-open FLUSH's try-only probe" | OPEN ENOSYS with no guard, CREATE uncounted, the inline / lane / deferred FLUSH arms, CREATE without NOFLUSH, the custody predicate per class | — |
+| smoke "A NO-OPEN CLOSE IS THE WRITE-BACK DRAIN" | write, close, kill -9, remount: both files whole; nothing parked, nothing owed, no RELEASE, ONE OPEN | a CREATE reply keeping NOFLUSH: the block stays parked (owed 1, parked 1); without the latch at ready: one RELEASE |
+| smoke "CUSTODY NO CLOSE COVERS IS DRAINED ONCE IDLE" | a held-open writer's parked block drained by the cadence, then kill -9: bytes whole | the idle drain off: still parked (owed 1, parked 1) |
+| smoke "A CLOSE BURST COALESCES ITS DRAINS" | 200 forked appenders on one fd: 1 drain, 601 deferred, the log whole after kill -9 | no window: 201 drains |
+| smoke "O_TRUNC UNDER NO-OPEN TRUNCATES" | `: >` empties a striped and an inline file; across daemons both ways | (the e2e row above is the flag's red) |
+| smoke "THE VIRTUAL INODES WITHOUT AN OPEN" | 200 reads under a create storm, each one parsed document of exactly the fstat size; two opens, two generations; EACCES for a truncate and a write | green from its first run: the generation design already carried it |
+| smoke "THE CONTROL ARM'S CLOSE DRAIN" | the control arm's asynchronous RELEASE drains (parked 0 observed) before kill -9: both files whole | — |
+
+Two existing rows held a dirty fd in the test process while they spawned probes; under no-open
+each child's exec closes its copy — a FLUSH, the drain — so the `sync -f` row now writes from the
+test process and spawns nothing until syncfs(2) (on an fd of the mount) returned, and the defrag
+`--fold` row holds its fds in a forked child that never forks or execs (`FoldHolder`).
+
+### 10.4 The close burst — found by the A-B-B-A, fixed before landing
+
+The first cut drained every FLUSH with custody. The perf container's fork appender (a shell
+holding one fd, 2,000 `/bin/echo` children appending through it; each child's exit a FLUSH) on a
+CACHE-LESS set:
+
+| arm | drains | device writes (OST diskstats) | for | elapsed |
+|---|---|---|---|---|
+| no-open, every close drained | 2,384 | 8,141 MB (57,000×) | 143 KB | 16.2–21.5 s |
+| no-open, coalesced (one FLUSH-drain per ino per reclaim tick) | 2 + 2 idle | 4.2–8.4 MB | 143 KB | 0.2–3.7 s |
+| control | 0 (one RELEASE at the shell's close) | 4.2 MB | 143 KB | 0.5–2.2 s |
+
+Each drain re-uploaded the extending append's whole 4 MiB block. The same cost exists in the
+CONTROL arm for an open-append-close loop (500 × `echo … >> f`, each `>>` an open and a RELEASE):
+1,602 MB for 36 KB, 1.5 s — where the coalesced no-open arm writes 4.2 MB in 176 ms. That cost is
+the data plane's (a drained extending append on a cache-less set re-uploads its block; a cache
+path stages it — the fork appender wrote 0 B to the OSTs on the perf set's cache-path posture in
+both arms): owed, below.
+
+### 10.5 The A-B-B-A and the opcode census
+
+Same-mount A-B-B-A on `sqz-noopen` (4 vCPU / 12 GiB, the venue kernel, the dist build of this
+branch, a fresh 2-MDT + 2-OST set with a cache path per leg; A = no-open, B = the control arm — one
+binary, the knob the arm). The host ran other agents' gates throughout (loads 3–15): a leg beside a
+gate reads low on every row. Two rounds after the coalescing fix:
+
+| op | A legs 1/4, 5/8 | B legs 2/3, 6/7 | A mean | B mean | A ÷ B |
+|---|---|---|---|---|---|
+| directory creation | 5,009 / 3,814; 3,434 / 6,560 | 2,927 / 3,833; 6,344 / 6,632 | 4,704 | 4,934 | 0.95 |
+| directory stat | 3.26 M / 2.48 M; 2.94 M / 4.99 M | 2.35 M / 2.80 M; 4.18 M / 4.81 M | 3.42 M | 3.54 M | 0.97 |
+| directory rename | 4,557 / 2,952; 3,102 / 7,632 | 3,041 / 3,915; 4,658 / 6,295 | 4,561 | 4,477 | 1.02 |
+| directory removal | 4,931 / 2,938; 3,849 / 7,050 | 3,025 / 4,388; 6,437 / 6,462 | 4,692 | 5,078 | 0.92 |
+| file creation | 5,954 / 2,551; 3,425 / 7,255 | 2,316 / 3,590; 4,987 / 5,396 | 4,796 | 4,072 | 1.18 |
+| file stat | 3.04 M / 2.80 M; 3.11 M / 5.87 M | 3.88 M / 3.10 M; 3.20 M / 4.79 M | 3.70 M | 3.74 M | 0.99 |
+| file read (open/close) | 108.9 k / 91.4 k; 157.7 k / 161.2 k | 91.2 k / 160.5 k; 181.7 k / 179.7 k | 129.8 k | 153.3 k | 0.85 |
+| file removal | 6,451 / 3,285; 3,682 / 8,758 | 3,773 / 4,337; 6,299 / 7,262 | 5,544 | 5,418 | 1.02 |
+| randread 4 KiB QD32 | 92.8 k / 97.1 k; 136.2 k / 142.8 k | 98.7 k / 101.2 k; 159.0 k / 167.4 k | 117.2 k | 131.6 k | 0.89 |
+| randwrite 4 KiB QD32 | 43.2 k / 92.4 k; 101.4 k / 65.7 k | 92.8 k / 53.7 k; 103.2 k / 69.2 k | 75.7 k | 79.7 k | 0.95 |
+| IOR write (MiB/s) | 892 / 1,584; 2,170 / 1,121 | 1,889 / 1,381; 1,334 / 1,256 | 1,442 | 1,465 | 0.98 |
+| IOR read (MiB/s) | 2,357 / 2,926; 3,681 / 1,912 | 2,924 / 2,522; 1,551 / 1,890 | 2,719 | 2,222 | 1.22 |
+| open/close, 1 thread | 34.1 k / 40.0 k; 46.3 k / 24.7 k | 32.8 k / 32.4 k; 22.3 k / 17.9 k | 36.3 k | 26.4 k | 1.38 |
+| open + 4 KiB read + close, 1 thread | 32.8 k / 43.8 k; 29.0 k / 18.6 k | 35.3 k / 28.2 k; 16.0 k / 20.8 k | 31.0 k | 25.1 k | 1.24 |
+| open/close, 4 threads | 503.8 k / 647.2 k; 586.6 k / 211.2 k | 55.8 k / 101.8 k; 68.8 k / 70.8 k | 487.2 k | 74.3 k | 6.56 |
+| open + 4 KiB read + close, 4 threads | 459.9 k / 477.7 k; 542.2 k / 267.0 k | 71.0 k / 82.0 k; 57.2 k / 99.8 k | 436.7 k | 77.5 k | 5.64 |
+
+The first two rounds (the first cut, before §10.4's fix — identical on these rows, where no close
+finds custody twice): open/close 4 threads 543 k vs 68 k (8.0×), with a read 427 k vs 70 k (6.1×),
+1 thread 1.44× / 1.41×; mdtest file read 1.19×, file creation 0.92×, the namespace rows 0.74–0.85
+(two A legs ran beside a gate); randread 1.11, randwrite 1.05, IOR 0.96 / 0.86. Over the 16 legs
+the mdtest rows are within the host's drift (file read A 147 k against B 145 k), the open/close
+loops 5.6–8× from four threads and 1.2–1.4× from one, the data rows unchanged.
+
+The census (`scripts/perf/opcount.sh`: `fuse_request_send → end`; the latch at ready in place):
+
+| workload | A (no-open) requests | B (control) requests |
+|---|---|---|
+| mdtest 4 × 2,000 | LOOKUP 24,015, **FLUSH 16,001**, MKDIR 8,002, RMDIR 8,002, RENAME 8,000, CREATE 8,000, UNLINK 8,000, GETATTR 10, READ 2, STATFS 1 — **80,033**; OPEN 0, RELEASE 0 | LOOKUP 24,004, **RELEASE 16,000**, MKDIR 8,002, RMDIR 8,002, RENAME 8,000, CREATE 8,000, **OPEN 8,000**, UNLINK 8,000, READ 6, GETATTR 2, FLUSH 1, STATFS 1 — **88,018** |
+| open + 4 KiB read + close, 1 thread, 5 s | 122,825 ops: **1 FLUSH per op** (122,827) | 98,580 ops: **1 OPEN + 1 RELEASE per op** (98,580 / 98,581) |
+
+Per open/close pair the requests go 2 → 1, not 2 → 0: the drain law keeps a synchronous FLUSH
+where the control arm's open paid a synchronous OPEN, and what disappears is the RELEASE (≈ 60 µs
+of lane time each, asynchronous) and the OPEN's handler. That is why §9.7's 5–10× estimate holds
+for concurrent open/close loops (the lane's RELEASE work was their bottleneck: 74 k/s against
+487 k/s) and not for mdtest's file-read phase, whose per-file cost stays one synchronous round
+trip — FLUSH (6.7 µs send → end in the first census, against the control arm's OPEN 13.2 µs) —
+plus the rank's own path walk. A census's round trips are not an A/B (each arm's ran minutes apart
+under a moving load; the second census's A ran beside a gate); its counts are exact.
+
+### 10.6 Gates
+
+Pre-landing on the first commit: venue 49/49 steps, 2,864 / 2,942 (78 skipped), 6 m 53 s (an
+earlier run of the same tree: 2 failed — the defrag `--fold` row, §10.3's held fds, and one
+"data plane WITH a cache path" run that passed 2/2 alone after); macOS 25/29 steps with one
+failure, `ops.jobs.fabric` "duty cycle adheres within ten percent" (a wall-clock duty cycle under
+host load; passed alone).
+
+### Owed
+
+- The data plane's drain of an extending append on a cache-less set re-uploads the whole block
+  (§10.4): 1.6 GB for 36 KB in the control arm's open-append-close loop. The coalescing bounds the
+  no-open arm's drains; the per-drain cost is the data plane's (§J).
+- No-opendir (directory listings in the kernel's page cache) needs the directory's own
+  invalidation on every remote namespace change.
+- `.stats` repeats a few keys across families (a JSON parser in strict mode refuses the document:
+  `DuplicateField`); the smoke parses with `use_first`.

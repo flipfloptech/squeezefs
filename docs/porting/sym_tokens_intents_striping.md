@@ -1120,7 +1120,7 @@ is PR 5's own row (`.benchmarks/…pr5` header).
 **Token family, holder side** (`token_plane.rs:3963–4004`): `dlm_token_grants_served`,
 `dlm_token_recalls`, `dlm_token_recall_acks`, `dlm_token_recall_expired_with_lease`, `dlm_token_lease_swept_
 grants`, `dlm_token_not_holder_redirects`, `slot_resolve_dead_redirects`, `dlm_token_park_expired_refusals`,
-`dlm_token_nonmember_refusals`*, `dlm_token_custody_rejected`*, **`dlm_token_recall_timeouts_live`***,
+`dlm_token_nonmember_refusals` (a counter, not must-stay-0: a frame served after its sender's deadline — 0003 §AE.3), `dlm_token_custody_rejected`*, **`dlm_token_recall_timeouts_live`***,
 `dlm_token_releases`, `dlm_token_recall_batches`, `dlm_token_grant_parks`, `dlm_token_regrant_under_
 recall_waits`, `dlm_token_outstanding` (gauge), `dlm_token_recall_fanout` (p50/p99 + the distribution
 — `QueueDepthHistogram`), **`dlm_token_recall_rtt_ns {send, drain, ack, total}`** (exact-sum

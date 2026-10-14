@@ -44,6 +44,57 @@ new holder after B's recovery, migrates the phase-1 names; C's `ls` crossed one 
   is read again as before, so U.3's no-miss argument stands. The stream's consumed-cookie word is
   gone. Both rows green (the U.3 row and the wide-reply row), every stripe row green.
 
+## 3. `dlm_token_nonmember_refusals` in a passing run (item 3)
+
+### 3.1 What fires it, and why it is not a fault
+
+The site is the token holder's frame law (`token_table.Holder.serveGrant`): a grant ask from a
+client whose lease the membership owner lists EXPIRED is refused `NotMember`, nothing registered.
+On the manager the owner's word is its roster: a member is listed and EXPIRED from its deadline
+until the next wire tick evicts it — the window the tripwire fired in (twice at A in run 4 of the
+tripwire hunt's pristine `f344862` loop, once in a pristine post-perf3 run), each time in a row
+that passed.
+
+A member's own clocks keep it from ASKING past its lease (the reader refuses itself at `T_self <
+T_owner`, `tokens.zig` "the parked joiner's root"), so an ask served past the owner's deadline is a
+frame the member sent while live and the holder served late. The listener serves one frame at a
+time per connection; a grant ask parks (by the charter's design) while a recall of the same
+`(client, object)` is pending — and a recall to a member that just died completes only at its
+lease's expiry. So the killed holder's (B's, then C's) asks queued in A's session behind its own
+parked grant: the parked one woke (§3.2's second defect: only an unrelated wake or the eviction
+woke it), registered a token for the dead member, and the next queued ask met the expired lease.
+That refusal is the protocol's correct answer — a frame from a member that is no longer one — and
+it can follow any session delay past `T_owner − T_self`; the reference counts it and warns
+(`token_plane.rs` :1690–1721) and its tests expect it (`sym_coherence_tests.rs` :3797, :4640). The
+port's must-stay-0 marking (`sym_tokens_intents_striping.md` §5.2) was wrong: a tripwire that
+fires in a green run is a defect of the instrument.
+
+### 3.2 The two defects beside it
+
+- **A parked grant registered for an expired member.** The lease was judged once, at the ask; a
+  grant that then waited for the member's own pending recall — a wait that ends at the lease's
+  expiry when the member stopped acking — registered a token no lease backs.
+- **A parked grant was not woken when the holder's pass retired its recall at the lease's
+  expiry.** The pass retires an unacked frame in its own locked sweeps (`sweepExpiredLocked`,
+  `expireOverdueLocked`) and posted no wake, so a grant parked on that recall waited for an
+  unrelated ack, the eviction's departure sweep, or its own park deadline (`T_owner`): the
+  member's session stood still behind it for that long.
+
+### 3.3 The red rows and the fix (0003 §AE.3, 0002 row 526)
+
+- **Red** (`34ca8b0`, portable, `tokens.zig`): "a grant ask from a member whose lease lapsed before
+  its eviction ran … is refused NotMember and counted … never a tripwire" — on `dev` the tripwire's
+  error log (the test runner fails it) and `invariant_tripwires` + 1; "a grant ask parked on the
+  member's OWN pending recall whose lease lapses during the wait … is refused NotMember at its
+  registration" (the member unreachable for pushes, its lease 400 ms from expiry, the pass on its
+  own thread) — on `dev` the ask was never woken at the expiry: the client's call answered
+  `Deferred` at its reply bound.
+- **Fix** (`bd0bc6e`): `dlm_token_nonmember_refusals` is a `ShardedCounter` with a warning naming
+  the client (its reason on its declaration); the lease is judged at the ask AND before every
+  registration (`Holder.refuseExpired`); a frame the pass retires at a lease's expiry or past the
+  deadline posts the ack's wake (`ack_wake.notifyWaiters`) so every grant parked on that recall
+  re-judges at once. Both rows green; the ghost-member row keeps its refusal, now counted.
+
 ## 4. The grant record as a family of chunks (item 4)
 
 ### 4.1 The limit

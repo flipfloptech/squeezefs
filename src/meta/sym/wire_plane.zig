@@ -60,6 +60,7 @@ const counters = @import("../../core/counters.zig");
 const knobs = @import("../../core/knobs.zig");
 const clock = @import("../../core/clock.zig");
 const log = @import("../../core/log.zig");
+const sync_tick = @import("../../sync/tick.zig");
 const errors = @import("../../core/errors.zig");
 const checksum = @import("../../core/checksum.zig");
 const key = @import("../key.zig");
@@ -411,6 +412,12 @@ pub const WirePlane = struct {
     /// membership leave (a leave lost on the wire: the home shard keeps
     /// the row for its successor's roster).
     leave_lost: bool = false,
+    /// `SQUEEZEFS_TEST_ONLINE_ARM_HOLD`: the online arm parks on
+    /// `unarmed_answered` (bounded by T_owner) before it arms.
+    online_arm_hold: bool = false,
+    /// A data-plane verb named a volume the holder has not armed (the
+    /// hold's token; `tick.wake` from the wire thread).
+    unarmed_answered: std.atomic.Value(u32) = .init(0),
     sink: RecallSink,
     /// The data planes' arms (`bindDataPlanes`, after the listener): the
     /// holder's grant plane is published with a release store and read by
@@ -491,6 +498,7 @@ pub const WirePlane = struct {
         self.divert = tokens.Divert.init(gpa, io, self.resolver_ctx.resolver(), clientIdOf(shard.writerMemberId(identity)), 0, self.sink.sink(), lease, tokens.cache.recordsBudgetBytes(mem_budget_bytes));
         self.divert.evict_after_serve = knobs.boolKnob("SQUEEZEFS_TEST_TOKEN_EVICT_AFTER_SERVE", env);
         self.leave_lost = knobs.boolKnob("SQUEEZEFS_TEST_MEMBERSHIP_LEAVE_LOST", env);
+        self.online_arm_hold = knobs.boolKnob("SQUEEZEFS_TEST_ONLINE_ARM_HOLD", env);
         // The token holder over this daemon's trees; the pusher over the
         // peers' dialled links.
         self.holder = tokens.table.Holder.init(gpa, io, identity.writer_id, self.oracle.oracle(), TOKEN_OBJECTS_CAP, listener.deriveMaxConnections(raw_cpus, listener.raiseNofile())) catch return error.OutOfMemory;
@@ -1012,12 +1020,37 @@ pub const WirePlane = struct {
         const m = self.mgr orelse return error.Io;
         const hp = self.holder_plane.load(.acquire) orelse return error.Io;
         const row = dp.vols.rows[ordinal].?;
+        if (self.online_arm_hold) self.holdOnlineArm(row.vol_tag);
         const g = (try self.acquireAllocLease(dp, row.vol_tag, row.alloc.capacityBlocks())) orelse return error.Io;
         hp.armVolume(ordinal, g.term, .{ .refs = g.refs.slice(), .already = g.already }, m.owner.members.items.len + 1) catch |e| return switch (e) {
             error.OutOfMemory => error.OutOfMemory,
             error.Io, error.Corrupt => error.Io,
         };
         log.info("data planes: vol {x} armed online as ordinal {d} under the allocation lease at term {d}", .{ row.vol_tag, ordinal, g.term });
+    }
+
+    /// The `SQUEEZEFS_TEST_ONLINE_ARM_HOLD` window: the arm waits until the
+    /// holder answered a data-plane verb naming a volume it has not armed,
+    /// or T_owner passed — a member renews within T_owner or is evicted, so
+    /// a joiner the record reached early has asked by then.
+    fn holdOnlineArm(self: *WirePlane, vol_tag: u64) void {
+        // A token an earlier add's window left behind is not this one's.
+        self.unarmed_answered.store(0, .release);
+        const deadline = clock.monotonicNs() + self.t_owner_ms * std.time.ns_per_ms;
+        const why: []const u8 = while (true) {
+            switch (sync_tick.parkUntilUncancelable(self.io, &self.unarmed_answered, deadline, null)) {
+                .woken => break "a data-plane verb named a volume this holder had not armed",
+                .deadline => break "T_owner passed with no data-plane verb for an unarmed volume",
+                .ticked => continue,
+            }
+        };
+        log.warn("data planes: SQUEEZEFS_TEST_ONLINE_ARM_HOLD — the online arm of vol {x} held until {s}", .{ vol_tag, why });
+    }
+
+    /// The hold's token: a data-plane verb named a volume the holder has
+    /// not armed.
+    fn noteUnarmed(self: *WirePlane, hp: *plane_arm.HolderPlane, vol_tag: u64) void {
+        if (self.online_arm_hold and !hp.holdsVolume(vol_tag)) sync_tick.wake(self.io, &self.unarmed_answered);
     }
 
     fn leaseScreen(self: *WirePlane, dp: *DataPlane) alloc_lease.Screen {
@@ -1154,18 +1187,21 @@ pub const WirePlane = struct {
     fn serveBlockGrant(ctx: *anyopaque, req: *const service.Request, scratch: []u8) service.Answer {
         const self: *WirePlane = @ptrCast(@alignCast(ctx));
         const hp = self.holder_plane.load(.acquire) orelse return service.Answer.refused(error.Busy, "no grant plane armed on this mount (not the allocation holder)");
+        self.noteUnarmed(hp, req.payload.block_grant.vol_tag);
         return plane_arm.HolderPlane.serveGrant(hp, req, scratch);
     }
 
     fn serveReturnBlocks(ctx: *anyopaque, req: *const service.Request, scratch: []u8) service.Answer {
         const self: *WirePlane = @ptrCast(@alignCast(ctx));
         const hp = self.holder_plane.load(.acquire) orelse return service.Answer.refused(error.Busy, "no grant plane armed on this mount (not the allocation holder)");
+        self.noteUnarmed(hp, req.payload.return_blocks.vol_tag);
         return plane_arm.HolderPlane.serveReturn(hp, req, scratch);
     }
 
     fn serveFreeBlocks(ctx: *anyopaque, req: *const service.Request, scratch: []u8) service.Answer {
         const self: *WirePlane = @ptrCast(@alignCast(ctx));
         const hp = self.holder_plane.load(.acquire) orelse return service.Answer.refused(error.Busy, "no grant plane armed on this mount (not the allocation holder)");
+        self.noteUnarmed(hp, req.payload.free_blocks.head.vol_tag);
         return plane_arm.HolderPlane.serveFrees(hp, req, scratch);
     }
 

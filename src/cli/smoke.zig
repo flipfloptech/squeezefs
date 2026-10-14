@@ -2054,6 +2054,11 @@ test "smoke: THE ONLINE VOLUME ROW ACROSS DAEMONS — mount A (the manager) + B 
     // lands its block through the router's placement at its own fsync, so
     // the row reads placement per file instead of at B's dismount.
     try rig.env.put("SQUEEZEFS_FSYNC_PROMOTE_STAGED", "1");
+    // A holds the online arm of d2 until its holder answered a data-plane
+    // verb for a volume it has not armed (or T_owner passed): a joiner that
+    // learnt d2 before A's arm asks A for it inside the window, and the
+    // closure below judges A's answer.
+    try rig.env.put("SQUEEZEFS_TEST_ONLINE_ARM_HOLD", "1");
     try rig.formatSet(true);
     const d2 = try std.fmt.allocPrintSentinel(gpa, "{s}/d2.img", .{rig.work}, 0);
     defer gpa.free(d2);

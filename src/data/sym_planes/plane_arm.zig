@@ -534,6 +534,11 @@ pub const HolderPlane = struct {
         return null;
     }
 
+    /// This holder armed `vol_tag`.
+    pub fn holdsVolume(self: *HolderPlane, vol_tag: u64) bool {
+        return self.volOf(vol_tag) != null;
+    }
+
     /// The holder's live bitmap of `vol_tag` (the fsck's C6 arm and the
     /// lessee-carve exemption of its block plane); null = not this holder's.
     pub fn bitmapOf(self: *HolderPlane, vol_tag: u64) ?*data_bitmap.DataBitmap {

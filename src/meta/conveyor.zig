@@ -803,6 +803,10 @@ pub const TestSeams = struct {
     /// (the lost-wake shape the venue's tick backstop must absorb and
     /// `park_tick_rescues` must count).
     drop_pass_wakes: std.atomic.Value(u32) = .init(0),
+    /// 1 ⇒ `Done.send` holds right after its channel send (the receiver
+    /// may take the outcome and leave); `send_held` publishes the hold.
+    hold_after_send: std.atomic.Value(u32) = .init(0),
+    send_held: std.atomic.Value(u32) = .init(0),
 };
 
 pub var test_seams: TestSeams = .{};
@@ -826,9 +830,16 @@ pub const Done = struct {
 
     pub fn send(self: *Done, io: Io, outcome: Outcome) error{ReceiverGone}!void {
         try self.ch.send(io, outcome);
+        holdAfterSend();
         // Release: pairs with the spinner's acquire — a non-zero stamp is a
         // sent outcome (the channel's own lock orders the value).
         self.acked_ns.store(@max(clock.monotonicNs(), 1), .release);
+    }
+
+    fn holdAfterSend() void {
+        if (test_seams.hold_after_send.load(.acquire) == 0) return;
+        test_seams.send_held.store(1, .release);
+        while (test_seams.hold_after_send.load(.acquire) != 0) std.Thread.yield() catch {};
     }
 
     pub fn recvUncancelable(self: *Done, io: Io) error{SenderGone}!Outcome {
@@ -3230,6 +3241,29 @@ test "the ack spin: an ack landing inside the bound is a hit (the outcome is alr
     const t0 = clock.monotonicNs();
     try testing.expect(!spinForAck(&never, 200 * std.time.ns_per_us));
     try testing.expect(clock.monotonicNs() - t0 >= 200 * std.time.ns_per_us);
+}
+
+test "Done.send writes nothing once the receiver can take the outcome: a committer's Done lives in its frame, gone the instant its recv returns (a storm thread exited, its stack unmapped — the lane's late ack stamp segfaulted at a stack address, 1 in 100 runs of the journal-lane storm under 8-way load)" {
+    const gpa = testing.allocator;
+    const done = try gpa.create(Done);
+    defer gpa.destroy(done);
+    done.* = .init;
+    test_seams.send_held.store(0, .release);
+    test_seams.hold_after_send.store(1, .release);
+    defer test_seams.hold_after_send.store(0, .release);
+    const Sender = struct {
+        fn run(d: *Done) void {
+            d.send(testing.io, {}) catch {};
+        }
+    };
+    const t = try std.Thread.spawn(.{}, Sender.run, .{done});
+    try (try done.recvUncancelable(testing.io));
+    while (test_seams.send_held.load(.acquire) == 0) std.Thread.yield() catch {};
+    // The receiver's frame moves on: every byte of it is someone else's now.
+    @memset(std.mem.asBytes(done), 0xA5);
+    test_seams.hold_after_send.store(0, .release);
+    t.join();
+    for (std.mem.asBytes(done)) |b| try testing.expectEqual(@as(u8, 0xA5), b);
 }
 
 test "the ack spin's ledger: every park is a hit, a fall-through, a skip (no bound) or busy (work on the lane, or off a lane: never a spin); every answer feeds the ack estimator once" {

@@ -151,9 +151,11 @@ const RangedSlab = struct {
         return .{ .ptr = self.base + @as(usize, slot) * nd.ranged_buf_size, .len = len, .kind = .ranged, .slot = slot };
     }
 
+    /// The ring holds every slot and any reader takes: a refused push is a
+    /// taker mid-pop, never a full ring — retried (decision 0003 §AI.4).
     fn release(self: *RangedSlab, slot: u32) void {
         self.allocated_bytes.sub(nd.ranged_buf_size);
-        std.debug.assert(self.free.tryPush(slot));
+        self.free.pushSpin(slot);
     }
 
     /// `base <= ptr && ptr + len <= base + len`: the ReadFixed eligibility

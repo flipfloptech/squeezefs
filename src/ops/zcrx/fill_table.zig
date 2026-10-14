@@ -242,8 +242,10 @@ pub const CidPool = struct {
         return cid;
     }
 
+    /// The ring holds every cid: a refused push is a taker mid-pop, never a
+    /// full ring — retried (decision 0003 §AI.4).
     pub fn put(self: *CidPool, cid: u16) void {
-        std.debug.assert(self.free.tryPush(cid));
+        self.free.pushSpin(cid);
         _ = self.free_count.fetchAdd(1, .monotonic);
     }
 

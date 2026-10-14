@@ -755,7 +755,10 @@ pub const Reclaimer = struct {
         if (self.free_cells.tryPop()) |idx| {
             self.cells[idx] = e;
             if (self.q.tryPush(idx)) return;
-            assert(self.free_cells.tryPush(idx));
+            // The cell pool's ring holds every cell and every enqueuer takes:
+            // a refused push is a taker mid-pop, never a full ring
+            // (decision 0003 §AI.4).
+            self.free_cells.pushSpin(idx);
         }
         // Past the cell pool (the cap ceiling): the overflow deque.
         self.overflow_lock.lock();
@@ -773,7 +776,7 @@ pub const Reclaimer = struct {
     fn pop(self: *Reclaimer) ?Entry {
         if (self.q.tryPop()) |idx| {
             const e = self.cells[idx];
-            assert(self.free_cells.tryPush(idx));
+            self.free_cells.pushSpin(idx);
             return e;
         }
         self.overflow_lock.lock();

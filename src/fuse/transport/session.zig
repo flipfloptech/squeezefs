@@ -2357,8 +2357,15 @@ test "e2e: EchoFs mounts over the ring — INIT negotiated FUSE_OVER_IO_URING, e
             return worker.ring_replies.load() - b.replies == worker.ring_requests.load() - b.requests;
         }
     };
-    _ = waitUntil(&before, Settled.pred, 5 * std.time.ns_per_s);
-    const after = Snapshot.take();
+    // A background request can still land between the settled read and the
+    // snapshot (a worker answering on its own thread settles first): the
+    // snapshot itself must show the equality (bounded).
+    const settle_deadline = clock.monotonicNs() + 5 * std.time.ns_per_s;
+    var after = Snapshot.take();
+    while (after.requests - before.requests != after.replies - before.replies and clock.monotonicNs() < settle_deadline) {
+        _ = waitUntil(&before, Settled.pred, settle_deadline -| clock.monotonicNs());
+        after = Snapshot.take();
+    }
     try expectLaws(before, after);
     try testing.expect(after.requests - before.requests > 0);
     try testing.expect(after.reads - before.reads >= 2);

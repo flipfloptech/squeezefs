@@ -149,6 +149,9 @@ pub var notify_epochs_sent: counters.ShardedCounter = .{};
 /// `transport_notify_nb_waits`: a caller of a non-blocking notify waited
 /// for a reserved cell.
 pub var notify_nb_waits: counters.ShardedCounter = .{};
+/// `transport_sideband_recycle_respins`: a sideband cell given back met its
+/// free list's cell still held by a taker mid-pop.
+pub var sideband_recycle_respins: counters.ShardedCounter = .{};
 /// `transport_notify_pending`: fire-and-forget writes (notifies, inline
 /// replies) filled and not yet answered by the kernel — what "at notify
 /// speed" still owes (decision 0003 §AG.2: a recall's names are queued
@@ -303,6 +306,33 @@ const SbCell = struct {
     fire_and_forget: bool = true,
 };
 
+/// One of the sideband's cell pools: its free list — a ring holding the
+/// pool's WHOLE population — and the recycle word a taker out of cells
+/// parks on. Any thread takes; the sideband (a CQE) and a blocking reply's
+/// waiter give back.
+const CellPool = struct {
+    free: mpmc.BoundedMpmc(u32),
+    freed: futex.Word = .init(0),
+
+    /// Cells `[first, first + n)`, every one free.
+    fn init(gpa: std.mem.Allocator, first: usize, n: usize) std.mem.Allocator.Error!CellPool {
+        var free = try mpmc.BoundedMpmc(u32).init(gpa, n);
+        for (first..first + n) |i| assert(free.tryPush(@intCast(i)));
+        return .{ .free = free };
+    }
+
+    fn deinit(self: *CellPool, gpa: std.mem.Allocator) void {
+        self.free.deinit(gpa);
+    }
+
+    /// Give a cell back and wake a taker out of cells.
+    fn give(self: *CellPool, idx: u32) void {
+        assert(self.free.tryPush(idx));
+        _ = self.freed.fetchAdd(1, .release);
+        futex.wakeAll(&self.freed);
+    }
+};
+
 const Sideband = struct {
     const read_ud: u64 = 1;
     const cancel_ud: u64 = 2;
@@ -314,14 +344,12 @@ const Sideband = struct {
     fixed: bool,
     buf: []u8,
     cells: []SbCell,
-    free: mpmc.BoundedMpmc(u32),
+    /// Cells `[0, nb_base)`: the shared pool.
+    pool: CellPool,
     ready: mpmc.BoundedMpmc(u32),
-    /// Bumped at every recycle; a submitter out of cells waits on it.
-    freed: futex.Word = .init(0),
     /// Cells `[nb_base, cells.len)`: the non-blocking class's own pool.
     nb_base: u32,
-    nb_free: mpmc.BoundedMpmc(u32),
-    nb_freed: futex.Word = .init(0),
+    nb_pool: CellPool,
     /// An `INVAL_ENTRY` found no cell: the loop writes an `INC_EPOCH`.
     epoch_owed: std.atomic.Value(bool) = .init(false),
     read_armed: bool = false,
@@ -340,23 +368,20 @@ const Sideband = struct {
         const cells = try gpa.alloc(SbCell, total);
         errdefer gpa.free(cells);
         for (cells) |*c| c.* = .{};
-        var free = try mpmc.BoundedMpmc(u32).init(gpa, ncells);
-        errdefer free.deinit(gpa);
-        var nb_free = try mpmc.BoundedMpmc(u32).init(gpa, SIDEBAND_NB_CELLS);
-        errdefer nb_free.deinit(gpa);
-        var ready = try mpmc.BoundedMpmc(u32).init(gpa, total);
-        errdefer ready.deinit(gpa);
-        for (0..ncells) |i| assert(free.tryPush(@intCast(i)));
-        for (ncells..total) |i| assert(nb_free.tryPush(@intCast(i)));
-        return .{ .session = session, .ring = ring, .fuse_fd = fuse_fd, .fixed = fixed, .buf = buf, .cells = cells, .free = free, .ready = ready, .nb_base = @intCast(ncells), .nb_free = nb_free };
+        var pool = try CellPool.init(gpa, 0, ncells);
+        errdefer pool.deinit(gpa);
+        var nb_pool = try CellPool.init(gpa, ncells, SIDEBAND_NB_CELLS);
+        errdefer nb_pool.deinit(gpa);
+        const ready = try mpmc.BoundedMpmc(u32).init(gpa, total);
+        return .{ .session = session, .ring = ring, .fuse_fd = fuse_fd, .fixed = fixed, .buf = buf, .cells = cells, .pool = pool, .ready = ready, .nb_base = @intCast(ncells), .nb_pool = nb_pool };
     }
 
     fn deinit(self: *Sideband, gpa: std.mem.Allocator) void {
         assert(self.thread == null);
         self.ring.deinit();
         self.ready.deinit(gpa);
-        self.nb_free.deinit(gpa);
-        self.free.deinit(gpa);
+        self.nb_pool.deinit(gpa);
+        self.pool.deinit(gpa);
         gpa.free(self.cells);
         gpa.free(self.buf);
     }
@@ -413,31 +438,23 @@ const Sideband = struct {
     /// and none is free.
     fn takeCell(self: *Sideband, wait: bool) ?u32 {
         while (true) {
-            if (self.free.tryPop()) |i| {
+            if (self.pool.free.tryPop()) |i| {
                 self.cells[i].done.reset();
                 return i;
             }
             if (!wait) return null;
-            const gen = self.freed.load(.acquire);
-            if (self.free.tryPop()) |i| {
+            const gen = self.pool.freed.load(.acquire);
+            if (self.pool.free.tryPop()) |i| {
                 self.cells[i].done.reset();
                 return i;
             }
             // The lock plane's ticked park: a lost recycle costs one tick.
-            _ = futex.waitTimeout(&self.freed, gen, tick_law.tick_ns);
+            _ = futex.waitTimeout(&self.pool.freed, gen, tick_law.tick_ns);
         }
     }
 
     fn recycle(self: *Sideband, idx: u32) void {
-        if (idx >= self.nb_base) {
-            assert(self.nb_free.tryPush(idx));
-            _ = self.nb_freed.fetchAdd(1, .release);
-            futex.wakeAll(&self.nb_freed);
-            return;
-        }
-        assert(self.free.tryPush(idx));
-        _ = self.freed.fetchAdd(1, .release);
-        futex.wakeAll(&self.freed);
+        if (idx >= self.nb_base) self.nb_pool.give(idx) else self.pool.give(idx);
     }
 
     /// A reserved cell for a non-blocking notify; `wait` parks on the
@@ -446,19 +463,19 @@ const Sideband = struct {
     fn takeNbCell(self: *Sideband, wait: bool) ?u32 {
         var waited = false;
         while (true) {
-            if (self.nb_free.tryPop()) |i| {
+            if (self.nb_pool.free.tryPop()) |i| {
                 self.cells[i].done.reset();
                 return i;
             }
             if (!wait or self.disconnected or self.stop.load(.acquire)) return null;
             if (!waited) notify_nb_waits.inc();
             waited = true;
-            const gen = self.nb_freed.load(.acquire);
-            if (self.nb_free.tryPop()) |i| {
+            const gen = self.nb_pool.freed.load(.acquire);
+            if (self.nb_pool.free.tryPop()) |i| {
                 self.cells[i].done.reset();
                 return i;
             }
-            _ = futex.waitTimeout(&self.nb_freed, gen, tick_law.tick_ns);
+            _ = futex.waitTimeout(&self.nb_pool.freed, gen, tick_law.tick_ns);
         }
     }
 
@@ -1814,6 +1831,7 @@ pub const Session = struct {
         try field(w, "transport_notify_epochs_owed", notify_epochs_owed.load());
         try field(w, "transport_notify_epochs_sent", notify_epochs_sent.load());
         try field(w, "transport_notify_nb_waits", notify_nb_waits.load());
+        try field(w, "transport_sideband_recycle_respins", sideband_recycle_respins.load());
         try field(w, "transport_notify_pending", notify_pending.load());
         try w.print("\"transport_notify_dropped\":{d}", .{notify_dropped.load()});
         try w.writeAll("}");
@@ -3327,4 +3345,32 @@ test "sideband sizing: cells one per possible straggler plus the notify floor; r
     try testing.expectEqual(@as(usize, 2048), SIDEBAND_CELL_BYTES);
     try testing.expect(SIDEBAND_CELL_BYTES >= codec.NOTIFY_NAME_FRAME_MAX);
     try testing.expect(SIDEBAND_CELL_BYTES >= codec.OUT_HEADER_LEN + codec.MAX_OUT_LEN);
+}
+
+test "a sideband cell given back while another taker sits between its dequeue CAS and its sequence store is retried, never asserted (decision 0003 §AI.4): the free list holds the pool's whole population, so the refused push is a taker mid-pop — not a full ring; the give-back counts one respin and lands once that taker stores" {
+    const gpa = testing.allocator;
+    var pool = try CellPool.init(gpa, 0, 2);
+    defer pool.deinit(gpa);
+    // Taker 1 stalls mid-pop: its CAS took position 0; its store (cell 0
+    // handed to the producer at position 2) has not run.
+    const stalled = pool.free.dequeue_pos.fetchAdd(1, .monotonic);
+    try testing.expectEqual(@as(usize, 0), stalled);
+    // Taker 2 pops position 1 whole, and gives its cell back: the push at
+    // position 2 meets cell 0 still filled.
+    try testing.expectEqual(@as(?u32, 1), pool.free.tryPop());
+    const respins0 = sideband_recycle_respins.load();
+    const giver = try std.Thread.spawn(.{}, CellPool.give, .{ &pool, @as(u32, 1) });
+    while (sideband_recycle_respins.load() == respins0) std.Thread.yield() catch {};
+    // Taker 1 completes its pop.
+    const cell0 = &pool.free.cells[stalled & pool.free.mask];
+    const taken = cell0.data;
+    cell0.seq.store(stalled +% pool.free.mask +% 1, .release);
+    giver.join();
+    try testing.expectEqual(@as(u32, 0), taken);
+    try testing.expectEqual(respins0 + 1, sideband_recycle_respins.load());
+    pool.give(taken);
+    // Both cells back, each once.
+    try testing.expectEqual(@as(?u32, 1), pool.free.tryPop());
+    try testing.expectEqual(@as(?u32, 0), pool.free.tryPop());
+    try testing.expectEqual(@as(?u32, null), pool.free.tryPop());
 }

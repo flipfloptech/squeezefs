@@ -148,6 +148,13 @@ pub const Divert = struct {
     sink: cache.RecallSink,
     lease: cache.SelfLease,
     budget_bytes: u64,
+    /// The mount kernel's longest TTL (decision 0003 §AG.2): every plane's
+    /// serves pin their entries this long (`setKernelPin`).
+    kernel_pin_ns: u64 = std.math.maxInt(u64),
+    /// `SQUEEZEFS_TEST_TOKEN_EVICT_AFTER_SERVE`: every foreign serve's entry
+    /// is evicted under the room law right after it is served — a reader
+    /// that holds no token when the next change lands.
+    evict_after_serve: bool = false,
     lock: sync.Mutex = .init,
     planes: std.AutoHashMapUnmanaged(ClientId, *cache.Reader) = .empty,
     /// The root's attributes as last served under a token (kept past the
@@ -171,6 +178,22 @@ pub const Divert = struct {
         self.planes.deinit(self.gpa);
     }
 
+    /// The kernel's longest TTL for answers served under a token: from here
+    /// on (and on every plane already bound) a token whose entry served the
+    /// kernel within it is never released, only dropped (decision 0003
+    /// §AG.2). A mount sets it before it serves.
+    pub fn setKernelPin(self: *Divert, io: Io, ns: u64) void {
+        self.lock.lockUncancelable(io);
+        defer self.lock.unlock(io);
+        self.kernel_pin_ns = ns;
+        var it = self.planes.valueIterator();
+        while (it.next()) |r| {
+            r.*.cache.lock.lockUncancelable(io);
+            r.*.cache.kernel_pin_ns = ns;
+            r.*.cache.lock.unlock(io);
+        }
+    }
+
     /// The plane for `identity`, bound ONCE on first touch off the
     /// resolver's endpoint.
     pub fn planeFor(self: *Divert, io: Io, identity: ClientId, holder: u32) Error!*cache.Reader {
@@ -183,6 +206,7 @@ pub const Divert = struct {
         };
         const r = self.gpa.create(cache.Reader) catch return error.OutOfMemory;
         r.* = cache.Reader.init(self.gpa, io, self.client_id, self.volume, link, self.sink, self.lease, self.budget_bytes);
+        r.cache.kernel_pin_ns = self.kernel_pin_ns;
         self.planes.put(self.gpa, identity, r) catch {
             self.gpa.destroy(r);
             return error.OutOfMemory;
@@ -284,6 +308,7 @@ pub const Divert = struct {
                         else => return e,
                     };
                     if (object == inos.ROOT_INO) if (served.entry) |e| self.rememberRoot(e.attrs);
+                    if (self.evict_after_serve) plane.evict(io, object);
                     return served;
                 },
             }

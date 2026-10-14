@@ -149,6 +149,11 @@ pub var notify_epochs_sent: counters.ShardedCounter = .{};
 /// `transport_notify_nb_waits`: a caller of a non-blocking notify waited
 /// for a reserved cell.
 pub var notify_nb_waits: counters.ShardedCounter = .{};
+/// `transport_notify_pending`: fire-and-forget writes (notifies, inline
+/// replies) filled and not yet answered by the kernel — what "at notify
+/// speed" still owes (decision 0003 §AG.2: a recall's names are queued
+/// before its ack and written by the loop after it).
+pub var notify_pending: counters.Gauge = .{};
 /// `transport_sideband_cells_exhausted` (must-stay-0): the sideband itself
 /// had no cell for an inline reply.
 pub var sideband_cells_exhausted: counters.Tripwire = .init("transport_sideband_cells_exhausted");
@@ -500,7 +505,7 @@ const Sideband = struct {
         };
         c.head_len = frame.head.len;
         c.body = frame.body;
-        c.fire_and_forget = true;
+        markFireAndForget(c);
     }
 
     fn publish(self: *Sideband, idx: u32) void {
@@ -532,6 +537,13 @@ const Sideband = struct {
         }
     }
 
+    /// A write nobody waits on: the kernel's answer is counted, never
+    /// returned; pending until then (`transport_notify_pending`).
+    fn markFireAndForget(c: *SbCell) void {
+        c.fire_and_forget = true;
+        notify_pending.add(1);
+    }
+
     /// A notify frame built into a free cell by `build`; fire-and-forget.
     fn notify(self: *Sideband, comptime build: anytype, args: anytype) error{QueueFull}!void {
         if (self.disconnected or self.stop.load(.acquire)) return error.QueueFull;
@@ -547,7 +559,7 @@ const Sideband = struct {
         };
         c.head_len = frame.head.len;
         c.body = frame.body;
-        c.fire_and_forget = true;
+        markFireAndForget(c);
         self.publish(idx);
     }
 
@@ -562,7 +574,7 @@ const Sideband = struct {
         @memcpy(c.buf[codec.OUT_HEADER_LEN..][0..r.out.len], r.out);
         c.head_len = codec.OUT_HEADER_LEN + r.out.len;
         c.body = &.{};
-        c.fire_and_forget = true;
+        markFireAndForget(c);
         assert(self.ready.tryPush(idx));
     }
 
@@ -632,6 +644,7 @@ const Sideband = struct {
     fn completeCell(self: *Sideband, idx: u32, res: i32) void {
         const c = &self.cells[idx];
         if (c.fire_and_forget) {
+            notify_pending.sub(1);
             if (res < 0) {
                 const e: linux.E = @fromBackingInt(@as(u16, @intCast(-res)));
                 if (e == .NOENT) notify_enoent.inc() else {
@@ -1784,6 +1797,7 @@ pub const Session = struct {
         try field(w, "transport_notify_epochs_owed", notify_epochs_owed.load());
         try field(w, "transport_notify_epochs_sent", notify_epochs_sent.load());
         try field(w, "transport_notify_nb_waits", notify_nb_waits.load());
+        try field(w, "transport_notify_pending", notify_pending.load());
         try w.print("\"transport_notify_dropped\":{d}", .{notify_dropped.load()});
         try w.writeAll("}");
     }

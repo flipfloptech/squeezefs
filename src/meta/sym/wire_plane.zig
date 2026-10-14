@@ -57,6 +57,7 @@ const Allocator = std.mem.Allocator;
 const Io = std.Io;
 
 const counters = @import("../../core/counters.zig");
+const knobs = @import("../../core/knobs.zig");
 const clock = @import("../../core/clock.zig");
 const log = @import("../../core/log.zig");
 const errors = @import("../../core/errors.zig");
@@ -484,6 +485,7 @@ pub const WirePlane = struct {
         // (never lapses); a joiner's is its member lease.
         const lease: tokens.cache.SelfLease = if (self.joined) |j| j.selfLease() else .always;
         self.divert = tokens.Divert.init(gpa, io, self.resolver_ctx.resolver(), clientIdOf(shard.writerMemberId(identity)), 0, self.sink.sink(), lease, tokens.cache.recordsBudgetBytes(mem_budget_bytes));
+        self.divert.evict_after_serve = knobs.boolKnob("SQUEEZEFS_TEST_TOKEN_EVICT_AFTER_SERVE", env);
         // The token holder over this daemon's trees; the pusher over the
         // peers' dialled links.
         self.holder = tokens.table.Holder.init(gpa, io, identity.writer_id, self.oracle.oracle(), TOKEN_OBJECTS_CAP, listener.deriveMaxConnections(raw_cpus, listener.raiseNofile())) catch return error.OutOfMemory;

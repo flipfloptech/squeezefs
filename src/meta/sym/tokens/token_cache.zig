@@ -99,6 +99,11 @@ pub const stats = struct {
     /// Entries the authority's shed dropped WITHOUT a release (one needless
     /// recall per shed object, never a wrong answer).
     pub var dlm_token_sheds: counters.ShardedCounter = .{};
+    /// Entries room-making dropped WITHOUT a release because the kernel may
+    /// still cache an answer served under them (decision 0003 §AG.2): the
+    /// holder keeps recalling this reader, so its change reaches the
+    /// kernel by name — one needless recall per dropped object at worst.
+    pub var dlm_token_kernel_pinned_drops: counters.ShardedCounter = .{};
     /// ONE entry over the whole records budget: refused loud.
     pub var dlm_token_oversize_refusals: counters.ShardedCounter = .{};
     /// Dentry fetches cut at the window bound (the set is larger than one
@@ -351,6 +356,10 @@ pub const Entry = struct {
     /// The second-chance bit of `evictToBudget`.
     used: bool = false,
     pins: u32 = 0,
+    /// Until this instant the kernel may cache an answer a serve built from
+    /// this entry (decision 0003 §AG.2): the last serve + the mount's
+    /// longest kernel TTL. A token is RELEASED only past it.
+    kernel_pin_until_ns: u64 = 0,
 
     pub fn xattr(self: *const Entry, name: []const u8) ?[]const u8 {
         for (self.xattrs) |x| if (std.mem.eql(u8, x.name, name)) return x.value;
@@ -434,6 +443,11 @@ pub const Serve = struct {
 pub const Cache = struct {
     gpa: Allocator,
     lock: sync.Mutex = .init,
+    /// The longest TTL the mount's kernel caches an answer for (decision
+    /// 0003 §AG.2; `Divert.setKernelPin`): every serve pins its entry this
+    /// long. Until the mount names it, never released (the coherent default:
+    /// a needless recall, never a stale kernel entry).
+    kernel_pin_ns: u64 = std.math.maxInt(u64),
     entries: std.AutoHashMapUnmanaged(Object, *Entry) = .empty,
     /// Per-recall increments, never merged (the monotone-word lesson).
     revoke_gens: std.AutoHashMapUnmanaged(Object, u64) = .empty,
@@ -468,7 +482,18 @@ pub const Cache = struct {
         if (e.state != .live or (wants.dentries and !e.coversAfter(wants.after))) return null;
         e.pins += 1;
         e.used = true;
+        self.pinForKernelLocked(e);
         return e;
+    }
+
+    /// A serve hands `e`'s records to the kernel's caches: the token stays
+    /// this reader's (at its holder) for as long as they may live there.
+    fn pinForKernelLocked(self: *const Cache, e: *Entry) void {
+        e.kernel_pin_until_ns = @max(e.kernel_pin_until_ns, clock.monotonicNs() +| self.kernel_pin_ns);
+    }
+
+    fn kernelPinned(e: *const Entry, now_ns: u64) bool {
+        return e.kernel_pin_until_ns > now_ns;
     }
 
     pub fn unpin(self: *Cache, io: Io, e: *Entry) void {
@@ -519,6 +544,7 @@ pub const Cache = struct {
                 e.destroy();
                 old.pins += 1;
                 old.used = true;
+                self.pinForKernelLocked(old);
                 return .{ .installed = old };
             }
             self.removeLocked(old);
@@ -531,6 +557,7 @@ pub const Cache = struct {
         stats.dlm_token_cached_bytes.add(e.bytes);
         stats.dlm_token_cached.add(1);
         e.pins += 1;
+        self.pinForKernelLocked(e);
         return .{ .installed = e };
     }
 
@@ -570,10 +597,13 @@ pub const Cache = struct {
 
     /// Voluntary room: second-chance `used` bit, then any; the retired
     /// objects go to `out` and their entries, pinned, to `kept` (the
-    /// caller's drain + purge + `Release`, then the unpin).
+    /// caller's drain + purge + `Release`, then the unpin). An entry the
+    /// kernel may still cache an answer from is dropped WITHOUT a release
+    /// (`dropOrRetireLocked`).
     pub fn evictToBudget(self: *Cache, io: Io, need: u64, out: *std.ArrayList(Object), kept: *std.ArrayList(?*Entry)) Allocator.Error!void {
         self.lock.lockUncancelable(io);
         defer self.lock.unlock(io);
+        const now = clock.monotonicNs();
         var pass: u8 = 0;
         while (pass < 2 and self.bytes + need > self.budget_bytes) : (pass += 1) {
             var victims: std.ArrayListUnmanaged(*Entry) = .empty;
@@ -589,14 +619,36 @@ pub const Cache = struct {
             }
             for (victims.items) |e| {
                 if (self.bytes + need <= self.budget_bytes) break;
-                try out.ensureUnusedCapacity(self.gpa, 1);
-                try kept.ensureUnusedCapacity(self.gpa, 1);
-                out.appendAssumeCapacity(e.object);
-                e.pins += 1;
-                kept.appendAssumeCapacity(e);
-                self.removeLocked(e);
+                try self.dropOrRetireLocked(e, now, out, kept);
             }
         }
+    }
+
+    /// The room law for one victim (decision 0003 §AG.2): kernel-pinned ⇒
+    /// dropped WITHOUT a release — the holder keeps this reader on the
+    /// object, so a change still recalls it and its names reach the kernel
+    /// — else retired to `out`/`kept` for the caller's release.
+    fn dropOrRetireLocked(self: *Cache, e: *Entry, now_ns: u64, out: *std.ArrayList(Object), kept: *std.ArrayList(?*Entry)) Allocator.Error!void {
+        if (kernelPinned(e, now_ns)) {
+            stats.dlm_token_kernel_pinned_drops.inc();
+            self.removeLocked(e);
+            return;
+        }
+        try out.ensureUnusedCapacity(self.gpa, 1);
+        try kept.ensureUnusedCapacity(self.gpa, 1);
+        out.appendAssumeCapacity(e.object);
+        e.pins += 1;
+        kept.appendAssumeCapacity(e);
+        self.removeLocked(e);
+    }
+
+    /// One object out under the room law (`SQUEEZEFS_TEST_TOKEN_EVICT_AFTER_SERVE`:
+    /// the budget's eviction of exactly the entry a serve just used).
+    pub fn evictOne(self: *Cache, io: Io, object: Object, out: *std.ArrayList(Object), kept: *std.ArrayList(?*Entry)) Allocator.Error!void {
+        self.lock.lockUncancelable(io);
+        defer self.lock.unlock(io);
+        const e = self.entries.get(object) orelse return;
+        try self.dropOrRetireLocked(e, clock.monotonicNs(), out, kept);
     }
 
     /// The authority's shed: every entry dropped WITHOUT a release.
@@ -1075,6 +1127,21 @@ pub const Reader = struct {
         stats.dlm_token_reader_releases.add(@intCast(objects.len));
     }
 
+    /// Evict ONE object as room-making would (a kernel-pinned entry drops
+    /// without a release, a cold one is released): the
+    /// `SQUEEZEFS_TEST_TOKEN_EVICT_AFTER_SERVE` seam's step.
+    pub fn evict(self: *Reader, io: Io, object: Object) void {
+        var retired: std.ArrayList(Object) = .empty;
+        defer retired.deinit(self.gpa);
+        var kept: std.ArrayList(?*Entry) = .empty;
+        defer {
+            for (kept.items) |k| if (k) |x| self.cache.unpin(io, x);
+            kept.deinit(self.gpa);
+        }
+        self.cache.evictOne(io, object, &retired, &kept) catch return;
+        if (retired.items.len != 0) self.releaseRetired(io, retired.items, kept.items);
+    }
+
     /// Release ONE object the caller is done with (a test's voluntary
     /// release; the eviction path is `evictToBudget`'s).
     pub fn release(self: *Reader, io: Io, object: Object) void {
@@ -1255,6 +1322,9 @@ test "the budget: ONE oversize entry is refused loud; eviction gives the used bi
     const gpa = testing.allocator;
     var c = Cache.init(gpa, 3 * table.TOKEN_ENTRY_BYTES);
     defer c.deinit();
+    // No kernel caches these answers: room-making releases (§AG.2's pin is
+    // the next row's).
+    c.kernel_pin_ns = 0;
     const mk = struct {
         fn mk(a: Allocator, object: Object, bytes: u64) !*Entry {
             const e = try a.create(Entry);
@@ -1294,6 +1364,31 @@ test "the budget: ONE oversize entry is refused loud; eviction gives the used bi
     try testing.expectEqual(@as(u32, 2), c.shedAll(io));
     try testing.expectEqual(before + 2, stats.dlm_token_sheds.load());
     try testing.expectEqual(@as(u64, 0), c.bytesHeld(io));
+}
+
+test "the kernel pin (decision 0003 §AG.2): room-making drops an entry the kernel may still cache an answer from WITHOUT a release (counted), and retires one past the pin for its release" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+    var c = Cache.init(gpa, 2 * table.TOKEN_ENTRY_BYTES);
+    defer c.deinit();
+    for ([_]Object{ 1, 2 }) |o| {
+        const e = try gpa.create(Entry);
+        e.* = .{ .arena = std.heap.ArenaAllocator.init(gpa), .object = o, .attrs = .{}, .xattrs = &.{}, .xattrs_complete = true, .dir = null, .bytes = table.TOKEN_ENTRY_BYTES };
+        c.kernel_pin_ns = if (o == 1) std.math.maxInt(u64) else 0;
+        c.unpin(io, c.install(io, e, 0).installed);
+    }
+    var out: std.ArrayList(Object) = .empty;
+    defer out.deinit(gpa);
+    var kept: std.ArrayList(?*Entry) = .empty;
+    defer kept.deinit(gpa);
+    const drops0 = stats.dlm_token_kernel_pinned_drops.load();
+    // Room for both: object 1 (served under the pin) drops, object 2 (past
+    // its pin) is retired for the caller's release.
+    try c.evictToBudget(io, 2 * table.TOKEN_ENTRY_BYTES, &out, &kept);
+    try testing.expectEqual(drops0 + 1, stats.dlm_token_kernel_pinned_drops.load());
+    try testing.expectEqualSlices(Object, &.{2}, out.items);
+    c.unpin(io, kept.items[0].?);
+    try testing.expectEqual(@as(usize, 0), c.count(io));
 }
 
 test "Entry: pageAfter is the strict cookie successor; lookupName finds by full name" {

@@ -91,3 +91,53 @@ lattice.
   that count a holder's device failures on a healthy fleet (`cluster_wire_service_refusals`,
   `record_refusals`, `xv_midplan_escalations` — "the fail-stop class: must stay 0") fired in the
   sweep, loud as designed. Not changed.
+
+## 2. The negative-dentry coherence question (AB.2's open question)
+
+**What §9.8 saw.** The smoke `INVALIDATION COHERENCE ACROSS DAEMONS` second step (B's kernel holds a
+negative `d/y`, A creates `d/y`, B looks again) read `no` once, in a loaded cached gate. Two
+mechanisms answer `no` there, and the row could not tell them apart:
+
+- **No token, no recall.** AB.2's law reaches a peer's kernel through the recall, and a holder
+  recalls only the readers its table lists. A reader's token cache RELEASES an entry when it makes
+  room (`evictToBudget` → `Release`): from then on the holder's changes to the object recall nobody
+  there, while the reader's kernel may still hold entries answered from that token — a negative
+  `d/y`, a positive `d/x`, attributes — for their whole TTL (1 s peered, 60 s in the row). The
+  token was the coherence boundary and the kernel's cache outlived it.
+- **Notify speed.** The reader's recall service QUEUES each changed name on its sideband before it
+  acks (`notifyEntryOrEpoch`, fire-and-forget: the `INVAL_ENTRY` write takes the parent's
+  `i_rwsem`, which a request in flight may hold while it waits on this very recall — the ack cannot
+  wait for the write). The creator's syscall returns after the ack, so the reader's kernel learns
+  the name one notifier round later. The row asserted at once and raced that round.
+
+**The law (decision 0003 §AG.2; 0002 row 527).** A kernel cache entry answered under a token never outlives the
+token's coherence: every serve stamps its entry `kernel_pin_until = now + the mount's longest
+kernel TTL` (`Divert.setKernelPin(peered_ttls.longestNs())`, set by the mount before it serves);
+room-making DROPS a kernel-pinned entry without a release (`Cache.dropOrRetireLocked`,
+`dlm_token_kernel_pinned_drops`) — the holder keeps listing this reader, so a change still recalls
+it, and the recall's names and objects reach the kernel exactly as for a held entry — and releases
+only an entry past its pin (the holder's table stays the reader's live interest set; the memory
+bound is unchanged: a drop frees the entry's bytes like a release). The authority's shed was
+already a drop. Until a mount names its TTL the pin is unbounded (coherent by default: one needless
+recall per dropped object, never a stale kernel entry). Of the two shapes the task named, this is
+(a) — the negative is cached only while the node holds the parent's token, the token KEPT at the
+holder for the TTL — realized on the token table that already is the per-parent reader set, with
+no new structure and no wire change. "At notify speed" is a peer's change visible once the reader's
+notifier wrote it: `transport_notify_pending` (a gauge: fire-and-forget sideband writes filled and
+not yet answered by the kernel) is what the change still owes.
+
+**Red rows.**
+- `tokens` "a reader whose kernel may still cache an answer served under a directory's token keeps
+  hearing the holder's changes after its cache EVICTS the token …": B serves directory 2's dentries
+  under a 60 s pin, its cache makes room for the file's token, A creates `five`. Red without the
+  pin law: `expected 1, found 0` (no pinned drop: the token was released, the holder recalls
+  nobody, the name never reaches B's sink); green: dropped not released, the name noted; with a 0
+  pin the next eviction releases and A's next change recalls nobody.
+- `token_cache` "the kernel pin …": one pinned and one cold entry, room for both — the pinned one
+  drops (counted), the cold one is retired for release.
+- The smoke row now runs B with `SQUEEZEFS_TEST_TOKEN_EVICT_AFTER_SERVE` (every foreign serve's
+  entry evicted under the room law at once: B holds NO entry when A's change lands) and every
+  step's judgement after A's change waits — bounded, 5 s — for B's `transport_notify_pending` to
+  read 0, then asserts at once. Red without the pin law: the second step's `yes` (smoke.zig:1960 —
+  B's negative stood). Green: **20/20** consecutive venue runs; B's recalled names 5, epochs 0,
+  `dlm_token_kernel_pinned_drops` ≥ 4.

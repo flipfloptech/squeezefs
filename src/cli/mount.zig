@@ -516,6 +516,7 @@ fn mountMain(ctx: *Ctx) u8 {
     var rplane_live = true;
     defer if (rplane_live) if (rplane) |rp| rp.stop();
     if (rplane) |rp| {
+        rp.divert.setKernelPin(io, coherence.law.peered_ttls.longestNs());
         fs.bindDivert(&rp.divert);
         plane.bindForeignLayout(rp.foreignLayout());
         // A recall purges the plane's tiers of the object's blocks before
@@ -536,7 +537,10 @@ fn mountMain(ctx: *Ctx) u8 {
         vs.renderer.sources.mount.wire_endpoint = wp.endpointText();
         vs.renderer.sources.wire = wp;
         // The read divert: a foreign slot's records come under a token or
-        // answer the typed EAGAIN, never off this mount's cache.
+        // answer the typed EAGAIN, never off this mount's cache; a token
+        // whose records served the kernel stays this mount's at its holder
+        // for the kernel's longest peered TTL (decision 0003 §AG.2).
+        wp.divert.setKernelPin(io, coherence.law.peered_ttls.longestNs());
         fs.bindDivert(&wp.divert);
         // The cross-owner plane's step sessions: a foreign holder's steps
         // ship over the wire plane's dialled links.

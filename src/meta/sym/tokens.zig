@@ -611,6 +611,49 @@ test "invalidation coherence (decision 0003 §AB.2): a peer's create, unlink and
     hook.settle(hook.ctx, &.{objectOf(2)});
 }
 
+test "a reader whose kernel may still cache an answer served under a directory's token keeps hearing the holder's changes after its cache EVICTS the token (decision 0003 §AG.2; the coherence smoke's negative `d/y` read stale once): room-making drops the kernel-pinned entry WITHOUT a release, the holder still recalls the reader, the created name reaches its kernel; past the pin the entry is released as before and the holder stops recalling it" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    const f = try TwoMembers.init(gpa, io, 1);
+    defer f.deinit();
+    var binding: ConveyorBinding = .{ .io = io, .holder = &f.holder, .pusher = f.pusher.pusher() };
+    const hook = binding.hook();
+    const b = f.reader(0);
+    // B's kernel caches answers for 60 s; B looks up a missing "five" in
+    // A's directory (its kernel may hold the negative entry).
+    b.setKernelPin(io, 60 * std.time.ns_per_s);
+    var s = (try b.serve(io, objectOf(2), .{ .dentries = true })).?;
+    s.release(io);
+    const plane = b.planeOf(io, A_ID).?;
+    // Its cache makes room for the file's token: exactly what it holds.
+    plane.cache.budget_bytes = plane.cache.bytesHeld(io);
+    const releases0 = table.stats.dlm_token_releases.load();
+    const drops0 = cache.stats.dlm_token_kernel_pinned_drops.load();
+    s = (try b.serve(io, objectOf(3), .{})).?;
+    s.release(io);
+    try testing.expectEqual(drops0 + 1, cache.stats.dlm_token_kernel_pinned_drops.load());
+    try testing.expectEqual(releases0, table.stats.dlm_token_releases.load());
+    try testing.expect(plane.cache.describe(io, objectOf(2)) == null);
+    // A creates "five": the recall reaches B, the name its kernel.
+    const notes = [_]tx.NameNote{.{ .parent = objectOf(2), .name = "five" }};
+    try hook.recall(hook.ctx, &.{objectOf(2)}, .{ .notes = &notes });
+    try testing.expect(f.sinks[0].sawName(objectOf(2), "five"));
+    hook.settle(hook.ctx, &.{objectOf(2)});
+    // A kernel that caches nothing: the next eviction RELEASES the token
+    // (the holder's table stays the reader's live interest set) and the
+    // holder's next change recalls nobody.
+    b.setKernelPin(io, 0);
+    s = (try b.serve(io, objectOf(2), .{ .dentries = true })).?;
+    s.release(io);
+    plane.evict(io, objectOf(2));
+    try testing.expectEqual(releases0 + 1, table.stats.dlm_token_releases.load());
+    const names_before = f.sinks[0].names_len;
+    const later = [_]tx.NameNote{.{ .parent = objectOf(2), .name = "six" }};
+    try hook.recall(hook.ctx, &.{objectOf(2)}, .{ .notes = &later });
+    try testing.expectEqual(names_before, f.sinks[0].names_len);
+    hook.settle(hook.ctx, &.{objectOf(2)});
+}
+
 test "the paged-resident dentry set (rung 10 item 5c, spec Q13): a directory larger than the reader's window is never refused — the entry holds one cookie WINDOW from the serve's `after`, a readdir pages window after window (each a fetch, dir_complete false until the last), a lookup by name fetches the window around the name's cookies and judges absence only inside it (a cut mid-run re-serves from the window's end); a cached window is a hit; oversize refusals stay 0" {
     const gpa = testing.allocator;
     const io = testing.io;

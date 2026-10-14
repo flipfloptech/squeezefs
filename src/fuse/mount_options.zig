@@ -93,6 +93,13 @@ pub const Ttls = struct {
     pub fn negativeEnabled(self: Ttls) bool {
         return self.negative_ns != 0;
     }
+
+    /// The longest any class lets the kernel cache an answer: how long a
+    /// token whose records served a reply stays this mount's at its holder
+    /// (decision 0003 §AG.2).
+    pub fn longestNs(self: Ttls) u64 {
+        return @max(@max(self.attr_ns, self.entry_ns), @max(self.dir_entry_ns, self.negative_ns));
+    }
 };
 
 /// The classes whose `_TTL_MS` knob the environment sets (bit per

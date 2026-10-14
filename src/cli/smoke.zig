@@ -1899,7 +1899,7 @@ test "smoke: THE TWO-DAEMON MATRIX — mount A (the manager) → mount B as a SE
     try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
 }
 
-test "smoke: INVALIDATION COHERENCE ACROSS DAEMONS (decision 0003 §AB.2) — every TTL class at 60 s on both (a stale entry would outlive the row): mount A, B JOINS (A's TTL law flips to PEERED, logged) → A caches a NEGATIVE `d/x`, B creates it in A's directory (a served step at A) ⇒ A sees it at once → B caches a negative `d/y`, A creates it ⇒ B sees it at once (the recalled name) → B caches `d/x`, A unlinks it ⇒ B misses it at once → B caches `d/y` and a negative `d/z`, A renames y → z ⇒ B sees both at once → B caches z's mode, A chmods it ⇒ B's stat is fresh at once → B counts the recalled names, no epoch owed on either" {
+test "smoke: INVALIDATION COHERENCE ACROSS DAEMONS (decision 0003 §AB.2, §AG.2) — every TTL class at 60 s on both (a stale entry would outlive the row); B evicts every token entry right after its serve (`SQUEEZEFS_TEST_TOKEN_EVICT_AFTER_SERVE`: B holds NO entry when A's change lands): mount A, B JOINS (A's TTL law flips to PEERED, logged) → A caches a NEGATIVE `d/x`, B creates it in A's directory (a served step at A) ⇒ A sees it at once → B caches a negative `d/y`, A creates it ⇒ once B's notifier drained, B sees it (the recalled name) → B caches `d/x`, A unlinks it ⇒ B misses it → B caches `d/y` and a negative `d/z`, A renames y → z ⇒ B sees both → B caches z's mode, A chmods it ⇒ B's stat is fresh → B counts the recalled names and its kernel-pinned drops, no epoch owed on either" {
     const io = testing.io;
     if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
     const gpa = testing.allocator;
@@ -1916,8 +1916,11 @@ test "smoke: INVALIDATION COHERENCE ACROSS DAEMONS (decision 0003 §AB.2) — ev
     _ = try rig.awaitReady(0);
     const mk = try rig.onMount("mkdir d && echo ok");
     gpa.free(mk);
+    var env_b = try envWith(gpa, &rig.env, &.{.{ "SQUEEZEFS_TEST_TOKEN_EVICT_AFTER_SERVE", "1" }});
+    defer env_b.deinit();
     const b = try Peer.init(rig, "b");
     defer b.deinit();
+    b.env = &env_b;
     try b.spawn(&.{});
     _ = try b.awaitReady();
     {
@@ -1940,13 +1943,18 @@ test "smoke: INVALIDATION COHERENCE ACROSS DAEMONS (decision 0003 §AB.2) — ev
         defer gpa.free(after);
         try testing.expectEqualStrings("yes\n", after);
     }
-    // The recalled name: B's kernel held the negative.
+    // The recalled name: B's kernel held the negative; B's cache dropped
+    // the directory's entry right after serving it (the seam), so only
+    // the §AG.2 pin keeps A recalling B. A's create returns once B acked,
+    // B's names queued before the ack and written by B's notifier after
+    // it: the step waits for that notifier, then judges at once.
     {
         const before = try b.onMount("test -e d/y && echo yes || echo no");
         defer gpa.free(before);
         try testing.expectEqualStrings("no\n", before);
         const made = try rig.onMount("touch d/y && echo ok");
         gpa.free(made);
+        try awaitNotifierDrained(b);
         const after = try b.onMount("test -e d/y && echo yes || echo no");
         defer gpa.free(after);
         try testing.expectEqualStrings("yes\n", after);
@@ -1958,6 +1966,7 @@ test "smoke: INVALIDATION COHERENCE ACROSS DAEMONS (decision 0003 §AB.2) — ev
         try testing.expectEqualStrings("yes\n", before);
         const gone = try rig.onMount("rm d/x && echo ok");
         gpa.free(gone);
+        try awaitNotifierDrained(b);
         const after = try b.onMount("test -e d/x && echo yes || echo no");
         defer gpa.free(after);
         try testing.expectEqualStrings("no\n", after);
@@ -1969,6 +1978,7 @@ test "smoke: INVALIDATION COHERENCE ACROSS DAEMONS (decision 0003 §AB.2) — ev
         try testing.expectEqualStrings("yes\nno\n", before);
         const moved = try rig.onMount("mv d/y d/z && echo ok");
         gpa.free(moved);
+        try awaitNotifierDrained(b);
         const after = try b.onMount("test -e d/y && echo yes || echo no; test -e d/z && echo yes || echo no");
         defer gpa.free(after);
         try testing.expectEqualStrings("no\nyes\n", after);
@@ -1980,6 +1990,7 @@ test "smoke: INVALIDATION COHERENCE ACROSS DAEMONS (decision 0003 §AB.2) — ev
         try testing.expectEqualStrings("644\n", before);
         const ch = try rig.onMount("chmod 600 d/z && echo ok");
         gpa.free(ch);
+        try awaitNotifierDrained(b);
         const after = try b.onMount("stat -c %a d/z");
         defer gpa.free(after);
         try testing.expectEqualStrings("600\n", after);
@@ -1991,6 +2002,8 @@ test "smoke: INVALIDATION COHERENCE ACROSS DAEMONS (decision 0003 §AB.2) — ev
         defer gpa.free(ta);
         const names_b = numberAfter(tb, "\"dlm_token_kernel_name_invals\":") orelse 0;
         try testing.expect(names_b >= 4);
+        // Every directory entry B served was dropped, never released.
+        try testing.expect((numberAfter(tb, "\"dlm_token_kernel_pinned_drops\":") orelse 0) >= 4);
         try testing.expectEqual(@as(?u64, 0), numberAfter(tb, "\"transport_notify_epochs_owed\":"));
         try testing.expectEqual(@as(?u64, 0), numberAfter(ta, "\"transport_notify_epochs_owed\":"));
         std.debug.print("smoke: coherence: B's recalled names {d}, epochs {d}; A's epochs sent {d}\n", .{ names_b, numberAfter(tb, "\"dlm_token_kernel_epochs\":") orelse 0, numberAfter(ta, "\"transport_notify_epochs_sent\":") orelse 0 });
@@ -1999,6 +2012,23 @@ test "smoke: INVALIDATION COHERENCE ACROSS DAEMONS (decision 0003 §AB.2) — ev
     try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try b.waitExit());
     try rig.umount();
     try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+}
+
+/// A recall's names are queued on the reader's sideband before its ack and
+/// written by the notifier after it (decision 0003 §AG.2, "at notify
+/// speed"): wait — bounded — until the peer's sideband owes the kernel no
+/// write. The bound is the notifier's round under load, never a TTL.
+fn awaitNotifierDrained(p: *Peer) !void {
+    const until = clock.monotonicNs() + 5 * std.time.ns_per_s;
+    var pending: ?u64 = null;
+    while (clock.monotonicNs() < until) {
+        const t = try p.stats();
+        defer p.rig.gpa.free(t);
+        pending = numberAfter(t, "\"transport_notify_pending\":");
+        if (pending == @as(?u64, 0)) return;
+    }
+    std.debug.print("\n{s}: the notifier still owed {?d} write(s) after 5 s\n", .{ p.name, pending });
+    return error.NotifierNotDrained;
 }
 
 /// The grant-plane row of `vol_tag` in a `.stats` text (`block_grant_holder`

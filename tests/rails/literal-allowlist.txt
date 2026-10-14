@@ -69,9 +69,9 @@ src/cli/fsck.zig:37 | 20 | a size — OWED: derive from derive.Facts or document
 src/cli/fsck.zig:37 | 64 | a size — OWED: derive from derive.Facts or document the physical/format reason
 src/cli/job.zig:332 | 0xFFFF | an encoding constant (magic, mask, flag bit, hash seed) — OWED: name it or document the table
 src/cli/job.zig:332 | 32 | a size — OWED: derive from derive.Facts or document the physical/format reason
-src/cli/mount.zig:926 | 13 | a size — OWED: derive from derive.Facts or document the physical/format reason
-src/cli/mount.zig:927 | 7 | a size — OWED: derive from derive.Facts or document the physical/format reason
-src/cli/mount.zig:928 | 17 | a size — OWED: derive from derive.Facts or document the physical/format reason
+src/cli/mount.zig:930 | 13 | a size — OWED: derive from derive.Facts or document the physical/format reason
+src/cli/mount.zig:931 | 7 | a size — OWED: derive from derive.Facts or document the physical/format reason
+src/cli/mount.zig:932 | 17 | a size — OWED: derive from derive.Facts or document the physical/format reason
 src/cli/status.zig:220 | 512 | OWED: derive it or document it on the line (charter §1.5)
 src/cli/status.zig:229 | 512 | OWED: derive it or document it on the line (charter §1.5)
 src/cli/status.zig:346 | 20 | a size — OWED: derive from derive.Facts or document the physical/format reason
@@ -219,8 +219,8 @@ src/fuse/handler/kv_fs.zig:2227 | 4 | OWED: derive it or document it on the line
 src/fuse/handler/kv_fs.zig:2413 | 512 | OWED: derive it or document it on the line (charter §1.5)
 src/fuse/handler/kv_fs.zig:3428 | 4096 | OWED: derive it or document it on the line (charter §1.5)
 src/fuse/handler/op_trace.zig:279 | 10 | a size — OWED: derive from derive.Facts or document the physical/format reason
-src/fuse/mount_options.zig:326 | 10 | OWED: derive it or document it on the line (charter §1.5)
-src/fuse/mount_options.zig:327 | 10 | OWED: derive it or document it on the line (charter §1.5)
+src/fuse/mount_options.zig:333 | 10 | OWED: derive it or document it on the line (charter §1.5)
+src/fuse/mount_options.zig:334 | 10 | OWED: derive it or document it on the line (charter §1.5)
 src/fuse/transport/filesystem_vtable.zig:475 | 0o100444 | a file mode (POSIX permission bits)
 src/fuse/transport/filesystem_vtable.zig:475 | 0o100644 | a file mode (POSIX permission bits)
 src/fuse/transport/filesystem_vtable.zig:475 | 0o40755 | a file mode (POSIX permission bits)
@@ -240,8 +240,8 @@ src/fuse/transport/filesystem_vtable.zig:725 | 512 | a table entry (switch/range
 src/fuse/transport/filesystem_vtable.zig:725 | 8 | a table entry (switch/range arm) — the codec or classification table
 src/fuse/transport/probes.zig:106 | 4096 | OWED: derive it or document it on the line (charter §1.5)
 src/fuse/transport/probes.zig:210 | 16 | OWED: derive it or document it on the line (charter §1.5)
-src/fuse/transport/session.zig:294 | 32 | a size — OWED: derive from derive.Facts or document the physical/format reason
-src/fuse/transport/session.zig:739 | 64 | OWED: derive it or document it on the line (charter §1.5)
+src/fuse/transport/session.zig:299 | 32 | a size — OWED: derive from derive.Facts or document the physical/format reason
+src/fuse/transport/session.zig:752 | 64 | OWED: derive it or document it on the line (charter §1.5)
 src/fuse/transport/worker.zig:367 | 10 | OWED: derive it or document it on the line (charter §1.5)
 src/fuse/transport/worker.zig:367 | 16 | OWED: derive it or document it on the line (charter §1.5)
 src/fuse/transport/worker.zig:367 | 32 | OWED: derive it or document it on the line (charter §1.5)
@@ -483,8 +483,8 @@ src/meta/sym/tokens/token_table.zig:155 | 9 | OWED: derive it or document it on 
 src/meta/sym/tokens/token_table.zig:156 | 10 | OWED: derive it or document it on the line (charter §1.5)
 src/meta/sym/tokens/token_table.zig:156 | 64 | OWED: derive it or document it on the line (charter §1.5)
 src/meta/sym/tokens/token_table.zig:157 | 11 | OWED: derive it or document it on the line (charter §1.5)
-src/meta/sym/wire_plane.zig:267 | 3 | a table entry (switch/range arm) — the codec or classification table
-src/meta/sym/wire_plane.zig:268 | 4 | a table entry (switch/range arm) — the codec or classification table
+src/meta/sym/wire_plane.zig:268 | 3 | a table entry (switch/range arm) — the codec or classification table
+src/meta/sym/wire_plane.zig:269 | 4 | a table entry (switch/range arm) — the codec or classification table
 src/meta/sym/xv/applier.zig:296 | 12 | a size — OWED: derive from derive.Facts or document the physical/format reason
 src/meta/sym/xv/intent.zig:166 | 8 | OWED: derive it or document it on the line (charter §1.5)
 src/meta/sym/xv/intent.zig:198 | 8 | OWED: derive it or document it on the line (charter §1.5)

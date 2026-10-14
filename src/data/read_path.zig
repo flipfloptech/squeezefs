@@ -1505,6 +1505,20 @@ pub const ReadPath = struct {
                 key = self.currentBinding(ino, b);
                 continue;
             };
+            // Wholly past a SHORT image's plaintext (a promoted sub-block
+            // image, a tail trimmed to its live frames — decision 0003 §AK):
+            // zeros, once the page in hand is proven the binding's.
+            if (span.isEmpty()) {
+                if (!(self.still(k, before) and self.bindingIs(ino, b, k))) {
+                    stats.stale_binding_rebinds.inc();
+                    stats.ranged_read_rebinds.inc();
+                    key = self.currentBinding(ino, b);
+                    continue;
+                }
+                @memset(out, 0);
+                stats.read_copy_dest_bytes.add(out.len);
+                return;
+            }
             // 2. The frames' window. Frame 0's body begins inside the first
             //    grain (right after the table): a span starting there reuses
             //    the grain in hand and DMAs only the rest — one grain is
@@ -1544,8 +1558,11 @@ pub const ReadPath = struct {
                 key = self.currentBinding(ino, b);
                 continue;
             };
+            // The plaintext through `plain_end`, zeros past a short image's end.
             const from: usize = @intCast(rel_s - span.plain_base);
-            @memcpy(out, view[from..][0..out.len]);
+            const avail: usize = @intCast(span.plain_end - rel_s);
+            @memcpy(out[0..avail], view[from..][0..avail]);
+            @memset(out[avail..], 0);
             stats.read_copy_dest_bytes.add(out.len);
             return;
         }
@@ -1669,7 +1686,12 @@ pub const ReadPath = struct {
             pc.mark(&stats.read_fill_fetch_dma_ns);
             const view = d.decode(d.ctx, img.bytes[0..@intCast(d.chunk)], target) catch return error.InputOutput;
             if (view.ptr != target.ptr) @memcpy(target[0..view.len], view);
-            blk.len = @intCast(view.len);
+            // An image shorter than its block (a promoted sub-block image, a
+            // tail trimmed to its live frames — decision 0003 §AK) is zeros
+            // past its plaintext: the block every tier caches and every
+            // serve slices is the whole block (a short block sliced at an
+            // offset past its plaintext panicked out of bounds).
+            @memset(target[view.len..bs], 0);
             pc.mark(&stats.read_fill_decode_ns);
         } else {
             if (try self.vols.read_range(self.vols.ctx, key.vol_tag, key.offset, target[0..bs], .pooled) == .dma) {

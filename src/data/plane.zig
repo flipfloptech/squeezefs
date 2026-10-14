@@ -1646,6 +1646,26 @@ pub const DataPlane = struct {
         return out[w.lo..w.hi];
     }
 
+    /// The PLAINTEXT of a transformed mapping into `out`, a buffer the
+    /// image's plaintext fits (the write side's block-sized seed: the
+    /// seeded checkout's cell, the flush's complement). The stored window —
+    /// the chunk, `block + 4 KiB`, for a whole-block mapping — lands in ONE
+    /// pooled scratch and decodes straight into `out` (decision 0003 §AK:
+    /// read into `out` itself, a whole-block window never fit and every
+    /// write into a mapped transformed block answered EIO).
+    fn readMappingPlain(self: *DataPlane, m: Mapping, out: []u8) Error![]const u8 {
+        const x = &self.xform.?;
+        const w = m.readWindow(self.chunk, null) catch return error.InputOutput;
+        const raw = x.scratches.acquire(self.io);
+        defer x.scratches.release(self.io, raw);
+        if (w.len > raw.len) return error.BufferTooSmall;
+        const v = self.vols.byTag(w.vol_tag) orelse return error.InputOutput;
+        const before = v.alloc.fillIncarnation(v.alloc.idxOf(m.offset)) orelse return error.InputOutput;
+        try self.deviceRead(w.vol_tag, w.device_off, raw[0..@intCast(w.len)], .write_side);
+        if (!v.alloc.fillIncarnationStill(v.alloc.idxOf(m.offset), before)) return error.InputOutput;
+        return self.decodeStored(raw[0..@intCast(w.len)], out) catch return error.InputOutput;
+    }
+
     // ---- the promotion primitive (staging → inline / own block / packed) ----
 
     fn promotionPressure(ctx: ?*anyopaque, k: staging.StagingKey) void {
@@ -2094,11 +2114,11 @@ pub const DataPlane = struct {
     }
 
     /// `seams.ImageSeam` on a transformed set: the write side's seeds read
-    /// the block's PLAINTEXT image (`readMappingImage` decodes the frame),
+    /// the block's PLAINTEXT image (`readMappingPlain` decodes the frame),
     /// never the raw frame bytes.
     fn imageSeamRead(ctx: ?*anyopaque, b: Mapping, out: []u8) seams.ReadError!void {
         const self: *DataPlane = @ptrCast(@alignCast(ctx.?));
-        const plain = self.readMappingImage(b, out) catch |e| return switch (e) {
+        const plain = self.readMappingPlain(b, out) catch |e| return switch (e) {
             error.ShortRead => error.ShortRead,
             error.QueueFull => error.QueueFull,
             error.WorkerShutdown => error.WorkerShutdown,

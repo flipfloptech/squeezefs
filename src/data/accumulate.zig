@@ -1054,7 +1054,12 @@ pub fn uploadParkedBlock(table: *Table, deps: UploadDeps, io: Io, ino: u64, bloc
         const proof = blk: {
             const scratch: []align(PAGE) u8 = if (scratch_pool) |sp| sp.acquire(io) else &.{};
             defer if (scratch_pool) |sp| sp.release(io, scratch);
-            const image = deps.transform.process_write(deps.transform.ctx, vol_tag, snap.bytes(), scratch) catch {
+            // A transformed image carries the block's live frames only
+            // (decision 0003 §AK): the frames past the last non-zero byte
+            // read back as zeros, and storing them cost a tail append's
+            // drain the whole block on an encrypted set.
+            const plain = if (scratch_pool != null) snap.bytes()[0..transform.liveFramedLen(snap.bytes())] else snap.bytes();
+            const image = deps.transform.process_write(deps.transform.ctx, vol_tag, plain, scratch) catch {
                 fsck_guard.deinit();
                 mint.abandon();
                 stats.write_through_fallbacks.inc();
@@ -1178,7 +1183,9 @@ pub fn uploadParkedBlock(table: *Table, deps: UploadDeps, io: Io, ino: u64, bloc
             break;
         }
         stats.write_through_blocks.inc();
-        stats.write_through_bytes.add(bs);
+        // The bytes the DMA landed (a transformed image's stored length),
+        // so the device-write ledger closes against diskstats.
+        stats.write_through_bytes.add(proof.len);
         // Displaced frees OUTSIDE the guard (RES-1), then the epoch close
         // hint OUTSIDE the guard.
         for (displaced.slice()) |d| _ = deps.free.free(io, d);

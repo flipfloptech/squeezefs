@@ -516,7 +516,11 @@ pub fn decodeTable(cfg: VolumeTransform, h: Header, page: []const u8) DecodeErro
 
 /// The frames a block-relative window `[rel_s, rel_e)` needs and the image
 /// bytes to DMA for them, rounded to the DMA grain outward (`hi` is
-/// clipped to the image's padded end).
+/// clipped to the image's padded end). An image may be SHORTER than its
+/// block (a promoted sub-block image; a tail block's upload trimmed to its
+/// live frames, decision 0003 §AK): the window is served from the
+/// plaintext up to `plain_end` and reads zeros past it — a span whose
+/// `plain_end` is not past `plain_base` names no frame at all.
 pub const FrameSpan = struct {
     first: u32,
     last: u32,
@@ -525,16 +529,43 @@ pub const FrameSpan = struct {
     hi: u64,
     /// The plaintext offset of `first`'s start.
     plain_base: u64,
+    /// `min(rel_e, plain_len)`: where the image's plaintext ends inside the window.
+    plain_end: u64,
+
+    /// Wholly past the image's plaintext: zeros, no frame to read.
+    pub fn isEmpty(self: FrameSpan) bool {
+        return self.plain_end <= self.plain_base;
+    }
 };
 
 pub fn frameSpan(h: Header, t: Table, rel_s: u64, rel_e: u64) DecodeError!FrameSpan {
-    if (rel_e <= rel_s or rel_e > h.plain_len or t.count == 0) return error.FrameTable;
+    if (rel_e <= rel_s) return error.FrameTable;
+    const end = @min(rel_e, h.plain_len);
+    if (end <= rel_s) return .{ .first = 0, .last = 0, .lo = 0, .hi = 0, .plain_base = rel_s, .plain_end = rel_s };
+    if (t.count == 0) return error.FrameTable;
     const first: u32 = @intCast(rel_s / FRAME_GRAIN);
-    const last: u32 = @intCast((rel_e - 1) / FRAME_GRAIN);
+    const last: u32 = @intCast((end - 1) / FRAME_GRAIN);
     const a = t.get(first);
     const b = t.get(last);
     const image_end = derive.alignUp(tableLen(t.count) + @as(u64, h.body_len), DMA_GRAIN);
-    return .{ .first = first, .last = last, .lo = derive.alignDown(a.off, DMA_GRAIN), .hi = @min(derive.alignUp(@as(u64, b.off) + b.body_len, DMA_GRAIN), image_end), .plain_base = @as(u64, first) * FRAME_GRAIN };
+    return .{ .first = first, .last = last, .lo = derive.alignDown(a.off, DMA_GRAIN), .hi = @min(derive.alignUp(@as(u64, b.off) + b.body_len, DMA_GRAIN), image_end), .plain_base = @as(u64, first) * FRAME_GRAIN, .plain_end = end };
+}
+
+/// The plaintext a block's framed image must carry: through the last frame
+/// holding a non-zero byte — every frame past it reads back as zeros past
+/// the image's plaintext (`FrameSpan.plain_end`, the seeds' zero fill), so
+/// storing it buys nothing. A tail block's upload transforms only this
+/// (decision 0003 §AK): the stored image is then bounded by the live
+/// frames (`storedImageBound`), never the whole block — an encrypted
+/// set's zero frames are stored raw at 64 KiB + a tag each.
+pub fn liveFramedLen(plain: []const u8) usize {
+    var end = std.mem.alignForward(usize, plain.len, FRAME_GRAIN);
+    while (end != 0) {
+        const start = end - FRAME_GRAIN;
+        if (start < plain.len and !std.mem.allEqual(u8, plain[start..@min(end, plain.len)], 0)) return @min(end, plain.len);
+        end = start;
+    }
+    return 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -1682,8 +1713,10 @@ pub const Codec = struct {
 
     /// The plaintext of `image` (a device window: trailing bytes beyond
     /// the last frame are ignored by construction). On a passthrough
-    /// volume `image` itself. Otherwise a view into `out` (`len ≥
-    /// scratchLen(block)`): every frame is opened IN PLACE in `image` (when
+    /// volume `image` itself. Otherwise a view into `out` (`len ≥` the
+    /// image's plaintext — the decoder writes exactly each frame's content,
+    /// so a block-sized seed buffer holds any image of the block): every
+    /// frame is opened IN PLACE in `image` (when
     /// encrypted) then decompressed, or copied when raw, into its plaintext
     /// offset. Every refusal counts on its tripwire.
     pub fn processRead(self: *Codec, image: []u8, out: []u8) ReadError![]const u8 {
@@ -1700,12 +1733,12 @@ pub const Codec = struct {
     /// The read without the counting (the fuzz target).
     pub fn readInner(self: *Codec, image: []u8, out: []u8) ReadError![]const u8 {
         const cfg_ = self.t.cfg;
-        if (out.len < scratchLen(cfg_.block_size)) return error.ScratchTooSmall;
         const h = try decodeHeader(cfg_, image);
+        if (out.len < h.plain_len) return error.ScratchTooSmall;
         const tb = try decodeTable(cfg_, h, image);
         if (image.len < tableLen(tb.count) + @as(usize, h.body_len)) return error.FrameLen;
         if (tb.count == 0) return out[0..0];
-        const span: FrameSpan = .{ .first = 0, .last = tb.count - 1, .lo = 0, .hi = image.len, .plain_base = 0 };
+        const span: FrameSpan = .{ .first = 0, .last = tb.count - 1, .lo = 0, .hi = image.len, .plain_base = 0, .plain_end = h.plain_len };
         return self.decodeSpan(h, tb, image, image, 0, span, out);
     }
 
@@ -2141,14 +2174,55 @@ test "decodeHeader refuses by class in order: len, plain_len FIRST (before magic
     raw_entry.encode(page[HEADER_LEN + TABLE_HEAD_LEN ..][0..ENTRY_LEN]);
     Restamp.run(&page, 1);
     try testing.expectError(error.FrameTable, decodeTable(enc_only, eh, &page));
-    // The empty payload: zero frames, nothing to span.
+    // The empty payload: zero frames — a window over it is wholly past the
+    // plaintext (zeros, no frame); an empty window still refuses.
     const empty = try gpa.dupe(u8, try t.processWrite("", scratch));
     defer gpa.free(empty);
     const eh0 = try decodeHeader(cfg2, empty);
     const et = try decodeTable(cfg2, eh0, empty);
     try testing.expectEqual(@as(u32, 0), et.count);
     try testing.expectEqual(@as(usize, HEADER_PAGE_LEN), empty.len);
-    try testing.expectError(error.FrameTable, frameSpan(eh0, et, 0, 1));
+    try testing.expect((try frameSpan(eh0, et, 0, 1)).isEmpty());
+    try testing.expectError(error.FrameTable, frameSpan(eh0, et, 5, 5));
+}
+
+test "liveFramedLen: the plaintext through the last frame holding a non-zero byte — an all-zero block is 0, a byte in frame k is (k + 1) frames, a short last frame ends at the payload; the trimmed image round-trips and its stored bytes meet storedImageBound (decision 0003 §AK)" {
+    const gpa = testing.allocator;
+    const block: u32 = 4 * FRAME_GRAIN;
+    const plain = try gpa.alloc(u8, block);
+    defer gpa.free(plain);
+    @memset(plain, 0);
+    try testing.expectEqual(@as(usize, 0), liveFramedLen(plain));
+    plain[0] = 1;
+    try testing.expectEqual(@as(usize, FRAME_GRAIN), liveFramedLen(plain));
+    plain[2 * FRAME_GRAIN + 77] = 9;
+    try testing.expectEqual(@as(usize, 3 * FRAME_GRAIN), liveFramedLen(plain));
+    try testing.expectEqual(@as(usize, 3 * FRAME_GRAIN), liveFramedLen(plain[0 .. 3 * FRAME_GRAIN]));
+    try testing.expectEqual(@as(usize, 2 * FRAME_GRAIN + 100), liveFramedLen(plain[0 .. 2 * FRAME_GRAIN + 100]));
+    try testing.expectEqual(@as(usize, FRAME_GRAIN), liveFramedLen(plain[0 .. 2 * FRAME_GRAIN + 50]));
+    var env = testEnv();
+    defer env.deinit();
+    var d = deriveVolumeKey("a-32-byte-or-longer-key-material-string!!", &(@as([32]u8, @splat(5))));
+    defer d.zeroize();
+    const gcm = try CryptoState.init(gpa, testing.io, .aes256gcm, d, null, 0, 1);
+    defer gcm.deinit();
+    const scratch = try gpa.alloc(u8, @intCast(scratchLen(block)));
+    defer gpa.free(scratch);
+    const out = try gpa.alloc(u8, block);
+    defer gpa.free(out);
+    for ([_]VolumeTransform{ .{ .compression = .lz4, .block_size = block }, .{ .encryption = .aes256gcm, .block_size = block } }) |cfg| {
+        const xf = try Transform.init(&env, cfg, if (cfg.encryption == .none) null else gcm);
+        var t = try Codec.init(gpa, &xf);
+        defer t.deinit(gpa);
+        const live = liveFramedLen(plain);
+        const image = try gpa.dupe(u8, try t.processWrite(plain[0..live], scratch));
+        defer gpa.free(image);
+        try testing.expect(std.mem.alignForward(usize, image.len, DMA_GRAIN) <= storedImageBound(cfg, live));
+        try testing.expect(storedImageBound(cfg, live) < storedImageBound(cfg, block));
+        @memset(out, 0xEE);
+        const got = try t.processRead(image, out);
+        try testing.expectEqualSlices(u8, plain[0..live], got);
+    }
 }
 
 test "geometry: max_stored_image_len = table + block (+16 per frame encrypted) ≤ block + headroom; chunk = block + 4096 on transformed volumes, block on passthrough; the refusal; capacity reserves two chunks" {

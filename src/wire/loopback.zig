@@ -339,7 +339,7 @@ test "four in-process daemons exchange every verb family's shape over the hub: e
     const tg = try c.call(.{ .token_grant = .{ .head = .{ .volume = 0, .wants = verbs.WANT_RECORDS, .mode = 0, .xattr_after_len = 0, .client_id = 1, .object = 9, .after = 0 }, .bytes = "" } });
     try testing.expectEqual(@as(u8, 0), tg.token_grant.head.kind);
     const recalled = [_]u64{9};
-    const rv = try c.call(.{ .token_recall = .{ .head = .{ .volume = 0, .reserved = 0, .n = 1, .frame_id = 1, .holder = 1 }, .items = &recalled } });
+    const rv = try c.call(.{ .token_recall = .{ .head = .{ .volume = 0, .n_names = 0, .n = 1, .frame_id = 1, .holder = 1, .unnamed = 0, .reserved = @splat(0) }, .items = &recalled } });
     try testing.expectEqual(@as(u8, 0), rv.token_recall.kind);
     _ = try c.call(.{ .token_recall_ack = .{ .volume = 0, .reserved = 0, .reserved2 = 0, .client_id = 1, .frame_id = 0 } });
     const objs = [_]u64{ 9, 10 };

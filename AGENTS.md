@@ -50,6 +50,15 @@ moves the smoke's data volumes + cache dir there. Run `scripts/venue trim` after
 every `SQUEEZEFS_*` literal is a registry row; every non-retired row is read by some
 module — a row nothing reads is dead code and goes red). Keep it green on both venues.
 
+Its test steps run side by side (`docs/evidence/rung-10-gate-speed.md`): the unit tests
+and the smoke are shard sets of one compiled binary under `tests/test_runner.zig`, so a
+test must not depend on what ran before it in the process (reset process-wide state it
+asserts — a tripwire's log budget, a histogram-derived threshold) nor on an idle host
+(wait for the observable it asserts, never a real-time bound between two statements).
+Rigs stay run-scoped (pid-tagged paths, `127.0.0.1:0` ports); a test that cannot share
+the venue says `[venue-exclusive]` in its name. When the runner refuses a stale cost
+table, `scripts/venue zig build costs` regenerates `tests/costs/` — commit it.
+
 ## Conventions (Zig 0.17)
 
 - **Allocators explicit**; hot paths own pools and allocate nothing per op.

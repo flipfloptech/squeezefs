@@ -930,10 +930,15 @@ pub const WritePath = struct {
             //    (a plaintext page costs a whole-frame decode): it takes the
             //    SEEDED checkout below (one decode, a content-valid full
             //    buffer that parks) instead of the overlay.
+            //    A stream-adjacent piece CONTINUES an overlay already parked
+            //    over a mapped base (a held-open appender's first write
+            //    parked here): escalating it would seed the whole block to
+            //    land a few touched pages (decision 0003 §AK).
             const small = extent.isSmall(pc.len, bs);
             const existing = self.table.get(req.ino, pc.block);
             const base_passthrough = if (live_binding) |b| (if (self.vols.byTag(b.vol_tag)) |v| v.passthrough else false) else true;
-            if (small and !stream_adjacent and (existing == null or existing.?.repr == .extent) and (existing != null or base_passthrough)) {
+            const continues_overlay = if (existing) |x| x.repr == .extent and x.repr.extent.base_deferred else false;
+            if (small and (!stream_adjacent or continues_overlay) and (existing == null or existing.?.repr == .extent) and (existing != null or base_passthrough)) {
                 const e = existing orelse self.table.checkoutExtent(req.ino, pc.block, has_existing, live_binding) orelse {
                     try self.parkAtPoolCap(io, g, &held, req, pc.block, &gate);
                     continue;

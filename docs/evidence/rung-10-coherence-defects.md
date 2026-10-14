@@ -261,6 +261,7 @@ The shield is the producer's: the in-flight registry (`InflightAllocGuard`, Phas
 `inflightContains`, today held only from a mint to its publish) held from before every releasing
 commit until its terminal free, at every release site (the destroy and corpse sweep, truncate, the
 overwrite's old block, the pack release). Not done here; 4/150 under 14 × `yes` (0 in 100 idle).
+Landed in `rung-10-gate-blockers.md` §1 (decision 0003 §AH).
 
 ## The queued sideband abort (`Sideband.completeCell → recycle`, `session.zig:642` on `5ababa8`)
 

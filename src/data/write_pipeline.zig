@@ -510,6 +510,15 @@ pub const Governor = struct {
     completions: sync_notify.Notify = .init,
     /// `admission_waits` at the last roll (the saturation input).
     waits_at_roll: Atomic(u64) = .init(0),
+    /// Test seam: fires inside an admitter's park window — registered on
+    /// `completions`, its re-check not yet run (the window a completion
+    /// must not be lost in).
+    test_park_window: ?ParkWindow = null,
+
+    pub const ParkWindow = struct {
+        ctx: *anyopaque,
+        at: *const fn (ctx: *anyopaque) void,
+    };
 
     pub fn init(gpa: Allocator, block_size: u64, lanes: usize, override: DepthOverride, mem: ?*const budget.MemBudget, cap_fallback: u64) Allocator.Error!Governor {
         assert(lanes >= 1 and lanes <= router.MAX_VOLUMES);
@@ -601,6 +610,7 @@ pub const Governor = struct {
         while (true) {
             var w = self.completions.notified();
             _ = w.enable(io);
+            if (self.test_park_window) |h| h.at(h.ctx);
             if (self.tryAdmit(n)) |p| {
                 w.cancel(io);
                 return p;
@@ -809,21 +819,55 @@ test "admission_parks_at_target_and_wakes_on_completion; empty_pipe_always_admit
     const p1 = g.admitSegment(io, 4096);
     const p2 = g.admitSegment(io, 4096);
     try testing.expectEqual(@as(?Permit, null), g.tryAdmit(4096));
+    // (a) A completion inside the park window — the admitter registered,
+    // its re-check not yet run — is met by the re-check: admitted, no park
+    // counted (a lost wake here would sleep to the backstop tick).
+    const Window = struct {
+        gov: *Governor,
+        p: Permit,
+        fired: bool = false,
+        fn at(ctx: *anyopaque) void {
+            const w: *@This() = @ptrCast(@alignCast(ctx));
+            if (w.fired) return;
+            w.fired = true;
+            w.gov.complete(testing.io, w.p, 0, 1_000_000);
+        }
+    };
+    var win: Window = .{ .gov = &g, .p = p1 };
+    g.test_park_window = .{ .ctx = &win, .at = &Window.at };
+    const waits_a = stats.write_pipeline_admission_waits.load();
+    const p3 = g.admitSegment(io, 4096);
+    g.test_park_window = null;
+    try testing.expect(win.fired);
+    try testing.expectEqual(waits_a, stats.write_pipeline_admission_waits.load());
+    // (b) A completion once the admitter PARKED (its re-check failed and
+    // the park is counted): the admission waits for it, and every park it
+    // counts ends in that one completion's wake or a backstop tick — the
+    // count is the schedule's (a completer slower than the 5 ms tick adds
+    // a ticked re-park), the identity is not.
     const Completer = struct {
-        fn run(io_: Io, gov: *Governor, p: Permit) void {
-            while (gov.completions.waiters(io_) == 0) std.Thread.yield() catch {};
+        fn run(io_: Io, gov: *Governor, p: Permit, waits0: u64, completing: *Atomic(bool)) void {
+            while (stats.write_pipeline_admission_waits.load() == waits0) std.Thread.yield() catch {};
+            // Ordered before the release the admission's CAS reads (acq_rel).
+            completing.store(true, .release);
             gov.complete(io_, p, 0, 1_000_000);
         }
     };
-    const waits0 = stats.write_pipeline_admission_waits.load();
-    var fut = io.concurrent(Completer.run, .{ io, &g, p1 }) catch |err| switch (err) {
+    const waits_b = stats.write_pipeline_admission_waits.load();
+    const ticks_b = stats.write_pipeline_admission_tick_wakes.load();
+    var completing: Atomic(bool) = .init(false);
+    var fut = io.concurrent(Completer.run, .{ io, &g, p2, waits_b, &completing }) catch |err| switch (err) {
         error.ConcurrencyUnavailable => return testkit.skip(@src(), .no_concurrency, "the executor refused a unit of concurrency"),
     };
-    const p3 = g.admitSegment(io, 4096);
+    const p4 = g.admitSegment(io, 4096);
+    try testing.expect(completing.load(.acquire));
     fut.await(io);
-    try testing.expectEqual(waits0 + 1, stats.write_pipeline_admission_waits.load());
+    const waits = stats.write_pipeline_admission_waits.load() - waits_b;
+    const ticks = stats.write_pipeline_admission_tick_wakes.load() - ticks_b;
+    try testing.expect(waits >= 1 and ticks <= waits and waits <= 1 + ticks);
     try testing.expectEqual(@as(u64, 2), g.core.inflightBlocks());
-    // quiesce waits for the drain.
+    // quiesce waits for the drain (no wall-clock bound: it returns once
+    // the drainer's completions land).
     const Drainer = struct {
         fn run(io_: Io, gov: *Governor, a: Permit, b: Permit) void {
             while (gov.completions.waiters(io_) == 0) std.Thread.yield() catch {};
@@ -831,8 +875,8 @@ test "admission_parks_at_target_and_wakes_on_completion; empty_pipe_always_admit
             gov.complete(io_, b, 0, 1_000_000);
         }
     };
-    var fut2 = io.concurrent(Drainer.run, .{ io, &g, p2, p3 }) catch return testkit.skip(@src(), .no_concurrency, "the executor refused a unit of concurrency");
-    try testing.expect(g.quiesce(io, clock.monotonicNs() + 5 * std.time.ns_per_s));
+    var fut2 = io.concurrent(Drainer.run, .{ io, &g, p3, p4 }) catch return testkit.skip(@src(), .no_concurrency, "the executor refused a unit of concurrency");
+    try testing.expect(g.quiesce(io, std.math.maxInt(u64)));
     fut2.await(io);
     try testing.expectEqual(@as(u64, 0), g.core.inflightBytes());
 }

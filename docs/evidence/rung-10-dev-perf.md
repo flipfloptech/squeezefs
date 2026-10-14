@@ -489,10 +489,9 @@ fdatasync answering −5 — and the same binaries passed 12/12 (move matrix) an
 healthy disks. An EIO under the move matrix panicking instead of failing loud is a defect of its
 own (owed, not this lever's).
 
-**Gates.** Pre-landing, on the rebased tree: macOS 29/29 steps, 2,233 / 2,262 (29 skipped); Linux
-on the agent's container (same image, kernel 7.2.6-sqz, 5 vCPU / 12 GiB — the venue's root
-filesystem was read-only after the disk event) 45/45 steps, 2,841 / 2,914 (73 skipped). Post-landing
-venue gates: §9.8.
+**Gates.** Pre-landing, on the rebased tree (`8762523`): venue 49/49 steps, 2,851 / 2,924 (73
+skipped), 6 m 40 s; macOS 29/29, 2,216 / 2,245 (29 skipped), 3 m 04 s. The post-landing gates and
+the four rows they made robust: §9.8.
 
 ### 9.5 The bracket harness's two substrates
 
@@ -585,3 +584,31 @@ lives under that lock), N kmbuf regions where the zero-copy posture keeps one pe
 lanes re-introduces the cross-thread handoff (≈ 18–33 µs, §9.4) for every stolen request — worth it
 only for a saturated worker, which no row here shows. A kernel-side alternative (a queue choice that
 falls back to an idle CPU's queue) is not in 7.2.6.
+
+### 9.8 AB.3's post-landing gates
+
+The first post-landing venue gate on `8762523` failed one row, a second run hung 28 min in another,
+a third failed two more — each a row that asserted a timing or a process-wide counter the merge or
+the new shard plan (four new tests moved the partition) exposed; each now waits for the observable
+it asserts (AGENTS.md's gate rules), landed with both gates green before it:
+
+| row | what it asserted | what failed | the row now | commit |
+|---|---|---|---|---|
+| smoke `INVALIDATION COHERENCE ACROSS DAEMONS` | B's served create visible on A at once | A saw its cached negative: A's own kernel is invalidated by its notifier thread, which the served step's ack does not wait for (0003 §AB.2 (2)) | polls A's view for 2 s (a lost invalidation keeps the negative for the 60 s TTL) | `3243f1a` |
+| `session` e2e "a namespace request's handler runs on the thread that delivered it" | own dispatches ≡ the handlers EchoFs ran, right after the helper's last close | 257 against 256: the last RELEASEDIR is asynchronous | waits, bounded, until every counted dispatch ran (and for the sixteenth RELEASE) | `40f5d08` |
+| `nvme_dev` "wake coalescing: N publishes … ONE eventfd write" | the process-wide `dev_wake_writes` delta == 1 | one write too many (a lane an earlier test left) — and the failed check returned with the lane held before its park, so `deinit` waited forever | sums its own lanes' `ParkedRing.written`; a `defer` releases the hold and joins every reader | `98def1b` |
+| `session` e2e "EchoFs mounts over the ring" | requests ≡ replies after waiting for them to meet, read from a later snapshot | 13 against 12: the last close's RELEASE landed between the wait and the snapshot (a worker answering on its own thread meets sooner) | the snapshot itself must show the equality (bounded) | `f344862` |
+
+Three failures the gates also met are not this lever's and passed on rerun: the macOS online fsck
+"zero false positives under a live writer storm" ([C8] durable refs 0 vs derived 1, one shard of one
+run), the smoke `-o ro` reader of a live set (C's remount refused by the home shard's join), and the
+smoke joiner-side grant ledger (daemon A's mount refused loud on `KmbufRingEnomem` — no order-8
+pages free in the venue after four hours of gates). Owed: the coherence row's SECOND step (A creates
+`d/y`, B's kernel held the negative — the recall path, whose reader writes `INVAL_ENTRY` before it
+acks) read `no` once, in a cached gate after the three below; it passed in every other run. Whether
+B always holds the token on `d` when A's create runs (no token, no recall, the negative stands for
+the TTL) is AB.2's open question, not yet reproduced standalone.
+
+Three consecutive full venue gates on landed `dev` (`f344862`), each with a fresh local cache (every
+binary rebuilt, every row run): **49/49 steps, 2,851 / 2,924 passed (73 skipped)** each — 6 m 32 s,
+7 m 18 s, 7 m 57 s.

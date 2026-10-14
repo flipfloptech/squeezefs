@@ -6382,6 +6382,11 @@ fn dataPlanePass(rig: *Rig, cache: bool) !void {
     }
     // G: rm the big files → df back to the baseline (+ the striped small
     // files on the set without staging).
+    const destroys0 = blk: {
+        const tail = try rig.statsTail();
+        defer gpa.free(tail);
+        break :blk numberAfter(tail, "\"fuse_reclaim_destroys\":") orelse 0;
+    };
     {
         const out = try rig.onMount("rm -f big big100 shrunk storm0 storm1 storm2 storm3 storm4 storm5 storm6 storm7 && echo rm-ok");
         defer gpa.free(out);
@@ -6395,6 +6400,15 @@ fn dataPlanePass(rig: *Rig, cache: bool) !void {
     // left tracked is `[C2] leaked`, a count off is C3/C6 — and df by the
     // pack census's bound.
     if (cache) {
+        // The unlinked files are destroyed at their kernel FORGET (corpses
+        // until then, their blocks referenced): every one first, then the
+        // reclaim drained.
+        const removed: u64 = 3 + storm_files;
+        {
+            const destroyed = try awaitAtLeast(rig, "\"fuse_reclaim_destroys\":", destroys0 + removed, 20 * std.time.ns_per_s);
+            defer gpa.free(destroyed);
+            try testing.expect((numberAfter(destroyed, "\"fuse_reclaim_destroys\":") orelse 0) >= destroys0 + removed);
+        }
         const tail = try rig.quiescentStatsTail();
         gpa.free(tail);
         var got = try fsckJsonTarget(rig, rig.mp, &.{"--online"});

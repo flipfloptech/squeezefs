@@ -688,6 +688,18 @@ the R5 pass (`:21812-21823`). Dispositions (`write_pipeline.rs:220-252`):
 `FencingTokenExpired ⇒ StayParked` (a process-local rotation converges inside);
 `WriterGuardFenced ⇒ FenceDrop` (`write_pipeline_fence_drops`); other ⇒ `StayParked`.
 
+**Port (decision 0003 §AK.1, 0002 row 534): the in-place drain.** The flush of a PARTIAL
+parked buffer (`flushParkedBlock`: RELEASE / the no-open FLUSH, fsync's DUR-1, the gate's
+cold flush) whose complement is still the device's (`seed == deferred`) over a block W1's
+state half passes for (`beginInPlace`) lands the covered runs widened to pages in place —
+each partial page's other bytes read back from the mapping into the cell (≤ 2 per run),
+ONE DMA per contiguous page run, the W1 postlude, the entry retired; no seed of the whole
+block, no fresh block, no merge, no epoch. `drain_inplace_{drains,pages,dmas,write_bytes,
+seed_bytes,declines,dma_errors}`; `drain_inplace_write_bytes` is a device-write byte arm.
+An extending append's drain costs `pages(u, 1) × P` where the reference's whole-block
+escalation wrote `B` and read `B`. `write_through_bytes` and `write_pipeline_superseded_bytes`
+count the DMA'd (stored) length; both are device-write arms (§AK.6).
+
 ### 5.4 The rewrite epoch (`routing.rs:1592-1608`, `:16407-16537`, `:16726-16884`)
 
 Per ino, all mutation under (3.5): `shadow: scc::HashMap<u32, String>` (b → newest
@@ -761,6 +773,14 @@ runs at EVERY write path: the pipeline (`:21899`), the staged flush
 bytes BEFORE the DMA), the fold, the overlay never (impossible by math —
 `design-device-overlay.md:529-543`).
 
+**Port (decision 0003 §AK.4–5, 0002 row 536).** A transformed block's upload transforms its
+LIVE bytes only (`transform.liveLen`: through its last non-zero byte), so a tail block's
+drain is `≤ storedImageBound(r)`; a short image
+reads zeros past its plaintext (`frameSpan` ends at `plain_len`, the whole-block fill
+zero-completes the decode). The write side's seeds read a mapped transformed block through
+`readMappingPlain`: the chunk-long window into one pooled scratch, decoded straight into the
+block-sized buffer (the codec's destination law is the image's plaintext, not the scratch).
+
 ---
 
 ## 6. W2 extent overlay (`try_extent_park :18641-18765`, `active_block.rs:213-259, 437-587`)
@@ -774,7 +794,8 @@ Protocol under (3), after W1 and the overlay declined:
 
 1. `small = len × 4 < bs` (`:18653`). Existing RAM entry: `!extent_repr ⇒ false`;
    `!small || adjacent ⇒ escalate_to_full() + false` (the ordinary checkout owns
-   it); `merge_extent(rel, data)`; `completed ⇒` tripwire; `extent_parks`;
+   it; **port, 0003 §AK.2:** a stream-adjacent small piece meeting an overlay deferred
+   over a mapped base MERGES — a held-open appender's appends never seed the block); `merge_extent(rel, data)`; `completed ⇒` tripwire; `extent_parks`;
    `completed || bytes × 4 ≥ bs ⇒ escalate_to_full()` (the **25 % escalation**);
    else fold thresholds `count ≥ fold_max_extents() || bytes ≥ fold_max_bytes()` ⇒
    `fold_tx.try_send((ino, b))`; `spill_parked_toward_cap(token)`; `true` (`:18658-18694`).

@@ -782,10 +782,10 @@ refused mounts while a peer's load loop drained the free lists.
 
 ### Owed
 
-- The data plane's drain of an extending append on a cache-less set re-uploads the whole block
-  (§10.4): 1.6 GB for 36 KB in the control arm's open-append-close loop. The coalescing bounds the
-  no-open arm's drains; the per-drain cost is the data plane's (§J).
+- ~~The data plane's drain of an extending append on a cache-less set re-uploads the whole block
+  (§10.4)~~ — resolved: decision 0003 §AK, `rung-10-append-drain.md` (the touched pages in place;
+  1.74 GB → 1.85 MB for 500 `echo >> f`).
 - No-opendir (directory listings in the kernel's page cache) needs the directory's own
   invalidation on every remote namespace change.
-- `.stats` repeats a few keys across families (a JSON parser in strict mode refuses the document:
-  `DuplicateField`); the smoke parses with `use_first`.
+- ~~`.stats` repeats a few keys across families~~ — resolved: decision 0003 §AK.7 (one document a
+  strict parser accepts; every smoke read parses strictly).

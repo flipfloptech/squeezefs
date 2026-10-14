@@ -2144,6 +2144,10 @@ test "misaligned direct writes refuse, misaligned buffers bounce, narrow reads w
     var page = try AlignedBuf.zeroed(testing.allocator, 2 * g, mode.memAlign());
     defer page.deinit();
     @memset(page.bytes, 0xC3);
+    // The site logs at most once per second: an earlier test in this
+    // process may have spent the second (the refusal test of the loop
+    // device ran just before this one under one shard plan).
+    stats.unaligned_refusals.resetLogBudgetForTest();
     log.testing.expectErrorLogs(2);
     try testing.expectError(Error.UnalignedDirectWrite, pool.writeAt(path, 1, page.bytes[0..g]));
     try testing.expectError(Error.UnalignedDirectWrite, pool.writeAt(path, 0, page.bytes[0 .. g - 1]));

@@ -55,6 +55,9 @@ pub const SCRATCH_RING_ENTRIES: u16 = 8;
 pub const RETENTION_PROBE_WAIT_NS: u64 = 1 * std.time.ns_per_s;
 /// `CAP_SYS_ADMIN` in the `CapEff` word.
 pub const CAP_SYS_ADMIN_BIT: u6 = 21;
+/// `CAP_IPC_LOCK` in the `CapEff` word: without it io_uring charges its
+/// regions (the kmbuf buffers included) to `RLIMIT_MEMLOCK`.
+pub const CAP_IPC_LOCK_BIT: u6 = 14;
 
 /// The opcode pairs the ladder walks, the venue's track first (0002 ledger
 /// row: the order is a deployment fact; the conjunction makes either order
@@ -203,12 +206,17 @@ pub fn ringAtReply(offered_flags: u64, enable_uring_after_write: ?bool) bool {
 
 /// `CapEff` from a `/proc/self/status` text: bit 21.
 pub fn capSysAdminFromStatus(text: []const u8) ?bool {
+    return capBitFromStatus(text, CAP_SYS_ADMIN_BIT);
+}
+
+/// One `CapEff` bit from a `/proc/self/status` text (null = no readable word).
+pub fn capBitFromStatus(text: []const u8, bit: u6) ?bool {
     var it = std.mem.splitScalar(u8, text, '\n');
     while (it.next()) |line| {
         if (!std.mem.startsWith(u8, line, "CapEff:")) continue;
         const hex = std.mem.trim(u8, line["CapEff:".len..], " \t\r");
         const caps = std.fmt.parseInt(u64, hex, 16) catch return null;
-        return caps & (@as(u64, 1) << CAP_SYS_ADMIN_BIT) != 0;
+        return caps & (@as(u64, 1) << bit) != 0;
     }
     return null;
 }
@@ -350,6 +358,14 @@ pub const driver = if (is_linux) struct {
         return capSysAdminFromStatus(text) orelse false;
     }
 
+    /// `CapEff` bit 14 of this process (an unreadable word reads absent:
+    /// the refusal then names the memlock lever too).
+    pub fn capIpcLock(io: Io) bool {
+        var buf: [4096]u8 = undefined;
+        const text = Io.Dir.cwd().readFile(io, "/proc/self/status", &buf) catch return false;
+        return capBitFromStatus(text, CAP_IPC_LOCK_BIT) orelse false;
+    }
+
     /// The retention probe live: one `RELEASE_PAYLOAD` on the PLAIN fuse fd
     /// from a scratch SQE128 ring, `commit_id = u64::MAX`, waited ≤ 1 s.
     pub fn probeRetention(fuse_fd: linux.fd_t) Verdict {
@@ -433,6 +449,8 @@ test "the zc surface is a conjunction of kmbuf, CapEff bit 21 and the sparse tab
     try testing.expectEqual(@as(?bool, true), capSysAdminFromStatus("CapEff: 0000000000200000"));
     try testing.expectEqual(@as(?bool, null), capSysAdminFromStatus("CapPrm:\t00000000a82465fb\n"));
     try testing.expectEqual(@as(?bool, null), capSysAdminFromStatus("CapEff:\tzz\n"));
+    try testing.expectEqual(@as(?bool, true), capBitFromStatus("CapEff:\t0000000000004000\n", CAP_IPC_LOCK_BIT));
+    try testing.expectEqual(@as(?bool, false), capBitFromStatus("CapEff:\t0000000000200000\n", CAP_IPC_LOCK_BIT));
 }
 
 test "the ring exists at reply time iff enable_uring reads Y after the daemon's write: the first mount after boot (offer absent, parameter N when INIT was sent) still arms zc; an unreadable parameter falls back to the offer" {

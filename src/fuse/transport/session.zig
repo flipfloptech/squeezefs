@@ -207,9 +207,9 @@ pub const MountError = error{
     /// An explicit `SQUEEZEFS_FUSE_BUFFER_MODE` the probes refused (named
     /// in the log) — the only degrade point is the probe; never a downgrade.
     BufferModeRefused,
-    /// The kmbuf ring's contiguous-page registration answered ENOMEM after
-    /// every retry (`kmbuf.Error`): the probe decided the mode, so the law
-    /// is fail loud, never degrade; `Config.refusal` carries the order.
+    /// The kmbuf ring's registration answered ENOMEM after every retry
+    /// (`kmbuf.Error`): the probe decided the mode, so the law is fail
+    /// loud, never degrade; `Config.refusal` carries the region and levers.
     KmbufRingEnomem,
     SlabFailed,
 };
@@ -219,13 +219,18 @@ pub const MountError = error{
 /// `mount` into `Config.refusal` before the error returns.
 pub const Refusal = union(enum) {
     none,
-    /// `KmbufRingEnomem`: each ring buffer is `2^order` contiguous pages.
-    kmbuf_ring_enomem: struct { order: u8 },
+    /// `KmbufRingEnomem`: one queue's region (`buffers × buf_size`, `pages`
+    /// at once) found too few free pages (`kmbuf.Error`'s law), charged to
+    /// `RLIMIT_MEMLOCK` when the process lacks `CAP_IPC_LOCK`.
+    kmbuf_ring_enomem: struct { pages: u64, buffers: u32, buf_size: u32, memlock_charged: bool },
 
     pub fn format(self: Refusal, w: *Io.Writer) Io.Writer.Error!void {
         switch (self) {
             .none => try w.writeAll("no refusal detail"),
-            .kmbuf_ring_enomem => |r| try w.print("kmbuf ring registration ENOMEM (order-{d} contiguous pages); retry, or SQUEEZEFS_FUSE_BUFFER_MODE=user", .{r.order}),
+            .kmbuf_ring_enomem => |r| {
+                try w.print("kmbuf ring registration ENOMEM: a queue's region takes {d} pages at once ({d} × {d} B); the kernel falls back to order-0 pages but draws them from the free lists only (no reclaim) — free memory, or shrink the region (SQUEEZEFS_FUSE_MAX_WRITE: the buffer; SQUEEZEFS_FUSE_OVER_IO_URING_Q_DEPTH: the buffers per queue), or SQUEEZEFS_FUSE_BUFFER_MODE=user", .{ r.pages, r.buffers, r.buf_size });
+                if (r.memlock_charged) try w.writeAll("; without CAP_IPC_LOCK the region is charged to RLIMIT_MEMLOCK: raise it or grant the capability");
+            },
         }
     }
 };
@@ -1289,7 +1294,11 @@ pub const Session = struct {
                     error.RingSetupFailed => error.RingSetupFailed,
                     error.ThreadSpawnFailed => error.ThreadSpawnFailed,
                     error.KmbufRingEnomem => {
-                        if (cfg.refusal) |r| r.* = .{ .kmbuf_ring_enomem = .{ .order = kmbuf.pageOrder(self.plan.payload_sz, facts.page_size) } };
+                        if (cfg.refusal) |r| {
+                            const buf_size: u32 = @intCast(derive.alignUp(self.plan.payload_sz, facts.page_size));
+                            const buffers = zc.ringEntriesFor(self.plan.depth);
+                            r.* = .{ .kmbuf_ring_enomem = .{ .pages = kmbuf.regionPages(buffers, buf_size, facts.page_size), .buffers = buffers, .buf_size = buf_size, .memlock_charged = !probes.driver.capIpcLock(self.io) } };
+                        }
                         return error.KmbufRingEnomem;
                     },
                 };
@@ -2803,7 +2812,7 @@ test "e2e lattice: an explicit `zc` on a venue without CAP_SYS_ADMIN (the seam) 
     }
 }
 
-test "e2e lattice: the kmbuf ring answering ENOMEM after every retry (the seam) fails the mount with the TYPED KmbufRingEnomem refusal whose detail names the page order and the remedy; nothing stays pinned or mounted" {
+test "e2e lattice: the kmbuf ring answering ENOMEM after every retry (the seam) fails the mount with the TYPED KmbufRingEnomem refusal whose detail names the region's pages and the levers that shrink it — never an order-N contiguous shortage (the kernel falls back to order-0 pages); nothing stays pinned or mounted" {
     if (venueMissing()) |why| return testkit.skipWhy(@src(), why);
     if (probes.driver.probeKmbuf(@intCast(derive.facts().page_size)).opcodes() == null) return testkit.skip(@src(), .no_kernel_feature, "no kmbuf register opcode on this kernel");
     const rig = try Rig.init(testing.allocator, 25, &.{.{ "SQUEEZEFS_TEST_KMBUF_REGISTER_ENOMEM", "1" }});
@@ -2817,10 +2826,15 @@ test "e2e lattice: the kmbuf ring answering ENOMEM after every retry (the seam) 
     try testing.expectError(error.KmbufRingEnomem, rig.mountIt(.{ .mem_budget_bytes = 0, .refusal = &refusal, .test_error_logs = 1 }));
     try log.testing.expectAllFired();
     try testing.expect(refusal == .kmbuf_ring_enomem);
-    var buf: [256]u8 = undefined;
+    var buf: [768]u8 = undefined;
     const text = try std.fmt.bufPrint(&buf, "{f}", .{refusal});
-    try testing.expect(std.mem.startsWith(u8, text, "kmbuf ring registration ENOMEM (order-"));
-    try testing.expect(std.mem.endsWith(u8, text, " contiguous pages); retry, or SQUEEZEFS_FUSE_BUFFER_MODE=user"));
+    // The precise levers: the region's pages, never an "order-N contiguous"
+    // shortage (the kernel falls back to order-0 pages).
+    const r = refusal.kmbuf_ring_enomem;
+    try testing.expect(std.math.isPowerOfTwo(r.buffers) and r.buf_size % derive.facts().page_size == 0);
+    try testing.expectEqual(r.pages, kmbuf.regionPages(r.buffers, r.buf_size, derive.facts().page_size));
+    try testing.expect(std.mem.indexOf(u8, text, "contiguous") == null);
+    for ([_][]const u8{ "pages at once", "SQUEEZEFS_FUSE_MAX_WRITE", "SQUEEZEFS_FUSE_OVER_IO_URING_Q_DEPTH", "SQUEEZEFS_FUSE_BUFFER_MODE=user" }) |lever| try testing.expect(std.mem.indexOf(u8, text, lever) != null);
     try testing.expectEqual(retries_before + kmbuf.REGISTER_RETRIES, kmbuf.register_retries.load());
     try testing.expectEqual(pinned_before, kmbuf.pinned_bytes.load());
     var mi_buf: [64 * 1024]u8 = undefined;

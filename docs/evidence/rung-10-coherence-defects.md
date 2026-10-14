@@ -177,3 +177,38 @@ deadline — the window the grace exists for; the mount's typed refusal names it
   row is not expected, a live one, another host's and a torn one are; a roster of dead rows opens no
   grace and a reader's fresh join is granted, where the roster that expected the dead row refuses
   the same reader.
+
+## 4. `KmbufRingEnomem` after hours of gates
+
+**What §9.8 saw.** Daemon A's mount refused on `KmbufRingEnomem` after four hours of gates; the
+note read the refusal's own text ("order-8 contiguous pages") as "no order-8 pages free".
+
+**What the kernel does (the evidence).** The venue kernel's kmbuf region allocator (the reference
+recipe `44752ce5`, `docker/kernel-sqz/patches-7.2/0003-io_uring-kbuf-add-support-for-kernel-managed-buffer-.patch`,
+`io_region_allocate_pages_multi_buf`) tries ONE compound block per buffer (`io_mem_alloc_compound`)
+and, when no block of that order is free, falls back to `buf_size / PAGE_SIZE` order-0 pages
+(`alloc_pages_bulk_node`). A fragmented page cache therefore never fails the registration, and
+"more, smaller buffers" would ask for exactly the same order-0 pages: there is no smaller grain to
+fall back to that changes the outcome. The ENOMEM is (a) the bulk fallback coming up short — it
+draws on the free lists without reclaim and is all-or-nothing per region (one queue's region is
+`ring_entries × buf_size`: 32 × 1 MiB = 8,192 pages on this venue), so free memory short of the
+region while gigabytes are merely reclaimable refuses it — the "ample `available`" capture of
+2026-08-10 the retry ladder's comment records — or (b) `__io_account_mem`'s `RLIMIT_MEMLOCK`
+charge when the ring was created without `CAP_IPC_LOCK`. Separately, a smaller per-buffer order
+could not be adopted here anyway: one FUSE request's payload lands in ONE buffer, and the INIT
+reply commits `max_write` before the workers register their rings.
+
+**Fix (decision 0003 §AG.4).** The refusal names the real resource and the levers: the region's
+pages at once, the buffers × size, the no-reclaim order-0 fallback, and what shrinks the region
+(`SQUEEZEFS_FUSE_MAX_WRITE` the buffer, `SQUEEZEFS_FUSE_OVER_IO_URING_Q_DEPTH` the buffers per
+queue) or avoids it (`SQUEEZEFS_FUSE_BUFFER_MODE=user`), plus the memlock lever when the process
+lacks `CAP_IPC_LOCK` (`CapEff` bit 14, `probes.capBitFromStatus`); the worker's log line says the
+same. `kmbuf.pageOrder` (the false premise) is gone. **Owed, the substrate:** a kernel patch that
+completes a short bulk fallback with per-page allocations (which reclaim) would make the mount
+succeed whenever the memory is reclaimable — it needs a venue kernel rebuild and swap, not done
+here.
+
+**Red row.** `session` e2e "the kmbuf ring answering ENOMEM after every retry (the seam) …" now
+asserts the region's pages (`regionPages(buffers, buf_size, page)`) and every lever in the detail
+and that it never claims a contiguous-page shortage — red against the old detail
+(`kmbuf ring registration ENOMEM (order-8 contiguous pages); retry, or …`). `kmbuf` "regionPages".

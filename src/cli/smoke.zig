@@ -5563,7 +5563,7 @@ test "smoke: `umount --lazy` of a BUSY mount — the verb returns at once naming
     try testing.expectEqual(@as(usize, 0), try fuseMountsOf(gpa, io, rig.mp));
 }
 
-test "smoke: a LATE bring-up refusal — the kmbuf ring answers ENOMEM (the seam) after the data plane registered its budget sources: the daemon exits 1 (never a signal) with the typed refusal naming the page order and the remedy, nothing stays mounted or held, and the R5 sampler, ticking at its stop under its seam, reads no freed source; a clean mount → umount under the same sampler seam exits 0" {
+test "smoke: a LATE bring-up refusal — the kmbuf ring answers ENOMEM (the seam) after the data plane registered its budget sources: the daemon exits 1 (never a signal) with the typed refusal naming the region's pages and the levers that shrink it, nothing stays mounted or held, and the R5 sampler, ticking at its stop under its seam, reads no freed source; a clean mount → umount under the same sampler seam exits 0" {
     const io = testing.io;
     if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
     // The registration is reached only where the probe confirmed kmbuf.
@@ -5587,8 +5587,11 @@ test "smoke: a LATE bring-up refusal — the kmbuf ring answers ENOMEM (the seam
         if (r.term != .exited) std.debug.print("\n--- the refused mount died ({f}) instead of exiting ---\n{s}\n", .{ r.term, r.stderr });
         try testing.expectEqual(std.process.Child.Term{ .exited = 1 }, r.term);
         try testing.expect(std.mem.indexOf(u8, r.stderr, "squeezefs mount: the FUSE session could not arm at ") != null);
-        try testing.expect(std.mem.indexOf(u8, r.stderr, ": kmbuf ring registration ENOMEM (order-") != null);
-        try testing.expect(std.mem.indexOf(u8, r.stderr, " contiguous pages); retry, or SQUEEZEFS_FUSE_BUFFER_MODE=user") != null);
+        // The precise levers (decision 0003 §AG.4): the region's pages,
+        // never a contiguous-page shortage.
+        try testing.expect(std.mem.indexOf(u8, r.stderr, ": kmbuf ring registration ENOMEM: a queue's region takes ") != null);
+        for ([_][]const u8{ "SQUEEZEFS_FUSE_MAX_WRITE", "SQUEEZEFS_FUSE_OVER_IO_URING_Q_DEPTH", "SQUEEZEFS_FUSE_BUFFER_MODE=user" }) |lever| try testing.expect(std.mem.indexOf(u8, r.stderr, lever) != null);
+        try testing.expect(std.mem.indexOf(u8, r.stderr, "contiguous") == null);
         // The retry ladder ran its bounded course before the refusal.
         try testing.expectEqual(@as(usize, transport.kmbuf.REGISTER_RETRIES), std.mem.count(u8, r.stderr, "refused ENOMEM — retry "));
         try testing.expectEqual(@as(usize, 0), try fuseMountsOf(gpa, io, rig.mp));

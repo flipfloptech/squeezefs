@@ -50,19 +50,21 @@ pub var pinned_bytes: counters.Gauge = .{};
 pub var register_retries: counters.ShardedCounter = .{};
 
 /// `KmbufRingEnomem` is the typed refusal of a ring registration the
-/// kernel answers ENOMEM after every retry: each buffer is `2^order`
-/// physically contiguous pages, which a fragmented page cache may not
-/// hold even with ample free memory. The probe decided the mode, so the
-/// law is fail loud, never degrade (charter §3); the remedy is the
-/// operator's (retry, or pin `SQUEEZEFS_FUSE_BUFFER_MODE=user`).
+/// kernel answers ENOMEM after every retry. NOT a high-order shortage:
+/// the region allocator (kmbuf patch 0003, `io_region_allocate_pages_
+/// multi_buf`) tries one compound block per buffer and falls back to
+/// order-0 pages — but takes those with `alloc_pages_bulk_node`, which
+/// draws on the free lists and does not reclaim, all or nothing per
+/// region; without `CAP_IPC_LOCK` the region is also charged to
+/// `RLIMIT_MEMLOCK` (`__io_account_mem`). The probe decided the mode, so
+/// the law is fail loud, never degrade (charter §3); the refusal names
+/// the region's pages and the levers that shrink it (`regionPages`).
 pub const Error = error{ HeadersMapFailed, BufferTableFailed, KmbufRegisterFailed, KmbufRingEnomem, RegionMapFailed };
 
-/// The page order of one kmbuf buffer: `log2(ceil(payload / page))`
-/// (1 MiB payloads on 4 KiB pages are order 8 — the allocation the
-/// fragmented-cache ENOMEM names).
-pub fn pageOrder(payload_sz: u32, page: usize) u8 {
-    const pages = std.mem.alignForward(usize, payload_sz, page) / page;
-    return @intCast(std.math.log2_int_ceil(usize, @max(pages, 1)));
+/// The pages one queue's kmbuf region takes at once: `ring_entries ×
+/// buf_size / page` (36 × 1 MiB on 4 KiB pages = 9,216).
+pub fn regionPages(ring_entries: u32, buf_size: u32, page: usize) u64 {
+    return @as(u64, ring_entries) * buf_size / page;
 }
 
 /// The 288 B ent headers, back to back, page-granular (what the kernel
@@ -144,7 +146,7 @@ pub const Kmbuf = struct {
                     continue;
                 }
                 if (e == error.OutOfMemory) {
-                    log.err("transport: kmbuf ring registration ENOMEM (order-{d} contiguous pages: {d} buffers × {d} B at bgid 0, opcode {d}) after {d} retries — the probe-decided buffer mode fails loud, never degrades (charter §3); retry, or SQUEEZEFS_FUSE_BUFFER_MODE=user (RLIMIT_MEMLOCK binds the process's CUMULATIVE pins: raise it or grant CAP_IPC_LOCK)", .{ pageOrder(payload_sz, page), ring_entries, buf_size, opcodes.register, attempt });
+                    log.err("transport: kmbuf ring registration ENOMEM ({d} pages at once: {d} buffers × {d} B at bgid 0, opcode {d}) after {d} retries — the kernel takes order-0 pages when no {d}-byte block is free, from the free lists only (its bulk allocation does not reclaim), and charges the region to RLIMIT_MEMLOCK without CAP_IPC_LOCK; the probe-decided buffer mode fails loud, never degrades (charter §3)", .{ regionPages(ring_entries, buf_size, page), ring_entries, buf_size, opcodes.register, attempt, buf_size });
                     return error.KmbufRingEnomem;
                 }
                 log.err("transport: kmbuf ring registration refused ({s}): opcode {d}, bgid 0, buf_size {d}, entries {d}", .{ @errorName(e), opcodes.register, buf_size, ring_entries });
@@ -233,12 +235,10 @@ test "kmbuf setup on this kernel: the headers register at index 0 (BufRing) or d
     }
 }
 
-test "pageOrder: 1 MiB on 4 KiB pages is order 8; a sub-page payload is order 0; a 64 KiB page halves the order" {
-    try testing.expectEqual(@as(u8, 8), pageOrder(1 << 20, 4096));
-    try testing.expectEqual(@as(u8, 0), pageOrder(4096, 4096));
-    try testing.expectEqual(@as(u8, 0), pageOrder(100, 4096));
-    try testing.expectEqual(@as(u8, 1), pageOrder(4097, 4096));
-    try testing.expectEqual(@as(u8, 4), pageOrder(1 << 20, 65536));
+test "regionPages: one queue's region at once — 36 × 1 MiB on 4 KiB pages is 9,216 pages, on 64 KiB pages 576" {
+    try testing.expectEqual(@as(u64, 9216), regionPages(36, 1 << 20, 4096));
+    try testing.expectEqual(@as(u64, 576), regionPages(36, 1 << 20, 65536));
+    try testing.expectEqual(@as(u64, 32), regionPages(32, 4096, 4096));
 }
 
 test "the ENOMEM seam: every attempt answers ENOMEM — the bounded ladder retries REGISTER_RETRIES times, the refusal is the typed KmbufRingEnomem naming the remedy, nothing is pinned, the table is released" {

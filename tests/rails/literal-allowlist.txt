@@ -238,10 +238,10 @@ src/fuse/transport/filesystem_vtable.zig:725 | 4096 | a table entry (switch/rang
 src/fuse/transport/filesystem_vtable.zig:725 | 512 | a table entry (switch/range arm) — the codec or classification table
 src/fuse/transport/filesystem_vtable.zig:725 | 512 | a table entry (switch/range arm) — the codec or classification table
 src/fuse/transport/filesystem_vtable.zig:725 | 8 | a table entry (switch/range arm) — the codec or classification table
-src/fuse/transport/probes.zig:106 | 4096 | OWED: derive it or document it on the line (charter §1.5)
-src/fuse/transport/probes.zig:210 | 16 | OWED: derive it or document it on the line (charter §1.5)
-src/fuse/transport/session.zig:299 | 32 | a size — OWED: derive from derive.Facts or document the physical/format reason
-src/fuse/transport/session.zig:752 | 64 | OWED: derive it or document it on the line (charter §1.5)
+src/fuse/transport/probes.zig:109 | 4096 | OWED: derive it or document it on the line (charter §1.5)
+src/fuse/transport/probes.zig:218 | 16 | OWED: derive it or document it on the line (charter §1.5)
+src/fuse/transport/session.zig:304 | 32 | a size — OWED: derive from derive.Facts or document the physical/format reason
+src/fuse/transport/session.zig:757 | 64 | OWED: derive it or document it on the line (charter §1.5)
 src/fuse/transport/worker.zig:367 | 10 | OWED: derive it or document it on the line (charter §1.5)
 src/fuse/transport/worker.zig:367 | 16 | OWED: derive it or document it on the line (charter §1.5)
 src/fuse/transport/worker.zig:367 | 32 | OWED: derive it or document it on the line (charter §1.5)

@@ -804,9 +804,9 @@ pub const Group = struct {
     releases_pending: u32 = 0,
 
     pub const InitError = std.mem.Allocator.Error || error{ArenaMapFailed};
-    /// `KmbufRingEnomem`: the kmbuf ring's contiguous-page allocation
-    /// refused after every retry (`kmbuf.Error`), typed so the daemon's
-    /// refusal can name the remedy.
+    /// `KmbufRingEnomem`: the kmbuf ring's region allocation refused after
+    /// every retry (`kmbuf.Error`), typed so the daemon's refusal can name
+    /// the levers.
     pub const StartError = error{ ThreadSpawnFailed, RingSetupFailed, KmbufRingEnomem };
     const RingError = error{ RingSetupFailed, KmbufRingEnomem };
 

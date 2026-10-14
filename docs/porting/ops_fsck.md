@@ -120,7 +120,13 @@ post-settle, `L2127-2143`) → sort + dedup findings → `publish_metrics` (`L21
    (an owner deregisters only after its publish is durable AND visible to the reads fsck performs)
    makes both interleavings of a racing publish/deregister safe; reference-state-first would
    false-positive on a healthy just-published block (`L298-303`, `DVL:L418`). The test hook
-   `PRE_REGISTRY_CHECK_HOOK` marks that boundary (`FSCK:L1297-1318`, `L5667-5669`).
+   `PRE_REGISTRY_CHECK_HOOK` marks that boundary (`FSCK:L1297-1318`, `L5667-5669`; the port's
+   `Host.recheck_hook` at `.phase_a_registry`). The port (decision 0003 §AH.2) runs Phase A over
+   EVERY suspect before the first Phase C — the memoized fresh census is then read after every
+   suspect's registry check (interleaved, the census read for one suspect predated the publish
+   that ended the next one's mint) — and the C2-leaked / C3 re-checks read the allocator again
+   AFTER their fresh derivation (still tracked, at the judged count for C3, no live owner in
+   flight, no mint under this scan): registry-absence, then the references, then the tracking.
 3. **The inode plane (C9, C10)**: the era floor (C9) / the `(nlink, ctime)` record witness (C10)
    + the open cross-volume intent exemption (the registry's role here, `open_intent_inos`,
    `L7006-7042`) + ONE fresh dentry pass + the exclusive 4a re-check (§3.9, §3.10).
@@ -147,13 +153,20 @@ epoch is deliberately NOT packed into the per-offset incarnation seqlock (the lo
 `incarnation_core`; repacking it would couple fsck into the cache-fill validation hot path,
 `DVL:L416`). The registry: `inflight_register` returns a guard held until the publish is durable
 and visible; dropping it on unwind is exactly right — a dead owner shields nothing (`BA:L1405-1422`);
-`inflight_contains` (`L1425`), `inflight_offsets` (C6's aggregate exemption, `L1435`).
+`inflight_contains` (`L1425`), `inflight_offsets` (C6's aggregate exemption, `L1435`). The
+reference registers MINTS only; the port (decision 0003 §AH.1, 0002 row 532) registers every
+RELEASE too, from before its releasing commit until after the block's free — between the two the
+allocator tracks a block no record names, and a census inside the window confirmed `[C2] leaked`
+(C3 for a shared block).
 
 Port (landed): `PBA.fsck_epoch` + `epoch_map: ?[]Atomic(u64)` lazily allocated at the first scan,
 one word per cell (`PBA:L537-538`, `L1600-1608`), stamped at the mint when the scan latch is set
 (`PBA:L728`); `fsckBumpEpoch` (`L1610`), `fsckEndScan` (`L1614`), `allocationEpochOf` returns 0
 for "none" (`L1620-1623`); `InflightAllocGuard.register/deinit` is a per-cell `inflight` count
-(`L1685-1700`) — "fsck VISIBILITY ONLY: dropping it frees NOTHING (KD-OV-11)". `fsckEndScan` does
+(`L1685-1700`) — "fsck VISIBILITY ONLY: dropping it frees NOTHING (KD-OV-11)"; a release site
+carrying a binding list registers on the same count (`holdInflight / dropInflight`, a drop with
+none held refused, `block_inflight_unheld_drops`; `write_seams.ReleaseHolds`, `MergeOutcome.holds`,
+the handler's `AfterCommit` holds, `DataPlane.freeBindings`'s `release_free_unheld` tripwire). `fsckEndScan` does
 NOT drain the map (the reference's `clear_sync`): the next `fsckBeginScan` bumps the epoch, so a
 stale stamp reads as an OLDER epoch and is judged exactly as "allocated before this scan" — the
 port must compare `allocationEpochOf(idx) >= scan_epoch` (younger ⇒ exempt), never `!= 0`
@@ -456,7 +469,9 @@ reference's text generation string is a quirk (§11 Q6).
 ### 3.6 C6 — capacity accounting (`FSCK:L5383-5489`; recheck `L6015-6033`; repair `L10298-10327`)
 
 Two arms, unsharded only. **Flat / un-armed**: `used = highest_block_index − free_blocks_count −
-inflight(untracked) − graced` vs `tracked.len()` (`L5456-5489`): in-flight-registered offsets are
+inflight(untracked) − graced` vs `tracked.len()` (`L5456-5489`; the port's in-flight term skips a
+free-listed and a trim-windowed block — `freeBlocksCount`'s and `trimClaimed`'s already, so a release
+held past its free is not counted twice, decision 0003 §AH.3): in-flight-registered offsets are
 "used" by the arithmetic but deliberately untracked — since the write-wall manners law the
 `begin_free → reclaim` limbo legitimately spans whole foreground-busy periods, so the settle window
 can no longer absorb it (the 2026-07-31 iteration-loop FP); freed-offset GRACE entries are likewise

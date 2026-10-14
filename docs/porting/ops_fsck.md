@@ -876,6 +876,34 @@ its dentry pass (markers + user names per directory with a NUL-led name, plus ev
   (landed, `PST:L87`), `fsck_slot_custody_conflicts`, `meta_kv_block_refs_drift` (landed) and
   `data_alloc_bitmap_drift` (landed) — the per-site label is the class.
 
+### 6.1 The walk's cost and its bound (port; decision 0003 §AC)
+
+Every store read a run makes is tallied (`census.WalkTally`, through the `census.Store` face; the
+set counts at the tree — `KvTree.rangeCounted`/`lookupCounted`, `MetaSet.rangeCounted`) and the
+report carries it: `nodes_walked` (tree nodes the descents fetched — set at last; the pager used to
+bump the global per page and leave the report's field 0), `entries_visited` (entries the store
+delivered), `entries_read` (entries the trees copied to deliver them), `store_calls`,
+`trees_consulted`, and the wall clock per pass — `census_ms` (inode + layout kinds), `dentries_ms`,
+`c1_ms`, `classes_ms` (C2–C17), `recheck_ms`, `scrub_ms` (its fresh census included); all MAX-merged
+(every shard walks the whole space). `.stats`: `fsck_nodes_walked`, `fsck_entries_visited`,
+`fsck_entries_read` per run.
+
+The bound, two tie-tested functions: `walkReadBound = 3 × visited + trees consulted` (the merged
+walk's per-call law summed — `meta/merged_walk.readBound`: a call that fills its `max` consulting
+`p` of T trees reads ≤ 2e + p × ⌈max / T⌉, one that ends short reads exactly what it delivers) and
+`walkNodeBound = height × (visited + calls)` (node reads per entry within the tree height; a call
+that delivers nothing still descends once). An fsck over N entries in D directories is therefore
+O(N) entries read and O(N × height / page) node reads for its walks plus O(height) per point probe
+(C11's owner skip-scan, one per ino) — linear, whatever D and however the names are striped.
+
+Measured (venue, one flat directory, `fsck --offline`): before, the set's merged range read `max`
+from EVERY slot tree per page and kept `max` (64 trees × 512) — 29 / 235 / 2,713 / 5,736 / 9,435 ms
+at 2 k / 8 k / 32 k / 64 k / 100 k entries, 8.1–9.4 node reads and up to 37 entries read per entry
+visited (the cap: T × page past 32 k); after, 8 / 34 / 152 / 319 / 510 ms, 0.18–0.23 node reads and
+1.07 entries read per entry visited. The shared-hot-directory row's closing fsck over 52,871
+entries in one 64-stripe directory: 83.5 s → 0.79 s. Rows: `fsck/scale.zig` (2 k → 8 k names, flat
+and striped, within both bounds, 4N ≤ 4.5 × N on reads and nodes).
+
 ## 7. Online fsck as a JOB vs offline
 
 - **Online** (`MAIN:L2299-2355`; `IPC:L1519-1575`; `JOBS:L2096-2260`): the CLI submits over the

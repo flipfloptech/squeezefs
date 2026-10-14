@@ -1441,10 +1441,17 @@ pub const DataPlane = struct {
         self.wp.settleCustody(io, ino);
     }
 
-    /// RELEASE: the write-back class drains (parked blocks flush, the
-    /// overlay drains, the epoch closes).
+    /// RELEASE (the no-open posture: a FLUSH that found custody, or the
+    /// idle drain of an owed ino): the write-back class drains (parked
+    /// blocks flush, the overlay drains, the epoch closes).
     pub fn releaseIno(self: *DataPlane, io: Io, ino: u64) void {
         self.wp.flushIno(io, ino);
+    }
+
+    /// The no-open FLUSH's try-only probe (decision 0003 §AF): whether
+    /// `releaseIno` would land anything for `ino` (`WritePath.holdsCustody`).
+    pub fn hasWriteCustody(self: *DataPlane, ino: u64) bool {
+        return self.wp.holdsCustody(ino);
     }
 
     /// fsync (charter §6.4) through `fsync.zig`'s legs; the meta barrier is

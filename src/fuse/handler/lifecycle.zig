@@ -36,6 +36,23 @@
 //! (ReleaseSafe; decision 0002 rows 9/23): the transport's shutdown
 //! synthesizer covers the slots a dead lane owed.
 //!
+//! The no-open posture (`Options.no_open`, decision 0003 §AF): OPEN answers
+//! ENOSYS before the filesystem sees it (the kernel latches `no_open` for
+//! the connection: every regular open and close is local from then on, no
+//! RELEASE is ever sent), CREATE counts no open, and FLUSH — sent on every
+//! close(2) — carries the write-back drain RELEASE carried: the drain
+//! worker answers it inline when the filesystem's try-only `probe_flush`
+//! finds no custody (`probeMeta`), else the data lane drains before the
+//! reply. A FLUSH is never answered ENOSYS there (`fc->no_flush` would
+//! silence every later close). The kernel sends a FLUSH for EVERY close of
+//! every copy of an fd (a dup, a forked child's at its exit or exec), so a
+//! FLUSH with custody on an ino a FLUSH drained less than
+//! `drain_coalesce_ns` ago (one reclaim tick) defers its drain to the
+//! cadence's next tick: one drain per ino per tick under a close burst.
+//! Every WRITE notes its ino OWED a drain (`OpenTable.noteWrite`) and a
+//! FLUSH covers the notes made before it began; the reclaim cadence drains
+//! what stays owed once idle, and every deferred close at its next tick.
+//!
 //! The no-reply opcodes never mint an obligation: FORGET / BATCH_FORGET
 //! return lookup references through the open table and call the
 //! filesystem's `forget` once per ino whose last reference went (§8; the
@@ -88,9 +105,30 @@ pub var fuse_forgets: counters.ShardedCounter = .{};
 pub var fuse_forget_evictions: counters.ShardedCounter = .{};
 /// `fuse_release_clean_fastpath` / `fuse_flush_clean_fastpath`: never-
 /// dirtied handles elided (FLUSH answers ENOSYS — the kernel's `no_flush`
-/// latch; RELEASE skips the flush arm).
+/// latch; RELEASE skips the flush arm). The control arm's.
 pub var fuse_release_clean_fastpath: counters.ShardedCounter = .{};
 pub var fuse_flush_clean_fastpath: counters.ShardedCounter = .{};
+/// `fuse_open_enosys`: OPENs a no-open session answered ENOSYS — the
+/// latch's whole cost: the OPENs in flight when the first was answered.
+pub var fuse_open_enosys: counters.ShardedCounter = .{};
+/// `fuse_flush_drains`: no-open FLUSHes the data lane drained (the probe
+/// found custody); `fuse_flush_inline_clean`: FLUSHes the drain worker
+/// answered with nothing to drain.
+pub var fuse_flush_drains: counters.ShardedCounter = .{};
+pub var fuse_flush_inline_clean: counters.ShardedCounter = .{};
+/// `fuse_flush_drains_deferred`: no-open FLUSHes with custody on an ino a
+/// FLUSH drained less than the coalescing window ago — the drain deferred
+/// to the reclaim cadence's next tick, the reply at once (a close burst:
+/// a process tree's children closing their copies of one fd, an
+/// open-append-close loop).
+pub var fuse_flush_drains_deferred: counters.ShardedCounter = .{};
+/// `fuse_no_open_releases`: RELEASEs reaching a no-open session — a file a
+/// CREATE opened before the connection latched (its drain runs as the
+/// control arm's).
+pub var fuse_no_open_releases: counters.ShardedCounter = .{};
+/// `fuse_owed_note_overflows`: a no-open WRITE whose owed note could not
+/// be recorded (the owed set could not grow) — drained before its reply.
+pub var fuse_owed_note_overflows: counters.ShardedCounter = .{};
 /// `fuse_unsupported_opcodes`: ENOSYS replies to opcodes this daemon does
 /// not serve (the kernel latches and stops asking — a count that keeps
 /// growing names a kernel that does not latch).
@@ -128,6 +166,13 @@ pub const Options = struct {
     probe: op_guard.Probe = op_guard.Probe.none,
     /// `SQUEEZEFS_WRITE_SHARED` as read at mount.
     shared_enabled: bool = true,
+    /// `SQUEEZEFS_FUSE_NO_OPEN` as read at mount (module doc); the open
+    /// table takes the same posture at `init`.
+    no_open: bool = false,
+    /// No-open: a FLUSH with custody on an ino a FLUSH drained less than
+    /// this long ago defers its drain to the reclaim cadence (the mount
+    /// passes its tick; 0 = every FLUSH drains).
+    drain_coalesce_ns: u64 = 0,
 };
 
 pub fn Dispatcher(comptime Transport: type) type {
@@ -143,6 +188,8 @@ pub fn Dispatcher(comptime Transport: type) type {
         opens: *open_table.OpenTable,
         probe: op_guard.Probe,
         shared_enabled: bool,
+        no_open: bool,
+        drain_coalesce_ns: u64,
 
         /// FUSE-2: exactly one reply per delivered request. The value owes
         /// a reply from construction; `reply`/`fail` consume it; `deinit`
@@ -180,6 +227,7 @@ pub fn Dispatcher(comptime Transport: type) type {
         };
 
         pub fn init(transport: *Transport, opts: Options) Self {
+            opts.opens.no_open = opts.no_open;
             return .{
                 .transport = transport,
                 .fs = opts.fs,
@@ -189,7 +237,22 @@ pub fn Dispatcher(comptime Transport: type) type {
                 .opens = opts.opens,
                 .probe = opts.probe,
                 .shared_enabled = opts.shared_enabled,
+                .no_open = opts.no_open,
+                .drain_coalesce_ns = opts.drain_coalesce_ns,
             };
+        }
+
+        /// A no-open FLUSH that found custody: coalesce it when a FLUSH
+        /// drained this ino within the window (true = deferred to the
+        /// reclaim cadence's next tick, nothing to drain now). An owed set
+        /// that cannot grow drains now.
+        fn deferFlushDrain(self: *Self, ino: u64) bool {
+            if (self.drain_coalesce_ns == 0) return false;
+            const now_ns = clock.monotonicNs();
+            if (!self.opens.recentlyDrained(ino, now_ns, self.drain_coalesce_ns)) return false;
+            self.opens.deferDrain(ino, now_ns) catch return false;
+            fuse_flush_drains_deferred.inc();
+            return true;
         }
 
         /// THE procedure (module doc). `lease` is the WRITE payload lease
@@ -285,6 +348,21 @@ pub fn Dispatcher(comptime Transport: type) type {
                     break :blk codec.replyEntry(out, meta.unique, e);
                 },
                 .getattr => |a| codec.replyAttr(out, meta.unique, self.fs.vtable.probe_getattr(self.fs.impl, &ctx, .{ .ino = meta.nodeid, .fh = a.fh }) catch return null),
+                // No-open: a close of a file holding no custody — the FLUSH
+                // the kernel waits on, answered without a lane (module doc).
+                .flush => |a| blk: {
+                    if (!self.no_open) return null;
+                    const begun = self.opens.flushBegin(meta.nodeid);
+                    self.fs.vtable.probe_flush(self.fs.impl, &ctx, .{ .ino = meta.nodeid, .fh = a.fh, .lock_owner = a.lock_owner, .drain = true }) catch {
+                        // Custody: a burst's close coalesces here (no lane,
+                        // no device wait); a lone close drains on the lane.
+                        if (!self.deferFlushDrain(meta.nodeid)) return null;
+                        break :blk codec.replyOk(meta.unique);
+                    };
+                    self.opens.flushEnd(meta.nodeid, begun);
+                    fuse_flush_inline_clean.inc();
+                    break :blk codec.replyOk(meta.unique);
+                },
                 else => return null,
             };
             fuse_ops.inc();
@@ -308,7 +386,7 @@ pub fn Dispatcher(comptime Transport: type) type {
             var trace = op_trace.OpTrace.begin(0, .other);
             defer trace.finish();
             var ctx = self.sessionCtx(&trace);
-            try self.fs.vtable.init(self.fs.impl, &ctx, .{ .negotiated = negotiated, .minor = minor });
+            try self.fs.vtable.init(self.fs.impl, &ctx, .{ .negotiated = negotiated, .minor = minor, .no_open = self.no_open });
         }
 
         /// The session's teardown hook (DESTROY arrived, or the connection
@@ -430,6 +508,12 @@ pub fn Dispatcher(comptime Transport: type) type {
                     return codec.replyEntry(out, u, e);
                 },
                 .open => |a| {
+                    // No-open: the kernel latches `no_open` on this answer
+                    // and opens locally (this file included) from now on.
+                    if (self.no_open) {
+                        fuse_open_enosys.inc();
+                        return error.NotImplemented;
+                    }
                     // ATOMIC_O_TRUNC: the kernel sends no SETATTR(size=0),
                     // so an O_TRUNC open IS the size set and takes the
                     // size setter's whole-truncate exclusive guard (taker
@@ -450,7 +534,9 @@ pub fn Dispatcher(comptime Transport: type) type {
                 .create => |a| {
                     const cr = try fs.vtable.create(fs.impl, c, .{ .parent = ino, .name = a.name, .mode = a.mode, .flags = a.flags, .umask = a.umask, .open_flags = a.open_flags });
                     try self.noteEntry(cr.entry);
-                    _ = try self.opens.addOpen(cr.entry.nodeid);
+                    // No-open: once the connection latched, no RELEASE comes
+                    // for this file — a count would strand.
+                    if (!self.no_open) _ = try self.opens.addOpen(cr.entry.nodeid);
                     return codec.replyCreate(out, u, cr.entry, cr.fh, cr.open_flags);
                 },
                 .read => |r| {
@@ -479,10 +565,29 @@ pub fn Dispatcher(comptime Transport: type) type {
                     const class = adm.finalize(candidate);
                     c.stage(.write_locked);
                     const wr = try fs.vtable.write(fs.impl, c, .{ .ino = ino, .fh = w.in.fh, .offset = w.in.offset, .data = w.data, .held = heldPayload(&lease), .class = class, .write_flags = w.in.write_flags, .flags = w.in.flags });
-                    self.opens.markDirty(ino);
+                    self.opens.noteWrite(ino, clock.monotonicNs()) catch {
+                        // The owed set could not grow: drain now, under the
+                        // write's guard ((1) → (3), the truncate's own settle
+                        // order) — custody no FLUSH may cover is never unowed.
+                        fuse_owed_note_overflows.inc();
+                        try fs.vtable.flush(fs.impl, c, .{ .ino = ino, .fh = w.in.fh, .lock_owner = 0, .drain = true });
+                    };
                     return codec.replyWrite(out, u, wr.size);
                 },
                 .flush => |a| {
+                    if (self.no_open) {
+                        // The probe found custody (or this FLUSH took the
+                        // lane outright): the drain, then the reply close(2)
+                        // waits on — unless a FLUSH drained this ino within
+                        // the coalescing window (a close burst).
+                        if (self.deferFlushDrain(ino)) return codec.replyOk(u);
+                        const begun = self.opens.flushBegin(ino);
+                        try fs.vtable.flush(fs.impl, c, .{ .ino = ino, .fh = a.fh, .lock_owner = a.lock_owner, .drain = true });
+                        self.opens.flushEnd(ino, begun);
+                        self.opens.markDrained(ino, clock.monotonicNs());
+                        fuse_flush_drains.inc();
+                        return codec.replyOk(u);
+                    }
                     if (!self.opens.isDirty(ino)) {
                         fuse_flush_clean_fastpath.inc();
                         return error.NotImplemented;
@@ -491,7 +596,7 @@ pub fn Dispatcher(comptime Transport: type) type {
                     return codec.replyOk(u);
                 },
                 .release => |a| {
-                    if (!self.opens.isDirty(ino)) fuse_release_clean_fastpath.inc();
+                    if (self.no_open) fuse_no_open_releases.inc() else if (!self.opens.isDirty(ino)) fuse_release_clean_fastpath.inc();
                     // Errors never reach close(2): the count drops whatever the
                     // filesystem answered, so "last close" is exact.
                     const r = fs.vtable.release(fs.impl, c, .{ .ino = ino, .fh = a.fh, .flags = a.flags, .lock_owner = a.lock_owner, .flush = a.release_flags & abi.FUSE_RELEASE_FLUSH != 0 });
@@ -626,6 +731,12 @@ const Scripted = struct {
     short_read: ?usize = null,
     syncfs_calls: u32 = 0,
     syncfs_inos: [2]u64 = @splat(0),
+    open_calls: u32 = 0,
+    /// FLUSHes that carried the no-open drain.
+    flush_drains: u32 = 0,
+    /// The ino holds write custody: `probe_flush` declines, a drain clears.
+    custody: bool = false,
+    init_no_open: ?bool = null,
 
     fn entry(self: *Scripted) filesystem.Entry {
         var a = abi.zeroed(abi.fuse_attr);
@@ -645,14 +756,25 @@ const Scripted = struct {
         return .{ .entry = self.entry(), .fh = 9, .open_flags = abi.FOPEN_KEEP_CACHE };
     }
     pub fn open(self: *Scripted, _: *Ctx, _: filesystem.OpenArgs) Error!filesystem.Opened {
+        self.open_calls += 1;
         try self.verdict;
         return .{ .fh = 9, .open_flags = 0 };
     }
     pub fn release(self: *Scripted, _: *Ctx, _: filesystem.ReleaseArgs) Error!void {
         try self.verdict;
     }
-    pub fn flush(self: *Scripted, _: *Ctx, _: filesystem.FlushArgs) Error!void {
+    pub fn flush(self: *Scripted, _: *Ctx, a: filesystem.FlushArgs) Error!void {
         try self.verdict;
+        if (a.drain) {
+            self.flush_drains += 1;
+            self.custody = false;
+        }
+    }
+    pub fn probe_flush(self: *Scripted, _: *Ctx, _: filesystem.FlushArgs) Error!void {
+        if (self.custody) return error.WouldBlock;
+    }
+    pub fn init(self: *Scripted, _: *Ctx, a: filesystem.InitArgs) Error!void {
+        self.init_no_open = a.no_open;
     }
     pub fn read(self: *Scripted, c: *Ctx, a: filesystem.ReadArgs) Error!filesystem.Data {
         try self.verdict;
@@ -705,12 +827,16 @@ const Rig = struct {
     d: LoopDispatcher = undefined,
 
     fn init(self: *Rig) !void {
+        return self.initPosture(false);
+    }
+
+    fn initPosture(self: *Rig, no_open: bool) !void {
         self.lb = try Loopback.init(testing.allocator, 8, 4096);
         self.reg = try watchdog.Registry.init(testing.allocator, 1);
         self.guards = try op_guard.Table.init(testing.allocator, 64);
         self.opens = try open_table.OpenTable.init(testing.allocator, 64);
         self.fsi = .{};
-        self.d = LoopDispatcher.init(&self.lb, .{ .fs = Filesystem.of(Scripted, &self.fsi), .io = testing.io, .registry = &self.reg, .guards = &self.guards, .opens = &self.opens });
+        self.d = LoopDispatcher.init(&self.lb, .{ .fs = Filesystem.of(Scripted, &self.fsi), .io = testing.io, .registry = &self.reg, .guards = &self.guards, .opens = &self.opens, .no_open = no_open });
     }
 
     fn deinit(self: *Rig) void {
@@ -889,6 +1015,116 @@ test "open count: OPEN/CREATE count before the reply, RELEASE drops even on a ha
     try testing.expectEqual(stranded0, counters.tripwireCount("open_count_stranded"));
     // The write admission ledger closed on the one write that reached the guard.
     try testing.expectEqual(@as(u32, 0), rig.guards.locks[rig.guards.stripeOf(50)].readers);
+}
+
+test "no-open (decision 0003 §AF): OPEN answers ENOSYS before the filesystem or a guard sees it (the kernel latches and opens locally); CREATE counts no open; a WRITE notes its ino owed; a FLUSH with no custody is answered by the worker's probe, one with custody declines it and the lane drains before the reply — never ENOSYS; the FLUSH covers what was noted before it; the final FORGET strands nothing; the filesystem learns the posture at INIT" {
+    var rig: Rig = undefined;
+    try rig.initPosture(true);
+    defer rig.deinit();
+    try testing.expect(rig.opens.no_open);
+    try rig.d.initFilesystem(0, 45);
+    try testing.expectEqual(@as(?bool, true), rig.fsi.init_no_open);
+    const s = Loopback.slot(2);
+    // CREATE: the entry's lookup reference, no open count.
+    rig.d.dispatch(.{ .create = .{ .name = "f", .flags = 0, .mode = 0o644, .umask = 0, .open_flags = 0 } }, Rig.meta(2, 1), s, null);
+    try testing.expectEqual(@as(?linux.E, null), rig.lb.captured(s).?.errno());
+    try testing.expectEqual(@as(u32, 0), rig.opens.get(50).?.count);
+    try testing.expectEqual(@as(u64, 1), rig.opens.get(50).?.lookups);
+    // OPEN (an O_TRUNC one too): ENOSYS, the filesystem never asked, no
+    // guard taken.
+    const en0 = fuse_open_enosys.load();
+    rig.d.dispatch(.{ .open = .{ .flags = filesystem.O_TRUNC, .open_flags = 0 } }, Rig.meta(4, 50), s, null);
+    try testing.expectEqual(linux.E.NOSYS, rig.lb.captured(s).?.errno().?);
+    try testing.expectEqual(@as(u32, 0), rig.fsi.open_calls);
+    try testing.expectEqual(en0 + 1, fuse_open_enosys.load());
+    try testing.expectEqual(@as(u32, 0), rig.opens.get(50).?.count);
+    try testing.expectEqual(@as(u32, 0), rig.guards.locks[rig.guards.stripeOf(50)].readers);
+    // A clean close: the worker's probe answers the FLUSH, nothing drains.
+    var out: codec.OutBuf = undefined;
+    const fl = codec.Request{ .flush = .{ .fh = 0, .lock_owner = 7 } };
+    const ic0 = fuse_flush_inline_clean.load();
+    const r = rig.d.probeMeta(fl, Rig.meta(6, 50), &out).?;
+    try testing.expectEqual(@as(i32, 0), r.header.@"error");
+    try testing.expectEqual(ic0 + 1, fuse_flush_inline_clean.load());
+    try testing.expectEqual(@as(u32, 0), rig.fsi.flush_drains);
+    // A WRITE: custody, and the ino owed.
+    rig.fsi.custody = true;
+    const payload: [100]u8 = @splat(1);
+    const win: abi.fuse_write_in = .{ .fh = 0, .offset = 0, .size = 100, .write_flags = 0, .lock_owner = 0, .flags = 0, .padding = 0 };
+    rig.d.dispatch(.{ .write = .{ .in = win, .data = &payload } }, Rig.meta(8, 50), s, null);
+    try testing.expectEqual(@as(u32, 100), rig.lb.outAs(s, abi.fuse_write_out).?.size);
+    try testing.expectEqual(@as(u64, 1), rig.opens.owedCount());
+    try testing.expect(!rig.opens.isDirty(50));
+    // The close of a file holding custody: the probe declines; the lane
+    // drains, the reply is OK, the owed note is covered.
+    try testing.expectEqual(@as(?codec.Reply, null), rig.d.probeMeta(fl, Rig.meta(10, 50), &out));
+    try testing.expectEqual(@as(u64, 1), rig.opens.owedCount());
+    const dr0 = fuse_flush_drains.load();
+    const fc0 = fuse_flush_clean_fastpath.load();
+    rig.d.dispatch(fl, Rig.meta(10, 50), s, null);
+    try testing.expectEqual(@as(?linux.E, null), rig.lb.captured(s).?.errno());
+    try testing.expectEqual(@as(u32, 1), rig.fsi.flush_drains);
+    try testing.expectEqual(dr0 + 1, fuse_flush_drains.load());
+    try testing.expectEqual(fc0, fuse_flush_clean_fastpath.load());
+    try testing.expectEqual(@as(u64, 0), rig.opens.owedCount());
+    // A drain that fails is the close's errno, and the note stays owed.
+    try rig.opens.noteWrite(50, 1);
+    rig.fsi.verdict = error.InputOutput;
+    rig.d.dispatch(fl, Rig.meta(12, 50), s, null);
+    try testing.expectEqual(linux.E.IO, rig.lb.captured(s).?.errno().?);
+    try testing.expectEqual(@as(u64, 1), rig.opens.owedCount());
+    rig.fsi.verdict = {};
+    // The final FORGET: nothing counted, nothing stranded.
+    const stranded0 = counters.tripwireCount("open_count_stranded");
+    rig.d.dispatch(.{ .forget = .{ .nlookup = 1 } }, Rig.meta(14, 50), s, null);
+    try testing.expectEqual(@as(?open_table.Entry, null), rig.opens.get(50));
+    try testing.expectEqual(stranded0, counters.tripwireCount("open_count_stranded"));
+    try testing.expect(rig.fsi.last_forget.?.evicted);
+    // The control arm's probe never answers a FLUSH.
+    var ctl: Rig = undefined;
+    try ctl.init();
+    defer ctl.deinit();
+    try testing.expectEqual(@as(?codec.Reply, null), ctl.d.probeMeta(fl, Rig.meta(2, 50), &out));
+}
+
+test "no-open close bursts (decision 0003 §AF): a FLUSH with custody drains on the lane and stamps the ino; the next close with custody inside the coalescing window is answered by the worker's probe with no drain, the ino owed `deferred` for the reclaim cadence; past the window a close drains again; with no window every close drains" {
+    var rig: Rig = undefined;
+    try rig.initPosture(true);
+    defer rig.deinit();
+    rig.d.drain_coalesce_ns = std.time.ns_per_s * 3600;
+    try rig.opens.noteLookup(50);
+    const s = Loopback.slot(3);
+    var out: codec.OutBuf = undefined;
+    const fl = codec.Request{ .flush = .{ .fh = 0, .lock_owner = 0 } };
+    rig.fsi.custody = true;
+    // The first close: the probe declines (custody, never drained), the
+    // lane drains.
+    try testing.expectEqual(@as(?codec.Reply, null), rig.d.probeMeta(fl, Rig.meta(2, 50), &out));
+    rig.d.dispatch(fl, Rig.meta(2, 50), s, null);
+    try testing.expectEqual(@as(u32, 1), rig.fsi.flush_drains);
+    try testing.expect(rig.opens.get(50).?.drained_ns != 0);
+    // The burst: custody again, answered by the probe, nothing drained.
+    rig.fsi.custody = true;
+    const def0 = fuse_flush_drains_deferred.load();
+    try testing.expect(rig.d.probeMeta(fl, Rig.meta(4, 50), &out) != null);
+    try testing.expectEqual(@as(u32, 1), rig.fsi.flush_drains);
+    try testing.expectEqual(def0 + 1, fuse_flush_drains_deferred.load());
+    var harvest: [4]u64 = undefined;
+    try testing.expectEqualSlices(u64, &.{50}, rig.opens.takeIdleOwed(clock.monotonicNs(), std.math.maxInt(u64), &harvest));
+    // A burst close that reached the lane coalesces there too.
+    rig.d.dispatch(fl, Rig.meta(6, 50), s, null);
+    try testing.expectEqual(@as(u32, 1), rig.fsi.flush_drains);
+    try testing.expectEqual(def0 + 2, fuse_flush_drains_deferred.load());
+    // Past the window (stamp aged out): the close drains again.
+    rig.opens.markDrained(50, 1);
+    rig.d.dispatch(fl, Rig.meta(8, 50), s, null);
+    try testing.expectEqual(@as(u32, 2), rig.fsi.flush_drains);
+    // No window: every close with custody drains.
+    rig.d.drain_coalesce_ns = 0;
+    rig.fsi.custody = true;
+    try testing.expectEqual(@as(?codec.Reply, null), rig.d.probeMeta(fl, Rig.meta(10, 50), &out));
+    rig.d.dispatch(fl, Rig.meta(10, 50), s, null);
+    try testing.expectEqual(@as(u32, 3), rig.fsi.flush_drains);
 }
 
 test "READDIRPLUS counts one lookup reference per positive entry (never the nodeid-0 dots); READ truncates the window to the request size" {

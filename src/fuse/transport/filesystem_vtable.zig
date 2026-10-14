@@ -237,7 +237,9 @@ pub const Filesystem = struct {
         /// leg or the lane).
         direct_leg: *const fn (ctx: *anyopaque, req: Request) ?DirectLeg,
         /// The metadata twin of `probe_read` (decision 0003 §AB.1), ON THE
-        /// WORKER THREAD at a LOOKUP's or GETATTR's delivery: SYNC,
+        /// WORKER THREAD at a LOOKUP's or GETATTR's delivery — and a no-open
+        /// session's FLUSH (0003 §AF: the close of a file holding no write
+        /// custody answers here, success only): SYNC,
         /// try-only, non-blocking — answered from RAM (a node-cache hit on
         /// a slot this mount holds) into `out`, or null to decline (the
         /// request then takes the lane). Null = every metadata request
@@ -304,6 +306,18 @@ const EchoFsImpl = struct {
     /// LOOKUP and GETATTR are answered by `probe_meta` on the worker (the
     /// in-RAM tree); off = they take the lane like every other request.
     meta_probe: bool = false,
+    /// The no-open posture (decision 0003 §AF): OPEN answers ENOSYS (the
+    /// kernel latches and opens locally); a FLUSH is answered by
+    /// `probe_meta` unless `flush_custody` says the file holds write-back
+    /// custody (then it takes the lane, counted in `flushes_dispatched`).
+    no_open: bool = false,
+    flush_custody: bool = false,
+    opens_enosys: std.atomic.Value(u64) = .init(0),
+    file_releases: std.atomic.Value(u64) = .init(0),
+    flush_probes_served: std.atomic.Value(u64) = .init(0),
+    flushes_dispatched: std.atomic.Value(u64) = .init(0),
+    /// SETATTRs carrying a size (`/scratch` truncates to it).
+    size_sets: std.atomic.Value(u64) = .init(0),
     meta_probes_served: std.atomic.Value(u64) = .init(0),
     /// The probe declines the FIRST poll of each READ and serves the next:
     /// the fused frame's re-poll (arm (b)) is what serves it.
@@ -528,6 +542,11 @@ const EchoFsImpl = struct {
     /// the lane's).
     fn fsProbeMeta(ctx: *anyopaque, req: Request, out: *codec.OutBuf) ?codec.Reply {
         const self = of(ctx);
+        if (req.op == .flush) {
+            if (!self.no_open or self.flush_custody) return null;
+            _ = self.flush_probes_served.fetchAdd(1, .monotonic);
+            return codec.replyOk(req.unique());
+        }
         if (!self.meta_probe) return null;
         const u = req.unique();
         const ino = req.nodeid();
@@ -631,12 +650,24 @@ const EchoFsImpl = struct {
                 h.reply(codec.replyAttr(&out, u, .{ .attr_ttl_ns = std.time.ns_per_s, .attr = attr }));
             },
             .open => {
+                if (self.no_open) {
+                    _ = self.opens_enosys.fetchAdd(1, .monotonic);
+                    return h.fail(.NOSYS);
+                }
                 if (self.attrOf(ino) == null) return h.fail(.NOENT);
                 // DIRECT_IO: every read and write reaches the daemon.
                 h.reply(codec.replyOpen(&out, u, ino, abi.FOPEN_DIRECT_IO));
             },
             .opendir => h.reply(codec.replyOpen(&out, u, ino, 0)),
-            .release, .releasedir, .flush, .fsync, .fsyncdir => h.reply(codec.replyOk(u)),
+            .release => {
+                _ = self.file_releases.fetchAdd(1, .monotonic);
+                h.reply(codec.replyOk(u));
+            },
+            .flush => {
+                _ = self.flushes_dispatched.fetchAdd(1, .monotonic);
+                h.reply(codec.replyOk(u));
+            },
+            .releasedir, .fsync, .fsyncdir => h.reply(codec.replyOk(u)),
             .read => |in| {
                 if (ino == ino_park) {
                     _ = self.parked_readers.fetchAdd(1, .monotonic);
@@ -728,6 +759,10 @@ const EchoFsImpl = struct {
                 // `/scratch` honours an explicit mtime: what the VFS clamped
                 // to our advertised TIME_LIMITS range arrives here.
                 if (ino == ino_scratch and sa.valid & abi.FATTR_MTIME != 0) self.scratch_mtime.store(@bitCast(sa.mtime), .release);
+                if (sa.valid & abi.FATTR_SIZE != 0) {
+                    _ = self.size_sets.fetchAdd(1, .monotonic);
+                    if (ino == ino_scratch) self.scratch_len.store(@min(sa.size, scratch_cap), .release);
+                }
                 const attr = self.attrOf(ino) orelse return h.fail(.NOENT);
                 h.reply(codec.replyAttr(&out, u, .{ .attr_ttl_ns = std.time.ns_per_s, .attr = attr }));
             },

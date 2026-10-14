@@ -280,6 +280,11 @@ pub const Config = struct {
     /// and so declines FUSE_SYNCFS (the session tests' EchoFs); the product
     /// mount always derives one.
     request_timeout_s: u16 = 0,
+    /// The filesystem answers OPEN with ENOSYS (decision 0003 §AF, the
+    /// mount's `SQUEEZEFS_FUSE_NO_OPEN`): INIT drops FUSE_ATOMIC_O_TRUNC
+    /// (no OPEN will carry a truncate) and every FLUSH — the drain at
+    /// close — is probed on the worker, else handed to the data lane.
+    no_open: bool = false,
     /// Error logs each worker/sideband thread expects in a test.
     test_error_logs: usize = 0,
 };
@@ -1161,7 +1166,7 @@ pub const Session = struct {
 
         // 4. The reply word; the filesystem's init hook sees the negotiation.
         const asked_timeout_s = geometry.resolveRequestTimeoutS(geometry.requestTimeoutOverride(env), cfg.request_timeout_s);
-        const wants: codec.InitWants = .{ .writeback_cache = cfg.opts.write_back and !cfg.opts.read_only, .request_timeout_s = asked_timeout_s };
+        const wants: codec.InitWants = .{ .writeback_cache = cfg.opts.write_back and !cfg.opts.read_only, .request_timeout_s = asked_timeout_s, .atomic_o_trunc = !cfg.no_open };
         self.init_reply = codec.buildInitReply(init_in, self.plan, wants) catch {
             log.err("transport: unsupported FUSE protocol {d}.{d} (need 7.{d}+)", .{ init_in.major, init_in.minor, codec.MIN_SUPPORTED_MINOR });
             self.sideband.replyInline(codec.replyError(self.init_unique, .INVAL));
@@ -1237,6 +1242,7 @@ pub const Session = struct {
             .slab = if (self.slab) |*s| s else null,
             .test_error_logs = cfg.test_error_logs,
             .handlers_on_worker = knobs.boolKnob("SQUEEZEFS_FUSE_HANDLERS_ON_WORKER", env),
+            .no_open = cfg.no_open,
             .budget_bytes = cfg.mem_budget_bytes,
         };
         if (read_fusion_lever and !self.shared.read_fusion_on) log.info("transport: SQUEEZEFS_FUSE_READ_FUSION=1 accepted; inert on a {t} session (the fused poll is the zero-copy mode's)", .{self.mode});
@@ -1745,6 +1751,8 @@ pub const Session = struct {
         try field(w, "transport_cqe_errors", worker.cqe_errors.load());
         try field(w, "transport_forget_autocommits", worker.forget_autocommits.load());
         try field(w, "transport_meta_inline_serves", worker.meta_inline_serves.load());
+        try field(w, "transport_flush_inline_serves", worker.flush_inline_serves.load());
+        try field(w, "transport_flush_inline_demotes", worker.flush_inline_demotes.load());
         try field(w, "transport_meta_inline_demotes", worker.meta_inline_demotes.load());
         try field(w, "transport_fast_dispatch_serves", worker.fast_dispatch_serves.load());
         try field(w, "transport_fast_dispatch_demotes", worker.fast_dispatch_demotes.load());
@@ -2235,6 +2243,87 @@ test "e2e: a LOOKUP and a GETATTR the filesystem answers from RAM never leave th
     try result2;
     try testing.expect(rig.fs.dispatches.load(.monotonic) > d1);
     try testing.expect(worker.meta_inline_demotes.load() > m1);
+}
+
+test "e2e: a no-open session (decision 0003 §AF) — INIT drops FUSE_ATOMIC_O_TRUNC; the first OPEN answered ENOSYS latches the kernel, so 16 opens of /hello send ONE OPEN and no RELEASE; every close sends its FLUSH, answered on the worker by the probe (no handler dispatch); a FLUSH the probe declines (custody) drains on the CPU's lane, never the worker's; an O_TRUNC open reaches the filesystem as a SETATTR(size 0)" {
+    if (venueMissing()) |why| return testkit.skipWhy(@src(), why);
+    const rig = try Rig.init(testing.allocator, 41, &.{});
+    defer rig.deinit();
+    rig.fs.no_open = true;
+    // LOOKUP / GETATTR answer on the worker too: the only lane handlers
+    // are the ones the row counts.
+    rig.fs.meta_probe = true;
+    const s = try rig.mountIt(.{ .mem_budget_bytes = 0, .no_open = true });
+    try testing.expect(rig.fs.caps.?.negotiated & abi.FUSE_ATOMIC_O_TRUNC == 0);
+    const Helper = struct {
+        fn readFiles(r: *Rig, result: *anyerror!void) void {
+            result.* = readBody(r);
+        }
+        fn readBody(r: *Rig) !void {
+            var pb: [256]u8 = undefined;
+            var buf: [64]u8 = undefined;
+            var i: usize = 0;
+            while (i < 16) : (i += 1) try testing.expectEqual(EchoFs.hello_text.len, try readWhole(r.child(&pb, "hello"), &buf));
+        }
+        fn truncScratch(r: *Rig, result: *anyerror!void) void {
+            result.* = truncBody(r);
+        }
+        fn truncBody(r: *Rig) !void {
+            var pb: [256]u8 = undefined;
+            const path = r.child(&pb, "scratch");
+            try testing.expectEqual(@as(usize, 5), try writeWhole(path, "hello"));
+            try testing.expectEqual(@as(u64, 5), try statSize(path));
+            const fd = try openPath(path, .{ .ACCMODE = .WRONLY, .TRUNC = true, .CLOEXEC = true });
+            _ = linux.close(fd);
+        }
+        fn run(r: *Rig, comptime f: fn (*Rig, *anyerror!void) void) !void {
+            var result: anyerror!void = {};
+            const t = try std.Thread.spawn(.{}, f, .{ r, &result });
+            t.join();
+            try result;
+        }
+    };
+    const serves0 = worker.flush_inline_serves.load();
+    const demotes0 = worker.flush_inline_demotes.load();
+    try Helper.run(rig, Helper.readFiles);
+    try testing.expectEqual(@as(u64, 1), rig.fs.opens_enosys.load(.monotonic));
+    try testing.expectEqual(@as(u64, 16), rig.fs.flush_probes_served.load(.monotonic));
+    try testing.expectEqual(@as(u64, 16), worker.flush_inline_serves.load() - serves0);
+    try testing.expectEqual(demotes0, worker.flush_inline_demotes.load());
+    try testing.expectEqual(@as(u64, 0), rig.fs.flushes_dispatched.load(.monotonic));
+    // No RELEASE reaches the daemon — not even for the file whose OPEN
+    // latched the connection (`fuse_file_put` ends it locally).
+    try testing.expectEqual(@as(u64, 0), rig.fs.file_releases.load(.monotonic));
+    // Custody: the probe declines; each FLUSH runs on the CPU's lane.
+    rig.fs.flush_custody = true;
+    const foreign0 = worker.handler_dispatches_foreign.load();
+    try Helper.run(rig, Helper.readFiles);
+    try testing.expectEqual(@as(u64, 16), rig.fs.flushes_dispatched.load(.monotonic));
+    try testing.expectEqual(@as(u64, 16), worker.flush_inline_demotes.load() - demotes0);
+    try testing.expect(worker.handler_dispatches_foreign.load() - foreign0 >= 16);
+    // The last handler run was a FLUSH: off every drain worker.
+    const tid = rig.fs.handler_tid.load(.acquire);
+    for (s.groups) |g| try testing.expect(g.tid.load(.acquire) != tid);
+    rig.fs.flush_custody = false;
+    // O_TRUNC: no OPEN carries it — the kernel sends the SETATTR(size 0).
+    const sets0 = rig.fs.size_sets.load(.monotonic);
+    try Helper.run(rig, Helper.truncScratch);
+    try testing.expectEqual(sets0 + 1, rig.fs.size_sets.load(.monotonic));
+    try testing.expectEqual(@as(u64, 0), rig.fs.scratch_len.load(.acquire));
+    try testing.expectEqual(@as(u64, 1), rig.fs.opens_enosys.load(.monotonic));
+    try testing.expectEqual(@as(u64, 0), rig.fs.file_releases.load(.monotonic));
+}
+
+test "the dispatch law's FLUSH arm (decision 0003 §AF): a no-open FLUSH carries RELEASE's drain and is the data class — the CPU's lane — while the control arm's runs on the worker's lane; the rest of the law is unchanged" {
+    const flush: codec.Request = .{ .flush = .{ .fh = 0, .lock_owner = 0 } };
+    try testing.expect(worker.onWorkerLane(flush, false));
+    try testing.expect(!worker.onWorkerLane(flush, true));
+    for ([_]bool{ false, true }) |no_open| {
+        try testing.expect(worker.onWorkerLane(.{ .lookup = .{ .name = "a" } }, no_open));
+        try testing.expect(!worker.onWorkerLane(.{ .release = .{ .fh = 0, .flags = 0, .release_flags = 0, .lock_owner = 0 } }, no_open));
+        try testing.expect(worker.onWorkerLane(.{ .open = .{ .flags = 0, .open_flags = 0 } }, no_open));
+        try testing.expect(!worker.onWorkerLane(.{ .open = .{ .flags = @bitCast(linux.O{ .TRUNC = true }), .open_flags = 0 } }, no_open));
+    }
 }
 
 test "e2e: a namespace request's handler runs on the thread that delivered it — the worker drives its own lane: every OPENDIR / READDIR / RELEASEDIR / OPEN lands on it, the handler's thread IS a drain worker's, the reply commits with no cross-thread wake; the data class (RELEASE, a demoted READ) stays on the handler lane; the control arm (SQUEEZEFS_FUSE_HANDLERS_ON_WORKER=0) crosses a thread each way (decision 0003 §AB.3)" {

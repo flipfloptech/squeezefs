@@ -4782,6 +4782,7 @@ test "smoke: THE `-o ro` READER OF A LIVE SET — C mounts `-o ro` beside A (the
         const r = try std.process.run(gpa, io, .{ .argv = &.{ "sh", "-c", "ls b3 2>&1; cat a-tree/f2 2>&1" }, .cwd = .{ .path = c.mp }, .environ_map = &rig.env });
         defer gpa.free(r.stdout);
         defer gpa.free(r.stderr);
+        if (std.mem.count(u8, r.stdout, "Stale file handle") != 2) std.debug.print("\nsmoke: -o ro: C after the fail-stop answered:\n{s}\n", .{r.stdout});
         try testing.expectEqual(@as(usize, 2), std.mem.count(u8, r.stdout, "Stale file handle"));
         const text = try c.readLog();
         defer gpa.free(text);
@@ -6349,7 +6350,10 @@ fn dataPlanePass(rig: *Rig, cache: bool) !void {
         const promotions = numberAfter(tail, "\"fuse_write_promotions_to_striped\":") orelse 0;
         const clips = numberAfter(tail, "\"fuse_truncate_striped_clips\":") orelse 0;
         // Two striped shrinks in stage C: `big` 200 → 150 MiB and `shrunk` 8 MiB → 1.3 MB.
-        try testing.expect(striped > 0 and promotions >= 1 + 1 + storm_files and clips == 2);
+        std.debug.print("smoke[{s}]: write routing striped {d} / staged {d}, promotions to striped {d}, striped clips {d}\n", .{ label, striped, staged, promotions, clips });
+        try testing.expect(striped > 0);
+        try testing.expect(promotions >= 1 + 1 + storm_files);
+        try testing.expectEqual(@as(u64, 2), clips);
         if (cache) {
             try testing.expect(staged >= small_files_staged);
             try testing.expect((numberAfter(tail, "\"held_stores\":") orelse 0) > 0);
@@ -6919,7 +6923,7 @@ const syncfs_base_bytes: u64 = 4 << 20;
 /// (its mtime is a parked stamp under the coalesced cadence, §L.6).
 const syncfs_patch_bytes: u64 = 8192;
 
-test "smoke: `sync -f` IS A DURABILITY POINT FOR THE DAEMON'S WRITE CUSTODY — format (no cache path: every write beyond inline striped) → mount → a holder keeps `f` and `g` OPEN (no RELEASE ever drains them): 1 MiB + 1000 B into the fresh `f` (a partial block parked in RAM), 8 KiB over the head of the fsync'd `g` (a size-neutral write: its mtime parked) → `sync -f <mnt>` returns → kill -9 the daemon → fsck --offline clean → remount → `f` is the image byte for byte, `g` carries the overwrite and the mtime the holder saw" {
+test "smoke: `sync -f` IS A DURABILITY POINT FOR THE DAEMON'S WRITE CUSTODY — format (no cache path: every write beyond inline striped) → mount → the test process holds `f` and `g` OPEN and closes neither (no RELEASE, no FLUSH drains them; it spawns nothing while it holds them): 1 MiB + 1000 B into the fresh `f` (a partial block parked in RAM), 8 KiB over the head of the fsync'd `g` (a size-neutral write: its mtime parked) → syncfs(2) on the mount returns → kill -9 the daemon → fsck --offline clean → remount → `f` is the image byte for byte, `g` carries the overwrite and the mtime the holder saw" {
     const io = testing.io;
     if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
     const gpa = testing.allocator;
@@ -6953,22 +6957,28 @@ test "smoke: `sync -f` IS A DURABILITY POINT FOR THE DAEMON'S WRITE CUSTODY — 
         defer gpa.free(out);
         try testing.expect(std.mem.indexOf(u8, out, "base-ok") != null);
     }
-    // The holder: both fds stay open past the kill; `sync -f` is the only
-    // drain the bytes can meet before it.
-    var holder_script: [768]u8 = undefined;
-    const holder_cmd = try std.fmt.bufPrint(&holder_script, "cd {s} && exec 3>f 4<>g && head -c {d} {s}/image >&3 && tail -c {d} {s}/image >&4 && stat -c %Y.%y g > {s}/g.mtime && sync -f . && echo synced > {s}/synced && exec sleep 600", .{ rig.mp, syncfs_fresh_bytes, rig.work, syncfs_patch_bytes, rig.work, rig.work, rig.work });
-    var holder = try std.process.spawn(io, .{ .argv = &.{ "sh", "-e", "-c", holder_cmd }, .environ_map = &rig.env, .stdin = .ignore, .stdout = .ignore, .stderr = .inherit });
-    defer holder.kill(io);
-    var flag_buf: [256]u8 = undefined;
-    const flag = try std.fmt.bufPrintSentinel(&flag_buf, "{s}/synced", .{rig.work}, 0);
-    {
-        const deadline = clock.monotonicNs() + 60 * std.time.ns_per_s;
-        while (fileSize(flag) == 0) {
-            if (clock.monotonicNs() >= deadline) return error.Timeout;
-            try rig.expectAlive("the holder's sync -f");
-            sleepMs(5);
-        }
-    }
+    // The holder is THIS process: both fds stay open past the kill and no
+    // fd of either file is ever closed before it — a close(2) of ANY fd (a
+    // child's inherited copy too, closed at its exec even under CLOEXEC) is
+    // a FLUSH, the no-open drain (decision 0003 §AF) — so nothing is
+    // spawned while they are held and syncfs(2) is the only drain the
+    // bytes meet.
+    const head = try readImageRange(gpa, rig.image, 0, syncfs_fresh_bytes);
+    defer gpa.free(head);
+    const tail = try readImageRange(gpa, rig.image, (image_mib << 20) - syncfs_patch_bytes, syncfs_patch_bytes);
+    defer gpa.free(tail);
+    var path_buf: [256]u8 = undefined;
+    const fd_f = try openRaw(try std.fmt.bufPrintSentinel(&path_buf, "{s}/f", .{rig.mp}, 0), .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .CLOEXEC = true });
+    defer _ = linux.close(fd_f);
+    const fd_g = try openRaw(try std.fmt.bufPrintSentinel(&path_buf, "{s}/g", .{rig.mp}, 0), .{ .ACCMODE = .RDWR, .CLOEXEC = true });
+    defer _ = linux.close(fd_g);
+    try pwriteAll(fd_f, head, 0);
+    try pwriteAll(fd_g, tail, 0);
+    var g_path_buf: [256]u8 = undefined;
+    const g_path = try std.fmt.bufPrintSentinel(&g_path_buf, "{s}/g", .{rig.mp}, 0);
+    const seen_mtime = try mtimeOf(g_path);
+    // `sync -f <mnt>` is syncfs(2) on an fd of the mount.
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.syncfs(fd_f)));
     // The daemon served the syncfs and its census found the parked block.
     {
         const st = try rig.stats();
@@ -6978,19 +6988,435 @@ test "smoke: `sync -f` IS A DURABILITY POINT FOR THE DAEMON'S WRITE CUSTODY — 
         try testing.expect((numberAfter(st, "\"syncfs_parked_blocks\":") orelse 0) >= 1);
     }
     try rig.kill();
-    holder.kill(io);
     const recovered = try fsckClean(rig, "the kill after sync -f");
     _ = try remountAfterKill(rig, recovered);
-    var mtime_buf: [128]u8 = undefined;
-    var mtime_path_buf: [256]u8 = undefined;
-    const seen_mtime = std.mem.trimEnd(u8, try Io.Dir.cwd().readFile(io, try std.fmt.bufPrint(&mtime_path_buf, "{s}/g.mtime", .{rig.work}), &mtime_buf), "\n");
     var check: [768]u8 = undefined;
-    const out = try rig.onMount(try std.fmt.bufPrint(&check, "if head -c {d} \"$1/image\" | cmp -s - f; then echo f-whole; else echo f-LOST; fi; if {{ tail -c {d} \"$1/image\"; head -c {d} \"$1/image\" | tail -c +{d}; }} | cmp -s - g; then echo g-whole; else echo g-LOST; fi; stat -c %Y.%y g", .{ syncfs_fresh_bytes, syncfs_patch_bytes, syncfs_base_bytes, syncfs_patch_bytes + 1 }));
+    const out = try rig.onMount(try std.fmt.bufPrint(&check, "if head -c {d} \"$1/image\" | cmp -s - f; then echo f-whole; else echo f-LOST; fi; if {{ tail -c {d} \"$1/image\"; head -c {d} \"$1/image\" | tail -c +{d}; }} | cmp -s - g; then echo g-whole; else echo g-LOST; fi", .{ syncfs_fresh_bytes, syncfs_patch_bytes, syncfs_base_bytes, syncfs_patch_bytes + 1 }));
     defer gpa.free(out);
-    std.debug.print("\nsmoke[sync -f]: after the kill and the remount: {s} (the holder saw g's mtime {s})\n", .{ std.mem.trimEnd(u8, out, "\n"), seen_mtime });
+    const after_mtime = try mtimeOf(g_path);
+    std.debug.print("\nsmoke[sync -f]: after the kill and the remount: {s}; g's mtime {d}.{d:0>9} (the holder saw {d}.{d:0>9})\n", .{ std.mem.trimEnd(u8, out, "\n"), after_mtime.sec, after_mtime.nsec, seen_mtime.sec, seen_mtime.nsec });
     try testing.expect(std.mem.indexOf(u8, out, "f-whole") != null);
     try testing.expect(std.mem.indexOf(u8, out, "g-whole") != null);
-    try testing.expect(std.mem.indexOf(u8, out, seen_mtime) != null);
+    try testing.expectEqual(seen_mtime, after_mtime);
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+}
+
+/// `open(2)` with mode 0644 for a create (the holder rows' fds, the image reads).
+fn openRaw(path: [:0]const u8, flags: linux.O) !linux.fd_t {
+    const rc = linux.open(path.ptr, flags, 0o644);
+    if (linux.errno(rc) != .SUCCESS) {
+        std.debug.print("\nopen {s}: {t}\n", .{ path, linux.errno(rc) });
+        return error.OpenFailed;
+    }
+    return @intCast(rc);
+}
+
+/// A path's mtime by `statx` (no open, so no close and no FLUSH).
+const Mtime = struct { sec: i64, nsec: u32 };
+
+fn mtimeOf(path: [:0]const u8) !Mtime {
+    var st: linux.Statx = undefined;
+    if (linux.errno(linux.statx(linux.AT.FDCWD, path.ptr, 0, .{ .MTIME = true }, &st)) != .SUCCESS) return error.StatFailed;
+    return .{ .sec = st.mtime.sec, .nsec = st.mtime.nsec };
+}
+
+/// The mount's `.stats` read by THIS process (no child: a row holding a
+/// dirty fd spawns nothing — a child's exec closes its copy, a FLUSH).
+fn statsDirect(rig: *Rig) ![]u8 {
+    var pb: [256]u8 = undefined;
+    const fd = try openRaw(try std.fmt.bufPrintSentinel(&pb, "{s}/.stats", .{rig.mp}, 0), .{ .ACCMODE = .RDONLY, .CLOEXEC = true });
+    defer _ = linux.close(fd);
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(rig.gpa);
+    var buf: [64 << 10]u8 = undefined;
+    while (true) {
+        const n = linux.read(fd, &buf, buf.len);
+        if (linux.errno(n) != .SUCCESS) return error.ReadFailed;
+        if (n == 0) break;
+        try out.appendSlice(rig.gpa, buf[0..n]);
+    }
+    return out.toOwnedSlice(rig.gpa);
+}
+
+/// `awaitExactly` over `statsDirect` (owned; the last read either way).
+fn awaitExactlyDirect(rig: *Rig, key: []const u8, want: u64, deadline_ns: u64) ![]u8 {
+    const deadline = clock.monotonicNs() + deadline_ns;
+    while (true) {
+        const st = try statsDirect(rig);
+        if ((numberAfter(st, key) orelse std.math.maxInt(u64)) == want or clock.monotonicNs() >= deadline) return st;
+        rig.gpa.free(st);
+        sleepMs(100);
+    }
+}
+
+/// `len` bytes of the rig's image at `off` (owned).
+fn readImageRange(gpa: std.mem.Allocator, path: [:0]const u8, off: u64, len: u64) ![]u8 {
+    const fd = try openRaw(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true });
+    defer _ = linux.close(fd);
+    const out = try gpa.alloc(u8, @intCast(len));
+    errdefer gpa.free(out);
+    var done: usize = 0;
+    while (done < out.len) {
+        const n = linux.pread(fd, out[done..].ptr, out.len - done, @intCast(off + done));
+        if (linux.errno(n) != .SUCCESS or n == 0) return error.ReadFailed;
+        done += n;
+    }
+    return out;
+}
+
+/// Every byte of `data` at `off` (a short write continues).
+fn pwriteAll(fd: linux.fd_t, data: []const u8, off: u64) !void {
+    var done: usize = 0;
+    while (done < data.len) {
+        const n = linux.pwrite(fd, data[done..].ptr, data.len - done, @intCast(off + done));
+        if (linux.errno(n) != .SUCCESS) return error.WriteFailed;
+        if (n == 0) return error.WriteFailed;
+        done += n;
+    }
+}
+
+/// The close drain rows' set-up (decision 0003 §AF): `g` exists and is read
+/// (on a no-open mount the daemon latched the connection at ready, so no
+/// CREATE-opened file — `g`, `f` — is ever released with a RELEASE), then
+/// 1 MiB + 1000 B into the fresh `f` (`>`: a CREATE and its close) and the
+/// same appended to `g` (`>>`: an open with no OPEN, its close): a partial
+/// block of each parked in RAM until a drain.
+const close_drain_script = "head -c 4096 \"$1/image\" > g && cat g > /dev/null && head -c {d} \"$1/image\" > f && head -c {d} \"$1/image\" >> g && echo written";
+const close_drain_check = "if head -c {d} \"$1/image\" | cmp -s - f; then echo f-whole; else echo f-LOST; fi; if {{ head -c 4096 \"$1/image\"; head -c {d} \"$1/image\"; }} | cmp -s - g; then echo g-whole; else echo g-LOST; fi";
+
+/// One posture of the close drain row: write, close, (the control arm:
+/// wait for its asynchronous RELEASE to drain the parked blocks), kill -9,
+/// fsck, remount, both files whole.
+fn closeDrainRow(no_open: bool) !void {
+    const io = testing.io;
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    try rig.formatSet(false);
+    try rig.createImage();
+    try rig.env.put("SQUEEZEFS_FUSE_NO_OPEN", if (no_open) "1" else "0");
+    try rig.env.put("SQUEEZEFS_BLOCK_REFS_VERIFY", "1");
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(0);
+    var script: [512]u8 = undefined;
+    {
+        const out = try rig.onMount(try std.fmt.bufPrint(&script, close_drain_script, .{ syncfs_fresh_bytes, syncfs_fresh_bytes }));
+        defer gpa.free(out);
+        try testing.expect(std.mem.indexOf(u8, out, "written") != null);
+    }
+    const st = if (no_open) try rig.stats() else try awaitExactly(rig, "\"parked_buffers\":", 0, 20 * std.time.ns_per_s);
+    defer gpa.free(st);
+    const enosys = numberAfter(st, "\"fuse_open_enosys\":") orelse 0;
+    const drains = numberAfter(st, "\"fuse_flush_drains\":") orelse 0;
+    const clean = numberAfter(st, "\"transport_flush_inline_serves\":") orelse 0;
+    std.debug.print("\nsmoke[close drain, no_open={}]: OPENs answered ENOSYS {d}, FLUSH drains {d}, FLUSHes answered on the worker {d}, owed {d}, parked buffers {d}\n", .{ no_open, enosys, drains, clean, numberAfter(st, "\"fuse_owed_drain_inos\":") orelse 0, numberAfter(st, "\"parked_buffers\":") orelse 0 });
+    try testing.expectEqual(@as(?u64, 0), numberAfter(st, "\"parked_buffers\":"));
+    if (no_open) {
+        // The latch: the daemon's own open at ready — `cat g` sent none,
+        // and no CREATE-opened file was released with a RELEASE.
+        try testing.expectEqual(@as(u64, 1), enosys);
+        try testing.expectEqual(@as(?u64, 0), numberAfter(st, "\"fuse_no_open_releases\":"));
+        // `head` closing its stdout drained each partial block.
+        try testing.expect(drains >= 2);
+        try testing.expectEqual(@as(?u64, 0), numberAfter(st, "\"fuse_owed_drain_inos\":"));
+    } else {
+        try testing.expectEqual(@as(u64, 0), enosys);
+        try testing.expectEqual(@as(u64, 0), drains);
+    }
+    try rig.kill();
+    const recovered = try fsckClean(rig, "the kill after the close");
+    _ = try remountAfterKill(rig, recovered);
+    const out = try rig.onMount(try std.fmt.bufPrint(&script, close_drain_check, .{ syncfs_fresh_bytes, syncfs_fresh_bytes }));
+    defer gpa.free(out);
+    std.debug.print("smoke[close drain, no_open={}]: after the kill and the remount: {s}\n", .{ no_open, std.mem.trimEnd(u8, out, "\n") });
+    try testing.expect(std.mem.indexOf(u8, out, "f-whole") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "g-whole") != null);
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+}
+
+test "smoke: A NO-OPEN CLOSE IS THE WRITE-BACK DRAIN (decision 0003 §AF) — format (no cache path: a partial block parks in RAM) → mount with SQUEEZEFS_FUSE_NO_OPEN=1 (the daemon latches the connection at ready: its own `.stats` open, the ONE OPEN answered ENOSYS) → `g` written and read → 1 MiB + 1000 B into a fresh `f` (a CREATE: no RELEASE will ever come) and appended to `g` (no OPEN at all) by plain redirections → kill -9 the moment the last close returned: nothing parked, nothing owed, no RELEASE, ≥ 2 FLUSH drains, ONE OPEN → fsck --offline clean → remount → both files whole" {
+    if (venueMissing(testing.io)) |why| return testkit.skipWhy(@src(), why);
+    try closeDrainRow(true);
+}
+
+test "smoke: THE CONTROL ARM'S CLOSE DRAIN (SQUEEZEFS_FUSE_NO_OPEN=0) — the same writes; the asynchronous RELEASE drains the parked blocks after close(2) returned (observed: parked 0, no OPEN answered ENOSYS, no FLUSH drain) → kill -9 → fsck --offline clean → remount → both files whole" {
+    if (venueMissing(testing.io)) |why| return testkit.skipWhy(@src(), why);
+    try closeDrainRow(false);
+}
+
+/// The owed row's writer: an extending write that parks a partial block
+/// (no cache path), the pattern the remount checks.
+const owed_write_bytes: usize = (1 << 20) + 1000;
+
+fn owedByte(i: usize) u8 {
+    return @truncate(i *% 31 +% 7);
+}
+
+test "smoke: CUSTODY NO CLOSE COVERS IS DRAINED ONCE IDLE (decision 0003 §AF) — no-open, no cache path, the owed idle horizon at 0 (the seam), the connection latched at ready (no RELEASE would drain `m` either): a writer creates `m` and writes 1 MiB + 1000 B (a parked partial block) and holds its fd OPEN — no close, so no FLUSH follows the write: the class a mapping written back after its fd closed (`fuse_vma_close` at munmap) and an async write landing after its close share ⇒ the ino is owed → the reclaim cadence drains it (parked 0, owed 0, ONE idle drain, no FLUSH drain) → kill -9 with the fd still open → fsck --offline clean → remount → the bytes are there" {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    try rig.formatSet(false);
+    try rig.env.put("SQUEEZEFS_FUSE_NO_OPEN", "1");
+    try rig.env.put("SQUEEZEFS_TEST_FUSE_OWED_IDLE_MS", "0");
+    try rig.env.put("SQUEEZEFS_BLOCK_REFS_VERIFY", "1");
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(0);
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintSentinel(&path_buf, "{s}/m", .{rig.mp}, 0);
+    const pattern = try gpa.alloc(u8, owed_write_bytes);
+    defer gpa.free(pattern);
+    for (pattern, 0..) |*b, i| b.* = owedByte(i);
+    const fd = try openRaw(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .CLOEXEC = true });
+    // Held past the kill: never closed while the daemon lives.
+    defer _ = linux.close(fd);
+    try pwriteAll(fd, pattern, 0);
+    {
+        const st = try awaitExactlyDirect(rig, "\"fuse_owed_idle_drains\":", 1, 30 * std.time.ns_per_s);
+        defer gpa.free(st);
+        std.debug.print("\nsmoke[owed idle drain]: idle drains {d}, owed {d}, parked buffers {d}, parked extent bytes {d}, open overlays {d}, FLUSH drains {d}\n", .{ numberAfter(st, "\"fuse_owed_idle_drains\":") orelse 0, numberAfter(st, "\"fuse_owed_drain_inos\":") orelse 0, numberAfter(st, "\"parked_buffers\":") orelse 0, numberAfter(st, "\"parked_extent_bytes\":") orelse 0, numberAfter(st, "\"overlay_open\":") orelse 0, numberAfter(st, "\"fuse_flush_drains\":") orelse 0 });
+        try testing.expectEqual(@as(?u64, 1), numberAfter(st, "\"fuse_owed_idle_drains\":"));
+        try testing.expectEqual(@as(?u64, 0), numberAfter(st, "\"fuse_owed_drain_inos\":"));
+        try testing.expectEqual(@as(?u64, 0), numberAfter(st, "\"parked_buffers\":"));
+        try testing.expectEqual(@as(?u64, 0), numberAfter(st, "\"parked_extent_bytes\":"));
+        try testing.expectEqual(@as(?u64, 0), numberAfter(st, "\"overlay_open\":"));
+        // No close drained it: the custody came after every FLUSH.
+        try testing.expectEqual(@as(?u64, 0), numberAfter(st, "\"fuse_flush_drains\":"));
+    }
+    try rig.kill();
+    const recovered = try fsckClean(rig, "the kill after the idle drain");
+    _ = try remountAfterKill(rig, recovered);
+    {
+        const rfd = try openRaw(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true });
+        defer _ = linux.close(rfd);
+        const got = try gpa.alloc(u8, owed_write_bytes + 1);
+        defer gpa.free(got);
+        var done: usize = 0;
+        while (done < got.len) {
+            const n = linux.pread(rfd, got[done..].ptr, got.len - done, @intCast(done));
+            if (linux.errno(n) != .SUCCESS) return error.ReadFailed;
+            if (n == 0) break;
+            done += n;
+        }
+        try testing.expectEqual(owed_write_bytes, done);
+        for (got[0..done], 0..) |b, i| if (b != owedByte(i)) {
+            std.debug.print("\nsmoke[owed idle drain]: byte {d} reads 0x{x} after the remount — the write was LOST\n", .{ i, b });
+            return error.OwedWriteLost;
+        };
+    }
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+}
+
+/// The close-burst row: forked appenders sharing one fd.
+const burst_children: usize = 200;
+
+test "smoke: A CLOSE BURST COALESCES ITS DRAINS (decision 0003 §AF) — no-open, no cache path: `log` written past inline (its close drains), then a shell holds it open for append and 200 forked `/bin/echo` children write a line each through it — every child's exit closes its copy, a FLUSH with custody ⇒ ONE drains (the first), the rest defer to the reclaim cadence's next tick (drains ≤ 2 + the windows the burst spanned, drains + deferred ≥ 200; drained each, they re-uploaded a whole block per close: 57,000× amplification measured) → the deferred custody lands (owed 0, parked 0) → kill -9 → fsck --offline clean → remount → every line there" {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    try rig.formatSet(false);
+    try rig.createImage();
+    try rig.env.put("SQUEEZEFS_FUSE_NO_OPEN", "1");
+    try rig.env.put("SQUEEZEFS_BLOCK_REFS_VERIFY", "1");
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(0);
+    var script: [512]u8 = undefined;
+    const t0 = clock.monotonicNs();
+    {
+        const out = try rig.onMount(try std.fmt.bufPrint(&script, "head -c 8192 \"$1/image\" > log && exec 3>>log && i=0 && while [ $i -lt {d} ]; do /bin/echo \"line $i of the close burst\" >&3; i=$((i + 1)); done && echo appended", .{burst_children}));
+        defer gpa.free(out);
+        try testing.expect(std.mem.indexOf(u8, out, "appended") != null);
+    }
+    const burst_ns = clock.monotonicNs() - t0;
+    {
+        const st = try rig.stats();
+        defer gpa.free(st);
+        const drains = numberAfter(st, "\"fuse_flush_drains\":") orelse 0;
+        const deferred = numberAfter(st, "\"fuse_flush_drains_deferred\":") orelse 0;
+        // One drain per coalescing window the burst spanned (the window is
+        // the reclaim tick), the prefill's and the last close's on top —
+        // counted on the burst's own clock, so a loaded host only widens it.
+        const bound = 2 + burst_ns / handler.watchdog.TICK_NS; // `mount.RECLAIM_CADENCE_NS`
+        std.debug.print("\nsmoke[close burst]: {d} children in {d} ms: FLUSH drains {d} (bound {d}), deferred {d}, answered on the worker {d}\n", .{ burst_children, burst_ns / std.time.ns_per_ms, drains, bound, deferred, numberAfter(st, "\"transport_flush_inline_serves\":") orelse 0 });
+        try testing.expect(drains >= 1 and drains <= bound);
+        // Every child's write met its close: drained or deferred.
+        try testing.expect(drains + deferred >= burst_children);
+    }
+    // The deferred custody lands — the cadence's next tick, or the last
+    // close's own drain once a window passed.
+    {
+        const st = try awaitExactly(rig, "\"fuse_owed_drain_inos\":", 0, 30 * std.time.ns_per_s);
+        defer gpa.free(st);
+        try testing.expectEqual(@as(?u64, 0), numberAfter(st, "\"fuse_owed_drain_inos\":"));
+        try testing.expectEqual(@as(?u64, 0), numberAfter(st, "\"parked_buffers\":"));
+    }
+    try rig.kill();
+    const recovered = try fsckClean(rig, "the kill after the close burst");
+    _ = try remountAfterKill(rig, recovered);
+    {
+        const out = try rig.onMount(try std.fmt.bufPrint(&script, "{{ head -c 8192 \"$1/image\"; i=0; while [ $i -lt {d} ]; do echo \"line $i of the close burst\"; i=$((i + 1)); done; }} | cmp -s - log && echo log-whole", .{burst_children}));
+        defer gpa.free(out);
+        std.debug.print("smoke[close burst]: after the kill and the remount: {s}\n", .{std.mem.trimEnd(u8, out, "\n")});
+        try testing.expect(std.mem.indexOf(u8, out, "log-whole") != null);
+    }
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+}
+
+test "smoke: O_TRUNC UNDER NO-OPEN TRUNCATES (decision 0003 §AF: INIT drops FUSE_ATOMIC_O_TRUNC, so the open's truncate is a SETATTR(size 0) under the size setter's guard — with the flag kept, the kernel skips that SETATTR and no OPEN carries it) — every TTL class at 60 s: on A, `: > f` over a non-empty file empties it; B JOINS; A writes `d/a`, B empties it with `: >` (B's SETATTR ships to the holder) ⇒ both read size 0 and no byte; B writes `d/b`, A empties it ⇒ both read 0" {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    try rig.env.put("SQUEEZEFS_FUSE_NO_OPEN", "1");
+    try rig.env.put("SQUEEZEFS_MW_BIND", "127.0.0.1:0");
+    var t_owner_text: [8]u8 = undefined;
+    try rig.env.put("SQUEEZEFS_TEST_MEMBERSHIP_T_OWNER_MS", try std.fmt.bufPrint(&t_owner_text, "{d}", .{smoke_t_owner_ms}));
+    for ([_][]const u8{ "SQUEEZEFS_FUSE_ATTR_TTL_MS", "SQUEEZEFS_FUSE_ENTRY_TTL_MS", "SQUEEZEFS_FUSE_DIR_ENTRY_TTL_MS", "SQUEEZEFS_FUSE_NEGATIVE_TTL_MS" }) |k| try rig.env.put(k, "60000");
+    try rig.formatSet(true);
+    try rig.createImage();
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(0);
+    // One daemon: a striped file and an inline one, each emptied by `: >`.
+    {
+        const out = try rig.onMount("head -c 3000000 \"$1/image\" > big && echo hello > small && cat big small > /dev/null && : > big && : > small && stat -c %s big small && cat big small | wc -c && mkdir d && echo ok");
+        defer gpa.free(out);
+        try testing.expectEqualStrings("0\n0\n0\nok\n", out);
+    }
+    const b = try Peer.init(rig, "b");
+    defer b.deinit();
+    try b.spawn(&.{});
+    _ = try b.awaitReady();
+    // A's file, B's truncate (a cross-owner SETATTR).
+    {
+        const w = try rig.onMount("head -c 3000000 \"$1/image\" > d/a && stat -c %s d/a");
+        defer gpa.free(w);
+        try testing.expectEqualStrings("3000000\n", w);
+        const seen = try b.onMount("stat -c %s d/a && head -c 16 d/a | wc -c");
+        defer gpa.free(seen);
+        try testing.expectEqualStrings("3000000\n16\n", seen);
+        const t = try b.onMount(": > d/a && stat -c %s d/a && cat d/a | wc -c");
+        defer gpa.free(t);
+        try testing.expectEqualStrings("0\n0\n", t);
+        // A's kernel learns it from its own notifier (0003 §AB.2 (2)):
+        // bounded, a lost invalidation keeps the size for the 60 s TTL.
+        const a = try rig.onMount("for i in $(seq 100); do [ \"$(stat -c %s d/a)\" = 0 ] && break; sleep 0.02; done; stat -c %s d/a && cat d/a | wc -c");
+        defer gpa.free(a);
+        try testing.expectEqualStrings("0\n0\n", a);
+    }
+    // B's file, A's truncate.
+    {
+        const w = try b.onMount("echo from-b > d/b && cat d/b");
+        defer gpa.free(w);
+        try testing.expectEqualStrings("from-b\n", w);
+        const t = try rig.onMount("for i in $(seq 100); do [ -e d/b ] && break; sleep 0.02; done; cat d/b > /dev/null && : > d/b && stat -c %s d/b");
+        defer gpa.free(t);
+        try testing.expectEqualStrings("0\n", t);
+        const seen = try b.onMount("for i in $(seq 100); do [ \"$(stat -c %s d/b)\" = 0 ] && break; sleep 0.02; done; stat -c %s d/b && cat d/b | wc -c");
+        defer gpa.free(seen);
+        try testing.expectEqualStrings("0\n0\n", seen);
+    }
+    {
+        const ta = try rig.stats();
+        defer gpa.free(ta);
+        const tb = try b.stats();
+        defer gpa.free(tb);
+        std.debug.print("\nsmoke[O_TRUNC no-open]: OPENs answered ENOSYS A {d} / B {d}\n", .{ numberAfter(ta, "\"fuse_open_enosys\":") orelse 0, numberAfter(tb, "\"fuse_open_enosys\":") orelse 0 });
+        try testing.expect((numberAfter(ta, "\"fuse_open_enosys\":") orelse 0) >= 1);
+        try testing.expect((numberAfter(tb, "\"fuse_open_enosys\":") orelse 0) >= 1);
+    }
+}
+
+/// `.stats` opened, fstat'ed and read whole through the same fd: the bytes
+/// and the size the kernel reported for that generation (owned).
+const VirtualRead = struct { ino: u64, size: u64, bytes: []u8 };
+
+fn readVirtualWhole(gpa: std.mem.Allocator, path: [:0]const u8) !VirtualRead {
+    const fd = try openRaw(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true });
+    defer _ = linux.close(fd);
+    var st: linux.Statx = undefined;
+    if (linux.errno(linux.statx(fd, "", linux.AT.EMPTY_PATH, linux.STATX.BASIC_STATS, &st)) != .SUCCESS) return error.StatFailed;
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    var buf: [64 << 10]u8 = undefined;
+    while (true) {
+        const n = linux.read(fd, &buf, buf.len);
+        if (linux.errno(n) != .SUCCESS) return error.ReadFailed;
+        if (n == 0) break;
+        try out.appendSlice(gpa, buf[0..n]);
+    }
+    return .{ .ino = st.ino, .size = st.size, .bytes = try out.toOwnedSlice(gpa) };
+}
+
+test "smoke: THE VIRTUAL INODES WITHOUT AN OPEN (decision 0003 §AF) — under no-open `.stats` is read through the page cache with no generation pin and no FOPEN_DIRECT_IO: 200 reads while a create storm moves every counter are each ONE whole JSON document whose length is exactly the st_size the same fd's fstat reported; two sequential opens read two generations (different inos, different bytes, each exact); a truncating open and a write are EACCES" {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    try rig.env.put("SQUEEZEFS_FUSE_NO_OPEN", "1");
+    try rig.formatSet(false);
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(0);
+    const mk = try rig.onMount("mkdir hot && echo ok");
+    gpa.free(mk);
+    var storm = try Storm.start(rig, rig.mp, "virtual", "v");
+    defer storm.deinit(rig);
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintSentinel(&path_buf, "{s}/.stats", .{rig.mp}, 0);
+    var prev: ?VirtualRead = null;
+    defer if (prev) |p| gpa.free(p.bytes);
+    var generations: u64 = 0;
+    for (0..200) |_| {
+        const r = try readVirtualWhole(gpa, path);
+        errdefer gpa.free(r.bytes);
+        try testing.expectEqual(r.size, @as(u64, r.bytes.len));
+        // A torn or cut document fails the parse; `.stats` repeats a few
+        // keys across families, which a JSON object tolerates.
+        var parsed = std.json.parseFromSlice(std.json.Value, gpa, r.bytes, .{ .duplicate_field_behavior = .use_first }) catch |e| {
+            std.debug.print("\n--- a torn .stats generation ({d} of {d} B): {t} ---\n{s}\n", .{ r.bytes.len, r.size, e, r.bytes[r.bytes.len -| 200..] });
+            return e;
+        };
+        parsed.deinit();
+        if (prev) |p| {
+            if (p.ino != r.ino) generations += 1;
+            gpa.free(p.bytes);
+        }
+        prev = r;
+    }
+    // Two sequential opens: two generations, each exact.
+    const a = try readVirtualWhole(gpa, path);
+    defer gpa.free(a.bytes);
+    const b = try readVirtualWhole(gpa, path);
+    defer gpa.free(b.bytes);
+    try testing.expect(a.ino != b.ino);
+    try testing.expect(!std.mem.eql(u8, a.bytes, b.bytes));
+    try testing.expectEqual(a.size, @as(u64, a.bytes.len));
+    try testing.expectEqual(b.size, @as(u64, b.bytes.len));
+    const landed = try storm.finish(rig);
+    std.debug.print("\nsmoke[virtual no-open]: 200 whole .stats documents across {d} generation changes while {d} creates landed\n", .{ generations, landed });
+    try testing.expect(generations >= 199);
+    try testing.expect(landed > 0);
+    // 0400 under default_permissions refuses a non-root writer at open in
+    // the kernel; root (this test) opens locally — no OPEN refuses it — and
+    // every mutation is the daemon's EACCES: a truncating open's SETATTR, a
+    // write.
+    const rc = linux.open(path.ptr, .{ .ACCMODE = .WRONLY, .TRUNC = true, .CLOEXEC = true }, 0);
+    if (linux.errno(rc) == .SUCCESS) _ = linux.close(@intCast(rc));
+    try testing.expectEqual(linux.E.ACCES, linux.errno(rc));
+    {
+        const fd = try openRaw(path, .{ .ACCMODE = .WRONLY, .CLOEXEC = true });
+        defer _ = linux.close(fd);
+        try testing.expectEqual(linux.E.ACCES, linux.errno(linux.write(fd, "x", 1)));
+    }
     try rig.umount();
     try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
 }
@@ -7780,6 +8206,75 @@ const fold_files: usize = 3;
 const fold_writes_per_file: usize = 4;
 const fold_page: u64 = 4096;
 
+/// The D3 row's holder: a forked child that opens `big0..big2`, writes the
+/// 12 parked sectors and holds the fds until it is killed. It never forks
+/// or execs, so no copy of its fds closes before it dies — under no-open
+/// (decision 0003 §AF) the close of ANY copy is a FLUSH, the drain, and a
+/// test process holding the fds while it spawns its probes (`cat .stats`,
+/// `squeezefs defrag`: each child's exec closes its CLOEXEC copy) would
+/// drain the extents the row exists to fold. The child runs raw syscalls
+/// only (a forked copy of a threaded process allocates nothing).
+const FoldHolder = struct {
+    pid: linux.pid_t,
+    stopped: bool = false,
+
+    fn start(mp: []const u8) !FoldHolder {
+        var paths: [fold_files][linux.PATH_MAX:0]u8 = undefined;
+        for (0..fold_files) |n| _ = try std.fmt.bufPrintSentinel(&paths[n], "{s}/big{d}", .{ mp, n }, 0);
+        var ready: [2]i32 = undefined;
+        if (linux.errno(linux.pipe2(&ready, .{ .CLOEXEC = true })) != .SUCCESS) return error.PipeFailed;
+        defer _ = linux.close(ready[0]);
+        const rc = linux.fork();
+        if (linux.errno(rc) != .SUCCESS) {
+            _ = linux.close(ready[1]);
+            return error.ForkFailed;
+        }
+        if (rc == 0) childMain(&paths, ready[1]);
+        _ = linux.close(ready[1]);
+        var verdict: [1]u8 = .{0};
+        const n = linux.read(ready[0], &verdict, 1);
+        const self: FoldHolder = .{ .pid = @intCast(rc) };
+        if (linux.errno(n) != .SUCCESS or n != 1 or verdict[0] != 'r') {
+            var h = self;
+            h.stop();
+            return error.HolderFailed;
+        }
+        return self;
+    }
+
+    fn childMain(paths: *const [fold_files][linux.PATH_MAX:0]u8, ready: i32) noreturn {
+        var sector: [512]u8 = undefined;
+        for (0..fold_files) |n| {
+            const rc = linux.open(&paths[n], .{ .ACCMODE = .RDWR }, 0);
+            if (linux.errno(rc) != .SUCCESS) fail(ready);
+            const fd: linux.fd_t = @intCast(rc);
+            for (0..fold_writes_per_file) |k| {
+                @memset(&sector, @as(u8, @intCast(0x40 + n * 8 + k)));
+                // Block k, page 3 + 2k, 512 B into the page: a sub-cap,
+                // sector-aligned, unaligned-to-the-page write — the extent class.
+                const off: u64 = @as(u64, k) * kvmap_block + (3 + 2 * @as(u64, k)) * fold_page + 512;
+                if (linux.pwrite(fd, &sector, sector.len, @intCast(off)) != sector.len) fail(ready);
+            }
+        }
+        _ = linux.write(ready, "r", 1);
+        while (true) _ = linux.pause();
+    }
+
+    fn fail(ready: i32) noreturn {
+        _ = linux.write(ready, "e", 1);
+        linux.exit_group(1);
+    }
+
+    /// Kill and reap (idempotent).
+    fn stop(self: *FoldHolder) void {
+        if (self.stopped) return;
+        self.stopped = true;
+        _ = linux.kill(self.pid, .KILL);
+        var status: i32 = 0;
+        _ = linux.waitpid(self.pid, &status, 0);
+    }
+};
+
 /// The D4 row's forest: `defrag_forest_files` files created, every tenth
 /// kept, the survivors rewritten `defrag_rewrite_rounds` times — the
 /// leaves then hold a few live records under a log that is mostly dead
@@ -7836,35 +8331,16 @@ test "smoke: DEFRAG --fold AND --meta ON A LIVE MOUNT — format (64 KiB meta no
     try rig.spawnMount(&.{});
     _ = try rig.awaitReady(0);
 
-    // 1. D3: the striped files, then the parked writes from THIS process
-    //    (the fds stay open until the job completes).
+    // 1. D3: the striped files, then the parked writes from a HOLDER child
+    //    that keeps the fds open until the job completes and never forks
+    //    or execs (`FoldHolder`).
     {
         const out = try rig.onMount("for n in 0 1 2; do dd if=\"$1/image\" of=big$n bs=1M skip=$((n * 8)) count=8 conv=fsync status=none; done; echo filled");
         defer gpa.free(out);
         try testing.expect(std.mem.indexOf(u8, out, "filled") != null);
     }
-    var fds: [fold_files]linux.fd_t = undefined;
-    var opened: usize = 0;
-    defer for (fds[0..opened]) |fd| {
-        _ = linux.close(fd);
-    };
-    var sector: [512]u8 = undefined;
-    for (0..fold_files) |n| {
-        var pb: [linux.PATH_MAX:0]u8 = undefined;
-        const path = try std.fmt.bufPrintSentinel(&pb, "{s}/big{d}", .{ rig.mp, n }, 0);
-        const rc = linux.open(path, .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);
-        try testing.expectEqual(linux.E.SUCCESS, linux.errno(rc));
-        fds[n] = @intCast(rc);
-        opened += 1;
-        for (0..fold_writes_per_file) |k| {
-            @memset(&sector, @as(u8, @intCast(0x40 + n * 8 + k)));
-            // Block k, page 3 + 2k, 512 B into the page: a sub-cap,
-            // sector-aligned, unaligned-to-the-page write — the extent class.
-            const off: u64 = @as(u64, k) * kvmap_block + (3 + 2 * @as(u64, k)) * fold_page + 512;
-            const w = linux.pwrite(fds[n], &sector, sector.len, @intCast(off));
-            try testing.expectEqual(@as(usize, 512), w);
-        }
-    }
+    var holder = try FoldHolder.start(rig.mp);
+    defer holder.stop();
     const user_bytes: u64 = fold_files * fold_writes_per_file * 512;
     {
         const st = try rig.stats();
@@ -7903,10 +8379,10 @@ test "smoke: DEFRAG --fold AND --meta ON A LIVE MOUNT — format (64 KiB meta no
         try testing.expectEqual(user_bytes * fold_page / 512, ip_bytes);
         try testing.expect(ip_bytes * 1_000_000 / user_bytes <= extent_overlay.inPlaceBoundPpm(512, 512));
     }
-    // Close the fds (nothing left parked to flush) and verify every byte:
-    // the 512 B patterns, the untouched rest of each page from the image.
-    for (fds[0..opened]) |fd| _ = linux.close(fd);
-    opened = 0;
+    // End the holder (its exit closes the fds: nothing left parked to
+    // drain) and verify every byte: the 512 B patterns, the untouched rest
+    // of each page from the image.
+    holder.stop();
     {
         // Byte-exact against the image everywhere BUT the 12 sectors; the
         // sectors carry their byte (the expected image rebuilt with `tr`

@@ -116,12 +116,14 @@ const transform = @import("../data/transform.zig");
 const data_superblock = @import("../data/data_superblock.zig");
 const plane_mod = @import("../data/plane.zig");
 const write_admit = @import("../data/write_admit.zig");
+const write_epoch = @import("../data/write_epoch.zig");
 const slot = @import("../fuse/transport/slot.zig");
 const counters = @import("../core/counters.zig");
 const stats = @import("../stats/stats.zig");
 const ipc_host = @import("../ipc/host.zig");
 const ipc_rl = @import("../ipc/rendezvous_linux.zig");
 const derive = @import("../core/derive.zig");
+const knobs = @import("../core/knobs.zig");
 const errors = @import("../core/errors.zig");
 const log = @import("../core/log.zig");
 const futex = @import("../sync/futex.zig");
@@ -164,6 +166,15 @@ const filesystem = handler.filesystem;
 /// one entry, and the tick is the slowest periodic cadence the daemon
 /// already runs.
 pub const RECLAIM_CADENCE_NS: u64 = watchdog.TICK_NS;
+
+/// How long a no-open owed ino's latest write must be past before the
+/// reclaim cadence drains it (decision 0003 §AF): the rewrite epoch's own
+/// idle horizon (`write_epoch.EPOCH_IDLE_HORIZON_MS`, the metadata cache's
+/// TTI / 10 = 30 s) — the charter's bound for write custody nothing else
+/// closes. Long enough that a writer pausing between bursts keeps its
+/// parked blocks (the W2 fold "at the last moment", the accumulation's
+/// whole-block upload); a close's FLUSH drains at once regardless.
+pub const OWED_IDLE_NS: u64 = write_epoch.EPOCH_IDLE_HORIZON_MS * std.time.ns_per_ms;
 
 /// The verb's state, pinned in `run`'s frame for the root task.
 const Ctx = struct {
@@ -621,6 +632,10 @@ fn mountMain(ctx: *Ctx) u8 {
     const move_deadline_ms: ?u64 = if (wire) |wp| wp.moveDeadlineMs() else if (rplane) |rp| rp.moveDeadlineMs() else null;
     var move_gate: handler.move_gate.MoveGate = .{ .inner = if (rplane != null) reader_gate.filesystem() else filesystem.Filesystem.of(BackendFs, &fs), .moves = &moves, .deadline_ns = sym_slots.moves.deadlineNs(move_deadline_ms orelse 0) };
     const served_fs: filesystem.Filesystem = if (move_deadline_ms != null) move_gate.filesystem() else move_gate.inner;
+    // Zero-message opens (decision 0003 §AF): the lifecycle answers OPEN
+    // ENOSYS and FLUSH drains; the session drops ATOMIC_O_TRUNC and probes
+    // every FLUSH on its worker; the reclaim cadence drains idle owed custody.
+    const no_open = knobs.boolKnob("SQUEEZEFS_FUSE_NO_OPEN", env);
     var binding: handler.ring.Binding = .{};
     binding.bind(.{
         .fs = served_fs,
@@ -630,6 +645,12 @@ fn mountMain(ctx: *Ctx) u8 {
         .opens = &opens,
         .probe = plane.probe(),
         .shared_enabled = op_guard.sharedEnabled(env),
+        .no_open = no_open,
+        // One FLUSH-drain per ino per reclaim tick; a burst's later closes
+        // drain at the tick: the fork appender (2,000 children closing
+        // copies of one fd, a cache-less set) uploaded a whole 4 MiB block
+        // per close — 8.1 GB of device writes for 143 KB — draining each.
+        .drain_coalesce_ns = RECLAIM_CADENCE_NS,
     });
     binding.bindData(.{ .plane = plane });
 
@@ -662,6 +683,7 @@ fn mountMain(ctx: *Ctx) u8 {
         .on_shutdown = .{ .ctx = ctx, .call = onSessionShutdown },
         .refusal = &session_refusal,
         .request_timeout_s = fuse_geometry.requestTimeoutS(lattice_t_owner_ms, lattice_park_max_ms),
+        .no_open = no_open,
     }) catch |e| {
         if (fuse_fd) |fd| {
             _ = fusermount.unmount(io, ctx.mountpoint);
@@ -760,7 +782,8 @@ fn mountMain(ctx: *Ctx) u8 {
     var wd = watchdog.Watchdog.init(&registry);
     if (ctx.heartbeat) |h| wd.on_tick = .{ .ctx = h, .call = &beatHeartbeat };
     var wd_fut = ctx.sqz.spawnMeta(watchdogMain, .{ &wd, io }) catch return ctx.failed("cannot spawn the watchdog", .{});
-    var reclaim: ReclaimCadence = .{ .fs = &fs, .io = io, .plane = plane, .node = node };
+    const owed_idle_ns: u64 = if (knobs.optIntKnob("SQUEEZEFS_TEST_FUSE_OWED_IDLE_MS", u64, env)) |ms| ms * std.time.ns_per_ms else OWED_IDLE_NS;
+    var reclaim: ReclaimCadence = .{ .fs = &fs, .io = io, .plane = plane, .node = node, .opens = &opens, .owed_idle_ns = owed_idle_ns };
     var reclaim_fut = ctx.sqz.spawnMeta(ReclaimCadence.run, .{&reclaim}) catch {
         wd.requestStop();
         wd_fut.cancel(io);
@@ -797,6 +820,7 @@ fn mountMain(ctx: *Ctx) u8 {
     //    supervisor's first probe can read it (the watchdog's first tick is
     //    one interval away; a page still 0 reads as a missed probe).
     if (ctx.heartbeat) |h| h.beat();
+    if (no_open) latchNoOpen(ctx.mountpoint);
     log.info("ready: {s} mounted at {s} (pid {d}; {d} queue(s) × depth {d}; budget {d} MiB; TTLs attr {d} ms entry {d} ms dir_entry {d} ms negative {d} ms)", .{ ctx.meta_uri, ctx.mountpoint, linux.getpid(), session.plan.nqueues, session.plan.depth, ctx.budget_bytes >> 20, ctx.opts.ttls.attr_ns / std.time.ns_per_ms, ctx.opts.ttls.entry_ns / std.time.ns_per_ms, ctx.opts.ttls.dir_entry_ns / std.time.ns_per_ms, ctx.opts.ttls.negative_ns / std.time.ns_per_ms });
     if (ctx.reporter) |*r| {
         r.ready();
@@ -1141,10 +1165,44 @@ const ReclaimCadence = struct {
     /// same tick (the "health-worker cadence" of the router).
     plane: *plane_mod.DataPlane,
     node: ?*jobs.coordinator.Node,
+    /// The no-open owed set (decision 0003 §AF): custody no close covered —
+    /// a held-open writer, a mapping written back after its fd closed, an
+    /// async write landing after its close — drained here once idle.
+    opens: *open_table.OpenTable,
+    /// `OWED_IDLE_NS` (the seam `SQUEEZEFS_TEST_FUSE_OWED_IDLE_MS` wins).
+    owed_idle_ns: u64,
     stop: std.atomic.Value(bool) = .init(false),
 
     fn requestStop(self: *ReclaimCadence) void {
         self.stop.store(true, .release);
+    }
+
+    /// The owed inos one tick drains at most: the harvest's stack room (a
+    /// longer tail waits one tick; a full harvest loops within the tick).
+    const OWED_HARVEST = 64;
+
+    /// Every owed ino idle for `owed_idle_ns` drained through the
+    /// filesystem's FLUSH drain (the RELEASE drain), on this meta fiber —
+    /// the corpse destroys of the same tick settle custody the same way.
+    fn drainIdleOwed(self: *ReclaimCadence, c: *filesystem.Ctx) void {
+        if (!self.opens.no_open) return;
+        var buf: [OWED_HARVEST]u64 = undefined;
+        while (true) {
+            const inos = self.opens.takeIdleOwed(clock.monotonicNs(), self.owed_idle_ns, &buf);
+            var failed = false;
+            for (inos) |ino| {
+                self.fs.flush(c, .{ .ino = ino, .fh = 0, .lock_owner = 0, .drain = true }) catch |e| {
+                    // Never dropped: noted again (idle at once); the next
+                    // tick retries — this one stops harvesting.
+                    failed = true;
+                    log.err("reclaim cadence: the idle drain of owed ino {d} failed ({t}); noted owed again for the next tick", .{ ino, e });
+                    self.opens.noteWrite(ino, 0) catch log.err("reclaim cadence: owed ino {d} could not be noted again — its custody waits for a close, an fsync, a syncfs or the unmount", .{ino});
+                    continue;
+                };
+                open_table.fuse_owed_idle_drains.inc();
+            }
+            if (failed or inos.len < buf.len) return;
+        }
     }
 
     fn run(self: *ReclaimCadence) void {
@@ -1155,6 +1213,7 @@ const ReclaimCadence = struct {
             defer trace.finish();
             var ctx: filesystem.Ctx = .{ .unique = 0, .uid = 0, .gid = 0, .pid = 0, .io = self.io, .trace = &trace, .wd_slot = null, .window = &.{} };
             self.fs.reclaimDrain(&ctx) catch |e| log.err("reclaim cadence: drain failed: {t}", .{e});
+            self.drainIdleOwed(&ctx);
             // The cross-owner cadence rides the same meta fiber: the
             // roll-forward of abandoned intents, the stripe migration.
             self.fs.xvCadenceTick();
@@ -1245,6 +1304,26 @@ fn invalThunk(ctx: ?*anyopaque, ino: u64, off: i64, len: i64) error{QueueFull}!v
 
 /// The mounted root's `st_dev` (the fd screen's mount authority): an
 /// `O_PATH` open of the mountpoint served by our own lanes.
+/// Zero-message opens (decision 0003 §AF): the kernel latches `no_open` at
+/// the connection's first OPEN answered ENOSYS, and until then a file a
+/// CREATE opened still sends a RELEASE at its last close. The daemon opens
+/// its own `.stats` once before it reports ready (the request is the
+/// workers', the opener this task — as `mountDevice`'s GETATTR), so the
+/// posture holds from the first application request.
+fn latchNoOpen(mountpoint: [:0]const u8) void {
+    var buf: [linux.PATH_MAX:0]u8 = undefined;
+    const path = std.fmt.bufPrintSentinel(&buf, "{s}/{s}", .{ mountpoint, handler.virtual_inodes.STATS_NAME }, 0) catch {
+        log.warn("mount: the no-open latch's path does not fit PATH_MAX under {s}; the first application open latches it", .{mountpoint});
+        return;
+    };
+    const rc = linux.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(rc) != .SUCCESS) {
+        log.warn("mount: {s} could not be opened to latch no-open ({t}); the first application open latches it", .{ path, linux.errno(rc) });
+        return;
+    }
+    _ = linux.close(@intCast(rc));
+}
+
 fn mountDevice(mountpoint: [:0]const u8) ?u64 {
     const rc = linux.openat(linux.AT.FDCWD, mountpoint.ptr, .{ .ACCMODE = .RDONLY, .PATH = true, .DIRECTORY = true, .CLOEXEC = true }, 0);
     if (linux.errno(rc) != .SUCCESS) return null;

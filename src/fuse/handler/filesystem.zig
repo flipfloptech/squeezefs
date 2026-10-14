@@ -190,6 +190,11 @@ pub fn timeNs(sec: u64, nsec: u32) u64 {
 pub const InitArgs = struct {
     negotiated: u64,
     minor: u32,
+    /// The no-open posture (decision 0003 §AF): OPEN answers ENOSYS before
+    /// the filesystem sees it, a CREATE's reply must leave the kernel a
+    /// FLUSH at every close (no `FOPEN_NOFLUSH`), and FLUSH carries the
+    /// write-back drain RELEASE carried.
+    no_open: bool = false,
 
     pub fn has(self: InitArgs, bit: u64) bool {
         return self.negotiated & bit != 0;
@@ -234,7 +239,9 @@ pub const HeldPayload = struct {
     ctx: ?*anyopaque,
     extract: *const fn (ctx: ?*anyopaque, io: Io) anyerror![]const u8,
 };
-pub const FlushArgs = struct { ino: u64, fh: u64, lock_owner: u64 };
+/// `drain`: the no-open posture's FLUSH — the write-back drain at close
+/// that RELEASE carries in the control arm (charter §6.2).
+pub const FlushArgs = struct { ino: u64, fh: u64, lock_owner: u64, drain: bool = false };
 pub const ReleaseArgs = struct { ino: u64, fh: u64, flags: u32, lock_owner: u64, flush: bool };
 pub const FsyncArgs = struct { ino: u64, fh: u64, datasync: bool };
 /// `ino` = the request's nodeid (the root's): the op names the mount.
@@ -306,6 +313,12 @@ pub const VTable = struct {
     /// the blocking op. Never a device touch, a wire verb or a park.
     probe_lookup: Op(LookupArgs, Entry) = &defaults.enosys(LookupArgs, Entry),
     probe_getattr: Op(GetattrArgs, Attr) = &defaults.enosys(GetattrArgs, Attr),
+    /// The no-open FLUSH's try-only twin (decision 0003 §AF): success iff
+    /// the ino holds no write custody the drain would land — read under
+    /// the custody tables' O(1)-section spin locks, never a device wait, a
+    /// park or a lock a pass holds; any error sends the FLUSH to the data
+    /// lane, which drains.
+    probe_flush: Op(FlushArgs, void) = &defaults.enosys(FlushArgs, void),
 };
 
 const defaults = struct {

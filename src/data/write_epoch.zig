@@ -216,6 +216,14 @@ pub const Epochs = struct {
         }
     }
 
+    /// Whether `ino` has an epoch open or saving — the no-open FLUSH's
+    /// try-only probe (decision 0003 §AF): one spin-locked lookup per map.
+    pub fn holds(self: *Epochs, ino: u64) bool {
+        self.lock.lock();
+        defer self.lock.unlock();
+        return self.table.contains(ino) or self.closing.contains(ino);
+    }
+
     /// Open epochs (a save in flight is not open: its ino's next record
     /// opens a fresh one).
     pub fn openCount(self: *Epochs) usize {

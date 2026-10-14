@@ -518,7 +518,7 @@ pub const Engine = struct {
             stats.ipc_dd_write_bytes.add(p.len);
             stats.ipc_ops_write.inc();
             stats.ipc_bytes_in.add(p.len);
-            if (self.opens) |o| o.markDirty(p.nodeid);
+            if (self.opens) |o| o.noteDurableWrite(p.nodeid);
             p.c.complete(@intCast(p.len));
             _ = self.inval.onWrite(p.nodeid, p.offset + p.len, clock.realtimeCoarseS());
         } else |e| {

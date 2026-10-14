@@ -176,6 +176,13 @@ pub var forget_entries: counters.ShardedCounter = .{};
 /// GETATTR deliveries`.
 pub var meta_inline_serves: counters.ShardedCounter = .{};
 pub var meta_inline_demotes: counters.ShardedCounter = .{};
+/// `transport_flush_inline_serves` / `_demotes` (a no-open session,
+/// decision 0003 §AF): FLUSHes — the drain at every close — the
+/// filesystem's try-only probe answered on this thread (nothing to drain) /
+/// handed to the CPU's lane to drain. Partition: `serves + demotes ≡ FLUSH
+/// deliveries` on a no-open session.
+pub var flush_inline_serves: counters.ShardedCounter = .{};
+pub var flush_inline_demotes: counters.ShardedCounter = .{};
 /// `transport_fast_dispatch_serves` / `_demotes`: the READ law's arms (a) / (c).
 pub var fast_dispatch_serves: counters.ShardedCounter = .{};
 pub var fast_dispatch_demotes: counters.ShardedCounter = .{};
@@ -589,6 +596,9 @@ pub const Shared = struct {
     /// worker DRIVES a lane of its own and every handler it dispatches runs
     /// on it — on this thread.
     handlers_on_worker: bool = false,
+    /// The no-open posture (`Config.no_open`, decision 0003 §AF): a FLUSH
+    /// is probed here first, and its drain is the data class.
+    no_open: bool = false,
     /// The executor's budget the driven lane's fiber reserve derives from.
     budget_bytes: u64 = 0,
 
@@ -2602,6 +2612,7 @@ pub const Group = struct {
             .interrupt, .notify_reply => self.autoCommit(gent, unique, commit_id),
             .read => |in| self.dispatchRead(gent, req, in, sref),
             .lookup, .getattr => self.dispatchMeta(gent, req, sref),
+            .flush => if (self.shared.no_open) self.dispatchFlush(gent, req, sref) else self.dispatch(gent, req, sref, null),
             .write => |w| {
                 const lease = held orelse slot.PayloadLease.acquire(&ent.lease, w.data, self.waker());
                 self.dispatch(gent, req, sref, lease);
@@ -2635,6 +2646,24 @@ pub const Group = struct {
             return;
         }
         meta_inline_demotes.inc();
+        self.dispatch(gent, req, sref, null);
+    }
+
+    /// A no-open FLUSH (decision 0003 §AF): close(2) waits on it, so a file
+    /// holding no write custody is answered on this thread (the
+    /// filesystem's try-only probe through `probe_meta`); one holding
+    /// custody drains on the CPU's lane — the data class: the drain's
+    /// device waits park the thread that runs it.
+    fn dispatchFlush(self: *Group, gent: u32, req: fsv.Request, sref: slot.SlotRef) void {
+        if (self.shared.fs.probeMeta(req, &self.meta_out)) |reply| {
+            flush_inline_serves.inc();
+            const m = self.memberOf(gent);
+            const e = self.entIdxOf(gent);
+            self.local_msgs[gent] = commit_queue.Msg.reply(.{ .qid = m.qid, .ent_idx = e, .commit_id = m.slots.ent(e).owing().?.commit_id }, reply);
+            self.commitReady(gent, &self.local_msgs[gent], .local);
+            return;
+        }
+        flush_inline_demotes.inc();
         self.dispatch(gent, req, sref, null);
     }
 
@@ -2738,7 +2767,7 @@ pub const Group = struct {
         const handle: fsv.Handle = .{ .tx = self.shared.tx, .slot = .{ .ring = sref }, .unique = req.unique(), .window = self.window(gent) };
         const cpu: ?u16 = if (self.shared.qid_is_cpu) m.qid else null;
         // The worker's own lane: the handler runs on this thread (§AB.3).
-        const own = if (onWorkerLane(req.op)) self.lane else null;
+        const own = if (onWorkerLane(req.op, self.shared.no_open)) self.lane else null;
         const lane = own orelse self.shared.exec.homeLane(cpu, self.shared.nodeOf(m.qid));
         if (own != null) handler_dispatches_own.inc() else handler_dispatches_foreign.inc();
         self.shared.exec.spawnGroupOn(lane, self.shared.handler_group, handlerMain, .{ self.shared.fs, req, handle, lease }) catch {
@@ -2977,15 +3006,17 @@ threadlocal var current_group: ?*Group = null;
 /// 0003 §AB.3): the namespace and attribute class. The data class — READ,
 /// WRITE, the syncs, RELEASE (a close drains the file's write-back), a
 /// truncating SETATTR / OPEN / CREATE, FALLOCATE, COPY_FILE_RANGE, LSEEK,
-/// IOCTL, POLL, the locks, BMAP, the forgets (an eviction reclaims) — stays
+/// IOCTL, POLL, the locks, BMAP, the forgets (an eviction reclaims), and a
+/// no-open session's FLUSH (it carries RELEASE's drain, 0003 §AF) — stays
 /// on the CPU's handler lane: its handler waits on a data device through a
 /// completion that parks the calling THREAD (`sync/completion.zig`, 0003
 /// WP-C row 14), and on the worker that wait would stall the queue's ring.
-pub fn onWorkerLane(op: codec.Request) bool {
+pub fn onWorkerLane(op: codec.Request, no_open: bool) bool {
     const o_trunc: u32 = @bitCast(linux.O{ .TRUNC = true });
     return switch (op) {
         .lookup, .getattr, .readlink, .symlink, .mknod, .mkdir, .unlink, .rmdir, .rename, .rename2, .link => true,
-        .statfs, .access, .setxattr, .getxattr, .listxattr, .removexattr, .flush => true,
+        .statfs, .access, .setxattr, .getxattr, .listxattr, .removexattr => true,
+        .flush => !no_open,
         .opendir, .readdir, .readdirplus, .releasedir => true,
         .setattr => |s| s.valid & abi.FATTR_SIZE == 0,
         .open => |o| o.flags & o_trunc == 0,

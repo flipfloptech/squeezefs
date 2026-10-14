@@ -755,6 +755,21 @@ pub const Table = struct {
     }
 
     /// Every parked key of `ino` (fsync/release/truncate walks).
+    /// Whether any block of `ino` is parked (or uploading) — the no-open
+    /// FLUSH's try-only probe (decision 0003 §AF); O(1) on an empty table,
+    /// else the `blocksOf` scan under the spin lock.
+    pub fn holdsIno(self: *Table, ino: u64) bool {
+        // Monotonic suffices: a write's checkout increments under the lock
+        // before its ACK, and the probe's FLUSH reaches here after that ACK
+        // through the open table's stripe lock (`flushBegin`).
+        if (self.count.load(.monotonic) == 0) return false;
+        self.lock.lock();
+        defer self.lock.unlock();
+        var it = self.index.keyIterator();
+        while (it.next()) |k| if (k.ino == ino) return true;
+        return false;
+    }
+
     pub fn blocksOf(self: *Table, ino: u64, out: []u32) []u32 {
         self.lock.lock();
         defer self.lock.unlock();

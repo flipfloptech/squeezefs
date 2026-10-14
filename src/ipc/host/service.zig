@@ -737,7 +737,11 @@ pub const DataPlaneSink = struct {
         if (op.binding.durability == .sync) {
             self.fs.vtable.fsync(self.fs.impl, &ctx, .{ .ino = nodeid, .fh = 0, .datasync = false }) catch |e| return c.fail(errors.toErrno(e));
         }
-        self.opens.markDirty(nodeid);
+        self.opens.noteWrite(nodeid, clock.monotonicNs()) catch {
+            // The owed set could not grow (decision 0003 §AF): the drain
+            // no close may cover runs before the DONE.
+            self.fs.vtable.flush(self.fs.impl, &ctx, .{ .ino = nodeid, .fh = 0, .lock_owner = 0, .drain = true }) catch |e| return c.fail(errors.toErrno(e));
+        };
         stats.ipc_ops_write.inc();
         stats.ipc_bytes_in.add(written);
         c.complete(@intCast(written));

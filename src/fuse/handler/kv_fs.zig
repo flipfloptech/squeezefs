@@ -305,7 +305,7 @@ pub fn assertStore(comptime T: type) void {
 /// the product; `NoData` is the volume-less set).
 pub fn assertData(comptime T: type) void {
     comptime {
-        for ([_][]const u8{ "hasVolumes", "stagingOn", "blockSize", "inlineMax", "geometry", "refsSeam", "noteShape", "forgetShape", "isPassthrough", "canStoreHeld", "write", "read", "ownBlock", "abandonOwnBlock", "freeBindings", "flushCustody", "releaseIno", "fsync", "statfs", "mintFileId", "stageImage", "appendStaged", "releaseStaged", "stagedLease", "readMappingImage", "lockLayout", "stageKvmapShrink", "stageKvmapCorpse", "drainKvmapSweep", "publishForeign" }) |name| {
+        for ([_][]const u8{ "hasVolumes", "stagingOn", "blockSize", "inlineMax", "geometry", "refsSeam", "noteShape", "forgetShape", "isPassthrough", "canStoreHeld", "write", "read", "ownBlock", "abandonOwnBlock", "freeBindings", "flushCustody", "releaseIno", "hasWriteCustody", "fsync", "statfs", "mintFileId", "stageImage", "appendStaged", "releaseStaged", "stagedLease", "readMappingImage", "lockLayout", "stageKvmapShrink", "stageKvmapCorpse", "drainKvmapSweep", "publishForeign" }) |name| {
             if (!@hasDecl(T, name)) @compileError(@typeName(T) ++ " is not a kv_fs Data face: lacks `" ++ name ++ "`");
         }
     }
@@ -467,6 +467,10 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         /// From the INIT reply.
         minor: u32 = abi.FUSE_KERNEL_MINOR_VERSION,
         killpriv_v2: bool = false,
+        /// The no-open posture (decision 0003 §AF), from INIT: a CREATE's
+        /// reply leaves the kernel its FLUSH at every close, and FLUSH
+        /// carries the write-back drain.
+        no_open: bool = false,
         /// The mount identity (the virtual inodes' owner).
         uid: u32,
         gid: u32,
@@ -1187,8 +1191,10 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
 
         fn regularOpenFlags(self: *const Self) u32 {
             var f: u32 = abi.FOPEN_KEEP_CACHE;
-            // FOPEN_NOFLUSH: fuse ≥ 7.35; FOPEN_PARALLEL_DIRECT_WRITES: ≥ 7.38.
-            if (self.minor >= 35) f |= abi.FOPEN_NOFLUSH;
+            // FOPEN_NOFLUSH: fuse ≥ 7.35, the control arm only — a no-open
+            // CREATE's file gets no RELEASE once the connection latched,
+            // so its close's FLUSH is the drain. FOPEN_PARALLEL_DIRECT_WRITES: ≥ 7.38.
+            if (self.minor >= 35 and !self.no_open) f |= abi.FOPEN_NOFLUSH;
             if (self.minor >= 38) f |= abi.FOPEN_PARALLEL_DIRECT_WRITES;
             return f;
         }
@@ -1466,6 +1472,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         pub fn init(self: *Self, _: *Ctx, a: filesystem.InitArgs) Error!void {
             self.minor = a.minor;
             self.killpriv_v2 = a.has(abi.FUSE_HANDLE_KILLPRIV_V2);
+            self.no_open = a.no_open;
             // The directory-parent memo feeds the handover's subtree credit.
             if (@hasDecl(Store, "bindParentMemo")) self.store.bindParentMemo(.{ .ctx = self, .parentOf = parentMemoSeam });
             // The handover's step 0 drains the departing slot's parked stamps.
@@ -2603,6 +2610,10 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         /// non-striped file); else striped — promoting a resident payload
         /// to its own block DURABLY first.
         pub fn write(self: *Self, c: *Ctx, a: filesystem.WriteArgs) Error!filesystem.Written {
+            // A virtual inode is read-only: under no-open (decision 0003 §AF)
+            // no OPEN refuses a write-intent open, so the mutation is
+            // refused here — EACCES like every other virtual mutation.
+            if (virtual_inodes.isVirtualIno(a.ino)) return error.AccessDenied;
             const local = try localOf(a.ino);
             if (c.move) |m| if (m.write_landed) |wl| return self.shipSizeClaim(c, local, wl);
             const len: u64 = if (a.held) |h| h.src.len else a.data.len;
@@ -3060,8 +3071,25 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
 
         /// Nothing is deferred at the metadata plane: every write is a landed
         /// journal entry (or write-side custody that drains at RELEASE), so a
-        /// FLUSH has no latched error to carry.
-        pub fn flush(_: *Self, _: *Ctx, _: filesystem.FlushArgs) Error!void {}
+        /// FLUSH has no latched error to carry. The no-open posture's FLUSH
+        /// (`drain`) is the RELEASE drain itself (charter §6.2 "flush at
+        /// release" — the close the kernel still tells us about), and the
+        /// idle drain of an owed ino rides the same call.
+        pub fn flush(self: *Self, _: *Ctx, a: filesystem.FlushArgs) Error!void {
+            if (!a.drain or virtual_inodes.isVirtualIno(a.ino)) return;
+            const local = localOf(a.ino) catch return;
+            if (self.data.hasVolumes()) self.data.releaseIno(self.io, local);
+        }
+
+        /// The no-open FLUSH's try-only twin (decision 0003 §AF), on the
+        /// drain worker: success iff `flush` would land nothing — a virtual
+        /// inode, an inline-only set, an ino the data plane holds no write
+        /// custody for (`hasWriteCustody`: spin-locked sections only).
+        pub fn probe_flush(self: *Self, _: *Ctx, a: filesystem.FlushArgs) Error!void {
+            if (virtual_inodes.isVirtualIno(a.ino)) return;
+            const local = localOf(a.ino) catch return;
+            if (self.data.hasVolumes() and self.data.hasWriteCustody(local)) return error.WouldBlock;
+        }
 
         /// RELEASE: the write-back class drains (charter §6.2 "flush at
         /// release").
@@ -3530,6 +3558,9 @@ pub const NoData = struct {
     pub fn freeBindings(_: *NoData, _: Io, _: []const Mapping) void {}
     pub fn flushCustody(_: *NoData, _: Io, _: u64) void {}
     pub fn releaseIno(_: *NoData, _: Io, _: u64) void {}
+    pub fn hasWriteCustody(_: *NoData, _: u64) bool {
+        return false;
+    }
     /// A volume-less set has no wire: a foreign publish cannot ship.
     pub fn publishForeign(_: *NoData, _: Io, _: u64, _: Layout, _: []const layout.DmaProof) Error!void {
         return error.HolderUnreachable;
@@ -3903,6 +3934,11 @@ fn HarnessOf(comptime Data: type) type {
         const window_bytes = 8192;
 
         fn init(self: *Self) !void {
+            return self.initPosture(false);
+        }
+
+        /// `init` in the given open posture, INIT negotiated (minor 45).
+        fn initPosture(self: *Self, no_open: bool) !void {
             self.store = try MemStore.init(testing.allocator);
             self.data = .{};
             self.fs = try Fs.mount(testing.allocator, testing.io, &self.store, &self.data, .{ .dlm_stripes = 64 });
@@ -3911,7 +3947,8 @@ fn HarnessOf(comptime Data: type) type {
             self.guards = try op_guard.Table.init(testing.allocator, 64);
             self.opens = try open_table.OpenTable.init(testing.allocator, 64);
             self.unique = 2;
-            self.d = LoopDispatcher.init(&self.lb, .{ .fs = filesystem.Filesystem.of(Fs, &self.fs), .io = testing.io, .registry = &self.reg, .guards = &self.guards, .opens = &self.opens });
+            self.d = LoopDispatcher.init(&self.lb, .{ .fs = filesystem.Filesystem.of(Fs, &self.fs), .io = testing.io, .registry = &self.reg, .guards = &self.guards, .opens = &self.opens, .no_open = no_open });
+            if (no_open) try self.d.initFilesystem(abi.FUSE_HANDLE_KILLPRIV_V2, 45);
         }
 
         fn deinit(self: *Self) void {
@@ -4062,6 +4099,10 @@ const SettlingData = struct {
     /// `from` → `to`.
     merge: ?struct { ino: u64, size: u64, from: Mapping, to: Mapping } = null,
     flushes: u32 = 0,
+    /// The write-back custody a test arms (`hasWriteCustody`) and the
+    /// RELEASE-class drains that landed it (`releaseIno`).
+    custody_of: ?u64 = null,
+    write_back_drains: u32 = 0,
     /// The (3.7) balance observed inside the flush: a held lock there is
     /// the deadlock the plane's own merge would meet.
     locks_held_at_flush: u32 = 0,
@@ -4229,7 +4270,14 @@ const SettlingData = struct {
         self.publishStriped(ino, m.size, Layout.stripedInline(m.size, &prev_entries), m.to) catch unreachable;
         self.freeBindings(io, &.{m.from});
     }
-    pub fn releaseIno(_: *SettlingData, _: Io, _: u64) void {}
+    /// The write-back drain: the armed custody (`custody_of`) lands.
+    pub fn releaseIno(self: *SettlingData, _: Io, ino: u64) void {
+        self.write_back_drains += 1;
+        if (self.custody_of == ino) self.custody_of = null;
+    }
+    pub fn hasWriteCustody(self: *SettlingData, ino: u64) bool {
+        return self.custody_of == ino;
+    }
     pub fn publishForeign(_: *SettlingData, _: Io, _: u64, _: Layout, _: []const layout.DmaProof) Error!void {
         return error.HolderUnreachable;
     }
@@ -4863,6 +4911,59 @@ test "every layout-record RMW of the filesystem takes the data face's (3.7) layo
     try testing.expectEqual(@as(u32, 0), h.data.layout_lock_held);
     h.release(f);
     try testing.expectEqual(inv0, lock_order.lock_order_inversions.load());
+}
+
+test "no-open through the POSIX layer (decision 0003 §AF): INIT hands the posture down; a CREATE's reply leaves the kernel its FLUSH (no FOPEN_NOFLUSH — no RELEASE comes once the connection latched) where the control arm's sets it; OPEN answers ENOSYS; the worker's probe answers a FLUSH of a file without custody (and of a virtual inode) and declines one with custody; the lane's FLUSH lands the custody through the data plane's RELEASE drain and replies OK; an O_TRUNC open's SETATTR(size 0) truncates" {
+    const H = HarnessOf(SettlingData);
+    var ctl: H = undefined;
+    try ctl.initPosture(false);
+    defer ctl.deinit();
+    defer ctl.data.deinit();
+    try ctl.d.initFilesystem(abi.FUSE_HANDLE_KILLPRIV_V2, 45);
+    const cc = ctl.call(.{ .create = .{ .name = "f", .flags = 0, .mode = 0o644, .umask = 0, .open_flags = 0 } }, 1);
+    const ctl_open = abi.decodeExact(abi.fuse_open_out, cc.outBytes()[@sizeOf(abi.fuse_entry_out)..]).?;
+    try testing.expect(ctl_open.open_flags & abi.FOPEN_NOFLUSH != 0);
+
+    var h: H = undefined;
+    try h.initPosture(true);
+    defer h.deinit();
+    defer h.data.deinit();
+    h.data.store = &h.store;
+    try testing.expect(h.fs.no_open);
+    const c = h.call(.{ .create = .{ .name = "f", .flags = 0, .mode = 0o644, .umask = 0, .open_flags = 0 } }, 1);
+    try testing.expectEqual(@as(?linux.E, null), c.errno());
+    const oo = abi.decodeExact(abi.fuse_open_out, c.outBytes()[@sizeOf(abi.fuse_entry_out)..]).?;
+    try testing.expectEqual(@as(u32, 0), oo.open_flags & abi.FOPEN_NOFLUSH);
+    try testing.expect(oo.open_flags & abi.FOPEN_KEEP_CACHE != 0);
+    const f = (abi.decodePrefix(abi.fuse_entry_out, c.outBytes()) orelse return error.TestBadReply).nodeid;
+    try testing.expectEqual(@as(u32, 0), h.opens.get(f).?.count);
+    try testing.expectEqual(linux.E.NOSYS, h.call(.{ .open = .{ .flags = 0, .open_flags = 0 } }, f).errno().?);
+    try testing.expectEqual(@as(?linux.E, null), h.write(f, 0, "hello", 0).errno());
+    // No custody: the worker's probe answers; the plane is never drained.
+    var out: codec.OutBuf = undefined;
+    const fl = codec.Request{ .flush = .{ .fh = 0, .lock_owner = 0 } };
+    const meta: lifecycle.Meta = .{ .unique = 100, .nodeid = f, .uid = 1000, .gid = 1000, .pid = 7 };
+    try testing.expect(h.d.probeMeta(fl, meta, &out) != null);
+    try testing.expectEqual(@as(u32, 0), h.data.write_back_drains);
+    // Custody: the probe declines, the lane's FLUSH drains, then OK.
+    h.data.custody_of = try H.Fs.localOf(f);
+    try testing.expect(h.d.probeMeta(fl, meta, &out) == null);
+    try testing.expectEqual(@as(?linux.E, null), h.call(fl, f).errno());
+    try testing.expectEqual(@as(u32, 1), h.data.write_back_drains);
+    try testing.expectEqual(@as(?u64, null), h.data.custody_of);
+    try testing.expect(h.d.probeMeta(fl, meta, &out) != null);
+    // A virtual inode's close: answered by the probe (no custody, ever);
+    // a write through a write-intent open no OPEN refused is EACCES.
+    var vmeta = meta;
+    vmeta.nodeid = virtual_inodes.GEN_INO_FIRST;
+    try testing.expect(h.d.probeMeta(fl, vmeta, &out) != null);
+    try testing.expectEqual(linux.E.ACCES, h.write(virtual_inodes.GEN_INO_FIRST, 0, "x", 0).errno().?);
+    // The O_TRUNC open's SETATTR(size 0): the bytes go.
+    var in = abi.zeroed(abi.fuse_setattr_in);
+    in.valid = abi.FATTR_SIZE;
+    in.size = 0;
+    try testing.expectEqual(@as(?linux.E, null), h.setattr(f, in).errno());
+    try testing.expectEqual(@as(u64, 0), (try h.getattr(f)).size);
 }
 
 // The level-1 taker list says "SETATTR iff size" — and the O_TRUNC open IS a

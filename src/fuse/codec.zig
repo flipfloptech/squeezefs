@@ -870,6 +870,10 @@ pub const InitWants = struct {
     handle_killpriv_v2: bool = true,
     /// Answer plain READDIR with ENOSYS so every listing is READDIRPLUS.
     force_readdirplus: bool = false,
+    /// `FUSE_ATOMIC_O_TRUNC` (echoed iff offered): the truncate rides the
+    /// OPEN. A no-open session (decision 0003 §AF) sends no OPEN, so it
+    /// drops the bit and the kernel sends the O_TRUNC open's SETATTR(size 0).
+    atomic_o_trunc: bool = true,
     /// The kernel's request timeout, seconds (`geometry.requestTimeoutS`,
     /// decision 0003 §Z): sent with FUSE_REQUEST_TIMEOUT iff the kernel
     /// offers it; 0 asks for none (and so for no FUSE_SYNCFS either).
@@ -877,7 +881,7 @@ pub const InitWants = struct {
 };
 
 /// Echoed iff offered, unconditionally.
-const echo_if_offered: u64 = abi.FUSE_ASYNC_READ | abi.FUSE_FILE_OPS | abi.FUSE_ATOMIC_O_TRUNC | abi.FUSE_BIG_WRITES |
+const echo_if_offered: u64 = abi.FUSE_ASYNC_READ | abi.FUSE_FILE_OPS | abi.FUSE_BIG_WRITES |
     abi.FUSE_HAS_IOCTL_DIR | abi.FUSE_ASYNC_DIO | abi.FUSE_PARALLEL_DIROPS |
     abi.FUSE_MAX_PAGES | abi.FUSE_CACHE_SYMLINKS | abi.FUSE_DO_READDIRPLUS;
 
@@ -956,6 +960,7 @@ pub fn buildInitReply(in: abi.fuse_init_in, p: geometry.Plan, wants: InitWants) 
     var want: u64 = echo_if_offered;
     if (wants.export_support) want |= abi.FUSE_EXPORT_SUPPORT;
     if (wants.dont_mask) want |= abi.FUSE_DONT_MASK;
+    if (wants.atomic_o_trunc) want |= abi.FUSE_ATOMIC_O_TRUNC;
     if (wants.writeback_cache) want |= abi.FUSE_WRITEBACK_CACHE;
     if (wants.no_open_support) want |= abi.FUSE_NO_OPEN_SUPPORT;
     if (wants.no_opendir_support) want |= abi.FUSE_NO_OPENDIR_SUPPORT;
@@ -1801,6 +1806,19 @@ test "INIT reply option gates: KILLPRIV_V2 iff offered ∧ wanted (v1 never ride
     try testing.expect(opts.has(abi.FUSE_EXPORT_SUPPORT));
     try testing.expect(opts.has(abi.FUSE_DO_READDIRPLUS));
     try testing.expect(!opts.has(abi.FUSE_READDIRPLUS_AUTO));
+}
+
+test "INIT reply carries FUSE_ATOMIC_O_TRUNC iff offered and wanted: a no-open session (decision 0003 §AF) drops it — with it the kernel's `fuse_setattr` skips the ATTR_OPEN truncate (\"done by OPEN\") and no OPEN is sent, so an O_TRUNC open would truncate nothing" {
+    const offer = kernel_6_14_offer | abi.FUSE_ATOMIC_O_TRUNC;
+    const control = try buildInitReply(initIn(45, offer), test_plan, .{});
+    try testing.expect(control.has(abi.FUSE_ATOMIC_O_TRUNC));
+    const no_open = try buildInitReply(initIn(45, offer), test_plan, .{ .atomic_o_trunc = false });
+    try testing.expect(!no_open.has(abi.FUSE_ATOMIC_O_TRUNC));
+    try testing.expectEqual(@as(u32, 0), no_open.out.flags & abi.flagsOf(abi.FUSE_ATOMIC_O_TRUNC));
+    // Everything else the control arm echoes still rides.
+    try testing.expectEqual(control.negotiated & ~abi.FUSE_ATOMIC_O_TRUNC, no_open.negotiated);
+    const unoffered = try buildInitReply(initIn(45, offer & ~abi.FUSE_ATOMIC_O_TRUNC), test_plan, .{});
+    try testing.expect(!unoffered.has(abi.FUSE_ATOMIC_O_TRUNC));
 }
 
 test "INIT reply minor law over the whole shape space: min(kernel, 36); INIT_EXT needs offered ∧ minor ≥ 36; an unknown major or a pre-7.23 minor refuses" {

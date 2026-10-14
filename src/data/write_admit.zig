@@ -1287,6 +1287,15 @@ pub const WritePath = struct {
         return folded;
     }
 
+    /// Whether `ino` holds any custody `flushIno` lands — a parked block (a
+    /// W2 extent among them, an upload in flight), an overlay record, a
+    /// rewrite epoch open or saving: the no-open FLUSH's try-only probe
+    /// (decision 0003 §AF). Spin-locked O(1)-or-scan sections only — never
+    /// a device wait, a park, or a lock held across I/O.
+    pub fn holdsCustody(self: *WritePath, ino: u64) bool {
+        return self.table.holdsIno(ino) or self.overlay.registry.holdsIno(ino) or self.epochs.holds(ino);
+    }
+
     /// RELEASE / unmount: every parked block of `ino` flushes durably, the
     /// overlay drains (write-back class), the epoch closes.
     pub fn flushIno(self: *WritePath, io: Io, ino: u64) void {
@@ -1904,6 +1913,35 @@ test "fsync through the write path: a parked block, an open overlay and a shadow
     try testing.expect(std.mem.allEqual(u8, got[wt.BS / 2 ..], 0xAA));
     try testing.expect(w.f.dev.flushes.items.len >= 1);
     try testing.expectEqual(unpub0, counters.tripwireCount("overlay_unpublished_at_fsync"));
+}
+
+test "the no-open FLUSH's try-only probe (decision 0003 §AF): `holdsCustody` is true exactly while `flushIno` has something to land — a parked partial block, an open overlay record, an epoch the overlay fed — for that ino alone; after the drain every arm reads false" {
+    const io = testing.io;
+    const w = try World.init(testing.allocator, .sync_inline, true);
+    defer w.deinit(testing.allocator);
+    try testing.expect(!w.wp.holdsCustody(30));
+    _ = try w.f.publishBlock(30, 0, 0xAA);
+    _ = try w.f.publishBlock(31, 0, 0xBB);
+    try testing.expect(!w.wp.holdsCustody(30));
+    // An overwrite half-block: an open overlay record (no parked block).
+    var half: [wt.BS / 2]u8 align(4096) = @splat(0x30);
+    _ = try w.wp.write(io, .{ .ino = 31, .offset = 0, .payload = .{ .bytes = &half }, .class = .shared, .file = World.striped(wt.BS) });
+    try testing.expect(w.wp.overlay.anyOpenFast());
+    try testing.expectEqual(@as(u32, 0), w.wp.table.parkedCount());
+    try testing.expect(w.wp.holdsCustody(31));
+    try testing.expect(!w.wp.holdsCustody(30));
+    // A fresh partial block parks.
+    var tail: [1000]u8 = @splat(0x31);
+    _ = try w.wp.write(io, .{ .ino = 30, .offset = 2 * wt.BS, .payload = .{ .bytes = &tail }, .class = .entire_op, .file = World.striped(wt.BS) });
+    try testing.expect(w.wp.table.has(30, 2));
+    try testing.expect(w.wp.holdsCustody(30));
+    w.wp.flushIno(io, 30);
+    try testing.expect(!w.wp.holdsCustody(30));
+    try testing.expect(w.wp.holdsCustody(31));
+    w.wp.flushIno(io, 31);
+    try testing.expect(!w.wp.holdsCustody(31));
+    try testing.expect(!w.wp.overlay.anyOpenFast());
+    try testing.expectEqual(@as(usize, 0), w.wp.epochs.openCount());
 }
 
 test "the lost overwrite (2026-10-07, the smoke's dd-per-overwrite shape): a write landing on a block the OPEN epoch shadows takes the accumulation arm with the epoch's B as its base, never the map's stale A; after the save, the next flush seeds from B and its save displaces exactly what it parked — every acked byte readable, drift 0, nothing freed twice" {

@@ -513,6 +513,19 @@ pub const Registry = struct {
         while (it.next()) |k| out.appendAssumeCapacity(k.ino);
     }
 
+    /// Whether `ino` holds a live record — the no-open FLUSH's try-only
+    /// probe (decision 0003 §AF); O(1) with nothing open (the install's
+    /// increment precedes its ACK, the probe follows that ACK through the
+    /// open table's stripe lock), else one scan under the spin lock.
+    pub fn holdsIno(self: *Registry, ino: u64) bool {
+        if (!self.anyOpenFast()) return false;
+        self.lock.lock();
+        defer self.lock.unlock();
+        var it = self.index.keyIterator();
+        while (it.next()) |k| if (k.ino == ino) return true;
+        return false;
+    }
+
     /// Every live record of `ino` (for fsync / release / truncate drains).
     pub fn blocksOf(self: *Registry, ino: u64, out: []u32) []u32 {
         self.lock.lock();

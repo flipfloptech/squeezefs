@@ -1785,6 +1785,60 @@ test "stale_inflight_upload_never_publishes_and_newest_bytes_win: a write landin
     w.f.dev.hook = null;
 }
 
+test "the device-write ledger closes on a superseded upload (decision 0003 §AK.6): `write_through_bytes + write_pipeline_superseded_bytes` ≡ the bytes the DMAs landed — a transformed image shorter than the block counts its stored length on both arms, the abandoned DMA's included (the perf container's aes-256-gcm close rows read 1.3–8.7 MB of diskstats no arm named: one block per supersession counted, an image landed)" {
+    const io = testing.io;
+    const w = try UploadWorld.init(testing.allocator);
+    defer w.deinit(testing.allocator);
+    try w.f.map.create(7, .striped, 0);
+    const e = w.table.checkout(7, 0, false, null).?;
+    var first: [wt.BS]u8 = @splat(0x01);
+    var second: [wt.BS]u8 = @splat(0x02);
+    _ = try w.table.recordWrite(e, 0, &first);
+    // A compressing transform's shape: a one-page image built in the scratch.
+    const PageSeam = struct {
+        fn processWrite(_: ?*anyopaque, _: u64, plain: []const u8, scratch: []u8) anyerror![]const u8 {
+            @memcpy(scratch[0..PAGE], plain[0..PAGE]);
+            return scratch[0..PAGE];
+        }
+        fn scratchLen(_: ?*anyopaque, _: u64) usize {
+            return wt.BS;
+        }
+    };
+    var pool = try transform.ScratchPool.init(testing.allocator, 1, wt.BS);
+    defer pool.deinit(testing.allocator);
+    var deps = w.deps();
+    deps.transform = .{ .ctx = null, .process_write = &PageSeam.processWrite, .scratch_len = &PageSeam.scratchLen };
+    deps.scratch = &pool;
+    // A sibling write lands during the first upload's DMA: superseded, re-driven.
+    const Racer = struct {
+        var tbl: *Table = undefined;
+        var newest: []const u8 = undefined;
+        var fired: bool = false;
+        fn hook(_: *anyopaque, _: *wt.FakeDevice, _: u64, _: u64, _: u64) void {
+            if (fired) return;
+            fired = true;
+            _ = tbl.recordWrite(tbl.get(7, 0).?, 0, newest) catch unreachable;
+        }
+    };
+    Racer.tbl = &w.table;
+    Racer.newest = &second;
+    Racer.fired = false;
+    var dummy: u8 = 0;
+    w.f.dev.hook = .{ .ctx = &dummy, .call = &Racer.hook };
+    defer w.f.dev.hook = null;
+    w.f.dev.resetLedger();
+    const sup0 = pipeline.stats.write_pipeline_supersessions.load();
+    const wt0 = stats.write_through_bytes.load();
+    const sb0 = pipeline.stats.write_pipeline_superseded_bytes.load();
+    var prof = pipeline.Prof.start();
+    try testing.expectEqual(Disposition.published, uploadParkedBlock(&w.table, deps, io, 7, 0, &prof));
+    prof.finish();
+    try testing.expectEqual(sup0 + 1, pipeline.stats.write_pipeline_supersessions.load());
+    try testing.expectEqual(@as(u64, 2 * PAGE), w.f.dev.writeBytesTotal());
+    try testing.expectEqual(@as(u64, PAGE), stats.write_through_bytes.load() - wt0);
+    try testing.expectEqual(@as(u64, PAGE), pipeline.stats.write_pipeline_superseded_bytes.load() - sb0);
+}
+
 test "the overwrite write-through FEEDS the rewrite epoch (no per-block merge); a full-coverage feed closes the epoch; ENOSPC early-close frees parked supply and the upload lands; a fenced merge is a counted fence drop freeing nothing" {
     const io = testing.io;
     const w = try UploadWorld.init(testing.allocator);

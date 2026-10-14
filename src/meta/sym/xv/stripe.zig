@@ -768,37 +768,62 @@ pub const DirView = struct {
 
 /// The five shapes over ONE dentry walk: `dirs` = every directory with a
 /// NUL-led name (the nomination), `records` = the inode census (an ino
-/// → present), `names_of(stripe)` the stripes' own names.
+/// → present), `names_of(stripe)` the stripes' own names. The routing check
+/// indexes every decoded map's stripes once and looks each view up in it
+/// (decision 0003 §AC.6: `route_steps` ≤ the maps' stripes + the views +
+/// the routed names, sorting aside — where a scan per striped directory
+/// walked every view's place in its map).
 pub fn verifyStripes(gpa: Allocator, views: []const DirView, hasRecord: *const fn (ino: u64) bool, name_key: *const key.NameKey, out: *std.ArrayList(Finding), route_steps: *u64) Allocator.Error!void {
     var mapped: std.AutoHashMapUnmanaged(u64, u64) = .empty;
     defer mapped.deinit(gpa);
+    // One stripe of one decoded map: `map` orders the maps, `i` the stripe's
+    // place (a map naming one ino twice routes it by its LAST place).
+    const Place = struct { stripe: u64, map: u32, i: u8, k: u8 };
+    var routes: std.ArrayList(Place) = .empty;
+    defer routes.deinit(gpa);
+    var maps: u32 = 0;
     for (views) |v| {
         if (v.markers.len == 0) continue;
         const map = decodeMap(v.dir, v.markers) orelse {
             try out.append(gpa, .{ .shape = .incomplete_map, .dir = v.dir, .ino = v.dir });
             continue;
         };
-        for (map.slice()) |s| {
+        const map_id = maps;
+        maps += 1;
+        for (map.slice(), 0..) |s, i| {
             if (!hasRecord(s)) try out.append(gpa, .{ .shape = .missing_stripe, .dir = v.dir, .ino = s });
             const gop = try mapped.getOrPut(gpa, s);
             if (gop.found_existing and gop.value_ptr.* != v.dir) {
                 try out.append(gpa, .{ .shape = .multiply_mapped, .dir = v.dir, .ino = s });
             } else gop.value_ptr.* = v.dir;
+            route_steps.* += 1;
+            try routes.append(gpa, .{ .stripe = s, .map = map_id, .i = @intCast(i), .k = map.k });
         }
         if (!map.migrating) {
             for (v.names) |nm| try out.append(gpa, .{ .shape = .unmigrated_name, .dir = v.dir, .ino = nm.child });
         }
-        // Every stripe's names route to it.
-        for (views) |sv| {
-            var idx: ?u8 = null;
-            for (map.slice(), 0..) |s, i| {
-                route_steps.* += 1;
-                if (s == sv.dir) idx = @intCast(i);
+    }
+    std.mem.sort(Place, routes.items, {}, struct {
+        fn lt(_: void, a: Place, b: Place) bool {
+            if (a.stripe != b.stripe) return a.stripe < b.stripe;
+            if (a.map != b.map) return a.map < b.map;
+            return a.i < b.i;
+        }
+    }.lt);
+    // Every stripe's names route to it.
+    for (views) |sv| {
+        route_steps.* += 1;
+        var at = std.sort.lowerBound(Place, routes.items, sv.dir, struct {
+            fn order(ctx: u64, r: Place) std.math.Order {
+                return std.math.order(ctx, r.stripe);
             }
-            const i = idx orelse continue;
+        }.order);
+        while (at < routes.items.len and routes.items[at].stripe == sv.dir) : (at += 1) {
+            const r = routes.items[at];
+            if (at + 1 < routes.items.len and routes.items[at + 1].stripe == r.stripe and routes.items[at + 1].map == r.map) continue;
             for (sv.names) |nm| {
                 route_steps.* += 1;
-                if (stripeOf(key.dentryNameHash54(nm.name, name_key), map.k) != i) try out.append(gpa, .{ .shape = .misrouted_name, .dir = sv.dir, .ino = nm.child });
+                if (stripeOf(key.dentryNameHash54(nm.name, name_key), r.k) != r.i) try out.append(gpa, .{ .shape = .misrouted_name, .dir = sv.dir, .ino = nm.child });
             }
         }
     }

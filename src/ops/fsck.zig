@@ -14,7 +14,7 @@
 //!
 //! The classes WRAP the oracles the earlier rungs landed and duplicate none
 //! of them: C8/C3 `data/block_refs.verifyRefs/confirm/repairPlan`, C11
-//! `data/kvmap.verifyBlockMap/nextOwner`, C2/C6 `data/block_alloc`'s fsck
+//! `data/kvmap.verifyBlockMap` (its owners off one paged walk), C2/C6 `data/block_alloc`'s fsck
 //! seams + `sym_planes/data_bitmap.verifyBitmap`, C16 `shared_index.
 //! sharedIndexDrift`, C17 `xv/stripe.verifyStripes`, C14 `slots/lease_table.
 //! liveOnTwoPages`, C13/C15 the membership recovery's arms. The modules:

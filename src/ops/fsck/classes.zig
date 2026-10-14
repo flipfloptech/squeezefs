@@ -362,6 +362,10 @@ pub const Pass = struct {
     fresh: Fresh = .{},
     /// Candidates past the ceiling (deferred loudly).
     ceiling: u64,
+    /// C9's index of the census's owners: key ino → the bindings its
+    /// layout names (built at the first candidate: one pass over the
+    /// owners, one probe per candidate — 0003 §AC.6).
+    owner_blocks: ?std.AutoHashMapUnmanaged(u64, u32) = null,
 
     pub const Fresh = struct {
         cen: ?census.Census = null,
@@ -372,6 +376,10 @@ pub const Pass = struct {
         c13: ?[]Finding = null,
         c16: std.AutoHashMapUnmanaged(u64, shared_index.Drift) = .empty,
         c17: ?[]stripe.Finding = null,
+        /// C10's index of the fresh pass's collected names: child → its
+        /// distinct `(parent, suffix)` identities (built at the first
+        /// re-check: one pass over the names, one probe per candidate).
+        name_counts: ?std.AutoHashMapUnmanaged(u64, u32) = null,
     };
 
     pub fn deinit(self: *Pass) void {
@@ -390,6 +398,8 @@ pub const Pass = struct {
         self.fresh.c16.deinit(gpa);
         if (self.fresh.c13) |l| gpa.free(l);
         if (self.fresh.c17) |l| gpa.free(l);
+        if (self.fresh.name_counts) |*m| m.deinit(gpa);
+        if (self.owner_blocks) |*m| m.deinit(gpa);
         self.arena.deinit();
         self.* = undefined;
     }
@@ -623,10 +633,14 @@ pub const Pass = struct {
 
     // ---- C2 / C3 / C6: the allocator vs the census ----
 
+    /// One block's derived references and its FIRST owner in census order
+    /// (C2-lost names it: indexed with the count, never a scan per block).
+    const Derived = struct { count: u32, ino: u64, block_index: u32 };
+
     /// Derived references per block of one volume (owners' bindings).
-    fn derivedCounts(self: *Pass, cen: *const census.Census, vol_tag: u64, out: *std.AutoHashMapUnmanaged(u64, u32)) Allocator.Error!void {
+    fn derivedCounts(self: *Pass, cen: *const census.Census, vol_tag: u64, out: *std.AutoHashMapUnmanaged(u64, Derived)) Allocator.Error!void {
         for (cen.owners.items) |o| for (o.bindings) |b| if (b.vol_tag == vol_tag) {
-            (try out.getOrPutValue(self.gpa, b.block_idx, 0)).value_ptr.* += 1;
+            (try out.getOrPutValue(self.gpa, b.block_idx, .{ .count = 0, .ino = o.ino, .block_index = b.block_index })).value_ptr.count += 1;
         };
     }
 
@@ -648,7 +662,7 @@ pub const Pass = struct {
         const sharded = host.residue() or !counts_complete;
         if (!counts_complete) self.counters.alloc_census_declined += 1;
         for (host.volumes) |v| {
-            var derived: std.AutoHashMapUnmanaged(u64, u32) = .empty;
+            var derived: std.AutoHashMapUnmanaged(u64, Derived) = .empty;
             defer derived.deinit(gpa);
             try self.derivedCounts(&self.cen, v.vol_tag, &derived);
             const cap = v.alloc.capacityBlocks();
@@ -670,7 +684,7 @@ pub const Pass = struct {
                     self.counters.refcounts_checked += 1;
                     if (!sharded) {
                         const rc = v.alloc.refcount(idx).?;
-                        if (rc != e.value_ptr.*) try self.suspect(.{ .c3_refcount = .{ .vol_tag = v.vol_tag, .block_idx = idx, .expected = e.value_ptr.*, .actual = rc } });
+                        if (rc != e.value_ptr.count) try self.suspect(.{ .c3_refcount = .{ .vol_tag = v.vol_tag, .block_idx = idx, .expected = e.value_ptr.count, .actual = rc } });
                     }
                     continue;
                 }
@@ -678,8 +692,8 @@ pub const Pass = struct {
                     self.counters.alloc_bitmap_tracked_exempted += 1;
                     continue;
                 };
-                const owner = firstOwner(&self.cen, v.vol_tag, idx, &self.counters.c2_owner_steps);
-                try self.suspect(.{ .c2_lost = .{ .vol_tag = v.vol_tag, .block_idx = idx, .ino = owner.ino, .block_index = owner.block_index, .unrepairable_shape = out_of_range } });
+                self.counters.c2_owner_steps += 1;
+                try self.suspect(.{ .c2_lost = .{ .vol_tag = v.vol_tag, .block_idx = idx, .ino = e.value_ptr.ino, .block_index = e.value_ptr.block_index, .unrepairable_shape = out_of_range } });
             }
             // Leaked: tracked with zero referencers (allocator truth is
             // mount-session RAM — meaningless on a shard).
@@ -700,7 +714,7 @@ pub const Pass = struct {
     /// C6's two arms: the bitmap oracle on a grant-armed holder (LOSS =
     /// referenced ∧ clear is the finding; LEAK counted), else the flat
     /// arithmetic `used = highest − free − inflight − graced` vs tracked.
-    fn c6(self: *Pass, v: Volume, derived: *const std.AutoHashMapUnmanaged(u64, u32)) Error!void {
+    fn c6(self: *Pass, v: Volume, derived: *const std.AutoHashMapUnmanaged(u64, Derived)) Error!void {
         const gpa = self.gpa;
         if (v.bitmap) |bm| {
             const words = bm.alloc.bitmapWords().len;
@@ -816,15 +830,23 @@ pub const Pass = struct {
         const calls0 = if (host.store.tally) |t| t.calls else 0;
         defer self.counters.c11_store_calls += (if (host.store.tally) |t| t.calls else 0) - calls0;
         const ms = host.store.mapStore();
-        // (a) + (c): the owner skip-scan.
-        var from: u64 = 0;
+        // (a) + (c): every owner of the map kind off ONE paged walk (0003
+        // §AC.6: a page per SCAN_PAGE entries — a merged store returns
+        // every ino-major kind inside the bounds and the pager filters —
+        // where a probe per ino descended once per inode); an owner's
+        // further records in the walk are skipped.
+        var pager = census.KindPager.init(host.store, gpa, key.TREE_BLOCK_MAP, 0);
+        defer pager.deinit();
+        var last: ?u64 = null;
         while (true) {
             if (host.cancelled()) return;
-            const owner = (kvmap.nextOwner(ms, gpa, from) catch |e| switch (e) {
+            const kv = (pager.next() catch |e| switch (e) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => break,
             }) orelse break;
-            from = owner + 1;
+            const owner = std.mem.readInt(u64, kv.key[0..8], .big);
+            if (last == owner) continue;
+            last = owner;
             if (host.crossings) |c| if (c.inFlight(c.ctx, owner)) {
                 self.counters.crossing_exempted += 1;
                 continue;
@@ -835,7 +857,6 @@ pub const Pass = struct {
             };
             if (!(try self.liveKvmapHead(owner))) try self.suspect(.{ .c11_orphan_map_records = .{ .ino = owner, .records = rep.records } });
             if (rep.run_foreign_shadows != 0) try self.suspect(.{ .c11_run_foreign_shadow = .{ .ino = owner, .shadows = rep.run_foreign_shadows } });
-            if (owner == std.math.maxInt(u64)) break;
         }
         // (b): the census's nominees.
         for (self.cen.kvmap_nominees.items) |ino| {
@@ -1027,12 +1048,9 @@ pub const Pass = struct {
                     p.counters.unreferenced_intent_exempted += 1;
                     return true;
                 };
-                const blocks: u32 = blk: {
-                    for (p.cen.owners.items) |o| {
-                        p.counters.c9_owner_steps += 1;
-                        if (o.ino == census.keyInoOf(sl)) break :blk @intCast(o.bindings.len);
-                    }
-                    break :blk 0;
+                const blocks = p.ownerBlocks(census.keyInoOf(sl)) catch |e| {
+                    ctx.err = e;
+                    return false;
                 };
                 log.debug("fsck C9 candidate: ino {d} (slot {d}, raw {d}) live, prior-era, absent from the referenced set", .{ global, sl.slot, sl.raw });
                 p.suspect(.{ .c9_unreferenced = .{ .ino = global, .blocks = blocks } }) catch |e| {
@@ -1045,6 +1063,24 @@ pub const Pass = struct {
         var v: V = .{ .pass = self };
         self.cen.live.eachAbsentFrom(&self.dentries.referenced, &v, V.visit);
         if (v.err) |e| return e;
+    }
+
+    /// The bindings the census's owner `key_ino` names (0 = no owner):
+    /// the index is built at the first call — the FIRST owner of an ino
+    /// in census order wins, as the scan it replaces answered.
+    fn ownerBlocks(self: *Pass, key_ino: u64) Allocator.Error!u32 {
+        if (self.owner_blocks == null) {
+            var m: std.AutoHashMapUnmanaged(u64, u32) = .empty;
+            errdefer m.deinit(self.gpa);
+            for (self.cen.owners.items) |o| {
+                self.counters.c9_owner_steps += 1;
+                const gop = try m.getOrPut(self.gpa, o.ino);
+                if (!gop.found_existing) gop.value_ptr.* = @intCast(o.bindings.len);
+            }
+            self.owner_blocks = m;
+        }
+        self.counters.c9_owner_steps += 1;
+        return self.owner_blocks.?.get(key_ino) orelse 0;
     }
 
     // ---- C10: nlink / name consistency ----
@@ -1289,7 +1325,7 @@ pub const Pass = struct {
                 const v = host.volume(f.vol_tag) orelse return false;
                 if (v.alloc.refcount(f.block_idx) == null) return false;
                 const c = try self.freshCensus();
-                var derived: std.AutoHashMapUnmanaged(u64, u32) = .empty;
+                var derived: std.AutoHashMapUnmanaged(u64, Derived) = .empty;
                 defer derived.deinit(gpa);
                 try self.derivedCounts(c, f.vol_tag, &derived);
                 return !derived.contains(f.block_idx);
@@ -1306,10 +1342,10 @@ pub const Pass = struct {
                 const v = host.volume(f.vol_tag) orelse return false;
                 const rc = v.alloc.refcount(f.block_idx) orelse return false;
                 const c = try self.freshCensus();
-                var derived: std.AutoHashMapUnmanaged(u64, u32) = .empty;
+                var derived: std.AutoHashMapUnmanaged(u64, Derived) = .empty;
                 defer derived.deinit(gpa);
                 try self.derivedCounts(c, f.vol_tag, &derived);
-                const n = derived.get(f.block_idx) orelse return false;
+                const n = (derived.get(f.block_idx) orelse return false).count;
                 return n > 0 and rc != n;
             },
             .c4_orphan => |f| {
@@ -1328,7 +1364,7 @@ pub const Pass = struct {
             .c6_drift => |f| {
                 const v = host.volume(f.vol_tag) orelse return false;
                 const c = try self.freshCensus();
-                var derived: std.AutoHashMapUnmanaged(u64, u32) = .empty;
+                var derived: std.AutoHashMapUnmanaged(u64, Derived) = .empty;
                 defer derived.deinit(gpa);
                 try self.derivedCounts(c, f.vol_tag, &derived);
                 const before = self.suspects.items.len;
@@ -1506,7 +1542,7 @@ pub const Pass = struct {
             self.counters.nlink_transient_cleared += 1;
             return false;
         }
-        const names = dedupedNames(d, global, &self.counters.c10_name_steps);
+        const names = try self.dedupedNames(d, global);
         if (names == 0) return false; // C9's
         if (after.nlink == names) {
             self.counters.nlink_transient_cleared += 1;
@@ -1518,6 +1554,29 @@ pub const Pass = struct {
             .c10_zero_nlink_named => after.nlink == 0,
             else => unreachable,
         };
+    }
+
+    /// The deduped `(parent, name)` identities the fresh pass collected for
+    /// `global` (records may only NOMINATE; a VL5b migration mid-copy has one
+    /// dentry on two volumes): one pass over the names at the first call
+    /// indexes every child, then one probe per candidate.
+    fn dedupedNames(self: *Pass, d: *const census.DentryPass, global: u64) Allocator.Error!u32 {
+        const gpa = self.gpa;
+        if (self.fresh.name_counts == null) {
+            const Identity = struct { child: u64, parent: u64, suffix: u64 };
+            var seen: std.AutoHashMapUnmanaged(Identity, void) = .empty;
+            defer seen.deinit(gpa);
+            var m: std.AutoHashMapUnmanaged(u64, u32) = .empty;
+            errdefer m.deinit(gpa);
+            for (d.names.items) |a| {
+                self.counters.c10_name_steps += 1;
+                if ((try seen.getOrPut(gpa, .{ .child = a.child, .parent = a.parent, .suffix = a.suffix })).found_existing) continue;
+                (try m.getOrPutValue(gpa, a.child, 0)).value_ptr.* += 1;
+            }
+            self.fresh.name_counts = m;
+        }
+        self.counters.c10_name_steps += 1;
+        return self.fresh.name_counts.?.get(global) orelse 0;
     }
 
     /// Is `(ino, block_index)` still bound to `(vol_tag, block_idx)` in the
@@ -1594,24 +1653,6 @@ pub const Pass = struct {
 /// Whole milliseconds between two monotonic readings (a pass's report row).
 pub fn msBetween(t0: u64, t1: u64) u64 {
     return (t1 -| t0) / std.time.ns_per_ms;
-}
-
-/// The deduped `(parent, name)` identities the fresh pass collected for
-/// `global` (records may only NOMINATE; a VL5b migration mid-copy has one
-/// dentry on two volumes).
-fn dedupedNames(d: *const census.DentryPass, global: u64, steps: *u64) u32 {
-    var n: u32 = 0;
-    for (d.names.items, 0..) |a, i| {
-        steps.* += 1;
-        if (a.child != global) continue;
-        var dup = false;
-        for (d.names.items[0..i]) |b| {
-            steps.* += 1;
-            if (b.child == global and b.parent == a.parent and b.suffix == a.suffix) dup = true;
-        }
-        if (!dup) n += 1;
-    }
-    return n;
 }
 
 /// The schema of one record by its kind (`record_schema_violation`).
@@ -1719,14 +1760,6 @@ pub fn confirmCrossMember(gpa: Allocator, first: []const Finding, second: []cons
         };
         if (stands) try out.append(gpa, f) else counters.suspects_cleared += 1;
     }
-}
-
-fn firstOwner(cen: *const census.Census, vol_tag: u64, block_idx: u64, steps: *u64) struct { ino: u64, block_index: u32 } {
-    for (cen.owners.items) |o| for (o.bindings) |b| {
-        steps.* += 1;
-        if (b.vol_tag == vol_tag and b.block_idx == block_idx) return .{ .ino = o.ino, .block_index = b.block_index };
-    };
-    return .{ .ino = 0, .block_index = 0 };
 }
 
 /// A raw window of a layout record (the C12 Overrun arm's tolerant reader).

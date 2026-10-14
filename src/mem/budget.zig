@@ -944,15 +944,39 @@ pub const MemBudget = struct {
     // ---- §5 stats ----
 
     /// Every spec key as one JSON object; `floor` is the RAW floor, not the
-    /// clamped one.
+    /// clamped one. A component name registered more than once (the table
+    /// of each data volume, the cache of each member) is ONE entry: its
+    /// `instances`, and their current / floor / weight / sheds / trims
+    /// summed — a key repeated inside the object is a document a strict
+    /// parser refuses.
     pub fn writeStatsJson(self: *const MemBudget, w: *std.Io.Writer) std.Io.Writer.Error!void {
         try w.print("{{\"mem_budget_bytes\":{d},\"mem_budget_pressure_bytes\":{d},\"mem_budget_gauge_sum_bytes\":{d},\"mem_budget_level\":{d},", .{ self.budgetBytes(), self.pressureBytes(), self.gaugeSumBytes(), @backingInt(self.level()) });
         try w.print("\"mem_budget_yellow_events\":{d},\"mem_budget_red_events\":{d},\"mem_budget_floors_clamped\":{},\"mem_budget_unreclaimable_bytes\":{d},", .{ self.yellowEvents(), self.redEvents(), self.floorsClamped(), self.unreclaimableBytes() });
         try w.print("\"mem_budget_hard_backstops\":{d},\"mem_budget_backstop_active\":{},\"mem_budget_tier_publish_paused\":{},\"mem_budget_ticks\":{d},", .{ self.hardBackstops(), self.backstopActive(), self.tierPublishPaused(), self.ticks() });
         try w.writeAll("\"mem_budget_components\":{");
-        for (self.components(), 0..) |*c, i| {
-            if (i != 0) try w.writeByte(',');
-            try w.print("\"{s}\":{{\"current\":{d},\"floor\":{d},\"weight\":{d},\"sheds\":{d},\"trims\":{d}}}", .{ c.name, c.current(), c.floor, c.weight, c.shedCount(), c.trimCount() });
+        const comps = self.components();
+        var first = true;
+        for (comps, 0..) |*c, i| {
+            var seen = false;
+            for (comps[0..i]) |*p| seen = seen or std.mem.eql(u8, p.name, c.name);
+            if (seen) continue;
+            var instances: u64 = 0;
+            var current: u64 = 0;
+            var floor: u64 = 0;
+            var weight: u64 = 0;
+            var sheds: u64 = 0;
+            var trims: u64 = 0;
+            for (comps[i..]) |*s| if (std.mem.eql(u8, s.name, c.name)) {
+                instances += 1;
+                current += s.current();
+                floor += s.floor;
+                weight += s.weight;
+                sheds += s.shedCount();
+                trims += s.trimCount();
+            };
+            if (!first) try w.writeByte(',');
+            first = false;
+            try w.print("\"{s}\":{{\"instances\":{d},\"current\":{d},\"floor\":{d},\"weight\":{d},\"sheds\":{d},\"trims\":{d}}}", .{ c.name, instances, current, floor, weight, sheds, trims });
         }
         try w.writeAll("}}");
     }

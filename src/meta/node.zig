@@ -96,10 +96,11 @@ pub var meta_kv_node_append_bytes: counters.ShardedCounter = .{};
 pub var meta_kv_node_rewrite_bytes: counters.ShardedCounter = .{};
 pub var meta_kv_node_images: counters.ShardedCounter = .{};
 pub var meta_kv_foreign_frames_screened: counters.ShardedCounter = .{};
-pub var meta_kv_appender_fence_breach: counters.ShardedCounter = .{};
 pub var meta_kv_foreign_frame_overwrite_detected: counters.ShardedCounter = .{};
 /// A breach-class foreign frame (rule 1 or 4) on a DEVICE-FENCED substrate:
-/// a write the reservation should have rejected.
+/// a write the reservation should have rejected. Its count is the ONE
+/// `meta_kv_appender_fence_breach` key (a counter beside it counted the
+/// same event under the same key: a strict parser refused the document).
 pub var appender_fence_breach: counters.Tripwire = .init("meta_kv_appender_fence_breach");
 
 // ---------------------------------------------------------------------------
@@ -687,7 +688,6 @@ pub fn verifyNodeExtentScreened(gpa: Allocator, buf: []const u8, layout: NodeLay
         const pr_fenced = if (screen) |sc| sc.pr_fenced else false;
         const g_current: u32 = if (screen) |sc| sc.g_current else 0;
         if (FrameScreen.isBreachRule(s.rule) and pr_fenced) {
-            meta_kv_appender_fence_breach.inc();
             var detail_buf: [256]u8 = undefined;
             const appender_current: u32 = if (screen) |sc| sc.appender_current orelse 0 else 0;
             const detail = std.fmt.bufPrint(&detail_buf, "node 0x{x}: a frame at offset {d} carries slot generation {d} from appender {d} against the current lease generation {d} of appender {d} (rule {d}) on a DEVICE-FENCED substrate — a write the reservation should have rejected", .{ node_addr, s.pos, s.stamp.g, s.stamp.appender_id, g_current, appender_current, s.rule }) catch detail_buf[0..0];
@@ -1733,21 +1733,19 @@ test "the frame screen: rule 3 alone without a plane ((0,0) priming law); rules 
         defer gpa.free(f);
         vol3.write(NODE_PAGE, f);
         const fenced: FrameScreen = .{ .g_current = 2, .appender_current = 7, .recorded_tail = null, .pr_fenced = true };
-        const breach_before = meta_kv_appender_fence_breach.load();
         const tw_before = appender_fence_breach.load();
         log.testing.expectErrorLogs(1);
         var node = try verifyNodeExtentScreened(gpa, vol3.extent(l, 0), l, 0, 0, fenced, null);
         defer node.deinit(gpa);
         try log.testing.expectAllFired();
         try testing.expectEqual(@as(usize, 0), node.bsetCount());
-        try testing.expectEqual(breach_before + 1, meta_kv_appender_fence_breach.load());
         try testing.expectEqual(tw_before + 1, appender_fence_breach.load());
         // Not fenced: the same shape is screened, not a breach.
         var unfenced = fenced;
         unfenced.pr_fenced = false;
         var n2 = try verifyNodeExtentScreened(gpa, vol3.extent(l, 0), l, 0, 0, unfenced, null);
         defer n2.deinit(gpa);
-        try testing.expectEqual(breach_before + 1, meta_kv_appender_fence_breach.load());
+        try testing.expectEqual(tw_before + 1, appender_fence_breach.load());
     }
 }
 

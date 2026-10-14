@@ -483,3 +483,60 @@ test "e2e(nvme_dev): the overlay arm — four 1 MiB page-aligned pieces of a fre
     try testing.expectEqual(@as(usize, 1), e.frees.freed.items.len); // the displaced A key freed after the save
     try testing.expectEqual(fence0, counters.tripwireCount("overlay_fence_drops"));
 }
+
+test "e2e(nvme_dev): decision 0003 §AL — a recycled block never leaks its previous owner's bytes: file X lands a whole block of its marker and is unlinked (the terminal free, no discard: the block-device elision keeps the bytes), small file Y's promotion re-mints THAT block for its 100 B image (the own-block DMA lands one grain), and Y written past its EOF — a page overlay, a quarter-block park, a write into its next block — reads zeros across every gap on the device after its drain, never X's marker" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+    var e: E2E = .{};
+    e.init(gpa, false) catch |err| switch (err) {
+        error.DirectIoUnsupported, error.DirectOpenRefused => return testkit.skip(@src(), .no_device, "the venue's filesystem refuses O_DIRECT"),
+        else => return err,
+    };
+    defer e.deinit();
+    const got = try gpa.alloc(u8, BS);
+    defer gpa.free(got);
+    const marker = try gpa.alloc(u8, BS);
+    defer gpa.free(marker);
+    @memset(marker, 0xAA);
+    const Shape = struct { offset: u64, len: u64 };
+    const shapes = [_]Shape{
+        .{ .offset = 3 * PAGE + 5, .len = 72 },
+        .{ .offset = 600 * 1024 + 3, .len = BS / 4 },
+        .{ .offset = BS + 10, .len = 72 },
+    };
+    for (shapes, 0..) |sh, i| {
+        const x: u64 = 20 + 2 * i;
+        const y: u64 = x + 1;
+        // X: one whole block of the marker, written through, then unlinked.
+        try e.map.create(x, .striped, 0);
+        _ = try e.wp.write(io, .{ .ino = x, .offset = 0, .payload = .{ .bytes = marker }, .class = .entire_op, .file = E2E.striped(0) });
+        e.wp.quiesce(io);
+        const xb = e.map.seam().lookup(x, 0).?;
+        const idx = e.alloc.idxOf(xb.offset);
+        e.map.remove(x);
+        try testing.expectEqual(block_alloc.BeginFree.terminal, try e.alloc.freeBlock(idx));
+        // Y: the promotion's own block is X's — its 100 B image, one grain.
+        const m = try e.alloc.allocateSpecificBlock(idx);
+        var image: [PAGE]u8 align(PAGE) = @splat(0);
+        fillPattern(image[0..100], 7);
+        _ = try e.nseam.seam().write(VOL, m.offset, &image);
+        e.alloc.publishBlock(m.idx);
+        try e.map.create(y, .striped, 100);
+        try e.map.bind(y, 0, seams.Binding.wholeBlock(VOL, m.offset, m.stamp));
+        const payload = try gpa.alloc(u8, sh.len);
+        defer gpa.free(payload);
+        fillPattern(payload, 100 + i);
+        _ = try e.wp.write(io, .{ .ino = y, .offset = sh.offset, .payload = .{ .bytes = payload }, .class = .entire_op, .file = E2E.striped(100) });
+        e.wp.flushIno(io, y);
+        e.wp.quiesce(io);
+        const yb = e.map.seam().lookup(y, 0).?;
+        try e.readAt(got, yb.offset);
+        try expectPattern(got[0..100], 7);
+        const gap_end: usize = @intCast(@min(sh.offset, BS));
+        if (std.mem.indexOfNone(u8, got[100..gap_end], &.{0})) |at| {
+            std.debug.print("\ne2e[recycled tail] shape {d}: byte {d} of Y's gap reads 0x{x} — X's marker\n", .{ i, 100 + at, got[100 + at] });
+            return error.TestUnexpectedResult;
+        }
+        if (sh.offset < BS) try testing.expectEqualSlices(u8, payload, got[@intCast(sh.offset)..][0..payload.len]);
+    }
+}

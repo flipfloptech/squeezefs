@@ -2156,6 +2156,87 @@ test "the in-place dirty drain's crash law (the kill rows, decision 0003 §AJ.7)
     }
 }
 
+/// The bytes a recycled block's previous owner left on the device.
+const STALE: u8 = 0xAA;
+
+/// `ino`'s block 0 re-minted from a block a previous owner filled with
+/// `STALE`, holding a promoted sub-block image: the own-block DMA landed the
+/// file's `eof` bytes grain-padded with zeros (`plane.ownBlockStored`), the
+/// tail past the grain is the previous owner's. `shared` marks it cloned.
+fn recycledEofBlock(w: *World, ino: u64, eof: u64, shared: bool) !Binding {
+    assert(eof <= PAGE);
+    const b = try w.f.publishBlock(ino, 0, STALE);
+    var image: [PAGE]u8 align(PAGE) = @splat(0);
+    fill(image[0..@intCast(eof)], 0x31);
+    try w.f.dev.seam().vtable.write(&w.f.dev, b.vol_tag, b.offset, &image);
+    w.f.map.files.getPtr(ino).?.size = eof;
+    if (shared) w.f.alloc_a.markShared(w.f.alloc_a.idxOf(b.offset));
+    w.f.dev.resetLedger();
+    return b;
+}
+
+/// `ino`'s `block` as a reader sees it now: the write side's window (its
+/// covered runs, the gaps from the base it names), else the map's block,
+/// else a hole's zeros.
+fn readBlockNow(w: *World, io: Io, ino: u64, block: u32, out: []u8) !void {
+    @memset(out, 0);
+    switch (w.wp.writeSideView().serve(io, .{ .ino = ino, .block = block, .rel = 0, .out = out })) {
+        .none => if (w.f.map.seam().lookup(ino, block)) |b| w.f.dev.peek(b.vol_tag, b.offset, out),
+        .partial => |p| if (p.base) |base| {
+            var img: [wt.BS]u8 = undefined;
+            w.f.dev.peek(base.vol_tag, base.offset, &img);
+            var gaps = p.covered.gaps(0, wt.BS);
+            while (gaps.next()) |gp| @memcpy(out[gp.start..gp.end], img[gp.start..gp.end]);
+        },
+        .redirect => |shadow| w.f.dev.peek(shadow.vol_tag, shadow.offset, out),
+        .served => {},
+        .settle, .busy => return error.TestUnexpectedResult,
+    }
+}
+
+fn expectZeros(what: []const u8, bytes: []const u8, base: u64) !void {
+    if (std.mem.indexOfNone(u8, bytes, &.{0})) |i| {
+        std.debug.print("{s}: byte {d} reads 0x{x}, not 0 (the previous owner's)\n", .{ what, base + i, bytes[i] });
+        return error.TestUnexpectedResult;
+    }
+}
+
+test "decision 0003 §AL — a write past EOF never exposes the bytes a recycled block's previous owner left: a promoted sub-block image (its EOF bytes landed, the tail the previous owner's marker) written past its EOF reads zeros across [EOF, write) on every arm — the W2 page overlay folded in place, the accumulation drained in place, the overlay arm's fresh landing, the seeded CoW upload of a shared block, a write into a LATER block (the EOF block's tail is the gap) — live through the write side's view and on the device after the drain" {
+    const io = testing.io;
+    const w = try World.init(testing.allocator, .sync_inline, true);
+    defer w.deinit(testing.allocator);
+    const Case = struct { ino: u64, eof: u64 = 100, offset: u64, len: u64, arm: Arm, shared: bool = false };
+    const cases = [_]Case{
+        .{ .ino = 70, .offset = 3 * PAGE + 7, .len = 10, .arm = .extent },
+        .{ .ino = 71, .offset = 5 * PAGE + 3, .len = 5 * PAGE, .arm = .accumulate_park },
+        .{ .ino = 72, .eof = PAGE, .offset = 8 * PAGE, .len = 3 * PAGE, .arm = .overlay },
+        .{ .ino = 73, .offset = 5 * PAGE + 3, .len = 5 * PAGE, .arm = .accumulate_park, .shared = true },
+        .{ .ino = 74, .offset = wt.BS + 10, .len = 10, .arm = .extent },
+    };
+    var payload: [5 * PAGE]u8 = undefined;
+    var own: [PAGE]u8 = undefined;
+    var got: [wt.BS]u8 = undefined;
+    for (cases) |c| {
+        _ = try recycledEofBlock(w, c.ino, c.eof, c.shared);
+        fill(own[0..@intCast(c.eof)], 0x31);
+        fill(payload[0..@intCast(c.len)], @truncate(c.ino));
+        const o = try w.wp.write(io, .{ .ino = c.ino, .offset = c.offset, .payload = .{ .bytes = payload[0..@intCast(c.len)] }, .class = .entire_op, .file = World.striped(c.eof) });
+        try testing.expectEqual(@as(u32, 1), o.count(c.arm));
+        const gap_end: usize = @intCast(@min(c.offset, wt.BS));
+        for ([_]bool{ false, true }) |drained| {
+            if (drained) {
+                w.wp.flushIno(io, c.ino);
+                w.wp.quiesce(io);
+                try testing.expect(!w.wp.table.has(c.ino, 0));
+            }
+            try readBlockNow(w, io, c.ino, 0, &got);
+            try testing.expectEqualSlices(u8, own[0..@intCast(c.eof)], got[0..@intCast(c.eof)]);
+            try expectZeros(if (drained) "the gap on the device after the drain" else "the gap through the write side's view", got[@intCast(c.eof)..gap_end], c.eof);
+            if (c.offset < wt.BS) try testing.expectEqualSlices(u8, payload[0..@intCast(c.len)], got[@intCast(c.offset)..][0..@intCast(c.len)]);
+        }
+    }
+}
+
 test "the D3 fold seam (defrag --fold): `foldTargets` names the inos holding parked W2 extents (ascending, deduped — a full-buffer park is not a target), `foldParked` kicks each through the EXISTING fold — sole-owner passthrough blocks land in place at the page grain and retire, device ÷ user ≤ the §J in-place bound, the bindings unchanged, bytes exact; nothing left parked as an extent; a second census is empty" {
     const io = testing.io;
     const w = try World.init(testing.allocator, .sync_inline, false);

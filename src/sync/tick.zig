@@ -26,6 +26,7 @@
 //! smoke run, the phantom behind the "5 s stall").
 
 const std = @import("std");
+const builtin = @import("builtin");
 const testkit = @import("../core/testkit.zig");
 const Io = std.Io;
 const counters = @import("../core/counters.zig");
@@ -34,6 +35,25 @@ const futex = @import("futex.zig");
 
 /// The liveness tick: the backstop's re-contend period.
 pub const tick_ns: u64 = 2 * std.time.ns_per_s;
+
+/// The test seam: a non-zero value is the tick every park takes instead —
+/// a test of the tick's own law drives it at its scale rather than waiting
+/// out 2 s per beat (product builds read the constant alone).
+pub var test_tick_ns: std.atomic.Value(u64) = .init(0);
+
+/// The scale a tick test drives the backstop at: a twentieth of the
+/// product tick — 100 ms, three orders above a futex round trip, so a
+/// delivered wake still beats it on a loaded host.
+pub const test_scale_tick_ns: u64 = tick_ns / 20;
+
+/// The tick the parks take (`test_tick_ns` when a test set it).
+pub fn currentTickNs() u64 {
+    if (builtin.is_test) {
+        const t = test_tick_ns.load(.monotonic);
+        if (t != 0) return t;
+    }
+    return tick_ns;
+}
 
 /// `lock_ticked_reregisters`: mutex/rwlock acquires that re-contended past
 /// a tick (the reference's `TICK_RECOVERIES`).
@@ -75,7 +95,7 @@ pub fn park(io: Io, word: *std.atomic.Value(u32), counter: ?*counters.ShardedCou
 /// cadence task's `timeout_at(next_tick, notified())`). The tick stays the
 /// liveness backstop underneath.
 pub fn parkUntil(io: Io, word: *std.atomic.Value(u32), deadline_ns: u64, counter: ?*counters.ShardedCounter) Io.Cancelable!Outcome {
-    const tick_deadline = clock.monotonicNs() + tick_ns;
+    const tick_deadline = clock.monotonicNs() + currentTickNs();
     const until = @min(tick_deadline, deadline_ns);
     while (true) {
         // acquire pairs with the waker's release swap: a woken caller sees

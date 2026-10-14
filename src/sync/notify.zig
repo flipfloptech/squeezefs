@@ -450,22 +450,27 @@ test "the tick accounting: an idle waiter parked past a tick and then notified c
             w.waitUncancelable(io_);
         }
     };
+    tick.test_tick_ns.store(tick.test_scale_tick_ns, .monotonic);
+    defer tick.test_tick_ns.store(0, .monotonic);
     const before = tick.channel_ticked_reregisters.load();
-    // 1. Idle past one tick, then a real notify: no rescue.
+    // 1. Idle past ticks, then a real notify: no rescue.
     const t1 = try std.Thread.spawn(.{}, Parked.run, .{ io, &n });
     while (n.waiters(io) == 0) try std.Thread.yield();
-    io.sleep(.fromNanoseconds(@intCast(tick.tick_ns + tick.tick_ns / 4)), .awake) catch unreachable;
+    io.sleep(.fromNanoseconds(@intCast(2 * tick.test_scale_tick_ns + tick.test_scale_tick_ns / 4)), .awake) catch unreachable;
     n.notifyWaiters(io);
     t1.join();
     try testing.expectEqual(before, tick.channel_ticked_reregisters.load());
     // 2. The epoch bumps but the token never lands: the waiter's tick
-    //    finds it satisfied with no token — one rescue, counted.
+    //    finds it satisfied with no token — one rescue, counted. Timed from
+    //    before the waiter exists: its park's tick starts after this read,
+    //    so the rescue lands a whole tick past it on any host (a read after
+    //    its registration let a slow main thread eat into the tick).
+    const t0 = clock.monotonicNs();
     const t2 = try std.Thread.spawn(.{}, Parked.run, .{ io, &n });
     while (n.waiters(io) == 0) try std.Thread.yield();
-    const t0 = clock.monotonicNs();
     n.notifyWaitersDroppingWakeForTest(io);
     t2.join();
-    try testing.expect(clock.monotonicNs() - t0 >= tick.tick_ns - tick.tick_ns / 10);
+    try testing.expect(clock.monotonicNs() - t0 >= tick.test_scale_tick_ns);
     try testing.expectEqual(before + 1, tick.channel_ticked_reregisters.load());
     try testing.expectEqual(@as(u32, 0), n.waiters(io));
 }

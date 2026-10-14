@@ -431,6 +431,8 @@ test "cancelling_the_front_waiter_hands_the_wake_to_the_next: a cancelled parked
 }
 
 fn deadWaiterNeverWedges(io: Io) !void {
+    tick.test_tick_ns.store(tick.test_scale_tick_ns, .monotonic);
+    defer tick.test_tick_ns.store(0, .monotonic);
     var l: RwLock = .init;
     try l.lock(io);
     var dead: Waiter = .{ .mode = .exclusive };
@@ -445,7 +447,7 @@ fn deadWaiterNeverWedges(io: Io) !void {
     const waited = clock.monotonicNs() - t0;
     l.unlock(io);
     try testing.expect(tick.lock_ticked_reregisters.load() > before);
-    try testing.expect(waited >= tick.tick_ns);
+    try testing.expect(waited >= tick.test_scale_tick_ns);
     l.unregister(io, &dead);
     try testing.expectEqual(RwLock.init, l);
 }
@@ -455,6 +457,8 @@ test "a_dead_waiter_never_wedges_the_lock: a registered waiter that never re-con
 }
 
 fn tickBackstopRecovers(io: Io) !void {
+    tick.test_tick_ns.store(tick.test_scale_tick_ns, .monotonic);
+    defer tick.test_tick_ns.store(0, .monotonic);
     var l: RwLock = .init;
     try l.lock(io);
     const before = tick.lock_ticked_reregisters.load();
@@ -466,10 +470,9 @@ fn tickBackstopRecovers(io: Io) !void {
     };
     const t = try std.Thread.spawn(.{}, Parked.run, .{ io, &l });
     while (l.waiters(io) == 0) try std.Thread.yield();
-    // The hold window is longer than a tick, so the parked waiter MUST tick
-    // at least once before the release lets it in.
-    try io.sleep(.fromNanoseconds(@intCast(tick.tick_ns + 200 * std.time.ns_per_ms)), .awake);
-    try testing.expect(tick.lock_ticked_reregisters.load() > before);
+    // The hold outlasts the waiter's tick: it re-contends (counted) and
+    // stays queued until the release lets it in.
+    while (tick.lock_ticked_reregisters.load() == before) try std.Thread.yield();
     l.unlock(io);
     t.join();
     try testing.expectEqual(RwLock.init, l);

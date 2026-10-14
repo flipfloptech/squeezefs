@@ -1256,8 +1256,14 @@ pub const Pass = struct {
         for (self.host.volumes) |v| _ = v.alloc.fsckBumpEpoch();
     }
 
-    /// Phase A + Phase C over every suspect; the survivors are the
-    /// findings. Offline the suspects report directly.
+    /// Phase A over every suspect, then Phase C over the ones standing;
+    /// the survivors are the findings. Offline the suspects report
+    /// directly. Every Phase A runs before the first Phase C (decision
+    /// 0003 §AH.2): the re-checks memoize ONE fresh census per pass, and a
+    /// census read before a suspect's registry check can predate the
+    /// publish that ended the suspect's mint — interleaved, the census the
+    /// first suspect's re-check read confirmed the next one's block as
+    /// leaked.
     pub fn recheck(self: *Pass) Error!void {
         const gpa = self.gpa;
         if (!self.host.online()) {
@@ -1266,14 +1272,20 @@ pub const Pass = struct {
             try self.confirmVerdicts();
             return;
         }
-        var kept: std.ArrayList(Finding) = .empty;
-        defer kept.deinit(gpa);
+        var standing: std.ArrayList(Finding) = .empty;
+        defer standing.deinit(gpa);
         for (self.suspects.items) |s| {
             if (self.host.cancelled()) return;
             if (!(try self.phaseA(s))) {
                 self.counters.suspects_cleared += 1;
                 continue;
             }
+            try standing.append(gpa, s);
+        }
+        var kept: std.ArrayList(Finding) = .empty;
+        defer kept.deinit(gpa);
+        for (standing.items) |s| {
+            if (self.host.cancelled()) return;
             if (try self.phaseC(s)) {
                 try kept.append(gpa, s);
             } else self.counters.suspects_cleared += 1;
@@ -1316,23 +1328,50 @@ pub const Pass = struct {
         const b = block orelse return true;
         const v = self.host.volume(b.vol_tag) orelse return true;
         if (b.idx >= v.alloc.capacityBlocks()) return true;
-        const vi = for (self.host.volumes, 0..) |hv, i| {
-            if (hv.vol_tag == b.vol_tag) break i;
-        } else unreachable;
-        if (v.alloc.allocationEpochOf(b.idx) >= self.scan_epoch[vi] and v.alloc.allocationEpochOf(b.idx) != 0) {
-            self.counters.epoch_exempted += 1;
-            return false;
-        }
+        if (self.mintedUnderScan(b.vol_tag, b.idx)) return false;
         if (self.host.recheck_hook) |h| h.fire(.phase_a_registry, b.idx);
-        if (v.alloc.inflightContains(b.idx)) {
-            self.counters.inflight_exempted += 1;
-            return false;
-        }
+        if (self.inFlight(b.vol_tag, b.idx)) return false;
         if (self.host.pack) |p| if (p.isOpenPack(p.ctx, b.vol_tag, b.idx)) {
             self.counters.pack_ledger_exempted += 1;
             return false;
         };
         return true;
+    }
+
+    /// The epoch side map: a block minted while this pass's scan latch
+    /// stood is younger than the census (counted).
+    fn mintedUnderScan(self: *Pass, vol_tag: u64, idx: u64) bool {
+        const vi = for (self.host.volumes, 0..) |hv, i| {
+            if (hv.vol_tag == vol_tag) break i;
+        } else return false;
+        const epoch = self.host.volumes[vi].alloc.allocationEpochOf(idx);
+        if (epoch == 0 or epoch < self.scan_epoch[vi]) return false;
+        self.counters.epoch_exempted += 1;
+        return true;
+    }
+
+    /// The in-flight registry: a live owner — a mint before its publish, a
+    /// release between its commit and its free (decision 0003 §AH.1) —
+    /// holds the block (counted).
+    fn inFlight(self: *Pass, vol_tag: u64, idx: u64) bool {
+        const v = self.host.volume(vol_tag) orelse return false;
+        if (!v.alloc.inflightContains(idx)) return false;
+        self.counters.inflight_exempted += 1;
+        return true;
+    }
+
+    /// The tracking arms' re-read AFTER their fresh derivation (decision
+    /// 0003 §AH.2; Phase A read the registry before the references, this
+    /// reads the allocator after them): the block is still tracked, at
+    /// the count the arm judged when it is C3's, with no live owner in
+    /// flight and no mint under this scan — a block freed and minted to a
+    /// new writer since Phase A is that writer's, never the arm's.
+    fn trackingStands(self: *Pass, vol_tag: u64, idx: u64, rc_judged: ?u32) bool {
+        const v = self.host.volume(vol_tag) orelse return false;
+        const rc = v.alloc.refcount(idx) orelse return false;
+        if (rc_judged) |j| if (rc != j) return false;
+        if (self.inFlight(vol_tag, idx)) return false;
+        return !self.mintedUnderScan(vol_tag, idx);
     }
 
     /// Phase C per class (`ops_fsck.md` §3): the fresh evidence under the
@@ -1369,7 +1408,8 @@ pub const Pass = struct {
                 if (v.alloc.refcount(f.block_idx) == null) return false;
                 const derived = try self.recheckDerived(f.vol_tag);
                 if (host.recheck_hook) |h| h.fire(.count_recheck_derived, f.block_idx);
-                return !derived.contains(f.block_idx);
+                if (derived.contains(f.block_idx)) return false;
+                return self.trackingStands(f.vol_tag, f.block_idx, null);
             },
             .c2_lost => |f| {
                 if (f.unrepairable_shape) return true; // permanent by construction
@@ -1383,7 +1423,9 @@ pub const Pass = struct {
                 const v = host.volume(f.vol_tag) orelse return false;
                 const rc = v.alloc.refcount(f.block_idx) orelse return false;
                 const n = ((try self.recheckDerived(f.vol_tag)).get(f.block_idx) orelse return false).count;
-                return n > 0 and rc != n;
+                if (host.recheck_hook) |h| h.fire(.count_recheck_derived, f.block_idx);
+                if (n == 0 or rc == n) return false;
+                return self.trackingStands(f.vol_tag, f.block_idx, rc);
             },
             .c4_orphan => |f| {
                 const face = host.staging orelse return false;

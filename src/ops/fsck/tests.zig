@@ -926,7 +926,10 @@ const Storm = struct {
                 try set.mem.commit(t);
             }
             // 5. The destroy: the record + the layout + the reference, then
-            // the block's terminal free.
+            // the block's terminal free — the release held in flight from
+            // before its commit until after the free (decision 0003 §AH.1).
+            var release = block_alloc.InflightAllocGuard.register(a, minted.idx);
+            defer release.deinit();
             {
                 const t = try set.mem.begin(@src());
                 {

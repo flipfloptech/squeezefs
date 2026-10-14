@@ -45,11 +45,15 @@ SECTOR = 512
 # blocks, 0 escalation bytes — summing the subset alone read 0 device bytes
 # against 3.5 GB on diskstats) and is reported beside. The two in-place arms
 # land pages at a mapping the file owns alone: the W2 fold's (§J.1 landing 2)
-# and the deferred full buffer's drain (§AK: an extending append's drain).
+# and the deferred full buffer's drain (§AK: an extending append's drain). A
+# superseded upload's DMA landed its image before the newer bytes won: its
+# stored length is an arm too (§AK.6 — the aes close rows read 1.3–8.7 MB of
+# diskstats outside every arm before).
 DEVICE_WRITE_ARMS = [
     "overlay_store_bytes", "patch_write_bytes", "own_block_dma_bytes",
     "write_through_bytes", "durable_upload_bytes_writeback",
     "fold_inplace_write_bytes", "drain_inplace_write_bytes",
+    "write_pipeline_superseded_bytes",
 ]
 # `drain_inplace_dmas` is beside: the drain's page DMAs ride the block layer's
 # put (`put_obj` counts each one — the e2e row pins `put_obj + 1` per drain).

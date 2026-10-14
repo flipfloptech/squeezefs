@@ -1107,7 +1107,9 @@ pub fn uploadParkedBlock(table: *Table, deps: UploadDeps, io: Io, ino: u64, bloc
                 e.upload_inflight = false;
                 fsck_guard.deinit();
                 mint.abandon();
-                pipeline.countDisposition(.superseded, bs);
+                // The bytes the abandoned DMA landed: a device-write arm
+                // (the ledger closes against diskstats, decision 0003 §AK.6).
+                pipeline.countDisposition(.superseded, proof.len);
                 continue :drive; // re-drive with the newest bytes
             }
             const min_size = @as(u64, block) * bs + app_end;

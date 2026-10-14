@@ -2867,6 +2867,35 @@ test "a framed image SHORTER than its block (a promoted sub-block image, a tail 
     // Inside it: exact.
     _ = try f.rp.read(io, 7, 2 * Fixture.bs + 4096, 4096, .{ .buf = buf[0..4096] }, .{});
     for (buf[0..4096], 4096..) |b, j| try testing.expectEqual(@as(u8, @truncate((j / 4096) * 31 + j)), b);
+    // The second touch of block 2 is a ghost hit: ONE whole image into the
+    // hot tier, decoded and zero-completed — the block a tier caches is the
+    // block, so a later serve past the plaintext slices zeros out of it
+    // (the decoded short block sliced out of bounds: a daemon panic on the
+    // perf container's read past a trimmed tail).
+    _ = try f.rp.read(io, 7, 2 * Fixture.bs + 8192, 4096, .{ .buf = buf[0..4096] }, .{});
+    for (buf[0..4096], 8192..) |b, j| try testing.expectEqual(@as(u8, @truncate((j / 4096) * 31 + j)), b);
+    const key2 = BlockKey.init(Fixture.vol_tag, 7 * f.chunk);
+    try testing.expect(f.rp.hot.contains(key2) or f.rp.lru.contains(key2));
+    for ([_]u64{ 3 * transform.FRAME_GRAIN + 8192, Fixture.bs - 4096 }) |rel| {
+        @memset(buf[0..4096], 0xEE);
+        _ = try f.rp.read(io, 7, 2 * Fixture.bs + rel, 4096, .{ .buf = buf[0..4096] }, .{});
+        try testing.expect(std.mem.allEqual(u8, buf[0..4096], 0));
+    }
+    // The whole-block walk (a device-true O_DIRECT read, a streaming
+    // reader): the decoded block is zero-completed to the block — a short
+    // decode sliced at an offset past its plaintext panicked out of bounds
+    // (the perf container: `index 245760, len 65536` at a read past a
+    // trimmed tail).
+    const g = try Fixture.init(testing.allocator, .{ .compression = .lz4, .read_lane = false, .direct_device_true = true });
+    defer g.deinit();
+    @memcpy(g.device[5 * g.chunk ..][0..img.len], img);
+    g.bind(0, 5);
+    g.size = Fixture.bs;
+    for ([_]u64{ 3 * transform.FRAME_GRAIN + 8192, transform.FRAME_GRAIN - 4096 }) |rel| {
+        @memset(buf[0..8192], 0xEE);
+        _ = try g.rp.read(io, 7, rel, 8192, .{ .buf = buf[0..8192] }, .{ .odirect = true });
+        for (buf[0..8192], rel..) |b, j| try testing.expectEqual(if (j < transform.FRAME_GRAIN) @as(u8, @truncate((j / 4096) * 31 + j)) else 0, b);
+    }
 }
 
 test "a packed tenant on a TRANSFORMED volume: the window law runs under the chunk stride (block + 4 KiB — `block_size` refused every tenant past index 0 and tripped packed_mapping_refusals), the whole frame decodes on the lane's codec, the plaintext slice serves byte-exact" {

@@ -4110,6 +4110,13 @@ const SettlingData = struct {
     freed: std.ArrayList(Mapping) = .empty,
     adds: std.ArrayList(layout.RefOp) = .empty,
     releases: std.ArrayList(layout.RefOp) = .empty,
+    /// The releases held in flight (decision 0003 §AH.1), each with the
+    /// store's commit count at its hold: a free must find its binding held
+    /// by a hold a commit has followed since (the releasing commit).
+    held: std.ArrayList(struct { m: Mapping, commits: u64 }) = .empty,
+    unheld_frees: u32 = 0,
+    late_holds: u32 = 0,
+    unheld_drops: u32 = 0,
     /// The staging ring, when the test turns it on: the largest image
     /// staged (the ring holds whole files ≤ one block, never more); the
     /// ring FULL (no hole for the image, the pool at its cap): every stage
@@ -4126,9 +4133,12 @@ const SettlingData = struct {
     syncfs_calls: u32 = 0,
     commits_at_syncfs: u64 = 0,
     fsyncs_at_syncfs: u64 = 0,
-    /// The own-block promotions: the largest image DMA'd (≤ one block).
+    /// The own-block promotions: the largest image DMA'd (≤ one block);
+    /// `own_blocks_settled` the ones published or abandoned since (each a
+    /// live owner until then).
     own_block_max: u64 = 0,
     own_blocks: u32 = 0,
+    own_blocks_settled: u32 = 0,
     next_block_off: u64 = 0,
     /// The striped data writes: `(offset, len, the file view's size)`.
     writes: std.ArrayList(struct { offset: u64, len: u64, view_size: u64 }) = .empty,
@@ -4171,7 +4181,29 @@ const SettlingData = struct {
         self.freed.deinit(testing.allocator);
         self.adds.deinit(testing.allocator);
         self.releases.deinit(testing.allocator);
+        self.held.deinit(testing.allocator);
         self.writes.deinit(testing.allocator);
+    }
+
+    fn commitsNow(self: *const SettlingData) u64 {
+        return if (self.store) |s| s.commits else 0;
+    }
+
+    fn heldIndex(self: *const SettlingData, m: Mapping) ?usize {
+        for (self.held.items, 0..) |h, i| if (h.m.vol_tag == m.vol_tag and h.m.offset == m.offset) return i;
+        return null;
+    }
+
+    fn holdOne(self: *SettlingData, m: Mapping) void {
+        self.held.append(testing.allocator, .{ .m = m, .commits = self.commitsNow() }) catch unreachable;
+    }
+
+    fn dropOne(self: *SettlingData, m: Mapping) void {
+        const i = self.heldIndex(m) orelse {
+            self.unheld_drops += 1;
+            return;
+        };
+        _ = self.held.swapRemove(i);
     }
 
     /// The striped layout `[0 → m]` of `ino` published through the store
@@ -4248,9 +4280,28 @@ const SettlingData = struct {
         self.next_block_off += layout.DEFAULT_CHUNK;
         return .{ .mapping = Mapping.wholeBlock(0x11, off, 1), .proof = .{ .vol_tag = 0x11, .offset = off, .len = layout.DEFAULT_CHUNK, .completed_ns = 1 } };
     }
-    pub fn abandonOwnBlock(_: *SettlingData, _: OwnBlock) void {}
+    pub fn abandonOwnBlock(self: *SettlingData, _: OwnBlock) void {
+        self.own_blocks_settled += 1;
+    }
+    pub fn ownBlockPublished(self: *SettlingData, _: OwnBlock) void {
+        self.own_blocks_settled += 1;
+    }
+    pub fn holdReleases(self: *SettlingData, entries: []const layout.MapEntry) void {
+        for (entries) |e| self.holdOne(e.mapping);
+    }
+    pub fn dropReleases(self: *SettlingData, entries: []const layout.MapEntry) void {
+        for (entries) |e| self.dropOne(e.mapping);
+    }
+    /// Every free is a release's: held, by a hold its commit followed.
     pub fn freeBindings(self: *SettlingData, _: Io, maps: []const Mapping) void {
-        for (maps) |m| self.freed.append(testing.allocator, m) catch unreachable;
+        for (maps) |m| {
+            self.freed.append(testing.allocator, m) catch unreachable;
+            const i = self.heldIndex(m) orelse {
+                self.unheld_frees += 1;
+                continue;
+            };
+            if (self.held.items[i].commits == self.commitsNow()) self.late_holds += 1;
+        }
     }
     /// The custody lands: the plane's merge under its own (3.5)+(3.7).
     pub fn flushCustody(self: *SettlingData, io: Io, ino: u64) void {
@@ -4267,8 +4318,10 @@ const SettlingData = struct {
         if (m.ino != ino) return;
         self.merge = null;
         const prev_entries = [_]layout.MapEntryWire{(layout.MapEntry{ .block = 0, .mapping = m.from }).encode()};
+        self.holdOne(m.from);
         self.publishStriped(ino, m.size, Layout.stripedInline(m.size, &prev_entries), m.to) catch unreachable;
         self.freeBindings(io, &.{m.from});
+        self.dropOne(m.from);
     }
     /// The write-back drain: the armed custody (`custody_of`) lands.
     pub fn releaseIno(self: *SettlingData, _: Io, ino: u64) void {
@@ -4391,6 +4444,68 @@ test "the corpse destroy settles the write-side custody BEFORE it reads the layo
     try testing.expectEqual(@as(u32, 1), h.data.base.layout_locks_taken);
     try testing.expectEqual(@as(u32, 0), h.data.base.layout_lock_held);
     try testing.expectEqual(linux.E.NOENT, h.call(.{ .getattr = .{ .flags = 0, .fh = null } }, f).errno().?);
+}
+
+test "a release is a live owner of its block from before its releasing commit until its free (decision 0003 §AH.1; the online fsck's `[C2] leaked` window — between the two the allocator tracks a block no record names): every binding the handler frees after a commit — the corpse destroy's, a truncate's, an O_TRUNC open's — is held in flight by a hold its commit followed and dropped after the free; the own block a promotion mints stays a live owner until its publish lands; nothing stays held" {
+    const H = HarnessOf(SettlingData);
+    var h: H = undefined;
+    try h.init();
+    defer h.deinit();
+    defer h.data.deinit();
+    h.data.store = &h.store;
+    const bs = layout.DEFAULT_CHUNK;
+    var tr = @import("op_trace.zig").OpTrace.begin(1, .other);
+    var win: [16]u8 = undefined;
+    var c: Ctx = .{ .unique = 1, .uid = 0, .gid = 0, .pid = 0, .io = testing.io, .trace = &tr, .wd_slot = null, .window = &win };
+    // (a) The corpse destroy, after the custody settles onto a fresh block.
+    const f = try h.create(1, "f", 0o644);
+    const lf = try H.Fs.localOf(f);
+    const from = Mapping.wholeBlock(0x11, 0, 1);
+    const to = Mapping.wholeBlock(0x11, bs, 2);
+    try h.data.publishStriped(lf, bs, null, from);
+    h.data.merge = .{ .ino = lf, .size = bs, .from = from, .to = to };
+    try testing.expectEqual(@as(?linux.E, null), h.call(.{ .unlink = .{ .name = "f" } }, 1).errno());
+    h.release(f);
+    h.forget(f, 1);
+    try h.fs.reclaimDrain(&c);
+    // (b) A truncate to zero of a striped file (its inode sized first).
+    var sa = abi.zeroed(abi.fuse_setattr_in);
+    sa.valid = abi.FATTR_SIZE;
+    const g = try h.create(1, "g", 0o644);
+    const mg = Mapping.wholeBlock(0x11, 2 * bs, 3);
+    try h.data.publishStriped(try H.Fs.localOf(g), bs, null, mg);
+    sa.size = bs;
+    try testing.expectEqual(@as(?linux.E, null), h.setattr(g, sa).errno());
+    sa.size = 0;
+    try testing.expectEqual(@as(?linux.E, null), h.setattr(g, sa).errno());
+    h.release(g);
+    // (c) An O_TRUNC open of a striped file.
+    const k = try h.create(1, "k", 0o644);
+    const mk = Mapping.wholeBlock(0x11, 3 * bs, 4);
+    try h.data.publishStriped(try H.Fs.localOf(k), bs, null, mk);
+    sa.size = bs;
+    try testing.expectEqual(@as(?linux.E, null), h.setattr(k, sa).errno());
+    h.release(k);
+    try testing.expectEqual(@as(?linux.E, null), h.call(.{ .open = .{ .flags = O_TRUNC, .open_flags = 0 } }, k).errno());
+    h.release(k);
+    // (d) A promotion to an own block (an empty file grown past the block,
+    // then written through the striped arm).
+    const p = try h.create(1, "p", 0o644);
+    sa.size = 2 * bs;
+    try testing.expectEqual(@as(?linux.E, null), h.setattr(p, sa).errno());
+    const page: [4096]u8 = @splat('P');
+    try testing.expectEqual(@as(?linux.E, null), h.write(p, 0, &page, 0).errno());
+    h.release(p);
+    tr.finish();
+    // Every free: `from` (the custody's merge), `to` (the destroy), `mg`
+    // (the truncate), `mk` (the O_TRUNC) — each held across its commit.
+    try testing.expectEqual(@as(usize, 4), h.data.freed.items.len);
+    try testing.expectEqual(@as(u32, 0), h.data.unheld_frees);
+    try testing.expectEqual(@as(u32, 0), h.data.late_holds);
+    try testing.expectEqual(@as(u32, 0), h.data.unheld_drops);
+    try testing.expectEqual(@as(usize, 0), h.data.held.items.len);
+    try testing.expectEqual(@as(u32, 1), h.data.own_blocks);
+    try testing.expectEqual(h.data.own_blocks, h.data.own_blocks_settled);
 }
 
 test "a file grown past one block by truncate is written through the striped arm: the promotion DMAs at most one block of the resident image (the tail is the sparse zero run the size names) and the staged arm never rings an image above one block (repro-port: fstests generic/030 — `truncate 5017k` then `pwrite 0 5017k` answered EFBIG; fsstress left unpromotable ring images behind)" {

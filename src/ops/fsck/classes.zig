@@ -794,7 +794,14 @@ pub const Pass = struct {
         while (idx < highest) : (idx += 1) {
             if (v.alloc.refcount(idx) != null) {
                 tracked += 1;
-            } else if (v.alloc.inflightContains(idx)) inflight_untracked += 1;
+            } else if (v.alloc.inflightContains(idx)) switch (v.alloc.stateOf(idx)) {
+                // A free-listed block is `freeBlocksCount`'s and a trim-
+                // windowed one `trimClaimed`'s: a registration on either (a
+                // release held past its free, decision 0003 §AH.1; the trim
+                // claim's guard) is not a second exemption.
+                .free, .trim_windowed => {},
+                else => inflight_untracked += 1,
+            };
         }
         const used = highest -| v.alloc.freeBlocksCount() -| inflight_untracked -| v.alloc.trimClaimed();
         if (used != tracked) try self.suspect(.{ .c6_drift = .{ .vol_tag = v.vol_tag, .loss = used -| tracked, .leak = tracked -| used } });

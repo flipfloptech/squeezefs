@@ -5848,10 +5848,21 @@ test "smoke: THE TRANSFORMED APPEND on a set without a cache path (decision 0003
         }
         _ = try rig.awaitReady(0);
         // Past the inline bound: 4,096 B inline, then 904 B that promote the file.
+        const sp = try rig.stats();
+        defer gpa.free(sp);
         {
             const out = try rig.onMountTimed("head -c 5000 /dev/urandom > \"$1/ref\" && dd if=\"$1/ref\" of=f bs=4096 status=none && cmp f \"$1/ref\" && echo same", 60);
             defer gpa.free(out);
             try testing.expectEqualStrings("same\n", out);
+        }
+        // The promotion's own-block DMA counts the bytes it landed (the
+        // stored image, grain-padded): the device-write ledger closes.
+        {
+            const sq = try rig.stats();
+            defer gpa.free(sq);
+            const own = (numberAfter(sq, "\"own_block_dma_bytes\":") orelse 0) - (numberAfter(sp, "\"own_block_dma_bytes\":") orelse 0);
+            try testing.expect(own != 0 and own % 4096 == 0 and own <= transform_mod.storedImageBound(cfg, 4096));
+            if (enc != .none) try testing.expectEqual(transform_mod.storedImageBound(cfg, 4096), own);
         }
         const st0 = try rig.stats();
         defer gpa.free(st0);

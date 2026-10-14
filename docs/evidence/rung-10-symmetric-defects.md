@@ -83,7 +83,8 @@ Waiting for the 1-in-~100 recurrence would not pin the cause, so the row was mad
 4 now storms C too, through its kill (`f839d5f`) — C dies holding scopes parked at A by its own
 creates into A's stripes, the contract the row states ("kill -9 C … mid-storm"). On the tree
 before the fix (`dev` with items 4, 1 and 3) the row failed **5 of 10** runs (one manual run, 1 of
-3 in a first loop, 3 of 6 interleaved with the fixed build, half of each under 4 × `yes`):
+3 in a first loop, 3 of 6 interleaved with the fixed build; 3 of the 4 under 4 × `yes`, 2 of the
+6 alone):
 A never evicted C (`appender_recoveries` stuck at 1; A's log has no second `tick — 1 evicted`
 line), A's create into `hot` parked at `handler_entry` with `lock_ticked_reregisters` climbing for
 50 s until the kernel's 51 s request timeout ended A's connection (`StatsUnreadable` at the
@@ -259,3 +260,48 @@ cap had no room for a 64 KiB record beside it (the entry refused `ValueTooLarge`
 - `control_records` "extent_grant chunks": round trip, the key binding, every refused spelling
   byte-wise even re-stamped, the marker, the 253-run tie; `fsck` "C14 reads every grant record
   whole"; `extent_grant` "subtractRuns".
+
+## 5. Loops and gates
+
+The shared hot directory row alone (`-Dtest-filter="SHARED HOT DIRECTORY"`, ≈ 40 s a run) under
+the harness of `rung-10-tripwire-hunt.md` §5: odd rounds alone, even rounds under 4 × `yes`, on the
+venue the other worktrees' runs share (load average 4–13). A run passes when the row passes: every
+survivor's `ls` equals its `find` and its `stat` walk at each phase, and no cross-owner intent stays
+open after either death. A run's daemon logs are kept when it fails or logs a tripwire.
+
+| Build | Alone | Under 4 × `yes` | Tripwire runs | Note |
+|---|---|---|---|---|
+| `d5e3703` (the post-perf3 base, the custody fix, the row's listing capture; none of items 1–4) | 15 / 15 | 15 / 15 | 0 | items 1–3 did not recur in 30 runs |
+| the same, a second loop | 6 / 6 | 4 / 5 | 1 | the failure: A's `SIGABRT` at `fuse/transport/session.zig:642` (`Sideband.completeCell`, owned by `.wt-coherence`), `appender_park_expiries` firing after it |
+| items 4 and 1 (two loops side by side) | 18 / 18 | 18 / 18 | 0 | |
+| item 2's red row, without the fix | 4 / 6 | 1 / 4 | 0 | §2.2: every failure is A's wedged `create` |
+| item 2's fix before the rebase, interleaved with the red row | 4 / 4 | 3 / 3 | 0 | |
+| **the landed tree, `168b495`** | **60 / 60** | **59 / 60** | **0** | the failure (round 76): A's mount could not arm — `kmbuf ring registration ENOMEM (order-8 contiguous pages)` at startup, before the row's first op; the transport's class, owned by `.wt-coherence` |
+
+Gates before each landing:
+
+| Landing | Linux (`zig build gate`) | macOS (`zig build gate`) |
+|---|---|---|
+| items 4 and 1 (`af314c2`, `5eba3e1`) | 49/49 steps, 2,866 / 2,939 passed (73 skipped), 6 m 38 s | 29/29 steps, 2,255 / 2,284 passed (29 skipped), 3 m 33 s |
+| items 3 and 2 (`b54bef9`, `168b495`) | 49/49 steps, 2,873 / 2,946 passed (73 skipped), 8 m 26 s beside a loop | 29/29 steps, 2,234 / 2,263 passed (29 skipped) |
+
+Two macOS runs on the way failed one unrelated row each and were green on re-run: the write
+pipeline's admission row, and fsck's "zero false positives" row (the pre-existing loaded-host flake
+of `rung-10-tripwire-hunt.md` §8).
+
+## 6. Owed (seen beside this work, older than it)
+
+The first Linux gate on this note's commit failed two rows. Neither touches items 1–4:
+
+- **The joiner rejoin row** (`smoke.zig` "A JOINER'S CLEAN UNMOUNT AND REJOIN") fails at a fill
+  with one of two signatures: B's `no heap extent for slot N's first tree (heap full)` (the fill's
+  `dd` answers EIO), or B's next join refused (`JoinAppender refused for capacity`; the joiner maps
+  the manager's `no_space` to capacity too, `join_ladder.zig` :213). The row alone, interleaved,
+  half of the rounds under 4 × `yes` on a loaded venue: `d5e3703` (before items 1–4) failed 4 of 14
+  runs, the landed tree 2 of 13. Both signatures are a heap extent that no grant could supply when
+  a fill or a join needed one (each new slot's first tree takes a fresh extent); the cause is not
+  pinned here.
+- **`nvmet fidelity: sigstop-preempt`** read `writer_guard_verdict` `healthy` beside
+  `writer_guard_fenced` 1. The counter is process-wide (`journal.FailureLatch.noteFence`) and the
+  verdict is one lane's latch (`guard/gate.zig` :155): when another volume's lane met the
+  reservation conflict first, the stats snapshot can show the counter before the gate's own latch.

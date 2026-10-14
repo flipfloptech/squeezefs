@@ -183,6 +183,21 @@ whose fragments would push the merged record past it is CUT; a return that would
 **v4:** `ExtentGrantWire{version u16 = 1, reserved u16 = 0, n_runs u32}` ‖ `GrantRunWire{start u64,
 len u32, reserved u32}` × n (16 B, aligned); same normalization law, same `maxRuns(value_cap)` derivation.
 
+**v5 (rung 10 symmetric defects, decision 0003 §AE.4, 0002 row 525): a FAMILY of chunks.** Key
+`kind ‖ tag 3 ‖ appender u32 BE ‖ id u64 BE` (14 B; one appender's chunks are one range walk, the
+move marker at id `u64::MAX` last). Value `ExtentGrantChunkHead{version u16 = 2, kind u8 (1 runs,
+2 marker), reserved u8, n_runs u32, appender u32, reserved u32, id u64, staged_lo u64, staged_hi
+u64, csum u64}` (48 B; the head repeats the key's appender and id; `checksum.stamp` over the whole
+value) ‖ `GrantRunWire` × n, 1 ≤ n ≤ 253 (a chunk ≤ 4 KiB: one journal page, below every node's
+value cap). The record = the union of the effective chunks (pairwise disjoint; adjacent runs across
+a chunk bound coalesce). A change REPLACES only the chunks whose owned share of the extent space
+(from a chunk's first run to the next chunk's) changed, under fresh ids; a replacement that does not
+fit its change's entry is STAGED: the marker `[staged_lo, staged_hi]` + the fresh chunks first (no
+reader counts a staged chunk), then the change's own entry deletes the replaced chunks and the
+marker. A marker found at a later load never landed: its chunks and the marker are deleted before
+the next change. The run cap and its refusals are gone; a carve is cut to what ONE entry carries
+beside its `alloc` deltas (≈ 2,298 extents: an `alloc` frame and, at worst, one chunk delete each).
+
 ### 1.4 `appender_hint:{identity}` (`SS:329-476`)
 
 What an IDENTITY's predecessor incarnation grew to under load — read at its next `JoinAppender`, so a

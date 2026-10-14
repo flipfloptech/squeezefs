@@ -716,6 +716,14 @@ tree 0's `g` under another lessee / `.stale_entry` below `g` / `.drop_entry` for
 (`PLT:L757-772`); `PLT.liveOnTwoPages(pages)` (`L777-787`). The mount-path gate already refuses on
 `.conflict`; fsck's C14 is the same two functions over the appender directory
 (`sym/appender_dir.zig`) + `control_records.SlotState`.
+Port addition (rung 10 symmetric defects, decision 0003 §AE.4): the census also reads every
+volume's `extent_grant` records WHOLE — each appender's chunk family (`extent_grant:{a}:{id}`)
+loaded through `grant_record.Family.load` (every chunk's stamp, its head bound to its key, the
+effective chunks disjoint; chunks a present move marker stages excluded). A family that does not
+assemble is `C14GrantRecordCorrupt{vol, appender}`: report-only (the record is the manager's only
+attestation of the grant — no chunk can be told right from wrong, and a rewritten record would name
+extents another custodian holds); a marker is legal crash residue (a staged change that never
+landed), swept by the manager's next change of that record, never a finding.
 
 ### 3.15 C15 — un-recovered appender (`FSCK:L761-775`, `L4691-4725`; recheck `L6283-6332`; repair `L8968-9033`)
 

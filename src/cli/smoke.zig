@@ -1932,7 +1932,11 @@ test "smoke: INVALIDATION COHERENCE ACROSS DAEMONS (decision 0003 §AB.2) — ev
         try testing.expectEqualStrings("no\n", before);
         const made = try b.onMount("touch d/x && echo ok");
         gpa.free(made);
-        const after = try rig.onMount("test -e d/x && echo yes || echo no");
+        // A's own kernel is invalidated by its notifier thread, which the
+        // served step's ack does not wait for (0003 §AB.2 (2)): the row
+        // waits for the observable within 2 s — a lost invalidation keeps
+        // the negative for the whole 60 s TTL.
+        const after = try rig.onMount("for i in $(seq 100); do test -e d/x && { echo yes; exit 0; }; sleep 0.02; done; echo no");
         defer gpa.free(after);
         try testing.expectEqualStrings("yes\n", after);
     }

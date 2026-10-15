@@ -806,6 +806,23 @@ pub const Table = struct {
         return out[0..n];
     }
 
+    /// Up to `out.len` blocks of `ino` parked at or before `born_by` (a
+    /// durability point's own set: custody born after it began is a later
+    /// write's).
+    pub fn bornByOf(self: *Table, ino: u64, born_by: u64, out: []u32) []u32 {
+        self.lock.lock();
+        defer self.lock.unlock();
+        var n: usize = 0;
+        var it = self.index.iterator();
+        while (it.next()) |kv| {
+            if (n == out.len) break;
+            if (kv.key_ptr.ino != ino or kv.value_ptr.*.born_ns > born_by) continue;
+            out[n] = kv.key_ptr.block;
+            n += 1;
+        }
+        return out[0..n];
+    }
+
     pub fn blocksOf(self: *Table, ino: u64, out: []u32) []u32 {
         self.lock.lock();
         defer self.lock.unlock();
@@ -1235,6 +1252,34 @@ fn clearInflight(table: *Table, deps: UploadDeps, io: Io, ino: u64, block: u32) 
 /// A deferred full buffer over the same kind of mapping drains IN PLACE
 /// the same way (`drainInPlaceLocked`, decision 0003 §AK): an extending
 /// append's drain is its 1–2 touched pages, never the block.
+/// What `flushBornBy` left: blocks that stayed parked (the ENOSPC wall)
+/// and whether a fence dropped one.
+pub const BornByFlush = struct { stay_parked: u32 = 0, fenced: bool = false };
+
+/// Every block `ino` parked at or before `born_by` through
+/// `flushParkedBlock`, one buffer per pass until a pass sees the set's end
+/// or lands nothing: an ino parks one partial block per block a random
+/// writer touched — past any single buffer — and a durability point that
+/// stopped at the first buffer returned with the rest in RAM. Blocks born
+/// later are a later write's, so a concurrent writer never extends it.
+pub fn flushBornBy(table: *Table, deps: UploadDeps, io: Io, ino: u64, born_by: u64) BornByFlush {
+    var out: BornByFlush = .{};
+    // One pass's buffer: the census below the table's lock, on the stack.
+    var blocks: [64]u32 = undefined;
+    while (true) {
+        const bl = table.bornByOf(ino, born_by, &blocks);
+        var landed = false;
+        out.stay_parked = 0;
+        for (bl) |b| switch (flushParkedBlock(table, deps, io, ino, b)) {
+            .published, .discarded, .joined => landed = true,
+            .superseded => {},
+            .fence_drop => out.fenced = true,
+            .stay_parked => out.stay_parked += 1,
+        };
+        if (bl.len < blocks.len or !landed) return out;
+    }
+}
+
 pub fn flushParkedBlock(table: *Table, deps: UploadDeps, io: Io, ino: u64, block: u32) Disposition {
     const bs: u64 = table.block_size;
     {

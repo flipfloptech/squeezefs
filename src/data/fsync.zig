@@ -516,18 +516,13 @@ fn flushParkedKeys(ctx: Ctx, io: Io, keys: []const accumulate.Key) Error!void {
     }
 }
 
+/// Every block the ino parked before this fsync began (`flushBornBy`: all
+/// of them, not one buffer's worth — the ordered law journals the claim
+/// the fsync found on the strength of this leg).
 fn flushParked(ctx: Ctx, io: Io, ino: u64, retried: bool) Error!void {
-    var blocks: [64]u32 = undefined;
-    const bl = ctx.table.blocksOf(ino, &blocks);
-    var parked_after: u32 = 0;
-    for (bl) |b| {
-        switch (accumulate.flushParkedBlock(ctx.table, ctx.upload, io, ino, b)) {
-            .published, .discarded, .superseded, .joined => {},
-            .fence_drop => return error.WriterGuardFenced,
-            .stay_parked => parked_after += 1,
-        }
-    }
-    if (parked_after == 0) return;
+    const left = accumulate.flushBornBy(ctx.table, ctx.upload, io, ino, clock.monotonicNs());
+    if (left.fenced) return error.WriterGuardFenced;
+    if (left.stay_parked == 0) return;
     if (retried) return error.NoSpaceLeft;
     // The ENOSPC ladder: a data barrier releases nothing by itself but
     // orders the parked supply's close; the parking close of THIS ino's

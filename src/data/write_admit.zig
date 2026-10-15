@@ -1340,8 +1340,7 @@ pub const WritePath = struct {
     /// overlay drains (write-back class), the epoch closes.
     pub fn flushIno(self: *WritePath, io: Io, ino: u64) void {
         _ = self.overlay.drainForIno(io, &self.locks, ino, std.math.maxInt(u64), false, self.closeSeams());
-        var blocks: [64]u32 = undefined;
-        for (self.table.blocksOf(ino, &blocks)) |b| _ = accumulate.flushParkedBlock(&self.table, self.uploadDeps(), io, ino, b);
+        _ = accumulate.flushBornBy(&self.table, self.uploadDeps(), io, ino, clock.monotonicNs());
         _ = self.epochs.close(io, ino, self.closeSeams());
     }
 

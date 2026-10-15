@@ -270,8 +270,37 @@ test "tcp e2e: a severed connection surfaces HolderUnreachable (EAGAIN) to the c
     try testing.expectEqual(@as(u32, 1), l.severAllConnections());
     t.join();
     try testing.expectEqual(@as(?anyerror, error.HolderUnreachable), parked_result);
-    hold.gate.store(1, .release);
-    futex.wakeAll(&hold.gate);
+    hold.open();
+}
+
+test "tcp e2e: A SERVED VERB NEVER PARKS HOLDING THE SESSION (decision 0003 §AM; the move matrix's offered leg — B's unlink parked 218 s behind its own acquire_slot, then HolderUnresolved): a call parked in its handler holds its own lane only — a second call multiplexed on the same session is answered while the first is still parked (it waited behind it to the reply bound: HolderUnreachable), and the parked call answers its own reply once released" {
+    var svc: service.Service = .init;
+    var hold: Hold = .{};
+    svc.register(.resolve_slot, .{ .ctx = &hold, .serve = Hold.serve });
+    const l = try startListener(&svc);
+    defer l.stop();
+    var c = dialer.Client.init(testing.allocator, testing.io, l.advertised, secret, identityOf(8));
+    defer c.deinit();
+    var out: [64]u8 = undefined;
+    _ = try c.callTyped(.{ .ping = .{} }, &out);
+    const mux = c.mux.?;
+    var parked_result: ?anyerror = error.TestNotRun;
+    const t = try std.Thread.spawn(.{}, Parked.run, .{ mux, &parked_result });
+    // A red run fails here instead of parking the listener's stop on the
+    // held handler.
+    errdefer {
+        hold.open();
+        t.join();
+    }
+    while (hold.entered.load(.acquire) == 0) std.Thread.yield() catch {};
+    // The first call is parked in its handler: the second rides the same
+    // session and is served beside it.
+    _ = try mux.callTyped(.{ .ping = .{} }, &out);
+    try testing.expectEqual(@as(u32, 1), hold.entered.load(.acquire));
+    hold.open();
+    t.join();
+    try testing.expectEqual(@as(?anyerror, null), parked_result);
+    try testing.expectEqual(@as(u32, 1), l.liveConnections());
 }
 
 /// A handler that parks until released (the slow holder).
@@ -284,6 +313,11 @@ const Hold = struct {
         _ = self.entered.fetchAdd(1, .acq_rel);
         while (self.gate.load(.acquire) == 0) futex.wait(&self.gate, 0);
         return .{ .ok = .{ .resolve_slot = .{ .kind = 1, .reserved = @splat(0), .appender_id = 0, .g = 0, .reserved2 = 0 } } };
+    }
+
+    fn open(self: *Hold) void {
+        self.gate.store(1, .release);
+        futex.wakeAll(&self.gate);
     }
 };
 

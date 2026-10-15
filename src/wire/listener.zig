@@ -36,6 +36,7 @@ const codec = @import("codec.zig");
 const verbs = @import("verbs.zig");
 const auth = @import("auth.zig");
 const session = @import("session.zig");
+const dialer = @import("dialer.zig");
 const service = @import("service.zig");
 const endpoint = @import("endpoint.zig");
 const stats = @import("stats.zig");
@@ -62,12 +63,17 @@ pub const MAX_CONNS_FLOOR: u32 = 64;
 pub const CONNECTION_FDS: u32 = 2;
 /// The listener may spend a quarter of `RLIMIT_NOFILE` (the `fd_cache_cap` law).
 pub const LISTENER_FD_SHARE: u32 = 4;
-/// A serve that holds a session this long is named loud: the request loop
-/// is sequential per connection, so a parked serve (a grant on an object
-/// in flight, a guard behind a held lock) stalls every call the dialer
-/// multiplexed on the session — a tenth of the dialer's reply bound, so
-/// the warning lands before the callers time out.
+/// A serve that holds its lane this long is named loud: its caller gives
+/// up at the dialer's reply bound (a grant on an object in flight, a
+/// transfer behind a drain) — a tenth of that bound, so the warning lands
+/// before the caller times out.
 pub const SLOW_SERVE_WARN_MS: u64 = session.DIAL_TIMEOUT_MS / 10;
+/// A session's serving lanes (decision 0003 §AM: a served verb never parks
+/// holding the session's serving capacity): one per call the peer's mux
+/// can have in flight, so a call never waits behind another call's serve
+/// — a parked serve holds its own lane, never the session. Spawned only
+/// as concurrency asks for them (a sequential peer costs two).
+pub const SERVE_LANES_MAX: u32 = dialer.MUX_IN_FLIGHT;
 /// Accept errors ride a doubling backoff: a bare `continue` turned EMFILE
 /// into a busy loop.
 pub const ACCEPT_BACKOFF_MIN_MS: u64 = 5;
@@ -405,26 +411,220 @@ fn connMain(conn: *Conn) void {
     defer conn.sess.deinit();
     if (!handshake(conn, binding[0..binding_len])) return;
     defer if (l.departure.load(.acquire)) |d| d.call(d.ctx, conn.id);
-    while (!l.stopping.load(.acquire)) {
-        const in = conn.sess.recvFrame(session.SESSION_IDLE_TIMEOUT_MS) catch |e| {
-            switch (e) {
-                error.Eof, error.Timeout => {},
-                else => log.warn("cluster wire: connection {d} closed on {t}", .{ conn.id, e }),
-            }
+    var lanes: Lanes = .{ .conn = conn };
+    defer lanes.joinAll();
+    var lane0: Lane = .{ .lanes = &lanes, .out = conn.sess.send_buf, .scratch = conn.sess.scratch };
+    defer lane0.in.deinit(l.gpa);
+    lane0.run();
+}
+
+/// The session's lanes, leader/follower: ONE lane at a time holds the
+/// READER role (`recvFrame`; the receive MAC sequence is per direction, so
+/// frames are read in order by one thread); on a call it copies the frame,
+/// hands the role on (an idle lane, else a new one up to the cap) and
+/// serves on its own buffers; the reply is sealed and written under the
+/// send lock (the send sequence is per direction too). A lane whose serve
+/// parks holds only itself; at the cap the next frame waits for a lane to
+/// finish (the peer's mux has no more calls in flight than the cap).
+const Lanes = struct {
+    conn: *Conn,
+    mutex: Io.Mutex = .init,
+    /// Idle lanes wait here for the reader role.
+    cond: Io.Condition = .init,
+    send_lock: Io.Mutex = .init,
+    reader_taken: bool = false,
+    idle: u32 = 0,
+    serving: u32 = 0,
+    closing: bool = false,
+    /// Lanes beyond the connection thread's (lane 0).
+    spawned: std.ArrayList(*Lane) = .empty,
+
+    fn io(self: *Lanes) Io {
+        return self.conn.listener.io;
+    }
+
+    /// The reader role; false once the session closes.
+    fn takeReader(self: *Lanes) bool {
+        const lio = self.io();
+        self.mutex.lockUncancelable(lio);
+        defer self.mutex.unlock(lio);
+        while (!self.closing and self.reader_taken) {
+            self.idle += 1;
+            self.cond.waitUncancelable(lio, &self.mutex);
+            self.idle -= 1;
+        }
+        if (self.closing) return false;
+        self.reader_taken = true;
+        return true;
+    }
+
+    /// A call is in hand: the role goes to an idle lane, else to a new one
+    /// while under the cap (else the next lane to finish takes it).
+    fn handOn(self: *Lanes) void {
+        const l = self.conn.listener;
+        const lio = self.io();
+        self.mutex.lockUncancelable(lio);
+        defer self.mutex.unlock(lio);
+        self.reader_taken = false;
+        self.serving += 1;
+        if (self.idle > 0) {
+            self.cond.signal(lio);
+            return;
+        }
+        if (self.closing or self.spawned.items.len + 1 >= SERVE_LANES_MAX) return;
+        // Out of memory or threads: no new lane; the next lane to finish
+        // its serve takes the role (the sequential loop's shape).
+        self.spawned.ensureUnusedCapacity(l.gpa, 1) catch return;
+        const lane = Lane.create(self) catch return;
+        lane.thread = std.Thread.spawn(.{}, Lane.runSpawned, .{lane}) catch {
+            lane.destroy(l.gpa);
             return;
         };
-        if (in.header.isReply()) return; // a reply on the serving half is a protocol error
+        self.spawned.appendAssumeCapacity(lane);
+        stats.cluster_wire_serve_lanes.inc();
+    }
+
+    fn served(self: *Lanes) void {
+        const lio = self.io();
+        self.mutex.lockUncancelable(lio);
+        defer self.mutex.unlock(lio);
+        self.serving -= 1;
+    }
+
+    /// The reader met the end (EOF, a framing failure, the stop nudge):
+    /// every idle lane leaves, a serving lane after its reply.
+    fn close(self: *Lanes) void {
+        const lio = self.io();
+        self.mutex.lockUncancelable(lio);
+        defer self.mutex.unlock(lio);
+        self.closing = true;
+        self.reader_taken = false;
+        self.cond.broadcast(lio);
+    }
+
+    /// An idle read timeout ends the session only while no serve is in
+    /// flight (a parked serve's reply is still owed to its caller).
+    fn idleEnds(self: *Lanes) bool {
+        const lio = self.io();
+        self.mutex.lockUncancelable(lio);
+        defer self.mutex.unlock(lio);
+        return self.serving == 0;
+    }
+
+    fn releaseReader(self: *Lanes) void {
+        const lio = self.io();
+        self.mutex.lockUncancelable(lio);
+        defer self.mutex.unlock(lio);
+        self.reader_taken = false;
+        self.cond.signal(lio);
+    }
+
+    /// Lane 0's last act before the connection's teardown: every spawned
+    /// lane joined (a serving one finishes its serve first).
+    fn joinAll(self: *Lanes) void {
+        self.close();
+        for (self.spawned.items) |lane| {
+            lane.thread.?.join();
+            lane.destroy(self.conn.listener.gpa);
+        }
+        self.spawned.deinit(self.conn.listener.gpa);
+    }
+};
+
+const Lane = struct {
+    lanes: *Lanes,
+    /// The reply frame (header + payload window + MAC) and the handler's
+    /// scratch: lane 0 uses the session's own, a spawned lane its own
+    /// (virtual reservations, `session.SEND_BUF_LEN`'s law).
+    out: []u8,
+    scratch: []u8,
+    /// The call's payload, copied out of the session's receive buffer
+    /// before the reader role moves on.
+    in: std.ArrayList(u8) = .empty,
+    thread: ?std.Thread = null,
+    owns_buffers: bool = false,
+
+    fn create(lanes: *Lanes) !*Lane {
+        const gpa = lanes.conn.listener.gpa;
+        const out = try gpa.alloc(u8, session.SEND_BUF_LEN);
+        errdefer gpa.free(out);
+        const scratch = try gpa.alloc(u8, frame.CONTROL_CAP);
+        errdefer gpa.free(scratch);
+        const lane = try gpa.create(Lane);
+        lane.* = .{ .lanes = lanes, .out = out, .scratch = scratch, .owns_buffers = true };
+        return lane;
+    }
+
+    fn destroy(self: *Lane, gpa: std.mem.Allocator) void {
+        self.in.deinit(gpa);
+        if (self.owns_buffers) {
+            gpa.free(self.out);
+            gpa.free(self.scratch);
+        }
+        gpa.destroy(self);
+    }
+
+    fn runSpawned(self: *Lane) void {
+        var name_buf: thread_name.CommBuf = undefined;
+        _ = thread_name.nameCurrentThread(&name_buf, CONN_THREAD_NAME);
+        self.run();
+    }
+
+    fn run(self: *Lane) void {
+        const lanes = self.lanes;
+        const conn = lanes.conn;
+        const l = conn.listener;
+        while (lanes.takeReader()) {
+            if (l.stopping.load(.acquire)) return lanes.close();
+            const in = conn.sess.recvFrame(session.SESSION_IDLE_TIMEOUT_MS) catch |e| {
+                switch (e) {
+                    error.Timeout => if (!lanes.idleEnds()) {
+                        lanes.releaseReader();
+                        continue;
+                    },
+                    error.Eof => {},
+                    else => log.warn("cluster wire: connection {d} closed on {t}", .{ conn.id, e }),
+                }
+                return lanes.close();
+            };
+            // A reply on the serving half is a protocol error.
+            if (in.header.isReply()) return lanes.close();
+            self.in.clearRetainingCapacity();
+            self.in.appendSlice(l.gpa, in.payload) catch return lanes.close();
+            const header = in.header;
+            lanes.handOn();
+            self.serveOne(header);
+            lanes.served();
+        }
+    }
+
+    fn serveOne(self: *Lane, header: frame.Header) void {
+        const lanes = self.lanes;
+        const conn = lanes.conn;
+        const out = self.serveCall(header);
+        const lio = lanes.io();
+        lanes.send_lock.lockUncancelable(lio);
+        defer lanes.send_lock.unlock(lio);
+        const rh = conn.sess.framer.nextHeaderRaw(header.verb, header.schema, out.status, header.correlation, true);
+        const n = conn.sess.framer.seal(rh, self.out, out.payload.len) catch return;
+        // A failed write breaks the session: the reader's next read fails
+        // on the shut socket and closes every lane.
+        conn.sess.link.writeAll(self.out[0..n]) catch conn.link.link().shutdown();
+    }
+
+    fn serveCall(self: *Lane, header: frame.Header) service.Served {
+        const conn = self.lanes.conn;
+        const l = conn.listener;
         const t_serve = clock.monotonicNs();
-        const served = l.svc.serve(in.header, in.payload, conn.peer, conn.id, conn.sess.payloadWindow(), conn.sess.scratch);
+        const out = l.svc.serve(header, self.in.items, conn.peer, conn.id, self.out[frame.HEADER_LEN..][0..frame.CONTROL_CAP], self.scratch);
         const serve_ms = (clock.monotonicNs() -| t_serve) / std.time.ns_per_ms;
         if (serve_ms >= SLOW_SERVE_WARN_MS) {
             stats.cluster_wire_slow_serves.inc();
-            log.warn("cluster wire: connection {d}: {s} served in {d} ms — every call multiplexed on this session waited behind it", .{ conn.id, verbs.Verb.nameOf(in.header.verb), serve_ms });
+            log.warn("cluster wire: connection {d}: {s} served in {d} ms — its caller's reply bound is {d} ms", .{ conn.id, verbs.Verb.nameOf(header.verb), serve_ms, session.DIAL_TIMEOUT_MS });
         }
-        const rh = conn.sess.framer.nextHeaderRaw(in.header.verb, in.header.schema, served.status, in.header.correlation, true);
-        conn.sess.sendSealed(rh, served.payload.len) catch return;
+        return out;
     }
-}
+};
 
 /// A plaintext `Refused` handshake frame straight onto the raw socket (no
 /// session: the peer never got a Challenge and never will).

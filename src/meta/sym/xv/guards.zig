@@ -12,14 +12,14 @@
 //! key (`dlm.Manager.covers`), so a scope that parked unrelated keys never
 //! lets a step apply unguarded.
 //!
-//! The served acquisition NEVER PARKS THE SESSION (decision 0003 §Q): a
-//! listener serves one frame at a time per connection while the dialer
-//! multiplexes every call of a daemon to that peer on ONE session, so a
-//! served ask parked on a stripe another parked scope of the SAME
-//! initiator holds would wait behind itself — that scope's step and
-//! release frames queue behind the parked serve (found by the shared hot
-//! directory row: the holder's migration and its own creates into one
-//! stripe wedged the session until the grace belt). The holder takes the
+//! The served acquisition NEVER PARKS (decision 0003 §Q): a served ask
+//! parked on a stripe another parked scope of the SAME initiator holds
+//! waits on that scope's release — when the listener served one frame at
+//! a time per connection the release queued behind the parked serve
+//! itself (found by the shared hot directory row: the holder's migration
+//! and its own creates into one stripe wedged the session until the grace
+//! belt); the session's lanes (§AM) bound that to one lane, and a parked
+//! ask would still hold its initiator's op for nothing. The holder takes the
 //! set in the TRY form and answers `Busy` on contention; the initiator
 //! retries the ask on its own thread with a doubling backoff under the
 //! wire's reply bound — the patience a parked ask had, spent where it
@@ -47,6 +47,7 @@ const verbs = @import("../../../wire/verbs.zig");
 const service = @import("../../../wire/service.zig");
 const codec = @import("../../../wire/codec.zig");
 const dlm = @import("../../dlm.zig");
+const lock_order = @import("../../../sync/lock_order.zig");
 const token_cache = @import("../tokens/token_cache.zig");
 const token_table = @import("../tokens/token_table.zig");
 
@@ -219,6 +220,12 @@ pub const ParkedScopes = struct {
             stats.xv_cross_owner_guards_contended.inc();
             return error.Contended;
         };
+        // The set is the parked scope's from here: `XvRelease` or the
+        // sweep releases it on whichever serving lane or thread runs them,
+        // so this frame's lock-order ledger lets go of it now (the
+        // conveyor's hand-off; a release on a thread that never recorded
+        // the acquisition is a no-op).
+        lock_order.handedOff(.object);
         errdefer set.release(self.io);
         self.lock.lockUncancelable(self.io);
         defer self.lock.unlock(self.io);
@@ -594,6 +601,29 @@ test "the parked scopes: a served XvGuards parks the holder's canonical set unde
     parked.liveness = null;
     try testing.expectEqual(@as(u32, 0), parked.sweepExpired(now));
     try testing.expect(parked.isParked(mintScope(6)));
+}
+
+test "a served XvGuards hands its set to the parked scope (0003 §AM; the move matrix under serving lanes fired `lock_order_ledger_overflows`): the serving thread's lock-order ledger holds no 4a entry once the scope parked, and an `XvRelease` served on ANOTHER thread drops the stripes" {
+    const gpa = testing.allocator;
+    var locks = try dlm.Manager.init(gpa, 64);
+    defer locks.deinit();
+    var parked = ParkedScopes.init(gpa, testing.io, &locks);
+    defer parked.deinit();
+    const scope = mintScope(6);
+    try parked.serve(scope, 7, &.{.{ .ino = 20, .mode = .exclusive }}, &.{.{ .parent = 20, .name = "b", .mode = .exclusive }});
+    try testing.expect(parked.isParked(scope));
+    try testing.expect(!lock_order.enabled or !lock_order.holds(.object));
+    const Release = struct {
+        fn run(p: *ParkedScopes, sc: Scope, was: *bool) void {
+            was.* = p.release(sc);
+        }
+    };
+    var was = false;
+    const t = try std.Thread.spawn(.{}, Release.run, .{ &parked, scope, &was });
+    t.join();
+    try testing.expect(was);
+    var again = (try locks.tryLockMany(testing.io, &.{.{ .ino = 20, .mode = .exclusive }}, &.{})).?;
+    again.release(testing.io);
 }
 
 test "clientOf: the token client id of the peer's member id — stable, distinct across two members, 0 for an unproven session" {

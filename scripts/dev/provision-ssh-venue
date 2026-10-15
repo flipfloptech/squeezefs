@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# Provision an ssh venue (a bare Linux box, e.g. kamrui-dev) with what the
+# `sqz-zig` container gets from its image and its kernel. Idempotent: every step
+# checks before it acts. Run as root ON the box — `scripts/venue up` does it.
+#
+#   1. the kernel modules the nvmet / NVMe-oF / kTLS rows need, loaded now and
+#      persisted in /etc/modules-load.d/sqz.conf (a stock distro kernel ships
+#      them as modules; the venue kernel has them built in);
+#   2. IOR/mdtest at io500's pinned hash into /opt/sqz-tools, exactly as
+#      scripts/dev/Containerfile builds them, and root runs allowed for OpenMPI;
+#   3. the facts a gate log is read against (kernel, openssl, fusermount3).
+set -euo pipefail
+
+[ "$(id -u)" = 0 ] || { echo "provision: run as root" >&2; exit 1; }
+
+# nvmet + its loop and tcp transports (ops/nvmet rows), the initiator side
+# nvme-tcp/nvme-fabrics (the host-scoped parameter row), tls (kTLS rows).
+MODULES=(nvmet nvmet-tcp nvme-loop nvme-tcp nvme-fabrics tls)
+for m in "${MODULES[@]}"; do modprobe "$m"; done
+conf=/etc/modules-load.d/sqz.conf
+want=$(printf '%s\n' "# squeezefs venue (scripts/dev/provision-ssh-venue)" "${MODULES[@]}")
+if [ ! -f "$conf" ] || [ "$(cat "$conf")" != "$want" ]; then printf '%s\n' "$want" >"$conf"; fi
+mountpoint -q /sys/kernel/config || mount -t configfs none /sys/kernel/config
+
+# The hash io500 sc26 pins (docs/gates/brackets.md); the same as the image's.
+# Spelled out in full: the commit is reachable today only from a pull-request
+# ref, so a fresh clone lacks it and GitHub fetches an unadvertised commit only
+# by its full id (a short id answers "couldn't find remote ref").
+IOR_COMMIT=5528b3619236d475a864a8021ab56d6b5c1aafa2
+PREFIX=/opt/sqz-tools
+stamp="$PREFIX/.ior-${IOR_COMMIT:0:16}"
+if [ ! -f "$stamp" ]; then
+  for p in autoconf automake libtool pkg-config git make gcc fio openmpi-bin libopenmpi-dev; do
+    dpkg -s "$p" >/dev/null 2>&1 || DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "$p"
+  done
+  src=$(mktemp -d /tmp/ior.XXXXXX)
+  git clone -q https://github.com/hpc/ior.git "$src"
+  (cd "$src" && git fetch -q origin "$IOR_COMMIT" && git checkout -q "$IOR_COMMIT" && ./bootstrap >/dev/null \
+    && ./configure -q --prefix="$PREFIX" && make -s -j"$(nproc)" && make -s install)
+  rm -rf "$src"
+  touch "$stamp"
+fi
+
+# Commands run as root (`sudo bash -lc`), and OpenMPI refuses root without both.
+profile=/etc/profile.d/sqz-tools.sh
+want_profile=$(printf '%s\n' "# squeezefs venue (scripts/dev/provision-ssh-venue)" \
+  "export PATH=$PREFIX/bin:\$PATH" "export OMPI_ALLOW_RUN_AS_ROOT=1" "export OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1")
+if [ ! -f "$profile" ] || [ "$(cat "$profile")" != "$want_profile" ]; then printf '%s\n' "$want_profile" >"$profile"; fi
+
+mkdir -p /build/zig-cache-v2 /build/zig-global-cache /build/tmp
+chmod 1777 /build/tmp
+
+echo "kernel:   $(uname -r) ($(uname -m)), $(nproc) cpus, $(free -g | awk 'NR==2{print $2}') GiB"
+echo "modules:  $(for m in "${MODULES[@]}"; do [ -d "/sys/module/${m//-/_}" ] && printf '%s ' "$m"; done)"
+echo "openssl:  $(openssl version)"
+echo "fuse:     $(fusermount3 --version 2>&1 | head -1); enable_uring=$(cat /sys/module/fuse/parameters/enable_uring 2>/dev/null || echo absent)"
+echo "tools:    $(PATH=$PREFIX/bin:$PATH command -v ior mdtest | tr '\n' ' ')fio $(fio --version)"

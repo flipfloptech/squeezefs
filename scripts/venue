@@ -65,7 +65,8 @@ sync_tree() {
 up() {
   if [ "$VENUE" != vm ]; then
     sync_tree
-    "${SSH[@]}" "$SSH_HOST" "sudo mkdir -p /build/zig-cache-v2 /build/zig-global-cache /build/tmp && sudo chmod 1777 /build/tmp && echo \"venue $VENUE ready: \$(uname -r) \$(nproc) cpus \$(free -g | awk 'NR==2{print \$2}') GiB\""
+    # Modules, IOR/mdtest, root-MPI env: what the container gets from its image.
+    "${SSH[@]}" "$SSH_HOST" "sudo bash '$REPO/scripts/dev/provision-ssh-venue'"
     return
   fi
   container volume create "$CACHE_VOL" >/dev/null 2>&1 || true

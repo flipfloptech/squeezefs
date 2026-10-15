@@ -1342,6 +1342,46 @@ pub const WritePath = struct {
     /// rewrite epoch open or saving: the no-open FLUSH's try-only probe
     /// (decision 0003 §AF). Spin-locked O(1)-or-scan sections only — never
     /// a device wait, a park, or a lock held across I/O.
+    /// THE ORDERED LAW's floor (decision 0003 §AL.5): the lowest byte of
+    /// `ino` its RAM write custody covers (`maxInt` when it holds none).
+    /// Every byte below it the file wrote is on a device (behind the data
+    /// barrier) or in the staging ring, so a size claim up to it may be
+    /// journaled. A parked block answers its lowest covered byte (read
+    /// under its (3): a continuous appender's tail block never pins the
+    /// size at its block start); an open overlay record answers its block's
+    /// start; a rewrite epoch answers 0 — its landed blocks are named only
+    /// by its save, and the map still names the blocks it displaces.
+    pub fn custodyFloor(self: *WritePath, io: Io, ino: u64) u64 {
+        if (self.epochs.holds(ino)) return 0;
+        const bs = self.cfg.block_size;
+        var floor: u64 = std.math.maxInt(u64);
+        if (self.overlay.registry.lowestBlockOf(ino)) |b| floor = @as(u64, b) * bs;
+        if (self.table.lowestBlockOf(ino)) |b| {
+            const g = self.locks.acquire(io, ino, b, .writeback_flush);
+            defer g.release(io);
+            // Retired since the scan: its block start (the next drain
+            // reads the advance).
+            const rel: u64 = if (self.table.get(ino, b)) |e| lowestCovered(e) else 0;
+            floor = @min(floor, @as(u64, b) * bs + rel);
+        }
+        return floor;
+    }
+
+    fn lowestCovered(e: *const accumulate.Entry) u64 {
+        switch (e.repr) {
+            .full => {
+                var buf: [cov.CoverageUnion.max_runs]cov.Run = undefined;
+                const runs = e.coverage.runsSorted(&buf);
+                return if (runs.len == 0) 0 else runs[0].start;
+            },
+            .extent => |*x| {
+                var buf: [extent.MAX_PAGES]extent.Run = undefined;
+                const runs = x.pageRuns(&buf);
+                return if (runs.len == 0) 0 else runs[0].start;
+            },
+        }
+    }
+
     pub fn holdsCustody(self: *WritePath, ino: u64) bool {
         return self.table.holdsIno(ino) or self.overlay.registry.holdsIno(ino) or self.epochs.holds(ino);
     }

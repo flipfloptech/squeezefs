@@ -415,6 +415,27 @@ pub fn fsync(ctx: Ctx, io: Io, ino: u64, prof: *Prof) Error!void {
     prof.mark(.extent_barrier);
 }
 
+/// THE ORDERED LAW's data barrier (decision 0003 §AL.5): fsync's DATA
+/// BARRIER leg once for a batch of inos — every volatile namespace they
+/// touched since their last barrier flushed — before the times drain
+/// journals their size claims. Their custody below the claims landed
+/// already (the drain clips each claim to its custody floor).
+pub fn barrierInos(ctx: Ctx, io: Io, inos: []const u64) Error!void {
+    var observed: [64]u64 = undefined;
+    assert(inos.len <= observed.len);
+    var bits: u64 = 0;
+    for (inos, observed[0..inos.len]) |ino, *o| {
+        o.* = ctx.touched.observe(ino);
+        bits |= TouchedTable.bitsOf(o.*);
+    }
+    if (!ctx.levers.touched_namespaces) bits = TouchedTable.ALL_BIT;
+    var plan_buf: [256]u32 = undefined;
+    const plan = planBarriers(bits, ctx.vols, &plan_buf);
+    try runBarrierLegs(ctx, io, plan);
+    stats.fsync_data_namespaces_flushed.add(plan.len);
+    for (inos, observed[0..inos.len]) |ino, o| _ = ctx.touched.clearObserved(ino, o);
+}
+
 /// syncfs (FUSE_SYNCFS): `fsync`'s data legs for EVERY ino holding write
 /// custody when the census runs — the accumulation table's parked blocks
 /// (by key: no per-ino page bound), the device overlay's open records, the

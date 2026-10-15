@@ -305,7 +305,7 @@ pub fn assertStore(comptime T: type) void {
 /// the product; `NoData` is the volume-less set).
 pub fn assertData(comptime T: type) void {
     comptime {
-        for ([_][]const u8{ "hasVolumes", "stagingOn", "blockSize", "inlineMax", "geometry", "refsSeam", "noteShape", "forgetShape", "isPassthrough", "canStoreHeld", "write", "zeroExtension", "read", "ownBlock", "abandonOwnBlock", "ownBlockPublished", "holdReleases", "dropReleases", "freeBindings", "flushCustody", "releaseIno", "hasWriteCustody", "fsync", "statfs", "mintFileId", "stageImage", "appendStaged", "releaseStaged", "stagedLease", "readMappingImage", "lockLayout", "stageKvmapShrink", "stageKvmapCorpse", "drainKvmapSweep", "publishForeign" }) |name| {
+        for ([_][]const u8{ "hasVolumes", "stagingOn", "blockSize", "inlineMax", "geometry", "refsSeam", "noteShape", "forgetShape", "isPassthrough", "canStoreHeld", "write", "zeroExtension", "custodyFloor", "barrierData", "read", "ownBlock", "abandonOwnBlock", "ownBlockPublished", "holdReleases", "dropReleases", "freeBindings", "flushCustody", "releaseIno", "hasWriteCustody", "fsync", "statfs", "mintFileId", "stageImage", "appendStaged", "releaseStaged", "stagedLease", "readMappingImage", "lockLayout", "stageKvmapShrink", "stageKvmapCorpse", "drainKvmapSweep", "publishForeign" }) |name| {
             if (!@hasDecl(T, name)) @compileError(@typeName(T) ++ " is not a kv_fs Data face: lacks `" ++ name ++ "`");
         }
     }
@@ -989,7 +989,16 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         }
 
         fn attrOf(self: *Self, global: u64, v: InodeValue) abi.fuse_attr {
-            return codec.attrFromInode(global, v, self.blksize);
+            var shown = v;
+            if (localOf(global)) |local| shown.size = self.claimedSize(local, v) else |_| {}
+            return codec.attrFromInode(global, shown, self.blksize);
+        }
+
+        /// The size the file's readers and growers see: the durable size
+        /// folded with an extending write's parked claim (decision 0003
+        /// §AL.5) — every attr reply, the read's EOF, a write's base.
+        fn claimedSize(self: *Self, local: u64, v: InodeValue) u64 {
+            return @max(v.size, self.pending.claimOf(local));
         }
 
         fn entryOf(self: *Self, global: u64, v: InodeValue) filesystem.Entry {
@@ -1521,6 +1530,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             // The dismount sweep: every gathered corpse destroyed, then
             // every parked stamp journaled (the dismount's durability point).
             self.reclaimDrain(c) catch |e| log.err("kv_fs: dismount reclaim drain failed: {t}", .{e});
+            self.landClaims();
             _ = self.drainPendingTimes(c) catch |e| log.err("kv_fs: dismount times drain failed: {t} ({d} refinement(s) stay parked)", .{ e, self.pending.len() });
         }
 
@@ -1991,18 +2001,24 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 // custody flush below lands it BEFORE the size commits — a
                 // kill leaves the old size or the zeros, never the bytes the
                 // block held past EOF.
-                if (kind == .striped and sz > probe.size) self.data.zeroExtension(self.io, local, probe.size, sz) catch |e| return writeError(e);
+                const base = self.claimedSize(local, probe);
+                if (kind == .striped and sz > base) self.data.zeroExtension(self.io, local, base, sz) catch |e| return writeError(e);
                 // Under the lifecycle's exclusive guard: the custody lands
                 // before the clip (the layout read below is then the truth).
                 self.settleCustody(local, kind);
+                // A parked claim's bytes just landed: their barrier runs
+                // before the truncate's tx journals the size it starts from
+                // (§AL.5).
+                if (kind == .striped and self.pending.claimOf(local) != 0) try self.data.barrierData(self.io, &.{local});
                 // (3.7) before the 4a set, held across the commit (module doc).
                 layout_lock = self.data.lockLayout(self.io, local);
             }
             const t = try self.beginExclusive(local, @src());
             var t_owned = true;
             errdefer if (t_owned) self.store.abandon(t);
-            const stored = try self.readInode(local);
+            var stored = try self.readInode(local);
             if (a.attr.size) |sz| {
+                stored.size = self.claimedSize(local, stored);
                 old_size = stored.size;
                 try self.stageTruncate(c, t, local, stored, sz, &after);
             }
@@ -2642,7 +2658,8 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             }
             const local = try localOf(a.ino);
             c.stage(.meta_backend_start);
-            const v = try self.readInode(local);
+            var v = try self.readInode(local);
+            v.size = self.claimedSize(local, v);
             if (a.offset >= v.size) {
                 c.stage(.meta_backend_done);
                 return .{ .len = 0 };
@@ -2889,7 +2906,10 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             }
             const probe = try self.readInode(local);
             if (probe.mode & S.IFMT != S.IFREG) return error.InvalidArgument;
-            var old_size = probe.size;
+            // The base is the ACCEPTED size: a claim parked by an earlier
+            // write whose bytes are not durable yet is the extension law's
+            // mark (§AL.1) — its range is never this write's gap.
+            var old_size = self.claimedSize(local, probe);
             // The promotion's layout RMW runs under the (3.7) guard the
             // write took; the data plane's own I/O below runs without it.
             if (kindOf(rec) != .striped) old_size = try self.promoteToStriped(c, local, rec, probe.size);
@@ -2905,30 +2925,44 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             c.stage(.write_admitted);
             const outcome = self.data.write(self.io, local, a.offset, payload, a.class, .{ .kind = .striped, .size = old_size, .map_resident = true }, .{ .ctx = c, .parked = &stampParkedPool }) catch |e| return writeError(e);
             c.stage(.write_done);
-            // The postlude: SIZE NEVER LEADS DATA — the claim lands after the
-            // pieces were acked by their arms. A foreign-slot file's claim
-            // is ONE shipped record verb (its stamp never parks here: the
-            // holder's record is the fold's authority).
-            if (self.foreignSlot(globalOf(local))) return self.shipSizeClaim(c, local, .{ .size_claim = outcome.size_claim, .written = outcome.written });
+            // The postlude: SIZE NEVER LEADS DATA — durably (the ordered law,
+            // decision 0003 §AL.5): a size never becomes durable before the
+            // bytes it makes readable (the gap's zeros included). A
+            // foreign-slot file's claim is ONE shipped record verb, so its
+            // custody lands and its data barrier runs first (its stamp
+            // never parks here: the holder's record is the fold's authority).
+            if (self.foreignSlot(globalOf(local))) {
+                self.data.flushCustody(self.io, local);
+                try self.data.barrierData(self.io, &.{local});
+                return self.shipSizeClaim(c, local, .{ .size_claim = outcome.size_claim, .written = outcome.written });
+            }
             const t = try self.beginExclusive(local, @src());
             var t_owned = true;
             errdefer if (t_owned) self.store.abandon(t);
             var v = try self.readInode(local);
-            const size = @max(v.size, outcome.size_claim);
-            if (self.times_park and size == v.size and a.write_flags & abi.FUSE_WRITE_KILL_SUIDGID == 0) {
+            const accepted = self.claimedSize(local, v);
+            const size = @max(accepted, outcome.size_claim);
+            const claim: u64 = if (size > v.size) size else 0;
+            if (self.times_park and a.write_flags & abi.FUSE_WRITE_KILL_SUIDGID == 0) {
                 // §L.6: a size-neutral write's only record would be the
-                // 76 B Δ(mtime, ctime) — one grain-aligned window and one
-                // device round trip for two timestamps. Park the stamp
-                // under the guard instead (fold-visible on every read; the
-                // drain journals it); the tx stays empty, nothing commits.
-                try self.parkWriteTimes(local);
+                // 76 B Δ(mtime, ctime) — park the stamp under the guard
+                // (fold-visible; the drain journals it). An EXTENDING
+                // write parks its size claim with it: the drain journals
+                // the claim once its bytes are durable (§AL.5). The tx
+                // stays empty, nothing commits.
+                try self.parkWriteTimes(local, claim);
                 t_owned = false;
                 self.store.abandon(t);
             } else {
-                try self.stageInodePostlude(t, local, &v, size, a.write_flags);
+                // Strict cadence (an ack is durable): the bytes land and
+                // their barrier runs before the claim commits. A KILLPRIV
+                // write's record carries the durable size; its claim parks.
+                if (!self.times_park and claim != 0) try self.data.fsync(self.io, local, null);
+                try self.stageInodePostlude(t, local, &v, if (self.times_park) v.size else size, a.write_flags);
                 t_owned = false;
                 try self.commit(c, t);
                 _ = self.pending.retire(local);
+                if (self.times_park and claim != 0) try self.parkWriteTimes(local, claim);
             }
             self.data.noteShape(local, size, .striped);
             fuse_write_striped.inc();
@@ -2954,9 +2988,9 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         /// the caller's exclusive guard — `PendingTimes`' per-ino law): the
         /// signed monotone max, the same law `fold` serves it by. A park
         /// that crosses the cap wakes the drain ahead of its tick.
-        fn parkWriteTimes(self: *Self, local: u64) Error!void {
+        fn parkWriteTimes(self: *Self, local: u64, claim: u64) Error!void {
             const stamp = now();
-            switch (try self.pending.park(local, stamp, stamp)) {
+            switch (try self.pending.parkClaim(local, .{ .mtime = stamp, .ctime = stamp, .size = claim })) {
                 .parked => {},
                 .parked_wake_drain => self.times_drain_wake.notifyOne(self.io),
             }
@@ -2986,6 +3020,22 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         /// dropped`), never left to refuse every later batch at the door.
         fn drainTimesBatch(self: *Self, c: *Ctx, batch: []const u64) Error!u64 {
             assert(batch.len <= dlm.max_requests);
+            // The ordered law (§AL.5), BEFORE the guards ((3) is below 4a):
+            // each claim as it stands, then its custody floor (every byte
+            // under the claim was in custody before the claim parked), then
+            // ONE data barrier over the claimants' touched namespaces. The
+            // drain journals `min(claim, floor)`; a clipped claim stays.
+            var claims: [dlm.max_requests]u64 = @splat(0);
+            var claimants: [dlm.max_requests]u64 = undefined;
+            var n_claimants: usize = 0;
+            for (batch, claims[0..batch.len]) |ino, *cl| {
+                const claim = self.pending.claimOf(ino);
+                if (claim == 0) continue;
+                cl.* = @min(claim, self.data.custodyFloor(self.io, ino));
+                claimants[n_claimants] = ino;
+                n_claimants += 1;
+            }
+            if (n_claimants != 0) try self.data.barrierData(self.io, claimants[0..n_claimants]);
             var plan: economy.GuardPlan = .{};
             for (batch) |ino| {
                 plan.inode_reqs[plan.inode_len] = .{ .ino = ino, .mode = .exclusive };
@@ -2999,8 +3049,12 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             var staged: u64 = 0;
             for (batch, 0..) |ino, i| {
                 const parked = self.pending.parked(ino) orelse continue;
-                drained[i] = parked;
-                if ((try economy.stageDrainMember(t, ino, parked, try self.readInodeStored(ino))) == .staged) staged += 1;
+                var journal = parked;
+                journal.size = claims[i];
+                // A claim journaled whole retires with the stamp; a clipped
+                // (or newer) one stays parked for the next pass.
+                if (journal.size == parked.size) drained[i] = parked;
+                if ((try economy.stageDrainMember(t, ino, journal, try self.readInodeStored(ino))) == .staged) staged += 1;
             }
             t_owned = false;
             if (staged == 0) {
@@ -3016,6 +3070,18 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             };
             if (staged != 0) economy.noteDrainCommitted(staged);
             return staged;
+        }
+
+        /// Every ino holding a parked size claim lands its write custody, so
+        /// the next drain journals the claim whole (§AL.5): the dismount
+        /// and the handover's step 0 — a claim is never dropped with its
+        /// bytes still in RAM.
+        fn landClaims(self: *Self) void {
+            if (!self.data.hasVolumes()) return;
+            var held: std.ArrayList(u64) = .empty;
+            defer held.deinit(self.gpa);
+            self.pending.claimants(self.gpa, &held) catch |e| log.err("kv_fs: the claims' landing pass could not list them ({t}): their sizes stay at the durable length", .{e});
+            for (held.items) |ino| self.data.flushCustody(self.io, ino);
         }
 
         /// THE TIMES DRAIN (decision 0003 §L.6; charter §5.2 "Journal
@@ -3048,6 +3114,11 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             var inos_of_slot: std.ArrayList(u64) = .empty;
             defer inos_of_slot.deinit(self.gpa);
             try self.pending.parkedOfSlot(self.gpa, route_table.forestSlotOf(slot), &inos_of_slot);
+            // A claim's bytes land first, so the step-0 drain journals it
+            // whole while the door still admits it (§AL.5).
+            if (self.data.hasVolumes()) for (inos_of_slot.items) |ino| {
+                if (self.pending.claimOf(ino) != 0) self.data.flushCustody(self.io, ino);
+            };
             var total: u64 = 0;
             var i: usize = 0;
             while (i < inos_of_slot.items.len) : (i += dlm.max_requests) {
@@ -3073,9 +3144,9 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         /// `fsync(ino)`'s durability covers the ino's parked stamp: ONE Δ
         /// commit ahead of the barriers when one is parked, nothing
         /// otherwise (the common case is one relaxed load).
-        fn drainTimesOf(self: *Self, c: *Ctx, local: u64) Error!void {
-            if (self.pending.parked(local) == null) return;
-            _ = try self.drainTimesBatch(c, &.{local});
+        fn drainTimesOf(self: *Self, c: *Ctx, local: u64) Error!u64 {
+            if (self.pending.parked(local) == null) return 0;
+            return self.drainTimesBatch(c, &.{local});
         }
 
         /// The resident payload to its own block, the striped layout
@@ -3199,7 +3270,6 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         /// meta barrier (every acked entry durable).
         pub fn fsync(self: *Self, c: *Ctx, a: filesystem.FsyncArgs) Error!void {
             const local = try localOf(a.ino);
-            try self.drainTimesOf(c, local);
             if (self.data.hasVolumes()) {
                 const rec = try self.readLayout(local);
                 defer self.freeLayout(rec);
@@ -3207,8 +3277,13 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 c.stage(.write_admitted);
                 try self.data.fsync(self.io, local, staged_key);
                 c.stage(.write_done);
+                // The ordered law (§AL.5): the parked claim journals AFTER
+                // its bytes landed behind the data barrier, then the meta
+                // barrier that covers it.
+                if (try self.drainTimesOf(c, local) != 0) self.store.fsync() catch |e| return storeErr(e);
                 return;
             }
+            _ = try self.drainTimesOf(c, local);
             c.stage(.meta_backend_start);
             defer c.stage(.meta_backend_done);
             self.store.fsync() catch |e| return storeErr(e);
@@ -3242,6 +3317,8 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 c.stage(.write_admitted);
                 try self.data.syncfs(self.io, &prof);
                 c.stage(.write_done);
+                // The claims whose bytes the data legs just landed (§AL.5).
+                if (self.pending.len() != 0) _ = try self.drainPendingTimes(c);
             }
             c.stage(.meta_backend_start);
             defer c.stage(.meta_backend_done);
@@ -3666,6 +3743,10 @@ pub const NoData = struct {
     pub fn hasWriteCustody(_: *NoData, _: u64) bool {
         return false;
     }
+    pub fn custodyFloor(_: *NoData, _: Io, _: u64) u64 {
+        return std.math.maxInt(u64);
+    }
+    pub fn barrierData(_: *NoData, _: Io, _: []const u64) Error!void {}
     /// A volume-less set has no wire: a foreign publish cannot ship.
     pub fn publishForeign(_: *NoData, _: Io, _: u64, _: Layout, _: []const layout.DmaProof) Error!void {
         return error.HolderUnreachable;
@@ -4216,6 +4297,11 @@ const SettlingData = struct {
     /// The write-back custody a test arms (`hasWriteCustody`) and the
     /// RELEASE-class drains that landed it (`releaseIno`).
     custody_of: ?u64 = null,
+    /// The armed custody's lowest covered byte (`custodyFloor`) and the
+    /// ordered law's data barriers the times drain asked for.
+    custody_floor: u64 = 0,
+    data_barriers: u32 = 0,
+    barrier_inos: usize = 0,
     write_back_drains: u32 = 0,
     /// The (3.7) balance observed inside the flush: a held lock there is
     /// the deadlock the plane's own merge would meet.
@@ -4455,10 +4541,21 @@ const SettlingData = struct {
     pub fn hasWriteCustody(self: *SettlingData, ino: u64) bool {
         return self.custody_of == ino;
     }
+    /// The armed custody covers from `custody_floor` up.
+    pub fn custodyFloor(self: *SettlingData, _: Io, ino: u64) u64 {
+        return if (self.custody_of == ino) self.custody_floor else std.math.maxInt(u64);
+    }
+    pub fn barrierData(self: *SettlingData, _: Io, claimants: []const u64) Error!void {
+        self.data_barriers += 1;
+        self.barrier_inos += claimants.len;
+    }
     pub fn publishForeign(_: *SettlingData, _: Io, _: u64, _: Layout, _: []const layout.DmaProof) Error!void {
         return error.HolderUnreachable;
     }
-    pub fn fsync(_: *SettlingData, _: Io, _: u64, _: ?staging.StagingKey) Error!void {}
+    /// fsync's DUR-1: the armed custody lands.
+    pub fn fsync(self: *SettlingData, _: Io, ino: u64, _: ?staging.StagingKey) Error!void {
+        if (self.custody_of == ino) self.custody_of = null;
+    }
     /// The mount-wide drain: counted, with the store's commit and barrier
     /// counts it found (the parked stamps journaled BEFORE it, the meta
     /// barrier AFTER it) and a data-leg span marked.
@@ -4677,6 +4774,59 @@ test "a file grown past one block by truncate is written through the striped arm
     h.release(g);
 }
 
+test "decision 0003 §AL.5 — THE ORDERED LAW: an extending striped write's size claim parks fold-visible and the times drain journals it only up to its custody floor behind a data barrier, so at every kill point (before the drain, mid-drain, landed but undrained, drained) the durable size covers durable bytes alone; a later write's gap starts at the earlier claim (the extension law's mark, §AL.1), never inside that write's range; fsync forces both" {
+    const H = HarnessOf(SettlingData);
+    var h: H = undefined;
+    try h.init();
+    defer h.deinit();
+    defer h.data.deinit();
+    h.data.store = &h.store;
+    var trace = op_trace.OpTrace.begin(0, .other);
+    defer trace.finish();
+    var ctx: filesystem.Ctx = .{ .unique = 0, .uid = 0, .gid = 0, .pid = 0, .io = testing.io, .trace = &trace, .wd_slot = null, .window = &.{} };
+    const f = try h.create(1, "f", 0o644);
+    const l = try H.Fs.localOf(f);
+    const big: [8192]u8 = @splat('X');
+    try testing.expectEqual(@as(?linux.E, null), h.write(f, 0, &big, 0).errno());
+    _ = try h.fs.drainPendingTimes(&ctx);
+    try testing.expectEqual(@as(u64, big.len), (try h.fs.readInodeStored(l)).?.size);
+    // A: 100 B at the EOF, its bytes in custody from the EOF up.
+    h.data.custody_of = l;
+    h.data.custody_floor = big.len;
+    try testing.expectEqual(@as(?linux.E, null), h.write(f, big.len, big[0..100], 0).errno());
+    try testing.expectEqual(@as(u64, 8292), (try h.getattr(f)).size);
+    // B past A with a gap: its base — the gap's start — is A's claim.
+    try testing.expectEqual(@as(?linux.E, null), h.write(f, 20_000, big[0..10], 0).errno());
+    try testing.expectEqual(@as(u64, 8292), h.data.writes.items[h.data.writes.items.len - 1].view_size);
+    try testing.expectEqual(@as(u64, 20_010), (try h.getattr(f)).size);
+    // Killed before the drain: the durable size is the old EOF.
+    try testing.expectEqual(@as(u64, big.len), (try h.fs.readInodeStored(l)).?.size);
+    // A drain while custody holds every byte past the EOF: nothing advances.
+    _ = try h.fs.drainPendingTimes(&ctx);
+    try testing.expectEqual(@as(u64, big.len), (try h.fs.readInodeStored(l)).?.size);
+    // Mid-drain: A's bytes landed, B's gap and bytes still in custody.
+    h.data.custody_floor = 8292;
+    const barriers0 = h.data.data_barriers;
+    _ = try h.fs.drainPendingTimes(&ctx);
+    try testing.expectEqual(@as(u64, 8292), (try h.fs.readInodeStored(l)).?.size);
+    try testing.expectEqual(barriers0 + 1, h.data.data_barriers);
+    try testing.expectEqual(@as(u64, 20_010), (try h.getattr(f)).size);
+    // Landed, not yet drained: still A's end; drained: the whole claim.
+    h.data.custody_of = null;
+    try testing.expectEqual(@as(u64, 8292), (try h.fs.readInodeStored(l)).?.size);
+    _ = try h.fs.drainPendingTimes(&ctx);
+    try testing.expectEqual(@as(u64, 20_010), (try h.fs.readInodeStored(l)).?.size);
+    try testing.expectEqual(@as(u64, 0), h.fs.pending.claimOf(l));
+    // fsync forces both: the custody lands, then the claim journals.
+    h.data.custody_of = l;
+    h.data.custody_floor = 20_010;
+    try testing.expectEqual(@as(?linux.E, null), h.write(f, 20_010, big[0..50], 0).errno());
+    try testing.expectEqual(@as(u64, 20_010), (try h.fs.readInodeStored(l)).?.size);
+    try testing.expectEqual(@as(?linux.E, null), h.call(.{ .fsync = .{ .fh = 1, .datasync = false } }, f).errno());
+    try testing.expectEqual(@as(u64, 20_060), (try h.fs.readInodeStored(l)).?.size);
+    h.release(f);
+}
+
 test "decision 0003 §AL — a striped truncate-up asks the plane for the extension law's zeros over [old size, new size) BEFORE its custody lands and its size commits (a kill leaves the old size or the zeros, never what the EOF block held past EOF); an inline grow and a shrink ask nothing" {
     const H = HarnessOf(SettlingData);
     var h: H = undefined;
@@ -4830,7 +4980,7 @@ test "the staged append law (repro-port: fstests generic/069 `append_writer` —
     h.release(f);
 }
 
-test "§L.6 the write-stamp park (repro-port: frag-512b-write — 533 k size-neutral 512 B overwrites cost 533 k journal entries, 1.56 per 4 KiB window, 2.6 KB of metadata device per op): a size-neutral striped write commits NOTHING — its (mtime, ctime) is parked, fold-visible on getattr while the stored record lags; the drain commits ONE Δ entry per ≤ 16 parked inos and a retire never drops a stamp parked after it; fsync(ino) drains that ino ahead of its barrier; an extending write still commits its Δ(size, mtime, ctime) (§J.2); the cap wakes the cadence; strict mode commits per write" {
+test "§L.6 the write-stamp park (repro-port: frag-512b-write — 533 k size-neutral 512 B overwrites cost 533 k journal entries, 1.56 per 4 KiB window, 2.6 KB of metadata device per op): a size-neutral striped write commits NOTHING — its (mtime, ctime) is parked, fold-visible on getattr while the stored record lags; the drain commits ONE Δ entry per ≤ 16 parked inos and a retire never drops a stamp parked after it; fsync(ino) drains that ino; an extending write parks its size claim and the drain journals it (§AL.5); the cap wakes the cadence; strict mode commits per write" {
     const H = HarnessOf(SettlingData);
     var h: H = undefined;
     try h.init();
@@ -4904,17 +5054,24 @@ test "§L.6 the write-stamp park (repro-port: frag-512b-write — 533 k size-neu
     // An fsync with nothing parked commits nothing.
     try testing.expectEqual(@as(?linux.E, null), h.call(.{ .fsync = .{ .fh = 1, .datasync = false } }, files[0]).errno());
     try testing.expectEqual(commits0 + 2, h.store.commits);
-    // An extending write commits its Δ(size, mtime, ctime) per op (§J.2)
-    // and retires the ino's parked stamp (the Δ carries a newer one).
+    // An extending write parks its size claim with its stamp (the ordered
+    // law, decision 0003 §AL.5): nothing commits, the claim is
+    // fold-visible, the stored size lags; the drain journals it once no
+    // custody holds the bytes under it (none here) — ONE Δ(size, times).
+    const l1 = try H.Fs.localOf(files[1]);
     try testing.expectEqual(@as(?linux.E, null), h.write(files[1], 8192, &sector, 0).errno());
+    try testing.expectEqual(commits0 + 2, h.store.commits);
+    try testing.expectEqual(@as(u64, 8192 + 512), (try h.getattr(files[1])).size);
+    try testing.expect((try h.fs.readInodeStored(l1)).?.size < 8192 + 512);
+    try testing.expectEqual(@as(u64, 1), try h.fs.drainPendingTimes(&ctx));
     try testing.expectEqual(commits0 + 3, h.store.commits);
     try testing.expectEqual(@as(u64, 0), h.fs.pending.len());
-    try testing.expectEqual(@as(u64, 8192 + 512), (try h.getattr(files[1])).size);
+    try testing.expectEqual(@as(u64, 8192 + 512), (try h.fs.readInodeStored(l1)).?.size);
     // Strict mode: the size-neutral write commits as before.
     h.fs.times_park = false;
     try testing.expectEqual(@as(?linux.E, null), h.write(files[2], 0, &sector, 0).errno());
     try testing.expectEqual(commits0 + 4, h.store.commits);
-    try testing.expectEqual(parked0 + 402, fuse_write_times_parked.load());
+    try testing.expectEqual(parked0 + 403, fuse_write_times_parked.load());
     h.fs.times_park = true;
     // The cap: the park that crosses PENDING_TIMES_DRAIN_CAP wakes the
     // cadence (a permit stored for its next registration).

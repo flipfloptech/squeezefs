@@ -732,7 +732,12 @@ pub const PENDING_TIMES_DRAIN_BATCH: usize = 128;
 pub const PENDING_TIMES_DRAIN_CAP: u64 = 512;
 
 /// A parked refinement: the kernel's post-op times for one ino.
-pub const Times = struct { mtime: u64, ctime: u64 };
+/// A parked refinement: the stamp, and an extending striped write's size
+/// claim (0 = none) — the ordered law (decision 0003 §AL.5): the claim is
+/// fold-visible at once and journaled only once the bytes it covers are
+/// durable (`kv_fs.drainTimesBatch` commits `min(claim, the ino's custody
+/// floor)`).
+pub const Times = struct { mtime: u64, ctime: u64, size: u64 = 0 };
 
 /// What `park` answers: whether the population just crossed the cap (the
 /// drain's early wake).
@@ -841,18 +846,36 @@ pub const PendingTimes = struct {
         if (laterThan(p.ctime, v.ctime)) v.ctime = p.ctime;
     }
 
+    /// `ino`'s parked size claim (0 = none). NOT folded by `fold`: a
+    /// record a mutation RMWs must carry the durable size, never a claim
+    /// whose bytes may not be durable yet — the attr replies, the read's
+    /// EOF and the write's base fold it (`kv_fs.claimedSize`).
+    pub fn claimOf(self: *PendingTimes, ino: u64) u64 {
+        if (self.count.load(.monotonic) == 0) return 0;
+        const p = self.parked(ino) orelse return 0;
+        return p.size;
+    }
+
     /// Park a refinement: signed monotone merge per field (a parked stamp
     /// never regresses a fresher one). Answers the cap crossing.
     pub fn park(self: *PendingTimes, ino: u64, mtime: u64, ctime: u64) Allocator.Error!Park {
+        return self.parkClaim(ino, .{ .mtime = mtime, .ctime = ctime });
+    }
+
+    /// `park` with an extending write's size claim: the claim merges as a
+    /// max (it never lowers while a write between its acceptance and its
+    /// durable commit holds it — the extension law's mark, §AL.1).
+    pub fn parkClaim(self: *PendingTimes, ino: u64, t: Times) Allocator.Error!Park {
         const s = self.stripeOf(ino);
         s.lock.lock();
         defer s.lock.unlock();
         const gop = try s.map.getOrPut(self.gpa, ino);
         if (gop.found_existing) {
-            if (laterThan(mtime, gop.value_ptr.mtime)) gop.value_ptr.mtime = mtime;
-            if (laterThan(ctime, gop.value_ptr.ctime)) gop.value_ptr.ctime = ctime;
+            if (laterThan(t.mtime, gop.value_ptr.mtime)) gop.value_ptr.mtime = t.mtime;
+            if (laterThan(t.ctime, gop.value_ptr.ctime)) gop.value_ptr.ctime = t.ctime;
+            gop.value_ptr.size = @max(gop.value_ptr.size, t.size);
         } else {
-            gop.value_ptr.* = .{ .mtime = mtime, .ctime = ctime };
+            gop.value_ptr.* = t;
             _ = self.count.fetchAdd(1, .monotonic);
             stats.meta_kv_times_echo_pending.add(1);
         }
@@ -884,7 +907,7 @@ pub const PendingTimes = struct {
         s.lock.lock();
         defer s.lock.unlock();
         const cur = s.map.get(ino) orelse return false;
-        if (cur.mtime != drained.mtime or cur.ctime != drained.ctime) return false;
+        if (cur.mtime != drained.mtime or cur.ctime != drained.ctime or cur.size != drained.size) return false;
         _ = s.map.remove(ino);
         _ = self.count.fetchSub(1, .monotonic);
         stats.meta_kv_times_echo_pending.sub(1);
@@ -929,6 +952,17 @@ pub const PendingTimes = struct {
         }
     }
 
+    /// Every ino holding a parked size claim, appended to `out` (the
+    /// dismount's landing pass, §AL.5).
+    pub fn claimants(self: *PendingTimes, gpa: Allocator, out: *std.ArrayList(u64)) Allocator.Error!void {
+        for (&self.stripes) |*s| {
+            s.lock.lock();
+            defer s.lock.unlock();
+            var it = s.map.iterator();
+            while (it.next()) |e| if (e.value_ptr.size != 0) try out.append(gpa, e.key_ptr.*);
+        }
+    }
+
     /// Snapshot up to one batch of parked inos (any order) — BEFORE any
     /// gate or guard, so a drain with no work touches nothing. A full
     /// batch tells the drain to loop.
@@ -953,12 +987,16 @@ pub const PendingTimes = struct {
 /// echo-born refinement: its mtime is invariant-equal to the stored one);
 /// null when the stored record already carries it (a fresher committed
 /// write superseded the refinement — the drain must not regress it).
+/// `size` is the claim the drain may journal now (`min(claim, custody
+/// floor)`): a size advance rides the same Δ.
 pub fn drainDelta(parked_times: Times, stored: InodeValue) ?InodeDelta {
     const adv_m = laterThan(parked_times.mtime, stored.mtime);
     const adv_c = laterThan(parked_times.ctime, stored.ctime);
-    if (!adv_m and !adv_c) return null;
+    const adv_s = parked_times.size > stored.size;
+    if (!adv_m and !adv_c and !adv_s) return null;
     const m = if (adv_m) parked_times.mtime else stored.mtime;
     const c = if (adv_c) parked_times.ctime else stored.ctime;
+    if (adv_s) return .{ .mask = record.DELTA_SIZE | record.DELTA_TIMES, .fields = .{ .size = parked_times.size, .mtime = m, .ctime = c } };
     return if (adv_m) InodeDelta.times(m, c) else InodeDelta.ctime(c);
 }
 

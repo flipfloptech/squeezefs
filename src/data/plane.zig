@@ -1282,6 +1282,23 @@ pub const DataPlane = struct {
         return self.wp.zeroExtension(io, ino, .{ .kind = .striped, .size = old_size, .map_resident = true }, new_size);
     }
 
+    /// The ordered law's floor (decision 0003 §AL.5):
+    /// `write_admit.WritePath.custodyFloor`.
+    pub fn custodyFloor(self: *DataPlane, io: Io, ino: u64) u64 {
+        return self.wp.custodyFloor(io, ino);
+    }
+
+    /// The ordered law's data barrier for a batch of size claims
+    /// (`fsync.barrierInos`).
+    pub fn barrierData(self: *DataPlane, io: Io, claimants: []const u64) Error!void {
+        fsync_mod.barrierInos(self.wp.fsyncCtx(), io, claimants) catch |e| return switch (e) {
+            error.WriterGuardFenced => error.WriterGuardFenced,
+            error.VolumeFailed => error.VolumeFailed,
+            error.OutOfMemory => error.OutOfMemory,
+            error.NoSpaceLeft, error.InputOutput, error.IntentBarrierFailed, error.MetaBarrierFailed => error.InputOutput,
+        };
+    }
+
     /// THE read of any layout kind into `dest` (the reply window;
     /// `registered` = the device may DMA straight into it).
     pub fn read(self: *DataPlane, io: Io, ino: u64, offset: u64, dest: []u8, registered: bool, odirect: bool) Error!usize {

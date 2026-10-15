@@ -892,6 +892,20 @@ pub const Table = struct {
         return out[0..n];
     }
 
+    /// The lowest block `ino` holds parked (the ordered law's floor,
+    /// `WritePath.custodyFloor`).
+    pub fn lowestBlockOf(self: *Table, ino: u64) ?u32 {
+        if (self.count.load(.monotonic) == 0) return null;
+        self.lock.lock();
+        defer self.lock.unlock();
+        var low: ?u32 = null;
+        var it = self.index.keyIterator();
+        while (it.next()) |k| if (k.ino == ino and (low == null or k.block < low.?)) {
+            low = k.block;
+        };
+        return low;
+    }
+
     pub fn blocksOf(self: *Table, ino: u64, out: []u32) []u32 {
         self.lock.lock();
         defer self.lock.unlock();

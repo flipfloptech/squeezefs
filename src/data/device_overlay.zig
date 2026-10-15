@@ -552,6 +552,20 @@ pub const Registry = struct {
         while (it.next()) |k| out.appendAssumeCapacity(k.ino);
     }
 
+    /// The lowest block `ino` holds an open record on (the ordered law's
+    /// floor, `WritePath.custodyFloor`).
+    pub fn lowestBlockOf(self: *Registry, ino: u64) ?u32 {
+        if (!self.anyOpenFast()) return null;
+        self.lock.lock();
+        defer self.lock.unlock();
+        var low: ?u32 = null;
+        var it = self.index.keyIterator();
+        while (it.next()) |k| if (k.ino == ino and (low == null or k.block < low.?)) {
+            low = k.block;
+        };
+        return low;
+    }
+
     /// Whether `ino` holds a live record — the no-open FLUSH's try-only
     /// probe (decision 0003 §AF); O(1) with nothing open (the install's
     /// increment precedes its ACK, the probe follows that ACK through the

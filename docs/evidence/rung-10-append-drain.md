@@ -56,7 +56,39 @@ the render test parses strictly; every smoke `.stats` read parses strictly; `use
 
 **Found, not fixed.** `DEVICE_WRITE_REQS` double-counts DMAs that ride `put_obj` (wareq-sz only);
 a short transformed image's whole-block fill still DMAs the chunk; a write past EOF inside a
-promoted block reads recycled bytes between the old end and the write (unchanged).
+promoted block read recycled bytes between the old end and the write (fixed below, §AL).
 
 **Gates.** Full venue gate on the rebased tree: 49/49 steps, 2,917 / 2,997 (80 skipped); macOS
 29/29, 2,266 / 2,295 (29 skipped).
+
+## The extension law (decision 0003 §AL; 0002 row 538)
+
+**Defect (data exposure).** A promotion lands a small file's image on its own block as one grain
+(`ownBlockStored`); the rest of the block is whatever its previous owner wrote — a block-device
+free elides its discard. A write past EOF then served that owner's bytes across `[EOF, write)`:
+the W2 fold and the §AK drain land only their touched pages, the overlay seeds its gaps and the
+CoW upload its complement from the old block. Not a read-path miss: the bytes were on the device
+under a size that named them.
+
+**Red rows.** `write_admit.zig` "a write past EOF never exposes the bytes a recycled block's
+previous owner left": six arms (W2 fold in place, in-place drain, overlay landing, CoW of a shared
+block, CoW on the transformed volume, a write into the NEXT block), live through the write side's
+view and on the device — 0xAA at byte 4,096. `write_e2e_linux.zig` "a recycled block never leaks"
+(`nvme_dev`): file X lands a block of 0xAA and is unlinked, small file Y's promotion re-mints that
+exact block (`allocateSpecificBlock`), Y written past EOF read X's marker at byte 4,096.
+
+**Fix.** `WritePath.zeroExtension`: a growth from `e` to `s` writes `[e, min(s, block end))` of a
+mapped EOF block as zeros FIRST, through the ladder like any byte; the write then continues it,
+stream-adjacent, in the same custody. Both growers call it (the striped write; setattr's grow,
+before its custody flush so the zeros land before the size commits). A hole's EOF block and a
+block-aligned EOF write nothing. Cost: zeros ≤ the growth inside the EOF block, landed with the
+write — in place `pages(e, s − e) × P` (a 100 B → 24,577 B grow lands 7 pages, binding
+unchanged); an adjacent append opens no gap and pays nothing. `write_gap_zero_bytes` joins the
+admission ledger's closure. Truncate-up and truncate-up-then-write ride the same law; `fallocate`
+and punch are not ops of this filesystem.
+
+**Owed (§AL.5).** After a kill an extending WRITE can still read the recycled tail: its size Δ
+is a landed journal entry while its bytes (and the gap's zeros) are daemon memory until the drain
+— §AJ.4's "whole or zeros" holds over a hole, not over a mapped EOF block. Sized in §AL.5 (park
+the size claim until its bytes land, or a geometric zero watermark ahead of the size).
+

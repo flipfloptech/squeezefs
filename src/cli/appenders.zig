@@ -146,22 +146,12 @@ const OfflineVolume = struct {
         }
     }
 
-    /// The Layer-A flock probe: taken non-blocking and released at once;
-    /// `EAGAIN` = a live mount on this host holds it.
+    /// The Layer-A probe: an exclusive flock on the volume (a live mount on
+    /// this host) read off `/proc/locks` — taking the lock to test it would
+    /// refuse a racing writer, and a held SHARED lock is udev's block-device
+    /// probe, never a mount (`guard.proc.flockExclusive`).
     fn flockHeld(self: *const OfflineVolume) bool {
-        var zbuf: [linux.PATH_MAX]u8 = undefined;
-        const z = align_probe.pathZ(&zbuf, self.path) catch return true;
-        const rc = linux.open(z, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
-        if (linux.errno(rc) != .SUCCESS) return true;
-        const fd: linux.fd_t = @intCast(rc);
-        defer _ = linux.close(fd);
-        return switch (linux.errno(linux.flock(fd, std.posix.LOCK.EX | std.posix.LOCK.NB))) {
-            .SUCCESS => blk: {
-                _ = linux.flock(fd, std.posix.LOCK.UN);
-                break :blk false;
-            },
-            else => true,
-        };
+        return guard.proc.writerFlockHeld(self.path);
     }
 
     /// Write (1): a raw page image to both directory slots, then `fsync`.

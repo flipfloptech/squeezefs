@@ -181,6 +181,9 @@ pub fn openErrno(e: OpenError) linux.E {
 pub const Stats = struct {
     /// `writer_guard_busy_refusals`: mounts refused by a held flock.
     guard_busy_refusals: counters.ShardedCounter = .{},
+    /// Retries of the writer flock behind a SHARED holder (udev's block
+    /// device probe — `guard.proc.flockExclusive`).
+    guard_shared_lock_waits: counters.ShardedCounter = .{},
     mounts: counters.ShardedCounter = .{},
     clean_unmounts: counters.ShardedCounter = .{},
 };
@@ -1505,8 +1508,7 @@ pub const KvBackend = struct {
     fn acquireWriterFlock(gpa: Allocator, io: Io, path: []const u8, opts: OpenOptions) OpenError!linux.fd_t {
         const fd = try openGuardFd(path);
         errdefer _ = linux.close(fd);
-        const op: i32 = std.posix.LOCK.EX | std.posix.LOCK.NB;
-        switch (linux.errno(linux.flock(fd, op))) {
+        switch (guard.proc.flockExclusive(io, fd, &stats.guard_shared_lock_waits)) {
             .SUCCESS => return fd,
             .AGAIN => {
                 if (!opts.join_door) stats.guard_busy_refusals.inc();
@@ -3012,6 +3014,40 @@ test "the single-writer guard: a second open of a held volume refuses Busy loud;
     be.close();
     const again = try v.open();
     again.close();
+}
+
+test "the single-writer guard waits out a SHARED holder — udev's block-device probe (systemd.io/BLOCK_DEVICE_LOCKING) — and opens once it lets go; no refusal, no error log" {
+    const gpa = testing.allocator;
+    const v = try TestVol.create(gpa, "guard-shared", null);
+    defer v.destroy();
+    // The stand-in for systemd-udevd: LOCK_SH on its own open file.
+    var zbuf: [linux.PATH_MAX]u8 = undefined;
+    const z = try std.fmt.bufPrintSentinel(&zbuf, "{s}", .{v.path()}, 0);
+    const rc = linux.open(z, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(rc));
+    const probe_fd: linux.fd_t = @intCast(rc);
+    defer _ = linux.close(probe_fd);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.flock(probe_fd, std.posix.LOCK.SH)));
+    const refusals0 = stats.guard_busy_refusals.load();
+    const waits0 = stats.guard_shared_lock_waits.load();
+    const Opener = struct {
+        fn run(vol: *TestVol, out: *?(OpenError!*KvBackend), done: *std.atomic.Value(bool)) void {
+            out.* = vol.open();
+            done.store(true, .release);
+        }
+    };
+    var result: ?(OpenError!*KvBackend) = null;
+    var done: std.atomic.Value(bool) = .init(false);
+    const t = try std.Thread.spawn(.{}, Opener.run, .{ v, &result, &done });
+    // The opener met the shared lock and is waiting (or, refusing it, is
+    // done): only then let go.
+    while (stats.guard_shared_lock_waits.load() == waits0 and !done.load(.acquire)) try std.Thread.yield();
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.flock(probe_fd, std.posix.LOCK.UN)));
+    t.join();
+    try testing.expect(stats.guard_shared_lock_waits.load() > waits0);
+    const be = try result.?;
+    be.close();
+    try testing.expectEqual(refusals0, stats.guard_busy_refusals.load());
 }
 
 test "the join door: a held writer lock on volume 0 of a symmetric set is the manager's — Busy with ZERO error logs (an info line names the holder; the join follows), not counted as a refusal; without the door the same lock refuses loud" {

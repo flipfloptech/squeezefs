@@ -9,7 +9,10 @@ const fuzzkit = @import("../../core/fuzzkit.zig");
 const testkit = @import("../../core/testkit.zig");
 const builtin = @import("builtin");
 const linux = std.os.linux;
+const Io = std.Io;
 const claim = @import("claim.zig");
+const clock = @import("../../core/clock.zig");
+const counters = @import("../../core/counters.zig");
 
 comptime {
     if (builtin.os.tag != .linux) @compileError("guard/proc is Linux only (charter §1.2); gate the import on builtin.os.tag");
@@ -129,6 +132,44 @@ pub fn writerFlockHeld(path: []const u8) bool {
     if (linux.errno(linux.statx(linux.AT.FDCWD, z, 0, .{ .INO = true }, &st)) != .SUCCESS) return false;
     var buf: [PROC_LOCKS_CAP]u8 = undefined;
     const text = readSmall("/proc/locks", &buf) orelse return false;
+    return flockHeldIn(text, st.dev_major, st.dev_minor, st.ino);
+}
+
+/// systemd-udevd holds `flock(LOCK_SH)` on a whole-disk block device while it
+/// processes an event for it (systemd.io/BLOCK_DEVICE_LOCKING): a fresh
+/// namespace's `add`, the `change` its inotify watch synthesizes when a
+/// writer closes the node (a `format`). Every squeezefs holder is EXCLUSIVE,
+/// so a `LOCK_EX | LOCK_NB` refused while no exclusive lock stands on the
+/// inode is such a probe: retried until it lets go. The bound: one event's
+/// rules are a blkid probe (milliseconds); 5 s covers a queue of them behind
+/// a storm of new namespaces — past it the refusal stands.
+pub const SHARED_LOCK_WAIT_NS: u64 = 5 * std.time.ns_per_s;
+/// The retry step: a probe's own scale (one blkid read), so the wait ends
+/// within a step of the release.
+pub const SHARED_LOCK_RETRY_MS: i64 = 5;
+
+/// `flock(fd, LOCK_EX | LOCK_NB)` that waits out SHARED holders (above):
+/// `.SUCCESS`, `.AGAIN` when an exclusive holder stands (or a shared one
+/// outlasts the bound), or the call's other errno. `waits` counts each
+/// retry a shared holder caused.
+pub fn flockExclusive(io: Io, fd: linux.fd_t, waits: ?*counters.ShardedCounter) linux.E {
+    const deadline = clock.monotonicNs() + SHARED_LOCK_WAIT_NS;
+    while (true) {
+        const e = linux.errno(linux.flock(fd, std.posix.LOCK.EX | std.posix.LOCK.NB));
+        if (e != .AGAIN) return e;
+        if (exclusiveFlockOn(fd) or clock.monotonicNs() >= deadline) return .AGAIN;
+        if (waits) |w| w.inc();
+        io.sleep(.fromMilliseconds(SHARED_LOCK_RETRY_MS), .awake) catch return .AGAIN;
+    }
+}
+
+/// An exclusive `flock` on `fd`'s inode by any process (`/proc/locks`);
+/// unreadable reads as held (the refusal stands).
+fn exclusiveFlockOn(fd: linux.fd_t) bool {
+    var st: linux.Statx = undefined;
+    if (linux.errno(linux.statx(fd, "", linux.AT.EMPTY_PATH, .{ .INO = true }, &st)) != .SUCCESS) return true;
+    var buf: [PROC_LOCKS_CAP]u8 = undefined;
+    const text = readSmall("/proc/locks", &buf) orelse return true;
     return flockHeldIn(text, st.dev_major, st.dev_minor, st.ino);
 }
 

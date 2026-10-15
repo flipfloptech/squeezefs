@@ -71,15 +71,16 @@ pub const Outcome = struct {
     journal_len: u64,
 };
 
-/// The dedicated door fd: `flock(LOCK_EX | LOCK_NB)`, held until `close`.
-fn takeDoor(path: []const u8) Error!linux.fd_t {
+/// The dedicated door fd: `flock(LOCK_EX | LOCK_NB)`, held until `close`
+/// (a shared holder — udev's probe — waited out: `guard.proc.flockExclusive`).
+fn takeDoor(io: Io, path: []const u8) Error!linux.fd_t {
     var zbuf: [linux.PATH_MAX]u8 = undefined;
     const z = align_probe.pathZ(&zbuf, path) catch return error.DeviceRefused;
     const rc = linux.open(z, .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);
     if (linux.errno(rc) != .SUCCESS) return error.DeviceRefused;
     const fd: linux.fd_t = @intCast(rc);
     errdefer _ = linux.close(fd);
-    return switch (linux.errno(linux.flock(fd, std.posix.LOCK.EX | std.posix.LOCK.NB))) {
+    return switch (guard.proc.flockExclusive(io, fd, null)) {
         .SUCCESS => fd,
         .AGAIN => error.Mounted,
         else => error.DeviceRefused,
@@ -105,7 +106,7 @@ const PageReader = struct {
 /// The verb over one volume (module doc). `io` is the executor's (the
 /// claim probe replays the ring into private trees through the cache).
 pub fn enableSymmetric(gpa: Allocator, io: Io, path: []const u8, opts: Options, diag: ?*Refusal) Error!Outcome {
-    const door = takeDoor(path) catch |e| {
+    const door = takeDoor(io, path) catch |e| {
         if (e == error.Mounted) if (diag) |d| {
             d.* = .mounted_here;
         };

@@ -2494,10 +2494,12 @@ test "slow-read seam: a fast fill completes while a linked-timeout slow fill hol
     };
     var slow_ns: u64 = 0;
     var slow_failed = false;
+    // The baseline is read BEFORE the spawn: read after it, a slow thread that
+    // had already filled made the wait below spin forever (a VM gate, 59 min).
+    const fills = stats.dev_fills.load();
     const t = try std.Thread.spawn(.{}, Slow.run, .{ dev, &slow_ns, &slow_failed });
     // The slow read must have claimed the seam before the fast one is
     // queued; wait for its SQE build (dev_fills moves) rather than sleeping.
-    const fills = stats.dev_fills.load();
     while (stats.dev_fills.load() == fills) std.atomic.spinLoopHint();
     const t0 = clock.monotonicNs();
     const fast = try dev.readBlock(4096, 4096);

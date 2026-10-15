@@ -472,6 +472,11 @@ pub const Config = struct {
     test_ship_every_free: bool = false,
     /// Test seam: every substrate elides (the file-backed rigs).
     elision_class_all: bool = false,
+    /// Test seam: the debt drainer's clock (its quiet window, its trim
+    /// meter, its pace deadlines; null = `clock.monotonicNs`). Under it a
+    /// deadline park ends only on a wake: the row's time passes when the
+    /// row advances it, never on the venue's wall clock.
+    test_debt_clock: ?*const fn () u64 = null,
     /// The R5 budget: the cap ceiling's input.
     budget_bytes: u64,
     /// The write pipeline governor's BDP peak ÷ block: the cap's seed
@@ -1014,7 +1019,7 @@ pub const Reclaimer = struct {
     /// Per range of the TRIM venue: the debt meter learns the device's
     /// deallocate completion rate the drainer paces itself by.
     fn noteTrimmed(self: *Reclaimer, k: u32) void {
-        if (self.debt_meter.note(k, clock.monotonicNs() / std.time.ns_per_ms)) stats.block_free_debt_drain_rate.set(self.debt_meter.load());
+        if (self.debt_meter.note(k, self.debtNowNs() / std.time.ns_per_ms)) stats.block_free_debt_drain_rate.set(self.debt_meter.load());
     }
 
     /// `sample_arrivals`: once per worker pass; the arrival rate is a
@@ -1254,7 +1259,7 @@ pub const Reclaimer = struct {
     /// of WALL time (a paced pass is not a tick: twenty paced passes could
     /// span twenty seconds).
     fn drainerMustDefer(self: *Reclaimer) bool {
-        const now = clock.monotonicNs();
+        const now = self.debtNowNs();
         if (self.fg_signal) |s| {
             const cur = s.read(s.ctx);
             if (cur != self.debt_fg_last) {
@@ -1274,6 +1279,10 @@ pub const Reclaimer = struct {
         /// Blocks this pass issued (the pace's batch term).
         blocks: u64,
     };
+
+    fn debtNowNs(self: *const Reclaimer) u64 {
+        return if (self.cfg.test_debt_clock) |now| now() else clock.monotonicNs();
+    }
 
     /// One pass over every debt target: `debt == 0` ⇒ skip; foreground ∧
     /// within the watermark ⇒ defer (the row pays zero discards); foreground
@@ -1320,7 +1329,7 @@ pub const Reclaimer = struct {
     fn drainerMain(self: *Reclaimer, io: Io) void {
         while (!self.stop.load(.acquire)) {
             const pass = self.debtPass(io);
-            const now = clock.monotonicNs();
+            const now = self.debtNowNs();
             const deadline: u64 = switch (pass.verdict) {
                 .idle => std.math.maxInt(u64),
                 .progressed => blk: {
@@ -1338,7 +1347,8 @@ pub const Reclaimer = struct {
                 },
             };
             if (deadline == now) continue;
-            if (!self.parkWake(io, &self.debt_wake, deadline)) return;
+            const wall_deadline = if (self.cfg.test_debt_clock == null) deadline else std.math.maxInt(u64);
+            if (!self.parkWake(io, &self.debt_wake, wall_deadline)) return;
         }
     }
 
@@ -2003,18 +2013,34 @@ test "the debt drainer: idle drains elided debt past the watermark to zero with 
 // meter learns).
 test "the debt drainer under a FOREGROUND stream past the watermark issues one device-paced batch per pace, never the whole backlog at once; idle it drains to zero at full width" {
     const io = testing.io;
-    var f = try Fixture.init(.{ .budget_bytes = test_budget, .batch_ms = 0, .batch_blocks = 4 }, .bdev_discard, 32);
+    // The drainer's time is the row's: the quiet window, the meter's first
+    // window and the pace pass only when the row advances them (a stalled
+    // venue once let the pace elapse — or the meter learn — between two
+    // statements). 0 is the drainer's "not yet judged", so it starts at 1 s.
+    const Clock = struct {
+        var ns: Atomic(u64) = .init(0);
+        fn now() u64 {
+            return ns.load(.monotonic);
+        }
+    };
+    Clock.ns.store(std.time.ns_per_s, .monotonic);
+    var f = try Fixture.init(.{ .budget_bytes = test_budget, .batch_ms = 0, .batch_blocks = 4, .test_debt_clock = &Clock.now }, .bdev_discard, 32);
     defer f.deinit();
     try f.mintPublished(32); // the virgin tail is 0: the watermark is passed by the first byte of debt
     const Fg = struct {
         var bytes: Atomic(u64) = .init(0);
+        var moving: Atomic(bool) = .init(false);
+        /// A moving stream has new bytes at every look.
         fn read(_: ?*anyopaque) u64 {
+            if (moving.load(.monotonic)) return bytes.fetchAdd(1, .monotonic) + 1;
             return bytes.load(.monotonic);
         }
     };
     Fg.bytes.store(1, .monotonic);
+    Fg.moving.store(true, .monotonic);
     f.r.setForegroundSignal(.{ .ctx = null, .read = &Fg.read });
     const pressure0 = stats.block_free_debt_pressure_drains.load();
+    stats.block_free_debt_pace_ms.set(0);
     // 16 blocks of debt, scattered (every other block): four batches'
     // worth, landed under a moving foreground BEFORE the drainer starts
     // (the first free's wake is a stored permit: pass 1 finds the debt,
@@ -2027,17 +2053,25 @@ test "the debt drainer under a FOREGROUND stream past the watermark issues one d
     try testing.expectEqual(@as(u64, 16 * 4096), f.alloc.elidedDebtBytes());
     try f.r.start(io);
     // Two pressure passes of ONE batch each (4 blocks, the meter still
-    // cold), then the cold ceiling's rest: half a ceiling later the other
-    // 8 are still owed (the shipped hot loop drained all 16 at once).
-    stallMs(io, PARK_BOUND_CEILING_MS / 2);
+    // cold: the row's clock stands), each resting the cold ceiling — a rest
+    // only a wake ends — so the other 8 are still owed (the shipped hot
+    // loop drained all 16 at once).
+    var spins: u32 = 0;
+    while ((stats.block_free_debt_pressure_drains.load() < pressure0 + 2 or f.alloc.elidedDebtBytes() > 8 * 4096) and spins < 2000) : (spins += 1) stallMs(io, 5);
     try testing.expectEqual(@as(u64, 8 * 4096), f.alloc.elidedDebtBytes());
     try testing.expectEqual(pressure0 + 2, stats.block_free_debt_pressure_drains.load());
     try testing.expectEqual(PARK_BOUND_CEILING_MS, stats.block_free_debt_pace_ms.load());
-    // The foreground stops: the quiet drainer drains the rest at full width.
-    var spins: u32 = 0;
+    // The foreground stops and the quiet window and the pace pass on the
+    // row's clock: the woken drainer drains the rest at full width, with
+    // no third pressure pass.
+    Fg.moving.store(false, .monotonic);
+    _ = Clock.ns.fetchAdd((IDLE_CONFIRM_TICKS * MANNERS_TICK_MS + PARK_BOUND_CEILING_MS) * std.time.ns_per_ms, .monotonic);
+    f.r.debt_wake.notifyOne(io);
+    spins = 0;
     while (f.alloc.elidedDebtBytes() != 0 and spins < 2000) : (spins += 1) stallMs(io, 5);
     f.r.stopAndJoin(io);
     try testing.expectEqual(@as(u64, 0), f.alloc.elidedDebtBytes());
+    try testing.expectEqual(pressure0 + 2, stats.block_free_debt_pressure_drains.load());
     try testing.expectEqual(@as(u64, 0), f.alloc.trimClaimed());
     try testing.expect(f.r.debtDrainRate() > 0); // the trim venue fed the meter
 }

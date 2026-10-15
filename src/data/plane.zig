@@ -3700,6 +3700,48 @@ test "the shared probe keys by the plane's effective ino: a nodeid answers its o
     try testing.expect(DataPlane.shapeProbeKey(std.math.maxInt(u64) - 7) == null);
 }
 
+// leak67: the cache-path smoke row confirmed `[C2] … leaked` after `rm` on a
+// two-volume set. The refill picked the volume again, so key A's open pack sat
+// on B (the image transformed for A, landed on B), and fsck's open-pack face,
+// looking the block up by its own volume, missed it.
+test "a packed promotion's pack opens on the volume the promotion picked: the refill mints on the key's volume, never on a second router pick" {
+    const gpa = testing.allocator;
+    const chunk: u64 = 4 * derive.MiB;
+    const pl = try gpa.create(DataPlane);
+    defer gpa.destroy(pl);
+    pl.io = testing.io;
+    pl.chunk = chunk;
+    pl.scope = pack.packScopeKey(0, 0);
+    pl.vols = .{};
+    // The valve is consulted only on a full volume; neither fills here.
+    pl.reclaimer = undefined;
+    pl.rt = try router.Router.init(gpa, chunk);
+    defer pl.rt.deinit();
+    const tags = [2]u64{ 0xA, 0xB };
+    var allocs: [2]*block_alloc.BlockAllocator = undefined;
+    for (tags, 0..) |t, i| {
+        allocs[i] = try block_alloc.BlockAllocator.init(gpa, .{ .vol_tag = t, .vol = @intCast(i), .block_size = chunk, .capacity_bytes = 16 * chunk });
+        pl.vols.add(.{ .vol_tag = t, .ordinal = @intCast(i), .alloc = allocs[i], .passthrough = true, .write_cache_volatile = false });
+        try pl.rt.addVolume(.{ .id = .{ .tag = t }, .capacity_bytes = 16 * chunk });
+    }
+    defer for (allocs) |a| a.deinit();
+    var packer = try pack.Packer.init(gpa, chunk, .{ .enabled = true, .max_slot = chunk / 2 }, pl.packAllocSeam(), pl.dmaSeam(), pl.packReadSeam(), router.MAX_VOLUMES);
+    defer packer.deinit();
+    // Two equal volumes, a round-robin pick: a second pick inside the refill
+    // would name the other volume.
+    for (0..2) |_| {
+        const tag = (try pl.rt.pickVolume()).?;
+        const k: pack.PackKey = .{ .vol_tag = tag, .scope = pl.scope };
+        const tenant = (try packer.reserve(testing.io, k, 4096)).?;
+        try testing.expectEqual(tag, tenant.pack.vol_tag);
+        const open = packer.openPack(k).?;
+        try testing.expectEqual(tag, open.vol_tag);
+        // Tracked on the picked volume: the pack's pin + the tenant's.
+        const a = pl.vols.byTag(tag).?.alloc;
+        try testing.expectEqual(@as(?u32, 2), a.refcount(a.idxOf(open.base)));
+    }
+}
+
 test "stagingCapacity law: clamp(free/4, 64 MiB, budget/8) on the record grain" {
     const budget_bytes: u64 = 16 * derive.GiB;
     try testing.expectEqual(STAGING_FLOOR, DataPlane.stagingCapacityFor(1 << 20, budget_bytes));

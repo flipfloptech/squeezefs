@@ -779,7 +779,8 @@ pub const Absorb = enum {
 /// (`kv_fs.drainPendingTimes`) on the flush cadence / fsync / fsyncdir /
 /// the dismount / the cap. A write's stamp therefore never regresses an
 /// mtime set ahead of it by utimes (the fold's law, the reference's too);
-/// an EXTENDING write commits its Δ(size, mtime, ctime) per op (§J.2).
+/// an EXTENDING write parks its size claim with its stamp, journaled once
+/// the bytes under it are durable (§AL.5's ordered law).
 ///
 /// Mutations of ONE ino run under its 4a I-guard (absorb, the commit-side
 /// retire) or the drain's own guard set, so entries never race per ino;

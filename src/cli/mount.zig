@@ -1382,6 +1382,7 @@ const WritebackTimer = struct {
             _ = n.waitUntilUncancelable(self.io, clock.monotonicNs() + self.period_ns);
             if (self.stop.load(.acquire)) return;
             self.opens.timerPass(clock.monotonicNs(), self.age_ns, .{ .ctx = self, .call = &drain });
+            self.fs.afterTimerPass();
         }
     }
 };

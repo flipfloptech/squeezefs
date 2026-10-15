@@ -1337,11 +1337,6 @@ pub const WritePath = struct {
         return folded;
     }
 
-    /// Whether `ino` holds any custody `flushIno` lands — a parked block (a
-    /// W2 extent among them, an upload in flight), an overlay record, a
-    /// rewrite epoch open or saving: the no-open FLUSH's try-only probe
-    /// (decision 0003 §AF). Spin-locked O(1)-or-scan sections only — never
-    /// a device wait, a park, or a lock held across I/O.
     /// THE ORDERED LAW's floor (decision 0003 §AL.5): the lowest byte of
     /// `ino` its RAM write custody covers (`maxInt` when it holds none).
     /// Every byte below it the file wrote is on a device (behind the data
@@ -1382,6 +1377,11 @@ pub const WritePath = struct {
         }
     }
 
+    /// Whether `ino` holds any custody `flushIno` lands — a parked block (a
+    /// W2 extent among them, an upload in flight), an overlay record, a
+    /// rewrite epoch open or saving: the no-open FLUSH's try-only probe
+    /// (decision 0003 §AF). Spin-locked O(1)-or-scan sections only — never
+    /// a device wait, a park, or a lock held across I/O.
     pub fn holdsCustody(self: *WritePath, ino: u64) bool {
         return self.table.holdsIno(ino) or self.overlay.registry.holdsIno(ino) or self.epochs.holds(ino);
     }

@@ -7025,8 +7025,11 @@ test "smoke: THE KILL MATRIX — kill -9 at 50/100/150 MiB of a 200 MiB dd and m
             acked += 1;
         }
         const inflight = try std.fmt.bufPrintSentinel(&pb, "{s}/inflight{d}", .{ rig.mp, k }, 0);
-        var dd_script: [512]u8 = undefined;
-        const dd_cmd = try std.fmt.bufPrint(&dd_script, "dd if={s} of={s} bs=1M count={d} status=none", .{ rig.image, inflight, big_mib });
+        // Half the kill point fsynced, the rest streamed unsynced: the
+        // fsync is the size's durability point (decision 0003 §AL.5).
+        const synced_mib = point / 2;
+        var dd_script: [768]u8 = undefined;
+        const dd_cmd = try std.fmt.bufPrint(&dd_script, "dd if={s} of={s} bs=1M count={d} conv=fsync status=none && dd if={s} of={s} bs=1M skip={d} seek={d} count={d} conv=notrunc status=none", .{ rig.image, inflight, synced_mib, rig.image, inflight, synced_mib, synced_mib, big_mib - synced_mib });
         var dd = try std.process.spawn(io, .{ .argv = &.{ "sh", "-c", dd_cmd }, .environ_map = &rig.env, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore });
         var claimed: u64 = 0;
         {
@@ -7056,11 +7059,16 @@ test "smoke: THE KILL MATRIX — kill -9 at 50/100/150 MiB of a 200 MiB dd and m
         }
         var nb: [32]u8 = undefined;
         const in_name = try std.fmt.bufPrint(&nb, "inflight{d}", .{k});
-        // The claim grew between the last poll and the kill: the law is
-        // `observed ≤ size ≤ bytes dd could have written`.
+        // THE ORDERED LAW (decision 0003 §AL.5, §AJ.4): the size ends at
+        // its last durable claim — `fsynced ≤ size ≤ bytes dd could have
+        // written`; the unsynced extension is whole or absent (it lags the
+        // claim stat saw by the landing bound plus one drain) — and never
+        // covers a byte the kill took from RAM: every page below it is the
+        // image's, no hole (the size never leads its bytes).
         const c = try pageCensus(gpa, io, dir, in_name, image, 0, big_mib << 20);
-        try testing.expect(c.size >= claimed);
-        std.debug.print("\nsmoke[kill]: dd killed at {d} MiB claimed (point {d} MiB): replayed {d} entries ({d} torn dropped), ring {d} record(s) ({d} torn); inflight{d} claims {d} MiB: {d} pages exact, {d} holes, 0 torn; {d} acked file(s) byte-exact; C8 0 drift, C2 0/0\n", .{ claimed >> 20, point, rec.replayed, rec.torn, rec.ring_records, rec.ring_torn, k, c.size >> 20, c.exact, c.holes, acked });
+        std.debug.print("\nsmoke[kill]: dd killed at {d} MiB claimed (point {d} MiB, {d} MiB fsynced): replayed {d} entries ({d} torn dropped), ring {d} record(s) ({d} torn); inflight{d} durable at {d} B: {d} pages exact, {d} holes, 0 torn; {d} acked file(s) byte-exact; C8 0 drift, C2 0/0\n", .{ claimed >> 20, point, synced_mib, rec.replayed, rec.torn, rec.ring_records, rec.ring_torn, k, c.size, c.exact, c.holes, acked });
+        try testing.expect(c.size >= synced_mib << 20);
+        try testing.expectEqual(@as(u64, 0), c.holes);
         {
             const out = try rig.onMount("rm -f inflight* && echo ok");
             defer gpa.free(out);
@@ -7386,6 +7394,14 @@ fn closeDrainRow(no_open: bool) !void {
     const clean = numberAfter(st, "\"transport_flush_inline_serves\":") orelse 0;
     std.debug.print("\nsmoke[close drain, no_open={}]: OPENs answered ENOSYS {d}, FLUSH drains {d}, FLUSHes answered on the worker {d}, owed {d}, parked buffers {d}\n", .{ no_open, enosys, drains, clean, numberAfter(st, "\"fuse_owed_drain_inos\":") orelse 0, numberAfter(st, "\"parked_buffers\":") orelse 0 });
     try testing.expectEqual(@as(?u64, 0), numberAfter(st, "\"parked_buffers\":"));
+    // The drain journals the size claims its landing covered (decision
+    // 0003 §AL.5): the no-open FLUSH before the close returns, the control
+    // arm's asynchronous RELEASE after its landing.
+    {
+        const sp = if (no_open) try rig.stats() else try awaitExactly(rig, "\"meta_kv_times_echo_pending\":", 0, 20 * std.time.ns_per_s);
+        defer gpa.free(sp);
+        try testing.expectEqual(@as(?u64, 0), numberAfter(sp, "\"meta_kv_times_echo_pending\":"));
+    }
     if (no_open) {
         // The latch: the daemon's own open at ready — `cat g` sent none,
         // and no CREATE-opened file was released with a RELEASE.

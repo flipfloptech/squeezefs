@@ -120,6 +120,11 @@ fn layerOpts(layer: tls.RecordLayer, fd: linux.fd_t, now: u64) tls.Options {
     return .{ .now_s = now, .record_layer = layer, .socket = if (layer == .ktls) fd else null };
 }
 
+fn anyOf(text: []const u8, needles: []const []const u8) bool {
+    for (needles) |n| if (std.mem.indexOf(u8, text, n) != null) return true;
+    return false;
+}
+
 fn clientAgainstSServer(layer: tls.RecordLayer) !void {
     const io = testing.io;
     const gpa = testing.allocator;
@@ -179,8 +184,11 @@ fn clientAgainstSServer(layer: tls.RecordLayer) !void {
     const text = try Io.Dir.cwd().readFileAlloc(io, out_path, gpa, .limited(1 << 20));
     defer gpa.free(text);
     const established = std.mem.indexOf(u8, text, "CONNECTION ESTABLISHED") != null;
-    const verified = std.mem.indexOf(u8, text, "Peer certificate: CN = node-b") != null and std.mem.indexOf(u8, text, "Verification: OK") != null;
-    const suite = std.mem.indexOf(u8, text, "Ciphersuite: TLS_AES_128_GCM_SHA256") != null and std.mem.indexOf(u8, text, "Signature type: Ed25519") != null;
+    // The one-line name and the signature name are OpenSSL's spelling, which
+    // moved: 3.0 prints `CN = node-b` and `Ed25519`, 3.5 (Ubuntu 26.04)
+    // `CN=node-b` and `ed25519`. Either is the same verdict.
+    const verified = anyOf(text, &.{ "Peer certificate: CN = node-b", "Peer certificate: CN=node-b" }) and std.mem.indexOf(u8, text, "Verification: OK") != null;
+    const suite = std.mem.indexOf(u8, text, "Ciphersuite: TLS_AES_128_GCM_SHA256") != null and anyOf(text, &.{ "Signature type: Ed25519", "Signature type: ed25519" });
     if (!(established and verified and suite)) {
         std.debug.print("\n--- s_server ({f}) did not record the mutual session ---\n{s}\n", .{ term, text });
         return error.OracleDisagrees;

@@ -15,6 +15,8 @@
 # comment to src/core/clock.zig there (and restores it) so the test steps run
 # for real instead of answering from the build cache.
 set -uo pipefail
+# The logs carry UTF-8; macOS awk refuses multibyte input outside the C locale.
+export LC_ALL=C
 
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 STATE=$REPO/.gate-train

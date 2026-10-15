@@ -78,6 +78,12 @@ three consecutive greens (charter §11's release criterion), and reports one lin
   green. A row in `docs/gates/flakes.md` failing is reported, not yours to chase: its owner
   has it.
 - Evidence notes stay under a page: what changed, why, the red test, the numbers.
+- **Venue resources**: `scripts/venue` admits ONE full gate at a time (it holds every build
+  slot) and at most two other builds (three on kamrui). A heavy command that is not a
+  `zig build` — a loop of smoke rows, daemons, `yes` load — runs as
+  `SQZ_VENUE_SLOT=1 scripts/venue '…'` so it takes a slot too and never starves a gate.
+  `SQZ_VENUE=kamrui` selects the x86_64 box; `scripts/venue pull <path>` brings back what
+  a command there wrote into the tree.
 
 ## Conventions (Zig 0.17)
 

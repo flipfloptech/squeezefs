@@ -9,6 +9,16 @@
 #   scripts/venue up              # (re)create the container
 #   scripts/venue status          # kernel, zig, fuse/uring facts
 #   scripts/venue trim            # return deleted blocks to the Mac (run after big tests)
+#   scripts/venue pull <path>     # ssh venues: copy <path> (e.g. tests/costs) back to the Mac
+#
+# Two venues, chosen by SQZ_VENUE:
+#   vm (default)  the `sqz-zig` container on this Mac (aarch64, 8 vCPU / 16 GiB, the sqz
+#                 kernel with patches 0001–0028)
+#   kamrui        the x86_64 box `kamrui-dev` over ssh (12 threads, 61 GiB, local NVMe;
+#                 Ubuntu 26.04): the repo is mirrored at the SAME absolute path by rsync
+#                 before every command (a delta is ~2 s), commands run as root via sudo,
+#                 /build is an ext4 LV on its NVMe. Files a command writes into the tree
+#                 stay on the box until `pull`ed — the Mac's tree is the source of truth.
 #
 # Zig caches live on the `squeezefs-zig-cache` volume (/build) — never on the
 # virtiofs mount, where the cache's rename/lock traffic is slow.
@@ -32,10 +42,32 @@ EXT_DIR=${SQZ_EXT_DIR:-/Volumes/512GB/sqz-tmp}
 # ZIG_GLOBAL_CACHE_DIR is honoured by the compiler; --cache-dir is the build flag.
 # The install prefix is per venue: the repo (and so zig-out/) is shared with
 # macOS through the mount, and a Linux binary must never overwrite the host's.
-ZIG_CACHE_ARGS=(--cache-dir /build/zig-cache --prefix zig-out-linux)
+ZIG_CACHE_ARGS=(--cache-dir /build/zig-cache-v2 --prefix zig-out-linux)
 export_cache="export ZIG_GLOBAL_CACHE_DIR=/build/zig-global-cache"
 
+VENUE=${SQZ_VENUE:-vm}
+case "$VENUE" in
+  vm) SLOTS=2 ;;
+  # 61 GiB: three LTO links (several GB each) beside a 6-shard unit set still fit.
+  kamrui) SSH_HOST=${SQZ_VENUE_HOST:-kamrui-dev}; SLOTS=3 ;;
+  *) echo "venue: unknown SQZ_VENUE '$VENUE' (vm | kamrui)" >&2; exit 2 ;;
+esac
+SSH=(ssh -o BatchMode=yes -o LogLevel=ERROR)
+
+# The Mac's tree → the ssh venue's mirror (same absolute path, so worktrees' .git
+# pointers resolve). Build products and caches never cross.
+sync_tree() {
+  [ "${SQZ_VENUE_NOSYNC:-0}" = 1 ] && return 0
+  rsync -a --delete --exclude='.zig-cache/' --exclude='zig-out*/' --exclude='.gate-train/' \
+    --exclude='__pycache__/' -e "${SSH[*]}" "$REPO/" "$SSH_HOST:$REPO/"
+}
+
 up() {
+  if [ "$VENUE" != vm ]; then
+    sync_tree
+    "${SSH[@]}" "$SSH_HOST" "sudo mkdir -p /build/zig-cache-v2 /build/zig-global-cache /build/tmp && sudo chmod 1777 /build/tmp && echo \"venue $VENUE ready: \$(uname -r) \$(nproc) cpus \$(free -g | awk 'NR==2{print \$2}') GiB\""
+    return
+  fi
   container volume create "$CACHE_VOL" >/dev/null 2>&1 || true
   if container inspect "$NAME" >/dev/null 2>&1; then
     echo "venue: $NAME exists; 'container rm -f $NAME' first to recreate" >&2
@@ -67,6 +99,7 @@ up() {
 }
 
 ensure_running() {
+  [ "$VENUE" != vm ] && return 0
   local state
   state=$(container inspect "$NAME" 2>/dev/null | python3 -c 'import json,sys; d=json.load(sys.stdin); print((d[0] if isinstance(d,list) else d).get("status",""))' 2>/dev/null || true)
   case "$state" in
@@ -97,17 +130,30 @@ run_in() {
   # the gate lock AND both slots, so it runs alone. A command whose own exit status is 75
   # (EX_TEMPFAIL) is indistinguishable from "slot busy" — none of ours uses it.
   local q; q=$(printf '%q' "$cmd")
+  local all_slots="" s
+  for ((s = 0; s < SLOTS; s++)); do all_slots="$all_slots flock /build/.build-slot.$s"; done
   if printf '%s' "$cmd" | grep -Eq 'zig build[^;&|]*[[:space:]]gate([[:space:]]|$)'; then
-    cmd="flock -n /build/.gate.lock true 2>/dev/null || echo 'venue: another full gate is running — waiting for /build/.gate.lock' >&2; flock /build/.gate.lock flock /build/.build-slot.0 flock /build/.build-slot.1 bash -lc $q"
+    cmd="flock -n /build/.gate.lock true 2>/dev/null || echo 'venue: another full gate is running — waiting for /build/.gate.lock' >&2; flock /build/.gate.lock$all_slots bash -lc $q"
   elif printf '%s' "$cmd" | grep -Eq 'zig build'; then
-    cmd="r=75; for s in 0 1; do flock -n -E 75 /build/.build-slot.\$s bash -lc $q; r=\$?; [ \$r -ne 75 ] && break; done; if [ \$r -eq 75 ]; then echo 'venue: two builds are running — waiting for a build slot' >&2; flock /build/.build-slot.0 bash -lc $q; r=\$?; fi; exit \$r"
+    cmd="r=75; for s in \$(seq 0 $((SLOTS - 1))); do flock -n -E 75 /build/.build-slot.\$s bash -lc $q; r=\$?; [ \$r -ne 75 ] && break; done; if [ \$r -eq 75 ]; then echo 'venue: $SLOTS builds are running — waiting for a build slot' >&2; flock /build/.build-slot.0 bash -lc $q; r=\$?; fi; exit \$r"
   fi
   # -lc so PATH picks up /usr/local/bin/zig; cd into the repo at the same path.
-  container exec -i ${tty[@]+"${tty[@]}"} "$NAME" bash -lc "$export_cache; cd '$REPO' && $cmd"
+  if [ "$VENUE" = vm ]; then
+    container exec -i ${tty[@]+"${tty[@]}"} "$NAME" bash -lc "$export_cache; cd '$REPO' && $cmd"
+  else
+    sync_tree
+    # Root, as in the container: mount(2), fuse.enable_uring, nvmet configfs.
+    "${SSH[@]}" ${tty[@]+"${tty[@]}"} "$SSH_HOST" "sudo bash -lc $(printf '%q' "$export_cache; cd '$REPO' && $cmd")"
+  fi
 }
 
 case "${1:-}" in
   up) up ;;
+  pull)
+    shift
+    [ "$VENUE" = vm ] && { echo "venue: the vm shares the tree — nothing to pull" >&2; exit 0; }
+    for p in "$@"; do rsync -a -e "${SSH[*]}" "$SSH_HOST:$REPO/$p" "$(dirname "$REPO/$p")/"; done
+    ;;
   trim)
     # Return deleted blocks to the Mac: the container disk is a sparse image
     # that only shrinks when the guest issues discards. Run after big-file
@@ -137,7 +183,11 @@ case "${1:-}" in
     ;;
   "")
     ensure_running
-    exec container exec -it "$NAME" bash -lc "cd '$REPO' && exec bash"
+    if [ "$VENUE" = vm ]; then
+      exec container exec -it "$NAME" bash -lc "cd '$REPO' && exec bash"
+    fi
+    sync_tree
+    exec "${SSH[@]}" -t "$SSH_HOST" "sudo bash -lc $(printf '%q' "cd '$REPO' && exec bash")"
     ;;
   *) run_in "$*" ;;
 esac

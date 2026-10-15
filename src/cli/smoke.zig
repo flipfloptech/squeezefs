@@ -1839,7 +1839,7 @@ test "smoke: THE TWO-DAEMON MATRIX — mount A (the manager) → mount B as a SE
         // cadence, B's `df` drops it at A's verdict and A's at its grace
         // release. `df` is judged at rest — every block B shipped answered,
         // none pending, A's grace ring empty.
-        const b_freed = try awaitMatrixFreesSettled(b, rig);
+        const b_freed = try awaitShippedFreesSettled(b, rig);
         const used_b = blk: {
             const df = try b.onMount("df -k . | tail -1 | awk '{print $3}'");
             defer gpa.free(df);
@@ -3730,6 +3730,12 @@ fn kvdaKillRow(skip_pages: bool) !void {
         defer gpa.free(out);
         sha1 = try std.fmt.bufPrint(&sha1_buf, "{s}", .{std.mem.trimEnd(u8, out, "\n")});
     }
+    // A mint the dd abandoned (a superseded upload; x86_64 abandons 0–4 per
+    // 200 MiB) is a terminal free B ships at the cadence: judged at rest
+    // (the matrix row's wait), the kill below meets no free in flight — one
+    // the dead holder never answered is leak-safe, and the successor's
+    // derivation releases it (`data_alloc_bitmap_leaks_released`).
+    _ = try awaitShippedFreesSettled(b, rig);
     const ckpts0 = blk: {
         // B's beat declares every renewal: the holder's count climbs.
         const ta = inner: {
@@ -5682,11 +5688,12 @@ test "smoke: a LATE bring-up refusal — the kmbuf ring answers ENOMEM (the seam
     try testing.expectEqual(@as(usize, 0), try fuseMountsOf(gpa, io, rig.mp));
 }
 
-/// The matrix's shipped frees at rest: every block B shipped answered
-/// (freed, non-terminal or refused) with none pending in its batch, and
-/// A's grace ring empty — so both `df`s count every free. Bounded by the
-/// row's 60 s free wait; B's freed count at rest.
-fn awaitMatrixFreesSettled(b: *Peer, rig: *Rig) !u64 {
+/// B's shipped frees at rest: every block B shipped answered (freed,
+/// non-terminal or refused) with none pending in its batch, and A's grace
+/// ring empty — so both `df`s count every free, and a kill of A meets no
+/// free in flight. Bounded by the rows' 60 s free wait; B's freed count at
+/// rest.
+fn awaitShippedFreesSettled(b: *Peer, rig: *Rig) !u64 {
     const gpa = rig.gpa;
     const deadline = clock.monotonicNs() + 60 * std.time.ns_per_s;
     while (true) {
@@ -5701,7 +5708,7 @@ fn awaitMatrixFreesSettled(b: *Peer, rig: *Rig) !u64 {
         const graced = numberAfter(ta, "\"free_grace_offsets\":") orelse 0;
         if (shipped == answered and pending == 0 and graced == 0) return freed;
         if (clock.monotonicNs() >= deadline) {
-            std.debug.print("\nsmoke: matrix: B's shipped frees never settled — shipped {d}, answered {d} (freed {d}), pending {d}; A's grace ring {d}\n", .{ shipped, answered, freed, pending, graced });
+            std.debug.print("\nsmoke: B's shipped frees never settled — shipped {d}, answered {d} (freed {d}), pending {d}; A's grace ring {d}\n", .{ shipped, answered, freed, pending, graced });
             return error.FreesNeverSettled;
         }
         sleepMs(200);

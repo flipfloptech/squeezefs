@@ -10354,9 +10354,16 @@ fn kvmapWriteScript(gpa: std.mem.Allocator, from_mib: u64, reps: u64, tolerate: 
     var pos = from_mib;
     const end = reps * image_mib;
     while (pos < end) {
-        const n = @min(image_mib - pos % image_mib, end - pos);
+        // The crash arm syncs at the inline cap: the ordered law (decision
+        // 0003 §AL.5) makes a size durable at its landing's drain or at a
+        // sync, so the kill's lower bound — the file claims the inline-
+        // mapped run — stands on this durability point; the crossing
+        // starts past it.
+        const to_cap = if (tolerate and pos < kvmap_inline_cap_mib) kvmap_inline_cap_mib - pos else end - pos;
+        const n = @min(image_mib - pos % image_mib, end - pos, to_cap);
         try w.print("dd if=\"$W/image\" of=big bs=1M skip={d} seek={d} count={d} conv=notrunc status=none{s}\n", .{ pos % image_mib, pos, n, if (tolerate) " || true" else "" });
         pos += n;
+        if (tolerate and pos == kvmap_inline_cap_mib) try w.writeAll("sync -d big || true\n");
     }
     if (!tolerate) try w.writeAll("sync -d big\necho kvmap-write-ok\n");
     return script.toOwnedSlice();

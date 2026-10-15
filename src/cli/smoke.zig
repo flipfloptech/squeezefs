@@ -6036,6 +6036,18 @@ const small_len: u64 = 64 << 10;
 /// blocks, plus one open pack per data volume that the DISMOUNT seal may
 /// close short.
 const pack_census_bound: u64 = (small_files_staged * small_len + (2 << 20) - 1) / (2 << 20) + 2;
+/// The cache-path row's daemon budget, pinned. The staging ring is budget/8
+/// (`DataPlane.stagingCapacityFor`'s ceiling), and the storm must overflow
+/// it beside the small files, so the plane's dispatch packs them online: the
+/// open packs the post-rm census judges (leak67). A derived budget on a big
+/// host (kamrui, 61 GiB) gave a ring the storm never filled; nothing packed,
+/// and the row passed without judging a pack. The VM's free-space share gave
+/// 204–234 MiB, so its storm reached high water only sometimes. 1 GiB caps
+/// the ring at 128 MiB on every venue.
+const cache_row_budget_mib: u64 = 1024;
+comptime {
+    if (cache_row_budget_mib / 8 + small_files_staged * small_len / (1 << 20) >= storm_files * storm_mib) @compileError("the storm no longer overflows the cache-path row's staging ring");
+}
 /// 4 KiB overwrites against the mirrored image: page-aligned (the W1
 /// patch class on a striped file) and at arbitrary byte offsets (the
 /// overlay / RMW classes).
@@ -6519,6 +6531,7 @@ fn dataPlanePass(rig: *Rig, cache: bool) !void {
     const io = rig.io;
     const label: []const u8 = if (cache) "cache" else "no-cache";
     const zc_legs = zcKernel();
+    if (cache) try rig.env.put("SQUEEZEFS_MEM_BUDGET_MB", std.fmt.comptimePrint("{d}", .{cache_row_budget_mib}));
     try rig.formatSet(cache);
     try rig.createImage();
     try rig.spawnMount(&.{});
@@ -6607,6 +6620,11 @@ fn dataPlanePass(rig: *Rig, cache: bool) !void {
         try testing.expectEqual(@as(u64, 2), clips);
         if (cache) {
             try testing.expect(staged >= small_files_staged);
+            // The pinned budget's purpose: the storm's ring pressure packed
+            // small files online, so the census after rm judges open packs.
+            const packed_online = numberAfter(tail, "\"layout_promoted_packed\":") orelse 0;
+            std.debug.print("smoke[{s}]: {d} small file(s) packed by the dispatch before rm\n", .{ label, packed_online });
+            try testing.expect(packed_online > 0);
             // The held-slot store and the direct leg are zc legs.
             try testing.expectEqual(zc_legs, (numberAfter(tail, "\"held_stores\":") orelse 0) > 0);
             try testing.expectEqual(zc_legs, (numberAfter(tail, "\"transport_zc_direct_legs\":") orelse 0) > 0);

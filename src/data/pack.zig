@@ -1608,6 +1608,22 @@ test "a DMA error releases the tenant and errors (nothing published); a StorageF
     try testing.expect((try f.packer.prepare(io, k, &fill(10, 'q'), 1)) != null);
 }
 
+test "a refill whose OpenPack allocation fails mints nothing: OutOfMemory reaches the caller, the allocator tracks no block, and a retry opens the pack" {
+    const gpa = testing.allocator;
+    var world: World = .{ .gpa = gpa };
+    defer world.deinit();
+    // Allocation 0 is the row table; 1 is the refill's OpenPack.
+    var failing = std.testing.FailingAllocator.init(gpa, .{ .fail_index = 1 });
+    var packer = try Packer.init(failing.allocator(), CHUNK, Policy.resolve(true, null, CHUNK), world.allocSeam(), world.dmaSeam(), world.readSeam(), 8);
+    defer packer.deinit();
+    const k: PackKey = .{ .vol_tag = 0x11, .scope = 0 };
+    try testing.expectError(error.OutOfMemory, packer.reserve(testing.io, k, layout.GRAIN));
+    try testing.expectEqual(@as(u32, 0), world.refcounts.count());
+    failing.fail_index = std.math.maxInt(usize);
+    try testing.expect((try packer.reserve(testing.io, k, layout.GRAIN)) != null);
+    try testing.expectEqual(@as(u32, 1), world.refcounts.count());
+}
+
 test "overflow seals FULL exactly once and the next reservation refills into a fresh block; dismount seals every open pack; a drain seal names its block; the seal checks the pin arithmetic and releases the pin" {
     const gpa = testing.allocator;
     const io = testing.io;

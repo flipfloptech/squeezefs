@@ -1308,6 +1308,28 @@ test "the pack-open ledger shields an open pack's +1 pin from C2/C3/C8; an open 
     try ram.expectClasses(r2, &.{ .c2, .c9 });
 }
 
+test "C8's exemptions match the block's OWN volume: an open pack or an in-flight owner on B at index N never hides A's drift at N (a stray record on a leaked block of A)" {
+    const gpa = testing.allocator;
+    const set = try RamSet.init(gpa);
+    defer set.deinit();
+    const p = try populate(set);
+    // Block 5 is f2's on B and free on A: A's block 5 leaks with a stray record.
+    set.leak(VOL_A, 5);
+    try set.strayRef(RamSet.local(p.f1), 9, VOL_A, 5);
+    try set.open_packs.put(gpa, VOL_B ^ (5 << 8), {});
+    {
+        var r = try ram.run(set, .online, .{});
+        defer r.deinit(gpa);
+        try ram.expectClasses(r, &.{ .c2, .c8 });
+    }
+    set.open_packs.clearRetainingCapacity();
+    set.allocs[1].holdInflight(5);
+    defer set.allocs[1].dropInflight(5);
+    var r = try ram.run(set, .online, .{});
+    defer r.deinit(gpa);
+    try ram.expectClasses(r, &.{ .c2, .c8 });
+}
+
 test "C10's cross-owner names: a dentry in a judged directory naming a child in a LIVE foreign lessee's slot is the lessee's to judge (scoped, counted — a joiner's files under the manager's directory read as 50 dangling names on the two-daemon set), and a child minted past the census ceiling in the current era is the create window, never a blind dangling" {
     const gpa = testing.allocator;
     const set = try RamSet.init(gpa);

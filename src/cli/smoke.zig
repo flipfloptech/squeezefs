@@ -1724,8 +1724,17 @@ test "smoke: THE TWO-DAEMON MATRIX — mount A (the manager) → mount B as a SE
     var t_owner_text: [8]u8 = undefined;
     try rig.env.put("SQUEEZEFS_TEST_MEMBERSHIP_T_OWNER_MS", try std.fmt.bufPrint(&t_owner_text, "{d}", .{smoke_t_owner_ms}));
     try rig.formatSet(true);
+    // A's kernel classes outlive the row: its second read of B's file is a
+    // cache hit whatever the venue's pace (the shipped 1 s peered TTL lapsed
+    // between the reads in 13 of 30 runs under 8 × `yes` on kamrui: A's
+    // kernel revalidated and took 2 new grants on B, expected 10, found 12),
+    // and its third read is fresh by B's recall alone. B keeps the shipped
+    // classes.
+    const a_ttls = [_][]const u8{ "SQUEEZEFS_FUSE_ATTR_TTL_MS", "SQUEEZEFS_FUSE_ENTRY_TTL_MS", "SQUEEZEFS_FUSE_DIR_ENTRY_TTL_MS", "SQUEEZEFS_FUSE_NEGATIVE_TTL_MS" };
+    for (a_ttls) |k| try rig.env.put(k, "60000");
     try rig.spawnMount(&.{});
     _ = try rig.awaitReady(0);
+    for (a_ttls) |k| _ = rig.env.swapRemove(k);
     // The manager's endpoint lands in tree 0 at its first checkpoint; the
     // joiner polls the projection for it (bounded) — nothing to wait for.
     const b = try Peer.init(rig, "b");

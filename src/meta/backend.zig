@@ -1906,6 +1906,10 @@ pub const KvBackend = struct {
                 return error.Corrupt;
             },
         };
+        // Trees another appender leases (live, or dead until the recovery
+        // installs them): projections here, never walked (§U.1).
+        var projections: std.ArrayList(key.ForestSlot) = .empty;
+        defer projections.deinit(gpa);
         for (roots.items) |r| {
             try be.guest_cursor_floors.put(gpa, r.slot, r.cursor);
             // The native slot's lease names the ledger's own native root
@@ -1916,6 +1920,7 @@ pub const KvBackend = struct {
             // A granted, never-minted slot owns no extent yet.
             if (r.root.addr == 0) continue;
             const root: tree.RootPtr = .{ .addr = r.root.addr, .seq = r.root.seq };
+            if (r.lessee) |a| if (a != journal.FIXED_RING_APPENDER) try projections.append(gpa, key.guestForestSlot(r.slot));
             const t = KvTree.open(gpa, be.cache, .{ .slot = key.guestForestSlot(r.slot) }, root, &be.seq) catch |e| switch (e) {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.Io => return error.Io,
@@ -1928,7 +1933,7 @@ pub const KvBackend = struct {
             try be.guest_published.put(gpa, r.slot, root);
         }
         // Before the first claim (the mints below).
-        if (recovered) |a| try be.adoptReachableClaims(a);
+        if (recovered) |a| try be.adoptReachableClaims(a, projections.items);
         // Slots the window names without a tree.
         var mentioned = std.AutoHashMapUnmanaged(u16, void).empty;
         defer mentioned.deinit(gpa);
@@ -1963,12 +1968,18 @@ pub const KvBackend = struct {
     /// without a leaf's (`rung-10-routing-loop.md`). Cost: one read per
     /// interior node of every tree, leaves never read (their parents name
     /// them) — the walk's extents and wall are `meta_kv_mount_reach_walk_*`.
-    fn adoptReachableClaims(be: *KvBackend, alloc: *alloc_ext.ExtentAllocator) OpenError!void {
+    /// `projections`: the forest slots another appender leases — skipped
+    /// (§U.1: a lessee's tree is its lessee's to judge; its extents sit in
+    /// that lessee's grant, whose bits the grant's entry journals, and the
+    /// handover's cycle lands a holder's claims before the grant's entry
+    /// moves its images).
+    fn adoptReachableClaims(be: *KvBackend, alloc: *alloc_ext.ExtentAllocator, projections: []const key.ForestSlot) OpenError!void {
         const t0 = clock.monotonicNs();
         var extents: std.ArrayList(u64) = .empty;
         defer extents.deinit(be.gpa);
         var walked: u64 = 0;
         for (be.trees.load()) |t| {
+            if (t.forest_slot) |fs| if (std.mem.indexOfScalar(key.ForestSlot, projections, fs) != null) continue;
             extents.clearRetainingCapacity();
             be.collectTreeExtents(t, &extents) catch |e| return switch (e) {
                 error.OutOfMemory => error.OutOfMemory,

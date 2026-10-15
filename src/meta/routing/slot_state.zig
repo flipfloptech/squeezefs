@@ -56,7 +56,9 @@ pub const decode = cr.SlotStateWire.decode;
 /// `Releasing` entry at the record's generation under the manager — the
 /// two-homes law; a conflict is C14's). A slot leased but never minted has
 /// no root yet (`root.addr == 0`).
-pub const GuestRoot = struct { slot: u16, root: Root, cursor: u64, extents: u64 };
+/// `lessee`: the appender a `leased` / `releasing` record names (null when
+/// unleased) — another appender's tree is a projection to this mount.
+pub const GuestRoot = struct { slot: u16, root: Root, cursor: u64, extents: u64, lessee: ?u32 };
 
 pub const FoldError = error{ Corrupt, Conflict, OutOfMemory };
 
@@ -81,7 +83,7 @@ pub fn foldGuestRoots(gpa: std.mem.Allocator, kvs: []const tree.KeyValue, page0:
                 .drop_entry, .stale_entry => {},
             }
         };
-        try out.append(gpa, .{ .slot = slot, .root = root, .cursor = cursor, .extents = extents });
+        try out.append(gpa, .{ .slot = slot, .root = root, .cursor = cursor, .extents = extents, .lessee = if (v.variant == .unleased) null else v.appender_id });
     }
 }
 

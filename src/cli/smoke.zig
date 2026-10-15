@@ -1831,11 +1831,20 @@ test "smoke: THE TWO-DAEMON MATRIX — mount A (the manager) → mount B as a SE
     // boundary-crossing reads the handler lane serves); `rm` on B ships the
     // terminal frees to A and both `df`s return.
     {
-        const out = try b.onMount("mkdir b-data && dd if=/dev/urandom of=b-data/big bs=1M count=200 status=none && sync -d b-data/big && sha256sum b-data/big | cut -d' ' -f1 && df -k . | tail -1 | awk '{print $3}'");
+        const out = try b.onMount("mkdir b-data && dd if=/dev/urandom of=b-data/big bs=1M count=200 status=none && sync -d b-data/big && sha256sum b-data/big | cut -d' ' -f1");
         defer gpa.free(out);
-        var lines = std.mem.splitScalar(u8, out, '\n');
-        const sha_b = lines.next() orelse return error.ShaMissing;
-        const used_b = try std.fmt.parseInt(u64, lines.next() orelse return error.DfMissing, 10);
+        const sha_b = std.mem.trimEnd(u8, out, "\n");
+        // A mint the dd abandoned (a superseded upload) that B's window
+        // could not take back is a terminal free: it ships to A at the
+        // cadence, B's `df` drops it at A's verdict and A's at its grace
+        // release. `df` is judged at rest — every block B shipped answered,
+        // none pending, A's grace ring empty.
+        const b_freed = try awaitMatrixFreesSettled(b, rig);
+        const used_b = blk: {
+            const df = try b.onMount("df -k . | tail -1 | awk '{print $3}'");
+            defer gpa.free(df);
+            break :blk try std.fmt.parseInt(u64, std.mem.trimEnd(u8, df, "\n"), 10);
+        };
         const tb = try b.stats();
         defer gpa.free(tb);
         const topups = numberAfter(tb, "\"block_grant_topups\":") orelse 0;
@@ -1847,6 +1856,7 @@ test "smoke: THE TWO-DAEMON MATRIX — mount A (the manager) → mount B as a SE
         const grants = numberAfter(ta, "\"block_grants\":") orelse 0;
         const granted_blocks = numberAfter(ta, "\"block_grant_blocks\":") orelse 0;
         try testing.expect(grants >= 1 and granted_blocks >= matrix_dd_blocks);
+        const free_served_before = numberAfter(ta, "\"free_served_blocks\":") orelse 0;
         const from_a = try rig.onMount("sha256sum b-data/big | cut -d' ' -f1; df -k . | tail -1 | awk '{print $3}'");
         defer gpa.free(from_a);
         var a_lines = std.mem.splitScalar(u8, from_a, '\n');
@@ -1854,9 +1864,9 @@ test "smoke: THE TWO-DAEMON MATRIX — mount A (the manager) → mount B as a SE
         const used_a = try std.fmt.parseInt(u64, a_lines.next() orelse return error.DfMissing, 10);
         try testing.expectEqualStrings(sha_b, sha_a);
         // `df` per the rule (block 4 MiB = 4096 KiB): B sees exactly its
-        // file; A sees every granted block.
+        // file; A sees every granted block B has not freed back.
         try testing.expectEqual(matrix_dd_blocks * matrix_block_kib, used_b);
-        try testing.expectEqual(granted_blocks * matrix_block_kib, used_a);
+        try testing.expectEqual((granted_blocks - b_freed) * matrix_block_kib, used_a);
         const rm = try b.onMount("rm b-data/big");
         gpa.free(rm);
         // The forget → the terminal frees → the shipper's batch at the
@@ -1875,12 +1885,12 @@ test "smoke: THE TWO-DAEMON MATRIX — mount A (the manager) → mount B as a SE
         defer gpa.free(tb2);
         const ta2 = try rig.onMount("cat .stats");
         defer gpa.free(ta2);
-        try testing.expectEqual(@as(?u64, matrix_dd_blocks), numberAfter(tb2, "\"free_ship_freed\":"));
+        try testing.expectEqual(@as(?u64, b_freed + matrix_dd_blocks), numberAfter(tb2, "\"free_ship_freed\":"));
         try testing.expectEqual(@as(?u64, 0), numberAfter(tb2, "\"free_ship_refused\":"));
-        try testing.expectEqual(@as(?u64, matrix_dd_blocks), numberAfter(ta2, "\"free_served_blocks\":"));
+        try testing.expectEqual(@as(?u64, free_served_before + matrix_dd_blocks), numberAfter(ta2, "\"free_served_blocks\":"));
         const df_b = try b.onMount("df -k . | tail -1 | awk '{print $3}'");
         defer gpa.free(df_b);
-        std.debug.print("smoke: matrix: 200 MiB dd on B — {d} grant(s) / {d} blocks pulled from A in {d} top-up(s); sha from A equal; df used B {d} KiB, A {d} KiB; after rm on B: {d} frees shipped and freed at A, df A {d} KiB, B {s} KiB\n", .{ grants, granted_blocks, topups, used_b, used_a, numberAfter(tb2, "\"free_shipped_blocks\":") orelse 0, used_a_after, std.mem.trimEnd(u8, df_b, "\n") });
+        std.debug.print("smoke: matrix: 200 MiB dd on B — {d} grant(s) / {d} blocks pulled from A in {d} top-up(s), {d} abandoned mint(s) freed back; sha from A equal; df used B {d} KiB, A {d} KiB; after rm on B: {d} frees shipped and freed at A, df A {d} KiB, B {s} KiB\n", .{ grants, granted_blocks, topups, b_freed, used_b, used_a, numberAfter(tb2, "\"free_shipped_blocks\":") orelse 0, used_a_after, std.mem.trimEnd(u8, df_b, "\n") });
     }
     // A WRITES B's file AFTER the df arithmetic above (the holder's own
     // carve for the write counts as used from B's view): charter §5.5 "the
@@ -5670,6 +5680,32 @@ test "smoke: a LATE bring-up refusal — the kmbuf ring answers ENOMEM (the seam
     try rig.umount();
     try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
     try testing.expectEqual(@as(usize, 0), try fuseMountsOf(gpa, io, rig.mp));
+}
+
+/// The matrix's shipped frees at rest: every block B shipped answered
+/// (freed, non-terminal or refused) with none pending in its batch, and
+/// A's grace ring empty — so both `df`s count every free. Bounded by the
+/// row's 60 s free wait; B's freed count at rest.
+fn awaitMatrixFreesSettled(b: *Peer, rig: *Rig) !u64 {
+    const gpa = rig.gpa;
+    const deadline = clock.monotonicNs() + 60 * std.time.ns_per_s;
+    while (true) {
+        const tb = try b.stats();
+        defer gpa.free(tb);
+        const ta = try rig.stats();
+        defer gpa.free(ta);
+        const shipped = numberAfter(tb, "\"free_shipped_blocks\":") orelse 0;
+        const freed = numberAfter(tb, "\"free_ship_freed\":") orelse 0;
+        const answered = freed + (numberAfter(tb, "\"free_ship_nonterminal\":") orelse 0) + (numberAfter(tb, "\"free_ship_refused\":") orelse 0);
+        const pending = numberAfter(tb, "\"pending_frees\":") orelse 0;
+        const graced = numberAfter(ta, "\"free_grace_offsets\":") orelse 0;
+        if (shipped == answered and pending == 0 and graced == 0) return freed;
+        if (clock.monotonicNs() >= deadline) {
+            std.debug.print("\nsmoke: matrix: B's shipped frees never settled — shipped {d}, answered {d} (freed {d}), pending {d}; A's grace ring {d}\n", .{ shipped, answered, freed, pending, graced });
+            return error.FreesNeverSettled;
+        }
+        sleepMs(200);
+    }
 }
 
 /// A data volume of three 4 MiB(+4 KiB) chunks: two reserved, one usable.

@@ -212,6 +212,10 @@ pub const TestSeams = struct {
     /// P4: an SMO entry about to be written — the swap happened, the
     /// successor images are barriered, the entry is not on the device.
     before_smo_entry: ?node_cache.Hook = null,
+    /// C4b: every guest root the cycle names is on the device (appender
+    /// 0's page refresh, tree-0 records) — its dirty bitmap pages (C6) are
+    /// not.
+    after_guest_roots: ?node_cache.Hook = null,
 };
 
 pub var test_seams: TestSeams = .{};
@@ -2117,6 +2121,7 @@ pub const KvBackend = struct {
             };
             try be.guest_published.put(be.gpa, slot, root);
         }
+        if (test_seams.after_guest_roots) |h| h.call(h.ctx);
     }
 
     const StampCtx = struct {
@@ -3278,6 +3283,67 @@ test "kill matrix: after the ledger write before reusable_upto advances — the 
 
 test "kill matrix: mid-SMO entry — the swap happened, the entry never landed; the tree routes consistently through the old structure" {
     try killMatrixRow(testing.allocator, .before_smo_entry);
+}
+
+/// A create's inode record in routing slot `slot` (its tree minted on
+/// first touch); the KEY ino.
+fn commitGuestInode(be: *KvBackend, slot: u16) !u64 {
+    const ino = key.guestLocalIno(slot, try be.allocateInoInSlot(slot));
+    const t = try be.begin(@src());
+    try t.stagePut(key.TREE_INODES, &key.inodeKey(ino), &(record.InodeValue{ .mode = 0o100644, .nlink = 1 }).encode());
+    try be.commit(t);
+    return ino;
+}
+
+test "kill matrix: mid-C4b — two guest trees minted on first touch (each root one extent, claimed in RAM only), the cut after C4b named their roots and before the cycle's bitmap pages landed: the reopened cut holds every root it names ALLOCATED, so the first claim after the crash (a third slot's mint) lands beside them, never over one, and every acked guest record stays present" {
+    const gpa = testing.allocator;
+    const v = try TestVol.create(gpa, "cut-c4b", "600000");
+    defer v.destroy();
+    var dst_buf: [160]u8 = undefined;
+    const dst = try std.fmt.bufPrint(&dst_buf, "{s}.cut", .{v.path()});
+    defer unlinkPath(dst);
+    var acked_n: std.atomic.Value(usize) = .init(0);
+    var ctx: CutCtx = .{ .src = v.path(), .dst = dst, .acked = &acked_n };
+    defer test_seams = .{};
+    // Three guest slots (the native one skipped).
+    var slots: [3]u16 = undefined;
+    var inos_acked: [3]u64 = undefined;
+    {
+        const be = try v.open();
+        defer be.close();
+        var next: u16 = 1;
+        for (&slots) |*s| {
+            if (be.stamp.native_slot) |ns| if (ns == next) {
+                next += 1;
+            };
+            s.* = next;
+            next += 1;
+        }
+        // The durable baseline names no guest tree.
+        try be.checkpointNow();
+        for (inos_acked[0..2], slots[0..2], 0..) |*ino, s, i| {
+            ino.* = try commitGuestInode(be, s);
+            acked_n.store(i + 1, .release);
+        }
+        test_seams.after_guest_roots = ctx.hook();
+        try be.checkpointNow();
+        try testing.expectEqual(@as(u32, 1), ctx.fired.load(.acquire));
+    }
+    const copy = try KvBackend.open(gpa, v.io(), dst, .{ .env = &v.env, .cache_budget_bytes = 64 << 20, .cpus = 4, .index = 1 });
+    defer copy.close();
+    var named: usize = 0;
+    for (slots[0..2]) |s| {
+        const t = copy.slotTree(s) orelse continue;
+        named += 1;
+        try testing.expect(copy.alloc.isAllocated(copy.cache.addrExtent(t.rootPtr().addr)));
+    }
+    // The cut is past C4b: both roots are named, neither is re-minted.
+    try testing.expectEqual(@as(usize, 2), named);
+    // The first claim after the crash.
+    inos_acked[2] = try commitGuestInode(copy, slots[2]);
+    for (inos_acked) |ino| try testing.expect(try present(copy, ino));
+    for (copy.trees.load()) |t| try testing.expect(copy.alloc.isAllocated(copy.cache.addrExtent(t.rootPtr().addr)));
+    std.debug.print("\nkill matrix: cut mid-C4b → 2 guest roots named and allocated after the replay; the third slot minted beside them; 3 of 3 guest records present\n", .{});
 }
 
 test "4-thread commit storm with concurrent checkpoints, then reopen: every ack present, identities close at quiesce" {

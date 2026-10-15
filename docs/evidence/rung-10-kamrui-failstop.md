@@ -46,3 +46,17 @@ except by a deadline) — and its byte reading, device ≤ that × one grain + 2
 schedule (elapsed ≤ 248 round trips) the original two-per-round count and pad bound still hold.
 An unpaced pass (the original red: 16 windows per round) breaks the law at once. Loops: macOS 12/12
 + 10/10 under 11 × `yes`; kamrui 20/20 + 10/10 under 12 × `yes`; the VM 20/20. The flakes row is removed.
+
+**The fusectl-less arm (the VM).** The dev container mounts no fusectl: the train's first VM gate
+failed the row (it waited on fusectl's `waiting`). The row now corroborates with `waiting` only
+where fusectl is mounted, and the product logs the `MNT_FORCE` arm's abort; VM 3 of 3 green on that
+arm (the sync returns 20 ms after the release).
+
+## 4. The full gate on kamrui
+
+Run once on `4243eee` (all of the above): 8 m 37 s inside the gate lock, no stall (the watcher saw
+output throughout), 46/53 steps, 2,932/3,015 tests. Red: suites-smoke (the one `apt.lock` pinned
+24.04's versions: now one lock per release, pjdfstest 7,968 tests clean on 26.04), and three rows
+attributed in `docs/gates/flakes.md` (two KVDA page-sink rows meeting an abandoned mint's shipped
+free across A's kill; the write-back storm's `overlay_registry_full`); the exclusive steps were
+skipped behind them.

@@ -1688,7 +1688,11 @@ pub const Session = struct {
         // CAP_SYS_ADMIN in the initial namespace — EPERM detaches plainly.
         const flags: u32 = if (self.abort_written) linux.MNT.DETACH else linux.MNT.DETACH | linux.MNT.FORCE;
         var rc = linux.umount2(self.mountpoint.ptr, flags);
-        if (linux.errno(rc) == .PERM and flags != linux.MNT.DETACH) rc = linux.umount2(self.mountpoint.ptr, linux.MNT.DETACH);
+        if (linux.errno(rc) == .PERM and flags != linux.MNT.DETACH) {
+            rc = linux.umount2(self.mountpoint.ptr, linux.MNT.DETACH);
+        } else if (flags != linux.MNT.DETACH and linux.errno(rc) == .SUCCESS) {
+            log.warn("transport: ended its own FUSE connection at {s} (MNT_FORCE: no fusectl; `umount_begin` aborts it before the detach drops its last reference — decision 0003 §AN)", .{self.mountpoint});
+        }
         if (linux.errno(rc) != .SUCCESS) log.err("transport: umount2({s}, MNT_DETACH) failed ({t}) — a mount is left behind", .{ self.mountpoint, linux.errno(rc) });
         self.mounted.store(false, .release);
         // The workers' residency has nothing to wait for on a detached

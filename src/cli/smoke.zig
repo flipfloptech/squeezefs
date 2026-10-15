@@ -8271,7 +8271,10 @@ test "smoke: [venue-exclusive] A DAEMON WHOSE BRING-UP FAILS NEVER HANGS THE HOS
     var sync_child = try std.process.spawn(io, .{ .argv = &.{"sync"}, .stdin = .ignore, .stdout = .ignore, .stderr = .inherit });
     const sync_pid = sync_child.id.?;
     const spawned_at = clock.monotonicNs();
-    while (!(stackHas(sync_pid, "fuse_sync_fs") and (fusectlNumber(io, minor, "waiting") orelse 0) >= 1)) {
+    // The connection's `waiting` corroborates where fusectl is mounted (the
+    // dev container mounts none).
+    const have_fusectl = fusectlNumber(io, minor, "waiting") != null;
+    while (!(stackHas(sync_pid, "fuse_sync_fs") and (!have_fusectl or (fusectlNumber(io, minor, "waiting") orelse 0) >= 1))) {
         if (!alive(sync_pid)) {
             _ = try sync_child.wait(io);
             std.debug.print("\nsmoke[startup-fail]: the sync returned without ever waiting on the failing daemon's connection\n", .{});
@@ -8291,11 +8294,14 @@ test "smoke: [venue-exclusive] A DAEMON WHOSE BRING-UP FAILS NEVER HANGS THE HOS
     if (alive(sync_pid)) {
         // The deadlock: the daemon's unmount waits for s_umount, the sync
         // holds it waiting on a connection nobody will serve. Break it from
-        // outside (fusectl) so neither outlives the row, then fail.
+        // outside (fusectl, mounted here if the venue has none — the daemon
+        // already detached, so no umount can reach it) so neither outlives
+        // the row, then fail.
         var stack_buf: [4096]u8 = undefined;
         var pb: [64]u8 = undefined;
         const stack = Io.Dir.cwd().readFile(io, try std.fmt.bufPrint(&pb, "/proc/{d}/stack", .{rig.child_pid}), &stack_buf) catch "";
         std.debug.print("\nsmoke[startup-fail]: the host-wide sync was still held {d} ms after the daemon's failure path ran (waiting {?d}); the daemon's main thread:\n{s}\n", .{ (clock.monotonicNs() - parked_at) / std.time.ns_per_ms, fusectlNumber(io, minor, "waiting"), stack });
+        if (!have_fusectl) _ = linux.mount("fusectl", transport.session.fusectl_connections, "fusectl", 0, 0);
         var ab: [96]u8 = undefined;
         const abort_path = try std.fmt.bufPrintSentinel(&ab, "{s}/{d}/abort", .{ transport.session.fusectl_connections, minor }, 0);
         const afd = linux.open(abort_path.ptr, .{ .ACCMODE = .WRONLY, .CLOEXEC = true }, 0);

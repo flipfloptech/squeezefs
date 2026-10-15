@@ -1148,8 +1148,9 @@ test "the direct-call scanner: `std.testing.fuzz(` and `testing.fuzz(` are caugh
 // `src/gates/literals.zig` states the law; every violation it finds in a
 // non-harness file under `src/` is either derived, documented on its line,
 // or carried in `tests/rails/literal-allowlist.txt` (`path:line | literal |
-// reason`) — and a row that matches no violation is STALE and fails, so the
-// list only shrinks.
+// line hash | reason`, the line a display hint: a row matches by path,
+// literal and `literals.lineHash`, one row per literal) — and a row that
+// matches no violation is STALE and fails, so the list only shrinks.
 // ---------------------------------------------------------------------------
 
 const literals = squeezefs.gates.literals;
@@ -1157,8 +1158,12 @@ const allowlist_path = "tests/rails/literal-allowlist.txt";
 
 const AllowRow = struct {
     path: []const u8,
+    /// Where the literal stood when the row was written: a display hint,
+    /// never compared (a line shift above the literal leaves the row in force).
     line: usize,
     literal: []const u8,
+    /// `literals.lineHash` of the literal's line: with path and literal, the identity.
+    line_hash: u64,
     reason: []const u8,
     used: bool = false,
 };
@@ -1173,7 +1178,15 @@ fn parseAllowlist(gpa: std.mem.Allocator, text: []const u8, out: *std.ArrayList(
         var cols = std.mem.splitSequence(u8, line, " | ");
         const loc = cols.next() orelse continue;
         const lit = cols.next() orelse {
-            try violations.print("  {s}:{d}: malformed row (want `path:line | literal | reason`)\n", .{ allowlist_path, n });
+            try violations.print("  {s}:{d}: malformed row (want `path:line | literal | line hash | reason`)\n", .{ allowlist_path, n });
+            continue;
+        };
+        const hash_hex = cols.next() orelse {
+            try violations.print("  {s}:{d}: malformed row (want `path:line | literal | line hash | reason`)\n", .{ allowlist_path, n });
+            continue;
+        };
+        const line_hash = std.fmt.parseInt(u64, hash_hex, 16) catch {
+            try violations.print("  {s}:{d}: `{s}` is not a line hash (the hex the rail prints for the literal)\n", .{ allowlist_path, n, hash_hex });
             continue;
         };
         const reason = cols.rest();
@@ -1189,8 +1202,53 @@ fn parseAllowlist(gpa: std.mem.Allocator, text: []const u8, out: *std.ArrayList(
             try violations.print("  {s}:{d}: `{s}` is not path:line\n", .{ allowlist_path, n, loc });
             continue;
         };
-        try out.append(gpa, .{ .path = try gpa.dupe(u8, loc[0..colon]), .line = ln, .literal = try gpa.dupe(u8, lit), .reason = reason });
+        try out.append(gpa, .{ .path = try gpa.dupe(u8, loc[0..colon]), .line = ln, .literal = try gpa.dupe(u8, lit), .line_hash = line_hash, .reason = reason });
     }
+}
+
+/// One product file the literal rail judges.
+const LiteralSource = struct { path: []const u8, text: [:0]const u8 };
+
+const LiteralCensus = struct { found: usize, unlisted: usize, rows: usize, stale: usize };
+
+/// The rail's judgment of `sources` (harness files already skipped) against
+/// the allowlist text: an unlisted literal prints the row to add, a row that
+/// covers no literal prints as stale.
+fn judgeLiterals(gpa: std.mem.Allocator, sources: []const LiteralSource, allow_text: []const u8, violations: *std.Io.Writer) !LiteralCensus {
+    var allow: std.ArrayList(AllowRow) = .empty;
+    defer {
+        for (allow.items) |r| {
+            gpa.free(r.path);
+            gpa.free(r.literal);
+        }
+        allow.deinit(gpa);
+    }
+    try parseAllowlist(gpa, allow_text, &allow, violations);
+    var tally: LiteralCensus = .{ .found = 0, .unlisted = 0, .rows = allow.items.len, .stale = 0 };
+    for (sources) |src| {
+        var v = try literals.scan(gpa, src.text);
+        defer v.deinit(gpa);
+        for (v.items) |hit| {
+            tally.found += 1;
+            const listed = for (allow.items) |*row| {
+                if (!row.used and row.line_hash == hit.line_hash and std.mem.eql(u8, row.path, src.path) and std.mem.eql(u8, row.literal, hit.literal)) {
+                    row.used = true;
+                    break true;
+                }
+            } else false;
+            if (!listed) {
+                tally.unlisted += 1;
+                try violations.print("  {s}:{d} | {s} | {x:0>16} | <derive it, document it on the line, or add this row with a reason>\n", .{ src.path, hit.line, hit.literal, hit.line_hash });
+            }
+        }
+    }
+    for (allow.items) |row| {
+        if (!row.used) {
+            tally.stale += 1;
+            try violations.print("  {s}: stale row `{s}:{d} | {s} | {x:0>16}` matches no violation — delete it (the literal's line changed, or it was derived or documented)\n", .{ allowlist_path, row.path, row.line, row.literal, row.line_hash });
+        }
+    }
+    return tally;
 }
 
 test "literal rail: every runtime literal in product code is derived, documented on its line, or allowlisted with a reason; no allowlist row is stale" {
@@ -1213,60 +1271,70 @@ test "literal rail: every runtime literal in product code is derived, documented
             return std.mem.lessThan(u8, a, b);
         }
     }.lt);
-    var violations: std.Io.Writer.Allocating = .init(gpa);
-    defer violations.deinit();
-    var allow: std.ArrayList(AllowRow) = .empty;
+    var sources: std.ArrayList(LiteralSource) = .empty;
     defer {
-        for (allow.items) |r| {
-            gpa.free(r.path);
-            gpa.free(r.literal);
-        }
-        allow.deinit(gpa);
+        for (sources.items) |s| gpa.free(s.text);
+        sources.deinit(gpa);
     }
-    const allow_text = try cwd.readFileAlloc(io, allowlist_path, gpa, .limited(16 << 20));
-    defer gpa.free(allow_text);
-    try parseAllowlist(gpa, allow_text, &allow, &violations.writer);
-    var found: usize = 0;
-    var unlisted: usize = 0;
-    var scanned_files: usize = 0;
     for (files.items) |path| {
         if (literals.isHarnessFile(path)) continue;
-        scanned_files += 1;
         const text = try readWalked(gpa, io, cwd, path) orelse continue;
-        defer gpa.free(text);
-        var v = try literals.scan(gpa, text);
-        defer v.deinit(gpa);
-        for (v.items) |hit| {
-            found += 1;
-            var listed = false;
-            for (allow.items) |*row| {
-                if (row.line == hit.line and std.mem.eql(u8, row.path, path) and std.mem.eql(u8, row.literal, hit.literal)) {
-                    row.used = true;
-                    listed = true;
-                }
-            }
-            if (!listed) {
-                unlisted += 1;
-                try violations.writer.print("  {s}:{d} | {s} | <derive it, document it on the line, or add this row with a reason>\n", .{ path, hit.line, hit.literal });
-            }
-        }
+        errdefer gpa.free(text);
+        try sources.append(gpa, .{ .path = path, .text = text });
     }
-    var stale: usize = 0;
-    for (allow.items) |row| {
-        if (!row.used) {
-            stale += 1;
-            try violations.writer.print("  {s}: stale row `{s}:{d} | {s}` matches no violation — delete it (the literal moved, was derived, or was documented)\n", .{ allowlist_path, row.path, row.line, row.literal });
-        }
-    }
+    var violations: std.Io.Writer.Allocating = .init(gpa);
+    defer violations.deinit();
+    const allow_text = try cwd.readFileAlloc(io, allowlist_path, gpa, .limited(16 << 20));
+    defer gpa.free(allow_text);
+    const tally = try judgeLiterals(gpa, sources.items, allow_text, &violations.writer);
     // The census must have found the known population (a broken scanner passes vacuously).
-    try std.testing.expect(scanned_files >= min_files);
+    try std.testing.expect(sources.items.len >= min_files);
     if (violations.written().len != 0) {
-        std.debug.print("literal rail: {d} runtime literal(s) in {d} product files, {d} unlisted, {d} allowlisted, {d} stale row(s):\n{s}", .{ found, scanned_files, unlisted, allow.items.len, stale, violations.written() });
+        std.debug.print("literal rail: {d} runtime literal(s) in {d} product files, {d} unlisted, {d} allowlisted, {d} stale row(s):\n{s}", .{ tally.found, sources.items.len, tally.unlisted, tally.rows, tally.stale, violations.written() });
         return error.LiteralRailViolation;
     }
 }
 
-test "the allowlist parser: a row, a comment, a blank, a malformed row and a reasonless row" {
+/// The row the rail asks for when `text` holds one unlisted literal, with
+/// `reason` in place of the request.
+fn suggestedRow(gpa: std.mem.Allocator, path: []const u8, text: [:0]const u8, reason: []const u8) ![]u8 {
+    var w: std.Io.Writer.Allocating = .init(gpa);
+    defer w.deinit();
+    const tally = try judgeLiterals(gpa, &.{.{ .path = path, .text = text }}, "", &w.writer);
+    try std.testing.expectEqual(@as(usize, 1), tally.unlisted);
+    const ask = std.mem.trim(u8, w.written(), " \n");
+    const cut = std.mem.lastIndexOf(u8, ask, " | <derive it") orelse return error.NoSuggestedRow;
+    return std.mem.concat(gpa, u8, &.{ ask[0..cut], " | ", reason, "\n" });
+}
+
+fn judgeOne(gpa: std.mem.Allocator, path: []const u8, text: [:0]const u8, allow_text: []const u8) !LiteralCensus {
+    var w: std.Io.Writer.Allocating = .init(gpa);
+    defer w.deinit();
+    return judgeLiterals(gpa, &.{.{ .path = path, .text = text }}, allow_text, &w.writer);
+}
+
+test "the literal rail keys a row by its literal's line, not its line number: a line inserted above keeps the row; a changed value, a changed line or a copied line does not" {
+    const gpa = std.testing.allocator;
+    const path = "src/x.zig";
+    const row = try suggestedRow(gpa, path, "const a = y;\nconst b = 4096;\n", "the page: kernel geometry");
+    defer gpa.free(row);
+    const clean: LiteralCensus = .{ .found = 1, .unlisted = 0, .rows = 1, .stale = 0 };
+    try std.testing.expectEqual(clean, try judgeOne(gpa, path, "const a = y;\nconst b = 4096;\n", row));
+    // A blank line and a statement inserted above shift the literal two lines down.
+    try std.testing.expectEqual(clean, try judgeOne(gpa, path, "const a = y;\n\nconst z = q;\nconst b = 4096;\n", row));
+    // Re-indenting the line keeps it: the identity is the trimmed line.
+    try std.testing.expectEqual(clean, try judgeOne(gpa, path, "const a = y;\n    const b = 4096;\n", row));
+    // A changed value is a new literal: unlisted, and its row stale.
+    try std.testing.expectEqual(LiteralCensus{ .found = 1, .unlisted = 1, .rows = 1, .stale = 1 }, try judgeOne(gpa, path, "const a = y;\nconst b = 4097;\n", row));
+    // The same value on a changed line is a new use: unlisted, and its row stale.
+    try std.testing.expectEqual(LiteralCensus{ .found = 1, .unlisted = 1, .rows = 1, .stale = 1 }, try judgeOne(gpa, path, "const a = y;\nconst c = 4096;\n", row));
+    // Another file's identical line is not this row's.
+    try std.testing.expectEqual(LiteralCensus{ .found = 1, .unlisted = 1, .rows = 1, .stale = 1 }, try judgeOne(gpa, "src/w.zig", "const a = y;\nconst b = 4096;\n", row));
+    // A row covers ONE literal: a copy of the line elsewhere in the file is unlisted.
+    try std.testing.expectEqual(LiteralCensus{ .found = 2, .unlisted = 1, .rows = 1, .stale = 0 }, try judgeOne(gpa, path, "const a = y;\nconst b = 4096;\nfn f() void {}\nconst b = 4096;\n", row));
+}
+
+test "the allowlist parser: a row, a comment, a blank, a malformed row, a reasonless row and a row without its line hash" {
     const gpa = std.testing.allocator;
     var rows: std.ArrayList(AllowRow) = .empty;
     defer {
@@ -1281,19 +1349,22 @@ test "the allowlist parser: a row, a comment, a blank, a malformed row and a rea
     try parseAllowlist(gpa,
         \\# a comment
         \\
-        \\src/a.zig:12 | 4096 | the page: kernel geometry
+        \\src/a.zig:12 | 4096 | 00c0ffee00c0ffee | the page: kernel geometry
         \\src/b.zig:7 | 0o644
         \\nonsense
-        \\nope | 5 | a reason
-        \\src/c.zig:3 | 9 |
+        \\nope | 5 | 0000000000000005 | a reason
+        \\src/c.zig:3 | 9 | 0000000000000009
+        \\src/d.zig:4 | 9 | the old shape: no line hash
     , &rows, &v.writer);
     try std.testing.expectEqual(@as(usize, 1), rows.items.len);
     try std.testing.expectEqualStrings("src/a.zig", rows.items[0].path);
     try std.testing.expectEqual(@as(usize, 12), rows.items[0].line);
     try std.testing.expectEqualStrings("4096", rows.items[0].literal);
+    try std.testing.expectEqual(@as(u64, 0x00c0ffee00c0ffee), rows.items[0].line_hash);
     try std.testing.expect(std.mem.indexOf(u8, v.written(), "malformed") != null);
     try std.testing.expect(std.mem.indexOf(u8, v.written(), "not path:line") != null);
     try std.testing.expect(std.mem.indexOf(u8, v.written(), "needs a reason") != null);
+    try std.testing.expect(std.mem.indexOf(u8, v.written(), "not a line hash") != null);
 }
 
 // ---------------------------------------------------------------------------

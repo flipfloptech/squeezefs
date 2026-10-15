@@ -40,6 +40,12 @@
 //! reason — a row that no longer matches a violation fails the rail, so the
 //! list can only shrink.
 //!
+//! A row names its literal by CONTENT, not position: the file, the literal,
+//! and `lineHash` of the literal's line (whitespace-trimmed). An edit above
+//! the literal leaves its row in force; a changed value or a changed line is
+//! a new literal (unlisted) and leaves its row stale. A row covers ONE
+//! literal, so a copy of an allowlisted line needs its own row.
+//!
 //! HARNESS files are test rigs that happen to live under `src/` because they
 //! drive the binary (the smoke, the bench smoke, the e2e rigs, the fidelity
 //! tier, the kits, the sync test law) and the model-checked MODELS (standalone
@@ -47,6 +53,7 @@
 //! model bounds, not product behaviour. The name law is explicit below.
 
 const std = @import("std");
+const checksum = @import("../core/checksum.zig");
 const Allocator = std.mem.Allocator;
 const Tokenizer = std.zig.Tokenizer;
 
@@ -54,7 +61,17 @@ pub const Violation = struct {
     line: usize,
     /// The literal's text as written.
     literal: []const u8,
+    /// `lineHash` of the literal's line: with the file and the literal, the
+    /// identity an allowlist row names.
+    line_hash: u64,
 };
+
+/// The identity of the line holding `off`: its bytes with the indentation
+/// and trailing whitespace trimmed, hashed — a line shift or a re-indent
+/// keeps it, any edit to the line's code changes it.
+pub fn lineHash(text: []const u8, off: usize) u64 {
+    return checksum.hash64(std.mem.trim(u8, text[lineStart(text, off)..lineEnd(text, off)], " \t\r"));
+}
 
 /// A file is a harness when its basename carries one of these stems.
 pub const harness_stems = [_][]const u8{ "smoke", "e2e", "fidelity", "_model", "testkit", "fuzzkit", "testing" };
@@ -260,7 +277,7 @@ pub fn scan(gpa: Allocator, text: [:0]const u8) !std.ArrayList(Violation) {
                 if (openerLineStart(text, my_line_start)) |opener| {
                     if (commentAbove(text, opener) or eolCommentAfter(text, lineStart(text, opener))) continue;
                 }
-                try out.append(gpa, .{ .line = std.mem.count(u8, text[0..t.loc.start], "\n") + 1, .literal = word });
+                try out.append(gpa, .{ .line = std.mem.count(u8, text[0..t.loc.start], "\n") + 1, .literal = word, .line_hash = lineHash(text, t.loc.start) });
             },
             else => {},
         }
@@ -376,6 +393,19 @@ test "the law: 0/1/2 pass; a bare literal fails; an EOL comment, a comment headi
     // and g3 (line 38) past the blank line; the fixture past the tests'
     // preamble is test scope.
     try testing.expectEqualSlices(usize, &.{ 3, 10, 11, 23, 23, 28, 38 }, lines);
+}
+
+test "a line's identity: trimmed of indentation and trailing whitespace, blind to its position, changed by any edit to its code" {
+    const text = "const a = y;\nconst b = 4096;\n    const b = 4096;  \r\nconst b = 4097;\nconst c = 4096;";
+    const at = std.mem.indexOf(u8, text, "4096").?;
+    const b = lineHash(text, at);
+    try testing.expectEqual(b, lineHash(text, std.mem.indexOfPos(u8, text, at + 1, "4096").?));
+    try testing.expect(b != lineHash(text, std.mem.indexOf(u8, text, "4097").?));
+    try testing.expect(b != lineHash(text, std.mem.lastIndexOf(u8, text, "4096").?));
+    var v = try scan(testing.allocator, "const a = y;\n\nconst b = 4096;\n");
+    defer v.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 1), v.items.len);
+    try testing.expectEqual(b, v.items[0].line_hash);
 }
 
 test "the harness name law" {

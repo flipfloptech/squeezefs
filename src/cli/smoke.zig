@@ -8203,6 +8203,121 @@ test "smoke: [venue-exclusive] A FROZEN DAEMON NEVER HANGS THE HOST'S `sync` (00
     try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
 }
 
+/// What the host-wide sync may take once the failing daemon ended its
+/// connection: the abort's wake and the superblocks the sync visits after
+/// ours — the frozen row's allowance (one kernel check period).
+const startup_fail_after_abort_s: u64 = frozen_after_abort_s;
+
+/// `/sys/fs/fuse/connections/<minor>/<file>` as a number, or null.
+fn fusectlNumber(io: Io, minor: u32, file: []const u8) ?u64 {
+    var pb: [96]u8 = undefined;
+    var buf: [32]u8 = undefined;
+    const path = std.fmt.bufPrint(&pb, "{s}/{d}/{s}", .{ transport.session.fusectl_connections, minor, file }) catch return null;
+    const text = Io.Dir.cwd().readFile(io, path, &buf) catch return null;
+    return std.fmt.parseInt(u64, std.mem.trim(u8, text, " \t\r\n"), 10) catch null;
+}
+
+/// Opens the failure-path hold's FIFO read-write — never blocks, and wakes
+/// the daemon's blocked open (`SQUEEZEFS_TEST_FUSE_STARTUP_FAIL_HOLD`).
+fn releaseHold(fifo: [:0]const u8) void {
+    const rc = linux.open(fifo.ptr, .{ .ACCMODE = .RDWR, .NONBLOCK = true, .CLOEXEC = true }, 0);
+    if (linux.errno(rc) == .SUCCESS) _ = linux.close(@intCast(rc));
+}
+
+// [venue-exclusive] (tests/shard_plan.zig): the row's host-wide `sync`
+// visits every FUSE mount on the host (the frozen-daemon row's reason), and
+// another row's stopped task voids it (`otherStoppedTask`).
+test "smoke: [venue-exclusive] A DAEMON WHOSE BRING-UP FAILS NEVER HANGS THE HOST'S `sync` (0003 §AN) — the bring-up fails after the INIT reply (the seam: the kernel's ring created, no queue ever registered) and holds at the head of its failure path → a host-wide `sync` from another process parks its FUSE_SYNCFS on the connection (in fuse_get_req, holding the superblock's s_umount, outside the request timeout) → released, the daemon ends its own connection BEFORE its unmount: the sync returns within one check period, the daemon exits 1 naming the fail-stop, nothing stays mounted" {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    try rig.formatSet(false);
+    var fb: [linux.PATH_MAX]u8 = undefined;
+    const fifo = try std.fmt.bufPrintSentinel(&fb, "{s}/startup-fail.fifo", .{rig.work}, 0);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.mknodat(linux.AT.FDCWD, fifo.ptr, linux.S.IFIFO | 0o600, 0)));
+    try rig.env.put("SQUEEZEFS_TEST_FUSE_FAIL_AFTER_INIT_REPLY", "1");
+    try rig.env.put("SQUEEZEFS_TEST_FUSE_STARTUP_FAIL_HOLD", fifo);
+    try rig.spawnMount(&.{});
+    var released = false;
+    defer if (!released) releaseHold(fifo);
+    _ = try rig.awaitLog("its failure path holds until a writer opens", 0, ready_wait_ns);
+    {
+        const text = try rig.readLog();
+        defer gpa.free(text);
+        if (std.mem.indexOf(u8, text, "SYNCFS negotiated") == null) {
+            releaseHold(fifo);
+            released = true;
+            _ = try rig.waitChild();
+            return testkit.skip(@src(), .no_kernel_feature, "FUSE_HAS_SYNCFS not negotiated: the host's sync never reaches a plain /dev/fuse server");
+        }
+    }
+    if (try otherStoppedTask(io, rig.child_pid)) |pid| {
+        releaseHold(fifo);
+        released = true;
+        _ = try rig.waitChild();
+        var detail: [160]u8 = undefined;
+        return testkit.skip(@src(), .external_interference, std.fmt.bufPrint(&detail, "task {d} is stopped on this host: a host-wide sync would wait on it, not on this row's failing daemon", .{pid}) catch "another task is stopped on this host");
+    }
+    const minor = blk: {
+        var mi_buf: [64 * 1024]u8 = undefined;
+        const table = try Io.Dir.cwd().readFile(io, "/proc/self/mountinfo", &mi_buf);
+        break :blk transport.session.mountinfoMinor(table, rig.mp) orelse return error.MountNotInTable;
+    };
+    // The host-wide sync from another process: once the host's writeback
+    // is done it parks in `fuse_sync_fs` on our connection, counted in the
+    // connection's `waiting`.
+    var sync_child = try std.process.spawn(io, .{ .argv = &.{"sync"}, .stdin = .ignore, .stdout = .ignore, .stderr = .inherit });
+    const sync_pid = sync_child.id.?;
+    const spawned_at = clock.monotonicNs();
+    while (!(stackHas(sync_pid, "fuse_sync_fs") and (fusectlNumber(io, minor, "waiting") orelse 0) >= 1)) {
+        if (!alive(sync_pid)) {
+            _ = try sync_child.wait(io);
+            std.debug.print("\nsmoke[startup-fail]: the sync returned without ever waiting on the failing daemon's connection\n", .{});
+            return error.SyncNeverReachedTheMount;
+        }
+        if (clock.monotonicNs() >= spawned_at + frozen_writeback_wait_ns) {
+            std.debug.print("\nsmoke[startup-fail]: the sync did not reach the connection within {d} s\n", .{frozen_writeback_wait_ns / std.time.ns_per_s});
+            return error.SyncNeverReachedTheMount;
+        }
+        sleepMs(20);
+    }
+    const parked_at = clock.monotonicNs();
+    releaseHold(fifo);
+    released = true;
+    const deadline = parked_at + startup_fail_after_abort_s * std.time.ns_per_s;
+    while (alive(sync_pid) and clock.monotonicNs() < deadline) sleepMs(20);
+    if (alive(sync_pid)) {
+        // The deadlock: the daemon's unmount waits for s_umount, the sync
+        // holds it waiting on a connection nobody will serve. Break it from
+        // outside (fusectl) so neither outlives the row, then fail.
+        var stack_buf: [4096]u8 = undefined;
+        var pb: [64]u8 = undefined;
+        const stack = Io.Dir.cwd().readFile(io, try std.fmt.bufPrint(&pb, "/proc/{d}/stack", .{rig.child_pid}), &stack_buf) catch "";
+        std.debug.print("\nsmoke[startup-fail]: the host-wide sync was still held {d} ms after the daemon's failure path ran (waiting {?d}); the daemon's main thread:\n{s}\n", .{ (clock.monotonicNs() - parked_at) / std.time.ns_per_ms, fusectlNumber(io, minor, "waiting"), stack });
+        var ab: [96]u8 = undefined;
+        const abort_path = try std.fmt.bufPrintSentinel(&ab, "{s}/{d}/abort", .{ transport.session.fusectl_connections, minor }, 0);
+        const afd = linux.open(abort_path.ptr, .{ .ACCMODE = .WRONLY, .CLOEXEC = true }, 0);
+        if (linux.errno(afd) == .SUCCESS) {
+            _ = linux.write(@intCast(afd), "1", 1);
+            _ = linux.close(@intCast(afd));
+        }
+        _ = try sync_child.wait(io);
+        _ = try rig.waitChild();
+        return error.HostSyncHeld;
+    }
+    _ = try sync_child.wait(io);
+    std.debug.print("\nsmoke[startup-fail]: the host-wide sync returned {d} ms after the failure path was released ({d} ms parked before it; bound {d} s)\n", .{ (clock.monotonicNs() - parked_at) / std.time.ns_per_ms, (parked_at - spawned_at) / std.time.ns_per_ms, startup_fail_after_abort_s });
+    try testing.expectEqual(std.process.Child.Term{ .exited = 1 }, try rig.waitChild());
+    const text = try rig.readLog();
+    defer gpa.free(text);
+    try testing.expect(std.mem.indexOf(u8, text, "the FUSE session could not arm at ") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "(InjectedStartupFailure)") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "ended its own FUSE connection") != null);
+    try testing.expectEqual(@as(usize, 0), try fuseMountsOf(gpa, io, rig.mp));
+}
+
 test "smoke: FSCK AND SCRUB — format (a cache path) → fill (dirs, 200 packed small files, hard links, three fsync'd 20 MiB files, a clone) → umount → `fsck --offline --scrub` 0 findings over every block → mount, 8-way storm, kill -9 → `fsck --offline` 0 findings → remount, clean umount → a planted stray reference is exactly [C3]+[C8] on its block (exit 1), `--repair` plans, `--repair --apply` releases it, clean → a planted orphan inode is exactly [C9], destroyed on apply, clean → `merge-reports` of two residue shards ≡ the whole run" {
     const io = testing.io;
     if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);

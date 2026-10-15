@@ -691,12 +691,10 @@ fn mountMain(ctx: *Ctx) u8 {
         .request_timeout_s = fuse_geometry.requestTimeoutS(lattice_t_owner_ms, lattice_park_max_ms),
         .no_open = no_open,
     }) catch |e| {
-        if (fuse_fd) |fd| {
-            _ = fusermount.unmount(io, ctx.mountpoint);
-            _ = linux.close(fd);
-        }
-        // The typed refusal with an operator remedy names it on the
-        // refusal line itself (the `--daemon` invoker sees only this).
+        // `Session.mount` closed fusermount3's fd and detached its mount
+        // (it owns both on every path). The typed refusal with an operator
+        // remedy names it on the refusal line itself (the `--daemon`
+        // invoker sees only this).
         if (e == error.KmbufRingEnomem) return ctx.failed("the FUSE session could not arm at {s}: {f}", .{ ctx.mountpoint, session_refusal });
         return ctx.failed("the FUSE session could not arm at {s} ({s}) — see the log", .{ ctx.mountpoint, @errorName(e) });
     };

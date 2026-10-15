@@ -217,6 +217,9 @@ pub const MountError = error{
     /// loud, never degrade; `Config.refusal` carries the region and levers.
     KmbufRingEnomem,
     SlabFailed,
+    /// `SQUEEZEFS_TEST_FUSE_FAIL_AFTER_INIT_REPLY`: the bring-up failed by
+    /// the seam after the INIT reply, before any queue registered.
+    InjectedStartupFailure,
 };
 
 /// The operator-facing detail of a typed refusal: `MountError` names the
@@ -647,8 +650,10 @@ const Sideband = struct {
         // A connection gone without DESTROY (a lazy umount, a sysfs abort,
         // a dead ring): the session ends here too.
         if (self.disconnected or self.ring.isDead()) {
-            // release pairs with `endedUnderLiveMount`'s acquire.
-            self.session.lost_while_mounted.store(self.session.mounted.swap(false, .acq_rel), .release);
+            // Our own fail-stop's end is no kernel verdict and leaves the
+            // mount ours to unmount (acquire pairs with `failStop`'s
+            // release); release pairs with `endedUnderLiveMount`'s acquire.
+            if (!self.session.self_aborted.load(.acquire)) self.session.lost_while_mounted.store(self.session.mounted.swap(false, .acq_rel), .release);
             self.session.shutdown();
         }
         self.finish();
@@ -862,6 +867,15 @@ pub const Session = struct {
     /// the mount attached — the sideband's verdict, judged against the
     /// mount table by `endedUnderLiveMount`.
     lost_while_mounted: std.atomic.Value(bool) = .init(false),
+    /// `failStop` ran (once per session).
+    fail_stopped: bool = false,
+    /// `failStop` set out to end the connection itself: the sideband's
+    /// disconnect is then ours, never the kernel's verdict, and the mount
+    /// stays ours to unmount (release in `failStop`, acquire at the
+    /// sideband's disconnect).
+    self_aborted: std.atomic.Value(bool) = .init(false),
+    /// fusectl's `abort` for our connection was written.
+    abort_written: bool = false,
     /// The zc bounce slab (one per session) and its budget component.
     slab: ?worker.Slab = null,
     slab_component: mem_budget.Component = undefined,
@@ -1097,7 +1111,20 @@ pub const Session = struct {
     }
 
     /// THE ORDERED BRING-UP. `fs.init` runs once the geometry is planned.
+    /// `cfg.fuse_fd` (fusermount3's, already mounted) is this call's on
+    /// every path: a failure closes it and detaches the mount.
     pub fn mount(gpa: std.mem.Allocator, exec_io: *SqzIo, fs: fsv.Filesystem, mountpoint: []const u8, env: *const std.process.Environ.Map, facts: derive.Facts, cfg: Config) MountError!*Session {
+        // Until the session holds it, a failure closes the device FIRST — the
+        // connection's only reference, so its close ends the connection — and
+        // only then detaches (decision 0003 §AN).
+        var adopted = false;
+        errdefer if (!adopted) if (cfg.fuse_fd) |fd| {
+            _ = linux.close(fd);
+            var pb: [linux.PATH_MAX]u8 = undefined;
+            if (cfg.unmounter) |u| if (std.fmt.bufPrintSentinel(&pb, "{s}", .{mountpoint}, 0)) |p| {
+                if (!u.call(u.ctx, p, true)) log.err("transport: fusermount3 -u -z {s} failed — a mount is left behind", .{mountpoint});
+            } else |_| log.err("transport: {s} does not fit a path buffer — a mount is left behind", .{mountpoint});
+        };
         const self = try gpa.create(Session);
         errdefer gpa.destroy(self);
         self.* = .{
@@ -1144,7 +1171,11 @@ pub const Session = struct {
             }
         }
         self.mounted.store(true, .release);
-        errdefer self.unmountDetached();
+        errdefer {
+            self.failStartup();
+            self.unmountDetached(.startup);
+        }
+        adopted = true;
         // The mount's identity: every later `umount2` by path first proves
         // the mount at the path is still THIS one (a kernel-ended mount
         // may have a successor at the same path by the time we tear down).
@@ -1224,8 +1255,15 @@ pub const Session = struct {
         if (self.mode == .zero_copy) self.retention = probes.driver.probeRetention(self.fuse_fd);
         probes.publish(self.verdicts, self.retention, self.time_limits, probes.driver.capSysAdmin(self.io, env), self.mode);
         fs.init(.{ .negotiated = self.init_reply.negotiated, .minor = self.init_reply.minor(), .plan = self.plan, .io = self.io, .buffer_mode = self.mode, .read_zc_serve = read_zc_serve, .retention = self.retention == .present });
-        errdefer self.destroyOnce();
+        errdefer {
+            self.failStartup();
+            self.destroyOnce();
+        }
         log.info("transport: INIT 7.{d} → 7.{d}: flags 0x{x} (over_io_uring={}, time_limits={}, request_timeout {d} s), max_write {d}, max_pages {d}, max_background {d}, queues {d} × depth {d}, payload {d} B, {d} drain group(s) (width {d}), buffer mode {t} (kmbuf {?d}, retention {t})", .{ init_in.minor, self.init_reply.minor(), self.init_reply.negotiated, self.init_reply.has(abi.FUSE_OVER_IO_URING), self.init_reply.timeLimits(), self.request_timeout_s, self.plan.max_write, self.plan.max_pages, self.plan.max_background, self.plan.nqueues, self.plan.depth, self.plan.payload_sz, self.drain_groups.count(), self.drain_groups.maxWidth(), self.mode, if (self.verdicts.kmbuf.opcodes()) |p| p.register else null, self.retention });
+        if (knobs.boolKnob("SQUEEZEFS_TEST_FUSE_FAIL_AFTER_INIT_REPLY", env)) {
+            log.err("transport: SQUEEZEFS_TEST_FUSE_FAIL_AFTER_INIT_REPLY — the bring-up fails after the INIT reply, before any queue registers", .{});
+            return error.InjectedStartupFailure;
+        }
 
         // 6. The zc bounce slab (ONE memfd for every queue; a non-sheddable
         //    budget component), then the workers: one per drain group, the
@@ -1317,6 +1355,7 @@ pub const Session = struct {
 
         var started: usize = 0;
         errdefer {
+            self.failStartup();
             self.shutdown();
             for (self.groups[0..started]) |g| g.join();
         }
@@ -1502,7 +1541,13 @@ pub const Session = struct {
         if (self.closed) return;
         self.closed = true;
         self.shutdown();
-        self.awaitDrains();
+        if (!self.awaitDrains()) {
+            // A group still owes a request (a FUSE_SYNCFS a host-wide sync
+            // holds `s_umount` around, perhaps): the unmount must not wait
+            // on it.
+            log.warn("transport: a drain group did not drain within {d} ms — ending the connection before the unmount (decision 0003 §AN)", .{DRAIN_WAIT_NS / std.time.ns_per_ms});
+            self.failStop();
+        }
         self.unmount();
         for (self.groups) |g| g.join();
         if (self.have_sideband) self.sideband.join();
@@ -1512,17 +1557,19 @@ pub const Session = struct {
 
     /// Wait until every started group's drain flushed its synthesized
     /// commits (each group's `drained` word), bounded: the drain itself is
-    /// bounded by `DRAIN_LEASE_BUDGET` plus one enter.
-    fn awaitDrains(self: *Session) void {
+    /// bounded by `DRAIN_LEASE_BUDGET` plus one enter. False when a group
+    /// had not drained by the deadline.
+    fn awaitDrains(self: *Session) bool {
         const deadline = clock.monotonicNs() + DRAIN_WAIT_NS;
         for (self.groups) |g| {
             if (g.started.load(.acquire) != 1) continue;
             while (g.drained.load(.acquire) == 0) {
                 const now = clock.monotonicNs();
-                if (now >= deadline) return;
+                if (now >= deadline) return false;
                 _ = futex.waitTimeout(&g.drained, 0, deadline - now);
             }
         }
+        return true;
     }
 
     /// A plain `umount2` first: the drain already answered every blocked
@@ -1567,31 +1614,87 @@ pub const Session = struct {
             } else {
                 log.warn("transport: umount2({s}) failed ({t}); detaching lazily", .{ self.mountpoint, e });
             }
-            self.unmountDetached();
+            self.unmountDetached(.teardown);
             return;
         }
     }
 
-    fn unmountDetached(self: *Session) void {
+    /// The head of every bring-up failure path once the mount exists: the
+    /// test hold, then the fail-stop — before any teardown step.
+    fn failStartup(self: *Session) void {
+        if (self.fail_stopped) return;
+        if (self.mounted.load(.acquire)) self.holdFailurePath();
+        self.failStop();
+    }
+
+    /// THE FAIL-STOP ORDER (decision 0003 §AN): a failure path ends its own
+    /// connection BEFORE any step that can wait — a worker join, the
+    /// filesystem's destroy, an `umount2`. A detach's last reference
+    /// deactivates the superblock in the caller's task with `s_umount` held
+    /// for write, while a host-wide `sync` holds it for read around its
+    /// FUSE_SYNCFS; until every queue is registered that request waits in
+    /// `fuse_get_req`, where neither the request timeout (it times queued
+    /// requests) nor any reply of ours reaches it — only the connection's
+    /// end wakes it. fusectl's `abort` when it is mounted (the mount's
+    /// owner may write it); otherwise `unmountDetached` carries the abort
+    /// into the detach (`MNT_FORCE`) or closes the device first. Once.
+    fn failStop(self: *Session) void {
+        if (self.fail_stopped) return;
+        self.fail_stopped = true;
         if (!self.mounted.load(.acquire)) return;
+        // release pairs with the sideband's acquire at the disconnect.
+        self.self_aborted.store(true, .release);
+        const minor = self.connectionMinor() orelse return;
+        self.abort_written = self.abortConnection(minor);
+    }
+
+    /// `SQUEEZEFS_TEST_FUSE_STARTUP_FAIL_HOLD`: the failure path waits at
+    /// its head until a writer opens the FIFO — the window a row needs to
+    /// park a host-wide sync on this connection before any teardown step.
+    fn holdFailurePath(self: *Session) void {
+        const path = knobs.parseStr(self.env.get("SQUEEZEFS_TEST_FUSE_STARTUP_FAIL_HOLD")) orelse return;
+        var pb: [linux.PATH_MAX]u8 = undefined;
+        const p = std.fmt.bufPrintSentinel(&pb, "{s}", .{path}, 0) catch return;
+        log.warn("transport: SQUEEZEFS_TEST_FUSE_STARTUP_FAIL_HOLD — the bring-up failed after mount(2); its failure path holds until a writer opens {s}", .{path});
+        const rc = linux.open(p.ptr, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+        if (linux.errno(rc) != .SUCCESS) {
+            log.warn("transport: the failure-path hold could not open {s} ({t}); not holding", .{ path, linux.errno(rc) });
+            return;
+        }
+        _ = linux.close(@intCast(rc));
+    }
+
+    /// The lazy detach, after the fail-stop: a detached superblock lives on
+    /// behind any open fd and the uring queues hold the connection's devs,
+    /// so only the connection's end frees a holder (a later FLUSH on a
+    /// detached, live connection would wait forever) — and the detach's
+    /// last reference deactivates the superblock in THIS task, under
+    /// `s_umount`, which a waiter parked on the live connection holds.
+    fn unmountDetached(self: *Session, phase: enum { startup, teardown }) void {
+        if (!self.mounted.load(.acquire)) return;
+        self.failStop();
         if (self.unmounter) |u| {
+            // No fusectl abort: on the bring-up's failure path the workers
+            // and the sideband are gone, so our device fd is the
+            // connection's last reference once their rings exit — its close
+            // ends it (`fusermount3` has no force).
+            if (phase == .startup and !self.abort_written) self.closeFd();
             if (!u.call(u.ctx, self.mountpoint, true)) log.err("transport: fusermount3 -u -z {s} failed — a mount is left behind", .{self.mountpoint});
             self.mounted.store(false, .release);
             return;
         }
-        const minor = self.connectionMinor();
-        const rc = linux.umount2(self.mountpoint.ptr, linux.MNT.DETACH);
+        // Without the fusectl abort, MNT_FORCE carries it into the detach
+        // (`umount_begin` aborts before the last reference drops); it needs
+        // CAP_SYS_ADMIN in the initial namespace — EPERM detaches plainly.
+        const flags: u32 = if (self.abort_written) linux.MNT.DETACH else linux.MNT.DETACH | linux.MNT.FORCE;
+        var rc = linux.umount2(self.mountpoint.ptr, flags);
+        if (linux.errno(rc) == .PERM and flags != linux.MNT.DETACH) rc = linux.umount2(self.mountpoint.ptr, linux.MNT.DETACH);
         if (linux.errno(rc) != .SUCCESS) log.err("transport: umount2({s}, MNT_DETACH) failed ({t}) — a mount is left behind", .{ self.mountpoint, linux.errno(rc) });
         self.mounted.store(false, .release);
         // The workers' residency has nothing to wait for on a detached
         // connection no holder will end (release pairs with the residency
-        // loop's acquire).
-        self.shared.detached.store(true, .release);
-        // A detached superblock lives on behind any open fd, and the uring
-        // queues hold the connection's devs, so closing our fd never aborts
-        // it: a later FLUSH on that fd would wait forever. fusectl's abort
-        // ends it (when fusectl is mounted; the supervisor's last rung).
-        if (minor) |m| self.abortConnection(m);
+        // loop's acquire); the bring-up's failure path has no workers.
+        if (phase == .teardown) self.shared.detached.store(true, .release);
     }
 
     /// `squeezefs umount --lazy` (decision 0003 §S shape b): detach the
@@ -1652,15 +1755,18 @@ pub const Session = struct {
     }
 
     /// `/sys/fs/fuse/connections/<minor>/abort` ← 1 (a control write through
-    /// the raw syscalls, like `enable_uring`; a missing fusectl is quiet).
-    fn abortConnection(self: *Session, minor: u32) void {
+    /// the raw syscalls, like `enable_uring`); false when fusectl is not
+    /// mounted or refuses (`unmountDetached` then carries the abort).
+    fn abortConnection(self: *Session, minor: u32) bool {
         var path: [96]u8 = undefined;
-        const p = std.fmt.bufPrintSentinel(&path, "{s}/{d}/abort", .{ fusectl_connections, minor }, 0) catch return;
+        const p = std.fmt.bufPrintSentinel(&path, "{s}/{d}/abort", .{ fusectl_connections, minor }, 0) catch return false;
         const fd_rc = linux.open(p.ptr, .{ .ACCMODE = .WRONLY, .CLOEXEC = true }, 0);
-        if (linux.errno(fd_rc) != .SUCCESS) return;
+        if (linux.errno(fd_rc) != .SUCCESS) return false;
         const fd: linux.fd_t = @intCast(fd_rc);
         defer _ = linux.close(fd);
-        if (linux.errno(linux.write(fd, "1", 1)) == .SUCCESS) log.warn("transport: aborted fuse connection {d} through fusectl after the lazy detach of {s}", .{ minor, self.mountpoint });
+        if (linux.errno(linux.write(fd, "1", 1)) != .SUCCESS) return false;
+        log.warn("transport: ended its own FUSE connection {d} (fusectl abort) before the unmount of {s} — nothing parked on it can hold the detach (decision 0003 §AN)", .{ minor, self.mountpoint });
+        return true;
     }
 
     fn closeFd(self: *Session) void {

@@ -1013,6 +1013,95 @@ test "a transient save folds back into the next epoch: the key the next epoch pa
     try testing.expectEqual(@as(u64, 1), f.alloc_a.usedBlocks());
 }
 
+test "a transient save folds into the next epoch with no allocation: an allocation failure at the fold drops no shadow and no guard — the next close publishes every B the folded epoch recorded and drops every guard" {
+    const io = testing.io;
+    const f = try wt.Fixture.init(testing.allocator, 16);
+    defer f.deinit();
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{});
+    var ep = Epochs.init(failing.allocator(), wt.BS, true);
+    defer ep.deinit();
+    const cs: Epochs.CloseSeams = .{ .map = f.map.seam(), .free = f.frees.seam(), .purge = .none };
+    try f.map.create(71, .striped, 0);
+    var bs: [12]Binding = undefined;
+    var idxs: [12]u64 = undefined;
+    for (&bs, &idxs, 0..) |*b, *idx, i| {
+        const mb = try f.alloc_a.allocateBlock();
+        b.* = Binding.wholeBlock(wt.VOL_A, mb.offset, mb.stamp);
+        idx.* = mb.idx;
+        _ = try ep.record(71, @intCast(i), null, b.*, proofFor(b.*, wt.BS), 16 * wt.BS, block_alloc.InflightAllocGuard.register(f.alloc_a, mb.idx), true);
+    }
+    // The save's merge is transient; a record opens the next epoch in its
+    // window, then every allocation fails.
+    const Racer = struct {
+        var ep_: *Epochs = undefined;
+        var f_: *wt.Fixture = undefined;
+        var fa: *std.testing.FailingAllocator = undefined;
+        var c: Binding = undefined;
+        fn hook(_: *anyopaque, map: *wt.RamMap) void {
+            map.fail_next_merge = error.Transient;
+            const mc = f_.alloc_a.allocateBlock() catch unreachable;
+            c = Binding.wholeBlock(wt.VOL_A, mc.offset, mc.stamp);
+            _ = ep_.record(71, 12, null, c, proofFor(c, wt.BS), 16 * wt.BS, block_alloc.InflightAllocGuard.register(f_.alloc_a, mc.idx), true) catch unreachable;
+            fa.fail_index = fa.alloc_index;
+            fa.resize_fail_index = fa.resize_index;
+        }
+    };
+    Racer.ep_ = &ep;
+    Racer.f_ = f;
+    Racer.fa = &failing;
+    var dummy: u8 = 0;
+    f.map.before_merge = .{ .ctx = &dummy, .call = &Racer.hook };
+    try testing.expectEqual(CloseOutcome.transient, ep.close(io, 71, cs));
+    failing.fail_index = std.math.maxInt(usize);
+    failing.resize_fail_index = std.math.maxInt(usize);
+    _ = ep.close(io, 71, cs);
+    for (bs, 0..) |b, i| {
+        const got = f.map.seam().lookup(71, @intCast(i));
+        try testing.expect(got != null and got.?.eql(b));
+    }
+    try testing.expect(f.map.seam().lookup(71, 12).?.eql(Racer.c));
+    for (idxs) |idx| try testing.expect(!f.alloc_a.inflightContains(idx));
+    try testing.expectEqual(@as(usize, 0), ep.openCount());
+}
+
+test "a drift key the save displaced is freed with no allocation: an allocation failure at the close leaves no key tracked by the allocator and referenced by nothing" {
+    const io = testing.io;
+    const f = try wt.Fixture.init(testing.allocator, 16);
+    defer f.deinit();
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{});
+    var ep = Epochs.init(failing.allocator(), wt.BS, true);
+    defer ep.deinit();
+    const cs: Epochs.CloseSeams = .{ .map = f.map.seam(), .free = f.frees.seam(), .purge = .none };
+    try f.map.create(81, .striped, 0);
+    const mb = try f.alloc_a.allocateBlock();
+    const b = Binding.wholeBlock(wt.VOL_A, mb.offset, mb.stamp);
+    _ = try ep.record(81, 0, null, b, proofFor(b, wt.BS), 2 * wt.BS, block_alloc.InflightAllocGuard.register(f.alloc_a, mb.idx), true);
+    // A publisher binds the block under the epoch (the visibility law
+    // forbids it; the drift tripwire names it): the save displaces X,
+    // which the epoch never parked.
+    const mx = try f.alloc_a.allocateBlock();
+    const x = Binding.wholeBlock(wt.VOL_A, mx.offset, mx.stamp);
+    directPublish(io, f, 81, 0, x);
+    const Fail = struct {
+        fn hook(ctx: *anyopaque, _: *wt.RamMap) void {
+            const fa: *std.testing.FailingAllocator = @ptrCast(@alignCast(ctx));
+            fa.fail_index = fa.alloc_index;
+            fa.resize_fail_index = fa.resize_index;
+        }
+    };
+    f.map.before_merge = .{ .ctx = &failing, .call = &Fail.hook };
+    stats.rewrite_shadow_displaced_drift.resetLogBudgetForTest();
+    log.testing.expectErrorLogs(1);
+    const out = ep.close(io, 81, cs);
+    failing.fail_index = std.math.maxInt(usize);
+    failing.resize_fail_index = std.math.maxInt(usize);
+    try log.testing.expectAllFired();
+    try testing.expectEqual(@as(u32, 1), out.swapped.freed);
+    try testing.expectEqual(@as(usize, 1), f.frees.freed.items.len);
+    try testing.expect(f.frees.freed.items[0].eql(x));
+    try testing.expect(f.map.seam().lookup(81, 0).?.eql(b));
+}
+
 test "the ONE save's size caps the shadow: the 65th distinct block of an epoch answers not_shadowed (the per-block durable publish) instead of being dropped from the save" {
     const io = testing.io;
     const f = try wt.Fixture.init(testing.allocator, 160);

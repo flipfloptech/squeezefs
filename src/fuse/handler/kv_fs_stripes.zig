@@ -618,3 +618,38 @@ test "kv_fs over a FLIPPED directory (RAM store): the explicit flip through setx
     try testing.expectEqual(@as(usize, 0), store.countKind(key.TREE_DENTRIES));
     try testing.expectEqual(@as(u32, 0), (try fs.getattr(&c, .{ .ino = d, .fh = null })).attr.nlink);
 }
+
+test "a verdict install is all or nothing: an allocation failure caches no part of a migrating map, so the next verdict re-reads it and queues its migration for the cadence" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var store = try kv_fs.MemStore.init(gpa);
+    defer store.deinit();
+    var nodata: kv_fs.NoData = .{};
+    var fs = try kv_fs.MemFs.mount(gpa, io, &store, &nodata, .{ .dlm_stripes = 64 });
+    defer fs.unmount();
+    var plane = try kv_fs.MemFs.XvPlane.init(gpa, io, &store, &fs.locks, 1, 0, 7, OneHome.resolver(), .{}, 16 << 10);
+    defer plane.deinit();
+    try testing.expectEqual(@as(u32, 0), try fs.bindXv(&plane));
+    const st = try fs.bindStripes(64, .{ .fixed = 2 });
+    defer fs.unbindStripes();
+    var tr = op_trace.OpTrace.begin(0, .other);
+    defer tr.finish();
+    var window: [4096]u8 = undefined;
+    var c: filesystem.Ctx = .{ .unique = 1, .uid = 0, .gid = 0, .pid = 1, .io = io, .trace = &tr, .wd_slot = null, .window = &window };
+    const d = (try fs.mkdir(&c, .{ .parent = inos.ROOT_INO, .name = "hot", .mode = 0o755, .umask = 0 })).nodeid;
+    try fs.setxattr(&c, .{ .ino = d, .name = stripe.COMMAND_XATTR, .value = "64", .flags = 0 });
+    // A fresh cache (the map's slot kept, the rest unallocated), then a
+    // verdict under an allocator that refuses everything.
+    st.maps.clearRetainingCapacity();
+    st.stripe_of.deinit(gpa);
+    st.stripe_of = .empty;
+    st.migrating.deinit(gpa);
+    st.migrating = .empty;
+    var failing = std.testing.FailingAllocator.init(gpa, .{ .fail_index = 0, .resize_fail_index = 0 });
+    st.gpa = failing.allocator();
+    try testing.expect((try st.verdictOf(d)) == .striped);
+    st.gpa = gpa;
+    try testing.expect((try st.verdictOf(d)) == .striped);
+    try testing.expectEqual(@as(usize, 1), st.migrating.items.len);
+    try testing.expectEqual(d, st.migrating.items[0]);
+}

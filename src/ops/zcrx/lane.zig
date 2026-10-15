@@ -793,6 +793,8 @@ test "the lane ring stands with SINGLE_ISSUER|DEFER_TASKRUN|CQE32 and the derive
     try testing.expectEqual(poisoned_before, stats.zcrx_lane_poisoned.load());
     try testing.expectEqual(q.ledger.slots(), q.ledger.freeCount());
     try testing.expectEqual(q.table.cids.slots().total, q.table.cids.slots().free);
+    // A bounced span return is deferred, never dropped: one slot per chunk.
+    try testing.expect(q.deferred.capacity >= q.records.len);
 }
 
 test "the ifq registration refusal against ifindex 0 reaches `ready` naming the step (IfqRefused) and the queue unwinds without poisoning" {

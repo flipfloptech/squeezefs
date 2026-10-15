@@ -595,6 +595,24 @@ test "the screen: own identity, a live member, a key the census holds or that co
     try testing.expectEqual(unval0 + 2, stats.dead_member_keys_unvalidated.load());
 }
 
+test "an evicted member's key stays held through an allocation failure: the departure keeps it and the screen still rejects a death naming it (the screen never fails open)" {
+    const gpa = testing.allocator;
+    var rs = RamLedgerStore.init(gpa);
+    defer rs.deinit();
+    var failing = std.testing.FailingAllocator.init(gpa, .{});
+    var l = Ledger.init(failing.allocator(), rs.store(), 2, wireOf(wid(0)), 45_000);
+    defer l.deinit();
+    const clocks = try shard.LeaseClocks.derive(45_000, 0, 100);
+    var o = try shard.Owner.arm(failing.allocator(), clocks, 0, 1, 0, &.{}, 0);
+    defer o.deinit();
+    _ = o.join(.{ .id = shard.writerMemberId(wireOf(wid(3))), .role = .writer, .endpoint = .none, .pid = 1, .boot = @splat(0), .prior_epoch = null, .pr_key = 0x33, .mount = "/m", .row = null }, 0).granted;
+    failing.fail_index = failing.alloc_index;
+    failing.resize_fail_index = failing.resize_index;
+    try testing.expectEqual(@as(u32, 1), o.expireDue(50_000));
+    const req: verbs.RecordDeathReq = .{ .volume = 0, .reserved = 0, .reserved2 = 0, .member = wireOf(wid(4)), .epoch = 1, .pr_key = 0x33 };
+    try testing.expect(!l.screenDeath(req, &o, 50_000).isOk());
+}
+
 test "the poll: release-recovered first, then every death on every volume (acted per region; propagation = max lag), the retirement at 2 × T_owner only when no page stands and no lease names it, the roll-forward iff anything was recovered; the vol-0 rule releases the role after T_owner unreachable, once" {
     const gpa = testing.allocator;
     var rs = RamLedgerStore.init(gpa);

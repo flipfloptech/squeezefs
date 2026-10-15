@@ -91,6 +91,7 @@ const exec = @import("../exec/exec.zig");
 const key = @import("key.zig");
 const record = @import("record.zig");
 const node = @import("node.zig");
+const builder = @import("builder.zig");
 const node_cache = @import("node_cache.zig");
 const mem_budget = @import("../mem/budget.zig");
 const node_seq = @import("node_seq.zig");
@@ -219,6 +220,9 @@ pub const TestSeams = struct {
     /// 0's page refresh, tree-0 records) — its dirty bitmap pages (C6) are
     /// not.
     after_guest_roots: ?node_cache.Hook = null,
+    /// C6: one dirty bitmap page landed — the cycle's later pages (in page
+    /// order) and its record are not on the device.
+    after_bitmap_page: ?node_cache.Hook = null,
 };
 
 pub var test_seams: TestSeams = .{};
@@ -694,7 +698,7 @@ pub const KvBackend = struct {
             .flush = be.flusher.sink(),
             .barrier = be.dev.barrierSink(),
             .ledger = .{ .ctx = be, .writeSlot = ledgerSlotHook },
-            .pages = be.dev.pageSink(),
+            .pages = .{ .ctx = be, .writePage = bitmapPageHook },
             .record = .{ .ctx = be, .treeRoots = treeRootsFn, .next_ino = &be.ino, .node_seq = &be.seq, .membershipStamp = stampForLedger, .publishGuestRoots = publishGuestRootsHook, .appenderPages = if (sb.symmetricPlaneStamped()) appenderPagesHook else null, .dataPages = if (sb.symmetricPlaneStamped()) dataPagesHook else null },
             .smo = be.ckpt_seam.seam(),
             .maintenance = .{ .ctx = be, .pop = popMaintenance, .pending = maintenancePending, .requeue = requeueMaintenance },
@@ -1723,6 +1727,15 @@ pub const KvBackend = struct {
         if (test_seams.after_ledger) |h| h.call(h.ctx);
     }
 
+    /// A C6 bitmap page through the device, with the kill matrix's cut
+    /// point after it.
+    fn bitmapPageHook(ctx: *anyopaque, offset: u64, image: *const [alloc_ext.page_len]u8) checkpoint_cycle.IoError!void {
+        const be: *KvBackend = @ptrCast(@alignCast(ctx));
+        const sink = be.dev.pageSink();
+        try sink.writePage(sink.ctx, offset, image);
+        if (test_seams.after_bitmap_page) |h| h.call(h.ctx);
+    }
+
     /// A structural entry (an SMO's, the rollback's compensation) through
     /// the lane: the same aligned-run path as a user window, answered when
     /// it LANDED. The caller may be the checkpoint task's thread (a futex
@@ -2731,6 +2744,10 @@ const TestVol = struct {
     }
 
     fn createWithRing(gpa: Allocator, name: []const u8, flush_ms: ?[]const u8, journal_len: u64) !*TestVol {
+        return createSized(gpa, name, flush_ms, journal_len, test_volume_len);
+    }
+
+    fn createSized(gpa: Allocator, name: []const u8, flush_ms: ?[]const u8, journal_len: u64, volume_len: u64) !*TestVol {
         const self = try gpa.create(TestVol);
         errdefer gpa.destroy(self);
         self.* = .{ .gpa = gpa, .env = std.process.Environ.Map.init(gpa), .sqz = undefined };
@@ -2741,7 +2758,7 @@ const TestVol = struct {
         var zbuf: [linux.PATH_MAX]u8 = undefined;
         _ = linux.mkdirat(linux.AT.FDCWD, try align_probe.pathZ(&zbuf, test_dir), 0o755);
         self.path_len = (try std.fmt.bufPrint(&self.path_buf, "{s}/sqz-be-{d}-{s}.img", .{ test_dir, linux.getpid(), name })).len;
-        try truncateFile(self.path(), test_volume_len);
+        try truncateFile(self.path(), volume_len);
         try formatVolume(gpa, self.path(), .{
             .env = &self.env,
             .node_size = 65536,
@@ -3157,6 +3174,10 @@ test "rollback on the device: a synthetically failed window answers JournalWrite
     try testing.expectError(error.VolumeFailed, commitCreate(be, "post"));
 }
 
+/// lseek(2) whences the std table lacks (`include/uapi/linux/fs.h`).
+const seek_data: u32 = 3;
+const seek_hole: u32 = 4;
+
 /// Snapshot the device image to `dst` (a power cut: the device's landed
 /// bytes, nothing in any cache).
 /// The cut: a copy of the live image holding every write that COMPLETED
@@ -3180,21 +3201,40 @@ fn snapshotImage(src: []const u8, dst: []const u8) !void {
     if (linux.errno(dst_rc) != .SUCCESS) return error.CannotCreateSnapshot;
     const dst_fd: linux.fd_t = @intCast(dst_rc);
     defer _ = linux.close(dst_fd);
+    // Sparse to sparse: only the source's data runs are copied (a
+    // multi-GiB test volume is mostly holes).
+    const size_rc = linux.lseek(src_fd, 0, linux.SEEK.END);
+    if (linux.errno(size_rc) != .SUCCESS) return error.SnapshotReadFailed;
+    const size: u64 = size_rc;
+    if (linux.errno(linux.ftruncate(dst_fd, @intCast(size))) != .SUCCESS) return error.SnapshotWriteFailed;
     const chunk = 1 << 20;
     const buf = try std.heap.page_allocator.alignedAlloc(u8, .fromByteUnits(4096), chunk);
     defer std.heap.page_allocator.free(buf);
     var off: u64 = 0;
-    while (true) {
-        const got = linux.pread(src_fd, buf.ptr, chunk, @intCast(off));
-        if (linux.errno(got) != .SUCCESS) return error.SnapshotReadFailed;
-        if (got == 0) break;
-        var written: usize = 0;
-        while (written < got) {
-            const w = linux.pwrite(dst_fd, buf.ptr + written, got - written, @intCast(off + written));
-            if (linux.errno(w) != .SUCCESS) return error.SnapshotWriteFailed;
-            written += w;
+    while (off < size) {
+        const data_rc = linux.lseek(src_fd, @intCast(off), seek_data);
+        switch (linux.errno(data_rc)) {
+            .SUCCESS => {},
+            .NXIO => break, // no data at or past `off`
+            else => return error.SnapshotReadFailed,
         }
-        off += got;
+        const hole_rc = linux.lseek(src_fd, @intCast(data_rc), seek_hole);
+        if (linux.errno(hole_rc) != .SUCCESS) return error.SnapshotReadFailed;
+        off = data_rc;
+        while (off < hole_rc) {
+            const want: usize = @intCast(@min(chunk, hole_rc - off));
+            const got = linux.pread(src_fd, buf.ptr, want, @intCast(off));
+            if (linux.errno(got) != .SUCCESS) return error.SnapshotReadFailed;
+            if (got == 0) break;
+            var written: usize = 0;
+            while (written < got) {
+                const w = linux.pwrite(dst_fd, buf.ptr + written, got - written, @intCast(off + written));
+                if (linux.errno(w) != .SUCCESS) return error.SnapshotWriteFailed;
+                written += w;
+            }
+            off += got;
+        }
+        off = @max(off, hole_rc);
     }
     if (linux.errno(linux.fdatasync(dst_fd)) != .SUCCESS) return error.SnapshotSyncFailed;
 }
@@ -3415,6 +3455,105 @@ test "kill matrix: mid-C4b — two guest trees minted on first touch (each root 
     for (inos_acked) |ino| try testing.expect(try present(copy, ino));
     for (copy.trees.load()) |t| try testing.expect(copy.alloc.isAllocated(copy.cache.addrExtent(t.rootPtr().addr)));
     std.debug.print("\nkill matrix: cut mid-C4b → 2 guest roots named and allocated after the replay; the third slot minted beside them; 3 of 3 guest records present\n", .{});
+}
+
+/// Past one bitmap page at 64 KiB nodes: `alloc_ext.page_bits` (32,576)
+/// extents a page, so 2.5 GiB (sparse) spans two.
+const two_page_volume_len: u64 = 5 << 29;
+
+/// `copySlotTree`'s build (`routing/migrate.zig`) with one event between
+/// the last leaf's image and the root's claim: the held extents of bitmap
+/// page 0 are returned — a release landing mid-build (a checkpoint's
+/// coverage drain beside a live copy) lowers the lowest-first cursor, so
+/// the root, claimed last, takes page 0 while the leaves sit on page 1.
+const MidBuildRelease = struct {
+    be: *KvBackend,
+    held: []const u64,
+    released: bool = false,
+
+    fn write(ctx: *anyopaque, addr: u64, image: []const u8) anyerror!void {
+        const self: *MidBuildRelease = @ptrCast(@alignCast(ctx));
+        try self.be.cache.loader.writeImage(self.be.cache.loader.ctx, addr, image);
+        const h = try node.decodeHeaderPage(image[0..node.NODE_PAGE], null);
+        if (self.released or h.level != 0 or !std.mem.eql(u8, h.max_key, &key.KEY_SPACE_MAX)) return;
+        for (self.held) |e| self.be.alloc.releaseUnpublished(e);
+        self.released = true;
+    }
+
+    fn mint(ctx: *anyopaque) anyerror!u64 {
+        const self: *MidBuildRelease = @ptrCast(@alignCast(ctx));
+        return self.be.seq.mint();
+    }
+};
+
+test "kill matrix: mid-C6 — a slot tree built like copySlotTree (every extent claimed in RAM, the root LAST) while a release lands mid-build: its leaves on bitmap page 1, its root on page 0; the cut after C6 landed page 0 (the root's bit) and before page 1: the reopened cut holds EVERY extent the tree reaches allocated — no claim can hand out a live leaf — and every built record is present" {
+    const gpa = testing.allocator;
+    const v = try TestVol.createSized(gpa, "cut-c6", "600000", 1 << 20, two_page_volume_len);
+    defer v.destroy();
+    var dst_buf: [160]u8 = undefined;
+    const dst = try std.fmt.bufPrint(&dst_buf, "{s}.cut", .{v.path()});
+    defer unlinkPath(dst);
+    var acked_n: std.atomic.Value(usize) = .init(0);
+    var ctx: CutCtx = .{ .src = v.path(), .dst = dst, .acked = &acked_n };
+    defer test_seams = .{};
+    var slot: u16 = 1;
+    const records: u64 = 4000;
+    {
+        const be = try v.open();
+        defer be.close();
+        if (be.stamp.native_slot) |ns| if (ns == slot) {
+            slot += 1;
+        };
+        try be.checkpointNow();
+        // Every free extent of page 0 held: the leaves go to page 1.
+        var held: std.ArrayList(u64) = .empty;
+        defer held.deinit(gpa);
+        while (true) {
+            const e = try be.alloc.claimInternal();
+            if (e >= alloc_ext.page_bits) {
+                be.alloc.releaseUnpublished(e);
+                break;
+            }
+            try held.append(gpa, e);
+        }
+        var rel: MidBuildRelease = .{ .be = be, .held = held.items };
+        var sw = builder.StreamWriter.init(gpa, be.layout, be.sb.heap.start, &be.alloc, key.KIND_INTERIOR, .{ .ctx = &rel, .write = MidBuildRelease.write }, .{ .ctx = &rel, .mint = MidBuildRelease.mint });
+        defer sw.deinit();
+        for (2..2 + records) |local| try sw.append(&key.inodeKey(key.guestLocalIno(slot, local)), &(record.InodeValue{ .mode = 0o100644, .nlink = 1, .size = local }).encode());
+        const root = try sw.finish();
+        try testing.expect(rel.released);
+        try be.dev.barrier();
+        const t = try KvTree.open(gpa, be.cache, .{ .slot = key.guestForestSlot(slot) }, .{ .addr = root.addr, .seq = root.seq }, &be.seq);
+        try be.adoptTree(t);
+        var reach: std.ArrayList(u64) = .empty;
+        defer reach.deinit(gpa);
+        try be.collectTreeExtents(t, &reach);
+        // The root on page 0, at least one leaf on page 1.
+        try testing.expectEqual(@as(u64, 0), reach.items[0] / alloc_ext.page_bits);
+        var on_page_1: usize = 0;
+        for (reach.items) |e| on_page_1 += @intFromBool(e / alloc_ext.page_bits == 1);
+        try testing.expect(on_page_1 >= 1);
+        test_seams.after_bitmap_page = ctx.hook();
+        try be.checkpointNow();
+        try testing.expectEqual(@as(u32, 1), ctx.fired.load(.acquire));
+    }
+    const copy = try KvBackend.open(gpa, v.io(), dst, .{ .env = &v.env, .cache_budget_bytes = 64 << 20, .cpus = 4, .index = 1 });
+    defer copy.close();
+    var reach: std.ArrayList(u64) = .empty;
+    defer reach.deinit(gpa);
+    try copy.collectTreeExtents(copy.slotTree(slot) orelse return error.TestExpectedNamedTree, &reach);
+    var free_reachable: usize = 0;
+    for (reach.items) |e| free_reachable += @intFromBool(!copy.alloc.isAllocated(e));
+    // The mount's claims run lowest-first: the first one past page 0 is
+    // what a mint or an SMO would write next there.
+    const past_page_0 = while (true) {
+        const e = try copy.alloc.claimInternal();
+        if (e >= alloc_ext.page_bits) break e;
+    };
+    std.debug.print("\nkill matrix: cut mid-C6 → the built tree reaches {d} extent(s), {d} of them free in the recovered allocator; the first claim past page 0 is extent {d}\n", .{ reach.items.len, free_reachable, past_page_0 });
+    try testing.expect(std.mem.indexOfScalar(u64, reach.items, past_page_0) == null);
+    try testing.expectEqual(@as(usize, 0), free_reachable);
+    for (2..2 + records) |local| try testing.expect(try present(copy, key.guestLocalIno(slot, local)));
 }
 
 test "4-thread commit storm with concurrent checkpoints, then reopen: every ack present, identities close at quiesce" {

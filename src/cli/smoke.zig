@@ -4033,7 +4033,11 @@ test "smoke: THE HANDOVER DRAINS PARKED STAMPS (rung 10 item 4) — A (the manag
     var pair: [2][]const u8 = undefined;
     {
         var script_buf: [256]u8 = undefined;
-        const out = try rig.onMount(try std.fmt.bufPrint(&script_buf, "mkdir d && i=0; while [ $i -lt {d} ]; do dd if=/dev/zero of=d/f$i bs=32k count=1 status=none; i=$((i+1)); done; sync -d d; stat -c '%n %i' d/f*", .{handover_row_files}));
+        // `sync -f`: the syncfs lands the files' custody and journals their
+        // size claims (the ordered law, decision 0003 §AL.5) — an fsync of
+        // `d` journals only what already landed, and the flush cadence is
+        // held a minute away, so their claims would stay parked at A.
+        const out = try rig.onMount(try std.fmt.bufPrint(&script_buf, "mkdir d && i=0; while [ $i -lt {d} ]; do dd if=/dev/zero of=d/f$i bs=32k count=1 status=none; i=$((i+1)); done; sync -f d; stat -c '%n %i' d/f*", .{handover_row_files}));
         defer gpa.free(out);
         var inos_of: [handover_row_files]u64 = undefined;
         var names_of: [handover_row_files][]const u8 = undefined;

@@ -20,6 +20,7 @@ const linux = std.os.linux;
 const Io = std.Io;
 
 const clock = @import("../../core/clock.zig");
+const prefetch = @import("../../data/prefetch.zig");
 const log = @import("../../core/log.zig");
 const wire = @import("../wire.zig");
 const client = @import("../client.zig");
@@ -409,9 +410,17 @@ test "smoke: THE INTERCEPTION HOST — format → mount -o interception → the 
     try testing.expectEqual(@as(u64, 0), try rig.stat("ipc_placed_adoption_refusals"));
     try testing.expectEqual(@as(u64, 0), try rig.stat("ipc_placed_sever_fallbacks"));
     try testing.expectEqual(BLOCK, linux.pread(kfd, back.ptr, back.len, @intCast(BLOCK)));
+    // The kernel-path read-backs ran contiguous: a CLASSIFIED stream, which
+    // vetoes ranged windows file-wide while fresh (`prefetch.STALE_NS`).
+    const stream_stale_at = clock.monotonicNs() + prefetch.STALE_NS;
     try expectPattern(back, BLOCK);
     // Every parked block uploads (the write-through) before the W1 row.
     try rig.awaitStat("parked_buffers", 0);
+    // Step 3 judges the COLD ladder, so the stream must be stale first: on a
+    // fast host (kamrui, x86_64 NVMe) the upload settles inside the window and
+    // the unaligned read below was a 4 MiB whole-block fill, its block hot
+    // before the "second touch".
+    while (clock.monotonicNs() < stream_stale_at) sleepMs(50);
 
     // 3. Reads on the sync fast path. A cold ALIGNED ring read is the
     //    handler's dest lease: a ranged DMA straight into the arena (zero

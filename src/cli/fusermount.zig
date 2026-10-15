@@ -92,7 +92,11 @@ pub fn mount(gpa: std.mem.Allocator, io: Io, env: *const std.process.Environ.Map
         return error.HelperFailed;
     };
     if (!term.success()) {
-        log.err("fusermount3 {f} mounting {s} with -o {s}", .{ term, mountpoint, opts });
+        // The helper's own line for a confinement denial is a bare "mount failed:
+        // Permission denied": Ubuntu's AppArmor `fusermount3` profile admits
+        // mountpoints only under $HOME, /mnt, /media, /tmp and /run/user, and only
+        // the kernel's audit log names the profile.
+        log.err("fusermount3 {f} mounting {s} with -o {s} (a \"Permission denied\" from the helper can be the distro's confinement: AppArmor's fusermount3 profile admits only $HOME, /mnt, /media, /tmp and /run/user mountpoints)", .{ term, mountpoint, opts });
         if (received) |fd| _ = linux.close(fd);
         return error.HelperFailed;
     }
@@ -184,9 +188,11 @@ test "fusermount3: the _FUSE_COMMFD handshake yields a /dev/fuse fd whose first 
     var env = std.process.Environ.Map.init(testing.allocator);
     defer env.deinit();
     try env.put("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
-    _ = linux.mkdir("/build/tmp", 0o755);
+    // Under /tmp, not the rigs' /build/tmp: the helper is judged under every
+    // distro's stock confinement, and Ubuntu's AppArmor fusermount3 profile
+    // refuses a /build mountpoint (`mount` above).
     var pb: [64:0]u8 = undefined;
-    const mp = try std.fmt.bufPrintSentinel(&pb, "/build/tmp/mnt-fm-{d}", .{linux.getpid()}, 0);
+    const mp = try std.fmt.bufPrintSentinel(&pb, "/tmp/sqz-mnt-fm-{d}", .{linux.getpid()}, 0);
     _ = linux.mkdir(mp.ptr, 0o755);
     defer _ = linux.rmdir(mp.ptr);
     defer _ = linux.umount2(mp.ptr, linux.MNT.DETACH);

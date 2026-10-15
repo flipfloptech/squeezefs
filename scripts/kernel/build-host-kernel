@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+# build-host-kernel — build the sqz kernel (linux 7.2.6 + the series) natively on
+# a Debian/Ubuntu x86_64 HOST reached over ssh, as .deb packages, and install it.
+#
+#   scripts/kernel/build-host-kernel <ssh-host>            # build + install (no reboot)
+#   scripts/kernel/build-host-kernel <ssh-host> --status   # tail the remote build log
+#
+# The series: patches 0001–0026 from the reference recipe (branch
+# feat/kernel-sqz-container-arm64, commit 44752ce5, docker/kernel-sqz/patches-7.2 —
+# the 7.2 track the Rust reference already required) + this repo's 0027–0028
+# (scripts/kernel/patches-7.2). The config: the host's OWN running config (its
+# drivers: root on LVM, its NIC, its NVMe), trimmed by `localmodconfig` to the
+# modules loaded at build time — after loading every module the sqz work needs,
+# so they survive the trim — then the reference's sqz fragment and this repo's
+# kTLS lines, asserted as a checklist (fail loud), as the reference recipe does.
+# A full distro config builds ~6,000 modules (hours on a laptop CPU); the trim
+# keeps the hardware the box has. Output: linux-image/-headers .debs; dpkg
+# installs them and the distro's hooks build the initramfs and update GRUB (the
+# newest version sorts first, so the sqz kernel becomes the default entry; the
+# distro kernel stays in the menu as the fallback).
+set -euo pipefail
+
+HOST=${1:?usage: build-host-kernel <ssh-host> [--status]}
+REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+REF=${SQZ_REFERENCE:-$HOME/Source/squeezefs}
+REF_COMMIT=44752ce5
+KVER=7.2.6
+SSH=(ssh -o BatchMode=yes -o LogLevel=ERROR)
+RDIR=/build/kernel
+
+if [ "${2:-}" = --status ]; then
+  exec "${SSH[@]}" "$HOST" "tail -5 $RDIR/build.log; ls $RDIR/*.deb 2>/dev/null"
+fi
+
+# The series and the fragment, assembled on this side.
+stage=$(mktemp -d /tmp/sqz-hostkernel.XXXXXX)
+trap 'rm -rf "$stage"' EXIT
+git -C "$REF" archive "$REF_COMMIT" docker/kernel-sqz/patches-7.2 docker/kernel-sqz/config-fragment | tar -x -C "$stage"
+mkdir -p "$stage/patches"
+cp "$stage"/docker/kernel-sqz/patches-7.2/*.patch "$stage/patches/"
+cp "$REPO"/scripts/kernel/patches-7.2/*.patch "$stage/patches/"
+{
+  cat "$stage/docker/kernel-sqz/config-fragment"
+  echo "# --- this repo: the cluster wire's MutualTls rides kernel TLS (0003 §P)"
+  echo "CONFIG_TLS=y"
+  echo "CONFIG_TLS_DEVICE=y"
+} > "$stage/fragment"
+echo "series: $(ls "$stage/patches" | wc -l) patches; fragment: $(grep -c '^CONFIG_' "$stage/fragment") entries"
+
+"${SSH[@]}" "$HOST" "sudo mkdir -p $RDIR && sudo chown \$(id -un) $RDIR"
+rsync -a --delete -e "${SSH[*]}" "$stage/patches/" "$HOST:$RDIR/patches/"
+rsync -a -e "${SSH[*]}" "$stage/fragment" "$HOST:$RDIR/fragment"
+
+# The remote half (runs under nohup; its log is $RDIR/build.log).
+"${SSH[@]}" "$HOST" "cat > $RDIR/build.sh" <<'REMOTE'
+#!/usr/bin/env bash
+set -euo pipefail
+cd /build/kernel
+KVER=7.2.6
+TARBALL=linux-$KVER.tar.xz
+[ -f "$TARBALL" ] || curl -fsSL -o "$TARBALL" "https://cdn.kernel.org/pub/linux/kernel/v7.x/$TARBALL"
+rm -rf "linux-$KVER" && tar xf "$TARBALL" && cd "linux-$KVER"
+echo "== series"
+for p in ../patches/*.patch; do echo "  $(basename "$p")"; patch -p1 --fuzz=0 --silent < "$p"; done
+echo "== config: the running config, localmodconfig after loading the sqz modules, the fragment"
+for m in fuse nvmet nvmet-tcp nvme-loop nvme-tcp nvme-fabrics tls null_blk zram brd loop; do sudo modprobe "$m" 2>/dev/null || true; done
+cp "/boot/config-$(uname -r)" .config
+# The distro's trusted-key paths name files of its own source tree.
+scripts/config --set-str SYSTEM_TRUSTED_KEYS "" --set-str SYSTEM_REVOCATION_KEYS "" --set-str MODULE_SIG_KEY "certs/signing_key.pem"
+make olddefconfig >/dev/null
+lsmod > ../lsmod.txt
+yes '' | make LSMOD=../lsmod.txt localmodconfig >/dev/null 2>&1
+while IFS= read -r line; do
+  case "$line" in
+    ''|'#'*) continue ;;
+    CONFIG_*=n) scripts/config -d "${line%%=*}" ;;
+    CONFIG_*='"'*'"') opt=${line%%=*}; val=${line#*=}; scripts/config --set-str "$opt" "${val//\"/}" ;;
+    CONFIG_*=m) scripts/config -m "${line%%=*}" ;;
+    CONFIG_*=y) scripts/config -e "${line%%=*}" ;;
+  esac
+done < ../fragment
+make olddefconfig >/dev/null
+fail=0
+while IFS= read -r line; do
+  case "$line" in
+    ''|'#'*) continue ;;
+    CONFIG_LOCALVERSION_AUTO=n) want='# CONFIG_LOCALVERSION_AUTO is not set' ;;
+    *) want="$line" ;;
+  esac
+  grep -qxF "$want" .config || { echo "MISSING from final .config: $want"; fail=1; }
+done < ../fragment
+[ "$fail" = 0 ] || { echo "config checklist FAILED"; exit 1; }
+echo "checklist OK; modules: $(grep -c '=m$' .config)"
+echo "== build ($(nproc) jobs) $(date)"
+make -j"$(nproc)" bindeb-pkg LOCALVERSION= >../make.log 2>&1 || { tail -30 ../make.log; exit 1; }
+echo "== built $(date)"; ls -1 ../linux-image-*.deb ../linux-headers-*.deb
+echo "== install"
+sudo dpkg -i ../linux-image-${KVER}-sqz_*.deb ../linux-headers-${KVER}-sqz_*.deb
+echo "== GRUB default entry:"; sudo grep -m1 -E "^\s*menuentry " /boot/grub/grub.cfg | cut -c1-120
+echo "BUILD-AND-INSTALL-OK"
+REMOTE
+"${SSH[@]}" "$HOST" "chmod +x $RDIR/build.sh && cd $RDIR && nohup ./build.sh > build.log 2>&1 < /dev/null & echo started"
+echo "remote build started on $HOST — follow with: scripts/kernel/build-host-kernel $HOST --status"

@@ -2543,6 +2543,33 @@ test "endpoints: a dead appender's row is retired — its page written away from
     try testing.expectEqual(retired0 + 2, stats.manager_endpoints_retired.load());
 }
 
+test "an identity insert the cache refuses for memory still answers from the directory walk: the miss counts manager_identity_cache_drops and names the live appender; the next miss walks again and caches it" {
+    const gpa = testing.allocator;
+    const tv = try TestVolume.init(gpa, 1 << 30, 65_536, 4000);
+    defer tv.deinit();
+    try tv.liveManagerPage();
+    var failing = std.testing.FailingAllocator.init(gpa, .{});
+    var m = newManager(failing.allocator(), tv);
+    defer m.deinit();
+    _ = try m.joinAppender(.{ .identity = ident_a });
+    const stable: cr.StableIdentity = .{ .node_token = ident_a.node_token, .mount_slot = ident_a.mount_slot };
+    // A miss (a member that joined the predecessor manager) walks the
+    // directory; the identity insert into the emptied cache is its last allocation.
+    m.identities.clearAndFree(m.gpa);
+    const a0 = failing.alloc_index;
+    try testing.expectEqual(@as(?u32, 1), m.appenderOfIdentity(stable));
+    const walk_allocs = failing.alloc_index - a0;
+    m.identities.clearAndFree(m.gpa);
+    const drops0 = stats.manager_identity_cache_drops.load();
+    failing.fail_index = failing.alloc_index + walk_allocs - 1;
+    try testing.expectEqual(@as(?u32, 1), m.appenderOfIdentity(stable));
+    try testing.expectEqual(drops0 + 1, stats.manager_identity_cache_drops.load());
+    try testing.expectEqual(@as(u32, 0), m.identities.count());
+    failing.fail_index = std.math.maxInt(usize);
+    try testing.expectEqual(@as(?u32, 1), m.appenderOfIdentity(stable));
+    try testing.expectEqual(@as(u32, 1), m.identities.count());
+}
+
 test "endpoints: publish binds identity ↔ page strictly, is idempotent on the same address, re-points on a new one; resolve answers the table; forget drops it" {
     const gpa = testing.allocator;
     const tv = try TestVolume.init(gpa, 1 << 30, 65_536, 4000);

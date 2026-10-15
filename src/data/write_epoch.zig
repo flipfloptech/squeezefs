@@ -1231,6 +1231,97 @@ test "a record for a block the CLOSING epoch shadows never takes the durable mer
     try testing.expectEqual(@as(usize, 0), ep.openCount());
 }
 
+// A transient save folds the closing epoch into the one a record opened in
+// its window (`reregister`); the next close's ONE save carries the UNION of
+// their shadows — past `max_displaced` it tripped `closeEpoch`'s buffer
+// assert (a panic: the daemon died).
+test "a transient save's fold never carries more than the ONE save's size: a record in the save's window grows the open epoch only while its union with the closing shadow fits (past it: save_in_flight, the caller awaits and records again), so the folded epoch's close publishes every block in one merge" {
+    const io = testing.io;
+    const f = try wt.Fixture.init(testing.allocator, 200);
+    defer f.deinit();
+    var ep = Epochs.init(testing.allocator, wt.BS, true);
+    defer ep.deinit();
+    const cs: Epochs.CloseSeams = .{ .map = f.map.seam(), .free = f.frees.seam(), .purge = .none };
+    try f.map.create(90, .striped, 0);
+    const max = seams.MergeOutcome.max_displaced;
+    var block: u32 = 0;
+    while (block < max / 2) : (block += 1) {
+        const m = try f.alloc_a.allocateBlock();
+        const b = Binding.wholeBlock(wt.VOL_A, m.offset, m.stamp);
+        _ = try ep.record(90, block, null, b, proofFor(b, wt.BS), 0, block_alloc.InflightAllocGuard.register(f.alloc_a, m.idx), true);
+    }
+    // In the save's window a writer records `max` OTHER blocks; the save is transient.
+    const Racer = struct {
+        var ep_: *Epochs = undefined;
+        var f_: *wt.Fixture = undefined;
+        var shadowed: u32 = 0;
+        var waited: std.ArrayList(u32) = .empty;
+        fn hook(_: *anyopaque, map: *wt.RamMap) void {
+            map.fail_next_merge = error.Transient;
+            var blk: u32 = seams.MergeOutcome.max_displaced / 2;
+            while (blk < seams.MergeOutcome.max_displaced * 3 / 2) : (blk += 1) {
+                const m = f_.alloc_a.allocateBlock() catch unreachable;
+                const b = Binding.wholeBlock(wt.VOL_A, m.offset, m.stamp);
+                switch (ep_.record(90, blk, null, b, proofFor(b, wt.BS), 0, block_alloc.InflightAllocGuard.register(f_.alloc_a, m.idx), true) catch unreachable) {
+                    .shadowed => shadowed += 1,
+                    .save_in_flight => waited.append(testing.allocator, blk) catch unreachable,
+                    .not_shadowed => unreachable,
+                }
+            }
+        }
+    };
+    Racer.ep_ = &ep;
+    Racer.f_ = f;
+    Racer.shadowed = 0;
+    Racer.waited = .empty;
+    defer Racer.waited.deinit(testing.allocator);
+    var dummy: u8 = 0;
+    f.map.before_merge = .{ .ctx = &dummy, .call = &Racer.hook };
+    try testing.expectEqual(CloseOutcome.transient, ep.close(io, 90, cs));
+    // The fold: ONE open epoch whose shadow the next save carries whole.
+    try testing.expectEqual(@as(u32, max), ep.table.get(90).?.shadow.count());
+    try testing.expectEqual(@as(u32, max / 2), Racer.shadowed);
+    try testing.expectEqual(@as(usize, max / 2), Racer.waited.items.len);
+    try testing.expect(ep.close(io, 90, cs) == .swapped);
+    try testing.expectEqual(@as(u8, max), f.map.merges.items[f.map.merges.items.len - 1].blocks);
+    // The waiters record again over the settled save: a fresh epoch takes them.
+    ep.awaitSaveSettled(io, 90);
+    for (Racer.waited.items) |blk| {
+        const m = try f.alloc_a.allocateBlock();
+        const b = Binding.wholeBlock(wt.VOL_A, m.offset, m.stamp);
+        try testing.expect((try ep.record(90, blk, null, b, proofFor(b, wt.BS), 0, block_alloc.InflightAllocGuard.register(f.alloc_a, m.idx), true)) == .shadowed);
+    }
+    try testing.expect(ep.close(io, 90, cs) == .swapped);
+    block = 0;
+    while (block < max * 3 / 2) : (block += 1) try testing.expect(f.map.seam().lookup(90, block) != null);
+    try testing.expectEqual(@as(usize, 0), ep.openCount());
+}
+
+test "record is all or nothing: an allocation failure at any of its reservations registers no epoch (a registered empty one went unreserved for the fold) and leaves the guard the caller's" {
+    const f = try wt.Fixture.init(testing.allocator, 16);
+    defer f.deinit();
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{});
+    try f.map.create(91, .striped, 0);
+    const m = try f.alloc_a.allocateBlock();
+    const b = Binding.wholeBlock(wt.VOL_A, m.offset, m.stamp);
+    const open0 = stats.rewrite_shadow_open_epochs.load();
+    // The five reservations of a first record: the table slot, the epoch,
+    // its parked list, its shadow, its guards — the last first (a refused
+    // `create` once left an undefined epoch pointer in the table).
+    var i: usize = 5;
+    while (i > 0) {
+        i -= 1;
+        var ep = Epochs.init(failing.allocator(), wt.BS, true);
+        defer ep.deinit();
+        failing.fail_index = failing.alloc_index + i;
+        var g = block_alloc.InflightAllocGuard.register(f.alloc_a, m.idx);
+        try testing.expectError(error.OutOfMemory, ep.record(91, 0, null, b, proofFor(b, wt.BS), wt.BS, g, true));
+        g.deinit();
+        try testing.expectEqual(@as(usize, 0), ep.openCount());
+        try testing.expectEqual(open0, stats.rewrite_shadow_open_epochs.load());
+    }
+}
+
 test {
     _ = @import("write_epoch_model.zig");
 }

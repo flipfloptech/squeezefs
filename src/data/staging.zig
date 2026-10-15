@@ -2790,6 +2790,15 @@ test "linux: a ring under a tmp dir — 0700/0600 modes, mmap put/get, a remount
     try testing.expectEqual(cap, ms2.map.len);
     var seg2 = try Segment.init(gpa, ms2.map, ms2.backing());
     defer seg2.deinit();
+    // Residency below must count the SCAN's touches alone: drop the first
+    // session's pages (written back first — a dirty page is never dropped) and
+    // fault without readahead. A write fault on a sparse shared mapping reads
+    // its readahead window in (32 pages at the default 128 KiB: holes cached as
+    // zero pages), which on a hole-reporting host left 30 of the 64 grains
+    // resident before the scan ran (x86_64, ext4, 7.0).
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.fdatasync(ms2.fd)));
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.fadvise(ms2.fd, 0, 0, linux.POSIX_FADV.DONTNEED)));
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.madvise(ms2.map.ptr, ms2.map.len, linux.MADV.RANDOM)));
     const rep = seg2.recover();
     try testing.expectEqual(@as(u64, 1), rep.adopted);
     try testing.expectEqual(@as(u64, 0), rep.torn);

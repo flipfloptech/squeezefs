@@ -467,6 +467,10 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         /// The reclaim gather.
         reclaim_lock: jc.SpinLock = .{},
         reclaim: std.ArrayList(u64) = .empty,
+        /// The reclaim cadence's wake (it parks on it with its tick as the
+        /// deadline): a gather that fills a batch notifies it — the destroy
+        /// is never the forgetting thread's (`gatherCorpse`).
+        reclaim_wake: sync.Notify = .init,
         next_fh: std.atomic.Value(u64) = .init(1),
         /// From the INIT reply.
         minor: u32 = abi.FUSE_KERNEL_MINOR_VERSION,
@@ -1610,11 +1614,16 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             self.gatherCorpse(c, local);
         }
 
-        /// A forgotten corpse joins the batch; a full batch drains inline
-        /// (one entry per `RECLAIM_BATCH`); a gather that cannot grow drives
-        /// the corpse alone (never lost).
+        /// A forgotten corpse joins the batch; a full batch wakes the reclaim
+        /// cadence, which destroys it (one entry per `RECLAIM_BATCH`) — never
+        /// the forgetting thread: the FUSE drain worker runs every ring
+        /// FORGET inline, and its thread drives its handler lane and its
+        /// ring, so a destroy parked there (a node read's single flight, the
+        /// layout lock, the commit: raw thread parks) would park every fiber
+        /// of the lane and every request of its queue with it. A gather
+        /// that cannot grow drives the corpse alone (never lost).
         fn gatherCorpse(self: *Self, c: *Ctx, ino: u64) void {
-            var drain = false;
+            var full = false;
             {
                 self.reclaim_lock.lock();
                 defer self.reclaim_lock.unlock();
@@ -1623,19 +1632,32 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                     self.destroyCorpses(c, &.{ino}) catch |e| log.err("kv_fs: inline corpse destroy of ino {d} failed: {t}", .{ ino, e });
                     return;
                 };
-                drain = self.reclaim.items.len >= RECLAIM_BATCH;
+                full = self.reclaim.items.len >= RECLAIM_BATCH;
             }
-            if (drain) self.reclaimDrain(c) catch |e| log.err("kv_fs: reclaim drain failed: {t}", .{e});
+            if (full) self.reclaim_wake.notifyOne(self.io);
         }
 
         /// Destroy every gathered corpse, `RECLAIM_BATCH` per entry.
         pub fn reclaimDrain(self: *Self, c: *Ctx) Error!void {
+            return self.drainGather(c, 1);
+        }
+
+        /// Destroy FULL batches only (the cadence's wake, `gatherCorpse`):
+        /// the tail under `RECLAIM_BATCH` waits for the tick, so a wake that
+        /// lands mid-storm never spends an entry on a few corpses (the
+        /// `unlink ≤ 1.05 entries/op` economy).
+        pub fn reclaimDrainFull(self: *Self, c: *Ctx) Error!void {
+            return self.drainGather(c, RECLAIM_BATCH);
+        }
+
+        fn drainGather(self: *Self, c: *Ctx, min_batch: usize) Error!void {
             while (true) {
                 var batch: [RECLAIM_BATCH]u64 = undefined;
                 var n: usize = 0;
                 {
                     self.reclaim_lock.lock();
                     defer self.reclaim_lock.unlock();
+                    if (self.reclaim.items.len < min_batch) return;
                     while (n < RECLAIM_BATCH and self.reclaim.items.len > 0) : (n += 1) batch[n] = self.reclaim.pop().?;
                 }
                 if (n == 0) return;
@@ -5783,17 +5805,33 @@ test "a FORGET that fills the corpse gather destroys nothing on the forgetting t
     }
     const commits0 = h.store.commits;
     for (corpses) |ino| h.forget(ino, 1);
-    // The 64th corpse filled the batch: gathered, none destroyed here.
+    // The 64th corpse filled the batch: gathered, none destroyed here, the
+    // cadence woken (its permit stands).
     try testing.expectEqual(commits0, h.store.commits);
+    var wake = h.fs.reclaim_wake.notified();
+    try testing.expect(wake.enable(testing.io));
     try testing.expectEqual(@as(usize, RECLAIM_BATCH), h.fs.reclaim.items.len);
     try testing.expectEqual(inodes0 + RECLAIM_BATCH, h.store.countKind(key.TREE_INODES));
     var tr = @import("op_trace.zig").OpTrace.begin(1, .other);
     var win: [16]u8 = undefined;
     var c: Ctx = .{ .unique = 1, .uid = 0, .gid = 0, .pid = 0, .io = testing.io, .trace = &tr, .wd_slot = null, .window = &win };
+    // A tail corpse past the batch: the wake's drain takes full batches only.
+    const tail = try h.create(1, "tail", 0o644);
+    try testing.expectEqual(@as(?linux.E, null), h.call(.{ .unlink = .{ .name = "tail" } }, 1).errno());
+    h.release(tail);
+    h.forget(tail, 1);
+    const commits1 = h.store.commits;
+    try h.fs.reclaimDrainFull(&c);
+    // The wake's drain: the whole batch in ONE destroy entry, the tail kept.
+    try testing.expectEqual(commits1 + 1, h.store.commits);
+    try testing.expectEqual(inodes0 + 1, h.store.countKind(key.TREE_INODES));
+    try testing.expectEqual(@as(usize, 1), h.fs.reclaim.items.len);
+    try h.fs.reclaimDrainFull(&c);
+    try testing.expectEqual(@as(usize, 1), h.fs.reclaim.items.len);
+    // The tick's drain takes the tail.
     try h.fs.reclaimDrain(&c);
     tr.finish();
-    // The cadence's drain: the whole batch in ONE destroy entry.
-    try testing.expectEqual(commits0 + 1, h.store.commits);
+    try testing.expectEqual(commits1 + 2, h.store.commits);
     try testing.expectEqual(inodes0, h.store.countKind(key.TREE_INODES));
     try testing.expectEqual(@as(usize, 0), h.fs.reclaim.items.len);
 }

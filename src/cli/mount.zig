@@ -1212,6 +1212,7 @@ const ReclaimCadence = struct {
 
     fn requestStop(self: *ReclaimCadence) void {
         self.stop.store(true, .release);
+        self.fs.reclaim_wake.notifyOne(self.io);
     }
 
     /// The owed inos one tick drains at most: the harvest's stack room (a
@@ -1242,14 +1243,31 @@ const ReclaimCadence = struct {
         }
     }
 
+    /// Parked on the filesystem's reclaim wake with the next tick as the
+    /// deadline (register-then-check, the notify law): a full corpse batch
+    /// wakes it for the full batches alone (`kv_fs.gatherCorpse` — the
+    /// forgetting thread destroys nothing); the tick drains the tail and
+    /// runs the rest.
     fn run(self: *ReclaimCadence) void {
-        while (!self.stop.load(.acquire)) {
-            self.io.sleep(.fromNanoseconds(RECLAIM_CADENCE_NS), .awake) catch return;
+        var next_tick_ns = clock.monotonicNs() + RECLAIM_CADENCE_NS;
+        while (true) {
+            var wake = self.fs.reclaim_wake.notified();
+            _ = wake.enable(self.io);
+            if (self.stop.load(.acquire)) {
+                wake.cancel(self.io);
+                return;
+            }
+            _ = wake.waitUntilUncancelable(self.io, next_tick_ns);
             if (self.stop.load(.acquire)) return;
             var trace = op_trace.OpTrace.begin(0, .other);
             defer trace.finish();
             var ctx: filesystem.Ctx = .{ .unique = 0, .uid = 0, .gid = 0, .pid = 0, .io = self.io, .trace = &trace, .wd_slot = null, .window = &.{} };
+            if (clock.monotonicNs() < next_tick_ns) {
+                self.fs.reclaimDrainFull(&ctx) catch |e| log.err("reclaim cadence: drain failed: {t}", .{e});
+                continue;
+            }
             self.fs.reclaimDrain(&ctx) catch |e| log.err("reclaim cadence: drain failed: {t}", .{e});
+            next_tick_ns = clock.monotonicNs() + RECLAIM_CADENCE_NS;
             self.drainIdleOwed(&ctx);
             // The cross-owner cadence rides the same meta fiber: the
             // roll-forward of abandoned intents, the stripe migration.

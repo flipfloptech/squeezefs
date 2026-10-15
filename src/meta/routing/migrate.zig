@@ -606,7 +606,7 @@ test "migrate a loaded slot WHILE a writer storm hits it: every acked create pre
                 while (!self.stop.load(.acquire)) : (i += 1) {
                     const name = std.fmt.bufPrint(&name_buf, "storm{d}", .{i}) catch unreachable;
                     const g = meta_set.createFile(self.set, inos.ROOT_INO, name) catch continue;
-                    self.acked.append(self.gpa, g) catch {};
+                    self.acked.append(self.gpa, g) catch @panic("storm: out of memory (an acked create would go unchecked)");
                     // A mutation on the migrating slot through the door.
                     const victim = self.victims[i % self.victims.len];
                     const eff = self.set.effectiveIno(victim);

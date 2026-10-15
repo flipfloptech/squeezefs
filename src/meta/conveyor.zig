@@ -2719,7 +2719,7 @@ pub const RamLane = struct {
             for (group, verdicts) |h, v| {
                 const result: Error!void = if (v) |_| (if (hole_err) |e| e else {}) else |e| e;
                 self.acks += 1;
-                self.ack_order.append(self.gpa, h.w.res.start) catch {};
+                self.ack_order.append(self.gpa, h.w.res.start) catch @panic("RamLane (a test double): out of memory");
                 h.w.finish(result);
             }
         }

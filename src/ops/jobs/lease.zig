@@ -385,22 +385,22 @@ pub const RamSink = struct {
     }
     fn admit(ctx: *anyopaque, d: DestTuple, epoch: u64) void {
         const self: *RamSink = @ptrCast(@alignCast(ctx));
-        self.quarantined.put(self.gpa, key(d), epoch) catch {};
+        self.quarantined.put(self.gpa, key(d), epoch) catch @panic("RamSink (a test double): out of memory");
     }
     fn preempt(ctx: *anyopaque, holder: StableIdentity) u32 {
         const self: *RamSink = @ptrCast(@alignCast(ctx));
-        self.preempts.append(self.gpa, holder) catch {};
+        self.preempts.append(self.gpa, holder) catch @panic("RamSink (a test double): out of memory");
         return self.preempt_lands;
     }
     fn release(ctx: *anyopaque, epoch: u64, _: u32) void {
         const self: *RamSink = @ptrCast(@alignCast(ctx));
-        self.released.append(self.gpa, epoch) catch {};
+        self.released.append(self.gpa, epoch) catch @panic("RamSink (a test double): out of memory");
         // A released cohort's blocks leave quarantine (the allocator's
         // `releaseQuarantine` returns them to the free list).
         var it = self.quarantined.iterator();
         var drop: std.ArrayList(u128) = .empty;
         defer drop.deinit(self.gpa);
-        while (it.next()) |kv| if (kv.value_ptr.* == epoch) drop.append(self.gpa, kv.key_ptr.*) catch {};
+        while (it.next()) |kv| if (kv.value_ptr.* == epoch) drop.append(self.gpa, kv.key_ptr.*) catch @panic("RamSink (a test double): out of memory");
         for (drop.items) |k| _ = self.quarantined.remove(k);
     }
     fn isQuarantined(ctx: *anyopaque, d: DestTuple) bool {
@@ -410,8 +410,8 @@ pub const RamSink = struct {
     fn putFn(ctx: *anyopaque, s: records.JobShard) void {
         const self: *RamSink = @ptrCast(@alignCast(ctx));
         var copy = s;
-        copy.dests = self.gpa.dupe(DestTuple, s.dests) catch return;
-        self.puts.append(self.gpa, copy) catch {};
+        copy.dests = self.gpa.dupe(DestTuple, s.dests) catch @panic("RamSink (a test double): out of memory");
+        self.puts.append(self.gpa, copy) catch @panic("RamSink (a test double): out of memory");
     }
 
     pub fn lastPut(self: *const RamSink) ?records.JobShard {

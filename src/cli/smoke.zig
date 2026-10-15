@@ -456,6 +456,23 @@ const Rig = struct {
         self.gpa.free(r.stderr);
     }
 
+    /// `freeRun`, printing both streams of a failed run.
+    fn freeRunOk(self: *Rig, r: std.process.RunResult) void {
+        defer self.freeRun(r);
+        if (!r.term.success()) std.debug.print("\n--- script failed ({f}) ---\n{s}\n--- stderr ---\n{s}\n", .{ r.term, r.stdout, r.stderr });
+    }
+
+    /// An fsck refusal's evidence outlives the work dir: the post-kill
+    /// metadata image (`fsckClean`'s copy) and the daemon's log move to
+    /// `/build/tmp/fsck-refused-<pid>/` (printed).
+    fn keepRefusedImage(self: *Rig) void {
+        var cmd_buf: [256]u8 = undefined;
+        const cmd = std.fmt.bufPrint(&cmd_buf, "d=/build/tmp/fsck-refused-{d}; mkdir -p $d && mv vol.prefsck.img $d/ && cp daemon.log $d/ && sync -f $d && echo \"fsck refusal kept in $d\"", .{linux.getpid()}) catch return;
+        const r = self.sh(self.work, cmd) catch return;
+        defer self.freeRunOk(r);
+        std.debug.print("{s}", .{r.stdout});
+    }
+
     /// Spawn the foreground mount with its stderr appended to the log file.
     fn spawnMount(self: *Rig, extra: []const []const u8) !void {
         return self.spawnMountOf(self.meta_uri, extra);
@@ -6883,10 +6900,14 @@ const Recovery = struct { replayed: u64, torn: u64, ring_records: u64, ring_torn
 /// guarded open replays the ring, then C1–C17 and the scrub must report
 /// `findings: 0 (clean)` with exit 0.
 fn fsckClean(rig: *Rig, label: []const u8) !Recovery {
+    // The metadata image as the kill left it: fsck's guarded open replays
+    // and checkpoints it in place, so a refusal's evidence is this copy.
+    rig.freeRunOk(try rig.sh(rig.work, "cp --sparse=always vol.img vol.prefsck.img"));
     const r = try rig.squeezefs(&.{ "fsck", "--offline", "--scrub", rig.meta_uri });
     defer rig.freeRun(r);
     if (!r.term.success() or std.mem.indexOf(u8, r.stdout, "findings: 0 (clean)") == null) {
         std.debug.print("\n--- fsck --offline after {s} ({f}) ---\n{s}\n--- stderr ---\n{s}\n", .{ label, r.term, r.stdout, r.stderr });
+        rig.keepRefusedImage();
         return error.FsckNotClean;
     }
     std.debug.print("smoke[kill]: fsck --offline --scrub after {s}: {s}", .{ label, r.stdout[0 .. std.mem.indexOfScalar(u8, r.stdout, '\n') orelse r.stdout.len] });

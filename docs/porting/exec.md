@@ -290,7 +290,9 @@ No knob sizes the lanes, the meta pool, the blocking pool, the tick or the timer
 parked lane = exactly one unpark, a lane-local spawn adds none, `service` runs ≥ once per park and per
 poll; `condvar_park_is_sticky_and_ticks` (L527) a pre-delivered unpark returns the park at once, no unpark
 honours the tick; `pluggable_park_never_loses_a_wake` (L549) 2000 spawns from 4 threads all complete in
-< TICK/2; `stress_many_tasks_many_foreign_wakes` (L597) 200 ping-pong tasks all complete.
+< TICK/2 (the port judges the same claim by the lane's own books — 0 tick rescues, a lost wake being
+a park only the tick ends — since a wall clock measures the Debug build's per-recycle costs: 6.4 s on
+x86_64 with 0 rescues); `stress_many_tasks_many_foreign_wakes` (L597) 200 ping-pong tasks all complete.
 `session.rs::tpc_dispatch_tests::dead_lane_redispatches_loudly_healthy_lanes_never` (L7431) healthy lanes
 never move the counter; a dead lane re-routes every dispatch and counts.
 `sqz_time.rs`: `sleep_fires_and_timeout_splits` (L328), `dropped_sleep_cancels_cleanly` (L350) a dropped

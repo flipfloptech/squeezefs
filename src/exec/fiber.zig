@@ -258,18 +258,23 @@ pub const Stack = struct {
 
     /// Bytes of the usable region below the top that lost their canary: the
     /// deepest frame since the last fill. Scans from the low end (the
-    /// untouched part) 32 bytes at a time: a 1 MiB stack is ~32 k compares,
-    /// which keeps the per-recycle cost of the debug/test build at ~10 µs.
+    /// untouched part) four words at a time — plain u64 XOR/OR, which every
+    /// Debug backend compiles to straight-line integer code: measured per MiB
+    /// ~0.25 ms on x86_64 under zig's self-hosted backend (the default for
+    /// x86_64 Debug) and ~0.2 ms on aarch64 under LLVM. A `@Vector(32, u8)`
+    /// compare-and-reduce cost 3.3 ms per MiB on the self-hosted backend
+    /// (lane-by-lane extraction) — paid on every fiber recycle of a test build.
     pub fn highWater(self: Stack) usize {
         const u = self.usable();
-        const V = @Vector(32, u8);
-        const pattern: V = @splat(canary_byte);
+        // `usable` starts one page above a page-aligned base: word-aligned.
+        const ws: []const u64 = @as([*]const u64, @ptrCast(@alignCast(u.ptr)))[0 .. u.len / 8];
+        const word: u64 = @as(u64, canary_byte) * 0x0101_0101_0101_0101;
         var i: usize = 0;
-        while (i + 32 <= u.len) : (i += 32) {
-            const chunk: V = u[i..][0..32].*;
-            if (@reduce(.Or, chunk != pattern)) break;
+        while (i + 4 <= ws.len) : (i += 4) {
+            if ((ws[i] ^ word) | (ws[i + 1] ^ word) | (ws[i + 2] ^ word) | (ws[i + 3] ^ word) != 0) break;
         }
-        while (i < u.len) : (i += 1) if (u[i] != canary_byte) return u.len - i;
+        var b = i * 8;
+        while (b < u.len) : (b += 1) if (u[b] != canary_byte) return u.len - b;
         return 0;
     }
 

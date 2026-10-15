@@ -93,8 +93,9 @@ pub const stats = struct {
     pub var write_pipeline_depth_target_base: counters.Gauge = .{};
     pub var write_pipeline_depth_probe_ups: counters.ShardedCounter = .{};
     pub var write_pipeline_depth_probe_backoffs: counters.ShardedCounter = .{};
-    pub var write_pipeline_supersessions: counters.ShardedCounter = .{};
-    pub var write_pipeline_superseded_bytes: counters.ShardedCounter = .{};
+    /// An upload a newer write superseded that PUBLISHED its snapshot (the
+    /// entry stays parked with the newer pages; decision 0003 §AJ.7).
+    pub var write_pipeline_superseded_publishes: counters.ShardedCounter = .{};
     pub var write_pipeline_fence_drops: counters.Tripwire = .init("write_pipeline_fence_drops");
     pub var write_pipeline_stay_parked: counters.ShardedCounter = .{};
     pub var write_pipeline_published: counters.ShardedCounter = .{};
@@ -115,7 +116,7 @@ pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
     inline for (.{ "write_pipeline_inflight_bytes", "write_pipeline_inflight_blocks", "write_pipeline_depth_target", "write_pipeline_depth_target_base" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, @field(stats, name).load() });
     }
-    inline for (.{ "write_pipeline_admission_waits", "write_pipeline_admission_tick_wakes", "write_pipeline_depth_probe_ups", "write_pipeline_depth_probe_backoffs", "write_pipeline_supersessions", "write_pipeline_superseded_bytes", "write_pipeline_stay_parked", "write_pipeline_published", "write_pipeline_discards", "write_pipeline_joins", "write_pipeline_join_waits" }) |name| {
+    inline for (.{ "write_pipeline_admission_waits", "write_pipeline_admission_tick_wakes", "write_pipeline_depth_probe_ups", "write_pipeline_depth_probe_backoffs", "write_pipeline_superseded_publishes", "write_pipeline_stay_parked", "write_pipeline_published", "write_pipeline_discards", "write_pipeline_joins", "write_pipeline_join_waits" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, @field(stats, name).load() });
     }
     try w.print("\"write_pipeline_fence_drops\":{d},\"write_pipeline_phase_ns\":{{", .{counters.tripwireCount("write_pipeline_fence_drops")});
@@ -200,9 +201,6 @@ pub const Disposition = enum {
     stay_parked,
     /// `WriterGuardFenced`: publish nothing, free nothing (must-stay-0).
     fence_drop,
-    /// A newer write superseded the snapshot: the fresh offset was freed,
-    /// nothing published (latest-wins).
-    superseded,
     /// The entry vanished (truncate/unlink) or the ino is gone.
     discarded,
     /// Another task's upload of this block was in flight: this one waited
@@ -211,15 +209,11 @@ pub const Disposition = enum {
     joined,
 };
 
-pub fn countDisposition(d: Disposition, bytes: u64) void {
+pub fn countDisposition(d: Disposition) void {
     switch (d) {
         .published => stats.write_pipeline_published.inc(),
         .stay_parked => stats.write_pipeline_stay_parked.inc(),
         .fence_drop => stats.write_pipeline_fence_drops.fire("a pipeline upload met the writer-guard fence"),
-        .superseded => {
-            stats.write_pipeline_supersessions.inc();
-            stats.write_pipeline_superseded_bytes.add(bytes);
-        },
         .discarded => stats.write_pipeline_discards.inc(),
         .joined => stats.write_pipeline_joins.inc(),
     }
@@ -914,21 +908,16 @@ test "phase_family_is_always_on_with_exact_keys; recording_lands_in_exactly_the_
 
 test "disposition_mapping_is_the_task_counting_contract" {
     const pub0 = stats.write_pipeline_published.load();
-    const sup0 = stats.write_pipeline_supersessions.load();
-    const bytes0 = stats.write_pipeline_superseded_bytes.load();
     const stay0 = stats.write_pipeline_stay_parked.load();
     const disc0 = stats.write_pipeline_discards.load();
     const fence0 = counters.tripwireCount("write_pipeline_fence_drops");
-    countDisposition(.published, BS);
-    countDisposition(.superseded, BS);
-    countDisposition(.stay_parked, BS);
-    countDisposition(.discarded, BS);
+    countDisposition(.published);
+    countDisposition(.stay_parked);
+    countDisposition(.discarded);
     try testing.expectEqual(pub0 + 1, stats.write_pipeline_published.load());
-    try testing.expectEqual(sup0 + 1, stats.write_pipeline_supersessions.load());
-    try testing.expectEqual(bytes0 + BS, stats.write_pipeline_superseded_bytes.load());
     try testing.expectEqual(stay0 + 1, stats.write_pipeline_stay_parked.load());
     try testing.expectEqual(disc0 + 1, stats.write_pipeline_discards.load());
-    try testing.expectEqual(fence0, counters.tripwireCount("write_pipeline_fence_drops")); // none of the four fires it
+    try testing.expectEqual(fence0, counters.tripwireCount("write_pipeline_fence_drops")); // none of the three fires it
 }
 
 test {

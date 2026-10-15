@@ -333,7 +333,7 @@ pub fn spillParkedBlock(table: *accumulate.Table, deps: Deps, io: Io, worker: *W
             const img = table.gpa.alignedAlloc(u8, .fromByteUnits(PAGE), @intCast(bs)) catch return error.OutOfMemory;
             defer table.gpa.free(img);
             readImage(deps, old, img) catch return error.StorageFull;
-            table.fillComplementFrom(e, img) catch return error.PoolExhausted;
+            table.fillComplementFrom(e, img, old) catch return error.PoolExhausted;
         } else {
             e.seed = .fresh;
             table.zeroComplete(e);

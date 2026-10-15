@@ -458,10 +458,10 @@ pub const stats = struct {
     /// §AH.1: a release's hold and its drop are one pairing).
     pub var block_inflight_unheld_drops: counters.Tripwire = .init("block_inflight_unheld_drops");
     /// An unpublished mint returned by its rollback owner: a failed DMA, a
-    /// publish refused, or a write-through SUPERSEDED by a newer write
-    /// landing during its DMA (latest-wins — a healthy storm's outcome, so
-    /// an event count and never a tripwire; `≡ write_pipeline_supersessions
-    /// + write_pipeline_discards` on a healthy device is the smoke's law).
+    /// publish refused, or an orphan's discard (an event count and never a
+    /// tripwire; `≤ write_pipeline_discards` on a healthy device is the
+    /// smoke's law — a superseded write-through publishes its snapshot,
+    /// decision 0003 §AJ.7).
     pub var unpublished_mint_abandons: counters.ShardedCounter = .{};
     // Per-op counters.
     pub var alloc_from_freelist: counters.ShardedCounter = .{};

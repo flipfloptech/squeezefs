@@ -380,7 +380,7 @@ pub const StatsTerms = struct {
     /// pages at a mapping the file owns alone: the W2 fold's and the
     /// deferred full buffer's drain (decision 0003 §AK); a superseded
     /// upload's DMA landed its image before the newer bytes won (§AK.6).
-    pub const device_write_keys = [_][]const u8{ "overlay_store_bytes", "patch_write_bytes", "own_block_dma_bytes", "write_through_bytes", "durable_upload_bytes_writeback", "fold_inplace_write_bytes", "drain_inplace_write_bytes", "write_pipeline_superseded_bytes" };
+    pub const device_write_keys = [_][]const u8{ "overlay_store_bytes", "patch_write_bytes", "own_block_dma_bytes", "write_through_bytes", "durable_upload_bytes_writeback", "fold_inplace_write_bytes", "drain_inplace_write_bytes" };
     /// The device-write REQUEST arms (brk.py `DEVICE_WRITE_REQS`): `put_obj`
     /// is the block layer's put (an overlay store IS a put, never summed
     /// twice); a W1 patch DMA, a W2 in-place page DMA and an own-block DMA

@@ -147,6 +147,9 @@ pub const stats = struct {
     pub var drain_inplace_declines: counters.ShardedCounter = .{};
     /// A failed seed read or DMA: the entry stays parked (never lossy), loud.
     pub var drain_inplace_dma_errors: counters.ShardedCounter = .{};
+    /// The drains of a CONTENT-VALID buffer that landed its dirty pages in
+    /// place (decision 0003 §AJ.7; inside `drain_inplace_drains`).
+    pub var drain_inplace_dirty_drains: counters.ShardedCounter = .{};
     // Tripwires.
     pub var coverage_complete_buffer_not_content_valid: counters.Tripwire = .init("coverage_complete_buffer_not_content_valid");
     pub var complete_union_with_extra_runs: counters.Tripwire = .init("complete_union_with_extra_runs");
@@ -156,7 +159,7 @@ pub const stats = struct {
 
 pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
     try w.writeAll("{");
-    inline for (.{ "write_through_blocks", "write_through_bytes", "write_through_fallbacks", "nt_copy_bytes", "active_block_cow_copies", "active_block_memset_elided_bytes", "active_block_ooo_runs", "active_block_run_table_completions", "overwrite_seed_deferred", "overwrite_seed_materialized", "overwrite_seed_skipped", "write_block_revisits", "parked_pool_refusals", "parked_pool_trimmed_cells", "durable_upload_bytes_escalation", "placed_merge_elides", "drain_inplace_drains", "drain_inplace_pages", "drain_inplace_dmas", "drain_inplace_write_bytes", "drain_inplace_seed_bytes", "drain_inplace_declines", "drain_inplace_dma_errors" }) |name| {
+    inline for (.{ "write_through_blocks", "write_through_bytes", "write_through_fallbacks", "nt_copy_bytes", "active_block_cow_copies", "active_block_memset_elided_bytes", "active_block_ooo_runs", "active_block_run_table_completions", "overwrite_seed_deferred", "overwrite_seed_materialized", "overwrite_seed_skipped", "write_block_revisits", "parked_pool_refusals", "parked_pool_trimmed_cells", "durable_upload_bytes_escalation", "placed_merge_elides", "drain_inplace_drains", "drain_inplace_pages", "drain_inplace_dmas", "drain_inplace_write_bytes", "drain_inplace_seed_bytes", "drain_inplace_declines", "drain_inplace_dma_errors", "drain_inplace_dirty_drains" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, @field(stats, name).load() });
     }
     try w.print("\"parked_full_buffer_bytes\":{d},\"parked_buffers\":{d},", .{ stats.parked_full_buffer_bytes.load(), stats.parked_buffers.load() });
@@ -366,9 +369,28 @@ pub const Entry = struct {
     /// An upload task holds a snapshot (the entry is being written through).
     upload_inflight: bool = false,
     in_use: bool = false,
+    /// The binding whose bytes a content-valid cell's clean pages equal:
+    /// the seed's base, or the key a superseded upload's snapshot published
+    /// (decision 0003 §AJ.7). Null = no device image under the cell (a
+    /// fresh block, a hole, a never-seeded union).
+    clean_base: ?Binding = null,
+    /// The pages written since the cell last matched `clean_base`: what the
+    /// in-place drain of a content-valid buffer lands.
+    dirty: extent.PageSet = .empty,
+    /// The pages written since the in-flight upload's snapshot: the dirty
+    /// set a superseded snapshot's publish leaves behind.
+    dirty_since_snap: extent.PageSet = .empty,
 
     pub fn isFull(self: *const Entry) bool {
         return self.repr == .full;
+    }
+
+    /// `[start, end)` was written: its pages are dirty in both sets.
+    pub fn markDirty(self: *Entry, start: u32, end: u32) void {
+        if (end <= start) return;
+        const r: std.bit_set.Range = .{ .start = start / PAGE, .end = (end + PAGE - 1) / PAGE };
+        self.dirty.setRangeValue(r, true);
+        self.dirty_since_snap.setRangeValue(r, true);
     }
 };
 
@@ -534,6 +556,7 @@ pub const Table = struct {
         for (landed) |r| {
             _ = e.coverage.record(r.start, r.end, self.block_size) catch unreachable;
             e.app_end = @max(e.app_end, r.end);
+            e.markDirty(r.start, r.end);
         }
         e.write_epoch = nextWriteEpoch();
         if (e.coverage.isFull(self.block_size)) {
@@ -591,6 +614,8 @@ pub const Table = struct {
         const cell = self.pool.acquire() orelse return null;
         var ext = e.repr.extent;
         ext.completeInto(cell.data[0..self.block_size], base);
+        var runs_buf: [extent.MAX_PAGES]extent.Run = undefined;
+        for (ext.pageRuns(&runs_buf)) |r| e.markDirty(r.start, r.end);
         stats.parked_full_buffer_bytes.add(self.block_size);
         ext.deinit(self.gpa);
         e.repr = .{ .full = cell };
@@ -621,6 +646,7 @@ pub const Table = struct {
         e.coverage.setFull(self.block_size);
         e.seed = .seeded;
         e.content_valid = true;
+        e.clean_base = old_binding;
         stats.overwrite_seed_materialized.inc();
         return e;
     }
@@ -683,6 +709,7 @@ pub const Table = struct {
             stats.nt_copy_bytes.add(data.len);
         }
         if (v.out_of_order) stats.active_block_ooo_runs.inc();
+        e.markDirty(rel, end);
         e.write_epoch = nextWriteEpoch();
         e.app_end = @max(e.app_end, end);
         e.last_touch_ns = clock.monotonicNs();
@@ -727,8 +754,9 @@ pub const Table = struct {
 
     /// Materialize the complement from the old image (the deferred seed's
     /// exit): copy the gaps, set full, content valid (`overwrite_seed_
-    /// materialized`). Needs a unique cell.
-    pub fn fillComplementFrom(self: *Table, e: *Entry, image: []const u8) RecordError!void {
+    /// materialized`); `base` — the binding `image` was read from — is the
+    /// cell's clean base. Needs a unique cell.
+    pub fn fillComplementFrom(self: *Table, e: *Entry, image: []const u8, base: Binding) RecordError!void {
         assert(e.repr == .full and image.len >= self.block_size);
         const cell = self.pool.uniqueOrCopy(e.repr.full, &e.coverage) orelse return error.PoolExhausted;
         e.repr = .{ .full = cell };
@@ -737,6 +765,7 @@ pub const Table = struct {
         e.coverage.setFull(self.block_size);
         e.seed = .seeded;
         e.content_valid = true;
+        e.clean_base = base;
         stats.overwrite_seed_materialized.inc();
     }
 
@@ -990,7 +1019,20 @@ pub const Disposition = pipeline.Disposition;
 /// Returns the disposition (counted by the caller through
 /// `pipeline.countDisposition`). `prof` is the caller's phase profile
 /// (admit_wait/detach_lag already marked).
-pub fn uploadParkedBlock(table: *Table, deps: UploadDeps, io: Io, ino: u64, block: u32, prof: *pipeline.Prof) Disposition {
+///
+/// A newer write landing during the device phase SUPERSEDES the snapshot
+/// (decision 0003 §AJ.7): the snapshot is still one consistent image of
+/// the block at its stamp — every write whole in it, taken under (3) — so
+/// it PUBLISHES (`write_pipeline_superseded_publishes`) and the entry stays
+/// parked with the pages written since (`dirty_since_snap`) over the
+/// published key (`clean_base`). Readers keep the entry: the write-side
+/// view outranks the map for every byte of a content-valid buffer, so the
+/// older image is never served after the newer write was acked. The
+/// upload then re-drives for the newer writes unless the snapshot was taken
+/// after `cutoff_ns` (they are younger than what the caller owes: the
+/// timer's next pass lands them, in place when the block is the file's
+/// alone). The DMA is never thrown away.
+pub fn uploadParkedBlock(table: *Table, deps: UploadDeps, io: Io, ino: u64, block: u32, cutoff_ns: u64, prof: *pipeline.Prof) Disposition {
     const bs: u64 = table.block_size;
     // ONE upload per entry at a time: a second flush of the same block (an
     // fsync or a RELEASE racing the write-through, two RELEASEs of one
@@ -1015,6 +1057,7 @@ pub fn uploadParkedBlock(table: *Table, deps: UploadDeps, io: Io, ino: u64, bloc
         // The snapshot + the epoch stamp under (3).
         var snap: Snapshot = undefined;
         var app_end: u32 = 0;
+        var snap_ns: u64 = 0;
         {
             var settle = table.upload_settled.notified();
             _ = settle.enable(io);
@@ -1035,6 +1078,8 @@ pub fn uploadParkedBlock(table: *Table, deps: UploadDeps, io: Io, ino: u64, bloc
                     e.upload_inflight = true;
                     snap = table.snapshot(e);
                     app_end = e.app_end;
+                    e.dirty_since_snap = .empty;
+                    snap_ns = clock.monotonicNs();
                 }
             }
             if (inflight_elsewhere) {
@@ -1128,6 +1173,7 @@ pub fn uploadParkedBlock(table: *Table, deps: UploadDeps, io: Io, ino: u64, bloc
         var fed_hint = false;
         var fed = false;
         var await_save = false;
+        var superseded = false;
         publish: while (true) {
             if (await_save) {
                 await_save = false;
@@ -1140,15 +1186,8 @@ pub fn uploadParkedBlock(table: *Table, deps: UploadDeps, io: Io, ino: u64, bloc
                 mint.abandon();
                 return .discarded;
             };
-            if (e.write_epoch != snap.write_epoch) {
-                e.upload_inflight = false;
-                fsck_guard.deinit();
-                mint.abandon();
-                // The bytes the abandoned DMA landed: a device-write arm
-                // (the ledger closes against diskstats, decision 0003 §AK.6).
-                pipeline.countDisposition(.superseded, proof.len);
-                continue :drive; // re-drive with the newest bytes
-            }
+            // A newer write superseded the snapshot: it publishes all the same.
+            superseded = e.write_epoch != snap.write_epoch;
             const min_size = @as(u64, block) * bs + app_end;
             const striped = if (deps.map.view(ino)) |v| v.kind == .striped else false;
             // An OVERWRITE displaces the write-side authority's key: the
@@ -1216,8 +1255,17 @@ pub fn uploadParkedBlock(table: *Table, deps: UploadDeps, io: Io, ino: u64, bloc
             // keys leave the read tiers before a new writer's fresh entry
             // can race the retire (the 2026-08-04 crash).
             for (displaced.slice()) |d| deps.purge.purge(d);
-            table.retire(e);
-            retired_by_us = true;
+            if (superseded) {
+                // The newer writes stay parked over the published image.
+                e.upload_inflight = false;
+                e.dirty = e.dirty_since_snap;
+                e.clean_base = new_key;
+                e.old_binding = new_key;
+                e.born_ns = snap_ns;
+            } else {
+                table.retire(e);
+                retired_by_us = true;
+            }
             prof.mark(.inval_tail);
             break;
         }
@@ -1231,6 +1279,10 @@ pub fn uploadParkedBlock(table: *Table, deps: UploadDeps, io: Io, ino: u64, bloc
         displaced.dropHolds();
         prof.mark(.displaced_free);
         if (fed_hint) _ = deps.epochs.close(io, ino, .{ .map = deps.map, .free = deps.free, .purge = deps.purge });
+        if (superseded) {
+            pipeline.stats.write_pipeline_superseded_publishes.inc();
+            if (snap_ns <= cutoff_ns) continue :drive; // the newer writes are owed too
+        }
         return .published;
     }
 }
@@ -1242,16 +1294,6 @@ fn clearInflight(table: *Table, deps: UploadDeps, io: Io, ino: u64, block: u32) 
     if (table.get(ino, block)) |e| e.upload_inflight = false;
 }
 
-/// The synchronous flush of a PARTIAL parked block (an fsync's DUR-1
-/// escalation, a release, a spill): complete the complement under (3) —
-/// zeros on a fresh buffer, the old image on a deferred seed (one whole-
-/// block read) — then upload. `durable_upload_bytes_escalation` counts it.
-/// An extent entry folds IN PLACE when its block is a sole-owner
-/// passthrough mapping (§J.1 landing 2: the touched pages, nothing else,
-/// no upload); else it escalates (seeded whole for a CoW base) and uploads.
-/// A deferred full buffer over the same kind of mapping drains IN PLACE
-/// the same way (`drainInPlaceLocked`, decision 0003 §AK): an extending
-/// append's drain is its 1–2 touched pages, never the block.
 /// What `flushBornBy` left: blocks that stayed parked (the ENOSPC wall)
 /// and whether a fence dropped one.
 pub const BornByFlush = struct { stay_parked: u32 = 0, fenced: bool = false };
@@ -1272,7 +1314,6 @@ pub fn flushBornBy(table: *Table, deps: UploadDeps, io: Io, ino: u64, born_by: u
         out.stay_parked = 0;
         for (bl) |b| switch (flushParkedBlock(table, deps, io, ino, b)) {
             .published, .discarded, .joined => landed = true,
-            .superseded => {},
             .fence_drop => out.fenced = true,
             .stay_parked => out.stay_parked += 1,
         };
@@ -1280,7 +1321,28 @@ pub fn flushBornBy(table: *Table, deps: UploadDeps, io: Io, ino: u64, born_by: u
     }
 }
 
+/// The synchronous flush of a PARTIAL parked block (an fsync's DUR-1
+/// escalation, a release, a spill): complete the complement under (3) —
+/// zeros on a fresh buffer, the old image on a deferred seed (one whole-
+/// block read) — then upload. `durable_upload_bytes_escalation` counts it.
+/// An extent entry folds IN PLACE when its block is a sole-owner
+/// passthrough mapping (§J.1 landing 2: the touched pages, nothing else,
+/// no upload); else it escalates (seeded whole for a CoW base) and uploads.
+/// A deferred full buffer over the same kind of mapping drains IN PLACE
+/// the same way (`drainInPlaceLocked`, decision 0003 §AK): an extending
+/// append's drain is its 1–2 touched pages, never the block. A
+/// content-valid buffer over its clean base drains its dirty pages in place
+/// (`drainDirtyInPlaceLocked`, §AJ.7). Every write acked before the call
+/// lands (`flushParkedBlockBy` with no cutoff).
 pub fn flushParkedBlock(table: *Table, deps: UploadDeps, io: Io, ino: u64, block: u32) Disposition {
+    return flushParkedBlockBy(table, deps, io, ino, block, std.math.maxInt(u64));
+}
+
+/// `flushParkedBlock` owing only the writes acked by `cutoff_ns` (the
+/// write-back timer's cutoff): an upload a newer write superseded publishes
+/// its snapshot and, when the snapshot was taken after the cutoff, leaves
+/// the newer writes parked for the next pass (§AJ.7).
+pub fn flushParkedBlockBy(table: *Table, deps: UploadDeps, io: Io, ino: u64, block: u32, cutoff_ns: u64) Disposition {
     const bs: u64 = table.block_size;
     {
         const g = deps.locks.acquire(io, ino, block, .writeback_flush);
@@ -1312,7 +1374,7 @@ pub fn flushParkedBlock(table: *Table, deps: UploadDeps, io: Io, ino: u64, block
                 const img = table.gpa.alignedAlloc(u8, .fromByteUnits(PAGE), @intCast(bs)) catch return .stay_parked;
                 defer table.gpa.free(img);
                 readImage(deps, old, img) catch return .stay_parked;
-                table.fillComplementFrom(e, img) catch return .stay_parked;
+                table.fillComplementFrom(e, img, old) catch return .stay_parked;
             } else {
                 // Fresh, or deferred without a binding (the existing bytes
                 // were below EOF in a hole): the complement is zeros.
@@ -1321,16 +1383,20 @@ pub fn flushParkedBlock(table: *Table, deps: UploadDeps, io: Io, ino: u64, block
             }
             stats.durable_upload_bytes_escalation.add(bs);
         }
+        if (drainDirtyInPlaceLocked(table, deps, e)) |d| {
+            if (d == .published) table.capacity.notifyWaiters(io);
+            return d;
+        }
     }
     // The guard is dropped: the upload takes its own.
-    return uploadWith(table, deps, io, ino, block);
+    return uploadWith(table, deps, io, ino, block, cutoff_ns);
 }
 
-fn uploadWith(table: *Table, deps: UploadDeps, io: Io, ino: u64, block: u32) Disposition {
+fn uploadWith(table: *Table, deps: UploadDeps, io: Io, ino: u64, block: u32, cutoff_ns: u64) Disposition {
     var prof = pipeline.Prof.start();
-    const d = uploadParkedBlock(table, deps, io, ino, block, &prof);
+    const d = uploadParkedBlock(table, deps, io, ino, block, cutoff_ns, &prof);
     prof.finish();
-    pipeline.countDisposition(d, table.block_size);
+    pipeline.countDisposition(d);
     return d;
 }
 
@@ -1377,6 +1443,7 @@ pub fn escalateExtentLocked(table: *Table, deps: UploadDeps, e: *Entry) error{ P
         readImage(deps, old, img) catch return error.InputOutput;
         extent.stats.fold_seed_reads.inc();
         table.escalate(e, img) orelse return error.PoolExhausted;
+        e.clean_base = old;
     } else {
         table.escalate(e, null) orelse return error.PoolExhausted;
     }
@@ -1561,6 +1628,75 @@ fn drainInPlaceLocked(table: *Table, deps: UploadDeps, e: *Entry) ?Disposition {
     return .published;
 }
 
+/// Decision 0003 §AJ.7, under the caller's (3): a CONTENT-VALID full buffer
+/// whose clean pages are the bytes of `clean_base` (a seeded complement, an
+/// escalated overlay's base, a superseded upload's published snapshot) and
+/// whose block W1's state half passes for — `clean_base` still the mapping
+/// the authoritative map names — lands its DIRTY pages in place: ONE DMA
+/// per contiguous dirty run from the cell, then the W1 postlude; the entry
+/// retires. Device bytes per drain = `pages(dirty) × P`, never the block
+/// (the whole-block upload re-landed `B` per pass for a random rewriter's
+/// few hundred pages). The crash law is W1's at the page grain: a dirty
+/// run is one DMA from a cell no writer mutates under (3) and a write's
+/// pages are contiguous, so a cut between DMAs leaves each page — each
+/// FUSE write — old or new. Null = declined (`drain_inplace_declines`:
+/// no clean base, an upload in flight, a moved mapping, the §AK reasons).
+fn drainDirtyInPlaceLocked(table: *Table, deps: UploadDeps, e: *Entry) ?Disposition {
+    assert(e.repr == .full and e.content_valid);
+    const base = e.clean_base orelse return null;
+    if (e.upload_inflight) return null;
+    const probe = deps.custody orelse return null;
+    const pdeps: sole_owner_patch.Deps = .{ .device = deps.device, .map = deps.map, .vols = deps.vols, .purge = deps.purge, .custody = probe, .touched = if (deps.touched) |t| .{ .ctx = deps.touched_ctx, .stamp = t } else null };
+    const begun = switch (sole_owner_patch.beginInPlace(pdeps, e.key.ino, e.key.block, 0) catch {
+        stats.drain_inplace_declines.inc();
+        return null;
+    }) {
+        .begun => |b| b,
+        .declined => {
+            stats.drain_inplace_declines.inc();
+            return null;
+        },
+    };
+    // The clean pages are `base`'s bytes: only that mapping may take the
+    // dirty ones alone.
+    if (!begun.mapping.eql(base)) {
+        sole_owner_patch.abandonInPlace(pdeps, begun);
+        stats.drain_inplace_declines.inc();
+        return null;
+    }
+    const cell = e.repr.full;
+    const pages: usize = table.block_size / PAGE;
+    var written: u64 = 0;
+    var dma: seams.DmaError!void = {};
+    var p: usize = 0;
+    while (p < pages) {
+        if (!e.dirty.isSet(p)) {
+            p += 1;
+            continue;
+        }
+        var q = p + 1;
+        while (q < pages and e.dirty.isSet(q)) q += 1;
+        const s: u32 = @intCast(p * PAGE);
+        const t: u32 = @intCast(q * PAGE);
+        dma = if (deps.device.write(begun.vol_tag, begun.dest + s, cell.data[s..t])) |_| {} else |err| err;
+        if (dma) |_| {
+            written += t - s;
+            stats.drain_inplace_dmas.inc();
+        } else |_| break;
+        p = q;
+    }
+    stats.drain_inplace_write_bytes.add(written);
+    sole_owner_patch.finishInPlace(pdeps, begun, dma, "in-place dirty drain") catch {
+        stats.drain_inplace_dma_errors.inc();
+        return .stay_parked;
+    };
+    stats.drain_inplace_drains.inc();
+    stats.drain_inplace_dirty_drains.inc();
+    stats.drain_inplace_pages.add(written / PAGE);
+    table.retire(e);
+    return .published;
+}
+
 // ---------------------------------------------------------------------------
 // Tests.
 // ---------------------------------------------------------------------------
@@ -1688,7 +1824,7 @@ test "the deferred seed: an overwrite's partial coverage parks with the seed pos
     const f = t.checkout(2, 1, true, old).?;
     _ = try t.recordWrite(f, 0, &half);
     var image: [wt.BS]u8 = @splat(0xAA);
-    try t.fillComplementFrom(f, &image);
+    try t.fillComplementFrom(f, &image, old);
     try testing.expect(f.content_valid);
     try testing.expect(std.mem.allEqual(u8, f.repr.full.data[0 .. wt.BS / 2], 0x11));
     try testing.expect(std.mem.allEqual(u8, f.repr.full.data[wt.BS / 2 ..], 0xAA));
@@ -1780,7 +1916,7 @@ test "write-through of a completed fresh block: 1 copy + 1 DMA, allocate unstabl
     try testing.expect(v.completed);
     const copies0 = stats.nt_copy_bytes.load();
     var prof = pipeline.Prof.start();
-    const d = uploadParkedBlock(&w.table, w.deps(), io, 5, 1, &prof);
+    const d = uploadParkedBlock(&w.table, w.deps(), io, 5, 1, std.math.maxInt(u64), &prof);
     prof.finish();
     try testing.expectEqual(Disposition.published, d);
     try testing.expectEqual(copies0, stats.nt_copy_bytes.load()); // the upload copies nothing more
@@ -1801,7 +1937,7 @@ test "write-through of a completed fresh block: 1 copy + 1 DMA, allocate unstabl
     try testing.expectEqual(prof.last - prof.t0, sum);
 }
 
-test "a superseded upload publishes its snapshot, newest bytes win (decision 0003 §AJ.7): a write landing between the snapshot and the revalidation supersedes the upload — the snapshot's DMA publishes (no mint abandoned), the entry stays parked over it, and the re-drive an unbounded flush owes publishes the newest bytes" {
+test "a superseded upload publishes its snapshot, newest bytes win (decision 0003 §AJ.7): a write landing between the snapshot and the revalidation supersedes the upload — the snapshot's DMA publishes (no mint abandoned, `write_pipeline_superseded_publishes`), the entry stays parked over it, and the re-drive an unbounded flush owes publishes the newest bytes" {
     const io = testing.io;
     const w = try UploadWorld.init(testing.allocator);
     defer w.deinit(testing.allocator);
@@ -1824,7 +1960,7 @@ test "a superseded upload publishes its snapshot, newest bytes win (decision 000
     Racer.newest = &second;
     var dummy: u8 = 0;
     w.f.dev.hook = .{ .ctx = &dummy, .call = &Racer.hook };
-    const sup0 = pipeline.stats.write_pipeline_supersessions.load();
+    const sp0 = pipeline.stats.write_pipeline_superseded_publishes.load();
     const used0 = w.f.alloc_a.usedBlocks();
     const abandons0 = block_alloc.stats.unpublished_mint_abandons.load();
     var prof = pipeline.Prof.start();
@@ -1838,11 +1974,11 @@ test "a superseded upload publishes its snapshot, newest bytes win (decision 000
         }
     };
     w.f.dev.hook = .{ .ctx = &dummy, .call = &Once.hook };
-    const d = uploadParkedBlock(&w.table, w.deps(), io, 6, 0, &prof);
+    const d = uploadParkedBlock(&w.table, w.deps(), io, 6, 0, std.math.maxInt(u64), &prof);
     prof.finish();
     try testing.expectEqual(Disposition.published, d);
     try testing.expectEqual(abandons0, block_alloc.stats.unpublished_mint_abandons.load()); // no DMA thrown away
-    try testing.expectEqual(sup0, pipeline.stats.write_pipeline_supersessions.load());
+    try testing.expectEqual(sp0 + 1, pipeline.stats.write_pipeline_superseded_publishes.load());
     try testing.expectEqual(@as(usize, 2), w.f.map.merges.items.len); // the snapshot, then the newest
     try testing.expectEqual(used0 + 1, w.f.alloc_a.usedBlocks()); // the snapshot's block displaced and freed; one block owned
     try testing.expect(!w.table.has(6, 0));
@@ -1853,7 +1989,7 @@ test "a superseded upload publishes its snapshot, newest bytes win (decision 000
     w.f.dev.hook = null;
 }
 
-test "the device-write ledger closes on a superseded upload (decision 0003 §AK.6): `write_through_bytes + write_pipeline_superseded_bytes` ≡ the bytes the DMAs landed — a transformed image shorter than the block counts its stored length on both arms, the abandoned DMA's included (the perf container's aes-256-gcm close rows read 1.3–8.7 MB of diskstats no arm named: one block per supersession counted, an image landed)" {
+test "the device-write ledger closes on a superseded upload (decision 0003 §AK.6, §AJ.7): `write_through_bytes` ≡ the bytes the DMAs landed — a transformed image shorter than the block counts its stored length, the superseded snapshot's publish included (no DMA is abandoned) (the perf container's aes-256-gcm close rows read 1.3–8.7 MB of diskstats no arm named: one block per supersession counted, an image landed)" {
     const io = testing.io;
     const w = try UploadWorld.init(testing.allocator);
     defer w.deinit(testing.allocator);
@@ -1877,7 +2013,7 @@ test "the device-write ledger closes on a superseded upload (decision 0003 §AK.
     var deps = w.deps();
     deps.transform = .{ .ctx = null, .process_write = &PageSeam.processWrite, .scratch_len = &PageSeam.scratchLen };
     deps.scratch = &pool;
-    // A sibling write lands during the first upload's DMA: superseded, re-driven.
+    // A sibling write lands during the first upload's DMA: superseded, published, re-driven.
     const Racer = struct {
         var tbl: *Table = undefined;
         var newest: []const u8 = undefined;
@@ -1895,16 +2031,15 @@ test "the device-write ledger closes on a superseded upload (decision 0003 §AK.
     w.f.dev.hook = .{ .ctx = &dummy, .call = &Racer.hook };
     defer w.f.dev.hook = null;
     w.f.dev.resetLedger();
-    const sup0 = pipeline.stats.write_pipeline_supersessions.load();
+    const sp0 = pipeline.stats.write_pipeline_superseded_publishes.load();
     const wt0 = stats.write_through_bytes.load();
-    const sb0 = pipeline.stats.write_pipeline_superseded_bytes.load();
     var prof = pipeline.Prof.start();
-    try testing.expectEqual(Disposition.published, uploadParkedBlock(&w.table, deps, io, 7, 0, &prof));
+    try testing.expectEqual(Disposition.published, uploadParkedBlock(&w.table, deps, io, 7, 0, std.math.maxInt(u64), &prof));
     prof.finish();
-    try testing.expectEqual(sup0 + 1, pipeline.stats.write_pipeline_supersessions.load());
+    try testing.expectEqual(sp0 + 1, pipeline.stats.write_pipeline_superseded_publishes.load());
     try testing.expectEqual(@as(u64, 2 * PAGE), w.f.dev.writeBytesTotal());
-    try testing.expectEqual(@as(u64, PAGE), stats.write_through_bytes.load() - wt0);
-    try testing.expectEqual(@as(u64, PAGE), pipeline.stats.write_pipeline_superseded_bytes.load() - sb0);
+    try testing.expectEqual(@as(u64, 2 * PAGE), stats.write_through_bytes.load() - wt0);
+    try testing.expect(!w.table.has(7, 0));
 }
 
 test "a transformed tail's upload transforms its LIVE bytes only (decision 0003 §AK.4): a 100 B tail in a block lands ONE grain (the XOR transform's image is its plaintext's length), never the block nor its whole first frame — the bytes past it read back as zeros past the image's plaintext" {
@@ -1925,7 +2060,7 @@ test "a transformed tail's upload transforms its LIVE bytes only (decision 0003 
     w.f.dev.resetLedger();
     const wt0 = stats.write_through_bytes.load();
     var prof = pipeline.Prof.start();
-    try testing.expectEqual(Disposition.published, uploadParkedBlock(&w.table, deps, io, 8, 0, &prof));
+    try testing.expectEqual(Disposition.published, uploadParkedBlock(&w.table, deps, io, 8, 0, std.math.maxInt(u64), &prof));
     prof.finish();
     // The image is the live bytes; the DMA pads it to the grain.
     try testing.expectEqual(@as(u64, tail.len), w.f.dev.writeBytesTotal());
@@ -1944,7 +2079,7 @@ test "the overwrite write-through FEEDS the rewrite epoch (no per-block merge); 
     const e = w.table.checkout(7, 0, true, a).?;
     var data: [wt.BS]u8 = @splat(0x33);
     _ = try w.table.recordWrite(e, 0, &data);
-    const d = uploadWith(&w.table, w.deps(), io, 7, 0);
+    const d = uploadWith(&w.table, w.deps(), io, 7, 0, std.math.maxInt(u64));
     try testing.expectEqual(Disposition.published, d);
     // Fed + full coverage (size BS, one block) ⇒ the close ran: ONE save, A freed.
     try testing.expectEqual(@as(usize, 1), w.f.map.merges.items.len);
@@ -1961,7 +2096,7 @@ test "the overwrite write-through FEEDS the rewrite epoch (no per-block merge); 
     const e2 = w.table.checkout(8, 1, true, a3).?;
     _ = try w.table.recordWrite(e2, 0, &data);
     const fb0 = epoch_mod.stats.rewrite_shadow_fallbacks.load();
-    try testing.expectEqual(Disposition.published, uploadWith(&w.table, w.deps(), io, 8, 1));
+    try testing.expectEqual(Disposition.published, uploadWith(&w.table, w.deps(), io, 8, 1, std.math.maxInt(u64)));
     try testing.expectEqual(fb0 + 1, epoch_mod.stats.rewrite_shadow_fallbacks.load());
     try testing.expect(w.f.map.seam().lookup(8, 1).?.eql(a3)); // fed, not yet saved (half the file shadowed)
     try testing.expect(w.epochs.bindsBlock(8, 1));
@@ -1975,7 +2110,7 @@ test "the overwrite write-through FEEDS the rewrite epoch (no per-block merge); 
     const used = w.f.alloc_a.usedBlocks();
     pipeline.stats.write_pipeline_fence_drops.resetLogBudgetForTest();
     log.testing.expectErrorLogs(1);
-    try testing.expectEqual(Disposition.fence_drop, uploadWith(&w.table, w.deps(), io, 9, 0));
+    try testing.expectEqual(Disposition.fence_drop, uploadWith(&w.table, w.deps(), io, 9, 0, std.math.maxInt(u64)));
     try log.testing.expectAllFired();
     try testing.expectEqual(used + 1, w.f.alloc_a.usedBlocks()); // W5: the mint is NOT freed — successor recovery owns the accounting
     try testing.expect(w.table.has(9, 0)); // the entry stays (publish nothing, free nothing)
@@ -2035,7 +2170,7 @@ test "two flushes of one parked block (a RELEASE racing an fsync): the second JO
     w.f.dev.hook = .{ .ctx = &dummy, .call = &Gate.hook };
     const Uploader = struct {
         fn run(io_: Io, table: *Table, deps: UploadDeps, out: *Disposition) void {
-            out.* = uploadWith(table, deps, io_, 12, 0);
+            out.* = uploadWith(table, deps, io_, 12, 0, std.math.maxInt(u64));
         }
     };
     const used0 = w.f.alloc_a.usedBlocks();
@@ -2144,7 +2279,7 @@ test "the transform scratch is held through the DMA (decision 0003 §K10): two u
     const Uploader = struct {
         fn run(io_: Io, table: *Table, d: UploadDeps, block: u32, out: *Disposition) void {
             var prof = pipeline.Prof.start();
-            out.* = uploadParkedBlock(table, d, io_, 21, block, &prof);
+            out.* = uploadParkedBlock(table, d, io_, 21, block, std.math.maxInt(u64), &prof);
         }
     };
     var first: Disposition = .stay_parked;

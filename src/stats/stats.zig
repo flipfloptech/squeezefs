@@ -819,7 +819,7 @@ pub fn closure() Closure {
         .terminal_frees = reclaim.stats.terminal_frees.load(),
         .reclaim_queued_plus_elided = reclaim.stats.block_free_reclaim_queued.load() + reclaim.stats.block_free_reclaim_elided.load(),
         .mint_abandons = block_alloc.stats.unpublished_mint_abandons.load(),
-        .mint_abandons_bound = write_pipeline.stats.write_pipeline_supersessions.load() + write_pipeline.stats.write_pipeline_discards.load(),
+        .mint_abandons_bound = write_pipeline.stats.write_pipeline_discards.load(),
         .parked_commits = slot.parked_commits.load(),
         .unparked_commits = slot.unparked_commits.load(),
     };

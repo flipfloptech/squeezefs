@@ -1109,7 +1109,7 @@ pub const WritePath = struct {
                 const img = self.gpa.alignedAlloc(u8, .fromByteUnits(PAGE), @intCast(self.cfg.block_size)) catch return error.OutOfMemory;
                 defer self.gpa.free(img);
                 imageRead(self, old, img) catch return error.InputOutput;
-                self.table.fillComplementFrom(e, img) catch |e2| switch (e2) {
+                self.table.fillComplementFrom(e, img, old) catch |e2| switch (e2) {
                     error.PoolExhausted => return error.PoolExhausted,
                     error.NeedsSeed => unreachable, // the fill IS the seed
                 };
@@ -1192,7 +1192,7 @@ pub const WritePath = struct {
                         room.cancel(io);
                         return error.WriterGuardFenced;
                     },
-                    .stay_parked, .superseded => {
+                    .stay_parked => {
                         const now = clock.monotonicNs();
                         if (gate.failed_since_ns == 0) gate.failed_since_ns = now;
                         if (now - gate.failed_since_ns >= PARKED_GATE_WALL_NS) {
@@ -1237,13 +1237,15 @@ pub const WritePath = struct {
 
     fn runUpload(self: *WritePath, io: Io, ino: u64, block: u32, permit: ?pipeline.Permit, prof: *pipeline.Prof) void {
         prof.mark(.detach_lag);
-        const d = accumulate.uploadParkedBlock(&self.table, self.uploadDeps(), io, ino, block, prof);
+        // The write-through trigger owes nothing: a superseded snapshot
+        // publishes and the newer writes wait for their own drain.
+        const d = accumulate.uploadParkedBlock(&self.table, self.uploadDeps(), io, ino, block, 0, prof);
         if (permit) |p| {
             const ord: u32 = if (self.map.lookup(ino, block)) |b| (if (self.vols.byTag(b.vol_tag)) |v| v.ordinal else 0) else 0;
             self.governor.complete(io, p, ord, clock.monotonicNs() -| p.admitted_ns);
         }
         prof.finish();
-        pipeline.countDisposition(d, self.cfg.block_size);
+        pipeline.countDisposition(d);
     }
 
     /// Wait for every detached upload/drain (tests, teardown).
@@ -1324,9 +1326,9 @@ pub const WritePath = struct {
         var births: [64]accumulate.Table.BlockBirth = undefined;
         for (self.table.birthsOf(ino, &births)) |b| {
             if (b.born_ns > cutoff_ns) continue;
-            switch (accumulate.flushParkedBlock(&self.table, self.uploadDeps(), io, ino, b.block)) {
+            switch (accumulate.flushParkedBlockBy(&self.table, self.uploadDeps(), io, ino, b.block, cutoff_ns)) {
                 .published, .joined => landed = true,
-                .superseded, .stay_parked, .fence_drop, .discarded => {},
+                .stay_parked, .fence_drop, .discarded => {},
             }
         }
         _ = self.epochs.close(io, ino, self.closeSeams());
@@ -1973,7 +1975,7 @@ fn parkSeededRewrites(w: *WritePath, io: Io, ino: u64) !u64 {
         user += piece.len;
     }
     const e = w.table.get(ino, 0).?;
-    try testing.expect(e.content_valid);
+    try testing.expect(e.content_valid and e.clean_base != null);
     return user;
 }
 
@@ -1999,6 +2001,7 @@ test "random 4 KiB rewrites under the write-back timer (decision 0003 §AJ.7): a
     const used = w.f.alloc_a.usedBlocks();
     const merges = w.f.map.merges.items.len;
     const wt0 = accumulate.stats.write_through_bytes.load();
+    const dd0 = accumulate.stats.drain_inplace_dirty_drains.load();
     const shadow0 = epoch_mod.stats.rewrite_shadow_bytes.load();
     const drained = w.wp.drainAged(io, 47, clock.monotonicNs());
     try testing.expect(drained.landed and drained.kept_born_ns == null);
@@ -2006,6 +2009,7 @@ test "random 4 KiB rewrites under the write-back timer (decision 0003 §AJ.7): a
     // The dirty pages: 1, 3, 8, 11, 14 — five DMAs of a page each.
     try testing.expectEqual(@as(u64, 5 * PAGE), w.f.dev.writeBytesTotal());
     try testing.expect(w.f.dev.writeBytesTotal() <= writes * PAGE);
+    try testing.expectEqual(dd0 + 1, accumulate.stats.drain_inplace_dirty_drains.load());
     try testing.expectEqual(wt0, accumulate.stats.write_through_bytes.load());
     try testing.expectEqual(shadow0, epoch_mod.stats.rewrite_shadow_bytes.load());
     try testing.expectEqual(used, w.f.alloc_a.usedBlocks());
@@ -2019,6 +2023,138 @@ test "random 4 KiB rewrites under the write-back timer (decision 0003 §AJ.7): a
     const o = try w.wp.write(io, .{ .ino = 47, .offset = 6 * PAGE, .payload = .{ .bytes = &page }, .class = .shared, .file = file });
     try testing.expectEqual(@as(u32, 1), o.count(.patch));
     try testing.expectEqual(@as(u64, 6 * PAGE), w.f.dev.writeBytesTotal());
+}
+
+test "a superseded upload's snapshot publishes and its successor drains only what changed after it (decision 0003 §AJ.7): a write landing during the upload's DMA supersedes it; under the timer's cutoff the snapshot publishes (`write_pipeline_superseded_publishes`, no mint abandoned) and the entry stays parked with the newer page dirty over the published key — reads keep the entry (never the older image); once the epoch saves, the next pass lands that ONE page in place over the published key" {
+    const io = testing.io;
+    const w = try World.init(testing.allocator, .sync_inline, false);
+    defer w.deinit(testing.allocator);
+    _ = try w.f.publishBlock(48, 0, 0xAA);
+    _ = try parkSeededRewrites(w.wp, io, 48);
+    // The racing writer: page 9 lands during the upload's DMA.
+    const Racer = struct {
+        var wp: *WritePath = undefined;
+        var fired: bool = false;
+        fn hook(_: *anyopaque, _: *wt.FakeDevice, _: u64, _: u64, _: u64) void {
+            if (fired) return;
+            fired = true;
+            var newer: [PAGE]u8 = undefined;
+            fill(&newer, 0x5A);
+            const o = wp.write(testing.io, .{ .ino = 48, .offset = 9 * PAGE, .payload = .{ .bytes = &newer }, .class = .shared, .file = World.striped(wt.BS) }) catch unreachable;
+            assert(o.count(.accumulate_park) == 1);
+        }
+    };
+    Racer.wp = w.wp;
+    Racer.fired = false;
+    var dummy: u8 = 0;
+    w.f.dev.hook = .{ .ctx = &dummy, .call = &Racer.hook };
+    defer w.f.dev.hook = null;
+    const sp0 = pipeline.stats.write_pipeline_superseded_publishes.load();
+    const abandons0 = block_alloc.stats.unpublished_mint_abandons.load();
+    var prof = pipeline.Prof.start();
+    try testing.expectEqual(accumulate.Disposition.published, accumulate.uploadParkedBlock(&w.wp.table, w.wp.uploadDeps(), io, 48, 0, 0, &prof));
+    prof.finish();
+    w.f.dev.hook = null;
+    try testing.expect(Racer.fired);
+    try testing.expectEqual(sp0 + 1, pipeline.stats.write_pipeline_superseded_publishes.load());
+    try testing.expectEqual(abandons0, block_alloc.stats.unpublished_mint_abandons.load());
+    // Kept: page 9 dirty alone, over the snapshot's key.
+    const e = w.wp.table.get(48, 0).?;
+    const snap_key = e.clean_base.?;
+    try testing.expectEqual(@as(usize, 1), e.dirty.count());
+    try testing.expect(e.dirty.isSet(9));
+    var newest: [wt.BS]u8 = undefined;
+    @memcpy(&newest, e.repr.full.data[0..wt.BS]);
+    var page9: [PAGE]u8 = undefined;
+    fill(&page9, 0x5A);
+    try testing.expectEqualSlices(u8, &page9, newest[9 * PAGE ..][0..PAGE]);
+    // The published snapshot is older; the read seam serves the entry.
+    var img: [wt.BS]u8 = undefined;
+    w.f.dev.peek(snap_key.vol_tag, snap_key.offset, &img);
+    try testing.expect(std.mem.allEqual(u8, img[9 * PAGE ..][0..PAGE], 0xAA));
+    var out: [PAGE]u8 = undefined;
+    try testing.expect(w.wp.writeSideView().serve(io, .{ .ino = 48, .block = 0, .rel = 9 * PAGE, .out = &out }) == .served);
+    try testing.expectEqualSlices(u8, &page9, &out);
+    // A pass with nothing aged closes the epoch (map → the snapshot's key).
+    _ = w.wp.drainAged(io, 48, 0);
+    try testing.expect(w.f.map.seam().lookup(48, 0).?.eql(snap_key));
+    try testing.expect(w.wp.table.has(48, 0));
+    // The successor: one page, in place.
+    w.f.dev.resetLedger();
+    const drained = w.wp.drainAged(io, 48, clock.monotonicNs());
+    try testing.expect(drained.landed and drained.kept_born_ns == null);
+    try testing.expect(!w.wp.table.has(48, 0));
+    try testing.expectEqual(@as(u64, PAGE), w.f.dev.writeBytesTotal());
+    try testing.expect(w.f.map.seam().lookup(48, 0).?.eql(snap_key));
+    w.f.dev.peek(snap_key.vol_tag, snap_key.offset, &img);
+    try testing.expectEqualSlices(u8, &newest, &img);
+}
+
+test "the in-place dirty drain's crash law (the kill rows, decision 0003 §AJ.7): a drain cut after any of its DMAs leaves every acked write whole or absent — each dirty run one DMA from the cell — and every clean page old; a DMA torn at any page leaves each page old or new, never a torn page; the entry stays parked and the next drain lands every byte (never lossy)" {
+    const io = testing.io;
+    const w = try World.init(testing.allocator, .sync_inline, false);
+    defer w.deinit(testing.allocator);
+    const a = try w.f.publishBlock(49, 0, 0xAA);
+    const file = World.striped(wt.BS);
+    // Dirty runs: page 1, page 3 (the seeded pieces), pages 11–12 (one 8 KiB write) — three DMAs.
+    const Cut = struct {
+        var dev: *wt.FakeDevice = undefined;
+        var after: usize = 0;
+        var torn: usize = 0;
+        var seen: usize = 0;
+        fn hook(_: *anyopaque, d: *wt.FakeDevice, _: u64, _: u64, _: u64) void {
+            seen += 1;
+            if (seen == after) {
+                d.fail_next = error.InputOutput;
+                d.torn_grains = torn;
+            }
+        }
+    };
+    var before: [wt.BS]u8 = undefined;
+    var pair: [2 * PAGE]u8 = undefined;
+    var round: u8 = 0;
+    const cuts = [_][2]usize{ .{ 0, 0 }, .{ 1, 0 }, .{ 2, 0 }, .{ 2, 1 } };
+    for (cuts) |cut| {
+        round += 1;
+        w.f.dev.peek(a.vol_tag, a.offset, &before);
+        _ = try parkSeededRewrites(w.wp, io, 49);
+        fill(&pair, 0xC0 +% round);
+        _ = try w.wp.write(io, .{ .ino = 49, .offset = 11 * PAGE, .payload = .{ .bytes = &pair }, .class = .shared, .file = file });
+        var after: [wt.BS]u8 = undefined;
+        @memcpy(&after, w.wp.table.get(49, 0).?.repr.full.data[0..wt.BS]);
+        log.testing.expectErrorLogs(1);
+        Cut.dev = &w.f.dev;
+        Cut.after = cut[0];
+        Cut.torn = cut[1];
+        Cut.seen = 0;
+        var dummy: u8 = 0;
+        if (cut[0] == 0) {
+            w.f.dev.fail_next = error.InputOutput;
+        } else w.f.dev.hook = .{ .ctx = &dummy, .call = &Cut.hook };
+        _ = w.wp.drainAged(io, 49, clock.monotonicNs());
+        w.f.dev.hook = null;
+        try log.testing.expectAllFired();
+        try testing.expect(w.wp.table.has(49, 0)); // never lossy: still parked
+        var crash: [wt.BS]u8 = undefined;
+        w.f.dev.peek(a.vol_tag, a.offset, &crash);
+        var p: usize = 0;
+        while (p < wt.BS / PAGE) : (p += 1) {
+            const c = crash[p * PAGE ..][0..PAGE];
+            const old = std.mem.eql(u8, c, before[p * PAGE ..][0..PAGE]);
+            const new = std.mem.eql(u8, c, after[p * PAGE ..][0..PAGE]);
+            try testing.expect(old or new); // never a torn page
+        }
+        // The 8 KiB write is whole or absent unless its own DMA was torn.
+        const w_old = std.mem.eql(u8, crash[11 * PAGE ..][0 .. 2 * PAGE], before[11 * PAGE ..][0 .. 2 * PAGE]);
+        const w_new = std.mem.eql(u8, crash[11 * PAGE ..][0 .. 2 * PAGE], &pair);
+        if (cut[1] == 0) try testing.expect(w_old or w_new);
+        // The next drain lands every byte.
+        _ = w.wp.drainAged(io, 49, clock.monotonicNs());
+        try testing.expect(!w.wp.table.has(49, 0));
+        w.f.dev.peek(a.vol_tag, a.offset, &crash);
+        try testing.expectEqualSlices(u8, &after, &crash);
+        try testing.expect(w.f.map.seam().lookup(49, 0).?.eql(a));
+    }
 }
 
 test "the D3 fold seam (defrag --fold): `foldTargets` names the inos holding parked W2 extents (ascending, deduped — a full-buffer park is not a target), `foldParked` kicks each through the EXISTING fold — sole-owner passthrough blocks land in place at the page grain and retire, device ÷ user ≤ the §J in-place bound, the bindings unchanged, bytes exact; nothing left parked as an extent; a second census is empty" {
@@ -2084,7 +2220,7 @@ test "the D3 fold seam (defrag --fold): `foldTargets` names the inos holding par
     w.wp.flushIno(io, 50);
 }
 
-test "W2 amplification law, CoW bases land whole ONCE per parked episode: a cloned (pinned) block declines the in-place arm, escalates seeded (one whole read) and PARKS — later small writes are memcpys and the release uploads one block to a fresh destination; a transformed volume's block takes the seeded checkout (one decode) and likewise lands once" {
+test "W2 amplification law, CoW bases land ONCE per parked episode: a cloned (pinned) block declines the in-place arm, escalates seeded (one whole read) and PARKS — later small writes are memcpys and the release lands once: its dirty pages in place over the seeded base once the clone is gone (§AJ.7); a transformed volume's block takes the seeded checkout (one decode) and lands once, whole" {
     const io = testing.io;
     const w = try World.init(testing.allocator, .sync_inline, false);
     defer w.deinit(testing.allocator);
@@ -2108,8 +2244,8 @@ test "W2 amplification law, CoW bases land whole ONCE per parked episode: a clon
     try testing.expectEqual(@as(u64, 0), w.f.dev.writeBytesTotal()); // parked, nothing landed
     const e = w.wp.table.get(42, 0).?;
     try testing.expect(e.repr == .full and e.content_valid);
-    // The clone goes away; the parked full buffer still lands CoW (its
-    // flush is an upload, never a patch).
+    // The clone goes away: the block is the file's alone again, so the
+    // parked buffer's ONE landing is its dirty pages over the seeded base.
     w.f.alloc_a.unpin(idx);
     // Eight more small writes: memcpys into the parked buffer.
     const reads_before = w.f.dev.read_bytes;
@@ -2121,9 +2257,10 @@ test "W2 amplification law, CoW bases land whole ONCE per parked episode: a clon
     try testing.expectEqual(reads_before, w.f.dev.read_bytes);
     try testing.expectEqual(@as(u64, 0), w.f.dev.writeBytesTotal());
     w.wp.flushIno(io, 42);
-    try testing.expectEqual(@as(u64, wt.BS), w.f.dev.writeBytesTotal()); // ONE landing
+    // ONE landing: the dirty pages 0–7 and 9, in place.
+    try testing.expectEqual(@as(u64, 9 * PAGE), w.f.dev.writeBytesTotal());
     const b = w.f.map.seam().lookup(42, 0).?;
-    try testing.expect(!b.eql(a)); // CoW: a fresh destination
+    try testing.expect(b.eql(a));
     var got: [wt.BS]u8 = undefined;
     w.f.dev.peek(b.vol_tag, b.offset, &got);
     fill(&sector, 0x40);
@@ -2334,7 +2471,7 @@ test "the lost overwrite (2026-10-07, the smoke's dd-per-overwrite shape): a wri
     try testing.expectEqual(@as(u64, 2), w.f.alloc_a.usedBlocks() + w.f.alloc_b.usedBlocks()); // the file's two blocks, nothing leaked
 }
 
-test "the save window: while an epoch's ONE save is in flight the block stays bound — a racing W1 patch declines (it would land in the key the save displaces), the overlay declines, the park bases on B; the save displaces only what it parked" {
+test "the save window: while an epoch's ONE save is in flight the block stays bound — a racing W1 patch declines (it would land in the key the save displaces), the overlay declines, the park bases on B; the save displaces only what it parked; B, the file's alone once saved, takes the parked pages in place (§AJ.7)" {
     const io = testing.io;
     const w = try World.init(testing.allocator, .sync_inline, true);
     defer w.deinit(testing.allocator);
@@ -2378,9 +2515,9 @@ test "the save window: while an epoch's ONE save is in flight the block stays bo
     try testing.expect(std.mem.allEqual(u8, got[0 .. wt.BS / 2], 0x33));
     try testing.expect(std.mem.allEqual(u8, got[8 * PAGE .. 9 * PAGE], 0x22));
     try testing.expect(std.mem.allEqual(u8, got[9 * PAGE ..], 0xBB));
-    try testing.expectEqual(@as(usize, 2), w.f.frees.freed.items.len);
+    try testing.expect(final.eql(b));
+    try testing.expectEqual(@as(usize, 1), w.f.frees.freed.items.len);
     try testing.expect(w.f.frees.freed.items[0].eql(a1));
-    try testing.expect(w.f.frees.freed.items[1].eql(b));
     try testing.expectEqual(drift0, counters.tripwireCount("rewrite_shadow_displaced_drift"));
     try testing.expectEqual(untracked0, counters.tripwireCount("block_untracked_free_refusals"));
     try testing.expectEqual(@as(u64, 2), w.f.alloc_a.usedBlocks() + w.f.alloc_b.usedBlocks());

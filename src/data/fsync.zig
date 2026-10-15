@@ -494,7 +494,7 @@ fn flushParkedKeys(ctx: Ctx, io: Io, keys: []const accumulate.Key) Error!void {
     for (keys) |k| {
         switch (accumulate.flushParkedBlock(ctx.table, ctx.upload, io, k.ino, k.block)) {
             .published => stats.syncfs_parked_blocks.inc(),
-            .discarded, .superseded, .joined => {},
+            .discarded, .joined => {},
             .fence_drop => return error.WriterGuardFenced,
             .stay_parked => parked_after += 1,
         }
@@ -509,7 +509,7 @@ fn flushParkedKeys(ctx: Ctx, io: Io, keys: []const accumulate.Key) Error!void {
     for (keys) |k| {
         switch (accumulate.flushParkedBlock(ctx.table, ctx.upload, io, k.ino, k.block)) {
             .published => stats.syncfs_parked_blocks.inc(),
-            .discarded, .superseded, .joined => {},
+            .discarded, .joined => {},
             .fence_drop => return error.WriterGuardFenced,
             .stay_parked => return error.NoSpaceLeft,
         }

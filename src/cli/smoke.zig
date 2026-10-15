@@ -6332,12 +6332,13 @@ fn expectLedgersClosed(tail: []const u8) !void {
     const copies = (numberAfter(tail, "\"read_copy_dest_bytes\":") orelse 0) + (numberAfter(tail, "\"read_copy_bounce_bytes\":") orelse 0) + (numberAfter(tail, "\"read_dest_dma_bytes\":") orelse 0) + (numberAfter(tail, "\"read_zc_serve_bytes\":") orelse 0) + (numberAfter(tail, "\"read_zc_pool_serve_bytes\":") orelse 0);
     if (user != copies) std.debug.print("\n--- read copy ledger {d} ≠ read user bytes {d} ---\n", .{ copies, user });
     try testing.expectEqual(user, copies);
-    // Every abandoned mint is a superseded write-through or an orphan's
-    // discard on a healthy device (a failed DMA would be its own alert).
+    // Every abandoned mint is an orphan's discard on a healthy device (a
+    // superseded write-through publishes its snapshot, decision 0003 §AJ.7;
+    // a failed DMA would be its own alert).
     const abandons = numberAfter(tail, "\"unpublished_mint_abandons\":") orelse 0;
-    const legit = (numberAfter(tail, "\"write_pipeline_supersessions\":") orelse 0) + (numberAfter(tail, "\"write_pipeline_discards\":") orelse 0);
+    const legit = numberAfter(tail, "\"write_pipeline_discards\":") orelse 0;
     // (a flush that finds its entry already gone discards BEFORE minting.)
-    if (abandons > legit) std.debug.print("\n--- mint abandons {d} > supersessions + discards {d} ---\n", .{ abandons, legit });
+    if (abandons > legit) std.debug.print("\n--- mint abandons {d} > discards {d} ---\n", .{ abandons, legit });
     try testing.expect(abandons <= legit);
     const queued = numberAfter(tail, "\"block_free_reclaim_queued\":") orelse 0;
     const elided = numberAfter(tail, "\"block_free_reclaim_elided\":") orelse 0;
@@ -6368,7 +6369,7 @@ fn printRates(label: []const u8, tail: []const u8) void {
     const own = numberAfter(tail, "\"own_block_dmas\":") orelse 0;
     const merges = numberAfter(tail, "\"layout_map_merges\":") orelse 0;
     const abandons = numberAfter(tail, "\"unpublished_mint_abandons\":") orelse 0;
-    const supersessions = numberAfter(tail, "\"write_pipeline_supersessions\":") orelse 0;
+    const supersessions = numberAfter(tail, "\"write_pipeline_superseded_publishes\":") orelse 0;
     const joins = numberAfter(tail, "\"write_pipeline_joins\":") orelse 0;
     const lock_ticks = numberAfter(tail, "\"lock_ticked_reregisters\":") orelse 0;
     const chan_ticks = numberAfter(tail, "\"channel_ticked_reregisters\":") orelse 0;
@@ -6385,7 +6386,7 @@ fn printRates(label: []const u8, tail: []const u8) void {
     std.debug.print("smoke[{s}]: write pipeline legs' slowest buckets: admit_wait {s}, detach_lag {s}, lock_wait {s}, dma {s}, publish {s}, total {s}\n", .{ label, histMaxBucket(wp_seg, "\"admit_wait\":"), histMaxBucket(wp_seg, "\"detach_lag\":"), histMaxBucket(wp_seg, "\"lock_wait\":"), histMaxBucket(wp_seg, "\"dma\":"), histMaxBucket(wp_seg, "\"publish\":"), histMaxBucket(wp_seg, "\"total\":") });
     std.debug.print("smoke[{s}]: device legs' slowest buckets: read fill queue {s} / service {s}, write queue {s} / service {s}; read serve total {s}; the longest fiber poll {s}\n", .{ label, histMaxBucket(dev_seg, "\"dev_queue\":"), histMaxBucket(dev_seg, "\"dev_service\":"), histMaxBucket(dev_write_seg, "\"dev_queue\":"), histMaxBucket(dev_write_seg, "\"dev_service\":"), histMaxBucket(tail, "\"read_serve_phase_ns\":{\"total\":"), histMaxBucket(exec_seg, "\"exec_poll_ns\":") });
     std.debug.print("smoke[{s}]: fsync legs' slowest buckets: data_flush {s}, data_barrier {s}, meta_barrier {s}; conveyor tx queue wait {s}, pass {s}, window {s}; the checkpoint's device barrier {s}; staging backing msync {s}, punch+madvise {s}\n", .{ label, histMaxBucket(tail, "\"data_flush\":"), histMaxBucket(tail, "\"data_barrier\":"), histMaxBucket(tail, "\"meta_barrier\":"), histMaxBucket(meta_seg, "\"meta_tx_queue_wait\":"), histMaxBucket(meta_seg, "\"meta_pass_total\":"), histMaxBucket(meta_seg, "\"meta_window_total\":"), histMaxBucket(meta_seg, "\"meta_barrier\":"), histMaxBucket(tail, "\"backing_sync\":"), histMaxBucket(tail, "\"backing_reclaim\":") });
-    std.debug.print("smoke[{s}]: {d} fuse ops, {d} ring requests, {d} enters ({d}.{d:0>2}/request), {d} bounce copies; READ user {d} B: dest memcpy {d} B, dest DMA {d} B, zc serve {d} B ({d} direct legs, {d} fd-source serves, {d} probe serves, {d} hot-tier hits); WRITE: {d} held stores / {d} hold admits / {d} W1 patches, NT copy {d} B of {d} B write-through, {d} own-block DMAs, {d} map merges, {d} mint abandons ({d} supersessions, {d} joins); ticked parks lock {d} / channel {d}; journal full stalls {d}, park-kicked checkpoint cycles {d} of {d}, conveyor tick rescues {d}\n", .{ label, ops, reqs, enters, enters / @max(reqs, 1), (enters * 100 / @max(reqs, 1)) % 100, copies, user_r, dest, dma, zc, legs, fd_src, probe_serves, hot_hits, held, admits, patches, nt, wt, own, merges, abandons, supersessions, joins, lock_ticks, chan_ticks, full_stalls, park_cycles, checkpoints, cv_ticks });
+    std.debug.print("smoke[{s}]: {d} fuse ops, {d} ring requests, {d} enters ({d}.{d:0>2}/request), {d} bounce copies; READ user {d} B: dest memcpy {d} B, dest DMA {d} B, zc serve {d} B ({d} direct legs, {d} fd-source serves, {d} probe serves, {d} hot-tier hits); WRITE: {d} held stores / {d} hold admits / {d} W1 patches, NT copy {d} B of {d} B write-through, {d} own-block DMAs, {d} map merges, {d} mint abandons ({d} superseded publishes, {d} joins); ticked parks lock {d} / channel {d}; journal full stalls {d}, park-kicked checkpoint cycles {d} of {d}, conveyor tick rescues {d}\n", .{ label, ops, reqs, enters, enters / @max(reqs, 1), (enters * 100 / @max(reqs, 1)) % 100, copies, user_r, dest, dma, zc, legs, fd_src, probe_serves, hot_hits, held, admits, patches, nt, wt, own, merges, abandons, supersessions, joins, lock_ticks, chan_ticks, full_stalls, park_cycles, checkpoints, cv_ticks });
 }
 
 /// Every op class's slowest latency bucket (`stats ops:`) is at or under

@@ -1402,7 +1402,7 @@ const RamVolume = struct {
         const runs = self.hold orelse return;
         self.gpa.free(runs);
         self.hold = null;
-        if (park) self.fifo.appendSlice(self.gpa, self.held.items) catch {};
+        if (park) self.fifo.appendSlice(self.gpa, self.held.items) catch @panic("RamVolume (a test double): out of memory");
         self.held.clearRetainingCapacity();
     }
     fn flushedRootFn(ctx: *anyopaque, slot: u16) Error!FlushedRoot {
@@ -1471,7 +1471,7 @@ const RamVolume = struct {
     }
     fn quarantineFn(ctx: *anyopaque, slot: u16, _: u64) void {
         const self = self_(ctx);
-        self.quarantined.append(self.gpa, slot) catch {};
+        self.quarantined.append(self.gpa, slot) catch @panic("RamVolume (a test double): out of memory");
     }
     fn notifyFn(ctx: *anyopaque) void {
         self_(ctx).handover_notifies += 1;

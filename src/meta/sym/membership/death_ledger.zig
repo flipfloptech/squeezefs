@@ -238,17 +238,19 @@ pub const Ledger = struct {
     /// `census` supplies the owner's view (null = this node owns no shard
     /// the member could be in: the word is unvalidated).
     pub fn screenDeath(self: *Ledger, req: verbs.RecordDeathReq, census: ?*const shard.Owner, now_ms: u64) screen.Verdict {
-        var held: std.ArrayList(u64) = .empty;
-        defer held.deinit(self.gpa);
+        // The one key the screen asks about, held or not: no allocation, so
+        // the screen never fails open.
+        const held = [1]u64{req.pr_key};
+        var n_held: usize = 0;
         var listed_live = false;
         var registered: ?u64 = null;
         if (census) |o| {
             const id = shard.writerMemberId(req.member);
             listed_live = o.memberIsLive(id, now_ms);
             registered = o.registeredKey(id);
-            o.heldKeys(self.gpa, &held) catch {};
+            if (o.holdsKey(req.pr_key)) n_held = 1;
         }
-        const b: screen.DeathBounds = .{ .own = self.own, .listed_live = listed_live, .registered_key = registered, .held_keys = held.items };
+        const b: screen.DeathBounds = .{ .own = self.own, .listed_live = listed_live, .registered_key = registered, .held_keys = held[0..n_held] };
         const v = screen.recordDeath(req, &b);
         if (v.isOk() and req.pr_key != 0 and registered == null) stats.dead_member_keys_unvalidated.inc();
         return v;

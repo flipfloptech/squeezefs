@@ -580,6 +580,9 @@ pub const Owner = struct {
         if (existing) |i| {
             self.members.items[i] = m;
         } else {
+            // Room for every member's departure: `rememberDepartedKey`
+            // never allocates.
+            self.departed_keys.ensureUnusedCapacity(self.gpa, self.members.items.len + 1) catch return .io;
             self.members.append(self.gpa, m) catch return .io;
         }
         self.writeRow(&m) catch return .io;
@@ -625,7 +628,7 @@ pub const Owner = struct {
 
     fn rememberDepartedKey(self: *Owner, key: u64, now_ms: u64) void {
         if (key == 0) return;
-        self.departed_keys.append(self.gpa, .{ .key = key, .until_ms = now_ms + DEPARTED_KEY_TTLS * self.clocks.t_owner_ms }) catch {};
+        self.departed_keys.appendAssumeCapacity(.{ .key = key, .until_ms = now_ms + DEPARTED_KEY_TTLS * self.clocks.t_owner_ms });
     }
 
     fn evict(self: *Owner, i: usize, now_ms: u64, epoch_word: u64) void {
@@ -703,11 +706,11 @@ pub const Owner = struct {
         return m.pr_key;
     }
 
-    /// Every key this owner knows held: live members' and departures'
-    /// inside their TTL.
-    pub fn heldKeys(self: *const Owner, gpa: Allocator, out: *std.ArrayList(u64)) Allocator.Error!void {
-        for (self.members.items) |m| if (m.pr_key != 0) try out.append(gpa, m.pr_key);
-        for (self.departed_keys.items) |d| try out.append(gpa, d.key);
+    /// Is `key` held — a live member's or a departure's inside its TTL?
+    pub fn holdsKey(self: *const Owner, key: u64) bool {
+        for (self.members.items) |m| if (m.pr_key != 0 and m.pr_key == key) return true;
+        for (self.departed_keys.items) |d| if (d.key == key) return true;
+        return false;
     }
 
     pub fn endpointOf(self: *const Owner, id: MemberId) ?EndpointWire {
@@ -1290,14 +1293,9 @@ test "the owner: arm refuses a stale term; a join writes ONE row and grants an e
     try testing.expectEqual(@as(u32, 1), rows.deletes);
     try testing.expectEqual(Liveness.dead, o.liveness(id1, t + 45_000));
     try testing.expect(o.renew(id1, 1, 0, t + 45_001) == .unknown_lease);
-    var keys: std.ArrayList(u64) = .empty;
-    defer keys.deinit(gpa);
-    try o.heldKeys(gpa, &keys);
-    try testing.expectEqual(@as(usize, 1), keys.items.len);
+    try testing.expect(o.holdsKey(0x1001));
     _ = o.expireDue(t + 45_000 + 2 * 45_000);
-    keys.clearRetainingCapacity();
-    try o.heldKeys(gpa, &keys);
-    try testing.expectEqual(@as(usize, 0), keys.items.len);
+    try testing.expect(!o.holdsKey(0x1001));
     // A leave: departed, no death.
     _ = o.join(joinReqOf(2, null, "/mnt/b"), t);
     try testing.expect(o.leave(writerMemberId(testIdentity(2)), t));

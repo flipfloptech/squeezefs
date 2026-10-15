@@ -313,6 +313,11 @@ pub var zc_direct_leg_recheck_withdrawn: counters.ShardedCounter = .{};
 /// bytes`: the validated subset the app's pages kept — the user side.
 pub var zc_direct_leg_dma_bytes: counters.ShardedCounter = .{};
 pub var zc_direct_leg_serve_bytes: counters.ShardedCounter = .{};
+/// `transport_write_window_bytes`: WRITE payload bytes delivered from the
+/// ring's own window — the UserEnts arena or the BufRing attached buffer —
+/// the non-zc modes' term of the admission ledger (a zc session's payloads
+/// are the extraction and direct-store terms instead).
+pub var write_window_bytes: counters.ShardedCounter = .{};
 /// `transport_zc_write_directs` / `_bytes` / `_failures`: held WRITE
 /// payloads landed by `WRITE_FIXED(slot → device)` — the sole-owner patch
 /// class with zero daemon passes — and the bridges that came back short.
@@ -2614,6 +2619,7 @@ pub const Group = struct {
             .lookup, .getattr => self.dispatchMeta(gent, req, sref),
             .flush => if (self.shared.no_open) self.dispatchFlush(gent, req, sref) else self.dispatch(gent, req, sref, null),
             .write => |w| {
+                if (!self.shared.zeroCopy()) write_window_bytes.add(w.data.len);
                 const lease = held orelse slot.PayloadLease.acquire(&ent.lease, w.data, self.waker());
                 self.dispatch(gent, req, sref, lease);
             },

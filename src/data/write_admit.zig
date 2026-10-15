@@ -76,6 +76,12 @@ const write_side_view = @import("write_side_view.zig");
 pub const Binding = seams.Binding;
 pub const PAGE: u32 = seams.PAGE;
 
+/// The extension law's zeros (`WritePath.zeroExtension`): one block at the
+/// format's largest (`transform.MAX_BLOCK_SIZE`), never written —
+/// zero-initialized static storage, so no image bytes and no RSS beyond the
+/// shared zero page.
+var gap_zeros: [transform.MAX_BLOCK_SIZE]u8 align(PAGE) = @splat(0);
+
 // ---------------------------------------------------------------------------
 // Config: every row read once at mount.
 // ---------------------------------------------------------------------------
@@ -165,6 +171,11 @@ pub const stats = struct {
     /// returned AND every data volume's fresh supply latched exhausted (the
     /// set is full). Must stay 0 on a set with free blocks.
     pub var parked_gate_wall_refusals: counters.ShardedCounter = .{};
+    /// `write_gap_zero_bytes`: the zeros the extension law admitted
+    /// (`WritePath.zeroExtension`, decision 0003 §AL) — bytes the
+    /// filesystem itself wrote, so the admission ledger ≡ WRITE payload
+    /// bytes + the truncate's zero tails + these.
+    pub var write_gap_zero_bytes: counters.ShardedCounter = .{};
     pub var write_shared_class_violation: counters.Tripwire = .init("write_shared_class_violation");
     /// The gate's cold flushes failed for a whole wall while fresh supply
     /// was VISIBLE on some volume: the plane is wrong, not full — the
@@ -186,7 +197,7 @@ pub fn noteInlineWrite(len: u64) void {
 
 pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
     try w.writeAll("{");
-    inline for (.{ "admit_write_overlay_bytes", "admit_write_inplace_bytes", "admit_write_accumulate_bytes", "admit_write_inline_bytes", "write_enospc_refusals", "write_pieces", "writes_admitted", "staging_sibling_probes", "restage_churn_removes", "restage_churn_bytes", "parked_gate_waits", "parked_gate_self_flushes", "parked_gate_cold_flushes", "parked_gate_wall_refusals" }) |name| {
+    inline for (.{ "admit_write_overlay_bytes", "admit_write_inplace_bytes", "admit_write_accumulate_bytes", "admit_write_inline_bytes", "write_enospc_refusals", "write_pieces", "writes_admitted", "staging_sibling_probes", "restage_churn_removes", "restage_churn_bytes", "parked_gate_waits", "parked_gate_self_flushes", "parked_gate_cold_flushes", "parked_gate_wall_refusals", "write_gap_zero_bytes" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, @field(stats, name).load() });
     }
     try w.print("\"write_shared_class_violation\":{d},\"parked_gate_wall_supply_visible\":{d},", .{ counters.tripwireCount("write_shared_class_violation"), counters.tripwireCount("parked_gate_wall_supply_visible") });
@@ -788,6 +799,9 @@ pub const WritePath = struct {
         const end = std.math.add(u64, req.offset, len) catch return error.FileTooBig;
         if (end / bs >= std.math.maxInt(u32)) return error.FileTooBig;
         const file = req.file orelse seams.FileView{ .kind = .striped, .size = 0, .map_resident = false };
+        // The gap this write opens past EOF lands first (the extension law):
+        // the write then continues it, stream-adjacent, in the same custody.
+        if (req.offset > file.size) try self.zeroExtension(io, req.ino, file, req.offset);
         // The shared-mode handoff: a Shared classification is a cache-
         // resident striped write with `end ≤ size` — anything else here is
         // the handler's classifier disagreeing with the data plane.
@@ -834,6 +848,36 @@ pub const WritePath = struct {
         }
         stats.writes_admitted.inc();
         return out;
+    }
+
+    /// THE EXTENSION LAW (decision 0003 §AL; charter §6.2 "uncovered bytes
+    /// never escape"): growing `file` from its EOF to `upto` — a write past
+    /// EOF, a truncate-up — writes `[EOF, min(upto, the EOF block's end))`
+    /// of a MAPPED EOF block as the write path's own zeros, admitted like
+    /// any byte, so every arm lands them (in place: their pages; CoW: with
+    /// the block) and every reader serves them from custody until then. A
+    /// mapped block's bytes past EOF are not the file's: a sub-block landing
+    /// (a promoted inline, staged or packed image — `plane.ownBlockStored`
+    /// DMAs its grain) leaves the tail the block's previous owner wrote (the
+    /// block-device free elides its discard: reclaim.zig), a shrink leaves
+    /// the file's own old bytes, and every seed copies them forward. A
+    /// hole's EOF block reads zeros and a block-aligned EOF opens no gap in
+    /// a mapped block: nothing is written. Cost: zeros ≤ the growth inside
+    /// the EOF block, landed with the write that continues them — §AK's
+    /// `pages × P` in place, never a second landing.
+    pub fn zeroExtension(self: *WritePath, io: Io, ino: u64, file: seams.FileView, upto: u64) Error!void {
+        const bs = self.cfg.block_size;
+        const eof = file.size;
+        if (upto <= eof or eof % bs == 0) return;
+        if (eof / bs >= std.math.maxInt(u32)) return error.FileTooBig;
+        // Unguarded: the grower holds the ino's exclusive op guard, so only
+        // a landing changes the EOF block's binding meanwhile — one binding
+        // for another, or a fresh custody's zero-completed block.
+        if (self.epochs.baseBinding(self.map, ino, @intCast(eof / bs)) == null) return;
+        const n: usize = @intCast(@min(upto, std.mem.alignForward(u64, eof + 1, bs)) - eof);
+        assert(n < gap_zeros.len);
+        _ = try self.write(io, .{ .ino = ino, .offset = eof, .payload = .{ .bytes = gap_zeros[0..n] }, .class = .entire_op, .file = file });
+        stats.write_gap_zero_bytes.add(n);
     }
 
     fn materialize(_: *WritePath, io: Io, p: Payload) ![]const u8 {
@@ -2162,10 +2206,22 @@ const STALE: u8 = 0xAA;
 /// `ino`'s block 0 re-minted from a block a previous owner filled with
 /// `STALE`, holding a promoted sub-block image: the own-block DMA landed the
 /// file's `eof` bytes grain-padded with zeros (`plane.ownBlockStored`), the
-/// tail past the grain is the previous owner's. `shared` marks it cloned.
-fn recycledEofBlock(w: *World, ino: u64, eof: u64, shared: bool) !Binding {
+/// tail past the grain is the previous owner's. `shared` marks it cloned;
+/// `transformed` mints it on the fixture's transformed volume (no image
+/// seam bound: its seeds read the stored bytes whole, the worst case of a
+/// framed image whose plaintext covers less than the block).
+fn recycledEofBlock(w: *World, ino: u64, eof: u64, shared: bool, transformed: bool) !Binding {
     assert(eof <= PAGE);
-    const b = try w.f.publishBlock(ino, 0, STALE);
+    const b = if (transformed) blk: {
+        const m = try w.f.alloc_b.allocateBlock();
+        var buf: [wt.BS]u8 = @splat(STALE);
+        try w.f.dev.seam().vtable.write(&w.f.dev, wt.VOL_B, m.offset, &buf);
+        w.f.alloc_b.publishBlock(m.idx);
+        const tb = Binding.wholeBlock(wt.VOL_B, m.offset, m.stamp);
+        try w.f.map.create(ino, .striped, eof);
+        try w.f.map.bind(ino, 0, tb);
+        break :blk tb;
+    } else try w.f.publishBlock(ino, 0, STALE);
     var image: [PAGE]u8 align(PAGE) = @splat(0);
     fill(image[0..@intCast(eof)], 0x31);
     try w.f.dev.seam().vtable.write(&w.f.dev, b.vol_tag, b.offset, &image);
@@ -2201,23 +2257,25 @@ fn expectZeros(what: []const u8, bytes: []const u8, base: u64) !void {
     }
 }
 
-test "decision 0003 §AL — a write past EOF never exposes the bytes a recycled block's previous owner left: a promoted sub-block image (its EOF bytes landed, the tail the previous owner's marker) written past its EOF reads zeros across [EOF, write) on every arm — the W2 page overlay folded in place, the accumulation drained in place, the overlay arm's fresh landing, the seeded CoW upload of a shared block, a write into a LATER block (the EOF block's tail is the gap) — live through the write side's view and on the device after the drain" {
+test "decision 0003 §AL — a write past EOF never exposes the bytes a recycled block's previous owner left: a promoted sub-block image (its EOF bytes landed, the tail the previous owner's marker) written past its EOF reads zeros across [EOF, write) on every arm — the W2 page overlay folded in place, the accumulation drained in place, the overlay arm's fresh landing, the seeded CoW upload of a shared block and of a transformed volume's block, a write into a LATER block (the EOF block's tail is the gap) — live through the write side's view and on the device after the drain" {
     const io = testing.io;
     const w = try World.init(testing.allocator, .sync_inline, true);
     defer w.deinit(testing.allocator);
-    const Case = struct { ino: u64, eof: u64 = 100, offset: u64, len: u64, arm: Arm, shared: bool = false };
+    const Case = struct { ino: u64, eof: u64 = 100, offset: u64, len: u64, arm: Arm, shared: bool = false, transformed: bool = false };
     const cases = [_]Case{
-        .{ .ino = 70, .offset = 3 * PAGE + 7, .len = 10, .arm = .extent },
+        // Below the W2 RAM trigger (`pages ≥ B/4P`) with the gap's pages.
+        .{ .ino = 70, .offset = 2 * PAGE + 7, .len = 10, .arm = .extent },
         .{ .ino = 71, .offset = 5 * PAGE + 3, .len = 5 * PAGE, .arm = .accumulate_park },
         .{ .ino = 72, .eof = PAGE, .offset = 8 * PAGE, .len = 3 * PAGE, .arm = .overlay },
         .{ .ino = 73, .offset = 5 * PAGE + 3, .len = 5 * PAGE, .arm = .accumulate_park, .shared = true },
         .{ .ino = 74, .offset = wt.BS + 10, .len = 10, .arm = .extent },
+        .{ .ino = 75, .offset = 5 * PAGE + 3, .len = 10, .arm = .accumulate_park, .transformed = true },
     };
     var payload: [5 * PAGE]u8 = undefined;
     var own: [PAGE]u8 = undefined;
     var got: [wt.BS]u8 = undefined;
     for (cases) |c| {
-        _ = try recycledEofBlock(w, c.ino, c.eof, c.shared);
+        _ = try recycledEofBlock(w, c.ino, c.eof, c.shared, c.transformed);
         fill(own[0..@intCast(c.eof)], 0x31);
         fill(payload[0..@intCast(c.len)], @truncate(c.ino));
         const o = try w.wp.write(io, .{ .ino = c.ino, .offset = c.offset, .payload = .{ .bytes = payload[0..@intCast(c.len)] }, .class = .entire_op, .file = World.striped(c.eof) });
@@ -2235,6 +2293,32 @@ test "decision 0003 §AL — a write past EOF never exposes the bytes a recycled
             if (c.offset < wt.BS) try testing.expectEqualSlices(u8, payload[0..@intCast(c.len)], got[@intCast(c.offset)..][0..@intCast(c.len)]);
         }
     }
+}
+
+test "decision 0003 §AL — a truncate-up past a recycled tail reads zeros: `zeroExtension` lands [EOF, min(new size, block end)) of a mapped EOF block as the write path's own zeros (the extension's pages, nothing else), and declines a hole's EOF block and a block-aligned EOF (nothing to expose, nothing written)" {
+    const io = testing.io;
+    const w = try World.init(testing.allocator, .sync_inline, false);
+    defer w.deinit(testing.allocator);
+    var got: [wt.BS]u8 = undefined;
+    const b = try recycledEofBlock(w, 80, 100, false, false);
+    const z0 = stats.write_gap_zero_bytes.load();
+    try w.wp.zeroExtension(io, 80, World.striped(100), 6 * PAGE + 1);
+    try readBlockNow(w, io, 80, 0, &got);
+    try expectZeros("the grown range through the write side's view", got[100 .. 6 * PAGE + 1], 100);
+    try testing.expectEqual(@as(u64, 6 * PAGE + 1 - 100), stats.write_gap_zero_bytes.load() - z0);
+    w.f.dev.resetLedger();
+    w.wp.flushIno(io, 80);
+    // In place: the extension's seven pages, the binding unchanged.
+    try testing.expectEqual(@as(u64, 7 * PAGE), w.f.dev.writeBytesTotal());
+    try testing.expect(w.f.map.seam().lookup(80, 0).?.eql(b));
+    w.f.dev.peek(b.vol_tag, b.offset, &got);
+    try expectZeros("the grown range on the device", got[100 .. 6 * PAGE + 1], 100);
+    // A hole's EOF block and a block-aligned EOF: nothing written.
+    try w.f.map.create(81, .striped, 100);
+    try w.wp.zeroExtension(io, 81, World.striped(100), wt.BS);
+    try w.wp.zeroExtension(io, 80, World.striped(wt.BS), 3 * wt.BS);
+    try testing.expectEqual(@as(u64, 6 * PAGE + 1 - 100), stats.write_gap_zero_bytes.load() - z0);
+    try testing.expect(!w.wp.table.has(81, 0));
 }
 
 test "the D3 fold seam (defrag --fold): `foldTargets` names the inos holding parked W2 extents (ascending, deduped — a full-buffer park is not a target), `foldParked` kicks each through the EXISTING fold — sole-owner passthrough blocks land in place at the page grain and retire, device ÷ user ≤ the §J in-place bound, the bindings unchanged, bytes exact; nothing left parked as an extent; a second census is empty" {

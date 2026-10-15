@@ -305,7 +305,7 @@ pub fn assertStore(comptime T: type) void {
 /// the product; `NoData` is the volume-less set).
 pub fn assertData(comptime T: type) void {
     comptime {
-        for ([_][]const u8{ "hasVolumes", "stagingOn", "blockSize", "inlineMax", "geometry", "refsSeam", "noteShape", "forgetShape", "isPassthrough", "canStoreHeld", "write", "read", "ownBlock", "abandonOwnBlock", "ownBlockPublished", "holdReleases", "dropReleases", "freeBindings", "flushCustody", "releaseIno", "hasWriteCustody", "fsync", "statfs", "mintFileId", "stageImage", "appendStaged", "releaseStaged", "stagedLease", "readMappingImage", "lockLayout", "stageKvmapShrink", "stageKvmapCorpse", "drainKvmapSweep", "publishForeign" }) |name| {
+        for ([_][]const u8{ "hasVolumes", "stagingOn", "blockSize", "inlineMax", "geometry", "refsSeam", "noteShape", "forgetShape", "isPassthrough", "canStoreHeld", "write", "zeroExtension", "read", "ownBlock", "abandonOwnBlock", "ownBlockPublished", "holdReleases", "dropReleases", "freeBindings", "flushCustody", "releaseIno", "hasWriteCustody", "fsync", "statfs", "mintFileId", "stageImage", "appendStaged", "releaseStaged", "stagedLease", "readMappingImage", "lockLayout", "stageKvmapShrink", "stageKvmapCorpse", "drainKvmapSweep", "publishForeign" }) |name| {
             if (!@hasDecl(T, name)) @compileError(@typeName(T) ++ " is not a kv_fs Data face: lacks `" ++ name ++ "`");
         }
     }
@@ -1980,12 +1980,18 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             var kind: layout.Kind = .inline_;
             var layout_lock: ?Data.LayoutGuard = null;
             errdefer if (layout_lock) |g| g.release(self.io);
-            if (a.attr.size) |_| {
+            if (a.attr.size) |sz| {
                 const probe = (try self.readInodeOpt(local)) orelse return error.FileNotFound;
                 if (!(probe.mode & S.IFMT == S.IFREG)) return error.InvalidArgument;
                 const rec = try self.readLayout(local);
                 kind = kindOf(rec);
                 self.freeLayout(rec);
+                // A striped grow's extension law (decision 0003 §AL): the
+                // mapped EOF block's gap is written as zeros here, so the
+                // custody flush below lands it BEFORE the size commits — a
+                // kill leaves the old size or the zeros, never the bytes the
+                // block held past EOF.
+                if (kind == .striped and sz > probe.size) self.data.zeroExtension(self.io, local, probe.size, sz) catch |e| return writeError(e);
                 // Under the lifecycle's exclusive guard: the custody lands
                 // before the clip (the layout read below is then the truth).
                 self.settleCustody(local, kind);
@@ -2897,17 +2903,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             else
                 .{ .bytes = a.data };
             c.stage(.write_admitted);
-            const outcome = self.data.write(self.io, local, a.offset, payload, a.class, .{ .kind = .striped, .size = old_size, .map_resident = true }, .{ .ctx = c, .parked = &stampParkedPool }) catch |e| return switch (e) {
-                error.NoSpaceLeft => error.NoSpaceLeft,
-                error.InputOutput => error.InputOutput,
-                error.VolumeFailed => error.VolumeFailed,
-                error.WriterGuardFenced => error.WriterGuardFenced,
-                error.OutOfMemory => error.OutOfMemory,
-                error.WorkerShutdown => error.WorkerShutdown,
-                error.QueueFull => error.QueueFull,
-                error.ReadOnlyFileSystem => error.ReadOnlyFileSystem,
-                error.FileTooBig => error.FileTooBig,
-            };
+            const outcome = self.data.write(self.io, local, a.offset, payload, a.class, .{ .kind = .striped, .size = old_size, .map_resident = true }, .{ .ctx = c, .parked = &stampParkedPool }) catch |e| return writeError(e);
             c.stage(.write_done);
             // The postlude: SIZE NEVER LEADS DATA — the claim lands after the
             // pieces were acked by their arms. A foreign-slot file's claim
@@ -2937,6 +2933,21 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             self.data.noteShape(local, size, .striped);
             fuse_write_striped.inc();
             return .{ .size = @intCast(outcome.written) };
+        }
+
+        /// The data plane's write verdicts as the filesystem's.
+        fn writeError(e: write_admit.Error) Error {
+            return switch (e) {
+                error.NoSpaceLeft => error.NoSpaceLeft,
+                error.InputOutput => error.InputOutput,
+                error.VolumeFailed => error.VolumeFailed,
+                error.WriterGuardFenced => error.WriterGuardFenced,
+                error.OutOfMemory => error.OutOfMemory,
+                error.WorkerShutdown => error.WorkerShutdown,
+                error.QueueFull => error.QueueFull,
+                error.ReadOnlyFileSystem => error.ReadOnlyFileSystem,
+                error.FileTooBig => error.FileTooBig,
+            };
         }
 
         /// The write's stamp parked as `local`'s pending refinement (under
@@ -3632,6 +3643,9 @@ pub const NoData = struct {
     pub fn write(_: *NoData, _: Io, _: u64, _: u64, _: write_admit.Payload, _: op_guard.Class, _: seams.FileView, _: ?write_admit.ParkHook) write_admit.Error!write_admit.Outcome {
         unreachable; // gated by hasVolumes
     }
+    pub fn zeroExtension(_: *NoData, _: Io, _: u64, _: u64, _: u64) write_admit.Error!void {
+        unreachable; // every layout on this set is inline
+    }
     pub fn read(_: *NoData, _: Io, _: u64, _: u64, _: []u8, _: bool, _: bool) Error!usize {
         unreachable; // every layout on this set is inline
     }
@@ -4196,6 +4210,9 @@ const SettlingData = struct {
     /// `from` → `to`.
     merge: ?struct { ino: u64, size: u64, from: Mapping, to: Mapping } = null,
     flushes: u32 = 0,
+    /// The last extension law asked of the plane (`zeroExtension`) and
+    /// the custody flushes that had run before it.
+    extension: ?struct { old_size: u64, new_size: u64, flushes_before: u32 } = null,
     /// The write-back custody a test arms (`hasWriteCustody`) and the
     /// RELEASE-class drains that landed it (`releaseIno`).
     custody_of: ?u64 = null,
@@ -4363,6 +4380,9 @@ const SettlingData = struct {
         const n = payload.len();
         self.writes.append(testing.allocator, .{ .offset = offset, .len = n, .view_size = view.size }) catch return error.OutOfMemory;
         return .{ .written = n, .size_claim = offset + n, .pieces = 1 };
+    }
+    pub fn zeroExtension(self: *SettlingData, _: Io, _: u64, old_size: u64, new_size: u64) write_admit.Error!void {
+        self.extension = .{ .old_size = old_size, .new_size = new_size, .flushes_before = self.flushes };
     }
     pub fn read(_: *SettlingData, _: Io, _: u64, _: u64, _: []u8, _: bool, _: bool) Error!usize {
         unreachable;
@@ -4655,6 +4675,36 @@ test "a file grown past one block by truncate is written through the striped arm
     try testing.expectEqual(bs, h.data.own_block_max);
     try testing.expectEqual(grown, (try h.getattr(g)).size);
     h.release(g);
+}
+
+test "decision 0003 §AL — a striped truncate-up asks the plane for the extension law's zeros over [old size, new size) BEFORE its custody lands and its size commits (a kill leaves the old size or the zeros, never what the EOF block held past EOF); an inline grow and a shrink ask nothing" {
+    const H = HarnessOf(SettlingData);
+    var h: H = undefined;
+    try h.init();
+    defer h.deinit();
+    defer h.data.deinit();
+    h.data.store = &h.store;
+    const f = try h.create(1, "f", 0o644);
+    var in = abi.zeroed(abi.fuse_setattr_in);
+    in.valid = abi.FATTR_SIZE;
+    in.size = 100;
+    try testing.expectEqual(@as(?linux.E, null), h.setattr(f, in).errno());
+    try testing.expect(h.data.extension == null);
+    // A write past the inline cap promotes the file to striped; then the grow.
+    const big: [8192]u8 = @splat('X');
+    try testing.expectEqual(@as(?linux.E, null), h.write(f, 0, &big, 0).errno());
+    in.size = 3 * big.len + 5;
+    try testing.expectEqual(@as(?linux.E, null), h.setattr(f, in).errno());
+    const x = h.data.extension.?;
+    try testing.expectEqual(@as(u64, big.len), x.old_size);
+    try testing.expectEqual(in.size, x.new_size);
+    try testing.expectEqual(x.flushes_before + 1, h.data.flushes);
+    try testing.expectEqual(in.size, (try h.getattr(f)).size);
+    h.data.extension = null;
+    in.size = 10;
+    try testing.expectEqual(@as(?linux.E, null), h.setattr(f, in).errno());
+    try testing.expect(h.data.extension == null);
+    h.release(f);
 }
 
 // Rung 9 (the external suites' fsstress rounds): a 20-writer burst of 3–4 MiB

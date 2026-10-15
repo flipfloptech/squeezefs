@@ -1274,6 +1274,14 @@ pub const DataPlane = struct {
         return self.wp.write(io, .{ .ino = ino, .offset = offset, .payload = payload, .class = class, .file = file, .park_hook = park_hook });
     }
 
+    /// A striped truncate-up's extension law (decision 0003 §AL): the
+    /// mapped EOF block's `[old_size, min(new_size, its end))` written as
+    /// zeros (`write_admit.WritePath.zeroExtension`), landed by the
+    /// caller's custody flush before its size commit.
+    pub fn zeroExtension(self: *DataPlane, io: Io, ino: u64, old_size: u64, new_size: u64) write_admit.Error!void {
+        return self.wp.zeroExtension(io, ino, .{ .kind = .striped, .size = old_size, .map_resident = true }, new_size);
+    }
+
     /// THE read of any layout kind into `dest` (the reply window;
     /// `registered` = the device may DMA straight into it).
     pub fn read(self: *DataPlane, io: Io, ino: u64, offset: u64, dest: []u8, registered: bool, odirect: bool) Error!usize {

@@ -6331,8 +6331,9 @@ fn expectMustStayZero(tail: []const u8) !void {
 /// `queued + elided ≡ terminal frees`.
 fn expectLedgersClosed(tail: []const u8) !void {
     const admit = (numberAfter(tail, "\"admit_write_overlay_bytes\":") orelse 0) + (numberAfter(tail, "\"admit_write_inplace_bytes\":") orelse 0) + (numberAfter(tail, "\"admit_write_accumulate_bytes\":") orelse 0) + (numberAfter(tail, "\"admit_write_inline_bytes\":") orelse 0);
-    // + the truncate's own zero-complete of a kept partial block.
-    const transport_write = (numberAfter(tail, "\"transport_zc_write_extract_bytes\":") orelse 0) + (numberAfter(tail, "\"transport_zc_write_direct_bytes\":") orelse 0) + (numberAfter(tail, "\"transport_write_window_bytes\":") orelse 0) + (numberAfter(tail, "\"fuse_truncate_zero_tail_bytes\":") orelse 0);
+    // + the truncate's own zero-complete of a kept partial block + the
+    // extension law's zeros (decision 0003 §AL).
+    const transport_write = (numberAfter(tail, "\"transport_zc_write_extract_bytes\":") orelse 0) + (numberAfter(tail, "\"transport_zc_write_direct_bytes\":") orelse 0) + (numberAfter(tail, "\"transport_write_window_bytes\":") orelse 0) + (numberAfter(tail, "\"fuse_truncate_zero_tail_bytes\":") orelse 0) + (numberAfter(tail, "\"write_gap_zero_bytes\":") orelse 0);
     if (admit != transport_write) std.debug.print("\n--- admission ledger {d} ≠ transport WRITE payload bytes + zero tails {d} ---\n", .{ admit, transport_write });
     try testing.expectEqual(transport_write, admit);
     const user = numberAfter(tail, "\"read_user_bytes\":") orelse 0;

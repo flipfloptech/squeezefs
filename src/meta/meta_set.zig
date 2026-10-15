@@ -938,6 +938,30 @@ test "a two-member set: format → open (either URI order) → 200 creates sprea
     }
 }
 
+test "a two-member set: every member's writer claim refreshes on the beat and is deleted at the clean dismount (red: member 1's claim sat at its local ino 1 — slot 0's keyspace, hosted by member 0 alone — so its armed door refused every refresh and the dismount's delete SlotBusy; the claim went stale under a live writer and outlived the unmount)" {
+    const gpa = testing.allocator;
+    const s = try TestSet.create(gpa, "claims", 2);
+    defer s.destroy();
+    const pool = try uring_fs.Pool.init(gpa, uring_fs.Config.resolve(&s.env, derive.Facts.probe()));
+    defer pool.deinit();
+    {
+        const set = try s.open();
+        defer set.close();
+        for (set.volumes) |be| {
+            const beats0 = guard.stats.heartbeats.load();
+            const fails0 = guard.stats.heartbeat_failures.load();
+            be.guard.?.beat();
+            try testing.expectEqual(fails0, guard.stats.heartbeat_failures.load());
+            try testing.expect(guard.stats.heartbeats.load() > beats0);
+        }
+    }
+    for (s.pathList()) |p| {
+        const raw = try guard.gate.probeClaim(gpa, s.io(), &s.env, pool, p);
+        defer if (raw) |r| gpa.free(r);
+        try testing.expect(raw == null);
+    }
+}
+
 test "a child of a directory this mount leases outside the native slot mints on the directory's member (charter §5.5's affinity ranks above §5.4's round-robin): 100 creates under such a directory mint ZERO cross-owner intents — each a single-member entry, no intent barriers; the root's children still spread over both members" {
     const gpa = testing.allocator;
     const s = try TestSet.create(gpa, "home", 2);

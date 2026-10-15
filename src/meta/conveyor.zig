@@ -185,6 +185,10 @@ pub const WindowHold = struct {
     /// hold past the barrier cadence would carry a window across the
     /// barrier that was due to cover it.
     ceiling_ns: u64,
+    /// Test seam: every eligible window is held as if the worth gate were
+    /// open, so a row measures the hold's pacing law apart from the gate's
+    /// learning (the worth-gate tie rows judge that).
+    pin_gate_open: bool = false,
 };
 
 /// The law from the ONE flush-interval knob (`checkpoint.flushIntervalMsFromEnv`):
@@ -1530,7 +1534,7 @@ pub const Conveyor = struct {
             n.cancel(io);
             return unheld;
         }
-        const verdict = self.gate.decide();
+        const verdict: WorthGate.Verdict = if (law.pin_gate_open) .hold else self.gate.decide();
         switch (verdict) {
             .decline => {
                 n.cancel(io);
@@ -4068,15 +4072,9 @@ const WindowFillCommitters = struct {
         };
         h.cv.quiesce();
     }
-
-    /// The worth gate paid a hold of its own (a `.hold` verdict, not a
-    /// probe's): it opened.
-    fn gateOpened(h: *Harness) bool {
-        return h.cv.stats.holds.load() > h.cv.stats.hold_probes.load();
-    }
 };
 
-test "§L: the window-fill hold — 48 closed-loop committers of 76 B entries against a 4 ms device: once the worth gate opened (the rendezvous), the steady pairs' pad fraction ≤ 1 − N·s/(2·g) + slack, two windows per committer round, every entry acked once, zero tick rescues" {
+test "§L: the window-fill hold — 48 closed-loop committers of 76 B entries against a 4 ms device, every eligible window held (the gate pinned open): the pacing law under ANY schedule — pad-majority windows ≤ one per device round trip of the run + one per deadline, journal device bytes ≤ one grain per such window + twice the entry bytes — and at the paced schedule two windows per committer round at pad ≤ 1 − N·s/(2·g) + slack; every entry acked once, zero tick rescues" {
     // Leak-checked, no stack traces: `testing.allocator`'s trace capture
     // made a one-record apply cost ~0.5 ms in Debug — the pass latency
     // the shape measures against must stay far under the round trip.
@@ -4092,10 +4090,14 @@ test "§L: the window-fill hold — 48 closed-loop committers of 76 B entries ag
     // The simulated journal device's round trip: long against the pass
     // latency AND the device thread's own delivery grain (a futex wake per
     // completion, tens of µs on macOS: the 16 arrival phases, 250 µs
-    // apart, must stay distinct), short for the gate (≈ 96 × 2 × 4 ms ≈
-    // 0.8 s of paced landings + the learning rounds').
+    // apart, must stay distinct), short for the row (≈ 96 × 2 × 4 ms ≈
+    // 0.8 s of paced landings).
     const device_ns = C.device_ns;
-    h.cv.deps.window_hold = .{ .ceiling_ns = 50 * std.time.ns_per_ms };
+    // The gate pinned open: the row measures the HOLD; when the gate opens
+    // under a schedule is its learning law's (the worth-gate tie rows) — a
+    // loaded host's thin holds close it, and its declined windows are the
+    // unpaced regime, not this law's.
+    h.cv.deps.window_hold = .{ .ceiling_ns = 50 * std.time.ns_per_ms, .pin_gate_open = true };
     h.lane.hold = true;
     h.threaded_pass = true;
     var dma: Harness.DmaSim = .{};
@@ -4125,20 +4127,6 @@ test "§L: the window-fill hold — 48 closed-loop committers of 76 B entries ag
         ino.* = try h.commitCreate(try std.fmt.bufPrint(&nb, "w{d}", .{i}));
     }
     h.cv.quiesce();
-    // THE RENDEZVOUS: rounds until the worth gate opened. The gate starts
-    // OFF and probes at its `HOLD_PROBE_PERIOD`th eligible window; WHEN it
-    // opens is the schedule's (a probe burst whose holds meet a stalled
-    // host collects too little, and the gate stays off for another
-    // period) — its learning law is the worth-gate tie row's. Four probe
-    // periods' worth of rounds without an open gate is the gate failing
-    // 48 committers, never the schedule.
-    const learn_rounds = 16;
-    var first: usize = 0;
-    while (!C.gateOpened(h)) {
-        if (first >= 4 * learn_rounds) return error.WorthGateNeverOpened;
-        try C.phase(h, &dma, &inos, first, learn_rounds);
-        first += learn_rounds;
-    }
     const st = &h.vol.journal.stats;
     const pad0 = st.written_pad_bytes.load();
     const dev0 = st.written_device_bytes.load();
@@ -4150,9 +4138,14 @@ test "§L: the window-fill hold — 48 closed-loop committers of 76 B entries ag
     const deadlines0 = h.cv.stats.hold_deadlines.load();
     const not_worth0 = h.cv.stats.holds_not_worth.load();
     const handoffs0 = h.cv.stats.lane_handoffs.load();
-    const classed0 = h.cv.stats.windows_held.load() + h.cv.stats.windows_unshadowed.load() + h.cv.stats.windows_pipelined.load();
-    // THE MEASUREMENT: the steady pairs past the rendezvous.
-    try C.phase(h, &dma, &inos, first, per_committer);
+    const held0 = h.cv.stats.windows_held.load();
+    const unshadowed0 = h.cv.stats.windows_unshadowed.load();
+    const pipelined0 = h.cv.stats.windows_pipelined.load();
+    // THE MEASUREMENT: per_committer rounds from the first, the span of
+    // every window it issues inside [t0, t1].
+    const t0 = clock.monotonicNs();
+    try C.phase(h, &dma, &inos, 0, per_committer);
+    const elapsed = clock.monotonicNs() - t0;
 
     const entries = st.written_entries.load() - ent0;
     const windows = st.written_windows.load() - win0;
@@ -4161,47 +4154,63 @@ test "§L: the window-fill hold — 48 closed-loop committers of 76 B entries ag
     const holds = h.cv.stats.holds.load() - holds0;
     const landings = h.cv.stats.hold_landings.load() - landings0;
     const deadlines = h.cv.stats.hold_deadlines.load() - deadlines0;
+    const held = h.cv.stats.windows_held.load() - held0;
+    const unshadowed = h.cv.stats.windows_unshadowed.load() - unshadowed0;
+    const pipelined = h.cv.stats.windows_pipelined.load() - pipelined0;
     // Every Δ landed as an entry (a structural entry — a leaf's compaction
     // under the growing overlay — may ride beside them).
     try testing.expect(entries >= n_committers * per_committer);
     try testing.expectEqual(acks0 + n_committers * per_committer, h.cv.stats.acks.load());
     try testing.expectEqual(@as(u64, 0), h.cv.stats.refusals.load());
     try testing.expectEqual(@as(u64, 0), h.cv.stats.park_tick_rescues.load());
-    // The identity: Σ journal device bytes ≡ entries + pad + headers + holes
-    // (asserted per window in `noteWritten`); the §L reading over the
-    // steady pairs at `1 − N·s/(2·g)`.
+    // Every handoff is one class; every hold ended by the landing's wake
+    // or the deadline; the pinned gate declined nothing.
+    try testing.expectEqual(h.cv.stats.lane_handoffs.load() - handoffs0, held + unshadowed + pipelined);
+    try testing.expectEqual(windows, held + unshadowed + pipelined);
+    try testing.expectEqual(holds, landings + deadlines);
+    try testing.expectEqual(not_worth0, h.cv.stats.holds_not_worth.load());
+    try testing.expect(holds >= per_committer);
+
+    // THE PACING LAW, under any schedule. A pad-majority window issues
+    // only once nothing is in flight (unshadowed) or after a hold the
+    // flight's emptying ended — or its deadline, the one way two overlap —
+    // and the device lands a window no sooner than `device_ns` after its
+    // issue: pad-majority windows are serialized at least a round trip
+    // apart, so a run of `elapsed` holds at most `⌊elapsed / D⌋ + 1` of
+    // them plus one per deadline. A load that stretches the committers'
+    // rounds stretches `elapsed` with them; an unpaced pass (no hold: one
+    // window per pass, the red test's 16 per round) breaks it at once.
+    const law_windows = elapsed / device_ns + 1 + deadlines;
+    // Its byte reading: a pad-majority window fills at most one grain (a
+    // page: under half a page of entries, padded); an entry-majority one
+    // costs under twice its entries' bytes (`bytesPerOpBound`).
     const s: u64 = 76;
     const geo = h.vol.journal.geo;
+    const grain_bytes = geo.page_data_len + jc.PAGE_HDR_LEN;
+    const law_device = law_windows * grain_bytes + 2 * s * entries;
+    // The paced schedule's reading (the committers re-arrive inside one
+    // flight: two alternating cohorts summing to N per pair of windows):
+    // two windows per committer round, a third when the re-drain races a
+    // cohort's tail, plus the forming/finishing transient — against
+    // entries/2 ≈ 2,300 unpaced; pad `1 − N·s/(2·g)` up to the first and
+    // last windows (12 pp: the row's tolerance for the forming and
+    // finishing cohorts over its 2K windows).
+    const paced_windows: u64 = (5 * per_committer) / 2 + 8;
+    const paced = elapsed <= paced_windows * device_ns;
     const pair = windowCost(geo, n_committers / 2, s);
     const bound_ppm = pair.padFractionPpm();
     const pad_ppm = (pad * WindowCost.PPM) / device;
-    // The slack for the cohorts forming and finishing (their windows
-    // carry more pad than the steady pairs): the row's 12 pp over a run of
-    // `2K` steady windows plus the gate's `P − 1` one-entry learning
-    // windows (at their cost by construction) — restricted to the steady
-    // windows now judged alone, the same tolerance is 12 pp × (2K + P − 1)
-    // / 2K, neither loosened nor tightened by the rendezvous.
-    const steady_windows: u64 = 2 * per_committer;
-    const slack_ppm = (12 * WindowCost.PPM / 100) * (steady_windows + HOLD_PROBE_PERIOD - 1) / steady_windows;
-    std.debug.print("\n§L red test: {d} learning rounds; {d} entries in {d} windows, pad {d} B of {d} B device = {d}.{d:0>1} % (bound {d}.{d:0>1} % + {d}.{d:0>1} pp); holds {d} (landings {d}, deadlines {d}; probes {d}, not worth {d}; gain {d}/1000); held {d}, unshadowed {d}, pipelined {d}; hold bound {d} µs\n", .{ first, entries, windows, pad, device, pad_ppm / 10_000, (pad_ppm % 10_000) / 1000, bound_ppm / 10_000, (bound_ppm % 10_000) / 1000, slack_ppm / 10_000, (slack_ppm % 10_000) / 1000, holds, landings, deadlines, h.cv.stats.hold_probes.load(), h.cv.stats.holds_not_worth.load(), h.cv.stats.hold_gain_milli.load(), h.cv.stats.windows_held.load(), h.cv.stats.windows_unshadowed.load(), h.cv.stats.windows_pipelined.load(), h.cv.stats.hold_bound_ns.load() / 1000 });
-    try testing.expect(pad_ppm <= bound_ppm + slack_ppm);
-    // The pacing law's counts: every handoff is one class; a hold ended by
-    // the landing's wake or the deadline; one window per round trip means
-    // TWO windows per committer round (the alternating cohorts), plus the
-    // forming/finishing transient — against entries/2 ≈ 2,300 unpaced.
-    const classed = h.cv.stats.windows_held.load() + h.cv.stats.windows_unshadowed.load() + h.cv.stats.windows_pipelined.load();
-    try testing.expectEqual(h.cv.stats.lane_handoffs.load() - handoffs0, classed - classed0);
-    try testing.expectEqual(holds, landings + deadlines);
-    try testing.expect(holds >= per_committer);
-    // Two windows per round, a third when the re-drain races a cohort's
-    // tail (the device thread lands and completes DMAs from one clock),
-    // plus the forming/finishing transient.
-    try testing.expect(windows <= (5 * per_committer) / 2 + 8);
-    // The gate stayed open — or, closed by a stall's thin holds, opened
-    // again at its next probe burst.
-    try testing.expect(h.cv.stats.holds_not_worth.load() - not_worth0 < HOLD_PROBE_PERIOD);
-    try testing.expect(holdWorthIt(h.cv.stats.hold_gain_milli.load() * GAIN_UNIT / 1000, true));
-    try testing.expect(landings >= deadlines);
+    const slack_ppm = 12 * WindowCost.PPM / 100;
+    std.debug.print("\n§L window-fill hold: {d} entries in {d} windows over {d} ms = {d} round trips (paced schedule: {}); held {d}, unshadowed {d}, pipelined {d} — law {d} pad-majority windows, {d} B device of law {d} B; pad {d} B = {d}.{d:0>1} % (paced bound {d}.{d:0>1} % + {d} pp); holds {d} (landings {d}, deadlines {d}; gain {d}/1000); hold bound {d} µs\n", .{ entries, windows, elapsed / std.time.ns_per_ms, elapsed / device_ns, paced, held, unshadowed, pipelined, law_windows, device, law_device, pad, pad_ppm / 10_000, (pad_ppm % 10_000) / 1000, bound_ppm / 10_000, (bound_ppm % 10_000) / 1000, slack_ppm / 10_000, holds, landings, deadlines, h.cv.stats.hold_gain_milli.load(), h.cv.stats.hold_bound_ns.load() / 1000 });
+    try testing.expect(held + unshadowed <= law_windows);
+    try testing.expect(device <= law_device);
+    // At the paced schedule the law IS two windows per round: a run that
+    // kept the device's pace must not have spent its round trips on more
+    // windows (and their pad).
+    if (paced) {
+        try testing.expect(windows <= paced_windows);
+        try testing.expect(pad_ppm <= bound_ppm + slack_ppm);
+    }
     // Every Δ landed: the fold's newest size per inode is the last write's.
     for (inos) |ino| try testing.expect(try h.present(ino));
 }

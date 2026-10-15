@@ -290,8 +290,7 @@ pub const PlaneMover = struct {
     fn isOpenPack(ctx: *anyopaque, vol_tag: u64, idx: u64) bool {
         const self = self_(ctx);
         const p = &(self.plane.packer orelse return false);
-        const op = p.openPack(.{ .vol_tag = vol_tag, .scope = self.plane.scope }) orelse return false;
-        return op.base == idx * self.plane.chunk and !op.isSealed();
+        return p.isOpenBlock(vol_tag, idx * self.plane.chunk);
     }
     fn sealPack(ctx: *anyopaque, vol_tag: u64, idx: u64) void {
         const self = self_(ctx);

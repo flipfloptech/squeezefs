@@ -508,8 +508,7 @@ pub const linux = if (builtin.os.tag == .linux) struct {
     fn isOpenPack(ctx: ?*anyopaque, vol_tag: u64, block_idx: u64) bool {
         const pl: *plane_mod.DataPlane = @ptrCast(@alignCast(ctx.?));
         const p = &(pl.packer orelse return false);
-        if (p.openPack(.{ .vol_tag = vol_tag, .scope = pl.scope })) |op| return op.base / pl.chunk == block_idx;
-        return false;
+        return p.isOpenBlock(vol_tag, block_idx * pl.chunk);
     }
 
     /// The plane's codec pool behind the scrub's face (a codec per decode,

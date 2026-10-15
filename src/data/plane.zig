@@ -1948,15 +1948,14 @@ pub const DataPlane = struct {
         return .{ .ctx = self, .allocate_placed = &packAllocatePlaced, .pin = &packPin, .release = &packRelease, .publish = &packPublish, .abandon = &packAbandon, .refcount = &packRefcount };
     }
 
-    fn packAllocatePlaced(ctx: *anyopaque, _: u64) pack.AllocError!pack.Placed {
+    fn packAllocatePlaced(ctx: *anyopaque, k: pack.PackKey) pack.AllocError!pack.Mint {
         const self: *DataPlane = @ptrCast(@alignCast(ctx));
-        const tag = (self.rt.pickVolume() catch return error.OutOfMemory) orelse return error.StorageFull;
-        const v = self.vols.byTag(tag) orelse return error.VolumeFailed;
+        const v = self.vols.byTag(k.vol_tag) orelse return error.VolumeFailed;
         const m = enospc.allocateWithValve(v.alloc, self.io, enospc.Valve.fromReclaimer(self.reclaimer)) catch |e| return switch (e) {
             error.StorageFull => error.StorageFull,
             error.ReadOnly, error.PlaneRefused, error.NotFree => error.VolumeFailed,
         };
-        return .{ .vol_tag = tag, .offset = m.offset, .incarnation = m.stamp };
+        return .{ .offset = m.offset, .incarnation = m.stamp };
     }
 
     fn packPin(ctx: *anyopaque, vol_tag: u64, offset: u64) bool {
@@ -3510,7 +3509,8 @@ pub const DataPlane = struct {
         var rows: u64 = 0;
         for (self.vols.rows[0..self.vols.n()]) |r| {
             const v = r.?;
-            var report = block_refs.verifyRefs(gpa, self.refs_store, v.vol_tag, owners.items, .{ .ctx = self, .isOpenPack = &isOpenPack, .isInflight = &isInflight }) catch |e| {
+            var x: MountExempt = .{ .plane = self, .vol_tag = v.vol_tag };
+            var report = block_refs.verifyRefs(gpa, self.refs_store, v.vol_tag, owners.items, x.exemptions()) catch |e| {
                 log.err("C8 at mount: vol-{x:0>16}: {s}", .{ v.vol_tag, @errorName(e) });
                 continue;
             };
@@ -3526,20 +3526,28 @@ pub const DataPlane = struct {
         stats.block_refs_drift_rows.set(rows);
     }
 
-    fn isOpenPack(ctx: ?*anyopaque, block_idx: u64) bool {
-        const self: *DataPlane = @ptrCast(@alignCast(ctx.?));
-        const p = &(self.packer orelse return false);
-        for (self.vols.rows[0..self.vols.n()]) |r| {
-            if (p.openPack(.{ .vol_tag = r.?.vol_tag, .scope = self.scope })) |op| if (op.base / self.chunk == block_idx) return true;
-        }
-        return false;
-    }
+    /// C8 at mount's exemptions while it judges ONE volume.
+    const MountExempt = struct {
+        plane: *DataPlane,
+        vol_tag: u64,
 
-    fn isInflight(ctx: ?*anyopaque, block_idx: u64) bool {
-        const self: *DataPlane = @ptrCast(@alignCast(ctx.?));
-        for (self.vols.rows[0..self.vols.n()]) |r| if (r.?.alloc.inflightContains(block_idx)) return true;
-        return false;
-    }
+        fn exemptions(self: *MountExempt) block_refs.Exemptions {
+            return .{ .ctx = self, .isOpenPack = &isOpenPack, .isInflight = &isInflight };
+        }
+
+        fn isOpenPack(ctx: ?*anyopaque, block_idx: u64) bool {
+            const self: *MountExempt = @ptrCast(@alignCast(ctx.?));
+            const p = &(self.plane.packer orelse return false);
+            return p.isOpenBlock(self.vol_tag, block_idx * self.plane.chunk);
+        }
+
+        fn isInflight(ctx: ?*anyopaque, block_idx: u64) bool {
+            const self: *MountExempt = @ptrCast(@alignCast(ctx.?));
+            const vols = &self.plane.vols;
+            for (vols.rows[0..vols.n()]) |r| if (r.?.alloc.inflightContains(block_idx)) return true;
+            return false;
+        }
+    };
 
     /// Every layout record in the xattr tree → its owner's bindings: the
     /// inline map's entries, or — for a tree-mapped head — every record of
@@ -3725,11 +3733,12 @@ test "a packed promotion's pack opens on the volume the promotion picked: the re
         try pl.rt.addVolume(.{ .id = .{ .tag = t }, .capacity_bytes = 16 * chunk });
     }
     defer for (allocs) |a| a.deinit();
-    var packer = try pack.Packer.init(gpa, chunk, .{ .enabled = true, .max_slot = chunk / 2 }, pl.packAllocSeam(), pl.dmaSeam(), pl.packReadSeam(), router.MAX_VOLUMES);
-    defer packer.deinit();
+    pl.packer = try pack.Packer.init(gpa, chunk, .{ .enabled = true, .max_slot = chunk / 2 }, pl.packAllocSeam(), pl.dmaSeam(), pl.packReadSeam(), router.MAX_VOLUMES);
+    defer pl.packer.?.deinit();
+    const packer = &pl.packer.?;
     // Two equal volumes, a round-robin pick: a second pick inside the refill
     // would name the other volume.
-    for (0..2) |_| {
+    for (0..2) |i| {
         const tag = (try pl.rt.pickVolume()).?;
         const k: pack.PackKey = .{ .vol_tag = tag, .scope = pl.scope };
         const tenant = (try packer.reserve(testing.io, k, 4096)).?;
@@ -3739,6 +3748,16 @@ test "a packed promotion's pack opens on the volume the promotion picked: the re
         // Tracked on the picked volume: the pack's pin + the tenant's.
         const a = pl.vols.byTag(tag).?.alloc;
         try testing.expectEqual(@as(?u32, 2), a.refcount(a.idxOf(open.base)));
+        // The exemption faces match the block by its own volume and base (C8
+        // at mount here; fsck's runner and the mover ask the same `isOpenBlock`).
+        var on: DataPlane.MountExempt = .{ .plane = pl, .vol_tag = tag };
+        const ex = on.exemptions();
+        try testing.expect(ex.isOpenPack(ex.ctx, a.idxOf(open.base)));
+        if (i == 0) {
+            var off: DataPlane.MountExempt = .{ .plane = pl, .vol_tag = if (tag == tags[0]) tags[1] else tags[0] };
+            const ex_off = off.exemptions();
+            try testing.expect(!ex_off.isOpenPack(ex_off.ctx, a.idxOf(open.base)));
+        }
     }
 }
 

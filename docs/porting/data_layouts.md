@@ -646,6 +646,9 @@ Every fresh-block site (write-through, overlay, flush/fold uploads, spills, blob
 packer's refill) calls `allocate_placed_block` and DMAs BEFORE the layout commit that names the block; the commit
 carries the `+ref`/`−ref` in the same tx; the displaced binding is freed only after the durable publish and after the
 3.5 guard drops (RES-1). Durable promotion = the same law applied to a type flip (§2.5, §4.4).
+Port detail: a promotion picks ONCE. That pick names the transform and the pack key `(volume, scope)`, and the
+packer's refill mints on the key's volume, never on a second pick (the reference keys its row by the refill's
+answer instead). A pack placed off its key's volume escaped fsck's open-pack exemption: leak67.
 
 ---
 

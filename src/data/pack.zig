@@ -294,6 +294,9 @@ pub const OpenPack = struct {
 
 pub const Placed = struct { vol_tag: u64, offset: u64, incarnation: u64 };
 
+/// A block minted on the volume the caller named.
+pub const Mint = struct { offset: u64, incarnation: u64 };
+
 pub const AllocError = error{ StorageFull, VolumeFailed, OutOfMemory };
 
 pub const ReleaseVerdict = enum {
@@ -306,15 +309,18 @@ pub const ReleaseVerdict = enum {
 };
 
 /// The block allocator's face (`data/block_refs.zig` + the allocator bind it;
-/// the RAM refcount is theirs). `allocate_placed` = `pick + allocate` as ONE
-/// act, minted at refcount 1 = the packer's PIN; `pin` is acquire-from-
-/// nonzero (false ⇒ the count hit 0 under the caller); `publish` is the
-/// idempotent `fetch_or` that stabilises the block's word (the FIRST
-/// tenant's publish — a stable word keeps the block movable and a peer's
-/// tenant free answerable); `abandon` returns a never-published mint.
+/// the RAM refcount is theirs). `allocate_placed` mints ONE block on
+/// `k.vol_tag` at refcount 1 = the packer's PIN. The key's volume is the one
+/// the promotion picked and transformed the image for; the seam never picks
+/// again (a second pick put key A's pack on B, and fsck missed it: leak67).
+/// `pin` is acquire-from-nonzero (false ⇒ the count hit 0 under the
+/// caller); `publish` is the idempotent `fetch_or` that stabilises the
+/// block's word (the FIRST tenant's publish — a stable word keeps the block
+/// movable and a peer's tenant free answerable); `abandon` returns a
+/// never-published mint.
 pub const AllocSeam = struct {
     ctx: *anyopaque,
-    allocate_placed: *const fn (ctx: *anyopaque, scope: u64) AllocError!Placed,
+    allocate_placed: *const fn (ctx: *anyopaque, k: PackKey) AllocError!Mint,
     pin: *const fn (ctx: *anyopaque, vol_tag: u64, offset: u64) bool,
     release: *const fn (ctx: *anyopaque, vol_tag: u64, offset: u64) ReleaseVerdict,
     publish: *const fn (ctx: *anyopaque, vol_tag: u64, offset: u64) void,
@@ -556,13 +562,13 @@ pub const Packer = struct {
             const self = c.packer;
             if (self.isStopped()) return error.StorageFull;
             if (c.row.pack.load(.acquire)) |existing| if (!existing.isSealed()) return existing;
-            const placed = try self.alloc.allocate_placed(self.alloc.ctx, c.key.scope);
+            const minted = try self.alloc.allocate_placed(self.alloc.ctx, c.key);
             const p = try self.gpa.create(OpenPack);
             p.* = .{
-                .vol_tag = placed.vol_tag,
+                .vol_tag = c.key.vol_tag,
                 .scope = c.key.scope,
-                .base = placed.offset,
-                .incarnation = placed.incarnation,
+                .base = minted.offset,
+                .incarnation = minted.incarnation,
                 .chunk = self.chunk,
                 .seq = self.seq.fetchAdd(1, .monotonic) + 1,
                 .opened_at_ns = clock.monotonicNs(),
@@ -571,7 +577,7 @@ pub const Packer = struct {
             self.opened.append(self.gpa, p) catch |e| {
                 self.rows_lock.unlock();
                 self.gpa.destroy(p);
-                self.alloc.abandon(self.alloc.ctx, placed.vol_tag, placed.offset);
+                self.alloc.abandon(self.alloc.ctx, c.key.vol_tag, minted.offset);
                 return e;
             };
             self.rows_lock.unlock();
@@ -582,7 +588,7 @@ pub const Packer = struct {
                 if (cur) |existing| if (!existing.isSealed()) {
                     // Lost to a concurrent install: abandon the unpublished mint.
                     p.sealed.store(true, .release);
-                    self.alloc.abandon(self.alloc.ctx, placed.vol_tag, placed.offset);
+                    self.alloc.abandon(self.alloc.ctx, c.key.vol_tag, minted.offset);
                     return existing;
                 };
                 if (c.row.pack.cmpxchgStrong(cur, p, .acq_rel, .acquire) == null) break;
@@ -785,6 +791,13 @@ pub const Packer = struct {
         _ = pack.released.fetchAdd(1, .acq_rel);
         self.countRelease(self.alloc.release(self.alloc.ctx, pack.vol_tag, pack.base));
         return true;
+    }
+
+    /// Is `(vol_tag, base)` an open pack's block? The ONE answer every
+    /// exemption face asks (fsck, the mover): matched by the pack's own
+    /// placement, never through a row key (`openPack` claims a row).
+    pub fn isOpenBlock(self: *Packer, vol_tag: u64, base: u64) bool {
+        return self.openPackAt(vol_tag, base) != null;
     }
 
     /// The open pack whose block is `(vol_tag, base)`, if any.
@@ -1199,14 +1212,14 @@ const World = struct {
         return .{ .ctx = self, .allocate_placed = allocatePlaced, .pin = pin, .release = release, .publish = publish, .abandon = abandon, .refcount = refcount };
     }
 
-    fn allocatePlaced(ctx: *anyopaque, _: u64) AllocError!Placed {
+    fn allocatePlaced(ctx: *anyopaque, k: PackKey) AllocError!Mint {
         const self: *World = @ptrCast(@alignCast(ctx));
         if (self.storage_full) return error.StorageFull;
         const off = self.next_block * CHUNK;
         self.next_block += 1;
         self.allocs += 1;
-        try self.refcounts.put(self.gpa, .{ 0x11, off }, 1);
-        return .{ .vol_tag = 0x11, .offset = off, .incarnation = 5 };
+        try self.refcounts.put(self.gpa, .{ k.vol_tag, off }, 1);
+        return .{ .offset = off, .incarnation = 5 };
     }
 
     fn pin(ctx: *anyopaque, vol_tag: u64, offset: u64) bool {

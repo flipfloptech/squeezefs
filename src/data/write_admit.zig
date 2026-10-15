@@ -1422,16 +1422,22 @@ const World = struct {
     wp: *WritePath,
 
     fn init(gpa: Allocator, depth: pipeline.DepthOverride, overlay_on: bool) !*World {
+        return initSized(gpa, depth, overlay_on, 8, 32);
+    }
+
+    /// `init` with the parked cap and the blocks per volume a row parking
+    /// many blocks needs.
+    fn initSized(gpa: Allocator, depth: pipeline.DepthOverride, overlay_on: bool, parked_cap: u64, blocks_per_vol: u64) !*World {
         const w = try gpa.create(World);
         errdefer gpa.destroy(w);
-        w.f = try wt.Fixture.init(gpa, 32);
+        w.f = try wt.Fixture.init(gpa, blocks_per_vol);
         w.stripes = .{};
         const cfg: Config = .{
             .block_size = wt.BS,
             .patch_max = wt.BS / 8,
             .overlay = .{ .block_size = wt.BS, .patch_max = wt.BS / 8, .enabled = overlay_on },
             .rewrite_shadow = true,
-            .parked_cap = 8,
+            .parked_cap = parked_cap,
             .depth_override = depth,
             .fsync = .{},
         };
@@ -2082,6 +2088,26 @@ test "W2 amplification law, CoW bases land whole ONCE per parked episode: a clon
     try testing.expectEqualSlices(u8, &sector, got[5 * PAGE + 7 .. 5 * PAGE + 519]);
     try testing.expectEqualSlices(u8, &sector, got[9 * PAGE + 7 .. 9 * PAGE + 519]);
     try testing.expect(std.mem.allEqual(u8, got[0 .. 5 * PAGE + 7], 0xB0));
+}
+
+test "fsync and the RELEASE drain land EVERY block the ino parked before them — past one buffer of the flush's census (a random writer under the write-back timer parks a partial block per block it touched): 80 parked partial blocks, none left in RAM" {
+    const io = testing.io;
+    const blocks: u32 = 80;
+    // Two inos' blocks parked at once, then landed on fresh blocks.
+    const w = try World.initSized(testing.allocator, .sync_inline, true, 2 * blocks, 2 * blocks);
+    defer w.deinit(testing.allocator);
+    var tail: [1000]u8 = @splat(0x31);
+    for ([_]u64{ 30, 31 }) |ino| {
+        for (0..blocks) |b| _ = try w.wp.write(io, .{ .ino = ino, .offset = b * wt.BS, .payload = .{ .bytes = &tail }, .class = .entire_op, .file = World.striped(blocks * wt.BS) });
+        var held: [2 * blocks]u32 = undefined;
+        try testing.expectEqual(@as(usize, blocks), w.wp.table.blocksOf(ino, &held).len);
+    }
+    var prof = fsync_mod.Prof.start();
+    try fsync_mod.fsync(w.wp.fsyncCtx(), io, 30, &prof);
+    prof.finish();
+    try testing.expect(!w.wp.table.holdsIno(30));
+    w.wp.flushIno(io, 31);
+    try testing.expect(!w.wp.table.holdsIno(31));
 }
 
 test "fsync through the write path: a parked block, an open overlay and a shadowed epoch all land; the phases sum exactly; nothing stays open" {

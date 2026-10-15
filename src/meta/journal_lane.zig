@@ -2496,11 +2496,20 @@ test "a dead ring latches the volume FAILED at once (a device fence is terminal)
     const a = try h.append(1, 500, 0x11);
     try a.ticket.wait().result;
     try testing.expect(!lane.isFailed());
-    // The fiber's next poll admits the window, then the ring dies under it
-    // as a failed `io_uring_enter` would kill it.
-    test_seams.kill_ring.store(1, .release);
+    // The poll that admits b prepares its WRITE SQE, then the ring dies before
+    // any enter, as a failed `io_uring_enter` leaves it. A foreign message
+    // posted during that poll (the shutdown kick's shape) sends the lane loop
+    // through its pre-park flush: a dead ring must submit nothing there.
+    test_seams.held.store(0, .release);
+    test_seams.hold_before_scan.store(1, .release);
     const b = try h.append(2, 500, 0x22);
+    while (test_seams.held.load(.acquire) == 0) futex.wait(&test_seams.held, 0);
+    test_seams.kill_ring.store(1, .release);
+    lane.execLane().postCancelOp(lane.fiber.?);
+    test_seams.hold_before_scan.store(0, .release);
+    futex.wakeAll(&test_seams.hold_before_scan);
     try testing.expectError(error.RingFailed, b.ticket.wait().result);
+    test_seams.held.store(0, .release);
     try testing.expect(lane.isFailed());
     try testing.expectEqual(dead0 + 1, stats.rings_dead.load());
     try testing.expectEqual(failed0 + 1, stats.volumes_failed.load());

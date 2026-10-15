@@ -630,11 +630,16 @@ test "quiesce on the ring's thread, deinit on the joiner's: the standing READ is
     pr.deinit();
 }
 
-test "a dead ring parks on the eventfd alone: the tick still fires, a wake still arrives and is consumed" {
+test "a dead ring submits nothing and parks on the eventfd alone: a prepared SQE stays unsubmitted through a flush; the tick still fires, a wake still arrives and is consumed" {
     var pr = try ParkedRing.init(testing.allocator, 8, 0);
     defer pr.deinit();
+    // Prepared before the verdict, as a failed enter leaves its SQEs: the
+    // owner has already answered this op, so the kernel must never see it.
+    pr.getSqe().?.prep_nop();
     pr.markDead();
     try testing.expect(pr.isDead());
+    pr.flush();
+    try testing.expectEqual(@as(u32, 1), pr.ring.sq_ready());
     try testing.expect(!pr.armWake());
     try testing.expectEqual(Verdict.tick, pr.park(2 * std.time.ns_per_ms));
     pr.forceWake();

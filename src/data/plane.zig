@@ -221,6 +221,11 @@ pub const stats = struct {
     /// context not holding the (3.7) layout lock (debug builds; must stay
     /// 0 — the head's ONE authority, 0002 row 210).
     pub var kvmap_head_put_unlocked: counters.Tripwire = .init("kvmap_head_put_unlocked");
+    /// `layout_map_merge_displaced_overflow`: an inline-map fold displaced
+    /// more bindings than `MergeOutcome` holds (the excess would never be
+    /// freed). A fold displaces at most one binding per insert and a merge
+    /// carries at most `max_displaced` inserts — must stay 0.
+    pub var layout_map_merge_displaced_overflow: counters.Tripwire = .init("layout_map_merge_displaced_overflow");
     /// The promotion dispatch at dismount / pressure / fsync.
     pub var promotions_run: counters.ShardedCounter = .{};
     pub var promotions_stale: counters.ShardedCounter = .{};
@@ -285,7 +290,7 @@ pub fn writeStatsJson(w: *Io.Writer) Io.Writer.Error!void {
     inline for (.{ "layout_map_merges", "layout_map_merge_blocks", "layout_map_merge_failures", "layout_map_merges_shipped", "foreign_publish_kvmap_refusals", "layout_publishes_served", "kvmap_sweep_spawn_refusals", "promotions_run", "promotions_stale", "promotions_failed", "own_block_dmas", "own_block_dma_bytes", "held_stores", "held_store_failures", "hold_gate_admits", "hold_gate_declines", "prefetch_fibers", "prefetch_fiber_refusals", "hold_ceremony_fibers", "bindings_freed", "device_read_bounces", "data_device_read_bytes", "write_side_read_dma_bytes", "compose_read_dma_bytes", "pack_read_dma_bytes" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, @field(stats, name).load() });
     }
-    try w.print("\"data_unresolved_volume\":{d},\"kvmap_resolve_failures\":{d},\"kvmap_head_put_unlocked\":{d},\"release_free_unheld\":{d}}}", .{ counters.tripwireCount("data_unresolved_volume"), counters.tripwireCount("kvmap_resolve_failures"), counters.tripwireCount("kvmap_head_put_unlocked"), counters.tripwireCount("release_free_unheld") });
+    try w.print("\"data_unresolved_volume\":{d},\"kvmap_resolve_failures\":{d},\"kvmap_head_put_unlocked\":{d},\"release_free_unheld\":{d},\"layout_map_merge_displaced_overflow\":{d}}}", .{ counters.tripwireCount("data_unresolved_volume"), counters.tripwireCount("kvmap_resolve_failures"), counters.tripwireCount("kvmap_head_put_unlocked"), counters.tripwireCount("release_free_unheld"), counters.tripwireCount("layout_map_merge_displaced_overflow") });
 }
 
 // ---------------------------------------------------------------------------
@@ -2394,9 +2399,13 @@ pub const DataPlane = struct {
                 j += 1;
             } else {
                 const old = Mapping.decode(old_entries[i].mapping, chunk) catch return error.Corrupt;
-                if (!old.sameRef(inserts[j].binding, chunk) and out.n_displaced < seams.MergeOutcome.max_displaced) {
-                    out.displaced[out.n_displaced] = old;
-                    out.n_displaced += 1;
+                // One displaced per insert, at most `max_displaced` inserts
+                // per merge (`MergeRequest.inserts`): the else cannot run.
+                if (!old.sameRef(inserts[j].binding, chunk)) {
+                    if (out.n_displaced < seams.MergeOutcome.max_displaced) {
+                        out.displaced[out.n_displaced] = old;
+                        out.n_displaced += 1;
+                    } else stats.layout_map_merge_displaced_overflow.fire("an inline-map fold displaced more bindings than MergeOutcome holds; the excess is never freed");
                 }
                 merged.appendAssumeCapacity((layout.MapEntry{ .block = inserts[j].block, .mapping = inserts[j].binding }).encode());
                 i += 1;
@@ -3747,6 +3756,7 @@ test "foldInserts displaces at most one binding per insert, so a merge of at mos
         try testing.expectEqual(@as(u8, max), out.n_displaced);
         try testing.expectEqual(fired0, counters.tripwireCount(site));
     }
+    stats.layout_map_merge_displaced_overflow.resetLogBudgetForTest();
     log.testing.expectErrorLogs(1);
     var merged: std.ArrayList(layout.MapEntryWire) = .empty;
     defer merged.deinit(gpa);
@@ -3761,7 +3771,7 @@ test "stats JSON names every plane instrument" {
     var w: Io.Writer = .fixed(&buf);
     try writeStatsJson(&w);
     const s = w.buffered();
-    inline for (.{ "\"data_volumes\":", "\"layout_map_merges\":", "\"kvmap_sweep_spawn_refusals\":", "\"held_stores\":", "\"hold_gate_admits\":", "\"prefetch_fibers\":", "\"bindings_freed\":", "\"data_unresolved_volume\":", "\"kvmap_head_put_unlocked\":", "\"release_free_unheld\":" }) |k| {
+    inline for (.{ "\"data_volumes\":", "\"layout_map_merges\":", "\"kvmap_sweep_spawn_refusals\":", "\"held_stores\":", "\"hold_gate_admits\":", "\"prefetch_fibers\":", "\"bindings_freed\":", "\"data_unresolved_volume\":", "\"kvmap_head_put_unlocked\":", "\"release_free_unheld\":", "\"layout_map_merge_displaced_overflow\":" }) |k| {
         try testing.expect(std.mem.indexOf(u8, s, k) != null);
     }
 }

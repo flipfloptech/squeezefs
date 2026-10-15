@@ -212,6 +212,9 @@ pub const MergeError = error{
 
 pub const MergeRequest = struct {
     ino: u64,
+    /// At most `MergeOutcome.max_displaced` (the ONE save's buffer; every
+    /// other publisher sends one), each a distinct block: a merge displaces
+    /// at most one binding per insert, so `MergeOutcome` never overflows.
     inserts: []const MapInsert,
     /// The size floor the merge establishes (0 = none; SIZE NEVER LEADS DATA).
     min_size: u64,

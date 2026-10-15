@@ -170,6 +170,10 @@ pub const stats = struct {
     /// A record inside one ino's key range decoding to another owner — the
     /// range bounds are exact, so this cannot happen.
     pub var owner_mismatch: counters.Tripwire = .init("kvmap_owner_mismatch");
+    /// A window put displaced more bindings than `MergeOutcome` holds (the
+    /// excess would never be freed): one displaced per unique insert, at
+    /// most `max_displaced` inserts per merge — must stay 0.
+    pub var merge_displaced_overflow: counters.Tripwire = .init("kvmap_merge_displaced_overflow");
 };
 
 pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
@@ -177,7 +181,7 @@ pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
     inline for (.{ "meta_kv_block_map_puts", "meta_kv_block_map_run_puts", "meta_kv_block_map_deletes", "meta_kv_block_map_lookup_exact", "meta_kv_block_map_lookup_floor", "meta_kv_block_map_lookup_range", "meta_kv_block_map_range_records", "publish_map_record_bytes", "kvmap_crossings", "map_migrate_records", "map_migrate_resumed", "kvmap_window_saves", "map_sweep_jobs", "map_sweep_chunks", "map_sweep_records", "map_sweep_resumed", "kvmap_corpses_destroyed", "block_map_window_bytes", "kvmap_write_map_budget_bytes", "block_map_window_fills", "block_map_window_hits", "block_map_window_evictions", "kvmap_windows_shed", "fsck_map_orphan_records", "fsck_map_empty_heads", "fsck_map_run_foreign_shadows" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, @field(stats, name).load() });
     }
-    try w.print("\"meta_kv_block_map_leaf_reads\":{d},\"kvmap_owner_mismatch\":{d}}}", .{ node_cache.stats.meta_kv_block_map_leaf_reads.load(), counters.tripwireCount("kvmap_owner_mismatch") });
+    try w.print("\"meta_kv_block_map_leaf_reads\":{d},\"kvmap_owner_mismatch\":{d},\"kvmap_merge_displaced_overflow\":{d}}}", .{ node_cache.stats.meta_kv_block_map_leaf_reads.load(), counters.tripwireCount("kvmap_owner_mismatch"), counters.tripwireCount("kvmap_merge_displaced_overflow") });
 }
 
 // ---------------------------------------------------------------------------
@@ -511,10 +515,12 @@ pub fn stageWindow(store: Store, gpa: Allocator, t: *KvTx, ino: u64, inserts: []
                 continue;
             }
             try ref_ops.append(gpa, block_refs.released(refOf(ino, ins.block, old_b, chunk)));
+            // One displaced per unique insert, at most `max_displaced`
+            // inserts per merge (`MergeRequest.inserts`): the else cannot run.
             if (out.n_displaced < seams.MergeOutcome.max_displaced) {
                 out.displaced[out.n_displaced] = old_b;
                 out.n_displaced += 1;
-            }
+            } else stats.merge_displaced_overflow.fire("a window put displaced more bindings than MergeOutcome holds; the excess is never freed");
         }
         try ref_ops.append(gpa, block_refs.taken(refOf(ino, ins.block, ins.binding, chunk)));
         cell.* = ins.binding;
@@ -1315,6 +1321,7 @@ test "the window put displaces at most one binding per (unique) insert, so a mer
         try testing.expectEqual(@as(u8, max), out.n_displaced);
         try testing.expectEqual(fired0, counters.tripwireCount(site));
     }
+    stats.merge_displaced_overflow.resetLogBudgetForTest();
     log.testing.expectErrorLogs(1);
     var t = KvTx.init(gpa, @src());
     defer t.deinit();
@@ -1610,7 +1617,7 @@ test "stats JSON names every instrument" {
     var w: std.Io.Writer = .fixed(&buf);
     try writeStatsJson(&w);
     const out = w.buffered();
-    inline for (.{ "\"meta_kv_block_map_puts\":", "\"meta_kv_block_map_lookup_floor\":", "\"meta_kv_block_map_range_records\":", "\"kvmap_crossings\":", "\"map_migrate_resumed\":", "\"kvmap_window_saves\":", "\"map_sweep_chunks\":", "\"map_sweep_resumed\":", "\"block_map_window_bytes\":", "\"fsck_map_orphan_records\":", "\"kvmap_owner_mismatch\":" }) |k| {
+    inline for (.{ "\"meta_kv_block_map_puts\":", "\"meta_kv_block_map_lookup_floor\":", "\"meta_kv_block_map_range_records\":", "\"kvmap_crossings\":", "\"map_migrate_resumed\":", "\"kvmap_window_saves\":", "\"map_sweep_chunks\":", "\"map_sweep_resumed\":", "\"block_map_window_bytes\":", "\"fsck_map_orphan_records\":", "\"kvmap_owner_mismatch\":", "\"kvmap_merge_displaced_overflow\":" }) |k| {
         try testing.expect(std.mem.indexOf(u8, out, k) != null);
     }
     try testing.expect(std.mem.endsWith(u8, out, "}"));

@@ -322,7 +322,10 @@ pub const Epochs = struct {
     /// keys: the map's A is the publisher's to free; our own keys (the
     /// shadow's B when it is not what landed, intermediate Bs) are
     /// unpublished mints the caller frees — returned in `orphans`, freed
-    /// with no lock held.
+    /// with no lock held. The epoch parks one intermediate B per rewrite of
+    /// the block, so their count has no bound: the ones past the batch stay
+    /// parked (under their guards) and the epoch's close frees them with the
+    /// rest of its parked set.
     pub fn supersede(self: *Epochs, ino: u64, block: u32, published: Binding, orphans: *[8]Binding) []Binding {
         self.lock.lock();
         defer self.lock.unlock();
@@ -330,9 +333,9 @@ pub const Epochs = struct {
         const e = self.table.get(ino) orelse return orphans[0..0];
         if (e.shadow.fetchRemove(block)) |kv| {
             stats.rewrite_shadow_superseded.inc();
-            if (!kv.value.binding.eql(published) and n < orphans.len) {
-                orphans[n] = kv.value.binding;
-                n += 1;
+            if (!kv.value.binding.eql(published)) {
+                orphans[0] = kv.value.binding;
+                n = 1;
             }
         }
         var i: usize = 0;
@@ -342,7 +345,11 @@ pub const Epochs = struct {
                 i += 1;
                 continue;
             }
-            if (p.origin == .epoch and n < orphans.len) {
+            if (p.origin == .epoch) {
+                if (n == orphans.len) {
+                    i += 1;
+                    continue;
+                }
                 orphans[n] = p.binding;
                 n += 1;
             }
@@ -500,9 +507,16 @@ pub const Epochs = struct {
                         return .fence_dropped;
                     },
                     error.NotFound => {
-                        // The ino never comes back: the B keys are orphans.
+                        // The ino never comes back: every key the epoch
+                        // minted is an orphan — the newest B per block and
+                        // each intermediate B parked as the epoch's (freed
+                        // under their guards, which `dropEpoch` drops after).
+                        // The map's A keys belong to the destroy.
                         stats.rewrite_shadow_orphan_discards.inc();
                         for (inserts_buf[0..n]) |ins| _ = cs.free.free(io, ins.binding);
+                        for (e.displaced.items) |p| if (p.origin == .epoch) {
+                            _ = cs.free.free(io, p.binding);
+                        };
                         self.dropEpoch(io, e);
                         return .orphan_discarded;
                     },

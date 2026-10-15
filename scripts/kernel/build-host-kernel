@@ -55,7 +55,12 @@ rsync -a -e "${SSH[*]}" "$stage/fragment" "$HOST:$RDIR/fragment"
 "${SSH[@]}" "$HOST" "cat > $RDIR/build.sh" <<'REMOTE'
 #!/usr/bin/env bash
 set -euo pipefail
+# A failed step says so in the log (set -e alone exits silently).
+trap 'echo "BUILD FAILED at line $LINENO: $BASH_COMMAND"' ERR
 cd /build/kernel
+# bindeb-pkg's build dependencies (dpkg-checkbuilddeps refuses without libdw-dev, etc.).
+sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq build-essential flex bison bc cpio \
+  dwarves libelf-dev libdw-dev libssl-dev zstd rsync debhelper-compat >/dev/null
 KVER=7.2.6
 TARBALL=linux-$KVER.tar.xz
 [ -f "$TARBALL" ] || curl -fsSL -o "$TARBALL" "https://cdn.kernel.org/pub/linux/kernel/v7.x/$TARBALL"
@@ -69,7 +74,10 @@ cp "/boot/config-$(uname -r)" .config
 scripts/config --set-str SYSTEM_TRUSTED_KEYS "" --set-str SYSTEM_REVOCATION_KEYS "" --set-str MODULE_SIG_KEY "certs/signing_key.pem"
 make olddefconfig >/dev/null
 lsmod > ../lsmod.txt
-yes '' | make LSMOD=../lsmod.txt localmodconfig >/dev/null 2>&1
+# Answers every new symbol's prompt with its default. (Not `yes '' | make …`: under
+# pipefail the SIGPIPE that ends `yes` fails the pipeline and set -e ends the build —
+# silently, as on 2026-10-14.)
+make LSMOD=../lsmod.txt localmodconfig < <(yes '') > ../localmodconfig.log 2>&1
 while IFS= read -r line; do
   case "$line" in
     ''|'#'*) continue ;;

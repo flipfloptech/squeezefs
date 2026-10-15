@@ -476,6 +476,9 @@ pub const Stats = struct {
     mode_resolves: counters.ShardedCounter = .{},
     /// `trySend` refusals (a full queue; the cell pool shares its bound).
     queue_full: counters.ShardedCounter = .{},
+    /// A request cell given back met a taker between its free-list dequeue
+    /// CAS and its sequence store (the wrap cell still filled).
+    cell_return_respins: counters.ShardedCounter = .{},
     /// Cells and the queue share one bound, so neither can happen: a held
     /// cell could not return to the free list / the queue refused a push
     /// while a cell was held.
@@ -493,7 +496,7 @@ fn recordWritePhases(s: WriteStamps) void {
     stats.phases[@backingInt(WritePhase.total)].record(s.observed_at -| s.submitted_at);
 }
 
-/// `{"meta_io":{…},"uring_fs_write_phase_ns":{…},"uring_queue_full":n}`
+/// `{"meta_io":{…},"uring_fs_write_phase_ns":{…},"uring_queue_full":n,"uring_fs_cell_return_respins":n}`
 pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
     try w.print("{{\"meta_io\":{{\"meta_io_direct_paths\":{d},\"meta_io_buffered_fallback\":{d},\"meta_io_bounce_bytes\":{d},\"meta_io_unaligned_refusals\":{d},\"meta_io_read_widened\":{d},\"meta_io_write_bytes\":{d}}},\"uring_fs_write_phase_ns\":{{", .{
         stats.direct_paths.load(),
@@ -508,7 +511,7 @@ pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
         try w.print("\"{s}\":", .{@tagName(phase)});
         try stats.phases[@backingInt(phase)].snapshot().writeJson(w);
     }
-    try w.print("}},\"uring_queue_full\":{d}}}", .{stats.queue_full.load()});
+    try w.print("}},\"uring_queue_full\":{d},\"uring_fs_cell_return_respins\":{d}}}", .{ stats.queue_full.load(), stats.cell_return_respins.load() });
 }
 
 // ---------------------------------------------------------------------------
@@ -1097,7 +1100,9 @@ pub const Pool = struct {
     }
 
     fn freeCell(self: *Pool, idx: u32) void {
-        if (!self.free_cells.tryPush(idx)) stats.cell_return_refused.fire("a request cell could not return to the free list");
+        if (self.free_cells.tryPush(idx)) return;
+        stats.cell_return_respins.inc();
+        stats.cell_return_refused.fire("a request cell could not return to the free list");
     }
 
     /// Worker side: publish the outcome; when the caller abandoned its
@@ -2048,6 +2053,36 @@ test "shutdown drains and joins: every outstanding handle completes, none hangs"
     for (got.bytes()) |x| try testing.expectEqual(@as(u8, 0), x);
 }
 
+test "a request cell given back while another taker sits between its free-list dequeue CAS and its sequence store is never lost (decision 0003 §AI.4): the free list holds all queue_cap cells, so the refused push is a taker mid-pop, not a full list — one respin, the give-back lands once that taker stores, every cell comes back" {
+    const pool = try Pool.init(testing.allocator, Config.fixed(1, 0));
+    defer pool.deinit();
+    const ring = &pool.free_cells;
+    // Taker 1 stalls mid-pop: its CAS took position 0; its store (cell 0
+    // handed to the producer at position queue_cap) has not run.
+    const stalled = ring.dequeue_pos.fetchAdd(1, .monotonic);
+    try testing.expectEqual(@as(usize, 0), stalled);
+    // Taker 2 pops position 1 whole and gives its cell back: the push at
+    // position queue_cap meets cell 0 still filled.
+    const idx = ring.tryPop().?;
+    const respins0 = stats.cell_return_respins.load();
+    const giver = try std.Thread.spawn(.{}, Pool.freeCell, .{ pool, idx });
+    while (stats.cell_return_respins.load() == respins0) std.Thread.yield() catch {};
+    // Taker 1 completes its pop and gives its cell back too.
+    const cell0 = &ring.cells[stalled & ring.mask];
+    const taken = cell0.data;
+    cell0.seq.store(stalled +% ring.mask +% 1, .release);
+    giver.join();
+    pool.freeCell(taken);
+    // Every cell back, each once.
+    var seen: [queue_cap]bool = @splat(false);
+    var n: usize = 0;
+    while (ring.tryPop()) |i| : (n += 1) {
+        try testing.expect(!seen[i]);
+        seen[i] = true;
+    }
+    try testing.expectEqual(queue_cap, n);
+}
+
 test "a registered metadata file opens O_DIRECT with a derived grain; lookup by given and canonical path; idempotent" {
     clearMetaDevices();
     var tp = try TmpPath.init();
@@ -2284,12 +2319,12 @@ test "the posture lookup resolves a path once and never on a hit; aliases; regis
     try testing.expectEqual(r0 + 4, stats.mode_resolves.load());
 }
 
-test "the stats JSON names every meta_io counter, the four write phases and the queue-full count" {
+test "the stats JSON names every meta_io counter, the four write phases, the queue-full count and the cell-return respins" {
     var buf: [8192]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
     try writeStatsJson(&w);
     const s = w.buffered();
-    for ([_][]const u8{ "\"meta_io\":{", "\"meta_io_direct_paths\":", "\"meta_io_buffered_fallback\":", "\"meta_io_bounce_bytes\":", "\"meta_io_unaligned_refusals\":", "\"meta_io_read_widened\":", "\"uring_fs_write_phase_ns\":{", "\"queue_hop\":", "\"device\":", "\"wake_hop\":", "\"total\":", "\"uring_queue_full\":" }) |needle| {
+    for ([_][]const u8{ "\"meta_io\":{", "\"meta_io_direct_paths\":", "\"meta_io_buffered_fallback\":", "\"meta_io_bounce_bytes\":", "\"meta_io_unaligned_refusals\":", "\"meta_io_read_widened\":", "\"uring_fs_write_phase_ns\":{", "\"queue_hop\":", "\"device\":", "\"wake_hop\":", "\"total\":", "\"uring_queue_full\":", "\"uring_fs_cell_return_respins\":" }) |needle| {
         try testing.expect(std.mem.indexOf(u8, s, needle) != null);
     }
 }

@@ -57,7 +57,8 @@ run_once() {
   local verdict=green fields="" fails="" line="" v log t0 rc wall res
   git -C "$TRAIN" checkout -q --detach "$sha" || return 1
   for v in $VENUES; do
-    log=$STATE/$v-$sha.log
+    # One log per RUN: a retry on the same head must not overwrite the failure it retries.
+    log=$STATE/$v-$sha-$(date -u +%Y%m%dT%H%M%SZ).log
     t0=$(date +%s)
     SQZ_VENUE=$v "$REPO/scripts/venue" "cd '$TRAIN' && timeout 3900 zig build --cache-dir /build/zig-cache-v2 -Dfresh=true gate --summary all" > "$log" 2>&1
     rc=$?

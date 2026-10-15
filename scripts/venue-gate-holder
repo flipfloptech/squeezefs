@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Names what holds a venue's gate lock, for scripts/venue's waiting messages: a wait
+# that only said "a full gate holds the venue" read as a hang. Prints e.g.
+# `gate in .wt-train, pid 2152007, running 11:48`; prints nothing when no one holds it.
+# Runs inside the venue (Linux: /proc/locks).
+f=${1:-/build/.gate.lock}
+ino=$(stat -c %i "$f" 2>/dev/null) || exit 0
+# /proc/locks: `N: FLOCK  ADVISORY  WRITE <pid> <maj>:<min>:<inode> …`; a waiter's line
+# reads `N: -> FLOCK …`, so field 2 is "->" and the holder is the one line without it.
+pid=$(awk -v ino="$ino" '$2 == "FLOCK" && $4 == "WRITE" && $6 ~ (":" ino "$") { print $5; exit }' /proc/locks)
+[ -n "$pid" ] || exit 0
+cmd=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null)
+where=$(printf '%s %s' "$(readlink "/proc/$pid/cwd" 2>/dev/null)" "$cmd" | grep -o '\.wt-[A-Za-z0-9_-]*' | head -1)
+what=gate
+case $cmd in *bindeb-pkg*) what="kernel build" ;; *install-*.sh*) what="kernel install" ;; esac
+printf '%s in %s, pid %s, running %s' "$what" "${where:-the main tree}" "$pid" "$(ps -o etime= -p "$pid" | tr -d ' ')"

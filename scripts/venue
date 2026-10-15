@@ -146,7 +146,7 @@ run_in() {
   local all_slots="" s
   for ((s = 0; s < SLOTS; s++)); do all_slots="$all_slots flock -o /build/.build-slot.$s"; done
   if printf '%s' "$cmd" | grep -Eq 'zig build[^;&|]*[[:space:]]gate([[:space:]]|$)'; then
-    cmd="flock -o -n /build/.gate.lock true 2>/dev/null || echo 'venue: another full gate is running — waiting for /build/.gate.lock' >&2; flock -o /build/.gate.lock$all_slots bash -lc $q"
+    cmd="flock -o -n /build/.gate.lock true 2>/dev/null || echo \"venue: another full gate holds the venue (\$(bash scripts/venue-gate-holder 2>/dev/null)) — waiting for it\" >&2; flock -o /build/.gate.lock$all_slots bash -lc $q"
   elif printf '%s' "$cmd" | grep -Eq 'zig build' || [ "${SQZ_VENUE_SLOT:-0}" = 1 ]; then
     # (SQZ_VENUE_SLOT=1: any heavy command — a loop of smoke rows, daemons, `yes` load —
     # takes a slot too, so a full gate, which holds every slot, never runs beside it.)
@@ -156,7 +156,7 @@ run_in() {
     # each slot the moment it freed and the train held the gate lock 28 min waiting for
     # slot 0 (kamrui, 2026-10-15). A waiting command polls every slot and takes the first
     # that frees.
-    cmd="r=75; said=0; while :; do flock -s -o -n /build/.gate.lock true || { echo 'venue: a full gate holds the venue — waiting for it' >&2; flock -s -o /build/.gate.lock true; }; for s in \$(seq 0 $((SLOTS - 1))); do flock -o -n -E 75 /build/.build-slot.\$s bash -lc $q; r=\$?; [ \$r -ne 75 ] && break 2; done; [ \$said = 1 ] || echo 'venue: $SLOTS builds are running — waiting for a build slot' >&2; said=1; sleep 2; done; exit \$r"
+    cmd="r=75; said=0; while :; do flock -s -o -n /build/.gate.lock true || { echo \"venue: a full gate holds the venue (\$(bash scripts/venue-gate-holder 2>/dev/null)) — waiting for it\" >&2; flock -s -o /build/.gate.lock true; }; for s in \$(seq 0 $((SLOTS - 1))); do flock -o -n -E 75 /build/.build-slot.\$s bash -lc $q; r=\$?; [ \$r -ne 75 ] && break 2; done; [ \$said = 1 ] || echo 'venue: $SLOTS builds are running — waiting for a build slot' >&2; said=1; sleep 2; done; exit \$r"
   fi
   # -lc so PATH picks up /usr/local/bin/zig; cd into the repo at the same path.
   if [ "$VENUE" = vm ]; then

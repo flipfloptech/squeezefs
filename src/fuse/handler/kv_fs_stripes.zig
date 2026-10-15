@@ -64,6 +64,9 @@ pub const stats = struct {
     pub var dir_stripe_migrations_done: counters.ShardedCounter = .{};
     /// A verdict cache flushed whole at its cap.
     pub var dir_stripe_cache_flushes: counters.ShardedCounter = .{};
+    /// A verdict-cache entry (or a whole map's install) refused for
+    /// memory: nothing cached, the next verdict re-reads the records.
+    pub var dir_stripe_cache_drops: counters.ShardedCounter = .{};
 };
 
 /// What the prelude knows of a directory.
@@ -166,7 +169,7 @@ pub fn Stripes(comptime Fs: type) type {
             stripe.writeStripeRecords(Store, self.fs.store, out[0..n], attrs) catch return 0;
             self.lock.lockUncancelable(self.io);
             defer self.lock.unlock(self.io);
-            for (out[0..n]) |s| self.stripe_of.put(self.gpa, s, dir) catch {};
+            for (out[0..n]) |s| self.stripe_of.put(self.gpa, s, dir) catch stats.dir_stripe_cache_drops.inc();
             return n;
         }
 
@@ -190,10 +193,15 @@ pub fn Stripes(comptime Fs: type) type {
                 self.stripe_of.clearRetainingCapacity();
                 stats.dir_stripe_cache_flushes.inc();
             }
+            // All or nothing: a cached map is never re-read, so a part
+            // cached without its queue entry would never migrate.
+            self.maps.ensureUnusedCapacity(self.gpa, 1) catch return stats.dir_stripe_cache_drops.inc();
+            self.stripe_of.ensureUnusedCapacity(self.gpa, map.k) catch return stats.dir_stripe_cache_drops.inc();
+            self.migrating.ensureUnusedCapacity(self.gpa, 1) catch return stats.dir_stripe_cache_drops.inc();
             _ = self.plain.remove(map.dir);
-            self.maps.put(self.gpa, map.dir, map) catch return;
-            for (map.slice()) |s| self.stripe_of.put(self.gpa, s, map.dir) catch {};
-            if (map.migrating) self.migrating.append(self.gpa, map.dir) catch {};
+            self.maps.putAssumeCapacity(map.dir, map);
+            for (map.slice()) |s| self.stripe_of.putAssumeCapacity(s, map.dir);
+            if (map.migrating) self.migrating.appendAssumeCapacity(map.dir);
         }
 
         // ---- the verdict ----
@@ -225,7 +233,7 @@ pub fn Stripes(comptime Fs: type) type {
             if (stripe.isStripeRecord(v)) {
                 self.lock.lockUncancelable(self.io);
                 defer self.lock.unlock(self.io);
-                self.stripe_of.put(self.gpa, global, 0) catch {};
+                self.stripe_of.put(self.gpa, global, 0) catch stats.dir_stripe_cache_drops.inc();
                 return .{ .stripe = 0 };
             }
             // The commit marker first (one targeted probe); present ⇒ the
@@ -238,7 +246,7 @@ pub fn Stripes(comptime Fs: type) type {
                         self.plain.clearRetainingCapacity();
                         stats.dir_stripe_cache_flushes.inc();
                     }
-                    self.plain.put(self.gpa, global, gen) catch {};
+                    self.plain.put(self.gpa, global, gen) catch stats.dir_stripe_cache_drops.inc();
                 }
                 return .plain;
             };

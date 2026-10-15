@@ -182,6 +182,11 @@ pub fn killSuidgidMode(mode: u32) u32 {
 // Instruments.
 // ---------------------------------------------------------------------------
 
+/// `fuse_parent_memo_drops`: a directory's `..` memo refused for memory —
+/// its `..` answers ENOENT, readdir's `..` names the directory itself and
+/// the ancestry walk cannot confirm through it, until its next lookup
+/// records it.
+pub var fuse_parent_memo_drops: counters.ShardedCounter = .{};
 /// `fuse_write_no_data_volume_refused`: a WRITE/truncate past `inline_max`
 /// on a set with NO data volumes answered EFBIG — the set's honest
 /// capacity, not a stopgap (a set with volumes never refuses here).
@@ -1204,7 +1209,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         fn rememberParent(self: *Self, dir: u64, parent: u64) void {
             self.parents_lock.lock();
             defer self.parents_lock.unlock();
-            self.parents.put(self.gpa, dir, parent) catch {};
+            self.parents.put(self.gpa, dir, parent) catch fuse_parent_memo_drops.inc();
         }
 
         fn parentOf(self: *Self, dir: u64) ?u64 {

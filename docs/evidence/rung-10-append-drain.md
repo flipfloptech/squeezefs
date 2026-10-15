@@ -100,3 +100,9 @@ extension.
 **Cross-daemon size changes (§AL.6).** `two_holders.zig` "a shipped size change runs the
 HOLDER's own size path": the holder applied the size alone; now it runs the filesystem's truncate
 face or rejects.
+
+**The interception-host row (gate F1 on the first cut).** Attributed to this wave, not the row's
+flake (`flakes.md` names a different signature): `THE INTERCEPTION HOST` ×10 — `dev` 10/10 green;
+the ordered law's first cut 7/7 red (`pread` of the ring-written block read 0 B: the plane's read
+path clamped at the DURABLE size); folding the claim into `DataPlane.inodeSize` — 10/10 green.
+

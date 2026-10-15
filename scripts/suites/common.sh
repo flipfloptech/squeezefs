@@ -96,7 +96,10 @@ suite_packages() {
     apt-get -qq clean
   fi
   local current
-  current=$(for p in "${SUITE_PACKAGES[@]}"; do dpkg-query -W -f='${Package}=${Version}\n' "$p"; done | sort)
+  # Byte order: the caller's locale reaches here through ssh and sudo, and en_US.UTF-8
+  # sorts `libtool=` before `libtool-bin=` while C sorts it after — a lock pinned under
+  # one refused every run under the other (kamrui, the gate train's LC_ALL=C).
+  current=$(for p in "${SUITE_PACKAGES[@]}"; do dpkg-query -W -f='${Package}=${Version}\n' "$p"; done | LC_ALL=C sort)
   if [ ! -s "$APT_LOCK" ] || [ "${SUITE_REFRESH_LOCK:-0}" = 1 ]; then
     printf '%s\n' "$current" > "$APT_LOCK"
     suite_log "$(basename "$APT_LOCK") written (${#SUITE_PACKAGES[@]} packages)"

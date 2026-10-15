@@ -195,6 +195,11 @@ pub const InitArgs = struct {
     /// FLUSH at every close (no `FOPEN_NOFLUSH`), and FLUSH carries the
     /// write-back drain RELEASE carried.
     no_open: bool = false,
+    /// The write-back timer (decision 0003 §AJ): close is no durability
+    /// point — every regular open and CREATE reply carries `FOPEN_NOFLUSH`
+    /// (in either open posture) and RELEASE drains nothing; the mount's
+    /// timer lands custody within `T_wb`.
+    writeback_timer: bool = false,
 
     pub fn has(self: InitArgs, bit: u64) bool {
         return self.negotiated & bit != 0;

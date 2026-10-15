@@ -475,6 +475,10 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         /// reply leaves the kernel its FLUSH at every close, and FLUSH
         /// carries the write-back drain.
         no_open: bool = false,
+        /// The write-back timer (decision 0003 §AJ), from INIT: every
+        /// regular reply carries `FOPEN_NOFLUSH` and RELEASE drains nothing
+        /// — the mount's timer lands custody (`drainAged`).
+        writeback_timer: bool = false,
         /// The mount identity (the virtual inodes' owner).
         uid: u32,
         gid: u32,
@@ -1195,10 +1199,12 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
 
         fn regularOpenFlags(self: *const Self) u32 {
             var f: u32 = abi.FOPEN_KEEP_CACHE;
-            // FOPEN_NOFLUSH: fuse ≥ 7.35, the control arm only — a no-open
-            // CREATE's file gets no RELEASE once the connection latched,
-            // so its close's FLUSH is the drain. FOPEN_PARALLEL_DIRECT_WRITES: ≥ 7.38.
-            if (self.minor >= 35 and !self.no_open) f |= abi.FOPEN_NOFLUSH;
+            // FOPEN_NOFLUSH: fuse ≥ 7.35 — the control open arm's, and the
+            // write-back timer's in either arm (close is no durability
+            // point); a no-open CREATE's file under the close posture gets
+            // no RELEASE once the connection latched, so its close's FLUSH
+            // is the drain. FOPEN_PARALLEL_DIRECT_WRITES: ≥ 7.38.
+            if (self.minor >= 35 and (!self.no_open or self.writeback_timer)) f |= abi.FOPEN_NOFLUSH;
             if (self.minor >= 38) f |= abi.FOPEN_PARALLEL_DIRECT_WRITES;
             return f;
         }
@@ -1496,6 +1502,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             self.minor = a.minor;
             self.killpriv_v2 = a.has(abi.FUSE_HANDLE_KILLPRIV_V2);
             self.no_open = a.no_open;
+            self.writeback_timer = a.writeback_timer;
             // The directory-parent memo feeds the handover's subtree credit.
             if (@hasDecl(Store, "bindParentMemo")) self.store.bindParentMemo(.{ .ctx = self, .parentOf = parentMemoSeam });
             // The handover's step 0 drains the departing slot's parked stamps.
@@ -3132,11 +3139,26 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         }
 
         /// RELEASE: the write-back class drains (charter §6.2 "flush at
-        /// release").
+        /// release") — under the close posture; the write-back timer lands
+        /// it within `T_wb` instead (decision 0003 §AJ).
         pub fn release(self: *Self, _: *Ctx, a: filesystem.ReleaseArgs) Error!void {
             if (virtual_inodes.isVirtualIno(a.ino)) return self.virtuals.unpin(a.ino);
+            if (self.writeback_timer) return;
             const local = localOf(a.ino) catch return;
             if (self.data.hasVolumes()) self.data.releaseIno(self.io, local);
+        }
+
+        /// The write-back timer's drain (decision 0003 §AJ,
+        /// `open_table.timerPass`): `ino`'s custody born at or before
+        /// `cutoff_ns` lands through the plane; the birth of the custody it
+        /// still holds comes back (the timer re-owes it).
+        pub fn drainAged(self: *Self, ino: u64, cutoff_ns: u64) open_table.Drained {
+            const none: open_table.Drained = .{ .landed = false, .kept_born_ns = null };
+            if (virtual_inodes.isVirtualIno(ino)) return none;
+            const local = localOf(ino) catch return none;
+            if (!self.data.hasVolumes()) return none;
+            const d = self.data.drainAged(self.io, local, cutoff_ns);
+            return .{ .landed = d.landed, .kept_born_ns = d.kept_born_ns };
         }
 
         /// fsync (charter §6.4): the ino's parked stamp journaled (§L.6),
@@ -3602,6 +3624,9 @@ pub const NoData = struct {
     pub fn freeBindings(_: *NoData, _: Io, _: []const Mapping) void {}
     pub fn flushCustody(_: *NoData, _: Io, _: u64) void {}
     pub fn releaseIno(_: *NoData, _: Io, _: u64) void {}
+    pub fn drainAged(_: *NoData, _: Io, _: u64, _: u64) open_table.Drained {
+        return .{ .landed = false, .kept_born_ns = null };
+    }
     pub fn hasWriteCustody(_: *NoData, _: u64) bool {
         return false;
     }
@@ -3983,6 +4008,12 @@ fn HarnessOf(comptime Data: type) type {
 
         /// `init` in the given open posture, INIT negotiated (minor 45).
         fn initPosture(self: *Self, no_open: bool) !void {
+            return self.initWriteback(no_open, .close);
+        }
+
+        /// `initPosture` under a write-back posture; the timer's INIT is
+        /// negotiated in either open arm.
+        fn initWriteback(self: *Self, no_open: bool, writeback: open_table.Posture) !void {
             self.store = try MemStore.init(testing.allocator);
             self.data = .{};
             self.fs = try Fs.mount(testing.allocator, testing.io, &self.store, &self.data, .{ .dlm_stripes = 64 });
@@ -3991,8 +4022,8 @@ fn HarnessOf(comptime Data: type) type {
             self.guards = try op_guard.Table.init(testing.allocator, 64);
             self.opens = try open_table.OpenTable.init(testing.allocator, 64);
             self.unique = 2;
-            self.d = LoopDispatcher.init(&self.lb, .{ .fs = filesystem.Filesystem.of(Fs, &self.fs), .io = testing.io, .registry = &self.reg, .guards = &self.guards, .opens = &self.opens, .no_open = no_open });
-            if (no_open) try self.d.initFilesystem(abi.FUSE_HANDLE_KILLPRIV_V2, 45);
+            self.d = LoopDispatcher.init(&self.lb, .{ .fs = filesystem.Filesystem.of(Fs, &self.fs), .io = testing.io, .registry = &self.reg, .guards = &self.guards, .opens = &self.opens, .no_open = no_open, .writeback = writeback });
+            if (no_open or writeback == .timer) try self.d.initFilesystem(abi.FUSE_HANDLE_KILLPRIV_V2, 45);
         }
 
         fn deinit(self: *Self) void {
@@ -4371,6 +4402,13 @@ const SettlingData = struct {
     pub fn releaseIno(self: *SettlingData, _: Io, ino: u64) void {
         self.write_back_drains += 1;
         if (self.custody_of == ino) self.custody_of = null;
+    }
+    /// The timer's drain: the armed custody lands whatever the cutoff.
+    pub fn drainAged(self: *SettlingData, _: Io, ino: u64, _: u64) open_table.Drained {
+        if (self.custody_of != ino) return .{ .landed = false, .kept_born_ns = null };
+        self.write_back_drains += 1;
+        self.custody_of = null;
+        return .{ .landed = true, .kept_born_ns = null };
     }
     pub fn hasWriteCustody(self: *SettlingData, ino: u64) bool {
         return self.custody_of == ino;
@@ -5123,6 +5161,41 @@ test "no-open through the POSIX layer (decision 0003 §AF): INIT hands the postu
     in.size = 0;
     try testing.expectEqual(@as(?linux.E, null), h.setattr(f, in).errno());
     try testing.expectEqual(@as(u64, 0), (try h.getattr(f)).size);
+}
+
+test "the write-back timer through the POSIX layer (decision 0003 §AJ): a CREATE's reply carries FOPEN_NOFLUSH in BOTH open arms (close is no durability point — no FLUSH is ever owed), the control arm's OPEN too; a FLUSH answers ENOSYS and RELEASE drains nothing; the timer's `drainAged` lands the custody through the plane and says so; a virtual inode and an ino holding nothing land nothing" {
+    const H = HarnessOf(SettlingData);
+    for ([_]bool{ true, false }) |no_open| {
+        var h: H = undefined;
+        try h.initWriteback(no_open, .timer);
+        defer h.deinit();
+        defer h.data.deinit();
+        h.data.store = &h.store;
+        try testing.expect(h.fs.writeback_timer);
+        const c = h.call(.{ .create = .{ .name = "f", .flags = 0, .mode = 0o644, .umask = 0, .open_flags = 0 } }, 1);
+        try testing.expectEqual(@as(?linux.E, null), c.errno());
+        const oo = abi.decodeExact(abi.fuse_open_out, c.outBytes()[@sizeOf(abi.fuse_entry_out)..]).?;
+        try testing.expect(oo.open_flags & abi.FOPEN_NOFLUSH != 0);
+        const f = (abi.decodePrefix(abi.fuse_entry_out, c.outBytes()) orelse return error.TestBadReply).nodeid;
+        if (!no_open) {
+            const o = h.call(.{ .open = .{ .flags = 0, .open_flags = 0 } }, f);
+            try testing.expectEqual(@as(?linux.E, null), o.errno());
+            try testing.expect(abi.decodeExact(abi.fuse_open_out, o.outBytes()).?.open_flags & abi.FOPEN_NOFLUSH != 0);
+        }
+        try testing.expectEqual(@as(?linux.E, null), h.write(f, 0, "hello", 0).errno());
+        h.data.custody_of = try H.Fs.localOf(f);
+        // The close: FLUSH is ENOSYS (the latch), RELEASE drains nothing.
+        const fl = codec.Request{ .flush = .{ .fh = 0, .lock_owner = 0 } };
+        try testing.expectEqual(linux.E.NOSYS, h.call(fl, f).errno().?);
+        try testing.expectEqual(@as(?linux.E, null), h.call(.{ .release = .{ .fh = 0, .flags = 0, .release_flags = 0, .lock_owner = 0 } }, f).errno());
+        try testing.expectEqual(@as(u32, 0), h.data.write_back_drains);
+        // The timer's drain lands it.
+        try testing.expectEqual(open_table.Drained{ .landed = true, .kept_born_ns = null }, h.fs.drainAged(f, std.math.maxInt(u64)));
+        try testing.expectEqual(@as(u32, 1), h.data.write_back_drains);
+        try testing.expectEqual(@as(?u64, null), h.data.custody_of);
+        try testing.expectEqual(open_table.Drained{ .landed = false, .kept_born_ns = null }, h.fs.drainAged(f, std.math.maxInt(u64)));
+        try testing.expectEqual(open_table.Drained{ .landed = false, .kept_born_ns = null }, h.fs.drainAged(virtual_inodes.GEN_INO_FIRST, std.math.maxInt(u64)));
+    }
 }
 
 // The level-1 taker list says "SETATTR iff size" — and the O_TRUNC open IS a

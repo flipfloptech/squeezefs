@@ -48,6 +48,19 @@
 //! stamped by `markDrained`) only notes it owed with `deferred`
 //! (`deferDrain`), which the cadence's next tick drains whatever its age.
 //!
+//! **The write-back timer** (`Posture.timer`, decision 0003 §AJ — the
+//! owner's ruling: close is no durability point): every close is local
+//! (the daemon latches the kernel's `no_flush`; a CREATE answers
+//! `FOPEN_NOFLUSH`), and the owed set is AGE-ORDERED instead — each owed
+//! ino carries the birth of its oldest custody (`Owed.born_ns`, the first
+//! note since it last held none) in a per-stripe min-heap, and ONE timer
+//! pass per flush cadence (`timerPass`) takes every ino born at or before
+//! `now − age`, lands its custody born by then and re-owes the ino at the
+//! birth of the custody still held. An acknowledged unsynced write leaves
+//! daemon memory within `T_wb = age + period + the pass's drain` (the
+//! derivations below). FLUSH, the idle harvest and the burst coalescing are
+//! the `close` posture's alone.
+//!
 //! Striped under spin locks (the metadata-transaction class; O(1)
 //! sections) and pre-sized once from the transport geometry; the kernel's
 //! inode cache can outgrow any fixed bound, so growth past the pre-size is
@@ -57,8 +70,55 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const counters = @import("../../core/counters.zig");
+const clock = @import("../../core/clock.zig");
 const log = @import("../../core/log.zig");
 const jc = @import("../../meta/journal_core.zig");
+const checkpoint = @import("../../meta/checkpoint.zig");
+
+/// Where an acknowledged write's custody becomes durable when no fsync,
+/// syncfs or unmount asks first (`SQUEEZEFS_WRITEBACK_POSTURE`, decision
+/// 0003 §AJ): `timer` — within `T_wb` of its write, closes local; `close`
+/// — at the close that tells the daemon (the no-open FLUSH, the control
+/// arm's RELEASE), the A/B control arm.
+pub const Posture = enum {
+    timer,
+    close,
+
+    /// The registry row's value (the knob's ONE reader passes it).
+    pub fn ofKnobWord(word: []const u8) Posture {
+        return if (std.mem.eql(u8, word, "timer")) .timer else .close;
+    }
+};
+
+/// The timer's period: the flush cadence (`checkpoint.checkpointTickPeriodMs`
+/// — the coalesced barrier's interval, 50 ms derived; the strict cadence's
+/// 100 ms task tick). The pass is O(1) per stripe when nothing is owed, so
+/// it rides the same rate as the barrier it hands its publishes to.
+pub fn timerPeriodNs(flush_interval_ms: u64) u64 {
+    return checkpoint.checkpointTickPeriodMs(flush_interval_ms) * std.time.ns_per_ms;
+}
+
+/// The age a custody must reach before the timer lands it: the checkpoint's
+/// cadence ceiling (`SQUEEZEFS_CHECKPOINT_MAX_AGE_MS`, 1 s — the flush
+/// cadence is its twentieth), so with the pass's period and one period of
+/// drain an acked write lands within the ceiling a dirty metadata leaf
+/// lands within (`max_age + 2 × tick`). A block filled within the age
+/// writes itself through (`union == whole block`) and never lands partial:
+/// a streamer at ≥ block ÷ age (4 MB/s at 4 MiB) pays the timer nothing.
+/// Measured: an age of one period (50 ms) landed IOR's in-progress blocks
+/// partial under host load — 1.27 device bytes per user byte against the
+/// close posture's 1.00 (`rung-10-writeback-timer.md`).
+pub fn timerAgeNs(max_age_ms: u64) u64 {
+    return max_age_ms * std.time.ns_per_ms;
+}
+
+/// `T_wb`'s static part: a custody born just after a pass's cutoff waits
+/// `age` to come of age and up to one `period` for the next pass; the
+/// pass's own drain latency adds to it (`writeback_residency_ns` measures
+/// the whole).
+pub fn boundStaticNs(age_ns: u64, period_ns: u64) u64 {
+    return age_ns + period_ns;
+}
 
 /// `open_count_stranded` (must stay 0).
 pub var open_count_stranded: counters.Tripwire = .init("open_count_stranded");
@@ -72,6 +132,28 @@ pub var fuse_owed_drain_inos: counters.Gauge = .{};
 /// (custody no close covered: a held-open writer, a mapping or an async
 /// write outliving its fd).
 pub var fuse_owed_idle_drains: counters.ShardedCounter = .{};
+/// `writeback_timer_passes`: timer passes that found an aged ino.
+pub var writeback_timer_passes: counters.ShardedCounter = .{};
+/// `writeback_timer_drains`: aged inos the timer drained.
+pub var writeback_timer_drains: counters.ShardedCounter = .{};
+/// `writeback_timer_kept`: drained inos still holding custody younger than
+/// the cutoff — re-owed at its birth, landed by a later pass.
+pub var writeback_timer_kept: counters.ShardedCounter = .{};
+/// `writeback_timer_reowe_overflows`: a kept ino the owed set could not
+/// re-note (it could not grow) — its custody waits for its next write's
+/// note, an fsync, a syncfs or the unmount (logged).
+pub var writeback_timer_reowe_overflows: counters.ShardedCounter = .{};
+/// `writeback_residency_ns`: per drained ino, its oldest custody's birth →
+/// the drain's end — the measured `T_wb` (exact-sum).
+pub var writeback_residency_ns: counters.ShardedLatencyHistogram = .{};
+/// `writeback_residency_max_ns`: the longest residency measured.
+pub var writeback_residency_max_ns: counters.Gauge = .{};
+/// `writeback_bound_ns`: `T_wb`'s static part (`boundStaticNs`) the mount
+/// derived — 0 under the `close` posture.
+pub var writeback_bound_ns: counters.Gauge = .{};
+/// `writeback_age_ns`: the age a custody reaches before the timer lands it
+/// (`timerAgeNs`, or the seam) — 0 under the `close` posture.
+pub var writeback_age_ns: counters.Gauge = .{};
 
 pub const Entry = struct {
     count: u32 = 0,
@@ -105,8 +187,31 @@ pub const Verdict = struct {
 /// sequence of its note (a FLUSH begun at `s` covers every note `≤ s`), its
 /// monotonic stamp (the idle drain's clock), and `deferred`: a close whose
 /// drain was coalesced into the next reclaim tick (`deferDrain`) — harvested
-/// at that tick whatever its idle age.
-pub const Owed = struct { seq: u64, last_ns: u64, deferred: bool = false };
+/// at that tick whatever its idle age. `born_ns`: the birth of the ino's
+/// oldest custody (the timer posture's age; its heap entry carries it).
+pub const Owed = struct { seq: u64, last_ns: u64, deferred: bool = false, born_ns: u64 = 0 };
+
+/// One age-ordered heap entry (the timer posture): an ino and the birth it
+/// was owed at. Stale once its ino's `Owed.born_ns` differs (re-owed
+/// younger-first, or harvested and noted again) — skipped at the pop.
+pub const Aged = struct { ino: u64, born_ns: u64 };
+
+fn bornFirst(_: void, a: Aged, b: Aged) std.math.Order {
+    return std.math.order(a.born_ns, b.born_ns);
+}
+
+const AgeHeap = std.PriorityQueue(Aged, void, bornFirst);
+
+/// What the timer's drain of one ino did: `landed` — it held custody born
+/// by the cutoff and landed it; `kept_born_ns` — the birth of the oldest
+/// custody it still holds (null: none).
+pub const Drained = struct { landed: bool, kept_born_ns: ?u64 };
+
+/// The timer pass's drain face (the filesystem's `drainAged`).
+pub const DrainAged = struct {
+    ctx: *anyopaque,
+    call: *const fn (ctx: *anyopaque, ino: u64, cutoff_ns: u64) Drained,
+};
 
 pub const OpenTable = struct {
     gpa: std.mem.Allocator,
@@ -114,6 +219,8 @@ pub const OpenTable = struct {
     /// The no-open posture (module doc), set once at mount before the
     /// session serves its first request.
     no_open: bool = false,
+    /// The write-back posture (module doc), set with `no_open`.
+    posture: Posture = .close,
 
     const Stripe = struct {
         lock: jc.SpinLock = .{},
@@ -121,6 +228,9 @@ pub const OpenTable = struct {
         /// No-open: ino → its latest uncovered write. Independent of `map`:
         /// an evicted ino's custody is still owed its drain.
         owed: std.AutoHashMapUnmanaged(u64, Owed) = .empty,
+        /// The timer posture's age order over `owed`: one live entry per
+        /// owed ino (its `born_ns`), plus the stale ones a re-owe left.
+        aged: AgeHeap = .empty,
         /// Bumped by every `noteWrite` under the lock: the order a FLUSH's
         /// begin and a write's note are judged by (both sections hold the
         /// stripe lock, so the order is total).
@@ -134,8 +244,15 @@ pub const OpenTable = struct {
             try s.map.ensureTotalCapacity(gpa, capacity / stripe_count + 1);
             // A handful of files written per in-flight op: the same pre-size.
             try s.owed.ensureTotalCapacity(gpa, capacity / stripe_count + 1);
+            try s.aged.ensureTotalCapacity(gpa, capacity / stripe_count + 1);
         }
         return self;
+    }
+
+    /// Whether WRITEs note their ino owed: the no-open close posture (a
+    /// FLUSH covers the notes) and the timer posture in either open arm.
+    fn tracksOwed(self: *const OpenTable) bool {
+        return self.no_open or self.posture == .timer;
     }
 
     pub fn deinit(self: *OpenTable) void {
@@ -151,6 +268,7 @@ pub const OpenTable = struct {
             owed += s.owed.count();
             s.map.deinit(self.gpa);
             s.owed.deinit(self.gpa);
+            s.aged.deinit(self.gpa);
         }
         fuse_tracked_inodes.sub(tracked);
         fuse_open_inodes.sub(open);
@@ -163,17 +281,76 @@ pub const OpenTable = struct {
     /// clean-handle elision keys on it); the no-open posture notes the ino
     /// OWED a drain — the note follows the custody, so a FLUSH whose
     /// custody check missed this write began after it and leaves it owed.
+    /// The timer posture notes it in either open arm; its first note since
+    /// the ino last held nothing is the custody's birth (the heap's key).
     /// `error.OutOfMemory`: the owed set could not grow; the caller drains.
     pub fn noteWrite(self: *OpenTable, ino: u64, now_ns: u64) std.mem.Allocator.Error!void {
-        if (!self.no_open) return self.markDirty(ino);
+        if (!self.no_open) self.markDirty(ino);
+        if (!self.tracksOwed()) return;
         const s = self.stripeOf(ino);
         s.lock.lock();
         defer s.lock.unlock();
         const gop = try s.owed.getOrPut(self.gpa, ino);
         const deferred = gop.found_existing and gop.value_ptr.deferred;
+        const born_ns = if (gop.found_existing) gop.value_ptr.born_ns else now_ns;
+        if (!gop.found_existing and self.posture == .timer) {
+            s.aged.push(self.gpa, .{ .ino = ino, .born_ns = born_ns }) catch |e| {
+                s.owed.removeByPtr(gop.key_ptr);
+                return e;
+            };
+        }
         if (!gop.found_existing) fuse_owed_drain_inos.add(1);
         s.seq += 1;
-        gop.value_ptr.* = .{ .seq = s.seq, .last_ns = now_ns, .deferred = deferred };
+        gop.value_ptr.* = .{ .seq = s.seq, .last_ns = now_ns, .deferred = deferred, .born_ns = born_ns };
+    }
+
+    /// The timer's harvest: every owed ino whose custody was born at or
+    /// before `cutoff_ns`, popped in birth order per stripe and removed from
+    /// the set, up to `out.len` (the rest wait for the next call). A write
+    /// after the harvest notes the ino again (a new birth); the caller
+    /// drains each one harvested and re-owes what it kept (`reowe`).
+    pub fn takeAgedOwed(self: *OpenTable, cutoff_ns: u64, out: []Aged) []Aged {
+        var n: usize = 0;
+        for (&self.stripes) |*s| {
+            if (n == out.len) break;
+            s.lock.lock();
+            defer s.lock.unlock();
+            while (n < out.len) {
+                const top = s.aged.peek() orelse break;
+                if (top.born_ns > cutoff_ns) break;
+                _ = s.aged.pop();
+                const o = s.owed.get(top.ino) orelse continue;
+                if (o.born_ns != top.born_ns) continue;
+                _ = s.owed.remove(top.ino);
+                fuse_owed_drain_inos.sub(1);
+                out[n] = top;
+                n += 1;
+            }
+        }
+        return out[0..n];
+    }
+
+    /// A drained ino still holds custody born at `born_ns` (younger than
+    /// the pass's cutoff, or a drain that failed): owed again at that
+    /// birth — the older of it and a note a write made since the harvest.
+    pub fn reowe(self: *OpenTable, ino: u64, born_ns: u64) std.mem.Allocator.Error!void {
+        const s = self.stripeOf(ino);
+        s.lock.lock();
+        defer s.lock.unlock();
+        const gop = try s.owed.getOrPut(self.gpa, ino);
+        if (gop.found_existing and gop.value_ptr.born_ns <= born_ns) return;
+        s.aged.push(self.gpa, .{ .ino = ino, .born_ns = born_ns }) catch |e| {
+            // A new note rolls back; an existing one keeps its own entry.
+            if (!gop.found_existing) s.owed.removeByPtr(gop.key_ptr);
+            return e;
+        };
+        if (gop.found_existing) {
+            gop.value_ptr.born_ns = born_ns;
+            return;
+        }
+        fuse_owed_drain_inos.add(1);
+        s.seq += 1;
+        gop.value_ptr.* = .{ .seq = s.seq, .last_ns = born_ns, .born_ns = born_ns };
     }
 
     /// A close of `ino` whose drain is coalesced (a FLUSH-drain of the ino
@@ -260,6 +437,42 @@ pub const OpenTable = struct {
             }
         }
         return out[0..n];
+    }
+
+    /// The aged inos one harvest takes at most: the pass's stack room (a
+    /// longer backlog loops within the pass).
+    pub const TIMER_HARVEST = 64;
+
+    /// ONE timer pass at `now_ns` (module doc): every ino owed since
+    /// `now − age_ns` or earlier through `drain`, oldest first per stripe;
+    /// what the drain kept is re-owed — no earlier than the next pass's
+    /// cutoff, so a drain that keeps aged custody (a failure the data plane
+    /// already logged) is retried at the next pass, never spun on here.
+    pub fn timerPass(self: *OpenTable, now_ns: u64, age_ns: u64, drain: DrainAged) void {
+        const cutoff_ns = now_ns -| age_ns;
+        var buf: [TIMER_HARVEST]Aged = undefined;
+        var any = false;
+        while (true) {
+            const aged = self.takeAgedOwed(cutoff_ns, &buf);
+            for (aged) |a| {
+                any = true;
+                const d = drain.call(drain.ctx, a.ino, cutoff_ns);
+                writeback_timer_drains.inc();
+                if (d.landed) {
+                    const residency = clock.monotonicNs() -| a.born_ns;
+                    writeback_residency_ns.record(residency);
+                    writeback_residency_max_ns.raise(residency);
+                }
+                const kept = d.kept_born_ns orelse continue;
+                writeback_timer_kept.inc();
+                self.reowe(a.ino, @max(kept, cutoff_ns + 1)) catch {
+                    writeback_timer_reowe_overflows.inc();
+                    log.err("write-back timer: ino {d} keeps custody the owed set could not re-note — it lands at its next write's note, an fsync, a syncfs or the unmount", .{a.ino});
+                };
+            }
+            if (aged.len < buf.len) break;
+        }
+        if (any) writeback_timer_passes.inc();
     }
 
     pub fn owedCount(self: *OpenTable) u64 {
@@ -614,6 +827,120 @@ test "no-open close bursts coalesce: `recentlyDrained` is true within the window
     try testing.expectEqual(@as(u64, 1), t.owedCount());
     _ = t.returnLookups(5, 1);
     try testing.expectEqualSlices(u64, &.{5}, t.takeIdleOwed(std.math.maxInt(u64), 0, &out));
+}
+
+test "the write-back timer's derivations (decision 0003 §AJ): period = the flush cadence (50 ms derived; the strict cadence's 100 ms tick), age = the checkpoint's cadence ceiling (1 s), T_wb's static part = age + period — with one period of drain, the metadata leaves' landing ceiling `max_age + 2 × tick`; the knob's words" {
+    try testing.expectEqual(@as(u64, checkpoint.DEFAULT_FLUSH_INTERVAL_MS * std.time.ns_per_ms), timerPeriodNs(checkpoint.DEFAULT_FLUSH_INTERVAL_MS));
+    try testing.expectEqual(@as(u64, 50 * std.time.ns_per_ms), timerPeriodNs(50));
+    try testing.expectEqual(@as(u64, checkpoint.STRICT_TICK_PERIOD_MS * std.time.ns_per_ms), timerPeriodNs(0));
+    try testing.expectEqual(@as(u64, checkpoint.CHECKPOINT_MAX_AGE_MS * std.time.ns_per_ms), timerAgeNs(checkpoint.CHECKPOINT_MAX_AGE_MS));
+    const p = timerPeriodNs(checkpoint.DEFAULT_FLUSH_INTERVAL_MS);
+    try testing.expectEqual(@as(u64, 1050 * std.time.ns_per_ms), boundStaticNs(timerAgeNs(checkpoint.CHECKPOINT_MAX_AGE_MS), p));
+    try testing.expectEqual(checkpoint.checkpointLandingCeilingMs(checkpoint.CHECKPOINT_MAX_AGE_MS, checkpoint.DEFAULT_FLUSH_INTERVAL_MS) * std.time.ns_per_ms, boundStaticNs(timerAgeNs(checkpoint.CHECKPOINT_MAX_AGE_MS), p) + p);
+    try testing.expectEqual(Posture.timer, Posture.ofKnobWord("timer"));
+    try testing.expectEqual(Posture.close, Posture.ofKnobWord("close"));
+}
+
+test "the timer posture: the owed set is age-ordered — a note's birth is its ino's first since it held nothing (later notes keep it), the harvest takes exactly the inos born by the cutoff in birth order, bounded by the caller's room; a re-owe keeps the older birth and its stale heap entry is skipped; the control open arm owes too" {
+    var t = try OpenTable.init(testing.allocator, 64);
+    defer t.deinit();
+    t.posture = .timer;
+    // The control open arm (no_open off) still notes under the timer.
+    try t.noteLookup(7);
+    _ = try t.addOpen(7);
+    try t.noteWrite(7, 100);
+    try testing.expect(t.isDirty(7));
+    try testing.expectEqual(@as(u64, 1), t.owedCount());
+    _ = t.removeOpen(7);
+    // Births 100 (7), 200 (8), 300 (9); 7 written again at 900 keeps 100.
+    try t.noteWrite(8, 200);
+    try t.noteWrite(9, 300);
+    try t.noteWrite(7, 900);
+    var out: [8]Aged = undefined;
+    try testing.expectEqual(@as(usize, 0), t.takeAgedOwed(99, &out).len);
+    var small: [1]Aged = undefined;
+    var two: [2]Aged = undefined;
+    two[0] = t.takeAgedOwed(250, &small)[0];
+    const rest = t.takeAgedOwed(250, &out);
+    try testing.expectEqual(@as(usize, 1), rest.len);
+    two[1] = rest[0];
+    try testing.expectEqualSlices(Aged, &.{ .{ .ino = 7, .born_ns = 100 }, .{ .ino = 8, .born_ns = 200 } }, sortedAged(&two));
+    try testing.expectEqual(@as(u64, 1), t.owedCount());
+    // A write after the harvest is a new birth.
+    try t.noteWrite(7, 1000);
+    // A drained ino kept custody born at 260: re-owed at it (older than
+    // the note at 1000); the 1000 entry turns stale.
+    try t.reowe(7, 260);
+    // A re-owe younger than the live birth changes nothing.
+    try t.reowe(9, 5000);
+    try testing.expectEqual(@as(u64, 2), t.owedCount());
+    try testing.expectEqualSlices(Aged, &.{ .{ .ino = 7, .born_ns = 260 }, .{ .ino = 9, .born_ns = 300 } }, sortedAged(t.takeAgedOwed(300, &out)));
+    // The stale entry (7 at 1000) is skipped; nothing is owed.
+    try testing.expectEqual(@as(usize, 0), t.takeAgedOwed(std.math.maxInt(u64), &out).len);
+    try testing.expectEqual(@as(u64, 0), t.owedCount());
+    // A re-owe of an ino nothing owes notes it.
+    try t.reowe(11, 400);
+    try testing.expectEqualSlices(Aged, &.{.{ .ino = 11, .born_ns = 400 }}, t.takeAgedOwed(400, &out));
+}
+
+fn sortedAged(a: []Aged) []Aged {
+    std.mem.sort(Aged, a, {}, struct {
+        fn lt(_: void, x: Aged, y: Aged) bool {
+            return x.ino < y.ino;
+        }
+    }.lt);
+    return a;
+}
+
+test "the timer pass: every ino born by `now − age` drains once, in birth order per stripe; what the drain kept is re-owed at its birth (never earlier than the next cutoff, so a drain keeping aged custody is retried next pass, not spun on); the residency records only drains that landed; a pass with nothing aged counts nothing" {
+    var t = try OpenTable.init(testing.allocator, 64);
+    defer t.deinit();
+    t.posture = .timer;
+    const Fake = struct {
+        calls: std.ArrayList(u64) = .empty,
+        cutoffs: std.ArrayList(u64) = .empty,
+        fn drain(ctx: *anyopaque, ino: u64, cutoff_ns: u64) Drained {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.calls.append(testing.allocator, ino) catch unreachable;
+            self.cutoffs.append(testing.allocator, cutoff_ns) catch unreachable;
+            return switch (ino) {
+                // A younger block kept.
+                21 => .{ .landed = true, .kept_born_ns = 1500 },
+                // A drain that failed: its aged custody kept.
+                22 => .{ .landed = false, .kept_born_ns = 100 },
+                // fsync drained it first: nothing landed, nothing kept.
+                23 => .{ .landed = false, .kept_born_ns = null },
+                else => .{ .landed = true, .kept_born_ns = null },
+            };
+        }
+    };
+    var fake: Fake = .{};
+    defer fake.calls.deinit(testing.allocator);
+    defer fake.cutoffs.deinit(testing.allocator);
+    const face: DrainAged = .{ .ctx = &fake, .call = &Fake.drain };
+    for ([_]u64{ 20, 21, 22, 23 }) |ino| try t.noteWrite(ino, 100);
+    try t.noteWrite(24, 1800);
+    const p0 = writeback_timer_passes.load();
+    const d0 = writeback_timer_drains.load();
+    const k0 = writeback_timer_kept.load();
+    const r0 = writeback_residency_ns.snapshot().count;
+    // Nothing aged at now = 1000 − age 1000.
+    t.timerPass(1000, 1000, face);
+    try testing.expectEqual(@as(usize, 0), fake.calls.items.len);
+    try testing.expectEqual(p0, writeback_timer_passes.load());
+    // now = 2000, age 1000: cutoff 1000 — the four born at 100.
+    t.timerPass(2000, 1000, face);
+    std.mem.sort(u64, fake.calls.items, {}, std.sort.asc(u64));
+    try testing.expectEqualSlices(u64, &.{ 20, 21, 22, 23 }, fake.calls.items);
+    for (fake.cutoffs.items) |c| try testing.expectEqual(@as(u64, 1000), c);
+    try testing.expectEqual(p0 + 1, writeback_timer_passes.load());
+    try testing.expectEqual(d0 + 4, writeback_timer_drains.load());
+    try testing.expectEqual(k0 + 2, writeback_timer_kept.load());
+    try testing.expectEqual(r0 + 2, writeback_residency_ns.snapshot().count);
+    // 21 owed at 1500 (its kept block), 22 at the next cutoff (1001), 24 at 1800.
+    try testing.expectEqual(@as(u64, 3), t.owedCount());
+    var out: [8]Aged = undefined;
+    try testing.expectEqualSlices(Aged, &.{ .{ .ino = 21, .born_ns = 1500 }, .{ .ino = 22, .born_ns = 1001 }, .{ .ino = 24, .born_ns = 1800 } }, sortedAged(t.takeAgedOwed(std.math.maxInt(u64), &out)));
 }
 
 test "a healthy open/lookup lifecycle never trips: lookup, open, release, forget" {

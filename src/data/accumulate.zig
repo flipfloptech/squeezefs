@@ -786,6 +786,26 @@ pub const Table = struct {
         return false;
     }
 
+    /// A parked block of an ino and its entry's birth.
+    pub const BlockBirth = struct { block: u32, born_ns: u64 };
+
+    /// `blocksOf` with each entry's birth: the write-back timer's per-block
+    /// age (decision 0003 §AJ) — a block younger than the cutoff is left to
+    /// fill and write itself through.
+    pub fn birthsOf(self: *Table, ino: u64, out: []BlockBirth) []BlockBirth {
+        self.lock.lock();
+        defer self.lock.unlock();
+        var n: usize = 0;
+        var it = self.index.iterator();
+        while (it.next()) |kv| {
+            if (n == out.len) break;
+            if (kv.key_ptr.ino != ino) continue;
+            out[n] = .{ .block = kv.key_ptr.block, .born_ns = kv.value_ptr.*.born_ns };
+            n += 1;
+        }
+        return out[0..n];
+    }
+
     pub fn blocksOf(self: *Table, ino: u64, out: []u32) []u32 {
         self.lock.lock();
         defer self.lock.unlock();

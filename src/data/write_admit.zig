@@ -1301,6 +1301,41 @@ pub const WritePath = struct {
         return self.table.holdsIno(ino) or self.overlay.registry.holdsIno(ino) or self.epochs.holds(ino);
     }
 
+    /// What the write-back timer's drain of one ino did (decision 0003
+    /// §AJ): `landed` — custody born by the cutoff was held and landed;
+    /// `kept_born_ns` — the birth of the oldest custody still held.
+    pub const AgedDrain = struct { landed: bool, kept_born_ns: ?u64 };
+
+    /// The write-back timer's drain (decision 0003 §AJ): the overlay
+    /// records drain and the epoch closes, each whole (a record's bytes
+    /// already sit on the device; the epoch is the ino's one save); the
+    /// parked blocks born at or before `cutoff_ns` flush through
+    /// `flushParkedBlock` (the RELEASE drain's own landing), the younger
+    /// ones stay — a block filled within the age writes itself through,
+    /// so a streamer's in-progress block never lands partial. `landed`
+    /// counts a landing that happened (published, or joined to an upload
+    /// that retired the entry). What stays held afterwards — a young block,
+    /// a flush that failed or was superseded (aged: retried by the next
+    /// pass), custody a write made meanwhile (its own note owes it) — comes
+    /// back as the oldest birth.
+    pub fn drainAged(self: *WritePath, io: Io, ino: u64, cutoff_ns: u64) AgedDrain {
+        var landed = self.overlay.registry.holdsIno(ino) or self.epochs.holds(ino);
+        _ = self.overlay.drainForIno(io, &self.locks, ino, std.math.maxInt(u64), false, self.closeSeams());
+        var births: [64]accumulate.Table.BlockBirth = undefined;
+        for (self.table.birthsOf(ino, &births)) |b| {
+            if (b.born_ns > cutoff_ns) continue;
+            switch (accumulate.flushParkedBlock(&self.table, self.uploadDeps(), io, ino, b.block)) {
+                .published, .joined => landed = true,
+                .superseded, .stay_parked, .fence_drop, .discarded => {},
+            }
+        }
+        _ = self.epochs.close(io, ino, self.closeSeams());
+        var kept: ?u64 = null;
+        for (self.table.birthsOf(ino, &births)) |b| kept = @min(kept orelse b.born_ns, b.born_ns);
+        if (self.overlay.registry.holdsIno(ino) or self.epochs.holds(ino)) kept = @min(kept orelse cutoff_ns, cutoff_ns);
+        return .{ .landed = landed, .kept_born_ns = kept };
+    }
+
     /// RELEASE / unmount: every parked block of `ino` flushes durably, the
     /// overlay drains (write-back class), the epoch closes.
     pub fn flushIno(self: *WritePath, io: Io, ino: u64) void {
@@ -2105,6 +2140,40 @@ test "the no-open FLUSH's try-only probe (decision 0003 §AF): `holdsCustody` is
     try testing.expect(w.wp.holdsCustody(31));
     w.wp.flushIno(io, 31);
     try testing.expect(!w.wp.holdsCustody(31));
+    try testing.expect(!w.wp.overlay.anyOpenFast());
+    try testing.expectEqual(@as(usize, 0), w.wp.epochs.openCount());
+}
+
+test "the write-back timer's drain (decision 0003 §AJ): `drainAged` flushes exactly the parked blocks born by the cutoff and keeps the younger ones (reporting the oldest kept birth); a later cutoff lands the rest; an overlay record and its epoch drain whole whatever their age; an ino holding nothing lands nothing" {
+    const io = testing.io;
+    const w = try World.init(testing.allocator, .sync_inline, true);
+    defer w.deinit(testing.allocator);
+    try testing.expectEqual(WritePath.AgedDrain{ .landed = false, .kept_born_ns = null }, w.wp.drainAged(io, 40, std.math.maxInt(u64)));
+    // Two fresh partial blocks of a live file, born apart.
+    _ = try w.f.publishBlock(40, 0, 0xAA);
+    var tail: [1000]u8 = @splat(0x41);
+    _ = try w.wp.write(io, .{ .ino = 40, .offset = 2 * wt.BS, .payload = .{ .bytes = &tail }, .class = .entire_op, .file = World.striped(wt.BS) });
+    const born2 = w.wp.table.get(40, 2).?.born_ns;
+    while (clock.monotonicNs() == born2) {}
+    _ = try w.wp.write(io, .{ .ino = 40, .offset = 5 * wt.BS, .payload = .{ .bytes = &tail }, .class = .entire_op, .file = World.striped(3 * wt.BS) });
+    const born5 = w.wp.table.get(40, 5).?.born_ns;
+    try testing.expect(born5 > born2);
+    // The cutoff between them: block 2 lands, block 5 stays.
+    try testing.expectEqual(WritePath.AgedDrain{ .landed = true, .kept_born_ns = born5 }, w.wp.drainAged(io, 40, born2));
+    try testing.expect(!w.wp.table.has(40, 2));
+    try testing.expect(w.wp.table.has(40, 5));
+    // Nothing aged by a cutoff before both: nothing lands, block 5 kept.
+    try testing.expectEqual(WritePath.AgedDrain{ .landed = false, .kept_born_ns = born5 }, w.wp.drainAged(io, 40, born5 - 1));
+    try testing.expectEqual(WritePath.AgedDrain{ .landed = true, .kept_born_ns = null }, w.wp.drainAged(io, 40, born5));
+    try testing.expect(!w.wp.holdsCustody(40));
+    // An overwrite half-block: an open overlay record — drained whole at
+    // any cutoff (its bytes are already on the device), the epoch closed.
+    _ = try w.f.publishBlock(41, 0, 0xBB);
+    var half: [wt.BS / 2]u8 align(4096) = @splat(0x42);
+    _ = try w.wp.write(io, .{ .ino = 41, .offset = 0, .payload = .{ .bytes = &half }, .class = .shared, .file = World.striped(wt.BS) });
+    try testing.expect(w.wp.holdsCustody(41));
+    try testing.expectEqual(WritePath.AgedDrain{ .landed = true, .kept_born_ns = null }, w.wp.drainAged(io, 41, 0));
+    try testing.expect(!w.wp.holdsCustody(41));
     try testing.expect(!w.wp.overlay.anyOpenFast());
     try testing.expectEqual(@as(usize, 0), w.wp.epochs.openCount());
 }

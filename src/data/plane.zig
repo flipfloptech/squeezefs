@@ -1499,6 +1499,11 @@ pub const DataPlane = struct {
 
     /// The no-open FLUSH's try-only probe (decision 0003 §AF): whether
     /// `releaseIno` would land anything for `ino` (`WritePath.holdsCustody`).
+    /// The write-back timer's drain of one ino (decision 0003 §AJ).
+    pub fn drainAged(self: *DataPlane, io: Io, ino: u64, cutoff_ns: u64) write_admit.WritePath.AgedDrain {
+        return self.wp.drainAged(io, ino, cutoff_ns);
+    }
+
     pub fn hasWriteCustody(self: *DataPlane, ino: u64) bool {
         return self.wp.holdsCustody(ino);
     }

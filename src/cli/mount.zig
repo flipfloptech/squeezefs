@@ -144,6 +144,7 @@ const sym_joined = @import("../meta/sym/joined.zig");
 const fsck_runner = @import("../ops/fsck/runner.zig");
 const data_bitmap = @import("../data/sym_planes/data_bitmap.zig");
 const checkpoint = @import("../meta/checkpoint.zig");
+const sync = @import("../sync/sync.zig");
 const clock = @import("../core/clock.zig");
 
 comptime {
@@ -636,6 +637,10 @@ fn mountMain(ctx: *Ctx) u8 {
     // ENOSYS and FLUSH drains; the session drops ATOMIC_O_TRUNC and probes
     // every FLUSH on its worker; the reclaim cadence drains idle owed custody.
     const no_open = knobs.boolKnob("SQUEEZEFS_FUSE_NO_OPEN", env);
+    // The write-back posture (decision 0003 §AJ): `timer` answers FLUSH
+    // ENOSYS (the kernel's `no_flush`), a CREATE carries FOPEN_NOFLUSH and
+    // the write-back timer below lands custody within T_wb.
+    const writeback = open_table.Posture.ofKnobWord(knobs.enumKnob("SQUEEZEFS_WRITEBACK_POSTURE", env));
     var binding: handler.ring.Binding = .{};
     binding.bind(.{
         .fs = served_fs,
@@ -651,6 +656,7 @@ fn mountMain(ctx: *Ctx) u8 {
         // copies of one fd, a cache-less set) uploaded a whole 4 MiB block
         // per close — 8.1 GB of device writes for 143 KB — draining each.
         .drain_coalesce_ns = RECLAIM_CADENCE_NS,
+        .writeback = writeback,
     });
     binding.bindData(.{ .plane = plane });
 
@@ -782,7 +788,8 @@ fn mountMain(ctx: *Ctx) u8 {
     var wd = watchdog.Watchdog.init(&registry);
     if (ctx.heartbeat) |h| wd.on_tick = .{ .ctx = h, .call = &beatHeartbeat };
     var wd_fut = ctx.sqz.spawnMeta(watchdogMain, .{ &wd, io }) catch return ctx.failed("cannot spawn the watchdog", .{});
-    const owed_idle_ns: u64 = if (knobs.optIntKnob("SQUEEZEFS_TEST_FUSE_OWED_IDLE_MS", u64, env)) |ms| ms * std.time.ns_per_ms else OWED_IDLE_NS;
+    const owed_seam_ns: ?u64 = if (knobs.optIntKnob("SQUEEZEFS_TEST_FUSE_OWED_IDLE_MS", u64, env)) |ms| ms * std.time.ns_per_ms else null;
+    const owed_idle_ns: u64 = owed_seam_ns orelse OWED_IDLE_NS;
     var reclaim: ReclaimCadence = .{ .fs = &fs, .io = io, .plane = plane, .node = node, .opens = &opens, .owed_idle_ns = owed_idle_ns };
     var reclaim_fut = ctx.sqz.spawnMeta(ReclaimCadence.run, .{&reclaim}) catch {
         wd.requestStop();
@@ -815,6 +822,32 @@ fn mountMain(ctx: *Ctx) u8 {
         }
         return ctx.failed("cannot spawn the times drain cadence", .{});
     };
+    // The write-back timer (decision 0003 §AJ): one pass per flush cadence
+    // lands every custody as old as the checkpoint's cadence ceiling —
+    // T_wb = age + period + the pass's drain. The `close` posture drains at
+    // close instead.
+    const wb_period_ns = open_table.timerPeriodNs(flush_interval_ms);
+    var wb_timer: WritebackTimer = .{ .fs = &fs, .io = io, .opens = &opens, .period_ns = wb_period_ns, .age_ns = owed_seam_ns orelse open_table.timerAgeNs(checkpoint.maxAgeMsFromEnv(env)) };
+    open_table.writeback_bound_ns.set(if (writeback == .timer) open_table.boundStaticNs(wb_timer.age_ns, wb_period_ns) else 0);
+    open_table.writeback_age_ns.set(if (writeback == .timer) wb_timer.age_ns else 0);
+    var wb_timer_fut: ?@TypeOf(reclaim_fut) = if (writeback == .close) null else ctx.sqz.spawnMeta(WritebackTimer.run, .{&wb_timer}) catch {
+        wd.requestStop();
+        wd_fut.cancel(io);
+        reclaim.requestStop();
+        reclaim_fut.cancel(io);
+        if (membership_fut) |*f| {
+            membership.?.requestStop();
+            f.cancel(io);
+        }
+        if (times_drain_fut) |*f| {
+            times_drain.requestStop();
+            f.cancel(io);
+        }
+        return ctx.failed("cannot spawn the write-back timer", .{});
+    };
+    if (writeback == .timer) {
+        log.info("write-back timer: custody lands once {d} ms old, a pass every {d} ms — T_wb = {d} ms + the pass's drain; close is no durability point", .{ wb_timer.age_ns / std.time.ns_per_ms, wb_period_ns / std.time.ns_per_ms, open_table.writeback_bound_ns.load() / std.time.ns_per_ms });
+    } else log.info("write-back: the close posture — custody drains at the close the kernel reports", .{});
 
     // 6. Ready. The heartbeat's first stamp lands HERE, before the
     //    supervisor's first probe can read it (the watchdog's first tick is
@@ -855,6 +888,12 @@ fn mountMain(ctx: *Ctx) u8 {
     if (times_drain_fut) |*f| {
         times_drain.requestStop();
         f.cancel(io);
+    }
+    // The write-back timer finishes its pass (never cancelled mid-drain);
+    // the dismount pass below lands whatever it leaves.
+    if (wb_timer_fut) |*f| {
+        wb_timer.requestStop();
+        f.await(io);
     }
     // The job fabric stops BEFORE the dismount pass and the wire: a mover
     // mid-step releases its claim at its next task boundary (the plan is
@@ -1185,7 +1224,7 @@ const ReclaimCadence = struct {
     /// filesystem's FLUSH drain (the RELEASE drain), on this meta fiber —
     /// the corpse destroys of the same tick settle custody the same way.
     fn drainIdleOwed(self: *ReclaimCadence, c: *filesystem.Ctx) void {
-        if (!self.opens.no_open) return;
+        if (!self.opens.no_open or self.opens.posture == .timer) return;
         var buf: [OWED_HARVEST]u64 = undefined;
         while (true) {
             const inos = self.opens.takeIdleOwed(clock.monotonicNs(), self.owed_idle_ns, &buf);
@@ -1290,6 +1329,46 @@ const TimesDrainCadence = struct {
     }
 };
 
+/// The write-back timer (decision 0003 §AJ): a meta fiber parked on its own
+/// wake with the period (the flush cadence) as its deadline; each wake runs
+/// ONE `open_table.timerPass` — every owed ino whose custody is `age_ns` old
+/// drains through the filesystem's `drainAged`, what it keeps is re-owed.
+/// The stop wakes it and the teardown AWAITS the pass in flight: a drain is
+/// never cancelled mid-DMA (the dismount pass lands what is left).
+const WritebackTimer = struct {
+    fs: *BackendFs,
+    io: Io,
+    opens: *open_table.OpenTable,
+    period_ns: u64,
+    age_ns: u64,
+    wake: sync.Notify = .init,
+    stop: std.atomic.Value(bool) = .init(false),
+
+    fn requestStop(self: *WritebackTimer) void {
+        self.stop.store(true, .release);
+        self.wake.notifyOne(self.io);
+    }
+
+    fn drain(ctx: *anyopaque, ino: u64, cutoff_ns: u64) open_table.Drained {
+        const self: *WritebackTimer = @ptrCast(@alignCast(ctx));
+        return self.fs.drainAged(ino, cutoff_ns);
+    }
+
+    fn run(self: *WritebackTimer) void {
+        while (true) {
+            var n = self.wake.notified();
+            _ = n.enable(self.io);
+            if (self.stop.load(.acquire)) {
+                n.cancel(self.io);
+                return;
+            }
+            _ = n.waitUntilUncancelable(self.io, clock.monotonicNs() + self.period_ns);
+            if (self.stop.load(.acquire)) return;
+            self.opens.timerPass(clock.monotonicNs(), self.age_ns, .{ .ctx = self, .call = &drain });
+        }
+    }
+};
+
 /// The `il0` face binder the host calls at arm and unarm.
 fn bindIl0Thunk(ctx: *anyopaque, face: ?handler.kv_fs.Il0Face) void {
     const fs: *BackendFs = @ptrCast(@alignCast(ctx));
@@ -1309,7 +1388,11 @@ fn invalThunk(ctx: ?*anyopaque, ino: u64, off: i64, len: i64) error{QueueFull}!v
 /// CREATE opened still sends a RELEASE at its last close. The daemon opens
 /// its own `.stats` once before it reports ready (the request is the
 /// workers', the opener this task — as `mountDevice`'s GETATTR), so the
-/// posture holds from the first application request.
+/// posture holds from the first application request. Its close is the
+/// write-back timer's latch too (decision 0003 §AJ): a zero-message open
+/// carries the kernel's own `FOPEN_KEEP_CACHE` — no reply could add
+/// `FOPEN_NOFLUSH` — so its FLUSH answered ENOSYS sets `fc->no_flush` and
+/// every later close(2) on the connection is local.
 fn latchNoOpen(mountpoint: [:0]const u8) void {
     var buf: [linux.PATH_MAX:0]u8 = undefined;
     const path = std.fmt.bufPrintSentinel(&buf, "{s}/{s}", .{ mountpoint, handler.virtual_inodes.STATS_NAME }, 0) catch {

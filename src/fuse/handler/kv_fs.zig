@@ -4337,6 +4337,7 @@ const SettlingData = struct {
     /// The armed custody's lowest covered byte (`custodyFloor`) and the
     /// ordered law's data barriers the times drain asked for.
     custody_floor: u64 = 0,
+    reopen_floor: ?u64 = null,
     data_barriers: u32 = 0,
     barrier_inos: usize = 0,
     write_back_drains: u32 = 0,
@@ -4592,6 +4593,10 @@ const SettlingData = struct {
     /// fsync's DUR-1: the armed custody lands.
     pub fn fsync(self: *SettlingData, _: Io, ino: u64, _: ?staging.StagingKey) Error!void {
         if (self.custody_of == ino) self.custody_of = null;
+        if (self.reopen_floor) |f| {
+            self.custody_of = ino;
+            self.custody_floor = f;
+        }
     }
     /// The mount-wide drain: counted, with the store's commit and barrier
     /// counts it found (the parked stamps journaled BEFORE it, the meta
@@ -4861,6 +4866,38 @@ test "decision 0003 §AL.5 — THE ORDERED LAW: an extending striped write's siz
     try testing.expectEqual(@as(u64, 20_010), (try h.fs.readInodeStored(l)).?.size);
     try testing.expectEqual(@as(?linux.E, null), h.call(.{ .fsync = .{ .fh = 1, .datasync = false } }, f).errno());
     try testing.expectEqual(@as(u64, 20_060), (try h.fs.readInodeStored(l)).?.size);
+    h.release(f);
+}
+
+test "decision 0003 §AL.5 — an fsynced extension is durable at its full size: a write that opens custody under the claim right after fsync's data leg (an overlay record, a rewrite epoch: the floor drops below the claim) never clips the claim the fsync found" {
+    const H = HarnessOf(SettlingData);
+    var h: H = undefined;
+    try h.init();
+    defer h.deinit();
+    defer h.data.deinit();
+    h.data.store = &h.store;
+    var trace = op_trace.OpTrace.begin(0, .other);
+    defer trace.finish();
+    var ctx: filesystem.Ctx = .{ .unique = 0, .uid = 0, .gid = 0, .pid = 0, .io = testing.io, .trace = &trace, .wd_slot = null, .window = &.{} };
+    const f = try h.create(1, "f", 0o644);
+    const l = try H.Fs.localOf(f);
+    const big: [8192]u8 = @splat('X');
+    try testing.expectEqual(@as(?linux.E, null), h.write(f, 0, &big, 0).errno());
+    _ = try h.fs.drainPendingTimes(&ctx);
+    h.data.custody_of = l;
+    h.data.custody_floor = big.len;
+    try testing.expectEqual(@as(?linux.E, null), h.write(f, big.len, big[0..100], 0).errno());
+    h.data.reopen_floor = 4096;
+    try testing.expectEqual(@as(?linux.E, null), h.call(.{ .fsync = .{ .fh = 1, .datasync = false } }, f).errno());
+    try testing.expectEqual(@as(u64, 8292), (try h.fs.readInodeStored(l)).?.size);
+    try testing.expectEqual(@as(u64, 0), h.fs.pending.claimOf(l));
+    // The cadence's drain keeps the floor's law: the reopened custody pins
+    // a later claim below it.
+    try testing.expectEqual(@as(?linux.E, null), h.write(f, 8292, big[0..8], 0).errno());
+    _ = try h.fs.drainPendingTimes(&ctx);
+    try testing.expectEqual(@as(u64, 8292), (try h.fs.readInodeStored(l)).?.size);
+    h.data.reopen_floor = null;
+    h.data.custody_of = null;
     h.release(f);
 }
 

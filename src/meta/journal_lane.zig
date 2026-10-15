@@ -1119,6 +1119,8 @@ pub const JournalLane = struct {
     /// submitted never reaches the kernel (a dead ring's flush submits
     /// nothing); a run the kernel already took may still land, so its
     /// RingFailed is an indeterminate EIO and replay may apply the entry.
+    /// Its late CQE never reaches `residentCqe`: the lane drops it (0003
+    /// §AR.2; a WRITE only reads its buffer, so releasing it now is safe).
     fn failAll(self: *JournalLane, err: Error) void {
         const w = &self.w;
         if (w.ring_dead) return;

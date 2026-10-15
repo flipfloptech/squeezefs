@@ -87,6 +87,8 @@ const first_fiber_ud: u64 = 4096;
 /// The tag of an `ASYNC_CANCEL` SQE the lane issued (its CQE is ignored:
 /// the original op's CQE releases the fiber).
 const cancel_ud: u64 = 1;
+/// A dead ring's answer to a fiber's ring op.
+const ring_failed_res: i32 = -@as(i32, @intCast(@backingInt(errors.toErrno(error.RingFailed))));
 /// The resident's tag space: `[resident_ud_min, resident_ud_max]` — above
 /// the lane's own tags, below any fiber.
 pub const resident_ud_min: u64 = cancel_ud + 1;
@@ -267,7 +269,7 @@ pub const Lane = struct {
     ring_entries: u16,
     resident: ?Resident,
     driven: bool,
-    ring_dead_logged: bool = false,
+    ring_dead_handled: bool = false,
 
     pub const InitError = std.mem.Allocator.Error;
     pub const StartError = error{ RingSetupFailed, ThreadSpawnFailed };
@@ -703,6 +705,8 @@ pub const Lane = struct {
 
     fn issueCancel(self: *Lane, f: *Fiber) void {
         if (f.cancelWord().awaiting != .ring_op) return;
+        // A held op on a dead ring still ends on a cancel (§AR.4).
+        if (self.ring.isDead()) return self.ring.cancelSync(@intFromPtr(f));
         const sqe = self.ring.getSqe() orelse return;
         sqe.prep_cancel(@intFromPtr(f), 0);
         sqe.user_data = cancel_ud;
@@ -744,11 +748,20 @@ pub const Lane = struct {
         }
     }
 
+    /// On a dead ring this reaps the ops the verdict held (§AR.4): each one
+    /// answers RingFailed at its CQE, and only then does its fiber get its
+    /// buffer back.
     fn reapCqes(self: *Lane) void {
-        if (self.ring.isDead()) return;
+        const dead = self.ring.isDead();
+        if (dead) {
+            self.onRingDead();
+            if (self.in_flight == 0) return;
+            self.ring.enterDead();
+        }
         var cqes: [64]linux.io_uring_cqe = undefined;
         while (true) {
             const n = self.ring.ring.copy_cqes(&cqes, 0) catch {
+                if (dead) return;
                 self.ring.markDead();
                 self.onRingDead();
                 return;
@@ -756,14 +769,16 @@ pub const Lane = struct {
             for (cqes[0..n]) |cqe| {
                 if (self.ring.consumeWake(cqe)) continue;
                 if (cqe.user_data < first_fiber_ud) {
-                    if (cqe.user_data >= resident_ud_min) if (self.resident) |r| r.cqe(r.ctx, cqe);
+                    // The resident answered its ops at the verdict (§AR.2).
+                    if (!dead and cqe.user_data >= resident_ud_min) if (self.resident) |r| r.cqe(r.ctx, cqe);
                     continue;
                 }
                 const f: *Fiber = @ptrFromInt(cqe.user_data);
-                f.cqe_res = cqe.res;
-                f.cqe_flags = cqe.flags;
+                f.cqe_res = if (dead) ring_failed_res else cqe.res;
+                f.cqe_flags = if (dead) 0 else cqe.flags;
                 f.op_pending = false;
                 self.in_flight -= 1;
+                if (dead) stats.ring_dead_held_ops.sub(1);
                 if (f.state.wake()) self.pushReady(f);
             }
             if (n < cqes.len) return;
@@ -882,23 +897,30 @@ pub const Lane = struct {
         }
     }
 
-    /// The ring broke: fail every owed ring op with EIO and let placement
-    /// route around this lane (charter §1.8: loud, never a wedge).
+    /// The ring broke (once per lane): let placement route around this lane
+    /// (charter §1.8: loud, never a wedge). An op the kernel never took fails
+    /// EIO now. An op it took may still write its fiber's buffer, so the
+    /// fiber stays parked until that op's CQE (`reapCqes`, §AR.4).
     fn onRingDead(self: *Lane) void {
+        if (self.ring_dead_handled) return;
+        self.ring_dead_handled = true;
         self.alive.store(false, .release);
-        if (!self.ring_dead_logged) {
-            self.ring_dead_logged = true;
-            log.err("exec: lane {d} ({s}) ring is dead — {d} in-flight ring ops fail EIO; the lane keeps serving its parked fibers on the eventfd and takes no new spawns", .{ self.index, self.name, self.in_flight });
-            if (self.resident) |r| r.ringDead(r.ctx);
-        }
+        var held: u32 = 0;
         for (self.fibers) |*f| {
-            if (f.cancelWord().awaiting != .ring_op) continue;
-            f.cqe_res = -@as(i32, @intCast(@backingInt(errors.toErrno(error.RingFailed))));
+            if (!f.op_pending) continue;
+            if (!self.ring.untaken(@intFromPtr(f))) {
+                held += 1;
+                continue;
+            }
+            f.cqe_res = ring_failed_res;
             f.cqe_flags = 0;
             f.op_pending = false;
-            if (self.in_flight > 0) self.in_flight -= 1;
+            self.in_flight -= 1;
             if (f.state.wake()) self.pushReady(f);
         }
+        stats.ring_dead_held_ops.add(held);
+        log.err("exec: lane {d} ({s}) ring is dead — the ring ops the kernel never took fail EIO now; {d} it took keep their fibers parked until their CQEs (0003 §AR.4); the lane keeps serving on the eventfd and takes no new spawns", .{ self.index, self.name, held });
+        if (self.resident) |r| r.ringDead(r.ctx);
     }
 
     fn pushReady(self: *Lane, f: *Fiber) void {
@@ -929,7 +951,8 @@ pub const Lane = struct {
     }
 
     /// Test seam: mark the ring dead as a device fence would (the next pass
-    /// fails the owed ops and flips `alive`).
+    /// fails the ops the kernel never took, holds the rest until their CQEs
+    /// and flips `alive`).
     pub fn markRingDeadForTest(self: *Lane) void {
         assert(builtin.is_test);
         self.ring.markDead();

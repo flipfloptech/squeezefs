@@ -92,6 +92,10 @@ pub var blocking_refused: counters.ShardedCounter = .{};
 pub var blocking_reaped: counters.ShardedCounter = .{};
 /// `exec_ring_ops`: SQEs fibers armed on their lane rings (READV/WRITEV/POLL_ADD).
 pub var ring_ops: counters.ShardedCounter = .{};
+/// `exec_ring_dead_held_ops`: ring ops a dead lane ring still holds because
+/// the kernel took them (decision 0003 §AR.4). Each falls at its CQE; one
+/// that never comes is leaked on purpose: its fiber is never resumed.
+pub var ring_dead_held_ops: counters.Gauge = .{};
 
 // Tripwires (must stay 0).
 /// A second `readable(fd)` awaiter on one fd on one lane (a caller bug; the
@@ -151,7 +155,7 @@ pub fn writeStatsJson(w: *Io.Writer, lanes: []const LaneView) Io.Writer.Error!vo
     try writePerClass(w, "exec_spawn_refused", perClassLoads(counters.ShardedCounter, &spawn_refused));
     try w.print(",\"exec_spawn_trim_waits\":{d}", .{spawn_trim_waits.load()});
     try w.print(",\"exec_timer_arms\":{d},\"exec_timer_fires\":{d},\"exec_timer_thread_tombstones\":{d},", .{ timer_arms.load(), timer_fires.load(), timer_thread_tombstones.load() });
-    try w.print("\"exec_blocking_threads\":{d},\"exec_blocking_queue_depth\":{d},\"exec_blocking_spawns\":{d},\"exec_blocking_refused\":{d},\"exec_blocking_reaped\":{d},\"exec_ring_ops\":{d},", .{ blocking_threads.load(), blocking_queue_depth.load(), blocking_spawns.load(), blocking_refused.load(), blocking_reaped.load(), ring_ops.load() });
+    try w.print("\"exec_blocking_threads\":{d},\"exec_blocking_queue_depth\":{d},\"exec_blocking_spawns\":{d},\"exec_blocking_refused\":{d},\"exec_blocking_reaped\":{d},\"exec_ring_ops\":{d},\"exec_ring_dead_held_ops\":{d},", .{ blocking_threads.load(), blocking_queue_depth.load(), blocking_spawns.load(), blocking_refused.load(), blocking_reaped.load(), ring_ops.load(), ring_dead_held_ops.load() });
     try w.print("\"exec_fdwatch_double_await\":{d},\"exec_blocking_op_on_fuse_lane\":{d},\"exec_batch_on_lane\":{d},\"exec_inbox_overflow\":{d},\"exec_fiber_stack_over_half\":{d},\"exec_group_second_awaiter\":{d},", .{ fdwatch_double_await.load(), blocking_op_on_fuse_lane.load(), batch_on_lane.load(), inbox_overflow.load(), fiber_stack_half.load(), group_second_awaiter.load() });
     try w.writeAll("\"exec_lanes\":[");
     for (lanes, 0..) |l, i| {

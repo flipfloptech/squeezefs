@@ -23,9 +23,11 @@
 //!     verdict, so a combined submit-and-timed-wait never reports ETIME
 //!     (found red-first in rung 1; liburing waits in a separate call for the
 //!     same reason). An untimed park is one `submit_and_wait(1)`;
-//!   - the dead-ring park: once the ring broke nothing on it completes, so
+//!   - the dead-ring park: once the ring broke nothing waits on it, so
 //!     the lane parks on the eventfd alone (`poll(2)` — the failure drain,
-//!     never a product I/O path) until a message, a kick or the tick;
+//!     never a product I/O path) until a message, a kick or the tick. The
+//!     ops the kernel already took still complete: their owner holds them
+//!     and reaps them through `enterDead` (decision 0003 §AR.4);
 //!   - teardown: cancel the armed READ and reap its CQE BEFORE the ring goes
 //!     away so no in-kernel completion lands in `wake_buf` after the lane freed
 //!     it.
@@ -110,7 +112,9 @@ fn writeEventfd(fd: linux.fd_t) void {
 /// face (a comptime namespace):
 ///
 ///   - `Ring` with fields `fd: fd_t` and `features: u32` (the raw EXT_ARG
-///     wait enters on them); `Sqe` with fields `flags: u8`, `user_data: u64`;
+///     wait enters on them) and `sq` with `head: *u32`, `sqe_tail: u32`,
+///     `mask: u32`, `sqes: []Sqe` (liburing's layout; `untaken` reads it);
+///     `Sqe` with fields `flags: u8`, `user_data: u64`;
 ///     `Cqe` with field `user_data: u64`;
 ///   - `setup(entries: u16, flags: u32) !Ring`, `deinit(*Ring) void`;
 ///   - `getSqe(*Ring) ?*Sqe` — the raw take, null when the SQ is full;
@@ -266,6 +270,42 @@ pub fn Parked(comptime F: type) type {
             if (self.dead) return;
             _ = self.enters.fetchAdd(1, .monotonic);
             _ = F.submit(&self.ring) catch {};
+        }
+
+        /// After the verdict: true when the kernel never took the SQE tagged
+        /// `ud`. It sits in the SQ between the kernel's head and the owner's
+        /// tail (prepared, or published and left there by a failed enter) and
+        /// never runs (§AR.1), so its owner answers it at once. Any other op
+        /// the owner holds was taken: it stays owned, buffer and waiter, until
+        /// its CQE (decision 0003 §AR.4).
+        pub fn untaken(self: *const Self, ud: u64) bool {
+            const sq = &self.ring.sq;
+            var pos = @atomicLoad(u32, sq.head, .acquire);
+            while (pos != sq.sqe_tail) : (pos +%= 1) {
+                if (sq.sqes[pos & sq.mask].user_data == ud) return true;
+            }
+            return false;
+        }
+
+        /// The dead ring's reap enter, on the owner's thread: nothing to submit
+        /// (`to_submit = 0`, so the untaken SQEs stay untaken, §AR.1) and no
+        /// wait. It runs the completions a `DEFER_TASKRUN` ring posts only
+        /// inside its owner's enter, so the owner's next CQ read sees the CQEs
+        /// of the ops it still holds. A refusal is quiet: the CQ memory still
+        /// shows whatever the kernel posts by itself.
+        pub fn enterDead(self: *Self) void {
+            _ = self.enters.fetchAdd(1, .monotonic);
+            _ = linux.io_uring_enter(self.ring.fd, 0, 0, linux.IORING_ENTER_GETEVENTS, null);
+        }
+
+        /// A cancel request on a dead ring: `IORING_REGISTER_SYNC_CANCEL` of the
+        /// op tagged `ud`. It is a register, not an SQE, so §AR.1 holds, and its
+        /// zero timeout never waits. The op's CQE (ECANCELED, or its completion)
+        /// answers it at the owner's next dead reap; a refusal leaves the op to
+        /// complete on its own.
+        pub fn cancelSync(self: *Self, ud: u64) void {
+            var reg: linux.io_uring_sync_cancel_reg = .{ .addr = ud, .fd = 0, .flags = 0, .timeout = .{ .sec = 0, .nsec = 0 }, .pad = @splat(0) };
+            _ = linux.io_uring_register(self.ring.fd, .REGISTER_SYNC_CANCEL, &reg, 1);
         }
 
         /// Push the eventfd READ under `wake_ud` unless it already stands. True
@@ -652,4 +692,34 @@ test "a dead ring submits nothing and parks on the eventfd alone: a prepared SQE
     try testing.expect(!pr.wake());
     try testing.expectEqual(Verdict.event, pr.park(null));
     try testing.expect(pr.service());
+}
+
+test "a dead ring's taken ops stay reapable (0003 §AR.4): untaken names only the SQE the kernel never took; cancelSync ends a taken pipe READ without an SQE; enterDead brings its CQE to the CQ read" {
+    var pr = try ParkedRing.init(testing.allocator, 8, linux.IORING_SETUP_SINGLE_ISSUER | linux.IORING_SETUP_DEFER_TASKRUN);
+    defer pr.deinit();
+    var fds: [2]linux.fd_t = undefined;
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.pipe2(&fds, .{ .CLOEXEC = true })));
+    defer for (fds) |fd| {
+        _ = linux.close(fd);
+    };
+    var buf: [8]u8 = undefined;
+    // Taken: a READ of a pipe nothing writes, submitted before the verdict.
+    const read = pr.getSqe().?;
+    read.prep_read(fds[0], &buf, std.math.maxInt(u64));
+    read.user_data = 1;
+    pr.flush();
+    // Never taken: prepared before the verdict, as a failed enter leaves it.
+    const nop = pr.getSqe().?;
+    nop.prep_nop();
+    nop.user_data = 2;
+    pr.markDead();
+    try testing.expect(!pr.untaken(1));
+    try testing.expect(pr.untaken(2));
+    pr.cancelSync(1);
+    pr.enterDead();
+    var cqes: [4]linux.io_uring_cqe = undefined;
+    try testing.expectEqual(@as(u32, 1), try pr.ring.copy_cqes(&cqes, 0));
+    try testing.expectEqual(@as(u64, 1), cqes[0].user_data);
+    try testing.expectEqual(-@as(i32, @intCast(@backingInt(linux.E.CANCELED))), cqes[0].res);
+    try testing.expectEqual(@as(u32, 1), pr.ring.sq_ready());
 }

@@ -811,9 +811,11 @@ fn workerPasses(w: *Worker) void {
         if (takeArmed(&dev.seams.kill_ring)) {
             // The seam's loud line is declared on the thread that logs it.
             // The ring is healthy here, so the standing READ is cancelled
-            // first: a dead park polls the eventfd itself.
+            // first: a dead park polls the eventfd itself. `quiesce` drops
+            // every other CQE it meets, so with requests in the ring the
+            // READ stands and the dead reap consumes its CQE.
             if (builtin.is_test) log.testing.expectErrorLogs(1);
-            w.park.quiesce();
+            if (w.active_count == 0) w.park.quiesce();
             w.park.markDead();
             failInFlight(w);
         }
@@ -843,7 +845,9 @@ fn workerPasses(w: *Worker) void {
         // (tripwired above). A dead ring parks on the eventfd alone.
         stats.dev_enters.inc();
         if (pass_fills > 0) stats.dev_submit_enters.inc();
-        const tick: ?u64 = if (w.ring_dead or w.park.wake_armed) null else nd.wake_unarmed_backstop_ns;
+        // A dead ring's CQEs wake nobody: while it holds ops (§AR.4) the
+        // backstop tick is what reaps them.
+        const tick: ?u64 = if (w.ring_dead) (if (w.active_count > 0) nd.wake_unarmed_backstop_ns else null) else if (w.park.wake_armed) null else nd.wake_unarmed_backstop_ns;
         _ = w.park.park(tick);
         if (w.park.isDead() and !w.ring_dead) failInFlight(w);
         reap(w);
@@ -862,18 +866,26 @@ fn holdIfArmed(seams: *Seams) void {
 /// The ring broke (the park found its enter failing, or the seam killed
 /// it): every request IN the ring fails with `RingFailed` — once, here,
 /// loud — and every later one at the pump; the lane stays up to answer
-/// them (charter §1.2: no classical fallback; §1.8: fail loud). Nothing on
-/// a dead ring completes, so its CQEs are never read again.
+/// them (charter §1.2: no classical fallback; §1.8: fail loud). A request
+/// the kernel never took is answered now. One it took may still DMA into
+/// its buffer (`readInto`'s is the caller's), so it keeps its cell and
+/// buffer until its CQE and is answered then (`reap`, decision 0003 §AR.4).
 fn failInFlight(w: *Worker) void {
     const lane = w.lane;
     w.ring_dead = true;
-    log.err("NvmeBlockDev lane {d} ({s}): the ring is dead — failing {d} in-flight ops and every later request on this lane (RingFailed; charter §1.2: no classical fallback)", .{ lane.number, lane.dev.path, w.active_count });
+    var held: usize = 0;
     for (w.in_ring, 0..) |*in_ring, i| {
         if (!in_ring.*) continue;
+        if (!w.park.untaken(i)) {
+            held += 1;
+            continue;
+        }
         in_ring.* = false;
         answerUnrun(lane, @intCast(i), .ring_failed);
     }
-    w.active_count = 0;
+    log.err("NvmeBlockDev lane {d} ({s}): the ring is dead — failing {d} in-flight ops the kernel never took and every later request on this lane; {d} it took answer RingFailed at their CQEs (0003 §AR.4; charter §1.2: no classical fallback)", .{ lane.number, lane.dev.path, w.active_count - held, held });
+    w.active_count = held;
+    stats.dev_ring_dead_held_ops.add(held);
 }
 
 /// Build and push one request's SQE(s). False ⇒ the request was refused
@@ -965,10 +977,14 @@ fn pumpOne(w: *Worker, idx: u32) bool {
     return true;
 }
 
-/// Reap every ready CQE after the pass's park. A dead ring's CQEs are never
-/// read: its in-flight ops were already answered.
+/// Reap every ready CQE after the pass's park. On a dead ring only the
+/// requests `failInFlight` held remain, and each answers RingFailed here,
+/// at its CQE.
 fn reap(w: *Worker) void {
-    if (w.ring_dead) return;
+    if (w.ring_dead) {
+        if (w.active_count == 0) return;
+        w.park.enterDead();
+    }
     const lane = w.lane;
     var completed: usize = 0;
     while (true) {
@@ -981,7 +997,11 @@ fn reap(w: *Worker) void {
                 stats.cqe_orphan_slot.fire("CQE named a slot with no in-flight request");
                 continue;
             }
-            completeOne(w, @intCast(cqe.user_data), cqe.res);
+            if (w.ring_dead) {
+                w.in_ring[cqe.user_data] = false;
+                answerUnrun(lane, @intCast(cqe.user_data), .ring_failed);
+                stats.dev_ring_dead_held_ops.sub(1);
+            } else completeOne(w, @intCast(cqe.user_data), cqe.res);
             completed += 1;
         }
     }

@@ -374,6 +374,10 @@ pub const stats = struct {
     /// completion (writes, barriers) — the watchdog's "LOST DEVICE
     /// COMPLETION" instrument.
     pub var device_lock_waiters: counters.Gauge = .{};
+    /// Requests a dead lane ring still holds because the kernel took them
+    /// (decision 0003 §AR.4). Each falls at its CQE; one that never comes
+    /// keeps its cell and buffer for good (a leak, never a reuse).
+    pub var dev_ring_dead_held_ops: counters.Gauge = .{};
     /// Read enqueue → SQE build (queue + slot wait) and SQE stamp → CQE.
     pub var read_fill_dev_queue_ns: counters.ShardedLatencyHistogram = .{};
     pub var read_fill_dev_service_ns: counters.ShardedLatencyHistogram = .{};
@@ -409,7 +413,7 @@ pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
     inline for (.{ "get_obj", "put_obj", "uring_queue_full", "nvme_unaligned_write_fallbacks", "dev_fills", "dev_enters", "dev_submit_enters", "dev_wake_batches", "dev_wake_writes", "dev_wakes_elided", "dev_fixed_buf_fills", "data_device_sync_requests", "data_device_syncs", "data_dma_fence_refusals", "data_dma_dismount_refusals", "aligned_pool_hits", "aligned_pool_misses", "aligned_pool_trimmed_bytes" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, @field(stats, name).load() });
     }
-    try w.print("\"device_lock_waiters\":{d},", .{stats.device_lock_waiters.load()});
+    try w.print("\"device_lock_waiters\":{d},\"dev_ring_dead_held_ops\":{d},", .{ stats.device_lock_waiters.load(), stats.dev_ring_dead_held_ops.load() });
     try writeHistJson(w, "read_fill_phase_ns", &stats.read_fill_dev_queue_ns, &stats.read_fill_dev_service_ns);
     try w.writeAll(",");
     try writeHistJson(w, "write_pipeline_phase_ns", &stats.write_pipeline_dev_queue_ns, &stats.write_pipeline_dev_service_ns);

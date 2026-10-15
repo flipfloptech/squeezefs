@@ -1092,6 +1092,38 @@ test "smoke: a TWO-MEMBER metadata set through the binary — format sqmeta://a,
 /// two reclaim cadences.
 const smoke_t_owner_ms: u64 = 3000;
 
+/// The longest serve measured beside a member's renewal in a storming
+/// three-daemon row: an `xv_step` of 2,762 ms at B's kill (kamrui, 4 × `yes`;
+/// rung-10-symmetric-defects.md §7). The member's beat makes its other calls
+/// inline (the census, an offer's accept — a handover the holder serves
+/// behind the slot's steps — a set-config learn), so its renewal margin
+/// `T_self − renew` must cover one such call: at the shipped 45 s it is
+/// 32.7 s, past the dialer's 10 s reply bound; at `smoke_t_owner_ms` it is
+/// 532 ms, and C parked at `T_self` beside that step and was evicted.
+const smoke_storm_serve_ms: u64 = 2_762;
+
+/// `T_owner` for the rows that storm three daemons across a kill: the
+/// smallest whole second whose derived margin covers `smoke_storm_serve_ms`
+/// (7 s: `T_self` 4,794 ms, renew 1,598 ms, margin 3,196 ms).
+const smoke_storm_t_owner_ms: u64 = blk: {
+    var t: u64 = smoke_t_owner_ms;
+    while (true) : (t += 1000) {
+        const c = membership.shard.LeaseClocks.derive(t, 0, membership.shard.CHECKPOINT_LANDING_CEILING_MS) catch continue;
+        if (c.t_self_ms - c.renew_ms >= smoke_storm_serve_ms) break :blk t;
+    }
+};
+
+test "the storming rows' T_owner is the smallest whole second whose renewal margin covers the measured serve: 7 s (T_self 4,794 ms, renew 1,598 ms); 6 s leaves 2,530 ms" {
+    try testing.expectEqual(@as(u64, 7000), smoke_storm_t_owner_ms);
+    const c = try membership.shard.LeaseClocks.derive(smoke_storm_t_owner_ms, 0, membership.shard.CHECKPOINT_LANDING_CEILING_MS);
+    try testing.expectEqual(@as(u64, 4794), c.t_self_ms);
+    try testing.expectEqual(@as(u64, 1598), c.renew_ms);
+    const below = try membership.shard.LeaseClocks.derive(smoke_storm_t_owner_ms - 1000, 0, membership.shard.CHECKPOINT_LANDING_CEILING_MS);
+    try testing.expectEqual(@as(u64, 2530), below.t_self_ms - below.renew_ms);
+    const smoke = try membership.shard.LeaseClocks.derive(smoke_t_owner_ms, 0, membership.shard.CHECKPOINT_LANDING_CEILING_MS);
+    try testing.expectEqual(@as(u64, 532), smoke.t_self_ms - smoke.renew_ms);
+}
+
 /// The offline reader a joiner process uses before it holds any wire: the
 /// superblock, the newest ledger record, the control records at that
 /// checkpoint, the appender pages (`PageReader`).
@@ -4302,7 +4334,7 @@ test "smoke: THE SHARED HOT DIRECTORY ACROSS DAEMONS — A (the manager) mkdirs 
     defer rig.deinit();
     try rig.env.put("SQUEEZEFS_MW_BIND", "127.0.0.1:0");
     var t_owner_text: [8]u8 = undefined;
-    try rig.env.put("SQUEEZEFS_TEST_MEMBERSHIP_T_OWNER_MS", try std.fmt.bufPrint(&t_owner_text, "{d}", .{smoke_t_owner_ms}));
+    try rig.env.put("SQUEEZEFS_TEST_MEMBERSHIP_T_OWNER_MS", try std.fmt.bufPrint(&t_owner_text, "{d}", .{smoke_storm_t_owner_ms}));
     try rig.formatSetWith(false, &.{});
     try rig.spawnMount(&.{});
     _ = try rig.awaitReady(0);

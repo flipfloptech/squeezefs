@@ -164,3 +164,7 @@ registry-full count × 1 MiB (`dev` 4 → 4.39 MB, 8 → 8.58 MB; branch 2 → 2
 The row engages the gate only when that tripwire fires. The branch drops the per-write size
 commit, so it overflows the registry less. This is the capacity defect `storm` is fixing, not a
 change in where tails park.
+With §AP's custody tables on `dev` (`0e1b057`), the row is green in the branch's gate below.
+
+**Gate.** Full venue gate on the VM (the orchestrator's routing while kamrui's lock was held), the
+branch on `ff1bed7`, `-Dfresh`: 49/49 steps, 2,960/3,044 tests (84 skipped), 0 failed.

@@ -177,9 +177,13 @@ case "${1:-}" in
     ;;
   trim)
     # Return deleted blocks to the Mac: the container disk is a sparse image
-    # that only shrinks when the guest issues discards. Run after big-file
-    # tests; also clears stale test images under /build/tmp.
-    run_in 'rm -rf /build/tmp/mnt-* /build/tmp/*.img /build/tmp/*.log 2>/dev/null; sync -f /build; fstrim -v /build; df -h /build | tail -1'
+    # that only shrinks when the guest issues discards. First prune what builds
+    # leave behind (scripts/venue-prune: the zig cache above SQZ_VENUE_CACHE_CAP_GB,
+    # finished agents' caches, test leftovers) holding the gate lock and every
+    # slot, so nothing in use is deleted; a venue busy for 15 min skips the prune.
+    all_slots=""
+    for ((s = 0; s < SLOTS; s++)); do all_slots="$all_slots flock -o /build/.build-slot.$s"; done
+    SQZ_VENUE_SLOT=0 run_in "flock -o -w 900 /build/.gate.lock$all_slots bash scripts/venue-prune ${SQZ_VENUE_CACHE_CAP_GB:-30} || echo 'venue: busy for 15 min — prune skipped' >&2; sync -f /build; fstrim -v /build; df -h /build | tail -1"
     ;;
   status)
     run_in 'uname -r; zig version; echo "install prefix: zig-out-linux/"; echo "fuse.enable_uring=$(cat /sys/module/fuse/parameters/enable_uring)"; echo "io_uring_disabled=$(cat /proc/sys/kernel/io_uring_disabled)"; nproc; free -g | sed -n 2p'

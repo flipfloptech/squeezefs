@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# Prunes a venue's build leftovers. `scripts/venue trim` runs it holding the gate lock and
+# every build slot, so no build or test is using what it deletes.
+# The zig cache never forgets an artifact: every fresh gate adds its test binaries, so
+# /build/zig-cache-v2 reached 58 GB on the VM and 47 GB on kamrui within a day (2026-10-15),
+# and the Mac's free disk fell trim after trim (the VM's /build is a sparse image on it).
+set -u
+cap_gb=${1:-30}
+
+used_mb=$(du -sm /build/zig-cache-v2 2>/dev/null | cut -f1)
+if [ "${used_mb:-0}" -gt $((cap_gb * 1024)) ]; then
+  rm -rf /build/zig-cache-v2
+  echo "venue: zig-cache-v2 held $((used_mb / 1024)) GB (cap $cap_gb GB) — emptied; the next build recompiles once"
+fi
+
+# A worktree's own cache (`--cache-dir /build/zig-cache-<name>`) untouched for a day is a
+# finished agent's.
+for d in /build/zig-cache-*; do
+  [ -d "$d" ] && [ "$d" != /build/zig-cache-v2 ] || continue
+  [ -n "$(find "$d" -mmin -1440 -print -quit 2>/dev/null)" ] && continue
+  echo "venue: removed $(du -sh "$d" | cut -f1) idle cache $d"
+  rm -rf "$d"
+done
+
+# Test leftovers: images, logs and mount dirs at once, run dirs after a day. Never a path with
+# a live mount under it (a leaked daemon's): rm -rf would delete through FUSE.
+for p in /build/tmp/*; do
+  [ -e "$p" ] || continue
+  grep -qF " $p" /proc/mounts && continue
+  case $p in
+    /build/tmp/mnt-* | *.img | *.log) rm -rf "$p" ;;
+    *) [ -z "$(find "$p" -mmin -1440 -print -quit 2>/dev/null)" ] && rm -rf "$p" ;;
+  esac
+done
+true

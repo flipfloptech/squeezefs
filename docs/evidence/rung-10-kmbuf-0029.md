@@ -49,8 +49,13 @@ build over ssh. Packages (built 13:16–13:33 UTC; they reuse the names of the p
 runs, so check the hashes): `/build/kernel/linux-image-7.2.6-sqz_7.2.6-1_amd64.deb` (sha256
 `d5e9579e302e…`) and `/build/kernel/linux-headers-7.2.6-sqz_7.2.6-1_amd64.deb` (`d2c77d8f0b34…`).
 
-**Owed (the orchestrator's).** kamrui: `sudo dpkg -i` both packages, then reboot right away.
-The version string matches the running kernel; `uname -v` shows the new build time. VM:
-`scripts/kernel/build-venue-kernel`, `container system kernel set --binary <Image> --force`,
-`container rm -f sqz-zig && scripts/venue up`. **After:** rerun `RAND=6 PAR=1 TRIALS=10` (and
-`PAR=12`) with `BIN=<zig-out-linux>/bin/squeezefs`; 0 refused expected.
+**Installed (2026-10-15).** kamrui: both packages (hashes checked) installed and rebooted at
+13:44 UTC under the gate lock and every slot; `uname -v` = `Thu Oct 15 13:29:48 UTC 2026`. VM:
+`build-venue-kernel` (Image sha256 `1e7a39a903a7…`, build `13:42:41 UTC`), boot-tested with
+`container run --rm -k`, set as the default, `sqz-zig` recreated.
+
+**After, on kamrui's new kernel** (same binary, same repro): `RAND=6 PAR=1 TRIALS=10` — **0 of 10**
+refused (before: 10 of 10), at MemFree 277–591 MiB, 55.8 GiB cached and 0 MiB free at order ≥ 8 in
+ZONE_NORMAL, so every buffer's compound attempt failed and the page-by-page finish carried it.
+`RAND=6 PAR=12 TRIALS=3` — 0 of 36 refused; only trial 1 ran under pressure (min MemFree 561 MiB,
+12 of 12 mounted), trials 2–3 started with the page cache drained (23–40 GiB free).

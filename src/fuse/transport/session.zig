@@ -1360,7 +1360,7 @@ pub const Session = struct {
     /// the mount loud naming the probe (the only degrade point is the probe).
     fn resolveMode(self: *Session, env: *const std.process.Environ.Map, offered: u64) MountError!void {
         const page: u32 = @intCast(self.facts.page_size);
-        const kmbuf_v = probes.driver.probeKmbuf(page);
+        const kmbuf_v: probes.KmbufVerdict = if (knobs.boolKnob("SQUEEZEFS_TEST_KMBUF_ABSENT", env)) .absent else probes.driver.probeKmbuf(page);
         const cap = probes.driver.capSysAdmin(self.io, env);
         // The ring the reply will create (the parameter after our write,
         // `probes.ringAtReply`); the sparse table is the zc slot shape
@@ -2927,6 +2927,50 @@ test "e2e lattice: an explicit `bufring` mounts BufRing (no arena, every payload
         try testing.expectEqual(before.bridges, after.bridges);
     }
     if (no_kmbuf) |why| return testkit.skipWhy(@src(), why);
+}
+
+test "e2e lattice: the stock stratum (the SQUEEZEFS_TEST_KMBUF_ABSENT seam, a stock distro kernel's verdicts on any venue) — `auto` mounts UserEnts with its arena, kmbuf/zc/retention read absent and publish 0; reads and writes serve byte-exact and the laws close; an explicit `bufring` and `zc` are refused loud naming kmbuf" {
+    if (venueMissing()) |why| return testkit.skipWhy(@src(), why);
+    const seam: [2][]const u8 = .{ "SQUEEZEFS_TEST_KMBUF_ABSENT", "1" };
+    {
+        const rig = try Rig.init(testing.allocator, 42, &.{seam});
+        defer rig.deinit();
+        const before = Snapshot.take();
+        const s = try rig.mountIt(.{ .mem_budget_bytes = 0 });
+        try testing.expectEqual(geometry.BufferMode.user_ents, s.mode);
+        try testing.expect(s.verdicts.kmbuf == .absent);
+        try testing.expectEqual(probes.Verdict.absent, s.verdicts.zc);
+        try testing.expectEqual(probes.Verdict.absent, s.retention);
+        try testing.expect(!s.shared.retention);
+        try testing.expect(s.slab == null);
+        try testing.expect(arena_bytes.load() > 0);
+        try testing.expectEqual(@as(u64, 0), probes.mode_gauge.load());
+        try testing.expectEqual(@as(u64, 0), probes.kmbuf_gauge.load());
+        try testing.expectEqual(@as(u64, 0), probes.zc_gauge.load());
+        try testing.expectEqual(@as(u64, 0), probes.retention_gauge.load());
+        var pb: [256]u8 = undefined;
+        const big = try testing.allocator.alloc(u8, EchoFs.big_len);
+        defer testing.allocator.free(big);
+        try testing.expectEqual(EchoFs.big_len, try readWhole(rig.child(&pb, "big"), big));
+        for (big, 0..) |b, j| if (b != EchoFs.bigByte(j)) return error.BigPatternMismatch;
+        const data = "stock stratum bytes";
+        const w0 = worker.write_window_bytes.load();
+        try testing.expectEqual(data.len, try writeWhole(rig.child(&pb, "scratch"), data));
+        try testing.expectEqualSlices(u8, data, rig.fs.scratch[0..data.len]);
+        // The non-zc term of the admission ledger counts the payload.
+        try testing.expectEqual(w0 + data.len, worker.write_window_bytes.load());
+        const after = Snapshot.take();
+        try expectLaws(before, after);
+        try testing.expectEqual(before.attached, after.attached);
+        try testing.expectEqual(before.bridges, after.bridges);
+    }
+    for ([_][]const u8{ "bufring", "zc" }, 0..) |mode, i| {
+        const rig = try Rig.init(testing.allocator, 43 + @as(u32, @intCast(i)), &.{ seam, modeEnv(mode) });
+        defer rig.deinit();
+        log.testing.expectErrorLogs(1);
+        try testing.expectError(error.BufferModeRefused, rig.mountIt(.{ .mem_budget_bytes = 0 }));
+        try log.testing.expectAllFired();
+    }
 }
 
 test "e2e lattice: an explicit `zc` on a venue without CAP_SYS_ADMIN (the seam) fails the mount LOUD naming the probe; `auto` on the same seam settles on BufRing — the probe is the only degrade point" {

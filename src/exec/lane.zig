@@ -465,7 +465,7 @@ pub const Lane = struct {
         assert(self.driven and current_lane == self);
         self.passTop();
         self.runReadyBudget(self.ready_len);
-        if (!self.ring.isDead() and self.ring.ring.sq_ready() > 0) self.ring.flush();
+        if (self.ring.ring.sq_ready() > 0) self.ring.flush();
     }
 
     /// A fiber is runnable: the owner must not park.

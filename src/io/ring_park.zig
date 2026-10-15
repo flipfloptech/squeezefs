@@ -260,8 +260,10 @@ pub fn Parked(comptime F: type) type {
         }
 
         /// A non-blocking submit of every prepared SQE (one enter, no wait):
-        /// the owner's flush between parks.
+        /// the owner's flush between parks. A dead ring submits nothing: its
+        /// owner already failed every prepared op and may have freed its buffers.
         pub fn flush(self: *Self) void {
+            if (self.dead) return;
             _ = self.enters.fetchAdd(1, .monotonic);
             _ = F.submit(&self.ring) catch {};
         }

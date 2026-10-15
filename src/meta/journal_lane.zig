@@ -1113,7 +1113,10 @@ pub const JournalLane = struct {
     /// once — a ring that cannot `io_uring_enter` is a device fence, which
     /// charter §1.8 names terminal (three later window verdicts would leave
     /// a quiet volume "dead lane, not FAILED"). Idempotent: the seam and
-    /// the lane's own verdict may both arrive.
+    /// the lane's own verdict may both arrive. A run prepared but not yet
+    /// submitted never reaches the kernel (a dead ring's flush submits
+    /// nothing); a run the kernel already took may still land, so its
+    /// RingFailed is an indeterminate EIO and replay may apply the entry.
     fn failAll(self: *JournalLane, err: Error) void {
         const w = &self.w;
         if (w.ring_dead) return;

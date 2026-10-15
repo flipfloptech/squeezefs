@@ -146,6 +146,11 @@ the file's own.
 **Cost.** Close posture: one data barrier per drained close of an extended file. Timer: no new
 barrier (the woken drain is the one the tick would have run). fsync: unchanged.
 
+**THE BLOCK-MAP TREE** (red in the branch's kamrui gate, `smoke.zig` "big claims ≥ the inline
+cap" after the mid-crossing kill): the same per-write size commit the kill matrix assumed. Its
+crash arm now runs `sync -d big` at the inline cap (1,364 MiB) before the crossing begins. Alone on
+kamrui ×2: 1,364 MiB durable, 1,364 blocks exact, 0 holes.
+
 **The writer-storm row** (owned by `storm` on `dev`). Alone on kamrui, same base (`e1c334f`), 5
 runs each: `dev` failed 2 of 5, the branch 5 of 5, both with `waits + cold ≥ 1`. Instrumented
 (admission bytes by arm): the 1,000 B tails never park on EITHER tree. The only parked buffers are

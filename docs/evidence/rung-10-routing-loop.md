@@ -54,3 +54,59 @@ joined mounts open grant-mirror trees elsewhere (not this path).
 **Gate.** One full venue gate through the lock (VM, the series on `703dd98`): 49/49 steps,
 2,934 / 3,016 tests (82 skipped). Targeted: the unit kill matrix (5 cuts) and `adoptLive`; the smoke's
 79 kill / write-back-timer rows green.
+
+## Round 2 — the whole reachable set; the symmetric plane (0003 §AO)
+
+**Builder-built trees (the owed residual).** `copySlotTree`'s builder claims every node in RAM, its
+root LAST; C6 writes the bitmap pages in page order. The cursor is lowest-first (a release lowers
+it), so a release landing mid-build — a checkpoint's coverage drain beside a live copy — puts the
+root BELOW its leaves, and a kill inside C6 lands the root's page without the leaves'. Round 1 tested
+the root's bit only and skipped the tree. **Red** (`meta.backend` "kill matrix: mid-C6 …"; seam
+`after_bitmap_page`, a 2.5 GiB sparse two-page volume): `the built tree reaches 10 extent(s), 9 of
+them free in the recovered allocator; the first claim past page 0 is extent 32576` — a live leaf.
+**Fix:** the writer mount walks EVERY maintained tree and adopts each reachable free extent; green:
+`0 of them free; the first claim past page 0 is extent 32585`. The mid-C4b cut still adopts its two
+roots. The cut snapshot now copies data runs only (SEEK_DATA / SEEK_HOLE).
+
+**Cost** (AO.3; kamrui, x86_64 NVMe, a ReleaseFast build): 1,000,000 files in 8 directories (8 shell
+writers, 244 s), 66 trees, 1,026 reachable extents — the walk takes **0.65 ms** per writer mount,
+clean or after a kill (`meta_kv_mount_reach_walk_extents` / `_ns`). It reads only interior nodes,
+under 1 % of the images at the shipped fan-out. Every writer mount walks: a page refresh names a root
+with no journal entry, so an empty window does not prove the bitmap whole.
+
+**The symmetric plane — the review.** Can a named root, or a node it reaches, come back FREE in
+the bitmap the manager allocates from after a kill of either member?
+- *Manager → joiner (T1).* The handover's `cycleOnce` checkpoints the holder BEFORE the grant's
+  entry moves the tree's images into the grantee's record: measured, one A page lands between the
+  mint and the grant, and B's pooled image (A's RAM claim moved to B, then retired into B's pool)
+  stays allocated on A's reopened bitmap.
+- *A joiner's own claims* sit inside its grant runs, and the grant entry journals their bits with
+  the record (`Manager.grant`'s alloc frames). A joiner killed: §U.1's recovery installs the newer of
+  page and tree-0 root, replays the dead window under the SMO lock, keeps every extent the
+  recovered trees reach and returns only the rest. A joiner's rejoin is a new incarnation whose
+  mirror is its fresh grants (nothing to adopt).
+- *KVDA homes* barrier their images and then journal their claims as one control entry.
+- **The one defect: my own round-2 walk.** At the manager's mount it also walked trees that tree 0
+  names as leased to a LIVE joiner. Such a tree is a projection whose interior may name extents the
+  lessee recycled; §U.1 forbids walking it. **Red** (`sym.handover_moves` "THE MANAGER'S KILL WITH A
+  LIVE LESSEE"): `the mount walked 3 extent(s), the maintained trees hold 2`. **Fix:**
+  `slot_state.GuestRoot.lessee`, and the walk skips another appender's slots (AO.2). Green: 2 = 2.
+  Round 1 on `dev` walked a tree only when its root was free, and a live lessee's root is always
+  allocated (it sits in the grant), so `dev` was never exposed.
+
+**Owed (not found reachable here).** The manager killed in the middle of a dead member's recovery,
+between the residue return and the replayed trees' first checkpoint, is §U.1's structure law; this
+pass did not re-verify it. The kamrui measurement also hit an unrelated wedge: under 8 mdtest ranks
+whose MPI TCP pairing failed, one create was parked at `handler_entry` for over 75 s, and the
+umount then hung.
+
+**Gate (round 2).** One full gate on kamrui (the VM is the train's), on the series before its last
+rebase: 47 of 53 steps passed, 2 failed, and 2,936 of 3,017 tests passed (80 skipped, 1 failed). Both
+failures happen without this change and are attributed in `docs/gates/flakes.md`:
+- the writer-storm row on kamrui (`gate waits 0, cold flushes 0`), which fails the same way on `dev`
+  `260be26` alone;
+- `suites-smoke`'s apt.lock drift on kamrui's Ubuntu 26.04 packages.
+
+Targeted runs: the backend, `handover_moves`, `volume_bind` and `slot_state` units, and 94 smoke rows
+(kill, daemons, joins, timer, readers). The KVDA page-sink row failed once in that batch and passed
+2 of 2 alone; its rows were attributed on `dev` meanwhile.

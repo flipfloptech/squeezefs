@@ -717,7 +717,8 @@ Closure: `lock_phase_ns.dlm_guard_wait.count ≡ Σ both classes' (collisions + 
 | `meta_kv_merge_sweeps` / `_laps` / `_yields` / `_sweep_ns` / `_sweep_projections` | C | bounded sweep calls; whole laps; yields to a space retry; ns ÷ projections = ns/leaf | `:1675-1806` |
 | `frag_d4_mergeable_leaves` / `defrag_meta_merges` | G / C | the D4 census face | §4.6a (h) |
 | `meta_kv_replay_root_frees_dropped` | C (0 on clean remount) | replayed frees of a live root dropped at mount | `mod.rs:488` |
-| `meta_kv_replay_root_claims_adopted` | C (0 on clean remount) | extents a named root reaches that the recovered allocator held free, adopted at mount (a kill between a guest root's naming and its claim's C6 page) | Z/ `alloc_ext.zig` |
+| `meta_kv_replay_root_claims_adopted` | C (0 on clean remount) | extents a maintained tree reaches that the recovered allocator held free, adopted at mount (a kill between a RAM claim's naming and its C6 page) | Z/ `alloc_ext.zig` |
+| `meta_kv_mount_reach_walk_extents` / `_ns` | G | the writer mount's reachability walk: extents reached over every maintained tree, its wall (1 M files: 1,026 extents, 0.65 ms) | Z/ `alloc_ext.zig` |
 
 Closures: `parked − released ≈ Σ per-volume pending_free`; `merge_candidates ≡ census_at(gauge_tail)` with no commit since the publish; `census_now ≥ census_at(gauge_tail)`; `frag_d4_mergeable_leaves ≡ merge_candidates` on a quiescent volume; `heap_promised = 0` at quiesce.
 

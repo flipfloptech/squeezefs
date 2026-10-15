@@ -212,6 +212,10 @@ pub const Queue = struct {
         const records = gpa.alloc(SpanRecord, chunks) catch return error.OutOfMemory;
         errdefer gpa.free(records);
         @memset(records, .{});
+        // A slot is deferred at most once (it keeps its ledger ref until
+        // posted): one per chunk, so a bounced return never allocates.
+        var deferred = std.ArrayList(u32).initCapacity(gpa, chunks) catch return error.OutOfMemory;
+        errdefer deferred.deinit(gpa);
         const sent = gpa.alloc(u32, cfg.depth) catch return error.OutOfMemory;
         @memset(sent, 0);
         self.* = .{
@@ -225,6 +229,7 @@ pub const Queue = struct {
             .capsules = capsules,
             .gov = governor.Governor.init(clock.monotonicNs()),
             .records = records,
+            .deferred = deferred,
             .sent = sent,
         };
         return self;
@@ -495,9 +500,7 @@ pub const Queue = struct {
             const rec = self.records[slot];
             if (rec.len != 0) {
                 if (!r.post(rec.raw_off, rec.len)) {
-                    self.deferred.append(self.gpa, slot) catch {
-                        _ = self.ledger.release(slot);
-                    };
+                    self.deferred.appendAssumeCapacity(slot);
                     return;
                 }
                 self.records[slot] = .{};
@@ -670,7 +673,7 @@ pub const Queue = struct {
         const slot = if (self.ready_slots.pop()) |s| s else self.ledger.grant() orelse return self.markPoisoned("span records exhausted: no ledger slot for a RECV_ZC CQE");
         if (self.records[slot].len != 0) {
             // A late grant with a pending return: post it first (or defer).
-            if (!r.post(self.records[slot].raw_off, self.records[slot].len)) self.deferred.append(self.gpa, slot) catch {};
+            if (!r.post(self.records[slot].raw_off, self.records[slot].len)) self.deferred.appendAssumeCapacity(slot);
         }
         self.records[slot] = .{ .raw_off = raw_off, .len = res };
         const bytes = self.mapped.bytes()[@intCast(off)..][0..res];

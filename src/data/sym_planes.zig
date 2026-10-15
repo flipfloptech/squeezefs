@@ -397,6 +397,91 @@ test "two writers in process: A holds the lease; B pulls grants, writes, its fre
     try testing.expect(b_bitmap.populationDriftCheck());
 }
 
+/// The same-node successor of the fixture's holder (the KVDA page sink's
+/// fallback: the predecessor's pages carried no carve, its kept window was
+/// checkpointed away): its bits are the refs census alone, its executor
+/// answers over the same durable ledger.
+const Successor = struct {
+    alloc: *block_alloc.BlockAllocator,
+    bitmap: *data_bitmap.DataBitmap,
+    holder: block_grant.HolderGrants,
+    ladder: TwoWriters.Ladder,
+    executor: free_ship.FreeExecutor,
+
+    fn init(f: *TwoWriters, term: u64) !*Successor {
+        const gpa = f.gpa;
+        const s = try gpa.create(Successor);
+        errdefer gpa.destroy(s);
+        s.alloc = try block_alloc.BlockAllocator.init(gpa, .{ .vol_tag = TwoWriters.VOL_TAG, .vol = 0, .block_size = 4096, .capacity_bytes = TwoWriters.BLOCKS * 4096 });
+        errdefer s.alloc.deinit();
+        var census: std.ArrayList(u64) = .empty;
+        defer census.deinit(gpa);
+        for (f.a_ledger.counts, 0..) |n, idx| for (0..n) |_| try census.append(gpa, idx);
+        s.alloc.seedFromDurableRefs(census.items);
+        s.bitmap = try data_bitmap.DataBitmap.init(gpa, s.alloc, .{ .vol_tag = TwoWriters.VOL_TAG, .term = term, .blocks = TwoWriters.BLOCKS, .ring_capacity = data_bitmap.ringCapacity(block_grant.BLOCK_GRANT_FLOOR, 2, 64) });
+        errdefer s.bitmap.deinit();
+        s.holder = .{ .ledger = try block_grant.Ledger.init(gpa, 32), .bitmap = s.bitmap };
+        s.ladder = .{ .alloc = s.alloc };
+        s.executor = .{ .alloc = s.alloc, .durable = f.a_ledger.durable(), .ladder = s.ladder.seam() };
+        s.alloc.finish_free_sink = s.bitmap.finishFreeSink();
+        s.alloc.untracked_gate = s.executor.untrackedGate();
+        return s;
+    }
+
+    fn deinit(s: *Successor, gpa: std.mem.Allocator) void {
+        s.holder.ledger.deinit();
+        s.bitmap.deinit();
+        s.alloc.deinit();
+        gpa.destroy(s);
+    }
+};
+
+test "a late shipped free across the holder's failover (THE KVDA PAGE SINK's fallback): B's free sits in its shipping batch across its renewal declaration and A's death — consumed, unpublished, unanswered, so the declaration names it nowhere; the same-node successor rebuilds from the refs census and B's declaration (B's window re-learnt), and the batch flushes to it ⇒ the successor's derivation already returned the block: answered Freed, counted, nothing moves — never the untracked refusal" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    const f = try TwoWriters.init(gpa);
+    defer f.deinit();
+    const T = TwoWriters;
+
+    // B pulls a grant from A and writes 8 blocks; it frees the first: the
+    // ladder ships it, and the batch waits for the cadence (nothing flushes).
+    var b_blocks: [8]u64 = undefined;
+    try f.mintPublish(f.b_alloc, &f.b_arm, 8, &b_blocks);
+    const x = b_blocks[0];
+    f.a_ledger.release(x);
+    try testing.expectEqual(reclaim.FreeOutcome.nonterminal, f.b_reclaimer.freeBlock(io, 0, x, f.b_alloc.stampOf(x)));
+    try testing.expectEqual(@as(u8, 1), f.b_shipper.pending_n);
+    // B's renewal declaration: the window and the in-flight registrations —
+    // the batched block is in neither.
+    var decl: std.ArrayList(block_grant.BlockGrant) = .empty;
+    defer decl.deinit(gpa);
+    try block_grant.heldBlockRanges(&f.b_arm.window, f.b_alloc, gpa, &decl);
+    for (decl.items) |r| try testing.expect(!r.contains(x));
+    try testing.expect(f.a_bitmap.isSet(x));
+
+    // A dies; its same-node successor arms at term 2 over the census alone
+    // (the fallback) and folds B's declaration: B's window is re-learnt,
+    // the batched block reads nobody's.
+    const s = try Successor.init(f, 2);
+    defer s.deinit(gpa);
+    var dl = try block_grant.DeferredLeaks.init(gpa, T.BLOCKS);
+    defer dl.deinit();
+    const folded = dl.adoptDeclared(&s.holder.ledger, s.bitmap, 2, decl.items);
+    try testing.expectEqual(f.b_arm.window.remaining(), folded.relearned);
+    try testing.expect(!s.bitmap.isSet(x));
+    const pop0 = s.bitmap.populationNow();
+
+    // B's cadence flushes the batch to the successor.
+    f.b_client.executor = &s.executor;
+    const untracked0 = counters.tripwireCount("block_untracked_free_refusals");
+    const retired0 = f.b_tracking.retired;
+    try testing.expectEqual(free_ship.Shipper.FlushOutcome.served, f.b_shipper.flush());
+    try testing.expectEqual(untracked0, counters.tripwireCount("block_untracked_free_refusals"));
+    try testing.expectEqual(retired0 + 1, f.b_tracking.retired); // B's word retires
+    try testing.expect(!s.bitmap.isSet(x)); // nothing moved at the successor
+    try testing.expectEqual(pop0, s.bitmap.populationNow());
+}
+
 test "the dismount defect's core: a mint after the grant plane is DISARMED meets the carved window's SET bit at the frontier ⇒ a typed PlaneRefused + the anomaly tripwire, never an assert, never StorageFull; the cursor stays; re-armed, the window mints again" {
     const gpa = testing.allocator;
     const f = try TwoWriters.init(gpa);

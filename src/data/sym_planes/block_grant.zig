@@ -1445,6 +1445,33 @@ test "a_poisoned_window_declaration_is_refused_before_any_walk; a crashed incarn
     try testing.expectEqual(@as(u64, 64), h.ledger.releaseWriter(bm, 2));
 }
 
+test "a deferred candidate a late shipped free settled and this term re-carved is never released by the exact census: the predecessor's pages carried block 40 (granted, never declared); B's free of it arrives at the successor (the ladder clears it through the sink), the successor carves it into a fresh grant; the sole writer's census then finds it SET and unreferenced — a live grant, not the predecessor's remainder" {
+    const a = try testAlloc(512);
+    defer a.deinit();
+    const bm = try testBitmap(a);
+    defer bm.deinit();
+    a.finish_free_sink = bm.finishFreeSink();
+    // The derivation: the predecessor's page carried 40 (no delta, no move
+    // — `loadRegionImage`'s take), beyond the refs census.
+    try testing.expect(a.holderTakeBit(40));
+    var dl = try DeferredLeaks.init(testing.allocator, 512);
+    defer dl.deinit();
+    dl.deferLeaks(&.{40});
+    // The late free under this term (the executor's row 7: seeded, the
+    // ladder, the sink's CLEAR), then this term's carve takes it again.
+    a.fsckSetRefcount(40, 1);
+    try testing.expectEqual(block_alloc.BeginFree.terminal, try a.freeBlock(40));
+    try testing.expect(!bm.isSet(40));
+    try testing.expectEqual(@as(u64, 40), bm.carveRun(40, 1).?.start);
+    // The exact census (no live peer) references nothing.
+    const referenced: [8]u64 = @splat(0);
+    const converged = dl.convergeDeferred(bm, &referenced);
+    try testing.expectEqual(@as(u64, 0), converged.released);
+    try testing.expect(bm.isSet(40)); // the fresh grant keeps its bit
+    try testing.expectEqual(@as(u64, 0), dl.pendingCount());
+    try testing.expect(dl.closureHolds());
+}
+
 test "THE KVDA PAGE SINK'S TWO OUTCOMES (rung 10 item 2): a holder carves two grants, its pages land at the cadence, a third carve lands only in its ring; it dies. The successor that folds page + ring starts with every granted bit SET and the live writer's declaration RE-LEARNS NOTHING (adopted = the window, relearned 0); a successor whose predecessor's page never landed (the fallback) re-learns exactly the declared blocks the page did not carry — SET under its own term, journaled, adopted — and the counter reads them" {
     const gpa = testing.allocator;
     // The predecessor: 512 blocks, three carves to writer 7 (the first two

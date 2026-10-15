@@ -16,10 +16,12 @@ RUN apt-get update \
       fdisk e2fsprogs util-linux \
  && rm -rf /var/lib/apt/lists/*
 
-# IOR and mdtest from one tree, at the hash io500 sc26 pins (docs/gates/brackets.md).
-ARG IOR_COMMIT=5528b3619236d475
+# IOR and mdtest from one tree, at the hash io500 sc26 pins (docs/gates/brackets.md),
+# by its full id: the commit is reachable only from a pull-request ref today, so a
+# fresh clone lacks it and GitHub fetches an unadvertised commit only by full id.
+ARG IOR_COMMIT=5528b3619236d475a864a8021ab56d6b5c1aafa2
 RUN git clone https://github.com/hpc/ior.git /tmp/ior \
- && cd /tmp/ior && git checkout "$IOR_COMMIT" \
+ && cd /tmp/ior && git fetch origin "$IOR_COMMIT" && git checkout "$IOR_COMMIT" \
  && ./bootstrap && ./configure --prefix=/opt/sqz-tools \
  && make -j"$(nproc)" && make install \
  && cd / && rm -rf /tmp/ior

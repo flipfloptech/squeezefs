@@ -16,7 +16,8 @@ pub var cluster_wire_frames_sent: counters.ShardedCounter = .{};
 pub var cluster_wire_frames_received: counters.ShardedCounter = .{};
 pub var cluster_wire_bytes_sent: counters.ShardedCounter = .{};
 pub var cluster_wire_bytes_received: counters.ShardedCounter = .{};
-/// Connections the listener currently serves (the cap's gauge).
+/// Connections the listener currently serves (the cap's gauge): an exact
+/// sum — each admission adds one, its retire takes it out before `live` drops.
 pub var cluster_wire_live_connections: counters.Gauge = .{};
 /// Accepted-then-closed at the connection cap (one accept + one close).
 pub var cluster_wire_connections_refused: counters.ShardedCounter = .{};

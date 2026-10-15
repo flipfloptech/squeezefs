@@ -302,16 +302,19 @@ pub const Listener = struct {
 
     /// The connection's last act. Everything it needs of the listener is
     /// read BEFORE the decrement: from the decrement on, `stop` may see 0
-    /// and free the listener, so the gauge takes the decrement's own result
-    /// and the wake names the word by its address alone (a private futex
-    /// is keyed by the address; the kernel reads nothing there — the
-    /// waker-after-free shape every futex-backed release has).
+    /// and free the listener, so the wake names the word by its address
+    /// alone (a private futex is keyed by the address; the kernel reads
+    /// nothing there — the waker-after-free shape every futex-backed
+    /// release has). The gauge leaves before the decrement too: once `stop`
+    /// has seen 0 a detached connection thread writes nothing process-wide
+    /// (its tail once set the gauge after `stop` returned, under the next
+    /// listener's count).
     fn retire(self: *Listener) void {
         const station = self.retire_station;
         const word = &self.live;
-        const prev = word.fetchSub(1, .acq_rel);
+        stats.cluster_wire_live_connections.sub(1);
+        _ = word.fetchSub(1, .acq_rel);
         if (station) |st| st.decremented(st.ctx);
-        stats.cluster_wire_live_connections.set(prev - 1);
         futex.wakeAll(word);
         if (station) |st| st.retired(st.ctx);
     }
@@ -338,7 +341,7 @@ pub const Listener = struct {
                 stream.close(self.io);
                 continue;
             };
-            stats.cluster_wire_live_connections.set(self.live.load(.acquire));
+            stats.cluster_wire_live_connections.add(1);
             const conn = self.gpa.create(Conn) catch {
                 stream.close(self.io);
                 self.retire();

@@ -461,6 +461,8 @@ pub const DataPlane = struct {
     meta_rr: Atomic(u64) = .init(0),
     /// `SQUEEZEFS_TEST_KVMAP_CROSSING_KILL_AFTER` (0 = inert).
     crossing_kill_after: u32,
+    /// `SQUEEZEFS_TEST_OWN_BLOCK_POISON`.
+    test_own_block_poison: bool,
     /// The token divert's layout face (bound by the daemon once the wire
     /// plane is up; null = a flat mount: every slot local).
     foreign_layout: ?ForeignLayout = null,
@@ -587,6 +589,7 @@ pub const DataPlane = struct {
             .kvmap_chunk = kvmap.chunkFromEnv(opts.env),
             .windows = undefined,
             .crossing_kill_after = knobs.intKnob("SQUEEZEFS_TEST_KVMAP_CROSSING_KILL_AFTER", u32, opts.env),
+            .test_own_block_poison = knobs.boolKnob("SQUEEZEFS_TEST_OWN_BLOCK_POISON", opts.env),
             .zcrx_registry = zcrx.steering.Registry.init(gpa),
         };
         self.shape = try ShapeTable.init(gpa);
@@ -1346,6 +1349,7 @@ pub const DataPlane = struct {
         errdefer v.alloc.dropInflight(minted.idx);
         var guard = block_alloc.MintedBlockGuard.init(v.alloc, minted);
         errdefer guard.abandon();
+        if (self.test_own_block_poison) try self.poisonMint(tag, minted.offset);
         self.deviceWrite(tag, minted.offset, stored) catch |e| return mapDma(e);
         v.alloc.publishBlock(minted.idx);
         guard.disarm();
@@ -1361,6 +1365,15 @@ pub const DataPlane = struct {
         // `inline_max` — and a transformed image shorter than the chunk both
         // publish; the tail of a fresh mint is unnamed and never read).
         return .{ .mapping = Mapping.wholeBlock(tag, minted.offset, minted.stamp), .proof = .{ .vol_tag = tag, .offset = minted.offset, .len = layout.ceilGrain(stored.len), .completed_ns = clock.monotonicNs() }, .alloc = v.alloc, .idx = minted.idx };
+    }
+
+    /// `SQUEEZEFS_TEST_OWN_BLOCK_POISON`: the minted block whole as 0xAA —
+    /// the previous owner's bytes the image grain lands over.
+    fn poisonMint(self: *DataPlane, tag: u64, offset: u64) Error!void {
+        const buf = self.gpa.alignedAlloc(u8, .fromByteUnits(layout.GRAIN), @intCast(self.block_size)) catch return error.OutOfMemory;
+        defer self.gpa.free(buf);
+        @memset(buf, 0xAA);
+        self.deviceWrite(tag, offset, buf) catch |e| return mapDma(e);
     }
 
     /// The publish failed: the never-published mint returns, then its

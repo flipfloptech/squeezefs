@@ -70,6 +70,7 @@ const route_table = @import("../meta/routing/route_table.zig");
 const appender_page = @import("../meta/sym/appender_page.zig");
 const membership = @import("../meta/sym/membership.zig");
 const sym_xv = @import("../meta/sym/xv.zig");
+const layout = @import("../data/layout.zig");
 const shard = membership.shard;
 const join_ladder = membership.join_ladder;
 const wire_verbs = @import("../wire/verbs.zig");
@@ -7417,6 +7418,124 @@ test "smoke: A NO-OPEN CLOSE IS THE WRITE-BACK DRAIN (decision 0003 §AF) — fo
 test "smoke: THE CONTROL ARM'S CLOSE DRAIN (SQUEEZEFS_FUSE_NO_OPEN=0) — the same writes; the asynchronous RELEASE drains the parked blocks after close(2) returned (observed: parked 0, no OPEN answered ENOSYS, no FLUSH drain) → kill -9 → fsck --offline clean → remount → both files whole" {
     if (venueMissing(testing.io)) |why| return testkit.skipWhy(@src(), why);
     try closeDrainRow(false);
+}
+
+/// The ordered law's kill row: a small file's size before its growth — a
+/// resident image (below the inline bound), so the growth promotes it.
+const ordered_small: u64 = 100;
+/// The size the growth writes: ONE grain of the image's second grain at
+/// byte 8,192, leaving the gap `[100, 8192)` across the promoted grain's
+/// end — the poisoned block's tail is the gap's last grain.
+const ordered_grown: u64 = 3 * layout.GRAIN;
+/// The truncate step's size past the fsynced growth: a further grain of
+/// the poisoned tail, now the truncate's own gap.
+const ordered_truncated: u64 = 5 * layout.GRAIN;
+
+/// Where each step of the ordered law's kill row kills the daemon.
+const OrderedStep = enum {
+    /// The moment the growing write returned: its custody and its claim in RAM.
+    write,
+    /// The write-back timer landed the custody; the claim journals at the
+    /// drain right after its pass.
+    landed,
+    /// `conv=fsync`: the size and its bytes durable.
+    fsync,
+    /// An fsynced growth, then a truncate-up into the poisoned tail.
+    truncate,
+};
+
+/// The growth of one step's file `y{k}` (`$1` = the work dir).
+fn orderedScript(buf: []u8, step: OrderedStep, k: usize) ![]const u8 {
+    const grow = "head -c {d} \"$1/image\" > y{d} && dd if=\"$1/image\" of=y{d} bs={d} skip=1 seek=2 count=1 conv=notrunc{s} status=none";
+    const g: u64 = layout.GRAIN;
+    return switch (step) {
+        .write, .landed => std.fmt.bufPrint(buf, grow ++ " && echo grown", .{ ordered_small, k, k, g, "" }),
+        .fsync => std.fmt.bufPrint(buf, grow ++ " && echo grown", .{ ordered_small, k, k, g, ",fsync" }),
+        .truncate => std.fmt.bufPrint(buf, grow ++ " && truncate -s {d} y{d} && echo grown", .{ ordered_small, k, k, g, ",fsync", ordered_truncated, k }),
+    };
+}
+
+/// One step's file after the kill and the remount: a size the law allows
+/// (the last durable one) and every byte below it the file's own — the
+/// image's head, the gap's zeros, the grown grain, the truncate's zeros.
+/// Never the poison: another file's bytes.
+fn orderedCheck(io: Io, dir: Io.Dir, image: Io.File, step: OrderedStep, k: usize) !u64 {
+    var nb: [16]u8 = undefined;
+    const name = try std.fmt.bufPrint(&nb, "y{d}", .{k});
+    const f = try dir.openFile(io, name, .{});
+    defer f.close(io);
+    const size = (try f.stat(io)).size;
+    const allowed: []const u64 = switch (step) {
+        .write, .landed => &.{ ordered_small, ordered_grown },
+        .fsync => &.{ordered_grown},
+        .truncate => &.{ ordered_grown, ordered_truncated },
+    };
+    if (std.mem.indexOfScalar(u64, allowed, size) == null) {
+        std.debug.print("\n--- ordered law, step {t}: y{d} recovered at {d} B, allowed {any} ---\n", .{ step, k, size, allowed });
+        return error.SizeOutsideTheLaw;
+    }
+    var got: [ordered_truncated]u8 = undefined;
+    var want: [ordered_truncated]u8 = @splat(0);
+    const n: usize = @intCast(size);
+    if (try f.readPositionalAll(io, got[0..n], 0) != n) return error.ShortRead;
+    if (try image.readPositionalAll(io, want[0..ordered_small], 0) != ordered_small) return error.ShortRead;
+    if (size >= ordered_grown) {
+        const g = layout.GRAIN;
+        if (try image.readPositionalAll(io, want[2 * g .. 3 * g], g) != g) return error.ShortRead;
+    }
+    if (!std.mem.eql(u8, got[0..n], want[0..n])) {
+        const at = std.mem.indexOfDiff(u8, got[0..n], want[0..n]).?;
+        std.debug.print("\n--- ordered law, step {t}: y{d} ({d} B) byte {d} reads 0x{x:0>2}, its own is 0x{x:0>2}{s} ---\n", .{ step, k, size, at, got[at], want[at], if (got[at] == 0xAA) " — the poisoned block's previous-owner bytes" else "" });
+        return error.AnotherFilesBytes;
+    }
+    return size;
+}
+
+test "smoke: THE ORDERED LAW'S KILL ROW (decision 0003 §AL.5 with §AJ.4) — format (no cache path: a partial block parks in RAM), the write-back timer posture, every promotion's own block POISONED with 0xAA before its image grain lands (SQUEEZEFS_TEST_OWN_BLOCK_POISON: the bytes a recycled block's previous owner leaves where a block device elides its discard) → per step a 100 B file grows by one grain at byte 8,192 (the gap [100, 8192) crosses the poisoned tail) and the daemon is killed -9: the moment the write returned / once the timer landed it / after conv=fsync / after an fsynced growth and a truncate-up into the tail → fsck --offline clean → remount → the file at its last durable size (unsynced: 100 B or whole; fsynced: whole) and every byte below it its own, never the poison" {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    try rig.formatSet(false);
+    try rig.createImage();
+    try rig.env.put("SQUEEZEFS_TEST_OWN_BLOCK_POISON", "1");
+    try rig.env.put("SQUEEZEFS_BLOCK_REFS_VERIFY", "1");
+    const image = try Io.Dir.cwd().openFile(io, rig.image, .{});
+    defer image.close(io);
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(0);
+    const steps = comptime std.enums.values(OrderedStep);
+    var sizes: [steps.len]u64 = undefined;
+    for (steps, 0..) |step, k| {
+        var script: [512]u8 = undefined;
+        {
+            const out = try rig.onMount(try orderedScript(&script, step, k));
+            defer gpa.free(out);
+            try testing.expect(std.mem.indexOf(u8, out, "grown") != null);
+        }
+        const st = try rig.stats();
+        defer gpa.free(st);
+        // The growth promoted the file into a poisoned block.
+        try testing.expect((numberAfter(st, "\"own_block_dmas\":") orelse 0) >= 1);
+        if (step == .landed) {
+            const landed = try awaitAtLeast(rig, "\"writeback_timer_drains\":", 1, 20 * std.time.ns_per_s);
+            defer gpa.free(landed);
+            try testing.expect((numberAfter(landed, "\"writeback_timer_drains\":") orelse 0) >= 1);
+            const parked = try awaitExactly(rig, "\"parked_buffers\":", 0, 20 * std.time.ns_per_s);
+            defer gpa.free(parked);
+            try testing.expectEqual(@as(?u64, 0), numberAfter(parked, "\"parked_buffers\":"));
+        }
+        try rig.kill();
+        const recovered = try fsckClean(rig, "the ordered law's kill");
+        _ = try remountAfterKill(rig, recovered);
+        var dir = try Io.Dir.cwd().openDir(io, rig.mp, .{});
+        defer dir.close(io);
+        sizes[k] = try orderedCheck(io, dir, image, step, k);
+    }
+    std.debug.print("\nsmoke[ordered law]: recovered sizes after the kill — write {d} B, landed {d} B, fsync {d} B, truncate {d} B; every byte the file's own, never the poison\n", .{ sizes[0], sizes[1], sizes[2], sizes[3] });
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
 }
 
 /// The owed row's writer: an extending write that parks a partial block

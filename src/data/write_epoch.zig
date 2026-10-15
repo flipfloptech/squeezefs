@@ -292,7 +292,10 @@ pub const Epochs = struct {
             stats.rewrite_shadow_fallbacks.inc();
             return .not_shadowed;
         };
-        const gop = try self.table.getOrPut(self.gpa, ino);
+        // A table slot stays free for every closing epoch: a transient save
+        // re-registers with no allocation (`reregister`).
+        try self.table.ensureUnusedCapacity(self.gpa, self.closing.count() + 1);
+        const gop = self.table.getOrPutAssumeCapacity(ino);
         if (!gop.found_existing) {
             const e = try self.gpa.create(Epoch);
             e.* = .{ .ino = ino };
@@ -300,16 +303,24 @@ pub const Epochs = struct {
             stats.rewrite_shadow_open_epochs.add(1);
         }
         const e = gop.value_ptr.*;
+        const closing = self.closing.get(ino);
+        // Under a closing epoch this one keeps room for the closing one's
+        // records past its own next: a transient save folds in with no
+        // allocation (`reregister`).
+        const fold: struct { shadow: u32, displaced: usize, guards: usize } = if (closing) |c| .{ .shadow = c.shadow.count(), .displaced = c.displaced.items.len, .guards = c.guards.items.len } else .{ .shadow = 0, .displaced = 0, .guards = 0 };
+        try e.displaced.ensureUnusedCapacity(self.gpa, fold.displaced + 1);
+        try e.shadow.ensureUnusedCapacity(self.gpa, fold.shadow + 1);
+        try e.guards.ensureUnusedCapacity(self.gpa, fold.guards + 1);
         const own_prev = e.shadowBinding(block);
-        const closing_prev: ?Binding = if (own_prev == null) (if (self.closing.get(ino)) |c| c.shadowBinding(block) else null) else null;
+        const closing_prev: ?Binding = if (own_prev == null) (if (closing) |c| c.shadowBinding(block) else null) else null;
         const displaced_prev: ?Binding = own_prev orelse closing_prev orelse prev;
         if (displaced_prev) |d| {
-            try e.displaced.append(self.gpa, .{ .block = block, .origin = if (own_prev != null) .epoch else .map, .binding = d });
+            e.displaced.appendAssumeCapacity(.{ .block = block, .origin = if (own_prev != null) .epoch else .map, .binding = d });
             e.parked_bytes += self.block_size;
             stats.rewrite_shadow_parked_bytes.add(self.block_size);
         }
-        try e.shadow.put(self.gpa, block, .{ .binding = new, .proof = proof });
-        try e.guards.append(self.gpa, guard);
+        e.shadow.putAssumeCapacity(block, .{ .binding = new, .proof = proof });
+        e.guards.appendAssumeCapacity(guard);
         e.recorded_bytes += self.block_size;
         e.min_size = @max(e.min_size, min_size);
         e.last_record_ns = clock.monotonicNs();
@@ -438,15 +449,9 @@ pub const Epochs = struct {
             self.lock.lock();
             defer self.lock.unlock();
             _ = self.closing.remove(e.ino);
-            const gop = self.table.getOrPut(self.gpa, e.ino) catch {
-                // Allocation failure on the re-register: keep the record alive
-                // under the table's existing capacity is impossible — count the
-                // never-lossy breach loud and leak nothing by retrying forever
-                // is not an option without memory; the records stay parked in
-                // `e` and are merged into a fresh epoch by the next record.
-                log.err("rewrite epoch ino {d}: re-register after a transient close failed to allocate; {d} shadowed blocks stay parked in RAM until the next record", .{ e.ino, e.shadow.count() });
-                return;
-            };
+            // No allocation: `record` keeps the table slot and the fresh
+            // epoch's room for ours.
+            const gop = self.table.getOrPutAssumeCapacity(e.ino);
             if (gop.found_existing) {
                 // A record opened a fresh epoch meanwhile: fold ours into it.
                 // A key the fresh epoch parked as "the map's" because OUR
@@ -459,10 +464,10 @@ pub const Epochs = struct {
                 }
                 var it = e.shadow.iterator();
                 while (it.next()) |kv| {
-                    if (!fresh.shadow.contains(kv.key_ptr.*)) fresh.shadow.put(self.gpa, kv.key_ptr.*, kv.value_ptr.*) catch {};
+                    if (!fresh.shadow.contains(kv.key_ptr.*)) fresh.shadow.putAssumeCapacity(kv.key_ptr.*, kv.value_ptr.*);
                 }
-                fresh.displaced.appendSlice(self.gpa, e.displaced.items) catch {};
-                fresh.guards.appendSlice(self.gpa, e.guards.items) catch {};
+                fresh.displaced.appendSliceAssumeCapacity(e.displaced.items);
+                fresh.guards.appendSliceAssumeCapacity(e.guards.items);
                 e.guards.clearRetainingCapacity();
                 fresh.recorded_bytes += e.recorded_bytes;
                 fresh.parked_bytes += e.parked_bytes;
@@ -533,6 +538,8 @@ pub const Epochs = struct {
         // we never parked means another arm published the block under us —
         // the visibility law forbids it (module doc); the tripwire names it
         // and the key is freed too (the map no longer names it).
+        var drift: [seams.MergeOutcome.max_displaced]Binding = undefined;
+        var n_drift: usize = 0;
         for (outcome.slice()) |d| {
             var parked = false;
             for (e.displaced.items) |p| if (p.binding.eql(d)) {
@@ -540,13 +547,14 @@ pub const Epochs = struct {
             };
             if (!parked) {
                 stats.rewrite_shadow_displaced_drift.fire("the save displaced a binding the epoch never parked");
-                e.displaced.append(self.gpa, .{ .block = 0, .origin = .map, .binding = d }) catch {};
+                drift[n_drift] = d;
+                n_drift += 1;
             }
         }
         stats.rewrite_shadow_swaps.inc();
         stats.rewrite_shadow_bytes.add(e.recorded_bytes);
         const bytes = e.recorded_bytes;
-        const freed: u32 = @intCast(e.displaced.items.len);
+        const freed: u32 = @intCast(e.displaced.items.len + n_drift);
         // Free the parked keys with no lock held (RES-1 — "the worst park
         // amplifier in the tree"), then drop the live-owner registrations:
         // the merge's on the keys it displaced, every B guard (an
@@ -557,6 +565,10 @@ pub const Epochs = struct {
         for (e.displaced.items) |d| {
             cs.purge.purge(d.binding);
             _ = cs.free.free(io, d.binding);
+        }
+        for (drift[0..n_drift]) |d| {
+            cs.purge.purge(d);
+            _ = cs.free.free(io, d);
         }
         outcome.dropHolds();
         for (e.guards.items) |*g| g.deinit();

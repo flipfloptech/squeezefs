@@ -2220,6 +2220,21 @@ const Snapshot = struct {
     }
 };
 
+/// Every owed slot by name — queue, ent, state, unique, opcode, age and
+/// where its reply is (the cell, a lease park, a bridge) — for a test whose
+/// owed set did not drain. Read racily off the workers' tables.
+fn describeOwed(s: *Session) void {
+    const now = clock.monotonicNs();
+    for (s.groups) |g| for (g.members, 0..) |*m, ms| for (m.slots.ents, 0..) |*e, ei| {
+        const o = e.owing() orelse continue;
+        const gent = g.gentOf(@intCast(ms), @intCast(ei));
+        const op = if (abi.decodePrefix(abi.fuse_in_header, &g.headers.at(gent).in_out)) |h| @tagName(h.op()) else "?";
+        const since = e.owed_since_ns.load(.acquire);
+        const cell: commit_queue.CellState = @fromBackingInt(@intCast(g.cells.cells[gent].state.load(.acquire)));
+        std.debug.print("owed: queue {d} ent {d} {t} unique {d} commit {d} {s}, owed {d} ms, reply cell {t}, lease-parked {}, bridge {t}\n", .{ m.qid, ei, e.state, o.unique, o.commit_id, op, (now -| since) / std.time.ns_per_ms, cell, m.parked[ei], g.bridge_parked[gent] });
+    };
+}
+
 /// The must-stay-0 law (as deltas: the slot unit tests fire the oversize
 /// tripwire on purpose in the same process) and the partition law.
 fn expectLaws(a: Snapshot, b: Snapshot) !void {
@@ -2830,18 +2845,22 @@ test "e2e: a 10 s random-op storm from 4 threads never needs the 100 ms backstop
     const s = try rig.mountIt(.{ .mem_budget_bytes = 0 });
     const before = Snapshot.take();
     const Storm = struct {
-        fn run(r: *Rig, seed: u64, ops: *std.atomic.Value(u64), result: *anyerror!void) void {
-            result.* = body(r, seed, ops);
+        fn run(r: *Rig, seed: u64, ops: *std.atomic.Value(u64), opens: *std.atomic.Value(u64), result: *anyerror!void) void {
+            result.* = body(r, seed, ops, opens);
         }
-        fn body(r: *Rig, seed: u64, ops: *std.atomic.Value(u64)) !void {
+        fn body(r: *Rig, seed: u64, ops: *std.atomic.Value(u64), opens: *std.atomic.Value(u64)) !void {
             var prng = std.Random.DefaultPrng.init(seed);
             const rnd = prng.random();
             var pb: [256]u8 = undefined;
             var buf: [8192]u8 = undefined;
             const deadline = clock.monotonicNs() + 10 * std.time.ns_per_s;
             var n: u64 = 0;
+            var o: u64 = 0;
             while (clock.monotonicNs() < deadline) : (n += 1) {
-                switch (rnd.uintLessThan(u8, 4)) {
+                const kind = rnd.uintLessThan(u8, 4);
+                // Every kind but a stat opens (and closes) one file.
+                if (kind != 0) o += 1;
+                switch (kind) {
                     0 => _ = try statSize(r.child(&pb, EchoFs.names[rnd.uintLessThan(usize, 2)])),
                     1 => _ = try readWhole(r.child(&pb, "hello"), &buf),
                     2 => {
@@ -2858,18 +2877,40 @@ test "e2e: a 10 s random-op storm from 4 threads never needs the 100 ms backstop
                 }
             }
             _ = ops.fetchAdd(n, .monotonic);
+            _ = opens.fetchAdd(o, .monotonic);
         }
     };
     var ops = std.atomic.Value(u64).init(0);
+    var opens = std.atomic.Value(u64).init(0);
     var results: [4]anyerror!void = .{ {}, {}, {}, {} };
     var threads: [4]std.Thread = undefined;
-    for (&threads, 0..) |*t, i| t.* = try std.Thread.spawn(.{}, Storm.run, .{ rig, @as(u64, i + 1), &ops, &results[i] });
+    for (&threads, 0..) |*t, i| t.* = try std.Thread.spawn(.{}, Storm.run, .{ rig, @as(u64, i + 1), &ops, &opens, &results[i] });
     for (threads) |t| t.join();
     for (results) |r| try r;
-    // `close(2)` sends RELEASE as a background request: the last ones are
-    // still being answered when the threads return — wait for the slots.
-    const settle = clock.monotonicNs() + 5 * std.time.ns_per_s;
-    while (s.owedCount() > 0 and clock.monotonicNs() < settle) std.Thread.yield() catch {};
+    // `close(2)` sends RELEASE as a background request: when the threads
+    // return the kernel may not have delivered the last ones yet, so an
+    // empty owed set is not "all answered" (the VM's `found 1`: the settle
+    // read 0 before the last delivery, the assertion caught it owed). The
+    // observable: every OPEN's RELEASE served, THEN the owed set empty —
+    // past that no request can arrive.
+    const Drained = struct {
+        s: *Session,
+        fs: *EchoFs,
+        opens: u64,
+        fn pred(d: *const @This()) bool {
+            return d.fs.file_releases.load(.monotonic) == d.opens and d.s.owedCount() == 0;
+        }
+    };
+    const drained: Drained = .{ .s = s, .fs = rig.fs, .opens = opens.load(.monotonic) };
+    const joined_ns = clock.monotonicNs();
+    // A hang guard, not a speed bound: the drain takes milliseconds even
+    // under 24 × `yes` on kamrui (rung-10-owedstorm.md).
+    if (!waitUntil(&drained, Drained.pred, 60 * std.time.ns_per_s)) {
+        std.debug.print("\nstorm: {d} opens, {d} RELEASEs served, {d} owed after 60 s\n", .{ drained.opens, rig.fs.file_releases.load(.monotonic), s.owedCount() });
+        describeOwed(s);
+        return error.TestRequestNeverAnswered;
+    }
+    const drain_us = (clock.monotonicNs() - joined_ns) / std.time.ns_per_us;
     const after = Snapshot.take();
     try expectLaws(before, after);
     try testing.expectEqual(before.commit_lost_wakes, after.commit_lost_wakes);
@@ -2881,7 +2922,7 @@ test "e2e: a 10 s random-op storm from 4 threads never needs the 100 ms backstop
     const reqs = after.requests - before.requests;
     const writes = after.writes - before.writes;
     const elided = after.elided - before.elided;
-    std.debug.print("\nstorm: {d} syscalls, {d} ring requests, {d} enters ({d}.{d:0>2} per request), wake writes {d} / elided {d} ({d} % elided), backstop ticks {d}, lost commit wakes {d}, late commits {d}, lost CQE wakes {d}, late CQEs {d}\n", .{ ops.load(.monotonic), reqs, after.enters - before.enters, (after.enters - before.enters) / @max(reqs, 1), ((after.enters - before.enters) * 100 / @max(reqs, 1)) % 100, writes, elided, elided * 100 / @max(writes + elided, 1), worker.park_backstop_ticks.load(), after.commit_lost_wakes - before.commit_lost_wakes, after.late_commits - before.late_commits, after.cqe_lost_wakes - before.cqe_lost_wakes, after.late_cqes - before.late_cqes });
+    std.debug.print("\nstorm: {d} syscalls, {d} ring requests, {d} enters ({d}.{d:0>2} per request), wake writes {d} / elided {d} ({d} % elided), backstop ticks {d}, lost commit wakes {d}, late commits {d}, lost CQE wakes {d}, late CQEs {d}; {d} RELEASEs drained {d} us after the join\n", .{ ops.load(.monotonic), reqs, after.enters - before.enters, (after.enters - before.enters) / @max(reqs, 1), ((after.enters - before.enters) * 100 / @max(reqs, 1)) % 100, writes, elided, elided * 100 / @max(writes + elided, 1), worker.park_backstop_ticks.load(), after.commit_lost_wakes - before.commit_lost_wakes, after.late_commits - before.late_commits, after.cqe_lost_wakes - before.cqe_lost_wakes, after.late_cqes - before.late_cqes, drained.opens, drain_us });
     try testing.expect(writes + elided >= after.replies - before.replies - (after.serves - before.serves));
 }
 

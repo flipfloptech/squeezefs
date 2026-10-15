@@ -122,7 +122,7 @@ pub const Msg = struct {
 
 pub const Submit = enum { published, busy };
 
-const CellState = enum(u8) { free, filling, published };
+pub const CellState = enum(u8) { free, filling, published };
 
 pub const Cell = struct {
     state: std.atomic.Value(u8) = .init(@backingInt(CellState.free)),

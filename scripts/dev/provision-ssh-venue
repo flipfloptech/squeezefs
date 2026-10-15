@@ -22,6 +22,22 @@ want=$(printf '%s\n' "# squeezefs venue (scripts/dev/provision-ssh-venue)" "${MO
 if [ ! -f "$conf" ] || [ "$(cat "$conf")" != "$want" ]; then printf '%s\n' "$want" >"$conf"; fi
 mountpoint -q /sys/kernel/config || mount -t configfs none /sys/kernel/config
 
+# Host-scoped fabric subsystems at boot: a multipath kernel (Ubuntu's config
+# keeps CONFIG_NVME_MULTIPATH=y) otherwise MERGES two host identities on one
+# subsystem under one head, which the product never hands out — the nvmet
+# two-identity rows (the PR matrix, the WE fence, the registrants) cannot
+# connect. The sqz series' nvme_core.fabrics_host_scoped_subsystems=Y gives
+# each identity its own subsystem head (a stock kernel ignores the unknown
+# parameter). nvme_core loads from the initramfs, so only the command line
+# sets it: persisted here, live after the next reboot.
+grub_cfg=/etc/default/grub.d/sqz-venue.cfg
+want_grub='GRUB_CMDLINE_LINUX_DEFAULT="$GRUB_CMDLINE_LINUX_DEFAULT nvme_core.fabrics_host_scoped_subsystems=Y"'
+if [ -d /etc/default/grub.d ] && { [ ! -f "$grub_cfg" ] || [ "$(cat "$grub_cfg")" != "$want_grub" ]; }; then
+  printf '%s\n' "$want_grub" >"$grub_cfg"
+  update-grub >/dev/null 2>&1
+fi
+hs_param=/sys/module/nvme_core/parameters/fabrics_host_scoped_subsystems
+
 # The hash io500 sc26 pins (docs/gates/brackets.md); the same as the image's.
 # Spelled out in full: the commit is reachable today only from a pull-request
 # ref, so a fresh clone lacks it and GitHub fetches an unadvertised commit only
@@ -53,5 +69,6 @@ chmod 1777 /build/tmp
 echo "kernel:   $(uname -r) ($(uname -m)), $(nproc) cpus, $(free -g | awk 'NR==2{print $2}') GiB"
 echo "modules:  $(for m in "${MODULES[@]}"; do [ -d "/sys/module/${m//-/_}" ] && printf '%s ' "$m"; done)"
 echo "openssl:  $(openssl version)"
+echo "nvme:     multipath=$(cat /sys/module/nvme_core/parameters/multipath 2>/dev/null || echo absent) host_scoped=$(cat "$hs_param" 2>/dev/null || echo absent)$(grep -q fabrics_host_scoped_subsystems=Y /proc/cmdline || echo ' (host_scoped=Y persisted for the next boot: REBOOT to apply)')"
 echo "fuse:     $(fusermount3 --version 2>&1 | head -1); enable_uring=$(cat /sys/module/fuse/parameters/enable_uring 2>/dev/null || echo absent)"
 echo "tools:    $(PATH=$PREFIX/bin:$PATH command -v ior mdtest | tr '\n' ' ')fio $(fio --version)"

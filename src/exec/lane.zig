@@ -1631,6 +1631,93 @@ test "a spawn that pops a slot the idle trim holds waits the trim out and lands 
     try testing.expectEqual(Lane.CLAIM_FREE, l.claims[0].load(.acquire));
 }
 
+/// A dead-ring rig: a READ of a pipe nothing has written yet. Its copy into
+/// the fiber's buffer runs as task work once data arrives: at the lane
+/// thread's next syscall exit, or under `DEFER_TASKRUN` only inside an enter
+/// of the lane's ring.
+const DeadRead = struct {
+    lane: *Lane,
+    rd: linux.fd_t,
+    wr: linux.fd_t,
+    buf: [8]u8 = "--------".*,
+    res: i32 = 0,
+    reader: ?*Fiber = null,
+    read_done: Probe = .{},
+    written: Probe = .{},
+
+    fn of(context: *const anyopaque) *DeadRead {
+        const p: *const *DeadRead = @ptrCast(@alignCast(context));
+        return p.*;
+    }
+    fn read(context: *const anyopaque) void {
+        const s = of(context);
+        const f = currentFiber().?;
+        assert(s.lane.armRingOp(f, linux.io_uring_sqe.prep_read, .{ s.rd, @as([]u8, &s.buf), std.math.maxInt(u64) }));
+        _ = f.changeAwaiting(.nothing, .ring_op);
+        while (f.op_pending) f.park();
+        _ = f.changeAwaiting(.ring_op, .nothing);
+        s.res = f.cqe_res;
+        // The buffer is its owner's again, and the owner reuses it.
+        s.buf = "REUSED!!".*;
+        s.read_done.finish();
+    }
+    /// Kills the ring once the READ is in the kernel (armed, and the SQ
+    /// flushed by the pass's work-in-hand flush). The loud line is the
+    /// lane thread's.
+    fn kill(context: *const anyopaque) void {
+        const s = of(context);
+        const f = currentFiber().?;
+        while (!(s.reader.?.op_pending and s.lane.ring.ring.sq_ready() == 0)) f.yieldNow();
+        log.testing.expectErrorLogs(1);
+        s.lane.markRingDeadForTest();
+    }
+    /// Parked until the test wakes it after the verdict: one lane thread,
+    /// one ready FIFO, so it runs after every fiber the verdict readied.
+    fn write(context: *const anyopaque) void {
+        const s = of(context);
+        currentFiber().?.park();
+        assert(linux.write(s.wr, "LATEDATA", 8) == 8);
+        s.written.finish();
+    }
+    fn pipeBytes(s: *const DeadRead) usize {
+        var n: c_int = 0;
+        assert(linux.errno(linux.ioctl(s.rd, linux.T.FIONREAD, @intFromPtr(&n))) == .SUCCESS);
+        return @intCast(n);
+    }
+};
+
+test "a dead ring keeps a READ the kernel took: its fiber stays parked until the CQE, so the kernel's late write lands before the fiber has its buffer back (0003 §AR.4)" {
+    const l = try testLane(.meta, 8, false);
+    defer l.deinit();
+    var fds: [2]linux.fd_t = undefined;
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.pipe2(&fds, .{ .CLOEXEC = true })));
+    defer for (fds) |fd| {
+        _ = linux.close(fd);
+    };
+    var s: DeadRead = .{ .lane = l, .rd = fds[0], .wr = fds[1] };
+    const sp: *DeadRead = &s;
+    var g = membersGroup(3);
+    s.reader = try l.spawn(.group, .{ .group = DeadRead.read }, std.mem.asBytes(&sp), &g, .unblocked);
+    const w = try l.spawn(.group, .{ .group = DeadRead.write }, std.mem.asBytes(&sp), &g, .unblocked);
+    _ = try l.spawn(.group, .{ .group = DeadRead.kill }, std.mem.asBytes(&sp), &g, .unblocked);
+    // The verdict: the lane routes around itself.
+    while (l.alive.load(.acquire)) try std.Thread.yield();
+    while (w.state.load() != .idle) try std.Thread.yield();
+    try testing.expect(w.state.wake());
+    l.enqueue(w);
+    s.written.waitDone();
+    s.read_done.waitDone();
+    // The fiber had its buffer back only after the kernel was done with it:
+    // the READ took the bytes, and the fiber's reuse is the LAST write to
+    // the buffer. Before the fix the fiber resumed first, so the READ was
+    // still in the kernel: it either never ran (the bytes stay in the pipe)
+    // or it ran after the reuse (`LATEDATA`).
+    try testing.expectEqual(@as(usize, 0), s.pipeBytes());
+    try testing.expectEqualStrings("REUSED!!", &s.buf);
+    try testing.expectEqual(-@as(i32, @intCast(@backingInt(linux.E.IO))), s.res);
+    waitQuiescent(l);
+}
+
 test "ring entries derivation: power of two above the fiber population + wake + cancels, floor 8, ceiling 4096" {
     try testing.expectEqual(@as(u16, 16), ringEntriesFor(4));
     try testing.expectEqual(@as(u16, 128), ringEntriesFor(64));

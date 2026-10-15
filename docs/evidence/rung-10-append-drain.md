@@ -106,3 +106,51 @@ flake (`flakes.md` names a different signature): `THE INTERCEPTION HOST` ×10 �
 the ordered law's first cut 7/7 red (`pread` of the ring-written block read 0 B: the plane's read
 path clamped at the DURABLE size); folding the claim into `DataPlane.inodeSize` — 10/10 green.
 
+
+## The ordered law on the write-back timer (2026-10-15)
+
+**One crash law** (0003 §AJ.4 = §AL.5, charter §1.10): after a kill every fsynced byte and size is
+present; the file ends at its last DURABLE size with only its own bytes below it; an unsynced
+extension is whole or absent; never another file's bytes. The timer lands data, and a size follows
+its data: the pass that landed a claimant's custody wakes the times drain once at its end
+(`afterTimerPass`), so an unsynced extension is durable within `T_wb` + one drain. Under the close
+posture the drained FLUSH/RELEASE journals the claim after its landing (`closeDrain`), and the
+try-only FLUSH probe declines while a claim is parked.
+
+**The handed-over red rows, attributed (rebased onto `dev` 703dd98, VM).** THE KILL MATRIX failed
+on the in-flight file, not on the fsynced files: `c.size >= claimed` asserted the size `stat` saw
+before the kill. That is the per-write size commit the ordered law removes (on `dev` the in-flight
+file came back claiming 50 MiB over 48 MiB of bytes: 512 hole pages). Restated to the law: half the
+kill point is fsynced (`conv=fsync`), the recovered size is ≥ that half, and every page below it
+is the image's, with **no hole**. Measured: durable 25/50/75 MiB, 6,400/12,800/19,200 pages exact,
+0 holes; acked files byte-exact. A NO-OPEN CLOSE / THE CONTROL ARM read `g-LOST`: the claim waited
+for the next drain tick and the kill after the close came first. Both now await or assert
+`meta_kv_times_echo_pending` 0.
+
+**fsync, found by reading the floor path.** (1) The data leg flushed ONE census buffer (64) of
+parked blocks: landed on its own on `dev` (`7ff9e42`/`e1c334f`, `accumulate.flushBornBy`). (2) The
+drain clipped fsync's claim to the custody floor read AFTER the data leg, so a write that opened
+custody under the claim (an overlay record, a rewrite epoch) left the fsynced extension undurable.
+kv_fs "an fsynced extension is durable at its full size": 8,192 B durable after fsync of 8,292 B.
+Fix: fsync and the close drain journal at least the claim found at entry (`landed`); a claim
+re-parked below it after a size-setting commit is excluded.
+
+**THE ORDERED LAW'S KILL ROW** (new; `SQUEEZEFS_TEST_OWN_BLOCK_POISON` writes a promotion's own
+block whole with 0xAA before its image grain lands, so the bytes a recycled block's previous owner
+leaves are planted on the file-backed rig). A 100 B file grows by one grain at 8,192 B, and the
+daemon is killed at four points: right after the write, after the timer landed it, after
+`conv=fsync`, and after an fsynced growth plus a truncate-up. Red on `dev` + the row: step write,
+`y0` (12,288 B), byte 4,096 reads 0xAA. Green here: 100 / 12,288 / 12,288 / 20,480 B, every byte
+the file's own.
+
+**Cost.** Close posture: one data barrier per drained close of an extended file. Timer: no new
+barrier (the woken drain is the one the tick would have run). fsync: unchanged.
+
+**The writer-storm row** (owned by `storm` on `dev`). Alone on kamrui, same base (`e1c334f`), 5
+runs each: `dev` failed 2 of 5, the branch 5 of 5, both with `waits + cold ≥ 1`. Instrumented
+(admission bytes by arm): the 1,000 B tails never park on EITHER tree. The only parked buffers are
+1 MiB heads spilled by `overlay_registry_full`, a must-stay-0 tripwire: accumulate bytes =
+registry-full count × 1 MiB (`dev` 4 → 4.39 MB, 8 → 8.58 MB; branch 2 → 2.29 MB, 3 → 3.34 MB).
+The row engages the gate only when that tripwire fires. The branch drops the per-write size
+commit, so it overflows the registry less. This is the capacity defect `storm` is fixing, not a
+change in where tails park.

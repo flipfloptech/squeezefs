@@ -48,4 +48,12 @@ on every stock-kernel mount.
 | wedge census `fuse_ops_inflight=1` (a passing row's alert) | not kamrui-specific | daemon A's `lookup` of the shared hot directory (ino 3, unique 9640) parked at `meta_backend_start` after B's kill until A recovered B's region (10.6 s); resolved before its 10 s report | attributed, not changed: a lookup that keys into a dead holder's region waits for the manager's recovery (8–13 s on the VM too), past the watchdog's 5 s; did not recur in an isolated run |
 | `mtls matrix` mount "device I/O failed" lines | not a failure | daemons C/D's expected refusals (the row passes) | none |
 
-**Numbers.** <filled after the green gate>
+**Numbers.** Gate 1 (stock 7.0, before): 34/53 steps, 21 failed, 104 skipped, 530 s. Gate 2 (stock,
+these fixes minus the multipath head): every original failure gone; the nvmet tier now ran and met
+the multipath gap (13 rows, 60 s each). Gate 3 (7.2.6-sqz, 9 m 21 s): 44/53 steps, 2,911/2,999
+passed, 77 skipped, 11 failed — every kmbuf/zc/retention/TIME_LIMITS/syncfs row RAN and passed on
+x86_64 (`lattice: kmbuf 38/39, zc present, retention present, time_limits present ⇒ zero_copy`), the
+smoke 6/6 shards green; left: the literal rail (fixed after), the conveyor §L window count under load
+(flakes.md; 199 windows alone, green), and 9 nvmet rows whose second host identity merges under one
+multipath head until kamrui boots with `fabrics_host_scoped_subsystems=Y` (provisioned; reboot owed).
+Canary scan per MiB: 3.3 ms → 0.25 ms (x86_64 self-hosted Debug), 0.15 → 0.2 ms (aarch64 LLVM).

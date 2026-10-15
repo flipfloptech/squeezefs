@@ -3114,6 +3114,54 @@ test "the overlay never opens a second authority on a block the RAM table holds:
     try testing.expect(std.mem.allEqual(u8, got[12 * PAGE ..], 0));
 }
 
+// The write-back storm at a parked cap of 8 (`rung-10-writeback-timer.md`):
+// W2 page overlays held every table entry without a pool cell, so a full
+// checkout holding a fresh cell found no entry (`active_block_table_full`,
+// must-stay-0) and parked the writer at a gate whose pool had room.
+test "the active-block table holds the parked cap's buffers AND the extents beside them: with every extent slot taken, a full checkout still finds its entry (no tripwire, no gate visit) and a small piece past the extent cap parks a full buffer" {
+    const io = testing.io;
+    const w = try World.init(testing.allocator, .sync_inline, false);
+    defer w.deinit(testing.allocator);
+    const cap = w.wp.cfg.parked_cap;
+    const tripped0 = counters.tripwireCount("active_block_table_full");
+    const waits0 = stats.parked_gate_waits.load();
+    // `cap` first pieces into fresh hole blocks: one W2 extent each.
+    var page: [PAGE]u8 = undefined;
+    fill(&page, 0x61);
+    var ino: u64 = 100;
+    while (ino < 100 + cap) : (ino += 1) {
+        try w.f.map.create(ino, .striped, 0);
+        const o = try w.wp.write(io, .{ .ino = ino, .offset = 0, .payload = .{ .bytes = &page }, .class = .entire_op, .file = World.striped(0) });
+        try testing.expectEqual(@as(u32, 1), o.count(.extent));
+    }
+    try testing.expectEqual(@as(u32, @intCast(cap)), w.wp.table.parkedCount());
+    // A half-block piece takes a cell from the empty pool and its entry.
+    try w.f.map.create(200, .striped, 0);
+    var half: [wt.BS / 2 + 100]u8 = undefined;
+    fill(&half, 0x62);
+    const o_full = try w.wp.write(io, .{ .ino = 200, .offset = 0, .payload = .{ .bytes = &half }, .class = .entire_op, .file = World.striped(0) });
+    try testing.expectEqual(@as(u32, 1), o_full.count(.accumulate_park));
+    // A small first piece past the extent cap parks a full buffer.
+    try w.f.map.create(201, .striped, 0);
+    const o_small = try w.wp.write(io, .{ .ino = 201, .offset = 0, .payload = .{ .bytes = &page }, .class = .entire_op, .file = World.striped(0) });
+    try testing.expectEqual(@as(u32, 1), o_small.count(.accumulate_park));
+    try testing.expectEqual(@as(u32, @intCast(cap + 2)), w.wp.table.parkedCount());
+    try testing.expectEqual(tripped0, counters.tripwireCount("active_block_table_full"));
+    try testing.expectEqual(waits0, stats.parked_gate_waits.load());
+    // Every parked byte lands at its flush.
+    ino = 100;
+    while (ino < 100 + cap) : (ino += 1) w.wp.flushIno(io, ino);
+    w.wp.flushIno(io, 200);
+    w.wp.flushIno(io, 201);
+    w.wp.quiesce(io);
+    try testing.expectEqual(@as(u32, 0), w.wp.table.parkedCount());
+    var got: [wt.BS]u8 = undefined;
+    const b = w.f.map.seam().lookup(201, 0) orelse return error.BlockUnmapped;
+    w.f.dev.peek(b.vol_tag, b.offset, &got);
+    try testing.expectEqualSlices(u8, &page, got[0..PAGE]);
+    try testing.expect(std.mem.allEqual(u8, got[PAGE..], 0));
+}
+
 // generic/551's stall: the overlay store took its depth-governor permit
 // UNDER the block guard, and the in-flight permits belonged to uploads
 // that re-take that guard to publish — four overlay writers parked at the

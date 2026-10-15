@@ -1696,6 +1696,36 @@ test "the fsync drain covers EVERY open record of the ino, however many: 70 bloc
     while (b < n) : (b += 1) try testing.expect(w.f.map.seam().lookup(44, b) != null);
 }
 
+// The write-back storm (16 writers, a registry the parked cap of 8 sized)
+// minted a destination, found the registry full and fired the must-stay-0
+// `overlay_registry_full` on every run.
+test "a full registry declines a fresh install BEFORE it mints (`overlay_registry_declines`; the next arm's parked gate is the writer's backpressure): no destination minted, nothing trips, a join of an open record still lands, and the install after a retire succeeds" {
+    const io = testing.io;
+    const w = try TestWorld.init(testing.allocator, .{ .registry_capacity = 2 });
+    defer w.deinit(testing.allocator);
+    try w.f.map.create(45, .striped, 0);
+    var p: [wt.BS / 4]u8 align(4096) = undefined;
+    pattern(&p, 0x45);
+    const full0 = counters.tripwireCount("overlay_registry_full");
+    for (0..2) |b| {
+        const o = try w.ov.store(io, .{ .ino = 45, .block = @intCast(b), .rel = 0, .vehicle = .{ .bytes = &p }, .file = TestWorld.striped(@as(u64, b) * wt.BS), .overwrite = false });
+        try testing.expect(o == .stored);
+    }
+    const o3 = try w.ov.store(io, .{ .ino = 45, .block = 2, .rel = 0, .vehicle = .{ .bytes = &p }, .file = TestWorld.striped(2 * wt.BS), .overwrite = false });
+    try testing.expect(o3 == .declined);
+    try testing.expectEqual(full0, counters.tripwireCount("overlay_registry_full"));
+    // A join needs no slot.
+    const oj = try w.ov.store(io, .{ .ino = 45, .block = 1, .rel = wt.BS / 4, .vehicle = .{ .bytes = &p }, .file = TestWorld.striped(2 * wt.BS), .overwrite = false });
+    try testing.expect(oj == .stored);
+    // A retire returns the slot.
+    w.ov.drainBlock(io, &w.locks, 45, 0, false, w.cs());
+    const o4 = try w.ov.store(io, .{ .ino = 45, .block = 2, .rel = 0, .vehicle = .{ .bytes = &p }, .file = TestWorld.striped(2 * wt.BS), .overwrite = false });
+    try testing.expect(o4 == .stored);
+    try testing.expectEqual(@as(u32, 2), w.ov.registry.open_count.load(.monotonic));
+    try testing.expectEqual(@as(u32, 0), w.ov.drainForIno(io, &w.locks, 45, std.math.maxInt(u64), true, w.cs()));
+    try testing.expectEqual(full0, counters.tripwireCount("overlay_registry_full"));
+}
+
 test "live_mapped_overwrite_rides_the_overlay_end_to_end: the install captures the old binding in ONE (3.5) section; reads serve gaps from the OLD binding; the settle seeds old bytes RANGED and FEEDS the rewrite epoch; the epoch close frees the displaced A key AFTER the save" {
     const io = testing.io;
     const w = try TestWorld.init(testing.allocator, .{});

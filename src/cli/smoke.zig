@@ -7815,10 +7815,11 @@ test "smoke: THE WRITE-BACK TIMER UNDER A WRITER STORM — the memory bound (dec
     const block_bytes: u64 = @import("../data/transform.zig").DEFAULT_BLOCK_SIZE;
     var cmd_buf: [512]u8 = undefined;
     // Each file is two write(2)s, 1 MiB and its 1000 B tail (`dd` over a
-    // pipe, full blocks): no small piece opens a W2 page overlay, whose
-    // cell-less table entries trip `active_block_table_full` at a cap this
-    // small under either posture (owed, `rung-10-writeback-timer.md`).
-    const cmd = try std.fmt.bufPrint(&cmd_buf, "w=0; while [ $w -lt {d} ]; do ( i=0; while [ $i -lt {d} ]; do head -c {d} {s}/image | dd of={s}/w$w-$i bs=1M iflag=fullblock status=none; i=$((i + 1)); done ) & w=$((w + 1)); done; wait", .{ wb_storm_writers, wb_storm_files, wb_file_bytes, rig.work, rig.mp });
+    // pipe, full blocks): the head rides the device overlay, the tail parks.
+    // `conv=notrunc`: uutils dd (0.10, kamrui's Ubuntu 26.04) ftruncates its
+    // output to the bytes written AFTER the last write — a size-setting
+    // SETATTR, which settles the file's custody, so no tail would park.
+    const cmd = try std.fmt.bufPrint(&cmd_buf, "w=0; while [ $w -lt {d} ]; do ( i=0; while [ $i -lt {d} ]; do head -c {d} {s}/image | dd of={s}/w$w-$i bs=1M iflag=fullblock conv=notrunc status=none; i=$((i + 1)); done ) & w=$((w + 1)); done; wait", .{ wb_storm_writers, wb_storm_files, wb_file_bytes, rig.work, rig.mp });
     var storm = try std.process.spawn(io, .{ .argv = &.{ "sh", "-c", cmd }, .environ_map = &rig.env, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore, .pgid = 0 });
     var samples: usize = 0;
     var max_parked: u64 = 0;
@@ -7856,6 +7857,9 @@ test "smoke: THE WRITE-BACK TIMER UNDER A WRITER STORM — the memory bound (dec
         try testing.expect(max_bytes <= wb_storm_cap * block_bytes);
         try testing.expect(waits + cold >= 1);
         try testing.expectEqual(@as(?u64, 0), numberAfter(st, "\"parked_buffers\":"));
+        try expectMustStayZero(st);
+        // The registry holds every head in flight (decision 0003 §AP).
+        try testing.expectEqual(@as(?u64, 0), numberAfter(st, "\"overlay_registry_declines\":"));
     }
     try rig.kill();
     const recovered = try fsckClean(rig, "the kill after the storm");

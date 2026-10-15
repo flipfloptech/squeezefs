@@ -594,7 +594,7 @@ fn multipathHead(gpa: Allocator, root: []const u8, instance: u32) !?Namespace {
     const prefix = "nvme-subsys";
     for (subs) |sub| {
         if (!std.mem.startsWith(u8, sub, prefix)) continue;
-        const k = std.fmt.parseInt(u32, sub[prefix.len..], 10) catch continue;
+        const k = std.fmt.parseInt(u32, sub[prefix.len..], 10) catch continue; // decimal, as sysfs names the subsystem instance
         const children = listDir(gpa, "{s}/class/nvme-subsystem/{s}", .{ root, sub }) catch continue;
         defer configfs.freeNames(gpa, children);
         var listed = false;
@@ -607,7 +607,7 @@ fn multipathHead(gpa: Allocator, root: []const u8, instance: u32) !?Namespace {
                 continue;
             }
             if (!std.mem.startsWith(u8, ch, "nvme")) continue;
-            _ = std.fmt.parseInt(u32, ch["nvme".len..], 10) catch continue;
+            _ = std.fmt.parseInt(u32, ch["nvme".len..], 10) catch continue; // decimal, as sysfs names the controller link
             // A serving controller not provably ours (gone, or another
             // identity) makes the head shared: never handed out.
             const c = readController(root, ch) orelse return null;

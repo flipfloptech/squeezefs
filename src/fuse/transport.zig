@@ -18,6 +18,7 @@ pub const commit_queue = @import("transport/commit_queue.zig");
 pub const filesystem_vtable = @import("transport/filesystem_vtable.zig");
 pub const zc = @import("transport/zc.zig");
 pub const probes = @import("transport/probes.zig");
+pub const pass_stamps = @import("transport/pass_stamps.zig");
 
 // ---- Linux only ----
 pub const kmbuf = if (is_linux) @import("transport/kmbuf.zig") else struct {};
@@ -38,6 +39,7 @@ test {
     _ = filesystem_vtable;
     _ = zc;
     _ = probes;
+    _ = pass_stamps;
     if (is_linux) {
         _ = kmbuf;
         _ = worker;

@@ -68,6 +68,7 @@ const derive = @import("../../core/derive.zig");
 const log = @import("../../core/log.zig");
 const tick_mod = @import("../../sync/tick.zig");
 const timer_heap = @import("../../exec/timer_heap.zig");
+const pass_stamps = @import("../transport/pass_stamps.zig");
 
 /// The tick: D1.b's cadence, and the coarse clock's refresh period (age
 /// error ≤ one tick).
@@ -306,7 +307,10 @@ pub const Registry = struct {
 /// The one-line wedge census: process-global atomics only, so it is
 /// readable from the watchdog no matter what is wedged.
 fn logWedgeCensus(report: Registry.TickReport) void {
-    log.err("wedge census: fuse_ops_inflight={d} overdue_now={d} fuse_op_watchdog_overdue={d} fuse_requests_malformed={d} lock_ticked_reregisters={d} channel_ticked_reregisters={d} invariant_tripwires={d} registry_exhausted={d}", .{
+    // The stalest FUSE worker pass: the holder of every fiber on its lane
+    // (`transport/pass_stamps.zig`); 0 ms on group 0 when no worker runs.
+    const stalest = pass_stamps.stalest(clock.monotonicNs()) orelse pass_stamps.Stalest{ .group = 0, .age_ns = 0 };
+    log.err("wedge census: fuse_ops_inflight={d} overdue_now={d} fuse_op_watchdog_overdue={d} fuse_requests_malformed={d} lock_ticked_reregisters={d} channel_ticked_reregisters={d} invariant_tripwires={d} registry_exhausted={d} stalest_worker_pass_ms={d} stalest_worker_group={d}", .{
         report.in_flight,
         report.overdue,
         fuse_op_watchdog_overdue.load(),
@@ -315,6 +319,8 @@ fn logWedgeCensus(report: Registry.TickReport) void {
         tick_mod.channel_ticked_reregisters.load(),
         counters.invariantTripwires(),
         fuse_op_registry_exhausted.load(),
+        stalest.age_ns / std.time.ns_per_ms,
+        stalest.group,
     });
 }
 

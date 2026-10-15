@@ -76,6 +76,7 @@ const tick_law = @import("../../sync/tick.zig");
 const abi = @import("../abi.zig");
 const codec = @import("../codec.zig");
 const geometry = @import("../geometry.zig");
+const pass_stamps = @import("pass_stamps.zig");
 const slot = @import("slot.zig");
 const zc = @import("zc.zig");
 const kmbuf = @import("kmbuf.zig");
@@ -1243,6 +1244,7 @@ pub const Group = struct {
         self.registerAll();
         self.started.store(1, .release);
         futex.wakeAll(&self.started);
+        defer pass_stamps.clear(self.index);
         self.runLoop();
         self.drain();
         // The FUSE side is done; a driven lane's handlers still run here.
@@ -1303,6 +1305,7 @@ pub const Group = struct {
         const l = self.lane.?;
         var last_log = clock.monotonicNs();
         while (true) {
+            pass_stamps.stamp(self.index, clock.monotonicNs());
             self.pumpLane();
             while (self.cells.pop()) |gent| self.handleCommitCell(gent);
             self.pumpExtracts();
@@ -2162,6 +2165,7 @@ pub const Group = struct {
     fn runLoop(self: *Group) void {
         while (self.shared.isActive() and !self.disconnected and !self.protocol_rejected) {
             passes.inc();
+            pass_stamps.stamp(self.index, clock.monotonicNs());
             // 1. Rescue capture.
             const after_tick = self.tick_rescue_pending;
             self.tick_rescue_pending = false;

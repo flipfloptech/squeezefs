@@ -130,7 +130,12 @@ run_in() {
   # KILL) the same day. Two build slots (flock /build/.build-slot.{0,1}); a full gate holds
   # the gate lock AND both slots, so it runs alone. A command whose own exit status is 75
   # (EX_TEMPFAIL) is indistinguishable from "slot busy" — none of ours uses it.
-  local q; q=$(printf '%q' "$cmd")
+  # Every slotted command runs under a wall bound (SQZ_VENUE_TIMEOUT, default 2 h — a full
+  # gate is ~10–45 min with its waits): two hung red-repro test processes once held both
+  # build slots for 2 h and stalled every gate behind them. A command that needs longer
+  # sets the variable.
+  local bound=${SQZ_VENUE_TIMEOUT:-7200}
+  local q; q=$(printf '%q' "timeout --kill-after=30 $bound bash -lc $(printf '%q' "$cmd")")
   local all_slots="" s
   for ((s = 0; s < SLOTS; s++)); do all_slots="$all_slots flock /build/.build-slot.$s"; done
   if printf '%s' "$cmd" | grep -Eq 'zig build[^;&|]*[[:space:]]gate([[:space:]]|$)'; then

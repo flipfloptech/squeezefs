@@ -1265,24 +1265,30 @@ test "checkpoint cadence: tasks_done persists every 256 tasks; the terminal reco
     try testing.expectEqual(@as(u32, 8), defaultWorkers(256));
 }
 
-test "duty cycle adheres within ten percent at 25/50/75 over a noop run" {
+test "duty cycle at 25/50/75 over a noop run: the throttle's books grant exactly pct — every task's active time priced by the law, every park served in full — and the job's wall span holds work and park in sequence, so no host load lifts the duty above pct" {
     const gpa = testing.allocator;
     const io = testing.io;
+    // Twelve 10 ms tasks: every park clears the law's 1 ms floor (75 % prices 10 ms at 3.3 ms).
+    const tasks: u64 = 12;
     for ([_]u8{ 25, 50, 75 }) |pct| {
         const r = try Rig.init(gpa, .{});
         defer r.deinit(gpa);
-        const id = try r.fabric.submit(io, .{ .job_type = .noop, .arg0 = 12, .arg1 = 10, .throttle_pct = pct });
+        _ = try r.fabric.submit(io, .{ .job_type = .noop, .arg0 = tasks, .arg1 = 10, .throttle_pct = pct });
         const j = r.fabric.claimNext(io, false).?;
         const t0 = clock.monotonicNs();
         try testing.expectEqual(JobState.completed, r.fabric.runClaimed(io, j));
         const wall = clock.monotonicNs() - t0;
-        const active = r.noop.active_ns.load(.monotonic);
-        const duty = active * 100 / wall;
-        _ = id;
-        // The slice clock and the thread scheduler add latency on the
-        // active side only, so adherence is judged from below at 25 % and
-        // within ±10 pp otherwise.
-        try testing.expect(duty + 10 >= pct);
-        try testing.expect(duty <= pct + 10 or pct == 75);
+        const worked: u128 = j.ctl.worked_ns.load(.monotonic);
+        const served: u128 = j.ctl.served_ns.load(.monotonic);
+        // Every task's measured active time reached the throttle, once.
+        try testing.expectEqual(@as(u128, r.noop.active_ns.load(.monotonic)), worked);
+        // The law per task, floored: Σ⌊tᵢ·(100−p)/p⌋ never exceeds
+        // worked·(100−p)/p and falls short of it by under 1 ns per task.
+        const p: u128 = pct;
+        try testing.expect(served * p <= worked * (100 - p));
+        try testing.expect(worked * (100 - p) < (served + tasks) * p);
+        // One worker runs each task and then its park: the wall span holds
+        // both in sequence (a late wake only lengthens it).
+        try testing.expect(wall >= worked + served);
     }
 }

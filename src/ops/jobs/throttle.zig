@@ -7,7 +7,9 @@
 //! LIVE pct and the control flags per slice: a live rethrottle / pause /
 //! cancel reaches a parked worker within one slice (at 1 % a 2 s task
 //! priced a 198 s un-interruptible park in the reference), while the TOTAL
-//! park for a fixed pct is unchanged, so the ±10 % duty gate holds.
+//! park for a fixed pct is unchanged. `Control` keeps the throttle's books
+//! (the task time priced, the park served), so the duty it grants is
+//! judged apart from how promptly the scheduler runs the worker.
 //!
 //! The duty cycle is per WORKER: an unthrottled drain/rebalance overlaps
 //! `MOVER_PIPELINE_WIDTH` independent block moves (each move pays read →
@@ -59,6 +61,14 @@ pub const Control = struct {
     /// Woken by `retune`/`interrupt` so a parked worker re-reads at once
     /// (the slice is the bound, the notify the fast path).
     wake: sync.Notify = .init,
+    /// The throttle's books: the task-active ns its parks were priced on,
+    /// and the park ns served — each slice credited no more than its
+    /// deadline, so a late wake lengthens the wall park, never pays it
+    /// down. At a fixed pct `served_ns = Σ dutySleepNs(task, pct)`.
+    /// Monotonic adds by the job's claim holder alone (the claim word's
+    /// release/acquire orders one holder's adds before the next's).
+    worked_ns: Atomic(u64) = .init(0),
+    served_ns: Atomic(u64) = .init(0),
 
     pub fn setPct(self: *Control, io: Io, pct: u8) void {
         std.debug.assert(pct <= 100);
@@ -93,6 +103,7 @@ pub const ParkOutcome = enum { served, interrupted };
 /// task) and the stop flag. Never a sleep: each slice is a `Notify`
 /// deadline wait.
 pub fn dutyPark(io: Io, ctl: *Control, elapsed_ns: u64) ParkOutcome {
+    _ = ctl.worked_ns.fetchAdd(elapsed_ns, .monotonic);
     var pct = ctl.loadPct();
     var remaining = dutySleepNs(elapsed_ns, pct) orelse return .served;
     while (remaining > 0) {
@@ -104,6 +115,7 @@ pub fn dutyPark(io: Io, ctl: *Control, elapsed_ns: u64) ParkOutcome {
         const now = clock.monotonicNs();
         const slept = if (now >= deadline) slice else slice - (deadline - now);
         remaining -|= slept;
+        _ = ctl.served_ns.fetchAdd(slept, .monotonic);
         const live = ctl.loadPct();
         if (live != pct) {
             // Re-price the remainder under the new pct: the share of the
@@ -177,7 +189,7 @@ test "dutyPark: unthrottled returns at once; a pre-set stop interrupts before th
     try testing.expect(clock.monotonicNs() - t1 < 5 * DUTY_SLICE_NS);
 }
 
-test "dutyPark at a fixed pct serves the law's total: a 20 ms task at 50 % parks ≈ 20 ms across slices (±10 %)" {
+test "dutyPark at a fixed pct serves the law's total: a 20 ms task at 50 % parks ≈ 20 ms across slices (±10 %), and its books hold the task and exactly the law's park" {
     const io = testing.io;
     var ctl: Control = .{};
     ctl.setPct(io, 50);
@@ -186,4 +198,7 @@ test "dutyPark at a fixed pct serves the law's total: a 20 ms task at 50 % parks
     const parked = clock.monotonicNs() - t0;
     try testing.expect(parked >= 18 * std.time.ns_per_ms);
     try testing.expect(parked < 200 * std.time.ns_per_ms);
+    try testing.expectEqual(@as(u64, 20 * std.time.ns_per_ms), ctl.worked_ns.load(.monotonic));
+    try testing.expectEqual(@as(u64, 20 * std.time.ns_per_ms), ctl.served_ns.load(.monotonic));
+    try testing.expect(parked >= ctl.served_ns.load(.monotonic));
 }

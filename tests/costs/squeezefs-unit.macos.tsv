@@ -1826,7 +1826,7 @@ ops.jobs.fabric.test.an error-returning job releases its claim, lands Failed wit
 ops.jobs.fabric.test.cancel inside the park window stays terminal; a parked job is re-claimable by another worker after resume (the claim was released)	209	210
 ops.jobs.fabric.test.checkpoint cadence: tasks_done persists every 256 tasks; the terminal record carries the final count; the default worker count is clamp(cpus/4, 2, 8)	270	269
 ops.jobs.fabric.test.crash resume reconstructs from durable records: a fresh fabric over the same store adopts Running/Queued as Queued, Paused stays paused, terminal and corrupt records are skipped (counted, logged)	1733	1734
-ops.jobs.fabric.test.duty cycle adheres within ten percent at 25/50/75 over a noop run	1092038	1165
+ops.jobs.fabric.test.duty cycle at 25/50/75 over a noop run: the throttle's books grant exactly pct — every task's active time priced by the law, every park served in full — and the job's wall span holds work and park in sequence, so no host load lifts the duty above pct	1092038	1165
 ops.jobs.fabric.test.intersecting-scope movers serialize (queued loud, once), disjoint scopes run concurrently, WholeSet conflicts with every mover, and the second runs once the first releases	595	597
 ops.jobs.fabric.test.noop job runs to completion and the record is durable: the terminal record is on disk BEFORE the waiter wakes; submitted ≡ completed + live	260	271
 ops.jobs.fabric.test.pause / resume / cancel / live rethrottle: the intent flips the state durably; resume re-queues; cancel of a paused job is terminal; a terminal job refuses control; the rethrottle reaches the live word	359	360
@@ -1855,7 +1855,7 @@ ops.jobs.records.test.the type predicates: movers are evacuate/rebalance/defrag_
 ops.jobs.seams.test.the fabric's own AdminJob and Throttle bindings: submit/status/wait route to the fabric; a step prices the park and reads the live pct; the none dispatcher has zero capacity and the charter's TTL	183	184
 ops.jobs.stats.test.the family renders as one JSON object with every instrument named; the closures hold on a quiet fabric	40	40
 ops.jobs.test_0	6	7
-ops.jobs.throttle.test.dutyPark at a fixed pct serves the law's total: a 20 ms task at 50 % parks ≈ 20 ms across slices (±10 %)	20665	13
+ops.jobs.throttle.test.dutyPark at a fixed pct serves the law's total: a 20 ms task at 50 % parks ≈ 20 ms across slices (±10 %), and its books hold the task and exactly the law's park	20665	13
 ops.jobs.throttle.test.dutyPark: unthrottled returns at once; a pre-set stop interrupts before the first slice; a live rethrottle to 100 from another thread ends the park within one slice	73	79
 ops.jobs.throttle.test.pipeline width: unthrottled movers overlap 4; throttled or order-dependent passes are serial	1	1
 ops.jobs.throttle.test.throttle law is exact at every duty target: sleep = t × (100 − pct)/pct — 25/50/75 give 3t, t, t/3; 0 and ≥ 100 are none; under 1 ms is none	3	3

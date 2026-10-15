@@ -486,6 +486,10 @@ pub const Stats = struct {
     /// cell met a FULL free list / a FULL queue (a double give-back).
     cell_return_refused: counters.Tripwire = .init("uring_fs_cell_return_refused"),
     queue_push_with_cell: counters.Tripwire = .init("uring_fs_queue_push_refused_with_cell"),
+    /// `uring_fs_ring_dead_held_ops`: ops a dead ring still holds because
+    /// the kernel took them (slot, buffer and cell kept until the CQE,
+    /// decision 0003 §AR.4); one whose CQE never comes stays counted.
+    ring_dead_held_ops: counters.Gauge = .{},
     phases: [4]counters.ShardedLatencyHistogram = @splat(.{}),
 };
 
@@ -2087,6 +2091,47 @@ test "a request cell given back while another taker sits between its free-list d
         seen[i] = true;
     }
     try testing.expectEqual(queue_cap, n);
+}
+
+test "a dead ring keeps a READ the kernel took (0003 §AR.4): its slot, buffer and cell stay held until its CQE, so the kernel's late copy lands in a buffer nobody reused; the CQE answers RingFailed; an SQE the kernel never took is answered at the verdict" {
+    const pool = try testPool(1);
+    defer pool.deinit();
+    // A reactor of the test thread's own: the pool's worker never sees these cells.
+    var r = try Reactor.init(testing.allocator, pool, 8, 16);
+    defer r.deinit();
+    var fds: [2]linux.fd_t = undefined;
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.pipe2(&fds, .{ .CLOEXEC = true })));
+    defer _ = linux.close(fds[1]);
+    // The read end is the cached file's: its last release closes it.
+    const file = try CachedFile.create(testing.allocator, fds[0]);
+    const placeholder: Request = .{ .fdatasync = .{ .path = &.{}, .direct = false } };
+
+    const taken = try pool.acquireCell(placeholder);
+    r.enqueueRead(file, try AlignedBuf.zeroed(testing.allocator, 8, 1), 0, 0, 8, 1, taken);
+    // The kernel takes it: an empty pipe parks the READ on its poll.
+    try testing.expectEqual(@as(u32, 1), try r.ring.submit());
+    const untaken = try pool.acquireCell(placeholder);
+    file.retain();
+    r.enqueueRead(file, try AlignedBuf.zeroed(testing.allocator, 8, 1), 0, 0, 8, 1, untaken);
+
+    const held0 = stats.ring_dead_held_ops.load();
+    r.failAll(error.RingFailed);
+    try testing.expectError(error.RingFailed, pool.waitCell(untaken).read);
+    // Before the fix the taken READ's cell was answered here and its buffer
+    // freed while the READ still sat in the kernel.
+    try testing.expect(!pool.cells[taken].done.isDone());
+    try testing.expectEqual(@as(usize, 1), r.inflight);
+    try testing.expectEqual(held0 + 1, stats.ring_dead_held_ops.load());
+
+    // The late data: the held READ copies it into its own buffer.
+    try testing.expectEqual(@as(usize, 8), linux.write(fds[1], "LATEDATA", 8));
+    while (!pool.cells[taken].done.isDone()) r.reap();
+    try testing.expectError(error.RingFailed, pool.waitCell(taken).read);
+    var n: c_int = -1;
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.ioctl(fds[1], linux.T.FIONREAD, @intFromPtr(&n))));
+    try testing.expectEqual(@as(c_int, 0), n);
+    try testing.expectEqual(@as(usize, 0), r.inflight);
+    try testing.expectEqual(held0, stats.ring_dead_held_ops.load());
 }
 
 test "a registered metadata file opens O_DIRECT with a derived grain; lookup by given and canonical path; idempotent" {

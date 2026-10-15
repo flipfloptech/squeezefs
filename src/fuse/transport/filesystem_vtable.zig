@@ -312,6 +312,10 @@ const EchoFsImpl = struct {
     /// custody (then it takes the lane, counted in `flushes_dispatched`).
     no_open: bool = false,
     flush_custody: bool = false,
+    /// The write-back timer's close (decision 0003 §AJ): every FLUSH is
+    /// answered ENOSYS (the kernel latches `no_flush`), counted here.
+    flush_enosys: bool = false,
+    flushes_enosys: std.atomic.Value(u64) = .init(0),
     opens_enosys: std.atomic.Value(u64) = .init(0),
     file_releases: std.atomic.Value(u64) = .init(0),
     flush_probes_served: std.atomic.Value(u64) = .init(0),
@@ -543,6 +547,10 @@ const EchoFsImpl = struct {
     fn fsProbeMeta(ctx: *anyopaque, req: Request, out: *codec.OutBuf) ?codec.Reply {
         const self = of(ctx);
         if (req.op == .flush) {
+            if (self.flush_enosys) {
+                _ = self.flushes_enosys.fetchAdd(1, .monotonic);
+                return codec.replyError(req.unique(), .NOSYS);
+            }
             if (!self.no_open or self.flush_custody) return null;
             _ = self.flush_probes_served.fetchAdd(1, .monotonic);
             return codec.replyOk(req.unique());
@@ -664,6 +672,10 @@ const EchoFsImpl = struct {
                 h.reply(codec.replyOk(u));
             },
             .flush => {
+                if (self.flush_enosys) {
+                    _ = self.flushes_enosys.fetchAdd(1, .monotonic);
+                    return h.fail(.NOSYS);
+                }
                 _ = self.flushes_dispatched.fetchAdd(1, .monotonic);
                 h.reply(codec.replyOk(u));
             },

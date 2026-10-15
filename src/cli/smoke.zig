@@ -5847,11 +5847,13 @@ test "smoke: THE TRANSFORMED APPEND on a set without a cache path (decision 0003
             try rig.spawnMount(&.{ "--encrypt-key", kp });
         }
         _ = try rig.awaitReady(0);
-        // Past the inline bound: 4,096 B inline, then 904 B that promote the file.
+        // Past the inline bound: 4,096 B inline, then 904 B that promote the
+        // file — fsync'd: its custody lands before the appends' window
+        // opens (close is no durability point, decision 0003 §AJ).
         const sp = try rig.stats();
         defer gpa.free(sp);
         {
-            const out = try rig.onMountTimed("head -c 5000 /dev/urandom > \"$1/ref\" && dd if=\"$1/ref\" of=f bs=4096 status=none && cmp f \"$1/ref\" && echo same", 60);
+            const out = try rig.onMountTimed("head -c 5000 /dev/urandom > \"$1/ref\" && dd if=\"$1/ref\" of=f bs=4096 conv=fsync status=none && cmp f \"$1/ref\" && echo same", 60);
             defer gpa.free(out);
             try testing.expectEqualStrings("same\n", out);
         }
@@ -7129,6 +7131,9 @@ test "smoke: `sync -f` IS A DURABILITY POINT FOR THE DAEMON'S WRITE CUSTODY — 
     try rig.createImage();
     // The C8 oracle at every mount (the remount after the kill judges it).
     try rig.env.put("SQUEEZEFS_BLOCK_REFS_VERIFY", "1");
+    // syncfs is the drain the row judges: the write-back timer (decision
+    // 0003 §AJ) and the close posture's idle drain held ten minutes away.
+    try rig.env.put("SQUEEZEFS_TEST_FUSE_OWED_IDLE_MS", "600000");
     try rig.spawnMount(&.{});
     _ = try rig.awaitReady(0);
     // The kernel forwards syncfs to a plain /dev/fuse server only once INIT
@@ -7295,6 +7300,9 @@ fn closeDrainRow(no_open: bool) !void {
     try rig.formatSet(false);
     try rig.createImage();
     try rig.env.put("SQUEEZEFS_FUSE_NO_OPEN", if (no_open) "1" else "0");
+    // The close posture: the A/B control arm of the write-back timer
+    // (decision 0003 §AJ), kept tested.
+    try rig.env.put("SQUEEZEFS_WRITEBACK_POSTURE", "close");
     try rig.env.put("SQUEEZEFS_BLOCK_REFS_VERIFY", "1");
     try rig.spawnMount(&.{});
     _ = try rig.awaitReady(0);
@@ -7361,6 +7369,7 @@ test "smoke: CUSTODY NO CLOSE COVERS IS DRAINED ONCE IDLE (decision 0003 §AF) �
     defer rig.deinit();
     try rig.formatSet(false);
     try rig.env.put("SQUEEZEFS_FUSE_NO_OPEN", "1");
+    try rig.env.put("SQUEEZEFS_WRITEBACK_POSTURE", "close");
     try rig.env.put("SQUEEZEFS_TEST_FUSE_OWED_IDLE_MS", "0");
     try rig.env.put("SQUEEZEFS_BLOCK_REFS_VERIFY", "1");
     try rig.spawnMount(&.{});
@@ -7433,6 +7442,7 @@ test "smoke: A CLOSE BURST COALESCES ITS DRAINS (decision 0003 §AF) — no-open
     try rig.formatSet(false);
     try rig.createImage();
     try rig.env.put("SQUEEZEFS_FUSE_NO_OPEN", "1");
+    try rig.env.put("SQUEEZEFS_WRITEBACK_POSTURE", "close");
     try rig.env.put("SQUEEZEFS_BLOCK_REFS_VERIFY", "1");
     try rig.spawnMount(&.{});
     _ = try rig.awaitReady(0);
@@ -7477,6 +7487,326 @@ test "smoke: A CLOSE BURST COALESCES ITS DRAINS (decision 0003 §AF) — no-open
         std.debug.print("smoke[close burst]: after the kill and the remount: {s}\n", .{std.mem.trimEnd(u8, out, "\n")});
         try testing.expect(std.mem.indexOf(u8, out, "log-whole") != null);
     }
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+}
+
+/// The write-back timer rows' files (decision 0003 §AJ): a partial block
+/// each on a set without a cache path (parked in RAM until a drain), a
+/// pattern per file so a swapped or torn body is caught.
+const wb_file_bytes: usize = (1 << 20) + 1000;
+
+fn wbByte(file: usize, i: usize) u8 {
+    return @truncate(i *% 31 +% 7 +% file *% 13);
+}
+
+/// The rows' write(2) grain: the head and the tail of a file are one
+/// write(2) each, neither past the kernel's `max_write` (1 MiB), so each is
+/// ONE FUSE WRITE — the unit an acknowledgement covers (a longer write(2)
+/// is split by the kernel into requests the daemon acks one by one).
+const wb_head_bytes: usize = 1 << 20;
+
+/// Create `path` (O_TRUNC), write file `file`'s pattern as its two writes,
+/// close — from THIS process: no child, so every request is the row's own.
+fn wbWrite(gpa: std.mem.Allocator, path: [:0]const u8, file: usize) !void {
+    const body = try gpa.alloc(u8, wb_file_bytes);
+    defer gpa.free(body);
+    for (body, 0..) |*b, i| b.* = wbByte(file, i);
+    const fd = try openRaw(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .CLOEXEC = true });
+    defer _ = linux.close(fd);
+    try pwriteAll(fd, body[0..wb_head_bytes], 0);
+    try pwriteAll(fd, body[wb_head_bytes..], wb_head_bytes);
+}
+
+/// The crash law at write grain for an unsynced write (decision 0003 §AJ,
+/// ext4's `data=ordered`, §AL): after a kill -9 each write(2) of a file is
+/// its whole pattern (landed) or absent — zeros, or past the file's
+/// recovered length (an unsynced extension may revert to the last durable
+/// length, a write boundary) — never part one and part the other, never
+/// another file's bytes.
+const WbState = enum { present, absent };
+
+/// A file's two writes judged one by one.
+const WbFile = struct {
+    head: WbState,
+    tail: WbState,
+
+    fn whole(self: WbFile) bool {
+        return self.head == .present and self.tail == .present;
+    }
+};
+
+fn wbRegion(path: [:0]const u8, got: []const u8, file: usize, from: usize) !WbState {
+    var exact = true;
+    var zeros = true;
+    for (got, from..) |b, i| {
+        exact = exact and b == wbByte(file, i);
+        zeros = zeros and b == 0;
+    }
+    if (exact) return .present;
+    if (zeros) return .absent;
+    var n_exact: usize = 0;
+    var n_zero: usize = 0;
+    for (got, from..) |b, i| {
+        if (b == wbByte(file, i)) n_exact += 1 else if (b == 0) n_zero += 1;
+    }
+    std.debug.print("\nsmoke[write-back timer]: {s}: the write at {d} ({d} B) is neither itself nor zeros after the remount — TORN: {d} B its own, {d} B zeros, {d} B foreign\n", .{ path, from, got.len, n_exact, n_zero, got.len - n_exact - n_zero });
+    return error.TornWrite;
+}
+
+/// A histogram's field (`"count":`, `"sum_ns":`) in a `.stats` document:
+/// the first after the histogram's key.
+fn histFieldAfter(text: []const u8, key: []const u8, field: []const u8) ?u64 {
+    const i = std.mem.indexOf(u8, text, key) orelse return null;
+    return numberAfter(text[i..], field);
+}
+
+fn wbJudge(gpa: std.mem.Allocator, path: [:0]const u8, file: usize) !WbFile {
+    const fd = try openRaw(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true });
+    defer _ = linux.close(fd);
+    const got = try gpa.alloc(u8, wb_file_bytes + 1);
+    defer gpa.free(got);
+    var done: usize = 0;
+    while (done < got.len) {
+        const n = linux.pread(fd, got[done..].ptr, got.len - done, @intCast(done));
+        if (linux.errno(n) != .SUCCESS) return error.ReadFailed;
+        if (n == 0) break;
+        done += n;
+    }
+    // The recovered length is a write boundary: none, the head, both.
+    if (done != 0 and done != wb_head_bytes and done != wb_file_bytes) {
+        std.debug.print("\nsmoke[write-back timer]: {s} reads {d} B after the remount — not a write boundary of its 0 / {d} / {d}\n", .{ path, done, wb_head_bytes, wb_file_bytes });
+        return error.TornLength;
+    }
+    const head: WbState = if (done == 0) .absent else try wbRegion(path, got[0..wb_head_bytes], file, 0);
+    const tail: WbState = if (done < wb_file_bytes) .absent else try wbRegion(path, got[wb_head_bytes..done], file, wb_head_bytes);
+    return .{ .head = head, .tail = tail };
+}
+
+test "smoke: THE WRITE-BACK TIMER — CLOSE IS LOCAL, THE BOUND HOLDS (decision 0003 §AJ: close is no durability point; an acked unsynced write leaves daemon memory within T_wb) — format (no cache path: a partial block parks in RAM) → mount under SQUEEZEFS_WRITEBACK_POSTURE=timer (no-open; the daemon's own close at ready is the ONE FLUSH, answered ENOSYS: the kernel's `no_flush`) → 8 files created, written past inline and closed, each reopened and closed 4 times: no FLUSH reaches the daemon past the latch (ENOSYS still the one, no worker serve, no demotion, no drain), no RELEASE → `f` written and closed, never synced: the timer lands it (owed 0, parked 0, every residency ≥ the age: nothing landed before it came of age) → 16 more written and closed and kill -9 AT ONCE → fsck --offline clean → remount → `f` and the 8 whole; each write(2) of the 16 (1 MiB, then its 1000 B tail: one FUSE WRITE each) whole or absent (zeros, or past a length reverted to a write boundary), never torn, never another file's bytes" {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    try rig.formatSet(false);
+    try rig.env.put("SQUEEZEFS_FUSE_NO_OPEN", "1");
+    try rig.env.put("SQUEEZEFS_WRITEBACK_POSTURE", "timer");
+    try rig.env.put("SQUEEZEFS_BLOCK_REFS_VERIFY", "1");
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(0);
+    // The latch: the daemon's own close at ready (answered on a worker).
+    var latch: struct { inline_serves: u64, enosys: u64, bound_ns: u64 } = undefined;
+    {
+        const st = try statsDirect(rig);
+        defer gpa.free(st);
+        latch = .{ .inline_serves = numberAfter(st, "\"transport_flush_inline_serves\":") orelse 0, .enosys = numberAfter(st, "\"fuse_flush_enosys\":") orelse 0, .bound_ns = numberAfter(st, "\"writeback_bound_ns\":") orelse 0 };
+    }
+    const bound_ns = latch.bound_ns;
+    var pb: [256]u8 = undefined;
+    // (a) Closes are local: creates, written closes, read closes.
+    const census_files = 8;
+    for (0..census_files) |i| {
+        const p = try std.fmt.bufPrintSentinel(&pb, "{s}/c{d}", .{ rig.mp, i }, 0);
+        try wbWrite(gpa, p, 100 + i);
+        for (0..4) |_| _ = linux.close(try openRaw(p, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }));
+    }
+    {
+        const st = try statsDirect(rig);
+        defer gpa.free(st);
+        std.debug.print("\nsmoke[write-back timer]: T_wb's static part {d} ms; after {d} creates + {d} closes: FLUSH drained {d}, answered on the worker {d} (at ready {d}), demoted {d}, ENOSYS {d}, RELEASEs {d}\n", .{ bound_ns / std.time.ns_per_ms, census_files, census_files * 5, numberAfter(st, "\"fuse_flush_drains\":") orelse 0, numberAfter(st, "\"transport_flush_inline_serves\":") orelse 0, latch.inline_serves, numberAfter(st, "\"transport_flush_inline_demotes\":") orelse 0, numberAfter(st, "\"fuse_flush_enosys\":") orelse 0, numberAfter(st, "\"fuse_no_open_releases\":") orelse 0 });
+        try testing.expectEqual(@as(?u64, 0), numberAfter(st, "\"fuse_flush_drains\":"));
+        try testing.expectEqual(@as(?u64, latch.inline_serves), numberAfter(st, "\"transport_flush_inline_serves\":"));
+        try testing.expectEqual(@as(?u64, 0), numberAfter(st, "\"transport_flush_inline_demotes\":"));
+        try testing.expectEqual(@as(?u64, 0), numberAfter(st, "\"fuse_no_open_releases\":"));
+        try testing.expectEqual(@as(?u64, 1), numberAfter(st, "\"fuse_flush_enosys\":"));
+        try testing.expect(latch.enosys == 1 and latch.inline_serves <= 1);
+        try testing.expect(bound_ns > 0);
+    }
+    // (b) Written and closed, never synced: the timer lands it.
+    const f_path = try std.fmt.bufPrintSentinel(&pb, "{s}/f", .{rig.mp}, 0);
+    var f_buf: [256]u8 = undefined;
+    @memcpy(f_buf[0 .. f_path.len + 1], f_path[0 .. f_path.len + 1]);
+    const f: [:0]const u8 = f_buf[0..f_path.len :0];
+    try wbWrite(gpa, f, 7);
+    const t_close = clock.monotonicNs();
+    {
+        const st = try awaitStats(rig, &.{ .{ .key = "\"fuse_owed_drain_inos\":", .want = 0 }, .{ .key = "\"parked_buffers\":", .want = 0 }, .{ .key = "\"parked_extent_bytes\":", .want = 0 }, .{ .key = "\"overlay_open\":", .want = 0 } }, 30 * std.time.ns_per_s);
+        defer gpa.free(st);
+        const seen_ms = (clock.monotonicNs() - t_close) / std.time.ns_per_ms;
+        const drains = numberAfter(st, "\"writeback_timer_drains\":") orelse 0;
+        const res_max = numberAfter(st, "\"writeback_residency_max_ns\":") orelse 0;
+        const res_count = histFieldAfter(st, "\"writeback_residency_ns\":", "\"count\":") orelse 0;
+        const res_sum = histFieldAfter(st, "\"writeback_residency_ns\":", "\"sum_ns\":") orelse 0;
+        std.debug.print("smoke[write-back timer]: `f` landed by the timer, observed {d} ms after its close: timer drains {d}, residencies {d} (mean {d} ms, max {d} ms), FLUSH drains {d}, syncfs {d}\n", .{ seen_ms, drains, res_count, if (res_count == 0) 0 else res_sum / res_count / std.time.ns_per_ms, res_max / std.time.ns_per_ms, numberAfter(st, "\"fuse_flush_drains\":") orelse 0, numberAfter(st, "\"fuse_syncfs\":") orelse 0 });
+        try testing.expectEqual(@as(?u64, 0), numberAfter(st, "\"fuse_owed_drain_inos\":"));
+        try testing.expectEqual(@as(?u64, 0), numberAfter(st, "\"parked_buffers\":"));
+        // The 8 census files and `f`: every one landed by the timer — no
+        // close, no fsync, no syncfs drained any.
+        try testing.expect(drains >= census_files + 1);
+        try testing.expect(res_count >= census_files + 1);
+        try testing.expectEqual(@as(?u64, 0), numberAfter(st, "\"fuse_flush_drains\":"));
+        try testing.expectEqual(@as(?u64, 0), numberAfter(st, "\"fuse_syncfs\":"));
+        // The age law: nothing landed before it came of age.
+        try testing.expect(res_sum >= res_count * (numberAfter(st, "\"writeback_age_ns\":") orelse 0));
+    }
+    // Kill at once: 16 more, the youngest far inside the age.
+    const late_files = 16;
+    for (0..late_files) |i| try wbWrite(gpa, try std.fmt.bufPrintSentinel(&pb, "{s}/g{d}", .{ rig.mp, i }, 0), 200 + i);
+    try rig.kill();
+    const recovered = try fsckClean(rig, "the kill right after the closes");
+    _ = try remountAfterKill(rig, recovered);
+    try testing.expect((try wbJudge(gpa, f, 7)).whole());
+    for (0..census_files) |i| try testing.expect((try wbJudge(gpa, try std.fmt.bufPrintSentinel(&pb, "{s}/c{d}", .{ rig.mp, i }, 0), 100 + i)).whole());
+    var present: usize = 0;
+    var landed_writes: usize = 0;
+    for (0..late_files) |i| {
+        const j = try wbJudge(gpa, try std.fmt.bufPrintSentinel(&pb, "{s}/g{d}", .{ rig.mp, i }, 0), 200 + i);
+        if (j.whole()) present += 1;
+        landed_writes += @as(usize, @intFromBool(j.head == .present)) + @intFromBool(j.tail == .present);
+    }
+    std.debug.print("smoke[write-back timer]: after kill -9 at once and the remount: `f` and the {d} census files whole; of the {d} closed at the kill {d} whole — {d} of their {d} writes landed, the rest absent (zeros or past the recovered length), 0 torn, 0 foreign\n", .{ census_files, late_files, present, landed_writes, 2 * late_files });
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+}
+
+test "smoke: UNDER THE WRITE-BACK TIMER fsync, fdatasync AND syncfs ARE STILL DURABILITY POINTS — the timer held ten minutes away (the seam), no cache path: `s1` written + fsync, `s2` + fdatasync, `s3` + syncfs(2), `s4` written and closed with no sync → kill -9 at once → fsck --offline clean → remount → s1, s2, s3 whole; s4's parked tail absent (zeros, or past a length reverted to the head): the unsynced write younger than T_wb the owner's ruling lets a crash lose, never torn" {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    try rig.formatSet(false);
+    try rig.env.put("SQUEEZEFS_FUSE_NO_OPEN", "1");
+    try rig.env.put("SQUEEZEFS_WRITEBACK_POSTURE", "timer");
+    try rig.env.put("SQUEEZEFS_TEST_FUSE_OWED_IDLE_MS", "600000");
+    try rig.env.put("SQUEEZEFS_BLOCK_REFS_VERIFY", "1");
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(0);
+    var pb: [256]u8 = undefined;
+    const body = try gpa.alloc(u8, wb_file_bytes);
+    defer gpa.free(body);
+    var syncfs_armed = true;
+    {
+        const st = try statsDirect(rig);
+        defer gpa.free(st);
+        syncfs_armed = numberAfter(st, "\"fuse_syncfs_armed\":") == 1;
+    }
+    for (1..5) |k| {
+        for (body, 0..) |*b, i| b.* = wbByte(300 + k, i);
+        const fd = try openRaw(try std.fmt.bufPrintSentinel(&pb, "{s}/s{d}", .{ rig.mp, k }, 0), .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .CLOEXEC = true });
+        defer _ = linux.close(fd);
+        try pwriteAll(fd, body, 0);
+        switch (k) {
+            1 => try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.fsync(fd))),
+            2 => try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.fdatasync(fd))),
+            3 => try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.syncfs(fd))),
+            else => {},
+        }
+    }
+    {
+        const st = try statsDirect(rig);
+        defer gpa.free(st);
+        std.debug.print("\nsmoke[write-back timer, syncs]: before the kill: timer drains {d}, owed {d}, parked buffers {d}, syncfs {d} (armed {})\n", .{ numberAfter(st, "\"writeback_timer_drains\":") orelse 0, numberAfter(st, "\"fuse_owed_drain_inos\":") orelse 0, numberAfter(st, "\"parked_buffers\":") orelse 0, numberAfter(st, "\"fuse_syncfs\":") orelse 0, syncfs_armed });
+        // The timer is held away: only the syncs drained, `s4` still parked
+        // (and `s3` when the kernel never forwards syncfs).
+        try testing.expectEqual(@as(?u64, 0), numberAfter(st, "\"writeback_timer_drains\":"));
+        try testing.expectEqual(@as(?u64, if (syncfs_armed) 1 else 2), numberAfter(st, "\"parked_buffers\":"));
+    }
+    try rig.kill();
+    const recovered = try fsckClean(rig, "the kill after the syncs");
+    _ = try remountAfterKill(rig, recovered);
+    for (1..4) |k| {
+        const j = try wbJudge(gpa, try std.fmt.bufPrintSentinel(&pb, "{s}/s{d}", .{ rig.mp, k }, 0), 300 + k);
+        // Without FUSE_HAS_SYNCFS the kernel never forwards syncfs(2): `s3`
+        // is then an unsynced file like `s4` (judged at write grain only).
+        if (k != 3 or syncfs_armed) try testing.expect(j.whole());
+    }
+    // `s4`'s tail was parked (the timer held away): zeros at its acked
+    // size. Its 1 MiB head is whichever its arm made it — the device
+    // overlay's fresh-destination write publishes at its completion.
+    const s4 = try wbJudge(gpa, try std.fmt.bufPrintSentinel(&pb, "{s}/s4", .{rig.mp}, 0), 304);
+    try testing.expectEqual(WbState.absent, s4.tail);
+    std.debug.print("smoke[write-back timer, syncs]: after kill -9 and the remount: s1 (fsync), s2 (fdatasync), s3 (syncfs) whole; s4 (no sync): head {t}, tail {t} (zeros or past the recovered length)\n", .{ s4.head, s4.tail });
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+}
+
+/// The storm row's shape: writers × files each, against a parked cap of
+/// `wb_storm_cap` buffers.
+const wb_storm_writers: usize = 16;
+const wb_storm_files: usize = 12;
+const wb_storm_cap: u64 = 8;
+
+test "smoke: THE WRITE-BACK TIMER UNDER A WRITER STORM — the memory bound (decision 0003 §AJ): no cache path, SQUEEZEFS_PARKED_BUFFERS=8 (the budget's parked-buffer component), 16 writers each create, write 1 MiB + 1000 B (two write(2)s) and close 12 files (a partial block each, every close local): at every sample the parked buffers stay ≤ 8 and their bytes ≤ 8 blocks — a writer past the cap parks at the gate or lands the coldest custody itself (gate waits + cold flushes ≥ 1), nothing grows without bound → the storm ends, the timer lands the rest (owed 0, parked 0) → kill -9 → fsck --offline clean → remount → all 192 files whole" {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    try rig.formatSet(false);
+    try rig.createImage();
+    try rig.env.put("SQUEEZEFS_FUSE_NO_OPEN", "1");
+    try rig.env.put("SQUEEZEFS_WRITEBACK_POSTURE", "timer");
+    var cap_text: [8]u8 = undefined;
+    try rig.env.put("SQUEEZEFS_PARKED_BUFFERS", try std.fmt.bufPrint(&cap_text, "{d}", .{wb_storm_cap}));
+    try rig.env.put("SQUEEZEFS_BLOCK_REFS_VERIFY", "1");
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(0);
+    // `formatSet` takes the format's default block.
+    const block_bytes: u64 = @import("../data/transform.zig").DEFAULT_BLOCK_SIZE;
+    var cmd_buf: [512]u8 = undefined;
+    // Each file is two write(2)s, 1 MiB and its 1000 B tail (`dd` over a
+    // pipe, full blocks): no small piece opens a W2 page overlay, whose
+    // cell-less table entries trip `active_block_table_full` at a cap this
+    // small under either posture (owed, `rung-10-writeback-timer.md`).
+    const cmd = try std.fmt.bufPrint(&cmd_buf, "w=0; while [ $w -lt {d} ]; do ( i=0; while [ $i -lt {d} ]; do head -c {d} {s}/image | dd of={s}/w$w-$i bs=1M iflag=fullblock status=none; i=$((i + 1)); done ) & w=$((w + 1)); done; wait", .{ wb_storm_writers, wb_storm_files, wb_file_bytes, rig.work, rig.mp });
+    var storm = try std.process.spawn(io, .{ .argv = &.{ "sh", "-c", cmd }, .environ_map = &rig.env, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore, .pgid = 0 });
+    var samples: usize = 0;
+    var max_parked: u64 = 0;
+    var max_bytes: u64 = 0;
+    {
+        // Sampled while the storm runs (its own process group: reaped on
+        // every exit path).
+        errdefer _ = linux.kill(-storm.id.?, .KILL);
+        const deadline = clock.monotonicNs() + 300 * std.time.ns_per_s;
+        while (clock.monotonicNs() < deadline) {
+            const st = try rig.stats();
+            defer gpa.free(st);
+            samples += 1;
+            max_parked = @max(max_parked, numberAfter(st, "\"parked_buffers\":") orelse 0);
+            max_bytes = @max(max_bytes, numberAfter(st, "\"parked_full_buffer_bytes\":") orelse 0);
+            var running = false;
+            for (0..wb_storm_writers) |w| {
+                var pb: [256:0]u8 = undefined;
+                const p = try std.fmt.bufPrintSentinel(&pb, "{s}/w{d}-{d}", .{ rig.mp, w, wb_storm_files - 1 }, 0);
+                running = running or fileSize(p) < wb_file_bytes;
+            }
+            if (!running) break;
+        }
+    }
+    try testing.expect((try storm.wait(io)).success());
+    {
+        const st = try awaitStats(rig, &.{ .{ .key = "\"fuse_owed_drain_inos\":", .want = 0 }, .{ .key = "\"parked_buffers\":", .want = 0 } }, 60 * std.time.ns_per_s);
+        defer gpa.free(st);
+        const waits = numberAfter(st, "\"parked_gate_waits\":") orelse 0;
+        const cold = numberAfter(st, "\"parked_gate_cold_flushes\":") orelse 0;
+        const res_max = numberAfter(st, "\"writeback_residency_max_ns\":") orelse 0;
+        std.debug.print("\nsmoke[write-back storm]: {d} writers × {d} files under a cap of {d}: {d} samples, parked ≤ {d} buffers / {d} KiB (bound {d} KiB); gate waits {d}, cold flushes {d}, timer drains {d} (kept {d}), residency max {d} ms\n", .{ wb_storm_writers, wb_storm_files, wb_storm_cap, samples, max_parked, max_bytes >> 10, (wb_storm_cap * block_bytes) >> 10, waits, cold, numberAfter(st, "\"writeback_timer_drains\":") orelse 0, numberAfter(st, "\"writeback_timer_kept\":") orelse 0, res_max / std.time.ns_per_ms });
+        try testing.expect(samples >= 1);
+        try testing.expect(max_parked <= wb_storm_cap);
+        try testing.expect(max_bytes <= wb_storm_cap * block_bytes);
+        try testing.expect(waits + cold >= 1);
+        try testing.expectEqual(@as(?u64, 0), numberAfter(st, "\"parked_buffers\":"));
+    }
+    try rig.kill();
+    const recovered = try fsckClean(rig, "the kill after the storm");
+    _ = try remountAfterKill(rig, recovered);
+    var check_buf: [512]u8 = undefined;
+    const out = try rig.onMount(try std.fmt.bufPrint(&check_buf, "bad=0; w=0; while [ $w -lt {d} ]; do i=0; while [ $i -lt {d} ]; do head -c {d} \"$1/image\" | cmp -s - w$w-$i || bad=$((bad + 1)); i=$((i + 1)); done; w=$((w + 1)); done; echo \"bad=$bad\"", .{ wb_storm_writers, wb_storm_files, wb_file_bytes }));
+    defer gpa.free(out);
+    std.debug.print("smoke[write-back storm]: after kill -9 and the remount: {s}\n", .{std.mem.trimEnd(u8, out, "\n")});
+    try testing.expect(std.mem.indexOf(u8, out, "bad=0") != null);
     try rig.umount();
     try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
 }
@@ -8538,6 +8868,9 @@ test "smoke: DEFRAG --fold AND --meta ON A LIVE MOUNT — format (64 KiB meta no
     var bs_buf: [16]u8 = undefined;
     try rig.formatSetWith(true, &.{ "--meta-node-kib", "64", "--block-size", try std.fmt.bufPrint(&bs_buf, "{d}", .{kvmap_block}) });
     try rig.createImage();
+    // The parked W2 extents are the fold's input: the write-back timer
+    // (decision 0003 §AJ) is held ten minutes away so only the job lands them.
+    try rig.env.put("SQUEEZEFS_TEST_FUSE_OWED_IDLE_MS", "600000");
     try rig.spawnMount(&.{});
     _ = try rig.awaitReady(0);
 

@@ -2351,6 +2351,40 @@ test "e2e: a no-open session (decision 0003 §AF) — INIT drops FUSE_ATOMIC_O_T
     try testing.expectEqual(@as(u64, 0), rig.fs.file_releases.load(.monotonic));
 }
 
+test "e2e: the write-back timer's close (decision 0003 §AJ) — on the real kernel a FLUSH answered ENOSYS latches `no_flush`: after ONE open and close of /hello (the OPEN and the FLUSH that latch both postures), 32 more fds of it open and close and the closes send NO request at all — `transport_ring_requests` unmoved across them — and the whole session saw ONE OPEN, ONE FLUSH, no RELEASE" {
+    if (venueMissing()) |why| return testkit.skipWhy(@src(), why);
+    const rig = try Rig.init(testing.allocator, 41, &.{});
+    defer rig.deinit();
+    rig.fs.no_open = true;
+    rig.fs.flush_enosys = true;
+    rig.fs.meta_probe = true;
+    _ = try rig.mountIt(.{ .mem_budget_bytes = 0, .no_open = true });
+    const Helper = struct {
+        fn closes(r: *Rig, result: *anyerror!void) void {
+            result.* = body(r);
+        }
+        fn body(r: *Rig) !void {
+            var pb: [256]u8 = undefined;
+            const path = r.child(&pb, "hello");
+            _ = linux.close(try openPath(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }));
+            var fds: [32]linux.fd_t = undefined;
+            for (&fds) |*fd| fd.* = try openPath(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true });
+            const r0 = worker.ring_requests.load();
+            for (fds) |fd| _ = linux.close(fd);
+            try testing.expectEqual(r0, worker.ring_requests.load());
+        }
+    };
+    var result: anyerror!void = {};
+    const t = try std.Thread.spawn(.{}, Helper.closes, .{ rig, &result });
+    t.join();
+    try result;
+    try testing.expectEqual(@as(u64, 1), rig.fs.opens_enosys.load(.monotonic));
+    try testing.expectEqual(@as(u64, 1), rig.fs.flushes_enosys.load(.monotonic));
+    try testing.expectEqual(@as(u64, 0), rig.fs.flushes_dispatched.load(.monotonic));
+    try testing.expectEqual(@as(u64, 0), rig.fs.flush_probes_served.load(.monotonic));
+    try testing.expectEqual(@as(u64, 0), rig.fs.file_releases.load(.monotonic));
+}
+
 test "the dispatch law's FLUSH arm (decision 0003 §AF): a no-open FLUSH carries RELEASE's drain and is the data class — the CPU's lane — while the control arm's runs on the worker's lane; the rest of the law is unchanged" {
     const flush: codec.Request = .{ .flush = .{ .fh = 0, .lock_owner = 0 } };
     try testing.expect(worker.onWorkerLane(flush, false));

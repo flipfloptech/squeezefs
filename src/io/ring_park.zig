@@ -108,6 +108,32 @@ fn writeEventfd(fd: linux.fd_t) void {
     _ = linux.write(fd, @ptrCast(&one), @sizeOf(u64));
 }
 
+/// `Parked.untaken` over any ring with liburing's SQ layout (`uring_fs`'s
+/// bare `IoUring` too): after the verdict, true when the kernel never took
+/// the SQE tagged `ud`. It sits in the SQ between the kernel's head and the
+/// owner's tail (prepared, or published and left there by a failed enter)
+/// and never runs (§AR.1), so its owner answers it at once. Any other op the
+/// owner holds was taken: it stays owned, buffer and waiter, until its CQE
+/// (decision 0003 §AR.4).
+pub fn untakenIn(ring: anytype, ud: u64) bool {
+    const sq = &ring.sq;
+    var pos = @atomicLoad(u32, sq.head, .acquire);
+    while (pos != sq.sqe_tail) : (pos +%= 1) {
+        if (sq.sqes[pos & sq.mask].user_data == ud) return true;
+    }
+    return false;
+}
+
+/// `Parked.enterDead` over any ring fd: the dead ring's reap enter, on the
+/// owner's thread: nothing to submit (`to_submit = 0`, so the untaken SQEs
+/// stay untaken, §AR.1) and no wait. It runs the completions a
+/// `DEFER_TASKRUN` ring posts only inside its owner's enter, so the owner's
+/// next CQ read sees the CQEs of the ops it still holds. A refusal is quiet:
+/// the CQ memory still shows whatever the kernel posts by itself.
+pub fn enterDeadFd(ring_fd: linux.fd_t) void {
+    _ = linux.io_uring_enter(ring_fd, 0, 0, linux.IORING_ENTER_GETEVENTS, null);
+}
+
 /// The park/wake/dead protocol over any ring binding that presents this
 /// face (a comptime namespace):
 ///
@@ -279,23 +305,12 @@ pub fn Parked(comptime F: type) type {
         /// the owner holds was taken: it stays owned, buffer and waiter, until
         /// its CQE (decision 0003 §AR.4).
         pub fn untaken(self: *const Self, ud: u64) bool {
-            const sq = &self.ring.sq;
-            var pos = @atomicLoad(u32, sq.head, .acquire);
-            while (pos != sq.sqe_tail) : (pos +%= 1) {
-                if (sq.sqes[pos & sq.mask].user_data == ud) return true;
-            }
-            return false;
+            return untakenIn(&self.ring, ud);
         }
 
-        /// The dead ring's reap enter, on the owner's thread: nothing to submit
-        /// (`to_submit = 0`, so the untaken SQEs stay untaken, §AR.1) and no
-        /// wait. It runs the completions a `DEFER_TASKRUN` ring posts only
-        /// inside its owner's enter, so the owner's next CQ read sees the CQEs
-        /// of the ops it still holds. A refusal is quiet: the CQ memory still
-        /// shows whatever the kernel posts by itself.
         pub fn enterDead(self: *Self) void {
             _ = self.enters.fetchAdd(1, .monotonic);
-            _ = linux.io_uring_enter(self.ring.fd, 0, 0, linux.IORING_ENTER_GETEVENTS, null);
+            enterDeadFd(self.ring.fd);
         }
 
         /// A cancel request on a dead ring: `IORING_REGISTER_SYNC_CANCEL` of the

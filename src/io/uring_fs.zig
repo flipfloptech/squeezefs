@@ -31,7 +31,7 @@
 //! in-flight slot (`Pending`) — the read buffer outright, the write payload as
 //! the caller's slice which the API contract keeps alive until the completion
 //! is observed, or the bounce copy outright. A slot is never touched until its
-//! CQE is reaped.
+//! CQE is reaped, on a dead ring too (decision 0003 §AR.4).
 
 const std = @import("std");
 const fuzzkit = @import("../core/fuzzkit.zig");
@@ -52,6 +52,8 @@ const thread_name = @import("../core/thread_name.zig");
 const completion = @import("../sync/completion.zig");
 const futex = @import("../sync/futex.zig");
 const mpmc = @import("../sync/mpmc.zig");
+const nd = @import("nvme_derive.zig");
+const ring_park = @import("ring_park.zig");
 
 comptime {
     if (builtin.os.tag != .linux) @compileError("uring_fs is Linux only (charter §1.2); gate the import on builtin.os.tag");
@@ -226,11 +228,13 @@ const ParkedQueue = struct {
         return self.ring.tryPop();
     }
 
-    /// Park until an index arrives; null once closed AND drained.
-    fn recvBlocking(self: *ParkedQueue) ?u32 {
+    /// Park until an index arrives; null once closed AND drained. With a
+    /// `tick_ns` (a dead ring's reap tick) null also when the tick elapsed,
+    /// closed or not.
+    fn recvBlocking(self: *ParkedQueue, tick_ns: ?u64) ?u32 {
         while (true) {
             if (self.ring.tryPop()) |idx| return idx;
-            if (self.closed.load(.seq_cst)) return self.ring.tryPop();
+            if (tick_ns == null and self.closed.load(.seq_cst)) return self.ring.tryPop();
             _ = self.sleepers.fetchAdd(1, .seq_cst);
             defer _ = self.sleepers.fetchSub(1, .seq_cst);
             const e = self.epoch.load(.seq_cst);
@@ -238,6 +242,10 @@ const ParkedQueue = struct {
             // and the registration bumped epoch, so the wait below returns
             // at once (EAGAIN) and we loop.
             if (self.ring.tryPop()) |idx| return idx;
+            if (tick_ns) |t| {
+                if (futex.waitTimeout(&self.epoch, e, t) == .timed_out) return null;
+                continue;
+            }
             if (self.closed.load(.seq_cst)) continue;
             futex.wait(&self.epoch, e);
         }
@@ -502,7 +510,7 @@ fn recordWritePhases(s: WriteStamps) void {
     stats.phases[@backingInt(WritePhase.total)].record(s.observed_at -| s.submitted_at);
 }
 
-/// `{"meta_io":{…},"uring_fs_write_phase_ns":{…},"uring_queue_full":n,"uring_fs_cell_return_respins":n}`
+/// `{"meta_io":{…},"uring_fs_write_phase_ns":{…},"uring_queue_full":n,"uring_fs_cell_return_respins":n,"uring_fs_ring_dead_held_ops":n}`
 pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
     try w.print("{{\"meta_io\":{{\"meta_io_direct_paths\":{d},\"meta_io_buffered_fallback\":{d},\"meta_io_bounce_bytes\":{d},\"meta_io_unaligned_refusals\":{d},\"meta_io_read_widened\":{d},\"meta_io_write_bytes\":{d}}},\"uring_fs_write_phase_ns\":{{", .{
         stats.direct_paths.load(),
@@ -517,7 +525,7 @@ pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
         try w.print("\"{s}\":", .{@tagName(phase)});
         try stats.phases[@backingInt(phase)].snapshot().writeJson(w);
     }
-    try w.print("}},\"uring_queue_full\":{d},\"uring_fs_cell_return_respins\":{d}}}", .{ stats.queue_full.load(), stats.cell_return_respins.load() });
+    try w.print("}},\"uring_queue_full\":{d},\"uring_fs_cell_return_respins\":{d},\"uring_fs_ring_dead_held_ops\":{d}}}", .{ stats.queue_full.load(), stats.cell_return_respins.load(), stats.ring_dead_held_ops.load() });
 }
 
 // ---------------------------------------------------------------------------
@@ -677,6 +685,8 @@ const Reactor = struct {
     slots: std.ArrayList(?Pending) = .empty,
     free: std.ArrayList(u32) = .empty,
     inflight: usize = 0,
+    /// The ring broke (`failAll`): only the ops the kernel took remain.
+    dead: bool = false,
     cache: FdCache,
 
     fn init(gpa: Allocator, pool: *Pool, entries: u16, fd_cache_cap: u32) InitError!Reactor {
@@ -882,17 +892,29 @@ const Reactor = struct {
     }
 
     /// Reap every ready CQE; one clock read per pass (the `woken_at` stamp);
-    /// continuations are pushed after the CQEs are consumed.
+    /// continuations are pushed after the CQEs are consumed. On a dead ring
+    /// only the ops `failAll` held remain, and each answers RingFailed here,
+    /// at its CQE.
     fn reap(self: *Reactor) void {
+        if (self.dead) {
+            if (self.inflight == 0) return;
+            ring_park.enterDeadFd(self.ring.fd);
+        }
         var cqes: [64]linux.io_uring_cqe = undefined;
         while (true) {
             const n = self.ring.copy_cqes(&cqes, 0) catch |e| {
-                log.err("uring-fs: completion queue read failed: {s} — failing every in-flight op", .{@errorName(e)});
+                if (self.dead) return;
+                log.err("uring-fs: completion queue read failed: {s} — the ring is dead; failing every in-flight op the kernel never took now and every one it took at its CQE (decision 0003 §AR.4)", .{@errorName(e)});
                 self.failAll(error.RingFailed);
                 return;
             };
             if (n == 0) break;
             const now = clock.monotonicNs();
+            if (self.dead) {
+                for (cqes[0..n]) |cqe| self.finishFailed(self.releaseSlot(@intCast(cqe.user_data)), error.RingFailed, now);
+                stats.ring_dead_held_ops.sub(n);
+                continue;
+            }
             var cont: [64]u32 = undefined;
             var nc: usize = 0;
             for (cqes[0..n]) |cqe| {
@@ -994,13 +1016,24 @@ const Reactor = struct {
         }
     }
 
+    /// The ring is dead. An op whose SQE the kernel never took is answered
+    /// `err` now (decision 0003 §AR.1). One it took keeps its slot, buffer
+    /// and cell until `reap` meets its CQE (§AR.4): the kernel may still copy
+    /// into its buffer, so neither goes back before the kernel is done; one
+    /// whose CQE never comes stays held and counted (§AR.5).
     fn failAll(self: *Reactor, err: Error) void {
+        self.dead = true;
         const now = clock.monotonicNs();
+        var held: u64 = 0;
         for (self.slots.items, 0..) |slot, i| {
             if (slot == null) continue;
-            const p = self.releaseSlot(@intCast(i));
-            self.finishFailed(p, err, now);
+            if (!ring_park.untakenIn(&self.ring, i)) {
+                held += 1;
+                continue;
+            }
+            self.finishFailed(self.releaseSlot(@intCast(i)), err, now);
         }
+        stats.ring_dead_held_ops.add(held);
     }
 };
 
@@ -1253,7 +1286,7 @@ fn workerMain(pool: *Pool, index: u32) void {
     const r = &pool.reactors[index];
     while (true) {
         if (r.inflight == 0) {
-            const idx = pool.queue.recvBlocking() orelse return;
+            const idx = pool.queue.recvBlocking(null) orelse return;
             r.admit(idx);
         }
         while (r.inflight < admit_cap) {
@@ -1264,14 +1297,27 @@ fn workerMain(pool: *Pool, index: u32) void {
         _ = r.ring.submit_and_wait(1) catch |e| switch (e) {
             error.SignalInterrupt => continue,
             else => {
-                log.err("uring-fs: worker {d}: io_uring_enter failed: {s} — the ring is dead; failing every in-flight op and every later request on this worker (charter §1.2: no classical fallback)", .{ index, @errorName(e) });
+                log.err("uring-fs: worker {d}: io_uring_enter failed: {s} — the ring is dead; failing every in-flight op the kernel never took now, every one it took at its CQE (decision 0003 §AR.4), and every later request on this worker (charter §1.2: no classical fallback)", .{ index, @errorName(e) });
                 r.failAll(error.RingFailed);
-                // The failing lane: this worker keeps draining its share of the
-                // queue so callers see a loud error instead of a hang.
-                while (pool.queue.recvBlocking()) |idx| pool.completeCell(idx, failedOutcome(pool.gpa, pool.cells[idx].req, error.RingFailed));
-                return;
+                return drainDead(pool, r);
             },
         };
+        r.reap();
+        if (r.dead) return drainDead(pool, r);
+    }
+}
+
+/// The failing lane: this worker keeps draining its share of the queue so
+/// callers see a loud error instead of a hang, and reaps the ops the kernel
+/// took on the dead ring's tick (decision 0003 §AR.4). It exits once the
+/// queue is closed and drained and nothing is held: a CQE that never comes
+/// holds the join, as on the NVMe lanes (§AR.5).
+fn drainDead(pool: *Pool, r: *Reactor) void {
+    while (true) {
+        const tick: ?u64 = if (r.inflight != 0) nd.wake_unarmed_backstop_ns else null;
+        if (pool.queue.recvBlocking(tick)) |idx| {
+            pool.completeCell(idx, failedOutcome(pool.gpa, pool.cells[idx].req, error.RingFailed));
+        } else if (r.inflight == 0) return;
         r.reap();
     }
 }
@@ -1684,7 +1730,7 @@ test "the pool's errors are the ONE table's: a refusal replies EINVAL, backpress
     try testing.expectEqual(ErrorClass.refusal, classOf(Error.UnalignedDirectWrite));
 }
 
-test "the parked queue: try-send never blocks, a full queue refuses, a parked consumer wakes, close drains then ends it" {
+test "the parked queue: try-send never blocks, a full queue refuses, a parked consumer wakes, close drains then ends it; a ticked receive ends at its tick, open or closed" {
     var q = try ParkedQueue.init(testing.allocator, 8);
     defer q.deinit(testing.allocator);
     var i: u32 = 0;
@@ -1701,7 +1747,7 @@ test "the parked queue: try-send never blocks, a full queue refuses, a parked co
 
     const Consumer = struct {
         fn run(queue: *ParkedQueue, got: *std.atomic.Value(u32)) void {
-            while (queue.recvBlocking()) |v| _ = got.fetchAdd(v, .monotonic);
+            while (queue.recvBlocking(null)) |v| _ = got.fetchAdd(v, .monotonic);
         }
     };
     var got: std.atomic.Value(u32) = .init(0);
@@ -1713,6 +1759,13 @@ test "the parked queue: try-send never blocks, a full queue refuses, a parked co
     try testing.expectError(error.Closed, q.trySend(1));
     t.join();
     try testing.expectEqual(@as(u32, 12), got.load(.monotonic));
+    try testing.expectEqual(@as(?u32, null), q.recvBlocking(std.time.ns_per_ms));
+
+    var open = try ParkedQueue.init(testing.allocator, 8);
+    defer open.deinit(testing.allocator);
+    try testing.expectEqual(@as(?u32, null), open.recvBlocking(std.time.ns_per_ms));
+    try open.trySend(3);
+    try testing.expectEqual(@as(?u32, 3), open.recvBlocking(std.time.ns_per_ms));
 }
 
 test "AlignedBuf honours the alignment it was asked for and copies a slice" {
@@ -2123,9 +2176,12 @@ test "a dead ring keeps a READ the kernel took (0003 §AR.4): its slot, buffer a
     try testing.expectEqual(@as(usize, 1), r.inflight);
     try testing.expectEqual(held0 + 1, stats.ring_dead_held_ops.load());
 
-    // The late data: the held READ copies it into its own buffer.
+    // The late data: the held READ copies it into its own buffer. The dead
+    // worker's loop reaps it on its tick and returns once the queue is closed
+    // and nothing is held.
     try testing.expectEqual(@as(usize, 8), linux.write(fds[1], "LATEDATA", 8));
-    while (!pool.cells[taken].done.isDone()) r.reap();
+    pool.queue.close();
+    drainDead(pool, &r);
     try testing.expectError(error.RingFailed, pool.waitCell(taken).read);
     var n: c_int = -1;
     try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.ioctl(fds[1], linux.T.FIONREAD, @intFromPtr(&n))));
@@ -2370,12 +2426,12 @@ test "the posture lookup resolves a path once and never on a hit; aliases; regis
     try testing.expectEqual(r0 + 4, stats.mode_resolves.load());
 }
 
-test "the stats JSON names every meta_io counter, the four write phases, the queue-full count and the cell-return respins" {
+test "the stats JSON names every meta_io counter, the four write phases, the queue-full count, the cell-return respins and the dead ring's held ops" {
     var buf: [8192]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
     try writeStatsJson(&w);
     const s = w.buffered();
-    for ([_][]const u8{ "\"meta_io\":{", "\"meta_io_direct_paths\":", "\"meta_io_buffered_fallback\":", "\"meta_io_bounce_bytes\":", "\"meta_io_unaligned_refusals\":", "\"meta_io_read_widened\":", "\"uring_fs_write_phase_ns\":{", "\"queue_hop\":", "\"device\":", "\"wake_hop\":", "\"total\":", "\"uring_queue_full\":", "\"uring_fs_cell_return_respins\":" }) |needle| {
+    for ([_][]const u8{ "\"meta_io\":{", "\"meta_io_direct_paths\":", "\"meta_io_buffered_fallback\":", "\"meta_io_bounce_bytes\":", "\"meta_io_unaligned_refusals\":", "\"meta_io_read_widened\":", "\"uring_fs_write_phase_ns\":{", "\"queue_hop\":", "\"device\":", "\"wake_hop\":", "\"total\":", "\"uring_queue_full\":", "\"uring_fs_cell_return_respins\":", "\"uring_fs_ring_dead_held_ops\":" }) |needle| {
         try testing.expect(std.mem.indexOf(u8, s, needle) != null);
     }
 }

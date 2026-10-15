@@ -59,7 +59,7 @@ SSH=(ssh -o BatchMode=yes -o LogLevel=ERROR)
 sync_tree() {
   [ "${SQZ_VENUE_NOSYNC:-0}" = 1 ] && return 0
   rsync -a --delete --exclude='.zig-cache/' --exclude='zig-out*/' --exclude='.gate-train/' \
-    --exclude='__pycache__/' -e "${SSH[*]}" "$REPO/" "$SSH_HOST:$REPO/"
+    --exclude='__pycache__/' --exclude='.git/hooks/' -e "${SSH[*]}" "$REPO/" "$SSH_HOST:$REPO/"
 }
 
 up() {

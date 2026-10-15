@@ -74,6 +74,9 @@ three consecutive greens (charter §11's release criterion), and reports one lin
   gate --summary all'` — serialized by `flock /build/.gate.lock`; never launched from a
   script inside the container, never under extra load). No post-landing gates: the train
   runs them.
+- **Landing publishes**: a fast-forward of `dev` (and any commit on `dev`) is pushed to
+  `origin` by the main repo's local hooks (owner ruling 2026-10-14). Never push a branch of
+  your own, never force-push.
 - **The train goes red on your commit**: fix it within the hour or revert it — `dev` stays
   green. A row in `docs/gates/flakes.md` failing is reported, not yours to chase: its owner
   has it.

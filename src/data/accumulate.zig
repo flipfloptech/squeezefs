@@ -95,6 +95,24 @@ pub fn parkedCapFromEnv(env: *const std.process.Environ.Map, budget_bytes: u64, 
     return resolveParkedCap(knobs.optIntKnob("SQUEEZEFS_PARKED_BUFFERS", u64, env), budget_bytes, block_size);
 }
 
+/// The W2 extent entries the table holds beside the parked buffers
+/// (decision 0003 §AP): `cap`. An extent holds at most a quarter block of
+/// page RAM before it folds (`extent.foldPagesDerived`), so `cap` of them
+/// hold ≤ `cap × B/4` — a quarter of the parked set's RAM, charged as
+/// `parked_extents`. A first piece past it takes a full buffer
+/// (`extent_cap_fallbacks`), whose pool cap the gate enforces.
+pub fn extentEntryCap(cap_buffers: u64) u64 {
+    return cap_buffers;
+}
+
+/// The table's entries: one per pool cell plus one per extent — a full
+/// checkout holding a cell then always finds its entry (every full entry
+/// holds its own cell, so at most `cap − 1` others are live), which is the
+/// law `active_block_table_full` (must-stay-0) asserts.
+pub fn activeBlockEntries(cap_buffers: u64) u64 {
+    return cap_buffers + extentEntryCap(cap_buffers);
+}
+
 /// Red halves the parked cap (the charter's "parked caps halve and become
 /// bounds").
 pub fn effectiveParkedCap(cap: u64, level: budget.Level) u64 {
@@ -155,11 +173,14 @@ pub const stats = struct {
     pub var complete_union_with_extra_runs: counters.Tripwire = .init("complete_union_with_extra_runs");
     pub var zero_complete_on_deferred_seed: counters.Tripwire = .init("zero_complete_on_deferred_seed");
     pub var active_block_table_full: counters.Tripwire = .init("active_block_table_full");
+    /// A first small piece met the extent entries at `extentEntryCap` and
+    /// took a full buffer instead.
+    pub var extent_cap_fallbacks: counters.ShardedCounter = .{};
 };
 
 pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
     try w.writeAll("{");
-    inline for (.{ "write_through_blocks", "write_through_bytes", "write_through_fallbacks", "nt_copy_bytes", "active_block_cow_copies", "active_block_memset_elided_bytes", "active_block_ooo_runs", "active_block_run_table_completions", "overwrite_seed_deferred", "overwrite_seed_materialized", "overwrite_seed_skipped", "write_block_revisits", "parked_pool_refusals", "parked_pool_trimmed_cells", "durable_upload_bytes_escalation", "placed_merge_elides", "drain_inplace_drains", "drain_inplace_pages", "drain_inplace_dmas", "drain_inplace_write_bytes", "drain_inplace_seed_bytes", "drain_inplace_declines", "drain_inplace_dma_errors", "drain_inplace_dirty_drains" }) |name| {
+    inline for (.{ "write_through_blocks", "write_through_bytes", "write_through_fallbacks", "nt_copy_bytes", "active_block_cow_copies", "active_block_memset_elided_bytes", "active_block_ooo_runs", "active_block_run_table_completions", "overwrite_seed_deferred", "overwrite_seed_materialized", "overwrite_seed_skipped", "write_block_revisits", "parked_pool_refusals", "parked_pool_trimmed_cells", "durable_upload_bytes_escalation", "placed_merge_elides", "drain_inplace_drains", "drain_inplace_pages", "drain_inplace_dmas", "drain_inplace_write_bytes", "drain_inplace_seed_bytes", "drain_inplace_declines", "drain_inplace_dma_errors", "drain_inplace_dirty_drains", "extent_cap_fallbacks" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, @field(stats, name).load() });
     }
     try w.print("\"parked_full_buffer_bytes\":{d},\"parked_buffers\":{d},", .{ stats.parked_full_buffer_bytes.load(), stats.parked_buffers.load() });
@@ -458,6 +479,11 @@ pub const Table = struct {
     index: std.AutoHashMapUnmanaged(Key, *Entry) = .empty,
     lock: jc.SpinLock = .{},
     count: Atomic(u32) = .init(0),
+    /// Live extent entries: raised under `lock` only below `extent_cap`
+    /// (`checkoutExtent`), lowered by an escalation (after its cell is
+    /// taken) and a retire — so it never exceeds the cap.
+    extents: Atomic(u32) = .init(0),
+    extent_cap: u32,
     /// Notified whenever an upload task ends (publish, discard, supersede,
     /// a transient): the JOIN of a second flush of the same block (an
     /// fsync or a RELEASE racing the write-through) waits here instead of
@@ -471,14 +497,14 @@ pub const Table = struct {
     capacity: sync_notify.Notify = .init,
 
     pub fn init(gpa: Allocator, block_size: u32, cap_buffers: u64) Allocator.Error!Table {
-        const cap: usize = @intCast(cap_buffers);
+        const cap: usize = @intCast(activeBlockEntries(cap_buffers));
         const entries = try gpa.alloc(Entry, cap);
         errdefer gpa.free(entries);
         var free = try std.ArrayList(u32).initCapacity(gpa, cap);
         errdefer free.deinit(gpa);
         var i: u32 = @intCast(cap);
         while (i > 0) : (i -= 1) free.appendAssumeCapacity(i - 1);
-        var self: Table = .{ .gpa = gpa, .block_size = block_size, .pool = Pool.init(gpa, block_size, cap_buffers), .entries = entries, .free = free };
+        var self: Table = .{ .gpa = gpa, .block_size = block_size, .pool = Pool.init(gpa, block_size, cap_buffers), .entries = entries, .free = free, .extent_cap = @intCast(extentEntryCap(cap_buffers)) };
         try self.index.ensureTotalCapacity(gpa, @intCast(cap));
         return self;
     }
@@ -619,6 +645,7 @@ pub const Table = struct {
         stats.parked_full_buffer_bytes.add(self.block_size);
         ext.deinit(self.gpa);
         e.repr = .{ .full = cell };
+        _ = self.extents.fetchSub(1, .monotonic);
         e.coverage.setFull(self.block_size);
         e.seed = .seeded;
         e.content_valid = true;
@@ -652,12 +679,22 @@ pub const Table = struct {
     }
 
     /// An extent entry (arm F): the compact sorted list, no block buffer.
+    /// Null = the extents are at `extent_cap` (the caller takes a full
+    /// buffer).
     pub fn checkoutExtent(self: *Table, ino: u64, block: u32, has_existing_bytes: bool, old_binding: ?Binding) ?*Entry {
         self.lock.lock();
         defer self.lock.unlock();
         const key: Key = .{ .ino = ino, .block = block };
         if (self.index.get(key)) |e| return e;
-        const idx = self.free.pop() orelse return null;
+        if (self.extents.load(.monotonic) >= self.extent_cap) {
+            stats.extent_cap_fallbacks.inc();
+            return null;
+        }
+        const idx = self.free.pop() orelse {
+            stats.active_block_table_full.fire("entry table full below the extent cap");
+            return null;
+        };
+        _ = self.extents.fetchAdd(1, .monotonic);
         const e = &self.entries[idx];
         const now = clock.monotonicNs();
         e.* = .{
@@ -782,7 +819,10 @@ pub const Table = struct {
                 self.pool.release(c);
                 stats.parked_full_buffer_bytes.sub(self.block_size);
             },
-            .extent => |*x| x.deinit(self.gpa), // credits the pages' charge
+            .extent => |*x| {
+                x.deinit(self.gpa); // credits the pages' charge
+                _ = self.extents.fetchSub(1, .monotonic);
+            },
         }
     }
 
@@ -1710,6 +1750,19 @@ test "derivations: parked cap max(256, budget/16 ÷ bs), Red halves" {
     try testing.expectEqual(@as(u64, 9), resolveParkedCap(9, 64 * derive.GiB, 4 * derive.MiB));
     try testing.expectEqual(@as(u64, 512), effectiveParkedCap(1024, .red));
     try testing.expectEqual(@as(u64, 1024), effectiveParkedCap(1024, .yellow));
+}
+
+test "derivations: the table's entries = the pool's cells + the extent cap (= the parked cap: cap extents of ≤ B/4 page RAM each beside cap buffers of B)" {
+    try testing.expectEqual(@as(u64, 8), extentEntryCap(8));
+    try testing.expectEqual(@as(u64, 16), activeBlockEntries(8));
+    try testing.expectEqual(@as(u64, 512), activeBlockEntries(parkedCapBuffers(4 * derive.GiB, 4 * derive.MiB)));
+    // The extents' page RAM at the fold bound ≤ a quarter of the parked set's.
+    const bs = 4 * derive.MiB;
+    try testing.expect(extentEntryCap(256) * extent.foldPagesDerived(bs) * PAGE * 4 <= 256 * bs);
+    var t = try Table.init(testing.allocator, @intCast(wt.BS), 8);
+    defer t.deinit();
+    try testing.expectEqual(@as(usize, 16), t.entries.len);
+    try testing.expectEqual(@as(u32, 8), t.extent_cap);
 }
 
 test "the pool and the CoW cell: unique mutates in place; a shared cell copies the covered runs into a fresh one and drops the share; the cap refuses; recycled cells return" {

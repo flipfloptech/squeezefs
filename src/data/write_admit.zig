@@ -563,7 +563,7 @@ pub const WritePath = struct {
             .governor = &self.governor,
             .ram_custody = &ramCustody,
             .ram_custody_ctx = self,
-        }, @intCast(cfg.parked_cap));
+        }, device_overlay.registryCapacity(cfg.parked_cap, pipeline.capBytes(d.budget_bytes), cfg.block_size));
         self.view = .{ .table = &self.table, .overlay = &self.overlay, .epochs = &self.epochs, .locks = &self.locks, .device = d.device };
         return self;
     }
@@ -934,15 +934,14 @@ pub const WritePath = struct {
             //    over a mapped base (a held-open appender's first write
             //    parked here): escalating it would seed the whole block to
             //    land a few touched pages (decision 0003 §AK).
+            //    A first piece past the extent cap takes G's full buffer
+            //    (decision 0003 §AP), never the gate.
             const small = extent.isSmall(pc.len, bs);
             const existing = self.table.get(req.ino, pc.block);
             const base_passthrough = if (live_binding) |b| (if (self.vols.byTag(b.vol_tag)) |v| v.passthrough else false) else true;
             const continues_overlay = if (existing) |x| x.repr == .extent and x.repr.extent.base_deferred else false;
-            if (small and (!stream_adjacent or continues_overlay) and (existing == null or existing.?.repr == .extent) and (existing != null or base_passthrough)) {
-                const e = existing orelse self.table.checkoutExtent(req.ino, pc.block, has_existing, live_binding) orelse {
-                    try self.parkAtPoolCap(io, g, &held, req, pc.block, &gate);
-                    continue;
-                };
+            if (small and (!stream_adjacent or continues_overlay) and (existing == null or existing.?.repr == .extent) and (existing != null or base_passthrough)) arm_f: {
+                const e = existing orelse self.table.checkoutExtent(req.ino, pc.block, has_existing, live_binding) orelse break :arm_f;
                 // No I/O: a hole's page is zeros, a deferred overlay's page
                 // waits under its mask for the base (the fold's seed).
                 e.repr.extent.merge(self.gpa, pc.rel, data) catch return error.OutOfMemory;

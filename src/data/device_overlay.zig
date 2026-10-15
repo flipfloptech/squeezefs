@@ -94,6 +94,18 @@ pub const ACK_EARLY_LADDER: retry.Ladder = .{ .base_ns = 10 * std.time.ns_per_ms
 /// claim loudly — never a hang (the 2026-08-13 fused-lane wedge class).
 pub const SETTLE_BARK_NS: u64 = 30 * std.time.ns_per_s;
 
+/// The registry's records (decision 0003 §AP): `max(parked_cap, ⌈pipe ÷
+/// block⌉)`. An open record is write custody the write-back timer lands —
+/// at most one block each (the gap seed writes the complement), the parked
+/// buffer's unit and drain cost — so the parked cap is its floor; and every
+/// overlay store in flight holds a record, so the write pipeline's byte cap
+/// in blocks keeps the governor, not the registry, the bound on a streaming
+/// writer. Past it a fresh install declines to the accumulation arm, whose
+/// parked-buffer gate parks the writer.
+pub fn registryCapacity(parked_cap: u64, pipe_cap_bytes: u64, block_size: u64) usize {
+    return @intCast(@max(parked_cap, std.math.divCeil(u64, pipe_cap_bytes, block_size) catch unreachable));
+}
+
 comptime {
     assert(MAX_OVERLAY_PAGES == 1024 and CLAIM_WORDS == 16);
 }
@@ -129,6 +141,9 @@ pub const stats = struct {
     pub var overlay_ineligible_ram_custody: counters.ShardedCounter = .{};
     pub var overlay_sub_cap_joins: counters.ShardedCounter = .{};
     pub var overlay_enospc_declines: counters.ShardedCounter = .{};
+    /// A fresh install found every record taken (`registryCapacity`): the
+    /// piece took the next arm, nothing minted.
+    pub var overlay_registry_declines: counters.ShardedCounter = .{};
     pub var overlay_unreachable_declines: counters.ShardedCounter = .{};
     pub var overlay_read_serves: counters.ShardedCounter = .{};
     pub var overlay_read_serve_bytes: counters.ShardedCounter = .{};
@@ -166,7 +181,7 @@ pub const stats = struct {
 
 pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
     try w.print("{{\"overlay_open\":{d},\"overlay_inflight_bytes\":{d},", .{ stats.overlay_open.load(), stats.overlay_inflight_bytes.load() });
-    inline for (.{ "overlay_installs", "overlay_overwrite_installs", "overlay_stores", "overlay_store_bytes", "overlay_overwrite_bytes", "overlay_ack_early_stores", "overlay_ack_early_bytes", "overlay_ack_early_retries", "overlay_short_stores", "overlay_store_fallbacks", "overlay_claim_conflicts", "overlay_governed_stores", "overlay_dma_passthrough_bytes", "overlay_dma_pool_copy_bytes", "overlay_ineligible_sub_cap", "overlay_ineligible_shadow_bound", "overlay_ineligible_range_shared", "overlay_ineligible_ram_custody", "overlay_sub_cap_joins", "overlay_enospc_declines", "overlay_unreachable_declines", "overlay_read_serves", "overlay_read_serve_bytes", "overlay_read_gap_serves", "overlay_read_gap_bytes", "overlay_read_drains", "overlay_window_escalations", "overlay_gap_seeds", "overlay_gap_seed_bytes", "overlay_gap_seed_old_bytes", "overlay_gap_seed_ranged_bytes", "overlay_gap_seed_read_bytes", "overlay_publishes", "overlay_published_bytes", "overlay_epoch_feeds", "overlay_feed_fallbacks", "overlay_supersessions", "overlay_superseded_by_merge", "overlay_superseded_dead_old_binding", "overlay_settle_retries", "overlay_teardown_waits", "writeback_orphan_discards_overlay" }) |name| {
+    inline for (.{ "overlay_installs", "overlay_overwrite_installs", "overlay_stores", "overlay_store_bytes", "overlay_overwrite_bytes", "overlay_ack_early_stores", "overlay_ack_early_bytes", "overlay_ack_early_retries", "overlay_short_stores", "overlay_store_fallbacks", "overlay_claim_conflicts", "overlay_governed_stores", "overlay_dma_passthrough_bytes", "overlay_dma_pool_copy_bytes", "overlay_ineligible_sub_cap", "overlay_ineligible_shadow_bound", "overlay_ineligible_range_shared", "overlay_ineligible_ram_custody", "overlay_sub_cap_joins", "overlay_enospc_declines", "overlay_registry_declines", "overlay_unreachable_declines", "overlay_read_serves", "overlay_read_serve_bytes", "overlay_read_gap_serves", "overlay_read_gap_bytes", "overlay_read_drains", "overlay_window_escalations", "overlay_gap_seeds", "overlay_gap_seed_bytes", "overlay_gap_seed_old_bytes", "overlay_gap_seed_ranged_bytes", "overlay_gap_seed_read_bytes", "overlay_publishes", "overlay_published_bytes", "overlay_epoch_feeds", "overlay_feed_fallbacks", "overlay_supersessions", "overlay_superseded_by_merge", "overlay_superseded_dead_old_binding", "overlay_settle_retries", "overlay_teardown_waits", "writeback_orphan_discards_overlay" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, @field(stats, name).load() });
     }
     inline for (.{ "overlay_fence_drops", "overlay_unpublished_at_fsync", "overlay_ack_early_lost", "overlay_teardown_wait_overlong", "overlay_teardown_nonterminal", "overlay_install_race_under_guard", "overlay_store_superseded_under_guard", "overlay_state_word_corrupt", "overlay_registry_full" }, 0..) |name, i| {
@@ -443,6 +458,10 @@ pub const Registry = struct {
     lock: jc.SpinLock = .{},
     open_count: Atomic(u32) = .init(0),
     births: Atomic(u64) = .init(0),
+    /// Free records promised to installs whose mint runs outside the lock
+    /// (`reserve`): `reserved ≤ free.items.len`, so an install holding a
+    /// reservation always finds its record.
+    reserved: u32 = 0,
 
     pub fn init(gpa: Allocator, capacity: usize) Allocator.Error!Registry {
         const recs = try gpa.alloc(Record, capacity);
@@ -473,11 +492,31 @@ pub const Registry = struct {
         return self.index.get(k);
     }
 
-    /// Install a fresh record (the caller filled everything but `in_use`).
-    /// `error.Exists` = a race the caller's guard should have excluded.
+    /// Promise one free record to an install about to mint; false = every
+    /// record is live or promised.
+    fn reserve(self: *Registry) bool {
+        self.lock.lock();
+        defer self.lock.unlock();
+        if (self.free.items.len <= self.reserved) return false;
+        self.reserved += 1;
+        return true;
+    }
+
+    /// Return a promise the install never used.
+    fn unreserve(self: *Registry) void {
+        self.lock.lock();
+        defer self.lock.unlock();
+        self.reserved -= 1;
+    }
+
+    /// Install a fresh record (the caller filled everything but `in_use`),
+    /// spending the caller's reservation whatever the outcome.
+    /// `error.Exists` = a race the caller's guard should have excluded;
+    /// `error.Full` = the reservation accounting broke.
     fn install(self: *Registry, k: Key, fill: *const Record) error{ Exists, Full }!*Record {
         self.lock.lock();
         defer self.lock.unlock();
+        self.reserved -= 1;
         if (self.index.contains(k)) return error.Exists;
         const idx = self.free.pop() orelse return error.Full;
         const r = &self.records[idx];
@@ -932,8 +971,16 @@ pub const Overlay = struct {
     /// waits for supply: under (3) and with the accumulation arm to fall
     /// to, it YIELDS scarce supply to the flushes that return RAM), fsck
     /// guard + mint owner, the slot vehicle needs the direct leg, the
-    /// OVERWRITE capture in ONE (3.5) section with the install (§5.1).
+    /// OVERWRITE capture in ONE (3.5) section with the install (§5.1). The
+    /// record is reserved BEFORE the mint: a full registry declines with
+    /// nothing minted (`overlay_registry_declines`).
     fn installRecord(self: *Overlay, io: Io, req: StoreRequest) StoreError!?*Record {
+        if (!self.registry.reserve()) {
+            stats.overlay_registry_declines.inc();
+            return null;
+        }
+        var promised = true;
+        defer if (promised) self.registry.unreserve();
         const pm = enospc.allocatePlacedMint(self.deps.picker, .{ .ino = req.ino, .block = req.block }, io, self.deps.valve, self.deps.pressure_hook, true, .none) catch |e| switch (e) {
             error.StorageFull => {
                 stats.overlay_enospc_declines.inc();
@@ -986,11 +1033,13 @@ pub const Overlay = struct {
                 return null;
             }
             fill.old_binding = old;
+            promised = false;
             const r = self.registry.install(fill.key, &fill) catch |e| return self.installFailed(e, &fill, &mint);
             stats.overlay_installs.inc();
             stats.overlay_overwrite_installs.inc();
             return r;
         }
+        promised = false;
         const r = self.registry.install(fill.key, &fill) catch |e| return self.installFailed(e, &fill, &mint);
         stats.overlay_installs.inc();
         return r;
@@ -999,7 +1048,7 @@ pub const Overlay = struct {
     fn installFailed(_: *Overlay, e: error{ Exists, Full }, fill: *Record, mint: *block_alloc.MintedBlockGuard) ?*Record {
         switch (e) {
             error.Exists => stats.overlay_install_race_under_guard.fire("a record appeared under the writer's block guard"),
-            error.Full => stats.overlay_registry_full.fire("the overlay registry is full"),
+            error.Full => stats.overlay_registry_full.fire("an install holding a reservation found the overlay registry full"),
         }
         fill.fsck_guard.?.deinit();
         mint.abandon();
@@ -1696,6 +1745,21 @@ test "the fsync drain covers EVERY open record of the ino, however many: 70 bloc
     while (b < n) : (b += 1) try testing.expect(w.f.map.seam().lookup(44, b) != null);
 }
 
+test "registryCapacity ties to its formula: max(parked_cap, ⌈pipe ÷ block⌉)" {
+    const MiB = derive.MiB;
+    const GiB = derive.GiB;
+    // The shipped derivations at a 4 GiB budget: 256 parked buffers, a
+    // 1 GiB pipe = 256 blocks of 4 MiB.
+    try testing.expectEqual(@as(usize, 256), registryCapacity(256, pipeline.capBytes(4 * GiB), 4 * MiB));
+    // 64 GiB: the pipe's 4,096 blocks outrun the parked cap's 1,024.
+    try testing.expectEqual(@as(usize, 4096), registryCapacity(1024, pipeline.capBytes(64 * GiB), 4 * MiB));
+    // An explicit small parked cap (the storm's 8) keeps the pipe's room.
+    try testing.expectEqual(@as(usize, 256), registryCapacity(8, pipeline.capBytes(4 * GiB), 4 * MiB));
+    // A pipe smaller than the parked set: the parked cap; a partial block rounds up.
+    try testing.expectEqual(@as(usize, 300), registryCapacity(300, 8 * MiB, 4 * MiB));
+    try testing.expectEqual(@as(usize, 3), registryCapacity(1, 8 * MiB + 1, 4 * MiB));
+}
+
 // The write-back storm (16 writers, a registry the parked cap of 8 sized)
 // minted a destination, found the registry full and fired the must-stay-0
 // `overlay_registry_full` on every run.
@@ -1707,13 +1771,17 @@ test "a full registry declines a fresh install BEFORE it mints (`overlay_registr
     var p: [wt.BS / 4]u8 align(4096) = undefined;
     pattern(&p, 0x45);
     const full0 = counters.tripwireCount("overlay_registry_full");
+    const declines0 = stats.overlay_registry_declines.load();
     for (0..2) |b| {
         const o = try w.ov.store(io, .{ .ino = 45, .block = @intCast(b), .rel = 0, .vehicle = .{ .bytes = &p }, .file = TestWorld.striped(@as(u64, b) * wt.BS), .overwrite = false });
         try testing.expect(o == .stored);
     }
+    const free0 = w.f.alloc_a.freeBlocksCount();
     const o3 = try w.ov.store(io, .{ .ino = 45, .block = 2, .rel = 0, .vehicle = .{ .bytes = &p }, .file = TestWorld.striped(2 * wt.BS), .overwrite = false });
     try testing.expect(o3 == .declined);
+    try testing.expectEqual(declines0 + 1, stats.overlay_registry_declines.load());
     try testing.expectEqual(full0, counters.tripwireCount("overlay_registry_full"));
+    try testing.expectEqual(free0, w.f.alloc_a.freeBlocksCount());
     // A join needs no slot.
     const oj = try w.ov.store(io, .{ .ino = 45, .block = 1, .rel = wt.BS / 4, .vehicle = .{ .bytes = &p }, .file = TestWorld.striped(2 * wt.BS), .overwrite = false });
     try testing.expect(oj == .stored);

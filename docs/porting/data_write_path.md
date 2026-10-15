@@ -228,6 +228,8 @@ length floor (join an Open record below the cap, else decline)
 → §7 state screen (striped authority; RAM map present; overwrite ⇒ lever;
    no shadow binding for b; no RAM/staged/extent custody; range clause)
 → registry: join Open | steal-settle Frozen/terminal then decline | INSTALL:
+   [port: reserve a record first — none free ⇒ decline, nothing minted;
+   records = max(parked_cap, ⌈pipe ÷ B⌉), 0003 §AP]
    allocate_placed_block (reserve-before-DMA) → fsck guard + mint owner →
    [overwrite: ONE (3.5) section: capture old_binding ∧ re-check shadow ∧ install]
 → depth-governor permit (admit_segment(len, bs))
@@ -262,7 +264,7 @@ qd32 while data devices idled at qd ≈ 1–1.5 (`design-write-inode-convoy.md:1
 
 | Field | Where | Role |
 |---|---|---|
-| `(ino, block)` | registry key, `scc::HashMap` (`:423`) | one live record per block; a second opener JOINS |
+| `(ino, block)` | registry key, `scc::HashMap` (`:423`) | one live record per block; a second opener JOINS (the port: a fixed registry, 0003 §AP) |
 | `core.old_binding: Option<String>` | `overlay_core.rs:215`, getter `:263` | `None` ⇔ fresh/hole (gaps zeros — law 5); `Some(mapping)` ⇔ OVERWRITE; captured in the SAME (3.5) section as the install (§5.1 one-section rule, `fuse_client.rs:19067-19084`); IMMUTABLE — no mutator exists |
 | `be_id`, `dest_offset`, `device`, `allocator` | `:320-326` | the unpublished destination (durable `vol-` id, never a path) |
 | `fence_token` | `:329` | the ino's DLM token at install; publication re-presents the CURRENT generation |
@@ -836,7 +838,9 @@ Constants: `SQUEEZEFS_FOLD_MAX_EXTENTS` default **64** (`fuse_client.rs:1143-114
 1201`; env wins verbatim); the parked budget `max(256, budget/16 ÷ block_size)`
 buffers' worth (`resolve_parked_cap_buffers :1213-1227`; floor 256 = the shipped
 `MAX_ACTIVE_BLOCK_BUFFERS :8762`, never-regress; Red halves it,
-`mem_budget::effective_parked_cap :1103`).
+`mem_budget::effective_parked_cap :1103`). The port's table holds the parked
+cap's buffers plus as many W2 extents beside them (0003 §AP.3): a first small
+piece past the extent cap takes a full buffer.
 
 ---
 

@@ -1950,6 +1950,77 @@ test "the in-place drain's crash law (the kill rows): a drain killed at every gr
     try testing.expect(w.f.map.seam().lookup(45, 0).?.eql(a));
 }
 
+/// fio's random rewriter's block under the timer (the perf rows of
+/// `rung-10-writeback-timer.md`): a rewrite that happens to be
+/// stream-adjacent parks a DEFERRED full buffer (arm G; W1 declines every
+/// later write of the block on its RAM custody), and the run table's
+/// overflow seeds its complement whole (`NeedsSeed`) — a CONTENT-VALID
+/// buffer over the mapping. Returns the user bytes written.
+fn parkSeededRewrites(w: *WritePath, io: Io, ino: u64) !u64 {
+    const file = World.striped(wt.BS);
+    var page: [PAGE]u8 = undefined;
+    fill(&page, 0x10);
+    _ = w.last_write_end.note(ino, 0, PAGE);
+    const o = try w.write(io, .{ .ino = ino, .offset = PAGE, .payload = .{ .bytes = &page }, .class = .shared, .file = file });
+    try testing.expectEqual(@as(u32, 1), o.count(.accumulate_park));
+    var user: u64 = PAGE;
+    // 65 disjoint 16 B pieces in page 3 overflow the 65-run table.
+    var piece: [16]u8 = undefined;
+    var i: u32 = 0;
+    while (i < cov.CoverageUnion.max_runs) : (i += 1) {
+        fill(&piece, @truncate(0x40 + i));
+        _ = try w.write(io, .{ .ino = ino, .offset = 3 * PAGE + 32 * i, .payload = .{ .bytes = &piece }, .class = .shared, .file = file });
+        user += piece.len;
+    }
+    const e = w.table.get(ino, 0).?;
+    try testing.expect(e.content_valid);
+    return user;
+}
+
+test "random 4 KiB rewrites under the write-back timer (decision 0003 §AJ.7): a CONTENT-VALID buffer seeded over its sole-owner mapping drains its DIRTY pages in place — device = pages(dirty) × P ≤ Σ pages(w) × P (≤ the user bytes for page-aligned rewrites: device ÷ user ≤ 1), never the whole block; no mint, no merge, no epoch shadow, the binding unchanged, every byte exact; the block is custody-free after (W1 takes the next rewrite)" {
+    const io = testing.io;
+    const w = try World.init(testing.allocator, .sync_inline, false);
+    defer w.deinit(testing.allocator);
+    const a = try w.f.publishBlock(47, 0, 0xAA);
+    const file = World.striped(wt.BS);
+    var user = try parkSeededRewrites(w.wp, io, 47);
+    var writes: u64 = 1 + cov.CoverageUnion.max_runs;
+    var page: [PAGE]u8 = undefined;
+    for ([_]u32{ 8, 11, 14 }) |p| {
+        fill(&page, @truncate(0x80 + p));
+        const o = try w.wp.write(io, .{ .ino = 47, .offset = @as(u64, p) * PAGE, .payload = .{ .bytes = &page }, .class = .shared, .file = file });
+        try testing.expectEqual(@as(u32, 1), o.count(.accumulate_park));
+        user += PAGE;
+        writes += 1;
+    }
+    var expect: [wt.BS]u8 = undefined;
+    @memcpy(&expect, w.wp.table.get(47, 0).?.repr.full.data[0..wt.BS]);
+    w.f.dev.resetLedger();
+    const used = w.f.alloc_a.usedBlocks();
+    const merges = w.f.map.merges.items.len;
+    const wt0 = accumulate.stats.write_through_bytes.load();
+    const shadow0 = epoch_mod.stats.rewrite_shadow_bytes.load();
+    const drained = w.wp.drainAged(io, 47, clock.monotonicNs());
+    try testing.expect(drained.landed and drained.kept_born_ns == null);
+    try testing.expect(!w.wp.table.has(47, 0));
+    // The dirty pages: 1, 3, 8, 11, 14 — five DMAs of a page each.
+    try testing.expectEqual(@as(u64, 5 * PAGE), w.f.dev.writeBytesTotal());
+    try testing.expect(w.f.dev.writeBytesTotal() <= writes * PAGE);
+    try testing.expectEqual(wt0, accumulate.stats.write_through_bytes.load());
+    try testing.expectEqual(shadow0, epoch_mod.stats.rewrite_shadow_bytes.load());
+    try testing.expectEqual(used, w.f.alloc_a.usedBlocks());
+    try testing.expectEqual(merges, w.f.map.merges.items.len);
+    try testing.expect(w.f.map.seam().lookup(47, 0).?.eql(a));
+    var got: [wt.BS]u8 = undefined;
+    w.f.dev.peek(a.vol_tag, a.offset, &got);
+    try testing.expectEqualSlices(u8, &expect, &got);
+    // Custody-free: the next page-aligned rewrite is W1's, 1:1.
+    fill(&page, 0x99);
+    const o = try w.wp.write(io, .{ .ino = 47, .offset = 6 * PAGE, .payload = .{ .bytes = &page }, .class = .shared, .file = file });
+    try testing.expectEqual(@as(u32, 1), o.count(.patch));
+    try testing.expectEqual(@as(u64, 6 * PAGE), w.f.dev.writeBytesTotal());
+}
+
 test "the D3 fold seam (defrag --fold): `foldTargets` names the inos holding parked W2 extents (ascending, deduped — a full-buffer park is not a target), `foldParked` kicks each through the EXISTING fold — sole-owner passthrough blocks land in place at the page grain and retire, device ÷ user ≤ the §J in-place bound, the bindings unchanged, bytes exact; nothing left parked as an extent; a second census is empty" {
     const io = testing.io;
     const w = try World.init(testing.allocator, .sync_inline, false);

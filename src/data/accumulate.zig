@@ -1801,7 +1801,7 @@ test "write-through of a completed fresh block: 1 copy + 1 DMA, allocate unstabl
     try testing.expectEqual(prof.last - prof.t0, sum);
 }
 
-test "stale_inflight_upload_never_publishes_and_newest_bytes_win: a write landing between the snapshot and the revalidation supersedes the upload (the fresh offset is freed, nothing published) and the re-drive publishes the newest bytes" {
+test "a superseded upload publishes its snapshot, newest bytes win (decision 0003 §AJ.7): a write landing between the snapshot and the revalidation supersedes the upload — the snapshot's DMA publishes (no mint abandoned), the entry stays parked over it, and the re-drive an unbounded flush owes publishes the newest bytes" {
     const io = testing.io;
     const w = try UploadWorld.init(testing.allocator);
     defer w.deinit(testing.allocator);
@@ -1841,10 +1841,11 @@ test "stale_inflight_upload_never_publishes_and_newest_bytes_win: a write landin
     const d = uploadParkedBlock(&w.table, w.deps(), io, 6, 0, &prof);
     prof.finish();
     try testing.expectEqual(Disposition.published, d);
-    try testing.expectEqual(abandons0 + 1, block_alloc.stats.unpublished_mint_abandons.load()); // the superseded mint went back
-    try testing.expectEqual(sup0 + 1, pipeline.stats.write_pipeline_supersessions.load());
-    try testing.expectEqual(@as(usize, 1), w.f.map.merges.items.len); // the stale pass published nothing
-    try testing.expectEqual(used0 + 1, w.f.alloc_a.usedBlocks()); // the orphan offset returned; one block owned
+    try testing.expectEqual(abandons0, block_alloc.stats.unpublished_mint_abandons.load()); // no DMA thrown away
+    try testing.expectEqual(sup0, pipeline.stats.write_pipeline_supersessions.load());
+    try testing.expectEqual(@as(usize, 2), w.f.map.merges.items.len); // the snapshot, then the newest
+    try testing.expectEqual(used0 + 1, w.f.alloc_a.usedBlocks()); // the snapshot's block displaced and freed; one block owned
+    try testing.expect(!w.table.has(6, 0));
     const b = w.f.map.seam().lookup(6, 0).?;
     var got: [wt.BS]u8 = undefined;
     w.f.dev.peek(wt.VOL_A, b.offset, &got);

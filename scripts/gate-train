@@ -42,7 +42,9 @@ failures() {  # failed tests by name, else the steps that failed on their own (n
   {
     grep -E "^error: '|^error: while executing test '" "$1" | sed -E "s/^error: (while executing test )?'([^']*)'.*/\2/"
     awk '/^Build Summary/{f=1} f' "$1" | grep -E ' (failure|[0-9]+ errors?|[0-9]+ failed)' | grep -v transitive | sed -E 's/^[ |+-]*//; s/ (failure|[0-9]+ errors?|[0-9]+ failed).*//' | sed 's/^/step: /'
-    grep -q 'terminated with signal KILL' "$1" && echo "a compiler was OOM-killed (signal KILL)"
+    # The build runner's own wording for a step whose command was killed (a test's
+    # deliberately killed daemon prints "daemon A ended terminated with signal KILL").
+    grep -Eq '^error: [^ ]*zig[^ ]* terminated with signal KILL' "$1" && echo "a build step's command was killed (signal KILL — OOM?)"
   } | sort -u | head -8 | paste -sd ';' -
 }
 

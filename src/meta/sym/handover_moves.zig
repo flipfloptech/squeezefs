@@ -197,6 +197,7 @@ const cr = @import("control_records.zig");
 const grant_record = @import("grant_record.zig");
 const tree = @import("../tree.zig");
 const smo = @import("../smo.zig");
+const alloc_ext = @import("../alloc_ext.zig");
 
 /// The manager's record of `appender_id`'s grant as runs (empty: none).
 fn grantRecordOf(gpa: std.mem.Allocator, be: *KvBackend, appender_id: u32) !std.ArrayList(cr.GrantRun) {
@@ -316,6 +317,111 @@ test "linux: THE CUSTODY OF A MOVED TREE'S IMAGES (charter §5.5 'Extent grants'
     var rec = try grantRecordOf(gpa, be0, me);
     defer rec.deinit(gpa);
     for (images_now.items) |e| try testing.expect(!runsContain(rec.items, e));
+}
+
+/// Counts the C6 bitmap pages that land (`backend.test_seams`).
+const PageCount = struct {
+    n: std.atomic.Value(u32) = .init(0),
+
+    fn hook(self: *PageCount) @import("../node_cache.zig").Hook {
+        return .{ .ctx = self, .call = call };
+    }
+
+    fn call(ctx: *anyopaque) void {
+        const self: *PageCount = @ptrCast(@alignCast(ctx));
+        _ = self.n.fetchAdd(1, .acq_rel);
+    }
+};
+
+test "linux: THE MANAGER'S KILL WITH A LIVE LESSEE (charter §5.5 'Extent grants', 0003 §U.1): A mints a slot tree (its root one image claimed in A's RAM), B takes the slot — the handover's cycle lands A's claim on A's bitmap BEFORE the grant's entry moves the image into B's record — and compacts the root (the image retires into B's pool); A is killed: the reopened manager holds every extent B's record names allocated (its claims never hand out B's pooled image), and its mount's reachability walk never visits B's tree (a live lessee's projection: its interior may name extents the lessee recycled)" {
+    const gpa = testing.allocator;
+    const s = try meta_set.TestSet.create(gpa, "custody-cut", 1);
+    defer s.destroy();
+    try s.env.put("SQUEEZEFS_MW_BIND", "127.0.0.1:0");
+    var cut_buf: [192]u8 = undefined;
+    const cut = try std.fmt.bufPrintSentinel(&cut_buf, "{s}.cut", .{s.paths[0]}, 0);
+    defer _ = std.os.linux.unlink(cut.ptr);
+    var pages: PageCount = .{};
+    defer backend.test_seams = .{};
+    var moved: u64 = undefined;
+    var me: u32 = undefined;
+    var slot_of_b: u16 = undefined;
+    {
+        const set = try s.open();
+        defer set.close();
+        var locks = try dlm.Manager.init(gpa, 64);
+        defer locks.deinit();
+        const bound = try xv.set_bind.Bound.create(gpa, s.io(), set, &locks, &s.env);
+        defer bound.destroy(gpa);
+        const plane = (try wire_plane.WirePlane.start(gpa, s.io(), set, &s.env, 4, 1 << 30, &bound.plane, false)).?;
+        defer plane.stop();
+        const be0 = set.volumes[0];
+        const slot = try managerRotorSlot(gpa, be0);
+        slot_of_b = slot;
+        const b = try MetaSet.open(gpa, s.io(), s.pathList(), .{ .env = &s.env, .cache_budget_bytes = 64 << 20, .cpus = 4, .join = .{ .mountpoint = "/build/tmp/mnt-custody-cut-b", .endpoint = plane.advertised } });
+        defer b.close();
+        const bj = b.volumes[0];
+        me = bj.joined.?.appenderId();
+        try be0.checkpointNow();
+        backend.test_seams.after_bitmap_page = pages.hook();
+        try fillSlot(be0, slot, 1, &@as([200]u8, @splat('a')));
+        var images_a: std.ArrayList(u64) = .empty;
+        defer images_a.deinit(gpa);
+        try be0.collectTreeExtents(be0.slotTree(slot).?, &images_a);
+        try testing.expectEqual(@as(usize, 1), images_a.items.len);
+        moved = images_a.items[0];
+        try testing.expectEqual(acquire.Verbs.OfferResult.offered, try be0.slots.verbs.offerSlot(lt.MANAGER, slot, me, std.math.maxInt(u64)));
+        const sink = bj.slots.carriageSink();
+        sink.offered(sink.ctx, slot, lt.MANAGER);
+        try testing.expect(bj.slots.table.view(slot).leasedBy(me));
+        {
+            var rec = try grantRecordOf(gpa, be0, me);
+            defer rec.deinit(gpa);
+            try testing.expect(runsContain(rec.items, moved));
+        }
+        // The handover's cycle (`cycleOnce`) landed A's claim first.
+        try testing.expect(pages.n.load(.acquire) >= 1);
+        // B compacts the root: A's image retires through B's SMO context and
+        // B's checkpoints cover it into B's pool.
+        const t = bj.slotTree(slot).?;
+        {
+            bj.smo_lock.lockUncancelable(bj.io);
+            defer bj.smo_lock.unlock(bj.io);
+            const n = try t.getNode(t.rootPtr().addr);
+            defer n.release();
+            var out: smo.MaintenanceOutcome = .{};
+            try testing.expect(try smo.compactForDefrag(t, &bj.smo_ctx, n, &out));
+        }
+        var cycles: u32 = 0;
+        while (bj.alloc.pendingCount() != 0 and cycles < 4) : (cycles += 1) try bj.checkpointNow();
+        try testing.expect(!bj.alloc.isAllocated(moved));
+        // The kill of A: its device as it stands.
+        try backend.snapshotImage(s.paths[0], cut);
+    }
+    const copy = try KvBackend.open(gpa, s.io(), cut, .{ .env = &s.env, .cache_budget_bytes = 64 << 20, .cpus = 4, .index = 1 });
+    defer copy.close();
+    var rec = try grantRecordOf(gpa, copy, me);
+    defer rec.deinit(gpa);
+    try testing.expect(runsContain(rec.items, moved));
+    var free_named: usize = 0;
+    for (rec.items) |r| {
+        var e = r.start;
+        while (e < r.start + r.len) : (e += 1) free_named += @intFromBool(!copy.alloc.isAllocated(e));
+    }
+    try testing.expectEqual(@as(usize, 0), free_named);
+    // The walk's extents: every tree but B's projection.
+    var maintained: u64 = 0;
+    var extents: std.ArrayList(u64) = .empty;
+    defer extents.deinit(gpa);
+    for (copy.trees.load()) |tr| {
+        if (tr == copy.slotTree(slot_of_b).?) continue;
+        extents.clearRetainingCapacity();
+        try copy.collectTreeExtents(tr, &extents);
+        maintained += extents.items.len;
+    }
+    const walked = alloc_ext.meta_kv_mount_reach_walk_extents.load();
+    std.debug.print("\nmanager kill with a live lessee: B's pooled image {d} allocated {}; the mount walked {d} extent(s), the maintained trees hold {d}\n", .{ moved, copy.alloc.isAllocated(moved), walked, maintained });
+    try testing.expectEqual(maintained, walked);
 }
 
 // ---------------------------------------------------------------------------

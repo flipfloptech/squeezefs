@@ -3194,7 +3194,7 @@ const seek_hole: u32 = 4;
 /// until the conversion lands a concurrent reader of the range sees zeros —
 /// then O_DIRECT reads, never the page cache of a direct-written file
 /// (open(2): the two must not mix on one file).
-fn snapshotImage(src: []const u8, dst: []const u8) !void {
+pub fn snapshotImage(src: []const u8, dst: []const u8) !void {
     var zsrc: [linux.PATH_MAX]u8 = undefined;
     const src_z = try align_probe.pathZ(&zsrc, src);
     const src_rc = linux.open(src_z, .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .DIRECT = true }, 0);

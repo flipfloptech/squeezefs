@@ -171,6 +171,16 @@ pub const Reply = struct {
     inode: ?InodeValue,
 };
 
+/// The holder's truncate face (decision 0003 §AL.6): a shipped size change
+/// runs the filesystem's own size path at the holder — the custody settle,
+/// the map clip and the shrink's zero tail, a grow's extension zeros landed
+/// before the size — never the size alone (a shrink left the bytes past the
+/// new EOF to read back after a grow; a grow exposed the EOF block's tail).
+pub const TruncateFace = struct {
+    ctx: *anyopaque,
+    truncate: *const fn (ctx: *anyopaque, global: u64, size: u64) errors.Error!void,
+};
+
 pub const ShipError = error{ OutOfMemory, SlotMoved, HolderUnreachable, Deferred, Io, Rejected, ValueTooLarge, NoAttribute };
 
 pub fn coreError(e: ShipError) errors.Error {
@@ -374,9 +384,17 @@ pub fn RecordShipService(comptime Store: type) type {
         /// never a torn face); a holder without one (a volume-less set)
         /// rejects every shipped publish.
         publish: std.atomic.Value(?*const PublishFace) = .init(null),
+        /// The filesystem's truncate face (armed with the publish face; the
+        /// same release/acquire pair). A holder without one rejects every
+        /// shipped size change.
+        truncate: std.atomic.Value(?*const TruncateFace) = .init(null),
 
         pub fn armPublish(self: *Self, face: ?*const PublishFace) void {
             self.publish.store(face, .release);
+        }
+
+        pub fn armTruncate(self: *Self, face: ?*const TruncateFace) void {
+            self.truncate.store(face, .release);
         }
 
         pub fn register(self: *Self, svc: *service.Service) void {
@@ -431,6 +449,17 @@ pub fn RecordShipService(comptime Store: type) type {
         /// ordering law a reader relies on).
         pub fn apply(self: *Self, global: u64, call: Call) ShipError!Reply {
             if (!self.plane.isLocal(global)) return error.SlotMoved;
+            // A size change runs the holder's own size path first (its
+            // commit carries the size); the verb's other fields ride the
+            // entry below.
+            if (call == .setattr) if (call.setattr.size) |sz| {
+                const face = self.truncate.load(.acquire) orelse return error.Rejected;
+                face.truncate(face.ctx, global, sz) catch |e| return switch (e) {
+                    error.OutOfMemory => error.OutOfMemory,
+                    error.SlotMoved => error.SlotMoved,
+                    else => error.Io,
+                };
+            };
             const a = &self.plane.apply;
             const k = route_table.effectiveIno(global);
             var v = (a.readInode(global) catch return error.Io) orelse return error.Io;

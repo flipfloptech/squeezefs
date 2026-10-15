@@ -564,6 +564,7 @@ fn mountMain(ctx: *Ctx) u8 {
         plane.bindForeignLayout(wp.foreignLayout());
         plane.bindForeignPublish(wp.foreignPublish());
         wp.bindServedPublish(plane.servedPublishFace());
+        wp.bindServedTruncate(fs.servedTruncateFace());
         // A recall purges the plane's tiers of the object's blocks before
         // it acks (the plane outlives the wire).
         wp.sink.bindPlane(plane);

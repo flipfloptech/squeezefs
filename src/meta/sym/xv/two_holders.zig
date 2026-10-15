@@ -1171,6 +1171,39 @@ const RamPublish = struct {
     }
 };
 
+test "decision 0003 §AL.6 — a shipped size change runs the HOLDER's own size path: unarmed, the holder rejects it (never the size alone — a shrink left the bytes past the new EOF to read back after a grow, a grow exposed the EOF block's tail); armed, the truncate face runs once with the size, and the verb's other fields ride the entry" {
+    const gpa = testing.allocator;
+    const f = try TwoHolders.init(gpa, testing.io, .{}, .{});
+    defer f.deinit();
+    var view: HolderView = .{};
+    var rs_b: RecordShipService = .{ .plane = &f.b.plane, .sink = view.sink() };
+    rs_b.register(&f.b.svc);
+    const file = gino(50, 3);
+    try f.b.seedFile(file, 1);
+    const size0 = (try f.b.inode(file)).?.size;
+    try testing.expectError(error.Rejected, record_ship.ship(f.a.plane.resolver, 0, file, .{ .setattr = .{ .size = 1 << 20 } }, 0));
+    try testing.expectEqual(size0, (try f.b.inode(file)).?.size);
+    const Rec = struct {
+        calls: u32 = 0,
+        global: u64 = 0,
+        size: u64 = 0,
+        fn run(ctx: *anyopaque, global: u64, size: u64) errors.Error!void {
+            const r: *@This() = @ptrCast(@alignCast(ctx));
+            r.calls += 1;
+            r.global = global;
+            r.size = size;
+        }
+    };
+    var rec: Rec = .{};
+    const face: record_ship.TruncateFace = .{ .ctx = &rec, .truncate = &Rec.run };
+    rs_b.armTruncate(&face);
+    const rep = (try record_ship.ship(f.a.plane.resolver, 0, file, .{ .setattr = .{ .size = 1 << 20, .mode = 0o640 } }, 0)).?;
+    try testing.expectEqual(@as(u32, 1), rec.calls);
+    try testing.expectEqual(file, rec.global);
+    try testing.expectEqual(@as(u64, 1 << 20), rec.size);
+    try testing.expectEqual(@as(u32, S.IFREG | 0o640), rep.inode.?.mode);
+}
+
 test "record ship: a chmod/setxattr/removexattr/layout publish of a FOREIGN-slot file lands at its holder as ONE verb each, under the holder's door, and the holder invalidates its own attr cache and kernel view (INVAL_INODE then PRUNE); the publish carries its DMA proofs to the holder's face and is REJECTED where no face is armed; a local file ships nothing; a slot-moved answer redirects once; ships ≡ served" {
     const gpa = testing.allocator;
     const f = try TwoHolders.init(gpa, testing.io, .{}, .{});

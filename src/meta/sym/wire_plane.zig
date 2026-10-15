@@ -403,6 +403,7 @@ pub const WirePlane = struct {
     /// The data plane's publish face for shipped layout publishes
     /// (`bindServedPublish`; its address is what `record_svc` arms).
     served_publish: xv.record_ship.PublishFace = undefined,
+    served_truncate: xv.record_ship.TruncateFace = undefined,
     t_owner_ms: u64,
     /// This mount's read divert (charter §5.5 "Every writer is also a
     /// token client of the holders it writes to"): a slot another
@@ -1303,6 +1304,13 @@ pub const WirePlane = struct {
     pub fn bindServedPublish(self: *WirePlane, face: @import("xv/record_ship.zig").PublishFace) void {
         self.served_publish = face;
         self.record_svc.armPublish(&self.served_publish);
+    }
+
+    /// Arm the holder side of shipped size changes with the filesystem's
+    /// own size path (decision 0003 §AL.6).
+    pub fn bindServedTruncate(self: *WirePlane, face: xv.record_ship.TruncateFace) void {
+        self.served_truncate = face;
+        self.record_svc.armTruncate(&self.served_truncate);
     }
 
     fn foreignLayoutFn(ctx: *anyopaque, gpa: Allocator, ino: u64) errors.Error!@import("../../data/plane.zig").DataPlane.ForeignLayout.Verdict {

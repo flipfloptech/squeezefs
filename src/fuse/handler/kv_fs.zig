@@ -1981,6 +1981,13 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 // (charter §5.5 "Record-level mutations of a foreign-slot
                 // file"); the reply is the holder's folded record.
                 const req = a.attr.toEconomy();
+                // This writer's custody of the file lands (and its barrier
+                // runs) before the holder's size path reads the layout
+                // (§AL.6): the holder cannot land another member's RAM.
+                if (req.size != null and self.data.hasVolumes()) {
+                    self.data.flushCustody(self.io, local);
+                    try self.data.barrierData(self.io, &.{local});
+                }
                 const rep = try self.shipRecord(a.ino, .{ .setattr = .{ .mode = req.mode, .uid = req.uid, .gid = req.gid, .size = req.size, .atime = req.atime, .mtime = req.mtime, .ctime = req.ctime } });
                 return self.attrReply(a.ino, rep.inode orelse return error.FileNotFound);
             }
@@ -3125,6 +3132,22 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 total += try self.drainTimesBatch(c, inos_of_slot.items[i..@min(i + dlm.max_requests, inos_of_slot.items.len)]);
             }
             return total;
+        }
+
+        /// The holder's truncate face (decision 0003 §AL.6): a non-holder's
+        /// shipped size change runs THIS filesystem's size path — the
+        /// settle, the clip, the zero tail, the extension zeros — on the
+        /// wire service's own op context.
+        pub fn servedTruncateFace(self: *Self) sym_xv.record_ship.TruncateFace {
+            return .{ .ctx = self, .truncate = &servedTruncate };
+        }
+
+        fn servedTruncate(ctx: *anyopaque, global: u64, size: u64) errors.Error!void {
+            const self: *Self = @ptrCast(@alignCast(ctx));
+            var trace = op_trace.OpTrace.begin(0, .other);
+            defer trace.finish();
+            var c: Ctx = .{ .unique = 0, .uid = 0, .gid = 0, .pid = 0, .io = self.io, .trace = &trace, .wd_slot = null, .window = &.{} };
+            _ = try self.setattr(&c, .{ .ino = global, .attr = .{ .size = size } });
         }
 
         /// The handover's step 0 as the plane calls it (its own op context:

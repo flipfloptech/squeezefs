@@ -822,7 +822,9 @@ pub const JournalLane = struct {
 
     fn freeCell(self: *JournalLane, idx: u32) void {
         self.cells[idx].done.reset();
-        if (!self.free_cells.tryPush(idx)) stats.queue_push_with_cell.fire("a cell could not return to the free list");
+        // Every cell lives in the ring and every caller takes: a refusal is a
+        // taker mid-pop on the wrap cell, waited out (decision 0003 §AI.4).
+        if (!self.free_cells.pushSpinUnlessFull(idx)) stats.queue_push_with_cell.fire("a cell met a full free list (a double give-back)");
     }
 
     /// Publish a filled cell. A caller on the lane thread (the pass fiber,

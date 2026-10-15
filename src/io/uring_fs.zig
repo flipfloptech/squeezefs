@@ -189,7 +189,7 @@ const FutexMutex = struct {
 
 /// The caller → worker channel: the ONE bounded MPMC carrying cell indices,
 /// plus the pool's own consumer park (idle workers sleep on `epoch`;
-/// producers wake one). Producers never block (`trySend`).
+/// producers wake one). Producers never park (`trySend`).
 const ParkedQueue = struct {
     ring: mpmc.BoundedMpmc(u32),
     /// Bumped by every send and by close; the consumers' futex word.
@@ -212,7 +212,10 @@ const ParkedQueue = struct {
         // once more after joining them (Pool.shutdown), so nothing is
         // stranded.
         if (self.closed.load(.seq_cst)) return error.Closed;
-        if (!self.ring.tryPush(idx)) return error.Full;
+        // The ring holds at most the cell pool's population and several
+        // workers pop: a refusal short of full is a worker mid-pop on the
+        // wrap cell, waited out (`pushSpinUnlessFull`).
+        if (!self.ring.pushSpinUnlessFull(idx)) return error.Full;
         _ = self.epoch.fetchAdd(1, .seq_cst);
         // seq_cst: a consumer that registered as a sleeper before our epoch
         // bump is seen here; one that registers after sees the bump.
@@ -480,8 +483,7 @@ pub const Stats = struct {
     /// CAS and its sequence store (the wrap cell still filled).
     cell_return_respins: counters.ShardedCounter = .{},
     /// Cells and the queue share one bound, so neither can happen: a held
-    /// cell could not return to the free list / the queue refused a push
-    /// while a cell was held.
+    /// cell met a FULL free list / a FULL queue (a double give-back).
     cell_return_refused: counters.Tripwire = .init("uring_fs_cell_return_refused"),
     queue_push_with_cell: counters.Tripwire = .init("uring_fs_queue_push_refused_with_cell"),
     phases: [4]counters.ShardedLatencyHistogram = @splat(.{}),
@@ -1099,10 +1101,14 @@ pub const Pool = struct {
         return idx;
     }
 
+    /// The free list holds every cell and every caller takes, so a refused
+    /// give-back is a taker between its dequeue CAS and its sequence store:
+    /// counted and waited out, never dropped (decision 0003 §AI.4; model
+    /// `sync/mpmc_pool_model.zig`).
     fn freeCell(self: *Pool, idx: u32) void {
         if (self.free_cells.tryPush(idx)) return;
         stats.cell_return_respins.inc();
-        stats.cell_return_refused.fire("a request cell could not return to the free list");
+        if (!self.free_cells.pushSpinUnlessFull(idx)) stats.cell_return_refused.fire("a request cell met a full free list (a double give-back)");
     }
 
     /// Worker side: publish the outcome; when the caller abandoned its

@@ -82,6 +82,27 @@ pub fn BoundedMpmc(comptime T: type) type {
             while (!self.tryPush(item)) std.atomic.spinLoopHint();
         }
 
+        /// `pushSpin` that keeps its owner's tripwire live: a refusal while
+        /// the ring is not full (a pop mid-flight on the wrap cell) is waited
+        /// out, but a FULL ring — the owner's population bound broken, a
+        /// double give-back — answers false instead of spinning forever.
+        /// No oversizing replaces the wait: a popper preempted between its
+        /// CAS and its store is lapped by any finite ring (the model
+        /// `sync/mpmc_pool_model.zig`).
+        pub fn pushSpinUnlessFull(self: *Self, item: T) bool {
+            while (!self.tryPush(item)) {
+                // `dequeue_pos` read AFTER `enqueue_pos` (acquire keeps the
+                // order) can only have grown, so `e − d` under-reads the
+                // occupancy and "full" was true when `e` was read; signed,
+                // since `d` may have passed `e` meanwhile.
+                const e = self.enqueue_pos.load(.acquire);
+                const used: isize = @bitCast(e -% self.dequeue_pos.load(.monotonic));
+                if (used >= @as(isize, @intCast(self.cells.len))) return false;
+                std.atomic.spinLoopHint();
+            }
+            return true;
+        }
+
         /// No item at the consumer's position — a HINT (relaxed: a push may
         /// land a moment later; the lane's ack-spin asks it before spinning,
         /// decision 0003 §AB.4).
@@ -146,6 +167,18 @@ test "bounded MPMC queue: FIFO, full refuses, wraps, empty is null" {
     var tiny = try Q.init(testing.allocator, 1);
     defer tiny.deinit(testing.allocator);
     try testing.expectEqual(@as(usize, 2), tiny.capacity());
+}
+
+test "pushSpinUnlessFull: lands when there is room, answers false on a FULL ring (a double give-back) instead of spinning, and the refused item never enters" {
+    const Q = BoundedMpmc(u32);
+    var q = try Q.init(testing.allocator, 2);
+    defer q.deinit(testing.allocator);
+    try testing.expect(q.pushSpinUnlessFull(0));
+    try testing.expect(q.pushSpinUnlessFull(1));
+    try testing.expect(!q.pushSpinUnlessFull(1));
+    try testing.expectEqual(@as(?u32, 0), q.tryPop());
+    try testing.expectEqual(@as(?u32, 1), q.tryPop());
+    try testing.expectEqual(@as(?u32, null), q.tryPop());
 }
 
 test "bounded MPMC queue: 8 producers × 1 consumer deliver every item exactly once" {

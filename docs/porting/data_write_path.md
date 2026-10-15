@@ -664,10 +664,11 @@ loop:
         publish_block(offset); purge_block_key(new_key)              (:22911-22983)
     StorageFull ⇒ close_rewrite_epoch(ino, token) succeeded ⇒ rewrite_shadow_fallbacks
                  + continue (KD-1.7 ENOSPC early-close); else serialized path
-  (3) lock: current_epoch ≠ snapshot epoch ⇒ SUPERSEDED: abandon_unpublished_offset
-            (the orphan was never named), write_pipeline_supersessions,
-            write_pipeline_superseded_bytes; entry gone ⇒ return; else continue
-            (re-drive with the newest bytes)                             (:21946-21974)
+  (3) lock: current_epoch ≠ snapshot epoch ⇒ SUPERSEDED. The reference abandoned the
+            offset and re-drove (:21946-21974); the port (decision 0003 §AJ.7) PUBLISHES
+            the snapshot (one consistent image at its stamp), keeps the entry parked with
+            the pages written since over the published key, and re-drives only for writes
+            its caller owes (`write_pipeline_superseded_publishes`)
   current ⇒ upload_block_publish_phase(…) under the held guard (merge / shadow record),
             retire_parked_overlay, write_through_{blocks,bytes}, upload_invalidation_tail
             UNDER the guard (the 2026-08-04 crash: the tail's second retire raced a new
@@ -697,8 +698,10 @@ ONE DMA per contiguous page run, the W1 postlude, the entry retired; no seed of 
 block, no fresh block, no merge, no epoch. `drain_inplace_{drains,pages,dmas,write_bytes,
 seed_bytes,declines,dma_errors}`; `drain_inplace_write_bytes` is a device-write byte arm.
 An extending append's drain costs `pages(u, 1) × P` where the reference's whole-block
-escalation wrote `B` and read `B`. `write_through_bytes` and `write_pipeline_superseded_bytes`
-count the DMA'd (stored) length; both are device-write arms (§AK.6).
+escalation wrote `B` and read `B`. A CONTENT-VALID buffer over the binding its clean pages
+equal (`clean_base`) drains its dirty pages the same way (§AJ.7, `drain_inplace_dirty_drains`
+inside `drain_inplace_drains`): `pages(dirty) × P` per pass. `write_through_bytes` counts the
+DMA'd (stored) length — a superseded snapshot's publish included (§AK.6, §AJ.7).
 
 ### 5.4 The rewrite epoch (`routing.rs:1592-1608`, `:16407-16537`, `:16726-16884`)
 
@@ -1175,7 +1178,7 @@ W2: `parked_extent_bytes` (gauge, sheddable via fold), `extent_parks`,
 Pipeline: `write_pipeline_inflight_{bytes,blocks}` (gauges), `write_pipeline_
 admission_waits`, `write_pipeline_admission_tick_wakes` (tripwire-class),
 `write_pipeline_depth_target[_base]`, `write_pipeline_depth_probe_{ups,backoffs}`,
-`write_pipeline_supersessions`, `write_pipeline_superseded_bytes`,
+`write_pipeline_superseded_publishes`,
 `write_pipeline_phase_ns` (12 histograms); **must-stay-0:** `write_pipeline_fence_drops`
 on a healthy mount.
 
@@ -1330,7 +1333,7 @@ blocks_intact`. `tests/striped_overwrite_lazy_seed_tests.rs`: `full_coverage_ove
 reads_nothing_and_is_byte_exact`, `partial_coverage_seeds_old_bytes_at_flush`,
 `{truncate,punch,cfr}_inside_deferral_window`. `tests/write_supersession_tests.rs`
 (the upload stall seam): `stale_inflight_upload_never_publishes_and_newest_bytes_win`
-(`write_pipeline_supersessions == 1`, orphan freed); `flush_that_wins_makes_the_
+(the port's law differs, §AJ.7: the snapshot publishes, the newest bytes still win); `flush_that_wins_makes_the_
 stalled_task_a_counted_noop`; `inplace_lever_keeps_the_serialized_upload`.
 `tests/pipeline_inval_tail_race_tests.rs`: `detached_inval_tail_cannot_retire_a_
 concurrent_writers_parked_entry`. `tests/inplace_overwrite_tests.rs`: `eligible_full_

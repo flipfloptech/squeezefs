@@ -231,8 +231,8 @@ cli/smoke.zig:1352-1379`): `admit_write_{overlay,inplace,accumulate,inline}_byte
 transport_zc_write_{extract,direct}_bytes + fuse_truncate_zero_tail_bytes`;
 `read_user_bytes ≡ read_copy_dest_bytes + read_copy_bounce_bytes + read_dest_dma_bytes +
 read_zc_serve_bytes + read_zc_pool_serve_bytes`; `terminal_frees ≡ block_free_reclaim_queued
-+ block_free_reclaim_elided`; `unpublished_mint_abandons ≤ write_pipeline_supersessions +
-write_pipeline_discards`; the transport's `parked_commits ≡ unparked_commits` and
++ block_free_reclaim_elided`; `unpublished_mint_abandons ≤
+write_pipeline_discards` (a superseded upload publishes, decision 0003 §AJ.7); the transport's `parked_commits ≡ unparked_commits` and
 `fast_dispatch_serves + fusions + demotes ≡ READs` (charter §4). The inode states nothing
 new: it is the ONE place every term of every identity is readable in one snapshot.
 

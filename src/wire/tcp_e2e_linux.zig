@@ -222,10 +222,14 @@ test "tcp e2e: a connection retiring while the listener stops reads nothing of t
     s.close(testing.io);
     try testing.expect(rv.awaitPhase(1));
     // live is 0: the stop frees the listener while the retiring thread is
-    // parked past its decrement.
+    // parked past its decrement — and that thread has already taken its
+    // connection out of the process-wide gauge (a write after `stop`
+    // returned would land under whatever listener the process starts next).
     l.stop();
+    const gauge_at_stop = stats.cluster_wire_live_connections.load();
     rv.advance(2);
     try testing.expect(rv.awaitPhase(3));
+    try testing.expectEqual(@as(u64, 0), gauge_at_stop);
     try testing.expectEqual(@as(u64, 0), stats.cluster_wire_live_connections.load());
 }
 

@@ -78,6 +78,9 @@ pub const stats = struct {
     pub var block_grant_inline_topups: counters.ShardedCounter = .{};
     /// Shipped-free batches flushed at the cadence.
     pub var free_ship_cadence_flushes: counters.ShardedCounter = .{};
+    /// A writer's declaration left out of the convergence term for memory:
+    /// the remainder report waits for its next renewal's declaration.
+    pub var block_grant_declarations_uncounted: counters.ShardedCounter = .{};
     /// Unconsumed window runs a joiner returned to the holder at its stop.
     pub var block_grant_window_runs_returned: counters.ShardedCounter = .{};
     /// Renewals this writer declared its windows on (the joiner side of
@@ -454,7 +457,7 @@ pub const HolderPlane = struct {
         }
         _ = v.grants.ledger.syncWriter(writer, ranges);
         _ = v.bitmap.drain();
-        v.declared.put(self.gpa, writer, {}) catch {};
+        v.declared.put(self.gpa, writer, {}) catch stats.block_grant_declarations_uncounted.inc();
         block_grant.stats.block_grant_windows_declared.inc();
     }
 

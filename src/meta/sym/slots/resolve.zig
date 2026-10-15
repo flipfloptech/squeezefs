@@ -32,6 +32,9 @@ pub const stats = struct {
     /// A redirect named a lessee the membership owner lists dead: refused
     /// retryable, never dialled.
     pub var slot_resolve_dead_redirects: counters.ShardedCounter = .{};
+    /// A "known unleased" hint refused for memory: the slot reads as
+    /// unknown, so the resolver asks the manager once more.
+    pub var slot_resolve_hint_drops: counters.ShardedCounter = .{};
     /// `ResolveSlot` issued by this mount (a cold view).
     pub var slot_resolve_calls: counters.ShardedCounter = .{};
 };
@@ -148,7 +151,7 @@ pub const SlotHolderCache = struct {
         self.lock.lock();
         defer self.lock.unlock();
         _ = self.learnt.remove(slot);
-        self.known_unleased.put(self.gpa, slot, {}) catch {};
+        self.known_unleased.put(self.gpa, slot, {}) catch stats.slot_resolve_hint_drops.inc();
     }
 
     pub fn setEndpoint(self: *SlotHolderCache, id: AppenderId, ep: Endpoint) Allocator.Error!void {

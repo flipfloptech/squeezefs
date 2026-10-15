@@ -64,6 +64,9 @@ pub const Identity = page.Identity;
 
 pub const stats = struct {
     pub var manager_verbs: counters.ShardedCounter = .{};
+    /// A live appender's identity left out of the RAM cache for memory:
+    /// its next ship re-reads the directory (the pages are the truth).
+    pub var manager_identity_cache_drops: counters.ShardedCounter = .{};
     /// `manager_verbs_per_s` and `manager_load_pct` — MEASURED (Σ service
     /// ÷ wall from the first verb), never declared.
     pub var manager_verbs_per_s: counters.Gauge = .{};
@@ -567,15 +570,20 @@ pub const Manager = struct {
         defer self.verbs_lock.unlock(self.io);
         var d = self.readDirectory() catch return null;
         defer d.deinit(self.gpa);
+        // The answer is the walk's, not the cache's: a cache insert
+        // refused for memory never hides a live appender.
+        var hit: ?u32 = null;
         for (d.links.items) |l| {
             var pair: u32 = 0;
             while (pair < l.header.pairs) : (pair += 1) {
                 const imgs = dir.readPair(self.vol.reader(), l, pair) catch return null;
                 const pg = imgs.newest() orelse continue;
-                if (pg.state == .live) self.rememberIdentity(pg.identity, pg.appender_id);
+                if (pg.state != .live) continue;
+                self.rememberIdentity(pg.identity, pg.appender_id);
+                if (pg.identity.node_token == identity.node_token and pg.identity.mount_slot == identity.mount_slot) hit = pg.appender_id;
             }
         }
-        return self.identityHit(identity);
+        return hit;
     }
 
     /// The stable identity appender `appender_id` is Live under, if known.
@@ -597,7 +605,7 @@ pub const Manager = struct {
         self.identities_lock.lock();
         defer self.identities_lock.unlock();
         self.forgetAppenderLocked(appender_id);
-        self.identities.put(self.gpa, .{ .node_token = identity.node_token, .mount_slot = identity.mount_slot }, appender_id) catch {};
+        self.identities.put(self.gpa, .{ .node_token = identity.node_token, .mount_slot = identity.mount_slot }, appender_id) catch stats.manager_identity_cache_drops.inc();
     }
 
     fn forgetAppender(self: *Manager, appender_id: u32) void {

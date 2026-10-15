@@ -89,6 +89,7 @@ const Atomic = std.atomic.Value;
 const Allocator = std.mem.Allocator;
 
 const clock = @import("../../core/clock.zig");
+const counters = @import("../../core/counters.zig");
 const log = @import("../../core/log.zig");
 const errors = @import("../../core/errors.zig");
 const thread_name = @import("../../core/thread_name.zig");
@@ -248,13 +249,16 @@ pub const Shard = struct {
     fn inlineReap(self: *Shard) void {
         if (!self.cq_gate.tryLock()) return;
         defer self.cq_gate.unlock(self.engine.io);
-        if (self.drainCq() > 0) stats.ipc_dd_inline_reaps.inc();
+        self.drainCq(&stats.ipc_dd_inline_reaps);
     }
 
-    /// Under `cq_gate`: every posted CQE → its op's postlude. Returns the count.
-    fn drainCq(self: *Shard) u32 {
+    /// Under `cq_gate`: every posted CQE → its op's postlude. A pass that
+    /// retires any op counts in `reaps` BEFORE its first postlude publishes
+    /// (counted after, a waiter that saw its write done could read the
+    /// count one short).
+    fn drainCq(self: *Shard, reaps: *counters.ShardedCounter) void {
         var cqes: [64]uring128.Cqe32 = undefined;
-        var total: u32 = 0;
+        var counted = false;
         while (true) {
             const n = self.ring.copyCqes(&cqes, 0) catch break;
             if (n == 0) break;
@@ -275,11 +279,11 @@ pub const Shard = struct {
                     log.err("ipc dd shard {d}: a CQE for a vacant slab entry {d} (res {d}) was dropped", .{ self.index, idx, cqe.res });
                     continue;
                 };
+                if (!counted) reaps.inc();
+                counted = true;
                 self.engine.finishWrite(p, cqe.res);
-                total += 1;
             }
         }
-        return total;
     }
 
     /// `sqz-ipc-dd<N>`: the blocking backstop (module doc).
@@ -318,7 +322,7 @@ pub const Shard = struct {
             stalls = 0;
             self.cq_gate.lockUncancelable(self.engine.io);
             defer self.cq_gate.unlock(self.engine.io);
-            if (self.drainCq() > 0) stats.ipc_dd_reaper_reaps.inc();
+            self.drainCq(&stats.ipc_dd_reaper_reaps);
         }
     }
 

@@ -339,11 +339,14 @@ pub const HostScoped = enum(u8) {
     }
 };
 
+/// Published on `fabric_host_scoped` on every path — a stock kernel's
+/// `absent` too, never left reading the gauge's zero (`off`).
 pub fn readHostScoped() HostScoped {
     var buf: [16]u8 = undefined;
-    const t = proc.readSmall(HOST_SCOPED_PARAM, &buf) orelse return .absent;
-    const v = std.mem.trim(u8, t, " \t\r\n");
-    const hs: HostScoped = if (std.mem.eql(u8, v, "Y")) .on else .off;
+    const hs: HostScoped = if (proc.readSmall(HOST_SCOPED_PARAM, &buf)) |t|
+        (if (std.mem.eql(u8, std.mem.trim(u8, t, " \t\r\n"), "Y")) .on else .off)
+    else
+        .absent;
     stats.fabric_host_scoped.set(@backingInt(hs));
     return hs;
 }

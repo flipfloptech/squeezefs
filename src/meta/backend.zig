@@ -590,7 +590,7 @@ pub const KvBackend = struct {
             error.Io => return error.Io,
             else => return error.Corrupt,
         };
-        try be.openGuestTrees(recovery.entries);
+        try be.openGuestTrees(recovery.entries, &be.alloc);
         errdefer {
             be.guest_published.deinit(gpa);
             be.guest_cursor_floors.deinit(gpa);
@@ -1246,7 +1246,7 @@ pub const KvBackend = struct {
             be.seq.raiseTo(r.node_seq);
             try be.trees.add(t);
         }
-        try be.openGuestTrees(&.{});
+        try be.openGuestTrees(&.{}, null);
     }
 
     /// Re-point the projection at the newest checkpoint on the device (the
@@ -1860,7 +1860,10 @@ pub const KvBackend = struct {
     /// window mentions without a published root (a tree created in the
     /// crashed daemon's last window: its records are in the ring, its root
     /// never reached tree 0 — the recreated empty tree replays identically).
-    fn openGuestTrees(be: *KvBackend, entries: []const journal.ReplayedEntry) OpenError!void {
+    /// `recovered`: the writer's allocator as the replay folded it — the
+    /// named roots' claims are adopted into it before the first mint; null
+    /// on a projection (it claims nothing; its allocator is not the bitmap).
+    fn openGuestTrees(be: *KvBackend, entries: []const journal.ReplayedEntry, recovered: ?*alloc_ext.ExtentAllocator) OpenError!void {
         const gpa = be.gpa;
         const control = be.trees.find(.control) orelse return error.Corrupt;
         var kvs: std.ArrayList(tree.KeyValue) = .empty;
@@ -1909,6 +1912,8 @@ pub const KvBackend = struct {
             try be.trees.add(t);
             try be.guest_published.put(gpa, r.slot, root);
         }
+        // Before the first claim (the mints below).
+        if (recovered) |a| try be.adoptNamedClaims(a);
         // Slots the window names without a tree.
         var mentioned = std.AutoHashMapUnmanaged(u16, void).empty;
         defer mentioned.deinit(gpa);
@@ -1926,6 +1931,36 @@ pub const KvBackend = struct {
         while (it.next()) |slot| {
             if (be.trees.find(.{ .slot = key.guestForestSlot(slot.*) }) != null) continue;
             _ = try be.mintGuestTree(slot.*);
+        }
+    }
+
+    /// Every root the recovered state names is live, so every extent it
+    /// reaches is allocated before the mount's first claim. A guest root
+    /// minted on first touch is one extent claimed in RAM (no journaled
+    /// delta) and is NAMED at once — appender 0's page refresh at C4b,
+    /// C11's page plan, a tree-0 record — while its claim reaches the
+    /// device only with a later C6 bitmap page: a kill between the two
+    /// recovers the root free, and the first claim (a re-mint of a slot the
+    /// window names, any SMO) overwrote it (`rung-10-routing-loop.md`). A
+    /// tree whose root is allocated is skipped: below a minted root every
+    /// claim is an SMO's, journaled in the window (a builder-built tree's
+    /// lower claims are owed, same note). The ledger-rooted trees' roots
+    /// are format- or SMO-claimed.
+    fn adoptNamedClaims(be: *KvBackend, alloc: *alloc_ext.ExtentAllocator) OpenError!void {
+        var extents: std.ArrayList(u64) = .empty;
+        defer extents.deinit(be.gpa);
+        for (be.trees.load()) |t| {
+            const root = t.rootPtr();
+            if (alloc.isAllocated(be.cache.addrExtent(root.addr))) continue;
+            extents.clearRetainingCapacity();
+            be.collectTreeExtents(t, &extents) catch |e| return switch (e) {
+                error.OutOfMemory => error.OutOfMemory,
+                error.Io => error.Io,
+                else => error.Corrupt,
+            };
+            var adopted: usize = 0;
+            for (extents.items) |ext| adopted += @intFromBool(alloc.adoptLive(ext));
+            log.warn("meta volume {s}: slot tree {?d}'s root 0x{x}@{d} is named but its extent was free in the recovered allocator — a kill between the root's naming and its claim's bitmap page; {d} of its {d} extent(s) adopted (meta_kv_replay_root_claims_adopted)", .{ be.path, t.forest_slot, root.addr, root.seq, adopted, extents.items.len });
         }
     }
 

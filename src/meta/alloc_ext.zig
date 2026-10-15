@@ -66,6 +66,10 @@ pub var meta_kv_pending_free_released: counters.ShardedCounter = .{};
 /// ≈ 0 in steady state.
 pub var meta_kv_pending_free_overflow: counters.ShardedCounter = .{};
 pub var meta_kv_replay_root_frees_dropped: counters.ShardedCounter = .{};
+/// Extents a named root reaches that the recovered allocator held free,
+/// adopted at mount (`adoptLive`); 0 unless a kill fell between a root's
+/// naming and its claim's bitmap page.
+pub var meta_kv_replay_root_claims_adopted: counters.ShardedCounter = .{};
 pub var meta_kv_bitmap_generation_raises: counters.ShardedCounter = .{};
 /// The wedge detector: every parked retirement, wherever parked.
 pub var meta_kv_pending_free: counters.Gauge = .{};
@@ -454,6 +458,20 @@ pub const ExtentAllocator = struct {
         }
         meta_kv_pending_free.set(self.core.pendingCount());
         return out;
+    }
+
+    /// Mount only, after the replay fold and before the first claim: an
+    /// extent a root the recovered state names reaches is LIVE whatever the
+    /// bitmap says — a claim made in RAM (a guest root minted on first
+    /// touch journals no delta) is named by C4b / C11 before C6 lands its
+    /// page. Sets the bit and dirties its page (the next checkpoint writes
+    /// it); `true` = the bit was clear (counted).
+    pub fn adoptLive(self: *ExtentAllocator, extent: u64) bool {
+        if (self.core.isAllocated(extent)) return false;
+        self.core.markAllocated(extent);
+        self.markDirty(extent);
+        meta_kv_replay_root_claims_adopted.inc();
+        return true;
     }
 
     pub fn totalExtents(self: *const ExtentAllocator) u64 {
@@ -1027,6 +1045,23 @@ test "park_replayed_frees drops a free naming a live root (counted) and parks th
     try testing.expect(!alloc.isAllocated(3));
     try testing.expect(alloc.isAllocated(6));
     try testing.expectEqual(@as(u64, 1), alloc.advanceDurable(10));
+}
+
+test "adoptLive: a free extent a named root reaches turns allocated once (counted, its page dirty, never claimed after); an allocated one is untouched" {
+    const gpa = testing.allocator;
+    var region: [8192]u8 = @splat(0);
+    var alloc = try ExtentAllocator.load(gpa, &region, 8, 0, 2, 0, &.{}, null);
+    defer alloc.deinit();
+    try testing.expect(!alloc.hasDirtyPages());
+    const before = meta_kv_replay_root_claims_adopted.load();
+    try testing.expect(alloc.adoptLive(0));
+    try testing.expect(!alloc.adoptLive(0));
+    try testing.expectEqual(before + 1, meta_kv_replay_root_claims_adopted.load());
+    try testing.expect(alloc.isAllocated(0));
+    try testing.expect(alloc.hasDirtyPages());
+    try testing.expectEqual(@as(u64, 7), alloc.freeExtents());
+    for (0..7) |_| try testing.expect(try alloc.claimInternal() != 0);
+    try testing.expectError(error.NoSpace, alloc.claimInternal());
 }
 
 test "replayed parks beyond the FIFO cap overflow (counted, warned) instead of refusing the mount" {

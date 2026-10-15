@@ -628,6 +628,8 @@ pub const KvTree = struct {
         // Restart-reason tallies `[root-retired, root-seq, routing-hole,
         // child-retired, child-seq]`, carried into the exhaustion error.
         var reasons: [5]u32 = @splat(0);
+        // The seq the root's extent held at the last root-seq restart.
+        var root_extent_seq: ?u64 = null;
         var attempt: u32 = 0;
         restart: while (attempt < node.RETRY_BUDGET) : (attempt += 1) {
             // Cooperative restart: every reason to be here is a racing
@@ -649,6 +651,7 @@ pub const KvTree = struct {
             // A device error mid-walk drops the reference the walk holds.
             errdefer cur.release();
             if (cur.node_seq != root.seq) {
+                root_extent_seq = cur.node_seq;
                 cur.release();
                 reasons[1] += 1;
                 continue :restart;
@@ -691,7 +694,10 @@ pub const KvTree = struct {
             }
         }
         const root = self.rootPtr();
-        log.err("tree {d} (root 0x{x}@{d}): traversal retry budget exhausted descending to level {d} (routing loop — SMO protocol bug) restarts [root-retired, root-seq, routing-hole, child-retired, child-seq] = {any}", .{ self.tree_id, root.addr, root.seq, target_level, reasons });
+        // Every restart a root-seq mismatch: no SMO window is that long —
+        // the root's extent holds another node (an overwritten root).
+        const cause = if (reasons[1] == node.RETRY_BUDGET) "the root's extent holds another node — an overwritten root" else "routing loop — SMO protocol bug";
+        log.err("tree {d} slot {?d} (root 0x{x}@{d}, its extent last seen at seq {?d}): traversal retry budget exhausted descending to level {d} ({s}) restarts [root-retired, root-seq, routing-hole, child-retired, child-seq] = {any}", .{ self.tree_id, self.forest_slot, root.addr, root.seq, root_extent_seq, target_level, cause, reasons });
         return error.RetryBudgetExhausted;
     }
 

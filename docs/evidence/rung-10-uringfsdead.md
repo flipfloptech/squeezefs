@@ -50,7 +50,10 @@ The kernel ends that READ when the thread exits, not when the ring closes. `do_e
 tears down the thread's io-wq (`io_uring_clean_tctx` → `io_wq_put_and_exit`). The teardown
 wakes a blocked worker with a notify signal, which ends `fuse_dev_do_read`'s interruptible
 wait. It cancels queued work and waits for every worker to exit. Any copy therefore lands
-before the join returns, while `buf` is still allocated.
+before the join returns, while `buf` is still allocated. (Checked against the venues' 7.2.6-sqz
+source: `kernel/exit.c:949` `io_uring_files_cancel()` precedes `:997` `exit_mm()`, whose
+`mm_release` clears `clear_child_tid` and wakes the joiner, `kernel/fork.c:1483`;
+`io_uring/tctx.c:190,258` `io_wq_put_and_exit`; `io_uring/tw.h:22` `io_should_terminate_tw`.)
 
 A poll-armed READ that fires after the exit queues task work on a dead task. That work falls
 back to the ring's kworker, where `io_should_terminate_tw` fails the READ without issuing it.

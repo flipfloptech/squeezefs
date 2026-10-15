@@ -363,6 +363,26 @@ test "a joiner's knowledge of a slot beyond its table (found by the shared hot d
     try testing.expect(c.knows(8));
 }
 
+test "a known-unleased hint refused for memory drops only the hint (slot_resolve_hint_drops): the learnt holder is forgotten, the slot routes local, and it reads as unknown so the manager is asked once more" {
+    const gpa = testing.allocator;
+    const t = try lt.LeaseTable.init(gpa);
+    defer t.deinit();
+    var failing = std.testing.FailingAllocator.init(gpa, .{});
+    var dummy: u8 = 0;
+    var c = SlotHolderCache.init(failing.allocator(), t, &dummy, ownsOne);
+    defer c.deinit();
+    try c.setEndpoint(3, endpointOfByte(3));
+    try c.learn(7, .{ .appender_id = 3, .g = 2 });
+    const drops0 = stats.slot_resolve_hint_drops.load();
+    failing.fail_index = failing.alloc_index;
+    c.forget(7);
+    failing.fail_index = std.math.maxInt(usize);
+    try testing.expectEqual(drops0 + 1, stats.slot_resolve_hint_drops.load());
+    try testing.expectEqual(@as(?SlotHolder, null), c.holderOf(7));
+    try testing.expectEqual(StepHome.local, c.stepHome(7));
+    try testing.expect(!c.knows(7));
+}
+
 test "a joiner's table drops a FOREIGN lease the manager answers unleased (found by the shared hot directory row: a refused first touch had loaded the dead holder B into C's table, and after the manager recovered B's slot every read of the striped directory at C resolved to the corpse — the answer dropped only the learnt view): the table's word goes unleased at the manager's generation; this process's own lease and a newer generation are left" {
     const gpa = testing.allocator;
     const t = try lt.LeaseTable.init(gpa);

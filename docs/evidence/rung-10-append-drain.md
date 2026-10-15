@@ -151,6 +151,11 @@ cap" after the mid-crossing kill): the same per-write size commit the kill matri
 crash arm now runs `sync -d big` at the inline cap (1,364 MiB) before the crossing begins. Alone on
 kamrui ×2: 1,364 MiB durable, 1,364 blocks exact, 0 holes.
 
+**THE HANDOVER DRAINS PARKED STAMPS** (red in the branch's VM gate: times pending 70 at A, row
+end). Its setup `sync -d d` (an fsync of the directory) journals only the claims whose bytes
+landed. With the flush cadence held a minute away, the 72 files' claims stayed parked. The setup
+is now `sync -f d` (a syncfs, which lands them): 2/2 green on the VM, pending 0.
+
 **The writer-storm row** (owned by `storm` on `dev`). Alone on kamrui, same base (`e1c334f`), 5
 runs each: `dev` failed 2 of 5, the branch 5 of 5, both with `waits + cold ≥ 1`. Instrumented
 (admission bytes by arm): the 1,000 B tails never park on EITHER tree. The only parked buffers are

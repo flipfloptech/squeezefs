@@ -456,6 +456,11 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         pending: economy.PendingTimes,
         /// `Options.times_park`.
         times_park: bool,
+        /// The data plane is live: false from the dismount's drain on (the
+        /// slot plane's leave hands slots over after the plane is gone, so
+        /// its times drain must never reach the plane — §AL.5's claims
+        /// were landed and journaled by the dismount).
+        data_live: bool = true,
         /// The drain cadence's wake (the daemon's `TimesDrainCadence` parks
         /// on it with the flush interval as its deadline): a park that
         /// crosses `PENDING_TIMES_DRAIN_CAP` notifies it ahead of the tick.
@@ -1533,6 +1538,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             self.reclaimDrain(c) catch |e| log.err("kv_fs: dismount reclaim drain failed: {t}", .{e});
             self.landClaims();
             _ = self.drainPendingTimes(c) catch |e| log.err("kv_fs: dismount times drain failed: {t} ({d} refinement(s) stay parked)", .{ e, self.pending.len() });
+            self.data_live = false;
         }
 
         pub fn lookup(self: *Self, c: *Ctx, a: filesystem.LookupArgs) Error!filesystem.Entry {
@@ -3037,13 +3043,13 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             var claims: [dlm.max_requests]u64 = @splat(0);
             var claimants: [dlm.max_requests]u64 = undefined;
             var n_claimants: usize = 0;
-            for (batch, claims[0..batch.len]) |ino, *cl| {
+            if (self.data_live) for (batch, claims[0..batch.len]) |ino, *cl| {
                 const claim = self.pending.claimOf(ino);
                 if (claim == 0) continue;
                 cl.* = @min(claim, self.data.custodyFloor(self.io, ino));
                 claimants[n_claimants] = ino;
                 n_claimants += 1;
-            }
+            };
             if (n_claimants != 0) try self.data.barrierData(self.io, claimants[0..n_claimants]);
             var plan: economy.GuardPlan = .{};
             for (batch) |ino| {
@@ -3086,7 +3092,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         /// and the handover's step 0 — a claim is never dropped with its
         /// bytes still in RAM.
         fn landClaims(self: *Self) void {
-            if (!self.data.hasVolumes()) return;
+            if (!self.data_live or !self.data.hasVolumes()) return;
             var held: std.ArrayList(u64) = .empty;
             defer held.deinit(self.gpa);
             self.pending.claimants(self.gpa, &held) catch |e| log.err("kv_fs: the claims' landing pass could not list them ({t}): their sizes stay at the durable length", .{e});
@@ -3125,7 +3131,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             try self.pending.parkedOfSlot(self.gpa, route_table.forestSlotOf(slot), &inos_of_slot);
             // A claim's bytes land first, so the step-0 drain journals it
             // whole while the door still admits it (§AL.5).
-            if (self.data.hasVolumes()) for (inos_of_slot.items) |ino| {
+            if (self.data_live and self.data.hasVolumes()) for (inos_of_slot.items) |ino| {
                 if (self.pending.claimOf(ino) != 0) self.data.flushCustody(self.io, ino);
             };
             var total: u64 = 0;

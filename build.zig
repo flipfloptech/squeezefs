@@ -506,6 +506,14 @@ pub fn build(b: *std.Build) void {
         sdk_step.dependOn(&b.addInstallArtifact(sdk_static, .{}).step);
         sdk_step.dependOn(&b.addInstallArtifact(sdk_shared, .{}).step);
 
+        // The C body's flags. Zig supplies the libc headers and crt; a host GCC
+        // installation is no input to this compile, yet clang's Linux driver probes
+        // /usr/lib/gcc for one on every target and under -Werror its findings are
+        // fatal (Ubuntu 26.04: gcc-16's libgcc dir beside gcc-15's libstdc++ →
+        // -Wgcc-install-dir-libstdcxx). `--gcc-toolchain` names the prefix the probe
+        // searches (relative: the compile runs in the build root): our header dir
+        // holds no lib/gcc tree, so the probe finds nothing.
+        const c_smoke_flags: []const []const u8 = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror", "--gcc-toolchain=include" };
         // The C smoke: a Zig driver (the stub host out of the library) + the
         // C body compiled natively against the header, linked with the .a.
         const sdk_smoke = b.addExecutable(.{
@@ -517,7 +525,7 @@ pub fn build(b: *std.Build) void {
                 .imports = &.{.{ .name = "squeezefs", .module = squeezefs_mod }},
             }),
         });
-        sdk_smoke.root_module.addCSourceFile(.{ .file = b.path("tests/sdk/c_smoke.c"), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" } });
+        sdk_smoke.root_module.addCSourceFile(.{ .file = b.path("tests/sdk/c_smoke.c"), .flags = c_smoke_flags });
         sdk_smoke.root_module.addIncludePath(b.path("include"));
         sdk_smoke.root_module.linkLibrary(sdk_static);
         sdk_smoke.root_module.link_libc = true;
@@ -537,7 +545,7 @@ pub fn build(b: *std.Build) void {
                 .imports = &.{.{ .name = "squeezefs", .module = squeezefs_mod }},
             }),
         });
-        sdk_smoke_shared.root_module.addCSourceFile(.{ .file = b.path("tests/sdk/c_smoke.c"), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" } });
+        sdk_smoke_shared.root_module.addCSourceFile(.{ .file = b.path("tests/sdk/c_smoke.c"), .flags = c_smoke_flags });
         sdk_smoke_shared.root_module.addIncludePath(b.path("include"));
         sdk_smoke_shared.root_module.linkLibrary(sdk_shared);
         sdk_smoke_shared.root_module.link_libc = true;

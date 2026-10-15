@@ -248,11 +248,13 @@ test "tcp e2e: a severed connection surfaces HolderUnreachable (EAGAIN) to the c
     var i: u32 = 0;
     while (!mux.isPoisoned() and i < 10_000) : (i += 1) testing.io.sleep(.fromMilliseconds(1), .awake) catch {};
     try testing.expect(mux.isPoisoned());
-    try testing.expectEqual(poisoned_before + 1, stats.cluster_wire_sessions_poisoned.load());
     try testing.expect(mux.deadOnArrival());
     // The client re-dials: the next call lands on a fresh session.
     const r = try c.callTyped(.{ .resolve_slot = .{ .volume = 0, .slot = 9, .reserved = 0 } }, &out);
     try testing.expectEqual(@as(u32, 9), r.resolve_slot.g);
+    // The reader counts its poison AFTER publishing the flag, so the flag
+    // alone orders nothing; the re-dial's `close` joined the reader.
+    try testing.expectEqual(poisoned_before + 1, stats.cluster_wire_sessions_poisoned.load());
     try testing.expectEqual(reconnects_before + 1, stats.cluster_wire_reconnects.load());
     try testing.expect(c.mux.? != mux);
     try testing.expectEqual(linux.E.AGAIN, errors.toErrno(error.HolderUnreachable));

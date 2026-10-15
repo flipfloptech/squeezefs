@@ -16,8 +16,8 @@
 # State lives in .gate-train/ (ignored): ledger.tsv (utc, sha, verdict, one
 # venue:result:wall field per venue, failures) and each run's logs. The train
 # gates a detached worktree .wt-train so nothing it does touches an agent's tree;
-# each run appends a comment to src/core/clock.zig there (and restores it) so the
-# test steps run for real instead of answering from the build cache.
+# `-Dfresh=true` makes every test step run for real on the cached binary (a repeat
+# of an unchanged head would otherwise answer from the build cache).
 set -uo pipefail
 # The logs carry UTF-8; macOS awk refuses multibyte input outside the C locale.
 export LC_ALL=C
@@ -54,18 +54,16 @@ run_once() {
   local sha=$1
   local verdict=green fields="" fails="" line="" v log t0 rc wall res
   git -C "$TRAIN" checkout -q --detach "$sha" || return 1
-  echo "// gate-train run $(date +%s%N)" >> "$TRAIN/src/core/clock.zig"
   for v in $VENUES; do
     log=$STATE/$v-$sha.log
     t0=$(date +%s)
-    SQZ_VENUE=$v "$REPO/scripts/venue" "cd '$TRAIN' && timeout 3900 zig build --cache-dir /build/zig-cache-v2 gate --summary all" > "$log" 2>&1
+    SQZ_VENUE=$v "$REPO/scripts/venue" "cd '$TRAIN' && timeout 3900 zig build --cache-dir /build/zig-cache-v2 -Dfresh=true gate --summary all" > "$log" 2>&1
     rc=$?
     wall=$(( $(date +%s) - t0 ))
     if [ $rc -eq 0 ]; then res=green; else res=red; verdict=red; fails="$fails${fails:+;}$(failures "$log" | sed "s/^/$v:/; s/;/;$v:/g")"; fi
     fields="$fields${fields:+ }$v:$res:${wall}s"
     line="$line | $v $(echo $res | tr a-z A-Z) $(summary "$log") ${wall}s"
   done
-  git -C "$TRAIN" checkout -q -- src/core/clock.zig
   printf '%s\t%s\t%s\t%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%MZ)" "$sha" "$verdict" "$fields" "$fails" >> "$LEDGER"
   echo "gate-train $(git -C "$REPO" log -1 --format='%h %s' "$sha" | cut -c1-60)$line | streak $(run_of "$sha" green)/${WANT_STREAK}${fails:+ | FAIL: $fails}"
 }

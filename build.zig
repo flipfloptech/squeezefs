@@ -173,6 +173,7 @@ pub fn build(b: *std.Build) void {
     //      into failures"): every test run step carries the harness knob the
     //      ONE testkit reads; a `testkit.skip` then FAILS the test except for
     //      the classes a venue cannot honestly satisfy (`core/testkit.zig`) ----
+    gate_fresh = b.option(bool, "fresh", "Run every test step even when cached (the gate train's repeated runs of one binary)") orelse false;
     const release_gate = b.option(bool, "release-gate", "Release-gate mode: environment skips fail the gate (except needs_reference_hardware / other_step)") orelse false;
 
     // ---- the project test runner and the shard sets
@@ -652,8 +653,16 @@ fn addTreeInputs(b: *std.Build, run: *std.Build.Step.Run, sub: []const u8) void 
 
 /// A test run step under the release-gate option: the harness knob the ONE
 /// testkit reads (`src/core/testkit.zig`) rides the step's environment.
+/// `-Dfresh`: every gated run step executes even when its binary and inputs are
+/// cached — the gate train's repeated runs of ONE binary (charter §11: three consecutive
+/// clean runs). Without it a repeat answers from the build cache and proves nothing; a
+/// source edit cannot force it either, since the compiler caches by ZIR and a comment
+/// changes none.
+var gate_fresh: bool = false;
+
 fn gated(run: *std.Build.Step.Run, release_gate: bool) *std.Build.Step.Run {
     if (release_gate) run.setEnvironmentVariable("SQUEEZEFS_TEST_RELEASE_GATE", "1");
+    if (gate_fresh) run.has_side_effects = true;
     return run;
 }
 

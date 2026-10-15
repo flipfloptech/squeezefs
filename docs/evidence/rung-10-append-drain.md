@@ -90,5 +90,7 @@ and punch are not ops of this filesystem.
 **Owed (§AL.5).** After a kill an extending WRITE can still read the recycled tail: its size Δ
 is a landed journal entry while its bytes (and the gap's zeros) are daemon memory until the drain
 — §AJ.4's "whole or zeros" holds over a hole, not over a mapped EOF block. Sized in §AL.5 (park
-the size claim until its bytes land, or a geometric zero watermark ahead of the size).
+the size claim until its bytes land, or a geometric zero watermark ahead of the size). And
+(§AL.6) a FOREIGN-slot truncate ships its size to the holder, which applies it to the inode
+alone — no clip, no zero tail, no extension zeros.
 

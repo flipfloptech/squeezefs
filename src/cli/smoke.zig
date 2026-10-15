@@ -7224,12 +7224,15 @@ fn statsDirect(rig: *Rig) ![]u8 {
     return out.toOwnedSlice(rig.gpa);
 }
 
-/// `awaitExactly` over `statsDirect` (owned; the last read either way).
-fn awaitExactlyDirect(rig: *Rig, key: []const u8, want: u64, deadline_ns: u64) ![]u8 {
+/// `awaitStats` over `statsDirect`: every `(key, want)` holds in ONE read
+/// or the deadline passed (owned; the last read either way).
+fn awaitStatsDirect(rig: *Rig, pairs: []const struct { key: []const u8, want: u64 }, deadline_ns: u64) ![]u8 {
     const deadline = clock.monotonicNs() + deadline_ns;
     while (true) {
         const st = try statsDirect(rig);
-        if ((numberAfter(st, key) orelse std.math.maxInt(u64)) == want or clock.monotonicNs() >= deadline) return st;
+        var ok = true;
+        for (pairs) |p| ok = ok and (numberAfter(st, p.key) orelse std.math.maxInt(u64)) == p.want;
+        if (ok or clock.monotonicNs() >= deadline) return st;
         rig.gpa.free(st);
         sleepMs(100);
     }
@@ -7361,7 +7364,17 @@ test "smoke: CUSTODY NO CLOSE COVERS IS DRAINED ONCE IDLE (decision 0003 Â§AF) â
     defer _ = linux.close(fd);
     try pwriteAll(fd, pattern, 0);
     {
-        const st = try awaitExactlyDirect(rig, "\"fuse_owed_idle_drains\":", 1, 30 * std.time.ns_per_s);
+        // Every word settled in one render: a render is no atomic cut, so
+        // the render that first shows the drain's count can carry a word
+        // read before the drain (`parked_buffers` 1 beside the count).
+        const st = try awaitStatsDirect(rig, &.{
+            .{ .key = "\"fuse_owed_idle_drains\":", .want = 1 },
+            .{ .key = "\"fuse_owed_drain_inos\":", .want = 0 },
+            .{ .key = "\"parked_buffers\":", .want = 0 },
+            .{ .key = "\"parked_extent_bytes\":", .want = 0 },
+            .{ .key = "\"overlay_open\":", .want = 0 },
+            .{ .key = "\"fuse_flush_drains\":", .want = 0 },
+        }, 30 * std.time.ns_per_s);
         defer gpa.free(st);
         std.debug.print("\nsmoke[owed idle drain]: idle drains {d}, owed {d}, parked buffers {d}, parked extent bytes {d}, open overlays {d}, FLUSH drains {d}\n", .{ numberAfter(st, "\"fuse_owed_idle_drains\":") orelse 0, numberAfter(st, "\"fuse_owed_drain_inos\":") orelse 0, numberAfter(st, "\"parked_buffers\":") orelse 0, numberAfter(st, "\"parked_extent_bytes\":") orelse 0, numberAfter(st, "\"overlay_open\":") orelse 0, numberAfter(st, "\"fuse_flush_drains\":") orelse 0 });
         try testing.expectEqual(@as(?u64, 1), numberAfter(st, "\"fuse_owed_idle_drains\":"));

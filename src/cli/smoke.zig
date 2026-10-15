@@ -3910,8 +3910,16 @@ fn kvdaKillRow(skip_pages: bool) !void {
         // pages carried no bit beyond the refs census) — the consumed
         // blocks below B's windows are the frontier's to protect.
         if (!skip_pages) try testing.expect((numberAfter(ta4, "\"data_alloc_bitmap_leaks_referenced\":") orelse 0) >= 1);
-        std.debug.print("smoke: kvda ({s}): after B's leave the sole writer's census converged the remainder — referenced {d}, released {d}\n", .{ if (skip_pages) "pages SKIPPED" else "pages held", numberAfter(ta4, "\"data_alloc_bitmap_leaks_referenced\":") orelse 0, numberAfter(ta4, "\"data_alloc_bitmap_leaks_released\":") orelse 0 });
+        std.debug.print("smoke: kvda ({s}): after B's leave the sole writer's census converged the remainder — referenced {d}, released {d}, settled {d}; late frees settled by the derivation {d}\n", .{ if (skip_pages) "pages SKIPPED" else "pages held", numberAfter(ta4, "\"data_alloc_bitmap_leaks_referenced\":") orelse 0, numberAfter(ta4, "\"data_alloc_bitmap_leaks_released\":") orelse 0, numberAfter(ta4, "\"data_alloc_bitmap_leaks_settled\":") orelse 0, numberAfter(ta4, "\"free_derivation_settled\":") orelse 0 });
+        try expectMustStayZero(ta4);
     }
+    // The online census of the sole writer's set, whole and merged — with
+    // the pages only: the fallback successor's live bitmap lacks the blocks
+    // B published before the kill that its census could not see (B's
+    // uncheckpointed trees) and no declaration names (`rung-10-kvda-late-
+    // free.md` owed: 50 referenced-but-clear); the offline fsck below
+    // re-derives them.
+    if (!skip_pages) _ = try fsckOnlineMergedClean(rig, "kvda (pages held)");
     try rig.umount();
     try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
     _ = try fsckClean(rig, "the KVDA kill row");
@@ -9443,6 +9451,31 @@ const extent_overlay = @import("../data/extent_overlay.zig");
 fn fsckOnline(rig: *Rig, target: []const u8, residue: ?[]const u8) !FsckOutcome {
     if (residue) |s| return fsckJsonTarget(rig, target, &.{ "--online", "--shards", s });
     return fsckJsonTarget(rig, target, &.{"--online"});
+}
+
+/// The online census of `rig.mp` whole and as two residue shards, the
+/// shards merged: 0 findings each, the merge ≡ the whole (inodes and
+/// dentry refs summed exactly). Returns the whole run's blocks checked.
+fn fsckOnlineMergedClean(rig: *Rig, label: []const u8) !u64 {
+    const gpa = rig.gpa;
+    var whole = try fsckOnline(rig, rig.mp, null);
+    defer whole.report.deinit(gpa);
+    if (whole.report.findings.len != 0) for (whole.report.findings) |f| std.debug.print("  unexpected ({s}): {f}\n", .{ label, f });
+    try testing.expectEqual(@as(usize, 0), whole.report.findings.len);
+    try testing.expectEqual(@as(u8, 0), whole.code);
+    inline for (.{ "0/2", "1/2" }, .{ "online0.json", "online1.json" }) |sh, name| try fsckOnlineToFile(rig, sh, name);
+    var p0: [256]u8 = undefined;
+    var p1: [256]u8 = undefined;
+    const r = try rig.squeezefs(&.{ "fsck", "merge-reports", "--json", try std.fmt.bufPrint(&p0, "{s}/online0.json", .{rig.work}), try std.fmt.bufPrint(&p1, "{s}/online1.json", .{rig.work}) });
+    defer rig.freeRun(r);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, r.term);
+    var merged = try json_scan_report.Report.parse(gpa, r.stdout);
+    defer merged.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), merged.findings.len);
+    try testing.expectEqual(whole.report.counters.inodes_scanned, merged.counters.inodes_scanned);
+    try testing.expectEqual(whole.report.counters.dentry_refs_indexed, merged.counters.dentry_refs_indexed);
+    std.debug.print("smoke[{s}]: fsck --online 0 findings over {d} block(s), {d} inode(s); 2 shards merged ≡ whole\n", .{ label, whole.report.counters.blocks_checked, whole.report.counters.inodes_scanned });
+    return whole.report.counters.blocks_checked;
 }
 
 /// Write the online report's JSON to `<work>/<name>` (the merge's input).

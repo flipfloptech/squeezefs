@@ -87,10 +87,16 @@ unchanged); an adjacent append opens no gap and pays nothing. `write_gap_zero_by
 admission ledger's closure. Truncate-up and truncate-up-then-write ride the same law; `fallocate`
 and punch are not ops of this filesystem.
 
-**Owed (§AL.5).** After a kill an extending WRITE can still read the recycled tail: its size Δ
-is a landed journal entry while its bytes (and the gap's zeros) are daemon memory until the drain
-— §AJ.4's "whole or zeros" holds over a hole, not over a mapped EOF block. Sized in §AL.5 (park
-the size claim until its bytes land, or a geometric zero watermark ahead of the size). And
-(§AL.6) a FOREIGN-slot truncate ships its size to the holder, which applies it to the inode
-alone — no clip, no zero tail, no extension zeros.
+**The ordered law (§AL.5).** An extending write's size claim parks (fold-visible) and the times
+drain journals `min(claim, custody floor)` behind one data barrier, so the durable size never
+covers bytes still in RAM. Red: `kv_fs.zig` "THE ORDERED LAW" — on the pre-fix postlude a kill
+before the drain read 20,010 B durable over 8,192 B of durable bytes (expected 8,192); the row
+walks every kill point (before the drain, mid-drain, landed-undrained, drained: 8,192 → 8,192 →
+8,292 → 8,292 → 20,010) and fsync (20,060 durable at return); the later write's base is the
+earlier claim (8,292), never inside its range. Cost: the size lags acceptance ≤ `T_wb + τ`; one
+data barrier per drain pass that journals a claim; one more meta barrier per fsync after an
+extension.
 
+**Cross-daemon size changes (§AL.6).** `two_holders.zig` "a shipped size change runs the
+HOLDER's own size path": the holder applied the size alone; now it runs the filesystem's truncate
+face or rejects.

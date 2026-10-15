@@ -2,6 +2,7 @@
 zig-out/
 zig-out-linux/
 zig-out-dev/
+zig-out-perf/
 *.debug
 .DS_Store
 fuzz-corpus/

@@ -6387,11 +6387,20 @@ fn refCensus(report: []const u8) RefCensus {
     return out;
 }
 
+/// The daemon's transport stratum, by the transport's own kmbuf ladder run
+/// here: with the register opcode a root mount is ZeroCopy and the zc legs
+/// arm; without it (a stock distro kernel) the mount is UserEnts and they
+/// stay off — the row judges whichever stratum the kernel offers.
+fn zcKernel() bool {
+    return transport.probes.driver.probeKmbuf(@intCast(derive.facts().page_size)).opcodes() != null;
+}
+
 /// THE DATA-PLANE PASS on a fresh set (with or without a cache path).
 fn dataPlanePass(rig: *Rig, cache: bool) !void {
     const gpa = rig.gpa;
     const io = rig.io;
     const label: []const u8 = if (cache) "cache" else "no-cache";
+    const zc_legs = zcKernel();
     try rig.formatSet(cache);
     try rig.createImage();
     try rig.spawnMount(&.{});
@@ -6403,7 +6412,8 @@ fn dataPlanePass(rig: *Rig, cache: bool) !void {
         try testing.expect(std.mem.indexOf(u8, seg, "data plane: 2 data volume(s)") != null);
         if (cache) {
             try testing.expect(std.mem.indexOf(u8, seg, "staging ON, NVMe tier ON") != null);
-            try testing.expect(std.mem.indexOf(u8, seg, "held-slot direct store ON, direct device leg ON, fd-source probe serve ON") != null);
+            const legs = if (zc_legs) "held-slot direct store ON, direct device leg ON, fd-source probe serve ON" else "held-slot direct store off, direct device leg off, fd-source probe serve off";
+            try testing.expect(std.mem.indexOf(u8, seg, legs) != null);
         } else {
             try testing.expect(std.mem.indexOf(u8, seg, "the set declares NO cache paths — staging and the NVMe read tier are OFF") != null);
         }
@@ -6479,8 +6489,9 @@ fn dataPlanePass(rig: *Rig, cache: bool) !void {
         try testing.expectEqual(@as(u64, 2), clips);
         if (cache) {
             try testing.expect(staged >= small_files_staged);
-            try testing.expect((numberAfter(tail, "\"held_stores\":") orelse 0) > 0);
-            try testing.expect((numberAfter(tail, "\"transport_zc_direct_legs\":") orelse 0) > 0);
+            // The held-slot store and the direct leg are zc legs.
+            try testing.expectEqual(zc_legs, (numberAfter(tail, "\"held_stores\":") orelse 0) > 0);
+            try testing.expectEqual(zc_legs, (numberAfter(tail, "\"transport_zc_direct_legs\":") orelse 0) > 0);
         } else {
             try testing.expectEqual(@as(u64, 0), staged);
         }

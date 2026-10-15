@@ -829,7 +829,8 @@ pub const Pass = struct {
     }
 
     /// C8's exemption context: the host's open-pack and in-flight faces,
-    /// the pass's foreign blocks of ONE volume.
+    /// the pass's foreign blocks — all of ONE volume (an index alone names
+    /// a block on every volume: B's open pack at N hid A's drift at N).
     const C8Exempt = struct {
         pass: *Pass,
         vol_tag: u64,
@@ -840,12 +841,14 @@ pub const Pass = struct {
 
         fn isOpenPack(ctx: ?*anyopaque, block_idx: u64) bool {
             const self: *C8Exempt = @ptrCast(@alignCast(ctx.?));
-            return isOpenPackAny(@constCast(self.pass.host), block_idx);
+            const p = self.pass.host.pack orelse return false;
+            return p.isOpenPack(p.ctx, self.vol_tag, block_idx);
         }
 
         fn isInflight(ctx: ?*anyopaque, block_idx: u64) bool {
             const self: *C8Exempt = @ptrCast(@alignCast(ctx.?));
-            return isInflightAny(@constCast(self.pass.host), block_idx);
+            const v = self.pass.host.volume(self.vol_tag) orelse return false;
+            return block_idx < v.alloc.capacityBlocks() and v.alloc.inflightContains(block_idx);
         }
 
         fn isForeignRef(ctx: ?*anyopaque, block_idx: u64) bool {
@@ -853,23 +856,6 @@ pub const Pass = struct {
             return self.pass.foreign_blocks.contains(.{ .vol_tag = self.vol_tag, .block_idx = block_idx });
         }
     };
-
-    fn exemptions(self: *Pass) block_refs.Exemptions {
-        return .{ .ctx = @constCast(self.host), .isOpenPack = &isOpenPackAny, .isInflight = &isInflightAny };
-    }
-
-    fn isOpenPackAny(ctx: ?*anyopaque, block_idx: u64) bool {
-        const host: *const Host = @ptrCast(@alignCast(ctx.?));
-        const p = host.pack orelse return false;
-        for (host.volumes) |v| if (p.isOpenPack(p.ctx, v.vol_tag, block_idx)) return true;
-        return false;
-    }
-
-    fn isInflightAny(ctx: ?*anyopaque, block_idx: u64) bool {
-        const host: *const Host = @ptrCast(@alignCast(ctx.?));
-        for (host.volumes) |v| if (block_idx < v.alloc.capacityBlocks() and v.alloc.inflightContains(block_idx)) return true;
-        return false;
-    }
 
     // ---- C11: the map plane ----
 
@@ -1749,7 +1735,8 @@ pub const Pass = struct {
         const gop = try self.fresh.c8.getOrPut(self.gpa, vol_tag);
         if (!gop.found_existing) {
             const c = try self.freshCensus();
-            gop.value_ptr.* = block_refs.verifyRefs(self.gpa, self.host.store.refStore(), vol_tag, c.owners.items, self.exemptions()) catch |e| switch (e) {
+            var x: C8Exempt = .{ .pass = self, .vol_tag = vol_tag };
+            gop.value_ptr.* = block_refs.verifyRefs(self.gpa, self.host.store.refStore(), vol_tag, c.owners.items, x.exemptions()) catch |e| switch (e) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => blk: {
                     const empty: block_refs.DriftReport = .{ .rows = try self.gpa.alloc(block_refs.Drift, 0), .pack_exempted = 0, .inflight_exempted = 0 };

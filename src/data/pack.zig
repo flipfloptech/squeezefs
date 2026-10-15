@@ -562,8 +562,12 @@ pub const Packer = struct {
             const self = c.packer;
             if (self.isStopped()) return error.StorageFull;
             if (c.row.pack.load(.acquire)) |existing| if (!existing.isSealed()) return existing;
-            const minted = try self.alloc.allocate_placed(self.alloc.ctx, c.key);
+            // The struct before the mint: an OOM leaves the allocator untouched.
             const p = try self.gpa.create(OpenPack);
+            const minted = self.alloc.allocate_placed(self.alloc.ctx, c.key) catch |e| {
+                self.gpa.destroy(p);
+                return e;
+            };
             p.* = .{
                 .vol_tag = c.key.vol_tag,
                 .scope = c.key.scope,

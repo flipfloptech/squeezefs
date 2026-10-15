@@ -3543,9 +3543,8 @@ pub const DataPlane = struct {
 
         fn isInflight(ctx: ?*anyopaque, block_idx: u64) bool {
             const self: *MountExempt = @ptrCast(@alignCast(ctx.?));
-            const vols = &self.plane.vols;
-            for (vols.rows[0..vols.n()]) |r| if (r.?.alloc.inflightContains(block_idx)) return true;
-            return false;
+            const v = self.plane.vols.byTag(self.vol_tag) orelse return false;
+            return block_idx < v.alloc.capacityBlocks() and v.alloc.inflightContains(block_idx);
         }
     };
 

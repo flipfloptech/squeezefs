@@ -132,6 +132,11 @@ pub const stats = struct {
 /// class the caller sees (the intent stays open).
 pub const SLOT_MOVED_RETRIES: u32 = 2;
 
+/// Stuck intents named per membership tick: the stack room of one harvest
+/// (a longer tail is named on the next ticks, each entry once) — 16 lines
+/// cover the largest stuck set any run has met (11 at one creator).
+pub const STUCK_NAMED_PER_TICK = 16;
+
 /// An intent an execute left OPEN at a retryable failure (a slot moved, a
 /// holder unreachable, a step deferred) that stays the LIVE op's
 /// (decision 0003 §X.2): the op's re-issue resumes it (`resumeHeld` — the
@@ -326,9 +331,12 @@ pub fn Plane(comptime Store: type) type {
         /// The ship seam fired on the last ship (its failure is terminal,
         /// never re-resolved).
         seam_fired: std.atomic.Value(bool) = .init(false),
-        /// The cadence's last pass stamp (a pass runs only while the
-        /// register holds an abandoned intent).
-        last_pass_ns: u64 = 0,
+        /// The cadence's last pass: its start and its end (a pass runs only
+        /// while the register holds an abandoned intent; started > ended =
+        /// running). Written by the reclaim fiber, read by the membership
+        /// fiber's stuck line — monotonic stamps, no ordering to pair.
+        pass_started_ns: std.atomic.Value(u64) = .init(0),
+        pass_ended_ns: std.atomic.Value(u64) = .init(0),
 
         pub fn init(gpa: Allocator, io: Io, store: *Store, locks: *dlm.Manager, own_id: AppenderId, volume: u16, term: u64, resolver: Resolver, seams: Seams, record_cap: usize) Allocator.Error!Self {
             return .{
@@ -1011,6 +1019,7 @@ pub fn Plane(comptime Store: type) type {
                     // Left open for the next pass (an unreachable holder, a
                     // moved slot past the bound); a device error is loud.
                     self.register.noteAbandoned(id);
+                    self.register.noteFailure(id, e);
                     switch (e) {
                         error.ShipFailed, error.SlotMoved, error.Deferred, error.GuardRefused => continue,
                         else => return e,
@@ -1153,7 +1162,83 @@ pub fn Plane(comptime Store: type) type {
         pub fn sweepParked(self: *Self, now: u64) u32 {
             const n = self.parked.sweepExpired(now);
             self.register.publish(now);
+            self.nameNewlyStuck(now);
             return n;
+        }
+
+        /// What a stuck intent's line names: where it lives, how far it
+        /// got, where its next step goes now, how its last roll-forward
+        /// attempt ended and what the cadence's pass is doing — enough to
+        /// tell a pass that fails from one that never returns.
+        pub const StuckReport = struct {
+            tx_id: u64,
+            home_slot: u16,
+            age_ms: u64,
+            /// Null: the record is gone (retired since the harvest).
+            op: ?intent.Op,
+            applied: u16 = 0,
+            steps: usize = 0,
+            next_slot: ?u16 = null,
+            next_home: NextHome = .none,
+            /// `@intFromError` of the last failed attempt; 0 = none failed.
+            last_err: u16,
+            /// Started > ended: the pass running for `pass_ms`; else idle
+            /// for `pass_ms` since the last one ended (never ran: the age).
+            pass_running: bool,
+            pass_ms: u64,
+
+            pub const NextHome = union(enum) { none, local, foreign: AppenderId, unreachable_: AppenderId };
+        };
+
+        /// One harvested stuck entry described (reads only: the record,
+        /// the resolver's view — the membership cadence never waits on a
+        /// guard).
+        pub fn describeStuck(self: *Self, s: intent.Stuck, now: u64) StuckReport {
+            const started = self.pass_started_ns.load(.monotonic);
+            const ended = self.pass_ended_ns.load(.monotonic);
+            const running = started > ended;
+            var r: StuckReport = .{
+                .tx_id = s.tx_id,
+                .home_slot = intent.slotOfHome(s.home),
+                .age_ms = s.age_ns / std.time.ns_per_ms,
+                .op = null,
+                .last_err = s.last_err,
+                .pass_running = running,
+                .pass_ms = (now -| (if (running) started else if (ended != 0) ended else now -| s.age_ns)) / std.time.ns_per_ms,
+            };
+            const bytes = (self.apply.readIntentBytes(s.home, s.tx_id) catch return r) orelse return r;
+            defer self.gpa.free(bytes);
+            var out: [intent.XV_MAX_STEPS]intent.StepRec = undefined;
+            const k = intent.recordKey(s.home, s.tx_id);
+            const it = intent.decodeStored(&k, bytes, &out) catch return r;
+            r.op = it.op;
+            r.applied = it.applied;
+            r.steps = it.steps.len;
+            if (it.applied < it.steps.len) {
+                const slot = route_table.slotOf(steps.Step.fromRec(it.steps[it.applied]).homeIno());
+                r.next_slot = slot;
+                r.next_home = switch (self.resolver.homeOf(self.resolver.ctx, slot)) {
+                    .local => .local,
+                    .foreign => |f| .{ .foreign = f.holder },
+                    .unreachable_ => |u| .{ .unreachable_ = u.holder },
+                };
+            }
+            return r;
+        }
+
+        /// The stuck transitions since the last call, one warn line each
+        /// (the tripwire counts them; this names them).
+        fn nameNewlyStuck(self: *Self, now: u64) void {
+            var buf: [STUCK_NAMED_PER_TICK]intent.Stuck = undefined;
+            for (self.register.newlyStuck(now, &buf)) |s| {
+                const r = self.describeStuck(s, now);
+                const err_name: []const u8 = if (r.last_err == 0) "none failed" else @errorName(@errorFromInt(r.last_err));
+                const holder: ?AppenderId = switch (r.next_home) {
+                    .foreign, .unreachable_ => |h| h,
+                    .none, .local => null,
+                };
+                log.warn("cross-owner intent 0x{x} stuck {d} ms: home slot {d}, op {s}, {d} of {d} step(s) attested, next step at slot {?d} ({t}, holder {?d}); last roll-forward attempt: {s}; the cadence's pass {s} {d} ms", .{ r.tx_id, r.age_ms, r.home_slot, if (r.op) |o| @tagName(o) else "(record gone)", r.applied, r.steps, r.next_slot, std.meta.activeTag(r.next_home), holder, err_name, if (r.pass_running) "running for" else "idle for", r.pass_ms });
+            }
         }
 
         /// The cross-owner cadence's pass: a roll-forward only while the
@@ -1164,7 +1249,8 @@ pub fn Plane(comptime Store: type) type {
             self.register.publish(now);
             if (!self.register.anyAbandoned()) return 0;
             stats.xv_cadence_passes.inc();
-            self.last_pass_ns = now;
+            self.pass_started_ns.store(clock.monotonicNs(), .monotonic);
+            defer self.pass_ended_ns.store(clock.monotonicNs(), .monotonic);
             const slots_buf = self.gpa.alloc(u16, route_table.W) catch return error.OutOfMemory;
             defer self.gpa.free(slots_buf);
             const slots_ = self.resolver.localSlots(self.resolver.ctx, slots_buf);

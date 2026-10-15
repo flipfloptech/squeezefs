@@ -500,6 +500,26 @@ test "a ship that fails leaves the intent OPEN (abandoned on the register, never
     try testing.expect(f.a.plane.register.anyAbandoned());
     try testing.expect((try f.b.dentry(DIR_B, "f")) == null);
     try testing.expectEqual(s0.open + 1, intent.stats.xv_cross_owner_intents_open.load());
+    // A pass whose ship fails too keeps it open and notes the failure.
+    f.a.plane.seams.ship_fail_at = f.a.plane.ships.load(.monotonic) + 1;
+    try testing.expectEqual(@as(u32, 0), try f.a.plane.cadenceTick(clock.monotonicNs()));
+    // Past the grace the stuck entry is named ONCE, described from its
+    // record and the resolver: the line that tells a failing pass from
+    // one that never returns (the shared hot directory row's open intents).
+    var harvest: [ops.STUCK_NAMED_PER_TICK]intent.Stuck = undefined;
+    const later = clock.monotonicNs() + intent.STUCK_GRACE_NS + 1;
+    const named = f.a.plane.register.newlyStuck(later, &harvest);
+    try testing.expectEqual(@as(usize, 1), named.len);
+    const r = f.a.plane.describeStuck(named[0], later);
+    try testing.expectEqual(intent.Op.create, r.op.?);
+    try testing.expectEqual(@as(usize, 2), r.steps);
+    try testing.expectEqual(@as(u16, 1), r.applied);
+    try testing.expectEqual(route_table.slotOf(DIR_B), r.next_slot.?);
+    try testing.expectEqual(f.b.plane.own_id, r.next_home.foreign);
+    try testing.expectEqual(@as(u16, @intFromError(error.ShipFailed)), r.last_err);
+    try testing.expect(!r.pass_running);
+    try testing.expect(r.age_ms >= intent.STUCK_GRACE_NS / std.time.ns_per_ms);
+    try testing.expectEqual(@as(usize, 0), f.a.plane.register.newlyStuck(later, &harvest).len);
     // The cadence: the pass rolls the plan forward (the ship now lands).
     const recovered0 = ops.stats.xv_recovered.load();
     try testing.expectEqual(@as(u32, 1), try f.a.plane.cadenceTick(clock.monotonicNs()));

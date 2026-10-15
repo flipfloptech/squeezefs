@@ -359,7 +359,16 @@ pub const Entry = struct {
     counted: bool,
     /// The home the record lives under (the cadence's reconciliation).
     home: u64,
+    /// The last roll-forward attempt's failure (`@intFromError`; 0 = none
+    /// failed yet) — named when the entry turns stuck.
+    last_err: u16 = 0,
+    /// Its stuck transition was handed out by `newlyStuck` (named once).
+    stuck_named: bool = false,
 };
+
+/// An entry that crossed `STUCK_GRACE_NS` since the last harvest: what the
+/// plane names in the stuck intent's log line.
+pub const Stuck = struct { tx_id: u64, home: u64, age_ns: u64, last_err: u16 };
 
 /// Open intents of this mount: `tx_id → Entry`, sized once at the plane's
 /// arm (`XV_MAX_STEPS`-class plans in flight per lane; the live population
@@ -521,6 +530,32 @@ pub const Register = struct {
         const before = stats.xv_cross_owner_intents_stuck.load();
         stats.xv_cross_owner_intents_stuck.set(stuck);
         if (stuck > before) stats.xv_cross_owner_intent_stuck.fire("an abandoned cross-owner intent is older than the membership TTL");
+    }
+
+    /// A roll-forward attempt of `tx_id` failed with `e` (kept for the
+    /// stuck transition's line).
+    pub fn noteFailure(self: *Register, tx_id: u64, e: anyerror) void {
+        self.lock.lockUncancelable(self.io);
+        defer self.lock.unlock(self.io);
+        if (self.map.getPtr(tx_id)) |entry| entry.last_err = @intFromError(e);
+    }
+
+    /// The abandoned entries past the grace not handed out before (into
+    /// `out`; one that does not fit is handed out by a later call).
+    pub fn newlyStuck(self: *Register, now_ns: u64, out: []Stuck) []Stuck {
+        self.lock.lockUncancelable(self.io);
+        defer self.lock.unlock(self.io);
+        var n: usize = 0;
+        var it = self.map.iterator();
+        while (it.next()) |e| {
+            if (n == out.len) break;
+            const v = e.value_ptr;
+            if (v.state != .abandoned or v.stuck_named or now_ns -| v.since_ns <= STUCK_GRACE_NS) continue;
+            v.stuck_named = true;
+            out[n] = .{ .tx_id = e.key_ptr.*, .home = v.home, .age_ns = now_ns -| v.since_ns, .last_err = v.last_err };
+            n += 1;
+        }
+        return out[0..n];
     }
 
     pub fn count(self: *Register) usize {
@@ -716,9 +751,20 @@ test "the register: minted ≡ retired + open; in-flight → durable → retired
     r.noteTaken(11);
     try testing.expect(!r.anyAbandoned());
     r.noteAbandoned(11);
+    r.noteFailure(11, error.ShipFailed);
     const stuck_before = stats.xv_cross_owner_intent_stuck.load();
     r.publish(1000 + STUCK_GRACE_NS);
     try testing.expectEqual(@as(u64, 0), stats.xv_cross_owner_intents_stuck.load());
+    var harvest: [4]Stuck = undefined;
+    try testing.expectEqual(@as(usize, 0), r.newlyStuck(1000 + STUCK_GRACE_NS, &harvest).len);
+    // Past the grace the transition is handed out ONCE, with the last
+    // failed attempt's error.
+    const named = r.newlyStuck(1001 + STUCK_GRACE_NS, &harvest);
+    try testing.expectEqual(@as(usize, 1), named.len);
+    try testing.expectEqual(@as(u64, 11), named[0].tx_id);
+    try testing.expectEqual(STUCK_GRACE_NS + 1, named[0].age_ns);
+    try testing.expectEqual(@as(u16, @intFromError(error.ShipFailed)), named[0].last_err);
+    try testing.expectEqual(@as(usize, 0), r.newlyStuck(1002 + STUCK_GRACE_NS, &harvest).len);
     stats.xv_cross_owner_intent_stuck.resetLogBudgetForTest();
     @import("../../../core/log.zig").testing.expectErrorLogs(1);
     r.publish(1001 + STUCK_GRACE_NS);

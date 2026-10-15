@@ -18,6 +18,8 @@ const xv = @import("xv.zig");
 const wire_plane = @import("wire_plane.zig");
 const acquire = @import("slots/acquire.zig");
 const lt = @import("slots/lease_table.zig");
+const slots_mod = @import("slots.zig");
+const slots_plane = @import("slots/plane.zig");
 const log = @import("../../core/log.zig");
 
 comptime {
@@ -122,6 +124,74 @@ test "linux: THE ACCEPTER'S INSTALL OF A WIRE GRANT (0003 §X.5; found by the on
     const after = (try b.lookup(gpa, key.TREE_INODES, &k)) orelse return error.TestRecordLost;
     defer gpa.free(after);
     try testing.expectEqualStrings("written by A", after);
+}
+
+/// The leases a plane's own regions hold, off its table.
+fn ownLeases(p: *slots_plane.Plane) u64 {
+    var held: u64 = 0;
+    for (p.own_ids[0..p.own_n.load(.acquire)]) |*o| held += p.table.heldCount(o.load(.acquire));
+    return held;
+}
+
+/// The process-wide `slot_leases_held` against what the live planes'
+/// own regions hold: the gauge's move since `g0` IS their sum.
+fn expectLeaseGauge(g0: u64, planes: []const *slots_plane.Plane) !void {
+    var held: u64 = 0;
+    for (planes) |p| held += ownLeases(p);
+    const now = slots_mod.stats.slot_leases_held.load();
+    try testing.expect(now >= g0);
+    try testing.expectEqual(held, now - g0);
+}
+
+test "linux: THE LEASE GAUGE IS ONE EXACT SUM (rung-10-gate-blockers-2 §7 — `slot_leases_held` read 18,446,744,073,709,551,452, −164 wrapped, on A after the rejoin row: the arm added the table's whole count, a wire grant added nothing at the manager, every release subtracted one, a joiner's close subtracted the foreign views it had loaded): after A's arm, B's join, B's accept of A's slot, B's release of every lease, B's close and B's re-join under the same mountpoint, the gauge moved by exactly the leases the live planes' own regions hold, never below where it started" {
+    const gpa = testing.allocator;
+    const g0 = slots_mod.stats.slot_leases_held.load();
+    {
+        const s = try meta_set.TestSet.create(gpa, "lease-gauge", 1);
+        defer s.destroy();
+        try s.env.put("SQUEEZEFS_MW_BIND", "127.0.0.1:0");
+        const set = try s.open();
+        defer set.close();
+        var locks = try dlm.Manager.init(gpa, 64);
+        defer locks.deinit();
+        const bound = try xv.set_bind.Bound.create(gpa, s.io(), set, &locks, &s.env);
+        defer bound.destroy(gpa);
+        const plane = (try wire_plane.WirePlane.start(gpa, s.io(), set, &s.env, 4, 1 << 30, &bound.plane, false)).?;
+        defer plane.stop();
+        const be0 = set.volumes[0];
+        try expectLeaseGauge(g0, &.{be0.slots});
+        const slot = try managerRotorSlot(gpa, be0);
+        const join: meta_set.OpenOptions = .{ .env = &s.env, .cache_budget_bytes = 64 << 20, .cpus = 4, .join = .{ .mountpoint = "/build/tmp/mnt-lease-gauge-b", .endpoint = plane.advertised } };
+        {
+            const b = try MetaSet.open(gpa, s.io(), s.pathList(), join);
+            defer b.close();
+            const bj = b.volumes[0];
+            const me = bj.joined.?.appenderId();
+            try expectLeaseGauge(g0, &.{ be0.slots, bj.slots });
+            // A's slot moves to B: A's share falls by one, B's rises by one.
+            try testing.expectEqual(acquire.Verbs.OfferResult.offered, try be0.slots.verbs.offerSlot(lt.MANAGER, slot, me, std.math.maxInt(u64)));
+            const sink = bj.slots.carriageSink();
+            sink.offered(sink.ctx, slot, lt.MANAGER);
+            try testing.expect(be0.slots.table.view(slot).leasedBy(me));
+            try expectLeaseGauge(g0, &.{ be0.slots, bj.slots });
+            // B returns every lease it holds: A's share is unchanged by a
+            // wire lessee's release.
+            bj.slots.releaseAllForLeave(me);
+            try testing.expectEqual(@as(u64, 0), ownLeases(bj.slots));
+            try expectLeaseGauge(g0, &.{ be0.slots, bj.slots });
+        }
+        // B's close takes out its own share only (its table's views of A's
+        // leases were never in it).
+        try expectLeaseGauge(g0, &.{be0.slots});
+        {
+            // The re-join re-adopts under the same mountpoint's id.
+            const b = try MetaSet.open(gpa, s.io(), s.pathList(), join);
+            defer b.close();
+            try expectLeaseGauge(g0, &.{ be0.slots, b.volumes[0].slots });
+        }
+        try expectLeaseGauge(g0, &.{be0.slots});
+    }
+    try testing.expectEqual(g0, slots_mod.stats.slot_leases_held.load());
 }
 
 test "linux: THE CACHE BARRIER AT A LEASE MOVE (0003 §X.5; found by the online fsck row — every name B created in the directory it took by handover was gone after B's unmount: a wire lessee appends frames into its leaves IN PLACE under an unchanged root pointer, and the manager re-adopting the released slot opened it off the leaf image it had cached before the grant): B takes a slot from A, writes into it and checkpoints, leaves cleanly (the slot back to A); A reads every record B wrote, and A's later write lands beside them" {

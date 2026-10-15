@@ -92,9 +92,14 @@ pub const Plane = struct {
     /// A joiner's wire-grant installs, one at a time (`installWireGrant`).
     install_lock: Io.Mutex = .init,
     armed: bool = false,
-    /// The process-wide `slot_leases_held` gauge counts this plane's leases
-    /// once the arm folded them in (the arm's own grants are in the fold).
+    /// The process-wide `slot_leases_held` gauge carries this plane's share
+    /// from the arm on: `gauge_share` is the count last folded in, re-read
+    /// from the table at every lease change (`syncLeaseGauge`), so the
+    /// gauge is always Σ of the planes' shares — never a running sum of
+    /// per-event deltas that two event classes can disagree on.
     gauge_counted: bool = false,
+    gauge_share: u64 = 0,
+    gauge_lock: jc.SpinLock = .{},
     /// Per held slot: what is durably named where.
     pub_lock: jc.SpinLock = .{},
     publications: std.AutoHashMapUnmanaged(u16, page_budget.Publication) = .empty,
@@ -236,7 +241,7 @@ pub const Plane = struct {
 
     pub fn deinit(self: *Plane) void {
         self.cadence.deinit(self.io);
-        if (self.gauge_counted) slots.stats.slot_leases_held.sub(self.table.leasedCount());
+        self.retireLeaseGauge();
         self.cache.deinit();
         self.judge.deinit();
         self.publications.deinit(self.gpa);
@@ -318,6 +323,37 @@ pub const Plane = struct {
     pub fn setOwn(self: *Plane, ids: []const AppenderId) void {
         for (ids, 0..) |id, i| self.own_ids[i].store(id, .release);
         self.own_n.store(@intCast(ids.len), .release);
+    }
+
+    /// The leases this process's own regions hold on this volume
+    /// (`own_ids`): a wire lessee's leases are its own process's share, so
+    /// the fleet's processes sum every lease exactly once.
+    fn ownLeaseCount(self: *Plane) u64 {
+        const n = self.own_n.load(.acquire);
+        var total: u64 = 0;
+        for (self.own_ids[0..n]) |*o| total += self.table.heldCount(o.load(.acquire));
+        return total;
+    }
+
+    /// The gauge's share re-read from the table: the difference since the
+    /// last fold goes in (add before sub keeps Σ ≥ 0 across planes).
+    /// Serialized per plane, so the last fold is the newest count.
+    fn syncLeaseGauge(self: *Plane) void {
+        if (!self.gauge_counted) return;
+        self.gauge_lock.lock();
+        defer self.gauge_lock.unlock();
+        const now = self.ownLeaseCount();
+        if (now >= self.gauge_share) slots.stats.slot_leases_held.add(now - self.gauge_share) else slots.stats.slot_leases_held.sub(self.gauge_share - now);
+        self.gauge_share = now;
+    }
+
+    /// The plane leaves: its whole share comes out.
+    fn retireLeaseGauge(self: *Plane) void {
+        self.gauge_lock.lock();
+        defer self.gauge_lock.unlock();
+        slots.stats.slot_leases_held.sub(self.gauge_share);
+        self.gauge_share = 0;
+        self.gauge_counted = false;
     }
 
     // ---- the conveyor's step 0 ----
@@ -415,14 +451,13 @@ pub const Plane = struct {
     /// A cutover moved `slot` off this volume: the lease, the view and the
     /// publication go (the engine deletes tree 0's record).
     pub fn slotLeft(self: *Plane, slot: u16) void {
-        const was_leased = self.table.view(slot).state == .leased;
         self.table.evict(slot);
         self.cache.forget(slot);
         self.judge.window.forget(slot);
         self.pub_lock.lock();
         _ = self.publications.remove(slot);
         self.pub_lock.unlock();
-        if (was_leased and self.gauge_counted) slots.stats.slot_leases_held.sub(1);
+        self.syncLeaseGauge();
     }
 
     // ---- the arm (spec §2.1) ----
@@ -552,8 +587,8 @@ pub const Plane = struct {
         // of 1 ms and the fleet's ≈ 0.3 ms ship (spec §4.4) — N_floor 17;
         // the first handover and the first ships replace both.
         self.judge.seed(COLD_BARRIER_NS, COLD_SHIP_NS);
-        slots.stats.slot_leases_held.add(self.table.leasedCount());
         self.gauge_counted = true;
+        self.syncLeaseGauge();
         // The frame plane: the device fence decides rule 1/4's class; the
         // prime's overrides retire now that the table holds every lease.
         self.frames.setFenced(if (be.guard) |g| g.prClient() != null else false);
@@ -660,8 +695,8 @@ pub const Plane = struct {
             self.table.setRotor(g.slot, true);
         }
         self.judge.seed(COLD_BARRIER_NS, COLD_SHIP_NS);
-        slots.stats.slot_leases_held.add(self.table.heldCount(self.me));
         self.gauge_counted = true;
+        self.syncLeaseGauge();
         // The frame plane: a joiner holds no device fence of its own (the
         // manager's WERO is the set's); its stamps are the table's words
         // for its leases from here on.
@@ -761,6 +796,7 @@ pub const Plane = struct {
         };
         self.parkMidInstall();
         try self.table.load(slot, .{ .variant = .leased, .appender_id = self.me, .g = g, .root = words.root, .cursor = words.cursor, .slot_tree_extents = words.extents, .seq_floor = words.seq_floor });
+        self.syncLeaseGauge();
     }
 
     /// A joiner whose holder cache names ITSELF for `slot` while its table
@@ -891,8 +927,8 @@ pub const Plane = struct {
         self.cache.learn(slot, .{ .appender_id = holder, .g = g }) catch return error.OutOfMemory;
         if (fresh) {
             try self.setPublicationE(slot, .{ .root = words.root, .cursor = words.cursor, .home = .tree0, .tree0_root = words.root });
-            if (self.gauge_counted) slots.stats.slot_leases_held.add(1);
         }
+        self.syncLeaseGauge();
     }
 
     fn releasedFn(ctx: *anyopaque, slot: u16) void {
@@ -900,7 +936,7 @@ pub const Plane = struct {
         self.cache.forget(slot);
         self.judge.window.forget(slot);
         self.table.resetHolderOps(slot);
-        if (self.gauge_counted) slots.stats.slot_leases_held.sub(1);
+        self.syncLeaseGauge();
         // The manager maintains every UNLEASED tree (charter §5.5): a tree
         // a wire lessee returned opens here at the released root — its
         // reads are local from now on (the divert's `local` verdict).

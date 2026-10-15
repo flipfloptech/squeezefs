@@ -1,19 +1,23 @@
 #!/usr/bin/env bash
-# gate-train — THE gate for `dev`: one runner gates dev's head on both venues
-# (the Linux venue through scripts/venue's gate lock, then macOS), re-gates an
-# unchanged green head until it has three consecutive greens (charter §11's
-# release criterion: three consecutive clean runs on one binary), and prints
-# ONE line per run so a monitor can react. Agents land after targeted tests
-# and the macOS gate; the train owns the full venue gating (AGENTS.md).
+# gate-train — THE gate for `dev`: one runner gates dev's head on every Linux venue
+# in GATE_TRAIN_VENUES (each through scripts/venue, so each waits for that venue's
+# gate lock and build slots), re-gates an unchanged green head until it has three
+# consecutive greens on ALL of them (charter §11's release criterion: three
+# consecutive clean runs on one binary), and prints ONE line per run so a monitor
+# can react. Agents land after targeted runs on a Linux venue; the train owns the
+# full gating (AGENTS.md "Landing"). The product is Linux-only (charter §1.2): no
+# macOS gate (owner ruling 2026-10-14) — `zig build gate` on macOS stays an
+# optional local check of the portable modules.
 #
 #   scripts/gate-train            # loop forever (run it as a monitor)
 #   scripts/gate-train --once     # gate dev's head once and exit
+#   GATE_TRAIN_VENUES="vm kamrui" # the venues (default: vm); see scripts/venue
 #
-# State lives in .gate-train/ (ignored): ledger.tsv (sha, venue, macOS, wall,
-# failures), the last run's logs. The train gates a detached worktree
-# .wt-train so nothing it does touches an agent's tree; each run appends a
-# comment to src/core/clock.zig there (and restores it) so the test steps run
-# for real instead of answering from the build cache.
+# State lives in .gate-train/ (ignored): ledger.tsv (utc, sha, verdict, one
+# venue:result:wall field per venue, failures) and each run's logs. The train
+# gates a detached worktree .wt-train so nothing it does touches an agent's tree;
+# each run appends a comment to src/core/clock.zig there (and restores it) so the
+# test steps run for real instead of answering from the build cache.
 set -uo pipefail
 # The logs carry UTF-8; macOS awk refuses multibyte input outside the C locale.
 export LC_ALL=C
@@ -21,11 +25,13 @@ export LC_ALL=C
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 STATE=$REPO/.gate-train
 TRAIN=$REPO/.wt-train
+VENUES=${GATE_TRAIN_VENUES:-vm}
 POLL_S=${GATE_TRAIN_POLL_S:-300}   # how often an idle train looks for a new head
 WANT_STREAK=3                      # charter §11: three consecutive clean runs
 once=0; [ "${1:-}" = --once ] && once=1
 mkdir -p "$STATE"
-[ -f "$STATE/ledger.tsv" ] || printf 'utc\tsha\tvenue\tvenue_wall_s\tmacos\tmacos_wall_s\tfailures\n' > "$STATE/ledger.tsv"
+LEDGER=$STATE/ledger-v2.tsv
+[ -f "$LEDGER" ] || printf 'utc\tsha\tverdict\tvenues\tfailures\n' > "$LEDGER"
 
 if [ ! -d "$TRAIN" ]; then
   git -C "$REPO" worktree add --detach "$TRAIN" dev >/dev/null 2>&1 || { echo "gate-train: cannot create $TRAIN"; exit 1; }
@@ -40,41 +46,34 @@ failures() {  # failed tests by name, else the steps that failed on their own (n
   } | sort -u | head -8 | paste -sd ';' -
 }
 
-reds_of() {  # consecutive reds on $1 at the end of the ledger
-  awk -F'\t' -v s="$1" 'NR>1 { if ($2==s && ($3=="red" || $5=="red")) n++; else n=0 } END { print n+0 }' "$STATE/ledger.tsv"
-}
-
-streak_of() {  # consecutive greens on $1 at the end of the ledger (both venues)
-  awk -F'\t' -v s="$1" 'NR>1 { if ($2==s && $3=="green" && $5=="green") n++; else n=0 } END { print n+0 }' "$STATE/ledger.tsv"
-}
+# Consecutive rows on $1 at the end of the ledger with verdict $2 (green|red).
+run_of() { awk -F'\t' -v s="$1" -v want="$2" 'NR>1 { if ($2==s && $3==want) n++; else n=0 } END { print n+0 }' "$LEDGER"; }
 
 run_once() {
   # (One word per `local`: bash expands every word of a `local` before assigning any.)
   local sha=$1
-  local vlog=$STATE/venue-$sha.log mlog=$STATE/macos-$sha.log t0 t1 vres mres vwall mwall fails
+  local verdict=green fields="" fails="" line="" v log t0 rc wall res
   git -C "$TRAIN" checkout -q --detach "$sha" || return 1
   echo "// gate-train run $(date +%s%N)" >> "$TRAIN/src/core/clock.zig"
-  t0=$(date +%s)
-  "$REPO/scripts/venue" "cd '$TRAIN' && timeout 3900 zig build --cache-dir /build/zig-cache-v2 gate --summary all" > "$vlog" 2>&1
-  local vrc=$?
-  t1=$(date +%s); vwall=$((t1 - t0))
-  if [ $vrc -eq 0 ]; then vres=green; else vres=red; fi
-  t0=$(date +%s)
-  ( cd "$TRAIN" && timeout 1800 zig build gate --summary all ) > "$mlog" 2>&1
-  local mrc=$?
-  t1=$(date +%s); mwall=$((t1 - t0))
-  if [ $mrc -eq 0 ]; then mres=green; else mres=red; fi
+  for v in $VENUES; do
+    log=$STATE/$v-$sha.log
+    t0=$(date +%s)
+    SQZ_VENUE=$v "$REPO/scripts/venue" "cd '$TRAIN' && timeout 3900 zig build --cache-dir /build/zig-cache-v2 gate --summary all" > "$log" 2>&1
+    rc=$?
+    wall=$(( $(date +%s) - t0 ))
+    if [ $rc -eq 0 ]; then res=green; else res=red; verdict=red; fails="$fails${fails:+;}$(failures "$log" | sed "s/^/$v:/; s/;/;$v:/g")"; fi
+    fields="$fields${fields:+ }$v:$res:${wall}s"
+    line="$line | $v $(echo $res | tr a-z A-Z) $(summary "$log") ${wall}s"
+  done
   git -C "$TRAIN" checkout -q -- src/core/clock.zig
-  fails=$( { [ $vrc -ne 0 ] && failures "$vlog" | sed 's/^/venue:/'; [ $mrc -ne 0 ] && failures "$mlog" | sed 's/^/macos:/'; } | paste -sd ';' -)
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%MZ)" "$sha" "$vres" "$vwall" "$mres" "$mwall" "${fails:-}" >> "$STATE/ledger.tsv"
-  local streak; streak=$(streak_of "$sha")
-  echo "gate-train $(git -C "$REPO" log -1 --format='%h %s' "$sha" | cut -c1-60) — venue $(echo $vres | tr a-z A-Z) $(summary "$vlog") ${vwall}s | macOS $(echo $mres | tr a-z A-Z) $(summary "$mlog") ${mwall}s | streak ${streak}/${WANT_STREAK}${fails:+ | FAIL: $fails}"
+  printf '%s\t%s\t%s\t%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%MZ)" "$sha" "$verdict" "$fields" "$fails" >> "$LEDGER"
+  echo "gate-train $(git -C "$REPO" log -1 --format='%h %s' "$sha" | cut -c1-60)$line | streak $(run_of "$sha" green)/${WANT_STREAK}${fails:+ | FAIL: $fails}"
 }
 
 while true; do
   head=$(git -C "$REPO" rev-parse --short=12 dev)
-  streak=$(streak_of "$head")
-  if [ "$(reds_of "$head")" -ge 2 ]; then
+  streak=$(run_of "$head" green)
+  if [ "$(run_of "$head" red)" -ge 2 ]; then
     # Red twice in a row on this head: not a flake to retry — wait for a fix.
     [ "$once" = 1 ] && { echo "gate-train $head is red twice; waiting for dev to move"; exit 1; }
     sleep "$POLL_S"; continue
@@ -85,5 +84,5 @@ while true; do
   fi
   [ "$once" = 1 ] && exit 0
   # A green streak complete on an unchanged head: idle until dev moves.
-  [ "$(streak_of "$head")" -ge "$WANT_STREAK" ] && sleep "$POLL_S"
+  [ "$(run_of "$head" green)" -ge "$WANT_STREAK" ] && sleep "$POLL_S"
 done

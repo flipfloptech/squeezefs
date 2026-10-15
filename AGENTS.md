@@ -17,16 +17,19 @@ take the better design and add a row to the ledger in decision 0002 before diver
 
 ## Venue
 
-Linux only (charter §1.2). The dev box is macOS; the Linux venue is the macOS
-`container` `sqz-zig` (Ubuntu 24.04 on the **7.2.6-sqz** kernel series, Zig 0.17.0,
-`fuse.enable_uring` available, this repo mounted rw at the same path).
+Linux only (charter §1.2). The dev box is macOS; there are two Linux venues, both
+reached through `scripts/venue`:
+- `vm` (default): the macOS `container` `sqz-zig` — aarch64, Ubuntu 24.04 on the
+  **7.2.6-sqz** kernel series, Zig 0.17.0, this repo mounted rw at the same path.
+- `kamrui` (`SQZ_VENUE=kamrui`): the x86_64 box `kamrui-dev` over ssh — 12 threads,
+  61 GiB, local NVMe; the repo rsynced to the same path before every command.
 
 ```
 scripts/venue up                 # create the container once
 scripts/venue status             # kernel / zig / fuse facts
-scripts/venue zig build gate     # THE per-commit gate, in Linux
+scripts/venue zig build gate     # the full gate, in Linux (the gate train runs it)
 scripts/venue test "filter"      # unit tests matching a filter, in Linux
-zig build gate                   # same gate on macOS: portable modules only
+zig build gate                   # optional local check on macOS: portable modules only
 ```
 
 Portable modules (codecs, derivations, knobs, counters, pure state machines) run on
@@ -48,7 +51,9 @@ moves the smoke's data volumes + cache dir there. Run `scripts/venue trim` after
 
 `zig build gate` = `zig fmt --check` + unit tests + the static rails (`tests/rails.zig`:
 every `SQUEEZEFS_*` literal is a registry row; every non-retired row is read by some
-module — a row nothing reads is dead code and goes red). Keep it green on both venues.
+module — a row nothing reads is dead code and goes red). Keep it green on the Linux
+venues; the macOS run is an optional local check (owner ruling 2026-10-14: the product is
+Linux-only, so no macOS gate is required).
 
 Its test steps run side by side (`docs/evidence/rung-10-gate-speed.md`): the unit tests
 and the smoke are shard sets of one compiled binary under `tests/test_runner.zig`, so a
@@ -61,13 +66,14 @@ table, `scripts/venue zig build costs` regenerates `tests/costs/` — commit it.
 
 ## Landing (the gate train owns the full gate)
 
-`scripts/gate-train` gates `dev`'s head on both venues, re-gates a green head until it has
-three consecutive greens (charter §11's release criterion), and reports one line per run
-(`.gate-train/ledger.tsv`). So a change lands like this:
+`scripts/gate-train` gates `dev`'s head on the Linux venues in `GATE_TRAIN_VENUES`,
+re-gates a green head until it has three consecutive greens on all of them (charter §11's
+release criterion), and reports one line per run (`.gate-train/ledger-v2.tsv`). So a change
+lands like this:
 
 - **Light tier** (tests, accounting, small defects, docs): the red test, the fix, the
-  targeted runs (`scripts/venue test "<filter>"`, the affected smoke rows), `zig build gate`
-  on macOS (~3 min); rebase, `--ff-only`, done. No full venue gate of your own.
+  targeted runs on a Linux venue (`scripts/venue test "<filter>"`, the affected smoke
+  rows); rebase, `--ff-only`, done. No full gate of your own.
 - **Full tier** (on-disk format, wire protocol, a lock-free core or its model, the FUSE
   contract, the durability or coherence laws): the light tier plus ONE full venue gate
   before landing (`scripts/venue 'timeout 3900 zig build --cache-dir /build/zig-cache-v2

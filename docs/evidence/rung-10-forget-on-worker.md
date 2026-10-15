@@ -63,4 +63,9 @@ That build drained the gather to empty on every wake: 22 corpses per destroy ent
 full batches on a wake, which restores one entry per 64. The red test pins this: 64 + 1 corpses give
 one entry and leave the tail for the tick. The loops above were not re-run on that last change.
 
-**Gate.** `GATE_RESULT`
+**Gate.** One full gate on kamrui at `8db2028`: 48 of 53 steps passed, 2,941 of 3,023 tests passed (80
+skipped, 2 failed). Both failures are rows already in `docs/gates/flakes.md`:
+- "THE WRITE-BACK TIMER UNDER A WRITER STORM" on kamrui (gate waits 0, cold flushes 0).
+- "THE KVDA PAGE SINK's fallback", here as `cannot open metadata set … device I/O failed`.
+
+Neither touches the forget, the reclaim or the worker pass. Unit and kv_fs targeted runs were green.

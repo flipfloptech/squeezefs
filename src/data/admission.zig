@@ -263,6 +263,9 @@ pub const Governor = struct {
     foreground_cur: Atomic(u64) = .init(0),
     foreground_prev: Atomic(u64) = .init(0),
     tokens: Atomic(u64) = .init(0),
+    /// This governor's share of `read_admission_governor_denials`: the
+    /// per-read-path view, which no other read path in the process moves.
+    denials: counters.ShardedCounter = .{},
 
     pub fn init(fill_pct: u64, block: u64) Governor {
         std.debug.assert(fill_pct <= 100 and block > 0);
@@ -376,6 +379,7 @@ pub const Governor = struct {
     pub fn allowEscalation(self: *Governor, block: u64, now_ns: u64) bool {
         if (!self.clampEngaged(now_ns) or self.reserveTokens(block)) return true;
         stats.read_admission_governor_denials.inc();
+        self.denials.inc();
         return false;
     }
 
@@ -413,6 +417,9 @@ pub const Admission = struct {
     ghost: GhostTable,
     cooldown: EscalationCooldown,
     governor: Governor,
+    /// This admission's share of `ranged_read_ghost_escalations`: the
+    /// per-read-path view, which no other read path in the process moves.
+    escalations: counters.ShardedCounter = .{},
 
     pub fn init(gpa: Allocator, policy: Policy, fill_pct: u64, block: u64) Allocator.Error!Admission {
         var ghost = try GhostTable.init(gpa);
@@ -462,6 +469,7 @@ pub const Admission = struct {
         if (!self.governor.allowEscalation(block, now_ns)) return false;
         self.cooldown.record(key, now_ns);
         stats.ranged_read_ghost_escalations.inc();
+        self.escalations.inc();
         if (odirect) stats.read_odirect_ghost_admits.inc();
         return true;
     }
@@ -539,6 +547,7 @@ test "governor: waste → clamp → denials by ONE token CAS; tokens minted once
     while (i < 20) : (i += 1) admits += @intFromBool(g.allowEscalation(block, now));
     try testing.expectEqual(@as(u32, 12), admits);
     try testing.expectEqual(denials_before + 8, stats.read_admission_governor_denials.load());
+    try testing.expectEqual(@as(u64, 9), g.denials.load());
     try testing.expect(!g.escalationWouldAdmit(block, now));
     const trans_before = stats.read_admission_stream_transients.load();
     try testing.expect(!g.allowStreamAdmission(block, now));
@@ -639,6 +648,7 @@ test "the §1.5 decision table" {
     const od_before = stats.read_odirect_ghost_admits.load();
     try testing.expect(a.rangedEscalation(k3, big, false, true, now));
     try testing.expectEqual(esc_before + 1, stats.ranged_read_ghost_escalations.load());
+    try testing.expectEqual(@as(u64, 1), a.escalations.load());
     try testing.expectEqual(od_before + 1, stats.read_odirect_ghost_admits.load());
     try testing.expect(!a.rangedEscalation(k3, big, false, false, now));
     // Red pauses escalation; `always`/`never` never escalate.

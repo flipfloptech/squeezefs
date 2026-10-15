@@ -2298,11 +2298,11 @@ test "the ranged-vs-whole decision table: a random 4 KiB cold read on a passthro
         try testing.expectEqual(bounces0 + 1, stats.ranged_read_unaligned_bounces.load());
         try testing.expectEqual(@as(u64, 8192), f.device_read_bytes.load(.monotonic));
         // The ghost second touch of a ranged key escalates to ONE admitted whole-block fetch.
-        const esc0 = admission.stats.ranged_read_ghost_escalations.load();
+        const esc0 = f.rp.adm.escalations.load();
         const n3 = try f.rp.read(io, 7, 16384, 4096, .{ .buf = buf[0..4096] }, .{});
         try testing.expectEqual(@as(usize, 4096), n3);
         try Fixture.expected(3 * Fixture.bs + 16384, buf[0..4096]);
-        try testing.expectEqual(esc0 + 1, admission.stats.ranged_read_ghost_escalations.load());
+        try testing.expectEqual(esc0 + 1, f.rp.adm.escalations.load());
         try testing.expect(f.rp.hot.contains(key));
         try testing.expect(f.rp.nvme.has(key));
         try testing.expectEqual(@as(u64, 8192 + Fixture.bs), f.device_read_bytes.load(.monotonic));
@@ -2435,10 +2435,10 @@ test "a transformed volume's random 4 KiB read costs the table grain + ONE frame
     // The second touch of block 1 is a ghost hit: ONE whole image, then a
     // hot serve.
     const dev2 = f.device_read_bytes.load(.monotonic);
-    const esc0 = admission.stats.ranged_read_ghost_escalations.load();
+    const esc0 = f.rp.adm.escalations.load();
     _ = try f.rp.read(io, 7, Fixture.bs + 100, 4096, .{ .buf = buf[0..4096] }, .{});
     try Fixture.expected(4 * Fixture.bs + 100, buf[0..4096]);
-    try testing.expectEqual(esc0 + 1, admission.stats.ranged_read_ghost_escalations.load());
+    try testing.expectEqual(esc0 + 1, f.rp.adm.escalations.load());
     try testing.expectEqual(f.chunk, f.device_read_bytes.load(.monotonic) - dev2);
     try testing.expect(f.rp.hot.contains(key1));
     const dev3 = f.device_read_bytes.load(.monotonic);
@@ -2488,14 +2488,18 @@ test "the bounded-waste law under a random sub-block storm over a set ≫ the ho
     const blocks: usize = 16;
     f.size = blocks * Fixture.bs;
     for (0..blocks) |i| f.bind(i, @intCast(i + 1));
-    // A 10 s governor epoch never rolls on its own inside the test; the
-    // epochs are advanced by hand (`roll` at now + k × epoch), adjacent.
+    // The epochs are advanced by hand (`roll` at now + k × epoch), adjacent,
+    // and never on their own: the governor's index is `now / epoch_ns`, so
+    // a finite epoch rolls wherever the storm straddles a multiple of it on
+    // the monotonic clock (a 10 s epoch did between pass 2's fifth and sixth
+    // evictions: the clamp's evidence split over two epochs and a seventh
+    // block escalated). At 2^62 ns `now / epoch_ns` is 0 for ~146 years of uptime.
     const g = &f.rp.adm.governor;
-    g.setEpochNsForTest(10 * std.time.ns_per_s);
+    g.setEpochNsForTest(1 << 62);
     const buf = try alignedBuf(testing.allocator, 4096);
     defer testing.allocator.free(buf);
-    const esc0 = admission.stats.ranged_read_ghost_escalations.load();
-    const denials0 = admission.stats.read_admission_governor_denials.load();
+    // The read path's own counts: no other read path in the process moves them.
+    const adm = &f.rp.adm;
     const l0 = DmaLedger.snap();
     // Pass 1 over blocks 0..7: first touches — ranged windows, the ghost records.
     for (0..8) |b| _ = try f.rp.read(io, 7, @as(u64, b) * Fixture.bs + 4096, 4096, .{ .buf = buf }, .{});
@@ -2505,8 +2509,8 @@ test "the bounded-waste law under a random sub-block storm over a set ≫ the ho
     // evicted) engages the clamp inside the epoch: the seventh and eighth
     // are denied (no tokens until a roll mints them) and stay ranged.
     for (0..8) |b| _ = try f.rp.read(io, 7, @as(u64, b) * Fixture.bs + 8192, 4096, .{ .buf = buf }, .{});
-    try testing.expectEqual(esc0 + 6, admission.stats.ranged_read_ghost_escalations.load());
-    try testing.expectEqual(denials0 + 2, admission.stats.read_admission_governor_denials.load());
+    try testing.expectEqual(@as(u64, 6), adm.escalations.load());
+    try testing.expectEqual(@as(u64, 2), g.denials.load());
     try testing.expectEqual(@as(u64, 1), admission.stats.read_admission_governor_clamped.load());
     g.roll(clock.monotonicNs() + g.epoch_ns);
     try testing.expectEqual(@as(u64, 1), admission.stats.read_admission_governor_clamped.load());
@@ -2523,8 +2527,8 @@ test "the bounded-waste law under a random sub-block storm over a set ≫ the ho
     const demand_before = DmaLedger.snap().demand;
     for (8..16) |b| _ = try f.rp.read(io, 7, @as(u64, b) * Fixture.bs + 8192, 4096, .{ .buf = buf }, .{});
     const l = DmaLedger.snap();
-    try testing.expectEqual(denials0 + 10, admission.stats.read_admission_governor_denials.load());
-    try testing.expectEqual(esc0 + 6, admission.stats.ranged_read_ghost_escalations.load());
+    try testing.expectEqual(@as(u64, 10), g.denials.load());
+    try testing.expectEqual(@as(u64, 6), adm.escalations.load());
     try testing.expectEqual(demand_before, l.demand);
     // The whole storm: 32 reads × 4 KiB user; ranged 26 windows + 6 escalated blocks.
     try testing.expectEqual(@as(u64, 26 * 4096), l.ranged - l0.ranged);

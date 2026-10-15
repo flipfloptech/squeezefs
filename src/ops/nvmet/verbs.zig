@@ -441,7 +441,7 @@ pub fn list(ctx: *Ctx, json: bool) Outcome {
             if (!c.isFabric()) continue;
             if (!first) w.writeByte(',') catch {};
             first = false;
-            const ns = initiator.findNamespaceUnderController(gpa, initiator.SYSFS_ROOT, c.instance) catch null;
+            const ns = initiator.controllerNamespace(gpa, initiator.SYSFS_ROOT, c.instance) catch null;
             w.print("{{\"controller\":\"{s}\",\"device\":", .{c.nameOf()}) catch {};
             if (ns) |n| w.print("\"/dev/{s}\"", .{n.blockName()}) catch {} else w.writeAll("null") catch {};
             w.print(",\"subnqn\":\"{s}\",\"transport\":\"{s}\",\"state\":\"{s}\",\"address\":\"{s}\",\"hostnqn\":\"{s}\"}}", .{ c.subsysnqnOf(), c.transportOf(), c.stateOf(), c.addressOf(), c.hostnqnOf() }) catch {};
@@ -476,7 +476,7 @@ pub fn list(ctx: *Ctx, json: bool) Outcome {
         if (!c.isFabric()) continue;
         if (!any_ctrl) w.writeAll("connected fabric disks:\n") catch {};
         any_ctrl = true;
-        const ns = initiator.findNamespaceUnderController(gpa, initiator.SYSFS_ROOT, c.instance) catch null;
+        const ns = initiator.controllerNamespace(gpa, initiator.SYSFS_ROOT, c.instance) catch null;
         w.print("  {s}: {s} {s} {s} {s} hostnqn {s}\n", .{ c.nameOf(), if (ns) |n| n.blockName() else "(no namespace)", c.subsysnqnOf(), c.transportOf(), c.stateOf(), c.hostnqnOf() }) catch {};
     }
     w.flush() catch {};

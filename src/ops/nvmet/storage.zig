@@ -204,7 +204,7 @@ pub fn list(ctx: *Ctx, json: bool) Outcome {
     if (json) w.writeAll("],\"namespaces\":[") catch {} else w.writeAll("NVMe namespaces:\n") catch {};
     var n_ns: usize = 0;
     for (ctrls) |*c| {
-        const ns = (initiator.findNamespaceUnderController(gpa, initiator.SYSFS_ROOT, c.instance) catch null) orelse continue;
+        const ns = (initiator.controllerNamespace(gpa, initiator.SYSFS_ROOT, c.instance) catch null) orelse continue;
         var bp: [40]u8 = undefined;
         const block = ns.blockPath(&bp);
         const class = classify(ctx.pool, block);

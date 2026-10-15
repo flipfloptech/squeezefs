@@ -23,13 +23,16 @@
 //! reconnect counter that undercounts flaps faster than its cadence — by
 //! design) and the §5.2 refusal ladder as a pure verdict.
 //!
-//! On THIS kernel `CONFIG_NVME_MULTIPATH` is unset: two identities on one
-//! subsystem yield two controllers with their own `nvme<N>n1` nodes (the
+//! On the VM's kernel `CONFIG_NVME_MULTIPATH` is unset: two identities on
+//! one subsystem yield two controllers with their own `nvme<N>n1` nodes (the
 //! kernel warns "multipathing not supported" and proceeds) — the merged
 //! shape cannot arise and `fabrics_host_scoped_subsystems=N` is inert; on
-//! a multipath kernel with `N` two per-mount identities would merge under
-//! one head whose round-robin voids per-mount fencing, which is what the
-//! announcement at the first connect says.
+//! a multipath kernel (a stock distro's, kamrui's) the controller holds only
+//! a hidden path node and the namespace is its subsystem's head, handed out
+//! only while every serving controller is ours (`controllerNamespace`); with
+//! `N` two per-mount identities would merge under one head whose round-robin
+//! voids per-mount fencing, which is what the announcement at the first
+//! connect says.
 
 const std = @import("std");
 const fuzzkit = @import("../../core/fuzzkit.zig");
@@ -553,10 +556,12 @@ pub const Namespace = struct {
     }
 };
 
-/// The FIRST strict-shape `nvme<N>n<Y>` child of `/sys/class/nvme/nvme<N>`
-/// (the per-controller node of a non-multipath kernel), with its facts.
-/// Honest null: a name is never fabricated.
-pub fn findNamespaceUnderController(gpa: Allocator, root: []const u8, instance: u32) !?Namespace {
+/// The namespace controller `nvme<N>` serves, with its facts (spec §3.4):
+/// (a) the FIRST strict-shape `nvme<N>n<Y>` child of `/sys/class/nvme/nvme<N>`
+/// — the per-controller node of a non-multipath kernel (the VM's); else
+/// (b) on a multipath kernel the head of the subsystem dir listing it
+/// (`multipathHead`). Honest null: a name is never fabricated.
+pub fn controllerNamespace(gpa: Allocator, root: []const u8, instance: u32) !?Namespace {
     const names = listDir(gpa, "{s}/class/nvme/nvme{d}", .{ root, instance }) catch |e| switch (e) {
         error.FileNotFound => return null,
         else => return e,
@@ -566,6 +571,50 @@ pub fn findNamespaceUnderController(gpa: Allocator, root: []const u8, instance: 
         const parts = splitNamespaceName(n) orelse continue;
         if (parts.ctrl != instance) continue;
         return namespaceFacts(root, n, parts.ns);
+    }
+    return multipathHead(gpa, root, instance);
+}
+
+/// (b) A multipath kernel (`CONFIG_NVME_MULTIPATH=y` with
+/// `nvme_core.multipath=Y`, a stock distro's default): the controller holds
+/// only the hidden path node `nvme<K>c<N>n<Y>`; the namespace is the head
+/// `nvme<K>n<Y>` of the `nvme-subsys<K>` dir that lists `nvme<N>` — offered
+/// only when every serving controller there carries controller N's identity
+/// (a head shared with another identity round-robins across per-mount
+/// fences: the merged shape, never handed out).
+fn multipathHead(gpa: Allocator, root: []const u8, instance: u32) !?Namespace {
+    var nb: [16]u8 = undefined;
+    const ctrl_name = std.fmt.bufPrint(&nb, "nvme{d}", .{instance}) catch unreachable;
+    const own = readController(root, ctrl_name) orelse return null;
+    const subs = listDir(gpa, "{s}/class/nvme-subsystem", .{root}) catch |e| switch (e) {
+        error.FileNotFound => return null,
+        else => return e,
+    };
+    defer configfs.freeNames(gpa, subs);
+    const prefix = "nvme-subsys";
+    for (subs) |sub| {
+        if (!std.mem.startsWith(u8, sub, prefix)) continue;
+        const k = std.fmt.parseInt(u32, sub[prefix.len..], 10) catch continue;
+        const children = listDir(gpa, "{s}/class/nvme-subsystem/{s}", .{ root, sub }) catch continue;
+        defer configfs.freeNames(gpa, children);
+        var listed = false;
+        for (children) |ch| listed = listed or std.mem.eql(u8, ch, ctrl_name);
+        if (!listed) continue;
+        var head: ?usize = null;
+        for (children, 0..) |ch, i| {
+            if (splitNamespaceName(ch)) |parts| {
+                if (parts.ctrl == k and head == null) head = i;
+                continue;
+            }
+            if (!std.mem.startsWith(u8, ch, "nvme")) continue;
+            _ = std.fmt.parseInt(u32, ch["nvme".len..], 10) catch continue;
+            // A serving controller not provably ours (gone, or another
+            // identity) makes the head shared: never handed out.
+            const c = readController(root, ch) orelse return null;
+            if (!c.hasIdentity(own.hostnqnOf(), own.hostidOf())) return null;
+        }
+        const h = head orelse return null;
+        return namespaceFacts(root, children[h], splitNamespaceName(children[h]).?.ns);
     }
     return null;
 }
@@ -695,7 +744,7 @@ pub const UeventSocket = struct {
 /// as expected (when known), its char twin's sysfs entry and both `/dev`
 /// nodes present (devtmpfs).
 fn namespaceReady(gpa: Allocator, instance: u32, expected_uuid: ?[16]u8) ConnectError!?Namespace {
-    const ns = (findNamespaceUnderController(gpa, SYSFS_ROOT, instance) catch |e| switch (e) {
+    const ns = (controllerNamespace(gpa, SYSFS_ROOT, instance) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return null,
     }) orelse return null;
@@ -755,6 +804,10 @@ pub fn connect(gpa: Allocator, spec: ConnectSpec, expected_uuid: ?[16]u8) Connec
         return error.ReadBackMalformed;
     };
     stats.fabric_connects.inc();
+    // The controller exists from the read-back on: a failure below deletes
+    // it, else it outlives the refusal and keeps reconnecting for
+    // ctrl_loss_tmo (a kamrui gate left five such behind).
+    errdefer deleteController(back.instance) catch {};
     const deadline = clock.monotonicNs() + adminTimeoutS() * std.time.ns_per_s;
     while (true) {
         if (try namespaceReady(gpa, back.instance, expected_uuid)) |ns| return .{ .instance = back.instance, .cntlid = back.cntlid, .ns = ns };
@@ -1224,13 +1277,13 @@ test "discovery over fixture trees: the plain per-controller node with its nsid,
     // Decoys under the controller: a path node and a partition.
     try fx.dir("class/nvme/nvme3/nvme3c3n1", .{});
     try fx.dir("class/nvme/nvme3/nvme3n1p1", .{});
-    const ns = (try findNamespaceUnderController(gpa, fx.root, 3)).?;
+    const ns = (try controllerNamespace(gpa, fx.root, 3)).?;
     try testing.expectEqualStrings("nvme3n1", ns.blockName());
     try testing.expectEqualStrings("ng3n1", ns.charName());
     try testing.expectEqual(@as(u32, 1), ns.nsid);
     try testing.expectEqual(@as(u8, 0x11), ns.uuid.?[0]);
     try testing.expect(ns.char_present);
-    try testing.expect((try findNamespaceUnderController(gpa, fx.root, 9)) == null);
+    try testing.expect((try controllerNamespace(gpa, fx.root, 9)) == null);
     const c = readController(fx.root, "nvme3").?;
     try testing.expect(c.isFabric() and c.isLive());
     try testing.expectEqualStrings("nqn.sub", c.subsysnqnOf());
@@ -1257,6 +1310,41 @@ test "discovery over fixture trees: the plain per-controller node with its nsid,
     try fx.dir("class/nvme-subsystem/nvme-subsys0/nvme6", .{});
     try testing.expect(try multipathMergedShape(gpa, fx.root, "nqn.sub"));
     try testing.expect(!(try multipathMergedShape(gpa, fx.root, "nqn.other")));
+}
+
+test "discovery on a multipath kernel: the controller holds only its hidden path node; the namespace is the head of the subsystem dir listing it, with its uuid and char twin — and never while another identity serves that subsystem" {
+    const gpa = testing.allocator;
+    var fx = Fixture.init(gpa, testing.io, "mpath") catch return testkit.skip(@src(), .no_device, "/build/tmp is not writable on this host (the venue's cache volume)");
+    defer fx.deinit();
+    // kamrui's 7.0.0-38-generic after `connect` of a loop target as nvme7:
+    // `class/nvme/nvme7/nvme2c7n1` (hidden), the head `nvme2n1` + `ng2n1`
+    // and the `nvme7` link in `nvme-subsys2`.
+    try fx.controller(7, "loop", "live", "nqn.sub", "nqn.hostA", "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "");
+    try fx.dir("class/nvme/nvme7/nvme2c7n1", .{});
+    try fx.file("class/nvme-subsystem/nvme-subsys2/subsysnqn", .{}, "nqn.sub");
+    try fx.dir("class/nvme-subsystem/nvme-subsys2/nvme7", .{});
+    try fx.dir("class/nvme-subsystem/nvme-subsys2/nvme2n1", .{});
+    try fx.dir("class/nvme-subsystem/nvme-subsys2/ng2n1", .{});
+    try fx.file("class/block/nvme2n1/nsid", .{}, "1\n");
+    try fx.file("class/block/nvme2n1/uuid", .{}, "66666666-2222-3333-4444-555555555555\n");
+    try fx.file("class/nvme-generic/ng2n1/dev", .{}, "245:2\n");
+    // A foreign subsystem's head is never ours.
+    try fx.file("class/nvme-subsystem/nvme-subsys0/subsysnqn", .{}, "nqn.local");
+    try fx.dir("class/nvme-subsystem/nvme-subsys0/nvme0n1", .{});
+    const ns = (try controllerNamespace(gpa, fx.root, 7)).?;
+    try testing.expectEqualStrings("nvme2n1", ns.blockName());
+    try testing.expectEqualStrings("ng2n1", ns.charName());
+    try testing.expect(ns.char_present);
+    try testing.expectEqual(@as(u32, 1), ns.nsid);
+    try testing.expectEqual(@as(u8, 0x66), ns.uuid.?[0]);
+    // A second controller of OUR identity on the subsystem: still ours.
+    try fx.controller(8, "loop", "live", "nqn.sub", "nqn.hostA", "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "");
+    try fx.dir("class/nvme-subsystem/nvme-subsys2/nvme8", .{});
+    try testing.expect((try controllerNamespace(gpa, fx.root, 7)) != null);
+    // Another identity serving it: the merged shape — never handed out.
+    try fx.controller(9, "loop", "live", "nqn.sub", "nqn.hostB", "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", "");
+    try fx.dir("class/nvme-subsystem/nvme-subsys2/nvme9", .{});
+    try testing.expect((try controllerNamespace(gpa, fx.root, 7)) == null);
 }
 
 /// An allocator that counts its calls (the sampler's zero-allocation pin).

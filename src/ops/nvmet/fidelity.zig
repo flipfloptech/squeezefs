@@ -736,7 +736,7 @@ fn roundtripLeg(transport: configfs.Trtype) !void {
     const c = try rig.connect(nqn, transport, port, null, &.{});
     try testing.expect(std.mem.startsWith(u8, c.dev(), "/dev/nvme"));
     try testing.expect(std.mem.startsWith(u8, c.chr(), "/dev/ng"));
-    const ns = (try initiator.findNamespaceUnderController(gpa, initiator.SYSFS_ROOT, c.instance)).?;
+    const ns = (try initiator.controllerNamespace(gpa, initiator.SYSFS_ROOT, c.instance)).?;
     try testing.expectEqual(rec.ns_uuid, ns.uuid.?);
     const lj2 = try rig.listJson();
     defer gpa.free(lj2);

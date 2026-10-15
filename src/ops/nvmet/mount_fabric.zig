@@ -252,7 +252,7 @@ pub const Plan = struct {
         for (ctrls) |c| {
             if (!std.mem.eql(u8, c.subsysnqnOf(), subnqn) or !c.hasIdentity(p.hostnqn, p.hostid)) continue;
             if (!c.isLive()) continue;
-            const ns = (initiator.findNamespaceUnderController(self.gpa, initiator.SYSFS_ROOT, c.instance) catch null) orelse continue;
+            const ns = (initiator.controllerNamespace(self.gpa, initiator.SYSFS_ROOT, c.instance) catch null) orelse continue;
             if (!ns.char_present) continue;
             return .{ .instance = c.instance, .cntlid = 0, .ns = ns };
         }

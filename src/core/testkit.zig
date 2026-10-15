@@ -157,6 +157,15 @@ pub const venue = if (builtin.os.tag == .linux) struct {
     pub fn mount(io: std.Io, staged_names: []const []const u8) ?Why {
         return staged(staged_names) orelse root() orelse devFuse() orelse capSysAdmin(io);
     }
+
+    /// A kernel feature a row's own probe read absent, named with the
+    /// running release (`<what> absent on 7.0.0-38-generic`) so the ledger
+    /// tells a stock distro kernel from a venue kernel that regressed.
+    pub fn kernelFeatureAbsent(buf: []u8, what: []const u8) Why {
+        var uts: linux.utsname = undefined;
+        const release: []const u8 = if (linux.errno(linux.uname(&uts)) == .SUCCESS) std.mem.sliceTo(&uts.release, 0) else "this kernel (uname failed)";
+        return .{ .class = .no_kernel_feature, .detail = std.fmt.bufPrint(buf, "{s} absent on {s}", .{ what, release }) catch what };
+    }
 } else struct {};
 
 test "the class table: exactly the two documented classes are exempt from the release gate" {

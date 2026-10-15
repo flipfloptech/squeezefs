@@ -786,6 +786,11 @@ pub const Group = struct {
     /// 1 once the drain flushed its synthesized commits (the session's
     /// `umount2` waits for it so no blocked caller still holds the mount).
     drained: futex.Word = .init(0),
+    /// This worker's share of `transport_handler_dispatches_{own,foreign}`
+    /// (its thread writes them): the per-session view, which no other
+    /// session in the process moves.
+    dispatches_own: std.atomic.Value(u64) = .init(0),
+    dispatches_foreign: std.atomic.Value(u64) = .init(0),
     name_buf: thread_name.CommBuf = undefined,
     // ---- pass state (worker thread only) ----
     wake_cqe_seen: bool = false,
@@ -2775,7 +2780,13 @@ pub const Group = struct {
         // The worker's own lane: the handler runs on this thread (§AB.3).
         const own = if (onWorkerLane(req.op, self.shared.no_open)) self.lane else null;
         const lane = own orelse self.shared.exec.homeLane(cpu, self.shared.nodeOf(m.qid));
-        if (own != null) handler_dispatches_own.inc() else handler_dispatches_foreign.inc();
+        if (own != null) {
+            handler_dispatches_own.inc();
+            _ = self.dispatches_own.fetchAdd(1, .monotonic);
+        } else {
+            handler_dispatches_foreign.inc();
+            _ = self.dispatches_foreign.fetchAdd(1, .monotonic);
+        }
         self.shared.exec.spawnGroupOn(lane, self.shared.handler_group, handlerMain, .{ self.shared.fs, req, handle, lease }) catch {
             dispatch_refused.inc();
             // Nothing is parked yet: the drop wakes nobody.

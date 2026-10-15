@@ -2543,11 +2543,30 @@ test "e2e: a namespace request's handler runs on the thread that delivered it â€
             for (s.groups) |g| if (g.tid.load(.acquire) == tid) return true;
             return false;
         }
-        /// Until every own dispatch since `own0` has run its handler
-        /// (bounded: a stuck one fails the equality below).
-        fn settle(r: *Rig, own0: u64, d0: u64) void {
+        /// THIS session's handler dispatches since its mount, summed over its
+        /// drain workers: no other session in the process moves them.
+        fn dispatches(s: *Session) struct { own: u64, foreign: u64 } {
+            var own: u64 = 0;
+            var foreign: u64 = 0;
+            for (s.groups) |g| {
+                own += g.dispatches_own.load(.monotonic);
+                foreign += g.dispatches_foreign.load(.monotonic);
+            }
+            return .{ .own = own, .foreign = foreign };
+        }
+        /// Until every dispatch since the mount has run its handler â€” the
+        /// rig's EchoFs serves this session alone, so its count and the
+        /// session's need no baselines (two baselines' loads straddled by a
+        /// whole request count it in one and not the other). Bounded: a
+        /// stuck one fails the equalities below.
+        fn settle(r: *Rig, s: *Session) struct { handled: u64, own: u64, foreign: u64 } {
             const deadline = clock.monotonicNs() + 2 * std.time.ns_per_s;
-            while (worker.handler_dispatches_own.load() - own0 != r.fs.dispatches.load(.monotonic) - d0 and clock.monotonicNs() < deadline) std.Thread.yield() catch {};
+            while (true) {
+                const handled = r.fs.dispatches.load(.monotonic);
+                const d = dispatches(s);
+                if (handled == d.own + d.foreign or clock.monotonicNs() >= deadline) return .{ .handled = handled, .own = d.own, .foreign = d.foreign };
+                std.Thread.yield() catch {};
+            }
         }
         fn run(r: *Rig, comptime f: fn (*Rig, *anyerror!void) void) !void {
             var result: anyerror!void = {};
@@ -2562,40 +2581,38 @@ test "e2e: a namespace request's handler runs on the thread that delivered it â€
         const s = try rig.mountIt(.{ .mem_budget_bytes = 0 });
         // The namespace class: every handler on the delivering worker.
         const own0 = worker.handler_dispatches_own.load();
-        const foreign0 = worker.handler_dispatches_foreign.load();
-        const d0 = rig.fs.dispatches.load(.monotonic);
         const w0 = slot.wake_writes.load();
         try Helper.run(rig, Helper.listRoot);
         // The last RELEASEDIR is asynchronous (close(2) returns before it
         // is answered): wait until every counted dispatch has run.
-        Helper.settle(rig, own0, d0);
-        const dispatched = rig.fs.dispatches.load(.monotonic) - d0;
-        try testing.expect(dispatched >= 128);
-        try testing.expectEqual(dispatched, worker.handler_dispatches_own.load() - own0);
-        try testing.expectEqual(foreign0, worker.handler_dispatches_foreign.load());
+        const settled = Helper.settle(rig, s);
+        try testing.expect(settled.handled >= 128);
+        try testing.expectEqual(settled.handled, settled.own);
+        try testing.expectEqual(@as(u64, 0), settled.foreign);
+        // The process-wide stat counts them too (other sessions only add).
+        try testing.expect(worker.handler_dispatches_own.load() - own0 >= 128);
         try testing.expect(Helper.onWorker(rig, s));
         // No reply crossed a thread: not one eventfd write to a worker.
         try testing.expectEqual(w0, slot.wake_writes.load());
         // The data class: each file's RELEASE on the handler lane, its OPEN
         // on the worker (a READ the worker answers inline under the READ
         // law's arm (a) dispatches nothing; a demoted one is foreign too).
-        const own1 = worker.handler_dispatches_own.load();
-        const foreign1 = worker.handler_dispatches_foreign.load();
+        const d1 = Helper.dispatches(s);
         try Helper.run(rig, Helper.readFiles);
         // The RELEASEs are asynchronous too: wait for the sixteenth.
         const deadline = clock.monotonicNs() + 2 * std.time.ns_per_s;
-        while (worker.handler_dispatches_foreign.load() - foreign1 < 16 and clock.monotonicNs() < deadline) std.Thread.yield() catch {};
-        try testing.expect(worker.handler_dispatches_foreign.load() - foreign1 >= 16);
-        try testing.expect(worker.handler_dispatches_own.load() - own1 >= 16);
+        while (Helper.dispatches(s).foreign - d1.foreign < 16 and clock.monotonicNs() < deadline) std.Thread.yield() catch {};
+        const d2 = Helper.dispatches(s);
+        try testing.expect(d2.foreign - d1.foreign >= 16);
+        try testing.expect(d2.own - d1.own >= 16);
     }
     {
         const rig = try Rig.init(testing.allocator, 39, &.{.{ "SQUEEZEFS_FUSE_HANDLERS_ON_WORKER", "0" }});
         defer rig.deinit();
         const s = try rig.mountIt(.{ .mem_budget_bytes = 0 });
-        const own0 = worker.handler_dispatches_own.load();
         const w0 = slot.wake_writes.load();
         try Helper.run(rig, Helper.listRoot);
-        try testing.expectEqual(own0, worker.handler_dispatches_own.load());
+        try testing.expectEqual(@as(u64, 0), Helper.dispatches(s).own);
         try testing.expect(!Helper.onWorker(rig, s));
         // The lane thread's replies wake the worker across threads.
         try testing.expect(slot.wake_writes.load() > w0);

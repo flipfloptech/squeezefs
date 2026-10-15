@@ -305,3 +305,43 @@ The first Linux gate on this note's commit failed two rows. Neither touches item
   `writer_guard_fenced` 1. The counter is process-wide (`journal.FailureLatch.noteFence`) and the
   verdict is one lane's latch (`guard/gate.zig` :155): when another volume's lane met the
   reservation conflict first, the stats snapshot can show the counter before the gate's own latch.
+
+## 7. Item 2's return after B's kill: not reproduced; the stuck intents now named (2026-10-15)
+
+`rung-10-gate-blockers.md` §3: one of four venue gates on `352a16f` read `expected 0, found 11`
+open intents at A after B's kill in phase 3, with `xv_cross_owner_intent_stuck` fired — item 2's
+count, after its fix (§2.3). The gate's log was not kept. `src/` is byte-identical between
+`352a16f` and the looped base `8f77974`.
+
+**Loops** (the row alone through `zig build smoke -Dtest-filter=…`, or its compiled smoke binary
+run directly; each run pid-tagged; under a venue build slot, never beside a full gate):
+
+| Venue | Shape | Runs | The signature |
+|---|---|---|---|
+| VM (aarch64) | alone | 9 | 0 |
+| VM | 3 runs side by side, 4 × `yes` | 36 | 0 |
+| VM | 3 side by side, 8 × `yes` | 45 | 0 |
+| kamrui (x86_64) | alone | 45 | 0 |
+| kamrui | 4 × `yes` | 25 | 0 (1 red of another signature, below) |
+| kamrui | 3 side by side, 8 × `yes` | 36 | 0 |
+| kamrui | 4 side by side, 16 × `yes` | 60 | 0 |
+
+0 of 256: no failing run, so no intent, home slot, step or holder to name, no red repro and no
+fix. The row stays in `docs/gates/flakes.md` under this owner with the measured rate.
+
+**What the next occurrence will say** (`789dff2`): the tripwire counted stuck intents and named
+none; the gate output (the rig's daemon alerts) could not tell a pass that fails from a pass that
+never returns. Each stuck transition now logs one line on the membership cadence (reads only, no
+guard): the intent's tx, home slot, op, attested steps, the next step's slot and its holder as
+the resolver sees it now, the last roll-forward attempt's error (`Register.noteFailure` in
+`recoverHome`) and the cadence's pass state (`pass_started_ns`/`pass_ended_ns`: running for N ms,
+or idle). Rows: `two_holders` "a ship that fails leaves the intent OPEN…" (a failed pass's
+`ShipFailed` and the foreign holder named once past the grace), `intent` "the register…" (the
+harvest hands each transition out once).
+
+**Seen beside it.** kamrui, 4 × `yes`, run 5: at B's kill C parked at T_self ("the home volume
+0's manager unreachable") and was evicted (`membership_evictions` 2 at A, `expected 1, found 2`);
+the alert beside it is a served `xv_step` of 2,762 ms on a multiplexed session, with the smoke's
+T_owner at 3 s. A flakes row of its own (unassigned). On the VM two orphaned smoke daemons of a
+killed gate (ppid 1, 33 min) held `/build/.gate.lock` through the fd `scripts/venue`'s `flock`
+lets every child inherit, queueing every gate behind them until killed by pid.

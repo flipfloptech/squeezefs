@@ -44,4 +44,4 @@ the reader's own `REUSED!!`.
 | pre-fix binary × 30 | red 30 of 30 |
 | fixed, the new test × 120 (`-Dfresh`) | green 120 of 120 |
 | fixed, filters `dead ring`, `ring_park`, `journal_lane`, `exec.`, `nvme_dev` | 7/7 steps, 192/192 tests passed. This includes the new `ring_park` row (`untaken` / `cancelSync` / `enterDead`) and the NVMe dead-ring row, whose slow READ is now held for its 300 ms and then answered |
-| full gate (`-Dfresh`) | GATE |
+| full gate (`-Dfresh`) on `63b8296` | 53/53 steps, 2987/3070 tests passed (83 skipped) |

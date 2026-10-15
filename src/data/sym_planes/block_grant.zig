@@ -156,11 +156,15 @@ pub const stats = struct {
     pub var block_grant_topup_deferred: counters.ShardedCounter = .{};
     pub var block_grant_topup_refused: counters.ShardedCounter = .{};
     // Declared windows and the deferred-leak protocol (closure `deferred
-    // ≡ released + adopted + pending`).
+    // ≡ released + adopted + referenced + settled + pending`).
     pub var data_alloc_bitmap_leaks_deferred: counters.ShardedCounter = .{};
     pub var data_alloc_bitmap_leaks_released: counters.ShardedCounter = .{};
     pub var data_alloc_bitmap_leaks_referenced: counters.ShardedCounter = .{};
     pub var data_alloc_bitmap_leaks_adopted: counters.ShardedCounter = .{};
+    /// Candidates this term moved before the exact census (a late shipped
+    /// free cleared one, a carve may hold it again — 0003 §AQ.3): never
+    /// released.
+    pub var data_alloc_bitmap_leaks_settled: counters.ShardedCounter = .{};
     pub var data_alloc_bitmap_decls_screened: counters.ShardedCounter = .{};
     /// Must-stay-0: a poisoned window declaration.
     pub var data_alloc_bitmap_decls_rejected: counters.Tripwire = .init("data_alloc_bitmap_decls_rejected");
@@ -169,6 +173,10 @@ pub const stats = struct {
     /// ring did not fold (the KVDA page sink's fallback): SET again under
     /// the successor's term and adopted. 0 when the pages landed.
     pub var block_grant_relearned_from_windows: counters.ShardedCounter = .{};
+    /// Declared blocks that read CLEAR because THIS term cleared them (a
+    /// shipped free answered, a return, a release) while the word was in
+    /// flight — a stale word, never re-learnt (0003 §AQ.3).
+    pub var block_grant_stale_declared_blocks: counters.ShardedCounter = .{};
     /// Declarations the holder folded (`syncWriter` + adopt per renewal).
     pub var block_grant_windows_declared: counters.ShardedCounter = .{};
     /// Levels.
@@ -966,7 +974,8 @@ fn rejectDecl() bool {
 /// ledger granted and died with — indistinguishable from the bitmap alone.
 /// Every candidate enters `pending`; once every live peer has declared (or
 /// is dead), what is still pending is released (bit CLEAR + delta, in
-/// order). Closure: `deferred ≡ released + adopted + pending`.
+/// order). Closure: `deferred ≡ released + adopted + referenced + settled
+/// + pending`.
 pub const DeferredLeaks = struct {
     gpa: Allocator,
     pending: []u64,
@@ -976,6 +985,8 @@ pub const DeferredLeaks = struct {
     adopted: u64 = 0,
     /// Candidates the exact census referenced after all: never leaks.
     referenced: u64 = 0,
+    /// Candidates this term moved before the census (0003 §AQ.3).
+    settled: u64 = 0,
 
     pub fn init(gpa: Allocator, blocks: u64) Allocator.Error!DeferredLeaks {
         const words = try gpa.alloc(u64, @intCast((blocks + 63) / 64));
@@ -1019,9 +1030,12 @@ pub const DeferredLeaks = struct {
     /// writer declares its held windows on each renewal so a successor
     /// adopts/releases a crashed incarnation's bits"): over each range,
     /// a PENDING ∩ SET block is ADOPTED (the leak candidate was a live
-    /// window), a CLEAR block is RE-LEARNT — SET + journaled under this
-    /// holder's term (`block_grant_relearned_from_windows`: a carve the
-    /// pages never carried) — and every block of the range not already
+    /// window), a CLEAR block the derivation left clear is RE-LEARNT — SET
+    /// + journaled under this holder's term
+    /// (`block_grant_relearned_from_windows`: a carve the pages never
+    /// carried); a CLEAR block THIS term cleared is a stale word's (a free
+    /// or a return answered while the word was in flight: 0003 §AQ.3) and
+    /// moves nothing — and every block of the range not already
     /// granted enters the ledger under the writer's name as runs (its
     /// death revokes them, its leave returns them). A block already set
     /// and not pending (minted, referenced) is the writer's own and moves
@@ -1034,7 +1048,9 @@ pub const DeferredLeaks = struct {
             while (idx <= r.end()) : (idx += 1) {
                 var take = false;
                 if (idx < r.end() and !ledger.isGranted(idx)) {
-                    if (!bitmap.isSet(idx)) {
+                    if (!bitmap.isSet(idx) and bitmap.movedSinceArm(idx)) {
+                        stats.block_grant_stale_declared_blocks.inc();
+                    } else if (!bitmap.isSet(idx)) {
                         if (bitmap.setRun(idx, 1) == 1) out.relearned += 1;
                         self.clearPending(idx);
                         take = true;
@@ -1059,21 +1075,24 @@ pub const DeferredLeaks = struct {
         return out;
     }
 
-    pub const Converged = struct { released: u64, referenced: u64 };
+    pub const Converged = struct { released: u64, referenced: u64, settled: u64 };
 
     /// The remainder's verdict under an EXACT census — the holder's own
     /// refs scan when it is the ONLY writer (every peer departed, or dead
     /// and recovered into the holder's trees): a pending block nothing
     /// references is RELEASED (bit CLEAR + delta, ascending); one the
     /// census does reference was never a leak and leaves `pending`
-    /// (`data_alloc_bitmap_leaks_referenced`). While another writer is
+    /// (`data_alloc_bitmap_leaks_referenced`); one THIS term moved since
+    /// its arm (a late shipped free cleared it, a carve may hold it again)
+    /// is no longer the predecessor's remainder and is never released
+    /// (`data_alloc_bitmap_leaks_settled`, 0003 §AQ.3). While another writer is
     /// live the holder's census is a projection of that writer's trees
     /// (its unflushed publishes are invisible here), so no release runs
     /// — a leak costs space, a release of a live block costs data; the
     /// remainder is reported and fsck C6 counts it.
     pub fn convergeDeferred(self: *DeferredLeaks, bitmap: *DataBitmap, referenced: []const u64) Converged {
         assert(referenced.len == self.pending.len);
-        var out: Converged = .{ .released = 0, .referenced = 0 };
+        var out: Converged = .{ .released = 0, .referenced = 0, .settled = 0 };
         for (self.pending, referenced, 0..) |*w, refd, wi| {
             var bits = w.*;
             while (bits != 0) : (bits &= bits - 1) {
@@ -1081,6 +1100,8 @@ pub const DeferredLeaks = struct {
                 const bit = @as(u64, 1) << @intCast(idx % 64); // the bit inside its word
                 if (refd & bit != 0) {
                     out.referenced += 1;
+                } else if (bitmap.movedSinceArm(idx)) {
+                    out.settled += 1;
                 } else if (bitmap.isSet(idx)) {
                     out.released += bitmap.clearRun(idx, 1);
                 }
@@ -1089,15 +1110,17 @@ pub const DeferredLeaks = struct {
         }
         self.released += out.released;
         self.referenced += out.referenced;
+        self.settled += out.settled;
         stats.data_alloc_bitmap_leaks_released.add(out.released);
         stats.data_alloc_bitmap_leaks_referenced.add(out.referenced);
+        stats.data_alloc_bitmap_leaks_settled.add(out.settled);
         stats.data_alloc_bitmap_leaks_pending.set(0);
         return out;
     }
 
-    /// `deferred ≡ released + adopted + referenced + pending`.
+    /// `deferred ≡ released + adopted + referenced + settled + pending`.
     pub fn closureHolds(self: *const DeferredLeaks) bool {
-        return self.deferred == self.released + self.adopted + self.referenced + self.pendingCount();
+        return self.deferred == self.released + self.adopted + self.referenced + self.settled + self.pendingCount();
     }
 };
 
@@ -1384,6 +1407,7 @@ test "a_poisoned_window_declaration_is_refused_before_any_walk; a crashed incarn
     // a writer that died with it; the successor's ledger is empty, so the
     // bitmap shows 128 SET bits nothing references and no grant names.
     try testing.expect(bm.setRun(8, 128) == 128);
+    bm.sealDerivation(); // the successor's arm: the bits above are its derivation
     var referenced = [_]u64{ 0xFF, 0, 0, 0, 0, 0, 0, 0 };
     var granted = [_]u64{ 0, 0, 0, 0, 0, 0, 0, 0 };
     h.ledger.openRangesInto(&granted);
@@ -1465,11 +1489,42 @@ test "a deferred candidate a late shipped free settled and this term re-carved i
     try testing.expectEqual(@as(u64, 40), bm.carveRun(40, 1).?.start);
     // The exact census (no live peer) references nothing.
     const referenced: [8]u64 = @splat(0);
+    const settled0 = stats.data_alloc_bitmap_leaks_settled.load();
     const converged = dl.convergeDeferred(bm, &referenced);
     try testing.expectEqual(@as(u64, 0), converged.released);
+    try testing.expectEqual(@as(u64, 1), converged.settled);
+    try testing.expectEqual(settled0 + 1, stats.data_alloc_bitmap_leaks_settled.load());
     try testing.expect(bm.isSet(40)); // the fresh grant keeps its bit
     try testing.expectEqual(@as(u64, 0), dl.pendingCount());
     try testing.expect(dl.closureHolds());
+}
+
+test "a declaration never re-learns a block THIS term cleared (0003 §AQ.3): the successor re-learns a declared run its derivation left clear; the writer returns part of it and ships a free of another block while its next word — naming both — is in flight; that stale word re-learns neither (block_grant_stale_declared_blocks), while a declared block the derivation left clear and nothing moved is still re-learnt" {
+    const a = try testAlloc(512);
+    defer a.deinit();
+    const bm = try testBitmap(a);
+    defer bm.deinit();
+    a.finish_free_sink = bm.finishFreeSink();
+    var h: HolderGrants = .{ .ledger = try Ledger.init(testing.allocator, 16), .bitmap = bm };
+    defer h.ledger.deinit();
+    var dl = try DeferredLeaks.init(testing.allocator, 512);
+    defer dl.deinit();
+    bm.sealDerivation();
+    // The first word: 64..80 (a window the pages never carried) re-learnt.
+    try testing.expectEqual(@as(u64, 16), dl.adoptDeclared(&h.ledger, bm, 2, &.{.{ .start = 64, .len = 16 }}).relearned);
+    _ = h.ledger.syncWriter(2, &.{.{ .start = 64, .len = 16 }});
+    // The word in flight names 64..80 and 100; meanwhile the writer returns
+    // 72..80 and this term's ladder frees 64 (minted, published, shipped).
+    try testing.expectEqual(@as(?u32, 8), h.ledger.returnBlocks(bm, 2, 72, 8));
+    _ = h.ledger.syncWriter(2, &.{.{ .start = 65, .len = 7 }});
+    a.fsckSetRefcount(64, 1);
+    try testing.expectEqual(block_alloc.BeginFree.terminal, try a.freeBlock(64));
+    try testing.expect(!bm.isSet(64) and !bm.isSet(72));
+    const stale0 = stats.block_grant_stale_declared_blocks.load();
+    const out = dl.adoptDeclared(&h.ledger, bm, 2, &.{ .{ .start = 64, .len = 16 }, .{ .start = 100, .len = 1 } });
+    try testing.expectEqual(@as(u64, 1), out.relearned); // 100 alone
+    try testing.expectEqual(stale0 + 1 + 8, stats.block_grant_stale_declared_blocks.load());
+    try testing.expect(!bm.isSet(64) and !bm.isSet(72) and !bm.isSet(79) and bm.isSet(100));
 }
 
 test "THE KVDA PAGE SINK'S TWO OUTCOMES (rung 10 item 2): a holder carves two grants, its pages land at the cadence, a third carve lands only in its ring; it dies. The successor that folds page + ring starts with every granted bit SET and the live writer's declaration RE-LEARNS NOTHING (adopted = the window, relearned 0); a successor whose predecessor's page never landed (the fallback) re-learns exactly the declared blocks the page did not carry — SET under its own term, journaled, adopted — and the counter reads them" {

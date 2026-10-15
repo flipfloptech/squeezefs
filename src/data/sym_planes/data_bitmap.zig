@@ -316,6 +316,12 @@ pub const DataBitmap = struct {
     /// delta inside it. A spin lock: the critical section is O(1) and the
     /// finish-free sink runs on paths that carry no `Io`.
     mutations: jc.SpinLock = .{},
+    /// One bit per block, under `mutations`: the bits THIS term moved since
+    /// its arm sealed the derivation (decision 0003 §AQ.1) — set by every
+    /// carve, re-learn, free and return that flips a bit; the arm's census,
+    /// page load and fold are the derivation, not moves, and a trim
+    /// window's transient take moves nothing.
+    moved: []u64,
     ring: DeltaRing,
     /// The single-drainer latch (a CAS; the drainer releases it and
     /// re-checks the queue).
@@ -351,15 +357,19 @@ pub const DataBitmap = struct {
         const dirty = try gpa.alloc(Atomic(u64), @intCast((pages + 63) / 64));
         errdefer gpa.free(dirty);
         @memset(dirty, .init(0));
+        const moved = try gpa.alloc(u64, @intCast((cfg.blocks + 63) / 64)); // 64 bits per word
+        errdefer gpa.free(moved);
+        @memset(moved, 0);
         var ring = try DeltaRing.init(gpa, cfg.ring_capacity);
         errdefer ring.deinit(gpa);
-        self.* = .{ .gpa = gpa, .alloc = alloc, .cfg = cfg, .pages = pages, .page_states = states, .dirty = dirty, .ring = ring };
+        self.* = .{ .gpa = gpa, .alloc = alloc, .cfg = cfg, .pages = pages, .page_states = states, .dirty = dirty, .moved = moved, .ring = ring };
         self.resyncPopulation();
         return self;
     }
 
     pub fn deinit(self: *DataBitmap) void {
         self.ring.deinit(self.gpa);
+        self.gpa.free(self.moved);
         self.gpa.free(self.dirty);
         self.gpa.free(self.page_states);
         self.gpa.destroy(self);
@@ -402,6 +412,55 @@ pub const DataBitmap = struct {
     fn markDirty(self: *DataBitmap, idx: u64) void {
         const page = idx / page_bits;
         _ = self.dirty[@intCast(page / 64)].fetchOr(@as(u64, 1) << @intCast(page % 64), .acq_rel);
+    }
+
+    fn markMovedLocked(self: *DataBitmap, idx: u64) void {
+        self.moved[@intCast(idx / 64)] |= @as(u64, 1) << @intCast(idx % 64); // 64 bits per word
+    }
+
+    fn movedLocked(self: *const DataBitmap, idx: u64) bool {
+        return self.moved[@intCast(idx / 64)] & (@as(u64, 1) << @intCast(idx % 64)) != 0; // 64 bits per word
+    }
+
+    /// The arm's last step (0003 §AQ.1): what the derivation moved — a
+    /// re-hold's replay runs through the journaled set/clear — is the
+    /// term's starting state, not its moves.
+    pub fn sealDerivation(self: *DataBitmap) void {
+        self.mutations.lock();
+        defer self.mutations.unlock();
+        @memset(self.moved, 0);
+    }
+
+    /// This term moved the bit since its arm (a carve, a re-learn, a free,
+    /// a return): the derivation no longer speaks for the block.
+    pub fn movedSinceArm(self: *DataBitmap, idx: u64) bool {
+        assert(idx < self.cfg.blocks);
+        self.mutations.lock();
+        defer self.mutations.unlock();
+        return self.movedLocked(idx);
+    }
+
+    /// A late shipped free settled by the derivation (0003 §AQ.2): true iff
+    /// the derivation returned the block — its bit reads clear as the arm
+    /// left it (or a trim window holds it transiently) — and this term
+    /// never moved it; the free sat in a writer's batch or wire across the
+    /// failover. The settle is the term's act on the block: it is marked
+    /// moved (no bit flips), so a declaration built before the answer
+    /// never re-learns it and a second free of it is the double release.
+    pub fn settleByDerivation(self: *DataBitmap, idx: u64) bool {
+        assert(idx < self.cfg.blocks);
+        self.mutations.lock();
+        defer self.mutations.unlock();
+        if (self.movedLocked(idx)) return false;
+        if (self.isSet(idx) and self.alloc.stateOf(idx) != .trim_windowed) return false;
+        self.markMovedLocked(idx);
+        return true;
+    }
+
+    /// `settleByDerivation` with the executor's probe signature.
+    pub fn settleByDerivationFn(ctx: *anyopaque, idx: u64) bool {
+        const self: *DataBitmap = @ptrCast(@alignCast(ctx));
+        return self.settleByDerivation(idx);
     }
 
     pub fn hasDirtyPages(self: *const DataBitmap) bool {
@@ -455,6 +514,7 @@ pub const DataBitmap = struct {
         self.mutations.lock();
         defer self.mutations.unlock();
         if (!self.alloc.holderPublishFree(idx)) return false;
+        self.markMovedLocked(idx);
         _ = self.population.fetchSub(1, .acq_rel);
         stats.data_alloc_bitmap_population.set(self.population.load(.monotonic));
         stats.data_alloc_bitmap_clear_bits.inc();
@@ -477,6 +537,7 @@ pub const DataBitmap = struct {
         defer self.mutations.unlock();
         if (!self.alloc.holderTakeOutOfList(idx, listed)) return false;
         if (!holds) return true;
+        self.markMovedLocked(idx);
         _ = self.population.fetchAdd(1, .acq_rel);
         stats.data_alloc_bitmap_population.set(self.population.load(.monotonic));
         stats.data_alloc_bitmap_set_bits.inc();
@@ -538,6 +599,7 @@ pub const DataBitmap = struct {
             // lock sets bits on an armed allocator.
             const ok = self.alloc.holderTakeBit(run.start + taken);
             assert(ok);
+            self.markMovedLocked(run.start + taken);
         }
         _ = self.population.fetchAdd(run.len, .acq_rel);
         stats.data_alloc_bitmap_population.set(self.population.load(.monotonic));
@@ -558,7 +620,10 @@ pub const DataBitmap = struct {
         var cleared: u32 = 0;
         var i: u64 = 0;
         while (i < len) : (i += 1) {
-            if (self.alloc.holderReturnBit(start + i)) cleared += 1;
+            if (self.alloc.holderReturnBit(start + i)) {
+                self.markMovedLocked(start + i);
+                cleared += 1;
+            }
         }
         if (cleared == 0) return 0;
         _ = self.population.fetchSub(cleared, .acq_rel);
@@ -579,7 +644,10 @@ pub const DataBitmap = struct {
         var set: u32 = 0;
         var i: u64 = 0;
         while (i < len) : (i += 1) {
-            if (self.alloc.holderTakeBit(start + i)) set += 1;
+            if (self.alloc.holderTakeBit(start + i)) {
+                self.markMovedLocked(start + i);
+                set += 1;
+            }
         }
         if (set == 0) return 0;
         _ = self.population.fetchAdd(set, .acq_rel);

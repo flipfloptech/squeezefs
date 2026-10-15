@@ -93,6 +93,10 @@ pub const stats = struct {
     pub var free_served_requests: counters.ShardedCounter = .{};
     pub var free_dedup_replays: counters.ShardedCounter = .{};
     pub var free_seeded_references: counters.ShardedCounter = .{};
+    /// Shipped frees a successor answered from its derivation (0003
+    /// §AQ.2): untracked, unreferenced, the bit clear as its arm left it —
+    /// the free sat in the writer's batch or wire across the failover.
+    pub var free_derivation_settled: counters.ShardedCounter = .{};
     /// Must-stay-0: a served layout publish whose frame TAKES a block this
     /// mount released (free-listed, graced or quarantined).
     pub var served_publish_free_block_refusals: counters.Tripwire = .init("served_publish_free_block_refusals");
@@ -132,6 +136,16 @@ pub const GraceProbe = struct {
     holds: *const fn (?*anyopaque, idx: u64) bool,
 };
 
+/// A successor's derivation (0003 §AQ.2): `settle` answers true iff the
+/// arm's census, pages and fold left the block's bit clear and this term
+/// never moved it — and marks it moved (the settle is the term's act).
+/// Null on a holder that succeeded nobody — every block a writer can free
+/// there was carved under its own term.
+pub const DerivationProbe = struct {
+    ctx: *anyopaque,
+    settle: *const fn (*anyopaque, idx: u64) bool,
+};
+
 const DedupEntry = struct { lease_epoch: u64, request_id: u64, verdicts: Verdicts, used: bool = false };
 
 pub const FreeExecutor = struct {
@@ -139,6 +153,7 @@ pub const FreeExecutor = struct {
     durable: DurableRefcounts,
     ladder: FreeLadder,
     grace: ?GraceProbe = null,
+    derivation: ?DerivationProbe = null,
     lock: jc.SpinLock = .{},
     dedup: [FREE_DEDUP_WINDOW]DedupEntry = @splat(.{ .lease_epoch = 0, .request_id = 0, .verdicts = .{} }),
     dedup_next: usize = 0,
@@ -211,8 +226,17 @@ pub const FreeExecutor = struct {
         // Untracked at the holder.
         if (durable_pop > 0) return .nonterminal; // the release already happened durably
         // Row 6: already free / bit CLEAR / graced / quarantined / in flight
-        // — the double-release lineage.
+        // — the double-release lineage … unless this successor's derivation
+        // returned the block and its term never moved it (0003 §AQ.2): the
+        // writer's free sat in its batch or wire across the failover
+        // (consumed, unpublished, unanswered — no declaration names it), so
+        // the derivation already made it nobody's. Freed: the writer's word
+        // retires, nothing moves here.
         if (!formerLesseeBlock(self.alloc, self.grace, idx)) {
+            if (self.derivation) |d| if (d.settle(d.ctx, idx)) {
+                stats.free_derivation_settled.inc();
+                return .freed;
+            };
             block_alloc.stats.block_untracked_free_refusals.fire("a shipped free of an untracked, unreferenced block (the double-release lineage)");
             return .refused;
         }

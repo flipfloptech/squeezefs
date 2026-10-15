@@ -65,6 +65,7 @@ pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
+const log = @import("../core/log.zig");
 const block_alloc = @import("block_alloc.zig");
 const reclaim = @import("reclaim.zig");
 
@@ -353,6 +354,7 @@ test "two writers in process: A holds the lease; B pulls grants, writes, its fre
     const recs = try f.journal.replayRecords(gpa);
     defer data_bitmap.RamJournal.freeReplay(gpa, recs);
     _ = try b_bitmap.replay(recs, 1);
+    b_bitmap.sealDerivation(); // B's arm: the load and the replay are its derivation
     try testing.expectEqual(f.a_bitmap.populationNow(), b_bitmap.populationNow());
     var b_holder: block_grant.HolderGrants = .{ .ledger = try block_grant.Ledger.init(gpa, 32), .bitmap = b_bitmap };
     defer b_holder.ledger.deinit();
@@ -422,9 +424,10 @@ const Successor = struct {
         errdefer s.bitmap.deinit();
         s.holder = .{ .ledger = try block_grant.Ledger.init(gpa, 32), .bitmap = s.bitmap };
         s.ladder = .{ .alloc = s.alloc };
-        s.executor = .{ .alloc = s.alloc, .durable = f.a_ledger.durable(), .ladder = s.ladder.seam() };
+        s.executor = .{ .alloc = s.alloc, .durable = f.a_ledger.durable(), .ladder = s.ladder.seam(), .derivation = .{ .ctx = s.bitmap, .settle = &data_bitmap.DataBitmap.settleByDerivationFn } };
         s.alloc.finish_free_sink = s.bitmap.finishFreeSink();
         s.alloc.untracked_gate = s.executor.untrackedGate();
+        s.bitmap.sealDerivation();
         return s;
     }
 
@@ -474,12 +477,38 @@ test "a late shipped free across the holder's failover (THE KVDA PAGE SINK's fal
     // B's cadence flushes the batch to the successor.
     f.b_client.executor = &s.executor;
     const untracked0 = counters.tripwireCount("block_untracked_free_refusals");
+    const settled0 = free_ship.stats.free_derivation_settled.load();
     const retired0 = f.b_tracking.retired;
     try testing.expectEqual(free_ship.Shipper.FlushOutcome.served, f.b_shipper.flush());
     try testing.expectEqual(untracked0, counters.tripwireCount("block_untracked_free_refusals"));
+    try testing.expectEqual(settled0 + 1, free_ship.stats.free_derivation_settled.load());
     try testing.expectEqual(retired0 + 1, f.b_tracking.retired); // B's word retires
     try testing.expect(!s.bitmap.isSet(x)); // nothing moved at the successor
     try testing.expectEqual(pop0, s.bitmap.populationNow());
+    // The settle is the term's act: a word B built before the answer (one
+    // naming x — an in-flight registration it then abandoned) re-learns
+    // nothing, and the next carve may take x.
+    const stale0 = block_grant.stats.block_grant_stale_declared_blocks.load();
+    try testing.expectEqual(@as(u64, 0), dl.adoptDeclared(&s.holder.ledger, s.bitmap, 2, &.{.{ .start = x, .len = 1 }}).relearned);
+    try testing.expectEqual(stale0 + 1, block_grant.stats.block_grant_stale_declared_blocks.load());
+    try testing.expect(!s.bitmap.isSet(x));
+
+    // The double-release lineage stays whole: a block of B's re-learnt
+    // window, minted, published and freed under the successor's term, then
+    // shipped AGAIN — its bit is clear because THIS term cleared it.
+    const y = try f.b_alloc.allocateBlock();
+    f.b_alloc.publishBlock(y.idx);
+    try testing.expect(s.bitmap.isSet(y.idx));
+    try testing.expectEqual(reclaim.FreeOutcome.nonterminal, f.b_reclaimer.freeBlock(io, 0, y.idx, f.b_alloc.stampOf(y.idx)));
+    try testing.expectEqual(free_ship.Shipper.FlushOutcome.served, f.b_shipper.flush());
+    try testing.expect(!s.bitmap.isSet(y.idx));
+    block_alloc.stats.block_untracked_free_refusals.resetLogBudgetForTest();
+    log.testing.expectErrorLogs(1);
+    const again = s.executor.execute(.{ .vol_tag = T.VOL_TAG, .blocks = &.{y.idx}, .lease_epoch = 1, .request_id = 1 << 32 });
+    try log.testing.expectAllFired();
+    try testing.expectEqual(free_ship.FreeVerdict.refused, again.buf[0]);
+    try testing.expectEqual(untracked0 + 1, counters.tripwireCount("block_untracked_free_refusals"));
+    try testing.expectEqual(settled0 + 1, free_ship.stats.free_derivation_settled.load());
 }
 
 test "the dismount defect's core: a mint after the grant plane is DISARMED meets the carved window's SET bit at the frontier ⇒ a typed PlaneRefused + the anomaly tripwire, never an assert, never StorageFull; the cursor stays; re-armed, the window mints again" {

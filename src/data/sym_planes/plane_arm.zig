@@ -333,7 +333,17 @@ pub const HolderPlane = struct {
             v.refs.deinit(gpa);
             if (v.leaks) |*l| l.deinit();
         }
-        v.frees = .{ .alloc = r.alloc, .durable = .{ .ctx = v, .refcount = &durableRefcount }, .ladder = .{ .ctx = v, .free = &ladderFree } };
+        // A holder that succeeded a predecessor (a later term, or its own
+        // replayed one) answers a late shipped free of a block its
+        // derivation returned (0003 §AQ.2); the volume's first holder carved
+        // every block a writer can free, so it keeps the refusal whole.
+        const succeeded = term > 1 or hold.already;
+        v.frees = .{
+            .alloc = r.alloc,
+            .durable = .{ .ctx = v, .refcount = &durableRefcount },
+            .ladder = .{ .ctx = v, .free = &ladderFree },
+            .derivation = if (succeeded) .{ .ctx = v.bitmap, .settle = &data_bitmap.DataBitmap.settleByDerivationFn } else null,
+        };
         v.handlers = .{ .vol_tag = r.vol_tag, .grants = &v.grants, .frees = &v.frees, .writer_ctx = self, .writerId = &writerIdFn };
         // The own window is bound to its sink: every top-up retires the
         // grants it consumed (the ledger holds OPEN grants only).
@@ -348,6 +358,9 @@ pub const HolderPlane = struct {
         r.alloc.grant_source = v.own_src.source();
         r.alloc.lease = .{ .ctx = v, .vtable = &holder_lease_vtable };
         plane.reclaimer.setFreeTarget(v.ordinal, v.frees.localTarget());
+        // The derivation ends here: from now on every bit this holder
+        // flips is its term's move (0003 §AQ.1).
+        v.bitmap.sealDerivation();
         // Release pairs with `armedVols`' acquire: the row is whole first.
         self.n_vols.store(ordinal + 1, .release);
         stats.alloc_lease_held_volumes.set(ordinal + 1);
@@ -471,7 +484,7 @@ pub const HolderPlane = struct {
                 home.vt.referencedFresh(home.ctx, v.vol_tag, referenced) catch continue;
                 const out = l.convergeDeferred(v.bitmap, referenced);
                 _ = v.bitmap.drain();
-                log.info("data planes: vol {x} — the only writer's exact census converged {d} deferred block(s): {d} released (no reference), {d} referenced after all", .{ v.vol_tag, pending, out.released, out.referenced });
+                log.info("data planes: vol {x} — the only writer's exact census converged {d} deferred block(s): {d} released (no reference), {d} referenced after all, {d} settled by this term's moves", .{ v.vol_tag, pending, out.released, out.referenced, out.settled });
             } else if (!v.remainder_reported and v.declared.count() >= live) {
                 v.remainder_reported = true;
                 log.info("data planes: vol {x} — every live writer declared; {d} block(s) stay SET that no window names and this holder's census does not reference (a live writer's unflushed publishes are invisible here): left as a leak for fsck C6, never released", .{ v.vol_tag, pending });

@@ -605,6 +605,7 @@ per block:
 | tracked, count 0 | `Refused`, `block_untracked_free_refusals` | the transient window of a racing terminal release |
 | untracked, population > 0 | `NonTerminal` | the release already happened durably |
 | untracked, population 0, already free / bit CLEAR in the holder's bitmap / graced / quarantined / in flight | `Refused` through the UNSEEDED ladder (`block_untracked_free_refusals`) | the double-release lineage; "a refusal storm of one class is a duplicate free ISSUER on the shipper" |
+| untracked, population 0, bit CLEAR (or trim-windowed) as a SUCCESSOR's derivation left it, never moved by its term (port, 0003 §AQ.2) | `Freed`, no bit flipped, the block marked moved (`free_derivation_settled`) | the free sat in the writer's batch or wire across the failover — no declaration named it; the derivation already made it nobody's. The volume's first holder has no derivation probe: row 6 whole |
 | untracked, population 0, none of those | `seed_shipped_free_reference` + the ladder ⇒ `Freed` | "deliberately NOT `recover_block`, whose gap-filling arm would declare a live peer's unpublished tail free" |
 
 Measured (`ACC:L1036`): 7 joiners rewriting 7 GiB in place — 983 frees/s served at the holder;

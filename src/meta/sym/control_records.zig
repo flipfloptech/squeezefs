@@ -68,6 +68,10 @@ pub const Tag = enum(u8) {
     job = 13,
     /// `JobShardV1`: keyed by `job_id u64 ‖ shard u32`.
     job_shard = 14,
+    /// THIS volume's `WriterClaimV1` (`kind = 0`, charter §5.7 B2): one
+    /// per volume, in tree 0 — no slot, no lease, no door, never migrated
+    /// (`docs/porting/dynamic_routing.md` Q4; decision 0003 §AS).
+    writer_claim = 15,
 
     /// The id bytes behind the two-byte prefix.
     pub fn idLen(self: Tag) usize {
@@ -78,7 +82,7 @@ pub const Tag = enum(u8) {
             .appender_hint, .dead_member, .member, .job_shard => 12,
             .recovered => 14,
             .alloc_lease, .job => 8,
-            .dir_rename, .node_seq_incarnations => 0,
+            .dir_rename, .node_seq_incarnations, .writer_claim => 0,
         };
     }
 
@@ -199,6 +203,10 @@ pub fn dirRenameKey() ControlKey {
 
 pub fn nodeSeqIncarnationsKey() ControlKey {
     return ControlKey.prefix(.node_seq_incarnations);
+}
+
+pub fn writerClaimKey() ControlKey {
+    return ControlKey.prefix(.writer_claim);
 }
 
 /// The tag of a tree-0 key, or null for a key that is not a control key

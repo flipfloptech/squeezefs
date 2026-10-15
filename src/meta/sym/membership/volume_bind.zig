@@ -1274,6 +1274,14 @@ test "linux: the one-writer forest — every frame of every leased slot tree car
             try t.stagePut(key.TREE_INODES, k, &iv_value);
             try be.commit(t);
         }
+        // A mount-written frame in the native slot (the writer claim lives in tree 0).
+        {
+            const t = try be.begin(@src());
+            const k = try gpa.dupe(u8, &key.inodeKey(1000));
+            try keys.append(gpa, k);
+            try t.stagePut(key.TREE_INODES, k, &iv_value);
+            try be.commit(t);
+        }
         try be.checkpointNow();
         const g3 = be.slots.table.gOf(3);
         try testing.expect(g3 >= 1 and be.slots.table.view(3).leasedBy(0));

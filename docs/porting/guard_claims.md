@@ -254,6 +254,12 @@ PER-VOLUME control state: it never travels with a migrating slot (B:987-990 excl
 is hidden from FUSE by the reserved-xattr screen (B:740-744; TM:2731), and is excluded from
 the digest walk (builder.rs:1127-1134).
 
+**Port (decision 0003 §AS; `dynamic_routing.md` Q4):** the record is the tree-0 control record
+`TREE_CONTROL ‖ tag 15` (`control_records.writerClaimKey`), value = the 88-byte `WriterClaimV1`
+alone. At local ino 1 the key routed to slot 0, which only member 0 hosts: on an armed set the
+commit door refused every refresh and the dismount's delete of a member ≥ 1 (`SlotBusy`). Tree 0
+has no slot, no door, no migration and no digest, so the tee/digest/FUSE exclusions are moot.
+
 Value (reference): compact JSON `{"id","ts","pid","boot"[,"term"]}` (B:800-812):
 - `id` — `writer_id`, a fresh uuid v4 PER MOUNT (B:2088; `inner.writer_id = Uuid::new_v4()`),
   also the `client:{id}` suffix's sibling. Not the node identity (that is

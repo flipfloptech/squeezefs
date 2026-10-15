@@ -916,8 +916,7 @@ test "a two-member set: format → open (either URI order) → 200 creates sprea
             inode_records += 1;
         };
         try testing.expectEqual(@as(usize, 201), inode_records);
-        // Strictly ascending: one copy of every key, the members' own
-        // control homes (their claims at local ino 1) excluded.
+        // Strictly ascending: one copy of every key.
         for (kvs.items[1..], 1..) |kv, i| try testing.expect(key.lessThan(kvs.items[i - 1].key, kv.key));
         try set.checkpointNow();
         set.close();

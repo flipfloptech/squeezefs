@@ -33,7 +33,6 @@ const tick = @import("../../sync/tick.zig");
 const mem_budget = @import("../../mem/budget.zig");
 const uri = @import("../../cli/uri.zig");
 const key = @import("../key.zig");
-const record = @import("../record.zig");
 const tree = @import("../tree.zig");
 const node = @import("../node.zig");
 const node_cache = @import("../node_cache.zig");
@@ -42,7 +41,7 @@ const ledger = @import("../ledger.zig");
 const superblock = @import("../superblock.zig");
 const journal = @import("../journal.zig");
 const device_loader = @import("../device_loader.zig");
-const inos = @import("../inos.zig");
+const cr = @import("../sym/control_records.zig");
 const backend = @import("../backend.zig");
 const guard = @import("../guard.zig");
 const claim = @import("claim.zig");
@@ -106,8 +105,6 @@ pub const Guard = struct {
     mode: Mode,
     identity: claim.Identity,
     probe: claim.PidProbe,
-    /// The claim's xattr key (the chain scanned once at the gate).
-    xkey: [key.XATTR_KEY_LEN]u8,
     claimed: std.atomic.Value(bool) = .init(false),
     heartbeat_seq: u64 = 0,
     posture: pr.Posture,
@@ -183,7 +180,7 @@ pub const Guard = struct {
         const probe: claim.PidProbe = if (builtin.is_test) (opts.test_pid_probe orelse proc.probe) else proc.probe;
         const g = try gpa.create(Guard);
         errdefer gpa.destroy(g);
-        g.* = .{ .gpa = gpa, .io = io, .be = be, .mode = opts.mode, .identity = identity, .probe = probe, .xkey = undefined, .posture = .{ .none = .not_nvme_namespace }, .identity_opts = opts.identity, .identity_stamp = .{ .nqn_hash = 0, .id_hash = 0 } };
+        g.* = .{ .gpa = gpa, .io = io, .be = be, .mode = opts.mode, .identity = identity, .probe = probe, .posture = .{ .none = .not_nvme_namespace }, .identity_opts = opts.identity, .identity_stamp = .{ .nqn_hash = 0, .id_hash = 0 } };
         if (!identity.bootIdReadable()) log.warn("meta volume {s}: the boot id is unreadable — the same-host dead-pid proof never applies on this host (every foreign claim is judged by the TTL alone)", .{be.path});
 
         // The configured host identity (pair-or-neither).
@@ -202,13 +199,12 @@ pub const Guard = struct {
             },
         }
 
-        // The replayed claim (the staleness evidence) and its key.
+        // The replayed claim (the staleness evidence).
         const found = try g.readClaim(gpa);
-        errdefer if (found.raw) |r| gpa.free(r);
-        g.xkey = found.xkey;
-        g.found_raw = found.raw;
+        errdefer if (found) |r| gpa.free(r);
+        g.found_raw = found;
         g.gate_now = clock.realtimeCoarseNs();
-        g.evidence = claim.classify(found.raw, identity, g.gate_now, probe);
+        g.evidence = claim.classify(found, identity, g.gate_now, probe);
 
         // `claim clear` decides at commit (its delete needs the cover too).
         if (opts.mode == .claim_clear) return g;
@@ -233,7 +229,7 @@ pub const Guard = struct {
                 .own_residue => log.info("meta volume {s}: reclaiming this process's own residual writer claim (a drop-without-shutdown teardown)", .{be.path}),
                 .dead_pid => {
                     guard.stats.reclaims_dead_pid.inc();
-                    const c = claim.Claim.decode(found.raw.?) catch unreachable;
+                    const c = claim.Claim.decode(found.?) catch unreachable;
                     log.info("meta volume {s}: reclaiming the writer claim of a provably dead same-host holder (pid {d}, {d} s old; its /proc identity is gone or belongs to another incarnation)", .{ be.path, c.pid, c.ageS(now) });
                 },
             },
@@ -359,41 +355,19 @@ pub const Guard = struct {
 
     // ---- the claim record through the conveyor ----
 
-    const Found = struct { xkey: [key.XATTR_KEY_LEN]u8, raw: ?[]u8 };
-
-    /// The `(ino 1, hash56("writer_claim"))` chain: the matching record and
-    /// its key, else the first free coll's key.
-    fn readClaim(g: *Guard, gpa: Allocator) backend.OpenError!Found {
-        var kvs: std.ArrayList(tree.KeyValue) = .empty;
-        defer tree.deinitKeyValues(gpa, &kvs);
-        const h = key.xattrNameHash56(claim.CLAIM_XATTR, g.be.nameKey());
-        const start = key.xattrKey(inos.ROOT_INO, h, 0);
-        const end = key.xattrKey(inos.ROOT_INO, h, std.math.maxInt(u8));
-        g.be.range(gpa, key.TREE_XATTRS, &start, &end, 256, &kvs) catch |e| return switch (e) {
+    /// The claim's record in tree 0 (`cr.writerClaimKey`): a control
+    /// record takes no door token, so a member that hosts no slot still
+    /// refreshes and deletes its own claim.
+    fn readClaim(g: *Guard, gpa: Allocator) backend.OpenError!?[]u8 {
+        return g.be.lookup(gpa, key.TREE_CONTROL, cr.writerClaimKey().slice()) catch |e| switch (e) {
             error.OutOfMemory => error.OutOfMemory,
             error.Io => error.Io,
             else => error.Corrupt,
         };
-        var occ: [256]u8 = undefined;
-        var n: usize = 0;
-        for (kvs.items) |kv| {
-            occ[n] = kv.key[kv.key.len - 1];
-            n += 1;
-            const xv = record.XattrValue.decode(kv.value) catch return error.Corrupt;
-            if (std.mem.eql(u8, xv.name, claim.CLAIM_XATTR)) {
-                var k: [key.XATTR_KEY_LEN]u8 = undefined;
-                @memcpy(&k, kv.key[0..key.XATTR_KEY_LEN]);
-                return .{ .xkey = k, .raw = try gpa.dupe(u8, xv.value) };
-            }
-        }
-        const coll = key.firstFreeCollSeq(occ[0..n]) orelse return error.Corrupt;
-        return .{ .xkey = key.xattrKey(inos.ROOT_INO, h, coll), .raw = null };
     }
 
-    fn stageClaimPut(g: *Guard, t: *backend.KvTx, c: claim.Claim) Allocator.Error!void {
-        var buf: [1 + claim.CLAIM_XATTR.len + claim.CLAIM_LEN]u8 = undefined;
-        const enc = (record.XattrValue{ .name = claim.CLAIM_XATTR, .value = &c.encode() }).encodeInto(&buf) catch unreachable;
-        try t.stagePut(key.TREE_XATTRS, &g.xkey, enc);
+    fn stageClaimPut(_: *const Guard, t: *backend.KvTx, c: claim.Claim) Allocator.Error!void {
+        try t.stagePut(key.TREE_CONTROL, cr.writerClaimKey().slice(), &c.encode());
     }
 
     fn mapCommit(e: backend.Error) backend.OpenError {
@@ -456,7 +430,7 @@ pub const Guard = struct {
         const t = try g.be.begin(@src());
         {
             errdefer g.be.abandon(t);
-            try t.stageDelete(key.TREE_XATTRS, &g.xkey);
+            try t.stageDelete(key.TREE_CONTROL, cr.writerClaimKey().slice());
         }
         g.be.commit(t) catch |e| return mapCommit(e);
         try g.barrier();
@@ -601,7 +575,7 @@ pub const Guard = struct {
             return;
         }
         const t = g.be.begin(@src()) catch return;
-        t.stageDelete(key.TREE_XATTRS, &g.xkey) catch {
+        t.stageDelete(key.TREE_CONTROL, cr.writerClaimKey().slice()) catch {
             g.be.abandon(t);
             return;
         };
@@ -649,7 +623,7 @@ pub const ProbeError = error{ DeviceRefused, NotFormatted, Corrupt, Io, OutOfMem
 
 /// The raw `writer_claim` value as the RAM state after bootstrap replay
 /// would hold it: both superblock copies → the newest ledger record → the
-/// ring replayed into private trees → the xattr chain of ino 1. A live
+/// ring replayed into private trees → tree 0's `writer_claim` record. A live
 /// writer's concurrent pages are whole checksummed units: a torn one drops
 /// as in any replay. Caller frees.
 pub fn probeClaim(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, pool: *uring_fs.Pool, path: []const u8) ProbeError!?[]u8 {
@@ -702,27 +676,16 @@ pub fn probeClaim(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, p
         error.Io => return error.Io,
         else => return error.Corrupt,
     };
-    // A mount-time path: the key is expanded once per call, never per name.
-    const name_key: key.NameKey = .init(sb.hash_seed);
-    const h = key.xattrNameHash56(claim.CLAIM_XATTR, &name_key);
-    const start = key.xattrKey(inos.ROOT_INO, h, 0);
-    const end = key.xattrKey(inos.ROOT_INO, h, std.math.maxInt(u8));
-    const t = tree.routeContent(trees.items, key.TREE_XATTRS, &start) orelse return error.Corrupt;
-    var kvs: std.ArrayList(tree.KeyValue) = .empty;
-    defer tree.deinitKeyValues(gpa, &kvs);
-    t.range(gpa, &start, &end, 256, &kvs) catch |e| return switch (e) {
+    const k = cr.writerClaimKey();
+    const t = tree.routeContent(trees.items, key.TREE_CONTROL, k.slice()) orelse return error.Corrupt;
+    return t.lookup(gpa, k.slice()) catch |e| switch (e) {
         error.OutOfMemory => error.OutOfMemory,
         error.Io => error.Io,
         else => error.Corrupt,
     };
-    for (kvs.items) |kv| {
-        const xv = record.XattrValue.decode(kv.value) catch return error.Corrupt;
-        if (std.mem.eql(u8, xv.name, claim.CLAIM_XATTR)) return try gpa.dupe(u8, xv.value);
-    }
-    return null;
 }
 
-/// A probe needs a handful of nodes (the roots, the ino-1 xattr leaf);
+/// A probe needs a handful of nodes (the roots, the tree-0 claim leaf);
 /// the floor the cache shards derive from.
 const probe_cache_budget_bytes: u64 = 16 << 20;
 

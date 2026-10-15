@@ -2,7 +2,7 @@
 //! guard_claims.md`): the three layers every writer walks — (A) the flock
 //! on a dedicated fd (`backend.zig`), (B1) NVMe Persistent Reservations
 //! where `RESCAP ≠ 0` (`pr.zig` over the `/dev/ngXnY` uring_cmd transport
-//! of `pr_linux.zig`, or the fake), (B2) the `writer_claim` record on ino 1
+//! of `pr_linux.zig`, or the fake), (B2) the `writer_claim` record in tree 0
 //! committed and barriered before the checkpoint task spawns and before
 //! FUSE arms, heartbeat 10 s, stale at 45 s (`claim.zig`, `gate.zig`) —
 //! plus the fence latch's third rung (`journal.FailureLatch.noteFence`),

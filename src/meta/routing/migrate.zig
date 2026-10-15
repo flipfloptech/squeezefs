@@ -10,8 +10,8 @@
 //! fresh extents of B — every kind travels (inodes, dentries, xattrs, block
 //! refs, block maps), ZERO journal traffic per record, the images barriered
 //! before the tree joins B's live set. Nothing in a guest slot tree is
-//! pinned (the volume's control records live at its native local ino 1,
-//! Q4), so the copy is exact and the tee needs no exclusion. Teardown of
+//! pinned (the volume's control records live in tree 0, Q4), so the copy
+//! is exact and the tee needs no exclusion. Teardown of
 //! the source is ONE `slot_state` delete plus the tree's extents into
 //! pending-free (O(nodes)). Slot 0 — the root pin, the native keyspace of
 //! member 0 — is the one slot that never moves (`ledger.nativeSlotOf`);
@@ -406,6 +406,9 @@ pub fn copySlotTree(gpa: Allocator, src: *KvBackend, dst: *KvBackend, slot: u16)
         fn write(ctx: *anyopaque, addr: u64, image: []const u8) anyerror!void {
             const be: *KvBackend = @ptrCast(@alignCast(ctx));
             try be.cache.loader.writeImage(be.cache.loader.ctx, addr, image);
+            // An extent an earlier SMO retired and the allocator handed back:
+            // else the open below loads `RetiredExtent`.
+            be.cache.unretire(addr);
         }
         fn mint(ctx: *anyopaque) anyerror!u64 {
             const be: *KvBackend = @ptrCast(@alignCast(ctx));

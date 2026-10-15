@@ -1935,6 +1935,12 @@ pub const NodeCache = struct {
         }
     }
 
+    /// A fresh image written to `addr` outside the cache (the migration's
+    /// bulk copy) owns the extent: it leaves `retired`, as a publish does.
+    pub fn unretire(self: *NodeCache, addr: u64) void {
+        self.retired.remove(self.io, addr);
+    }
+
     /// Clock sweep: second-chance FIFO; clean unpinned nodes evict by
     /// dropping the map reference (in-flight readers keep their snapshots
     /// alive); dirty/serializing nodes are pinned by the clean-only CAS;

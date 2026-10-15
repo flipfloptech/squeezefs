@@ -108,7 +108,6 @@ const dlm = @import("../../meta/dlm.zig");
 const lock_order = @import("../../sync/lock_order.zig");
 const sync = @import("../../sync/sync.zig");
 const economy = @import("../../meta/economy.zig");
-const guard_claim = @import("../../meta/guard/claim.zig");
 const virtual_inodes = @import("virtual_inodes.zig");
 const inos = @import("../../meta/inos.zig");
 const jc = @import("../../meta/journal_core.zig");
@@ -936,16 +935,13 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         /// The reserved-xattr screen is an ALLOWLIST (`stats_cli.md` §1.7):
         /// `user.*` minus the `user.squeezefs.` family, `security.*` and
         /// `trusted.*` pass; everything else — the layout record, the
-        /// symlink target, the guard's control records on ino 1
-        /// (`writer_claim`, `client:*`), `job:*`, "and anything added
+        /// symlink target, `job:*`, "and anything added
         /// later" — is never listed, read, set or removed through FUSE. WHY
         /// an allowlist: a denylist left `system.symlink` (the VFS performs
         /// NO permission check for `system.*`), the layout (a decodable
         /// foreign value redirects reads to another file's blocks) and the
-        /// claim writable from an unprivileged shell. The guard's own
-        /// predicate stays the authority for its names.
+        /// claim writable from an unprivileged shell.
         pub fn xattrNameAllowed(name: []const u8) bool {
-            if (guard_claim.isGuardXattr(name)) return false;
             // `user.squeezefs.gather` is the ONE user-settable name of the
             // reserved family (charter §5.5 "`setfattr -n
             // user.squeezefs.gather -v 1 <dir>`"), admitted BY NAME.

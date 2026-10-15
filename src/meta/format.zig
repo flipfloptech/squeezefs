@@ -186,8 +186,8 @@ pub fn planFormatWith(gpa: Allocator, volume_len: u64, opts: FormatOptions, desc
                 .control => opts.control_records,
                 // The native keyspace belongs to slot 0's host (member 0,
                 // `ledger.nativeSlotOf`): every other member's native tree
-                // is born EMPTY — it holds the volume's own control records
-                // (the writer claim at local ino 1) and never a `/`.
+                // is born EMPTY and never holds a `/` (the volume's own
+                // control records — the writer claim — live in tree 0).
                 .native => if (opts.member_position != 0) &.{} else blk: {
                     const records = try desc.nativeRecords(a);
                     const out = try a.alloc(rec.RecordRef, records.len);

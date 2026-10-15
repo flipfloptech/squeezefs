@@ -5,8 +5,9 @@
 //! of the identity (`proc.zig`) and the volume binding (`gate.zig`) live
 //! beside them.
 //!
-//! The record is ONE xattr record on local ino 1 (`writer_claim`, hidden
-//! from FUSE by the reserved-xattr screen, never migrated with a slot). Its
+//! The record is ONE tree-0 control record (`control_records.writerClaimKey`:
+//! no slot, no lease, no door, never migrated — `dynamic_routing.md` Q4,
+//! decision 0003 §AS). Its
 //! value is a byte-exact `extern struct` (quirk Q1: never a JSON blob):
 //! magic/version/checksum like every other on-disk unit (charter §12).
 //!
@@ -47,13 +48,6 @@ pub const STALE_TTL_S: u64 = 45;
 /// stamped further than this into the future reads FRESH (conservative) and
 /// is logged; on PR a preempt needs `age > TTL + skew`.
 pub const SKEW_BOUND_S: u64 = 1;
-
-pub const CLAIM_XATTR: []const u8 = "writer_claim";
-
-/// Every control xattr the guard owns on ino 1 (the FUSE screen's row).
-pub fn isGuardXattr(name: []const u8) bool {
-    return std.mem.eql(u8, name, CLAIM_XATTR);
-}
 
 // ---------------------------------------------------------------------------
 // The record.

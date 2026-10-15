@@ -29,9 +29,9 @@ const NodeLayout = node.NodeLayout;
 /// ino 0 is reserved, 1 is the root; `next_ino` starts above the built
 /// population.
 pub const ROOT_INO: u64 = 1;
-/// Per-mount guard records the digest walk excludes: unique to every mount
-/// by design, never user-visible content.
-pub const WRITER_CLAIM_XATTR = "writer_claim";
+/// The per-mount guard record the digest walk excludes: unique to every
+/// mount by design, never user-visible content (the writer claim lives in
+/// tree 0, outside every digested kind).
 pub const WRITER_TERM_XATTR = "writer_term";
 
 /// The wire's `mode` bits (identical on Linux and macOS, and on-disk
@@ -378,11 +378,11 @@ pub fn freeRecords(gpa: Allocator, list: *std.ArrayList(Record)) void {
     list.deinit(gpa);
 }
 
-/// The digest walk's exclusion predicate: the per-mount `writer_claim` /
-/// `writer_term` guard xattrs.
+/// The digest walk's exclusion predicate: the per-mount `writer_term`
+/// guard xattr.
 pub fn isMountGuardXattr(value: []const u8) bool {
     const x = rec.XattrValue.decode(value) catch return false;
-    return std.mem.eql(u8, x.name, WRITER_CLAIM_XATTR) or std.mem.eql(u8, x.name, WRITER_TERM_XATTR);
+    return std.mem.eql(u8, x.name, WRITER_TERM_XATTR);
 }
 
 /// One user kind's contribution to the digest walk: the kind byte, then per
@@ -980,9 +980,9 @@ test "TreeWriter: the ¾ budget (64 KiB ⇒ 46,026; 256 KiB ⇒ 193,482 = splitP
     try testing.expectEqual(@as(u64, 100 - 9), alloc.freeExtents());
 }
 
-test "digest walks: kind-then-key chained hash excludes writer_claim/writer_term; the set digest is order-independent" {
+test "digest walks: kind-then-key chained hash excludes writer_term; the set digest is order-independent" {
     const gpa = testing.allocator;
-    const claim = try (rec.XattrValue{ .name = WRITER_CLAIM_XATTR, .value = "x" }).encodeAlloc(gpa);
+    const claim = try (rec.XattrValue{ .name = WRITER_TERM_XATTR, .value = "x" }).encodeAlloc(gpa);
     defer gpa.free(claim);
     const user = try (rec.XattrValue{ .name = "user.a", .value = "x" }).encodeAlloc(gpa);
     defer gpa.free(user);

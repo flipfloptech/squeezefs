@@ -863,7 +863,17 @@ fn globalSyncAt(text: []const u8) ?usize {
         switch (text[i]) {
             ';', '&', '|', ')', '}', '\n', '>', '<' => return at,
             '0'...'9' => if (i + 1 < text.len and text[i + 1] == '>') return at,
-            else => {},
+            '-' => {
+                // Only the scoped modes: `-f` (syncfs of the operand's
+                // filesystem) and `-d` (fdatasync of the operand).
+                inline for (.{ "-f ", "-d ", "--file-system ", "--data " }) |flag| {
+                    if (std.mem.startsWith(u8, text[i..], flag)) break;
+                } else return at;
+            },
+            // A file operand without `-d`/`-f`: GNU coreutils fsyncs it, but
+            // uutils (Ubuntu 26.04's `sync`) calls sync(2) — host-wide, a
+            // FUSE_SYNCFS to every FUSE mount on the host (kamrui).
+            else => return at,
         }
     }
     return null;
@@ -946,7 +956,7 @@ fn walkAll(gpa: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, prefix: []const 
     }
 }
 
-test "rig sync rail: no rig script runs a host-wide `sync` — every sync names the rig's own mount or file" {
+test "rig sync rail: no rig script runs a host-wide `sync` — every sync is `-f` on the rig's own mount or `-d` on its file" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     const cwd = std.Io.Dir.cwd();
@@ -1006,7 +1016,7 @@ test "rig sync rail: no rig script runs a host-wide `sync` — every sync names 
     }
 }
 
-test "the sync scanner: a bare `sync` in command position counts; an operand, an option, fsync, syncfs, prose and a lone name do not" {
+test "the sync scanner: a bare `sync` or one with a file operand counts (uutils: sync(2)); `-d`/`-f` operands, fsync, syncfs, prose and a lone name do not" {
     try std.testing.expect(globalSyncAt("sync") != null);
     try std.testing.expect(globalSyncAt("echo a > f && sync && cat f") != null);
     try std.testing.expect(globalSyncAt("rm x; sync; echo ok") != null);
@@ -1016,8 +1026,12 @@ test "the sync scanner: a bare `sync` in command position counts; an operand, an
     try std.testing.expect(globalSyncAt("sync 2>/dev/null") != null);
     try std.testing.expect(globalSyncAt("( sync )") != null);
     try std.testing.expect(globalSyncAt("echo a > f && sync -f . && cat f") == null);
-    try std.testing.expect(globalSyncAt("dd if=x of=y conv=fsync && sync big") == null);
-    try std.testing.expect(globalSyncAt("sync d; stat d") == null);
+    try std.testing.expect(globalSyncAt("dd if=x of=y conv=fsync && sync big") != null);
+    try std.testing.expect(globalSyncAt("sync d; stat d") != null);
+    try std.testing.expect(globalSyncAt("sync --help") != null);
+    try std.testing.expect(globalSyncAt("dd if=x of=y conv=fsync && sync -d big") == null);
+    try std.testing.expect(globalSyncAt("sync -d d; stat d") == null);
+    try std.testing.expect(globalSyncAt("sync --data big && sync --file-system .") == null);
     try std.testing.expect(globalSyncAt("syncfs and fsync and fdatasync") == null);
     try std.testing.expect(globalSyncAt("echo \"sync\"") == null);
     try std.testing.expect(globalSyncAt("resync; async") == null);

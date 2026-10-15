@@ -1831,7 +1831,7 @@ test "smoke: THE TWO-DAEMON MATRIX — mount A (the manager) → mount B as a SE
     // boundary-crossing reads the handler lane serves); `rm` on B ships the
     // terminal frees to A and both `df`s return.
     {
-        const out = try b.onMount("mkdir b-data && dd if=/dev/urandom of=b-data/big bs=1M count=200 status=none && sync b-data/big && sha256sum b-data/big | cut -d' ' -f1 && df -k . | tail -1 | awk '{print $3}'");
+        const out = try b.onMount("mkdir b-data && dd if=/dev/urandom of=b-data/big bs=1M count=200 status=none && sync -d b-data/big && sha256sum b-data/big | cut -d' ' -f1 && df -k . | tail -1 | awk '{print $3}'");
         defer gpa.free(out);
         var lines = std.mem.splitScalar(u8, out, '\n');
         const sha_b = lines.next() orelse return error.ShaMissing;
@@ -1891,7 +1891,7 @@ test "smoke: THE TWO-DAEMON MATRIX — mount A (the manager) → mount B as a SE
     // the size claim ships as one setattr; B reads the bytes back
     // byte-exact and A reads them under B's token.
     {
-        const out = try rig.onMount("dd if=/dev/urandom of=b2/f9 bs=1M count=8 conv=notrunc status=none && sync b2/f9 && sha256sum b2/f9 | cut -d' ' -f1 && stat -c %s b2/f9");
+        const out = try rig.onMount("dd if=/dev/urandom of=b2/f9 bs=1M count=8 conv=notrunc status=none && sync -d b2/f9 && sha256sum b2/f9 | cut -d' ' -f1 && stat -c %s b2/f9");
         defer gpa.free(out);
         var lines = std.mem.splitScalar(u8, out, '\n');
         const sha_a = lines.next() orelse return error.ShaMissing;
@@ -3177,7 +3177,7 @@ test "smoke: THE TWO-DAEMON MATRIX over MutualTls on KERNEL TLS — `key tls-ini
     {
         var script: [256]u8 = undefined;
         const t0 = clock.monotonicNs();
-        const out = try b.onMount(try std.fmt.bufPrint(&script, "mkdir b-data && dd if=/dev/urandom of=b-data/big bs=1M count={d} status=none && sync b-data/big && sha256sum b-data/big | cut -d' ' -f1", .{mtls_dd_mib}));
+        const out = try b.onMount(try std.fmt.bufPrint(&script, "mkdir b-data && dd if=/dev/urandom of=b-data/big bs=1M count={d} status=none && sync -d b-data/big && sha256sum b-data/big | cut -d' ' -f1", .{mtls_dd_mib}));
         defer gpa.free(out);
         const dd_ms = (clock.monotonicNs() - t0) / std.time.ns_per_ms;
         const sha_b = std.mem.trimEnd(u8, out, "\n");
@@ -3716,7 +3716,7 @@ fn kvdaKillRow(skip_pages: bool) !void {
     var sha1: []const u8 = "";
     {
         var script_buf: [256]u8 = undefined;
-        const out = try b.onMount(try std.fmt.bufPrint(&script_buf, "mkdir kv && dd if=/dev/urandom of=kv/one bs=1M count={d} status=none && sync kv/one && sha256sum kv/one | cut -d' ' -f1", .{kvda_dd_mib}));
+        const out = try b.onMount(try std.fmt.bufPrint(&script_buf, "mkdir kv && dd if=/dev/urandom of=kv/one bs=1M count={d} status=none && sync -d kv/one && sha256sum kv/one | cut -d' ' -f1", .{kvda_dd_mib}));
         defer gpa.free(out);
         sha1 = try std.fmt.bufPrint(&sha1_buf, "{s}", .{std.mem.trimEnd(u8, out, "\n")});
     }
@@ -3813,7 +3813,7 @@ fn kvdaKillRow(skip_pages: bool) !void {
     var sha2: []const u8 = "";
     {
         var script_buf: [256]u8 = undefined;
-        const out = try b.onMount(try std.fmt.bufPrint(&script_buf, "dd if=/dev/urandom of=kv/two bs=1M count={d} status=none && sync kv/two && sha256sum kv/two | cut -d' ' -f1", .{kvda_dd_mib / 2}));
+        const out = try b.onMount(try std.fmt.bufPrint(&script_buf, "dd if=/dev/urandom of=kv/two bs=1M count={d} status=none && sync -d kv/two && sha256sum kv/two | cut -d' ' -f1", .{kvda_dd_mib / 2}));
         defer gpa.free(out);
         sha2 = try std.fmt.bufPrint(&sha2_buf, "{s}", .{std.mem.trimEnd(u8, out, "\n")});
     }
@@ -3906,7 +3906,7 @@ test "smoke: THE JOINER-SIDE GRANT LEDGER — the holder's ledger capped at 8 op
     var max_open: u64 = 0;
     while (i < grant_ledger_row_files) : (i += 1) {
         var script_buf: [192]u8 = undefined;
-        const out = try b.onMount(try std.fmt.bufPrint(&script_buf, "mkdir -p g && dd if=/dev/zero of=g/f{d} bs=1M count=64 status=none && sync g/f{d}", .{ i, i }));
+        const out = try b.onMount(try std.fmt.bufPrint(&script_buf, "mkdir -p g && dd if=/dev/zero of=g/f{d} bs=1M count=64 status=none && sync -d g/f{d}", .{ i, i }));
         gpa.free(out);
         const ta = try rig.stats();
         defer gpa.free(ta);
@@ -4016,7 +4016,7 @@ test "smoke: THE HANDOVER DRAINS PARKED STAMPS (rung 10 item 4) — A (the manag
     var pair: [2][]const u8 = undefined;
     {
         var script_buf: [256]u8 = undefined;
-        const out = try rig.onMount(try std.fmt.bufPrint(&script_buf, "mkdir d && i=0; while [ $i -lt {d} ]; do dd if=/dev/zero of=d/f$i bs=32k count=1 status=none; i=$((i+1)); done; sync d; stat -c '%n %i' d/f*", .{handover_row_files}));
+        const out = try rig.onMount(try std.fmt.bufPrint(&script_buf, "mkdir d && i=0; while [ $i -lt {d} ]; do dd if=/dev/zero of=d/f$i bs=32k count=1 status=none; i=$((i+1)); done; sync -d d; stat -c '%n %i' d/f*", .{handover_row_files}));
         defer gpa.free(out);
         var inos_of: [handover_row_files]u64 = undefined;
         var names_of: [handover_row_files][]const u8 = undefined;
@@ -4078,7 +4078,7 @@ test "smoke: THE HANDOVER DRAINS PARKED STAMPS (rung 10 item 4) — A (the manag
     // step 0 had left parked would meet the moved door here and be
     // dropped counted — the counter the row holds at 0.
     {
-        const out = try rig.onMount("sync d");
+        const out = try rig.onMount("sync -d d");
         gpa.free(out);
     }
     const ta = try rig.stats();
@@ -5975,7 +5975,7 @@ const stage_dd_script =
     \\W="$1"
     \\s=$(date +%s%N)
     \\dd if="$W/image" of=big bs=1M count=200 status=none
-    \\sync big
+    \\sync -d big
     \\e=$(date +%s%N)
     \\echo "dd_ns=$((e - s))"
     \\test "$(stat -c %s big)" = 209715200
@@ -5993,7 +5993,7 @@ const stage_cp_script =
     \\head -c 104857600 "$W/image" > "$W/hundred"
     \\s=$(date +%s%N)
     \\cp "$W/hundred" big100
-    \\sync big100
+    \\sync -d big100
     \\e=$(date +%s%N)
     \\echo "cp_ns=$((e - s))"
     \\cmp big100 "$W/hundred"
@@ -6027,19 +6027,19 @@ const stage_truncate_script =
     \\truncate -s 220M big
     \\truncate -s 220M "$W/expect"
     \\test "$(stat -c %s big)" = 230686720
-    \\sync big
+    \\sync -d big
     \\cmp big "$W/expect"
     \\dd if="$W/image" of=shrunk bs=1M count=8 status=none
     \\dd if="$W/image" of="$W/shrunk" bs=1M count=8 status=none
-    \\sync shrunk
+    \\sync -d shrunk
     \\truncate -s 1300000 shrunk
     \\truncate -s 1300000 "$W/shrunk"
-    \\sync shrunk
+    \\sync -d shrunk
     \\head -c 4096 /dev/urandom > "$W/page"
     \\dd if="$W/page" of=shrunk bs=4k seek=384 count=1 conv=notrunc status=none
     \\dd if="$W/page" of="$W/shrunk" bs=4k seek=384 count=1 conv=notrunc status=none
     \\test "$(stat -c %s shrunk)" = 1576960
-    \\sync shrunk
+    \\sync -d shrunk
     \\cmp shrunk "$W/shrunk"
     \\echo stage-truncate-ok
 ;
@@ -6056,7 +6056,7 @@ const stage_storm_script =
     \\s=$(date +%s%N)
     \\i=0
     \\while [ $i -lt 8 ]; do
-    \\  ( cp "$W/s$i" storm$i && sync storm$i ) &
+    \\  ( cp "$W/s$i" storm$i && sync -d storm$i ) &
     \\  i=$((i + 1))
     \\done
     \\wait
@@ -6100,7 +6100,7 @@ fn overwriteScript(gpa: std.mem.Allocator, n_aligned: usize, n_unaligned: usize,
         }
     }
     try w.writeAll(
-        \\sync big
+        \\sync -d big
         \\cmp big "$W/expect"
         \\sha256sum big | cut -d' ' -f1
         \\echo stage-overwrite-ok
@@ -6120,7 +6120,7 @@ fn smallFilesScript(gpa: std.mem.Allocator, n: usize) ![]u8 {
         \\  dd if="$W/image" of=p/f$i bs=65536 count=1 skip=$i status=none
         \\  i=$((i + 1))
         \\done
-        \\sync p/f0 p/f{d}
+        \\sync -d p/f0 p/f{d}
         \\e=$(date +%s%N)
         \\echo "small_ns=$((e - s))"
         \\echo stage-small-ok
@@ -10053,7 +10053,7 @@ fn kvmapWriteScript(gpa: std.mem.Allocator, from_mib: u64, reps: u64, tolerate: 
         try w.print("dd if=\"$W/image\" of=big bs=1M skip={d} seek={d} count={d} conv=notrunc status=none{s}\n", .{ pos % image_mib, pos, n, if (tolerate) " || true" else "" });
         pos += n;
     }
-    if (!tolerate) try w.writeAll("sync big\necho kvmap-write-ok\n");
+    if (!tolerate) try w.writeAll("sync -d big\necho kvmap-write-ok\n");
     return script.toOwnedSlice();
 }
 
@@ -10085,7 +10085,7 @@ fn kvmapOverwriteScript(gpa: std.mem.Allocator, n: usize, seed: u64) ![]u8 {
         try w.print("dd if=\"$W/image\" of=\"$W/want\" bs=4096 count=1 skip={d} status=none\n", .{src_page});
         try w.writeAll("cmp \"$W/got\" \"$W/want\"\n");
     }
-    try w.writeAll("sync big\necho kvmap-overwrite-ok\n");
+    try w.writeAll("sync -d big\necho kvmap-overwrite-ok\n");
     return script.toOwnedSlice();
 }
 
@@ -10096,7 +10096,7 @@ const kvmap_truncate_script =
     \\head -c 104857600 big | sha256sum | cut -d' ' -f1 > "$W/expect.sha"
     \\truncate -s 100M big
     \\test "$(stat -c %s big)" = 104857600
-    \\sync big
+    \\sync -d big
     \\sha256sum big | cut -d' ' -f1 > "$W/big.sha"
     \\cmp "$W/big.sha" "$W/expect.sha"
     \\echo kvmap-truncate-ok

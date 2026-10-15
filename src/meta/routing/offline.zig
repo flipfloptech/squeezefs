@@ -229,7 +229,7 @@ fn boundMarker(gpa: Allocator, pool: *uring_fs.Pool, root: []const u8, r: Rebind
         return error.StagingCustodyLive;
     }
     if (row.live_units != 0) {
-        log.err("staging drain barrier refused (KD-8): {d} pending write-custody unit(s) remain under {s} — mount the filesystem as that member (mount slot {x:0>8}), let writeback drain (sync + clean unmount), then re-run; nothing was changed", .{ row.live_units, root, row.mount_slot });
+        log.err("staging drain barrier refused (KD-8): {d} pending write-custody unit(s) remain under {s} — mount the filesystem as that member (mount slot {x:0>8}), let writeback drain (`sync -f` the mount, then a clean unmount), then re-run; nothing was changed", .{ row.live_units, root, row.mount_slot });
         return error.StagingCustodyLive;
     }
     return (staging.Ring.readMarker(pool, root) catch return error.StagingRefused) orelse null;

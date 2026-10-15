@@ -526,7 +526,8 @@ Unknown}` three-valued (`L8658-8694`); the OTHER direction (a layout naming a bl
 stays report-only — a record is never fabricated (`L8696-8707`). One `commit_block_refs_witnessed`
 per stale record under its owner's 4a; a failure refuses THIS finding naming what landed
 (`L8708-8742`).
-Port oracle (landed): `PBR.verifyRefs` with `Exemptions{isOpenPack, isInflight}` (`PBR:L683-728`),
+Port oracle (landed): `PBR.verifyRefs` with `Exemptions{isOpenPack, isInflight}` — each face judges the
+verified volume's block, never the index on any volume (packfsck) (`PBR:L683-728`),
 `PBR.confirm` = the verdict site firing `meta_kv_block_refs_drift` and logging the first
 `DRIFT_LOG_ROWS` offenders WITH owners (`L776-787`), `PBR.repairPlan(…, online)` refusing
 `OnlineRepairRefused`/`UnknownJustification` with `Naming` three-valued and `unfabricated` counted

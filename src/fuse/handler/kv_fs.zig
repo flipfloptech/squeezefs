@@ -5768,6 +5768,36 @@ test "unlinked-open file: readable until the final FORGET; the forget gathers th
     try testing.expectEqual(@as(u64, 0), h.opens.openCount());
 }
 
+test "a FORGET that fills the corpse gather destroys nothing on the forgetting thread — the full batch is the reclaim cadence's (the FUSE drain worker runs every ring FORGET inline, and its thread drives its handler lane and its ring: a destroy parked there — a node read's single flight, the layout lock, the commit — parks every fiber of the lane with it; the kamrui mdtest wedge: one create parked at `handler_entry`, the umount behind it)" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    const inodes0 = h.store.countKind(key.TREE_INODES);
+    var corpses: [RECLAIM_BATCH]u64 = undefined;
+    var name_buf: [16]u8 = undefined;
+    for (&corpses, 0..) |*ino, i| {
+        const name = try std.fmt.bufPrint(&name_buf, "c{d}", .{i});
+        ino.* = try h.create(1, name, 0o644);
+        try testing.expectEqual(@as(?linux.E, null), h.call(.{ .unlink = .{ .name = name } }, 1).errno());
+        h.release(ino.*);
+    }
+    const commits0 = h.store.commits;
+    for (corpses) |ino| h.forget(ino, 1);
+    // The 64th corpse filled the batch: gathered, none destroyed here.
+    try testing.expectEqual(commits0, h.store.commits);
+    try testing.expectEqual(@as(usize, RECLAIM_BATCH), h.fs.reclaim.items.len);
+    try testing.expectEqual(inodes0 + RECLAIM_BATCH, h.store.countKind(key.TREE_INODES));
+    var tr = @import("op_trace.zig").OpTrace.begin(1, .other);
+    var win: [16]u8 = undefined;
+    var c: Ctx = .{ .unique = 1, .uid = 0, .gid = 0, .pid = 0, .io = testing.io, .trace = &tr, .wd_slot = null, .window = &win };
+    try h.fs.reclaimDrain(&c);
+    tr.finish();
+    // The cadence's drain: the whole batch in ONE destroy entry.
+    try testing.expectEqual(commits0 + 1, h.store.commits);
+    try testing.expectEqual(inodes0, h.store.countKind(key.TREE_INODES));
+    try testing.expectEqual(@as(usize, 0), h.fs.reclaim.items.len);
+}
+
 test "the corpse sweep at mount: an unlinked file whose FORGET died with the daemon (nlink 0, no dentry) is destroyed by the next mount's sweep with its layout; live files are untouched; a clean store sweeps nothing" {
     var h: Harness = undefined;
     try h.init();

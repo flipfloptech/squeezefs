@@ -63,7 +63,9 @@ sync_tree() {
     | grep -v '^cannot delete non-empty directory: \.wt-' || true
   # A worktree removed on the Mac leaves its mirror behind: the build products inside it are
   # excluded from the sync, so rsync cannot empty the directory. Remove such mirrors.
-  local here; here=$(cd "$REPO" && ls -d .wt-*/ 2>/dev/null | tr -d / | tr '\n' ' ')
+  # (`|| true`: a tree with no worktrees under it matches nothing, and under pipefail the
+  # failed ls would end the script silently — it did, from inside a worktree.)
+  local here; here=$( { cd "$REPO" && ls -d .wt-*/ 2>/dev/null || true; } | tr -d / | tr '\n' ' ')
   "${SSH[@]}" "$SSH_HOST" "cd '$REPO' && for d in .wt-*/; do d=\${d%/}; [ -d \"\$d\" ] || continue; case ' $here ' in *\" \$d \"*) ;; *) sudo rm -rf -- \"\$d\" ;; esac; done" </dev/null
 }
 

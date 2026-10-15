@@ -886,7 +886,28 @@ pub const PendingTimes = struct {
     /// intentionally supersedes — it (an exact-set utimes must never be
     /// max-clamped by a dead echo); a destroyed corpse's is moot. Under the
     /// ino's I-guard, so it never races an absorb. True iff one was parked.
+    /// A parked size CLAIM survives (its stamp is dropped): only its own
+    /// drain or a size-setting commit (`retireAll`) retires a claim — a
+    /// chmod's or an xattr's commit dropping it would lose the size.
     pub fn retire(self: *PendingTimes, ino: u64) bool {
+        const s = self.stripeOf(ino);
+        s.lock.lock();
+        defer s.lock.unlock();
+        const p = s.map.getPtr(ino) orelse return false;
+        if (p.size != 0) {
+            p.mtime = 0;
+            p.ctime = 0;
+            return true;
+        }
+        _ = s.map.remove(ino);
+        _ = self.count.fetchSub(1, .monotonic);
+        stats.meta_kv_times_echo_pending.sub(1);
+        return true;
+    }
+
+    /// `retire` for a commit that SETS the size (a truncate, O_TRUNC): the
+    /// claim leaves with the stamp.
+    pub fn retireAll(self: *PendingTimes, ino: u64) bool {
         const s = self.stripeOf(ino);
         s.lock.lock();
         defer s.lock.unlock();

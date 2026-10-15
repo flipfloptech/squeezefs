@@ -468,6 +468,10 @@ pub const DataPlane = struct {
     /// mutations of a foreign-slot file — the layout publish"): bound with
     /// the layout face; null = a merge on a foreign record is refused.
     foreign_publish: ?ForeignPublish = null,
+    /// The filesystem's parked size claims (decision 0003 §AL.5): an
+    /// extending write's size is readable before it is durable, so the
+    /// plane's reads and its write side fold it as the attr replies do.
+    claims: ?ClaimSource = null,
     /// `dismount` ran (once; `close` runs it if nobody did).
     dismounted: bool = false,
 
@@ -1246,6 +1250,15 @@ pub const DataPlane = struct {
     /// Shared write that extends the file under a shared guard — two such
     /// writes race their size Δs (field overwrite, not max) and the file
     /// ends shorter than its last write.
+    pub const ClaimSource = struct {
+        ctx: *anyopaque,
+        claimOf: *const fn (ctx: *anyopaque, ino: u64) u64,
+    };
+
+    pub fn bindClaims(self: *DataPlane, src: ?ClaimSource) void {
+        self.claims = src;
+    }
+
     pub fn noteShape(self: *DataPlane, ino: u64, size: u64, kind: layout.Kind) void {
         self.shape.publish(ino, size, kind == .striped and self.passthrough);
     }
@@ -2265,7 +2278,7 @@ pub const DataPlane = struct {
         const bytes = (self.backend.lookup(self.gpa, key.TREE_INODES, &key.inodeKey(ino)) catch |e| return KvBackend.coreError(e)) orelse return null;
         defer self.gpa.free(bytes);
         const v = record.InodeValue.decode(bytes) catch return error.InputOutput;
-        return v.size;
+        return @max(v.size, if (self.claims) |c| c.claimOf(c.ctx, ino) else 0);
     }
 
     fn mapLookup(ctx: *anyopaque, ino: u64, block: u32) ?Mapping {

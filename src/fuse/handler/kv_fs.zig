@@ -1520,6 +1520,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             if (@hasDecl(Store, "bindParentMemo")) self.store.bindParentMemo(.{ .ctx = self, .parentOf = parentMemoSeam });
             // The handover's step 0 drains the departing slot's parked stamps.
             if (@hasDecl(Store, "bindTimesDrain")) self.store.bindTimesDrain(.{ .ctx = self, .drainSlot = timesDrainSeam });
+            if (@hasDecl(Data, "bindClaims")) self.data.bindClaims(.{ .ctx = self, .claimOf = claimSeam });
             fuse_killpriv_negotiated.set(@intFromBool(self.killpriv_v2));
             const syncfs_armed = a.has(abi.FUSE_HAS_SYNCFS);
             fuse_syncfs_armed.set(@intFromBool(syncfs_armed));
@@ -2053,7 +2054,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             try self.commit(c, t);
             if (layout_lock) |g| g.release(self.io);
             layout_lock = null;
-            _ = self.pending.retire(local);
+            _ = if (a.attr.size != null) self.pending.retireAll(local) else self.pending.retire(local);
             if (a.attr.size) |sz| {
                 self.afterCommit(&after);
                 if (kind == .striped and sz < old_size) self.zeroTailAfterShrink(local, sz, old_size);
@@ -2638,6 +2639,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 var t_owned = true;
                 errdefer if (t_owned) self.store.abandon(t);
                 var stored = try self.readInode(local);
+                stored.size = self.claimedSize(local, stored);
                 try self.stageTruncate(c, t, local, stored, 0, &after);
                 stored.size = 0;
                 const stamp = now();
@@ -2650,7 +2652,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 try self.commit(c, t);
                 layout_lock.?.release(self.io);
                 layout_lock = null;
-                _ = self.pending.retire(local);
+                _ = self.pending.retireAll(local);
                 self.afterCommit(&after);
                 self.data.noteShape(local, 0, if (kind == .striped) .striped else .inline_);
             }
@@ -3148,6 +3150,12 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             defer trace.finish();
             var c: Ctx = .{ .unique = 0, .uid = 0, .gid = 0, .pid = 0, .io = self.io, .trace = &trace, .wd_slot = null, .window = &.{} };
             _ = try self.setattr(&c, .{ .ino = global, .attr = .{ .size = size } });
+        }
+
+        /// The data plane's view of a parked size claim (§AL.5).
+        fn claimSeam(ctx: *anyopaque, ino: u64) u64 {
+            const self: *Self = @ptrCast(@alignCast(ctx));
+            return self.pending.claimOf(ino);
         }
 
         /// The handover's step 0 as the plane calls it (its own op context:

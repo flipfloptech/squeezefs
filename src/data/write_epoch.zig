@@ -36,7 +36,6 @@ const std = @import("std");
 const Io = std.Io;
 const Atomic = std.atomic.Value;
 const Allocator = std.mem.Allocator;
-const assert = std.debug.assert;
 
 const counters = @import("../core/counters.zig");
 const clock = @import("../core/clock.zig");
@@ -78,6 +77,7 @@ pub const stats = struct {
     /// Must-stay-0.
     pub var rewrite_shadow_fence_drops: counters.Tripwire = .init("rewrite_shadow_fence_drops");
     pub var rewrite_shadow_displaced_drift: counters.Tripwire = .init("rewrite_shadow_displaced_drift");
+    pub var rewrite_shadow_save_overflow: counters.Tripwire = .init("rewrite_shadow_save_overflow");
 };
 
 pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
@@ -85,7 +85,7 @@ pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
     inline for (.{ "rewrite_shadow_swaps", "rewrite_shadow_bytes", "rewrite_shadow_fallbacks", "rewrite_shadow_close_retries", "rewrite_shadow_close_waits", "rewrite_shadow_save_waits", "rewrite_shadow_superseded", "rewrite_shadow_pressure_closes", "rewrite_shadow_orphan_discards", "rewrite_shadow_idle_closes", "rewrite_blocks", "rewrite_user_bytes", "rewrite_device_write_bytes" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, @field(stats, name).load() });
     }
-    try w.print("\"rewrite_shadow_fence_drops\":{d},\"rewrite_shadow_displaced_drift\":{d}}}", .{ counters.tripwireCount("rewrite_shadow_fence_drops"), counters.tripwireCount("rewrite_shadow_displaced_drift") });
+    try w.print("\"rewrite_shadow_fence_drops\":{d},\"rewrite_shadow_displaced_drift\":{d},\"rewrite_shadow_save_overflow\":{d}}}", .{ counters.tripwireCount("rewrite_shadow_fence_drops"), counters.tripwireCount("rewrite_shadow_displaced_drift"), counters.tripwireCount("rewrite_shadow_save_overflow") });
 }
 
 const Shadowed = struct {
@@ -127,21 +127,39 @@ pub const Epoch = struct {
     }
 };
 
+fn shadows(e: ?*const Epoch, block: u32) bool {
+    return if (e) |x| x.shadow.contains(block) else false;
+}
+
+/// The blocks a fold of `open` and `closing` shadows — what its ONE save
+/// carries. At most `max_displaced` lookups: the closing shadow is capped too.
+fn shadowUnion(open: ?*const Epoch, closing: ?*const Epoch) usize {
+    var n: usize = if (open) |e| e.shadow.count() else 0;
+    const c = closing orelse return n;
+    var it = c.shadow.keyIterator();
+    while (it.next()) |b| {
+        if (!shadows(open, b.*)) n += 1;
+    }
+    return n;
+}
+
 pub const RecordVerdict = union(enum) {
     shadowed: struct { displaced_prev: ?Binding, coverage_complete: bool },
     /// The ino's layout is not striped (a promotion in flight), or the
     /// epoch already shadows `MergeOutcome.max_displaced` other blocks (the
-    /// ONE save's size) and no save in flight names this block: the caller
-    /// takes the durable-merge arm.
+    /// ONE save's size) and no save is in flight: the caller takes the
+    /// durable-merge arm.
     not_shadowed,
-    /// The open epoch is at the ONE save's size AND the ino's CLOSING epoch
-    /// shadows this block: a durable merge now would land under that
-    /// save, which then displaces a key it never parked and frees the
-    /// parked one a second time (`rewrite_shadow_displaced_drift` +
-    /// `block_untracked_free_refusals`: fstests generic/247, 500 blocks
-    /// overwritten by O_DIRECT and mmap at once). The caller publishes
-    /// nothing: it awaits the save (`awaitSaveSettled`, never under (3))
-    /// and records again over the landed B.
+    /// The open epoch's shadow united with the ino's CLOSING epoch's is at
+    /// the ONE save's size and neither shadows this block: a transient save
+    /// folds the two into one epoch whose close must fit that save. The
+    /// caller publishes nothing: it awaits the save (`awaitSaveSettled`,
+    /// never under (3)) and records again — over the landed B, or into the
+    /// folded epoch. (A block the closing epoch shadows is always taken: a
+    /// durable merge under that save made it displace a key it never parked
+    /// and free the parked one a second time — `rewrite_shadow_displaced_
+    /// drift` + `block_untracked_free_refusals`: fstests generic/247, 500
+    /// blocks overwritten by O_DIRECT and mmap at once.)
     save_in_flight,
 };
 
@@ -279,31 +297,38 @@ pub const Epochs = struct {
         }
         self.lock.lock();
         defer self.lock.unlock();
-        // The ONE save publishes at most `max_displaced` blocks: a block
-        // beyond that takes the per-block durable publish instead of being
-        // dropped from the save (the pre-fix `closeEpoch` break) — unless
-        // the ino's CLOSING epoch shadows it: a durable merge would land
-        // under that save (the visibility law), so the caller awaits the
-        // save instead and records again over the landed B.
-        if (self.table.get(ino)) |e| if (!e.shadow.contains(block) and e.shadow.count() >= seams.MergeOutcome.max_displaced) {
+        const open = self.table.get(ino);
+        const closing = self.closing.get(ino);
+        // The ONE save publishes at most `max_displaced` blocks, and a
+        // transient save folds the closing epoch's shadow into the open one
+        // (`reregister`): the cap bounds their UNION, so every close — a
+        // fold's included — fits its save by construction. A block past it
+        // awaits the save in flight (it lands, or folds within the cap) and
+        // records again; with none in flight it takes the per-block durable
+        // publish instead of being dropped from the save. A block the
+        // closing epoch shadows never grows the union, so it is always
+        // taken: no durable merge lands under that save (the visibility law).
+        if (!shadows(open, block) and !shadows(closing, block) and shadowUnion(open, closing) >= seams.MergeOutcome.max_displaced) {
             var g = guard;
             g.deinit();
-            if (self.closing.get(ino)) |c| if (c.shadowBinding(block) != null) return .save_in_flight;
+            if (closing != null) return .save_in_flight;
             stats.rewrite_shadow_fallbacks.inc();
             return .not_shadowed;
-        };
+        }
+        // Every reservation precedes the first mutation: a refusal registers
+        // nothing (an empty epoch left registered lacked the fold's room).
         // A table slot stays free for every closing epoch: a transient save
         // re-registers with no allocation (`reregister`).
         try self.table.ensureUnusedCapacity(self.gpa, self.closing.count() + 1);
-        const gop = self.table.getOrPutAssumeCapacity(ino);
-        if (!gop.found_existing) {
-            const e = try self.gpa.create(Epoch);
-            e.* = .{ .ino = ino };
-            gop.value_ptr.* = e;
-            stats.rewrite_shadow_open_epochs.add(1);
-        }
-        const e = gop.value_ptr.*;
-        const closing = self.closing.get(ino);
+        const e = open orelse blk: {
+            const fresh = try self.gpa.create(Epoch);
+            fresh.* = .{ .ino = ino };
+            break :blk fresh;
+        };
+        errdefer if (open == null) {
+            e.deinit(self.gpa);
+            self.gpa.destroy(e);
+        };
         // Under a closing epoch this one keeps room for the closing one's
         // records past its own next: a transient save folds in with no
         // allocation (`reregister`).
@@ -311,6 +336,10 @@ pub const Epochs = struct {
         try e.displaced.ensureUnusedCapacity(self.gpa, fold.displaced + 1);
         try e.shadow.ensureUnusedCapacity(self.gpa, fold.shadow + 1);
         try e.guards.ensureUnusedCapacity(self.gpa, fold.guards + 1);
+        if (open == null) {
+            self.table.putAssumeCapacityNoClobber(ino, e);
+            stats.rewrite_shadow_open_epochs.add(1);
+        }
         const own_prev = e.shadowBinding(block);
         const closing_prev: ?Binding = if (own_prev == null) (if (closing) |c| c.shadowBinding(block) else null) else null;
         const displaced_prev: ?Binding = own_prev orelse closing_prev orelse prev;
@@ -488,8 +517,14 @@ pub const Epochs = struct {
         var n: usize = 0;
         var it = e.shadow.iterator();
         while (it.next()) |kv| {
-            // `record` caps the shadow at the ONE save's size.
-            assert(n < inserts_buf.len);
+            // `record` caps the open shadow united with the closing one at
+            // the ONE save's size, so a fold fits too. Past it is a bug:
+            // loud, never lossy (the epoch re-registers whole).
+            if (n == inserts_buf.len) {
+                stats.rewrite_shadow_save_overflow.fire("an epoch shadows more blocks than the ONE save carries; it stays open, nothing published or freed");
+                self.reregister(io, e);
+                return .transient;
+            }
             inserts_buf[n] = .{ .block = kv.key_ptr.*, .binding = kv.value_ptr.binding };
             proofs_buf[n] = kv.value_ptr.proof;
             n += 1;
@@ -1159,54 +1194,54 @@ fn directPublish(io: Io, f: *wt.Fixture, ino: u64, block: u32, new: Binding) voi
 // the running save — the save then displaced that fresh key (never parked:
 // `rewrite_shadow_displaced_drift`) and freed the old A a second time
 // (`block_untracked_free_refusals`, "REFUSED begin_free of block 315").
-test "a record for a block the CLOSING epoch shadows never takes the durable merge under the save, cap or no cap: it answers save_in_flight, the caller awaits the save, and the saves land B then C with A and B freed once each — drift 0, refusals 0" {
+test "a record for a block the CLOSING epoch shadows never takes the durable merge under the save: the cap bounds the open shadow united with the closing one, so that block is always taken (parking the closing B) and a block past the union answers save_in_flight; the saves land B then C with A and B freed once each — drift 0, refusals 0" {
     const io = testing.io;
     const f = try wt.Fixture.init(testing.allocator, 200);
     defer f.deinit();
     var ep = Epochs.init(testing.allocator, wt.BS, true);
     defer ep.deinit();
     const cs: Epochs.CloseSeams = .{ .map = f.map.seam(), .free = f.frees.seam(), .purge = .none };
+    const max = seams.MergeOutcome.max_displaced;
     const drift0 = counters.tripwireCount("rewrite_shadow_displaced_drift");
     const refused0 = counters.tripwireCount("block_untracked_free_refusals");
     const a = try f.publishBlock(80, 0, 0xAA);
     const mb = try f.alloc_a.allocateBlock();
     const b = Binding.wholeBlock(wt.VOL_A, mb.offset, mb.stamp);
     _ = try ep.record(80, 0, a, b, proofFor(b, wt.BS), wt.BS, block_alloc.InflightAllocGuard.register(f.alloc_a, mb.idx), true);
-    // In the save's window: the next epoch fills to the cap with other
-    // blocks, then a record for block 0 arrives (the upload's venue).
+    // In the save's window: the next epoch fills the union to the cap with
+    // other blocks, one more block arrives, then a record for block 0 (the
+    // upload's venue).
     const Racer = struct {
         var ep_: *Epochs = undefined;
         var f_: *wt.Fixture = undefined;
-        var io_: Io = undefined;
         var c: Binding = undefined;
+        var p: Binding = undefined;
+        var past: ?RecordVerdict = null;
         var verdict: ?RecordVerdict = null;
         fn hook(_: *anyopaque, map: *wt.RamMap) void {
             var block: u32 = 1;
-            while (block <= seams.MergeOutcome.max_displaced) : (block += 1) {
+            while (block < seams.MergeOutcome.max_displaced) : (block += 1) {
                 const ai = f_.publishBlock(80, block, 0x11) catch unreachable;
                 const m = f_.alloc_a.allocateBlock() catch unreachable;
                 const bi = Binding.wholeBlock(wt.VOL_A, m.offset, m.stamp);
                 std.debug.assert((ep_.record(80, block, ai, bi, proofFor(bi, wt.BS), 0, block_alloc.InflightAllocGuard.register(f_.alloc_a, m.idx), true) catch unreachable) == .shadowed);
             }
+            const ap = f_.publishBlock(80, block, 0x11) catch unreachable;
+            const mp = f_.alloc_a.allocateBlock() catch unreachable;
+            p = Binding.wholeBlock(wt.VOL_A, mp.offset, mp.stamp);
+            past = ep_.record(80, block, ap, p, proofFor(p, wt.BS), 0, block_alloc.InflightAllocGuard.register(f_.alloc_a, mp.idx), true) catch unreachable;
             const mc = f_.alloc_a.allocateBlock() catch unreachable;
             c = Binding.wholeBlock(wt.VOL_A, mc.offset, mc.stamp);
-            const v = ep_.record(80, 0, map.seam().lookup(80, 0), c, proofFor(c, wt.BS), wt.BS, block_alloc.InflightAllocGuard.register(f_.alloc_a, mc.idx), true) catch unreachable;
-            verdict = v;
-            switch (v) {
-                .save_in_flight => {},
-                // What the upload does with the durable-merge verdict.
-                .not_shadowed => directPublish(io_, f_, 80, 0, c),
-                .shadowed => unreachable,
-            }
+            verdict = ep_.record(80, 0, map.seam().lookup(80, 0), c, proofFor(c, wt.BS), wt.BS, block_alloc.InflightAllocGuard.register(f_.alloc_a, mc.idx), true) catch unreachable;
         }
     };
     Racer.ep_ = &ep;
     Racer.f_ = f;
-    Racer.io_ = io;
     var dummy: u8 = 0;
     f.map.before_merge = .{ .ctx = &dummy, .call = &Racer.hook };
     try testing.expect(ep.close(io, 80, cs) == .swapped);
-    try testing.expect(Racer.verdict.? == .save_in_flight);
+    try testing.expect(Racer.past.? == .save_in_flight);
+    try testing.expect(Racer.verdict.? == .shadowed);
     try testing.expectEqual(drift0, counters.tripwireCount("rewrite_shadow_displaced_drift"));
     try testing.expectEqual(refused0, counters.tripwireCount("block_untracked_free_refusals"));
     // The save landed B over A; A freed once; nothing is in flight for the ino.
@@ -1214,20 +1249,20 @@ test "a record for a block the CLOSING epoch shadows never takes the durable mer
     try testing.expectEqual(@as(usize, 1), f.frees.freed.items.len);
     try testing.expect(f.frees.freed.items[0].eql(a));
     ep.awaitSaveSettled(io, 80);
-    // The caller records again: the open epoch is still at its cap and no
-    // save names block 0 — the durable merge is now the right arm, over B.
-    const v2 = try ep.record(80, 0, f.map.seam().lookup(80, 0), Racer.c, proofFor(Racer.c, wt.BS), wt.BS, block_alloc.InflightAllocGuard.register(f.alloc_a, f.alloc_a.idxOf(Racer.c.offset)), true);
+    // The waiter records again: the open epoch is at the cap and no save is
+    // in flight — the durable merge is now the right arm.
+    const v2 = try ep.record(80, max, f.map.seam().lookup(80, max), Racer.p, proofFor(Racer.p, wt.BS), 0, block_alloc.InflightAllocGuard.register(f.alloc_a, f.alloc_a.idxOf(Racer.p.offset)), true);
     try testing.expect(v2 == .not_shadowed);
-    directPublish(io, f, 80, 0, Racer.c);
-    try testing.expect(f.map.seam().lookup(80, 0).?.eql(Racer.c));
-    try testing.expectEqual(@as(usize, 2), f.frees.freed.items.len);
-    try testing.expect(f.frees.freed.items[1].eql(b));
-    // The next epoch's save publishes its 64 blocks, each displacing what it parked.
+    directPublish(io, f, 80, max, Racer.p);
+    // The next epoch's save publishes C over the landed B, freeing B with
+    // the 63 A keys it parked — each displacing exactly what it parked.
     const out = ep.close(io, 80, cs);
-    try testing.expectEqual(@as(u32, seams.MergeOutcome.max_displaced), out.swapped.freed);
+    try testing.expectEqual(@as(u32, max), out.swapped.freed);
+    try testing.expectEqual(@as(usize, 2 + max), f.frees.freed.items.len);
     try testing.expectEqual(drift0, counters.tripwireCount("rewrite_shadow_displaced_drift"));
     try testing.expectEqual(refused0, counters.tripwireCount("block_untracked_free_refusals"));
     try testing.expect(f.map.seam().lookup(80, 0).?.eql(Racer.c));
+    try testing.expect(f.map.seam().lookup(80, max).?.eql(Racer.p));
     try testing.expectEqual(@as(usize, 0), ep.openCount());
 }
 
@@ -1295,6 +1330,36 @@ test "a transient save's fold never carries more than the ONE save's size: a rec
     block = 0;
     while (block < max * 3 / 2) : (block += 1) try testing.expect(f.map.seam().lookup(90, block) != null);
     try testing.expectEqual(@as(usize, 0), ep.openCount());
+}
+
+test "a shadow past the ONE save's size (record caps the fold's union, so it cannot happen) is loud and never lossy: rewrite_shadow_save_overflow fires, the close publishes and frees nothing, and the epoch stays open" {
+    const io = testing.io;
+    const f = try wt.Fixture.init(testing.allocator, 100);
+    defer f.deinit();
+    var ep = Epochs.init(testing.allocator, wt.BS, true);
+    defer ep.deinit();
+    const cs: Epochs.CloseSeams = .{ .map = f.map.seam(), .free = f.frees.seam(), .purge = .none };
+    try f.map.create(92, .striped, 0);
+    const max = seams.MergeOutcome.max_displaced;
+    var block: u32 = 0;
+    while (block < max) : (block += 1) {
+        const m = try f.alloc_a.allocateBlock();
+        const b = Binding.wholeBlock(wt.VOL_A, m.offset, m.stamp);
+        _ = try ep.record(92, block, null, b, proofFor(b, wt.BS), 0, block_alloc.InflightAllocGuard.register(f.alloc_a, m.idx), true);
+    }
+    const m = try f.alloc_a.allocateBlock();
+    const extra = Binding.wholeBlock(wt.VOL_A, m.offset, m.stamp);
+    try ep.table.get(92).?.shadow.put(ep.gpa, max, .{ .binding = extra, .proof = proofFor(extra, wt.BS) });
+    const fired0 = counters.tripwireCount("rewrite_shadow_save_overflow");
+    stats.rewrite_shadow_save_overflow.resetLogBudgetForTest();
+    log.testing.expectErrorLogs(1);
+    try testing.expectEqual(CloseOutcome.transient, ep.close(io, 92, cs));
+    try log.testing.expectAllFired();
+    try testing.expectEqual(fired0 + 1, counters.tripwireCount("rewrite_shadow_save_overflow"));
+    try testing.expectEqual(@as(usize, 0), f.map.merges.items.len);
+    try testing.expectEqual(@as(usize, 0), f.frees.freed.items.len);
+    try testing.expectEqual(@as(usize, 1), ep.openCount());
+    try testing.expectEqual(@as(u32, max + 1), ep.table.get(92).?.shadow.count());
 }
 
 test "record is all or nothing: an allocation failure at any of its reservations registers no epoch (a registered empty one went unreserved for the fold) and leaves the guard the caller's" {

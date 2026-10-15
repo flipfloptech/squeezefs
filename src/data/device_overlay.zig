@@ -1248,8 +1248,8 @@ pub const Overlay = struct {
                     rec.fsck_guard = block_alloc.InflightAllocGuard.register(rec.alloc, rec.dest_idx);
                 },
                 .save_in_flight => {
-                    // A durable merge would land under the ino's running
-                    // save: a TRANSIENT — the record stays FROZEN, the
+                    // The ino's running save must land (or fold) first
+                    // (`RecordVerdict.save_in_flight`): a TRANSIENT — the record stays FROZEN, the
                     // settler's ladder retries with the guard dropped
                     // (the save lands within its own merge).
                     rec.fsck_guard = block_alloc.InflightAllocGuard.register(rec.alloc, rec.dest_idx);

@@ -48,9 +48,12 @@ SUITE_META_MIB=${SUITE_META_MIB:-1024}
 SUITE_DATA_GIB=${SUITE_DATA_GIB:-8}
 # The release posture; see the module comment for each option's WHY.
 SUITE_MOUNT_OPTS=${SUITE_MOUNT_OPTS:-default_permissions,allow_other}
-APT_LOCK="$SUITES_DIR/apt.lock"
+# One lock per distro release (`apt.<ID>-<VERSION_ID>.lock`): each venue's
+# release ships its own package versions (the VM's Ubuntu 24.04, kamrui's
+# 26.04), so a shared lock is a drift on every venue but the one that pinned.
+APT_LOCK="$SUITES_DIR/apt.$(. /etc/os-release && echo "$ID-$VERSION_ID").lock"
 
-# apt packages the three suites need to build and run; `apt.lock` pins the
+# apt packages the three suites need to build and run; the release's lock pins the
 # versions this harness verified (a drift is a loud refusal, never a silent
 # upgrade: the suites' own behaviour is part of the gate's evidence).
 #   build: autoconf automake libtool pkg-config gcc make (pjdfstest, LTP, xfstests)
@@ -96,7 +99,7 @@ suite_packages() {
   current=$(for p in "${SUITE_PACKAGES[@]}"; do dpkg-query -W -f='${Package}=${Version}\n' "$p"; done | sort)
   if [ ! -s "$APT_LOCK" ] || [ "${SUITE_REFRESH_LOCK:-0}" = 1 ]; then
     printf '%s\n' "$current" > "$APT_LOCK"
-    suite_log "apt.lock written (${#SUITE_PACKAGES[@]} packages)"
+    suite_log "$(basename "$APT_LOCK") written (${#SUITE_PACKAGES[@]} packages)"
     return 0
   fi
   if ! diff -u "$APT_LOCK" <(printf '%s\n' "$current") >"${RESULTS:-/tmp}/apt-lock.diff"; then

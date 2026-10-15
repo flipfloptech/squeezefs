@@ -1284,6 +1284,46 @@ test "the read law: an exact point supersedes a covering run; the floor probe ke
     try testing.expectEqual(@as(usize, 3), out.items.len);
 }
 
+test "the window put displaces at most one binding per (unique) insert, so a merge of at most max_displaced inserts fills MergeOutcome exactly and never past it; a window past the bound is loud (kvmap_merge_displaced_overflow), never a silent drop" {
+    const gpa = testing.allocator;
+    var ts = TestStore.init(gpa);
+    defer ts.deinit();
+    const s = ts.store();
+    const max = seams.MergeOutcome.max_displaced;
+    const S0: u64 = 1 << 40 | 1;
+    var first: [max + 1]seams.MapInsert = undefined;
+    var over: [max + 1]seams.MapInsert = undefined;
+    for (&first, &over, 0..) |*a, *b, i| {
+        const blk: u32 = @intCast(i);
+        a.* = .{ .block = blk, .binding = wb(1, 500 + blk, S0 + blk) };
+        b.* = .{ .block = blk, .binding = wb(2, 900 + blk, S0 + 1000 + blk) };
+    }
+    {
+        var t = KvTx.init(gpa, @src());
+        var out: seams.MergeOutcome = .{};
+        try stageWindow(s, gpa, &t, INO, &first, CHUNK, &out);
+        try testing.expectEqual(@as(u8, 0), out.n_displaced);
+        try ts.commit(&t);
+    }
+    const site = "kvmap_merge_displaced_overflow";
+    const fired0 = counters.tripwireCount(site);
+    {
+        var t = KvTx.init(gpa, @src());
+        defer t.deinit();
+        var out: seams.MergeOutcome = .{};
+        try stageWindow(s, gpa, &t, INO, over[0..max], CHUNK, &out);
+        try testing.expectEqual(@as(u8, max), out.n_displaced);
+        try testing.expectEqual(fired0, counters.tripwireCount(site));
+    }
+    log.testing.expectErrorLogs(1);
+    var t = KvTx.init(gpa, @src());
+    defer t.deinit();
+    var out: seams.MergeOutcome = .{};
+    try stageWindow(s, gpa, &t, INO, &over, CHUNK, &out);
+    try log.testing.expectAllFired();
+    try testing.expectEqual(fired0 + 1, counters.tripwireCount(site));
+}
+
 test "the window put: sequential per-block merges grow ONE run at the left edge (no point per block); an overwrite inside a run supersedes with the −ref of the run-derived block; a write at a run's own key keeps the tail covered; an idempotent re-bind moves no reference; tree ops stay O(window)" {
     const gpa = testing.allocator;
     var ts = TestStore.init(gpa);

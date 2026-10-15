@@ -3726,6 +3726,36 @@ test "foldInserts: the inserts fold ascending whatever order the epoch fed them;
     _ = layout.Layout.stripedInline(10 * chunk, merged.items);
 }
 
+test "foldInserts displaces at most one binding per insert, so a merge of at most max_displaced inserts (the ONE save's buffer; every other publisher sends one) fills MergeOutcome exactly and never past it; a fold past the bound is loud (layout_map_merge_displaced_overflow), never a silent drop" {
+    const gpa = testing.allocator;
+    const chunk: u64 = 4 << 20;
+    const max = seams.MergeOutcome.max_displaced;
+    var old: [max + 1]layout.MapEntryWire = undefined;
+    var inserts: [max + 1]seams.MapInsert = undefined;
+    for (&old, &inserts, 0..) |*o, *ins, i| {
+        const b: u32 = @intCast(i);
+        o.* = (layout.MapEntry{ .block = b, .mapping = Mapping.wholeBlock(0x10, b * chunk, 1) }).encode();
+        ins.* = .{ .block = b, .binding = Mapping.wholeBlock(0x10, (max + 1 + b) * chunk, 1) };
+    }
+    const site = "layout_map_merge_displaced_overflow";
+    const fired0 = counters.tripwireCount(site);
+    {
+        var merged: std.ArrayList(layout.MapEntryWire) = .empty;
+        defer merged.deinit(gpa);
+        var out: seams.MergeOutcome = .{};
+        try DataPlane.foldInserts(gpa, old[0..max], inserts[0..max], chunk, &merged, &out);
+        try testing.expectEqual(@as(u8, max), out.n_displaced);
+        try testing.expectEqual(fired0, counters.tripwireCount(site));
+    }
+    log.testing.expectErrorLogs(1);
+    var merged: std.ArrayList(layout.MapEntryWire) = .empty;
+    defer merged.deinit(gpa);
+    var out: seams.MergeOutcome = .{};
+    try DataPlane.foldInserts(gpa, &old, &inserts, chunk, &merged, &out);
+    try log.testing.expectAllFired();
+    try testing.expectEqual(fired0 + 1, counters.tripwireCount(site));
+}
+
 test "stats JSON names every plane instrument" {
     var buf: [4096]u8 = undefined;
     var w: Io.Writer = .fixed(&buf);

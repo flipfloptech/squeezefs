@@ -762,6 +762,34 @@ test "fenced_close_publishes_nothing_and_frees_nothing; a_process_local_lease_ro
     try testing.expect(f.frees.freed.items[frees_orphan].eql(b3));
 }
 
+test "a reclaimed ino frees EVERY key the epoch minted: a block rewritten twice in the epoch leaves its intermediate B freed with the newest, the map's A the destroy's — no mint left tracked and referenced by nothing" {
+    const io = testing.io;
+    const f = try wt.Fixture.init(testing.allocator, 16);
+    defer f.deinit();
+    var ep = Epochs.init(testing.allocator, wt.BS, true);
+    defer ep.deinit();
+    const cs: Epochs.CloseSeams = .{ .map = f.map.seam(), .free = f.frees.seam(), .purge = .none };
+    const a = try f.publishBlock(24, 0, 0x55);
+    const m1 = try f.alloc_a.allocateBlock();
+    const m2 = try f.alloc_a.allocateBlock();
+    const b1 = Binding.wholeBlock(wt.VOL_A, m1.offset, m1.stamp);
+    const b2 = Binding.wholeBlock(wt.VOL_A, m2.offset, m2.stamp);
+    _ = try ep.record(24, 0, a, b1, proofFor(b1, wt.BS), 2 * wt.BS, block_alloc.InflightAllocGuard.register(f.alloc_a, m1.idx), true);
+    const v2 = try ep.record(24, 0, a, b2, proofFor(b2, wt.BS), 2 * wt.BS, block_alloc.InflightAllocGuard.register(f.alloc_a, m2.idx), true);
+    try testing.expect(v2.shadowed.displaced_prev.?.eql(b1)); // B1 parked as the epoch's own
+    f.map.remove(24);
+    try testing.expectEqual(CloseOutcome.orphan_discarded, ep.close(io, 24, cs));
+    // B1 and B2 freed, each once, under their guards; A stays (the destroy frees it).
+    try testing.expectEqual(@as(usize, 2), f.frees.freed.items.len);
+    try testing.expectEqual(@as(u32, 0), f.frees.unheld);
+    for ([_]u64{ m1.idx, m2.idx }) |idx| {
+        try testing.expectEqual(@as(?u32, null), f.alloc_a.refcount(idx));
+        try testing.expect(!f.alloc_a.inflightContains(idx));
+    }
+    try testing.expectEqual(@as(u64, 1), f.alloc_a.usedBlocks());
+    try testing.expect(f.alloc_a.refcount(f.alloc_a.idxOf(a.offset)) != null);
+}
+
 test "the close triggers: ENOSPC pressure close frees parked supply; the idle sweep closes at TTI/10; supersede evicts a shadow binding; the lever off never shadows" {
     const io = testing.io;
     const f = try wt.Fixture.init(testing.allocator, 16);
@@ -815,6 +843,43 @@ test "the close triggers: ENOSPC pressure close frees parked supply; the idle sw
     const b3 = Binding.wholeBlock(wt.VOL_A, m3.offset, m3.stamp);
     try testing.expectEqual(RecordVerdict.not_shadowed, try off.record(33, 0, null, b3, proofFor(b3, wt.BS), wt.BS, block_alloc.InflightAllocGuard.register(f.alloc_a, m3.idx), true));
     try testing.expect(!f.alloc_a.inflightContains(m3.idx));
+}
+
+test "a supersede of a block rewritten more times in the epoch than its orphan batch holds never drops a mint: the batch is freed by the publisher, the rest stay parked and the close frees them — every B freed once, nothing left tracked and referenced by nothing" {
+    const io = testing.io;
+    const f = try wt.Fixture.init(testing.allocator, 32);
+    defer f.deinit();
+    var ep = Epochs.init(testing.allocator, wt.BS, true);
+    defer ep.deinit();
+    const cs: Epochs.CloseSeams = .{ .map = f.map.seam(), .free = f.frees.seam(), .purge = .none };
+    const a = try f.publishBlock(34, 0, 0x66);
+    // Ten records of block 0: the newest B in the shadow, nine intermediate Bs parked as the epoch's.
+    var orphans: [8]Binding = undefined;
+    const rewrites = orphans.len + 2;
+    var minted: [rewrites]u64 = undefined;
+    for (&minted) |*idx| {
+        const m = try f.alloc_a.allocateBlock();
+        const b = Binding.wholeBlock(wt.VOL_A, m.offset, m.stamp);
+        _ = try ep.record(34, 0, f.map.seam().lookup(34, 0), b, proofFor(b, wt.BS), 2 * wt.BS, block_alloc.InflightAllocGuard.register(f.alloc_a, m.idx), true);
+        idx.* = m.idx;
+    }
+    // A durable publish of block 0 outside the epoch (the upload's not-striped arm): A is the publisher's.
+    const mp = try f.alloc_a.allocateBlock();
+    const published = Binding.wholeBlock(wt.VOL_A, mp.offset, mp.stamp);
+    f.alloc_a.publishBlock(mp.idx);
+    directPublish(io, f, 34, 0, published);
+    for (ep.supersede(34, 0, published, &orphans)) |o| _ = f.frees.seam().free(io, o);
+    try testing.expect(!ep.bindsBlock(34, 0));
+    try testing.expect(ep.close(io, 34, cs) == .swapped);
+    // A and all ten Bs freed exactly once; only the published key is tracked.
+    try testing.expectEqual(@as(usize, rewrites + 1), f.frees.freed.items.len);
+    for (minted) |idx| {
+        try testing.expectEqual(@as(?u32, null), f.alloc_a.refcount(idx));
+        try testing.expect(!f.alloc_a.inflightContains(idx));
+    }
+    try testing.expectEqual(@as(?u32, null), f.alloc_a.refcount(f.alloc_a.idxOf(a.offset)));
+    try testing.expectEqual(@as(u64, 1), f.alloc_a.usedBlocks());
+    try testing.expect(f.map.seam().lookup(34, 0).?.eql(published));
 }
 
 test "the save stays visible and closes of one ino serialize in epoch order: during a save the block stays bound and the shadow served; a record meanwhile opens the next epoch over the CLOSING shadow (never the map's stale A); a second close parks on the running one; the saves land B then C, A and B freed once each, drift 0" {

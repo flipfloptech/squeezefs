@@ -70,6 +70,10 @@ pub var meta_kv_replay_root_frees_dropped: counters.ShardedCounter = .{};
 /// adopted at mount (`adoptLive`); 0 unless a kill fell between a root's
 /// naming and its claim's bitmap page.
 pub var meta_kv_replay_root_claims_adopted: counters.ShardedCounter = .{};
+/// The writer mount's reachability walk (`adoptLive`'s input): extents
+/// reached over every opened tree, and its wall.
+pub var meta_kv_mount_reach_walk_extents: counters.Gauge = .{};
+pub var meta_kv_mount_reach_walk_ns: counters.Gauge = .{};
 pub var meta_kv_bitmap_generation_raises: counters.ShardedCounter = .{};
 /// The wedge detector: every parked retirement, wherever parked.
 pub var meta_kv_pending_free: counters.Gauge = .{};
@@ -463,8 +467,8 @@ pub const ExtentAllocator = struct {
     /// Mount only, after the replay fold and before the first claim: an
     /// extent a root the recovered state names reaches is LIVE whatever the
     /// bitmap says — a claim made in RAM (a guest root minted on first
-    /// touch journals no delta) is named by C4b / C11 before C6 lands its
-    /// page. Sets the bit and dirties its page (the next checkpoint writes
+    /// touch, a builder's node: no journaled delta) is named by C4b / C11
+    /// before C6 lands its page. Sets the bit and dirties its page (the next checkpoint writes
     /// it); `true` = the bit was clear (counted).
     pub fn adoptLive(self: *ExtentAllocator, extent: u64) bool {
         if (self.core.isAllocated(extent)) return false;

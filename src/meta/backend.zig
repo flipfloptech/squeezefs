@@ -1928,7 +1928,7 @@ pub const KvBackend = struct {
             try be.guest_published.put(gpa, r.slot, root);
         }
         // Before the first claim (the mints below).
-        if (recovered) |a| try be.adoptNamedClaims(a);
+        if (recovered) |a| try be.adoptReachableClaims(a);
         // Slots the window names without a tree.
         var mentioned = std.AutoHashMapUnmanaged(u16, void).empty;
         defer mentioned.deinit(gpa);
@@ -1949,34 +1949,41 @@ pub const KvBackend = struct {
         }
     }
 
-    /// Every root the recovered state names is live, so every extent it
-    /// reaches is allocated before the mount's first claim. A guest root
-    /// minted on first touch is one extent claimed in RAM (no journaled
-    /// delta) and is NAMED at once — appender 0's page refresh at C4b,
-    /// C11's page plan, a tree-0 record — while its claim reaches the
-    /// device only with a later C6 bitmap page: a kill between the two
-    /// recovers the root free, and the first claim (a re-mint of a slot the
-    /// window names, any SMO) overwrote it (`rung-10-routing-loop.md`). A
-    /// tree whose root is allocated is skipped: below a minted root every
-    /// claim is an SMO's, journaled in the window (a builder-built tree's
-    /// lower claims are owed, same note). The ledger-rooted trees' roots
-    /// are format- or SMO-claimed.
-    fn adoptNamedClaims(be: *KvBackend, alloc: *alloc_ext.ExtentAllocator) OpenError!void {
+    /// Every root the recovered state names is live, and so is every extent
+    /// it reaches: before the mount's first claim (the re-mints below),
+    /// every opened tree is walked and each reachable extent the recovered
+    /// allocator holds free is adopted. A claim made in RAM reaches the
+    /// device only with a later C6 bitmap page while the tree holding it is
+    /// named at once (appender 0's page refresh at C4b, C11's page plan, a
+    /// tree-0 record): a guest root minted on first touch (one extent, no
+    /// journaled delta), and every node of a builder-built tree
+    /// (`copySlotTree`) — C6 writes its pages in page order, the builder
+    /// claims its root last, and a release landing mid-build drops the
+    /// lowest-first cursor, so a kill inside C6 can land the root's page
+    /// without a leaf's (`rung-10-routing-loop.md`). Cost: one read per
+    /// interior node of every tree, leaves never read (their parents name
+    /// them) — the walk's extents and wall are `meta_kv_mount_reach_walk_*`.
+    fn adoptReachableClaims(be: *KvBackend, alloc: *alloc_ext.ExtentAllocator) OpenError!void {
+        const t0 = clock.monotonicNs();
         var extents: std.ArrayList(u64) = .empty;
         defer extents.deinit(be.gpa);
+        var walked: u64 = 0;
         for (be.trees.load()) |t| {
-            const root = t.rootPtr();
-            if (alloc.isAllocated(be.cache.addrExtent(root.addr))) continue;
             extents.clearRetainingCapacity();
             be.collectTreeExtents(t, &extents) catch |e| return switch (e) {
                 error.OutOfMemory => error.OutOfMemory,
                 error.Io => error.Io,
                 else => error.Corrupt,
             };
+            walked += extents.items.len;
             var adopted: usize = 0;
             for (extents.items) |ext| adopted += @intFromBool(alloc.adoptLive(ext));
-            log.warn("meta volume {s}: slot tree {?d}'s root 0x{x}@{d} is named but its extent was free in the recovered allocator — a kill between the root's naming and its claim's bitmap page; {d} of its {d} extent(s) adopted (meta_kv_replay_root_claims_adopted)", .{ be.path, t.forest_slot, root.addr, root.seq, adopted, extents.items.len });
+            if (adopted == 0) continue;
+            const root = t.rootPtr();
+            log.warn("meta volume {s}: slot tree {?d} (root 0x{x}@{d}) reaches {d} extent(s) the recovered allocator held free — a kill between their claims and the bitmap pages naming them; adopted (meta_kv_replay_root_claims_adopted)", .{ be.path, t.forest_slot, root.addr, root.seq, adopted });
         }
+        alloc_ext.meta_kv_mount_reach_walk_extents.set(walked);
+        alloc_ext.meta_kv_mount_reach_walk_ns.set(clock.monotonicNs() - t0);
     }
 
     /// Appender 0's newest valid page (null on a flat volume or a blank

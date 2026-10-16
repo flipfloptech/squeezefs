@@ -1265,7 +1265,7 @@ pub const Session = struct {
             return error.InjectedStartupFailure;
         }
 
-        // 6. The zc bounce slab (ONE memfd for every queue; a non-sheddable
+        // 6. The zc bounce slab (one memfd per queue; a non-sheddable
         //    budget component), then the workers: one per drain group, the
         //    arena as ONE budget component, the arm barrier counting
         //    submissions.

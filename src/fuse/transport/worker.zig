@@ -468,48 +468,72 @@ pub fn prepBridgeStore(sqe: *uring128.Sqe128, fd: linux.fd_t, off: u64, len: u32
 
 pub const BarrierOutcome = enum(u8) { armed, failed };
 
-/// The session's bounce SLAB (zero-copy): ONE MAP_SHARED memfd for every
-/// queue's ent windows (`(qid × depth + ent) × stride`), two faces of one
-/// memory — a VA for CPU serves and leases, an fd for the ring's
-/// `READ_FIXED`/`WRITE_FIXED`. LAZILY populated: a window costs pages only
-/// once a body is staged through it (rung 9 measured the populated slab
-/// at 288 MiB resident on an idle mount), and an idle window's pages
+/// The session's bounce SLAB (zero-copy): ONE VA span of every queue's ent
+/// windows (`(qid × depth + ent) × stride`), each queue's `depth` windows a
+/// MAP_SHARED memfd of its own mapped in place — two faces of one memory: a
+/// VA for CPU serves and leases, the queue's fd (window at `ent × stride`)
+/// for the ring's `READ_FIXED`/`WRITE_FIXED`. One memfd PER QUEUE: an
+/// extraction is a shmem write under the file's i_rwsem, and one file for
+/// every queue had every ring's io-wq waiting on it (68 % of io-wq time on
+/// 1M seq write ×4, rung-10-perf-baseline); a ring's writes to one file are
+/// already one hashed io-wq chain. LAZILY populated: a window costs pages
+/// only once a body is staged through it (rung 9 measured the populated
+/// slab at 288 MiB resident on an idle mount), and an idle window's pages
 /// return under the idle-trim law (`punch`: a hole in the memfd, the
 /// window reads zeros until the next stage). A non-sheddable budget
 /// component over the resident bytes (`zc_bounce_resident_bytes`).
 pub const Slab = struct {
-    fd: linux.fd_t,
+    gpa: std.mem.Allocator,
+    fds: []linux.fd_t,
     base: []align(4096) u8,
     stride: usize,
     depth: u32,
 
     pub fn init(gpa: std.mem.Allocator, nqueues: u32, depth: u32, payload_sz: u32) error{SlabFailed}!Slab {
-        _ = gpa;
         const stride: usize = @intCast(derive.alignUp(payload_sz, ARENA_ALIGN));
-        const span: usize = stride * @as(usize, nqueues) * depth;
-        const rc = linux.memfd_create("sqz-fuse-zc-bounce", linux.MFD.CLOEXEC);
-        if (linux.errno(rc) != .SUCCESS) {
-            log.err("transport: memfd_create for the zc bounce slab failed ({t})", .{linux.errno(rc)});
+        const qspan: usize = stride * depth;
+        const span: usize = qspan * nqueues;
+        const fds = gpa.alloc(linux.fd_t, nqueues) catch {
+            log.err("transport: no memory for the zc bounce slab's {d} queue fds", .{nqueues});
+            return error.SlabFailed;
+        };
+        errdefer gpa.free(fds);
+        const res = linux.mmap(null, span, .{}, .{ .TYPE = .PRIVATE, .ANONYMOUS = true, .NORESERVE = true }, -1, 0);
+        if (linux.errno(res) != .SUCCESS) {
+            log.err("transport: reserving the {d}-byte zc bounce slab failed ({t})", .{ span, linux.errno(res) });
             return error.SlabFailed;
         }
-        const fd: linux.fd_t = @intCast(rc);
-        errdefer _ = linux.close(fd);
-        if (linux.errno(linux.ftruncate(fd, @intCast(span))) != .SUCCESS) {
-            log.err("transport: ftruncate({d}) of the zc bounce slab failed", .{span});
-            return error.SlabFailed;
+        const ptr: [*]align(4096) u8 = @ptrFromInt(res); // mmap answers page-aligned, and pages are ≥ 4 KiB
+        errdefer _ = linux.munmap(ptr, span);
+        var made: usize = 0;
+        errdefer for (fds[0..made]) |fd| {
+            _ = linux.close(fd);
+        };
+        for (fds, 0..) |*fd, q| {
+            const rc = linux.memfd_create("sqz-fuse-zc-bounce", linux.MFD.CLOEXEC);
+            if (linux.errno(rc) != .SUCCESS) {
+                log.err("transport: memfd_create for the zc bounce slab failed ({t})", .{linux.errno(rc)});
+                return error.SlabFailed;
+            }
+            fd.* = @intCast(rc);
+            made += 1;
+            if (linux.errno(linux.ftruncate(fd.*, @intCast(qspan))) != .SUCCESS) {
+                log.err("transport: ftruncate({d}) of the zc bounce slab failed", .{qspan});
+                return error.SlabFailed;
+            }
+            const map = linux.mmap(ptr + q * qspan, qspan, .{ .READ = true, .WRITE = true }, .{ .TYPE = .SHARED, .FIXED = true }, fd.*, 0);
+            if (linux.errno(map) != .SUCCESS) {
+                log.err("transport: mmap of the {d}-byte zc bounce window set failed ({t})", .{ qspan, linux.errno(map) });
+                return error.SlabFailed;
+            }
         }
-        const map = linux.mmap(null, span, .{ .READ = true, .WRITE = true }, .{ .TYPE = .SHARED }, fd, 0);
-        if (linux.errno(map) != .SUCCESS) {
-            log.err("transport: mmap of the {d}-byte zc bounce slab failed ({t})", .{ span, linux.errno(map) });
-            return error.SlabFailed;
-        }
-        const ptr: [*]align(4096) u8 = @ptrFromInt(map);
-        return .{ .fd = fd, .base = ptr[0..span], .stride = stride, .depth = depth };
+        return .{ .gpa = gpa, .fds = fds, .base = ptr[0..span], .stride = stride, .depth = depth };
     }
 
     pub fn deinit(self: *Slab) void {
         _ = linux.munmap(self.base.ptr, self.base.len);
-        _ = linux.close(self.fd);
+        for (self.fds) |fd| _ = linux.close(fd);
+        self.gpa.free(self.fds);
         self.* = undefined;
     }
 
@@ -519,8 +543,7 @@ pub const Slab = struct {
 
     /// The fd face of a queue's windows.
     pub fn fdOf(self: *const Slab, qid: u16) linux.fd_t {
-        _ = qid;
-        return self.fd;
+        return self.fds[qid];
     }
 
     /// An ent's window offset in its queue's fd face.
@@ -540,7 +563,7 @@ pub const Slab = struct {
     /// offsets stay, the shmem pages go). True when the kernel took it.
     pub fn punch(self: *Slab, qid: u16, ent_idx: u16) bool {
         const mode = linux.FALLOC.FL_PUNCH_HOLE | linux.FALLOC.FL_KEEP_SIZE;
-        return linux.errno(linux.fallocate(self.fd, mode, @intCast(self.offsetOf(qid, ent_idx)), @intCast(self.stride))) == .SUCCESS;
+        return linux.errno(linux.fallocate(self.fdOf(qid), mode, @intCast(self.fdOffsetOf(ent_idx)), @intCast(self.stride))) == .SUCCESS;
     }
 };
 
@@ -1088,8 +1111,13 @@ pub const Group = struct {
         return s.window(self.memberOf(gent).qid, self.entIdxOf(gent), self.payload_len);
     }
 
+    /// The gent's bounce window in its queue's fd face (zc only).
+    fn bounceFd(self: *Group, gent: u32) linux.fd_t {
+        return self.shared.slab.?.fdOf(self.memberOf(gent).qid);
+    }
+
     fn bounceOffset(self: *Group, gent: u32) u64 {
-        return self.shared.slab.?.offsetOf(self.memberOf(gent).qid, self.entIdxOf(gent));
+        return self.shared.slab.?.fdOffsetOf(self.entIdxOf(gent));
     }
 
     /// The window's resident high-water rises to `len` (page-rounded,
@@ -1621,7 +1649,7 @@ pub const Group = struct {
         if (fetch) prepBridgeFetch(sqe, src_fd, src_off, pend.len, e, gent) else prepBridgeStore(sqe, src_fd, src_off, pend.len, e, gent);
         // Every bounce bridge names the window bytes in play (a staged body
         // read out of it, an extraction written into it).
-        if (self.shared.slab) |sl| if (fd == sl.fd) self.noteBouncePopulated(gent, pend.len);
+        if (self.shared.slab != null and fd == self.bounceFd(gent)) self.noteBouncePopulated(gent, pend.len);
         self.pends[gent] = pend;
         if (self.deadlines.stamp(gent, clock.monotonicNs())) zc_bridge_pends.add(1);
         zc_bridges.inc();
@@ -1654,7 +1682,7 @@ pub const Group = struct {
         }
         const dma: u32 = @intCast(@min(win.len, @max(body.len, zero_pad)));
         if (dma > body.len) @memset(win[body.len..dma], 0);
-        return self.pushBridge(gent, .{ .kind = .reply_bounce, .len = dma, .reply_len = @intCast(body.len), .readdir_probe = readdir_probe }, self.shared.slab.?.fd, self.bounceOffset(gent), true);
+        return self.pushBridge(gent, .{ .kind = .reply_bounce, .len = dma, .reply_len = @intCast(body.len), .readdir_probe = readdir_probe }, self.bounceFd(gent), self.bounceOffset(gent), true);
     }
 
     /// The bridge deadline scan (every `BRIDGE_SCAN_PERIOD` while a pend is
@@ -1891,7 +1919,7 @@ pub const Group = struct {
                 cell.event.set(self.shared.io);
                 continue;
             }
-            if (!self.pushBridge(gent, .{ .kind = .lazy_extract, .len = self.held_len[gent] }, self.shared.slab.?.fd, self.bounceOffset(gent), false)) {
+            if (!self.pushBridge(gent, .{ .kind = .lazy_extract, .len = self.held_len[gent] }, self.bounceFd(gent), self.bounceOffset(gent), false)) {
                 cell.res = -@as(i32, @intCast(@backingInt(linux.E.BUSY)));
                 cell.event.set(self.shared.io);
             }
@@ -2573,7 +2601,7 @@ pub const Group = struct {
             self.deliverParsed(gent, &.{}, announced, lease);
             return;
         }
-        if (!self.pushBridge(gent, .{ .kind = .write_extract, .len = @intCast(announced) }, self.shared.slab.?.fd, self.bounceOffset(gent), false)) {
+        if (!self.pushBridge(gent, .{ .kind = .write_extract, .len = @intCast(announced) }, self.bounceFd(gent), self.bounceOffset(gent), false)) {
             return self.failEnt(gent, .IO);
         }
     }

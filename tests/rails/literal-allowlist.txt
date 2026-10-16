@@ -251,7 +251,6 @@ src/fuse/transport/worker.zig:374 | 32 | 93d1fe8a1cd2d81a | OWED: derive it or d
 src/fuse/transport/worker.zig:374 | 8 | 93d1fe8a1cd2d81a | OWED: derive it or document it on the line (charter §1.5)
 src/fuse/transport/worker.zig:374 | 8 | 93d1fe8a1cd2d81a | OWED: derive it or document it on the line (charter §1.5)
 src/fuse/transport/worker.zig:374 | 9 | 93d1fe8a1cd2d81a | OWED: derive it or document it on the line (charter §1.5)
-src/fuse/transport/worker.zig:499 | 4096 | 5b3414bef79c0cf2 | OWED: derive it or document it on the line (charter §1.5)
 src/fuse/transport/worker.zig:1184 | 3 | 5f35a8825558b8ff | OWED: derive it or document it on the line (charter §1.5)
 src/fuse/transport/worker.zig:1216 | 3 | dab3c9322b5cf352 | OWED: derive it or document it on the line (charter §1.5)
 src/gates/fuzz_campaign.zig:128 | 72 | 6d1a9775639172ba | OWED: derive it or document it on the line (charter §1.5)

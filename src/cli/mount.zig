@@ -485,6 +485,7 @@ fn mountMain(ctx: *Ctx) u8 {
         .uid = ctx.opts.uid,
         .gid = ctx.opts.gid,
         .times_park = flush_interval_ms != 0,
+        .write_postlude_hold = knobs.boolKnob("SQUEEZEFS_TEST_WRITE_POSTLUDE_HOLD", env),
     }) catch return ctx.failed("out of memory mounting the filesystem", .{});
     defer fs.unmount();
     // The `.stats`/`.config`/`.trace` renderer: every family's source the

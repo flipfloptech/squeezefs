@@ -332,6 +332,9 @@ pub const Options = struct {
     /// barrier before every ack) commits them per write as before — that
     /// mount declared latency over bytes and its ack means durable.
     times_park: bool = true,
+    /// `SQUEEZEFS_TEST_WRITE_POSTLUDE_HOLD`: a striped write parks inside
+    /// its postlude's `I{ino}` section until `write_hold_release` fires.
+    write_postlude_hold: bool = false,
 };
 
 /// A held 4a set travelling with a transaction; it drops at the terminal
@@ -460,6 +463,10 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         pending: economy.PendingTimes,
         /// `Options.times_park`.
         times_park: bool,
+        /// `Options.write_postlude_hold` (`holdPostlude`).
+        write_hold: bool = false,
+        write_hold_release: sync.Notify = .init,
+        write_held: std.atomic.Value(u32) = .init(0),
         /// The data plane is live: false from the dismount's drain on (the
         /// slot plane's leave hands slots over after the plane is gone, so
         /// its times drain must never reach the plane — §AL.5's claims
@@ -543,6 +550,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 .blksize = opts.page_size,
                 .pending = try economy.PendingTimes.init(gpa),
                 .times_park = opts.times_park,
+                .write_hold = opts.write_postlude_hold,
                 .locks = undefined,
                 .uid = opts.uid,
                 .gid = opts.gid,
@@ -2981,6 +2989,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             const t = try self.beginExclusive(local, @src());
             var t_owned = true;
             errdefer if (t_owned) self.store.abandon(t);
+            if (self.write_hold) self.holdPostlude();
             var v = try self.readInode(local);
             const accepted = self.claimedSize(local, v);
             const size = @max(accepted, outcome.size_claim);
@@ -3009,6 +3018,17 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             self.data.noteShape(local, size, .striped);
             fuse_write_striped.inc();
             return .{ .size = @intCast(outcome.written) };
+        }
+
+        /// The postlude-hold seam's park: registered on the release BEFORE
+        /// `write_held` is published (the test's cue), so a release never
+        /// lands in a window the park misses.
+        fn holdPostlude(self: *Self) void {
+            var n = self.write_hold_release.notified();
+            _ = n.enable(self.io);
+            _ = self.write_held.fetchAdd(1, .release);
+            n.waitUncancelable(self.io);
+            _ = self.write_held.fetchSub(1, .release);
         }
 
         /// The data plane's write verdicts as the filesystem's.
@@ -5329,6 +5349,133 @@ test "§L.6 the write-stamp park (repro-port: frag-512b-write — 533 k size-neu
     try testing.expectEqual(@as(u64, 0), h.fs.pending.len());
     for (crowd) |f| h.release(f);
     for (files) |f| h.release(f);
+}
+
+/// One op on its own thread against a harness's filesystem (the rangelock
+/// pins): a striped write (Shared-classed: level 1 admits disjoint
+/// in-EOF writes side by side), a truncate, or the times drain.
+const PostludeOp = struct {
+    fs: *HarnessOf(SettlingData).Fs,
+    ino: u64,
+    kind: enum { write, truncate, drain },
+    offset: u64 = 0,
+    size: u64 = 0,
+    done: std.atomic.Value(bool) = .init(false),
+    err: ?anyerror = null,
+
+    fn run(op: *PostludeOp) void {
+        var trace = op_trace.OpTrace.begin(0, .other);
+        defer trace.finish();
+        var ctx: filesystem.Ctx = .{ .unique = 0, .uid = 0, .gid = 0, .pid = 0, .io = testing.io, .trace = &trace, .wd_slot = null, .window = &.{} };
+        const sector: [512]u8 = @splat('w');
+        switch (op.kind) {
+            .write => _ = op.fs.write(&ctx, .{ .ino = op.ino, .fh = 1, .offset = op.offset, .data = &sector, .class = .shared, .write_flags = 0, .flags = 0 }) catch |e| {
+                op.err = e;
+            },
+            .truncate => _ = op.fs.setattr(&ctx, .{ .ino = op.ino, .attr = .{ .size = op.size } }) catch |e| {
+                op.err = e;
+            },
+            .drain => _ = op.fs.drainPendingTimes(&ctx) catch |e| {
+                op.err = e;
+            },
+        }
+        op.done.store(true, .release);
+    }
+
+    fn spawn(op: *PostludeOp) !std.Thread {
+        return std.Thread.spawn(.{}, run, .{op});
+    }
+};
+
+/// Until `op` finished or a waiter parked on `ino`'s `I` stripe — the two
+/// observables a rangelock pin tells apart.
+fn awaitDoneOrParked(fs: *HarnessOf(SettlingData).Fs, ino: u64, op: *const PostludeOp) !bool {
+    const lock = &fs.locks.inode.locks[fs.locks.inodeStripe(try HarnessOf(SettlingData).Fs.localOf(ino))];
+    while (!op.done.load(.acquire) and lock.waiters(testing.io) == 0) std.Thread.yield() catch {};
+    return op.done.load(.acquire);
+}
+
+/// Start a striped write to `[offset, offset + 512)` of `ino` and return
+/// once it is parked inside its postlude (`SQUEEZEFS_TEST_WRITE_POSTLUDE_HOLD`).
+fn holdWriteInPostlude(fs: *HarnessOf(SettlingData).Fs, op: *PostludeOp) !std.Thread {
+    const held0 = fs.write_held.load(.acquire);
+    fs.write_hold = true;
+    const t = try op.spawn();
+    while (fs.write_held.load(.acquire) == held0) std.Thread.yield() catch {};
+    // Only the one write holds: the ops spawned after this see it off.
+    fs.write_hold = false;
+    return t;
+}
+
+test "rangelock: a size-neutral striped write to a DISJOINT range of a file proceeds while another write to that file is held inside its postlude's `I{ino}` section (red: the postlude's exclusive guard serialized every write of one file — 51 % of the writes of 1M seq write ×4 waited on it, mean 10.3 ms, rung-10-slabcopy)" {
+    const H = HarnessOf(SettlingData);
+    var h: H = undefined;
+    try h.init();
+    defer h.deinit();
+    defer h.data.deinit();
+    h.data.store = &h.store;
+    const image: []u8 = try testing.allocator.alloc(u8, 8192);
+    defer testing.allocator.free(image);
+    @memset(image, 'I');
+    const f = try h.create(1, "f", 0o644);
+    try testing.expectEqual(@as(?linux.E, null), h.write(f, 0, image, 0).errno());
+    var a: PostludeOp = .{ .fs = &h.fs, .ino = f, .kind = .write, .offset = 0 };
+    const ta = try holdWriteInPostlude(&h.fs, &a);
+    var b: PostludeOp = .{ .fs = &h.fs, .ino = f, .kind = .write, .offset = 4096 };
+    const tb = try b.spawn();
+    const proceeded = try awaitDoneOrParked(&h.fs, f, &b);
+    h.fs.write_hold_release.notifyWaiters(testing.io);
+    ta.join();
+    tb.join();
+    try testing.expect(proceeded);
+    try testing.expectEqual(@as(?anyerror, null), a.err);
+    try testing.expectEqual(@as(?anyerror, null), b.err);
+    // Both stamps parked, nothing committed per write (§L.6).
+    try testing.expect(h.fs.pending.parked(try H.Fs.localOf(f)) != null);
+    h.release(f);
+}
+
+test "rangelock: what stays ordered behind a write held inside its postlude — a truncate of the same file and the times drain wait for it (both take the `I{ino}` guard exclusive); an extending write beside it parks its size claim and the held write's park never lowers it (the claim merge is a max)" {
+    const H = HarnessOf(SettlingData);
+    var h: H = undefined;
+    try h.init();
+    defer h.deinit();
+    defer h.data.deinit();
+    h.data.store = &h.store;
+    const image: []u8 = try testing.allocator.alloc(u8, 8192);
+    defer testing.allocator.free(image);
+    @memset(image, 'I');
+    const f = try h.create(1, "f", 0o644);
+    try testing.expectEqual(@as(?linux.E, null), h.write(f, 0, image, 0).errno());
+    // The claim: level 1 orders an extending write after a Shared one in
+    // the product; the postlude's merge must not depend on it.
+    {
+        var a: PostludeOp = .{ .fs = &h.fs, .ino = f, .kind = .write, .offset = 0 };
+        const ta = try holdWriteInPostlude(&h.fs, &a);
+        var ext: PostludeOp = .{ .fs = &h.fs, .ino = f, .kind = .write, .offset = 8192 };
+        const te = try ext.spawn();
+        _ = try awaitDoneOrParked(&h.fs, f, &ext);
+        h.fs.write_hold_release.notifyWaiters(testing.io);
+        ta.join();
+        te.join();
+        try testing.expectEqual(@as(?anyerror, null), ext.err);
+        try testing.expectEqual(@as(u64, 8192 + 512), (try h.getattr(f)).size);
+    }
+    // The drain and a truncate: parked behind the held write, done after it.
+    inline for (.{ .drain, .truncate }) |kind| {
+        var a: PostludeOp = .{ .fs = &h.fs, .ino = f, .kind = .write, .offset = 0 };
+        const ta = try holdWriteInPostlude(&h.fs, &a);
+        var op: PostludeOp = .{ .fs = &h.fs, .ino = f, .kind = kind, .size = 1024 };
+        const t = try op.spawn();
+        const early = try awaitDoneOrParked(&h.fs, f, &op);
+        h.fs.write_hold_release.notifyWaiters(testing.io);
+        ta.join();
+        t.join();
+        try testing.expect(!early);
+        try testing.expectEqual(@as(?anyerror, null), op.err);
+    }
+    try testing.expectEqual(@as(u64, 1024), (try h.getattr(f)).size);
+    h.release(f);
 }
 
 test "a striped write reads its layout's kind off the borrowed record: the store copies the same bytes for a write into a file whose map names 768 blocks (a 3 GiB file) as into one naming 1 (red: every write copied and decoded the whole record — the lanes' 275 µs per 4 KiB write on 3 GiB files, rung-10-perf-baseline)" {

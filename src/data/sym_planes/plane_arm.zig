@@ -860,17 +860,24 @@ pub const WriterPlane = struct {
 
     /// `Freed` at the holder: this mount's own word retires (the ladder it
     /// never ran locally; on a grant-armed allocator a free-listed block
-    /// is never re-minted — the holder's bit is the free list).
+    /// is never re-minted — the holder's bit is the free list). A block
+    /// this mount never counted has no word here: the reclaimer ships an
+    /// untracked block too (the holder minted it and a served publish bound
+    /// it into this mount's tree), and the holder's verdict already judged
+    /// the double-release lineage.
     fn trackRetire(ctx: *anyopaque, _: u64, idx: u64) void {
         const v: *Vol = @ptrCast(@alignCast(ctx));
         _ = v.freed_since_word.fetchAdd(1, .acq_rel);
+        if (v.alloc.refcount(idx) == null) return;
         const verdict = v.alloc.beginFree(idx) catch return;
         if (verdict == .terminal) v.alloc.finishFree(idx);
     }
 
-    /// `NonTerminal` at the holder: this reference only.
+    /// `NonTerminal` at the holder: this reference only (none for a block
+    /// this mount never counted, as `trackRetire`).
     fn trackRelease(ctx: *anyopaque, _: u64, idx: u64) void {
         const v: *Vol = @ptrCast(@alignCast(ctx));
+        if (v.alloc.refcount(idx) == null) return;
         _ = v.alloc.beginFree(idx) catch return;
     }
 

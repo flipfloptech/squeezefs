@@ -1667,10 +1667,25 @@ const DeadRead = struct {
     reader: ?*Fiber = null,
     read_done: Probe = .{},
     written: Probe = .{},
+    blocking: Probe = .{},
+    release: futex.Word = .init(0),
+    abort: std.atomic.Value(bool) = .init(false),
+    kill_polls: std.atomic.Value(u64) = .init(0),
+
+    /// The hang guard, not a speed bound: every wait here takes milliseconds.
+    const guard_ns = 60 * std.time.ns_per_s;
 
     fn of(context: *const anyopaque) *DeadRead {
         const p: *const *DeadRead = @ptrCast(@alignCast(context));
         return p.*;
+    }
+    /// Holds the lane thread until the test spawned the other three, so they
+    /// land in one inbox drain and the reader arms its READ in the same pass
+    /// the killer first runs in.
+    fn block(context: *const anyopaque) void {
+        const s = of(context);
+        s.blocking.finish();
+        while (s.release.load(.acquire) == 0) futex.wait(&s.release, 0);
     }
     fn read(context: *const anyopaque) void {
         const s = of(context);
@@ -1690,7 +1705,11 @@ const DeadRead = struct {
     fn kill(context: *const anyopaque) void {
         const s = of(context);
         const f = currentFiber().?;
-        while (!(s.reader.?.op_pending and s.lane.ring.ring.sq_ready() == 0)) f.yieldNow();
+        while (!(s.reader.?.op_pending and s.lane.ring.ring.sq_ready() == 0)) {
+            if (s.abort.load(.acquire)) return;
+            _ = s.kill_polls.fetchAdd(1, .monotonic);
+            f.yieldNow();
+        }
         log.testing.expectErrorLogs(1);
         s.lane.markRingDeadForTest();
     }
@@ -1707,6 +1726,26 @@ const DeadRead = struct {
         assert(linux.errno(linux.ioctl(s.rd, linux.T.FIONREAD, @intFromPtr(&n))) == .SUCCESS);
         return @intCast(n);
     }
+    fn waitDone(p: *Probe, t0: u64) bool {
+        while (p.done.load(.acquire) == 0) {
+            if (clock.monotonicNs() - t0 > guard_ns) return false;
+            _ = futex.waitTimeout(&p.done, 0, 100 * std.time.ns_per_ms);
+        }
+        return true;
+    }
+    /// A guard expired: stop the killer's loop and name the state the wait
+    /// stood on.
+    fn expired(s: *DeadRead, what: []const u8) error{DeadReadHang} {
+        s.abort.store(true, .release);
+        log.warn("dead-read rig: {s} not reached in {d} s — reader op_pending={}, sq_ready={d}, killer polls={d}, lane alive={}, in_flight={d}, held={d}, pipe bytes={d}", .{
+            what,                          guard_ns / std.time.ns_per_s,
+            s.reader.?.op_pending,         s.lane.ring.ring.sq_ready(),
+            s.kill_polls.load(.monotonic), s.lane.alive.load(.acquire),
+            s.lane.in_flight,              stats.ring_dead_held_ops.load(),
+            s.pipeBytes(),
+        });
+        return error.DeadReadHang;
+    }
 };
 
 test "a dead ring keeps a READ the kernel took: its fiber stays parked until the CQE, so the kernel's late write lands before the fiber has its buffer back (0003 §AR.4)" {
@@ -1719,17 +1758,28 @@ test "a dead ring keeps a READ the kernel took: its fiber stays parked until the
     };
     var s: DeadRead = .{ .lane = l, .rd = fds[0], .wr = fds[1] };
     const sp: *DeadRead = &s;
-    var g = membersGroup(3);
+    var g = membersGroup(4);
+    _ = try l.spawn(.group, .{ .group = DeadRead.block }, std.mem.asBytes(&sp), &g, .unblocked);
+    s.blocking.waitDone();
     s.reader = try l.spawn(.group, .{ .group = DeadRead.read }, std.mem.asBytes(&sp), &g, .unblocked);
     const w = try l.spawn(.group, .{ .group = DeadRead.write }, std.mem.asBytes(&sp), &g, .unblocked);
     _ = try l.spawn(.group, .{ .group = DeadRead.kill }, std.mem.asBytes(&sp), &g, .unblocked);
+    s.release.store(1, .release);
+    futex.wakeAll(&s.release);
+    const t0 = clock.monotonicNs();
     // The verdict: the lane routes around itself.
-    while (l.alive.load(.acquire)) try std.Thread.yield();
-    while (w.state.load() != .idle) try std.Thread.yield();
+    while (l.alive.load(.acquire)) {
+        if (clock.monotonicNs() - t0 > DeadRead.guard_ns) return s.expired("the verdict");
+        try std.Thread.yield();
+    }
+    while (w.state.load() != .idle) {
+        if (clock.monotonicNs() - t0 > DeadRead.guard_ns) return s.expired("the parked writer");
+        try std.Thread.yield();
+    }
     try testing.expect(w.state.wake());
     l.enqueue(w);
-    s.written.waitDone();
-    s.read_done.waitDone();
+    if (!DeadRead.waitDone(&s.written, t0)) return s.expired("LATEDATA's write");
+    if (!DeadRead.waitDone(&s.read_done, t0)) return s.expired("the held READ's CQE");
     // The fiber had its buffer back only after the kernel was done with it:
     // the READ took the bytes, and the fiber's reuse is the LAST write to
     // the buffer. Before the fix the fiber resumed first, so the READ was
@@ -1738,7 +1788,10 @@ test "a dead ring keeps a READ the kernel took: its fiber stays parked until the
     try testing.expectEqual(@as(usize, 0), s.pipeBytes());
     try testing.expectEqualStrings("REUSED!!", &s.buf);
     try testing.expectEqual(-@as(i32, @intCast(@backingInt(linux.E.IO))), s.res);
-    waitQuiescent(l);
+    while (l.live.load(.monotonic) != 0) {
+        if (clock.monotonicNs() - t0 > DeadRead.guard_ns) return s.expired("quiescence");
+        try std.Thread.yield();
+    }
 }
 
 test "ring entries derivation: power of two above the fiber population + wake + cancels, floor 8, ceiling 4096" {

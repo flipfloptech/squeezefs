@@ -129,9 +129,13 @@ const PROC_LOCKS_CAP: usize = 1 << 20;
 /// Unreadable procfs reads as "no lock" (the claim face judges then).
 /// `waits` counts each retry a locker caused.
 pub fn writerFlockHeld(io: Io, path: []const u8, waits: ?*counters.ShardedCounter) bool {
-    _ = io;
-    _ = waits;
-    return exclusiveLocker(path) != null;
+    const deadline = clock.monotonicNs() + SHARED_LOCK_WAIT_NS;
+    while (true) {
+        const h = exclusiveLocker(path) orelse return false;
+        if (h.squeezefs or clock.monotonicNs() >= deadline) return true;
+        if (waits) |w| w.inc();
+        io.sleep(.fromMilliseconds(SHARED_LOCK_RETRY_MS), .awake) catch return true;
+    }
 }
 
 /// The exclusive `flock` locker of `path`'s inode right now (one scan, no
@@ -172,8 +176,8 @@ pub fn flockExclusive(io: Io, fd: linux.fd_t, waits: ?*counters.ShardedCounter, 
         if (e != .AGAIN) return e;
         if (linux.errno(linux.statx(fd, "", linux.AT.EMPTY_PATH, .{ .INO = true }, &st)) != .SUCCESS) return .AGAIN;
         // Unreadable `/proc/locks`: the refusal stands.
-        _ = locker;
         if (lockerOf(&st) catch return .AGAIN) |h| {
+            locker.* = h;
             if (h.squeezefs) return .AGAIN;
         }
         if (clock.monotonicNs() >= deadline) return .AGAIN;

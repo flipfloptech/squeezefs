@@ -921,7 +921,7 @@ pub const Overlay = struct {
     /// The CQE: the governor's permit release FIRST (never waits on a block
     /// guard), then `complete_store`, the gauge, the counters, the wake.
     fn finishStore(self: *Overlay, io: Io, rec: *Record, ticket: Ticket, permit: ?pipeline.Permit, len: u64, overwrite: bool, success: bool) StoreOutcome {
-        if (permit) |p| if (self.deps.governor) |g| g.complete(io, p, rec.ordinal, clock.monotonicNs() -| p.admitted_ns);
+        if (permit) |p| if (self.deps.governor) |g| g.complete(io, p, rec.ordinal, clock.monotonicNs());
         const verdict = rec.core.completeStore(ticket, success);
         stats.overlay_inflight_bytes.sub(len);
         rec.inflight_change.notifyWaiters(io);

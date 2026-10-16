@@ -309,7 +309,7 @@ pub const Registry = struct {
 fn logWedgeCensus(report: Registry.TickReport) void {
     // The stalest FUSE worker pass: the holder of every fiber on its lane
     // (`transport/pass_stamps.zig`); 0 ms on group 0 when no worker runs.
-    const stalest = pass_stamps.stalest(clock.monotonicNs()) orelse pass_stamps.Stalest{ .group = 0, .age_ns = 0 };
+    const stalest = pass_stamps.stalest(clock.monotonicCoarseNs()) orelse pass_stamps.Stalest{ .group = 0, .age_ns = 0 };
     log.err("wedge census: fuse_ops_inflight={d} overdue_now={d} fuse_op_watchdog_overdue={d} fuse_requests_malformed={d} lock_ticked_reregisters={d} channel_ticked_reregisters={d} invariant_tripwires={d} registry_exhausted={d} stalest_worker_pass_ms={d} stalest_worker_group={d}", .{
         report.in_flight,
         report.overdue,

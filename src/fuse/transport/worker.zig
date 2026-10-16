@@ -1345,7 +1345,7 @@ pub const Group = struct {
         const l = self.lane.?;
         var last_log = clock.monotonicNs();
         while (true) {
-            pass_stamps.stamp(self.index, clock.monotonicNs());
+            pass_stamps.stamp(self.index, clock.monotonicCoarseNs());
             self.pumpLane();
             while (self.cells.pop()) |gent| self.handleCommitCell(gent);
             self.pumpExtracts();
@@ -1651,7 +1651,7 @@ pub const Group = struct {
         // read out of it, an extraction written into it).
         if (self.shared.slab != null and fd == self.bounceFd(gent)) self.noteBouncePopulated(gent, pend.len);
         self.pends[gent] = pend;
-        if (self.deadlines.stamp(gent, clock.monotonicNs())) zc_bridge_pends.add(1);
+        if (self.deadlines.stamp(gent, clock.monotonicCoarseNs())) zc_bridge_pends.add(1);
         zc_bridges.inc();
         return true;
     }
@@ -1688,7 +1688,9 @@ pub const Group = struct {
     /// The bridge deadline scan (every `BRIDGE_SCAN_PERIOD` while a pend is
     /// live): each overdue ent gets ONE AsyncCancel and the tripwire; a live
     /// pend with no stamp is an orphan, re-stamped loud.
-    fn deadlineScan(self: *Group, now: u64) void {
+    /// Bridge deadlines are seconds (`zc.BRIDGE_DEADLINE_NS`): stamped and
+    /// scanned on the coarse clock.
+    fn deadlineScan(self: *Group) void {
         if (self.deadlines.outstanding == 0) {
             var any = false;
             for (self.pends) |p| if (p != null) {
@@ -1696,6 +1698,7 @@ pub const Group = struct {
             };
             if (!any) return;
         }
+        const now = clock.monotonicCoarseNs();
         if (now -| self.last_scan_ns < zc.BRIDGE_SCAN_PERIOD_NS) return;
         self.last_scan_ns = now;
         for (self.pends, 0..) |p, g| if (p != null and !self.deadlines.live(g)) {
@@ -1829,7 +1832,7 @@ pub const Group = struct {
             .restamp => {
                 bridge_restamps.inc();
                 log.err("transport: queue {d} ent {d}: cancel answered {d} — the bridge still runs kernel-side; re-stamped (a synthesis would let a late DMA alias a recycled slot)", .{ self.memberOf(gent).qid, self.entIdxOf(gent), res });
-                _ = self.deadlines.stamp(gent, clock.monotonicNs());
+                _ = self.deadlines.stamp(gent, clock.monotonicCoarseNs());
             },
         }
     }
@@ -2205,7 +2208,7 @@ pub const Group = struct {
     fn runLoop(self: *Group) void {
         while (self.shared.isActive() and !self.disconnected and !self.protocol_rejected) {
             passes.inc();
-            pass_stamps.stamp(self.index, clock.monotonicNs());
+            pass_stamps.stamp(self.index, clock.monotonicCoarseNs());
             // 1. Rescue capture.
             const after_tick = self.tick_rescue_pending;
             self.tick_rescue_pending = false;
@@ -2252,9 +2255,10 @@ pub const Group = struct {
             self.unparkScan();
             // 7. Exit if the session died under us.
             if (!self.shared.isActive()) break;
-            const now = clock.monotonicNs();
-            // 8. The bridge deadline scan.
-            self.deadlineScan(now);
+            // 8. The bridge deadline scan. The pass's fine stamp only when
+            //    an ent's retry owes a deadline (12).
+            var now: ?u64 = null;
+            self.deadlineScan();
             // 9. Re-arm the standing READs: this ring's wake and the
             //    driven lane's.
             var armed = true;
@@ -2277,7 +2281,8 @@ pub const Group = struct {
             // 12. Work in hand ⇒ a non-blocking flush and loop.
             var retry_left: ?u64 = null;
             for (self.members) |*m| if (m.slots.nextRetryDeadline()) |d| {
-                const left = d -| now;
+                if (now == null) now = clock.monotonicNs();
+                const left = d -| now.?;
                 retry_left = if (retry_left) |r| @min(r, left) else left;
             };
             // A fiber runnable on the lane, or a publication a handler on
@@ -2514,9 +2519,11 @@ pub const Group = struct {
     }
 
     fn pushRetriesDue(self: *Group) void {
-        const now = clock.monotonicNs();
+        var now: ?u64 = null;
         for (self.members, 0..) |*m, ms| {
-            while (m.slots.nextRetryDue(now)) |e| self.pushRegister(@intCast(ms), e);
+            if (m.slots.nextRetryDeadline() == null) continue;
+            if (now == null) now = clock.monotonicNs();
+            while (m.slots.nextRetryDue(now.?)) |e| self.pushRegister(@intCast(ms), e);
         }
     }
 
@@ -2526,7 +2533,8 @@ pub const Group = struct {
         const m = self.memberOf(gent);
         const ent_idx = self.entIdxOf(gent);
         const hdr = self.headerOf(gent);
-        const now = clock.monotonicNs();
+        // The owed stamp is the watchdog's, aged in ms: the coarse clock.
+        const now = clock.monotonicCoarseNs();
         if (from_register) m.slots.noteRegisterSuccess(ent_idx);
         if (self.kmb) |*k| {
             // The attachment law: flagged re-points, unflagged keeps, a bid

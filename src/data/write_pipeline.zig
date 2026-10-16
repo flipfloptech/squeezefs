@@ -161,7 +161,7 @@ pub const Prof = struct {
     legs: [Phase.legs]u64 = @splat(0),
 
     pub fn start() Prof {
-        const now = clock.monotonicNs();
+        const now = clock.phaseNs();
         return .{ .t0 = now, .last = now };
     }
 
@@ -170,7 +170,7 @@ pub const Prof = struct {
     }
 
     pub fn mark(self: *Prof, p: Phase) void {
-        self.markAt(p, clock.monotonicNs());
+        self.markAt(p, clock.phaseNs());
     }
 
     pub fn markAt(self: *Prof, p: Phase, now: u64) void {
@@ -181,7 +181,7 @@ pub const Prof = struct {
     }
 
     pub fn finish(self: *Prof) void {
-        self.finishAt(clock.monotonicNs());
+        self.finishAt(clock.phaseNs());
     }
 
     pub fn finishAt(self: *Prof, now: u64) void {
@@ -626,11 +626,13 @@ pub const Governor = struct {
         self.completions.notifyWaiters(io);
     }
 
-    /// The completion: release the permit, feed the lane's BDP, feed the
-    /// probe epoch (and roll it), wake parked admitters. Never waits.
-    pub fn complete(self: *Governor, io: Io, p: Permit, lane_ord: u32, dur_ns: u64) void {
+    /// The completion at `now_ns` (`monotonicNs`, the permit's own clock —
+    /// one read serves the BDP sample and the epochs): release the permit,
+    /// feed the lane's BDP, feed the probe epoch (and roll it), wake parked
+    /// admitters. Never waits.
+    pub fn complete(self: *Governor, io: Io, p: Permit, lane_ord: u32, now_ns: u64) void {
         self.core.release(p.bytes);
-        const now_ns = clock.monotonicNs();
+        const dur_ns = now_ns -| p.admitted_ns;
         const now_ms = now_ns / std.time.ns_per_ms;
         if (lane_ord < self.lanes.len) self.lanes[lane_ord].record(p.bytes, dur_ns, now_ms);
         self.probe.noteBytes(p.bytes);
@@ -824,7 +826,7 @@ test "admission_parks_at_target_and_wakes_on_completion; empty_pipe_always_admit
             const w: *@This() = @ptrCast(@alignCast(ctx));
             if (w.fired) return;
             w.fired = true;
-            w.gov.complete(testing.io, w.p, 0, 1_000_000);
+            w.gov.complete(testing.io, w.p, 0, w.p.admitted_ns + 1_000_000);
         }
     };
     var win: Window = .{ .gov = &g, .p = p1 };

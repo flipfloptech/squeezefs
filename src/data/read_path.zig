@@ -288,20 +288,21 @@ pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
     try w.writeByte('}');
 }
 
-/// Span-form phase recording: each `mark` records the phase from the last
-/// clock read and returns the new one, so abutting phases sum EXACTLY to
-/// the total measured from the first read.
+/// Span-form phase recording on the phase clock (one thread: a fiber stays on
+/// its lane): each `mark` records the phase from the last clock read and
+/// returns the new one, so abutting phases sum EXACTLY to the total measured
+/// from the first read.
 const PhaseClock = struct {
     t0: u64,
     last: u64,
 
     fn start() PhaseClock {
-        const t = clock.monotonicNs();
+        const t = clock.phaseNs();
         return .{ .t0 = t, .last = t };
     }
 
     fn mark(self: *PhaseClock, h: *counters.ShardedLatencyHistogram) void {
-        const now = clock.monotonicNs();
+        const now = @max(clock.phaseNs(), self.last);
         h.record(now -| self.last);
         self.last = now;
     }
@@ -793,7 +794,7 @@ pub const ReadPath = struct {
     /// warm serve never mints a lane (`claim = false`).
     pub fn ringReadLaneTouch(self: *ReadPath, ino: u64, offset: u64, len: u64, size: u64) void {
         if (len == 0) return;
-        const now = clock.monotonicNs();
+        const now = clock.monotonicCoarseNs();
         const p = self.pipelineFor(ino, false, now) orelse return;
         const bs = self.cfg.block_size;
         _ = p.touch(self.prefetchEnv(ino), .{
@@ -982,7 +983,7 @@ pub const ReadPath = struct {
     pub fn read(self: *ReadPath, io: Io, ino: u64, offset: u64, len: u64, dest: Dest, flags: Flags) Error!usize {
         var pc = PhaseClock.start();
         defer {
-            pc.last = clock.monotonicNs();
+            pc.last = @max(clock.phaseNs(), pc.last);
             pc.total(&stats.read_serve_total_ns);
         }
         if (flags.odirect) stats.read_odirect_requests.inc();
@@ -1195,7 +1196,7 @@ pub const ReadPath = struct {
     fn readSingleBlock(self: *ReadPath, io: Io, ino: u64, info: FileInfo, b: u64, rel_s: u64, rel_e: u64, out: []u8, dest: Dest, flags: Flags, req_offset: u64, req_len: u64) Error!void {
         const bs = self.cfg.block_size;
         const slice_len = rel_e - rel_s;
-        const now = clock.monotonicNs();
+        const now = clock.monotonicCoarseNs();
         // (1) W2 extent runs — NEWER than every base.
         var scratch_cov: ExtentCoverage = .none;
         {
@@ -1376,7 +1377,7 @@ pub const ReadPath = struct {
             };
             if (attempt >= BACKOFF_AFTER) backoffSleep(io, attempt - BACKOFF_AFTER);
             // The ghost second touch escalates (not device-true, not a lease).
-            if (!device_true and !lease and self.adm.rangedEscalation(k, bs, self.level() == .red, odirect, clock.monotonicNs())) {
+            if (!device_true and !lease and self.adm.rangedEscalation(k, bs, self.level() == .red, odirect, clock.monotonicCoarseNs())) {
                 const blk = try self.getBlockForIndex(io, ino, b, key, false, true, .escalation);
                 if (blk) |bl| {
                     defer bl.release(self);
@@ -1399,7 +1400,7 @@ pub const ReadPath = struct {
             };
             stats.ranged_reads.inc();
             stats.ranged_read_bytes.add(win.len());
-            self.adm.governor.noteForeground(win.len(), clock.monotonicNs());
+            self.adm.governor.noteForeground(win.len(), clock.monotonicCoarseNs());
             if (win.bounced(req_len)) stats.ranged_read_unaligned_bounces.inc();
             if (direct) {
                 if (try self.vols.read_range(self.vols.ctx, k.vol_tag, k.offset + win.aligned_start, out, .registered) == .dma) {
@@ -1467,7 +1468,7 @@ pub const ReadPath = struct {
             };
             if (attempt >= BACKOFF_AFTER) backoffSleep(io, attempt - BACKOFF_AFTER);
             // The ghost second touch escalates to ONE whole-block fill.
-            if (self.adm.rangedEscalation(k, bs, self.level() == .red, odirect, clock.monotonicNs())) {
+            if (self.adm.rangedEscalation(k, bs, self.level() == .red, odirect, clock.monotonicCoarseNs())) {
                 const blk = try self.getBlockForIndex(io, ino, b, key, false, true, .escalation);
                 if (blk) |bl| {
                     defer bl.release(self);
@@ -1535,7 +1536,7 @@ pub const ReadPath = struct {
             }
             stats.ranged_reads.inc();
             stats.ranged_read_bytes.add(HEADER_PAGE_LEN + dma_len);
-            self.adm.governor.noteForeground(HEADER_PAGE_LEN + dma_len, clock.monotonicNs());
+            self.adm.governor.noteForeground(HEADER_PAGE_LEN + dma_len, clock.monotonicCoarseNs());
             if (self.seams.after_dma) |f| f(self.seams.after_dma_ctx, k);
             // 3. Bytes in hand FIRST, then the two checks.
             const incarnation_ok = self.still(k, before);
@@ -1590,7 +1591,7 @@ pub const ReadPath = struct {
     /// a fresh-map hole.
     pub fn getBlockForIndex(self: *ReadPath, io: Io, ino: u64, b: u64, resolved: ?BlockKey, device_true: bool, escalate_contended: bool, class_override: ?FillClass) Error!?Block {
         const ladder_cap = if (escalate_contended) SETTLE_HANDOFF else self.cfg.rebind_ladder_cap;
-        const now = clock.monotonicNs();
+        const now = clock.monotonicCoarseNs();
         const class: FillClass = class_override orelse self.fillClass(ino, device_true, now);
         var key = resolved orelse self.currentBinding(ino, b);
         var losses: u32 = 0;
@@ -1810,7 +1811,7 @@ pub const ReadPath = struct {
         var publish_to_nvme = false;
         var still_ctx: StillCtx = .{ .rp = self, .key = key, .before = publishable orelse 0 };
         const validate: Validate = .{ .ctx = &still_ctx, .call = &stillValidate };
-        const now = clock.monotonicNs();
+        const now = clock.monotonicCoarseNs();
         if (publishable != null and blk.where == .pool) {
             const len: u64 = blk.len;
             if (class == .demand_stream) self.adm.governor.noteForeground(len, now);
@@ -1974,7 +1975,7 @@ pub const ReadPath = struct {
         const sv = self.hold.serve(key, 0) orelse return;
         defer self.hold.unpin(sv);
         if (!sv.ledger_visible) return;
-        self.holdServeAdmission(key, sv.slot, sv.len, class, clock.monotonicNs());
+        self.holdServeAdmission(key, sv.slot, sv.len, class, clock.monotonicCoarseNs());
     }
 };
 
@@ -2323,7 +2324,7 @@ test "the ranged-vs-whole decision table: a random 4 KiB cold read on a passthro
             try Fixture.expected((i + 4) * Fixture.bs, buf);
         }
         try testing.expectEqual(classified0 + 1, prefetch.stats.read_streams_classified.load());
-        try testing.expect(f.rp.streamingFresh(9, clock.monotonicNs()));
+        try testing.expect(f.rp.streamingFresh(9, clock.monotonicCoarseNs()));
         // The ranged VETO: a stream's sub-block request into an unregistered
         // dest takes the whole block (1.0× amp + the pipeline).
         const ranged0 = stats.ranged_reads.load();
@@ -2512,14 +2513,14 @@ test "the bounded-waste law under a random sub-block storm over a set ≫ the ho
     try testing.expectEqual(@as(u64, 6), adm.escalations.load());
     try testing.expectEqual(@as(u64, 2), g.denials.load());
     try testing.expectEqual(@as(u64, 1), admission.stats.read_admission_governor_clamped.load());
-    g.roll(clock.monotonicNs() + g.epoch_ns);
+    g.roll(clock.monotonicCoarseNs() + g.epoch_ns);
     try testing.expectEqual(@as(u64, 1), admission.stats.read_admission_governor_clamped.load());
     // Pass 3 over blocks 8..15: first touches — ranged (this epoch's
     // foreground: 8 × 4 KiB = 32 KiB ⇒ next epoch's tokens = 5 % of that,
     // less than one block). The roll carries no eviction evidence: the
     // clamp STANDS (the flap the prev-epoch-only reading had).
     for (8..16) |b| _ = try f.rp.read(io, 7, @as(u64, b) * Fixture.bs + 4096, 4096, .{ .buf = buf }, .{});
-    g.roll(clock.monotonicNs() + 2 * g.epoch_ns);
+    g.roll(clock.monotonicCoarseNs() + 2 * g.epoch_ns);
     try testing.expectEqual(@as(u64, 1), admission.stats.read_admission_governor_clamped.load());
     try testing.expect(g.tokensLeft() < Fixture.bs);
     // Pass 4 over blocks 8..15: second touches under the engaged clamp — the
@@ -3387,7 +3388,7 @@ test "e2e (Linux, nvme_dev.Device): cold whole-block fill → hot hit → purge 
         try Fixture.expected((i + 2) * DeviceFixture.bs, buf);
     }
     try testing.expectEqual(classified0 + 1, prefetch.stats.read_streams_classified.load());
-    try testing.expect(f.rp.streamingFresh(11, clock.monotonicNs()));
+    try testing.expect(f.rp.streamingFresh(11, clock.monotonicCoarseNs()));
     try testing.expectEqual(get_obj0 + 6, nvme_dev.stats.get_obj.load());
     // direct_device_true on a second mount: O_DIRECT reads are device-true.
     var g: DeviceFixture = .{ .gpa = testing.allocator };

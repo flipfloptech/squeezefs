@@ -1,27 +1,31 @@
 #!/usr/bin/env bash
-# The Linux venue: run a command inside the `sqz-zig` macOS container
-# (Ubuntu 24.04 on the sqz kernel series, Zig 0.17, this repo mounted rw at the
-# same path, the Rust reference mounted ro at ~/Source/squeezefs).
+# The Linux venue: run a command on this Linux host, inside the `sqz-zig` macOS
+# container, or on an ssh box — each on the sqz kernel series with Zig 0.17 and
+# this repo at the same absolute path.
 #
 #   scripts/venue                 # interactive shell in the repo
 #   scripts/venue zig build gate  # run the gate in the container
 #   scripts/venue test [filter]   # shorthand: zig build test [-- filter]
-#   scripts/venue up              # (re)create the container
-#   scripts/venue status          # kernel, zig, fuse/uring facts
-#   scripts/venue trim            # return deleted blocks to the Mac (run after big tests)
+#   scripts/venue up              # (re)create the container / provision or check the host
+#   scripts/venue status          # kernel, zig, fuse/uring, nvmet modules, build-root space
+#   scripts/venue trim            # prune build leftovers + discard (run after big tests)
 #   scripts/venue pull <path>     # ssh venues: copy <path> (e.g. tests/costs) back to the Mac
 #
-# Two venues, chosen by SQZ_VENUE:
-#   vm (default)  the `sqz-zig` container on this Mac (aarch64, 8 vCPU / 16 GiB, the sqz
-#                 kernel with patches 0001–0028)
+# Three venues, chosen by SQZ_VENUE:
+#   local         THIS host (the default when it is Linux): commands run as root via sudo
+#                 in this tree — no sync, no VM. `up` runs scripts/dev/provision-local-venue.
+#   vm            the `sqz-zig` container on this Mac (the default on macOS; aarch64,
+#                 8 vCPU / 16 GiB, the sqz kernel with patches 0001–0029)
 #   kamrui        the x86_64 box `kamrui-dev` over ssh (12 threads, 61 GiB, local NVMe;
 #                 Ubuntu 26.04): the repo is mirrored at the SAME absolute path by rsync
 #                 before every command (a delta is ~2 s), commands run as root via sudo,
 #                 /build is an ext4 LV on its NVMe. Files a command writes into the tree
 #                 stay on the box until `pull`ed — the Mac's tree is the source of truth.
 #
-# Zig caches live on the `squeezefs-zig-cache` volume (/build) — never on the
-# virtiofs mount, where the cache's rename/lock traffic is slow.
+# Every venue keeps its locks, build slots and zig caches under the build root
+# SQZ_BUILD_ROOT (default /build; on the vm the `squeezefs-zig-cache` volume — never the
+# virtiofs mount, where the cache's rename/lock traffic is slow). Commands see it exported.
+# The product's tests write under /build/tmp, so a root elsewhere needs /build linked to it.
 set -euo pipefail
 
 NAME=${SQZ_VENUE_NAME:-sqz-zig}
@@ -38,19 +42,29 @@ MEM=${SQZ_VENUE_MEM:-16G}
 # HFS+/exFAT volumes have NO sparse files: a `truncate -s 8G` costs 8 GB and the
 # bus's time there; keep /build (ext4 on the cache volume) for the fast smoke.
 EXT_DIR=${SQZ_EXT_DIR:-/Volumes/512GB/sqz-tmp}
+ROOT=${SQZ_BUILD_ROOT:-/build}
+# The root is spliced unquoted into the lock commands below.
+case $ROOT in *[[:space:]]* | [!/]*) echo "venue: SQZ_BUILD_ROOT '$ROOT' must be an absolute path without spaces" >&2; exit 2 ;; esac
 
 # ZIG_GLOBAL_CACHE_DIR is honoured by the compiler; --cache-dir is the build flag.
 # The install prefix is per venue: the repo (and so zig-out/) is shared with
 # macOS through the mount, and a Linux binary must never overwrite the host's.
-ZIG_CACHE_ARGS=(--cache-dir /build/zig-cache-v2 --prefix zig-out-linux)
-export_cache="export ZIG_GLOBAL_CACHE_DIR=/build/zig-global-cache"
+ZIG_CACHE_ARGS=(--cache-dir "$ROOT/zig-cache-v2" --prefix zig-out-linux)
+export_cache="export SQZ_BUILD_ROOT=$ROOT ZIG_GLOBAL_CACHE_DIR=$ROOT/zig-global-cache"
 
-VENUE=${SQZ_VENUE:-vm}
+if [ -z "${SQZ_VENUE:-}" ] && [ "$(uname -s)" = Linux ]; then VENUE=local; else VENUE=${SQZ_VENUE:-vm}; fi
 case "$VENUE" in
   vm) SLOTS=2 ;;
   # 61 GiB: three LTO links (several GB each) beside a 6-shard unit set still fit.
   kamrui) SSH_HOST=${SQZ_VENUE_HOST:-kamrui-dev}; SLOTS=3 ;;
-  *) echo "venue: unknown SQZ_VENUE '$VENUE' (vm | kamrui)" >&2; exit 2 ;;
+  # One slot per 4 threads (kamrui: 3 on 6 C / 12 T) and per 8 GiB (an LTO link takes several
+  # GB; the vm's 2 on 8 vCPU / 16 GiB), at least 1. Every controller of one build root must
+  # agree (kamrui's ssh and local modes both give 3): a full gate holds the slots it counts.
+  local)
+    mem_gib=$(awk '/^MemTotal:/ { print int($2 / 1048576) }' /proc/meminfo)
+    SLOTS=$(( $(nproc) / 4 < mem_gib / 8 ? $(nproc) / 4 : mem_gib / 8 ))
+    SLOTS=${SQZ_VENUE_SLOTS:-$(( SLOTS < 1 ? 1 : SLOTS ))} ;;
+  *) echo "venue: unknown SQZ_VENUE '$VENUE' (local | vm | kamrui)" >&2; exit 2 ;;
 esac
 SSH=(ssh -o BatchMode=yes -o LogLevel=ERROR)
 
@@ -70,10 +84,13 @@ sync_tree() {
 }
 
 up() {
+  if [ "$VENUE" = local ]; then
+    exec bash "$REPO/scripts/dev/provision-local-venue" "$@"
+  fi
   if [ "$VENUE" != vm ]; then
     sync_tree
     # Modules, IOR/mdtest, root-MPI env: what the container gets from its image.
-    "${SSH[@]}" "$SSH_HOST" "sudo bash '$REPO/scripts/dev/provision-ssh-venue'"
+    "${SSH[@]}" "$SSH_HOST" "sudo SQZ_BUILD_ROOT=$ROOT bash '$REPO/scripts/dev/provision-ssh-venue'"
     return
   fi
   container volume create "$CACHE_VOL" >/dev/null 2>&1 || true
@@ -93,7 +110,7 @@ up() {
     container build -t "$IMAGE" -f "$REPO/scripts/dev/Containerfile" "$REPO/scripts/dev" >/dev/null
   fi
   local ext_mount=()
-  if [ -d "$EXT_DIR" ]; then ext_mount=(--mount "type=virtiofs,source=$EXT_DIR,target=/build/ext"); fi
+  if [ -d "$EXT_DIR" ]; then ext_mount=(--mount "type=virtiofs,source=$EXT_DIR,target=$ROOT/ext"); fi
   # --init: PID 1 reaps orphans (with `sleep infinity` as PID 1 the venue piled
   # up ~890 zombies from exited supervisors and test helpers).
   container run -d --init --name "$NAME" -c "$CPUS" -m "$MEM" \
@@ -101,9 +118,9 @@ up() {
     "${ext_mount[@]}" \
     --mount "type=virtiofs,source=$REPO,target=$REPO" \
     --mount "type=virtiofs,source=$REF,target=$REF,readonly" \
-    -v "$CACHE_VOL:/build" \
+    -v "$CACHE_VOL:$ROOT" \
     "$IMAGE" sleep infinity
-  container exec "$NAME" mkdir -p /build/zig-cache /build/zig-global-cache
+  container exec "$NAME" mkdir -p "$ROOT/zig-cache" "$ROOT/zig-global-cache"
 }
 
 ensure_running() {
@@ -131,10 +148,10 @@ run_in() {
   # compile), so two or three concurrent gates over-commit its 16 GiB until the
   # kernel livelocks reclaiming page cache — on 2026-10-14 not even an `exec`
   # of `echo` could start for 5 minutes and the VM had to be stopped from the
-  # host. A gate waits here (flock on the shared /build volume) and says so.
+  # host. A gate waits here (flock on the shared build root) and says so.
   # And at most TWO builds at once otherwise: an LTO link of the product takes several GB, and
   # four agents' targeted builds beside the gate train got the compiler OOM-killed (signal
-  # KILL) the same day. Two build slots (flock /build/.build-slot.{0,1}); a full gate holds
+  # KILL) the same day. Two build slots (flock $ROOT/.build-slot.{0,1}); a full gate holds
   # the gate lock AND both slots, so it runs alone. A command whose own exit status is 75
   # (EX_TEMPFAIL) is indistinguishable from "slot busy" — none of ours uses it.
   # Every slotted command runs under a wall bound (SQZ_VENUE_TIMEOUT, default 2 h — a full
@@ -144,9 +161,9 @@ run_in() {
   local bound=${SQZ_VENUE_TIMEOUT:-7200}
   local q; q=$(printf '%q' "timeout --kill-after=30 $bound bash -lc $(printf '%q' "$cmd")")
   local all_slots="" s
-  for ((s = 0; s < SLOTS; s++)); do all_slots="$all_slots flock -o /build/.build-slot.$s"; done
+  for ((s = 0; s < SLOTS; s++)); do all_slots="$all_slots flock -o $ROOT/.build-slot.$s"; done
   if printf '%s' "$cmd" | grep -Eq 'zig build[^;&|]*[[:space:]]gate([[:space:]]|$)'; then
-    cmd="flock -o -n /build/.gate.lock true 2>/dev/null || echo \"venue: another full gate holds the venue (\$(bash scripts/venue-gate-holder 2>/dev/null)) — waiting for it\" >&2; flock -o /build/.gate.lock$all_slots bash -lc $q"
+    cmd="flock -o -n $ROOT/.gate.lock true 2>/dev/null || echo \"venue: another full gate holds the venue (\$(bash scripts/venue-gate-holder 2>/dev/null)) — waiting for it\" >&2; flock -o $ROOT/.gate.lock$all_slots bash -lc $q"
   elif printf '%s' "$cmd" | grep -Eq 'zig build' || [ "${SQZ_VENUE_SLOT:-0}" = 1 ]; then
     # (SQZ_VENUE_SLOT=1: any heavy command — a loop of smoke rows, daemons, `yes` load —
     # takes a slot too, so a full gate, which holds every slot, never runs beside it.)
@@ -156,11 +173,15 @@ run_in() {
     # each slot the moment it freed and the train held the gate lock 28 min waiting for
     # slot 0 (kamrui, 2026-10-15). A waiting command polls every slot and takes the first
     # that frees.
-    cmd="r=75; said=0; while :; do flock -s -o -n /build/.gate.lock true || { echo \"venue: a full gate holds the venue (\$(bash scripts/venue-gate-holder 2>/dev/null)) — waiting for it\" >&2; flock -s -o /build/.gate.lock true; }; for s in \$(seq 0 $((SLOTS - 1))); do flock -o -n -E 75 /build/.build-slot.\$s bash -lc $q; r=\$?; [ \$r -ne 75 ] && break 2; done; [ \$said = 1 ] || echo 'venue: $SLOTS builds are running — waiting for a build slot' >&2; said=1; sleep 2; done; exit \$r"
+    cmd="r=75; said=0; while :; do flock -s -o -n $ROOT/.gate.lock true || { echo \"venue: a full gate holds the venue (\$(bash scripts/venue-gate-holder 2>/dev/null)) — waiting for it\" >&2; flock -s -o $ROOT/.gate.lock true; }; for s in \$(seq 0 $((SLOTS - 1))); do flock -o -n -E 75 $ROOT/.build-slot.\$s bash -lc $q; r=\$?; [ \$r -ne 75 ] && break 2; done; [ \$said = 1 ] || echo 'venue: $SLOTS builds are running — waiting for a build slot' >&2; said=1; sleep 2; done; exit \$r"
   fi
   # -lc so PATH picks up /usr/local/bin/zig; cd into the repo at the same path.
   if [ "$VENUE" = vm ]; then
     container exec -i ${tty[@]+"${tty[@]}"} "$NAME" bash -lc "$export_cache; cd '$REPO' && $cmd"
+  elif [ "$VENUE" = local ]; then
+    # Root, as in the container. Without a terminal, sudo must not wait for a password.
+    local nopw=(-n); [ -t 0 ] && nopw=()
+    sudo ${nopw[@]+"${nopw[@]}"} bash -lc "$export_cache; cd '$REPO' && $cmd"
   else
     sync_tree
     # Root, as in the container: mount(2), fuse.enable_uring, nvmet configfs.
@@ -169,10 +190,10 @@ run_in() {
 }
 
 case "${1:-}" in
-  up) up ;;
+  up) shift; up "$@" ;;
   pull)
     shift
-    [ "$VENUE" = vm ] && { echo "venue: the vm shares the tree — nothing to pull" >&2; exit 0; }
+    case $VENUE in vm | local) echo "venue: the $VENUE venue shares the tree — nothing to pull" >&2; exit 0 ;; esac
     for p in "$@"; do rsync -a -e "${SSH[*]}" "$SSH_HOST:$REPO/$p" "$(dirname "$REPO/$p")/"; done
     ;;
   trim)
@@ -185,11 +206,16 @@ case "${1:-}" in
     # the prune. (Pruning first made the discard wait behind a running gate while
     # the Mac fell 99 → 38 GiB free.)
     all_slots=""
-    for ((s = 0; s < SLOTS; s++)); do all_slots="$all_slots flock -o /build/.build-slot.$s"; done
-    SQZ_VENUE_SLOT=0 run_in "sync -f /build; fstrim -v /build; if flock -o -w 900 /build/.gate.lock$all_slots bash scripts/venue-prune ${SQZ_VENUE_CACHE_CAP_GB:-30}; then sync -f /build; fstrim -v /build; else echo 'venue: busy for 15 min — prune skipped' >&2; fi; df -h /build | tail -1"
+    for ((s = 0; s < SLOTS; s++)); do all_slots="$all_slots flock -o $ROOT/.build-slot.$s"; done
+    # (A root whose filesystem or device has no discard skips fstrim and says so.)
+    discard="sync -f $ROOT; fstrim -v $ROOT 2>/dev/null || echo 'venue: $ROOT does not support discard — fstrim skipped' >&2"
+    SQZ_VENUE_SLOT=0 run_in "$discard; if flock -o -w 900 $ROOT/.gate.lock$all_slots bash scripts/venue-prune ${SQZ_VENUE_CACHE_CAP_GB:-30}; then $discard; else echo 'venue: busy for 15 min — prune skipped' >&2; fi; df -h $ROOT | tail -1"
     ;;
   status)
-    run_in 'uname -r; zig version; echo "install prefix: zig-out-linux/"; echo "fuse.enable_uring=$(cat /sys/module/fuse/parameters/enable_uring)"; echo "io_uring_disabled=$(cat /proc/sys/kernel/io_uring_disabled)"; nproc; free -g | sed -n 2p'
+    # A module is loaded, available (modprobe can load it), built-in (/proc/config.gz — the
+    # vm's kernel has no /lib/modules) or absent.
+    mods='for m in nvmet:NVME_TARGET nvme_loop:NVME_TARGET_LOOP brd:BLK_DEV_RAM null_blk:BLK_DEV_NULL_BLK; do c=${m#*:}; m=${m%%:*}; if [ -d /sys/module/$m ]; then s=loaded; elif modprobe -n $m 2>/dev/null; then s=available; elif zcat /proc/config.gz 2>/dev/null | grep -qx CONFIG_$c=y; then s=built-in; else s=absent; fi; printf "%s=%s " $m $s; done'
+    run_in 'echo "venue: '"$VENUE"' (build slots: '"$SLOTS"')"; uname -r; zig version; echo "install prefix: zig-out-linux/"; echo "fuse.enable_uring=$(cat /sys/module/fuse/parameters/enable_uring)"; echo "io_uring_disabled=$(cat /proc/sys/kernel/io_uring_disabled)"; echo "modules: $('"$mods"')"; nproc; free -g | sed -n 2p; df -h "$SQZ_BUILD_ROOT" | tail -1'
     ;;
   test)
     shift
@@ -214,6 +240,7 @@ case "${1:-}" in
     if [ "$VENUE" = vm ]; then
       exec container exec -it "$NAME" bash -lc "cd '$REPO' && exec bash"
     fi
+    [ "$VENUE" = local ] && exec sudo bash -lc "$export_cache; cd '$REPO' && exec bash"
     sync_tree
     exec "${SSH[@]}" -t "$SSH_HOST" "sudo bash -lc $(printf '%q' "cd '$REPO' && exec bash")"
     ;;

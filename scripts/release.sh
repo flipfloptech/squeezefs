@@ -104,7 +104,7 @@ git --no-pager diff
 # ---- the verification, on the Linux venue ----
 say "verification (Linux venue)"
 VENUE="$REPO/scripts/venue"
-ZB="zig build --cache-dir /build/zig-cache --prefix zig-out-linux"
+ZB="zig build --cache-dir ${SQZ_BUILD_ROOT:-/build}/zig-cache --prefix zig-out-linux"
 # Every command below runs inside the venue, in WORK.
 v() { "$VENUE" "cd '$WORK' && $*"; }
 v "$ZB install shim sdk"

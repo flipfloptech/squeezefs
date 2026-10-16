@@ -63,8 +63,9 @@ want_profile=$(printf '%s\n' "# squeezefs venue (scripts/dev/provision-ssh-venue
   "export PATH=$PREFIX/bin:\$PATH" "export OMPI_ALLOW_RUN_AS_ROOT=1" "export OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1")
 if [ ! -f "$profile" ] || [ "$(cat "$profile")" != "$want_profile" ]; then printf '%s\n' "$want_profile" >"$profile"; fi
 
-mkdir -p /build/zig-cache-v2 /build/zig-global-cache /build/tmp
-chmod 1777 /build/tmp
+root=${SQZ_BUILD_ROOT:-/build}
+mkdir -p "$root/zig-cache-v2" "$root/zig-global-cache" "$root/tmp"
+chmod 1777 "$root/tmp"
 
 echo "kernel:   $(uname -r) ($(uname -m)), $(nproc) cpus, $(free -g | awk 'NR==2{print $2}') GiB"
 echo "modules:  $(for m in "${MODULES[@]}"; do [ -d "/sys/module/${m//-/_}" ] && printf '%s ' "$m"; done)"

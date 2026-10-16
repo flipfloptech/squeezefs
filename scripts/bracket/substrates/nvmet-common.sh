@@ -85,7 +85,7 @@ nvmet_ns_name() {
 substrate_up() {   # bin nsets
   local bin=$1 nsets=$2 s v port=$NVMET_PORT_BASE disk
   nvmet_env
-  disk=$(backing_disk_of /build)
+  disk=$(backing_disk_of ${SQZ_BUILD_ROOT:-/build})
   META_DEV=(); DATA_DEVS_BY_SET=(); META_DISK_DEVS_BY_SET=(); DATA_DISK_DEVS_BY_SET=()
   DISK_DEVS=("$disk")
   for s in $(seq 0 $((nsets - 1))); do
@@ -112,7 +112,7 @@ substrate_up() {   # bin nsets
   done
   NVMET_BASE_DISKS=("${DISK_DEVS[@]}")
   local tr="nvmet-loop"; [ "$NVMET_TRTYPE" = tcp ] && tr="nvmet-tcp on 127.0.0.1"
-  SUBSTRATE_DESC="$tr: $((nsets * (1 + DATA_VOLUMES))) kernel nvmet namespaces (resv_enable=1), the metadata connected through \`nvmeof connect\`, the data volumes by the DAEMON from their fabric_endpoint records; backed by sparse files on /build (/dev/$disk)"
+  SUBSTRATE_DESC="$tr: $((nsets * (1 + DATA_VOLUMES))) kernel nvmet namespaces (resv_enable=1), the metadata connected through \`nvmeof connect\`, the data volumes by the DAEMON from their fabric_endpoint records; backed by sparse files on ${SQZ_BUILD_ROOT:-/build} (/dev/$disk)"
   log "substrate: $SUBSTRATE_DESC; meta ${META_DEV[*]}; data (format-time) ${DATA_DEVS_BY_SET[*]}"
 }
 

@@ -17,8 +17,8 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"
 BRK="$HERE/brk.py"
-export BRK_TOOLS="${BRK_TOOLS:-/build/tools/bin}"
-IO500_SRC="${IO500_SRC:-/build/tools/src/io500}"
+export BRK_TOOLS="${BRK_TOOLS:-${SQZ_BUILD_ROOT:-/build}/tools/bin}"
+IO500_SRC="${IO500_SRC:-${SQZ_BUILD_ROOT:-/build}/tools/src/io500}"
 
 SCOPING=0; SUBSTRATE=file; NP=""; INI=""; POSTURE=symmetric; MOUNT_OPTS=""; OUT="$REPO/bench/brackets"; KEEP=0
 META_SIZE=$((2 << 30)); DATA_SIZE=$((8 << 30)); DATA_VOLUMES=2; BUDGET_MB=2048; SCRATCH=""
@@ -49,7 +49,7 @@ if [ -z "$INI" ]; then
   if [ "$SCOPING" = 1 ]; then INI="$HERE/io500-scoping.ini"; else INI="$IO500_SRC/config-minimal.ini"; fi
 fi
 ROW=io500
-PID=$$; [ -n "$SCRATCH" ] || SCRATCH=/build/brk-io500-$PID; mkdir -p "$SCRATCH"
+PID=$$; [ -n "$SCRATCH" ] || SCRATCH=${SQZ_BUILD_ROOT:-/build}/brk-io500-$PID; mkdir -p "$SCRATCH"
 DATE=$(date -u +%Y%m%dT%H%M%SZ); LOG="$SCRATCH/io500.log"
 log() { printf '%s io500: %s\n' "$(date -u +%H:%M:%S)" "$*" | tee -a "$LOG" >&2; }
 # shellcheck source=lib.sh
@@ -57,7 +57,7 @@ source "$HERE/lib.sh"
 # shellcheck source=/dev/null
 source "$HERE/substrates/$SUBSTRATE.sh"
 BUILD=$(python3 "$BRK" build "$BIN")
-VENUE=$(python3 "$BRK" venue-id "$(backing_disk_of /build)")
+VENUE=$(python3 "$BRK" venue-id "$(backing_disk_of ${SQZ_BUILD_ROOT:-/build})")
 VENUE_ID=$(printf '%s' "$VENUE" | python3 -c 'import json,sys; print(json.load(sys.stdin)["venue_id"])')
 OUT_DIR="$OUT/$VENUE_ID/io500-$DATE"; mkdir -p "$OUT_DIR"
 

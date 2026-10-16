@@ -15,7 +15,7 @@ MDTEST=${MDTEST:-$BRK_TOOLS/mdtest}
 MD_NP=${MD_NP:-$BRK_NUMJOBS}
 MD_MIN_ITEMS=${MD_MIN_ITEMS:-10000}
 MD_WARM_ITEMS=${MD_WARM_ITEMS:-10000}
-ROW_INSTRUMENT="mdtest (ior $(cd /build/tools/src/ior-io500 2>/dev/null && git describe --tags --always 2>/dev/null || echo io500-sc19-605-g5528b36)) -C -F -u -z 2 -b 8 -n <sized from the warm-up rate>, mpirun -np $MD_NP"
+ROW_INSTRUMENT="mdtest (ior $(cd ${SQZ_BUILD_ROOT:-/build}/tools/src/ior-io500 2>/dev/null && git describe --tags --always 2>/dev/null || echo io500-sc19-605-g5528b36)) -C -F -u -z 2 -b 8 -n <sized from the warm-up rate>, mpirun -np $MD_NP"
 
 row_prepare() { mkdir -p "$1/mdtest"; }
 

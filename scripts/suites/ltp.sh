@@ -20,7 +20,7 @@ LTP_REPO=${LTP_REPO:-https://github.com/linux-test-project/ltp}
 KIRK_REPO=${KIRK_REPO:-https://github.com/linux-test-project/kirk}
 LTP_SRC="$SUITES_ROOT/ltp"
 KIRK_DIR="$SUITES_ROOT/kirk"
-LTP_PREFIX=${LTP_PREFIX:-/build/ltp}
+LTP_PREFIX=${LTP_PREFIX:-${SQZ_BUILD_ROOT:-/build}/ltp}
 LTP_FILES=${LTP_FILES:-"fs syscalls"}
 # Wall bound per runtest file (kirk's --suite-timeout): `syscalls` is
 # ~1,400 tests; `fs` ~90. A hung test is a defect to repro, never a reason

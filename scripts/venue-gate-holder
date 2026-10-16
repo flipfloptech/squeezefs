@@ -3,7 +3,7 @@
 # that only said "a full gate holds the venue" read as a hang. Prints e.g.
 # `gate in .wt-train, pid 2152007, running 11:48`; prints nothing when no one holds it.
 # Runs inside the venue (Linux: /proc/locks).
-f=${1:-/build/.gate.lock}
+f=${1:-${SQZ_BUILD_ROOT:-/build}/.gate.lock}
 ino=$(stat -c %i "$f" 2>/dev/null) || exit 0
 # /proc/locks: `N: FLOCK  ADVISORY  WRITE <pid> <maj>:<min>:<inode> …`; a waiter's line
 # reads `N: -> FLOCK …`, so field 2 is "->" and the holder is the one line without it.

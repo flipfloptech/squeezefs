@@ -11,8 +11,8 @@ echo 1 > $TR/tracing_on
 "$@"
 echo 0 > $TR/tracing_on
 echo 0 > $TR/events/fuse/fuse_request_send/enable; echo 0 > $TR/events/fuse/fuse_request_end/enable
-mkdir -p /build/perf; cp $TR/trace /build/perf/trace-$L.txt
-python3 - /build/perf/trace-$L.txt <<'EOF'
+mkdir -p ${SQZ_BUILD_ROOT:-/build}/perf; cp $TR/trace ${SQZ_BUILD_ROOT:-/build}/perf/trace-$L.txt
+python3 - ${SQZ_BUILD_ROOT:-/build}/perf/trace-$L.txt <<'EOF'
 import re, sys, collections
 send = {}; cnt = collections.Counter(); rtt = collections.defaultdict(list)
 for line in open(sys.argv[1]):

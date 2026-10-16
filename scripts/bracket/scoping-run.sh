@@ -11,7 +11,7 @@ set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN=$(readlink -f "${1:?binary}")
 OUT=${2:-$(cd "$HERE/../.." && pwd)/bench/brackets}
-LOG=/build/brk-scoping-run.log
+LOG=${SQZ_BUILD_ROOT:-/build}/brk-scoping-run.log
 # The venue's sizing: 4 × 512 MiB files (2 GiB datasets) and a 7 GiB budget keep
 # the daemon Green beside its ≈ 2.7 GiB unreclaimable floor on a 16 GiB VM shared
 # with two other agents; the box uses BRK_FILE_SIZE=4g and the default budget.

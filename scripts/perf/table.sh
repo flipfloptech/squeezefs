@@ -8,9 +8,9 @@
 # counted once the daemon's write custody settled (owed and parked both 0, ≤ 10 s).
 set -uo pipefail
 D=$1; L=$2; P=${3:-mdtest,randread,randwrite,ior}
-OUT=/build/perf/$L; mkdir -p "$OUT"
-T=${SQZ_TGT:-/build/dev/targets}
-OC=${SQZ_OCLOOP:-/build/perf/bin/ocloop}
+OUT=${SQZ_BUILD_ROOT:-/build}/perf/$L; mkdir -p "$OUT"
+T=${SQZ_TGT:-${SQZ_BUILD_ROOT:-/build}/dev/targets}
+OC=${SQZ_OCLOOP:-${SQZ_BUILD_ROOT:-/build}/perf/bin/ocloop}
 stats() { [ -r /mnt/sqz/.stats ] && case "$D" in /mnt/sqz*) cat /mnt/sqz/.stats > "$OUT/$1.stats.json" ;; esac; true; }
 has() { case ",$P," in *",$1,"*) return 0 ;; esac; return 1; }
 ostw() { local s=0 t d; for t in "$T"/ost*; do d=$(basename "$(readlink -f "$t")"); s=$((s + $(awk '{print $7}' "/sys/class/block/$d/stat"))); done; echo $((s * 512)); }

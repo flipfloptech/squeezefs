@@ -17,10 +17,10 @@ for spec in "${ROWS[@]}"; do
   row=${spec%% --format-opts=*}
   fopts=""
   case "$spec" in *" --format-opts="*) fopts=${spec#* --format-opts=} ;; esac
-  args=(--scoping --legs "$LEGS" --duration "$DUR" --warmup 10 --substrate "$SUB" --numjobs 4 --out "$OUT" --scratch "/build/tmp/readamp-brk-$$")
+  args=(--scoping --legs "$LEGS" --duration "$DUR" --warmup 10 --substrate "$SUB" --numjobs 4 --out "$OUT" --scratch "${SQZ_BUILD_ROOT:-/build}/tmp/readamp-brk-$$")
   [ -n "$fopts" ] && args+=(--format-opts "$fopts")
   echo "=== $(date -u +%H:%M:%S) $row ${fopts:+(format $fopts)} ==="
   timeout 3000 "$HERE/bracket.sh" "${args[@]}" "$row" "$A" "$B" 2>&1 | grep -E "bracket\[|^\| [0-9]|read device|INVALID|verdict" || true
-  sync -f /build; fstrim -v /build > /dev/null 2>&1 || true
+  sync -f ${SQZ_BUILD_ROOT:-/build}; fstrim -v ${SQZ_BUILD_ROOT:-/build} > /dev/null 2>&1 || true
 done
 python3 "$HERE/brk.py" summary "$OUT"/*/

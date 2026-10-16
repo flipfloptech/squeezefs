@@ -19,7 +19,7 @@ set -euo pipefail
 T=$1 L=$2
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 ROWS=${MX_ROWS:-.} S=${MX_SIZE:-3g} RT=${MX_RUNTIME:-30}
-OUT=${MX_OUT:-/build/perf/mx}; O=$OUT/$L; mkdir -p "$O"
+OUT=${MX_OUT:-${SQZ_BUILD_ROOT:-/build}/perf/mx}; O=$OUT/$L; mkdir -p "$O"
 die() { echo "matrix: $*" >&2; exit 1; }
 
 common=(--ioengine=io_uring --direct=1 --group_reporting --output-format=json)

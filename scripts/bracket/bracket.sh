@@ -60,7 +60,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"
 BRK="$HERE/brk.py"
 export BRK_JOBS="$HERE/jobs"
-export BRK_TOOLS="${BRK_TOOLS:-/build/tools/bin}"
+export BRK_TOOLS="${BRK_TOOLS:-${SQZ_BUILD_ROOT:-/build}/tools/bin}"
 
 SCOPING=0
 SUBSTRATE=file
@@ -128,7 +128,7 @@ case "$SUBSTRATE" in file|nvmet-loop|nvmet-tcp) ;; *) echo "bracket: --substrate
 export BRK_NUMJOBS=$NUMJOBS BRK_IODEPTH=$IODEPTH BRK_DURATION=$DURATION
 
 PID=$$
-[ -n "$SCRATCH" ] || SCRATCH=/build/brk-$PID
+[ -n "$SCRATCH" ] || SCRATCH=${SQZ_BUILD_ROOT:-/build}/brk-$PID
 mkdir -p "$SCRATCH"
 DATE=$(date -u +%Y%m%dT%H%M%SZ)
 LOG="$SCRATCH/bracket.log"
@@ -174,7 +174,7 @@ BIN_A=$(snapshot_binary "$SRC_A" "$SCRATCH/A")
 if [ "$A_EQ_B" = true ]; then BIN_B=$BIN_A; else BIN_B=$(snapshot_binary "$SRC_B" "$SCRATCH/B"); fi
 BUILD_A=$(python3 "$BRK" build "$BIN_A" "$SRC_A")
 BUILD_B=$(python3 "$BRK" build "$BIN_B" "$SRC_B")
-VENUE=$(python3 "$BRK" venue-id "$(backing_disk_of /build)")
+VENUE=$(python3 "$BRK" venue-id "$(backing_disk_of ${SQZ_BUILD_ROOT:-/build})")
 VENUE_ID=$(printf '%s' "$VENUE" | python3 -c 'import json,sys; print(json.load(sys.stdin)["venue_id"])')
 OUT_DIR="$OUT/$VENUE_ID"; mkdir -p "$OUT_DIR"
 log "venue $VENUE_ID; A=$BUILD_A; B=$BUILD_B; substrate $SUBSTRATE; lever $LEVER; posture $POSTURE; ${DURATION}s legs (+${WARMUP}s warm-up); numjobs $NUMJOBS iodepth $IODEPTH; scratch $SCRATCH"

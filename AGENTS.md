@@ -21,16 +21,30 @@ take the better design and add a row to the ledger in decision 0002 before diver
 
 ## Venue
 
-Linux only (charter §1.2). The dev box is macOS; there are two Linux venues, both
-reached through `scripts/venue`:
-- `vm` (default): the macOS `container` `sqz-zig` — aarch64, Ubuntu 24.04 on the
-  **7.2.6-sqz** kernel series, Zig 0.17.0, this repo mounted rw at the same path.
+Linux only (charter §1.2). Every Linux venue is reached through `scripts/venue`, runs on
+the **7.2.6-sqz** kernel series (`scripts/kernel/patches-7.2/`) with Zig 0.17.0 and the repo
+at the same absolute path, and runs commands as root:
+- `local` (`SQZ_VENUE=local`; the default when the controller is Linux): THIS host —
+  commands run through `sudo` in this tree, no sync, no VM. Set it up once with
+  `scripts/dev/provision-local-venue` (checks the distro, zig on root's PATH, the sqz kernel
+  and `fuse.enable_uring`, the nvmet/brd/null_blk modules, the packages, the build root,
+  passwordless sudo; prints each fix; `--apply` does the packages, modules, IOR/mdtest and
+  directories — never a kernel install or a reboot). The kernel:
+  `scripts/kernel/build-host-kernel --local` builds and installs the .debs here; reboot
+  into it yourself. Build slots: one per 4 threads and per 8 GiB (`SQZ_VENUE_SLOTS`
+  overrides; every controller of one build root must agree).
+- `vm` (the default on the Mac): the macOS `container` `sqz-zig` — aarch64, Ubuntu 24.04,
+  this repo mounted rw at the same path.
 - `kamrui` (`SQZ_VENUE=kamrui`): the x86_64 box `kamrui-dev` over ssh — 12 threads,
   61 GiB, local NVMe; the repo rsynced to the same path before every command.
 
+One venue covers one architecture: a local x86_64 workstation needs a second venue for
+aarch64 (the Mac's `vm`, or an arm64 box over ssh), and the gate train runs on every venue
+in `GATE_TRAIN_VENUES` (default `local` on Linux, `vm kamrui` on the Mac).
+
 ```
-scripts/venue up                 # create the container once
-scripts/venue status             # kernel / zig / fuse facts
+scripts/venue up                 # vm: create the container; local: the provisioning check
+scripts/venue status             # kernel / zig / fuse / nvmet modules / build-root space
 scripts/venue zig build gate     # the full gate, in Linux (the gate train runs it)
 scripts/venue test "filter"      # unit tests matching a filter, in Linux
 zig build gate                   # optional local check on macOS: portable modules only
@@ -43,8 +57,11 @@ cgroups) compile their tests only on Linux — gate them in `src/squeezefs.zig` 
 
 ## Test data and disk
 
-`/build` (ext4 on the cache volume inside the VM) is where the gate's smoke runs: real block
-semantics, sparse files, fast. An external capacity disk is mounted at `/build/ext` when
+The build root `SQZ_BUILD_ROOT` (default `/build`; ext4 on the cache volume inside the VM,
+an ext4 LV on kamrui, an ext4 filesystem of its own on a local workstation) holds the venue's
+gate lock, build slots and zig caches, and is where the gate's smoke runs: real block
+semantics, sparse files, fast. The product's tests write under `/build/tmp`, so a root
+elsewhere needs `/build` linked to it (the provisioning check says so). An external capacity disk is mounted at `/build/ext` when
 `SQZ_EXT_DIR` (default `/Volumes/512GB/sqz-tmp`) exists at `scripts/venue up`: HFS+ over USB
 through virtiofs — **no sparse files** (`truncate -s 8G` costs 8 GB), ~40 MB/s writes, reads
 served from the Mac's cache, so use it for capacity-class experiments by hand (large volumes,
@@ -84,8 +101,8 @@ lands like this:
   rows); rebase, `--ff-only`, done. No full gate of your own.
 - **Full tier** (on-disk format, wire protocol, a lock-free core or its model, the FUSE
   contract, the durability or coherence laws): the light tier plus ONE full venue gate
-  before landing (`scripts/venue 'timeout 3900 zig build --cache-dir /build/zig-cache-v2
-  gate --summary all'` — serialized by `flock /build/.gate.lock`; never launched from a
+  before landing (`scripts/venue 'timeout 3900 zig build --cache-dir "$SQZ_BUILD_ROOT"/zig-cache-v2
+  gate --summary all'` — serialized by `flock $SQZ_BUILD_ROOT/.gate.lock`; never launched from a
   script inside the container, never under extra load). No post-landing gates: the train
   runs them.
 - **Landing publishes**: a fast-forward of `dev` (and any commit on `dev`) is pushed to
@@ -96,7 +113,7 @@ lands like this:
   has it.
 - Evidence notes stay under a page: what changed, why, the red test, the numbers.
 - **Venue resources**: `scripts/venue` admits ONE full gate at a time (it holds every build
-  slot) and at most two other builds (three on kamrui). A heavy command that is not a
+  slot) and at most two other builds (three on kamrui; `nproc`/4 and GiB/8 locally). A heavy command that is not a
   `zig build` — a loop of smoke rows, daemons, `yes` load — runs as
   `SQZ_VENUE_SLOT=1 scripts/venue '…'` so it takes a slot too and never starves a gate.
   `SQZ_VENUE=kamrui` selects the x86_64 box; `scripts/venue pull <path>` brings back what

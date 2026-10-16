@@ -1,0 +1,145 @@
+#!/usr/bin/env bash
+# provision-local-venue — check THIS Linux host as the `local` venue (scripts/venue with
+# SQZ_VENUE=local, the default on Linux): gates, perf runs and kernel builds run here natively,
+# as root through sudo. Idempotent: every fact prints as `ok` or `MISSING` with its fix.
+#
+#   scripts/dev/provision-local-venue           # check only; exit 1 when something is missing
+#   scripts/dev/provision-local-venue --apply   # also fix what is safe to fix, then re-check:
+#       apt-install the missing packages, then scripts/dev/provision-ssh-venue (the nvmet
+#       modules loaded and persisted, the nvme_core boot parameter, IOR/mdtest into
+#       /opt/sqz-tools, root-MPI env, the build root's directories)
+#
+# Never done here: a kernel install (scripts/kernel/build-host-kernel --local), a reboot, a
+# filesystem, LV or sudoers change — those print as commands to run.
+set -uo pipefail
+
+REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+ROOT=${SQZ_BUILD_ROOT:-/build}
+REF=${SQZ_REFERENCE:-$HOME/Source/squeezefs}
+ZIG_WANT=0.17.0
+KVER=7.2.6-sqz
+apply=0
+case "${1:-}" in --apply) apply=1 ;; '') ;; *) echo "usage: provision-local-venue [--apply]" >&2; exit 2 ;; esac
+
+missing=0
+ok() { printf '  ok       %s\n' "$*"; }
+note() { printf '  note     %s\n' "$*"; }
+miss() { printf '  MISSING  %s\n' "$1"; shift; for l in "$@"; do printf '           → %s\n' "$l"; done; missing=$((missing + 1)); }
+
+[ "$(uname -s)" = Linux ] || { echo "provision-local-venue: this host is $(uname -s); on macOS the venue is the vm (scripts/venue up)" >&2; exit 2; }
+. /etc/os-release
+echo "== host: $PRETTY_NAME, $(uname -m), $(nproc) threads, $(awk '/^MemTotal:/ { print int($2 / 1048576) }' /proc/meminfo) GiB"
+case $ID in ubuntu | debian) ;; *) note "$ID is untested: the scripts assume apt, dpkg and bindeb-pkg" ;; esac
+note "one architecture per venue: $(uname -m) here; the other architecture's coverage needs a second venue (the Mac's vm for aarch64, or an ssh box)"
+[ "$ID-$VERSION_ID" = ubuntu-26.04 ] && note "Ubuntu 26.04 ships uutils coreutils — already handled: dd ftruncates its output after the last write (the smoke writes with conv=notrunc); 'sync FILE' is a host-wide sync(2) (tests/rails.zig's sync scanner counts it)"
+
+echo "== sudo"
+if sudo -n true 2>/dev/null; then
+  ok "passwordless sudo (scripts/venue runs every command as root, without a terminal)"
+else
+  miss "passwordless sudo" "echo '$(id -un) ALL=(ALL) NOPASSWD: ALL' | sudo tee /etc/sudoers.d/sqz-venue && sudo chmod 440 /etc/sudoers.d/sqz-venue"
+fi
+
+echo "== zig $ZIG_WANT"
+zig_fix="curl -fsSL https://ziglang.org/download/$ZIG_WANT/zig-$(uname -m)-linux-$ZIG_WANT.tar.xz | sudo tar -xJ -C /opt && sudo ln -sfn /opt/zig-$(uname -m)-linux-$ZIG_WANT/zig /usr/local/bin/zig"
+v=$(zig version 2>/dev/null)
+[ "$v" = "$ZIG_WANT" ] && ok "zig $v on PATH" || miss "zig $ZIG_WANT on PATH (have: ${v:-none})" "$zig_fix"
+v=$(sudo -n bash -lc 'zig version' 2>/dev/null)
+[ "$v" = "$ZIG_WANT" ] && ok "zig $v on root's login PATH (sudo bash -lc)" || miss "zig $ZIG_WANT on root's login PATH (have: ${v:-none})" "$zig_fix"
+
+echo "== kernel"
+kr=$(uname -r)
+if [ "$kr" = "$KVER" ]; then ok "kernel $kr"; else
+  miss "the sqz kernel $KVER (running $kr): FUSE over io_uring, kmbuf, syncfs — patches 0001–0029" \
+    "scripts/kernel/build-host-kernel --local   # builds + installs the .debs (never reboots)" "then REBOOT into $KVER"
+fi
+if [ -e /sys/module/fuse/parameters/enable_uring ]; then ok "fuse.enable_uring=$(cat /sys/module/fuse/parameters/enable_uring) (the tests set it)"; else
+  miss "fuse.enable_uring (FUSE_IO_URING: a mount has no classical fallback, charter §1.2)" "the sqz kernel (above)"
+fi
+v=$(cat /proc/sys/kernel/io_uring_disabled 2>/dev/null || echo 0)
+[ "$v" = 0 ] && ok "io_uring enabled" || miss "io_uring (kernel.io_uring_disabled=$v)" "echo kernel.io_uring_disabled=0 | sudo tee /etc/sysctl.d/60-sqz-io-uring.conf && sudo sysctl --system"
+lack=""
+for m in nvmet nvme_loop nvmet_tcp nvme_tcp nvme_fabrics tls brd null_blk; do
+  [ -d "/sys/module/$m" ] || modprobe -n "$m" 2>/dev/null || lack="$lack $m"
+done
+[ -z "$lack" ] && ok "modules nvmet nvme_loop nvmet_tcp nvme_tcp nvme_fabrics tls brd null_blk available" \
+  || miss "modules:$lack (the nvmet, NVMe-oF, kTLS and RAM-namespace rows)" "a kernel config that has them: build-host-kernel loads every sqz module before localmodconfig"
+[ -f /etc/modules-load.d/sqz.conf ] && ok "nvmet modules persisted (/etc/modules-load.d/sqz.conf)" \
+  || miss "the nvmet modules loaded at boot" "scripts/dev/provision-local-venue --apply"
+grep -q 'nvme_core.fabrics_host_scoped_subsystems=Y' /proc/cmdline && ok "nvme_core.fabrics_host_scoped_subsystems=Y (the nvmet two-identity rows)" \
+  || miss "nvme_core.fabrics_host_scoped_subsystems=Y on the kernel command line (the nvmet two-identity rows)" "scripts/dev/provision-local-venue --apply (persists it in GRUB), then reboot"
+
+echo "== packages"
+lock=$REPO/scripts/suites/apt.$ID-$VERSION_ID.lock
+pkgs=()
+if [ -f "$lock" ]; then mapfile -t pkgs < <(cut -d= -f1 "$lock"); else note "no suites lock for $ID-$VERSION_ID (scripts/suites/apt.*.lock): the first suite run pins one"; fi
+# The instruments and the venue's own tools; then build-host-kernel's build dependencies
+# (debhelper provides the debhelper-compat it installs).
+pkgs+=(fio nvme-cli fuse3 util-linux e2fsprogs rsync curl git python3 openssl openmpi-bin libopenmpi-dev
+  build-essential flex bison bc cpio dwarves libelf-dev libdw-dev libssl-dev zstd debhelper)
+lackp=()
+for p in $(printf '%s\n' "${pkgs[@]}" | sort -u); do dpkg -s "$p" >/dev/null 2>&1 || lackp+=("$p"); done
+[ ${#lackp[@]} = 0 ] && ok "${#pkgs[@]} packages (suites lock, instruments, kernel build deps)" \
+  || miss "packages: ${lackp[*]}" "sudo apt-get install -y --no-install-recommends ${lackp[*]}   # or --apply"
+if PATH=/opt/sqz-tools/bin:$PATH command -v ior >/dev/null && PATH=/opt/sqz-tools/bin:$PATH command -v mdtest >/dev/null; then
+  ok "ior/mdtest ($(PATH=/opt/sqz-tools/bin:$PATH command -v ior))"
+else
+  miss "ior/mdtest at io500's pinned hash" "scripts/dev/provision-local-venue --apply (builds them into /opt/sqz-tools)"
+fi
+git -C "$REF" cat-file -e '44752ce5^{commit}' 2>/dev/null && ok "the Rust reference at $REF (kernel patches 0001–0026, porting)" \
+  || miss "the Rust reference at $REF with commit 44752ce5 (build-host-kernel's patches 0001–0026; read-only porting evidence)" "git clone git@github.com:flipfloptech/squeezefs.git $REF   # or set SQZ_REFERENCE"
+
+echo "== build root $ROOT (SQZ_BUILD_ROOT)"
+if [ -d "$ROOT" ]; then
+  real=$(readlink -f "$ROOT")
+  fstype=$(findmnt -no FSTYPE -T "$real")
+  src=$(findmnt -no SOURCE -T "$real")
+  avail=$(df -BG --output=avail "$real" | tail -1 | tr -dc 0-9)
+  case $fstype in
+    ext4) ok "$real: ext4 on $src" ;;
+    xfs | btrfs) ok "$real: $fstype on $src (ext4 is what the venues measure on)" ;;
+    *) miss "a real local filesystem at $real (it is $fstype on $src)" "ext4 recommended: real block semantics and sparse files (tmpfs, overlay, nfs, fuse and virtiofs change what the smoke measures)" ;;
+  esac
+  # A 30 GB zig cache cap (scripts/venue trim) + a gate's smoke volumes + the perf targets.
+  [ "${avail:-0}" -ge 50 ] && ok "$avail GiB free" || miss "≥ 50 GiB free at $real (have ${avail:-0} GiB)" "grow it (lvextend -r) or free space: scripts/venue trim"
+  if t=$(sudo -n mktemp -p "$real" .sparse-probe.XXXXXX 2>/dev/null); then
+    sudo -n truncate -s 1G "$t"
+    used=$(sudo -n du -k "$t" | cut -f1)
+    sudo -n rm -f "$t"
+    [ "$used" -lt 1024 ] && ok "sparse files" || miss "sparse files (a 1 GiB truncate took $used KiB)" "put the build root on ext4"
+  fi
+  [ "$(lsblk -dno DISC-MAX "$src" 2>/dev/null | tr -d ' ')" != 0B ] && ok "discard (scripts/venue trim runs fstrim)" \
+    || note "$src has no discard: scripts/venue trim prunes and skips fstrim"
+  for d in zig-cache-v2 zig-global-cache tmp; do [ -d "$real/$d" ] || lackd="${lackd:-} $d"; done
+  [ -z "${lackd:-}" ] && ok "zig-cache-v2 zig-global-cache tmp" || miss "build-root directories:$lackd" "scripts/dev/provision-local-venue --apply"
+  # The product's tests and the smoke's defaults write under /build/tmp.
+  [ "$(readlink -f /build)" = "$real" ] && ok "/build resolves to the build root" \
+    || miss "/build → $real (the product's tests write under /build/tmp)" "sudo ln -sfn $real /build"
+else
+  vgs=$(sudo -n vgs --noheadings --units g -o vg_name,vg_free 2>/dev/null | awk '{ printf "%s (%s free) ", $1, $2 }')
+  if [ -n "$vgs" ]; then
+    vg=$(sudo -n vgs --noheadings -o vg_name 2>/dev/null | awk 'NR==1 { print $1 }')
+    miss "the build root $ROOT: an ext4 filesystem of its own (volume groups here: $vgs)" \
+      "sudo lvcreate -L 300G -n sqzbuild $vg && sudo mkfs.ext4 -L sqzbuild /dev/$vg/sqzbuild" \
+      "sudo mkdir -p $ROOT && echo '/dev/$vg/sqzbuild $ROOT ext4 defaults,noatime 0 2' | sudo tee -a /etc/fstab && sudo systemctl daemon-reload && sudo mount $ROOT" \
+      "then: scripts/dev/provision-local-venue --apply"
+  else
+    miss "the build root $ROOT: an ext4 filesystem of its own (a spare disk or partition; no LVM here)" \
+      "sudo mkfs.ext4 -L sqzbuild /dev/<disk-or-partition> && sudo mkdir -p $ROOT && echo 'LABEL=sqzbuild $ROOT ext4 defaults,noatime 0 2' | sudo tee -a /etc/fstab && sudo mount $ROOT" \
+      "(or a directory on an ext4 root fs: sudo mkdir -p $ROOT) — then: scripts/dev/provision-local-venue --apply"
+  fi
+fi
+
+if [ "$apply" = 1 ]; then
+  echo "== apply"
+  [ ${#lackp[@]} = 0 ] || sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${lackp[@]}" || exit 1
+  if [ -d "$ROOT" ]; then sudo SQZ_BUILD_ROOT="$(readlink -f "$ROOT")" bash "$REPO/scripts/dev/provision-ssh-venue" || exit 1
+  else echo "provision-local-venue: no build root $ROOT yet — create it (above), then --apply again" >&2; fi
+  echo "== re-check"
+  exec bash "$0"
+fi
+
+if [ "$missing" = 0 ]; then echo "local venue: ready (scripts/venue status; scripts/venue zig build gate)"; else
+  echo "local venue: $missing missing — fix them as shown (--apply does the packages, modules, tools and directories)"
+  exit 1
+fi

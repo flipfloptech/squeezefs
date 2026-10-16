@@ -105,7 +105,9 @@ ver=$([ -x "$BIN" ] && "$BIN" --version 2>/dev/null || true)
 have=$(echo "$ver" | sed -n 's/.*(\([0-9a-f]*\)[^,]*,.*/\1/p')
 if [ "$REBUILD" = 1 ] || [ "$have" != "$head" ] || ! echo "$ver" | grep -q "dist profile"; then
   echo "perf_mount: building the DIST profile at $head (ReleaseSafe + fat LTO; several minutes) …"
-  if [ "$MODE" = container ]; then export ZIG_GLOBAL_CACHE_DIR=/build/zig-global-cache; cachearg=(--cache-dir /build/zig-cache-perf); else cachearg=(); fi
+  # The container's /build is its own volume; natively, the venue's build root when there is one.
+  croot=/build; [ "$MODE" = container ] || croot=${SQZ_BUILD_ROOT:-/build}
+  if [ -d "$croot" ]; then export ZIG_GLOBAL_CACHE_DIR=$croot/zig-global-cache; cachearg=(--cache-dir "$croot/zig-cache-perf"); else cachearg=(); fi
   ( cd "$REPO" && zig build ${cachearg[@]+"${cachearg[@]}"} -Dprofile=dist --prefix zig-out-perf dist shim ) \
     || die "the dist build failed (in the container a compiler killed by signal KILL is memory: SQZ_PERF_MEM)"
   ver=$("$BIN" --version)

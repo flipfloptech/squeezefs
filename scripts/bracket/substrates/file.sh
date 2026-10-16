@@ -13,7 +13,7 @@ FILE_LOOPS=()
 
 substrate_up() {   # bin nsets
   local nsets=$2 s v disk loop
-  disk=$(backing_disk_of /build)
+  disk=$(backing_disk_of ${SQZ_BUILD_ROOT:-/build})
   META_DEV=(); DATA_DEVS_BY_SET=(); META_DISK_DEVS_BY_SET=(); DATA_DISK_DEVS_BY_SET=()
   DISK_DEVS=("$disk")
   for s in $(seq 0 $((nsets - 1))); do
@@ -31,7 +31,7 @@ substrate_up() {   # bin nsets
     DATA_DEVS_BY_SET[$s]=$list
     DATA_DISK_DEVS_BY_SET[$s]=$disk
   done
-  SUBSTRATE_DESC="file-backed sparse volumes on /build ($(findmnt -no FSTYPE /build) on /dev/$disk, shared disk: the data diskstats ratio is an upper bound); metadata on a dedicated loop device per set (${META_DEV[*]}, exclusive diskstats)"
+  SUBSTRATE_DESC="file-backed sparse volumes on ${SQZ_BUILD_ROOT:-/build} ($(findmnt -no FSTYPE ${SQZ_BUILD_ROOT:-/build}) on /dev/$disk, shared disk: the data diskstats ratio is an upper bound); metadata on a dedicated loop device per set (${META_DEV[*]}, exclusive diskstats)"
   log "substrate: $SUBSTRATE_DESC"
 }
 

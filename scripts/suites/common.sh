@@ -41,9 +41,9 @@ SQZ_BIN=${SQZ_BIN:-$REPO/zig-out-linux/bin/squeezefs}
 export -n SQZ_BIN
 # Clones and builds persist on the cache volume between runs; their build
 # artefacts are deleted when a suite's run is over (`suite_clean_build`).
-SUITES_ROOT=${SUITES_ROOT:-/build/suites}
+SUITES_ROOT=${SUITES_ROOT:-${SQZ_BUILD_ROOT:-/build}/suites}
 # Volumes, mountpoints, results: bounded, trimmed.
-SUITES_TMP=${SUITES_TMP:-/build/tmp}
+SUITES_TMP=${SUITES_TMP:-${SQZ_BUILD_ROOT:-/build}/tmp}
 SUITE_META_MIB=${SUITE_META_MIB:-1024}
 SUITE_DATA_GIB=${SUITE_DATA_GIB:-8}
 # The release posture; see the module comment for each option's WHY.

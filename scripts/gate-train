@@ -11,7 +11,8 @@
 #
 #   scripts/gate-train            # loop forever (run it as a monitor)
 #   scripts/gate-train --once     # gate dev's head once and exit
-#   GATE_TRAIN_VENUES="vm kamrui" # the venues (default: vm); see scripts/venue
+#   GATE_TRAIN_VENUES="vm kamrui" # the venues (default: local on Linux, vm kamrui on macOS);
+#                                 # see scripts/venue
 #
 # State lives in .gate-train/ (ignored): ledger.tsv (utc, sha, verdict, one
 # venue:result:wall field per venue, failures) and each run's logs. The train
@@ -25,7 +26,7 @@ export LC_ALL=C
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 STATE=$REPO/.gate-train
 TRAIN=$REPO/.wt-train
-VENUES=${GATE_TRAIN_VENUES:-vm}
+if [ "$(uname -s)" = Linux ]; then VENUES=${GATE_TRAIN_VENUES:-local}; else VENUES=${GATE_TRAIN_VENUES:-vm kamrui}; fi
 POLL_S=${GATE_TRAIN_POLL_S:-300}   # how often an idle train looks for a new head
 WANT_STREAK=3                      # charter §11: three consecutive clean runs
 once=0; [ "${1:-}" = --once ] && once=1
@@ -61,9 +62,10 @@ run_once() {
   git -C "$TRAIN" checkout -q --detach "$sha" || return 1
   for v in $VENUES; do
     # One log per RUN: a retry on the same head must not overwrite the failure it retries.
+    # ($SQZ_BUILD_ROOT expands on the venue: scripts/venue exports each venue's build root.)
     log=$STATE/$v-$sha-$(date -u +%Y%m%dT%H%M%SZ).log
     t0=$(date +%s)
-    SQZ_VENUE=$v "$REPO/scripts/venue" "cd '$TRAIN' && timeout 3900 zig build --cache-dir /build/zig-cache-v2 -Dfresh=true gate --summary all" > "$log" 2>&1
+    SQZ_VENUE=$v "$REPO/scripts/venue" "cd '$TRAIN' && timeout 3900 zig build --cache-dir \"\$SQZ_BUILD_ROOT\"/zig-cache-v2 -Dfresh=true gate --summary all" > "$log" 2>&1
     rc=$?
     wall=$(( $(date +%s) - t0 ))
     if [ $rc -eq 0 ]; then res=green; else res=red; verdict=red; fails="$fails${fails:+;}$(failures "$log" | sed "s/^/$v:/; s/;/;$v:/g")"; fi

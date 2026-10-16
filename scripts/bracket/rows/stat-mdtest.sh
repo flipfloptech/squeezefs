@@ -9,7 +9,7 @@ ROW_NEEDS_SHIM=0
 MDTEST=${MDTEST:-$BRK_TOOLS/mdtest}
 MD_NP=${MD_NP:-$BRK_NUMJOBS}
 MD_ITEMS=${MD_ITEMS:-25000}
-ROW_INSTRUMENT="mdtest (ior $(cd /build/tools/src/ior-io500 2>/dev/null && git describe --tags --always 2>/dev/null || echo io500-sc19-605-g5528b36)) -T -F -u -z 2 -b 8 -n $MD_ITEMS over a tree created once, mpirun -np $MD_NP"
+ROW_INSTRUMENT="mdtest (ior $(cd ${SQZ_BUILD_ROOT:-/build}/tools/src/ior-io500 2>/dev/null && git describe --tags --always 2>/dev/null || echo io500-sc19-605-g5528b36)) -T -F -u -z 2 -b 8 -n $MD_ITEMS over a tree created once, mpirun -np $MD_NP"
 
 row_prepare() {   # mnt
   local mnt=$1 dir="$1/mdtest-stat"

@@ -1,10 +1,16 @@
 #!/usr/bin/env bash
 # build-host-kernel — build the sqz kernel (linux 7.2.6 + the series) natively on
-# a Debian/Ubuntu x86_64 HOST reached over ssh, as .deb packages, and install it.
+# a Debian/Ubuntu HOST — one reached over ssh, or this one (--local) — as .deb
+# packages, and install it.
 #
 #   scripts/kernel/build-host-kernel <ssh-host>               # build + install (no reboot)
 #   scripts/kernel/build-host-kernel <ssh-host> --no-install  # build the .debs only
 #   scripts/kernel/build-host-kernel <ssh-host> --status      # tail the remote build log
+#   scripts/kernel/build-host-kernel --local [--no-install | --status]   # the same, on this host
+#
+# The build runs in the background under nohup in $SQZ_BUILD_ROOT/kernel (default
+# /build/kernel) on the target; its log is build.log there. Nothing here reboots:
+# the new kernel runs after the reboot whoever owns the host schedules.
 #
 # --no-install stops after bindeb-pkg: the log ends with the packages' absolute
 # paths and the `sudo dpkg -i` line that installs them, for whoever coordinates
@@ -26,23 +32,31 @@
 # distro kernel stays in the menu as the fallback).
 set -euo pipefail
 
-HOST=${1:?usage: build-host-kernel <ssh-host> [--no-install | --status]}
+HOST=${1:?usage: build-host-kernel <ssh-host> | --local [--no-install | --status]}
+[ "$HOST" = --local ] && HOST=
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 REF=${SQZ_REFERENCE:-$HOME/Source/squeezefs}
 REF_COMMIT=44752ce5
 KVER=7.2.6
 SSH=(ssh -o BatchMode=yes -o LogLevel=ERROR)
-RDIR=/build/kernel
+ROOT=${SQZ_BUILD_ROOT:-/build}
+RDIR=$ROOT/kernel
+# A shell command on the target: over ssh, or here.
+on() { if [ -n "$HOST" ]; then "${SSH[@]}" "$HOST" "$1"; else bash -c "$1"; fi; }
+at() { echo "${HOST:+$HOST:}$1"; }
+WHERE=${HOST:-this host}
 
 INSTALL=1
 case "${2:-}" in
-  --status) exec "${SSH[@]}" "$HOST" "tail -5 $RDIR/build.log; ls $RDIR/*.deb 2>/dev/null" ;;
+  --status) on "tail -5 $RDIR/build.log; ls $RDIR/*.deb 2>/dev/null"; exit ;;
   --no-install) INSTALL=0 ;;
   '') ;;
   *) echo "build-host-kernel: unknown option '$2' (--no-install | --status)" >&2; exit 2 ;;
 esac
 
 # The series and the fragment, assembled on this side.
+git -C "$REF" cat-file -e "$REF_COMMIT^{commit}" 2>/dev/null \
+  || { echo "build-host-kernel: the reference recipe $REF_COMMIT (patches 0001–0026) is not in $REF — clone the Rust reference there or set SQZ_REFERENCE" >&2; exit 1; }
 stage=$(mktemp -d /tmp/sqz-hostkernel.XXXXXX)
 trap 'rm -rf "$stage"' EXIT
 git -C "$REF" archive "$REF_COMMIT" docker/kernel-sqz/patches-7.2 docker/kernel-sqz/config-fragment | tar -x -C "$stage"
@@ -57,17 +71,17 @@ cp "$REPO"/scripts/kernel/patches-7.2/*.patch "$stage/patches/"
 } > "$stage/fragment"
 echo "series: $(ls "$stage/patches" | wc -l) patches; fragment: $(grep -c '^CONFIG_' "$stage/fragment") entries"
 
-"${SSH[@]}" "$HOST" "sudo mkdir -p $RDIR && sudo chown \$(id -un) $RDIR"
-rsync -a --delete -e "${SSH[*]}" "$stage/patches/" "$HOST:$RDIR/patches/"
-rsync -a -e "${SSH[*]}" "$stage/fragment" "$HOST:$RDIR/fragment"
+on "sudo mkdir -p $RDIR && sudo chown \$(id -un) $RDIR"
+rsync -a --delete -e "${SSH[*]}" "$stage/patches/" "$(at "$RDIR/patches/")"
+rsync -a -e "${SSH[*]}" "$stage/fragment" "$(at "$RDIR/fragment")"
 
-# The remote half (runs under nohup; its log is $RDIR/build.log).
-"${SSH[@]}" "$HOST" "cat > $RDIR/build.sh" <<'REMOTE'
+# The target's half (runs under nohup; its log is $RDIR/build.log).
+on "cat > $RDIR/build.sh" <<'REMOTE'
 #!/usr/bin/env bash
 set -euo pipefail
 # A failed step says so in the log (set -e alone exits silently).
 trap 'echo "BUILD FAILED at line $LINENO: $BASH_COMMAND"' ERR
-cd /build/kernel
+cd "$(dirname "$0")"
 # bindeb-pkg's build dependencies (dpkg-checkbuilddeps refuses without libdw-dev, etc.).
 sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq build-essential flex bison bc cpio \
   dwarves libelf-dev libdw-dev libssl-dev zstd rsync debhelper-compat >/dev/null
@@ -109,13 +123,14 @@ while IFS= read -r line; do
 done < ../fragment
 [ "$fail" = 0 ] || { echo "config checklist FAILED"; exit 1; }
 echo "checklist OK; modules: $(grep -c '=m$' .config)"
-# On a venue box (scripts/venue's locks under /build) the whole-box make holds the
-# gate lock and every build slot, as a full gate does, so it never runs beside one.
+# On a venue box (scripts/venue's locks under the build root) the whole-box make holds
+# the gate lock and every build slot, as a full gate does, so it never runs beside one.
+root=${SQZ_BUILD_ROOT:-/build}
 locks=()
-if [ -e /build/.gate.lock ]; then
-  locks=(flock -o /build/.gate.lock)
-  for s in /build/.build-slot.*; do [ -e "$s" ] && locks+=(flock -o "$s"); done
-  flock -o -n /build/.gate.lock true || echo "== waiting for the venue's gate lock and build slots $(date)"
+if [ -e "$root/.gate.lock" ]; then
+  locks=(flock -o "$root/.gate.lock")
+  for s in "$root"/.build-slot.*; do [ -e "$s" ] && locks+=(flock -o "$s"); done
+  flock -o -n "$root/.gate.lock" true || echo "== waiting for the venue's gate lock and build slots $(date)"
 fi
 "${locks[@]}" bash -c 'echo "== build ($(nproc) jobs) $(date)"; make -j"$(nproc)" bindeb-pkg LOCALVERSION= >../make.log 2>&1' \
   || { tail -30 ../make.log; exit 1; }
@@ -123,6 +138,9 @@ echo "== built $(date)"
 image=$(readlink -f ../linux-image-${KVER}-sqz_*.deb)
 headers=$(readlink -f ../linux-headers-${KVER}-sqz_*.deb)
 echo "$image"; echo "$headers"
+if [ "$(uname -r)" = "${KVER}-sqz" ]; then
+  echo "== NOTE: this host runs ${KVER}-sqz now: installing replaces the running kernel's /lib/modules — install and reboot together"
+fi
 if [ "${INSTALL:-1}" = 0 ]; then
   echo "== not installed (--no-install); install, then reboot: sudo dpkg -i $image $headers"
   echo "BUILD-OK"
@@ -131,9 +149,10 @@ fi
 echo "== install"
 sudo dpkg -i "$image" "$headers"
 echo "== GRUB default entry:"; sudo grep -m1 -E "^\s*menuentry " /boot/grub/grub.cfg | cut -c1-120
+echo "== installed; REBOOT this host into ${KVER}-sqz to run it (nothing here reboots), then check: uname -r; cat /sys/module/fuse/parameters/enable_uring"
 echo "BUILD-AND-INSTALL-OK"
 REMOTE
 # Background the build alone: a backgrounded and-list is a subshell holding ssh's
 # streams, and ssh waited out the whole build.
-"${SSH[@]}" "$HOST" "chmod +x $RDIR/build.sh && cd $RDIR && { INSTALL=$INSTALL nohup ./build.sh > build.log 2>&1 < /dev/null & } && echo started"
-echo "remote build started on $HOST — follow with: scripts/kernel/build-host-kernel $HOST --status"
+on "chmod +x $RDIR/build.sh && cd $RDIR && { INSTALL=$INSTALL SQZ_BUILD_ROOT=$ROOT nohup ./build.sh > build.log 2>&1 < /dev/null & } && echo started"
+echo "build started on $WHERE — follow with: scripts/kernel/build-host-kernel ${HOST:---local} --status (log $RDIR/build.log; the host needs a reboot after the install)"

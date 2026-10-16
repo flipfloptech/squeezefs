@@ -50,10 +50,10 @@ case "$S" in
     for e in $LVS; do [ -e "/dev/$VG/${e%%:*}" ] && lvremove -q -y "$VG/${e%%:*}"; done
     lvs "$VG" ;;
   slc)
-    quiet; blkdiscard "/dev/$VG/perf-slc"; mkdir -p /build/perf
+    quiet; blkdiscard "/dev/$VG/perf-slc"; mkdir -p ${SQZ_BUILD_ROOT:-/build}/perf
     fio --name=slc --filename="/dev/$VG/perf-slc" --rw=write --bs=1m --iodepth=16 --direct=1 --ioengine=io_uring \
-      --size=56g --write_bw_log=/build/perf/slc --log_avg_msec=5000 --output-format=terse >/dev/null
-    awk -F, '{printf "%ds %.0f MiB/s\n", $1/1000, $2/1024}' /build/perf/slc_bw.1.log
+      --size=56g --write_bw_log=${SQZ_BUILD_ROOT:-/build}/perf/slc --log_avg_msec=5000 --output-format=terse >/dev/null
+    awk -F, '{printf "%ds %.0f MiB/s\n", $1/1000, $2/1024}' ${SQZ_BUILD_ROOT:-/build}/perf/slc_bw.1.log
     blkdiscard "/dev/$VG/perf-slc" ;;
   ssd-raw)
     quiet; blkdiscard "/dev/$VG/perf-ref"; "$HERE/matrix.sh" "/dev/$VG/perf-ref" "$L" ;;

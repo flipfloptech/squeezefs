@@ -1512,7 +1512,8 @@ pub const KvBackend = struct {
     fn acquireWriterFlock(gpa: Allocator, io: Io, path: []const u8, opts: OpenOptions) OpenError!linux.fd_t {
         const fd = try openGuardFd(path);
         errdefer _ = linux.close(fd);
-        switch (guard.proc.flockExclusive(io, fd, &stats.guard_shared_lock_waits)) {
+        var locker: ?guard.proc.Holder = null;
+        switch (guard.proc.flockExclusive(io, fd, &stats.guard_shared_lock_waits, &locker)) {
             .SUCCESS => return fd,
             .AGAIN => {
                 if (!opts.join_door) stats.guard_busy_refusals.inc();
@@ -1537,7 +1538,10 @@ pub const KvBackend = struct {
                 if (opts.join_door) {
                     log.info("meta volume {s}: volume 0 is held by the manager{s}; joining as appender over the wire", .{ path, w.buffered() });
                 } else {
-                    log.err("meta volume {s}: another squeezefs process holds the writer lock{s} — concurrent mounts of one metadata volume are refused (single-writer guard, EBUSY)", .{ path, w.buffered() });
+                    var lb: [192]u8 = undefined;
+                    var lw: Io.Writer = .fixed(&lb);
+                    guard.proc.writeLocker(&lw, locker) catch {};
+                    log.err("meta volume {s}: {s}{s} — concurrent mounts of one metadata volume are refused (single-writer guard, EBUSY)", .{ path, lw.buffered(), w.buffered() });
                 }
                 return error.Busy;
             },

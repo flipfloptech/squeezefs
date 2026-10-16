@@ -5396,7 +5396,7 @@ test "smoke: --daemon --supervise --log-file: the invoking process returns 0 onl
     try testing.expect(std.mem.indexOf(u8, after, "exited (wait status 0x0); done") != null);
     try testing.expectEqual(@as(usize, 0), try fuseMountsOf(gpa, io, rig.mp));
     // Nothing of ours survives: no squeezefs process holds the volume.
-    try testing.expect(!@import("status.zig").writerGuardHeld(rig.img));
+    try testing.expect(!@import("status.zig").writerGuardHeld(testing.io, rig.img));
 }
 
 /// A process whose cwd is the mount (the holder of the busy-umount rows):
@@ -5531,7 +5531,7 @@ test "smoke: umount of a BUSY mount (another process's cwd inside it) — the ve
     try testing.expect(std.mem.indexOf(u8, after[ready_i..], "clean unmount") != null);
     try expectSupervisorSilent(after[ready_i..]);
     try testing.expectEqual(@as(usize, 0), try fuseMountsOf(gpa, io, rig.mp));
-    try testing.expect(!status_verb.writerGuardHeld(rig.img));
+    try testing.expect(!status_verb.writerGuardHeld(testing.io, rig.img));
 }
 
 test "smoke: the stop's own sender reading `.stats` is no holder — a process opens `<mp>/.stats` and SIGTERMs the daemon with the fd open (what `squeezefs umount` does: its verdict poll opens `.stats` on its signal's heels — the matrix row's `is busy (0 holder(s))`): the daemon's census exempts the sender's control-document fds and unmounts — never `is busy`, never the lazy detach — and exits 0" {
@@ -5696,7 +5696,7 @@ test "smoke: `umount --lazy` of a BUSY mount — the verb returns at once naming
         try testing.expect(std.mem.indexOf(u8, after[lazy_mark..], "clean unmount") != null);
         try expectSupervisorSilent(after[ready_i..]);
     }
-    try testing.expect(!status_verb.writerGuardHeld(rig.img));
+    try testing.expect(!status_verb.writerGuardHeld(testing.io, rig.img));
     // 5. `--lazy` on an unheld mount: the orderly stop, nothing lazy.
     Io.Dir.cwd().deleteFile(io, stop_path) catch {};
     const mark2 = try rig.logLen();
@@ -5754,7 +5754,7 @@ test "smoke: a LATE bring-up refusal — the kmbuf ring answers ENOMEM (the seam
         // The retry ladder ran its bounded course before the refusal.
         try testing.expectEqual(@as(usize, transport.kmbuf.REGISTER_RETRIES), std.mem.count(u8, r.stderr, "refused ENOMEM — retry "));
         try testing.expectEqual(@as(usize, 0), try fuseMountsOf(gpa, io, rig.mp));
-        try testing.expect(!status_verb.writerGuardHeld(rig.img));
+        try testing.expect(!status_verb.writerGuardHeld(testing.io, rig.img));
     }
     // 2. The same sampler seam over a clean cycle: the stop's tick reads
     //    live sources on the serve-path teardown too; exit 0.

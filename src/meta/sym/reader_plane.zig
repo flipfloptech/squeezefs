@@ -238,7 +238,7 @@ pub const ReaderPlane = struct {
     /// this host; a heartbeat-fresh writer claim on any volume.
     fn writerLive(self: *ReaderPlane) bool {
         for (self.set.volumes) |be| {
-            if (proc.writerFlockHeld(be.path)) return true;
+            if (proc.writerFlockHeld(self.io, be.path, null)) return true;
             const raw = guard_gate.probeClaim(self.gpa, self.io, self.env, self.set.pool, be.path) catch continue;
             defer if (raw) |r| self.gpa.free(r);
             const c = claim.Claim.decode(raw orelse continue) catch continue;
@@ -356,7 +356,7 @@ pub const ReaderPlane = struct {
             rec.deinit(self.gpa);
             face = .ledger_advance;
         }
-        if (face == .none and proc.writerFlockHeld(be0.path)) face = .same_host_lock;
+        if (face == .none and proc.writerFlockHeld(self.io, be0.path, null)) face = .same_host_lock;
         self.quiescent.onPoll(face, self.mountpoint);
     }
 

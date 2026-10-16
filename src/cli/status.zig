@@ -120,8 +120,8 @@ pub fn probeForeignOnPath(gpa: std.mem.Allocator, env: *const std.process.Enviro
 
 /// Is a writer's layer-A guard held on `path` right now? Read off
 /// `/proc/locks`: the probe takes no lock of its own.
-pub fn writerGuardHeld(path: []const u8) bool {
-    return guard.proc.writerFlockHeld(path);
+pub fn writerGuardHeld(io: Io, path: []const u8) bool {
+    return guard.proc.writerFlockHeld(io, path, null);
 }
 
 /// The newest valid ledger record of a v4 volume (caller frees).
@@ -437,7 +437,7 @@ pub fn run(p: cli.Process, s: args.Status) u8 {
             }
         }
     }
-    writeReport(p.stdout, meta_uri, snap, rec, cfg, census.items, writerGuardHeld(path)) catch return cli.exit_failed;
+    writeReport(p.stdout, meta_uri, snap, rec, cfg, census.items, writerGuardHeld(p.io, path)) catch return cli.exit_failed;
     if (snap.prior == .formatted) {
         // The registrations (the claim holder under the ONE staleness law).
         if (guard.gate.clients(p.gpa, p.io, p.env, pool, path, null)) |rows| {
@@ -495,6 +495,6 @@ test "the report: a blank volume is one line; a v4 volume prints the superblock,
 }
 
 test "the writer-guard probe reads false on a path nobody locks and on a missing path" {
-    try testing.expect(!writerGuardHeld("/build/tmp/does-not-exist-status"));
-    try testing.expect(!writerGuardHeld("/proc/self/status"));
+    try testing.expect(!writerGuardHeld(testing.io, "/build/tmp/does-not-exist-status"));
+    try testing.expect(!writerGuardHeld(testing.io, "/proc/self/status"));
 }

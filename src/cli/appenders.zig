@@ -150,8 +150,8 @@ const OfflineVolume = struct {
     /// this host) read off `/proc/locks` — taking the lock to test it would
     /// refuse a racing writer, and a held SHARED lock is udev's block-device
     /// probe, never a mount (`guard.proc.flockExclusive`).
-    fn flockHeld(self: *const OfflineVolume) bool {
-        return guard.proc.writerFlockHeld(self.path);
+    fn flockHeld(self: *const OfflineVolume, io: Io) bool {
+        return guard.proc.writerFlockHeld(io, self.path, null);
     }
 
     /// Write (1): a raw page image to both directory slots, then `fsync`.
@@ -248,7 +248,8 @@ const ClearCtx = struct {
     }
 
     fn flockHeld(ctx: *anyopaque, vol0: bool) bool {
-        return self_(ctx).volOf(vol0).flockHeld();
+        const self = self_(ctx);
+        return self.volOf(vol0).flockHeld(self.sqz.io());
     }
 
     /// The claim's age through the gate's probe and the ONE classifier.

@@ -120,19 +120,28 @@ pub fn localIdentity() claim.Identity {
 /// busy host is a few hundred lines; 1 MiB holds thousands.
 const PROC_LOCKS_CAP: usize = 1 << 20;
 
-/// Is an exclusive `flock` (the D0 guard's layer A) held on `path` by any
-/// process of this host — read off `/proc/locks`, so the probe takes NO
-/// lock of its own (a `-o ro` reader "claims nothing", and a transient
-/// `LOCK_SH` would refuse a writer's `LOCK_EX | LOCK_NB` racing it).
+/// Is a writer's exclusive `flock` (the D0 guard's layer A) held on `path`
+/// on this host — read off `/proc/locks`, so the probe takes NO lock of its
+/// own (a `-o ro` reader "claims nothing", and a transient `LOCK_SH` would
+/// refuse a writer's `LOCK_EX | LOCK_NB` racing it). A locker that is not
+/// this binary (udev's re-read after a write-close, below) is waited out
+/// like `flockExclusive` does; one that outlasts the bound reads as held.
 /// Unreadable procfs reads as "no lock" (the claim face judges then).
-pub fn writerFlockHeld(path: []const u8) bool {
+/// `waits` counts each retry a locker caused.
+pub fn writerFlockHeld(io: Io, path: []const u8, waits: ?*counters.ShardedCounter) bool {
+    _ = io;
+    _ = waits;
+    return exclusiveLocker(path) != null;
+}
+
+/// The exclusive `flock` locker of `path`'s inode right now (one scan, no
+/// wait); null = none, or `path` / `/proc/locks` unreadable.
+pub fn exclusiveLocker(path: []const u8) ?Holder {
     var zbuf: [linux.PATH_MAX]u8 = undefined;
-    const z = std.fmt.bufPrintSentinel(&zbuf, "{s}", .{path}, 0) catch return false;
+    const z = std.fmt.bufPrintSentinel(&zbuf, "{s}", .{path}, 0) catch return null;
     var st: linux.Statx = undefined;
-    if (linux.errno(linux.statx(linux.AT.FDCWD, z, 0, .{ .INO = true }, &st)) != .SUCCESS) return false;
-    var buf: [PROC_LOCKS_CAP]u8 = undefined;
-    const text = readSmall("/proc/locks", &buf) orelse return false;
-    return flockHolderIn(text, st.dev_major, st.dev_minor, st.ino) != null;
+    if (linux.errno(linux.statx(linux.AT.FDCWD, z, 0, .{ .INO = true }, &st)) != .SUCCESS) return null;
+    return lockerOf(&st) catch null;
 }
 
 /// systemd-udevd locks a whole-disk block device while it handles it
@@ -153,29 +162,62 @@ pub const SHARED_LOCK_RETRY_MS: i64 = 5;
 /// `flock(fd, LOCK_EX | LOCK_NB)` that waits out udev's holders (above):
 /// `.SUCCESS`, `.AGAIN` when this binary holds it exclusively (or another
 /// holder outlasts the bound), or the call's other errno. `waits` counts
-/// each retry a holder caused.
-pub fn flockExclusive(io: Io, fd: linux.fd_t, waits: ?*counters.ShardedCounter) linux.E {
+/// each retry a holder caused; `locker` is the exclusive locker last seen
+/// (for the refusal's text, `writeLocker`).
+pub fn flockExclusive(io: Io, fd: linux.fd_t, waits: ?*counters.ShardedCounter, locker: *?Holder) linux.E {
     const deadline = clock.monotonicNs() + SHARED_LOCK_WAIT_NS;
+    var st: linux.Statx = undefined;
     while (true) {
         const e = linux.errno(linux.flock(fd, std.posix.LOCK.EX | std.posix.LOCK.NB));
         if (e != .AGAIN) return e;
-        if (squeezefsHoldsExclusive(fd) or clock.monotonicNs() >= deadline) return .AGAIN;
+        if (linux.errno(linux.statx(fd, "", linux.AT.EMPTY_PATH, .{ .INO = true }, &st)) != .SUCCESS) return .AGAIN;
+        // Unreadable `/proc/locks`: the refusal stands.
+        _ = locker;
+        if (lockerOf(&st) catch return .AGAIN) |h| {
+            if (h.squeezefs) return .AGAIN;
+        }
+        if (clock.monotonicNs() >= deadline) return .AGAIN;
         if (waits) |w| w.inc();
         io.sleep(.fromMilliseconds(SHARED_LOCK_RETRY_MS), .awake) catch return .AGAIN;
     }
 }
 
-/// An exclusive `flock` on `fd`'s inode whose locker (`/proc/locks`) is this
-/// process or runs this very executable. Unreadable `/proc/locks` reads as
-/// held (the refusal stands); a locker whose exe is unreadable (another
-/// user's, a pid outside our namespace) is waited out — the bound refuses it.
-fn squeezefsHoldsExclusive(fd: linux.fd_t) bool {
-    var st: linux.Statx = undefined;
-    if (linux.errno(linux.statx(fd, "", linux.AT.EMPTY_PATH, .{ .INO = true }, &st)) != .SUCCESS) return true;
+/// The locker of an exclusive `flock`, off `/proc/locks`.
+pub const Holder = struct {
+    pid: linux.pid_t,
+    /// This process, or a process running this very executable. A locker
+    /// whose exe is unreadable (another user's, a pid outside our
+    /// namespace) is not — the bound refuses it.
+    squeezefs: bool,
+
+    /// `pid 1234 (systemd-udevd)`: the comm read now (a refusal's text).
+    pub fn format(self: Holder, w: *Io.Writer) Io.Writer.Error!void {
+        var pb: [32]u8 = undefined;
+        var cb: [64]u8 = undefined;
+        const path = std.fmt.bufPrintSentinel(&pb, "/proc/{d}/comm", .{self.pid}, 0) catch return w.print("pid {d}", .{self.pid});
+        const comm = if (readSmall(path.ptr, &cb)) |t| std.mem.trimEnd(u8, t, "\n") else "exited";
+        try w.print("pid {d} ({s})", .{ self.pid, comm });
+    }
+};
+
+/// The subject of a refusal `flockExclusive` answered `.AGAIN`, naming the
+/// locker it last saw.
+pub fn writeLocker(w: *Io.Writer, locker: ?Holder) Io.Writer.Error!void {
+    const h = locker orelse return w.writeAll("another process holds the writer lock");
+    if (h.squeezefs) return w.print("another squeezefs process, {f}, holds the writer lock", .{h});
+    try w.print("{f}, not a squeezefs process, held the writer lock past the {d} s wait", .{ h, SHARED_LOCK_WAIT_NS / std.time.ns_per_s });
+}
+
+/// The ONE `/proc/locks` read behind every writer-lock judgement: the
+/// exclusive `flock` locker of `st`'s inode (`.INO` statx), null = none.
+fn lockerOf(st: *const linux.Statx) error{Unreadable}!?Holder {
     var buf: [PROC_LOCKS_CAP]u8 = undefined;
-    const text = readSmall("/proc/locks", &buf) orelse return true;
-    const pid = flockHolderIn(text, st.dev_major, st.dev_minor, st.ino) orelse return false;
-    if (pid == linux.getpid()) return true;
+    const text = readSmall("/proc/locks", &buf) orelse return error.Unreadable;
+    const pid = flockHolderIn(text, st.dev_major, st.dev_minor, st.ino) orelse return null;
+    return .{ .pid = pid, .squeezefs = pid == linux.getpid() or runsOurExe(pid) };
+}
+
+fn runsOurExe(pid: linux.pid_t) bool {
     var pb: [32]u8 = undefined;
     const exe = std.fmt.bufPrintSentinel(&pb, "/proc/{d}/exe", .{pid}, 0) catch return false;
     var theirs: linux.Statx = undefined;
@@ -300,11 +342,11 @@ test "/proc/locks: an exclusive FLOCK line on the file's (major, minor, inode) i
         _ = linux.close(fd);
         _ = linux.unlink(path.ptr);
     }
-    try testing.expect(!writerFlockHeld(path));
+    try testing.expect(!writerFlockHeld(testing.io, path, null));
     try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.flock(fd, std.posix.LOCK.EX | std.posix.LOCK.NB)));
-    try testing.expect(writerFlockHeld(path));
+    try testing.expect(writerFlockHeld(testing.io, path, null));
     try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.flock(fd, std.posix.LOCK.UN)));
-    try testing.expect(!writerFlockHeld(path));
+    try testing.expect(!writerFlockHeld(testing.io, path, null));
 }
 
 test "flockExclusive waits out an EXCLUSIVE holder that is not this binary — systemd-udevd's flock(LOCK_EX) + BLKRRPART after every write-close of a whole disk — and opens once it lets go; an exclusive holder of this binary (here: this process) still refuses at once" {
@@ -326,8 +368,10 @@ test "flockExclusive waits out an EXCLUSIVE holder that is not this binary — s
         const own: linux.fd_t = @intCast(rc2);
         defer _ = linux.close(own);
         try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.flock(own, std.posix.LOCK.EX | std.posix.LOCK.NB)));
-        try testing.expectEqual(linux.E.AGAIN, flockExclusive(testing.io, fd, &waits));
+        var locker: ?Holder = null;
+        try testing.expectEqual(linux.E.AGAIN, flockExclusive(testing.io, fd, &waits, &locker));
         try testing.expectEqual(@as(u64, 0), waits.load());
+        try testing.expect(locker != null and locker.?.squeezefs and locker.?.pid == linux.getpid());
     }
     // The stand-in for the udev worker: flock(1) holding LOCK_EX until its
     // `cat` reads EOF on our pipe.
@@ -337,17 +381,11 @@ test "flockExclusive waits out an EXCLUSIVE holder that is not this binary — s
         holder.stdin = null;
         _ = holder.wait(testing.io) catch {};
     };
-    const hang_guard = clock.monotonicNs() + 60 * std.time.ns_per_s;
-    while (!writerFlockHeld(path)) {
-        if (clock.monotonicNs() >= hang_guard) {
-            std.debug.print("\nflock(1) pid {d} never took the lock on {s}\n", .{ holder.id.?, path });
-            return error.HolderNeverLocked;
-        }
-        try std.Thread.yield();
-    }
+    try awaitLocker(path, @intCast(holder.id.?));
     const Opener = struct {
         fn run(f: linux.fd_t, w: *counters.ShardedCounter, out: *linux.E, done: *std.atomic.Value(bool)) void {
-            out.* = flockExclusive(testing.io, f, w);
+            var locker: ?Holder = null;
+            out.* = flockExclusive(testing.io, f, w, &locker);
             done.store(true, .release);
         }
     };
@@ -363,6 +401,111 @@ test "flockExclusive waits out an EXCLUSIVE holder that is not this binary — s
     t.join();
     try testing.expectEqual(linux.E.SUCCESS, result);
     try testing.expect(waits.load() > 0);
+}
+
+/// A scratch file pid-tagged under `/build/tmp`; null = not writable here.
+fn scratch(buf: []u8, tag: []const u8) !?[:0]const u8 {
+    const path = try std.fmt.bufPrintSentinel(buf, "/build/tmp/proc-flock-{s}-{d}", .{ tag, linux.getpid() }, 0);
+    _ = linux.mkdir("/build/tmp", 0o755);
+    const rc = linux.open(path.ptr, .{ .ACCMODE = .RDWR, .CLOEXEC = true, .CREAT = true }, 0o600);
+    if (linux.errno(rc) != .SUCCESS) return null;
+    _ = linux.close(@intCast(rc));
+    return path;
+}
+
+/// flock(1) (`pid`) took its lock on `path`: its line is in `/proc/locks`.
+fn awaitLocker(path: []const u8, pid: linux.pid_t) !void {
+    const hang_guard = clock.monotonicNs() + 60 * std.time.ns_per_s;
+    while (exclusiveLocker(path) == null) {
+        if (clock.monotonicNs() >= hang_guard) {
+            std.debug.print("\nflock(1) pid {d} never took the lock on {s}\n", .{ pid, path });
+            return error.HolderNeverLocked;
+        }
+        try std.Thread.yield();
+    }
+}
+
+test "writerFlockHeld (the readers' 'is a writer here?') waits out an exclusive holder that is not this binary — udevd's re-read after the writer's last close — and reads 'no writer' once it lets go; this process's own holder reads 'writer' with no wait" {
+    var path_buf: [64]u8 = undefined;
+    const path = (try scratch(&path_buf, "reader")) orelse return testkit.skip(@src(), .no_device, "/build/tmp is not writable on this host (the venue's cache volume)");
+    defer _ = linux.unlink(path.ptr);
+    var waits: counters.ShardedCounter = .{};
+    {
+        const rc = linux.open(path.ptr, .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);
+        try testing.expectEqual(linux.E.SUCCESS, linux.errno(rc));
+        const own: linux.fd_t = @intCast(rc);
+        defer _ = linux.close(own);
+        try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.flock(own, std.posix.LOCK.EX | std.posix.LOCK.NB)));
+        try testing.expect(writerFlockHeld(testing.io, path, &waits));
+        try testing.expectEqual(@as(u64, 0), waits.load());
+    }
+    var holder = try std.process.spawn(testing.io, .{ .argv = &.{ "flock", "-x", path, "cat" }, .stdin = .pipe, .stdout = .ignore, .stderr = .ignore });
+    defer if (holder.stdin) |s| {
+        s.close(testing.io);
+        holder.stdin = null;
+        _ = holder.wait(testing.io) catch {};
+    };
+    try awaitLocker(path, @intCast(holder.id.?));
+    const Reader = struct {
+        fn run(p: []const u8, w: *counters.ShardedCounter, out: *bool, done: *std.atomic.Value(bool)) void {
+            out.* = writerFlockHeld(testing.io, p, w);
+            done.store(true, .release);
+        }
+    };
+    var held = true;
+    var done: std.atomic.Value(bool) = .init(false);
+    const t = try std.Thread.spawn(.{}, Reader.run, .{ path, &waits, &held, &done });
+    // The reader met the holder and is waiting (or, judging it, is done):
+    // only then let go.
+    while (waits.load() == 0 and !done.load(.acquire)) try std.Thread.yield();
+    holder.stdin.?.close(testing.io);
+    holder.stdin = null;
+    _ = try holder.wait(testing.io);
+    t.join();
+    try testing.expect(!held);
+    try testing.expect(waits.load() > 0);
+}
+
+test "an exclusive holder that is not this binary and outlasts the bound: flockExclusive refuses and the refusal names it by pid and comm ('pid N (flock)', not 'another squeezefs process'); writerFlockHeld reads it as a writer" {
+    var path_buf: [64]u8 = undefined;
+    const path = (try scratch(&path_buf, "long")) orelse return testkit.skip(@src(), .no_device, "/build/tmp is not writable on this host (the venue's cache volume)");
+    defer _ = linux.unlink(path.ptr);
+    const rc = linux.open(path.ptr, .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(rc));
+    const fd: linux.fd_t = @intCast(rc);
+    defer _ = linux.close(fd);
+    var holder = try std.process.spawn(testing.io, .{ .argv = &.{ "flock", "-x", path, "cat" }, .stdin = .pipe, .stdout = .ignore, .stderr = .ignore });
+    defer {
+        holder.stdin.?.close(testing.io);
+        holder.stdin = null;
+        _ = holder.wait(testing.io) catch {};
+    }
+    try awaitLocker(path, @intCast(holder.id.?));
+    // Both judgements wait out the same bound: run them side by side.
+    const Reader = struct {
+        fn run(p: []const u8, out: *bool) void {
+            out.* = writerFlockHeld(testing.io, p, null);
+        }
+    };
+    var held = false;
+    const t = try std.Thread.spawn(.{}, Reader.run, .{ path, &held });
+    var locker: ?Holder = null;
+    const e = flockExclusive(testing.io, fd, null, &locker);
+    t.join();
+    try testing.expectEqual(linux.E.AGAIN, e);
+    try testing.expect(held);
+    try testing.expect(locker != null);
+    try testing.expectEqual(@as(linux.pid_t, @intCast(holder.id.?)), locker.?.pid);
+    try testing.expect(!locker.?.squeezefs);
+    var buf: [192]u8 = undefined;
+    var w: Io.Writer = .fixed(&buf);
+    try writeLocker(&w, locker);
+    var want_buf: [32]u8 = undefined;
+    const want = try std.fmt.bufPrint(&want_buf, "pid {d} (flock)", .{locker.?.pid});
+    if (std.mem.indexOf(u8, w.buffered(), want) == null or std.mem.indexOf(u8, w.buffered(), "another squeezefs") != null) {
+        std.debug.print("\nthe refusal: {s}\n", .{w.buffered()});
+        return error.LockerUnnamed;
+    }
 }
 
 test "/etc/nvme reads as empty when absent, never written" {

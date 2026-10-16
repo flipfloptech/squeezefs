@@ -216,7 +216,7 @@ pub fn run(p: cli.Process, f: args.Format) u8 {
 
     // The metadata preflight, every member.
     for (meta.paths) |mp| {
-        if (status.writerGuardHeld(mp)) {
+        if (status.writerGuardHeld(p.io, mp)) {
             p.stderr.print("squeezefs format: cannot format {s}: a live daemon holds its single-writer guard (umount it first; --force does not override a live mount)\n", .{mp}) catch {};
             return cli.exit_failed;
         }

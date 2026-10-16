@@ -38,15 +38,20 @@ pub const Error = error{ DeviceRefused, NotFormatted, Mounted, Io } || enable.Er
 
 /// The door's refusals beside the plan's, rendered in ONE place.
 pub const Refusal = union(enum) {
-    /// Layer A: another process on this host holds the writer lock.
-    mounted_here,
+    /// Layer A: another process on this host holds the writer lock (its
+    /// locker as `flockExclusive` last saw it).
+    mounted_here: ?guard.proc.Holder,
     /// Layer B2: a heartbeat-fresh writer claim under another identity.
     mounted_elsewhere: struct { claim: guard.claim.Claim, now_ns: i64 },
     plan: enable.Refusal,
 
     pub fn write(self: Refusal, w: *std.Io.Writer) std.Io.Writer.Error!void {
         switch (self) {
-            .mounted_here => try w.writeAll("the volume is MOUNTED — another squeezefs process on this host holds its writer lock; unmount it first (the conversion needs the volume quiesced with an empty replay window)"),
+            .mounted_here => |h| {
+                try w.writeAll("the volume is MOUNTED — ");
+                try guard.proc.writeLocker(w, h);
+                try w.writeAll(" on this host; unmount it first (the conversion needs the volume quiesced with an empty replay window)");
+            },
             .mounted_elsewhere => |m| {
                 try w.writeAll("the volume is MOUNTED on another host — its writer claim is heartbeat-fresh (");
                 try m.claim.writeSummary(w, m.now_ns);
@@ -73,14 +78,14 @@ pub const Outcome = struct {
 
 /// The dedicated door fd: `flock(LOCK_EX | LOCK_NB)`, held until `close`
 /// (udev's block-device locks waited out: `guard.proc.flockExclusive`).
-fn takeDoor(io: Io, path: []const u8) Error!linux.fd_t {
+fn takeDoor(io: Io, path: []const u8, locker: *?guard.proc.Holder) Error!linux.fd_t {
     var zbuf: [linux.PATH_MAX]u8 = undefined;
     const z = align_probe.pathZ(&zbuf, path) catch return error.DeviceRefused;
     const rc = linux.open(z, .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);
     if (linux.errno(rc) != .SUCCESS) return error.DeviceRefused;
     const fd: linux.fd_t = @intCast(rc);
     errdefer _ = linux.close(fd);
-    return switch (guard.proc.flockExclusive(io, fd, null)) {
+    return switch (guard.proc.flockExclusive(io, fd, null, locker)) {
         .SUCCESS => fd,
         .AGAIN => error.Mounted,
         else => error.DeviceRefused,
@@ -106,9 +111,10 @@ const PageReader = struct {
 /// The verb over one volume (module doc). `io` is the executor's (the
 /// claim probe replays the ring into private trees through the cache).
 pub fn enableSymmetric(gpa: Allocator, io: Io, path: []const u8, opts: Options, diag: ?*Refusal) Error!Outcome {
-    const door = takeDoor(io, path) catch |e| {
+    var locker: ?guard.proc.Holder = null;
+    const door = takeDoor(io, path, &locker) catch |e| {
         if (e == error.Mounted) if (diag) |d| {
-            d.* = .mounted_here;
+            d.* = .{ .mounted_here = locker };
         };
         return e;
     };

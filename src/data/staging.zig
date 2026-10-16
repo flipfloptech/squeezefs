@@ -1864,7 +1864,7 @@ pub const Ring = if (builtin.os.tag == .linux) struct {
     /// (read off `/proc/locks` — the probe takes NO lock: a transient one
     /// would refuse a member's own bind racing it).
     pub fn ownerLive(path: []const u8) bool {
-        return @import("../meta/guard/proc.zig").writerFlockHeld(path);
+        return @import("../meta/guard/proc.zig").exclusiveLocker(path) != null; // a directory: udev never locks one, so no wait
     }
 
     /// The member roots under a container, straight off `getdents64`.

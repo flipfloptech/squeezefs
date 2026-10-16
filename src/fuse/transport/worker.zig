@@ -483,7 +483,8 @@ pub const Slab = struct {
     stride: usize,
     depth: u32,
 
-    pub fn init(nqueues: u32, depth: u32, payload_sz: u32) error{SlabFailed}!Slab {
+    pub fn init(gpa: std.mem.Allocator, nqueues: u32, depth: u32, payload_sz: u32) error{SlabFailed}!Slab {
+        _ = gpa;
         const stride: usize = @intCast(derive.alignUp(payload_sz, ARENA_ALIGN));
         const span: usize = stride * @as(usize, nqueues) * depth;
         const rc = linux.memfd_create("sqz-fuse-zc-bounce", linux.MFD.CLOEXEC);
@@ -514,6 +515,17 @@ pub const Slab = struct {
 
     pub fn offsetOf(self: *const Slab, qid: u16, ent_idx: u16) u64 {
         return (@as(u64, qid) * self.depth + ent_idx) * self.stride;
+    }
+
+    /// The fd face of a queue's windows.
+    pub fn fdOf(self: *const Slab, qid: u16) linux.fd_t {
+        _ = qid;
+        return self.fd;
+    }
+
+    /// An ent's window offset in its queue's fd face.
+    pub fn fdOffsetOf(self: *const Slab, ent_idx: u16) u64 {
+        return @as(u64, ent_idx) * self.stride;
     }
 
     pub fn window(self: *Slab, qid: u16, ent_idx: u16, len: usize) []u8 {
@@ -3177,17 +3189,26 @@ test "the commit-batch histogram buckets: 1–8 exact, ≤ 16, ≤ 32, > 32" {
     try testing.expectEqual(snap[10] + 1, commit_batch[10].load(.monotonic));
 }
 
-test "the zc bounce slab: one memfd for every queue's windows at (qid × depth + ent) × stride, page-aligned, VA and fd faces of one memory" {
-    var s = try Slab.init(3, 4, 8192 + 100);
+test "the zc bounce slab: one memfd per queue mapped in place — windows at (qid × depth + ent) × stride in one VA span, a queue's fd face at ent × stride, no two queues share a file (an extraction is a shmem write under the file's inode lock)" {
+    var s = try Slab.init(testing.allocator, 3, 4, 8192 + 100);
     defer s.deinit();
     try testing.expectEqual(@as(usize, 12288), s.stride);
     try testing.expectEqual(@as(usize, 12288 * 12), s.base.len);
     try testing.expectEqual(@as(u64, 12288 * 9), s.offsetOf(2, 1));
-    const w = s.window(2, 1, 16);
-    w[0] = 0xAB;
-    // The fd face sees the VA write.
+    // The queue's fd face sees a VA write (a staged reply body)…
+    s.window(2, 1, 16)[0] = 0xAB;
     var byte: [1]u8 = .{0};
-    const n = linux.pread(s.fd, &byte, 1, @intCast(s.offsetOf(2, 1)));
-    try testing.expectEqual(@as(usize, 1), n);
+    try testing.expectEqual(@as(usize, 1), linux.pread(s.fdOf(2), &byte, 1, @intCast(s.fdOffsetOf(1))));
     try testing.expectEqual(@as(u8, 0xAB), byte[0]);
+    // …and the VA sees a write through the fd face (an extraction).
+    const v: [1]u8 = .{0xCD};
+    try testing.expectEqual(@as(usize, 1), linux.pwrite(s.fdOf(0), &v, 1, @intCast(s.fdOffsetOf(3))));
+    try testing.expectEqual(@as(u8, 0xCD), s.window(0, 3, 1)[0]);
+    var inos: [3]u64 = undefined;
+    for (&inos, 0..) |*ino, q| {
+        var st: linux.Statx = undefined;
+        try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.statx(s.fdOf(@intCast(q)), "", linux.AT.EMPTY_PATH, .{ .INO = true }, &st)));
+        ino.* = st.ino;
+    }
+    try testing.expect(inos[0] != inos[1] and inos[1] != inos[2] and inos[0] != inos[2]);
 }

@@ -1270,7 +1270,7 @@ pub const Session = struct {
         //    arena as ONE budget component, the arm barrier counting
         //    submissions.
         if (self.mode == .zero_copy) {
-            self.slab = worker.Slab.init(self.plan.nqueues, self.plan.depth, self.plan.payload_sz) catch return error.SlabFailed;
+            self.slab = worker.Slab.init(self.gpa, self.plan.nqueues, self.plan.depth, self.plan.payload_sz) catch return error.SlabFailed;
             zc_bounce_slab_bytes.set(self.slab.?.bytes());
             // Non-sheddable (a populated window is a delivery in flight or
             // its body); floor 0 — the slab is lazily populated and the idle

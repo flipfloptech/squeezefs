@@ -1742,11 +1742,11 @@ pub const Device = struct {
 
 const testing = std.testing;
 
-/// A regular-file substrate under `/build` (ext4 in the venue; O_DIRECT
-/// works there) or `/tmp` elsewhere. The `std.Io.File` handle doubles as the
-/// page-cache view for byte-exact verification: an O_DIRECT write
-/// invalidates the cached range, so a buffered read after completion sees
-/// the device bytes.
+/// A regular-file substrate under `/build/tmp` (where every test writes:
+/// ext4 in the venues, RAM-backed on a local venue; O_DIRECT works there) or
+/// `/tmp` elsewhere. The `std.Io.File` handle doubles as the page-cache view
+/// for byte-exact verification: an O_DIRECT write invalidates the cached
+/// range, so a buffered read after completion sees the device bytes.
 const TestFile = struct {
     path_buf: [96]u8 = undefined,
     path: [:0]const u8 = "",
@@ -1757,8 +1757,8 @@ const TestFile = struct {
     /// In place (`path` aliases `path_buf`, so the struct must not move).
     fn create(tf: *TestFile, len: u64) !void {
         const dir: []const u8 = blk: {
-            std.Io.Dir.accessAbsolute(testing.io, "/build", .{}) catch break :blk "/tmp";
-            break :blk "/build";
+            std.Io.Dir.accessAbsolute(testing.io, "/build/tmp", .{}) catch break :blk "/tmp";
+            break :blk "/build/tmp";
         };
         tf.path = try std.mem.printSentinel(&tf.path_buf, "{s}/sqz-nvme-{d}-{d}.img", .{ dir, linux.getpid(), seq.fetchAdd(1, .monotonic) }, 0);
         tf.file = try std.Io.Dir.createFileAbsolute(testing.io, tf.path, .{ .read = true, .truncate = true });
@@ -2696,9 +2696,16 @@ test "thread names: lanes are numbered process-wide as sqz-nvme<N>; the write ph
     const name = thread_name.commName(&name_buf, laneThreadName(dev.laneNumber(1)));
     try testing.expectEqualStrings("sqz-nvme", thread_name.classify(name));
     // Phase histograms are exact-sum: dma ⊇ dev_queue + dev_service, both
-    // moved by the writes of the earlier tests in this process.
-    try testing.expect(stats.write_pipeline_dev_queue_ns.snapshot().count > 0);
-    try testing.expect(stats.write_pipeline_dev_service_ns.snapshot().count > 0);
+    // moved by THIS test's write (a shard runs its tests in any order, so an
+    // earlier test's writes are not owed). The lane records both before
+    // `lane.complete` wakes the writer.
+    const queued0 = stats.write_pipeline_dev_queue_ns.snapshot().count;
+    const served0 = stats.write_pipeline_dev_service_ns.snapshot().count;
+    var payload: [4096]u8 align(4096) = undefined;
+    fillPattern(&payload, 3);
+    try dev.writeBlock(0, &payload);
+    try testing.expect(stats.write_pipeline_dev_queue_ns.snapshot().count > queued0);
+    try testing.expect(stats.write_pipeline_dev_service_ns.snapshot().count > served0);
     // The caller census is level-triggered: nobody is parked now.
     try testing.expectEqual(@as(u64, 0), stats.device_lock_waiters.load());
 }

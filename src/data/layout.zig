@@ -516,10 +516,18 @@ pub const Layout = struct {
 
     /// The mapping of `block` in an inline map (binary search; null = hole).
     pub fn lookup(self: Layout, chunk: u64, block: u32) ?Mapping {
+        return self.lookupChecked(chunk, block) catch unreachable;
+    }
+
+    /// `lookup` checking the ONE entry it lands on as `validate` checks
+    /// every entry (a `decodePoint` layout's entries are unchecked).
+    fn lookupChecked(self: Layout, chunk: u64, block: u32) LayoutError!?Mapping {
         if (self.flags & F_MAP_INLINE == 0) return null;
         const idx = std.sort.lowerBound(MapEntryWire, self.entries, block, entryBlockOrder);
-        if (idx < self.entries.len and self.entries[idx].block() == block) return Mapping.decode(self.entries[idx].mapping, chunk) catch unreachable;
-        return null;
+        if (idx == self.entries.len or self.entries[idx].block() != block) return null;
+        const e = &self.entries[idx];
+        if (!std.mem.allEqual(u8, &e.reserved_le, 0)) return error.Corrupt;
+        return try Mapping.decode(e.mapping, chunk);
     }
 
     fn entryBlockOrder(block: u32, e: MapEntryWire) std.math.Order {
@@ -561,6 +569,19 @@ pub const Layout = struct {
     /// ascending map, a present generation ≠ 0, nothing carried a kind does
     /// not own.
     pub fn validate(self: Layout, geo: Geometry) LayoutError!void {
+        try self.validateHead(geo);
+        var prev: ?u32 = null;
+        for (self.entries) |*e| {
+            if (!std.mem.allEqual(u8, &e.reserved_le, 0)) return error.Corrupt;
+            const b = e.block();
+            if (prev) |p| if (b <= p) return error.MapNotAscending;
+            prev = b;
+            _ = try Mapping.decode(e.mapping, geo.chunk);
+        }
+    }
+
+    /// `validate` short of the inline map's entries (O(1) in the map).
+    fn validateHead(self: Layout, geo: Geometry) LayoutError!void {
         if (self.flags & ~F_KNOWN != 0) return error.Corrupt;
         const admissible: u16 = switch (self.kind) {
             .inline_ => 0,
@@ -593,14 +614,6 @@ pub const Layout = struct {
             try m.check(geo.chunk);
             // A tenant is a window, never the undecorated binding.
             if (self.kind == .packed_ and m.whole_block) return error.MappingRefused;
-        }
-        var prev: ?u32 = null;
-        for (self.entries) |*e| {
-            if (!std.mem.allEqual(u8, &e.reserved_le, 0)) return error.Corrupt;
-            const b = e.block();
-            if (prev) |p| if (b <= p) return error.MapNotAscending;
-            prev = b;
-            _ = try Mapping.decode(e.mapping, geo.chunk);
         }
     }
 
@@ -691,6 +704,13 @@ pub const Layout = struct {
     /// `base_version`, the kind's body in the encoder's form, the layout
     /// `validate`s. `data`/`entries` borrow from `bytes`.
     pub fn decode(bytes: []const u8, geo: Geometry) LayoutError!Layout {
+        const l = try decodeShape(bytes, geo);
+        try l.validate(geo);
+        return l;
+    }
+
+    /// `decode` short of `validate`: the header and the body's framing.
+    fn decodeShape(bytes: []const u8, geo: Geometry) LayoutError!Layout {
         if (bytes.len < LAYOUT_HEADER_LEN) return error.Corrupt;
         const h = std.mem.bytesToValue(LayoutHeaderWire, bytes[0..LAYOUT_HEADER_LEN]);
         if (h.version != LAYOUT_RECORD_VERSION) return error.Corrupt;
@@ -742,10 +762,39 @@ pub const Layout = struct {
                 }
             },
         }
-        try l.validate(geo);
         return l;
     }
 };
+
+/// What one read or write needs of a stored layout: its head and the ONE
+/// binding the op's block names.
+pub const Point = struct {
+    kind: Kind,
+    size: u64,
+    file_id: FileId,
+    durable_copy: ?Mapping,
+    /// A tree-mapped head: the block resolves in tree 7, never here.
+    kvmap: ?Layout.KvmapHead,
+    /// The inline map's binding of the asked block (null = a hole, or none asked).
+    binding: ?Mapping,
+};
+
+/// The per-op read of a layout record, O(log entries) whatever the file's
+/// size: `decode`'s checks on the header and on the ONE inline-map entry the
+/// search lands on, never on the rest of the map (the full `decode` of every
+/// publish's read-modify-write and fsck's walk check those).
+pub fn resolvePoint(bytes: []const u8, geo: Geometry, block: ?u32) LayoutError!Point {
+    const l = try Layout.decodeShape(bytes, geo);
+    try l.validateHead(geo);
+    return .{
+        .kind = l.kind,
+        .size = l.size,
+        .file_id = l.file_id,
+        .durable_copy = l.durableCopy(),
+        .kvmap = l.kvmapHead(),
+        .binding = if (block) |b| try l.lookupChecked(geo.chunk, b) else null,
+    };
+}
 
 /// One `(block → mapping)` pair.
 pub const MapEntry = struct {
@@ -1535,13 +1584,12 @@ fn refOf(ino: u64, e: MapEntry, chunk: u64) RefOp {
 }
 
 /// Does `l` name the same REFERENCE as `e` (same block index, same block)?
+/// O(log entries): a publish diffs every entry of a 768-block map.
 fn namesRef(l: ?Layout, e: MapEntry, chunk: u64) bool {
     const layout = l orelse return false;
-    var it = layout.named(chunk);
-    while (it.next()) |o| {
-        if (o.block == e.block and o.mapping.sameRef(e.mapping, chunk)) return true;
-    }
-    return false;
+    if (e.block == 0) if (layout.durableCopy()) |m| if (m.sameRef(e.mapping, chunk)) return true;
+    const m = layout.lookup(chunk, e.block) orelse return false;
+    return m.sameRef(e.mapping, chunk);
 }
 
 /// `XattrValue{"layout", layout}` encoded in one pass (no intermediate
@@ -1677,6 +1725,55 @@ test "encode ∘ decode = id for every kind and flag shape; exactly the encoder'
     try testing.expectEqual(@as(?u32, null), bare.sweep);
     try testing.expectEqual(@as(?u64, null), bare.gen);
     try testing.expectEqual(@as(?Layout.KvmapHead, null), shapes[6].kvmapHead());
+}
+
+test "resolvePoint = decode ∘ lookup on every shape and every block of a 3 GiB file's 768-block map, and it reads only the entry its search lands on: an entry the full decode refuses leaves every other block resolvable and refuses only its own" {
+    const gpa = testing.allocator;
+    var named: std.ArrayList(MapEntry) = .empty;
+    defer named.deinit(gpa);
+    var b: u32 = 0;
+    // Every third block a hole.
+    while (b < 768) : (b += 1) if (b % 3 != 2) try named.append(gpa, .{ .block = b, .mapping = Mapping.wholeBlock(1, @as(u64, b) * DEFAULT_CHUNK, b) });
+    const entries = try sortedEntries(gpa, named.items);
+    defer gpa.free(entries);
+    const shapes = [_]Layout{
+        Layout.inlineData(10, "0123456789"),
+        Layout.staged(5000, fid(3), Mapping.tenant(9, 0, 1, 0, 5000)),
+        Layout.packedTenant(12, fid(4), Mapping.tenant(9, 4 * derive.MiB, 0, 4096 * 3, 12)),
+        Layout.stripedInline(768 * DEFAULT_CHUNK, entries),
+        Layout.stripedKvmap(1 << 40, 512, 77),
+    };
+    for (shapes) |l| {
+        const enc = try l.encodeAlloc(gpa);
+        defer gpa.free(enc);
+        const full = try Layout.decode(enc, tgeo);
+        var blk: u32 = 0;
+        while (blk < 770) : (blk += 1) {
+            const p = try resolvePoint(enc, tgeo, blk);
+            try testing.expectEqual(full.kind, p.kind);
+            try testing.expectEqual(full.size, p.size);
+            try testing.expectEqual(full.file_id, p.file_id);
+            try testing.expectEqual(full.durableCopy(), p.durable_copy);
+            try testing.expectEqual(full.kvmapHead(), p.kvmap);
+            try testing.expectEqual(full.lookup(tgeo.chunk, blk), p.binding);
+        }
+        try testing.expectEqual(@as(?Mapping, null), (try resolvePoint(enc, tgeo, null)).binding);
+        try testing.expectError(error.Corrupt, resolvePoint(enc[0 .. enc.len - 1], tgeo, 0));
+    }
+    const enc = try shapes[3].encodeAlloc(gpa);
+    defer gpa.free(enc);
+    const at = for (entries, 0..) |e, i| {
+        if (e.block() == 400) break LAYOUT_HEADER_LEN + 4 + i * MAP_ENTRY_WIRE_LEN;
+    } else unreachable;
+    for ([_]usize{ 4, 8 + 8 }) |field| {
+        // A reserved byte, then a misaligned device offset.
+        enc[at + field] ^= 1;
+        defer enc[at + field] ^= 1;
+        if (Layout.decode(enc, tgeo)) |_| return error.TestUnexpectedResult else |_| {}
+        if (resolvePoint(enc, tgeo, 400)) |_| return error.TestUnexpectedResult else |_| {}
+        b = 0;
+        while (b < 768) : (b += 1) if (b != 400) try testing.expectEqual(shapes[3].lookup(tgeo.chunk, b), (try resolvePoint(enc, tgeo, b)).binding);
+    }
 }
 
 test "per-kind flag admissibility, the ascending-map law, the inline ceiling and the mapping window law all refuse typed" {

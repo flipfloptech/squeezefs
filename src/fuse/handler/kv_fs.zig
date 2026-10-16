@@ -1270,6 +1270,24 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             return .{ .value = hit.value, .coll_seq = hit.k[hit.k.len - 1], .layout = l };
         }
 
+        /// The stored layout's kind read off the borrowed record; null
+        /// when only `readLayout` can tell (a token-served object, a chain
+        /// whose slot 0 holds another name, no record, a corrupt one).
+        fn layoutKindView(self: *Self, ino: u64) Error!?layout.Kind {
+            if (try self.tokenServe(ino, .{})) |served| {
+                served.release(self.io);
+                return null;
+            }
+            const k = key.xattrKey(ino, key.xattrNameHash56(LAYOUT_XATTR, self.store.nameKey()), 0);
+            return (self.store.lookupView(self.gpa, key.TREE_XATTRS, &k, ?layout.Kind, self.geo, viewKind) catch |e| return storeErr(e)) orelse null;
+        }
+
+        fn viewKind(geo: layout.Geometry, v: []const u8) ?layout.Kind {
+            const xv = record.XattrValue.decode(v) catch return null;
+            if (!std.mem.eql(u8, xv.name, LAYOUT_XATTR)) return null;
+            return (layout.resolvePoint(xv.value, geo, null) catch return null).kind;
+        }
+
         fn freeLayout(self: *Self, r: ?LayoutRec) void {
             if (r) |rec| self.gpa.free(rec.value);
         }
@@ -2735,9 +2753,12 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             // (3.7) themselves inside their (3.5).
             var layout_lock: ?Data.LayoutGuard = self.data.lockLayout(self.io, local);
             errdefer if (layout_lock) |g| g.release(self.io);
-            const rec = try self.readLayout(local);
+            // A striped file's write needs its layout's kind alone (the
+            // plane resolves the blocks): no copy of the record.
+            const striped = self.data.hasVolumes() and ((try self.layoutKindView(local)) orelse .inline_) == .striped;
+            const rec = if (striped) null else try self.readLayout(local);
             defer self.freeLayout(rec);
-            const kind = kindOf(rec);
+            const kind: layout.Kind = if (striped) .striped else kindOf(rec);
             if (!self.data.hasVolumes()) {
                 if (end > self.inline_max) {
                     fuse_write_no_data_volume_refused.inc();
@@ -2754,7 +2775,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             // holder's door refuses.
             if (self.foreignSlot(a.ino)) {
                 fuse_write_foreign_striped.inc();
-                return self.writeStriped(c, local, a, rec, end, &layout_lock);
+                return self.writeStriped(c, local, a, rec, kind, end, &layout_lock);
             }
             if (kind == .inline_ and end <= self.inline_max) return self.writeInline(c, local, a, rec, end, &layout_lock);
             // The staged arm rings the WHOLE file: its bound is the file's
@@ -2776,9 +2797,9 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 var in_hand = a;
                 in_hand.data = try self.payloadBytes(a);
                 in_hand.held = null;
-                return self.writeStriped(c, local, in_hand, rec, end, &layout_lock);
+                return self.writeStriped(c, local, in_hand, rec, kind, end, &layout_lock);
             }
-            return self.writeStriped(c, local, a, rec, end, &layout_lock);
+            return self.writeStriped(c, local, a, rec, kind, end, &layout_lock);
         }
 
         /// The (3.7) guard leaves right after its commit landed (before
@@ -2920,7 +2941,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         /// payload DMA'd to its own block, the striped layout naming it
         /// published — block I/O before the type flip), then the data
         /// plane's admission per piece, then the inode's size claim.
-        fn writeStriped(self: *Self, c: *Ctx, local: u64, a: filesystem.WriteArgs, rec: ?LayoutRec, end: u64, layout_lock: *?Data.LayoutGuard) Error!filesystem.Written {
+        fn writeStriped(self: *Self, c: *Ctx, local: u64, a: filesystem.WriteArgs, rec: ?LayoutRec, kind: layout.Kind, end: u64, layout_lock: *?Data.LayoutGuard) Error!filesystem.Written {
             if (end > self.maxFileSize()) {
                 fuse_write_u32_index_refused.inc();
                 return error.FileTooBig;
@@ -2933,7 +2954,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             var old_size = self.claimedSize(local, probe);
             // The promotion's layout RMW runs under the (3.7) guard the
             // write took; the data plane's own I/O below runs without it.
-            if (kindOf(rec) != .striped) old_size = try self.promoteToStriped(c, local, rec, probe.size);
+            if (kind != .striped) old_size = try self.promoteToStriped(c, local, rec, probe.size);
             self.dropLayoutLock(layout_lock);
             const payload: write_admit.Payload = if (a.held) |h|
                 (if (self.data.canStoreHeld()) write_admit.Payload{ .slot = .{ .src = h.src, .class = if (h.class == .direct_gup) .odirect else .page_cache, .commit_retain = false, .ctx = h.ctx, .extract = h.extract } } else .{ .bytes = try self.payloadBytes(a) })

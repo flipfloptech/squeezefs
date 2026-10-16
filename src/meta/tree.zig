@@ -736,6 +736,19 @@ pub const KvTree = struct {
         return try gpa.dupe(u8, v);
     }
 
+    /// `lookup` without the copy: `visit(ctx, value)` reads the live value
+    /// borrowed under the leaf snapshot's pin; null for an absent key. `gpa`
+    /// is touched only by a delta fold (`NodeSnapshot.lookup` step 3).
+    pub fn lookupView(self: *KvTree, gpa: Allocator, k: []const u8, comptime T: type, ctx: anytype, comptime visit: fn (@TypeOf(ctx), []const u8) T) Error!?T {
+        const leaf = try self.descend(k, 0);
+        defer leaf.release();
+        const snap = leaf.snapshotLoad();
+        defer snap.release();
+        var l = try snap.value.lookup(gpa, k);
+        defer l.deinit();
+        return visit(ctx, l.liveValue() orelse return null);
+    }
+
     // ---- the commit path: resolve → lock → revalidate → apply ----
 
     /// THE lock-window primitive (module doc). Never performs I/O and
@@ -1409,6 +1422,27 @@ test "point_ops_insert_overwrite_delete_reinsert: LWW by seq, tombstones fold to
     @memset(big, 0);
     try t.insert(&ikey(1), big[0..cap]);
     try testing.expectError(error.ValueTooLarge, t.insert(&ikey(2), big));
+}
+
+test "lookupView reads the live value borrowed — an overlay head, then the base after write-back — with an allocator that refuses every allocation; absent and tombstoned keys visit nothing" {
+    var vol = try smo.TestVolume.init(testing.allocator, .{});
+    defer vol.deinit();
+    const t = try vol.createTree(.native);
+    var refusing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    const Eq = struct {
+        fn f(want: []const u8, v: []const u8) bool {
+            return std.mem.eql(u8, want, v);
+        }
+    };
+    var buf: [64]u8 = undefined;
+    try testing.expectEqual(@as(?bool, null), try t.lookupView(refusing.allocator(), &ikey(7), bool, @as([]const u8, ""), Eq.f));
+    try t.insert(&ikey(7), testValue(7, 48, &buf));
+    try testing.expectEqual(@as(?bool, true), try t.lookupView(refusing.allocator(), &ikey(7), bool, testValue(7, 48, &buf), Eq.f));
+    try vol.flushDirty(t);
+    try testing.expectEqual(@as(?bool, true), try t.lookupView(refusing.allocator(), &ikey(7), bool, testValue(7, 48, &buf), Eq.f));
+    try t.delete(&ikey(7));
+    try testing.expectEqual(@as(?bool, null), try t.lookupView(refusing.allocator(), &ikey(7), bool, @as([]const u8, ""), Eq.f));
+    try testing.expectEqual(@as(usize, 0), refusing.allocations);
 }
 
 test "range_scan_folds_orders_and_resumes: tombstones and overwrites fold through the scan; chunks stitch; both bounds hold" {

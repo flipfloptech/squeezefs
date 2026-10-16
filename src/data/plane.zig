@@ -2270,10 +2270,16 @@ pub const DataPlane = struct {
             if (std.mem.eql(u8, xv.name, layout.LAYOUT_XATTR_NAME)) return .{ .value = v, .coll_seq = 0 };
             self.gpa.free(v);
         }
+        return self.layoutChain(ino, h);
+    }
+
+    /// The layout record off its xattr chain when slot 0 is not `layout`.
+    fn layoutChain(self: *DataPlane, ino: u64, h: u64) Error!?LayoutRecord {
         var kvs: std.ArrayList(tree.KeyValue) = .empty;
         defer tree.deinitKeyValues(self.gpa, &kvs);
+        const start = key.xattrKey(ino, h, 0);
         const end = key.xattrKey(ino, h, std.math.maxInt(u8));
-        self.backend.range(self.gpa, key.TREE_XATTRS, &start, &end, 256, &kvs) catch |e| return KvBackend.coreError(e);
+        self.backend.range(self.gpa, key.TREE_XATTRS, &start, &end, std.math.maxInt(u8) + 1, &kvs) catch |e| return KvBackend.coreError(e);
         for (kvs.items) |kv| {
             const xv = record.XattrValue.decode(kv.value) catch return error.InputOutput;
             if (std.mem.eql(u8, xv.name, layout.LAYOUT_XATTR_NAME)) {
@@ -2281,6 +2287,43 @@ pub const DataPlane = struct {
             }
         }
         return null;
+    }
+
+    /// What one op needs of `ino`'s layout (`layout.resolvePoint`) read off
+    /// the node cache's borrowed record: no copy, no allocation, O(log
+    /// entries) whatever the file's size (`docs/evidence/rung-10-
+    /// layoutlookup.md`). Null = no record (an inline file).
+    fn layoutPoint(self: *DataPlane, ino: u64, block: ?u32) Error!?layout.Point {
+        const Probe = union(enum) { point: layout.Point, other_name, corrupt };
+        const Q = struct {
+            geo: layout.Geometry,
+            block: ?u32,
+            fn visit(q: @This(), v: []const u8) Probe {
+                const xv = record.XattrValue.decode(v) catch return .corrupt;
+                if (!std.mem.eql(u8, xv.name, layout.LAYOUT_XATTR_NAME)) return .other_name;
+                return .{ .point = layout.resolvePoint(xv.value, q.geo, q.block) catch return .corrupt };
+            }
+        };
+        const q: Q = .{ .geo = self.geo, .block = block };
+        // A foreign record is the holder's, owned (`layoutRecord`).
+        const value = if (self.foreign_layout) |f| switch (try f.lookup(f.ctx, self.gpa, ino)) {
+            .local => null,
+            .gone => return null,
+            .foreign => |x| x.layout orelse return null,
+        } else null;
+        const owned = value orelse local: {
+            const h = key.xattrNameHash56(layout.LAYOUT_XATTR_NAME, self.name_key);
+            switch ((self.backend.lookupView(self.gpa, key.TREE_XATTRS, &key.xattrKey(ino, h, 0), Probe, q, Q.visit) catch |e| return KvBackend.coreError(e)) orelse .other_name) {
+                .point => |p| return p,
+                .corrupt => return error.InputOutput,
+                .other_name => break :local ((try self.layoutChain(ino, h)) orelse return null).value,
+            }
+        };
+        defer self.gpa.free(owned);
+        return switch (Q.visit(q, owned)) {
+            .point => |p| p,
+            .other_name, .corrupt => error.InputOutput,
+        };
     }
 
     fn inodeSize(self: *DataPlane, ino: u64) Error!?u64 {
@@ -2292,20 +2335,20 @@ pub const DataPlane = struct {
                 return x.size;
             },
         };
-        const bytes = (self.backend.lookup(self.gpa, key.TREE_INODES, &key.inodeKey(ino)) catch |e| return KvBackend.coreError(e)) orelse return null;
-        defer self.gpa.free(bytes);
-        const v = record.InodeValue.decode(bytes) catch return error.InputOutput;
-        return @max(v.size, if (self.claims) |c| c.claimOf(c.ctx, ino) else 0);
+        const Size = struct {
+            fn of(_: void, bytes: []const u8) ?u64 {
+                return (record.InodeValue.decode(bytes) catch return null).size;
+            }
+        };
+        const size = (self.backend.lookupView(self.gpa, key.TREE_INODES, &key.inodeKey(ino), ?u64, {}, Size.of) catch |e| return KvBackend.coreError(e)) orelse return null;
+        return @max(size orelse return error.InputOutput, if (self.claims) |c| c.claimOf(c.ctx, ino) else 0);
     }
 
     fn mapLookup(ctx: *anyopaque, ino: u64, block: u32) ?Mapping {
         const self: *DataPlane = @ptrCast(@alignCast(ctx));
-        const rec = (self.layoutRecord(ino) catch return null) orelse return null;
-        defer self.gpa.free(rec.value);
-        const l = layout.XattrLayout.decode(rec.value, self.geo) catch return null;
-        if (l.kind != .striped) return null;
-        if (!l.isKvmap()) return l.lookup(self.chunk, block);
-        return self.kvmapLookup(ino, l, block);
+        const p = (self.layoutPoint(ino, block) catch return null) orelse return null;
+        if (p.kind != .striped) return null;
+        return if (p.kvmap) |head| self.kvmapLookup(ino, head, block) else p.binding;
     }
 
     /// The tree-mapped resolve ladder: an index at or above a live sweep
@@ -2313,8 +2356,8 @@ pub const DataPlane = struct {
     /// verdict (a filled span's miss is a definitive hole); then the tree —
     /// ONE range page filled into the store. An unresolvable record is loud
     /// (`kvmap_resolve_failures`), never a fabricated hole.
-    fn kvmapLookup(self: *DataPlane, ino: u64, head: layout.Layout, block: u32) ?Mapping {
-        if (head.kvmapHead().?.sweep) |k| if (block >= k) return null;
+    fn kvmapLookup(self: *DataPlane, ino: u64, head: layout.Layout.KvmapHead, block: u32) ?Mapping {
+        if (head.sweep) |k| if (block >= k) return null;
         if (self.windows.probe(ino, block)) |p| return switch (p) {
             .hole => null,
             .mapping => |m| m,
@@ -2339,9 +2382,7 @@ pub const DataPlane = struct {
     fn mapView(ctx: *anyopaque, ino: u64) ?seams.FileView {
         const self: *DataPlane = @ptrCast(@alignCast(ctx));
         const size = (self.inodeSize(ino) catch return null) orelse return null;
-        const rec = (self.layoutRecord(ino) catch return null) orelse return .{ .kind = .inline_, .size = size, .map_resident = true };
-        defer self.gpa.free(rec.value);
-        const l = layout.XattrLayout.decode(rec.value, self.geo) catch return null;
+        const l = (self.layoutPoint(ino, null) catch return null) orelse return .{ .kind = .inline_, .size = size, .map_resident = true };
         // A tree-mapped head resolves through `kvmapLookup` as the inline
         // map does through the record: the map is resident either way.
         return .{ .kind = switch (l.kind) {
@@ -3135,23 +3176,19 @@ pub const DataPlane = struct {
     fn metaFile(ctx: *anyopaque, ino: u64) ?read_path.FileInfo {
         const self: *DataPlane = @ptrCast(@alignCast(ctx));
         const size = (self.inodeSize(ino) catch return null) orelse return null;
-        const rec = (self.layoutRecord(ino) catch return null) orelse return .{ .size = size, .kind = .inline_ };
-        defer self.gpa.free(rec.value);
-        const l = layout.XattrLayout.decode(rec.value, self.geo) catch return null;
-        return .{ .size = size, .kind = l.kind, .file_id = l.file_id, .durable_copy = l.durableCopy() };
+        const p = (self.layoutPoint(ino, null) catch return null) orelse return .{ .size = size, .kind = .inline_ };
+        return .{ .size = size, .kind = p.kind, .file_id = p.file_id, .durable_copy = p.durable_copy };
     }
 
     /// `metaFile` + `metaBinding(block)` over ONE layout-record read.
     fn metaFileAt(ctx: *anyopaque, ino: u64, block: u64) ?read_path.FileAt {
         const self: *DataPlane = @ptrCast(@alignCast(ctx));
         const size = (self.inodeSize(ino) catch return null) orelse return null;
-        const rec = (self.layoutRecord(ino) catch return null) orelse return .{ .info = .{ .size = size, .kind = .inline_ }, .binding = null };
-        defer self.gpa.free(rec.value);
-        const l = layout.XattrLayout.decode(rec.value, self.geo) catch return null;
-        const info: read_path.FileInfo = .{ .size = size, .kind = l.kind, .file_id = l.file_id, .durable_copy = l.durableCopy() };
-        if (l.kind != .striped or block > std.math.maxInt(u32)) return .{ .info = info, .binding = null };
-        const b: u32 = @intCast(block);
-        return .{ .info = info, .binding = if (!l.isKvmap()) l.lookup(self.chunk, b) else self.kvmapLookup(ino, l, b) };
+        const b = std.math.cast(u32, block);
+        const p = (self.layoutPoint(ino, b) catch return null) orelse return .{ .info = .{ .size = size, .kind = .inline_ }, .binding = null };
+        const info: read_path.FileInfo = .{ .size = size, .kind = p.kind, .file_id = p.file_id, .durable_copy = p.durable_copy };
+        if (p.kind != .striped or b == null) return .{ .info = info, .binding = null };
+        return .{ .info = info, .binding = if (p.kvmap) |head| self.kvmapLookup(ino, head, b.?) else p.binding };
     }
 
     fn metaBinding(ctx: *anyopaque, ino: u64, block: u64) ?Mapping {

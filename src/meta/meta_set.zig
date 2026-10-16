@@ -375,6 +375,16 @@ pub const MetaSet = struct {
         };
     }
 
+    /// `lookup` over the borrowed value (`KvTree.lookupView`): no copy.
+    pub fn lookupView(self: *MetaSet, gpa: Allocator, kind: u8, k: []const u8, comptime T: type, ctx: anytype, comptime visit: fn (@TypeOf(ctx), []const u8) T) Error!?T {
+        const t = (try self.treeOfKey(kind, k)) orelse return null;
+        return t.lookupView(gpa, k, T, ctx, visit) catch |e| switch (e) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.Io => error.Io,
+            else => error.Corrupt,
+        };
+    }
+
     /// Range scan over `[start, end]` of one kind. Bounds of an ino-major
     /// kind inside one slot read its tree; bounds spanning slots (the
     /// corpse sweep, the layout census) and EVERY refs range (a ref key

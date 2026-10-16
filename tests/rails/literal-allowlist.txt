@@ -137,7 +137,6 @@ src/data/layout.zig:989 | 4 | f552a1bd33b64efe | OWED: derive it or document it 
 src/data/nvme_read_cache.zig:149 | 56 | 97f6dfc9c3ca789e | OWED: derive it or document it on the line (charter §1.5)
 src/data/nvme_read_cache.zig:559 | 4096 | 78e671ecc8862f6f | OWED: derive it or document it on the line (charter §1.5)
 src/data/pack.zig:283 | 1000 | 5dbb614c5d8ae749 | OWED: derive it or document it on the line (charter §1.5)
-src/data/plane.zig:2216 | 256 | cab2d6c1b9b8f351 | OWED: derive it or document it on the line (charter §1.5)
 src/data/prefetch.zig:223 | 64 | 54bcb91f3bc4a0bd | a percentage — OWED: derive it (charter §1.5) or document the measured reason
 src/data/prefetch.zig:223 | 64 | 54bcb91f3bc4a0bd | a percentage — OWED: derive it (charter §1.5) or document the measured reason
 src/data/prefetch.zig:470 | 16 | 1854363a500b7b7f | OWED: derive it or document it on the line (charter §1.5)

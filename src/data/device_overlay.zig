@@ -254,8 +254,11 @@ pub const Core = struct {
     claims: [CLAIM_WORDS]Atomic(u64) = @splat(.init(0)),
     /// The lock-free published coverage face — set only by a full-success CQE.
     covered: [CLAIM_WORDS]Atomic(u64) = @splat(.init(0)),
-    /// The coverage LAW (shared with RAM accumulation); mutated under (3).
+    /// The coverage LAW (shared with RAM accumulation); every access under
+    /// `union_lock` but the settle's, which reads it Frozen with nothing in
+    /// flight (stores land holding no (3): their CQEs meet only here).
     union_: CoverageUnion = .empty,
+    union_lock: jc.SpinLock = .{},
     block_len: u32,
     pages: u32,
     /// Registry-monotone identity (offsets are reused; births are not).
@@ -318,8 +321,12 @@ pub const Core = struct {
         if (anyBit(&self.claims, first_page, pages)) return error.Overlap;
         // A pending claim is a run-to-be: the union must have room for it
         // and for every other in-flight claim (conservative: inflight runs
-        // are counted as disjoint).
-        if (!self.union_.hasHeadroom(@as(usize, self.inflight.load(.monotonic)) + 1)) return error.RunTableFull;
+        // are counted as disjoint). `inflight` is read under the lock: a
+        // CQE records its run before it decrements, so either side is seen.
+        self.union_lock.lock();
+        const room = self.union_.hasHeadroom(@as(usize, self.inflight.load(.monotonic)) + 1);
+        self.union_lock.unlock();
+        if (!room) return error.RunTableFull;
         setBits(&self.claims, first_page, pages);
         // Dekker, writer side: publish inflight, THEN read state (both SeqCst).
         _ = self.inflight.fetchAdd(1, .seq_cst);
@@ -332,8 +339,9 @@ pub const Core = struct {
         return .{ .first_page = first_page, .pages = pages, .generation = g };
     }
 
-    /// At the CQE (under (3)): a terminal record ⇒ superseded; success ⇒
-    /// the union records the run, then the covered bits publish (SeqCst
+    /// At the CQE (no block guard: disjoint stores land concurrently, §3.3):
+    /// a terminal record ⇒ superseded; success ⇒ the union records the run
+    /// under `union_lock`, then the covered bits publish (SeqCst
     /// `fetch_or`); failure ⇒ nothing covered. The claim releases ONLY here;
     /// `inflight −= 1` last (the freezer's drain observes the final coverage).
     pub fn completeStore(self: *Core, t: Ticket, success: bool) CompleteVerdict {
@@ -343,10 +351,16 @@ pub const Core = struct {
         if (!success) return .not_covered;
         const start = t.first_page * OVERLAY_PAGE;
         const end = (t.first_page + t.pages) * OVERLAY_PAGE;
+        self.union_lock.lock();
         // `beginStore` reserved the headroom; a refusal here is unreachable.
         const v = self.union_.record(start, end, self.block_len) catch unreachable;
+        const full = v.completed or self.union_.isFull(self.block_len);
+        self.union_lock.unlock();
         setBits(&self.covered, t.first_page, t.pages);
-        return .{ .covered = .{ .coverage_complete = v.completed or self.union_.isFull(self.block_len) } };
+        // Frozen while this claim still holds the record live: past the
+        // decrement a settle may retire it and the slot host a new record.
+        if (full) _ = self.freeze();
+        return .{ .covered = .{ .coverage_complete = full } };
     }
 
     /// Claims first (an in-flight range is never served, even a re-write of
@@ -696,6 +710,13 @@ pub const StoreOutcome = union(enum) {
         /// ACK-early: the DMA lands on a detached continuation.
         acked_early: bool,
     },
+    /// The range is claimed under the caller's (3); the caller DROPS (3)
+    /// and `land`s it: the claim, not the guard, excludes an overlapping
+    /// DMA (§3.3), so a sequential stream's writes into one block land
+    /// side by side (rung-10-seqwrite: the guard held across the DMA
+    /// serialized 1M seq write ×4 four writes per block, 54 % of the
+    /// writes parked 7 ms).
+    claimed: Claimed,
     declined,
     /// The pipe is full and the store will not park under the caller's (3):
     /// the in-flight permits belong to uploads that re-take that guard to
@@ -705,6 +726,17 @@ pub const StoreOutcome = union(enum) {
     /// guard, parks at the governor holding no lock, and retries the ladder
     /// with the permit in `StoreRequest.permit`.
     governor_full,
+};
+
+/// A granted claim owed its DMA and CQE (`Overlay.land`). The record stays
+/// live: every teardown awaits `inflight`, which this claim holds.
+pub const Claimed = struct {
+    rec: *Record,
+    ticket: Ticket,
+    permit: ?pipeline.Permit,
+    rel: u32,
+    vehicle: Vehicle,
+    overwrite: bool,
 };
 
 pub const StoreError = error{ InputOutput, VolumeFailed, WriterGuardFenced, OutOfMemory, WorkerShutdown, QueueFull, NoSpaceLeft, ReadOnlyFileSystem };
@@ -772,9 +804,18 @@ pub const Overlay = struct {
 
     // ---- §3.4 install / store / CQE ----
 
-    /// Arm B under (3). `.declined` falls through to the next arm; an error
-    /// fails THIS write loud (nothing acked, nothing parked, nothing lost).
+    /// Arm B, landed inline: for a caller holding no block guard (tests).
     pub fn store(self: *Overlay, io: Io, req: StoreRequest) StoreError!StoreOutcome {
+        return switch (try self.claim(io, req)) {
+            .claimed => |c| self.land(io, c),
+            else => |o| o,
+        };
+    }
+
+    /// Arm B under (3). `.claimed` is the caller's to `land` after it
+    /// drops (3); `.declined` falls through to the next arm; an error
+    /// fails THIS write loud (nothing acked, nothing parked, nothing lost).
+    pub fn claim(self: *Overlay, io: Io, req: StoreRequest) StoreError!StoreOutcome {
         // The permit is UNSPENT in `pre` until the claim lands (step 5):
         // every earlier exit returns it, the caller's pre-admission too.
         var pre = req.permit;
@@ -841,7 +882,7 @@ pub const Overlay = struct {
         // 6. ACK-early: a sound (page-cache) held slot under retention
         //    lands on a detached continuation; the O_DIRECT class only
         //    under its opt-in, as a SNAPSHOT (the 2026-08-09 aliasing).
-        if (req.vehicle == .slot) {
+        if (req.vehicle == .slot) early: {
             const sv = req.vehicle.slot;
             const early = self.cfg.ack_early and sv.commit_retain and (sv.class == .page_cache or (self.cfg.ack_early_odirect and sv.extract != null));
             if (early) {
@@ -857,23 +898,26 @@ pub const Overlay = struct {
                     break :blk b;
                 } else null;
                 self.tasks.spawn(io, ackEarlyContinuation, .{ self, io, rec, ticket, permit, sv, snapshot, len, req.overwrite }) catch {
-                    // No unit of concurrency: land it inline (still acked
-                    // only after the CQE — the sound fallback).
+                    // No unit of concurrency: the caller lands it (still
+                    // acked only after the CQE — the sound fallback).
                     _ = rec.acked_pending.fetchSub(1, .acq_rel);
-                    return self.storeSync(io, rec, ticket, permit, req, len);
+                    break :early;
                 };
                 return .{ .stored = .{ .coverage_complete = false, .acked_early = true } };
             }
         }
-        return self.storeSync(io, rec, ticket, permit, req, len);
+        return .{ .claimed = .{ .rec = rec, .ticket = ticket, .permit = permit, .rel = req.rel, .vehicle = req.vehicle, .overwrite = req.overwrite } };
     }
 
-    fn storeSync(self: *Overlay, io: Io, rec: *Record, ticket: Ticket, permit: ?pipeline.Permit, req: StoreRequest, len: u64) StoreError!StoreOutcome {
-        self.dmaVehicle(io, rec, rec.dest.offset + req.rel, req.vehicle) catch |e| {
-            _ = self.finishStore(io, rec, ticket, permit, len, req.overwrite, false);
+    /// The claimed store's DMA and CQE, holding NO block guard (a settle
+    /// under (3) awaits this CQE: landing under a guard would deadlock it).
+    pub fn land(self: *Overlay, io: Io, c: Claimed) StoreError!StoreOutcome {
+        const len: u64 = c.vehicle.len();
+        self.dmaVehicle(io, c.rec, c.rec.dest.offset + c.rel, c.vehicle) catch |e| {
+            _ = self.finishStore(io, c.rec, c.ticket, c.permit, len, c.overwrite, false);
             return e;
         };
-        return self.finishStore(io, rec, ticket, permit, len, req.overwrite, true);
+        return self.finishStore(io, c.rec, c.ticket, c.permit, len, c.overwrite, true);
     }
 
     /// The two vehicles, one contract: the slot's direct leg (`WRITE_FIXED`),
@@ -930,12 +974,10 @@ pub const Overlay = struct {
         stats.overlay_store_bytes.add(len);
         if (overwrite) stats.overlay_overwrite_bytes.add(len);
         return switch (verdict) {
-            .covered => |c| blk: {
-                if (c.coverage_complete) _ = rec.core.freeze();
-                break :blk .{ .stored = .{ .coverage_complete = c.coverage_complete, .acked_early = false } };
-            },
+            .covered => |c| .{ .stored = .{ .coverage_complete = c.coverage_complete, .acked_early = false } },
             .superseded => blk: {
-                stats.overlay_store_superseded_under_guard.fire("a store completed on a record terminal under the writer's guard");
+                // Every terminal transition awaits `inflight`, which this store held.
+                stats.overlay_store_superseded_under_guard.fire("a store completed on a record that went terminal while it was in flight");
                 break :blk .{ .stored = .{ .coverage_complete = false, .acked_early = false } };
             },
             .not_covered => .{ .stored = .{ .coverage_complete = false, .acked_early = false } },
@@ -1467,7 +1509,9 @@ pub const Overlay = struct {
             if (rec.core.stateNow().isTerminal()) return .settle;
             // Covered runs from dest; gaps collected between them.
             var runs_buf: [CoverageUnion.max_runs]cov.Run = undefined;
+            rec.core.union_lock.lock();
             const runs = rec.core.union_.coveredRunsIn(rel, end, &runs_buf);
+            rec.core.union_lock.unlock();
             var cursor: u32 = rel;
             var gap_bytes: u64 = 0;
             var ok = true;
@@ -1567,12 +1611,14 @@ test "overlay_core: coverage publishes only on a successful complete (law 3); th
     try testing.expect(c.coveredProbe(2, 6));
     try testing.expectEqual(CompleteVerdict{ .covered = .{ .coverage_complete = true } }, c.completeStore(t2, true));
     try testing.expect(c.union_.isFull(8 * OVERLAY_PAGE));
+    try testing.expectEqual(State.frozen, c.stateNow()); // the completing CQE froze it before releasing its claim
     try testing.expect(c.inflightEmpty());
     // A snapshot taken before an accept is invalid afterwards (equality).
-    const snap = c.readBegin();
-    try testing.expect(c.readValid(snap));
-    _ = try c.beginStore(0, 1);
-    try testing.expect(!c.readValid(snap));
+    var e = Core.init(8 * OVERLAY_PAGE, 2);
+    const snap = e.readBegin();
+    try testing.expect(e.readValid(snap));
+    _ = try e.beginStore(0, 1);
+    try testing.expect(!e.readValid(snap));
 }
 
 test "overlay_core: freeze refuses new stores and the in-flight set drains to publishable; law 9 rollback requires terminal ∧ empty; fence_drop is terminal and never publishable; fed is reachable only from the freeze" {

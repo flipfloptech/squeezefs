@@ -931,7 +931,18 @@ pub const WritePath = struct {
                 const overwrite = self.map.lookup(req.ino, pc.block) != null;
                 const handed = overlay_permit;
                 overlay_permit = null;
-                switch (try self.overlay.store(io, .{ .ino = req.ino, .block = pc.block, .rel = pc.rel, .vehicle = vehicle, .file = file, .overwrite = overwrite, .permit = handed })) {
+                const stored = switch (try self.overlay.claim(io, .{ .ino = req.ino, .block = pc.block, .rel = pc.rel, .vehicle = vehicle, .file = file, .overwrite = overwrite, .permit = handed })) {
+                    // The claim excludes an overlapping DMA, not (3): a
+                    // sibling write into this block lands beside this one.
+                    .claimed => |c| landed: {
+                        held = false;
+                        g.release(io);
+                        break :landed try self.overlay.land(io, c);
+                    },
+                    else => |o| o,
+                };
+                switch (stored) {
+                    .claimed => unreachable, // landed above
                     .stored => |s| {
                         stats.admit_write_overlay_bytes.add(pc.len);
                         if (s.coverage_complete) hint = .overlay_drain;

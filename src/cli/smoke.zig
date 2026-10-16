@@ -2012,6 +2012,14 @@ test "smoke: THE TWO-DAEMON MATRIX — mount A (the manager) → mount B as a SE
     // from A (its slots are the manager's now).
     try b.umount();
     try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try b.waitExit());
+    {
+        // B's leave flushes its last shipped frees: a Freed verdict for a
+        // block B never tracked (A minted it for its write into B's file)
+        // retires nothing here and fires no tripwire.
+        const text = try b.readLog();
+        defer gpa.free(text);
+        try testing.expect(std.mem.indexOf(u8, text, "INVARIANT TRIPWIRE") == null);
+    }
     try testing.expectEqual(@as(usize, 0), try fuseMountsOf(gpa, io, b.mp));
     {
         const r = try rig.squeezefs(&.{ "appenders", "--json", rig.meta_uri });

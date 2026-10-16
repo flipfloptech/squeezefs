@@ -897,3 +897,23 @@ test "the writer key folds the identity's stable pair: equal for one mount, dist
     try testing.expect(a != b);
     try testing.expect(a != HOLDER_WRITER and b != HOLDER_WRITER);
 }
+
+test "a joiner's Freed or NonTerminal verdict for a block it never tracked touches no RAM count: the reclaimer ships an untracked block by design (a block the holder minted that a served layout publish bound into this mount's tree, displaced by a later merge), so the retire and the release refuse nothing and fire no double-release tripwire; a tracked block still retires its count" {
+    const a = try block_alloc.BlockAllocator.init(testing.allocator, .{ .vol_tag = 0xF1, .vol = 0, .block_size = 4096, .capacity_bytes = 64 * 4096 });
+    defer a.deinit();
+    const mine = try a.allocateBlock();
+    a.publishBlock(mine.idx);
+    var v: WriterPlane.Vol = .{ .vol_tag = 0xF1, .ordinal = 0, .alloc = a, .arm = .{ .capacity_blocks = a.capacityBlocks() }, .src = undefined, .shipper = undefined, .writer = undefined };
+    const refused0 = counters.tripwireCount("block_untracked_free_refusals");
+    const holders: u64 = 40;
+    WriterPlane.trackRetire(&v, 0xF1, holders);
+    WriterPlane.trackRelease(&v, 0xF1, holders);
+    try testing.expectEqual(refused0, counters.tripwireCount("block_untracked_free_refusals"));
+    try testing.expectEqual(@as(?u32, null), a.refcount(holders));
+    // The holder cleared its bit either way: `df` projects the Freed one.
+    try testing.expectEqual(@as(u64, 1), v.freed_since_word.load(.acquire));
+    WriterPlane.trackRetire(&v, 0xF1, mine.idx);
+    try testing.expectEqual(@as(?u32, null), a.refcount(mine.idx));
+    try testing.expectEqual(@as(u64, 2), v.freed_since_word.load(.acquire));
+    try testing.expectEqual(refused0, counters.tripwireCount("block_untracked_free_refusals"));
+}

@@ -269,7 +269,9 @@ pub fn build(b: *std.Build) void {
             " (cost table: no row; limit: 2.0s) [squeezefs-hangwatch-selftest]\n",
             " state R cpu ", // the spinning thread, from /proc/self/task
             "user stack of thread ",
-            "in test.hangwatch: a spinning test never returns (hangwatch_selftest.zig)", // its user stack is in the spin
+            // its user stack is in the spin (the frame's unit in parentheses is the source file on
+            // x86_64's self-hosted backend, the binary's name under aarch64's LLVM: match up to it)
+            "in test.hangwatch: a spinning test never returns (",
         }) |m| run_hang.expectStdErrMatch(m);
         rails_step.dependOn(&run_hang.step);
     }

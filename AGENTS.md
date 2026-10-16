@@ -28,13 +28,16 @@ the **7.2.6-sqz** kernel series (`scripts/kernel/patches-7.2/`) with Zig 0.17.0 
 at the same absolute path, and runs commands as root:
 - `local` (`SQZ_VENUE=local`; the default when the controller is Linux): THIS host —
   commands run through `sudo` in this tree, no sync, no VM. Set it up once with
-  `scripts/dev/provision-local-venue` (checks the distro, zig on root's PATH, the sqz kernel
+  `scripts/dev/provision-local-venue` (checks the distro — Debian/Ubuntu with apt, or Arch
+  and its derivatives such as Omarchy with pacman —, zig on root's PATH, the sqz kernel
   and `fuse.enable_uring`, the nvmet/brd/null_blk modules, the packages, the build root,
-  passwordless sudo; prints each fix; `--apply` does the packages, modules, IOR/mdtest and
-  directories — never a kernel install or a reboot). The kernel:
-  `scripts/kernel/build-host-kernel --local` builds and installs the .debs here; reboot
-  into it yourself. Build slots: one per 4 threads and per 8 GiB (`SQZ_VENUE_SLOTS`
-  overrides; every controller of one build root must agree).
+  passwordless sudo; prints each fix; `--apply` does the packages, modules, the boot
+  parameter in GRUB or Limine, IOR/mdtest and directories — never a kernel install or a
+  reboot). The kernel: on Debian/Ubuntu `scripts/kernel/build-host-kernel --local` builds
+  and installs the .debs here; on Arch/Omarchy it is the distro kernel's PKGBUILD plus the
+  sqz series, built with makepkg and installed with pacman (owner ruling 2026-10-16; not
+  scripted yet). Reboot into it yourself. Build slots: one per 4 threads and per 8 GiB
+  (`SQZ_VENUE_SLOTS` overrides; every controller of one build root must agree).
 - `vm` (the default on the Mac): the macOS `container` `sqz-zig` — aarch64, Ubuntu 24.04,
   this repo mounted rw at the same path.
 - `kamrui` (`SQZ_VENUE=kamrui`): the x86_64 box `kamrui-dev` over ssh — 12 threads,

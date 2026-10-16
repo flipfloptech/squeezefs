@@ -5,18 +5,24 @@
 #
 #   scripts/dev/provision-local-venue           # check only; exit 1 when something is missing
 #   scripts/dev/provision-local-venue --apply   # also fix what is safe to fix, then re-check:
-#       apt-install the missing packages, then scripts/dev/provision-ssh-venue (the nvmet
-#       modules loaded and persisted, the nvme_core boot parameter, IOR/mdtest into
-#       /opt/sqz-tools, root-MPI env, the build root's directories)
+#       install the missing packages (apt or pacman), then scripts/dev/provision-ssh-venue
+#       (the nvmet modules loaded and persisted, the nvme_core boot parameter in GRUB or
+#       Limine, IOR/mdtest into /opt/sqz-tools, root-MPI env, the build root's directories)
 #
-# Never done here: a kernel install (scripts/kernel/build-host-kernel --local), a reboot, a
-# filesystem, LV or sudoers change — those print as commands to run.
+# Two package families: Debian/Ubuntu (apt, dpkg; the sqz kernel as .debs from
+# scripts/kernel/build-host-kernel) and Arch and its derivatives such as Omarchy (pacman;
+# the sqz kernel as the distro kernel's PKGBUILD plus the sqz series, built with makepkg).
+#
+# Never done here: a kernel install, a reboot, a filesystem, LV or sudoers change — those
+# print as commands to run.
 set -uo pipefail
 
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 ROOT=${SQZ_BUILD_ROOT:-/build}
 REF=${SQZ_REFERENCE:-$HOME/Source/squeezefs}
 ZIG_WANT=0.17.0
+# build-host-kernel's release string; a PKGBUILD-built kernel carries the sqz tag in its own
+# form (7.2.x-N-omarchy-sqz), so the kernel check looks for the tag, not this string.
 KVER=7.2.6-sqz
 apply=0
 case "${1:-}" in --apply) apply=1 ;; '') ;; *) echo "usage: provision-local-venue [--apply]" >&2; exit 2 ;; esac
@@ -29,7 +35,13 @@ miss() { printf '  MISSING  %s\n' "$1"; shift; for l in "$@"; do printf '       
 [ "$(uname -s)" = Linux ] || { echo "provision-local-venue: this host is $(uname -s); on macOS the venue is the vm (scripts/venue up)" >&2; exit 2; }
 . /etc/os-release
 echo "== host: $PRETTY_NAME, $(uname -m), $(nproc) threads, $(awk '/^MemTotal:/ { print int($2 / 1048576) }' /proc/meminfo) GiB"
-case $ID in ubuntu | debian) ;; *) note "$ID is untested: the scripts assume apt, dpkg and bindeb-pkg" ;; esac
+# The package family: the package names, the installer and how the kernel is packaged.
+# A derivative names its parent in ID_LIKE (Omarchy: ID=omarchy ID_LIKE=arch).
+case " $ID ${ID_LIKE:-} " in
+  *" ubuntu "* | *" debian "*) FAMILY=deb ;;
+  *" arch "*) FAMILY=arch ;;
+  *) FAMILY=deb; note "$ID is untested: the scripts know apt/dpkg (Debian, Ubuntu) and pacman (Arch); assuming apt" ;;
+esac
 note "one architecture per venue: $(uname -m) here; the other architecture's coverage needs a second venue (the Mac's vm for aarch64, or an ssh box)"
 [ "$ID-$VERSION_ID" = ubuntu-26.04 ] && note "Ubuntu 26.04 ships uutils coreutils — already handled: dd ftruncates its output after the last write (the smoke writes with conv=notrunc); 'sync FILE' is a host-wide sync(2) (tests/rails.zig's sync scanner counts it)"
 
@@ -41,18 +53,34 @@ else
 fi
 
 echo "== zig $ZIG_WANT"
-zig_fix="curl -fsSL https://ziglang.org/download/$ZIG_WANT/zig-$(uname -m)-linux-$ZIG_WANT.tar.xz | sudo tar -xJ -C /opt && sudo ln -sfn /opt/zig-$(uname -m)-linux-$ZIG_WANT/zig /usr/local/bin/zig"
+if command -v mise >/dev/null; then
+  # A mise-managed zig (owner preference 2026-10-16). Root's login shell has no mise
+  # activation, so root gets a link to the versioned install — never the shim, which resolves
+  # the version from the caller's mise config, and root has none.
+  if p=$(mise where "zig@$ZIG_WANT" 2>/dev/null); then zig_fix="sudo ln -sfn $p/zig /usr/local/bin/zig   # mise's install"
+  else zig_fix="mise use -g zig@$ZIG_WANT && sudo ln -sfn \"\$(mise where zig@$ZIG_WANT)/zig\" /usr/local/bin/zig"; fi
+else
+  zig_fix="curl -fsSL https://ziglang.org/download/$ZIG_WANT/zig-$(uname -m)-linux-$ZIG_WANT.tar.xz | sudo tar -xJ -C /opt && sudo ln -sfn /opt/zig-$(uname -m)-linux-$ZIG_WANT/zig /usr/local/bin/zig"
+fi
 v=$(zig version 2>/dev/null)
 [ "$v" = "$ZIG_WANT" ] && ok "zig $v on PATH" || miss "zig $ZIG_WANT on PATH (have: ${v:-none})" "$zig_fix"
 v=$(sudo -n bash -lc 'zig version' 2>/dev/null)
 [ "$v" = "$ZIG_WANT" ] && ok "zig $v on root's login PATH (sudo bash -lc)" || miss "zig $ZIG_WANT on root's login PATH (have: ${v:-none})" "$zig_fix"
 
 echo "== kernel"
+# The sqz tag in uname -r is the series' contract (the reference's config-fragment).
 kr=$(uname -r)
-if [ "$kr" = "$KVER" ]; then ok "kernel $kr"; else
-  miss "the sqz kernel $KVER (running $kr): FUSE over io_uring, kmbuf, syncfs — patches 0001–0029" \
-    "scripts/kernel/build-host-kernel --local   # builds + installs the .debs (never reboots)" "then REBOOT into $KVER"
-fi
+case $kr in
+  *sqz*) ok "kernel $kr (the sqz series)" ;;
+  *) if [ "$FAMILY" = arch ]; then
+    miss "the sqz kernel (running $kr): FUSE over io_uring, kmbuf, syncfs — patches 0001–0029" \
+      "the distro kernel's PKGBUILD (Omarchy: omacom/omarchy-pkgs pkgbuilds/linux-omarchy-bore) with the sqz series appended, built with makepkg and installed with pacman -U — the mkinitcpio/Limine hooks build the UKI and the boot entry (build-host-kernel --local does not script this yet)" \
+      "then REBOOT into it"
+  else
+    miss "the sqz kernel $KVER (running $kr): FUSE over io_uring, kmbuf, syncfs — patches 0001–0029" \
+      "scripts/kernel/build-host-kernel --local   # builds + installs the .debs (never reboots)" "then REBOOT into $KVER"
+  fi ;;
+esac
 if [ -e /sys/module/fuse/parameters/enable_uring ]; then ok "fuse.enable_uring=$(cat /sys/module/fuse/parameters/enable_uring) (the tests set it)"; else
   miss "fuse.enable_uring (FUSE_IO_URING: a mount has no classical fallback, charter §1.2)" "the sqz kernel (above)"
 fi
@@ -66,21 +94,42 @@ done
   || miss "modules:$lack (the nvmet, NVMe-oF, kTLS and RAM-namespace rows)" "a kernel config that has them: build-host-kernel loads every sqz module before localmodconfig"
 [ -f /etc/modules-load.d/sqz.conf ] && ok "nvmet modules persisted (/etc/modules-load.d/sqz.conf)" \
   || miss "the nvmet modules loaded at boot" "scripts/dev/provision-local-venue --apply"
+# Where provision-ssh-venue persists a kernel parameter: Debian's GRUB drop-ins, or
+# limine-entry-tool's drop-ins (Omarchy); anything else is by hand.
+if [ -d /etc/default/grub.d ]; then cmdline_fix="scripts/dev/provision-local-venue --apply (persists it in GRUB: /etc/default/grub.d/sqz-venue.cfg), then reboot"
+elif [ -d /etc/limine-entry-tool.d ] && command -v limine-mkinitcpio >/dev/null; then cmdline_fix="scripts/dev/provision-local-venue --apply (persists it in Limine: /etc/limine-entry-tool.d/sqz-venue.conf, then limine-mkinitcpio rebuilds the boot image), then reboot"
+elif [ -f /etc/default/grub ]; then cmdline_fix="append it to GRUB_CMDLINE_LINUX_DEFAULT in /etc/default/grub && sudo grub-mkconfig -o /boot/grub/grub.cfg, then reboot"
+else cmdline_fix="append it to the kernel command line in your bootloader's config (neither GRUB drop-ins nor limine-entry-tool here), then reboot"; fi
 grep -q 'nvme_core.fabrics_host_scoped_subsystems=Y' /proc/cmdline && ok "nvme_core.fabrics_host_scoped_subsystems=Y (the nvmet two-identity rows)" \
-  || miss "nvme_core.fabrics_host_scoped_subsystems=Y on the kernel command line (the nvmet two-identity rows)" "scripts/dev/provision-local-venue --apply (persists it in GRUB), then reboot"
+  || miss "nvme_core.fabrics_host_scoped_subsystems=Y on the kernel command line (the nvmet two-identity rows)" "$cmdline_fix"
 
 echo "== packages"
-lock=$REPO/scripts/suites/apt.$ID-$VERSION_ID.lock
 pkgs=()
-if [ -f "$lock" ]; then mapfile -t pkgs < <(cut -d= -f1 "$lock"); else note "no suites lock for $ID-$VERSION_ID (scripts/suites/apt.*.lock): the first suite run pins one"; fi
-# The instruments and the venue's own tools; then build-host-kernel's build dependencies
-# (debhelper provides the debhelper-compat it installs).
-pkgs+=(fio nvme-cli fuse3 util-linux e2fsprogs rsync curl git python3 openssl openmpi-bin libopenmpi-dev
-  build-essential flex bison bc cpio dwarves libelf-dev libdw-dev libssl-dev zstd debhelper)
+if [ "$FAMILY" = deb ]; then
+  lock=$REPO/scripts/suites/apt.$ID-$VERSION_ID.lock
+  pkg_from="suites lock, instruments, kernel build deps"
+  if [ -f "$lock" ]; then mapfile -t pkgs < <(cut -d= -f1 "$lock"); else note "no suites lock for $ID-$VERSION_ID (scripts/suites/apt.*.lock): the first suite run pins one"; fi
+  # The instruments and the venue's own tools; then build-host-kernel's build dependencies
+  # (debhelper provides the debhelper-compat it installs).
+  pkgs+=(fio nvme-cli fuse3 util-linux e2fsprogs rsync curl git python3 openssl openmpi-bin libopenmpi-dev
+    build-essential flex bison bc cpio dwarves libelf-dev libdw-dev libssl-dev zstd debhelper)
+  pkg_have() { dpkg -s "$1" >/dev/null 2>&1; }
+  pkg_install="sudo apt-get install -y --no-install-recommends"
+else
+  note "the external suites (scripts/suites/common.sh: pjdfstest, LTP, xfstests) install with apt: class C runs need a Debian/Ubuntu venue"
+  # The same instruments and tools under their Arch names (libelf carries libdw; openmpi is
+  # one package), then what makepkg needs for the kernel PKGBUILD beyond base-devel —
+  # `makepkg -s` installs the PKGBUILD's own makedepends (rust, xxhash, …) at build time.
+  pkg_from="instruments, kernel build deps"
+  pkgs+=(fio nvme-cli fuse3 util-linux e2fsprogs rsync curl git python openssl openmpi
+    base-devel flex bison bc cpio pahole libelf zstd perl)
+  pkg_have() { pacman -Q "$1" >/dev/null 2>&1; }
+  pkg_install="sudo pacman -S --needed --noconfirm"
+fi
 lackp=()
-for p in $(printf '%s\n' "${pkgs[@]}" | sort -u); do dpkg -s "$p" >/dev/null 2>&1 || lackp+=("$p"); done
-[ ${#lackp[@]} = 0 ] && ok "${#pkgs[@]} packages (suites lock, instruments, kernel build deps)" \
-  || miss "packages: ${lackp[*]}" "sudo apt-get install -y --no-install-recommends ${lackp[*]}   # or --apply"
+for p in $(printf '%s\n' "${pkgs[@]}" | sort -u); do pkg_have "$p" || lackp+=("$p"); done
+[ ${#lackp[@]} = 0 ] && ok "${#pkgs[@]} packages ($pkg_from)" \
+  || miss "packages: ${lackp[*]}" "$pkg_install ${lackp[*]}   # or --apply"
 if PATH=/opt/sqz-tools/bin:$PATH command -v ior >/dev/null && PATH=/opt/sqz-tools/bin:$PATH command -v mdtest >/dev/null; then
   ok "ior/mdtest ($(PATH=/opt/sqz-tools/bin:$PATH command -v ior))"
 else
@@ -124,15 +173,29 @@ else
       "sudo mkdir -p $ROOT && echo '/dev/$vg/sqzbuild $ROOT ext4 defaults,noatime 0 2' | sudo tee -a /etc/fstab && sudo systemctl daemon-reload && sudo mount $ROOT" \
       "then: scripts/dev/provision-local-venue --apply"
   else
+    rootfs=$(findmnt -no FSTYPE /)
+    # On a btrfs root, a TOP-LEVEL subvolume mounted by fstab, as @home is: a root snapshot
+    # (snapper) does not include it and a rollback keeps it; +C (no copy-on-write) spares the
+    # test volumes' random writes the CoW amplification. Mount options are per filesystem on
+    # btrfs, so +C on the directory is the only per-subvolume knob.
+    if [ "$rootfs" = btrfs ]; then
+      dev=$(findmnt -no SOURCE / | sed 's/\[.*//'); uuid=$(findmnt -no UUID /)
+      on_root="a top-level subvolume on the btrfs root fs: sudo mount -o subvolid=5 $dev /mnt && sudo btrfs subvolume create /mnt/@build && sudo umount /mnt && sudo mkdir -p $ROOT && echo 'UUID=$uuid $ROOT btrfs rw,noatime,ssd,space_cache=v2,subvol=/@build 0 0' | sudo tee -a /etc/fstab && sudo systemctl daemon-reload && sudo mount $ROOT && sudo chattr +C $ROOT"
+    else on_root="a directory on the $rootfs root fs: sudo mkdir -p $ROOT"; fi
     miss "the build root $ROOT: an ext4 filesystem of its own (a spare disk or partition; no LVM here)" \
       "sudo mkfs.ext4 -L sqzbuild /dev/<disk-or-partition> && sudo mkdir -p $ROOT && echo 'LABEL=sqzbuild $ROOT ext4 defaults,noatime 0 2' | sudo tee -a /etc/fstab && sudo mount $ROOT" \
-      "(or a directory on an ext4 root fs: sudo mkdir -p $ROOT) — then: scripts/dev/provision-local-venue --apply"
+      "(or $on_root) — then: scripts/dev/provision-local-venue --apply"
   fi
 fi
 
 if [ "$apply" = 1 ]; then
   echo "== apply"
-  [ ${#lackp[@]} = 0 ] || sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${lackp[@]}" || exit 1
+  if [ ${#lackp[@]} != 0 ]; then
+    case $FAMILY in
+      deb) sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${lackp[@]}" ;;
+      arch) sudo pacman -S --needed --noconfirm "${lackp[@]}" ;;
+    esac || exit 1
+  fi
   if [ -d "$ROOT" ]; then sudo SQZ_BUILD_ROOT="$(readlink -f "$ROOT")" bash "$REPO/scripts/dev/provision-ssh-venue" || exit 1
   else echo "provision-local-venue: no build root $ROOT yet — create it (above), then --apply again" >&2; fi
   echo "== re-check"

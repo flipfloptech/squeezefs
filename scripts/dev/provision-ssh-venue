@@ -5,13 +5,18 @@
 #
 #   1. the kernel modules the nvmet / NVMe-oF / kTLS rows need, loaded now and
 #      persisted in /etc/modules-load.d/sqz.conf (a stock distro kernel ships
-#      them as modules; the venue kernel has them built in);
+#      them as modules; the venue kernel has them built in), and the nvme_core
+#      boot parameter persisted in the bootloader (GRUB drop-ins, or Limine's);
 #   2. IOR/mdtest at io500's pinned hash into /opt/sqz-tools, exactly as
 #      scripts/dev/Containerfile builds them, and root runs allowed for OpenMPI;
 #   3. the facts a gate log is read against (kernel, openssl, fusermount3).
+# Packages come from apt (Debian, Ubuntu) or pacman (Arch and its derivatives such
+# as Omarchy, which say ID_LIKE=arch).
 set -euo pipefail
 
 [ "$(id -u)" = 0 ] || { echo "provision: run as root" >&2; exit 1; }
+. /etc/os-release
+case " $ID ${ID_LIKE:-} " in *" arch "*) FAMILY=arch ;; *) FAMILY=deb ;; esac
 
 # nvmet + its loop and tcp transports (ops/nvmet rows), the initiator side
 # nvme-tcp/nvme-fabrics (the host-scoped parameter row), tls (kTLS rows).
@@ -29,12 +34,28 @@ mountpoint -q /sys/kernel/config || mount -t configfs none /sys/kernel/config
 # connect. The sqz series' nvme_core.fabrics_host_scoped_subsystems=Y gives
 # each identity its own subsystem head (a stock kernel ignores the unknown
 # parameter). nvme_core loads from the initramfs, so only the command line
-# sets it: persisted here, live after the next reboot.
-grub_cfg=/etc/default/grub.d/sqz-venue.cfg
-want_grub='GRUB_CMDLINE_LINUX_DEFAULT="$GRUB_CMDLINE_LINUX_DEFAULT nvme_core.fabrics_host_scoped_subsystems=Y"'
-if [ -d /etc/default/grub.d ] && { [ ! -f "$grub_cfg" ] || [ "$(cat "$grub_cfg")" != "$want_grub" ]; }; then
-  printf '%s\n' "$want_grub" >"$grub_cfg"
-  update-grub >/dev/null 2>&1
+# sets it: persisted here, live after the next reboot — in Debian's GRUB
+# drop-ins, or in limine-entry-tool's (Omarchy), where the parameter is baked
+# into the UKI, so the boot image is rebuilt the way Omarchy's own migrations
+# do it (limine-mkinitcpio; it also refreshes the Limine entries).
+hs_cmdline=nvme_core.fabrics_host_scoped_subsystems=Y
+if [ -d /etc/default/grub.d ]; then
+  grub_cfg=/etc/default/grub.d/sqz-venue.cfg
+  want_grub="GRUB_CMDLINE_LINUX_DEFAULT=\"\$GRUB_CMDLINE_LINUX_DEFAULT $hs_cmdline\""
+  if [ ! -f "$grub_cfg" ] || [ "$(cat "$grub_cfg")" != "$want_grub" ]; then
+    printf '%s\n' "$want_grub" >"$grub_cfg"
+    update-grub >/dev/null 2>&1
+  fi
+elif [ -d /etc/limine-entry-tool.d ] && command -v limine-mkinitcpio >/dev/null; then
+  limine_conf=/etc/limine-entry-tool.d/sqz-venue.conf
+  want_limine=$(printf '%s\n' "# squeezefs venue (scripts/dev/provision-ssh-venue)" "KERNEL_CMDLINE[default]+=\" $hs_cmdline\"")
+  if [ ! -f "$limine_conf" ] || [ "$(cat "$limine_conf")" != "$want_limine" ]; then
+    printf '%s\n' "$want_limine" >"$limine_conf"
+    echo "provision: $limine_conf written; rebuilding the boot image (limine-mkinitcpio) …"
+    limine-mkinitcpio
+  fi
+else
+  grep -q "$hs_cmdline" /proc/cmdline || echo "provision: no GRUB drop-in dir and no limine-entry-tool here — put $hs_cmdline on the kernel command line yourself" >&2
 fi
 hs_param=/sys/module/nvme_core/parameters/fabrics_host_scoped_subsystems
 
@@ -46,9 +67,13 @@ IOR_COMMIT=5528b3619236d475a864a8021ab56d6b5c1aafa2
 PREFIX=/opt/sqz-tools
 stamp="$PREFIX/.ior-${IOR_COMMIT:0:16}"
 if [ ! -f "$stamp" ]; then
-  for p in autoconf automake libtool pkg-config git make gcc fio openmpi-bin libopenmpi-dev; do
-    dpkg -s "$p" >/dev/null 2>&1 || DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "$p"
-  done
+  case $FAMILY in
+    deb) for p in autoconf automake libtool pkg-config git make gcc fio openmpi-bin libopenmpi-dev; do
+      dpkg -s "$p" >/dev/null 2>&1 || DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "$p"
+    done ;;
+    # (--needed: installed ones are skipped, so this is idempotent.)
+    arch) pacman -S --needed --noconfirm autoconf automake libtool pkgconf git make gcc fio openmpi ;;
+  esac
   src=$(mktemp -d /tmp/ior.XXXXXX)
   git clone -q https://github.com/hpc/ior.git "$src"
   (cd "$src" && git fetch -q origin "$IOR_COMMIT" && git checkout -q "$IOR_COMMIT" && ./bootstrap >/dev/null \

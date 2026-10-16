@@ -459,6 +459,10 @@ Per queue: `memfd_create("sqz-fuse-zc-bounce", MFD_CLOEXEC)`, `ftruncate(depth.m
 ops (`zc.rs:146-154`); `buf_ptr(idx)`, `offset_of(idx) = idx × stride`, both `None`
 for `idx ≥ depth` (`zc.rs:232-241`). Dual-face pinned `zc.rs:864-906`. Any refusal
 fails the worker → the mount (`fuse_over_uring.rs:4766-4774`).
+The port (`worker.Slab`): one VA span for every queue at `(qid × depth + ent) × stride`, and each
+queue's memfd mapped in place (its fd face at `ent × stride`), lazily populated (0002 row 467). It
+stays per queue because an extraction is a shmem write under the file's `i_rwsem`, and one file
+shared by all rings made their io-wq spin on it (`docs/evidence/rung-10-slabcopy.md`).
 
 ---
 

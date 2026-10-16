@@ -567,6 +567,7 @@ const Rig = struct {
         defer self.freeRun(r);
         // An orderly unmount is silent; a fallback says why even at rc 0.
         if (!r.term.success() or r.stderr.len != 0) std.debug.print("\numount ({f}): {s}\n", .{ r.term, r.stderr });
+        if (!r.term.success() and self.child != null and alive(self.child_pid)) printWedge(self.io, "A", self.child_pid, self.readLog() catch null, self.gpa);
         try testing.expect(r.term.success());
     }
 
@@ -601,6 +602,35 @@ fn printUncleanExit(name: []const u8, term: std.process.Child.Term, log_text: ?[
     const text = log_text orelse "";
     const tail_bytes: usize = 6 << 10;
     std.debug.print("\n--- daemon {s} ended {f}; its log's last {d} B ---\n{s}\n--- end of daemon {s}'s log ---\n", .{ name, term, @min(text.len, tail_bytes), text[text.len - @min(text.len, tail_bytes) ..], name });
+}
+
+/// A daemon whose teardown outlived the umount verb's wait: every thread's
+/// name, state, wait channel and kernel stack, then the log's tail (the last
+/// teardown step it logged) — `deinit` kills it and deletes the log next.
+/// `log_text` (owned) is freed.
+fn printWedge(io: Io, name: []const u8, pid: linux.pid_t, log_text: ?[]u8, gpa: std.mem.Allocator) void {
+    defer if (log_text) |t| gpa.free(t);
+    std.debug.print("\n--- daemon {s} (pid {d}) still alive: its threads ---\n", .{ name, pid });
+    var pb: [64]u8 = undefined;
+    var dir = Io.Dir.cwd().openDir(io, std.fmt.bufPrint(&pb, "/proc/{d}/task", .{pid}) catch return, .{ .iterate = true }) catch return;
+    defer dir.close(io);
+    var it = dir.iterate();
+    while (it.next(io) catch null) |entry| {
+        var comm: [64]u8 = undefined;
+        var wchan: [128]u8 = undefined;
+        var status: [2048]u8 = undefined;
+        var stack: [4096]u8 = undefined;
+        const c = dir.readFile(io, std.fmt.bufPrint(&pb, "{s}/comm", .{entry.name}) catch continue, &comm) catch "";
+        const w = dir.readFile(io, std.fmt.bufPrint(&pb, "{s}/wchan", .{entry.name}) catch continue, &wchan) catch "";
+        const st = dir.readFile(io, std.fmt.bufPrint(&pb, "{s}/status", .{entry.name}) catch continue, &status) catch "";
+        const k = dir.readFile(io, std.fmt.bufPrint(&pb, "{s}/stack", .{entry.name}) catch continue, &stack) catch "";
+        const state_at = std.mem.indexOf(u8, st, "State:\t") orelse st.len;
+        const state = std.mem.sliceTo(st[@min(state_at + 7, st.len)..], '\n');
+        std.debug.print("tid {s} {s} [{s}] wchan {s}\n{s}", .{ entry.name, std.mem.trimEnd(u8, c, "\n"), state, w, k });
+    }
+    const text = log_text orelse "";
+    const tail_bytes: usize = 6 << 10;
+    std.debug.print("--- daemon {s}'s log's last {d} B ---\n{s}\n--- end of daemon {s}'s log ---\n", .{ name, @min(text.len, tail_bytes), text[text.len - @min(text.len, tail_bytes) ..], name });
 }
 
 fn sleepMs(ms: u64) void {

@@ -27,6 +27,7 @@
 #   Linux (native, the reference box): no container; root; real devices.
 #     scripts/perf_mount.sh --mdt /dev/nvme0n1 [--mdt /dev/nvme1n1] \
 #                           --ost /dev/nvme2n1 [--ost …] [--cache-dir DIR]
+#     scripts/perf_mount.sh --ram …          # the RAM namespaces of scripts/perf/ramnvme.sh up
 #   Format refuses a device carrying another filesystem unless --fresh (which
 #   formats with --force). The staging ring lives under --cache-dir (default
 #   /var/tmp/sqz-perf-cache — put it on NVMe). fio/ior/mdtest come from PATH.
@@ -47,6 +48,7 @@ MEM=${SQZ_PERF_MEM:-16G}
 fresh=0 rebuild=0 keep=0 remove=0 scrub=0
 mdts=2 osts=2 mdt_size=2G ost_size=16G cache_dir=/var/tmp/sqz-perf-cache
 mdt_devs=() ost_devs=() cmd=()
+die() { echo "perf_mount: $*" >&2; exit 1; }
 while [ $# -gt 0 ]; do
   case "$1" in
     --fresh) fresh=1 ;;
@@ -61,14 +63,15 @@ while [ $# -gt 0 ]; do
     --mdt) mdt_devs+=("$2"); shift ;;
     --ost) ost_devs+=("$2"); shift ;;
     --cache-dir) cache_dir=$2; shift ;;
+    --ram) [ -r /run/sqz-ramnvme/devs ] || die "--ram: run scripts/perf/ramnvme.sh up first"
+      while IFS== read -r r d; do case "$r" in mdt*) mdt_devs+=("$d") ;; ost*) ost_devs+=("$d") ;; esac; done < /run/sqz-ramnvme/devs ;;
     --) shift; cmd=("$@"); break ;;
-    -h|--help) sed -n '2,36p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,37p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "perf_mount: unknown flag '$1' (see --help)" >&2; exit 2 ;;
   esac
   shift
 done
 
-die() { echo "perf_mount: $*" >&2; exit 1; }
 case "$mdts" in 1|2) ;; *) die "--mdts must be 1 or 2" ;; esac
 case "$osts" in 1|2|3|4) ;; *) die "--osts must be 1..4" ;; esac
 # (`|| true`: a worktree mirrored to an ssh venue has a `.git` file naming a gitdir only the

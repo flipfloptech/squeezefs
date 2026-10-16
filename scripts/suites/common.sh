@@ -48,14 +48,24 @@ SUITE_META_MIB=${SUITE_META_MIB:-1024}
 SUITE_DATA_GIB=${SUITE_DATA_GIB:-8}
 # The release posture; see the module comment for each option's WHY.
 SUITE_MOUNT_OPTS=${SUITE_MOUNT_OPTS:-default_permissions,allow_other}
-# One lock per distro release (`apt.<ID>-<VERSION_ID>.lock`): each venue's
-# release ships its own package versions (the VM's Ubuntu 24.04, kamrui's
-# 26.04), so a shared lock is a drift on every venue but the one that pinned.
-APT_LOCK="$SUITES_DIR/apt.$(. /etc/os-release && echo "$ID-$VERSION_ID").lock"
+# The venue's package family, from /etc/os-release (a derivative names its parent in
+# ID_LIKE: Omarchy says ID=omarchy ID_LIKE=arch):
+#   apt     Debian/Ubuntu. One lock per distro release (`apt.<ID>-<VERSION_ID>.lock`): each
+#           release ships its own package versions (the VM's Ubuntu 24.04, kamrui's 26.04),
+#           so a shared lock is a drift on every venue but the one that pinned; a drift is a
+#           loud refusal, never a silent upgrade (the suites' own behaviour is part of the
+#           gate's evidence).
+#   pacman  Arch and its derivatives. NO lock (owner ruling 2026-10-16: a rolling release,
+#           bleeding-edge packages for a bleeding-edge filesystem): the suites install what
+#           the mirrors carry today; the versions a run used go into its results dir
+#           (packages.txt) as evidence for reading the run, never as a gate.
+read -r SUITE_PKG_FAMILY SUITE_RELEASE < <(. /etc/os-release && case " $ID ${ID_LIKE:-} " in
+  *" arch "*) echo "pacman $ID-${VERSION_ID:-rolling}" ;;
+  *) echo "apt $ID-$VERSION_ID" ;;
+esac)
+APT_LOCK="$SUITES_DIR/apt.$SUITE_RELEASE.lock"
 
-# apt packages the three suites need to build and run; the release's lock pins the
-# versions this harness verified (a drift is a loud refusal, never a silent
-# upgrade: the suites' own behaviour is part of the gate's evidence).
+# The packages the three suites need to build and run, per family.
 #   build: autoconf automake libtool pkg-config gcc make (pjdfstest, LTP, xfstests)
 #   LTP:   libaio-dev libacl1-dev libattr1-dev libcap-dev libnuma-dev libtirpc-dev
 #          libkeyutils-dev libssl-dev libmnl-dev linux-headers (none: syscalls only)
@@ -63,13 +73,24 @@ APT_LOCK="$SUITES_DIR/apt.$(. /etc/os-release && echo "$ID-$VERSION_ID").lock"
 #          libgdbm-dev uuid-dev gettext libtool-bin indent psmisc sed xfslibs-dev
 #          liburing-dev python3 (the `check` driver), gawk, duperemove(absent)
 #   tools: attr acl (setfattr/getfattr/setfacl), psmisc (fuser/killall), bc
-SUITE_PACKAGES=(
-  autoconf automake libtool libtool-bin pkg-config gcc make bison flex gettext indent
-  attr acl bc fio psmisc gawk sed uuid-runtime xfsprogs e2fsprogs quota
-  libaio-dev libacl1-dev libattr1-dev libcap-dev libnuma-dev libtirpc-dev libkeyutils-dev
-  libssl-dev libmnl-dev libgdbm-dev uuid-dev xfslibs-dev liburing-dev libicu-dev
-  python3 perl
-)
+# Arch ships headers inside the library's package (acl, attr, xfsprogs, openssl, …), so
+# the -dev rows collapse onto them; uuid-runtime/uuid-dev are util-linux(-libs), quota is
+# quota-tools, libnuma is numactl, python3/pkg-config are python/pkgconf.
+case $SUITE_PKG_FAMILY in
+  apt) SUITE_PACKAGES=(
+    autoconf automake libtool libtool-bin pkg-config gcc make bison flex gettext indent
+    attr acl bc fio psmisc gawk sed uuid-runtime xfsprogs e2fsprogs quota
+    libaio-dev libacl1-dev libattr1-dev libcap-dev libnuma-dev libtirpc-dev libkeyutils-dev
+    libssl-dev libmnl-dev libgdbm-dev uuid-dev xfslibs-dev liburing-dev libicu-dev
+    python3 perl
+  ) ;;
+  pacman) SUITE_PACKAGES=(
+    autoconf automake libtool pkgconf gcc make bison flex gettext indent
+    attr acl bc fio psmisc gawk sed util-linux util-linux-libs xfsprogs e2fsprogs quota-tools
+    libaio libcap numactl libtirpc keyutils openssl libmnl gdbm liburing icu
+    python perl
+  ) ;;
+esac
 
 suite_log() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" | tee -a "${RESULTS:-/dev/null}/harness.log" >&2; }
 suite_die() { suite_log "FATAL: $*"; exit 2; }
@@ -81,25 +102,50 @@ suite_require_venue() {
   [ -c /dev/fuse ] || suite_die "/dev/fuse absent"
 }
 
-# Install the package set once; verify the lockfile every time. A missing
-# lockfile is written from the installed versions (the first run pins);
-# `SUITE_REFRESH_LOCK=1` re-pins after a deliberate upgrade.
+# Install the package set once. apt: verify the lockfile every time — a missing lockfile
+# is written from the installed versions (the first run pins); `SUITE_REFRESH_LOCK=1`
+# re-pins after a deliberate upgrade. pacman: no lock; the run records its versions.
+suite_pkg_installed() {
+  case $SUITE_PKG_FAMILY in
+    apt) dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q 'install ok installed' ;;
+    pacman) pacman -Q "$1" >/dev/null 2>&1 ;;
+  esac
+}
+# `name=version` per package. Byte order: the caller's locale reaches here through ssh
+# and sudo, and en_US.UTF-8 sorts `libtool=` before `libtool-bin=` while C sorts it after
+# — a lock pinned under one refused every run under the other (kamrui, the gate train's
+# LC_ALL=C).
+suite_pkg_versions() {
+  local p
+  case $SUITE_PKG_FAMILY in
+    apt) for p in "${SUITE_PACKAGES[@]}"; do dpkg-query -W -f='${Package}=${Version}\n' "$p"; done ;;
+    pacman) pacman -Q "${SUITE_PACKAGES[@]}" | sed 's/ /=/' ;;
+  esac | LC_ALL=C sort
+}
 suite_packages() {
   local missing=() p
-  for p in "${SUITE_PACKAGES[@]}"; do
-    dpkg-query -W -f='${Status}' "$p" 2>/dev/null | grep -q 'install ok installed' || missing+=("$p")
-  done
+  for p in "${SUITE_PACKAGES[@]}"; do suite_pkg_installed "$p" || missing+=("$p"); done
   if [ ${#missing[@]} -gt 0 ]; then
-    suite_log "apt-get install: ${missing[*]}"
-    DEBIAN_FRONTEND=noninteractive apt-get -qq update >/dev/null
-    DEBIAN_FRONTEND=noninteractive apt-get -qq install -y --no-install-recommends "${missing[@]}" >/dev/null
-    apt-get -qq clean
+    case $SUITE_PKG_FAMILY in
+      apt)
+        suite_log "apt-get install: ${missing[*]}"
+        DEBIAN_FRONTEND=noninteractive apt-get -qq update >/dev/null
+        DEBIAN_FRONTEND=noninteractive apt-get -qq install -y --no-install-recommends "${missing[@]}" >/dev/null
+        apt-get -qq clean ;;
+      pacman)
+        # From the sync db as it is: the harness never refreshes it alone (`-Sy` + an
+        # install is a partial upgrade on Arch). A stale db means `pacman -Syu` first.
+        suite_log "pacman -S --needed: ${missing[*]}"
+        pacman -S --needed --noconfirm "${missing[@]}" >/dev/null \
+          || suite_die "pacman -S failed for ${missing[*]} (a stale sync db? run pacman -Syu, then the suite)" ;;
+    esac
   fi
-  local current
-  # Byte order: the caller's locale reaches here through ssh and sudo, and en_US.UTF-8
-  # sorts `libtool=` before `libtool-bin=` while C sorts it after — a lock pinned under
-  # one refused every run under the other (kamrui, the gate train's LC_ALL=C).
-  current=$(for p in "${SUITE_PACKAGES[@]}"; do dpkg-query -W -f='${Package}=${Version}\n' "$p"; done | LC_ALL=C sort)
+  local current; current=$(suite_pkg_versions)
+  if [ "$SUITE_PKG_FAMILY" = pacman ]; then
+    printf '%s\n' "$current" > "${RESULTS:-/tmp}/packages.txt"
+    suite_log "${#SUITE_PACKAGES[@]} packages, rolling (no lock); versions in packages.txt"
+    return 0
+  fi
   if [ ! -s "$APT_LOCK" ] || [ "${SUITE_REFRESH_LOCK:-0}" = 1 ]; then
     printf '%s\n' "$current" > "$APT_LOCK"
     suite_log "$(basename "$APT_LOCK") written (${#SUITE_PACKAGES[@]} packages)"

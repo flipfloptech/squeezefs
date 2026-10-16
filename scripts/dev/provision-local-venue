@@ -116,7 +116,6 @@ if [ "$FAMILY" = deb ]; then
   pkg_have() { dpkg -s "$1" >/dev/null 2>&1; }
   pkg_install="sudo apt-get install -y --no-install-recommends"
 else
-  note "the external suites (scripts/suites/common.sh: pjdfstest, LTP, xfstests) install with apt: class C runs need a Debian/Ubuntu venue"
   # The same instruments and tools under their Arch names (libelf carries libdw; openmpi is
   # one package), then what makepkg needs for the kernel PKGBUILD beyond base-devel —
   # `makepkg -s` installs the PKGBUILD's own makedepends (rust, xxhash, …) at build time.
@@ -166,6 +165,42 @@ if [ -d "$ROOT" ]; then
   # The product's tests and the smoke's defaults write under /build/tmp.
   [ "$(readlink -f /build)" = "$real" ] && ok "/build resolves to the build root" \
     || miss "/build → $real (the product's tests write under /build/tmp)" "sudo ln -sfn $real /build"
+
+  # The test images in RAM (owner ruling 2026-10-16: a venue with RAM to spare keeps them off
+  # the disk). /build/tmp is where the tests, the smoke's volumes and the suites write: an
+  # ext4 of its own on a zram device — still ext4 (sparse files, O_DIRECT, discard, the
+  # device numbers /proc/locks reports), every byte in memory. zram, not brd: brd belongs to
+  # scripts/perf/ramnvme.sh, which refuses to start when brd is loaded. Mounted with discard,
+  # so a deleted image gives its memory back at once; lz4 keeps the per-write cost low; the
+  # capacity is half the RAM (sparse images and compressible test data use far less).
+  echo "== test images $real/tmp (RAM)"
+  mem_gib=$(awk '/^MemTotal:/ { print int($2 / 1048576) }' /proc/meminfo)
+  tmp_src=$(findmnt -no SOURCE --mountpoint "$real/tmp" 2>/dev/null)
+  tmp_fs=$(findmnt -no FSTYPE --mountpoint "$real/tmp" 2>/dev/null)
+  ram_tmp_apply=0 ram_tmp_ok=0
+  if [ "$tmp_fs" = ext4 ] && [[ $tmp_src == /dev/zram* ]]; then
+    ram_tmp_ok=1
+    ok "$real/tmp: ext4 on $tmp_src ($(df -BG --output=size "$real/tmp" | tail -1 | tr -dc 0-9) GiB, in RAM; $(df -BG --output=used "$real/tmp" | tail -1 | tr -dc 0-9) GiB used)"
+  elif [ "$mem_gib" -lt 64 ]; then
+    note "$real/tmp stays on the build root: $mem_gib GiB of RAM is under the 64 GiB a RAM-backed one needs beside a gate"
+  elif [ -n "$tmp_fs" ]; then
+    miss "$real/tmp in RAM (it is a $tmp_fs mount on ${tmp_src:-?}, not ext4 on zram)" "unmount it, then scripts/dev/provision-local-venue --apply"
+  elif [ -x /usr/lib/systemd/system-generators/zram-generator ]; then
+    ram_tmp_apply=1
+    miss "$real/tmp in RAM (it is a directory on the build root's $fstype)" \
+      "scripts/dev/provision-local-venue --apply   # zram-generator: /etc/systemd/zram-generator.conf.d/sqz-build-tmp.conf (ext4 on zram, RAM/2, mounted at boot) + a tmpfiles rule for its 1777 mode"
+  else
+    miss "$real/tmp in RAM (it is a directory on the build root's $fstype; no zram-generator here)" \
+      "install zram-generator, then scripts/dev/provision-local-venue --apply (or: a zram device formatted ext4, mounted at $real/tmp with -o discard, mode 1777)"
+  fi
+  # std.testing.tmpDir writes under the cwd's .zig-cache/tmp (16 call sites): a link into the
+  # RAM tmp puts those images in memory too.
+  # shortcut: this tree only, a worktree's .zig-cache/tmp stays on disk; link it the same way if one runs gates.
+  zig_tmp_apply=0
+  if [ "$ram_tmp_ok" = 1 ] || [ "$ram_tmp_apply" = 1 ]; then
+    if [ "$(readlink "$REPO/.zig-cache/tmp")" = "$real/tmp/zig-testing" ]; then ok "$REPO/.zig-cache/tmp → $real/tmp/zig-testing (std.testing.tmpDir in RAM)"
+    else zig_tmp_apply=1; miss "$REPO/.zig-cache/tmp in RAM (std.testing.tmpDir's images)" "scripts/dev/provision-local-venue --apply   # a link to $real/tmp/zig-testing"; fi
+  fi
 else
   vgs=$(sudo -n vgs --noheadings --units g -o vg_name,vg_free 2>/dev/null | awk '{ printf "%s (%s free) ", $1, $2 }')
   if [ -n "$vgs" ]; then
@@ -197,6 +232,35 @@ if [ "$apply" = 1 ]; then
       deb) sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${lackp[@]}" ;;
       arch) sudo pacman -S --needed --noconfirm "${lackp[@]}" ;;
     esac || exit 1
+  fi
+  if [ "${ram_tmp_apply:-0}" = 1 ]; then
+    # (The distro's own zram config may live under /usr/lib only: the /etc drop-in dir may not exist.)
+    sudo mkdir -p /etc/systemd/zram-generator.conf.d || exit 1
+    printf '%s\n' "# squeezefs venue (scripts/dev/provision-local-venue): the test images in RAM" \
+      "[zram1]" "zram-size = ram / 2" "compression-algorithm = lz4" "fs-type = ext4" \
+      "mount-point = $real/tmp" "options = discard" \
+      | sudo tee /etc/systemd/zram-generator.conf.d/sqz-build-tmp.conf >/dev/null || exit 1
+    sudo systemctl daemon-reload
+    unit=$(systemd-escape --path --suffix=mount "$real/tmp")
+    # Under the gate lock and every build slot (as scripts/venue trim prunes), so no test has a
+    # file open under the directory the mount covers; what the disk directory held moves aside.
+    locks=(flock -o -w 900 "$real/.gate.lock")
+    for s in "$real"/.build-slot.*; do [ -e "$s" ] && locks+=(flock -o "$s"); done
+    sudo "${locks[@]}" bash -c 'set -e
+      if [ -n "$(ls -A "$1")" ]; then old="$1.disk-$(date +%Y%m%d-%H%M%S)"; mv "$1" "$old"; mkdir "$1"; echo "provision: the old $1 moved to $old (test leftovers on disk; delete it when done)"; fi
+      systemctl start "$2"' _ "$real/tmp" "$unit" || exit 1
+  fi
+  if [ "${ram_tmp_apply:-0}" = 1 ] || [ "${zig_tmp_apply:-0}" = 1 ]; then
+    # A fresh ext4 root is 0755 and empty at every boot: the tests' unprivileged legs need the
+    # sticky 1777, and the .zig-cache/tmp link needs its target.
+    printf '%s\n' "# squeezefs venue (scripts/dev/provision-local-venue)" "d $real/tmp 1777 root root -" "d $real/tmp/zig-testing 1777 root root -" \
+      | sudo tee /etc/tmpfiles.d/sqz-build-tmp.conf >/dev/null || exit 1
+    sudo systemd-tmpfiles --create /etc/tmpfiles.d/sqz-build-tmp.conf || exit 1
+    z=$REPO/.zig-cache/tmp
+    mkdir -p "$REPO/.zig-cache"
+    # An empty directory goes; one with contents is someone's: refuse.
+    [ -L "$z" ] || [ ! -e "$z" ] || rmdir "$z" || { echo "provision-local-venue: $z is not empty — move it, then --apply again" >&2; exit 1; }
+    ln -sfn "$real/tmp/zig-testing" "$z"
   fi
   if [ -d "$ROOT" ]; then sudo SQZ_BUILD_ROOT="$(readlink -f "$ROOT")" bash "$REPO/scripts/dev/provision-ssh-venue" || exit 1
   else echo "provision-local-venue: no build root $ROOT yet — create it (above), then --apply again" >&2; fi

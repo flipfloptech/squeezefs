@@ -32,6 +32,8 @@ for p in "$root"/tmp/*; do
   [ -e "$p" ] || continue
   grep -qF " $p" /proc/mounts && continue
   case $p in
+    # (/build/tmp is its own ext4 on a local venue: RAM-backed, provision-local-venue.)
+    "$root"/tmp/lost+found) ;;
     "$root"/tmp/mnt-* | *.img | *.log) rm -rf "$p" ;;
     *) [ -z "$(find "$p" -mmin -1440 -print -quit 2>/dev/null)" ] && rm -rf "$p" ;;
   esac

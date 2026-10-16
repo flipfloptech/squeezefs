@@ -34,7 +34,8 @@ at the same absolute path, and runs commands as root:
   and `fuse.enable_uring`, the nvmet/brd/null_blk modules, the packages, the build root,
   passwordless sudo; prints each fix; `--apply` does the packages, modules, the boot
   parameter in GRUB or Limine, IOR/mdtest and directories — never a kernel install or a
-  reboot). The kernel: `scripts/kernel/build-host-kernel --local` — on Debian/Ubuntu
+  reboot; with ≥ 64 GiB of RAM, `/build/tmp` and the tree's `.zig-cache/tmp` live in RAM:
+  ext4 on a zram device via zram-generator, so every test image stays off the disk). The kernel: `scripts/kernel/build-host-kernel --local` — on Debian/Ubuntu
   linux 7.2.8 + the series as .debs (`7.2.8-sqz`); on Arch/Omarchy Omarchy's CURRENT
   `linux-omarchy-bore` PKGBUILD (its base, all its patches, its config) + the series, built
   with makepkg, installed with pacman (`7.2.x-N-omarchy-sqz`; owner ruling 2026-10-16).

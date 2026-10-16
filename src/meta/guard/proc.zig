@@ -13,6 +13,7 @@ const Io = std.Io;
 const claim = @import("claim.zig");
 const clock = @import("../../core/clock.zig");
 const counters = @import("../../core/counters.zig");
+const mountinfo = @import("../../core/mountinfo.zig");
 
 comptime {
     if (builtin.os.tag != .linux) @compileError("guard/proc is Linux only (charter §1.2); gate the import on builtin.os.tag");
@@ -144,7 +145,7 @@ pub fn exclusiveLocker(path: []const u8) ?Holder {
     var zbuf: [linux.PATH_MAX]u8 = undefined;
     const z = std.fmt.bufPrintSentinel(&zbuf, "{s}", .{path}, 0) catch return null;
     var st: linux.Statx = undefined;
-    if (linux.errno(linux.statx(linux.AT.FDCWD, z, 0, .{ .INO = true }, &st)) != .SUCCESS) return null;
+    if (linux.errno(linux.statx(linux.AT.FDCWD, z, 0, .{ .INO = true, .MNT_ID = true }, &st)) != .SUCCESS) return null;
     return lockerOf(&st) catch null;
 }
 
@@ -174,7 +175,7 @@ pub fn flockExclusive(io: Io, fd: linux.fd_t, waits: ?*counters.ShardedCounter, 
     while (true) {
         const e = linux.errno(linux.flock(fd, std.posix.LOCK.EX | std.posix.LOCK.NB));
         if (e != .AGAIN) return e;
-        if (linux.errno(linux.statx(fd, "", linux.AT.EMPTY_PATH, .{ .INO = true }, &st)) != .SUCCESS) return .AGAIN;
+        if (linux.errno(linux.statx(fd, "", linux.AT.EMPTY_PATH, .{ .INO = true, .MNT_ID = true }, &st)) != .SUCCESS) return .AGAIN;
         // Unreadable `/proc/locks`: the refusal stands.
         if (lockerOf(&st) catch return .AGAIN) |h| {
             locker.* = h;
@@ -213,11 +214,18 @@ pub fn writeLocker(w: *Io.Writer, locker: ?Holder) Io.Writer.Error!void {
 }
 
 /// The ONE `/proc/locks` read behind every writer-lock judgement: the
-/// exclusive `flock` locker of `st`'s inode (`.INO` statx), null = none.
+/// exclusive `flock` locker of `st`'s inode (`.INO | .MNT_ID` statx), null =
+/// none. The device is the file's MOUNT's, off mountinfo: `/proc/locks` and
+/// mountinfo both print the superblock's `s_dev`, while statx reports btrfs's
+/// per-subvolume anonymous device (a guard blind to every lock on btrfs).
 fn lockerOf(st: *const linux.Statx) error{Unreadable}!?Holder {
     var buf: [PROC_LOCKS_CAP]u8 = undefined;
+    if (!st.mask.MNT_ID) return error.Unreadable;
+    const mount = mountinfo.entryOf(readSmall(mountinfo.path, &buf) orelse return error.Unreadable, st.mnt_id) orelse return error.Unreadable;
+    // Copied out: `buf` is reused for `/proc/locks` below.
+    const dev_major, const dev_minor = .{ mount.dev_major, mount.dev_minor };
     const text = readSmall("/proc/locks", &buf) orelse return error.Unreadable;
-    const pid = flockHolderIn(text, st.dev_major, st.dev_minor, st.ino) orelse return null;
+    const pid = flockHolderIn(text, dev_major, dev_minor, st.ino) orelse return null;
     return .{ .pid = pid, .squeezefs = pid == linux.getpid() or runsOurExe(pid) };
 }
 
@@ -510,6 +518,40 @@ test "an exclusive holder that is not this binary and outlasts the bound: flockE
         std.debug.print("\nthe refusal: {s}\n", .{w.buffered()});
         return error.LockerUnnamed;
     }
+}
+
+/// `argv` ran and exited 0 (its output dropped).
+fn runOk(argv: []const []const u8) bool {
+    var child = std.process.spawn(testing.io, .{ .argv = argv, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore }) catch return false;
+    const term = child.wait(testing.io) catch return false;
+    return term == .exited and term.exited == 0;
+}
+
+test "a file on btrfs, whose statx device is the subvolume's anonymous one while /proc/locks prints the superblock's: exclusiveLocker still finds flock(1)'s exclusive lock (a writer guard blind on Omarchy's default filesystem)" {
+    if (linux.getuid() != 0) return testkit.skip(@src(), .no_root, "a loop mount needs root");
+    var dir_buf: [64]u8 = undefined;
+    const dir = try std.fmt.bufPrintSentinel(&dir_buf, "/build/tmp/proc-btrfs-{d}", .{linux.getpid()}, 0);
+    var img_buf: [72]u8 = undefined;
+    const img = try std.fmt.bufPrintSentinel(&img_buf, "{s}.img", .{dir}, 0);
+    var file_buf: [72]u8 = undefined;
+    const file = try std.fmt.bufPrintSentinel(&file_buf, "{s}/f", .{dir}, 0);
+    defer _ = linux.unlink(img.ptr);
+    if (!runOk(&.{ "truncate", "-s", "256M", img }) or !runOk(&.{ "mkfs.btrfs", "-q", "-f", img }))
+        return testkit.skip(@src(), .no_device, "no mkfs.btrfs here (btrfs-progs)");
+    _ = linux.mkdir(dir.ptr, 0o700);
+    defer _ = linux.rmdir(dir.ptr);
+    if (!runOk(&.{ "mount", "-o", "loop", img, dir })) return testkit.skip(@src(), .no_device, "no loop-mounted btrfs here (the loop driver, the btrfs module)");
+    defer _ = runOk(&.{ "umount", dir });
+    const rc = linux.open(file.ptr, .{ .ACCMODE = .RDWR, .CLOEXEC = true, .CREAT = true }, 0o600);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(rc));
+    _ = linux.close(@intCast(rc));
+    var holder = try std.process.spawn(testing.io, .{ .argv = &.{ "flock", "-x", file, "cat" }, .stdin = .pipe, .stdout = .ignore, .stderr = .ignore });
+    defer {
+        holder.stdin.?.close(testing.io);
+        holder.stdin = null;
+        _ = holder.wait(testing.io) catch {};
+    }
+    try awaitLocker(file, @intCast(holder.id.?));
 }
 
 test "/etc/nvme reads as empty when absent, never written" {

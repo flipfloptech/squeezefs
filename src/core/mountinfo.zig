@@ -67,14 +67,21 @@ pub fn entryAt(text: []const u8, mountpoint: []const u8) ?Entry {
     return found;
 }
 
-/// Is a mount with this id still in the table (attached somewhere)?
-pub fn hasId(text: []const u8, id: u64) bool {
+/// The mount with this id (`statx` `STATX_MNT_ID` names a file's mount).
+/// Its `major:minor` is the superblock's `s_dev` — what `/proc/locks`
+/// prints — where statx reports btrfs's per-subvolume anonymous device.
+pub fn entryOf(text: []const u8, id: u64) ?Entry {
     var lines = std.mem.splitScalar(u8, text, '\n');
     while (lines.next()) |line| {
         const e = parseLine(line) orelse continue;
-        if (e.id == id) return true;
+        if (e.id == id) return e;
     }
-    return false;
+    return null;
+}
+
+/// Is a mount with this id still in the table (attached somewhere)?
+pub fn hasId(text: []const u8, id: u64) bool {
+    return entryOf(text, id) != null;
 }
 
 /// The first mount whose parent is `id` (a mount stacked inside it makes
@@ -135,7 +142,11 @@ test "entryAt: the exact mountpoint, the last line wins, a prefix is not a match
     try testing.expectEqual(@as(u64, 94), entryAt(shadowed, "/build/tmp/mnt-7").?.id);
 }
 
-test "hasId and firstChildOf: a detached mount's id is gone; the tmpfs under mnt-7 is its child" {
+test "entryOf, hasId and firstChildOf: the mount by id carries its device; a detached mount's id is gone; the tmpfs under mnt-7 is its child" {
+    const m = entryOf(sample, 92).?;
+    try testing.expectEqual(@as(u32, 0), m.dev_major);
+    try testing.expectEqual(@as(u32, 47), m.dev_minor);
+    try testing.expect(entryOf(sample, 9000) == null);
     try testing.expect(hasId(sample, 90));
     try testing.expect(!hasId(sample, 9000));
     try testing.expectEqualStrings("/build/tmp/mnt-7/sub", firstChildOf(sample, 90).?.mountpoint);

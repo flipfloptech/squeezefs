@@ -5410,7 +5410,10 @@ test "the handover's step 0 (rung 10 item 4): drainPendingTimesOfSlot commits th
     try testing.expectEqual(commits0 + 1, h.store.commits);
     try testing.expectEqual(@as(u64, 0), h.fs.pending.len());
     // The seam over a slot with work: the count it answers is the drain's.
-    awaitCoarseTickAfter(served.mtime * std.time.ns_per_s + served.mtimensec);
+    // (Past files[2]'s OWN stored mtime: the four writes above can span coarse
+    // ticks, and a rewrite inside the tick files[2] already holds parks nothing —
+    // waiting on files[1]'s served stamp failed this on a loaded kamrui.)
+    awaitCoarseTickAfter((try h.fs.readInodeStored(try H.Fs.localOf(files[2]))).?.mtime);
     try testing.expectEqual(@as(?linux.E, null), h.write(files[2], 0, &sector, 0).errno());
     try testing.expectEqual(@as(u64, 1), H.Fs.timesDrainSeam(&h.fs, 0));
     try testing.expectEqual(commits0 + 2, h.store.commits);

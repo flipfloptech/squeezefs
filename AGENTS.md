@@ -62,7 +62,11 @@ asserts — a tripwire's log budget, a histogram-derived threshold) nor on an id
 (wait for the observable it asserts, never a real-time bound between two statements).
 Rigs stay run-scoped (pid-tagged paths, `127.0.0.1:0` ports); a test that cannot share
 the venue says `[venue-exclusive]` in its name. When the runner refuses a stale cost
-table, `scripts/venue zig build costs` regenerates `tests/costs/` — commit it.
+table, `scripts/venue zig build costs` regenerates `tests/costs/` — commit it. A test past
+its hang limit (20 × its cost row, clamped to 120–900 s; no row = 900 s) ends its shard with a
+`HUNG TEST:` line, every thread's kernel and user stack, and exit 124
+(`docs/evidence/rung-10-hangwatch.md`): a test that legitimately got that much slower needs
+its row in `tests/costs/` updated, not a bigger limit.
 
 ## Landing (the gate train owns the full gate)
 

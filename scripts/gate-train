@@ -40,7 +40,10 @@ fi
 summary() { grep -E '^Build Summary' "$1" | tail -1 | sed 's/^Build Summary: //'; }
 failures() {  # failed tests by name, else the steps that failed on their own (not transitively)
   {
-    grep -E "^error: '|^error: while executing test '" "$1" | sed -E "s/^error: (while executing test )?'([^']*)'.*/\2/"
+    # A test the runner's hang watchdog ended (tests/test_runner.zig): its HUNG line is the
+    # reason, and its process's exit 124 stays out of the plain name list below.
+    grep -E '^HUNG TEST: ' "$1" | sed -E 's/ \[[^]]*\]$//'
+    grep -E "^error: '|^error: while executing test '" "$1" | grep -v "' exited with code 124" | sed -E "s/^error: (while executing test )?'([^']*)'.*/\2/"
     awk '/^Build Summary/{f=1} f' "$1" | grep -E ' (failure|[0-9]+ errors?|[0-9]+ failed)' | grep -v transitive | sed -E 's/^[ |+-]*//; s/ (failure|[0-9]+ errors?|[0-9]+ failed).*//' | sed 's/^/step: /'
     # The build runner's own wording for a step whose command was killed (a test's
     # deliberately killed daemon prints "daemon A ended terminated with signal KILL").

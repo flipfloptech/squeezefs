@@ -19,6 +19,18 @@
 //!       Write every test this process ran with its measured wall and CPU
 //!       time (`<name>\t<wall µs>\t<cpu µs>`) when the build runner ends the
 //!       run (`zig build costs` merges a set's files into the table).
+//!   --hang-limit-ms=N
+//!       Every test's hang limit, instead of the derived one (the watchdog's
+//!       self-test, `tests/hangwatch_selftest.zig`).
+//!
+//! THE HANG WATCHDOG (Linux, both modes). A test running past its limit —
+//! `shard_plan.hang.limitUs` of its cost-table row — ends the process: one
+//! `HUNG TEST: "<name>" ran <s> (cost table: <s>|no row; limit: <s>)` line
+//! (to the heartbeat's sink too, so it lands live), every thread's name,
+//! state, CPU, wait channel and kernel stack, each thread's user stack, then
+//! exit 124. The build runner reports the test with that stderr and resumes
+//! the shard in a new process: a hang fails its step in minutes, never at the
+//! gate's outer timeout with the venue held.
 //!
 //! THE HEARTBEAT (Linux, server mode). The build runner buffers a test
 //! process's stderr until the step ends and draws live progress only on a
@@ -78,7 +90,12 @@ const Run = struct {
     costs_out: ?[]const u8,
     /// Measured per entry of `indices`, for `--costs-out`.
     measured: []Measured,
+    /// The table's wall per entry of `indices` (null: no row or no table).
+    rows_us: []const ?u64,
 };
+
+/// `--hang-limit-ms`: replaces every test's derived hang limit.
+var hang_limit_override_us: ?u64 = null;
 
 const Measured = struct { wall_us: u64 = 0, cpu_us: u64 = 0 };
 
@@ -146,6 +163,10 @@ pub fn main(init: std.process.Init.Minimal) void {
             costs_out = arg["--costs-out=".len..];
         } else if (std.mem.eql(u8, arg, "--no-exclusive-step")) {
             no_exclusive_step = true;
+        } else if (std.mem.startsWith(u8, arg, "--hang-limit-ms=")) {
+            const ms = std.fmt.parseUnsigned(u64, arg["--hang-limit-ms=".len..], 10) catch
+                fatal("--hang-limit-ms expects a whole number of milliseconds, got {s}", .{arg});
+            hang_limit_override_us = ms * std.time.us_per_ms;
         } else {
             panic("unrecognized command line argument: {s}", .{arg});
         }
@@ -157,8 +178,9 @@ pub fn main(init: std.process.Init.Minimal) void {
     }
 
     const run = makeRun(spec, costs_path, costs_out, no_exclusive_step);
+    heartbeat.start(std.fs.path.basename(args[0]), run, listen);
     if (listen) {
-        return mainServer(init, std.fs.path.basename(args[0]), run) catch |err| panic("internal test runner failure: {t}", .{err});
+        return mainServer(init, run) catch |err| panic("internal test runner failure: {t}", .{err});
     } else {
         return mainTerminal(init, run);
     }
@@ -188,7 +210,9 @@ fn makeRun(spec: shard_plan.Spec, costs_path: ?[]const u8, costs_out: ?[]const u
     const p = shard_plan.plan(plan_gpa, names, if (costs) |*c| c else null, spec) catch @panic("OOM");
     const measured = plan_gpa.alloc(Measured, p.indices.len) catch @panic("OOM");
     @memset(measured, .{});
-    return .{ .indices = p.indices, .spec = spec, .predicted_us = if (costs != null) p.predicted_us else null, .costs_out = costs_out, .measured = measured };
+    const rows = plan_gpa.alloc(?u64, p.indices.len) catch @panic("OOM");
+    for (p.indices, rows) |i, *r| r.* = if (costs) |c| c.map.get(names[i]) else null;
+    return .{ .indices = p.indices, .spec = spec, .predicted_us = if (costs != null) p.predicted_us else null, .costs_out = costs_out, .measured = measured, .rows_us = rows };
 }
 
 fn writeCosts(run: Run) void {
@@ -201,7 +225,7 @@ fn writeCosts(run: Run) void {
         fatal("cannot write the measured costs to {s}: {t}", .{ path, err });
 }
 
-fn mainServer(init: std.process.Init.Minimal, binary: []const u8, run: Run) !void {
+fn mainServer(init: std.process.Init.Minimal, run: Run) !void {
     @disableInstrumentation();
     stdin_reader = .initStreaming(.stdin(), runner_threaded_io, &stdin_buffer);
     stdout_writer = .initStreaming(.stdout(), runner_threaded_io, &stdout_buffer);
@@ -210,7 +234,6 @@ fn mainServer(init: std.process.Init.Minimal, binary: []const u8, run: Run) !voi
         .out = &stdout_writer.interface,
     };
     try server.serveStringMessage(.zig_version, builtin.zig_version_string);
-    heartbeat.start(binary, run);
 
     while (true) {
         const hdr = try server.receiveMessage();
@@ -429,14 +452,17 @@ fn mainTerminal(init: std.process.Init.Minimal, run: Run) void {
             std.debug.print("{d}/{d} {s}...", .{ i + 1, total, test_fn.name });
         }
         is_fuzz_test = false;
+        heartbeat.testStarted(@intCast(i));
         const started: Mark = .now();
         defer run.measured[i] = started.since();
         if (test_fn.func()) |_| {
+            heartbeat.testEnded(.pass);
             ok_count += 1;
             test_node.end();
             if (!have_tty) std.debug.print("OK\n", .{});
         } else |err| switch (err) {
             error.SkipZigTest => {
+                heartbeat.testEnded(.skip);
                 skip_count += 1;
                 if (have_tty) {
                     std.debug.print("{d}/{d} {s}...SKIP\n", .{ i + 1, total, test_fn.name });
@@ -446,6 +472,7 @@ fn mainTerminal(init: std.process.Init.Minimal, run: Run) void {
                 test_node.end();
             },
             else => {
+                heartbeat.testEnded(.fail);
                 fail_count += 1;
                 if (have_tty) {
                     std.debug.print("{d}/{d} {s}...FAIL ({t})\n", .{
@@ -488,14 +515,20 @@ fn elapsedUs(started: Io.Clock.Timestamp) u64 {
     return @intCast(@divTrunc(@max(ns, 0), std.time.ns_per_us));
 }
 
-/// The heartbeat (module doc). Off unless `start` found a non-terminal
+/// The heartbeat and the hang watchdog (module doc): one thread, ticking
+/// every second. The heartbeat is off unless `start` found a non-terminal
 /// build-runner stderr; the counters it reads are single-writer (the test
-/// loop) and read racily by its thread — a heartbeat line is a sample.
+/// loop) and read racily by the thread — a heartbeat line is a sample.
 const heartbeat = struct {
     /// The owner's cadence (rung 10 gate speed): often enough that a quiet
     /// screen means a stuck test, rare enough to stay a few lines a minute.
     const heartbeat_period_s = 30;
     const idle = std.math.maxInt(u32);
+    /// timeout(1)'s status: the gate train tells a hang from a crash by it.
+    const hung_exit_code = 124;
+    /// How long one thread's user-stack dump may take before the dump gives
+    /// up (its handler is stuck on a lock the hung code holds).
+    const user_stack_wait_ms = 2000;
 
     var sink: ?std.posix.fd_t = null;
     var label_buf: [96]u8 = undefined;
@@ -509,43 +542,45 @@ const heartbeat = struct {
     var current: std.atomic.Value(u32) = .init(idle);
     var current_t0_us: std.atomic.Value(u64) = .init(0);
     var run_indices: []const u32 = &.{};
+    var run_rows: []const ?u64 = &.{};
+    var user_stacks_done: std.atomic.Value(u32) = .init(0);
 
-    fn start(binary: []const u8, run: Run) void {
+    /// `live`: server mode, where the build runner holds the test's stderr
+    /// until the step ends — the heartbeat writes to the runner's own.
+    fn start(binary: []const u8, run: Run, live: bool) void {
         t0 = .now(runner_threaded_io, .awake);
         if (builtin.os.tag != .linux) return;
-        const linux = std.os.linux;
-        var path_buf: [32]u8 = undefined;
-        const path = std.fmt.bufPrintSentinel(&path_buf, "/proc/{d}/fd/2", .{linux.getppid()}, 0) catch return;
-        // APPEND: a stderr redirected to a file is written at its end, never
-        // over its head; NONBLOCK: a reader that stopped draining costs a
-        // dropped line, never a stalled test.
-        const rc = linux.open(path, .{ .ACCMODE = .WRONLY, .APPEND = true, .NONBLOCK = true, .NOCTTY = true, .CLOEXEC = true }, 0);
-        if (linux.errno(rc) != .SUCCESS) return;
-        const fd: std.posix.fd_t = @intCast(rc);
-        var stx: linux.Statx = undefined;
-        const is_pipe = linux.errno(linux.statx(fd, "", linux.AT.EMPTY_PATH, .{ .TYPE = true }, &stx)) == .SUCCESS and linux.S.ISFIFO(stx.mode);
-        if (!is_pipe) {
-            _ = linux.close(fd);
-            return;
-        }
         label = switch (run.spec) {
             .all => std.fmt.bufPrint(&label_buf, "{s}", .{binary}),
             .part => |p| std.fmt.bufPrint(&label_buf, "{s} {d}/{d}", .{ binary, p.index + 1, p.count }),
             .exclusive => std.fmt.bufPrint(&label_buf, "{s} exclusive", .{binary}),
-        } catch {
-            _ = linux.close(fd);
-            return;
-        };
+        } catch binary;
         total = @intCast(run.indices.len);
         predicted_us = run.predicted_us;
         run_indices = run.indices;
-        sink = fd;
-        const thread = std.Thread.spawn(.{}, loop, .{}) catch {
-            sink = null;
-            _ = linux.close(fd);
-            return;
-        };
+        run_rows = run.rows_us;
+        if (live) sink = openSink();
+        const thread = std.Thread.spawn(.{}, loop, .{}) catch |err|
+            fatal("cannot start the heartbeat and hang-watch thread: {t}", .{err});
         thread.detach();
+    }
+
+    /// The build runner's stderr when it is a pipe (module doc), else null.
+    fn openSink() ?std.posix.fd_t {
+        const linux = std.os.linux;
+        var path_buf: [32]u8 = undefined;
+        const path = std.fmt.bufPrintSentinel(&path_buf, "/proc/{d}/fd/2", .{linux.getppid()}, 0) catch return null;
+        // APPEND: a stderr redirected to a file is written at its end, never
+        // over its head; NONBLOCK: a reader that stopped draining costs a
+        // dropped line, never a stalled test.
+        const rc = linux.open(path, .{ .ACCMODE = .WRONLY, .APPEND = true, .NONBLOCK = true, .NOCTTY = true, .CLOEXEC = true }, 0);
+        if (linux.errno(rc) != .SUCCESS) return null;
+        const fd: std.posix.fd_t = @intCast(rc);
+        var stx: linux.Statx = undefined;
+        const is_pipe = linux.errno(linux.statx(fd, "", linux.AT.EMPTY_PATH, .{ .TYPE = true }, &stx)) == .SUCCESS and linux.S.ISFIFO(stx.mode);
+        if (is_pipe) return fd;
+        _ = linux.close(fd);
+        return null;
     }
 
     fn sinceT0Us() u64 {
@@ -568,21 +603,143 @@ const heartbeat = struct {
     }
 
     fn loop() void {
-        const linux = std.os.linux;
+        var ticks: u32 = 0;
         while (true) {
-            const req: linux.timespec = .{ .sec = heartbeat_period_s, .nsec = 0 };
-            _ = linux.nanosleep(&req, null);
-            var buf: [512]u8 = undefined;
-            var w: Io.Writer = .fixed(&buf);
-            w.print("[{s}] {d}/{d}, {f}", .{ label, done.load(.monotonic), total, fmtUs(sinceT0Us()) }) catch {};
-            const cur = current.load(.acquire);
-            if (cur != idle) {
-                const name = builtin.test_functions[run_indices[cur]].name;
-                const shown = name[0..@min(name.len, max_name_shown)];
-                w.print("; running \"{s}{s}\" for {f}", .{ shown, if (shown.len < name.len) "…" else "", fmtUs(sinceT0Us() -| current_t0_us.load(.monotonic)) }) catch {};
-            }
-            emit(&w);
+            const req: std.os.linux.timespec = .{ .sec = 1, .nsec = 0 };
+            _ = std.os.linux.nanosleep(&req, null);
+            watch();
+            ticks += 1;
+            if (sink != null and ticks % heartbeat_period_s == 0) beat();
         }
+    }
+
+    fn beat() void {
+        var buf: [512]u8 = undefined;
+        var w: Io.Writer = .fixed(&buf);
+        w.print("[{s}] {d}/{d}, {f}", .{ label, done.load(.monotonic), total, fmtUs(sinceT0Us()) }) catch {};
+        const cur = current.load(.acquire);
+        if (cur != idle) {
+            const name = builtin.test_functions[run_indices[cur]].name;
+            const shown = name[0..@min(name.len, max_name_shown)];
+            w.print("; running \"{s}{s}\" for {f}", .{ shown, if (shown.len < name.len) "…" else "", fmtUs(sinceT0Us() -| current_t0_us.load(.monotonic)) }) catch {};
+        }
+        emit(&w);
+    }
+
+    fn watch() void {
+        const cur = current.load(.acquire);
+        if (cur == idle) return;
+        // A test that started after the load above only makes `ran` smaller.
+        const ran = sinceT0Us() -| current_t0_us.load(.monotonic);
+        const limit = hang_limit_override_us orelse shard_plan.hang.limitUs(run_rows[cur]);
+        if (ran >= limit) fire(cur, ran, limit);
+    }
+
+    fn fire(cur: u32, ran_us: u64, limit_us: u64) noreturn {
+        var buf: [2048]u8 = undefined;
+        var w: Io.Writer = .fixed(&buf);
+        w.print("HUNG TEST: \"{s}\" ran {f} (cost table: ", .{ builtin.test_functions[run_indices[cur]].name, fmtTenths(ran_us) }) catch {};
+        if (run_rows[cur]) |row| w.print("{f}", .{fmtTenths(row)}) catch {} else w.writeAll("no row") catch {};
+        w.print("; limit: {f}) [{s}]", .{ fmtTenths(limit_us), label }) catch {};
+        emit(&w);
+        // A leading newline ends terminal mode's `i/N name...` line.
+        writeStderr("\n");
+        writeStderr(w.buffered());
+        dumpThreads();
+        dumpUserStacks();
+        std.os.linux.exit_group(hung_exit_code);
+    }
+
+    /// Raw: the stuck test may hold `std.debug`'s stderr lock.
+    fn writeStderr(bytes: []const u8) void {
+        _ = std.os.linux.write(2, bytes.ptr, bytes.len);
+    }
+
+    /// Every other thread's name, state, CPU, wait channel and kernel stack
+    /// (the stack file needs root: the venues run as root).
+    fn dumpThreads() void {
+        const io = runner_threaded_io;
+        var dir = Io.Dir.openDirAbsolute(io, "/proc/self/task", .{ .iterate = true }) catch return writeStderr("(/proc/self/task unreadable)\n");
+        defer dir.close(io);
+        var it = dir.iterate();
+        while (it.next(io) catch null) |entry| {
+            // Not this thread: its stack is the read of its own stack.
+            if ((std.fmt.parseUnsigned(std.os.linux.pid_t, entry.name, 10) catch 0) == std.os.linux.gettid()) continue;
+            var out: [8192]u8 = undefined;
+            var w: Io.Writer = .fixed(&out);
+            var stat_buf: [1024]u8 = undefined;
+            var wchan_buf: [128]u8 = undefined;
+            var stack_buf: [6144]u8 = undefined;
+            const stat = procFile(dir, entry.name, "stat", &stat_buf);
+            // `tid (comm) S …`: comm may hold spaces and parens, so the fields start after the last ')'.
+            const open = std.mem.indexOfScalar(u8, stat, '(') orelse 0;
+            const close = std.mem.lastIndexOfScalar(u8, stat, ')') orelse stat.len;
+            var fields = std.mem.tokenizeScalar(u8, stat[@min(close + 1, stat.len)..], ' ');
+            var f: [13][]const u8 = @splat("?");
+            for (&f) |*x| x.* = fields.next() orelse break;
+            // utime + stime (stat fields 14, 15) in USER_HZ ticks: 100 on every Linux ABI.
+            const ticks = (std.fmt.parseUnsigned(u64, f[11], 10) catch 0) + (std.fmt.parseUnsigned(u64, f[12], 10) catch 0);
+            w.print("thread {s} \"{s}\" state {s} cpu {d}.{d:0>2}s wchan {s}\n", .{
+                entry.name,  if (close > open) stat[open + 1 .. close] else "?",
+                f[0],        ticks / 100,
+                ticks % 100, procFile(dir, entry.name, "wchan", &wchan_buf),
+            }) catch {};
+            var lines = std.mem.tokenizeScalar(u8, procFile(dir, entry.name, "stack", &stack_buf), '\n');
+            while (lines.next()) |l| w.print("    {s}\n", .{l}) catch {};
+            writeStderr(w.buffered());
+        }
+    }
+
+    fn procFile(dir: Io.Dir, tid: []const u8, file: []const u8, buf: []u8) []const u8 {
+        var path: [64]u8 = undefined;
+        const p = std.fmt.bufPrint(&path, "{s}/{s}", .{ tid, file }) catch return "?";
+        const text = dir.readFile(runner_threaded_io, p, buf) catch |err| return @errorName(err);
+        return std.mem.trimEnd(u8, text, "\n");
+    }
+
+    /// Each thread's user stack, the test's own thread first: SIGQUIT to one
+    /// thread at a time, whose handler unwinds from the interrupted context.
+    fn dumpUserStacks() void {
+        const linux = std.os.linux;
+        const act: linux.Sigaction = .{ .handler = .{ .sigaction = onQuit }, .mask = linux.sigemptyset(), .flags = linux.SA.SIGINFO | linux.SA.RESTART };
+        _ = linux.sigaction(.QUIT, &act, null);
+        const pid = linux.getpid();
+        if (!userStack(pid, pid)) return;
+        const io = runner_threaded_io;
+        var dir = Io.Dir.openDirAbsolute(io, "/proc/self/task", .{ .iterate = true }) catch return;
+        defer dir.close(io);
+        var it = dir.iterate();
+        while (it.next(io) catch null) |entry| {
+            const tid = std.fmt.parseUnsigned(linux.pid_t, entry.name, 10) catch continue;
+            if (tid == pid or tid == linux.gettid()) continue;
+            if (!userStack(pid, tid)) return;
+        }
+    }
+
+    /// False when the handler did not finish in time: the dump ends there.
+    fn userStack(pid: std.os.linux.pid_t, tid: std.os.linux.pid_t) bool {
+        const linux = std.os.linux;
+        const before = user_stacks_done.load(.acquire);
+        // A thread that exited since the listing has no stack to dump.
+        if (linux.errno(linux.tgkill(pid, tid, .QUIT)) != .SUCCESS) return true;
+        var waited_ms: u32 = 0;
+        while (user_stacks_done.load(.acquire) == before) : (waited_ms += 10) {
+            if (waited_ms >= user_stack_wait_ms) {
+                writeStderr("(a user stack did not finish within 2 s: the rest are skipped)\n");
+                return false;
+            }
+            const req: linux.timespec = .{ .sec = 0, .nsec = 10 * std.time.ns_per_ms };
+            _ = linux.nanosleep(&req, null);
+        }
+        return true;
+    }
+
+    fn onQuit(_: std.os.linux.SIG, _: *const std.os.linux.siginfo_t, ctx_ptr: ?*anyopaque) callconv(.c) void {
+        var head: [48]u8 = undefined;
+        writeStderr(std.fmt.bufPrint(&head, "user stack of thread {d}:\n", .{std.os.linux.gettid()}) catch "");
+        const ctx = std.debug.cpu_context.fromPosixSignalContext(ctx_ptr);
+        std.debug.dumpCurrentStackTrace(.{ .context = if (ctx) |*c| c else null });
+        _ = user_stacks_done.fetchAdd(1, .release); // pairs with userStack's acquire
     }
 
     /// The test name's head: enough to find it, short enough for one line.
@@ -612,6 +769,15 @@ const heartbeat = struct {
         const s = us / std.time.us_per_s;
         if (s >= 60) return w.print("{d}m{d:0>2}s", .{ s / 60, s % 60 });
         return w.print("{d}s", .{s});
+    }
+
+    fn fmtTenths(us: u64) std.fmt.Alt(u64, formatTenths) {
+        return .{ .data = us };
+    }
+
+    fn formatTenths(us: u64, w: *Io.Writer) Io.Writer.Error!void {
+        const tenths = us / (std.time.us_per_s / 10);
+        return w.print("{d}.{d}s", .{ tenths / 10, tenths % 10 });
     }
 };
 

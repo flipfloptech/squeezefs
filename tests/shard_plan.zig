@@ -192,7 +192,38 @@ fn testCosts(gpa: Allocator, names: []const []const u8, costs: ?*const Costs) Al
     return out;
 }
 
+/// The hang watchdog's limit for one test (`tests/test_runner.zig`
+/// `hangwatch`): `k` × its row, clamped to [floor, cap]; a test without a row
+/// gets the cap — its cost is unknown, and `zig build costs`, the step that
+/// would measure it, runs under the same watchdog. The constants come from
+/// 43,114 measured test runs on kamrui (every `--costs-out` file in its gate
+/// cache, 2026-10-15/16; docs/evidence/rung-10-hangwatch.md).
+pub const hang = struct {
+    /// 3 runs passed 10× their row and 30 s; the only 2 past 20× were one stalled run (1019 s wall on 5 s CPU).
+    pub const k = 20;
+    /// No green gate-train run showed a row under 6 s past 45 s (meta.backend's D4 faces, a 5.15 s row): 2.7× margin.
+    pub const floor_us = 120 * std.time.us_per_s;
+    /// 3.7× the slowest row (the jobs matrix, 241 s); still fails a hung step in 15 min, not at the gate's 65.
+    pub const cap_us = 900 * std.time.us_per_s;
+
+    pub fn limitUs(row_us: ?u64) u64 {
+        const row = row_us orelse return cap_us;
+        return std.math.clamp(row *| k, floor_us, cap_us);
+    }
+};
+
 const testing = std.testing;
+
+test "hang limit: k × the row, never under the floor nor over the cap; no row is the cap" {
+    const s = std.time.us_per_s;
+    try testing.expectEqual(hang.floor_us, hang.limitUs(0));
+    try testing.expectEqual(hang.floor_us, hang.limitUs(400_000)); // a 0.4 s row: 8 s < floor
+    try testing.expectEqual(20 * 10 * s, hang.limitUs(10 * s)); // the 10 s storms: 200 s
+    try testing.expectEqual(20 * 28 * s, hang.limitUs(28 * s)); // the slowest unit row: 560 s
+    try testing.expectEqual(hang.cap_us, hang.limitUs(241 * s)); // the jobs matrix: 4820 s → cap
+    try testing.expectEqual(hang.cap_us, hang.limitUs(std.math.maxInt(u64)));
+    try testing.expectEqual(hang.cap_us, hang.limitUs(null));
+}
 
 test "spec: I/N is 1-based, exclusive is a word, anything else refuses" {
     try testing.expectEqual(Spec{ .part = .{ .index = 2, .count = 6 } }, try Spec.parse("3/6"));

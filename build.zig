@@ -244,6 +244,36 @@ pub fn build(b: *std.Build) void {
     const rails_step = b.step("rails", "Run static-rail convention tests");
     rails_step.dependOn(&run_rails_tests.step);
 
+    // ---- the project runner's hang watchdog, proven (Linux: it reads
+    //      /proc): tests/hangwatch_selftest.zig in terminal mode under a 2 s
+    //      limit — two 1.2 s tests pass, the spinning third ends the run with
+    //      the HUNG line, the thread dump and exit 124 ----
+    if (target.result.os.tag == .linux) {
+        const hang_tests = b.addTest(.{
+            .name = "squeezefs-hangwatch-selftest",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("tests/hangwatch_selftest.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+            .test_runner = test_runner,
+        });
+        const run_hang = gated(std.Build.Step.Run.create(b, "run hangwatch self-test"), release_gate);
+        run_hang.addArtifactArg(hang_tests);
+        run_hang.addArg("--hang-limit-ms=2000");
+        run_hang.expectExitCode(124);
+        for ([_][]const u8{
+            "1/3 hangwatch_selftest.test.hangwatch: a quick test passes (1.2 s)...OK\n",
+            "2/3 hangwatch_selftest.test.hangwatch: a second quick test passes (1.2 s)...OK\n",
+            "\nHUNG TEST: \"hangwatch_selftest.test.hangwatch: a spinning test never returns\" ran ",
+            " (cost table: no row; limit: 2.0s) [squeezefs-hangwatch-selftest]\n",
+            " state R cpu ", // the spinning thread, from /proc/self/task
+            "user stack of thread ",
+            "in test.hangwatch: a spinning test never returns (hangwatch_selftest.zig)", // its user stack is in the spin
+        }) |m| run_hang.expectStdErrMatch(m);
+        rails_step.dependOn(&run_hang.step);
+    }
+
     // ---- the shim's binary census (Linux): SONAME, DT_FLAGS_1 NODELETE and
     //      the exported symbol set == the ONE table, read off the .so's
     //      dynamic section (readelf-free) ----

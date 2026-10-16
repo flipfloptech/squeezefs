@@ -18,7 +18,7 @@ array is allocated once at bring-up); it costs `nqueues` fds and VMAs. This was 
 
 **Red → green.** `the zc bounce slab: one memfd per queue mapped in place …`: queue 2's window, read
 through its fd face at `ent × stride`, must hold the VA write; a write through the fd face must show
-in the VA; three queues must have three inodes. Red (`0bc5230`, today's one file behind the new
+in the VA; three queues must have three inodes. Red (`53afb21`, today's one file behind the new
 faces): `expected 171, found 0`. Green: `fuse.transport` 123/123, and the smoke + bench-smoke rows
 (KILL MATRIX, JOBS MATRIX, KERNEL AIO, CACHED COPY) 84/84 on kamrui.
 

@@ -71,7 +71,9 @@ done
 die() { echo "perf_mount: $*" >&2; exit 1; }
 case "$mdts" in 1|2) ;; *) die "--mdts must be 1 or 2" ;; esac
 case "$osts" in 1|2|3|4) ;; *) die "--osts must be 1..4" ;; esac
-dirty=$(git -C "$REPO" status --porcelain --untracked-files=no 2>/dev/null | head -1)
+# (`|| true`: a worktree mirrored to an ssh venue has a `.git` file naming a gitdir only the
+# Mac has; the failed git ended the script silently under pipefail.)
+dirty=$(git -C "$REPO" status --porcelain --untracked-files=no 2>/dev/null | head -1) || true
 [ -n "$dirty" ] && echo "perf_mount: WARNING — the tree has uncommitted changes; the binary will say -dirty and its numbers cannot be attributed to a commit" >&2
 
 # ---------------------------------------------------------------------------

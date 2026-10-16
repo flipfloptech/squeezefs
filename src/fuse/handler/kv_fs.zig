@@ -3118,16 +3118,30 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         /// `dlm.max_requests` inos per entry. Run by the daemon's cadence
         /// (the flush interval; the cap wakes it early), by `fsyncdir` and
         /// the dismount ahead of their barriers, and by tests. Returns the
-        /// refinements made durable.
+        /// refinements made durable. A refinement is one inode record,
+        /// whole on its home: the snapshot drains one home at a time (an
+        /// entry spanning two members is the facade's refusal, and one
+        /// holding another holder's ino is its door's).
         pub fn drainPendingTimes(self: *Self, c: *Ctx) Error!u64 {
             var total: u64 = 0;
             var buf: [economy.PENDING_TIMES_DRAIN_BATCH]u64 = undefined;
             while (true) {
                 const snapshot = self.pending.drainBatch(&buf);
                 if (snapshot.len == 0) return total;
-                var i: usize = 0;
-                while (i < snapshot.len) : (i += dlm.max_requests) {
-                    total += try self.drainTimesBatch(c, snapshot[i..@min(i + dlm.max_requests, snapshot.len)], 0);
+                var rest = snapshot;
+                while (rest.len != 0) {
+                    // rest[0]'s home-mates to the front.
+                    var n: usize = 1;
+                    for (1..rest.len) |j| {
+                        if (self.spansHomes(&.{ globalOf(rest[0]), globalOf(rest[j]) })) continue;
+                        std.mem.swap(u64, &rest[n], &rest[j]);
+                        n += 1;
+                    }
+                    var i: usize = 0;
+                    while (i < n) : (i += dlm.max_requests) {
+                        total += try self.drainTimesBatch(c, rest[i..@min(i + dlm.max_requests, n)], 0);
+                    }
+                    rest = rest[n..];
                 }
                 if (snapshot.len < buf.len) return total;
             }

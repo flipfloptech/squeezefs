@@ -3921,6 +3921,8 @@ pub const MemStore = struct {
     node_size_: usize = 65536,
     commits: u64 = 0,
     fsyncs: u64 = 0,
+    /// Value bytes `lookup` and `range` copied out (a view copies none).
+    value_bytes_copied: u64 = 0,
 
     const Row = struct { kind: u8, k: []u8, v: []u8 };
 
@@ -4028,7 +4030,16 @@ pub const MemStore = struct {
         defer self.lock.unlock();
         const f = self.find(kind, k);
         if (!f.hit) return null;
+        self.value_bytes_copied += self.entries.items[f.idx].v.len;
         return try gpa.dupe(u8, self.entries.items[f.idx].v);
+    }
+
+    pub fn lookupView(self: *MemStore, _: Allocator, kind: u8, k: []const u8, comptime T: type, ctx: anytype, comptime visit: fn (@TypeOf(ctx), []const u8) T) StoreError!?T {
+        self.lock.lock();
+        defer self.lock.unlock();
+        const f = self.find(kind, k);
+        if (!f.hit) return null;
+        return visit(ctx, self.entries.items[f.idx].v);
     }
 
     pub fn range(self: *MemStore, gpa: Allocator, kind: u8, start: []const u8, end: []const u8, max: usize, out: *std.ArrayList(tree.KeyValue)) StoreError!void {
@@ -4039,6 +4050,7 @@ pub const MemStore = struct {
         while (i < self.entries.items.len and n < max) : (i += 1) {
             const r = self.entries.items[i];
             if (r.kind != kind or key.lessThan(end, r.k)) break;
+            self.value_bytes_copied += r.v.len;
             try out.append(gpa, .{ .key = try gpa.dupe(u8, r.k), .value = try gpa.dupe(u8, r.v) });
             n += 1;
         }
@@ -5296,6 +5308,41 @@ test "§L.6 the write-stamp park (repro-port: frag-512b-write — 533 k size-neu
     try testing.expectEqual(@as(u64, 0), h.fs.pending.len());
     for (crowd) |f| h.release(f);
     for (files) |f| h.release(f);
+}
+
+test "a striped write reads its layout's kind off the borrowed record: the store copies the same bytes for a write into a file whose map names 768 blocks (a 3 GiB file) as into one naming 1 (red: every write copied and decoded the whole record — the lanes' 275 µs per 4 KiB write on 3 GiB files, rung-10-perf-baseline)" {
+    const H = HarnessOf(SettlingData);
+    var h: H = undefined;
+    try h.init();
+    defer h.deinit();
+    defer h.data.deinit();
+    h.data.store = &h.store;
+    const gpa = testing.allocator;
+    const image = try gpa.alloc(u8, 8192);
+    defer gpa.free(image);
+    @memset(image, 'I');
+    var copied: [2]u64 = undefined;
+    for ([_]usize{ 1, 768 }, &copied, 0..) |blocks, *out, i| {
+        const name = [_]u8{ 'f', @intCast('0' + i) };
+        const f = try h.create(1, &name, 0o644);
+        try testing.expectEqual(@as(?linux.E, null), h.write(f, 0, image, 0).errno());
+        const local = try H.Fs.localOf(f);
+        const rec = (try h.fs.readLayout(local)).?;
+        defer h.fs.freeLayout(rec);
+        try testing.expectEqual(layout.Kind.striped, rec.layout.kind);
+        const entries = try gpa.alloc(layout.MapEntryWire, blocks);
+        defer gpa.free(entries);
+        for (entries, 0..) |*e, b| e.* = (layout.MapEntry{ .block = @intCast(b), .mapping = Mapping.wholeBlock(1, b * layout.DEFAULT_CHUNK, 1) }).encode();
+        const big: layout.XattrLayout = .{ .layout = Layout.stripedInline(rec.layout.size, entries) };
+        const buf = try gpa.alloc(u8, big.encodedLen());
+        defer gpa.free(buf);
+        try h.store.upsert(key.TREE_XATTRS, &key.xattrKey(local, key.xattrNameHash56(LAYOUT_XATTR, h.store.nameKey()), rec.coll_seq), big.encodeInto(buf));
+        const before = h.store.value_bytes_copied;
+        try testing.expectEqual(@as(?linux.E, null), h.write(f, 512, image[0..512], 0).errno());
+        out.* = h.store.value_bytes_copied - before;
+        h.release(f);
+    }
+    try testing.expectEqual(copied[0], copied[1]);
 }
 
 test "FUSE_SYNCFS is a per-file fsync for the whole mount: every parked stamp journaled in ONE Δ entry BEFORE the plane's drain, the plane's mount-wide drain once, the store-wide meta barrier AFTER it; counted, its phases exact-sum; a volume-less set journals and barriers alone" {

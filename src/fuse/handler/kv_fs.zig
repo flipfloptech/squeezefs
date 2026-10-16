@@ -2986,25 +2986,30 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 try self.data.barrierData(self.io, &.{local});
                 return self.shipSizeClaim(c, local, .{ .size_claim = outcome.size_claim, .written = outcome.written });
             }
-            const t = try self.beginExclusive(local, @src());
-            var t_owned = true;
-            errdefer if (t_owned) self.store.abandon(t);
-            if (self.write_hold) self.holdPostlude();
-            var v = try self.readInode(local);
-            const accepted = self.claimedSize(local, v);
-            const size = @max(accepted, outcome.size_claim);
-            const claim: u64 = if (size > v.size) size else 0;
-            if (self.times_park and a.write_flags & abi.FUSE_WRITE_KILL_SUIDGID == 0) {
+            const size = if (self.times_park and a.write_flags & abi.FUSE_WRITE_KILL_SUIDGID == 0) park: {
                 // §L.6: a size-neutral write's only record would be the
-                // 76 B Δ(mtime, ctime) — park the stamp under the guard
-                // (fold-visible; the drain journals it). An EXTENDING
-                // write parks its size claim with it: the drain journals
-                // the claim once its bytes are durable (§AL.5). The tx
-                // stays empty, nothing commits.
-                try self.parkWriteTimes(local, claim);
-                t_owned = false;
-                self.store.abandon(t);
-            } else {
+                // 76 B Δ(mtime, ctime) — park the stamp (fold-visible; the
+                // drain journals it). An EXTENDING write parks its size
+                // claim with it: the drain journals the claim once its
+                // bytes are durable (§AL.5). Nothing commits, so the guard
+                // is SHARED: two parks commute (a max per field), and every
+                // RMW of the parked entry or the stored record — the drain,
+                // setattr, absorb — takes it exclusive (rung-10-rangelock).
+                var g = self.locks.lockManyUncancelable(self.io, &.{.{ .ino = local, .mode = .shared }}, &.{}) catch unreachable; // one request fits every plan
+                defer g.release(self.io);
+                if (self.write_hold) self.holdPostlude();
+                const v = try self.readInode(local);
+                const size = @max(self.claimedSize(local, v), outcome.size_claim);
+                try self.parkWriteTimes(local, if (size > v.size) size else 0);
+                break :park size;
+            } else commit: {
+                const t = try self.beginExclusive(local, @src());
+                var t_owned = true;
+                errdefer if (t_owned) self.store.abandon(t);
+                if (self.write_hold) self.holdPostlude();
+                var v = try self.readInode(local);
+                const size = @max(self.claimedSize(local, v), outcome.size_claim);
+                const claim: u64 = if (size > v.size) size else 0;
                 // Strict cadence (an ack is durable): the bytes land and
                 // their barrier runs before the claim commits. A KILLPRIV
                 // write's record carries the durable size; its claim parks.
@@ -3014,7 +3019,8 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 try self.commit(c, t);
                 _ = self.pending.retire(local);
                 if (self.times_park and claim != 0) try self.parkWriteTimes(local, claim);
-            }
+                break :commit size;
+            };
             self.data.noteShape(local, size, .striped);
             fuse_write_striped.inc();
             return .{ .size = @intCast(outcome.written) };
@@ -3047,7 +3053,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         }
 
         /// The write's stamp parked as `local`'s pending refinement (under
-        /// the caller's exclusive guard — `PendingTimes`' per-ino law): the
+        /// the caller's `I{ino}` guard — `PendingTimes`' per-ino law): the
         /// signed monotone max, the same law `fold` serves it by. A park
         /// that crosses the cap wakes the drain ahead of its tick.
         fn parkWriteTimes(self: *Self, local: u64, claim: u64) Error!void {

@@ -783,7 +783,10 @@ pub const Absorb = enum {
 /// the bytes under it are durable (§AL.5's ordered law).
 ///
 /// Mutations of ONE ino run under its 4a I-guard (absorb, the commit-side
-/// retire) or the drain's own guard set, so entries never race per ino;
+/// retire) or the drain's own guard set, so entries never race per ino —
+/// except a write's park, which holds it SHARED: parks commute (`parkClaim`
+/// is a max per field under the stripe lock) and every guarded RMW of the
+/// entry or the record takes the guard exclusive;
 /// the container is striped under spin locks (O(1) sections — the
 /// metadata-transaction class) with a lock-free count so the read path's
 /// common case — an empty map — is one relaxed load. The stripes are

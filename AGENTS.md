@@ -24,7 +24,8 @@ take the better design and add a row to the ledger in decision 0002 before diver
 ## Venue
 
 Linux only (charter §1.2). Every Linux venue is reached through `scripts/venue`, runs on
-the **7.2.6-sqz** kernel series (`scripts/kernel/patches-7.2/`) with Zig 0.17.0 and the repo
+the **sqz kernel series** (`scripts/kernel/patches-7.2/`, 0001–0029 on linux 7.2.y, plus
+`scripts/kernel/config-fragment`; `uname -r` carries `sqz`) with Zig 0.17.0 and the repo
 at the same absolute path, and runs commands as root:
 - `local` (`SQZ_VENUE=local`; the default when the controller is Linux): THIS host —
   commands run through `sudo` in this tree, no sync, no VM. Set it up once with
@@ -33,10 +34,13 @@ at the same absolute path, and runs commands as root:
   and `fuse.enable_uring`, the nvmet/brd/null_blk modules, the packages, the build root,
   passwordless sudo; prints each fix; `--apply` does the packages, modules, the boot
   parameter in GRUB or Limine, IOR/mdtest and directories — never a kernel install or a
-  reboot). The kernel: on Debian/Ubuntu `scripts/kernel/build-host-kernel --local` builds
-  and installs the .debs here; on Arch/Omarchy it is the distro kernel's PKGBUILD plus the
-  sqz series, built with makepkg and installed with pacman (owner ruling 2026-10-16; not
-  scripted yet). Reboot into it yourself. Build slots: one per 4 threads and per 8 GiB
+  reboot). The kernel: `scripts/kernel/build-host-kernel --local` — on Debian/Ubuntu
+  linux 7.2.8 + the series as .debs (`7.2.8-sqz`); on Arch/Omarchy Omarchy's CURRENT
+  `linux-omarchy-bore` PKGBUILD (its base, all its patches, its config) + the series, built
+  with makepkg, installed with pacman (`7.2.x-N-omarchy-sqz`; owner ruling 2026-10-16).
+  After an Omarchy bump run `--prepare-only` first: it applies everything at `--fuzz=0` in
+  minutes and a conflict means refreshing the patch in `scripts/kernel/patches-7.2/`.
+  Reboot into it yourself. Build slots: one per 4 threads and per 8 GiB
   (`SQZ_VENUE_SLOTS` overrides; every controller of one build root must agree).
 - `vm` (the default on the Mac): the macOS `container` `sqz-zig` — aarch64, Ubuntu 24.04,
   this repo mounted rw at the same path.

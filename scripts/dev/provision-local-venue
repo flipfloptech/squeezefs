@@ -74,8 +74,8 @@ case $kr in
   *sqz*) ok "kernel $kr (the sqz series)" ;;
   *) if [ "$FAMILY" = arch ]; then
     miss "the sqz kernel (running $kr): FUSE over io_uring, kmbuf, syncfs — patches 0001–0029" \
-      "the distro kernel's PKGBUILD (Omarchy: omacom/omarchy-pkgs pkgbuilds/linux-omarchy-bore) with the sqz series appended, built with makepkg and installed with pacman -U — the mkinitcpio/Limine hooks build the UKI and the boot entry (build-host-kernel --local does not script this yet)" \
-      "then REBOOT into it"
+      "scripts/kernel/build-host-kernel --local   # Omarchy's current linux-omarchy-bore PKGBUILD + the series, makepkg, pacman -U; the Limine hooks make the UKI and entry (never reboots)" \
+      "(after an Omarchy bump: build-host-kernel --local --prepare-only first — every patch at --fuzz=0 in minutes)" "then REBOOT into it"
   else
     miss "the sqz kernel $KVER (running $kr): FUSE over io_uring, kmbuf, syncfs — patches 0001–0029" \
       "scripts/kernel/build-host-kernel --local   # builds + installs the .debs (never reboots)" "then REBOOT into $KVER"
@@ -135,8 +135,10 @@ if PATH=/opt/sqz-tools/bin:$PATH command -v ior >/dev/null && PATH=/opt/sqz-tool
 else
   miss "ior/mdtest at io500's pinned hash" "scripts/dev/provision-local-venue --apply (builds them into /opt/sqz-tools)"
 fi
-git -C "$REF" cat-file -e '44752ce5^{commit}' 2>/dev/null && ok "the Rust reference at $REF (kernel patches 0001–0026, porting)" \
-  || miss "the Rust reference at $REF with commit 44752ce5 (build-host-kernel's patches 0001–0026; read-only porting evidence)" "git clone git@github.com:flipfloptech/squeezefs.git $REF   # or set SQZ_REFERENCE"
+# (The kernel series lives in scripts/kernel/patches-7.2 since 2026-10-16; the reference is
+# porting evidence only.)
+git -C "$REF" rev-parse --is-inside-work-tree >/dev/null 2>&1 && ok "the Rust reference at $REF (read-only porting evidence)" \
+  || miss "the Rust reference at $REF (read-only porting evidence; the vm venue mounts it)" "git clone git@github.com:flipfloptech/squeezefs.git $REF   # or set SQZ_REFERENCE"
 
 echo "== build root $ROOT (SQZ_BUILD_ROOT)"
 if [ -d "$ROOT" ]; then

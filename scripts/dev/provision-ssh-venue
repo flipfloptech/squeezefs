@@ -18,9 +18,11 @@ set -euo pipefail
 . /etc/os-release
 case " $ID ${ID_LIKE:-} " in *" arch "*) FAMILY=arch ;; *) FAMILY=deb ;; esac
 
-# nvmet + its loop and tcp transports (ops/nvmet rows), the initiator side
-# nvme-tcp/nvme-fabrics (the host-scoped parameter row), tls (kTLS rows).
-MODULES=(nvmet nvmet-tcp nvme-loop nvme-tcp nvme-fabrics tls)
+# fuse (the fragment builds it =m: /sys/module/fuse/parameters/enable_uring exists only
+# once it is loaded, and `scripts/venue status` and the provisioning check read it), nvmet +
+# its loop and tcp transports (ops/nvmet rows), the initiator side nvme-tcp/nvme-fabrics
+# (the host-scoped parameter row), tls (kTLS rows). A built-in one modprobes as a no-op.
+MODULES=(fuse nvmet nvmet-tcp nvme-loop nvme-tcp nvme-fabrics tls)
 for m in "${MODULES[@]}"; do modprobe "$m"; done
 conf=/etc/modules-load.d/sqz.conf
 want=$(printf '%s\n' "# squeezefs venue (scripts/dev/provision-ssh-venue)" "${MODULES[@]}")

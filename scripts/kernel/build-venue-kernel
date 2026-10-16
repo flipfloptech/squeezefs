@@ -1,12 +1,17 @@
 #!/usr/bin/env bash
-# The venue kernel (7.2.6-sqz for the macOS `container` VM, charter §1.2)
+# The venue kernel (the sqz series for the macOS `container` VM, charter §1.2)
 # rebuilt from the reference's recipe — squeezefs@44752ce5 docker/kernel-sqz,
-# read-only, the series and the build image — plus THIS repo's deltas:
+# read-only: the arm64 build image and its script — with THIS repo's:
 #
 #   config-fragment-container-arm64.delta  appended to the fragment (kTLS and
 #                                          the ARMv8 CE crypto, owner 2026-10-12)
-#   patches-7.2/*.patch                    appended to the 7.2 series, in name
-#                                          order (0027: FUSE_HAS_SYNCFS)
+#   patches-7.2/*.patch                    THE series (0001–0029; it replaces the
+#                                          recipe's copy, which stops at 0026 and
+#                                          is refreshed against linux 7.2.8 here)
+#
+# The recipe's build script pins its own linux 7.2.y base: the series is refreshed
+# against the base scripts/kernel/build-host-kernel names (7.2.8), so the recipe
+# must build that base too (TRACK=7.2; check build-container-arm64.sh).
 #
 #   scripts/kernel/build-venue-kernel [WORKDIR]     (default /tmp/ksqz-venue)
 #
@@ -28,9 +33,8 @@ mkdir -p "$work"
 git -C "$ref" archive "$recipe" docker/kernel-sqz | tar -x -C "$work"
 k="$work/docker/kernel-sqz"
 { echo; cat "$here/config-fragment-container-arm64.delta"; } >> "$k/config-fragment-container-arm64"
-for p in "$here"/patches-7.2/*.patch; do
-	[ -e "$k/patches-7.2/$(basename "$p")" ] && { echo "$(basename "$p") collides with the reference series"; exit 1; }
-	cp "$p" "$k/patches-7.2/"
-done
+rm -f "$k"/patches-7.2/*.patch
+cp "$here"/patches-7.2/*.patch "$k/patches-7.2/"
+echo "series: $(ls "$k"/patches-7.2/*.patch | wc -l) patches from $here/patches-7.2"
 cd "$k"
 TRACK=7.2 exec bash build-container-arm64.sh --cpus "${SQZ_KERNEL_CPUS:-4}" --memory "${SQZ_KERNEL_MEMORY:-8g}"

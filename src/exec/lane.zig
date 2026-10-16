@@ -1700,12 +1700,16 @@ const DeadRead = struct {
         s.read_done.finish();
     }
     /// Kills the ring once the READ is in the kernel (armed, and the SQ
-    /// flushed by the pass's work-in-hand flush). The loud line is the
-    /// lane thread's.
+    /// flushed). The flush is this fiber's: the pass flushes only once its
+    /// ready FIFO is empty, and a yielded fiber goes back to its tail
+    /// (`poll_budget` 0 re-runs it for 2^32 polls first). The loud line is
+    /// the lane thread's.
     fn kill(context: *const anyopaque) void {
         const s = of(context);
         const f = currentFiber().?;
-        while (!(s.reader.?.op_pending and s.lane.ring.ring.sq_ready() == 0)) {
+        while (true) {
+            s.lane.ring.flush();
+            if (s.reader.?.op_pending and s.lane.ring.ring.sq_ready() == 0) break;
             if (s.abort.load(.acquire)) return;
             _ = s.kill_polls.fetchAdd(1, .monotonic);
             f.yieldNow();

@@ -420,10 +420,11 @@ milliseconds of taking the lock, so the holder is an external flock on the devic
 metadata volume are refused (single-writer guard)" (B:2005-2027). The reader's probe
 `flock(LOCK_SH|LOCK_NB)` then `LOCK_UN` at once (`probe_shared_lock`, B:17655-17692) is
 classification only — a RETAINED shared lock would refuse a legitimate same-host writer
-(B:17636-17646; rung 6's `-o ro`). The port's `acquireWriterFlock` (backend.zig L649-672)
-refuses at once with no holder suffix today; rung 5 adds the probe read and the absorption.
-Port's wait: a bounded poll is acceptable here (an EXTERNAL holder, not a sync primitive);
-reuse the sync layer's 2 s ticked-backstop constant as the bound, 5 ms as the poll.
+(B:17636-17646; rung 6's `-o ro`). The port reads the claim for the message only and
+absorbs by the LOCKER `/proc/locks` names (`guard.proc.flockExclusive`, decision 0002 row
+542): this process or a process of this executable refuses at once; any other locker —
+udevd's `LOCK_SH` rules and its `LOCK_EX` + `BLKRRPART` after every write-close of a whole
+disk (strace, systemd 259) — is polled every 5 ms for ≤ 5 s, then refused.
 
 ### 2.7 The recovery ladder (charter §5.7; DMT:207, 225 — "in that order of automation")
 

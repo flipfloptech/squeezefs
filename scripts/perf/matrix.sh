@@ -1,25 +1,25 @@
 #!/usr/bin/env bash
 # matrix.sh <target> <label> — the perf baseline's fio matrix (docs/evidence/rung-10-perf-baseline.md)
 # against a raw block device or a mounted directory. One lay-down (1 MiB sequential O_DIRECT writes of
-# 4 regions × SQZ_MX_SIZE: per-job files in a directory, offset_increment regions on a device), then
-# every row time-based for SQZ_MX_RUNTIME s, io_uring, O_DIRECT. One line per row (also appended to
+# 4 regions × MX_SIZE: per-job files in a directory, offset_increment regions on a device), then
+# every row time-based for MX_RUNTIME s, io_uring, O_DIRECT. One line per row (also appended to
 # $OUT/results.tsv): IOPS, MiB/s, clat p50/p99 µs, fio usr+sys %, host cores busy (/proc/stat), device
 # bytes ÷ user bytes (diskstats over the row and its settle), and on a SqueezeFS mount the daemon's cores (/proc/<pid>/stat) and
 # its busiest thread classes (cores, the busiest thread's %). .stats snapshots and the fio JSON land
 # in $OUT/<label>/.
-#   SQZ_MX_ROWS     regex over row names (default all)     SQZ_MX_SIZE  per-job region (3g)
-#   SQZ_MX_RUNTIME  seconds per row (30)                   SQZ_MX_OUT   results root (/build/perf/mx)
-#   SQZ_MX_DEVS     block devices whose diskstats count (default: the device, the mount's source, or
+#   MX_ROWS     regex over row names (default all)     MX_SIZE  per-job region (3g)
+#   MX_RUNTIME  seconds per row (30)                   MX_OUT   results root (/build/perf/mx)
+#   MX_DEVS     block devices whose diskstats count (default: the device, the mount's source, or
 #                   a perf_mount.sh set's targets)
-#   SQZ_MX_LAYDOWN=0  skip the lay-down (the files/regions are already written)
-#   SQZ_MX_PROFILE=1  per row: perf record -a -g for 10 s mid-row → <row>.comm.txt (samples by thread)
+#   MX_LAYDOWN=0  skip the lay-down (the files/regions are already written)
+#   MX_PROFILE=1  per row: perf record -a -g for 10 s mid-row → <row>.comm.txt (samples by thread)
 #                     and <row>.incl-<who>.txt (scripts/perf/incl.py)
 # A block device must be unmounted and carry no signature (blkid): the lay-down overwrites it.
 set -euo pipefail
 T=$1 L=$2
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-ROWS=${SQZ_MX_ROWS:-.} S=${SQZ_MX_SIZE:-3g} RT=${SQZ_MX_RUNTIME:-30}
-OUT=${SQZ_MX_OUT:-/build/perf/mx}; O=$OUT/$L; mkdir -p "$O"
+ROWS=${MX_ROWS:-.} S=${MX_SIZE:-3g} RT=${MX_RUNTIME:-30}
+OUT=${MX_OUT:-/build/perf/mx}; O=$OUT/$L; mkdir -p "$O"
 die() { echo "matrix: $*" >&2; exit 1; }
 
 common=(--ioengine=io_uring --direct=1 --group_reporting --output-format=json)
@@ -41,7 +41,7 @@ elif [ -d "$T" ]; then
 else
   die "$T is neither a block device nor a directory"
 fi
-[ -n "${SQZ_MX_DEVS:-}" ] && read -r -a devs <<< "$SQZ_MX_DEVS"
+[ -n "${MX_DEVS:-}" ] && read -r -a devs <<< "$MX_DEVS"
 devnames=(); for d in "${devs[@]}"; do devnames+=("$(basename "$(readlink -f "$d")")"); done
 
 # The row table: name rw bs iodepth numjobs.
@@ -125,20 +125,22 @@ settle() {   # a SqueezeFS mount: the write custody drained (owed and parked bot
     grep -q '"fuse_owed_drain_inos":0,' "$T/.stats" && grep -q '"parked_buffers":0,' "$T/.stats" && return 0
     sleep 0.1; i=$((i + 1))
   done
+  echo "matrix: write custody not drained after 10 s" >&2
 }
 
 profile() {   # $1 row: 10 s of system-wide stacks mid-row
   local r=$1
   sleep $((RT / 3))
   perf record -a -g -F 499 -o "$O/$r.perf.data" -- sleep 10 >/dev/null 2>&1
-  perf report -i "$O/$r.perf.data" --sort comm --stdio 2>/dev/null | grep -v '^#' | grep -v '^$' | head -25 > "$O/$r.comm.txt"
-  perf script -i "$O/$r.perf.data" 2>/dev/null > "$O/$r.script"
+  timeout 120 perf report -i "$O/$r.perf.data" --no-inline --sort comm --stdio 2>/dev/null | grep -v '^#' | grep -v '^$' | head -25 > "$O/$r.comm.txt" || true
+  # --no-inline: resolving the fat-LTO binary's inlined frames is minutes per profile.
+  timeout 300 perf script -i "$O/$r.perf.data" --no-inline 2>/dev/null > "$O/$r.script" || true
   python3 "$HERE/incl.py" "" 45 < "$O/$r.script" > "$O/$r.incl-all.txt"
   python3 "$HERE/incl.py" sqz 45 < "$O/$r.script" > "$O/$r.incl-sqz.txt"
   rm -f "$O/$r.script"
 }
 
-if [ "${SQZ_MX_LAYDOWN:-1}" = 1 ]; then
+if [ "${MX_LAYDOWN:-1}" = 1 ]; then
   fio --name=mx --rw=write --bs=1m --iodepth=16 --numjobs=4 "${common[@]}" "${where[@]}" --output="$O/laydown.json"
   settle
   echo "matrix: $L lay-down 4 × $S done ($(python3 -c 'import json,sys; j=json.load(open(sys.argv[1]))["jobs"][0]; print("%.0f MiB/s" % (j["write"]["bw_bytes"] / 2**20))' "$O/laydown.json"))"
@@ -148,18 +150,19 @@ while read -r name rw bs qd nj; do
   [[ $name =~ $ROWS ]] || continue
   extra=(--randrepeat=0 --norandommap)
   case $rw in *write) extra+=(--end_fsync=1) ;; esac
-  [ -n "$pid" ] && cp "$T/.stats" "$O/$name.stats0.json"
+  # (cat, not cp: the virtual .stats has no size for cp's copy_file_range path to trust.)
+  [ -n "$pid" ] && cat "$T/.stats" > "$O/$name.stats0.json"
   snap "$O/$name.s0"
   fio --name=mx --rw="$rw" --bs="$bs" --iodepth="$qd" --numjobs="$nj" --time_based --runtime="$RT" \
     "${extra[@]}" "${common[@]}" "${where[@]}" --output="$O/$name.json" &
   fpid=$!
   ( sleep 2; snap "$O/$name.m0"; sleep $((RT - 4)); snap "$O/$name.m1" ) &
   spid=$!
-  [ "${SQZ_MX_PROFILE:-0}" = 1 ] && profile "$name"
+  [ "${MX_PROFILE:-0}" = 1 ] && profile "$name"
   wait $fpid || die "fio $name failed (see $O/$name.json)"
   wait $spid
   settle
   snap "$O/$name.s1"
-  [ -n "$pid" ] && cp "$T/.stats" "$O/$name.stats1.json"
+  [ -n "$pid" ] && cat "$T/.stats" > "$O/$name.stats1.json"
   summarize "$name"
 done <<< "$ROWTAB"

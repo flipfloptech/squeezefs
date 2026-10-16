@@ -11,12 +11,12 @@
 #   up      prints `mdt0=/dev/nvmeXnY …` and writes them to $STATE/devs (perf_mount.sh --ram reads it)
 #   down    disconnect, unshare, rmmod brd, and verify no subsystem/port/namespace/module is left
 #   status  the devices and the configfs entries that are ours
-# SQZ_RAM_MDT_GIB (4) × 2 + SQZ_RAM_OST_GIB (14) × 2; the binary: SQZ_BIN (zig-out-perf's dist build).
+# RAMNVME_MDT_GIB (4) × 2 + RAMNVME_OST_GIB (14) × 2; the binary: RAMNVME_BIN (zig-out-perf's dist build).
 set -euo pipefail
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
-BIN=${SQZ_BIN:-$REPO/zig-out-perf/bin/squeezefs}
+BIN=${RAMNVME_BIN:-$REPO/zig-out-perf/bin/squeezefs}
 STATE=/run/sqz-ramnvme
-MDT_GIB=${SQZ_RAM_MDT_GIB:-4} OST_GIB=${SQZ_RAM_OST_GIB:-14}
+MDT_GIB=${RAMNVME_MDT_GIB:-4} OST_GIB=${RAMNVME_OST_GIB:-14}
 ROLES=(mdt0 mdt1 ost0 ost1)
 NQN=nqn.2026-10.io.squeezefs:perfram
 CFS=/sys/kernel/config/nvmet
@@ -30,18 +30,18 @@ residue() {   # what of ours is still in the kernel
   for s in "$CFS"/subsystems/"$NQN"-*; do [ -e "$s" ] && r="$r subsystem:$(basename "$s")"; done
   for p in "$CFS"/ports/*/subsystems/"$NQN"-*; do [ -e "$p" ] && r="$r port-link:$p"; done
   grep -ls "^$NQN-" /sys/class/nvme/nvme*/subsysnqn 2>/dev/null | while read -r f; do echo -n " controller:$(basename "$(dirname "$f")")"; done
-  lsmod | grep -q '^brd ' && r="$r module:brd"
+  [ -d /sys/module/brd ] && r="$r module:brd"
   for p in $(ls "$CFS/ports" 2>/dev/null); do grep -qsx "$p" "$STATE/ports.before" || r="$r port:$p"; done
   echo -n "$r"
 }
 
 up() {
   [ -e "$STATE/devs" ] && die "already up ($(tr '\n' ' ' < "$STATE/devs")); down first"
-  lsmod | grep -q '^brd ' && die "brd is loaded by someone else; refusing to take it"
+  [ -d /sys/module/brd ] && die "brd is loaded by someone else; refusing to take it"
   [ -x "$BIN" ] || die "$BIN is absent (build: zig build -Dprofile=dist --prefix zig-out-perf dist)"
   mkdir -p "$STATE"
   # What was here before us: down unloads only the modules and removes only the ports we added.
-  local m; for m in nvme_loop nvmet; do lsmod | grep -q "^$m " || echo "$m" >> "$STATE/modules.ours"; done
+  local m; for m in nvme_loop nvmet; do [ -d "/sys/module/$m" ] || echo "$m" >> "$STATE/modules.ours"; done
   ls "$CFS/ports" > "$STATE/ports.before" 2>/dev/null || : > "$STATE/ports.before"
   modprobe -a nvmet nvme_loop
   local kib=$(((2 * MDT_GIB + 2 * OST_GIB + 1) * 1024 * 1024))
@@ -76,10 +76,12 @@ down() {
       "$BIN" nvmeof unshare "$NQN-$role" >/dev/null || echo "ramnvme: unshare $role failed" >&2
     fi
   done
-  if lsmod | grep -q '^brd '; then
-    udevadm settle
-    rmmod brd || echo "ramnvme: rmmod brd failed (still open?)" >&2
-  fi
+  # udev's probe of the vanished /dev/ram* nodes autoloads brd again (block-major-1): repeat until gone.
+  local i
+  for i in 1 2 3 4 5; do
+    [ -d /sys/module/brd ] || break
+    udevadm settle; rmmod brd 2>/dev/null || true; udevadm settle; sleep 1
+  done
   local p
   for p in $(ls "$CFS/ports" 2>/dev/null); do
     [ -f "$STATE/ports.before" ] || break

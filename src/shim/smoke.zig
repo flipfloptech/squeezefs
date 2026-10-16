@@ -47,6 +47,11 @@ const data_len: u64 = 2 << 30;
 const ready_wait_ns: u64 = 60 * std.time.ns_per_s;
 const exit_wait_ns: u64 = 60 * std.time.ns_per_s;
 
+/// The last 4 KiB of a stream, for a failure report.
+fn lastBytes(text: []const u8) []const u8 {
+    return text[text.len -| 4096..];
+}
+
 fn sleepMs(ms: u64) void {
     const ts: linux.timespec = .{ .sec = @intCast(ms / 1000), .nsec = @intCast((ms % 1000) * std.time.ns_per_ms) };
     _ = linux.nanosleep(&ts, null);
@@ -192,9 +197,14 @@ const Rig = struct {
     }
 
     fn preloadOk(self: *Rig, cwd: []const u8, script: []const u8) !std.process.RunResult {
+        const mark = if (self.child != null) try self.logLen() else 0;
         const r = try self.preload(cwd, script);
         if (!r.term.success()) {
-            std.debug.print("\n--- preload script failed ({f}) ---\n{s}\n--- stdout ---\n{s}\n--- stderr ---\n{s}\n", .{ r.term, script, r.stdout, r.stderr });
+            // The gate log alone must name the cause: the streams' tails and
+            // what the daemon (when one runs) logged during the script.
+            const log_text: []const u8 = if (self.child != null) self.readLog() catch "" else "";
+            defer self.gpa.free(log_text);
+            std.debug.print("\n--- preload script failed ({f}) in {s} ---\n{s}\n--- stdout (tail) ---\n{s}\n--- stderr (tail) ---\n{s}\n--- daemon log during the script (tail) ---\n{s}\n", .{ r.term, cwd, script, lastBytes(r.stdout), lastBytes(r.stderr), lastBytes(log_text[@min(mark, log_text.len)..]) });
             self.freeRun(r);
             return error.ScriptFailed;
         }
@@ -337,9 +347,10 @@ const battery_script =
     \\cp f g
     \\cat g > h
     \\b=$(sha256sum h | cut -d' ' -f1)
-    \\test "$a" = "$b"
+    \\test "$a" = "$b" || { echo "FAIL sha: f $a, h $b, g $(sha256sum g | cut -d' ' -f1); sizes $(stat -c %s f g h)" >&2; cmp f g >&2 || :; cmp f h >&2 || :; exit 1; }
     \\truncate -s 3M h
-    \\test "$(stat -c %s h)" = 3145728
+    \\s=$(stat -c %s h)
+    \\test "$s" = 3145728 || { echo "FAIL truncate -s 3M: stat says $s" >&2; exit 1; }
     \\head -c 3M f | cmp - h
     \\tar cf t.tar f
     \\tar xf t.tar -O f | cmp - f

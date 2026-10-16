@@ -424,7 +424,9 @@ classification only — a RETAINED shared lock would refuse a legitimate same-ho
 absorbs by the LOCKER `/proc/locks` names (`guard.proc.flockExclusive`, decision 0002 row
 542): this process or a process of this executable refuses at once; any other locker —
 udevd's `LOCK_SH` rules and its `LOCK_EX` + `BLKRRPART` after every write-close of a whole
-disk (strace, systemd 259) — is polled every 5 ms for ≤ 5 s, then refused.
+disk (strace, systemd 259) — is polled every 5 ms for ≤ 5 s, then refused, the refusal
+naming it by pid and comm. The readers' "is a writer here?" (`guard.proc.writerFlockHeld`,
+no lock taken) applies the same rule to the same `/proc/locks` read.
 
 ### 2.7 The recovery ladder (charter §5.7; DMT:207, 225 — "in that order of automation")
 

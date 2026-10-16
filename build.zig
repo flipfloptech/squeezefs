@@ -117,6 +117,11 @@ pub fn build(b: *std.Build) void {
             .dist => .full,
         };
     }
+    // Frame-pointer call graphs for `perf record -g` (scripts/perf/clockreads.sh).
+    if (b.option(bool, "frame-pointers", "Keep frame pointers in the binary (profiling)") orelse false) {
+        exe.root_module.omit_frame_pointer = false;
+        squeezefs_exe_mod.omit_frame_pointer = false;
+    }
     b.installArtifact(exe);
 
     const run_step = b.step("run", "Run the squeezefs binary");

@@ -2224,7 +2224,7 @@ const Snapshot = struct {
 /// where its reply is (the cell, a lease park, a bridge) — for a test whose
 /// owed set did not drain. Read racily off the workers' tables.
 fn describeOwed(s: *Session) void {
-    const now = clock.monotonicNs();
+    const now = clock.monotonicCoarseNs();
     for (s.groups) |g| for (g.members, 0..) |*m, ms| for (m.slots.ents, 0..) |*e, ei| {
         const o = e.owing() orelse continue;
         const gent = g.gentOf(@intCast(ms), @intCast(ei));
@@ -2631,6 +2631,40 @@ test "e2e: a namespace request's handler runs on the thread that delivered it �
         try testing.expect(!Helper.onWorker(rig, s));
         // The lane thread's replies wake the worker across threads.
         try testing.expect(slot.wake_writes.load() > w0);
+    }
+}
+
+test "e2e: the transport's clock budget — a 4 KiB O_DIRECT pread and pwrite each cost the worker and its lane at most ONE fine clock read per request, background included (red: ~6–10 — the pass's watchdog stamp and deadline read, the owed stamp, the lease's age, the lane's timer check and two per fiber poll; rung-10-clockreads: on an HPET host each is a ~1 µs syscall). The op's latency stamps are the handler's (op_trace: one at entry, one at return); the transport's own times are ms-scale ages on the coarse clock, phases on the phase clock, and a deadline's fine read only near it" {
+    if (venueMissing()) |why| return testkit.skipWhy(@src(), why);
+    const first = clock.phaseNs();
+    while (clock.phaseOnCounter() == null and clock.monotonicNs() -| first < 10 * std.time.ns_per_s) _ = clock.phaseNs();
+    if (clock.phaseOnCounter() != true) return testkit.skip(@src(), .needs_reference_hardware, "no invariant cycle counter: the phase clock is the fine clock on this CPU");
+    const rig = try Rig.init(testing.allocator, 1, &.{});
+    defer rig.deinit();
+    _ = try rig.mountIt(.{ .mem_budget_bytes = 0 });
+    var pb: [256]u8 = undefined;
+    const fd = try openPath(rig.child(&pb, "scratch"), .{ .ACCMODE = .RDWR, .CLOEXEC = true, .DIRECT = true });
+    defer _ = linux.close(fd);
+    const buf = try testing.allocator.alignedAlloc(u8, .fromByteUnits(4096), 4096);
+    defer testing.allocator.free(buf);
+    @memset(buf, 'c');
+    // Warm: the first request of each kind arms what it arms once.
+    try testing.expectEqual(@as(usize, 4096), linux.pwrite(fd, buf.ptr, buf.len, 0));
+    try testing.expectEqual(@as(usize, 4096), linux.pread(fd, buf.ptr, buf.len, 0));
+    const ops = 128;
+    const before = Snapshot.take();
+    const reads_before = clock.fine_reads.load(.monotonic);
+    for (0..ops) |_| {
+        try testing.expectEqual(@as(usize, 4096), linux.pwrite(fd, buf.ptr, buf.len, 0));
+        try testing.expectEqual(@as(usize, 4096), linux.pread(fd, buf.ptr, buf.len, 0));
+    }
+    const fine = clock.fine_reads.load(.monotonic) - reads_before;
+    const after = Snapshot.take();
+    const requests = after.requests - before.requests;
+    try testing.expect(requests >= 2 * ops);
+    if (fine > requests) {
+        std.debug.print("clock budget: {d} fine reads over {d} requests\n", .{ fine, requests });
+        return error.ClockBudgetExceeded;
     }
 }
 

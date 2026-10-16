@@ -4461,6 +4461,7 @@ const SettlingData = struct {
     reopen_floor: ?u64 = null,
     data_barriers: u32 = 0,
     barrier_inos: usize = 0,
+    in_release: ?struct { ctx: *anyopaque, call: *const fn (*anyopaque) void } = null,
     write_back_drains: u32 = 0,
     /// The (3.7) balance observed inside the flush: a held lock there is
     /// the deadlock the plane's own merge would meet.
@@ -4534,7 +4535,20 @@ const SettlingData = struct {
 
     pub const OwnBlock = NoData.OwnBlock;
     pub const Space = NoData.Space;
-    pub const LayoutGuard = NoData.LayoutGuard;
+    /// The base's guard; its release runs `in_release` once, armed: the
+    /// window a size-setting commit leaves between its landing (the 4a
+    /// guard dropped) and its retire of the parked claim.
+    pub const LayoutGuard = struct {
+        base: NoData.LayoutGuard,
+        owner: *SettlingData,
+
+        pub fn release(self: LayoutGuard, io: Io) void {
+            self.base.release(io);
+            const hook = self.owner.in_release orelse return;
+            self.owner.in_release = null;
+            hook.call(hook.ctx);
+        }
+    };
 
     fn deinit(self: *SettlingData) void {
         self.freed.deinit(testing.allocator);
@@ -4771,7 +4785,7 @@ const SettlingData = struct {
         return error.NotSupported;
     }
     pub fn lockLayout(self: *SettlingData, io: Io, ino: u64) LayoutGuard {
-        return self.base.lockLayout(io, ino);
+        return .{ .base = self.base.lockLayout(io, ino), .owner = self };
     }
     pub fn stageKvmapShrink(_: *SettlingData, _: *tx.KvTx, _: u64, _: Layout, _: u8, _: u64) Error!u32 {
         unreachable;
@@ -4987,6 +5001,44 @@ test "decision 0003 §AL.5 — THE ORDERED LAW: an extending striped write's siz
     try testing.expectEqual(@as(u64, 20_010), (try h.fs.readInodeStored(l)).?.size);
     try testing.expectEqual(@as(?linux.E, null), h.call(.{ .fsync = .{ .fh = 1, .datasync = false } }, f).errno());
     try testing.expectEqual(@as(u64, 20_060), (try h.fs.readInodeStored(l)).?.size);
+    h.release(f);
+}
+
+test "decision 0003 §AL.5 — a truncate supersedes the parked size claim it folded: a times drain in the window between the truncate's landing (its 4a guard dropped at the commit's terminal outcome) and its retire must not journal the claim over the new size (the LD_PRELOAD battery's `truncate -s 3M` read back 64 MiB on the VM)" {
+    const H = HarnessOf(SettlingData);
+    var h: H = undefined;
+    try h.init();
+    defer h.deinit();
+    defer h.data.deinit();
+    h.data.store = &h.store;
+    const f = try h.create(1, "f", 0o644);
+    const l = try H.Fs.localOf(f);
+    var trace = op_trace.OpTrace.begin(0, .other);
+    defer trace.finish();
+    var ctx: filesystem.Ctx = .{ .unique = 0, .uid = 0, .gid = 0, .pid = 0, .io = testing.io, .trace = &trace, .wd_slot = null, .window = &.{} };
+    const big: [8192]u8 = @splat('X');
+    try testing.expectEqual(@as(?linux.E, null), h.write(f, 0, &big, 0).errno());
+    _ = try h.fs.drainPendingTimes(&ctx);
+    // An extending write parks its claim; then the shrink.
+    try testing.expectEqual(@as(?linux.E, null), h.write(f, big.len, &big, 0).errno());
+    try testing.expectEqual(@as(u64, 2 * big.len), h.fs.pending.claimOf(l));
+    const Window = struct {
+        fs: *H.Fs,
+        ctx: *filesystem.Ctx,
+        fn drain(p: *anyopaque) void {
+            const w: *@This() = @ptrCast(@alignCast(p));
+            _ = w.fs.drainPendingTimes(w.ctx) catch |e| std.debug.panic("drain in the window: {t}", .{e});
+        }
+    };
+    var window: Window = .{ .fs = &h.fs, .ctx = &ctx };
+    h.data.in_release = .{ .ctx = &window, .call = &Window.drain };
+    var in = abi.zeroed(abi.fuse_setattr_in);
+    in.valid = abi.FATTR_SIZE;
+    in.size = 100;
+    try testing.expectEqual(@as(?linux.E, null), h.setattr(f, in).errno());
+    try testing.expect(h.data.in_release == null);
+    try testing.expectEqual(@as(u64, 100), (try h.fs.readInodeStored(l)).?.size);
+    try testing.expectEqual(@as(u64, 100), (try h.getattr(f)).size);
     h.release(f);
 }
 

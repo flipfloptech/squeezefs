@@ -591,7 +591,10 @@ request id — "the old id never reached anyone"); a lease-epoch change mid-retr
 per verdict: `Freed` ⇒ purge read tiers + `retire_shipped_free_tracking` (entry gone, word retired);
 `NonTerminal` ⇒ purge + `release_shipped_free_tracking` (this reference only, never the word);
 `Refused` ⇒ touch NOTHING (`SF:L396-428`: "the verdict-blind retire moved a LIVE owner's incarnation
-word whenever a `Refused` double-release entry rode a served batch").
+word whenever a `Refused` double-release entry rode a served batch"). Both tracking steps act on a RAM count
+this mount HOLDS: an untracked block it shipped (the holder minted it, a served publish bound it into
+this tree) has no word here, so they skip it — the holder's verdict already judged the double-release
+lineage (0003 §AU; `rung-10-matrixwedge.md`).
 
 The executor (`execute_shipped_frees`, `SF:L478-617`), under `with_authority_accounting` (a task-local
 marker — "NEVER ambiently active", `SF:L31-66`), ONE ledger read per batch (`durable_block_refcounts`);

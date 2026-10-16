@@ -1174,3 +1174,12 @@ Seen on kamrui (RAM-backed NVMe): on 1M seq write ×4, 51 % of the writes waited
 | AT.2 Rejected: range-granular admission (a per-file range lock) | Not built | The postlude runs after the write's data has landed, so this guard never ordered data. The plane's per-(inode, block) locks (3) order overlapping writes. Level 1 orders an extending write against truncate, because an extending write is never Shared there. Nothing here needs ranges, and a range structure would be a new lock-free core (a model and its weakening) for semantics shared mode already gives |
 | AT.3 Rejected: only shrinking the exclusive section | Not enough | Held 3.3 µs, the guard still cost 790 µs per wait. If handoffs were free, 31 holds ahead would cost about 100 µs. The time is the handoff: a release wakes one waiter, and the lock stays free until that waiter runs, because a fresh taker yields to a queued one (charter §9, bounded barging). A shorter hold leaves the handoff as it is |
 | AT.4 Unchanged | The level-1 classes. The cross-daemon tokens: `I{ino}` is local, and a foreign-slot file's claim is still one shipped verb (`shipSizeClaim`) | — |
+
+## AU. A joiner's shipped-free verdict retires only a count it holds (2026-10-16; `docs/evidence/rung-10-matrixwedge.md`)
+
+The reclaimer ships a non-holder's last reference, a SHARED block and an UNTRACKED one (porting spec §4.1). An untracked block reaches a joiner's reclaimer when the holder minted it for a write into the joiner's file and a later served merge displaced it. The joiner's `Freed` step ran its local `begin_free` for every verdict, so that block met row 6 and fired `block_untracked_free_refusals` on a correct free (THE TWO-DAEMON MATRIX, block 129, every run).
+
+| Call | Decision | Why |
+|---|---|---|
+| AU.1 The tracking steps | `Freed` (retire) and `NonTerminal` (release) touch the joiner's allocator only when it holds a RAM count for the block; `freed_since_word` still counts every `Freed` | The holder's verdict is the authority on the double-release lineage (it runs row 6 with its own state); a missing count here means this mount never counted the block, not a second release |
+| AU.2 Rejected: carrying a tracked flag per shipped block | Not built | The count is 0 or 1 at the ship and nothing but this mount's own ladder moves it in between; the flag would widen the batch and the `FreeTarget` seam for no case the read misses |

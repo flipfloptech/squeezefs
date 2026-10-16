@@ -325,7 +325,7 @@ pub const PayloadLease = struct {
         std.debug.assert(prev == 0);
         payload_leases.inc();
         leases_outstanding.add(1);
-        return .{ .state = state, .data = data, .born_ns = clock.monotonicCoarseNs(), .waker = waker };
+        return .{ .state = state, .data = data, .born_ns = clock.monotonicNs(), .waker = waker };
     }
 
     /// Worker side at a HELD delivery (zero-copy, W1 eligible): no bytes
@@ -369,7 +369,7 @@ pub const PayloadLease = struct {
 
     /// The drop (any thread): the 1 s rule, the gauges, then the wake law.
     pub fn release(self: PayloadLease) void {
-        const age_ns = clock.monotonicCoarseNs() -| self.born_ns;
+        const age_ns = clock.monotonicNs() -| self.born_ns;
         const age_ms = age_ns / std.time.ns_per_ms;
         _ = lease_max_age_ms.fetchMax(age_ms, .monotonic);
         leases_outstanding.sub(1);

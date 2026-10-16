@@ -481,9 +481,7 @@ pub const Lane = struct {
     pub fn drivenBoundNs(self: *Lane) ?u64 {
         var bound: ?u64 = if (self.in_flight > 0) backstop_ns else null;
         if (self.timers.peekDeadline()) |d| {
-            // A far deadline bounds the wait from the coarse side: an early
-            // wake, never a late timer.
-            const left = if (clock.fineNear(d, bound orelse tick_ns)) |now| d -| now else d -| (clock.monotonicCoarseNs() +| clock.coarseLagNs());
+            const left = d -| clock.monotonicNs();
             bound = if (bound) |b| @min(b, left) else left;
         }
         return bound;
@@ -788,8 +786,7 @@ pub const Lane = struct {
     }
 
     fn expireTimers(self: *Lane) void {
-        const d = self.timers.peekDeadline() orelse return;
-        const now = clock.fineNear(d, 0) orelse return;
+        const now = clock.monotonicNs();
         while (self.timers.popDue(now)) |f| {
             stats.timer_fires.inc();
             // The pop is a tick only when it is the wake that schedules the
@@ -811,9 +808,9 @@ pub const Lane = struct {
             self.current = f;
             self.polls_run +%= 1;
             stats.polls.of(self.class).inc();
-            const t0 = clock.phaseNs();
+            const t0 = clock.monotonicNs();
             f.switchIn();
-            stats.poll_ns.record(clock.phaseNs() -| t0);
+            stats.poll_ns.record(clock.monotonicNs() - t0);
             self.current = null;
             switch (f.msg) {
                 .parked => if (f.state.endPollPending()) self.pushReady(f),
@@ -858,14 +855,13 @@ pub const Lane = struct {
     }
 
     fn parkOnce(self: *Lane) void {
+        const now = clock.monotonicNs();
         var tick: u64 = tick_ns;
         if (self.in_flight > 0) {
             tick = backstop_ns;
             stats.lane_backstop_ticks.inc();
         }
-        if (self.timers.peekDeadline()) |d| if (clock.fineNear(d, tick)) |now| {
-            tick = @min(tick, d -| now);
-        };
+        if (self.timers.peekDeadline()) |d| tick = @min(tick, d -| now);
         // A standing READ is the only way a foreign wake reaches the park;
         // an SQ still full after a flush leaves the tick as the sole transport.
         if (!self.ring.armWake()) tick = @min(tick, backstop_ns);

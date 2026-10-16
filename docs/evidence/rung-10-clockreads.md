@@ -1,5 +1,7 @@
 # Rung 10 — one fine clock read where a time is genuinely fine (clockreads; perf-baseline lever 3)
 
+> **Reverted for the move checkpoint (2026-10-16).** The two-daemon teardown wedge (`docs/gates/flakes.md`, "THE TWO-DAEMON MATRIX") appeared only after these cuts — 3 of ~9 VM gates vs 0 of ~88 before — while `lanepark`'s audit found no stall in the clock arithmetic: the cuts most likely expose an older teardown race by changing timing. Re-land `57d9090` + `fa3fe60` (`git revert` the revert) after that wedge is root-caused and fixed; the numbers below are what to expect back.
+
 **Why.** kamrui's clocksource is HPET, which has no vDSO mode. Every `monotonicNs` is a
 `clock_gettime` syscall plus a device read (~1 µs). Before this change a 4 KiB read cost the
 transport 11 such reads and a 4 KiB write 40. `read_hpet` was 30–38 % of the daemon's samples on

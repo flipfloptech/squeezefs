@@ -1296,7 +1296,7 @@ pub const WritePath = struct {
         const d = accumulate.uploadParkedBlock(&self.table, self.uploadDeps(), io, ino, block, 0, prof);
         if (permit) |p| {
             const ord: u32 = if (self.map.lookup(ino, block)) |b| (if (self.vols.byTag(b.vol_tag)) |v| v.ordinal else 0) else 0;
-            self.governor.complete(io, p, ord, clock.monotonicNs());
+            self.governor.complete(io, p, ord, clock.monotonicNs() -| p.admitted_ns);
         }
         prof.finish();
         pipeline.countDisposition(d);

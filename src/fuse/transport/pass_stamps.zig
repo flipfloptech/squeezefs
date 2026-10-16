@@ -23,9 +23,8 @@ pub const MAX_GROUPS: usize = geometry.MAX_QUEUES;
 /// 0 = no worker has passed at that index.
 pub var stamps: [MAX_GROUPS]std.atomic.Value(u64) = @splat(.init(0));
 
-/// The worker's loop, at the top of every pass, on the COARSE monotonic clock
-/// (the census reads ages in ms). Monotonic: the census reads the stamp
-/// alone, never a field it publishes.
+/// The worker's loop, at the top of every pass. Monotonic: the census reads
+/// the stamp alone, never a field it publishes.
 pub fn stamp(group: u16, now_ns: u64) void {
     stamps[group].store(now_ns, .monotonic);
 }

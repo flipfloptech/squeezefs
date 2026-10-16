@@ -23,9 +23,7 @@
 //! ONE token CAS — a check-then-add herd admitted ~6× the budget under
 //! 256-deep O_DIRECT), and the COOLDOWN (a key re-escalates at most every
 //! ~32–64 s: the ghost proves REUSE, the cooldown bounds CHURN). Every
-//! epoch stamp is `clock.monotonicCoarseNs` (Q11: a wall clock steps; the
-//! epochs are seconds, so the coarse clock's tick is noise and a read pays
-//! no clocksource access).
+//! epoch stamp is `clock.monotonicNs` (Q11: a wall clock steps).
 //!
 //! The clamp's RELEASE is additive-increase (decision 0003 §K): the share
 //! of foreground an epoch may spend on admissions starts at `fill_pct`
@@ -479,7 +477,7 @@ pub const Admission = struct {
     /// The hot tier's eviction sink: the governor's ledger for protected
     /// victims (the publish-of-protected-victims arm is the owner's).
     pub fn onHotVictim(self: *Admission, v: hot_tier.Victim) void {
-        self.governor.onEviction(v, clock.monotonicCoarseNs());
+        self.governor.onEviction(v, clock.monotonicNs());
     }
 };
 

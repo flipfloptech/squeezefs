@@ -345,3 +345,51 @@ test "a FLIPPED directory over a two-member set behind the filesystem: the expli
     try testing.expectEqual(intent.stats.xv_cross_owner_intents_minted.load(), intent.stats.xv_cross_owner_intents_retired.load() + intent.stats.xv_cross_owner_intents_open.load());
     try testing.expectEqual(@as(u32, 0), try bound.plane.recoverOpen(3_000));
 }
+
+test "a two-member set behind the filesystem: the times drain commits each member's parked refinements on that member — no entry spans the members (routing_split_refused stays 0), ≤ dlm.max_requests inos per entry, nothing stays parked, and a remount reads every refined stamp" {
+    const gpa = testing.allocator;
+    const economy = @import("../../economy.zig");
+    const key = @import("../../key.zig");
+    const rstats = @import("../../routing/stats.zig").stats;
+    const s = try meta_set.TestSet.create(gpa, "xvtimes", 2);
+    defer s.destroy();
+    var files: [40]u64 = undefined;
+    // Ahead of every create's stamp, so each parked refinement advances its record.
+    const stamp: u64 = @bitCast(@import("../../../core/clock.zig").realtimeCoarseNs() + 60 * std.time.ns_per_s);
+    {
+        const set = try s.open();
+        defer set.close();
+        var nodata: kv_fs.NoData = .{};
+        var fs = try SetFs.mount(gpa, s.io(), set, &nodata, .{ .dlm_stripes = 64 });
+        defer fs.unmount();
+        const bound = try Bound.create(gpa, s.io(), set, &fs.locks, &s.env);
+        defer bound.destroy(gpa);
+        try testing.expectEqual(@as(u32, 0), try fs.bindXv(&bound.plane));
+        var tr = op_trace.OpTrace.begin(0, .other);
+        defer tr.finish();
+        var c: filesystem.Ctx = .{ .unique = 1, .uid = 0, .gid = 0, .pid = 1, .io = s.io(), .trace = &tr, .wd_slot = null, .window = &.{} };
+        var nb: [16]u8 = undefined;
+        var on: [2]u64 = .{ 0, 0 };
+        for (&files, 0..) |*f, i| {
+            f.* = (try fs.create(&c, .{ .parent = inos.ROOT_INO, .name = try std.fmt.bufPrint(&nb, "t{d}", .{i}), .mode = 0o644, .flags = 0, .umask = 0, .open_flags = 0 })).entry.nodeid;
+            on[set.volumeIndexOfSlot(route_table.slotOf(f.*))] += 1;
+        }
+        try testing.expect(on[0] > 0 and on[1] > 0);
+        for (files) |f| _ = try fs.pending.park(try SetFs.localOf(f), stamp, stamp);
+        const split0 = rstats.routing_split_refused.load();
+        const entries0 = economy.stats.meta_kv_times_echo_drain_commits.load();
+        try testing.expectEqual(@as(u64, files.len), try fs.drainPendingTimes(&c));
+        try testing.expectEqual(split0, rstats.routing_split_refused.load());
+        try testing.expectEqual(entries0 + (on[0] + dlm.max_requests - 1) / dlm.max_requests + (on[1] + dlm.max_requests - 1) / dlm.max_requests, economy.stats.meta_kv_times_echo_drain_commits.load());
+        try testing.expectEqual(@as(u64, 0), fs.pending.len());
+    }
+    const set = try s.open();
+    defer set.close();
+    for (files) |f| {
+        const bytes = (try set.lookup(gpa, key.TREE_INODES, &key.inodeKey(route_table.effectiveIno(f)))).?;
+        defer gpa.free(bytes);
+        const v = try record.InodeValue.decode(bytes);
+        try testing.expectEqual(stamp, v.mtime);
+        try testing.expectEqual(stamp, v.ctime);
+    }
+}

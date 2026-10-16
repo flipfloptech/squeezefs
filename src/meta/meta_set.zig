@@ -484,7 +484,8 @@ pub const MetaSet = struct {
             const v = self.route.volumeOf(h.slot);
             if (home) |hv| {
                 if (hv != v) {
-                    rstats.routing_split_refused.fire("a transaction spanning two members reached the facade: the cross-owner intents are the law");
+                    var why: [256]u8 = undefined;
+                    rstats.routing_split_refused.fire(std.fmt.bufPrint(&why, "a transaction spanning two members (committer {s}:{d}) reached the facade: the cross-owner intents are the law", .{ t.site.fn_name, t.site.line }) catch "a transaction spanning two members reached the facade: the cross-owner intents are the law");
                     self.abandon(t);
                     return error.Corrupt;
                 }

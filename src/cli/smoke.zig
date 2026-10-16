@@ -967,13 +967,14 @@ test "smoke: a TWO-MEMBER metadata set through the binary — format sqmeta://a,
     const gpa = testing.allocator;
     const rig = try Rig.init(gpa, io);
     defer rig.deinit();
-    for ([_][:0]const u8{ rig.img, rig.img2 }) |p| {
+    for ([_][:0]const u8{ rig.img, rig.img2, rig.d0, rig.d1 }, [_]u64{ volume_len, volume_len, data_len, data_len }) |p, len| {
         const f = try Io.Dir.cwd().createFile(io, p, .{ .truncate = true });
         defer f.close(io);
-        try f.setLength(io, volume_len);
+        try f.setLength(io, len);
     }
     {
-        const r = try rig.squeezefs(&.{ "format", rig.set_uri });
+        // With data volumes: a striped write parks its stamp (the times drain's work).
+        const r = try rig.squeezefs(&.{ "format", rig.set_uri, rig.data_uri });
         defer rig.freeRun(r);
         if (!r.term.success()) std.debug.print("\nformat: {s}\n", .{r.stderr});
         try testing.expect(r.term.success());
@@ -1025,6 +1026,29 @@ test "smoke: a TWO-MEMBER metadata set through the binary — format sqmeta://a,
         const mints = (numberAfter(tail, "\"rotor_mints\":") orelse 0) + (numberAfter(tail, "\"affinity_mints\":") orelse 0) + (numberAfter(tail, "\"dir_gather_mints\":") orelse 0);
         try testing.expect(mints >= routing_dirs * routing_files_per_dir);
         try testing.expectEqual(@as(?u64, 0), numberAfter(tail, "\"slot_door_refusals\":"));
+    }
+    // The times drain over both members (rung-10-timesdrain): a striped
+    // write into every directory (homes on both members) parks its stamp
+    // and size claim; the syncfs drains them, one entry per member — never
+    // an entry the facade refuses (`routing_split_refused`, EIO, every
+    // refinement parked forever).
+    {
+        const out = try rig.onMount("for d in $(seq 0 7); do dd if=/dev/zero of=r$d/big bs=32k count=1 status=none && dd if=/dev/zero of=r$d/big bs=512 count=1 conv=notrunc status=none; done; sync -f . && echo synced");
+        defer gpa.free(out);
+        try testing.expectEqualStrings("synced\n", out);
+        const st = try rig.stats();
+        defer gpa.free(st);
+        try testing.expect((numberAfter(st, "\"fuse_write_times_parked\":") orelse 0) >= routing_dirs);
+        try testing.expectEqual(@as(?u64, 0), numberAfter(st, "\"meta_kv_times_echo_pending\":"));
+        try testing.expectEqual(@as(?u64, 0), numberAfter(st, "\"routing_split_refused\":"));
+        try testing.expectEqual(@as(?u64, 0), numberAfter(st, "\"invariant_tripwires\":"));
+        const log_text = try rig.readLog();
+        defer gpa.free(log_text);
+        try testing.expect(std.mem.indexOf(u8, log_text, "drain failed") == null);
+        // The verify scripts count the tree's 2000 files.
+        const rm = try rig.onMount("rm r*/big && echo removed");
+        defer gpa.free(rm);
+        try testing.expectEqualStrings("removed\n", rm);
     }
     try rig.umount();
     try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());

@@ -3433,6 +3433,53 @@ test "a writer parked at the write-pipeline governor holds no block guard: the o
     try testing.expectEqualSlices(u8, &writer.mid, got[0 .. 4 * PAGE]);
 }
 
+// rung-10-seqwrite: 1M seq write ×4 on RAM-backed NVMe kept four writes of
+// each 4 MiB block in flight, and the overlay arm held the block guard
+// across its DMA — 54 % of the writes parked 7.2 ms on (3) behind a
+// sibling's DMA. The range claims exclude overlapping DMAs (§3.3); the guard
+// covers the claim, not the device.
+test "two writes into disjoint halves of one block are in flight at once through the overlay: the second reaches its DMA while the first is held in its own — the block guard is never held across a store's DMA" {
+    const io = testing.io;
+    const w = try World.init(testing.allocator, .adaptive, true);
+    defer w.deinit(testing.allocator);
+    var held: HeldDma = .{};
+    w.f.dev.hook = held.hook();
+    try w.f.map.create(5, .striped, 0);
+    const Writer = struct {
+        w: *World,
+        offset: u64,
+        buf: [wt.BS / 2]u8 align(4096) = undefined,
+        result: anyerror!Outcome = error.NotRun,
+        fn run(self: *@This()) void {
+            self.result = self.w.wp.write(testing.io, .{ .ino = 5, .offset = self.offset, .payload = .{ .bytes = &self.buf }, .class = .entire_op, .file = World.striped(self.offset) });
+        }
+    };
+    var a: Writer = .{ .w = w, .offset = 0 };
+    var b: Writer = .{ .w = w, .offset = wt.BS / 2 };
+    fill(&a.buf, 0x51);
+    fill(&b.buf, 0x52);
+    const ta = try std.Thread.spawn(.{}, Writer.run, .{&a});
+    while (held.hits.load(.acquire) == 0) std.Thread.yield() catch {};
+    const stripe = &w.wp.locks.locks[w.wp.locks.stripeOf(5, 0)];
+    const tb = try std.Thread.spawn(.{}, Writer.run, .{&b});
+    // B either reaches its own DMA or parks on the block guard A holds.
+    while (held.hits.load(.acquire) < 2 and stripe.waiters(io) == 0) std.Thread.yield() catch {};
+    const both_in_flight = held.hits.load(.acquire) == 2;
+    held.release();
+    ta.join();
+    tb.join();
+    try testing.expect(both_in_flight);
+    try testing.expectEqual(@as(u32, 1), (try a.result).count(.overlay));
+    try testing.expectEqual(@as(u32, 1), (try b.result).count(.overlay));
+    // The second CQE completed the coverage: the drain publishes both halves.
+    w.wp.quiesce(io);
+    const bound = w.f.map.seam().lookup(5, 0) orelse return error.BlockUnmapped;
+    var got: [wt.BS]u8 = undefined;
+    w.f.dev.peek(bound.vol_tag, bound.offset, &got);
+    try testing.expectEqualSlices(u8, &a.buf, got[0 .. wt.BS / 2]);
+    try testing.expectEqualSlices(u8, &b.buf, got[wt.BS / 2 ..]);
+}
+
 /// A settler of one ino's custody on its own thread (the truncate's venue).
 const Settler = struct {
     w: *World,

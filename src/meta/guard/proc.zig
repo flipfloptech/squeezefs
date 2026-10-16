@@ -293,6 +293,64 @@ test "/proc/locks: an exclusive FLOCK line on the file's (major, minor, inode) i
     try testing.expect(!writerFlockHeld(path));
 }
 
+test "flockExclusive waits out an EXCLUSIVE holder that is not this binary — systemd-udevd's flock(LOCK_EX) + BLKRRPART after every write-close of a whole disk — and opens once it lets go; an exclusive holder of this binary (here: this process) still refuses at once" {
+    var path_buf: [64]u8 = undefined;
+    const path = try std.fmt.bufPrintSentinel(&path_buf, "/build/tmp/proc-flock-transient-{d}", .{linux.getpid()}, 0);
+    _ = linux.mkdir("/build/tmp", 0o755);
+    const rc = linux.open(path.ptr, .{ .ACCMODE = .RDWR, .CLOEXEC = true, .CREAT = true }, 0o600);
+    if (linux.errno(rc) != .SUCCESS) return testkit.skip(@src(), .no_device, "/build/tmp is not writable on this host (the venue's cache volume)");
+    const fd: linux.fd_t = @intCast(rc);
+    defer {
+        _ = linux.close(fd);
+        _ = linux.unlink(path.ptr);
+    }
+    var waits: counters.ShardedCounter = .{};
+    // This process holds it from another open file: refused, no wait.
+    {
+        const rc2 = linux.open(path.ptr, .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);
+        try testing.expectEqual(linux.E.SUCCESS, linux.errno(rc2));
+        const own: linux.fd_t = @intCast(rc2);
+        defer _ = linux.close(own);
+        try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.flock(own, std.posix.LOCK.EX | std.posix.LOCK.NB)));
+        try testing.expectEqual(linux.E.AGAIN, flockExclusive(testing.io, fd, &waits));
+        try testing.expectEqual(@as(u64, 0), waits.load());
+    }
+    // The stand-in for the udev worker: flock(1) holding LOCK_EX until its
+    // `cat` reads EOF on our pipe.
+    var holder = try std.process.spawn(testing.io, .{ .argv = &.{ "flock", "-x", path, "cat" }, .stdin = .pipe, .stdout = .ignore, .stderr = .ignore });
+    defer if (holder.stdin) |s| {
+        s.close(testing.io);
+        holder.stdin = null;
+        _ = holder.wait(testing.io) catch {};
+    };
+    const hang_guard = clock.monotonicNs() + 60 * std.time.ns_per_s;
+    while (!writerFlockHeld(path)) {
+        if (clock.monotonicNs() >= hang_guard) {
+            std.debug.print("\nflock(1) pid {d} never took the lock on {s}\n", .{ holder.id.?, path });
+            return error.HolderNeverLocked;
+        }
+        try std.Thread.yield();
+    }
+    const Opener = struct {
+        fn run(f: linux.fd_t, w: *counters.ShardedCounter, out: *linux.E, done: *std.atomic.Value(bool)) void {
+            out.* = flockExclusive(testing.io, f, w);
+            done.store(true, .release);
+        }
+    };
+    var result: linux.E = .SUCCESS;
+    var done: std.atomic.Value(bool) = .init(false);
+    const t = try std.Thread.spawn(.{}, Opener.run, .{ fd, &waits, &result, &done });
+    // The opener met the holder and is waiting (or, refusing it, is done):
+    // only then let go.
+    while (waits.load() == 0 and !done.load(.acquire)) try std.Thread.yield();
+    holder.stdin.?.close(testing.io);
+    holder.stdin = null;
+    _ = try holder.wait(testing.io);
+    t.join();
+    try testing.expectEqual(linux.E.SUCCESS, result);
+    try testing.expect(waits.load() > 0);
+}
+
 test "/etc/nvme reads as empty when absent, never written" {
     const e = EtcNvme.read();
     _ = e.hostnqn();

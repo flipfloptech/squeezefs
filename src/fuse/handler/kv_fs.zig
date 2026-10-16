@@ -2089,10 +2089,16 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             }
             self.holdAfter(&after);
             t_owned = false;
-            try self.commit(c, t);
+            const clip = if (a.attr.size) |sz| self.pending.clipClaim(local, sz) else null;
+            self.commit(c, t) catch |e| {
+                if (clip) |cl| _ = try self.pending.parkClaim(local, cl.before);
+                return e;
+            };
             if (layout_lock) |g| g.release(self.io);
             layout_lock = null;
-            _ = if (a.attr.size != null) self.pending.retireAll(local) else self.pending.retire(local);
+            if (a.attr.size == null) {
+                _ = self.pending.retire(local);
+            } else if (clip) |cl| _ = self.pending.retireIfStill(local, cl.after);
             if (a.attr.size) |sz| {
                 self.afterCommit(&after);
                 if (kind == .striped and sz < old_size) self.zeroTailAfterShrink(local, sz, old_size);
@@ -2687,10 +2693,14 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 try t.stagePut(key.TREE_INODES, &key.inodeKey(local), &stored.encode());
                 self.holdAfter(&after);
                 t_owned = false;
-                try self.commit(c, t);
+                const clip = self.pending.clipClaim(local, 0);
+                self.commit(c, t) catch |e| {
+                    if (clip) |cl| _ = try self.pending.parkClaim(local, cl.before);
+                    return e;
+                };
                 layout_lock.?.release(self.io);
                 layout_lock = null;
-                _ = self.pending.retireAll(local);
+                if (clip) |cl| _ = self.pending.retireIfStill(local, cl.after);
                 self.afterCommit(&after);
                 self.data.noteShape(local, 0, if (kind == .striped) .striped else .inline_);
             }

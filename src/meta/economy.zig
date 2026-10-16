@@ -891,7 +891,7 @@ pub const PendingTimes = struct {
     /// max-clamped by a dead echo); a destroyed corpse's is moot. Under the
     /// ino's I-guard, so it never races an absorb. True iff one was parked.
     /// A parked size CLAIM survives (its stamp is dropped): only its own
-    /// drain or a size-setting commit (`retireAll`) retires a claim — a
+    /// drain or a size-setting commit (`clipClaim`) retires a claim — a
     /// chmod's or an xattr's commit dropping it would lose the size.
     pub fn retire(self: *PendingTimes, ino: u64) bool {
         const s = self.stripeOf(ino);
@@ -909,16 +909,22 @@ pub const PendingTimes = struct {
         return true;
     }
 
-    /// `retire` for a commit that SETS the size (a truncate, O_TRUNC): the
-    /// claim leaves with the stamp.
-    pub fn retireAll(self: *PendingTimes, ino: u64) bool {
+    pub const Clip = struct { before: Times, after: Times };
+
+    /// A commit that SETS the size (a truncate, O_TRUNC) supersedes the
+    /// claim it folded: under the ino's I-guard, before the commit, the
+    /// claim clips to `size`. The guard drops at the commit's terminal
+    /// outcome, before the caller's `retireIfStill(after)`, and a drain
+    /// taking it in between would journal an unclipped claim over the new
+    /// size. `before` restores a failed commit's claim. Null = none parked.
+    pub fn clipClaim(self: *PendingTimes, ino: u64, size: u64) ?Clip {
         const s = self.stripeOf(ino);
         s.lock.lock();
         defer s.lock.unlock();
-        if (s.map.fetchRemove(ino) == null) return false;
-        _ = self.count.fetchSub(1, .monotonic);
-        stats.meta_kv_times_echo_pending.sub(1);
-        return true;
+        const p = s.map.getPtr(ino) orelse return null;
+        const before = p.*;
+        p.size = @min(p.size, size);
+        return .{ .before = before, .after = p.* };
     }
 
     /// The drain's retire: `ino`'s refinement leaves iff it is still

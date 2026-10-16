@@ -132,50 +132,63 @@ pub fn writerFlockHeld(path: []const u8) bool {
     if (linux.errno(linux.statx(linux.AT.FDCWD, z, 0, .{ .INO = true }, &st)) != .SUCCESS) return false;
     var buf: [PROC_LOCKS_CAP]u8 = undefined;
     const text = readSmall("/proc/locks", &buf) orelse return false;
-    return flockHeldIn(text, st.dev_major, st.dev_minor, st.ino);
+    return flockHolderIn(text, st.dev_major, st.dev_minor, st.ino) != null;
 }
 
-/// systemd-udevd holds `flock(LOCK_SH)` on a whole-disk block device while it
-/// processes an event for it (systemd.io/BLOCK_DEVICE_LOCKING): a fresh
-/// namespace's `add`, the `change` its inotify watch synthesizes when a
-/// writer closes the node (a `format`). Every squeezefs holder is EXCLUSIVE,
-/// so a `LOCK_EX | LOCK_NB` refused while no exclusive lock stands on the
-/// inode is such a probe: retried until it lets go. The bound: one event's
-/// rules are a blkid probe (milliseconds); 5 s covers a queue of them behind
-/// a storm of new namespaces — past it the refusal stands.
+/// systemd-udevd locks a whole-disk block device while it handles it
+/// (systemd.io/BLOCK_DEVICE_LOCKING): `LOCK_SH` for an event's rules (a fresh
+/// namespace's `add`, a blkid probe), and `LOCK_EX` around the `BLKRRPART`
+/// its inotify watch issues after EVERY write-close of the node — a `format`,
+/// a config verb, a mount's teardown (a worker's `flock(LOCK_EX|LOCK_NB)`,
+/// then the ioctl: ~10 ms idle; strace on kamrui, systemd 259). A squeezefs
+/// holder holds for its whole life, so a refused `LOCK_EX | LOCK_NB` is
+/// retried unless the exclusive holder is this binary. The bound: one
+/// event's rules are a blkid probe (milliseconds); 5 s covers a queue of
+/// them behind a storm of new namespaces — past it the refusal stands.
 pub const SHARED_LOCK_WAIT_NS: u64 = 5 * std.time.ns_per_s;
 /// The retry step: a probe's own scale (one blkid read), so the wait ends
 /// within a step of the release.
 pub const SHARED_LOCK_RETRY_MS: i64 = 5;
 
-/// `flock(fd, LOCK_EX | LOCK_NB)` that waits out SHARED holders (above):
-/// `.SUCCESS`, `.AGAIN` when an exclusive holder stands (or a shared one
-/// outlasts the bound), or the call's other errno. `waits` counts each
-/// retry a shared holder caused.
+/// `flock(fd, LOCK_EX | LOCK_NB)` that waits out udev's holders (above):
+/// `.SUCCESS`, `.AGAIN` when this binary holds it exclusively (or another
+/// holder outlasts the bound), or the call's other errno. `waits` counts
+/// each retry a holder caused.
 pub fn flockExclusive(io: Io, fd: linux.fd_t, waits: ?*counters.ShardedCounter) linux.E {
     const deadline = clock.monotonicNs() + SHARED_LOCK_WAIT_NS;
     while (true) {
         const e = linux.errno(linux.flock(fd, std.posix.LOCK.EX | std.posix.LOCK.NB));
         if (e != .AGAIN) return e;
-        if (exclusiveFlockOn(fd) or clock.monotonicNs() >= deadline) return .AGAIN;
+        if (squeezefsHoldsExclusive(fd) or clock.monotonicNs() >= deadline) return .AGAIN;
         if (waits) |w| w.inc();
         io.sleep(.fromMilliseconds(SHARED_LOCK_RETRY_MS), .awake) catch return .AGAIN;
     }
 }
 
-/// An exclusive `flock` on `fd`'s inode by any process (`/proc/locks`);
-/// unreadable reads as held (the refusal stands).
-fn exclusiveFlockOn(fd: linux.fd_t) bool {
+/// An exclusive `flock` on `fd`'s inode whose locker (`/proc/locks`) is this
+/// process or runs this very executable. Unreadable `/proc/locks` reads as
+/// held (the refusal stands); a locker whose exe is unreadable (another
+/// user's, a pid outside our namespace) is waited out — the bound refuses it.
+fn squeezefsHoldsExclusive(fd: linux.fd_t) bool {
     var st: linux.Statx = undefined;
     if (linux.errno(linux.statx(fd, "", linux.AT.EMPTY_PATH, .{ .INO = true }, &st)) != .SUCCESS) return true;
     var buf: [PROC_LOCKS_CAP]u8 = undefined;
     const text = readSmall("/proc/locks", &buf) orelse return true;
-    return flockHeldIn(text, st.dev_major, st.dev_minor, st.ino);
+    const pid = flockHolderIn(text, st.dev_major, st.dev_minor, st.ino) orelse return false;
+    if (pid == linux.getpid()) return true;
+    var pb: [32]u8 = undefined;
+    const exe = std.fmt.bufPrintSentinel(&pb, "/proc/{d}/exe", .{pid}, 0) catch return false;
+    var theirs: linux.Statx = undefined;
+    var ours: linux.Statx = undefined;
+    if (linux.errno(linux.statx(linux.AT.FDCWD, exe, 0, .{ .INO = true }, &theirs)) != .SUCCESS) return false;
+    if (linux.errno(linux.statx(linux.AT.FDCWD, "/proc/self/exe", 0, .{ .INO = true }, &ours)) != .SUCCESS) return false;
+    return theirs.ino == ours.ino and theirs.dev_major == ours.dev_major and theirs.dev_minor == ours.dev_minor;
 }
 
-/// The `/proc/locks` scan: an exclusive FLOCK line whose `MAJ:MIN:INO`
-/// (hex major and minor, decimal inode) names the file.
-pub fn flockHeldIn(text: []const u8, dev_major: u32, dev_minor: u32, ino: u64) bool {
+/// The `/proc/locks` scan: the locker pid of an exclusive FLOCK line whose
+/// `MAJ:MIN:INO` (hex major and minor, decimal inode) names the file (0 when
+/// its pid field does not parse).
+pub fn flockHolderIn(text: []const u8, dev_major: u32, dev_minor: u32, ino: u64) ?linux.pid_t {
     var lines = std.mem.splitScalar(u8, text, '\n');
     while (lines.next()) |line| {
         var it = std.mem.tokenizeAny(u8, line, " \t");
@@ -185,15 +198,16 @@ pub fn flockHeldIn(text: []const u8, dev_major: u32, dev_minor: u32, ino: u64) b
         _ = it.next() orelse continue;
         const mode = it.next() orelse continue;
         if (!std.mem.eql(u8, mode, "WRITE")) continue;
-        _ = it.next() orelse continue;
+        const pid = it.next() orelse continue;
         const where = it.next() orelse continue;
         var parts = std.mem.splitScalar(u8, where, ':');
         const maj = std.fmt.parseInt(u32, parts.next() orelse continue, 16) catch continue;
         const min = std.fmt.parseInt(u32, parts.next() orelse continue, 16) catch continue;
         const node = std.fmt.parseInt(u64, parts.next() orelse continue, 10) catch continue;
-        if (maj == dev_major and min == dev_minor and node == ino) return true;
+        if (maj != dev_major or min != dev_minor or node != ino) continue;
+        return std.fmt.parseInt(linux.pid_t, pid, 10) catch 0; // procfs prints the pid in decimal
     }
-    return false;
+    return null;
 }
 
 /// `/etc/nvme/hostnqn` + `/etc/nvme/hostid`, trimmed; absent reads empty.
@@ -268,12 +282,12 @@ test "/proc/locks: an exclusive FLOCK line on the file's (major, minor, inode) i
         \\4: FLOCK  ADVISORY  WRITE 4245 00:1f:9 0 EOF
         \\
     ;
-    try testing.expect(flockHeldIn(table, 0xfd, 1, 131074));
-    try testing.expect(!flockHeldIn(table, 0xfd, 1, 131075));
-    try testing.expect(!flockHeldIn(table, 0xfd, 1, 131076));
-    try testing.expect(flockHeldIn(table, 0, 0x1f, 9));
-    try testing.expect(!flockHeldIn(table, 0xfd, 2, 131074));
-    try testing.expect(!flockHeldIn("garbage\n\n: : :\n", 1, 1, 1));
+    try testing.expectEqual(@as(?linux.pid_t, 4242), flockHolderIn(table, 0xfd, 1, 131074));
+    try testing.expectEqual(null, flockHolderIn(table, 0xfd, 1, 131075));
+    try testing.expectEqual(null, flockHolderIn(table, 0xfd, 1, 131076));
+    try testing.expectEqual(@as(?linux.pid_t, 4245), flockHolderIn(table, 0, 0x1f, 9));
+    try testing.expectEqual(null, flockHolderIn(table, 0xfd, 2, 131074));
+    try testing.expectEqual(null, flockHolderIn("garbage\n\n: : :\n", 1, 1, 1));
     // A real file: no lock, then our exclusive flock, then released. Pid-
     // tagged: two test processes on the venue never share the probe.
     var path_buf: [64]u8 = undefined;

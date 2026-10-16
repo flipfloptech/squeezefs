@@ -72,7 +72,7 @@ pub const Outcome = struct {
 };
 
 /// The dedicated door fd: `flock(LOCK_EX | LOCK_NB)`, held until `close`
-/// (a shared holder — udev's probe — waited out: `guard.proc.flockExclusive`).
+/// (udev's block-device locks waited out: `guard.proc.flockExclusive`).
 fn takeDoor(io: Io, path: []const u8) Error!linux.fd_t {
     var zbuf: [linux.PATH_MAX]u8 = undefined;
     const z = align_probe.pathZ(&zbuf, path) catch return error.DeviceRefused;

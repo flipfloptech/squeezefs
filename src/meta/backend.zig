@@ -182,8 +182,8 @@ pub fn openErrno(e: OpenError) linux.E {
 pub const Stats = struct {
     /// `writer_guard_busy_refusals`: mounts refused by a held flock.
     guard_busy_refusals: counters.ShardedCounter = .{},
-    /// Retries of the writer flock behind a SHARED holder (udev's block
-    /// device probe — `guard.proc.flockExclusive`).
+    /// Retries of the writer flock behind a holder that is not this binary
+    /// (udev's block-device locks — `guard.proc.flockExclusive`).
     guard_shared_lock_waits: counters.ShardedCounter = .{},
     mounts: counters.ShardedCounter = .{},
     clean_unmounts: counters.ShardedCounter = .{},

@@ -31,6 +31,7 @@ How to build, test, and work on squeezefs-zig: the macOS dev box, the Linux venu
 - Orphaned daemons: janitor monitor stops `squeezefs` daemons older than 3 h. Disk: `scripts/venue trim` (fstrim, `scripts/venue-prune` under locks, fstrim); auto-trim monitor when Mac < 40 GiB; janitor trims kamrui when /build > 60%. Restart monitors at their 10 h limit.
 - `container exec` ignores local SIGTERM; kill inside the VM by pid.
 - Owner rule (2026-10-15): external suites (pjdfstest, LTP, xfstests — class C) run ONLY right before a release tag, never as discovery/probe passes while fix agents work (competes for kamrui slots); the gate's 2-min pjdfstest `suites-smoke` stays.
+- Memory travels in the repo (715450e): `docs/memory/` = a copy of these topics + README; the owner keeps his own `~/.grok` on the workstation untouched; AGENTS.md points there. At the handoff, re-copy the topics into `docs/memory/` and refresh the README's "Recent" section.
 - AGENTS.md Landing: light tier = red test + fix + targeted venue runs; full tier adds ONE venue gate. Red train on your commit: fix within an hour or revert. Flaky rows in docs/gates/flakes.md.
 
 ## Git publishing

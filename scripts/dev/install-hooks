@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Installs the repo's git hooks into this clone (owner ruling 2026-10-14: origin/dev follows
+# every landing on dev — post-commit and post-merge push dev in the background, never forced,
+# and log to <git-common-dir>/sqz-push.log). Run once per clone; worktrees share the hooks.
+set -euo pipefail
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+hooks=$(git -C "$here" rev-parse --git-common-dir)/hooks
+mkdir -p "$hooks"
+for h in post-commit post-merge; do install -m 0755 "$here/hooks/$h" "$hooks/$h"; done
+echo "installed post-commit and post-merge into $hooks"

@@ -1,0 +1,7 @@
+#!/bin/sh
+# Owner ruling 2026-10-14: origin/dev follows every landing on dev. Background, never forced;
+# a rejected push (origin moved) is logged to .git/sqz-push.log for the orchestrator.
+[ "$(git rev-parse --abbrev-ref HEAD)" = dev ] || exit 0
+log="$(git rev-parse --git-common-dir)/sqz-push.log"
+( if git push -q origin dev >>"$log" 2>&1; then echo "$(date -u +%FT%TZ) pushed $(git rev-parse --short dev)" >>"$log"; else echo "$(date -u +%FT%TZ) PUSH FAILED for $(git rev-parse --short dev)" >>"$log"; fi ) >/dev/null 2>&1 &
+exit 0

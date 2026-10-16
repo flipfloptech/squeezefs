@@ -1,4 +1,4 @@
-# Agent memory snapshot (2026-10-16)
+# Agent memory snapshot (2026-10-16, refreshed at the move checkpoint)
 
 The agent's working notes for this repo, copied from the Grok workspace memory on the Mac
 (`~/.grok/memory-v2/workspaces/squeezefs-zig-86202243/topics/`) so that they travel with the
@@ -35,12 +35,11 @@ sessions and mean nothing elsewhere.
   kernel drops the TSC — the stock Ubuntu kernel too. HPET reads cost ~1 µs vs ~20 ns, so
   kamrui's absolute numbers look worse than SqueezeFS is; A/B comparisons on the box stay
   valid. Forcing the TSC (`tsc=nowatchdog`/`reliable`) would run the clock 0.74 % fast;
-  decided: keep HPET, re-measure after the clock-read cuts (landed `c689c54`), try the
-  parameter only with chrony tracking checked if HPET still dominates.
-- The move: development pauses after the running agents land, then moves to the owner's
-  Linux workstation, where Grok runs directly and the workstation is the local venue
-  (gates, perf and kernel builds native). aarch64 coverage then needs a second venue (the
-  Mac VM or an arm64 box over ssh).
+  decided: keep HPET. (The clock-read cuts that reduced the reads per op are reverted for the
+  move — see the handoff — and come back once the two-daemon teardown wedge is fixed.)
+- The move happened at the checkpoint of 2026-10-16: `docs/handoff/2026-10-16-workstation.md`
+  is the state, the open items in order, and the steps to resume on the Linux workstation
+  (the local venue; aarch64 coverage needs a second venue, the Mac VM or an arm64 box).
 
 ## Using these notes on another machine
 

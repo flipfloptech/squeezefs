@@ -330,6 +330,10 @@ pub const JoinedSet = struct {
     rate_mark_claims: u64 = 0,
     rate_mark_ns: u64 = 0,
     rate_withdrawn: u64 = 0,
+    /// The pool a CAPPED grant left (`grant.joinedCappedTarget`): the
+    /// target's ceiling until an ask fits under the manager's cap again.
+    /// Under `pool_lock`.
+    capped_pool: ?u64 = null,
     /// The proactive refill's flight: the mirror's low-water hook kicks
     /// ONE pool cadence when a claim crosses the refill mark (the pool's
     /// state, not the checkpoint clock, decides).
@@ -706,19 +710,22 @@ pub const JoinedSet = struct {
     /// At the cadence (the checkpoint's page write) and on the low-water
     /// kick: refill when the unclaimed headroom halves — the top-up to
     /// the target (the wire carries no page word, so the joiner names the
-    /// difference); return the surplus above twice the target (a pool
-    /// that outgrew its target after a storm of frees); the mirror's mark
+    /// difference; past the manager's cap the pool it got is the target's
+    /// ceiling); return the surplus above twice the target (a pool that
+    /// outgrew its target after a storm of frees); the mirror's mark
     /// follows the target.
     pub fn poolCadence(self: *JoinedSet) void {
         self.pool_lock.lockUncancelable(self.be.io);
         defer self.pool_lock.unlock(self.be.io);
-        const target = self.poolTarget();
+        const want_target = self.poolTarget();
+        const target = grant.joinedCappedTarget(want_target, self.capped_pool);
         const unclaimed = self.unclaimedCount();
         self.be.alloc.setLowWater(grant.joinedRefillMark(target, self.be.cache.heapPromised()));
         if (grant.joinedRefillDue(unclaimed -| self.be.cache.heapPromised(), target)) {
             var runs: std.ArrayList(grant.GrantRun) = .empty;
             defer runs.deinit(self.gpa);
-            var want: u32 = @intCast(@min(target -| unclaimed, grant.GRANT_EXTENTS_MAX));
+            // The law's want, not the ceiling: an ask that fits the cap again lifts it.
+            var want: u32 = @intCast(@min(want_target -| unclaimed, grant.GRANT_EXTENTS_MAX));
             if (want == 0) return;
             self.wire.extentGrant(self.appenderId(), want, &runs) catch |e| switch (e) {
                 error.Rejected => {
@@ -748,6 +755,7 @@ pub const JoinedSet = struct {
                 }
                 self.be.alloc.absorbGranted(.{ .start = r.start, .len = r.len });
             }
+            self.capped_pool = if (want == 0) self.unclaimedCount() else null;
             stats.extent_grant_refills.inc();
             self.checkClosure();
             return;

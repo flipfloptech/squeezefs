@@ -127,6 +127,16 @@ pub fn refillDue(unclaimed: u64, refill_reference: u64) bool {
 }
 
 /// Joined: `headroom < derived / 2`, `headroom = unclaimed − promised`.
+/// A wire joiner's effective pool target: the law's want, ceilinged by the
+/// pool a CAPPED grant left it (the manager's heap share at that answer).
+/// The wire carries no page word, so the manager grants a cap ask as an
+/// INCREMENT; without the ceiling every cadence re-asks the cap and the
+/// pool swallows the heap (the KILL ROWS (b) finding: 919 of 990 extents
+/// unclaimed in B, the remounted manager left none to hold its pages).
+pub fn joinedCappedTarget(target: u64, capped_pool: ?u64) u64 {
+    return @min(target, capped_pool orelse target);
+}
+
 pub fn joinedRefillDue(headroom: u64, derived: u64) bool {
     return headroom < derived / REFILL_FRACTION_DIVISOR;
 }
@@ -724,6 +734,42 @@ test "a wire joiner's derived size, its SMO-rate fold and its refill mark: the s
     try testing.expectEqual(@as(u64, 45), joinedRefillMark(72, 10));
     try testing.expect(joinedRefillDue(45 - 10, 72) and !joinedRefillDue(46 - 10, 72));
     try testing.expectEqual(@as(u64, 0), joinedRefillMark(1, 0));
+}
+
+test "a wire joiner whose want exceeds the manager's heap share holds about one share, never the heap: each capped grant is an increment, so the pool it leaves is the ceiling (without it, 30 cadences drain 987 free extents to the floor)" {
+    const Sim = struct {
+        /// The manager's answers to a joiner storming at 122 SMO/s (target
+        /// ≈ 11,000) on the smoke's 990-extent heap, 2 appenders known,
+        /// 3 images claimed per cadence; returns the heap's free count.
+        fn run(remember_cap: bool) u64 {
+            var free: u64 = 987;
+            var unclaimed: u64 = 0;
+            var capped: ?u64 = null;
+            const want_target = joinedGrantDerived(122_000, 46_500);
+            for (0..30) |_| {
+                unclaimed -|= 3;
+                const target = joinedCappedTarget(want_target, if (remember_cap) capped else null);
+                if (!joinedRefillDue(unclaimed, target)) continue;
+                const cap = grantWireCap(free, 2);
+                var rejected = false;
+                const want = clampGrantWant(want_target - unclaimed, cap) catch blk: {
+                    rejected = true; // the joiner then asks the cap (0)
+                    break :blk clampGrantWant(0, cap) catch unreachable;
+                };
+                const got = @min(want, free);
+                free -= got;
+                unclaimed += got;
+                capped = if (rejected) unclaimed else null;
+            }
+            return free;
+        }
+    };
+    // With the ceiling: two capped grants (123, then 108 once the pool
+    // halved) — three quarters of the heap stays free.
+    try testing.expectEqual(@as(u64, 756), Sim.run(true));
+    try testing.expect(Sim.run(false) < 50);
+    try testing.expectEqual(@as(u64, 100), joinedCappedTarget(11_000, 100));
+    try testing.expectEqual(@as(u64, 11_000), joinedCappedTarget(11_000, null));
 }
 
 test "grant − reached is normalized runs" {

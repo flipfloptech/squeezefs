@@ -35,6 +35,24 @@ FSTESTS_TIMEOUT_S=${FSTESTS_TIMEOUT_S:-14400}
 # never a filesystem semantic (those are the ledger's).
 FSTESTS_VENUE_EXCLUDE="$SUITES_DIR/fstests-venue-exclude.txt"
 
+# xfstests master defines `struct delegation` (the file-delegation tests'
+# fcntl argument) only `#ifndef F_GETDELEG`; glibc 2.43+ defines the
+# constants without the struct, so on a rolling venue locktest.c does not
+# compile ("storage size of 'deleg' isn't known"). The maintainer's fix
+# (https://lore.kernel.org/fstests/20260813150846.280498-1-zlang@kernel.org/)
+# takes the struct out of that guard; until it lands, the same edit here,
+# only where the guard still wraps the struct and glibc lacks it.
+fstests_patch_locktest() {
+  local f="$FSTESTS_DIR/src/locktest.c"
+  # A libc that completes the struct: nothing to do.
+  printf '#include <fcntl.h>\nstruct delegation d;\n' | cc -x c -fsyntax-only - 2>/dev/null && return 0
+  # The struct still inside the guard (the clone predates the fix)?
+  grep -Pzoq 'struct delegation \{[^}]*\};\n#endif\n' "$f" || return 0
+  # Close the guard after the constants; drop the `#endif` after the struct.
+  sed -i -e '/^#define F_SETDELEG[[:space:]]*(1024 + 16)$/a #endif' -e '/^struct delegation {/,/^#endif$/{/^#endif$/d}' "$f"
+  suite_log "locktest.c: struct delegation defined outside the F_GETDELEG guard (this glibc defines the constants, not the struct; upstream fix pending)"
+}
+
 fstests_build() {
   if [ ! -d "$FSTESTS_DIR/.git" ]; then
     suite_log "cloning $FSTESTS_REPO"
@@ -42,6 +60,7 @@ fstests_build() {
   fi
   if [ ! -x "$FSTESTS_DIR/ltp/fsstress" ] || [ ! -x "$FSTESTS_DIR/ltp/fsx" ]; then
     suite_log "building xfstests ($(cd "$FSTESTS_DIR" && git log -1 --format=%h))"
+    fstests_patch_locktest
     (cd "$FSTESTS_DIR" && make -s -j"$(nproc)" >"$RESULTS/fstests-build.log" 2>&1) || { tail -30 "$RESULTS/fstests-build.log" >&2; suite_die "xfstests build failed"; }
   fi
   echo "xfstests $(cd "$FSTESTS_DIR" && git log -1 --format='%H %cd')" > "$RESULTS/fstests-version.txt"

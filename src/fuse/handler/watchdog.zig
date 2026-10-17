@@ -454,6 +454,7 @@ test "watchdog tick: an op past its class threshold is reported with op/ino/age/
     var reg = try Registry.init(testing.allocator, 3);
     defer reg.deinit();
     var wd = Watchdog.init(&reg);
+    reg.refreshes = 0; // the init's real-clock seed is not this fake clock's (see the lower-bound test)
     const t0: u64 = 1_000 * std.time.ns_per_s;
     reg.refreshCoarse(t0);
     // One op per shard (the home shard rotates per thread, so force the
@@ -498,6 +499,7 @@ test "the watchdog never cancels: a slot that stays claimed across many ticks is
     var reg = try Registry.init(testing.allocator, 1);
     defer reg.deinit();
     var wd = Watchdog.init(&reg);
+    reg.refreshes = 0; // the init's real-clock seed is not this fake clock's (see the lower-bound test)
     const t0: u64 = 50 * std.time.ns_per_s;
     reg.refreshCoarse(t0);
     const s = reg.claim(.fsync, 5, 55).?;
@@ -524,6 +526,11 @@ test "the age lower bound: an op claimed since the previous tick is never overdu
     var reg = try Registry.init(testing.allocator, 1);
     defer reg.deinit();
     var wd = Watchdog.init(&reg);
+    // `init` seeds the history with the REAL clock; a fake-clock test owns
+    // its history (a host 100–105 s after boot put the real stamp between
+    // t0 and t1 and the bound read 326 ms: the gate train's first run
+    // after a reboot).
+    reg.refreshes = 0;
     const t0: u64 = 100 * std.time.ns_per_s;
     reg.refreshCoarse(t0);
     // Eight storm writes claimed 300 ms before the next tick, which lands

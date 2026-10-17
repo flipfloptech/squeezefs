@@ -131,8 +131,14 @@ pub const RecordSource = struct {
     membershipStamp: *const fn (ctx: *anyopaque) ledger.MembershipStamp,
     /// Publish every guest slot tree's root whose durable copy in tree 0
     /// is stale (one checkpoint-class control entry each), after the
-    /// flush pass and before the tail rule (C4b).
+    /// flush pass and before the tail rule (C4b). A root the full
+    /// checkpoint class cannot take stays unpublished (the next C4b
+    /// retries) and clamps the tail through `unpublishedGuestFloor`.
     publishGuestRoots: *const fn (ctx: *anyopaque) CycleError!void,
+    /// The lowest journal position at which a root tree 0 does not name yet
+    /// came into force (`no_floor` when every one is named): the tail stays
+    /// under it so replay still rebuilds that tree.
+    unpublishedGuestFloor: ?*const fn (ctx: *anyopaque) u64 = null,
     /// The symmetric plane's appender pages (charter §5.5: the page IS the
     /// appender's ledger record — one write per checkpoint), after the
     /// ledger record landed and its bookkeeping moved; `cache_clean` is
@@ -864,8 +870,10 @@ pub const Checkpointer = struct {
         const dying = self.deps.cache.takeDyingFloors();
         const inflight_start = self.deps.inflight.minInflightStart();
         const dirty_floor_min = self.minDirtyFloor();
-        const tail = ledger.checkpointTail(h, &.{ inflight_start, dying, dirty_floor_min });
-        if (tail < h) log.debug("checkpoint tail {d} < head {d}: inflight {d}, dying floors {d}, dirty node floor {d}", .{ tail, h, inflight_start, dying, dirty_floor_min });
+        // Never under the previous record's tail: that window is reclaimed.
+        const guest_floor = if (self.deps.record.unpublishedGuestFloor) |f| @max(f(self.deps.record.ctx), tail_before) else node_cache.no_floor;
+        const tail = ledger.checkpointTail(h, &.{ inflight_start, dying, dirty_floor_min, guest_floor });
+        if (tail < h) log.debug("checkpoint tail {d} < head {d}: inflight {d}, dying floors {d}, dirty node floor {d}, unpublished guest root {d}", .{ tail, h, inflight_start, dying, dirty_floor_min, guest_floor });
         const t_tail = clock.monotonicNs();
 
         // ---- C9: the record. Node-seq watermark captured AFTER the flush

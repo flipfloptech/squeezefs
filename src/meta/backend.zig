@@ -220,6 +220,9 @@ pub const TestSeams = struct {
     /// 0's page refresh, tree-0 records) — its dirty bitmap pages (C6) are
     /// not.
     after_guest_roots: ?node_cache.Hook = null,
+    /// C1b/C4b: a guest root's tree-0 publish finds the checkpoint class
+    /// full (`ConveyorFull`), as a ring a storm filled does.
+    refuse_guest_publish: bool = false,
     /// C6: one dirty bitmap page landed — the cycle's later pages (in page
     /// order) and its record are not on the device.
     after_bitmap_page: ?node_cache.Hook = null,
@@ -699,7 +702,7 @@ pub const KvBackend = struct {
             .barrier = be.dev.barrierSink(),
             .ledger = .{ .ctx = be, .writeSlot = ledgerSlotHook },
             .pages = .{ .ctx = be, .writePage = bitmapPageHook },
-            .record = .{ .ctx = be, .treeRoots = treeRootsFn, .next_ino = &be.ino, .node_seq = &be.seq, .membershipStamp = stampForLedger, .publishGuestRoots = publishGuestRootsHook, .appenderPages = if (sb.symmetricPlaneStamped()) appenderPagesHook else null, .dataPages = if (sb.symmetricPlaneStamped()) dataPagesHook else null },
+            .record = .{ .ctx = be, .treeRoots = treeRootsFn, .next_ino = &be.ino, .node_seq = &be.seq, .membershipStamp = stampForLedger, .publishGuestRoots = publishGuestRootsHook, .unpublishedGuestFloor = unpublishedGuestFloor, .appenderPages = if (sb.symmetricPlaneStamped()) appenderPagesHook else null, .dataPages = if (sb.symmetricPlaneStamped()) dataPagesHook else null },
             .smo = be.ckpt_seam.seam(),
             .maintenance = .{ .ctx = be, .pop = popMaintenance, .pending = maintenancePending, .requeue = requeueMaintenance },
         });
@@ -1074,7 +1077,7 @@ pub const KvBackend = struct {
             .barrier = be.dev.barrierSink(),
             .ledger = null,
             .pages = null,
-            .record = .{ .ctx = be, .treeRoots = treeRootsFn, .next_ino = &be.ino, .node_seq = &be.seq, .membershipStamp = stampForLedger, .publishGuestRoots = publishGuestRootsHook, .appenderPages = joinedPagesHook },
+            .record = .{ .ctx = be, .treeRoots = treeRootsFn, .next_ino = &be.ino, .node_seq = &be.seq, .membershipStamp = stampForLedger, .publishGuestRoots = publishGuestRootsHook, .unpublishedGuestFloor = unpublishedGuestFloor, .appenderPages = joinedPagesHook },
             .smo = be.ckpt_seam.seam(),
             .maintenance = .{ .ctx = be, .pop = popMaintenance, .pending = maintenancePending, .requeue = requeueMaintenance },
         });
@@ -1954,7 +1957,8 @@ pub const KvBackend = struct {
         var it = mentioned.keyIterator();
         while (it.next()) |slot| {
             if (be.trees.find(.{ .slot = key.guestForestSlot(slot.*) }) != null) continue;
-            _ = try be.mintGuestTree(slot.*);
+            // A re-mint's records are the replayed window's: its floor is the window's start.
+            (try be.mintGuestTree(slot.*)).setRootFloor(be.core.reusableUpto());
         }
     }
 
@@ -2047,6 +2051,8 @@ pub const KvBackend = struct {
             else => return error.Corrupt,
         };
         errdefer t.destroy();
+        // Its records are this commit's and later: none sits under the head.
+        t.setRootFloor(be.core.headPos());
         try be.trees.add(t);
         routing.stats.stats.routing_guest_trees_minted.inc();
         return t;
@@ -2058,6 +2064,7 @@ pub const KvBackend = struct {
     pub fn adoptTree(be: *KvBackend, t: *KvTree) Allocator.Error!void {
         be.trees_lock.lockUncancelable(be.io);
         defer be.trees_lock.unlock(be.io);
+        t.setRootFloor(be.core.headPos());
         try be.trees.add(t);
     }
 
@@ -2185,15 +2192,41 @@ pub const KvBackend = struct {
             if (be.slots.armed and be.slots.table.view(slot).state != .unleased) continue;
             const root = t.rootPtr();
             if (be.guest_published.get(slot)) |p| if (p.addr == root.addr and p.seq == root.seq) continue;
-            _ = be.writeSlotStateEntry(slot, root) catch |e| return switch (e) {
-                error.OutOfMemory => error.OutOfMemory,
-                error.VolumeFailed => error.VolumeFailed,
-                error.Io, error.JournalWriteFailed => error.Io,
-                else => error.Corrupt,
+            _ = be.writeSlotStateEntry(slot, root) catch |e| switch (e) {
+                // A ring a storm filled: the root stays pending (the next C4b
+                // retries), and `unpublishedGuestFloor` holds the tail under it.
+                error.ConveyorFull => {
+                    log.debug("meta volume {s}: slot {d}'s root publish deferred (the checkpoint class is full)", .{ be.path, slot });
+                    continue;
+                },
+                else => return switch (e) {
+                    error.OutOfMemory => error.OutOfMemory,
+                    error.VolumeFailed => error.VolumeFailed,
+                    error.Io, error.JournalWriteFailed => error.Io,
+                    else => error.Corrupt,
+                },
             };
             try be.guest_published.put(be.gpa, slot, root);
         }
         if (test_seams.after_guest_roots) |h| h.call(h.ctx);
+    }
+
+    /// The C8 input: the lowest `rootFloor` among the guest roots
+    /// `publishGuestRoots` would publish (the same filter), `no_floor` when
+    /// tree 0 names every one.
+    fn unpublishedGuestFloor(ctx: *anyopaque) u64 {
+        const be: *KvBackend = @ptrCast(@alignCast(ctx));
+        var floor: u64 = node_cache.no_floor;
+        for (be.trees.load()) |t| {
+            const fs = t.forest_slot orelse continue;
+            if (t.identity.rootId() != null) continue;
+            const slot = routing.route_table.slotOfForestSlot(fs);
+            if (be.slots.armed and be.slots.table.view(slot).state != .unleased) continue;
+            const root = t.rootPtr();
+            if (be.guest_published.get(slot)) |p| if (p.addr == root.addr and p.seq == root.seq) continue;
+            floor = @min(floor, t.rootFloor());
+        }
+        return floor;
     }
 
     const StampCtx = struct {
@@ -2234,6 +2267,7 @@ pub const KvBackend = struct {
         const kind: record.RecordKind = if (state != null) .put else .delete;
         var frames = [_]journal.RecordFrame{.{ .tag = key.tagFor(key.TREE_CONTROL, 0), .key = k, .kind = @fromBackingInt(@intCast(@backingInt(kind))), .seq = 0, .value = value }};
         const len = journal.entryLenFor(&frames) catch return error.Corrupt;
+        if (test_seams.refuse_guest_publish) return error.ConveyorFull;
         const adm = be.core.tryAdmit(len, .checkpoint) orelse return error.ConveyorFull;
         var st: StampCtx = .{ .j = &be.smo_journal, .adm = adm };
         var attempt: u32 = 0;
@@ -2770,6 +2804,16 @@ const TestVol = struct {
     }
 
     fn createSized(gpa: Allocator, name: []const u8, flush_ms: ?[]const u8, journal_len: u64, volume_len: u64) !*TestVol {
+        return createClassed(gpa, name, flush_ms, journal_len, volume_len, .symmetric);
+    }
+
+    /// A flat single-writer volume: no lease plane, so every guest root
+    /// publishes through `publishGuestRoots` (the class `ops.fsck.scale` runs).
+    fn createSingleWriter(gpa: Allocator, name: []const u8, flush_ms: ?[]const u8) !*TestVol {
+        return createClassed(gpa, name, flush_ms, 1 << 20, test_volume_len, .single_writer);
+    }
+
+    fn createClassed(gpa: Allocator, name: []const u8, flush_ms: ?[]const u8, journal_len: u64, volume_len: u64, class: geometry.Class) !*TestVol {
         const self = try gpa.create(TestVol);
         errdefer gpa.destroy(self);
         self.* = .{ .gpa = gpa, .env = std.process.Environ.Map.init(gpa), .sqz = undefined };
@@ -2787,6 +2831,7 @@ const TestVol = struct {
             .journal_len_override = journal_len,
             .uuid = "kv-backend-uuid!".*,
             .set = test_set,
+            .class = class,
         });
         return self;
     }
@@ -3477,6 +3522,40 @@ test "kill matrix: mid-C4b — two guest trees minted on first touch (each root 
     for (inos_acked) |ino| try testing.expect(try present(copy, ino));
     for (copy.trees.load()) |t| try testing.expect(copy.alloc.isAllocated(copy.cache.addrExtent(t.rootPtr().addr)));
     std.debug.print("\nkill matrix: cut mid-C4b → 2 guest roots named and allocated after the replay; the third slot minted beside them; 3 of 3 guest records present\n", .{});
+}
+
+test "a guest root the cycle cannot publish (the checkpoint class full) defers instead of failing the cycle: the tail stays under the root's floor, a cut taken then still recovers the guest record from the window, and the next cycle with room publishes it (the ops.fsck.scale wedge: every tick failed Corrupt and the ring never drained)" {
+    const gpa = testing.allocator;
+    const v = try TestVol.createSingleWriter(gpa, "guest-full", "600000");
+    defer v.destroy();
+    defer test_seams = .{};
+    var dst_buf: [160]u8 = undefined;
+    const dst = try std.fmt.bufPrint(&dst_buf, "{s}.cut", .{v.path()});
+    defer unlinkPath(dst);
+    var ino: u64 = undefined;
+    {
+        const be = try v.open();
+        defer be.close();
+        var slot: u16 = 1;
+        if (be.stamp.native_slot) |ns| if (ns == slot) {
+            slot += 1;
+        };
+        try be.checkpointNow();
+        ino = try commitGuestInode(be, slot);
+        const floor = be.slotTree(slot).?.rootFloor();
+        test_seams.refuse_guest_publish = true;
+        try be.checkpointNow();
+        try testing.expect(be.guest_published.get(slot) == null);
+        try testing.expect(be.cp.last_ledger_tail.load(.acquire) <= floor);
+        try snapshotImage(v.path(), dst);
+        test_seams.refuse_guest_publish = false;
+        try be.checkpointNow();
+        try testing.expect(be.guest_published.get(slot) != null);
+    }
+    // The cut: the guest tree unnamed in tree 0, its record replayed from the window.
+    const copy = try KvBackend.open(gpa, v.io(), dst, .{ .env = &v.env, .cache_budget_bytes = 64 << 20, .cpus = 4, .index = 1 });
+    defer copy.close();
+    try testing.expect(try present(copy, ino));
 }
 
 /// Past one bitmap page at 64 KiB nodes: `alloc_ext.page_bits` (32,576)

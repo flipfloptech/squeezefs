@@ -1055,12 +1055,15 @@ pub fn smoReplace(t: *KvTree, ctx: *SmoContext, n: *CachedNode, out: *Maintenanc
         // keeps `PendingFreeFull` a clean pre-swap abort.
         if (!forced_retirement and !ctx.pendingHasRoomFor(1)) return ctx.refusePendingFull();
         var recs = SmoEntry.init(gpa);
-        errdefer recs.deinit();
-        if (!is_root) {
-            for (build.successors.items) |s| try recs.putInterior(t, n.level + 1, s.max_key, s.addr, s.node_seq);
+        {
+            // Ours until `prepare`, which takes them on every outcome.
+            errdefer recs.deinit();
+            if (!is_root) {
+                for (build.successors.items) |s| try recs.putInterior(t, n.level + 1, s.max_key, s.addr, s.node_seq);
+            }
+            for (build.claimed.items) |e| try recs.allocRecord(e);
+            try recs.freeRecord(old_extent, j.retire_seq.load(.acquire));
         }
-        for (build.claimed.items) |e| try recs.allocRecord(e);
-        try recs.freeRecord(old_extent, j.retire_seq.load(.acquire));
         prep = try PreparedEntry.prepare(ctx, j, recs);
     }
 
@@ -2759,6 +2762,41 @@ test "CheckpointSeam: the checkpoint's CacheFlusher appends in place, hands a fu
 fn sweepThrough(seam_ctx: *CheckpointSeam) checkpoint_cycle.SweepReport {
     const s = seam_ctx.seam();
     return s.mergeUnderfull(s.ctx, clock.monotonicNs() + 10 * std.time.ns_per_s);
+}
+
+test "an SMO whose entry the ring cannot admit refuses JournalReserveExhausted pre-swap and frees its records ONCE (prepare takes them on every outcome; the caller's errdefer freed them again — the ops.fsck.scale GPF)" {
+    const gpa = testing.allocator;
+    var vol = try TestVolume.init(gpa, .{ .journaled = true });
+    defer vol.deinit();
+    const t = try vol.createTree(.native);
+    var buf: [64]u8 = undefined;
+    // A leaf past its node size: the pass's SMO is due.
+    var spins: u64 = 0;
+    while (true) : (spins += 1) {
+        for (0..80) |i| try vol.commit(t, &ikey(i), .put, tree.testValue(i * 11 + spins, 40, &buf));
+        const leaf = try t.resolveLeaf(&ikey(10));
+        defer leaf.release();
+        const d = leaf.lockRead(testing.io);
+        const full = d.projectedLogEnd(vol.layout, 0) > vol.layout.node_size;
+        leaf.unlockRead(testing.io);
+        if (full) break;
+        _ = try vol.drain(t);
+        try testing.expect(spins < 10_000);
+    }
+    // The checkpoint class held to the last page: the SMO's entry cannot admit.
+    var held: std.ArrayList(jc.Admission) = .empty;
+    defer {
+        for (held.items) |a| vol.journal.core.release(a);
+        held.deinit(gpa);
+    }
+    var chunk: u64 = 1 << 20;
+    while (chunk >= 64) {
+        if (vol.journal.core.tryAdmit(chunk, .checkpoint)) |a| try held.append(gpa, a) else chunk /= 2;
+    }
+    const root0 = t.rootPtr();
+    try testing.expectError(error.JournalReserveExhausted, runMaintenance(t, &vol.ctx));
+    try testing.expect(vol.ctx.last_refusal == .journal_reserve);
+    try testing.expectEqual(root0, t.rootPtr());
 }
 
 test "threshold SMO under the FIFO valve refuses PendingFreeFull pre-swap with nothing published; the flush pass's forced retirement parks in the overflow" {

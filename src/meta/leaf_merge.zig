@@ -617,13 +617,16 @@ pub fn smoMerge(t: *KvTree, ctx: *SmoContext, parent: *CachedNode, left: *Cached
     if (ctx.journal) |j| {
         try j.barrier();
         var recs = smo.SmoEntry.init(gpa);
-        errdefer recs.deinit();
-        try recs.putInterior(t, left.level + 1, right.max_key, dst, dst_seq);
-        try recs.deleteInterior(t, left.level + 1, left.max_key);
-        try recs.allocRecord(extent);
-        const tag = j.retire_seq.load(.acquire);
-        try recs.freeRecord(old_l, tag);
-        try recs.freeRecord(old_r, tag);
+        {
+            // Ours until `prepare`, which takes them on every outcome.
+            errdefer recs.deinit();
+            try recs.putInterior(t, left.level + 1, right.max_key, dst, dst_seq);
+            try recs.deleteInterior(t, left.level + 1, left.max_key);
+            try recs.allocRecord(extent);
+            const tag = j.retire_seq.load(.acquire);
+            try recs.freeRecord(old_l, tag);
+            try recs.freeRecord(old_r, tag);
+        }
         prep = try smo.PreparedEntry.prepare(ctx, j, recs);
     }
 
@@ -751,8 +754,10 @@ pub fn smoRootCollapse(t: *KvTree, ctx: *SmoContext, root: *CachedNode, out: *Ma
     defer if (prep) |*p| p.deinit();
     if (ctx.journal) |j| {
         var recs = smo.SmoEntry.init(gpa);
-        errdefer recs.deinit();
-        try recs.freeRecord(old_extent, j.retire_seq.load(.acquire));
+        recs.freeRecord(old_extent, j.retire_seq.load(.acquire)) catch |e| {
+            recs.deinit();
+            return e;
+        };
         prep = try smo.PreparedEntry.prepare(ctx, j, recs);
     }
     var registered: ?jc.InflightRegistry.Registered = null;

@@ -1081,6 +1081,15 @@ test "the park ladder has no lost wake: 20 k ops from a client thread with rando
     const s = ts.s;
     _ = s.bind(.{ .ino = 7, .rights = .{ .read = true, .write = true } }, false, .mount).?;
     reg.add(s);
+    defer {
+        // Stopped and joined BEFORE the deferred `o.deinit` above frees the
+        // doorbell under the owner — on an assertion's early return too.
+        reg.remove(s);
+        stop.store(true, .release);
+        o.kick();
+        o.join();
+        ts.deinit();
+    }
     o.kick();
     const parks0 = ipc_stats.ipc_service_parks.load();
     const Client = struct {
@@ -1091,15 +1100,14 @@ test "the park ladder has no lost wake: 20 k ops from a client thread with rando
             while (i < 20_000) : (i += 1) {
                 const idx: u32 = i % 64;
                 const gen = cl.submit(idx, .read, 1, i, 128);
-                const t0 = clock.monotonicNs();
+                // A stranded op (a lost wake with no park timeout behind it)
+                // waits out `awaitDone`'s 5 s bound; no tighter real-time
+                // bound — a loaded gate schedules the owner late.
                 const r = cl.awaitDone(idx, gen) catch {
                     _ = failures.fetchAdd(1, .monotonic);
                     return;
                 };
                 if (r != 128) _ = failures.fetchAdd(1, .monotonic);
-                // A stranded op would wait the 5 s test bound; a parked one
-                // wakes within the 5 ms bound plus scheduling.
-                if (clock.monotonicNs() - t0 > std.time.ns_per_s) _ = failures.fetchAdd(1, .monotonic);
                 // Randomised gaps straddle the spin/park boundary.
                 const gap = prng.random().uintLessThan(u64, 40_000);
                 if (gap > 20_000) sleepNs(gap);
@@ -1114,11 +1122,6 @@ test "the park ladder has no lost wake: 20 k ops from a client thread with rando
     try testing.expect(ipc_stats.ipc_service_parks.load() > parks0);
     try testing.expect(stats.ipc_service_wakes.load() + stats.ipc_service_park_timeouts.load() > 0);
     for (s.m.slots()) |*sl| try testing.expectEqual(slot_core.FREE, sl.core.state.load(.monotonic));
-    reg.remove(s);
-    stop.store(true, .release);
-    o.kick();
-    o.join();
-    ts.deinit();
 }
 
 test "/proc/stat's cpu line parses to (total, idle + iowait); garbage is null" {

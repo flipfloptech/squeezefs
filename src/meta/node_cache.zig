@@ -1376,21 +1376,26 @@ const Clock = struct {
 };
 
 /// Extents an SMO retired whose disk image lags the RAM state that
-/// superseded it (miss-path checks only).
+/// superseded it (miss-path checks only). The mark names the lagging
+/// node's seq: the allocator hands a freed extent to ANY appender (a
+/// joiner's grant), whose fresh image this cache never publishes, and no
+/// two nodes ever carry one seq (node_seq.zig) — so an image at a marked
+/// address refuses only while it IS the retired node.
 const Retired = struct {
     mutex: Io.Mutex = .init,
-    set: std.AutoHashMapUnmanaged(u64, void) = .empty,
+    set: std.AutoHashMapUnmanaged(u64, u64) = .empty,
 
-    fn contains(self: *Retired, io: Io, addr: u64) bool {
+    /// The retired node's seq, if `addr` carries a mark.
+    fn seqOf(self: *Retired, io: Io, addr: u64) ?u64 {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
-        return self.set.contains(addr);
+        return self.set.get(addr);
     }
 
-    fn insert(self: *Retired, io: Io, gpa: Allocator, addr: u64) Allocator.Error!void {
+    fn insert(self: *Retired, io: Io, gpa: Allocator, addr: u64, node_seq: u64) Allocator.Error!void {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
-        try self.set.put(gpa, addr, {});
+        try self.set.put(gpa, addr, node_seq);
     }
 
     fn remove(self: *Retired, io: Io, addr: u64) void {
@@ -1739,7 +1744,6 @@ pub const NodeCache = struct {
                 stats.meta_kv_node_cache_hits.inc();
                 return n;
             }
-            if (self.retired.contains(self.io, addr)) return null;
             var ctx: LoadCtx = .{ .cache = self, .addr = addr, .slot = slot };
             self.inflight.run(self.io, addr, &ctx, LoadCtx.compute) catch |e| {
                 return @as(LoadError, @errorCast(e));
@@ -1784,18 +1788,27 @@ pub const NodeCache = struct {
                     buf.release();
                     continue;
                 }
+                // A retired extent that reads torn or foreign is its next
+                // owner's mid-write: the stale pointer's image is gone
+                // either way, never corruption.
+                if (self.retired.seqOf(self.io, addr) != null) {
+                    buf.release();
+                    return null;
+                }
                 return e;
             };
             break;
         }
-        // Re-check after the read: a retire during our load means the bytes
-        // we hold are the lagging image (retire marks the set BEFORE
-        // dropping the mapping, so a loader that missed the map sees it).
-        if (self.retired.contains(self.io, addr)) {
+        // The check is AFTER the read: a retire during our load means the
+        // bytes we hold are the lagging image (retire marks the set BEFORE
+        // dropping the mapping, so a loader that missed the map sees it);
+        // an image under another seq is a later owner's fresh node, which
+        // the publish below unmarks.
+        if (self.retired.seqOf(self.io, addr)) |retired_seq| if (retired_seq == loaded.header.node_seq) {
             loaded.deinit(gpa);
             buf.release();
             return null;
-        }
+        };
         const block_map_leaf = loaded.header.level == 0 and try leafCarriesBlockMap(gpa, &loaded);
         if (block_map_leaf) stats.meta_kv_block_map_leaf_reads.inc();
         const n = try CachedNode.fromLoaded(self, loaded, buf, false);
@@ -1928,7 +1941,7 @@ pub const NodeCache = struct {
         // their REACHABILITY is not tied down until a ledger record written
         // after this point.
         self.noteNodeDyingFloor(n);
-        try self.retired.insert(self.io, self.gpa, n.addr);
+        try self.retired.insert(self.io, self.gpa, n.addr, n.node_seq);
         if (try self.mapRemoveIf(n.addr, n)) {
             self.cached_bytes.sub(self.cfg.layout.node_size);
             _ = self.mapped.fetchSub(1, .monotonic);
@@ -2978,6 +2991,29 @@ test "a dirty-floor node that leaves the map folds its floor into the dying floo
     leaf.restoreDirtyFloor(1);
     try testing.expectEqual(@as(u64, 1), leaf.dirtyFloor());
     leaf.release();
+}
+
+test "a retired extent reused by ANOTHER appender loads its fresh image: the mark names the lagging node's seq, so only that image stays refused" {
+    var vol = try Vol.init(2, 8);
+    defer vol.deinit();
+    vol.arm();
+    try vol.writeEmptyLeaf(0, 1, 0);
+    const leaf = (try vol.cache.load(Vol.addrOf(0))).?;
+    try vol.cache.retire(leaf);
+    leaf.release();
+    // The lagging image (node_seq 1) stays refused: a stale pointer never
+    // serves it.
+    try testing.expectEqual(@as(?*CachedNode, null), try vol.cache.load(Vol.addrOf(0)));
+    // The allocator freed the extent and a grant handed it to a joined
+    // appender, whose write of a fresh node (its own seq space; no two
+    // nodes ever carry one seq) this cache never saw: that image is live.
+    var records = [_]Record{try Record.put(testing.allocator, &key.inodeKey(7), 2, &iv(7).encode())};
+    defer rec.deinitRecords(testing.allocator, &records);
+    try vol.writeNode(0, 1 << 40, 0, &key.inodeKey(7), &key.inodeKey(7), &records);
+    const fresh = (try vol.cache.load(Vol.addrOf(0))).?;
+    defer fresh.release();
+    try testing.expectEqual(@as(u64, 1 << 40), fresh.node_seq);
+    try expectLive(fresh, &key.inodeKey(7), &iv(7).encode());
 }
 
 // ---- demand paging ----

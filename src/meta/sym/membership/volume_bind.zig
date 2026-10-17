@@ -424,9 +424,15 @@ pub const VolumeBinding = struct {
 
     fn slotStateFn(ctx: *anyopaque, slot: u16) Error!?cr.SlotState {
         const self = self_(ctx);
-        const v = (self.be.lookup(self.gpa, key.TREE_CONTROL, cr.slotStateKey(slot).slice()) catch |e| return mapBackend(e)) orelse return null;
+        const v = (self.be.lookup(self.gpa, key.TREE_CONTROL, cr.slotStateKey(slot).slice()) catch |e| {
+            log.err("recovery: slot {d}'s state in tree 0 of {s} does not read ({s})", .{ slot, self.be.path, @errorName(e) });
+            return mapBackend(e);
+        }) orelse return null;
         defer self.gpa.free(v);
-        return cr.SlotStateWire.decode(v) catch error.Corrupt;
+        return cr.SlotStateWire.decode(v) catch |e| {
+            log.err("recovery: slot {d}'s state record in tree 0 of {s} does not decode ({s}, {d} bytes)", .{ slot, self.be.path, @errorName(e), v.len });
+            return error.Corrupt;
+        };
     }
 
     fn leasedToFn(ctx: *anyopaque, gpa: Allocator, appender_id: u32, out: *std.ArrayList(u16)) Error!void {
@@ -563,13 +569,19 @@ pub const VolumeBinding = struct {
             const minted = be.mintGuestTree(slot) catch |e| return switch (e) {
                 error.OutOfMemory => error.OutOfMemory,
                 error.Io => error.Io,
-                else => error.Corrupt,
+                else => {
+                    log.err("recovery: slot {d}'s empty tree does not mint on {s} ({s})", .{ slot, be.path, @errorName(e) });
+                    return error.Corrupt;
+                },
             };
             minted.setRootFloor(floor);
             try self.adopted.append(self.gpa, slot);
             return;
         }
-        const opened = KvTree.open(self.gpa, be.cache, .{ .slot = key.guestForestSlot(slot) }, .{ .addr = root.addr, .seq = root.seq }, &be.seq) catch |e| return mapTree(e);
+        const opened = KvTree.open(self.gpa, be.cache, .{ .slot = key.guestForestSlot(slot) }, .{ .addr = root.addr, .seq = root.seq }, &be.seq) catch |e| {
+            log.err("recovery: slot {d}'s root 0x{x} (seq {d}) does not open on {s} ({s})", .{ slot, root.addr, root.seq, be.path, @errorName(e) });
+            return mapTree(e);
+        };
         errdefer opened.destroy();
         opened.setRootFloor(floor);
         be.seq.raiseTo(root.seq);
@@ -584,7 +596,10 @@ pub const VolumeBinding = struct {
         const n = t.getNode(r.addr) catch |e| return switch (e) {
             error.OutOfMemory => error.OutOfMemory,
             error.Io => error.Io,
-            else => error.Corrupt,
+            else => {
+                log.err("recovery: the root 0x{x} (seq {d}) of slot tree {?d} does not load ({s}) — refusing the install", .{ r.addr, r.seq, t.forest_slot, @errorName(e) });
+                return error.Corrupt;
+            },
         };
         defer n.release();
         if (n.node_seq != r.seq or n.tree_id != key.KIND_INTERIOR) {

@@ -363,8 +363,12 @@ pub const Driver = struct {
     seams: Seams = .{},
     /// One recovery at a time per volume (the handover mutex's role).
     busy: bool = false,
+    /// The last step boundary the running recovery passed: a failure's log
+    /// names it (the error alone said nothing about where).
+    step_reached: Step = .decide,
 
-    fn fail(self: *const Driver, step: Step) Error!void {
+    fn fail(self: *Driver, step: Step) Error!void {
+        self.step_reached = step;
         if (self.seams.fail_at) |f| if (f == step) return error.Io;
     }
 
@@ -384,9 +388,10 @@ pub const Driver = struct {
             const fresh = self.mount.ledger.recordRecovered(death.identity, vol_ordinal, p.recovered_by_term, @intCast(clock.realtimeCoarseNs())) catch return .failed;
             return if (fresh) .acted else .skipped;
         }
+        self.step_reached = .decide;
         return self.recoverRegion(p, death) catch |e| {
             stats.appender_recovery_rollbacks.inc();
-            log.warn("recovery: appender {d} (node 0x{x} mount slot {d}) on volume {d} failed at {s} — the page stays Recovering, the next poll re-runs from the durable state", .{ p.appender_id, p.identity.node_token, p.identity.mount_slot, self.vol.vt.vol(self.vol.ctx), @errorName(e) });
+            log.warn("recovery: appender {d} (node 0x{x} mount slot {d}) on volume {d} failed with {s} after step {t} — the page stays Recovering, the next poll re-runs from the durable state", .{ p.appender_id, p.identity.node_token, p.identity.mount_slot, self.vol.vt.vol(self.vol.ctx), @errorName(e), self.step_reached });
             return .failed;
         };
     }

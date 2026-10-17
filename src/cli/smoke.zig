@@ -555,6 +555,7 @@ const Rig = struct {
         while (alive(self.child_pid) and clock.monotonicNs() < deadline) sleepMs(20);
         if (alive(self.child_pid)) {
             std.debug.print("\n--- the daemon did not exit within {d} s; killing ---\n", .{exit_wait_ns / std.time.ns_per_s});
+            printWedge(self.io, "A", self.child_pid, self.log_path, self.gpa);
             _ = linux.kill(self.child_pid, .KILL);
         }
         const term = try c.wait(self.io);
@@ -567,7 +568,7 @@ const Rig = struct {
         defer self.freeRun(r);
         // An orderly unmount is silent; a fallback says why even at rc 0.
         if (!r.term.success() or r.stderr.len != 0) std.debug.print("\numount ({f}): {s}\n", .{ r.term, r.stderr });
-        if (!r.term.success() and self.child != null and alive(self.child_pid)) printWedge(self.io, "A", self.child_pid, self.readLog() catch null, self.gpa);
+        if (!r.term.success() and self.child != null and alive(self.child_pid)) printWedge(self.io, "A", self.child_pid, self.log_path, self.gpa);
         try testing.expect(r.term.success());
     }
 
@@ -605,15 +606,18 @@ fn printUncleanExit(name: []const u8, term: std.process.Child.Term, log_text: ?[
 }
 
 /// A daemon whose teardown outlived the umount verb's wait: every thread's
-/// name, state, wait channel and kernel stack, then the log's tail (the last
-/// teardown step it logged) — `deinit` kills it and deletes the log next.
-/// `log_text` (owned) is freed.
-fn printWedge(io: Io, name: []const u8, pid: linux.pid_t, log_text: ?[]u8, gpa: std.mem.Allocator) void {
-    defer if (log_text) |t| gpa.free(t);
+/// name, state, wait channel and kernel stack, the log's tail (the last
+/// teardown step it logged), then every thread's USER stack — a SIGQUIT per
+/// thread, one at a time, answered by the daemon's handler into its log
+/// (kernel stacks of a wedge are generic futex waits; the user frames name
+/// the step) — `deinit` kills it and deletes the log next.
+fn printWedge(io: Io, name: []const u8, pid: linux.pid_t, log_path: []const u8, gpa: std.mem.Allocator) void {
     std.debug.print("\n--- daemon {s} (pid {d}) still alive: its threads ---\n", .{ name, pid });
     var pb: [64]u8 = undefined;
     var dir = Io.Dir.cwd().openDir(io, std.fmt.bufPrint(&pb, "/proc/{d}/task", .{pid}) catch return, .{ .iterate = true }) catch return;
     defer dir.close(io);
+    var tids: std.ArrayList(linux.pid_t) = .empty;
+    defer tids.deinit(gpa);
     var it = dir.iterate();
     while (it.next(io) catch null) |entry| {
         var comm: [64]u8 = undefined;
@@ -627,10 +631,42 @@ fn printWedge(io: Io, name: []const u8, pid: linux.pid_t, log_text: ?[]u8, gpa: 
         const state_at = std.mem.indexOf(u8, st, "State:\t") orelse st.len;
         const state = std.mem.sliceTo(st[@min(state_at + 7, st.len)..], '\n');
         std.debug.print("tid {s} {s} [{s}] wchan {s}\n{s}", .{ entry.name, std.mem.trimEnd(u8, c, "\n"), state, w, k });
+        // An io_uring kernel worker (`iou-wrk-<tid>`) has no user context
+        // to unwind: a signal to it runs no handler.
+        if (std.mem.startsWith(u8, c, "iou-wrk-")) continue;
+        if (std.fmt.parseUnsigned(linux.pid_t, entry.name, 10) catch null) |tid| tids.append(gpa, tid) catch {};
     }
-    const text = log_text orelse "";
+    const before = Io.Dir.cwd().readFileAlloc(io, log_path, gpa, .limited(16 << 20)) catch null;
+    defer if (before) |t| gpa.free(t);
+    const text = before orelse "";
     const tail_bytes: usize = 6 << 10;
     std.debug.print("--- daemon {s}'s log's last {d} B ---\n{s}\n--- end of daemon {s}'s log ---\n", .{ name, @min(text.len, tail_bytes), text[text.len - @min(text.len, tail_bytes) ..], name });
+    // One thread at a time: the handler's unwinder is not signal-safe
+    // against a thread it interrupts mid-print, so each gets its own window
+    // — the next signal goes once the log has grown past the dump's header
+    // line and stayed still (the first dump loads the debug info after its
+    // header and takes longest), 2 s at most.
+    const header_bytes: u64 = 64;
+    for (tids.items) |tid| {
+        const start = logSize(io, log_path);
+        if (linux.errno(linux.tgkill(pid, tid, .QUIT)) != .SUCCESS) continue;
+        var last = start;
+        var waited_ms: u32 = 0;
+        while (waited_ms < 2000) : (waited_ms += 50) {
+            sleepMs(50);
+            const now = logSize(io, log_path);
+            if (now == last and now > start + header_bytes) break;
+            last = now;
+        }
+    }
+    const after = Io.Dir.cwd().readFileAlloc(io, log_path, gpa, .limited(16 << 20)) catch return;
+    defer gpa.free(after);
+    if (after.len > text.len) std.debug.print("--- daemon {s}'s user stacks ({d} thread(s) signalled) ---\n{s}\n--- end of daemon {s}'s user stacks ---\n", .{ name, tids.items.len, after[text.len..], name });
+}
+
+fn logSize(io: Io, log_path: []const u8) u64 {
+    const st = Io.Dir.cwd().statFile(io, log_path, .{}) catch return 0;
+    return st.size;
 }
 
 fn sleepMs(ms: u64) void {
@@ -1696,6 +1732,7 @@ const Peer = struct {
         defer self.rig.freeRun(r);
         // An orderly unmount is silent; a fallback says why even at rc 0.
         if (!r.term.success() or r.stderr.len != 0) std.debug.print("\numount {s} ({f}): {s}\n", .{ self.name, r.term, r.stderr });
+        if (!r.term.success() and self.child != null and alive(self.pid)) printWedge(self.rig.io, self.name, self.pid, self.log_path, self.rig.gpa);
         try testing.expect(r.term.success());
     }
 
@@ -1706,6 +1743,7 @@ const Peer = struct {
         while (alive(self.pid) and clock.monotonicNs() < deadline) sleepMs(20);
         if (alive(self.pid)) {
             std.debug.print("\n--- daemon {s} did not exit within {d} s; killing ---\n", .{ self.name, exit_wait_ns / std.time.ns_per_s });
+            printWedge(self.rig.io, self.name, self.pid, self.log_path, self.rig.gpa);
             _ = linux.kill(self.pid, .KILL);
         }
         const term = try c.wait(self.rig.io);

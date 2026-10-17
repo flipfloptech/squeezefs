@@ -318,6 +318,20 @@ pub const Signals = struct {
         _ = linux.sigaction(.USR2, &act, null);
         var ign: linux.Sigaction = .{ .handler = .{ .handler = linux.SIG.IGN }, .mask = linux.sigemptyset(), .flags = 0 };
         _ = linux.sigaction(.PIPE, &ign, null);
+        var quit: linux.Sigaction = .{ .handler = .{ .sigaction = dumpUserStack }, .mask = linux.sigemptyset(), .flags = linux.SA.RESTART | linux.SA.SIGINFO };
+        _ = linux.sigaction(.QUIT, &quit, null);
+    }
+
+    /// SIGQUIT: the signalled thread's user stack to the log (stderr) and
+    /// on it goes — a wedged teardown's capture (the smoke's `printWedge`
+    /// sends one per thread, one at a time: the unwinder's lock is not
+    /// signal-safe against the thread it interrupts).
+    fn dumpUserStack(_: linux.SIG, _: *const linux.siginfo_t, ctx_ptr: ?*anyopaque) callconv(.c) void {
+        var head: [48]u8 = undefined;
+        const line = std.fmt.bufPrint(&head, "user stack of thread {d}:\n", .{linux.gettid()}) catch "";
+        _ = linux.write(2, line.ptr, line.len);
+        const ctx = std.debug.cpu_context.fromPosixSignalContext(ctx_ptr);
+        std.debug.dumpCurrentStackTrace(.{ .context = if (ctx) |*c| c else null });
     }
 
     /// Swap out the pending bits (the main task, after its wake).

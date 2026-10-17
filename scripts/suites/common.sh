@@ -37,8 +37,10 @@ REPO="$(cd "$SUITES_DIR/../.." && pwd)"
 if [ "${1:-}" = --bin ]; then SQZ_BIN=$2; shift 2; fi
 SQZ_BIN=${SQZ_BIN:-$REPO/zig-out-linux/bin/squeezefs}
 # The harness's own variable, never the daemon's environment (the knob
-# parser warns about every unknown SQZ*-prefixed name it inherits).
-export -n SQZ_BIN
+# parser warns about every unknown SQZ*-prefixed name it inherits); the
+# venue's exports (`scripts/venue`: the zig cache root, the slot) likewise —
+# the warning line in a mount's stderr fails every xfstests golden output.
+export -n SQZ_BIN SQZ_BUILD_ROOT SQZ_VENUE SQZ_VENUE_SLOT SQZ_VENUE_SLOTS 2>/dev/null || true
 # Clones and builds persist on the cache volume between runs; their build
 # artefacts are deleted when a suite's run is over (`suite_clean_build`).
 SUITES_ROOT=${SUITES_ROOT:-${SQZ_BUILD_ROOT:-/build}/suites}
@@ -183,6 +185,9 @@ suite_prepare() {
   suite_log "results: $RESULTS; binary: $("$SQZ_BIN" --version)"
   suite_packages
   trap suite_cleanup EXIT
+  # A stop (the venue's timeout, an operator's kill) exits through the
+  # EXIT trap: bash runs no trap when a signal simply kills it.
+  trap 'exit 143' TERM INT HUP
 }
 
 # ---- the set: format + mount with the release posture ----------------------
@@ -316,6 +321,8 @@ suite_fsck() {
 
 suite_cleanup() {
   local tag
+  # A suite's own first step (fstests: its `check` process group, its sets).
+  if [ -n "${SUITE_CLEANUP_HOOK:-}" ]; then "$SUITE_CLEANUP_HOOK" || true; fi
   for tag in "${!SUITE_MNT[@]}"; do [ -n "${SUITE_MNT[$tag]}" ] && suite_umount "$tag" || true; done
   # Never leave OUR daemons or mounts behind on the shared venue (other
   # agents' daemons are theirs: listed, never signalled).

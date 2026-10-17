@@ -163,7 +163,15 @@ fstests_run() {
   if [ -n "${FSTESTS_TESTS:-}" ]; then read -ra what <<< "$FSTESTS_TESTS"; else read -ra what <<< "$FSTESTS_GROUPS"; fi
   local rc=0 t0 t1
   t0=$(date +%s)
-  (cd "$FSTESTS_DIR" && cp "$SETS/local.config" local.config && timeout -s KILL "$FSTESTS_TIMEOUT_S" ./check -R xunit "${exclude[@]}" "${what[@]}" > "$RESULTS/check-run$n.out" 2>&1) || rc=$?
+  # `check` leads a process group of its own and the harness remembers it:
+  # a stopped harness (its EXIT trap) takes the whole group down — a `check`
+  # that outlived one stop kept running its list against the loop devices
+  # the next run re-created, and the two runs fought over one set.
+  cp "$SETS/local.config" "$FSTESTS_DIR/local.config"
+  (cd "$FSTESTS_DIR" && exec setsid timeout -s KILL "$FSTESTS_TIMEOUT_S" ./check -R xunit "${exclude[@]}" "${what[@]}") > "$RESULTS/check-run$n.out" 2>&1 &
+  CHECK_PGID=$!
+  wait "$CHECK_PGID" || rc=$?
+  CHECK_PGID=""
   t1=$(date +%s)
   # The summary block: `Ran: …`, `Not run: …`, `Failures: …`, `Failed N of M tests`.
   local ran notrun failed
@@ -210,7 +218,19 @@ fstests_run() {
   return $ok
 }
 
+# The harness's exit (a pass's end, a stop): `check`'s whole process group
+# first, then this run's mounts and loop devices — nothing of a run
+# outlives it to meet the next run's devices.
+CHECK_PGID=""
+fstests_cleanup() {
+  if [ -n "$CHECK_PGID" ]; then kill -KILL -- "-$CHECK_PGID" 2>/dev/null || true; CHECK_PGID=""; fi
+  [ -n "${SETS:-}" ] || return 0
+  fstests_unmount_all
+  fstests_detach_loops
+}
+
 main() {
+  SUITE_CLEANUP_HOOK=fstests_cleanup
   suite_prepare fstests
   fstests_build
   local verdict=0 n

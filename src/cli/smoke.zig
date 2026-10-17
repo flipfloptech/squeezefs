@@ -8255,7 +8255,11 @@ test "smoke: THE VIRTUAL INODES WITHOUT AN OPEN (decision 0003 §AF) — under n
     defer if (prev) |p| gpa.free(p.bytes);
     var generations: u64 = 0;
     for (0..200) |_| {
-        const r = try readVirtualWhole(gpa, path);
+        const r = readVirtualWhole(gpa, path) catch |e| {
+            // A dead daemon is named with its log, never a bare ENOTCONN.
+            try rig.expectAlive("the .stats reads");
+            return e;
+        };
         errdefer gpa.free(r.bytes);
         try testing.expectEqual(r.size, @as(u64, r.bytes.len));
         // A torn or cut document fails the parse — a STRICT one: no key

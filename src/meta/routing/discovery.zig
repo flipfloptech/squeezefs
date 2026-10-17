@@ -356,7 +356,13 @@ pub const linux_dev = if (builtin.os.tag == .linux) struct {
         const backup: ?[]u8 = if (superblock.backupOffsetFor(volume_len)) |off| try dev.readRange(gpa, off, superblock.sector_len) else null;
         defer if (backup) |b| gpa.free(b);
         var diag: superblock.Refusal = undefined;
-        const classified = superblock.classifyVolumeImages(sector0, backup, volume_len, &diag) catch return error.Corrupt;
+        const classified = superblock.classifyVolumeImages(sector0, backup, volume_len, &diag) catch {
+            var buf: [512]u8 = undefined;
+            var w: std.Io.Writer = .fixed(&buf);
+            diag.write(&w) catch {};
+            log.err("metadata volume {s}: superblock refused at discovery: {s}", .{ path, w.buffered() });
+            return error.Corrupt;
+        };
         // Typed, never loud here: a blank device is the `add-meta` joiner's
         // expected state; the mount names its refusal.
         const sb = switch (classified.format) {

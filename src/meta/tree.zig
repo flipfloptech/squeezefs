@@ -437,13 +437,39 @@ pub const KvTree = struct {
     /// verified against the pointer (a torn or stale ledger word never
     /// installs an unverified root), it is stamped with the slot and pinned.
     pub fn open(gpa: Allocator, cache: *NodeCache, identity: TreeIdentity, root: RootPtr, seq: *NodeSeqHandle) Error!*KvTree {
-        const n = (if (cache.tryGet(root.addr)) |hit| hit else try cache.loadForSlot(root.addr, identity.forestSlot())) orelse return error.RetiredExtent;
+        return openVerified(gpa, cache, identity, root, seq, .writer) catch |e| switch (e) {
+            error.RootStale => error.Corrupt, // never: the writer posture logs and answers Corrupt itself
+            else => |x| x,
+        };
+    }
+
+    /// `open` for a READER's projection: a root the pointer no longer names
+    /// (its extent retired or reused under a writer's later checkpoint) is
+    /// `RootStale`, with no log — the reader's normal race; it re-points at
+    /// the newest record and tries again.
+    pub fn openAsReader(gpa: Allocator, cache: *NodeCache, identity: TreeIdentity, root: RootPtr, seq: *NodeSeqHandle) (Error || error{RootStale})!*KvTree {
+        return openVerified(gpa, cache, identity, root, seq, .reader);
+    }
+
+    fn openVerified(gpa: Allocator, cache: *NodeCache, identity: TreeIdentity, root: RootPtr, seq: *NodeSeqHandle, who: enum { writer, reader }) (Error || error{RootStale})!*KvTree {
+        const loaded = if (cache.tryGet(root.addr)) |hit| hit else cache.loadForSlot(root.addr, identity.forestSlot()) catch |e| switch (e) {
+            error.OutOfMemory, error.Io, error.Canceled, error.WouldBlock, error.FlightTableFull => |x| return x,
+            // A reader reads the image a writer is appending to in place:
+            // a page mid-rewrite decodes torn or foreign — its race, re-read.
+            else => |x| if (who == .reader) return error.RootStale else return x,
+        };
+        const n = loaded orelse {
+            if (who == .reader) return error.RootStale;
+            return error.RetiredExtent;
+        };
         defer n.release();
         if (n.node_seq != root.seq) {
+            if (who == .reader) return error.RootStale;
             log.err("root pointer stale: ledger says node_seq {d}, extent 0x{x} holds {d}", .{ root.seq, root.addr, n.node_seq });
             return error.Corrupt;
         }
         if (n.tree_id != identity.headerTreeId()) {
+            if (who == .reader) return error.RootStale;
             log.err("root tree_id mismatch: expected {d}, extent 0x{x} holds {d}", .{ identity.headerTreeId(), root.addr, n.tree_id });
             return error.Corrupt;
         }
@@ -456,6 +482,13 @@ pub const KvTree = struct {
     /// (`error.Corrupt` when the record names no such root).
     pub fn openFromLedger(gpa: Allocator, cache: *NodeCache, record: *const ledger.LedgerRecord, id: ledger.RootId, seq: *NodeSeqHandle) Error!*KvTree {
         if (record.root(id)) |r| return open(gpa, cache, .fromRootId(id), .{ .addr = r.node_addr, .seq = r.node_seq }, seq);
+        log.err("ledger record {d} names no root {d}", .{ record.seq, @backingInt(id) });
+        return error.Corrupt;
+    }
+
+    /// `openFromLedger` as a reader (`openAsReader`).
+    pub fn openFromLedgerAsReader(gpa: Allocator, cache: *NodeCache, record: *const ledger.LedgerRecord, id: ledger.RootId, seq: *NodeSeqHandle) (Error || error{RootStale})!*KvTree {
+        if (record.root(id)) |r| return openAsReader(gpa, cache, .fromRootId(id), .{ .addr = r.node_addr, .seq = r.node_seq }, seq);
         log.err("ledger record {d} names no root {d}", .{ record.seq, @backingInt(id) });
         return error.Corrupt;
     }

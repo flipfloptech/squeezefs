@@ -1030,6 +1030,49 @@ test "a refs range always merges every slot tree: one volume's references owned 
     for (kvs.items, owners) |kv, o| try testing.expectEqual(o, (try key.BlockRefKey.decode(kv.key)).ownerIno());
 }
 
+test "a read-only open of a LIVE set beside a commit storm at a fast checkpoint cadence never refuses Corrupt (the ONLINE FSCK row: `scrub --online`'s storage-trust open answered 'cannot open the set read-only (Corrupt)' about half the time under load)" {
+    const gpa = testing.allocator;
+    const s = try TestSet.create(gpa, "ro-storm", 1);
+    defer s.destroy();
+    try s.env.put("SQUEEZEFS_META_FLUSH_INTERVAL_MS", "10");
+    const set = try s.open();
+    defer set.close();
+    const Storm = struct {
+        fn run(ms: *MetaSet, stop: *std.atomic.Value(bool)) void {
+            var value: [200]u8 = undefined;
+            var i: u64 = 0;
+            while (!stop.load(.acquire)) : (i += 1) {
+                @memset(&value, @truncate(i));
+                const t = ms.begin(@src()) catch return;
+                // 4,000 keys rewritten round-robin: leaves split, compact and retire.
+                t.stagePut(key.TREE_INODES, &key.inodeKey(1000 + ((i *% 7919) % 20_000)), &value) catch {
+                    ms.abandon(t);
+                    return;
+                };
+                ms.commit(t) catch return;
+            }
+        }
+    };
+    var stop: std.atomic.Value(bool) = .init(false);
+    var storms: [4]std.Thread = undefined;
+    for (&storms) |*th| th.* = try std.Thread.spawn(.{}, Storm.run, .{ set, &stop });
+    defer {
+        stop.store(true, .release);
+        for (storms) |th| th.join();
+    }
+    var refused: usize = 0;
+    for (0..24) |_| {
+        const reader = MetaSet.open(gpa, s.io(), s.pathList(), .{ .env = &s.env, .cache_budget_bytes = 64 << 20, .cpus = 4, .read_only = true }) catch |e| {
+            std.debug.print("\nread-only open refused: {s}\n", .{@errorName(e)});
+            if (@errorReturnTrace()) |tr| std.debug.dumpErrorReturnTrace(tr);
+            refused += 1;
+            continue;
+        };
+        reader.close();
+    }
+    try testing.expectEqual(@as(usize, 0), refused);
+}
+
 test "a `-o ro` reader of a symmetric set has no slot plane: the filesystem's handover binds (the parent memo, the step-0 times drain) are no-ops on it — never a dereference of the unarmed plane (rung 10 item 4's regression: the -o ro row's reader aborted at bindTimesDrain)" {
     const gpa = testing.allocator;
     const s = try TestSet.create(gpa, "ro-binds", 1);

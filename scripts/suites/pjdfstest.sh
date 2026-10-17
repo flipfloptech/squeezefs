@@ -52,14 +52,31 @@ pjd_run() {
   t0=$(date +%s)
   # prove's -v prints each test file's TAP under a `tests/... ..` banner;
   # the suite's cwd must be ON the mount. `--merge` keeps stderr in order.
-  (cd "$mnt" && prove -rv --merge "${targets[@]}") > "$RESULTS/run-$n.tap" 2>&1 || rc=$?
-  t1=$(date +%s)
   # Fold `not ok N …` under the current file banner to `dir/NN.t#N`. A
   # `# TODO` not-ok is the SUITE's own declared expectation (TAP: counted
   # as a pass by prove — pjdfstest marks the rows where Linux VFS semantics
   # differ from the POSIX text, e.g. chown on a directory keeping its
   # sgid), listed separately, never a failure of ours.
   local fold='/^\/.*\.t \.\./ { f = $1; sub(root, "", f); next } /^not ok [0-9]+/ { if (($0 ~ /# TODO/) == todo) print f "#" $3 }'
+  (cd "$mnt" && exec setsid prove -rv --merge "${targets[@]}") > "$RESULTS/run-$n.tap" 2>&1 &
+  PROVE_PGID=$!
+  # FAIL EARLY (owner ruling 2026-10-17): the first failing subtest that is
+  # no ledger row ends the run; prove has no halt of its own.
+  local first_unadjudicated=""
+  suite_ledger_rows pjdfstest | cut -f1 > "$RESULTS/ledger-ids.txt"
+  while kill -0 "$PROVE_PGID" 2>/dev/null; do
+    first_unadjudicated=$(awk -v root="$PJD_DIR/tests/" -v todo=0 "$fold" "$RESULTS/run-$n.tap" 2>/dev/null | grep -vxF -f "$RESULTS/ledger-ids.txt" | head -1 || true)
+    [ -z "$first_unadjudicated" ] || break
+    sleep 2
+  done
+  if [ -n "$first_unadjudicated" ]; then
+    suite_log "run $n: $first_unadjudicated failed and is no ledger row — stopping the run here (fail early)"
+    kill -KILL -- "-$PROVE_PGID" 2>/dev/null || true
+    SUITE_JUDGE_NO_STALE=1
+  fi
+  wait "$PROVE_PGID" || rc=$?
+  PROVE_PGID=""
+  t1=$(date +%s)
   awk -v root="$PJD_DIR/tests/" -v todo=0 "$fold" "$RESULTS/run-$n.tap" | sort -u > "$failures"
   awk -v root="$PJD_DIR/tests/" -v todo=1 "$fold" "$RESULTS/run-$n.tap" | sort -u > "$RESULTS/run-$n.todo"
   local nf nt; nf=$(grep -c . "$failures" || true); nt=$(grep -c . "$RESULTS/run-$n.todo" || true)
@@ -68,10 +85,18 @@ pjd_run() {
   suite_umount "$tag"
   suite_daemon_alerts "$tag" || return 1
   suite_fsck "$tag" || return 1
+  [ -z "$first_unadjudicated" ] || return 1
   return 0
 }
 
+# A stop of the harness takes prove's process group with it.
+PROVE_PGID=""
+pjd_cleanup() {
+  if [ -n "$PROVE_PGID" ]; then kill -KILL -- "-$PROVE_PGID" 2>/dev/null || true; PROVE_PGID=""; fi
+}
+
 main() {
+  SUITE_CLEANUP_HOOK=pjd_cleanup
   suite_prepare pjdfstest
   pjd_build
   local n verdict=0

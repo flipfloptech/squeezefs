@@ -6,6 +6,11 @@
 # root. Nothing here is a product path: the product is the `squeezefs`
 # binary this harness formats, mounts, drives, unmounts and fscks.
 #
+# FAIL EARLY, FAIL HARD (owner ruling 2026-10-17): a run stops at the first
+# failing test that is not an adjudicated ledger row (LTP: nor the venue's,
+# judged by its control run on the spot) — that failure is the work, and the
+# hours of tests behind it add nothing to it. A by-design row fails on.
+#
 #   suite_prepare <suite>        packages (lockfile-checked) + results dir
 #   suite_mount <tag>            format a set and mount it with the release posture
 #   suite_umount <tag>           orderly `squeezefs umount` (the daemon exits)
@@ -388,7 +393,8 @@ suite_judge() {
     [ -n "$id" ] || continue
     if cls=$(awk -F'\t' -v id="$id" '$1 == id {print $2; exit}' "$ledger") && [ -n "$cls" ]; then echo "$id	$cls" >> "$adj"; else echo "$id" >> "$unadj"; fi
   done
-  cut -f1 "$ledger" | sort -u | while read -r id; do
+  # A pass stopped early (fail early) never reached most rows: no stale verdict.
+  [ "${SUITE_JUDGE_NO_STALE:-0}" = 1 ] || cut -f1 "$ledger" | sort -u | while read -r id; do
     [ -n "$id" ] || continue
     grep -qxF "$id" "$failures" || echo "$id" >> "$stale"
   done

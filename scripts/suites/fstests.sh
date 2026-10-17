@@ -175,16 +175,45 @@ fstests_run() {
   # contract says. Helpers run the same under either API.
   (cd "$FSTESTS_DIR" && exec setsid env LIBMOUNT_FORCE_MOUNT2=always timeout -s KILL "$FSTESTS_TIMEOUT_S" ./check -R xunit "${exclude[@]}" "${what[@]}") > "$RESULTS/check-run$n.out" 2>&1 &
   CHECK_PGID=$!
+  # FAIL EARLY (owner ruling 2026-10-17): the first failing test that is not
+  # a ledger row ends the pass — that failure is the work; the hours of
+  # tests behind it add nothing to it. A by-design row fails on, as it must.
+  local first_unadjudicated=""
+  suite_ledger_rows fstests | cut -f1 > "$RESULTS/ledger-ids.txt"
+  while kill -0 "$CHECK_PGID" 2>/dev/null; do
+    local bad
+    for bad in "$SETS"/results/*/*.out.bad; do
+      [ -f "$bad" ] || continue
+      local id; id=$(basename "$(dirname "$bad")")/$(basename "$bad" .out.bad)
+      grep -qxF "$id" "$RESULTS/ledger-ids.txt" && continue
+      first_unadjudicated=$id
+      break 2
+    done
+    sleep 2
+  done
+  if [ -n "$first_unadjudicated" ]; then
+    suite_log "run $n: $first_unadjudicated failed and is no ledger row — stopping the pass here (fail early; the diff follows)"
+    kill -KILL -- "-$CHECK_PGID" 2>/dev/null || true
+    SUITE_JUDGE_NO_STALE=1
+  fi
   wait "$CHECK_PGID" || rc=$?
   CHECK_PGID=""
   t1=$(date +%s)
   # The summary block: `Ran: …`, `Not run: …`, `Failures: …`, `Failed N of M tests`.
+  # A pass stopped early has none: its counts are the results dir's.
   local ran notrun failed
-  ran=$(grep -E '^Ran: ' "$RESULTS/check-run$n.out" | tail -1 | sed 's/^Ran: //' | wc -w)
-  notrun=$(grep -E '^Not run: ' "$RESULTS/check-run$n.out" | tail -1 | sed 's/^Not run: //' | wc -w)
-  grep -E '^Failures: ' "$RESULTS/check-run$n.out" | tail -1 | sed 's/^Failures: //' | tr ' ' '\n' | grep . | sort -u > "$failures" || true
+  if [ -n "$first_unadjudicated" ]; then
+    ran=$(ls "$SETS"/results/*/*.full 2>/dev/null | wc -l)
+    notrun=$(ls "$SETS"/results/*/*.notrun 2>/dev/null | wc -l)
+    (cd "$SETS/results" && ls */*.out.bad 2>/dev/null | sed 's/\.out\.bad$//' | sort -u) > "$failures" || true
+    rc=1
+  else
+    ran=$(grep -E '^Ran: ' "$RESULTS/check-run$n.out" | tail -1 | sed 's/^Ran: //' | wc -w)
+    notrun=$(grep -E '^Not run: ' "$RESULTS/check-run$n.out" | tail -1 | sed 's/^Not run: //' | wc -w)
+    grep -E '^Failures: ' "$RESULTS/check-run$n.out" | tail -1 | sed 's/^Failures: //' | tr ' ' '\n' | grep . | sort -u > "$failures" || true
+  fi
   failed=$(grep -c . "$failures" || true)
-  suite_log "run $n: check rc=$rc, ran $ran, not run $notrun, failed $failed, $((t1 - t0)) s wall ($(grep -E '^(Passed all|Failed [0-9]+ of)' "$RESULTS/check-run$n.out" | tail -1))"
+  suite_log "run $n: check rc=$rc, ran $ran, not run $notrun, failed $failed, $((t1 - t0)) s wall ($(grep -E '^(Passed all|Failed [0-9]+ of)' "$RESULTS/check-run$n.out" | tail -1)${first_unadjudicated:+stopped early at $first_unadjudicated})"
   [ "$ran" -gt 0 ] || { tail -20 "$RESULTS/check-run$n.out" >&2; suite_log "run $n: check ran nothing"; fstests_unmount_all; fstests_detach_loops; return 1; }
   # Per-failure: the first lines of the .out.bad diff and the dmesg flag.
   if [ "$failed" != 0 ]; then
@@ -220,6 +249,7 @@ fstests_run() {
   # The data volumes are the bulk; the logs and results stay.
   [ "${SUITE_KEEP_SET:-0}" = 1 ] || rm -f "$SETS"/set-*/d?.img "$SETS"/set-*/meta.img
   [ "$rc" = 0 ] || [ "$rc" = 1 ] || { suite_log "check rc $rc (137 = the wall bound): the pass did not complete"; return 1; }
+  [ -z "$first_unadjudicated" ] || return 1
   return $ok
 }
 

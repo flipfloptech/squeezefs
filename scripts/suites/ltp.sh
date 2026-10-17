@@ -68,8 +68,15 @@ PY
 ltp_control() {
   local tag=$1 rows=$2 n=$3
   local cmd; cmd=$(awk -F'\t' -v t="$tag" '$1 == t { print $3; exit }' "$rows")
+  ltp_control_cmd "$tag" "$cmd" "$n"
+}
+
+# The control run of one command (`ltp_control` with the command in hand:
+# the fail-early watcher reads it off the runtest file before the report exists).
+ltp_control_cmd() {
+  local tag=$1 cmd=$2 n=$3
   [ -n "$cmd" ] || { echo ours; return; }
-  local ctl="$SUITES_TMP/ltp-ctl-$n"; rm -rf "$ctl"; mkdir -p "$ctl"
+  local ctl="$SUITES_TMP/ltp-ctl-$n-$tag"; rm -rf "$ctl"; mkdir -p "$ctl"
   local rc=0
   (cd "$ctl" && PATH="$LTP_PREFIX/testcases/bin:$PATH" TMPDIR="$ctl" LTPROOT="$LTP_PREFIX" LTP_TIMEOUT_MUL=${LTP_TIMEOUT_MUL:-4} timeout -s KILL "$LTP_EXEC_TIMEOUT_S" sh -c "$cmd" > "$RESULTS/ctl-$tag-run$n.out" 2>&1) || rc=$?
   rm -rf "$ctl"
@@ -95,11 +102,49 @@ ltp_run() {
   # ×4 for the FUSE round trip (fcntl12 opens one file getdtablesize()
   # times inside a 30 s budget — ≈ 50 µs per OPEN across the ring is the
   # transport's cost, not a semantic; LTP's own advice is this multiplier).
-  (cd "$KIRK_DIR" && LTPROOT="$LTP_PREFIX" TMPDIR="$tmp" LTP_TIMEOUT_MUL=${LTP_TIMEOUT_MUL:-4} timeout -s KILL $((LTP_TIMEOUT_S + 120)) \
-     ./kirk --no-colors --tmp-dir "$ktmp" --run-suite "$file" ${LTP_PATTERN:+--run-pattern "$LTP_PATTERN"} --json-report "$report" --suite-timeout "$LTP_TIMEOUT_S" --exec-timeout "$LTP_EXEC_TIMEOUT_S" "${skip[@]}" > "$RESULTS/kirk-$tag.console" 2>&1) || rc=$?
+  local console="$RESULTS/kirk-$tag.console"
+  (cd "$KIRK_DIR" && exec setsid env LTPROOT="$LTP_PREFIX" TMPDIR="$tmp" LTP_TIMEOUT_MUL=${LTP_TIMEOUT_MUL:-4} timeout -s KILL $((LTP_TIMEOUT_S + 120)) \
+     ./kirk --no-colors --tmp-dir "$ktmp" --run-suite "$file" ${LTP_PATTERN:+--run-pattern "$LTP_PATTERN"} --json-report "$report" --suite-timeout "$LTP_TIMEOUT_S" --exec-timeout "$LTP_EXEC_TIMEOUT_S" "${skip[@]}") > "$console" 2>&1 &
+  KIRK_PGID=$!
+  # FAIL EARLY (owner ruling 2026-10-17): the first failing tag that is
+  # neither a ledger row nor the venue's (its control run on ext4 fails
+  # too — judged right here, off the runtest file's command) ends the file;
+  # kirk is interrupted (SIGINT: it still writes the report of what ran).
+  local first_ours="" seen="$RESULTS/ltp-$tag.seen" t cmd v
+  : > "$seen"
+  suite_ledger_rows ltp | cut -f1 > "$RESULTS/ledger-ids.txt"
+  while kill -0 "$KIRK_PGID" 2>/dev/null; do
+    for t in $(grep -oE '^[A-Za-z0-9_.+-]+: (fail|broken|timeout)' "$console" 2>/dev/null | cut -d: -f1); do
+      grep -qxF "$t" "$seen" && continue
+      echo "$t" >> "$seen"
+      grep -qxF "$file/$t" "$RESULTS/ledger-ids.txt" && continue
+      cmd=$(awk -v t="$t" '$1 == t { sub(/^[^ \t]+[ \t]+/, ""); print; exit }' "$LTP_PREFIX/runtest/$file")
+      v=$(ltp_control_cmd "$t" "$cmd" "$n")
+      [ "$v" = venue ] && continue
+      first_ours=$t
+      break 2
+    done
+    sleep 2
+  done
+  if [ -n "$first_ours" ]; then
+    suite_log "$file run $n: $first_ours failed, passes on ext4 and is no ledger row — stopping the file here (fail early)"
+    # kirk ignores SIGINT when its output is no terminal: the group is killed
+    # and the rows below come off its console (the report is never written).
+    kill -KILL -- "-$KIRK_PGID" 2>/dev/null || true
+    SUITE_JUDGE_NO_STALE=1
+  fi
+  wait "$KIRK_PGID" || rc=$?
+  KIRK_PGID=""
   t1=$(date +%s)
-  [ -s "$report" ] || { tail -20 "$RESULTS/kirk-$tag.console" >&2; suite_log "$file run $n: kirk produced no report (rc $rc)"; suite_umount "$tag"; return 1; }
-  ltp_report_rows "$report" > "$rows"
+  if [ -n "$first_ours" ]; then
+    grep -oE '^[A-Za-z0-9_.+-]+: (pass|fail|broken|timeout|conf|skip)' "$console" | awk -F': ' -v rt="$LTP_PREFIX/runtest/$file" '
+      BEGIN { while ((getline l < rt) > 0) { split(l, a, /[ \t]+/); c = l; sub(/^[^ \t]+[ \t]+/, "", c); cmd[a[1]] = c } }
+      { print $1 "\t" $2 "\t" cmd[$1] }' > "$rows"
+    rc=1
+  else
+    [ -s "$report" ] || { tail -20 "$console" >&2; suite_log "$file run $n: kirk produced no report (rc $rc)"; suite_umount "$tag"; return 1; }
+    ltp_report_rows "$report" > "$rows"
+  fi
   local all="$RESULTS/ltp-$tag.allfail"
   awk -F'\t' '$2 == "fail" || $2 == "brok" || $2 == "broken" || $2 == "timeout" { print $1 }' "$rows" | sort -u > "$all"
   local total pass fail confn
@@ -121,6 +166,7 @@ ltp_run() {
     while read -r t; do
       t=${t#*/}
       awk -F'\t' -v t="$t" '$1 == t { print "    " $1 " [" $2 "]: " $3 }' "$rows" >&2
+      [ -s "$report" ] || continue
       python3 - "$report" "$t" <<'PY' >&2
 import json, sys
 r = json.load(open(sys.argv[1]))
@@ -140,7 +186,15 @@ PY
   return 0
 }
 
+# A stop of the harness takes kirk's process group with it (its tests hold
+# files on the mount the cleanup unmounts next).
+KIRK_PGID=""
+ltp_cleanup() {
+  if [ -n "$KIRK_PGID" ]; then kill -KILL -- "-$KIRK_PGID" 2>/dev/null || true; KIRK_PGID=""; fi
+}
+
 main() {
+  SUITE_CLEANUP_HOOK=ltp_cleanup
   suite_prepare ltp
   ltp_build
   local verdict=0 file n

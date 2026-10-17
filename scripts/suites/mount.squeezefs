@@ -70,6 +70,10 @@ IFS=',' read -ra items <<< "$opts"
 for it in "${items[@]}"; do
   case "$it" in
     ""|rw|defaults|auto|noauto|user|nouser|owner|group|_netdev|nofail|loop) ;;
+    # mount(8)'s atime family reaches a helper as words (util-linux 2.42:
+    # generic/338's `-o strictatime`); the daemon stamps no atime on a read
+    # (the ledger's `noatime` class), so none of them changes anything.
+    atime|noatime|diratime|nodiratime|relatime|norelatime|strictatime|nostrictatime|lazytime|nolazytime) ;;
     *) pass+=("$it") ;;
   esac
 done

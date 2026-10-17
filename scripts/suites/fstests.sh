@@ -168,7 +168,12 @@ fstests_run() {
   # that outlived one stop kept running its list against the loop devices
   # the next run re-created, and the two runs fought over one set.
   cp "$SETS/local.config" "$FSTESTS_DIR/local.config"
-  (cd "$FSTESTS_DIR" && exec setsid timeout -s KILL "$FSTESTS_TIMEOUT_S" ./check -R xunit "${exclude[@]}" "${what[@]}") > "$RESULTS/check-run$n.out" 2>&1 &
+  # util-linux 2.39+ remounts through the new mount API, and FUSE refuses
+  # every option on a reconfigure there ("No changes allowed in
+  # reconfigure": generic/294, 306, 452's `-o remount,ro`); the classic
+  # mount(2) applies the flag and ignores the options, as the daemon's
+  # contract says. Helpers run the same under either API.
+  (cd "$FSTESTS_DIR" && exec setsid env LIBMOUNT_FORCE_MOUNT2=always timeout -s KILL "$FSTESTS_TIMEOUT_S" ./check -R xunit "${exclude[@]}" "${what[@]}") > "$RESULTS/check-run$n.out" 2>&1 &
   CHECK_PGID=$!
   wait "$CHECK_PGID" || rc=$?
   CHECK_PGID=""

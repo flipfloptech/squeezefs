@@ -21,6 +21,9 @@ suite_set_of() {
   back=$dev
   case "$dev" in
     /dev/loop*) back=$(losetup -O BACK-FILE -n "$dev" 2>/dev/null | head -1); [ -n "$back" ] || { echo "$(basename "$0"): $dev is not an attached loop device" >&2; exit 1; } ;;
+    # Any other block device (a scsi_debug disk, a real one) backs no file:
+    # the set's data images and cache would land in /dev (devtmpfs).
+    /dev/*) echo "$(basename "$0"): $dev is a block device with no backing file — the suites key a set by its metadata image's directory (a loop device over it, or a dm target over that loop)" >&2; exit 1 ;;
   esac
   SET_DIR=$(dirname "$back")
 }

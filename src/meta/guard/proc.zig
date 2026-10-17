@@ -71,7 +71,10 @@ pub fn parseUuid(text: []const u8) ?[16]u8 {
 /// Field 22 of `/proc/<pid>/stat` (start time, clock ticks since boot).
 /// The comm field is parenthesised and may hold spaces, so the parse
 /// resumes after the LAST ')'. Null = no such process (or unreadable —
-/// which the proof reads the same way: nothing alive answers to the pid).
+/// which the proof reads the same way: nothing alive answers to the pid),
+/// and a ZOMBIE or dead task (state `Z`/`X`: exited, its parent has not
+/// reaped it — a supervisor's probe interval away): it holds no fd and
+/// writes nothing, and its pid cannot be reused while it stands.
 pub fn startTicksOf(pid: u32) ?u64 {
     var pb: [64]u8 = undefined;
     const path = std.fmt.bufPrintSentinel(&pb, "/proc/{d}/stat", .{pid}, 0) catch return null;
@@ -87,14 +90,12 @@ pub fn parseStartTicks(stat: []const u8) ?u64 {
     var it = std.mem.tokenizeScalar(u8, stat[close + 2 ..], ' ');
     var idx: usize = 3;
     while (it.next()) |tok| : (idx += 1) {
+        if (idx == 3 and (std.mem.eql(u8, tok, "Z") or std.mem.eql(u8, tok, "X"))) return null; // field 3 is the state letter (proc(5))
         if (idx == 22) return std.fmt.parseInt(u64, tok, 10) catch null;
     }
     return null;
 }
 
-/// A zombie still has a `/proc/<pid>/stat` with its original start ticks;
-/// its parent has not reaped it, so it IS the author — not provably dead
-/// (the smoke reaps its children before remounting).
 fn startTicksFn(_: ?*anyopaque, pid: u32) ?u64 {
     return startTicksOf(pid);
 }
@@ -324,6 +325,28 @@ test "start ticks: field 22 after the last ')' (a comm with spaces and parenthes
     var child = try std.process.spawn(testing.io, .{ .argv = &.{"true"}, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore });
     const pid: u32 = @intCast(child.id.?);
     _ = try child.wait(testing.io);
+    try testing.expect(startTicksOf(pid) == null);
+    try testing.expect(probe.provablyDead(pid, 1));
+}
+
+test "a ZOMBIE holder is dead: a daemon that exited under a supervisor that reaps on its 5 s probe still has /proc/<pid>/stat (state Z, its start ticks) — it holds no fd, writes nothing, and its pid cannot be reused, so the claim it left is reclaimable at once (xfstests' _flakey_drop_and_remount remounts within 50 ms)" {
+    try testing.expect(parseStartTicks("1234 (sqz) Z 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 6559818 20 21") == null);
+    try testing.expect(parseStartTicks("1234 (sqz) X 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 6559818 20 21") == null);
+    // A real zombie: a child that exited and is not yet reaped.
+    var child = try std.process.spawn(testing.io, .{ .argv = &.{"true"}, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore });
+    const pid: u32 = @intCast(child.id.?);
+    defer _ = child.wait(testing.io) catch {};
+    var pb: [64]u8 = undefined;
+    const path = try std.fmt.bufPrintSentinel(&pb, "/proc/{d}/stat", .{pid}, 0);
+    var buf: [1024]u8 = undefined;
+    // Wait for the exit (the stat's state letter turns Z); no reap yet.
+    var polls: u32 = 0;
+    while (polls < 2000) : (polls += 1) {
+        const text = readSmall(path.ptr, &buf) orelse break;
+        const close = std.mem.lastIndexOfScalar(u8, text, ')') orelse break;
+        if (close + 2 < text.len and text[close + 2] == 'Z') break;
+        try testing.io.sleep(.fromMilliseconds(1), .awake);
+    }
     try testing.expect(startTicksOf(pid) == null);
     try testing.expect(probe.provablyDead(pid, 1));
 }

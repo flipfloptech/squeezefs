@@ -92,7 +92,11 @@ case $SUITE_PKG_FAMILY in
   ) ;;
 esac
 
-suite_log() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" | tee -a "${RESULTS:-/dev/null}/harness.log" >&2; }
+suite_log() {
+  # Before `suite_begin` there is no results dir: stderr only.
+  if [ -n "${RESULTS:-}" ]; then printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" | tee -a "$RESULTS/harness.log" >&2
+  else printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" >&2; fi
+}
 suite_die() { suite_log "FATAL: $*"; exit 2; }
 
 suite_require_venue() {

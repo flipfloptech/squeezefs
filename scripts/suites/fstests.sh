@@ -58,7 +58,9 @@ fstests_build() {
     suite_log "cloning $FSTESTS_REPO"
     git clone -q --depth 1 "$FSTESTS_REPO" "$FSTESTS_DIR"
   fi
-  if [ ! -x "$FSTESTS_DIR/ltp/fsstress" ] || [ ! -x "$FSTESTS_DIR/ltp/fsx" ]; then
+  # `src/locktest` is among the last targets: a build that died midway
+  # (the glibc guard below) left fsstress and fsx behind and must re-run.
+  if [ ! -x "$FSTESTS_DIR/ltp/fsstress" ] || [ ! -x "$FSTESTS_DIR/ltp/fsx" ] || [ ! -x "$FSTESTS_DIR/src/locktest" ]; then
     suite_log "building xfstests ($(cd "$FSTESTS_DIR" && git log -1 --format=%h))"
     fstests_patch_locktest
     (cd "$FSTESTS_DIR" && make -s -j"$(nproc)" >"$RESULTS/fstests-build.log" 2>&1) || { tail -30 "$RESULTS/fstests-build.log" >&2; suite_die "xfstests build failed"; }
@@ -93,7 +95,7 @@ fstests_sets() {
   "$SUITES_DIR/mkfs.squeezefs" -f "$SCRATCH_LOOP" > "$SETS/set-scratch/format.out" 2>&1 || { cat "$SETS/set-scratch/format.out" >&2; suite_die "mkfs scratch set"; }
   cat > "$SETS/local.config" <<CFG
 export FSTYP=fuse.squeezefs
-# `_scratch_mkfs` reformats a set the previous test formatted: mkfs(8)'s -f.
+# _scratch_mkfs reformats a set the previous test formatted: mkfs(8)'s -f.
 export MKFS_OPTIONS="-f"
 export TEST_DEV=$TEST_LOOP
 export TEST_DIR=$SETS/mnt-test

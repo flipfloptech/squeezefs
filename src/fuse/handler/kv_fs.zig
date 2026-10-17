@@ -1199,9 +1199,11 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             // The 4a set leaves this frame with the tx (the conveyor drops it
             // at the terminal outcome, on its thread).
             lock_order.handedOff(.object);
-            // A request the kernel sent (the move gate carries every one):
-            // its caches follow the reply (decision 0003 §AB.2).
-            t.kernel_origin = t.kernel_origin or c.move != null;
+            // A request the kernel sent: its caches follow the reply
+            // (decision 0003 §AB.2). The lifecycle's flag, never the move
+            // gate's presence — a flat mount arms no gate, and its kernel
+            // asked all the same.
+            t.kernel_origin = t.kernel_origin or c.kernel;
             self.store.commit(t) catch |e| return storeErr(e);
         }
 
@@ -3977,6 +3979,8 @@ pub const MemStore = struct {
     name_key: key.NameKey = .init(0x5EED_0F_7E57),
     node_size_: usize = 65536,
     commits: u64 = 0,
+    /// The last commit's `kernel_origin` (the kernel view's law).
+    last_kernel_origin: bool = false,
     fsyncs: u64 = 0,
     /// Value bytes `lookup` and `range` copied out (a view copies none).
     value_bytes_copied: u64 = 0,
@@ -4080,6 +4084,7 @@ pub const MemStore = struct {
             }
         }
         self.commits += 1;
+        self.last_kernel_origin = t.kernel_origin;
     }
 
     pub fn lookup(self: *MemStore, gpa: Allocator, kind: u8, k: []const u8) StoreError!?[]u8 {
@@ -4443,6 +4448,22 @@ fn HarnessOf(comptime Data: type) type {
 }
 
 const Harness = HarnessOf(NoData);
+
+test "a request the kernel sent is kernel-origin WITHOUT a move gate (a flat mount arms none): its conveyor tells its kernel nothing of its own change — else every name it makes is INVAL_ENTRY'd back, d_invalidate throws a mount off a fresh directory and a cwd under it answers getcwd ENOENT (repro-port: LTP linkat02, fanotify13, dirtyc0w_shmem, msgget01 on a cache-path mount); a tool's direct call stays a change the kernel must hear" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    // Through the lifecycle's dispatch, as the kernel's requests arrive.
+    _ = try h.mkdir(1, "mntpoint");
+    try testing.expect(h.store.last_kernel_origin);
+    // A tool's call (no lifecycle, no gate): the kernel did not ask.
+    var tr = @import("op_trace.zig").OpTrace.begin(1, .other);
+    defer tr.finish();
+    var win: [64]u8 = undefined;
+    var c: Ctx = .{ .unique = 1, .uid = 0, .gid = 0, .pid = 0, .io = testing.io, .trace = &tr, .wd_slot = null, .window = &win };
+    _ = try h.fs.mkdir(&c, .{ .parent = 1, .name = "tool-made", .mode = 0o755, .umask = 0 });
+    try testing.expect(!h.store.last_kernel_origin);
+}
 
 /// A data face WITH volumes whose write side holds custody: `flushCustody`
 /// lands it as the plane's upload merge does — the layout republished onto

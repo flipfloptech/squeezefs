@@ -321,6 +321,7 @@ pub fn Dispatcher(comptime Transport: type) type {
                 .trace = &trace,
                 .wd_slot = wd,
                 .window = self.transport.replyWindow(slot),
+                .kernel = true,
             };
             ctx.stage(.handler_entry);
             var out: codec.OutBuf = undefined;
@@ -359,7 +360,7 @@ pub fn Dispatcher(comptime Transport: type) type {
         pub fn probeMeta(self: *Self, req: codec.Request, meta: Meta, out: *codec.OutBuf) ?codec.Reply {
             const op = opcodeOf(req);
             var trace = op_trace.OpTrace.begin(meta.unique, op_trace.OpClass.of(op));
-            var ctx: Ctx = .{ .unique = meta.unique, .uid = meta.uid, .gid = meta.gid, .pid = meta.pid, .io = self.io, .trace = &trace, .wd_slot = null, .window = &.{} };
+            var ctx: Ctx = .{ .unique = meta.unique, .uid = meta.uid, .gid = meta.gid, .pid = meta.pid, .io = self.io, .trace = &trace, .wd_slot = null, .window = &.{}, .kernel = true };
             const reply: codec.Reply = switch (req) {
                 .lookup => |a| blk: {
                     const e = self.fs.vtable.probe_lookup(self.fs.impl, &ctx, .{ .parent = meta.nodeid, .name = a.name }) catch return null;
@@ -437,7 +438,7 @@ pub fn Dispatcher(comptime Transport: type) type {
             if (v.evicted) fuse_forget_evictions.inc();
             var trace = op_trace.OpTrace.begin(meta.unique, .other);
             defer trace.finish();
-            var ctx: Ctx = .{ .unique = meta.unique, .uid = meta.uid, .gid = meta.gid, .pid = meta.pid, .io = self.io, .trace = &trace, .wd_slot = null, .window = &.{} };
+            var ctx: Ctx = .{ .unique = meta.unique, .uid = meta.uid, .gid = meta.gid, .pid = meta.pid, .io = self.io, .trace = &trace, .wd_slot = null, .window = &.{}, .kernel = true };
             self.fs.vtable.forget(self.fs.impl, &ctx, .{ .ino = ino, .nlookup = nlookup, .evicted = v.evicted });
         }
 

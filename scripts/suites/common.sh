@@ -104,6 +104,12 @@ suite_require_venue() {
   [ "$(id -u)" = 0 ] || suite_die "the suites need root (mount(2), the suites' -u/-g legs)"
   [ -x "$SQZ_BIN" ] || suite_die "no binary at $SQZ_BIN (scripts/venue zig build)"
   [ -c /dev/fuse ] || suite_die "/dev/fuse absent"
+  # A desktop's udisks auto-mounts the loop devices the suites format (LTP's
+  # .all_filesystems tests, xfstests' devices): the next mkfs sees "is mounted".
+  # provision-local-venue's udev rule keeps it off loop devices backed under the build root.
+  if { [ -x /usr/lib/udisks2/udisksd ] || [ -x /usr/libexec/udisks2/udisksd ]; } && [ ! -f /etc/udev/rules.d/99-sqz-loop-ignore.rules ]; then
+    suite_die "udisks is installed and no /etc/udev/rules.d/99-sqz-loop-ignore.rules keeps it off the suites' loop devices (scripts/dev/provision-local-venue --apply)"
+  fi
 }
 
 # Install the package set once. apt: verify the lockfile every time — a missing lockfile

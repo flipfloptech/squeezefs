@@ -102,6 +102,17 @@ elif [ -f /etc/default/grub ]; then cmdline_fix="append it to GRUB_CMDLINE_LINUX
 else cmdline_fix="append it to the kernel command line in your bootloader's config (neither GRUB drop-ins nor limine-entry-tool here), then reboot"; fi
 grep -q 'nvme_core.fabrics_host_scoped_subsystems=Y' /proc/cmdline && ok "nvme_core.fabrics_host_scoped_subsystems=Y (the nvmet two-identity rows)" \
   || miss "nvme_core.fabrics_host_scoped_subsystems=Y on the kernel command line (the nvmet two-identity rows)" "$cmdline_fix"
+# A desktop host runs udisks (and an automounter over it: Omarchy's udiskie): it probes and
+# auto-mounts every loop device the suites format (LTP's .all_filesystems tests, xfstests'
+# TEST_DEV/SCRATCH_DEV) — the next mkfs sees "is mounted", the loop never detaches, and the
+# mounts outlive the run under /run/media. A udev rule marks loop devices backed by a file
+# under the build root UDISKS_IGNORE (the suites' only loop devices); the user's own stay.
+udev_rule=/etc/udev/rules.d/99-sqz-loop-ignore.rules
+udev_rule_apply=0
+if [ -x /usr/lib/udisks2/udisksd ] || [ -x /usr/libexec/udisks2/udisksd ]; then
+  if [ -f "$udev_rule" ]; then ok "udisks ignores the suites' loop devices ($udev_rule)"
+  else udev_rule_apply=1; miss "udisks/udiskie kept off the suites' loop devices (a desktop host auto-mounts what LTP and xfstests format)" "scripts/dev/provision-local-venue --apply   # $udev_rule: UDISKS_IGNORE for loop devices backed under $(readlink -f "$ROOT" 2>/dev/null || echo "$ROOT")"; fi
+fi
 
 echo "== packages"
 pkgs=()
@@ -232,6 +243,15 @@ if [ "$apply" = 1 ]; then
       deb) sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${lackp[@]}" ;;
       arch) sudo pacman -S --needed --noconfirm "${lackp[@]}" ;;
     esac || exit 1
+  fi
+  if [ "$udev_rule_apply" = 1 ]; then
+    rr=$(readlink -f "$ROOT" 2>/dev/null || echo "$ROOT")
+    printf '%s\n' "# squeezefs venue (scripts/dev/provision-local-venue): the suites' loop devices (LTP's" \
+      "# .all_filesystems tests, xfstests' TEST_DEV/SCRATCH_DEV) are backed by files under the build" \
+      "# root; udisks must neither probe nor auto-mount them (udiskie mounted every one under /run/media)." \
+      "SUBSYSTEM==\"block\", KERNEL==\"loop[0-9]*\", ATTR{loop/backing_file}==\"$rr/*\", ENV{UDISKS_IGNORE}=\"1\"" \
+      | sudo tee "$udev_rule" >/dev/null || exit 1
+    sudo udevadm control --reload || exit 1
   fi
   if [ "${ram_tmp_apply:-0}" = 1 ]; then
     # (The distro's own zram config may live under /usr/lib only: the /etc drop-in dir may not exist.)

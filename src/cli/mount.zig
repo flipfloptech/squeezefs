@@ -751,7 +751,7 @@ fn mountMain(ctx: *Ctx) u8 {
             .probe = plane.probe(),
             .shared_enabled = op_guard.sharedEnabled(env),
             .opens = &opens,
-            .notify = .{ .ctx = session, .call = &invalThunk },
+            .notify = .{ .ctx = session, .call = &invalThunk, .sync = &invalSyncThunk },
             .our_commit = ctx.p.build.commit,
             .mount_dev = mount_dev,
             .mount_uid = ctx.opts.uid,
@@ -1398,6 +1398,12 @@ fn bindIl0Thunk(ctx: *anyopaque, face: ?handler.kv_fs.Il0Face) void {
 fn invalThunk(ctx: ?*anyopaque, ino: u64, off: i64, len: i64) error{QueueFull}!void {
     const session: *Session = @ptrCast(@alignCast(ctx.?));
     return session.notifyInvalInode(ino, off, len);
+}
+
+/// The invalidator's awaited size announcement (a grow, before its ack).
+fn invalSyncThunk(ctx: ?*anyopaque, ino: u64) void {
+    const session: *Session = @ptrCast(@alignCast(ctx.?));
+    session.notifyAttrsAwaited(ino);
 }
 
 /// The mounted root's `st_dev` (the fd screen's mount authority): an

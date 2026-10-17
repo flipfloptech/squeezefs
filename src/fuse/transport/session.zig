@@ -502,6 +502,35 @@ const Sideband = struct {
         return true;
     }
 
+    /// `notifyNb` AWAITED: returns once the device write completed — the
+    /// kernel has the attrs invalidated when its write returns, and a
+    /// reserved cell's write never waits in the kernel, so the wait is one
+    /// sideband round. What a ring write that grew a file owes before its
+    /// ack (`ipc/host/inval.zig`). False = the session ended or the write
+    /// failed (counted).
+    fn notifyNbAwaited(self: *Sideband, comptime build: anytype, args: anytype) bool {
+        if (self.disconnected or self.stop.load(.acquire)) return false;
+        const idx = self.takeNbCell(true) orelse return false;
+        self.fillNotify(idx, build, args) catch return false;
+        const c = &self.cells[idx];
+        // `fillNotify` marked it fire-and-forget: this one is waited on.
+        c.fire_and_forget = false;
+        notify_pending.sub(1);
+        self.publish(idx);
+        const res = c.done.wait();
+        self.recycle(idx);
+        if (res < 0) {
+            const e: linux.E = @fromBackingInt(@as(u16, @intCast(-res)));
+            if (e == .NOENT) notify_enoent.inc() else {
+                notify_failed.inc();
+                log.warn("transport: an awaited attrs invalidation failed ({t})", .{e});
+            }
+            return false;
+        }
+        notify_sent.inc();
+        return true;
+    }
+
     /// `INVAL_ENTRY` from the shared pool, never waiting (its write waits
     /// on the parent's `i_rwsem`, which a request may hold while it waits
     /// on this very caller); no cell ⇒ the loop owes the kernel an epoch.
@@ -1072,6 +1101,12 @@ pub const Session = struct {
     /// sideband thread itself may wait on a commit (a FORGET's destroy).
     pub fn notifyAttrs(self: *Session, ino: u64) void {
         _ = self.sideband.notifyNb(codec.notifyInvalInode, .{ ino, @as(i64, -1), @as(i64, 0) });
+    }
+
+    /// `notifyAttrs` that returns once the kernel took it (a ring write that
+    /// grew the file announces its size before its ack: POSIX-8).
+    pub fn notifyAttrsAwaited(self: *Session, ino: u64) void {
+        _ = self.sideband.notifyNbAwaited(codec.notifyInvalInode, .{ ino, @as(i64, -1), @as(i64, 0) });
     }
 
     /// The token plane's kernel-invalidation face (a recalled object's

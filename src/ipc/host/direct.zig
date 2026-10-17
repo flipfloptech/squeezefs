@@ -523,8 +523,9 @@ pub const Engine = struct {
             stats.ipc_ops_write.inc();
             stats.ipc_bytes_in.add(p.len);
             if (self.opens) |o| o.noteDurableWrite(p.nodeid);
-            p.c.complete(@intCast(p.len));
+            // A grow announces its size to the kernel BEFORE the ack (POSIX-8).
             _ = self.inval.onWrite(p.nodeid, p.offset + p.len, clock.realtimeCoarseS());
+            p.c.complete(@intCast(p.len));
         } else |e| {
             stats.ipc_dd_write_dma_errors.inc();
             p.c.fail(errors.toErrno(e));
@@ -579,7 +580,7 @@ const Lab = struct {
         errdefer l.wp.deinit(testing.io);
         l.pool = try severed_pool.SeveredPool.init(gpa, wt.BS, 8);
         errdefer l.pool.deinit();
-        l.inval = try inval_mod.Invalidator.init(gpa, 64, .{ .ctx = null, .call = &noInval }, 1000);
+        l.inval = try inval_mod.Invalidator.init(gpa, 64, .{ .ctx = null, .call = &noInval, .sync = &OrderProbe.sync }, 1000);
         errdefer l.inval.deinit(gpa);
         _ = linux.mkdir("/build/tmp", 0o755);
         const p = try std.fmt.bufPrintSentinel(&l.path_buf, "/build/tmp/sqz-dd-lane-{d}.img", .{linux.getpid()}, 0);
@@ -606,6 +607,23 @@ const Lab = struct {
     fn readBack(self: *Lab, off: u64, out: []u8) !void {
         const n = linux.pread(self.fd, out.ptr, out.len, @intCast(off));
         if (linux.errno(n) != .SUCCESS or n != out.len) return error.ShortRead;
+    }
+};
+
+/// The lab's awaited size announcement: records whether the write under
+/// watch was already ACKED (its slot result published) when the kernel was
+/// told the size — the order POSIX-8 forbids.
+const OrderProbe = struct {
+    var slot: ?*const ipc_layout.IpcSlot = null;
+    var gen: u64 = 0;
+    var fired: u32 = 0;
+    var acked_first: bool = false;
+
+    fn sync(_: ?*anyopaque, _: u64) void {
+        fired += 1;
+        if (slot) |sl| if (slot_core.isDoneFor(sl, gen)) {
+            acked_first = true;
+        };
     }
 };
 
@@ -648,6 +666,12 @@ test "the dd lane: a W1-shaped 4 KiB overwrite serves INLINE — one SQE on the 
     const rmw0 = @import("../../data/sole_owner_patch.zig").stats.patch_edge_rmw_reads.load();
     // The W1 shape: page 3 of block 0, 4 KiB, aligned, non-extending.
     const w = try submitWrite(s, 1, 1, 3 * 4096, 4096, 0x55);
+    // The size announcement (no bind seeded the high-water: a grow) lands
+    // BEFORE the ack: when the kernel is told, the slot is not done yet.
+    OrderProbe.slot = try s.m.slot(1);
+    OrderProbe.gen = w.gen;
+    OrderProbe.fired = 0;
+    OrderProbe.acked_first = false;
     try testing.expect(engine.tryInlineWrite(0, w.op, 2, w.c));
     try testing.expectEqual(@as(u32, 1), engine.shards[0].inflight.load(.monotonic));
     try testing.expectEqual(@as(u32, 0), engine.shards[1].inflight.load(.monotonic));
@@ -659,6 +683,9 @@ test "the dd lane: a W1-shaped 4 KiB overwrite serves INLINE — one SQE on the 
         sleepNs(100 * std.time.ns_per_us);
     }
     try testing.expectEqual(@as(i64, 4096), slot_core.result(try s.m.slot(1)));
+    try testing.expectEqual(@as(u32, 1), OrderProbe.fired);
+    try testing.expect(!OrderProbe.acked_first);
+    OrderProbe.slot = null;
     slot_core.release(try s.m.slot(1));
     try testing.expectEqual(serves0 + 1, stats.ipc_dd_inline_serves.load());
     try testing.expect(stats.ipc_dd_lane_flushes.load() > flushes0);

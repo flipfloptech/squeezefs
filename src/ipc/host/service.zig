@@ -744,8 +744,9 @@ pub const DataPlaneSink = struct {
         };
         stats.ipc_ops_write.inc();
         stats.ipc_bytes_in.add(written);
-        c.complete(@intCast(written));
+        // A grow announces its size to the kernel BEFORE the ack (POSIX-8).
         _ = self.inval.onWrite(nodeid, op.desc.offset + written, clock.realtimeCoarseS());
+        c.complete(@intCast(written));
     }
 
     /// The registry's face on the write path (`write_admit.PlacedSeam`).

@@ -133,8 +133,14 @@ while :; do
     # serving a live mount (the `mount` group's second mount of SCRATCH_DEV:
     # generic/409–411, 589, 732 — the ledger's by-design rows) is refused
     # at once, never waited for: twelve 60 s waits made one test 40 minutes.
+    # ("exiting": a daemon leaving on its own — a FAILED volume after dm-error
+    # — whose claim stands by design until its pid is provably dead.)
+    # A holder whose own mountpoint is no longer served is leaving too (a
+    # FAILED daemon's `.stats` is unreadable, so `squeezefs umount` detached
+    # it externally and returned before its exit: generic/475's soak loop).
     hlog=$(grep -l "ready: .*(pid $lpid;" "$SET_DIR"/daemon-*.log 2>/dev/null | head -1)
-    if [ -n "$lpid" ] && [ -n "$hlog" ] && ! grep -q 'stop requested' "$hlog"; then lpid=""; fi
+    hmnt=$(grep -o "ready: .* mounted at [^ ]* (pid $lpid;" "$hlog" 2>/dev/null | sed 's/.* mounted at //; s/ (pid.*//')
+    if [ -n "$lpid" ] && [ -n "$hlog" ] && ! grep -qE 'stop requested|— exiting [0-9]' "$hlog" && { [ -z "$hmnt" ] || grep -q " $hmnt fuse.squeezefs " /proc/mounts; }; then lpid=""; fi
     if [ -n "$lpid" ] && [ -d "/proc/$lpid" ] && ! grep -q 'State:.*Z' "/proc/$lpid/status" 2>/dev/null; then
       waited=0
       while [ -d "/proc/$lpid" ] && ! grep -q 'State:.*Z' "/proc/$lpid/status" 2>/dev/null && [ "$waited" -lt 60 ]; do sleep 1; waited=$((waited + 1)); done
@@ -142,6 +148,11 @@ while :; do
         echo "$(date +%s) mount $dir: waited ${waited}s for the previous holder (pid $lpid) to exit; retrying" >> "$SET_DIR/mounts.log"
         [ "$attempt" -lt 3 ] && continue
       fi
+    elif [ -n "$lpid" ]; then
+      # Gone between the daemon's check and ours (it held the flock for its
+      # last milliseconds): the plain retry.
+      echo "$(date +%s) mount $dir: the previous holder (pid $lpid) exited meanwhile; retrying" >> "$SET_DIR/mounts.log"
+      [ "$attempt" -lt 3 ] && continue
     fi
   fi
   if [ "$attempt" -lt 3 ] && grep -q 'another writer holds the single-writer guard' <<< "$out" && grep -q 'stale writer claim' "$log" 2>/dev/null; then

@@ -1915,9 +1915,18 @@ pub const KvBackend = struct {
     }
 
     /// Checkpoint past a journal hole under the SMO lock (the lane's hole
-    /// discipline; the conveyor's abandon arm).
+    /// discipline; the conveyor's abandon arm). Never a WAIT for the lock:
+    /// the caller is the lane's stage-B fiber — the one that lands every
+    /// structural entry — and a holder parked on such an entry (the
+    /// checkpointer mid-SMO in `smoWriteHook`) waits on this very fiber,
+    /// so the wait is a deadlock (xfstests generic/753 under dm-error: every
+    /// committer parked for the kernel's 135 s). Held ⇒ the holder's own
+    /// cycle covers the hole; this cover fails loud and the lane escalates.
     fn checkpointPast(be: *KvBackend, pos: u64) bool {
-        be.smo_lock.lockUncancelable(be.io);
+        if (!be.smo_lock.tryLock()) {
+            log.warn("meta volume {s}: the journal hole ending at {d} is not covered from the lane — the SMO lock is held (a checkpoint cycle in flight, parked on this lane); its own cycle covers it", .{ be.path, pos });
+            return false;
+        }
         defer be.smo_lock.unlock(be.io);
         be.cp.checkpointPast(pos) catch return false;
         return true;
@@ -3312,6 +3321,45 @@ test "rollback on the device: a synthetically failed window answers JournalWrite
     }
     try testing.expect(be.isFailed());
     try testing.expectError(error.VolumeFailed, commitCreate(be, "post"));
+}
+
+test "the lane's hole checkpoint never waits on the SMO lock: a window failing while the lock is held (the checkpointer mid-SMO, parked on this lane's answer to its structural entry) is rolled back and answered at once, the volume stays open and the holder's own cycle covers the hole (repro-port: xfstests generic/753's soak loop under dm-error — every committer parked for the kernel's 135 s request timeout)" {
+    const gpa = testing.allocator;
+    const v = try TestVol.create(gpa, "hole-lock", "600000");
+    defer v.destroy();
+    v.lane_error_logs = 1;
+    const be = try v.open();
+    defer be.close();
+    _ = try commitCreate(be, "base");
+    // The checkpointer mid-SMO: the SMO lock held by another thread.
+    be.smo_lock.lockUncancelable(be.io);
+    var held = true;
+    defer if (held) be.smo_lock.unlock(be.io);
+    journal_lane.test_seams.fail_windows.store(1, .release);
+    defer journal_lane.test_seams.fail_windows.store(0, .release);
+    const Victim = struct {
+        fn run(b: *KvBackend, out: *?anyerror, done: *std.atomic.Value(u32)) void {
+            out.* = if (commitCreate(b, "victim")) |_| null else |e| e;
+            done.store(1, .release);
+        }
+    };
+    var out: ?anyerror = null;
+    var done = std.atomic.Value(u32).init(0);
+    const t = try std.Thread.spawn(.{}, Victim.run, .{ be, &out, &done });
+    // Answered while the lock stays held (a bound only against the hang:
+    // the answer takes milliseconds).
+    const deadline = clock.monotonicNs() + 5 * std.time.ns_per_s;
+    while (done.load(.acquire) == 0 and clock.monotonicNs() < deadline) try testing.io.sleep(.fromMilliseconds(5), .awake);
+    const answered = done.load(.acquire) == 1;
+    be.smo_lock.unlock(be.io);
+    held = false;
+    t.join();
+    try testing.expect(answered);
+    try testing.expectEqual(@as(?anyerror, error.JournalWriteFailed), out);
+    try testing.expect(!be.isFailed());
+    // The volume serves on; the next checkpoint covers the hole.
+    _ = try commitCreate(be, "after");
+    try be.checkpointNow();
 }
 
 /// lseek(2) whences the std table lacks (`include/uapi/linux/fs.h`).

@@ -37,13 +37,20 @@ patches-7.2/`), `/build` a btrfs subvolume, `/build/tmp` ext4 on zram (the test 
   to `/dev/mapper` as the set (`2bf09b8`); the zombie holder (`6141de3`); `LIBMOUNT_FORCE_MOUNT2=always` and
   the atime words (`37662ec`); **the lane's hole checkpoint deadlock** (`09ca33c`, found by generic/753's
   dm-error soak loop); the dm-error tripwire scoping and the leaving-holder waits (same commit).
-- **Venue exclusions to revisit** (`scripts/suites/fstests-venue-exclude.txt`): the 65 dm-flakey, 5
-  dm-log-writes and dm-error-on-data (743) tests — they cut the METADATA volume alone while the data volumes
-  and the staging cache keep their writes; fsync'ed data survives the same cut under kill -9 and reads back
-  as zeros after an orderly dismount's promotion (measured). The fix is the suites' scratch set with ONE
-  device under the cut (dm-linear slices: meta | d0 | d1 | a small ext4 for the cache) — about a day — and
-  it turns the flakey corpus into a real crash-consistency oracle for the staging ring. Also excluded:
-  generic/650 (CPU hotplug: this platform's CPUs do not come back) and the scsi_debug tests (no backing file).
+- **Venue exclusions** (`scripts/suites/fstests-venue-exclude.txt`): the 65 dm-flakey, 5 dm-log-writes and
+  dm-error-on-data (743) tests were excluded 2026-10-17 because they cut the METADATA volume alone while the
+  data volumes and the staging cache kept their writes. **Re-enabled 2026-10-18** (`c6e0f5b`): each set is
+  ONE loop image the helpers carve with dm-linear into meta | d0 | d1 | an ext4 for the cache
+  (`scripts/suites/setpaths.sh`), so the test's dm target cuts every byte of the set. Under it generic/475
+  exposed the overlay settle ladder retrying a plain-EIO gap seed forever on a FAILED volume (`1fbb62d`:
+  the ladder polls the plane's fence probe), and fsx exposed three staged-arm defects (`34ca652`,
+  `482300c`, `c917653`). Still excluded: generic/650 (CPU hotplug: this platform's CPUs do not come back)
+  and the scsi_debug tests (no backing file).
+- **The flakey corpus needs a durability ruling**: with `SQUEEZEFS_FSYNC_PROMOTE_STAGED` off (the default)
+  a staged file's fsync'ed bytes live in the staging ring's mmap, never msync'ed, so a dm-flakey cut loses
+  them and generic/057 fails BY DESIGN of charter item 10 (kill -9 only); with the lever on (exported into
+  the venue command) the whole validated subset passes. Options: run the suites with the lever on; msync the
+  segment at fsync; or adjudicate the flakey rows. Until ruled, run xfstests with the lever on.
 - **Open from the pass**: generic/112's size race (a `flakes.md` row; 1 of 3 passes).
 - **Fail early, fail hard** (owner ruling): every suite stops at the first failing test that is not a ledger
   row (`eea8892`); the three suites take a stop (`sudo pkill -TERM -f scripts/suites/<suite>.sh`) down to

@@ -688,6 +688,8 @@ pub const DataPlane = struct {
             .scratch_len = if (self.xform != null) transform.scratchLen(cfg.block_size) else 0,
             .scratch_pool_cap = transform.scratchPoolCap(opts.facts.cpus),
             .image = if (self.xform != null) seams.ImageSeam{ .ctx = self, .read = &imageSeamRead } else null,
+            .fence = &fencePoll,
+            .fence_ctx = self,
         }) catch return error.OutOfMemory;
         errdefer self.wp.deinit(io);
         // The write side's R5 components (spec §2.5): the parked-buffer

@@ -504,6 +504,10 @@ pub const WritePath = struct {
         scratch_pool_cap: u32 = 0,
         /// The plaintext image seam (required when any volume is transformed).
         image: ?seams.ImageSeam = null,
+        /// The volume's FAILED latch for the overlay's settle ladder
+        /// (`device_overlay.Deps.fence`).
+        fence: ?*const fn (ctx: ?*anyopaque) bool = null,
+        fence_ctx: ?*anyopaque = null,
     };
 
     pub fn init(gpa: Allocator, cfg: Config, d: Deps) Allocator.Error!*WritePath {
@@ -574,6 +578,8 @@ pub const WritePath = struct {
             .governor = &self.governor,
             .ram_custody = &ramCustody,
             .ram_custody_ctx = self,
+            .fence = d.fence,
+            .fence_ctx = d.fence_ctx,
         }, device_overlay.registryCapacity(cfg.parked_cap, pipeline.capBytes(d.budget_bytes), cfg.block_size));
         self.view = .{ .table = &self.table, .overlay = &self.overlay, .epochs = &self.epochs, .locks = &self.locks, .device = d.device };
         return self;

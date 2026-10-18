@@ -654,6 +654,12 @@ pub const Deps = struct {
     /// (fstests generic/551: a 1 MiB run of zeros in the verify).
     ram_custody: ?*const fn (ctx: ?*anyopaque, ino: u64, block: u32) bool = null,
     ram_custody_ctx: ?*anyopaque = null,
+    /// The volume's FAILED latch (the plane's `fencePoll`: the meta set's
+    /// `is_failed` or a fenced device). A settle transient on a FAILED
+    /// volume can never clear before the remount, so the ladder treats it
+    /// as the fence instead of retrying forever (generic/475).
+    fence: ?*const fn (ctx: ?*anyopaque) bool = null,
+    fence_ctx: ?*anyopaque = null,
 };
 
 /// The payload's stability class at mint (the §3.4 stability law).
@@ -1168,7 +1174,10 @@ pub const Overlay = struct {
     /// immediate; ONE (3) acquisition per attempt — the backoff runs with
     /// the guard dropped (module doc), the record re-looked-up under the
     /// next acquisition (a sibling settler may have landed or torn it
-    /// down). Returns the close-owed hint.
+    /// down). A transient while the volume is FAILED (`Deps.fence`) is the
+    /// fence: nothing clears before the remount, and the daemon's teardown
+    /// joins this settler (generic/475 under dm-error: attempt 1024 and
+    /// the umount waiting). Returns the close-owed hint.
     pub fn settleWriteArm(self: *Overlay, io: Io, locks: *seams.BlockLocks, ino: u64, block: u32, barrier: bool) bool {
         var ladder = SETTLE_LADDER;
         while (true) {
@@ -1180,6 +1189,13 @@ pub const Overlay = struct {
                     .settled => |hint| return hint,
                     .fenced => return false,
                     .transient => {
+                        if (self.volumeFenced()) {
+                            stats.overlay_fence_drops.fire("an overlay settle's transient met a FAILED volume");
+                            log.err("overlay ino {d} block {d}: settle transient on a FAILED volume (attempt {d}) — publishing nothing, freeing nothing", .{ ino, block, ladder.attempts() + 1 });
+                            _ = rec.core.fenceDrop();
+                            self.teardown(rec);
+                            return false;
+                        }
                         const s = ladder.next();
                         if (ladder.shouldBark()) log.warn("overlay ino {d} block {d}: settle transient, attempt {d}", .{ ino, block, ladder.attempts() });
                         break :blk s;
@@ -1188,6 +1204,11 @@ pub const Overlay = struct {
             };
             io.sleep(.{ .nanoseconds = @intCast(step.backoff_ns) }, .awake) catch {};
         }
+    }
+
+    fn volumeFenced(self: *const Overlay) bool {
+        const poll = self.deps.fence orelse return false;
+        return poll(self.deps.fence_ctx);
     }
 
     /// The fence class of a device leg (the seed read/write, the flush):
@@ -1660,10 +1681,13 @@ const TestWorld = struct {
     locks: seams.BlockLocks,
     gov: pipeline.Governor,
     ov: Overlay,
+    /// The volume's FAILED latch as the overlay's fence probe sees it.
+    fenced: Atomic(bool),
 
     fn init(gpa: Allocator, cfg_over: struct { patch_max: u64 = wt.BS / 8, overwrite: bool = true, shadow: bool = true, close_barrier: bool = false, gap_seed_ranged: bool = true, blocks: u32 = 32, registry_capacity: usize = 16 }) !*TestWorld {
         const w = try gpa.create(TestWorld);
         errdefer gpa.destroy(w);
+        w.fenced = .init(false);
         w.f = try wt.Fixture.init(gpa, cfg_over.blocks);
         w.epochs = epoch_mod.Epochs.init(gpa, wt.BS, cfg_over.shadow);
         w.stripes = .{};
@@ -1679,12 +1703,19 @@ const TestWorld = struct {
             .epochs = &w.epochs,
             .stripes = &w.stripes,
             .governor = &w.gov,
+            .fence = &fencePoll,
+            .fence_ctx = w,
         }, cfg_over.registry_capacity);
         return w;
     }
 
     fn pickA(ctx: ?*anyopaque, _: enospc.Place) ?*block_alloc.BlockAllocator {
         return @ptrCast(@alignCast(ctx.?));
+    }
+
+    fn fencePoll(ctx: ?*anyopaque) bool {
+        const w: *TestWorld = @ptrCast(@alignCast(ctx.?));
+        return w.fenced.load(.monotonic);
     }
 
     fn deinit(self: *TestWorld, gpa: Allocator) void {
@@ -2217,6 +2248,39 @@ test "fence immediate on every settle leg: a gap seed or a flush answering Volum
     w.ov.drainBlock(io, &w.locks, 93, 0, false, w.cs());
     try testing.expectEqual(retries0 + 1, stats.overlay_settle_retries.load());
     try testing.expect(w.f.map.seam().lookup(93, 0) != null);
+}
+
+// xfstests generic/475 on the one-device layout: dm-error under the meta
+// AND the data slices latched the volume FAILED, and the gap seed of one
+// frozen record answered EIO on every attempt — a transient the ladder
+// retried forever (attempt 1024 and counting) while the daemon's teardown
+// joined that settler, so `squeezefs umount` never saw it exit.
+test "a transient on a FAILED volume is the fence: a gap seed answering plain EIO while the fence probe says FAILED ends the ladder on that attempt — the record torn down FenceDropped, nothing published, the dest not freed, the must-stay-0 fired, the settler returns" {
+    const io = testing.io;
+    const w = try TestWorld.init(testing.allocator, .{ .shadow = false });
+    defer w.deinit(testing.allocator);
+    var half: [wt.BS / 2]u8 align(4096) = undefined;
+    pattern(&half, 0x7F);
+    try w.f.map.create(94, .striped, 0);
+    _ = try w.ov.store(io, .{ .ino = 94, .block = 0, .rel = 0, .vehicle = .{ .bytes = &half }, .file = TestWorld.striped(0), .overwrite = false });
+    // The device never answers again, and the volume is latched FAILED.
+    w.f.dev.setFailWrites(std.math.maxInt(u32), error.InputOutput);
+    w.fenced.store(true, .monotonic);
+    const fence0 = counters.tripwireCount("overlay_fence_drops");
+    const retries0 = stats.overlay_settle_retries.load();
+    const pub0 = stats.overlay_publishes.load();
+    const used0 = w.f.alloc_a.usedBlocks();
+    stats.overlay_fence_drops.resetLogBudgetForTest();
+    log.testing.expectErrorLogs(2);
+    w.ov.drainBlock(io, &w.locks, 94, 0, false, w.cs());
+    try log.testing.expectAllFired();
+    try testing.expectEqual(fence0 + 1, counters.tripwireCount("overlay_fence_drops"));
+    // ONE transient (the failing seed) and then the fence verdict: no ladder.
+    try testing.expectEqual(retries0 + 1, stats.overlay_settle_retries.load());
+    try testing.expectEqual(pub0, stats.overlay_publishes.load());
+    try testing.expect(w.f.map.seam().lookup(94, 0) == null);
+    try testing.expectEqual(used0, w.f.alloc_a.usedBlocks());
+    try testing.expectEqual(@as(u32, 0), w.ov.registry.open_count.load(.monotonic));
 }
 
 test "crash windows OW-1..OW-8 as RAM cases: an unpublished dest is reclaimable by the census (refcount 1, never named by the map), the old image intact; the fed-but-unsaved epoch ≡ OW-1; a swap durable with frees not run leaves a tracked A key the census free-lists; OW-7 durably written ≠ durably named" {

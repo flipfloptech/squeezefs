@@ -501,7 +501,12 @@ before device work (`:19882-19901`). Then:
 
 The write-arm form retries forever on transients with backoff `min(1 ms <<
 min(attempt, 6), 50 ms)`, fence immediate (`settle_overlay_block_write_arm
-:19834-19860`); the read/drain-venue form `SETTLE_RETRIES = 24` with `1 ms << min
+:19834-19860`). Ours polls the volume's FAILED latch (the plane's fence probe:
+the meta set's `is_failed` or a fenced device) on every transient and takes
+the fence arm when it is set — a transient on a FAILED volume never clears
+before the remount, and the daemon's teardown joins the settler (xfstests
+generic/475 with dm-error under the meta AND data slices: the gap seed's EIO
+retried past attempt 1024, the umount waited forever). The read/drain-venue form `SETTLE_RETRIES = 24` with `1 ms << min
 (attempt−1, 3)` backoff (`settle_overlay_block_converged :19786-19817`; the round-4
 budget of 4 "was a constant with no lineage"). **Epoch-close venue law**: the settle
 NEVER calls `close_rewrite_epoch` under the block guard — the guard-DROPPING caller

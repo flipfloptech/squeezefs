@@ -2833,9 +2833,9 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             // The staged arm rings the WHOLE file: its bound is the file's
             // reach — `max(size, end)` — never the write's end alone (a
             // file grown past the block by truncate rang a 5 MiB image no
-            // promotion could place: fstests generic/030, fsstress).
-            const reach = @max(end, (try self.readInode(local)).size);
-            if (self.data.stagingOn() and kind != .striped and reach <= self.block_size) {
+            // promotion could place: fstests generic/030, fsstress). A
+            // striped file never takes the arm: its reach is not read.
+            if (self.data.stagingOn() and kind != .striped and @max(end, (try self.readInode(local)).size) <= self.block_size) {
                 if (try self.writeStaged(c, local, a, rec, end, &layout_lock)) |w| return w;
                 // The ring cannot hold the image (no hole, the pool at its
                 // cap): the ring is a cache, never the set's capacity — the

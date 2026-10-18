@@ -825,9 +825,13 @@ pub const WritePath = struct {
         }
         const first: u32 = @intCast(req.offset / bs);
         const last: u32 = @intCast((end - 1) / bs);
-        // §8: the ENOSPC terminal law, decided for the WHOLE write.
+        // §8: the ENOSPC terminal law, decided for the WHOLE write. The
+        // custody probe (a map lookup per block) is asked only once the
+        // set's fresh supply is exhausted: with supply the law admits
+        // whatever it would answer.
         var cands: [router.MAX_VOLUMES]*block_alloc.BlockAllocator = undefined;
-        if (enospc.admitWrite(enospc.freshSupplyExhausted(self.vols.candidates(&cands)), self.writeWouldCreateFreshCustody(req.ino, req.file, first, last)) == .refuse_enospc) {
+        const exhausted = enospc.freshSupplyExhausted(self.vols.candidates(&cands));
+        if (enospc.admitWrite(exhausted, exhausted and self.writeWouldCreateFreshCustody(req.ino, req.file, first, last)) == .refuse_enospc) {
             stats.write_enospc_refusals.inc();
             return error.NoSpaceLeft;
         }

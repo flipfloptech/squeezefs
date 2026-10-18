@@ -87,6 +87,12 @@ pub const SlotHolderCache = struct {
     /// reaches the ledger only at the next cycle); a LOWER `g` than the
     /// table's is a stale view and ignored.
     learnt: std.AutoHashMapUnmanaged(u16, SlotHolder) = .empty,
+    /// `learnt`'s population, mirrored under the lock (release) and read
+    /// without it by `holderOf` (acquire): an empty map — every mount that
+    /// learnt no view, the hot path of every inode read's slot resolution
+    /// — skips the lock. A reader racing a `learn` reads as if it ran just
+    /// before it, which the lock allowed too.
+    learnt_n: std.atomic.Value(u32) = .init(0),
     /// Slots the manager answered UNLEASED to a joiner's `ResolveSlot`
     /// (the table knows nothing of them): remembered so the one ask per
     /// slot is not an ask per op; a grant seen later (`learn`) or a
@@ -124,6 +130,7 @@ pub const SlotHolderCache = struct {
         if (v.state == .unleased) if (self.table.reservedFor(slot, clock.monotonicNs())) |to| {
             out = .{ .appender_id = to, .g = v.g };
         };
+        if (self.learnt_n.load(.acquire) == 0) return out;
         self.lock.lock();
         defer self.lock.unlock();
         if (self.learnt.get(slot)) |l| {
@@ -142,6 +149,7 @@ pub const SlotHolderCache = struct {
         if (self.table.gOf(slot) > h.g) return;
         _ = self.known_unleased.remove(slot);
         try self.learnt.put(self.gpa, slot, h);
+        self.learnt_n.store(self.learnt.count(), .release);
     }
 
     /// A release observed (or the manager's "unleased"): the view drops
@@ -151,6 +159,7 @@ pub const SlotHolderCache = struct {
         self.lock.lock();
         defer self.lock.unlock();
         _ = self.learnt.remove(slot);
+        self.learnt_n.store(self.learnt.count(), .release);
         self.known_unleased.put(self.gpa, slot, {}) catch stats.slot_resolve_hint_drops.inc();
     }
 

@@ -130,6 +130,10 @@ pub const Nvmeof = union(enum) {
     share: NvmeofShare,
     unshare: struct { subnqn: []const u8 },
     list: struct { json: bool = false },
+    /// `status [--json]`: every fabric subsystem of the host with its
+    /// multipath head, its iopolicy and its paths (controller, address,
+    /// state, identity).
+    status: struct { json: bool = false },
     restore,
     adopt: struct { subnqn: []const u8 },
     target: NvmeofTarget,
@@ -197,9 +201,9 @@ pub const Tune = struct {
 pub const Config = union(enum) {
     show: struct { target: Target, json: bool = false },
     set_cache_paths: struct { target: Target, paths: []const u8, force: bool = false },
-    /// `set-fabric-endpoints <sqmeta-uri> vol-<tag>=<trtype>:<traddr>:<trsvcid>:<subnqn>…`
-    /// (`ops_nvmet_keys.md` §3.7, a PROPOSED design: the per-data-volume
-    /// `FabricEndpoint` inside `set_config`).
+    /// `set-fabric-endpoints <sqmeta-uri> vol-<tag>=<trtype>:<traddr>:<trsvcid>:<subnqn>[,<path>…]…`
+    /// (`ops_nvmet_keys.md` §3.7: the per-data-volume `FabricEndpoint`
+    /// inside `set_config` — one subsystem, one or more paths).
     set_fabric_endpoints: struct { target: Target, specs: RepeatList },
     get_fabric_endpoints: struct { target: Target, json: bool = false },
 };
@@ -447,7 +451,7 @@ pub const Refusal = union(enum) {
     /// `--pr-matrix` without `--peer`.
     matrix_without_peer,
     /// A `vol-<tag>=<trtype>:<traddr>:<trsvcid>:<subnqn>` spec that does not parse.
-    bad_endpoint_spec: []const u8,
+    bad_endpoint_spec: struct { word: []const u8, why: EndpointSpecRefusal },
 
     pub fn format(self: Refusal, w: *std.Io.Writer) std.Io.Writer.Error!void {
         switch (self) {
@@ -492,7 +496,12 @@ pub const Refusal = union(enum) {
             .bad_uuid => |u| try w.print("--ns-uuid '{s}' is not a uuid (8-4-4-4-12 hex)", .{u}),
             .identity_half => |f| try w.print("nvmeof connect: {s} given without its pair — hostnqn and hostid are PAIR-OR-NEITHER", .{f}),
             .matrix_without_peer => try w.writeAll("nvmeof resv-report: --pr-matrix needs --peer <second namespace node> (a second association under a DISTINCT host identity)"),
-            .bad_endpoint_spec => |s| try w.print("config set-fabric-endpoints: '{s}' is not vol-<16 hex>=<tcp|loop>:<traddr>:<trsvcid>:<subnqn>", .{s}),
+            .bad_endpoint_spec => |s| switch (s.why) {
+                .shape => try w.print("config set-fabric-endpoints: '{s}' is not vol-<16 hex>=<tcp|loop>:<traddr>:<trsvcid>:<subnqn>[,<tcp|loop>:<traddr>:<trsvcid>:<subnqn>…]", .{s.word}),
+                .subnqn_differs => |d| try w.print("config set-fabric-endpoints: '{s}' names two subsystems, '{s}' and '{s}' — every path of a volume reaches ONE subsystem (its paths merge under one multipath head); a second subsystem is another volume", .{ s.word, d.a, d.b }),
+                .repeated_path => |p| try w.print("config set-fabric-endpoints: '{s}' names the path '{s}' twice (the kernel answers a repeated connect EALREADY)", .{ s.word, p }),
+                .too_many_paths => try w.print("config set-fabric-endpoints: '{s}' names more than {d} paths (the `share` verb's listener cap)", .{ s.word, MAX_REPEAT }),
+            },
         }
     }
 };
@@ -542,6 +551,7 @@ pub fn usage(verb: ?std.meta.Tag(Verb)) []const u8 {
         \\  squeezefs nvmeof share [--subnqn NQN] [--transport tcp|loop] [--ip ADDR]… [--port N] [--allow-host NQN]… [--create-size SIZE] [--ns-uuid UUID] <backing>
         \\  squeezefs nvmeof unshare <subnqn>
         \\  squeezefs nvmeof list [--json]
+        \\  squeezefs nvmeof status [--json]
         \\  squeezefs nvmeof restore
         \\  squeezefs nvmeof adopt <subnqn>
         \\  squeezefs nvmeof target status [--json] | setup | systemd-unit | stop
@@ -553,7 +563,7 @@ pub fn usage(verb: ?std.meta.Tag(Verb)) []const u8 {
         \\  squeezefs key install [--force] sqmeta://<path> <keyfile|->
         \\  squeezefs key show sqmeta://<path>
         \\  squeezefs key check [--encrypt-key PATH|-] sqmeta://<path>
-        \\  squeezefs config set-fabric-endpoints sqmeta://<path> vol-<tag>=<tcp|loop>:<traddr>:<trsvcid>:<subnqn>…
+        \\  squeezefs config set-fabric-endpoints sqmeta://<path> vol-<tag>=<tcp|loop>:<traddr>:<trsvcid>:<subnqn>[,<path>…]…
         \\  squeezefs config get-fabric-endpoints [--json] sqmeta://<path>|<mountpoint>
         \\  squeezefs --version
         \\
@@ -562,7 +572,7 @@ pub fn usage(verb: ?std.meta.Tag(Verb)) []const u8 {
     return switch (v) {
         .format => "usage: squeezefs format [--single-writer] [--meta-node-kib 64|128|256|512|1024] [--meta-journal-mb N] [--block-size BYTES] [--compress none|lz4|zstd] [--encrypt none|aes-256-gcm|chacha20-poly1305 --encrypt-key PATH|-] [--disk-cache-paths a,b] [--force] sqmeta://<path> [sqdata://<path>…]\n",
         .mount => "usage: squeezefs mount [-o opt[,opt…]] [--daemon --log-file PATH [--supervise]] [--join host:port] [--encrypt-key PATH|-] sqmeta://<path> <mountpoint>\n",
-        .nvmeof => "usage: squeezefs nvmeof share [--subnqn NQN] [--transport tcp|loop] [--ip ADDR]… [--port N] [--allow-host NQN]… [--create-size SIZE] [--ns-uuid UUID] <backing>\n       squeezefs nvmeof unshare <subnqn>\n       squeezefs nvmeof list [--json]\n       squeezefs nvmeof restore\n       squeezefs nvmeof adopt <subnqn>\n       squeezefs nvmeof target status [--json] | setup | systemd-unit | stop\n       squeezefs nvmeof connect [--transport tcp|loop] [--ip ADDR] [--port N] [--hostnqn NQN --hostid UUID] [--host-traddr ADDR] [--host-iface IF] [--nr-io-queues N] [--ns-uuid UUID] <subnqn>\n       squeezefs nvmeof disconnect [--identity-only [--hostnqn NQN --hostid UUID]] <subnqn>\n       squeezefs nvmeof resv-report [--json] [--pr-matrix --peer <dev> [--force]] <dev>\n",
+        .nvmeof => "usage: squeezefs nvmeof share [--subnqn NQN] [--transport tcp|loop] [--ip ADDR]… [--port N] [--allow-host NQN]… [--create-size SIZE] [--ns-uuid UUID] <backing>\n       squeezefs nvmeof unshare <subnqn>\n       squeezefs nvmeof list [--json]\n       squeezefs nvmeof status [--json]\n       squeezefs nvmeof restore\n       squeezefs nvmeof adopt <subnqn>\n       squeezefs nvmeof target status [--json] | setup | systemd-unit | stop\n       squeezefs nvmeof connect [--transport tcp|loop] [--ip ADDR] [--port N] [--hostnqn NQN --hostid UUID] [--host-traddr ADDR] [--host-iface IF] [--nr-io-queues N] [--ns-uuid UUID] <subnqn>\n       squeezefs nvmeof disconnect [--identity-only [--hostnqn NQN --hostid UUID]] <subnqn>\n       squeezefs nvmeof resv-report [--json] [--pr-matrix --peer <dev> [--force]] <dev>\n",
         .storage => "usage: squeezefs storage list [--json]\n       squeezefs storage validate <path>\n",
         .key => "usage: squeezefs key install [--force] sqmeta://<path> <keyfile|->\n       squeezefs key show sqmeta://<path>\n       squeezefs key check [--encrypt-key PATH|-] sqmeta://<path>\n       squeezefs key tls-init [--name CA-NAME] [--force] <dir>\n       squeezefs key tls-issue --node NAME [--out DIR] [--force] <ca-dir>\n",
 
@@ -572,7 +582,7 @@ pub fn usage(verb: ?std.meta.Tag(Verb)) []const u8 {
         .df => "usage: squeezefs df [--json] sqmeta://<path>|<mountpoint>\n",
         .clone => "usage: squeezefs clone sqmeta://<path>|<mountpoint> /src/file /dest/file\n",
         .tune => "usage: squeezefs tune [--apply]\n",
-        .config => "usage: squeezefs config show [--json] sqmeta://<path>|<mountpoint>\n       squeezefs config set-cache-paths [--force] sqmeta://<path>|<mountpoint> <abs path>[,…]\n       squeezefs config set-fabric-endpoints sqmeta://<path> vol-<tag>=<tcp|loop>:<traddr>:<trsvcid>:<subnqn>…\n       squeezefs config get-fabric-endpoints [--json] sqmeta://<path>|<mountpoint>\n",
+        .config => "usage: squeezefs config show [--json] sqmeta://<path>|<mountpoint>\n       squeezefs config set-cache-paths [--force] sqmeta://<path>|<mountpoint> <abs path>[,…]\n       squeezefs config set-fabric-endpoints sqmeta://<path> vol-<tag>=<tcp|loop>:<traddr>:<trsvcid>:<subnqn>[,<path>…]…\n       squeezefs config get-fabric-endpoints [--json] sqmeta://<path>|<mountpoint>\n",
         .staging => "usage: squeezefs staging list [--json] sqmeta://<path>|<mountpoint>\n       squeezefs staging promote sqmeta://<path>\n",
         .claim_clear => "usage: squeezefs claim clear sqmeta://<path>\n",
         .appenders => "usage: squeezefs appenders [--json] sqmeta://<path>\n",
@@ -811,8 +821,9 @@ fn parseNvmeof(words: []const []const u8, diag: *Refusal) Error!Verb {
         const nqn = try exactlyOne(&c, "the subsystem NQN");
         return .{ .nvmeof = if (is_unshare) .{ .unshare = .{ .subnqn = nqn } } else .{ .adopt = .{ .subnqn = nqn } } };
     }
-    if (std.mem.eql(u8, sub, "list")) {
-        var c: Cursor = .{ .verb = "nvmeof list", .words = rest, .diag = diag };
+    if (std.mem.eql(u8, sub, "list") or std.mem.eql(u8, sub, "status")) {
+        const is_list = std.mem.eql(u8, sub, "list");
+        var c: Cursor = .{ .verb = if (is_list) "nvmeof list" else "nvmeof status", .words = rest, .diag = diag };
         var json = false;
         while (try c.step()) |f| {
             if (std.mem.eql(u8, f.name, "--json")) json = true else return c.unknown(f);
@@ -821,7 +832,7 @@ fn parseNvmeof(words: []const []const u8, diag: *Refusal) Error!Verb {
             diag.* = .{ .extra_positional = .{ .verb = c.verb, .word = c.pos()[0] } };
             return error.Refused;
         }
-        return .{ .nvmeof = .{ .list = .{ .json = json } } };
+        return .{ .nvmeof = if (is_list) .{ .list = .{ .json = json } } else .{ .status = .{ .json = json } } };
     }
     if (std.mem.eql(u8, sub, "restore")) {
         var c: Cursor = .{ .verb = "nvmeof restore", .words = rest, .diag = diag };
@@ -1027,16 +1038,38 @@ fn parseKey(words: []const []const u8, diag: *Refusal) Error!Verb {
     return error.Refused;
 }
 
-/// `vol-<16 hex>=<tcp|loop>:<traddr>:<trsvcid>:<subnqn>` (the traddr and
-/// trsvcid empty on loop: `vol-…=loop:::nqn.x`).
-pub const EndpointSpec = struct { vol_tag: u64, transport: Transport, traddr: []const u8, trsvcid: u16, subnqn: []const u8 };
+/// One path of an endpoint spec: `<tcp|loop>:<traddr>:<trsvcid>` (the
+/// traddr and trsvcid empty on loop: `loop::`).
+pub const EndpointPath = struct { transport: Transport, traddr: []const u8, trsvcid: u16 };
 
-pub fn parseEndpointSpec(word: []const u8) ?EndpointSpec {
-    const eq = std.mem.indexOfScalar(u8, word, '=') orelse return null;
-    const tag_text = word[0..eq];
-    if (!std.mem.startsWith(u8, tag_text, "vol-") or tag_text.len != 20) return null;
-    const vol_tag = std.fmt.parseInt(u64, tag_text[4..], 16) catch return null;
-    var it = std.mem.splitScalar(u8, word[eq + 1 ..], ':');
+/// `vol-<16 hex>=<path>[,<path>…]:<subnqn>` — one subsystem reached over
+/// one or more paths (one per target listener), every path naming the
+/// SAME subnqn: `vol-…=tcp:10.0.0.1:4420:nqn.x,tcp:10.0.1.1:4420:nqn.x`,
+/// `vol-…=loop:::nqn.x`.
+pub const EndpointSpec = struct {
+    vol_tag: u64,
+    subnqn: []const u8,
+    paths: [MAX_REPEAT]EndpointPath,
+    n: usize,
+
+    pub fn slice(self: *const EndpointSpec) []const EndpointPath {
+        return self.paths[0..self.n];
+    }
+};
+
+/// Why a spec is refused, for the refusal text: the shape itself, two
+/// paths naming different subsystems (both named), or one path twice.
+pub const EndpointSpecRefusal = union(enum) {
+    shape,
+    subnqn_differs: struct { a: []const u8, b: []const u8 },
+    repeated_path: []const u8,
+    too_many_paths,
+};
+
+/// One `<tcp|loop>:<traddr>:<trsvcid>:<subnqn>` word; null on a shape
+/// outside the grammar.
+fn parseEndpointPath(word: []const u8, out: *EndpointPath) ?[]const u8 {
+    var it = std.mem.splitScalar(u8, word, ':');
     const tr_text = it.next() orelse return null;
     const transport: Transport = if (std.mem.eql(u8, tr_text, "tcp")) .tcp else if (std.mem.eql(u8, tr_text, "loop")) .loop else return null;
     const traddr = it.next() orelse return null;
@@ -1046,7 +1079,44 @@ pub fn parseEndpointSpec(word: []const u8) ?EndpointSpec {
     const trsvcid: u16 = if (svc_text.len == 0) 0 else std.fmt.parseInt(u16, svc_text, 10) catch return null;
     if (transport == .tcp and (traddr.len == 0 or trsvcid == 0)) return null;
     if (transport == .loop and (traddr.len != 0 or svc_text.len != 0)) return null;
-    return .{ .vol_tag = vol_tag, .transport = transport, .traddr = traddr, .trsvcid = trsvcid, .subnqn = subnqn };
+    out.* = .{ .transport = transport, .traddr = traddr, .trsvcid = trsvcid };
+    return subnqn;
+}
+
+pub fn parseEndpointSpecDiag(word: []const u8, why: *EndpointSpecRefusal) ?EndpointSpec {
+    why.* = .shape;
+    const eq = std.mem.indexOfScalar(u8, word, '=') orelse return null;
+    const tag_text = word[0..eq];
+    if (!std.mem.startsWith(u8, tag_text, "vol-") or tag_text.len != 20) return null;
+    var spec: EndpointSpec = .{ .vol_tag = std.fmt.parseInt(u64, tag_text[4..], 16) catch return null, .subnqn = "", .paths = undefined, .n = 0 }; // vol-<16 hex>
+    var it = std.mem.splitScalar(u8, word[eq + 1 ..], ',');
+    while (it.next()) |path_word| {
+        if (spec.n == MAX_REPEAT) {
+            why.* = .too_many_paths;
+            return null;
+        }
+        const nqn = parseEndpointPath(path_word, &spec.paths[spec.n]) orelse return null;
+        if (spec.n == 0) {
+            spec.subnqn = nqn;
+        } else if (!std.mem.eql(u8, nqn, spec.subnqn)) {
+            why.* = .{ .subnqn_differs = .{ .a = spec.subnqn, .b = nqn } };
+            return null;
+        }
+        const p = spec.paths[spec.n];
+        for (spec.paths[0..spec.n]) |q| {
+            if (q.transport == p.transport and q.trsvcid == p.trsvcid and std.mem.eql(u8, q.traddr, p.traddr)) {
+                why.* = .{ .repeated_path = path_word };
+                return null;
+            }
+        }
+        spec.n += 1;
+    }
+    return spec;
+}
+
+pub fn parseEndpointSpec(word: []const u8) ?EndpointSpec {
+    var why: EndpointSpecRefusal = undefined;
+    return parseEndpointSpecDiag(word, &why);
 }
 
 /// A set-level target: a `sqmeta://` URI (validated by the ONE parser) or
@@ -1206,8 +1276,9 @@ fn parseConfig(words: []const []const u8, diag: *Refusal) Error!Verb {
         }
         var specs: RepeatList = .{};
         for (pos[1..]) |word| {
-            if (parseEndpointSpec(word) == null) {
-                diag.* = .{ .bad_endpoint_spec = word };
+            var why: EndpointSpecRefusal = undefined;
+            if (parseEndpointSpecDiag(word, &why) == null) {
+                diag.* = .{ .bad_endpoint_spec = .{ .word = word, .why = why } };
                 return error.Refused;
             }
             if (specs.n == MAX_REPEAT) {
@@ -2297,6 +2368,9 @@ test "nvmeof: share collects repeatable --ip/--allow-host, parses --transport/--
     try testing.expectEqualStrings("nqn.x", u.nvmeof.unshare.subnqn);
     const l = try parse(av(&.{ "nvmeof", "list", "--json" }), &d);
     try testing.expect(l.nvmeof.list.json);
+    try testing.expect((try parse(av(&.{ "nvmeof", "status", "--json" }), &d)).nvmeof.status.json);
+    try testing.expect(!(try parse(av(&.{ "nvmeof", "status" }), &d)).nvmeof.status.json);
+    try testing.expect((try refusal(av(&.{ "nvmeof", "status", "extra" }))) == .extra_positional);
     try testing.expect((try parse(av(&.{ "nvmeof", "restore" }), &d)).nvmeof == .restore);
     try testing.expectEqualStrings("nqn.y", (try parse(av(&.{ "nvmeof", "adopt", "nqn.y" }), &d)).nvmeof.adopt.subnqn);
     try testing.expect((try parse(av(&.{ "nvmeof", "target", "status", "--json" }), &d)).nvmeof.target.status.json);
@@ -2344,13 +2418,48 @@ test "nvmeof: share collects repeatable --ip/--allow-host, parses --transport/--
     try testing.expectEqual(@as(usize, 2), fe.config.set_fabric_endpoints.specs.n);
     const spec = parseEndpointSpec("vol-0123456789abcdef=tcp:127.0.0.1:4420:nqn.x").?;
     try testing.expectEqual(@as(u64, 0x0123456789abcdef), spec.vol_tag);
-    try testing.expectEqual(@as(u16, 4420), spec.trsvcid);
+    try testing.expectEqual(@as(usize, 1), spec.n);
+    try testing.expectEqual(@as(u16, 4420), spec.slice()[0].trsvcid);
+    try testing.expectEqualStrings("127.0.0.1", spec.slice()[0].traddr);
     try testing.expectEqualStrings("nqn.x", spec.subnqn);
     try testing.expect(parseEndpointSpec("vol-01=tcp:1:2:nqn.x") == null);
     try testing.expect(parseEndpointSpec("vol-0123456789abcdef=tcp::4420:nqn.x") == null);
     try testing.expect(parseEndpointSpec("vol-0123456789abcdef=loop:1::nqn.x") == null);
     try testing.expect((try refusal(av(&.{ "config", "set-fabric-endpoints", "sqmeta:///dev/m", "junk" }))) == .bad_endpoint_spec);
     try testing.expect((try parse(av(&.{ "config", "get-fabric-endpoints", "--json", "/mnt" }), &d)).config.get_fabric_endpoints.json);
+}
+
+test "endpoint specs with several paths: two tcp paths of one subsystem parse in order; a path naming another subsystem refuses naming both; a repeated path refuses naming it; a 17th path refuses; a trailing comma is a shape refusal; loop and tcp paths mix" {
+    const two = parseEndpointSpec("vol-0123456789abcdef=tcp:10.0.0.1:4420:nqn.x,tcp:10.0.1.1:4421:nqn.x").?;
+    try testing.expectEqual(@as(usize, 2), two.n);
+    try testing.expectEqualStrings("10.0.0.1", two.slice()[0].traddr);
+    try testing.expectEqualStrings("10.0.1.1", two.slice()[1].traddr);
+    try testing.expectEqual(@as(u16, 4421), two.slice()[1].trsvcid);
+    try testing.expectEqualStrings("nqn.x", two.subnqn);
+    var why: EndpointSpecRefusal = undefined;
+    try testing.expect(parseEndpointSpecDiag("vol-0123456789abcdef=tcp:10.0.0.1:4420:nqn.x,tcp:10.0.1.1:4420:nqn.y", &why) == null);
+    try testing.expectEqualStrings("nqn.x", why.subnqn_differs.a);
+    try testing.expectEqualStrings("nqn.y", why.subnqn_differs.b);
+    try testing.expect(parseEndpointSpecDiag("vol-0123456789abcdef=tcp:10.0.0.1:4420:nqn.x,tcp:10.0.0.1:4420:nqn.x", &why) == null);
+    try testing.expectEqualStrings("tcp:10.0.0.1:4420:nqn.x", why.repeated_path);
+    try testing.expect(parseEndpointSpecDiag("vol-0123456789abcdef=tcp:10.0.0.1:4420:nqn.x,", &why) == null);
+    try testing.expect(why == .shape);
+    var many: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer many.deinit();
+    try many.writer.writeAll("vol-0123456789abcdef=");
+    for (0..MAX_REPEAT + 1) |i| try many.writer.print("{s}tcp:10.0.0.{d}:4420:nqn.x", .{ if (i == 0) "" else ",", i });
+    try testing.expect(parseEndpointSpecDiag(many.written(), &why) == null);
+    try testing.expect(why == .too_many_paths);
+    const mixed = parseEndpointSpec("vol-0123456789abcdef=loop:::nqn.x,tcp:10.0.0.1:4420:nqn.x").?;
+    try testing.expectEqual(@as(usize, 2), mixed.n);
+    try testing.expectEqual(Transport.loop, mixed.slice()[0].transport);
+    var d: Refusal = undefined;
+    const fe = try parse(av(&.{ "config", "set-fabric-endpoints", "sqmeta:///dev/m", "vol-0123456789abcdef=tcp:10.0.0.1:4420:nqn.x,tcp:10.0.1.1:4420:nqn.x" }), &d);
+    try testing.expectEqual(@as(usize, 1), fe.config.set_fabric_endpoints.specs.n);
+    const r = try refusal(av(&.{ "config", "set-fabric-endpoints", "sqmeta:///dev/m", "vol-0123456789abcdef=tcp:10.0.0.1:4420:nqn.x,tcp:10.0.1.1:4420:nqn.y" }));
+    try testing.expect(r == .bad_endpoint_spec and r.bad_endpoint_spec.why == .subnqn_differs);
+    var buf: [512]u8 = undefined;
+    try testing.expect(std.mem.indexOf(u8, text(&buf, r), "'nqn.x' and 'nqn.y'") != null);
 }
 
 test "usage names every verb" {

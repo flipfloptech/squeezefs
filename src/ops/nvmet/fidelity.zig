@@ -52,6 +52,7 @@ const lease_clock = @import("../../meta/guard/lease_clock.zig");
 const configfs = @import("configfs.zig");
 const ledger = @import("ledger.zig");
 const initiator = @import("initiator.zig");
+const multipath = @import("multipath.zig");
 
 comptime {
     if (builtin.os.tag != .linux) @compileError("ops/nvmet/fidelity is Linux only (charter §1.2); gate the import on builtin.os.tag");
@@ -192,6 +193,15 @@ const Rig = struct {
         for (self.connects.items) |*c| disconnectQuiet(c);
         self.connects.deinit(self.gpa);
         for (self.shares.items) |s| {
+            // Every controller of a harness subsystem is the harness's own
+            // (a killed daemon's associations included): deleted before
+            // the share goes, so a failed leg leaves no controller behind.
+            const ctrls = initiator.listControllers(self.gpa, initiator.SYSFS_ROOT) catch &.{};
+            defer self.gpa.free(ctrls);
+            for (ctrls) |c| if (std.mem.eql(u8, c.subsysnqnOf(), s)) {
+                initiator.deleteController(c.instance) catch {};
+                _ = initiator.awaitControllerGone(c.instance);
+            };
             // The verb first; a share whose record a leg deleted (the
             // ledger-loss rows) is torn down by the walk — the harness's
             // own objects are its own to remove.
@@ -266,12 +276,19 @@ const Rig = struct {
 
     /// An env with the second identity pair.
     fn envWith(self: *Rig, ident: initiator.HostPair) !std.process.Environ.Map {
+        var e = try self.envWithKnob(hostnqn_knob, ident.hostnqn);
+        errdefer e.deinit();
+        try e.put(hostid_knob, ident.hostid);
+        return e;
+    }
+
+    /// The rig's env plus one knob row.
+    fn envWithKnob(self: *Rig, key: []const u8, value: []const u8) !std.process.Environ.Map {
         var e = std.process.Environ.Map.init(self.gpa);
         errdefer e.deinit();
         var it = self.env.iterator();
         while (it.next()) |kv| try e.put(kv.key_ptr.*, kv.value_ptr.*);
-        try e.put(hostnqn_knob, ident.hostnqn);
-        try e.put(hostid_knob, ident.hostid);
+        try e.put(key, value);
         return e;
     }
 
@@ -350,6 +367,12 @@ const Rig = struct {
     }
 
     fn connect(self: *Rig, nqn: []const u8, transport: configfs.Trtype, port: u16, ident: ?initiator.HostPair, extra: []const []const u8) !Connected {
+        return self.connectAt(nqn, transport, "127.0.0.1", port, ident, extra);
+    }
+
+    /// `nvmeof connect` to one listener address (a second path of a share
+    /// connected by hand — the metadata volume's multipath).
+    fn connectAt(self: *Rig, nqn: []const u8, transport: configfs.Trtype, ip: []const u8, port: u16, ident: ?initiator.HostPair, extra: []const []const u8) !Connected {
         var env_b: ?std.process.Environ.Map = if (ident) |i| try self.envWith(i) else null;
         defer if (env_b) |*e| e.deinit();
         var argv: [16][]const u8 = undefined;
@@ -364,7 +387,7 @@ const Rig = struct {
             n += 2;
         } else {
             argv[n] = "--ip";
-            argv[n + 1] = "127.0.0.1";
+            argv[n + 1] = ip;
             argv[n + 2] = "--port";
             argv[n + 3] = try std.fmt.bufPrint(&pb, "{d}", .{port});
             n += 4;
@@ -390,6 +413,7 @@ const Rig = struct {
         }
         @memcpy(c.subnqn[0..nqn.len], nqn);
         c.subnqn_len = nqn.len;
+        if (lineAfter(r.stdout, "  timeouts ") == null) return error.ConnectOutput;
         const dev = lineAfter(r.stdout, "  device ") orelse return error.ConnectOutput;
         @memcpy(c.device[0..dev.len], dev);
         c.device_len = dev.len;
@@ -518,6 +542,14 @@ const Rig = struct {
     // ---- daemons (foreground mounts) ----
 
     fn spawnMount(self: *Rig, name: []const u8, meta_uri: []const u8, ident: ?initiator.HostPair, extra: []const []const u8) !usize {
+        var env_b: ?std.process.Environ.Map = if (ident) |i| try self.envWith(i) else null;
+        defer if (env_b) |*e| e.deinit();
+        return self.spawnMountEnv(name, meta_uri, if (env_b) |*e| e else &self.env, extra);
+    }
+
+    /// A foreground mount under an explicit environment (a knob row set
+    /// beside the rig's identity).
+    fn spawnMountEnv(self: *Rig, name: []const u8, meta_uri: []const u8, env: *const std.process.Environ.Map, extra: []const []const u8) !usize {
         const mp = try std.fmt.allocPrintSentinel(self.gpa, "{s}/mnt-{s}", .{ self.root, name }, 0);
         errdefer self.gpa.free(mp);
         _ = linux.mkdir(mp.ptr, 0o755);
@@ -525,8 +557,6 @@ const Rig = struct {
         errdefer self.gpa.free(log_path);
         const log_file = try Io.Dir.cwd().createFile(self.io, log_path, .{ .truncate = false });
         errdefer log_file.close(self.io);
-        var env_b: ?std.process.Environ.Map = if (ident) |i| try self.envWith(i) else null;
-        defer if (env_b) |*e| e.deinit();
         var argv: [16][]const u8 = undefined;
         var n: usize = 0;
         argv[n] = self.bin;
@@ -539,7 +569,7 @@ const Rig = struct {
         argv[n] = meta_uri;
         argv[n + 1] = mp;
         n += 2;
-        const child = try std.process.spawn(self.io, .{ .argv = argv[0..n], .environ_map = if (env_b) |*e| e else &self.env, .stdin = .ignore, .stdout = .{ .file = log_file }, .stderr = .{ .file = log_file } });
+        const child = try std.process.spawn(self.io, .{ .argv = argv[0..n], .environ_map = env, .stdin = .ignore, .stdout = .{ .file = log_file }, .stderr = .{ .file = log_file } });
         try self.daemons.append(self.gpa, .{ .child = child, .pid = child.id.?, .log_path = log_path, .mp = mp, .log_file = log_file });
         return self.daemons.items.len - 1;
     }
@@ -1018,7 +1048,7 @@ fn daemonConnectLeg(transport: configfs.Trtype) !void {
     try testing.expectEqual(@as(?u64, 0), json_scan.number(st, "fabric_daemon_reuses"));
     try testing.expectEqual(@as(?u64, 0), json_scan.number(st, "fabric_ladder_refusals"));
     var needle: [320]u8 = undefined;
-    try testing.expect(std.mem.indexOf(u8, st, try std.fmt.bufPrint(&needle, "\"subnqn\":\"{s}\",\"instance\":", .{data_nqn})) != null);
+    try testing.expect(std.mem.indexOf(u8, st, try std.fmt.bufPrint(&needle, "\"subnqn\":\"{s}\",\"device\":", .{data_nqn})) != null);
     try testing.expect(std.mem.indexOf(u8, st, "\"reused\":false") != null);
     try testing.expectEqual(@as(u32, 1), try rig.controllersOf(data_nqn, ident_a));
     const sum = try rig.onMount(a, "head -c 8388608 /dev/urandom > payload && sync -f . && cksum payload | cut -d' ' -f1");
@@ -1062,6 +1092,281 @@ test "nvmet fidelity: daemon-connect-loop — a mount by endpoint record with NO
 
 test "nvmet fidelity: daemon-connect-tcp — the same over nvmet-tcp on 127.0.0.1" {
     try daemonConnectLeg(.tcp);
+}
+
+/// `share --ip A --ip B …` of a RAM-backed file (`/build/tmp` is the
+/// venue's RAM-backed scratch on a ≥ 64 GiB host) under the harness NQN;
+/// recorded in the manifest, the backing removed with the rig.
+fn shareMulti(rig: *Rig, name: []const u8, size: u64, ips: []const []const u8, port: u16, backing: []const u8) ![]u8 {
+    var nb: [256]u8 = undefined;
+    const nqn = rig.nqnFor(&nb, name);
+    var sb: [32]u8 = undefined;
+    const size_text = try std.fmt.bufPrint(&sb, "{d}", .{size});
+    var pb: [8]u8 = undefined;
+    const port_text = try std.fmt.bufPrint(&pb, "{d}", .{port});
+    var argv: [24][]const u8 = undefined;
+    var n: usize = 0;
+    for ([_][]const u8{ "nvmeof", "share", "--subnqn", nqn }) |a| {
+        argv[n] = a;
+        n += 1;
+    }
+    for (ips) |ip| {
+        argv[n] = "--ip";
+        argv[n + 1] = ip;
+        n += 2;
+    }
+    for ([_][]const u8{ "--port", port_text, "--create-size", size_text, backing }) |a| {
+        argv[n] = a;
+        n += 1;
+    }
+    const out = try rig.sqzOk(argv[0..n]);
+    defer rig.gpa.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "shared ") != null);
+    for (ips) |ip| {
+        var needle: [64]u8 = undefined;
+        try testing.expect(std.mem.indexOf(u8, out, try std.fmt.bufPrint(&needle, "listener tcp {s}:{d}", .{ ip, port })) != null);
+    }
+    const owned = try rig.gpa.dupe(u8, nqn);
+    try rig.shares.append(rig.gpa, owned);
+    return owned;
+}
+
+/// The instances of `nqn`'s controllers under `ident`, ascending.
+fn instancesOf(rig: *Rig, nqn: []const u8, ident: initiator.HostPair, out: *[16]u32) ![]const u32 {
+    const ctrls = try initiator.listControllers(rig.gpa, initiator.SYSFS_ROOT);
+    defer rig.gpa.free(ctrls);
+    var n: usize = 0;
+    for (ctrls) |c| {
+        if (!std.mem.eql(u8, c.subsysnqnOf(), nqn) or !c.hasIdentity(ident.hostnqn, ident.hostid) or n == out.len) continue;
+        out[n] = c.instance;
+        n += 1;
+    }
+    std.mem.sort(u32, out[0..n], {}, std.sort.asc(u32));
+    return out[0..n];
+}
+
+/// The per-path block stats of `instances`, each path's hidden node
+/// awaited (the kernel's scan of a later path is asynchronous).
+fn pathStats(rig: *Rig, instances: []const u32, nodes: *[16][32]u8, out: *[16]multipath.BlockStat) !void {
+    const deadline = clock.monotonicNs() + ready_wait_ns;
+    for (instances, 0..) |inst, i| {
+        nodes[i] = @splat(0);
+        while (true) {
+            if (try multipath.pathNode(rig.gpa, initiator.SYSFS_ROOT, inst, &nodes[i])) |node| {
+                if (multipath.readNodeStat(initiator.SYSFS_ROOT, inst, node)) |st| {
+                    out[i] = st;
+                    break;
+                }
+            }
+            if (clock.monotonicNs() >= deadline) return error.PathNodeTimeout;
+            sleepMs(50);
+        }
+    }
+}
+
+test "nvmet fidelity: multipath-tcp — RAM-backed metadata and data shares with TWO tcp listeners each (127.0.0.1 and 127.0.0.2); the metadata head connected by hand on both paths under the one pair (rule 2 per path accepts, fabric_meta_bound lists both live, the policy set on it too); the data endpoint record naming both paths plus a DEAD third (127.0.0.3, no listener): the daemon connects both under its one identity (fabric_daemon_connects 2, fabric_paths_degraded 1, fabric_paths_live 2) and ONE head serves them (one nvme-subsys, both hidden path nodes under it); iopolicy as configured (round-robin written and read back) → a parallel write workload lands sectors on BOTH paths; kill -9 → remount REUSES both paths (fabric_daemon_reuses 2) → a cold read-back lands read sectors on BOTH; umount releases both → a mount under the DEFAULT policy reconnects both, reads queue-depth back and its cold reads are measured per path; `nvmeof status` names the subsystem, its policy and every path; zero residue" {
+    const gpa = testing.allocator;
+    var rig = try venue(gpa, testing.io);
+    defer rig.deinit();
+    if (multipath.readMultipathParam() != .on) return testkit.skip(@src(), .no_kernel_feature, "nvme_core.multipath is not Y on this kernel (no native multipath head)");
+    const ports = try rig.servicePorts(.tcp);
+    var bb: [linux.PATH_MAX]u8 = undefined;
+    var mbb: [linux.PATH_MAX]u8 = undefined;
+    const meta_backing = try std.fmt.bufPrintSentinel(&mbb, "/build/tmp/fideli-mpath-meta-{d}.img", .{rig.pid}, 0);
+    defer _ = linux.unlink(meta_backing.ptr);
+    const backing = try std.fmt.bufPrintSentinel(&bb, "/build/tmp/fideli-mpath-{d}.img", .{rig.pid}, 0);
+    defer _ = linux.unlink(backing.ptr);
+    // The METADATA share too has two listeners: the operator connects both
+    // paths by hand under the one pair (the product's own initiator, the
+    // timeouts it derives) and the mount meets a head.
+    const meta_nqn = try shareMulti(rig, "mpmeta", meta_len, &.{ "127.0.0.1", "127.0.0.2" }, ports[0], meta_backing);
+    const data_nqn = try shareMulti(rig, "mpdata", data_len, &.{ "127.0.0.1", "127.0.0.2" }, ports[1], backing);
+    const cm = try rig.connect(meta_nqn, .tcp, ports[0], null, &.{});
+    const cm2 = try rig.connectAt(meta_nqn, .tcp, "127.0.0.2", ports[0], null, &.{});
+    try testing.expectEqualStrings(cm.dev(), cm2.dev());
+    try testing.expectEqual(@as(u32, 2), try rig.controllersOf(meta_nqn, ident_a));
+    const cd = try rig.connect(data_nqn, .tcp, ports[1], null, &.{});
+    var mu: [64]u8 = undefined;
+    var du: [64]u8 = undefined;
+    const meta_uri = try std.fmt.bufPrint(&mu, "sqmeta://{s}", .{cm.dev()});
+    const data_uri = try std.fmt.bufPrint(&du, "sqdata://{s}", .{cd.dev()});
+    const fmt_out = try rig.sqzOk(&.{ "format", "--single-writer", meta_uri, data_uri });
+    gpa.free(fmt_out);
+    // The record: both live paths and a dead one, one subsystem.
+    {
+        const show = try rig.sqzOk(&.{ "config", "show", "--json", meta_uri });
+        defer gpa.free(show);
+        const tag = json_scan.string(show, "vol_tag") orelse return error.NoVolTag;
+        var spec: [1024]u8 = undefined;
+        const word = try std.fmt.bufPrint(&spec, "{s}=tcp:127.0.0.1:{d}:{s},tcp:127.0.0.2:{d}:{s},tcp:127.0.0.3:{d}:{s}", .{ tag, ports[1], data_nqn, ports[1], data_nqn, ports[1], data_nqn });
+        const out = try rig.sqzOk(&.{ "config", "set-fabric-endpoints", meta_uri, word });
+        defer gpa.free(out);
+        try testing.expect(std.mem.indexOf(u8, out, "(3 paths)") != null);
+        const get = try rig.sqzOk(&.{ "config", "get-fabric-endpoints", "--json", meta_uri });
+        defer gpa.free(get);
+        try testing.expect(std.mem.indexOf(u8, get, "\"traddr\":\"127.0.0.1\"") != null and std.mem.indexOf(u8, get, "\"traddr\":\"127.0.0.2\"") != null and std.mem.indexOf(u8, get, "\"traddr\":\"127.0.0.3\"") != null);
+        const get_text = try rig.sqzOk(&.{ "config", "get-fabric-endpoints", meta_uri });
+        defer gpa.free(get_text);
+        try testing.expectEqual(@as(usize, 3), std.mem.count(u8, get_text, "  path tcp:127.0.0."));
+    }
+    try rig.disconnect(&cd);
+    try testing.expectEqual(@as(u32, 0), try rig.controllersOf(data_nqn, null));
+    // Mount A under `round-robin` (every bio alternates, so both paths
+    // carry bytes whatever the daemon's in-flight depth — the
+    // deterministic assertion); two paths up, the dead one loud.
+    var env_rr = try rig.envWithKnob("SQUEEZEFS_FABRIC_IOPOLICY", "round-robin");
+    defer env_rr.deinit();
+    const a = try rig.spawnMountEnv("mp-a", meta_uri, &env_rr, &.{});
+    try rig.awaitLog(a, "ready: ", ready_wait_ns);
+    const st = try rig.stats(a);
+    defer gpa.free(st);
+    try testing.expectEqual(@as(?u64, 2), json_scan.number(st, "fabric_daemon_connects"));
+    try testing.expectEqual(@as(?u64, 0), json_scan.number(st, "fabric_daemon_reuses"));
+    try testing.expectEqual(@as(?u64, 1), json_scan.number(st, "fabric_paths_degraded"));
+    // 2 data paths + the metadata head's 2 paths.
+    try testing.expectEqual(@as(?u64, 4), json_scan.number(st, "fabric_paths_live"));
+    try testing.expectEqual(@as(?u64, 2), json_scan.number(st, "fabric_iopolicy_sets"));
+    try testing.expectEqual(@as(?u64, 0), json_scan.number(st, "fabric_iopolicy_failures"));
+    try testing.expect(std.mem.indexOf(u8, st, "\"iopolicy\":\"round-robin\",\"paths_failed\":1,\"paths\":[{\"instance\":") != null);
+    {
+        // The metadata head: judged per path under the pair, its policy
+        // set, both paths listed live.
+        var needle: [400]u8 = undefined;
+        try testing.expect(std.mem.indexOf(u8, st, try std.fmt.bufPrint(&needle, "\"fabric_meta_bound\":[{{\"path\":\"{s}\",\"subsystem\":\"nvme-subsys", .{cm.dev()})) != null);
+        try testing.expect(std.mem.indexOf(u8, st, try std.fmt.bufPrint(&needle, "\"subsysnqn\":\"{s}\",\"iopolicy\":\"round-robin\",\"paths\":[{{\"instance\":{d},\"transport\":\"tcp\",\"traddr\":\"127.0.0.1\",\"trsvcid\":\"{d}\",\"state\":\"live\"}},{{\"instance\":{d},\"transport\":\"tcp\",\"traddr\":\"127.0.0.2\",\"trsvcid\":\"{d}\",\"state\":\"live\"}}]}}", .{ meta_nqn, cm.instance, ports[0], cm2.instance, ports[0] })) != null);
+        var msb: [32]u8 = undefined;
+        const meta_sub = (try multipath.subsystemOf(gpa, initiator.SYSFS_ROOT, cm.instance, &msb)).?;
+        var mpb: [32]u8 = undefined;
+        try testing.expectEqualStrings("round-robin", multipath.readIopolicy(initiator.SYSFS_ROOT, meta_sub, &mpb).?);
+        const log_a = try rig.readLog(a);
+        defer gpa.free(log_a);
+        try testing.expect(std.mem.indexOf(u8, log_a, "(2 path(s) under this mount's identity pair): iopolicy round-robin") != null);
+        try testing.expect(std.mem.indexOf(u8, log_a, "fast_io_fail_tmo 45 s, ctrl_loss_tmo 90 s, reconnect_delay 10 s") != null);
+    }
+    try testing.expect(std.mem.indexOf(u8, st, "\"traddr\":\"127.0.0.1\"") != null and std.mem.indexOf(u8, st, "\"traddr\":\"127.0.0.2\"") != null);
+    {
+        const log_a = try rig.readLog(a);
+        defer gpa.free(log_a);
+        try testing.expect(std.mem.indexOf(u8, log_a, "DEGRADED — 1 of 3 path(s)") != null);
+        try testing.expect(std.mem.indexOf(u8, log_a, "127.0.0.3") != null);
+    }
+    // Two controllers under our identity, ONE head: both hidden path nodes
+    // name the same head and one subsystem dir lists both.
+    var ib: [16]u32 = undefined;
+    const insts = try instancesOf(rig, data_nqn, ident_a, &ib);
+    try testing.expectEqual(@as(usize, 2), insts.len);
+    var nodes: [16][32]u8 = @splat(@splat(0));
+    var before: [16]multipath.BlockStat = undefined;
+    try pathStats(rig, insts, &nodes, &before);
+    const n0 = multipath.splitPathNodeName(std.mem.sliceTo(&nodes[0], 0)) orelse return error.NotAPathNode;
+    const n1 = multipath.splitPathNodeName(std.mem.sliceTo(&nodes[1], 0)) orelse return error.NotAPathNode;
+    try testing.expectEqual(n0.head, n1.head);
+    var sb0: [32]u8 = undefined;
+    var sb1: [32]u8 = undefined;
+    const sub0 = (try multipath.subsystemOf(gpa, initiator.SYSFS_ROOT, insts[0], &sb0)).?;
+    const sub1 = (try multipath.subsystemOf(gpa, initiator.SYSFS_ROOT, insts[1], &sb1)).?;
+    try testing.expectEqualStrings(sub0, sub1);
+    var hb: [32]u8 = undefined;
+    var head_dev: [40]u8 = undefined;
+    const head = (try multipath.headOf(gpa, initiator.SYSFS_ROOT, sub0, &hb)).?;
+    try testing.expect(std.mem.indexOf(u8, st, try std.fmt.bufPrint(&head_dev, "\"device\":\"/dev/{s}\"", .{head})) != null);
+    var pb: [32]u8 = undefined;
+    try testing.expectEqualStrings("round-robin", multipath.readIopolicy(initiator.SYSFS_ROOT, sub0, &pb).?);
+    const hv = try multipath.headVerdict(gpa, initiator.SYSFS_ROOT, insts, ident_a, &sb0);
+    try testing.expectEqual(multipath.HeadVerdict.exactly_ours, hv.verdict);
+    // `nvmeof status`: the subsystem, its policy, both paths.
+    {
+        const sj = try rig.sqzOk(&.{ "nvmeof", "status", "--json" });
+        defer gpa.free(sj);
+        var needle: [320]u8 = undefined;
+        try testing.expect(std.mem.indexOf(u8, sj, try std.fmt.bufPrint(&needle, "\"subsysnqn\":\"{s}\",\"iopolicy\":\"round-robin\",\"head\":\"/dev/{s}\"", .{ data_nqn, head })) != null);
+        try testing.expect(std.mem.indexOf(u8, sj, "\"traddr\":\"127.0.0.1\"") != null and std.mem.indexOf(u8, sj, "\"traddr\":\"127.0.0.2\"") != null);
+        const stx = try rig.sqzOk(&.{ "nvmeof", "status" });
+        defer gpa.free(stx);
+        try testing.expect(std.mem.indexOf(u8, stx, try std.fmt.bufPrint(&needle, "{s} {s}\n  iopolicy round-robin; head {s}; 2 path(s)\n", .{ sub0, data_nqn, head })) != null);
+    }
+    // The write workload: four 64 MiB files in parallel, synced.
+    const sums = try rig.onMount(a, "for i in 1 2 3 4; do head -c 67108864 /dev/urandom > p$i & done; wait; sync -f . && cksum p1 p2 p3 p4 | cut -d' ' -f1");
+    defer gpa.free(sums);
+    var after_write: [16]multipath.BlockStat = undefined;
+    try pathStats(rig, insts, &nodes, &after_write);
+    const w0 = after_write[0].write_sectors - before[0].write_sectors;
+    const w1 = after_write[1].write_sectors - before[1].write_sectors;
+    std.debug.print("\nmultipath-tcp: {s} ({s}) round-robin, 4 × 64 MiB written: write sectors per path nvme{d} {d}, nvme{d} {d}\n", .{ sub0, head, insts[0], w0, insts[1], w1 });
+    try testing.expect(w0 > 0 and w1 > 0);
+    // kill -9 → remount: both paths REUSED (never a second connect), the
+    // dead one degraded again; the cold read-back of every file is a
+    // device read on both paths.
+    try rig.kill9(a);
+    try testing.expectEqual(@as(u32, 2), try rig.controllersOf(data_nqn, ident_a));
+    const a2 = try rig.spawnMountEnv("mp-a2", meta_uri, &env_rr, &.{});
+    try rig.awaitLog(a2, "ready: ", ready_wait_ns);
+    const st2 = try rig.stats(a2);
+    defer gpa.free(st2);
+    try testing.expectEqual(@as(?u64, 0), json_scan.number(st2, "fabric_daemon_connects"));
+    try testing.expectEqual(@as(?u64, 2), json_scan.number(st2, "fabric_daemon_reuses"));
+    try testing.expectEqual(@as(?u64, 1), json_scan.number(st2, "fabric_paths_degraded"));
+    try testing.expectEqual(@as(?u64, 4), json_scan.number(st2, "fabric_paths_live"));
+    try testing.expectEqual(@as(u32, 2), try rig.controllersOf(data_nqn, ident_a));
+    const sums2 = try rig.onMount(a2, "cksum p1 p2 p3 p4 | cut -d' ' -f1");
+    defer gpa.free(sums2);
+    try testing.expectEqualStrings(sums, sums2);
+    var after_read: [16]multipath.BlockStat = undefined;
+    try pathStats(rig, insts, &nodes, &after_read);
+    const r0 = after_read[0].read_sectors - after_write[0].read_sectors;
+    const r1 = after_read[1].read_sectors - after_write[1].read_sectors;
+    std.debug.print("multipath-tcp: round-robin, 4 × 64 MiB read cold: read sectors per path nvme{d} {d}, nvme{d} {d}\n", .{ insts[0], r0, insts[1], r1 });
+    try testing.expect(r0 > 0 and r1 > 0);
+    // umount: every path released.
+    try rig.umount(a2);
+    try testing.expectEqual(@as(u32, 0), try rig.controllersOf(data_nqn, null));
+    {
+        const log2 = try rig.readLog(a2);
+        defer gpa.free(log2);
+        try testing.expect(std.mem.indexOf(u8, log2, "2 controller(s) of ") != null and std.mem.indexOf(u8, log2, "under this mount's identity released") != null);
+    }
+    // Mount A3 under the DEFAULT policy (the proposed ruling, queue-depth:
+    // a path is chosen by in-flight count, so a lone serial stream stays
+    // on one link and only concurrency spreads): fresh connects, the
+    // policy read back, four parallel cold readers measured per path —
+    // the numbers are the evidence note's, the sum the assertion.
+    const a3 = try rig.spawnMount("mp-a3", meta_uri, null, &.{});
+    try rig.awaitLog(a3, "ready: ", ready_wait_ns);
+    const st3 = try rig.stats(a3);
+    defer gpa.free(st3);
+    try testing.expectEqual(@as(?u64, 2), json_scan.number(st3, "fabric_daemon_connects"));
+    try testing.expectEqual(@as(?u64, 0), json_scan.number(st3, "fabric_daemon_reuses"));
+    try testing.expectEqual(@as(?u64, 4), json_scan.number(st3, "fabric_paths_live"));
+    try testing.expect(std.mem.indexOf(u8, st3, "\"iopolicy\":\"queue-depth\",\"paths_failed\":1,") != null);
+    try testing.expect(std.mem.indexOf(u8, st3, "\"iopolicy\":\"queue-depth\",\"paths\":[{\"instance\":") != null);
+    const insts3 = try instancesOf(rig, data_nqn, ident_a, &ib);
+    try testing.expectEqual(@as(usize, 2), insts3.len);
+    var sb3: [32]u8 = undefined;
+    const sub3 = (try multipath.subsystemOf(gpa, initiator.SYSFS_ROOT, insts3[0], &sb3)).?;
+    try testing.expectEqualStrings("queue-depth", multipath.readIopolicy(initiator.SYSFS_ROOT, sub3, &pb).?);
+    var before3: [16]multipath.BlockStat = undefined;
+    try pathStats(rig, insts3, &nodes, &before3);
+    const sums3 = try rig.onMount(a3, "for f in p1 p2 p3 p4; do cat $f > /dev/null & done; wait; cksum p1 p2 p3 p4 | cut -d' ' -f1");
+    defer gpa.free(sums3);
+    try testing.expectEqualStrings(sums, sums3);
+    var after3: [16]multipath.BlockStat = undefined;
+    try pathStats(rig, insts3, &nodes, &after3);
+    const q0 = after3[0].read_sectors - before3[0].read_sectors;
+    const q1 = after3[1].read_sectors - before3[1].read_sectors;
+    std.debug.print("multipath-tcp: queue-depth (the default), 4 × 64 MiB read cold by 4 parallel readers: read sectors per path nvme{d} {d}, nvme{d} {d}\n", .{ insts3[0], q0, insts3[1], q1 });
+    // 256 MiB of files = 524288 sectors of device reads at least.
+    try testing.expect(q0 + q1 >= (4 * 64 << 20) / 512);
+    try rig.umount(a3);
+    try testing.expectEqual(@as(u32, 0), try rig.controllersOf(data_nqn, null));
+    // The metadata paths are the operator's: both still stand after the
+    // umount, one `--identity-only` disconnect releases both.
+    try testing.expectEqual(@as(u32, 2), try rig.controllersOf(meta_nqn, ident_a));
+    try rig.disconnect(&cm);
+    try testing.expectEqual(@as(u32, 0), try rig.controllersOf(meta_nqn, null));
+    try rig.unshare(data_nqn);
+    try rig.unshare(meta_nqn);
+    try expectNoResidue(rig, meta_nqn);
+    try expectNoResidue(rig, data_nqn);
 }
 
 test "nvmet fidelity: fidelity-mount (loop) — THE row: the metadata and data volumes ARE connected namespaces (the data volume the daemon's own connect from its endpoint record); format → mount → PR armed for real (holder == pr_key, regctl 1) → a second identity refused → kill -9 → remount recovers via the own-stale ladder (pr_own_stale_recoveries 1, payload intact) and REUSES the data association → umount → regctl 0, the association released → disconnect → unshare" {

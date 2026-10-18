@@ -51,6 +51,16 @@ pub var fabric_daemon_reuses: counters.ShardedCounter = .{};
 pub var fabric_daemon_connect_failures: counters.ShardedCounter = .{};
 pub var fabric_daemon_disconnects: counters.ShardedCounter = .{};
 pub var fabric_ladder_refusals: counters.ShardedCounter = .{};
+/// Multipath (several paths per `fabric_endpoint` record, one head): a
+/// path that failed to connect while a sibling served (the mount runs
+/// DEGRADED, loud); our serving controllers over the owned subsystems,
+/// summed (sampled at bind and at every `.stats` render); `iopolicy`
+/// writes that read back as asked; writes refused or read back otherwise
+/// (a kernel without the policy — never a refusal).
+pub var fabric_paths_degraded: counters.ShardedCounter = .{};
+pub var fabric_paths_live: counters.Gauge = .{};
+pub var fabric_iopolicy_sets: counters.ShardedCounter = .{};
+pub var fabric_iopolicy_failures: counters.ShardedCounter = .{};
 
 pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
     try counters.writeNamespaceJson(@This(), w);
@@ -60,7 +70,7 @@ test "the family names every nvmet_* and fabric_* instrument" {
     var buf: [2048]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
     try writeStatsJson(&w);
-    inline for (.{ "nvmet_shares_applied", "nvmet_configfs_write_failures", "nvmet_ledger_generation", "fabric_controllers", "fabric_ctrl_not_live", "fabric_ctrl_reconnects", "fabric_host_scoped", "fabric_host_identity_source", "fabric_connects", "fabric_daemon_connects", "fabric_daemon_reuses", "fabric_daemon_disconnects", "fabric_ladder_refusals" }) |k| {
+    inline for (.{ "nvmet_shares_applied", "nvmet_configfs_write_failures", "nvmet_ledger_generation", "fabric_controllers", "fabric_ctrl_not_live", "fabric_ctrl_reconnects", "fabric_host_scoped", "fabric_host_identity_source", "fabric_connects", "fabric_daemon_connects", "fabric_daemon_reuses", "fabric_daemon_disconnects", "fabric_ladder_refusals", "fabric_paths_degraded", "fabric_paths_live", "fabric_iopolicy_sets", "fabric_iopolicy_failures" }) |k| {
         try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "\"" ++ k ++ "\":") != null);
     }
 }

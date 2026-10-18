@@ -2,7 +2,7 @@
 //! the verb modules with the real configfs face, the ledger store under
 //! the state dir, the port-id base from its knob, and the initiator's
 //! connect / disconnect reported in the shape the fidelity tier reads.
-//! Linux only.
+//! `nvmeof status` reads the host's fabric subsystems off sysfs. Linux only.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -17,6 +17,7 @@ const configfs = @import("configfs.zig");
 const ledger = @import("ledger.zig");
 const verbs = @import("verbs.zig");
 const initiator = @import("initiator.zig");
+const multipath = @import("multipath.zig");
 const storage = @import("storage.zig");
 const pr_legs = @import("pr_legs.zig");
 
@@ -43,6 +44,14 @@ pub fn run(p: cli.Process, v: args.Nvmeof) u8 {
     switch (v) {
         .connect => |c| return connect(p, c),
         .disconnect => |d| return disconnect(p, d),
+        .status => |s| {
+            multipath.writeStatus(p.gpa, initiator.SYSFS_ROOT, p.stdout, s.json) catch |e| {
+                p.stderr.print("squeezefs nvmeof status: cannot walk {s}/class/nvme-subsystem: {s}\n", .{ initiator.SYSFS_ROOT, @errorName(e) }) catch {};
+                return cli.exit_failed;
+            };
+            p.stdout.flush() catch {};
+            return cli.exit_ok;
+        },
         .resv_report => |r| {
             if (r.pr_matrix) return pr_legs.matrixVerb(p.gpa, p.env, r.device, r.peer.?, r.force, r.json, p.stdout, p.stderr);
             return pr_legs.resvReport(p.gpa, r.device, r.json, p.stdout, p.stderr);
@@ -82,7 +91,7 @@ pub fn run(p: cli.Process, v: args.Nvmeof) u8 {
             .systemd_unit => code(verbs.targetSystemdUnit(&ctx, p.argv[0])),
             .stop => code(verbs.targetStop(&ctx)),
         },
-        .connect, .disconnect, .resv_report => unreachable,
+        .connect, .disconnect, .resv_report, .status => unreachable,
     }
 }
 
@@ -121,6 +130,9 @@ fn connect(p: cli.Process, c: args.NvmeofConnect) u8 {
         .host_traddr = c.host_traddr,
         .host_iface = c.host_iface,
         .nr_io_queues = c.nr_io_queues,
+        // The operator's connects (a metadata volume's paths) ride the same
+        // path-loss clocks as the daemon's own.
+        .timeouts = multipath.resolveConnectTimeouts(p.env),
     };
     const hs = initiator.readHostScoped();
     log.info("nvmeof connect: identity {s} / {s} ({s}); {s}", .{ id.hostnqn(), id.hostid(), @tagName(id.source), hs.announce() });
@@ -135,6 +147,8 @@ fn connect(p: cli.Process, c: args.NvmeofConnect) u8 {
     var cp: [40]u8 = undefined;
     var ub: [36]u8 = undefined;
     p.stdout.print("connected {s}\n  device {s}\n  char {s}\n  nsid {d}\n  uuid {s}\n  instance {d}\n  cntlid {d}\n  hostnqn {s}\n  hostid {s}\n  identity_source {s}\n", .{ c.subnqn, got.ns.blockPath(&bp), got.ns.charPath(&cp), got.ns.nsid, if (got.ns.uuid) |u| configfs.uuidText(&ub, u) else "(none)", got.instance, got.cntlid, id.hostnqn(), id.hostid(), @tagName(id.source) }) catch {};
+    const t = spec.timeouts.?;
+    if (trtype == .tcp) p.stdout.print("  timeouts fast_io_fail_tmo={d} ctrl_loss_tmo={d} reconnect_delay={d}\n", .{ t.fast_io_fail_tmo, t.ctrl_loss_tmo, t.reconnect_delay }) catch {} else p.stdout.writeAll("  timeouts none (nvme-loop admits no path-loss clocks)\n") catch {};
     p.stdout.flush() catch {};
     return cli.exit_ok;
 }

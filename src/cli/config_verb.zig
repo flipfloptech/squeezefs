@@ -61,24 +61,27 @@ const FabricBody = struct {
         defer cur.deinit(p.gpa);
         for (self.specs) |word| {
             const spec = args.parseEndpointSpec(word) orelse unreachable; // the grammar admitted it
-            var ep: set_config.FabricEndpoint = .{ .trtype = if (spec.transport == .tcp) .tcp else .loop, .adrfam = .none, .trsvcid = spec.trsvcid, .traddr = @splat(0), .subnqn = spec.subnqn };
-            if (spec.transport == .tcp) {
-                if (std.Io.net.Ip4Address.parse(spec.traddr, 0)) |v4| {
-                    ep.adrfam = .ipv4;
-                    ep.traddr[0..4].* = v4.bytes;
-                } else |_| if (std.Io.net.Ip6Address.parse(spec.traddr, 0)) |v6| {
-                    ep.adrfam = .ipv6;
-                    ep.traddr = v6.bytes;
+            var paths: [set_config.MAX_FABRIC_PATHS]set_config.FabricPath = undefined;
+            for (spec.slice(), paths[0..spec.n]) |sp, *fp| {
+                fp.* = .{ .trtype = if (sp.transport == .tcp) .tcp else .loop, .adrfam = .none, .trsvcid = sp.trsvcid, .traddr = @splat(0) };
+                if (sp.transport != .tcp) continue;
+                if (std.Io.net.Ip4Address.parse(sp.traddr, 0)) |v4| {
+                    fp.adrfam = .ipv4;
+                    fp.traddr[0..4].* = v4.bytes;
+                } else |_| if (std.Io.net.Ip6Address.parse(sp.traddr, 0)) |v6| {
+                    fp.adrfam = .ipv6;
+                    fp.traddr = v6.bytes;
                 } else |_| {
-                    p.stderr.print("squeezefs config set-fabric-endpoints: '{s}': traddr '{s}' is not an IPv4/IPv6 address\n", .{ word, spec.traddr }) catch {};
+                    p.stderr.print("squeezefs config set-fabric-endpoints: '{s}': traddr '{s}' is not an IPv4/IPv6 address\n", .{ word, sp.traddr }) catch {};
                     return cli.exit_failed;
                 }
             }
+            const ep: set_config.FabricEndpoint = .{ .subnqn = spec.subnqn, .paths = paths[0..spec.n] };
             var m = set_config.setFabricEndpoint(p.gpa, &cur, spec.vol_tag, ep) catch |e| {
                 p.stderr.print("squeezefs config set-fabric-endpoints: '{s}': {s}\n", .{ word, switch (e) {
                     error.UnknownVolume => "no data volume with that vol-tag in the set (`squeezefs config show`)",
                     error.IllegalTransition => "the volume is retired",
-                    error.BadFabricEndpoint => "the subnqn or transport shape is not one the record represents",
+                    error.BadFabricEndpoint => "the subnqn or a path's shape is not one the record represents (a path twice, or two addresses that spell one)",
                     else => @errorName(e),
                 } }) catch {};
                 return cli.exit_failed;
@@ -111,8 +114,9 @@ const FabricBody = struct {
         };
         p.stdout.print("fabric endpoints set (config generation {d}):\n", .{cur.config_generation}) catch {};
         for (cur.data) |d| if (d.fabric) |f| {
-            var ab: [48]u8 = undefined;
-            p.stdout.print("  vol-{x:0>16} {s}:{s}:{d}:{s}\n", .{ d.vol_tag, @tagName(f.trtype), f.traddrText(&ab), f.trsvcid, f.subnqn }) catch {};
+            p.stdout.print("  vol-{x:0>16} ", .{d.vol_tag}) catch {};
+            f.writeText(p.stdout) catch {};
+            p.stdout.print(" ({d} path{s})\n", .{ f.paths.len, if (f.paths.len == 1) "" else "s" }) catch {};
         };
         p.stdout.flush() catch {};
         return cli.exit_ok;
@@ -188,8 +192,12 @@ fn getFabricEndpoints(p: cli.Process, tgt: args.Target, json: bool) u8 {
             } else {
                 var n: usize = 0;
                 for (cfg.data) |d| if (d.fabric) |f| {
-                    var ab: [48]u8 = undefined;
-                    p.stdout.print("vol-{x:0>16} {s}:{s}:{d}:{s}\n", .{ d.vol_tag, @tagName(f.trtype), f.traddrText(&ab), f.trsvcid, f.subnqn }) catch {};
+                    p.stdout.print("vol-{x:0>16} {s} ({d} path{s})\n", .{ d.vol_tag, f.subnqn, f.paths.len, if (f.paths.len == 1) "" else "s" }) catch {};
+                    for (f.paths) |fp| {
+                        p.stdout.writeAll("  path ") catch {};
+                        fp.writeText(p.stdout) catch {};
+                        p.stdout.writeAll("\n") catch {};
+                    }
                     n += 1;
                 };
                 if (n == 0) p.stdout.writeAll("no fabric endpoints recorded (every data volume is local or operator-connected)\n") catch {};

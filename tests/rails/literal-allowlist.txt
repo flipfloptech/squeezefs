@@ -16,8 +16,6 @@ src/cli/args.zig:759 | 10 | 54e5be7280e1c85f | a table entry (switch/range arm) 
 src/cli/args.zig:763 | 16 | 200652b036e8bb69 | OWED: derive it or document it on the line (charter §1.5)
 src/cli/args.zig:764 | 4 | f9d1c252b85a117a | a size — OWED: derive from derive.Facts or document the physical/format reason
 src/cli/args.zig:1037 | 20 | c1a8c4f5ec4f04f7 | OWED: derive it or document it on the line (charter §1.5)
-src/cli/args.zig:1038 | 16 | 9955bcd6e05b4968 | OWED: derive it or document it on the line (charter §1.5)
-src/cli/args.zig:1046 | 10 | e15f6dbf5be96f3d | OWED: derive it or document it on the line (charter §1.5)
 src/cli/args.zig:1124 | 3 | 98b31bc9ce58d5c1 | OWED: derive it or document it on the line (charter §1.5)
 src/cli/args.zig:1128 | 3 | f2e15f4be215db5d | OWED: derive it or document it on the line (charter §1.5)
 src/cli/args.zig:1351 | 100 | b694e1f68e794f02 | OWED: derive it or document it on the line (charter §1.5)

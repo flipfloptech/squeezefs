@@ -50,7 +50,11 @@ const Encryption = transform.Encryption;
 /// charter's `slot_state:{s}` naming style).
 pub const CONTROL_KEY = "set_config";
 pub const MAGIC = "SQZSETCF";
-pub const VERSION: u16 = 1;
+/// Version 1 carried ONE fabric path per data volume (`FabricPathWire` +
+/// a framed subnqn); version 2 carries a LIST (`FabricEndpointWire` head,
+/// the paths, the subnqn). Both decode; every write is version 2.
+pub const VERSION_V1: u16 = 1;
+pub const VERSION: u16 = 2;
 
 /// The caps the verbs refuse at (never the mount): one argv of 4096
 /// volumes is past any operator; 4096 is `PATH_MAX`.
@@ -101,17 +105,17 @@ pub const DataVolume = struct {
     volume_len: u64,
     /// Absolute path, no NUL; empty on a retired record.
     uri: []const u8,
-    /// The fabric coordinate the daemon connects under an explicit per-
-    /// mount identity (`ops_nvmet_keys.md` §3.7, KD-MW-15 — a PROPOSED
-    /// design: the record rides the ONE versioned, checksummed home
-    /// instead of a bespoke ino-1 blob, decision 0002 row 121). Null =
-    /// no record (a local device, or the operator connects).
+    /// The fabric coordinates the daemon connects under its per-mount
+    /// identity (`ops_nvmet_keys.md` §3.7, KD-MW-15 — the record rides
+    /// the ONE versioned, checksummed home instead of a bespoke ino-1
+    /// blob, decision 0002 row 121). Null = no record (a local device,
+    /// or the operator connects).
     fabric: ?FabricEndpoint = null,
 };
 
-/// `trtype:traddr:trsvcid:subnqn` of a data volume's NVMe-oF share. The
-/// uuid the connect verifies is the volume's own `device_uuid`.
-pub const FabricEndpoint = struct {
+/// One NVMe-oF path of a data volume's share: `trtype:traddr:trsvcid`
+/// (one target listener, one link).
+pub const FabricPath = struct {
     pub const Trtype = enum(u8) {
         tcp = 1,
         loop = 2,
@@ -142,15 +146,18 @@ pub const FabricEndpoint = struct {
     trsvcid: u16,
     /// IPv4 in the first 4 bytes; IPv6 whole; zero on loop.
     traddr: [16]u8,
-    /// `nqn.…`, 1..=223 bytes, owned by the config.
-    subnqn: []const u8,
 
-    pub fn encodedLen(self: FabricEndpoint) usize {
-        return FABRIC_FIXED_LEN + 2 + self.subnqn.len;
+    /// A loop path carries no address; a tcp path carries one.
+    pub fn shapeValid(self: FabricPath) bool {
+        return (self.adrfam == .none) == (self.trtype == .loop);
+    }
+
+    pub fn eql(a: FabricPath, b: FabricPath) bool {
+        return a.trtype == b.trtype and a.adrfam == b.adrfam and a.trsvcid == b.trsvcid and std.mem.eql(u8, &a.traddr, &b.traddr);
     }
 
     /// The textual address (`a.b.c.d` / the v6 hex groups), into `buf`.
-    pub fn traddrText(self: FabricEndpoint, buf: *[48]u8) []const u8 {
+    pub fn traddrText(self: FabricPath, buf: *[48]u8) []const u8 {
         return switch (self.adrfam) {
             .none => "",
             .ipv4 => std.fmt.bufPrint(buf, "{d}.{d}.{d}.{d}", .{ self.traddr[0], self.traddr[1], self.traddr[2], self.traddr[3] }) catch unreachable,
@@ -158,24 +165,92 @@ pub const FabricEndpoint = struct {
         };
     }
 
-    pub fn writeJson(self: FabricEndpoint, w: *std.Io.Writer) std.Io.Writer.Error!void {
+    /// `trtype:traddr:trsvcid` — the CLI spelling of one path.
+    pub fn writeText(self: FabricPath, w: *std.Io.Writer) std.Io.Writer.Error!void {
         var ab: [48]u8 = undefined;
-        try w.print("{{\"trtype\":\"{s}\",\"adrfam\":\"{s}\",\"traddr\":\"{s}\",\"trsvcid\":{d},\"subnqn\":\"{s}\"}}", .{ @tagName(self.trtype), @tagName(self.adrfam), self.traddrText(&ab), self.trsvcid, self.subnqn });
+        try w.print("{s}:{s}:", .{ @tagName(self.trtype), self.traddrText(&ab) });
+        if (self.trtype != .loop) try w.print("{d}", .{self.trsvcid});
+    }
+
+    pub fn writeJson(self: FabricPath, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        var ab: [48]u8 = undefined;
+        try w.print("{{\"trtype\":\"{s}\",\"adrfam\":\"{s}\",\"traddr\":\"{s}\",\"trsvcid\":{d}}}", .{ @tagName(self.trtype), @tagName(self.adrfam), self.traddrText(&ab), self.trsvcid });
+    }
+};
+
+/// The NVMe-oF share of a data volume: ONE subsystem reached over one or
+/// more paths (one per target listener — several Ethernet links). The
+/// daemon connects every path under ONE host identity and the kernel's
+/// native multipath merges them into one namespace head (charter §3).
+/// The uuid the connect verifies is the volume's own `device_uuid`.
+pub const FabricEndpoint = struct {
+    pub const Trtype = FabricPath.Trtype;
+    pub const Adrfam = FabricPath.Adrfam;
+
+    /// `nqn.…`, 1..=223 bytes, owned by the config.
+    subnqn: []const u8,
+    /// 1..=`MAX_FABRIC_PATHS`, owned by the config.
+    paths: []const FabricPath,
+
+    pub fn encodedLen(self: FabricEndpoint) usize {
+        return FABRIC_HEAD_LEN + self.paths.len * FABRIC_PATH_LEN + self.subnqn.len;
+    }
+
+    /// `trtype:traddr:trsvcid[,…]:subnqn` — the CLI spelling.
+    pub fn writeText(self: FabricEndpoint, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        for (self.paths, 0..) |p, i| {
+            if (i != 0) try w.writeByte(',');
+            try p.writeText(w);
+        }
+        try w.print(":{s}", .{self.subnqn});
+    }
+
+    pub fn writeJson(self: FabricEndpoint, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        try w.print("{{\"subnqn\":\"{s}\",\"paths\":[", .{self.subnqn});
+        for (self.paths, 0..) |p, i| {
+            if (i != 0) try w.writeByte(',');
+            try p.writeJson(w);
+        }
+        try w.writeAll("]}");
     }
 };
 
 /// The NVMe spec's NQN maximum.
 pub const NVMF_NQN_SIZE: usize = 223;
+/// The `share` verb's listener cap (`cli/args.MAX_REPEAT`): one path per
+/// listener of ONE subsystem.
+pub const MAX_FABRIC_PATHS: usize = 16;
 
-/// The fixed part of a fabric endpoint: 20 B, then `subnqn_len` + bytes.
+/// Version 2: the head of a fabric endpoint (4 B), then `n_paths ×
+/// FabricPathWire`, then `subnqn_len` bytes of NQN.
 pub const FabricEndpointWire = extern struct {
+    n_paths: u8,
+    reserved: u8,
+    subnqn_len_le: [2]u8,
+};
+
+/// One path (20 B). In a version 1 record this was the whole fixed part,
+/// followed by `u16 subnqn_len` + the NQN.
+pub const FabricPathWire = extern struct {
     trtype: u8,
     adrfam: u8,
     trsvcid_le: [2]u8,
     traddr: [16]u8,
 };
 
-pub const FABRIC_FIXED_LEN: usize = @sizeOf(FabricEndpointWire);
+pub const FABRIC_HEAD_LEN: usize = @sizeOf(FabricEndpointWire);
+pub const FABRIC_PATH_LEN: usize = @sizeOf(FabricPathWire);
+
+fn freeEndpoint(gpa: Allocator, f: FabricEndpoint) void {
+    gpa.free(f.subnqn);
+    gpa.free(f.paths);
+}
+
+fn cloneEndpoint(gpa: Allocator, f: FabricEndpoint) Allocator.Error!FabricEndpoint {
+    const nqn = try gpa.dupe(u8, f.subnqn);
+    errdefer gpa.free(nqn);
+    return .{ .subnqn = nqn, .paths = try gpa.dupe(FabricPath, f.paths) };
+}
 
 /// The head: 128 B, little-endian, reserved bytes zero.
 pub const HeadWire = extern struct {
@@ -243,8 +318,10 @@ pub const DataVolumeWire = extern struct {
     capacity_blocks_le: [8]u8,
     volume_len_le: [8]u8,
     uri_len_le: [2]u8,
-    /// Bytes of a `FabricEndpointWire` + framed subnqn after the uri; 0 =
-    /// no record (every pre-rung-8 image reads as none).
+    /// Bytes of the fabric endpoint after the uri (version 2: the
+    /// `FabricEndpointWire` head, the paths, the NQN; version 1: one
+    /// `FabricPathWire` + the framed NQN); 0 = no record (every pre-rung-8
+    /// image reads as none).
     fabric_len_le: [2]u8,
     reserved1: [4]u8,
 };
@@ -256,7 +333,10 @@ comptime {
     assert(HEAD_LEN == 128);
     assert(REKEY_LEN == 40);
     assert(DATA_VOLUME_FIXED_LEN == 64);
-    assert(FABRIC_FIXED_LEN == 20);
+    assert(FABRIC_HEAD_LEN == 4);
+    assert(FABRIC_PATH_LEN == 20);
+    // The longest endpoint (16 paths + a 223 B NQN) fits the u16 length.
+    assert(FABRIC_HEAD_LEN + MAX_FABRIC_PATHS * FABRIC_PATH_LEN + NVMF_NQN_SIZE <= std.math.maxInt(u16));
     assert(@offsetOf(DataVolumeWire, "fabric_len_le") == 58);
     assert(@offsetOf(HeadWire, "config_generation_le") == 12);
     assert(@offsetOf(HeadWire, "kdf_salt") == 40);
@@ -287,7 +367,7 @@ pub const Config = struct {
     pub fn deinit(self: *Config, gpa: Allocator) void {
         for (self.data) |d| {
             gpa.free(d.uri);
-            if (d.fabric) |f| gpa.free(f.subnqn);
+            if (d.fabric) |f| freeEndpoint(gpa, f);
         }
         gpa.free(self.data);
         for (self.cache_paths) |p| gpa.free(p);
@@ -312,7 +392,7 @@ pub const Config = struct {
         errdefer {
             for (out.data[0..n_data]) |d| {
                 gpa.free(d.uri);
-                if (d.fabric) |f| gpa.free(f.subnqn);
+                if (d.fabric) |f| freeEndpoint(gpa, f);
             }
             gpa.free(out.data);
         }
@@ -320,7 +400,7 @@ pub const Config = struct {
             d.* = s;
             d.uri = try gpa.dupe(u8, s.uri);
             errdefer gpa.free(d.uri);
-            if (s.fabric) |f| d.fabric.?.subnqn = try gpa.dupe(u8, f.subnqn);
+            if (s.fabric) |f| d.fabric = try cloneEndpoint(gpa, f);
             n_data += 1;
         }
         out.cache_paths = try gpa.alloc([]const u8, self.cache_paths.len);
@@ -415,8 +495,8 @@ pub const Config = struct {
             try w.print("    vol-{x:0>16} {s} {s} {d} blocks ({d} MiB) device ", .{ d.vol_tag, d.state.name(), if (d.uri.len == 0) "(retired; no uri)" else d.uri, d.capacity_blocks, (d.capacity_blocks * self.block_size) >> 20 });
             try writeUuid(w, d.device_uuid);
             if (d.fabric) |f| {
-                var ab: [48]u8 = undefined;
-                try w.print("; fabric {s}:{s}:{d}:{s}", .{ @tagName(f.trtype), f.traddrText(&ab), f.trsvcid, f.subnqn });
+                try w.writeAll("; fabric ");
+                try f.writeText(w);
             }
             try w.writeAll("\n");
         }
@@ -445,6 +525,35 @@ pub fn writeVolTag(w: *std.Io.Writer, tag: u64) std.Io.Writer.Error!void {
 
 pub const EncodeError = error{ RecordTooLarge, TooManyDataVolumes, UriTooLong, TooManyCachePaths, CachePathTooLong, BadFabricEndpoint, OutOfMemory };
 
+/// The endpoint laws every writer and reader hold: an NQN of the grammar,
+/// 1..=`MAX_FABRIC_PATHS` paths each of a valid shape, no path twice (the
+/// kernel answers a repeated connect EALREADY).
+pub fn endpointShapeValid(f: FabricEndpoint) bool {
+    if (f.subnqn.len == 0 or f.subnqn.len > NVMF_NQN_SIZE or !std.mem.startsWith(u8, f.subnqn, "nqn.") or std.mem.indexOfScalar(u8, f.subnqn, 0) != null) return false;
+    if (f.paths.len == 0 or f.paths.len > MAX_FABRIC_PATHS) return false;
+    for (f.paths, 0..) |p, i| {
+        if (!p.shapeValid()) return false;
+        for (f.paths[0..i]) |q| if (p.eql(q)) return false;
+    }
+    return true;
+}
+
+fn pathWire(p: FabricPath) FabricPathWire {
+    var w: FabricPathWire = .{ .trtype = @backingInt(p.trtype), .adrfam = @backingInt(p.adrfam), .trsvcid_le = undefined, .traddr = p.traddr };
+    std.mem.writeInt(u16, &w.trsvcid_le, p.trsvcid, .little);
+    return w;
+}
+
+/// Null on a trtype/adrfam code this binary does not know.
+fn pathFromWire(w: FabricPathWire) ?FabricPath {
+    return .{
+        .trtype = FabricPath.Trtype.fromWire(w.trtype) orelse return null,
+        .adrfam = FabricPath.Adrfam.fromWire(w.adrfam) orelse return null,
+        .trsvcid = std.mem.readInt(u16, &w.trsvcid_le, .little),
+        .traddr = w.traddr,
+    };
+}
+
 /// Encode into a fresh buffer (caller frees). `cap` is the per-volume
 /// record-value cap (`geometry.recordValueCap(node_size)`): refused HERE,
 /// at the verb, never at mount.
@@ -452,7 +561,7 @@ pub fn encode(gpa: Allocator, cfg: *const Config, cap: usize) EncodeError![]u8 {
     if (cfg.data.len > MAX_DATA_VOLUMES) return error.TooManyDataVolumes;
     for (cfg.data) |d| {
         if (d.uri.len > MAX_URI_LEN) return error.UriTooLong;
-        if (d.fabric) |f| if (f.subnqn.len == 0 or f.subnqn.len > NVMF_NQN_SIZE) return error.BadFabricEndpoint;
+        if (d.fabric) |f| if (!endpointShapeValid(f)) return error.BadFabricEndpoint;
     }
     if (cfg.cache_paths.len > MAX_CACHE_PATHS) return error.TooManyCachePaths;
     for (cfg.cache_paths) |p| if (p.len > MAX_URI_LEN) return error.CachePathTooLong;
@@ -499,15 +608,14 @@ pub fn encode(gpa: Allocator, cfg: *const Config, cap: usize) EncodeError![]u8 {
         @memcpy(out[off..][0..d.uri.len], d.uri);
         off += d.uri.len;
         if (d.fabric) |f| {
-            var fw: FabricEndpointWire = undefined;
-            fw.trtype = @backingInt(f.trtype);
-            fw.adrfam = @backingInt(f.adrfam);
-            std.mem.writeInt(u16, &fw.trsvcid_le, f.trsvcid, .little);
-            fw.traddr = f.traddr;
-            out[off..][0..FABRIC_FIXED_LEN].* = std.mem.toBytes(fw);
-            off += FABRIC_FIXED_LEN;
-            std.mem.writeInt(u16, out[off..][0..2], @intCast(f.subnqn.len), .little);
-            off += 2;
+            var fw: FabricEndpointWire = .{ .n_paths = @intCast(f.paths.len), .reserved = 0, .subnqn_len_le = undefined };
+            std.mem.writeInt(u16, &fw.subnqn_len_le, @intCast(f.subnqn.len), .little);
+            out[off..][0..FABRIC_HEAD_LEN].* = std.mem.toBytes(fw);
+            off += FABRIC_HEAD_LEN;
+            for (f.paths) |p| {
+                out[off..][0..FABRIC_PATH_LEN].* = std.mem.toBytes(pathWire(p));
+                off += FABRIC_PATH_LEN;
+            }
             @memcpy(out[off..][0..f.subnqn.len], f.subnqn);
             off += f.subnqn.len;
         }
@@ -565,7 +673,7 @@ pub const Refusal = union(enum) {
         switch (self) {
             .bad_length => |n| try w.print("set_config record of {d} bytes is shorter than its {d}-byte head + checksum", .{ n, HEAD_LEN + CHECKSUM_LEN }),
             .bad_magic => try w.writeAll("set_config record has a bad magic (a foreign or corrupt control record)"),
-            .wrong_version => |v| try w.print("set_config record version {d} is not {d} — upgrade squeezefs", .{ v, VERSION }),
+            .wrong_version => |v| try w.print("set_config record version {d} is not {d} or {d} — upgrade squeezefs", .{ v, VERSION_V1, VERSION }),
             .checksum_mismatch => try w.writeAll("set_config record checksum mismatch — corrupt control record"),
             .reserved_not_zero => try w.writeAll("set_config record reserved bytes are not zero (a writer this binary does not know)"),
             .bad_mode => try w.writeAll("set_config record names a compression or encryption mode this binary does not know — upgrade squeezefs"),
@@ -608,17 +716,49 @@ fn refuse(diag: ?*Refusal, r: Refusal) DecodeError {
 pub fn peekGeneration(bytes: []const u8) ?u64 {
     if (bytes.len < HEAD_LEN + CHECKSUM_LEN) return null;
     if (!std.mem.eql(u8, bytes[0..8], MAGIC)) return null;
-    if (std.mem.readInt(u16, bytes[8..10], .little) != VERSION) return null;
+    if (!versionKnown(std.mem.readInt(u16, bytes[8..10], .little))) return null;
     if (!checksum.verify(bytes, bytes.len - CHECKSUM_LEN)) return null;
     const h = std.mem.bytesToValue(HeadWire, bytes[0..HEAD_LEN]);
     return std.mem.readInt(u64, &h.config_generation_le, .little);
+}
+
+fn versionKnown(v: u16) bool {
+    return v == VERSION_V1 or v == VERSION;
+}
+
+/// The fabric endpoint of a record, consumed EXACTLY from `blob` (the
+/// `fabric_len` bytes after the uri) in the record version's shape: v1
+/// is one path + a framed NQN (a list of one), v2 the head, the paths,
+/// the NQN. The result borrows `blob` (the NQN) and `paths_buf` (the
+/// paths) until the caller dupes it. `Truncated` when the lengths
+/// disagree with the bytes; `BadRecord` on a code or count this binary
+/// does not know (the caller names the record).
+fn decodeFabric(version: u16, blob: []const u8, paths_buf: *[MAX_FABRIC_PATHS]FabricPath) error{ Truncated, BadRecord }!FabricEndpoint {
+    if (version == VERSION_V1) {
+        if (blob.len < FABRIC_PATH_LEN + 2) return error.Truncated;
+        const nqn_len: usize = std.mem.readInt(u16, blob[FABRIC_PATH_LEN..][0..2], .little);
+        if (FABRIC_PATH_LEN + 2 + nqn_len != blob.len) return error.Truncated;
+        paths_buf[0] = pathFromWire(std.mem.bytesToValue(FabricPathWire, blob[0..FABRIC_PATH_LEN])) orelse return error.BadRecord;
+        return .{ .subnqn = blob[FABRIC_PATH_LEN + 2 ..][0..nqn_len], .paths = paths_buf[0..1] };
+    }
+    if (blob.len < FABRIC_HEAD_LEN) return error.Truncated;
+    const head = std.mem.bytesToValue(FabricEndpointWire, blob[0..FABRIC_HEAD_LEN]);
+    if (head.reserved != 0) return error.BadRecord;
+    const n_paths: usize = head.n_paths;
+    const nqn_len: usize = std.mem.readInt(u16, &head.subnqn_len_le, .little);
+    if (n_paths == 0 or n_paths > MAX_FABRIC_PATHS) return error.BadRecord;
+    if (FABRIC_HEAD_LEN + n_paths * FABRIC_PATH_LEN + nqn_len != blob.len) return error.Truncated;
+    for (paths_buf[0..n_paths], 0..) |*p, i| {
+        p.* = pathFromWire(std.mem.bytesToValue(FabricPathWire, blob[FABRIC_HEAD_LEN + i * FABRIC_PATH_LEN ..][0..FABRIC_PATH_LEN])) orelse return error.BadRecord;
+    }
+    return .{ .subnqn = blob[FABRIC_HEAD_LEN + n_paths * FABRIC_PATH_LEN ..][0..nqn_len], .paths = paths_buf[0..n_paths] };
 }
 
 pub fn decode(gpa: Allocator, bytes: []const u8, diag: ?*Refusal) DecodeError!Config {
     if (bytes.len < HEAD_LEN + CHECKSUM_LEN) return refuse(diag, .{ .bad_length = bytes.len });
     if (!std.mem.eql(u8, bytes[0..8], MAGIC)) return refuse(diag, .bad_magic);
     const version = std.mem.readInt(u16, bytes[8..10], .little);
-    if (version != VERSION) return refuse(diag, .{ .wrong_version = version });
+    if (!versionKnown(version)) return refuse(diag, .{ .wrong_version = version });
     const sum_off = bytes.len - CHECKSUM_LEN;
     if (!checksum.verify(bytes, sum_off)) return refuse(diag, .checksum_mismatch);
     const h = std.mem.bytesToValue(HeadWire, bytes[0..HEAD_LEN]);
@@ -664,7 +804,7 @@ pub fn decode(gpa: Allocator, bytes: []const u8, diag: ?*Refusal) DecodeError!Co
     errdefer {
         for (data[0..n_done]) |d| {
             gpa.free(d.uri);
-            if (d.fabric) |f| gpa.free(f.subnqn);
+            if (d.fabric) |f| freeEndpoint(gpa, f);
         }
         gpa.free(data);
     }
@@ -683,27 +823,24 @@ pub fn decode(gpa: Allocator, bytes: []const u8, diag: ?*Refusal) DecodeError!Co
         if (state != .retired and uri.len == 0) return refuse(diag, .{ .bad_record = i });
         const tag = std.mem.readInt(u64, &r.vol_tag_le, .little);
         for (data[0..i]) |prev| if (prev.vol_tag == tag or std.mem.eql(u8, &prev.device_uuid, &r.device_uuid)) return refuse(diag, .{ .bad_record = i });
-        // The fabric endpoint: its length against the bytes present, its
-        // fixed part, the framed subnqn consumed EXACTLY.
+        // The fabric endpoint: its length against the bytes present, then
+        // the version's shape consumed EXACTLY, then the endpoint laws.
         const fabric_len: usize = std.mem.readInt(u16, &r.fabric_len_le, .little);
         var fabric: ?FabricEndpoint = null;
+        var paths_buf: [MAX_FABRIC_PATHS]FabricPath = undefined;
         if (fabric_len != 0) {
-            if (fabric_len > sum_off - off or fabric_len < FABRIC_FIXED_LEN + 2) return refuse(diag, .truncated);
-            const fw = std.mem.bytesToValue(FabricEndpointWire, bytes[off..][0..FABRIC_FIXED_LEN]);
-            const nqn_len: usize = std.mem.readInt(u16, bytes[off + FABRIC_FIXED_LEN ..][0..2], .little);
-            if (FABRIC_FIXED_LEN + 2 + nqn_len != fabric_len) return refuse(diag, .truncated);
-            const nqn = bytes[off + FABRIC_FIXED_LEN + 2 ..][0..nqn_len];
-            const trtype = FabricEndpoint.Trtype.fromWire(fw.trtype) orelse return refuse(diag, .{ .bad_record = i });
-            const adrfam = FabricEndpoint.Adrfam.fromWire(fw.adrfam) orelse return refuse(diag, .{ .bad_record = i });
-            if (nqn.len == 0 or nqn.len > NVMF_NQN_SIZE or !std.mem.startsWith(u8, nqn, "nqn.") or std.mem.indexOfScalar(u8, nqn, 0) != null) return refuse(diag, .{ .bad_record = i });
-            if ((adrfam == .none) != (trtype == .loop)) return refuse(diag, .{ .bad_record = i });
-            if (state == .retired) return refuse(diag, .{ .bad_record = i });
-            fabric = .{ .trtype = trtype, .adrfam = adrfam, .trsvcid = std.mem.readInt(u16, &fw.trsvcid_le, .little), .traddr = fw.traddr, .subnqn = nqn };
+            if (fabric_len > sum_off - off) return refuse(diag, .truncated);
+            const f = decodeFabric(version, bytes[off..][0..fabric_len], &paths_buf) catch |e| return switch (e) {
+                error.Truncated => refuse(diag, .truncated),
+                error.BadRecord => refuse(diag, .{ .bad_record = i }),
+            };
+            if (!endpointShapeValid(f) or state == .retired) return refuse(diag, .{ .bad_record = i });
+            fabric = f;
             off += fabric_len;
         }
         const uri_owned = try gpa.dupe(u8, uri);
         errdefer gpa.free(uri_owned);
-        if (fabric) |*f| f.subnqn = try gpa.dupe(u8, f.subnqn);
+        if (fabric) |f| fabric = try cloneEndpoint(gpa, f);
         d.* = .{
             .vol_tag = tag,
             .state = state,
@@ -907,22 +1044,18 @@ pub fn setState(gpa: Allocator, prev: *const Config, vol_tag: u64, to: State) Ve
 }
 
 /// `config set-fabric-endpoints`: record (or clear, with null) the fabric
-/// coordinate of a data volume; a retired record takes none. The subnqn
-/// is copied.
+/// endpoint of a data volume — one subsystem, its paths; a retired record
+/// takes none. The subnqn and the paths are copied.
 pub fn setFabricEndpoint(gpa: Allocator, prev: *const Config, vol_tag: u64, ep: ?FabricEndpoint) VerbError!Mutation {
     const cur = prev.find(vol_tag) orelse return error.UnknownVolume;
     if (cur.state == .retired) return error.IllegalTransition;
-    if (ep) |e| if (e.subnqn.len == 0 or e.subnqn.len > NVMF_NQN_SIZE or !std.mem.startsWith(u8, e.subnqn, "nqn.") or (e.adrfam == .none) != (e.trtype == .loop)) return error.BadFabricEndpoint;
+    if (ep) |e| if (!endpointShapeValid(e)) return error.BadFabricEndpoint;
     var next = try prev.clone(gpa);
     errdefer next.deinit(gpa);
     const d = next.find(vol_tag).?;
-    if (d.fabric) |f| gpa.free(f.subnqn);
+    if (d.fabric) |f| freeEndpoint(gpa, f);
     d.fabric = null;
-    if (ep) |e| {
-        var copy = e;
-        copy.subnqn = try gpa.dupe(u8, e.subnqn);
-        d.fabric = copy;
-    }
+    if (ep) |e| d.fabric = try cloneEndpoint(gpa, e);
     return finish(prev, next);
 }
 
@@ -1168,7 +1301,7 @@ test "the head is 128 B and the record fixed part 64 B at the spec's offsets; bi
     try testing.expectEqual(cfg.encodedLen(), bytes.len);
     try testing.expect(bytes.len < 400);
     try testing.expectEqualStrings("SQZSETCF", bytes[0..8]);
-    try testing.expectEqual(@as(u16, 1), std.mem.readInt(u16, bytes[8..10], .little));
+    try testing.expectEqual(VERSION, std.mem.readInt(u16, bytes[8..10], .little));
     try testing.expectEqual(@as(u16, 2), std.mem.readInt(u16, bytes[104..106], .little));
     try testing.expectEqual(@as(u16, 2), std.mem.readInt(u16, bytes[106..108], .little));
     var diag: Refusal = undefined;
@@ -1209,61 +1342,176 @@ test "the head is 128 B and the record fixed part 64 B at the spec's offsets; bi
     try testing.expect(std.mem.indexOf(u8, out.written(), "disk cache paths 2: /build/cache/a /build/cache/b") != null);
 }
 
-test "fabric endpoints (the proposed §3.7 record): set/clear round-trips through encode∘decode byte-canonically; a pre-record image (fabric_len 0) reads as none; the shape laws refuse (loop with an address, a non-NQN, a retired volume); JSON and the summary carry it" {
+fn v4Path(a: u8, b: u8, c: u8, d: u8, port: u16) FabricPath {
+    var p: FabricPath = .{ .trtype = .tcp, .adrfam = .ipv4, .trsvcid = port, .traddr = @splat(0) };
+    p.traddr[0..4].* = .{ a, b, c, d };
+    return p;
+}
+
+const loop_path: FabricPath = .{ .trtype = .loop, .adrfam = .none, .trsvcid = 0, .traddr = @splat(0) };
+
+test "fabric endpoints (§3.7, a list of paths): set/clear round-trips through encode∘decode byte-canonically; a pre-record image (fabric_len 0) reads as none; the shape laws refuse (loop with an address, a non-NQN, no path, a repeated path, 17 paths, a retired volume); JSON and the summary carry every path" {
     const gpa = testing.allocator;
     var cfg = try fixture(gpa);
     defer cfg.deinit(gpa);
-    var traddr: [16]u8 = @splat(0);
-    traddr[0..4].* = .{ 127, 0, 0, 1 };
-    var m = try setFabricEndpoint(gpa, &cfg, 0x1111_2222_3333_4444, .{ .trtype = .tcp, .adrfam = .ipv4, .trsvcid = 4420, .traddr = traddr, .subnqn = "nqn.2026-10.io.squeezefs:share-d0" });
+    const two = [_]FabricPath{ v4Path(127, 0, 0, 1, 4420), v4Path(127, 0, 0, 2, 4420) };
+    var m = try setFabricEndpoint(gpa, &cfg, 0x1111_2222_3333_4444, .{ .subnqn = "nqn.2026-10.io.squeezefs:share-d0", .paths = &two });
     defer m.next.deinit(gpa);
     try testing.expectEqual(@as(u64, 2), m.next.config_generation);
     try testing.expect(!m.lifecycle_bit_needed);
     const f = m.next.data[0].fabric.?;
     try testing.expectEqualStrings("nqn.2026-10.io.squeezefs:share-d0", f.subnqn);
-    try testing.expectEqual(@as(usize, 20 + 2 + 33), f.encodedLen());
+    try testing.expectEqual(@as(usize, 4 + 2 * 20 + 33), f.encodedLen());
     const bytes = try encode(gpa, &m.next, test_cap);
     defer gpa.free(bytes);
     try testing.expectEqual(m.next.encodedLen(), bytes.len);
-    try testing.expectEqual(@as(u16, 55), std.mem.readInt(u16, bytes[HEAD_LEN + 58 ..][0..2], .little));
+    try testing.expectEqual(@as(u16, 77), std.mem.readInt(u16, bytes[HEAD_LEN + 58 ..][0..2], .little));
     var back = try decode(gpa, bytes, null);
     defer back.deinit(gpa);
     const bf = back.data[0].fabric.?;
-    try testing.expectEqual(FabricEndpoint.Trtype.tcp, bf.trtype);
-    try testing.expectEqual(@as(u16, 4420), bf.trsvcid);
+    try testing.expectEqual(@as(usize, 2), bf.paths.len);
+    try testing.expect(bf.paths[0].eql(two[0]) and bf.paths[1].eql(two[1]));
     try testing.expectEqualStrings("nqn.2026-10.io.squeezefs:share-d0", bf.subnqn);
     try testing.expect(back.data[1].fabric == null);
     var ab: [48]u8 = undefined;
-    try testing.expectEqualStrings("127.0.0.1", bf.traddrText(&ab));
+    try testing.expectEqualStrings("127.0.0.2", bf.paths[1].traddrText(&ab));
     const again = try encode(gpa, &back, test_cap);
     defer gpa.free(again);
     try testing.expectEqualSlices(u8, bytes, again);
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
     try back.writeJson(&out.writer);
-    try testing.expect(std.mem.indexOf(u8, out.written(), "\"fabric_endpoint\":{\"trtype\":\"tcp\",\"adrfam\":\"ipv4\",\"traddr\":\"127.0.0.1\",\"trsvcid\":4420,\"subnqn\":\"nqn.2026-10.io.squeezefs:share-d0\"}") != null);
+    try testing.expect(std.mem.indexOf(u8, out.written(), "\"fabric_endpoint\":{\"subnqn\":\"nqn.2026-10.io.squeezefs:share-d0\",\"paths\":[{\"trtype\":\"tcp\",\"adrfam\":\"ipv4\",\"traddr\":\"127.0.0.1\",\"trsvcid\":4420},{\"trtype\":\"tcp\",\"adrfam\":\"ipv4\",\"traddr\":\"127.0.0.2\",\"trsvcid\":4420}]}") != null);
     out.clearRetainingCapacity();
     try back.writeSummary(&out.writer);
-    try testing.expect(std.mem.indexOf(u8, out.written(), "; fabric tcp:127.0.0.1:4420:nqn.2026-10.io.squeezefs:share-d0") != null);
+    try testing.expect(std.mem.indexOf(u8, out.written(), "; fabric tcp:127.0.0.1:4420,tcp:127.0.0.2:4420:nqn.2026-10.io.squeezefs:share-d0") != null);
     // Clear.
     var cleared = try setFabricEndpoint(gpa, &m.next, 0x1111_2222_3333_4444, null);
     defer cleared.next.deinit(gpa);
     try testing.expect(cleared.next.data[0].fabric == null);
-    // Loop with an address, a non-NQN, an unknown volume, a retired record.
-    try testing.expectError(error.BadFabricEndpoint, setFabricEndpoint(gpa, &cfg, 0x1111_2222_3333_4444, .{ .trtype = .loop, .adrfam = .ipv4, .trsvcid = 0, .traddr = traddr, .subnqn = "nqn.x" }));
-    try testing.expectError(error.BadFabricEndpoint, setFabricEndpoint(gpa, &cfg, 0x1111_2222_3333_4444, .{ .trtype = .loop, .adrfam = .none, .trsvcid = 0, .traddr = @splat(0), .subnqn = "x" }));
-    try testing.expectError(error.UnknownVolume, setFabricEndpoint(gpa, &cfg, 0x77, .{ .trtype = .loop, .adrfam = .none, .trsvcid = 0, .traddr = @splat(0), .subnqn = "nqn.x" }));
-    // A corrupt fabric length (past the bytes) refuses as truncated; a bad trtype as a bad record.
+    // Loop with an address, a non-NQN, no path, a repeated path, one past
+    // the cap, an unknown volume.
+    var loop_addr = loop_path;
+    loop_addr.adrfam = .ipv4;
+    try testing.expectError(error.BadFabricEndpoint, setFabricEndpoint(gpa, &cfg, 0x1111_2222_3333_4444, .{ .subnqn = "nqn.x", .paths = &.{loop_addr} }));
+    try testing.expectError(error.BadFabricEndpoint, setFabricEndpoint(gpa, &cfg, 0x1111_2222_3333_4444, .{ .subnqn = "x", .paths = &.{loop_path} }));
+    try testing.expectError(error.BadFabricEndpoint, setFabricEndpoint(gpa, &cfg, 0x1111_2222_3333_4444, .{ .subnqn = "nqn.x", .paths = &.{} }));
+    try testing.expectError(error.BadFabricEndpoint, setFabricEndpoint(gpa, &cfg, 0x1111_2222_3333_4444, .{ .subnqn = "nqn.x", .paths = &.{ two[0], two[0] } }));
+    var many: [MAX_FABRIC_PATHS + 1]FabricPath = undefined;
+    for (&many, 0..) |*p, i| p.* = v4Path(10, 0, 0, @intCast(i), 4420);
+    try testing.expectError(error.BadFabricEndpoint, setFabricEndpoint(gpa, &cfg, 0x1111_2222_3333_4444, .{ .subnqn = "nqn.x", .paths = &many }));
+    var ok16 = try setFabricEndpoint(gpa, &cfg, 0x1111_2222_3333_4444, .{ .subnqn = "nqn.x", .paths = many[0..MAX_FABRIC_PATHS] });
+    defer ok16.next.deinit(gpa);
+    try testing.expectEqual(MAX_FABRIC_PATHS, ok16.next.data[0].fabric.?.paths.len);
+    try testing.expectError(error.UnknownVolume, setFabricEndpoint(gpa, &cfg, 0x77, .{ .subnqn = "nqn.x", .paths = &.{loop_path} }));
+    // A corrupt fabric length (past the bytes) refuses as truncated; a bad
+    // trtype as a bad record; a zero path count as a bad record.
     var lying = try gpa.dupe(u8, bytes);
     defer gpa.free(lying);
     std.mem.writeInt(u16, lying[HEAD_LEN + 58 ..][0..2], 500, .little);
     checksum.stamp(lying, lying.len - CHECKSUM_LEN);
     try testing.expectError(error.Truncated, decode(gpa, lying, null));
+    const blob_at = HEAD_LEN + DATA_VOLUME_FIXED_LEN + "/dev/nvme0n1".len;
     var badtr = try gpa.dupe(u8, bytes);
     defer gpa.free(badtr);
-    badtr[HEAD_LEN + DATA_VOLUME_FIXED_LEN + "/dev/nvme0n1".len] = 9;
+    badtr[blob_at + FABRIC_HEAD_LEN] = 9;
     checksum.stamp(badtr, badtr.len - CHECKSUM_LEN);
     try testing.expectError(error.BadRecord, decode(gpa, badtr, null));
+    var zero = try gpa.dupe(u8, bytes);
+    defer gpa.free(zero);
+    zero[blob_at] = 0;
+    checksum.stamp(zero, zero.len - CHECKSUM_LEN);
+    try testing.expectError(error.BadRecord, decode(gpa, zero, null));
+}
+
+/// A set_config image built BYTE BY BYTE: one plaintext data volume
+/// `/dev/d0` with a fabric endpoint in the given version's shape, no cache
+/// paths, the checksum stamped. The fixtures of the codec test.
+fn fabricImage(gpa: Allocator, version: u16, fabric_blob: []const u8) ![]u8 {
+    const uri = "/dev/d0";
+    const len = HEAD_LEN + DATA_VOLUME_FIXED_LEN + uri.len + fabric_blob.len + CHECKSUM_LEN;
+    const out = try gpa.alloc(u8, len);
+    @memset(out, 0);
+    out[0..8].* = MAGIC.*;
+    std.mem.writeInt(u16, out[8..10], version, .little);
+    std.mem.writeInt(u64, out[12..20], 7, .little); // config_generation
+    std.mem.writeInt(u32, out[20..24], 1 << 20, .little); // block_size
+    std.mem.writeInt(u32, out[24..28], 1 << 20, .little); // chunk_size (plaintext: == block)
+    std.mem.writeInt(u64, out[28..36], 10 << 20, .little); // capacity = 10 blocks
+    // compression none (0), encryption none (0), key scheme 0: already zero.
+    @memset(out[80..96], 0x55); // set_uuid
+    std.mem.writeInt(u16, out[104..106], 1, .little); // n_data
+    const r = out[HEAD_LEN..][0..DATA_VOLUME_FIXED_LEN];
+    std.mem.writeInt(u64, r[0..8], 0xfeed, .little); // vol_tag
+    r[8] = @backingInt(State.active);
+    @memset(r[16..32], 0x33); // device_uuid
+    std.mem.writeInt(u64, r[40..48], 10, .little); // capacity_blocks
+    std.mem.writeInt(u64, r[48..56], 1 << 30, .little); // volume_len
+    std.mem.writeInt(u16, r[56..58], uri.len, .little);
+    std.mem.writeInt(u16, r[58..60], @intCast(fabric_blob.len), .little);
+    var off = HEAD_LEN + DATA_VOLUME_FIXED_LEN;
+    @memcpy(out[off..][0..uri.len], uri);
+    off += uri.len;
+    @memcpy(out[off..][0..fabric_blob.len], fabric_blob);
+    off += fabric_blob.len;
+    checksum.stamp(out, off);
+    return out;
+}
+
+test "the fabric codec by fixture: a version 1 image (one FabricPathWire + a framed NQN) decodes to a list of ONE path and re-encodes BYTE-EXACTLY as the version 2 image (head, paths, NQN); the version 2 image decodes to the same; a version 1 image's lengths are checked (a lying NQN length is truncated)" {
+    const gpa = testing.allocator;
+    // nqn.x (5 B) at tcp 10.1.2.3:4420.
+    const v1_blob = [_]u8{
+        1, 1, 0x44, 0x11, // trtype tcp, adrfam ipv4, trsvcid 4420 LE
+        10, 1, 2, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // traddr
+        5,   0, // subnqn_len LE
+        'n', 'q',
+        'n', '.',
+        'x',
+    };
+    const v2_blob = [_]u8{
+        1, 0, 5, 0, // n_paths 1, reserved, subnqn_len 5 LE
+        1, 1, 0x44, 0x11, // path 0: trtype tcp, adrfam ipv4, trsvcid 4420 LE
+        10,  1,   2,   3,   0,   0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // traddr
+        'n', 'q', 'n', '.', 'x',
+    };
+    const v1 = try fabricImage(gpa, VERSION_V1, &v1_blob);
+    defer gpa.free(v1);
+    const v2 = try fabricImage(gpa, VERSION, &v2_blob);
+    defer gpa.free(v2);
+    try testing.expectEqual(@as(?u64, 7), peekGeneration(v1));
+    try testing.expectEqual(@as(?u64, 7), peekGeneration(v2));
+    var from_v1 = try decode(gpa, v1, null);
+    defer from_v1.deinit(gpa);
+    const f1 = from_v1.data[0].fabric.?;
+    try testing.expectEqual(@as(usize, 1), f1.paths.len);
+    try testing.expect(f1.paths[0].eql(v4Path(10, 1, 2, 3, 4420)));
+    try testing.expectEqualStrings("nqn.x", f1.subnqn);
+    // The old image re-encodes as the new one, byte for byte.
+    const re = try encode(gpa, &from_v1, test_cap);
+    defer gpa.free(re);
+    try testing.expectEqualSlices(u8, v2, re);
+    var from_v2 = try decode(gpa, v2, null);
+    defer from_v2.deinit(gpa);
+    const f2 = from_v2.data[0].fabric.?;
+    try testing.expectEqual(@as(usize, 1), f2.paths.len);
+    try testing.expect(f2.paths[0].eql(f1.paths[0]));
+    try testing.expectEqualStrings("nqn.x", f2.subnqn);
+    // A v1 blob whose NQN length lies past the blob; a v2 blob with a
+    // reserved byte set; a v2 blob read as v1 (the shapes are distinct).
+    var lying = v1_blob;
+    lying[20] = 6;
+    const bad1 = try fabricImage(gpa, VERSION_V1, &lying);
+    defer gpa.free(bad1);
+    try testing.expectError(error.Truncated, decode(gpa, bad1, null));
+    var reserved = v2_blob;
+    reserved[1] = 1;
+    const bad2 = try fabricImage(gpa, VERSION, &reserved);
+    defer gpa.free(bad2);
+    try testing.expectError(error.BadRecord, decode(gpa, bad2, null));
+    const cross = try fabricImage(gpa, VERSION_V1, &v2_blob);
+    defer gpa.free(cross);
+    try testing.expectError(error.Truncated, decode(gpa, cross, null));
 }
 
 test "the rotation window: openRekey sets the head flag and a 40 B tail that round-trips byte-canonically; a pre-window image reads as no window; open refuses a plaintext set, the primary's own id and a second next key (the same next key is idempotent); closeRekey makes the next key the primary and drops the tail; a window on a plaintext head and a next id equal to the primary refuse at decode" {
@@ -1389,8 +1637,9 @@ test "decode refuses by class in order and names each; the record cap refuses at
     mut[0] = 'X';
     try testing.expectError(error.BadMagic, decode(gpa, mut, &diag));
     @memcpy(mut, bytes);
-    std.mem.writeInt(u16, mut[8..10], 2, .little);
+    std.mem.writeInt(u16, mut[8..10], VERSION + 1, .little);
     try testing.expectError(error.WrongVersion, decode(gpa, mut, &diag));
+    try testing.expect(peekGeneration(mut) == null);
     @memcpy(mut, bytes);
     mut[50] ^= 1;
     try testing.expectError(error.ChecksumMismatch, decode(gpa, mut, &diag));

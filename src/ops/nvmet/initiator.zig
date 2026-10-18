@@ -87,6 +87,12 @@ pub const ConnectSpec = struct {
     host_iface: ?[]const u8 = null,
     /// 0 refuses BEFORE any side effect (I:924-930).
     nr_io_queues: ?u32 = null,
+    /// The path-loss clocks (null = the kernel's: fail-fast off,
+    /// ctrl_loss 600 s, reconnect 10 s — an all-paths-down head would
+    /// hold I/O for ten minutes). Written on tcp only: nvme-loop's
+    /// `allowed_opts` has none of them (EINVAL), and a loop target lives
+    /// in the same kernel — there is no path to lose.
+    timeouts: ?ConnectTimeouts = null,
 
     /// The exact option string (`fabrics_connect_string` I:846-868 + the
     /// loop shape): an all-absent option set is byte-identical to the base.
@@ -101,6 +107,7 @@ pub const ConnectSpec = struct {
         if (self.host_traddr) |h| try w.print(",host_traddr={s}", .{h});
         if (self.host_iface) |i| try w.print(",host_iface={s}", .{i});
         if (self.nr_io_queues) |n| try w.print(",nr_io_queues={d}", .{n});
+        if (self.trtype == .tcp) if (self.timeouts) |t| try w.print(",fast_io_fail_tmo={d},ctrl_loss_tmo={d},reconnect_delay={d}", .{ t.fast_io_fail_tmo, t.ctrl_loss_tmo, t.reconnect_delay });
     }
 
     pub fn text(self: ConnectSpec, buf: []u8) []const u8 {
@@ -108,6 +115,19 @@ pub const ConnectSpec = struct {
         self.write(&w) catch unreachable;
         return w.buffered();
     }
+};
+
+/// The kernel's path-loss clocks on a connect (`nvmf_parse_options`),
+/// seconds: `fast_io_fail_tmo` — with EVERY path of a head down, the
+/// head's I/O is held until each path's fail-fast expires, then fails
+/// (EIO: the daemon's fail-stop); a single path's loss fails over at once
+/// regardless; `ctrl_loss_tmo` — how long a lost path reconnects before
+/// the kernel deletes its controller; `reconnect_delay` — between
+/// attempts. Derived in `multipath.deriveConnectTimeouts`.
+pub const ConnectTimeouts = struct {
+    fast_io_fail_tmo: u32,
+    ctrl_loss_tmo: u32,
+    reconnect_delay: u32,
 };
 
 pub const ReadBack = struct { instance: u32, cntlid: u16 };
@@ -378,7 +398,7 @@ pub fn splitNamespaceName(name: []const u8) ?struct { ctrl: u32, ns: u32 } {
     return .{ .ctrl = ctrl, .ns = ns };
 }
 
-fn readSysfs(buf: []u8, comptime fmt: []const u8, args: anytype) ?[]const u8 {
+pub fn readSysfs(buf: []u8, comptime fmt: []const u8, args: anytype) ?[]const u8 {
     var pb: [linux.PATH_MAX]u8 = undefined;
     const path = std.fmt.bufPrintSentinel(&pb, fmt, args, 0) catch return null;
     const t = proc.readSmall(path.ptr, buf) orelse return null;
@@ -389,13 +409,13 @@ fn readSysfs(buf: []u8, comptime fmt: []const u8, args: anytype) ?[]const u8 {
 /// no allocation, directory order, `.`/`..` skipped. The fabric sampler
 /// walks `class/nvme` through it (the `.stats` render's one-allocation
 /// law); `listDir` sorts a duped copy for the callers that keep names.
-const DirWalk = struct {
+pub const DirWalk = struct {
     fd: linux.fd_t,
     buf: [8192]u8 = undefined,
     len: usize = 0,
     off: usize = 0,
 
-    fn open(comptime fmt: []const u8, args: anytype) !DirWalk {
+    pub fn open(comptime fmt: []const u8, args: anytype) !DirWalk {
         var pb: [linux.PATH_MAX]u8 = undefined;
         const path = std.fmt.bufPrintSentinel(&pb, fmt, args, 0) catch return error.NameTooLong;
         const rc = linux.open(path.ptr, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true }, 0);
@@ -403,12 +423,12 @@ const DirWalk = struct {
         return .{ .fd = @intCast(rc) };
     }
 
-    fn close(self: *DirWalk) void {
+    pub fn close(self: *DirWalk) void {
         _ = linux.close(self.fd);
     }
 
     /// The next entry's name (valid until the next call), null at the end.
-    fn next(self: *DirWalk) !?[]const u8 {
+    pub fn next(self: *DirWalk) !?[]const u8 {
         while (true) {
             if (self.off >= self.len) {
                 const n = linux.getdents64(self.fd, &self.buf, self.buf.len);
@@ -426,7 +446,7 @@ const DirWalk = struct {
     }
 };
 
-fn listDir(gpa: Allocator, comptime fmt: []const u8, args: anytype) ![][]u8 {
+pub fn listDir(gpa: Allocator, comptime fmt: []const u8, args: anytype) ![][]u8 {
     var walk = try DirWalk.open(fmt, args);
     defer walk.close();
     var out: std.ArrayList([]u8) = .empty;
@@ -494,7 +514,7 @@ pub const Controller = struct {
     }
 };
 
-fn fill(dst: []u8, len: *usize, src: ?[]const u8) void {
+pub fn fill(dst: []u8, len: *usize, src: ?[]const u8) void {
     const s = src orelse "";
     const n = @min(s.len, dst.len);
     @memcpy(dst[0..n], s[0..n]);
@@ -1131,8 +1151,14 @@ test "connect string: the tcp base shape; each option singly and combined; the l
     all.host_iface = "eth1";
     all.nr_io_queues = 4;
     try testing.expect(std.mem.endsWith(u8, all.text(&buf), ",host_traddr=10.0.0.9,host_iface=eth1,nr_io_queues=4"));
-    const loop: ConnectSpec = .{ .trtype = .loop, .subnqn = "nqn.x", .hostnqn = "nqn.h", .hostid = "id" };
+    all.timeouts = .{ .fast_io_fail_tmo = 45, .ctrl_loss_tmo = 90, .reconnect_delay = 10 };
+    try testing.expect(std.mem.endsWith(u8, all.text(&buf), ",nr_io_queues=4,fast_io_fail_tmo=45,ctrl_loss_tmo=90,reconnect_delay=10"));
+    // nvme-loop admits none of the clocks: never written on loop.
+    var loop: ConnectSpec = .{ .trtype = .loop, .subnqn = "nqn.x", .hostnqn = "nqn.h", .hostid = "id" };
     try testing.expectEqualStrings("transport=loop,nqn=nqn.x,hostnqn=nqn.h,hostid=id", loop.text(&buf));
+    loop.timeouts = all.timeouts;
+    try testing.expectEqualStrings("transport=loop,nqn=nqn.x,hostnqn=nqn.h,hostid=id", loop.text(&buf));
+    loop.timeouts = null;
     var loop_addr = loop;
     loop_addr.traddr = "loopaddr";
     try testing.expectEqualStrings("transport=loop,nqn=nqn.x,hostnqn=nqn.h,hostid=id,traddr=loopaddr", loop_addr.text(&buf));

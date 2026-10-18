@@ -3,11 +3,8 @@
 **`docs/charter.md` is the specification.** Read it before touching core logic. This file
 is only the how-we-work layer on top of it.
 
-`docs/memory/` holds the agent's working notes (venues, the progress ledger, decisions,
-performance findings, Zig 0.17 facts) — read the matching note before working in an area;
-`docs/memory/README.md` lists them. Where a note and the repo disagree, the repo wins.
 When resuming work, read the newest note in `docs/handoff/` first (state, open items in order,
-resume steps).
+owed lists, resume steps); `docs/decisions/` and `docs/evidence/` hold the why and the numbers.
 
 The Rust reference implementation lives at `~/Source/squeezefs` (read-only; mounted
 read-only in the build container). `docs/porting/*.md` are compact porting specs

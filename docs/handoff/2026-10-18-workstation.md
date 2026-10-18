@@ -51,6 +51,42 @@ on `539ae02` and on `c6e0f5b` are in `.gate-train/ledger-v2.tsv`.
   FAILED daemon exits when its `.stats` is unreadable; the overlay's fence verdict fires
   `overlay_fence_drops` like the other fence arms (scoped by the harness on dm-error daemons).
 
+## Owed items carried from the retired progress ledger
+
+`docs/memory/` (the agent-memory snapshot that carried the notes to this workstation) is gone;
+its progress ledger's actionable lists live here now. Everything else it held is in `git log`,
+the evidence notes and the decision ledgers.
+
+- **Deliberate limits still standing**: `submitReplyFdBody` falls back to a copy
+  (`transport_fd_body_fallbacks`); `--daemon` requires `--log-file` (0002 row 93).
+- **Owed from the rungs**: forest/slot-tree `compact_node_forced` and `reachable_node_addrs`
+  (rung 2b); a lane ticket waited from a fiber on another lane still parks the raw futex,
+  supervisor escalation tested only as the pure state machine, the empty-submit enter in
+  `ring_park.park` (rung 3); NT stores and per-op NVMe phase stamps (rung 4); the KVDA page sink
+  follow-ups and a parked joiner's `.stats` EAGAIN exemption (rung 6); key rotation as a
+  defrag-class mover (rung 8); the smoke's cache-path data-plane stage fails when
+  `SQUEEZEFS_TEST_DATA_DIR` points at `/build/ext` (a test-side timing assumption on a non-sparse
+  staging-ring preallocation).
+- **Owed from the syncfs work**: fsync flushes at most 64 parked blocks per inode; the `sync.mpmc`
+  pool row assumes its race happened (fails under load); a failed nvmet share leaves its subsystem
+  behind; `quarantineBlock`'s virgin arm vs a concurrent mint (judged benign).
+- **Suites open items** (re-judge in the release window): generic/069 staged-append amplification
+  (≈ 380 appends/s, correct but slow); staging ring full → ENOSPC under a 20-writer 4 MiB burst;
+  generic/740 bare mkfs must refuse a foreign fs; generic/756/777 `open_by_handle` on an unlinked
+  file returns success; daemon RSS 1.9 → 3.7 GB under the suites without return.
+- **Post-release list**: the exec lane starves its own end-of-pass flush/reap while a fiber
+  yield-loops (no product fiber does); peer unlink/rename ~10 s wait for the slot offer during
+  handover; multi-worker per kernel queue; no-opendir; best-effort caches that still allocate under
+  a spin lock (`kv_fs` parents, `manager` identities, `plane_arm` declared — their drops are
+  counted; move the allocation out of the lock); the pjdfstest row's daemon refuses unmount while
+  `prove` is in the mount and never retries (1 leak in ~230 VM gate runs).
+- **Owner rulings pending from `rung-10-seqwrite.md`**: (a) fiber-aware device waits (revise
+  decision 0001 item 2 so a device write parks only its fiber; ≈ +50 % on big writes); (b)
+  zero-copy big writes from the slot (charter §6.2 item 1; with (a) ≈ 2×). Recommended both, (a)
+  first — this is where the performance stretch starts.
+- **Hardware-owed**: the box brackets on reference hardware, zcrx against a real HDS NIC, PR preempt
+  on a real substrate — the 200 G venue below covers the first two.
+
 ## The performance venue (owner, 2026-10-18)
 
 Five hosts with 2 × 200 GbE each (40 GB/s measured over the two links). Plan: 1 MDT host, 2 OSS

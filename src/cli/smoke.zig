@@ -8647,6 +8647,50 @@ test "smoke: [venue-exclusive] A DAEMON WHOSE BRING-UP FAILS NEVER HANGS THE HOS
     try testing.expectEqual(@as(usize, 0), try fuseMountsOf(gpa, io, rig.mp));
 }
 
+test "smoke: THE STAGED READ'S IDENTITY WINDOW — a 256 KiB staged file; an O_DIRECT read of its page 39 held by SQUEEZEFS_TEST_STAGED_READ_HOLD between its layout resolve and its ring lookup (the device-true ruler, so the read reaches the lane) while `sync -f` under the promote lever promotes the file into a pack (the packed layout committed, the ring entry released) → released: the page reads back as written, staged_payload_lost_reads 0, the file promoted; the hold and the sync on different CPUs' queues (red: 4 KiB of zeros and `staged payload unreachable`; fstests generic/127 under the lever, a host-wide sync)" {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    var fb: [linux.PATH_MAX]u8 = undefined;
+    const fifo = try std.fmt.bufPrintSentinel(&fb, "{s}/staged-read.fifo", .{rig.work}, 0);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.mknodat(linux.AT.FDCWD, fifo.ptr, linux.S.IFIFO | 0o600, 0)));
+    try rig.env.put("SQUEEZEFS_FSYNC_PROMOTE_STAGED", "1");
+    try rig.env.put("SQUEEZEFS_DIRECT_DEVICE_TRUE", "1");
+    try rig.env.put("SQUEEZEFS_TEST_STAGED_READ_HOLD", fifo);
+    try rig.formatSet(true);
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(0);
+    var released = false;
+    defer if (!released) releaseHold(fifo);
+    var script: [512]u8 = undefined;
+    gpa.free(try rig.shOk(rig.work, try std.fmt.bufPrint(&script, "head -c 262144 /dev/urandom > pattern && cp pattern {s}/f && dd if=pattern of=want bs=4096 skip=39 count=1 status=none", .{rig.mp})));
+    const mark = try rig.logLen();
+    // The read: page 39 (0x27000, the suite's page), O_DIRECT, from CPU 2's
+    // queue; it parks in the daemon before its ring lookup.
+    const src = try std.fmt.allocPrintSentinel(gpa, "if={s}/f", .{rig.mp}, 0);
+    defer gpa.free(src);
+    const dst = try std.fmt.allocPrintSentinel(gpa, "of={s}/page", .{rig.work}, 0);
+    defer gpa.free(dst);
+    var reader = try std.process.spawn(io, .{ .argv = &.{ "taskset", "-c", "2", "dd", src, dst, "bs=4096", "skip=39", "count=1", "iflag=direct", "status=none" }, .environ_map = &rig.env, .stdin = .ignore, .stdout = .ignore, .stderr = .inherit });
+    _ = try rig.awaitLog("SQUEEZEFS_TEST_STAGED_READ_HOLD", mark, ready_wait_ns);
+    // The promotion lands in the window: syncfs of the mount from CPU 5's
+    // queue, returned (the file promoted) before the hold is released. No
+    // other request touches the mount while the read is parked.
+    gpa.free(try rig.shOk(rig.work, try std.fmt.bufPrint(&script, "taskset -c 5 sync -f {s}", .{rig.mp})));
+    releaseHold(fifo);
+    released = true;
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try reader.wait(io));
+    gpa.free(try rig.shOk(rig.work, "cmp page want"));
+    const t = try rig.stats();
+    defer gpa.free(t);
+    try testing.expectEqual(@as(?u64, 1), numberAfter(t, "\"fsync_promoted_files\":"));
+    try testing.expectEqual(@as(?u64, 1), numberAfter(t, "\"layout_promoted_packed\":"));
+    try testing.expectEqual(@as(?u64, 0), numberAfter(t, "\"staged_payload_lost_reads\":"));
+    try rig.umount();
+}
+
 test "smoke: FSCK AND SCRUB — format (a cache path) → fill (dirs, 200 packed small files, hard links, three fsync'd 20 MiB files, a clone) → umount → `fsck --offline --scrub` 0 findings over every block → mount, 8-way storm, kill -9 → `fsck --offline` 0 findings → remount, clean umount → a planted stray reference is exactly [C3]+[C8] on its block (exit 1), `--repair` plans, `--repair --apply` releases it, clean → a planted orphan inode is exactly [C9], destroyed on apply, clean → `merge-reports` of two residue shards ≡ the whole run" {
     const io = testing.io;
     if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);

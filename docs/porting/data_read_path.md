@@ -166,6 +166,16 @@ read_file_range_zero_copy_with_meta(path, offset, size, dest, hint, meta_hint, z
   else STABLE lost identity ⇒ note_lost_staged_payload; zeros of lost_staged_range_len   // D0 degrade, loud, :19835–19847
 ```
 
+The "fresh identity moved" line is load-bearing (`docs/evidence/rung-10-staged-unreachable.md`):
+the reader holds no lock, and a promotion commits its layout and releases the ring
+entry under its own locks between a reader's resolve and its ring lookup, so an
+ABSENT ring copy is judged only against a resolve taken AFTER the lookup — a moved
+kind re-dispatches, a moved `file_id` / durable copy re-resolves, and the lost arm
+(zeros) needs the SAME staged identity on both sides of the miss. The port's
+`readStaged` had the in-flight and lost arms without this line and served 4 KiB of
+zeros for a promoted file (fstests generic/127, promote-at-fsync on, a host-wide sync).
+The try-only warm ladder is not exposed: its ring miss is a Demote to the lane.
+
 ### 1.4 Striped, single block (`start_block == end_block`, `:19848–21140`)
 
 ```

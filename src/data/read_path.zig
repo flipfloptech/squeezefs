@@ -522,6 +522,9 @@ pub const Config = struct {
     zc_serve: bool = false,
     /// The non-escalating ladder cap (24; the test seam).
     rebind_ladder_cap: u32 = MAX_REBINDS,
+    /// `SQUEEZEFS_TEST_STAGED_READ_HOLD`: the FIFO a staged read parks on
+    /// between its identity resolve and its ring lookup (null = no hold).
+    staged_read_hold: ?[]const u8 = null,
     cores: u32,
     hot_budget: u64,
     read_mem_limit: u64,
@@ -543,6 +546,7 @@ pub const Config = struct {
             .direct_device_true = knobs.boolKnob("SQUEEZEFS_DIRECT_DEVICE_TRUE", env),
             .zc_serve = knobs.boolKnob("SQUEEZEFS_READ_ZC_SERVE", env),
             .rebind_ladder_cap = if (cap_seam == 0) MAX_REBINDS else cap_seam,
+            .staged_read_hold = knobs.parseStr(env.get("SQUEEZEFS_TEST_STAGED_READ_HOLD")),
             .cores = facts.cpus,
             .hot_budget = hot,
             .read_mem_limit = read_mem,
@@ -1023,9 +1027,19 @@ pub const ReadPath = struct {
 
     // ---- §1.3 staged ----
 
+    /// The reader takes no lock, so the identity it resolved can move before
+    /// its ring lookup: a promotion commits the packed (or inline, or own-
+    /// block) layout and releases the ring entry under its own locks, a
+    /// re-stage after a truncate to 0 lands under a fresh id. An ABSENT copy
+    /// is therefore judged only against a resolve taken AFTER the lookup;
+    /// the lost arm (zeros) needs the same staged identity on both sides of
+    /// it (fstests generic/127 under the promote-at-fsync lever: a host-wide
+    /// sync's promotion of fsx's file landed in the window of a one-page
+    /// read, which served 4 KiB of zeros for bytes the writer had acked).
     fn readStaged(self: *ReadPath, io: Io, ino: u64, info: FileInfo, offset: u64, out: []u8) Error!usize {
         var attempt: u32 = 0;
         var cur = info;
+        if (self.cfg.staged_read_hold) |path| holdStagedRead(io, ino, path);
         while (attempt < IDENTITY_LOOP) : (attempt += 1) {
             switch (self.write_side.staged_payload(self.write_side.ctx, ino, cur.file_id, offset, out.len, out)) {
                 .served => |n| {
@@ -1040,7 +1054,19 @@ pub const ReadPath = struct {
                     if (cur.kind != .staged) return self.read(io, ino, offset, out.len, .{ .buf = out }, .{});
                     continue;
                 },
-                .absent => {},
+                .absent => {
+                    const fresh = self.meta.file(self.meta.ctx, ino) orelse return error.FileNotFound;
+                    if (fresh.kind != .staged) {
+                        stats.staged_identity_retries.inc();
+                        return self.read(io, ino, offset, out.len, .{ .buf = out }, .{});
+                    }
+                    if (!std.mem.eql(u8, &fresh.file_id, &cur.file_id) or !sameDurableCopy(fresh.durable_copy, cur.durable_copy)) {
+                        stats.staged_identity_retries.inc();
+                        cur = fresh;
+                        continue;
+                    }
+                    cur = fresh;
+                },
             }
             if (cur.durable_copy) |m| {
                 // ONE ranged routed window on the mapping's own volume.
@@ -1067,6 +1093,23 @@ pub const ReadPath = struct {
         }
         log.err("read of ino {d}: the staged identity kept moving across {d} re-resolves", .{ ino, IDENTITY_LOOP });
         return error.InputOutput;
+    }
+
+    fn sameDurableCopy(a: ?Mapping, b: ?Mapping) bool {
+        if (a == null or b == null) return (a == null) == (b == null);
+        return a.?.eql(b.?);
+    }
+
+    /// `SQUEEZEFS_TEST_STAGED_READ_HOLD`: a staged read parks between its
+    /// identity resolve and its ring lookup until a writer opens the FIFO —
+    /// the window a promotion's commit + release lands in.
+    fn holdStagedRead(io: Io, ino: u64, path: []const u8) void {
+        log.warn("read of ino {d}: SQUEEZEFS_TEST_STAGED_READ_HOLD — the staged identity resolved; holding before the ring lookup until a writer opens {s}", .{ ino, path });
+        const f = Io.Dir.cwd().openFile(io, path, .{}) catch |e| {
+            log.warn("read of ino {d}: the staged-read hold could not open {s} ({t}); not holding", .{ ino, path, e });
+            return;
+        };
+        f.close(io);
     }
 
     /// A window read's verdict before the caller's binding recheck: the
@@ -2016,6 +2059,8 @@ const Fixture = struct {
     xscratch: []u8 = &.{},
     size: u64 = 0,
     kind: layout.Kind = .striped,
+    /// The staged / packed identity the meta seam reports.
+    file_id: layout.FileId = layout.zero_file_id,
     bindings: [MaxBlocks]?Mapping = @splat(null),
     inline_data: []const u8 = &.{},
     device_reads: Atomic(u64) = .init(0),
@@ -2134,7 +2179,7 @@ const Fixture = struct {
     fn metaFile(ctx: *anyopaque, _: u64) ?FileInfo {
         const self: *Fixture = @ptrCast(@alignCast(ctx));
         _ = self.file_calls.fetchAdd(1, .monotonic);
-        return .{ .size = self.size, .kind = self.kind, .durable_copy = if (self.kind == .packed_) self.bindings[0] else null };
+        return .{ .size = self.size, .kind = self.kind, .file_id = self.file_id, .durable_copy = if (self.kind == .packed_) self.bindings[0] else null };
     }
     fn metaBinding(ctx: *anyopaque, _: u64, block: u64) ?Mapping {
         const self: *Fixture = @ptrCast(@alignCast(ctx));
@@ -3217,6 +3262,103 @@ test "the write side outranks every tier: an overlay serve returns its bytes; fu
     try testing.expectEqualSlices(u8, &@as([16]u8, @splat(0xAA)), buf[0..16]);
     try Fixture.expected(2 * Fixture.bs + 16, buf[16..4096]);
     try testing.expectEqual(@as(u64, 1), f.device_reads.load(.monotonic));
+}
+
+/// The staged arm's ring, as a promotion and a re-stage leave it: the
+/// identity the read resolved is ABSENT at its lookup because the layout
+/// moved in between — the promotion committed the packed layout and
+/// released the ring entry, or a re-stage under a fresh identity landed.
+/// The double applies the move at the lookup itself: that is the window.
+const StagedRing = struct {
+    var lookups: u32 = 0;
+    var mode: enum { promoted, restaged, lost } = .promoted;
+    const next_id: layout.FileId = @splat(0x5A);
+
+    fn stagedPayload(ctx: *anyopaque, _: u64, file_id: layout.FileId, _: u64, len: u64, dest: []u8) StagedVerdict {
+        const fx: *Fixture = @ptrCast(@alignCast(ctx));
+        lookups += 1;
+        switch (mode) {
+            .promoted => if (fx.kind == .staged) {
+                // The promotion's commit + release, between the reader's
+                // resolve and its lookup: a packed tenant on block 1.
+                fx.kind = .packed_;
+                fx.bindings[0] = Mapping.tenant(Fixture.vol_tag, 1 * Fixture.bs, 1, 0, @intCast(fx.size));
+            },
+            .restaged => {
+                if (std.mem.eql(u8, &file_id, &next_id)) {
+                    @memset(dest[0..@intCast(len)], 0x77);
+                    return .{ .served = @intCast(len) };
+                }
+                // A truncate to 0 and a write re-staged under a fresh id.
+                fx.file_id = next_id;
+            },
+            .lost => {},
+        }
+        return .absent;
+    }
+    fn none(_: *anyopaque, _: u64, _: u64, _: u64, _: []u8) OverlayVerdict {
+        return .none;
+    }
+    fn runs(_: *anyopaque, _: u64, _: u64, _: u64, _: u64, _: []u8) ExtentCoverage {
+        return .none;
+    }
+    fn block(_: *anyopaque, _: u64, _: u64, _: u64, _: u64, _: []u8, _: bool) StagedBlock {
+        return .none;
+    }
+    fn no(_: *anyopaque, _: u64) bool {
+        return false;
+    }
+    fn no2(_: *anyopaque, _: u64, _: u64) bool {
+        return false;
+    }
+    fn bind(fx: *Fixture) void {
+        fx.rp.write_side = .{ .ctx = fx, .overlay_read = &none, .extent_runs = &runs, .staged_block = &block, .staged_payload = &stagedPayload, .has_retained_extents = &no, .open_overlay = &no2, .has_custody = &no2 };
+    }
+};
+
+test "a staged read whose identity moved between its resolve and its ring lookup re-resolves instead of serving zeros: the promotion that committed the packed layout and released the ring entry in that window serves the tenant's bytes; a re-stage under a fresh identity serves the fresh copy; only an identity still staged and still absent after a FRESH resolve is the lost arm (repro-port: fstests generic/127 under the promote-at-fsync lever — a host-wide sync promoted fsx's file while one page was read, `staged payload unreachable for ino 8: serving 4096 zero bytes`)" {
+    const io = testing.io;
+    const f = try Fixture.init(testing.allocator, .{});
+    defer f.deinit();
+    f.kind = .staged;
+    f.size = 6000;
+    f.file_id = @splat(0xA5);
+    f.mint(1);
+    StagedRing.bind(f);
+    const buf = try alignedBuf(testing.allocator, 8192);
+    defer testing.allocator.free(buf);
+    const lost0 = staging.stats.staged_payload_lost_reads.load();
+    // 1. The promotion lands in the window: the tenant's bytes, never zeros.
+    StagedRing.mode = .promoted;
+    StagedRing.lookups = 0;
+    const retries0 = stats.staged_identity_retries.load();
+    try testing.expectEqual(@as(usize, 4096), try f.rp.read(io, 7, 0, 4096, .{ .buf = buf[0..4096] }, .{}));
+    try Fixture.expected(1 * Fixture.bs, buf[0..4096]);
+    try testing.expectEqual(@as(u32, 1), StagedRing.lookups);
+    try testing.expectEqual(retries0 + 1, stats.staged_identity_retries.load());
+    try testing.expectEqual(lost0, staging.stats.staged_payload_lost_reads.load());
+    // 2. A re-stage under a fresh identity lands in the window: the fresh
+    //    copy (the ring's), never zeros.
+    f.kind = .staged;
+    f.file_id = @splat(0xA5);
+    StagedRing.mode = .restaged;
+    StagedRing.lookups = 0;
+    try testing.expectEqual(@as(usize, 4096), try f.rp.read(io, 7, 0, 4096, .{ .buf = buf[0..4096] }, .{}));
+    try testing.expectEqualSlices(u8, &@as([4096]u8, @splat(0x77)), buf[0..4096]);
+    try testing.expectEqual(@as(u32, 2), StagedRing.lookups);
+    try testing.expectEqual(lost0, staging.stats.staged_payload_lost_reads.load());
+    // 3. STABLE lost: the identity re-resolves to the same staged record
+    //    and the ring still has nothing — size-consistent zeros, counted.
+    StagedRing.mode = .lost;
+    StagedRing.lookups = 0;
+    const calls0 = f.file_calls.load(.monotonic);
+    @memset(buf[0..4096], 0xEE);
+    try testing.expectEqual(@as(usize, 4096), try f.rp.read(io, 7, 0, 4096, .{ .buf = buf[0..4096] }, .{}));
+    try testing.expectEqualSlices(u8, &@as([4096]u8, @splat(0)), buf[0..4096]);
+    try testing.expectEqual(@as(u32, 1), StagedRing.lookups);
+    try testing.expectEqual(lost0 + 1, staging.stats.staged_payload_lost_reads.load());
+    // The verdict followed a resolve taken AFTER the lookup.
+    try testing.expectEqual(calls0 + 2, f.file_calls.load(.monotonic));
 }
 
 test "writeStatsJson emits one object naming every family" {

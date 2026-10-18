@@ -1,10 +1,19 @@
 //! The ONE lane-class completion cell (decision 0003 WP-C row 14): the
 //! oneshot a caller parks on while a ring-owning lane runs its request. It
 //! lives INSIDE a preallocated request cell (the hot path allocates nothing
-//! per op — charter §12) and takes no `Io` on either side: the completer is
-//! a lane thread parked in its ring, the waiter a caller thread parked on
-//! the raw futex (`sync/futex.zig`; decision 0001 §4). `sync.Oneshot`
-//! (`channel.zig`) is the task-class channel for `Io` code; it is not this.
+//! per op — charter §12) and holds no `Io`: the completer is a lane thread
+//! parked in its ring. Two wait faces over the one word:
+//!   - raw (`wait`, `complete`): the caller thread parks on the raw futex
+//!     (`sync/futex.zig`) — a lane thread's own cells, bare devices;
+//!   - routed (`waitIo`, `completeIo`): both sides go through an `Io`'s
+//!     futex ops — under `SqzIo` a fiber waiter parks in the executor's
+//!     futex table (its lane thread runs other fibers meanwhile) and a raw
+//!     waiter takes the counted kernel wait (decision 0001 amendment
+//!     2026-10-18: a device DMA parks only the fiber that issued it). The
+//!     `Io` is the caller's, passed per call, never stored here; a cell's
+//!     two sides must use the same face.
+//! `sync.Oneshot` (`channel.zig`) is the task-class channel for `Io` code;
+//! it is not this.
 //!
 //! The three-state word is the protocol a timed-out or dropped waiter needs:
 //!
@@ -64,6 +73,29 @@ pub fn Completion(comptime T: type) type {
         /// Park until the value is published.
         pub fn wait(self: *Self) T {
             while (self.state.load(.acquire) == pending) futex.wait(&self.state, pending);
+            return self.value;
+        }
+
+        /// The routed completer: the same release CAS, the wake through
+        /// `io`'s futex face (under `SqzIo`: the fiber waiters of the
+        /// word's bucket, then the kernel wake iff a raw waiter is
+        /// counted — `exec/futex_table.zig`'s Dekker). Pairs with `waitIo`.
+        pub fn completeIo(self: *Self, io: std.Io, value: T) bool {
+            self.value = value;
+            if (self.state.cmpxchgStrong(pending, done, .release, .acquire) == null) {
+                futex.ioWake(io, &self.state, std.math.maxInt(i32));
+                return true;
+            }
+            return false;
+        }
+
+        /// The routed waiter: park through `io`'s futex face until the
+        /// value is published — a fiber parks alone, a raw thread is
+        /// counted for the completer's kernel wake. Uncancelable: the
+        /// completer owns what the cell names until it publishes, so the
+        /// waiter never leaves early.
+        pub fn waitIo(self: *Self, io: std.Io) T {
+            while (self.state.load(.acquire) == pending) io.futexWaitUncancelable(u32, &self.state.raw, pending);
             return self.value;
         }
 
@@ -140,6 +172,46 @@ test "abandon: exactly one side owns the cell — the completer when the waiter 
     const t = try std.Thread.spawn(.{}, Late.run, .{&e});
     try testing.expectEqual(@as(?u32, 4), e.waitTimeout(10 * std.time.ns_per_s));
     t.join();
+}
+
+fn routedFace(io: std.Io) !void {
+    const C = Completion(u32);
+    // A raw waiter (the test thread) through the routed face: the
+    // completer's wake reaches the counted kernel wait.
+    var a: C = .{};
+    const Completer = struct {
+        fn run(io_: std.Io, cell: *C, v: u32) void {
+            std.debug.assert(cell.completeIo(io_, v));
+        }
+    };
+    const t = try std.Thread.spawn(.{}, Completer.run, .{ io, &a, 11 });
+    try testing.expectEqual(@as(u32, 11), a.waitIo(io));
+    t.join();
+    // A task waiter (under SqzIo a fiber on a meta lane: it parks in the
+    // futex table and its lane thread is free) completed from a raw thread.
+    var b: C = .{};
+    const Waiter = struct {
+        fn run(io_: std.Io, cell: *C) u32 {
+            return cell.waitIo(io_);
+        }
+    };
+    var fut = io.concurrent(Waiter.run, .{ io, &b }) catch return testkit.skip(@src(), .no_concurrency, "completion: no concurrency");
+    const t2 = try std.Thread.spawn(.{}, Completer.run, .{ io, &b, 12 });
+    try testing.expectEqual(@as(u32, 12), fut.await(io));
+    t2.join();
+    // A value published before the routed wait returns at once; the
+    // abandon arbitration is the same word.
+    var c: C = .{};
+    try testing.expect(c.completeIo(io, 13));
+    try testing.expectEqual(@as(u32, 13), c.waitIo(io));
+    try testing.expect(!c.abandon());
+    var d: C = .{};
+    try testing.expect(d.abandon());
+    try testing.expect(!d.completeIo(io, 14));
+}
+
+test "routed face: completeIo wakes a waitIo waiter under both executors — a raw thread and a task (a lane fiber under SqzIo)" {
+    try @import("testing.zig").underBoth(routedFace);
 }
 
 test "a parked waiter and a racing completer never both free: 64 rounds of CAS arbitration" {

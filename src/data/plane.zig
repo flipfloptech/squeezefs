@@ -804,6 +804,10 @@ pub const DataPlane = struct {
             return error.DeviceRefused;
         };
         errdefer dev.deinit();
+        // Every wait on the device parks through the executor: a handler
+        // fiber's DMA holds the fiber, never its lane thread (before the
+        // first request — the probe read below is one).
+        dev.routeWaits(self.io);
         // The identity through THIS device (the discovery pass read it
         // through a scratch one): tag, set, geometry, transform.
         {

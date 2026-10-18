@@ -12,9 +12,12 @@
 //! THROUGH the ring (measured on the stock kernel before this shape:
 //! `dev_queue` 500 µs vs `dev_service` 285 µs — the queue wait cost more
 //! than the device). A request is a preallocated cell whose index is the
-//! SQE `user_data`; the caller parks on the cell's `sync.Completion`, the
-//! queue is the ONE `sync.BoundedMpmc`, errors are the ONE table
-//! (`core/errors.zig`).
+//! SQE `user_data`; the caller parks on the cell's `sync.Completion` —
+//! through the device's wait route (`Device.routeWaits`: the executor's
+//! futex face, so a FIBER parks alone and its lane thread runs the other
+//! fibers for the whole DMA; decision 0001 amendment 2026-10-18) or, on a
+//! bare device, the raw futex —, the queue is the ONE `sync.BoundedMpmc`,
+//! errors are the ONE table (`core/errors.zig`).
 //!
 //! Discard/trim POLICY (elision, the queue, pacing) lives in the reclaim
 //! module (`data/reclaim.zig`); the device offers only the COMMAND
@@ -41,6 +44,7 @@ const clock = @import("../core/clock.zig");
 const thread_name = @import("../core/thread_name.zig");
 const reclaim = @import("../data/reclaim.zig");
 const mem_budget = @import("../mem/budget.zig");
+const exec = @import("../exec/exec.zig");
 
 pub const Refusal = nd.Refusal;
 pub const Terminal = nd.Terminal;
@@ -389,7 +393,9 @@ const Cell = struct {
 // barrier drains. ALL SeqCst: the Dekker pair between `waitCompleted`'s
 // `waiters++ ; re-read completed` and `noteCompleted`'s `completed++ ; read
 // waiters` guarantees a completer that misses the waiter forces the waiter
-// to see the count, and vice versa.
+// to see the count, and vice versa. The park and the wake take the
+// device's wait route (`Device.wait_io`: a barrier's fiber parks alone) or
+// the raw futex; both sides always pass the same route.
 // ---------------------------------------------------------------------------
 
 pub const Watermark = struct { submitted: u64, completed: u64 };
@@ -410,29 +416,29 @@ const WriteWatermark = struct {
 
     /// Worker thread at the CQE (authoritative), or the caller on a submit
     /// failure. Writes AND fsyncs count symmetrically.
-    fn noteCompleted(self: *WriteWatermark) void {
+    fn noteCompleted(self: *WriteWatermark, route: ?std.Io) void {
         const c = self.completed.fetchAdd(1, .seq_cst) + 1;
         if (c > self.submitted.load(.seq_cst)) stats.watermark_underflow.fire("completed ran past submitted");
-        if (self.waiters.load(.seq_cst) > 0) self.notify();
+        if (self.waiters.load(.seq_cst) > 0) self.notify(route);
     }
 
-    fn notify(self: *WriteWatermark) void {
+    fn notify(self: *WriteWatermark, route: ?std.Io) void {
         _ = self.epoch.fetchAdd(1, .seq_cst);
-        futex.wakeAll(&self.epoch);
+        if (route) |io| futex.ioWake(io, &self.epoch, std.math.maxInt(i32)) else futex.wakeAll(&self.epoch);
     }
 
     /// Every exit path of the worker: parked barriers fail loud, never
     /// falsely complete.
-    fn markDead(self: *WriteWatermark) void {
+    fn markDead(self: *WriteWatermark, route: ?std.Io) void {
         self.dead.store(true, .seq_cst);
-        self.notify();
+        self.notify(route);
     }
 
     fn snapshot(self: *const WriteWatermark) Watermark {
         return .{ .submitted = self.submitted.load(.seq_cst), .completed = self.completed.load(.seq_cst) };
     }
 
-    fn waitCompleted(self: *WriteWatermark, target: u64) Terminal!void {
+    fn waitCompleted(self: *WriteWatermark, route: ?std.Io, target: u64) Terminal!void {
         while (true) {
             if (self.completed.load(.seq_cst) >= target) return;
             if (self.dead.load(.seq_cst)) return error.WorkerShutdown;
@@ -442,7 +448,7 @@ const WriteWatermark = struct {
             // Re-check under the registered waiter (the Dekker half).
             if (self.completed.load(.seq_cst) >= target) return;
             if (self.dead.load(.seq_cst)) return error.WorkerShutdown;
-            futex.wait(&self.epoch, e);
+            if (route) |io| io.futexWaitUncancelable(u32, &self.epoch.raw, e) else futex.wait(&self.epoch, e);
         }
     }
 };
@@ -568,7 +574,11 @@ const Lane = struct {
         _ = self.inflight_submitters.fetchAdd(1, .seq_cst);
         defer _ = self.inflight_submitters.fetchSub(1, .release);
         if (self.closing.load(.seq_cst)) return false;
+        // The gauge rises BEFORE the push: the worker may complete the
+        // request (and lower it) before this thread returns.
+        stats.dev_dma_inflight.add(1);
         if (!self.queue.tryPush(idx)) {
+            stats.dev_dma_inflight.sub(1);
             stats.queue_push_with_cell.fire("lane queue refused a push while a cell was held");
             return false;
         }
@@ -590,20 +600,36 @@ const Lane = struct {
     /// bound, to fence the VOLUME through the lattice (§1.8) — never one
     /// EIO per op after 30 s while the writes behind it park on the same
     /// lane (decision 0003 Q5).
+    ///
+    /// Through the device's wait route (`Device.wait_io`) a FIBER parks
+    /// alone — its lane thread runs the other fibers homed there for the
+    /// whole DMA — and a raw thread takes the executor's counted kernel
+    /// wait; without a route the caller thread parks on the raw futex.
     fn wait(self: *Lane, idx: u32) Outcome {
         // The completion's acquire pairs with the worker's release CAS so
         // `buf` is visible with the outcome.
-        return self.cells[idx].done.wait();
+        const c = &self.cells[idx];
+        if (c.done.poll()) |o| return o;
+        if (self.dev.wait_io) |io| {
+            // The only route ever installed is `SqzIo`'s, whose futex face
+            // parks exactly the fibers `currentFiber` names.
+            if (exec.lane.currentFiber() != null) stats.dev_wait_fiber_parks.inc() else stats.dev_wait_raw_parks.inc();
+            return c.done.waitIo(io);
+        }
+        stats.dev_wait_raw_parks.inc();
+        return c.done.wait();
     }
 
     /// Worker side: publish the outcome; the parked caller owns the cell
     /// from here (the completion's release CAS publishes `buf`). A caller
     /// never abandons (no per-op timeout), so the completer never inherits
-    /// the cleanup.
+    /// the cleanup. The wake takes the route the waiter took (both read
+    /// `wait_io`, set before the first request).
     fn complete(self: *Lane, idx: u32, outcome: Outcome) void {
         const c = &self.cells[idx];
         c.enq_ns.store(0, .monotonic);
-        const waiter_owns = c.done.complete(outcome);
+        stats.dev_dma_inflight.sub(1);
+        const waiter_owns = if (self.dev.wait_io) |io| c.done.completeIo(io, outcome) else c.done.complete(outcome);
         std.debug.assert(waiter_owns);
     }
 
@@ -652,7 +678,7 @@ fn workerMain(lane: *Lane) void {
     while (lane.inflight_submitters.load(.seq_cst) != 0) std.Thread.yield() catch {};
     lane.sealed.store(true, .release);
     drainQueueAtExit(lane);
-    lane.wm.markDead();
+    lane.wm.markDead(lane.dev.wait_io);
 }
 
 /// Fail every still-queued request with the shutdown verdict.
@@ -665,7 +691,7 @@ fn drainQueueAtExit(lane: *Lane) void {
 /// the worker's buffer goes home, the outcome publishes.
 fn answerUnrun(lane: *Lane, idx: u32, outcome: Outcome) void {
     const c = &lane.cells[idx];
-    if (c.op != .read) lane.wm.noteCompleted();
+    if (c.op != .read) lane.wm.noteCompleted(lane.dev.wait_io);
     c.buf.release();
     c.buf = .empty;
     lane.complete(idx, outcome);
@@ -1028,13 +1054,13 @@ fn completeOne(w: *Worker, idx: u32, res: i32) void {
         },
         .write => {
             stats.write_pipeline_dev_service_ns.record(clock.monotonicNs() -| c.submitted_ns);
-            lane.wm.noteCompleted();
+            lane.wm.noteCompleted(lane.dev.wait_io);
             c.buf.release();
             c.buf = .empty;
             lane.complete(idx, .{ .io = res });
         },
         .fsync, .discard => {
-            lane.wm.noteCompleted();
+            lane.wm.noteCompleted(lane.dev.wait_io);
             lane.complete(idx, .{ .io = res });
         },
     }
@@ -1160,6 +1186,15 @@ pub const Device = struct {
     /// the FUSE queue ring that registered the slot): a lane's own fd is
     /// that lane's (fixed file 0 on its ring) and never leaves it.
     direct_fd: linux.fd_t,
+    /// The wait route (`routeWaits`): the executor's futex face every
+    /// caller parks through and every lane completes through, so a fiber
+    /// waiting on its DMA parks ALONE (its lane thread runs other fibers)
+    /// and a raw thread takes the counted kernel wait. Null = the raw
+    /// futex on both sides (bare devices: tests, offline tools). Set once,
+    /// before the first request; both sides of every cell read the same
+    /// value (a cell whose waiter and completer disagreed would lose its
+    /// wake).
+    wait_io: ?std.Io = null,
     closed: bool = false,
 
     /// `open_checked`: `probeDirectIo` FIRST (loud refusal), spawn lane 0,
@@ -1191,6 +1226,17 @@ pub const Device = struct {
     /// The fd of the zero-copy legs (module field doc). Valid until `deinit`.
     pub fn directFd(self: *const Device) linux.fd_t {
         return self.direct_fd;
+    }
+
+    /// Route every wait on this device through `io`'s futex face (the
+    /// `wait_io` field doc; decision 0001 amendment 2026-10-18). Legal only
+    /// before the first request: a request in flight would have its waiter
+    /// on one route and its completer on the other. The `Io` must outlive
+    /// the device: the lanes wake through it until their exit.
+    pub fn routeWaits(self: *Device, io: std.Io) void {
+        std.debug.assert(self.overdueCensus(clock.monotonicNs(), 0).in_flight == 0);
+        for (self.lanes[0..self.lane_count.load(.acquire)]) |l| std.debug.assert(l.?.wm.waiters.load(.seq_cst) == 0);
+        self.wait_io = io;
     }
 
     /// Stop every lane (idempotent): close queues → wake → join. Callers
@@ -1452,7 +1498,7 @@ pub const Device = struct {
         // refused submit.
         lane.wm.noteSubmitted();
         if (!lane.submit(idx)) {
-            lane.wm.noteCompleted();
+            lane.wm.noteCompleted(self.wait_io);
             lane.freeCell(idx);
             stats.uring_queue_full.inc();
             return error.QueueFull;
@@ -1645,7 +1691,7 @@ pub const Device = struct {
         c.op = .fsync;
         lane.wm.noteSubmitted();
         if (!lane.submit(idx)) {
-            lane.wm.noteCompleted();
+            lane.wm.noteCompleted(self.wait_io);
             lane.freeCell(idx);
             stats.uring_queue_full.inc();
             return error.QueueFull;
@@ -1698,7 +1744,7 @@ pub const Device = struct {
         c.enq_ns.store(clock.monotonicNs(), .monotonic);
         lane.wm.noteSubmitted();
         if (!lane.submit(idx)) {
-            lane.wm.noteCompleted();
+            lane.wm.noteCompleted(self.wait_io);
             lane.freeCell(idx);
             stats.uring_queue_full.inc();
             return error.QueueFull;
@@ -1732,7 +1778,7 @@ pub const Device = struct {
         const n = self.lane_count.load(.acquire);
         var targets: [max_lanes]u64 = undefined;
         for (self.lanes[0..n], 0..) |l, i| targets[i] = l.?.wm.submitted.load(.seq_cst);
-        for (self.lanes[0..n], 0..) |l, i| try l.?.wm.waitCompleted(targets[i]);
+        for (self.lanes[0..n], 0..) |l, i| try l.?.wm.waitCompleted(self.wait_io, targets[i]);
     }
 };
 
@@ -2415,6 +2461,83 @@ test "a warm readBlock, writeBlock and flush allocate nothing (preallocated cell
     buf.release();
     try dev.flush();
     try testing.expectEqual(before, counting.allocs.load(.monotonic));
+}
+
+test "a fiber waiting on a device write parks only itself: a second fiber homed on the same lane runs while the DMA is held; the wait counts as a fiber park and the in-flight gauge follows the DMA (decision 0001 amendment 2026-10-18)" {
+    var tf: TestFile = .{};
+    try tf.create(1 * derive.MiB);
+    defer tf.destroy();
+    // The route outlives the device (its lanes wake through it at exit).
+    const sqz = try exec.SqzIo.testInstance();
+    defer sqz.deinit();
+    const io = sqz.io();
+    const dev = try Device.open(testing.allocator, tf.path);
+    defer dev.deinit();
+    dev.routeWaits(io);
+    // Warm lane 0 so the held pass below holds exactly the one write.
+    var payload: [4096]u8 align(4096) = undefined;
+    fillPattern(&payload, 33);
+    try dev.writeBlock(0, &payload);
+    const inflight0 = stats.dev_dma_inflight.load();
+
+    // The lane holds BEFORE its park: the write is pumped into the SQ but
+    // never submitted, so the DMA stays held without a sleep.
+    const seams = &dev.seams;
+    seams.held.store(0, .release);
+    seams.hold_before_park.store(1, .release);
+    defer {
+        seams.hold_before_park.store(0, .release);
+        futex.wakeAll(&seams.hold_before_park);
+    }
+    const S = struct {
+        fn write(d: *Device, p: *const [4096]u8) DeviceError!void {
+            return d.writeBlock(4096, p);
+        }
+        /// The bystander on the same lane: runs iff the lane thread is free.
+        fn bystander(ran: *futex.Word) void {
+            ran.store(1, .release);
+            futex.wakeAll(ran);
+        }
+    };
+    const lane = sqz.metaLanes()[0];
+    const fiber_parks0 = stats.dev_wait_fiber_parks.load();
+    const raw_parks0 = stats.dev_wait_raw_parks.load();
+    var writer = try sqz.spawnOn(lane, S.write, .{ dev, &payload });
+    while (seams.held.load(.acquire) == 0) futex.wait(&seams.held, 0);
+    // The DMA is held: one request in flight, its waiter parked as a fiber.
+    try testing.expectEqual(inflight0 + 1, stats.dev_dma_inflight.load());
+    while (stats.dev_wait_fiber_parks.load() == fiber_parks0 and stats.dev_wait_raw_parks.load() == raw_parks0) std.atomic.spinLoopHint();
+    var ran: futex.Word = .init(0);
+    var by = try sqz.spawnOn(lane, S.bystander, .{&ran});
+    // THE LAW: the bystander runs during the DMA. A waiter that held the
+    // lane thread would keep it off the CPU until the DMA completes; the
+    // bound is a diagnostic, never a synchronization (the held DMA cannot
+    // complete, so a timeout here means the lane thread is held).
+    while (ran.load(.acquire) == 0) {
+        if (futex.waitTimeout(&ran, 0, 10 * std.time.ns_per_s) == .timed_out and ran.load(.acquire) == 0) {
+            std.debug.print("the fiber waiting on the DMA holds its lane thread: the bystander never ran\n", .{});
+            seams.hold_before_park.store(0, .release);
+            futex.wakeAll(&seams.hold_before_park);
+            try writer.await(io);
+            by.await(io);
+            return error.TestExpectedEqual;
+        }
+    }
+    by.await(io);
+    try testing.expectEqual(fiber_parks0 + 1, stats.dev_wait_fiber_parks.load());
+    try testing.expectEqual(raw_parks0, stats.dev_wait_raw_parks.load());
+    // Release the DMA: the writer completes and the gauge returns to 0.
+    seams.hold_before_park.store(0, .release);
+    futex.wakeAll(&seams.hold_before_park);
+    try writer.await(io);
+    try testing.expectEqual(inflight0, stats.dev_dma_inflight.load());
+    var back: [4096]u8 = undefined;
+    try tf.readAt(&back, 4096);
+    try expectPattern(&back, 33);
+    // A raw thread's wait through the same route is a counted raw park.
+    try dev.writeBlock(8192, &payload);
+    try testing.expectEqual(raw_parks0 + 1, stats.dev_wait_raw_parks.load());
+    try testing.expectEqual(fiber_parks0 + 1, stats.dev_wait_fiber_parks.load());
 }
 
 test "a dead ring fails every in-flight op and every later request with RingFailed, balances the watermark, sends the DMA slots home, and the lane still joins cleanly" {

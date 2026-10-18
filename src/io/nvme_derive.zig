@@ -374,6 +374,17 @@ pub const stats = struct {
     /// completion (writes, barriers) — the watchdog's "LOST DEVICE
     /// COMPLETION" instrument.
     pub var device_lock_waiters: counters.Gauge = .{};
+    /// Requests between the lane-queue push and the completion publish
+    /// (reads, writes, barriers, discards, every device): the DMAs in
+    /// flight. Bounded by the callers' admission (the write pipeline's
+    /// depth governor), never by the lane threads — a waiter parks only
+    /// its fiber (decision 0001 amendment 2026-10-18).
+    pub var dev_dma_inflight: counters.Gauge = .{};
+    /// Device waits that parked: a FIBER (the executor's futex table; its
+    /// lane thread ran other fibers meanwhile) vs a raw thread (the kernel
+    /// futex — a non-lane caller, or a device with no wait route).
+    pub var dev_wait_fiber_parks: counters.ShardedCounter = .{};
+    pub var dev_wait_raw_parks: counters.ShardedCounter = .{};
     /// Requests a dead lane ring still holds because the kernel took them
     /// (decision 0003 §AR.4). Each falls at its CQE; one that never comes
     /// keeps its cell and buffer for good (a leak, never a reuse).
@@ -410,10 +421,10 @@ fn writeHistJson(w: *std.Io.Writer, name: []const u8, queue: *const counters.Sha
 /// Process-wide families (every device shares them).
 pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
     try w.writeAll("{");
-    inline for (.{ "get_obj", "put_obj", "uring_queue_full", "nvme_unaligned_write_fallbacks", "dev_fills", "dev_enters", "dev_submit_enters", "dev_wake_batches", "dev_wake_writes", "dev_wakes_elided", "dev_fixed_buf_fills", "data_device_sync_requests", "data_device_syncs", "data_dma_fence_refusals", "data_dma_dismount_refusals", "aligned_pool_hits", "aligned_pool_misses", "aligned_pool_trimmed_bytes" }) |name| {
+    inline for (.{ "get_obj", "put_obj", "uring_queue_full", "nvme_unaligned_write_fallbacks", "dev_fills", "dev_enters", "dev_submit_enters", "dev_wake_batches", "dev_wake_writes", "dev_wakes_elided", "dev_fixed_buf_fills", "data_device_sync_requests", "data_device_syncs", "data_dma_fence_refusals", "data_dma_dismount_refusals", "aligned_pool_hits", "aligned_pool_misses", "aligned_pool_trimmed_bytes", "dev_wait_fiber_parks", "dev_wait_raw_parks" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, @field(stats, name).load() });
     }
-    try w.print("\"device_lock_waiters\":{d},\"dev_ring_dead_held_ops\":{d},", .{ stats.device_lock_waiters.load(), stats.dev_ring_dead_held_ops.load() });
+    try w.print("\"device_lock_waiters\":{d},\"dev_ring_dead_held_ops\":{d},\"dev_dma_inflight\":{d},", .{ stats.device_lock_waiters.load(), stats.dev_ring_dead_held_ops.load(), stats.dev_dma_inflight.load() });
     try writeHistJson(w, "read_fill_phase_ns", &stats.read_fill_dev_queue_ns, &stats.read_fill_dev_service_ns);
     try w.writeAll(",");
     try writeHistJson(w, "write_pipeline_phase_ns", &stats.write_pipeline_dev_queue_ns, &stats.write_pipeline_dev_service_ns);
@@ -799,7 +810,7 @@ test "stats JSON names every family the spec lists" {
     var w: std.Io.Writer = .fixed(&buf);
     try writeStatsJson(&w);
     const json = w.buffered();
-    for ([_][]const u8{ "get_obj", "put_obj", "uring_queue_full", "nvme_unaligned_write_fallbacks", "dev_fills", "dev_enters", "dev_submit_enters", "dev_wake_batches", "dev_wake_writes", "dev_wakes_elided", "dev_fixed_buf_fills", "data_device_sync_requests", "data_device_syncs", "data_dma_fence_refusals", "data_dma_dismount_refusals", "aligned_pool_hits", "aligned_pool_misses", "aligned_pool_trimmed_bytes", "device_lock_waiters", "read_fill_phase_ns", "write_pipeline_phase_ns", "dev_queue", "dev_service" }) |key| {
+    for ([_][]const u8{ "get_obj", "put_obj", "uring_queue_full", "nvme_unaligned_write_fallbacks", "dev_fills", "dev_enters", "dev_submit_enters", "dev_wake_batches", "dev_wake_writes", "dev_wakes_elided", "dev_fixed_buf_fills", "data_device_sync_requests", "data_device_syncs", "data_dma_fence_refusals", "data_dma_dismount_refusals", "aligned_pool_hits", "aligned_pool_misses", "aligned_pool_trimmed_bytes", "dev_wait_fiber_parks", "dev_wait_raw_parks", "device_lock_waiters", "dev_dma_inflight", "read_fill_phase_ns", "write_pipeline_phase_ns", "dev_queue", "dev_service" }) |key| {
         if (std.mem.indexOf(u8, json, key) == null) {
             std.debug.print("missing stats key {s}\n", .{key});
             return error.TestExpectedEqual;

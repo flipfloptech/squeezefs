@@ -1,8 +1,9 @@
 //! The ONE futex wrapper (charter §12; decision 0003 WP-C row 13). Three
 //! faces over one law:
 //!   - raw Linux, process-private (`wait`, `waitTimeout`, `wake`, `wakeAll`):
-//!     for lane threads and the hot-path completion cells, which never take
-//!     an `Io` (decision 0001 §4);
+//!     for lane threads' own parks and the completion cells of a bare
+//!     device (decision 0001 §4; a device with a wait route parks through
+//!     the `Io` face below — the 2026-10-18 amendment);
 //!   - raw Linux, cross-process (`waitShared`, `waitSharedTimeout`,
 //!     `wakeShared`, `waitMany`): for words that live in a `MAP_SHARED`
 //!     memfd two processes map — the IL session's slot states and doorbells

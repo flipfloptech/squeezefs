@@ -43,8 +43,9 @@
 //! runs on the paths it has; zero paths up refuses as before. The kernel's
 //! `iopolicy` default (`numa`) sends every I/O of a NUMA node down ONE
 //! path, so the mount writes `SQUEEZEFS_FABRIC_IOPOLICY` (default
-//! `queue-depth`) to every owned subsystem and reads it back — a mismatch
-//! is a warning + `fabric_iopolicy_failures`, never a refusal.
+//! `round-robin`: every stream uses every link — owner ruling 2026-10-18)
+//! to every owned subsystem and reads it back — a mismatch is a warning +
+//! `fabric_iopolicy_failures`, never a refusal.
 //! `fabric_paths_live` sums our serving controllers over the owned
 //! subsystems. Linux only.
 

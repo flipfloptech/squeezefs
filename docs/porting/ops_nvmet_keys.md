@@ -632,16 +632,20 @@ mount's pair is released (`--identity-only`, every path).
 **The I/O policy law:** the kernel's `iopolicy` default `numa` sends every I/O of a NUMA node
 down ONE path, so a single-socket client never uses its second link. At mount the daemon
 writes `SQUEEZEFS_FABRIC_IOPOLICY` (enum `numa | round-robin | queue-depth`, default
-`queue-depth` — a PROPOSED owner ruling: it balances by in-flight count across links of
-different load, kernel ≥ 6.11; `round-robin` alternates per request whatever the depth) to
-`/sys/class/nvme-subsystem/<subsys>/iopolicy` of every subsystem it owns paths of — the data
-heads AND the metadata head (below) — and reads it back: `fabric_iopolicy_sets` counts a
-read-back as asked; a write refused or read back otherwise (a kernel without the policy) is
-a warning + `fabric_iopolicy_failures`, never a refusal. `fabric_paths_live` sums the live
-serving controllers over the owned subsystems (sampled at bind and at every `.stats`
-render). Measured on 7.2.8-sqz over two loopback paths (`rung-10-fabric-multipath.md`):
-round-robin splits a 4 × 64 MiB parallel write 254024/270264 sectors; queue-depth 4 parallel
-cold readers 301056/223232; a lone serial writer under queue-depth stays on one path.
+`round-robin` — owner ruling 2026-10-18: the fabric is two 200 GbE links and the goal is
+aggregate bandwidth; round-robin alternates per request, so every stream uses every link;
+`queue-depth` (kernel ≥ 6.11) picks the path with the fewest requests in flight and ties go
+to the first, so a lone sequential stream stays on one link — it stays selectable for a
+fabric whose paths differ in latency) to `/sys/class/nvme-subsystem/<subsys>/iopolicy` of
+every subsystem it owns paths of — the data heads AND the metadata head (below) — and reads
+it back: `fabric_iopolicy_sets` counts a read-back as asked; a write refused or read back
+otherwise (a kernel without the policy) is a warning + `fabric_iopolicy_failures`, never a
+refusal. `fabric_paths_live` sums the live serving controllers over the owned subsystems
+(sampled at bind and at every `.stats` render). Measured on 7.2.8-sqz over two loopback
+paths (`rung-10-fabric-multipath.md`): round-robin splits every workload within 5 % (a
+4 × 64 MiB parallel write 254160/270128 sectors, its cold read by 4 readers 262144/262144);
+queue-depth left a lone serial writer 131072/0, a serial reader 487920/44408 and four
+parallel writers 409600/114688.
 
 **The METADATA volume** (owner extension 2026-10-18): the mount's argument names its node,
 so the daemon owns no record for it — the operator connects its paths (two `squeezefs
@@ -861,7 +865,7 @@ transports), `two-identity-fence`, `g2-restore-tcp`, `pr-registrants`, `guard-tc
 | `pr-registrants` | 64–128 `connect --hostnqn/--hostid --nr-io-queues 1` on loop; each registers its own key through `/dev/ng<N>n1`; `resv-report` | `regctl == N`, `report_bytes == 64 + 64 × N`, cap 0; drain to 0 (FID:1130-1257) |
 | `guard-{loop,tcp} ×N` | the kill-9 matrix of `fidelity-mount` repeated N times | GS:251-291 |
 | `storage-list` | `storage list` while the shares are connected | the inventory names each connected namespace, its transport, nsid, uuid, and the squeezefs superblock class (§6) |
-| `multipath-tcp` (rung 10) | RAM-backed metadata + data shares with two listeners each (127.0.0.1, 127.0.0.2); the metadata head connected by hand on both paths under one pair; the data record names both paths + a dead third; mount under `round-robin` → 4 × 64 MiB parallel write; kill -9 → remount reuses both paths → cold read-back; umount; a mount under the default (`queue-depth`) → 4 parallel cold readers | `fabric_daemon_connects 2`, `fabric_paths_degraded 1`, `fabric_paths_live 4`, ONE head (both hidden path nodes under one `nvme-subsys`), `fabric_meta_bound` lists both metadata paths live, the policy read back on both subsystems, BOTH paths carried write and read sectors (`/sys/class/nvme/nvme<N>/nvme<K>c<N>n1/stat`), `fabric_daemon_reuses 2` after kill -9, `nvmeof status` names subsystem/policy/paths, every controller released, zero residue |
+| `multipath-tcp` (rung 10) | RAM-backed metadata + data shares with two listeners each (127.0.0.1, 127.0.0.2); the metadata head connected by hand on both paths under one pair; the data record names both paths + a dead third; mount under the default (`round-robin`) → 4 × 64 MiB parallel write; kill -9 → remount under an explicit `queue-depth` reuses both paths → cold serial read-back (measured); umount; a mount under the default again → 4 parallel cold readers | `fabric_daemon_connects 2`, `fabric_paths_degraded 1`, `fabric_paths_live 4`, ONE head (both hidden path nodes under one `nvme-subsys`), `fabric_meta_bound` lists both metadata paths live, the policy read back on both subsystems (and flipped by the knob), BOTH paths carried write and read sectors under the default (`/sys/class/nvme/nvme<N>/nvme<K>c<N>n1/stat`), `fabric_daemon_reuses 2` after kill -9, `nvmeof status` names subsystem/policy/paths, every controller released, zero residue |
 | `substrate-down` | teardown by manifest; snapshot diff | empty diff (SUB:21-25) |
 
 ### 5.4 Gate rows
@@ -1000,7 +1004,7 @@ readable under the retired key.
 | `SQUEEZEFS_PR_REGISTRANT_CAP` | int `1..=65535`, unset = learn (nvmet: unbounded) | `derived_override` | a DECLARED cap for a vendor array (R:249-253, EK:420); `pr.CapLearner.effective(declared)` already takes it (pr.zig L92-94) — the row is owed since rung 6 |
 | `SQUEEZEFS_ENCRYPT_KEY_FILE` | str | `config` | landed (knobs.zig L225) |
 | `SQUEEZEFS_TEST_FIDELITY_ROOT` | str | `test_seam` | the fidelity harness's state root (`/build/fideli` default); never read by product code — the harness only |
-| `SQUEEZEFS_FABRIC_IOPOLICY` | enum `numa \| round-robin \| queue-depth`, default `queue-depth` | `enum_select` | the kernel multipath I/O policy written to every owned subsystem at mount (§3.7); the default is a PROPOSED owner ruling |
+| `SQUEEZEFS_FABRIC_IOPOLICY` | enum `numa \| round-robin \| queue-depth`, default `round-robin` | `enum_select` | the kernel multipath I/O policy written to every owned subsystem at mount (§3.7); owner ruling 2026-10-18 (two 200 GbE links, aggregate bandwidth: round-robin split every measured workload within 5 %, queue-depth left a lone stream 131072/0) |
 | `SQUEEZEFS_FABRIC_FAST_IO_FAIL_TMO_S` | int `1..=600`, derived 45 | `derived_override` | the connect's fail-fast = the claim's staleness TTL (§3.1) |
 | `SQUEEZEFS_FABRIC_CTRL_LOSS_TMO_S` | int `1..=3600`, derived 90 | `derived_override` | 2 × TTL (§3.1); infinite is refused by range |
 | `SQUEEZEFS_FABRIC_RECONNECT_DELAY_S` | int `1..=600`, derived 10 | `derived_override` | the claim's beat (§3.1) |

@@ -1164,7 +1164,7 @@ fn pathStats(rig: *Rig, instances: []const u32, nodes: *[16][32]u8, out: *[16]mu
     }
 }
 
-test "nvmet fidelity: multipath-tcp — RAM-backed metadata and data shares with TWO tcp listeners each (127.0.0.1 and 127.0.0.2); the metadata head connected by hand on both paths under the one pair (rule 2 per path accepts, fabric_meta_bound lists both live, the policy set on it too); the data endpoint record naming both paths plus a DEAD third (127.0.0.3, no listener): the daemon connects both under its one identity (fabric_daemon_connects 2, fabric_paths_degraded 1, fabric_paths_live 2) and ONE head serves them (one nvme-subsys, both hidden path nodes under it); iopolicy as configured (round-robin written and read back) → a parallel write workload lands sectors on BOTH paths; kill -9 → remount REUSES both paths (fabric_daemon_reuses 2) → a cold read-back lands read sectors on BOTH; umount releases both → a mount under the DEFAULT policy reconnects both, reads queue-depth back and its cold reads are measured per path; `nvmeof status` names the subsystem, its policy and every path; zero residue" {
+test "nvmet fidelity: multipath-tcp — RAM-backed metadata and data shares with TWO tcp listeners each (127.0.0.1 and 127.0.0.2); the metadata head connected by hand on both paths under the one pair (rule 2 per path accepts, fabric_meta_bound lists both live, the policy set on it too); the data endpoint record naming both paths plus a DEAD third (127.0.0.3, no listener): the daemon connects both under its one identity (fabric_daemon_connects 2, fabric_paths_degraded 1, fabric_paths_live 2) and ONE head serves them (one nvme-subsys, both hidden path nodes under it); the DEFAULT iopolicy (round-robin) written and read back on both subsystems → a parallel write workload lands sectors on BOTH paths; kill -9 → remount under an explicit queue-depth REUSES both paths (fabric_daemon_reuses 2), flips both subsystems to it and its cold serial read-back is measured per path; umount releases both → a mount under the default again reconnects both, reads round-robin back and four parallel cold readers land read sectors on BOTH; `nvmeof status` names the subsystem, its policy and every path; zero residue" {
     const gpa = testing.allocator;
     var rig = try venue(gpa, testing.io);
     defer rig.deinit();
@@ -1211,12 +1211,10 @@ test "nvmet fidelity: multipath-tcp — RAM-backed metadata and data shares with
     }
     try rig.disconnect(&cd);
     try testing.expectEqual(@as(u32, 0), try rig.controllersOf(data_nqn, null));
-    // Mount A under `round-robin` (every bio alternates, so both paths
-    // carry bytes whatever the daemon's in-flight depth — the
-    // deterministic assertion); two paths up, the dead one loud.
-    var env_rr = try rig.envWithKnob("SQUEEZEFS_FABRIC_IOPOLICY", "round-robin");
-    defer env_rr.deinit();
-    const a = try rig.spawnMountEnv("mp-a", meta_uri, &env_rr, &.{});
+    // Mount A under the DEFAULT policy (`round-robin`, owner ruling
+    // 2026-10-18: every bio alternates, so both paths carry bytes whatever
+    // the daemon's in-flight depth); two paths up, the dead one loud.
+    const a = try rig.spawnMount("mp-a", meta_uri, null, &.{});
     try rig.awaitLog(a, "ready: ", ready_wait_ns);
     const st = try rig.stats(a);
     defer gpa.free(st);
@@ -1292,14 +1290,19 @@ test "nvmet fidelity: multipath-tcp — RAM-backed metadata and data shares with
     try pathStats(rig, insts, &nodes, &after_write);
     const w0 = after_write[0].write_sectors - before[0].write_sectors;
     const w1 = after_write[1].write_sectors - before[1].write_sectors;
-    std.debug.print("\nmultipath-tcp: {s} ({s}) round-robin, 4 × 64 MiB written: write sectors per path nvme{d} {d}, nvme{d} {d}\n", .{ sub0, head, insts[0], w0, insts[1], w1 });
+    std.debug.print("\nmultipath-tcp: {s} ({s}) round-robin (the default), 4 × 64 MiB written: write sectors per path nvme{d} {d}, nvme{d} {d}\n", .{ sub0, head, insts[0], w0, insts[1], w1 });
     try testing.expect(w0 > 0 and w1 > 0);
-    // kill -9 → remount: both paths REUSED (never a second connect), the
-    // dead one degraded again; the cold read-back of every file is a
-    // device read on both paths.
+    // kill -9 → remount under an EXPLICIT `queue-depth` (the knob's other
+    // arm, the measured line: a path is chosen by in-flight count and ties
+    // go to the first, so a lone serial stream stays on one link): both
+    // paths REUSED (never a second connect), the dead one degraded again,
+    // both subsystems flipped to the knob; the cold serial read-back of
+    // every file reaches the device (the sum is the assertion).
     try rig.kill9(a);
     try testing.expectEqual(@as(u32, 2), try rig.controllersOf(data_nqn, ident_a));
-    const a2 = try rig.spawnMountEnv("mp-a2", meta_uri, &env_rr, &.{});
+    var env_qd = try rig.envWithKnob("SQUEEZEFS_FABRIC_IOPOLICY", "queue-depth");
+    defer env_qd.deinit();
+    const a2 = try rig.spawnMountEnv("mp-a2", meta_uri, &env_qd, &.{});
     try rig.awaitLog(a2, "ready: ", ready_wait_ns);
     const st2 = try rig.stats(a2);
     defer gpa.free(st2);
@@ -1307,6 +1310,10 @@ test "nvmet fidelity: multipath-tcp — RAM-backed metadata and data shares with
     try testing.expectEqual(@as(?u64, 2), json_scan.number(st2, "fabric_daemon_reuses"));
     try testing.expectEqual(@as(?u64, 1), json_scan.number(st2, "fabric_paths_degraded"));
     try testing.expectEqual(@as(?u64, 4), json_scan.number(st2, "fabric_paths_live"));
+    try testing.expectEqual(@as(?u64, 2), json_scan.number(st2, "fabric_iopolicy_sets"));
+    try testing.expect(std.mem.indexOf(u8, st2, "\"iopolicy\":\"queue-depth\",\"paths_failed\":1,") != null);
+    try testing.expect(std.mem.indexOf(u8, st2, "\"iopolicy\":\"queue-depth\",\"paths\":[{\"instance\":") != null);
+    try testing.expectEqualStrings("queue-depth", multipath.readIopolicy(initiator.SYSFS_ROOT, sub0, &pb).?);
     try testing.expectEqual(@as(u32, 2), try rig.controllersOf(data_nqn, ident_a));
     const sums2 = try rig.onMount(a2, "cksum p1 p2 p3 p4 | cut -d' ' -f1");
     defer gpa.free(sums2);
@@ -1315,8 +1322,9 @@ test "nvmet fidelity: multipath-tcp — RAM-backed metadata and data shares with
     try pathStats(rig, insts, &nodes, &after_read);
     const r0 = after_read[0].read_sectors - after_write[0].read_sectors;
     const r1 = after_read[1].read_sectors - after_write[1].read_sectors;
-    std.debug.print("multipath-tcp: round-robin, 4 × 64 MiB read cold: read sectors per path nvme{d} {d}, nvme{d} {d}\n", .{ insts[0], r0, insts[1], r1 });
-    try testing.expect(r0 > 0 and r1 > 0);
+    std.debug.print("multipath-tcp: queue-depth (explicit), 4 × 64 MiB read cold by one serial reader: read sectors per path nvme{d} {d}, nvme{d} {d}\n", .{ insts[0], r0, insts[1], r1 });
+    // 256 MiB of files = 524288 sectors of device reads at least.
+    try testing.expect(r0 + r1 >= (4 * 64 << 20) / 512);
     // umount: every path released.
     try rig.umount(a2);
     try testing.expectEqual(@as(u32, 0), try rig.controllersOf(data_nqn, null));
@@ -1325,11 +1333,9 @@ test "nvmet fidelity: multipath-tcp — RAM-backed metadata and data shares with
         defer gpa.free(log2);
         try testing.expect(std.mem.indexOf(u8, log2, "2 controller(s) of ") != null and std.mem.indexOf(u8, log2, "under this mount's identity released") != null);
     }
-    // Mount A3 under the DEFAULT policy (the proposed ruling, queue-depth:
-    // a path is chosen by in-flight count, so a lone serial stream stays
-    // on one link and only concurrency spreads): fresh connects, the
-    // policy read back, four parallel cold readers measured per path —
-    // the numbers are the evidence note's, the sum the assertion.
+    // Mount A3 under the DEFAULT again: fresh connects, both subsystems
+    // back to `round-robin`, four parallel cold readers land read sectors
+    // on BOTH paths.
     const a3 = try rig.spawnMount("mp-a3", meta_uri, null, &.{});
     try rig.awaitLog(a3, "ready: ", ready_wait_ns);
     const st3 = try rig.stats(a3);
@@ -1337,13 +1343,13 @@ test "nvmet fidelity: multipath-tcp — RAM-backed metadata and data shares with
     try testing.expectEqual(@as(?u64, 2), json_scan.number(st3, "fabric_daemon_connects"));
     try testing.expectEqual(@as(?u64, 0), json_scan.number(st3, "fabric_daemon_reuses"));
     try testing.expectEqual(@as(?u64, 4), json_scan.number(st3, "fabric_paths_live"));
-    try testing.expect(std.mem.indexOf(u8, st3, "\"iopolicy\":\"queue-depth\",\"paths_failed\":1,") != null);
-    try testing.expect(std.mem.indexOf(u8, st3, "\"iopolicy\":\"queue-depth\",\"paths\":[{\"instance\":") != null);
+    try testing.expect(std.mem.indexOf(u8, st3, "\"iopolicy\":\"round-robin\",\"paths_failed\":1,") != null);
+    try testing.expect(std.mem.indexOf(u8, st3, "\"iopolicy\":\"round-robin\",\"paths\":[{\"instance\":") != null);
     const insts3 = try instancesOf(rig, data_nqn, ident_a, &ib);
     try testing.expectEqual(@as(usize, 2), insts3.len);
     var sb3: [32]u8 = undefined;
     const sub3 = (try multipath.subsystemOf(gpa, initiator.SYSFS_ROOT, insts3[0], &sb3)).?;
-    try testing.expectEqualStrings("queue-depth", multipath.readIopolicy(initiator.SYSFS_ROOT, sub3, &pb).?);
+    try testing.expectEqualStrings("round-robin", multipath.readIopolicy(initiator.SYSFS_ROOT, sub3, &pb).?);
     var before3: [16]multipath.BlockStat = undefined;
     try pathStats(rig, insts3, &nodes, &before3);
     const sums3 = try rig.onMount(a3, "for f in p1 p2 p3 p4; do cat $f > /dev/null & done; wait; cksum p1 p2 p3 p4 | cut -d' ' -f1");
@@ -1353,8 +1359,8 @@ test "nvmet fidelity: multipath-tcp — RAM-backed metadata and data shares with
     try pathStats(rig, insts3, &nodes, &after3);
     const q0 = after3[0].read_sectors - before3[0].read_sectors;
     const q1 = after3[1].read_sectors - before3[1].read_sectors;
-    std.debug.print("multipath-tcp: queue-depth (the default), 4 × 64 MiB read cold by 4 parallel readers: read sectors per path nvme{d} {d}, nvme{d} {d}\n", .{ insts3[0], q0, insts3[1], q1 });
-    // 256 MiB of files = 524288 sectors of device reads at least.
+    std.debug.print("multipath-tcp: round-robin (the default), 4 × 64 MiB read cold by 4 parallel readers: read sectors per path nvme{d} {d}, nvme{d} {d}\n", .{ insts3[0], q0, insts3[1], q1 });
+    try testing.expect(q0 > 0 and q1 > 0);
     try testing.expect(q0 + q1 >= (4 * 64 << 20) / 512);
     try rig.umount(a3);
     try testing.expectEqual(@as(u32, 0), try rig.controllersOf(data_nqn, null));

@@ -12,9 +12,9 @@ multipath merges them into one head, and the head is handed to discovery only wh
 set is EXACTLY ours (`multipath.judgeServing`, pure; fixture-tested). A path that fails beside
 a serving sibling is a loud warning + `fabric_paths_degraded`; zero paths up refuses as before.
 The kernel's `iopolicy` default `numa` sends every I/O of a NUMA node down one path, so the
-mount writes `SQUEEZEFS_FABRIC_IOPOLICY` (default `queue-depth`, a PROPOSED owner ruling) to
-every owned subsystem and reads it back (`fabric_iopolicy_sets` / `fabric_iopolicy_failures`,
-never a refusal); `fabric_paths_live` sums the live serving controllers. `nvmeof status
+mount writes `SQUEEZEFS_FABRIC_IOPOLICY` (default `round-robin` — the ruling below) to every
+owned subsystem and reads it back (`fabric_iopolicy_sets` / `fabric_iopolicy_failures`, never
+a refusal); `fabric_paths_live` sums the live serving controllers. `nvmeof status
 [--json]` lists every fabric subsystem's head, policy and paths. Decision 0002 row 543.
 
 **The metadata volume (owner extension).** Its node is the mount's argument, so the operator
@@ -43,32 +43,40 @@ Before the change the mount made one association and `.stats` had no path rows. 
 head connected by hand on both paths (`fabric_meta_bound` lists both live, policy read back);
 data record = both live paths + a dead 127.0.0.3 → `fabric_daemon_connects 2`,
 `fabric_paths_degraded 1`, `fabric_paths_live 4`; ONE head (`nvme-subsys3`, `nvme3n1`; both
-hidden path nodes `nvme3c3n1`, `nvme3c4n1`); kill -9 → remount `fabric_daemon_reuses 2`,
-`fabric_daemon_connects 0`; umount releases both (`2 controller(s) … released`); the metadata
-paths stand until the operator's one `--identity-only` disconnect releases both; zero residue.
+hidden path nodes `nvme3c3n1`, `nvme3c4n1`); under the default both paths carry the parallel
+write; kill -9 → remount under an explicit `queue-depth` `fabric_daemon_reuses 2`,
+`fabric_daemon_connects 0`, both subsystems read the knob back; umount releases both
+(`2 controller(s) … released`); a mount under the default again reads `round-robin` back and
+both paths carry the parallel cold read; the metadata paths stand until the operator's one
+`--identity-only` disconnect releases both; zero residue.
 
 **Per-path sectors** (`/sys/class/nvme/nvme<N>/nvme<K>c<N>n1/stat`, three runs agree within
 5 %):
 
 | policy | workload | path A | path B |
 |---|---|---|---|
-| round-robin | 4 × 64 MiB files written in parallel + `sync -f` | 255120 | 269168 |
-| round-robin | the same files read cold after the remount | 265552 | 266776 |
-| queue-depth (default) | the same files read cold by 4 parallel readers | 304128 | 220160 |
+| round-robin (default) | 4 × 64 MiB files written in parallel + `sync -f` | 254160 | 270128 |
+| round-robin (default) | the same files read cold by 4 parallel readers | 262144 | 262144 |
+| round-robin | the same files read cold by one serial reader | 265552 | 266776 |
+| queue-depth | the same files read cold by one serial reader | 487920 | 44408 |
+| queue-depth | the same files read cold by 4 parallel readers | 296960 | 227328 |
 | queue-depth | 4 × 64 MiB written in parallel (by hand, `exp4.sh`) | 409600 | 114688 |
 | queue-depth | ONE serial `dd` writer, 64 MiB O_DIRECT on the raw head | 131072 | 0 |
 
-So both links carry bandwidth under the default once requests are in flight concurrently —
-queue-depth picks the path with the fewest in flight and ties go to the first path, so a lone
-serial stream stays on one link (the first leg draft asserted both paths under queue-depth
-after a serial-ish write-back and read 524288/0 once). The leg therefore asserts BOTH paths
-under `round-robin` (deterministic: every bio alternates) and measures the default, asserting
-only that the reads reached the device (≥ 524288 sectors).
+Round-robin alternates per bio, so every stream — serial or parallel — splits within 5 %.
+Queue-depth picks the path with the fewest requests in flight and ties go to the first path,
+so a lone serial stream stays 100 % on one link, a serial reader 92/8, four parallel writers 78/22 (the
+first leg draft asserted both paths under queue-depth after a serial-ish write-back and read
+524288/0 once). The leg asserts BOTH paths under the default for the write and the 4-reader
+phases, and measures queue-depth under the explicit knob (asserting only that the reads
+reached the device, ≥ 524288 sectors).
 
-**Open ruling.** The `SQUEEZEFS_FABRIC_IOPOLICY` default: `queue-depth` as proposed (adapts to
-links of different load; needs in-flight concurrency, which the daemon's lanes give under
-load) vs `round-robin` (uses both links even for a serial stream; a slow link throttles half
-the I/O). The numbers above are the evidence; the knob flips it per mount.
+**Ruling (owner, 2026-10-18).** The `SQUEEZEFS_FABRIC_IOPOLICY` default is `round-robin`: the
+fabric this is for has two 200 GbE links and the goal is aggregate bandwidth; queue-depth
+leaves a lone sequential stream entirely on one link (131072 / 0) and skews four parallel
+writers 78/22, while round-robin balances every workload in the table within 5 %. `numa` (the
+kernel's default) pins a single-socket client to one link. `queue-depth` stays selectable for
+a fabric whose paths differ in latency; the knob flips it per mount.
 
 **Follow-up (not in this change).** A `sqmeta://` fabric URI form (or a mount option) carrying
 the metadata volume's paths on the command line, so the daemon owns the metadata connects

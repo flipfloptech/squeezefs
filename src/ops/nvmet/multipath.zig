@@ -513,7 +513,7 @@ const testing = std.testing;
 const testkit = @import("../../core/testkit.zig");
 const fuzzkit = @import("../../core/fuzzkit.zig");
 
-test "the iopolicy enum spells the kernel's names and parses each; the knob's default is queue-depth; an outside word is null" {
+test "the iopolicy enum spells the kernel's names and parses each; the knob's default is round-robin (owner ruling 2026-10-18); an outside word is null" {
     try testing.expectEqual(Iopolicy.@"queue-depth", Iopolicy.parse("queue-depth").?);
     try testing.expectEqual(Iopolicy.@"round-robin", Iopolicy.parse("round-robin").?);
     try testing.expectEqual(Iopolicy.numa, Iopolicy.parse("numa").?);
@@ -521,9 +521,9 @@ test "the iopolicy enum spells the kernel's names and parses each; the knob's de
     try testing.expectEqualStrings("queue-depth", Iopolicy.@"queue-depth".name());
     var env = std.process.Environ.Map.init(testing.allocator);
     defer env.deinit();
-    try testing.expectEqual(Iopolicy.@"queue-depth", iopolicyKnob(&env));
-    try env.put("SQUEEZEFS_FABRIC_IOPOLICY", "round-robin");
     try testing.expectEqual(Iopolicy.@"round-robin", iopolicyKnob(&env));
+    try env.put("SQUEEZEFS_FABRIC_IOPOLICY", "queue-depth");
+    try testing.expectEqual(Iopolicy.@"queue-depth", iopolicyKnob(&env));
 }
 
 test "the connect timeouts restate the guard's clock (tie): reconnect_delay = the beat, fast_io_fail_tmo = the staleness TTL, ctrl_loss_tmo = 2 × TTL; fail-fast ≤ ctrl_loss; each knob overrides its field verbatim" {

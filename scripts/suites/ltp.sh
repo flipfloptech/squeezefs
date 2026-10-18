@@ -178,6 +178,10 @@ for t in r.get("results", []):
 PY
     done < "$failures"
   fi
+  # kirk's debug log holds every test's stdout: on a run that did not pass
+  # it is the only record of WHERE a test hung (a fail-early kill writes no
+  # report; 2026-10-18 kill11 "broken 2m 0s" left nothing to read).
+  [ "$rc" = 0 ] || cp "$ktmp/kirk.root/latest/debug.log" "$RESULTS/kirk-$tag.debug.log" 2>/dev/null || true
   rm -rf "$ktmp"
   suite_umount "$tag"
   suite_daemon_alerts "$tag" || return 1

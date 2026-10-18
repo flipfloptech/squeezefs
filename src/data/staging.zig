@@ -977,11 +977,15 @@ pub const Segment = struct {
         return rep;
     }
 
-    /// Every resident key with its footprint (the ledger seed, the
-    /// dismount pass). `out` holds ≥ `live()` entries.
-    pub fn residents(self: *Segment, out: []Resident) []Resident {
+    /// Every resident key with its footprint (the ledger seed, the dismount
+    /// and syncfs passes, fsck), sized AND filled under the ONE lock hold:
+    /// a caller that sized by `live()` and then filled met a stage landing
+    /// in between (syncfs under four fsstress writers) one entry past its
+    /// buffer. The caller frees the slice.
+    pub fn residentsAlloc(self: *Segment, gpa: Allocator) Allocator.Error![]Resident {
         self.lock.lock();
         defer self.lock.unlock();
+        const out = try gpa.alloc(Resident, self.index.count());
         var n: usize = 0;
         var it = self.index.valueIterator();
         while (it.next()) |c| {
@@ -989,7 +993,8 @@ pub const Segment = struct {
             out[n] = .{ .key = std.mem.bytesToValue(StagingKey, &c.*.key), .cost = stride(e.key_len, e.val_len), .generation = e.generation };
             n += 1;
         }
-        return out[0..n];
+        assert(n == out.len);
+        return out;
     }
 
     /// The live extents (tests: the no-overlap law).
@@ -1150,9 +1155,9 @@ pub const Pool = struct {
 
     /// Seed the ledger from a recovered segment at generation 0.
     pub fn seedFromRecovery(self: *Pool, seg: *Segment) Allocator.Error!void {
-        const out = try self.gpa.alloc(Resident, seg.live());
+        const out = try seg.residentsAlloc(self.gpa);
         defer self.gpa.free(out);
-        for (seg.residents(out)) |r| try self.charge(r.key.file_id, r.cost, RECOVERED_GENERATION);
+        for (out) |r| try self.charge(r.key.file_id, r.cost, RECOVERED_GENERATION);
     }
 };
 
@@ -1234,9 +1239,9 @@ pub fn releaseStaged(pool: *Pool, seg: *Segment, key: StagingKey, generation: u6
 /// the open packs before "Dismount clean".
 pub fn promoteAllAtDismount(gpa: Allocator, seg: *Segment, hooks: PromotionHooks) Allocator.Error!void {
     const promote = hooks.promote orelse return;
-    const out = try gpa.alloc(Resident, seg.live());
+    const out = try seg.residentsAlloc(gpa);
     defer gpa.free(out);
-    for (seg.residents(out)) |r| {
+    for (out) |r| {
         if (promote(hooks.ctx, r.key)) {
             stats.dismount_promoted_files.inc();
             stats.dismount_promoted_bytes.add(r.cost);
@@ -1268,9 +1273,9 @@ pub fn promoteAtFsync(lever: FsyncLever, hooks: PromotionHooks, key: StagingKey)
 pub fn promoteAllAtSyncfs(gpa: Allocator, lever: FsyncLever, seg: *Segment, hooks: PromotionHooks) Allocator.Error!void {
     if (!lever.on) return;
     if (hooks.promote == null) return;
-    const out = try gpa.alloc(Resident, seg.live());
+    const out = try seg.residentsAlloc(gpa);
     defer gpa.free(out);
-    for (seg.residents(out)) |r| promoteAtFsync(lever, hooks, r.key);
+    for (out) |r| promoteAtFsync(lever, hooks, r.key);
 }
 
 // ---------------------------------------------------------------------------
@@ -2518,6 +2523,40 @@ test "the three promotion points: pressure rides stageWrite; the dismount pass p
     promoteAtFsync(.{ .on = true }, kicks.hooks(), tkey(1, 1));
     try testing.expectEqual(p0 + 1, stats.fsync_promoted_files.load());
     try testing.expectEqual(@as(u32, 3), kicks.promoted);
+}
+
+test "the residents census under stages landing: sized and filled under ONE lock hold, every census is whole — a census sized by live() and filled after met a stage in between one entry past its buffer (xfstests generic/013: fsstress's sync under four writers, syncfs's promote pass)" {
+    const gpa = testing.allocator;
+    var r = try ramSegment(gpa, 8192 * 4096);
+    defer gpa.free(r.image);
+    defer r.seg.deinit();
+    const Writer = struct {
+        fn run(seg: *Segment, done: *std.atomic.Value(bool)) void {
+            const v: [10]u8 = @splat(7);
+            var i: u64 = 1;
+            while (i <= 1500) : (i += 1) seg.put(tkey(@intCast(i % 200), i), &v, i, 0, 0) catch break;
+            done.store(true, .release);
+        }
+    };
+    var done = std.atomic.Value(bool).init(false);
+    const t = try std.Thread.spawn(.{}, Writer.run, .{ &r.seg, &done });
+    var censuses: usize = 0;
+    var last: usize = 0;
+    while (!done.load(.acquire) or censuses == 0) {
+        const out = try r.seg.residentsAlloc(gpa);
+        defer gpa.free(out);
+        // Whole: every entry filled, never fewer than the previous census
+        // (nothing is removed here), never beyond the writer's total.
+        for (out) |res| try testing.expect(res.cost != 0);
+        try testing.expect(out.len >= last and out.len <= 1500);
+        last = out.len;
+        censuses += 1;
+    }
+    t.join();
+    try testing.expect(censuses > 1);
+    const final = try r.seg.residentsAlloc(gpa);
+    defer gpa.free(final);
+    try testing.expectEqual(@as(usize, 1500), final.len);
 }
 
 test "the reader's view: resident ⇒ the bytes; ledger-only ⇒ in flight; neither ⇒ size-consistent zeros, counted and warned" {

@@ -540,9 +540,7 @@ pub const linux = if (builtin.os.tag == .linux) struct {
         fn residentsFn(ctx: *anyopaque, gpa: Allocator) Error![]staging.Resident {
             const self: *StagingBind = @ptrCast(@alignCast(ctx));
             const seg = &self.plane.stage.?.seg;
-            const out = try gpa.alloc(staging.Resident, seg.live() + 1);
-            const got = seg.residents(out);
-            return gpa.realloc(out, got.len) catch out[0..got.len];
+            return seg.residentsAlloc(gpa);
         }
 
         fn markerFn(ctx: *anyopaque) ?finding.StagingVerdict {
@@ -575,9 +573,9 @@ pub const linux = if (builtin.os.tag == .linux) struct {
             const seg = &self.plane.stage.?.seg;
             try q.putRecord(.c5, "staging-segment", seg.image);
             const gpa = self.plane.gpa;
-            const out = try gpa.alloc(staging.Resident, seg.live() + 1);
+            const out = try seg.residentsAlloc(gpa);
             defer gpa.free(out);
-            for (seg.residents(out)) |r| _ = seg.remove(r.key, r.generation);
+            for (out) |r| _ = seg.remove(r.key, r.generation);
         }
 
         const vtable: classes.StagingFace.VTable = .{ .residents = &residentsFn, .marker = &markerFn, .image = &imageFn, .remove = &removeFn, .quarantineDir = &quarantineDirFn };

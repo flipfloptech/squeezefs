@@ -34,8 +34,11 @@
 //!     — the direct device leg, the fd-source leg from a MAP_SHARED fill
 //!     pool, or the bounce leg from the session's memfd slab (daemon CPU/GiB
 //!     −24 % measured on the fd-source leg). Paged WRITE payloads are HELD
-//!     in the slot when W1-eligible (holding ineligible shapes measured
-//!     0.45×) and extracted at delivery otherwise. Bridges are
+//!     in the slot when the filesystem's gate admits the shape — the W1
+//!     class (≤ PATCH_MAX; holding W1-ineligible shapes measured 0.45×) or
+//!     the overlay class (above it: the streaming write lands by
+//!     `WRITE_FIXED(device ← slot)`, charter §6.2 item 1) — and extracted
+//!     at delivery otherwise. Bridges are
 //!     deadline-bounded (30 s, AsyncCancel once, must-stay-0 cancels), and
 //!     the commit FOLLOWS the bridge CQE: the slot stays Delivered until then.
 //!
@@ -321,10 +324,15 @@ pub var zc_direct_leg_serve_bytes: counters.ShardedCounter = .{};
 pub var write_window_bytes: counters.ShardedCounter = .{};
 /// `transport_zc_write_directs` / `_bytes` / `_failures`: held WRITE
 /// payloads landed by `WRITE_FIXED(slot → device)` — the sole-owner patch
-/// class with zero daemon passes — and the bridges that came back short.
+/// and overlay classes with zero daemon passes — and the bridges that came
+/// back short. `transport_zc_write_direct_refusals`: a direct store this
+/// ring could not push (the SQ full after its flush — the one bound a held
+/// store meets: one pend per ent, `sqEntries(width, depth)` SQEs; the
+/// handler falls to the extraction vehicle, counted here, never silently).
 pub var zc_write_directs: counters.ShardedCounter = .{};
 pub var zc_write_direct_bytes: counters.ShardedCounter = .{};
 pub var zc_write_direct_failures: counters.ShardedCounter = .{};
+pub var zc_write_direct_refusals: counters.ShardedCounter = .{};
 /// `transport_zc_fd_source_copies`: a probe's fd-source answer served by
 /// the copy arm (a non-zc session, a fused frame).
 pub var zc_fd_source_copies: counters.ShardedCounter = .{};
@@ -1799,6 +1807,7 @@ pub const Group = struct {
                     slot.zc_write_extractions.inc();
                     slot.zc_write_extract_bytes.add(pend.len);
                     slot.zc_write_lazy_extractions.inc();
+                    slot.zc_write_lazy_extract_bytes.add(pend.len);
                     cell.done_len = pend.len;
                 }
                 cell.res = res;
@@ -1892,6 +1901,7 @@ pub const Group = struct {
                 continue;
             }
             if (!self.pushBridge(gent, .{ .kind = .direct_store, .len = cell.len }, cell.fd, cell.off, false)) {
+                zc_write_direct_refusals.inc();
                 cell.res = -@as(i32, @intCast(@backingInt(linux.E.BUSY)));
                 cell.event.set(self.shared.io);
             }
@@ -2577,10 +2587,13 @@ pub const Group = struct {
     }
 
     /// A paged WRITE on a zero-copy slot: the bytes sit in the slot, the
-    /// kmbuf attachment holds nothing. HELD iff the shape and the
-    /// filesystem's pure gate say so (the lease carries the slot); else
-    /// extracted at delivery (`WRITE_FIXED(slot → slab)`) and dispatched at
-    /// the CQE over the bounce bytes.
+    /// kmbuf attachment holds nothing. HELD iff the shape (`zc.holdShape`)
+    /// and the filesystem's pure gate say so (the lease carries the slot);
+    /// else extracted at delivery (`WRITE_FIXED(slot → slab)`) and
+    /// dispatched at the CQE over the bounce bytes. A held slot costs the
+    /// transport nothing an extracted one does not: both stay Delivered
+    /// until the commit; the held one's bridge is its device DMA instead of
+    /// its bounce copy, one pend per ent like every bridge.
     fn deliverPagedWrite(self: *Group, gent: u32, announced: usize) void {
         const m = self.memberOf(gent);
         const ent_idx = self.entIdxOf(gent);
@@ -2591,8 +2604,7 @@ pub const Group = struct {
         ent.class = zc.PayloadClass.classify(win.flags, win.write_flags);
         const hint: fsv.HoldHint = .{ .ino = std.mem.readInt(u64, hdr.in_out[16..24], .little), .offset = win.offset, .len = win.size, .class = ent.class };
         const hold = @as(usize, win.size) == announced and
-            zc.holdCandidate(win.offset, win.size, zc.holdBound(self.shared.plan.payload_sz)) and
-            zc.w1Shape(win.offset, win.size, self.shared.block_size) and
+            zc.holdShape(win.offset, win.size, self.shared.block_size) and
             self.shared.fs.writeHoldEligible(hint);
         if (hold) {
             ent.held = true;

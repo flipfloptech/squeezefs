@@ -631,6 +631,11 @@ pub const Config = struct {
     /// `SQUEEZEFS_ZC_ACK_EARLY` / `_ODIRECT`.
     ack_early: bool = true,
     ack_early_odirect: bool = false,
+    /// `SQUEEZEFS_ZC_HOLD_OVERLAY`: an overlay-class write is HELD in its
+    /// zero-copy slot at delivery (the plane's hold gate) and stored by
+    /// `WRITE_FIXED(device ← slot)`; off = extracted at delivery (the
+    /// one-copy control arm).
+    hold_slot: bool = true,
 };
 
 pub const Deps = struct {

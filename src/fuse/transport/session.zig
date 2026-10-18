@@ -1884,6 +1884,7 @@ pub const Session = struct {
         try field(w, "transport_zc_write_directs", worker.zc_write_directs.load());
         try field(w, "transport_zc_write_direct_bytes", worker.zc_write_direct_bytes.load());
         try field(w, "transport_zc_write_direct_failures", worker.zc_write_direct_failures.load());
+        try field(w, "transport_zc_write_direct_refusals", worker.zc_write_direct_refusals.load());
         try field(w, "transport_zc_fd_source_copies", worker.zc_fd_source_copies.load());
         try field(w, "transport_zc_fallbacks", worker.zc_fallbacks.load());
         try field(w, "transport_zc_readdir_latch", worker.zc_readdir_latch.load());
@@ -1896,9 +1897,14 @@ pub const Session = struct {
         try field(w, "transport_zc_scan_max_age_ms", worker.scan_max_age_ms.load());
         try field(w, "transport_zc_direction_refusals", slot.zc_direction_refusals.load());
         try field(w, "transport_zc_write_holds", slot.zc_write_holds.load());
+        try field(w, "transport_zc_write_hold_bytes", slot.zc_write_hold_bytes.load());
+        try w.writeAll("\"transport_zc_write_hold_ns\":");
+        try slot.zc_write_hold_ns.snapshot().writeJson(w);
+        try w.writeByte(',');
         try field(w, "transport_zc_write_extractions", slot.zc_write_extractions.load());
         try field(w, "transport_zc_write_extract_bytes", slot.zc_write_extract_bytes.load());
         try field(w, "transport_zc_write_lazy_extractions", slot.zc_write_lazy_extractions.load());
+        try field(w, "transport_zc_write_lazy_extract_bytes", slot.zc_write_lazy_extract_bytes.load());
         try field(w, "transport_zc_retain_commits", slot.retain_commits.load());
         try field(w, "transport_zc_releases", slot.releases.load());
         try field(w, "transport_zc_retained_outstanding", slot.retained_outstanding.load());
@@ -2189,8 +2195,13 @@ const Snapshot = struct {
     fd_body_replies: u64,
     fd_body_fallbacks: u64,
     holds: u64,
+    hold_bytes: u64,
     extractions: u64,
     lazy: u64,
+    directs: u64,
+    direct_bytes: u64,
+    direct_failures: u64,
+    direct_refusals: u64,
     retain_commits: u64,
     releases: u64,
     retain_refused_class: u64,
@@ -2215,8 +2226,13 @@ const Snapshot = struct {
             .fd_body_replies = worker.zc_fd_body_replies.load(),
             .fd_body_fallbacks = worker.zc_fd_body_fallbacks.load(),
             .holds = slot.zc_write_holds.load(),
+            .hold_bytes = slot.zc_write_hold_bytes.load(),
             .extractions = slot.zc_write_extractions.load(),
             .lazy = slot.zc_write_lazy_extractions.load(),
+            .directs = worker.zc_write_directs.load(),
+            .direct_bytes = worker.zc_write_direct_bytes.load(),
+            .direct_failures = worker.zc_write_direct_failures.load(),
+            .direct_refusals = worker.zc_write_direct_refusals.load(),
             .retain_commits = slot.retain_commits.load(),
             .releases = slot.releases.load(),
             .retain_refused_class = slot.retain_refused_class.load(),
@@ -3354,6 +3370,75 @@ test "e2e zc WRITE: a W1-eligible aligned write is HELD in the slot and extracte
     const last = Snapshot.take();
     try testing.expectEqual(after.holds, last.holds);
     try testing.expectEqual(@as(u64, 1), last.extractions - after.extractions);
+}
+
+/// `EchoFs.HeldStore.store` over the session: the product's `HeldStore`
+/// face in `cli/mount.zig` is this thunk.
+fn storeHeldThunk(ctx: *anyopaque, src: slot.HeldSource, fd: linux.fd_t, off: u64, io: Io) slot.ExtractError!void {
+    const s: *Session = @ptrCast(@alignCast(ctx));
+    return s.storeHeld(src, fd, off, io);
+}
+
+test "e2e zc WRITE, the overlay class (charter §6.2 item 1): a 1 MiB page-aligned write on a zero-copy session is HELD in its slot and lands by WRITE_FIXED(fd ← slot) straight from the app's pages — the bytes byte-exact in the fd, directs +1 for 1 MiB, extractions +0 (zero daemon copies); a 1 MiB write that straddles the block edge and an unaligned write are extracted at delivery; a filesystem that declines the shape extracts the same 1 MiB at delivery" {
+    if (venueMissing()) |why| return testkit.skipWhy(@src(), why);
+    var kb: [192]u8 = undefined;
+    if (kmbufMissing(&kb)) |why| return testkit.skipWhy(@src(), why);
+    const rig = try Rig.init(testing.allocator, 29, &.{});
+    defer rig.deinit();
+    // The device stand-in: a memfd the held slot DMAs into.
+    const dev_rc = linux.memfd_create("sqz-zc-write-dev", linux.MFD.CLOEXEC);
+    try testing.expect(linux.errno(dev_rc) == .SUCCESS);
+    const dev_fd: linux.fd_t = @intCast(dev_rc);
+    defer _ = linux.close(dev_fd);
+    try testing.expect(linux.errno(linux.ftruncate(dev_fd, 8 << 20)) == .SUCCESS);
+    rig.fs.hold_eligible = true;
+    const s = try rig.mountIt(.{ .mem_budget_bytes = 0 });
+    try testing.expectEqual(geometry.BufferMode.zero_copy, s.mode);
+    rig.fs.held_store = .{ .ctx = s, .fd = dev_fd, .store = &storeHeldThunk };
+    const before = Snapshot.take();
+    var pb: [256]u8 = undefined;
+    const fd = try openPath(rig.child(&pb, "scratch"), .{ .ACCMODE = .WRONLY, .CLOEXEC = true });
+    defer _ = linux.close(fd);
+    const mib: usize = 1 << 20;
+    const buf = try testing.allocator.alignedAlloc(u8, .fromByteUnits(4096), mib);
+    defer testing.allocator.free(buf);
+    for (buf, 0..) |*b, i| b.* = @truncate((i * 7) ^ (i >> 12));
+    // 1 MiB at offset 0 of a 4 MiB block: the overlay shape ⇒ HELD ⇒ the direct store.
+    try testing.expectEqual(mib, linux.pwrite(fd, buf.ptr, mib, 0));
+    try testing.expectEqual(@as(u64, 1), rig.fs.held_writes.load(.monotonic));
+    try testing.expectEqual(@as(u64, 1), rig.fs.direct_stores.load(.monotonic));
+    try testing.expectEqual(@as(u64, 0), rig.fs.direct_store_failures.load(.monotonic));
+    try testing.expectEqual(@as(u64, 0), rig.fs.lazy_extracts.load(.monotonic));
+    const got = try testing.allocator.alloc(u8, mib);
+    defer testing.allocator.free(got);
+    try testing.expectEqual(mib, try preadAt(dev_fd, got, 0));
+    try testing.expectEqualSlices(u8, buf, got);
+    const mid = Snapshot.take();
+    try testing.expectEqual(@as(u64, 1), mid.holds - before.holds);
+    try testing.expectEqual(@as(u64, mib), mid.hold_bytes - before.hold_bytes);
+    try testing.expectEqual(@as(u64, 1), mid.directs - before.directs);
+    try testing.expectEqual(@as(u64, mib), mid.direct_bytes - before.direct_bytes);
+    try testing.expectEqual(@as(u64, 0), mid.extractions - before.extractions);
+    try testing.expectEqual(@as(u64, 0), mid.direct_failures - before.direct_failures);
+    try testing.expectEqual(@as(u64, 0), mid.direct_refusals - before.direct_refusals);
+    // 1 MiB at 3.5 MiB straddles the 4 MiB block edge: two pieces ⇒ extracted at delivery (EFBIG from
+    // the scratch array is the echo filesystem's answer, the counters the transport's).
+    _ = linux.pwrite(fd, buf.ptr, mib, (3 << 20) + (512 << 10));
+    const unaligned = "unaligned tail";
+    try testing.expectEqual(@as(usize, unaligned.len), linux.pwrite(fd, unaligned, unaligned.len, 8192 + 7));
+    try testing.expectEqualSlices(u8, unaligned, rig.fs.scratch[8192 + 7 ..][0..unaligned.len]);
+    const after = Snapshot.take();
+    try testing.expectEqual(@as(u64, 1), after.holds - before.holds);
+    try testing.expectEqual(@as(u64, 2), after.extractions - before.extractions);
+    try testing.expectEqual(@as(u64, 0), after.lazy - before.lazy);
+    // The filesystem declines the shape: the same 1 MiB is extracted at delivery, never held.
+    rig.fs.hold_eligible = false;
+    _ = linux.pwrite(fd, buf.ptr, mib, 0);
+    const last = Snapshot.take();
+    try testing.expectEqual(after.holds, last.holds);
+    try testing.expectEqual(@as(u64, 1), last.extractions - after.extractions);
+    try expectLaws(before, last);
+    try testing.expectEqual(@as(u64, 0), slot.leases_outstanding.load());
 }
 
 test "e2e zc bridges: a bridge that never completes (the stall seam) is cancelled at the deadline — bridge_cancels == 1, the slot still commits header-only -EIO (THE LAW: the reader gets EIO), lost/orphans stay 0, the session serves on" {

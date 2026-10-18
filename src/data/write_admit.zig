@@ -110,6 +110,7 @@ pub const Config = struct {
                 .depth_governor = knobs.boolKnob("SQUEEZEFS_OVERLAY_DEPTH_GOVERNOR", env),
                 .ack_early = knobs.boolKnob("SQUEEZEFS_ZC_ACK_EARLY", env),
                 .ack_early_odirect = knobs.boolKnob("SQUEEZEFS_ZC_ACK_EARLY_ODIRECT", env),
+                .hold_slot = knobs.boolKnob("SQUEEZEFS_ZC_HOLD_OVERLAY", env),
             },
             .rewrite_shadow = knobs.boolKnob("SQUEEZEFS_REWRITE_SHADOW", env),
             .parked_cap = accumulate.parkedCapFromEnv(env, budget_bytes, block_size),
@@ -130,6 +131,7 @@ pub const Config = struct {
         if (!self.overlay.gap_seed_ranged) log.info("write path: A/B lever SQUEEZEFS_GAP_SEED_RANGED=0", .{});
         if (!self.overlay.ack_early) log.info("write path: A/B lever SQUEEZEFS_ZC_ACK_EARLY=0", .{});
         if (self.overlay.ack_early_odirect) log.info("write path: SQUEEZEFS_ZC_ACK_EARLY_ODIRECT=1 (the held-GUP snapshot opt-in)", .{});
+        if (!self.overlay.hold_slot) log.info("write path: A/B lever SQUEEZEFS_ZC_HOLD_OVERLAY=0 (overlay-class writes extracted at delivery)", .{});
         if (!self.rewrite_shadow) log.info("write path: A/B lever SQUEEZEFS_REWRITE_SHADOW=0 (per-block durable publishes)", .{});
         switch (self.depth_override) {
             .adaptive => {},

@@ -97,6 +97,7 @@ const route_table = @import("../meta/routing/route_table.zig");
 const op_guard = @import("../fuse/handler/op_guard.zig");
 const fsv = @import("../fuse/transport/filesystem_vtable.zig");
 const transport_slot = @import("../fuse/transport/slot.zig");
+const zc = @import("../fuse/transport/zc.zig");
 const layout = @import("layout.zig");
 const kvmap = @import("kvmap.zig");
 const staging = @import("staging.zig");
@@ -238,11 +239,16 @@ pub const stats = struct {
     /// Own-block images landed for a layout promotion (staged/inline → striped).
     pub var own_block_dmas: counters.ShardedCounter = .{};
     pub var own_block_dma_bytes: counters.ShardedCounter = .{};
-    /// Direct stores of a held slot (`WRITE_FIXED(device ← slot)`) through the seam.
+    /// Direct stores of a held slot (`WRITE_FIXED(device ← slot)`) through
+    /// the seam, and their bytes (held-store bytes: every one a byte no
+    /// daemon pass touched).
     pub var held_stores: counters.ShardedCounter = .{};
+    pub var held_store_bytes: counters.ShardedCounter = .{};
     pub var held_store_failures: counters.ShardedCounter = .{};
-    /// W1 hold gate verdicts on the queue thread.
+    /// Hold gate verdicts on the queue thread; `hold_gate_overlay_admits`
+    /// is the overlay class's share of the admits (the rest W1's).
     pub var hold_gate_admits: counters.ShardedCounter = .{};
+    pub var hold_gate_overlay_admits: counters.ShardedCounter = .{};
     pub var hold_gate_declines: counters.ShardedCounter = .{};
     /// Prefetch / ceremony fibers spawned on the home lanes.
     pub var prefetch_fibers: counters.ShardedCounter = .{};
@@ -292,7 +298,7 @@ pub fn writeStatsJson(w: *Io.Writer) Io.Writer.Error!void {
     inline for (.{ "data_volumes", "data_staging_on", "data_nvme_tier_on", "block_refs_drift_rows" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, @field(stats, name).load() });
     }
-    inline for (.{ "layout_map_merges", "layout_map_merge_blocks", "layout_map_merge_failures", "layout_map_merge_clipped_blocks", "layout_map_merges_shipped", "foreign_publish_kvmap_refusals", "layout_publishes_served", "kvmap_sweep_spawn_refusals", "promotions_run", "promotions_stale", "promotions_failed", "own_block_dmas", "own_block_dma_bytes", "held_stores", "held_store_failures", "hold_gate_admits", "hold_gate_declines", "prefetch_fibers", "prefetch_fiber_refusals", "hold_ceremony_fibers", "bindings_freed", "device_read_bounces", "data_device_read_bytes", "write_side_read_dma_bytes", "compose_read_dma_bytes", "pack_read_dma_bytes" }) |name| {
+    inline for (.{ "layout_map_merges", "layout_map_merge_blocks", "layout_map_merge_failures", "layout_map_merge_clipped_blocks", "layout_map_merges_shipped", "foreign_publish_kvmap_refusals", "layout_publishes_served", "kvmap_sweep_spawn_refusals", "promotions_run", "promotions_stale", "promotions_failed", "own_block_dmas", "own_block_dma_bytes", "held_stores", "held_store_bytes", "held_store_failures", "hold_gate_admits", "hold_gate_overlay_admits", "hold_gate_declines", "prefetch_fibers", "prefetch_fiber_refusals", "hold_ceremony_fibers", "bindings_freed", "device_read_bounces", "data_device_read_bytes", "write_side_read_dma_bytes", "compose_read_dma_bytes", "pack_read_dma_bytes" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, @field(stats, name).load() });
     }
     try w.print("\"data_unresolved_volume\":{d},\"kvmap_resolve_failures\":{d},\"kvmap_head_put_unlocked\":{d},\"release_free_unheld\":{d},\"layout_map_merge_displaced_overflow\":{d}}}", .{ counters.tripwireCount("data_unresolved_volume"), counters.tripwireCount("kvmap_resolve_failures"), counters.tripwireCount("kvmap_head_put_unlocked"), counters.tripwireCount("release_free_unheld"), counters.tripwireCount("layout_map_merge_displaced_overflow") });
@@ -2091,6 +2097,7 @@ pub const DataPlane = struct {
             };
         };
         stats.held_stores.inc();
+        stats.held_store_bytes.add(src.len);
     }
 
     /// Who asked for a device read — the ledger arm its bytes land in. The
@@ -3482,23 +3489,61 @@ pub const DataPlane = struct {
 
     // ---- the queue-thread gates (handler.zig's Binding calls these) ----
 
-    /// The W1 hold gate: a PURE predicate over the hint and the published
-    /// shape (striped on a passthrough set, non-extending, within one
-    /// block, ≤ patch_max, not stream-adjacent) — no lookup, no lock.
+    /// The hold gate: a PURE predicate over the hint and the published
+    /// shape — no lookup, no lock (`holdVerdict`); the direct-store face
+    /// must be armed for either class.
     pub fn writeHoldEligible(self: *DataPlane, hint: fsv.HoldHint) bool {
+        if (self.held_store == null) return declineHold();
         const snap = self.shape.peek(hint.ino) orelse return declineHold();
-        if (!snap.striped_passthrough or self.held_store == null) return declineHold();
-        const end = hint.offset + hint.len;
-        if (end > snap.size or hint.len > self.wp.cfg.patch_max) return declineHold();
-        if (hint.offset / self.block_size != (end - 1) / self.block_size) return declineHold();
-        if (self.wp.last_write_end.peek(hint.ino) == hint.offset) return declineHold();
+        const class = holdVerdict(hint, snap, .{
+            .block_size = self.block_size,
+            .patch_max = self.wp.cfg.patch_max,
+            .prev_end = self.wp.last_write_end.peek(hint.ino),
+            .overlay_hold = self.wp.cfg.overlay.hold_slot and self.wp.overlay.shapeEligible(hint.len, self.wp.any_passthrough),
+        }) orelse return declineHold();
         stats.hold_gate_admits.inc();
+        if (class == .overlay) stats.hold_gate_overlay_admits.inc();
         return true;
     }
 
     fn declineHold() bool {
         stats.hold_gate_declines.inc();
         return false;
+    }
+
+    /// What the gate knows besides the hint and the shape snapshot.
+    const HoldFacts = struct {
+        block_size: u64,
+        patch_max: u64,
+        /// The ino's previous write end (`last_write_end`), 0 = none.
+        prev_end: u64,
+        /// The overlay arm is on this set and its hold lever armed.
+        overlay_hold: bool,
+    };
+
+    /// The gate's verdict (the tie test restates it): a striped file on a
+    /// passthrough set, the write within one block, then by class
+    /// (`zc.holdClass`: PATCH_MAX = block/8 is W1's ceiling and the
+    /// overlay's length floor). The W1 class holds only what the sole-owner
+    /// patch can take — non-extending, not stream-adjacent — because a
+    /// held W1-ineligible shape pays hold + late extraction (0.45× on
+    /// rand-4k at fabric RTT). The overlay class (charter §6.2 item 1) holds
+    /// whenever the arm is on: extending and stream-adjacent writes ARE the
+    /// streaming write it exists for (a fresh unpublished destination; the
+    /// overwrite shape feeds the rewrite epoch), and both payload classes
+    /// hold — the port lands an O_DIRECT slot synchronously by
+    /// `WRITE_FIXED(device ← slot)` before the ack, never a late
+    /// materialize (0002 row 544). What the arm declines under its guard
+    /// (RAM custody on the block, an epoch's save in flight, a full
+    /// registry, no supply) costs that write one lazy extraction, counted.
+    fn holdVerdict(hint: fsv.HoldHint, snap: ShapeTable.Snap, f: HoldFacts) ?zc.HoldClass {
+        if (hint.len == 0 or !snap.striped_passthrough) return null;
+        const end = hint.offset + hint.len;
+        if (hint.offset / f.block_size != (end - 1) / f.block_size) return null;
+        return switch (zc.holdClass(hint.len, f.patch_max)) {
+            .w1 => if (end > snap.size or f.prev_end == hint.offset) null else .w1,
+            .overlay => if (f.overlay_hold) .overlay else null,
+        };
     }
 
     /// The shared-mode admission probe (charter §6.2): a resident striped
@@ -3777,6 +3822,44 @@ pub const DataPlane = struct {
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
+
+test "the hold gate's verdict by class (charter §6.2 items 1–2 on PATCH_MAX = block/8): the W1 class holds a non-extending, non-adjacent aligned write within one block and declines an extending or stream-adjacent one; the overlay class holds the streaming write — extending, stream-adjacent, both payload classes — iff the arm is on; a straddling write, an empty one and a non-striped file never hold" {
+    const bs: u64 = 4 << 20;
+    const facts: DataPlane.HoldFacts = .{ .block_size = bs, .patch_max = bs / 8, .prev_end = 0, .overlay_hold = true };
+    const striped: ShapeTable.Snap = .{ .size = 3 * bs, .striped_passthrough = true };
+    const hint = struct {
+        fn at(offset: u64, len: u32, class: zc.PayloadClass) fsv.HoldHint {
+            return .{ .ino = 7, .offset = offset, .len = len, .class = class };
+        }
+    };
+    // W1: ≤ PATCH_MAX, inside the file, not adjacent to the previous write.
+    try testing.expectEqual(@as(?zc.HoldClass, .w1), DataPlane.holdVerdict(hint.at(4096, 4096, .page_cache), striped, facts));
+    try testing.expectEqual(@as(?zc.HoldClass, .w1), DataPlane.holdVerdict(hint.at(bs - (bs / 8), @intCast(bs / 8), .direct_gup), striped, facts));
+    // W1 declines: extending; stream-adjacent (the previous write ended here).
+    try testing.expectEqual(@as(?zc.HoldClass, null), DataPlane.holdVerdict(hint.at(3 * bs, 4096, .page_cache), striped, facts));
+    var adjacent = facts;
+    adjacent.prev_end = 8192;
+    try testing.expectEqual(@as(?zc.HoldClass, null), DataPlane.holdVerdict(hint.at(8192, 4096, .page_cache), striped, adjacent));
+    // The overlay class: a 1 MiB piece — extending the file, stream-adjacent, O_DIRECT — holds.
+    const mib: u32 = 1 << 20;
+    try testing.expectEqual(@as(?zc.HoldClass, .overlay), DataPlane.holdVerdict(hint.at(0, mib, .page_cache), striped, facts));
+    try testing.expectEqual(@as(?zc.HoldClass, .overlay), DataPlane.holdVerdict(hint.at(3 * bs, mib, .direct_gup), striped, facts));
+    adjacent.prev_end = 3 * bs + mib;
+    try testing.expectEqual(@as(?zc.HoldClass, .overlay), DataPlane.holdVerdict(hint.at(3 * bs + mib, mib, .direct_gup), striped, adjacent));
+    try testing.expectEqual(@as(?zc.HoldClass, .overlay), DataPlane.holdVerdict(hint.at(bs, @intCast(bs), .page_cache), striped, facts)); // a block-sized write
+    // The overlay class declines with its arm off (the control arm, a transformed set, the lever at 0).
+    var off = facts;
+    off.overlay_hold = false;
+    try testing.expectEqual(@as(?zc.HoldClass, null), DataPlane.holdVerdict(hint.at(0, mib, .page_cache), striped, off));
+    // Never: a straddling write, an empty one, a file that is not striped on a passthrough set.
+    try testing.expectEqual(@as(?zc.HoldClass, null), DataPlane.holdVerdict(hint.at(bs - mib + 4096, mib, .page_cache), striped, facts));
+    try testing.expectEqual(@as(?zc.HoldClass, null), DataPlane.holdVerdict(hint.at(0, 0, .page_cache), striped, facts));
+    try testing.expectEqual(@as(?zc.HoldClass, null), DataPlane.holdVerdict(hint.at(0, mib, .page_cache), .{ .size = 3 * bs, .striped_passthrough = false }, facts));
+    // The patch-OFF control arm (PATCH_MAX 0): every aligned shape is the overlay's.
+    var patch_off = facts;
+    patch_off.patch_max = 0;
+    try testing.expectEqual(@as(?zc.HoldClass, .overlay), DataPlane.holdVerdict(hint.at(4096, 4096, .page_cache), striped, patch_off));
+}
 
 test "the shape table publishes ino-last and a torn row never matches a foreign ino" {
     var t = try ShapeTable.init(testing.allocator);

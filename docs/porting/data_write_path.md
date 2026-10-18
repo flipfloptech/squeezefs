@@ -62,6 +62,30 @@ The WRITE handler, in order (`fuse_client.rs:27674-28245`):
    (`:27726-27755`); the §3.4 stability class `sound = !O_DIRECT ||
    FUSE_WRITE_CACHE` is stamped at mint (`:27741-27742`). Non-zc deliveries are
    `WritePayload::Bytes(data)` (the transport lease — `slot.zig PayloadLease`).
+   3a. **Which shapes are held** (PORT; `rung-10-zero-copy-writes.md`): the
+   transport proves `zc.holdShape` (4 KiB-aligned, within one block, non-empty —
+   no bound of its own: the reference's strict `payload/2` was W1's streaming
+   exclusion and is subsumed by the class split) and the plane's gate
+   (`plane.holdVerdict`, a pure predicate over the hint and the shape snapshot)
+   classes the write by `zc.holdClass` on `PATCH_MAX = block/8` — W1's ceiling
+   AND the overlay's length floor, so the class costs no constant: `≤` ⇒ the W1
+   class, held iff the sole-owner patch can take it (striped passthrough,
+   non-extending, not stream-adjacent; holding W1-ineligible shapes measured
+   0.45×); `>` ⇒ the overlay class, held iff the arm is on (`SQUEEZEFS_DEVICE_OVERLAY`
+   ∧ `SQUEEZEFS_ZC_HOLD_OVERLAY` ∧ a passthrough volume), extending and
+   stream-adjacent included (they ARE the streaming write), both payload classes
+   (the port lands an O_DIRECT slot synchronously by `WRITE_FIXED(device ← slot)`
+   before the ack, never the reference's late materialize — 0002 row 544). A held
+   overlay-class write that the arm declines under its guard (RAM custody on the
+   block, an epoch's save in flight, a full registry, no supply) materializes
+   lazily (`transport_zc_write_lazy_extractions`, one wake later than at
+   delivery). A held slot costs the transport nothing an extracted one does not
+   (both stay Delivered until the commit; one pend per ent; the overlay's
+   governor permit bounds the bytes in flight); the one refusal — the ring's SQ
+   full after its flush — is `transport_zc_write_direct_refusals`, and the write
+   falls to the extraction vehicle. Before 3a every write above `block/8` paid
+   `WRITE_FIXED(slot → bounce)` on io-wq (0.77 ms/MiB, half the daemon's cores on
+   1M seq write ×4) and then the overlay's DMA from the bounce.
 4. `wlen == 0` ⇒ `written: 0`, no lease, no dirty mark, no killpriv (`:27774-27776`).
 5. `offset.checked_add(wlen) ≤ max_file_size()` else `EFBIG` (`:27785-27788`;
    `u32::MAX` blocks — charter §5.6).
@@ -1127,6 +1151,7 @@ namespaces are `write_through_skips`.
 | `SQUEEZEFS_GAP_SEED_RANGED` | bool, on (`:251`) | A/B lever | ranged gap seeds |
 | `SQUEEZEFS_ZC_ACK_EARLY` | bool, on (`:249`) | A/B lever | ACK-early |
 | `SQUEEZEFS_ZC_ACK_EARLY_ODIRECT` | bool, off (`:255`) | opt-in posture | held-GUP snapshot ACK-early |
+| `SQUEEZEFS_ZC_HOLD_OVERLAY` | bool, on (PORT: the reference's streaming-hold bound rode `SQUEEZEFS_DEVICE_OVERLAY` through a process-global, `zc.rs:372-383`, ledger Q11) | A/B lever (`0` = extract at delivery) | the overlay class is HELD in its slot (§1.1 step 3a) |
 | `SQUEEZEFS_REWRITE_SHADOW` | bool, on (`:185`) | A/B lever | the rewrite epoch |
 | `SQUEEZEFS_REWRITE_SUPPLY_CLOSE` | Retired (`:186`) | delete | — |
 | `SQUEEZEFS_WRITEBACK_QUEUE_CAP` | int [1, 2^24], 4096 (`:187`) | **R:** literal default | flush-unit queue |

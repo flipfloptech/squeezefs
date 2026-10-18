@@ -140,11 +140,24 @@ pub var zc_direction_refusals: counters.ShardedCounter = .{};
 /// invalid.
 pub var zc_write_extractions: counters.ShardedCounter = .{};
 pub var zc_write_extract_bytes: counters.ShardedCounter = .{};
-/// `transport_zc_write_lazy_extractions`: the LATE split — a held payload
-/// the handler extracted after dispatch (hold-gate staleness, ≈ 0).
+/// `transport_zc_write_lazy_extractions` / `_lazy_extract_bytes`: the LATE
+/// split — a held payload the handler extracted after dispatch (the gate's
+/// snapshot was stale, or the arm it was held for declined under its
+/// guard: a W1 patch refused, an overlay store declined to accumulation —
+/// the one extraction a hold can still pay, one wake later than at
+/// delivery; ≈ 0 of the holds).
 pub var zc_write_lazy_extractions: counters.ShardedCounter = .{};
-/// `transport_zc_write_holds`: WRITE payloads HELD in the slot (W1 eligible).
+pub var zc_write_lazy_extract_bytes: counters.ShardedCounter = .{};
+/// `transport_zc_write_holds` / `_hold_bytes`: WRITE payloads HELD in the
+/// slot (the filesystem's gate admitted the W1 or overlay class) and their
+/// bytes — the extraction at delivery they did not pay; `hold_bytes −
+/// lazy_extract_bytes` is what moved to the device with zero daemon copies.
 pub var zc_write_holds: counters.ShardedCounter = .{};
+pub var zc_write_hold_bytes: counters.ShardedCounter = .{};
+/// `transport_zc_write_hold_ns`: a held slot's life, delivery → the lease's
+/// release (the handler's admission, the DMA it waited for, or its lazy
+/// extraction) — how long the app's pages stay pinned in the slot.
+pub var zc_write_hold_ns: counters.ShardedLatencyHistogram = .{};
 
 // ---------------------------------------------------------------------------
 // Addressing
@@ -328,8 +341,9 @@ pub const PayloadLease = struct {
         return .{ .state = state, .data = data, .born_ns = clock.monotonicNs(), .waker = waker };
     }
 
-    /// Worker side at a HELD delivery (zero-copy, W1 eligible): no bytes
-    /// in hand, the slot coordinates and the bridge face instead.
+    /// Worker side at a HELD delivery (zero-copy, the gate admitted the
+    /// shape): no bytes in hand, the slot coordinates and the bridge face
+    /// instead.
     pub fn acquireHeld(state: *LeaseState, waker: Waker, held_len: u32, class: zc.PayloadClass, qid: u16, ent_idx: u16, gent: u32, face: HeldFace) PayloadLease {
         var l = acquire(state, &.{}, waker);
         l.held = true;
@@ -340,6 +354,7 @@ pub const PayloadLease = struct {
         l.gent = gent;
         l.face = face;
         zc_write_holds.inc();
+        zc_write_hold_bytes.add(held_len);
         return l;
     }
 
@@ -372,6 +387,7 @@ pub const PayloadLease = struct {
         const age_ns = clock.monotonicNs() -| self.born_ns;
         const age_ms = age_ns / std.time.ns_per_ms;
         _ = lease_max_age_ms.fetchMax(age_ms, .monotonic);
+        if (self.held) zc_write_hold_ns.record(age_ns);
         leases_outstanding.sub(1);
         if (age_ns >= LEASE_OVERLONG_NS) {
             lease_overlong.inc();

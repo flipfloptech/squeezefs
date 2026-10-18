@@ -152,31 +152,38 @@ pub fn dirOf(op: abi.Opcode, latch: ReaddirLatch) Dir {
 // The hold predicate and the stability class (porting spec §4.4, §5.2)
 // ---------------------------------------------------------------------------
 
-/// `hold_candidate`: `size > 0 ∧ size < bound ∧ 4 KiB-aligned offset and
-/// size`. `bound` is a field of the resolved geometry passed in (0002 ledger
-/// Q11: never a process-global): `payload / 2` STRICT — a half-payload write
-/// is the streaming class (kernel-split streaming writes arrive
-/// payload-sized) and the W1 cap `block/8 ≤ payload/2` on every shipped
-/// geometry.
-pub fn holdCandidate(offset: u64, size: u32, bound: u32) bool {
-    return size > 0 and size < bound and offset % HOLD_ALIGN == 0 and size % HOLD_ALIGN == 0;
-}
-
-pub fn holdBound(payload_sz: u32) u32 {
-    return payload_sz / 2;
-}
-
-/// The W1 SHAPE (charter §6.2 item 2) as a pure predicate on the request:
-/// 4 KiB-aligned offset and length, `len ≤ block/8` (`PATCH_MAX`), within
-/// one block. The filesystem's gate adds what only it knows (striped,
-/// non-extending, undecorated whole-block map, passthrough) from a
-/// published per-inode snapshot — never a map lookup on the worker thread
-/// (0002 ledger Q10). Holding W1-INELIGIBLE shapes measured 0.45× (386k
-/// unarmed / 300k fusion-off / 175k fused rand-4k at ~300 µs RTT).
-pub fn w1Shape(offset: u64, size: u32, block: u64) bool {
-    if (size == 0 or @as(u64, size) > block / 8) return false;
+/// The hold SHAPE as a pure predicate on the request (the transport's
+/// half, proved on the worker thread): a non-empty payload, 4 KiB-aligned
+/// offset and length (`HOLD_ALIGN`, the LBA grain of the direct
+/// `WRITE_FIXED`), within ONE block — the write splitter makes pieces
+/// single-block, and a straddling write's pieces all materialize (one lazy
+/// extraction on the lane instead of one at delivery: the same copy, one
+/// wake later), so it is extracted at delivery. No upper bound of its own:
+/// a FUSE WRITE never exceeds `max_write ≤ payload`. The filesystem's gate
+/// adds what only it knows (the class by `holdClass`, striped on a
+/// passthrough set, the W1 or overlay arm's own screens) from a published
+/// per-inode snapshot — never a map lookup on the worker thread (0002
+/// ledger Q10).
+pub fn holdShape(offset: u64, size: u32, block: u64) bool {
+    if (size == 0) return false;
     if (offset % HOLD_ALIGN != 0 or size % HOLD_ALIGN != 0) return false;
     return offset / block == (offset + size - 1) / block;
+}
+
+/// Which write arm a held payload is destined for: charter §6.2 items 1–2
+/// meet on ONE line, `PATCH_MAX = block/8` — W1's ceiling and the overlay's
+/// length floor — so the class costs no constant of its own. At or under
+/// it the sole-owner patch (W1), whose filesystem gate declines every
+/// W1-ineligible shape (holding those measured 0.45×: rand-4k at fabric
+/// RTT paid hold + late extraction per op). Above it the device overlay
+/// (item 1: `WRITE_FIXED(device fd ← slot)`, zero daemon copies) — the
+/// streaming class, whose extraction at delivery was the ONE daemon copy
+/// of every big written byte (io-wq 0.77 ms/MiB, half the daemon's cores
+/// on 1M seq write ×4: rung-10-slabcopy, rung-10-perf-baseline-workstation).
+pub const HoldClass = enum(u8) { w1, overlay };
+
+pub fn holdClass(size: u32, patch_max: u64) HoldClass {
+    return if (@as(u64, size) <= patch_max) .w1 else .overlay;
 }
 
 /// The stability law (porting spec §5.2): page-cache folios are sound after
@@ -392,24 +399,28 @@ test "the paged mirror is not track-keyed: READ/READLINK out-paged always, WRITE
     try testing.expect(!inPaged(.read) and inPaged(.write));
 }
 
-test "hold_candidate: strict half-payload bound, 4 KiB alignment, zero length never; the W1 shape caps at block/8 within one block" {
-    const bound = holdBound(1 << 20);
-    try testing.expectEqual(@as(u32, 512 << 10), bound);
-    try testing.expect(holdCandidate(0, 4096, bound));
-    try testing.expect(holdCandidate(4096 * 7, 4096 * 3, bound));
-    try testing.expect(!holdCandidate(0, 0, bound));
-    try testing.expect(!holdCandidate(0, 512 << 10, bound));
-    try testing.expect(holdCandidate(0, (512 << 10) - 4096, bound));
-    try testing.expect(!holdCandidate(1, 4096, bound));
-    try testing.expect(!holdCandidate(0, 4095, bound));
+test "the hold shape: 4 KiB alignment, within one block, zero length never, no bound of its own (a whole-payload 1 MiB write holds, a 4 MiB block-sized write holds); the class splits on PATCH_MAX = block/8 — at or under it W1, above it the overlay" {
     const block: u64 = 4 << 20;
-    try testing.expect(w1Shape(0, 4096, block));
-    try testing.expect(w1Shape(block - 4096, 4096, block));
-    try testing.expect(w1Shape(0, 512 << 10, block));
-    try testing.expect(!w1Shape(0, (512 << 10) + 4096, block));
-    try testing.expect(!w1Shape(block - 4096, 8192, block));
-    try testing.expect(!w1Shape(512, 4096, block));
-    try testing.expect(!w1Shape(0, 0, block));
+    try testing.expect(holdShape(0, 4096, block));
+    try testing.expect(holdShape(block - 4096, 4096, block));
+    try testing.expect(holdShape(4096 * 7, 4096 * 3, block));
+    try testing.expect(holdShape(0, 512 << 10, block));
+    try testing.expect(holdShape(0, (512 << 10) + 4096, block));
+    try testing.expect(holdShape(3 << 20, 1 << 20, block)); // the streaming shape: the last 1 MiB of a block
+    try testing.expect(holdShape(block, @intCast(block), block)); // a block-sized write at a block edge
+    try testing.expect(!holdShape(block - 4096, 8192, block)); // straddles the block edge
+    try testing.expect(!holdShape((3 << 20) + 4096, 1 << 20, block)); // a 1 MiB write that straddles
+    try testing.expect(!holdShape(512, 4096, block));
+    try testing.expect(!holdShape(1, 4096, block));
+    try testing.expect(!holdShape(0, 4095, block));
+    try testing.expect(!holdShape(0, 0, block));
+    const patch_max = block / 8;
+    try testing.expectEqual(HoldClass.w1, holdClass(4096, patch_max));
+    try testing.expectEqual(HoldClass.w1, holdClass(512 << 10, patch_max));
+    try testing.expectEqual(HoldClass.overlay, holdClass((512 << 10) + 4096, patch_max));
+    try testing.expectEqual(HoldClass.overlay, holdClass(1 << 20, patch_max));
+    // The patch-OFF control arm (SQUEEZEFS_PATCH_MAX_BYTES=0): every length is the overlay's.
+    try testing.expectEqual(HoldClass.overlay, holdClass(4096, 0));
 }
 
 test "the stability class: O_DIRECT without FUSE_WRITE_CACHE is direct_gup; a writeback-cache write is page_cache even with O_DIRECT; a plain write is page_cache" {

@@ -136,13 +136,14 @@ pub const InitCaps = struct {
     retention: bool = false,
 };
 
-/// The W1 hold gate's input: the WRITE's shape and class, decided ON THE
+/// The hold gate's input: the WRITE's shape and class, decided ON THE
 /// WORKER THREAD at delivery. The gate is a pure predicate over this and
 /// the filesystem's published per-inode snapshot — never a cache lookup, a
 /// lock or an await (0002 ledger: the reference probed its metadata cache
-/// on the queue worker). The transport already proved `zc.w1Shape` and
-/// `holdCandidate`; the filesystem adds what only it knows (non-extending,
-/// striped, undecorated whole-block map, passthrough).
+/// on the queue worker). The transport already proved `zc.holdShape`
+/// (aligned, one block); the filesystem adds the class (`zc.holdClass` on
+/// its PATCH_MAX) and what only it knows (striped on a passthrough set; for
+/// W1 non-extending and not stream-adjacent; for the overlay its arm on).
 pub const HoldHint = struct {
     ino: u64,
     offset: u64,
@@ -301,6 +302,13 @@ const EchoFsImpl = struct {
     /// negative once released).
     pub const park_lookup_name = "park-lookup";
 
+    /// `held_store`'s face: the session's `storeHeld`, type-erased.
+    pub const HeldStore = struct {
+        ctx: *anyopaque,
+        fd: linux.fd_t,
+        store: *const fn (ctx: *anyopaque, src: slot.HeldSource, fd: linux.fd_t, off: u64, io: std.Io) slot.ExtractError!void,
+    };
+
     /// Every READ declines the probe (arm (a)) and takes the lane (arm (c)).
     probe_declines: bool = false,
     /// LOOKUP and GETATTR are answered by `probe_meta` on the worker (the
@@ -329,9 +337,17 @@ const EchoFsImpl = struct {
     /// A WRITE handler replies BEFORE releasing its lease and waits until
     /// the worker parked the commit (the gate's Parked arm, observable).
     hold_lease_across_reply: bool = false,
-    /// The W1 gate says yes for `/scratch` (a test filesystem that declares
+    /// The hold gate says yes for `/scratch` (a test filesystem that declares
     /// eligibility; the transport proved the shape already).
     hold_eligible: bool = false,
+    /// The direct store of a held payload (`WRITE_FIXED(fd ← slot)` on the
+    /// ring that registered it): a held `/scratch` WRITE lands in `fd` at
+    /// its offset through `store` — the session's `storeHeld` behind a
+    /// type-erased face — instead of the scratch array; the lazy
+    /// extraction arm stays the fallback on a failed store.
+    held_store: ?HeldStore = null,
+    direct_stores: std.atomic.Value(u64) = .init(0),
+    direct_store_failures: std.atomic.Value(u64) = .init(0),
     /// A held `.page_cache` WRITE is answered ACK-early (`replyRetain`),
     /// extracted after `retain_gate` opens, then released.
     retain_writes: bool = false,
@@ -590,14 +606,31 @@ const EchoFsImpl = struct {
         return .{ .reply = codec.replyData(req.unique(), window[0..n]) };
     }
 
-    /// A WRITE whose payload is HELD in the zc slot (W1 eligible): the
+    /// A WRITE whose payload is HELD in the zc slot (the gate admitted it):
+    /// the direct-store arm (`held_store`: the bytes move slot → fd with no
+    /// daemon pass; a failed store falls to the extraction below), the
     /// retain arm (ACK-early, extract after the gate, release) or the lazy
     /// extraction arm. The lease is released before any reply.
     fn heldWrite(self: *Self, h: Handle, u: u64, w: codec.Write, l: slot.PayloadLease, out: *codec.OutBuf) void {
         _ = self.held_writes.fetchAdd(1, .monotonic);
         const io = self.io.?;
-        const dst = self.scratch[@intCast(w.in.offset)..][0..w.in.size];
         const end = w.in.offset + w.in.size;
+        if (self.held_store) |hs| {
+            if (hs.store(hs.ctx, l.heldSource().?, hs.fd, w.in.offset, io)) |_| {
+                _ = self.direct_stores.fetchAdd(1, .monotonic);
+                l.release();
+                _ = self.scratch_len.fetchMax(end, .acq_rel);
+                _ = self.write_bytes.fetchAdd(w.in.size, .monotonic);
+                return h.reply(codec.replyWrite(out, u, w.in.size));
+            } else |_| {
+                _ = self.direct_store_failures.fetchAdd(1, .monotonic);
+            }
+        }
+        if (end > scratch_cap) {
+            l.release();
+            return h.fail(.FBIG);
+        }
+        const dst = self.scratch[@intCast(w.in.offset)..][0..w.in.size];
         if (self.retain_writes and (l.class == .page_cache or self.retain_ignore_class)) {
             if (l.class == .direct_gup) {
                 // The snapshot-first law: a GUP payload is owned before any ACK.
@@ -713,12 +746,12 @@ const EchoFsImpl = struct {
                     l.release();
                     return h.fail(.ROFS);
                 }
+                if (l.held) return self.heldWrite(h, u, w, l, &out);
                 const end = w.in.offset + w.in.size;
                 if (end > scratch_cap) {
                     l.release();
                     return h.fail(.FBIG);
                 }
-                if (l.held) return self.heldWrite(h, u, w, l, &out);
                 defer l.release();
                 @memcpy(self.scratch[@intCast(w.in.offset)..][0..w.in.size], w.data);
                 _ = self.scratch_len.fetchMax(end, .acq_rel);

@@ -402,7 +402,10 @@ size % 4096 == 0`, `bound = payload_sz / 2` (STRICT — half-payload is streamin
 kernel-split streaming writes arrive payload-sized and the W1 cap `block/8 ≤
 payload/2` on every shipped geometry) or `payload_sz + 1` when streaming holds are
 armed (`SQUEEZEFS_DEVICE_OVERLAY` on: eligible streaming segments consume the slot by
-direct DMA, `zc.rs:356-368, 374-383`). Pinned `zc.rs:690-709`.
+direct DMA, `zc.rs:356-368, 374-383`). Pinned `zc.rs:690-709`. **PORT:** `zc.holdShape`
+(alignment, one block, non-empty; no bound — a WRITE never exceeds `max_write ≤ payload`)
+and `zc.holdClass` on `PATCH_MAX = block/8` (≤ W1, > the overlay); the filesystem's gate
+judges the class (`data_write_path.md` §1.1 step 3a; 0002 row 544).
 
 The **W1 eligibility gate** (`Filesystem::zc_write_hold_eligible`,
 `fuse_client.rs:26231-26290`, wired through `session.rs:1032` and

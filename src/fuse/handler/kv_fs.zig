@@ -2895,9 +2895,8 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             if (!in_place) {
                 const buf = try self.gpa.alloc(u8, @intCast(layout.ceilGrain(size)));
                 defer self.gpa.free(buf);
-                _ = try self.residentImage(local, rec, buf);
-                @memcpy(buf[@intCast(a.offset)..@intCast(end)], data);
-                const image = buf[0..@intCast(size)];
+                const got = try self.residentImage(local, rec, buf);
+                const image = rebuiltImage(buf, got, @intCast(a.offset), data, @intCast(size));
                 generation = self.data.stageImage(k, image, if (extending) .append else .none) catch |e| switch (e) {
                     error.NoSpaceLeft => return null,
                     else => |x| return x,
@@ -2928,6 +2927,19 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             fuse_write_staged.inc();
             write_admit.noteInlineWrite(data.len);
             return .{ .size = @intCast(data.len) };
+        }
+
+        /// The staged arm's rebuilt image in `buf`: the resident bytes
+        /// `[0, got)`, ZEROS over the gap up to the write, the write's
+        /// bytes, `size` long. The gap is zeroed explicitly — `buf` is
+        /// recycled memory, and a tenant read fills its grain's tail with
+        /// the slot's dead bytes past the file's length (fstests
+        /// generic/075: a packed file truncated to an unaligned size, then
+        /// written beyond EOF, read a dead write back from the gap).
+        fn rebuiltImage(buf: []u8, got: usize, offset: usize, data: []const u8, size: usize) []u8 {
+            if (got < offset) @memset(buf[got..offset], 0);
+            @memcpy(buf[offset .. offset + data.len], data);
+            return buf[0..size];
         }
 
         /// `write_admit.ParkHook.parked`: the op's station while the data
@@ -5317,6 +5329,49 @@ test "the staged append law (repro-port: fstests generic/069 `append_writer` —
     while (i < m) : (i += 1) try testing.expectEqual(i, std.mem.readInt(u32, img[head.len + 4 * i ..][0..4], .little));
     try testing.expectEqual(@as(usize, 1), h.data.ring.?.seg.live());
     h.release(f);
+}
+
+test "the staged arm's rebuilt image ZEROES the gap between the resident bytes and an extending write past the slack (repro-port: fstests generic/075 fsx — a packed file truncated to an unaligned size, then written beyond EOF, read a dead write's bytes back from the gap; the rebuild buffer is recycled memory: never zeros by luck, never another file's bytes)" {
+    const H = HarnessOf(SettlingData);
+    var h: H = undefined;
+    try h.init();
+    defer h.deinit();
+    defer h.data.deinit();
+    h.data.store = &h.store;
+    h.data.staging = true;
+    h.data.ring = try SettlingData.RamRing.init(64 << 20, 32 << 20);
+    defer h.data.ring.?.deinit();
+    const f = try h.create(1, "gap", 0o644);
+    const head: [100]u8 = @splat('A');
+    try testing.expectEqual(@as(?linux.E, null), h.write(f, 0, &head, 0).errno());
+    // Past the record's slack (one grain): no in-place append — the image
+    // is rebuilt from the resident bytes and the write, in a buffer of
+    // `ceilGrain(size)` bytes. Recycled memory, as the daemon's allocator
+    // hands it: the same size dirtied and freed just before.
+    const far: u64 = 8000;
+    const dirty = try testing.allocator.alloc(u8, @intCast(layout.ceilGrain(far + 4)));
+    @memset(dirty, 0xee);
+    testing.allocator.free(dirty);
+    try testing.expectEqual(@as(?linux.E, null), h.write(f, far, "BBBB", 0).errno());
+    const k = staging.StagingKey.init(layout.zero_file_id, try H.Fs.localOf(f));
+    const lease = h.data.ring.?.seg.get(k).?;
+    defer lease.release();
+    const b = lease.bytes();
+    try testing.expectEqual(far + 4, b.len);
+    for (b[0..head.len]) |x| try testing.expectEqual(@as(u8, 'A'), x);
+    for (b[head.len..@intCast(far)]) |x| try testing.expectEqual(@as(u8, 0), x);
+    try testing.expectEqualStrings("BBBB", b[@intCast(far)..]);
+    // The rebuild itself over a buffer full of a dead write's bytes (what a
+    // tenant read leaves in its grain's tail, what a recycled buffer holds):
+    // the gap reads zeros, nothing else moves.
+    var stale: [12288]u8 = @splat(0xee);
+    @memset(stale[0..100], 'A');
+    const img = H.Fs.rebuiltImage(&stale, 100, 8000, "BBBB", 8004);
+    try testing.expectEqual(@as(usize, 8004), img.len);
+    for (img[0..100]) |x| try testing.expectEqual(@as(u8, 'A'), x);
+    for (img[100..8000]) |x| try testing.expectEqual(@as(u8, 0), x);
+    try testing.expectEqualStrings("BBBB", img[8000..]);
+    for (stale[8004..]) |x| try testing.expectEqual(@as(u8, 0xee), x);
 }
 
 test "§L.6 the write-stamp park (repro-port: frag-512b-write — 533 k size-neutral 512 B overwrites cost 533 k journal entries, 1.56 per 4 KiB window, 2.6 KB of metadata device per op): a size-neutral striped write commits NOTHING — its (mtime, ctime) is parked, fold-visible on getattr while the stored record lags; the drain commits ONE Δ entry per ≤ 16 parked inos and a retire never drops a stamp parked after it; fsync(ino) drains that ino; an extending write parks its size claim and the drain journals it (§AL.5); the cap wakes the cadence; strict mode commits per write" {

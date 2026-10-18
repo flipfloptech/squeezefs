@@ -2189,12 +2189,27 @@ test "wake coalescing: N publishes between two polls of the stage-B fiber cost n
     defer h.deinit();
     try h.spawnLane(.{}, "600000", 0);
     const lane = h.lane.?;
-    // Warm up: after this ack the fiber parked idle.
+    // Warm up; the ack lands BEFORE the fiber parks, so wait for the park
+    // itself (the delivery word reads IDLE) — a publish that meets the
+    // fiber still RUNNING elides its wake (train 2026-10-18: `expected 2,
+    // found 1` on a loaded host).
     const warm = try h.append(1, 300, 0x01);
     try warm.ticket.wait().result;
+    spinUntil(struct {
+        f: *const Fiber,
+        fn ready(s: @This()) bool {
+            return s.f.state.load() == .idle;
+        }
+    }{ .f = lane.fiber.? });
 
     test_seams.held.store(0, .release);
     test_seams.hold_before_scan.store(1, .release);
+    // Released on EVERY exit: a failed expectation with the fiber held at
+    // the seam left `h.deinit()` waiting for ever (the shard's hang limit).
+    defer {
+        test_seams.hold_before_scan.store(0, .release);
+        futex.wakeAll(&test_seams.hold_before_scan);
+    }
     var tickets: [9]Ticket = undefined;
     // Publish #1 wakes the parked fiber: the one eventfd write.
     const w_idle = lane.snapshot().wake_writes;

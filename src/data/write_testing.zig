@@ -12,6 +12,7 @@ const assert = std.debug.assert;
 
 const seams = @import("write_seams.zig");
 const block_alloc = @import("block_alloc.zig");
+const size_epoch = @import("size_epoch.zig");
 
 comptime {
     assert(builtin.is_test);
@@ -238,9 +239,12 @@ pub const RamMap = struct {
     /// binding held in flight from before the publish, the outcome carrying
     /// the holds for the caller to drop after its frees. Null = none.
     holds: ?seams.ReleaseHolds = null,
+    /// The size epochs (`size_epoch.SizeEpochs`): `truncate` bumps, the
+    /// merge applies the product's stale rule over `RamFile.size`.
+    epochs: size_epoch.SizeEpochs,
 
-    pub fn init(gpa: Allocator) RamMap {
-        return .{ .gpa = gpa };
+    pub fn init(gpa: Allocator) Allocator.Error!RamMap {
+        return .{ .gpa = gpa, .epochs = try size_epoch.SizeEpochs.init(gpa, 16) };
     }
 
     pub fn deinit(self: *RamMap) void {
@@ -248,6 +252,7 @@ pub const RamMap = struct {
         while (it.next()) |f| f.map.deinit(self.gpa);
         self.files.deinit(self.gpa);
         self.merges.deinit(self.gpa);
+        self.epochs.deinit();
         self.* = undefined;
     }
 
@@ -255,10 +260,30 @@ pub const RamMap = struct {
         return .{ .ctx = self, .vtable = &vtable };
     }
 
-    const vtable: seams.MapSeam.VTable = .{ .lookup = &lookup, .view = &view, .merge = &merge, .current_fencing = &currentFencing };
+    const vtable: seams.MapSeam.VTable = .{ .lookup = &lookup, .view = &view, .merge = &merge, .current_fencing = &currentFencing, .size_epoch = &sizeEpoch };
 
     pub fn create(self: *RamMap, ino: u64, kind: seams.FileKind, size: u64) !void {
         try self.files.put(self.gpa, ino, .{ .kind = kind, .size = size });
+    }
+
+    /// The filesystem's truncate as the authority sees it: the epoch bumps
+    /// under the setter's guards, the size is set, the blocks at or past
+    /// the new end leave the map (their bindings are the caller's to free).
+    pub fn truncate(self: *RamMap, ino: u64, size: u64) !void {
+        self.lock.lockUncancelable(std.testing.io);
+        defer self.lock.unlock(std.testing.io);
+        try self.epochs.bump(ino);
+        const f = self.files.getPtr(ino).?;
+        f.size = size;
+        const keep: u32 = @intCast((size + self.chunk - 1) / self.chunk);
+        var gone: [64]u32 = undefined;
+        var n: usize = 0;
+        var it = f.map.keyIterator();
+        while (it.next()) |b| if (b.* >= keep and n < gone.len) {
+            gone[n] = b.*;
+            n += 1;
+        };
+        for (gone[0..n]) |b| _ = f.map.remove(b);
     }
 
     pub fn bind(self: *RamMap, ino: u64, block: u32, b: Binding) !void {
@@ -316,7 +341,23 @@ pub const RamMap = struct {
             if (!covered) return error.Transient;
         }
         var out: seams.MergeOutcome = .{};
-        for (req.inserts) |ins| {
+        // The product's stale rule (`plane.mapMerge`): a unit formed before
+        // a size set inserts only below the current size and raises none.
+        var kept: [seams.MergeOutcome.max_displaced]seams.MapInsert = undefined;
+        var inserts = req.inserts;
+        var min_size = req.min_size;
+        if (req.size_epoch) |seen| if (self.epochs.setSince(req.ino, seen)) {
+            var n: usize = 0;
+            for (req.inserts) |ins| {
+                if (@as(u64, ins.block) * self.chunk < f.size) {
+                    kept[n] = ins;
+                    n += 1;
+                } else out.clipped += 1;
+            }
+            inserts = kept[0..n];
+            min_size = 0;
+        };
+        for (inserts) |ins| {
             if (f.map.get(ins.block)) |old| {
                 if (!old.sameRef(ins.binding, self.chunk)) {
                     out.displaced[out.n_displaced] = old;
@@ -329,13 +370,13 @@ pub const RamMap = struct {
             }
             f.map.put(self.gpa, ins.block, ins.binding) catch return error.OutOfMemory;
         }
-        if (req.min_size > f.size) f.size = req.min_size;
+        if (min_size > f.size) f.size = min_size;
         f.kind = .striped;
         if (self.holds) |h| {
             h.hold(out.slice());
             out.holds = h;
         }
-        self.merges.append(self.gpa, .{ .ino = req.ino, .blocks = @intCast(req.inserts.len), .min_size = req.min_size, .fencing = req.fencing, .displaced = out.n_displaced }) catch return error.OutOfMemory;
+        self.merges.append(self.gpa, .{ .ino = req.ino, .blocks = @intCast(inserts.len), .min_size = min_size, .fencing = req.fencing, .displaced = out.n_displaced }) catch return error.OutOfMemory;
         if (self.on_merge) |h| h(self);
         return out;
     }
@@ -343,6 +384,11 @@ pub const RamMap = struct {
     fn currentFencing(ctx: *anyopaque, _: u64) u64 {
         const self: *RamMap = @ptrCast(@alignCast(ctx));
         return self.fencing;
+    }
+
+    fn sizeEpoch(ctx: *anyopaque, ino: u64) u64 {
+        const self: *RamMap = @ptrCast(@alignCast(ctx));
+        return self.epochs.current(ino);
     }
 };
 
@@ -423,7 +469,7 @@ pub const Fixture = struct {
     pub fn init(gpa: Allocator, blocks_per_vol: u64) !*Fixture {
         const f = try gpa.create(Fixture);
         errdefer gpa.destroy(f);
-        f.* = .{ .gpa = gpa, .dev = FakeDevice.init(gpa), .map = RamMap.init(gpa), .frees = undefined, .alloc_a = undefined, .alloc_b = undefined };
+        f.* = .{ .gpa = gpa, .dev = FakeDevice.init(gpa), .map = try RamMap.init(gpa), .frees = undefined, .alloc_a = undefined, .alloc_b = undefined };
         f.alloc_a = try block_alloc.BlockAllocator.init(gpa, .{ .vol_tag = VOL_A, .vol = 0, .block_size = BS, .capacity_bytes = blocks_per_vol * BS });
         f.alloc_b = try block_alloc.BlockAllocator.init(gpa, .{ .vol_tag = VOL_B, .vol = 1, .block_size = BS, .capacity_bytes = blocks_per_vol * BS });
         f.vols.add(.{ .vol_tag = VOL_A, .ordinal = 0, .alloc = f.alloc_a, .passthrough = true, .write_cache_volatile = true });

@@ -404,6 +404,12 @@ pub const Outcome = struct {
     written: u64,
     /// The size the write's bytes establish (the postlude's size claim).
     size_claim: u64,
+    /// The ino's size epoch as the last piece landed (`MapSeam.sizeEpoch`):
+    /// the postlude asks the plane whether a size-setting commit landed
+    /// since (`DataPlane.sizeSetSince`) and parks no claim when one did —
+    /// the truncate clipped the bytes `size_claim` would name. 0 for a
+    /// write that landed nothing.
+    size_epoch: u64,
     pieces: u32,
     arms: [5]u32 = @splat(0),
 
@@ -801,7 +807,7 @@ pub const WritePath = struct {
     pub fn write(self: *WritePath, io: Io, req: Request) Error!Outcome {
         const len = req.payload.len();
         const bs = self.cfg.block_size;
-        if (len == 0) return .{ .written = 0, .size_claim = 0, .pieces = 0 };
+        if (len == 0) return .{ .written = 0, .size_claim = 0, .size_epoch = 0, .pieces = 0 };
         const end = std.math.add(u64, req.offset, len) catch return error.FileTooBig;
         if (end / bs >= std.math.maxInt(u32)) return error.FileTooBig;
         const file = req.file orelse seams.FileView{ .kind = .striped, .size = 0, .map_resident = false };
@@ -845,13 +851,17 @@ pub const WritePath = struct {
         if (bytes == null and !(single and (try_patch or overlay_shape))) {
             bytes = self.materialize(io, req.payload) catch return error.InputOutput;
         }
-        var out: Outcome = .{ .written = 0, .size_claim = end, .pieces = @intCast(pieces.len) };
+        var out: Outcome = .{ .written = 0, .size_claim = end, .size_epoch = 0, .pieces = @intCast(pieces.len) };
         for (pieces) |pc| {
             stats.write_pieces.inc();
             const arm = try self.admitPiece(io, req, file, pc, &bytes, try_patch and single, overlay_shape, stream_adjacent);
             out.arms[@backingInt(arm)] += 1;
             out.written += pc.len;
         }
+        // Read AFTER the last piece landed: a size set before this point
+        // saw (or settled) the pieces it clipped; one after it is the
+        // postlude's to detect.
+        out.size_epoch = self.map.sizeEpoch(req.ino);
         stats.writes_admitted.inc();
         return out;
     }

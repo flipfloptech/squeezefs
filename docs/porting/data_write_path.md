@@ -907,6 +907,17 @@ own contract); the staged/record stamp is the supersession and remount test only
 the GENUINE fence is `WriterGuardFenced` from the D0 latch (`write_pipeline.rs:
 236-249`; `design-rewrite-program.md:447-462`).
 
+### 7.4 The size epoch (this port's addition; `docs/evidence/rung-10-size-epoch.md`)
+
+Orthogonal to the fencing credential: a per-ino epoch (`data/size_epoch.zig`) every
+size-setting commit bumps under its exclusive guards before its clip. A write-back unit
+records it at formation (`Unit.size_epoch` → `MergeRequest.size_epoch`); a merge that
+finds it moved inserts only the blocks below the ino's current size, raises no size and
+returns the rest `clipped` (the flush returns the mint, releases the ring entry:
+`eof_discarded`). A striped write's landing stamps it into `Outcome.size_epoch`; the
+postlude parks no size claim when it moved. The fencing field keeps its contract (a
+formation-time value in it would be re-presented away by every caller's retry).
+
 ---
 
 ## 8. ENOSPC terminal law + the wall-bounded park

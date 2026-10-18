@@ -40,8 +40,12 @@
 //! conveyor drops it at the terminal outcome BEFORE the ack (D-3). A
 //! striped write takes NO 4a guard across its data I/O: the pieces run
 //! under the write path's level (3) and the inode's size claim is a
-//! postlude transaction (SIZE NEVER LEADS DATA). A TRUNCATE (SETATTR size,
-//! `O_TRUNC`) and the tree-mapped corpse mark take the data plane's
+//! postlude transaction (SIZE NEVER LEADS DATA) judged against the plane's
+//! per-ino SIZE EPOCH — a size-setting commit that landed between the
+//! bytes' landing and the postlude leaves the write's end stale, and the
+//! postlude claims nothing (`sizeClaimOf`; `data/size_epoch.zig`). A
+//! TRUNCATE (SETATTR size, `O_TRUNC`) bumps that epoch under its guards
+//! before its clip; it and the tree-mapped corpse mark take the data plane's
 //! per-ino layout lock — level (3.7), `Data.lockLayout` — BEFORE the 4a
 //! set and hold it until the commit landed: the layout record they read is
 //! the one their commit lands on, against the plane's merges, sweeps and
@@ -123,6 +127,7 @@ const block_refs = @import("../../data/block_refs.zig");
 const pack = @import("../../data/pack.zig");
 const write_admit = @import("../../data/write_admit.zig");
 const seams = @import("../../data/write_seams.zig");
+const size_epoch = @import("../../data/size_epoch.zig");
 const fsync_mod = @import("../../data/fsync.zig");
 const ipc_wire = @import("../../ipc/wire.zig");
 
@@ -212,6 +217,12 @@ pub var fuse_write_foreign_striped: counters.ShardedCounter = .{};
 /// journaled by the batched drain — instead of committed as a 76 B entry
 /// that cost one grain-aligned window and one device round trip per op.
 pub var fuse_write_times_parked: counters.ShardedCounter = .{};
+/// `fuse_write_size_claims_dropped`: striped writes whose size claim a
+/// size-setting commit (a truncate, an O_TRUNC open) that landed between
+/// the bytes' landing and the postlude made stale — the postlude parked the
+/// claimed size as it stands, never the write's pre-truncate end
+/// (`DataPlane.sizeSetSince`; fstests generic/075, 112's class).
+pub var fuse_write_size_claims_dropped: counters.ShardedCounter = .{};
 /// Durable promotions a write forced BEFORE its type flip (inline/staged/
 /// packed → striped: the resident payload landed on its own block).
 pub var fuse_write_promotions_to_striped: counters.ShardedCounter = .{};
@@ -309,7 +320,7 @@ pub fn assertStore(comptime T: type) void {
 /// the product; `NoData` is the volume-less set).
 pub fn assertData(comptime T: type) void {
     comptime {
-        for ([_][]const u8{ "hasVolumes", "stagingOn", "blockSize", "inlineMax", "geometry", "refsSeam", "noteShape", "forgetShape", "isPassthrough", "canStoreHeld", "write", "zeroExtension", "custodyFloor", "barrierData", "read", "ownBlock", "abandonOwnBlock", "ownBlockPublished", "holdReleases", "dropReleases", "freeBindings", "flushCustody", "releaseIno", "hasWriteCustody", "fsync", "statfs", "mintFileId", "stageImage", "appendStaged", "releaseStaged", "stagedLease", "readMappingImage", "lockLayout", "stageKvmapShrink", "stageKvmapCorpse", "drainKvmapSweep", "publishForeign" }) |name| {
+        for ([_][]const u8{ "hasVolumes", "stagingOn", "blockSize", "inlineMax", "geometry", "refsSeam", "noteShape", "forgetShape", "noteSizeSet", "sizeSetSince", "isPassthrough", "canStoreHeld", "write", "zeroExtension", "custodyFloor", "barrierData", "read", "ownBlock", "abandonOwnBlock", "ownBlockPublished", "holdReleases", "dropReleases", "freeBindings", "flushCustody", "releaseIno", "hasWriteCustody", "fsync", "statfs", "mintFileId", "stageImage", "appendStaged", "releaseStaged", "stagedLease", "readMappingImage", "lockLayout", "stageKvmapShrink", "stageKvmapCorpse", "drainKvmapSweep", "publishForeign" }) |name| {
             if (!@hasDecl(T, name)) @compileError(@typeName(T) ++ " is not a kv_fs Data face: lacks `" ++ name ++ "`");
         }
     }
@@ -465,6 +476,10 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         times_park: bool,
         /// `Options.write_postlude_hold` (`holdPostlude`).
         write_hold: bool = false,
+        /// Test seam: a striped write parks AFTER its bytes landed and
+        /// BEFORE its postlude's `I{ino}` guard until `write_hold_release`
+        /// fires (the window a size-setting commit crosses whole).
+        write_hold_pre_guard: bool = false,
         /// Test seam: the times drain parks between its claims snapshot and
         /// its guards until `write_hold_release` fires (the window a
         /// size-setting commit can cross).
@@ -2070,6 +2085,11 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             errdefer if (t_owned) self.store.abandon(t);
             var stored = try self.readInode(local);
             if (a.attr.size) |sz| {
+                // The size epoch moves BEFORE the clip, under the guards:
+                // a write whose bytes landed before this moment claims no
+                // size past it; a write-back unit formed before it merges
+                // nothing at or past the new end (`DataPlane.noteSizeSet`).
+                try self.data.noteSizeSet(local);
                 stored.size = self.claimedSize(local, stored);
                 old_size = stored.size;
                 try self.stageTruncate(c, t, local, stored, sz, &after);
@@ -2689,6 +2709,8 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 var t_owned = true;
                 errdefer if (t_owned) self.store.abandon(t);
                 var stored = try self.readInode(local);
+                // The size epoch moves before the clip (as the truncate's).
+                try self.data.noteSizeSet(local);
                 stored.size = self.claimedSize(local, stored);
                 try self.stageTruncate(c, t, local, stored, 0, &after);
                 stored.size = 0;
@@ -3008,6 +3030,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             c.stage(.write_admitted);
             const outcome = self.data.write(self.io, local, a.offset, payload, a.class, .{ .kind = .striped, .size = old_size, .map_resident = true }, .{ .ctx = c, .parked = &stampParkedPool }) catch |e| return writeError(e);
             c.stage(.write_done);
+            if (self.write_hold_pre_guard) self.holdPostlude();
             // The postlude: SIZE NEVER LEADS DATA — durably (the ordered law,
             // decision 0003 §AL.5): a size never becomes durable before the
             // bytes it makes readable (the gap's zeros included). A
@@ -3032,7 +3055,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 defer g.release(self.io);
                 if (self.write_hold) self.holdPostlude();
                 const v = try self.readInode(local);
-                const size = @max(self.claimedSize(local, v), outcome.size_claim);
+                const size = @max(self.claimedSize(local, v), self.sizeClaimOf(local, outcome));
                 try self.parkWriteTimes(local, if (size > v.size) size else 0);
                 break :park size;
             } else commit: {
@@ -3041,7 +3064,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 errdefer if (t_owned) self.store.abandon(t);
                 if (self.write_hold) self.holdPostlude();
                 var v = try self.readInode(local);
-                const size = @max(self.claimedSize(local, v), outcome.size_claim);
+                const size = @max(self.claimedSize(local, v), self.sizeClaimOf(local, outcome));
                 const claim: u64 = if (size > v.size) size else 0;
                 // Strict cadence (an ack is durable): the bytes land and
                 // their barrier runs before the claim commits. A KILLPRIV
@@ -3068,6 +3091,21 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             _ = self.write_held.fetchAdd(1, .release);
             n.waitUncancelable(self.io);
             _ = self.write_held.fetchSub(1, .release);
+        }
+
+        /// The size a landed write may claim, judged under the postlude's
+        /// `I{ino}` guard: its end — unless a size-setting commit of the
+        /// ino landed since its bytes did (the plane's size epoch moved
+        /// past the landing's stamp). The truncate clipped the map and the
+        /// claim the end would have raised; the bytes past its cut are
+        /// gone by the only serialization left ("write, then truncate"),
+        /// so the write claims nothing and the size stands as the truncate
+        /// set it (fstests generic/075, 112: fsx's `Size error` right after
+        /// a truncate down).
+        fn sizeClaimOf(self: *Self, local: u64, outcome: write_admit.Outcome) u64 {
+            if (!self.data.sizeSetSince(local, outcome.size_epoch)) return outcome.size_claim;
+            fuse_write_size_claims_dropped.inc();
+            return 0;
         }
 
         /// The data plane's write verdicts as the filesystem's.
@@ -3899,6 +3937,11 @@ pub const NoData = struct {
     fn noRef(_: *anyopaque, _: *tx.KvTx, _: layout.RefOp) Allocator.Error!void {}
     pub fn noteShape(_: *NoData, _: u64, _: u64, _: layout.Kind) void {}
     pub fn forgetShape(_: *NoData, _: u64) void {}
+    /// No striped write lands on a volume-less set: no raise to judge.
+    pub fn noteSizeSet(_: *NoData, _: u64) Allocator.Error!void {}
+    pub fn sizeSetSince(_: *NoData, _: u64, _: u64) bool {
+        return false;
+    }
     pub fn canStoreHeld(_: *const NoData) bool {
         return false;
     }
@@ -4553,6 +4596,9 @@ const SettlingData = struct {
     syncfs_calls: u32 = 0,
     commits_at_syncfs: u64 = 0,
     fsyncs_at_syncfs: u64 = 0,
+    /// The plane's size epochs over the same core (built on first use: the
+    /// double is a plain default value).
+    epochs: ?size_epoch.SizeEpochs = null,
     /// The own-block promotions: the largest image DMA'd (≤ one block);
     /// `own_blocks_settled` the ones published or abandoned since (each a
     /// live owner until then).
@@ -4611,6 +4657,7 @@ const SettlingData = struct {
     };
 
     fn deinit(self: *SettlingData) void {
+        if (self.epochs) |*e| e.deinit();
         self.freed.deinit(testing.allocator);
         self.adds.deinit(testing.allocator);
         self.releases.deinit(testing.allocator);
@@ -4690,15 +4737,28 @@ const SettlingData = struct {
         try self.releases.append(testing.allocator, op);
     }
     pub fn noteShape(_: *SettlingData, _: u64, _: u64, _: layout.Kind) void {}
-    pub fn forgetShape(_: *SettlingData, _: u64) void {}
+    pub fn forgetShape(self: *SettlingData, ino: u64) void {
+        self.epochsOf().forget(ino);
+    }
+    fn epochsOf(self: *SettlingData) *size_epoch.SizeEpochs {
+        if (self.epochs == null) self.epochs = size_epoch.SizeEpochs.init(testing.allocator, 16) catch unreachable;
+        return &self.epochs.?;
+    }
+    pub fn noteSizeSet(self: *SettlingData, ino: u64) Allocator.Error!void {
+        return self.epochsOf().bump(ino);
+    }
+    pub fn sizeSetSince(self: *SettlingData, ino: u64, seen: u64) bool {
+        return self.epochsOf().setSince(ino, seen);
+    }
     pub fn canStoreHeld(_: *const SettlingData) bool {
         return false;
     }
-    /// The striped data write: recorded, every byte acked.
-    pub fn write(self: *SettlingData, _: Io, _: u64, offset: u64, payload: write_admit.Payload, _: op_guard.Class, view: seams.FileView, _: ?write_admit.ParkHook) write_admit.Error!write_admit.Outcome {
+    /// The striped data write: recorded, every byte acked, the landing
+    /// stamped with the ino's size epoch as the plane's is.
+    pub fn write(self: *SettlingData, _: Io, ino: u64, offset: u64, payload: write_admit.Payload, _: op_guard.Class, view: seams.FileView, _: ?write_admit.ParkHook) write_admit.Error!write_admit.Outcome {
         const n = payload.len();
         self.writes.append(testing.allocator, .{ .offset = offset, .len = n, .view_size = view.size }) catch return error.OutOfMemory;
-        return .{ .written = n, .size_claim = offset + n, .pieces = 1 };
+        return .{ .written = n, .size_claim = offset + n, .size_epoch = self.epochsOf().current(ino), .pieces = 1 };
     }
     pub fn zeroExtension(self: *SettlingData, _: Io, _: u64, old_size: u64, new_size: u64) write_admit.Error!void {
         self.extension = .{ .old_size = old_size, .new_size = new_size, .flushes_before = self.flushes };
@@ -5686,6 +5746,59 @@ test "the times drain journals a size claim as it stands UNDER its guards, never
     // The drain journaled nothing above the truncated size.
     try testing.expectEqual(@as(u64, 4096), (try h.getattr(f)).size);
     try testing.expectEqual(@as(u64, 4096), (try h.fs.readInode(local)).size);
+    h.release(f);
+}
+
+/// Start a striped write of `op` and return once it is parked AFTER its
+/// bytes landed and BEFORE its postlude's `I{ino}` guard
+/// (`write_hold_pre_guard`): the window a size-setting commit crosses whole.
+fn holdWriteBeforeGuard(fs: *HarnessOf(SettlingData).Fs, op: *PostludeOp) !std.Thread {
+    const held0 = fs.write_held.load(.acquire);
+    fs.write_hold_pre_guard = true;
+    const t = try op.spawn();
+    while (fs.write_held.load(.acquire) == held0) std.Thread.yield() catch {};
+    fs.write_hold_pre_guard = false;
+    return t;
+}
+
+test "a truncate down that lands BETWEEN a striped write's data landing and its postlude: the postlude parks no size claim — the size is the truncate's, a read at it is EOF, and a write landing AFTER the truncate claims its end as before (red: the postlude re-parked `max(claimed size, the write's end)` — the pre-truncate end over the new size; fstests generic/075, 112: fsx's `Size error: expected 0x49b4e0 stat 0x800000` right after a TRUNCATE DOWN)" {
+    const H = HarnessOf(SettlingData);
+    var h: H = undefined;
+    try h.init();
+    defer h.deinit();
+    defer h.data.deinit();
+    h.data.store = &h.store;
+    const image: []u8 = try testing.allocator.alloc(u8, 8192);
+    defer testing.allocator.free(image);
+    @memset(image, 'I');
+    const f = try h.create(1, "f", 0o644);
+    try testing.expectEqual(@as(?linux.E, null), h.write(f, 0, image, 0).errno());
+    const local = try H.Fs.localOf(f);
+    // An extending write to [16384, 16896): its bytes land, then it parks
+    // before its postlude's guard.
+    var w: PostludeOp = .{ .fs = &h.fs, .ino = f, .kind = .write, .offset = 16384 };
+    const dropped0 = fuse_write_size_claims_dropped.load();
+    const tw = try holdWriteBeforeGuard(&h.fs, &w);
+    // The truncate crosses whole: down to 4096, inside the first write.
+    var in = abi.zeroed(abi.fuse_setattr_in);
+    in.valid = abi.FATTR_SIZE;
+    in.size = 4096;
+    try testing.expectEqual(@as(?linux.E, null), h.setattr(f, in).errno());
+    try testing.expectEqual(@as(u64, 4096), (try h.getattr(f)).size);
+    h.fs.write_hold_release.notifyWaiters(testing.io);
+    tw.join();
+    try testing.expectEqual(@as(?anyerror, null), w.err);
+    // The write claimed nothing: the size stands as the truncate set it —
+    // the attr, the parked claim, the stored record, the read's EOF.
+    try testing.expectEqual(@as(u64, 4096), (try h.getattr(f)).size);
+    try testing.expectEqual(@as(u64, 0), h.fs.pending.claimOf(local));
+    try testing.expectEqual(@as(u64, 4096), (try h.fs.readInode(local)).size);
+    try testing.expectEqual(@as(usize, 0), h.read(f, 4096, 512).body.len);
+    try testing.expectEqual(dropped0 + 1, fuse_write_size_claims_dropped.load());
+    // A write landing after the truncate is current: its end is the size.
+    try testing.expectEqual(@as(?linux.E, null), h.write(f, 16384, image[0..512], 0).errno());
+    try testing.expectEqual(@as(u64, 16896), (try h.getattr(f)).size);
+    try testing.expectEqual(dropped0 + 1, fuse_write_size_claims_dropped.load());
     h.release(f);
 }
 

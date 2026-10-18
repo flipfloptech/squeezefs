@@ -70,6 +70,8 @@ pub const stats = struct {
     pub var writeback_stale_token_retries: counters.ShardedCounter = .{};
     pub var writeback_retry_exhaustions: counters.ShardedCounter = .{};
     pub var writeback_orphan_discards: counters.ShardedCounter = .{};
+    /// Units a truncate made dead before their flush (`Disposition.eof_discarded`).
+    pub var writeback_eof_discards: counters.ShardedCounter = .{};
     pub var writeback_fence_noops: counters.ShardedCounter = .{};
     pub var writeback_errors_latched: counters.ShardedCounter = .{};
     pub var writeback_errors_reported: counters.ShardedCounter = .{};
@@ -82,7 +84,7 @@ pub const stats = struct {
 
 pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
     try w.print("{{\"writeback_queue_cap\":{d},\"writeback_queue_depth\":{d}", .{ stats.writeback_queue_cap.load(), stats.writeback_queue_depth.load() });
-    inline for (.{ "writeback_enqueued_spill", "writeback_enqueued_wt_fallback", "writeback_enqueued_flush", "writeback_sync_flushes_on_full_queue", "writeback_superseded_noops", "writeback_stale_token_retries", "writeback_retry_exhaustions", "writeback_orphan_discards", "writeback_fence_noops", "writeback_errors_latched", "writeback_errors_reported", "writeback_flushed", "durable_upload_bytes_writeback", "staging_put_bytes_spill", "layout_promoted_inline", "layout_promoted_own_block" }) |name| {
+    inline for (.{ "writeback_enqueued_spill", "writeback_enqueued_wt_fallback", "writeback_enqueued_flush", "writeback_sync_flushes_on_full_queue", "writeback_superseded_noops", "writeback_stale_token_retries", "writeback_retry_exhaustions", "writeback_orphan_discards", "writeback_eof_discards", "writeback_fence_noops", "writeback_errors_latched", "writeback_errors_reported", "writeback_flushed", "durable_upload_bytes_writeback", "staging_put_bytes_spill", "layout_promoted_inline", "layout_promoted_own_block" }) |name| {
         try w.print(",\"{s}\":{d}", .{ name, @field(stats, name).load() });
     }
     try w.writeAll("}");
@@ -149,6 +151,12 @@ pub const Unit = struct {
     min_size: u64,
     /// Entries this unit displaced (the overwrite's old binding).
     old_binding: ?Binding,
+    /// The ino's size epoch when the unit was formed (`MergeRequest.
+    /// size_epoch`): a truncate that lands before the flush makes the
+    /// unit's reach dead — its merge inserts nothing at or past the new
+    /// EOF and raises no size. Null = formed inside the setter's ordering
+    /// (a promotion: one shot under its own re-check).
+    size_epoch: ?u64 = null,
     ladder: retry.Ladder = REQUEUE_LADDER,
 };
 
@@ -160,6 +168,10 @@ pub const Disposition = enum {
     nothing,
     /// Verified: the ino is gone; the orphan was discarded.
     orphan_discarded,
+    /// Verified: a truncate landed after the unit was formed and its block
+    /// lies at or past the new EOF — the bytes are dead by the truncate,
+    /// the mint is returned, the ring entry released.
+    eof_discarded,
     /// The fence latched with custody poisoned: a VERIFIED no-op (the
     /// bytes stay staged for the remount).
     fence_noop,
@@ -239,7 +251,8 @@ pub fn flushOne(deps: Deps, io: Io, unit: *Unit) Disposition {
             };
             return .retry;
         };
-        // 5. Publish; the merge credential is the CURRENT generation.
+        // 5. Publish; the merge credential is the CURRENT generation; the
+        //    size epoch is the unit's own (a truncate since ⇒ clipped).
         pm.alloc.publishBlock(pm.minted.idx);
         const new_key = Binding.wholeBlock(vol_tag, pm.minted.offset, pm.minted.stamp);
         stats.durable_upload_bytes_writeback.add(proof.len);
@@ -248,7 +261,7 @@ pub fn flushOne(deps: Deps, io: Io, unit: *Unit) Disposition {
             const sg = deps.stripes.acquire(io, unit.ino);
             defer sg.release(io);
             while (true) {
-                displaced = deps.map.merge(.{ .ino = unit.ino, .inserts = &.{.{ .block = unit.block, .binding = new_key }}, .min_size = unit.min_size, .proofs = &.{proof}, .fencing = deps.map.currentFencing(unit.ino) }) catch |e| switch (e) {
+                displaced = deps.map.merge(.{ .ino = unit.ino, .inserts = &.{.{ .block = unit.block, .binding = new_key }}, .min_size = unit.min_size, .proofs = &.{proof}, .fencing = deps.map.currentFencing(unit.ino), .size_epoch = unit.size_epoch }) catch |e| switch (e) {
                     error.FencingTokenExpired => {
                         stats.writeback_stale_token_retries.inc();
                         continue;
@@ -280,6 +293,16 @@ pub fn flushOne(deps: Deps, io: Io, unit: *Unit) Disposition {
                 };
                 break;
             }
+        }
+        // 6b. The unit predates a truncate and its block lies at or past the
+        //     new EOF: nothing names the mint — returned; the dead bytes
+        //     leave the ring (the never-lossy law covered no byte below EOF).
+        if (displaced.clipped != 0) {
+            stats.writeback_eof_discards.inc();
+            fsck_guard.deinit();
+            mint.abandon();
+            _ = staging.releaseStaged(deps.pool, deps.seg, key, staged_gen);
+            return .eof_discarded;
         }
         // 7. Disarm, purge the recycled key, free displaced, release the
         //    ring entry iff the generation still matches.
@@ -350,7 +373,9 @@ fn spillValid(table: *accumulate.Table, deps: Deps, io: Io, worker: *Worker, e: 
         error.OutOfMemory => return error.OutOfMemory,
     };
     stats.staging_put_bytes_spill.add(bs);
-    const unit: Unit = .{ .ino = e.key.ino, .block = e.key.block, .key = key, .owner_generation = staged.generation, .min_size = @as(u64, e.key.block) * bs + e.app_end, .old_binding = e.old_binding };
+    // The unit's reach is this moment's: a truncate that lands before the
+    // flush shows in the epoch and the merge clips the unit to the new EOF.
+    const unit: Unit = .{ .ino = e.key.ino, .block = e.key.block, .key = key, .owner_generation = staged.generation, .min_size = @as(u64, e.key.block) * bs + e.app_end, .old_binding = e.old_binding, .size_epoch = deps.map.sizeEpoch(e.key.ino) };
     table.retire(e);
     worker.enqueue(io, deps, unit, .spill);
 }
@@ -515,7 +540,7 @@ fn promoteOwnBlock(pd: PromoteDeps, io: Io, key: staging.StagingKey, gen: u64, s
             stats.layout_promoted_own_block.inc();
             break :blk .own_block;
         },
-        .superseded_noop, .nothing, .orphan_discarded => .stale,
+        .superseded_noop, .nothing, .orphan_discarded, .eof_discarded => .stale,
         .fence_noop, .retry => .failed,
     };
 }
@@ -599,6 +624,50 @@ test "the spill → flush unit: a parked partial block zero-completes, stages (n
     try testing.expect(std.mem.allEqual(u8, got[wt.BS / 2 ..], 0));
     try testing.expectEqual(@as(?u32, 3), blockOfKey(blockKey(1, 3)));
     try testing.expect(blockOfKey(staging.StagingKey.init(.{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 }, 1)) == null);
+}
+
+test "a spill unit formed BEFORE a truncate merges after it: its block at or past the new EOF is never re-inserted and the size stays the truncate's (the mint returned, the ring entry released, `writeback_eof_discards`); a unit of the same vintage below EOF still lands its bytes and raises no size (red: block 3 came back past EOF with `min_size = 3·bs + app_end` over a size inside block 1 — a later grow reads its bytes instead of zeros; the class of fstests generic/112's size race)" {
+    const io = testing.io;
+    const w = try WbWorld.init(testing.allocator);
+    defer w.deinit(testing.allocator);
+    try w.f.map.create(1, .striped, 0);
+    // Two parked half blocks spill — both units formed under this epoch.
+    var half: [wt.BS / 2]u8 = @splat(0x7A);
+    for ([_]u32{ 0, 3 }) |b| {
+        const e = w.table.checkout(1, b, false, null).?;
+        _ = try w.table.recordWrite(e, 0, &half);
+        try spillParkedBlock(&w.table, w.deps(), io, &w.worker, 1, b);
+    }
+    try testing.expectEqual(@as(u64, 2), w.worker.depth.load(.monotonic));
+    try testing.expectEqual(@as(u64, 0), w.f.map.sizeOf(1));
+    // The truncate lands first: a size inside block 1 (block 0 kept, block 3 dead).
+    const cut = wt.BS + wt.BS / 4;
+    try w.f.map.truncate(1, cut);
+    const used = w.f.alloc_a.usedBlocks();
+    const eof0 = stats.writeback_eof_discards.load();
+    try testing.expectEqual(@as(u32, 2), w.worker.drainOnce(io, w.deps()));
+    // Block 0's bytes landed (below EOF), block 3 did not; the size is the truncate's.
+    try testing.expect(w.f.map.seam().lookup(1, 0) != null);
+    try testing.expect(w.f.map.seam().lookup(1, 3) == null);
+    try testing.expectEqual(cut, w.f.map.sizeOf(1));
+    try testing.expectEqual(@as(usize, 2), w.f.map.merges.items.len);
+    try testing.expectEqual(@as(u8, 1), w.f.map.merges.items[0].blocks);
+    try testing.expectEqual(@as(u64, 0), w.f.map.merges.items[0].min_size);
+    try testing.expectEqual(@as(u8, 0), w.f.map.merges.items[1].blocks);
+    // One block named; the clipped unit's mint went back.
+    try testing.expectEqual(used + 1, w.f.alloc_a.usedBlocks());
+    try testing.expectEqual(eof0 + 1, stats.writeback_eof_discards.load());
+    // Both ring entries released: the dead bytes leave with the unit.
+    try testing.expect(w.seg.residentGeneration(blockKey(1, 0)) == null);
+    try testing.expect(w.seg.residentGeneration(blockKey(1, 3)) == null);
+    try testing.expectEqual(@as(u64, 0), w.pool.currentBytes());
+    // A unit formed AFTER the truncate is current: it lands and raises.
+    const e5 = w.table.checkout(1, 5, false, null).?;
+    _ = try w.table.recordWrite(e5, 0, &half);
+    try spillParkedBlock(&w.table, w.deps(), io, &w.worker, 1, 5);
+    try testing.expectEqual(@as(u32, 1), w.worker.drainOnce(io, w.deps()));
+    try testing.expect(w.f.map.seam().lookup(1, 5) != null);
+    try testing.expectEqual(5 * wt.BS + wt.BS / 2, w.f.map.sizeOf(1));
 }
 
 test "never-lossy dispositions: a superseded unit is a contractual no-op (newest bytes win); a stale fencing token converges by re-presenting; a verified-NotFound discards the orphan and the ring entry; a transient requeues (never sticky); the fence with custody poisoned is a verified no-op" {

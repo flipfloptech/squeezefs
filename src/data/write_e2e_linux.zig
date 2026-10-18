@@ -124,7 +124,7 @@ const E2E = struct {
         self.alloc = try block_alloc.BlockAllocator.init(gpa, .{ .vol_tag = VOL, .vol = 0, .block_size = BS, .capacity_bytes = capacity });
         self.vols = .{};
         self.vols.add(.{ .vol_tag = VOL, .ordinal = 0, .alloc = self.alloc, .passthrough = true, .write_cache_volatile = true });
-        self.map = wt.RamMap.init(gpa);
+        self.map = try wt.RamMap.init(gpa);
         self.map.chunk = BS;
         self.frees = wt.RamFrees.init(gpa, &self.vols);
         self.stripes = .{};

@@ -113,6 +113,7 @@ const data_superblock = @import("data_superblock.zig");
 const verbs = @import("../wire/verbs.zig");
 const record_ship = @import("../meta/sym/xv/record_ship.zig");
 const seams = @import("write_seams.zig");
+const size_epoch = @import("size_epoch.zig");
 const write_admit = @import("write_admit.zig");
 const write_side_view = @import("write_side_view.zig");
 const device_overlay = @import("device_overlay.zig");
@@ -208,6 +209,10 @@ pub const stats = struct {
     pub var layout_map_merges: counters.ShardedCounter = .{};
     pub var layout_map_merge_blocks: counters.ShardedCounter = .{};
     pub var layout_map_merge_failures: counters.ShardedCounter = .{};
+    /// Inserts a STALE write-back unit (formed before a size-setting
+    /// commit) presented at or past the ino's current EOF: dropped, never
+    /// re-inserted, the layout size never raised (`MergeRequest.size_epoch`).
+    pub var layout_map_merge_clipped_blocks: counters.ShardedCounter = .{};
     /// `layout_republishes`: the ONE mover's republish transactions.
     pub var layout_republishes: counters.ShardedCounter = .{};
     /// `kvmap_resolve_failures`: a tree-mapped binding the read side could
@@ -287,7 +292,7 @@ pub fn writeStatsJson(w: *Io.Writer) Io.Writer.Error!void {
     inline for (.{ "data_volumes", "data_staging_on", "data_nvme_tier_on", "block_refs_drift_rows" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, @field(stats, name).load() });
     }
-    inline for (.{ "layout_map_merges", "layout_map_merge_blocks", "layout_map_merge_failures", "layout_map_merges_shipped", "foreign_publish_kvmap_refusals", "layout_publishes_served", "kvmap_sweep_spawn_refusals", "promotions_run", "promotions_stale", "promotions_failed", "own_block_dmas", "own_block_dma_bytes", "held_stores", "held_store_failures", "hold_gate_admits", "hold_gate_declines", "prefetch_fibers", "prefetch_fiber_refusals", "hold_ceremony_fibers", "bindings_freed", "device_read_bounces", "data_device_read_bytes", "write_side_read_dma_bytes", "compose_read_dma_bytes", "pack_read_dma_bytes" }) |name| {
+    inline for (.{ "layout_map_merges", "layout_map_merge_blocks", "layout_map_merge_failures", "layout_map_merge_clipped_blocks", "layout_map_merges_shipped", "foreign_publish_kvmap_refusals", "layout_publishes_served", "kvmap_sweep_spawn_refusals", "promotions_run", "promotions_stale", "promotions_failed", "own_block_dmas", "own_block_dma_bytes", "held_stores", "held_store_failures", "hold_gate_admits", "hold_gate_declines", "prefetch_fibers", "prefetch_fiber_refusals", "hold_ceremony_fibers", "bindings_freed", "device_read_bounces", "data_device_read_bytes", "write_side_read_dma_bytes", "compose_read_dma_bytes", "pack_read_dma_bytes" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, @field(stats, name).load() });
     }
     try w.print("\"data_unresolved_volume\":{d},\"kvmap_resolve_failures\":{d},\"kvmap_head_put_unlocked\":{d},\"release_free_unheld\":{d},\"layout_map_merge_displaced_overflow\":{d}}}", .{ counters.tripwireCount("data_unresolved_volume"), counters.tripwireCount("kvmap_resolve_failures"), counters.tripwireCount("kvmap_head_put_unlocked"), counters.tripwireCount("release_free_unheld"), counters.tripwireCount("layout_map_merge_displaced_overflow") });
@@ -451,6 +456,11 @@ pub const DataPlane = struct {
     /// Promotion tasks (the pressure hook) on the meta pool.
     tasks: taskset.TaskSet = .init,
     shape: ShapeTable,
+    /// The per-ino size epochs (`size_epoch.SizeEpochs`): bumped by every
+    /// size-setting commit (`noteSizeSet`), read at a write's landing
+    /// (`write_admit.Outcome.size_epoch`) and a write-back unit's formation,
+    /// judged at the raise (`sizeSetSince`, the merge's stale rule).
+    size_epochs: size_epoch.SizeEpochs,
     file_id_seq: Atomic(u64),
     refs_store: block_refs.RefStore,
     scope: u64,
@@ -587,6 +597,7 @@ pub const DataPlane = struct {
             .rp = undefined,
             .ladder = undefined,
             .shape = undefined,
+            .size_epochs = undefined,
             .file_id_seq = .init(@bitCast(clock.realtimeCoarseNs())),
             .refs_store = block_refs.RefStore.from(KvBackend, be),
             // Rung 4: one meta volume, the native slot — scope 0.
@@ -599,6 +610,8 @@ pub const DataPlane = struct {
         };
         self.shape = try ShapeTable.init(gpa);
         errdefer self.shape.deinit(gpa);
+        self.size_epochs = try size_epoch.SizeEpochs.init(gpa, SHAPE_STRIPES);
+        errdefer self.size_epochs.deinit();
         self.windows = try kvmap.WindowCache.init(gpa, kvmap.windowBudgetBytes(opts.budget_bytes), cfg.chunk_size);
         errdefer self.windows.deinit();
         budget.authority.register(self.windows.component());
@@ -1194,6 +1207,7 @@ pub const DataPlane = struct {
         self.windows.deinit();
         self.sweeps.deinit(self.gpa);
         self.shape.deinit(self.gpa);
+        self.size_epochs.deinit();
         self.gpa.destroy(self);
     }
 
@@ -1275,6 +1289,22 @@ pub const DataPlane = struct {
 
     pub fn forgetShape(self: *DataPlane, ino: u64) void {
         self.shape.forget(ino);
+        self.size_epochs.forget(ino);
+    }
+
+    /// A size-setting commit of `ino` is about to land (the truncate, the
+    /// O_TRUNC open: under their exclusive guards, before the commit): every
+    /// raise formed before this moment is stale (`sizeSetSince`).
+    pub fn noteSizeSet(self: *DataPlane, ino: u64) Allocator.Error!void {
+        return self.size_epochs.bump(ino);
+    }
+
+    /// Whether a size-setting commit of `ino` landed since `seen` — the
+    /// epoch a write's landing stamped into its outcome (`write_admit.
+    /// Outcome.size_epoch`). The write's postlude raises no size on true:
+    /// the truncate clipped the bytes its end would name.
+    pub fn sizeSetSince(self: *DataPlane, ino: u64, seen: u64) bool {
+        return self.size_epochs.setSince(ino, seen);
     }
 
     /// The per-ino layout lock, level (3.7) (module doc). kv_fs takes it
@@ -2237,7 +2267,7 @@ pub const DataPlane = struct {
         return .{ .ctx = self, .vtable = &map_vtable };
     }
 
-    const map_vtable: seams.MapSeam.VTable = .{ .lookup = &mapLookup, .view = &mapView, .merge = &mapMerge, .current_fencing = &mapFencing };
+    const map_vtable: seams.MapSeam.VTable = .{ .lookup = &mapLookup, .view = &mapView, .merge = &mapMerge, .current_fencing = &mapFencing, .size_epoch = &mapSizeEpoch };
 
     /// The layout record of `ino`: the xattr chain at the layout name's
     /// hash, the record named `layout` (owned bytes) and its chain slot.
@@ -2416,6 +2446,11 @@ pub const DataPlane = struct {
         return 1;
     }
 
+    fn mapSizeEpoch(ctx: *anyopaque, ino: u64) u64 {
+        const self: *DataPlane = @ptrCast(@alignCast(ctx));
+        return self.size_epochs.current(ino);
+    }
+
     /// The inline map fold (pure): the current ascending entries and the
     /// inserts — in the CALLER's order (a rewrite epoch's save lists its
     /// shadowed blocks as they were fed) — folded into one ascending map,
@@ -2461,13 +2496,45 @@ pub const DataPlane = struct {
     /// block's old binding) → `publishLayout` with the `+ref`/`−ref` diff
     /// → the conveyor commit. The displaced bindings are the caller's to
     /// free after this returns (RES-1).
-    fn mapMerge(ctx: *anyopaque, req: seams.MergeRequest) seams.MergeError!seams.MergeOutcome {
+    ///
+    /// The stale rule first (`MergeRequest.size_epoch`): a unit formed
+    /// before a size-setting commit of the ino inserts only the blocks
+    /// still below the ino's CURRENT size (the record folded with its
+    /// parked claim — a grow since the truncate keeps its blocks) and
+    /// raises no size; the inserts at or past EOF come back `clipped` for
+    /// the caller to free. The truncate's own settle lands or joins every
+    /// RAM custody before its clip, so this reaches only what the settle
+    /// cannot see: a spilled unit waiting in the write-back queue.
+    fn mapMerge(ctx: *anyopaque, req_in: seams.MergeRequest) seams.MergeError!seams.MergeOutcome {
         const self: *DataPlane = @ptrCast(@alignCast(ctx));
         const io = self.io;
-        const gpa = self.gpa;
-        if (req.fencing != 1) return error.FencingTokenExpired;
-        const lock = self.lockLayout(io, req.ino);
+        if (req_in.fencing != 1) return error.FencingTokenExpired;
+        const lock = self.lockLayout(io, req_in.ino);
         defer lock.release(io);
+        var req = req_in;
+        var kept: [seams.MergeOutcome.max_displaced]seams.MapInsert = undefined;
+        var clipped: u8 = 0;
+        if (req_in.size_epoch) |seen| if (self.size_epochs.setSince(req_in.ino, seen)) {
+            const cur = (self.inodeSize(req_in.ino) catch return error.Transient) orelse return error.NotFound;
+            var n: usize = 0;
+            for (req_in.inserts) |ins| {
+                if (@as(u64, ins.block) * self.block_size < cur) {
+                    kept[n] = ins;
+                    n += 1;
+                } else clipped += 1;
+            }
+            req.inserts = kept[0..n];
+            req.min_size = 0;
+            if (clipped != 0) stats.layout_map_merge_clipped_blocks.add(clipped);
+            if (n == 0) return .{ .clipped = clipped };
+        };
+        var out = try self.mergeLocked(req);
+        out.clipped = clipped;
+        return out;
+    }
+
+    fn mergeLocked(self: *DataPlane, req: seams.MergeRequest) seams.MergeError!seams.MergeOutcome {
+        const gpa = self.gpa;
         // A FOREIGN-slot file (the record under its holder's token): the
         // merge is computed here and the publish SHIPS to the holder.
         var foreign = false;

@@ -222,6 +222,17 @@ pub const MergeRequest = struct {
     proofs: []const DmaProof,
     /// The ino's CURRENT fencing generation (the merge credential).
     fencing: u64,
+    /// The ino's size epoch (`MapSeam.sizeEpoch`) read when the unit was
+    /// FORMED — a write-back unit carries its `min_size` and its block from
+    /// that moment. A size-setting commit landed since ⇒ the unit is
+    /// STALE: the authority inserts only the blocks still below the ino's
+    /// current size, raises no size, and reports the rest `clipped` (never
+    /// lossy: a byte below EOF is published; only the dead reach is
+    /// dropped). Null = the caller's own ordering keeps it current (an
+    /// upload the truncate's settle lands or joins, an overlay drain, a
+    /// rewrite epoch's save — every one of them inside a section the size
+    /// setter waits for).
+    size_epoch: ?u64 = null,
 };
 
 pub const MergeOutcome = struct {
@@ -229,6 +240,10 @@ pub const MergeOutcome = struct {
     /// guard drops (RES-1).
     displaced: [max_displaced]Binding = undefined,
     n_displaced: u8 = 0,
+    /// Inserts of a STALE unit (`MergeRequest.size_epoch`) the authority
+    /// dropped as at or past the ino's current EOF: the caller frees their
+    /// fresh bindings (nothing names them). 0 for a current unit.
+    clipped: u8 = 0,
     /// The registrations the merge took on `displaced` before its commit
     /// (decision 0003 §AH.1); the caller drops them AFTER its frees
     /// (`dropHolds`). Null = nothing held (a merge that displaced nothing,
@@ -274,7 +289,10 @@ pub const ReleaseHolds = struct {
 /// the `+ref`/`−ref` records through `block_refs` in the SAME tx, committed
 /// through the conveyor — run under the caller's meta stripe (3.5).
 /// `current_fencing` is the ino's DLM generation (rung 6; rung 4 engages
-/// with 1).
+/// with 1). `size_epoch` is the ino's size epoch as it stands
+/// (`size_epoch.SizeEpochs.current`): what a unit records at its formation
+/// and a write's landing stamps into its outcome, so the raise that follows
+/// can tell a size-setting commit that crossed it.
 pub const MapSeam = struct {
     ctx: *anyopaque,
     vtable: *const VTable,
@@ -284,6 +302,7 @@ pub const MapSeam = struct {
         view: *const fn (ctx: *anyopaque, ino: u64) ?FileView,
         merge: *const fn (ctx: *anyopaque, req: MergeRequest) MergeError!MergeOutcome,
         current_fencing: *const fn (ctx: *anyopaque, ino: u64) u64,
+        size_epoch: *const fn (ctx: *anyopaque, ino: u64) u64,
     };
 
     pub fn lookup(self: MapSeam, ino: u64, block: u32) ?Binding {
@@ -300,6 +319,10 @@ pub const MapSeam = struct {
 
     pub fn currentFencing(self: MapSeam, ino: u64) u64 {
         return self.vtable.current_fencing(self.ctx, ino);
+    }
+
+    pub fn sizeEpoch(self: MapSeam, ino: u64) u64 {
+        return self.vtable.size_epoch(self.ctx, ino);
     }
 };
 

@@ -30,32 +30,35 @@ patches-7.2/`), `/build` a btrfs subvolume, `/build/tmp` ext4 on zram (the test 
   5 adjudicated (`epoll_ctl06`, `fallocate03`, `ioctl_loop05`, `mremap06`, `setxattr03` — the last is new,
   `docs/gates/ltp-exceptions.md`) / 7 the venue's (`clock_settime03`, `leapsec01`, `swapon*`/`swapoff*`:
   fail on ext4 too). PASSED after `32e591a`.
-- **xfstests `-g auto`** (xfstests master 22348af, 85 min): 779 ran, 539 not run, **70 failed**, both sets
-  fsck-clean. The pass predates the last two fixes, so most of it is explained: **49** are dm-flakey remounts
-  refused on the zombie holder (`6141de3`); 5 are the ledger's by-design single-writer rows (409–411, 589, 732);
-  192 is the ledger's `noatime` row; 650 and the scsi_debug tests (704, 731, 803) are now venue-excluded.
-  **Left to triage (next session, after the reboot; re-run the whole pass):** 294, 306 (`mount -o remount`
-  through util-linux 2.42's fsconfig: "fuse: No changes allowed in reconfigure" — the helper's remount
-  branch), 338 (util-linux hands `strictatime` to the helper as an option; the daemon refuses it), 441, 452,
-  475, 484, 651, 743, 753, 798 (unread). The first two passes of the day were void: a `check` that survived a
-  stop fought the next run for the loop devices (fixed: `592fba4`), and udiskie auto-mounted every loop
-  device (`0787032`).
-- **The host needs a reboot before anything else runs here**: xfstests `generic/650` (CPU hotplug stress)
-  offlined 8 of 32 CPUs at 17:28 and they refuse to boot again (`CPUN failed to report alive state`);
-  `nproc` reads 24 and every nvme fabrics connect answers EXDEV (gate 12's two nvmet reds). Omarchy's
-  Limine menu still has the stock kernel as a fallback; the sqz kernel is the default entry.
+- **xfstests `-g auto`** (xfstests master 22348af): **PASSED** at 23:42 — 700 ran, 515 not run, 10 failed, all ten
+  ledger rows (003, 192, 409–411, 441, 484, 589, 732, 798), both sets fsck-clean, 46 min. With the venue
+  exclusions below in force. The road there, in order: a `check` that survived a stop fought the next run
+  for the loop devices (`592fba4`); udiskie auto-mounted every loop device (`0787032`); dm targets resolved
+  to `/dev/mapper` as the set (`2bf09b8`); the zombie holder (`6141de3`); `LIBMOUNT_FORCE_MOUNT2=always` and
+  the atime words (`37662ec`); **the lane's hole checkpoint deadlock** (`09ca33c`, found by generic/753's
+  dm-error soak loop); the dm-error tripwire scoping and the leaving-holder waits (same commit).
+- **Venue exclusions to revisit** (`scripts/suites/fstests-venue-exclude.txt`): the 65 dm-flakey, 5
+  dm-log-writes and dm-error-on-data (743) tests — they cut the METADATA volume alone while the data volumes
+  and the staging cache keep their writes; fsync'ed data survives the same cut under kill -9 and reads back
+  as zeros after an orderly dismount's promotion (measured). The fix is the suites' scratch set with ONE
+  device under the cut (dm-linear slices: meta | d0 | d1 | a small ext4 for the cache) — about a day — and
+  it turns the flakey corpus into a real crash-consistency oracle for the staging ring. Also excluded:
+  generic/650 (CPU hotplug: this platform's CPUs do not come back) and the scsi_debug tests (no backing file).
+- **Open from the pass**: generic/112's size race (a `flakes.md` row; 1 of 3 passes).
+- **Fail early, fail hard** (owner ruling): every suite stops at the first failing test that is not a ledger
+  row (`eea8892`); the three suites take a stop (`sudo pkill -TERM -f scripts/suites/<suite>.sh`) down to
+  their runners, daemons, loops and mounts.
 
 ## Flakes (`docs/gates/flakes.md`)
 
-Fixed this week and waiting on the train's three greens: KILL ROWS (b), ONLINE FSCK, THE VIRTUAL INODES,
-`ops.fsck.scale`, THE INTERCEPTION HOST + row 4b, THE SHARED HOT DIRECTORY, the park ladder, kmbuf 0029,
-the storm/routing-loop rows. Still open, none reproducing here (60 six-wide runs each):
+Retired 2026-10-17 after the train's three greens on `0d6633b` (`02f1589`): 20 rows. Open:
 - `-o ro` READER (C's teardown / ESTALE fail-stop) and THE TWO-DAEMON MATRIX wedge (VM-only so far): both
-  now get a full capture (kernel AND user stacks of every thread) at the next sighting.
-- A DEAD MANAGER HOLDING A STRIPED HOT DIRECTORY (`xv_cross_owner_steps_rejected` after a failover; one
-  kamrui sighting).
+  now get a full capture (kernel AND user stacks of every thread) at the next sighting; 0 of 60 six-wide here.
+- A DEAD MANAGER HOLDING A STRIPED HOT DIRECTORY (one kamrui sighting; 0 of 60 here).
 - THE MOVE MATRIX `HolderUnresolved` (one loaded gate; its deadline is T_park_max ≈ 90 s, so it needs a
   stalled host).
+- xfstests generic/112's truncate-vs-landing size race (1 of 3 full passes; keep the results dir next time
+  and replay `112.2.fsxops`).
 
 ## Open items
 
@@ -67,11 +70,10 @@ the storm/routing-loop rows. Still open, none reproducing here (60 six-wide runs
 
 ## Resuming here
 
-1. Reboot (the offline CPUs); `nproc` must read 32. `scripts/dev/provision-local-venue` (`ready`); `scripts/venue status`.
-2. `scripts/gate-train` for the three consecutive greens (`.gate-train/ledger-v2.tsv`); it retires the
-   flakes rows marked fixed.
-3. `SQZ_VENUE_SLOT=1 scripts/venue 'SUITE_RUNS=1 scripts/suites/fstests.sh'` (~1.5 h) and triage what is left
-   (above); when the three suites pass once, the release gate wants three clean runs each (`SUITE_RUNS=3`).
+1. `scripts/dev/provision-local-venue` (`ready`); `scripts/venue status`; `nproc` must read 32 (generic/650 is excluded; a CPU it offlines never comes back without a reboot).
+2. `scripts/gate-train` (three greens on `0d6633b` were reached 2026-10-17 evening; the 20 fixed flakes rows retired in `02f1589`); re-run it on the current head.
+3. The release gate wants three clean runs of each suite (`SUITE_RUNS=3`): pjdfstest has them; LTP and
+   xfstests have one each (`SQZ_VENUE_SLOT=1 scripts/venue 'SUITE_RUNS=3 scripts/suites/<suite>.sh'`).
    To stop a suite: `sudo pkill -TERM -f scripts/suites/<suite>.sh` — its trap takes `check`, the daemons,
    the loops and the mounts down; verify with `pgrep -af '\./check'`, `losetup -a`, `grep fuse.squeezefs /proc/mounts`.
 4. A single row: `scripts/venue 'zig build --cache-dir "$SQZ_BUILD_ROOT"/zig-cache-v2 --prefix zig-out-linux smoke "-Dtest-filter=<row>"'`;

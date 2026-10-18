@@ -456,9 +456,21 @@ path the port has, §0):
 ```
 transport=tcp,traddr=<ip>,trsvcid=<port>,nqn=<subnqn>,hostnqn=<hostnqn>,hostid=<hostid>
   [,host_traddr=<src ip>][,host_iface=<ifname>][,nr_io_queues=<n>]
+  [,fast_io_fail_tmo=<s>,ctrl_loss_tmo=<s>,reconnect_delay=<s>]
 ```
 The port adds the loop shape `transport=loop,nqn=<subnqn>,hostnqn=…,hostid=…` (§0;
-`traddr` optional). Procedure: `open("/dev/nvme-fabrics", O_RDWR|O_CLOEXEC)` (absent ⇒ refuse
+`traddr` optional) and the PATH-LOSS CLOCKS (rung 10 multipath; the reference left the
+kernel's: fail-fast off, `ctrl_loss_tmo` 600 s): every daemon-owned connect and every
+`squeezefs nvmeof connect` carries `fast_io_fail_tmo` = the writer claim's staleness TTL
+(45 s — with EVERY path of a head down that long the holder is preemptable, so its held
+I/O must fail THEN and fail-stop the volume, well under the FUSE 135 s request timeout; a
+single path's loss fails over at once regardless), `ctrl_loss_tmo` = 2 × TTL (90 s — one
+more window past fail-fast so an outage spanning it still brings the association back for
+the FAILED daemon's teardown to release; never 600 s, which pins a dead association for ten
+minutes) and `reconnect_delay` = the beat (10 s). `multipath.deriveConnectTimeouts` is the
+derivation; `SQUEEZEFS_FABRIC_{FAST_IO_FAIL_TMO,CTRL_LOSS_TMO,RECONNECT_DELAY}_S` override
+a field verbatim. An operator connecting a METADATA volume's paths with nvme-cli passes
+the same: `nvme connect … --fast-io-fail-tmo 45 --ctrl-loss-tmo 90 --reconnect-delay 10`. Procedure: `open("/dev/nvme-fabrics", O_RDWR|O_CLOEXEC)` (absent ⇒ refuse
 naming `CONFIG_NVME_FABRICS`/`CONFIG_NVME_TCP`, I:894-901); `write(fd, string)` — a short
 write never happens (the kernel consumes the whole buffer); errno table: `EINVAL` malformed
 option / unknown transport after autoload, `EADDRNOTAVAIL`/`ECONNREFUSED`/`EHOSTUNREACH`
@@ -591,9 +603,65 @@ ino 1 beside `writer_claim`, screened from FUSE by the xattr allowlist); the rec
 u8 | (len u16 LE ‖ bytes) × {traddr, trsvcid, subnqn} | xxh3-64` (LIB:1114-1130), decode
 total — torn/truncated/future-version refuse "never a guessed coordinate" (LIB:1133-1187).
 `get-fabric-endpoints` lists them (MAIN:7244). The port carries the record in `set_config`'s
-control record instead (one versioned, checksummed home — decision 0002 row 121): per data
-volume an optional `FabricEndpointWire {trtype u8, adrfam u8, trsvcid u16, traddr [16]u8,
-subnqn (u16 ‖ bytes)}` plus the volume's `device_uuid` it already carries.
+control record instead (one versioned, checksummed home — decision 0002 row 121), and as a
+LIST (row 543 — the reference's record is single-path): per data volume an optional
+`FabricEndpoint = {subnqn, paths[1..=16]}` where a path is `{trtype, adrfam, trsvcid,
+traddr}` — ONE subsystem reached over one or more target listeners (several Ethernet
+links). On the wire (`set_config` version 2) the blob after the uri is
+`FabricEndpointWire {n_paths u8, reserved u8, subnqn_len u16}` + `n_paths × FabricPathWire
+{trtype u8, adrfam u8, trsvcid u16, traddr [16]u8}` + the NQN; a version 1 image (one
+`FabricPathWire` + `u16 ‖ NQN`) decodes as a list of one and re-encodes byte-exactly as
+version 2 (the fixture test). The CLI spelling is `vol-<tag>=tcp:A:4420:nqn,tcp:B:4420:nqn`
+(comma-separated paths, the same subnqn on every path — two subsystems refuse naming both;
+a path twice refuses; 16 is the `share` verb's listener cap). The uuid the connect verifies
+is the volume's own `device_uuid`.
+
+**The multipath law** (`multipath.zig`, `mount_fabric.zig`; charter §3): the daemon
+connects EVERY path of a record under its ONE identity (a controller already riding that
+identity on the path's `traddr:trsvcid` is reused), so the kernel's native multipath
+(`CONFIG_NVME_MULTIPATH=y`, `nvme_core.multipath=Y`; patch 0025 keeps same-identity merging)
+merges them into one head `nvme<K>n<Y>` in the `nvme-subsys<K>` dir that links them. The
+head is handed to discovery only when its serving set is EXACTLY ours — every path ours, no
+foreign one (`judgeServing`: a foreign or gone controller → `foreign`, a connected path the
+dir does not list → `missing`, no dir → `no_head`, which with one path is the pre-multipath
+per-controller node and with several refuses naming `nvme_core.multipath`). A path that
+fails to connect while a sibling serves is a LOUD warning + `fabric_paths_degraded`; zero
+paths up refuses as before. At the clean umount every controller of the subsystem under the
+mount's pair is released (`--identity-only`, every path).
+
+**The I/O policy law:** the kernel's `iopolicy` default `numa` sends every I/O of a NUMA node
+down ONE path, so a single-socket client never uses its second link. At mount the daemon
+writes `SQUEEZEFS_FABRIC_IOPOLICY` (enum `numa | round-robin | queue-depth`, default
+`queue-depth` — a PROPOSED owner ruling: it balances by in-flight count across links of
+different load, kernel ≥ 6.11; `round-robin` alternates per request whatever the depth) to
+`/sys/class/nvme-subsystem/<subsys>/iopolicy` of every subsystem it owns paths of — the data
+heads AND the metadata head (below) — and reads it back: `fabric_iopolicy_sets` counts a
+read-back as asked; a write refused or read back otherwise (a kernel without the policy) is
+a warning + `fabric_iopolicy_failures`, never a refusal. `fabric_paths_live` sums the live
+serving controllers over the owned subsystems (sampled at bind and at every `.stats`
+render). Measured on 7.2.8-sqz over two loopback paths (`rung-10-fabric-multipath.md`):
+round-robin splits a 4 × 64 MiB parallel write 254024/270264 sectors; queue-depth 4 parallel
+cold readers 301056/223232; a lone serial writer under queue-depth stays on one path.
+
+**The METADATA volume** (owner extension 2026-10-18): the mount's argument names its node,
+so the daemon owns no record for it — the operator connects its paths (two `squeezefs
+nvmeof connect`s under one pair; the timeouts of §3.1 ride them). At mount `Shape.of`
+resolves the node to its head's subsystem dir (`multipath.subsystemOfNode`) and its serving
+controllers; under an explicit pair rule 2 is judged PER PATH (`servingShape`: the first
+controller's identity stands for the device, more than one identity among the paths — a gone
+link counts as an unknown one — is the merged shape → the existing `refuse_merged`; a lone
+foreign path → `refuse_identity`); the head's policy is set and read back like a data head's,
+its paths count in `fabric_paths_live`, and `.stats` lists it (`fabric_meta_bound[]`: path,
+subsystem, subsysnqn, iopolicy, paths[{instance, transport, traddr, trsvcid, state}]).
+Nothing of it is released at the teardown — the operator's association stays. Follow-up (not
+in this change): a `sqmeta://` fabric URI form or a mount option carrying the metadata
+coordinates on the command line, so the daemon owns the metadata connects under the mount's
+identity too — the same fan-out code, no record needed.
+
+**`nvmeof status [--json]`** lists every fabric subsystem of the host (`/sys/class/nvme-
+subsystem/*` with ≥ 1 non-PCIe serving controller): its `nvme-subsys<K>`, subsysnqn,
+iopolicy, head and paths (controller instance, transport, `traddr:trsvcid` off `address`,
+`state`, hostnqn/hostid), and `nvme_core.multipath`.
 
 The §5.2 refusal ladder (`fabric_ladder_verdict` I:681-771, pure over `VolumeShape` I:629-647):
 with NO explicit identity everything accepts unchanged; with one: a DATA volume with a record →
@@ -793,6 +861,7 @@ transports), `two-identity-fence`, `g2-restore-tcp`, `pr-registrants`, `guard-tc
 | `pr-registrants` | 64–128 `connect --hostnqn/--hostid --nr-io-queues 1` on loop; each registers its own key through `/dev/ng<N>n1`; `resv-report` | `regctl == N`, `report_bytes == 64 + 64 × N`, cap 0; drain to 0 (FID:1130-1257) |
 | `guard-{loop,tcp} ×N` | the kill-9 matrix of `fidelity-mount` repeated N times | GS:251-291 |
 | `storage-list` | `storage list` while the shares are connected | the inventory names each connected namespace, its transport, nsid, uuid, and the squeezefs superblock class (§6) |
+| `multipath-tcp` (rung 10) | RAM-backed metadata + data shares with two listeners each (127.0.0.1, 127.0.0.2); the metadata head connected by hand on both paths under one pair; the data record names both paths + a dead third; mount under `round-robin` → 4 × 64 MiB parallel write; kill -9 → remount reuses both paths → cold read-back; umount; a mount under the default (`queue-depth`) → 4 parallel cold readers | `fabric_daemon_connects 2`, `fabric_paths_degraded 1`, `fabric_paths_live 4`, ONE head (both hidden path nodes under one `nvme-subsys`), `fabric_meta_bound` lists both metadata paths live, the policy read back on both subsystems, BOTH paths carried write and read sectors (`/sys/class/nvme/nvme<N>/nvme<K>c<N>n1/stat`), `fabric_daemon_reuses 2` after kill -9, `nvmeof status` names subsystem/policy/paths, every controller released, zero residue |
 | `substrate-down` | teardown by manifest; snapshot diff | empty diff (SUB:21-25) |
 
 ### 5.4 Gate rows
@@ -931,6 +1000,10 @@ readable under the retired key.
 | `SQUEEZEFS_PR_REGISTRANT_CAP` | int `1..=65535`, unset = learn (nvmet: unbounded) | `derived_override` | a DECLARED cap for a vendor array (R:249-253, EK:420); `pr.CapLearner.effective(declared)` already takes it (pr.zig L92-94) — the row is owed since rung 6 |
 | `SQUEEZEFS_ENCRYPT_KEY_FILE` | str | `config` | landed (knobs.zig L225) |
 | `SQUEEZEFS_TEST_FIDELITY_ROOT` | str | `test_seam` | the fidelity harness's state root (`/build/fideli` default); never read by product code — the harness only |
+| `SQUEEZEFS_FABRIC_IOPOLICY` | enum `numa \| round-robin \| queue-depth`, default `queue-depth` | `enum_select` | the kernel multipath I/O policy written to every owned subsystem at mount (§3.7); the default is a PROPOSED owner ruling |
+| `SQUEEZEFS_FABRIC_FAST_IO_FAIL_TMO_S` | int `1..=600`, derived 45 | `derived_override` | the connect's fail-fast = the claim's staleness TTL (§3.1) |
+| `SQUEEZEFS_FABRIC_CTRL_LOSS_TMO_S` | int `1..=3600`, derived 90 | `derived_override` | 2 × TTL (§3.1); infinite is refused by range |
+| `SQUEEZEFS_FABRIC_RECONNECT_DELAY_S` | int `1..=600`, derived 10 | `derived_override` | the claim's beat (§3.1) |
 | NOT carried: `SQUEEZEFS_NVMEOF_TARGET_STACK` (EK:388), `SQUEEZEFS_NVMEOF_RUN_DIR` (EK:390), `SQUEEZEFS_SPDK_TGT_BIN` (EK:392) | — | — | quirk Q1: one stack exists; a knob whose only live arm refuses a retired value is dead code (charter §1.9) |
 
 ### 8.2 Gauges / counters (always exported, zero when inert — decision 0002 row 200)
@@ -942,6 +1015,10 @@ readable under the retired key.
 | `fabric_host_scoped` | gauge `{0, 1, 2 absent}` | §3.3 | no |
 | `fabric_host_identity_source` | gauge `{0 explicit, 1 etc_nvme, 2 machine_id}` | §3.2 | no |
 | `fabric_connects`, `fabric_connect_failures`, `fabric_disconnects` | counters | §3.1/§3.5 | no |
+| `fabric_daemon_connects`, `fabric_daemon_reuses`, `fabric_daemon_connect_failures`, `fabric_daemon_disconnects`, `fabric_ladder_refusals` | counters (per PATH) | §3.7 | no |
+| `fabric_paths_degraded` | counter | §3.7 (a path failed beside a serving sibling) | no — loud |
+| `fabric_paths_live` | gauge | §3.7 (live serving controllers over the owned subsystems, data + metadata heads) | no |
+| `fabric_iopolicy_sets`, `fabric_iopolicy_failures` | counters | §3.7 | no (a failure = a kernel without the policy, loud) |
 | `writer_guard_pr_reacquires` | counter | gate.zig L502-503 | no — expected across nvmet restarts (charter §8) |
 | `writer_guard_fenced`, `volume_fenced` | counter / latch | decision 0002 row 183 | no (a fence is a real event) |
 | `pr_registrants_per_namespace`, `pr_report_bytes`, `pr_registrant_cap`, `pr_registrant_cap_refusals`, `pr_own_stale_recoveries`, `pr_ptpl_requested`, `pr_rescap`, `pr_rtype` | per-client fields | pr.zig L373-375 | `pr_registrant_cap_refusals` **yes on nvmet** ("0 by construction", EK:420) |
@@ -963,7 +1040,8 @@ readable under the retired key.
 | default fabric port | 4420 | the IANA NVMe/TCP port (MAIN:1027) |
 | namespace index | 1 | one namespace per subsystem; the G2 same-nsid clause holds structurally (D:359) |
 | connect settle deadline | `nvme_core.admin_timeout` (60 s default), read from sysfs | a namespace scan is a sequence of admin commands each bounded by it (§3.4) |
-| fabric reconnect facts (documented, not owned) | `reconnect_delay` 10 s, `ctrl_loss_tmo` 600 s | D:510 R3 "measured: 10 s cadence, ~10 min to give-up" |
+| fabric reconnect facts (the kernel's, when a connect names none) | `reconnect_delay` 10 s, `ctrl_loss_tmo` 600 s, fail-fast off | D:510 R3 "measured: 10 s cadence, ~10 min to give-up" — the product's connects name their own (§3.1: 10 / 90 / 45 s) |
+| `MAX_FABRIC_PATHS` | 16 | the `share` verb's listener cap (`args.MAX_REPEAT`): one path per listener of one subsystem |
 | `T_owner` | 45 s | `lease_clock.T_OWNER_MS` (decision 0002 row 188) — the SIGSTOP leg waits past it |
 | key constants | salt 32, KEK 32, key id 8, blob 63, material ≥ 32, file ≤ 64 KiB | K:39-56; DK:36-40 |
 
@@ -999,6 +1077,10 @@ readable under the retired key.
 - `status Fabric section: absent for non-fabric; family fields + rows; multipath path nodes and partitions match` — TF:446-515.
 - `key: --encrypt-key on a plaintext set refuses; the stdin path through the pre-fork reader; key install refuses an id mismatch and writes 0600 atomically; key show prints no material` — TK:499-576 shape.
 - `rails: no std.process.Child in src/ops/nvmeof/*; every knob a row`.
+- `set_config: the fabric codec by fixture — a version 1 image decodes as a list of one and re-encodes byte-exactly as version 2; the endpoint laws (no path, a path twice, 17 paths, loop with an address)`.
+- `args: endpoint specs with several paths — order kept; two subsystems refuse naming both; a repeated path refuses; a 17th path refuses`.
+- `multipath: the exactly-ours verdict (pure) and the serving shape of a head (pure, rule 2 per path); the fixture of a two-path head — subsystem dir, serving set, head, hidden path nodes and their stat, iopolicy written/read back/mismatch, live count, the status walk; the connect timeouts restate the guard's clock (tie)`.
+- `mount_fabric: the metadata device's shape over a multipath fixture — two paths of one identity accept, a third identity is the merged shape, a PCIe head is local, a per-controller node is the one controller`.
 
 **Linux, root, nvmet (the fidelity tier, §5.3):** each leg above is a named test under `zig
 build fidelity`; the unit binary's `pr_linux` real-device test (pr_linux.zig L222) stops

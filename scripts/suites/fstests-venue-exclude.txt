@@ -97,3 +97,4 @@ generic/457  dm-log-writes over SCRATCH_DEV: the same one-device-of-three model 
 generic/470  dm-log-writes over SCRATCH_DEV: the same one-device-of-three model as the flakey rows (replays the metadata volume's log alone)
 generic/482  dm-log-writes over SCRATCH_DEV: the same one-device-of-three model as the flakey rows (replays the metadata volume's log alone)
 generic/757  dm-log-writes over SCRATCH_DEV: the same one-device-of-three model as the flakey rows (replays the metadata volume's log alone)
+generic/743  dm-error over SCRATCH_DEV errors the METADATA volume alone; the test means to fail a DATA read (mmap + MADV_POPULATE_READ → "madvise: Bad address"), which a data volume beside it serves. The one-device-of-three model, as the flakey rows — interim exclusion until the suites' scratch set has one device under the cut

@@ -25,6 +25,7 @@
 #   FSTESTS_TESTS="generic/001 generic/003" …                   # a subset (triage)
 set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
+source "$SUITES_DIR/setpaths.sh"
 
 FSTESTS_REPO=${FSTESTS_REPO:-https://git.kernel.org/pub/scm/fs/xfs/xfstests-dev.git}
 FSTESTS_DIR="$SUITES_ROOT/xfstests-dev"
@@ -74,21 +75,27 @@ SQZ_BIN=$SQZ_BIN
 SUITE_MOUNT_OPTS=$SUITE_MOUNT_OPTS
 SUITE_META_MIB=$SUITE_META_MIB
 SUITE_DATA_GIB=$SUITE_DATA_GIB
+SUITE_CACHE_GIB=${SUITE_CACHE_GIB:-4}
 ENV
   ln -sf "$SUITES_DIR/mount.squeezefs" /sbin/mount.fuse.squeezefs
-  ln -sf "$SUITES_DIR/mount.squeezefs" /sbin/umount.fuse.squeezefs
+  # umount(8) names its helper by the type's PREFIX: `umount.fuse -t fuse.squeezefs`.
+  ln -sf "$SUITES_DIR/mount.squeezefs" /sbin/umount.fuse
+  rm -f /sbin/umount.fuse.squeezefs
   ln -sf "$SUITES_DIR/mkfs.squeezefs" /sbin/mkfs.fuse.squeezefs
   ln -sf "$SUITES_DIR/fsck.squeezefs" /sbin/fsck.fuse.squeezefs
 }
 
 # The two sets: TEST (long-lived across the run) and SCRATCH (every test
-# re-mkfses it). Both formatted fresh per run; each metadata image behind
-# a loop device (detached by `fstests_detach_loops`).
+# re-mkfses it). Both formatted fresh per run; each set ONE sparse image
+# behind a loop device (detached by `fstests_detach_loops`) that the helpers
+# carve into the metadata volume, the two data volumes and the staging
+# root's ext4 (`setpaths.sh`): every byte of a set's state under the device
+# the test cuts, errors or logs.
 fstests_sets() {
   local n=$1
   SETS="$RESULTS/run$n"
   mkdir -p "$SETS/set-test" "$SETS/set-scratch" "$SETS/mnt-test" "$SETS/mnt-scratch" "$SETS/results"
-  truncate -s "${SUITE_META_MIB}M" "$SETS/set-test/meta.img" "$SETS/set-scratch/meta.img"
+  truncate -s "$(suite_set_bytes)" "$SETS/set-test/meta.img" "$SETS/set-scratch/meta.img"
   TEST_LOOP=$(losetup -f --show "$SETS/set-test/meta.img") || suite_die "losetup (test)"
   SCRATCH_LOOP=$(losetup -f --show "$SETS/set-scratch/meta.img") || suite_die "losetup (scratch)"
   "$SUITES_DIR/mkfs.squeezefs" -f "$TEST_LOOP" > "$SETS/set-test/format.out" 2>&1 || { cat "$SETS/set-test/format.out" >&2; suite_die "mkfs test set"; }
@@ -131,6 +138,14 @@ fstests_unmount_all() {
 }
 
 fstests_detach_loops() {
+  # A set's slices (and its cache mount) a test left standing go first:
+  # the loop is busy under them.
+  local id
+  for id in set-test set-scratch; do
+    SET_ID=$id; SET_DIR="$SETS/$id"; suite_slice_paths; suite_slices_down
+    rm -f "/run/squeezefs-suites/$id.dir"
+  done
+  rm -f /run/squeezefs-suites/mnt-* 2>/dev/null
   [ -n "${TEST_LOOP:-}" ] && losetup -d "$TEST_LOOP" 2>/dev/null; TEST_LOOP=""
   [ -n "${SCRATCH_LOOP:-}" ] && losetup -d "$SCRATCH_LOOP" 2>/dev/null; SCRATCH_LOOP=""
   return 0
@@ -143,10 +158,12 @@ fstests_fsck_set() {
   # The SCRATCH device is any test's to leave as it likes (`_require_scratch_nocheck`:
   # generic/740 ends with a foreign mkfs on it); only a squeezefs volume is scrubbed.
   if [ "$which" = scratch ]; then
-    local st; st=$("$SQZ_BIN" status "sqmeta://$dev" 2>/dev/null | grep -v '^info\|^debug' | head -1)
+    suite_set_of "$dev"; suite_slices_up "$dev"
+    local st; st=$("$SQZ_BIN" status "sqmeta://$SLICE_META" 2>/dev/null | grep -v '^info\|^debug' | head -1)
+    suite_slices_down
     case "$st" in *"not formatted"*) suite_log "fsck $which (run $n): skipped — the last test left the scratch device $(echo "$st" | sed 's/.*not formatted/not formatted/' | cut -c1-120)"; return 0 ;; esac
   fi
-  "$SQZ_BIN" fsck --offline --scrub --json "sqmeta://$dev" > "$out" 2>"$out.err" || rc=$?
+  "$SUITES_DIR/fsck.squeezefs" "$dev" > "$out" 2>"$out.err" || rc=$?
   if [ "$rc" = 0 ]; then suite_log "fsck --offline --scrub $which (run $n): 0 findings"; return 0; fi
   suite_log "fsck --offline --scrub $which (run $n): exit $rc — $out"; head -c 1500 "$out" >&2; echo >&2; grep -v '^info\|^debug' "$out.err" | head -10 >&2
   return 1
@@ -261,7 +278,7 @@ fstests_run() {
   fstests_fsck_set scratch "$n" || ok=1
   fstests_detach_loops
   # The data volumes are the bulk; the logs and results stay.
-  [ "${SUITE_KEEP_SET:-0}" = 1 ] || rm -f "$SETS"/set-*/d?.img "$SETS"/set-*/meta.img
+  [ "${SUITE_KEEP_SET:-0}" = 1 ] || rm -f "$SETS"/set-*/meta.img
   [ "$rc" = 0 ] || [ "$rc" = 1 ] || { suite_log "check rc $rc (137 = the wall bound): the pass did not complete"; return 1; }
   [ -z "$first_unadjudicated" ] || return 1
   return $ok

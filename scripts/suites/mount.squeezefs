@@ -2,15 +2,16 @@
 # mount(8) helper for the external suites: `mount -t fuse.squeezefs <dev> <dir>
 # -o <opts>` (xfstests' `_mount -t $FSTYP$FUSE_SUBTYP`) lands here through
 # util-linux's `/sbin/mount.fuse.squeezefs` symlink (installed by
-# scripts/suites/fstests.sh). Also answers as `/sbin/umount.fuse.squeezefs`
+# scripts/suites/fstests.sh). Also answers as `/sbin/umount.fuse`
 # (util-linux's umount helper: `umount.<type> <dir> [-l] [-f] [-n] [-v]`),
 # so xfstests' `umount` runs the ORDERLY `squeezefs umount` (teardown
 # promotes staged files first, the final checkpoint lands) instead of the
 # bare umount2 that gives a type-fuse mount no DESTROY.
 #
-# <dev> is the set's metadata volume — a plain file or a loop device over
-# one (xfstests' TEST_DEV/SCRATCH_DEV: loop devices, so the suite's block-
-# device requirements hold); the data volumes are the format's config. The mount posture is the RELEASE posture
+# <dev> is the set's ONE device (xfstests' TEST_DEV/SCRATCH_DEV loop, or a
+# dm target the test put over it): the helper stands the set's slices over
+# it — the metadata volume, the data volumes, the staging root's ext4
+# (`setpaths.sh`) — and the daemon mounts the metadata slice. The mount posture is the RELEASE posture
 # (`default_permissions,allow_other`) PLUS the caller's options: `ro`,
 # `noatime`, `nodiratime`, `sync`, `dirsync`, `nosuid`, `nodev`, `noexec`
 # and the daemon's own `-o` names pass through to `squeezefs mount`, which
@@ -30,21 +31,42 @@ SUITE_MOUNT_OPTS=${SUITE_MOUNT_OPTS:-default_permissions,allow_other}
 die() { echo "$(basename "$0"): $*" >&2; exit 32; }
 
 if [[ "$(basename "$0")" == umount.* ]]; then
-  target=""
+  # util-linux names the helper by the TYPE'S PREFIX (`umount.fuse -t
+  # fuse.squeezefs`, as umount(8) documents for `fuse.sshfs`): installed as
+  # /sbin/umount.fuse, this answers every fuse.* unmount on the venue — ours
+  # the orderly way, any other type's as the kernel's plain detach.
+  target="" type=""
   while [ $# -gt 0 ]; do
     case "$1" in
+      -t) type=$2; shift ;;
+      -N) shift ;;
       -*) ;;                       # -l -f -n -v -r -i: the orderly umount is the one act
       *) [ -z "$target" ] && target=$1 ;;
     esac
     shift
   done
-  [ -n "$target" ] || die "usage: umount.fuse.squeezefs <mountpoint>"
+  [ -n "$target" ] || die "usage: umount.fuse [-t fuse.<subtype>] <mountpoint>"
+  [ -z "$type" ] && type=$(findmnt -n -o FSTYPE -M "$target" 2>/dev/null)
+  [ "$type" = fuse.squeezefs ] || exec umount -i "$target"
   # A BIND of a path inside a squeezefs mount (generic/306 binds a file)
   # carries our fstype in the mount table but has no daemon of its own:
   # the kernel's plain detach, silently (mount(8) prints nothing). Only a
   # daemon's own root gets the orderly `squeezefs umount`.
   if ! findmnt -n -o FSROOT -M "$target" 2>/dev/null | grep -qx /; then exec umount -i "$target"; fi
-  exec "$SQZ_BIN" umount "$target"
+  rc=0
+  "$SQZ_BIN" umount "$target" || rc=$?
+  # The set's slices and cache go down with the mount (the mount helper
+  # recorded which set serves this mountpoint), so the test's own dm device
+  # above them can be removed by its cleanup. A refused umount (BUSY: a
+  # holder) leaves everything standing.
+  tag=/run/squeezefs-suites/mnt-$(printf '%s' "$target" | md5sum | cut -c1-16)
+  if [ "$rc" = 0 ] && [ -f "$tag" ]; then
+    SET_ID=$(cat "$tag"); SET_DIR=$(cat "/run/squeezefs-suites/$SET_ID.dir"); suite_slice_paths
+    echo "$(date +%s) umount $target rc=$rc: set $SET_ID down" >> "$SET_DIR/mounts.log"
+    suite_slices_down 2>>"$SET_DIR/mounts.log"
+    rm -f "$tag"
+  fi
+  exit "$rc"
 fi
 
 dev="" dir="" opts=""
@@ -87,6 +109,14 @@ suite_set_of "$dev"
 log="$SET_DIR/daemon-$(date +%Y%m%d-%H%M%S)-$$.log"
 # One line per mount in the set's own ledger, so a run's daemons are findable.
 echo "$(date +%s) mount $dir -o $all log $log" >> "$SET_DIR/mounts.log"
+# The set's slices over the device handed over (re-pointed when they
+# stand: a dm-flakey target now, the loop a moment ago), the cache's ext4
+# mounted; the umount helper finds the set by the mountpoint's tag. A mount
+# that fails takes them down again (the test's cleanup removes its device).
+suite_slices_up "$dev"
+suite_cache_mount
+mkdir -p /run/squeezefs-suites && echo "$SET_ID" > "/run/squeezefs-suites/mnt-$(printf '%s' "$dir" | md5sum | cut -c1-16)"
+mount_failed() { suite_slices_down; rm -f "/run/squeezefs-suites/mnt-$(printf '%s' "$dir" | md5sum | cut -c1-16)"; }
 # The zero-copy kmbuf ring needs order-8 contiguous pages per queue; a
 # fragmented venue (other agents' daemons, a hot page cache) answers
 # ENOMEM. Compact and retry, as `common.sh`'s `suite_mount` does — never a
@@ -101,7 +131,7 @@ while :; do
   # diagnosis and go to stderr.
   # `--supervise`: the release posture's external supervisor (common.sh's
   # `suite_mount` says why) — a death gets its wait status, a wedge its dump.
-  out=$("$SQZ_BIN" mount --daemon --supervise --log-file "$log" -o "$all" "sqmeta://$SET_DEV" "$dir" 2>&1) && exit 0
+  out=$("$SQZ_BIN" mount --daemon --supervise --log-file "$log" -o "$all" "sqmeta://$SLICE_META" "$dir" 2>&1) && exit 0
   rc=$?
   if [ "$attempt" -lt 3 ] && grep -q 'ENOMEM (order-8' <<< "$out"; then
     echo "$(date +%s) mount $dir: kmbuf ENOMEM (fragmented venue); compacting memory, retry $attempt/3" >> "$SET_DIR/mounts.log"
@@ -159,10 +189,11 @@ while :; do
     cpid=$(grep -o 'stale writer claim (id=[0-9a-f]*, pid=[0-9]*' "$log" | head -1 | grep -o 'pid=[0-9]*' | cut -d= -f2)
     if [ -n "$cpid" ] && { [ ! -d "/proc/$cpid" ] || grep -q 'State:.*Z' "/proc/$cpid/status" 2>/dev/null; }; then
       echo "$(date +%s) DAEMON DIED: claim pid $cpid is gone; clearing the claim (operator attestation: the set is the harness's) and retrying $attempt/3" | tee -a "$SET_DIR/mounts.log" >> "$SET_DIR/daemon-died"
-      "$SQZ_BIN" claim clear "sqmeta://$SET_DEV" >> "$SET_DIR/mounts.log" 2>&1 || true
+      "$SQZ_BIN" claim clear "sqmeta://$SLICE_META" >> "$SET_DIR/mounts.log" 2>&1 || true
       continue
     fi
   fi
   echo "$out" >&2
+  mount_failed
   exit "$rc"
 done

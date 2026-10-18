@@ -1,22 +1,18 @@
 #!/usr/bin/env bash
 # mkfs(8) helper for the external suites: `mkfs.fuse.squeezefs [-f] [--]
-# <device> [squeezefs format flags…]` formats a SET around the device — the
-# metadata volume is the device itself (a plain file, or a loop device over
-# one: xfstests' TEST_DEV/SCRATCH_DEV are loop devices so `_require_scratch`
-# sees a block device), two data volumes `d0.img`/`d1.img` and a `cache/`
-# staging root beside the metadata image (created sparse when absent:
-# SUITE_META_MIB / SUITE_DATA_GIB, defaults 1024 / 8) — with `squeezefs
-# format --single-writer --disk-cache-paths`. xfstests' `_scratch_mkfs`
-# runs `yes | mkfs -t fuse.squeezefs -- $SCRATCH_DEV` before every scratch
-# test: a reformat (`--force`) drops the previous life's staging ring.
-# Installed as /sbin/mkfs.fuse.squeezefs (and /sbin/mkfs.squeezefs).
+# <device> [squeezefs format flags…]` formats a SET on the ONE device
+# (`setpaths.sh`: dm-linear slices for the metadata volume, two data volumes
+# and an ext4 for the staging root, all over the device xfstests hands over —
+# its TEST_DEV/SCRATCH_DEV loop, or a dm target the test put over it) with
+# `squeezefs format --single-writer --disk-cache-paths`. xfstests'
+# `_scratch_mkfs` runs `yes | mkfs -t fuse.squeezefs -- $SCRATCH_DEV` before
+# every scratch test: a reformat (`--force`) drops the previous life's
+# staging ring (a fresh ext4). Installed as /sbin/mkfs.fuse.squeezefs.
 set -euo pipefail
 ENV_FILE=${SQZ_SUITES_ENV:-/run/squeezefs-suites.env}
 [ -f "$ENV_FILE" ] && source "$ENV_FILE"
 source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/setpaths.sh"
 SQZ_BIN=${SQZ_BIN:-squeezefs}
-SUITE_META_MIB=${SUITE_META_MIB:-1024}
-SUITE_DATA_GIB=${SUITE_DATA_GIB:-8}
 
 die() { echo "mkfs.squeezefs: $*" >&2; exit 1; }
 
@@ -34,11 +30,14 @@ while [ $# -gt 0 ]; do
 done
 [ -n "$dev" ] || die "usage: mkfs.fuse.squeezefs [-f] [--] <device> [squeezefs format flags]"
 suite_set_of "$dev"
-mkdir -p "$SET_DIR/cache"; chmod 0700 "$SET_DIR/cache"
-case "$dev" in /dev/*) ;; *) [ -f "$dev" ] || truncate -s "${SUITE_META_MIB}M" "$dev" ;; esac
-for d in d0 d1; do [ -f "$SET_DIR/$d.img" ] || truncate -s "${SUITE_DATA_GIB}G" "$SET_DIR/$d.img"; done
-# A reformat must not inherit the previous life's staging ring.
-rm -rf "$SET_DIR/cache"/*
+# A set still standing from a mount the test never unmounted: down first.
+suite_slices_down
+suite_slices_up "$dev"
+trap suite_slices_down EXIT
+# The staging root: a fresh ext4 on the cache slice (a reformat must not
+# inherit the previous life's staging ring).
+mkfs.ext4 -q -F "$SLICE_CACHE" >/dev/null 2>&1 || die "mkfs.ext4 on $SLICE_CACHE failed"
+suite_cache_mount
 # Without -f the format runs as the operator would: a volume already
 # formatted refuses (generic/740 asks exactly that of a foreign filesystem).
 [ "$force" = 1 ] && extra+=(--force)
@@ -47,7 +46,7 @@ rm -rf "$SET_DIR/cache"/*
 # into its golden output — generic/631, 634, 732, 754, 800); a refusal is
 # the diagnosis and goes to stderr with the exit code.
 rc=0
-out=$("$SQZ_BIN" format --single-writer --disk-cache-paths "$SET_DIR/cache" "${extra[@]}" "sqmeta://$SET_DEV" "sqdata://$SET_DIR/d0.img,$SET_DIR/d1.img" 2>&1) || rc=$?
+out=$("$SQZ_BIN" format --single-writer --disk-cache-paths "$SET_DIR/cache" "${extra[@]}" "sqmeta://$SLICE_META" "sqdata://$SLICE_D0,$SLICE_D1" 2>&1) || rc=$?
 if [ "$rc" = 0 ]; then
   printf '%s\n' "$(date +%s) format $dev" "$out" >> "$SET_DIR/formats.log"
   exit 0

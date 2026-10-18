@@ -1,19 +1,24 @@
 #!/usr/bin/env bash
 # fsck(8) helper for the external suites: `fsck.fuse.squeezefs [fsck flags]
 # <device>` runs `squeezefs fsck --offline --scrub` over the UNMOUNTED set
-# the device heads. xfstests' `_check_generic_filesystem` unmounts the test
-# or scratch fs after every test, runs `fsck -t fuse.squeezefs $dev` and
-# fails the test on a non-zero exit — so OUR fsck (C1–C17 + the scrub) is
-# the per-test oracle, exactly what xfstests cannot do for a `fuse` FSTYP.
-# Exit: 0 clean (fsck(8)'s 0), 4 findings (fsck(8)'s "errors left
-# uncorrected"), 8 an operational error.
+# on the device (`setpaths.sh`: the set's slices stand over it for the
+# scrub and go down after). xfstests' `_check_generic_filesystem` unmounts
+# the test or scratch fs after every test, runs `fsck -t fuse.squeezefs
+# $dev` and fails the test on a non-zero exit — so OUR fsck (C1–C17 + the
+# scrub) is the per-test oracle, exactly what xfstests cannot do for a
+# `fuse` FSTYP. Exit: 0 clean (fsck(8)'s 0), 4 findings (fsck(8)'s "errors
+# left uncorrected"), 8 an operational error.
 set -uo pipefail
 ENV_FILE=${SQZ_SUITES_ENV:-/run/squeezefs-suites.env}
 [ -f "$ENV_FILE" ] && source "$ENV_FILE"
+source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/setpaths.sh"
 SQZ_BIN=${SQZ_BIN:-squeezefs}
 dev=""
 for a in "$@"; do case "$a" in -*) ;; *) dev=$a ;; esac; done
 [ -n "$dev" ] || { echo "fsck.fuse.squeezefs: no device" >&2; exit 8; }
-out=$("$SQZ_BIN" fsck --offline --scrub "sqmeta://$dev" 2>&1); rc=$?
+suite_set_of "$dev" || exit 8
+suite_slices_up "$dev" || exit 8
+trap suite_slices_down EXIT
+out=$("$SQZ_BIN" fsck --offline --scrub "sqmeta://$SLICE_META" 2>&1); rc=$?
 echo "$out" | grep -v '^info\|^debug'
 case $rc in 0) exit 0 ;; 1) exit 4 ;; *) exit 8 ;; esac

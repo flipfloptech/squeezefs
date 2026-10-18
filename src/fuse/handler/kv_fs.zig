@@ -465,6 +465,10 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         times_park: bool,
         /// `Options.write_postlude_hold` (`holdPostlude`).
         write_hold: bool = false,
+        /// Test seam: the times drain parks between its claims snapshot and
+        /// its guards until `write_hold_release` fires (the window a
+        /// size-setting commit can cross).
+        drain_hold: bool = false,
         write_hold_release: sync.Notify = .init,
         write_held: std.atomic.Value(u32) = .init(0),
         /// The data plane is live: false from the dismount's drain on (the
@@ -3135,6 +3139,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 n_claimants += 1;
             };
             if (n_claimants != 0) try self.data.barrierData(self.io, claimants[0..n_claimants]);
+            if (self.drain_hold) self.holdPostlude();
             var plan: economy.GuardPlan = .{};
             for (batch) |ino| {
                 plan.inode_reqs[plan.inode_len] = .{ .ino = ino, .mode = .exclusive };
@@ -3149,7 +3154,14 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             for (batch, 0..) |ino, i| {
                 const parked = self.pending.parked(ino) orelse continue;
                 var journal = parked;
-                journal.size = claims[i];
+                // The snapshot's value was read BEFORE the guards: a
+                // size-setting commit that crossed the window clipped (or
+                // retired, and a later stamp re-parked) the claim, so the
+                // journaled size is capped by the claim AS IT STANDS here —
+                // never the pre-truncate end over the new size (fstests
+                // generic/075, 112: fsx's `Size error` right after a
+                // truncate down).
+                journal.size = @min(parked.size, claims[i]);
                 // A claim journaled whole retires with the stamp; a clipped
                 // (or newer) one stays parked for the next pass.
                 if (journal.size == parked.size) drained[i] = parked;
@@ -5619,6 +5631,47 @@ test "rangelock: what stays ordered behind a write held inside its postlude — 
         try testing.expectEqual(@as(?anyerror, null), op.err);
     }
     try testing.expectEqual(@as(u64, 1024), (try h.getattr(f)).size);
+    h.release(f);
+}
+
+test "the times drain journals a size claim as it stands UNDER its guards, never the value it snapshotted before them: a truncate crossing the window (the snapshot, the data barrier, then the exclusive guards) clips and retires the claim, a later stamp re-parks the ino, and the drain would journal the pre-truncate end over the new size (repro-port: fstests generic/075 and 112 — fsx's `Size error: expected 0x1636fb stat 0x939576` right after a truncate down)" {
+    const H = HarnessOf(SettlingData);
+    var h: H = undefined;
+    try h.init();
+    defer h.deinit();
+    defer h.data.deinit();
+    h.data.store = &h.store;
+    const image: []u8 = try testing.allocator.alloc(u8, 8192);
+    defer testing.allocator.free(image);
+    @memset(image, 'I');
+    const f = try h.create(1, "f", 0o644);
+    // An extending striped write: its size claim (8192) parks (§AL.5).
+    try testing.expectEqual(@as(?linux.E, null), h.write(f, 0, image, 0).errno());
+    const local = try H.Fs.localOf(f);
+    try testing.expectEqual(@as(u64, 8192), h.fs.pending.claimOf(local));
+    // The drain snapshots the claim and parks before its guards.
+    const held0 = h.fs.write_held.load(.acquire);
+    h.fs.drain_hold = true;
+    var d: PostludeOp = .{ .fs = &h.fs, .ino = f, .kind = .drain };
+    const td = try d.spawn();
+    while (h.fs.write_held.load(.acquire) == held0) std.Thread.yield() catch {};
+    h.fs.drain_hold = false;
+    // The truncate crosses the window: the claim clips and retires, the
+    // size commits at 4096.
+    var in = abi.zeroed(abi.fuse_setattr_in);
+    in.valid = abi.FATTR_SIZE;
+    in.size = 4096;
+    try testing.expectEqual(@as(?linux.E, null), h.setattr(f, in).errno());
+    try testing.expectEqual(@as(u64, 4096), (try h.getattr(f)).size);
+    // A size-neutral write re-parks a stamp on the ino (what a kernel page
+    // writeback or a copy does after the truncate).
+    try testing.expectEqual(@as(?linux.E, null), h.write(f, 0, image[0..512], 0).errno());
+    h.fs.write_hold_release.notifyWaiters(testing.io);
+    td.join();
+    try testing.expectEqual(@as(?anyerror, null), d.err);
+    // The drain journaled nothing above the truncated size.
+    try testing.expectEqual(@as(u64, 4096), (try h.getattr(f)).size);
+    try testing.expectEqual(@as(u64, 4096), (try h.fs.readInode(local)).size);
     h.release(f);
 }
 

@@ -2934,14 +2934,19 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         }
 
         /// The staged arm's rebuilt image in `buf`: the resident bytes
-        /// `[0, got)`, ZEROS over the gap up to the write, the write's
-        /// bytes, `size` long. The gap is zeroed explicitly — `buf` is
-        /// recycled memory, and a tenant read fills its grain's tail with
-        /// the slot's dead bytes past the file's length (fstests
-        /// generic/075: a packed file truncated to an unaligned size, then
-        /// written beyond EOF, read a dead write back from the gap).
+        /// `[0, got)`, ZEROS over every byte of `[got, size)` the resident
+        /// image did not cover, then the write's bytes — `size` long. The
+        /// zeros are explicit: `buf` is recycled memory, and a tenant read
+        /// fills its grain's tail with the slot's dead bytes past the
+        /// file's length. Both gaps are holes: the one before a write past
+        /// EOF (fstests generic/075: a packed file truncated to an unaligned
+        /// size, then written beyond EOF, read a dead write back) and the
+        /// one after a write INSIDE an image shorter than the file — a
+        /// truncate-up over a staged image raises the size alone, and the
+        /// next in-image write rebuilt the tail from garbage (generic/127:
+        /// copy_file_range read it out of the hole).
         fn rebuiltImage(buf: []u8, got: usize, offset: usize, data: []const u8, size: usize) []u8 {
-            if (got < offset) @memset(buf[got..offset], 0);
+            if (got < size) @memset(buf[got..size], 0);
             @memcpy(buf[offset .. offset + data.len], data);
             return buf[0..size];
         }
@@ -5384,6 +5389,15 @@ test "the staged arm's rebuilt image ZEROES the gap between the resident bytes a
     for (img[100..8000]) |x| try testing.expectEqual(@as(u8, 0), x);
     try testing.expectEqualStrings("BBBB", img[8000..]);
     for (stale[8004..]) |x| try testing.expectEqual(@as(u8, 0xee), x);
+    // A write INSIDE an image shorter than the file (a truncate-up raised
+    // the size alone): the tail past the write up to the size is a hole too.
+    var stale2: [12288]u8 = @splat(0xee);
+    @memset(stale2[0..100], 'A');
+    const img2 = H.Fs.rebuiltImage(&stale2, 100, 40, "BBBB", 8004);
+    for (img2[0..40]) |x| try testing.expectEqual(@as(u8, 'A'), x);
+    try testing.expectEqualStrings("BBBB", img2[40..44]);
+    for (img2[44..100]) |x| try testing.expectEqual(@as(u8, 'A'), x);
+    for (img2[100..8004]) |x| try testing.expectEqual(@as(u8, 0), x);
 }
 
 test "§L.6 the write-stamp park (repro-port: frag-512b-write — 533 k size-neutral 512 B overwrites cost 533 k journal entries, 1.56 per 4 KiB window, 2.6 KB of metadata device per op): a size-neutral striped write commits NOTHING — its (mtime, ctime) is parked, fold-visible on getattr while the stored record lags; the drain commits ONE Δ entry per ≤ 16 parked inos and a retire never drops a stamp parked after it; fsync(ino) drains that ino; an extending write parks its size claim and the drain journals it (§AL.5); the cap wakes the cadence; strict mode commits per write" {

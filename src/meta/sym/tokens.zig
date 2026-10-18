@@ -236,6 +236,8 @@ fn objectOf(local: u64) u64 {
 const ReaderResolver = struct {
     conn_to_a: *loopback.Conn,
     refreshes: u32 = 0,
+    /// The holder's listener not dialable (a successor not yet listening).
+    fail_dial: bool = false,
 
     fn homeOf(ctx: *anyopaque, slot: u16) divert.Home {
         _ = ctx;
@@ -248,6 +250,7 @@ const ReaderResolver = struct {
     }
     fn dial(ctx: *anyopaque, _: u64, _: u32) ?cache.Link {
         const self: *ReaderResolver = @ptrCast(@alignCast(ctx));
+        if (self.fail_dial) return null;
         return linkOf(self.conn_to_a);
     }
     fn resolver(self: *ReaderResolver) divert.Resolver {
@@ -1331,6 +1334,37 @@ test "the serve gate: a reader past T_self serves NOTHING from its cache; a hold
     s.release(io);
     // Back onto the fixture's session before the temporary ones die.
     plane.repoint(io, linkOf(&f.b_to_a[0]));
+}
+
+// THE KILL ROWS (b) under gate load: B's reclaim was admitted by the
+// successor manager, the divert's re-point dialled its listener before it
+// answered, and the dial's null left the plane on the dead manager's link
+// WITH every token of the dead grant table still cached (`dlm_token_holder_
+// repoints` 0 — the row's assertion).
+test "a holder's re-point whose dial fails still drops every token and bumps the endpoint generation: the successor's listener not yet dialable leaves no stale token served — the plane re-points onto its old link and the next serve fetches a fresh grant" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    const f = try TwoMembers.init(gpa, io, 1);
+    defer f.deinit();
+    const b = f.reader(0);
+    var s = (try b.serve(io, objectOf(3), .{})).?;
+    s.release(io);
+    const plane = b.planeOf(io, A_ID).?;
+    try testing.expectEqual(@as(usize, 1), plane.cache.count(io));
+    const gen0 = plane.endpointGen();
+    const repoints0 = cache.stats.dlm_token_holder_repoints.load();
+    const grants0 = cache.stats.dlm_token_grants.load();
+    f.resolvers[0].fail_dial = true;
+    try testing.expect(b.repoint(io, A_ID, A_APPENDER));
+    f.resolvers[0].fail_dial = false;
+    try testing.expectEqual(repoints0 + 1, cache.stats.dlm_token_holder_repoints.load());
+    try testing.expectEqual(gen0 + 1, plane.endpointGen());
+    try testing.expectEqual(@as(usize, 0), plane.cache.count(io));
+    // The next serve is a FETCH on a fresh grant, never the dropped token.
+    s = (try b.serve(io, objectOf(3), .{})).?;
+    try testing.expectEqual(@as(u64, 100), s.entry.?.attrs.mtime);
+    s.release(io);
+    try testing.expectEqual(grants0 + 1, cache.stats.dlm_token_grants.load());
 }
 
 test "a CACHED token serves while the holder is unreachable: a round that fails closes the channel for FETCHES only — the cached object still hits (0 RPCs), an uncached one is the typed EAGAIN, the in-op re-probe whose dial dies keeps the cache; a re-probe that completes drops it (a live holder we lost a round with)" {

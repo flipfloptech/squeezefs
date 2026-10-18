@@ -231,9 +231,17 @@ pub const Divert = struct {
 
     /// A holder MOVED its listener: the plane re-points in place (every
     /// token dropped, the channel fail-closed until a round completes).
+    /// The drop never waits on the dial: a successor whose listener does
+    /// not answer yet (THE KILL ROWS (b) under gate load) must leave no
+    /// token of the dead holder's grant table served, so the plane
+    /// re-points onto its OLD link — the probe round fails on the dead
+    /// session and the serve re-dials through the resolver (`reprobe`).
     pub fn repoint(self: *Divert, io: Io, identity: ClientId, holder: u32) bool {
         const r = self.planeOf(io, identity) orelse return false;
-        const link = self.resolver.dial(self.resolver.ctx, identity, holder) orelse return false;
+        const link = self.resolver.dial(self.resolver.ctx, identity, holder) orelse blk: {
+            log.warn("token plane of holder {d}: its listener did not dial at the re-point — every token dropped, the channel re-probed at the next serve", .{holder});
+            break :blk r.link;
+        };
         r.repoint(io, link);
         return true;
     }

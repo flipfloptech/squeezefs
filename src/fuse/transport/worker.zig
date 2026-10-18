@@ -2834,7 +2834,8 @@ pub const Group = struct {
         const handle: fsv.Handle = .{ .tx = self.shared.tx, .slot = .{ .ring = sref }, .unique = req.unique(), .window = self.window(gent) };
         const cpu: ?u16 = if (self.shared.qid_is_cpu) m.qid else null;
         // The worker's own lane: the handler runs on this thread (§AB.3).
-        const own = if (onWorkerLane(req.op, self.shared.no_open)) self.lane else null;
+        const held_write = if (lease) |l| l.held else false;
+        const own = if (onWorkerLane(req.op, self.shared.no_open, held_write)) self.lane else null;
         const lane = own orelse self.shared.exec.homeLane(cpu, self.shared.nodeOf(m.qid));
         if (own != null) {
             handler_dispatches_own.inc();
@@ -3076,15 +3077,23 @@ pub const Group = struct {
 threadlocal var current_group: ?*Group = null;
 
 /// Whether a request's handler may run on the worker's own lane (decision
-/// 0003 §AB.3): the namespace and attribute class. The data class — READ,
-/// WRITE, the syncs, RELEASE (a close drains the file's write-back), a
-/// truncating SETATTR / OPEN / CREATE, FALLOCATE, COPY_FILE_RANGE, LSEEK,
-/// IOCTL, POLL, the locks, BMAP, the forgets (an eviction reclaims), and a
-/// no-open session's FLUSH (it carries RELEASE's drain, 0003 §AF) — stays
-/// on the CPU's handler lane: its handler waits on a data device through a
-/// completion that parks the calling THREAD (`sync/completion.zig`, 0003
-/// WP-C row 14), and on the worker that wait would stall the queue's ring.
-pub fn onWorkerLane(op: codec.Request, no_open: bool) bool {
+/// 0003 §AB.3): the namespace and attribute class, and a HELD WRITE
+/// (`held_write`: the zero-copy slot the W1 hold gate admitted — a striped
+/// passthrough file, non-extending, one block, ≤ `PATCH_MAX`, not
+/// stream-adjacent). A held write's one device leg is `WRITE_FIXED(slot →
+/// device)` on THIS worker's ring (`storeFromForeign`): its wait parks the
+/// handler's FIBER on the store cell and the CQE is this thread's own reap,
+/// so the queue's ring never stalls; its fall-through arm (the extent park
+/// on RAM custody) touches no device. The rest of the data class — READ,
+/// an extracted or gate-declined WRITE, the syncs, RELEASE (a close drains
+/// the file's write-back), a truncating SETATTR / OPEN / CREATE, FALLOCATE,
+/// COPY_FILE_RANGE, LSEEK, IOCTL, POLL, the locks, BMAP, the forgets (an
+/// eviction reclaims), and a no-open session's FLUSH (it carries RELEASE's
+/// drain, 0003 §AF) — stays on the CPU's handler lane: its handler waits on
+/// a data device through a completion that parks the calling THREAD
+/// (`sync/completion.zig`, 0003 WP-C row 14), and on the worker that wait
+/// would stall the queue's ring.
+pub fn onWorkerLane(op: codec.Request, no_open: bool, held_write: bool) bool {
     const o_trunc: u32 = @bitCast(linux.O{ .TRUNC = true });
     return switch (op) {
         .lookup, .getattr, .readlink, .symlink, .mknod, .mkdir, .unlink, .rmdir, .rename, .rename2, .link => true,
@@ -3094,6 +3103,7 @@ pub fn onWorkerLane(op: codec.Request, no_open: bool) bool {
         .setattr => |s| s.valid & abi.FATTR_SIZE == 0,
         .open => |o| o.flags & o_trunc == 0,
         .create => |c| c.flags & o_trunc == 0,
+        .write => held_write,
         else => false,
     };
 }

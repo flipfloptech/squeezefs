@@ -2561,15 +2561,22 @@ test "e2e: the write-back timer's close (decision 0003 §AJ) — on the real ker
     try testing.expectEqual(@as(u64, 0), rig.fs.file_releases.load(.monotonic));
 }
 
-test "the dispatch law's FLUSH arm (decision 0003 §AF): a no-open FLUSH carries RELEASE's drain and is the data class — the CPU's lane — while the control arm's runs on the worker's lane; the rest of the law is unchanged" {
+test "the dispatch law's FLUSH arm (decision 0003 §AF): a no-open FLUSH carries RELEASE's drain and is the data class — the CPU's lane — while the control arm's runs on the worker's lane; a WRITE runs on the worker's lane iff its payload is HELD (the W1 hold gate's slot: its one DMA is this worker's own bridge), an extracted WRITE and a READ stay the data class; the rest of the law is unchanged" {
     const flush: codec.Request = .{ .flush = .{ .fh = 0, .lock_owner = 0 } };
-    try testing.expect(worker.onWorkerLane(flush, false));
-    try testing.expect(!worker.onWorkerLane(flush, true));
+    try testing.expect(worker.onWorkerLane(flush, false, false));
+    try testing.expect(!worker.onWorkerLane(flush, true, false));
+    const write: codec.Request = .{ .write = .{ .in = .{ .fh = 0, .offset = 4096, .size = 4096, .write_flags = 0, .lock_owner = 0, .flags = 0, .padding = 0 }, .data = &.{} } };
+    const read: codec.Request = .{ .read = .{ .fh = 0, .offset = 0, .size = 4096, .read_flags = 0, .lock_owner = 0, .flags = 0, .padding = 0 } };
     for ([_]bool{ false, true }) |no_open| {
-        try testing.expect(worker.onWorkerLane(.{ .lookup = .{ .name = "a" } }, no_open));
-        try testing.expect(!worker.onWorkerLane(.{ .release = .{ .fh = 0, .flags = 0, .release_flags = 0, .lock_owner = 0 } }, no_open));
-        try testing.expect(worker.onWorkerLane(.{ .open = .{ .flags = 0, .open_flags = 0 } }, no_open));
-        try testing.expect(!worker.onWorkerLane(.{ .open = .{ .flags = @bitCast(linux.O{ .TRUNC = true }), .open_flags = 0 } }, no_open));
+        try testing.expect(worker.onWorkerLane(.{ .lookup = .{ .name = "a" } }, no_open, false));
+        try testing.expect(!worker.onWorkerLane(.{ .release = .{ .fh = 0, .flags = 0, .release_flags = 0, .lock_owner = 0 } }, no_open, false));
+        try testing.expect(worker.onWorkerLane(.{ .open = .{ .flags = 0, .open_flags = 0 } }, no_open, false));
+        try testing.expect(!worker.onWorkerLane(.{ .open = .{ .flags = @bitCast(linux.O{ .TRUNC = true }), .open_flags = 0 } }, no_open, false));
+        try testing.expect(worker.onWorkerLane(write, no_open, true));
+        try testing.expect(!worker.onWorkerLane(write, no_open, false));
+        // The held flag names a WRITE's payload alone: it admits nothing else.
+        try testing.expect(!worker.onWorkerLane(read, no_open, true));
+        try testing.expect(!worker.onWorkerLane(.{ .release = .{ .fh = 0, .flags = 0, .release_flags = 0, .lock_owner = 0 } }, no_open, true));
     }
 }
 
@@ -3439,6 +3446,88 @@ test "e2e zc WRITE, the overlay class (charter §6.2 item 1): a 1 MiB page-align
     try testing.expectEqual(@as(u64, 1), last.extractions - after.extractions);
     try expectLaws(before, last);
     try testing.expectEqual(@as(u64, 0), slot.leases_outstanding.load());
+}
+
+test "e2e zc WRITE on the worker's lane (decision 0003 §AB.3, the write arm): a HELD write's handler runs on the thread that delivered it — dispatched `own`, the handler's thread a drain worker's, its extraction bridge round-trips on that worker's own ring and its reply commits with NO cross-thread wake; an extracted-at-delivery write stays the data class (foreign, off every worker); the control arm (SQUEEZEFS_FUSE_HANDLERS_ON_WORKER=0) crosses a thread each way" {
+    if (venueMissing()) |why| return testkit.skipWhy(@src(), why);
+    var kb: [192]u8 = undefined;
+    if (kmbufMissing(&kb)) |why| return testkit.skipWhy(@src(), why);
+    const Helper = struct {
+        fn onWorker(r: *Rig, s: *Session) bool {
+            const tid = r.fs.handler_tid.load(.acquire);
+            for (s.groups) |g| if (g.tid.load(.acquire) == tid) return true;
+            return false;
+        }
+        fn dispatches(s: *Session) struct { own: u64, foreign: u64 } {
+            var own: u64 = 0;
+            var foreign: u64 = 0;
+            for (s.groups) |g| {
+                own += g.dispatches_own.load(.monotonic);
+                foreign += g.dispatches_foreign.load(.monotonic);
+            }
+            return .{ .own = own, .foreign = foreign };
+        }
+    };
+    var page: [4096]u8 = undefined;
+    for (&page, 0..) |*b, i| b.* = @truncate(i * 7 + 3);
+    {
+        const rig = try Rig.init(testing.allocator, 44, &.{});
+        defer rig.deinit();
+        rig.fs.hold_eligible = true;
+        const s = try rig.mountIt(.{ .mem_budget_bytes = 0 });
+        try testing.expectEqual(geometry.BufferMode.zero_copy, s.mode);
+        var pb: [256]u8 = undefined;
+        const fd = try openPath(rig.child(&pb, "scratch"), .{ .ACCMODE = .WRONLY, .CLOEXEC = true });
+        defer _ = linux.close(fd);
+        // The W1 shape ⇒ HELD ⇒ the worker's own lane: the handler's lazy
+        // extraction is a bridge on the delivering worker's ring (its wake
+        // elided, its CQE that worker's reap) and the reply commits from
+        // the same thread — not one eventfd write to a worker.
+        const d0 = Helper.dispatches(s);
+        const w0 = slot.wake_writes.load();
+        const held0 = rig.fs.held_writes.load(.monotonic);
+        var i: usize = 0;
+        while (i < 16) : (i += 1) {
+            try testing.expectEqual(@as(usize, 4096), linux.pwrite(fd, &page, page.len, 4096));
+            try testing.expect(Helper.onWorker(rig, s));
+        }
+        try testing.expectEqual(held0 + 16, rig.fs.held_writes.load(.monotonic));
+        try testing.expectEqualSlices(u8, &page, rig.fs.scratch[4096..8192]);
+        const d1 = Helper.dispatches(s);
+        try testing.expectEqual(d0.own + 16, d1.own);
+        try testing.expectEqual(d0.foreign, d1.foreign);
+        try testing.expectEqual(w0, slot.wake_writes.load());
+        // Unaligned ⇒ extracted at delivery ⇒ the data class: the CPU's lane.
+        const tail = "off the worker";
+        try testing.expectEqual(@as(usize, tail.len), linux.pwrite(fd, tail, tail.len, 8192 + 7));
+        try testing.expectEqualSlices(u8, tail, rig.fs.scratch[8192 + 7 ..][0..tail.len]);
+        const d2 = Helper.dispatches(s);
+        try testing.expectEqual(d1.own, d2.own);
+        try testing.expectEqual(d1.foreign + 1, d2.foreign);
+        try testing.expect(!Helper.onWorker(rig, s));
+        try testing.expectEqual(@as(u64, 0), slot.leases_outstanding.load());
+    }
+    {
+        const rig = try Rig.init(testing.allocator, 45, &.{.{ "SQUEEZEFS_FUSE_HANDLERS_ON_WORKER", "0" }});
+        defer rig.deinit();
+        rig.fs.hold_eligible = true;
+        const s = try rig.mountIt(.{ .mem_budget_bytes = 0 });
+        try testing.expectEqual(geometry.BufferMode.zero_copy, s.mode);
+        var pb: [256]u8 = undefined;
+        const fd = try openPath(rig.child(&pb, "scratch"), .{ .ACCMODE = .WRONLY, .CLOEXEC = true });
+        defer _ = linux.close(fd);
+        const w0 = slot.wake_writes.load();
+        const held0 = rig.fs.held_writes.load(.monotonic);
+        var i: usize = 0;
+        while (i < 16) : (i += 1) {
+            try testing.expectEqual(@as(usize, 4096), linux.pwrite(fd, &page, page.len, 4096));
+            try testing.expect(!Helper.onWorker(rig, s));
+        }
+        try testing.expectEqual(held0 + 16, rig.fs.held_writes.load(.monotonic));
+        try testing.expectEqual(@as(u64, 0), Helper.dispatches(s).own);
+        // The lane thread's extraction requests and replies wake the worker across threads.
+        try testing.expect(slot.wake_writes.load() > w0);
+    }
 }
 
 test "e2e zc bridges: a bridge that never completes (the stall seam) is cancelled at the deadline — bridge_cancels == 1, the slot still commits header-only -EIO (THE LAW: the reader gets EIO), lost/orphans stay 0, the session serves on" {

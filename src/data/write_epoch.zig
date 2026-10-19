@@ -1149,9 +1149,10 @@ test "a drift key the save displaced is freed with no allocation: an allocation 
     try testing.expect(f.map.seam().lookup(81, 0).?.eql(b));
 }
 
-test "the ONE save's size caps the shadow: the 65th distinct block of an epoch answers not_shadowed (the per-block durable publish) instead of being dropped from the save" {
+test "the ONE save's width caps the shadow: the first distinct block past it answers not_shadowed (the per-block durable publish) instead of being dropped from the save" {
     const io = testing.io;
-    const f = try wt.Fixture.init(testing.allocator, 160);
+    // Every A key published and every B minted: two blocks per shadowed index.
+    const f = try wt.Fixture.init(testing.allocator, 2 * seams.MergeOutcome.max_displaced + 8);
     defer f.deinit();
     var ep = Epochs.init(testing.allocator, wt.BS, true);
     defer ep.deinit();
@@ -1175,7 +1176,7 @@ test "the ONE save's size caps the shadow: the 65th distinct block of an epoch a
     const b_again = Binding.wholeBlock(wt.VOL_A, m_again.offset, m_again.stamp);
     try testing.expect((try ep.record(70, 0, null, b_again, proofFor(b_again, wt.BS), 0, block_alloc.InflightAllocGuard.register(f.alloc_a, m_again.idx), true)) == .shadowed);
     const out = ep.close(io, 70, cs);
-    try testing.expectEqual(@as(u32, seams.MergeOutcome.max_displaced + 1), out.swapped.freed); // 64 A keys + block 0's intermediate B
+    try testing.expectEqual(@as(u32, seams.MergeOutcome.max_displaced + 1), out.swapped.freed); // every A key + block 0's intermediate B
     try testing.expectEqual(@as(u8, seams.MergeOutcome.max_displaced), f.map.merges.items[0].blocks);
     try testing.expect(f.map.seam().lookup(70, 0).?.eql(b_again));
 }
@@ -1196,7 +1197,7 @@ fn directPublish(io: Io, f: *wt.Fixture, ino: u64, block: u32, new: Binding) voi
 // (`block_untracked_free_refusals`, "REFUSED begin_free of block 315").
 test "a record for a block the CLOSING epoch shadows never takes the durable merge under the save: the cap bounds the open shadow united with the closing one, so that block is always taken (parking the closing B) and a block past the union answers save_in_flight; the saves land B then C with A and B freed once each — drift 0, refusals 0" {
     const io = testing.io;
-    const f = try wt.Fixture.init(testing.allocator, 200);
+    const f = try wt.Fixture.init(testing.allocator, 2 * seams.MergeOutcome.max_displaced + 8);
     defer f.deinit();
     var ep = Epochs.init(testing.allocator, wt.BS, true);
     defer ep.deinit();
@@ -1255,7 +1256,7 @@ test "a record for a block the CLOSING epoch shadows never takes the durable mer
     try testing.expect(v2 == .not_shadowed);
     directPublish(io, f, 80, max, Racer.p);
     // The next epoch's save publishes C over the landed B, freeing B with
-    // the 63 A keys it parked — each displacing exactly what it parked.
+    // the `max − 1` A keys it parked — each displacing exactly what it parked.
     const out = ep.close(io, 80, cs);
     try testing.expectEqual(@as(u32, max), out.swapped.freed);
     try testing.expectEqual(@as(usize, 2 + max), f.frees.freed.items.len);
@@ -1272,7 +1273,7 @@ test "a record for a block the CLOSING epoch shadows never takes the durable mer
 // assert (a panic: the daemon died).
 test "a transient save's fold never carries more than the ONE save's size: a record in the save's window grows the open epoch only while its union with the closing shadow fits (past it: save_in_flight, the caller awaits and records again), so the folded epoch's close publishes every block in one merge" {
     const io = testing.io;
-    const f = try wt.Fixture.init(testing.allocator, 200);
+    const f = try wt.Fixture.init(testing.allocator, 2 * seams.MergeOutcome.max_displaced + 8);
     defer f.deinit();
     var ep = Epochs.init(testing.allocator, wt.BS, true);
     defer ep.deinit();
@@ -1315,7 +1316,7 @@ test "a transient save's fold never carries more than the ONE save's size: a rec
     try testing.expectEqual(CloseOutcome.transient, ep.close(io, 90, cs));
     // The fold: ONE open epoch whose shadow the next save carries whole.
     try testing.expectEqual(@as(u32, max), ep.table.get(90).?.shadow.count());
-    try testing.expectEqual(@as(u32, max / 2), Racer.shadowed);
+    try testing.expectEqual(@as(u32, max - max / 2), Racer.shadowed);
     try testing.expectEqual(@as(usize, max / 2), Racer.waited.items.len);
     try testing.expect(ep.close(io, 90, cs) == .swapped);
     try testing.expectEqual(@as(u8, max), f.map.merges.items[f.map.merges.items.len - 1].blocks);
@@ -1334,7 +1335,7 @@ test "a transient save's fold never carries more than the ONE save's size: a rec
 
 test "a shadow past the ONE save's size (record caps the fold's union, so it cannot happen) is loud and never lossy: rewrite_shadow_save_overflow fires, the close publishes and frees nothing, and the epoch stays open" {
     const io = testing.io;
-    const f = try wt.Fixture.init(testing.allocator, 100);
+    const f = try wt.Fixture.init(testing.allocator, seams.MergeOutcome.max_displaced + 8);
     defer f.deinit();
     var ep = Epochs.init(testing.allocator, wt.BS, true);
     defer ep.deinit();

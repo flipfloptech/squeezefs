@@ -22,6 +22,9 @@ const counters = @import("../core/counters.zig");
 const clock = @import("../core/clock.zig");
 const derive = @import("../core/derive.zig");
 const dlm = @import("../meta/dlm.zig");
+const journal = @import("../meta/journal.zig");
+const key = @import("../meta/key.zig");
+const record = @import("../meta/record.zig");
 const sync_mutex = @import("../sync/mutex.zig");
 const lock_order = @import("../sync/lock_order.zig");
 const slot = @import("../fuse/transport/slot.zig");
@@ -250,7 +253,44 @@ pub const MergeOutcome = struct {
     /// a fake map).
     holds: ?ReleaseHolds = null,
 
-    pub const max_displaced = 64;
+    /// The ONE save's width: the most blocks one merge inserts, and so the
+    /// most a rewrite epoch shadows before its close (`write_epoch`) —
+    /// DERIVED from the journal's whole-entry cap (charter §5.1: one
+    /// transaction = one entry ≤ 128 KiB; the save is ONE tx). Half the
+    /// entry is the window's (`kvmap.CROSSING_CHUNK`'s convention: the
+    /// other half holds the layout record at its cap, or the kvmap head
+    /// and a straddler's re-Puts), less four map frames of headroom for
+    /// the neighbourhood records a window touches, divided by the widest
+    /// per-block cost of either map shape: a tree-mapped insert
+    /// re-canonicalizes its run into at most three kind-7 Puts (the left
+    /// remainder, the point, the right remainder) and one Delete beside
+    /// its `+ref`/`−ref`; an inline-map insert costs the two refs alone.
+    /// The port's first buffer was 64: a streaming overwrite filled it in
+    /// a quarter of the write-back cadence and every later block paid a
+    /// full-record publish of its own (`docs/evidence/rung-10-publish-
+    /// churn.md`: 57 % of the blocks, 3,600 publishes/s at 27 GB/s).
+    pub const max_displaced: usize = (journal.MAX_ENTRY_LEN / 2 - 4 * map_record_frame_bytes) / save_bytes_per_block_kvmap;
+
+    /// The widest kind-7 record frame: a RUN2 value under the 13 B key.
+    const map_record_frame_bytes: u64 = journal.recordFrameLen(key.BLOCK_MAP_KEY_LEN, record.BLOCK_MAP_RUN_STAMPED_VALUE_LEN);
+    const map_delete_frame_bytes: u64 = journal.recordFrameLen(key.BLOCK_MAP_KEY_LEN, 0);
+    /// `+ref` is a Put of the 4 B ref value, `−ref` its Delete.
+    const save_bytes_per_block_inline: u64 = journal.recordFrameLen(key.BLOCK_REF_KEY_LEN, record.BLOCK_REF_VALUE_LEN) + journal.recordFrameLen(key.BLOCK_REF_KEY_LEN, 0);
+    const save_bytes_per_block_kvmap: u64 = 3 * map_record_frame_bytes + map_delete_frame_bytes + save_bytes_per_block_inline;
+
+    comptime {
+        // The inline shape: the layout record at the format's cap plus the
+        // window's refs fit one entry.
+        const layout_frame_at_cap = journal.recordFrameLen(key.XATTR_KEY_LEN, record.RECORD_VALUE_CAP_CEILING + record.XATTR_RECORD_ENVELOPE_MAX);
+        assert(journal.ENTRY_HDR_LEN + layout_frame_at_cap + max_displaced * save_bytes_per_block_inline <= journal.MAX_ENTRY_LEN);
+        // The tree-mapped shape: the window's records and refs, the
+        // neighbourhood's four frames and the head Put (a sweep cursor and
+        // a generation at most) fit one entry with the other half spare.
+        const kvmap_head_frame = journal.recordFrameLen(key.XATTR_KEY_LEN, 1 + layout.LAYOUT_XATTR_NAME.len + layout.LAYOUT_HEADER_LEN + 4 + 8);
+        assert(journal.ENTRY_HDR_LEN + kvmap_head_frame + max_displaced * save_bytes_per_block_kvmap + 4 * map_record_frame_bytes <= journal.MAX_ENTRY_LEN / 2);
+        // The displaced count and the clipped count ride u8 fields.
+        assert(max_displaced <= std.math.maxInt(u8));
+    }
 
     pub fn slice(self: *const MergeOutcome) []const Binding {
         return self.displaced[0..self.n_displaced];
@@ -484,6 +524,18 @@ pub const BlockLocks = struct {
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
+
+test "tie: the ONE save's width = (half the 128 KiB entry − four 60 B map frames) ÷ the tree-mapped insert's 306 B (three 60 B Puts, a 30 B Delete, a 50 B +ref, a 46 B −ref) = 213; the inline record at its 65,826 B frame plus 213 × 96 B of refs fits the entry with room; 213 ≤ u8" {
+    try testing.expectEqual(@as(u64, 60), journal.recordFrameLen(key.BLOCK_MAP_KEY_LEN, record.BLOCK_MAP_RUN_STAMPED_VALUE_LEN));
+    try testing.expectEqual(@as(u64, 306), 3 * 60 + 30 + 50 + 46);
+    try testing.expectEqual(@as(usize, 213), MergeOutcome.max_displaced);
+    try testing.expectEqual(@as(usize, (64 * 1024 - 4 * 60) / 306), MergeOutcome.max_displaced);
+    const layout_frame_at_cap = journal.recordFrameLen(key.XATTR_KEY_LEN, record.RECORD_VALUE_CAP_CEILING + record.XATTR_RECORD_ENVELOPE_MAX);
+    try testing.expectEqual(@as(u64, 65_826), layout_frame_at_cap);
+    try testing.expect(journal.ENTRY_HDR_LEN + layout_frame_at_cap + 213 * 96 <= journal.MAX_ENTRY_LEN);
+    // One more block of either shape and the kvmap window would cross its half.
+    try testing.expect(journal.ENTRY_HDR_LEN + 85 + 214 * 306 + 4 * 60 > journal.MAX_ENTRY_LEN / 2);
+}
 
 test "the block lock table: a held stripe parks a second acquirer of the same block, counted against its site; distinct blocks of one ino spread" {
     const io = testing.io;

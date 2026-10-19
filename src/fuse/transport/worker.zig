@@ -1532,20 +1532,35 @@ pub const Group = struct {
         return if (slept) |s| s.rto else 0;
     }
 
-    /// The oldest live bridge still inside the spin's reach (`born >
-    /// now − horizon`): the completion the spin waits for; null when every
-    /// owed one is already late (the park's, not the spin's).
+    /// Whether a bridge is the spin's: at most a page. The predictors are
+    /// one device round trip per ring, so they must sample ONE size — the
+    /// page-sized store and leg the spin exists for (4k randwrite, 4k
+    /// randread) — and a bigger DMA is never spun for: a 1 MiB store takes
+    /// milliseconds, and sampled into the same estimators it made W read
+    /// milliseconds, after which the sequential-write rows spun 55–80 s of
+    /// CPU per 20 s row (measured 2026-10-19: sw1m-q16j4 72–116 µs spun
+    /// per request, +2.7 cores).
+    fn spinSized(self: *const Group, len: u32) bool {
+        return len <= self.shared.page;
+    }
+
+    /// The oldest live page-sized bridge still inside the spin's reach
+    /// (`born > now − horizon`): the completion the spin waits for; null
+    /// when every owed one is bigger or already late (the park's, not the
+    /// spin's).
     fn oldestOwedBorn(self: *const Group, now: u64, horizon: u64) ?u64 {
         var oldest: ?u64 = null;
-        for (self.deadlines.born_ns) |b| {
+        for (self.deadlines.born_ns, self.pends) |b, p| {
             if (b == 0 or b +| horizon <= now) continue;
+            if (!self.spinSized((p orelse continue).len)) continue;
             if (oldest == null or b < oldest.?) oldest = b;
         }
         return oldest;
     }
 
     /// The owed spin (the pass's step 12½): with no work in hand and a
-    /// device completion owed on this ring, spin on the ring — the CQ tail,
+    /// page-sized device completion owed on this ring (`spinSized`), spin
+    /// on the ring — the CQ tail,
     /// or the `IORING_SQ_TASKRUN` flag a `DEFER_TASKRUN` ring raises when
     /// a completion waits for its owner's enter — for `owedSpinBudget`,
     /// instead of parking per CQE. This pass's SQEs go first (the store a
@@ -1606,10 +1621,11 @@ pub const Group = struct {
         };
     }
 
-    /// A bridge CQE's push → reap round trip feeds the predictor its reap's
-    /// origin names (`ReapOrigin`); a busy pass's reap measures no wait.
-    fn sampleBridgeRoundTrip(self: *Group, born_ns: u64) void {
-        if (born_ns == 0) return;
+    /// A page-sized bridge CQE's push → reap round trip feeds the predictor
+    /// its reap's origin names (`ReapOrigin`); a busy pass's reap measures
+    /// no wait, a bigger bridge is not the spin's (`spinSized`).
+    fn sampleBridgeRoundTrip(self: *Group, born_ns: u64, len: u32) void {
+        if (born_ns == 0 or !self.spinSized(len)) return;
         const age = clock.monotonicNs() -| born_ns;
         switch (self.reap_origin) {
             .busy => {},
@@ -2015,7 +2031,7 @@ pub const Group = struct {
     fn handleBridgeCqe(self: *Group, gent: u32, res: i32) void {
         const born = self.deadlines.born_ns[gent];
         const pend = self.clearPend(gent) orelse return;
-        self.sampleBridgeRoundTrip(born);
+        self.sampleBridgeRoundTrip(born, pend.len);
         const m = self.memberOf(gent);
         const e = self.entIdxOf(gent);
         const ok = res >= 0 and @as(u32, @intCast(res)) == pend.len;

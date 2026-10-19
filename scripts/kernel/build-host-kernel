@@ -32,7 +32,7 @@
 #   distro kernel stays in the menu as the fallback). uname -r: 7.2.8-sqz.
 #
 # Arch and derivatives (Omarchy; owner ruling 2026-10-16): the sqz kernel TRACKS Omarchy's
-#   current linux-omarchy-bore — its base, all its patches and its config — fetched from
+#   current linux-omarchy (linux-omarchy-bore until 2026-10-19) — its base, all its patches and its config — fetched from
 #   omacom/omarchy-pkgs at build time; the series and the fragment are appended to that
 #   PKGBUILD as pkgbase linux-omarchy-sqz, built with makepkg (the full Omarchy config:
 #   ~30 min on 32 threads) and installed with pacman -U, which fires the mkinitcpio/Limine
@@ -176,7 +176,9 @@ cd "$(dirname "$0")"
 # (mise shims) would be picked over the makedepends makepkg installs.
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/bin
 PKGBASE=linux-omarchy-sqz
-UPSTREAM=linux-omarchy-bore
+# Omarchy's kernel recipe: linux-omarchy-bore until 2026-10-19 (omarchy-pkgs 403eae6 folded the
+# BORE build into linux-omarchy itself; -bore is a transitional shim with no prepare()).
+UPSTREAM=linux-omarchy
 # makepkg caches the kernel tarball here across rebuilds and drops the packages beside the log.
 export SRCDEST=$PWD/sources PKGDEST=$PWD
 mkdir -p "$SRCDEST"

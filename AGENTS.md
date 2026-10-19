@@ -34,7 +34,7 @@ at the same absolute path, and runs commands as root:
   reboot; with ≥ 64 GiB of RAM, `/build/tmp` and the tree's `.zig-cache/tmp` live in RAM:
   ext4 on a zram device via zram-generator, so every test image stays off the disk). The kernel: `scripts/kernel/build-host-kernel --local` — on Debian/Ubuntu
   linux 7.2.8 + the series as .debs (`7.2.8-sqz`); on Arch/Omarchy Omarchy's CURRENT
-  `linux-omarchy-bore` PKGBUILD (its base, all its patches, its config) + the series, built
+  `linux-omarchy` PKGBUILD (its base, all its patches, its config; `linux-omarchy-bore` until 2026-10-19) + the series, built
   with makepkg, installed with pacman (`7.2.x-N-omarchy-sqz`; owner ruling 2026-10-16).
   After an Omarchy bump run `--prepare-only` first: it applies everything at `--fuzz=0` in
   minutes and a conflict means refreshing the patch in `scripts/kernel/patches-7.2/`.

@@ -74,7 +74,7 @@ case $kr in
   *sqz*) ok "kernel $kr (the sqz series)" ;;
   *) if [ "$FAMILY" = arch ]; then
     miss "the sqz kernel (running $kr): FUSE over io_uring, kmbuf, syncfs — patches 0001–0029" \
-      "scripts/kernel/build-host-kernel --local   # Omarchy's current linux-omarchy-bore PKGBUILD + the series, makepkg, pacman -U; the Limine hooks make the UKI and entry (never reboots)" \
+      "scripts/kernel/build-host-kernel --local   # Omarchy's current linux-omarchy PKGBUILD + the series, makepkg, pacman -U; the Limine hooks make the UKI and entry (never reboots)" \
       "(after an Omarchy bump: build-host-kernel --local --prepare-only first — every patch at --fuzz=0 in minutes)" "then REBOOT into it"
   else
     miss "the sqz kernel $KVER (running $kr): FUSE over io_uring, kmbuf, syncfs — patches 0001–0029" \

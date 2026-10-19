@@ -481,7 +481,9 @@ before device work (`:19882-19901`). Then:
 
 1. **COMPLETE**: `await_overlay_inflight(&rec)` — register-then-recheck on
    `inflight_change` (`:3314-3354`; `overlay_teardown_waits` once per wait; a 30 s
-   bark naming the leaked ticket's claim words — never a hang).
+   bark naming the leaked ticket's claim words — never a hang); the port then quiesces
+   on the notify once (`overlay_teardown_quiesce_waits` when a completion was still
+   inside) — §3.1's last-touch law.
 2. **SEED GAPS** (`:19911-20028`): `gaps = union.gaps()`; `app_complete = gaps.is_empty()`
    (a fully-covered overlay pays nothing). Overwrite: the DEAD-CAPTURE belt —
    `!block_key_incarnation_ok(old_key)` ⇒ `overlay_superseded_dead_old_binding`,

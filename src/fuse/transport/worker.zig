@@ -1538,10 +1538,10 @@ pub const Group = struct {
     /// or the `IORING_SQ_TASKRUN` flag a `DEFER_TASKRUN` ring raises when
     /// a completion waits for its owner's enter — for `owedSpinBudget`,
     /// instead of parking per CQE. This pass's SQEs go first (the store a
-    /// spin waits for is one of them). True ⇒ a completion is in the CQ
-    /// (one GETEVENTS enter posted it where the flag said so) and the pass
-    /// reaps now; false ⇒ the pass parks as before (its SQEs already
-    /// flushed, so the park is the one-enter timed wait).
+    /// spin waits for is one of them: a pure submit). True ⇒ a completion
+    /// is in the CQ or owed to the reap's GETEVENTS enter (the flag) and the
+    /// pass reaps now; false ⇒ the pass parks as before (its SQEs already
+    /// submitted, so the park is the one-enter timed wait).
     fn spinForOwed(self: *Group) bool {
         if (self.deadlines.outstanding == 0 or self.ring.isDead()) return false;
         const awake = predictionOf(&self.dev_awake);
@@ -1559,18 +1559,16 @@ pub const Group = struct {
             return false;
         }
         if (self.ring.ring.sqReady() > 0) {
-            self.flushNonBlocking();
+            self.submitOnly();
             if (self.ring.isDead()) return false;
         }
         owed_spins.inc();
         const deadline = now +| budget;
         var t = now;
+        // A hit on the TASKRUN flag alone leaves the completion to the reap:
+        // `copyCqes` runs the one no-wait GETEVENTS enter that posts it.
         const hit = while (true) {
-            if (self.ring.cqReady() > 0) break true;
-            if (self.ring.ring.sqFlags() & linux.IORING_SQ_TASKRUN != 0) {
-                self.flushNonBlocking();
-                break !self.ring.isDead();
-            }
+            if (self.ring.cqReady() > 0 or self.ring.ring.sqFlags() & linux.IORING_SQ_TASKRUN != 0) break true;
             t = clock.monotonicNs();
             if (t >= deadline) break false;
             std.atomic.spinLoopHint();
@@ -1578,6 +1576,25 @@ pub const Group = struct {
         owed_spin_ns.add(clock.monotonicNs() -| now);
         if (hit) owed_spin_hits.inc() else owed_spin_falls.inc();
         return hit;
+    }
+
+    /// The pure submit of this pass's SQEs (no wait, no GETEVENTS: a
+    /// `min_complete` of 1 with a zero timeout arms and fires an hrtimer
+    /// around a `schedule()` — measured +5 µs on a QD1 read's spin). The
+    /// spin that follows watches for the completions; a `DEFER_TASKRUN`
+    /// ring posts them in the reap's GETEVENTS enter.
+    fn submitOnly(self: *Group) void {
+        noteCommitBatch(self.commits_pushed);
+        self.commits_pushed = 0;
+        self.noteBridgesSubmitted();
+        enters.inc();
+        _ = self.ring.ring.submit() catch |e| switch (e) {
+            error.Interrupted => {},
+            else => {
+                log.err("transport: group {d}: io_uring_enter failed ({s}) — the ring is dead", .{ self.index, @errorName(e) });
+                self.ring.markDead();
+            },
+        };
     }
 
     /// A bridge CQE's push → reap round trip feeds the predictor its reap's

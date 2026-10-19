@@ -810,7 +810,7 @@ fn mountMain(ctx: *Ctx) u8 {
     // The times drain (decision 0003 §L.6): the parked write stamps and
     // SETATTR echoes journaled once per flush interval; strict mode parks
     // nothing and runs no cadence.
-    var times_drain: TimesDrainCadence = .{ .fs = &fs, .io = io, .interval_ns = flush_interval_ms * std.time.ns_per_ms };
+    var times_drain: TimesDrainCadence = .{ .fs = &fs, .io = io, .interval_ns = flush_interval_ms * std.time.ns_per_ms, .meta_uri = ctx.meta_uri };
     var times_drain_fut: ?@TypeOf(reclaim_fut) = if (flush_interval_ms == 0) null else ctx.sqz.spawnMeta(TimesDrainCadence.run, .{&times_drain}) catch {
         wd.requestStop();
         wd_fut.cancel(io);
@@ -1316,36 +1316,69 @@ const MembershipCadence = struct {
 /// journaled within one interval of its write, the same bound the
 /// coalesced barrier already gives an acked entry. Register-then-check on
 /// every iteration (the notify law); a drain that fails keeps its
-/// refinements parked and the next wake retries.
-const TimesDrainCadence = struct {
-    fs: *BackendFs,
-    io: Io,
-    interval_ns: u64,
-    stop: std.atomic.Value(bool) = .init(false),
+/// refinements parked and the next wake retries — unless the store is
+/// FAILED (the fail-stop latch): every commit refuses until remount, so
+/// the cadence names it ONCE and from then on drains nothing and counts
+/// its ticks (`fuse_write_times_drain_failed_ticks`), never a line per
+/// tick (fstests generic/475 under dm-error: 20 lines a second until the
+/// unmount). Generic over the filesystem so the tick runs over the RAM
+/// store in tests; the daemon's is `TimesDrainCadence`.
+fn TimesDrainCadenceOf(comptime Fs: type) type {
+    return struct {
+        const Self = @This();
 
-    fn requestStop(self: *TimesDrainCadence) void {
-        self.stop.store(true, .release);
-        self.fs.times_drain_wake.notifyOne(self.io);
-    }
+        fs: *Fs,
+        io: Io,
+        interval_ns: u64,
+        /// The set the FAILED line names.
+        meta_uri: []const u8,
+        stop: std.atomic.Value(bool) = .init(false),
+        /// The FAILED line was logged (the cadence fiber's own word).
+        failed_named: bool = false,
 
-    fn run(self: *TimesDrainCadence) void {
-        while (true) {
-            var n = self.fs.times_drain_wake.notified();
-            _ = n.enable(self.io);
-            if (self.stop.load(.acquire)) {
-                n.cancel(self.io);
-                return;
+        fn requestStop(self: *Self) void {
+            self.stop.store(true, .release);
+            self.fs.times_drain_wake.notifyOne(self.io);
+        }
+
+        fn run(self: *Self) void {
+            while (true) {
+                var n = self.fs.times_drain_wake.notified();
+                _ = n.enable(self.io);
+                if (self.stop.load(.acquire)) {
+                    n.cancel(self.io);
+                    return;
+                }
+                _ = n.waitUntilUncancelable(self.io, clock.monotonicNs() + self.interval_ns);
+                if (self.stop.load(.acquire)) return;
+                self.tick();
             }
-            _ = n.waitUntilUncancelable(self.io, clock.monotonicNs() + self.interval_ns);
-            if (self.stop.load(.acquire)) return;
-            if (self.fs.pending.len() == 0) continue;
+        }
+
+        /// One tick: the drain of whatever is parked.
+        fn tick(self: *Self) void {
+            if (self.fs.pending.len() == 0) return;
+            if (self.fs.store.isFailed()) return self.failedTick();
             var trace = op_trace.OpTrace.begin(0, .other);
             defer trace.finish();
             var ctx: filesystem.Ctx = .{ .unique = 0, .uid = 0, .gid = 0, .pid = 0, .io = self.io, .trace = &trace, .wd_slot = null, .window = &.{} };
-            _ = self.fs.drainPendingTimes(&ctx) catch |e| log.warn("times drain cadence: drain failed ({t}); {d} refinement(s) stay parked for the next tick", .{ e, self.fs.pending.len() });
+            _ = self.fs.drainPendingTimes(&ctx) catch |e| {
+                // The latch can trip under the drain (the lane's thread).
+                if (self.fs.store.isFailed()) return self.failedTick();
+                log.warn("times drain cadence: drain failed ({t}); {d} refinement(s) stay parked for the next tick", .{ e, self.fs.pending.len() });
+            };
         }
-    }
-};
+
+        fn failedTick(self: *Self) void {
+            handler.kv_fs.fuse_write_times_drain_failed_ticks.inc();
+            if (self.failed_named) return;
+            self.failed_named = true;
+            log.err("times drain cadence: a member of {s} is FAILED — the drain stops until remount; {d} parked refinement(s) stay fold-visible for the rest of this mount and are never journaled (every commit answers EIO)", .{ self.meta_uri, self.fs.pending.len() });
+        }
+    };
+}
+
+const TimesDrainCadence = TimesDrainCadenceOf(BackendFs);
 
 /// The write-back timer (decision 0003 §AJ): a meta fiber parked on its own
 /// wake with the period (the flush cadence) as its deadline; each wake runs
@@ -1703,4 +1736,41 @@ const testing = std.testing;
 test "the reclaim cadence is one watchdog tick; the supervisor's probe interval is that tick (its heartbeat is the watchdog's)" {
     try testing.expectEqual(watchdog.TICK_NS, RECLAIM_CADENCE_NS);
     try testing.expectEqual(watchdog.TICK_NS, cli.supervisor.PROBE_INTERVAL_NS);
+}
+
+test "the times drain cadence on a FAILED store (fstests generic/475 under dm-error: a line per 50 ms tick until the unmount): the first tick names the set ONCE, every tick on the latch drains nothing and counts, a tick with nothing parked says and counts nothing; a live store's tick drains as before" {
+    const kv_fs = handler.kv_fs;
+    var store = try kv_fs.MemStore.init(testing.allocator);
+    defer store.deinit();
+    var nodata: kv_fs.NoData = .{};
+    var fs = try kv_fs.MemFs.mount(testing.allocator, testing.io, &store, &nodata, .{ .dlm_stripes = 64 });
+    defer fs.unmount();
+    var cadence: TimesDrainCadenceOf(kv_fs.MemFs) = .{ .fs = &fs, .io = testing.io, .interval_ns = 0, .meta_uri = "sqmeta:///dev/mapper/failed-meta" };
+    const failed0 = kv_fs.fuse_write_times_drain_failed_ticks.load();
+    // A stamp parked on the root (stored mtime 1): a Δ for the drain.
+    const root = try kv_fs.MemFs.localOf(1);
+    const stamp: u64 = @bitCast(clock.realtimeCoarseNs());
+    _ = try fs.pending.park(root, stamp, stamp);
+    // Live: the tick drains it (one commit), nothing is counted.
+    cadence.tick();
+    try testing.expectEqual(@as(u64, 1), store.commits);
+    try testing.expectEqual(@as(u64, 0), fs.pending.len());
+    try testing.expectEqual(failed0, kv_fs.fuse_write_times_drain_failed_ticks.load());
+    try testing.expect(!cadence.failed_named);
+    // FAILED with a refinement parked: one line across 100 ticks, 100
+    // ticks counted, no commit attempted, the refinement still parked.
+    _ = try fs.pending.park(root, stamp + 1, stamp + 1);
+    store.failed = true;
+    log.testing.expectErrorLogs(1);
+    for (0..100) |_| cadence.tick();
+    try log.testing.expectAllFired();
+    try testing.expect(cadence.failed_named);
+    try testing.expectEqual(failed0 + 100, kv_fs.fuse_write_times_drain_failed_ticks.load());
+    try testing.expectEqual(@as(u64, 1), store.commits);
+    try testing.expectEqual(@as(u64, 1), fs.pending.len());
+    // Nothing parked: nothing to drain, nothing counted.
+    _ = fs.pending.retire(root);
+    try testing.expectEqual(@as(u64, 0), fs.pending.len());
+    cadence.tick();
+    try testing.expectEqual(failed0 + 100, kv_fs.fuse_write_times_drain_failed_ticks.load());
 }

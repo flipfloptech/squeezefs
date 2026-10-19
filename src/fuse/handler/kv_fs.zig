@@ -217,6 +217,12 @@ pub var fuse_write_foreign_striped: counters.ShardedCounter = .{};
 /// journaled by the batched drain — instead of committed as a 76 B entry
 /// that cost one grain-aligned window and one device round trip per op.
 pub var fuse_write_times_parked: counters.ShardedCounter = .{};
+/// `fuse_write_times_drain_failed_ticks`: drain cadence ticks met on a
+/// FAILED store (the fail-stop latch): every commit refuses until remount,
+/// so the tick drains nothing and the parked refinements stay fold-visible
+/// for the rest of the mount — the first tick says so once, the rest count
+/// here (`cli/mount.TimesDrainCadence`).
+pub var fuse_write_times_drain_failed_ticks: counters.ShardedCounter = .{};
 /// `fuse_write_size_claims_dropped`: striped writes whose size claim a
 /// size-setting commit (a truncate, an O_TRUNC open) that landed between
 /// the bytes' landing and the postlude made stale — the postlude parked the
@@ -4056,6 +4062,9 @@ pub const MemStore = struct {
     fsyncs: u64 = 0,
     /// Value bytes `lookup` and `range` copied out (a view copies none).
     value_bytes_copied: u64 = 0,
+    /// A real member's fail-stop latch (`journal.FailureLatch`): set,
+    /// `isFailed` says so and every commit refuses as the device would.
+    failed: bool = false,
 
     const Row = struct { kind: u8, k: []u8, v: []u8 };
 
@@ -4138,6 +4147,7 @@ pub const MemStore = struct {
     /// Apply, then drop the guards with the tx (the terminal outcome).
     pub fn commit(self: *MemStore, t: *tx.KvTx) StoreError!void {
         defer self.abandon(t);
+        if (self.failed) return error.Io;
         self.lock.lock();
         defer self.lock.unlock();
         for (t.staged.items) |s| {
@@ -4224,8 +4234,8 @@ pub const MemStore = struct {
         return .{ .total_bytes = 64 << 20, .free_bytes = 48 << 20 };
     }
 
-    pub fn isFailed(_: *const MemStore) bool {
-        return false;
+    pub fn isFailed(self: *const MemStore) bool {
+        return self.failed;
     }
 
     /// Records of one kind (a test's census).

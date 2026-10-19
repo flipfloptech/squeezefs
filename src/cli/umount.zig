@@ -11,14 +11,21 @@
 //!
 //! The daemon is found through the mount's own `.stats` inode (the
 //! `mount` family's `pid`): the one channel that names exactly the process
-//! serving THIS mountpoint. When no daemon answers there (a mount whose
-//! daemon already died, a foreign FUSE mount, a path that is no mount) the
-//! verb falls back LOUD to the external detach — root's `umount2(path, 0)`
-//! with EBUSY retried for one lock-plane tick (`sync/tick.zig`, 2 s: a
-//! caller still returning from its last syscall), anyone else's
-//! `fusermount3 -u` — never a lazy detach by itself: `MNT_DETACH` hides an
-//! owed reply behind a disappearing mountpoint, and the operator asked for
-//! a real unmount.
+//! serving THIS mountpoint. A mount that serves no document under a LIVE
+//! daemon — a FAILED volume whose ops answer EIO, a connection the kernel
+//! ended under it (ENOTCONN; fstests generic/475 under dm-error) — is
+//! found by its PROCESS instead (`daemonByProcess`: the one `squeezefs
+//! mount` whose argv names this mountpoint, its supervisor's seat
+//! excluded) and signalled and awaited the same way: a verb that detached
+//! and returned with the daemon still tearing down handed the next mount a
+//! writer claim its holder had not yet released. When no daemon answers
+//! either way (a mount whose daemon already died, a foreign FUSE mount, a
+//! path that is no mount) the verb falls back LOUD to the external detach
+//! — root's `umount2(path, 0)` with EBUSY retried for one lock-plane tick
+//! (`sync/tick.zig`, 2 s: a caller still returning from its last syscall),
+//! anyone else's `fusermount3 -u` — never a lazy detach by itself:
+//! `MNT_DETACH` hides an owed reply behind a disappearing mountpoint, and
+//! the operator asked for a real unmount.
 //!
 //! BUSY (decision 0003 §S). Before the signal the verb runs the holder
 //! census (`holders.zig`: every process's cwd/root/exe/fds/mappings on the
@@ -114,8 +121,9 @@ pub fn refusalsOf(stats_text: []const u8) u64 {
 
 /// Why the verb fell back to the external detach (each reported by name).
 pub const Fallback = enum {
-    /// `<mountpoint>/.stats` could not be read (no mount, a foreign FUSE
-    /// filesystem, a daemon that died: the connection is aborted).
+    /// `<mountpoint>/.stats` could not be read and no `squeezefs mount`
+    /// process names the path (no mount, a foreign FUSE filesystem, a
+    /// daemon that died: the connection is aborted).
     stats_unreadable,
     /// The document names no daemon pid.
     no_pid,
@@ -125,7 +133,7 @@ pub const Fallback = enum {
 
     pub fn text(self: Fallback) []const u8 {
         return switch (self) {
-            .stats_unreadable => "its .stats inode is unreadable (no squeezefs daemon serves it, or the daemon died)",
+            .stats_unreadable => "its .stats inode is unreadable and no `squeezefs mount` process names it (no squeezefs daemon serves it, or the daemon died)",
             .no_pid => "its .stats names no daemon pid",
             .daemon_gone => "the daemon named by .stats no longer exists",
         };
@@ -160,8 +168,141 @@ pub const Signalled = union(enum) {
     /// KILLS a process without our handler, so the lazy stop is sent only
     /// to a daemon that provably has one — the same build as this verb.
     foreign_build: linux.pid_t,
+    /// `--lazy` on a daemon found by its process: with no `.stats` its
+    /// build cannot be proven, so no SIGUSR2 — and nothing detached from
+    /// under a live daemon (the orderly stop is the way out).
+    build_unknown: linux.pid_t,
     fallback: Fallback,
 };
+
+/// Where the daemon of a mountpoint was found (`locateDaemon`).
+pub const Located = union(enum) {
+    /// The `.stats` document (owned by the caller) and the pid it names.
+    stats: struct { pid: linux.pid_t, text: []u8 },
+    /// No document; the daemon by its process (`daemonByProcess`).
+    process: linux.pid_t,
+    fallback: Fallback,
+};
+
+/// The daemon serving `mountpoint`: by its `.stats` (the channel that
+/// names exactly this mount's process), else by its process (module doc).
+pub fn locateDaemon(gpa: std.mem.Allocator, io: Io, mountpoint: []const u8) Located {
+    if (readStats(gpa, io, mountpoint)) |text| {
+        const pid = daemonPidOf(text) orelse {
+            gpa.free(text);
+            return .{ .fallback = .no_pid };
+        };
+        return .{ .stats = .{ .pid = pid, .text = text } };
+    }
+    if (daemonByProcess(io, mountpoint)) |pid| return .{ .process = pid };
+    return .{ .fallback = .stats_unreadable };
+}
+
+/// A `squeezefs mount` process naming a mountpoint (`daemonByProcess`):
+/// its parent, and whether it has a child of its own (the supervisor's
+/// seat has the daemon — alive, or a zombie it has not reaped yet; a daemon
+/// keeps no child).
+const Candidate = struct { pid: linux.pid_t, ppid: linux.pid_t, has_children: bool = false };
+
+/// At most this many `squeezefs mount` processes naming ONE path are
+/// looked at: the daemon and its supervisor's seat are two; more is a
+/// bring-up racing the stop, which is never a guess.
+const CANDIDATES_MAX = 4;
+
+/// Does a `/proc/<pid>/cmdline` document (NUL-separated argv) run the
+/// mount verb at `mountpoint`? Parsed by the verb's own argument parser, so
+/// every flag shape `squeezefs mount` accepts is read the way it was.
+pub fn cmdlineMounts(cmdline: []const u8, mountpoint: []const u8) bool {
+    var argv: [32][]const u8 = undefined;
+    var n: usize = 0;
+    var words = std.mem.splitScalar(u8, cmdline, 0);
+    while (words.next()) |w| {
+        if (w.len == 0) continue;
+        if (n == argv.len) return false;
+        argv[n] = w;
+        n += 1;
+    }
+    var diag: args.Refusal = undefined;
+    const verb = args.parse(argv[0..n], &diag) catch return false;
+    return switch (verb) {
+        .mount => |m| std.mem.eql(u8, m.mountpoint, mountpoint),
+        else => false,
+    };
+}
+
+/// The one daemon among the processes naming a mountpoint: a candidate
+/// that is another candidate's parent, or has any child, is the
+/// supervisor's seat (the intermediate of the double fork shares the
+/// daemon's argv and holds the daemon as its child — a zombie still, once
+/// the daemon exited and the seat has not reaped it; a TERM would end the
+/// seat by default action) and is dropped; exactly one left is the daemon,
+/// anything else is null.
+pub fn pickDaemon(cands: []const Candidate) ?linux.pid_t {
+    var picked: ?linux.pid_t = null;
+    for (cands) |c| {
+        if (c.has_children or parentAmong(cands, c.pid)) continue;
+        if (picked != null) return null;
+        picked = c.pid;
+    }
+    return picked;
+}
+
+fn parentAmong(cands: []const Candidate, pid: linux.pid_t) bool {
+    for (cands) |c| if (c.ppid == pid) return true;
+    return false;
+}
+
+/// `PPid:\t<n>` out of a `/proc/<pid>/status` document.
+fn parseStatusPpid(text: []const u8) ?linux.pid_t {
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        if (!std.mem.startsWith(u8, line, "PPid:")) continue;
+        const v = std.mem.trim(u8, line["PPid:".len..], " \t\r");
+        return std.fmt.parseInt(linux.pid_t, v, 10) catch null; // decimal, as proc(5) prints it
+    }
+    return null;
+}
+
+/// The daemon of `mountpoint` by its PROCESS, for a mount that serves no
+/// `.stats` document under a live daemon (a FAILED volume whose ops
+/// answer EIO; a connection the kernel ended under it, ENOTCONN): the one
+/// `squeezefs mount` process whose argv names this path (`cmdlineMounts`),
+/// its supervisor's seat excluded (`pickDaemon`). Null when none — a dead
+/// daemon, and the detach is right — or more than one.
+pub fn daemonByProcess(io: Io, mountpoint: []const u8) ?linux.pid_t {
+    var cands: [CANDIDATES_MAX]Candidate = undefined;
+    var n: usize = 0;
+    // Two PATH_MAX paths, the options and the flags fit; a longer argv is
+    // another program's.
+    var cmdline_buf: [16 << 10]u8 = undefined;
+    var proc_dir = Io.Dir.cwd().openDir(io, "/proc", .{ .iterate = true }) catch return null;
+    defer proc_dir.close(io);
+    var it = proc_dir.iterate();
+    while (it.next(io) catch null) |ent| {
+        const pid = std.fmt.parseInt(linux.pid_t, ent.name, 10) catch continue; // a pid directory, decimal
+        if (pid == linux.getpid()) continue;
+        var pb: [64]u8 = undefined;
+        const cmdline_path = std.fmt.bufPrint(&pb, "/proc/{d}/cmdline", .{pid}) catch continue;
+        // A proc file reports size 0, so it is read into a buffer, never
+        // sized by stat (`readFileAlloc` answers it empty); argv past the
+        // buffer is no `squeezefs mount` line.
+        const cmdline = Io.Dir.cwd().readFile(io, cmdline_path, &cmdline_buf) catch continue;
+        if (!cmdlineMounts(cmdline, mountpoint)) continue;
+        if (n == cands.len) return null;
+        var sb: [4096]u8 = undefined;
+        const status_path = std.fmt.bufPrint(&pb, "/proc/{d}/status", .{pid}) catch continue;
+        const status = Io.Dir.cwd().readFile(io, status_path, &sb) catch continue;
+        // `children` (CONFIG_PROC_CHILDREN) lists the pids the task holds,
+        // zombies included; a kernel without it reads as none and the
+        // parent rule alone tells the seat apart.
+        const children_path = std.fmt.bufPrint(&pb, "/proc/{d}/task/{d}/children", .{ pid, pid }) catch continue;
+        var cb: [64]u8 = undefined;
+        const children = Io.Dir.cwd().readFile(io, children_path, &cb) catch "";
+        cands[n] = .{ .pid = pid, .ppid = parseStatusPpid(status) orelse 0, .has_children = std.mem.trim(u8, children, " \n").len != 0 };
+        n += 1;
+    }
+    return pickDaemon(cands[0..n]);
+}
 
 /// Is `pid` alive? A zombie counts as gone (it has run its teardown; the
 /// daemon is not this process's child, so nothing here reaps it) — the
@@ -232,11 +373,26 @@ const Watched = struct {
 /// Signal the daemon serving `mountpoint` (TERM, or USR2 under `lazy`)
 /// and judge the outcome by the order of the kernel's facts (module doc).
 pub fn signalDaemon(gpa: std.mem.Allocator, io: Io, mountpoint: []const u8, lazy: bool, our_commit: []const u8, watched: *const Watched) Signalled {
-    const text = readStats(gpa, io, mountpoint) orelse return .{ .fallback = .stats_unreadable };
-    defer gpa.free(text);
-    const pid = daemonPidOf(text) orelse return .{ .fallback = .no_pid };
-    if (lazy and !std.mem.eql(u8, buildCommitOf(text) orelse "", our_commit)) return .{ .foreign_build = pid };
-    const refusals_before = refusalsOf(text);
+    return signalLocated(gpa, io, mountpoint, lazy, our_commit, watched, locateDaemon(gpa, io, mountpoint));
+}
+
+/// `signalDaemon` over a daemon already located (`run` reports how it was
+/// found before the wait). Takes the document's ownership.
+pub fn signalLocated(gpa: std.mem.Allocator, io: Io, mountpoint: []const u8, lazy: bool, our_commit: []const u8, watched: *const Watched, located: Located) Signalled {
+    // The refusal count the busy re-read compares against; null when the
+    // mount serves no document (then its census' refusal is not readable
+    // either, and the verb's own census already ran).
+    var refusals_before: ?u64 = null;
+    const pid: linux.pid_t = switch (located) {
+        .fallback => |why| return .{ .fallback = why },
+        .process => |pid| if (lazy) return .{ .build_unknown = pid } else pid,
+        .stats => |s| blk: {
+            defer gpa.free(s.text);
+            if (lazy and !std.mem.eql(u8, buildCommitOf(s.text) orelse "", our_commit)) return .{ .foreign_build = s.pid };
+            refusals_before = refusalsOf(s.text);
+            break :blk s.pid;
+        },
+    };
     if (linux.errno(linux.kill(pid, if (lazy) .USR2 else .TERM)) != .SUCCESS) return .{ .fallback = .daemon_gone };
     const deadline = clock.monotonicNs() + DAEMON_EXIT_WAIT_NS;
     var detached = false;
@@ -258,10 +414,10 @@ pub fn signalDaemon(gpa: std.mem.Allocator, io: Io, mountpoint: []const u8, lazy
             if (lazy and polls % STATS_POLL_EVERY == 0 and watched.census(pid).busy()) return .{ .detached_held = pid };
         } else if (!lazy and polls % STATS_POLL_EVERY == 0) {
             // Still attached and serving: did the daemon's census refuse?
-            if (readStats(gpa, io, mountpoint)) |now_text| {
+            if (refusals_before) |before| if (readStats(gpa, io, mountpoint)) |now_text| {
                 defer gpa.free(now_text);
-                if (refusalsOf(now_text) > refusals_before) return .{ .busy = pid };
-            }
+                if (refusalsOf(now_text) > before) return .{ .busy = pid };
+            };
         }
         if (clock.monotonicNs() >= deadline) return .{ .still_alive = pid };
         io.sleep(.fromNanoseconds(EXIT_POLL_NS), .awake) catch {};
@@ -319,7 +475,9 @@ pub fn run(p: cli.Process, u: args.Umount) u8 {
         const c = watched.census(0);
         if (c.busy()) return refuseBusy(p, path, c);
     }
-    switch (signalDaemon(p.gpa, p.io, path, u.lazy, p.build.commit, &watched)) {
+    const located = locateDaemon(p.gpa, p.io, path);
+    if (located == .process) p.stderr.print("squeezefs umount: {s}: its .stats inode is unreadable (its volume is FAILED, or the kernel ended its connection) but daemon {d} still serves it — signalling it and waiting for its exit\n", .{ path, located.process }) catch {};
+    switch (signalLocated(p.gpa, p.io, path, u.lazy, p.build.commit, &watched, located)) {
         .exited => |pid| {
             if (!isFuseMount(p.io, p.gpa, path)) return cli.exit_ok;
             // A successor mounted over the path after ours left: not ours
@@ -343,6 +501,10 @@ pub fn run(p: cli.Process, u: args.Umount) u8 {
         },
         .foreign_build => |pid| {
             p.stderr.print("squeezefs umount: daemon {d} at {s} is another build than this verb — the lazy stop (SIGUSR2) is sent only to a daemon known to handle it; `squeezefs umount {s}` (the orderly stop) works across builds\n", .{ pid, path, path }) catch {};
+            return cli.exit_failed;
+        },
+        .build_unknown => |pid| {
+            p.stderr.print("squeezefs umount: daemon {d} at {s} serves no .stats (its volume is FAILED, or the kernel ended its connection), so its build cannot be proven — the lazy stop (SIGUSR2) is sent only to a daemon known to handle it; nothing detached from under it: `squeezefs umount {s}` (the orderly stop) signals it and waits for its exit\n", .{ pid, path, path }) catch {};
             return cli.exit_failed;
         },
         .fallback => |why| {
@@ -410,6 +572,113 @@ test "a directory that is no mount: no daemon to signal (.stats unreadable), not
     const e = umountAsRoot(dir);
     try testing.expectEqual(linux.E.INVAL, e);
     try testing.expectEqual(error.InvalidArgument, errors.fromErrno(e));
+}
+
+test "the process census: a cmdline is the daemon's iff the mount verb's parser reads it as a mount of exactly this path; among the candidates a parent of another is the supervisor's seat, one left is the daemon, two unrelated are never a guess" {
+    const line = "squeezefs\x00mount\x00--daemon\x00--log-file\x00/var/log/sqz.log\x00-o\x00default_permissions,allow_other\x00sqmeta:///dev/mapper/meta\x00/mnt/scratch\x00";
+    try testing.expect(cmdlineMounts(line, "/mnt/scratch"));
+    try testing.expect(!cmdlineMounts(line, "/mnt/scratch2"));
+    try testing.expect(!cmdlineMounts(line, "/mnt"));
+    try testing.expect(!cmdlineMounts("squeezefs\x00umount\x00/mnt/scratch\x00", "/mnt/scratch"));
+    try testing.expect(!cmdlineMounts("squeezefs\x00mount\x00/mnt/scratch\x00", "/mnt/scratch"));
+    try testing.expect(!cmdlineMounts("", "/mnt/scratch"));
+    try testing.expectEqual(@as(?linux.pid_t, 41), parseStatusPpid("Name:\tsqueezefs\nState:\tS (sleeping)\nTgid:\t42\nPid:\t42\nPPid:\t41\n"));
+    try testing.expectEqual(@as(?linux.pid_t, null), parseStatusPpid("Name:\tsqueezefs\n"));
+    try testing.expectEqual(@as(?linux.pid_t, null), pickDaemon(&.{}));
+    try testing.expectEqual(@as(?linux.pid_t, 42), pickDaemon(&.{.{ .pid = 42, .ppid = 1 }}));
+    // The supervisor's seat (the daemon's parent, the same argv) is dropped.
+    try testing.expectEqual(@as(?linux.pid_t, 42), pickDaemon(&.{ .{ .pid = 41, .ppid = 1 }, .{ .pid = 42, .ppid = 41 } }));
+    try testing.expectEqual(@as(?linux.pid_t, 42), pickDaemon(&.{ .{ .pid = 42, .ppid = 41 }, .{ .pid = 41, .ppid = 1 } }));
+    try testing.expectEqual(@as(?linux.pid_t, 42), pickDaemon(&.{ .{ .pid = 41, .ppid = 1, .has_children = true }, .{ .pid = 42, .ppid = 41 } }));
+    // The seat alone — its daemon exited and sits unreaped as its zombie
+    // child (no argv of its own): nobody to signal, never the seat.
+    try testing.expectEqual(@as(?linux.pid_t, null), pickDaemon(&.{.{ .pid = 41, .ppid = 1, .has_children = true }}));
+    // Two daemons naming one path (a bring-up racing the stop): no guess.
+    try testing.expectEqual(@as(?linux.pid_t, null), pickDaemon(&.{ .{ .pid = 42, .ppid = 1 }, .{ .pid = 52, .ppid = 1 } }));
+    try testing.expectEqual(@as(?linux.pid_t, null), pickDaemon(&.{ .{ .pid = 41, .ppid = 1 }, .{ .pid = 42, .ppid = 41 }, .{ .pid = 52, .ppid = 41 } }));
+}
+
+/// The stand-in daemon of the process-census test: `/bin/sh` exec'd under
+/// the daemon's own argv (`squeezefs mount … <dir>`), running the script
+/// `mount` in `dir` (a shell's command file is its first word), which
+/// names its pid on stdout and parks on stdin — so `/proc/<pid>/cmdline`
+/// is a daemon's line without a mount.
+fn standInDaemon(dir: [*:0]const u8, out_fd: linux.fd_t, in_fd: linux.fd_t) noreturn {
+    _ = linux.chdir(dir);
+    _ = linux.dup2(in_fd, 0);
+    _ = linux.dup2(out_fd, 1);
+    const argv = [_:null]?[*:0]const u8{ "squeezefs", "mount", "--daemon", "--log-file", "/l", "-o", "rw", "sqmeta:///dev/x", dir };
+    const envp = [_:null]?[*:0]const u8{};
+    _ = linux.execve("/bin/sh", &argv, &envp);
+    linux.exit(127);
+}
+
+test "a mount serving no .stats under a LIVE daemon (a FAILED volume's EIO; a connection the kernel ended — fstests generic/475's soak loop, where the verb detached and returned with the daemon still tearing down and the next mount met its claim): the verb finds the daemon by its process — the supervisor's seat sharing the argv excluded — signals it and waits for its exit; `--lazy` refuses with the build unknown and signals nothing; a path no process names keeps the stats_unreadable fallback" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+    _ = linux.mkdir("/build/tmp", 0o755);
+    var pb: [64]u8 = undefined;
+    const dir = try std.fmt.bufPrint(&pb, "/build/tmp/failed-mount-{d}", .{linux.getpid()});
+    var zb: [64:0]u8 = undefined;
+    const dirz = try std.fmt.bufPrintSentinel(&zb, "{s}", .{dir}, 0);
+    _ = linux.mkdir(dirz.ptr, 0o755);
+    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
+    var sp: [96]u8 = undefined;
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fmt.bufPrint(&sp, "{s}/mount", .{dir}), .data = "echo $$\nread x\n" });
+    var ready: [2]linux.fd_t = undefined;
+    var park: [2]linux.fd_t = undefined;
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.pipe2(&ready, .{ .CLOEXEC = true })));
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.pipe2(&park, .{ .CLOEXEC = true })));
+    // The supervisor's seat forks the daemon, then takes the same argv.
+    const rc = linux.fork();
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(rc));
+    if (rc == 0) {
+        if (linux.fork() == 0) standInDaemon(dirz.ptr, ready[1], park[0]);
+        standInDaemon(dirz.ptr, ready[1], park[0]);
+    }
+    const seat: linux.pid_t = @intCast(rc);
+    _ = linux.close(ready[1]);
+    _ = linux.close(park[0]);
+    defer {
+        // The seat leaves at EOF; its zombie child goes to init with it.
+        _ = linux.close(park[1]);
+        var status: i32 = 0;
+        _ = linux.waitpid(seat, &status, 0);
+    }
+    // Two pid lines, either order; the one that is not the seat is the daemon.
+    var lines: [64]u8 = undefined;
+    var got: usize = 0;
+    while (std.mem.count(u8, lines[0..got], "\n") < 2) {
+        const n = linux.read(ready[0], lines[got..].ptr, lines.len - got);
+        if (linux.errno(n) != .SUCCESS or n == 0) break;
+        got += n;
+    }
+    _ = linux.close(ready[0]);
+    var daemon: ?linux.pid_t = null;
+    var it = std.mem.tokenizeScalar(u8, lines[0..got], '\n');
+    while (it.next()) |l| {
+        const pid = try std.fmt.parseInt(linux.pid_t, l, 10);
+        if (pid != seat) daemon = pid;
+    }
+    try testing.expect(daemon != null);
+    var watched = Watched.init(gpa, io, dir);
+    defer watched.deinit();
+    try testing.expect(watched.target == null);
+    try testing.expectEqual(daemon, daemonByProcess(io, dir));
+    try testing.expectEqual(@as(?linux.pid_t, null), daemonByProcess(io, "/build/tmp/no-process-mounts-this"));
+    try testing.expectEqual(Located{ .process = daemon.? }, locateDaemon(gpa, io, dir));
+    try testing.expectEqual(Signalled{ .fallback = .stats_unreadable }, signalDaemon(gpa, io, "/build/tmp/no-process-mounts-this", false, "", &watched));
+    // --lazy: no document, no proof of the build, no SIGUSR2 — the daemon lives on.
+    try testing.expectEqual(Signalled{ .build_unknown = daemon.? }, signalDaemon(gpa, io, dir, true, "", &watched));
+    try testing.expect(alive(io, daemon.?));
+    // The orderly stop: TERM ends the stand-in (its default action) and the
+    // verdict waits for that exit — the daemon's, never the seat's.
+    try testing.expectEqual(Signalled{ .exited = daemon.? }, signalDaemon(gpa, io, dir, false, "", &watched));
+    try testing.expect(!alive(io, daemon.?));
+    try testing.expect(alive(io, seat));
+    // (The seat left alone with its daemon as an unreaped zombie — the
+    // supervisor between the daemon's exit and its next probe — is the
+    // pure census' row above: a shell seat reaps at once and cannot stage it.)
 }
 
 test "a .stats document naming a dead pid falls back as `daemon_gone`" {

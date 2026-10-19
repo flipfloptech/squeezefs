@@ -33,8 +33,8 @@ drain). (3) Three RAM lookups a striped write paid for nothing: the staged arm's
 read) only for a non-striped file; the ENOSPC prelude's custody probe (a map lookup per block) only
 once fresh supply is exhausted; `holderOf` skips its spinlock while `learnt` is empty (`learnt_n`,
 mirrored under the lock — a reader racing a `learn` reads as if it ran just before it). (4)
-`SQUEEZEFS_FUSE_WRITE_OWN_DEPTH` (default 0 = unbounded): past this many live handlers on the lane a
-held write takes the CPU's lane (`transport_write_spills`) — see the trade below. Tried and dropped:
+`SQUEEZEFS_FUSE_WRITE_OWN_DEPTH` (default 8): past this many live handlers on the lane a held write
+takes the CPU's lane (`transport_write_spills`) — the ruling and the trade below. Tried and dropped:
 batching the lane's ready fibers with a submit between batches (passes per request did not move).
 
 **Red → green.** `session` e2e "a HELD write's handler runs on the thread that delivered it": 16 held
@@ -44,8 +44,19 @@ nothing `own` and writes wakes (red before: `onWorker` false at the first write)
 anonymous concurrent spawned from a fiber on a DRIVEN lane lands on a threaded lane" (red: `expected 0,
 found 1`). The dispatch-law row pins the write arm. `worker_pass_model`'s park law is unchanged.
 
-**A/B.** Series 1 (changes 1 + 3 on 887c334, full matrix) and series 3 (the rebased branch ec9e995 on
-`dev` c28babc with levers (a) and (b) landed; the write rows):
+**A/B, the shipped default** (depth 8; series 4: legs A7 B7 B8 A8 on the 4k randwrite rows, A =
+`dev` acc4b55, B = 46a49a6 — the branch rebased on it):
+
+| row | A legs 1/4 | B legs 2/3 | A mean | B mean | B ÷ A | p50 A → B µs | daemon cores A → B (`ur`/`ln`) |
+|---|---|---|---|---|---|---|---|
+| 4k randwrite QD1 | 45.9 k / 41.0 k | 96.9 k / 82.1 k | 43.4 k | 89.5 k | **2.06** | 18.8 → 9.8 | 0.84 → 0.68 (0.46/0.37 → 0.67/0) |
+| 4k randwrite QD32×1 | 241.3 k / 212.0 k | 231.3 k / 219.9 k | 226.7 k | 225.6 k | **1.00** | 130 → 134 | 1.99 → 1.81 (0.94/1.04 → 1.00/0.79) |
+| 4k randwrite QD32×4 | 404.9 k / 416.0 k | 424.7 k / 419.5 k | 410.4 k | 422.1 k | **1.03** | 272 → 285 | 7.46 → 7.05 (3.23/4.20 → 3.98/3.05) |
+
+Series 2 (depth 8 on 887c334, the full matrix) read the same: QD1 2.08×, QD32×1 0.99×, QD32×4 1.06×
+at 7.42 → 7.06 cores, 64k randwrite 0.96× (3 % spread), reads 1.07–1.27× (A legs 16–39 % spreads),
+sequential rows within noise. **The all-own arm (depth 0)** — series 1 (changes 1 + 3 on 887c334, the
+full matrix) and series 3 (the branch rebased on c28babc with levers (a) and (b) landed; the write rows):
 
 | row | A mean (series 1 / 3) | B mean | B ÷ A | p50 A → B µs | daemon cores A → B (`ur`/`ln`) |
 |---|---|---|---|---|---|
@@ -59,17 +70,18 @@ found 1`). The dispatch-law row pins the write arm. `worker_pass_model`'s park l
 
 Series 1's remaining rows: 64k randread 0.96, seq read 0.92–0.94 (2–4 % spreads, the reads are
 untouched), seq writes bimodal on the pre-(b) tree independent of the binary (`dev` itself read 2,195
-/ 3,563 / 7,154 on sw4m across legs). Series 2 (the spill arm at depth 8, 1106101 on 887c334): QD1
-2.08×, QD32×1 0.99×, QD32×4 1.06× at 7.42 → 7.06 cores, 64k 0.96×. A depth sweep on one leg each:
-depth 16 spills 44–48 % at QD32 (QD32×1 219 k at 1.54 cores, QD32×4 371 k at 6.07).
+/ 3,563 / 7,154 on sw4m across legs). The depth sweep (one leg each, 9696e5a): depth 16 spills 44–48 %
+at QD32 — QD32×1 219 k at 1.54 cores, QD32×4 371 k at 6.07; depth 8 spills 70 %; depth 0 none.
 
-**The trade, and what remains.** The kernel queues a request on the submitter's CPU's FUSE queue, so
-ONE io_uring thread's whole depth lands on ONE queue: all-own makes that queue's worker its one
-saturated CPU (≈ 6 µs of worker time per write; `daemon_cores` ≡ 1.0 at QD32×1) where the two-thread
-arm had two — the 0.78× row — while every many-submitter row gains at half the CPU (18.5 → 9 µs per
-write at QD32×4). The default is all-own (the lever's target: CPU per write and the 32-core bar's
-shape); the knob is the owner's dial for the single-submitter shape, and lever 5 (N workers per
-queue, §AB.6) its real cure. The write handler is now ≈ 6 µs of worker CPU, all RAM: `readInodeOpt`
+**The trade, the ruling, and what remains.** The kernel queues a request on the submitter's CPU's
+FUSE queue, so ONE io_uring thread's whole depth lands on ONE queue: all-own makes that queue's worker
+its one saturated CPU (≈ 6 µs of worker time per write; `daemon_cores` ≡ 1.0 at QD32×1) where the
+two-thread arm had two — the 0.76–0.78× row — while every many-submitter row gains at half the CPU
+(18.5 → 9 µs per write at QD32×4). **Ruling (the orchestrator, 2026-10-19, under the charter's "a
+regression is a defect" and the owner's "performance first"): the default is 8, the measured knee** —
+QD1 2.06×, QD32×1 1.00×, QD32×4 1.03× at 0.95× the cores; all-own (0) becomes the default once lever
+5 (N workers per kernel queue, §AB.6) removes the one-queue saturation, and the dispatch-law row pins
+the default until then. The write handler is now ≈ 6 µs of worker CPU, all RAM: `readInodeOpt`
 (the probe and the postlude's re-read under the shared guard), `mapLookup` (the prelude's and
 `beginInPlace`'s), per lookup the route table's arc-swap RMW pair (`MetaSet.volumeOfSlot`, 4.8 % self —
 a shared-line RMW on the hot path; a lock-free-core change with its model) and `homeOf`. With lever

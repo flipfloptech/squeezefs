@@ -33,6 +33,7 @@ const builtin = @import("builtin");
 const linux = std.os.linux;
 const Io = std.Io;
 const fuzzkit = @import("../core/fuzzkit.zig");
+const log = @import("../core/log.zig");
 const testkit = @import("../core/testkit.zig");
 const mountinfo = @import("../core/mountinfo.zig");
 
@@ -48,8 +49,10 @@ pub const MAX_NAMED: usize = 8;
 /// `/proc/<pid>/comm` is `TASK_COMM_LEN` (16) bytes with its NUL.
 pub const COMM_MAX: usize = 16;
 
-/// A process's `maps` beyond this is read no further: 16 MiB is ~200k
-/// mappings, past any process that is not itself a fault.
+/// A process's `maps` beyond this is read no further (a warning names
+/// it): 16 MiB is ~200k mappings — the default `vm.max_map_count` is
+/// 65530 at ~150 bytes a line — past any process that is not itself a
+/// fault.
 pub const MAPS_READ_LIMIT: Io.Limit = .limited(16 << 20);
 
 pub const Via = enum {
@@ -196,6 +199,19 @@ fn linkMountId(link: [*:0]const u8) ?u64 {
     return st.mnt_id;
 }
 
+/// A proc file whole (owned). It reports size 0, so it is read until EOF,
+/// never sized by stat (`readFileAlloc` answers it empty); `StreamTooLong`
+/// at `limit`.
+fn readProcFileAlloc(gpa: std.mem.Allocator, io: Io, path: []const u8, limit: Io.Limit) ![]u8 {
+    var file = try Io.Dir.cwd().openFile(io, path, .{});
+    defer file.close(io);
+    var reader = file.readerStreaming(io, &.{});
+    return reader.interface.allocRemaining(gpa, limit) catch |e| switch (e) {
+        error.ReadFailed => return reader.err.?,
+        error.OutOfMemory, error.StreamTooLong => |x| return x,
+    };
+}
+
 fn readComm(io: Io, pid: linux.pid_t, h: *Holder) void {
     var pb: [48]u8 = undefined;
     var buf: [COMM_MAX + 1]u8 = undefined;
@@ -238,7 +254,12 @@ fn processHolds(gpa: std.mem.Allocator, io: Io, pid: linux.pid_t, target: Target
     // Mappings by device number.
     {
         const maps = std.fmt.bufPrint(&pb, "/proc/{d}/maps", .{pid}) catch return null;
-        const text = Io.Dir.cwd().readFileAlloc(io, maps, gpa, MAPS_READ_LIMIT) catch return null;
+        const text = readProcFileAlloc(gpa, io, maps, MAPS_READ_LIMIT) catch |e| {
+            // Past the cap the mappings go unjudged: said, never silent
+            // (the kernel's umount2 still answers EBUSY for them).
+            if (e == error.StreamTooLong) log.warn("holders: /proc/{d}/maps exceeds {d} bytes; its mappings are not judged", .{ pid, MAPS_READ_LIMIT.toInt().? });
+            return null;
+        };
         defer gpa.free(text);
         var lines = std.mem.splitScalar(u8, text, '\n');
         while (lines.next()) |line| {
@@ -352,6 +373,18 @@ test "fuzz: the fdinfo and maps line parsers are total on arbitrary text" {
     try fuzzkit.fuzz({}, linesFuzz, .{ .corpus = &.{ fuzzkit.slice("mnt_id:\t45\n"), fuzzkit.slice("ino:\t18446744069414584320\n"), fuzzkit.slice("a-b r-xp 0 00:2f 1 /x") } });
 }
 
+test "a proc file is read to EOF, not to its stat size (0): /proc/self/maps comes back whole; the cap is StreamTooLong, never a short read" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+    const whole = try readProcFileAlloc(gpa, io, "/proc/self/maps", MAPS_READ_LIMIT);
+    defer gpa.free(whole);
+    // The main thread's stack is among the last lines, far past the first
+    // read's chunk; a complete last record ends the text.
+    try testing.expect(std.mem.indexOf(u8, whole, "[stack]") != null);
+    try testing.expect(std.mem.endsWith(u8, whole, "\n"));
+    try testing.expectError(error.StreamTooLong, readProcFileAlloc(gpa, io, "/proc/self/maps", .limited(64)));
+}
+
 /// The exemption row's inode (its predicate is a plain function pointer).
 var exempt_ino_for_test: u64 = 0;
 
@@ -462,4 +495,77 @@ test "the census over a real mount: a child whose cwd is a tmpfs we mount is fou
     }
     try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.umount2(mp.ptr, 0)));
     try testing.expect(censusAt(gpa, io, mp, &.{}, null) == null);
+}
+
+test "the census over a real mount: a child holding ONLY a mapping of a file on a tmpfs we mount (no fd on it, cwd elsewhere) is found by mmap — /proc/<pid>/maps reports size 0 and must be read to EOF; after it dies nobody holds it" {
+    if (linux.geteuid() != 0) return testkit.skip(@src(), .no_root, "mount(2) of a tmpfs needs root");
+    const io = testing.io;
+    const gpa = testing.allocator;
+    _ = linux.mkdir("/build/tmp", 0o755);
+    var pb: [64:0]u8 = undefined;
+    const mp = try std.fmt.bufPrintSentinel(&pb, "/build/tmp/holders-map-{d}", .{linux.getpid()}, 0);
+    _ = linux.mkdir(mp.ptr, 0o755);
+    defer _ = linux.rmdir(mp.ptr);
+    if (linux.errno(linux.mount("tmpfs", mp.ptr, "tmpfs", 0, 0)) != .SUCCESS) return testkit.skip(@src(), .no_cap, "mount(2) of a tmpfs refused (CAP_SYS_ADMIN)");
+    defer _ = linux.umount2(mp.ptr, linux.MNT.DETACH);
+    const self_pid = linux.getpid();
+    // One page of a file on it, nothing open by the time the census runs.
+    var fb: [96:0]u8 = undefined;
+    const fpath = try std.fmt.bufPrintSentinel(&fb, "{s}/f", .{mp}, 0);
+    {
+        const frc = linux.open(fpath.ptr, .{ .ACCMODE = .RDWR, .CREAT = true, .CLOEXEC = true }, 0o600);
+        try testing.expectEqual(linux.E.SUCCESS, linux.errno(frc));
+        try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.ftruncate(@intCast(frc), 4096)));
+        _ = linux.close(@intCast(frc));
+    }
+    var fds: [2]linux.fd_t = undefined;
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.pipe2(&fds, .{ .CLOEXEC = true })));
+    var done: [2]linux.fd_t = undefined;
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.pipe2(&done, .{ .CLOEXEC = true })));
+    const rc = linux.fork();
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(rc));
+    if (rc == 0) {
+        // As the cwd test's child: drop the unused pipe ends, dumpable again
+        // (`maps` of a non-dumpable task needs CAP_SYS_PTRACE). Map the
+        // file, then CLOSE its fd: the mapping alone holds the mount.
+        _ = linux.close(fds[0]);
+        _ = linux.close(done[1]);
+        _ = linux.prctl(@backingInt(linux.PR.SET_DUMPABLE), 1, 0, 0, 0);
+        var one: u8 = 1;
+        const frc = linux.open(fpath.ptr, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+        if (linux.errno(frc) != .SUCCESS) linux.exit(2);
+        const m = linux.mmap(null, 4096, .{ .READ = true }, .{ .TYPE = .SHARED }, @intCast(frc), 0);
+        if (linux.errno(m) != .SUCCESS) linux.exit(3);
+        _ = linux.close(@intCast(frc));
+        _ = linux.write(fds[1], @ptrCast(&one), 1);
+        _ = linux.close(fds[1]);
+        _ = linux.read(done[0], @ptrCast(&one), 1);
+        linux.exit(0);
+    }
+    const child: linux.pid_t = @intCast(rc);
+    _ = linux.close(fds[1]);
+    var byte: u8 = 0;
+    _ = linux.read(fds[0], @ptrCast(&byte), 1);
+    _ = linux.close(fds[0]);
+    {
+        const c = censusAt(gpa, io, mp, &.{self_pid}, null).?;
+        try testing.expectEqual(linux.E.BUSY, linux.errno(linux.umount2(mp.ptr, 0)));
+        try testing.expectEqual(@as(usize, 1), c.total);
+        try testing.expectEqual(child, c.named[0].pid);
+        try testing.expectEqual(Via.map, c.named[0].via);
+        var buf: [256]u8 = undefined;
+        var w: Io.Writer = .fixed(&buf);
+        try c.format(&w);
+        try testing.expect(std.mem.indexOf(u8, w.buffered(), ") mmap") != null);
+    }
+    _ = linux.close(done[1]);
+    _ = linux.close(done[0]);
+    var status: i32 = 0;
+    _ = linux.waitpid(child, &status, 0);
+    try testing.expectEqual(@as(i32, 0), status);
+    {
+        const c = censusAt(gpa, io, mp, &.{self_pid}, null).?;
+        try testing.expectEqual(@as(usize, 0), c.total);
+    }
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.umount2(mp.ptr, 0)));
 }

@@ -8,6 +8,9 @@
 # its busiest thread classes (cores, the busiest thread's %). .stats snapshots and the fio JSON land
 # in $OUT/<label>/.
 #   MX_ROWS     regex over row names (default all)     MX_SIZE  per-job region (3g)
+#   MX_COOL_C   wait before each row until the CPU package (k10temp Tctl) is at or below this
+#               many °C (default 70), at most MX_COOL_MAX_S seconds (default 180): the owner found a
+#               thermal throttle skewing rows (2026-10-19); each row records Tctl at its start and end
 #   MX_RUNTIME  seconds per row (30)                   MX_OUT   results root (/build/perf/mx)
 #   MX_DEVS     block devices whose diskstats count (default: the device, the mount's source, or
 #                   a perf_mount.sh set's targets)
@@ -84,9 +87,9 @@ EOF
 # One summary line from the fio JSON, the CPU snapshots taken inside the steady state (m0 at +2 s, m1
 # 2 s before the end) and the device snapshots around the whole row and its settle (s0, s1).
 summarize() {
-  python3 - "$O/$1.json" "$O/$1.m0" "$O/$1.m1" "$O/$1.s0" "$O/$1.s1" "$L" "$1" <<'EOF'
+  python3 - "$O/$1.json" "$O/$1.m0" "$O/$1.m1" "$O/$1.s0" "$O/$1.s1" "$L" "$1" "$2" "$3" <<'EOF'
 import json, os, re, sys, collections
-fj, a, b, fa, fb, label, row = sys.argv[1:]
+fj, a, b, fa, fb, label, row, tc0, tc1 = sys.argv[1:]
 j = json.load(open(fj))["jobs"][0]
 a, b, fa, fb = (json.load(open(x)) for x in (a, b, fa, fb))
 hz = os.sysconf("SC_CLK_TCK"); wall = b["t"] - a["t"]
@@ -112,7 +115,7 @@ if b["tasks"]:
     dcores = "%.2f" % tot_t
     top = " ".join("%s:%.2f(%d%%)" % (k, v[0], 100 * v[1]) for k, v in sorted(cls.items(), key=lambda kv: -kv[1][0])[:5])
 line = "\t".join([label, row, "%.0f" % iops, "%.1f" % mib, "%.1f" % p50, "%.1f" % p99,
-                  "%.0f" % (j["usr_cpu"] + j["sys_cpu"]), "%.2f" % host, dcores, amp, top])
+                  "%.0f" % (j["usr_cpu"] + j["sys_cpu"]), "%.2f" % host, dcores, amp, top, "%s>%s" % (tc0, tc1)])
 print(line)
 open(os.path.join(os.path.dirname(os.path.dirname(fj)), "results.tsv"), "a").write(line + "\n")
 EOF
@@ -128,6 +131,15 @@ settle() {   # a SqueezeFS mount: the write custody drained (owed and parked bot
   echo "matrix: write custody not drained after 10 s" >&2
 }
 
+TCTL=$(for h in /sys/class/hwmon/hwmon*; do [ "$(cat "$h/name" 2>/dev/null)" = k10temp ] && echo "$h/temp1_input"; done | head -1)
+tctl() { if [ -n "$TCTL" ]; then echo $(( $(cat "$TCTL") / 1000 )); else echo -; fi; }
+cool() {   # thermal: a row starts only once the package is at or below MX_COOL_C (bounded by MX_COOL_MAX_S)
+  [ -n "$TCTL" ] || return 0
+  local lim=${MX_COOL_C:-70} max=${MX_COOL_MAX_S:-180} w=0
+  while [ "$(tctl)" -gt "$lim" ] && [ $w -lt "$max" ]; do sleep 5; w=$((w + 5)); done
+  if [ $w -gt 0 ]; then echo "matrix: $L waited $w s for the package to cool to $(tctl) °C before $1" >&2; fi
+}
+
 profile() {   # $1 row: 10 s of system-wide stacks mid-row
   local r=$1
   sleep $((RT / 3))
@@ -141,15 +153,17 @@ profile() {   # $1 row: 10 s of system-wide stacks mid-row
 }
 
 if [ "${MX_LAYDOWN:-1}" = 1 ]; then
+  cool "the lay-down"
   fio --name=mx --rw=write --bs=1m --iodepth=16 --numjobs=4 "${common[@]}" "${where[@]}" --output="$O/laydown.json"
   settle
   echo "matrix: $L lay-down 4 × $S done ($(python3 -c 'import json,sys; j=json.load(open(sys.argv[1]))["jobs"][0]; print("%.0f MiB/s" % (j["write"]["bw_bytes"] / 2**20))' "$O/laydown.json"))"
 fi
-echo -e "label\trow\tIOPS\tMiB/s\tp50us\tp99us\tfio%\thost_cores\tdaemon_cores\tdev/user\tthreads"
+echo -e "label\trow\tIOPS\tMiB/s\tp50us\tp99us\tfio%\thost_cores\tdaemon_cores\tdev/user\tthreads\ttctl_c"
 while read -r name rw bs qd nj; do
   [[ $name =~ $ROWS ]] || continue
   extra=(--randrepeat=0 --norandommap)
   case $rw in *write) extra+=(--end_fsync=1) ;; esac
+  cool "$name"; tc0=$(tctl)
   # (cat, not cp: the virtual .stats has no size for cp's copy_file_range path to trust.)
   [ -n "$pid" ] && cat "$T/.stats" > "$O/$name.stats0.json"
   snap "$O/$name.s0"
@@ -164,5 +178,6 @@ while read -r name rw bs qd nj; do
   settle
   snap "$O/$name.s1"
   [ -n "$pid" ] && cat "$T/.stats" > "$O/$name.stats1.json"
-  summarize "$name"
+  tc1=$(tctl)
+  summarize "$name" "$tc0" "$tc1"
 done <<< "$ROWTAB"

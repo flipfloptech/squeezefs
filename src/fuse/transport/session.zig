@@ -3739,14 +3739,13 @@ fn waitParkedLookups(rig: *Rig, n: u32) !void {
     try testing.expectEqual(n, rig.fs.parked_lookups.load(.monotonic));
 }
 
-test "e2e rings per queue (series patch 0030): the FEATURES probe reads RINGS_PER_QUEUE present, under SQUEEZEFS_FUSE_RINGS_PER_QUEUE=2 the session registers TWO rings on every queue (ceil(depth/2) + the rest, both workers named sqz-fuse-ur<qid>), and `depth` requests from one CPU fill both rings' entries — each ring owes exactly its share; the control arm (SQUEEZEFS_FUSE_RINGS_PER_QUEUE=1) owes the whole depth on its one ring; .stats carries fuse_uring_rings_per_queue" {
+test "e2e rings per queue (series patch 0030): the FEATURES probe reads RINGS_PER_QUEUE present, the session registers TWO rings on every queue (ceil(depth/2) + the rest, both workers named sqz-fuse-ur<qid>), and `depth` requests from one CPU fill both rings' entries — each ring owes exactly its share; the control arm (SQUEEZEFS_FUSE_RINGS_PER_QUEUE=1) owes the whole depth on its one ring; .stats carries fuse_uring_rings_per_queue" {
     if (venueMissing()) |why| return testkit.skipWhy(@src(), why);
     var kb: [192]u8 = undefined;
     if (kmbufMissing(&kb)) |why| return testkit.skipWhy(@src(), why);
     const cpu = firstAllowedCpu();
     {
-        // The lever set: two rings are the A/B arm until the two-ring daemon holds the gate (geometry.ringsPerQueue).
-        const rig = try Rig.init(testing.allocator, 46, &.{.{ "SQUEEZEFS_FUSE_RINGS_PER_QUEUE", "2" }});
+        const rig = try Rig.init(testing.allocator, 46, &.{});
         defer rig.deinit();
         const s = try rig.mountIt(.{ .mem_budget_bytes = 0 });
         try testing.expectEqual(geometry.BufferMode.zero_copy, s.mode);

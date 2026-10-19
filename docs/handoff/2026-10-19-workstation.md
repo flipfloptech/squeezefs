@@ -1,6 +1,6 @@
 # Handoff — 2026-10-19: the first local performance wave
 
-**Checkpoint:** `dev` at the commit that adds this note (first on `8c1aa86`, amended on `039ae68`); everything pushed. The
+**Checkpoint:** `dev` at the commit that adds this note (first on `8c1aa86`, amended on `c533315`); everything pushed. The
 2026-10-18 note holds the release sequence, the owed lists, the rulings and the venue plan; this one
 adds the day's performance work. Venue: this host (`SQZ_VENUE=local`).
 
@@ -38,10 +38,12 @@ bandwidth bars cleared on the RAM substrate; write IOPS at 59 % of its bar is th
   QD32×1 even with two rings (a half-loaded worker parks per CQE). `SQUEEZEFS_FABRIC_IOPOLICY`
   round-robin (10-18). Pools register with the memory budget (the publish and transform scratch
   pools do now; the zstd codec pool is owed).
-- Two rings per queue ship as the derived default although the 4k randwrite QD32×4 row lost 15 %:
-  no regression-free setting captures any of the read gain (1.43× / 1.73×, the §1.4 read bar), the
-  mechanism is named, and `SQUEEZEFS_FUSE_RINGS_PER_QUEUE=1` is the one-line return. Owner may
-  overrule.
+- Two rings per queue were landed as the derived default (the read gain 1.43× / 1.73× clears the
+  §1.4 read bar; the 4k randwrite QD32×4 row −15 % flagged) and **taken back to one ring the same
+  evening** (`c533315`): the train on `039ae68` ran 3 reds in 7 — THE KILL MATRIX twice with a
+  lookup/create parked > 5 s at the metadata backend, lever (a)'s lane-park unit test once — where
+  every one-ring head was 3/3. Two rings are the A/B lever `SQUEEZEFS_FUSE_RINGS_PER_QUEUE=2` until
+  the stall and the write row are fixed (an agent has both); then the derivation flips back.
 - A wedge or panic found by a perf session is fixed or reverted before anything else lands (the
   fsync route was reverted within the hour and re-landed with its gate row; the overlay panic got
   its model).
@@ -64,8 +66,10 @@ bandwidth bars cleared on the RAM substrate; write IOPS at 59 % of its bar is th
 All four of the first list landed in the second wave (lever 5 as kernel patch 0030 + the daemon
 half; the fsync route; fresh-file publish; the read side). What follows:
 
-1. The two-ring 4k randwrite QD32×4 regression (0.85×): a bounded spin / multi-CQE reap before the
-   half-loaded worker parks; the pass boundary an all-own write crosses twice (an agent is on it).
+1. The two-ring daemon: its stall (a request to the metadata backend from a two-ring queue picked up
+   seconds late; the idle second worker's driven lane) and its 4k randwrite QD32×4 regression (0.85×:
+   a bounded spin / multi-CQE reap before the half-loaded worker parks); then the derivation back to
+   2 rings (an agent has both).
 2. `MetaSet.fsync` barriers every member (2.1 barriers per fsync): barrier the touched volume(s) or
    join the members' barriers.
 3. The lay-down: the kernel's exclusive inode lock on extending O_DIRECT writes (≈ 4 GB/s per

@@ -352,7 +352,10 @@ USER-class admission ever decides the cycle's outcome": a queued SET only ever c
 CLEAR reads a genuinely free block); a non-empty queue kicks the journaler OFF the cycle. Once per
 cycle `population_drift_check()` compares the maintained counter against the popcount (a disagreement
 = `data_alloc_population_drift` tripwire + re-sync, `DAB:L599-619`; `population_scans` pins that the
-allocation funnel performs none, `DAB:L969-976`).
+allocation funnel performs none, `DAB:L969-976`). Port (0002 row 545): the reference's check reads the
+two outside any exclusion and a carve in flight is a torn pair it calls a drift; here the population ≡
+the popcount and every bit moves with it under the ONE ordering lock (a trim window's take and return
+included), and the check reads both under that lock (`rung-10-population-drift.md`).
 
 `take_dirty_plan(generation)` (`DAB:L721-758`): every dirty page's image at `gen = max(page.generation,
 generation − 1) + 1` into the ALTERNATE slot (`SLOT_NONE → A`, else `1 − cur`), the state advanced

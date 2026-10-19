@@ -264,7 +264,9 @@ pub const stats = struct {
     /// its arm — `plane_arm.Home`), so a growing count on a mount is a
     /// wiring defect.
     pub var data_alloc_bitmap_deltas_unjournaled: counters.ShardedCounter = .{};
-    /// Population scans the allocation funnel performed (0 by contract).
+    /// Popcount scans: the arm's derivation and once per checkpoint cycle;
+    /// the allocation funnel performs none (a count growing with mints is
+    /// the reference's Issue 33 back).
     pub var population_scans: counters.ShardedCounter = .{};
     /// The page sink (charter §5.5 "pages written before barrier #1"):
     /// holds published at an arm (the pages claimed on the home volume
@@ -310,11 +312,16 @@ pub const DataBitmap = struct {
     pages: u64,
     page_states: []PageState,
     dirty: []Atomic(u64),
-    /// O(1) maintained (`DAB:L578-586`); re-synced by the drift check.
+    /// O(1) maintained (`DAB:L578-586`) and ≡ the popcount of the words:
+    /// every bit moves with it under `mutations` (a trim window's
+    /// transient take and return included — 0002 row 545), so the drift
+    /// check compares the two under that lock and nothing else re-syncs it.
     population: Atomic(u64) = .init(0),
     /// THE ordering lock: every bit mutation moves the bit and queues its
     /// delta inside it. A spin lock: the critical section is O(1) and the
-    /// finish-free sink runs on paths that carry no `Io`.
+    /// finish-free sink runs on paths that carry no `Io`. The one O(words)
+    /// section is the once-per-cycle `populationDriftCheck` (4096 words
+    /// per TiB at 4 MiB blocks — microseconds).
     mutations: jc.SpinLock = .{},
     /// One bit per block, under `mutations`: the bits THIS term moved since
     /// its arm sealed the derivation (decision 0003 §AQ.1) — set by every
@@ -402,9 +409,17 @@ pub const DataBitmap = struct {
         return self.alloc.highestSetPlusOne();
     }
 
-    fn resyncPopulation(self: *DataBitmap) void {
+    /// The popcount over the words (O(words); counted so a pin can say the
+    /// allocation funnel performs none).
+    fn scanPopulation(self: *const DataBitmap) u64 {
         stats.population_scans.inc();
-        const n = self.alloc.bitPopulation() -| self.alloc.trim_windowed.load(.acquire);
+        return self.alloc.bitPopulation();
+    }
+
+    /// The arm's derivation (`init`, a page load): the words are the truth
+    /// and nothing else moves them yet.
+    fn resyncPopulation(self: *DataBitmap) void {
+        const n = self.scanPopulation();
         self.population.store(n, .release);
         stats.data_alloc_bitmap_population.set(n);
     }
@@ -527,32 +542,35 @@ pub const DataBitmap = struct {
     /// model 4): the allocator's `holderTakeOutOfList` inside the critical
     /// section every carve runs its scan and its takes in, so the carve
     /// never meets a bit taken between the two nor an entitlement won ahead
-    /// of its debit. `holds` (a quarantine, a publication's take-back): the
-    /// bit stays set here — the population and a SET delta move with it; a
-    /// trim window's transient take moves neither (the population excludes
-    /// the windows).
+    /// of its debit. The population moves with the bit either way; `holds`
+    /// (a quarantine, a publication's take-back) keeps the bit set, so a
+    /// SET delta and the term's move go with it; a trim window's transient
+    /// take journals nothing and is not a move of the term.
     pub fn takeOutOfList(self: *DataBitmap, idx: u64, listed: bool, holds: bool) bool {
         assert(idx < self.cfg.blocks);
         self.lockContended();
         defer self.mutations.unlock();
         if (!self.alloc.holderTakeOutOfList(idx, listed)) return false;
-        if (!holds) return true;
-        self.markMovedLocked(idx);
         _ = self.population.fetchAdd(1, .acq_rel);
         stats.data_alloc_bitmap_population.set(self.population.load(.monotonic));
+        if (!holds) return true;
+        self.markMovedLocked(idx);
         stats.data_alloc_bitmap_set_bits.inc();
         self.markDirty(idx);
         self.queueLocked(.{ .set = true, .start = idx, .len = 1, .term = self.cfg.term });
         return true;
     }
 
-    /// A trim window's return under THE lock: the bit and its credit
-    /// together (`block_alloc.holderReturnTrim`).
+    /// A trim window's return under THE lock: the bit, its credit and the
+    /// population together (`block_alloc.holderReturnTrim`).
     pub fn returnTrim(self: *DataBitmap, idx: u64) bool {
         assert(idx < self.cfg.blocks);
         self.lockContended();
         defer self.mutations.unlock();
-        return self.alloc.holderReturnTrim(idx);
+        if (!self.alloc.holderReturnTrim(idx)) return false;
+        _ = self.population.fetchSub(1, .acq_rel);
+        stats.data_alloc_bitmap_population.set(self.population.load(.monotonic));
+        return true;
     }
 
     fn lockContended(self: *DataBitmap) void {
@@ -798,12 +816,17 @@ pub const DataBitmap = struct {
         return try self.takeDirtyPlan(generation);
     }
 
-    /// Once per cycle: the maintained population against the popcount
-    /// (minus the trim windows' transient bits); a disagreement is the
-    /// tripwire and a re-sync.
+    /// Once per cycle: the maintained population against the popcount,
+    /// both read under the ordering lock — a carve or a free in flight
+    /// moves its bits and its count inside one critical section, so a
+    /// check outside it read the two at different instants and called the
+    /// torn pair a drift (0002 row 545). A disagreement is the tripwire
+    /// and a re-sync.
     pub fn populationDriftCheck(self: *DataBitmap) bool {
+        self.mutations.lock();
+        defer self.mutations.unlock();
         const maintained = self.population.load(.acquire);
-        const counted = self.alloc.bitPopulation() -| self.alloc.trim_windowed.load(.acquire);
+        const counted = self.scanPopulation();
         if (maintained == counted) return true;
         stats.data_alloc_population_drift.fire("the maintained population disagreed with the popcount");
         log.err("data bitmap vol {x}: population drift — maintained {d}, counted {d}; re-synced", .{ self.cfg.vol_tag, maintained, counted });
@@ -1827,6 +1850,84 @@ test "a trim claim and a quarantine on an armed holder take their bit under the 
     a.finishFree(out[0]);
     try testing.expect(!a.bitIsSet(5));
     try testing.expect(bm.populationDriftCheck());
+}
+
+test "the maintained population IS the popcount (a trim window's transient take and return move it under the ordering lock), and the once-per-cycle drift check reads both under that lock: 10 k carve/return/trim-window laps, each raced by a check, over a 1 TiB-geometry bitmap fire the tripwire 0 times" {
+    const a = try testAlloc(1 << 18); // 4096 words: the charter's 32 KiB/TiB at 4 MiB blocks
+    defer a.deinit();
+    _ = try a.allocateBlock();
+    _ = try a.allocateBlock();
+    const bm = try testBitmap(a, 5);
+    defer bm.deinit();
+    a.finish_free_sink = bm.finishFreeSink();
+    // Block 1 back on the holder's list; a trim window over it sets the
+    // bit, and the population says so for exactly as long as the bit does.
+    try testing.expectEqual(block_alloc.BeginFree.terminal, try a.freeBlock(1));
+    const pop0 = bm.populationNow();
+    var g = a.claimFreeForTrim(1).?;
+    try testing.expectEqual(pop0 + 1, bm.populationNow());
+    try testing.expectEqual(a.bitPopulation(), bm.populationNow());
+    try testing.expect(bm.populationDriftCheck());
+    a.returnFromTrim(1, &g);
+    try testing.expectEqual(pop0, bm.populationNow());
+    try testing.expectEqual(a.bitPopulation(), bm.populationNow());
+    try testing.expect(bm.populationDriftCheck());
+
+    const Rig = struct {
+        a: *BlockAllocator,
+        bm: *DataBitmap,
+        laps: Atomic(u32) = .init(0),
+        done: Atomic(bool) = .init(false),
+        checks: u64 = 0,
+        disagreed: u64 = 0,
+
+        /// The holder's traffic: a 64-block carve above the cursor and its
+        /// return, a trim window over block 1 opened and closed.
+        fn mutate(self: *@This()) void {
+            defer self.done.store(true, .release);
+            var lap: u32 = 0;
+            while (lap < 10_000) : (lap += 1) {
+                const run = self.bm.carveRun(64, 64).?;
+                std.debug.assert(run.start == 64 and run.len == 64);
+                std.debug.assert(self.bm.clearRun(run.start, run.len) == 64);
+                var guard = self.a.claimFreeForTrim(1).?;
+                self.a.returnFromTrim(1, &guard);
+                _ = self.laps.fetchAdd(1, .release);
+            }
+        }
+
+        /// The checkpoint cycle's check once per lap the traffic completes
+        /// (over the next lap in flight — never back to back, which would
+        /// starve the traffic of the lock), then once over the settled
+        /// bitmap.
+        fn check(self: *@This()) void {
+            var seen: u32 = 0;
+            while (!self.done.load(.acquire)) {
+                const now = self.laps.load(.acquire);
+                if (now == seen) {
+                    std.atomic.spinLoopHint();
+                    continue;
+                }
+                seen = now;
+                self.checks += 1;
+                if (!self.bm.populationDriftCheck()) self.disagreed += 1;
+            }
+            self.checks += 1;
+            if (!self.bm.populationDriftCheck()) self.disagreed += 1;
+        }
+    };
+    var rig: Rig = .{ .a = a, .bm = bm };
+    const fired0 = counters.tripwireCount("data_alloc_population_drift");
+    const scans0 = stats.population_scans.load();
+    const mutator = try std.Thread.spawn(.{}, Rig.mutate, .{&rig});
+    rig.check();
+    mutator.join();
+    try testing.expectEqual(@as(u64, 0), rig.disagreed);
+    try testing.expectEqual(fired0, counters.tripwireCount("data_alloc_population_drift"));
+    try testing.expectEqual(scans0 + rig.checks, stats.population_scans.load());
+    try testing.expectEqual(pop0, bm.populationNow());
+    try testing.expectEqual(a.bitPopulation(), bm.populationNow());
+    try testing.expect(rig.checks >= 2);
 }
 
 test "fuzz: the data bitmap page decoder is total on arbitrary and restamped pages; a decoded page re-encodes byte-identically" {

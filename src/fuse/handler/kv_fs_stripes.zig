@@ -32,6 +32,7 @@ const sync = @import("../../sync/sync.zig");
 const key = @import("../../meta/key.zig");
 const record = @import("../../meta/record.zig");
 const economy = @import("../../meta/economy.zig");
+const node_cache = @import("../../meta/node_cache.zig");
 const route_table = @import("../../meta/routing/route_table.zig");
 const sym_xv = @import("../../meta/sym/xv.zig");
 
@@ -67,6 +68,9 @@ pub const stats = struct {
     /// A verdict-cache entry (or a whole map's install) refused for
     /// memory: nothing cached, the next verdict re-reads the records.
     pub var dir_stripe_cache_drops: counters.ShardedCounter = .{};
+    /// A try-only verdict (the drain worker's probe) that met the cache
+    /// lock held: `WouldBlock`, the lane re-asks the op.
+    pub var dir_stripe_verdict_try_refusals: counters.ShardedCounter = .{};
 };
 
 /// What the prelude knows of a directory.
@@ -188,6 +192,28 @@ pub fn Stripes(comptime Fs: type) type {
         fn install(self: *Self, map: StripeMap) void {
             self.lock.lockUncancelable(self.io);
             defer self.lock.unlock(self.io);
+            self.installLocked(map);
+        }
+
+        /// The cache lock as the caller may take it. A try-only reader
+        /// (`node_cache.try_only`: the FUSE drain worker's probe, off a
+        /// fiber on the thread that DRIVES its own handler lane) never
+        /// queues behind it: a held lock is `WouldBlock` and the lane
+        /// re-asks the op. Queued, the worker parks until its tick while
+        /// the holder's release goes to the queue's front — a handler
+        /// fiber of its own lane, which runs only in the worker's pass:
+        /// 2 s per contention and the hot directory's guards held
+        /// through it (`docs/evidence/rung-10-mdtest-wedge.md`).
+        fn lockCache(self: *Self) Error!void {
+            if (node_cache.try_only) {
+                if (self.lock.tryLock(self.io)) return;
+                stats.dir_stripe_verdict_try_refusals.inc();
+                return error.WouldBlock;
+            }
+            self.lock.lockUncancelable(self.io);
+        }
+
+        fn installLocked(self: *Self, map: StripeMap) void {
             if (self.maps.count() >= MAPS_CACHE_MAX) {
                 self.maps.clearRetainingCapacity();
                 self.stripe_of.clearRetainingCapacity();
@@ -211,7 +237,7 @@ pub fn Stripes(comptime Fs: type) type {
         pub fn verdictOf(self: *Self, global: u64) Error!Verdict {
             const g = self.plane.localGen(global);
             {
-                self.lock.lockUncancelable(self.io);
+                try self.lockCache();
                 defer self.lock.unlock(self.io);
                 if (self.maps.get(global)) |m| {
                     stats.dir_stripe_verdict_hits.inc();
@@ -231,7 +257,7 @@ pub fn Stripes(comptime Fs: type) type {
             const v = (try self.fs.readInodeOpt(local)) orelse return .plain;
             if (!economy.isDirMode(v.mode)) return .plain;
             if (stripe.isStripeRecord(v)) {
-                self.lock.lockUncancelable(self.io);
+                try self.lockCache();
                 defer self.lock.unlock(self.io);
                 self.stripe_of.put(self.gpa, global, 0) catch stats.dir_stripe_cache_drops.inc();
                 return .{ .stripe = 0 };
@@ -240,7 +266,7 @@ pub fn Stripes(comptime Fs: type) type {
             // whole map by name.
             const commit = (try self.fs.findDentry(local, stripe.STRIPED)) orelse {
                 if (g) |gen| {
-                    self.lock.lockUncancelable(self.io);
+                    try self.lockCache();
                     defer self.lock.unlock(self.io);
                     if (self.plain.count() >= PLAIN_CACHE_MAX) {
                         self.plain.clearRetainingCapacity();
@@ -267,7 +293,9 @@ pub fn Stripes(comptime Fs: type) type {
                 n += 1;
             }
             const map = stripe.decodeMap(global, markers[0..n]) orelse return .plain;
-            self.install(map);
+            try self.lockCache();
+            defer self.lock.unlock(self.io);
+            self.installLocked(map);
             return .{ .striped = map };
         }
 
@@ -660,4 +688,61 @@ test "a verdict install is all or nothing: an allocation failure caches no part 
     try testing.expect((try st.verdictOf(d)) == .striped);
     try testing.expectEqual(@as(usize, 1), st.migrating.items.len);
     try testing.expectEqual(d, st.migrating.items[0]);
+}
+
+test "the drain worker's try-only probe never queues behind the verdict cache's lock: a held lock answers WouldBlock at once with nobody parked (the lane re-asks); a free lock serves the probe" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var store = try kv_fs.MemStore.init(gpa);
+    defer store.deinit();
+    var nodata: kv_fs.NoData = .{};
+    var fs = try kv_fs.MemFs.mount(gpa, io, &store, &nodata, .{ .dlm_stripes = 64 });
+    defer fs.unmount();
+    var plane = try kv_fs.MemFs.XvPlane.init(gpa, io, &store, &fs.locks, 1, 0, 7, OneHome.resolver(), .{}, 16 << 10);
+    defer plane.deinit();
+    try testing.expectEqual(@as(u32, 0), try fs.bindXv(&plane));
+    const st = try fs.bindStripes(64, .{ .fixed = 2 });
+    defer fs.unbindStripes();
+    var tr = op_trace.OpTrace.begin(0, .other);
+    defer tr.finish();
+    var window: [4096]u8 = undefined;
+    var c: filesystem.Ctx = .{ .unique = 1, .uid = 0, .gid = 0, .pid = 1, .io = io, .trace = &tr, .wd_slot = null, .window = &window };
+    const d = (try fs.mkdir(&c, .{ .parent = inos.ROOT_INO, .name = "hot", .mode = 0o755, .umask = 0 })).nodeid;
+    const Prober = struct {
+        fs: *kv_fs.MemFs,
+        io: Io,
+        result: Error!filesystem.Entry = error.Unexpected,
+        done: std.atomic.Value(bool) = .init(false),
+        fn run(self: *@This()) void {
+            var t = op_trace.OpTrace.begin(2, .other);
+            defer t.finish();
+            var ctx: filesystem.Ctx = .{ .unique = 2, .uid = 0, .gid = 0, .pid = 1, .io = self.io, .trace = &t, .wd_slot = null, .window = &.{} };
+            self.result = self.fs.probe_lookup(&ctx, .{ .parent = inos.ROOT_INO, .name = "hot" });
+            self.done.store(true, .release);
+        }
+    };
+    // The lock held by another party (the holder is this thread; the
+    // probe runs where the drain worker would): the probe must come back
+    // refused without ever joining the lock's queue.
+    const refusals0 = stats.dir_stripe_verdict_try_refusals.load();
+    st.lock.lockUncancelable(io);
+    var p: Prober = .{ .fs = &fs, .io = io };
+    const th = try std.Thread.spawn(.{}, Prober.run, .{&p});
+    var parked = false;
+    while (!p.done.load(.acquire)) {
+        if (st.lock.waiters(io) != 0) {
+            parked = true;
+            break;
+        }
+        try std.Thread.yield();
+    }
+    st.lock.unlock(io);
+    th.join();
+    try testing.expect(!parked);
+    try testing.expectError(error.WouldBlock, p.result);
+    try testing.expectEqual(refusals0 + 1, stats.dir_stripe_verdict_try_refusals.load());
+    // Free: the probe serves the entry.
+    var p2: Prober = .{ .fs = &fs, .io = io };
+    p2.run();
+    try testing.expectEqual(d, (try p2.result).nodeid);
 }

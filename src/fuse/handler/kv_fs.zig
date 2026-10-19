@@ -272,6 +272,10 @@ pub var fuse_reclaim_blocks_freed: counters.ShardedCounter = .{};
 /// `fuse_reclaim_queue_overflow`: a forget found the gather full and drove
 /// its corpse inline.
 pub var fuse_reclaim_queue_overflow: counters.ShardedCounter = .{};
+/// `fuse_forget_judgements_deferred`: a forget whose try-only inode read
+/// would have parked the drain worker; the ino joined the gather for the
+/// cadence's nlink judgement instead.
+pub var fuse_forget_judgements_deferred: counters.ShardedCounter = .{};
 /// A dentry that names an ino whose record is gone (a corpse reachable by
 /// name): fsck C9/C10 territory, never a handler outcome (must stay 0).
 pub var dentry_without_inode: counters.Tripwire = .init("fuse_dentry_without_inode");
@@ -1685,9 +1689,26 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             // drops its cached view alone — never a destroy on a slot
             // another appender leases (`SlotMoved`).
             if (self.divert) |d| if (d.isForeign(local)) return;
-            const v = (self.readInodeOpt(local) catch return) orelse return;
-            if (v.nlink != 0) return;
-            self.gatherCorpse(c, local);
+            // The corpse judgement is try-only: the drain worker runs every
+            // ring FORGET on its own thread, which drives its handler lane,
+            // so a node read that would park it — a demand page, or the
+            // cohort wait on a load a fiber of that very lane leads — is
+            // the cadence's instead (`destroyCorpses` re-judges nlink).
+            const judged: enum { corpse, live, deferred } = blk: {
+                const was = node_cache.try_only;
+                node_cache.try_only = true;
+                defer node_cache.try_only = was;
+                const v = (self.readInodeOpt(local) catch |e| break :blk if (e == error.WouldBlock) .deferred else .live) orelse break :blk .live;
+                break :blk if (v.nlink == 0) .corpse else .live;
+            };
+            switch (judged) {
+                .live => {},
+                .corpse => self.gatherCorpse(c, local),
+                .deferred => {
+                    fuse_forget_judgements_deferred.inc();
+                    self.gatherCorpse(c, local);
+                },
+            }
         }
 
         /// A forgotten corpse joins the batch; a full batch wakes the reclaim
@@ -4044,11 +4065,15 @@ const testing = std.testing;
 /// upserts, Delete removes, a Delta overwrites its masked fields on an
 /// existing base and folds to nothing on an absent one).
 pub const MemStore = struct {
-    pub const StoreError = error{ OutOfMemory, Io };
+    pub const StoreError = error{ OutOfMemory, Io, WouldBlock };
 
     gpa: Allocator,
     lock: jc.SpinLock = .{},
     entries: std.ArrayList(Row) = .empty,
+    /// The seam for the real store's try-only refusals (a demand page, a
+    /// load's cohort wait under `node_cache.try_only`): the next N lookups
+    /// made try-only answer `WouldBlock`.
+    try_only_refusals: u32 = 0,
     /// Starts past the base so no test ino is identity-mapped between its
     /// local and global forms (`(local − 2) · W + 2`): a global/local mix-up
     /// in a handler is a loud ENOENT here, not a coincidence.
@@ -4088,6 +4113,7 @@ pub const MemStore = struct {
         return switch (e) {
             error.OutOfMemory => error.OutOfMemory,
             error.Io => error.InputOutput,
+            error.WouldBlock => error.WouldBlock,
         };
     }
 
@@ -4172,6 +4198,10 @@ pub const MemStore = struct {
     pub fn lookup(self: *MemStore, gpa: Allocator, kind: u8, k: []const u8) StoreError!?[]u8 {
         self.lock.lock();
         defer self.lock.unlock();
+        if (node_cache.try_only and self.try_only_refusals > 0) {
+            self.try_only_refusals -= 1;
+            return error.WouldBlock;
+        }
         const f = self.find(kind, k);
         if (!f.hit) return null;
         self.value_bytes_copied += self.entries.items[f.idx].v.len;
@@ -4972,6 +5002,47 @@ test "the corpse destroy settles the write-side custody BEFORE it reads the layo
     try testing.expectEqual(@as(u32, 1), h.data.base.layout_locks_taken);
     try testing.expectEqual(@as(u32, 0), h.data.base.layout_lock_held);
     try testing.expectEqual(linux.E.NOENT, h.call(.{ .getattr = .{ .flags = 0, .fh = null } }, f).errno().?);
+}
+
+test "a FORGET whose corpse judgement would park the drain worker (the inode read refused try-only: a demand page, a load a fiber of its own lane leads) defers the judgement to the gather: the cadence re-judges nlink there, destroys the corpse and leaves the live inode" {
+    const H = HarnessOf(NoData);
+    var h: H = undefined;
+    try h.init();
+    defer h.deinit();
+    const f = try h.create(1, "f", 0o644);
+    const g = try h.create(1, "g", 0o644);
+    try testing.expectEqual(@as(?linux.E, null), h.call(.{ .unlink = .{ .name = "f" } }, 1).errno());
+    h.release(f);
+    h.release(g);
+    const deferred0 = fuse_forget_judgements_deferred.load();
+    const destroyed0 = fuse_reclaim_destroys.load();
+    // The corpse's read refused: gathered unjudged, counted.
+    h.store.try_only_refusals = 1;
+    h.forget(f, 1);
+    try testing.expectEqual(@as(u32, 0), h.store.try_only_refusals);
+    try testing.expectEqual(deferred0 + 1, fuse_forget_judgements_deferred.load());
+    try testing.expectEqual(@as(usize, 1), h.fs.reclaim.items.len);
+    // A LIVE inode's refused read is gathered the same way (the cadence
+    // is the judge), never destroyed.
+    h.store.try_only_refusals = 1;
+    h.forget(g, 1);
+    try testing.expectEqual(deferred0 + 2, fuse_forget_judgements_deferred.load());
+    try testing.expectEqual(@as(usize, 2), h.fs.reclaim.items.len);
+    var tr = @import("op_trace.zig").OpTrace.begin(1, .other);
+    defer tr.finish();
+    var win: [16]u8 = undefined;
+    var c: Ctx = .{ .unique = 1, .uid = 0, .gid = 0, .pid = 0, .io = testing.io, .trace = &tr, .wd_slot = null, .window = &win };
+    try h.fs.reclaimDrain(&c);
+    try testing.expectEqual(destroyed0 + 1, fuse_reclaim_destroys.load());
+    try testing.expectEqual(@as(usize, 0), h.fs.reclaim.items.len);
+    try testing.expectEqual(linux.E.NOENT, h.call(.{ .getattr = .{ .flags = 0, .fh = null } }, f).errno().?);
+    try testing.expectEqual(@as(?linux.E, null), h.call(.{ .getattr = .{ .flags = 0, .fh = null } }, g).errno());
+    // Judged on the spot when the read serves: a corpse gathers, a live
+    // inode does not.
+    try testing.expectEqual(@as(?linux.E, null), h.call(.{ .unlink = .{ .name = "g" } }, 1).errno());
+    h.forget(g, 1);
+    try testing.expectEqual(deferred0 + 2, fuse_forget_judgements_deferred.load());
+    try testing.expectEqual(@as(usize, 1), h.fs.reclaim.items.len);
 }
 
 test "a release is a live owner of its block from before its releasing commit until its free (decision 0003 §AH.1; the online fsck's `[C2] leaked` window — between the two the allocator tracks a block no record names): every binding the handler frees after a commit — the corpse destroy's, a truncate's, an O_TRUNC open's — is held in flight by a hold its commit followed and dropped after the free; the own block a promotion mints stays a live owner until its publish lands; nothing stays held" {

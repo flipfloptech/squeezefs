@@ -2732,7 +2732,7 @@ test "the stats JSON names every lane counter" {
     var w: std.Io.Writer = .fixed(&buf);
     try writeStatsJson(&w);
     const s = w.buffered();
-    for ([_][]const u8{ "\"journal_lanes_spawned\":", "\"journal_lanes_live\":", "\"journal_ring_lane_writes\":", "\"journal_lane_structural_writes\":", "\"journal_lane_write_failures\":", "\"journal_lane_rollbacks\":", "\"journal_lane_barriers_strict\":", "\"journal_lane_barriers_coalesced\":", "\"journal_lane_barrier_failures\":", "\"journal_lane_wake_writes\":", "\"journal_lane_wake_elided\":", "\"journal_lane_parks\":", "\"journal_lane_park_tick_rescues\":", "\"journal_lane_park_backstop_ticks\":", "\"journal_lane_prefix_waits\":", "\"journal_lane_wait_fiber_parks\":", "\"journal_lane_wait_raw_parks\":", "\"journal_lane_queue_full\":", "\"journal_lane_volumes_failed\":", "\"journal_lane_rings_dead\":", "\"journal_lane_cqe_orphan\":", "\"journal_lane_ack_out_of_order\":" }) |needle| {
+    for ([_][]const u8{ "\"journal_lanes_spawned\":", "\"journal_lanes_live\":", "\"journal_ring_lane_writes\":", "\"journal_lane_structural_writes\":", "\"journal_lane_write_failures\":", "\"journal_lane_rollbacks\":", "\"journal_lane_barriers_strict\":", "\"journal_lane_barriers_coalesced\":", "\"journal_lane_barrier_failures\":", "\"journal_lane_wake_writes\":", "\"journal_lane_wake_elided\":", "\"journal_lane_parks\":", "\"journal_lane_park_tick_rescues\":", "\"journal_lane_park_backstop_ticks\":", "\"journal_lane_prefix_waits\":", "\"journal_lane_queue_full\":", "\"journal_lane_volumes_failed\":", "\"journal_lane_rings_dead\":", "\"journal_lane_cqe_orphan\":", "\"journal_lane_ack_out_of_order\":" }) |needle| {
         try testing.expect(std.mem.indexOf(u8, s, needle) != null);
     }
 }

@@ -96,13 +96,3 @@ scheduling hop beyond the park itself; the request path still allocates nothing 
 still own their rings. The waits are counted (`dev_wait_fiber_parks` / `dev_wait_raw_parks`) and the
 DMAs in flight are a gauge (`dev_dma_inflight`), so the posture is observable in `.stats`. Numbers:
 `docs/evidence/rung-10-fiber-device-waits.md`.
-
-**Extended 2026-10-19 to the journal lane's tickets.** The same rule governs `meta/journal_lane.zig`'s
-`Ticket.wait` from OFF the lane thread (a handler fiber's `fsync` through `KvBackend.fsync` →
-`requestBarrier`; a structural entry from a space retry on another lane; the checkpoint thread's
-structural entries): `JournalLane.routeWaits(io)` installs the route once at open (the backend, before
-the first request), the waiter parks through `Completion.waitIo`, the lane's `deliver` wakes through
-`completeIo`. The lane's OWN fibers (the pass fiber, the stage-B fiber inside a hook) keep their fiber
-park answered by the lane's own reap — that path is not a futex wait at all; and a bare lane (tests,
-offline tools) keeps the raw futex on both sides. Counted: `journal_lane_wait_fiber_parks` /
-`journal_lane_wait_raw_parks`. Numbers: `docs/evidence/rung-10-fsync-route.md`.

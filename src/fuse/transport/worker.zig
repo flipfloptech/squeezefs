@@ -1503,31 +1503,41 @@ pub const Group = struct {
     /// classic spin-then-park competitive rule on the MEASURED price: `W`
     /// = what a slept park's round trip adds over a spin-caught one, the
     /// bound `2·W` (the CPU a spin burns is at most twice the wake it
-    /// saves), and the spin only while the landing (`born + srtt`) is
-    /// predicted inside the bound and until the RTO says it is a stall —
-    /// a landing predicted later would make every spin a fall-through (an
-    /// SSD's 80 µs against a 5 µs wake spins never; a RAM device's 8 µs
-    /// spins every time). No slept measurement (`slept` null) ⇒ no spin:
-    /// the first parks measure it. No caught measurement yet (`awake`
-    /// null) ⇒ the PROBE: spin to the slept predictor's bound once, so a
-    /// hit can seed the other side.
+    /// saves), the spin only while the landing (`born + srtt`) is predicted
+    /// inside the bound — a landing predicted later would make every spin
+    /// a fall-through (an SSD's 80 µs against a 5 µs wake spins never; a
+    /// RAM device's 8 µs spins every time) — and until one wake past the
+    /// landing (a completion that late still beats the park; the RTO is no
+    /// end here: a stable device drives `rttvar` to 0 and `srtt + 4·rttvar`
+    /// onto the landing itself, where every jitter fell through — measured
+    /// 82 % skips on QD1 reads). No slept measurement (`slept` null) ⇒ no
+    /// spin: the first parks measure it. No caught measurement yet
+    /// (`awake` null) ⇒ the PROBE: spin to the slept predictor's RTO once,
+    /// so a hit can seed the other side.
     pub fn owedSpinBudget(now: u64, oldest_born: u64, awake: ?Prediction, slept: ?Prediction) u64 {
         const s = slept orelse return 0;
         const a = awake orelse return (oldest_born +| s.rto) -| now;
         const wake = s.srtt -| a.srtt;
         if (wake == 0) return 0;
-        const bound = 2 * wake;
-        if (oldest_born +| a.srtt > now +| bound) return 0;
-        return @min(now +| bound, oldest_born +| a.rto) -| now;
+        const landing = oldest_born +| a.srtt;
+        if (landing > now +| 2 * wake) return 0;
+        return @min(now +| 2 * wake, landing +| wake) -| now;
     }
 
-    /// The oldest live bridge whose RTO has not lapsed (`born > now − rto`):
-    /// the completion the spin waits for; null when every owed one is
-    /// already a stall (the park's, not the spin's).
-    fn oldestOwedBorn(self: *const Group, now: u64, rto: u64) ?u64 {
+    /// The spin's reach: how long past its push a completion is still the
+    /// spin's to wait for (the probe's RTO; else the landing plus the wake).
+    fn spinHorizon(awake: ?Prediction, slept: ?Prediction) u64 {
+        if (awake) |a| return a.srtt +| ((slept orelse return 0).srtt -| a.srtt);
+        return if (slept) |s| s.rto else 0;
+    }
+
+    /// The oldest live bridge still inside the spin's reach (`born >
+    /// now − horizon`): the completion the spin waits for; null when every
+    /// owed one is already late (the park's, not the spin's).
+    fn oldestOwedBorn(self: *const Group, now: u64, horizon: u64) ?u64 {
         var oldest: ?u64 = null;
         for (self.deadlines.born_ns) |b| {
-            if (b == 0 or b +| rto <= now) continue;
+            if (b == 0 or b +| horizon <= now) continue;
             if (oldest == null or b < oldest.?) oldest = b;
         }
         return oldest;
@@ -1547,8 +1557,7 @@ pub const Group = struct {
         const awake = predictionOf(&self.dev_awake);
         const slept = predictionOf(&self.dev_slept);
         const now = clock.monotonicNs();
-        const rto = if (awake) |a| a.rto else if (slept) |s| s.rto else 0;
-        const oldest = self.oldestOwedBorn(now, rto) orelse {
+        const oldest = self.oldestOwedBorn(now, spinHorizon(awake, slept)) orelse {
             owed_spin_skips.inc();
             return false;
         };
@@ -3507,26 +3516,30 @@ test "the own-lane knee is a queue's: one ring takes it whole, two rings split i
     try testing.expectEqual(@as(u32, 0), Group.ownDepthShare(0, 1));
 }
 
-test "the owed spin's budget: no slept measurement ⇒ park; no caught one ⇒ the probe spins to the slept bound; else 2·W where W = slept − caught, only while the landing is predicted inside it, and never past the caught RTO (an overdue completion is the park's)" {
+test "the owed spin's budget: no slept measurement ⇒ park; no caught one ⇒ the probe spins to the slept RTO; else 2·W where W = slept − caught, only while the landing is predicted inside it, and until one wake past the landing (never the caught RTO: a stable device collapses it onto the landing); the horizon names which owed completion is still the spin's" {
     const B = Group.owedSpinBudget;
     const P = Group.Prediction;
     // Nothing measured: the first parks measure.
     try testing.expectEqual(@as(u64, 0), B(1_000, 900, null, null));
-    // The probe: a slept predictor alone spins to its bound (born 900 + rto 24 000 − now 1 000).
+    try testing.expectEqual(@as(u64, 0), Group.spinHorizon(null, null));
+    // The probe: a slept predictor alone spins to its RTO (born 900 + rto 24 000 − now 1 000).
     try testing.expectEqual(@as(u64, 23_900), B(1_000, 900, null, P{ .srtt = 12_000, .rto = 24_000 }));
     try testing.expectEqual(@as(u64, 0), B(30_000, 900, null, P{ .srtt = 12_000, .rto = 24_000 }));
-    // RAM device: caught 8 µs, slept 12 µs ⇒ W 4 µs, bound 8 µs; born 2 µs ago, landing in 6 ⇒
-    // spin to the bound (8 µs), which the caught RTO (born + 14 µs = 12 µs from now) does not cut.
-    const ram_a = P{ .srtt = 8_000, .rto = 14_000 };
+    try testing.expectEqual(@as(u64, 24_000), Group.spinHorizon(null, P{ .srtt = 12_000, .rto = 24_000 }));
+    // RAM device: caught 8 µs, slept 12 µs ⇒ W 4 µs, bound 8 µs; born 2 µs ago, landing in 6 ⇒ spin
+    // to the bound (8 µs; landing + W would be 10). The caught RTO plays no part: here it is a
+    // converged 8 µs that would have ended the spin ON the landing.
+    const ram_a = P{ .srtt = 8_000, .rto = 8_000 };
     const ram_s = P{ .srtt = 12_000, .rto = 24_000 };
     try testing.expectEqual(@as(u64, 8_000), B(12_000, 10_000, ram_a, ram_s));
-    // Born 7 µs ago: landing in 1 µs, the RTO in 7 ⇒ the RTO is the shorter bound.
-    try testing.expectEqual(@as(u64, 7_000), B(17_000, 10_000, ram_a, ram_s));
-    // The RTO lapsed: overdue is a stall, the park's.
-    try testing.expectEqual(@as(u64, 0), B(24_001, 10_000, ram_a, ram_s));
+    // Born 7 µs ago: landing in 1 µs ⇒ spin to landing + W (5 µs), inside the bound.
+    try testing.expectEqual(@as(u64, 5_000), B(17_000, 10_000, ram_a, ram_s));
+    // Born 13 µs ago: one wake past the landing — late is the park's.
+    try testing.expectEqual(@as(u64, 0), B(23_000, 10_000, ram_a, ram_s));
+    try testing.expectEqual(@as(u64, 12_000), Group.spinHorizon(ram_a, ram_s));
     // An SSD: caught 80 µs against a 5 µs wake ⇒ the landing is 70 µs past the 10 µs bound: no spin.
     try testing.expectEqual(@as(u64, 0), B(10_000, 10_000, P{ .srtt = 80_000, .rto = 100_000 }, P{ .srtt = 85_000, .rto = 110_000 }));
-    // …until it is within the bound (born 72 µs ago: landing in 8).
+    // …until it is within the bound (born 72 µs ago: landing in 8 ⇒ spin to the bound, 10).
     try testing.expectEqual(@as(u64, 10_000), B(82_000, 10_000, P{ .srtt = 80_000, .rto = 100_000 }, P{ .srtt = 85_000, .rto = 110_000 }));
     // No measured wake (slept ≤ caught): a spin saves nothing.
     try testing.expectEqual(@as(u64, 0), B(12_000, 10_000, ram_a, P{ .srtt = 8_000, .rto = 9_000 }));

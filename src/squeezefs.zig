@@ -27,6 +27,7 @@ pub const checksum = @import("core/checksum.zig");
 pub const sqzhash = @import("core/sqzhash.zig");
 pub const clock = @import("core/clock.zig");
 pub const derive = @import("core/derive.zig");
+pub const rtt = @import("core/rtt.zig");
 pub const core_sort = @import("core/sort.zig");
 pub const knobs = @import("core/knobs.zig");
 pub const log = @import("core/log.zig");

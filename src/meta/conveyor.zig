@@ -83,6 +83,7 @@ const errors = @import("../core/errors.zig");
 const log = @import("../core/log.zig");
 const clock = @import("../core/clock.zig");
 const derive = @import("../core/derive.zig");
+const core_rtt = @import("../core/rtt.zig");
 const knobs = @import("../core/knobs.zig");
 const sync = @import("../sync/sync.zig");
 const conveyor_core = @import("conveyor_core.zig");
@@ -168,16 +169,6 @@ pub const PARK_TICK_NS: u64 = 10 * std.time.ns_per_ms;
 // latency over bytes (`META_FLUSH_INTERVAL_MS=0`, the control arm).
 // ---------------------------------------------------------------------------
 
-/// The round-trip predictor the hold's deadline rides (RFC 6298, Jacobson/
-/// Karels): `srtt += (R − srtt)/8`, `rttvar += (|srtt − R| − rttvar)/4`,
-/// `rto = srtt + 4·rttvar`. The hold waits for a predicted landing; the
-/// deadline is where a round trip stops being a round trip and starts
-/// being a stall (TCP's own ruling on the same question; K = 4 bounds the
-/// false-timeout rate). No clamp below: a sub-µs device holds sub-µs.
-pub const RTT_ALPHA_SHIFT: u6 = 3;
-pub const RTT_BETA_SHIFT: u6 = 2;
-pub const RTT_K: u64 = 4;
-
 /// The hold law in force on a volume: null = never hold (strict cadence;
 /// the portable contracts unless a test arms it).
 pub const WindowHold = struct {
@@ -198,51 +189,14 @@ pub fn windowHoldFor(flush_interval_ms: u64) ?WindowHold {
     return .{ .ceiling_ns = flush_interval_ms * std.time.ns_per_ms };
 }
 
-/// The window round-trip estimator (handoff → terminal outcome), fed on
-/// the lane thread at every window's finish and read by the pass fiber on
-/// the same thread; the RAM contracts' device thread feeds it from
-/// another, so the two words are atomics (a torn pair read is a bound,
-/// never a correctness term). The same estimator smooths the committers'
-/// inter-arrival interval (fed by the pass alone) for the worth gate.
-pub const RttEstimator = struct {
-    srtt_ns: std.atomic.Value(u64) = .init(0),
-    rttvar_ns: std.atomic.Value(u64) = .init(0),
-    samples: std.atomic.Value(u64) = .init(0),
-
-    pub fn sample(self: *RttEstimator, r: u64) void {
-        const n = self.samples.fetchAdd(1, .monotonic);
-        if (n == 0) {
-            // RFC 6298 §2.2: the first measurement seeds `srtt = R`,
-            // `rttvar = R/2`.
-            self.srtt_ns.store(r, .monotonic);
-            self.rttvar_ns.store(r / 2, .monotonic);
-            return;
-        }
-        const srtt = self.srtt_ns.load(.monotonic);
-        const rttvar = self.rttvar_ns.load(.monotonic);
-        const dev = if (srtt > r) srtt - r else r - srtt;
-        // §2.3: `rttvar` BEFORE `srtt` (the deviation is against the old mean).
-        const new_var = rttvar - (rttvar >> RTT_BETA_SHIFT) + (dev >> RTT_BETA_SHIFT);
-        const new_srtt = srtt - (srtt >> RTT_ALPHA_SHIFT) + (r >> RTT_ALPHA_SHIFT);
-        self.rttvar_ns.store(new_var, .monotonic);
-        self.srtt_ns.store(new_srtt, .monotonic);
-    }
-
-    /// `srtt + 4·rttvar`, capped at `ceiling_ns`; 0 before the first
-    /// sample (a hold with no predictor is no hold).
-    pub fn bound(self: *const RttEstimator, ceiling_ns: u64) u64 {
-        if (self.samples.load(.monotonic) == 0) return 0;
-        const rto = self.srtt_ns.load(.monotonic) +| RTT_K *| self.rttvar_ns.load(.monotonic);
-        return @min(rto, ceiling_ns);
-    }
-
-    /// The smoothed mean alone (the inter-arrival predictor's reading);
-    /// null before the first sample.
-    pub fn mean(self: *const RttEstimator) ?u64 {
-        if (self.samples.load(.monotonic) == 0) return null;
-        return self.srtt_ns.load(.monotonic);
-    }
-};
+/// The window round-trip estimator (handoff → terminal outcome; `core/rtt.zig`,
+/// RFC 6298 — the hold's deadline is where a round trip stops being a round
+/// trip and starts being a stall), fed on the lane thread at every window's
+/// finish and read by the pass fiber on the same thread; the RAM contracts'
+/// device thread feeds it from another. The same estimator smooths the
+/// committers' inter-arrival interval (fed by the pass alone) for the worth
+/// gate.
+pub const RttEstimator = core_rtt.RttEstimator;
 
 /// THE WORTH GATE: a hold pays for itself iff it collects at least one
 /// entry that would otherwise have been its own window (one more entry on
@@ -295,7 +249,7 @@ pub const HOLD_PROBE_FORMING: u32 = 2;
 /// The sampled holds of a probe burst: one estimator memory (`1/α = 8`),
 /// so the mean the burst answers and the EWMA it seeds carry the same
 /// weight of evidence.
-pub const HOLD_PROBE_BURST: u32 = 1 << RTT_ALPHA_SHIFT;
+pub const HOLD_PROBE_BURST: u32 = 1 << core_rtt.ALPHA_SHIFT;
 /// A probe burst every this many eligible windows while the gate is off:
 /// sixteen bursts' worth, so a workload that starts paying is seen within
 /// ≈ 6 % of its windows and an off gate's cost is one hold in sixteen (each
@@ -3942,32 +3896,6 @@ test "§L tie: the pad arithmetic — a sub-page window costs one grain whatever
     // the interval is the deadline's ceiling.
     try testing.expect(windowHoldFor(0) == null);
     try testing.expectEqual(@as(u64, 50 * std.time.ns_per_ms), windowHoldFor(50).?.ceiling_ns);
-}
-
-test "§L tie: the RFC 6298 round-trip predictor — first sample seeds srtt = R, rttvar = R/2; the gains 1/8 and 1/4; bound = srtt + 4·rttvar capped at the ceiling; 0 before any sample" {
-    var e: RttEstimator = .{};
-    try testing.expectEqual(@as(u64, 0), e.bound(std.math.maxInt(u64)));
-    e.sample(200_000);
-    try testing.expectEqual(@as(u64, 200_000), e.srtt_ns.load(.monotonic));
-    try testing.expectEqual(@as(u64, 100_000), e.rttvar_ns.load(.monotonic));
-    try testing.expectEqual(@as(u64, 600_000), e.bound(std.math.maxInt(u64)));
-    try testing.expectEqual(@as(u64, 50_000), e.bound(50_000));
-    // A second identical sample: rttvar decays by a quarter of itself,
-    // srtt stays.
-    e.sample(200_000);
-    try testing.expectEqual(@as(u64, 200_000), e.srtt_ns.load(.monotonic));
-    try testing.expectEqual(@as(u64, 75_000), e.rttvar_ns.load(.monotonic));
-    // A 1 ms outlier moves srtt by an eighth of the difference and rttvar
-    // by a quarter of the deviation (against the OLD srtt).
-    e.sample(1_000_000);
-    try testing.expectEqual(@as(u64, 300_000), e.srtt_ns.load(.monotonic));
-    try testing.expectEqual(@as(u64, 75_000 - 18_750 + 200_000), e.rttvar_ns.load(.monotonic));
-    // Convergence: a constant stream drives rttvar toward 0 and the bound
-    // toward the round trip itself.
-    for (0..64) |_| e.sample(200_000);
-    try testing.expect(e.srtt_ns.load(.monotonic) >= 200_000 and e.srtt_ns.load(.monotonic) < 202_000);
-    try testing.expect(e.bound(std.math.maxInt(u64)) < 210_000);
-    try testing.expectEqual(e.srtt_ns.load(.monotonic), e.mean().?);
 }
 
 test "§L tie: the worth gate — OFF declines 159 eligible windows then probes 2 forming + 8 sampled holds whose MEAN opens it at ½ an entry; ON tracks the EWMA per hold and closes below ¼ (the 2:1 band); a burst's mean below ½ leaves it closed" {

@@ -3,10 +3,10 @@
 Lever 5 of `rung-10-perf-baseline-workstation.md` (decision 0003 §AB.6): one io_uring submitter's
 whole depth lands on ONE FUSE queue, so the all-own write arm (`SQUEEZEFS_FUSE_WRITE_OWN_DEPTH=0`,
 `rung-10-write-lane.md`) made that queue's worker its one saturated CPU and ships at depth 8. This
-note settles what the kernel allows, pins the saturation on this box, and leaves the lever's
-kernel half compile-checked but unbooted. Venue: the Linux workstation (`local`), kernel
-`7.2.8-7-omarchy-sqz`, head `464025a` (dist), the whole venue held (`scripts/perf/quiet.sh`),
-session `ram-sqz-rl5-prof-r1` (`/build/perf/mx/`). No default changes; nothing landed in the product.
+note settles what the kernel allows, pins the saturation on this box, drafts the lever's kernel
+half, and — once that half was booted (`7.2.8-9.30-omarchy-sqz`, series 0001–0030) — lands the
+daemon half and measures it (the last two sections). Venue: the Linux workstation (`local`), the
+whole venue held per session (`scripts/perf/quiet.sh`), sessions `ram-sqz-rl5-*` (`/build/perf/mx/`).
 
 **The kernel contract (7.2.8 + series 0001–0029, read, not run).** `fuse_uring_task_to_queue`
 picks `qid = task_cpu(current)` with no fallback; `fuse_uring_queue_fuse_req` hands the request to
@@ -52,7 +52,7 @@ if the write handler's own-lane cost (≈ 3 µs: two `readInodeOpt`, the layout 
 write-lane note's "what remains", not this lever.
 
 **The kernel half, drafted.** `scripts/kernel/proposed/0030-sqz-fuse-uring-several-rings-per-queue.patch`
-(moved into `patches-7.2/` 2026-10-19 on the owner's word, built as `linux-omarchy-sqz 7.2.8-7.30`; unbooted at this writing): the
+(moved into `patches-7.2/` 2026-10-19 on the owner's word, built as `linux-omarchy-sqz 7.2.8-7.30`, booted as `7.2.8-9.30-omarchy-sqz` the same day; the gate green on it): the
 buffer ring becomes a property of the registering ring — a queue keeps `struct fuse_ring_src`
 per ring ctx (its pinned kmbuf ring, its zc depth), each entry points at its ring's source,
 selection and the headers index go through it, a commit from another ring is refused `-EXDEV`,
@@ -60,10 +60,63 @@ and a FEATURES command (cmd_op 4) answers `FUSE_URING_FEAT_RINGS_PER_QUEUE` inli
 kernel answers `-EINVAL`: the probe). One ring still serves one queue (`-EALREADY` on a second
 pin). Compile-checked `W=1` as an out-of-tree `fuse.ko` against the built 7.2.8 tree; applies at
 `--fuzz=0` after 0029. Fuse is a module here, but swapping it means unmounting the desktop's
-gvfs/portal FUSE mounts, and a kernel install is a reboot — the owner's. The daemon half
-(unwritten): probe → `drainGroupPlan` with 2 groups per queue under kmbuf/zc (the LIFO entry pick
-engages the second ring only once the first's entries are all in userspace, so N = 2 doubles the
-single-submitter ceiling and costs nothing idle; N > 2 needs its row), `ceil(depth / 2)` entries
-per ring so the queue's depth and pinned memory are unchanged, the slot address gaining the ring
-index, both threads named `sqz-fuse-ur<qid>` (the class contract), an e2e row skipped where the
-probe reads absent — then the depth-0 A/B this lever was for.
+gvfs/portal FUSE mounts, and a kernel install is a reboot — the owner's.
+
+**The daemon half, landed** (on the booted 0030 kernel). The FEATURES probe runs once per mount
+right after the retention probe (`probes.driver.probeFeatures`: the CQE result is the mask; on
+this kernel `FEATURES → 1`, an unpatched kernel's `-EINVAL` reads absent, fail-safe), published as
+`transport_probe_rings_per_queue`. `geometry.ringsPerQueue(mode, feature)` derives 2 on a
+kmbuf/zc session where it reads present, 1 on UserEnts and wherever absent (tie test);
+`SQUEEZEFS_FUSE_RINGS_PER_QUEUE` (1–2) is the A/B pin, an explicit 2 the probe refuses fails the
+mount loud. Each drain group becomes `rings` groups — two `sqz-fuse-ur<qid>` workers per queue
+(the identical comm: the daemon's class is a prefix match, but the perf harness strips trailing
+digits, so a suffix would split the class), each with its own io_uring, kmbuf ring and
+`geometry.ringShare`: ring 0 `ceil(depth / 2)` entries at queue-level slots `0..`, ring 1 the rest
+at `ceil(depth / 2)..` (the queue's depth and the pinned bytes unchanged: 2 × 16 buffers at depth
+32). A slot's address `(qid, ent_idx, commit_id)` now carries the queue-level index (`ring_base +
+ent`); the kernel's `buf_index`, the slot table and `gent` stay ring-local; the session resolves an
+address to the ring that owns it (`locate`). The arm barrier counts member rings. `.stats`:
+`fuse_uring_rings_per_queue`. Red → green: `session` e2e "rings per queue" — `depth` LOOKUPs of
+distinct park names from threads pinned to one CPU fill both rings' shares exactly (ring 0 owes
+`ceil(depth/2)`, ring 1 the rest), the control arm owes the whole depth on its one ring; skipped
+naming the kernel feature where the probe reads absent. The executor reserves
+`MAX_RINGS_PER_QUEUE` driven lanes per queue. Suites: transport 141, session 126 (+2 skips
+unrelated), e2e 110, exec 141, kv_fs 93, lifecycle 80, probes 56, geometry 109, knobs 55, rails
+32; the smoke's kernel-aio, data-plane (with/without cache) and KILL MATRIX rows green on the
+two-ring transport.
+
+**A/B** (A = `dev` 941d343, B = the branch on it; legs A B B A B A A B, 20 s rows, 4 per side):
+
+| row | A mean (spread) | B mean (spread) | B ÷ A | daemon cores A → B |
+|---|---|---|---|---|
+| 4k randread QD1 | 89.2 k (33 %) | 97.3 k (31 %) | 1.09 | 0.60 → 0.59 |
+| 4k randread QD32×1 | 281 k (17 %) | 487 k (27 %) | **1.73** | 1.02 → 2.01 (two workers; fio's thread at 89–94 %: the submitter is now the ceiling) |
+| 4k randread QD32×4 | 871 k (13 %) | **1,249 k** (2 %) | **1.43** | 4.07 → 7.96 — the §1.4 read-IOPS bar (942 k) cleared |
+| 4k randwrite QD1 | 72.1 k (13 %) | 77.7 k (9 %) | 1.08 | 0.67 → 0.68 |
+| 4k randwrite QD32×1 | 199 k (13 %) | 202 k (12 %) | 1.02 | 1.79 → 2.27 |
+| 4k randwrite QD32×4 | 384 k (4 %) | 373 k (11 %) | 0.97 | 6.93 → 8.12 |
+
+Reads scale as designed: one submitter's QD32 spreads over the queue's two workers (p50 118 → 64
+µs). Writes at the shipped depth 8 do not move: their bound was never the worker's CPU alone.
+
+**The depth-0 question** (both arms two rings, legs D B B D D B B D on the write rows, D =
+`SQUEEZEFS_FUSE_WRITE_OWN_DEPTH=0`):
+
+| row | depth 8 mean (spread) | depth 0 mean (spread) | 0 ÷ 8 | cores 8 → 0 | p50 8 → 0 µs |
+|---|---|---|---|---|---|
+| 4k randwrite QD1 | 63.2 k (6 %) | 67.2 k (32 %) | 1.06 | 0.64 → 0.65 | 14 → 13 |
+| 4k randwrite QD32×1 | 203 k (14 %) | 169 k (11 %) | **0.83** | 2.46 → 1.66 | 139 → 175 |
+| 4k randwrite QD32×4 | 345 k (5 %) | 377 k (12 %) | 1.09 | 7.76 → 5.76 | 348 → 312 |
+
+**Ruling: the default stays 8.** All-own still regresses the one-submitter row, and not for the
+reason lever 4 named: the queue's two workers sit at 0.83 cores each, not saturated. Per write
+the two-ring workers enter 2.4–2.9× and run 1.6–1.9 passes (one ring at depth 8: 1.2 enters, 0.78
+passes — a saturated worker batched 1.3 writes per pass; a half-idle one wakes per CQE), and an
+all-own write crosses the pass boundary twice (delivery → store SQE; store CQE → postlude →
+commit), so its latency is two park/wake cycles of a worker holding 16 requests: p50 175 µs at 16
+in flight per worker is the 0.83×. The four-submitter row gains 1.09× at 0.74× the cores, as
+before. What binds the all-own write row now is the worker's pass structure under a half-idle
+load, not its CPU — the next lever is there (a bounded spin before the park while a fiber waits on
+this ring's own device op, the ack-spin's rule; or the knee re-swept with 16 in flight per worker),
+and the 4k write IOPS gap (373–384 k vs the 727 k bar) stays open. The full-matrix A B B A on the
+shipped default is in the table below.

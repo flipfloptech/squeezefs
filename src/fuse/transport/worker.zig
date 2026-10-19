@@ -1385,12 +1385,24 @@ pub const Group = struct {
     }
 
     /// Whether a held WRITE may run on the worker's own lane now: fewer
-    /// handlers than `Shared.write_own_depth` live there (an acquire load;
-    /// the lane recycles a fiber at its finish), or no bound.
+    /// handlers than this ring's share of `Shared.write_own_depth` live
+    /// there (an acquire load; the lane recycles a fiber at its finish), or
+    /// no bound.
     fn ownLaneHasRoom(self: *Group) bool {
         const l = self.lane orelse return false;
-        const depth = self.shared.write_own_depth;
+        const depth = ownDepthShare(self.shared.write_own_depth, self.shared.rings_per_queue);
         return depth == 0 or l.liveFibers() < depth;
+    }
+
+    /// The knee (`SQUEEZEFS_FUSE_WRITE_OWN_DEPTH`) was measured per QUEUE —
+    /// 8 of a queue's 32 in flight on the worker's own lane — so a queue
+    /// served by `rings` workers splits it (ceil: a knee of 1 still admits
+    /// one own write per ring; 0 stays unbounded). Measured on the
+    /// workstation with two rings: the whole knee per ring read 4k randwrite
+    /// QD32×4 0.93× of one ring; the share 1.05× (rung-10-workers-per-queue).
+    pub fn ownDepthShare(write_own_depth: u32, rings: u32) u32 {
+        if (write_own_depth == 0) return 0;
+        return @intCast(derive.ceilDiv(write_own_depth, rings));
     }
 
     /// The lane's bound on this pass's wait (its timers, its owed ring ops).
@@ -3263,6 +3275,15 @@ test "tags: every op kind round-trips for ents 0, 1, 31, 255 and 16383; the wake
     try testing.expectEqual(@as(u32, 512 << 10), fusionCeiling(4 << 20));
     try testing.expectEqual(@as(u32, 4096), fusionCeiling(8192));
     try testing.expect(isDisconnect(.NOTCONN) and isDisconnect(.NODEV) and !isDisconnect(.AGAIN));
+}
+
+test "the own-lane knee is a queue's: one ring takes it whole, two rings split it ceil-wise (8 → 4, 7 → 4, 1 → 1), 0 stays unbounded" {
+    try testing.expectEqual(@as(u32, 8), Group.ownDepthShare(8, 1));
+    try testing.expectEqual(@as(u32, 4), Group.ownDepthShare(8, 2));
+    try testing.expectEqual(@as(u32, 4), Group.ownDepthShare(7, 2));
+    try testing.expectEqual(@as(u32, 1), Group.ownDepthShare(1, 2));
+    try testing.expectEqual(@as(u32, 0), Group.ownDepthShare(0, 2));
+    try testing.expectEqual(@as(u32, 0), Group.ownDepthShare(0, 1));
 }
 
 test "the tick's re-check: on a DEFER_TASKRUN ring a completion in the CQ at a -ETIME verdict that was empty at the park is a lost wake; a CQ that already held work at the park, or a posture whose CQ moves outside the worker's enters, classes nothing lost (late, counted beside)" {

@@ -123,6 +123,17 @@ pub const DRAIN_LEASE_BUDGET_NS: u64 = 100 * std.time.ns_per_ms;
 /// parks on the worker's own ring, never a sleep-poll (Q14).
 pub const RESIDENCY_NS: u64 = 30 * std.time.ns_per_s;
 pub const RESIDENCY_PARK_NS: u64 = 10 * std.time.ns_per_ms;
+/// Held WRITE handlers live on the worker's own lane before the next is
+/// handed to the CPU's lane instead. One fio thread's whole queue depth
+/// lands on ONE FUSE queue (the kernel picks it by the submitter's CPU),
+/// so past a few in flight the queue's worker is its one saturated CPU:
+/// a write costs it ≈ 6 µs run on its own lane against ≈ 2 µs handed off
+/// (the dispatch and the two wakes) while the lane thread carries the
+/// rest — below this depth the handoff's latency is the dominant cost
+/// (QD1 p50 18.8 → 10.3 µs on the own lane), past it the second thread
+/// is (all-own at QD32 on one queue read 0.78× the two-thread arm;
+/// rung-10-write-lane).
+pub const WRITE_OWN_LANE_DEPTH: u32 = 8;
 /// How long the drain waits for its RELEASE CQEs: the kernel answers a
 /// RELEASE_PAYLOAD inline in the submitting enter (`fuse_uring_cmd` returns
 /// the verdict, never -EIOCBQUEUED), so the wait is one enter and the bound
@@ -210,6 +221,10 @@ pub var dispatch_refused: counters.ShardedCounter = .{};
 /// handoff each way).
 pub var handler_dispatches_own: counters.ShardedCounter = .{};
 pub var handler_dispatches_foreign: counters.ShardedCounter = .{};
+/// `transport_write_spills`: a held WRITE the worker's own lane had no
+/// room for (`WRITE_OWN_LANE_DEPTH` handlers live) — handed to the CPU's
+/// lane, the two-thread arm (counted among the foreign dispatches too).
+pub var write_spills: counters.ShardedCounter = .{};
 /// `transport_lane_pumps`: passes that ran the worker's lane.
 pub var lane_pumps: counters.ShardedCounter = .{};
 /// `transport_park_backstop_ticks`: bounded parks that ticked out
@@ -1337,6 +1352,14 @@ pub const Group = struct {
         const l = self.lane orelse return;
         lane_pumps.inc();
         l.pumpDriven();
+    }
+
+    /// Whether a held WRITE may run on the worker's own lane now: fewer
+    /// than `WRITE_OWN_LANE_DEPTH` handlers live there (an acquire load;
+    /// the lane recycles a fiber at its finish).
+    fn ownLaneHasRoom(self: *Group) bool {
+        const l = self.lane orelse return false;
+        return l.liveFibers() < WRITE_OWN_LANE_DEPTH;
     }
 
     /// The lane's bound on this pass's wait (its timers, its owed ring ops).
@@ -2835,7 +2858,9 @@ pub const Group = struct {
         const cpu: ?u16 = if (self.shared.qid_is_cpu) m.qid else null;
         // The worker's own lane: the handler runs on this thread (§AB.3).
         const held_write = if (lease) |l| l.held else false;
-        const own = if (onWorkerLane(req.op, self.shared.no_open, held_write)) self.lane else null;
+        const own_write = held_write and self.ownLaneHasRoom();
+        if (held_write and !own_write) write_spills.inc();
+        const own = if (onWorkerLane(req.op, self.shared.no_open, own_write)) self.lane else null;
         const lane = own orelse self.shared.exec.homeLane(cpu, self.shared.nodeOf(m.qid));
         if (own != null) {
             handler_dispatches_own.inc();
@@ -3077,15 +3102,17 @@ pub const Group = struct {
 threadlocal var current_group: ?*Group = null;
 
 /// Whether a request's handler may run on the worker's own lane (decision
-/// 0003 §AB.3): the namespace and attribute class, and a HELD WRITE
-/// (`held_write`: the zero-copy slot the W1 hold gate admitted — a striped
-/// passthrough file, non-extending, one block, ≤ `PATCH_MAX`, not
-/// stream-adjacent). A held write's one device leg is `WRITE_FIXED(slot →
-/// device)` on THIS worker's ring (`storeFromForeign`): its wait parks the
-/// handler's FIBER on the store cell and the CQE is this thread's own reap,
-/// so the queue's ring never stalls; its fall-through arm (the extent park
-/// on RAM custody) touches no device. The rest of the data class — READ,
-/// an extracted or gate-declined WRITE, the syncs, RELEASE (a close drains
+/// 0003 §AB.3): the namespace and attribute class, and a HELD WRITE the
+/// lane has room for (`own_write`: the zero-copy slot the W1 hold gate
+/// admitted — a striped passthrough file, non-extending, one block, ≤
+/// `PATCH_MAX`, not stream-adjacent — with fewer than
+/// `WRITE_OWN_LANE_DEPTH` handlers live on the lane). A held write's one
+/// device leg is `WRITE_FIXED(slot → device)` on THIS worker's ring
+/// (`storeFromForeign`): its wait parks the handler's FIBER on the store
+/// cell and the CQE is this thread's own reap, so the queue's ring never
+/// stalls; its fall-through arm (the extent park on RAM custody) touches no
+/// device. The rest of the data class — READ, an extracted, gate-declined
+/// or spilled WRITE, the syncs, RELEASE (a close drains
 /// the file's write-back), a truncating SETATTR / OPEN / CREATE, FALLOCATE,
 /// COPY_FILE_RANGE, LSEEK, IOCTL, POLL, the locks, BMAP, the forgets (an
 /// eviction reclaims), and a no-open session's FLUSH (it carries RELEASE's
@@ -3093,7 +3120,7 @@ threadlocal var current_group: ?*Group = null;
 /// a data device through a completion that parks the calling THREAD
 /// (`sync/completion.zig`, 0003 WP-C row 14), and on the worker that wait
 /// would stall the queue's ring.
-pub fn onWorkerLane(op: codec.Request, no_open: bool, held_write: bool) bool {
+pub fn onWorkerLane(op: codec.Request, no_open: bool, own_write: bool) bool {
     const o_trunc: u32 = @bitCast(linux.O{ .TRUNC = true });
     return switch (op) {
         .lookup, .getattr, .readlink, .symlink, .mknod, .mkdir, .unlink, .rmdir, .rename, .rename2, .link => true,
@@ -3103,7 +3130,7 @@ pub fn onWorkerLane(op: codec.Request, no_open: bool, held_write: bool) bool {
         .setattr => |s| s.valid & abi.FATTR_SIZE == 0,
         .open => |o| o.flags & o_trunc == 0,
         .create => |c| c.flags & o_trunc == 0,
-        .write => held_write,
+        .write => own_write,
         else => false,
     };
 }

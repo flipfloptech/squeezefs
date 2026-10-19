@@ -1940,6 +1940,7 @@ pub const Session = struct {
         try field(w, "transport_dispatch_refused", worker.dispatch_refused.load());
         try field(w, "transport_handler_dispatches_own", worker.handler_dispatches_own.load());
         try field(w, "transport_handler_dispatches_foreign", worker.handler_dispatches_foreign.load());
+        try field(w, "transport_write_spills", worker.write_spills.load());
         try field(w, "transport_lane_pumps", worker.lane_pumps.load());
         try field(w, "transport_payload_leases", slot.payload_leases.load());
         try field(w, "transport_dest_dma_leases", slot.dest_dma_leases.load());
@@ -2561,7 +2562,7 @@ test "e2e: the write-back timer's close (decision 0003 §AJ) — on the real ker
     try testing.expectEqual(@as(u64, 0), rig.fs.file_releases.load(.monotonic));
 }
 
-test "the dispatch law's FLUSH arm (decision 0003 §AF): a no-open FLUSH carries RELEASE's drain and is the data class — the CPU's lane — while the control arm's runs on the worker's lane; a WRITE runs on the worker's lane iff its payload is HELD (the W1 hold gate's slot: its one DMA is this worker's own bridge), an extracted WRITE and a READ stay the data class; the rest of the law is unchanged" {
+test "the dispatch law's FLUSH arm (decision 0003 §AF): a no-open FLUSH carries RELEASE's drain and is the data class — the CPU's lane — while the control arm's runs on the worker's lane; a WRITE runs on the worker's lane iff its payload is HELD and the lane has room (the W1 hold gate's slot: its one DMA is this worker's own bridge), an extracted or spilled WRITE and a READ stay the data class; the rest of the law is unchanged" {
     const flush: codec.Request = .{ .flush = .{ .fh = 0, .lock_owner = 0 } };
     try testing.expect(worker.onWorkerLane(flush, false, false));
     try testing.expect(!worker.onWorkerLane(flush, true, false));
@@ -3485,6 +3486,7 @@ test "e2e zc WRITE on the worker's lane (decision 0003 §AB.3, the write arm): a
         // the same thread — not one eventfd write to a worker.
         const d0 = Helper.dispatches(s);
         const w0 = slot.wake_writes.load();
+        const spills0 = worker.write_spills.load();
         const held0 = rig.fs.held_writes.load(.monotonic);
         var i: usize = 0;
         while (i < 16) : (i += 1) {
@@ -3496,6 +3498,8 @@ test "e2e zc WRITE on the worker's lane (decision 0003 §AB.3, the write arm): a
         const d1 = Helper.dispatches(s);
         try testing.expectEqual(d0.own + 16, d1.own);
         try testing.expectEqual(d0.foreign, d1.foreign);
+        // One write in flight at a time: the lane always has room.
+        try testing.expectEqual(spills0, worker.write_spills.load());
         try testing.expectEqual(w0, slot.wake_writes.load());
         // Unaligned ⇒ extracted at delivery ⇒ the data class: the CPU's lane.
         const tail = "off the worker";

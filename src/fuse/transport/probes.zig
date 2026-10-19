@@ -80,6 +80,9 @@ pub var retention_gauge: counters.Gauge = .{};
 pub var time_limits_gauge: counters.Gauge = .{};
 /// `transport_probe_cap_sys_admin`: 1 when CapEff bit 21 is set.
 pub var cap_gauge: counters.Gauge = .{};
+/// `transport_probe_rings_per_queue`: 1 when FEATURES answered with
+/// `FUSE_URING_FEAT_RINGS_PER_QUEUE` (series patch 0030).
+pub var rings_per_queue_gauge: counters.Gauge = .{};
 
 // ---------------------------------------------------------------------------
 // 1. The kmbuf opcode ladder (porting spec §2.1)
@@ -171,6 +174,28 @@ pub fn retentionVerdict(res: ?i32) Verdict {
         .NOTCONN, .NOENT => .present,
         else => .absent,
     };
+}
+
+// ---------------------------------------------------------------------------
+// 2b. The FEATURES probe (series patch 0030)
+// ---------------------------------------------------------------------------
+
+/// `FEATURES` (cmd_op 4) on the plain fuse fd after the INIT reply: a
+/// non-negative result IS the `FUSE_URING_FEAT_*` mask; `-EINVAL` /
+/// `-EOPNOTSUPP` (the opcode switch's default on a kernel without the
+/// patch) ⇒ no features; any other errno or no answer within the wait ⇒
+/// none, fail-safe (a feature read present when it is not would register
+/// a second ring on a queue whose kernel recycles buffers into the wrong
+/// ring — the stall class the patch exists to prevent).
+pub fn featuresMask(res: ?i32) u32 {
+    const r = res orelse return 0;
+    if (r < 0) return 0;
+    return @intCast(r);
+}
+
+/// Several rings per queue: the mask's bit.
+pub fn ringsPerQueueVerdict(mask: u32) Verdict {
+    return if (mask & abi.FUSE_URING_FEAT_RINGS_PER_QUEUE != 0) .present else .absent;
 }
 
 // ---------------------------------------------------------------------------
@@ -282,10 +307,11 @@ pub fn usesKmbuf(m: geometry.BufferMode) bool {
 }
 
 /// Publish every verdict (after the mode is decided).
-pub fn publish(v: Verdicts, retention: Verdict, time_limits: Verdict, cap: bool, mode: geometry.BufferMode) void {
+pub fn publish(v: Verdicts, retention: Verdict, rings_per_queue: Verdict, time_limits: Verdict, cap: bool, mode: geometry.BufferMode) void {
     kmbuf_gauge.set(if (v.kmbuf.opcodes()) |p| p.register else 0);
     zc_gauge.set(v.zc.gauge());
     retention_gauge.set(retention.gauge());
+    rings_per_queue_gauge.set(rings_per_queue.gauge());
     time_limits_gauge.set(time_limits.gauge());
     cap_gauge.set(@intFromBool(cap));
     mode_gauge.set(modeGauge(mode));
@@ -366,25 +392,39 @@ pub const driver = if (is_linux) struct {
         return capBitFromStatus(text, CAP_IPC_LOCK_BIT) orelse false;
     }
 
-    /// The retention probe live: one `RELEASE_PAYLOAD` on the PLAIN fuse fd
-    /// from a scratch SQE128 ring, `commit_id = u64::MAX`, waited ≤ 1 s.
-    pub fn probeRetention(fuse_fd: linux.fd_t) Verdict {
-        var ring = uring128.Ring128.init(SCRATCH_RING_ENTRIES, 0) catch return .absent;
+    /// One FUSE uring command on the PLAIN fuse fd from a scratch SQE128
+    /// ring (`qid` 0, `commit_id = u64::MAX`), waited ≤ 1 s: the CQE result,
+    /// or null when unanswered (the fail-safe class).
+    fn probeCmd(fuse_fd: linux.fd_t, cmd_op: u32) ?i32 {
+        var ring = uring128.Ring128.init(SCRATCH_RING_ENTRIES, 0) catch return null;
         defer ring.deinit();
         var cmd: [uring128.cmd_len]u8 = @splat(0);
         const req: abi.fuse_uring_cmd_req = .{ .flags = 0, .commit_id = std.math.maxInt(u64), .qid = 0, .init_flags = 0, .queue_depth = 0, .padding = @splat(0) };
         cmd[0..@sizeOf(abi.fuse_uring_cmd_req)].* = abi.encode(req);
-        const sqe = ring.getSqe() orelse return .absent;
-        uring128.prepUringCmd(sqe, .{ .raw = fuse_fd }, abi.FUSE_IO_URING_CMD_RELEASE_PAYLOAD, &cmd);
+        const sqe = ring.getSqe() orelse return null;
+        uring128.prepUringCmd(sqe, .{ .raw = fuse_fd }, cmd_op, &cmd);
         sqe.user_data = 1;
-        const entered = ring.submitAndWaitTimed(1, RETENTION_PROBE_WAIT_NS) catch return .absent;
-        _ = entered;
+        _ = ring.submitAndWaitTimed(1, RETENTION_PROBE_WAIT_NS) catch return null;
         var cqes: [1]uring128.Cqe32 = undefined;
-        const n = ring.copyCqes(&cqes, 0) catch return .absent;
-        const res: ?i32 = if (n == 1 and cqes[0].user_data == 1) cqes[0].res else null;
+        const n = ring.copyCqes(&cqes, 0) catch return null;
+        return if (n == 1 and cqes[0].user_data == 1) cqes[0].res else null;
+    }
+
+    /// The retention probe live: one `RELEASE_PAYLOAD` with an impossible id.
+    pub fn probeRetention(fuse_fd: linux.fd_t) Verdict {
+        const res = probeCmd(fuse_fd, abi.FUSE_IO_URING_CMD_RELEASE_PAYLOAD);
         const v = retentionVerdict(res);
         if (res) |r| log.info("transport probe: RELEASE_PAYLOAD(commit_id=MAX) → {d} ⇒ retention {t}", .{ r, v }) else log.info("transport probe: RELEASE_PAYLOAD unanswered within {d} s ⇒ retention absent (fail-safe)", .{RETENTION_PROBE_WAIT_NS / std.time.ns_per_s});
         return v;
+    }
+
+    /// The FEATURES probe live (series patch 0030): the kernel's
+    /// `FUSE_URING_FEAT_*` mask, 0 on a kernel without the command.
+    pub fn probeFeatures(fuse_fd: linux.fd_t) u32 {
+        const res = probeCmd(fuse_fd, abi.FUSE_IO_URING_CMD_FEATURES);
+        const mask = featuresMask(res);
+        if (res) |r| log.info("transport probe: FEATURES → {d} ⇒ mask 0x{x} (rings per queue {t})", .{ r, mask, ringsPerQueueVerdict(mask) }) else log.info("transport probe: FEATURES unanswered within {d} s ⇒ no features (fail-safe)", .{RETENTION_PROBE_WAIT_NS / std.time.ns_per_s});
+        return mask;
     }
 } else struct {};
 
@@ -436,6 +476,19 @@ test "the retention verdict table: ENOTCONN/ENOENT present; EINVAL/EOPNOTSUPP/0/
     try testing.expectEqual(Verdict.absent, retentionVerdict(neg(.AGAIN)));
     try testing.expectEqual(Verdict.absent, retentionVerdict(null));
     try testing.expectEqual(@as(u64, 1), Verdict.present.gauge());
+}
+
+test "the FEATURES verdict table: a non-negative result is the mask (bit 0 ⇒ rings per queue present); EINVAL/EOPNOTSUPP (no such command), any other errno and no answer read as no features" {
+    try testing.expectEqual(@as(u32, 1), featuresMask(1));
+    try testing.expectEqual(Verdict.present, ringsPerQueueVerdict(featuresMask(1)));
+    try testing.expectEqual(Verdict.present, ringsPerQueueVerdict(featuresMask(0b11)));
+    try testing.expectEqual(Verdict.absent, ringsPerQueueVerdict(featuresMask(0b10)));
+    try testing.expectEqual(Verdict.absent, ringsPerQueueVerdict(featuresMask(0)));
+    try testing.expectEqual(@as(u32, 0), featuresMask(neg(.INVAL)));
+    try testing.expectEqual(@as(u32, 0), featuresMask(neg(.OPNOTSUPP)));
+    try testing.expectEqual(@as(u32, 0), featuresMask(neg(.NOTCONN)));
+    try testing.expectEqual(@as(u32, 0), featuresMask(neg(.AGAIN)));
+    try testing.expectEqual(@as(u32, 0), featuresMask(null));
 }
 
 test "the zc surface is a conjunction of kmbuf, CapEff bit 21 and the sparse table; CapEff parses from /proc/self/status text" {

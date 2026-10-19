@@ -622,8 +622,11 @@ pub const Shared = struct {
     /// no holder will end the connection, so the residency has nothing to
     /// wait for (the connection ends at the process's exit).
     detached: std.atomic.Value(bool) = .init(false),
-    /// The arm barrier: queues whose REGISTERs were all PUSHED.
+    /// The arm barrier: member rings (one per queue per ring) whose
+    /// REGISTERs were all PUSHED; complete at `nqueues × rings_per_queue`.
     queues_registered: std.atomic.Value(u32) = .init(0),
+    /// Rings (groups, workers) registered on each queue (`geometry.ringsPerQueue`).
+    rings_per_queue: u32 = 1,
     /// Completed by the worker that pushes the last queue's REGISTERs, or by
     /// a failing worker.
     barrier: completion.Completion(BarrierOutcome) = .{},
@@ -787,7 +790,12 @@ pub const Group = struct {
     shared: *Shared,
     index: u16,
     members: []Member,
+    /// This ring's entries per member queue (its share of the queue's depth).
     depth: u32,
+    /// The queue-level slot index of this ring's ent 0 (`geometry.RingShare`):
+    /// the session addresses a slot by `(qid, ring_base + ent)`; the kernel's
+    /// `buf_index`, the slot table and `gent` stay ring-local.
+    ring_base: u16,
     payload_len: usize,
     stride: usize,
     /// UserEnts: ONE anonymous mapping for every member's payload buffers.
@@ -890,13 +898,17 @@ pub const Group = struct {
     const RingError = error{ RingSetupFailed, KmbufRingEnomem };
 
     /// Allocate the group's tables and buffers (startup; nothing per op).
-    pub fn init(gpa: std.mem.Allocator, shared: *Shared, index: u16, qids: []const u16, affinity: ?placement.CpuSet) InitError!*Group {
-        const depth = shared.plan.depth;
+    pub fn init(gpa: std.mem.Allocator, shared: *Shared, index: u16, qids: []const u16, share: geometry.RingShare, affinity: ?placement.CpuSet) InitError!*Group {
+        const depth = share.depth;
         const gents: usize = @as(usize, qids.len) * depth;
         const payload_len: usize = shared.plan.payload_sz;
         const stride: usize = @intCast(derive.alignUp(payload_len, ARENA_ALIGN));
         // Width 1 under kmbuf/zc: the fixed index 0 / bgid 0 serve one queue.
         assert(!shared.usesKmbuf() or qids.len == 1);
+        // A second ring on a queue exists only there (the kernel's per-source
+        // buffer ring, patch 0030); UserEnts groups take the whole depth.
+        assert(share.base == 0 or shared.usesKmbuf());
+        assert(share.base + depth <= shared.plan.depth);
 
         const self = try gpa.create(Group);
         errdefer gpa.destroy(self);
@@ -906,6 +918,7 @@ pub const Group = struct {
             .index = index,
             .members = &.{},
             .depth = depth,
+            .ring_base = share.base,
             .payload_len = payload_len,
             .stride = stride,
             .arena = &.{},
@@ -1131,7 +1144,7 @@ pub const Group = struct {
     /// The gent's bounce window in the session slab (zc only).
     fn bounce(self: *Group, gent: u32) []u8 {
         const s = self.shared.slab orelse return &.{};
-        return s.window(self.memberOf(gent).qid, self.entIdxOf(gent), self.payload_len);
+        return s.window(self.memberOf(gent).qid, self.slotIdx(self.entIdxOf(gent)), self.payload_len);
     }
 
     /// The gent's bounce window in its queue's fd face (zc only).
@@ -1140,7 +1153,7 @@ pub const Group = struct {
     }
 
     fn bounceOffset(self: *Group, gent: u32) u64 {
-        return self.shared.slab.?.fdOffsetOf(self.entIdxOf(gent));
+        return self.shared.slab.?.fdOffsetOf(self.slotIdx(self.entIdxOf(gent)));
     }
 
     /// The window's resident high-water rises to `len` (page-rounded,
@@ -1182,7 +1195,7 @@ pub const Group = struct {
                 const ent = m.slots.ent(e);
                 if (ent.owing() != null or ent.lease.leased()) continue;
                 if (now -| self.bounce_idle_tick[gent] < min_idle_ticks) continue;
-                if (!sl.punch(m.qid, e)) continue;
+                if (!sl.punch(m.qid, self.slotIdx(e))) continue;
                 self.bounce_populated[gent] = 0;
                 zc_bounce_resident_bytes.sub(populated);
                 zc_bounce_trimmed_bytes.add(populated);
@@ -1194,11 +1207,28 @@ pub const Group = struct {
         return member_slot * self.depth + ent_idx;
     }
 
+    /// Whether a queue-level slot index (`ring_base + ent`) is this ring's.
+    pub fn ownsSlot(self: *const Group, slot_idx: u16) bool {
+        return slot_idx >= self.ring_base and slot_idx < self.ring_base + self.depth;
+    }
+
+    /// The gent of a queue-level slot index this ring owns (`ownsSlot`).
+    pub fn gentOfSlot(self: *const Group, member_slot: u32, slot_idx: u16) u32 {
+        assert(self.ownsSlot(slot_idx));
+        return self.gentOf(member_slot, slot_idx - self.ring_base);
+    }
+
+    /// The queue-level slot index of a ring-local ent (the address a
+    /// request carries and the bounce slab's window).
+    fn slotIdx(self: *const Group, ent_idx: u16) u16 {
+        return self.ring_base + ent_idx;
+    }
+
     fn memberOf(self: *Group, gent: u32) *Member {
         return &self.members[gent / self.depth];
     }
 
-    fn entIdxOf(self: *const Group, gent: u32) u16 {
+    pub fn entIdxOf(self: *const Group, gent: u32) u16 {
         return @intCast(gent % self.depth);
     }
 
@@ -1473,7 +1503,7 @@ pub const Group = struct {
         };
         if (!self.ring.armWake()) return error.RingSetupFailed;
         const posture = if (self.shared.sqpoll) "sqpoll" else uring128.taskrun_ladder[self.ring_rung].name;
-        log.info("transport: group {d} (qids {d}..{d}, {d} members × depth {d}, {t}) ring armed on rung {d} ({s}), sq {d}, payload {d} B, arena {d} B, kmbuf {d} B", .{ self.index, self.members[0].qid, self.members[self.members.len - 1].qid, self.members.len, self.depth, self.shared.mode, self.ring_rung, posture, entries, self.payload_len, self.arena.len, if (self.kmb) |k| k.pinnedBytes() else 0 });
+        log.info("transport: group {d} (qids {d}..{d}, {d} members × depth {d} at slots {d}.., {t}) ring armed on rung {d} ({s}), sq {d}, payload {d} B, arena {d} B, kmbuf {d} B", .{ self.index, self.members[0].qid, self.members[self.members.len - 1].qid, self.members.len, self.depth, self.ring_base, self.shared.mode, self.ring_rung, posture, entries, self.payload_len, self.arena.len, if (self.kmb) |k| k.pinnedBytes() else 0 });
     }
 
     // ---- SQE pushes (append only; the loop-bottom enter flushes) ----
@@ -1528,7 +1558,7 @@ pub const Group = struct {
         if (m.initial_pending != 0) return;
         m.counted = true;
         const n = self.shared.queues_registered.fetchAdd(1, .acq_rel) + 1;
-        if (n == self.shared.nqueues) _ = self.shared.barrier.complete(.armed);
+        if (n == self.shared.nqueues * self.shared.rings_per_queue) _ = self.shared.barrier.complete(.armed);
     }
 
     fn onRegisterRefused(self: *Group, member_slot: u32, ent_idx: u16, errno: linux.E, now: u64) void {
@@ -2150,7 +2180,7 @@ pub const Group = struct {
         const m = self.memberOf(gent);
         const e = self.entIdxOf(gent);
         const msg = self.cells.msg(gent);
-        if (msg.slot.qid != m.qid or msg.slot.ent_idx != e) {
+        if (msg.slot.qid != m.qid or msg.slot.ent_idx != self.slotIdx(e)) {
             slot.replies_refused_stale.inc();
             self.cells.recycle(gent);
             return;
@@ -2633,7 +2663,7 @@ pub const Group = struct {
         if (hold) {
             ent.held = true;
             self.held_len[gent] = win.size;
-            const lease = slot.PayloadLease.acquireHeld(&ent.lease, self.waker(), win.size, ent.class, m.qid, ent_idx, gent, self.heldFace());
+            const lease = slot.PayloadLease.acquireHeld(&ent.lease, self.waker(), win.size, ent.class, m.qid, self.slotIdx(ent_idx), gent, self.heldFace());
             self.deliverParsed(gent, &.{}, announced, lease);
             return;
         }
@@ -2663,7 +2693,7 @@ pub const Group = struct {
         const req: fsv.Request = .{ .header = delivery.header, .op = parsed };
         const m = self.memberOf(gent);
         const ent_idx = self.entIdxOf(gent);
-        const sref: slot.SlotRef = .{ .qid = m.qid, .ent_idx = ent_idx, .commit_id = m.slots.ent(ent_idx).owing().?.commit_id };
+        const sref: slot.SlotRef = .{ .qid = m.qid, .ent_idx = self.slotIdx(ent_idx), .commit_id = m.slots.ent(ent_idx).owing().?.commit_id };
         self.dispatch(gent, req, sref, null);
     }
 
@@ -2686,7 +2716,7 @@ pub const Group = struct {
             return self.failEnt(gent, codec.parseErrno(e));
         };
         const req: fsv.Request = .{ .header = delivery.header, .op = parsed };
-        const sref: slot.SlotRef = .{ .qid = m.qid, .ent_idx = ent_idx, .commit_id = commit_id };
+        const sref: slot.SlotRef = .{ .qid = m.qid, .ent_idx = self.slotIdx(ent_idx), .commit_id = commit_id };
         switch (parsed) {
             .forget => |f| {
                 forget_entries.inc();
@@ -2732,7 +2762,7 @@ pub const Group = struct {
             meta_inline_serves.inc();
             const m = self.memberOf(gent);
             const e = self.entIdxOf(gent);
-            self.local_msgs[gent] = commit_queue.Msg.reply(.{ .qid = m.qid, .ent_idx = e, .commit_id = m.slots.ent(e).owing().?.commit_id }, reply);
+            self.local_msgs[gent] = commit_queue.Msg.reply(.{ .qid = m.qid, .ent_idx = self.slotIdx(e), .commit_id = m.slots.ent(e).owing().?.commit_id }, reply);
             self.commitReady(gent, &self.local_msgs[gent], .local);
             return;
         }
@@ -2750,7 +2780,7 @@ pub const Group = struct {
             flush_inline_serves.inc();
             const m = self.memberOf(gent);
             const e = self.entIdxOf(gent);
-            self.local_msgs[gent] = commit_queue.Msg.reply(.{ .qid = m.qid, .ent_idx = e, .commit_id = m.slots.ent(e).owing().?.commit_id }, reply);
+            self.local_msgs[gent] = commit_queue.Msg.reply(.{ .qid = m.qid, .ent_idx = self.slotIdx(e), .commit_id = m.slots.ent(e).owing().?.commit_id }, reply);
             self.commitReady(gent, &self.local_msgs[gent], .local);
             return;
         }
@@ -2768,7 +2798,7 @@ pub const Group = struct {
         const cid = m.slots.ent(e).owing().?.commit_id;
         if (self.shared.zeroCopy()) {
             // The worker's own message: a bridge parks it in `local_msgs`.
-            self.local_msgs[gent] = commit_queue.Msg.reply(.{ .qid = m.qid, .ent_idx = e, .commit_id = cid }, r);
+            self.local_msgs[gent] = commit_queue.Msg.reply(.{ .qid = m.qid, .ent_idx = self.slotIdx(e), .commit_id = cid }, r);
             self.commitReadyZc(gent, &self.local_msgs[gent], .local);
             return;
         }
@@ -2783,7 +2813,7 @@ pub const Group = struct {
     fn commitReadFdSource(self: *Group, gent: u32, req: fsv.Request, in: abi.fuse_read_in, fs: fsv.FdSource) void {
         const m = self.memberOf(gent);
         const e = self.entIdxOf(gent);
-        const sref: slot.SlotRef = .{ .qid = m.qid, .ent_idx = e, .commit_id = m.slots.ent(e).owing().?.commit_id };
+        const sref: slot.SlotRef = .{ .qid = m.qid, .ent_idx = self.slotIdx(e), .commit_id = m.slots.ent(e).owing().?.commit_id };
         // A short serve (EOF inside the requested pages) takes the copy arm:
         // the fill-pool view has no zeros to bridge past its bytes.
         const served: usize = @min(fs.body.len, in.size);

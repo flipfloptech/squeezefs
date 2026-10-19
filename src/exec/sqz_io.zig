@@ -65,7 +65,19 @@ pub const LaneClass = stats.LaneClass;
 /// — resident handler fibers cannot exceed the slot count (RES-18:
 /// backpressure is the kernel's), plus `spawn_slack` for the lane's own
 /// detached helpers.
-pub const FuseGeometry = struct { nqueues: u32, q_depth: u32 };
+pub const FuseGeometry = struct {
+    nqueues: u32,
+    q_depth: u32,
+    /// The most rings (drain workers, each driving a lane of its own) the
+    /// transport registers on one queue: the driven-lane slots reserved per
+    /// queue (`fuse/geometry.MAX_RINGS_PER_QUEUE`; the mount probes the
+    /// kernel for the count only after this executor exists).
+    rings_per_queue: u32 = 1,
+};
+
+/// The fibers a lane holds beyond its slot count for its own detached
+/// helpers (the prefetch issuer, the hold ceremony; charter §4's capacity
+/// law above).
 pub const spawn_slack: u32 = 16;
 
 /// Default populations (a handful of mostly-parked loops — tie-tested).
@@ -360,7 +372,7 @@ pub const SqzIo = struct {
         self.fuse_alive = alive;
         self.fuse_homes = homes;
         if (options.fuse) |g| {
-            self.driven = try gpa.alloc(?*Lane, g.nqueues);
+            self.driven = try gpa.alloc(?*Lane, g.nqueues * g.rings_per_queue);
             @memset(self.driven, null);
         }
         errdefer gpa.free(self.driven);

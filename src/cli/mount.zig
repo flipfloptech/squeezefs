@@ -373,7 +373,7 @@ pub fn run(p: cli.Process, m: args.Mount) u8 {
         .facts = facts,
         .budget_bytes = budget_bytes,
         .budget = &mem_budget.authority,
-        .fuse = .{ .nqueues = facts.possible_cpus, .q_depth = fuse_geometry.Q_DEPTH_DESIRED },
+        .fuse = .{ .nqueues = facts.possible_cpus, .q_depth = fuse_geometry.Q_DEPTH_DESIRED, .rings_per_queue = fuse_geometry.MAX_RINGS_PER_QUEUE },
     }) catch |e| {
         p.stderr.print("squeezefs mount: executor init failed ({s})\n", .{@errorName(e)}) catch {};
         if (reporter) |*r| {

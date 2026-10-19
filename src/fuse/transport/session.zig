@@ -212,6 +212,10 @@ pub const MountError = error{
     /// An explicit `SQUEEZEFS_FUSE_BUFFER_MODE` the probes refused (named
     /// in the log) — the only degrade point is the probe; never a downgrade.
     BufferModeRefused,
+    /// An explicit `SQUEEZEFS_FUSE_RINGS_PER_QUEUE` above what the FEATURES
+    /// probe admits (named in the log): the kernel would accept the second
+    /// ring and recycle its buffers into the first's.
+    RingsPerQueueRefused,
     /// The kmbuf ring's registration answered ENOMEM after every retry
     /// (`kmbuf.Error`): the probe decided the mode, so the law is fail
     /// loud, never degrade; `Config.refusal` carries the region and levers.
@@ -888,6 +892,12 @@ pub const Session = struct {
     verdicts: probes.Verdicts = .{ .kmbuf = .absent, .zc = .absent },
     retention: probes.Verdict = .absent,
     time_limits: probes.Verdict = .absent,
+    /// The FEATURES probe's rings-per-queue bit (series patch 0030).
+    rings_feature: probes.Verdict = .absent,
+    /// Rings (groups, `sqz-fuse-ur<qid>` workers) registered on each queue:
+    /// `drain_groups.count() × rings_per_queue` groups, a queue's rings at
+    /// consecutive indices from `qid_group[qid]`.
+    rings_per_queue: u32 = 1,
     /// `SQUEEZEFS_READ_ZC_SERVE` ∧ zero-copy: what INIT told the filesystem.
     read_zc_serve: bool = false,
     /// The request timeout the kernel applies, seconds (0 = none).
@@ -918,14 +928,29 @@ pub const Session = struct {
     pub const SlotRef = fsv.ReplySlot;
     pub const PayloadLease = slot.PayloadLease;
 
+    /// A slot address resolved to its ring: the group among the queue's
+    /// `rings_per_queue` (consecutive from `qid_group[qid]`) whose share
+    /// holds the queue-level slot index, and the gent there. Null for an
+    /// address outside the plan.
+    const Located = struct { g: *worker.Group, gent: u32 };
+
+    fn locate(self: *Session, qid: u16, slot_idx: u16) ?Located {
+        if (qid >= self.plan.nqueues or slot_idx >= self.plan.depth) return null;
+        const first = self.qid_group[qid];
+        const ms = self.qid_member[qid];
+        for (self.groups[first .. first + self.rings_per_queue]) |g| {
+            if (g.ownsSlot(slot_idx)) return .{ .g = g, .gent = g.gentOfSlot(ms, slot_idx) };
+        }
+        return null;
+    }
+
     /// The ent's payload window (empty on the classical venue).
     pub fn replyWindow(self: *Session, s: SlotRef) []u8 {
         switch (s) {
             .classical => return &.{},
             .ring => |r| {
-                if (r.qid >= self.plan.nqueues or r.ent_idx >= self.plan.depth) return &.{};
-                const g = self.groups[self.qid_group[r.qid]];
-                return g.window(g.gentOf(self.qid_member[r.qid], r.ent_idx));
+                const at = self.locate(r.qid, r.ent_idx) orelse return &.{};
+                return at.g.window(at.gent);
             },
         }
     }
@@ -983,9 +1008,9 @@ pub const Session = struct {
             .classical => return,
             .ring => |r| r,
         };
-        const g = self.groupOf(ref) orelse return;
+        const at = self.groupOf(ref) orelse return;
         releases_requested.inc();
-        g.requestRelease(g.gentOf(self.qid_member[ref.qid], ref.ent_idx));
+        at.g.requestRelease(at.gent);
     }
 
     pub fn releaseLease(self: *Session, l: PayloadLease) void {
@@ -999,10 +1024,9 @@ pub const Session = struct {
     /// that registered it, parking the caller's fiber until the CQE. The
     /// data plane's device seam calls this through `heldStoreFace`.
     pub fn storeHeld(self: *Session, src: slot.HeldSource, fd: linux.fd_t, off: u64, io: Io) slot.ExtractError!void {
-        if (src.qid >= self.plan.nqueues or src.buf_index >= self.plan.depth) return error.SlotNotHeld;
+        const at = self.locate(src.qid, src.buf_index) orelse return error.SlotNotHeld;
         if (!self.shared.isActive()) return error.SessionClosed;
-        const g = self.groups[self.qid_group[src.qid]];
-        return g.storeFromForeign(g.gentOf(self.qid_member[src.qid], src.buf_index), fd, off, src.len, io);
+        return at.g.storeFromForeign(at.gent, fd, off, src.len, io);
     }
 
     /// Whether `storeHeld` can land anything: a zero-copy session (a held
@@ -1016,26 +1040,25 @@ pub const Session = struct {
         return self.read_zc_serve;
     }
 
-    /// The group owning a live slot that still names `ref.commit_id` (the
-    /// economy check; the worker's slot table is the authority).
-    fn groupOf(self: *Session, ref: slot.SlotRef) ?*worker.Group {
-        if (ref.qid >= self.plan.nqueues or ref.ent_idx >= self.plan.depth) {
+    /// The group (and gent) owning a live slot that still names
+    /// `ref.commit_id` (the economy check; the worker's slot table is the
+    /// authority).
+    fn groupOf(self: *Session, ref: slot.SlotRef) ?Located {
+        const at = self.locate(ref.qid, ref.ent_idx) orelse {
             replies_dropped_no_slot.inc();
             return null;
-        }
-        const g = self.groups[self.qid_group[ref.qid]];
-        const ms = self.qid_member[ref.qid];
-        const ent = g.members[ms].slots.ent(ref.ent_idx);
+        };
+        const ent = at.g.members[self.qid_member[ref.qid]].slots.ent(at.g.entIdxOf(at.gent));
         if (!self.shared.isActive() or ent.owed_commit_id.load(.acquire) != ref.commit_id) {
             replies_dropped_no_slot.inc();
             return null;
         }
-        return g;
+        return at;
     }
 
     fn ringSubmit(self: *Session, ref: slot.SlotRef, msg: commit_queue.Msg) void {
-        const g = self.groupOf(ref) orelse return;
-        _ = g.cells.submit(g.gentOf(self.qid_member[ref.qid], ref.ent_idx), msg);
+        const at = self.groupOf(ref) orelse return;
+        _ = at.g.cells.submit(at.gent, msg);
     }
 
     // ---- the Tx face handlers reply through ----
@@ -1288,13 +1311,18 @@ pub const Session = struct {
             try self.sideband.writeOnce(&frame);
         }
         if (self.mode == .zero_copy) self.retention = probes.driver.probeRetention(self.fuse_fd);
-        probes.publish(self.verdicts, self.retention, self.time_limits, probes.driver.capSysAdmin(self.io, env), self.mode);
+        // The FEATURES probe (series patch 0030), after the reply like the
+        // retention probe: it decides how many rings each queue gets.
+        self.rings_feature = probes.ringsPerQueueVerdict(probes.driver.probeFeatures(self.fuse_fd));
+        try self.resolveRingsPerQueue(env);
+        probes.publish(self.verdicts, self.retention, self.rings_feature, self.time_limits, probes.driver.capSysAdmin(self.io, env), self.mode);
+        geometry.gauges.publishRingsPerQueue(self.rings_per_queue);
         fs.init(.{ .negotiated = self.init_reply.negotiated, .minor = self.init_reply.minor(), .plan = self.plan, .io = self.io, .buffer_mode = self.mode, .read_zc_serve = read_zc_serve, .retention = self.retention == .present });
         errdefer {
             self.failStartup();
             self.destroyOnce();
         }
-        log.info("transport: INIT 7.{d} → 7.{d}: flags 0x{x} (over_io_uring={}, time_limits={}, request_timeout {d} s), max_write {d}, max_pages {d}, max_background {d}, queues {d} × depth {d}, payload {d} B, {d} drain group(s) (width {d}), buffer mode {t} (kmbuf {?d}, retention {t})", .{ init_in.minor, self.init_reply.minor(), self.init_reply.negotiated, self.init_reply.has(abi.FUSE_OVER_IO_URING), self.init_reply.timeLimits(), self.request_timeout_s, self.plan.max_write, self.plan.max_pages, self.plan.max_background, self.plan.nqueues, self.plan.depth, self.plan.payload_sz, self.drain_groups.count(), self.drain_groups.maxWidth(), self.mode, if (self.verdicts.kmbuf.opcodes()) |p| p.register else null, self.retention });
+        log.info("transport: INIT 7.{d} → 7.{d}: flags 0x{x} (over_io_uring={}, time_limits={}, request_timeout {d} s), max_write {d}, max_pages {d}, max_background {d}, queues {d} × depth {d}, payload {d} B, {d} drain group(s) (width {d}) × {d} ring(s) per queue, buffer mode {t} (kmbuf {?d}, retention {t}, rings per queue {t})", .{ init_in.minor, self.init_reply.minor(), self.init_reply.negotiated, self.init_reply.has(abi.FUSE_OVER_IO_URING), self.init_reply.timeLimits(), self.request_timeout_s, self.plan.max_write, self.plan.max_pages, self.plan.max_background, self.plan.nqueues, self.plan.depth, self.plan.payload_sz, self.drain_groups.count(), self.drain_groups.maxWidth(), self.rings_per_queue, self.mode, if (self.verdicts.kmbuf.opcodes()) |p| p.register else null, self.retention, self.rings_feature });
         if (knobs.boolKnob("SQUEEZEFS_TEST_FUSE_FAIL_AFTER_INIT_REPLY", env)) {
             log.err("transport: SQUEEZEFS_TEST_FUSE_FAIL_AFTER_INIT_REPLY — the bring-up fails after the INIT reply, before any queue registers", .{});
             return error.InjectedStartupFailure;
@@ -1342,6 +1370,7 @@ pub const Session = struct {
             .slab = if (self.slab) |*s| s else null,
             .test_error_logs = cfg.test_error_logs,
             .handlers_on_worker = knobs.boolKnob("SQUEEZEFS_FUSE_HANDLERS_ON_WORKER", env),
+            .rings_per_queue = self.rings_per_queue,
             .write_own_depth = knobs.intKnob("SQUEEZEFS_FUSE_WRITE_OWN_DEPTH", u32, env),
             .no_open = cfg.no_open,
             .budget_bytes = cfg.mem_budget_bytes,
@@ -1353,7 +1382,11 @@ pub const Session = struct {
         self.armBridgeSeams(env);
         errdefer self.closeStallPipe();
 
-        const ngroups = self.drain_groups.count();
+        // One group (worker, ring) per drain group PER RING: a queue's rings
+        // sit at consecutive group indices from `qid_group[qid]`, each
+        // taking its `ringShare` of the depth.
+        const rings = self.rings_per_queue;
+        const ngroups = self.drain_groups.count() * rings;
         self.groups = try gpa.alloc(*worker.Group, ngroups);
         errdefer gpa.free(self.groups);
         self.qid_group = try gpa.alloc(u16, self.plan.nqueues);
@@ -1364,19 +1397,25 @@ pub const Session = struct {
         var built: usize = 0;
         errdefer for (self.groups[0..built]) |g| g.deinit();
         var total_arena: u64 = 0;
-        for (0..ngroups) |gi| {
-            const qids = self.drain_groups.group(gi);
+        var kmbuf_pinned: u64 = 0;
+        for (0..self.drain_groups.count()) |di| {
+            const qids = self.drain_groups.group(di);
             for (qids, 0..) |q, mi| {
-                self.qid_group[q] = @intCast(gi);
+                self.qid_group[q] = @intCast(di * rings);
                 self.qid_member[q] = @intCast(mi);
             }
             const affinity: ?placement.CpuSet = if (pcfg.numa and qid_is_cpu) placement.scopedAffinityCpus(pcfg.scope, qids[0], self.topo.mask, &self.topo) else null;
-            self.groups[gi] = worker.Group.init(gpa, &self.shared, @intCast(gi), qids, affinity) catch |e| switch (e) {
-                error.OutOfMemory => return error.OutOfMemory,
-                error.ArenaMapFailed => return error.ArenaMapFailed,
-            };
-            built += 1;
-            total_arena += self.groups[gi].arenaBytes();
+            for (0..rings) |ring| {
+                const gi = di * rings + ring;
+                const share = geometry.ringShare(self.plan.depth, rings, @intCast(ring));
+                self.groups[gi] = worker.Group.init(gpa, &self.shared, @intCast(gi), qids, share, affinity) catch |e| switch (e) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.ArenaMapFailed => return error.ArenaMapFailed,
+                };
+                built += 1;
+                total_arena += self.groups[gi].arenaBytes();
+                kmbuf_pinned += @as(u64, qids.len) * zc.ringEntriesFor(share.depth) * derive.alignUp(self.plan.payload_sz, facts.page_size);
+            }
         }
         arena_bytes.set(total_arena);
         // Non-sheddable: the kernel writes into these pages at delivery
@@ -1384,8 +1423,7 @@ pub const Session = struct {
         self.arena_component = mem_budget.Component.init("transport_payload_arena", total_arena, 0, .{ .gauge = &arena_bytes }, null);
         if (cfg.budget) |b| b.register(self.arena_component);
         if (self.mode != .user_ents) {
-            const pinned: u64 = @as(u64, self.plan.nqueues) * zc.ringEntriesFor(self.plan.depth) * derive.alignUp(self.plan.payload_sz, facts.page_size);
-            self.kmbuf_component = mem_budget.Component.init("transport_kmbuf_region", pinned, 0, .{ .gauge = &kmbuf.pinned_bytes }, null);
+            self.kmbuf_component = mem_budget.Component.init("transport_kmbuf_region", kmbuf_pinned, 0, .{ .gauge = &kmbuf.pinned_bytes }, null);
             if (cfg.budget) |b| b.register(self.kmbuf_component);
         }
 
@@ -1415,7 +1453,7 @@ pub const Session = struct {
         }
         // 7. The arm barrier: every queue's REGISTERs PUSHED (never completed).
         const verdict = self.shared.barrier.waitTimeout(ARM_BARRIER_NS) orelse {
-            log.err("transport: arm barrier: {d} of {d} queues registered within {d} s — the mount fails", .{ self.shared.queues_registered.load(.acquire), self.plan.nqueues, ARM_BARRIER_NS / std.time.ns_per_s });
+            log.err("transport: arm barrier: {d} of {d} queue rings registered within {d} s — the mount fails", .{ self.shared.queues_registered.load(.acquire), self.plan.nqueues * self.rings_per_queue, ARM_BARRIER_NS / std.time.ns_per_s });
             return error.ArmBarrierFailed;
         };
         if (verdict == .failed) return error.EveryEntRetired;
@@ -1425,7 +1463,7 @@ pub const Session = struct {
         self.ready.store(true, .release);
         sessions_active.add(1);
         self.publishKernelMaxBackground();
-        log.info("transport: FUSE-over-io_uring transport armed at {s}: {d} queue(s) × {d} ent(s) over {d} worker(s), {t}", .{ self.mountpoint, self.plan.nqueues, self.plan.depth, ngroups, self.mode });
+        log.info("transport: FUSE-over-io_uring transport armed at {s}: {d} queue(s) × {d} ent(s) over {d} worker(s) ({d} ring(s) per queue), {t}", .{ self.mountpoint, self.plan.nqueues, self.plan.depth, ngroups, self.rings_per_queue, self.mode });
         return self;
     }
 
@@ -1452,6 +1490,26 @@ pub const Session = struct {
             return error.BufferModeRefused;
         };
         if (lever != .auto) log.info("transport: SQUEEZEFS_FUSE_BUFFER_MODE={t} — the A/B pin (auto would take {t})", .{ lever, probes.resolveBufferMode(self.verdicts, .auto) catch unreachable });
+    }
+
+    /// `SQUEEZEFS_FUSE_RINGS_PER_QUEUE` over the derivation: an explicit
+    /// count above what the FEATURES probe admits fails the mount loud
+    /// (the probe is the only degrade point, charter §3).
+    fn resolveRingsPerQueue(self: *Session, env: *const std.process.Environ.Map) MountError!void {
+        const feature = self.rings_feature == .present;
+        const derived = geometry.ringsPerQueue(self.mode, feature);
+        const explicit = knobs.optIntKnob("SQUEEZEFS_FUSE_RINGS_PER_QUEUE", u32, env);
+        if (explicit) |n| if (n > 1 and !feature) {
+            log.err("transport: SQUEEZEFS_FUSE_RINGS_PER_QUEUE={d} refused by the FEATURES probe (FUSE_URING_FEAT_RINGS_PER_QUEUE absent: the kernel lacks series patch 0030, so a second ring on a queue would have its buffers recycled into the first's) — the mount fails: the probe is the only degrade point (charter §3)", .{n});
+            return error.RingsPerQueueRefused;
+        };
+        if (explicit) |n| if (n > 1 and self.mode == .user_ents) {
+            log.info("transport: SQUEEZEFS_FUSE_RINGS_PER_QUEUE={d} on a UserEnts session — a ring there serves a drain group of queues; the count is the derivation's 1", .{n});
+            self.rings_per_queue = 1;
+            return;
+        };
+        self.rings_per_queue = geometry.resolveRingsPerQueue(explicit, derived);
+        if (explicit != null and self.rings_per_queue != derived) log.info("transport: SQUEEZEFS_FUSE_RINGS_PER_QUEUE={d} — the A/B pin (derived {d})", .{ self.rings_per_queue, derived });
     }
 
     /// `SQUEEZEFS_TEST_ZC_BRIDGE_STALL` / `_DEADLINE_MS`: a pipe with no
@@ -1506,8 +1564,11 @@ pub const Session = struct {
     }
 
     /// Every queue holds ≥ 1 registered entry (the arm barrier's fact).
+    /// Queues whose every ring has every REGISTER pushed (the barrier
+    /// counts member rings; a queue with one of two rings pushed rounds
+    /// down).
     pub fn queuesRegistered(self: *const Session) u32 {
-        return self.shared.queues_registered.load(.acquire);
+        return self.shared.queues_registered.load(.acquire) / self.rings_per_queue;
     }
 
     fn destroyOnce(self: *Session) void {
@@ -1858,6 +1919,8 @@ pub const Session = struct {
         try field(w, "transport_probe_kmbuf", probes.kmbuf_gauge.load());
         try field(w, "transport_probe_zc", probes.zc_gauge.load());
         try field(w, "transport_probe_retention", probes.retention_gauge.load());
+        try field(w, "transport_probe_rings_per_queue", probes.rings_per_queue_gauge.load());
+        try field(w, "fuse_uring_rings_per_queue", g.rings_per_queue.load());
         try field(w, "transport_probe_time_limits", probes.time_limits_gauge.load());
         try field(w, "transport_probe_cap_sys_admin", probes.cap_gauge.load());
         try field(w, "transport_time_limits", time_limits_gauge.load());
@@ -2073,7 +2136,7 @@ const Rig = struct {
         self.io_exec = try SqzIo.init(gpa, .{
             .env = &self.env,
             .budget_bytes = derive.GiB,
-            .fuse = .{ .nqueues = facts.possible_cpus, .q_depth = geometry.Q_DEPTH_DESIRED },
+            .fuse = .{ .nqueues = facts.possible_cpus, .q_depth = geometry.Q_DEPTH_DESIRED, .rings_per_queue = geometry.MAX_RINGS_PER_QUEUE },
             .meta_lanes = 1,
             .blocking_cap = 4,
         });
@@ -3535,6 +3598,129 @@ test "e2e zc WRITE on the worker's lane (decision 0003 §AB.3, the write arm): a
         try testing.expectEqual(@as(u64, 0), Helper.dispatches(s).own);
         // The lane thread's extraction requests and replies wake the worker across threads.
         try testing.expect(slot.wake_writes.load() > w0);
+    }
+}
+
+/// `depth` LOOKUPs of distinct park names from threads pinned to ONE CPU:
+/// the kernel queues each on that CPU's queue, so every entry of every
+/// ring registered there ends up in userspace, parked. Returns the CPU.
+const PinnedParkers = struct {
+    threads: []std.Thread,
+    results: []anyerror!u64,
+    names: [][96]u8,
+
+    fn start(gpa: std.mem.Allocator, rig: *Rig, n: usize, cpu: u16) !PinnedParkers {
+        const self: PinnedParkers = .{ .threads = try gpa.alloc(std.Thread, n), .results = try gpa.alloc(anyerror!u64, n), .names = try gpa.alloc([96]u8, n) };
+        for (0..n) |i| {
+            const path = std.fmt.bufPrintSentinel(&self.names[i], "{s}/{s}-{d}", .{ rig.path, EchoFs.park_lookup_name, i }, 0) catch unreachable;
+            self.results[i] = 0;
+            self.threads[i] = try std.Thread.spawn(.{}, run, .{ path.ptr, cpu, &self.results[i] });
+        }
+        return self;
+    }
+
+    fn run(path: [*:0]const u8, cpu: u16, result: *anyerror!u64) void {
+        var set: linux.cpu_set_t = @splat(0);
+        set[cpu / @bitSizeOf(usize)] |= @as(usize, 1) << @intCast(cpu % @bitSizeOf(usize));
+        linux.sched_setaffinity(0, &set) catch {};
+        result.* = statSize(path);
+    }
+
+    /// Join every parker; each stat failed (the released lookup answers
+    /// negative — ENOENT).
+    fn joinAll(self: *PinnedParkers) !void {
+        for (self.threads) |t| t.join();
+        for (self.results) |r| try testing.expectError(error.StatFailed, r);
+    }
+
+    fn deinit(self: *PinnedParkers, gpa: std.mem.Allocator) void {
+        gpa.free(self.threads);
+        gpa.free(self.results);
+        gpa.free(self.names);
+    }
+};
+
+/// The first CPU this process may run on (the queue the pinned threads hit).
+fn firstAllowedCpu() u16 {
+    var set: linux.cpu_set_t = @splat(0);
+    if (linux.errno(linux.sched_getaffinity(linux.getpid(), @sizeOf(linux.cpu_set_t), &set)) != .SUCCESS) return 0;
+    for (set, 0..) |word, w| if (word != 0) return @intCast(w * @bitSizeOf(usize) + @ctz(word));
+    return 0;
+}
+
+fn waitParkedLookups(rig: *Rig, n: u32) !void {
+    const deadline = clock.monotonicNs() + 10 * std.time.ns_per_s;
+    while (rig.fs.parked_lookups.load(.monotonic) < n and clock.monotonicNs() < deadline) std.Thread.yield() catch {};
+    try testing.expectEqual(n, rig.fs.parked_lookups.load(.monotonic));
+}
+
+test "e2e rings per queue (series patch 0030): the FEATURES probe reads RINGS_PER_QUEUE present, the session registers TWO rings on every queue (ceil(depth/2) + the rest, both workers named sqz-fuse-ur<qid>), and `depth` requests from one CPU fill both rings' entries — each ring owes exactly its share; the control arm (SQUEEZEFS_FUSE_RINGS_PER_QUEUE=1) owes the whole depth on its one ring; .stats carries fuse_uring_rings_per_queue" {
+    if (venueMissing()) |why| return testkit.skipWhy(@src(), why);
+    var kb: [192]u8 = undefined;
+    if (kmbufMissing(&kb)) |why| return testkit.skipWhy(@src(), why);
+    const cpu = firstAllowedCpu();
+    {
+        const rig = try Rig.init(testing.allocator, 46, &.{});
+        defer rig.deinit();
+        const s = try rig.mountIt(.{ .mem_budget_bytes = 0 });
+        try testing.expectEqual(geometry.BufferMode.zero_copy, s.mode);
+        if (s.rings_feature != .present) return testkit.skip(@src(), .no_kernel_feature, "FUSE_IO_URING_CMD_FEATURES reads FUSE_URING_FEAT_RINGS_PER_QUEUE absent (the fuse-io-uring several-rings-per-queue patch, sqz series 0030)");
+        try testing.expectEqual(@as(u32, 2), s.rings_per_queue);
+        try testing.expectEqual(@as(u64, 1), probes.rings_per_queue_gauge.load());
+        try testing.expectEqual(@as(u64, 2), geometry.gauges.rings_per_queue.load());
+        try testing.expectEqual(s.drain_groups.count() * 2, s.groups.len);
+        try testing.expectEqual(s.plan.nqueues, s.queuesRegistered());
+        const g0 = s.groups[s.qid_group[cpu]];
+        const g1 = s.groups[s.qid_group[cpu] + 1];
+        const share0 = geometry.ringShare(s.plan.depth, 2, 0);
+        const share1 = geometry.ringShare(s.plan.depth, 2, 1);
+        try testing.expectEqual(share0.depth, g0.depth);
+        try testing.expectEqual(@as(u16, 0), g0.ring_base);
+        try testing.expectEqual(share1.depth, g1.depth);
+        try testing.expectEqual(share1.base, g1.ring_base);
+        try testing.expectEqual(s.plan.depth, g0.depth + g1.depth);
+        try testing.expect(g0.ownsSlot(0) and !g1.ownsSlot(0) and g1.ownsSlot(share1.base) and !g0.ownsSlot(share1.base));
+        // Both workers carry the class name (the CPU accounting contract).
+        var expect_name: [24]u8 = undefined;
+        const want = try std.fmt.bufPrint(&expect_name, "sqz-fuse-ur{d}", .{cpu});
+        try testing.expectEqualStrings(want, std.mem.sliceTo(&g0.name_buf, 0));
+        try testing.expectEqualStrings(want, std.mem.sliceTo(&g1.name_buf, 0));
+        // `depth` parked LOOKUPs from one CPU: every entry of both rings in
+        // userspace (the kernel's LIFO pick spills to the second ring only
+        // once the first's are all out).
+        var parkers = try PinnedParkers.start(testing.allocator, rig, s.plan.depth, cpu);
+        defer parkers.deinit(testing.allocator);
+        try waitParkedLookups(rig, s.plan.depth);
+        try testing.expectEqual(share0.depth, g0.owedCount());
+        try testing.expectEqual(share1.depth, g1.owedCount());
+        try testing.expect(g1.dispatches_own.load(.monotonic) >= share1.depth);
+        var sb: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer sb.deinit();
+        try s.writeStatsJson(&sb.writer);
+        try testing.expect(std.mem.indexOf(u8, sb.written(), "\"fuse_uring_rings_per_queue\":2,") != null);
+        try testing.expect(std.mem.indexOf(u8, sb.written(), "\"transport_probe_rings_per_queue\":1,") != null);
+        rig.fs.releaseParked();
+        try parkers.joinAll();
+        try testing.expectEqual(@as(u32, 0), s.owedCount());
+    }
+    {
+        const rig = try Rig.init(testing.allocator, 47, &.{.{ "SQUEEZEFS_FUSE_RINGS_PER_QUEUE", "1" }});
+        defer rig.deinit();
+        const s = try rig.mountIt(.{ .mem_budget_bytes = 0 });
+        try testing.expectEqual(@as(u32, 1), s.rings_per_queue);
+        try testing.expectEqual(s.drain_groups.count(), s.groups.len);
+        const g = s.groups[s.qid_group[cpu]];
+        try testing.expectEqual(s.plan.depth, g.depth);
+        var parkers = try PinnedParkers.start(testing.allocator, rig, s.plan.depth, cpu);
+        defer parkers.deinit(testing.allocator);
+        try waitParkedLookups(rig, s.plan.depth);
+        try testing.expectEqual(s.plan.depth, g.owedCount());
+        rig.fs.releaseParked();
+        try parkers.joinAll();
+        var sb: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer sb.deinit();
+        try s.writeStatsJson(&sb.writer);
+        try testing.expect(std.mem.indexOf(u8, sb.written(), "\"fuse_uring_rings_per_queue\":1,") != null);
     }
 }
 

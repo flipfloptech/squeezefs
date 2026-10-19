@@ -601,6 +601,14 @@ pub const FUSE_IO_URING_CMD_COMMIT_AND_FETCH: u32 = 2;
 /// retention PROBE opcode (RELEASE with an impossible commit id: -ENOTCONN /
 /// -ENOENT ⇒ present, anything else ⇒ absent).
 pub const FUSE_IO_URING_CMD_RELEASE_PAYLOAD: u32 = 3;
+/// sqz patch 0030: answers the `FUSE_URING_FEAT_*` mask inline (the CQE
+/// result); a kernel without the patch answers -EINVAL (the opcode switch's
+/// default) — the probe.
+pub const FUSE_IO_URING_CMD_FEATURES: u32 = 4;
+/// `FUSE_IO_URING_CMD_FEATURES` result bit: several io_urings may REGISTER
+/// entries on one queue (each entry served and committed by the ring that
+/// registered it; a ring still serves one queue).
+pub const FUSE_URING_FEAT_RINGS_PER_QUEUE: u32 = 1 << 0;
 
 /// `fuse_uring_cmd_req.init.flags` (REGISTER).
 pub const FUSE_URING_BUF_RING: u16 = 1 << 0;
@@ -921,10 +929,12 @@ test "killpriv v2 bits pinned together: FATTR_KILL_SUIDGID 1<<11, WRITE_KILL_SUI
     try testing.expectEqual(@as(u32, 256), FUSE_IOCTL_MAX_IOV);
 }
 
-test "uring command and init-flag constants: REGISTER 1, COMMIT_AND_FETCH 2, RELEASE_PAYLOAD 3; BUF_RING/ZERO_COPY/RETENTION 1/2/4; COMMIT_RETAIN 1; kmbuf opcode pairs 37/38 and 38/39; mmap offset law" {
+test "uring command and init-flag constants: REGISTER 1, COMMIT_AND_FETCH 2, RELEASE_PAYLOAD 3, FEATURES 4 (RINGS_PER_QUEUE bit 0); BUF_RING/ZERO_COPY/RETENTION 1/2/4; COMMIT_RETAIN 1; kmbuf opcode pairs 37/38 and 38/39; mmap offset law" {
     try testing.expectEqual(@as(u32, 1), FUSE_IO_URING_CMD_REGISTER);
     try testing.expectEqual(@as(u32, 2), FUSE_IO_URING_CMD_COMMIT_AND_FETCH);
     try testing.expectEqual(@as(u32, 3), FUSE_IO_URING_CMD_RELEASE_PAYLOAD);
+    try testing.expectEqual(@as(u32, 4), FUSE_IO_URING_CMD_FEATURES);
+    try testing.expectEqual(@as(u32, 1), FUSE_URING_FEAT_RINGS_PER_QUEUE);
     try testing.expectEqual(@as(u16, 1), FUSE_URING_BUF_RING);
     try testing.expectEqual(@as(u16, 2), FUSE_URING_ZERO_COPY);
     try testing.expectEqual(@as(u16, 4), FUSE_URING_PAYLOAD_RETENTION);

@@ -299,8 +299,14 @@ const EchoFsImpl = struct {
     pub const names = [_][]const u8{ "hello", "big", "park", "scratch" };
     pub const inos = [_]u64{ ino_hello, ino_big, ino_park, ino_scratch };
     /// A name outside the tree whose LOOKUP parks in its handler (answered
-    /// negative once released).
+    /// negative once released); every name with this prefix parks, so N
+    /// distinct names are N concurrent parked LOOKUPs (the kernel runs one
+    /// lookup per name at a time: `d_alloc_parallel`).
     pub const park_lookup_name = "park-lookup";
+
+    fn parksLookup(name: []const u8) bool {
+        return std.mem.startsWith(u8, name, park_lookup_name);
+    }
 
     /// `held_store`'s face: the session's `storeHeld`, type-erased.
     pub const HeldStore = struct {
@@ -576,7 +582,7 @@ const EchoFsImpl = struct {
         const ino = req.nodeid();
         const reply: codec.Reply = switch (req.op) {
             .lookup => |l| blk: {
-                if (ino != ino_root or std.mem.eql(u8, l.name, park_lookup_name)) return null;
+                if (ino != ino_root or parksLookup(l.name)) return null;
                 const child = lookupName(l.name) orelse break :blk codec.replyEntry(out, u, codec.EntryReply.negative(std.time.ns_per_s));
                 break :blk codec.replyEntry(out, u, self.entry(child).?);
             },
@@ -682,7 +688,7 @@ const EchoFsImpl = struct {
         switch (req.op) {
             .lookup => |l| {
                 if (ino != ino_root) return h.fail(.NOTDIR);
-                if (std.mem.eql(u8, l.name, park_lookup_name)) return self.parkedLookup(h, u, l.name, &out);
+                if (parksLookup(l.name)) return self.parkedLookup(h, u, l.name, &out);
                 const child = lookupName(l.name) orelse return h.reply(codec.replyEntry(&out, u, codec.EntryReply.negative(std.time.ns_per_s)));
                 h.reply(codec.replyEntry(&out, u, self.entry(child).?));
             },
@@ -831,7 +837,7 @@ const EchoFsImpl = struct {
             _ = self.names_unmapped_after_park.fetchAdd(1, .monotonic);
             return h.fail(.IO);
         }
-        if (std.mem.eql(u8, name, park_lookup_name)) _ = self.names_intact_after_park.fetchAdd(1, .monotonic);
+        if (parksLookup(name)) _ = self.names_intact_after_park.fetchAdd(1, .monotonic);
         h.reply(codec.replyEntry(out, u, codec.EntryReply.negative(std.time.ns_per_s)));
     }
 

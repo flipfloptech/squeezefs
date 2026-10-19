@@ -15,6 +15,15 @@
 //! * `no_claims` — overlapping stores admitted concurrently: B (gen g+1)
 //!   lands first, A (gen g) lands LAST, the device holds A's older bytes
 //!   under a coverage and generation that say B (`FinalViolated`).
+//! * `drop_outside_lock` — the completion drops its hold BEFORE the
+//!   notify's lock (the shipped 2026-10-19 shape): the settler reads the
+//!   set empty, retires the record, the slot's next install resets the
+//!   notify and the completion's lock/unlock lands on a record that is not
+//!   its own (`InvariantViolated`: a touch past the retire; the unlock of
+//!   an unlocked mutex is the field's `unreachable`).
+//! * `no_quiesce` — the settler tears the record down without taking the
+//!   notify's lock once after its empty read: the completion is still
+//!   inside its critical section when the slot is re-filled.
 
 const std = @import("std");
 const explorer = @import("../model/explorer.zig");
@@ -341,6 +350,141 @@ pub fn OverlapModel(comptime weakening: ClaimWeakening) type {
     };
 }
 
+// ---------------------------------------------------------------------------
+// Model 4: overlay_completion_last_touch_precedes_the_retire.
+// ---------------------------------------------------------------------------
+
+pub const LifetimeWeakening = enum { none, drop_outside_lock, no_quiesce };
+
+/// One store in flight on a record in a pool slot. The completion (C) drops
+/// the hold and announces it on the record's notify (a mutex word); the
+/// settler (S) reads the in-flight set empty, quiesces on the notify,
+/// retires the record and the slot's next install resets the notify. The
+/// invariant: C never touches a slot whose birth moved under it, and C's
+/// unlock finds the mutex held (the field's `unreachable` otherwise).
+pub fn LifetimeModel(comptime weakening: LifetimeWeakening) type {
+    return struct {
+        const Self = @This();
+        pub const thread_count: usize = 2;
+        const C = 0;
+        const S = 1;
+
+        inflight: u8 = 1,
+        /// The notify's interior mutex (0 free, 1 held).
+        locked: u8 = 0,
+        epoch: u8 = 0,
+        /// The slot's current record; C holds birth 1.
+        birth: u8 = 1,
+        c_pc: u8 = 0,
+        s_pc: u8 = 0,
+        foreign_touch: u8 = 0,
+        unlock_of_unlocked: u8 = 0,
+
+        pub fn init() Self {
+            return .{};
+        }
+
+        pub fn done(self: *const Self, t: usize) bool {
+            return switch (t) {
+                C => self.c_pc == 4,
+                S => self.s_pc == 3,
+                else => unreachable,
+            };
+        }
+
+        fn touch(self: *Self) void {
+            if (self.birth != 1) self.foreign_touch = 1;
+        }
+
+        fn lock(self: *Self) bool {
+            self.touch();
+            if (self.locked != 0) return false;
+            self.locked = 1;
+            return true;
+        }
+
+        fn unlock(self: *Self) void {
+            self.touch();
+            if (self.locked == 0) self.unlock_of_unlocked = 1;
+            self.locked = 0;
+        }
+
+        pub fn step(self: *Self, t: usize) void {
+            switch (t) {
+                C => switch (weakening) {
+                    .none, .no_quiesce => switch (self.c_pc) {
+                        0 => if (self.lock()) {
+                            self.c_pc = 1;
+                        },
+                        1 => {
+                            // The hold drop inside the critical section (seq_cst RMW after the lock's acquire).
+                            self.touch();
+                            self.inflight = 0;
+                            self.c_pc = 2;
+                        },
+                        2 => {
+                            self.touch();
+                            self.epoch += 1;
+                            self.c_pc = 3;
+                        },
+                        3 => {
+                            self.unlock();
+                            self.c_pc = 4;
+                        },
+                        else => unreachable,
+                    },
+                    .drop_outside_lock => switch (self.c_pc) {
+                        0 => {
+                            self.touch();
+                            self.inflight = 0;
+                            self.c_pc = 1;
+                        },
+                        1 => if (self.lock()) {
+                            self.c_pc = 2;
+                        },
+                        2 => {
+                            self.touch();
+                            self.epoch += 1;
+                            self.c_pc = 3;
+                        },
+                        3 => {
+                            self.unlock();
+                            self.c_pc = 4;
+                        },
+                        else => unreachable,
+                    },
+                },
+                S => switch (self.s_pc) {
+                    0 => {
+                        // inflight_empty: the Notify wait while a store is in flight.
+                        if (self.inflight == 0) self.s_pc = if (weakening == .no_quiesce) 2 else 1;
+                    },
+                    1 => {
+                        // quiesce: lock + unlock as one step (nothing happens inside).
+                        if (self.locked == 0) self.s_pc = 2;
+                    },
+                    2 => {
+                        // teardown → retire → the slot's next install resets the notify.
+                        self.birth = 2;
+                        self.locked = 0;
+                        self.epoch = 0;
+                        self.s_pc = 3;
+                    },
+                    else => unreachable,
+                },
+                else => unreachable,
+            }
+        }
+
+        pub fn invariant(self: *const Self) !void {
+            if (self.foreign_touch != 0) return error.CompletionTouchedRetiredRecord;
+            if (self.unlock_of_unlocked != 0) return error.UnlockOfUnlocked;
+        }
+
+        pub fn final(_: *const Self) !void {}
+    };
+}
+
 test "overlay_freeze_drain_observes_final_coverage — holds; weakening EITHER SeqCst point admits a store invisible to the drain" {
     try explorer.expectHolds(FreezeDrainModel(.none), .{});
     try explorer.expectFails(FreezeDrainModel(.writer_fence), .{}, error.FinalViolated);
@@ -357,10 +501,18 @@ test "overlapping_inflight_stores_are_unrepresentable — holds under the claims
     try explorer.expectFails(OverlapModel(.no_claims), .{}, error.FinalViolated);
 }
 
+test "overlay_completion_last_touch_precedes_the_retire — holds; the drop outside the notify's lock, or a settler that skips the quiesce, lets the slot's next install land under the completion" {
+    try explorer.expectHolds(LifetimeModel(.none), .{});
+    try explorer.expectFails(LifetimeModel(.drop_outside_lock), .{}, error.InvariantViolated);
+    try explorer.expectFails(LifetimeModel(.no_quiesce), .{}, error.InvariantViolated);
+}
+
 test "state counts: small enough for every gate" {
     var report: explorer.Report = undefined;
     try explorer.explore(FreezeDrainModel(.none), std.testing.allocator, .{}, &report);
     try std.testing.expect(report.states > 10 and report.states < 500);
     try explorer.explore(ValidatedServeModel(.none), std.testing.allocator, .{}, &report);
     try std.testing.expect(report.states > 10 and report.states < 2000);
+    try explorer.explore(LifetimeModel(.none), std.testing.allocator, .{}, &report);
+    try std.testing.expect(report.states > 5 and report.states < 100);
 }

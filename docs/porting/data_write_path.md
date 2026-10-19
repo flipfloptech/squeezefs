@@ -301,7 +301,7 @@ qd32 while data devices idled at qd ≈ 1–1.5 (`design-write-inode-convoy.md:1
 | `core.covered: Box<[AtomicU64]>` | `:204` | the lock-free published coverage face — set only by a full-success CQE |
 | `core.union: Mutex<CoverageUnion>` | `:208` | the coverage LAW (shared with RAM accumulation, KD-OV-2); mutated under (3) |
 | `core.birth` | `:190` | registry-monotone identity for `dest' == dest` (offsets are reused; births are not) |
-| `retired`, `inflight_change: Notify` | `:336-342` | waiters on retire / on the in-flight set changing (the settle's event wait — the retired `yield_now` spin self-woke forever on the queue worker's lane, 2026-08-13) |
+| `retired`, `inflight_change: Notify` | `:336-342` | waiters on retire / on the in-flight set changing (the settle's event wait — the retired `yield_now` spin self-woke forever on the queue worker's lane, 2026-08-13). The port's fixed registry (0003 §AP) re-fills a retired slot, and a CQE lands holding no (3), so a store's hold drop (`inflight −= 1`, the claim release) runs INSIDE the notify's critical section with its announcement and the settler quiesces on that lock once after reading the set empty — the completion's unlock is its last touch of the record (`device_overlay.zig` THE COMPLETION'S LAST TOUCH; the 2026-10-19 panic, `rung-10-overlay-lifetime.md`) |
 
 Volatile: RAM only, no on-disk form, no incompat bit, no journal record
 (`device_overlay.rs:36-41`). Gauges `overlay_open` (`+1` at install `:509-511`, `−1` at

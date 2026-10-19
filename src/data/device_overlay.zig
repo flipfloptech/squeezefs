@@ -28,6 +28,23 @@
 //! proves the §3.3 stale-DMA counterexample (two overlapping stores in
 //! flight) is unrepresentable under the range claims.
 //!
+//! THE COMPLETION'S LAST TOUCH (record lifetime): a record is torn down by
+//! a settler under (3) once the in-flight set is empty, and its slot is a
+//! fixed pool entry the next install re-fills (LIFO). A store's CQE lands
+//! holding NO (3) (the claim, not the guard, excludes an overlapping DMA),
+//! so its hold (`inflight`) is the only thing keeping the record alive —
+//! and the CQE must not touch the record after dropping it. The drop
+//! (`Core.releaseStore`) therefore runs INSIDE `inflight_change`'s critical
+//! section with its announcement (`Notify.notifyWaitersAfter`), and a
+//! settler that reads the set empty takes that lock once (`Notify.quiesce`)
+//! before the teardown: the lock's acquire pairs with the completion's
+//! unlock (release), so the unlock is the completion's last access to the
+//! record. The 2026-10-19 panic (1 MiB seq writes, QD16): the drop ran
+//! before the notify's lock, a settler slipped through, the slot's next
+//! install reset the notify under the completion, and its unlock met
+//! `.unlocked`. `device_overlay_model.zig` proves the shape and both
+//! weakenings (the drop outside the lock, the settler's missing quiesce).
+//!
 //! The settle (`FREEZE → COMPLETE → SEED GAPS → FLUSH → PUBLISH → META SYNC
 //! → deferred frees`) is the fsync sequence; the write arm's form retries
 //! transients forever on the ONE ladder (`write_retry.zig`), fence
@@ -350,11 +367,9 @@ pub const Core = struct {
     /// At the CQE (no block guard: disjoint stores land concurrently, §3.3):
     /// a terminal record ⇒ superseded; success ⇒ the union records the run
     /// under `union_lock`, then the covered bits publish (SeqCst
-    /// `fetch_or`); failure ⇒ nothing covered. The claim releases ONLY here;
-    /// `inflight −= 1` last (the freezer's drain observes the final coverage).
+    /// `fetch_or`); failure ⇒ nothing covered. The claim and the hold stay
+    /// HELD: `releaseStore` drops them, the caller's last touch.
     pub fn completeStore(self: *Core, t: Ticket, success: bool) CompleteVerdict {
-        defer _ = self.inflight.fetchSub(1, .seq_cst);
-        defer clearBits(&self.claims, t.first_page, t.pages);
         if (self.stateNow().isTerminal()) return .superseded;
         if (!success) return .not_covered;
         const start = t.first_page * OVERLAY_PAGE;
@@ -365,10 +380,19 @@ pub const Core = struct {
         const full = v.completed or self.union_.isFull(self.block_len);
         self.union_lock.unlock();
         setBits(&self.covered, t.first_page, t.pages);
-        // Frozen while this claim still holds the record live: past the
-        // decrement a settle may retire it and the slot host a new record.
+        // Frozen while this claim still holds the record live.
         if (full) _ = self.freeze();
         return .{ .covered = .{ .coverage_complete = full } };
+    }
+
+    /// The claim releases ONLY here; `inflight −= 1` last (the freezer's
+    /// drain observes the final coverage). Past the decrement a settle may
+    /// retire the record and its slot host a new one, so this is the
+    /// completion's LAST access to the core — the record owner runs it
+    /// inside the announcement's critical section (module doc).
+    pub fn releaseStore(self: *Core, t: Ticket) void {
+        clearBits(&self.claims, t.first_page, t.pages);
+        _ = self.inflight.fetchSub(1, .seq_cst);
     }
 
     /// Claims first (an in-flight range is never served, even a re-write of
@@ -459,8 +483,6 @@ pub const Record = struct {
     /// Waiters on the in-flight set changing (the settle's and the read's
     /// event wait — never a yield spin, Q4).
     inflight_change: sync_notify.Notify = .init,
-    /// ACK-early stores acked but not yet landed.
-    acked_pending: Atomic(u32) = .init(0),
     /// The install's monotonic stamp: an ino drain owes every record
     /// opened BEFORE it began; one opened during the drain is the next
     /// fsync's (never a stranded record, never an endless drain under a
@@ -918,12 +940,10 @@ pub const Overlay = struct {
             const sv = req.vehicle.slot;
             const early = self.cfg.ack_early and sv.commit_retain and (sv.class == .page_cache or (self.cfg.ack_early_odirect and sv.extract != null));
             if (early) {
-                _ = rec.acked_pending.fetchAdd(1, .acq_rel);
                 stats.overlay_ack_early_stores.inc();
                 stats.overlay_ack_early_bytes.add(len);
                 const snapshot: ?[]const u8 = if (sv.class == .odirect) blk: {
                     const b = sv.extract.?(sv.ctx, io) catch {
-                        _ = rec.acked_pending.fetchSub(1, .acq_rel);
                         _ = self.finishStore(io, rec, ticket, permit, len, req.overwrite, false);
                         return error.InputOutput;
                     };
@@ -932,7 +952,6 @@ pub const Overlay = struct {
                 self.tasks.spawn(io, ackEarlyContinuation, .{ self, io, rec, ticket, permit, sv, snapshot, len, req.overwrite }) catch {
                     // No unit of concurrency: the caller lands it (still
                     // acked only after the CQE — the sound fallback).
-                    _ = rec.acked_pending.fetchSub(1, .acq_rel);
                     break :early;
                 };
                 return .{ .stored = .{ .coverage_complete = false, .acked_early = true } };
@@ -995,13 +1014,16 @@ pub const Overlay = struct {
     }
 
     /// The CQE: the governor's permit release FIRST (never waits on a block
-    /// guard), then `complete_store`, the gauge, the counters, the wake.
+    /// guard), then `complete_store`, the gauge, the hold drop with its
+    /// announcement (one critical section — the completion's last touch of
+    /// `rec`), the counters.
     fn finishStore(self: *Overlay, io: Io, rec: *Record, ticket: Ticket, permit: ?pipeline.Permit, len: u64, overwrite: bool, success: bool) StoreOutcome {
         if (permit) |p| if (self.deps.governor) |g| g.complete(io, p, rec.ordinal, clock.monotonicNs() -| p.admitted_ns);
         const verdict = rec.core.completeStore(ticket, success);
         stats.overlay_inflight_bytes.sub(len);
-        if (self.announce_hold.load(.acquire)) self.holdAnnounce(io);
-        rec.inflight_change.notifyWaiters(io);
+        rec.inflight_change.notifyWaitersAfter(io, HoldDrop{ .ov = self, .io = io, .core = &rec.core, .ticket = ticket });
+        // `rec` is not ours past this line: a settler's quiesce may have
+        // retired it and its slot may already host another record.
         if (!success) return .{ .stored = .{ .coverage_complete = false, .acked_early = false } };
         stats.overlay_stores.inc();
         stats.overlay_store_bytes.add(len);
@@ -1016,6 +1038,24 @@ pub const Overlay = struct {
             .not_covered => .{ .stored = .{ .coverage_complete = false, .acked_early = false } },
         };
     }
+
+    /// THE COMPLETION'S LAST TOUCH (module doc): the hold drop, applied
+    /// inside `inflight_change`'s critical section right before the
+    /// announcement. A settler that reads the in-flight set empty and then
+    /// quiesces on the record's notify (`awaitInflight`) is ordered after
+    /// the completion's unlock — the mutex's acquire pairs with that
+    /// release — so the record outlives every access the completion makes.
+    const HoldDrop = struct {
+        ov: *Overlay,
+        io: Io,
+        core: *Core,
+        ticket: Ticket,
+
+        pub fn apply(self: HoldDrop) void {
+            self.core.releaseStore(self.ticket);
+            if (self.ov.announce_hold.load(.acquire)) self.ov.holdAnnounce(self.io);
+        }
+    };
 
     /// The `announce_hold` seam's park (test builds arm it).
     fn holdAnnounce(self: *Overlay, io: Io) void {
@@ -1033,7 +1073,6 @@ pub const Overlay = struct {
     /// the payload is released exactly once, last.
     fn ackEarlyContinuation(self: *Overlay, io: Io, rec: *Record, ticket: Ticket, permit: ?pipeline.Permit, sv: SlotVehicle, snapshot: ?[]const u8, len: u64, overwrite: bool) Io.Cancelable!void {
         defer if (sv.release) |r| r(sv.ctx);
-        defer _ = rec.acked_pending.fetchSub(1, .acq_rel);
         var ladder = ACK_EARLY_LADDER;
         const dest_off = rec.dest.offset + ticket.first_page * OVERLAY_PAGE;
         while (true) {
@@ -1157,7 +1196,10 @@ pub const Overlay = struct {
 
     /// Register-then-recheck on `inflight_change` until the in-flight set
     /// is empty (law 9's wait set); a 30 s wait names the leaked ticket's
-    /// claim words — never a hang.
+    /// claim words — never a hang. Then ONE quiesce of the notify: the last
+    /// hold was dropped inside its critical section (`HoldDrop`), so
+    /// acquiring it once means that completion has left the record — the
+    /// caller may tear it down.
     fn awaitInflight(_: *Overlay, io: Io, rec: *Record) void {
         var waited = false;
         const t0 = clock.monotonicNs();
@@ -1176,6 +1218,10 @@ pub const Overlay = struct {
                 stats.overlay_teardown_wait_overlong.fire("settle waited 30 s on an in-flight overlay store");
                 log.err("overlay ino {d} block {d}: {d} store(s) still in flight after {d} s — claims {x}", .{ rec.key.ino, rec.key.block, rec.core.inflight.load(.monotonic), (clock.monotonicNs() - t0) / std.time.ns_per_s, rec.core.claims[0].load(.monotonic) });
             }
+        }
+        if (!rec.inflight_change.tryQuiesce(io)) {
+            stats.overlay_teardown_quiesce_waits.inc();
+            rec.inflight_change.quiesce(io);
         }
     }
 
@@ -1669,17 +1715,25 @@ test "overlay_core: coverage publishes only on a successful complete (law 3); th
     const t1 = try c.beginStore(2, 6); // disjoint ranges run concurrently (the 4 × 1 MiB cohort)
     try testing.expectEqual(@as(u64, 2), t1.generation);
     try testing.expectEqual(@as(u32, 2), c.inflight.load(.monotonic));
-    // A failed CQE covers nothing but releases its claim.
+    // A failed CQE covers nothing; the claim and the hold go only at the release.
     try testing.expectEqual(CompleteVerdict.not_covered, c.completeStore(t0, false));
     try testing.expect(!c.coveredProbe(0, 2));
+    try testing.expect(c.rangeInflight(0, 2));
+    try testing.expectEqual(@as(u32, 2), c.inflight.load(.monotonic));
+    c.releaseStore(t0);
     try testing.expect(!c.rangeInflight(0, 2));
+    try testing.expectEqual(@as(u32, 1), c.inflight.load(.monotonic));
     const t2 = try c.beginStore(0, 2); // re-write of the released range
     try testing.expectEqual(@as(u64, 3), t2.generation);
     try testing.expectEqual(CompleteVerdict{ .covered = .{ .coverage_complete = false } }, c.completeStore(t1, true));
+    try testing.expect(!c.coveredProbe(2, 6)); // covered, but claimed until the release
+    c.releaseStore(t1);
     try testing.expect(c.coveredProbe(2, 6));
     try testing.expectEqual(CompleteVerdict{ .covered = .{ .coverage_complete = true } }, c.completeStore(t2, true));
     try testing.expect(c.union_.isFull(8 * OVERLAY_PAGE));
     try testing.expectEqual(State.frozen, c.stateNow()); // the completing CQE froze it before releasing its claim
+    try testing.expect(!c.inflightEmpty());
+    c.releaseStore(t2);
     try testing.expect(c.inflightEmpty());
     // A snapshot taken before an accept is invalid afterwards (equality).
     var e = Core.init(8 * OVERLAY_PAGE, 2);
@@ -1698,6 +1752,7 @@ test "overlay_core: freeze refuses new stores and the in-flight set drains to pu
     try testing.expect(!c.inflightEmpty());
     try testing.expect(!c.rollbackAdmissible());
     try testing.expectEqual(CompleteVerdict{ .covered = .{ .coverage_complete = false } }, c.completeStore(t, true)); // a store accepted before the freeze still covers
+    c.releaseStore(t);
     try testing.expect(c.inflightEmpty());
     try testing.expect(c.rollbackAdmissible() == false); // frozen is not terminal
     var d = Core.init(4 * OVERLAY_PAGE, 2);
@@ -1718,7 +1773,9 @@ test "overlay_core: freeze refuses new stores and the in-flight set drains to pu
     try testing.expect(f.freeze());
     try testing.expect(f.markPublished());
     try testing.expectEqual(CompleteVerdict.superseded, f.completeStore(tf, true));
+    f.releaseStore(tf);
     try testing.expect(!f.coveredProbe(0, 4));
+    try testing.expect(f.inflightEmpty());
 }
 
 const TestWorld = struct {

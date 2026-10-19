@@ -7,6 +7,14 @@
 //!   race is safe; permits never accumulate past one (tokio parity).
 //! * `notifyWaiters` bumps the EPOCH and wakes every currently registered
 //!   waiter; it never stores a permit (a later waiter parks).
+//! * `notifyWaitersAfter` applies the condition's change INSIDE the same
+//!   critical section as the announcement, and `quiesce` is one lock/unlock
+//!   of it: a waiter whose re-check saw the change and then quiesced knows
+//!   the notifier has left the Notify, so it may free or recycle the
+//!   Notify's owner — the kernel's `complete()` / `wait_for_completion`
+//!   contract (the notifier's unlock is its last touch). A notifier that
+//!   changes the condition OUTSIDE the lock and announces afterwards is
+//!   touching an object its waiter may already have torn down.
 //! * A waiter REGISTERS FIRST (`enable`), then re-checks its own condition,
 //!   then parks (`wait`) — the todo-24 law: the registration and the epoch
 //!   snapshot happen under the same lock every notifier mutates under, so a
@@ -196,6 +204,42 @@ pub const Notify = struct {
     pub fn notifyWaiters(self: *Notify, io: Io) void {
         self.interior.lockUncancelable(io);
         defer self.interior.unlock(io);
+        self.notifyWaitersLocked(io);
+    }
+
+    /// `notifyWaiters` with the condition's change inside the critical
+    /// section: `change.apply()` runs under the interior lock, then the
+    /// epoch bumps and every registered waiter wakes (module doc: the
+    /// waiter's `quiesce` after its re-check then means this notifier is
+    /// gone). The unlock is the notifier's last access to the Notify: the
+    /// owner may be recycled by the first waiter to acquire it afterwards.
+    pub fn notifyWaitersAfter(self: *Notify, io: Io, change: anytype) void {
+        self.interior.lockUncancelable(io);
+        defer self.interior.unlock(io);
+        change.apply();
+        self.notifyWaitersLocked(io);
+    }
+
+    /// One lock/unlock of the interior: every notifier whose change the
+    /// caller already observed (`notifyWaitersAfter`) has left its critical
+    /// section. The lock's acquire pairs with that notifier's unlock
+    /// (release), so everything it did to the owner precedes the caller's
+    /// teardown.
+    pub fn quiesce(self: *Notify, io: Io) void {
+        self.interior.lockUncancelable(io);
+        self.interior.unlock(io);
+    }
+
+    /// `quiesce` without parking: false ⇔ someone is inside (a notifier
+    /// still announcing, or a waiter registering) and the caller must
+    /// `quiesce` — the park observable a caller counts before it waits.
+    pub fn tryQuiesce(self: *Notify, io: Io) bool {
+        if (!self.interior.tryLock()) return false;
+        self.interior.unlock(io);
+        return true;
+    }
+
+    fn notifyWaitersLocked(self: *Notify, io: Io) void {
         self.epoch += 1;
         while (self.head) |w| {
             self.unlinkLocked(w);
@@ -439,6 +483,59 @@ fn waitUntilBody(io: Io) !void {
 
 test "waitUntil: a passed deadline unregisters and keeps a later permit; a stored permit or epoch wins over the deadline; a cross-thread notify ends a far-deadline wait" {
     try sync_testing.underBoth(waitUntilBody);
+}
+
+fn changeAndQuiesceBody(io: Io) !void {
+    // The change lands under the lock and the registered waiter completes
+    // seeing it; a waiter that quiesces finds nobody inside.
+    var n: Notify = .init;
+    const Flag = struct {
+        word: *std.atomic.Value(u32),
+        pub fn apply(self: @This()) void {
+            self.word.store(1, .monotonic);
+        }
+    };
+    var word: std.atomic.Value(u32) = .init(0);
+    var w = n.notified();
+    try testing.expect(!w.enable(io));
+    n.notifyWaitersAfter(io, Flag{ .word = &word });
+    try testing.expectEqual(@as(u32, 1), word.load(.monotonic));
+    try w.wait(io);
+    try testing.expect(n.tryQuiesce(io));
+    n.quiesce(io);
+    // A notifier parked inside its critical section after its change: a
+    // waiter that saw the change finds someone inside and its quiesce
+    // WAITS for the notifier to leave. The notifier holds until the
+    // quiescer is parked on the lock (the mutex word reads contended), so
+    // the outcome is deterministic.
+    const Shared = struct {
+        n: Notify = .init,
+        word: std.atomic.Value(u32) = .init(0),
+        pub fn apply(self: *@This()) void {
+            self.word.store(1, .release);
+            while (self.n.interior.state.load(.acquire) != .contended) std.atomic.spinLoopHint();
+        }
+        fn notifier(io_: Io, s: *@This()) void {
+            s.n.notifyWaitersAfter(io_, s);
+        }
+        fn quiescer(io_: Io, s: *@This(), inside: *bool) void {
+            while (s.word.load(.acquire) == 0) std.atomic.spinLoopHint();
+            inside.* = !s.n.tryQuiesce(io_);
+            s.n.quiesce(io_);
+        }
+    };
+    var s: Shared = .{};
+    var inside = false;
+    const tq = try std.Thread.spawn(.{}, Shared.quiescer, .{ io, &s, &inside });
+    const tn = try std.Thread.spawn(.{}, Shared.notifier, .{ io, &s });
+    tq.join();
+    tn.join();
+    try testing.expect(inside);
+    try testing.expectEqual(@as(u64, 1), s.n.epoch);
+}
+
+test "notifyWaitersAfter applies the change under the lock before the announcement; tryQuiesce says nobody is inside, and quiesce waits out a notifier parked inside its critical section after its change" {
+    try sync_testing.underBoth(changeAndQuiesceBody);
 }
 
 test "the tick accounting: an idle waiter parked past a tick and then notified counts NOTHING (the reclaimer's idle shape — the phantom 'lost wakes'); a notify whose wake was lost is rescued by the tick and counts exactly one channel_ticked_reregisters" {

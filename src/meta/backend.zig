@@ -680,8 +680,6 @@ pub const KvBackend = struct {
             else => return error.LaneSpawnFailed,
         };
         errdefer be.lane.deinit();
-        // Before the first request: a handler fiber's fsync parks alone.
-        be.lane.routeWaits(io);
         // Every checkpoint-side device error now classifies for the fence.
         be.dev.latch = &be.lane.latch;
         be.smo_journal = .{ .gpa = gpa, .layout = ring_layout, .geo = geo, .core = &be.core, .reg = &be.reg, .image = &.{}, .barrier_hook = be.dev.barrierSink(), .latch = &be.lane.latch, .device = .{ .ctx = be, .write = smoWriteHook, .completed = smoCompletedHook } };
@@ -1055,7 +1053,6 @@ pub const KvBackend = struct {
             else => return error.LaneSpawnFailed,
         };
         errdefer be.lane.deinit();
-        be.lane.routeWaits(io);
         be.dev.latch = &be.lane.latch;
         be.smo_journal = .{ .gpa = gpa, .layout = be.ring_layout, .geo = be.geo, .core = &be.core, .reg = &be.reg, .image = &.{}, .barrier_hook = be.dev.barrierSink(), .latch = &be.lane.latch, .device = .{ .ctx = be, .write = smoWriteHook, .completed = smoCompletedHook }, .appender_id = standing.appender_id };
         be.smo_journal.retire_seq.store(standing.ckpt_seq + 1, .release);

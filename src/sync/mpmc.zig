@@ -103,14 +103,6 @@ pub fn BoundedMpmc(comptime T: type) type {
             return true;
         }
 
-        /// Items between the two cursors — a HINT like `isEmpty` (relaxed),
-        /// exact only while no producer or consumer is mid-operation: the
-        /// owner's quiescence assertions (a pool whose whole population is
-        /// back in its ring).
-        pub fn len(self: *const Self) usize {
-            return self.enqueue_pos.load(.monotonic) -% self.dequeue_pos.load(.monotonic);
-        }
-
         /// No item at the consumer's position — a HINT (relaxed: a push may
         /// land a moment later; the lane's ack-spin asks it before spinning,
         /// decision 0003 §AB.4).
@@ -153,15 +145,12 @@ test "bounded MPMC queue: FIFO, full refuses, wraps, empty is null" {
     var q = try Q.init(testing.allocator, 4);
     defer q.deinit(testing.allocator);
     try testing.expectEqual(@as(usize, 4), q.capacity());
-    try testing.expectEqual(@as(usize, 0), q.len());
     try testing.expect(q.tryPush(1));
     try testing.expect(q.tryPush(2));
     try testing.expect(q.tryPush(3));
     try testing.expect(q.tryPush(4));
     try testing.expect(!q.tryPush(5));
-    try testing.expectEqual(@as(usize, 4), q.len());
     try testing.expectEqual(@as(?u32, 1), q.tryPop());
-    try testing.expectEqual(@as(usize, 3), q.len());
     try testing.expect(q.tryPush(5));
     try testing.expectEqual(@as(?u32, 2), q.tryPop());
     try testing.expectEqual(@as(?u32, 3), q.tryPop());

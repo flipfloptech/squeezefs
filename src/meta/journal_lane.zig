@@ -52,12 +52,7 @@
 //! either class (the pass fiber, the stage-B fiber inside a hook) is served
 //! on its own thread: its request is admitted directly and its wait is a
 //! fiber park — a queue only the parked fiber scans would be a wait on
-//! itself. Every OTHER waiter (a handler fiber's `fsync`, the checkpoint
-//! thread's structural entry) parks through the lane's wait route
-//! (`routeWaits`, the backend installs it at open): a fiber alone in the
-//! executor's futex table, a raw thread on the counted kernel wait —
-//! decision 0001's 2026-10-18 amendment, extended here; a bare lane keeps
-//! the raw futex on both sides.
+//! itself.
 //!
 //! Zig has no unwinding panics: where the reference panic-guards its lane
 //! task (`LaneSentinel`), a panic on this thread aborts the process — fail
@@ -83,7 +78,6 @@ const mpmc = @import("../sync/mpmc.zig");
 const exec_lane = @import("../exec/lane.zig");
 const fiber_mod = @import("../exec/fiber.zig");
 const group_mod = @import("../exec/group.zig");
-const sqz_io = @import("../exec/sqz_io.zig");
 const jc = @import("journal_core.zig");
 const journal = @import("journal.zig");
 const checkpoint = @import("checkpoint.zig");
@@ -223,14 +217,6 @@ pub const Stats = struct {
     /// completion is still at the device (slow, not lost). Reporting.
     park_backstop_ticks: counters.ShardedCounter = .{},
     prefix_waits: counters.ShardedCounter = .{},
-    /// Ticket waits from OFF the lane thread, by what parked: a fiber on
-    /// another lane in the executor's futex table (its lane thread ran on —
-    /// `journal_lane_wait_fiber_parks`) vs a raw thread on the kernel
-    /// futex (`journal_lane_wait_raw_parks`: the checkpoint thread, tests,
-    /// a lane without a route). On a serving mount a handler's fsync is a
-    /// fiber park; a same-lane fiber's wait is neither (its own park).
-    wait_fiber_parks: counters.ShardedCounter = .{},
-    wait_raw_parks: counters.ShardedCounter = .{},
     queue_full: counters.ShardedCounter = .{},
     volumes_failed: counters.ShardedCounter = .{},
     /// Rings that died under a lane (`io_uring_enter` / the CQE read
@@ -247,7 +233,7 @@ pub var stats: Stats = .{};
 
 /// `{"journal_lanes_spawned":n,…}`
 pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
-    try w.print("{{\"journal_lanes_spawned\":{d},\"journal_lanes_live\":{d},\"journal_ring_lane_writes\":{d},\"journal_lane_structural_writes\":{d},\"journal_lane_write_bytes\":{d},\"journal_lane_write_failures\":{d},\"journal_lane_rollbacks\":{d},\"journal_lane_barriers_strict\":{d},\"journal_lane_barriers_coalesced\":{d},\"journal_lane_barrier_failures\":{d},\"journal_lane_wake_writes\":{d},\"journal_lane_wake_elided\":{d},\"journal_lane_parks\":{d},\"journal_lane_park_tick_rescues\":{d},\"journal_lane_park_backstop_ticks\":{d},\"journal_lane_prefix_waits\":{d},\"journal_lane_wait_fiber_parks\":{d},\"journal_lane_wait_raw_parks\":{d},\"journal_lane_queue_full\":{d},\"journal_lane_volumes_failed\":{d},\"journal_lane_rings_dead\":{d},\"journal_lane_cqe_orphan\":{d},\"journal_lane_ack_out_of_order\":{d}}}", .{
+    try w.print("{{\"journal_lanes_spawned\":{d},\"journal_lanes_live\":{d},\"journal_ring_lane_writes\":{d},\"journal_lane_structural_writes\":{d},\"journal_lane_write_bytes\":{d},\"journal_lane_write_failures\":{d},\"journal_lane_rollbacks\":{d},\"journal_lane_barriers_strict\":{d},\"journal_lane_barriers_coalesced\":{d},\"journal_lane_barrier_failures\":{d},\"journal_lane_wake_writes\":{d},\"journal_lane_wake_elided\":{d},\"journal_lane_parks\":{d},\"journal_lane_park_tick_rescues\":{d},\"journal_lane_park_backstop_ticks\":{d},\"journal_lane_prefix_waits\":{d},\"journal_lane_queue_full\":{d},\"journal_lane_volumes_failed\":{d},\"journal_lane_rings_dead\":{d},\"journal_lane_cqe_orphan\":{d},\"journal_lane_ack_out_of_order\":{d}}}", .{
         stats.lanes_spawned.load(),
         stats.lanes_live.load(),
         stats.lane_writes.load(),
@@ -264,8 +250,6 @@ pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
         stats.park_tick_rescues.load(),
         stats.park_backstop_ticks.load(),
         stats.prefix_waits.load(),
-        stats.wait_fiber_parks.load(),
-        stats.wait_raw_parks.load(),
         stats.queue_full.load(),
         stats.volumes_failed.load(),
         stats.rings_dead.load(),
@@ -510,12 +494,9 @@ pub const Ticket = struct {
 
     /// Park until the outcome: a fiber on the lane's own thread parks as a
     /// fiber (the lane keeps reaping — its own CQE is what answers it); any
-    /// other caller parks through the lane's wait route
-    /// (`JournalLane.wait_io`): a fiber on ANOTHER lane alone, in the
-    /// executor's futex table (its lane thread runs the fibers homed there
-    /// for the whole wait), a raw thread on the counted kernel wait; a
-    /// lane without a route parks the caller thread on the cell's raw
-    /// futex.
+    /// other thread parks on the cell's raw futex (a fiber on ANOTHER lane
+    /// holds its thread here — the handler lanes' `fsync` takes an `Io`
+    /// route when it lands).
     pub fn wait(self: Ticket) Outcome {
         const c = &self.lane.cells[self.cell];
         const o = if (self.lane.onLaneThread()) blk: {
@@ -524,15 +505,7 @@ pub const Ticket = struct {
             while (c.done.poll() == null) f.park();
             c.waiter = null;
             break :blk c.done.poll().?;
-        } else if (self.lane.wait_io) |io| blk: {
-            // The only route ever installed is `SqzIo`'s, whose futex face
-            // parks exactly the fibers `currentFiber` names.
-            if (exec_lane.currentFiber() != null) stats.wait_fiber_parks.inc() else stats.wait_raw_parks.inc();
-            break :blk c.done.waitIo(io);
-        } else blk: {
-            stats.wait_raw_parks.inc();
-            break :blk c.done.wait();
-        };
+        } else c.done.wait();
         self.lane.freeCell(self.cell);
         return o;
     }
@@ -598,17 +571,6 @@ pub const JournalLane = struct {
     /// The stage-B fiber and the group that joins it at shutdown.
     fiber: ?*Fiber = null,
     group: Io.Group = .init,
-    /// The wait route (`routeWaits`): the executor's futex face every
-    /// off-lane ticket waiter parks through and the lane's deliver wakes
-    /// through, so a fiber on ANOTHER lane (a handler's fsync, a space
-    /// retry's structural write) parks ALONE — its lane thread runs the
-    /// other fibers homed there — and a raw thread takes the counted
-    /// kernel wait. Null = the raw futex on both sides (a bare lane:
-    /// tests, offline tools). Set once, before the first request; both
-    /// sides of every cell read the same value (a cell whose waiter and
-    /// completer disagreed would lose its wake). A same-lane fiber never
-    /// takes it: its wait is its own park, answered by this thread.
-    wait_io: ?Io = null,
     /// The lane thread's kernel tid, published at start (0 until then).
     tid: std.atomic.Value(i32) = .init(0),
     stats: LaneStats = .{},
@@ -758,18 +720,6 @@ pub const JournalLane = struct {
     /// Whether the caller runs on this lane's thread (a fiber there).
     pub fn onLaneThread(self: *const JournalLane) bool {
         return exec_lane.current_lane == self.lane;
-    }
-
-    /// Route every off-lane ticket wait through `io`'s futex face (the
-    /// `wait_io` field doc; decision 0001 amendment 2026-10-18, extended to
-    /// the journal lane). Legal only before the first request: a request
-    /// in flight would have its waiter on one route and its completer on
-    /// the other. The `Io` must outlive the lane: deliver wakes through it
-    /// until the fiber's exit.
-    pub fn routeWaits(self: *JournalLane, io: Io) void {
-        std.debug.assert(self.inflight_submitters.load(.seq_cst) == 0);
-        std.debug.assert(self.free_cells.len() == self.cells.len);
-        self.wait_io = io;
     }
 
     /// Submit one window on the lane's ring. Refusals answer on THIS thread
@@ -1004,10 +954,8 @@ pub const JournalLane = struct {
     }
 
     /// Publish a cell's outcome: through its hook (then the cell is free),
-    /// or through the completion cell — the wake takes the route the
-    /// waiter took (both read `wait_io`, set before the first request); a
-    /// same-lane fiber waiter is woken here (one thread: its registration
-    /// preceded its park).
+    /// or through the completion cell — a same-lane fiber waiter is woken
+    /// here (one thread: its registration preceded its park).
     fn deliver(self: *JournalLane, c: *Cell, outcome: Outcome) void {
         if (c.done_hook) |h| {
             h.call(h.ctx, outcome);
@@ -1016,7 +964,7 @@ pub const JournalLane = struct {
         }
         // A ticket has no abandon face (`wait`/`poll` consume it), so the
         // waiter always owns the cell after this publish.
-        _ = if (self.wait_io) |io| c.done.completeIo(io, outcome) else c.done.complete(outcome);
+        _ = c.done.complete(outcome);
         if (c.waiter) |f| if (f.state.wake()) self.lane.enqueue(f);
     }
 
@@ -2644,87 +2592,6 @@ test "a same-lane fiber's ticket wait is a fiber park: a fiber on the journal la
     defer rec.deinit();
     var inos: [4]u64 = undefined;
     try testing.expectEqualSlices(u64, &.{3}, recoveredInos(&rec, &inos));
-}
-
-test "a fiber on ANOTHER lane waiting on a journal ticket parks only itself: a bystander fiber homed on the same lane runs while stage B is held before the ack; the wait counts as a fiber park, a raw thread's as a raw park (decision 0001 amendment 2026-10-18, the journal lane)" {
-    // The route outlives the lane (deliver wakes through it until the
-    // stage-B fiber's exit), so the executor is built first and torn down
-    // last.
-    const sqz = try sqz_io.SqzIo.testInstance();
-    defer sqz.deinit();
-    const io = sqz.io();
-    const h = try Harness.init(testing.allocator, "foreign-fiber");
-    defer h.deinit();
-    try h.spawnLane(.{}, "600000", 0);
-    const lane = h.lane.?;
-    lane.routeWaits(io);
-    const fiber_parks0 = stats.wait_fiber_parks.load();
-    const raw_parks0 = stats.wait_raw_parks.load();
-    // The test thread is a raw waiter through the route: one raw park.
-    const warm = try h.append(1, 300, 0x01);
-    try warm.ticket.wait().result;
-    try testing.expectEqual(raw_parks0 + 1, stats.wait_raw_parks.load());
-    try testing.expectEqual(fiber_parks0, stats.wait_fiber_parks.load());
-    spinUntil(struct {
-        f: *const Fiber,
-        fn ready(s: @This()) bool {
-            return s.f.state.load() == .idle;
-        }
-    }{ .f = lane.fiber.? });
-
-    // Stage B held at the top of its next poll: the barrier request below
-    // is published, wakes the fiber, and sits in the inbound queue — no
-    // barrier can start, so the fsync's ack is held without a sleep.
-    test_seams.held.store(0, .release);
-    test_seams.hold_before_scan.store(1, .release);
-    defer {
-        test_seams.hold_before_scan.store(0, .release);
-        futex.wakeAll(&test_seams.hold_before_scan);
-        test_seams.held.store(0, .release);
-    }
-    const S = struct {
-        /// A handler's fsync from a fiber on a meta lane.
-        fn fsync(l: *JournalLane) Error!void {
-            const t = try l.requestBarrier();
-            return t.wait().result;
-        }
-        /// The bystander on the same lane: runs iff the lane thread is free.
-        fn bystander(ran: *futex.Word) void {
-            ran.store(1, .release);
-            futex.wakeAll(ran);
-        }
-    };
-    const mlane = sqz.metaLanes()[0];
-    var waiter = try sqz.spawnOn(mlane, S.fsync, .{lane});
-    while (test_seams.held.load(.acquire) == 0) futex.wait(&test_seams.held, 0);
-    // The ack is held: the waiter is parked, counted before its park.
-    while (stats.wait_fiber_parks.load() == fiber_parks0 and stats.wait_raw_parks.load() == raw_parks0 + 1) std.atomic.spinLoopHint();
-    var ran: futex.Word = .init(0);
-    var by = try sqz.spawnOn(mlane, S.bystander, .{&ran});
-    // THE LAW: the bystander runs during the fsync wait. A waiter that held
-    // the lane thread would keep it off the CPU until the ack; the bound is
-    // a diagnostic, never a synchronization (the held ack cannot arrive, so
-    // a timeout here means the lane thread is held — a free lane runs the
-    // bystander in microseconds, loaded venue or not).
-    while (ran.load(.acquire) == 0) {
-        if (futex.waitTimeout(&ran, 0, 30 * std.time.ns_per_s) == .timed_out and ran.load(.acquire) == 0) {
-            std.debug.print("the fiber waiting on the journal ticket holds its lane thread: the bystander never ran\n", .{});
-            test_seams.hold_before_scan.store(0, .release);
-            futex.wakeAll(&test_seams.hold_before_scan);
-            try waiter.await(io);
-            by.await(io);
-            return error.TestExpectedEqual;
-        }
-    }
-    by.await(io);
-    try testing.expectEqual(fiber_parks0 + 1, stats.wait_fiber_parks.load());
-    try testing.expectEqual(raw_parks0 + 1, stats.wait_raw_parks.load());
-    // Release stage B: the barrier runs, the fsync is acked through the route.
-    test_seams.hold_before_scan.store(0, .release);
-    futex.wakeAll(&test_seams.hold_before_scan);
-    try waiter.await(io);
-    try testing.expectEqual(@as(u64, 1), lane.snapshot().barriers_coalesced);
-    try testing.expectEqual(fiber_parks0 + 1, stats.wait_fiber_parks.load());
 }
 
 test "the stats JSON names every lane counter" {

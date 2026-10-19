@@ -50,7 +50,7 @@ pub fn gino(local: u64, slot: u16) u64 {
 /// A holder's store: the portable `MemStore` behind the DOOR — a staged
 /// record whose slot this holder does not lease refuses `SlotBusy`.
 pub const HolderStore = struct {
-    pub const StoreError = error{ OutOfMemory, Io, SlotBusy };
+    pub const StoreError = error{ OutOfMemory, Io, SlotBusy, WouldBlock };
 
     mem: kv_fs.MemStore,
     leased: std.ArrayListUnmanaged(u16) = .empty,
@@ -67,6 +67,8 @@ pub const HolderStore = struct {
             error.OutOfMemory => error.OutOfMemory,
             error.Io => error.InputOutput,
             error.SlotBusy => error.SlotMoved,
+            // The MemStore's try-only refusal (never armed by these rigs).
+            error.WouldBlock => error.WouldBlock,
         };
     }
 

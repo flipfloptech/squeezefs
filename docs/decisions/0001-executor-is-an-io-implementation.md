@@ -106,3 +106,10 @@ the first request), the waiter parks through `Completion.waitIo`, the lane's `de
 park answered by the lane's own reap — that path is not a futex wait at all; and a bare lane (tests,
 offline tools) keeps the raw futex on both sides. Counted: `journal_lane_wait_fiber_parks` /
 `journal_lane_wait_raw_parks`. Numbers: `docs/evidence/rung-10-fsync-route.md`.
+
+**The corollary, learned the hard way (the `sw1m-q16j1` wedge, same note):** a wait that becomes a fiber
+park turns every SPIN on that path's progress into a possible self-deadlock — a fiber spinning for a latch
+whose holder is a parked fiber homed on the same lane holds the lane the holder needs. So a spin on another
+fiber's progress is admissible only where the holder provably has no park point; where a route reaches, the
+spinner takes the route too (`block_grant.WriterArm.routeWaits`: the lost top-up racer parks on the latch
+word, the winner wakes it). Giving a path the route means auditing its spinners.

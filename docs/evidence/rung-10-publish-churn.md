@@ -30,8 +30,12 @@ checkpoint lane 60 % allocation + `smoReplace` 53 % (37 KiB Puts filling 256 KiB
   the slab's remainder (`Slab.primeArena`: an arena grows its nodes ×1.5 — 56, 85, 128 KiB — so the
   first cut overflowed 163 MB per row into the heap). Slab = 2 records at the cap + 3/2 × (a record +
   the widest save's tx) = 356 KiB at 256 KiB nodes; pool = two conveyor batches (`2 × max(64, 2 ×
-  cpus)` = 128 here, 44.5 MiB); a merge past the pool parks (`layout_publish_scratch_waits`), bytes
-  past a slab fall to the heap counted (`layout_publish_scratch_overflow_bytes`) — both 0 on every row.
+  cpus)` = 128 here, 44.5 MiB — the count follows the merge concurrency, the budget offers no pool
+  tier); a merge past the pool parks (`layout_publish_scratch_waits`), bytes past a slab fall to the
+  heap counted (`layout_publish_scratch_overflow_bytes`) — both 0 on every row. The pool is the
+  budget's (charter §6.2 R5, `rung-09-memory-footprint.md` §3.5): component `layout_publish_scratch`,
+  its bytes as gauge and floor, weight 0, no shed (a slab in flight backs a queued tx), tie-tested at
+  pool × slab; the transform's `ScratchPool` registers the same way (`transform_scratch_pool`).
 - **Staged in place**: `KvTx.stagePutArena` stages the arena-built value without the second copy.
 - **The diff is ONE merge walk** of the two ascending named sequences (`layout.RefDiff` over
   `NamedIterator.peek`/`skip`): a same-block same-reference pair costs a 16 B compare off the wire,
@@ -85,4 +89,5 @@ DELTA records (`layout.LayoutDelta` — the KV fold still folds the reference's 
 port's binary one) are the mechanisms. (2) The journal lane's three per-publish copies (`captureUndo`'s
 dupe, `OwnedRec.fromRecordRef`, `buildBatchWrite`'s image) and the checkpoint's bset/snapshot buffers
 are still heap per op above 32 KiB. (3) `MetaSet.begin`'s `KvTx` box is one slab-class allocation per
-merge.
+merge. (4) The transform's `CodecPool` is still outside the budget: its contexts are the zstd
+library's own allocations, unmeasured.

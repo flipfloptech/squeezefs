@@ -669,6 +669,10 @@ pub const Shared = struct {
     /// worker DRIVES a lane of its own and every handler it dispatches runs
     /// on it — on this thread.
     handlers_on_worker: bool = false,
+    /// `SQUEEZEFS_FUSE_OWED_SPIN`: a pass with nothing in hand and a device
+    /// completion owed spins for it by `owedSpinBudget` (0 = the control
+    /// arm: park per CQE).
+    owed_spin: bool = true,
     /// `SQUEEZEFS_FUSE_WRITE_OWN_DEPTH`: a held WRITE takes the worker's own
     /// lane while fewer handlers than this are live there, else the CPU's
     /// lane (0 = unbounded). One io_uring submitter's whole queue depth
@@ -1550,7 +1554,7 @@ pub const Group = struct {
     /// pass reaps now; false ⇒ the pass parks as before (its SQEs already
     /// submitted, so the park is the one-enter timed wait).
     fn spinForOwed(self: *Group) bool {
-        if (self.deadlines.outstanding == 0 or self.ring.isDead()) return false;
+        if (!self.shared.owed_spin or self.deadlines.outstanding == 0 or self.ring.isDead()) return false;
         const awake = predictionOf(&self.dev_awake);
         const slept = predictionOf(&self.dev_slept);
         const now = clock.monotonicNs();

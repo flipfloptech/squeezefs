@@ -11,14 +11,24 @@
 //! or a cancel woke it). Off a lane the wait is the raw `futex(2)` with the
 //! kernel's own timeout.
 //!
-//! The raw-waiter Dekker: a raw waiter increments `raw_waiters` BEFORE its
-//! kernel compare-and-wait; the waker stores the word (the primitive's
-//! token) BEFORE it reads the count — both as RMWs on the count word, so one
-//! of them observes the other: either the waker pays the kernel wake or the
-//! raw waiter's compare sees the new word (`futex_table_model.zig`; the
-//! weakening is counting after the wait). A kernel `FUTEX_WAKE` is paid
-//! only when a raw waiter may exist: the common all-fiber case costs no
-//! syscall per wake.
+//! The raw-waiter Dekker: a raw waiter increments its bucket's `raw_waiters`
+//! BEFORE its kernel compare-and-wait; the waker stores the word (the
+//! primitive's token) BEFORE it reads the count — both as RMWs on the count
+//! word, so one of them observes the other: either the waker pays the kernel
+//! wake or the raw waiter's compare sees the new word (`futex_table_model.zig`;
+//! the weakening is counting after the wait). A kernel `FUTEX_WAKE` is paid
+//! only when a raw waiter may exist in the word's bucket: the common
+//! all-fiber case costs no syscall per wake, and a raw park elsewhere (a
+//! journal lane's counted ticket wait) does not tax the handler lanes' wakes.
+//!
+//! The raw side is woken for the WHOLE count whatever the fibers took of it
+//! (`DrivenOwnerModel`): a counted raw waiter may be the owner thread of a
+//! DRIVEN lane a woken fiber lives on — the FUSE drain worker, off a fiber
+//! in a try-only probe, behind one of its own handler fibers on a mutex's
+//! interior word. That fiber runs only once the owner is back in its pass,
+//! so a count-one wake the fiber took alone left both asleep on a FREE word
+//! (`docs/evidence/rung-10-mdtest-wedge.md`). A spurious raw wake costs one
+//! re-contend: every caller loops on its predicate.
 //!
 //! Linux only.
 
@@ -58,6 +68,9 @@ const Bucket = struct {
     lock: SpinLock = .{},
     head: ?*Fiber = null,
     tail: ?*Fiber = null,
+    /// Raw (non-lane) threads inside a kernel wait on a word of this
+    /// bucket, or about to enter one (the Dekker's count).
+    raw_waiters: std.atomic.Value(u32) = .init(0),
 
     fn link(b: *Bucket, f: *Fiber) void {
         assert(!f.futex_linked);
@@ -81,8 +94,6 @@ const Bucket = struct {
 
 pub const FutexTable = struct {
     buckets: [bucket_count]Bucket = @splat(.{}),
-    /// Raw (non-lane) threads inside a kernel wait or about to enter one.
-    raw_waiters: std.atomic.Value(u32) = .init(0),
 
     pub const init: FutexTable = .{};
 
@@ -142,12 +153,13 @@ pub const FutexTable = struct {
         b.lock.release();
     }
 
-    /// The raw-thread path: counted, then the kernel wait (`timeout_ns`
-    /// relative, null = unbounded). seq_cst RMWs on the count pair with
-    /// `wake`'s read (the Dekker, module doc).
+    /// The raw-thread path: counted in the word's bucket, then the kernel
+    /// wait (`timeout_ns` relative, null = unbounded). seq_cst RMWs on the
+    /// count pair with `wake`'s read (the Dekker, module doc).
     pub fn rawWait(self: *FutexTable, ptr: *const u32, expected: u32, timeout_ns: ?u64) void {
-        _ = self.raw_waiters.fetchAdd(1, .seq_cst);
-        defer _ = self.raw_waiters.fetchSub(1, .seq_cst);
+        const b = self.bucketOf(ptr);
+        _ = b.raw_waiters.fetchAdd(1, .seq_cst);
+        defer _ = b.raw_waiters.fetchSub(1, .seq_cst);
         const word: *const futex.Word = @ptrCast(@alignCast(ptr));
         if (timeout_ns) |ns| {
             _ = futex.waitTimeout(word, expected, ns);
@@ -156,9 +168,11 @@ pub const FutexTable = struct {
         }
     }
 
-    /// Wake up to `max` waiters on `ptr`: matching fibers first (moved off
-    /// the list under the lock, woken outside it — the enqueue may write an
-    /// eventfd), then the kernel wake for the raw waiters iff any exist.
+    /// Wake up to `max` waiters on `ptr`: matching fibers (moved off the
+    /// list under the lock, woken outside it — the enqueue may write an
+    /// eventfd), AND up to `max` raw waiters through the kernel iff the
+    /// bucket counts any — never the remainder alone (module doc: a counted
+    /// raw waiter may be what runs the fibers just woken).
     pub fn wake(self: *FutexTable, ptr: *const u32, max: u32) void {
         if (max == 0) return;
         var remaining = max;
@@ -183,30 +197,29 @@ pub const FutexTable = struct {
             f.futex_next = null;
             if (f.state.wake()) f.lane.enqueue(f);
         }
-        if (remaining == 0) return;
         // The Dekker read: a seq_cst RMW (fetchAdd 0) is the fence AND the
         // load — it is totally ordered against every raw waiter's increment.
-        if (self.raw_waiters.fetchAdd(0, .seq_cst) != 0) {
-            futex.wake(@ptrCast(@alignCast(ptr)), remaining);
+        if (b.raw_waiters.fetchAdd(0, .seq_cst) != 0) {
+            futex.wake(@ptrCast(@alignCast(ptr)), max);
         }
     }
 
-    /// Raw waiters counted right now (tests).
-    pub fn rawWaiters(self: *const FutexTable) u32 {
-        return self.raw_waiters.load(.seq_cst);
+    /// Raw waiters counted right now in `ptr`'s bucket (tests).
+    pub fn rawWaiters(self: *FutexTable, ptr: *const u32) u32 {
+        return self.bucketOf(ptr).raw_waiters.load(.seq_cst);
     }
 };
 
 const testing = std.testing;
 
-test "raw waiters: a wake from another thread ends a counted wait; expected mismatch returns at once; a timed wait expires; the count returns to 0" {
+test "raw waiters: a wake from another thread ends a counted wait; expected mismatch returns at once; a timed wait expires; the count is the word's bucket's and returns to 0" {
     var t: FutexTable = .init;
     var word: futex.Word = .init(0);
     t.rawWait(&word.raw, 1, null);
-    try testing.expectEqual(@as(u32, 0), t.rawWaiters());
+    try testing.expectEqual(@as(u32, 0), t.rawWaiters(&word.raw));
     const Waker = struct {
         fn run(tab: *FutexTable, w: *futex.Word) void {
-            while (tab.rawWaiters() == 0) std.Thread.yield() catch {};
+            while (tab.rawWaiters(&w.raw) == 0) std.Thread.yield() catch {};
             w.store(1, .release);
             tab.wake(&w.raw, 1);
         }
@@ -214,11 +227,34 @@ test "raw waiters: a wake from another thread ends a counted wait; expected mism
     const th = try std.Thread.spawn(.{}, Waker.run, .{ &t, &word });
     while (word.load(.acquire) == 0) t.rawWait(&word.raw, 0, null);
     th.join();
-    try testing.expectEqual(@as(u32, 0), t.rawWaiters());
+    try testing.expectEqual(@as(u32, 0), t.rawWaiters(&word.raw));
     word.store(0, .monotonic);
     t.rawWait(&word.raw, 0, 2 * std.time.ns_per_ms);
-    try testing.expectEqual(@as(u32, 0), t.rawWaiters());
+    try testing.expectEqual(@as(u32, 0), t.rawWaiters(&word.raw));
     // A wake with no waiters pays nothing and is harmless.
     t.wake(&word.raw, std.math.maxInt(u32));
     t.wake(&word.raw, 0);
+}
+
+test "the raw count is per bucket: a raw waiter on one word is not counted against a word of another bucket" {
+    var t: FutexTable = .init;
+    // Two words whose addresses hash to different buckets (the first pair
+    // of a page-spread that does; 256 buckets, Fibonacci hashing).
+    var words: [64]futex.Word = @splat(.init(0));
+    const a: usize = 0;
+    var b: usize = 1;
+    while (b < words.len and t.bucketOf(&words[a].raw) == t.bucketOf(&words[b].raw)) b += 1;
+    try testing.expect(b < words.len);
+    const Sleeper = struct {
+        fn run(tab: *FutexTable, w: *futex.Word) void {
+            tab.rawWait(&w.raw, 0, null);
+        }
+    };
+    const th = try std.Thread.spawn(.{}, Sleeper.run, .{ &t, &words[a] });
+    while (t.rawWaiters(&words[a].raw) == 0) try std.Thread.yield();
+    try testing.expectEqual(@as(u32, 0), t.rawWaiters(&words[b].raw));
+    words[a].store(1, .release);
+    t.wake(&words[a].raw, 1);
+    th.join();
+    try testing.expectEqual(@as(u32, 0), t.rawWaiters(&words[a].raw));
 }

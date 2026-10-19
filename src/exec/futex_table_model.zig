@@ -14,6 +14,19 @@
 //!   `.count_after_wait` — the raw waiter increments the count AFTER the
 //!     kernel wait (the increment step follows the sleep): the waker reads
 //!     0, pays no kernel wake, and the raw waiter sleeps forever.
+//!
+//! The second model (`DrivenOwnerModel`) is the bounded wake — `wake(ptr, 1)`,
+//! a mutex's release — when the raw waiter is the OWNER of the driven lane
+//! the fiber waiter lives on (the FUSE drain worker, off a fiber in a probe,
+//! behind a handler fiber of its own lane on the same word): the fiber can
+//! resume only once the owner is back in its pass, so a wake handed to the
+//! fiber alone leaves both asleep on a FREE word for ever
+//! (`docs/evidence/rung-10-mdtest-wedge.md`). The law: a counted raw waiter
+//! is kernel-woken whatever fibers took of the count.
+//!
+//!   `.fiber_takes_the_raw_wake` — the kernel wake is skipped once a fiber
+//!     consumed the count (the pre-fix `remaining == 0` return): the owner
+//!     sleeps forever and the fiber it would run with it.
 
 const std = @import("std");
 const explorer = @import("../model/explorer.zig");
@@ -163,11 +176,162 @@ fn FutexModel(comptime weakening: Weakening) type {
     };
 }
 
+const DrivenWeakening = struct {
+    fiber_takes_the_raw_wake: bool = false,
+};
+
+/// One fiber waiter on a DRIVEN lane, its owner thread as the raw waiter
+/// on the same word, one waker with a count of ONE. The owner reaches its
+/// own wait only after the fiber switched out (they share the thread), and
+/// the fiber resumes only while the owner is awake (its pass pumps the lane).
+fn DrivenOwnerModel(comptime weakening: DrivenWeakening) type {
+    return struct {
+        const Self = @This();
+        pub const thread_count: usize = 3;
+        const fiber = 0;
+        const owner = 1;
+        const waker = 2;
+
+        word: u8 = 0,
+        bucket_locked: bool = false,
+        fiber_linked: bool = false,
+        raw_count: u8 = 0,
+        fiber_sleeping: bool = false,
+        fiber_woken: bool = false,
+        owner_sleeping: bool = false,
+        owner_woken: bool = false,
+        fpc: u8 = 0,
+        opc: u8 = 0,
+        wpc: u8 = 0,
+
+        pub fn init() Self {
+            return .{};
+        }
+        pub fn done(self: *const Self, t: usize) bool {
+            return switch (t) {
+                fiber => self.fpc == 9,
+                owner => self.opc == 9,
+                waker => self.wpc == 9,
+                else => unreachable,
+            };
+        }
+        pub fn step(self: *Self, t: usize) void {
+            switch (t) {
+                fiber => switch (self.fpc) {
+                    0 => if (!self.bucket_locked) {
+                        self.bucket_locked = true;
+                        self.fpc = 1;
+                    },
+                    1 => {
+                        if (self.word != 0) {
+                            self.fpc = 8;
+                        } else {
+                            self.fiber_linked = true;
+                            self.fpc = 2;
+                        }
+                    },
+                    2 => {
+                        self.bucket_locked = false;
+                        self.fpc = 3;
+                    },
+                    // park: switch out to the owner's pass (a wake that
+                    // already landed is absorbed by the delivery word)
+                    3 => if (self.fiber_woken) {
+                        self.fpc = 9;
+                    } else {
+                        self.fiber_sleeping = true;
+                        self.fpc = 4;
+                    },
+                    // resume: the owner's pass runs the enqueued fiber —
+                    // only while the owner is not asleep in a kernel wait
+                    4 => if (self.fiber_woken and !self.owner_sleeping) {
+                        self.fiber_sleeping = false;
+                        self.fpc = 9;
+                    },
+                    8 => {
+                        self.bucket_locked = false;
+                        self.fpc = 9;
+                    },
+                    else => unreachable,
+                },
+                owner => switch (self.opc) {
+                    // the pass continues once the fiber switched out (or
+                    // never parked): the probe's own contended acquire
+                    0 => if (self.fiber_sleeping or self.fpc == 9) {
+                        self.raw_count += 1;
+                        self.opc = 1;
+                    },
+                    1 => {
+                        if (self.owner_sleeping) {
+                            if (self.owner_woken) {
+                                self.owner_sleeping = false;
+                                self.opc = 2;
+                            }
+                        } else if (self.word != 0) {
+                            self.opc = 2;
+                        } else {
+                            self.owner_sleeping = true;
+                        }
+                    },
+                    2 => {
+                        self.raw_count -= 1;
+                        self.opc = 9;
+                    },
+                    else => unreachable,
+                },
+                waker => switch (self.wpc) {
+                    0 => {
+                        self.word = 1;
+                        self.wpc = 1;
+                    },
+                    1 => if (!self.bucket_locked) {
+                        self.bucket_locked = true;
+                        self.wpc = 2;
+                    },
+                    // count ONE: the first matching fiber takes it
+                    2 => {
+                        if (self.fiber_linked) {
+                            self.fiber_linked = false;
+                            self.fiber_woken = true;
+                            self.wpc = if (weakening.fiber_takes_the_raw_wake) 9 else 3;
+                        } else {
+                            self.wpc = 3;
+                        }
+                        self.bucket_locked = false;
+                    },
+                    // fence + load(raw_waiters): the kernel wake for a
+                    // counted raw waiter, whatever the fibers took
+                    3 => {
+                        if (self.raw_count != 0) self.owner_woken = true;
+                        self.wpc = 9;
+                    },
+                    else => unreachable,
+                },
+                else => unreachable,
+            }
+        }
+        pub fn invariant(self: *const Self) !void {
+            if (self.wpc == 9) {
+                if (self.fiber_sleeping and !self.fiber_woken) return error.FiberSleepsForever;
+                if (self.owner_sleeping and !self.owner_woken) return error.OwnerSleepsForever;
+            }
+        }
+        pub fn final(self: *const Self) !void {
+            if (self.fpc != 9 or self.opc != 9) return error.WaiterNeverReturned;
+        }
+    };
+}
+
 const testing = std.testing;
 
 test "the fiber/raw futex Dekker holds; counting the raw waiter after its kernel wait sleeps it forever" {
     try explorer.expectHolds(FutexModel(.{}), .{});
     try explorer.expectFails(FutexModel(.{ .count_after_wait = true }), .{}, error.InvariantViolated);
+}
+
+test "a count-one wake reaches a counted raw waiter that drives the woken fiber's lane; a wake the fiber takes alone sleeps the owner — and the fiber — for ever" {
+    try explorer.expectHolds(DrivenOwnerModel(.{}), .{});
+    try explorer.expectFails(DrivenOwnerModel(.{ .fiber_takes_the_raw_wake = true }), .{}, error.InvariantViolated);
 }
 
 test "futex table model: exhaustive within the explorer's default limits" {

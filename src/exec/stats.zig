@@ -71,6 +71,15 @@ pub var lane_tick_rescues: counters.ShardedCounter = .{};
 /// `exec_lane_backstop_ticks`: 100 ms backstop parks taken while a lane
 /// owed a completion.
 pub var lane_backstop_ticks: counters.ShardedCounter = .{};
+/// `exec_driven_owner_queued_parks`: a TIMED raw futex park — a
+/// primitive's queued wait (a lock's ticked park, a flight's cohort wait)
+/// — by the owner thread of a DRIVEN lane, off a fiber: a wait only
+/// another thread can end, since the owner's own handler fibers run only
+/// in its pass. 0 on a healthy daemon; growth beside
+/// `lock_ticked_reregisters` names an off-fiber blocking site on the drain
+/// worker (`docs/evidence/rung-10-mdtest-wedge.md`). The interior mutex's
+/// untimed park is not counted: its holds are other threads' nanoseconds.
+pub var driven_owner_queued_parks: counters.ShardedCounter = .{};
 /// `exec_spawn_refused[class]`: a lane at `fiber_capacity`
 /// (`error.ConcurrencyUnavailable`; the transport answers EAGAIN-class).
 pub var spawn_refused: PerClass(counters.ShardedCounter) = .{};
@@ -151,7 +160,7 @@ pub fn writeStatsJson(w: *Io.Writer, lanes: []const LaneView) Io.Writer.Error!vo
     try w.writeAll(",\"exec_poll_ns\":");
     try poll_ns.snapshot().writeJson(w);
     try w.print(",\"exec_same_lane_wakes\":{d},\"exec_cross_lane_wakes\":{d},\"exec_wake_writes\":{d},\"exec_wake_elided\":{d},", .{ same_lane_wakes.load(), cross_lane_wakes.load(), wake_writes.load(), wake_elided.load() });
-    try w.print("\"exec_lane_tick_rescues\":{d},\"exec_lane_backstop_ticks\":{d},", .{ lane_tick_rescues.load(), lane_backstop_ticks.load() });
+    try w.print("\"exec_lane_tick_rescues\":{d},\"exec_lane_backstop_ticks\":{d},\"exec_driven_owner_queued_parks\":{d},", .{ lane_tick_rescues.load(), lane_backstop_ticks.load(), driven_owner_queued_parks.load() });
     try writePerClass(w, "exec_spawn_refused", perClassLoads(counters.ShardedCounter, &spawn_refused));
     try w.print(",\"exec_spawn_trim_waits\":{d}", .{spawn_trim_waits.load()});
     try w.print(",\"exec_timer_arms\":{d},\"exec_timer_fires\":{d},\"exec_timer_thread_tombstones\":{d},", .{ timer_arms.load(), timer_fires.load(), timer_thread_tombstones.load() });
@@ -174,7 +183,7 @@ test "the JSON names every family once and is well-formed for an empty and a pop
     const out = w.buffered();
     try testing.expect(std.mem.startsWith(u8, out, "{\"exec_fibers_live\":{\"fuse\":"));
     try testing.expect(std.mem.endsWith(u8, out, "\"exec_lanes\":[]}"));
-    for ([_][]const u8{ "exec_poll_ns", "exec_lane_tick_rescues", "exec_spawn_refused", "exec_timer_arms", "exec_blocking_threads", "exec_batch_on_lane", "exec_fiber_stack_bytes" }) |key| {
+    for ([_][]const u8{ "exec_poll_ns", "exec_lane_tick_rescues", "exec_driven_owner_queued_parks", "exec_spawn_refused", "exec_timer_arms", "exec_blocking_threads", "exec_batch_on_lane", "exec_fiber_stack_bytes" }) |key| {
         try testing.expectEqual(@as(usize, 1), std.mem.count(u8, out, key));
     }
     var w2: Io.Writer = .fixed(&buf);

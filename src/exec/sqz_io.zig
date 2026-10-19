@@ -841,6 +841,10 @@ pub const SqzIo = struct {
         const self = ownerOf(userdata);
         const deadline = monotonicDeadline(timeout);
         if (lane_mod.currentFiber()) |f| return self.futexes.fiberWait(f, ptr, expected, deadline, true);
+        // A timed raw park is a primitive's queued wait (`sync/tick.zig`);
+        // on the thread that drives a lane it is a wait its own fibers
+        // cannot end (`stats.driven_owner_queued_parks`).
+        if (deadline != null) if (lane_mod.current_lane) |l| if (l.driven) stats.driven_owner_queued_parks.inc();
         self.futexes.rawWait(ptr, expected, relativeNs(deadline));
     }
 
@@ -1185,6 +1189,106 @@ test "an anonymous concurrent spawned from a fiber on a DRIVEN lane lands on a t
     t.join();
     try o.result;
     try testing.expectEqual(@as(u8, 0), o.task_driven.load(.acquire));
+}
+
+test "a count-one mutex wake reaches a DRIVEN lane's owner parked raw behind one of its own fibers: the owner wakes, its pass runs the fiber, both acquire (the mdtest wedge: the fiber took the one wake and the owner slept on a FREE mutex for ever)" {
+    var budget: mem_budget.MemBudget = .{};
+    const sqz = try SqzIo.init(testing.allocator, .{
+        .budget_bytes = derive.GiB,
+        .budget = &budget,
+        .fuse = .{ .nqueues = 2, .q_depth = 4 },
+        .meta_lanes = 1,
+        .blocking_cap = 4,
+    });
+    defer sqz.deinit();
+    const page = std.heap.pageSize();
+    const driven = try Lane.init(testing.allocator, .{ .index = 0, .class = .fuse_ur, .fiber_capacity = 8, .stack_size = fiber_mod.stackSizeFor(.fuse_ur, page), .page = page, .driven = true });
+    defer driven.deinit();
+    try testing.expect(sqz.adoptDriven(driven));
+    defer sqz.releaseDriven(driven);
+    const Rig = struct {
+        sqz: *SqzIo,
+        lane: *Lane,
+        group: Io.Group = .init,
+        m: Io.Mutex = .init,
+        held: std.atomic.Value(bool) = .init(false),
+        owner_tid: std.atomic.Value(i32) = .init(0),
+        fiber_acquired: std.atomic.Value(u32) = .init(0),
+        owner_acquired: std.atomic.Value(bool) = .init(false),
+        /// The holder had to wake the owner by hand: the wedge.
+        rescued: std.atomic.Value(bool) = .init(false),
+        result: anyerror!void = {},
+
+        fn fiber(self: *@This()) void {
+            const io_ = self.sqz.io();
+            self.m.lockUncancelable(io_);
+            _ = self.fiber_acquired.fetchAdd(1, .acq_rel);
+            self.m.unlock(io_);
+        }
+        /// Whether the owner thread sleeps in the kernel (its `stat` state
+        /// is S): a counted raw waiter whose compare has not run yet would
+        /// see the release itself — the wedge needs it asleep.
+        fn ownerAsleep(self: *@This(), io_: Io) bool {
+            var pb: [64]u8 = undefined;
+            var buf: [512]u8 = undefined;
+            const path = std.fmt.bufPrint(&pb, "/proc/self/task/{d}/stat", .{self.owner_tid.load(.acquire)}) catch return false;
+            const text = Io.Dir.cwd().readFile(io_, path, &buf) catch return false;
+            const close = std.mem.lastIndexOfScalar(u8, text, ')') orelse return false;
+            return close + 2 < text.len and text[close + 2] == 'S';
+        }
+        /// The holder: a third thread that releases once the owner is a
+        /// counted raw waiter asleep behind its parked fiber.
+        fn holder(self: *@This()) void {
+            const io_ = self.sqz.io();
+            const word: *const futex.Word = @ptrCast(&self.m.state);
+            self.m.lockUncancelable(io_);
+            self.held.store(true, .release);
+            while (self.sqz.futexes.rawWaiters(&word.raw) == 0 or !self.ownerAsleep(io_)) std.Thread.yield() catch {};
+            self.m.unlock(io_);
+            // The owner must wake on that release alone. A bound turns a
+            // wedge into a failure instead of a hung shard: the rescue
+            // wakes the owner by hand and is the red verdict.
+            const deadline = clock.monotonicNs() + 2 * std.time.ns_per_s;
+            while (!self.owner_acquired.load(.acquire)) {
+                if (clock.monotonicNs() >= deadline) {
+                    self.rescued.store(true, .release);
+                    futex.wake(word, 1);
+                    return;
+                }
+                std.Thread.yield() catch {};
+            }
+        }
+        fn main(self: *@This()) void {
+            self.result = self.body();
+        }
+        fn body(self: *@This()) !void {
+            const io_ = self.sqz.io();
+            try self.lane.attachDriven();
+            defer self.lane.detachDriven();
+            while (!self.held.load(.acquire)) try std.Thread.yield();
+            try self.sqz.spawnGroupOn(self.lane, &self.group, fiber, .{self});
+            // The fiber runs here, meets the held mutex and parks on it.
+            self.lane.pumpDriven();
+            if (self.fiber_acquired.load(.acquire) != 0) return error.FiberNotParked;
+            // The owner's own contended acquire, off a fiber: the raw wait.
+            self.owner_tid.store(linux.gettid(), .release);
+            self.m.lockUncancelable(io_);
+            self.owner_acquired.store(true, .release);
+            self.m.unlock(io_);
+            while (self.lane.liveFibers() != 0) {
+                self.lane.pumpDriven();
+                try std.Thread.yield();
+            }
+        }
+    };
+    var r: Rig = .{ .sqz = sqz, .lane = driven };
+    const h = try std.Thread.spawn(.{}, Rig.holder, .{&r});
+    const t = try std.Thread.spawn(.{}, Rig.main, .{&r});
+    t.join();
+    h.join();
+    try r.result;
+    try testing.expect(!r.rescued.load(.acquire));
+    try testing.expectEqual(@as(u32, 1), r.fiber_acquired.load(.acquire));
 }
 
 test "Io.Mutex contended across two lanes and the test thread: every increment lands" {

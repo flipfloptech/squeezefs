@@ -2563,7 +2563,10 @@ test "e2e: the write-back timer's close (decision 0003 §AJ) — on the real ker
     try testing.expectEqual(@as(u64, 0), rig.fs.file_releases.load(.monotonic));
 }
 
-test "the dispatch law's FLUSH arm (decision 0003 §AF): a no-open FLUSH carries RELEASE's drain and is the data class — the CPU's lane — while the control arm's runs on the worker's lane; a WRITE runs on the worker's lane iff its payload is HELD and the lane has room (the W1 hold gate's slot: its one DMA is this worker's own bridge), an extracted or spilled WRITE and a READ stay the data class; the rest of the law is unchanged" {
+test "the dispatch law's FLUSH arm (decision 0003 §AF): a no-open FLUSH carries RELEASE's drain and is the data class — the CPU's lane — while the control arm's runs on the worker's lane; a WRITE runs on the worker's lane iff its payload is HELD and the lane has room (the W1 hold gate's slot: its one DMA is this worker's own bridge), an extracted or spilled WRITE and a READ stay the data class; the rest of the law is unchanged; the own-lane depth's shipped default is the measured knee, 8 (the 2026-10-19 ruling: all-own once lever 5 lands)" {
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+    try testing.expectEqual(@as(u32, 8), knobs.intKnob("SQUEEZEFS_FUSE_WRITE_OWN_DEPTH", u32, &env));
     const flush: codec.Request = .{ .flush = .{ .fh = 0, .lock_owner = 0 } };
     try testing.expect(worker.onWorkerLane(flush, false, false));
     try testing.expect(!worker.onWorkerLane(flush, true, false));

@@ -655,9 +655,10 @@ pub const Shared = struct {
     /// lane (0 = unbounded). One io_uring submitter's whole queue depth
     /// lands on ONE FUSE queue (the kernel picks it by the submitter's CPU),
     /// so all-own makes that queue's worker its one saturated CPU (≈ 6 µs
-    /// of worker time per write; QD32 from one thread read 0.78× the
-    /// two-thread arm) while four submitters gained 1.15× at half the CPU
-    /// (rung-10-write-lane).
+    /// of worker time per write; QD32 from one thread read 0.76–0.78× the
+    /// two-thread arm) while four submitters gained 1.15× at half the CPU;
+    /// the row's default is the measured knee, 8 (rung-10-write-lane). The
+    /// session reads the row; this zero is a bare `Shared`'s (tests).
     write_own_depth: u32 = 0,
     /// The no-open posture (`Config.no_open`, decision 0003 §AF): a FLUSH
     /// is probed here first, and its drain is the data class.

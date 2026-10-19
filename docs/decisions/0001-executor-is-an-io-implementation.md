@@ -61,3 +61,38 @@ than wakers), and swapping scheduling policy inside std is not an option.
   silently degrade (charter §1.8).
 - Zig 0.17 has no `std.Thread.Mutex`; where the reference used a plain mutex in the sanctioned
   class, the port uses `std.Io.Mutex` with the `Io` captured at construction.
+
+## Amendment 2026-10-18 — device waits park the fiber, not its lane thread (owner ruling 2026-10-18)
+
+Item 2's last clause ("the caller side parks on the lane-class `sync/completion.zig` cell over the raw
+futex, never on an `Io`") is withdrawn for the data device; items 1–5 otherwise stand and the text above
+is kept as history.
+
+**Why.** With rung 3's lanes in place, the caller of `nvme_dev.Device.writeBlock` is a handler FIBER, and
+a raw futex park holds the fiber's lane THREAD: every fiber homed on that lane waited out the DMA with
+it, so the DMAs in flight equalled the lanes (≈ 4.5 of 11 on kamrui), not the write pipeline's depth
+target (64 × 1 MiB), and device service stretched as jobs rose (`docs/evidence/rung-10-seqwrite.md`
+"what binds" item 1; the workstation's 1M×4 sequential write at 25 % of raw,
+`rung-10-perf-baseline-workstation.md`). The journal lane's `Ticket.wait` already named this "Io route"
+as owed to the handler lanes.
+
+**The rule.** A device wait goes through the executor's futex face: `Device.routeWaits(io)` installs
+`SqzIo`'s `Io` once, before the first request (the data plane does it at volume open; the `Io` outlives
+the device), and from then on
+
+- the waiter parks through `Io.futexWaitUncancelable` on the cell's word (`sync.Completion.waitIo`):
+  a fiber links into the executor's futex table and its lane thread runs the other fibers for the whole
+  DMA; a raw thread (a test, a blocking-pool job) takes the counted kernel wait;
+- the completing lane wakes through `Io.futexWake` (`Completion.completeIo`): the bucket's fibers, then
+  the kernel wake iff a raw waiter is counted — the `exec/futex_table.zig` Dekker, whose model
+  (`futex_table_model.zig`) covers this handoff unchanged (the cell's release CAS is the token store);
+- the write watermark's barrier drain (`flush`) takes the same route;
+- both sides of one cell always use the same face (a route change with a request in flight would lose
+  its wake), and a device with no route (tests, offline tools, the CLI's `main` lane) keeps the raw
+  futex on both sides as before.
+
+Item 4 is read accordingly: the device wait takes the `Io` futex ops only — no allocation, no
+scheduling hop beyond the park itself; the request path still allocates nothing per op and the lanes
+still own their rings. The waits are counted (`dev_wait_fiber_parks` / `dev_wait_raw_parks`) and the
+DMAs in flight are a gauge (`dev_dma_inflight`), so the posture is observable in `.stats`. Numbers:
+`docs/evidence/rung-10-fiber-device-waits.md`.

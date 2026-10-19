@@ -222,6 +222,17 @@ prefix-tolerant consumer (`DataRouter::read_nvme_block_old_image`, routing.rs:12
   COMPLETION"). Barrier: `site=1` (L2180-2185).
 - Oneshot `RecvError` (worker dropped the sender) → `InvalidOperation("Worker thread closed
   receiver: …")`.
+- **Port — how the caller parks** (decision 0001 amendment 2026-10-18). The reference's oneshot is
+  a tokio future, so its await yielded the task; the port's cell (`sync/completion.zig`) parks through
+  the device's wait route: `Device.routeWaits(io)` installs `SqzIo`'s futex face once before the first
+  request (the data plane does it at volume open), the waiter takes `Completion.waitIo` (a fiber
+  parks in the executor's futex table — its lane thread runs the other fibers for the whole DMA; a raw
+  thread takes the counted kernel wait) and the lane completes with `Completion.completeIo` (the
+  `exec/futex_table.zig` Dekker: fibers first, the kernel wake iff a raw waiter is counted). The
+  barrier's watermark drain (§4) takes the same route. A device with no route (tests, offline tools)
+  parks on the raw futex on both sides. Counted: `dev_wait_fiber_parks` / `dev_wait_raw_parks`; the
+  DMAs in flight are the gauge `dev_dma_inflight` (queue push → publish), bounded by the callers'
+  admission (the write pipeline's depth target), never by the lane threads.
 
 ### 1.8 Shutdown
 
@@ -507,6 +518,8 @@ elision (`SQUEEZEFS_DISCARD_ELISION`, default on) is also reclaim-side.
 | `zcrx_fills`, `zcrx_fill_bytes`, `zcrx_fill_fallbacks` (≈0 by design), `zcrx_degraded_bypasses` | counters | the zcrx lane hook (L2298-2373). |
 | `aligned_pool_hits` / `aligned_pool_misses` | counters (pool.rs) | moved indirectly by bounce allocs. |
 | op-trace stages `dev_submit` (32) / `dev_complete` | stamps | per request `trace_id` (0 = untraced), stamped on the worker thread. |
+| `dev_dma_inflight` (port) | gauge | requests between the lane-queue push and the completion publish, every class and device: the DMAs in flight, bounded by the callers' admission (the depth governor), never by the lane threads (§1.7 port note). |
+| `dev_wait_fiber_parks` / `dev_wait_raw_parks` (port) | counters | device waits that parked a fiber (the executor's futex table) vs a raw thread (the kernel futex). On a serving mount every handler wait is a fiber park. |
 
 ---
 

@@ -2512,9 +2512,10 @@ test "a fiber waiting on a device write parks only itself: a second fiber homed 
     // THE LAW: the bystander runs during the DMA. A waiter that held the
     // lane thread would keep it off the CPU until the DMA completes; the
     // bound is a diagnostic, never a synchronization (the held DMA cannot
-    // complete, so a timeout here means the lane thread is held).
+    // complete, so a timeout here means the lane thread is held — a free
+    // lane runs the bystander in microseconds, loaded venue or not).
     while (ran.load(.acquire) == 0) {
-        if (futex.waitTimeout(&ran, 0, 10 * std.time.ns_per_s) == .timed_out and ran.load(.acquire) == 0) {
+        if (futex.waitTimeout(&ran, 0, 30 * std.time.ns_per_s) == .timed_out and ran.load(.acquire) == 0) {
             std.debug.print("the fiber waiting on the DMA holds its lane thread: the bystander never ran\n", .{});
             seams.hold_before_park.store(0, .release);
             futex.wakeAll(&seams.hold_before_park);

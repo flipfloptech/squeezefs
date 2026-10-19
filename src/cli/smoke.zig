@@ -6968,6 +6968,122 @@ test "smoke: KERNEL AIO on the plain mount (no shim): io_submit of 8 × 4 KiB PW
     }
 }
 
+/// The streaming overwrite row's shape: one job, QD16, 1 MiB O_DIRECT
+/// sequential writes over a laid-down file, time-based — the perf matrix's
+/// `sw1m-q16j1`. 16 writes of ONE ino in flight on the one FUSE queue the
+/// submitter's CPU binds, so two of them share a handler lane as a rule.
+const stream_file_mib: u64 = 1024;
+const stream_depth: usize = 16;
+const stream_write_len: usize = 1 << 20;
+const stream_secs: u64 = 12;
+/// The writer's wall bound: the row's verdict when the daemon wedges
+/// (`timeout -s KILL`), well inside the shard's hang limit.
+const stream_bound_s: u32 = 90;
+
+/// The smoke's own QD16 streaming overwriter (kernel aio, no fio): `depth`
+/// PWRITEs of `len` each per `io_submit`, every event's `res` the write,
+/// the stride advancing through `file_len` and wrapping, for `secs`.
+/// Returns the bytes written.
+fn aioStreamOverwrite(path: [:0]const u8, file_len: u64, depth: usize, len: usize, secs: u64) !u64 {
+    const aio = @import("../shim/aio.zig");
+    var ctx: aio.io_context_t = 0;
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.syscall2(.io_setup, @intCast(depth), @intFromPtr(&ctx))));
+    defer _ = linux.syscall1(.io_destroy, ctx);
+    const rc = linux.open(path.ptr, .{ .ACCMODE = .WRONLY, .DIRECT = true, .CLOEXEC = true }, 0);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(rc));
+    const fd: linux.fd_t = @intCast(rc);
+    defer _ = linux.close(fd);
+    const gpa = testing.allocator;
+    const buf = try gpa.alignedAlloc(u8, .fromByteUnits(4096), depth * len);
+    defer gpa.free(buf);
+    for (0..depth) |i| @memset(buf[i * len ..][0..len], @as(u8, @truncate(0x40 + i)));
+    const cbs = try gpa.alloc(aio.Iocb, depth);
+    defer gpa.free(cbs);
+    const ptrs = try gpa.alloc(*aio.Iocb, depth);
+    defer gpa.free(ptrs);
+    const evs = try gpa.alloc(aio.IoEvent, depth);
+    defer gpa.free(evs);
+    const deadline = clock.monotonicNs() + secs * std.time.ns_per_s;
+    var off: u64 = 0;
+    var written: u64 = 0;
+    while (clock.monotonicNs() < deadline) {
+        for (cbs, 0..) |*cb, i| {
+            cb.* = .{ .data = i, .key = 0, .aio_rw_flags = 0, .aio_lio_opcode = aio.IOCB_CMD_PWRITE, .aio_reqprio = 0, .aio_fildes = fd, .buf = @intFromPtr(buf.ptr + i * len), .nbytes = len, .offset = @intCast(off), .__pad3 = 0, .flags = 0, .resfd = 0 };
+            ptrs[i] = cb;
+            off += len;
+            if (off >= file_len) off = 0;
+        }
+        try testing.expectEqual(depth, linux.syscall3(.io_submit, ctx, depth, @intFromPtr(ptrs.ptr)));
+        var got: usize = 0;
+        while (got < depth) {
+            const ts: linux.timespec = .{ .sec = @intCast(stream_bound_s), .nsec = 0 };
+            const r = linux.syscall5(.io_getevents, ctx, 1, depth - got, @intFromPtr(evs.ptr + got), @intFromPtr(&ts));
+            try testing.expectEqual(linux.E.SUCCESS, linux.errno(r));
+            // A timed-out getevents with writes still owed IS the wedge.
+            try testing.expect(r > 0);
+            got += r;
+        }
+        for (evs) |ev| try testing.expectEqual(@as(i64, @intCast(len)), ev.res);
+        written += depth * len;
+    }
+    return written;
+}
+
+test "smoke: A STREAMING OVERWRITE NEVER WEDGES THE DAEMON — format (no cache path), one 1 GiB file laid down, then ONE job's QD16 1 MiB sequential O_DIRECT overwrite of it (fio where present, else the smoke's kernel-aio writer) long enough to drain the fresh supply and run on block-grant top-ups: every write answered inside the row's bound, fuse_op_watchdog_overdue 0, lock_ticked_reregisters 0, the gauges clean, an orderly unmount (rung-10-fsync-route: a top-up winner parked on its journal ticket under a same-lane minter's spin)" {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    const rig = try Rig.init(testing.allocator, io);
+    defer rig.deinit();
+    const gpa = rig.gpa;
+    try rig.formatSet(false);
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(0);
+    // The lay-down: the file's blocks owned, and the set filled to the
+    // fill fraction so the fresh supply drains within the row and the
+    // window runs on the frees the reclaimer returns — small grants, a
+    // top-up every few mints.
+    {
+        var script: [384]u8 = undefined;
+        const out = try rig.onMountTimed(try std.fmt.bufPrint(&script, "for f in ow fill0 fill1; do dd if=/dev/zero of=$f bs=1M count={d} oflag=direct status=none; done && echo lay-ok", .{stream_file_mib}), 2 * stream_bound_s);
+        defer gpa.free(out);
+        try testing.expect(std.mem.indexOf(u8, out, "lay-ok") != null);
+    }
+    const t0 = clock.monotonicNs();
+    const has_fio = blk: {
+        const r = try rig.sh(rig.work, "command -v fio >/dev/null 2>&1 && echo yes || echo no");
+        defer rig.freeRun(r);
+        break :blk std.mem.indexOf(u8, r.stdout, "yes") != null;
+    };
+    var written: u64 = 0;
+    if (has_fio) {
+        var script: [512]u8 = undefined;
+        const out = try rig.onMountTimed(try std.fmt.bufPrint(&script, "fio --name=ow --filename=ow --rw=write --bs=1m --iodepth={d} --numjobs=1 --size={d}m --direct=1 --ioengine=io_uring --time_based --runtime={d} --output-format=terse --terse-version=3 | awk -F';' '{{print \"fio_write_kib=\" $47}}'", .{ stream_depth, stream_file_mib, stream_secs }), stream_bound_s);
+        defer gpa.free(out);
+        written = (numberAfter(out, "fio_write_kib=") orelse 0) << 10;
+    } else {
+        var path_buf: [192]u8 = undefined;
+        written = try aioStreamOverwrite(try std.fmt.bufPrintSentinel(&path_buf, "{s}/ow", .{rig.mp}, 0), stream_file_mib << 20, stream_depth, stream_write_len, stream_secs);
+    }
+    const elapsed_ms = (clock.monotonicNs() - t0) / std.time.ns_per_ms;
+    try rig.expectAlive("the streaming overwrite");
+    // The row's verdict is the daemon's own posture, not the writer's
+    // return: a wedged lane shows as overdue ops and ticking locks even
+    // when the writer's bound ended it.
+    const tail = try rig.quiescentStatsTail();
+    defer gpa.free(tail);
+    const topups = numberAfter(tail, "\"block_grant_topups\":") orelse 0;
+    const overdue = numberAfter(tail, "\"fuse_op_watchdog_overdue\":") orelse 0;
+    const lock_ticks = numberAfter(tail, "\"lock_ticked_reregisters\":") orelse 0;
+    std.debug.print("\nsmoke: streaming overwrite ({s}, QD{d} × 1 MiB, {d} s): {d} MiB written ({d} MB/s), block-grant top-ups {d} (waits {d}), watchdog overdue {d}, lock ticks {d}\n", .{ if (has_fio) "fio" else "kernel aio", stream_depth, stream_secs, written >> 20, if (elapsed_ms == 0) 0 else written * 1000 / (elapsed_ms * std.time.ns_per_ms), topups, numberAfter(tail, "\"block_grant_topup_waits\":") orelse 0, overdue, lock_ticks });
+    // The shape was exercised: the window ran on top-ups.
+    try testing.expect(topups > 0);
+    try testing.expectEqual(@as(u64, 0), overdue);
+    try testing.expectEqual(@as(u64, 0), lock_ticks);
+    try expectMustStayZero(tail);
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+}
+
 /// The promotions a file takes out of the ring (or inline) to its own
 /// block: the filesystem's at a write past the block, the plane's dispatch
 /// (ring pressure, fsync, dismount) onto its own-block arm.

@@ -352,6 +352,9 @@ pub const HolderPlane = struct {
         // grants it consumed (the ledger holds OPEN grants only).
         v.own_sink = .{ .holder = &v.grants, .writer = HOLDER_WRITER, .window = &v.own.window };
         v.own.sink = v.own_sink.sink();
+        // The inline carve parks its fiber (its delta journal rides the
+        // journal lane), so a minter that lost the latch parks too.
+        v.own.routeWaits(self.io);
         v.own_src = .{ .arm = &v.own, .alloc = r.alloc, .io = self.io };
         // The holder's bits and frees: the bitmap's finish-free sink
         // clears a carved bit; the shipped-free executor adjudicates

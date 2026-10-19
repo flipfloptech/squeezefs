@@ -503,8 +503,9 @@ pub const GrantWindow = struct {
     /// The top-up reference: `max(len installed)`.
     reference: Atomic(u64) = .init(0),
     exhausted: Atomic(u64) = .init(0),
-    /// The single-flight top-up latch.
-    topup_inflight: Atomic(bool) = .init(false),
+    /// The single-flight top-up latch (1 = an ask in flight): a futex
+    /// word, since a lost racer may PARK on it (`WriterArm.mintBlock`).
+    topup_inflight: Atomic(u32) = .init(0),
 
     const SpinLock = @import("../../meta/journal_core.zig").SpinLock;
 
@@ -807,10 +808,43 @@ pub const WriterArm = struct {
     capacity_blocks: u64,
     t_renewal_ms: u64 = BEAT_MAX_MS,
     last_word: ?HolderWord = null,
+    /// The latch's wait route (`routeWaits`; decision 0001 amendment
+    /// 2026-10-18): the executor's futex face a minter that lost the
+    /// single-flight latch parks through and the winner wakes through, so
+    /// a FIBER racer parks alone — its lane thread runs the fibers homed
+    /// there, the winner among them when they share a lane — and a raw
+    /// thread takes the counted kernel wait. The inline carve HAS a park
+    /// point (its delta journal is a structural entry through the journal
+    /// lane, whose ticket wait parks the fiber), so a racer that spun on
+    /// the latch with the winner parked on its own lane spun for ever
+    /// (`rung-10-fsync-route.md`). Null = the bare arm (tests): the racer
+    /// spins, the carve's park point being another thread's.
+    wait_io: ?std.Io = null,
+
+    /// Route the latch waits through `io` (the `wait_io` field doc). Set
+    /// once at arm, before the first mint; both sides read it.
+    pub fn routeWaits(self: *WriterArm, io: std.Io) void {
+        assert(self.window.topup_inflight.load(.acquire) == 0);
+        self.wait_io = io;
+    }
 
     /// The writer measures and names `want` (decision 0003 §E).
     pub fn namedWant(self: *const WriterArm) u64 {
         return deriveGrant(self.meter.ewmaMilliBlocksPerS(), self.t_renewal_ms, self.capacity_blocks, 1);
+    }
+
+    /// The latch released: the word, then the racers parked on it (the
+    /// futex table's fibers, the kernel wake iff a raw waiter is counted).
+    fn releaseLatch(self: *WriterArm) void {
+        self.window.topup_inflight.store(0, .release);
+        if (self.wait_io) |io| io.futexWake(u32, &self.window.topup_inflight.raw, std.math.maxInt(i32));
+    }
+
+    /// A lost racer's wait for the latch: a routed park on the word (a
+    /// fiber alone, a raw thread counted), else one spin step; the caller
+    /// re-reads the window either way.
+    fn waitLatch(self: *WriterArm) void {
+        if (self.wait_io) |io| io.futexWaitUncancelable(u32, &self.window.topup_inflight.raw, 1) else std.atomic.spinLoopHint();
     }
 
     /// The PULL: single-flight; asks `(want, held = remaining)` when the
@@ -818,8 +852,8 @@ pub const WriterArm = struct {
     pub fn topup(self: *WriterArm) TopupOutcome {
         if (!self.window.wantsTopup()) return .not_asked;
         const sink = self.sink orelse return .holder_unreachable;
-        if (self.window.topup_inflight.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) return .not_asked;
-        defer self.window.topup_inflight.store(false, .release);
+        if (self.window.topup_inflight.cmpxchgStrong(0, 1, .acq_rel, .acquire) != null) return .not_asked;
+        defer self.releaseLatch();
         stats.block_grant_topups.inc();
         const answer = sink.ask(sink.ctx, self.namedWant(), self.window.remaining());
         switch (answer) {
@@ -843,11 +877,11 @@ pub const WriterArm = struct {
     /// answers its CLASS: the holder's `full` word is terminal; a deferred
     /// or unreachable holder is `retry` (never a latch); a lost single-
     /// flight latch — another minter's ask in flight — is waited on when
-    /// the sink answers inline (`block_grant_topup_waits`; the carve is
-    /// microseconds of CPU on another thread, and a fiber of this lane
-    /// cannot hold the latch mid-carve since the carve has no park point),
-    /// else `retry`. A landed answer racers consumed before this mint asks
-    /// again: the window is below 50 % by construction.
+    /// the sink answers inline (`block_grant_topup_waits`: a routed park
+    /// on the latch word, since the inline carve parks its fiber on the
+    /// journal lane's ticket and the winner may be homed on THIS lane —
+    /// `wait_io`), else `retry`. A landed answer racers consumed before
+    /// this mint asks again: the window is below 50 % by construction.
     pub fn mintBlock(self: *WriterArm) MintOutcome {
         var waited = false;
         var asked_any = false;
@@ -862,12 +896,12 @@ pub const WriterArm = struct {
                 .not_asked => {
                     const sink = self.sink orelse return .{ .answer = .retry, .asked = asked_any };
                     if (!sink.inline_answer) return .{ .answer = .retry, .asked = asked_any };
-                    if (self.window.topup_inflight.load(.acquire)) {
+                    if (self.window.topup_inflight.load(.acquire) != 0) {
                         if (!waited) {
                             waited = true;
                             stats.block_grant_topup_waits.inc();
                         }
-                        std.atomic.spinLoopHint();
+                        self.waitLatch();
                     }
                 },
             }
@@ -916,9 +950,12 @@ pub const LocalSink = struct {
     writer: u32,
     window: ?*GrantWindow = null,
     /// Test seams: the next N asks answer the named class; an ask holds
-    /// (the single-flight latch with it) until the gate opens.
+    /// (the single-flight latch with it) until the gate opens — a spin,
+    /// or with `gate_io` a routed park (the asker a fiber whose lane must
+    /// stay free: the production carve's park point).
     unreachable_next: u32 = 0,
-    ask_gate: ?*const Atomic(bool) = null,
+    ask_gate: ?*const Atomic(u32) = null,
+    gate_io: ?std.Io = null,
 
     fn ask(ctx: *anyopaque, want: u64, held: u64) GrantAnswer {
         const s: *LocalSink = @ptrCast(@alignCast(ctx));
@@ -926,7 +963,9 @@ pub const LocalSink = struct {
             s.unreachable_next -= 1;
             return .holder_unreachable;
         }
-        if (s.ask_gate) |g| while (!g.load(.acquire)) std.atomic.spinLoopHint();
+        if (s.ask_gate) |g| while (g.load(.acquire) == 0) {
+            if (s.gate_io) |io| io.futexWaitUncancelable(u32, &g.raw, 0) else std.atomic.spinLoopHint();
+        };
         if (s.window) |w| {
             const holds = w.ranges();
             _ = s.holder.ledger.syncWriter(s.writer, holds.slice());
@@ -1377,11 +1416,11 @@ test "an_armed_two_writer_set_allocates_disjoint_ranges_from_grants; the PULL to
     _ = try a.allocateBlock(); // the next mint's pull lands: minted from the fresh grant
     try testing.expect(!a.freshSupplyExhausted());
     // The single-flight latch: a top-up in flight answers not_asked.
-    arm_b.window.topup_inflight.store(true, .release);
+    arm_b.window.topup_inflight.store(1, .release);
     var d2: Grants = .{};
     arm_b.window.drain(&d2);
     try testing.expectEqual(TopupOutcome.not_asked, arm_b.topup());
-    arm_b.window.topup_inflight.store(false, .release);
+    arm_b.window.topup_inflight.store(0, .release);
     // The deferred class rides a refused drain at the holder.
     var j: data_bitmap.RamJournal = .{ .gpa = testing.allocator };
     defer j.deinit();
@@ -1756,7 +1795,7 @@ test "an empty window with another minter's INLINE top-up in flight: the lost ra
     defer bm.deinit();
     var h: HolderGrants = .{ .ledger = try Ledger.init(testing.allocator, 16), .bitmap = bm };
     defer h.ledger.deinit();
-    var gate: Atomic(bool) = .init(false);
+    var gate: Atomic(u32) = .init(0);
     var arm: WriterArm = .{ .capacity_blocks = 256 };
     var sink: LocalSink = .{ .holder = &h, .writer = 0, .window = &arm.window, .ask_gate = &gate };
     arm.sink = sink.sink();
@@ -1769,10 +1808,10 @@ test "an empty window with another minter's INLINE top-up in flight: the lost ra
     var fut = io.concurrent(Holder.run, .{&arm}) catch |err| switch (err) {
         error.ConcurrencyUnavailable => return testkit.skip(@src(), .no_concurrency, "the executor refused a unit of concurrency"),
     };
-    while (!arm.window.topup_inflight.load(.acquire)) std.atomic.spinLoopHint();
+    while (arm.window.topup_inflight.load(.acquire) == 0) std.atomic.spinLoopHint();
     const Opener = struct {
-        fn run(g: *Atomic(bool)) void {
-            g.store(true, .release);
+        fn run(g: *Atomic(u32)) void {
+            g.store(1, .release);
         }
     };
     var opener = io.concurrent(Opener.run, .{&gate}) catch |err| switch (err) {
@@ -1791,8 +1830,85 @@ test "an empty window with another minter's INLINE top-up in flight: the lost ra
     arm.sink = wired;
     var drained: Grants = .{};
     arm.window.drain(&drained);
-    arm.window.topup_inflight.store(true, .release);
+    arm.window.topup_inflight.store(1, .release);
     try testing.expectEqual(block_alloc.MintAnswer.retry, arm.mintBlock().answer);
-    arm.window.topup_inflight.store(false, .release);
+    arm.window.topup_inflight.store(0, .release);
     try testing.expectEqual(waits0 + 1, stats.block_grant_topup_waits.load());
+}
+
+test "a minter that lost the latch to a winner PARKED mid-carve on the SAME lane parks too and mints from the carve: the lane runs its other fibers meanwhile (decision 0001 amendment; rung-10-fsync-route's wedge — the spinning racer held the lane the winner needed)" {
+    if (@import("builtin").os.tag == .linux) try sameLaneRacerParks() else return testkit.skip(@src(), .no_linux, "SqzIo's lanes are Linux only");
+}
+
+/// The body above, analyzed on Linux only (`SqzIo` is Linux only).
+fn sameLaneRacerParks() !void {
+    const exec = @import("../../exec/exec.zig");
+    const clock = @import("../../core/clock.zig");
+    const sqz = try exec.SqzIo.testInstance();
+    defer sqz.deinit();
+    const io = sqz.io();
+    const a = try testAlloc(256);
+    defer a.deinit();
+    const bm = try testBitmap(a);
+    defer bm.deinit();
+    var h: HolderGrants = .{ .ledger = try Ledger.init(testing.allocator, 16), .bitmap = bm };
+    defer h.ledger.deinit();
+    // The gate parks the asker's FIBER (the production carve's park point:
+    // its delta journal's ticket on the journal lane).
+    var gate: Atomic(u32) = .init(0);
+    var arm: WriterArm = .{ .capacity_blocks = 256 };
+    var sink: LocalSink = .{ .holder = &h, .writer = 0, .window = &arm.window, .ask_gate = &gate, .gate_io = io };
+    arm.sink = sink.sink();
+    a.grant_source = arm.grantSource();
+    arm.routeWaits(io);
+    const lane = sqz.metaLanes()[0];
+    const S = struct {
+        fn winner(w: *WriterArm) TopupOutcome {
+            return w.topup();
+        }
+        fn racer(al: *BlockAllocator) block_alloc.AllocError!block_alloc.Minted {
+            return al.allocateBlock();
+        }
+        fn bystander(ran: *Atomic(u32)) void {
+            ran.store(1, .release);
+        }
+    };
+    const waits0 = stats.block_grant_topup_waits.load();
+    // The winner takes the latch and parks at the gate, on lane 0.
+    var winner = try sqz.spawnOn(lane, S.winner, .{&arm});
+    while (arm.window.topup_inflight.load(.acquire) == 0) std.Thread.yield() catch {};
+    // The racer on the SAME lane: an empty window, the latch held — it waits.
+    var racer = try sqz.spawnOn(lane, S.racer, .{a});
+    while (stats.block_grant_topup_waits.load() == waits0) std.Thread.yield() catch {};
+    // THE LAW: with both parked the lane is free — a bystander homed there
+    // runs. A racer that spun would hold the lane for ever (the winner can
+    // never run to release the latch); the bound is a diagnostic.
+    var ran: Atomic(u32) = .init(0);
+    var by = try sqz.spawnOn(lane, S.bystander, .{&ran});
+    const deadline = clock.monotonicNs() + 30 * std.time.ns_per_s;
+    while (ran.load(.acquire) == 0) {
+        if (clock.monotonicNs() >= deadline) {
+            std.debug.print("the racer spinning on the latch holds its lane thread: the bystander never ran\n", .{});
+            // Let the spinner out (the gate, then the latch it spins on)
+            // so the lane can be joined; the verdict stands.
+            gate.store(1, .release);
+            io.futexWake(u32, &gate.raw, 1);
+            arm.window.topup_inflight.store(0, .release);
+            _ = winner.await(io);
+            _ = racer.await(io) catch {};
+            by.await(io);
+            return error.TestExpectedEqual;
+        }
+        std.Thread.yield() catch {};
+    }
+    by.await(io);
+    // The gate opens: the winner carves and releases the latch; the racer
+    // wakes and mints from the carve.
+    gate.store(1, .release);
+    io.futexWake(u32, &gate.raw, 1);
+    try testing.expectEqual(TopupOutcome.landed, winner.await(io));
+    const m = try racer.await(io);
+    try testing.expectEqual(@as(u64, 0), m.idx);
+    try testing.expectEqual(waits0 + 1, stats.block_grant_topup_waits.load());
+    try testing.expectEqual(@as(u64, 63), arm.window.remaining());
 }

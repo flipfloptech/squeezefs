@@ -9,6 +9,9 @@
 
 const std = @import("std");
 
+/// RFC 6298 §2.3's gains — `srtt += (R − srtt)/8`, `rttvar += (|srtt − R| −
+/// rttvar)/4` — and §2.2's `K = 4` in `rto = srtt + 4·rttvar` (what bounds
+/// the false-timeout rate).
 pub const ALPHA_SHIFT: u6 = 3;
 pub const BETA_SHIFT: u6 = 2;
 pub const K: u64 = 4;

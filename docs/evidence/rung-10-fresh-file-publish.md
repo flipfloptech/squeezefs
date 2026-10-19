@@ -47,7 +47,7 @@ LAW'S KILL ROW, `sync -f`, THE WRITE-BACK TIMER (three rows), THE BLOCK-MAP TREE
 
 | shape | A (per pass) | B (per pass) | merges/blk A → B | journal KB/blk | daemon cores |
 |---|---|---|---|---|---|
-| lay-down (extending, QD16) | 14,716 14,913 11,781 14,092 (+ matrix 11,725) | 13,170 13,199 12,203 14,059 (+ matrix 13,017) | 1.000 → 0.010 | 18.6 → 0.3 | 0.70–0.94 → 0.55–0.58 |
+| lay-down (extending, QD16) | 14,716 14,913 11,781 14,092 (+ the matrix's 11,725 11,770) | 13,170 13,199 12,203 14,059 (+ the matrix's 13,017 13,474) | 1.000 → 0.010 | 18.6 → 0.3 | 0.70–0.94 → 0.55–0.58 |
 | the same at QD1 | 12,616 12,488 | 12,976 14,206 | 1.000 → 0.010 | 18.6 → 0.3 | 0.79–0.86 → 0.50–0.55 |
 | fresh blocks, non-extending (files truncated to 3 GiB first) | 11,603 12,071 | 11,658 12,800 | 1.000 → 0.015 | 18.6 → 0.3 | 1.65–1.96 → 1.11–1.54 |
 
@@ -75,8 +75,13 @@ daemon's cores with `sqz-ckpt`/`sqz-jrnl` in parentheses).
 
 The width-close removes the fallback class (publishes per block 0.259 → 0.013 on ×1, 0.079 → 0.014 on ×4;
 one save per 79–85 blocks) and the metadata device bytes with it; the ×1 row — one ino, the timer's cadence
-its only close before — gains the most. The second matrix pair (`ffA-r2`, `ffB-r2`) is appended below
-when it lands.
+its only close before — gains the most. One pair only: the second (`ffA-r2` on `dev` `2edfd47`, `ffB-r2` on
+this branch rebased onto it) WEDGED on both legs at the first overwrite row — the 16 writes of the one ino
+parked past `write_admitted` until the kernel's 135 s timeout ended the connection (`stalest_worker_pass_ms`
+climbing, `invariant_tripwires` 0) — while five sessions on binaries without `654fd83` (the journal lane's
+off-lane ticket route) never did: the save's commit from a detached drain fiber through that route is the
+suspect, the fsync-route lever's area, reported, not chased here. The lay-down lines before the wedge are in
+the fresh-file table.
 
 **What binds next.** (1) The lay-down's kernel lock (above): the sqz series could let the daemon opt out of
 the exclusive lock for writes past EOF (the ordered law already keeps the size behind the data) — the

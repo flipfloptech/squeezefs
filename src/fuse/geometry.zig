@@ -413,15 +413,21 @@ pub fn forcedWidth(mode: BufferMode, explicit: ?u32) ?u32 {
 /// ceiling; the executor reserves this many driven lanes per queue).
 pub const MAX_RINGS_PER_QUEUE: u32 = 2;
 
-/// The derived count: `MAX_RINGS_PER_QUEUE` where the kernel's FEATURES
+/// The derived count is ONE ring until the two-ring daemon holds the gate
+/// (2026-10-19, the train on 039ae68: 3 reds in 7 — a lookup and a create
+/// parked > 5 s at the metadata backend under two rings, a lane-park unit
+/// test failing; every one-ring head that day was 3/3 — and the 4k randwrite
+/// QD32×4 row at 0.85×, `rung-10-workers-per-queue.md`). Two rings stay the
+/// A/B lever `SQUEEZEFS_FUSE_RINGS_PER_QUEUE=2` where the kernel's FEATURES
 /// probe reads `RINGS_PER_QUEUE` present AND the mode pins a ring to one
-/// queue (kmbuf/zc: the per-ring buffer ring is what the patch makes
-/// per-source); 1 on UserEnts (a ring there already serves a drain group
-/// of queues) and wherever the probe reads absent (the kernel would accept
-/// the second REGISTER and recycle buffers into the wrong ring).
+/// queue (kmbuf/zc); the session refuses 2 on UserEnts (a ring there already
+/// serves a drain group of queues) and where the probe reads absent (the
+/// kernel would accept the second REGISTER and recycle buffers into the
+/// wrong ring). `rings_feature` keeps the derivation's shape for the flip.
 pub fn ringsPerQueue(mode: BufferMode, rings_feature: bool) u32 {
+    _ = rings_feature;
     return switch (mode) {
-        .buf_ring, .zero_copy => if (rings_feature) MAX_RINGS_PER_QUEUE else 1,
+        .buf_ring, .zero_copy => 1,
         .user_ents => 1,
     };
 }
@@ -1003,10 +1009,10 @@ test "drain width = max(n/4, 1); sq entries = max(next_pow2(width × depth + 8),
     try testing.expectEqual(@as(u32, 4096), sqEntries(127, 32));
 }
 
-test "rings per queue: 2 where the FEATURES probe reads present on kmbuf/zc, 1 on UserEnts and wherever it reads absent; explicit wins; the shares split the depth ceil/rest with the queue's depth unchanged and ring 1's base at ring 0's depth" {
+test "rings per queue: the derived count is 1 until the two-ring daemon holds the gate (2 stays the A/B lever where the probe reads present on kmbuf/zc); explicit wins; the shares split the depth ceil/rest with the queue's depth unchanged and ring 1's base at ring 0's depth" {
     try testing.expectEqual(@as(u32, 2), MAX_RINGS_PER_QUEUE);
-    try testing.expectEqual(@as(u32, 2), ringsPerQueue(.zero_copy, true));
-    try testing.expectEqual(@as(u32, 2), ringsPerQueue(.buf_ring, true));
+    try testing.expectEqual(@as(u32, 1), ringsPerQueue(.zero_copy, true));
+    try testing.expectEqual(@as(u32, 1), ringsPerQueue(.buf_ring, true));
     try testing.expectEqual(@as(u32, 1), ringsPerQueue(.user_ents, true));
     try testing.expectEqual(@as(u32, 1), ringsPerQueue(.zero_copy, false));
     try testing.expectEqual(@as(u32, 1), ringsPerQueue(.buf_ring, false));

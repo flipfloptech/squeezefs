@@ -94,7 +94,10 @@ sessions (B's 4k spreads 10–35 % where A's are 0–5 %: eight half-loaded work
 are more exposed to placement). The mechanism is the depth-0 question's: a worker holding half a
 queue parks per CQE (2.5 enters per write against 1.2); the fix is the worker's pass structure, not
 the share — a bounded spin before the park while this ring owes a device completion (the ack-spin
-rule) is the next lever. Until then the row is a defect on the two-ring arm; the derived default is
-2 (the read bar is cleared by it) and `SQUEEZEFS_FUSE_RINGS_PER_QUEUE=1` is the one-line return to
-the one-ring posture if the ruling goes the other way. The 4k write IOPS gap (≈ 380–430 k vs the
-727 k bar) stays open.
+rule) is the next lever. Until then the row is a defect on the two-ring arm. **The derived default
+went back to 1 ring the same evening** (orchestrator, the hour rule): the train on `039ae68` ran 3 reds
+in 7 — THE KILL MATRIX twice, with a `lookup` and a `create` parked > 5 s at the metadata backend
+station (`stalest_worker_pass_ms` 30 s) and the watchdog's error lines failing the row, and lever (a)'s
+lane-park unit test once — where every one-ring head that day was 3/3. Two rings stay the A/B lever
+`SQUEEZEFS_FUSE_RINGS_PER_QUEUE=2` until the stall and the write row are fixed; then the derivation
+flips back (its shape is kept). The 4k write IOPS gap (≈ 380–430 k vs the 727 k bar) stays open.

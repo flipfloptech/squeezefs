@@ -1342,6 +1342,7 @@ pub const Session = struct {
             .slab = if (self.slab) |*s| s else null,
             .test_error_logs = cfg.test_error_logs,
             .handlers_on_worker = knobs.boolKnob("SQUEEZEFS_FUSE_HANDLERS_ON_WORKER", env),
+            .write_own_depth = knobs.intKnob("SQUEEZEFS_FUSE_WRITE_OWN_DEPTH", u32, env),
             .no_open = cfg.no_open,
             .budget_bytes = cfg.mem_budget_bytes,
         };

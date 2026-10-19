@@ -123,17 +123,7 @@ pub const DRAIN_LEASE_BUDGET_NS: u64 = 100 * std.time.ns_per_ms;
 /// parks on the worker's own ring, never a sleep-poll (Q14).
 pub const RESIDENCY_NS: u64 = 30 * std.time.ns_per_s;
 pub const RESIDENCY_PARK_NS: u64 = 10 * std.time.ns_per_ms;
-/// Held WRITE handlers live on the worker's own lane before the next is
-/// handed to the CPU's lane instead. One fio thread's whole queue depth
-/// lands on ONE FUSE queue (the kernel picks it by the submitter's CPU),
-/// so past a few in flight the queue's worker is its one saturated CPU:
-/// a write costs it ≈ 6 µs run on its own lane against ≈ 2 µs handed off
-/// (the dispatch and the two wakes) while the lane thread carries the
-/// rest — below this depth the handoff's latency is the dominant cost
-/// (QD1 p50 18.8 → 10.3 µs on the own lane), past it the second thread
-/// is (all-own at QD32 on one queue read 0.78× the two-thread arm;
-/// rung-10-write-lane).
-pub const WRITE_OWN_LANE_DEPTH: u32 = 8;
+
 /// How long the drain waits for its RELEASE CQEs: the kernel answers a
 /// RELEASE_PAYLOAD inline in the submitting enter (`fuse_uring_cmd` returns
 /// the verdict, never -EIOCBQUEUED), so the wait is one enter and the bound
@@ -222,7 +212,7 @@ pub var dispatch_refused: counters.ShardedCounter = .{};
 pub var handler_dispatches_own: counters.ShardedCounter = .{};
 pub var handler_dispatches_foreign: counters.ShardedCounter = .{};
 /// `transport_write_spills`: a held WRITE the worker's own lane had no
-/// room for (`WRITE_OWN_LANE_DEPTH` handlers live) — handed to the CPU's
+/// room for (`Shared.write_own_depth` handlers live) — handed to the CPU's
 /// lane, the two-thread arm (counted among the foreign dispatches too).
 pub var write_spills: counters.ShardedCounter = .{};
 /// `transport_lane_pumps`: passes that ran the worker's lane.
@@ -660,6 +650,15 @@ pub const Shared = struct {
     /// worker DRIVES a lane of its own and every handler it dispatches runs
     /// on it — on this thread.
     handlers_on_worker: bool = false,
+    /// `SQUEEZEFS_FUSE_WRITE_OWN_DEPTH`: a held WRITE takes the worker's own
+    /// lane while fewer handlers than this are live there, else the CPU's
+    /// lane (0 = unbounded). One io_uring submitter's whole queue depth
+    /// lands on ONE FUSE queue (the kernel picks it by the submitter's CPU),
+    /// so all-own makes that queue's worker its one saturated CPU (≈ 6 µs
+    /// of worker time per write; QD32 from one thread read 0.78× the
+    /// two-thread arm) while four submitters gained 1.15× at half the CPU
+    /// (rung-10-write-lane).
+    write_own_depth: u32 = 0,
     /// The no-open posture (`Config.no_open`, decision 0003 §AF): a FLUSH
     /// is probed here first, and its drain is the data class.
     no_open: bool = false,
@@ -1355,11 +1354,12 @@ pub const Group = struct {
     }
 
     /// Whether a held WRITE may run on the worker's own lane now: fewer
-    /// than `WRITE_OWN_LANE_DEPTH` handlers live there (an acquire load;
-    /// the lane recycles a fiber at its finish).
+    /// handlers than `Shared.write_own_depth` live there (an acquire load;
+    /// the lane recycles a fiber at its finish), or no bound.
     fn ownLaneHasRoom(self: *Group) bool {
         const l = self.lane orelse return false;
-        return l.liveFibers() < WRITE_OWN_LANE_DEPTH;
+        const depth = self.shared.write_own_depth;
+        return depth == 0 or l.liveFibers() < depth;
     }
 
     /// The lane's bound on this pass's wait (its timers, its owed ring ops).
@@ -3105,8 +3105,8 @@ threadlocal var current_group: ?*Group = null;
 /// 0003 §AB.3): the namespace and attribute class, and a HELD WRITE the
 /// lane has room for (`own_write`: the zero-copy slot the W1 hold gate
 /// admitted — a striped passthrough file, non-extending, one block, ≤
-/// `PATCH_MAX`, not stream-adjacent — with fewer than
-/// `WRITE_OWN_LANE_DEPTH` handlers live on the lane). A held write's one
+/// `PATCH_MAX`, not stream-adjacent — with room on the lane under
+/// `SQUEEZEFS_FUSE_WRITE_OWN_DEPTH`). A held write's one
 /// device leg is `WRITE_FIXED(slot → device)` on THIS worker's ring
 /// (`storeFromForeign`): its wait parks the handler's FIBER on the store
 /// cell and the CQE is this thread's own reap, so the queue's ring never

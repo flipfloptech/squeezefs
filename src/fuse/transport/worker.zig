@@ -259,18 +259,15 @@ pub var passes: counters.ShardedCounter = .{};
 /// surfaced inside the budget (`_hits`) or the budget lapsed into the park
 /// (`_falls`) — or declines (`_skips`: no measurement yet, or the landing
 /// predicted past the competitive bound). `transport_owed_spin_ns` is the
-/// CPU the spins burned (exact sum); the gauges are the rule's last
-/// inputs: `_dev_ns` the push → reap round trip of a completion a spin
-/// caught (the device), `_wake_ns` what a slept park added to it (the
-/// wake), `_bound_ns` the budget those gave.
+/// CPU the spins burned (exact sum). The rule's inputs — `_dev_ns` the
+/// push → reap round trip of a completion a spin caught (the device),
+/// `_wake_ns` what a slept park added to it (the wake) — are read off the
+/// rings at stats time (`Group.spinReading`), never stored per sample.
 pub var owed_spins: counters.ShardedCounter = .{};
 pub var owed_spin_hits: counters.ShardedCounter = .{};
 pub var owed_spin_falls: counters.ShardedCounter = .{};
 pub var owed_spin_skips: counters.ShardedCounter = .{};
 pub var owed_spin_ns: counters.ShardedCounter = .{};
-pub var owed_spin_dev_ns: counters.Gauge = .{};
-pub var owed_spin_wake_ns: counters.Gauge = .{};
-pub var owed_spin_bound_ns: counters.Gauge = .{};
 /// `transport_residency_replies`: fresh deliveries answered ENOTCONN
 /// after the drain.
 pub var residency_replies: counters.ShardedCounter = .{};
@@ -1362,12 +1359,12 @@ pub const Group = struct {
     pub fn censusView(self: *const Group, now_ns: u64) CensusView {
         var owed: u32 = 0;
         for (self.members) |*m| owed += m.slots.owedCountForeign();
-        const at = pass_stamps.stamps[self.index].load(.monotonic);
+        const st = pass_stamps.read(self.index);
         return .{
             .qid = self.members[0].qid,
             .ring_base = self.ring_base,
-            .pass_age_ns = if (at == 0) 0 else now_ns -| at,
-            .in_pass = pass_stamps.in_pass[self.index].load(.monotonic) != 0,
+            .pass_age_ns = if (st.at_ns == 0) 0 else now_ns -| st.at_ns,
+            .in_pass = st.in_pass,
             .owed = owed,
             .lane_live = if (self.lane) |l| l.liveFibers() else 0,
             .lane_ready = if (self.lane) |l| l.queue_depth.load() else 0,
@@ -1562,7 +1559,6 @@ pub const Group = struct {
             return false;
         };
         const budget = owedSpinBudget(now, oldest, awake, slept);
-        owed_spin_bound_ns.set(budget);
         if (budget == 0) {
             owed_spin_skips.inc();
             return false;
@@ -1612,14 +1608,21 @@ pub const Group = struct {
         if (born_ns == 0) return;
         const age = clock.monotonicNs() -| born_ns;
         switch (self.reap_origin) {
-            .busy => return,
+            .busy => {},
             .spin_hit => self.dev_awake.sample(age),
             .parked => self.dev_slept.sample(age),
         }
-        if (self.dev_awake.mean()) |a| {
-            owed_spin_dev_ns.set(a);
-            if (self.dev_slept.mean()) |s| owed_spin_wake_ns.set(s -| a);
-        }
+    }
+
+    /// The rule's inputs as this ring reads them now (the stats inode's
+    /// `transport_owed_spin_{dev,wake}_ns`, taken from the ring with the
+    /// most caught samples — never a store per sample on a shared line).
+    pub const SpinReading = struct { dev_ns: u64 = 0, wake_ns: u64 = 0, caught: u64 = 0 };
+
+    pub fn spinReading(self: *const Group) SpinReading {
+        const a = self.dev_awake.mean() orelse 0;
+        const s = self.dev_slept.mean() orelse 0;
+        return .{ .dev_ns = a, .wake_ns = s -| a, .caught = self.dev_awake.samples.load(.monotonic) };
     }
 
     /// The lane's bound on this pass's wait (its timers, its owed ring ops).

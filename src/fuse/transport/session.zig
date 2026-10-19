@@ -2065,9 +2065,14 @@ pub const Session = struct {
         try field(w, "transport_owed_spin_falls", worker.owed_spin_falls.load());
         try field(w, "transport_owed_spin_skips", worker.owed_spin_skips.load());
         try field(w, "transport_owed_spin_ns", worker.owed_spin_ns.load());
-        try field(w, "transport_owed_spin_dev_ns", worker.owed_spin_dev_ns.load());
-        try field(w, "transport_owed_spin_wake_ns", worker.owed_spin_wake_ns.load());
-        try field(w, "transport_owed_spin_bound_ns", worker.owed_spin_bound_ns.load());
+        // The rule's inputs on the ring that caught the most completions.
+        var reading: worker.Group.SpinReading = .{};
+        for (self.groups) |grp| {
+            const r = grp.spinReading();
+            if (r.caught > reading.caught) reading = r;
+        }
+        try field(w, "transport_owed_spin_dev_ns", reading.dev_ns);
+        try field(w, "transport_owed_spin_wake_ns", reading.wake_ns);
         try field(w, "transport_residency_replies", worker.residency_replies.load());
         try field(w, "transport_umount_busy_retries", umount_busy_retries.load());
         try field(w, "transport_umount_busy_refusals", umount_busy_refusals.load());
@@ -3682,8 +3687,13 @@ test "e2e the owed spin (rung-10-workers-per-queue, the write row): a worker who
     }
     try testing.expect(slept_samples >= 1);
     try testing.expect(awake_samples >= 1);
-    try testing.expect(worker.owed_spin_dev_ns.load() > 0);
-    std.debug.print("\nowed spin: {d} writes, {d} spins ({d} hits, {d} falls), {d} skips, {d} µs spun, dev {d} µs, wake {d} µs, last bound {d} µs\n", .{ i, spins, hits, falls, skips, (worker.owed_spin_ns.load() - ns0) / std.time.ns_per_us, worker.owed_spin_dev_ns.load() / std.time.ns_per_us, worker.owed_spin_wake_ns.load() / std.time.ns_per_us, worker.owed_spin_bound_ns.load() / std.time.ns_per_us });
+    var reading: worker.Group.SpinReading = .{};
+    for (s.groups) |g| {
+        const r = g.spinReading();
+        if (r.caught > reading.caught) reading = r;
+    }
+    try testing.expect(reading.dev_ns > 0);
+    std.debug.print("\nowed spin: {d} writes, {d} spins ({d} hits, {d} falls), {d} skips, {d} µs spun, dev {d} µs, wake {d} µs\n", .{ i, spins, hits, falls, skips, (worker.owed_spin_ns.load() - ns0) / std.time.ns_per_us, reading.dev_ns / std.time.ns_per_us, reading.wake_ns / std.time.ns_per_us });
 }
 
 /// `depth` LOOKUPs of distinct park names from threads pinned to ONE CPU:

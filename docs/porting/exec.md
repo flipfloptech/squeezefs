@@ -646,12 +646,21 @@ Every primitive in `P:src/sync/` waits via `tick.park/parkUntil` (`tick.zig` L50
   `CancelRegion` check before parking returns `error.Canceled` if requested (§3.8).
 - `futexWake(ptr, n)`: lock bucket; move ≤ n matching waiters off the list; unlock; for each:
   `fiber.state.wake()` ⇒ `lane.enqueue(fiber)` (same-lane fast path or `inbox.push + ring.wake()`);
-  then `fence(.seq_cst); if (raw_waiters.load(.monotonic) != 0) futex.wake(ptr, n_remaining)`. The
-  Dekker pair: the raw waiter increments BEFORE its kernel compare-and-wait, the waker publishes the
-  word (the primitive's store) BEFORE the fence+load — so a raw waiter either sees the new word (EAGAIN)
-  or is counted when the waker looks. Model `futex_table_model.zig`: 1 fiber waiter + 1 raw waiter + 1
+  then `fence(.seq_cst); if (bucket.raw_waiters.load(.monotonic) != 0) futex.wake(ptr, n)` — the
+  WHOLE count, whatever the fibers took (2026-10-19, `rung-10-mdtest-wedge.md`): a counted raw waiter
+  may be the owner thread of a DRIVEN lane a woken fiber lives on, which runs the fiber only once it
+  is awake itself; a count-one wake the fiber took alone left both asleep on a free word. The raw
+  count is per bucket (a raw park elsewhere does not tax the handler lanes' wakes). The Dekker pair:
+  the raw waiter increments BEFORE its kernel compare-and-wait, the waker publishes the word (the
+  primitive's store) BEFORE the fence+load — so a raw waiter either sees the new word (EAGAIN) or is
+  counted when the waker looks. Models `futex_table_model.zig`: 1 fiber waiter + 1 raw waiter + 1
   waker; invariant "both woken"; weakening: the raw count incremented AFTER the kernel wait (modelled as
-  the wait step preceding the increment step) ⇒ a raw waiter sleeps forever (`expectFails`).
+  the wait step preceding the increment step) ⇒ a raw waiter sleeps forever (`expectFails`); and
+  `DrivenOwnerModel` (the raw waiter owns the fiber's lane, count one; weakening: the kernel wake
+  skipped once a fiber took the count ⇒ the owner sleeps forever).
+- A thread that DRIVES a lane never blocks off a fiber on anything a fiber of that lane may hold or
+  be handed: its filesystem calls are try-only (`node_cache.try_only`: the probes, the inline FORGET's
+  corpse judgement), and `exec_driven_owner_queued_parks` counts the timed raw parks that remain.
 
 The 2 s ticked backstop composes unchanged: `tick.park` bounds every wait by `tick_ns` (`tick.zig`
 L25, L62–66) ⇒ on a fiber the bound is a lane timer (§3.6) and the fiber's requeue is a `TaskState.wake`

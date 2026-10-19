@@ -3103,23 +3103,21 @@ threadlocal var current_group: ?*Group = null;
 
 /// Whether a request's handler may run on the worker's own lane (decision
 /// 0003 §AB.3): the namespace and attribute class, and a HELD WRITE the
-/// lane has room for (`own_write`: the zero-copy slot the W1 hold gate
-/// admitted — a striped passthrough file, non-extending, one block, ≤
-/// `PATCH_MAX`, not stream-adjacent — with room on the lane under
-/// `SQUEEZEFS_FUSE_WRITE_OWN_DEPTH`). A held write's one
+/// lane has room for (`own_write`: a zero-copy slot the hold gate admitted —
+/// the W1 shape on a striped passthrough file, or the overlay class — with
+/// room on the lane under `SQUEEZEFS_FUSE_WRITE_OWN_DEPTH`). A held write's
 /// device leg is `WRITE_FIXED(slot → device)` on THIS worker's ring
 /// (`storeFromForeign`): its wait parks the handler's FIBER on the store
-/// cell and the CQE is this thread's own reap, so the queue's ring never
-/// stalls; its fall-through arm (the extent park on RAM custody) touches no
-/// device. The rest of the data class — READ, an extracted, gate-declined
-/// or spilled WRITE, the syncs, RELEASE (a close drains
-/// the file's write-back), a truncating SETATTR / OPEN / CREATE, FALLOCATE,
-/// COPY_FILE_RANGE, LSEEK, IOCTL, POLL, the locks, BMAP, the forgets (an
-/// eviction reclaims), and a no-open session's FLUSH (it carries RELEASE's
-/// drain, 0003 §AF) — stays on the CPU's handler lane: its handler waits on
-/// a data device through a completion that parks the calling THREAD
-/// (`sync/completion.zig`, 0003 WP-C row 14), and on the worker that wait
-/// would stall the queue's ring.
+/// cell and the CQE is this thread's own reap; every other data-device
+/// wait parks the fiber too (lever (a), `nvme_dev.Device.routeWaits`), so
+/// the queue's ring never stalls on a device. The rest of the data class —
+/// READ, an extracted, gate-declined or spilled WRITE, the syncs, RELEASE
+/// (a close drains the file's write-back), a truncating SETATTR / OPEN /
+/// CREATE, FALLOCATE, COPY_FILE_RANGE, LSEEK, IOCTL, POLL, the locks, BMAP,
+/// the forgets (an eviction reclaims), and a no-open session's FLUSH (it
+/// carries RELEASE's drain, 0003 §AF) — stays on the CPU's handler lane:
+/// measured there, not here (rung-10-write-lane measured the held class;
+/// the wider class is its own A/B).
 pub fn onWorkerLane(op: codec.Request, no_open: bool, own_write: bool) bool {
     const o_trunc: u32 = @bitCast(linux.O{ .TRUNC = true });
     return switch (op) {

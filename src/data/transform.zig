@@ -67,6 +67,7 @@ const clock = @import("../core/clock.zig");
 const derive = @import("../core/derive.zig");
 const knobs = @import("../core/knobs.zig");
 const log = @import("../core/log.zig");
+const budget = @import("../mem/budget.zig");
 const mpmc = @import("../sync/mpmc.zig");
 const semaphore = @import("../sync/semaphore.zig");
 
@@ -1900,6 +1901,9 @@ pub const ScratchPool = struct {
     bufs: []Buf,
     free: mpmc.BoundedMpmc(Buf),
     permits: semaphore.Semaphore,
+    /// The pool's bytes (`bufs × len`) for the budget: set at init, 0 after
+    /// deinit (the registry is append-only).
+    bytes: counters.Gauge = .{},
 
     /// `n ≥ 1` buffers of `len` bytes (`scratchPoolCap(cpus)` × `scratchLen`).
     pub fn init(gpa: Allocator, n: usize, len: usize) Allocator.Error!ScratchPool {
@@ -1915,18 +1919,30 @@ pub const ScratchPool = struct {
         var free = try mpmc.BoundedMpmc(Buf).init(gpa, count);
         errdefer free.deinit(gpa);
         for (bufs) |b| free.pushSpin(b);
-        return .{ .bufs = bufs, .free = free, .permits = semaphore.Semaphore.init(count) };
+        var pool: ScratchPool = .{ .bufs = bufs, .free = free, .permits = semaphore.Semaphore.init(count) };
+        pool.bytes.set(count * len);
+        return pool;
     }
 
     pub fn deinit(self: *ScratchPool, gpa: Allocator) void {
         for (self.bufs) |b| gpa.free(b);
         gpa.free(self.bufs);
         self.free.deinit(gpa);
+        self.bytes.set(0);
         self.* = undefined;
     }
 
     pub fn capacity(self: *const ScratchPool) usize {
         return self.bufs.len;
+    }
+
+    /// The budget component (charter §6.2 R5): `transform_scratch_pool`, the
+    /// pool's bytes as gauge and floor, weight 0, no shed — a fixed pool
+    /// whose buffers in flight feed DMAs; attribution, like
+    /// `nvme_ranged_slab`. (The codec pool's contexts are the zstd
+    /// library's own allocations, unmeasured here — owed.)
+    pub fn component(self: *ScratchPool) budget.Component {
+        return budget.Component.init("transform_scratch_pool", self.bytes.load(), 0, .{ .gauge = &self.bytes }, null);
     }
 
     pub fn acquire(self: *ScratchPool, io: std.Io) Buf {
@@ -3090,11 +3106,17 @@ test "the codec pool (decision 0003 §K10): N lanes decode the same zstd frames 
     lz.release(testing.io, b);
 }
 
-test "the scratch pool: capacity handouts are distinct DMA-aligned buffers of the scratch length; the one past the cap parks (counted) until a release; every buffer returns" {
+test "the scratch pool: capacity handouts are distinct DMA-aligned buffers of the scratch length; the one past the cap parks (counted) until a release; every buffer returns; its budget component `transform_scratch_pool` reads cap × len, floor the same, weight 0, no shed" {
     const gpa = testing.allocator;
     var pool = try ScratchPool.init(gpa, 2, scratchLen(4096));
     defer pool.deinit(gpa);
     try testing.expectEqual(@as(usize, 2), pool.capacity());
+    const comp = pool.component();
+    try testing.expectEqualStrings("transform_scratch_pool", comp.name);
+    try testing.expectEqual(@as(u64, 2 * scratchLen(4096)), comp.source.current());
+    try testing.expectEqual(comp.source.current(), comp.floor);
+    try testing.expectEqual(@as(u64, 0), comp.weight);
+    try testing.expect(comp.shed == null);
     const waits0 = stats.transform_scratch_pool_waits.load();
     const a = pool.acquire(testing.io);
     const b = pool.acquire(testing.io);

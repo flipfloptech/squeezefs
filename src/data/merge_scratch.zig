@@ -26,6 +26,7 @@ const assert = std.debug.assert;
 
 const counters = @import("../core/counters.zig");
 const derive = @import("../core/derive.zig");
+const budget = @import("../mem/budget.zig");
 const journal = @import("../meta/journal.zig");
 const key = @import("../meta/key.zig");
 const record = @import("../meta/record.zig");
@@ -71,7 +72,13 @@ const slab_page: usize = std.heap.page_size_min;
 /// Slabs a mount owns: two conveyor batches' worth (`conveyor.deriveBatch
 /// Txs(cpus)` = `max(64, 2 × cpus)` each) — a merge holds its slab from
 /// the fold until its tx's ack, and the pass builds one window while the
-/// durability lane lands the one before it.
+/// durability lane lands the one before it. The count follows the
+/// CONCURRENCY, not the budget (a merge needs its slab whatever the RAM;
+/// the budget's derivations size caches and parked custody, no pool tier):
+/// 128 slabs up to 32 CPUs (the 64 floor), 256 at 64 — 44.5 MiB at 256 KiB
+/// nodes — registered with the budget as the attribution-only component
+/// `layout_publish_scratch` (`Pool.component`: floor = its bytes, never
+/// shed — a slab in flight backs a queued tx).
 pub fn poolCap(cpus: u32) usize {
     return 2 * @max(64, @as(usize, cpus) * 2);
 }
@@ -127,6 +134,9 @@ pub const Pool = struct {
     slabs: []Slab,
     free: mpmc.BoundedMpmc(*Slab),
     permits: semaphore.Semaphore,
+    /// The pool's bytes (`slabs × slab_len`) for the budget: set at init,
+    /// 0 after deinit (the registry is append-only).
+    bytes: counters.Gauge = .{},
 
     pub fn init(gpa: Allocator, io: Io, n: usize, slab_len: usize) Allocator.Error!Pool {
         const count: usize = @max(n, 1);
@@ -142,7 +152,9 @@ pub const Pool = struct {
         var free = try mpmc.BoundedMpmc(*Slab).init(gpa, count);
         errdefer free.deinit(gpa);
         for (slabs) |*s| free.pushSpin(s);
-        return .{ .gpa = gpa, .io = io, .slabs = slabs, .free = free, .permits = semaphore.Semaphore.init(count) };
+        var pool: Pool = .{ .gpa = gpa, .io = io, .slabs = slabs, .free = free, .permits = semaphore.Semaphore.init(count) };
+        pool.bytes.set(count * slab_len);
+        return pool;
     }
 
     /// Waits for every slab to come home first: a tx's deinit on the
@@ -152,7 +164,17 @@ pub const Pool = struct {
         for (self.slabs) |s| self.gpa.free(s.buf);
         self.gpa.free(self.slabs);
         self.free.deinit(self.gpa);
+        self.bytes.set(0);
         self.* = undefined;
+    }
+
+    /// The budget component (charter §6.2 R5: every pool is the budget's):
+    /// `layout_publish_scratch`, the pool's bytes as both gauge and floor,
+    /// weight 0 and no shed — a fixed pool whose slabs in flight back queued
+    /// txs cannot be returned under pressure; attribution, like
+    /// `nvme_ranged_slab`.
+    pub fn component(self: *Pool) budget.Component {
+        return budget.Component.init("layout_publish_scratch", self.bytes.load(), 0, .{ .gauge = &self.bytes }, null);
     }
 
     pub fn capacity(self: *const Pool) usize {
@@ -237,6 +259,19 @@ test "ties: a slab is two records at the volume's cap (2 × 65,792 B at 256 KiB 
     try testing.expectEqual(@as(usize, 128), poolCap(32));
     try testing.expectEqual(@as(usize, 128), poolCap(8));
     try testing.expectEqual(@as(usize, 256), poolCap(64));
+}
+
+test "tie: the budget component `layout_publish_scratch` reads exactly pool_count × slab_bytes (128 × 364,544 B = 44.5 MiB at 32 CPUs and 256 KiB nodes), floor the same, weight 0, no shed; a pool's bytes are its own gauge" {
+    var p = try Pool.init(testing.allocator, testing.io, 3, 2 * slab_page);
+    defer p.deinit();
+    const c = p.component();
+    try testing.expectEqualStrings("layout_publish_scratch", c.name);
+    try testing.expectEqual(@as(u64, 3 * 2 * slab_page), c.source.current());
+    try testing.expectEqual(@as(u64, 3 * 2 * slab_page), c.floor);
+    try testing.expectEqual(@as(u64, 0), c.weight);
+    try testing.expect(c.shed == null and c.trim == null and !c.kernel_reclaimable);
+    try testing.expectEqual(p.capacity() * p.slabLen(), c.source.current());
+    try testing.expectEqual(@as(u64, 128 * 364_544), @as(u64, poolCap(32)) * slabLen(256 * 1024));
 }
 
 test "a primed arena over a slab takes ONE node of the slab's remainder: a record at the cap and the widest save's worth of small allocations all land in the slab (overflow bytes +0), and the next merge's slab starts empty again" {

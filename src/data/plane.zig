@@ -621,6 +621,7 @@ pub const DataPlane = struct {
         };
         self.publish_scratch = try merge_scratch.Pool.init(gpa, io, merge_scratch.poolCap(opts.facts.cpus), merge_scratch.slabLen(@intCast(node_size)));
         errdefer self.publish_scratch.deinit();
+        budget.authority.register(self.publish_scratch.component());
         self.shape = try ShapeTable.init(gpa);
         errdefer self.shape.deinit(gpa);
         self.size_epochs = try size_epoch.SizeEpochs.init(gpa, SHAPE_STRIPES);
@@ -898,6 +899,7 @@ pub const DataPlane = struct {
         x.codecs = transform.CodecPool.init(gpa, &x.t, transform.codecPoolSize(self.sqz.lanes.len)) catch return error.TransformRefused;
         errdefer x.codecs.deinit(gpa);
         x.scratches = transform.ScratchPool.init(gpa, transform.scratchPoolCap(opts.facts.cpus), @intCast(transform.scratchLen(cfg.block_size))) catch return error.OutOfMemory;
+        budget.authority.register(x.scratches.component());
     }
 
     // ---- the key-rotation faces (`ops/defrag/rekey.zig`; charter §6.5) ----

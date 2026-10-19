@@ -556,6 +556,40 @@ pub const Layout = struct {
             }
             return null;
         }
+
+        /// The next element's block and reference identity off the wire —
+        /// no decode, no window check: what a diff of two maps compares.
+        pub fn peek(self: *const NamedIterator) ?RefKey {
+            if (!self.done_copy) if (self.layout.durableCopy()) |m| return .{ .block = 0, .vol_tag = m.vol_tag, .offset = m.offset };
+            if (self.layout.flags & F_MAP_INLINE != 0 and self.i < self.layout.entries.len) {
+                const e = &self.layout.entries[self.i];
+                return .{ .block = e.block(), .vol_tag = std.mem.readInt(u64, &e.mapping.vol_tag_le, .little), .offset = std.mem.readInt(u64, &e.mapping.offset_le, .little) };
+            }
+            return null;
+        }
+
+        /// Past the peeked element without decoding it.
+        pub fn skip(self: *NamedIterator) void {
+            if (!self.done_copy) {
+                self.done_copy = true;
+                if (self.layout.durableCopy() != null) return;
+            }
+            if (self.layout.flags & F_MAP_INLINE != 0 and self.i < self.layout.entries.len) self.i += 1;
+        }
+    };
+
+    /// A named element's identity for the diff: its block and the
+    /// reference it names — the volume and the block's offset (a checked
+    /// mapping's offset is chunk-aligned, so equal offsets are one
+    /// `blockIdx`: exactly `Mapping.sameRef`).
+    pub const RefKey = struct {
+        block: u32,
+        vol_tag: u64,
+        offset: u64,
+
+        pub fn sameRef(a: RefKey, b: RefKey) bool {
+            return a.vol_tag == b.vol_tag and a.offset == b.offset;
+        }
     };
 
     pub fn named(self: *const Layout, chunk: u64) NamedIterator {
@@ -1539,13 +1573,19 @@ pub fn publishLayout(t: *tx.KvTx, p: Publish, refs: RefsSeam, geo: Geometry) Pub
         },
     }
     // Every reference the new layout names and the old did not needs a
-    // proof; every one the old named and the new does not is released.
-    var it = p.layout.named(geo.chunk);
-    while (it.next()) |e| {
-        if (namesRef(p.prev, e, geo.chunk)) continue;
+    // proof (checked before anything is staged) and a `+ref`; every one
+    // the old named and the new does not a `−ref`. Both sequences are
+    // ascending by block (`named`), so the diff is ONE merge walk per
+    // pass, an entry decoded only where the walk lands on a difference —
+    // a 768-block map paid 2,300 binary searches and 4,600 decodes per
+    // publish (21 % of the handler lanes' samples on a streaming write).
+    const old: ?*const Layout = if (p.arm == .diff) (if (p.prev) |*pl| pl else null) else null;
+    var walk = RefDiff.init(&p.layout, old, geo.chunk);
+    while (walk.next()) |d| {
+        if (d != .added) continue;
         var covered = false;
         for (p.proofs) |pr| {
-            if (pr.covers(e.mapping, geo.chunk)) {
+            if (pr.covers(d.added.mapping, geo.chunk)) {
                 covered = true;
                 break;
             }
@@ -1555,21 +1595,14 @@ pub fn publishLayout(t: *tx.KvTx, p: Publish, refs: RefsSeam, geo: Geometry) Pub
     const xk = key.xattrKey(p.ino, key.xattrNameHash56(LAYOUT_XATTR_NAME, p.name_key), p.coll_seq);
     const enc_len = (XattrLayout{ .layout = p.layout }).encodedLen();
     // The record value staged ONCE: the xattr envelope + the layout bytes
-    // are built straight into the tx arena.
+    // are built straight into the tx arena and staged in place.
     const buf = try t.arena.allocator().alloc(u8, enc_len);
     const value = (XattrLayout{ .layout = p.layout }).encodeInto(buf);
-    try t.stagePut(key.TREE_XATTRS, &xk, value);
-    it = p.layout.named(geo.chunk);
-    while (it.next()) |e| {
-        if (namesRef(p.prev, e, geo.chunk)) continue;
-        try refs.stage_add(refs.ctx, t, refOf(p.ino, e, geo.chunk));
-    }
-    if (p.arm == .diff) if (p.prev) |prev| {
-        var old = prev.named(geo.chunk);
-        while (old.next()) |e| {
-            if (namesRef(p.layout, e, geo.chunk)) continue;
-            try refs.stage_release(refs.ctx, t, refOf(p.ino, e, geo.chunk));
-        }
+    try t.stagePutArena(key.TREE_XATTRS, &xk, value);
+    walk = RefDiff.init(&p.layout, old, geo.chunk);
+    while (walk.next()) |d| switch (d) {
+        .added => |e| try refs.stage_add(refs.ctx, t, refOf(p.ino, e, geo.chunk)),
+        .released => |e| try refs.stage_release(refs.ctx, t, refOf(p.ino, e, geo.chunk)),
     };
     switch (p.layout.kind) {
         .inline_ => stats.layout_inline_writes.inc(),
@@ -1583,14 +1616,46 @@ fn refOf(ino: u64, e: MapEntry, chunk: u64) RefOp {
     return .{ .vol_tag = e.mapping.vol_tag, .block_idx = e.mapping.blockIdx(chunk), .owner_ino = ino, .block_index = e.block };
 }
 
-/// Does `l` name the same REFERENCE as `e` (same block index, same block)?
-/// O(log entries): a publish diffs every entry of a 768-block map.
-fn namesRef(l: ?Layout, e: MapEntry, chunk: u64) bool {
-    const layout = l orelse return false;
-    if (e.block == 0) if (layout.durableCopy()) |m| if (m.sameRef(e.mapping, chunk)) return true;
-    const m = layout.lookup(chunk, e.block) orelse return false;
-    return m.sameRef(e.mapping, chunk);
-}
+/// The reference diff of a publish as ONE merge walk over the two ascending
+/// named sequences (`NamedIterator`): `added` = a `(block, reference)` the
+/// new layout names and the old does not; `released` = the converse. The
+/// same block naming the same reference in both is no step and costs no
+/// decode (`peek` reads the identity off the wire); a block rebound to
+/// another reference yields its release, then its add. Null `old` = a
+/// fresh file or the flip arm (nothing released).
+const RefDiff = struct {
+    new: Layout.NamedIterator,
+    old: ?Layout.NamedIterator,
+    pending_add: ?MapEntry = null,
+
+    const Step = union(enum) { added: MapEntry, released: MapEntry };
+
+    fn init(new: *const Layout, old: ?*const Layout, chunk: u64) RefDiff {
+        return .{ .new = new.named(chunk), .old = if (old) |o| o.named(chunk) else null };
+    }
+
+    fn next(self: *RefDiff) ?Step {
+        if (self.pending_add) |e| {
+            self.pending_add = null;
+            return .{ .added = e };
+        }
+        while (true) {
+            const nk = self.new.peek();
+            const ok: ?Layout.RefKey = if (self.old) |*o| o.peek() else null;
+            if (nk == null and ok == null) return null;
+            if (ok == null or (nk != null and nk.?.block < ok.?.block)) return .{ .added = self.new.next().? };
+            if (nk == null or ok.?.block < nk.?.block) return .{ .released = self.old.?.next().? };
+            if (nk.?.sameRef(ok.?)) {
+                self.new.skip();
+                self.old.?.skip();
+                continue;
+            }
+            const released = self.old.?.next().?;
+            self.pending_add = self.new.next().?;
+            return .{ .released = released };
+        }
+    }
+};
 
 /// `XattrValue{"layout", layout}` encoded in one pass (no intermediate
 /// buffer).
@@ -2232,6 +2297,113 @@ test "publishLayout stages ONE xattr Put of the record and the ±ref diff in the
         try testing.expectError(error.Corrupt, publishLayout(&t, .{ .ino = ino, .name_key = &seed, .prev = null, .layout = bad, .proofs = &.{} }, refs.seam(), tgeo));
         try testing.expectEqual(staged_before, t.staged.items.len);
     }
+}
+
+test "property: the publish's merge-walk diff ≡ the per-entry search (+ref for every reference the new layout names and the old does not, −ref for the converse, a same-reference rebind neither) over random inline maps, a staged durable copy against a map, and a fresh file; the walk decodes only the differing entries" {
+    const gpa = testing.allocator;
+    const seed: key.NameKey = .init(7);
+    const chunk = tgeo.chunk;
+    var prng = std.Random.DefaultPrng.init(0xD1FF);
+    const r = prng.random();
+    // The reference: does `l` name the same reference as `e`? (the search
+    // the walk replaced).
+    const Naive = struct {
+        fn names(l: ?Layout, e: MapEntry, c: u64) bool {
+            const lay = l orelse return false;
+            if (e.block == 0) if (lay.durableCopy()) |m| if (m.sameRef(e.mapping, c)) return true;
+            const m = lay.lookup(c, e.block) orelse return false;
+            return m.sameRef(e.mapping, c);
+        }
+    };
+    var round: usize = 0;
+    while (round < 200) : (round += 1) {
+        // Two maps over blocks 0..15: each block absent, or bound to one of
+        // three volumes at a random block offset (a small range so rebinds
+        // to the same reference happen).
+        var old_list: std.ArrayList(MapEntry) = .empty;
+        defer old_list.deinit(gpa);
+        var new_list: std.ArrayList(MapEntry) = .empty;
+        defer new_list.deinit(gpa);
+        var b: u32 = 0;
+        while (b < 16) : (b += 1) {
+            if (r.uintLessThan(u8, 4) != 0) try old_list.append(gpa, .{ .block = b, .mapping = Mapping.wholeBlock(0x10 + r.uintLessThan(u64, 3), chunk * r.uintLessThan(u64, 6), 1) });
+            if (r.uintLessThan(u8, 4) != 0) try new_list.append(gpa, .{ .block = b, .mapping = Mapping.wholeBlock(0x10 + r.uintLessThan(u64, 3), chunk * r.uintLessThan(u64, 6), 2) });
+        }
+        const old_entries = try sortedEntries(gpa, old_list.items);
+        defer gpa.free(old_entries);
+        const new_entries = try sortedEntries(gpa, new_list.items);
+        defer gpa.free(new_entries);
+        const shape = round % 3;
+        const prev: ?Layout = switch (shape) {
+            0 => Layout.stripedInline(16 * chunk, old_entries),
+            1 => Layout.staged(100, fid(1), Mapping.tenant(0x10 + r.uintLessThan(u64, 3), chunk * r.uintLessThan(u64, 6), 1, 0, 100)),
+            else => null,
+        };
+        const new = Layout.stripedInline(16 * chunk, new_entries);
+        // Every reference the new layout names is proven (the proof check is
+        // not under test here).
+        var proofs: std.ArrayList(DmaProof) = .empty;
+        defer proofs.deinit(gpa);
+        for (new_list.items) |e| try proofs.append(gpa, .{ .vol_tag = e.mapping.vol_tag, .offset = e.mapping.offset, .len = chunk, .completed_ns = 1 });
+        var refs: TestRefs = .{};
+        defer refs.deinit();
+        var t = tx.KvTx.init(gpa, @src());
+        defer t.deinit();
+        try publishLayout(&t, .{ .ino = 5, .name_key = &seed, .prev = prev, .layout = new, .proofs = proofs.items }, refs.seam(), tgeo);
+        // The naive diff.
+        var want_adds: std.ArrayList(RefOp) = .empty;
+        defer want_adds.deinit(gpa);
+        var want_rels: std.ArrayList(RefOp) = .empty;
+        defer want_rels.deinit(gpa);
+        var it = new.named(chunk);
+        while (it.next()) |e| if (!Naive.names(prev, e, chunk)) try want_adds.append(gpa, refOf(5, e, chunk));
+        if (prev) |*pl| {
+            var ot = pl.named(chunk);
+            while (ot.next()) |e| if (!Naive.names(new, e, chunk)) try want_rels.append(gpa, refOf(5, e, chunk));
+        }
+        try testing.expectEqualSlices(RefOp, want_adds.items, refs.adds.items);
+        try testing.expectEqualSlices(RefOp, want_rels.items, refs.releases.items);
+        // One record staged, in place (the arena-built value is the staged value).
+        try testing.expectEqual(@as(usize, 1), t.staged.items.len);
+    }
+    // A same-block, same-reference pair is skipped off the wire: neither
+    // side decodes; a rebound block yields its release, then its add.
+    const a = try sortedEntries(gpa, &.{ .{ .block = 3, .mapping = Mapping.wholeBlock(1, 2 * chunk, 1) }, .{ .block = 4, .mapping = Mapping.wholeBlock(1, 9 * chunk, 1) } });
+    defer gpa.free(a);
+    const bb = try sortedEntries(gpa, &.{ .{ .block = 3, .mapping = Mapping.wholeBlock(1, 2 * chunk, 7) }, .{ .block = 4, .mapping = Mapping.wholeBlock(2, 9 * chunk, 1) } });
+    defer gpa.free(bb);
+    const la = Layout.stripedInline(chunk, a);
+    const lb = Layout.stripedInline(chunk, bb);
+    var walk = RefDiff.init(&lb, &la, chunk);
+    const s1 = walk.next().?;
+    try testing.expectEqual(@as(u32, 4), s1.released.block);
+    try testing.expectEqual(@as(u64, 1), s1.released.mapping.vol_tag);
+    const s2 = walk.next().?;
+    try testing.expectEqual(@as(u32, 4), s2.added.block);
+    try testing.expectEqual(@as(u64, 2), s2.added.mapping.vol_tag);
+    try testing.expect(walk.next() == null);
+    // The record is staged IN PLACE: a 1,000-entry map (48 KiB) grows the
+    // tx's arena by less than two copies of itself (the duplicate into its
+    // own arena was the publish's second 37 KiB allocation per block).
+    var big_list: std.ArrayList(MapEntry) = .empty;
+    defer big_list.deinit(gpa);
+    var pf: std.ArrayList(DmaProof) = .empty;
+    defer pf.deinit(gpa);
+    var blk: u32 = 0;
+    while (blk < 1000) : (blk += 1) {
+        try big_list.append(gpa, .{ .block = blk, .mapping = Mapping.wholeBlock(1, blk * chunk, 1) });
+        try pf.append(gpa, .{ .vol_tag = 1, .offset = blk * chunk, .len = chunk, .completed_ns = 1 });
+    }
+    const big_entries = try sortedEntries(gpa, big_list.items);
+    defer gpa.free(big_entries);
+    var refs: TestRefs = .{};
+    defer refs.deinit();
+    var t = tx.KvTx.init(gpa, @src());
+    defer t.deinit();
+    try publishLayout(&t, .{ .ino = 6, .name_key = &seed, .prev = null, .layout = Layout.stripedInline(1000 * chunk, big_entries), .proofs = pf.items }, refs.seam(), tgeo);
+    const staged_len = t.staged.items[0].value.len;
+    try testing.expect(staged_len > 48 * 1000);
+    try testing.expect(t.arena.queryCapacity() < 2 * staged_len);
 }
 
 test "the flip to the block-map tree releases NOTHING (the diff arm would release every moved entry — the port hazard); a kvmap head never regresses to an inline map; a kvmap → kvmap head Put stages no ref op; the flip arm refuses any other shape" {

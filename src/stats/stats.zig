@@ -318,6 +318,7 @@ pub const covered = [_]Covered{
     .{ .path = "src/data/fsync.zig", .by = "src/data/plane.zig" },
     .{ .path = "src/data/hot_tier.zig", .by = "src/data/plane.zig" },
     .{ .path = "src/data/kvmap.zig", .by = "src/data/plane.zig" },
+    .{ .path = "src/data/merge_scratch.zig", .by = "src/data/plane.zig" },
     .{ .path = "src/data/layout.zig", .by = "src/data/plane.zig" },
     .{ .path = "src/data/nvme_read_cache.zig", .by = "src/data/plane.zig" },
     .{ .path = "src/data/pack.zig", .by = "src/data/plane.zig" },

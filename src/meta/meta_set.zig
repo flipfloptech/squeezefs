@@ -353,6 +353,15 @@ pub const MetaSet = struct {
         return t;
     }
 
+    /// `begin` with the arena carved from the committer's slab-first
+    /// allocator (`KvTx.initBacked`): the slab returns through `backing`
+    /// at the tx's terminal outcome.
+    pub fn beginBacked(self: *MetaSet, site: tx.Site, child: Allocator, backing: tx.ArenaBacking) Allocator.Error!*KvTx {
+        const t = try self.gpa.create(KvTx);
+        t.* = KvTx.initBacked(child, site, backing);
+        return t;
+    }
+
     pub fn abandon(self: *MetaSet, t: *KvTx) void {
         t.deinit();
         self.gpa.destroy(t);

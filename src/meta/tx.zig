@@ -159,10 +159,27 @@ pub const NameNotes = struct {
     }
 };
 
+/// What backs a tx's arena besides the process allocator: the committer's
+/// pooled slab the arena's chunks are carved from (the data plane's publish
+/// scratch, `data/merge_scratch.zig` — a hot path allocates nothing per
+/// op). It rides the arena into the queue entry and is released ONCE,
+/// after the arena, at the terminal outcome — on whichever thread reaches
+/// it.
+pub const ArenaBacking = struct {
+    ctx: *anyopaque,
+    release_fn: *const fn (*anyopaque) void,
+
+    pub fn release(self: ArenaBacking) void {
+        self.release_fn(self.ctx);
+    }
+};
+
 pub const KvTx = struct {
     arena: std.heap.ArenaAllocator,
     staged: std.ArrayList(Staged) = .empty,
     site: Site,
+    /// The arena's slab, when a committer backed it (`initBacked`).
+    backing: ?ArenaBacking = null,
     /// A structural commit whose exclusion is the engine's — the migration
     /// engine's delta copy into the target (the slot is CLOSED at the
     /// source, the target's tree unpublished) — takes no door tokens.
@@ -188,11 +205,19 @@ pub const KvTx = struct {
         return .{ .arena = std.heap.ArenaAllocator.init(gpa), .site = site };
     }
 
+    /// A tx whose arena carves its chunks from `child` (the committer's
+    /// slab-first allocator) and returns the slab through `backing` at its
+    /// terminal outcome.
+    pub fn initBacked(child: Allocator, site: Site, backing: ArenaBacking) KvTx {
+        return .{ .arena = std.heap.ArenaAllocator.init(child), .site = site, .backing = backing };
+    }
+
     /// Releases every staged byte and the guards (if the tx never became a
     /// queue entry).
     pub fn deinit(self: *KvTx) void {
         self.guards.release();
         self.arena.deinit();
+        if (self.backing) |b| b.release();
         self.* = undefined;
     }
 
@@ -227,6 +252,17 @@ pub const KvTx = struct {
 
     pub fn stagePut(self: *KvTx, tree_id: u8, k: []const u8, value: []const u8) Allocator.Error!void {
         try self.stage(tree_id, k, .put, value);
+    }
+
+    /// `stagePut` of a value the caller already built in THIS tx's arena
+    /// (`arena.allocator()`): the record is staged in place, never copied
+    /// again (a 37 KiB layout record was duplicated into its own arena per
+    /// publish).
+    pub fn stagePutArena(self: *KvTx, tree_id: u8, k: []const u8, value_in_arena: []const u8) Allocator.Error!void {
+        assert(k.len != 0);
+        const a = self.arena.allocator();
+        const kd = try a.dupe(u8, k);
+        try self.staged.append(a, .{ .tree_id = tree_id, .key = kd, .kind = .put, .value = value_in_arena });
     }
 
     pub fn stageDelta(self: *KvTx, tree_id: u8, k: []const u8, delta: record.InodeDelta) Allocator.Error!void {
@@ -425,6 +461,8 @@ pub const QueuedTx = struct {
     /// the terminal outcome after the guards.
     door: DoorTokens = .none,
     door_bypass: bool = false,
+    /// The arena's slab (`KvTx.backing`), returned after the arena.
+    backing: ?ArenaBacking = null,
 
     /// The terminal outcome: drop the guards, the door tokens, free the
     /// records.
@@ -432,6 +470,7 @@ pub const QueuedTx = struct {
         self.guards.release();
         self.door.release();
         self.arena.deinit();
+        if (self.backing) |b| b.release();
         self.* = undefined;
     }
 
@@ -511,10 +550,12 @@ pub fn buildQueuedTx(tx: *KvTx, node_size: usize, diag: ?*BuildRefusal) BuildErr
     const names = tx.names;
     const site = tx.site;
     const door_bypass = tx.door_bypass;
+    const backing = tx.backing;
     tx.* = undefined;
     errdefer {
         guards.release();
         arena.deinit();
+        if (backing) |b| b.release();
     }
     const a = arena.allocator();
     const recs = try a.alloc(Rec, staged.len);
@@ -548,6 +589,7 @@ pub fn buildQueuedTx(tx: *KvTx, node_size: usize, diag: ?*BuildRefusal) BuildErr
         .site = site,
         .guards = guards,
         .door_bypass = door_bypass,
+        .backing = backing,
     };
 }
 
@@ -602,6 +644,55 @@ test "the name notes (decision 0003 §AB.2): deduplicated, two at most (a third 
     defer q.deinit();
     try testing.expectEqualStrings("b", q.names.slice()[1].name);
     try testing.expect(q.names.overflow);
+}
+
+test "stagePutArena stages an arena-built value in place (the staged bytes ARE the caller's, the key alone is copied) and frames exactly as stagePut's twin; a backed tx returns its slab once, after the arena, whether it is deinit'ed or became a queue entry" {
+    const gpa = testing.allocator;
+    var a = KvTx.init(gpa, @src());
+    defer a.deinit();
+    const built = try a.arena.allocator().alloc(u8, 40_000);
+    @memset(built, 'L');
+    try a.stagePutArena(key.TREE_XATTRS, &key.xattrKey(9, 1, 0), built);
+    try testing.expectEqual(built.ptr, a.staged.items[0].value.ptr);
+    try testing.expect(a.arena.queryCapacity() < 2 * built.len);
+    var b = KvTx.init(gpa, @src());
+    defer b.deinit();
+    try b.stagePut(key.TREE_XATTRS, &key.xattrKey(9, 1, 0), built);
+    var fa: [1]journal.RecordFrame = undefined;
+    var fb: [1]journal.RecordFrame = undefined;
+    var qa_recs = [_]Rec{.{ .tree_id = a.staged.items[0].tree_id, .key = a.staged.items[0].key, .kind = .put, .value = a.staged.items[0].value }};
+    var qb_recs = [_]Rec{.{ .tree_id = b.staged.items[0].tree_id, .key = b.staged.items[0].key, .kind = .put, .value = b.staged.items[0].value }};
+    const qa: QueuedTx = .{ .arena = undefined, .recs = &qa_recs, .len = 0, .class = .user, .token_quiet = false, .site = @src(), .guards = .none };
+    const qb: QueuedTx = .{ .arena = undefined, .recs = &qb_recs, .len = 0, .class = .user, .token_quiet = false, .site = @src(), .guards = .none };
+    const ra = qa.frames(&fa)[0];
+    const rb = qb.frames(&fb)[0];
+    try testing.expectEqualSlices(u8, rb.key, ra.key);
+    try testing.expectEqualSlices(u8, rb.value, ra.value);
+    try testing.expectEqual(rb.tag, ra.tag);
+    // The backing: released once at the terminal outcome, after the arena.
+    const Backing = struct {
+        var releases: u32 = 0;
+        fn release(_: *anyopaque) void {
+            releases += 1;
+        }
+    };
+    var dummy: u8 = 0;
+    const backing: ArenaBacking = .{ .ctx = &dummy, .release_fn = &Backing.release };
+    var c = KvTx.initBacked(gpa, @src(), backing);
+    try c.stagePut(key.TREE_INODES, &key.inodeKey(5), "v");
+    c.deinit();
+    try testing.expectEqual(@as(u32, 1), Backing.releases);
+    var d = KvTx.initBacked(gpa, @src(), backing);
+    try d.stagePut(key.TREE_INODES, &key.inodeKey(5), "v");
+    var q = try buildQueuedTx(&d, 4096, null);
+    try testing.expectEqual(@as(u32, 1), Backing.releases);
+    q.deinit();
+    try testing.expectEqual(@as(u32, 2), Backing.releases);
+    // A refused build releases it too.
+    var e = KvTx.initBacked(gpa, @src(), backing);
+    try e.stagePut(key.TREE_INODES, &key.inodeKey(5), built);
+    try testing.expectError(error.ValueTooLarge, buildQueuedTx(&e, 4096, null));
+    try testing.expectEqual(@as(u32, 3), Backing.releases);
 }
 
 test "staging keeps stage order, kinds and bytes; seqs are unassigned until the pass stamps them" {

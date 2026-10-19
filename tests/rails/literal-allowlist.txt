@@ -197,7 +197,6 @@ src/data/transform.zig:867 | 255 | 4d0ce489f0d81958 | OWED: derive it or documen
 src/data/write_pipeline.zig:379 | 16 | aad51832e11952a3 | OWED: derive it or document it on the line (charter §1.5)
 src/data/write_pipeline.zig:398 | 8 | b3b5a515fd77c187 | OWED: derive it or document it on the line (charter §1.5)
 src/data/write_pipeline.zig:413 | 4 | 81256b7087b62f00 | OWED: derive it or document it on the line (charter §1.5)
-src/data/write_seams.zig:235 | 64 | dd7d218ccc0f746b | OWED: derive it or document it on the line (charter §1.5)
 src/data/write_seams.zig:430 | 32 | cbd367d3de044c1b | OWED: derive it or document it on the line (charter §1.5)
 src/exec/cpu_class.zig:165 | 10 | 1564e073b78d1f3a | OWED: derive it or document it on the line (charter §1.5)
 src/exec/cpu_class.zig:175 | 100 | 21d87804ecced163 | OWED: derive it or document it on the line (charter §1.5)

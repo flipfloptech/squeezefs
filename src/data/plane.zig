@@ -100,6 +100,7 @@ const transport_slot = @import("../fuse/transport/slot.zig");
 const zc = @import("../fuse/transport/zc.zig");
 const layout = @import("layout.zig");
 const kvmap = @import("kvmap.zig");
+const merge_scratch = @import("merge_scratch.zig");
 const staging = @import("staging.zig");
 const pack = @import("pack.zig");
 const router = @import("router.zig");
@@ -450,6 +451,9 @@ pub const DataPlane = struct {
     reclaim_free: seams.ReclaimFree,
     /// Levels (3.5) and (3.7) with the promotion's order (module doc).
     locks: layout.PublishLocks = .{},
+    /// The block-map publish's pooled working set (`merge_scratch`): the
+    /// record, the fold and the tx's arena of one merge, never the heap.
+    publish_scratch: merge_scratch.Pool,
     stage: ?Staging = null,
     xform: ?Xform = null,
     packer: ?pack.Packer = null,
@@ -613,7 +617,10 @@ pub const DataPlane = struct {
             .crossing_kill_after = knobs.intKnob("SQUEEZEFS_TEST_KVMAP_CROSSING_KILL_AFTER", u32, opts.env),
             .test_own_block_poison = knobs.boolKnob("SQUEEZEFS_TEST_OWN_BLOCK_POISON", opts.env),
             .zcrx_registry = zcrx.steering.Registry.init(gpa),
+            .publish_scratch = undefined,
         };
+        self.publish_scratch = try merge_scratch.Pool.init(gpa, io, merge_scratch.poolCap(opts.facts.cpus), merge_scratch.slabLen(@intCast(node_size)));
+        errdefer self.publish_scratch.deinit();
         self.shape = try ShapeTable.init(gpa);
         errdefer self.shape.deinit(gpa);
         self.size_epochs = try size_epoch.SizeEpochs.init(gpa, SHAPE_STRIPES);
@@ -1218,6 +1225,7 @@ pub const DataPlane = struct {
         self.sweeps.deinit(self.gpa);
         self.shape.deinit(self.gpa);
         self.size_epochs.deinit();
+        self.publish_scratch.deinit();
         self.gpa.destroy(self);
     }
 
@@ -2289,7 +2297,13 @@ pub const DataPlane = struct {
     const LayoutRecord = struct { value: []u8, coll_seq: u8 };
 
     pub fn layoutRecord(self: *DataPlane, ino: u64) Error!?LayoutRecord {
-        if (self.foreign_layout) |f| switch (try f.lookup(f.ctx, self.gpa, ino)) {
+        return self.layoutRecordWith(self.gpa, ino);
+    }
+
+    /// `layoutRecord` with the copy owned by `a` (the process allocator,
+    /// or a merge's slab — `merge_scratch`).
+    pub fn layoutRecordWith(self: *DataPlane, a: Allocator, ino: u64) Error!?LayoutRecord {
+        if (self.foreign_layout) |f| switch (try f.lookup(f.ctx, a, ino)) {
             .local => {},
             .gone => return null,
             // A token page's chain slot is the holder's; a foreign record
@@ -2297,27 +2311,33 @@ pub const DataPlane = struct {
             .foreign => |x| return if (x.layout) |v| .{ .value = v, .coll_seq = 0 } else null,
         };
         const h = key.xattrNameHash56(layout.LAYOUT_XATTR_NAME, self.name_key);
-        const start = key.xattrKey(ino, h, 0);
         // The chain's first slot holds the record unless another name of
         // the same 56-bit hash took it first (or took it and was removed):
-        // ONE point lookup — one owned copy — answers the common case; the
-        // chain range (a list, a copy of every key and value, then this
-        // record's copy again) only when slot 0 is not `layout`. The read
-        // path resolves a layout per cold read (`docs/evidence/rung-10-
-        // dev-perf.md` §3.4).
-        if (self.backend.lookup(self.gpa, key.TREE_XATTRS, &start) catch |e| return KvBackend.coreError(e)) |v| {
-            const xv = record.XattrValue.decode(v) catch {
-                self.gpa.free(v);
-                return error.InputOutput;
-            };
-            if (std.mem.eql(u8, xv.name, layout.LAYOUT_XATTR_NAME)) return .{ .value = v, .coll_seq = 0 };
-            self.gpa.free(v);
+        // ONE copy off the borrowed view answers the common case (the
+        // store's own copy was a second one); the chain range (a list, a
+        // copy of every key and value, then this record's copy again) only
+        // when slot 0 is not `layout`. The read path resolves a layout per
+        // cold read (`docs/evidence/rung-10-dev-perf.md` §3.4).
+        const Probe = union(enum) { copied: []u8, other_name, corrupt, oom };
+        const Copy = struct {
+            a: Allocator,
+            fn visit(q: @This(), v: []const u8) Probe {
+                const xv = record.XattrValue.decode(v) catch return .corrupt;
+                if (!std.mem.eql(u8, xv.name, layout.LAYOUT_XATTR_NAME)) return .other_name;
+                return .{ .copied = q.a.dupe(u8, v) catch return .oom };
+            }
+        };
+        switch ((self.backend.lookupView(a, key.TREE_XATTRS, &key.xattrKey(ino, h, 0), Probe, Copy{ .a = a }, Copy.visit) catch |e| return KvBackend.coreError(e)) orelse .other_name) {
+            .copied => |v| return .{ .value = v, .coll_seq = 0 },
+            .other_name => {},
+            .corrupt => return error.InputOutput,
+            .oom => return error.OutOfMemory,
         }
-        return self.layoutChain(ino, h);
+        return self.layoutChain(a, ino, h);
     }
 
     /// The layout record off its xattr chain when slot 0 is not `layout`.
-    fn layoutChain(self: *DataPlane, ino: u64, h: u64) Error!?LayoutRecord {
+    fn layoutChain(self: *DataPlane, a: Allocator, ino: u64, h: u64) Error!?LayoutRecord {
         var kvs: std.ArrayList(tree.KeyValue) = .empty;
         defer tree.deinitKeyValues(self.gpa, &kvs);
         const start = key.xattrKey(ino, h, 0);
@@ -2326,7 +2346,7 @@ pub const DataPlane = struct {
         for (kvs.items) |kv| {
             const xv = record.XattrValue.decode(kv.value) catch return error.InputOutput;
             if (std.mem.eql(u8, xv.name, layout.LAYOUT_XATTR_NAME)) {
-                return .{ .value = try self.gpa.dupe(u8, kv.value), .coll_seq = kv.key[kv.key.len - 1] };
+                return .{ .value = try a.dupe(u8, kv.value), .coll_seq = kv.key[kv.key.len - 1] };
             }
         }
         return null;
@@ -2359,7 +2379,7 @@ pub const DataPlane = struct {
             switch ((self.backend.lookupView(self.gpa, key.TREE_XATTRS, &key.xattrKey(ino, h, 0), Probe, q, Q.visit) catch |e| return KvBackend.coreError(e)) orelse .other_name) {
                 .point => |p| return p,
                 .corrupt => return error.InputOutput,
-                .other_name => break :local ((try self.layoutChain(ino, h)) orelse return null).value,
+                .other_name => break :local ((try self.layoutChain(self.gpa, ino, h)) orelse return null).value,
             }
         };
         defer self.gpa.free(owned);
@@ -2557,8 +2577,17 @@ pub const DataPlane = struct {
                 foreign = true;
             },
         };
-        const rec = (self.layoutRecord(req.ino) catch return error.Transient);
-        defer if (rec) |r| gpa.free(r.value);
+        // The publish's working set is ONE pooled slab (`merge_scratch`):
+        // the record's copy and the fold below (both within the slab by
+        // its sizing — never freed, the slab resets when it comes home),
+        // then the tx's arena, which takes the slab over at `beginBacked`
+        // and returns it at the tx's terminal outcome on the journal lane.
+        // Past that handoff this fiber touches the slab's allocator no more.
+        const slab = self.publish_scratch.acquire();
+        var slab_to_tx = false;
+        defer if (!slab_to_tx) slab.release();
+        const sa = slab.allocator();
+        const rec = (self.layoutRecordWith(sa, req.ino) catch return error.Transient);
         var prev: ?layout.Layout = null;
         var coll_seq: u8 = 0;
         if (rec) |r| {
@@ -2577,9 +2606,8 @@ pub const DataPlane = struct {
         }
         const old_entries: []const layout.MapEntryWire = if (prev) |p| p.entries else &.{};
         var merged: std.ArrayList(layout.MapEntryWire) = .empty;
-        defer merged.deinit(gpa);
         var out: seams.MergeOutcome = .{};
-        foldInserts(gpa, old_entries, req.inserts, self.chunk, &merged, &out) catch |e| return switch (e) {
+        foldInserts(sa, old_entries, req.inserts, self.chunk, &merged, &out) catch |e| return switch (e) {
             error.OutOfMemory => error.OutOfMemory,
             error.Corrupt => error.Transient,
         };
@@ -2593,7 +2621,9 @@ pub const DataPlane = struct {
             try self.shipMerge(req, new);
             return out;
         }
-        const t = self.backend.begin(@src()) catch return error.OutOfMemory;
+        const t = self.backend.beginBacked(@src(), sa, slab.backing()) catch return error.OutOfMemory;
+        slab_to_tx = true;
+        slab.primeArena(&t.arena);
         layout.publishLayout(t, .{ .ino = req.ino, .name_key = self.name_key, .coll_seq = coll_seq, .prev = prev, .layout = new, .proofs = req.proofs }, self.refsSeam(), self.geo) catch |e| {
             self.backend.abandon(t);
             stats.layout_map_merge_failures.inc();
@@ -3798,6 +3828,7 @@ pub const DataPlane = struct {
         try block_refs.writeStatsJson(w);
         try w.writeAll(",\"reclaim\":");
         try reclaim.writeStatsJson(w);
+        try w.print(",\"publish_scratch\":{{\"layout_publish_scratch_slabs\":{d},\"layout_publish_scratch_slab_bytes\":{d},\"layout_publish_scratch_waits\":{d},\"layout_publish_scratch_overflow_bytes\":{d}}}", .{ self.publish_scratch.capacity(), self.publish_scratch.slabLen(), merge_scratch.stats.layout_publish_scratch_waits.load(), merge_scratch.stats.layout_publish_scratch_overflow_bytes.load() });
         try w.print(",\"transform\":{{\"compress_stored_raw\":{d},\"crypto_key_unwraps\":{d},\"crypto_key_unwrap_hits\":{d},\"crypto_unwrap_cache_full\":{d},\"transform_codec_pool_waits\":{d},\"transform_scratch_pool_waits\":{d},\"transform_codecs\":{d},\"transform_scratches\":{d}}}", .{ transform.stats.compress_stored_raw.load(), transform.stats.crypto_key_unwraps.load(), transform.stats.crypto_key_unwrap_hits.load(), transform.stats.crypto_unwrap_cache_full.load(), transform.stats.transform_codec_pool_waits.load(), transform.stats.transform_scratch_pool_waits.load(), if (self.xform) |*x| x.codecs.capacity() else 0, if (self.xform) |*x| x.scratches.capacity() else 0 });
         try w.writeAll(",\"nvme_dev\":");
         try nvme_dev.writeStatsJson(w);

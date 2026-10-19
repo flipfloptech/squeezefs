@@ -122,6 +122,7 @@ pub const data = struct {
     pub const sym_planes = @import("data/sym_planes.zig");
     pub const kvmap = @import("data/kvmap.zig");
     pub const layout = @import("data/layout.zig");
+    pub const merge_scratch = @import("data/merge_scratch.zig");
     pub const staging = @import("data/staging.zig");
     pub const pack = @import("data/pack.zig");
     pub const router = @import("data/router.zig");

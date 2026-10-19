@@ -702,6 +702,9 @@ fn mountMain(ctx: *Ctx) u8 {
     };
     var session_live = true;
     defer if (session_live) session.deinit();
+    // The wedge census names the drain workers' state while the session stands.
+    registry.setCensusHook(session.censusHook());
+    defer registry.setCensusHook(null);
     // An early exit from here on ends every move park BEFORE the session's
     // teardown joins its handlers (the serve path closes it explicitly).
     defer moves.close();
@@ -940,6 +943,7 @@ fn mountMain(ctx: *Ctx) u8 {
     kernel_view_live = false;
     session_live = false;
     vs.renderer.sources.session = null;
+    registry.setCensusHook(null);
     session.deinit();
     // The plane closes BEFORE the backend's final checkpoint (the dismount
     // pass's promotions were layout transactions); the `defer`s unwind the

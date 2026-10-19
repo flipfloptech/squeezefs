@@ -35,6 +35,7 @@ const abi = @import("../abi.zig");
 const codec = @import("../codec.zig");
 const geometry = @import("../geometry.zig");
 const mount_options = @import("../mount_options.zig");
+const watchdog = @import("../handler/watchdog.zig");
 const slot = @import("slot.zig");
 const zc = @import("zc.zig");
 const probes = @import("probes.zig");
@@ -1465,6 +1466,30 @@ pub const Session = struct {
         self.publishKernelMaxBackground();
         log.info("transport: FUSE-over-io_uring transport armed at {s}: {d} queue(s) × {d} ent(s) over {d} worker(s) ({d} ring(s) per queue), {t}", .{ self.mountpoint, self.plan.nqueues, self.plan.depth, ngroups, self.rings_per_queue, self.mode });
         return self;
+    }
+
+    /// The watchdog's worker census (`watchdog.CensusHook`): after the wedge
+    /// census line, every drain worker that holds fibers, owes a reply, has
+    /// work queued or stands inside a pass — its pass age, its lane's live
+    /// fibers, ready depth and inbox, the lane's wake coalescer and whether
+    /// this ring's READ of the lane's eventfd stands. Atomics only (any
+    /// thread). Bounded: the first 16 suspects.
+    pub fn logWorkerCensus(ctx: *anyopaque) void {
+        const self: *Session = @ptrCast(@alignCast(ctx));
+        const now = clock.monotonicNs();
+        var named: u32 = 0;
+        for (self.groups) |g| {
+            const v = g.censusView(now);
+            if (!worker.Group.censusSuspect(v)) continue;
+            log.err("worker census: group {d} (qid {d}, slots {d}..): pass {s} {d} ms ago, owed {d}; lane live {d} ready {d} inbox {d}, coalescer {s}, lane-wake READ {s}", .{ g.index, v.qid, v.ring_base, if (v.in_pass) "began" else "parked", v.pass_age_ns / std.time.ns_per_ms, v.owed, v.lane_live, v.lane_ready, v.lane_inbox, if (v.lane_coalescer_armed) "armed" else "disarmed", if (v.lane_wake_armed) "standing" else "DOWN" });
+            named += 1;
+            if (named == 16) break;
+        }
+        if (named == 0) log.err("worker census: no drain worker holds a fiber, owes a reply or stands inside a pass", .{});
+    }
+
+    pub fn censusHook(self: *Session) watchdog.CensusHook {
+        return .{ .ctx = self, .call = &logWorkerCensus };
     }
 
     /// The probes and the lattice decision (ONCE per mount): kmbuf by the

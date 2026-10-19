@@ -180,10 +180,25 @@ comptime {
 threadlocal var home_shard: u32 = std.math.maxInt(u32);
 var next_home: std.atomic.Value(u32) = .init(0);
 
+/// The transport's worker census, logged after the wedge census line when
+/// any op is overdue (`Session.logWorkerCensus`: every drain worker that
+/// holds fibers, owes a reply or stands inside a pass, with its lane's
+/// queues and wake state).
+pub const CensusHook = struct {
+    ctx: *anyopaque,
+    call: *const fn (ctx: *anyopaque) void,
+};
+
 pub const Registry = struct {
     gpa: std.mem.Allocator,
     shards: u32,
     slots: []OpSlot,
+    /// Installed by the daemon once its FUSE session stands and cleared
+    /// before the session goes; read and run under `census_lock`, so a
+    /// clear returns only after a running census call ended (the session
+    /// it reads is never torn down under it).
+    census_hook: ?CensusHook = null,
+    census_lock: std.atomic.Value(bool) = .init(false),
     /// Refreshed once per tick; every claim stamps it (zero clock syscalls
     /// on the per-op path — the whole point of retiring `timeout()`'s
     /// timer-wheel + vdso tax, 2.75 % of daemon cycles).
@@ -209,6 +224,29 @@ pub const Registry = struct {
 
     pub fn capacity(self: *const Registry) usize {
         return self.slots.len;
+    }
+
+    fn lockCensus(self: *Registry) void {
+        // acquire pairs with `unlockCensus`'s release.
+        while (self.census_lock.swap(true, .acquire)) std.atomic.spinLoopHint();
+    }
+
+    fn unlockCensus(self: *Registry) void {
+        self.census_lock.store(false, .release);
+    }
+
+    /// Install (or clear with null) the worker census; a clear returns
+    /// after any census call in progress.
+    pub fn setCensusHook(self: *Registry, hook: ?CensusHook) void {
+        self.lockCensus();
+        defer self.unlockCensus();
+        self.census_hook = hook;
+    }
+
+    fn runCensusHook(self: *Registry) void {
+        self.lockCensus();
+        defer self.unlockCensus();
+        if (self.census_hook) |h| h.call(h.ctx);
     }
 
     fn myShard(self: *const Registry) u32 {
@@ -299,7 +337,10 @@ pub const Registry = struct {
             log.err("FUSE op watchdog: {s} (ino {d}, unique {d}) in flight for at least {d} ms (> {d} ms), parked past station [{s}] — op is NOT cancelled (D1.b: no ETIMEDOUT synthesis; a dropped committer is the ring-wedge vector)", .{ op.name(), s.ino, s.unique, age / std.time.ns_per_ms, thr / std.time.ns_per_ms, op_trace.Stage.nameOf(s.station.load(.monotonic)) });
         }
         fuse_ops_inflight.set(report.in_flight);
-        if (report.overdue > 0) logWedgeCensus(report);
+        if (report.overdue > 0) {
+            logWedgeCensus(report);
+            self.runCensusHook();
+        }
         return report;
     }
 };
@@ -307,8 +348,9 @@ pub const Registry = struct {
 /// The one-line wedge census: process-global atomics only, so it is
 /// readable from the watchdog no matter what is wedged.
 fn logWedgeCensus(report: Registry.TickReport) void {
-    // The stalest FUSE worker pass: the holder of every fiber on its lane
-    // (`transport/pass_stamps.zig`); 0 ms on group 0 when no worker runs.
+    // The stalest FUSE worker pass still INSIDE its pass: the holder of
+    // every fiber on its lane (`transport/pass_stamps.zig`); 0 ms on group
+    // 0 when every worker is parked.
     const stalest = pass_stamps.stalest(clock.monotonicNs()) orelse pass_stamps.Stalest{ .group = 0, .age_ns = 0 };
     log.err("wedge census: fuse_ops_inflight={d} overdue_now={d} fuse_op_watchdog_overdue={d} fuse_requests_malformed={d} lock_ticked_reregisters={d} channel_ticked_reregisters={d} invariant_tripwires={d} registry_exhausted={d} stalest_worker_pass_ms={d} stalest_worker_group={d}", .{
         report.in_flight,
@@ -481,17 +523,31 @@ test "watchdog tick: an op past its class threshold is reported with op/ino/age/
     try log.testing.expectAllFired();
     try testing.expectEqual(@as(u32, 2), r.overdue);
     try testing.expectEqual(before + 2, fuse_op_watchdog_overdue.load());
-    // A second scan observes them again (one observation per scan per stuck op).
+    // A second scan observes them again (one observation per scan per stuck
+    // op) and runs the installed worker census once, after the wedge line.
+    const Census = struct {
+        calls: u32 = 0,
+        fn call(ctx: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.calls += 1;
+        }
+    };
+    var census: Census = .{};
+    reg.setCensusHook(.{ .ctx = &census, .call = &Census.call });
     log.testing.expectErrorLogs(3);
     _ = wd.tickOnce(t0 + 11 * std.time.ns_per_s);
     try log.testing.expectAllFired();
     try testing.expectEqual(before + 4, fuse_op_watchdog_overdue.load());
-    // Released: gone from the next scan.
+    try testing.expectEqual(@as(u32, 1), census.calls);
+    // Released: gone from the next scan; nothing overdue runs no census, and
+    // a cleared hook runs none either.
     reg.release(a);
     reg.release(far);
     r = wd.tickOnce(t0 + 16 * std.time.ns_per_s);
     try testing.expectEqual(@as(u32, 0), r.in_flight);
     try testing.expectEqual(@as(u32, 0), r.overdue);
+    try testing.expectEqual(@as(u32, 1), census.calls);
+    reg.setCensusHook(null);
     try testing.expectEqual(@as(u64, 4), wd.ticks.load(.monotonic));
 }
 

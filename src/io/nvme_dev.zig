@@ -2535,8 +2535,25 @@ test "a fiber waiting on a device write parks only itself: a second fiber homed 
     var back: [4096]u8 = undefined;
     try tf.readAt(&back, 4096);
     try expectPattern(&back, 33);
-    // A raw thread's wait through the same route is a counted raw park.
+    // A raw thread's wait through the same route is a counted raw park —
+    // under the hold again, so the wait is certain: an unheld 4 KiB DMA on
+    // a RAM file can complete before the caller reaches its wait (the
+    // cell's `poll` answers, no park) — the 2026-10-19 train red (expected
+    // 34, found 33). A helper lifts the hold once the lane holds AND the
+    // raw park is counted.
+    seams.held.store(0, .release);
+    seams.hold_before_park.store(1, .release);
+    const R = struct {
+        fn lift(s: *Seams, parks0: u64) void {
+            while (s.held.load(.acquire) == 0) futex.wait(&s.held, 0);
+            while (stats.dev_wait_raw_parks.load() == parks0) std.atomic.spinLoopHint();
+            s.hold_before_park.store(0, .release);
+            futex.wakeAll(&s.hold_before_park);
+        }
+    };
+    const lifter = try std.Thread.spawn(.{}, R.lift, .{ seams, raw_parks0 });
     try dev.writeBlock(8192, &payload);
+    lifter.join();
     try testing.expectEqual(raw_parks0 + 1, stats.dev_wait_raw_parks.load());
     try testing.expectEqual(fiber_parks0 + 1, stats.dev_wait_fiber_parks.load());
 }

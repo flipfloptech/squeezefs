@@ -174,6 +174,10 @@ const Rig = struct {
             .env = std.process.Environ.Map.init(gpa),
         };
         try self.env.put("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
+        // The rings-per-queue A/B pin reaches every row's daemon from the
+        // harness's environment (`SQUEEZEFS_FUSE_RINGS_PER_QUEUE=2 zig build
+        // smoke …` gates the two-ring arm; the daemon's env is otherwise ours).
+        if (knobs.present(proc_env.get(rings_knob))) |v| try self.env.put(rings_knob, v);
         _ = linux.mkdir(self.work.ptr, 0o755);
         // The data dir's per-run folder (equals `work` unless the seam moved it).
         const data_work = try std.fmt.allocPrintSentinel(gpa, "{s}/smoke-{d}", .{ data_dir, pid }, 0);
@@ -545,6 +549,24 @@ const Rig = struct {
 
     fn awaitReady(self: *Rig, from: usize) !usize {
         return self.awaitLog("ready: ", from, ready_wait_ns);
+    }
+
+    /// Unmount a mount whose server was just `kill -9`ed. The kernel frees
+    /// the dead daemon's last references to the mount ASYNCHRONOUSLY after
+    /// `waitpid` returned — its own `.stats` file through `delayed_fput`
+    /// (one jiffy), its rings' fixed files through the io_uring exit work
+    /// (≈ 100 ms with 64 rings) — so an `umount2` racing them answers EBUSY
+    /// (the 2026-10-19 two-ring red: the mid-dd kill's dd ended ECANCELED
+    /// at once, the umount landed inside the window). The bound is the
+    /// observable's: a mount still busy after a second has a live holder.
+    fn umountAfterKill(self: *Rig) !void {
+        const deadline = clock.monotonicNs() + std.time.ns_per_s;
+        var e = linux.errno(linux.umount2(self.mp.ptr, 0));
+        while (e == .BUSY and clock.monotonicNs() < deadline) {
+            sleepMs(1);
+            e = linux.errno(linux.umount2(self.mp.ptr, 0));
+        }
+        try testing.expectEqual(linux.E.SUCCESS, e);
     }
 
     /// Wait for the mount child to exit; its term.
@@ -5300,7 +5322,7 @@ fn killRowTarX(strict: bool) !void {
     // tar fails (ENOTCONN) and exits; the dead connection unmounts.
     const tar_term = try tar.wait(io);
     try testing.expect(!tar_term.success());
-    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.umount2(rig.mp.ptr, 0)));
+    try rig.umountAfterKill();
     try testing.expectEqual(@as(usize, 0), try fuseMountsOf(gpa, io, rig.mp));
     const tar_err = try Io.Dir.cwd().readFileAlloc(io, tar_err_path, gpa, .limited(1 << 20));
     defer gpa.free(tar_err);
@@ -6158,6 +6180,7 @@ const overwrite_seed: u64 = 0x5151_4a4a_0404_2026;
 /// The looped single-stage repro's knob (`knobs.zig`, harness class).
 const smoke_loops_knob = "SQUEEZEFS_TEST_SMOKE_STAGE_LOOPS";
 const data_dir_knob = "SQUEEZEFS_TEST_DATA_DIR";
+const rings_knob = "SQUEEZEFS_FUSE_RINGS_PER_QUEUE";
 /// One looped pass's wall bound: the overwrite stage runs ~5 s, the storm
 /// ~15 s on the venue; a pass past this is a hang, killed and failed.
 const stage_loop_timeout_s: u32 = 300;
@@ -7331,7 +7354,7 @@ test "smoke: THE KILL MATRIX — kill -9 at 50/100/150 MiB of a 200 MiB dd and m
         _ = linux.kill(rig.child_pid, .KILL);
         try testing.expectEqual(std.process.Child.Term{ .signal = .KILL }, try rig.waitChild());
         try testing.expect(!(try dd.wait(io)).success());
-        try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.umount2(rig.mp.ptr, 0)));
+        try rig.umountAfterKill();
         const recovered = try fsckClean(rig, "the mid-dd kill");
         const rec = try remountAfterKill(rig, recovered);
         // Every acked file byte-exact; the in-flight file exact or holes.
@@ -7383,7 +7406,7 @@ test "smoke: THE KILL MATRIX — kill -9 at 50/100/150 MiB of a 200 MiB dd and m
         _ = linux.kill(rig.child_pid, .KILL);
         try testing.expectEqual(std.process.Child.Term{ .signal = .KILL }, try rig.waitChild());
         _ = try storm.wait(io);
-        try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.umount2(rig.mp.ptr, 0)));
+        try rig.umountAfterKill();
         const recovered = try fsckClean(rig, "the storm kill");
         const rec = try remountAfterKill(rig, recovered);
         var dir = try Io.Dir.cwd().openDir(io, rig.mp, .{});
@@ -8908,7 +8931,7 @@ test "smoke: FSCK AND SCRUB — format (a cache path) → fill (dirs, 200 packed
         _ = linux.kill(rig.child_pid, .KILL);
         try testing.expectEqual(std.process.Child.Term{ .signal = .KILL }, try rig.waitChild());
         _ = try storm.wait(io);
-        try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.umount2(rig.mp.ptr, 0)));
+        try rig.umountAfterKill();
     }
     _ = try fsckClean(rig, "the storm kill (fsck smoke)");
     const mark_after_kill = try rig.logLen();
@@ -9330,7 +9353,7 @@ test "smoke: THE JOBS MATRIX — format (1 MiB blocks, a cache path) → fill (p
     rig.killed = true;
     _ = linux.kill(rig.child_pid, .KILL);
     try testing.expectEqual(std.process.Child.Term{ .signal = .KILL }, try rig.waitChild());
-    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.umount2(rig.mp.ptr, 0)));
+    try rig.umountAfterKill();
     mark = try rig.logLen();
     try rig.spawnMount(&.{});
     _ = try rig.awaitReady(mark);
@@ -10607,7 +10630,7 @@ test "smoke: THE REKEY ROW — format (1 MiB blocks, lz4 + aes-256-gcm, key A, a
     rig.killed = true;
     _ = linux.kill(rig.child_pid, .KILL);
     try testing.expectEqual(std.process.Child.Term{ .signal = .KILL }, try rig.waitChild());
-    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.umount2(rig.mp.ptr, 0)));
+    try rig.umountAfterKill();
     mark = try rig.logLen();
     try rig.spawnMount(&.{});
     _ = try rig.awaitReady(mark);
@@ -10840,7 +10863,7 @@ test "smoke: THE BLOCK-MAP TREE — a 1.5 GiB file at 1 MiB blocks crosses the i
         try testing.expect(std.mem.indexOf(u8, text, "BLOCK_MAP_TREE stamped") != null);
         try testing.expect(std.mem.indexOf(u8, text, "TEST SEAM SQUEEZEFS_TEST_KVMAP_CROSSING_KILL_AFTER") != null);
     }
-    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.umount2(rig.mp.ptr, 0)));
+    try rig.umountAfterKill();
     try rig.env.put("SQUEEZEFS_TEST_KVMAP_CROSSING_KILL_AFTER", "0");
 
     // 2. Remount: the head is still the inline map (every durable block

@@ -894,7 +894,9 @@ pub const Group = struct {
     /// wake eventfd is read by a standing READ on THIS ring.
     lane: ?*exec.Lane = null,
     lane_wake_buf: u64 = 0,
-    lane_wake_armed: bool = false,
+    /// The standing READ of the lane's wake eventfd stands (worker thread
+    /// writes; the watchdog's worker census reads).
+    lane_wake_armed: std.atomic.Value(bool) = .init(false),
     /// The worker's FUSE side ended (drained, resident, quiesced): the
     /// session's `close` waits for this word; the thread itself keeps
     /// running its lane until every handler on it has finished.
@@ -1337,6 +1339,50 @@ pub const Group = struct {
         return n;
     }
 
+    /// The watchdog's view of this worker from ANOTHER thread (the wedge
+    /// census, `Session.logWorkerCensus`): atomics only.
+    pub const CensusView = struct {
+        qid: u16,
+        ring_base: u16,
+        /// Age of the pass stamp and whether the worker is inside that pass.
+        pass_age_ns: u64,
+        in_pass: bool,
+        owed: u32,
+        /// The driven lane: fibers between spawn and recycle, the ready
+        /// queue's depth as of its last run, the inbox's occupancy hint, its
+        /// wake coalescer's arm bit, and whether this ring's READ of its
+        /// eventfd stands.
+        lane_live: u32,
+        lane_ready: u64,
+        lane_inbox: usize,
+        lane_coalescer_armed: bool,
+        lane_wake_armed: bool,
+    };
+
+    pub fn censusView(self: *const Group, now_ns: u64) CensusView {
+        var owed: u32 = 0;
+        for (self.members) |*m| owed += m.slots.owedCountForeign();
+        const at = pass_stamps.stamps[self.index].load(.monotonic);
+        return .{
+            .qid = self.members[0].qid,
+            .ring_base = self.ring_base,
+            .pass_age_ns = if (at == 0) 0 else now_ns -| at,
+            .in_pass = pass_stamps.in_pass[self.index].load(.monotonic) != 0,
+            .owed = owed,
+            .lane_live = if (self.lane) |l| l.liveFibers() else 0,
+            .lane_ready = if (self.lane) |l| l.queue_depth.load() else 0,
+            .lane_inbox = if (self.lane) |l| l.inbox.len() else 0,
+            .lane_coalescer_armed = if (self.lane) |l| l.ring.coalescer.armed.load(.seq_cst) else false,
+            .lane_wake_armed = self.lane_wake_armed.load(.monotonic),
+        };
+    }
+
+    /// Whether the census should name this worker: it holds fibers, owes
+    /// a reply, has work queued, or stands inside a pass.
+    pub fn censusSuspect(v: CensusView) bool {
+        return v.lane_live > 0 or v.owed > 0 or v.lane_ready > 0 or v.lane_inbox > 0 or v.in_pass;
+    }
+
     fn threadMain(self: *Group) void {
         var base: [24]u8 = undefined;
         _ = thread_name.nameCurrentThread(&self.name_buf, std.fmt.bufPrint(&base, "sqz-fuse-ur{d}", .{self.members[0].qid}) catch unreachable);
@@ -1387,19 +1433,19 @@ pub const Group = struct {
     /// Push the standing READ of the lane's wake eventfd unless it stands.
     fn armLaneWake(self: *Group) bool {
         const l = self.lane orelse return true;
-        if (self.lane_wake_armed) return true;
+        if (self.lane_wake_armed.load(.monotonic)) return true;
         if (self.ring.isDead()) return false;
         const sqe = self.ring.getSqe() orelse return false;
         uring128.prepRead(sqe, .{ .raw = l.wakeFd() }, std.mem.asBytes(&self.lane_wake_buf), 0);
         sqe.user_data = lane_wake_ud;
-        self.lane_wake_armed = true;
+        self.lane_wake_armed.store(true, .monotonic);
         return true;
     }
 
     /// Fold the lane-wake READ's CQE: true ⇒ it was (the next pump disarms).
     fn consumeLaneWake(self: *Group, cqe: uring128.Cqe32) bool {
         if (cqe.user_data != lane_wake_ud) return false;
-        self.lane_wake_armed = false;
+        self.lane_wake_armed.store(false, .monotonic);
         if (self.lane) |l| l.drivenWakeConsumed();
         return true;
     }
@@ -2622,6 +2668,10 @@ pub const Group = struct {
         noteCommitBatch(self.commits_pushed);
         self.commits_pushed = 0;
         self.noteBridgesSubmitted();
+        // The census's phase: parked in the ring is no holder; the loop top
+        // re-stamps the pass, the drain phases pass through here too.
+        pass_stamps.parked(self.index);
+        defer pass_stamps.stamp(self.index, clock.monotonicNs());
         if (bound) |b| {
             if (!self.ring.isDead() and self.ring.ring.sqReady() == 0 and self.ring.ring.features & linux.IORING_FEAT_EXT_ARG != 0) {
                 enters.inc();

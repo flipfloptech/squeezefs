@@ -721,6 +721,16 @@ pub const SlotTable = struct {
         return false;
     }
 
+    /// The owed count read from ANOTHER thread (the watchdog's worker
+    /// census): the per-ent atomic economy word, never the state union.
+    pub fn owedCountForeign(self: *const SlotTable) u32 {
+        var n: u32 = 0;
+        for (self.ents) |*e| if (e.owed_commit_id.load(.acquire) != 0) {
+            n += 1;
+        };
+        return n;
+    }
+
     pub fn allRetired(self: *const SlotTable) bool {
         for (self.ents) |*e| if (e.state != .retired) return false;
         return true;

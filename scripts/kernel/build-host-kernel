@@ -19,7 +19,7 @@
 # The series: scripts/kernel/patches-7.2 — 0001–0026 copied from the Rust reference's
 # docker/kernel-sqz/patches-7.2 (dev 48e1c9b2; Koong's kmbuf + FUSE zero-copy v4, the sqz
 # transplants, FUSE_TIME_LIMITS, host-scoped fabric subsystems, per-queue bg accounting)
-# and this repo's 0027–0029 — with scripts/kernel/config-fragment, asserted as a checklist
+# and this repo's 0027–0030 — with scripts/kernel/config-fragment, asserted as a checklist
 # (fail loud). Two package families, chosen by the target's /etc/os-release:
 #
 # Debian/Ubuntu: linux 7.2.8 from kernel.org + the series, as .debs (bindeb-pkg). The
@@ -38,8 +38,9 @@
 #   ~30 min on 32 threads) and installed with pacman -U, which fires the mkinitcpio/Limine
 #   hooks (the UKI, the boot entry); a limine-entry-tool drop-in puts the sqz kernel first
 #   in BOOT_ORDER, the stock kernel stays as the fallback. The sqz tag comes from the
-#   pkgbase (uname -r: 7.2.x-N-omarchy-sqz), so the fragment's CONFIG_LOCALVERSION lines are
-#   skipped. --prepare-only runs makepkg -o in the foreground — download, signatures, every
+#   pkgbase (uname -r: 7.2.x-N.S-omarchy-sqz — N Omarchy's pkgrel, S the series' last patch
+#   number, so a rebuilt kernel is distinguishable from the running one and names its series),
+#   so the fragment's CONFIG_LOCALVERSION lines are skipped. --prepare-only runs makepkg -o in the foreground — download, signatures, every
 #   patch at --fuzz=0, the config and its checklist, no compile — the pass to run first after
 #   an Omarchy bump, to see conflicts in minutes rather than after a build.
 set -euo pipefail
@@ -194,6 +195,11 @@ sed -i "s/^pkgbase=$UPSTREAM\$/pkgbase=$PKGBASE/" PKGBUILD
 # prepare() applies every *.patch in source order at --fuzz=0, so the series rides that loop
 # after Omarchy's patches; the fragment is not a patch and is applied by the prepare() below.
 for p in ../patches/*.patch; do cp "$p" "sqz-$(basename "$p")"; done
+# pkgrel N.S: Omarchy's N plus the series' last patch number S, so uname -r names the series and
+# a rebuild of the same Omarchy base is never the running kernel's version string.
+series=$(basename "$(ls ../patches/*.patch | sort | tail -1)" | cut -c1-4 | sed 's/^0*//')
+sed -i "s/^pkgrel=\([0-9]*\)\$/pkgrel=\1.$series/" PKGBUILD
+grep -q "^pkgrel=[0-9]*\.$series\$" PKGBUILD || { echo "pkgrel rewrite failed; read the PKGBUILD"; exit 1; }
 cp ../fragment sqz-config-fragment
 {
   echo

@@ -52,7 +52,7 @@ if the write handler's own-lane cost (≈ 3 µs: two `readInodeOpt`, the layout 
 write-lane note's "what remains", not this lever.
 
 **The kernel half, drafted.** `scripts/kernel/proposed/0030-sqz-fuse-uring-several-rings-per-queue.patch`
-(NOT in `patches-7.2/`: `build-host-kernel` globs that directory, and this is unbooted): the
+(moved into `patches-7.2/` 2026-10-19 on the owner's word, built as `linux-omarchy-sqz 7.2.8-7.30`; unbooted at this writing): the
 buffer ring becomes a property of the registering ring — a queue keeps `struct fuse_ring_src`
 per ring ctx (its pinned kmbuf ring, its zc depth), each entry points at its ring's source,
 selection and the headers index go through it, a commit from another ring is refused `-EXDEV`,

@@ -170,6 +170,10 @@ pub const stats = struct {
     pub var overlay_superseded_dead_old_binding: counters.ShardedCounter = .{};
     pub var overlay_settle_retries: counters.ShardedCounter = .{};
     pub var overlay_teardown_waits: counters.ShardedCounter = .{};
+    /// A settle that found the in-flight set empty but a completion still
+    /// inside the record's notify, and waited for it to leave (THE
+    /// COMPLETION'S LAST TOUCH, module doc).
+    pub var overlay_teardown_quiesce_waits: counters.ShardedCounter = .{};
     pub var writeback_orphan_discards_overlay: counters.ShardedCounter = .{};
     // Must-stay-0.
     pub var overlay_fence_drops: counters.Tripwire = .init("overlay_fence_drops");
@@ -185,7 +189,7 @@ pub const stats = struct {
 
 pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
     try w.print("{{\"overlay_open\":{d},\"overlay_inflight_bytes\":{d},", .{ stats.overlay_open.load(), stats.overlay_inflight_bytes.load() });
-    inline for (.{ "overlay_installs", "overlay_overwrite_installs", "overlay_stores", "overlay_store_bytes", "overlay_overwrite_bytes", "overlay_ack_early_stores", "overlay_ack_early_bytes", "overlay_ack_early_retries", "overlay_short_stores", "overlay_store_fallbacks", "overlay_claim_conflicts", "overlay_governed_stores", "overlay_dma_passthrough_bytes", "overlay_dma_pool_copy_bytes", "overlay_ineligible_sub_cap", "overlay_ineligible_shadow_bound", "overlay_ineligible_range_shared", "overlay_ineligible_ram_custody", "overlay_sub_cap_joins", "overlay_enospc_declines", "overlay_registry_declines", "overlay_unreachable_declines", "overlay_read_serves", "overlay_read_serve_bytes", "overlay_read_gap_serves", "overlay_read_gap_bytes", "overlay_read_drains", "overlay_window_escalations", "overlay_gap_seeds", "overlay_gap_seed_bytes", "overlay_gap_seed_old_bytes", "overlay_gap_seed_ranged_bytes", "overlay_gap_seed_read_bytes", "overlay_publishes", "overlay_published_bytes", "overlay_epoch_feeds", "overlay_epoch_feeds_fresh", "overlay_feed_fallbacks", "overlay_supersessions", "overlay_superseded_by_merge", "overlay_superseded_dead_old_binding", "overlay_settle_retries", "overlay_teardown_waits", "writeback_orphan_discards_overlay" }) |name| {
+    inline for (.{ "overlay_installs", "overlay_overwrite_installs", "overlay_stores", "overlay_store_bytes", "overlay_overwrite_bytes", "overlay_ack_early_stores", "overlay_ack_early_bytes", "overlay_ack_early_retries", "overlay_short_stores", "overlay_store_fallbacks", "overlay_claim_conflicts", "overlay_governed_stores", "overlay_dma_passthrough_bytes", "overlay_dma_pool_copy_bytes", "overlay_ineligible_sub_cap", "overlay_ineligible_shadow_bound", "overlay_ineligible_range_shared", "overlay_ineligible_ram_custody", "overlay_sub_cap_joins", "overlay_enospc_declines", "overlay_registry_declines", "overlay_unreachable_declines", "overlay_read_serves", "overlay_read_serve_bytes", "overlay_read_gap_serves", "overlay_read_gap_bytes", "overlay_read_drains", "overlay_window_escalations", "overlay_gap_seeds", "overlay_gap_seed_bytes", "overlay_gap_seed_old_bytes", "overlay_gap_seed_ranged_bytes", "overlay_gap_seed_read_bytes", "overlay_publishes", "overlay_published_bytes", "overlay_epoch_feeds", "overlay_epoch_feeds_fresh", "overlay_feed_fallbacks", "overlay_supersessions", "overlay_superseded_by_merge", "overlay_superseded_dead_old_binding", "overlay_settle_retries", "overlay_teardown_waits", "overlay_teardown_quiesce_waits", "writeback_orphan_discards_overlay" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, @field(stats, name).load() });
     }
     inline for (.{ "overlay_fence_drops", "overlay_unpublished_at_fsync", "overlay_ack_early_lost", "overlay_teardown_wait_overlong", "overlay_teardown_nonterminal", "overlay_install_race_under_guard", "overlay_store_superseded_under_guard", "overlay_state_word_corrupt", "overlay_registry_full" }, 0..) |name, i| {
@@ -783,6 +787,13 @@ pub const Overlay = struct {
     /// Test seam: `SQUEEZEFS_TEST_OVERLAY_SETTLE_TRANSIENTS` — inject N
     /// transient settle failures after the freeze, before device work.
     settle_transients: Atomic(u32) = .init(0),
+    /// Test seam (in-process): a store's completion parks AFTER it dropped
+    /// its hold on the record and BEFORE its announcement to the waiters,
+    /// until `announce_release` fires; `announce_held` is the park
+    /// observable. The window a settler must not be able to cross.
+    announce_hold: Atomic(bool) = .init(false),
+    announce_release: sync_notify.Notify = .init,
+    announce_held: Atomic(u32) = .init(0),
 
     pub fn init(gpa: Allocator, cfg: Config, deps: Deps, capacity: usize) Allocator.Error!Overlay {
         return .{ .gpa = gpa, .cfg = cfg, .deps = deps, .registry = try Registry.init(gpa, capacity) };
@@ -989,6 +1000,7 @@ pub const Overlay = struct {
         if (permit) |p| if (self.deps.governor) |g| g.complete(io, p, rec.ordinal, clock.monotonicNs() -| p.admitted_ns);
         const verdict = rec.core.completeStore(ticket, success);
         stats.overlay_inflight_bytes.sub(len);
+        if (self.announce_hold.load(.acquire)) self.holdAnnounce(io);
         rec.inflight_change.notifyWaiters(io);
         if (!success) return .{ .stored = .{ .coverage_complete = false, .acked_early = false } };
         stats.overlay_stores.inc();
@@ -1003,6 +1015,15 @@ pub const Overlay = struct {
             },
             .not_covered => .{ .stored = .{ .coverage_complete = false, .acked_early = false } },
         };
+    }
+
+    /// The `announce_hold` seam's park (test builds arm it).
+    fn holdAnnounce(self: *Overlay, io: Io) void {
+        var n = self.announce_release.notified();
+        _ = n.enable(io);
+        _ = self.announce_held.fetchAdd(1, .release);
+        n.waitUncancelable(io);
+        _ = self.announce_held.fetchSub(1, .release);
     }
 
     /// The ACK-early continuation: retry-forever on the ladder; the fence
@@ -2422,6 +2443,76 @@ test "ack_early_write_returns_before_store_cqe; fsync_awaits_acked_inflight_stor
     try testing.expectEqual(@as(u32, 1), Gate.released.load(.acquire));
     try testing.expectEqual(lost0, counters.tripwireCount("overlay_ack_early_lost"));
     w.f.dev.hook = null;
+}
+
+// The 2026-10-19 perf-session panic (1 MiB sequential writes, QD16):
+// `Io.Mutex.unlock` met `.unlocked` inside `Notify.notifyWaiters` under
+// `finishStore`. The store's CQE dropped its hold (`inflight −= 1`) and
+// only THEN announced it on the record's notify, holding no block guard; a
+// settler that observed the empty set in that window published the block
+// and retired the record, the next fresh install re-used the slot (the free
+// list is LIFO) and reset its notify while the completion was still inside.
+test "THE COMPLETION'S LAST TOUCH: a store's completion parked between its hold drop and its announcement still owns the record — a settler that finds the in-flight set empty waits for the announcement before it tears the record down (overlay_teardown_quiesce_waits), and the next record installed in that slot is woken by its own CQE alone (red: the settler got through and the slot's next record carried the stale completion's epoch)" {
+    const io = testing.io;
+    const w = try TestWorld.init(testing.allocator, .{});
+    defer w.deinit(testing.allocator);
+    try w.f.map.create(95, .striped, 0);
+    var p: [wt.BS]u8 align(4096) = undefined;
+    pattern(&p, 0x1D);
+    const Storer = struct {
+        fn run(world: *TestWorld, io_: Io, block: u32, bytes: []const u8, out: *anyerror!StoreOutcome) void {
+            out.* = world.ov.store(io_, .{ .ino = 95, .block = block, .rel = 0, .vehicle = .{ .bytes = bytes }, .file = TestWorld.striped(@as(u64, block) * wt.BS), .overwrite = false });
+        }
+        /// The settler: a drain of block 0 (the fsync's, the write-back
+        /// timer's, a sibling's steal — any of them), then a writer's fresh
+        /// install of block 1, which takes the slot block 0's record held.
+        fn settle(world: *TestWorld, io_: Io, bytes: []const u8, out: *anyerror!StoreOutcome, done: *Atomic(bool)) void {
+            world.ov.drainBlock(io_, &world.locks, 95, 0, false, world.cs());
+            run(world, io_, 1, bytes, out);
+            done.store(true, .release);
+        }
+    };
+    // 1. The whole-block store of block 0: its CQE completes the coverage,
+    //    freezes the record, drops the hold and parks at the seam.
+    w.ov.announce_hold.store(true, .release);
+    defer w.ov.announce_release.notifyWaiters(io);
+    var o0: anyerror!StoreOutcome = error.TestUnexpectedResult;
+    const t0 = try std.Thread.spawn(.{}, Storer.run, .{ w, io, @as(u32, 0), @as([]const u8, &p), &o0 });
+    while (w.ov.announce_held.load(.acquire) == 0) try std.Thread.yield();
+    // Only the one completion holds: block 1's store below runs free.
+    w.ov.announce_hold.store(false, .release);
+    const rec0 = w.ov.registry.get(.{ .ino = 95, .block = 0 }).?;
+    const frozen_at_park = rec0.core.stateNow() == .frozen;
+    const empty_at_park = rec0.core.inflightEmpty();
+    // 2. The settler drains block 0 and installs block 1. Either it gets
+    //    through while the completion is parked (the defect) or it waits
+    //    for the announcement (the law) — the two observables.
+    const q0 = stats.overlay_teardown_quiesce_waits.load();
+    var o1: anyerror!StoreOutcome = error.TestUnexpectedResult;
+    var done: Atomic(bool) = .init(false);
+    const t1 = try std.Thread.spawn(.{}, Storer.settle, .{ w, io, @as([]const u8, &p), &o1, &done });
+    while (!done.load(.acquire) and stats.overlay_teardown_quiesce_waits.load() == q0) try std.Thread.yield();
+    const settled_through_the_window = done.load(.acquire);
+    const still_registered = w.ov.registry.get(.{ .ino = 95, .block = 0 }) != null;
+    // 3. The completion announces; everything lands.
+    w.ov.announce_release.notifyWaiters(io);
+    t0.join();
+    t1.join();
+    try testing.expect(frozen_at_park);
+    try testing.expect(empty_at_park);
+    try testing.expect((try o0).stored.coverage_complete);
+    try testing.expect((try o1) == .stored);
+    // The slot was re-used: block 1's record lives where block 0's did.
+    const rec1 = w.ov.registry.get(.{ .ino = 95, .block = 1 }).?;
+    try testing.expectEqual(rec0, rec1);
+    // The law: the settler waited for the announcement, the record stayed
+    // registered meanwhile, and block 1's notify saw exactly its own CQE.
+    try testing.expect(!settled_through_the_window);
+    try testing.expect(still_registered);
+    try testing.expectEqual(q0 + 1, stats.overlay_teardown_quiesce_waits.load());
+    try testing.expectEqual(@as(u64, 1), rec1.inflight_change.epoch);
+    w.ov.drainBlock(io, &w.locks, 95, 1, false, w.cs());
+    try testing.expectEqual(@as(u32, 0), w.ov.registry.open_count.load(.monotonic));
 }
 
 test {

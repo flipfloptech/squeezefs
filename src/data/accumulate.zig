@@ -51,6 +51,7 @@ const log = @import("../core/log.zig");
 const derive = @import("../core/derive.zig");
 const knobs = @import("../core/knobs.zig");
 const jc = @import("../meta/journal_core.zig");
+const dlm = @import("../meta/dlm.zig");
 const budget = @import("../mem/budget.zig");
 const sync_notify = @import("../sync/notify.zig");
 const layout = @import("layout.zig");
@@ -111,6 +112,15 @@ pub fn extentEntryCap(cap_buffers: u64) u64 {
 /// law `active_block_table_full` (must-stay-0) asserts.
 pub fn activeBlockEntries(cap_buffers: u64) u64 {
     return cap_buffers + extentEntryCap(cap_buffers);
+}
+
+/// The per-ino presence stripes (`Table.presence`): the power of two at or
+/// above four per entry slot, so a cold ino's false "maybe" against a FULL
+/// table stays under 1 − e^(−1/4) ≈ 22 % (an empty table collides with
+/// nothing — the read row's case); 4 B a stripe, 64 KiB at the parked cap
+/// of a 76 GiB budget.
+pub fn presenceStripes(entries: u64) u64 {
+    return std.math.ceilPowerOfTwo(u64, @max(entries, 1) * 4) catch unreachable;
 }
 
 /// Red halves the parked cap (the charter's "parked caps halve and become
@@ -176,11 +186,15 @@ pub const stats = struct {
     /// A first small piece met the extent entries at `extentEntryCap` and
     /// took a full buffer instead.
     pub var extent_cap_fallbacks: counters.ShardedCounter = .{};
+    /// The locked per-ino scans of the index (`hasExtentOf`, `holdsIno`,
+    /// `lowestBlockOf`): only after the ino's presence stripe read non-zero.
+    /// The read row's probes never scan (`docs/evidence/rung-10-read-cost.md`).
+    pub var parked_ino_scans: counters.ShardedCounter = .{};
 };
 
 pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
     try w.writeAll("{");
-    inline for (.{ "write_through_blocks", "write_through_bytes", "write_through_fallbacks", "nt_copy_bytes", "active_block_cow_copies", "active_block_memset_elided_bytes", "active_block_ooo_runs", "active_block_run_table_completions", "overwrite_seed_deferred", "overwrite_seed_materialized", "overwrite_seed_skipped", "write_block_revisits", "parked_pool_refusals", "parked_pool_trimmed_cells", "durable_upload_bytes_escalation", "placed_merge_elides", "drain_inplace_drains", "drain_inplace_pages", "drain_inplace_dmas", "drain_inplace_write_bytes", "drain_inplace_seed_bytes", "drain_inplace_declines", "drain_inplace_dma_errors", "drain_inplace_dirty_drains", "extent_cap_fallbacks" }) |name| {
+    inline for (.{ "write_through_blocks", "write_through_bytes", "write_through_fallbacks", "nt_copy_bytes", "active_block_cow_copies", "active_block_memset_elided_bytes", "active_block_ooo_runs", "active_block_run_table_completions", "overwrite_seed_deferred", "overwrite_seed_materialized", "overwrite_seed_skipped", "write_block_revisits", "parked_pool_refusals", "parked_pool_trimmed_cells", "durable_upload_bytes_escalation", "placed_merge_elides", "drain_inplace_drains", "drain_inplace_pages", "drain_inplace_dmas", "drain_inplace_write_bytes", "drain_inplace_seed_bytes", "drain_inplace_declines", "drain_inplace_dma_errors", "drain_inplace_dirty_drains", "extent_cap_fallbacks", "parked_ino_scans" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, @field(stats, name).load() });
     }
     try w.print("\"parked_full_buffer_bytes\":{d},\"parked_buffers\":{d},", .{ stats.parked_full_buffer_bytes.load(), stats.parked_buffers.load() });
@@ -484,6 +498,16 @@ pub const Table = struct {
     /// taken) and a retire — so it never exceeds the cap.
     extents: Atomic(u32) = .init(0),
     extent_cap: u32,
+    /// Per-ino presence (`presenceStripes`, hashed by ino): every entry's
+    /// and the extent entries' alone. A stripe is raised under `lock`
+    /// BEFORE its entry joins the index (`acq_rel`: the insert cannot pass
+    /// it) and lowered AFTER it left (`release`), so a reader that loads 0
+    /// holds an exact "no entry of this ino" without the lock; a non-zero
+    /// stripe is a maybe the locked lookup settles. The uring worker's read
+    /// probe asks per read — the locked index scan it replaces was 9 % of
+    /// a saturated worker (`docs/evidence/rung-10-read-cost.md`).
+    presence: []Atomic(u32),
+    extent_presence: []Atomic(u32),
     /// Notified whenever an upload task ends (publish, discard, supersede,
     /// a transient): the JOIN of a second flush of the same block (an
     /// fsync or a RELEASE racing the write-through) waits here instead of
@@ -504,7 +528,14 @@ pub const Table = struct {
         errdefer free.deinit(gpa);
         var i: u32 = @intCast(cap);
         while (i > 0) : (i -= 1) free.appendAssumeCapacity(i - 1);
-        var self: Table = .{ .gpa = gpa, .block_size = block_size, .pool = Pool.init(gpa, block_size, cap_buffers), .entries = entries, .free = free, .extent_cap = @intCast(extentEntryCap(cap_buffers)) };
+        const stripes: usize = @intCast(presenceStripes(cap));
+        const presence = try gpa.alloc(Atomic(u32), stripes);
+        errdefer gpa.free(presence);
+        @memset(presence, .init(0));
+        const extent_presence = try gpa.alloc(Atomic(u32), stripes);
+        errdefer gpa.free(extent_presence);
+        @memset(extent_presence, .init(0));
+        var self: Table = .{ .gpa = gpa, .block_size = block_size, .pool = Pool.init(gpa, block_size, cap_buffers), .entries = entries, .free = free, .extent_cap = @intCast(extentEntryCap(cap_buffers)), .presence = presence, .extent_presence = extent_presence };
         try self.index.ensureTotalCapacity(gpa, @intCast(cap));
         return self;
     }
@@ -514,8 +545,47 @@ pub const Table = struct {
         self.index.deinit(self.gpa);
         self.free.deinit(self.gpa);
         self.gpa.free(self.entries);
+        self.gpa.free(self.presence);
+        self.gpa.free(self.extent_presence);
         self.pool.deinit();
         self.* = undefined;
+    }
+
+    fn stripeOf(self: *const Table, ino: u64) usize {
+        return @intCast(dlm.splitmix64(ino) & (self.presence.len - 1));
+    }
+
+    /// Under `lock`, before the entry's index insert.
+    fn raisePresence(self: *Table, ino: u64, is_extent: bool) void {
+        _ = self.presence[self.stripeOf(ino)].fetchAdd(1, .acq_rel);
+        if (is_extent) _ = self.extent_presence[self.stripeOf(ino)].fetchAdd(1, .acq_rel);
+    }
+
+    /// Under `lock`, after the entry's index removal (or an extent's
+    /// escalation to a full buffer: the extent stripe alone).
+    fn lowerPresence(self: *Table, ino: u64, all: bool, is_extent: bool) void {
+        if (all) _ = self.presence[self.stripeOf(ino)].fetchSub(1, .release);
+        if (is_extent) _ = self.extent_presence[self.stripeOf(ino)].fetchSub(1, .release);
+    }
+
+    /// False = certainly no parked entry of `ino` (one load, no lock);
+    /// true = maybe (the locked lookup decides).
+    pub fn mayHoldIno(self: *const Table, ino: u64) bool {
+        return self.presence[self.stripeOf(ino)].load(.acquire) != 0;
+    }
+
+    /// Whether `ino` holds a W2 extent entry — the warm ladder's pre-screen
+    /// (`read_path.WriteSide.has_retained_extents`), one load per read when
+    /// no extent of the ino's stripe exists; the locked scan only past it.
+    pub fn hasExtentOf(self: *Table, ino: u64) bool {
+        if (self.extents.load(.acquire) == 0) return false;
+        if (self.extent_presence[self.stripeOf(ino)].load(.acquire) == 0) return false;
+        stats.parked_ino_scans.inc();
+        self.lock.lock();
+        defer self.lock.unlock();
+        var it = self.index.iterator();
+        while (it.next()) |kv| if (kv.key_ptr.ino == ino and kv.value_ptr.*.repr == .extent) return true;
+        return false;
     }
 
     /// The R5 component: the pool's RAM (parked entries AND the cached
@@ -541,9 +611,11 @@ pub const Table = struct {
         return self.count.load(.monotonic);
     }
 
-    /// Lock-free-ish custody probe (one spin-locked lookup; the W1 and
-    /// overlay predicates ask it).
+    /// The custody probe (the W1 and overlay predicates, the read path's
+    /// precedence check): one load when the ino's presence stripe is clear,
+    /// else one spin-locked lookup.
     pub fn has(self: *Table, ino: u64, block: u32) bool {
+        if (!self.mayHoldIno(ino)) return false;
         self.lock.lock();
         defer self.lock.unlock();
         return self.index.contains(.{ .ino = ino, .block = block });
@@ -621,6 +693,7 @@ pub const Table = struct {
             .in_use = true,
         };
         if (has_existing_bytes) stats.overwrite_seed_deferred.inc();
+        self.raisePresence(ino, false);
         self.index.putAssumeCapacity(key, e);
         _ = self.count.fetchAdd(1, .monotonic);
         stats.parked_full_buffer_bytes.add(self.block_size);
@@ -645,7 +718,8 @@ pub const Table = struct {
         stats.parked_full_buffer_bytes.add(self.block_size);
         ext.deinit(self.gpa);
         e.repr = .{ .full = cell };
-        _ = self.extents.fetchSub(1, .monotonic);
+        _ = self.extents.fetchSub(1, .release);
+        self.lowerPresence(e.key.ino, false, true);
         e.coverage.setFull(self.block_size);
         e.seed = .seeded;
         e.content_valid = true;
@@ -694,6 +768,8 @@ pub const Table = struct {
             stats.active_block_table_full.fire("entry table full below the extent cap");
             return null;
         };
+        // Raised before the presence stripes (their `acq_rel` orders it
+        // ahead of the insert): `hasExtentOf` reads it first.
         _ = self.extents.fetchAdd(1, .monotonic);
         const e = &self.entries[idx];
         const now = clock.monotonicNs();
@@ -709,6 +785,7 @@ pub const Table = struct {
             .last_touch_ns = now,
             .in_use = true,
         };
+        self.raisePresence(ino, true);
         self.index.putAssumeCapacity(key, e);
         _ = self.count.fetchAdd(1, .monotonic);
         stats.parked_buffers.add(1);
@@ -831,7 +908,9 @@ pub const Table = struct {
         self.lock.lock();
         defer self.lock.unlock();
         _ = self.index.remove(e.key);
+        const was_extent = e.repr == .extent;
         self.releaseRepr(e);
+        self.lowerPresence(e.key.ino, true, was_extent);
         e.in_use = false;
         const idx: u32 = @intCast((@intFromPtr(e) - @intFromPtr(self.entries.ptr)) / @sizeOf(Entry));
         self.free.appendAssumeCapacity(idx);
@@ -839,15 +918,15 @@ pub const Table = struct {
         stats.parked_buffers.sub(1);
     }
 
-    /// Every parked key of `ino` (fsync/release/truncate walks).
     /// Whether any block of `ino` is parked (or uploading) — the no-open
-    /// FLUSH's try-only probe (decision 0003 §AF); O(1) on an empty table,
-    /// else the `blocksOf` scan under the spin lock.
+    /// FLUSH's try-only probe (decision 0003 §AF); one load when the ino's
+    /// presence stripe is clear, else the scan under the spin lock.
     pub fn holdsIno(self: *Table, ino: u64) bool {
-        // Monotonic suffices: a write's checkout increments under the lock
-        // before its ACK, and the probe's FLUSH reaches here after that ACK
-        // through the open table's stripe lock (`flushBegin`).
-        if (self.count.load(.monotonic) == 0) return false;
+        // A write's checkout raises the stripe under the lock before its
+        // ACK, and the probe's FLUSH reaches here after that ACK through
+        // the open table's stripe lock (`flushBegin`).
+        if (!self.mayHoldIno(ino)) return false;
+        stats.parked_ino_scans.inc();
         self.lock.lock();
         defer self.lock.unlock();
         var it = self.index.keyIterator();
@@ -895,7 +974,8 @@ pub const Table = struct {
     /// The lowest block `ino` holds parked (the ordered law's floor,
     /// `WritePath.custodyFloor`).
     pub fn lowestBlockOf(self: *Table, ino: u64) ?u32 {
-        if (self.count.load(.monotonic) == 0) return null;
+        if (!self.mayHoldIno(ino)) return null;
+        stats.parked_ino_scans.inc();
         self.lock.lock();
         defer self.lock.unlock();
         var low: ?u32 = null;
@@ -1777,6 +1857,76 @@ test "derivations: the table's entries = the pool's cells + the extent cap (= th
     defer t.deinit();
     try testing.expectEqual(@as(usize, 16), t.entries.len);
     try testing.expectEqual(@as(u32, 8), t.extent_cap);
+}
+
+test "derivations: the presence stripes = the power of two at or above 4 × the entries" {
+    try testing.expectEqual(@as(u64, 4), presenceStripes(0));
+    try testing.expectEqual(@as(u64, 4), presenceStripes(1));
+    try testing.expectEqual(@as(u64, 64), presenceStripes(16));
+    try testing.expectEqual(@as(u64, 128), presenceStripes(17));
+    try testing.expectEqual(@as(u64, 16384), presenceStripes(activeBlockEntries(parkedCapBuffers(76 * derive.GiB, 4 * derive.MiB))));
+    var t = try Table.init(testing.allocator, @intCast(wt.BS), 8);
+    defer t.deinit();
+    try testing.expectEqual(@as(usize, 64), t.presence.len);
+    try testing.expectEqual(@as(usize, 64), t.extent_presence.len);
+}
+
+test "the per-ino presence stripes: a read's custody probes (`has`, `hasExtentOf`, `holdsIno`) of an ino with no parked entry never take the lock or scan the index; an entry on the ino's stripe is found by the locked lookup; an extent entry scans `hasExtentOf` and a full one does not; the escalation clears the extent stripe, the retire both" {
+    var t = try Table.init(testing.allocator, @intCast(wt.BS), 4);
+    defer t.deinit();
+    const ino: u64 = 7;
+    // A second ino whose stripe differs (the probe's cold case) and a
+    // third sharing the first's stripe (the maybe the lookup settles).
+    var other: u64 = 100;
+    while (t.stripeOf(other) == t.stripeOf(ino)) other += 1;
+    var twin: u64 = 1000;
+    while (t.stripeOf(twin) != t.stripeOf(ino)) twin += 1;
+    const scans0 = stats.parked_ino_scans.load();
+    // Empty: no probe scans.
+    try testing.expect(!t.has(ino, 0));
+    try testing.expect(!t.hasExtentOf(ino));
+    try testing.expect(!t.holdsIno(ino));
+    try testing.expect(t.lowestBlockOf(ino) == null);
+    try testing.expectEqual(scans0, stats.parked_ino_scans.load());
+    // A full buffer on `ino`: its own probes find it (a scan for the
+    // ino-wide ones, the lookup for `has`); `hasExtentOf` reads the
+    // extent count and never scans; the other ino's probes stay lock-free.
+    const full = t.checkout(ino, 3, false, null).?;
+    try testing.expect(t.has(ino, 3));
+    try testing.expect(!t.has(ino, 4));
+    try testing.expect(t.holdsIno(ino));
+    try testing.expectEqual(@as(?u32, 3), t.lowestBlockOf(ino));
+    try testing.expectEqual(scans0 + 2, stats.parked_ino_scans.load());
+    try testing.expect(!t.hasExtentOf(ino));
+    try testing.expectEqual(scans0 + 2, stats.parked_ino_scans.load());
+    try testing.expect(!t.has(other, 3));
+    try testing.expect(!t.holdsIno(other));
+    try testing.expect(!t.hasExtentOf(other));
+    try testing.expectEqual(scans0 + 2, stats.parked_ino_scans.load());
+    // The twin shares the stripe: a maybe — the scan runs and answers no.
+    try testing.expect(!t.holdsIno(twin));
+    try testing.expectEqual(scans0 + 3, stats.parked_ino_scans.load());
+    // An extent on `ino`: `hasExtentOf` scans and finds it; `other` still
+    // never scans.
+    const x = t.checkoutExtent(ino, 0, false, null).?;
+    try testing.expect(t.hasExtentOf(ino));
+    try testing.expectEqual(scans0 + 4, stats.parked_ino_scans.load());
+    try testing.expect(!t.hasExtentOf(other));
+    try testing.expectEqual(scans0 + 4, stats.parked_ino_scans.load());
+    // Escalated to a full buffer: the extent stripe clears (no scan, no
+    // extent), the presence stays.
+    try testing.expect(t.escalate(x, null) != null);
+    try testing.expect(!t.hasExtentOf(ino));
+    try testing.expectEqual(scans0 + 4, stats.parked_ino_scans.load());
+    try testing.expect(t.has(ino, 0));
+    // Retired: every stripe of the ino clears and the probes are lock-free again.
+    t.retire(x);
+    t.retire(full);
+    try testing.expect(!t.mayHoldIno(ino));
+    try testing.expect(!t.has(ino, 0) and !t.holdsIno(ino) and !t.hasExtentOf(ino));
+    try testing.expectEqual(scans0 + 4, stats.parked_ino_scans.load());
+    for (t.presence) |*s| try testing.expectEqual(@as(u32, 0), s.load(.monotonic));
+    for (t.extent_presence) |*s| try testing.expectEqual(@as(u32, 0), s.load(.monotonic));
 }
 
 test "the pool and the CoW cell: unique mutates in place; a shared cell copies the covered runs into a fresh one and drops the share; the cap refuses; recycled cells return" {

@@ -588,6 +588,8 @@ pub const WritePath = struct {
             .ram_custody_ctx = self,
             .fence = d.fence,
             .fence_ctx = d.fence_ctx,
+            .touched = &touchedStamp,
+            .touched_ctx = self,
         }, device_overlay.registryCapacity(cfg.parked_cap, pipeline.capBytes(d.budget_bytes), cfg.block_size));
         self.view = .{ .table = &self.table, .overlay = &self.overlay, .epochs = &self.epochs, .locks = &self.locks, .device = d.device };
         return self;
@@ -2760,7 +2762,7 @@ test "the save window: while an epoch's ONE save is in flight the block stays bo
     try testing.expectEqual(@as(u64, 2), w.f.alloc_a.usedBlocks() + w.f.alloc_b.usedBlocks());
 }
 
-test "the one-authority screen never parks under (3): a write meeting an overlay record whose settle keeps failing drops the block guard for the settle's ladder (a sibling takes the guard mid-ladder) and restarts its ladder once the record landed — the write acks, the record published" {
+test "the one-authority screen never parks under (3): a write meeting an overlay record whose settle keeps failing drops the block guard for the settle's ladder (a sibling takes the guard mid-ladder) and restarts its ladder once the record landed — the write acks, the record fed to the epoch whose save publishes it" {
     const io = testing.io;
     const w = try World.init(testing.allocator, .sync_inline, true);
     defer w.deinit(testing.allocator);
@@ -2773,7 +2775,7 @@ test "the one-authority screen never parks under (3): a write meeting an overlay
     try testing.expectEqual(@as(u32, 1), o1.count(.overlay));
     w.f.dev.setFailWrites(std.math.maxInt(u32), error.InputOutput);
     const r0 = device_overlay.stats.overlay_settle_retries.load();
-    const pub0 = device_overlay.stats.overlay_publishes.load();
+    const feeds0 = device_overlay.stats.overlay_epoch_feeds.load();
     // A page-misaligned piece: overlay-ineligible, patch-ineligible — it
     // reaches the one-authority screen and must settle the record first.
     const Writer = struct {
@@ -2803,12 +2805,16 @@ test "the one-authority screen never parks under (3): a write meeting an overlay
     try testing.expect(taken);
     const o2 = outcome orelse return error.TestUnexpectedResult;
     try testing.expectEqual(@as(u64, PAGE + 12), o2.written);
-    try testing.expectEqual(pub0 + 1, device_overlay.stats.overlay_publishes.load());
+    // The record landed as a FEED (a fresh block rides the epoch); the
+    // epoch shadows the block until its save.
+    try testing.expectEqual(feeds0 + 1, device_overlay.stats.overlay_epoch_feeds.load());
+    try testing.expectEqual(@as(u32, 0), w.wp.overlay.registry.open_count.load(.monotonic));
+    try testing.expect(w.wp.epochs.bindsBlock(70, 0));
+    try testing.expect(w.wp.epochs.close(io, 70, w.wp.closeSeams()) == .swapped);
     const b = w.f.map.seam().lookup(70, 0) orelse return error.TestUnexpectedResult;
     var got: [wt.BS]u8 = undefined;
     w.f.dev.peek(b.vol_tag, b.offset, &got);
     try testing.expectEqualSlices(u8, &half, got[0 .. wt.BS / 2]);
-    try testing.expectEqual(@as(u32, 0), w.wp.overlay.registry.open_count.load(.monotonic));
 }
 
 /// Half a block (a park, never a write-through) for `(ino, block)`.

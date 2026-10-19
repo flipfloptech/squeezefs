@@ -159,7 +159,11 @@ pub const stats = struct {
     pub var overlay_publishes: counters.ShardedCounter = .{};
     pub var overlay_published_bytes: counters.ShardedCounter = .{};
     pub var overlay_epoch_feeds: counters.ShardedCounter = .{};
-    /// Growth with the shadow lever ON is a bug.
+    /// Of the feeds, the FRESH records (no old binding): named by their
+    /// epoch's save for the first time.
+    pub var overlay_epoch_feeds_fresh: counters.ShardedCounter = .{};
+    /// An overwrite that took the durable arm: growth with the shadow lever
+    /// ON is a bug.
     pub var overlay_feed_fallbacks: counters.ShardedCounter = .{};
     pub var overlay_supersessions: counters.ShardedCounter = .{};
     pub var overlay_superseded_by_merge: counters.ShardedCounter = .{};
@@ -181,7 +185,7 @@ pub const stats = struct {
 
 pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
     try w.print("{{\"overlay_open\":{d},\"overlay_inflight_bytes\":{d},", .{ stats.overlay_open.load(), stats.overlay_inflight_bytes.load() });
-    inline for (.{ "overlay_installs", "overlay_overwrite_installs", "overlay_stores", "overlay_store_bytes", "overlay_overwrite_bytes", "overlay_ack_early_stores", "overlay_ack_early_bytes", "overlay_ack_early_retries", "overlay_short_stores", "overlay_store_fallbacks", "overlay_claim_conflicts", "overlay_governed_stores", "overlay_dma_passthrough_bytes", "overlay_dma_pool_copy_bytes", "overlay_ineligible_sub_cap", "overlay_ineligible_shadow_bound", "overlay_ineligible_range_shared", "overlay_ineligible_ram_custody", "overlay_sub_cap_joins", "overlay_enospc_declines", "overlay_registry_declines", "overlay_unreachable_declines", "overlay_read_serves", "overlay_read_serve_bytes", "overlay_read_gap_serves", "overlay_read_gap_bytes", "overlay_read_drains", "overlay_window_escalations", "overlay_gap_seeds", "overlay_gap_seed_bytes", "overlay_gap_seed_old_bytes", "overlay_gap_seed_ranged_bytes", "overlay_gap_seed_read_bytes", "overlay_publishes", "overlay_published_bytes", "overlay_epoch_feeds", "overlay_feed_fallbacks", "overlay_supersessions", "overlay_superseded_by_merge", "overlay_superseded_dead_old_binding", "overlay_settle_retries", "overlay_teardown_waits", "writeback_orphan_discards_overlay" }) |name| {
+    inline for (.{ "overlay_installs", "overlay_overwrite_installs", "overlay_stores", "overlay_store_bytes", "overlay_overwrite_bytes", "overlay_ack_early_stores", "overlay_ack_early_bytes", "overlay_ack_early_retries", "overlay_short_stores", "overlay_store_fallbacks", "overlay_claim_conflicts", "overlay_governed_stores", "overlay_dma_passthrough_bytes", "overlay_dma_pool_copy_bytes", "overlay_ineligible_sub_cap", "overlay_ineligible_shadow_bound", "overlay_ineligible_range_shared", "overlay_ineligible_ram_custody", "overlay_sub_cap_joins", "overlay_enospc_declines", "overlay_registry_declines", "overlay_unreachable_declines", "overlay_read_serves", "overlay_read_serve_bytes", "overlay_read_gap_serves", "overlay_read_gap_bytes", "overlay_read_drains", "overlay_window_escalations", "overlay_gap_seeds", "overlay_gap_seed_bytes", "overlay_gap_seed_old_bytes", "overlay_gap_seed_ranged_bytes", "overlay_gap_seed_read_bytes", "overlay_publishes", "overlay_published_bytes", "overlay_epoch_feeds", "overlay_epoch_feeds_fresh", "overlay_feed_fallbacks", "overlay_supersessions", "overlay_superseded_by_merge", "overlay_superseded_dead_old_binding", "overlay_settle_retries", "overlay_teardown_waits", "writeback_orphan_discards_overlay" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, @field(stats, name).load() });
     }
     inline for (.{ "overlay_fence_drops", "overlay_unpublished_at_fsync", "overlay_ack_early_lost", "overlay_teardown_wait_overlong", "overlay_teardown_nonterminal", "overlay_install_race_under_guard", "overlay_store_superseded_under_guard", "overlay_state_word_corrupt", "overlay_registry_full" }, 0..) |name, i| {
@@ -665,6 +669,12 @@ pub const Deps = struct {
     /// as the fence instead of retrying forever (generic/475).
     fence: ?*const fn (ctx: ?*anyopaque) bool = null,
     fence_ctx: ?*anyopaque = null,
+    /// fsync's touched word (`fsync.TouchedTable.stampOrdinal`, the same
+    /// hook the uploads and W1 stamp): the ino touched the dest's
+    /// namespace at the settle, so the data barrier before the epoch's
+    /// save covers a fed block.
+    touched: ?*const fn (ctx: ?*anyopaque, ino: u64, ordinal: u32) void = null,
+    touched_ctx: ?*anyopaque = null,
 };
 
 /// The payload's stability class at mint (the §3.4 stability law).
@@ -754,10 +764,10 @@ pub const StoreError = error{ InputOutput, VolumeFailed, WriterGuardFenced, OutO
 
 pub const SettleOutcome = union(enum) {
     published,
-    /// FED into the rewrite epoch; `coverage_complete` is the close-owed
-    /// HINT (latency/economy, never correctness — the idle sweep and the
-    /// next fsync are the backstops).
-    fed: struct { coverage_complete: bool },
+    /// FED into the rewrite epoch; `close_owed` is the close-owed HINT
+    /// (latency/economy, never correctness — the write-back timer, the
+    /// idle sweep and the next fsync are the backstops).
+    fed: struct { close_owed: bool },
     superseded,
     already_terminal,
 };
@@ -1170,7 +1180,7 @@ pub const Overlay = struct {
             },
         };
         return .{ .settled = switch (out) {
-            .fed => |f| f.coverage_complete,
+            .fed => |f| f.close_owed,
             .published, .superseded, .already_terminal => false,
         } };
     }
@@ -1287,20 +1297,30 @@ pub const Overlay = struct {
         const min_size: u64 = if (app_complete) (@as(u64, rec.key.block) + 1) * bs else 0;
         const covered_app_bytes = rec.core.union_.coveredBytes();
         const proof: seams.DmaProof = .{ .vol_tag = new_key.vol_tag, .offset = new_key.offset, .len = bs, .completed_ns = clock.monotonicNs() };
-        if (rec.old_binding) |old| {
-            // Arm (a) FEED: the fsck guard travels record → epoch (continuous
-            // C2/C3 visibility).
+        // The ino touched the dest's namespace: fsync's data barrier
+        // (planned from the touched word) covers a fed block before the
+        // save names it.
+        if (self.deps.touched) |t| t(self.deps.touched_ctx, rec.key.ino, rec.ordinal);
+        {
+            // Arm (a) FEED — an overwrite (`old_binding`: the displaced key
+            // parks) and a FRESH record alike (`write_epoch` module doc: the
+            // save names a fresh block for the first time; the reference
+            // published it per block). The fsck guard travels record →
+            // epoch (continuous C2/C3 visibility).
             const guard = rec.fsck_guard.?;
             rec.fsck_guard = null;
-            const v = self.deps.epochs.record(rec.key.ino, rec.key.block, old, new_key, proof, min_size, guard, true) catch |e| switch (e) {
+            const v = self.deps.epochs.record(rec.key.ino, rec.key.block, rec.old_binding, new_key, proof, min_size, guard, true) catch |e| switch (e) {
                 error.OutOfMemory => return error.OutOfMemory,
             };
             switch (v) {
                 .shadowed => |s| {
                     if (s.displaced_prev) |d| self.deps.purge.purge(d);
-                    epoch_mod.stats.rewrite_blocks.inc();
-                    epoch_mod.stats.rewrite_user_bytes.add(covered_app_bytes);
-                    epoch_mod.stats.rewrite_device_write_bytes.add(bs);
+                    if (rec.old_binding != null) {
+                        // The `rewrite_amp` SLO is the overwrite's alone.
+                        epoch_mod.stats.rewrite_blocks.inc();
+                        epoch_mod.stats.rewrite_user_bytes.add(covered_app_bytes);
+                        epoch_mod.stats.rewrite_device_write_bytes.add(bs);
+                    } else stats.overlay_epoch_feeds_fresh.inc();
                     if (!rec.core.markFed()) {
                         // A guard-less discarding belt superseded the record
                         // post-freeze: disarm — never free the epoch's live B.
@@ -1308,7 +1328,7 @@ pub const Overlay = struct {
                     }
                     stats.overlay_epoch_feeds.inc();
                     self.teardown(rec);
-                    return .{ .fed = .{ .coverage_complete = s.coverage_complete } };
+                    return .{ .fed = .{ .close_owed = s.close_owed } };
                 },
                 .not_shadowed => {
                     // The guard was consumed by the epoch; the durable arm
@@ -1325,7 +1345,8 @@ pub const Overlay = struct {
                 },
             }
         }
-        // The durable-merge arm (fresh records + the shadow-off degenerate).
+        // The durable-merge arm (the shadow-off degenerate and the width's
+        // fallback).
         var displaced: seams.MergeOutcome = .{};
         while (true) {
             const token = @max(self.deps.map.currentFencing(rec.key.ino), rec.fence_token);
@@ -1787,7 +1808,7 @@ test "fresh_block_segments_ride_the_overlay_and_publish_at_completion: two disjo
     try testing.expect(w.f.alloc_a.fillIncarnation(w.f.alloc_a.idxOf(bound.offset)) != null); // published (stable)
 }
 
-test "partial_overlay_fsync_seeds_zeros_and_publishes_whole_block; open_overlay_reads_serve_acked_bytes_and_zero_gaps; the fsync sequence runs FREEZE → COMPLETE → SEED → FLUSH → PUBLISH with the barrier before the merge" {
+test "partial_overlay_fsync_seeds_zeros_and_publishes_whole_block; open_overlay_reads_serve_acked_bytes_and_zero_gaps; the fsync sequence runs FREEZE → COMPLETE → SEED → FLUSH → FEED with the barrier before the epoch's ONE save (the fsync's close)" {
     const io = testing.io;
     const w = try TestWorld.init(testing.allocator, .{});
     defer w.deinit(testing.allocator);
@@ -1798,6 +1819,7 @@ test "partial_overlay_fsync_seeds_zeros_and_publishes_whole_block; open_overlay_
     _ = try w.ov.store(io, .{ .ino = 41, .block = 0, .rel = wt.BS / 4, .vehicle = .{ .bytes = &p }, .file = TestWorld.striped(0), .overwrite = false });
     w.f.dev.resetLedger();
     const seeds0 = stats.overlay_gap_seeds.load();
+    const fresh0 = stats.overlay_epoch_feeds_fresh.load();
     const left = w.ov.drainForIno(io, &w.locks, 41, std.math.maxInt(u64), true, w.cs());
     try testing.expectEqual(@as(u32, 0), left);
     try testing.expectEqual(seeds0 + 2, stats.overlay_gap_seeds.load()); // the gap before and after
@@ -1806,6 +1828,12 @@ test "partial_overlay_fsync_seeds_zeros_and_publishes_whole_block; open_overlay_
     try testing.expectEqual(wt.FakeDevice.Event.write, tr[0]);
     try testing.expectEqual(wt.FakeDevice.Event.write, tr[1]);
     try testing.expectEqual(wt.FakeDevice.Event.flush, tr[2]);
+    // The fresh record FED the epoch (no per-block publish); fsync's META
+    // PUBLISH is the epoch's close.
+    try testing.expectEqual(fresh0 + 1, stats.overlay_epoch_feeds_fresh.load());
+    try testing.expectEqual(@as(usize, 0), w.f.map.merges.items.len);
+    try testing.expect(w.epochs.bindsBlock(41, 0));
+    try testing.expect(w.epochs.close(io, 41, w.cs()) == .swapped);
     try testing.expectEqual(@as(usize, 1), w.f.map.merges.items.len);
     // Seeded zeros were never app-written: SIZE NEVER LEADS DATA — min_size 0.
     try testing.expectEqual(@as(u64, 0), w.f.map.merges.items[0].min_size);
@@ -1818,7 +1846,7 @@ test "partial_overlay_fsync_seeds_zeros_and_publishes_whole_block; open_overlay_
     try testing.expectEqual(unpub0, counters.tripwireCount("overlay_unpublished_at_fsync"));
 }
 
-test "the fsync drain covers EVERY open record of the ino, however many: 70 blocks each with an open record (more than one enumeration page) all publish, none left (repro-port: LTP fs_fill — xfs on a loop device over a 300 MiB file — fired overlay_unpublished_at_fsync five times)" {
+test "the fsync drain covers EVERY open record of the ino, however many: 70 blocks each with an open record (more than one enumeration page) all feed the epoch, none left, and the epoch's ONE save names all 70 in one merge (repro-port: LTP fs_fill — xfs on a loop device over a 300 MiB file — fired overlay_unpublished_at_fsync five times)" {
     const io = testing.io;
     const w = try TestWorld.init(testing.allocator, .{ .blocks = 160, .registry_capacity = 96 });
     defer w.deinit(testing.allocator);
@@ -1837,6 +1865,12 @@ test "the fsync drain covers EVERY open record of the ino, however many: 70 bloc
     try testing.expectEqual(@as(u32, 0), left);
     try testing.expectEqual(@as(u32, 0), w.ov.registry.open_count.load(.monotonic));
     try testing.expectEqual(unpub0, counters.tripwireCount("overlay_unpublished_at_fsync"));
+    b = 0;
+    while (b < n) : (b += 1) try testing.expect(w.epochs.bindsBlock(44, b));
+    try testing.expectEqual(@as(usize, 0), w.f.map.merges.items.len);
+    try testing.expect(w.epochs.close(io, 44, w.cs()) == .swapped);
+    try testing.expectEqual(@as(usize, 1), w.f.map.merges.items.len);
+    try testing.expectEqual(@as(u8, n), w.f.map.merges.items[0].blocks);
     b = 0;
     while (b < n) : (b += 1) try testing.expect(w.f.map.seam().lookup(44, b) != null);
 }

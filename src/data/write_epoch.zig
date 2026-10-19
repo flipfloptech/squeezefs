@@ -6,16 +6,30 @@
 //! §5.4). PORTABLE: a per-ino RAM record under its own spin lock; the ONE
 //! save is the map authority's `merge` (one tx) run by `close`.
 //!
-//! Close triggers (KD-1.6): full coverage (`shadow.len × bs ≥ size`), fsync /
-//! flush (before the meta barrier), RELEASE, shape-change ops (truncate,
-//! punch, spill/promotion, clone, setattr size), the ENOSPC early-close
-//! generalized to the one allocation act (`closeAllForSpace`, the
-//! `enospc.PressureSupplyHook`), idle `EPOCH_IDLE_HORIZON_MS`, fence /
-//! unmount. Supersession coherence (KD-1.11): every durable publish of a
-//! shadowed index evicts `shadow[b]` (`supersede`) — the 2026-08-04 C2Lost/
-//! C2Leaked/C3 resurrection fix. The epoch-close venue law: `close` is never
-//! called under a block guard (3) — the guard-dropping caller acts on the
-//! close-owed hint.
+//! Close triggers (KD-1.6): full coverage (`shadow.len × bs ≥ size`), the
+//! shadow at the save's close width (`CLOSE_WIDTH`, below), fsync / flush
+//! (before the meta barrier), RELEASE, shape-change ops (truncate, punch,
+//! spill/promotion, clone, setattr size), the ENOSPC early-close generalized
+//! to the one allocation act (`closeAllForSpace`, the
+//! `enospc.PressureSupplyHook`), the write-back timer within `T_wb`, idle
+//! `EPOCH_IDLE_HORIZON_MS`, fence / unmount. Supersession coherence
+//! (KD-1.11): every durable publish of a shadowed index evicts `shadow[b]`
+//! (`supersede`) — the 2026-08-04 C2Lost/C2Leaked/C3 resurrection fix. The
+//! epoch-close venue law: `close` is never called under a block guard (3) —
+//! the guard-dropping caller acts on the close-owed hint.
+//!
+//! A FRESH block rides the epoch too (`prev == null`: nothing parked, the
+//! save names it for the first time — `docs/evidence/rung-10-fresh-file-
+//! publish.md`). The reference fed only overwrites (its epoch exists to park
+//! displaced keys; a fresh record took the per-block durable publish), so a
+//! file laid down for the first time journaled its whole inline map once per
+//! block: 768 records of up to 37 KiB for a 3 GiB file. The save is the
+//! coalescing unit for both: one publish per close width, the layout record
+//! written once per window instead of once per block. The durability law is
+//! unchanged — an acked write lands within `T_wb` (decision 0003 §AJ) or at
+//! fsync, whole or absent, and the size claim journals only up to the
+//! custody floor (`write_admit.custodyFloor`: 0 while an epoch holds the
+//! ino), so the durable size never names a block the save has not landed.
 //!
 //! The save's visibility law (the 2026-10-07 lost overwrite): an epoch
 //! whose ONE save is in flight stays VISIBLE — `bindsBlock` keeps W1 and
@@ -54,12 +68,40 @@ pub const Binding = seams.Binding;
 pub const METADATA_CACHE_TTI_MS: u64 = 300 * std.time.ms_per_s;
 pub const EPOCH_IDLE_HORIZON_MS: u64 = METADATA_CACHE_TTI_MS / 10;
 
+/// The close width: the distinct block whose record owes the close (the
+/// `close_owed` hint, acted on by the guard-dropping caller) — HALF the ONE
+/// save's width (`MergeOutcome.max_displaced`, derived from the journal's
+/// entry cap). Half, not the width itself: a stream keeps recording while
+/// the closed epoch's save is in flight, and `record` bounds the open
+/// shadow UNITED with the saving one at the width (a transient save folds
+/// the two — `reregister` — and the fold must fit one save), so an epoch
+/// closed at the full width would park every record behind its save
+/// (`save_in_flight`) and one closed at half leaves the next epoch the
+/// other half: the save lands within the time the stream takes to fill it
+/// (a few ms against ~40 ms at 2,800 blocks/s per file). Before this hint
+/// the timer's cadence alone closed a streaming epoch, so a stream faster
+/// than the width per cadence (213 blocks per 50–78 ms) paid the per-block
+/// publish for the rest of the window (`rewrite_shadow_fallbacks`: 7.8 % of
+/// the blocks of a 47 GB/s overwrite).
+pub const CLOSE_WIDTH: usize = seams.MergeOutcome.max_displaced / 2;
+
+comptime {
+    // Two width-closed epochs fold into one save.
+    std.debug.assert(2 * CLOSE_WIDTH <= seams.MergeOutcome.max_displaced);
+    std.debug.assert(CLOSE_WIDTH >= 2);
+}
+
 pub const stats = struct {
     pub var rewrite_shadow_open_epochs: counters.Gauge = .{};
     pub var rewrite_shadow_parked_bytes: counters.Gauge = .{};
     pub var rewrite_shadow_swaps: counters.ShardedCounter = .{};
     pub var rewrite_shadow_bytes: counters.ShardedCounter = .{};
     pub var rewrite_shadow_fallbacks: counters.ShardedCounter = .{};
+    /// Records with no key to displace: a fresh block named by its save for
+    /// the first time (module doc).
+    pub var rewrite_shadow_fresh_records: counters.ShardedCounter = .{};
+    /// Records that owed the close at `CLOSE_WIDTH`.
+    pub var rewrite_shadow_width_hints: counters.ShardedCounter = .{};
     pub var rewrite_shadow_close_retries: counters.ShardedCounter = .{};
     /// A close that parked on the ino's running save (closes serialize).
     pub var rewrite_shadow_close_waits: counters.ShardedCounter = .{};
@@ -82,7 +124,7 @@ pub const stats = struct {
 
 pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
     try w.print("{{\"rewrite_shadow_open_epochs\":{d},\"rewrite_shadow_parked_bytes\":{d},", .{ stats.rewrite_shadow_open_epochs.load(), stats.rewrite_shadow_parked_bytes.load() });
-    inline for (.{ "rewrite_shadow_swaps", "rewrite_shadow_bytes", "rewrite_shadow_fallbacks", "rewrite_shadow_close_retries", "rewrite_shadow_close_waits", "rewrite_shadow_save_waits", "rewrite_shadow_superseded", "rewrite_shadow_pressure_closes", "rewrite_shadow_orphan_discards", "rewrite_shadow_idle_closes", "rewrite_blocks", "rewrite_user_bytes", "rewrite_device_write_bytes" }) |name| {
+    inline for (.{ "rewrite_shadow_swaps", "rewrite_shadow_bytes", "rewrite_shadow_fallbacks", "rewrite_shadow_fresh_records", "rewrite_shadow_width_hints", "rewrite_shadow_close_retries", "rewrite_shadow_close_waits", "rewrite_shadow_save_waits", "rewrite_shadow_superseded", "rewrite_shadow_pressure_closes", "rewrite_shadow_orphan_discards", "rewrite_shadow_idle_closes", "rewrite_blocks", "rewrite_user_bytes", "rewrite_device_write_bytes" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, @field(stats, name).load() });
     }
     try w.print("\"rewrite_shadow_fence_drops\":{d},\"rewrite_shadow_displaced_drift\":{d},\"rewrite_shadow_save_overflow\":{d}}}", .{ counters.tripwireCount("rewrite_shadow_fence_drops"), counters.tripwireCount("rewrite_shadow_displaced_drift"), counters.tripwireCount("rewrite_shadow_save_overflow") });
@@ -144,7 +186,12 @@ fn shadowUnion(open: ?*const Epoch, closing: ?*const Epoch) usize {
 }
 
 pub const RecordVerdict = union(enum) {
-    shadowed: struct { displaced_prev: ?Binding, coverage_complete: bool },
+    /// `close_owed`: the close-owed hint for the guard-dropping caller —
+    /// the shadow covers the file (KD-1.6) or this record is the epoch's
+    /// `CLOSE_WIDTH`-th distinct block (once per epoch: the record that
+    /// reaches the width, so one close call per window, never one per
+    /// block past it).
+    shadowed: struct { displaced_prev: ?Binding, close_owed: bool },
     /// The ino's layout is not striped (a promotion in flight), or the
     /// epoch already shadows `MergeOutcome.max_displaced` other blocks (the
     /// ONE save's size) and no save is in flight: the caller takes the
@@ -347,14 +394,18 @@ pub const Epochs = struct {
             e.displaced.appendAssumeCapacity(.{ .block = block, .origin = if (own_prev != null) .epoch else .map, .binding = d });
             e.parked_bytes += self.block_size;
             stats.rewrite_shadow_parked_bytes.add(self.block_size);
-        }
+        } else stats.rewrite_shadow_fresh_records.inc();
         e.shadow.putAssumeCapacity(block, .{ .binding = new, .proof = proof });
         e.guards.appendAssumeCapacity(guard);
         e.recorded_bytes += self.block_size;
         e.min_size = @max(e.min_size, min_size);
         e.last_record_ns = clock.monotonicNs();
         const coverage_complete = e.shadow.count() * self.block_size >= min_size and min_size != 0;
-        return .{ .shadowed = .{ .displaced_prev = displaced_prev, .coverage_complete = coverage_complete } };
+        // A distinct block grew the shadow (`own_prev == null`): the one
+        // that reaches the close width owes the close.
+        const at_width = own_prev == null and e.shadow.count() == CLOSE_WIDTH;
+        if (at_width) stats.rewrite_shadow_width_hints.inc();
+        return .{ .shadowed = .{ .displaced_prev = displaced_prev, .close_owed = coverage_complete or at_width } };
     }
 
     /// KD-1.11: a durable publish of `(ino, block)` → `published` outside
@@ -711,7 +762,7 @@ test "epoch_records_are_ram_only_until_the_one_save_swap; full_coverage_auto_clo
     const b1 = Binding.wholeBlock(wt.VOL_A, m1.offset, m1.stamp);
     const v0 = try ep.record(10, 0, a0, b0, proofFor(b0, wt.BS), 2 * wt.BS, block_alloc.InflightAllocGuard.register(f.alloc_a, m0.idx), true);
     try testing.expect(v0.shadowed.displaced_prev.?.eql(a0));
-    try testing.expect(!v0.shadowed.coverage_complete);
+    try testing.expect(!v0.shadowed.close_owed);
     try testing.expectEqual(@as(usize, 1), ep.openCount());
     try testing.expect(ep.bindsBlock(10, 0));
     try testing.expect(!ep.bindsBlock(10, 1));
@@ -722,7 +773,7 @@ test "epoch_records_are_ram_only_until_the_one_save_swap; full_coverage_auto_clo
     try testing.expectEqual(@as(usize, 0), f.frees.freed.items.len);
     try testing.expect(f.alloc_a.inflightContains(m0.idx));
     const v1 = try ep.record(10, 1, a1, b1, proofFor(b1, wt.BS), 2 * wt.BS, block_alloc.InflightAllocGuard.register(f.alloc_a, m1.idx), true);
-    try testing.expect(v1.shadowed.coverage_complete); // the close-owed hint
+    try testing.expect(v1.shadowed.close_owed); // the close-owed hint (full coverage)
     try testing.expectEqual(parked0 + 2 * wt.BS, stats.rewrite_shadow_parked_bytes.load());
     const cs: Epochs.CloseSeams = .{ .map = f.map.seam(), .free = f.frees.seam(), .purge = .none };
     const out = ep.close(io, 10, cs);
@@ -1386,6 +1437,130 @@ test "record is all or nothing: an allocation failure at any of its reservations
         try testing.expectEqual(@as(usize, 0), ep.openCount());
         try testing.expectEqual(open0, stats.rewrite_shadow_open_epochs.load());
     }
+}
+
+test "tie: the close width is half the ONE save's width (106 of 213), so two width-closed epochs fold into one save; the fold of a width-closed epoch with the half the stream filled under its save fits the cap exactly" {
+    try testing.expectEqual(@as(usize, 106), CLOSE_WIDTH);
+    try testing.expectEqual(seams.MergeOutcome.max_displaced / 2, CLOSE_WIDTH);
+    try testing.expect(2 * CLOSE_WIDTH <= seams.MergeOutcome.max_displaced);
+    // The room left under a saving width-closed epoch: the other half plus
+    // the odd block — a stream records that many before any wait.
+    try testing.expectEqual(@as(usize, 107), seams.MergeOutcome.max_displaced - CLOSE_WIDTH);
+}
+
+test "a FRESH stream rides the epoch and the close width owes ONE close per window: 2 × CLOSE_WIDTH + 5 fresh records (prev null, nothing parked) hint the close exactly at the width's record of each epoch and nowhere else past block 0's own coverage, each close is one merge of the width, and the final close lands the rest — ⌈N ÷ width⌉ + 1 saves, every block named, nothing freed" {
+    const io = testing.io;
+    const n: u32 = @intCast(2 * CLOSE_WIDTH + 5);
+    const f = try wt.Fixture.init(testing.allocator, n + 8);
+    defer f.deinit();
+    var ep = Epochs.init(testing.allocator, wt.BS, true);
+    defer ep.deinit();
+    const cs: Epochs.CloseSeams = .{ .map = f.map.seam(), .free = f.frees.seam(), .purge = .none };
+    try f.map.create(95, .striped, 0);
+    const fresh0 = stats.rewrite_shadow_fresh_records.load();
+    const hints0 = stats.rewrite_shadow_width_hints.load();
+    const parked0 = stats.rewrite_shadow_parked_bytes.load();
+    var hinted: std.ArrayList(u32) = .empty;
+    defer hinted.deinit(testing.allocator);
+    var block: u32 = 0;
+    while (block < n) : (block += 1) {
+        const m = try f.alloc_a.allocateBlock();
+        const b = Binding.wholeBlock(wt.VOL_A, m.offset, m.stamp);
+        // A sequential lay-down: every block complete, its size floor the block's end.
+        const v = try ep.record(95, block, null, b, proofFor(b, wt.BS), (@as(u64, block) + 1) * wt.BS, block_alloc.InflightAllocGuard.register(f.alloc_a, m.idx), true);
+        try testing.expect(v == .shadowed);
+        try testing.expect(v.shadowed.displaced_prev == null);
+        if (v.shadowed.close_owed) {
+            try hinted.append(testing.allocator, block);
+            // The guard-dropping caller's close: one merge of the epoch.
+            try testing.expect(ep.close(io, 95, cs) == .swapped);
+        }
+    }
+    try testing.expectEqual(parked0, stats.rewrite_shadow_parked_bytes.load());
+    try testing.expectEqual(fresh0 + n, stats.rewrite_shadow_fresh_records.load());
+    // Block 0 trips the coverage hint of a file growing from 0 (one block
+    // shadowed, the floor one block); then exactly the width's record of
+    // each epoch: blocks 1..106 close at 106, 107..212 at 212.
+    const width: u32 = @intCast(CLOSE_WIDTH);
+    try testing.expectEqualSlices(u32, &.{ 0, width, 2 * width }, hinted.items);
+    try testing.expectEqual(hints0 + 2, stats.rewrite_shadow_width_hints.load());
+    try testing.expectEqual(@as(usize, 3), f.map.merges.items.len);
+    try testing.expectEqual(@as(u8, 1), f.map.merges.items[0].blocks);
+    try testing.expectEqual(@as(u8, width), f.map.merges.items[1].blocks);
+    try testing.expectEqual(@as(u8, width), f.map.merges.items[2].blocks);
+    // The tail (4 blocks) waits for the next trigger: the final close.
+    try testing.expectEqual(@as(usize, 1), ep.openCount());
+    try testing.expect(ep.close(io, 95, cs) == .swapped);
+    try testing.expectEqual(@as(usize, 4), f.map.merges.items.len);
+    try testing.expectEqual(@as(u8, n - 1 - 2 * width), f.map.merges.items[3].blocks);
+    try testing.expectEqual(@as(usize, (n + CLOSE_WIDTH - 1) / CLOSE_WIDTH + 1), f.map.merges.items.len);
+    block = 0;
+    while (block < n) : (block += 1) try testing.expect(f.map.seam().lookup(95, block) != null);
+    try testing.expectEqual(@as(usize, 0), f.frees.freed.items.len);
+    try testing.expectEqual(@as(u64, n * wt.BS), f.map.seam().view(95).?.size);
+}
+
+test "the width hint fires once per epoch: a re-record of a shadowed block at the width grows nothing and owes nothing; the record that reaches the width under a save in flight owes the close, and that close waits the save out then lands the epoch whole" {
+    const io = testing.io;
+    const f = try wt.Fixture.init(testing.allocator, 2 * seams.MergeOutcome.max_displaced + 8);
+    defer f.deinit();
+    var ep = Epochs.init(testing.allocator, wt.BS, true);
+    defer ep.deinit();
+    const cs: Epochs.CloseSeams = .{ .map = f.map.seam(), .free = f.frees.seam(), .purge = .none };
+    try f.map.create(96, .striped, 0);
+    const width: u32 = @intCast(CLOSE_WIDTH);
+    var block: u32 = 1;
+    while (block < width) : (block += 1) {
+        const m = try f.alloc_a.allocateBlock();
+        const b = Binding.wholeBlock(wt.VOL_A, m.offset, m.stamp);
+        const v = try ep.record(96, block, null, b, proofFor(b, wt.BS), 0, block_alloc.InflightAllocGuard.register(f.alloc_a, m.idx), true);
+        try testing.expect(!v.shadowed.close_owed);
+    }
+    // The width-th distinct block owes the close; a rewrite of it does not.
+    const m = try f.alloc_a.allocateBlock();
+    const b = Binding.wholeBlock(wt.VOL_A, m.offset, m.stamp);
+    try testing.expect((try ep.record(96, width, null, b, proofFor(b, wt.BS), 0, block_alloc.InflightAllocGuard.register(f.alloc_a, m.idx), true)).shadowed.close_owed);
+    const m2 = try f.alloc_a.allocateBlock();
+    const b2 = Binding.wholeBlock(wt.VOL_A, m2.offset, m2.stamp);
+    const again = try ep.record(96, width, f.map.seam().lookup(96, width), b2, proofFor(b2, wt.BS), 0, block_alloc.InflightAllocGuard.register(f.alloc_a, m2.idx), true);
+    try testing.expect(again.shadowed.displaced_prev.?.eql(b)); // the intermediate B parked as ours
+    try testing.expect(!again.shadowed.close_owed);
+    // Under the save of this epoch a stream fills the next one to the
+    // width: its width-th record owes the close, and the close parks on
+    // the running save (closes of one ino serialize) then lands.
+    const Racer = struct {
+        var ep_: *Epochs = undefined;
+        var f_: *wt.Fixture = undefined;
+        var owed: ?bool = null;
+        fn hook(_: *anyopaque, _: *wt.RamMap) void {
+            var blk: u32 = width + 1;
+            while (blk <= 2 * width) : (blk += 1) {
+                const mm = f_.alloc_a.allocateBlock() catch unreachable;
+                const bb = Binding.wholeBlock(wt.VOL_A, mm.offset, mm.stamp);
+                const v = ep_.record(96, blk, null, bb, proofFor(bb, wt.BS), 0, block_alloc.InflightAllocGuard.register(f_.alloc_a, mm.idx), true) catch unreachable;
+                std.debug.assert(v == .shadowed);
+                if (blk == 2 * width) owed = v.shadowed.close_owed else std.debug.assert(!v.shadowed.close_owed);
+            }
+        }
+    };
+    Racer.ep_ = &ep;
+    Racer.f_ = f;
+    var dummy: u8 = 0;
+    f.map.before_merge = .{ .ctx = &dummy, .call = &Racer.hook };
+    const waits0 = stats.rewrite_shadow_close_waits.load();
+    try testing.expect(ep.close(io, 96, cs) == .swapped);
+    f.map.before_merge = null;
+    try testing.expectEqual(@as(?bool, true), Racer.owed);
+    try testing.expectEqual(@as(usize, 1), f.map.merges.items.len);
+    try testing.expectEqual(@as(u8, width), f.map.merges.items[0].blocks);
+    // The hinted close of the second epoch (the stream's) lands it whole.
+    try testing.expect(ep.close(io, 96, cs) == .swapped);
+    try testing.expectEqual(@as(usize, 2), f.map.merges.items.len);
+    try testing.expectEqual(@as(u8, width), f.map.merges.items[1].blocks);
+    try testing.expectEqual(waits0, stats.rewrite_shadow_close_waits.load()); // sequential here: no save was running at the second close
+    try testing.expectEqual(@as(usize, 1), f.frees.freed.items.len); // the intermediate B alone
+    try testing.expect(f.frees.freed.items[0].eql(b));
+    try testing.expectEqual(@as(usize, 0), ep.openCount());
 }
 
 test {

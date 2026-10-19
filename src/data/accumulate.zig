@@ -1324,12 +1324,14 @@ pub fn uploadParkedBlock(table: *Table, deps: UploadDeps, io: Io, ino: u64, bloc
             superseded = e.write_epoch != snap.write_epoch;
             const min_size = @as(u64, block) * bs + app_end;
             const striped = if (deps.map.view(ino)) |v| v.kind == .striped else false;
-            // An OVERWRITE displaces the write-side authority's key: the
-            // live map's, or an epoch's shadow (`record` prefers its own
-            // and the saving epoch's) — never the checkout's snapshot.
+            // Every striped block rides the epoch (`write_epoch` module
+            // doc): an OVERWRITE displaces the write-side authority's key —
+            // the live map's, or an epoch's shadow (`record` prefers its
+            // own and the saving epoch's), never the checkout's snapshot —
+            // and a FRESH block parks nothing; a non-striped shape (a
+            // promotion in flight) takes the durable merge.
             const live = deps.map.lookup(ino, block);
-            const overwrite = live != null or deps.epochs.bindsBlock(ino, block);
-            if (overwrite and striped) {
+            if (striped) {
                 const v = deps.epochs.record(ino, block, live, new_key, proof, min_size, fsck_guard, true) catch {
                     mint.abandon();
                     return .stay_parked;
@@ -1339,7 +1341,7 @@ pub fn uploadParkedBlock(table: *Table, deps: UploadDeps, io: Io, ino: u64, bloc
                         if (s.displaced_prev) |d| deps.purge.purge(d);
                         mint.disarm();
                         fed = true;
-                        fed_hint = s.coverage_complete;
+                        fed_hint = s.close_owed;
                     },
                     .not_shadowed => fsck_guard = block_alloc.InflightAllocGuard.register(pm.alloc, pm.minted.idx),
                     .save_in_flight => {
@@ -2121,7 +2123,7 @@ const UploadWorld = struct {
     }
 };
 
-test "write-through of a completed fresh block: 1 copy + 1 DMA, allocate unstable → DMA → publish → revalidate → ONE merge with the app-written size floor; the entry retires; the touched word is stamped; the phase legs sum to total" {
+test "write-through of a completed fresh block: 1 copy + 1 DMA, allocate unstable → DMA → publish → revalidate → the FEED (a fresh block rides the epoch: no per-block merge, nothing parked), the epoch's ONE save with the app-written size floor; the entry retires; the touched word is stamped; the phase legs sum to total" {
     const io = testing.io;
     const w = try UploadWorld.init(testing.allocator);
     defer w.deinit(testing.allocator);
@@ -2132,6 +2134,8 @@ test "write-through of a completed fresh block: 1 copy + 1 DMA, allocate unstabl
     const v = try w.table.recordWrite(e, 0, &data);
     try testing.expect(v.completed);
     const copies0 = stats.nt_copy_bytes.load();
+    const fresh0 = epoch_mod.stats.rewrite_shadow_fresh_records.load();
+    const parked0 = epoch_mod.stats.rewrite_shadow_parked_bytes.load();
     var prof = pipeline.Prof.start();
     const d = uploadParkedBlock(&w.table, w.deps(), io, 5, 1, std.math.maxInt(u64), &prof);
     prof.finish();
@@ -2139,8 +2143,19 @@ test "write-through of a completed fresh block: 1 copy + 1 DMA, allocate unstabl
     try testing.expectEqual(copies0, stats.nt_copy_bytes.load()); // the upload copies nothing more
     try testing.expectEqual(@as(usize, 1), w.f.dev.writes.items.len);
     try testing.expectEqual(@as(u64, wt.BS), w.f.dev.writes.items[0].len);
+    // Fed, not merged: the epoch shadows the block (reads redirect to it),
+    // the map does not name it yet, nothing is parked.
+    try testing.expectEqual(@as(usize, 0), w.f.map.merges.items.len);
+    try testing.expect(w.epochs.bindsBlock(5, 1));
+    try testing.expect(w.f.map.seam().lookup(5, 1) == null);
+    try testing.expectEqual(fresh0 + 1, epoch_mod.stats.rewrite_shadow_fresh_records.load());
+    try testing.expectEqual(parked0, epoch_mod.stats.rewrite_shadow_parked_bytes.load());
+    // The ONE save: one merge with the app-written floor, nothing freed.
+    const frees0 = w.f.frees.freed.items.len;
+    try testing.expect(w.epochs.close(io, 5, .{ .map = w.f.map.seam(), .free = w.f.frees.seam(), .purge = .none }) == .swapped);
     try testing.expectEqual(@as(usize, 1), w.f.map.merges.items.len);
     try testing.expectEqual(@as(u64, 2 * wt.BS), w.f.map.merges.items[0].min_size); // block 1's end
+    try testing.expectEqual(frees0, w.f.frees.freed.items.len);
     const b = w.f.map.seam().lookup(5, 1).?;
     var got: [wt.BS]u8 = undefined;
     w.f.dev.peek(wt.VOL_A, b.offset, &got);
@@ -2319,18 +2334,24 @@ test "the overwrite write-through FEEDS the rewrite epoch (no per-block merge); 
     try testing.expect(w.epochs.bindsBlock(8, 1));
     try testing.expect(w.epochs.close(io, 8, .{ .map = w.f.map.seam(), .free = w.f.frees.seam(), .purge = .none }) == .swapped);
     try testing.expect(!w.f.map.seam().lookup(8, 1).?.eql(a3));
-    // Fence on a fresh block's merge: fence_drop, nothing published, the mint not freed (W5).
+    // Fence on a fresh block's save: the block FEEDS (a fresh block rides
+    // the epoch), its full-coverage hint closes the epoch, and the fenced
+    // save drops it W5 — nothing published, the mint not freed.
     try w.f.map.create(9, .striped, 0);
     const e3 = w.table.checkout(9, 0, false, null).?;
     _ = try w.table.recordWrite(e3, 0, &data);
     w.f.map.fail_next_merge = error.WriterGuardFenced;
     const used = w.f.alloc_a.usedBlocks();
-    pipeline.stats.write_pipeline_fence_drops.resetLogBudgetForTest();
-    log.testing.expectErrorLogs(1);
-    try testing.expectEqual(Disposition.fence_drop, uploadWith(&w.table, w.deps(), io, 9, 0, std.math.maxInt(u64)));
+    const drops0 = counters.tripwireCount("rewrite_shadow_fence_drops");
+    epoch_mod.stats.rewrite_shadow_fence_drops.resetLogBudgetForTest();
+    log.testing.expectErrorLogs(2); // the tripwire's line and the close's
+
+    try testing.expectEqual(Disposition.published, uploadWith(&w.table, w.deps(), io, 9, 0, std.math.maxInt(u64)));
     try log.testing.expectAllFired();
+    try testing.expectEqual(drops0 + 1, counters.tripwireCount("rewrite_shadow_fence_drops"));
+    try testing.expect(w.f.map.seam().lookup(9, 0) == null); // publish nothing
     try testing.expectEqual(used + 1, w.f.alloc_a.usedBlocks()); // W5: the mint is NOT freed — successor recovery owns the accounting
-    try testing.expect(w.table.has(9, 0)); // the entry stays (publish nothing, free nothing)
+    try testing.expect(!w.epochs.holds(9)); // the epoch dropped, the fed entry retired with it
 }
 
 test "flushParkedBlock (DUR-1 escalation): a partial fresh block zero-completes and uploads; a partial deferred block seeds its complement from the old image by one read, then uploads; the seed never reads for a complete block" {
@@ -2345,6 +2366,10 @@ test "flushParkedBlock (DUR-1 escalation): a partial fresh block zero-completes 
     try testing.expectEqual(Disposition.published, flushParkedBlock(&w.table, w.deps(), io, 10, 2));
     try testing.expectEqual(esc0 + wt.BS, stats.durable_upload_bytes_escalation.load());
     try testing.expectEqual(@as(u64, 0), w.f.dev.reads);
+    // A fresh partial block feeds the epoch like any striped block; its
+    // save carries the app-written floor.
+    try testing.expect(w.epochs.bindsBlock(10, 2));
+    try testing.expect(w.epochs.close(io, 10, .{ .map = w.f.map.seam(), .free = w.f.frees.seam(), .purge = .none }) == .swapped);
     const b = w.f.map.seam().lookup(10, 2).?;
     var got: [wt.BS]u8 = undefined;
     w.f.dev.peek(wt.VOL_A, b.offset, &got);
@@ -2510,6 +2535,10 @@ test "the transform scratch is held through the DMA (decision 0003 §K10): two u
     t2.join();
     try testing.expectEqual(Disposition.published, first);
     try testing.expectEqual(Disposition.published, second);
+    // Both fed the epoch; its save names them (the second feed's
+    // coverage hint may have closed it already).
+    const co = w.epochs.close(io, 21, .{ .map = w.f.map.seam(), .free = w.f.frees.seam(), .purge = .none });
+    try testing.expect(co == .swapped or co == .absent);
     // Every block landed ITS plaintext's image.
     var got: [wt.BS]u8 = undefined;
     for ([_]struct { block: u32, data: *const [wt.BS]u8 }{ .{ .block = 1, .data = &data1 }, .{ .block = 2, .data = &data2 } }) |row| {

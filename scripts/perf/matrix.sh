@@ -5,8 +5,9 @@
 # every row time-based for MX_RUNTIME s, io_uring, O_DIRECT. One line per row (also appended to
 # $OUT/results.tsv): IOPS, MiB/s, clat p50/p99 µs, fio usr+sys %, host cores busy (/proc/stat), device
 # bytes ÷ user bytes (diskstats over the row and its settle), and on a SqueezeFS mount the daemon's cores (/proc/<pid>/stat) and
-# its busiest thread classes (cores, the busiest thread's %). .stats snapshots and the fio JSON land
-# in $OUT/<label>/.
+# its busiest thread classes (cores, the busiest thread's %). .stats snapshots, the fio JSON and
+# <row>.sched.txt (per thread class: cores, voluntary context switches — sleeps — per second and
+# per op, CPU µs per op) land in $OUT/<label>/.
 #   MX_ROWS     regex over row names (default all)     MX_SIZE  per-job region (3g)
 #   MX_COOL_C   wait before each row until the CPU package (k10temp Tctl) is at or below this
 #               many °C (default 70), at most MX_COOL_MAX_S seconds (default 180): the owner found a
@@ -79,7 +80,15 @@ if pid:
             continue
         comm = st[st.index("(") + 1:st.rindex(")")]
         f = st[st.rindex(")") + 2:].split()
-        s["tasks"][tid] = [comm, int(f[11]) + int(f[12])]
+        # Voluntary switches = parks that slept (the thread's sleeps-per-op instrument).
+        vcs = 0
+        try:
+            for ln in open("/proc/%d/task/%s/status" % (pid, tid)):
+                if ln.startswith("voluntary_ctxt_switches:"):
+                    vcs = int(ln.split()[1]); break
+        except OSError:
+            pass
+        s["tasks"][tid] = [comm, int(f[11]) + int(f[12]), vcs]
 json.dump(s, open(out, "w"))
 EOF
 }
@@ -106,14 +115,21 @@ dw = sum(fb["disk"][k][1] - fa["disk"][k][1] for k in fb["disk"]) * 512
 amp = "r%.2f/w%.2f" % (dr / ur if ur else 0, dw / uw if uw else 0)
 dcores = "-"; top = "-"
 if b["tasks"]:
-    cls = collections.defaultdict(lambda: [0.0, 0.0])
+    cls = collections.defaultdict(lambda: [0.0, 0.0, 0, 0])
     tot_t = 0
-    for tid, (comm, t1) in b["tasks"].items():
-        t0 = a["tasks"].get(tid, [comm, 0])[1]
+    for tid, (comm, t1, v1) in b["tasks"].items():
+        t0, v0 = a["tasks"].get(tid, [comm, 0, 0])[1:3]
         c = (t1 - t0) / hz / wall; tot_t += c
-        k = re.sub(r"\d+$", "", comm); cls[k][0] += c; cls[k][1] = max(cls[k][1], c)
+        k = re.sub(r"\d+$", "", comm); cls[k][0] += c; cls[k][1] = max(cls[k][1], c); cls[k][2] += v1 - v0; cls[k][3] += 1
     dcores = "%.2f" % tot_t
     top = " ".join("%s:%.2f(%d%%)" % (k, v[0], 100 * v[1]) for k, v in sorted(cls.items(), key=lambda kv: -kv[1][0])[:5])
+    # The per-class side file: cores, threads, and the sleeps (voluntary switches) per second and per op.
+    ops = iops if iops else 1
+    with open(fj[:-5] + ".sched.txt", "w") as sf:
+        sf.write("class\tthreads\tcores\tsleeps/s\tsleeps/op\tus_cpu/op\n")
+        for k, v in sorted(cls.items(), key=lambda kv: -kv[1][0]):
+            if v[0] < 0.005 and v[2] == 0: continue
+            sf.write("%s\t%d\t%.2f\t%.0f\t%.3f\t%.2f\n" % (k, v[3], v[0], v[2] / wall, v[2] / wall / ops, v[0] * 1e6 / ops))
 line = "\t".join([label, row, "%.0f" % iops, "%.1f" % mib, "%.1f" % p50, "%.1f" % p99,
                   "%.0f" % (j["usr_cpu"] + j["sys_cpu"]), "%.2f" % host, dcores, amp, top, "%s>%s" % (tc0, tc1)])
 print(line)

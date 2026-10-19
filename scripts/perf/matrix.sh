@@ -131,7 +131,7 @@ settle() {   # a SqueezeFS mount: the write custody drained (owed and parked bot
   echo "matrix: write custody not drained after 10 s" >&2
 }
 
-TCTL=$(for h in /sys/class/hwmon/hwmon*; do [ "$(cat "$h/name" 2>/dev/null)" = k10temp ] && echo "$h/temp1_input"; done | head -1)
+TCTL=$(for h in /sys/class/hwmon/hwmon*; do if [ "$(cat "$h/name" 2>/dev/null)" = k10temp ]; then echo "$h/temp1_input"; fi; done | head -1; true)
 tctl() { if [ -n "$TCTL" ]; then echo $(( $(cat "$TCTL") / 1000 )); else echo -; fi; }
 cool() {   # thermal: a row starts only once the package is at or below MX_COOL_C (bounded by MX_COOL_MAX_S)
   [ -n "$TCTL" ] || return 0

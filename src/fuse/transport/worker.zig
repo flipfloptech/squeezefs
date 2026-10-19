@@ -89,6 +89,7 @@ const counters = @import("../../core/counters.zig");
 const clock = @import("../../core/clock.zig");
 const log = @import("../../core/log.zig");
 const derive = @import("../../core/derive.zig");
+const rtt = @import("../../core/rtt.zig");
 const thread_name = @import("../../core/thread_name.zig");
 const futex = @import("../../sync/futex.zig");
 const completion = @import("../../sync/completion.zig");
@@ -252,6 +253,24 @@ pub var park_tick_late_cqes: counters.ShardedCounter = .{};
 pub var enters: counters.ShardedCounter = .{};
 /// `transport_passes`: worker passes run.
 pub var passes: counters.ShardedCounter = .{};
+/// The owed spin's ledger (`owedSpinBudget`; rung-10-workers-per-queue
+/// "the write row"). A pass about to park while this ring owes a device
+/// completion either spins (`transport_owed_spins`) — and the completion
+/// surfaced inside the budget (`_hits`) or the budget lapsed into the park
+/// (`_falls`) — or declines (`_skips`: no measurement yet, or the landing
+/// predicted past the competitive bound). `transport_owed_spin_ns` is the
+/// CPU the spins burned (exact sum); the gauges are the rule's last
+/// inputs: `_dev_ns` the push → reap round trip of a completion a spin
+/// caught (the device), `_wake_ns` what a slept park added to it (the
+/// wake), `_bound_ns` the budget those gave.
+pub var owed_spins: counters.ShardedCounter = .{};
+pub var owed_spin_hits: counters.ShardedCounter = .{};
+pub var owed_spin_falls: counters.ShardedCounter = .{};
+pub var owed_spin_skips: counters.ShardedCounter = .{};
+pub var owed_spin_ns: counters.ShardedCounter = .{};
+pub var owed_spin_dev_ns: counters.Gauge = .{};
+pub var owed_spin_wake_ns: counters.Gauge = .{};
+pub var owed_spin_bound_ns: counters.Gauge = .{};
 /// `transport_residency_replies`: fresh deliveries answered ENOTCONN
 /// after the drain.
 pub var residency_replies: counters.ShardedCounter = .{};
@@ -884,6 +903,15 @@ pub const Group = struct {
     tid: std.atomic.Value(std.Thread.Id) = .init(0),
     /// `wakeSelf` elided a wake on this thread since the last park check.
     self_kick: bool = false,
+    /// The owed spin's two predictors (push → reap of this ring's device
+    /// bridges): sampled at a bridge CQE a spin caught (`dev_awake`: the
+    /// device alone) or one reaped after the pass PARKED for it
+    /// (`dev_slept`: the device plus the park's wake). Their difference is
+    /// the wake the spin saves; `reap_origin` names which the next reap
+    /// feeds.
+    dev_awake: rtt.RttEstimator = .{},
+    dev_slept: rtt.RttEstimator = .{},
+    reap_origin: ReapOrigin = .busy,
     disconnected: bool = false,
     protocol_rejected: bool = false,
     /// This group's RELEASE SQEs pushed and not yet answered (the drain
@@ -1405,6 +1433,123 @@ pub const Group = struct {
         return @intCast(derive.ceilDiv(write_own_depth, rings));
     }
 
+    /// Where the pass's reap came from (the owed spin's sampling key):
+    /// `busy` — work in hand, a non-blocking flush (no wait to measure);
+    /// `spin_hit` — a spin caught the completion (the device alone);
+    /// `parked` — the pass parked for it (the device plus the wake).
+    pub const ReapOrigin = enum(u8) { busy, spin_hit, parked };
+
+    /// A predictor's reading: the smoothed round trip and its RTO bound.
+    pub const Prediction = struct { srtt: u64, rto: u64 };
+
+    fn predictionOf(e: *const rtt.RttEstimator) ?Prediction {
+        const m = e.mean() orelse return null;
+        return .{ .srtt = m, .rto = e.bound(std.math.maxInt(u64)) };
+    }
+
+    /// THE OWED SPIN'S BUDGET (pure; tie-tested): how long a pass with no
+    /// work in hand may spin for the oldest owed device completion (pushed
+    /// at `oldest_born`) before it parks; 0 = park now. The park's price is
+    /// its wake — the completion lands, the kernel's task work wakes a
+    /// sleeping thread, it is scheduled back: the half-loaded two-ring
+    /// worker paid it per CQE (passes per write 1.2 → 2.6 against one
+    /// saturated ring; rung-10-workers-per-queue) — so the rule is the
+    /// classic spin-then-park competitive rule on the MEASURED price: `W`
+    /// = what a slept park's round trip adds over a spin-caught one, the
+    /// bound `2·W` (the CPU a spin burns is at most twice the wake it
+    /// saves), and the spin only while the landing (`born + srtt`) is
+    /// predicted inside the bound and until the RTO says it is a stall —
+    /// a landing predicted later would make every spin a fall-through (an
+    /// SSD's 80 µs against a 5 µs wake spins never; a RAM device's 8 µs
+    /// spins every time). No slept measurement (`slept` null) ⇒ no spin:
+    /// the first parks measure it. No caught measurement yet (`awake`
+    /// null) ⇒ the PROBE: spin to the slept predictor's bound once, so a
+    /// hit can seed the other side.
+    pub fn owedSpinBudget(now: u64, oldest_born: u64, awake: ?Prediction, slept: ?Prediction) u64 {
+        const s = slept orelse return 0;
+        const a = awake orelse return (oldest_born +| s.rto) -| now;
+        const wake = s.srtt -| a.srtt;
+        if (wake == 0) return 0;
+        const bound = 2 * wake;
+        if (oldest_born +| a.srtt > now +| bound) return 0;
+        return @min(now +| bound, oldest_born +| a.rto) -| now;
+    }
+
+    /// The oldest live bridge whose RTO has not lapsed (`born > now − rto`):
+    /// the completion the spin waits for; null when every owed one is
+    /// already a stall (the park's, not the spin's).
+    fn oldestOwedBorn(self: *const Group, now: u64, rto: u64) ?u64 {
+        var oldest: ?u64 = null;
+        for (self.deadlines.born_ns) |b| {
+            if (b == 0 or b +| rto <= now) continue;
+            if (oldest == null or b < oldest.?) oldest = b;
+        }
+        return oldest;
+    }
+
+    /// The owed spin (the pass's step 12½): with no work in hand and a
+    /// device completion owed on this ring, spin on the ring — the CQ tail,
+    /// or the `IORING_SQ_TASKRUN` flag a `DEFER_TASKRUN` ring raises when
+    /// a completion waits for its owner's enter — for `owedSpinBudget`,
+    /// instead of parking per CQE. This pass's SQEs go first (the store a
+    /// spin waits for is one of them). True ⇒ a completion is in the CQ
+    /// (one GETEVENTS enter posted it where the flag said so) and the pass
+    /// reaps now; false ⇒ the pass parks as before (its SQEs already
+    /// flushed, so the park is the one-enter timed wait).
+    fn spinForOwed(self: *Group) bool {
+        if (self.deadlines.outstanding == 0 or self.ring.isDead()) return false;
+        const awake = predictionOf(&self.dev_awake);
+        const slept = predictionOf(&self.dev_slept);
+        const now = clock.monotonicNs();
+        const rto = if (awake) |a| a.rto else if (slept) |s| s.rto else 0;
+        const oldest = self.oldestOwedBorn(now, rto) orelse {
+            owed_spin_skips.inc();
+            return false;
+        };
+        const budget = owedSpinBudget(now, oldest, awake, slept);
+        owed_spin_bound_ns.set(budget);
+        if (budget == 0) {
+            owed_spin_skips.inc();
+            return false;
+        }
+        if (self.ring.ring.sqReady() > 0) {
+            self.flushNonBlocking();
+            if (self.ring.isDead()) return false;
+        }
+        owed_spins.inc();
+        const deadline = now +| budget;
+        var t = now;
+        const hit = while (true) {
+            if (self.ring.cqReady() > 0) break true;
+            if (self.ring.ring.sqFlags() & linux.IORING_SQ_TASKRUN != 0) {
+                self.flushNonBlocking();
+                break !self.ring.isDead();
+            }
+            t = clock.monotonicNs();
+            if (t >= deadline) break false;
+            std.atomic.spinLoopHint();
+        };
+        owed_spin_ns.add(clock.monotonicNs() -| now);
+        if (hit) owed_spin_hits.inc() else owed_spin_falls.inc();
+        return hit;
+    }
+
+    /// A bridge CQE's push → reap round trip feeds the predictor its reap's
+    /// origin names (`ReapOrigin`); a busy pass's reap measures no wait.
+    fn sampleBridgeRoundTrip(self: *Group, born_ns: u64) void {
+        if (born_ns == 0) return;
+        const age = clock.monotonicNs() -| born_ns;
+        switch (self.reap_origin) {
+            .busy => return,
+            .spin_hit => self.dev_awake.sample(age),
+            .parked => self.dev_slept.sample(age),
+        }
+        if (self.dev_awake.mean()) |a| {
+            owed_spin_dev_ns.set(a);
+            if (self.dev_slept.mean()) |s| owed_spin_wake_ns.set(s -| a);
+        }
+    }
+
     /// The lane's bound on this pass's wait (its timers, its owed ring ops).
     fn laneBound(self: *Group) ?u64 {
         const l = self.lane orelse return null;
@@ -1789,7 +1934,9 @@ pub const Group = struct {
 
     /// A bridge CQE: resolve the pend by its kind.
     fn handleBridgeCqe(self: *Group, gent: u32, res: i32) void {
+        const born = self.deadlines.born_ns[gent];
         const pend = self.clearPend(gent) orelse return;
+        self.sampleBridgeRoundTrip(born);
         const m = self.memberOf(gent);
         const e = self.entIdxOf(gent);
         const ok = res >= 0 and @as(u32, @intCast(res)) == pend.len;
@@ -2321,6 +2468,7 @@ pub const Group = struct {
             // 5. Mid-pass reap of finished bridges, then ONE fused frame.
             if (self.deadlines.outstanding > 0 and !self.fused.isEmpty()) {
                 self.flushNonBlocking();
+                self.reap_origin = .busy;
                 self.reap();
             }
             self.pollFused();
@@ -2361,8 +2509,14 @@ pub const Group = struct {
             const lane_runnable = if (self.lane) |l| l.drivenRunnable() else false;
             if (pass_msgs > 0 or !self.fused.isEmpty() or lane_runnable or self.selfPending()) {
                 self.flushNonBlocking();
+                self.reap_origin = .busy;
+            } else if (self.spinForOwed()) {
+                // 12½. A completion this ring owed landed inside the spin:
+                //      its CQE is in the CQ, this pass reaps it.
+                self.reap_origin = .spin_hit;
             } else {
                 // 13. THE enter: every SQE pushed this pass and the wait.
+                self.reap_origin = .parked;
                 var bound: ?u64 = backstop;
                 if (retry_left) |r| bound = if (bound) |b| @min(b, r) else r;
                 if (self.laneBound()) |l| bound = if (bound) |b| @min(b, l) else l;
@@ -3284,6 +3438,31 @@ test "the own-lane knee is a queue's: one ring takes it whole, two rings split i
     try testing.expectEqual(@as(u32, 1), Group.ownDepthShare(1, 2));
     try testing.expectEqual(@as(u32, 0), Group.ownDepthShare(0, 2));
     try testing.expectEqual(@as(u32, 0), Group.ownDepthShare(0, 1));
+}
+
+test "the owed spin's budget: no slept measurement ⇒ park; no caught one ⇒ the probe spins to the slept bound; else 2·W where W = slept − caught, only while the landing is predicted inside it, and never past the caught RTO (an overdue completion is the park's)" {
+    const B = Group.owedSpinBudget;
+    const P = Group.Prediction;
+    // Nothing measured: the first parks measure.
+    try testing.expectEqual(@as(u64, 0), B(1_000, 900, null, null));
+    // The probe: a slept predictor alone spins to its bound (born 900 + rto 24 000 − now 1 000).
+    try testing.expectEqual(@as(u64, 23_900), B(1_000, 900, null, P{ .srtt = 12_000, .rto = 24_000 }));
+    try testing.expectEqual(@as(u64, 0), B(30_000, 900, null, P{ .srtt = 12_000, .rto = 24_000 }));
+    // RAM device: caught 8 µs, slept 12 µs ⇒ W 4 µs, bound 8 µs; born 2 µs ago, landing in 6 ⇒
+    // spin to the bound (8 µs), which the caught RTO (born + 14 µs = 12 µs from now) does not cut.
+    const ram_a = P{ .srtt = 8_000, .rto = 14_000 };
+    const ram_s = P{ .srtt = 12_000, .rto = 24_000 };
+    try testing.expectEqual(@as(u64, 8_000), B(12_000, 10_000, ram_a, ram_s));
+    // Born 7 µs ago: landing in 1 µs, the RTO in 7 ⇒ the RTO is the shorter bound.
+    try testing.expectEqual(@as(u64, 7_000), B(17_000, 10_000, ram_a, ram_s));
+    // The RTO lapsed: overdue is a stall, the park's.
+    try testing.expectEqual(@as(u64, 0), B(24_001, 10_000, ram_a, ram_s));
+    // An SSD: caught 80 µs against a 5 µs wake ⇒ the landing is 70 µs past the 10 µs bound: no spin.
+    try testing.expectEqual(@as(u64, 0), B(10_000, 10_000, P{ .srtt = 80_000, .rto = 100_000 }, P{ .srtt = 85_000, .rto = 110_000 }));
+    // …until it is within the bound (born 72 µs ago: landing in 8).
+    try testing.expectEqual(@as(u64, 10_000), B(82_000, 10_000, P{ .srtt = 80_000, .rto = 100_000 }, P{ .srtt = 85_000, .rto = 110_000 }));
+    // No measured wake (slept ≤ caught): a spin saves nothing.
+    try testing.expectEqual(@as(u64, 0), B(12_000, 10_000, ram_a, P{ .srtt = 8_000, .rto = 9_000 }));
 }
 
 test "the tick's re-check: on a DEFER_TASKRUN ring a completion in the CQ at a -ETIME verdict that was empty at the park is a lost wake; a CQ that already held work at the park, or a posture whose CQ moves outside the worker's enters, classes nothing lost (late, counted beside)" {

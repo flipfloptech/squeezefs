@@ -2035,6 +2035,14 @@ pub const Session = struct {
         try field(w, "transport_park_tick_late_cqes", worker.park_tick_late_cqes.load());
         try field(w, "transport_enters", worker.enters.load());
         try field(w, "transport_passes", worker.passes.load());
+        try field(w, "transport_owed_spins", worker.owed_spins.load());
+        try field(w, "transport_owed_spin_hits", worker.owed_spin_hits.load());
+        try field(w, "transport_owed_spin_falls", worker.owed_spin_falls.load());
+        try field(w, "transport_owed_spin_skips", worker.owed_spin_skips.load());
+        try field(w, "transport_owed_spin_ns", worker.owed_spin_ns.load());
+        try field(w, "transport_owed_spin_dev_ns", worker.owed_spin_dev_ns.load());
+        try field(w, "transport_owed_spin_wake_ns", worker.owed_spin_wake_ns.load());
+        try field(w, "transport_owed_spin_bound_ns", worker.owed_spin_bound_ns.load());
         try field(w, "transport_residency_replies", worker.residency_replies.load());
         try field(w, "transport_umount_busy_retries", umount_busy_retries.load());
         try field(w, "transport_umount_busy_refusals", umount_busy_refusals.load());
@@ -3599,6 +3607,58 @@ test "e2e zc WRITE on the worker's lane (decision 0003 §AB.3, the write arm): a
         // The lane thread's extraction requests and replies wake the worker across threads.
         try testing.expect(slot.wake_writes.load() > w0);
     }
+}
+
+test "e2e the owed spin (rung-10-workers-per-queue, the write row): a worker whose ring owes a held write's bridge parks for the first one (the slept predictor's seed), PROBES the next (a spin to the slept bound that catches the completion: the caught predictor's seed) and then spins by the competitive rule — over 64 QD1 held writes the ledger reads hits ≥ 1 and closes (spins ≡ hits + falls), both predictors hold samples and the gauges read the rule's inputs; a pass owing no bridge consults the rule never (the skips stay at the owed parks')" {
+    if (venueMissing()) |why| return testkit.skipWhy(@src(), why);
+    var kb: [192]u8 = undefined;
+    if (kmbufMissing(&kb)) |why| return testkit.skipWhy(@src(), why);
+    const rig = try Rig.init(testing.allocator, 47, &.{});
+    defer rig.deinit();
+    rig.fs.hold_eligible = true;
+    const s = try rig.mountIt(.{ .mem_budget_bytes = 0 });
+    try testing.expectEqual(geometry.BufferMode.zero_copy, s.mode);
+    var pb: [256]u8 = undefined;
+    const fd = try openPath(rig.child(&pb, "scratch"), .{ .ACCMODE = .WRONLY, .CLOEXEC = true });
+    defer _ = linux.close(fd);
+    var page: [4096]u8 = undefined;
+    for (&page, 0..) |*b, i| b.* = @truncate(i * 5 + 1);
+    const spins0 = worker.owed_spins.load();
+    const hits0 = worker.owed_spin_hits.load();
+    const falls0 = worker.owed_spin_falls.load();
+    const skips0 = worker.owed_spin_skips.load();
+    const ns0 = worker.owed_spin_ns.load();
+    // Every write is the W1 shape ⇒ HELD ⇒ its lazy extraction is a bridge
+    // on the delivering worker's own ring: the pass that pushed it owes a
+    // device completion with nothing else in hand — the owed park.
+    var i: usize = 0;
+    while (i < 64) : (i += 1) {
+        try testing.expectEqual(@as(usize, 4096), linux.pwrite(fd, &page, page.len, 4096));
+    }
+    try testing.expectEqualSlices(u8, &page, rig.fs.scratch[4096..8192]);
+    try testing.expectEqual(@as(u64, 64), rig.fs.lazy_extracts.load(.monotonic));
+    const spins = worker.owed_spins.load() - spins0;
+    const hits = worker.owed_spin_hits.load() - hits0;
+    const falls = worker.owed_spin_falls.load() - falls0;
+    const skips = worker.owed_spin_skips.load() - skips0;
+    // The first owed park measured (no spin: a skip); the probe caught a
+    // completion; every spin ended as a hit or a fall; every one of the 64
+    // owed parks was ruled on (a request arriving mid-bridge rules again).
+    try testing.expect(skips >= 1);
+    try testing.expect(hits >= 1);
+    try testing.expectEqual(spins, hits + falls);
+    try testing.expect(spins + skips >= 64);
+    try testing.expect(worker.owed_spin_ns.load() > ns0);
+    var slept_samples: u64 = 0;
+    var awake_samples: u64 = 0;
+    for (s.groups) |g| {
+        slept_samples += g.dev_slept.samples.load(.monotonic);
+        awake_samples += g.dev_awake.samples.load(.monotonic);
+    }
+    try testing.expect(slept_samples >= 1);
+    try testing.expect(awake_samples >= 1);
+    try testing.expect(worker.owed_spin_dev_ns.load() > 0);
+    std.debug.print("\nowed spin: {d} writes, {d} spins ({d} hits, {d} falls), {d} skips, {d} µs spun, dev {d} µs, wake {d} µs, last bound {d} µs\n", .{ i, spins, hits, falls, skips, (worker.owed_spin_ns.load() - ns0) / std.time.ns_per_us, worker.owed_spin_dev_ns.load() / std.time.ns_per_us, worker.owed_spin_wake_ns.load() / std.time.ns_per_us, worker.owed_spin_bound_ns.load() / std.time.ns_per_us });
 }
 
 /// `depth` LOOKUPs of distinct park names from threads pinned to ONE CPU:

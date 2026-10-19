@@ -2821,7 +2821,7 @@ test "the one-authority screen never parks under (3): a write meeting an overlay
     try testing.expectEqualSlices(u8, &half, got[0 .. wt.BS / 2]);
 }
 
-test "the ordered law's floor under a FRESH stream riding the epoch (decision 0003 §AL.5): the floor is the lowest block the epoch shadows — open or saving — not 0 for the epoch's whole life: whole blocks 1 and 2 fed ⇒ floor = block 1's start; the save lands them ⇒ no custody, the floor lifts; blocks 4 and 5 fed ⇒ block 4's start; a parked partial block 3 beside them ⇒ its lowest covered byte" {
+test "the ordered law's floor under a FRESH stream riding the epoch (decision 0003 §AL.5): the floor is the lowest block the epoch shadows — open or saving — not 0 for the epoch's whole life: whole blocks 2 and 3 fed ⇒ floor = block 2's start; the save lands them ⇒ no custody, the floor lifts; blocks 5 and 6 fed ⇒ block 5's start; a parked partial block 4 beside them ⇒ its lowest covered byte" {
     const io = testing.io;
     const w = try World.init(testing.allocator, .sync_inline, true);
     defer w.deinit(testing.allocator);
@@ -2829,30 +2829,33 @@ test "the ordered law's floor under a FRESH stream riding the epoch (decision 00
     var whole: [wt.BS]u8 align(4096) = undefined;
     fill(&whole, 3);
     try testing.expectEqual(@as(u64, std.math.maxInt(u64)), w.wp.custodyFloor(io, 75));
-    for ([_]u32{ 1, 2 }) |b| {
+    // Blocks 2 and 3, not 0 and 1: the detached drains feed in either
+    // order, and two blocks shadowed never reach block 2's floor of three
+    // (the coverage hint would close the epoch under the assertions).
+    for ([_]u32{ 2, 3 }) |b| {
         const o = try w.wp.write(io, .{ .ino = 75, .offset = @as(u64, b) * wt.BS, .payload = .{ .bytes = &whole }, .class = .entire_op, .file = World.striped(@as(u64, b) * wt.BS) });
         try testing.expectEqual(@as(u32, 1), o.count(.overlay));
     }
-    w.wp.quiesce(io); // the drains fed both (block 1's floor is 2 × BS: no coverage hint)
-    try testing.expect(w.wp.epochs.bindsBlock(75, 1) and w.wp.epochs.bindsBlock(75, 2));
-    try testing.expect(w.f.map.seam().lookup(75, 1) == null);
-    try testing.expectEqual(@as(u64, 1 * wt.BS), w.wp.custodyFloor(io, 75));
+    w.wp.quiesce(io); // the drains fed both
+    try testing.expect(w.wp.epochs.bindsBlock(75, 2) and w.wp.epochs.bindsBlock(75, 3));
+    try testing.expect(w.f.map.seam().lookup(75, 2) == null);
+    try testing.expectEqual(@as(u64, 2 * wt.BS), w.wp.custodyFloor(io, 75));
     // The save names them: no custody left, the claim may journal past them.
     try testing.expect(w.wp.epochs.close(io, 75, w.wp.closeSeams()) == .swapped);
     try testing.expectEqual(@as(u64, std.math.maxInt(u64)), w.wp.custodyFloor(io, 75));
-    for ([_]u32{ 4, 5 }) |b| {
+    for ([_]u32{ 5, 6 }) |b| {
         _ = try w.wp.write(io, .{ .ino = 75, .offset = @as(u64, b) * wt.BS, .payload = .{ .bytes = &whole }, .class = .entire_op, .file = World.striped(@as(u64, b) * wt.BS) });
     }
     w.wp.quiesce(io);
-    try testing.expectEqual(@as(u64, 4 * wt.BS), w.wp.custodyFloor(io, 75));
+    try testing.expectEqual(@as(u64, 5 * wt.BS), w.wp.custodyFloor(io, 75));
     // A parked partial block below the epoch's lowest: its covered byte wins.
     var tail: [PAGE]u8 align(4096) = @splat(0x77);
-    const o = try w.wp.write(io, .{ .ino = 75, .offset = 3 * wt.BS + 2 * PAGE, .payload = .{ .bytes = &tail }, .class = .entire_op, .file = World.striped(3 * wt.BS) });
+    const o = try w.wp.write(io, .{ .ino = 75, .offset = 4 * wt.BS + 2 * PAGE, .payload = .{ .bytes = &tail }, .class = .entire_op, .file = World.striped(4 * wt.BS) });
     try testing.expectEqual(@as(u32, 1), o.count(.extent) + o.count(.accumulate_park));
-    try testing.expectEqual(@as(u64, 3 * wt.BS + 2 * PAGE), w.wp.custodyFloor(io, 75));
+    try testing.expectEqual(@as(u64, 4 * wt.BS + 2 * PAGE), w.wp.custodyFloor(io, 75));
     w.wp.flushIno(io, 75);
     try testing.expectEqual(@as(u64, std.math.maxInt(u64)), w.wp.custodyFloor(io, 75));
-    for ([_]u32{ 1, 2, 3, 4, 5 }) |b| try testing.expect(w.f.map.seam().lookup(75, b) != null);
+    for ([_]u32{ 2, 3, 4, 5, 6 }) |b| try testing.expect(w.f.map.seam().lookup(75, b) != null);
 }
 
 /// Half a block (a park, never a write-through) for `(ino, block)`.

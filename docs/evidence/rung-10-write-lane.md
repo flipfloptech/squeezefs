@@ -81,7 +81,9 @@ two-thread arm had two — the 0.76–0.78× row — while every many-submitter 
 regression is a defect" and the owner's "performance first"): the default is 8, the measured knee** —
 QD1 2.06×, QD32×1 1.00×, QD32×4 1.03× at 0.95× the cores; all-own (0) becomes the default once lever
 5 (N workers per kernel queue, §AB.6) removes the one-queue saturation, and the dispatch-law row pins
-the default until then. The write handler is now ≈ 6 µs of worker CPU, all RAM: `readInodeOpt`
+the default until then. Lever 5 as measured (`rung-10-workers-per-queue.md`): the saturation is real —
+the one busy worker is the queue of fio's CPU, 0.9–1.0 cores per window — but this kernel series
+admits one ring per kmbuf/zc queue, so the lever waits on the proposed patch 0030 and the knee stays 8. The write handler is now ≈ 6 µs of worker CPU, all RAM: `readInodeOpt`
 (the probe and the postlude's re-read under the shared guard), `mapLookup` (the prelude's and
 `beginInPlace`'s), per lookup the route table's arc-swap RMW pair (`MetaSet.volumeOfSlot`, 4.8 % self —
 a shared-line RMW on the hot path; a lock-free-core change with its model) and `homeOf`. With lever

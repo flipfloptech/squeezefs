@@ -289,6 +289,24 @@ pub const Epochs = struct {
         return self.table.contains(ino) or self.closing.contains(ino);
     }
 
+    /// The lowest block `ino`'s epochs shadow — open or saving (the
+    /// ordered law's floor, `write_admit.custodyFloor`): a shadowed block
+    /// is named by no durable map until its save lands, so the size claim
+    /// stops below it. One walk of at most two shadows under the spin lock.
+    pub fn lowestBlockOf(self: *Epochs, ino: u64) ?u32 {
+        self.lock.lock();
+        defer self.lock.unlock();
+        var low: ?u32 = null;
+        for ([_]?*Epoch{ self.table.get(ino), self.closing.get(ino) }) |e| {
+            const ep = e orelse continue;
+            var it = ep.shadow.keyIterator();
+            while (it.next()) |b| if (low == null or b.* < low.?) {
+                low = b.*;
+            };
+        }
+        return low;
+    }
+
     /// Open epochs (a save in flight is not open: its ino's next record
     /// opens a fresh one).
     pub fn openCount(self: *Epochs) usize {

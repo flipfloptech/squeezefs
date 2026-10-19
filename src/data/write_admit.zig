@@ -1379,13 +1379,17 @@ pub const WritePath = struct {
     /// journaled. A parked block answers its lowest covered byte (read
     /// under its (3): a continuous appender's tail block never pins the
     /// size at its block start); an open overlay record answers its block's
-    /// start; a rewrite epoch answers 0 — its landed blocks are named only
-    /// by its save, and the map still names the blocks it displaces.
+    /// start; a rewrite epoch — open or saving — answers its lowest
+    /// shadowed block's start: a shadowed block is named by no durable map
+    /// until its save lands (a fresh block rides the epoch too, so an
+    /// extending stream's claim follows its saves: the whole-epoch 0 of
+    /// the overwrite-only epoch would have held a streamer's size at its
+    /// first save for the stream's whole life).
     pub fn custodyFloor(self: *WritePath, io: Io, ino: u64) u64 {
-        if (self.epochs.holds(ino)) return 0;
         const bs = self.cfg.block_size;
         var floor: u64 = std.math.maxInt(u64);
-        if (self.overlay.registry.lowestBlockOf(ino)) |b| floor = @as(u64, b) * bs;
+        if (self.epochs.lowestBlockOf(ino)) |b| floor = @as(u64, b) * bs;
+        if (self.overlay.registry.lowestBlockOf(ino)) |b| floor = @min(floor, @as(u64, b) * bs);
         if (self.table.lowestBlockOf(ino)) |b| {
             const g = self.locks.acquire(io, ino, b, .writeback_flush);
             defer g.release(io);
@@ -2815,6 +2819,40 @@ test "the one-authority screen never parks under (3): a write meeting an overlay
     var got: [wt.BS]u8 = undefined;
     w.f.dev.peek(b.vol_tag, b.offset, &got);
     try testing.expectEqualSlices(u8, &half, got[0 .. wt.BS / 2]);
+}
+
+test "the ordered law's floor under a FRESH stream riding the epoch (decision 0003 §AL.5): the floor is the lowest block the epoch shadows — open or saving — not 0 for the epoch's whole life: whole blocks 1 and 2 fed ⇒ floor = block 1's start; the save lands them ⇒ no custody, the floor lifts; blocks 4 and 5 fed ⇒ block 4's start; a parked partial block 3 beside them ⇒ its lowest covered byte" {
+    const io = testing.io;
+    const w = try World.init(testing.allocator, .sync_inline, true);
+    defer w.deinit(testing.allocator);
+    try w.f.map.create(75, .striped, 0);
+    var whole: [wt.BS]u8 align(4096) = undefined;
+    fill(&whole, 3);
+    try testing.expectEqual(@as(u64, std.math.maxInt(u64)), w.wp.custodyFloor(io, 75));
+    for ([_]u32{ 1, 2 }) |b| {
+        const o = try w.wp.write(io, .{ .ino = 75, .offset = @as(u64, b) * wt.BS, .payload = .{ .bytes = &whole }, .class = .entire_op, .file = World.striped(@as(u64, b) * wt.BS) });
+        try testing.expectEqual(@as(u32, 1), o.count(.overlay));
+    }
+    w.wp.quiesce(io); // the drains fed both (block 1's floor is 2 × BS: no coverage hint)
+    try testing.expect(w.wp.epochs.bindsBlock(75, 1) and w.wp.epochs.bindsBlock(75, 2));
+    try testing.expect(w.f.map.seam().lookup(75, 1) == null);
+    try testing.expectEqual(@as(u64, 1 * wt.BS), w.wp.custodyFloor(io, 75));
+    // The save names them: no custody left, the claim may journal past them.
+    try testing.expect(w.wp.epochs.close(io, 75, w.wp.closeSeams()) == .swapped);
+    try testing.expectEqual(@as(u64, std.math.maxInt(u64)), w.wp.custodyFloor(io, 75));
+    for ([_]u32{ 4, 5 }) |b| {
+        _ = try w.wp.write(io, .{ .ino = 75, .offset = @as(u64, b) * wt.BS, .payload = .{ .bytes = &whole }, .class = .entire_op, .file = World.striped(@as(u64, b) * wt.BS) });
+    }
+    w.wp.quiesce(io);
+    try testing.expectEqual(@as(u64, 4 * wt.BS), w.wp.custodyFloor(io, 75));
+    // A parked partial block below the epoch's lowest: its covered byte wins.
+    var tail: [PAGE]u8 align(4096) = @splat(0x77);
+    const o = try w.wp.write(io, .{ .ino = 75, .offset = 3 * wt.BS + 2 * PAGE, .payload = .{ .bytes = &tail }, .class = .entire_op, .file = World.striped(3 * wt.BS) });
+    try testing.expectEqual(@as(u32, 1), o.count(.extent) + o.count(.accumulate_park));
+    try testing.expectEqual(@as(u64, 3 * wt.BS + 2 * PAGE), w.wp.custodyFloor(io, 75));
+    w.wp.flushIno(io, 75);
+    try testing.expectEqual(@as(u64, std.math.maxInt(u64)), w.wp.custodyFloor(io, 75));
+    for ([_]u32{ 1, 2, 3, 4, 5 }) |b| try testing.expect(w.f.map.seam().lookup(75, b) != null);
 }
 
 /// Half a block (a park, never a write-through) for `(ino, block)`.

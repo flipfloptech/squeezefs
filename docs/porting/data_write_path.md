@@ -507,8 +507,15 @@ before device work (`:19882-19901`). Then:
      superseding the record post-freeze ⇒ `mint.disarm()` — never free the epoch's
      live B key), `overlay_epoch_feeds`, teardown, `Ok(coverage_complete)` — the
      close-owed HINT; `NotShadowed(guard)` ⇒ put the guard back, fall through.
-   - **Durable-merge arm** (fresh records + the shadow-off degenerate, `:20148-
-     20268`): `OverlaySelfPublish{block, dest_offset, birth}` provenance marker
+   - **The port feeds FRESH records too** (0002 row 546, `rung-10-fresh-file-publish.md`):
+     `old_binding` null ⇒ `rewrite_shadow_record(…, prev = null, …)` parks nothing and the
+     epoch's save names the block for the first time; the `rewrite_*` SLO terms stay the
+     overwrite's (`overlay_epoch_feeds_fresh` counts the fresh feeds); the settle stamps
+     fsync's touched word with the dest's ordinal (the reference's overlay never did, so a
+     fed block's namespace was outside the data barrier before its save). The accumulation
+     upload (§5.3) feeds every striped block the same way.
+   - **Durable-merge arm** (the shadow-off degenerate and the width's fallback in the port;
+     fresh records too in the reference, `:20148-20268`): `OverlaySelfPublish{block, dest_offset, birth}` provenance marker
      (KD-B4-11 — the record is still Frozen+registered while its own merge runs;
      retiring it first opens the record-gone-⇒-published generic/209 window);
      `token = current.max(rec.fence_token)`; `merge_block_mappings_coalesced_marked
@@ -746,7 +753,8 @@ bytes`, `:1611-1638`).
 `rewrite_shadow_record(ino, b, new_key, min_size, guard)` (`:16407-16537`): under
 (3.5): RMW base = dirty RAM entry else backend fetch (failure ⇒ `NotShadowed(guard)`);
 PARTIAL entries decline; open trigger (KD-1.1) = `striped ∧ prev ≠ new_key`
-(`:16442-16446`); CoW map mutation (`Arc::make_mut`); displaced prev ⇒
+(`:16442-16446`; the port reads a null `prev` as satisfying it — a fresh block rides the
+epoch, 0002 row 546); CoW map mutation (`Arc::make_mut`); displaced prev ⇒
 `purge_block_key(p)`, `displaced.push(p)`, `parked_bytes += bs`; size floor; `layout_dirty
 = true`; `note_block_ref_ops(ino, [−prev, +new])` so the save that persists the map
 drains the ref delta into the SAME tx (`:16498-16515`); `shadow[b] = new_key`;
@@ -765,7 +773,12 @@ THEN free (RES-1 — "the worst park amplifier in the tree", `:16821-16829`).
 `rewrite_shadow_fence_drops`, loud: publish nothing, free NOTHING (`:16857-16870`).
 Transient ⇒ RE-REGISTER the epoch (never-lossy, `:16871-16883`).
 
-Close triggers (KD-1.6, `design-rewrite-program.md:393-404`): full coverage; fsync /
+Close triggers (KD-1.6, `design-rewrite-program.md:393-404`): full coverage; the port's
+close width (`write_epoch.CLOSE_WIDTH` = half `MergeOutcome.max_displaced`: the record
+that reaches it answers the close-owed hint, so a stream closes one epoch per window while
+the previous save is in flight and the fold of two fits the ONE save — the reference had
+no width, its `shadow` grew without bound and its save was one `save_metadata_to_backend`
+of the whole record); fsync /
 `flush_inode_to_backend` (before the meta barrier); RELEASE; shape-change ops
 (truncate/punch prune, spill/promotion, extent-record commit, clone, setattr size);
 ENOSPC early-close (KD-1.7) generalized to the ONE allocation act

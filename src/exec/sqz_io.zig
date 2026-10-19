@@ -441,9 +441,15 @@ pub const SqzIo = struct {
 
     /// The lane an anonymous `concurrent` lands on (§3.4): the current lane
     /// (same-lane dispatch), the fuse rotation when the lever is off on a
-    /// fuse lane, the meta round-robin off a lane.
+    /// fuse lane, the meta round-robin off a lane. A DRIVEN lane is its
+    /// owner's ring thread (the drain worker, which never waits on a
+    /// device — decision 0003 §AB.3): an anonymous task spawned from it —
+    /// a write handler's upload, fold or overlay drain, whose DMAs park the
+    /// calling thread — goes to the fuse lane homed on the owner's CPU, as
+    /// it would from a handler there.
     fn pickLane(self: *SqzIo) ?*Lane {
         if (lane_mod.current_lane) |l| {
+            if (l.driven) return self.homeLane(l.home_cpu, l.node);
             if (self.same_lane_dispatch or l.class != .fuse) return l;
             if (self.fuse_placement.pickRotation()) |idx| return self.lanes[idx];
             return l;
@@ -1126,6 +1132,59 @@ test "a fiber awaiting a fiber: the awaiter parks on its lane and resumes with t
     };
     var fut = try io.concurrent(S.parent, .{ io, 5 });
     try testing.expectEqual(@as(u32, 22), fut.await(io));
+}
+
+test "an anonymous concurrent spawned from a fiber on a DRIVEN lane lands on a threaded lane, never the owner's (decision 0003 §AB.3: the drain worker never waits on a device); the spawner awaits it across the lanes" {
+    var budget: mem_budget.MemBudget = .{};
+    const sqz = try SqzIo.init(testing.allocator, .{
+        .budget_bytes = derive.GiB,
+        .budget = &budget,
+        .fuse = .{ .nqueues = 2, .q_depth = 4 },
+        .meta_lanes = 1,
+        .blocking_cap = 4,
+    });
+    defer sqz.deinit();
+    const page = std.heap.pageSize();
+    const driven = try Lane.init(testing.allocator, .{ .index = 0, .class = .fuse_ur, .fiber_capacity = 8, .stack_size = fiber_mod.stackSizeFor(.fuse_ur, page), .page = page, .driven = true });
+    defer driven.deinit();
+    try testing.expect(sqz.adoptDriven(driven));
+    defer sqz.releaseDriven(driven);
+    const Owner = struct {
+        sqz: *SqzIo,
+        lane: *Lane,
+        group: Io.Group = .init,
+        /// Whether the anonymous task's lane was the driven one (2 = unset).
+        task_driven: std.atomic.Value(u8) = .init(2),
+        result: anyerror!void = {},
+
+        fn task() bool {
+            return lane_mod.current_lane.?.driven;
+        }
+        fn spawner(self: *@This()) void {
+            const io_ = self.sqz.io();
+            var fut = io_.concurrent(task, .{}) catch return;
+            self.task_driven.store(@intFromBool(fut.await(io_)), .release);
+        }
+        fn main(self: *@This()) void {
+            self.result = self.body();
+        }
+        fn body(self: *@This()) !void {
+            try self.lane.attachDriven();
+            defer self.lane.detachDriven();
+            try self.sqz.spawnGroupOn(self.lane, &self.group, spawner, .{self});
+            // The owner's pump stands in for the worker's pass: the task's
+            // completion reaches the spawner through the lane's inbox.
+            while (self.lane.liveFibers() != 0) {
+                self.lane.pumpDriven();
+                try std.Thread.yield();
+            }
+        }
+    };
+    var o: Owner = .{ .sqz = sqz, .lane = driven };
+    const t = try std.Thread.spawn(.{}, Owner.main, .{&o});
+    t.join();
+    try o.result;
+    try testing.expectEqual(@as(u8, 0), o.task_driven.load(.acquire));
 }
 
 test "Io.Mutex contended across two lanes and the test thread: every increment lands" {

@@ -16,9 +16,10 @@
 #                       libc, so it cannot be intercepted); every row prints its engagement line.
 #                       The four columns of docs/evidence/rung-10-client-bypass-rows.md are
 #                       `MX_ENGINE=psync` × {ram-ext4, ram-xfs, ram-sqz} and ram-sqz-il.
-#   ram-sqz-il-direct   the DIRECT ARM (charter §7 "The direct arm"; rung-10-client-direct.md): the
-#                       set mounted `-o interception=direct`, the same preload and engine — a root
-#                       fio reads the data devices itself under layout leases; the fifth column.
+#   ram-sqz-il-direct   the DIRECT ARM (charter §7 "The direct arm"; rung-10-client-direct.md and
+#                       -writes.md): the set mounted `-o interception=direct`, the same preload and
+#                       engine — a root fio reads AND writes the data devices itself under layout
+#                       leases; the fifth column. `MX_MIX=1` adds the mixed randrw row.
 # Extra matrix.sh knobs pass through the environment (MX_ROWS, MX_PROFILE, MX_ENGINE, …).
 set -euo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)

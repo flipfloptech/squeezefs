@@ -91,6 +91,10 @@ sr1m-q16j4 read 1m 16 4
 sw1m-q16j1 write 1m 16 1
 sw1m-q16j4 write 1m 16 4
 sw4m-q4j4 write 4m 4 4"
+# MX_MIX=1 appends the mixed row (randrw 50/50, 4 KiB: one file read AND written by every job — the
+# direct arm's lease turnover case, rung-10-client-direct-writes.md); not in the default set.
+[ "${MX_MIX:-0}" = 1 ] && ROWTAB="$ROWTAB
+rwmix4k-q32j1 randrw 4k 32 1"
 
 # A snapshot: wall clock, /proc/stat's cpu line, diskstats of $devnames, the daemon's threads.
 snap() {
@@ -218,15 +222,16 @@ def d(suffix):
     ks = [k for k in fb if k.endswith("." + suffix) or k == suffix]
     return sum(fb[k] - fa.get(k, 0) for k in ks)
 ops = j["read"]["total_ios"] + j["write"]["total_ios"]
-# The direct arm's ops (the clients' pages folded at teardown) are the engagement law's third term.
-direct = d("ipc_direct_ops")
+# The direct arm's reads (the clients' pages folded at teardown) and writes (their notes) are the
+# engagement law's third and fourth terms.
+direct = d("ipc_direct_ops") + d("ipc_direct_writes")
 ring = d("ipc_ops_read") + d("ipc_ops_write") + direct
 # FUSE READs are counted at the worker (inline serves never reach a handler); WRITEs at the handler,
 # where a ring write's handoff runs too — those are ring ops, not kernel ones.
 fuse = d("transport_ring_reads") + max(0, d("fuse_op_latency_ns.write.count") - d("ipc_write_handoffs"))
 verdict = "ENGAGED" if ops and ring >= 0.99 * ops and fuse <= 0.01 * ops else "NOT ENGAGED (row INVALID as a bypass row)"
-print("matrix: %s %s engagement: ring+direct %d of %d fio ops (%.1f%%; direct %d, leases %d granted / rechecks refused %d), FUSE READ+WRITE %d — %s; reads: fast_path %d handoffs %d dd %d; writes: dd_inline %d handoffs %d severs %d; sessions %d svc_threads %d dd_shards %d; wakes %d park_timeouts %d empty_passes %d cqe_wakes %d/%d collapsed; lane_gate_routes %d; rejects %d poisoned %d" % (
-    label, row, ring, ops, 100.0 * ring / ops if ops else 0, direct, d("ipc_leases_granted"), d("ipc_direct_rechecks_failed"), fuse, verdict,
+print("matrix: %s %s engagement: ring+direct %d of %d fio ops (%.1f%%; direct reads %d writes %d, leases %d granted / %d write / rechecks refused %d / recalls %d forced %d), FUSE READ+WRITE %d — %s; reads: fast_path %d handoffs %d dd %d; writes: dd_inline %d handoffs %d severs %d; sessions %d svc_threads %d dd_shards %d; wakes %d park_timeouts %d empty_passes %d cqe_wakes %d/%d collapsed; lane_gate_routes %d; rejects %d poisoned %d" % (
+    label, row, ring, ops, 100.0 * ring / ops if ops else 0, d("ipc_direct_ops"), d("ipc_direct_writes"), d("ipc_leases_granted"), d("ipc_write_leases_granted"), d("ipc_direct_rechecks_failed"), d("ipc_write_lease_recalls"), d("ipc_write_leases_forced"), fuse, verdict,
     d("ipc_fast_path_serves"), d("ipc_read_handoffs"), d("ipc_dd_read_serves"),
     d("ipc_dd_inline_serves"), d("ipc_write_handoffs"), d("ipc_severs"),
     fb.get("ipc.ipc_sessions_active", fb.get("ipc_host.ipc_sessions_active", -1)), fb.get("ipc_host.ipc_service_threads", -1), fb.get("ipc_host.ipc_dd_shards", -1),
@@ -246,7 +251,8 @@ echo -e "label\trow\tIOPS\tMiB/s\tp50us\tp99us\tfio%\thost_cores\tdaemon_cores\t
 while read -r name rw bs qd nj; do
   [[ $name =~ $ROWS ]] || continue
   extra=(--randrepeat=0 --norandommap)
-  case $rw in *write) extra+=(--end_fsync=1) ;; esac
+  case $rw in *write|randrw) extra+=(--end_fsync=1) ;; esac
+  [ "$rw" = randrw ] && extra+=(--rwmixread=50)
   if [ "$ENGINE" = psync ]; then
     nj=$((qd * nj)); [ "$nj" -le "$PSYNC_CAP" ] || nj=$PSYNC_CAP; qd=1
   fi

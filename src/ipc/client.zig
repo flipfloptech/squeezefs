@@ -695,22 +695,37 @@ pub const Session = struct {
     /// single flight; larger lengths pipeline flights.
     pub fn pread(self: *Session, binding: u64, dst: []u8, offset: u64) Outcome {
         if (dst.len == 0) return .{ .served = 0 };
-        if (self.direct) |*d| if (!self.poisoned()) {
-            // A direct-only client never parks on a slot, so the heartbeat
-            // ladder runs here: a dead daemon can no longer move the epochs
-            // its leases rest on — poison, and the op falls through to the
-            // kernel (loud: the mount is gone with its daemon).
-            if (!self.heartbeatAlive(clock.monotonicNs())) {
-                self.poison();
-                return .fallthrough;
-            }
-            switch (d.pread(binding, dst, offset, self.directStats(), self)) {
-                .served => |n| return .{ .served = n },
-                .ring => {},
-            }
-        };
+        if (self.directPread(binding, dst, offset)) |o| return o;
+        return self.preadRing(binding, dst, offset);
+    }
+
+    /// The ring alone (the shim asked the direct arm itself, before its gate).
+    pub fn preadRing(self: *Session, binding: u64, dst: []u8, offset: u64) Outcome {
+        if (dst.len == 0) return .{ .served = 0 };
         if (dst.len <= self.layout.slab) return self.singleOp(.read, binding, offset, dst);
         return self.multiOp(.read, binding, offset, dst);
+    }
+
+    /// The direct arm alone: `served` (the device's bytes in `dst`), a
+    /// `fallthrough` (the session poisoned under the heartbeat ladder), or
+    /// null (no arm, or the op is the ring's / the kernel's). The shim asks
+    /// BEFORE its lane gate: the gate prices the ring's copies, which the
+    /// arm never pays, so a 1 MiB read within one block is one device read.
+    pub fn directPread(self: *Session, binding: u64, dst: []u8, offset: u64) ?Outcome {
+        const d = &(self.direct orelse return null);
+        if (self.poisoned()) return null;
+        // A direct-only client never parks on a slot, so the heartbeat
+        // ladder runs here: a dead daemon can no longer move the epochs its
+        // leases rest on — poison, and the op falls through to the kernel
+        // (loud: the mount is gone with its daemon).
+        if (!self.heartbeatAlive(clock.monotonicNs())) {
+            self.poison();
+            return .fallthrough;
+        }
+        return switch (d.pread(binding, dst, offset, self.directStats(), self)) {
+            .served => |n| .{ .served = n },
+            .ring => null,
+        };
     }
 
     fn directStats(self: *Session) direct_client.Stats {

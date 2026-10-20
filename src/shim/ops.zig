@@ -78,13 +78,23 @@ fn ringPositional(st: *State, cell: *fd_table.Cell, op: Op, buf: []u8, offset: u
         classify.note(.wrong_direction, s);
         return .real;
     }
+    // The direct arm (charter §7 "The direct arm") before the lane gate: the
+    // gate prices the ring's copies, which the device read never pays.
+    if (op == .read) if (s.directPread(cell.binding.id, buf, offset)) |o| switch (o) {
+        .served => |n| return .{ .served = n },
+        .errno => |e| return .{ .errno = e },
+        .fallthrough => {
+            classify.note(.poisoned, s);
+            return .real_poisoned;
+        },
+    };
     if (gate and s.routesKernel(buf.len)) {
         s.noteKernelRoute(buf.len);
         classify.note(.lane_gate, s);
         return .real;
     }
     const outcome = switch (op) {
-        .read => s.pread(cell.binding.id, buf, offset),
+        .read => s.preadRing(cell.binding.id, buf, offset),
         else => s.pwrite(cell.binding.id, buf, offset),
     };
     switch (outcome) {

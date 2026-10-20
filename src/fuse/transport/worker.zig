@@ -216,6 +216,10 @@ pub var handler_dispatches_foreign: counters.ShardedCounter = .{};
 /// room for (`Shared.write_own_depth` handlers live) — handed to the CPU's
 /// lane, the two-thread arm (counted among the foreign dispatches too).
 pub var write_spills: counters.ShardedCounter = .{};
+/// `transport_stream_spreads`: a spilled held write of the overlay class
+/// dispatched round-robin over the node's lanes (`Shared.stream_lanes`
+/// `node`/`node_only`) instead of the queue's CPU lane.
+pub var stream_spreads: counters.ShardedCounter = .{};
 /// `transport_lane_pumps`: passes that ran the worker's lane.
 pub var lane_pumps: counters.ShardedCounter = .{};
 /// `transport_park_backstop_ticks`: bounded parks that ticked out
@@ -699,11 +703,23 @@ pub const Shared = struct {
     /// the row's default is the measured knee, 8 (rung-10-write-lane). The
     /// session reads the row; this zero is a bare `Shared`'s (tests).
     write_own_depth: u32 = 0,
+    /// `SQUEEZEFS_FUSE_STREAM_LANES`: where a held write of the overlay
+    /// class (`> block/8`, the streaming write) runs when it leaves this
+    /// thread — `cpu`: the queue's CPU lane like every data-class request
+    /// (the control arm: one lane carries the queue's whole depth);
+    /// `node`: round-robin over the node's handler lanes; `node_only`:
+    /// the same, and never the worker's own lane. Derivation: a queue
+    /// holds up to `depth` streaming writes whose handler costs tens of µs
+    /// each against a device phase of hundreds, so one lane serializes
+    /// what the device would overlap (measured on 1M seq write ×4).
+    stream_lanes: StreamLanes = .cpu,
     /// The no-open posture (`Config.no_open`, decision 0003 §AF): a FLUSH
     /// is probed here first, and its drain is the data class.
     no_open: bool = false,
     /// The executor's budget the driven lane's fiber reserve derives from.
     budget_bytes: u64 = 0,
+
+    pub const StreamLanes = enum(u8) { cpu, node, node_only };
 
     pub fn nodeOf(self: *const Shared, qid: u16) ?u16 {
         const n = self.node_of(self.node_ctx, qid) orelse return null;
@@ -1486,6 +1502,21 @@ pub const Group = struct {
         const l = self.lane orelse return false;
         const depth = ownDepthShare(self.shared.write_own_depth, self.shared.rings_per_queue);
         return depth == 0 or l.liveFibers() < depth;
+    }
+
+    /// Where a held write's handler runs (pure; `Shared.stream_lanes`):
+    /// `own` = the worker's own lane (the own-depth share has room, and the
+    /// class is not barred from it); `spread` = a spilled write of the
+    /// overlay class (`> block/8`, the hold class's own line) under `node`
+    /// or `node_only` takes a node-round-robin lane instead of the queue's
+    /// CPU lane. A W1-class write never spreads; `cpu` never spreads.
+    pub const Placement = struct { own: bool, spread: bool };
+
+    pub fn heldWritePlacement(held: bool, len: u32, block: u64, lanes: Shared.StreamLanes, own_room: bool) Placement {
+        if (!held) return .{ .own = false, .spread = false };
+        const streaming = lanes != .cpu and zc.holdClass(len, zc.streamingFloor(block)) == .overlay;
+        const own = own_room and !(streaming and lanes == .node_only);
+        return .{ .own = own, .spread = streaming and !own };
     }
 
     /// The knee (`SQUEEZEFS_FUSE_WRITE_OWN_DEPTH`) was measured per QUEUE —
@@ -3206,12 +3237,13 @@ pub const Group = struct {
     fn dispatch(self: *Group, gent: u32, req: fsv.Request, sref: slot.SlotRef, lease: ?slot.PayloadLease) void {
         const m = self.memberOf(gent);
         const handle: fsv.Handle = .{ .tx = self.shared.tx, .slot = .{ .ring = sref }, .unique = req.unique(), .window = self.window(gent) };
-        const cpu: ?u16 = if (self.shared.qid_is_cpu) m.qid else null;
         // The worker's own lane: the handler runs on this thread (§AB.3).
         const held_write = if (lease) |l| l.held else false;
-        const own_write = held_write and self.ownLaneHasRoom();
-        if (held_write and !own_write) write_spills.inc();
-        const own = if (onWorkerLane(req.op, self.shared.no_open, own_write)) self.lane else null;
+        const place = heldWritePlacement(held_write, self.held_len[gent], self.shared.block_size, self.shared.stream_lanes, self.ownLaneHasRoom());
+        if (held_write and !place.own) write_spills.inc();
+        if (place.spread) stream_spreads.inc();
+        const cpu: ?u16 = if (self.shared.qid_is_cpu and !place.spread) m.qid else null;
+        const own = if (onWorkerLane(req.op, self.shared.no_open, place.own)) self.lane else null;
         const lane = own orelse self.shared.exec.homeLane(cpu, self.shared.nodeOf(m.qid));
         if (own != null) {
             handler_dispatches_own.inc();
@@ -3592,6 +3624,30 @@ test "the own-lane knee is a queue's: one ring takes it whole, two rings split i
     try testing.expectEqual(@as(u32, 1), Group.ownDepthShare(1, 2));
     try testing.expectEqual(@as(u32, 0), Group.ownDepthShare(0, 2));
     try testing.expectEqual(@as(u32, 0), Group.ownDepthShare(0, 1));
+}
+
+test "a held write's placement (SQUEEZEFS_FUSE_STREAM_LANES): the overlay class (> block/8) spreads over the node's lanes when it spills under `node`, always under `node_only` (never the own lane), never under `cpu`; the W1 class (≤ block/8) and an unheld write never spread; the own-depth share decides `own` unless the class is barred" {
+    const block: u64 = 4 << 20;
+    const mib: u32 = 1 << 20;
+    const w1: u32 = 512 << 10;
+    const P = Group.Placement;
+    // The control arm: today's placement.
+    try testing.expectEqual(P{ .own = true, .spread = false }, Group.heldWritePlacement(true, mib, block, .cpu, true));
+    try testing.expectEqual(P{ .own = false, .spread = false }, Group.heldWritePlacement(true, mib, block, .cpu, false));
+    // `node`: the own share first, the node's lanes for the spill.
+    try testing.expectEqual(P{ .own = true, .spread = false }, Group.heldWritePlacement(true, mib, block, .node, true));
+    try testing.expectEqual(P{ .own = false, .spread = true }, Group.heldWritePlacement(true, mib, block, .node, false));
+    try testing.expectEqual(P{ .own = false, .spread = true }, Group.heldWritePlacement(true, w1 + 4096, block, .node, false));
+    // `node_only`: the streaming class never takes the worker's lane.
+    try testing.expectEqual(P{ .own = false, .spread = true }, Group.heldWritePlacement(true, mib, block, .node_only, true));
+    try testing.expectEqual(P{ .own = false, .spread = true }, Group.heldWritePlacement(true, mib, block, .node_only, false));
+    // W1 (at the line and under it) keeps the CPU lane under every arm.
+    for ([_]Shared.StreamLanes{ .cpu, .node, .node_only }) |arm| {
+        try testing.expectEqual(P{ .own = true, .spread = false }, Group.heldWritePlacement(true, w1, block, arm, true));
+        try testing.expectEqual(P{ .own = false, .spread = false }, Group.heldWritePlacement(true, 4096, block, arm, false));
+    }
+    // An unheld write (extracted at delivery): the data class, never own, never spread.
+    try testing.expectEqual(P{ .own = false, .spread = false }, Group.heldWritePlacement(false, mib, block, .node_only, true));
 }
 
 test "the owed spin's budget: no slept measurement ⇒ park; no caught one ⇒ the probe spins to the slept RTO; else 2·W where W = slept − caught, only while the landing is predicted inside it, and until one wake past the landing (never the caught RTO: a stable device collapses it onto the landing); the horizon names which owed completion is still the spin's" {

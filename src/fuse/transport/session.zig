@@ -1169,6 +1169,13 @@ pub const Session = struct {
         return if (n == placement.no_node) null else n;
     }
 
+    /// `SQUEEZEFS_FUSE_STREAM_LANES` (the registry's one parser; its
+    /// allowed set is the enum's field names).
+    fn streamLanesKnob(env: *const std.process.Environ.Map) worker.Shared.StreamLanes {
+        const s = knobs.enumKnob("SQUEEZEFS_FUSE_STREAM_LANES", env);
+        return std.meta.stringToEnum(worker.Shared.StreamLanes, s) orelse .node;
+    }
+
     /// THE ORDERED BRING-UP. `fs.init` runs once the geometry is planned.
     /// `cfg.fuse_fd` (fusermount3's, already mounted) is this call's on
     /// every path: a failure closes it and detaches the mount.
@@ -1374,9 +1381,11 @@ pub const Session = struct {
             .owed_spin = knobs.boolKnob("SQUEEZEFS_FUSE_OWED_SPIN", env),
             .rings_per_queue = self.rings_per_queue,
             .write_own_depth = knobs.intKnob("SQUEEZEFS_FUSE_WRITE_OWN_DEPTH", u32, env),
+            .stream_lanes = streamLanesKnob(env),
             .no_open = cfg.no_open,
             .budget_bytes = cfg.mem_budget_bytes,
         };
+        if (self.shared.stream_lanes != .node) log.info("transport: SQUEEZEFS_FUSE_STREAM_LANES={t} — the streaming write's lane placement (the A/B lever; `node` is the derived default)", .{self.shared.stream_lanes});
         if (read_fusion_lever and !self.shared.read_fusion_on) log.info("transport: SQUEEZEFS_FUSE_READ_FUSION=1 accepted; inert on a {t} session (the fused poll is the zero-copy mode's)", .{self.mode});
         if (self.shared.sqpoll) log.info("transport: SQUEEZEFS_FUSE_SQPOLL=1 — the kernel submission poller (measured not recommended: the A/B control arm)", .{});
         self.shared.register_refuse_remaining.store(knobs.intKnob("SQUEEZEFS_TEST_FUSE_REGISTER_REFUSE", u32, env), .monotonic);
@@ -2044,6 +2053,7 @@ pub const Session = struct {
         try field(w, "transport_handler_dispatches_own", worker.handler_dispatches_own.load());
         try field(w, "transport_handler_dispatches_foreign", worker.handler_dispatches_foreign.load());
         try field(w, "transport_write_spills", worker.write_spills.load());
+        try field(w, "transport_stream_spreads", worker.stream_spreads.load());
         try field(w, "transport_lane_pumps", worker.lane_pumps.load());
         try field(w, "transport_payload_leases", slot.payload_leases.load());
         try field(w, "transport_dest_dma_leases", slot.dest_dma_leases.load());

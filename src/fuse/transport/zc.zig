@@ -186,6 +186,16 @@ pub fn holdClass(size: u32, patch_max: u64) HoldClass {
     return if (@as(u64, size) <= patch_max) .w1 else .overlay;
 }
 
+/// The class line as the transport derives it for a PLACEMENT choice
+/// (`worker.Group.heldWritePlacement`): `block/8`, the same denominator as
+/// the data plane's `sole_owner_patch.patchMaxDerived` (the natural
+/// sub-block grain: 512 KiB at the 4 MiB block). The data plane's knob
+/// `SQUEEZEFS_PATCH_MAX_BYTES` moves where a write is STORED; where its
+/// handler RUNS follows the derived line alone.
+pub fn streamingFloor(block: u64) u64 {
+    return block / 8; // block/8: W1's ceiling, the overlay's floor (charter §6.2 items 1–2)
+}
+
 /// The stability law (porting spec §5.2): page-cache folios are sound after
 /// an ACK-early (a later modification is a redirty = a new WRITE);
 /// O_DIRECT/GUP pages are NOT (the app owns them again at write(2)'s return
@@ -421,6 +431,10 @@ test "the hold shape: 4 KiB alignment, within one block, zero length never, no b
     try testing.expectEqual(HoldClass.overlay, holdClass(1 << 20, patch_max));
     // The patch-OFF control arm (SQUEEZEFS_PATCH_MAX_BYTES=0): every length is the overlay's.
     try testing.expectEqual(HoldClass.overlay, holdClass(4096, 0));
+    // The placement line restates the data plane's derived patch max: block/8 (512 KiB at 4 MiB).
+    try testing.expectEqual(patch_max, streamingFloor(block));
+    try testing.expectEqual(@as(u64, 512 << 10), streamingFloor(block));
+    try testing.expectEqual(@import("../../data/sole_owner_patch.zig").patchMaxDerived(block), streamingFloor(block));
 }
 
 test "the stability class: O_DIRECT without FUSE_WRITE_CACHE is direct_gup; a writeback-cache write is page_cache even with O_DIRECT; a plain write is page_cache" {

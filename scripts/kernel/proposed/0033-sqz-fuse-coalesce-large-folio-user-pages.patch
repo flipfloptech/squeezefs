@@ -1,0 +1,146 @@
+From: SqueezeFS-Zig <sqz@localhost>
+Date: Tue, 20 Oct 2026 20:00:00 +0000
+Subject: [PATCH] sqz: fuse: coalesce the contiguous pages of one folio into one descriptor in fuse_get_user_pages(), and release that many pins at once — a direct-I/O request over a large-folio buffer is pinned, dirtied, zero-copy registered and bio-mapped per folio, not per 4 KiB page
+
+PROPOSED (scripts/kernel/proposed/, not in the series): compile-checked
+(W=1, the whole fuse module: fuse.ko, cuse.ko, virtiofs.ko) as an
+out-of-tree module against the 7.2.8 omarchy-sqz tree with 0001-0030
+applied plus the proposed 0031 (it composes with 0031's per-entry
+zero-copy scratch and stands without it: the hunks touch file.c alone);
+NOT booted, NOT measured. The owner builds and boots; the probe plan is
+below.
+
+Why (docs/evidence/rung-10-seq-parity.md, wave 2). fuse_get_user_pages()
+walks the pages iov_iter_extract_pages() returns and records one
+(folio, offset, length <= PAGE_SIZE) descriptor PER PAGE — "Currently,
+all folios in FUSE are one page" — even when 256 consecutive pages are
+one 2 MiB THP folio (transparent_hugepage=always: fio's 1 MiB O_DIRECT
+buffers here, any THP-backed application buffer). Every consumer then
+works per descriptor, 256 times per 1 MiB request:
+
+  - fuse_release_user_pages(): 256 unpin_folio() (and on a READ 256
+    folio_mark_dirty_lock() + folio_unlock()) at fuse_request_end(),
+    which under FUSE-over-io_uring runs on the daemon's ring thread at
+    COMMIT — the thread that serializes a queue's whole depth;
+  - the zero-copy install (fuse_uring_set_up_zero_copy): 256 folio_get(),
+    a 256-bvec table copied into the imu (io_buffer_register_bvec: a
+    kvmalloc + memset per request), and the release's 256 folio_put();
+  - the daemon's READ_FIXED/WRITE_FIXED over that table: a 255-bvec bio
+    whose bio_split_rw() segment scan, __blk_rq_map_sg() and
+    sg_alloc_table_chained() are O(bvecs), then nvmet's 255 bio_add_page().
+
+Measured on the workstation (RAM NVMe over nvme-loop, 1 MiB O_DIRECT
+QD16 x 4 jobs, perf on the daemon's ring workers, 2026-10-20): on the
+READ row these terms are 52 % of the worker's 46 us per request
+(unpin_folio 15.2 %, folio_mark_dirty_lock + folio_unlock 7.4 %,
+io_buffer_unregister 4.8 %, the imu memset 5.6 %, io_buffer_register_bvec
+3.2 %, bio_split_io_at 6.1 %, sg_alloc_table_chained 4.6 %,
+__blk_rq_map_sg 3.2 %, kmalloc 2.2 %) — about 24 us; on the WRITE row
+25 % of 68 us — about 17 us (unpin_folio 5.9 %, io_buffer_unregister
+3.8 %, memset 3.4 %, io_buffer_register_bvec 2.0 %, bio_split_io_at 4.8 %,
+__blk_rq_map_sg 2.4 %, sg_alloc_table_chained 2.5 %). ext4 on the same
+substrate pays none of it: iomap's bio carries the folio as one bvec.
+
+What. In fuse_get_user_pages() a page that continues the previous
+descriptor's folio contiguously extends that descriptor instead of
+opening a new one, so num_folios counts folio runs (1-2 for a 1 MiB
+request inside THP memory, 256 as today for 4 KiB pages); the page bound
+(nr_pages against max_pages) is unchanged, so a request still carries at
+most max_pages pages. fuse_release_user_pages() releases a descriptor's
+pins with unpin_user_folio(folio, pages spanned) — GUP pins a large
+folio once per page (gup_fast_pmd_leaf: refs = pages), so the release
+gives back the same count; a one-page descriptor releases one pin, as
+before. Every consumer already takes a (folio, offset, length) triple
+whose length may exceed a page — fuse_copy_folio() (kmap_local_folio at
+the offset; the page-cache descriptors are multi-page today), the uring
+copy path through fuse_copy_args(), the zero-copy bvec (bv_offset past
+the first page is the block layer's multi-page bvec form; io_import_kbuf
+imports it with iov_iter_bvec + iov_iter_advance), virtiofs's
+sg_set_folio(). Nothing changes for buffers of 4 KiB pages.
+
+Expected saving (from the trace, THP-backed buffers): the daemon ring
+worker's CPU per 1 MiB read -~24 us of 46 (-52 %), per 1 MiB write -~17 us
+of 68 (-25 %); the imu allocation per request gone (1-2 bvecs fit 0031's
+32-folio scratch); the DMA's bio one bvec, so the block layer's split
+scan, sg mapping and nvmet's bio building are O(1) instead of O(255)
+per request — a shorter device phase (the daemon's `store` phase, 485 us
+at 52 GB/s against ext4's whole 300-460 us path). On the sequential rows
+that CPU sits on the thread that serializes a queue's depth, so the
+latency it costs is more than its CPU share.
+
+Probe plan: the same rows (scripts/perf/matrix.sh sw1m-q16j4,
+sr1m-q16j4, sw4m-q4j4) before and after the boot — the daemon's
+`sqz-fuse-ur` cores and us/op from the row's .sched.txt, the
+transport_held_write_phase_ns `store` and `to_commit` phases, perf's
+unpin_folio share; then with transparent_hugepage=never (the 4 KiB
+control: nothing may move); then the zc e2e rows, THE KILL MATRIX and
+the fstests direct-I/O groups (generic/*dio*, a buffer straddling two
+folios: the second descriptor's offset 0).
+---
+ fs/fuse/file.c | 40 +++++++++++++++++++++++++++++++++-------
+ 1 file changed, 34 insertions(+), 6 deletions(-)
+
+--- a/fs/fuse/file.c
++++ b/fs/fuse/file.c
+@@ -607,6 +607,17 @@
+ 	args->out_args[0].size = count;
+ }
+ 
++/*
++ * The pages a user-page descriptor spans. fuse_get_user_pages() coalesces
++ * the contiguous pages of one folio into one descriptor, and GUP pinned the
++ * folio once per page, so the release gives back as many pins.
++ */
++static unsigned int fuse_user_desc_pages(const struct fuse_folio_desc *desc)
++{
++	return (desc->offset + desc->length - 1) / PAGE_SIZE -
++	       desc->offset / PAGE_SIZE + 1;
++}
++
+ static void fuse_release_user_pages(struct fuse_args_pages *ap, ssize_t nres,
+ 				    bool should_dirty)
+ {
+@@ -616,7 +627,8 @@
+ 		if (should_dirty)
+ 			folio_mark_dirty_lock(ap->folios[i]);
+ 		if (ap->args.is_pinned)
+-			unpin_folio(ap->folios[i]);
++			unpin_user_folio(ap->folios[i],
++					 fuse_user_desc_pages(&ap->descs[i]));
+ 	}
+ 
+ 	if (nres > 0 && ap->args.invalidate_vmap)
+@@ -1629,13 +1641,29 @@
+ 			unsigned int offset = start +
+ 				(folio_page_idx(folio, pages[i]) << PAGE_SHIFT);
+ 			unsigned int len = umin(ret, PAGE_SIZE - start);
++			struct fuse_folio_desc *prev = ap->num_folios ?
++				&ap->descs[ap->num_folios - 1] : NULL;
+ 
+-			ap->descs[ap->num_folios].offset = offset;
+-			ap->descs[ap->num_folios].length = len;
+-			ap->folios[ap->num_folios] = folio;
++			/*
++			 * A page that continues the previous descriptor's folio
++			 * contiguously extends that descriptor: one descriptor
++			 * per folio run, so a large-folio buffer costs one pin
++			 * release, one dirtying and one zero-copy bvec per folio
++			 * rather than per 4 KiB page. Every consumer takes a
++			 * (folio, offset, length) triple whose length may exceed
++			 * a page, as the page-cache descriptors already do.
++			 */
++			if (prev && ap->folios[ap->num_folios - 1] == folio &&
++			    prev->offset + prev->length == offset) {
++				prev->length += len;
++			} else {
++				ap->descs[ap->num_folios].offset = offset;
++				ap->descs[ap->num_folios].length = len;
++				ap->folios[ap->num_folios] = folio;
++				ap->num_folios++;
++			}
+ 			start = 0;
+ 			ret -= len;
+-			ap->num_folios++;
+ 		}
+ 
+ 		nr_pages += nfolios;

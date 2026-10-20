@@ -36,11 +36,13 @@
 //! truncate to zero, a destroy. The two homes of a synced file must agree
 //! at every cut: as long as the publish that stopped naming the record is
 //! not durable, recovery reads the OLD layout and expects the record whole,
-//! so the departed copy stays on the segment (no tombstone, no punch, its
-//! slot live for placement) until a COVER ROUND — the meta barrier past that
-//! publish (`CoverSeam`, the plane binds it) — lands (`Segment.cover`). The
-//! block a promotion DMA'd is the plane's: it flushes the volume BEFORE the
-//! publish (DUR-1), so a durable layout never names bytes a cut took.
+//! so a SYNCED copy that departs stays on the segment (no tombstone, no
+//! punch, its slot live for placement) until a COVER ROUND — the meta
+//! barrier past that publish (`CoverSeam`, the plane binds it) — lands
+//! (`Segment.cover`); a copy no sync ever covered owes nothing to a cut and
+//! is released at once, as a superseded unsynced copy is. The block a
+//! promotion DMA'd is the plane's: it flushes the volume BEFORE the publish
+//! (DUR-1), so a durable layout never names bytes a cut took.
 
 const std = @import("std");
 const testkit = @import("../core/testkit.zig");

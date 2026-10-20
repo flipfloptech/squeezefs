@@ -5309,12 +5309,30 @@ fn killRowTarX(strict: bool) !void {
         defer gpa.free(listing);
         break :blk try TarWriteGrain.parse(listing, try TarWriteGrain.recordBlocks(defaults));
     };
-    try rig.spawnMount(&.{});
+    // The coalesced arm runs SUPERVISED (charter §5.2 "The ack point",
+    // decision 0003 §BB.7): its acks precede the landing, and the kill -9
+    // is the replay's proof — the supervisor writes the journal tail to the
+    // device before the writer guard is released, so every acked create is
+    // present on the remount. The strict arm is durable at the ack and runs
+    // in the foreground (no replay to prove).
+    const supervised = !strict;
+    var daemon_pid: linux.pid_t = 0;
+    if (supervised) {
+        const r = try rig.squeezefs(&.{ "mount", "--daemon", "--supervise", "--log-file", rig.log_path, rig.meta_uri, rig.mp });
+        defer rig.freeRun(r);
+        if (!r.term.success()) std.debug.print("\ndaemon mount: {s}\n", .{r.stderr});
+        try testing.expect(r.term.success());
+    } else try rig.spawnMount(&.{});
     const ready1 = try rig.awaitReady(0);
     {
         const text = try rig.readLog();
         defer gpa.free(text);
         try testing.expect(std.mem.indexOf(u8, text[0..ready1], cadence_word) != null);
+        if (supervised) {
+            const ready_i = std.mem.lastIndexOf(u8, text[0..ready1], "ready: ") orelse return error.NoReadyLine;
+            daemon_pid = @intCast(numberAfter(text[ready_i..], "(pid ") orelse return error.NoPid);
+            try testing.expect(std.mem.indexOf(u8, text, "journal tails: 1 volume(s) handed to the supervisor") != null);
+        }
     }
     // tar -x in a child; kill the daemon once enough files exist. tar's
     // stderr IS its ack ledger: the entries it could not open or write
@@ -5343,9 +5361,23 @@ fn killRowTarX(strict: bool) !void {
         }
     }
     try testing.expect(seen >= kill_after_files);
-    _ = linux.kill(rig.child_pid, .KILL);
-    const killed = try rig.waitChild();
-    try testing.expectEqual(std.process.Child.Term{ .signal = .KILL }, killed);
+    if (supervised) {
+        _ = linux.kill(daemon_pid, .KILL);
+        // The supervisor's replay, then the guard's release, then its exit.
+        const replay_i = try rig.awaitLog("supervisor: journal tail of volume 0 (", ready1, 30 * std.time.ns_per_s);
+        const released_i = try rig.awaitLog("supervisor: writer guard released on 1 volume(s) after the replay", ready1, 30 * std.time.ns_per_s);
+        try testing.expect(released_i > replay_i);
+        _ = try rig.awaitLog("exited (wait status 0x9); done", released_i, 30 * std.time.ns_per_s);
+        const after = try rig.readLog();
+        defer gpa.free(after);
+        const line = after[replay_i - 1 ..];
+        std.debug.print("\nsmoke[replay]: {s}\n", .{line[0 .. std.mem.indexOfScalar(u8, line, '\n') orelse line.len]});
+        try testing.expect(std.mem.indexOf(u8, after, "replay FAILED") == null);
+    } else {
+        _ = linux.kill(rig.child_pid, .KILL);
+        const killed = try rig.waitChild();
+        try testing.expectEqual(std.process.Child.Term{ .signal = .KILL }, killed);
+    }
     // tar fails (ENOTCONN) and exits; the dead connection unmounts.
     const tar_term = try tar.wait(io);
     try testing.expect(!tar_term.success());
@@ -5453,7 +5485,7 @@ fn killRowTarX(strict: bool) !void {
     try testing.expectEqual(@as(usize, 0), try fuseMountsOf(gpa, io, rig.mp));
 }
 
-test "smoke: kill -9 mid-tar -x → remount replays the window → judged at tar's write(2) grain: every write tar was acked on is present whole, an unacked file is whole, empty or cut exactly at tar's first write of a record-boundary entry, nothing else; a clean cycle after it" {
+test "smoke: kill -9 mid-tar -x (a `--daemon --supervise` mount: the replay's proof — the supervisor writes the journal tail to the device before the writer guard is released) → remount replays the window → judged at tar's write(2) grain: every write tar was acked on is present whole, an unacked file is whole, empty or cut exactly at tar's first write of a record-boundary entry, nothing else; a clean cycle after it" {
     try killRowTarX(false);
 }
 

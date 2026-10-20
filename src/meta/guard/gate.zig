@@ -1097,6 +1097,10 @@ test "a heartbeat rewrites ts and heartbeat_seq through the conveyor (coalesced 
     const gpa = testing.allocator;
     const v = try Vol.create(gpa, "beat", "600000");
     defer v.destroy();
+    // The durable-at-ack arm (decision 0003 §BB.1's control): a failed
+    // refresh is the committer's to hear; under the shipped arm it is the
+    // volume's FAILED latch (§BB.5).
+    try v.env.put("SQUEEZEFS_META_ACK_POINT", "landing");
     const be = try v.open(.{ .test_identity = ident(boot_a, 4000, 777), .test_pid_probe = PidTable.probe }, 0);
     defer be.close();
     const g = be.guard.?;
@@ -1334,6 +1338,9 @@ test "THE FENCE LATCH on the device path: an injected reservation conflict on (a
         // Strict mode for the barrier cases (a barrier per commit).
         const v = try Vol.create(gpa, name, if (case == .lane_barrier) "0" else "600000");
         defer v.destroy();
+        // The fence on an entry write reaches the committer under the
+        // durable-at-ack arm (§BB.1's control); the latch is the same.
+        try v.env.put("SQUEEZEFS_META_ACK_POINT", "landing");
         const be = try v.open(.{ .test_identity = ident(boot_a, 4000, 777), .test_pid_probe = PidTable.probe }, if (case == .checkpoint_barrier) 0 else 1);
         defer be.close();
         const fenced0 = guard.stats.fenced.load();
@@ -1392,6 +1399,10 @@ test "the writer claim's commit failing EIO at open refuses the mount loud (Io),
     const gpa = testing.allocator;
     const v = try Vol.create(gpa, "claim-eio", "600000");
     defer v.destroy();
+    // The committer hears the EIO under the durable-at-ack arm (§BB.1's
+    // control); the shipped arm's open hears it from the barrier that
+    // follows the claim (the volume FAILED under it, §BB.5).
+    try v.env.put("SQUEEZEFS_META_ACK_POINT", "landing");
     journal_lane.test_seams.fail_windows.store(1, .release);
     defer journal_lane.test_seams.fail_windows.store(0, .release);
     // The refusal's one line, on this thread.

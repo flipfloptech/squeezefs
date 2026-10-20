@@ -1568,7 +1568,10 @@ pub const JournalLane = struct {
                 continue;
             }
             _ = w.fsync_waiters.swapRemove(i);
-            self.publishAck(c, result, now);
+            // A volume FAILED under the request (a write that failed after
+            // its ack, §BB.5): the fsync hears it, as ext4's does after a
+            // journal abort.
+            self.publishAck(c, if (self.latch.isFailed()) error.VolumeFailed else result, now);
         }
         if (w.fsync_waiters.items.len != 0) {
             w.needs_flush = true;

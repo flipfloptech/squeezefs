@@ -3556,7 +3556,7 @@ test "§BB.5 a journal write that fails AFTER its window was acked: the commit r
     const gpa = testing.allocator;
     const v = try TestVol.create(gpa, "acked-fail", "600000");
     defer v.destroy();
-    v.lane_error_logs = 2;
+    v.lane_error_logs = 1;
     const be = try v.open();
     defer be.close();
     _ = try commitCreate(be, "base");
@@ -3577,6 +3577,7 @@ test "§BB.5 a journal write that fails AFTER its window was acked: the commit r
     try testing.expectEqual(@as(u64, 0), be.conveyorStats().rollbacks.load());
     try testing.expect(try present(be, ino));
     try testing.expectError(error.VolumeFailed, commitCreate(be, "post"));
+    try testing.expectError(error.VolumeFailed, be.fsync());
     // The tail keeps the window: the replay's bytes.
     try testing.expect(be.tail.?.image.writtenCount() >= 1);
 }

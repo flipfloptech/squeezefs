@@ -191,6 +191,8 @@ Panic at A2–A7 ⇒ release admission, fail members, unlead; panic at A8–A11 
 
 **Acks only after the entry landed; strict after the barrier; guards drop before ack; acks in journal order** — all four charter laws are visible in steps 8–14 + `fan_out`.
 
+**Zig port, amended 2026-10-20 (decision 0003 §BB; charter §5.2 "The ack point"):** the reference's first law is the STRICT arm's alone. Under the coalesced cadence the applier answers the members after the RAM apply, the encode, the copy of the window's image into the journal tail (`meta/journal_tail.zig`: a memfd mirror of the ring the supervisor holds and replays at the daemon's death) and the lane handoff; the lane's steps 8–13 stand for the landing and step 14 frees the window. A write that fails after an ack latches the volume FAILED with no rollback. A barrier an fsync pulls starts only after every window admitted before it landed.
+
 #### 2.3.1 Stage B as a step table
 
 | Step | What | Node locks | Ring state | On failure |
@@ -339,6 +341,8 @@ Serialized by `&mut SmoContext` behind `KvMetaBackend::smo: SqzMutex<SmoContext>
 ### 2.15 fsync and strict mode
 
 `sync_device` (`backend.rs:16071-16109`): `SyncCoalescer::barrier_bounded(threshold, fdatasync)` — the trailing coalesced barrier (leader runs, followers ride); `meta_device_syncs++`; DUR-3 tickets; `note_barrier_success/failure`; `after_durable_barrier()`. Strict mode = `SQUEEZEFS_META_FLUSH_INTERVAL_MS=0` ⇒ `strict = true` (`:1320`): the lane barriers once per group (§2.3 step 13); the checkpoint task still ticks at 100 ms for reclamation/SMOs. Deferred mode: the lane sets `needs_flush`, the tick barriers.
+
+**Zig port (2026-10-20, §BB):** deferred mode acks at the apply; an `fsync`'s barrier request covers every window admitted to the lane before it (the fiber starts the barrier once they landed), so an acked op is on stable storage when `fsync`/`fsyncdir`/`syncfs` return. Strict mode is the durable-at-ack lever.
 
 ### 2.16 Journal economy
 

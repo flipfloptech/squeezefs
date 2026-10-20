@@ -418,6 +418,16 @@ acking survivors → (10) strict mode (`META_FLUSH_INTERVAL_MS == 0`): ONE coale
 deferred flusher barriers; default `resolve_flush_interval_ms() = 50`, legacy alias
 `SQUEEZEFS_JOURNAL_FLUSH_INTERVAL_MS`, mod.rs:191–200) → (11) terminal outcomes window by
 window in journal order; guards drop BEFORE the ack.
+**Zig port, amended 2026-10-20 (the owner's ruling, decision 0003 §BB; charter §5.2 "The ack
+point"):** under the coalesced cadence the members are ANSWERED by the applier right after the
+RAM apply, the encode, the copy of the window's image into the volume's journal tail (a memfd
+mirror of the ring the mount's supervisor holds, `meta/journal_tail.zig`) and the lane handoff;
+steps (8)–(10) stand for the landing (the registry completion, the prefix wait, the hole
+checkpoints, the latch, the barrier) and step (11) answers nobody — it frees the window. Strict
+mode keeps (11) as the ack. A write that fails after an ack rolls nothing back: the volume
+latches FAILED at once. An fsync request's barrier starts only after every window admitted
+before it landed. At the daemon's death the supervisor writes every un-landed slot of the tail
+to the device in seq order and barriers before it releases the writer guard.
 Failure latch: `JOURNAL_FAILURE_LATCH = 3` (backend.rs:241) consecutive `note_journal_failure`
 ⇒ `failed.swap(true)`, log once, mutations EIO until remount. Barrier failures use a SEPARATE
 counter `barrier_failures` with the same 3-latch (reset on barrier success) because the

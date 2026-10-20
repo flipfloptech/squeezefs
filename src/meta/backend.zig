@@ -101,6 +101,7 @@ const leaf_merge = @import("leaf_merge.zig");
 const jc = @import("journal_core.zig");
 const journal = @import("journal.zig");
 const journal_lane = @import("journal_lane.zig");
+const journal_tail = @import("journal_tail.zig");
 const ledger = @import("ledger.zig");
 const superblock = @import("superblock.zig");
 const alloc_core = @import("alloc_core.zig");
@@ -410,6 +411,11 @@ pub const KvBackend = struct {
     /// `SQUEEZEFS_META_PASS_VENUE`: the election winner runs the pass (and
     /// the apply) on its own thread instead of waking the lane's fiber.
     pass_on_committer: bool = false,
+    /// The journal tail (decision 0003 §BB.2): the ring's kernel-held
+    /// mirror the supervisor replays at the daemon's death; null on a
+    /// reader. Created right after the lane (the slot table is sized to
+    /// twice the lane's cells).
+    tail: ?journal_tail.linux_tail.Tail = null,
     /// The applier fibers' group (decision 0003 §AW): joined at close,
     /// after the conveyor's quiesce (no window in flight ⇒ every applier
     /// has returned).
@@ -689,6 +695,8 @@ pub const KvBackend = struct {
         errdefer be.lane.deinit();
         // Before the first request: a handler fiber's fsync parks alone.
         be.lane.routeWaits(io);
+        be.tail = try openTail(be.path, ring_layout, geo);
+        errdefer if (be.tail) |*t| t.deinit();
         // Every checkpoint-side device error now classifies for the fence.
         be.dev.latch = &be.lane.latch;
         be.smo_journal = .{ .gpa = gpa, .layout = ring_layout, .geo = geo, .core = &be.core, .reg = &be.reg, .image = &.{}, .barrier_hook = be.dev.barrierSink(), .latch = &be.lane.latch, .device = .{ .ctx = be, .write = smoWriteHook, .completed = smoCompletedHook } };
@@ -749,6 +757,8 @@ pub const KvBackend = struct {
             .window_hold = conveyor.windowHoldFromEnv(opts.env, flush_ms, geo.grain),
             .caller = .{ .idle = exec.lane.laneIdleBesidesCaller, .polls = exec.lane.lanePolls },
             .applier = be.applierSeam(opts.env, cpus),
+            .ack_at_apply = ackAtApply(opts.env, flush_ms),
+            .tail = be.tailSeam(),
         });
         errdefer be.cv.deinit();
         try be.startPass();
@@ -1065,6 +1075,8 @@ pub const KvBackend = struct {
         };
         errdefer be.lane.deinit();
         be.lane.routeWaits(io);
+        be.tail = try openTail(be.path, be.ring_layout, be.geo);
+        errdefer if (be.tail) |*t| t.deinit();
         be.dev.latch = &be.lane.latch;
         be.smo_journal = .{ .gpa = gpa, .layout = be.ring_layout, .geo = be.geo, .core = &be.core, .reg = &be.reg, .image = &.{}, .barrier_hook = be.dev.barrierSink(), .latch = &be.lane.latch, .device = .{ .ctx = be, .write = smoWriteHook, .completed = smoCompletedHook }, .appender_id = standing.appender_id };
         be.smo_journal.retire_seq.store(standing.ckpt_seq + 1, .release);
@@ -1129,6 +1141,8 @@ pub const KvBackend = struct {
             .pre_admission = .{ .ctx = &js.park_gate, .wait = joinedPreAdmission },
             .window_hold = conveyor.windowHoldFromEnv(opts.env, flush_ms, be.geo.grain),
             .applier = be.applierSeam(opts.env, cpus),
+            .ack_at_apply = ackAtApply(opts.env, flush_ms),
+            .tail = be.tailSeam(),
         });
         errdefer be.cv.deinit();
         try be.startPass();
@@ -1929,6 +1943,43 @@ pub const KvBackend = struct {
             error.OutOfMemory => error.OutOfMemory,
             else => error.JournalWriteFailed,
         };
+    }
+
+    /// §BB.1: the ack point — at the apply under the coalesced cadence
+    /// (`SQUEEZEFS_META_ACK_POINT=apply`, shipped), at the lane's verdict
+    /// under strict mode or the `landing` arm.
+    fn ackAtApply(env: *const std.process.Environ.Map, flush_ms: u64) bool {
+        return flush_ms != 0 and std.mem.eql(u8, knobs.enumKnob("SQUEEZEFS_META_ACK_POINT", env), "apply");
+    }
+
+    /// The tail: a memfd of the ring's size plus a slot table of twice the
+    /// lane's cells. A refusal is the open's (a box that cannot give the
+    /// tail its memory cannot keep the crash law).
+    fn openTail(path: []const u8, layout: journal.RingLayout, geo: jc.CoreGeometry) OpenError!journal_tail.linux_tail.Tail {
+        return journal_tail.linux_tail.Tail.create(.{
+            .layout = layout,
+            .grain = geo.grain,
+            .path = path,
+            .n_slots = @intCast(2 * journal_lane.inboundCap(layout.pages)),
+        }) catch |e| {
+            log.err("meta volume {s}: cannot create the journal tail ({s})", .{ path, @errorName(e) });
+            return error.DeviceRefused;
+        };
+    }
+
+    fn tailSeam(be: *KvBackend) ?conveyor.TailSeam {
+        if (be.tail == null) return null;
+        return .{ .ctx = be, .claim = tailClaim, .release = tailRelease };
+    }
+
+    fn tailClaim(ctx: *anyopaque, seq_base: u64, ops: []const journal.WriteOp) ?u32 {
+        const be: *KvBackend = @ptrCast(@alignCast(ctx));
+        return be.tail.?.claim(seq_base, ops);
+    }
+
+    fn tailRelease(ctx: *anyopaque, slot: u32) void {
+        const be: *KvBackend = @ptrCast(@alignCast(ctx));
+        be.tail.?.release(slot);
     }
 
     fn laneSubmit(ctx: *anyopaque, w: *conveyor.Window) Error!void {
@@ -2892,6 +2943,7 @@ pub const KvBackend = struct {
         be.cv.deinit();
         be.slots.deinit();
         be.lane.deinit();
+        if (be.tail) |*t| t.deinit();
         be.cp.deinit();
         for (be.trees.load()) |t| t.destroy();
         be.trees.deinit();
@@ -3364,6 +3416,9 @@ test "rollback on the device: a synthetically failed window answers JournalWrite
     const gpa = testing.allocator;
     const v = try TestVol.create(gpa, "rollback", "600000");
     defer v.destroy();
+    // The durable-at-ack arm (§BB.1's control): the failed write is the
+    // committer's to hear.
+    try v.env.put("SQUEEZEFS_META_ACK_POINT", "landing");
     v.lane_error_logs = 1;
     const be = try v.open();
     defer be.close();
@@ -3392,6 +3447,7 @@ test "the lane's hole checkpoint never waits on the SMO lock: a window failing w
     const gpa = testing.allocator;
     const v = try TestVol.create(gpa, "hole-lock", "600000");
     defer v.destroy();
+    try v.env.put("SQUEEZEFS_META_ACK_POINT", "landing");
     v.lane_error_logs = 1;
     const be = try v.open();
     defer be.close();
@@ -3425,6 +3481,104 @@ test "the lane's hole checkpoint never waits on the SMO lock: a window failing w
     // The volume serves on; the next checkpoint covers the hole.
     _ = try commitCreate(be, "after");
     try be.checkpointNow();
+}
+
+test "§BB.1 the ack at the apply: under the coalesced cadence a commit returns while its journal write is still un-issued (the landing-hold seam), its record is readable, the tail holds its window; an fsync behind it parks until the write lands; the landing frees the tail slot; the landing arm and strict mode keep the commit parked" {
+    const gpa = testing.allocator;
+    const v = try TestVol.create(gpa, "ack-apply", "600000");
+    defer v.destroy();
+    const be = try v.open();
+    defer be.close();
+    _ = try commitCreate(be, "base");
+    const acks0 = be.conveyorStats().acks_at_apply.load();
+    journal_lane.test_seams.delay_issue.store(1, .release);
+    defer journal_lane.test_seams.delay_issue.store(0, .release);
+    // The commit returns: nothing landed (the seam), the record is RAM's.
+    const ino = try commitCreate(be, "early");
+    try testing.expect(try present(be, ino));
+    try testing.expectEqual(acks0 + 1, be.conveyorStats().acks_at_apply.load());
+    try testing.expectEqual(@as(u32, 1), be.tail.?.image.writtenCount());
+    // fsync parks behind the un-landed window (§BB.4).
+    const Sync = struct {
+        fn run(b: *KvBackend, out: *?anyerror, done: *std.atomic.Value(u32)) void {
+            out.* = if (b.fsync()) |_| null else |e| e;
+            done.store(1, .release);
+        }
+    };
+    var out: ?anyerror = null;
+    var done = std.atomic.Value(u32).init(0);
+    const t = try std.Thread.spawn(.{}, Sync.run, .{ be, &out, &done });
+    // Four lane parks later (the backstop's ticks) the fsync still waits.
+    const parks0 = be.laneSnapshot().parks;
+    const deadline = clock.monotonicNs() + 5 * std.time.ns_per_s;
+    while (be.laneSnapshot().parks < parks0 + 4 and clock.monotonicNs() < deadline) try testing.io.sleep(.fromMilliseconds(5), .awake);
+    try testing.expectEqual(@as(u32, 0), done.load(.acquire));
+    // The device answers: the window lands, the barrier follows, fsync
+    // returns, the tail slot is free.
+    journal_lane.test_seams.delay_issue.store(0, .release);
+    t.join();
+    try testing.expectEqual(@as(?anyerror, null), out);
+    try testing.expectEqual(@as(u32, 0), be.tail.?.image.writtenCount());
+    try testing.expectEqual(@as(u64, 0), be.conveyorStats().tail_slot_misses.load());
+
+    // The control arm: the commit parks until the landing.
+    inline for (.{ .{ "600000", "landing" }, .{ "0", "apply" } }) |arm| {
+        const v2 = try TestVol.create(gpa, "ack-landing", arm[0]);
+        defer v2.destroy();
+        try v2.env.put("SQUEEZEFS_META_ACK_POINT", arm[1]);
+        const be2 = try v2.open();
+        defer be2.close();
+        _ = try commitCreate(be2, "base");
+        const landing0 = be2.conveyorStats().acks_at_landing.load();
+        journal_lane.test_seams.delay_issue.store(1, .release);
+        const Committer = struct {
+            fn run(b: *KvBackend, out2: *?anyerror, done2: *std.atomic.Value(u32)) void {
+                out2.* = if (commitCreate(b, "held")) |_| null else |e| e;
+                done2.store(1, .release);
+            }
+        };
+        var out2: ?anyerror = null;
+        var done2 = std.atomic.Value(u32).init(0);
+        const t2 = try std.Thread.spawn(.{}, Committer.run, .{ be2, &out2, &done2 });
+        const p0 = be2.laneSnapshot().parks;
+        const dl = clock.monotonicNs() + 5 * std.time.ns_per_s;
+        while (be2.laneSnapshot().parks < p0 + 4 and clock.monotonicNs() < dl) try testing.io.sleep(.fromMilliseconds(5), .awake);
+        try testing.expectEqual(@as(u32, 0), done2.load(.acquire));
+        journal_lane.test_seams.delay_issue.store(0, .release);
+        t2.join();
+        try testing.expectEqual(@as(?anyerror, null), out2);
+        try testing.expectEqual(landing0 + 1, be2.conveyorStats().acks_at_landing.load());
+        try testing.expectEqual(@as(u32, 0), be2.tail.?.image.writtenCount());
+    }
+}
+
+test "§BB.5 a journal write that fails AFTER its window was acked: the commit returned Ok and its record STANDS (no rollback), the volume latches FAILED at once (one loud line), the tail still holds the window for the supervisor's replay" {
+    const gpa = testing.allocator;
+    const v = try TestVol.create(gpa, "acked-fail", "600000");
+    defer v.destroy();
+    v.lane_error_logs = 2;
+    const be = try v.open();
+    defer be.close();
+    _ = try commitCreate(be, "base");
+    // The write fails at issue — but only after the applier answered: the
+    // issue is delayed until the applier's ack is observed.
+    journal_lane.test_seams.delay_issue.store(1, .release);
+    defer journal_lane.test_seams.delay_issue.store(0, .release);
+    const ino = try commitCreate(be, "acked");
+    try testing.expect(try present(be, ino));
+    try testing.expectEqual(@as(u32, 1), be.tail.?.image.writtenCount());
+    journal_lane.test_seams.fail_windows.store(1, .release);
+    defer journal_lane.test_seams.fail_windows.store(0, .release);
+    journal_lane.test_seams.delay_issue.store(0, .release);
+    const deadline = clock.monotonicNs() + 5 * std.time.ns_per_s;
+    while (!be.isFailed() and clock.monotonicNs() < deadline) try testing.io.sleep(.fromMilliseconds(5), .awake);
+    try testing.expect(be.isFailed());
+    try testing.expectEqual(@as(u64, 1), be.conveyorStats().acked_write_failures.load());
+    try testing.expectEqual(@as(u64, 0), be.conveyorStats().rollbacks.load());
+    try testing.expect(try present(be, ino));
+    try testing.expectError(error.VolumeFailed, commitCreate(be, "post"));
+    // The tail keeps the window: the replay's bytes.
+    try testing.expect(be.tail.?.image.writtenCount() >= 1);
 }
 
 /// lseek(2) whences the std table lacks (`include/uapi/linux/fs.h`).

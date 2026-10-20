@@ -726,6 +726,20 @@ pub const Stats = struct {
     /// descended the tree (no seed; the leaf superseded, split or moved).
     resolve_seeded: counters.ShardedCounter = .{},
     resolve_descended: counters.ShardedCounter = .{},
+    /// `meta_conveyor_acks_at_apply` / `_at_landing`: windows answered by
+    /// the applier ahead of the landing (§BB.1: the coalesced cadence, no
+    /// apply hole, a tail slot) against windows answered by the lane's
+    /// verdict (strict mode; a window with an apply hole; a tail slot
+    /// missed; a verdict that beat the applier's answer).
+    acks_at_apply: counters.ShardedCounter = .{},
+    acks_at_landing: counters.ShardedCounter = .{},
+    /// `meta_conveyor_acked_write_failures`: a journal write that failed
+    /// AFTER its window was acked (§BB.5): no rollback, the volume FAILED.
+    acked_write_failures: counters.ShardedCounter = .{},
+    /// `meta_conveyor_tail_slot_misses` ★: the tail's slot table refused a
+    /// window (it holds twice the lane's cells; the window is acked at
+    /// the landing instead, so nothing acked escapes the device alone).
+    tail_slot_misses: counters.Tripwire = .init("meta_conveyor_tail_slot_misses"),
     /// The committer's ack spin (decision 0003 §AB.4): acks that landed
     /// inside the spin (no park, no wake), spins that fell through to the
     /// park, parks with no spin: no bound (no wake measured yet, or an ack
@@ -805,7 +819,7 @@ pub const Stats = struct {
             self.hold_bound_ns.load(),
             self.holds_pacing.load(),
         });
-        try w.print(",\"meta_conveyor_resolve_seeded\":{d},\"meta_conveyor_resolve_descended\":{d}", .{ self.resolve_seeded.load(), self.resolve_descended.load() });
+        try w.print(",\"meta_conveyor_resolve_seeded\":{d},\"meta_conveyor_resolve_descended\":{d},\"meta_conveyor_acks_at_apply\":{d},\"meta_conveyor_acks_at_landing\":{d},\"meta_conveyor_acked_write_failures\":{d},\"meta_conveyor_tail_slot_misses\":{d}", .{ self.resolve_seeded.load(), self.resolve_descended.load(), self.acks_at_apply.load(), self.acks_at_landing.load(), self.acked_write_failures.load(), self.tail_slot_misses.load() });
         try w.print(",\"meta_commit_ack_spin_hits\":{d},\"meta_commit_ack_spin_falls\":{d},\"meta_commit_ack_spin_skips\":{d},\"meta_commit_ack_spin_busy\":{d},\"meta_commit_ack_spin_bound_ns\":{d},\"meta_commit_ack_spin_wake_ns\":{d},\"meta_commit_ack_spin_ack_ns\":{d}}}", .{
             self.ack_spin_hits.load(),
             self.ack_spin_falls.load(),
@@ -1013,6 +1027,38 @@ pub const Window = struct {
     /// The token union the pass took in flight at A1½ (arena-owned);
     /// settled at the terminal outcome.
     token_union: []const u64 = &.{},
+    /// Who answers the members (§BB.1): the applier ahead of the landing,
+    /// or the lane at its verdict — ONE of them, decided by a CAS from
+    /// `none`; the lane's rollback claims it before it rolls anything
+    /// back, so a window acked is never rolled back.
+    ack_owner: std.atomic.Value(u8) = .init(ACK_NONE),
+    /// The tail slot holding the window's image (§BB.2); released at the
+    /// lane's verdict.
+    tail_slot: ?u32 = null,
+    /// Parties that must leave before the window is freed: the lane's
+    /// verdict, plus the applier while it answers ahead of the landing.
+    parties: std.atomic.Value(u8) = .init(1),
+
+    pub const ACK_NONE: u8 = 0;
+    pub const ACK_APPLIER: u8 = 1;
+    pub const ACK_LANE: u8 = 2;
+
+    /// Claim the answering role for `who`; true if this call won it.
+    fn claimAck(self: *Window, who: u8) bool {
+        // acq_rel: the winner's answer is ordered after the loser's last
+        // write to the members; the loser sees the winner's claim.
+        return self.ack_owner.cmpxchgStrong(ACK_NONE, who, .acq_rel, .acquire) == null;
+    }
+
+    /// One party done with the window; the last frees it.
+    fn release(self: *Window) void {
+        // acq_rel: the last party sees every other party's writes.
+        if (self.parties.fetchSub(1, .acq_rel) == 1) {
+            if (self.image) |*img| img.deinit();
+            self.arena.deinit();
+            self.conveyor.deps.gpa.destroy(self);
+        }
+    }
 
     pub fn span(self: *const Window) SeqSpan {
         return SeqSpan.stamped(self.seq_base, self.res.len);
@@ -1146,6 +1192,16 @@ fn refuseSpawn(_: *anyopaque, _: *Window) bool {
     return false;
 }
 
+/// The journal tail (decision 0003 §BB.2): the window's image copied into
+/// the kernel-held mirror before its members are acked ahead of the
+/// landing. `claim` returns the slot (null: the table refused), `release`
+/// frees it at the lane's verdict.
+pub const TailSeam = struct {
+    ctx: *anyopaque,
+    claim: *const fn (ctx: *anyopaque, seq_base: u64, ops: []const journal.WriteOp) ?u32,
+    release: *const fn (ctx: *anyopaque, slot: u32) void,
+};
+
 /// Stage B's binding: the journal lane (Linux) or the in-RAM lane.
 pub const LaneSeam = struct {
     ctx: *anyopaque,
@@ -1224,6 +1280,12 @@ pub const Deps = struct {
     caller: ?CallerSeam = null,
     /// The applier venue (§AW); the inline applier by default.
     applier: ApplySeam = inline_applier,
+    /// §BB.1: the members answered at the apply (the coalesced cadence);
+    /// false = at the lane's verdict (strict mode; the portable contracts'
+    /// default, which every durability-at-ack contract still asserts).
+    ack_at_apply: bool = false,
+    /// The journal tail (§BB.2); null = none (the contracts, a reader).
+    tail: ?TailSeam = null,
 };
 
 /// The committer's thread as the ack spin sees it (the backend binds the
@@ -2328,9 +2390,35 @@ pub const Conveyor = struct {
         // A13: handoff. The window's class for the pacing law (§L).
         self.stats.lane_handoffs.inc();
         if (window.held) self.stats.windows_held.inc() else if (window.acct().padMajority()) self.stats.windows_unshadowed.inc() else self.stats.windows_pipelined.inc();
+        // §BB.1: the ack ahead of the landing — a window with an apply hole
+        // waits for the hole checkpoint at the landing; the image goes to
+        // the tail BEFORE the handoff (a crash after the ack finds it
+        // there); a slot refused falls back to the landing (counted).
+        var ack_now = self.deps.ack_at_apply and !window.applyHoles();
+        if (ack_now) if (self.deps.tail) |t| {
+            window.tail_slot = t.claim(t.ctx, window.seq_base, window.ops());
+            if (window.tail_slot == null) {
+                self.stats.tail_slot_misses.fire("the journal tail's slot table refused a window; acked at the landing");
+                ack_now = false;
+            }
+        };
+        // Two parties while the applier answers: the lane's verdict may
+        // land before the answer and must not free the window under it.
+        if (ack_now) window.parties.store(2, .release);
         self.deps.lane.submit(self.deps.lane.ctx, window) catch |e| {
             self.abandonWindow(window, e);
+            if (ack_now) window.release();
+            return;
         };
+        if (ack_now) {
+            // The handoff precedes the ack: an fsync issued after the ack
+            // finds the window in the lane's queue (§BB.4).
+            if (window.claimAck(Window.ACK_APPLIER)) {
+                self.stats.acks_at_apply.inc();
+                self.answerMembers(window, {});
+            }
+            window.release();
+        }
     }
 
     /// Complete a reservation whose bytes never land (the hole completes
@@ -2364,7 +2452,9 @@ pub const Conveyor = struct {
                     .tombstone => .tombstone,
                     .absent => .absent,
                 };
-                try undo.append(wa, .{ .tree_id = rec.tree_id, .key = rec.key, .pre = pre });
+                // The key copied: the member's own goes with its ack, which
+                // may precede the rollback's need of it (§BB.5).
+                try undo.append(wa, .{ .tree_id = rec.tree_id, .key = try wa.dupe(u8, rec.key), .pre = pre });
             }
         }
         return undo.items;
@@ -2471,7 +2561,17 @@ pub const Conveyor = struct {
     pub fn rollbackHook(self: *Conveyor, span: SeqSpan, window_res: Reservation) void {
         const w = self.lookupInflight(window_res.start) orelse return;
         assert(w.seq_base == span.lo);
-        self.rollbackFailedTx(span, w.undo);
+        // §BB.5: the lane claims the answer BEFORE it rolls back; a window
+        // the applier already answered keeps its RAM (the ack stands) and
+        // the volume latches FAILED — the tail's replay retries the bytes.
+        if (w.claimAck(Window.ACK_LANE)) {
+            self.rollbackFailedTx(span, w.undo);
+            return;
+        }
+        self.stats.acked_write_failures.inc();
+        if (self.deps.latch.failStop()) {
+            log.err("meta volume {s}: the journal write of an ACKED window failed ({d} entries at [{d}, {d})) — volume marked FAILED; mutations return EIO until remount; the supervisor's tail replay retries the bytes at the daemon's death", .{ self.deps.volume, w.members.len, window_res.start, window_res.end() });
+        }
     }
 
     /// A window the lane never ran (a refused submit, an encode refusal):
@@ -2515,6 +2615,21 @@ pub const Conveyor = struct {
         // (or rolled-back) records.
         if (w.token_union.len != 0) if (self.tokens.load(.acquire)) |hook| hook.settle(hook.ctx, w.token_union);
         self.stats.window_total.record(rtt);
+        // The answer, unless the applier gave it ahead of the landing
+        // (§BB.1); the rollback arm claimed it already (§BB.5).
+        const owner = w.ack_owner.load(.acquire);
+        if (owner == Window.ACK_LANE or w.claimAck(Window.ACK_LANE)) {
+            self.stats.acks_at_landing.inc();
+            self.answerMembers(w, result);
+        }
+        if (w.tail_slot) |slot| if (self.deps.tail) |t| t.release(t.ctx, slot);
+        w.release();
+    }
+
+    /// Per member in journal order: the in-window apply failure else
+    /// `result`; the tee, the kernel's invalidation, the lease epochs,
+    /// then the ack — guards drop BEFORE it (`answer`).
+    fn answerMembers(self: *Conveyor, w: *Window, result: Error!void) void {
         // The tee sees every member that reached SUCCESS, before the
         // window's arena (the members' key copies) goes.
         if (self.tee.load(.acquire)) |tee| {
@@ -2529,9 +2644,6 @@ pub const Conveyor = struct {
             noteLease(&m.q);
             self.answer(m, outcome);
         }
-        if (w.image) |*img| img.deinit();
-        w.arena.deinit();
-        self.deps.gpa.destroy(w);
     }
 
     /// One member's invalidation in this mount's kernel (`KernelView`): a

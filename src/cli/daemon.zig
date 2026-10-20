@@ -51,6 +51,7 @@ const Io = std.Io;
 const log = @import("../core/log.zig");
 const log_sink = @import("log_sink.zig");
 const supervisor = @import("supervisor.zig");
+const journal_tail = @import("../meta/journal_tail.zig");
 
 comptime {
     if (builtin.os.tag != .linux) @compileError("cli/daemon is Linux only (charter §1.2); gate the import on builtin.os.tag");
@@ -222,8 +223,12 @@ pub fn detach(gpa: std.mem.Allocator, io: Io, opts: Options, stderr: *Io.Writer)
         linux.exit(1);
     };
     // The heartbeat page BEFORE the fork, so both processes map the one
-    // page (`MAP_SHARED|MAP_ANONYMOUS` survives a fork as shared memory).
+    // page (`MAP_SHARED|MAP_ANONYMOUS` survives a fork as shared memory);
+    // the tail socket likewise: the daemon sends each journal tail's memfd
+    // and writer guard over it (`SCM_RIGHTS`), the supervisor replays and
+    // releases them at the daemon's death (decision 0003 §BB.2–BB.3).
     const heartbeat: ?*supervisor.Heartbeat = if (opts.supervise) supervisor.linux_loop.mapHeartbeat() else null;
+    const tail_sock: ?[2]linux.fd_t = if (opts.supervise) makeSocketpair() else null;
     const pid2 = fork() orelse {
         writeAll(pipe_a[1], "fork failed in the intermediate process\n");
         linux.exit(1);
@@ -232,8 +237,13 @@ pub fn detach(gpa: std.mem.Allocator, io: Io, opts: Options, stderr: *Io.Writer)
         // C2: the daemon (stdio already C1's).
         _ = linux.close(pipe_a[1]);
         _ = linux.close(pipe_b[0]);
+        if (tail_sock) |sp| {
+            _ = linux.close(sp[0]);
+            journal_tail.supervisor_sock.store(sp[1], .release);
+        }
         return .{ .daemon = .{ .reporter = .{ .fd = pipe_b[1] }, .heartbeat = heartbeat } };
     }
+    if (tail_sock) |sp| _ = linux.close(sp[1]);
     // C1: the inherited key material goes first (the daemon owns it now),
     // then relay B → A, then exit or supervise.
     if (opts.scrub) |bytes| std.crypto.secureZero(u8, bytes);
@@ -251,7 +261,14 @@ pub fn detach(gpa: std.mem.Allocator, io: Io, opts: Options, stderr: *Io.Writer)
         linux.exit(1);
     }
     if (!opts.supervise) linux.exit(0);
-    linux.exit(supervisor.linux_loop.run(gpa, io, pid2, opts.mountpoint, opts.policy, heartbeat));
+    linux.exit(supervisor.linux_loop.run(gpa, io, pid2, opts.mountpoint, opts.policy, heartbeat, if (tail_sock) |sp| sp[0] else null));
+}
+
+/// `SOCK_SEQPACKET` so each tail frame arrives whole with its fd.
+fn makeSocketpair() ?[2]linux.fd_t {
+    var fds: [2]linux.fd_t = undefined;
+    if (linux.errno(linux.socketpair(linux.AF.UNIX, linux.SOCK.SEQPACKET | linux.SOCK.CLOEXEC, 0, &fds)) != .SUCCESS) return null;
+    return fds;
 }
 
 fn fork() ?linux.pid_t {

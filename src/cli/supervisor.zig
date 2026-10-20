@@ -50,6 +50,18 @@
 //!   `waiting > 0`: it is destructive (ECONNABORTED to every blocked
 //!   caller) and only needed when the kernel still holds requests the dead
 //!   daemon can never answer.
+//!
+//! The journal tails (charter §5.2 "The ack point"; decision 0003 §BB.2–
+//! BB.3): the daemon sends each writable volume's tail memfd and writer
+//! guard fd over a `SOCK_SEQPACKET` socketpair the intermediate created
+//! before the fork. The loop parks in `poll` on that socket for the probe
+//! interval, so a daemon's death (the kernel closes its end: `POLLHUP`) is
+//! seen at once, not a probe later. At the death — reaped on its own, or at
+//! the end of the ladder — the supervisor REPLAYS every tail (the un-landed
+//! windows to the device, in seq order, then `fsync`) and only then closes
+//! the guard fds: the `flock`'s open file description is shared, so the
+//! dead daemon's claim holds until the device is complete, and a successor
+//! waits it out (`guard.proc.flockExclusive`'s bound).
 
 const std = @import("std");
 const fuzzkit = @import("../core/fuzzkit.zig");
@@ -58,6 +70,7 @@ const tick_law = @import("../sync/tick.zig");
 const clock = @import("../core/clock.zig");
 const knobs = @import("../core/knobs.zig");
 const mountinfo = @import("../core/mountinfo.zig");
+const journal_tail = @import("../meta/journal_tail.zig");
 
 pub const PROBE_INTERVAL_NS: u64 = 5 * std.time.ns_per_s;
 pub const HEARTBEAT_STALE_NS: u64 = 2 * PROBE_INTERVAL_NS;
@@ -165,6 +178,34 @@ pub fn probeKind(attached: bool) ProbeKind {
     return if (attached) .control_inode else .heartbeat;
 }
 
+/// One frame on the tail socket: what the fd beside it is.
+pub const TailFrameKind = enum(u8) { tail = 1, guard = 2 };
+
+pub const TailFrame = struct {
+    kind: TailFrameKind,
+    /// The volume's index in the set (the log line).
+    index: u16,
+
+    pub const LEN = 1 + @sizeOf(u16);
+
+    pub fn encode(self: TailFrame) [LEN]u8 {
+        var b: [LEN]u8 = undefined;
+        b[0] = @backingInt(self.kind);
+        std.mem.writeInt(u16, b[1..3], self.index, .little);
+        return b;
+    }
+
+    pub fn decode(b: []const u8) ?TailFrame {
+        if (b.len != LEN) return null;
+        const kind: TailFrameKind = switch (b[0]) {
+            1 => .tail,
+            2 => .guard,
+            else => return null,
+        };
+        return .{ .kind = kind, .index = std.mem.readInt(u16, b[1..3], .little) };
+    }
+};
+
 /// `waiting` is a decimal count on one line.
 pub fn parseWaiting(text: []const u8) ?u64 {
     const t = std.mem.trim(u8, text, " \t\r\n");
@@ -178,6 +219,99 @@ pub const linux_loop = if (builtin.os.tag == .linux) struct {
     const log = @import("../core/log.zig");
     const thread_name = @import("../core/thread_name.zig");
     const completion = @import("../sync/completion.zig");
+    const rendezvous = @import("../ipc/rendezvous_linux.zig");
+
+    /// The fds the daemon sent: its journal tails and its writer guards.
+    pub const Tails = struct {
+        gpa: std.mem.Allocator,
+        sock: ?linux.fd_t,
+        tails: std.ArrayList(struct { index: u16, fd: linux.fd_t }) = .empty,
+        guards: std.ArrayList(linux.fd_t) = .empty,
+        /// The daemon's end closed (its death, or its exit): nothing more
+        /// arrives; the queued frames were drained first.
+        hup: bool = false,
+
+        pub fn deinit(self: *Tails) void {
+            for (self.tails.items) |t| _ = linux.close(t.fd);
+            self.tails.deinit(self.gpa);
+            self.releaseGuards();
+            self.guards.deinit(self.gpa);
+            if (self.sock) |s| _ = linux.close(s);
+            self.sock = null;
+        }
+
+        /// Park up to `timeout_ns` on the socket: frames are taken as they
+        /// arrive; `POLLHUP` (the daemon's end closed) returns at once and
+        /// is remembered. Without a socket: the plain sleep.
+        pub fn waitTick(self: *Tails, timeout_ns: u64) void {
+            const sock = self.sock orelse return sleepNs(timeout_ns);
+            if (self.hup) return sleepNs(timeout_ns);
+            var pfd = [_]linux.pollfd{.{ .fd = sock, .events = linux.POLL.IN, .revents = 0 }};
+            const deadline = clock.monotonicNs() + timeout_ns;
+            while (true) {
+                const now = clock.monotonicNs();
+                if (now >= deadline) return;
+                const ms: i32 = @intCast(@min((deadline - now + std.time.ns_per_ms - 1) / std.time.ns_per_ms, std.math.maxInt(i32)));
+                const rc = linux.poll(&pfd, 1, ms);
+                switch (linux.errno(rc)) {
+                    .SUCCESS => {},
+                    .INTR => continue,
+                    else => return sleepNs(deadline -| clock.monotonicNs()),
+                }
+                if (rc == 0) return;
+                self.drain();
+                if (self.hup) return;
+            }
+        }
+
+        /// Take every queued frame (never blocks).
+        pub fn drain(self: *Tails) void {
+            const sock = self.sock orelse return;
+            var buf: [64]u8 = undefined;
+            while (true) {
+                const got = rendezvous.tryRecvCtl(sock, &buf) catch |e| {
+                    if (e == error.Eof) self.hup = true;
+                    return;
+                } orelse return;
+                const frame = TailFrame.decode(buf[0..got.len]) orelse {
+                    if (got.fd) |fd| _ = linux.close(fd);
+                    log.warn("supervisor: an unreadable frame on the tail socket ({d} bytes) — dropped", .{got.len});
+                    continue;
+                };
+                const fd = got.fd orelse {
+                    log.warn("supervisor: a tail frame without a descriptor — dropped", .{});
+                    continue;
+                };
+                const kept = switch (frame.kind) {
+                    .tail => if (self.tails.append(self.gpa, .{ .index = frame.index, .fd = fd })) true else |_| false,
+                    .guard => if (self.guards.append(self.gpa, fd)) true else |_| false,
+                };
+                if (!kept) _ = linux.close(fd);
+            }
+        }
+
+        /// The daemon is dead: every tail to the device, in order, then the
+        /// guards released. Idempotent; logged per tail.
+        pub fn replayAndRelease(self: *Tails) void {
+            self.drain();
+            for (self.tails.items) |t| {
+                var path: [journal_tail.PATH_CAP]u8 = undefined;
+                var path_len: usize = 0;
+                if (journal_tail.linux_tail.replayFd(t.fd, &path, &path_len)) |r| {
+                    log.info("supervisor: journal tail of volume {d} ({s}): {d} un-landed window(s), {d} bytes replayed and barriered ({d} slot(s) landed or empty)", .{ t.index, path[0..path_len], r.windows, r.bytes, r.skipped });
+                } else |e| {
+                    log.err("supervisor: journal tail of volume {d} ({s}): replay FAILED ({s}) — acked metadata of the flush window may be lost; fsck the volume before the next mount", .{ t.index, path[0..path_len], @errorName(e) });
+                }
+            }
+            if (self.guards.items.len != 0) log.info("supervisor: writer guard released on {d} volume(s) after the replay", .{self.guards.items.len});
+            self.releaseGuards();
+        }
+
+        fn releaseGuards(self: *Tails) void {
+            for (self.guards.items) |g| _ = linux.close(g);
+            self.guards.clearRetainingCapacity();
+        }
+    };
 
     pub const sysfs_connections = "/sys/fs/fuse/connections";
 
@@ -330,7 +464,7 @@ pub const linux_loop = if (builtin.os.tag == .linux) struct {
 
     /// The charter's ladder, once: dump → SIGABRT → (grace) → SIGKILL →
     /// reap → `abort` iff `waiting > 0`.
-    pub fn escalate(io: Io, pid: linux.pid_t, conn: ?u64, for_ns: u64, kind: ProbeKind, policy: Policy) void {
+    pub fn escalate(io: Io, pid: linux.pid_t, conn: ?u64, for_ns: u64, kind: ProbeKind, policy: Policy, tails: *Tails) void {
         log.err("supervisor: daemon {d} unresponsive for {d} s (no answer to {s}) — dumping state, then SIGABRT → SIGKILL", .{ pid, for_ns / std.time.ns_per_s, kind.text() });
         dumpDaemonState(io, pid);
         _ = linux.kill(pid, .ABRT);
@@ -346,6 +480,7 @@ pub const linux_loop = if (builtin.os.tag == .linux) struct {
             while (!reap(pid, &status)) sleepNs(10 * std.time.ns_per_ms);
         }
         log.err("supervisor: daemon {d} is dead (wait status 0x{x})", .{ pid, @as(u32, @bitCast(status)) });
+        tails.replayAndRelease();
         const c = conn orelse {
             log.err("supervisor: the connection id was unknown at start — nothing to abort; `umount -l` the mountpoint by hand", .{});
             return;
@@ -367,9 +502,12 @@ pub const linux_loop = if (builtin.os.tag == .linux) struct {
     /// an escalation. `heartbeat` is the shared page (null only when the
     /// map failed at the fork: then the heartbeat probe is always a miss,
     /// said so at start).
-    pub fn run(gpa: std.mem.Allocator, io: Io, pid: linux.pid_t, mountpoint: [:0]const u8, policy: Policy, heartbeat: ?*const Heartbeat) u8 {
+    pub fn run(gpa: std.mem.Allocator, io: Io, pid: linux.pid_t, mountpoint: [:0]const u8, policy: Policy, heartbeat: ?*const Heartbeat, tail_sock: ?linux.fd_t) u8 {
         var name_buf: thread_name.CommBuf = undefined;
         _ = thread_name.nameCurrentThread(&name_buf, "sqz-supervise");
+        var tails: Tails = .{ .gpa = gpa, .sock = tail_sock };
+        defer tails.deinit();
+        if (tail_sock == null) log.warn("supervisor: no tail socket — a daemon crash has the flush-window exposure (no journal tail replay)", .{});
         const conn = connectionId(mountpoint);
         const mount_id = mountIdAt(gpa, io, mountpoint);
         if (conn) |c| log.info("supervisor: watching daemon {d} at {s} (fuse connection {d}, mount id {?d}; probe every {d} ms, escalate after {d} s)", .{ pid, mountpoint, c, mount_id, policy.probe_interval_ns / std.time.ns_per_ms, policy.unresponsive_after_ns / std.time.ns_per_s }) else log.warn("supervisor: stat({s}) failed at start — the connection id is unknown, the abort rung is disabled", .{mountpoint});
@@ -378,13 +516,24 @@ pub const linux_loop = if (builtin.os.tag == .linux) struct {
         var escalated = false;
         var was_attached = true;
         while (true) {
-            sleepNs(policy.probe_interval_ns);
+            tails.waitTick(policy.probe_interval_ns);
             var status: i32 = 0;
-            if (reap(pid, &status)) {
+            // The daemon's end of the tail socket closed: it is exiting or
+            // dead — wait for it (a blocking reap of a process already past
+            // its fd table) rather than a probe later.
+            const reaped = if (tails.hup) blk: {
+                while (!reap(pid, &status)) sleepNs(std.time.ns_per_ms);
+                break :blk true;
+            } else reap(pid, &status);
+            if (reaped) {
+                tails.replayAndRelease();
                 log.info("supervisor: daemon {d} exited (wait status 0x{x}); done", .{ pid, @as(u32, @bitCast(status)) });
                 return if (escalated) 1 else 0;
             }
-            if (!alive(pid)) return if (escalated) 1 else 0;
+            if (!alive(pid)) {
+                tails.replayAndRelease();
+                return if (escalated) 1 else 0;
+            }
             var is_attached = attached(gpa, io, mountpoint, mount_id);
             var kind = probeKind(is_attached);
             var ok = switch (kind) {
@@ -413,7 +562,7 @@ pub const linux_loop = if (builtin.os.tag == .linux) struct {
                 .grace => |for_ns| if (for_ns >= policy.probe_interval_ns) log.warn("supervisor: daemon {d} missed a probe ({s}; {d} s unresponsive; grace window {d} s)", .{ pid, kind.text(), for_ns / std.time.ns_per_s, policy.unresponsive_after_ns / std.time.ns_per_s }),
                 .escalate => |for_ns| {
                     escalated = true;
-                    escalate(io, pid, conn, for_ns, kind, policy);
+                    escalate(io, pid, conn, for_ns, kind, policy, &tails);
                     return 1;
                 },
             }
@@ -528,4 +677,26 @@ fn waitingFuzz(_: void, smith: *std.testing.Smith) !void {
 
 test "fuzz: the supervisor's waiting-count parser is total on arbitrary text" {
     try fuzzkit.fuzz({}, waitingFuzz, .{});
+}
+
+test "tail frame: encode/decode round-trips both kinds; a wrong length or kind is refused" {
+    inline for (.{ TailFrameKind.tail, TailFrameKind.guard }) |k| {
+        const f: TailFrame = .{ .kind = k, .index = 513 };
+        const d = TailFrame.decode(&f.encode()).?;
+        try testing.expectEqual(k, d.kind);
+        try testing.expectEqual(@as(u16, 513), d.index);
+    }
+    try testing.expectEqual(@as(?TailFrame, null), TailFrame.decode(&.{ 3, 0, 0 }));
+    try testing.expectEqual(@as(?TailFrame, null), TailFrame.decode(&.{ 1, 0 }));
+    try testing.expectEqual(@as(?TailFrame, null), TailFrame.decode(&.{}));
+}
+
+fn tailFrameFuzz(_: void, smith: *std.testing.Smith) !void {
+    var buf: [8]u8 = undefined;
+    const len = smith.slice(&buf);
+    _ = TailFrame.decode(buf[0..len]);
+}
+
+test "fuzz: TailFrame.decode is total on arbitrary bytes" {
+    try fuzzkit.fuzz({}, tailFrameFuzz, .{});
 }

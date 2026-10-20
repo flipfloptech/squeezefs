@@ -87,6 +87,8 @@ const cli = @import("cli.zig");
 const args = @import("args.zig");
 const uri = @import("uri.zig");
 const daemon = @import("daemon.zig");
+const journal_lane = @import("../meta/journal_lane.zig");
+const journal_tail = @import("../meta/journal_tail.zig");
 const fusermount = @import("fusermount.zig");
 const holders = @import("holders.zig");
 const exec = @import("../exec/exec.zig");
@@ -426,6 +428,11 @@ fn mountMain(ctx: *Ctx) u8 {
     }) catch |e| return ctx.failed("cannot open metadata set {s}: {s} ({t}, {s})", .{ ctx.meta_uri, openReason(e), meta_set.openErrno(e), @tagName(errors.classOf(meta_set.openCoreError(e))) });
     var be_open = true;
     defer if (be_open) be.close();
+    // The journal tails and the writer guards to the supervisor (decision
+    // 0003 §BB.2–BB.3), before `ready`: from here a crash of this process
+    // is replayed to the device under the dead claim. Without a supervisor
+    // the posture is said once: the coalesced cadence's window applies.
+    announceTails(be, env);
     // The daemon's own fabric associations go AFTER the plane closed its
     // device fds (this `defer` sits below the plane's) and before the
     // metadata set (which they never served).
@@ -869,6 +876,13 @@ fn mountMain(ctx: *Ctx) u8 {
         r.ready();
         r.close();
     }
+    // The landing-hold seam (the replay rows): every window admitted from
+    // here stays on the lane un-issued — acked, in the tail, never landed —
+    // until the daemon dies.
+    if (knobs.boolKnob("SQUEEZEFS_TEST_JOURNAL_HOLD_LANDING", env)) {
+        journal_lane.test_seams.delay_issue.store(1, .release);
+        log.warn("test seam: SQUEEZEFS_TEST_JOURNAL_HOLD_LANDING — journal writes are held un-issued from here; acked metadata lives in the journal tail alone", .{});
+    }
 
     // 7. Serve until a stop latches or the session ends.
     serve(ctx, session, &vs);
@@ -984,6 +998,36 @@ var job_id_seed: std.atomic.Value(u64) = .init(0);
 /// The striping census' `N_floor`: the slot plane's live derivation on
 /// volume 0 (the handover judge's word — "the striping trigger reads its
 /// window"), read at every served insert.
+/// Each writable volume's tail memfd and guard fd over the supervisor's
+/// socket (`SCM_RIGHTS`; the kernel holds them from the send on). A send
+/// that fails is said and the volume runs without the replay.
+fn announceTails(be: *meta_set.MetaSet, env: *const std.process.Environ.Map) void {
+    const sock = journal_tail.supervisor_sock.load(.acquire);
+    const strict = checkpoint.flushIntervalMsFromEnv(env) == 0;
+    const at_apply = !strict and std.mem.eql(u8, knobs.enumKnob("SQUEEZEFS_META_ACK_POINT", env), "apply");
+    if (sock < 0) {
+        if (at_apply) log.info("metadata acks precede the journal landing (the ext4 posture, charter §5.2); no supervisor holds the journal tail, so a crash of this process has the flush-window exposure ({d} ms) — `--daemon --supervise` replays it", .{checkpoint.flushIntervalMsFromEnv(env)});
+        return;
+    }
+    var sent: usize = 0;
+    for (be.volumes, 0..) |vol, i| {
+        const t = vol.tail orelse continue;
+        const index: u16 = @intCast(i);
+        const tail_frame = (cli.supervisor.TailFrame{ .kind = .tail, .index = index }).encode();
+        const guard_frame = (cli.supervisor.TailFrame{ .kind = .guard, .index = index }).encode();
+        ipc_rl.sendCtl(sock, &tail_frame, t.fd) catch |e| {
+            log.err("volume {d}: cannot hand the journal tail to the supervisor ({s}) — a crash has the flush-window exposure", .{ index, @errorName(e) });
+            continue;
+        };
+        ipc_rl.sendCtl(sock, &guard_frame, vol.guard_fd) catch |e| {
+            log.err("volume {d}: cannot hand the writer guard to the supervisor ({s}) — a successor may open the volume before the replay", .{ index, @errorName(e) });
+            continue;
+        };
+        sent += 1;
+    }
+    log.info("journal tails: {d} volume(s) handed to the supervisor (a crash of this process is replayed to the device before the writer claim is released); acks {s}", .{ sent, if (at_apply) "precede the landing (the ext4 posture)" else "follow the landing" });
+}
+
 fn stripeFloor(be: *meta_set.MetaSet) sym_xv.stripe.Floor {
     return .{ .live = .{ .ctx = be.volumes[0], .read = &stripeFloorRead } };
 }

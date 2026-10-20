@@ -116,18 +116,29 @@ pub fn sendCtl(sock: linux.fd_t, frame: []const u8, fd: ?linux.fd_t) Error!void 
 /// "one per cmsg"); `MSG_CTRUNC` or more than one fd ⇒ every received fd
 /// is closed and `Protocol`; a zero-length receive ⇒ `Eof`.
 pub fn recvCtl(sock: linux.fd_t, buf: []u8) Error!Received {
+    return (try recvCtlFlags(sock, buf, 0)).?;
+}
+
+/// `recvCtl` that never blocks: null when nothing is queued (`EAGAIN`
+/// under `MSG_DONTWAIT`); `Eof` once the peer closed — a message the peer
+/// queued before it died (an fd it sent) is still delivered first.
+pub fn tryRecvCtl(sock: linux.fd_t, buf: []u8) Error!?Received {
+    return recvCtlFlags(sock, buf, linux.MSG.DONTWAIT);
+}
+
+fn recvCtlFlags(sock: linux.fd_t, buf: []u8, flags: u32) Error!?Received {
     var iov = [_]iovec{.{ .base = buf.ptr, .len = buf.len }};
     // Room for MORE than the one fd we accept, so an attacker's extra
     // descriptors are received (and closed) rather than left dangling.
     var control: [cmsg_hdr_len + 64 * @sizeOf(linux.fd_t)]u8 align(@alignOf(linux.cmsghdr)) = undefined;
     var msg: linux.msghdr = .{ .name = null, .namelen = 0, .iov = &iov, .iovlen = 1, .control = &control, .controllen = control.len, .flags = 0 };
     while (true) {
-        const rc = linux.recvmsg(sock, &msg, linux.MSG.CMSG_CLOEXEC);
+        const rc = linux.recvmsg(sock, &msg, linux.MSG.CMSG_CLOEXEC | flags);
         switch (linux.errno(rc)) {
             .SUCCESS => {},
             .INTR => continue,
             .CONNRESET => return error.Eof,
-            .AGAIN => return error.Eof,
+            .AGAIN => return if (flags & linux.MSG.DONTWAIT != 0) null else error.Eof,
             else => return error.Protocol,
         }
         var fds: [64]linux.fd_t = undefined;

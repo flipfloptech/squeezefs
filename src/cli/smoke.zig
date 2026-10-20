@@ -498,7 +498,13 @@ const Rig = struct {
 
     fn spawnMountOf(self: *Rig, meta_uri: []const u8, extra: []const []const u8) !void {
         std.debug.assert(self.child == null);
-        if (self.log_file == null) self.log_file = try Io.Dir.cwd().createFile(self.io, self.log_path, .{ .truncate = false });
+        if (self.log_file == null) {
+            self.log_file = try Io.Dir.cwd().createFile(self.io, self.log_path, .{ .truncate = false });
+            // At the end: a `--log-file` daemon of this rig appended to the
+            // same file before (its sink is O_APPEND; a child's stderr
+            // writes at this description's offset).
+            _ = linux.lseek(self.log_file.?.handle, 0, linux.SEEK.END);
+        }
         var argv: [16][]const u8 = undefined;
         var n: usize = 0;
         argv[n] = self.bin;
@@ -5516,6 +5522,106 @@ test "smoke: --daemon --supervise --log-file: the invoking process returns 0 onl
     try testing.expectEqual(@as(usize, 0), try fuseMountsOf(gpa, io, rig.mp));
     // Nothing of ours survives: no squeezefs process holds the volume.
     try testing.expect(!@import("status.zig").writerGuardHeld(testing.io, rig.img));
+}
+
+test "smoke: THE REPLAY PROOF (charter §5.2 the ack point, decision 0003 §BB) — a `--daemon --supervise` mount under the landing-hold seam acks creates whose journal writes are never issued; kill -9 the daemon: the supervisor replays the journal tail to the device, barriers, and only then releases the writer guard; fsck clean; after the remount every acked create is present; the same creates on a FOREGROUND mount (no supervisor) are gone after its kill — the power-cut window; fsck clean" {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    try rig.formatSet(true);
+    // Every window acked and held un-landed from the ready line on; no
+    // §L hold (nothing ever lands to end one).
+    try rig.env.put("SQUEEZEFS_TEST_JOURNAL_HOLD_LANDING", "1");
+    try rig.env.put("SQUEEZEFS_META_WINDOW_HOLD", "none");
+    // 1. The supervised arm.
+    {
+        const r = try rig.squeezefs(&.{ "mount", "--daemon", "--supervise", "--log-file", rig.log_path, rig.meta_uri, rig.mp });
+        defer rig.freeRun(r);
+        if (!r.term.success()) std.debug.print("\ndaemon mount: {s}\n", .{r.stderr});
+        try testing.expect(r.term.success());
+    }
+    const text = try rig.readLog();
+    defer gpa.free(text);
+    const ready_i = std.mem.indexOf(u8, text, "ready: ") orelse return error.NoReadyLine;
+    const pid: linux.pid_t = @intCast(numberAfter(text[ready_i..], "(pid ") orelse return error.NoPid);
+    try testing.expect(std.mem.indexOf(u8, text, "journal tails: 1 volume(s) handed to the supervisor") != null);
+    _ = try rig.awaitLog("supervisor: watching daemon ", ready_i, ready_wait_ns);
+    {
+        const out = try rig.shOk(rig.mp, "mkdir d && touch d/x d/y && echo hello > d/z && test -e d/x && echo ok");
+        defer gpa.free(out);
+    }
+    // Acked, never landed: the tail holds them.
+    _ = linux.kill(pid, .KILL);
+    const replay_i = try rig.awaitLog("supervisor: journal tail of volume 0 (", ready_i, 20 * std.time.ns_per_s);
+    const released_i = try rig.awaitLog("supervisor: writer guard released on 1 volume(s) after the replay", ready_i, 20 * std.time.ns_per_s);
+    try testing.expect(released_i > replay_i);
+    _ = try rig.awaitLog("); done", released_i, 20 * std.time.ns_per_s);
+    {
+        const after = try rig.readLog();
+        defer gpa.free(after);
+        const line = after[replay_i - 1 ..];
+        const n = numberAfter(after[replay_i..], "): ") orelse return error.NoReplayCount;
+        std.debug.print("\nsmoke[replay]: {s}\n", .{line[0 .. std.mem.indexOfScalar(u8, line, '\n') orelse line.len]});
+        try testing.expect(n >= 1);
+        try testing.expect(std.mem.indexOf(u8, after, "replay FAILED") == null);
+    }
+    try rig.umountAfterKill();
+    _ = rig.env.swapRemove("SQUEEZEFS_TEST_JOURNAL_HOLD_LANDING");
+    _ = try fsckClean(rig, "the supervised kill");
+    {
+        const mark = try rig.logLen();
+        try rig.spawnMount(&.{});
+        _ = try rig.awaitReady(mark);
+    }
+    {
+        const out = try rig.shOk(rig.mp, "test -d d && test -e d/x && test -e d/y && test \"$(cat d/z)\" = hello && echo present");
+        defer gpa.free(out);
+        try testing.expect(std.mem.indexOf(u8, out, "present") != null);
+    }
+    {
+        const out = try rig.onMount("rm -r d && echo ok");
+        defer gpa.free(out);
+    }
+    try rig.umount();
+    try testing.expect(try rig.waitChild() == .exited);
+    _ = try fsckClean(rig, "the supervised arm's clean unmount");
+
+    // 2. The control arm: a foreground mount — no supervisor, no replay.
+    try rig.env.put("SQUEEZEFS_TEST_JOURNAL_HOLD_LANDING", "1");
+    const mark = try rig.logLen();
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(mark);
+    {
+        const fg = try rig.readLog();
+        defer gpa.free(fg);
+        try testing.expect(std.mem.indexOf(u8, fg[mark..], "no supervisor holds the journal tail") != null);
+    }
+    {
+        const out = try rig.shOk(rig.mp, "mkdir e && touch e/w && test -e e/w && echo ok");
+        defer gpa.free(out);
+    }
+    rig.killed = true;
+    _ = linux.kill(rig.child_pid, .KILL);
+    try testing.expectEqual(std.process.Child.Term{ .signal = .KILL }, try rig.waitChild());
+    try rig.umountAfterKill();
+    _ = rig.env.swapRemove("SQUEEZEFS_TEST_JOURNAL_HOLD_LANDING");
+    _ = try fsckClean(rig, "the foreground kill");
+    {
+        const mark2 = try rig.logLen();
+        try rig.spawnMount(&.{});
+        _ = try rig.awaitReady(mark2);
+    }
+    {
+        const out = try rig.shOk(rig.mp, "if test -e e/w; then echo kept; else echo lost; fi");
+        defer gpa.free(out);
+        std.debug.print("smoke[replay]: the foreground arm's acked create after its kill: {s}", .{out});
+        try testing.expect(std.mem.indexOf(u8, out, "lost") != null);
+    }
+    try rig.umount();
+    try testing.expect(try rig.waitChild() == .exited);
+    _ = try fsckClean(rig, "the foreground arm's clean unmount");
 }
 
 /// A process whose cwd is the mount (the holder of the busy-umount rows):

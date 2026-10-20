@@ -479,6 +479,10 @@ const Cell = struct {
     verdict: Error!void = {},
     /// A barrier request: the ticket of the barrier that satisfies it.
     need_barrier: u64 = 0,
+    /// A barrier request (§BB.4): the position every window admitted
+    /// before it ends by — the barrier that answers it must have started
+    /// with every pending window below this landed.
+    cover_upto: u64 = 0,
     /// The ONE completion cell (`sync/completion.zig`): pending until the
     /// lane publishes the outcome.
     done: completion.Completion(Outcome) = .{},
@@ -499,6 +503,7 @@ const Cell = struct {
         self.landed_ns = 0;
         self.verdict = {};
         self.need_barrier = 0;
+        self.cover_upto = 0;
     }
 };
 
@@ -1028,6 +1033,7 @@ pub const JournalLane = struct {
         switch (c.kind) {
             .barrier => {
                 c.need_barrier = w.barriers_started + 1;
+                c.cover_upto = self.pendingEnd();
                 w.fsync_waiters.appendAssumeCapacity(idx);
                 w.needs_flush = true;
                 w.flush_due_ns = 0;
@@ -1448,9 +1454,48 @@ pub const JournalLane = struct {
         w.flush_due_ns = @max(now, w.last_barrier_ns + self.cadence.interval_ns);
     }
 
+    /// The end of the furthest window admitted so far (0 with none): what
+    /// a barrier request admitted now must see landed (§BB.4).
+    fn pendingEnd(self: *JournalLane) u64 {
+        const w = &self.w;
+        var end: u64 = 0;
+        for (w.pending.items) |idx| end = @max(end, self.cells[idx].window.paddedEnd());
+        for (w.group.items) |idx| end = @max(end, self.cells[idx].window.paddedEnd());
+        return end;
+    }
+
+    /// The lowest position of a pending window NOT yet landed (∞ with
+    /// none): every window below it is on the device.
+    fn unlandedFloor(self: *JournalLane) u64 {
+        const w = &self.w;
+        var floor: u64 = std.math.maxInt(u64);
+        for (w.pending.items) |idx| {
+            const c = &self.cells[idx];
+            if (!c.landed) floor = @min(floor, c.window.start);
+        }
+        return floor;
+    }
+
+    /// The oldest fsync request's cover (∞ with no waiter).
+    fn firstCover(self: *JournalLane) u64 {
+        const w = &self.w;
+        var cover: u64 = std.math.maxInt(u64);
+        for (w.fsync_waiters.items) |idx| cover = @min(cover, self.cells[idx].cover_upto);
+        return cover;
+    }
+
     fn maybeStartCoalescedBarrier(self: *JournalLane, now: u64) void {
         const w = &self.w;
         if (!w.needs_flush or w.barrier_in_flight != null or now < w.flush_due_ns) return;
+        // §BB.4: a barrier an fsync pulled starts only once the windows
+        // admitted before the request landed — the FSYNC must follow their
+        // CQEs (the ring orders nothing between SQEs); the landing's CQE
+        // wakes this fiber, so the hold is no tick's.
+        if (w.fsync_waiters.items.len != 0 and self.firstCover() > self.unlandedFloor()) {
+            w.flush_held_for_cover = true;
+            return;
+        }
+        w.flush_held_for_cover = false;
         self.startBarrier(.coalesced);
     }
 
@@ -1461,8 +1506,10 @@ pub const JournalLane = struct {
         const w = &self.w;
         w.barriers_started += 1;
         w.needs_flush = false;
+        w.flush_held_for_cover = false;
         w.barrier_in_flight = kind;
         w.barrier_landed = false;
+        w.barrier_floor = self.unlandedFloor();
         // The DUR-3 ticket BEFORE the device op (a wasted ticket on an issue
         // failure only makes later pushes wait for a later barrier).
         w.barrier_ticket = if (self.hooks.barrier_started) |f| f(self.hooks.ctx) else 0;
@@ -1514,12 +1561,18 @@ pub const JournalLane = struct {
         while (i < w.fsync_waiters.items.len) {
             const idx = w.fsync_waiters.items[i];
             const c = &self.cells[idx];
-            if (c.need_barrier > w.barriers_done) {
+            // Started after the request AND after every window the request
+            // covers landed (§BB.4); else the next barrier is its.
+            if (c.need_barrier > w.barriers_done or c.cover_upto > w.barrier_floor) {
                 i += 1;
                 continue;
             }
             _ = w.fsync_waiters.swapRemove(i);
             self.publishAck(c, result, now);
+        }
+        if (w.fsync_waiters.items.len != 0) {
+            w.needs_flush = true;
+            w.flush_due_ns = 0;
         }
     }
 };
@@ -1558,6 +1611,12 @@ const Worker = struct {
     barrier_outcome: Error!void = {},
     /// The in-flight barrier's DUR-3 ticket (`Hooks.barrier_started`).
     barrier_ticket: u64 = 0,
+    /// The in-flight (then the last) barrier's cover: the lowest position
+    /// of a window not landed when it started (§BB.4).
+    barrier_floor: u64 = 0,
+    /// A coalesced barrier an fsync pulled is held for its cover: the
+    /// flush-due tick is not armed (the landing's CQE wakes the fiber).
+    flush_held_for_cover: bool = false,
     /// Barrier tickets: a request is satisfied by a barrier STARTED after it.
     barriers_started: u64 = 0,
     barriers_done: u64 = 0,
@@ -1649,7 +1708,7 @@ const Worker = struct {
     /// own park is bounded by its 2 s liveness tick alone).
     fn tickFor(w: *const Worker, now: u64) ?u64 {
         var tick: ?u64 = if (w.owesCompletion()) park_backstop_ns else null;
-        if (w.needs_flush and w.barrier_in_flight == null) {
+        if (w.needs_flush and w.barrier_in_flight == null and !w.flush_held_for_cover) {
             const until = w.flush_due_ns -| now;
             tick = if (tick) |t| @min(t, until) else until;
         }
@@ -2039,6 +2098,44 @@ test "coalesced cadence: acks precede the barrier; an fsync request is answered 
         }
     }{ .l = h2.lane.? });
     try testing.expectEqual(@as(u64, 0), h2.lane.?.snapshot().tick_rescues);
+}
+
+test "§BB.4: a barrier an fsync pulls while a window admitted before it is still un-landed does NOT start until that window lands — the request is answered by a barrier that followed the landing; the hold costs no flush tick" {
+    const h = try Harness.init(testing.allocator, "fsync-cover");
+    defer h.deinit();
+    try h.spawnLane(.{}, "600000", 0);
+    const lane = h.lane.?;
+    // The device is slow: the window is admitted (pending) but its runs are
+    // never issued until the seam clears — the ack-after-apply shape, where
+    // the committer has already left.
+    test_seams.delay_issue.store(1, .release);
+    defer test_seams.delay_issue.store(0, .release);
+    const parks0 = lane.snapshot().parks;
+    const win = try h.append(3, 400, 0xC0);
+    // An fsync behind it: its barrier must wait.
+    const t = try lane.requestBarrier();
+    spinUntil(struct {
+        l: *JournalLane,
+        p0: u64,
+        fn ready(s: @This()) bool {
+            return s.l.snapshot().parks >= s.p0 + 4;
+        }
+    }{ .l = lane, .p0 = parks0 });
+    try testing.expectEqual(@as(?Outcome, null), t.poll());
+    try testing.expectEqual(@as(u64, 0), lane.snapshot().barriers_coalesced);
+    try testing.expectEqual(@as(?Outcome, null), win.ticket.poll());
+    // The device answers: the window lands, THEN the barrier starts and
+    // the fsync is answered with the window on stable storage.
+    test_seams.delay_issue.store(0, .release);
+    try win.ticket.wait().result;
+    const o = t.wait();
+    try o.result;
+    try testing.expectEqual(@as(u64, 1), lane.snapshot().barriers_coalesced);
+    try testing.expect(o.acked_ns != 0);
+    // Replay: the entry is there.
+    var rec = try h.replay(0);
+    defer rec.deinit();
+    try testing.expectEqual(@as(usize, 1), rec.entries.len);
 }
 
 /// The DUR-3 faces as a ticket counter: `started` hands out 1, 2, …;

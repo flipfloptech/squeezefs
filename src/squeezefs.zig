@@ -85,6 +85,7 @@ pub const meta = struct {
     pub const journal_core = @import("meta/journal_core.zig");
     pub const journal_core_model = @import("meta/journal_core_model.zig");
     pub const journal = @import("meta/journal.zig");
+    pub const journal_tail = @import("meta/journal_tail.zig");
     pub const ledger = @import("meta/ledger.zig");
     pub const alloc_core = @import("meta/alloc_core.zig");
     pub const alloc_ext = @import("meta/alloc_ext.zig");
@@ -334,6 +335,7 @@ test {
     _ = meta.journal_core;
     _ = meta.journal_core_model;
     _ = meta.journal;
+    _ = meta.journal_tail;
     _ = meta.ledger;
     _ = meta.alloc_core;
     _ = meta.alloc_ext;

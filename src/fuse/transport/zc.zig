@@ -404,6 +404,17 @@ pub const FusedQueue = struct {
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
+const fuzzkit = @import("../../core/fuzzkit.zig");
+
+fn sysfsUnsignedFuzz(_: void, smith: *std.testing.Smith) !void {
+    var buf: [32]u8 = undefined;
+    const len = smith.slice(&buf);
+    _ = parseSysfsUnsigned(buf[0..len]);
+}
+
+test "fuzz: the queue attribute parser (parseSysfsUnsigned) is total on arbitrary text" {
+    try fuzzkit.fuzz({}, sysfsUnsignedFuzz, .{ .corpus = &.{ fuzzkit.slice("1020\n"), fuzzkit.slice(""), fuzzkit.slice("-1"), fuzzkit.slice("18446744073709551616") } });
+}
 
 test "kmbuf indexing: header stride 288, ring_entries = next_pow2(depth) ≥ 1, the headers span is page-granular, the headers index is 0 under BufRing and depth under zc, zc never rides without BUF_RING and retention never without zc" {
     try testing.expectEqual(@as(usize, 288), HEADER_STRIDE);

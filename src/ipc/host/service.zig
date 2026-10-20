@@ -109,11 +109,16 @@ pub const DataOp = struct {
 
 /// The per-op sink the thread dispatches to. `serve` must complete `c`
 /// exactly once (synchronously, or from a handoff/CQE later); `flush`
-/// runs once per sweep.
+/// runs once per sweep; `park` is the owner's wait while its ops are in
+/// flight (the ring park: the CQEs and the doorbells in one wait — null
+/// when nothing is in flight or the sink has no ring, and the owner takes
+/// the futex park).
 pub const Sink = struct {
     ctx: *anyopaque,
     serve: *const fn (ctx: *anyopaque, owner: u16, s: *Session, op: DataOp, c: Completion) void,
     flush: *const fn (ctx: *anyopaque, owner: u16) void,
+    park: *const fn (ctx: *anyopaque, owner: u16, waiters: []const futex.Waiter, epoch: u64, bound_ns: u64) ?futex.WaitManyVerdict,
+    inflight: *const fn (ctx: *anyopaque, owner: u16) u32,
 };
 
 /// The session registry as the thread sees it: an epoch, a collect that
@@ -235,7 +240,10 @@ pub const Owner = struct {
                 futex.wait(&self.wake, w);
                 continue;
             }
-            if (self.spinWindow(t1)) {
+            // Ops in flight on my shard: their CQEs are the next event, and
+            // only an enter posts them under COOP_TASKRUN — never a
+            // userspace spin here (it would strand my own completions).
+            if (self.sink.inflight(self.sink.ctx, self.cfg.index) == 0 and self.spinWindow(t1)) {
                 stats.ipc_spin_absorbed_parks.inc();
                 continue;
             }
@@ -309,7 +317,9 @@ pub const Owner = struct {
         const served = self.drainPass();
         self.sink.flush(self.sink.ctx, self.cfg.index);
         if (served == 0) {
-            switch (self.park.wait()) {
+            // The ring park when my ops are in flight, else the futex park.
+            const verdict = self.sink.park(self.sink.ctx, self.cfg.index, self.park.entries[0..self.park.n], self.epoch_seen, doorbell.SERVICE_PARK_MAX_NS) orelse self.park.wait();
+            switch (verdict) {
                 .returned => stats.ipc_service_wakes.inc(),
                 .timed_out => stats.ipc_service_park_timeouts.inc(),
                 // ENOSYS is refused at the client's establish; a late one
@@ -535,7 +545,19 @@ pub const DataPlaneSink = struct {
     }
 
     pub fn sink(self: *DataPlaneSink) Sink {
-        return .{ .ctx = self, .serve = &serveFn, .flush = &flushFn };
+        return .{ .ctx = self, .serve = &serveFn, .flush = &flushFn, .park = &parkFn, .inflight = &inflightFn };
+    }
+
+    fn parkFn(ctx: *anyopaque, owner: u16, waiters: []const futex.Waiter, epoch: u64, bound_ns: u64) ?futex.WaitManyVerdict {
+        const self: *DataPlaneSink = @ptrCast(@alignCast(ctx));
+        const dd = self.dd orelse return null;
+        return dd.parkInRing(owner, waiters, epoch, bound_ns);
+    }
+
+    fn inflightFn(ctx: *anyopaque, owner: u16) u32 {
+        const self: *DataPlaneSink = @ptrCast(@alignCast(ctx));
+        const dd = self.dd orelse return 0;
+        return dd.inflightOf(owner);
     }
 
     fn serveFn(ctx: *anyopaque, owner: u16, s: *Session, op: DataOp, c: Completion) void {
@@ -893,8 +915,16 @@ const StubSink = struct {
         _ = self.flushes.fetchAdd(1, .monotonic);
     }
 
+    fn park(_: *anyopaque, _: u16, _: []const futex.Waiter, _: u64, _: u64) ?futex.WaitManyVerdict {
+        return null;
+    }
+
+    fn inflight(_: *anyopaque, _: u16) u32 {
+        return 0;
+    }
+
     fn sink(self: *StubSink) Sink {
-        return .{ .ctx = self, .serve = &serve, .flush = &flush };
+        return .{ .ctx = self, .serve = &serve, .flush = &flush, .park = &park, .inflight = &inflight };
     }
 };
 

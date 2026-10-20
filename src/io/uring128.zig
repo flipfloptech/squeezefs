@@ -569,6 +569,18 @@ pub fn prepNop(sqe: *Sqe128) void {
     sqe.opcode = .NOP;
 }
 
+/// `FUTEX_WAITV` over `waiters` (Linux ≥ 6.7; `len` carries the count and
+/// `fd`, `addr2`, `addr3`, the futex flags and the buffer index must be 0
+/// — `io_futexv_prep` answers EINVAL otherwise): the CQE's `res` is the
+/// index of the woken word, at once when a value already differs. The
+/// kernel copies the array at submission, so it need only outlive the enter.
+pub fn prepFutexWaitv(sqe: *Sqe128, waiters: []const linux.futex2_waitone) void {
+    sqe.* = std.mem.zeroes(Sqe128);
+    sqe.opcode = .FUTEX_WAITV;
+    sqe.len = @intCast(waiters.len);
+    sqe.addr = @intFromPtr(waiters.ptr);
+}
+
 pub fn prepRead(sqe: *Sqe128, file: File, buf: []u8, off: u64) void {
     prepRw(sqe, .READ, file, @intFromPtr(buf.ptr), @intCast(buf.len), off);
 }

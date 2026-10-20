@@ -172,6 +172,11 @@ pub const stats = struct {
     /// Legs the lane refused BEFORE any DMA (no slab entry, no SQE): the
     /// handoff path, counted.
     pub var ipc_dd_read_refusals: counters.ShardedCounter = .{};
+    /// Owner parks taken IN THE RING (ops in flight: the CQEs and the
+    /// doorbells awaited in one enter; `SQUEEZEFS_IPC_DD_RING_PARK`) and
+    /// the CQ drains at their return.
+    pub var ipc_dd_ring_parks: counters.ShardedCounter = .{};
+    pub var ipc_dd_park_reaps: counters.ShardedCounter = .{};
 
     // ---- coherence (KD-11's residual windows) ----
     pub var ipc_inval_notifies: counters.ShardedCounter = .{};

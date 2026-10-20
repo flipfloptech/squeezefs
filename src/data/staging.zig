@@ -117,10 +117,20 @@ pub const stats = struct {
     /// 0 on any client of a cleanly unmounted set (gate G-PK2).
     pub var staged_payload_lost_reads: counters.ShardedCounter = .{};
     /// `staging_backing_phase_ns`: the wall of the ring's backing syscalls
-    /// (`msync` on a put, `fallocate(PUNCH_HOLE)` + `madvise` on a release)
-    /// — they run on the caller's lane thread, so their tail IS a lane stall.
+    /// (`msync` on a put; `fallocate(PUNCH_HOLE)` + `madvise` on a sweep's
+    /// run) — they run on the caller's lane thread, so their tail IS a lane
+    /// stall.
     pub var backing_sync_ns: counters.ShardedLatencyHistogram = .{};
     pub var backing_reclaim_ns: counters.ShardedLatencyHistogram = .{};
+    /// The lazy reclaim (`Segment.sweepDirty`): `staging_dirty_free_bytes`
+    /// — grains freed and not yet punched nor reused; `staging_sweep_runs`
+    /// / `staging_sweep_punched_bytes` — the free runs a sweep punched, one
+    /// syscall pair per run (a per-record punch under the segment lock was
+    /// 56–150 µs on every re-stage: the staged arm's second serialization
+    /// point).
+    pub var staging_dirty_free_bytes: counters.Gauge = .{};
+    pub var staging_sweep_runs: counters.ShardedCounter = .{};
+    pub var staging_sweep_punched_bytes: counters.ShardedCounter = .{};
     /// `dismount_promoted_files` / `dismount_promoted_bytes` /
     /// `dismount_promote_failures`: the clean-unmount promotion pass.
     pub var dismount_promoted_files: counters.ShardedCounter = .{};
@@ -180,7 +190,7 @@ pub const stats = struct {
 
 pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
     try w.writeAll("{");
-    inline for (.{ "current_staged_write_bytes", "staged_writes_in_flight", "staging_cell_state_bytes", "staging_tables_bytes", "staging_over_cap_refusals", "staging_ring_full_refusals", "staging_pressure_kicks", "staging_recovery_records", "staging_recovery_torn_records", "staging_generation_discards", "staging_foreign_scope_refusals", "staging_owner_live_refusals", "staging_member_residue_roots", "staged_payload_lost_reads", "dismount_promoted_files", "dismount_promoted_bytes", "dismount_promote_failures", "dismount_corpse_residents_destroyed", "dismount_unnamed_residents_destroyed", "fsync_promoted_files", "staging_fsync_syncs", "staging_fsync_bytes", "staging_fsync_coalesced", "staging_superseded_held", "staging_superseded_held_bytes", "staging_superseded_released", "staging_departures_deferred", "staging_departed_held", "staging_departed_held_bytes", "staging_departed_released", "staging_cover_rounds", "staging_appends", "staging_append_bytes", "staging_restages", "staging_restage_bytes" }, 0..) |name, i| {
+    inline for (.{ "current_staged_write_bytes", "staged_writes_in_flight", "staging_cell_state_bytes", "staging_tables_bytes", "staging_over_cap_refusals", "staging_ring_full_refusals", "staging_pressure_kicks", "staging_recovery_records", "staging_recovery_torn_records", "staging_generation_discards", "staging_foreign_scope_refusals", "staging_owner_live_refusals", "staging_member_residue_roots", "staged_payload_lost_reads", "dismount_promoted_files", "dismount_promoted_bytes", "dismount_promote_failures", "dismount_corpse_residents_destroyed", "dismount_unnamed_residents_destroyed", "fsync_promoted_files", "staging_fsync_syncs", "staging_fsync_bytes", "staging_fsync_coalesced", "staging_superseded_held", "staging_superseded_held_bytes", "staging_superseded_released", "staging_departures_deferred", "staging_departed_held", "staging_departed_held_bytes", "staging_departed_released", "staging_cover_rounds", "staging_dirty_free_bytes", "staging_sweep_runs", "staging_sweep_punched_bytes", "staging_appends", "staging_append_bytes", "staging_restages", "staging_restage_bytes" }, 0..) |name, i| {
         if (i != 0) try w.writeByte(',');
         try w.print("\"{s}\":{d}", .{ name, @field(stats, name).load() });
     }
@@ -498,8 +508,9 @@ pub const Backing = struct {
     /// waited for, the metadata that reaches them committed, the device's
     /// cache flushed). The fsync law's leg; a caller parks through `io`.
     durable: ?*const fn (ctx: ?*anyopaque, io: Io, off: u64, len: u64) DurableError!void = null,
-    /// Return `[off, off + len)` to the host (punch + drop pages) after a
-    /// tombstone; a cleanly unmounted dir scans EMPTY.
+    /// Return `[off, off + len)` to the host (punch + drop pages): a free
+    /// run of tombstoned records, from a sweep (`Segment.sweepDirty`) —
+    /// never per record on a hot path; a cleanly unmounted dir scans EMPTY.
     reclaim: ?*const fn (ctx: ?*anyopaque, off: u64, len: u64) void = null,
     /// The first offset ≥ `off` that holds DATA (`SEEK_DATA`), null past
     /// the last. The recovery scan skips holes with it: reading a hole
@@ -636,6 +647,13 @@ pub const Segment = struct {
     /// O(n²) fit check under the lock, per put) serialized every staged
     /// write of a mount at ≈ 1 k/s once the held copies grew the set.
     occupied: []u64,
+    /// Grains freed (tombstoned, their cell reclaimed) and not yet punched
+    /// nor reused: `dirty ⊆ ¬occupied`. A placement over them clears the
+    /// bits (the record's bytes overwrite the host's); `sweepDirty` punches
+    /// whole runs under a reservation, off every hot path.
+    dirty: []u64,
+    /// One sweep at a time (under the lock): a second caller returns.
+    sweeping: bool = false,
     /// The fsync law's batcher over `backing.durable` (module doc).
     durable: SyncCoalescer = .{},
     /// Retired cells not yet reclaimed (`Cell` doc), under the lock.
@@ -683,18 +701,18 @@ pub const Segment = struct {
     }
 
     /// The RAM the fixed per-cell tables take at `cap`: `n = maxCells(cap)`
-    /// cells, `n` free-list slots, the grain bitmap and the key index's slot
+    /// cells, `n` free-list slots, the two grain bitmaps and the key index's slot
     /// arrays (its 3-word header is not counted). Every table is sized ONCE
     /// at `init` and lives with the segment.
     pub fn tablesBound(cap: u64) u64 {
         const n: u64 = maxCells(cap);
-        return n * @sizeOf(Cell) + n * @sizeOf(u32) + @as(u64, occupiedWords(cap)) * @sizeOf(u64) + indexSlots(@intCast(n)) * INDEX_SLOT_BYTES;
+        return n * @sizeOf(Cell) + n * @sizeOf(u32) + 2 * @as(u64, occupiedWords(cap)) * @sizeOf(u64) + indexSlots(@intCast(n)) * INDEX_SLOT_BYTES;
     }
 
     /// What this segment's tables take — the same terms read off the live
     /// tables (`tablesBound(capacity)` by construction; the tie test says so).
     pub fn tablesBytes(self: *const Segment) u64 {
-        return @as(u64, self.cells.len) * @sizeOf(Cell) + @as(u64, self.free_cells.capacity) * @sizeOf(u32) + @as(u64, self.occupied.len) * @sizeOf(u64) + @as(u64, self.index.capacity()) * INDEX_SLOT_BYTES;
+        return @as(u64, self.cells.len) * @sizeOf(Cell) + @as(u64, self.free_cells.capacity) * @sizeOf(u32) + @as(u64, self.occupied.len + self.dirty.len) * @sizeOf(u64) + @as(u64, self.index.capacity()) * INDEX_SLOT_BYTES;
     }
 
     /// A cell's value-hash state, gauged at birth; `destroyState` undoes it.
@@ -722,7 +740,10 @@ pub const Segment = struct {
         const occupied = try gpa.alloc(u64, occupiedWords(image.len));
         errdefer gpa.free(occupied);
         @memset(occupied, 0);
-        var self: Segment = .{ .gpa = gpa, .image = image, .backing = backing, .cells = cells, .free_cells = free, .occupied = occupied };
+        const dirty = try gpa.alloc(u64, occupiedWords(image.len));
+        errdefer gpa.free(dirty);
+        @memset(dirty, 0);
+        var self: Segment = .{ .gpa = gpa, .image = image, .backing = backing, .cells = cells, .free_cells = free, .occupied = occupied, .dirty = dirty };
         errdefer self.index.deinit(gpa);
         try self.index.ensureTotalCapacity(gpa, @intCast(n));
         stats.staging_tables_bytes.add(self.tablesBytes());
@@ -755,6 +776,8 @@ pub const Segment = struct {
         self.free_cells.deinit(self.gpa);
         self.gpa.free(self.cells);
         self.gpa.free(self.occupied);
+        stats.staging_dirty_free_bytes.sub(self.dirtyFreeBytesLocked());
+        self.gpa.free(self.dirty);
         self.* = undefined;
     }
 
@@ -918,6 +941,7 @@ pub const Segment = struct {
             };
             const e: Extent = .{ .rec_off = rec_off, .key_len = KEY_LEN, .val_len = @intCast(value.len), .generation = generation, .reserved = need };
             self.markLocked(rec_off, need, true);
+            self.reuseDirtyLocked(rec_off, need);
             self.write_offset = e.end();
             if (self.write_offset >= self.image.len) self.write_offset = 0;
             break :blk e;
@@ -1210,10 +1234,13 @@ pub const Segment = struct {
         assert(cell.hold == .none);
         const e = cell.extent;
         self.unlinkRetiredLocked(cell);
-        // A shadowed cell's bytes live on under its successor: free the cell alone.
+        // A shadowed cell's bytes live on under its successor: free the cell
+        // alone. Otherwise the grains are free for placement at once and
+        // DIRTY for the sweep (the punch is batched, never here under the
+        // lock).
         if (!cell.shadowed) {
-            if (self.backing.reclaim) |r| r(self.backing.ctx, e.rec_off, e.end() - e.rec_off);
             self.markLocked(e.rec_off, e.end() - e.rec_off, false);
+            self.markDirtyLocked(e.rec_off, e.end() - e.rec_off);
         }
         if (cell.hash) |h| self.destroyState(h);
         cell.* = .{};
@@ -1247,6 +1274,103 @@ pub const Segment = struct {
 
     fn grainOccupied(self: *const Segment, g: usize) bool {
         return self.occupied[g / 64] & (@as(u64, 1) << @intCast(g % 64)) != 0;
+    }
+
+    /// Freed grains await the sweep.
+    fn markDirtyLocked(self: *Segment, off: u64, len: u64) void {
+        var g: usize = @intCast(off / RECORD_ALIGN);
+        const end: usize = @intCast((off + len) / RECORD_ALIGN);
+        while (g < end) : (g += 1) self.dirty[g / 64] |= @as(u64, 1) << @intCast(g % 64);
+        stats.staging_dirty_free_bytes.add(len);
+    }
+
+    /// A placement over dirty grains: the record's bytes overwrite the
+    /// host's, nothing to punch.
+    fn reuseDirtyLocked(self: *Segment, off: u64, len: u64) void {
+        var g: usize = @intCast(off / RECORD_ALIGN);
+        const end: usize = @intCast((off + len) / RECORD_ALIGN);
+        var reused: u64 = 0;
+        while (g < end) : (g += 1) {
+            const mask = @as(u64, 1) << @intCast(g % 64);
+            if (self.dirty[g / 64] & mask != 0) {
+                self.dirty[g / 64] &= ~mask;
+                reused += RECORD_ALIGN;
+            }
+        }
+        stats.staging_dirty_free_bytes.sub(reused);
+    }
+
+    fn dirtyFreeBytesLocked(self: *const Segment) u64 {
+        var n: u64 = 0;
+        for (self.dirty) |w| n += @popCount(w);
+        return n * RECORD_ALIGN;
+    }
+
+    /// Grains freed and not yet punched nor reused (the sweep's trigger).
+    pub fn dirtyFreeBytes(self: *Segment) u64 {
+        self.lock.lock();
+        defer self.lock.unlock();
+        return self.dirtyFreeBytesLocked();
+    }
+
+    /// The lazy reclaim: every dirty free run punched and its pages
+    /// dropped (`Backing.reclaim`), ONE syscall pair per run — the run is
+    /// RESERVED (its grains occupied) while the host works on it, so no
+    /// placement lands under the punch; the lock is never held across the
+    /// syscall. Run off the hot path: at the dirty threshold (the plane's
+    /// task), at every dismount (a cleanly unmounted ring scans EMPTY).
+    pub fn sweepDirty(self: *Segment) void {
+        const reclaim = self.backing.reclaim orelse {
+            // A RAM image: the grains are clean by definition.
+            self.lock.lock();
+            defer self.lock.unlock();
+            stats.staging_dirty_free_bytes.sub(self.dirtyFreeBytesLocked());
+            @memset(self.dirty, 0);
+            return;
+        };
+        {
+            self.lock.lock();
+            defer self.lock.unlock();
+            if (self.sweeping) return;
+            self.sweeping = true;
+        }
+        defer {
+            self.lock.lock();
+            self.sweeping = false;
+            self.lock.unlock();
+        }
+        while (true) {
+            const run: struct { off: u64, len: u64 } = blk: {
+                self.lock.lock();
+                defer self.lock.unlock();
+                const total: usize = @intCast(self.image.len / RECORD_ALIGN);
+                var g: usize = 0;
+                // The first dirty grain, a word at a time.
+                while (g < total and self.dirty[g / 64] == 0) g += 64;
+                while (g < total and self.dirty[g / 64] & (@as(u64, 1) << @intCast(g % 64)) == 0) g += 1;
+                if (g >= total) return;
+                var e = g;
+                while (e < total and self.dirty[e / 64] & (@as(u64, 1) << @intCast(e % 64)) != 0) : (e += 1) {
+                    const mask = @as(u64, 1) << @intCast(e % 64);
+                    assert(self.occupied[e / 64] & mask == 0);
+                    self.occupied[e / 64] |= mask; // reserved for the punch
+                }
+                break :blk .{ .off = @as(u64, g) * RECORD_ALIGN, .len = @as(u64, e - g) * RECORD_ALIGN };
+            };
+            reclaim(self.backing.ctx, run.off, run.len);
+            stats.staging_sweep_runs.inc();
+            stats.staging_sweep_punched_bytes.add(run.len);
+            self.lock.lock();
+            defer self.lock.unlock();
+            var g: usize = @intCast(run.off / RECORD_ALIGN);
+            const end: usize = @intCast((run.off + run.len) / RECORD_ALIGN);
+            while (g < end) : (g += 1) {
+                const mask = @as(u64, 1) << @intCast(g % 64);
+                self.occupied[g / 64] &= ~mask;
+                self.dirty[g / 64] &= ~mask;
+            }
+            stats.staging_dirty_free_bytes.sub(run.len);
+        }
     }
 
     /// First fit over the live set — the grain bitmap — for `need` bytes:
@@ -1358,7 +1482,7 @@ pub const Segment = struct {
                     self.retireLocked(old, true);
                 } else {
                     self.tombstone(off);
-                    if (self.backing.reclaim) |r| r(self.backing.ctx, off, e.end() - off);
+                    self.markDirtyLocked(off, e.end() - off);
                 }
                 rep.superseded += 1;
             } else {
@@ -3094,7 +3218,7 @@ test "the live cells' value-hash states are gauged (R5): N staged records carry 
     try testing.expectEqual(stats.staging_cell_state_bytes.load(), c.current());
 }
 
-test "the segment's fixed per-cell tables are gauged (R5): tablesBound(cap) = maxCells × (Cell + u32) + the grain bitmap + indexSlots × (1 + KEY_LEN + ptr); an open segment carries exactly it in staging_tables_bytes (the live tables agree term by term, the std map's capacity law pinned), puts move nothing, deinit returns it; the component is attribution-only; the tables are ≈ 4.4 % of the ring" {
+test "the segment's fixed per-cell tables are gauged (R5): tablesBound(cap) = maxCells × (Cell + u32) + the two grain bitmaps + indexSlots × (1 + KEY_LEN + ptr); an open segment carries exactly it in staging_tables_bytes (the live tables agree term by term, the std map's capacity law pinned), puts move nothing, deinit returns it; the component is attribution-only; the tables are ≈ 4.4 % of the ring" {
     const gpa = testing.allocator;
     // The tie, restated: n = cap / grain + 1 cells, one bit per grain.
     const cap: u64 = 64 * 4096;
@@ -3102,7 +3226,7 @@ test "the segment's fixed per-cell tables are gauged (R5): tablesBound(cap) = ma
     try testing.expectEqual(n, Segment.maxCells(cap));
     try testing.expectEqual(@as(u64, 128), Segment.indexSlots(@intCast(n)));
     try testing.expectEqual(@as(usize, 1), Segment.occupiedWords(cap));
-    try testing.expectEqual(n * @sizeOf(Cell) + n * @sizeOf(u32) + 8 + 128 * (1 + KEY_LEN + @sizeOf(*Cell)), Segment.tablesBound(cap));
+    try testing.expectEqual(n * @sizeOf(Cell) + n * @sizeOf(u32) + 2 * 8 + 128 * (1 + KEY_LEN + @sizeOf(*Cell)), Segment.tablesBound(cap));
     // The std map's capacity law at the boundary: 80 % load, power of two.
     try testing.expectEqual(@as(u64, 16), Segment.indexSlots(12));
     try testing.expectEqual(@as(u64, 32), Segment.indexSlots(13));
@@ -3121,15 +3245,15 @@ test "the segment's fixed per-cell tables are gauged (R5): tablesBound(cap) = ma
     try testing.expectEqual(g0 + Segment.tablesBound(cap), stats.staging_tables_bytes.load());
     seg.deinit();
     try testing.expectEqual(g0, stats.staging_tables_bytes.load());
-    // The share of the ring: 24,882,356 B at the venue's 546 MiB ring
-    // (139,777 cells × (112 + 4) B + 2,184 bitmap words × 8 B + 262,144
-    // index slots × 33 B; the sorted-extent scratch and the pending list
-    // — 80 B per cell — left with the grain bitmap, 2026-10-20) and
-    // 2,984,052 B at 64 MiB — 4.3–4.4 % of either, the index's
+    // The share of the ring: 24,899,828 B at the venue's 546 MiB ring
+    // (139,777 cells × (112 + 4) B + 2 × 2,184 bitmap words × 8 B +
+    // 262,144 index slots × 33 B; the sorted-extent scratch and the pending
+    // list — 80 B per cell — left with the grain bitmaps, 2026-10-20) and
+    // 2,986,100 B at 64 MiB — 4.3–4.4 % of either, the index's
     // power-of-two rounding the swing.
     const venue_ring: u64 = 546 * derive.MiB;
-    try testing.expectEqual(@as(u64, 24_882_356), Segment.tablesBound(venue_ring));
-    try testing.expectEqual(@as(u64, 2_984_052), Segment.tablesBound(64 * derive.MiB));
+    try testing.expectEqual(@as(u64, 24_899_828), Segment.tablesBound(venue_ring));
+    try testing.expectEqual(@as(u64, 2_986_100), Segment.tablesBound(64 * derive.MiB));
     try testing.expect(Segment.tablesBound(venue_ring) * 1000 / venue_ring == 43);
     try testing.expect(Segment.tablesBound(64 * derive.MiB) * 1000 / (64 * derive.MiB) == 44);
     // The R5 component: attribution-only (the tables live with the segment), heap, not page cache.
@@ -3207,6 +3331,13 @@ const SyncSeam = struct {
     fn reclaim(ctx: ?*anyopaque, off: u64, len: u64) void {
         const self: *SyncSeam = @ptrCast(@alignCast(ctx.?));
         self.reclaims.append(testing.allocator, .{ .off = off, .len = len }) catch @panic("OOM");
+    }
+
+    /// Bytes the sweeps punched so far.
+    fn punched(self: *const SyncSeam) u64 {
+        var n: u64 = 0;
+        for (self.reclaims.items) |r| n += r.len;
+        return n;
     }
 
     fn durable(ctx: ?*anyopaque, _: Io, off: u64, len: u64) DurableError!void {
@@ -3308,7 +3439,7 @@ test "a synced copy survives an unsynced re-stage: the superseded copy keeps its
     const b_ext = seg.residentExtent(k).?;
     try testing.expect(a_ext.end() <= b_ext.rec_off or b_ext.end() <= a_ext.rec_off);
     try testing.expect(!isTombstone(image, a_ext.rec_off)); // the old copy keeps its magic …
-    try testing.expectEqual(@as(usize, 0), seam.reclaims.items.len); // … its slot is not punched …
+    try testing.expectEqual(@as(u64, 0), seg.dirtyFreeBytes()); // … its slot is not freed …
     try testing.expectEqual(held0 + 1, stats.staging_superseded_held.load());
     try testing.expectEqual(hb0 + (a_ext.end() - a_ext.rec_off), stats.staging_superseded_held_bytes.load());
     // … and is no placement hole: a third record of its size lands elsewhere.
@@ -3339,13 +3470,19 @@ test "a synced copy survives an unsynced re-stage: the superseded copy keeps its
     try testing.expectEqual(held0 + 1, stats.staging_superseded_held.load());
     try testing.expect(!isTombstone(image, a_ext.rec_off));
     try testing.expect(isTombstone(image, b_ext.rec_off));
-    try testing.expectEqual(@as(usize, 1), seam.reclaims.items.len);
+    // Freed = DIRTY: free for placement at once, punched by the sweep in
+    // whole runs (never per record under the lock).
+    try testing.expectEqual(b_ext.end() - b_ext.rec_off, seg.dirtyFreeBytes());
+    try testing.expectEqual(@as(usize, 0), seam.reclaims.items.len);
     // The key's sync covers generation 4: the synced copy lets go —
-    // tombstoned, punched, its cell back in the pool.
+    // tombstoned, freed, its cell back in the pool; the sweep punches both.
     const free_before = seg.free_cells.items.len;
     try seg.syncResident(io, k);
     try testing.expect(isTombstone(image, a_ext.rec_off));
-    try testing.expectEqual(@as(usize, 2), seam.reclaims.items.len);
+    try testing.expectEqual((a_ext.end() - a_ext.rec_off) + (b_ext.end() - b_ext.rec_off), seg.dirtyFreeBytes());
+    seg.sweepDirty();
+    try testing.expectEqual((a_ext.end() - a_ext.rec_off) + (b_ext.end() - b_ext.rec_off), seam.punched());
+    try testing.expectEqual(@as(u64, 0), seg.dirtyFreeBytes());
     try testing.expectEqual(free_before + 1, seg.free_cells.items.len);
     try testing.expectEqual(held0, stats.staging_superseded_held.load());
     try testing.expectEqual(hb0, stats.staging_superseded_held_bytes.load());
@@ -3357,8 +3494,9 @@ test "a synced copy survives an unsynced re-stage: the superseded copy keeps its
     try testing.expectEqual(held0 + 1, stats.staging_superseded_held.load());
     try testing.expect(seg.remove(k, 5));
     try testing.expectEqual(held0, stats.staging_superseded_held.load());
-    try testing.expectEqual(@as(usize, 4), seam.reclaims.items.len);
+    try testing.expect(seg.dirtyFreeBytes() > 0);
     try testing.expectEqual(@as(?*Cell, null), seg.retired_head);
+    seg.sweepDirty();
     // syncAll: a copy whose successor was indexed before the sync began
     // lets go; one re-staged WHILE the sync ran stays held (its successor's
     // pages may have missed the kernel's dirty walk) — and so does a copy
@@ -3395,11 +3533,17 @@ test "a synced copy survives an unsynced re-stage: the superseded copy keeps its
     const k3 = tkey(4, 44);
     try seg.put(k3, &a, 10, 0, 0);
     const d_ext = seg.residentExtent(k3).?;
-    const reclaims_before = seam.reclaims.items.len;
+    const dirty_before = seg.dirtyFreeBytes();
     try seg.put(k3, &b, 11, 0, 0);
     try testing.expect(isTombstone(image, d_ext.rec_off));
-    try testing.expectEqual(reclaims_before + 1, seam.reclaims.items.len);
+    try testing.expectEqual(dirty_before + (d_ext.end() - d_ext.rec_off), seg.dirtyFreeBytes());
     try testing.expectEqual(held0, stats.staging_superseded_held.load());
+    // A placement over the freed grains reuses them without a punch: the
+    // cursor wrapped onto d's slot ⇒ its dirty bytes are gone from the ledger.
+    seg.write_offset = d_ext.rec_off;
+    try seg.put(tkey(6, 66), &b, 12, 0, 0);
+    try testing.expectEqual(d_ext.rec_off, seg.residentExtent(tkey(6, 66)).?.rec_off);
+    try testing.expectEqual(dirty_before + (d_ext.end() - d_ext.rec_off) - stride(KEY_LEN, b.len), seg.dirtyFreeBytes());
 }
 
 /// The departure law's counting seam: every cover round recorded; `hold`
@@ -3466,7 +3610,7 @@ test "the departure law: a key that leaves the ring (a promotion's release) keep
     try testing.expect(seg.get(k) == null); // the key is gone from the index …
     try testing.expect(!isTombstone(image, a_ext.rec_off)); // … but both copies keep their magic …
     try testing.expect(!isTombstone(image, b_ext.rec_off));
-    try testing.expectEqual(@as(usize, 0), seam.reclaims.items.len); // … and their slots.
+    try testing.expectEqual(@as(u64, 0), seg.dirtyFreeBytes()); // … and their slots.
     try testing.expectEqual(def0 + 1, stats.staging_departures_deferred.load());
     try testing.expectEqual(held0 + 2, stats.staging_departed_held.load());
     try testing.expectEqual(hb0 + (a_ext.end() - a_ext.rec_off) + (b_ext.end() - b_ext.rec_off), stats.staging_departed_held_bytes.load());
@@ -3498,7 +3642,7 @@ test "the departure law: a key that leaves the ring (a promotion's release) keep
     try testing.expectEqual(@as(u32, 1), rounds.rounds);
     try testing.expect(isTombstone(image, a_ext.rec_off));
     try testing.expect(isTombstone(image, b_ext.rec_off));
-    try testing.expectEqual(@as(usize, 2), seam.reclaims.items.len);
+    try testing.expectEqual((a_ext.end() - a_ext.rec_off) + (b_ext.end() - b_ext.rec_off), seg.dirtyFreeBytes());
     try testing.expectEqual(free_before + 2, seg.free_cells.items.len);
     try testing.expectEqual(held0, stats.staging_departed_held.load());
     try testing.expectEqual(hb0, stats.staging_departed_held_bytes.load());

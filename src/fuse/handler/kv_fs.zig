@@ -228,6 +228,13 @@ pub var fuse_write_times_parked: counters.ShardedCounter = .{};
 /// child of a directory folds its parent's key: thousands of Δs per
 /// leaf between two writebacks, each apply an O(overlay) re-merge).
 pub var fuse_parent_times_parked: counters.ShardedCounter = .{};
+/// `fuse_write_staged_parked`: size-neutral STAGED overwrites (inside the
+/// image, under the file's resident identity) that re-staged the image and
+/// parked their stamp — no transaction: the layout record they would have
+/// published is the one stored (same size, same identity), and the bytes
+/// are the ring's, durable at the ino's fsync. The arm's steady state
+/// (every rewrite of a small file) costs the ring put alone.
+pub var fuse_write_staged_parked: counters.ShardedCounter = .{};
 /// `fuse_write_times_drain_failed_ticks`: drain cadence ticks met on a
 /// FAILED store (the fail-stop latch): every commit refuses until remount,
 /// so the tick drains nothing and the parked refinements stay fold-visible
@@ -2981,6 +2988,27 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                     else => |x| return x,
                 };
             }
+            // §L.6 for the staged arm: a size-neutral overwrite INSIDE the
+            // image under the resident identity changes nothing the stored
+            // layout record says (same size, same file id) — its only record
+            // would be the Δ(mtime, ctime): the stamp parks under the shared
+            // guard as a striped size-neutral write's does; nothing commits,
+            // no journal bytes. The bytes are the ring's, durable at the
+            // ino's fsync (the record's own law); a KILLPRIV write keeps the
+            // transaction (its mode strip is a record).
+            if (keep_identity and end <= probe.size and self.times_park and a.write_flags & abi.FUSE_WRITE_KILL_SUIDGID == 0) {
+                {
+                    var g = self.locks.lockManyUncancelable(self.io, &.{.{ .ino = local, .mode = .shared }}, &.{}) catch unreachable; // one request fits every plan
+                    defer g.release(self.io);
+                    try self.parkWriteTimes(local, 0);
+                }
+                self.dropLayoutLock(layout_lock);
+                self.data.noteShape(local, size, .staged);
+                fuse_write_staged.inc();
+                fuse_write_staged_parked.inc();
+                write_admit.noteInlineWrite(data.len);
+                return .{ .size = @intCast(data.len) };
+            }
             var after: AfterCommit = .{};
             defer self.dropAfter(&after);
             if (!keep_identity) noteDisplaced(local, rec, &after);
@@ -5583,6 +5611,49 @@ test "the staged append law (repro-port: fstests generic/069 `append_writer` —
     i = 0;
     while (i < m) : (i += 1) try testing.expectEqual(i, std.mem.readInt(u32, img[head.len + 4 * i ..][0..4], .little));
     try testing.expectEqual(@as(usize, 1), h.data.ring.?.seg.live());
+    h.release(f);
+}
+
+test "a size-neutral overwrite inside a staged image commits NOTHING (§L.6 for the staged arm): the image re-staged under the resident identity, the stamp parked (fold-visible: mtime moves, the size stands), zero transactions — red before: one commit per rewrite publishing the layout record already stored, the 1.1 k/s staged arm's second half; a write that grows the file, a straddling one and a KILLPRIV one keep their transaction" {
+    const H = HarnessOf(SettlingData);
+    var h: H = undefined;
+    try h.init();
+    defer h.deinit();
+    defer h.data.deinit();
+    h.data.store = &h.store;
+    h.data.staging = true;
+    h.data.ring = try SettlingData.RamRing.init(64 << 20, 32 << 20);
+    defer h.data.ring.?.deinit();
+    const parked0 = fuse_write_staged_parked.load();
+    const f = try h.create(1, "small", 0o644);
+    const lf = try H.Fs.localOf(f);
+    var image: [16384]u8 = @splat('A');
+    try testing.expectEqual(@as(?linux.E, null), h.write(f, 0, &image, 0).errno());
+    const commits0 = h.store.commits;
+    // Rewrites inside the image: no commit, the stamp parked, the bytes the ring's.
+    var patch: [4096]u8 = @splat('B');
+    for (0..4) |i| try testing.expectEqual(@as(?linux.E, null), h.write(f, @intCast(4096 * i), &patch, 0).errno());
+    try testing.expectEqual(commits0, h.store.commits);
+    try testing.expectEqual(parked0 + 4, fuse_write_staged_parked.load());
+    try testing.expect(h.fs.pending.parked(lf) != null);
+    try testing.expectEqual(@as(u64, image.len), (try h.getattr(f)).size);
+    @memset(&image, 'B');
+    {
+        const rec = (try h.fs.readLayout(lf)).?;
+        defer h.fs.freeLayout(rec);
+        try testing.expectEqual(layout.Kind.staged, rec.layout.kind);
+        const lease = h.data.ring.?.seg.get(staging.StagingKey.init(rec.layout.file_id, lf)).?;
+        defer lease.release();
+        try testing.expectEqualSlices(u8, &image, lease.bytes());
+    }
+    // A straddling write grows the file: its transaction carries the size.
+    try testing.expectEqual(@as(?linux.E, null), h.write(f, 14336, &patch, 0).errno());
+    try testing.expectEqual(commits0 + 1, h.store.commits);
+    try testing.expectEqual(@as(u64, 18432), (try h.getattr(f)).size);
+    // A KILLPRIV write inside the image: the mode strip is a record.
+    try testing.expectEqual(@as(?linux.E, null), h.write(f, 0, &patch, abi.FUSE_WRITE_KILL_SUIDGID).errno());
+    try testing.expectEqual(commits0 + 2, h.store.commits);
+    try testing.expectEqual(parked0 + 4, fuse_write_staged_parked.load());
     h.release(f);
 }
 

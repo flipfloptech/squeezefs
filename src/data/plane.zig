@@ -344,6 +344,8 @@ const Staging = struct {
     mapped: staging.Ring.MappedSegment,
     seg: staging.Segment,
     pool: staging.Pool,
+    /// A sweep task is spawned or running (`sweepRing`): one at a time.
+    sweep_armed: Atomic(bool) = .init(false),
 };
 
 /// The transformed set's state (decision 0003 §K10): the immutable
@@ -1174,6 +1176,8 @@ pub const DataPlane = struct {
             // ring scans empty). A failed round leaves them held; the next
             // mount's pass destroys what nothing names.
             self.coverDeparted(io);
+            // The freed grains punched: a cleanly unmounted ring scans empty.
+            st.seg.sweepDirty();
             if (st.seg.departedHeld() != 0) log.err("dismount promotion: {d} released ring record(s) stay on the segment — the meta barrier that would cover their layouts failed; the next mount's pass destroys them", .{st.seg.departedHeld()});
         }
         if (self.packer) |*p| p.sealAll();
@@ -1705,7 +1709,23 @@ pub const DataPlane = struct {
             error.StorageFull => error.NoSpaceLeft,
             error.OutOfMemory => error.OutOfMemory,
         };
+        // The lazy reclaim's trigger: an eighth of the ring freed and not
+        // yet punched ⇒ one sweep task (`staging.Segment.sweepDirty`).
+        if (staging.stats.staging_dirty_free_bytes.load() >= st.seg.capacity() / RING_SWEEP_DIVISOR and !st.sweep_armed.swap(true, .acq_rel)) {
+            self.tasks.spawn(self.io, sweepTask, .{self}) catch st.sweep_armed.store(false, .release);
+        }
         return s.generation;
+    }
+
+    /// The dirty-free share of the ring that arms a sweep: an eighth — a
+    /// few hundred punches a second at the arm's rate, each over a whole
+    /// lap of freed records, instead of one per re-stage.
+    const RING_SWEEP_DIVISOR: u64 = 8;
+
+    fn sweepTask(self: *DataPlane) Io.Cancelable!void {
+        const st = &(self.stage orelse return);
+        st.seg.sweepDirty();
+        st.sweep_armed.store(false, .release);
     }
 
     /// §J.2: an extending write lands IN PLACE in the resident record's

@@ -145,6 +145,7 @@ pub const data = struct {
     pub const write_pipeline = @import("data/write_pipeline.zig");
     pub const writeback = @import("data/writeback.zig");
     pub const size_epoch = @import("data/size_epoch.zig");
+    pub const shape_table = @import("data/shape_table.zig");
     pub const fsync = @import("data/fsync.zig");
     pub const read_size_class = @import("data/read_size_class.zig");
     pub const read_fill_pool = @import("data/read_fill_pool.zig");
@@ -277,6 +278,7 @@ test {
     _ = data.write_pipeline;
     _ = data.writeback;
     _ = data.size_epoch;
+    _ = data.shape_table;
     _ = data.fsync;
     _ = data.read_size_class;
     _ = data.read_fill_pool;

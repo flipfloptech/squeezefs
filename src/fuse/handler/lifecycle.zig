@@ -588,8 +588,13 @@ pub fn Dispatcher(comptime Transport: type) type {
                     // floor is Shared; everything else is exclusive).
                     const candidate: op_guard.Class = if (adm.shared_snapshot) |snap| op_guard.classify(snap.classifyInput(end)) else .entire_op;
                     const class = adm.finalize(candidate);
+                    // The exact snapshot travels with the Shared class: under
+                    // this SHARED guard no size set, extension or layout
+                    // transition runs (each holds it exclusive), so the size
+                    // and the kind it names stand for the whole op.
+                    const shared_size: ?u64 = if (class == .shared and adm.shared_snapshot.?.striped_passthrough) adm.shared_snapshot.?.meta_size else null;
                     c.stage(.write_locked);
-                    const wr = try fs.vtable.write(fs.impl, c, .{ .ino = ino, .fh = w.in.fh, .offset = w.in.offset, .data = w.data, .held = heldPayload(&lease), .class = class, .write_flags = w.in.write_flags, .flags = w.in.flags });
+                    const wr = try fs.vtable.write(fs.impl, c, .{ .ino = ino, .fh = w.in.fh, .offset = w.in.offset, .data = w.data, .held = heldPayload(&lease), .class = class, .shared_size = shared_size, .write_flags = w.in.write_flags, .flags = w.in.flags });
                     self.opens.noteWrite(ino, clock.monotonicNs()) catch {
                         // The owed set could not grow: drain now, under the
                         // write's guard ((1) → (3), the truncate's own settle

@@ -239,7 +239,12 @@ pub const ReadArgs = struct { ino: u64, fh: u64, offset: u64, size: u32, flags: 
 /// shared assembly the striped arm adopts or copies from — charter §7);
 /// `class` is the level-1 admission's verdict (charter §6.2 shared-mode
 /// admission).
-pub const WriteArgs = struct { ino: u64, fh: u64, offset: u64, data: []const u8, held: ?HeldPayload = null, placed: ?write_admit.PlacedPayload = null, class: op_guard.Class = .entire_op, write_flags: u32, flags: u32 };
+/// `shared_size`: with `class == .shared`, the claimed size of the EXACT
+/// resident striped-passthrough snapshot the admission classified on (the
+/// write's end is within it) — the filesystem's striped arm runs off it
+/// with no layout lock and no KV read of the kind or the inode; null = the
+/// snapshot was not exact (a transformed set) and the arm re-derives.
+pub const WriteArgs = struct { ino: u64, fh: u64, offset: u64, data: []const u8, held: ?HeldPayload = null, placed: ?write_admit.PlacedPayload = null, class: op_guard.Class = .entire_op, shared_size: ?u64 = null, write_flags: u32, flags: u32 };
 
 /// A HELD zero-copy WRITE payload (portable face of `slot.PayloadLease`):
 /// the slot source for a direct device store and the memoized extraction.

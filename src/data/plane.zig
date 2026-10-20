@@ -116,6 +116,7 @@ const verbs = @import("../wire/verbs.zig");
 const record_ship = @import("../meta/sym/xv/record_ship.zig");
 const seams = @import("write_seams.zig");
 const size_epoch = @import("size_epoch.zig");
+const shape_table = @import("shape_table.zig");
 const write_admit = @import("write_admit.zig");
 const write_side_view = @import("write_side_view.zig");
 const writeback = @import("writeback.zig");
@@ -194,9 +195,8 @@ fn stagingOwnerMarker(be: *KvBackend) staging.Marker {
 
 /// The manager's appender id (the format-time fixed ring's).
 const manager_appender_id: u32 = @import("../meta/journal.zig").FIXED_RING_APPENDER;
-/// The shape-snapshot table the W1 hold gate and the shared-mode probe
-/// read on the queue thread: the op-guard width (one row per stripe).
-pub const SHAPE_STRIPES: usize = op_guard.INODE_GUARD_STRIPES;
+/// The shape-snapshot table's width (one row per op-guard stripe).
+pub const SHAPE_STRIPES: usize = shape_table.STRIPES;
 
 // ---------------------------------------------------------------------------
 // Stats.
@@ -307,63 +307,11 @@ pub fn writeStatsJson(w: *Io.Writer) Io.Writer.Error!void {
 }
 
 // ---------------------------------------------------------------------------
-// The shape table: what the queue thread may know about an inode.
+// The shape table (`shape_table.zig`): what a thread may know about an inode
+// without a KV lookup.
 // ---------------------------------------------------------------------------
 
-/// One published snapshot per op-guard stripe: the inode's size and its
-/// layout class, written by the filesystem at every layout publish and
-/// size change, read lock-free (three relaxed loads) by the W1 hold gate
-/// and the shared-mode probe. A torn read across the three words costs a
-/// misjudged HOLD (performance) or a Shared candidate the admission
-/// revalidates under the guard — never a wrong byte.
-const ShapeRow = struct {
-    ino: Atomic(u64) = .init(0),
-    size: Atomic(u64) = .init(0),
-    /// bit 0 = striped on a passthrough set.
-    flags: Atomic(u64) = .init(0),
-};
-
-const SHAPE_STRIPED_PASSTHROUGH: u64 = 1;
-
-const ShapeTable = struct {
-    rows: []ShapeRow,
-
-    fn init(gpa: Allocator) Allocator.Error!ShapeTable {
-        const rows = try gpa.alloc(ShapeRow, SHAPE_STRIPES);
-        @memset(rows, .{});
-        return .{ .rows = rows };
-    }
-
-    fn deinit(self: *ShapeTable, gpa: Allocator) void {
-        gpa.free(self.rows);
-    }
-
-    fn row(self: *ShapeTable, ino: u64) *ShapeRow {
-        return &self.rows[@intCast(dlm.splitmix64(ino) & (SHAPE_STRIPES - 1))];
-    }
-
-    fn publish(self: *ShapeTable, ino: u64, size: u64, striped_passthrough: bool) void {
-        const r = self.row(ino);
-        // The ino word LAST (release): a reader that matches the ino sees
-        // the size and flags published before it.
-        r.size.store(size, .monotonic);
-        r.flags.store(if (striped_passthrough) SHAPE_STRIPED_PASSTHROUGH else 0, .monotonic);
-        r.ino.store(ino, .release);
-    }
-
-    fn forget(self: *ShapeTable, ino: u64) void {
-        const r = self.row(ino);
-        if (r.ino.load(.monotonic) == ino) r.ino.store(0, .release);
-    }
-
-    const Snap = struct { size: u64, striped_passthrough: bool };
-
-    fn peek(self: *ShapeTable, ino: u64) ?Snap {
-        const r = self.row(ino);
-        if (r.ino.load(.acquire) != ino) return null;
-        return .{ .size = r.size.load(.monotonic), .striped_passthrough = r.flags.load(.monotonic) & SHAPE_STRIPED_PASSTHROUGH != 0 };
-    }
-};
+const ShapeTable = shape_table.ShapeTable;
 
 // ---------------------------------------------------------------------------
 // The plane.
@@ -3675,7 +3623,7 @@ pub const DataPlane = struct {
     /// materialize (0002 row 544). What the arm declines under its guard
     /// (RAM custody on the block, an epoch's save in flight, a full
     /// registry, no supply) costs that write one lazy extraction, counted.
-    fn holdVerdict(hint: fsv.HoldHint, snap: ShapeTable.Snap, f: HoldFacts) ?zc.HoldClass {
+    fn holdVerdict(hint: fsv.HoldHint, snap: shape_table.Snap, f: HoldFacts) ?zc.HoldClass {
         if (hint.len == 0 or !snap.striped_passthrough) return null;
         const end = hint.offset + hint.len;
         if (hint.offset / f.block_size != (end - 1) / f.block_size) return null;
@@ -3692,7 +3640,7 @@ pub const DataPlane = struct {
         _ = offset;
         const snap = self.shape.peek(shapeProbeKey(nodeid) orelse return null) orelse return null;
         if (!snap.striped_passthrough and self.passthrough) return null;
-        return .{ .size_floor = snap.size, .meta_size = snap.size, .block_size = self.block_size, .range_fully_mapped = null, .narrow = end <= snap.size };
+        return .{ .size_floor = snap.size, .meta_size = snap.size, .block_size = self.block_size, .range_fully_mapped = null, .narrow = end <= snap.size, .striped_passthrough = snap.striped_passthrough };
     }
 
     /// The shape table's key for a kernel nodeid (the lifecycle's probe):
@@ -3966,7 +3914,7 @@ const testing = std.testing;
 test "the hold gate's verdict by class (charter §6.2 items 1–2 on PATCH_MAX = block/8): the W1 class holds a non-extending, non-adjacent aligned write within one block and declines an extending or stream-adjacent one; the overlay class holds the streaming write — extending, stream-adjacent, both payload classes — iff the arm is on; a straddling write, an empty one and a non-striped file never hold" {
     const bs: u64 = 4 << 20;
     const facts: DataPlane.HoldFacts = .{ .block_size = bs, .patch_max = bs / 8, .prev_end = 0, .overlay_hold = true };
-    const striped: ShapeTable.Snap = .{ .size = 3 * bs, .striped_passthrough = true };
+    const striped: shape_table.Snap = .{ .size = 3 * bs, .striped_passthrough = true };
     const hint = struct {
         fn at(offset: u64, len: u32, class: zc.PayloadClass) fsv.HoldHint {
             return .{ .ino = 7, .offset = offset, .len = len, .class = class };
@@ -3999,19 +3947,6 @@ test "the hold gate's verdict by class (charter §6.2 items 1–2 on PATCH_MAX =
     var patch_off = facts;
     patch_off.patch_max = 0;
     try testing.expectEqual(@as(?zc.HoldClass, .overlay), DataPlane.holdVerdict(hint.at(4096, 4096, .page_cache), striped, patch_off));
-}
-
-test "the shape table publishes ino-last and a torn row never matches a foreign ino" {
-    var t = try ShapeTable.init(testing.allocator);
-    defer t.deinit(testing.allocator);
-    try testing.expect(t.peek(7) == null);
-    t.publish(7, 4096, true);
-    const s = t.peek(7).?;
-    try testing.expectEqual(@as(u64, 4096), s.size);
-    try testing.expect(s.striped_passthrough);
-    try testing.expect(t.peek(8) == null);
-    t.forget(7);
-    try testing.expect(t.peek(7) == null);
 }
 
 // fstests generic/464 (`write_shared_class_violation` ×193 in one run, every

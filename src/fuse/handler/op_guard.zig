@@ -165,6 +165,11 @@ pub const SharedProbe = struct {
     block_size: u64,
     range_fully_mapped: ?bool,
     narrow: bool,
+    /// The snapshot names a striped file on a passthrough set EXACTLY (the
+    /// shape table's whole row, `shape_table.zig`): a Shared write may run
+    /// its prelude and postlude off it (kv_fs `writeStripedShared`). False
+    /// on a transformed set, whose row cannot tell the kind.
+    striped_passthrough: bool = false,
 
     pub fn classifyInput(self: SharedProbe, end: u64) ClassifyInput {
         return .{

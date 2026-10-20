@@ -212,6 +212,10 @@ pub var fuse_write_striped: counters.ShardedCounter = .{};
 /// Writes to a FOREIGN-slot file taken through the striped arm (every
 /// record a shipped verb to the holder, charter §5.5).
 pub var fuse_write_foreign_striped: counters.ShardedCounter = .{};
+/// `fuse_write_shared_snapshot`: striped writes whose prelude and postlude
+/// ran off the admission's exact Shared snapshot (`writeStripedShared`):
+/// no layout lock, no KV read of the kind or the inode.
+pub var fuse_write_shared_snapshot: counters.ShardedCounter = .{};
 /// `fuse_write_times_parked`: size-neutral striped writes whose Δ(mtime,
 /// ctime) was PARKED (decision 0003 §L.6) — fold-visible on every read,
 /// journaled by the batched drain — instead of committed as a 76 B entry
@@ -2820,6 +2824,13 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             if (c.move) |m| if (m.write_landed) |wl| return self.shipSizeClaim(c, local, wl);
             const len: u64 = if (a.held) |h| h.src.len else a.data.len;
             const end = std.math.add(u64, a.offset, len) catch return error.FileTooBig;
+            // The Shared class on the admission's EXACT snapshot takes the
+            // striped arm with no record read at all (`writeStripedShared`);
+            // a foreign-slot file keeps its shipped claim, a KILLPRIV write
+            // its record RMW, the strict cadence its per-write commit.
+            if (a.shared_size) |size| if (self.data.hasVolumes() and self.times_park and a.write_flags & abi.FUSE_WRITE_KILL_SUIDGID == 0 and !self.foreignSlot(a.ino)) {
+                return self.writeStripedShared(c, local, a, size, end);
+            };
             // (3.7) BEFORE the layout read, held across the arm's commit
             // (module doc): the inline and staged arms and the striped
             // promotion are layout-record RMWs — against the plane's own
@@ -3033,6 +3044,53 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             return .{ .size = @intCast(wl.written) };
         }
 
+        /// The striped arm's payload: a held slot rides unmaterialized when
+        /// the session can store it straight from the slot; a ring write's
+        /// placed sever is adopted (or copied from); every other arm reads
+        /// `data`.
+        fn stripedPayload(self: *Self, a: filesystem.WriteArgs) Error!write_admit.Payload {
+            if (a.held) |h| {
+                if (self.data.canStoreHeld()) return .{ .slot = .{ .src = h.src, .class = if (h.class == .direct_gup) .odirect else .page_cache, .commit_retain = false, .ctx = h.ctx, .extract = h.extract } };
+                return .{ .bytes = try self.payloadBytes(a) };
+            }
+            if (a.placed) |p| return .{ .placed = p };
+            return .{ .bytes = a.data };
+        }
+
+        /// The striped arm off the admission's EXACT Shared snapshot
+        /// (`WriteArgs.shared_size`; rung-10-write-iops): the file is striped
+        /// on a passthrough set and the write ends within its claimed size,
+        /// and under the ino's SHARED op guard neither can change — a size
+        /// set, an extension and a layout transition each hold it exclusive
+        /// — so the (3.7) layout lock (the inline, staged and promotion
+        /// RMWs' guard) is not taken, the kind is not read, and the inode is
+        /// read neither before the data I/O nor after it: the write is
+        /// size-neutral by construction, its postlude parks the stamp alone
+        /// (§L.6 — a claim of 0 under the max law leaves any parked claim
+        /// standing, exactly what the record read would have re-parked), and
+        /// the shape it would republish is the one it was admitted on.
+        /// Measured on 4k randwrite QD32×4: the lock's FIFO courtesy convoyed
+        /// one file's 32 writers (a ticked park per write) and the three KV
+        /// reads were 2.4 µs of the 11 µs write handler.
+        fn writeStripedShared(self: *Self, c: *Ctx, local: u64, a: filesystem.WriteArgs, size: u64, end: u64) Error!filesystem.Written {
+            assert(end <= size);
+            const payload = try self.stripedPayload(a);
+            c.stage(.write_admitted);
+            const outcome = self.data.write(self.io, local, a.offset, payload, a.class, .{ .kind = .striped, .size = size, .map_resident = true }, .{ .ctx = c, .parked = &stampParkedPool }) catch |e| return writeError(e);
+            c.stage(.write_done);
+            if (self.write_hold_pre_guard) self.holdPostlude();
+            {
+                // SHARED like `writeStriped`'s park arm: two parks commute.
+                var g = self.locks.lockManyUncancelable(self.io, &.{.{ .ino = local, .mode = .shared }}, &.{}) catch unreachable; // one request fits every plan
+                defer g.release(self.io);
+                if (self.write_hold) self.holdPostlude();
+                try self.parkWriteTimes(local, 0);
+            }
+            fuse_write_striped.inc();
+            fuse_write_shared_snapshot.inc();
+            return .{ .size = @intCast(outcome.written) };
+        }
+
         /// The striped arm: a non-striped file promotes first (its resident
         /// payload DMA'd to its own block, the striped layout naming it
         /// published — block I/O before the type flip), then the data
@@ -3052,14 +3110,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             // write took; the data plane's own I/O below runs without it.
             if (kind != .striped) old_size = try self.promoteToStriped(c, local, rec, probe.size);
             self.dropLayoutLock(layout_lock);
-            const payload: write_admit.Payload = if (a.held) |h|
-                (if (self.data.canStoreHeld()) write_admit.Payload{ .slot = .{ .src = h.src, .class = if (h.class == .direct_gup) .odirect else .page_cache, .commit_retain = false, .ctx = h.ctx, .extract = h.extract } } else .{ .bytes = try self.payloadBytes(a) })
-            else if (a.placed) |p|
-                // A ring write's placed sever: the striped arm adopts the
-                // assembly (or copies from it); every other arm reads `data`.
-                .{ .placed = p }
-            else
-                .{ .bytes = a.data };
+            const payload = try self.stripedPayload(a);
             c.stage(.write_admitted);
             const outcome = self.data.write(self.io, local, a.offset, payload, a.class, .{ .kind = .striped, .size = old_size, .map_resident = true }, .{ .ctx = c, .parked = &stampParkedPool }) catch |e| return writeError(e);
             c.stage(.write_done);
@@ -4099,6 +4150,8 @@ pub const MemStore = struct {
     fsyncs: u64 = 0,
     /// Value bytes `lookup` and `range` copied out (a view copies none).
     value_bytes_copied: u64 = 0,
+    /// Point reads (`lookup`, `lookupView`) and `range`s served.
+    reads: u64 = 0,
     /// A real member's fail-stop latch (`journal.FailureLatch`): set,
     /// `isFailed` says so and every commit refuses as the device would.
     failed: bool = false,
@@ -4214,6 +4267,7 @@ pub const MemStore = struct {
             self.try_only_refusals -= 1;
             return error.WouldBlock;
         }
+        self.reads += 1;
         const f = self.find(kind, k);
         if (!f.hit) return null;
         self.value_bytes_copied += self.entries.items[f.idx].v.len;
@@ -4223,6 +4277,7 @@ pub const MemStore = struct {
     pub fn lookupView(self: *MemStore, _: Allocator, kind: u8, k: []const u8, comptime T: type, ctx: anytype, comptime visit: fn (@TypeOf(ctx), []const u8) T) StoreError!?T {
         self.lock.lock();
         defer self.lock.unlock();
+        self.reads += 1;
         const f = self.find(kind, k);
         if (!f.hit) return null;
         return visit(ctx, self.entries.items[f.idx].v);
@@ -4231,6 +4286,7 @@ pub const MemStore = struct {
     pub fn range(self: *MemStore, gpa: Allocator, kind: u8, start: []const u8, end: []const u8, max: usize, out: *std.ArrayList(tree.KeyValue)) StoreError!void {
         self.lock.lock();
         defer self.lock.unlock();
+        self.reads += 1;
         var i = self.find(kind, start).idx;
         var n: usize = 0;
         while (i < self.entries.items.len and n < max) : (i += 1) {
@@ -5928,6 +5984,79 @@ test "a striped write reads its layout's kind off the borrowed record: the store
         h.release(f);
     }
     try testing.expectEqual(copied[0], copied[1]);
+}
+
+// rung-10-write-iops: a 4 KiB randwrite handler was 11 µs, of which three
+// KV reads (the layout kind, the inode before and after the data) 2.4 µs and
+// the (3.7) layout lock a ticked park per write — its FIFO courtesy convoyed
+// one file's 32 writers behind a waiter's wake.
+test "a Shared-class write on the admission's EXACT snapshot reads no record and takes no layout lock: the data lands under the snapshot's size, the stamp parks, the size stands (a parked claim of an earlier extension included); a Shared write whose snapshot is not exact, an extending write and a KILLPRIV write keep the record path" {
+    const H = HarnessOf(SettlingData);
+    var h: H = undefined;
+    try h.init();
+    defer h.deinit();
+    defer h.data.deinit();
+    h.data.store = &h.store;
+    const image: [8192]u8 = @splat('I');
+    const f = try h.create(1, "f", 0o644);
+    // The lay-down (exclusive: the first write promotes to striped).
+    try testing.expectEqual(@as(?linux.E, null), h.write(f, 0, &image, 0).errno());
+    try testing.expectEqual(@as(u64, 8192), (try h.getattr(f)).size);
+    // The admission's probe: the plane's exact snapshot of `f` — striped
+    // on a passthrough set, claimed size as published.
+    const Probe = struct {
+        var size: u64 = 0;
+        var exact: bool = true;
+        fn probe(_: ?*anyopaque, _: u64, _: u64, end: u64) ?op_guard.SharedProbe {
+            return .{ .size_floor = size, .meta_size = size, .block_size = layout.DEFAULT_CHUNK, .range_fully_mapped = null, .narrow = end <= size, .striped_passthrough = exact };
+        }
+    };
+    Probe.size = 8192;
+    h.d.probe = .{ .ctx = null, .probe_fn = &Probe.probe };
+    const snap0 = fuse_write_shared_snapshot.load();
+    const parked0 = fuse_write_times_parked.load();
+    const mtime0 = (try h.getattr(f)).mtime;
+    const reads0 = h.store.reads;
+    const locks0 = h.data.base.layout_locks_taken;
+    const writes0 = h.data.writes.items.len;
+    // 1. Shared, exact: no KV read, no layout lock, the data landed under
+    //    the snapshot's size, the stamp parked, the size unchanged.
+    try testing.expectEqual(@as(?linux.E, null), h.write(f, 4096, image[0..512], 0).errno());
+    try testing.expectEqual(reads0, h.store.reads);
+    try testing.expectEqual(locks0, h.data.base.layout_locks_taken);
+    try testing.expectEqual(snap0 + 1, fuse_write_shared_snapshot.load());
+    try testing.expectEqual(parked0 + 1, fuse_write_times_parked.load());
+    try testing.expectEqual(writes0 + 1, h.data.writes.items.len);
+    try testing.expectEqual(@as(u64, 8192), h.data.writes.items[writes0].view_size);
+    try testing.expectEqual(@as(u64, 4096), h.data.writes.items[writes0].offset);
+    const after = try h.getattr(f);
+    try testing.expectEqual(@as(u64, 8192), after.size);
+    try testing.expect(after.mtime >= mtime0);
+    // 2. An extending write (exclusive: the probe says not narrow) parks
+    //    its claim through the record path.
+    try testing.expectEqual(@as(?linux.E, null), h.write(f, 8192, image[0..4096], 0).errno());
+    try testing.expectEqual(snap0 + 1, fuse_write_shared_snapshot.load());
+    try testing.expect(h.store.reads > reads0);
+    try testing.expectEqual(@as(u64, 12288), (try h.getattr(f)).size);
+    // 3. A Shared write beside the parked claim leaves it standing (the
+    //    max law): the size the readers see is the claim's.
+    Probe.size = 12288;
+    const reads1 = h.store.reads;
+    try testing.expectEqual(@as(?linux.E, null), h.write(f, 0, image[0..4096], 0).errno());
+    try testing.expectEqual(snap0 + 2, fuse_write_shared_snapshot.load());
+    try testing.expectEqual(reads1, h.store.reads);
+    try testing.expectEqual(@as(u64, 12288), (try h.getattr(f)).size);
+    // 4. A KILLPRIV write keeps the record RMW.
+    try testing.expectEqual(@as(?linux.E, null), h.write(f, 0, image[0..4096], abi.FUSE_WRITE_KILL_SUIDGID).errno());
+    try testing.expectEqual(snap0 + 2, fuse_write_shared_snapshot.load());
+    try testing.expect(h.store.reads > reads1);
+    // 5. A snapshot that is not exact (a transformed set's row) re-derives.
+    Probe.exact = false;
+    const reads2 = h.store.reads;
+    try testing.expectEqual(@as(?linux.E, null), h.write(f, 0, image[0..4096], 0).errno());
+    try testing.expectEqual(snap0 + 2, fuse_write_shared_snapshot.load());
+    try testing.expect(h.store.reads > reads2);
+    h.release(f);
 }
 
 test "FUSE_SYNCFS is a per-file fsync for the whole mount: every parked stamp journaled in ONE Δ entry BEFORE the plane's drain, the plane's mount-wide drain once, the store-wide meta barrier AFTER it; counted, its phases exact-sum; a volume-less set journals and barriers alone" {

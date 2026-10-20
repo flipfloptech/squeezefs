@@ -1,0 +1,717 @@
+From: SqueezeFS-Zig <sqz@localhost>
+Date: Mon, 20 Oct 2026 04:00:00 +0000
+Subject: [PATCH] sqz: fuse: io_uring: a cheaper request round trip (one header copy per direction, per-entry zero-copy scratch, one lock section for commit-end-and-fetch, no attr_version bump on a read's completion)
+
+PROPOSED (scripts/kernel/proposed/, not in the series): compile-checked
+(W=1) as an out-of-tree fuse module against the 7.2.8 omarchy-sqz tree
+with 0001-0030 applied; NOT booted, NOT measured. The owner builds and
+boots; the daemon-side probe plan is below.
+
+Why (docs/evidence/rung-10-fuse-boundary.md). A FUSE-over-io_uring round
+trip with no filesystem behind it (the daemon answers a 4 KiB O_DIRECT
+READ at its delivery CQE with a header-only commit) costs 3.0 us of host
+CPU per read on this kernel: fio 1.3-1.7 us, the daemon worker 1.9-2.3 us
+of which ~0.3 us is userspace. The worker's kernel share, by self time
+per read (perf, 2.35 M reads/s, 8 workers):
+
+  spinlocks (_raw_spin_lock + queued slowpath)          0.34 us
+  header copies (3 copy_to_iter per send, 2 copy_from_iter
+    per commit, each an iov advance over the headers bvec,
+    fuse_uring_args_to_ring self, memcpy)               ~0.25 us
+  request end + completion to the app's ring
+    (fuse_uring_req_end, fuse_put_request, io_complete_rw,
+    io_req_local_work_add)                              ~0.30 us
+  zero-copy register/unregister (kzalloc + kcalloc +
+    2 kfree + memcg hooks per request, io_free_rsrc_node,
+    fuse_zc_pages_release)                              ~0.18 us
+  io_uring plumbing, the park/wake                      ~0.45 us
+
+This patch takes the FUSE-uring-specific terms that are not the protocol:
+
+1. One header copy per direction. The send stages fuse_in_header, the
+   op header and fuse_uring_ent_in_out in a stack image of struct
+   fuse_uring_req_header and writes the 288 bytes once; the commit reads
+   the image once and takes fuse_out_header and ent_in_out from it.
+   Three advance-and-copy passes per send and two per commit (16-40
+   bytes each, one bvec iteration each) become one each. The per-type
+   copy helpers and enum fuse_uring_header_type go.
+
+2. Per-entry zero-copy scratch. fuse_uring_set_up_zero_copy() allocated a
+   folio carrier and a bvec array per request and freed both at the
+   unregister (the carrier through the imu's release callback). Each
+   entry now owns one carrier and one bvec array for up to 32 folios
+   (4 KiB-128 KiB requests; a larger request allocates as before and
+   amortizes it). The carrier's lifetime is the imu's, so it is claimed
+   with an acquire cmpxchg (FREE -> BUSY) at registration and handed back
+   by the release (BUSY -> FREE, release ordering); an entry freed while
+   its carrier is BUSY orphans it (xchg ORPHAN) and the release frees it.
+   Exactly one of the two frees it, never both.
+
+3. One queue->lock section for the plain commit's end-and-fetch.
+   fuse_uring_req_end() detached the request and credited the queue under
+   the lock, fuse_uring_get_next_fuse_req() took it again to make the
+   entry available and assign the next request. fuse_uring_commit_end_fetch()
+   does both in one section, then unregisters the zc slot, ends the
+   request and prepares the next. The retain arm and the error arms keep
+   the old sequence. The daemon's commit path takes the queue lock three
+   times per request instead of four, against the submitting CPU's
+   fuse_uring_queue_bq_req() on the same lock.
+
+4. fuse_aio_complete() bumps fc->attr_version (a connection-wide atomic)
+   under fi->lock for every completed async direct I/O; the synchronous
+   path bumps only for writes (fuse_write_update_attr). A read changes
+   nothing the bump guards, and at 1.25 M reads/s the atomic and the
+   per-file lock are contended across every CPU completing one file's
+   reads. Bump for writes only. (This is fs/fuse/file.c, not the uring
+   transport; it is here because the profile put it on the same path.)
+
+Expected saving, from the profile: 0.25-0.35 us of the worker's ~2.0 us
+kernel share per read (the header copies ~0.1, the zc allocations ~0.1,
+the lock trip and the attr_version bump ~0.05-0.15), i.e. 12-17 % of the
+round trip's kernel cost and 4-5 % of today's 6.4 us daemon cost per
+cold 4 KiB read. The daemon's probe plan: the boundary ruler row
+(SQUEEZEFS_TEST_READ_ZERO_FILL=prefilled, 4k randread QD32x4) before and
+after the boot, daemon cores per read at equal IOPS (fio is the ceiling
+there), and the flat perf profile's _copy_to_iter / iov_iter_advance /
+__kmalloc_noprof / kfree / _raw_spin_lock lines on the sqz-fuse-ur
+class; then the full row (seam off) and THE KILL MATRIX, the zc rows
+(e2e zc READ/WRITE, retention) and the dismount pass for the carrier's
+orphan arm (a SIGKILLed daemon with registered slots).
+
+Not in this patch, named for the record: the structural lever is a
+READ reply that names a device range for the kernel to read into the
+request's folios itself (no zero-copy slot, no READ_FIXED on the daemon
+ring, no completion task work into the daemon, one daemon pass per
+read); it needs the data plane's post-DMA binding recheck to become a
+pre-check with an in-flight pin, a full-tier law change (charter §6.3).
+---
+diff --git a/fs/fuse/dev_uring_i.h b/fs/fuse/dev_uring_i.h
+--- a/fs/fuse/dev_uring_i.h
++++ b/fs/fuse/dev_uring_i.h
+@@ -62,6 +62,8 @@
+ 	unsigned int zero_copy_depth;
+ };
+ 
++struct fuse_zc_pages;
++
+ /** A fuse ring entry, part of the ring queue */
+ struct fuse_ring_ent {
+ 	union {
+@@ -91,6 +93,17 @@
+ 			bool zc_dir_source : 1;
+ 			/* commit_id of a FRRS_RETAINED payload */
+ 			u64 retained_commit_id;
++			/*
++			 * Per-entry zero-copy scratch, reused across requests
++			 * of up to zc_cap folios instead of allocated per
++			 * request: the folio carrier (its lifetime is the
++			 * imu's, so it is handed back by the release callback
++			 * and orphaned if the entry dies first) and the bvec
++			 * array io_buffer_register_bvec() copies from.
++			 */
++			struct fuse_zc_pages *zc_held;
++			struct bio_vec *zc_bvs;
++			unsigned int zc_cap;
+ 		};
+ 	};
+ 
+diff --git a/fs/fuse/dev_uring.c b/fs/fuse/dev_uring.c
+--- a/fs/fuse/dev_uring.c
++++ b/fs/fuse/dev_uring.c
+@@ -37,16 +37,8 @@
+ 
+ static const struct fuse_iqueue_ops fuse_io_uring_ops;
+ 
+-enum fuse_uring_header_type {
+-	/* struct fuse_in_header / struct fuse_out_header */
+-	FUSE_URING_HEADER_IN_OUT,
+-	/* per op code header */
+-	FUSE_URING_HEADER_OP,
+-	/* struct fuse_uring_ent_in_out header */
+-	FUSE_URING_HEADER_RING_ENT,
+-};
+-
+ static void fuse_uring_free_srcs(struct fuse_ring_queue *queue);
++static void fuse_uring_free_ent(struct fuse_ring_ent *ent);
+ 
+ static void uring_cmd_set_ring_ent(struct io_uring_cmd *cmd,
+ 				   struct fuse_ring_ent *ring_ent)
+@@ -355,7 +347,7 @@
+ 		list_for_each_entry_safe(ent, next, &queue->ent_released,
+ 					 list) {
+ 			list_del_init(&ent->list);
+-			kfree(ent);
++			fuse_uring_free_ent(ent);
+ 		}
+ 		fuse_uring_free_srcs(queue);
+ 
+@@ -830,7 +822,7 @@
+ 	if (need_cmd_done) {
+ 		/* no queue lock to avoid lock order issues */
+ 		io_uring_cmd_done(cmd, -ENOTCONN, issue_flags);
+-		kfree(ent);
++		fuse_uring_free_ent(ent);
+ 		if (atomic_dec_and_test(&queue->ring->queue_refs))
+ 			wake_up_all(&queue->ring->stop_waitq);
+ 	}
+@@ -886,114 +878,52 @@
+ 	return err;
+ }
+ 
+-static int ring_header_type_offset(enum fuse_uring_header_type type)
+-{
+-	switch (type) {
+-	case FUSE_URING_HEADER_IN_OUT:
+-		return 0;
+-	case FUSE_URING_HEADER_OP:
+-		return offsetof(struct fuse_uring_req_header, op_in);
+-	case FUSE_URING_HEADER_RING_ENT:
+-		return offsetof(struct fuse_uring_req_header, ring_ent_in_out);
+-	default:
+-		WARN_ONCE(1, "Invalid header type: %d\n", type);
+-		return -EINVAL;
+-	}
+-}
+-
+-static int get_kernel_ring_header(struct fuse_ring_ent *ent,
+-				  enum fuse_uring_header_type type,
+-				  struct iov_iter *headers_iter)
+-{
+-	int offset = ring_header_type_offset(type);
+-
+-	if (offset < 0)
+-		return offset;
+-
+-	*headers_iter = ent->headers_iter;
+-	if (offset)
+-		iov_iter_advance(headers_iter, offset);
+-
+-	return 0;
+-}
+-
+-static int copy_header_to_ring(struct fuse_ring_ent *ent,
+-			       enum fuse_uring_header_type type,
+-			       const void *header, size_t header_size)
++/*
++ * The whole 288-byte entry header moves in ONE copy per direction: the
++ * send stages fuse_in_header, the op header and fuse_uring_ent_in_out in a
++ * stack image and writes it once; the commit reads the image once and
++ * takes fuse_out_header and fuse_uring_ent_in_out from it. Three
++ * iov_iter advance-and-copy passes per send and two per commit were a
++ * measurable share of a 4 KiB read's round trip (one bvec iteration each,
++ * for 16–40 bytes).
++ */
++static int copy_headers_to_ring(struct fuse_ring_ent *ent,
++				const struct fuse_uring_req_header *hdr)
+ {
+-	bool use_bufring = ent->queue->use_bufring;
+ 	int err = 0;
+ 
+-	if (use_bufring) {
+-		struct iov_iter iter;
+-
+-		err = get_kernel_ring_header(ent, type, &iter);
+-		if (err)
+-			goto done;
+-
+-		if (copy_to_iter(header, header_size, &iter) != header_size)
+-			err = -EFAULT;
+-	} else {
+-		int offset = ring_header_type_offset(type);
+-		void __user *ring;
+-
+-		if (offset < 0) {
+-			err = offset;
+-			goto done;
+-		}
++	if (ent->queue->use_bufring) {
++		struct iov_iter iter = ent->headers_iter;
+ 
+-		ring = (void __user *)ent->headers + offset;
+-		if (copy_to_user(ring, header, header_size))
++		if (copy_to_iter(hdr, sizeof(*hdr), &iter) != sizeof(*hdr))
+ 			err = -EFAULT;
++	} else if (copy_to_user(ent->headers, hdr, sizeof(*hdr))) {
++		err = -EFAULT;
+ 	}
+ 
+-done:
+ 	if (err)
+-		pr_info_ratelimited("Copying header to ring failed: "
+-				    "header_type=%u, header_size=%zu, "
+-				    "use_bufring=%d\n", type, header_size,
+-				    use_bufring);
+-
++		pr_info_ratelimited("Copying headers to ring failed: "
++				    "use_bufring=%d\n", ent->queue->use_bufring);
+ 	return err;
+ }
+ 
+-static int copy_header_from_ring(struct fuse_ring_ent *ent,
+-				 enum fuse_uring_header_type type, void *header,
+-				 size_t header_size)
++static int copy_headers_from_ring(struct fuse_ring_ent *ent,
++				  struct fuse_uring_req_header *hdr)
+ {
+-	bool use_bufring = ent->queue->use_bufring;
+ 	int err = 0;
+ 
+-	if (use_bufring) {
+-		struct iov_iter iter;
+-
+-		err = get_kernel_ring_header(ent, type, &iter);
+-		if (err)
+-			goto done;
+-
+-		if (copy_from_iter(header, header_size, &iter) != header_size)
+-			err = -EFAULT;
+-	} else {
+-		int offset = ring_header_type_offset(type);
+-		const void __user *ring;
+-
+-		if (offset < 0) {
+-			err = offset;
+-			goto done;
+-		}
++	if (ent->queue->use_bufring) {
++		struct iov_iter iter = ent->headers_iter;
+ 
+-		ring = (void __user *)ent->headers + offset;
+-		if (copy_from_user(header, ring, header_size))
++		if (copy_from_iter(hdr, sizeof(*hdr), &iter) != sizeof(*hdr))
+ 			err = -EFAULT;
++	} else if (copy_from_user(hdr, ent->headers, sizeof(*hdr))) {
++		err = -EFAULT;
+ 	}
+ 
+-done:
+ 	if (err)
+-		pr_info_ratelimited("Copying header from ring failed: "
+-				    "header_type=%u, header_size=%zu, "
+-				    "use_bufring=%d\n", type, header_size,
+-				    use_bufring);
+-
++		pr_info_ratelimited("Copying headers from ring failed: "
++				    "use_bufring=%d\n", ent->queue->use_bufring);
+ 	return err;
+ }
+ 
+@@ -1030,24 +960,19 @@
+ 
+ static int fuse_uring_copy_from_ring(struct fuse_ring *ring,
+ 				     struct fuse_req *req,
+-				     struct fuse_ring_ent *ent)
++				     struct fuse_ring_ent *ent,
++				     const struct fuse_uring_ent_in_out *ring_in_out)
+ {
+ 	struct fuse_copy_state cs;
+ 	struct fuse_args *args = req->args;
+ 	struct iov_iter iter;
+ 	int err;
+-	struct fuse_uring_ent_in_out ring_in_out;
+-
+-	err = copy_header_from_ring(ent, FUSE_URING_HEADER_RING_ENT,
+-				    &ring_in_out, sizeof(ring_in_out));
+-	if (err)
+-		return err;
+ 
+ 	err = setup_fuse_copy_state(&cs, ring, req, ent, ITER_SOURCE, &iter);
+ 	if (err)
+ 		return err;
+ 
+-	err = fuse_copy_out_args(&cs, args, ring_in_out.payload_sz);
++	err = fuse_copy_out_args(&cs, args, ring_in_out->payload_sz);
+ 	fuse_copy_finish(&cs);
+ 	return err;
+ }
+@@ -1060,11 +985,28 @@
+  * I/O across COMMIT (window 2) sound, and what makes payload retention
+  * (0029) possible at all.
+  */
++enum {
++	/* the entry's cached carrier, idle */
++	FUSE_ZC_HELD_FREE = 0,
++	/* registered: an imu's release will hand it back */
++	FUSE_ZC_HELD_BUSY = 1,
++	/* the entry died while busy: the release frees it */
++	FUSE_ZC_HELD_ORPHAN = 2,
++};
++
+ struct fuse_zc_pages {
+ 	unsigned int nr;
++	/* FUSE_ZC_HELD_*; only read for a cached carrier */
++	atomic_t state;
++	/* the entry's reusable carrier (else freed by the release) */
++	bool cached;
+ 	struct folio *folios[] __counted_by(nr);
+ };
+ 
++/* The common 4 KiB–128 KiB requests reuse the entry's scratch; a larger
++ * payload amortizes its allocation over its bytes. */
++#define FUSE_ZC_SCRATCH_FOLIOS 32
++
+ static void fuse_zc_pages_release(void *priv)
+ {
+ 	struct fuse_zc_pages *held = priv;
+@@ -1072,7 +1014,51 @@
+ 
+ 	for (i = 0; i < held->nr; i++)
+ 		folio_put(held->folios[i]);
+-	kfree(held);
++	if (!held->cached) {
++		kfree(held);
++		return;
++	}
++	/* Pairs with the acquire that claimed it; an orphaned one is ours */
++	if (atomic_cmpxchg_release(&held->state, FUSE_ZC_HELD_BUSY,
++				   FUSE_ZC_HELD_FREE) != FUSE_ZC_HELD_BUSY)
++		kfree(held);
++}
++
++static void fuse_uring_zc_scratch_alloc(struct fuse_ring_ent *ent)
++{
++	unsigned int cap = FUSE_ZC_SCRATCH_FOLIOS;
++	struct fuse_zc_pages *held;
++	struct bio_vec *bvs;
++
++	held = kzalloc(struct_size(held, folios, cap), GFP_KERNEL_ACCOUNT);
++	bvs = kcalloc(cap, sizeof(*bvs), GFP_KERNEL_ACCOUNT);
++	if (!held || !bvs) {
++		/* no scratch: every request allocates, as before */
++		kfree(held);
++		kfree(bvs);
++		return;
++	}
++	held->cached = true;
++	atomic_set(&held->state, FUSE_ZC_HELD_FREE);
++	ent->zc_held = held;
++	ent->zc_bvs = bvs;
++	ent->zc_cap = cap;
++}
++
++/*
++ * Free an entry: a cached carrier an imu still references (its release has
++ * not run) is orphaned and the release frees it.
++ */
++static void fuse_uring_free_ent(struct fuse_ring_ent *ent)
++{
++	if (ent->queue->use_bufring) {
++		if (ent->zc_held &&
++		    atomic_xchg(&ent->zc_held->state, FUSE_ZC_HELD_ORPHAN) ==
++			    FUSE_ZC_HELD_FREE)
++			kfree(ent->zc_held);
++		kfree(ent->zc_bvs);
++	}
++	kfree(ent);
+ }
+ 
+ static int fuse_uring_set_up_zero_copy(struct fuse_ring_ent *ent,
+@@ -1090,21 +1076,33 @@
+ 
+ 	ap = container_of(req->args, typeof(*ap), args);
+ 
+-	held = kzalloc(struct_size(held, folios, ap->num_folios),
+-		       GFP_KERNEL_ACCOUNT);
+-	if (!held)
+-		return -ENOMEM;
+-	held->nr = ap->num_folios;
+-
+ 	/*
+-	 * We can avoid having to allocate the bvs array when folios and
+-	 * descriptors are internally represented by bvs in fuse
++	 * The entry's scratch when the request fits and the previous
++	 * registration's release has handed it back (acquire pairs with
++	 * that release); else a carrier of its own.
+ 	 */
+-	bvs = kcalloc(ap->num_folios, sizeof(*bvs), GFP_KERNEL_ACCOUNT);
+-	if (!bvs) {
+-		kfree(held);
+-		return -ENOMEM;
++	if (ent->zc_held && ap->num_folios <= ent->zc_cap &&
++	    atomic_cmpxchg_acquire(&ent->zc_held->state, FUSE_ZC_HELD_FREE,
++				   FUSE_ZC_HELD_BUSY) == FUSE_ZC_HELD_FREE) {
++		held = ent->zc_held;
++		bvs = ent->zc_bvs;
++	} else {
++		held = kzalloc(struct_size(held, folios, ap->num_folios),
++			       GFP_KERNEL_ACCOUNT);
++		if (!held)
++			return -ENOMEM;
++		held->cached = false;
++		/*
++		 * We can avoid having to allocate the bvs array when folios
++		 * and descriptors are internally represented by bvs in fuse
++		 */
++		bvs = kcalloc(ap->num_folios, sizeof(*bvs), GFP_KERNEL_ACCOUNT);
++		if (!bvs) {
++			kfree(held);
++			return -ENOMEM;
++		}
+ 	}
++	held->nr = ap->num_folios;
+ 
+ 	for (i = 0; i < ap->num_folios; i++) {
+ 		total_bytes += ap->descs[i].length;
+@@ -1124,7 +1122,8 @@
+ 				      total_bytes, ddir, ent->fixed_buf_id,
+ 				      fuse_zc_pages_release, held,
+ 				      issue_flags);
+-	kfree(bvs);
++	if (bvs != ent->zc_bvs)
++		kfree(bvs);
+ 	if (err) {
+ 		/* callback never fires on register failure */
+ 		fuse_zc_pages_release(held);
+@@ -1142,7 +1141,8 @@
+  */
+ static int fuse_uring_args_to_ring(struct fuse_ring *ring, struct fuse_req *req,
+ 				   struct fuse_ring_ent *ent,
+-				   unsigned int issue_flags)
++				   unsigned int issue_flags,
++				   struct fuse_uring_req_header *hdr)
+ {
+ 	struct fuse_copy_state cs;
+ 	struct fuse_args *args = req->args;
+@@ -1165,11 +1165,9 @@
+ 		 * Some op code have that as zero size.
+ 		 */
+ 		if (args->in_args[0].size > 0) {
+-			err = copy_header_to_ring(ent, FUSE_URING_HEADER_OP,
+-						  in_args->value,
+-						  in_args->size);
+-			if (err)
+-				return err;
++			if (WARN_ON_ONCE(in_args->size > sizeof(hdr->op_in)))
++				return -EINVAL;
++			memcpy(hdr->op_in, in_args->value, in_args->size);
+ 		}
+ 		in_args++;
+ 		num_args--;
+@@ -1194,8 +1192,8 @@
+ 		ent_in_out.payload_sz +=
+ 			args->in_args[args->in_numargs - 1].size;
+ 
+-	return copy_header_to_ring(ent, FUSE_URING_HEADER_RING_ENT,
+-				   &ent_in_out, sizeof(ent_in_out));
++	hdr->ring_ent_in_out = ent_in_out;
++	return 0;
+ }
+ 
+ static int fuse_uring_copy_to_ring(struct fuse_ring_ent *ent,
+@@ -1204,7 +1202,7 @@
+ {
+ 	struct fuse_ring_queue *queue = ent->queue;
+ 	struct fuse_ring *ring = queue->ring;
+-	struct fuse_in_header in_header;
++	struct fuse_uring_req_header hdr;
+ 	int err;
+ 
+ 	err = -EIO;
+@@ -1218,17 +1216,18 @@
+ 	if (WARN_ON(req->in.h.unique == 0))
+ 		return err;
+ 
+-	/* copy the request */
+-	err = fuse_uring_args_to_ring(ring, req, ent, issue_flags);
++	/* stage the op header, the payload and fuse_uring_ent_in_out */
++	memset(&hdr, 0, sizeof(hdr));
++	err = fuse_uring_args_to_ring(ring, req, ent, issue_flags, &hdr);
+ 	if (unlikely(err)) {
+ 		pr_info_ratelimited("Copy to ring failed: %d\n", err);
+ 		return err;
+ 	}
+ 
+-	/* copy fuse_in_header */
+-	in_header = req->in.h;
+-	return copy_header_to_ring(ent, FUSE_URING_HEADER_IN_OUT, &in_header,
+-				   sizeof(in_header));
++	/* stage fuse_in_header; one copy of the whole header */
++	BUILD_BUG_ON(sizeof(req->in.h) > sizeof(hdr.in_out));
++	memcpy(hdr.in_out, &req->in.h, sizeof(req->in.h));
++	return copy_headers_to_ring(ent, &hdr);
+ }
+ 
+ static bool fuse_uring_req_has_copyable_payload(struct fuse_ring_ent *ent,
+@@ -1435,26 +1434,37 @@
+  * This is comparible with handling of classical write(/dev/fuse).
+  * Also make the ring request available again for new fuse requests.
+  */
+-static void fuse_uring_commit(struct fuse_ring_ent *ent, struct fuse_req *req,
+-			      unsigned int issue_flags, bool retain)
++/*
++ * Read the committed reply: the header image once, fuse_out_header and
++ * fuse_uring_ent_in_out from it, then the payload. Returns the error the
++ * request ends with (0 on success); the caller ends the request.
++ */
++static int fuse_uring_commit_read(struct fuse_ring_ent *ent,
++				  struct fuse_req *req)
+ {
+ 	struct fuse_ring *ring = ent->queue->ring;
+-	struct fuse_out_header out_header;
+-	ssize_t err = -EFAULT;
++	struct fuse_uring_req_header hdr;
++	int err;
+ 
+-	if (copy_header_from_ring(ent, FUSE_URING_HEADER_IN_OUT, &out_header,
+-				  sizeof(out_header)))
+-		goto out;
+-	req->out.h = out_header;
++	if (copy_headers_from_ring(ent, &hdr))
++		return -EFAULT;
++	BUILD_BUG_ON(sizeof(req->out.h) > sizeof(hdr.in_out));
++	memcpy(&req->out.h, hdr.in_out, sizeof(req->out.h));
+ 
+ 	err = fuse_uring_out_header_has_err(&req->out.h, req);
+ 	if (err) {
+ 		/* req->out.h.error already set */
+-		goto out;
++		return err;
+ 	}
+ 
+-	err = fuse_uring_copy_from_ring(ring, req, ent);
+-out:
++	return fuse_uring_copy_from_ring(ring, req, ent, &hdr.ring_ent_in_out);
++}
++
++static void fuse_uring_commit(struct fuse_ring_ent *ent, struct fuse_req *req,
++			      unsigned int issue_flags, bool retain)
++{
++	int err = fuse_uring_commit_read(ent, req);
++
+ 	if (err)
+ 		retain = false;
+ 	fuse_uring_req_end(ent, req, err, issue_flags, retain);
+@@ -1488,6 +1498,50 @@
+ 	return req != NULL;
+ }
+ 
++/*
++ * The plain commit's end-and-fetch: ONE queue->lock section detaches the
++ * ended request, credits the queue, makes the entry available and assigns
++ * the next request to it (fuse_uring_req_end() and
++ * fuse_uring_get_next_fuse_req() took the lock twice for the same); then
++ * the zc slot is unregistered, the request ended and the next one
++ * prepared. Returns true when a next request is prepared for sending.
++ */
++static bool fuse_uring_commit_end_fetch(struct fuse_ring_ent *ent,
++					struct fuse_req *req, int error,
++					unsigned int issue_flags)
++{
++	struct fuse_ring_queue *queue = ent->queue;
++	struct fuse_req *next;
++
++	lockdep_assert_not_held(&queue->lock);
++	spin_lock(&queue->lock);
++	ent->fuse_req = NULL;
++	list_del_init(&req->list);
++	/* only requests this queue charged are credited (fuse_uring_req_end) */
++	if (test_bit(FR_BG_URING, &req->flags))
++		fuse_uring_bg_finish(queue, req);
++	fuse_uring_ent_avail(ent, queue);
++	next = fuse_uring_ent_assign_req(ent, issue_flags);
++	spin_unlock(&queue->lock);
++
++	if (ent->zero_copied && ent->cmd) {
++		io_buffer_unregister(ent->cmd, ent->fixed_buf_id, issue_flags);
++		ent->zero_copied = false;
++		ent->zc_dir_source = false;
++	}
++
++	if (error)
++		req->out.h.error = error;
++	clear_bit(FR_SENT, &req->flags);
++	fuse_request_end(req);
++
++	if (!next)
++		return false;
++	if (fuse_uring_prepare_send(ent, next, issue_flags))
++		return fuse_uring_get_next_fuse_req(ent, queue, issue_flags);
++	return true;
++}
++
+ static int fuse_ring_ent_set_commit(struct fuse_ring_ent *ent)
+ {
+ 	struct fuse_ring_queue *queue = ent->queue;
+@@ -1643,6 +1697,7 @@
+ 	err = fuse_uring_headers_prep(ent, ITER_SOURCE, issue_flags);
+ 	if (err) {
+ 		fuse_uring_req_end(ent, req, err, issue_flags, false);
++		send = fuse_uring_get_next_fuse_req(ent, queue, issue_flags);
+ 	} else if (retain) {
+ 		fuse_uring_commit(ent, req, issue_flags, true);
+ 		if (ent->zero_copied) {
+@@ -1659,17 +1714,17 @@
+ 			return 0;
+ 		}
+ 		/* copy/header error cleared retain; fall through to fetch */
++		send = fuse_uring_get_next_fuse_req(ent, queue, issue_flags);
+ 	} else {
+-		fuse_uring_commit(ent, req, issue_flags, false);
++		/*
++		 * Fetching the next request is absolutely required as queued
++		 * fuse requests would otherwise not get processed - committing
++		 * and fetching is done in one step vs legacy fuse, which has
++		 * separated read (fetch request) and write (commit result).
++		 */
++		err = fuse_uring_commit_read(ent, req);
++		send = fuse_uring_commit_end_fetch(ent, req, err, issue_flags);
+ 	}
+-
+-	/*
+-	 * Fetching the next request is absolutely required as queued
+-	 * fuse requests would otherwise not get processed - committing
+-	 * and fetching is done in one step vs legacy fuse, which has separated
+-	 * read (fetch request) and write (commit result).
+-	 */
+-	send = fuse_uring_get_next_fuse_req(ent, queue, issue_flags);
+ 	fuse_uring_headers_cleanup(ent, issue_flags);
+ 	if (send)
+ 		fuse_uring_send(ent, cmd, 0, issue_flags);
+@@ -1785,7 +1840,7 @@
+ 		spin_unlock(&fch->lock);
+ 		if (atomic_dec_and_test(&ring->queue_refs))
+ 			wake_up_all(&ring->stop_waitq);
+-		kfree(ent);
++		fuse_uring_free_ent(ent);
+ 		return -ECONNABORTED;
+ 	}
+ 	spin_unlock(&fch->lock);
+@@ -1864,6 +1919,8 @@
+ 		}
+ 		ent->src = src;
+ 		ent->fixed_buf_id = READ_ONCE(cmd->sqe->buf_index);
++		if (queue->use_zero_copy)
++			fuse_uring_zc_scratch_alloc(ent);
+ 		atomic_inc(&ring->queue_refs);
+ 		return ent;
+ 	}
+@@ -2087,7 +2144,7 @@
+ 
+ 		if (req)
+ 			fuse_uring_req_end(ent, req, err, issue_flags, false);
+-		kfree(ent);
++		fuse_uring_free_ent(ent);
+ 		if (atomic_dec_and_test(&queue->ring->queue_refs))
+ 			wake_up_all(&queue->ring->stop_waitq);
+ 	}
+diff --git a/fs/fuse/file.c b/fs/fuse/file.c
+--- a/fs/fuse/file.c
++++ b/fs/fuse/file.c
+@@ -688,7 +688,16 @@
+ 		struct address_space *mapping = io->iocb->ki_filp->f_mapping;
+ 		ssize_t res = fuse_get_res_by_io(io);
+ 
+-		if (res >= 0) {
++		/*
++		 * A write moved size/mtime under the daemon, so a GETATTR
++		 * reply from before it is stale: bump as the synchronous path
++		 * does (fuse_write_update_attr). A read changed nothing the
++		 * synchronous path bumps for (fuse_direct_io), and the bump
++		 * is a connection-wide atomic plus the inode lock on every
++		 * completion — contended across the CPUs completing one
++		 * file's reads.
++		 */
++		if (res >= 0 && io->write) {
+ 			struct fuse_conn *fc = get_fuse_conn(inode);
+ 			struct fuse_inode *fi = get_fuse_inode(inode);
+ 

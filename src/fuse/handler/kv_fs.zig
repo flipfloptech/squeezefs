@@ -2804,10 +2804,15 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             }
             const want: usize = @intCast(@min(@as(u64, a.size), v.size - a.offset));
             const n = @min(want, c.window.len);
-            const rec = try self.readLayout(local);
+            // A routed read needs the layout's kind alone (the plane
+            // resolves the rest off its view): no copy of the record; the
+            // inline arm, whose record IS the payload, copies it.
+            const kind_view = if (self.data.hasVolumes()) try self.layoutKindView(local) else null;
+            const rec = if (kind_view != null and kind_view.? != .inline_) null else try self.readLayout(local);
             defer self.freeLayout(rec);
+            const kind: layout.Kind = kind_view orelse kindOf(rec);
             c.stage(.meta_backend_done);
-            switch (kindOf(rec)) {
+            switch (kind) {
                 .inline_ => {
                     // The record IS the payload: served here for every store.
                     @memset(c.window[0..n], 0);

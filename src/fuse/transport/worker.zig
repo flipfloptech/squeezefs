@@ -706,12 +706,11 @@ pub const Shared = struct {
     /// `SQUEEZEFS_FUSE_STREAM_LANES`: where a held write of the overlay
     /// class (`> block/8`, the streaming write) runs when it leaves this
     /// thread — `cpu`: the queue's CPU lane like every data-class request
-    /// (the control arm: one lane carries the queue's whole depth);
-    /// `node`: round-robin over the node's handler lanes; `node_only`:
-    /// the same, and never the worker's own lane. Derivation: a queue
-    /// holds up to `depth` streaming writes whose handler costs tens of µs
-    /// each against a device phase of hundreds, so one lane serializes
-    /// what the device would overlap (measured on 1M seq write ×4).
+    /// (the shipped arm); `node`: round-robin over the node's handler
+    /// lanes; `node_only`: the same, and never the worker's own lane. The
+    /// measured arms (rung-10-seq-parity): neither shortened the round —
+    /// the device phase stood at ≈ 490 µs with the worker freed of handler
+    /// work, and the hops cost 0.3–1.4 cores.
     stream_lanes: StreamLanes = .cpu,
     /// The no-open posture (`Config.no_open`, decision 0003 §AF): a FLUSH
     /// is probed here first, and its drain is the data class.

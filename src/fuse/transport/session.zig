@@ -1173,7 +1173,7 @@ pub const Session = struct {
     /// allowed set is the enum's field names).
     fn streamLanesKnob(env: *const std.process.Environ.Map) worker.Shared.StreamLanes {
         const s = knobs.enumKnob("SQUEEZEFS_FUSE_STREAM_LANES", env);
-        return std.meta.stringToEnum(worker.Shared.StreamLanes, s) orelse .node;
+        return std.meta.stringToEnum(worker.Shared.StreamLanes, s) orelse .cpu;
     }
 
     /// THE ORDERED BRING-UP. `fs.init` runs once the geometry is planned.
@@ -1385,7 +1385,7 @@ pub const Session = struct {
             .no_open = cfg.no_open,
             .budget_bytes = cfg.mem_budget_bytes,
         };
-        if (self.shared.stream_lanes != .node) log.info("transport: SQUEEZEFS_FUSE_STREAM_LANES={t} — the streaming write's lane placement (the A/B lever; `node` is the derived default)", .{self.shared.stream_lanes});
+        if (self.shared.stream_lanes != .cpu) log.info("transport: SQUEEZEFS_FUSE_STREAM_LANES={t} — the streaming write's lane placement (the measured A/B arm; `cpu` is the shipped one)", .{self.shared.stream_lanes});
         if (read_fusion_lever and !self.shared.read_fusion_on) log.info("transport: SQUEEZEFS_FUSE_READ_FUSION=1 accepted; inert on a {t} session (the fused poll is the zero-copy mode's)", .{self.mode});
         if (self.shared.sqpoll) log.info("transport: SQUEEZEFS_FUSE_SQPOLL=1 — the kernel submission poller (measured not recommended: the A/B control arm)", .{});
         self.shared.register_refuse_remaining.store(knobs.intKnob("SQUEEZEFS_TEST_FUSE_REGISTER_REFUSE", u32, env), .monotonic);

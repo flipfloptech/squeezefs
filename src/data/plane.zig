@@ -254,6 +254,10 @@ pub const stats = struct {
     /// copies afterwards: `promotion_cover_rounds_failed` (a meta barrier
     /// that failed; the copies stay held for the next round).
     pub var promotion_barriers: counters.ShardedCounter = .{};
+    /// The staged fast path's point cache (`stagedPoint`): hits served
+    /// without a lookup, misses that went to the read view and the store.
+    pub var staged_point_hits: counters.ShardedCounter = .{};
+    pub var staged_point_misses: counters.ShardedCounter = .{};
     pub var promotion_barriers_coalesced: counters.ShardedCounter = .{};
     pub var promotion_barrier_write_through_skips: counters.ShardedCounter = .{};
     pub var promotion_cover_rounds_failed: counters.ShardedCounter = .{};
@@ -316,7 +320,7 @@ pub fn writeStatsJson(w: *Io.Writer) Io.Writer.Error!void {
     inline for (.{ "data_volumes", "data_staging_on", "data_nvme_tier_on", "block_refs_drift_rows" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, @field(stats, name).load() });
     }
-    inline for (.{ "layout_map_merges", "layout_map_merge_blocks", "layout_map_merge_failures", "layout_map_merge_clipped_blocks", "layout_map_merges_shipped", "foreign_publish_kvmap_refusals", "layout_publishes_served", "kvmap_sweep_spawn_refusals", "promotions_run", "promotions_stale", "promotions_failed", "own_block_dmas", "own_block_dma_bytes", "promotion_barriers", "promotion_barriers_coalesced", "promotion_barrier_write_through_skips", "promotion_cover_rounds_failed", "held_stores", "held_store_bytes", "held_store_failures", "hold_gate_admits", "hold_gate_overlay_admits", "hold_gate_declines", "prefetch_fibers", "prefetch_fiber_refusals", "hold_ceremony_fibers", "bindings_freed", "device_read_bounces", "data_device_read_bytes", "write_side_read_dma_bytes", "compose_read_dma_bytes", "pack_read_dma_bytes" }) |name| {
+    inline for (.{ "layout_map_merges", "layout_map_merge_blocks", "layout_map_merge_failures", "layout_map_merge_clipped_blocks", "layout_map_merges_shipped", "foreign_publish_kvmap_refusals", "layout_publishes_served", "kvmap_sweep_spawn_refusals", "promotions_run", "promotions_stale", "promotions_failed", "own_block_dmas", "own_block_dma_bytes", "promotion_barriers", "staged_point_hits", "staged_point_misses", "promotion_barriers_coalesced", "promotion_barrier_write_through_skips", "promotion_cover_rounds_failed", "held_stores", "held_store_bytes", "held_store_failures", "hold_gate_admits", "hold_gate_overlay_admits", "hold_gate_declines", "prefetch_fibers", "prefetch_fiber_refusals", "hold_ceremony_fibers", "bindings_freed", "device_read_bounces", "data_device_read_bytes", "write_side_read_dma_bytes", "compose_read_dma_bytes", "pack_read_dma_bytes" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, @field(stats, name).load() });
     }
     try w.print("\"data_unresolved_volume\":{d},\"kvmap_resolve_failures\":{d},\"kvmap_head_put_unlocked\":{d},\"release_free_unheld\":{d},\"layout_map_merge_displaced_overflow\":{d}}}", .{ counters.tripwireCount("data_unresolved_volume"), counters.tripwireCount("kvmap_resolve_failures"), counters.tripwireCount("kvmap_head_put_unlocked"), counters.tripwireCount("release_free_unheld"), counters.tripwireCount("layout_map_merge_displaced_overflow") });
@@ -418,6 +422,8 @@ pub const DataPlane = struct {
     reclaim_free: seams.ReclaimFree,
     /// Levels (3.5) and (3.7) with the promotion's order (module doc).
     locks: layout.PublishLocks = .{},
+    /// The staged fast path's per-ino cache (`stagedPoint`).
+    staged_points: StagedPointCache = .{},
     /// The promotion arms' data barrier per volume (`fsync.BarrierCoalescer`,
     /// DUR-1: the DMA'd block flushed BEFORE the layout naming it publishes;
     /// concurrent promotions on a volume ride one flush).
@@ -1764,11 +1770,80 @@ pub const DataPlane = struct {
 
     pub fn stagedPoint(self: *DataPlane, ino: u64) Error!?StagedPoint {
         if (self.stage == null) return null;
+        // The witness and the move epoch BEFORE the lookups (the read
+        // view's law): a record that lands meanwhile moves the witness past
+        // what the entry carries.
+        const gen = ino_witness.genOf(ino);
+        const moves = self.view.movesNow();
+        if (self.staged_points.lookup(ino, gen, moves)) |hit| {
+            stats.staged_point_hits.inc();
+            return .{ .size = self.claimedSize(ino, hit.size), .file_id = hit.file_id };
+        }
+        stats.staged_point_misses.inc();
         const r = (try self.resolveAt(ino, null)) orelse return null;
         const p = r.point orelse return null;
         if (p.kind != .staged) return null;
-        return .{ .size = self.claimedSize(ino, r.size orelse return null), .file_id = p.file_id };
+        const size = r.size orelse return null;
+        if (!self.backend.isReader()) self.staged_points.fill(ino, gen, moves, size, p.file_id);
+        return .{ .size = self.claimedSize(ino, size), .file_id = p.file_id };
     }
+
+    /// The staged fast path's per-ino cache: the read view's validation law
+    /// (the ino witness's generation and the slot-move epoch read before
+    /// the fill's lookups; a seqlock per entry, every word an acquire load,
+    /// the second seq load after them) over a payload of one cache line —
+    /// the view's 4 × 64 slots thrash under a thousand hot small files
+    /// (`read_view_misses` 5.3 M to 18 k hits on the 16-job row), and the
+    /// write asks for an ino's identity and size alone.
+    const StagedPointCache = struct {
+        const N: usize = 4096;
+        const W_SEQ = 0;
+        const W_INO = 1;
+        const W_GEN = 2;
+        const W_MOVES = 3;
+        const W_SIZE = 4;
+        const W_FID_LO = 5;
+        const W_FID_HI = 6;
+        const Entry = struct { w: [8]Atomic(u64) align(std.atomic.cache_line) };
+        const Hit = struct { size: u64, file_id: layout.FileId };
+
+        entries: [N]Entry = @splat(.{ .w = @splat(.init(0)) }),
+
+        fn slot(self: *StagedPointCache, ino: u64) *Entry {
+            return &self.entries[@intCast(dlm.splitmix64(ino) & (N - 1))];
+        }
+
+        fn lookup(self: *StagedPointCache, ino: u64, gen: u64, moves: u64) ?Hit {
+            const e = self.slot(ino);
+            const s0 = e.w[W_SEQ].load(.acquire);
+            if (s0 & 1 != 0 or s0 == 0) return null;
+            if (e.w[W_INO].load(.acquire) != ino or e.w[W_GEN].load(.acquire) != gen or e.w[W_MOVES].load(.acquire) != moves) return null;
+            const size = e.w[W_SIZE].load(.acquire);
+            const lo = e.w[W_FID_LO].load(.acquire);
+            const hi = e.w[W_FID_HI].load(.acquire);
+            if (e.w[W_SEQ].load(.acquire) != s0) return null;
+            var fid: layout.FileId = undefined;
+            std.mem.writeInt(u64, fid[0..8], lo, .little);
+            std.mem.writeInt(u64, fid[8..16], hi, .little);
+            return .{ .size = size, .file_id = fid };
+        }
+
+        /// A racing filler loses (the entry is a cache; the loser's words
+        /// would be as good).
+        fn fill(self: *StagedPointCache, ino: u64, gen: u64, moves: u64, size: u64, file_id: layout.FileId) void {
+            const e = self.slot(ino);
+            const s0 = e.w[W_SEQ].load(.acquire);
+            if (s0 & 1 != 0) return;
+            if (e.w[W_SEQ].cmpxchgStrong(s0, s0 + 1, .acq_rel, .monotonic) != null) return;
+            e.w[W_INO].store(ino, .release);
+            e.w[W_GEN].store(gen, .release);
+            e.w[W_MOVES].store(moves, .release);
+            e.w[W_SIZE].store(size, .release);
+            e.w[W_FID_LO].store(std.mem.readInt(u64, file_id[0..8], .little), .release);
+            e.w[W_FID_HI].store(std.mem.readInt(u64, file_id[8..16], .little), .release);
+            e.w[W_SEQ].store(s0 + 2, .release);
+        }
+    };
 
     /// The in-place overwrite inside one grain of the resident record
     /// (`staging.overwriteStaged`): the new generation, or null when the
@@ -4194,6 +4269,30 @@ test "a packed promotion's pack opens on the volume the promotion picked: the re
             try testing.expect(!ex_off.isOpenPack(ex_off.ctx, a.idxOf(open.base)));
         }
     }
+}
+
+test "the staged point cache (the read view's validation law over one line): a fill is a hit under the same witness generation and move epoch and a miss under either moved; another ino in the slot is a miss; a fill in flight (seq odd) is a miss, not a torn read; a racing filler loses and the entry stays whole" {
+    const c = try testing.allocator.create(DataPlane.StagedPointCache);
+    defer testing.allocator.destroy(c);
+    c.* = .{};
+    const fid: layout.FileId = .{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 };
+    try testing.expect(c.lookup(7, 3, 1) == null);
+    c.fill(7, 3, 1, 16384, fid);
+    const hit = c.lookup(7, 3, 1).?;
+    try testing.expectEqual(@as(u64, 16384), hit.size);
+    try testing.expectEqualSlices(u8, &fid, &hit.file_id);
+    try testing.expect(c.lookup(7, 4, 1) == null); // the witness moved
+    try testing.expect(c.lookup(7, 3, 2) == null); // a slot move
+    try testing.expect(c.lookup(7 + DataPlane.StagedPointCache.N, 3, 1) == null); // the slot's other ino
+    // A fill in flight: the seq odd ⇒ a miss; a racing filler loses.
+    const e = c.slot(7);
+    const s = e.w[0].load(.acquire);
+    e.w[0].store(s + 1, .release);
+    try testing.expect(c.lookup(7, 3, 1) == null);
+    c.fill(7, 9, 9, 1, fid);
+    try testing.expectEqual(s + 1, e.w[0].load(.acquire));
+    e.w[0].store(s + 2, .release);
+    try testing.expectEqual(@as(u64, 16384), c.lookup(7, 3, 1).?.size);
 }
 
 test "stagingCapacity law: clamp(free/4, 64 MiB, budget/8) on the record grain" {

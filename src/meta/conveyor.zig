@@ -601,10 +601,24 @@ pub const Stats = struct {
     /// RAM ≠ replay: a roll-out, rollback or compensation that could not
     /// complete (allocation, resolution, a lock budget) left RAM holding
     /// what the ring never will (or the reverse). Each fires once per
-    /// exit and latches the volume FAILED (`divergedFromReplay`).
+    /// exit and latches the volume FAILED (`divergedFromReplay`). On a
+    /// volume ALREADY FAILED the same exit is the fail-stop's consequence
+    /// (the rollback's own writes meet the dead device): counted as
+    /// `meta_conveyor_divergences_failed_volume`, never the tripwire
+    /// (owner ruling 2026-10-19).
     divergence_rollout: counters.Tripwire = .init("conveyor_divergence_rollout"),
     divergence_rollback: counters.Tripwire = .init("conveyor_divergence_rollback"),
     divergence_compensation: counters.Tripwire = .init("conveyor_divergence_compensation"),
+    divergences_failed_volume: counters.ShardedCounter = .{},
+    /// `meta_conveyor_compensation_write_failures`: the compensation
+    /// entry's device write failed — the fail-stop lattice's own event
+    /// (FAILED at once), a device outcome and never a tripwire.
+    compensation_write_failures: counters.ShardedCounter = .{},
+    /// `meta_conveyor_windows_abandoned_failed_volume`: a window the lane
+    /// refused `VolumeFailed` — the latch landed between the pass's screen
+    /// and the submit; rolled back like a failed write, never
+    /// `meta_conveyor_pass_panics`.
+    windows_abandoned_failed_volume: counters.ShardedCounter = .{},
     /// `meta_conveyor_rollbacks`: windows rolled back after a failed write;
     /// `meta_conveyor_compensations`: escaped records compensated.
     rollbacks: counters.ShardedCounter = .{},
@@ -654,8 +668,8 @@ pub const Stats = struct {
     ack_spin_wake_ns: counters.Gauge = .{},
     ack_spin_ack_ns: counters.Gauge = .{},
     /// `meta_conveyor_pass_panics` ★: a window abandoned without its
-    /// outcome observed (every member failed loud, the reservation
-    /// completed as abandoned).
+    /// outcome observed on a HEALTHY volume (every member failed loud, the
+    /// reservation completed as abandoned).
     pass_panics: counters.Tripwire = .init("meta_conveyor_pass_panics"),
     /// `meta_txpass_phase_ns`: queue residence per tx, the Σ admission, the
     /// union-lock window, the pass (drain → handoff), the window (handoff →
@@ -680,7 +694,7 @@ pub const Stats = struct {
         for (GroupSizeHistogram.labels, 0..) |l, i| {
             try w.print("{s}\"{s}\":{d}", .{ if (i == 0) "" else ",", l, self.group_size.load(i) });
         }
-        try w.print("}},\"meta_commit_group_bytes\":{d},\"meta_conveyor_leader_passes\":{d},\"meta_conveyor_group_commits\":{d},\"meta_conveyor_group_txs\":{d},\"meta_conveyor_lane_handoffs\":{d},\"meta_conveyor_windows_inflight\":{d},\"meta_conveyor_windows_inflight_hwm\":{d},\"meta_conveyor_queued\":{d},\"meta_commit_parked\":{d},\"meta_conveyor_drained_txs\":{d},\"meta_conveyor_acks\":{d},\"meta_conveyor_refusals\":{d},\"meta_kv_journal_full_stalls\":{d},\"meta_conveyor_park_tick_rescues\":{d},\"manager_dependency_stalls\":{d},\"meta_conveyor_rollbacks\":{d},\"meta_conveyor_compensations\":{d},\"meta_conveyor_pass_panics\":{d},\"meta_conveyor_holds\":{d},\"meta_conveyor_hold_landings\":{d},\"meta_conveyor_hold_deadlines\":{d},\"meta_conveyor_holds_not_worth\":{d},\"meta_conveyor_hold_probes\":{d},\"meta_conveyor_hold_gain_milli\":{d},\"meta_conveyor_windows_held\":{d},\"meta_conveyor_windows_unshadowed\":{d},\"meta_conveyor_windows_pipelined\":{d},\"meta_conveyor_hold_bound_ns\":{d}", .{
+        try w.print("}},\"meta_commit_group_bytes\":{d},\"meta_conveyor_leader_passes\":{d},\"meta_conveyor_group_commits\":{d},\"meta_conveyor_group_txs\":{d},\"meta_conveyor_lane_handoffs\":{d},\"meta_conveyor_windows_inflight\":{d},\"meta_conveyor_windows_inflight_hwm\":{d},\"meta_conveyor_queued\":{d},\"meta_commit_parked\":{d},\"meta_conveyor_drained_txs\":{d},\"meta_conveyor_acks\":{d},\"meta_conveyor_refusals\":{d},\"meta_kv_journal_full_stalls\":{d},\"meta_conveyor_park_tick_rescues\":{d},\"manager_dependency_stalls\":{d},\"meta_conveyor_rollbacks\":{d},\"meta_conveyor_compensations\":{d},\"meta_conveyor_divergences_failed_volume\":{d},\"meta_conveyor_compensation_write_failures\":{d},\"meta_conveyor_pass_panics\":{d},\"meta_conveyor_windows_abandoned_failed_volume\":{d},\"meta_conveyor_holds\":{d},\"meta_conveyor_hold_landings\":{d},\"meta_conveyor_hold_deadlines\":{d},\"meta_conveyor_holds_not_worth\":{d},\"meta_conveyor_hold_probes\":{d},\"meta_conveyor_hold_gain_milli\":{d},\"meta_conveyor_windows_held\":{d},\"meta_conveyor_windows_unshadowed\":{d},\"meta_conveyor_windows_pipelined\":{d},\"meta_conveyor_hold_bound_ns\":{d}", .{
             self.group_bytes.load(),
             self.leader_passes.load(),
             self.group_commits.load(),
@@ -698,7 +712,10 @@ pub const Stats = struct {
             self.manager_dependency_stalls.load(),
             self.rollbacks.load(),
             self.compensations.load(),
+            self.divergences_failed_volume.load(),
+            self.compensation_write_failures.load(),
             self.pass_panics.load(),
+            self.windows_abandoned_failed_volume.load(),
             self.holds.load(),
             self.hold_landings.load(),
             self.hold_deadlines.load(),
@@ -2214,9 +2231,16 @@ pub const Conveyor = struct {
     /// the failed-write verdict, synchronously — complete the reservation
     /// as abandoned (the hole completes for the watermark; replay's
     /// checksum walk drops it), roll back, count, checkpoint past the hole,
-    /// answer every member.
+    /// answer every member. A submit refused `VolumeFailed` is the latch
+    /// landing between A1's screen and the handoff: the fail-stop working,
+    /// counted, not the tripwire.
     fn abandonWindow(self: *Conveyor, w: *Window, err: Error) void {
-        self.stats.pass_panics.fire("a conveyor window was abandoned before stage B observed its write");
+        if (err == error.VolumeFailed and self.deps.latch.isFailed()) {
+            self.stats.windows_abandoned_failed_volume.inc();
+            log.info("meta volume {s}: a conveyor window was refused by the lane on a FAILED volume — rolled back, every member answered", .{self.deps.volume});
+        } else {
+            self.stats.pass_panics.fire("a conveyor window was abandoned before stage B observed its write on a HEALTHY volume");
+        }
         self.completeAbandoned(w.res);
         self.rollbackFailedTx(w.span(), w.undo);
         _ = self.deps.latch.noteFailure(.journal_write);
@@ -2299,11 +2323,33 @@ pub const Conveyor = struct {
     /// could make RAM agree with what the ring will replay. Loud, counted
     /// on the site's tripwire, and TERMINAL — the volume latches FAILED
     /// (mutations EIO until remount, where replay rebuilds RAM) rather than
-    /// serving a state no recovery can reproduce (charter §1.8).
+    /// serving a state no recovery can reproduce (charter §1.8). On a
+    /// volume already FAILED the exit is the latch's consequence (a
+    /// compensation entry's write on a device that answers EIO): the
+    /// counted outcome, one info line, the tripwire untouched.
     fn divergedFromReplay(self: *Conveyor, site: *counters.Tripwire, detail: []const u8) void {
+        if (self.deps.latch.isFailed()) {
+            self.stats.divergences_failed_volume.inc();
+            log.info("meta volume {s}: RAM diverged from replay on a FAILED volume ({s}: {s}) — the remount's replay rebuilds RAM", .{ self.deps.volume, site.site, detail });
+            return;
+        }
         site.fire(detail);
         if (self.deps.latch.failStop()) {
             log.err("meta volume {s}: RAM diverged from replay ({s}: {s}) — volume marked FAILED; mutations return EIO until remount", .{ self.deps.volume, site.site, detail });
+        }
+    }
+
+    /// The compensation entry's device write failed: RAM holds the
+    /// compensation the ring will not replay, so the volume latches FAILED
+    /// at once (mutations EIO until the remount, where replay rebuilds
+    /// RAM) — a device event counted as
+    /// `meta_conveyor_compensation_write_failures`, never a tripwire.
+    fn compensationWriteFailed(self: *Conveyor) void {
+        self.stats.compensation_write_failures.inc();
+        if (self.deps.latch.failStop()) {
+            log.err("meta volume {s}: the compensation entry's write failed — the escaped record stands for replay while RAM holds its compensation; volume marked FAILED, mutations return EIO until remount", .{self.deps.volume});
+        } else {
+            log.info("meta volume {s}: the compensation entry's write failed on a FAILED volume — the remount's replay rebuilds RAM", .{self.deps.volume});
         }
     }
 
@@ -2475,8 +2521,13 @@ pub const Conveyor = struct {
             // The entry's hole (the write never landed) leaves the escaped
             // bset record standing for replay while RAM holds the
             // compensation: unlike an SMO entry's hole, nothing folds back.
-            j.commitEntry(reg.res, frames) catch {
-                self.divergedFromReplay(site, "the compensation entry's write failed; the escaped record stands for replay while RAM holds its compensation");
+            // A device refusing the write (`SmoJournal.commitEntry`: a device
+            // write failure is `error.Corrupt`) is the fail-stop lattice's own
+            // event, never a "cannot happen": FAILED at once, counted, loud
+            // once (generic/475: the rollback's own writes meet EIO).
+            j.commitEntry(reg.res, frames) catch |e| switch (e) {
+                error.Corrupt => self.compensationWriteFailed(),
+                else => self.divergedFromReplay(site, "the compensation entry could not be built; the escaped record stands for replay while RAM holds its compensation"),
             };
             return;
         }
@@ -3609,6 +3660,52 @@ test "an escaped record (a freeze raced the failed write) is compensated through
     try testing.expect(try Harness.replayedPresent(&r, base));
 }
 
+// generic/475 under dm-error: the second failed window's rollback found
+// an escaped record and its compensation entry's write met the dead device
+// — before this a divergence TRIPWIRE on a volume no rung had latched yet.
+test "a compensation entry whose device write fails is the fail-stop lattice's own event: the volume latches FAILED at once (one loud line), meta_conveyor_compensation_write_failures +1, the divergence tripwire untouched, every later commit refused" {
+    const h = try Harness.create(.{}, null, false);
+    defer h.destroy();
+    const base = try h.commitCreate("base");
+    _ = try h.checkpoint();
+    h.lane.hold = true;
+    var t = tx.KvTx.init(h.gpa, @src());
+    const victim = try h.stageCreate(&t, "escapee");
+    var d: Done = .init;
+    var e = try h.cv.build(&t, &d);
+    try h.cv.enqueueOne(&e, e.q.len);
+    h.cv.leadIfElected();
+    try testing.expectEqual(@as(usize, 1), h.lane.heldCount());
+    for (h.vol.trees.items) |tr| try h.vol.flushPass(tr);
+    // The SMO journal's device answers EIO from here: the compensation
+    // entry's write is the first write to meet it.
+    const DeadDevice = struct {
+        fn write(_: *anyopaque, _: []const journal.WriteOp) error{Io}!void {
+            return error.Io;
+        }
+        fn completed(_: *anyopaque) void {}
+    };
+    var dead: u8 = 0;
+    h.vol.journal.device = .{ .ctx = &dead, .write = &DeadDevice.write, .completed = &DeadDevice.completed };
+    defer h.vol.journal.device = null;
+    const site0 = counters.tripwireCount("conveyor_divergence_compensation");
+    const failures0 = h.cv.stats.compensation_write_failures.load();
+    try testing.expect(!h.latch.isFailed());
+    log.testing.expectErrorLogs(1);
+    h.lane.failWindow(0);
+    h.lane.pump();
+    try log.testing.expectAllFired();
+    try testing.expectError(error.JournalWriteFailed, try d.recvUncancelable(testing.io));
+    try testing.expectEqual(failures0 + 1, h.cv.stats.compensation_write_failures.load());
+    try testing.expectEqual(site0, counters.tripwireCount("conveyor_divergence_compensation"));
+    try testing.expectEqual(@as(u64, 0), h.cv.stats.divergence_compensation.load());
+    try testing.expect(h.latch.isFailed());
+    try testing.expectError(error.VolumeFailed, h.commitCreate("post"));
+    h.lane.hold = false;
+    try testing.expect(!try h.present(victim));
+    try testing.expect(try h.present(base));
+}
+
 test "a rollback that cannot complete (out of memory on its first allocation) is RAM ≠ replay: the volume latches FAILED at once, the divergence tripwire fires, the stuck records are never served as acked" {
     var fa = std.testing.FailingAllocator.init(testing.allocator, .{});
     const h = try Harness.createWithGpa(.{}, null, false, fa.allocator());
@@ -3625,6 +3722,44 @@ test "a rollback that cannot complete (out of memory on its first allocation) is
     h.lane.oom_on_rollback = null;
     try testing.expect(h.latch.isFailed());
     try testing.expectEqual(@as(u64, 1), h.cv.stats.divergence_rollback.load());
+    try testing.expect(try h.present(base));
+    try testing.expectError(error.VolumeFailed, h.commitCreate("post"));
+    try testing.expectEqual(@as(u64, 0), h.cv.windowsInflight());
+}
+
+// Owner ruling 2026-10-19: a divergence on a volume ALREADY FAILED (a
+// dm-error device: the rollback's own writes meet EIO, generic/475) is the
+// fail-stop's consequence — counted, never the tripwire that is for a
+// divergence latching a healthy volume.
+test "a rollback that cannot complete on a volume ALREADY FAILED is the counted FAILED-volume outcome: meta_conveyor_divergences_failed_volume +1, the divergence tripwire untouched, no error log; the commit is still refused and the volume stays FAILED" {
+    var fa = std.testing.FailingAllocator.init(testing.allocator, .{});
+    const h = try Harness.createWithGpa(.{}, null, false, fa.allocator());
+    defer h.destroy();
+    const base = try h.commitCreate("base");
+    // Hold the window in the lane, latch the volume FAILED underneath it
+    // (the journal's third consecutive failure elsewhere), then fail the
+    // held write with the rollback out of memory.
+    h.lane.hold = true;
+    var t = tx.KvTx.init(h.gpa, @src());
+    _ = try h.stageCreate(&t, "victim");
+    var d: Done = .init;
+    var e = try h.cv.build(&t, &d);
+    try h.cv.enqueueOne(&e, e.q.len);
+    h.cv.leadIfElected();
+    try testing.expectEqual(@as(usize, 1), h.lane.heldCount());
+    try testing.expect(h.latch.failStop());
+    const div0 = h.cv.stats.divergence_rollback.load();
+    const site0 = counters.tripwireCount("conveyor_divergence_rollback");
+    const failed0 = h.cv.stats.divergences_failed_volume.load();
+    h.lane.oom_on_rollback = &fa;
+    h.lane.failWindow(0);
+    h.lane.pump();
+    h.lane.oom_on_rollback = null;
+    try testing.expectError(error.JournalWriteFailed, try d.recvUncancelable(testing.io));
+    try testing.expectEqual(failed0 + 1, h.cv.stats.divergences_failed_volume.load());
+    try testing.expectEqual(div0, h.cv.stats.divergence_rollback.load());
+    try testing.expectEqual(site0, counters.tripwireCount("conveyor_divergence_rollback"));
+    try testing.expect(h.latch.isFailed());
     try testing.expect(try h.present(base));
     try testing.expectError(error.VolumeFailed, h.commitCreate("post"));
     try testing.expectEqual(@as(u64, 0), h.cv.windowsInflight());

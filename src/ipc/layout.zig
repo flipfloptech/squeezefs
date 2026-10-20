@@ -431,7 +431,15 @@ pub const ClientStatsPage = extern struct {
     il_slot_reroutes: Atomic(u64) = .init(0),
     preload_passthrough_ops: [PRELOAD_REASONS]Atomic(u64) = @splat(.init(0)),
     preload_bind_refused: [PRELOAD_REFUSE_CLASSES]Atomic(u64) = @splat(.init(0)),
-    _reserved: [PAGE_BYTES - 48 - 8 * (PRELOAD_REASONS + PRELOAD_REFUSE_CLASSES)]u8 = @splat(0),
+    /// The direct arm (charter §7 "The direct arm"): ops and bytes the
+    /// client served from the device itself (folded into `ipc_direct_ops`
+    /// / `ipc_direct_bytes` at teardown — the engagement law's third
+    /// term), rechecks that refused (the lease re-asked), lease asks.
+    il_direct_ops: Atomic(u64) = .init(0),
+    il_direct_bytes: Atomic(u64) = .init(0),
+    il_direct_rechecks_failed: Atomic(u64) = .init(0),
+    il_lease_asks: Atomic(u64) = .init(0),
+    _reserved: [PAGE_BYTES - 48 - 8 * (PRELOAD_REASONS + PRELOAD_REFUSE_CLASSES) - 32]u8 = @splat(0),
 };
 
 comptime {
@@ -444,6 +452,7 @@ comptime {
     assert(@offsetOf(ClientStatsPage, "il_slot_reroutes") == 40);
     assert(@offsetOf(ClientStatsPage, "preload_passthrough_ops") == 48);
     assert(@offsetOf(ClientStatsPage, "preload_bind_refused") == 48 + 8 * PRELOAD_REASONS);
+    assert(@offsetOf(ClientStatsPage, "il_direct_ops") == 48 + 8 * (PRELOAD_REASONS + PRELOAD_REFUSE_CLASSES));
 }
 
 // ---------------------------------------------------------------------------

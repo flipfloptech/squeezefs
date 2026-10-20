@@ -57,6 +57,8 @@ const Rig = struct {
     child: ?std.process.Child = null,
     child_pid: linux.pid_t = 0,
     env: std.process.Environ.Map,
+    /// The mount's `-o` string (`interception`, or the direct arm's).
+    mount_opts: []const u8 = "interception",
     /// Set by a test's last statement: a deinit before it is a failure's,
     /// and echoes the daemon's alert lines as the diagnostic.
     passed: bool = false,
@@ -151,7 +153,7 @@ const Rig = struct {
     fn spawnMount(self: *Rig) !void {
         std.debug.assert(self.child == null);
         if (self.log_file == null) self.log_file = try Io.Dir.cwd().createFile(self.io, self.log_path, .{ .truncate = false });
-        const argv = [_][]const u8{ self.bin, "mount", "-o", "interception", self.meta_uri, self.mp };
+        const argv = [_][]const u8{ self.bin, "mount", "-o", self.mount_opts, self.meta_uri, self.mp };
         self.child = try std.process.spawn(self.io, .{ .argv = &argv, .environ_map = &self.env, .stdin = .ignore, .stdout = .{ .file = self.log_file.? }, .stderr = .{ .file = self.log_file.? } });
         self.child_pid = self.child.?.id.?;
     }
@@ -663,6 +665,149 @@ test "smoke: THE INTERCEPTION HOST, death — kill -9 the daemon under a parked 
     const elapsed = clock.monotonicNs() - t0;
     try testing.expect(elapsed < 5 * std.time.ns_per_s);
     try testing.expect(s.poisoned());
+    _ = linux.umount2(rig.mp.ptr, linux.MNT.DETACH);
+    try testing.expectEqual(@as(usize, 0), try fuseMountsOf(gpa, io, rig.mp));
+    rig.passed = true;
+}
+
+test "smoke: THE DIRECT ARM — mount -o interception=direct → a root session is granted the arm (the lease page sealed and mapped, the data devices open) → a striped file's lease → a direct pread lands the device's bytes byte-exact from the client's own thread (ipc_ops_read flat, il_direct_ops +1) → a truncate through the kernel between the lease and the read moves the stripe's epoch: the recheck refuses, the lease is re-asked, the read answers the new EOF → a kernel write admitted on the inode invalidates the lease (re-asked, the new bytes read) → an inline-born file's lease is refused (kind) and the ring serves it → the engagement law closes with the direct term → kill -9 the daemon: the next direct read sees the dead heartbeat and falls through (never a serve under a lease nobody can invalidate)" {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    rig.mount_opts = "interception=direct";
+    try rig.formatSet();
+    try rig.spawnMount();
+    _ = try rig.awaitLog("ready: ", 0, ready_wait_ns);
+    _ = try rig.awaitLog("ipc: interception armed", 0, ready_wait_ns);
+    const fd = try rig.openOnMount("direct.dat", .{ .ACCMODE = .RDWR, .CREAT = true, .CLOEXEC = true });
+    defer _ = linux.close(fd);
+    const blob = try rig.il0Blob();
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    try env.put("SQUEEZEFS_TEST_IPC_ALLOW_DIRTY", "1");
+    try env.put("SQUEEZEFS_TEST_IL_OP_TIMEOUT_MS", "20000");
+    var refusal: ?client.Refusal = null;
+    var s = client.Session.establish(gpa, &blob, fd, .{ .build_commit = blob.buildCommit(), .mount_uid = linux.geteuid(), .env = &env }, &refusal) catch |e| {
+        std.debug.print("\n--- establish failed: {s} (refusal {any}) ---\n", .{ @errorName(e), refusal });
+        return e;
+    };
+    defer s.teardown();
+    try testing.expectEqual(client.Session.DirectState.on, s.direct_state);
+    try testing.expect(s.direct != null);
+    try testing.expect(s.features & wire.FEATURE_DIRECT != 0);
+    try testing.expectEqual(@as(u64, 1), try rig.stat("ipc_direct_sessions"));
+    try testing.expectEqual(@as(u64, 0), try rig.stat("ipc_direct_refused_access"));
+    const b = try s.bind(fd, .mount);
+
+    // Two blocks through the ring (the file is striped), the write-through
+    // drained: the lease needs a resident map with no custody.
+    const block = try gpa.alloc(u8, BLOCK);
+    defer gpa.free(block);
+    pattern(block, 0);
+    try testing.expectEqual(BLOCK, try served(s.pwrite(b.id, block, 0)));
+    pattern(block, BLOCK);
+    try testing.expectEqual(BLOCK, try served(s.pwrite(b.id, block, BLOCK)));
+    try rig.awaitStat("parked_buffers", 0);
+    const kfd = try rig.openOnMount("direct.dat", .{ .ACCMODE = .RDWR, .CLOEXEC = true });
+    defer _ = linux.close(kfd);
+    if (linux.errno(linux.fsync(kfd)) != .SUCCESS) return error.TestFsync;
+
+    // 1. The direct read: the device's bytes, no ring op.
+    const rbuf = try gpa.alignedAlloc(u8, .fromByteUnits(4096), 64 * 1024);
+    defer gpa.free(rbuf);
+    const ops0 = try rig.stat("ipc_ops_read");
+    const page = s.statsPage();
+    try testing.expectEqual(@as(usize, 64 * 1024), try served(s.pread(b.id, rbuf, 1 * MiB)));
+    try expectPattern(rbuf, 1 * MiB);
+    try testing.expectEqual(ops0, try rig.stat("ipc_ops_read"));
+    try testing.expectEqual(@as(u64, 1), page.il_direct_ops.load(.monotonic));
+    try testing.expectEqual(@as(u64, 1), page.il_lease_asks.load(.monotonic));
+    try testing.expectEqual(@as(u64, 1), try rig.stat("ipc_leases_granted"));
+    // Block 1 under the same lease, then a read past EOF.
+    try testing.expectEqual(@as(usize, 4096), try served(s.pread(b.id, rbuf[0..4096], BLOCK + 8192)));
+    try expectPattern(rbuf[0..4096], BLOCK + 8192);
+    try testing.expectEqual(@as(usize, 0), try served(s.pread(b.id, rbuf[0..4096], 2 * BLOCK)));
+    try testing.expectEqual(@as(u64, 1), page.il_lease_asks.load(.monotonic));
+
+    // 2. The window: a truncate lands between the client's lease and its
+    //    read. The lease (8 MiB) still names block 0's bytes at 1 MiB; the
+    //    device still holds them; the recheck sees the moved epoch, the
+    //    lease is asked again and the read answers the new EOF.
+    if (linux.errno(linux.ftruncate(kfd, 4096)) != .SUCCESS) return error.TestTruncate;
+    try testing.expectEqual(@as(usize, 0), try served(s.pread(b.id, rbuf, 1 * MiB)));
+    try testing.expectEqual(@as(u64, 1), page.il_direct_rechecks_failed.load(.monotonic));
+    try testing.expectEqual(@as(u64, 2), page.il_lease_asks.load(.monotonic));
+    // (The re-asked lease may be refused while the clipped block's custody
+    // drains — the ring then answers the EOF; either way the stale lease
+    // served nothing.)
+    try testing.expect((try rig.stat("ipc_ops_read")) <= ops0 + 1);
+
+    // 3. A kernel write admitted on the inode invalidates the lease: the
+    //    next direct read re-asks and reads the new bytes.
+    var kpage: [4096]u8 = undefined;
+    pattern(&kpage, 0x7000_0000);
+    try testing.expectEqual(kpage.len, linux.pwrite(kfd, &kpage, kpage.len, 0));
+    if (linux.errno(linux.fsync(kfd)) != .SUCCESS) return error.TestFsync;
+    try rig.awaitStat("parked_buffers", 0);
+    var asks_before = page.il_lease_asks.load(.monotonic);
+    const deadline = clock.monotonicNs() + 10 * std.time.ns_per_s;
+    while (true) {
+        // The custody of the write drains on the write-through cadence; a
+        // refused lease (custody) backs off and the ring serves meanwhile.
+        const n = try served(s.pread(b.id, rbuf[0..4096], 0));
+        try testing.expectEqual(@as(usize, 4096), n);
+        try expectPattern(rbuf[0..4096], 0x7000_0000);
+        if (page.il_direct_ops.load(.monotonic) >= 3) break;
+        if (clock.monotonicNs() > deadline) return error.TestDirectNotResumed;
+        sleepMs(client.direct_client.REFUSE_BACKOFF_NS / std.time.ns_per_ms + 10);
+    }
+    try testing.expect(page.il_lease_asks.load(.monotonic) > asks_before);
+    asks_before = page.il_lease_asks.load(.monotonic);
+
+    // 4. An inline-born small file: the lease refuses (kind), the ring serves.
+    {
+        const sfd = try rig.openOnMount("small.dat", .{ .ACCMODE = .RDWR, .CREAT = true, .TRUNC = true, .CLOEXEC = true });
+        defer _ = linux.close(sfd);
+        var small: [100]u8 = undefined;
+        pattern(&small, 0x9000);
+        try testing.expectEqual(small.len, linux.pwrite(sfd, &small, small.len, 0));
+        const sb = try s.bind(sfd, .mount);
+        defer s.unbind(sb.id);
+        const kind0 = try rig.stat("ipc_leases_refused_kind");
+        const ring0 = try rig.stat("ipc_ops_read");
+        try testing.expectEqual(@as(usize, 100), try served(s.pread(sb.id, rbuf[0..4096], 0)));
+        try expectPattern(rbuf[0..100], 0x9000);
+        try testing.expectEqual(kind0 + 1, try rig.stat("ipc_leases_refused_kind"));
+        try testing.expectEqual(ring0 + 1, try rig.stat("ipc_ops_read"));
+        // The backoff: the second read asks nothing and rides the ring.
+        try testing.expectEqual(@as(usize, 100), try served(s.pread(sb.id, rbuf[0..4096], 0)));
+        try testing.expectEqual(kind0 + 1, try rig.stat("ipc_leases_refused_kind"));
+        try testing.expectEqual(ring0 + 2, try rig.stat("ipc_ops_read"));
+    }
+
+    // 5. Kill -9 the daemon: the lease page's epochs can no longer move,
+    //    so the client must not serve under them — the heartbeat ladder
+    //    poisons the session and the read falls through.
+    const direct_ops = page.il_direct_ops.load(.monotonic);
+    var c = rig.child.?;
+    rig.child = null;
+    _ = linux.kill(rig.child_pid, .KILL);
+    _ = c.wait(io) catch {};
+    const t0 = clock.monotonicNs();
+    while (true) {
+        switch (s.pread(b.id, rbuf[0..4096], 0)) {
+            .fallthrough => break,
+            .served => {},
+            .errno => return error.TestRingErrno,
+        }
+        if (clock.monotonicNs() - t0 > 5 * std.time.ns_per_s) return error.TestNoPoison;
+        sleepMs(50);
+    }
+    try testing.expect(s.poisoned());
+    // At most the reads inside the heartbeat's grace served; none after.
+    try testing.expect(page.il_direct_ops.load(.monotonic) >= direct_ops);
     _ = linux.umount2(rig.mp.ptr, linux.MNT.DETACH);
     try testing.expectEqual(@as(usize, 0), try fuseMountsOf(gpa, io, rig.mp));
     rig.passed = true;

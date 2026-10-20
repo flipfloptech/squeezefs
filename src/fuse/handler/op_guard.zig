@@ -79,6 +79,8 @@ const counters = @import("../../core/counters.zig");
 const clock = @import("../../core/clock.zig");
 const knobs = @import("../../core/knobs.zig");
 const errors = @import("../../core/errors.zig");
+const lease_epoch = @import("../../data/lease_epoch.zig");
+const route_table = @import("../../meta/routing/route_table.zig");
 
 pub const Mode = rwlock.Mode;
 
@@ -450,6 +452,11 @@ pub const Admission = struct {
 /// classified → revalidate → at most one upgrade. The caller validated the
 /// range (`validateRange`) and answers `wlen == 0` before coming here.
 pub fn admitWrite(table: *Table, io: Io, probe: Probe, shared_enabled: bool, ino: u64, offset: u64, end: u64) Admission {
+    // A write admitted on this inode may hold bytes in RAM the device does
+    // not yet: every direct client's lease of it is invalid from here
+    // (`data/lease_epoch.zig`; a nodeid routes to its key ino as the plane's
+    // tables do).
+    lease_epoch.bump(if (route_table.isRoutable(ino)) route_table.effectiveIno(ino) else ino);
     const admit_shared = shared_enabled and sharedCandidate(probe, ino, offset, end) != null;
     if (!admit_shared) {
         return .{ .guard = table.acquire(io, ino, .exclusive), .shared_snapshot = null, .upgraded = false };

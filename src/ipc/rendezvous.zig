@@ -139,6 +139,22 @@ pub fn dirTrusted(st_uid: u32, st_mode: u32, owner_uid: u32) bool {
     return (st_uid == 0 or st_uid == owner_uid) and st_mode & 0o022 == 0;
 }
 
+/// The direct arm's screen (charter §7 "The direct arm", decision 0003
+/// §AX): a session is granted the direct arm iff its peer could open EVERY
+/// data device node for reading — root, or the owner/group/other read bit
+/// that applies to the peer's uid and primary gid (supplementary groups are
+/// not consulted: a refusal there costs the ring path, never a grant the
+/// kernel would have refused, since the client's own `open(2)` is the final
+/// word). The trust this grants is whole-device: a direct client reads any
+/// block of the volume, so the mount owner opts in (`-o interception=direct`)
+/// for clients it already trusts with the device.
+pub fn deviceReadable(st_mode: u32, st_uid: u32, st_gid: u32, peer_uid: u32, peer_gid: u32) bool {
+    if (peer_uid == 0) return true;
+    if (st_uid == peer_uid) return st_mode & 0o400 != 0;
+    if (st_gid == peer_gid) return st_mode & 0o040 != 0;
+    return st_mode & 0o004 != 0;
+}
+
 /// Rung 2: the daemon's uid must be root or the mount owner. Deliberately
 /// NO "or our own uid" disjunct: the conservative predicate only costs
 /// passthrough on a mount served by a third-party service account.
@@ -636,4 +652,15 @@ test "knob faces: the dirty seam, the op-timeout seam and the socket dir read th
     try testing.expect(allowDirtyFromEnv(&env));
     try testing.expectEqual(250 * std.time.ns_per_ms, opTimeoutFromEnv(&env));
     try testing.expectEqual(@as(?[]const u8, null), socketDirFromEnv(&buf, &env, 1000));
+}
+
+test "the direct arm's device screen: root always; the owner by the owner bit, the group by the group bit, others by the other bit — never a bit that is not theirs" {
+    try testing.expect(deviceReadable(0o600, 1000, 6, 0, 0));
+    try testing.expect(deviceReadable(0o600, 1000, 6, 1000, 1000));
+    try testing.expect(!deviceReadable(0o200, 1000, 6, 1000, 1000));
+    try testing.expect(deviceReadable(0o660, 0, 6, 1000, 6));
+    try testing.expect(!deviceReadable(0o620, 0, 6, 1000, 6));
+    try testing.expect(!deviceReadable(0o660, 0, 6, 1000, 7));
+    try testing.expect(deviceReadable(0o664, 0, 6, 1000, 7));
+    try testing.expect(!deviceReadable(0o660, 1000, 6, 2000, 7));
 }

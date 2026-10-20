@@ -155,6 +155,10 @@ pub const CODE_UNSEALED: ReasonCode = 5;
 pub const CODE_UNTRUSTED_RENDEZVOUS: ReasonCode = 6;
 pub const CODE_FUTEX_WAITV: ReasonCode = 7;
 pub const CODE_REGISTRY_FULL: ReasonCode = 8;
+/// The direct arm's once-lines (a ring session stands either way).
+pub const CODE_DIRECT_REFUSED: ReasonCode = 9;
+pub const CODE_DIRECT_OPEN_DENIED: ReasonCode = 10;
+pub const CODE_DIRECT_PROTOCOL: ReasonCode = 11;
 pub const CODE_SOCKET: ReasonCode = 0x1000;
 pub const CODE_MAP: ReasonCode = 0x2000;
 pub const CODE_REFUSED: ReasonCode = 0x4000;
@@ -506,6 +510,13 @@ fn establishFor(st: *State, p: Probes, fd: sys.fd_t, stat: sys.Stat, shard: u32,
     st.registry[slot].session = session;
     st.registry[slot].state.store(RegistrySlot.READY, .release);
     _ = sessions_established.fetchAdd(1, .monotonic);
+    // The direct arm's verdict, once per mount (a ring session either way).
+    switch (session.direct_state) {
+        .off, .on => {},
+        .refused => if (st.once.first(stat.dev, CODE_DIRECT_REFUSED)) line("mount dev {d}: the daemon granted the direct arm at HELLO and refused it at DirectHello — the ring serves", .{stat.dev}),
+        .open_denied => if (st.once.first(stat.dev, CODE_DIRECT_OPEN_DENIED)) line("mount dev {d}: the direct arm was granted but a data device node would not open for this uid — the ring serves", .{stat.dev}),
+        .protocol => if (st.once.first(stat.dev, CODE_DIRECT_PROTOCOL)) line("mount dev {d}: the direct arm's lease page failed its seals or geometry — the ring serves", .{stat.dev}),
+    }
     return slot;
 }
 

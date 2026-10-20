@@ -203,6 +203,12 @@ pub const Tag = enum(u32) {
     admin_ok = 9,
     admin_req = 10,
     admin_reply = 11,
+    // The direct arm (charter §7 "The direct arm", decision 0003 §AX).
+    direct_hello = 12,
+    direct_ok = 13,
+    lease_req = 14,
+    lease_ok = 15,
+    lease_refused = 16,
     _,
 };
 
@@ -211,10 +217,146 @@ pub fn tagOf(raw: []const u8) DecodeError!Tag {
     if (raw.len < 4) return error.Truncated;
     const v = std.mem.readInt(u32, raw[0..4], .little);
     return switch (v) {
-        1...11 => @fromBackingInt(@intCast(v)),
+        1...16 => @fromBackingInt(@intCast(v)),
         else => error.BadTag,
     };
 }
+
+/// `SessionOk.features`: the daemon granted this session the direct arm
+/// (its uid can open every data device node; `DirectHello` is answered).
+pub const FEATURE_DIRECT: u64 = 1 << 0;
+
+/// The direct arm's limits: device paths as the daemon opened them
+/// (`/dev/nvmeXnY`-class), at most this many volumes per lease frame, at
+/// most this many block entries per lease — what one ctl datagram holds
+/// (4 MiB blocks ⇒ ≈ 16 GiB of file; a larger file leases its first
+/// entries and the rest ride the ring).
+pub const DEVICE_PATH_LEN = 64;
+pub const DIRECT_MAX_VOLS = 16;
+pub const LEASE_MAX_ENTRIES: usize = (CTL_MSG_MAX - @sizeOf(LeaseOkHeader)) / @sizeOf(LeaseEntry);
+
+/// client → daemon: ask for the direct arm (no fd).
+pub const DirectHello = extern struct {
+    tag: u32 = @backingInt(Tag.direct_hello),
+    _pad: u32 = 0,
+};
+
+/// daemon → client, with the lease-epoch page's sealed memfd: the volume
+/// ordinals' device paths (NUL-terminated inside their widths; an unused
+/// ordinal is empty) and the block size the lease entries are in.
+pub const DirectOk = extern struct {
+    tag: u32 = @backingInt(Tag.direct_ok),
+    n_vols: u32,
+    block_size: u64,
+    /// The page's byte length (`lease_epoch.PAGE_BYTES`).
+    page_bytes: u64,
+    paths: [DIRECT_MAX_VOLS][DEVICE_PATH_LEN]u8 = @splat(@splat(0)),
+
+    pub fn path(d: *const DirectOk, ordinal: usize) []const u8 {
+        return fieldStr(&d.paths[ordinal]);
+    }
+};
+
+/// client → daemon: the layout lease of a binding.
+pub const LeaseReq = extern struct {
+    tag: u32 = @backingInt(Tag.lease_req),
+    _pad: u32 = 0,
+    binding_id: u64,
+};
+
+pub const LeaseRefuseClass = enum(u32) {
+    /// The direct arm is not granted to this session.
+    disabled = 1,
+    /// Not a resident striped passthrough file (inline, staged, packed,
+    /// transformed): the ring serves it.
+    kind = 2,
+    /// A write holds bytes in RAM the device does not: the ring serves it
+    /// until the custody drains.
+    custody = 3,
+    /// Unknown binding.
+    binding = 4,
+    /// A publish moved under the build (retry).
+    moved = 5,
+    _,
+
+    pub fn fromU32(v: u32) ?LeaseRefuseClass {
+        return switch (v) {
+            1...5 => @fromBackingInt(v),
+            else => null,
+        };
+    }
+};
+
+pub const LeaseRefused = extern struct {
+    tag: u32 = @backingInt(Tag.lease_refused),
+    class: u32,
+
+    pub fn refuseClass(r: *const LeaseRefused) DecodeError!LeaseRefuseClass {
+        return LeaseRefuseClass.fromU32(r.class) orelse error.BadClass;
+    }
+};
+
+/// One block of a lease: its volume ordinal and device byte offset;
+/// `UNMAPPED` = a hole (the ring serves a read into it).
+pub const LeaseEntry = extern struct {
+    pub const UNMAPPED: u16 = 0xFFFF;
+    vol: u16,
+    _pad: u16 = 0,
+    _pad2: u32 = 0,
+    dev_off: u64,
+};
+
+/// `LeaseOk{header, entries[n]}`: the frame's length is exactly the header
+/// plus `n` entries.
+pub const LeaseOkHeader = extern struct {
+    tag: u32 = @backingInt(Tag.lease_ok),
+    n_entries: u32,
+    ino: u64,
+    size: u64,
+    /// The stripe's epoch BEFORE the map was read (the client's recheck
+    /// compares the stripe to this).
+    epoch: u64,
+    block_size: u64,
+};
+
+pub const LeaseOk = struct {
+    ino: u64,
+    size: u64,
+    epoch: u64,
+    block_size: u64,
+    /// Viewed in the datagram (byte-aligned: the receive buffer is bytes).
+    entries: []align(1) const LeaseEntry,
+
+    pub fn encodedLen(l: LeaseOk) usize {
+        return @sizeOf(LeaseOkHeader) + l.entries.len * @sizeOf(LeaseEntry);
+    }
+
+    pub fn encode(l: LeaseOk, out: []u8) (EncodeError || error{BufferTooSmall})!usize {
+        if (l.entries.len > LEASE_MAX_ENTRIES) return error.StringTooLong;
+        const n = l.encodedLen();
+        if (out.len < n) return error.BufferTooSmall;
+        const h: LeaseOkHeader = .{ .n_entries = @intCast(l.entries.len), .ino = l.ino, .size = l.size, .epoch = l.epoch, .block_size = l.block_size };
+        @memcpy(out[0..@sizeOf(LeaseOkHeader)], std.mem.asBytes(&h));
+        @memcpy(out[@sizeOf(LeaseOkHeader)..][0 .. l.entries.len * @sizeOf(LeaseEntry)], std.mem.sliceAsBytes(l.entries));
+        return n;
+    }
+
+    /// Total: the count is capped and must size the datagram exactly; the
+    /// entries are viewed in place (the caller copies what it keeps).
+    pub fn decode(raw: []const u8) DecodeError!LeaseOk {
+        if (raw.len < @sizeOf(LeaseOkHeader)) return error.Truncated;
+        var h: LeaseOkHeader = undefined;
+        @memcpy(std.mem.asBytes(&h), raw[0..@sizeOf(LeaseOkHeader)]);
+        if (h.tag != @backingInt(Tag.lease_ok)) return error.BadTag;
+        if (h.n_entries > LEASE_MAX_ENTRIES) return error.BadString;
+        if (h.block_size == 0 or h.block_size % 4096 != 0) return error.BadString;
+        if (raw.len != @sizeOf(LeaseOkHeader) + @as(usize, h.n_entries) * @sizeOf(LeaseEntry)) return error.Truncated;
+        const bytes = raw[@sizeOf(LeaseOkHeader)..];
+        const entries = std.mem.bytesAsSlice(LeaseEntry, bytes);
+        for (entries) |e| if (e._pad != 0 or e._pad2 != 0 or (e.vol != LeaseEntry.UNMAPPED and e.vol >= DIRECT_MAX_VOLS)) return error.BadString;
+        return .{ .ino = h.ino, .size = h.size, .epoch = h.epoch, .block_size = h.block_size, .entries = entries };
+    }
+};
 
 /// shim/sdk → daemon, with exactly ONE fd (a dup of the credential fd).
 pub const Hello = extern struct {
@@ -410,6 +552,13 @@ comptime {
     assert(@sizeOf(AdminReqHeader) == 16);
     assert(@sizeOf(AdminReplyHeader) == 16);
     assert(@sizeOf(AdminReqHeader) + ADMIN_VERB_MAX + ADMIN_ARG_MAX <= CTL_MSG_MAX);
+    assert(@sizeOf(DirectHello) == 8);
+    assert(@sizeOf(DirectOk) == 24 + DIRECT_MAX_VOLS * DEVICE_PATH_LEN);
+    assert(@sizeOf(LeaseReq) == 16);
+    assert(@sizeOf(LeaseRefused) == 8);
+    assert(@sizeOf(LeaseEntry) == 16);
+    assert(@sizeOf(LeaseOkHeader) == 40);
+    assert(@sizeOf(LeaseOkHeader) + LEASE_MAX_ENTRIES * @sizeOf(LeaseEntry) <= CTL_MSG_MAX);
 }
 
 /// The fixed frames' ONE total decoder: exactly `@sizeOf(T)` bytes, the
@@ -426,6 +575,13 @@ pub fn decodeFixed(comptime T: type, raw: []const u8) DecodeError!T {
     }
     if (T == Refuse or T == BindRefused) {
         if (RefuseClass.fromU32(v.class) == null) return error.BadClass;
+    }
+    if (T == LeaseRefused) {
+        if (LeaseRefuseClass.fromU32(v.class) == null) return error.BadClass;
+    }
+    if (T == DirectOk) {
+        if (v.n_vols > DIRECT_MAX_VOLS or v.block_size == 0 or v.page_bytes == 0) return error.BadString;
+        for (&v.paths) |*p| if (std.mem.indexOfScalar(u8, p, 0) == null) return error.BadString;
     }
     if (T == BindOk) {
         if (v.rights._pad != 0) return error.BadString;
@@ -444,6 +600,10 @@ pub fn tagFor(comptime T: type) Tag {
         Unbind => .unbind,
         AdminHello => .admin_hello,
         AdminOk => .admin_ok,
+        DirectHello => .direct_hello,
+        DirectOk => .direct_ok,
+        LeaseReq => .lease_req,
+        LeaseRefused => .lease_refused,
         else => @compileError("not a fixed ctl frame: " ++ @typeName(T)),
     };
 }
@@ -533,7 +693,7 @@ test "ctl round-trip of every fixed variant through the ONE decoder; the tag dis
     try testing.expectError(error.BadTag, decodeFixed(Bind, frameBytes(&unbind)[0..8]));
     try testing.expectError(error.Truncated, decodeFixed(Hello, frameBytes(&hello)[0..111]));
     try testing.expectError(error.Truncated, decodeFixed(Bind, frameBytes(&unbind)));
-    try testing.expectError(error.BadTag, tagOf(&[_]u8{ 12, 0, 0, 0 }));
+    try testing.expectError(error.BadTag, tagOf(&[_]u8{ 17, 0, 0, 0 }));
     try testing.expectError(error.Truncated, tagOf(&[_]u8{ 1, 0 }));
     // A bad class word; an unterminated commit; a rights pad bit.
     const badref: Refuse = .{ .class = 42 };
@@ -575,6 +735,11 @@ test "decoders are total on garbage: no decoder panics on arbitrary bytes of arb
         _ = decodeFixed(AdminOk, raw) catch {};
         _ = AdminReq.decode(raw) catch {};
         _ = AdminReply.decode(raw) catch {};
+        _ = LeaseOk.decode(raw) catch {};
+        _ = decodeFixed(DirectHello, raw) catch {};
+        _ = decodeFixed(DirectOk, raw) catch {};
+        _ = decodeFixed(LeaseReq, raw) catch {};
+        _ = decodeFixed(LeaseRefused, raw) catch {};
         // A valid frame with its tag forced: either refuses or decodes to itself.
         if (len == @sizeOf(Hello)) {
             std.mem.writeInt(u32, buf[0..4], @backingInt(Tag.hello), .little);
@@ -625,11 +790,60 @@ fn ctlFramesFuzz(_: void, smith: *std.testing.Smith) !void {
         try std.testing.expectEqual(r.ok, back.ok);
         try std.testing.expectEqualSlices(u8, r.body, back.body);
     } else |_| {}
-    inline for (.{ Hello, SessionOk, Refuse, Bind, BindOk, BindRefused, Unbind, AdminHello, AdminOk }) |T| {
+    if (LeaseOk.decode(raw)) |l| {
+        var out: [1024]u8 = undefined;
+        const n = try l.encode(&out);
+        const back = try LeaseOk.decode(out[0..n]);
+        try std.testing.expectEqual(l.epoch, back.epoch);
+        try std.testing.expectEqual(l.entries.len, back.entries.len);
+        for (l.entries, back.entries) |a, b| try std.testing.expectEqual(a.dev_off, b.dev_off);
+    } else |_| {}
+    inline for (.{ Hello, SessionOk, Refuse, Bind, BindOk, BindRefused, Unbind, AdminHello, AdminOk, DirectHello, DirectOk, LeaseReq, LeaseRefused }) |T| {
         if (decodeFixed(T, raw)) |v| try std.testing.expectEqualSlices(u8, raw, frameBytes(&v)) else |_| {}
     }
 }
 
 test "fuzz: the il0 blob, the admin datagrams and every fixed ctl frame decode totally; whatever decodes re-encodes to its bytes" {
     try fuzzkit.fuzz({}, ctlFramesFuzz, .{});
+}
+
+test "the direct arm's frames: a lease round-trips header and entries; a lying count, an unaligned block size, an out-of-range volume or a padded entry refuse; DirectOk's paths must terminate; the refuse classes round-trip" {
+    const entries = [_]LeaseEntry{ .{ .vol = 0, .dev_off = 4 << 20 }, .{ .vol = LeaseEntry.UNMAPPED, .dev_off = 0 }, .{ .vol = 1, .dev_off = 12 << 20 } };
+    const l: LeaseOk = .{ .ino = 77, .size = 10 << 20, .epoch = 9, .block_size = 4 << 20, .entries = &entries };
+    var out: [256]u8 = undefined;
+    const n = try l.encode(&out);
+    try testing.expectEqual(@sizeOf(LeaseOkHeader) + 3 * @sizeOf(LeaseEntry), n);
+    const back = try LeaseOk.decode(out[0..n]);
+    try testing.expectEqual(@as(u64, 77), back.ino);
+    try testing.expectEqual(@as(u64, 9), back.epoch);
+    try testing.expectEqual(@as(usize, 3), back.entries.len);
+    for (entries, back.entries) |a, b| {
+        try testing.expectEqual(a.vol, b.vol);
+        try testing.expectEqual(a.dev_off, b.dev_off);
+    }
+    try testing.expectEqual(Tag.lease_ok, try tagOf(out[0..n]));
+    try testing.expectError(error.Truncated, LeaseOk.decode(out[0 .. n - 1]));
+    var bad = out;
+    std.mem.writeInt(u32, bad[4..8], 2, .little);
+    try testing.expectError(error.Truncated, LeaseOk.decode(bad[0..n]));
+    bad = out;
+    std.mem.writeInt(u64, bad[32..40], 4000, .little);
+    try testing.expectError(error.BadString, LeaseOk.decode(bad[0..n]));
+    bad = out;
+    std.mem.writeInt(u16, bad[@sizeOf(LeaseOkHeader)..][0..2], DIRECT_MAX_VOLS, .little);
+    try testing.expectError(error.BadString, LeaseOk.decode(bad[0..n]));
+    bad = out;
+    bad[@sizeOf(LeaseOkHeader) + 2] = 1;
+    try testing.expectError(error.BadString, LeaseOk.decode(bad[0..n]));
+    var d: DirectOk = .{ .n_vols = 2, .block_size = 4 << 20, .page_bytes = 32768 };
+    @memcpy(d.paths[0][0..12], "/dev/nvme3n1");
+    const dd = try decodeFixed(DirectOk, frameBytes(&d));
+    try testing.expectEqualStrings("/dev/nvme3n1", dd.path(0));
+    try testing.expectEqualStrings("", dd.path(1));
+    d.paths[1] = @splat('x');
+    try testing.expectError(error.BadString, decodeFixed(DirectOk, frameBytes(&d)));
+    const r: LeaseRefused = .{ .class = @backingInt(LeaseRefuseClass.custody) };
+    try testing.expectEqual(LeaseRefuseClass.custody, try (try decodeFixed(LeaseRefused, frameBytes(&r))).refuseClass());
+    const r2: LeaseRefused = .{ .class = 99 };
+    try testing.expectError(error.BadClass, decodeFixed(LeaseRefused, frameBytes(&r2)));
 }

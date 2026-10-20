@@ -88,6 +88,8 @@ pub const Session = struct {
     last_active_ns: Atomic(u64),
     admitted_ns: u64,
     torn_down: Atomic(bool) = .init(false),
+    /// The direct arm granted at HELLO (`DirectHello` / `LeaseReq` answered).
+    direct_granted: bool = false,
     poisoned: Atomic(bool) = .init(false),
     /// The handoff fibers (joined at teardown).
     group: Io.Group = .init,

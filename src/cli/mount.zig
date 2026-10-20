@@ -762,6 +762,7 @@ fn mountMain(ctx: *Ctx) u8 {
             .block_size = cfg.block_size,
             .max_file_size = handler.lifecycle.MAX_FILE_SIZE,
             .topo = &session.topo,
+            .direct_clients = ctx.opts.interception_direct,
         }) catch |e| return ctx.failed("the interception host could not arm ({s}) — see the log", .{@errorName(e)});
     } else if (ctx.opts.interception) {
         log.warn("mount: -o interception on a `-o ro` reader arms no session host (a reader serves no ring)", .{});

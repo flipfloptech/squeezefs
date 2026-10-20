@@ -211,6 +211,10 @@ pub const MountOptions = struct {
     /// `-o interception`: arm the client bypass's session host (charter §7)
     /// — and FORCE kernel write-through (`resolveInterceptionPosture`).
     interception: bool = false,
+    /// `-o interception=direct`: the TRUSTED-client direct arm (charter §7
+    /// "The direct arm", decision 0003 §AX) — a session whose uid can open
+    /// the data device nodes reads them itself under a layout lease.
+    interception_direct: bool = false,
 
     /// The first class an explicit `-o *_timeout=` set, if any.
     pub fn explicitTtl(self: MountOptions) ?TtlClass {
@@ -413,6 +417,12 @@ pub fn parseOptionString(opts: *MountOptions, text: []const u8) Outcome {
 }
 
 fn parseOne(opts: *MountOptions, name: []const u8, value: ?[]const u8) Outcome {
+    if (std.mem.eql(u8, name, "interception")) if (value) |v| {
+        if (!std.mem.eql(u8, v, "direct")) return refuse(name, v, .unexpected_value);
+        opts.interception = true;
+        opts.interception_direct = true;
+        return .ok;
+    };
     inline for (flags) |f| {
         if (std.mem.eql(u8, name, f.name)) {
             if (value != null) return refuse(name, value.?, .unexpected_value);
@@ -705,4 +715,18 @@ fn optionStringFuzz(_: void, smith: *std.testing.Smith) !void {
 
 test "fuzz: the -o option string and the seconds parsers are total on arbitrary text" {
     try fuzzkit.fuzz({}, optionStringFuzz, .{ .corpus = &.{ fuzzkit.slice("ro,allow_other,entry_timeout=1.5,fsname=x"), fuzzkit.slice("entry_timeout=.."), fuzzkit.slice(",,,=,=") } });
+}
+
+test "-o interception=direct arms the host AND the direct arm; -o interception alone arms no direct arm; any other value refuses" {
+    var o: MountOptions = .{};
+    try testing.expectEqual(Outcome.ok, parseOptionString(&o, "interception=direct"));
+    try testing.expect(o.interception and o.interception_direct);
+    var p: MountOptions = .{};
+    try testing.expectEqual(Outcome.ok, parseOptionString(&p, "interception"));
+    try testing.expect(p.interception and !p.interception_direct);
+    var q: MountOptions = .{};
+    switch (parseOptionString(&q, "interception=ring")) {
+        .invalid => |d| try testing.expectEqualStrings("interception", d.option),
+        else => return error.TestUnexpectedResult,
+    }
 }

@@ -181,6 +181,25 @@ pub const stats = struct {
     /// window: no enter, no wake).
     pub var ipc_dd_park_spins_absorbed: counters.ShardedCounter = .{};
 
+    // ---- the direct arm (charter §7 "The direct arm") ----
+    /// Sessions granted the direct arm at HELLO (their uid can open every
+    /// data device node) / refused it by the device screen.
+    pub var ipc_direct_sessions: counters.ShardedCounter = .{};
+    pub var ipc_direct_refused_access: counters.ShardedCounter = .{};
+    /// Ops and bytes the clients served from the device themselves (their
+    /// display pages folded at teardown): the engagement law's third term.
+    pub var ipc_direct_ops: counters.ShardedCounter = .{};
+    pub var ipc_direct_bytes: counters.ShardedCounter = .{};
+    /// Client-side rechecks that refused (a lease re-asked), folded alike.
+    pub var ipc_direct_rechecks_failed: counters.ShardedCounter = .{};
+    /// Layout leases granted / refused by class.
+    pub var ipc_leases_granted: counters.ShardedCounter = .{};
+    pub var ipc_leases_refused_disabled: counters.ShardedCounter = .{};
+    pub var ipc_leases_refused_kind: counters.ShardedCounter = .{};
+    pub var ipc_leases_refused_custody: counters.ShardedCounter = .{};
+    pub var ipc_leases_refused_binding: counters.ShardedCounter = .{};
+    pub var ipc_leases_refused_moved: counters.ShardedCounter = .{};
+
     // ---- coherence (KD-11's residual windows) ----
     pub var ipc_inval_notifies: counters.ShardedCounter = .{};
     pub var ipc_inval_attrs_only: counters.ShardedCounter = .{};

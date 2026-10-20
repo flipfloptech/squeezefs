@@ -99,6 +99,7 @@ const sync = @import("../sync/sync.zig");
 const conveyor_core = @import("conveyor_core.zig");
 const tx = @import("tx.zig");
 const token_table = @import("sym/tokens/token_table.zig");
+const lease_epoch = @import("../data/lease_epoch.zig");
 const tree = @import("tree.zig");
 const node = @import("node.zig");
 const node_cache = @import("node_cache.zig");
@@ -2449,6 +2450,7 @@ pub const Conveyor = struct {
         for (w.members, w.failed) |*m, f| {
             const outcome: Outcome = if (f) |e| e else result;
             if (kernel) |view| noteKernel(view, &m.q, if (outcome) |_| false else |_| true);
+            noteLease(&m.q);
             self.answer(m, outcome);
         }
         if (w.image) |*img| img.deinit();
@@ -2484,6 +2486,23 @@ pub const Conveyor = struct {
             n += 1;
         }
         if (n != 0 or (!named and (q.names.len != 0 or unnamed))) view.invalidate(view.ctx, if (named) &.{} else q.names.slice(), unnamed and !named, buf[0..n]);
+    }
+
+    /// The layout lease epochs (`data/lease_epoch.zig`): every inode whose
+    /// record or xattrs this member changed — its layout, its size — bumps
+    /// its stripe here, after the RAM apply and before the ack, whatever
+    /// the origin (a direct client's cached layout is no kernel's cache: the
+    /// kernel-origin exemption does not apply). A failed member's RAM was
+    /// readable until the rollback: bumped too.
+    fn noteLease(q: *const tx.QueuedTx) void {
+        var last: u64 = 0;
+        for (q.recs) |r| {
+            if (r.tree_id != key.TREE_INODES and r.tree_id != key.TREE_XATTRS) continue;
+            const o = token_table.recordObjectIno(r.tree_id, r.key) orelse continue;
+            if (o == last) continue;
+            last = o;
+            lease_epoch.bump(o);
+        }
     }
 
     // ---- the seq-conditional rollback (§5.2 "Failure") ----

@@ -40,6 +40,7 @@ const shm = @import("shm.zig");
 const futex = @import("../sync/futex.zig");
 const clock = @import("../core/clock.zig");
 const knobs = @import("../core/knobs.zig");
+pub const direct_client = @import("direct_client.zig");
 const derive = @import("../core/derive.zig");
 
 pub const Kind = wire.ClientKind;
@@ -183,6 +184,24 @@ pub const Session = struct {
     il_ring_full_impossible: Atomic(u64) = .init(0),
     /// Ops abandoned to the deadline or a poison (their slots are dead).
     il_abandoned_slots: Atomic(u64) = .init(0),
+    /// The direct arm (`direct_client.zig`): granted, mapped and the
+    /// devices open — else null and `direct_state` says why.
+    direct: ?direct_client.Direct = null,
+    direct_state: DirectState = .off,
+
+    pub const DirectState = enum(u8) {
+        /// The daemon did not grant it (not `-o interception=direct`, or
+        /// the device screen), or `SQUEEZEFS_IL_DIRECT=0`.
+        off,
+        on,
+        /// Granted at HELLO but refused at `DirectHello`.
+        refused,
+        /// A data device node would not open for this uid (EACCES-class):
+        /// the kernel's final word.
+        open_denied,
+        /// The lease page failed its seals or its geometry.
+        protocol,
+    };
 
     // ---------------------------------------------------------------------
     // Establish / teardown.
@@ -252,8 +271,24 @@ pub const Session = struct {
         const membw = sizing.probeMemBandwidth(gpa) catch sizing.MEMBW_PROBE_FLOOR_BYTES_PER_S;
         const lane_gate_min = sizing.kernelLaneMinFromEnv(opts.env, membw, l.slab, l.geometry.max_op_bytes);
         m.statsPage().lane_gate_threshold_bytes.store(lane_gate_min, .monotonic);
+        // The direct arm: granted at HELLO, established over the same
+        // socket before any op; a failure leaves a ring session.
+        var direct: ?direct_client.Direct = null;
+        var direct_state: DirectState = .off;
+        if (features & wire.FEATURE_DIRECT != 0 and knobs.boolKnob("SQUEEZEFS_IL_DIRECT", opts.env)) {
+            if (direct_client.Direct.establish(sock)) |d| {
+                direct = d;
+                direct_state = .on;
+            } else |e| direct_state = switch (e) {
+                error.Refused => .refused,
+                error.DeviceOpen => .open_denied,
+                error.Protocol, error.Unsealed, error.Map => .protocol,
+            };
+        }
         return .{
             .ctl = sock,
+            .direct = direct,
+            .direct_state = direct_state,
             .mapped = mapped,
             .layout = l,
             .m = m,
@@ -300,6 +335,7 @@ pub const Session = struct {
     /// Final teardown (process exit, a lost registry race, tests): unmap and
     /// close the ctl socket. Sessions otherwise live for the process.
     pub fn teardown(self: *Session) void {
+        if (self.direct) |*d| d.teardown();
         shm.unmap(self.mapped);
         _ = linux.close(self.ctl);
         self.* = undefined;
@@ -357,6 +393,7 @@ pub const Session = struct {
     /// Best-effort, silent, NEVER on a poisoned session (the atfork child
     /// must not unbind a binding the parent still uses).
     pub fn unbind(self: *Session, id: u64) void {
+        if (self.direct) |*d| d.forget(id);
         if (self.poisoned()) return;
         self.ctl_lock.lock();
         defer self.ctl_lock.unlock();
@@ -369,6 +406,7 @@ pub const Session = struct {
     /// defers the unbind instead of parking on a lock the interrupted
     /// thread may hold). A poisoned session answers true (nothing to send).
     pub fn tryUnbind(self: *Session, id: u64) bool {
+        if (self.direct) |*d| d.forget(id);
         if (self.poisoned()) return true;
         if (!self.ctl_lock.tryLock()) return false;
         defer self.ctl_lock.unlock();
@@ -652,12 +690,40 @@ pub const Session = struct {
         return .{ .served = done };
     }
 
-    /// `pread` over the ring: `len ≤ slab` is the allocation-free single
-    /// flight; larger lengths pipeline flights.
+    /// `pread`: the direct arm first (the device itself, under the binding's
+    /// layout lease), then the ring — `len ≤ slab` is the allocation-free
+    /// single flight; larger lengths pipeline flights.
     pub fn pread(self: *Session, binding: u64, dst: []u8, offset: u64) Outcome {
         if (dst.len == 0) return .{ .served = 0 };
+        if (self.direct) |*d| if (!self.poisoned()) {
+            // A direct-only client never parks on a slot, so the heartbeat
+            // ladder runs here: a dead daemon can no longer move the epochs
+            // its leases rest on — poison, and the op falls through to the
+            // kernel (loud: the mount is gone with its daemon).
+            if (!self.heartbeatAlive(clock.monotonicNs())) {
+                self.poison();
+                return .fallthrough;
+            }
+            switch (d.pread(binding, dst, offset, self.directStats(), self)) {
+                .served => |n| return .{ .served = n },
+                .ring => {},
+            }
+        };
         if (dst.len <= self.layout.slab) return self.singleOp(.read, binding, offset, dst);
         return self.multiOp(.read, binding, offset, dst);
+    }
+
+    fn directStats(self: *Session) direct_client.Stats {
+        const page = self.statsPage();
+        return .{ .ops = &page.il_direct_ops, .bytes = &page.il_direct_bytes, .rechecks_failed = &page.il_direct_rechecks_failed, .asks = &page.il_lease_asks };
+    }
+
+    /// The direct arm's lease ask under the ctl lock (`Direct.pread`'s asker).
+    pub fn ask(self: *Session, d: *direct_client.Direct, binding: u64, stats: direct_client.Stats) ?*direct_client.Lease {
+        if (self.poisoned()) return null;
+        self.ctl_lock.lock();
+        defer self.ctl_lock.unlock();
+        return d.ask(self.ctl, binding, stats);
     }
 
     pub fn pwrite(self: *Session, binding: u64, src: []const u8, offset: u64) Outcome {

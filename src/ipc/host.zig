@@ -65,6 +65,7 @@ pub const inval = @import("host/inval.zig");
 pub const session = @import("host/session.zig");
 pub const service = @import("host/service.zig");
 pub const direct = @import("host/direct.zig");
+pub const direct_lease = @import("host/direct_lease.zig");
 pub const e2e_linux = @import("host/e2e_linux.zig");
 
 comptime {
@@ -126,9 +127,12 @@ pub const Deps = struct {
     max_file_size: u64,
     /// `-o direct_device_true`.
     topo: *const placement.Topology,
+    /// `-o interception=direct`: the trusted-client direct arm (charter §7
+    /// "The direct arm").
+    direct_clients: bool = false,
 };
 
-pub const ArmError = error{ OutOfMemory, ListenerFailed, SpawnFailed, EngineFailed, Eventfd };
+pub const ArmError = error{ OutOfMemory, ListenerFailed, SpawnFailed, EngineFailed, Eventfd, DirectArm };
 
 pub const IpcHost = struct {
     gpa: Allocator,
@@ -173,6 +177,8 @@ pub const IpcHost = struct {
     inval: inval.Invalidator,
     dd: ?*direct.Engine,
     sink: *service.DataPlaneSink,
+    /// The direct arm's host half (`-o interception=direct`).
+    direct_host: ?direct_lease.DirectHost,
     stop: Atomic(bool) = .init(false),
     armed_at_ns: u64,
 
@@ -216,8 +222,16 @@ pub const IpcHost = struct {
             .inval = undefined,
             .dd = null,
             .sink = undefined,
+            .direct_host = null,
             .armed_at_ns = clock.monotonicNs(),
         };
+        if (d.direct_clients) {
+            self.direct_host = direct_lease.DirectHost.init(d.plane, d.block_size) catch |e| {
+                log.err("ipc: the direct arm could not arm ({s}): the lease page or a data device node", .{@errorName(e)});
+                return error.DirectArm;
+            };
+        }
+        errdefer if (self.direct_host) |*dh| dh.deinit();
         self.sessions = try gpa.alloc(?*Session, ctl_cap);
         errdefer gpa.free(self.sessions);
         @memset(self.sessions, null);
@@ -395,6 +409,11 @@ pub const IpcHost = struct {
         self.d.il0_bind(self.d.il0_ctx, null);
         hs.ipc_service_threads.set(0);
         hs.ipc_session_owners.set(0);
+        // 7. The lease page (every direct session is gone: unshare, unmap).
+        if (self.direct_host) |*dh| {
+            dh.deinit();
+            self.direct_host = null;
+        }
     }
 
     pub fn deinit(self: *IpcHost) void {
@@ -544,7 +563,21 @@ pub const IpcHost = struct {
             self.refuse(sock, .internal);
             return;
         };
-        const ok: wire.SessionOk = .{};
+        // The direct arm's screen: the peer could open every data device
+        // node (`deviceReadable`), else the session is a ring session and
+        // the refusal is counted and said once per peer.
+        var features: u64 = 0;
+        if (self.direct_host) |*dh| {
+            if (dh.grants(peer.?)) {
+                features |= wire.FEATURE_DIRECT;
+                s.direct_granted = true;
+                hs.ipc_direct_sessions.inc();
+            } else {
+                hs.ipc_direct_refused_access.inc();
+                log.warn("ipc: the direct arm is refused to pid {d} (uid {d}, gid {d}): it cannot open every data device node; the ring serves it", .{ peer.?.pid, peer.?.uid, peer.?.gid });
+            }
+        }
+        const ok: wire.SessionOk = .{ .features = features };
         const sent = rl.sendCtl(sock, wire.frameBytes(&ok), created.fd);
         _ = linux.close(created.fd);
         sent catch {
@@ -754,6 +787,37 @@ pub const IpcHost = struct {
                     if (!self.inoBoundAnywhere(ino)) self.inval.onLastUnbind(ino, clock.realtimeCoarseS());
                 }
             },
+            .direct_hello => {
+                _ = wire.decodeFixed(wire.DirectHello, frame) catch return self.malformed(s);
+                const dh = if (s.direct_granted) self.direct_host else null;
+                if (dh) |h| {
+                    const reply = h.directOk();
+                    rl.sendCtl(s.ctl, wire.frameBytes(&reply), h.memfd) catch {};
+                } else {
+                    direct_lease.countRefusal(.disabled);
+                    const reply: wire.LeaseRefused = .{ .class = @backingInt(wire.LeaseRefuseClass.disabled) };
+                    rl.sendCtl(s.ctl, wire.frameBytes(&reply), null) catch {};
+                }
+            },
+            .lease_req => {
+                const req = wire.decodeFixed(wire.LeaseReq, frame) catch return self.malformed(s);
+                var out: [wire.CTL_MSG_MAX]u8 = undefined;
+                const verdict: direct_lease.LeaseVerdict = blk: {
+                    if (!s.direct_granted or self.direct_host == null) break :blk .{ .refused = .disabled };
+                    const b = s.binding(req.binding_id) orelse break :blk .{ .refused = .binding };
+                    if (!b.rights.read) break :blk .{ .refused = .binding };
+                    break :blk direct_lease.buildLease(self.d.plane, b.ino, &out);
+                };
+                switch (verdict) {
+                    .ok => |n| rl.sendCtl(s.ctl, out[0..n], null) catch {},
+                    .refused => |class| {
+                        direct_lease.countRefusal(class);
+                        const reply: wire.LeaseRefused = .{ .class = @backingInt(class) };
+                        rl.sendCtl(s.ctl, wire.frameBytes(&reply), null) catch {};
+                    },
+                }
+                s.touch(clock.monotonicNs());
+            },
             else => self.malformed(s),
         }
     }
@@ -873,6 +937,9 @@ pub const IpcHost = struct {
             hs.ipc_lane_gate_kernel_routes.add(page.lane_gate_kernel_routes.load(.monotonic));
             hs.ipc_lane_gate_kernel_bytes.add(page.lane_gate_kernel_bytes.load(.monotonic));
             hs.ipc_client_aio_unknown_ctx_ops.add(page.preload_passthrough_ops[layout.PRELOAD_REASON_AIO_UNKNOWN_CTX_OP].load(.monotonic));
+            hs.ipc_direct_ops.add(page.il_direct_ops.load(.monotonic));
+            hs.ipc_direct_bytes.add(page.il_direct_bytes.load(.monotonic));
+            hs.ipc_direct_rechecks_failed.add(page.il_direct_rechecks_failed.load(.monotonic));
         }
         self.owners[s.owner].kick();
         _ = linux.shutdown(s.ctl, linux.SHUT.RDWR);

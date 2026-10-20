@@ -412,16 +412,25 @@ pub fn forcedWidth(mode: BufferMode, explicit: ?u32) ?u32 {
 /// a queue whose first two are saturated, which that row's are.
 pub const MAX_RINGS_PER_QUEUE: u32 = 4;
 
-/// The derived count on a kmbuf/zc session whose kernel has patch 0030: 2.
-/// The kernel picks a request's queue by the submitting task's CPU
-/// (`task_cpu`), so one submitter's whole depth lands on one queue; its entry
-/// pick is LIFO over the queue's available entries, so a second ring's
-/// entries are taken only once the first ring's are all in userspace — 2
-/// doubles the one-submitter ceiling (one worker saturated at ≈ 4.4 µs per
-/// 4 KiB write) and costs nothing idle. More than 2 is the lever's, not the
-/// derivation's, until the half-loaded worker's pass cost (the 4k randwrite
-/// QD32×4 row's +2.2 cores on two rings) is measured at 3 and 4.
-pub const RINGS_PER_QUEUE_DERIVED: u32 = 2;
+/// The derived count on a kmbuf/zc session whose kernel has patch 0030: the
+/// workers ONE submitter keeps busy. The kernel picks a request's queue by
+/// the submitting task's CPU (`task_cpu`), so one submitter's whole depth
+/// lands on one queue, and its entry pick is LIFO over the queue's available
+/// entries, so a later ring's entries are taken only once the earlier rings'
+/// are all in userspace: an idle ring costs nothing but its thread. The
+/// count is the measured ratio of the daemon's per-op cost to the
+/// submitter's across the FUSE boundary — a 4 KiB write ≈ 7 µs of worker
+/// against fio's ≈ 2.5 µs of issue and completion, a read 4.5 against 2.5
+/// (`rung-10-write-iops.md` wave 2, `rung-10-read-view.md`) — rounded up:
+/// 3. Measured with every held write on the worker's own lane: the third
+/// ring took 4k randwrite QD32×4 from 1.15 M to 1.40 M at the two-ring
+/// arm's cores and 4k randread QD32×4 from 1.74 M to 1.90 M (96 % of ext4,
+/// fio-bound at 96 %); the fourth paid +7 % on the write row for +27 %
+/// cores and gave back 5 % on the read row (its lock contention: fio and
+/// four workers on one `queue->lock`) — the A/B room above. A static cores
+/// ÷ queues cannot say it: the queues ARE the CPUs (charter §4), so the
+/// ratio is 1 on every host; the two per-op costs scale together.
+pub const RINGS_PER_QUEUE_DERIVED: u32 = 3;
 
 /// The derived count: `RINGS_PER_QUEUE_DERIVED` where the kernel's FEATURES
 /// probe reads `RINGS_PER_QUEUE` present (series patch 0030) AND the mode
@@ -1034,12 +1043,12 @@ test "drain width = max(n/4, 1); sq entries = max(next_pow2(width × depth × (1
     try testing.expectEqual(@as(u32, 32768), sqEntries(128, 32, 8));
 }
 
-test "rings per queue: 2 where the FEATURES probe reads present on kmbuf/zc, 1 on UserEnts and wherever it reads absent; explicit wins up to the ceiling of 4; the shares split the depth ceil/rest with the queue's depth unchanged and ring 1's base at ring 0's depth" {
-    try testing.expectEqual(@as(u32, 2), RINGS_PER_QUEUE_DERIVED);
+test "rings per queue: 3 where the FEATURES probe reads present on kmbuf/zc (the workers one submitter keeps busy: the daemon's ≈ 7 µs per op over the submitter's ≈ 2.5, rounded up), 1 on UserEnts and wherever it reads absent; explicit wins up to the ceiling of 4; the shares split the depth ceil/rest with the queue's depth unchanged and ring 1's base at ring 0's depth" {
+    try testing.expectEqual(@as(u32, 3), RINGS_PER_QUEUE_DERIVED);
     try testing.expectEqual(@as(u32, 4), MAX_RINGS_PER_QUEUE);
     try testing.expect(RINGS_PER_QUEUE_DERIVED <= MAX_RINGS_PER_QUEUE);
-    try testing.expectEqual(@as(u32, 2), ringsPerQueue(.zero_copy, true));
-    try testing.expectEqual(@as(u32, 2), ringsPerQueue(.buf_ring, true));
+    try testing.expectEqual(@as(u32, 3), ringsPerQueue(.zero_copy, true));
+    try testing.expectEqual(@as(u32, 3), ringsPerQueue(.buf_ring, true));
     try testing.expectEqual(@as(u32, 1), ringsPerQueue(.user_ents, true));
     try testing.expectEqual(@as(u32, 1), ringsPerQueue(.zero_copy, false));
     try testing.expectEqual(@as(u32, 1), ringsPerQueue(.buf_ring, false));

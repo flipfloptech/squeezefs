@@ -768,13 +768,11 @@ pub const Shared = struct {
     owed_spin: bool = true,
     /// `SQUEEZEFS_FUSE_WRITE_OWN_DEPTH`: a held WRITE takes the worker's own
     /// lane while fewer handlers than this are live there, else the CPU's
-    /// lane (0 = unbounded). One io_uring submitter's whole queue depth
-    /// lands on ONE FUSE queue (the kernel picks it by the submitter's CPU),
-    /// so all-own makes that queue's worker its one saturated CPU (≈ 6 µs
-    /// of worker time per write; QD32 from one thread read 0.76–0.78× the
-    /// two-thread arm) while four submitters gained 1.15× at half the CPU;
-    /// the row's default is the measured knee, 8 (rung-10-write-lane). The
-    /// session reads the row; this zero is a bare `Shared`'s (tests).
+    /// lane (0 = unbounded — the default since rung-10-write-iops wave 2,
+    /// with three rings per queue: the own handler fills a half-loaded
+    /// worker's gaps where the spilled arm left it spinning and parking per
+    /// CQE; the knee of 8 was the one- and two-ring measurement,
+    /// rung-10-write-lane). The session reads the row.
     write_own_depth: u32 = 0,
     /// `SQUEEZEFS_FUSE_STREAM_LANES`: where a held write of the overlay
     /// class (`> block/8`, the streaming write) runs when it leaves this

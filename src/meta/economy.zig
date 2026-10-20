@@ -209,6 +209,11 @@ pub const SharedTimes = struct {
 pub const ParentRecord = enum {
     /// `SharedTimes`: the Δtime merge record.
     delta_times,
+    /// Nothing staged: the stamp is the caller's to PARK as the parent's
+    /// pending refinement (decision 0003 §AV — the coalesced cadence's
+    /// shape of `delta_times`: fold-visible on every read, journaled by
+    /// the batched times drain).
+    parked_times,
     /// The full RMW `Put` (times, and the nlink shift when a directory
     /// child comes or goes).
     put,
@@ -217,24 +222,27 @@ pub const ParentRecord = enum {
     none,
 };
 
-/// The guard class a parent record REQUIRES: a Δ merges under `.shared`;
-/// a `Put` is an RMW and needs `.exclusive`; a planned RMW that staged
-/// nothing still planned the exclusive class.
+/// The guard class a parent record REQUIRES: a Δ merges under `.shared`,
+/// and so does a park (parks commute: a max per field under the stripe
+/// lock — §AT); a `Put` is an RMW and needs `.exclusive`; a planned RMW
+/// that staged nothing still planned the exclusive class.
 pub fn parentGuardFor(rec: ParentRecord) dlm.Mode {
     return switch (rec) {
-        .delta_times => .shared,
+        .delta_times, .parked_times => .shared,
         .put, .none => .exclusive,
     };
 }
 
 /// Stage the parent-directory update: under a SHARED parent the Δtime
-/// merge record; under an EXCLUSIVE parent a full `Put` carrying
-/// `nlink_delta` too (`+1` a directory child inserted, `−1` removed). An
-/// nlink mutation is never shared (asserted): it is the RMW the class
-/// exists for.
-pub fn stageParentUpdate(t: *tx.KvTx, parent: u64, shared: bool, nlink_delta: i32, now: u64, parent_value: ?InodeValue) Allocator.Error!ParentRecord {
+/// merge record — or, when `park` (the coalesced cadence), nothing: the
+/// caller parks the stamp (`.parked_times`); under an EXCLUSIVE parent a
+/// full `Put` carrying `nlink_delta` too (`+1` a directory child inserted,
+/// `−1` removed). An nlink mutation is never shared (asserted): it is the
+/// RMW the class exists for.
+pub fn stageParentUpdate(t: *tx.KvTx, parent: u64, shared: bool, nlink_delta: i32, now: u64, parent_value: ?InodeValue, park: bool) Allocator.Error!ParentRecord {
     if (shared) {
         assert(nlink_delta == 0);
+        if (park) return .parked_times;
         try (SharedTimes{ .parent = parent, .now = now }).stage(t);
         return .delta_times;
     }
@@ -316,19 +324,27 @@ pub const Create = struct {
     global_ino: u64,
     /// The live scan of the name's chain (`tx.dentryChainRange`).
     chain: []const []const u8 = &.{},
+    /// The coalesced cadence (decision 0003 §AV): a regular child's parent
+    /// stamp is PARKED by the caller (`CreateOutcome.parent ==
+    /// .parked_times`), never a record of this entry; strict mode and a
+    /// directory child's nlink shift stage as before.
+    park_parent_times: bool = false,
 };
 
 pub const CreateOutcome = struct {
     guards: GuardPlan,
     /// The record as staged — the reply's attrs.
     child: InodeValue,
+    /// What the parent side staged (`.parked_times`: the caller's park).
+    parent: ParentRecord,
 };
 
 /// Routed same-volume create — ONE whole-tx entry: inode `Put`, dentry
-/// `Put`, and the parent update (a regular child: `SharedTimes`; a
-/// directory: the exclusive `Put` with `nlink + 1`). EEXIST is the caller's
-/// check (it holds the D-guard and found no dentry). Setgid directories
-/// hand their gid down (and the bit itself to a directory child).
+/// `Put`, and the parent update (a regular child: `SharedTimes`, or the
+/// caller's park under the cadence; a directory: the exclusive `Put` with
+/// `nlink + 1`). EEXIST is the caller's check (it holds the D-guard and
+/// found no dentry). Setgid directories hand their gid down (and the bit
+/// itself to a directory child).
 pub fn stageCreate(t: *tx.KvTx, p: Create) DentryError!CreateOutcome {
     var mode = p.mode;
     var gid = p.gid;
@@ -351,11 +367,11 @@ pub fn stageCreate(t: *tx.KvTx, p: Create) DentryError!CreateOutcome {
     };
     try t.stagePut(key.TREE_INODES, &key.inodeKey(p.local_ino), &child.encode());
     _ = try stageDentryPut(t, p.name_key, p.parent, p.name, p.chain, p.global_ino, ftByte(mode));
-    const rec = try stageParentUpdate(t, p.parent, !is_dir, if (is_dir) 1 else 0, p.now, p.parent_value);
+    const rec = try stageParentUpdate(t, p.parent, !is_dir, if (is_dir) 1 else 0, p.now, p.parent_value, p.park_parent_times);
     var plan: GuardPlan = .{};
     plan.inode(p.parent, parentGuardFor(rec));
     plan.dentry(p.parent, p.name);
-    return .{ .guards = plan, .child = child };
+    return .{ .guards = plan, .child = child, .parent = rec };
 }
 
 /// `stageCreate` with the directory type forced: `nlink = 2`, the parent's
@@ -378,6 +394,8 @@ pub const Symlink = struct {
     global_ino: u64,
     target: []const u8,
     chain: []const []const u8 = &.{},
+    /// As `Create.park_parent_times`.
+    park_parent_times: bool = false,
 };
 
 pub const SymlinkError = DentryError || error{SymlinkTargetTooLong};
@@ -402,6 +420,7 @@ pub fn stageSymlink(t: *tx.KvTx, p: Symlink) SymlinkError!CreateOutcome {
         .local_ino = p.local_ino,
         .global_ino = p.global_ino,
         .chain = p.chain,
+        .park_parent_times = p.park_parent_times,
     });
     var buf: [1 + SYMLINK_XATTR.len + SYMLINK_TARGET_MAX]u8 = undefined;
     const xv = (record.XattrValue{ .name = SYMLINK_XATTR, .value = p.target }).encodeInto(&buf) catch unreachable;
@@ -445,7 +464,7 @@ pub fn stageLink(t: *tx.KvTx, p: Link) LinkError!LinkOutcome {
     if (laterThan(p.now, child.ctime)) child.ctime = p.now;
     try t.stagePut(key.TREE_INODES, &key.inodeKey(p.child), &child.encode());
     _ = try stageDentryPut(t, p.name_key, p.parent, p.name, p.chain, p.global_child, ftByte(child.mode));
-    const rec = try stageParentUpdate(t, p.parent, false, 0, p.now, p.parent_value);
+    const rec = try stageParentUpdate(t, p.parent, false, 0, p.now, p.parent_value, false);
     var plan: GuardPlan = .{};
     plan.inode(p.parent, parentGuardFor(rec));
     plan.inode(p.child, .exclusive);
@@ -470,6 +489,8 @@ pub const Unlink = struct {
     /// Read under the guard when the parent is EXCLUSIVE (a directory
     /// child, or a self-reference); null = unreadable, best-effort.
     parent_value: ?InodeValue = null,
+    /// As `Create.park_parent_times` (the shared-parent arm only).
+    park_parent_times: bool = false,
 };
 
 pub const UnlinkOutcome = struct {
@@ -480,6 +501,8 @@ pub const UnlinkOutcome = struct {
     /// then (the kernel may `getattr` an unlinked-open inode).
     child: InodeValue,
     parent_shared: bool,
+    /// What the parent side staged (`.parked_times`: the caller's park).
+    parent: ParentRecord,
 
     pub fn dying(self: UnlinkOutcome) bool {
         return self.child.nlink == 0;
@@ -501,7 +524,7 @@ pub fn stageUnlink(t: *tx.KvTx, p: Unlink) Allocator.Error!UnlinkOutcome {
     const shared = unlinkParentShared(p.is_dir, p.parent, p.child);
     t.noteName(p.parent, p.name);
     try t.stageDelete(key.TREE_DENTRIES, &p.pos.key);
-    const rec = try stageParentUpdate(t, p.parent, shared, if (p.is_dir) -1 else 0, p.now, p.parent_value);
+    const rec = try stageParentUpdate(t, p.parent, shared, if (p.is_dir) -1 else 0, p.now, p.parent_value, p.park_parent_times);
     var child = p.child_value;
     if (p.is_dir) {
         child.nlink = 0;
@@ -514,7 +537,7 @@ pub fn stageUnlink(t: *tx.KvTx, p: Unlink) Allocator.Error!UnlinkOutcome {
     plan.inode(p.parent, parentGuardFor(rec));
     plan.inode(p.child, .exclusive);
     plan.dentry(p.parent, p.name);
-    return .{ .guards = plan, .child = child, .parent_shared = shared };
+    return .{ .guards = plan, .child = child, .parent_shared = shared, .parent = rec };
 }
 
 /// `stageUnlink` of a directory child: parent `nlink − 1` under the
@@ -637,8 +660,8 @@ pub fn stageRename(t: *tx.KvTx, p: Rename) RenameError!RenameOutcome {
         // The moved directory's `..` now names the new parent: the nlink
         // shift rewrites both parents, and the times fold into those
         // `Put`s (same records, same entry; no separate Δ).
-        const old_rec = try stageParentUpdate(t, p.old_parent, false, -1, p.now, p.old_parent_value);
-        const new_rec = try stageParentUpdate(t, p.new_parent, false, 1, p.now, p.new_parent_value);
+        const old_rec = try stageParentUpdate(t, p.old_parent, false, -1, p.now, p.old_parent_value, false);
+        const new_rec = try stageParentUpdate(t, p.new_parent, false, 1, p.now, p.new_parent_value, false);
         plan.inode(p.old_parent, parentGuardFor(old_rec));
         plan.inode(p.new_parent, parentGuardFor(new_rec));
     } else {

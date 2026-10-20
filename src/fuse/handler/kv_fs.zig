@@ -221,6 +221,13 @@ pub var fuse_write_shared_snapshot: counters.ShardedCounter = .{};
 /// journaled by the batched drain — instead of committed as a 76 B entry
 /// that cost one grain-aligned window and one device round trip per op.
 pub var fuse_write_times_parked: counters.ShardedCounter = .{};
+/// `fuse_parent_times_parked`: creates, symlinks and unlinks of a
+/// non-directory child whose parent's Δ(mtime, ctime) was PARKED
+/// (decision 0003 §AV) instead of riding the entry as a merge record —
+/// the one record of the create that landed on a SHARED leaf (every
+/// child of a directory folds its parent's key: thousands of Δs per
+/// leaf between two writebacks, each apply an O(overlay) re-merge).
+pub var fuse_parent_times_parked: counters.ShardedCounter = .{};
 /// `fuse_write_times_drain_failed_ticks`: drain cadence ticks met on a
 /// FAILED store (the fail-stop latch): every commit refuses until remount,
 /// so the tick drains nothing and the parked refinements stay fold-visible
@@ -2228,17 +2235,18 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             }
             const stamp = now();
             const out = if (child.target) |target|
-                economy.stageSymlink(t, .{ .name_key = self.store.nameKey(), .now = stamp, .parent = parent, .parent_value = pv, .name = name, .uid = c.uid, .gid = c.gid, .local_ino = local, .global_ino = global, .target = target, .chain = chain.slice() }) catch |e| return switch (e) {
+                economy.stageSymlink(t, .{ .name_key = self.store.nameKey(), .now = stamp, .parent = parent, .parent_value = pv, .name = name, .uid = c.uid, .gid = c.gid, .local_ino = local, .global_ino = global, .target = target, .chain = chain.slice(), .park_parent_times = self.times_park }) catch |e| return switch (e) {
                     error.SymlinkTargetTooLong, error.NameTooLong => error.NameTooLong,
                     error.DentryChainOverflow => error.NoSpaceLeft,
                     error.OutOfMemory => error.OutOfMemory,
                 }
             else
-                economy.stageCreate(t, .{ .name_key = self.store.nameKey(), .now = stamp, .parent = parent, .parent_value = pv, .name = name, .mode = child.mode, .uid = c.uid, .gid = c.gid, .rdev = child.rdev, .local_ino = local, .global_ino = global, .chain = chain.slice() }) catch |e| return switch (e) {
+                economy.stageCreate(t, .{ .name_key = self.store.nameKey(), .now = stamp, .parent = parent, .parent_value = pv, .name = name, .mode = child.mode, .uid = c.uid, .gid = c.gid, .rdev = child.rdev, .local_ino = local, .global_ino = global, .chain = chain.slice(), .park_parent_times = self.times_park }) catch |e| return switch (e) {
                     error.NameTooLong => error.NameTooLong,
                     error.DentryChainOverflow => error.NoSpaceLeft,
                     error.OutOfMemory => error.OutOfMemory,
                 };
+            if (out.parent == .parked_times) try self.parkParentTimes(parent, stamp);
             t_owned = false;
             self.commit(c, t) catch |e| {
                 if (self.redispatches(e)) return self.xvCreate(c, parent_global, logical_parent, name, child, local, global);
@@ -2347,8 +2355,9 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             const cv = try self.readInode(found.local);
             if (want_dir and try self.dirHasEntries(found.local)) return error.DirectoryNotEmpty;
             const pv: ?InodeValue = if (shared) null else try self.readDir(parent);
-            const req: economy.Unlink = .{ .now = now(), .parent = parent, .name = name, .pos = found.pos, .child = found.local, .child_value = cv, .is_dir = want_dir, .parent_value = pv };
-            _ = if (want_dir) try economy.stageRmdir(t, req) else try economy.stageUnlink(t, req);
+            const req: economy.Unlink = .{ .now = now(), .parent = parent, .name = name, .pos = found.pos, .child = found.local, .child_value = cv, .is_dir = want_dir, .parent_value = pv, .park_parent_times = self.times_park };
+            const out = if (want_dir) try economy.stageRmdir(t, req) else try economy.stageUnlink(t, req);
+            if (out.parent == .parked_times) try self.parkParentTimes(parent, req.now);
             t_owned = false;
             self.commit(c, t) catch |e| {
                 if (self.redispatches(e)) return self.xvRemove(c, parent_global, name, found, want_dir);
@@ -3218,6 +3227,22 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 .parked_wake_drain => self.times_drain_wake.notifyOne(self.io),
             }
             fuse_write_times_parked.inc();
+        }
+
+        /// A create's or unlink's parent stamp parked as the parent's
+        /// pending refinement (decision 0003 §AV), under the op's SHARED
+        /// `I{parent}` guard — parks commute — before its entry commits:
+        /// the parent's `mtime`/`ctime` move with the name, never behind
+        /// it, and a refused commit leaves at most a harmless advance the
+        /// drain journals. The same law as `parkWriteTimes`: fold-visible
+        /// on every read, journaled within one flush interval, by
+        /// `fsyncdir` and the dismount; the cap wakes the drain early.
+        fn parkParentTimes(self: *Self, parent: u64, stamp: u64) Error!void {
+            switch (try self.pending.park(parent, stamp, stamp)) {
+                .parked => {},
+                .parked_wake_drain => self.times_drain_wake.notifyOne(self.io),
+            }
+            fuse_parent_times_parked.inc();
         }
 
         /// The stored record UNFOLDED (null when absent): the drain's base —
@@ -4145,6 +4170,9 @@ pub const MemStore = struct {
     name_key: key.NameKey = .init(0x5EED_0F_7E57),
     node_size_: usize = 65536,
     commits: u64 = 0,
+    /// Records the commits carried (Σ staged per commit: an op's record
+    /// count is a law the tests pin, decision 0003 §AV).
+    records_committed: u64 = 0,
     /// The last commit's `kernel_origin` (the kernel view's law).
     last_kernel_origin: bool = false,
     fsyncs: u64 = 0,
@@ -4257,6 +4285,7 @@ pub const MemStore = struct {
             }
         }
         self.commits += 1;
+        self.records_committed += t.staged.items.len;
         self.last_kernel_origin = t.kernel_origin;
     }
 
@@ -5627,6 +5656,12 @@ test "§L.6 the write-stamp park (repro-port: frag-512b-write — 533 k size-neu
         f.* = try h.create(1, nm, 0o644);
         try testing.expectEqual(@as(?linux.E, null), h.write(f.*, 0, image, 0).errno());
     }
+    var trace = op_trace.OpTrace.begin(0, .other);
+    defer trace.finish();
+    var ctx: filesystem.Ctx = .{ .unique = 0, .uid = 0, .gid = 0, .pid = 0, .io = testing.io, .trace = &trace, .wd_slot = null, .window = &.{} };
+    // The creates parked the root's stamp (§AV): drained here so the
+    // counts below are the writes' alone.
+    try testing.expectEqual(@as(u64, 5), try h.fs.drainPendingTimes(&ctx));
     const commits0 = h.store.commits;
     const parked0 = fuse_write_times_parked.load();
     const drains0 = economy.stats.meta_kv_times_echo_drain_commits.load();
@@ -5652,9 +5687,6 @@ test "§L.6 the write-stamp park (repro-port: frag-512b-write — 533 k size-neu
     try testing.expectEqual(stored_before.mtime, (try h.fs.readInodeStored(try H.Fs.localOf(files[0]))).?.mtime);
     // The drain: ONE entry carrying the four Δs; the stored record now
     // carries exactly the served stamp; nothing stays parked.
-    var trace = op_trace.OpTrace.begin(0, .other);
-    defer trace.finish();
-    var ctx: filesystem.Ctx = .{ .unique = 0, .uid = 0, .gid = 0, .pid = 0, .io = testing.io, .trace = &trace, .wd_slot = null, .window = &.{} };
     try testing.expectEqual(@as(u64, 4), try h.fs.drainPendingTimes(&ctx));
     try testing.expectEqual(commits0 + 1, h.store.commits);
     try testing.expectEqual(drains0 + 1, economy.stats.meta_kv_times_echo_drain_commits.load());
@@ -5715,6 +5747,10 @@ test "§L.6 the write-stamp park (repro-port: frag-512b-write — 533 k size-neu
         f.* = try h.create(1, try std.fmt.bufPrint(&name_buf, "c{d}", .{n}), 0o644);
         try testing.expectEqual(@as(?linux.E, null), h.write(f.*, 0, image, 0).errno());
     }
+    // The crowd's first writes parked their size claims and the creates
+    // the root's stamp (§AV): drained, so the cap below is crossed by the
+    // overwrites' parks alone.
+    try testing.expectEqual(@as(u64, cap + 1), try h.fs.drainPendingTimes(&ctx));
     awaitCoarseTickAfter(@bitCast(clock.realtimeCoarseNs()));
     for (crowd) |f| try testing.expectEqual(@as(?linux.E, null), h.write(f, 512, &sector, 0).errno());
     try testing.expectEqual(economy.PENDING_TIMES_DRAIN_CAP, h.fs.pending.len());
@@ -5728,6 +5764,85 @@ test "§L.6 the write-stamp park (repro-port: frag-512b-write — 533 k size-neu
     try testing.expectEqual(@as(u64, 0), h.fs.pending.len());
     for (crowd) |f| h.release(f);
     for (files) |f| h.release(f);
+}
+
+test "§AV the parent-stamp park (mdtest -np 32 creates at 41 k/s: the parent's Δ(mtime, ctime) was the one record of every create and unlink that landed on a SHARED leaf — 4,483 records in one leaf between two writebacks, every apply an O(overlay) re-merge on the journal lane): N creates commit N entries of exactly 2 records (inode + dentry) and N unlinks N entries of 2 (dentry delete + child put); the parent's stored record never moves, its served mtime/ctime do (fold-visible), a mkdir's exclusive Put carries the folded stamp, fsyncdir drains the park in ONE entry; strict mode stages the Δ as before" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    const dir = try h.mkdir(1, "d");
+    const dl = try Harness.Fs.localOf(dir);
+    var trace = op_trace.OpTrace.begin(0, .other);
+    defer trace.finish();
+    var ctx: filesystem.Ctx = .{ .unique = 0, .uid = 0, .gid = 0, .pid = 0, .io = testing.io, .trace = &trace, .wd_slot = null, .window = &.{} };
+    // A directory child never parks (the mkdir's parent arm is the
+    // exclusive Put): nothing is pending before the creates.
+    try testing.expectEqual(@as(u64, 0), try h.fs.drainPendingTimes(&ctx));
+    const stored0 = (try h.fs.readInodeStored(dl)).?;
+    awaitCoarseTickAfter(stored0.mtime);
+    const commits0 = h.store.commits;
+    const records0 = h.store.records_committed;
+    const parked0 = fuse_parent_times_parked.load();
+    // 64 creates: 64 entries, 128 records; the parent is a parked stamp.
+    var files: [64]u64 = undefined;
+    var name_buf: [8]u8 = undefined;
+    for (&files, 0..) |*f, i| f.* = try h.create(dir, try std.fmt.bufPrint(&name_buf, "f{d}", .{i}), 0o644);
+    try testing.expectEqual(commits0 + 64, h.store.commits);
+    try testing.expectEqual(records0 + 128, h.store.records_committed);
+    try testing.expectEqual(parked0 + 64, fuse_parent_times_parked.load());
+    try testing.expectEqual(@as(u64, 1), h.fs.pending.len());
+    try testing.expectEqual(stored0.mtime, (try h.fs.readInodeStored(dl)).?.mtime);
+    const served = try h.getattr(dir);
+    const served_mtime_ns = served.mtime * std.time.ns_per_s + served.mtimensec;
+    try testing.expect(economy.laterThan(served_mtime_ns, stored0.mtime));
+    try testing.expect(economy.laterThan(served.ctime * std.time.ns_per_s + served.ctimensec, stored0.ctime));
+    // A lookup serves the same folded stamp (the entry's attrs).
+    const looked = try h.entry(h.lookup(1, "d"));
+    try testing.expectEqual(served_mtime_ns, looked.attr.mtime * std.time.ns_per_s + looked.attr.mtimensec);
+    // A directory child: the exclusive Put carries the folded stamp and
+    // the nlink shift — journaled, never parked.
+    awaitCoarseTickAfter(served_mtime_ns);
+    const sub = try h.mkdir(dir, "sub");
+    try testing.expectEqual(commits0 + 65, h.store.commits);
+    try testing.expectEqual(records0 + 131, h.store.records_committed);
+    try testing.expectEqual(parked0 + 64, fuse_parent_times_parked.load());
+    const after_mkdir = (try h.fs.readInodeStored(dl)).?;
+    try testing.expectEqual(@as(u32, 3), after_mkdir.nlink);
+    try testing.expect(economy.laterThan(after_mkdir.mtime, served_mtime_ns) or after_mkdir.mtime == served_mtime_ns);
+    // 64 unlinks: 64 entries of 2 records; the stamp parks again.
+    awaitCoarseTickAfter(after_mkdir.mtime);
+    for (files, 0..) |f, i| {
+        h.release(f);
+        try testing.expectEqual(@as(?linux.E, null), h.call(.{ .unlink = .{ .name = try std.fmt.bufPrint(&name_buf, "f{d}", .{i}) } }, dir).errno());
+    }
+    try testing.expectEqual(commits0 + 129, h.store.commits);
+    try testing.expectEqual(records0 + 259, h.store.records_committed);
+    try testing.expectEqual(parked0 + 128, fuse_parent_times_parked.load());
+    try testing.expectEqual(after_mkdir.mtime, (try h.fs.readInodeStored(dl)).?.mtime);
+    const served2 = try h.getattr(dir);
+    try testing.expect(economy.laterThan(served2.mtime * std.time.ns_per_s + served2.mtimensec, after_mkdir.mtime));
+    // fsyncdir: the drain's ONE entry of ONE Δ, then the stored record
+    // carries the served stamp and nothing stays parked.
+    try testing.expectEqual(@as(?linux.E, null), h.call(.{ .fsyncdir = .{ .fh = 1, .datasync = false } }, dir).errno());
+    try testing.expectEqual(commits0 + 130, h.store.commits);
+    try testing.expectEqual(records0 + 260, h.store.records_committed);
+    try testing.expectEqual(@as(u64, 0), h.fs.pending.len());
+    try testing.expectEqual(served2.mtime * std.time.ns_per_s + served2.mtimensec, (try h.fs.readInodeStored(dl)).?.mtime);
+    // rmdir of the empty sub: the exclusive arm (nlink back to 2), 3 records.
+    try testing.expectEqual(@as(?linux.E, null), h.call(.{ .rmdir = .{ .name = "sub" } }, dir).errno());
+    try testing.expectEqual(records0 + 263, h.store.records_committed);
+    try testing.expectEqual(@as(u32, 2), (try h.fs.readInodeStored(dl)).?.nlink);
+    _ = sub;
+    // Strict mode: the Δ rides the entry (3 records), nothing parks.
+    h.fs.times_park = false;
+    defer h.fs.times_park = true;
+    const strict = try h.create(dir, "strict", 0o644);
+    try testing.expectEqual(records0 + 266, h.store.records_committed);
+    try testing.expectEqual(parked0 + 128, fuse_parent_times_parked.load());
+    try testing.expectEqual(@as(u64, 0), h.fs.pending.len());
+    h.release(strict);
+    try testing.expectEqual(@as(?linux.E, null), h.call(.{ .unlink = .{ .name = "strict" } }, dir).errno());
+    try testing.expectEqual(records0 + 269, h.store.records_committed);
 }
 
 /// One op on its own thread against a harness's filesystem (the rangelock
@@ -6077,7 +6192,8 @@ test "FUSE_SYNCFS is a per-file fsync for the whole mount: every parked stamp jo
     awaitCoarseTickAfter((try h.fs.readInodeStored(try H.Fs.localOf(files[1]))).?.mtime);
     var sector: [512]u8 = @splat('s');
     for (files) |f| try testing.expectEqual(@as(?linux.E, null), h.write(f, 512, &sector, 0).errno());
-    try testing.expectEqual(@as(u64, 2), h.fs.pending.len());
+    // Two write stamps and the root's (the creates' park, §AV): one entry.
+    try testing.expectEqual(@as(u64, 3), h.fs.pending.len());
     const commits0 = h.store.commits;
     const fsyncs0 = h.store.fsyncs;
     const calls0 = fuse_syncfs.load();
@@ -6147,14 +6263,16 @@ test "the handover's step 0 (rung 10 item 4): drainPendingTimesOfSlot commits th
     const foreign = key.guestLocalIno(5, 77);
     const stamp: u64 = @bitCast(clock.realtimeCoarseNs());
     try testing.expect(try h.fs.pending.park(foreign, stamp, stamp) == .parked);
-    try testing.expectEqual(@as(u64, 5), h.fs.pending.len());
+    // Four write stamps, the root's (the creates' park, §AV) and the
+    // foreign one.
+    try testing.expectEqual(@as(u64, 6), h.fs.pending.len());
     const commits0 = h.store.commits;
     var trace = op_trace.OpTrace.begin(0, .other);
     defer trace.finish();
     var ctx: filesystem.Ctx = .{ .unique = 0, .uid = 0, .gid = 0, .pid = 0, .io = testing.io, .trace = &trace, .wd_slot = null, .window = &.{} };
-    // Slot 0: ONE commit carrying the four Δs; the foreign stamp stays.
+    // Slot 0: ONE commit carrying the five Δs; the foreign stamp stays.
     const served = try h.getattr(files[1]);
-    try testing.expectEqual(@as(u64, 4), try h.fs.drainPendingTimesOfSlot(&ctx, 0));
+    try testing.expectEqual(@as(u64, 5), try h.fs.drainPendingTimesOfSlot(&ctx, 0));
     try testing.expectEqual(commits0 + 1, h.store.commits);
     try testing.expectEqual(@as(u64, 1), h.fs.pending.len());
     try testing.expect(h.fs.pending.parked(foreign) != null);

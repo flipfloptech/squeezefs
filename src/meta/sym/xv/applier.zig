@@ -344,7 +344,7 @@ pub fn Applier(comptime Store: type) type {
         fn stageParent(self: *Self, t: *tx.KvTx, parent_key: u64, pu: steps.ParentUpdate, dir_delta: i32, now: u64) Error!void {
             if (pu == .none) return;
             if (pu == .shared_times) {
-                _ = try economy.stageParentUpdate(t, parent_key, true, 0, now, null);
+                _ = try economy.stageParentUpdate(t, parent_key, true, 0, now, null, false);
                 return;
             }
             const pv = (try self.readInodeKey(parent_key)) orelse return;
@@ -358,9 +358,9 @@ pub fn Applier(comptime Store: type) type {
         fn stageParentWith(_: *Self, t: *tx.KvTx, parent_key: u64, pv: InodeValue, pu: steps.ParentUpdate, dir_delta: i32, now: u64) Error!void {
             switch (pu) {
                 .none => {},
-                .shared_times => _ = try economy.stageParentUpdate(t, parent_key, true, 0, now, null),
-                .exclusive_times => _ = try economy.stageParentUpdate(t, parent_key, false, 0, now, pv),
-                .exclusive_times_bump => _ = try economy.stageParentUpdate(t, parent_key, false, dir_delta, now, pv),
+                .shared_times => _ = try economy.stageParentUpdate(t, parent_key, true, 0, now, null, false),
+                .exclusive_times => _ = try economy.stageParentUpdate(t, parent_key, false, 0, now, pv, false),
+                .exclusive_times_bump => _ = try economy.stageParentUpdate(t, parent_key, false, dir_delta, now, pv, false),
             }
         }
 

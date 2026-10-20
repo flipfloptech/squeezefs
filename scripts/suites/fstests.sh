@@ -250,21 +250,22 @@ fstests_run() {
     cat "$m"/daemon-*.log 2>/dev/null | grep -E '^(error|warn)\(|TRIPWIRE' > "$RESULTS/daemon-$(basename "$m")-run$n.alerts" || true
     local na; na=$(wc -l < "$RESULTS/daemon-$(basename "$m")-run$n.alerts")
     suite_log "$(basename "$m"): $logs daemon log(s), $na alert line(s)"
-    # A tripwire fails the run — on a daemon whose device answered. A
-    # dm-error test fails the device on purpose (`InputOutput` in the log):
-    # the fail-stop is the design, a rollback whose own writes meet EIO
-    # diverges by construction, and the spec scopes the fence-path wires to
-    # "0 on healthy mounts" (`docs/porting/data_alloc_reclaim.md`,
-    # `data_write_path.md`); there the test's output and the fsck are the
-    # oracle, and its tripwires are listed for the record.
+    # A tripwire fails the run, on every daemon — a dm-error daemon's too
+    # (owner ruling 2026-10-19): a fence taken while the volume is FAILED
+    # is a counted outcome (`*_fence_drops_failed_volume`,
+    # `meta_conveyor_divergences_failed_volume`, one info line each), so a
+    # tripwire there is a fence on a HEALTHY volume like anywhere else.
+    # The FAILED-volume fence lines are histogrammed for the record.
     local l tw
     for l in "$m"/daemon-*.log; do
       [ -f "$l" ] || continue
       tw=$(grep -o "TRIPWIRE '[a-z_]*'" "$l" | sort -u | sed "s/TRIPWIRE '//; s/'//" | tr '\n' ' ')
       [ -n "$tw" ] || continue
-      if grep -q "failed: InputOutput" "$l"; then suite_log "$(basename "$m") ($(basename "$l")): tripwire(s) on a device that answered EIO (for the record): $tw"
-      else suite_log "TRIPWIRE fired in $(basename "$m") ($(basename "$l")): $tw"; ok=1; fi
+      suite_log "TRIPWIRE fired in $(basename "$m") ($(basename "$l")): $tw"; ok=1
     done
+    local fv
+    fv=$(cat "$m"/daemon-*.log 2>/dev/null | grep -c 'on a FAILED volume\|on a FAILED/fenced volume' || true)
+    [ "${fv:-0}" = 0 ] || suite_log "$(basename "$m"): $fv fence event(s) on a FAILED volume (for the record: counted, never a tripwire)"
     # A daemon that died mid-test (the mount helper cleared its stale
     # claim so the pass could go on): the run is VOID whatever `check` says.
     if [ -s "$m/daemon-died" ]; then

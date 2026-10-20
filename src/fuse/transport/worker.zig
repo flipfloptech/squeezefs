@@ -781,10 +781,13 @@ pub const Shared = struct {
     /// thread — `cpu`: the queue's CPU lane like every data-class request
     /// (the shipped arm); `node`: round-robin over the node's handler
     /// lanes; `node_only`: the same, and never the worker's own lane; `own`:
-    /// always the worker's own lane, past the own-depth share. The measured
-    /// arms (rung-10-seq-parity): `node` and `node_only` shortened no round —
-    /// the device phase stood at ≈ 490 µs with the worker freed of handler
-    /// work, and the hops cost 0.3–1.4 cores; `own` is wave 2's arm.
+    /// always the worker's own lane, past the own-depth share — the shipped
+    /// arm (rung-10-seq-parity wave 2: 1.018× on 1M seq write ×4 at −3 %
+    /// daemon cores; the handler is ≈ 16 µs with the read view, a spill two
+    /// wakes each way). `node` and `node_only` shortened no round — the
+    /// device phase stood at ≈ 490 µs with the worker freed of handler work,
+    /// and the hops cost 0.3–1.4 cores. The session reads the row; a bare
+    /// `Shared`'s `cpu` is the tests'.
     stream_lanes: StreamLanes = .cpu,
     /// The no-open posture (`Config.no_open`, decision 0003 §AF): a FLUSH
     /// is probed here first, and its drain is the data class.

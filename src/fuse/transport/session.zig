@@ -1173,7 +1173,7 @@ pub const Session = struct {
     /// allowed set is the enum's field names).
     fn streamLanesKnob(env: *const std.process.Environ.Map) worker.Shared.StreamLanes {
         const s = knobs.enumKnob("SQUEEZEFS_FUSE_STREAM_LANES", env);
-        return std.meta.stringToEnum(worker.Shared.StreamLanes, s) orelse .cpu;
+        return std.meta.stringToEnum(worker.Shared.StreamLanes, s) orelse .own;
     }
 
     /// THE ORDERED BRING-UP. `fs.init` runs once the geometry is planned.
@@ -1385,7 +1385,7 @@ pub const Session = struct {
             .no_open = cfg.no_open,
             .budget_bytes = cfg.mem_budget_bytes,
         };
-        if (self.shared.stream_lanes != .cpu) log.info("transport: SQUEEZEFS_FUSE_STREAM_LANES={t} — the streaming write's lane placement (the measured A/B arm; `cpu` is the shipped one)", .{self.shared.stream_lanes});
+        if (self.shared.stream_lanes != .own) log.info("transport: SQUEEZEFS_FUSE_STREAM_LANES={t} — the streaming write's lane placement (the measured A/B arm; `own` is the shipped one)", .{self.shared.stream_lanes});
         if (read_fusion_lever and !self.shared.read_fusion_on) log.info("transport: SQUEEZEFS_FUSE_READ_FUSION=1 accepted; inert on a {t} session (the fused poll is the zero-copy mode's)", .{self.mode});
         if (self.shared.sqpoll) log.info("transport: SQUEEZEFS_FUSE_SQPOLL=1 — the kernel submission poller (measured not recommended: the A/B control arm)", .{});
         self.shared.register_refuse_remaining.store(knobs.intKnob("SQUEEZEFS_TEST_FUSE_REGISTER_REFUSE", u32, env), .monotonic);
@@ -3615,6 +3615,12 @@ test "e2e zc WRITE, the overlay class (charter §6.2 item 1): a 1 MiB page-align
     try testing.expectEqual(geometry.BufferMode.zero_copy, s.mode);
     rig.fs.held_store = .{ .ctx = s, .fd = dev_fd, .store = &storeHeldThunk };
     const before = Snapshot.take();
+    var own0: u64 = 0;
+    var foreign0: u64 = 0;
+    for (s.groups) |g| {
+        own0 += g.dispatches_own.load(.monotonic);
+        foreign0 += g.dispatches_foreign.load(.monotonic);
+    }
     var pb: [256]u8 = undefined;
     const fd = try openPath(rig.child(&pb, "scratch"), .{ .ACCMODE = .WRONLY, .CLOEXEC = true });
     defer _ = linux.close(fd);
@@ -3625,6 +3631,16 @@ test "e2e zc WRITE, the overlay class (charter §6.2 item 1): a 1 MiB page-align
     // 1 MiB at offset 0 of a 4 MiB block: the overlay shape ⇒ HELD ⇒ the direct store.
     try testing.expectEqual(mib, linux.pwrite(fd, buf.ptr, mib, 0));
     try testing.expectEqual(@as(u64, 1), rig.fs.held_writes.load(.monotonic));
+    // The streaming class runs on the delivering worker's own lane (SQUEEZEFS_FUSE_STREAM_LANES=own):
+    // nothing the write caused was dispatched foreign (the namespace ops around it are own-lane too).
+    var own1: u64 = 0;
+    var foreign1: u64 = 0;
+    for (s.groups) |g| {
+        own1 += g.dispatches_own.load(.monotonic);
+        foreign1 += g.dispatches_foreign.load(.monotonic);
+    }
+    try testing.expect(own1 > own0);
+    try testing.expectEqual(foreign0, foreign1);
     try testing.expectEqual(@as(u64, 1), rig.fs.direct_stores.load(.monotonic));
     try testing.expectEqual(@as(u64, 0), rig.fs.direct_store_failures.load(.monotonic));
     try testing.expectEqual(@as(u64, 0), rig.fs.lazy_extracts.load(.monotonic));

@@ -149,9 +149,11 @@ pub const DMA_ALIGN: usize = 4096;
 /// RING_ENTRIES`), below `ring_park.reserved_ud` (this ring has no wake READ).
 pub const PARK_UD: u64 = std.math.maxInt(u64) - 2;
 pub const PARK_CANCEL_UD: u64 = std.math.maxInt(u64) - 3;
-/// The dd ring ladder: `COOP_TASKRUN`, then the plain setup (an EINVAL on
-/// a kernel without the flag degrades once, loudly).
-pub const ring_ladder = [_]u32{ linux.IORING_SETUP_COOP_TASKRUN, 0 };
+/// The dd ring ladder: `COOP_TASKRUN | TASKRUN_FLAG` (the kernel raises
+/// `IORING_SQ_TASKRUN` when a completion waits for an enter to post — the
+/// ring park's spin reads it and enters once, no IPI), then the plain
+/// setup (an EINVAL on a kernel without the flags degrades once, loudly).
+pub const ring_ladder = [_]u32{ linux.IORING_SETUP_COOP_TASKRUN | linux.IORING_SETUP_TASKRUN_FLAG, 0 };
 
 pub const Config = struct {
     shards: u16,
@@ -530,11 +532,34 @@ pub const Engine = struct {
     /// per op measured); it is cancelled and re-armed when the owned set's
     /// `epoch` moved (its words may be unmapped). Null = nothing in flight:
     /// the caller's futex park.
-    pub fn parkInRing(self: *Engine, owner: u16, waiters: []const futex.Waiter, epoch: u64, bound_ns: u64) ?futex.WaitManyVerdict {
+    pub fn parkInRing(self: *Engine, owner: u16, waiters: []const futex.Waiter, epoch: u64, spin_ns: u64, bound_ns: u64) ?futex.WaitManyVerdict {
         if (!self.ownerParksInRing() or self.stop.load(.acquire)) return null;
         const shard = self.shardOf(owner);
         if (shard.inflight.load(.monotonic) == 0) return null;
         std.debug.assert(waiters.len <= futex.wait_many_max);
+        // The spin half: a CQE in flight on a RAM-class device lands in
+        // microseconds — poll the CQ (and the kernel's TASKRUN flag: a
+        // completion waiting for an enter to post) and the doorbells for
+        // the window before sleeping; an absorbed park costs no enter at
+        // all and no wake latency.
+        if (spin_ns != 0) {
+            const deadline = clock.monotonicNs() + spin_ns;
+            while (clock.monotonicNs() < deadline) {
+                if (shard.ring.cqReady() != 0 or shard.ring.cqNeedsFlush()) {
+                    stats.ipc_dd_park_spins_absorbed.inc();
+                    if (shard.cq_gate.tryLock()) {
+                        defer shard.cq_gate.unlock(self.io);
+                        shard.drainCq(&stats.ipc_dd_park_reaps);
+                    }
+                    return .returned;
+                }
+                for (waiters) |w| if (w.word.load(.seq_cst) != w.expect) {
+                    stats.ipc_dd_park_spins_absorbed.inc();
+                    return .returned;
+                };
+                std.atomic.spinLoopHint();
+            }
+        }
         var ones: [futex.wait_many_max]linux.futex2_waitone = undefined;
         for (waiters, 0..) |w, i| ones[i] = .{ .val = w.expect, .uaddr = @intFromPtr(&w.word.raw), .flags = .{ .size = .U32, .private = false } };
         const to_submit = blk: {
@@ -1099,7 +1124,7 @@ test "the dd lane's RING PARK: an owner with ops in flight waits in its ring —
     var bell: futex.Word = .init(0);
     const waiters = [_]futex.Waiter{.{ .word = &bell, .expect = 0 }};
     // Nothing in flight: the futex park is the caller's.
-    try testing.expect(engine.parkInRing(0, &waiters, 1, 50 * std.time.ns_per_ms) == null);
+    try testing.expect(engine.parkInRing(0, &waiters, 1, 0, 50 * std.time.ns_per_ms) == null);
     // A read STUCK on a pipe (the device of this test), in flight on shard 0.
     var pipe_fds: [2]linux.fd_t = undefined;
     try testing.expectEqual(@as(usize, 0), linux.pipe2(&pipe_fds, .{ .CLOEXEC = true }));
@@ -1130,7 +1155,7 @@ test "the dd lane's RING PARK: an owner with ops in flight waits in its ring —
     const reaper0 = stats.ipc_dd_reaper_reaps.load();
     const ringer = try std.Thread.spawn(.{}, Ringer.run, .{Ringer{ .word = &bell, .delay_ns = 20 * std.time.ns_per_ms }});
     const t0 = clock.monotonicNs();
-    const v = engine.parkInRing(0, &waiters, 1, 2 * std.time.ns_per_s).?;
+    const v = engine.parkInRing(0, &waiters, 1, 0, 2 * std.time.ns_per_s).?;
     const waited = clock.monotonicNs() - t0;
     ringer.join();
     try testing.expectEqual(futex.WaitManyVerdict.returned, v);
@@ -1143,7 +1168,7 @@ test "the dd lane's RING PARK: an owner with ops in flight waits in its ring —
     try testing.expectEqual(page.len, linux.write(pipe_fds[1], &page, page.len));
     const park_reaps0 = stats.ipc_dd_park_reaps.load();
     const waiters2 = [_]futex.Waiter{.{ .word = &bell, .expect = bell.load(.seq_cst) }};
-    const v2 = engine.parkInRing(0, &waiters2, 1, 2 * std.time.ns_per_s).?;
+    const v2 = engine.parkInRing(0, &waiters2, 1, 0, 2 * std.time.ns_per_s).?;
     try testing.expectEqual(futex.WaitManyVerdict.returned, v2);
     try testing.expect(slot_core.isDoneFor(try s.m.slot(1), r.gen));
     try testing.expectEqual(@as(i64, 4096), slot_core.result(try s.m.slot(1)));
@@ -1156,7 +1181,7 @@ test "the dd lane's RING PARK: an owner with ops in flight waits in its ring —
     // park with nothing in flight is null whatever is armed.
     try testing.expect(shard.park_armed.load(.acquire));
     try testing.expectEqual(@as(u64, 1), shard.park_epoch);
-    try testing.expect(engine.parkInRing(0, &waiters2, 1, 50 * std.time.ns_per_ms) == null);
+    try testing.expect(engine.parkInRing(0, &waiters2, 1, 0, 50 * std.time.ns_per_ms) == null);
     // The owned set moved (epoch 2) with a read stuck again: the stale
     // waiter is cancelled and a fresh one armed in the same enter; the
     // cancel's CQE ends that park, the new waiter stays armed and answers
@@ -1175,20 +1200,53 @@ test "the dd lane's RING PARK: an owner with ops in flight waits in its ring —
     }
     _ = shard.pending_submits.fetchAdd(1, .release);
     const waiters3 = [_]futex.Waiter{.{ .word = &bell, .expect = bell.load(.seq_cst) }};
-    _ = engine.parkInRing(0, &waiters3, 2, 200 * std.time.ns_per_ms).?;
+    _ = engine.parkInRing(0, &waiters3, 2, 0, 200 * std.time.ns_per_ms).?;
     try testing.expect(shard.park_armed.load(.acquire));
     try testing.expectEqual(@as(u64, 2), shard.park_epoch);
     const ringer2 = try std.Thread.spawn(.{}, Ringer.run, .{Ringer{ .word = &bell, .delay_ns = 20 * std.time.ns_per_ms }});
     const t2 = clock.monotonicNs();
-    const v3 = engine.parkInRing(0, &waiters3, 2, 2 * std.time.ns_per_s).?;
+    const v3 = engine.parkInRing(0, &waiters3, 2, 0, 2 * std.time.ns_per_s).?;
     ringer2.join();
     try testing.expectEqual(futex.WaitManyVerdict.returned, v3);
     try testing.expect(clock.monotonicNs() - t2 < std.time.ns_per_s);
     try testing.expect(!shard.park_armed.load(.acquire));
+    // The spin half: with the device answered, a park with a window sees
+    // the completion (the TASKRUN flag or the CQE) and drains without an
+    // enter; a stuck read with a doorbell rung inside the window is
+    // absorbed the same way.
+    const absorbed0 = stats.ipc_dd_park_spins_absorbed.load();
     try testing.expectEqual(page.len, linux.write(pipe_fds[1], &page, page.len));
-    _ = engine.parkInRing(0, &waiters3, 2, 2 * std.time.ns_per_s).?;
+    sleepNs(std.time.ns_per_ms);
+    try testing.expectEqual(futex.WaitManyVerdict.returned, engine.parkInRing(0, &waiters3, 2, 100 * std.time.ns_per_ms, 2 * std.time.ns_per_s).?);
+    try testing.expectEqual(absorbed0 + 1, stats.ipc_dd_park_spins_absorbed.load());
     try testing.expectEqual(@as(i64, 4096), slot_core.result(try s.m.slot(5)));
     slot_core.release(try s.m.slot(5));
+    try testing.expectEqual(@as(u32, 0), shard.inflight.load(.monotonic));
+    const r6 = try submitRead(s, 6, 1, 0, 4096);
+    {
+        shard.state.lockUncancelable(testing.io);
+        defer shard.state.unlock(testing.io);
+        const sqe = shard.ring.getSqe().?;
+        shard.free_n -= 1;
+        const idx = shard.free[shard.free_n];
+        uring128.prepRead(sqe, .{ .raw = pipe_fds[0] }, r6.op.window[0..4096], 0);
+        sqe.user_data = idx;
+        shard.slab[idx] = .{ .c = r6.c, .kind = .{ .read = .{ .hook = hook, .s = s, .op = r6.op } }, .len = 4096, .nodeid = 2, .offset = 0, .in_use = true };
+        _ = shard.inflight.fetchAdd(1, .monotonic);
+    }
+    _ = shard.pending_submits.fetchAdd(1, .release);
+    engine.flushLane(0);
+    const waiters4 = [_]futex.Waiter{.{ .word = &bell, .expect = bell.load(.seq_cst) }};
+    const ringer3 = try std.Thread.spawn(.{}, Ringer.run, .{Ringer{ .word = &bell, .delay_ns = 5 * std.time.ns_per_ms }});
+    const t4 = clock.monotonicNs();
+    try testing.expectEqual(futex.WaitManyVerdict.returned, engine.parkInRing(0, &waiters4, 2, 500 * std.time.ns_per_ms, 2 * std.time.ns_per_s).?);
+    ringer3.join();
+    try testing.expect(clock.monotonicNs() - t4 < 400 * std.time.ns_per_ms);
+    try testing.expectEqual(absorbed0 + 2, stats.ipc_dd_park_spins_absorbed.load());
+    try testing.expectEqual(page.len, linux.write(pipe_fds[1], &page, page.len));
+    _ = engine.parkInRing(0, &waiters4, 2, 0, 2 * std.time.ns_per_s).?;
+    try testing.expectEqual(@as(i64, 4096), slot_core.result(try s.m.slot(6)));
+    slot_core.release(try s.m.slot(6));
     try testing.expectEqual(@as(u32, 0), shard.inflight.load(.monotonic));
     // The backstop: an owner that submits on shard 1 and never parks or
     // reaps is drained by `sqz-ipc-dd1` within its cadence.

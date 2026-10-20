@@ -177,6 +177,9 @@ pub const stats = struct {
     /// the CQ drains at their return.
     pub var ipc_dd_ring_parks: counters.ShardedCounter = .{};
     pub var ipc_dd_park_reaps: counters.ShardedCounter = .{};
+    /// Ring parks the spin half absorbed (a CQE or a doorbell inside the
+    /// window: no enter, no wake).
+    pub var ipc_dd_park_spins_absorbed: counters.ShardedCounter = .{};
 
     // ---- coherence (KD-11's residual windows) ----
     pub var ipc_inval_notifies: counters.ShardedCounter = .{};

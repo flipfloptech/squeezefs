@@ -404,7 +404,7 @@ pub const Ring128 = struct {
     /// liburing's `cq_ring_needs_flush`: the kernel parked CQEs in its
     /// overflow list, or (`DEFER_TASKRUN` + `TASKRUN_FLAG`) holds deferred
     /// completions only an enter materialises.
-    fn cqNeedsFlush(self: *Ring128) bool {
+    pub fn cqNeedsFlush(self: *Ring128) bool {
         return self.sqFlags() & (linux.IORING_SQ_CQ_OVERFLOW | linux.IORING_SQ_TASKRUN) != 0;
     }
 

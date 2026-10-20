@@ -117,7 +117,7 @@ pub const Sink = struct {
     ctx: *anyopaque,
     serve: *const fn (ctx: *anyopaque, owner: u16, s: *Session, op: DataOp, c: Completion) void,
     flush: *const fn (ctx: *anyopaque, owner: u16) void,
-    park: *const fn (ctx: *anyopaque, owner: u16, waiters: []const futex.Waiter, epoch: u64, bound_ns: u64) ?futex.WaitManyVerdict,
+    park: *const fn (ctx: *anyopaque, owner: u16, waiters: []const futex.Waiter, epoch: u64, spin_ns: u64, bound_ns: u64) ?futex.WaitManyVerdict,
     inflight: *const fn (ctx: *anyopaque, owner: u16) u32,
 };
 
@@ -282,6 +282,17 @@ pub const Owner = struct {
         return false;
     }
 
+    /// The ring park's spin window: the governor's explicit window
+    /// verbatim; derived, the window the governor would grant this lane
+    /// with the single-session guard lifted (a park with MY ops in flight
+    /// is never the "productive" sync-RTT wait that guard protects — the
+    /// CQE is the next event, and on a RAM-class device it is microseconds
+    /// away) under the same busy ceiling and EWMA rail.
+    fn ringSpinNs(self: *Owner, now: u64) u64 {
+        self.sampleBusy(now);
+        return doorbell.SpinGovernor.windowUs(self.cfg.spin, self.ewma_park_ns, self.busy_pct, self.cfg.lanes, self.cfg.cores, @max(2, @as(u32, @intCast(self.n)))) * std.time.ns_per_us;
+    }
+
     /// `/proc/stat`'s first line → busy %, at most once per second.
     fn sampleBusy(self: *Owner, now: u64) void {
         if (now -| self.busy_sampled_ns < BUSY_SAMPLE_NS) return;
@@ -318,7 +329,7 @@ pub const Owner = struct {
         self.sink.flush(self.sink.ctx, self.cfg.index);
         if (served == 0) {
             // The ring park when my ops are in flight, else the futex park.
-            const verdict = self.sink.park(self.sink.ctx, self.cfg.index, self.park.entries[0..self.park.n], self.epoch_seen, doorbell.SERVICE_PARK_MAX_NS) orelse self.park.wait();
+            const verdict = self.sink.park(self.sink.ctx, self.cfg.index, self.park.entries[0..self.park.n], self.epoch_seen, self.ringSpinNs(t0), doorbell.SERVICE_PARK_MAX_NS) orelse self.park.wait();
             switch (verdict) {
                 .returned => stats.ipc_service_wakes.inc(),
                 .timed_out => stats.ipc_service_park_timeouts.inc(),
@@ -548,10 +559,10 @@ pub const DataPlaneSink = struct {
         return .{ .ctx = self, .serve = &serveFn, .flush = &flushFn, .park = &parkFn, .inflight = &inflightFn };
     }
 
-    fn parkFn(ctx: *anyopaque, owner: u16, waiters: []const futex.Waiter, epoch: u64, bound_ns: u64) ?futex.WaitManyVerdict {
+    fn parkFn(ctx: *anyopaque, owner: u16, waiters: []const futex.Waiter, epoch: u64, spin_ns: u64, bound_ns: u64) ?futex.WaitManyVerdict {
         const self: *DataPlaneSink = @ptrCast(@alignCast(ctx));
         const dd = self.dd orelse return null;
-        return dd.parkInRing(owner, waiters, epoch, bound_ns);
+        return dd.parkInRing(owner, waiters, epoch, spin_ns, bound_ns);
     }
 
     fn inflightFn(ctx: *anyopaque, owner: u16) u32 {
@@ -915,7 +926,7 @@ const StubSink = struct {
         _ = self.flushes.fetchAdd(1, .monotonic);
     }
 
-    fn park(_: *anyopaque, _: u16, _: []const futex.Waiter, _: u64, _: u64) ?futex.WaitManyVerdict {
+    fn park(_: *anyopaque, _: u16, _: []const futex.Waiter, _: u64, _: u64, _: u64) ?futex.WaitManyVerdict {
         return null;
     }
 

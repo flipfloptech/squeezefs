@@ -36,11 +36,13 @@ const assert = std.debug.assert;
 
 const counters = @import("../core/counters.zig");
 const clock = @import("../core/clock.zig");
+const log = @import("../core/log.zig");
 const knobs = @import("../core/knobs.zig");
 const derive = @import("../core/derive.zig");
 const budget = @import("../mem/budget.zig");
 const sync_notify = @import("../sync/notify.zig");
 const router = @import("router.zig");
+const seams = @import("write_seams.zig");
 
 // ---------------------------------------------------------------------------
 // Constants (every one with its WHY; §11.3).
@@ -96,7 +98,11 @@ pub const stats = struct {
     /// An upload a newer write superseded that PUBLISHED its snapshot (the
     /// entry stays parked with the newer pages; decision 0003 §AJ.7).
     pub var write_pipeline_superseded_publishes: counters.ShardedCounter = .{};
+    /// Must-stay-0: an upload's fence drop on a HEALTHY volume. The same
+    /// drop while the volume is FAILED (or a device fenced) is the counted
+    /// `write_pipeline_fence_drops_failed_volume` (owner ruling 2026-10-19).
     pub var write_pipeline_fence_drops: counters.Tripwire = .init("write_pipeline_fence_drops");
+    pub var write_pipeline_fence_drops_failed_volume: counters.ShardedCounter = .{};
     pub var write_pipeline_stay_parked: counters.ShardedCounter = .{};
     pub var write_pipeline_published: counters.ShardedCounter = .{};
     pub var write_pipeline_discards: counters.ShardedCounter = .{};
@@ -116,7 +122,7 @@ pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
     inline for (.{ "write_pipeline_inflight_bytes", "write_pipeline_inflight_blocks", "write_pipeline_depth_target", "write_pipeline_depth_target_base" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, @field(stats, name).load() });
     }
-    inline for (.{ "write_pipeline_admission_waits", "write_pipeline_admission_tick_wakes", "write_pipeline_depth_probe_ups", "write_pipeline_depth_probe_backoffs", "write_pipeline_superseded_publishes", "write_pipeline_stay_parked", "write_pipeline_published", "write_pipeline_discards", "write_pipeline_joins", "write_pipeline_join_waits" }) |name| {
+    inline for (.{ "write_pipeline_admission_waits", "write_pipeline_admission_tick_wakes", "write_pipeline_depth_probe_ups", "write_pipeline_depth_probe_backoffs", "write_pipeline_superseded_publishes", "write_pipeline_stay_parked", "write_pipeline_published", "write_pipeline_discards", "write_pipeline_joins", "write_pipeline_join_waits", "write_pipeline_fence_drops_failed_volume" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, @field(stats, name).load() });
     }
     try w.print("\"write_pipeline_fence_drops\":{d},\"write_pipeline_phase_ns\":{{", .{counters.tripwireCount("write_pipeline_fence_drops")});
@@ -199,7 +205,8 @@ pub const Disposition = enum {
     /// A transient (fencing token expired, a device refusal): the block
     /// stays parked and rides the next pass.
     stay_parked,
-    /// `WriterGuardFenced`: publish nothing, free nothing (must-stay-0).
+    /// `WriterGuardFenced`/`VolumeFailed`: publish nothing, free nothing
+    /// (W5); the must-stay-0 on a HEALTHY volume, counted on a FAILED one.
     fence_drop,
     /// The entry vanished (truncate/unlink) or the ino is gone.
     discarded,
@@ -209,11 +216,17 @@ pub const Disposition = enum {
     joined,
 };
 
-pub fn countDisposition(d: Disposition) void {
+/// ONE count per task; a fence drop is classified on the volume's probe
+/// (`seams.classifyFence`): FAILED/fenced ⇒ counted with one info line,
+/// HEALTHY ⇒ the must-stay-0.
+pub fn countDisposition(d: Disposition, ino: u64, block: u32, fence: ?seams.FenceProbe) void {
     switch (d) {
         .published => stats.write_pipeline_published.inc(),
         .stay_parked => stats.write_pipeline_stay_parked.inc(),
-        .fence_drop => stats.write_pipeline_fence_drops.fire("a pipeline upload met the writer-guard fence"),
+        .fence_drop => switch (seams.classifyFence(fence, &stats.write_pipeline_fence_drops_failed_volume, &stats.write_pipeline_fence_drops, "a pipeline upload met the fence on a HEALTHY volume")) {
+            .failed_volume => log.info("write pipeline ino {d} block {d}: the upload met the fence on a FAILED volume — publishing nothing, freeing nothing", .{ ino, block }),
+            .healthy => log.err("write pipeline ino {d} block {d}: the upload met the fence on a HEALTHY volume — publishing nothing, freeing nothing", .{ ino, block }),
+        },
         .discarded => stats.write_pipeline_discards.inc(),
         .joined => stats.write_pipeline_joins.inc(),
     }
@@ -906,18 +919,40 @@ test "phase_family_is_always_on_with_exact_keys; recording_lands_in_exactly_the_
     try testing.expect(std.mem.indexOf(u8, w.buffered(), "\"total\":") != null);
 }
 
-test "disposition_mapping_is_the_task_counting_contract" {
+test "disposition_mapping_is_the_task_counting_contract; a fence drop is classified on the volume's probe: FAILED counts write_pipeline_fence_drops_failed_volume, HEALTHY fires the must-stay-0" {
+    const S = struct {
+        var latched: Atomic(bool) = .init(false);
+        fn poll(_: ?*anyopaque) bool {
+            return latched.load(.monotonic);
+        }
+    };
+    const probe: seams.FenceProbe = .{ .ctx = null, .poll = &S.poll };
     const pub0 = stats.write_pipeline_published.load();
     const stay0 = stats.write_pipeline_stay_parked.load();
     const disc0 = stats.write_pipeline_discards.load();
     const fence0 = counters.tripwireCount("write_pipeline_fence_drops");
-    countDisposition(.published);
-    countDisposition(.stay_parked);
-    countDisposition(.discarded);
+    const failed0 = stats.write_pipeline_fence_drops_failed_volume.load();
+    countDisposition(.published, 1, 0, probe);
+    countDisposition(.stay_parked, 1, 0, probe);
+    countDisposition(.discarded, 1, 0, probe);
     try testing.expectEqual(pub0 + 1, stats.write_pipeline_published.load());
     try testing.expectEqual(stay0 + 1, stats.write_pipeline_stay_parked.load());
     try testing.expectEqual(disc0 + 1, stats.write_pipeline_discards.load());
     try testing.expectEqual(fence0, counters.tripwireCount("write_pipeline_fence_drops")); // none of the three fires it
+    try testing.expectEqual(failed0, stats.write_pipeline_fence_drops_failed_volume.load());
+    // The fence on a FAILED volume: counted, quiet.
+    S.latched.store(true, .monotonic);
+    countDisposition(.fence_drop, 1, 0, probe);
+    try testing.expectEqual(failed0 + 1, stats.write_pipeline_fence_drops_failed_volume.load());
+    try testing.expectEqual(fence0, counters.tripwireCount("write_pipeline_fence_drops"));
+    // The fence on a HEALTHY volume: the must-stay-0 (its line and the arm's).
+    S.latched.store(false, .monotonic);
+    stats.write_pipeline_fence_drops.resetLogBudgetForTest();
+    log.testing.expectErrorLogs(2);
+    countDisposition(.fence_drop, 1, 0, probe);
+    try log.testing.expectAllFired();
+    try testing.expectEqual(fence0 + 1, counters.tripwireCount("write_pipeline_fence_drops"));
+    try testing.expectEqual(failed0 + 1, stats.write_pipeline_fence_drops_failed_volume.load());
 }
 
 test {

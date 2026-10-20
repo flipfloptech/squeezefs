@@ -1136,6 +1136,9 @@ pub const UploadDeps = struct {
     /// The in-place fold's state half (W1's: custody, the sole-owner
     /// verdict, the fence pair); null = the in-place arm is never taken.
     custody: ?sole_owner_patch.CustodyProbe = null,
+    /// The volume's FAILED/fenced probe an upload's fence drop is
+    /// classified on (`pipeline.countDisposition`); null = healthy.
+    fence: ?seams.FenceProbe = null,
 };
 
 /// The whole plaintext image of `b` into `out` (`image` when bound, else
@@ -1532,7 +1535,7 @@ fn uploadWith(table: *Table, deps: UploadDeps, io: Io, ino: u64, block: u32, cut
     var prof = pipeline.Prof.start();
     const d = uploadParkedBlock(table, deps, io, ino, block, cutoff_ns, &prof);
     prof.finish();
-    pipeline.countDisposition(d);
+    pipeline.countDisposition(d, ino, block, deps.fence);
     return d;
 }
 

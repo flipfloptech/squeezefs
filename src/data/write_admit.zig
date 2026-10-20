@@ -490,6 +490,9 @@ pub const WritePath = struct {
     /// The plaintext whole-block image of a binding (the plane decodes a
     /// transformed frame; null = raw device bytes, an all-passthrough set).
     image: ?seams.ImageSeam,
+    /// The volume's FAILED/fenced probe every fence arm classifies on
+    /// (`seams.classifyFence`): the overlay's, the pipeline's, the epochs'.
+    fence: ?seams.FenceProbe,
 
     pub const Deps = struct {
         /// The mount's `Io` for the slow paths that free parked supply
@@ -512,10 +515,10 @@ pub const WritePath = struct {
         scratch_pool_cap: u32 = 0,
         /// The plaintext image seam (required when any volume is transformed).
         image: ?seams.ImageSeam = null,
-        /// The volume's FAILED latch for the overlay's settle ladder
-        /// (`device_overlay.Deps.fence`).
-        fence: ?*const fn (ctx: ?*anyopaque) bool = null,
-        fence_ctx: ?*anyopaque = null,
+        /// The volume's FAILED latch (the plane's `fencePoll`): the
+        /// overlay's settle ladder ends on it, and every fence drop of the
+        /// write path is classified on it (`seams.classifyFence`).
+        fence: ?seams.FenceProbe = null,
     };
 
     pub fn init(gpa: Allocator, cfg: Config, d: Deps) Allocator.Error!*WritePath {
@@ -550,6 +553,7 @@ pub const WritePath = struct {
             .scratch = null,
             .any_passthrough = passthrough,
             .image = d.image,
+            .fence = d.fence,
         };
         errdefer self.epochs.deinit();
         self.locks = try seams.BlockLocks.init(gpa, seams.BLOCK_LOCK_STRIPES);
@@ -587,7 +591,6 @@ pub const WritePath = struct {
             .ram_custody = &ramCustody,
             .ram_custody_ctx = self,
             .fence = d.fence,
-            .fence_ctx = d.fence_ctx,
             .touched = &touchedStamp,
             .touched_ctx = self,
         }, device_overlay.registryCapacity(cfg.parked_cap, pipeline.capBytes(d.budget_bytes), cfg.block_size));
@@ -617,7 +620,7 @@ pub const WritePath = struct {
     }
 
     pub fn closeSeams(self: *WritePath) epoch_mod.Epochs.CloseSeams {
-        return .{ .map = self.map, .free = self.free, .purge = self.purge };
+        return .{ .map = self.map, .free = self.free, .purge = self.purge, .fence = self.fence };
     }
 
     fn pressureHook(ctx: ?*anyopaque) bool {
@@ -626,7 +629,7 @@ pub const WritePath = struct {
     }
 
     pub fn uploadDeps(self: *WritePath) accumulate.UploadDeps {
-        return .{ .device = self.device, .map = self.map, .free = self.free, .purge = self.purge, .vols = self.vols, .picker = self.picker.picker(), .valve = self.valve, .epochs = &self.epochs, .stripes = self.stripes, .locks = &self.locks, .transform = self.transform, .scratch = self.scratch, .touched = &touchedStamp, .touched_ctx = self, .image = self.image, .custody = .{ .ctx = self, .ram_custody = &epochCustody, .overlay_open = &overlayOpen } };
+        return .{ .device = self.device, .map = self.map, .free = self.free, .purge = self.purge, .vols = self.vols, .picker = self.picker.picker(), .valve = self.valve, .epochs = &self.epochs, .stripes = self.stripes, .locks = &self.locks, .transform = self.transform, .scratch = self.scratch, .touched = &touchedStamp, .touched_ctx = self, .image = self.image, .custody = .{ .ctx = self, .ram_custody = &epochCustody, .overlay_open = &overlayOpen }, .fence = self.fence };
     }
 
     fn touchedStamp(ctx: ?*anyopaque, ino: u64, ordinal: u32) void {
@@ -1323,7 +1326,7 @@ pub const WritePath = struct {
             self.governor.complete(io, p, ord, clock.monotonicNs() -| p.admitted_ns);
         }
         prof.finish();
-        pipeline.countDisposition(d);
+        pipeline.countDisposition(d, ino, block, self.fence);
     }
 
     /// Wait for every detached upload/drain (tests, teardown).

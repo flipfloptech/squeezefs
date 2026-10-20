@@ -57,7 +57,10 @@
 //! every RELEASE of the ino and every write to the block behind it (the
 //! 2026-10-07 wedge: five releases parked on one block's guard, `lock_
 //! ticked_reregisters` climbing, no holder the watchdog could name).
-//! Must-stay-0: `overlay_fence_drops`, `overlay_unpublished_at_fsync`,
+//! Must-stay-0: `overlay_fence_drops` (a fence drop on a HEALTHY volume;
+//! the same drop while the volume is FAILED or a device fenced is the
+//! counted `overlay_fence_drops_failed_volume` — owner ruling 2026-10-19),
+//! `overlay_unpublished_at_fsync`,
 //! `overlay_ack_early_lost`; tripwires `overlay_teardown_nonterminal`,
 //! `overlay_install_race_under_guard`, `overlay_store_superseded_under_
 //! guard`, `overlay_state_word_corrupt` (Q15).
@@ -192,7 +195,10 @@ pub const stats = struct {
     /// COMPLETION'S LAST TOUCH, module doc).
     pub var overlay_teardown_quiesce_waits: counters.ShardedCounter = .{};
     pub var writeback_orphan_discards_overlay: counters.ShardedCounter = .{};
-    // Must-stay-0.
+    /// W5 drops taken while the volume was FAILED (or a device fenced): the
+    /// fail-stop working, never a tripwire (owner ruling 2026-10-19).
+    pub var overlay_fence_drops_failed_volume: counters.ShardedCounter = .{};
+    // Must-stay-0: a fence drop on a HEALTHY volume.
     pub var overlay_fence_drops: counters.Tripwire = .init("overlay_fence_drops");
     pub var overlay_unpublished_at_fsync: counters.Tripwire = .init("overlay_unpublished_at_fsync");
     pub var overlay_ack_early_lost: counters.Tripwire = .init("overlay_ack_early_lost");
@@ -206,7 +212,7 @@ pub const stats = struct {
 
 pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
     try w.print("{{\"overlay_open\":{d},\"overlay_inflight_bytes\":{d},", .{ stats.overlay_open.load(), stats.overlay_inflight_bytes.load() });
-    inline for (.{ "overlay_installs", "overlay_overwrite_installs", "overlay_stores", "overlay_store_bytes", "overlay_overwrite_bytes", "overlay_ack_early_stores", "overlay_ack_early_bytes", "overlay_ack_early_retries", "overlay_short_stores", "overlay_store_fallbacks", "overlay_claim_conflicts", "overlay_governed_stores", "overlay_dma_passthrough_bytes", "overlay_dma_pool_copy_bytes", "overlay_ineligible_sub_cap", "overlay_ineligible_shadow_bound", "overlay_ineligible_range_shared", "overlay_ineligible_ram_custody", "overlay_sub_cap_joins", "overlay_enospc_declines", "overlay_registry_declines", "overlay_unreachable_declines", "overlay_read_serves", "overlay_read_serve_bytes", "overlay_read_gap_serves", "overlay_read_gap_bytes", "overlay_read_drains", "overlay_window_escalations", "overlay_gap_seeds", "overlay_gap_seed_bytes", "overlay_gap_seed_old_bytes", "overlay_gap_seed_ranged_bytes", "overlay_gap_seed_read_bytes", "overlay_publishes", "overlay_published_bytes", "overlay_epoch_feeds", "overlay_epoch_feeds_fresh", "overlay_feed_fallbacks", "overlay_supersessions", "overlay_superseded_by_merge", "overlay_superseded_dead_old_binding", "overlay_settle_retries", "overlay_teardown_waits", "overlay_teardown_quiesce_waits", "writeback_orphan_discards_overlay" }) |name| {
+    inline for (.{ "overlay_installs", "overlay_overwrite_installs", "overlay_stores", "overlay_store_bytes", "overlay_overwrite_bytes", "overlay_ack_early_stores", "overlay_ack_early_bytes", "overlay_ack_early_retries", "overlay_short_stores", "overlay_store_fallbacks", "overlay_claim_conflicts", "overlay_governed_stores", "overlay_dma_passthrough_bytes", "overlay_dma_pool_copy_bytes", "overlay_ineligible_sub_cap", "overlay_ineligible_shadow_bound", "overlay_ineligible_range_shared", "overlay_ineligible_ram_custody", "overlay_sub_cap_joins", "overlay_enospc_declines", "overlay_registry_declines", "overlay_unreachable_declines", "overlay_read_serves", "overlay_read_serve_bytes", "overlay_read_gap_serves", "overlay_read_gap_bytes", "overlay_read_drains", "overlay_window_escalations", "overlay_gap_seeds", "overlay_gap_seed_bytes", "overlay_gap_seed_old_bytes", "overlay_gap_seed_ranged_bytes", "overlay_gap_seed_read_bytes", "overlay_publishes", "overlay_published_bytes", "overlay_epoch_feeds", "overlay_epoch_feeds_fresh", "overlay_feed_fallbacks", "overlay_supersessions", "overlay_superseded_by_merge", "overlay_superseded_dead_old_binding", "overlay_settle_retries", "overlay_teardown_waits", "overlay_teardown_quiesce_waits", "writeback_orphan_discards_overlay", "overlay_fence_drops_failed_volume" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, @field(stats, name).load() });
     }
     inline for (.{ "overlay_fence_drops", "overlay_unpublished_at_fsync", "overlay_ack_early_lost", "overlay_teardown_wait_overlong", "overlay_teardown_nonterminal", "overlay_install_race_under_guard", "overlay_store_superseded_under_guard", "overlay_state_word_corrupt", "overlay_registry_full" }, 0..) |name, i| {
@@ -692,9 +698,9 @@ pub const Deps = struct {
     /// The volume's FAILED latch (the plane's `fencePoll`: the meta set's
     /// `is_failed` or a fenced device). A settle transient on a FAILED
     /// volume can never clear before the remount, so the ladder treats it
-    /// as the fence instead of retrying forever (generic/475).
-    fence: ?*const fn (ctx: ?*anyopaque) bool = null,
-    fence_ctx: ?*anyopaque = null,
+    /// as the fence instead of retrying forever (generic/475); and every
+    /// fence drop is classified on it (`noteFenceDrop`).
+    fence: ?seams.FenceProbe = null,
     /// fsync's touched word (`fsync.TouchedTable.stampOrdinal`, the same
     /// hook the uploads and W1 stamp): the ino touched the dest's
     /// namespace at the settle, so the data barrier before the epoch's
@@ -1082,7 +1088,7 @@ pub const Overlay = struct {
                 return;
             } else |e| switch (e) {
                 error.WriterGuardFenced, error.VolumeFailed => {
-                    stats.overlay_fence_drops.fire("an acked store met the fence before landing");
+                    self.noteFenceDrop(rec.key.ino, rec.key.block, "the acked store", @errorName(e), "an acked store met the fence before landing on a HEALTHY volume");
                     _ = self.finishStore(io, rec, ticket, permit, len, overwrite, false);
                     return;
                 },
@@ -1272,8 +1278,7 @@ pub const Overlay = struct {
                     .fenced => return false,
                     .transient => {
                         if (self.volumeFenced()) {
-                            stats.overlay_fence_drops.fire("an overlay settle's transient met a FAILED volume");
-                            log.err("overlay ino {d} block {d}: settle transient on a FAILED volume (attempt {d}) — publishing nothing, freeing nothing", .{ ino, block, ladder.attempts() + 1 });
+                            self.noteFenceDrop(ino, block, "the settle's transient", "retried while FAILED", "an overlay settle's transient met the fence on a HEALTHY volume");
                             _ = rec.core.fenceDrop();
                             self.teardown(rec);
                             return false;
@@ -1289,21 +1294,32 @@ pub const Overlay = struct {
     }
 
     fn volumeFenced(self: *const Overlay) bool {
-        const poll = self.deps.fence orelse return false;
-        return poll(self.deps.fence_ctx);
+        const p = self.deps.fence orelse return false;
+        return p.poll(p.ctx);
+    }
+
+    /// W5's accounting for one fence drop (publish nothing, free nothing —
+    /// successor recovery owns the dest), classified on the volume's
+    /// state (`seams.classifyFence`): FAILED/fenced ⇒ `overlay_fence_drops_
+    /// failed_volume` and one info line (the latch's own log said why);
+    /// HEALTHY ⇒ the must-stay-0 and the loud line. `leg` names the arm.
+    fn noteFenceDrop(self: *const Overlay, ino: u64, block: u32, leg: []const u8, cause: []const u8, detail: []const u8) void {
+        switch (seams.classifyFence(self.deps.fence, &stats.overlay_fence_drops_failed_volume, &stats.overlay_fence_drops, detail)) {
+            .failed_volume => log.info("overlay ino {d} block {d}: {s} met the fence ({s}) on a FAILED volume — publishing nothing, freeing nothing", .{ ino, block, leg, cause }),
+            .healthy => log.err("overlay ino {d} block {d}: {s} met the fence ({s}) on a HEALTHY volume — publishing nothing, freeing nothing", .{ ino, block, leg, cause }),
+        }
     }
 
     /// The fence class of a device leg (the seed read/write, the flush):
     /// W5 — publish nothing, free nothing (successor recovery owns the
-    /// dest), the record torn down FenceDropped, the must-stay-0 fired.
+    /// dest), the record torn down FenceDropped, the drop classified.
     /// Every other device error is a transient the ladder retries.
     const DeviceLegError = seams.ReadError || seams.DmaError;
 
     fn deviceLegFailed(self: *Overlay, rec: *Record, e: DeviceLegError, leg: []const u8) SettleError {
         switch (e) {
             error.WriterGuardFenced, error.VolumeFailed => {
-                stats.overlay_fence_drops.fire("an overlay settle's device leg met the fence");
-                log.err("overlay ino {d} block {d}: the settle's {s} met the fence ({s}) — publishing nothing, freeing nothing", .{ rec.key.ino, rec.key.block, leg, @errorName(e) });
+                self.noteFenceDrop(rec.key.ino, rec.key.block, leg, @errorName(e), "an overlay settle's device leg met the fence on a HEALTHY volume");
                 _ = rec.core.fenceDrop();
                 self.teardown(rec);
                 return error.WriterGuardFenced;
@@ -1423,7 +1439,7 @@ pub const Overlay = struct {
                     continue;
                 },
                 error.WriterGuardFenced => {
-                    stats.overlay_fence_drops.fire("overlay publish met the writer-guard fence");
+                    self.noteFenceDrop(rec.key.ino, rec.key.block, "the publish", "WriterGuardFenced", "an overlay publish met the writer-guard fence on a HEALTHY volume");
                     _ = rec.core.fenceDrop();
                     self.teardown(rec);
                     return error.WriterGuardFenced;
@@ -1807,8 +1823,7 @@ const TestWorld = struct {
             .epochs = &w.epochs,
             .stripes = &w.stripes,
             .governor = &w.gov,
-            .fence = &fencePoll,
-            .fence_ctx = w,
+            .fence = .{ .ctx = w, .poll = &fencePoll },
         }, cfg_over.registry_capacity);
         return w;
     }
@@ -2219,18 +2234,20 @@ test "the settle's never-lossy and fence arms: a transient leaves the record FRO
     w.ov.drainBlock(io, &w.locks, 62, 0, false, w.cs());
     try testing.expectEqual(dead0 + 1, stats.overlay_superseded_dead_old_binding.load());
     try testing.expectEqual(used - 1, w.f.alloc_a.usedBlocks()); // the dest went back (unpublished_mint_abandons is the design working)
-    // Fence: must-stay-0 fires, nothing published, nothing freed, the dest NOT freed (successor recovery owns it).
+    // Fence on a HEALTHY volume: must-stay-0 fires (the tripwire's line and the arm's), nothing published, nothing freed, the dest NOT freed (successor recovery owns it).
     try w.f.map.create(63, .striped, 0);
     _ = try w.ov.store(io, .{ .ino = 63, .block = 0, .rel = 0, .vehicle = .{ .bytes = &p }, .file = TestWorld.striped(0), .overwrite = false });
     w.f.map.fail_next_merge = error.WriterGuardFenced;
     const merges = w.f.map.merges.items.len;
     const used2 = w.f.alloc_a.usedBlocks();
     const fence0 = counters.tripwireCount("overlay_fence_drops");
+    const failed0 = stats.overlay_fence_drops_failed_volume.load();
     stats.overlay_fence_drops.resetLogBudgetForTest();
-    log.testing.expectErrorLogs(1);
+    log.testing.expectErrorLogs(2);
     w.ov.drainBlock(io, &w.locks, 63, 0, false, w.cs());
     try log.testing.expectAllFired();
     try testing.expectEqual(fence0 + 1, counters.tripwireCount("overlay_fence_drops"));
+    try testing.expectEqual(failed0, stats.overlay_fence_drops_failed_volume.load());
     try testing.expectEqual(merges, w.f.map.merges.items.len);
     try testing.expectEqual(used2, w.f.alloc_a.usedBlocks());
     try testing.expectEqual(@as(u32, 0), w.ov.registry.open_count.load(.monotonic));
@@ -2317,7 +2334,7 @@ test "the settle's backoff never parks under (3): a device that keeps failing th
     try testing.expect(std.mem.allEqual(u8, got[wt.BS / 2 ..], 0));
 }
 
-test "fence immediate on every settle leg: a gap seed or a flush answering VolumeFailed/WriterGuardFenced tears the record down FenceDropped at once — no retry, nothing published, the dest not freed, the must-stay-0 fired" {
+test "fence immediate on every settle leg of a HEALTHY volume: a gap seed or a flush answering VolumeFailed/WriterGuardFenced tears the record down FenceDropped at once — no retry, nothing published, the dest not freed, the must-stay-0 fired, the FAILED-volume counter untouched" {
     const io = testing.io;
     const w = try TestWorld.init(testing.allocator, .{ .shadow = false });
     defer w.deinit(testing.allocator);
@@ -2325,6 +2342,7 @@ test "fence immediate on every settle leg: a gap seed or a flush answering Volum
     pattern(&half, 0x3C);
     var whole: [wt.BS]u8 align(4096) = undefined;
     pattern(&whole, 0x3D);
+    const failed0 = stats.overlay_fence_drops_failed_volume.load();
     // The gap seed meets the fence.
     try w.f.map.create(91, .striped, 0);
     _ = try w.ov.store(io, .{ .ino = 91, .block = 0, .rel = 0, .vehicle = .{ .bytes = &half }, .file = TestWorld.striped(0), .overwrite = false });
@@ -2337,6 +2355,7 @@ test "fence immediate on every settle leg: a gap seed or a flush answering Volum
     w.ov.drainBlock(io, &w.locks, 91, 0, false, w.cs());
     try log.testing.expectAllFired();
     try testing.expectEqual(fence0 + 1, counters.tripwireCount("overlay_fence_drops"));
+    try testing.expectEqual(failed0, stats.overlay_fence_drops_failed_volume.load());
     try testing.expectEqual(retries0, stats.overlay_settle_retries.load());
     try testing.expect(w.f.map.seam().lookup(91, 0) == null);
     try testing.expectEqual(used0, w.f.alloc_a.usedBlocks());
@@ -2353,6 +2372,7 @@ test "fence immediate on every settle leg: a gap seed or a flush answering Volum
     w.ov.drainBlock(io, &w.locks, 92, 0, true, w.cs());
     try log.testing.expectAllFired();
     try testing.expectEqual(fence0 + 1, counters.tripwireCount("overlay_fence_drops"));
+    try testing.expectEqual(failed0, stats.overlay_fence_drops_failed_volume.load());
     try testing.expectEqual(retries0, stats.overlay_settle_retries.load());
     try testing.expect(w.f.map.seam().lookup(92, 0) == null);
     try testing.expectEqual(used0, w.f.alloc_a.usedBlocks());
@@ -2372,7 +2392,7 @@ test "fence immediate on every settle leg: a gap seed or a flush answering Volum
 // frozen record answered EIO on every attempt — a transient the ladder
 // retried forever (attempt 1024 and counting) while the daemon's teardown
 // joined that settler, so `squeezefs umount` never saw it exit.
-test "a transient on a FAILED volume is the fence: a gap seed answering plain EIO while the fence probe says FAILED ends the ladder on that attempt — the record torn down FenceDropped, nothing published, the dest not freed, the must-stay-0 fired, the settler returns" {
+test "a transient on a FAILED volume is the fence: a gap seed answering plain EIO while the fence probe says FAILED ends the ladder on that attempt — the record torn down FenceDropped, nothing published, the dest not freed, the settler returns; the drop is the counted FAILED-volume outcome (no tripwire, no error log)" {
     const io = testing.io;
     const w = try TestWorld.init(testing.allocator, .{ .shadow = false });
     defer w.deinit(testing.allocator);
@@ -2384,20 +2404,83 @@ test "a transient on a FAILED volume is the fence: a gap seed answering plain EI
     w.f.dev.setFailWrites(std.math.maxInt(u32), error.InputOutput);
     w.fenced.store(true, .monotonic);
     const fence0 = counters.tripwireCount("overlay_fence_drops");
+    const failed0 = stats.overlay_fence_drops_failed_volume.load();
     const retries0 = stats.overlay_settle_retries.load();
     const pub0 = stats.overlay_publishes.load();
     const used0 = w.f.alloc_a.usedBlocks();
-    stats.overlay_fence_drops.resetLogBudgetForTest();
-    log.testing.expectErrorLogs(2);
     w.ov.drainBlock(io, &w.locks, 94, 0, false, w.cs());
-    try log.testing.expectAllFired();
-    try testing.expectEqual(fence0 + 1, counters.tripwireCount("overlay_fence_drops"));
+    try testing.expectEqual(fence0, counters.tripwireCount("overlay_fence_drops"));
+    try testing.expectEqual(failed0 + 1, stats.overlay_fence_drops_failed_volume.load());
     // ONE transient (the failing seed) and then the fence verdict: no ladder.
     try testing.expectEqual(retries0 + 1, stats.overlay_settle_retries.load());
     try testing.expectEqual(pub0, stats.overlay_publishes.load());
     try testing.expect(w.f.map.seam().lookup(94, 0) == null);
     try testing.expectEqual(used0, w.f.alloc_a.usedBlocks());
     try testing.expectEqual(@as(u32, 0), w.ov.registry.open_count.load(.monotonic));
+}
+
+// Owner ruling 2026-10-19: a fence taken while the volume is FAILED (or a
+// device fenced) is the fail-stop working — an ordinary counted outcome;
+// the tripwire is for a fence on a HEALTHY volume. Before this the
+// dm-error rows (generic/475, 753, 441, 484) fired `overlay_fence_drops`
+// as a CONSEQUENCE of the latch and the suites harness carried an
+// exception for daemons whose device had answered EIO.
+test "the fence's class on every W5 arm: a gap seed, a flush and a publish answering the fence class while the probe says FAILED each count overlay_fence_drops_failed_volume and leave the must-stay-0 alone (no error log; W5 unchanged — nothing published, the dest not freed); the same gap seed once the probe reads healthy fires the must-stay-0" {
+    const io = testing.io;
+    const w = try TestWorld.init(testing.allocator, .{ .shadow = false });
+    defer w.deinit(testing.allocator);
+    var half: [wt.BS / 2]u8 align(4096) = undefined;
+    pattern(&half, 0x2A);
+    var whole: [wt.BS]u8 align(4096) = undefined;
+    pattern(&whole, 0x2B);
+    w.fenced.store(true, .monotonic);
+    const fence0 = counters.tripwireCount("overlay_fence_drops");
+    var failed0 = stats.overlay_fence_drops_failed_volume.load();
+    // The gap seed's VolumeFailed.
+    try w.f.map.create(95, .striped, 0);
+    _ = try w.ov.store(io, .{ .ino = 95, .block = 0, .rel = 0, .vehicle = .{ .bytes = &half }, .file = TestWorld.striped(0), .overwrite = false });
+    w.f.dev.fail_next = error.VolumeFailed;
+    var used0 = w.f.alloc_a.usedBlocks();
+    w.ov.drainBlock(io, &w.locks, 95, 0, false, w.cs());
+    try testing.expectEqual(failed0 + 1, stats.overlay_fence_drops_failed_volume.load());
+    try testing.expect(w.f.map.seam().lookup(95, 0) == null);
+    try testing.expectEqual(used0, w.f.alloc_a.usedBlocks());
+    // The fsync-class flush's WriterGuardFenced.
+    failed0 = stats.overlay_fence_drops_failed_volume.load();
+    try w.f.map.create(96, .striped, 0);
+    _ = try w.ov.store(io, .{ .ino = 96, .block = 0, .rel = 0, .vehicle = .{ .bytes = &whole }, .file = TestWorld.striped(0), .overwrite = false });
+    w.f.dev.fail_next_flush = error.WriterGuardFenced;
+    used0 = w.f.alloc_a.usedBlocks();
+    w.ov.drainBlock(io, &w.locks, 96, 0, true, w.cs());
+    try testing.expectEqual(failed0 + 1, stats.overlay_fence_drops_failed_volume.load());
+    try testing.expect(w.f.map.seam().lookup(96, 0) == null);
+    try testing.expectEqual(used0, w.f.alloc_a.usedBlocks());
+    // The publish's WriterGuardFenced (the map's commit on a FAILED meta set).
+    failed0 = stats.overlay_fence_drops_failed_volume.load();
+    try w.f.map.create(97, .striped, 0);
+    _ = try w.ov.store(io, .{ .ino = 97, .block = 0, .rel = 0, .vehicle = .{ .bytes = &whole }, .file = TestWorld.striped(0), .overwrite = false });
+    w.f.map.fail_next_merge = error.WriterGuardFenced;
+    const merges = w.f.map.merges.items.len;
+    used0 = w.f.alloc_a.usedBlocks();
+    w.ov.drainBlock(io, &w.locks, 97, 0, false, w.cs());
+    try testing.expectEqual(failed0 + 1, stats.overlay_fence_drops_failed_volume.load());
+    try testing.expectEqual(merges, w.f.map.merges.items.len);
+    try testing.expectEqual(used0, w.f.alloc_a.usedBlocks());
+    try testing.expectEqual(@as(u32, 0), w.ov.registry.open_count.load(.monotonic));
+    // Three fence drops on a FAILED volume: the must-stay-0 never moved.
+    try testing.expectEqual(fence0, counters.tripwireCount("overlay_fence_drops"));
+    // The probe reads healthy: the same gap seed is the tripwire.
+    w.fenced.store(false, .monotonic);
+    failed0 = stats.overlay_fence_drops_failed_volume.load();
+    try w.f.map.create(98, .striped, 0);
+    _ = try w.ov.store(io, .{ .ino = 98, .block = 0, .rel = 0, .vehicle = .{ .bytes = &half }, .file = TestWorld.striped(0), .overwrite = false });
+    w.f.dev.fail_next = error.VolumeFailed;
+    stats.overlay_fence_drops.resetLogBudgetForTest();
+    log.testing.expectErrorLogs(2);
+    w.ov.drainBlock(io, &w.locks, 98, 0, false, w.cs());
+    try log.testing.expectAllFired();
+    try testing.expectEqual(fence0 + 1, counters.tripwireCount("overlay_fence_drops"));
+    try testing.expectEqual(failed0, stats.overlay_fence_drops_failed_volume.load());
 }
 
 test "crash windows OW-1..OW-8 as RAM cases: an unpublished dest is reclaimable by the census (refcount 1, never named by the map), the old image intact; the fed-but-unsaved epoch ≡ OW-1; a swap durable with frees not run leaves a tracked A key the census free-lists; OW-7 durably written ≠ durably named" {

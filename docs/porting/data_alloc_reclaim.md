@@ -734,7 +734,9 @@ Must-stay-0 tripwires (`counters.Tripwire`, per-site label): `block_double_frees
 `block_claim_anomalies` (FC:L6116-6123), `block_key_incarnation_refusals` (a live map named a dead
 lifetime, FC:L6145-6153), `block_key_incarnation_exhausted` (FC:L6168-6172), `block_live_free_
 refusals` (FC:L6104-6115, rung 6), `block_free_reclaim_fence_halts` (0 on healthy mounts — always
-beside `writer_guard_fenced`, FC:L7168-7176), `meta_kv_block_refs_drift` (fsck C8 confirmed +
+beside `writer_guard_fenced`, FC:L7168-7176; **port: a plain counter, not a tripwire — the halt
+fires only when the fence probe reads FAILED/fenced, so it has no healthy arm; owner ruling
+2026-10-19, decision 0002 row 548**), `meta_kv_block_refs_drift` (fsck C8 confirmed +
 quiesced mount verify ONLY, `kv/mod.rs:L519`), `pack_release_untracked_noops` (FC:L5906),
 `unpublished_mint_abandons` (FC:L6821), `reclaim_destroy_refused_release_failed` (growth = a failing
 meta volume, never a leak, FC:L6015-6021), `block_free_reclaim_park_tick_wakes` (≈ 0 while room

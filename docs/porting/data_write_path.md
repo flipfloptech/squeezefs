@@ -1242,10 +1242,18 @@ admission_waits`, `write_pipeline_admission_tick_wakes` (tripwire-class),
 `write_pipeline_phase_ns` (12 histograms); **must-stay-0:** `write_pipeline_fence_drops`
 on a healthy mount.
 
+**Port (owner ruling 2026-10-19, decision 0002 row 548, `rung-10-fence-classification.md`):
+every fence drop is classified on the volume's FAILED/fenced probe (`seams.classifyFence`
+over the plane's `fencePoll`). While the volume is FAILED (or a device fenced) the drop is
+the fail-stop working — counted as `overlay_fence_drops_failed_volume`,
+`write_pipeline_fence_drops_failed_volume`, `rewrite_shadow_fence_drops_failed_volume`,
+one info line each — and the tripwire (`*_fence_drops`) is for a fence on a HEALTHY volume
+only. The suites harness carries no dm-error exception.**
+
 Rewrite epoch: `rewrite_shadow_open_epochs`, `rewrite_shadow_parked_bytes` (gauges),
 `rewrite_shadow_{swaps,bytes,fallbacks,close_retries,superseded,pressure_closes,
 pressure_close_busy}`, `rewrite_{blocks,user_bytes,device_write_bytes}` (the
-`rewrite_amp` SLO); **must-stay-0:** `rewrite_shadow_fence_drops`.
+`rewrite_amp` SLO); **must-stay-0:** `rewrite_shadow_fence_drops` (on a healthy mount).
 
 Writeback: `writeback_queue_{cap,depth}`, `writeback_enqueued_{wt_fallback,drain,
 flush,teardown}`, `writeback_{superseded_noops,stale_token_retries,retry_exhaustions,

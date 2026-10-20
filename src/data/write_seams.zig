@@ -20,6 +20,7 @@ const assert = std.debug.assert;
 
 const counters = @import("../core/counters.zig");
 const clock = @import("../core/clock.zig");
+const log = @import("../core/log.zig");
 const derive = @import("../core/derive.zig");
 const dlm = @import("../meta/dlm.zig");
 const journal = @import("../meta/journal.zig");
@@ -436,6 +437,38 @@ pub const ReclaimFree = struct {
 };
 
 // ---------------------------------------------------------------------------
+// The fence's class.
+// ---------------------------------------------------------------------------
+
+/// The volume's FAILED/fenced probe (the plane's `fencePoll`: the meta
+/// set's `is_failed` or a fenced device) — the reclaimer's type, so every
+/// fence arm of the write path reads the ONE verdict the reclaimer halts on.
+/// Sticky by construction: FAILED never clears before the remount.
+pub const FenceProbe = reclaim.FenceProbe;
+
+pub const FenceClass = enum {
+    /// The fail-stop working: counted, one info line, never a tripwire.
+    failed_volume,
+    /// A fence with no latch behind it: the must-stay-0.
+    healthy,
+};
+
+/// A fence taken by a W5 arm (publish nothing, free nothing), classified
+/// (owner ruling 2026-10-19): while the volume is FAILED or a device is
+/// fenced the fence is the fail-stop's ordinary consequence — `failed`
+/// counts it and the FAILED latch's own log already said why; on a HEALTHY
+/// volume it is a fence nothing explains, and `must_stay_0` fires with
+/// `detail`. A probe-less venue (the RAM fixtures) is healthy.
+pub fn classifyFence(probe: ?FenceProbe, failed: *counters.ShardedCounter, must_stay_0: *counters.Tripwire, detail: []const u8) FenceClass {
+    if (probe) |p| if (p.poll(p.ctx)) {
+        failed.inc();
+        return .failed_volume;
+    };
+    must_stay_0.fire(detail);
+    return .healthy;
+}
+
+// ---------------------------------------------------------------------------
 // Lock level 3: the per-(inode, block) flush lock.
 // ---------------------------------------------------------------------------
 
@@ -578,4 +611,30 @@ test "volumes: ordinal and tag lookups; candidates are the active allocators" {
     var out: [router.MAX_VOLUMES]*block_alloc.BlockAllocator = undefined;
     try testing.expectEqual(@as(usize, 1), v.candidates(&out).len);
     try testing.expectEqual(a, v.candidates(&out)[0]);
+}
+
+test "the fence's class: a probe reading FAILED counts the fence and leaves the must-stay-0 alone; a healthy probe (or none) fires the must-stay-0 and counts nothing" {
+    const S = struct {
+        var failed: counters.ShardedCounter = .{};
+        var tw: counters.Tripwire = .init("write_seams_test_fence_site");
+        var latched: Atomic(bool) = .init(false);
+        fn poll(_: ?*anyopaque) bool {
+            return latched.load(.monotonic);
+        }
+    };
+    const probe: FenceProbe = .{ .ctx = null, .poll = &S.poll };
+    const tw0 = counters.tripwireCount("write_seams_test_fence_site");
+    S.latched.store(true, .monotonic);
+    try testing.expectEqual(FenceClass.failed_volume, classifyFence(probe, &S.failed, &S.tw, "never fired"));
+    try testing.expectEqual(@as(u64, 1), S.failed.load());
+    try testing.expectEqual(tw0, counters.tripwireCount("write_seams_test_fence_site"));
+    S.latched.store(false, .monotonic);
+    S.tw.resetLogBudgetForTest();
+    log.testing.expectErrorLogs(2);
+    try testing.expectEqual(FenceClass.healthy, classifyFence(probe, &S.failed, &S.tw, "a fence on a HEALTHY volume"));
+    S.tw.resetLogBudgetForTest();
+    try testing.expectEqual(FenceClass.healthy, classifyFence(null, &S.failed, &S.tw, "a fence with no probe"));
+    try log.testing.expectAllFired();
+    try testing.expectEqual(@as(u64, 1), S.failed.load());
+    try testing.expectEqual(tw0 + 2, counters.tripwireCount("write_seams_test_fence_site"));
 }

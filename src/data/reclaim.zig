@@ -402,7 +402,10 @@ pub const FreeTarget = struct {
 
 pub const stats = struct {
     pub var block_key_incarnation_refusals: counters.Tripwire = .init("block_key_incarnation_refusals");
-    pub var block_free_reclaim_fence_halts: counters.Tripwire = .init("block_free_reclaim_fence_halts");
+    /// Batches dropped unrun because the fence probe read FAILED/fenced:
+    /// the fail-stop working, so a counter (0 on a healthy mount), never a
+    /// tripwire — the halt has no healthy arm (owner ruling 2026-10-19).
+    pub var block_free_reclaim_fence_halts: counters.ShardedCounter = .{};
     pub var block_free_reclaim_dismount_halts: counters.Tripwire = .init("block_free_reclaim_dismount_halts");
     pub var block_free_reclaim_park_tick_wakes: counters.Tripwire = .init("block_free_reclaim_park_tick_wakes");
     pub var terminal_frees: counters.ShardedCounter = .{};
@@ -439,13 +442,13 @@ pub const stats = struct {
 
 pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
     try w.writeAll("{");
-    inline for (.{ "terminal_frees", "block_free_reclaim_queued", "block_free_reclaim_elided", "block_free_discards", "block_free_discard_bytes", "block_free_file_punches", "block_free_punch_bytes", "block_free_reclaim_skipped", "block_free_reclaim_batches", "block_free_reclaim_commands", "block_free_reclaim_sync_drains", "block_free_reclaim_cap_parks", "block_free_reclaim_cap_overflow", "block_free_reclaim_supply_drains", "block_free_reclaim_deferred_ticks", "block_free_trim_discards", "block_free_trim_bytes", "block_free_debt_pressure_drains", "block_free_debt_drain_passes", "block_free_debt_fruitless_passes" }) |name| {
+    inline for (.{ "terminal_frees", "block_free_reclaim_queued", "block_free_reclaim_elided", "block_free_discards", "block_free_discard_bytes", "block_free_file_punches", "block_free_punch_bytes", "block_free_reclaim_skipped", "block_free_reclaim_batches", "block_free_reclaim_commands", "block_free_reclaim_sync_drains", "block_free_reclaim_cap_parks", "block_free_reclaim_cap_overflow", "block_free_reclaim_supply_drains", "block_free_reclaim_deferred_ticks", "block_free_trim_discards", "block_free_trim_bytes", "block_free_debt_pressure_drains", "block_free_debt_drain_passes", "block_free_debt_fruitless_passes", "block_free_reclaim_fence_halts" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, @field(stats, name).load() });
     }
     inline for (.{ "block_free_reclaim_queue_bytes", "block_free_elided_debt_bytes", "block_free_reclaim_drain_rate", "block_free_reclaim_arrival_rate", "block_free_reclaim_queue_cap", "block_free_reclaim_park_bound_ms", "block_free_debt_drain_rate", "block_free_debt_pace_ms" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, @field(stats, name).load() });
     }
-    inline for (.{ "block_key_incarnation_refusals", "block_free_reclaim_fence_halts", "block_free_reclaim_dismount_halts" }) |name| {
+    inline for (.{ "block_key_incarnation_refusals", "block_free_reclaim_dismount_halts" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, counters.tripwireCount(name) });
     }
     try w.print("\"block_free_reclaim_park_tick_wakes\":{d}}}", .{counters.tripwireCount("block_free_reclaim_park_tick_wakes")});
@@ -863,7 +866,7 @@ pub const Reclaimer = struct {
         const p = self.fence_probe orelse return false;
         if (!p.poll(p.ctx)) return false;
         if (!self.halted.swap(true, .acq_rel)) {
-            log.err("reclaim: the writer guard is FENCED — halting every device reclaim permanently (a fenced zombie never discards; the successor's recovery owns the accounting)", .{});
+            log.err("reclaim: the volume is FAILED or its writer guard FENCED — halting every device reclaim permanently (a fenced zombie never discards; the successor's recovery owns the accounting)", .{});
         }
         return true;
     }
@@ -897,7 +900,8 @@ pub const Reclaimer = struct {
         if (entries.len == 0) return;
         if (self.cfg.test_stall_ms != 0) stallMs(io, self.cfg.test_stall_ms);
         if (self.fenceHalted()) {
-            stats.block_free_reclaim_fence_halts.fire("a reclaim batch met the fence latch");
+            stats.block_free_reclaim_fence_halts.inc();
+            log.info("reclaim: a batch of {d} entries dropped unrun on a FAILED/fenced volume (the successor's recovery owns them)", .{entries.len});
             self.dropUnrun(io, entries);
             return;
         }
@@ -1810,12 +1814,11 @@ test "fenced_guard_halts_worker_batch_reclaims: a fenced batch drops without fin
     };
     Fence.armed = true;
     f.r.setFenceProbe(.{ .ctx = null, .poll = &Fence.poll });
-    const halts = counters.tripwireCount("block_free_reclaim_fence_halts");
-    stats.block_free_reclaim_fence_halts.resetLogBudgetForTest();
-    log.testing.expectErrorLogs(2); // the latch's line + the tripwire's
+    const halts = stats.block_free_reclaim_fence_halts.load();
+    log.testing.expectErrorLogs(1); // the halt latch's one line; the batch's halt is a counted outcome, never a tripwire
     try testing.expectEqual(@as(u64, 2), f.r.drainSync(io));
     try log.testing.expectAllFired();
-    try testing.expectEqual(halts + 1, counters.tripwireCount("block_free_reclaim_fence_halts"));
+    try testing.expectEqual(halts + 1, stats.block_free_reclaim_fence_halts.load());
     try testing.expectEqual(@as(usize, 0), f.rec.commands.items.len);
     try testing.expectEqual(block_alloc.State.limbo, f.alloc.stateOf(1)); // the successor's recovery owns it
     try testing.expect(!f.alloc.inflightContains(1));

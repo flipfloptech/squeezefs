@@ -116,7 +116,10 @@ pub const stats = struct {
     pub var rewrite_blocks: counters.ShardedCounter = .{};
     pub var rewrite_user_bytes: counters.ShardedCounter = .{};
     pub var rewrite_device_write_bytes: counters.ShardedCounter = .{};
-    /// Must-stay-0.
+    /// A close fenced while the volume was FAILED (or a device fenced):
+    /// the fail-stop working, never a tripwire (owner ruling 2026-10-19).
+    pub var rewrite_shadow_fence_drops_failed_volume: counters.ShardedCounter = .{};
+    /// Must-stay-0 (`rewrite_shadow_fence_drops`: a close fenced on a HEALTHY volume).
     pub var rewrite_shadow_fence_drops: counters.Tripwire = .init("rewrite_shadow_fence_drops");
     pub var rewrite_shadow_displaced_drift: counters.Tripwire = .init("rewrite_shadow_displaced_drift");
     pub var rewrite_shadow_save_overflow: counters.Tripwire = .init("rewrite_shadow_save_overflow");
@@ -124,7 +127,7 @@ pub const stats = struct {
 
 pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
     try w.print("{{\"rewrite_shadow_open_epochs\":{d},\"rewrite_shadow_parked_bytes\":{d},", .{ stats.rewrite_shadow_open_epochs.load(), stats.rewrite_shadow_parked_bytes.load() });
-    inline for (.{ "rewrite_shadow_swaps", "rewrite_shadow_bytes", "rewrite_shadow_fallbacks", "rewrite_shadow_fresh_records", "rewrite_shadow_width_hints", "rewrite_shadow_close_retries", "rewrite_shadow_close_waits", "rewrite_shadow_save_waits", "rewrite_shadow_superseded", "rewrite_shadow_pressure_closes", "rewrite_shadow_orphan_discards", "rewrite_shadow_idle_closes", "rewrite_blocks", "rewrite_user_bytes", "rewrite_device_write_bytes" }) |name| {
+    inline for (.{ "rewrite_shadow_swaps", "rewrite_shadow_bytes", "rewrite_shadow_fallbacks", "rewrite_shadow_fresh_records", "rewrite_shadow_width_hints", "rewrite_shadow_close_retries", "rewrite_shadow_close_waits", "rewrite_shadow_save_waits", "rewrite_shadow_superseded", "rewrite_shadow_pressure_closes", "rewrite_shadow_orphan_discards", "rewrite_shadow_idle_closes", "rewrite_blocks", "rewrite_user_bytes", "rewrite_device_write_bytes", "rewrite_shadow_fence_drops_failed_volume" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, @field(stats, name).load() });
     }
     try w.print("\"rewrite_shadow_fence_drops\":{d},\"rewrite_shadow_displaced_drift\":{d},\"rewrite_shadow_save_overflow\":{d}}}", .{ counters.tripwireCount("rewrite_shadow_fence_drops"), counters.tripwireCount("rewrite_shadow_displaced_drift"), counters.tripwireCount("rewrite_shadow_save_overflow") });
@@ -473,6 +476,9 @@ pub const Epochs = struct {
         map: seams.MapSeam,
         free: seams.FreeSeam,
         purge: seams.PurgeSeam,
+        /// The volume's FAILED/fenced probe the close's fence drop is
+        /// classified on (`seams.classifyFence`); null = healthy.
+        fence: ?seams.FenceProbe = null,
     };
 
     /// `close_rewrite_epoch_with`: move the ino's open epoch to `closing`
@@ -610,8 +616,10 @@ pub const Epochs = struct {
                         continue;
                     },
                     error.WriterGuardFenced => {
-                        stats.rewrite_shadow_fence_drops.fire("rewrite epoch close met the writer-guard fence");
-                        log.err("rewrite epoch ino {d}: FENCED at close — {d} shadowed blocks published nothing, {d} parked keys freed nothing (successor recovery owns the accounting)", .{ e.ino, n, e.displaced.items.len });
+                        switch (seams.classifyFence(cs.fence, &stats.rewrite_shadow_fence_drops_failed_volume, &stats.rewrite_shadow_fence_drops, "a rewrite epoch's close met the writer-guard fence on a HEALTHY volume")) {
+                            .failed_volume => log.info("rewrite epoch ino {d}: fenced at close on a FAILED volume — {d} shadowed blocks published nothing, {d} parked keys freed nothing (successor recovery owns the accounting)", .{ e.ino, n, e.displaced.items.len }),
+                            .healthy => log.err("rewrite epoch ino {d}: FENCED at close on a HEALTHY volume — {d} shadowed blocks published nothing, {d} parked keys freed nothing (successor recovery owns the accounting)", .{ e.ino, n, e.displaced.items.len }),
+                        }
                         self.dropEpoch(io, e);
                         return .fence_dropped;
                     },
@@ -879,6 +887,27 @@ test "fenced_close_publishes_nothing_and_frees_nothing; a_process_local_lease_ro
     try testing.expectEqual(frees_fence, f.frees.freed.items.len);
     try testing.expectEqual(merges_fence, f.map.merges.items.len);
     try testing.expect(f.map.seam().lookup(22, 0).?.eql(a2));
+    try testing.expectEqual(fd0 + 1, counters.tripwireCount("rewrite_shadow_fence_drops"));
+    // The same fence while the probe says FAILED: W5 unchanged, counted, no tripwire, no error log.
+    const Latched = struct {
+        fn poll(_: ?*anyopaque) bool {
+            return true;
+        }
+    };
+    const cs_failed: Epochs.CloseSeams = .{ .map = f.map.seam(), .free = f.frees.seam(), .purge = .none, .fence = .{ .ctx = null, .poll = &Latched.poll } };
+    const a4 = try f.publishBlock(24, 0, 0x55);
+    const m4 = try f.alloc_a.allocateBlock();
+    const b4 = Binding.wholeBlock(wt.VOL_A, m4.offset, m4.stamp);
+    _ = try ep.record(24, 0, a4, b4, proofFor(b4, wt.BS), wt.BS, block_alloc.InflightAllocGuard.register(f.alloc_a, m4.idx), true);
+    f.map.fail_next_merge = error.WriterGuardFenced;
+    const frees_failed = f.frees.freed.items.len;
+    const merges_failed = f.map.merges.items.len;
+    const failed0 = stats.rewrite_shadow_fence_drops_failed_volume.load();
+    try testing.expectEqual(CloseOutcome.fence_dropped, ep.close(io, 24, cs_failed));
+    try testing.expectEqual(frees_failed, f.frees.freed.items.len);
+    try testing.expectEqual(merges_failed, f.map.merges.items.len);
+    try testing.expect(f.map.seam().lookup(24, 0).?.eql(a4));
+    try testing.expectEqual(failed0 + 1, stats.rewrite_shadow_fence_drops_failed_volume.load());
     try testing.expectEqual(fd0 + 1, counters.tripwireCount("rewrite_shadow_fence_drops"));
     // A reclaimed ino: the B key is an orphan and is freed; the A key belongs to the destroy.
     const a3 = try f.publishBlock(23, 0, 0x44);

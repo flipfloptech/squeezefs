@@ -413,26 +413,22 @@ pub fn forcedWidth(mode: BufferMode, explicit: ?u32) ?u32 {
 /// ceiling; the executor reserves this many driven lanes per queue).
 pub const MAX_RINGS_PER_QUEUE: u32 = 2;
 
-/// The derived count is ONE ring until the two-ring daemon holds the gate.
-/// 2026-10-19 (`rung-10-workers-per-queue.md`): the train's reds on 039ae68
-/// were pinned elsewhere (the shared-hot-dir row's wait on a killed holder,
-/// logged on green one-ring gates too; the kill matrix's umount2 racing the
-/// kernel's release of the SIGKILLed daemon — waited out now) and the write
-/// row was the thermal throttle (cooled: 0.99×) — but THE KILL MATRIX still
-/// ends 1 in 11 two-ring runs with an fsck `[C4] staging custody orphan`
-/// after the clean unmount (a staged resident of an rm'd ino promoted at
-/// dismount before the reclaim cadence destroyed the corpse), never seen on
-/// one ring. Until that is fixed red-first, two rings stay the A/B lever
-/// `SQUEEZEFS_FUSE_RINGS_PER_QUEUE=2` where the kernel's FEATURES probe reads
-/// `RINGS_PER_QUEUE` present AND the mode pins a ring to one queue (kmbuf/zc);
-/// the session refuses 2 on UserEnts (a ring there already serves a drain
-/// group of queues) and where the probe reads absent (the kernel would accept
-/// the second REGISTER and recycle buffers into the wrong ring).
-/// `rings_feature` keeps the derivation's shape for the flip.
+/// The derived count: `MAX_RINGS_PER_QUEUE` where the kernel's FEATURES
+/// probe reads `RINGS_PER_QUEUE` present (series patch 0030) AND the mode
+/// pins a ring to one queue (kmbuf/zc: the per-ring buffer ring is what the
+/// patch makes per-source); 1 on UserEnts (a ring there already serves a
+/// drain group of queues) and wherever the probe reads absent (the kernel
+/// would accept the second REGISTER and recycle buffers into the wrong ring).
+/// Two rings became the default 2026-10-19 once their three train reds were
+/// pinned (`rung-10-workers-per-queue.md`: the shared-hot-dir row's by-design
+/// wait; the kill matrix's umount2 racing the kernel's release of the
+/// SIGKILLed daemon, waited out; the fsck C4 orphan — a ring record a kill
+/// left between a promotion's commit and its ring release, judged at
+/// dismount since `rung-10-dismount-corpse.md`) and the write row was the
+/// thermal throttle (cooled: 0.99×; reads 1.11× / 1.70× / 1.29×).
 pub fn ringsPerQueue(mode: BufferMode, rings_feature: bool) u32 {
-    _ = rings_feature;
     return switch (mode) {
-        .buf_ring, .zero_copy => 1,
+        .buf_ring, .zero_copy => if (rings_feature) MAX_RINGS_PER_QUEUE else 1,
         .user_ents => 1,
     };
 }
@@ -1014,10 +1010,10 @@ test "drain width = max(n/4, 1); sq entries = max(next_pow2(width × depth + 8),
     try testing.expectEqual(@as(u32, 4096), sqEntries(127, 32));
 }
 
-test "rings per queue: the derived count is 1 until the two-ring daemon holds the gate (2 stays the A/B lever where the probe reads present on kmbuf/zc); explicit wins; the shares split the depth ceil/rest with the queue's depth unchanged and ring 1's base at ring 0's depth" {
+test "rings per queue: 2 where the FEATURES probe reads present on kmbuf/zc, 1 on UserEnts and wherever it reads absent; explicit wins; the shares split the depth ceil/rest with the queue's depth unchanged and ring 1's base at ring 0's depth" {
     try testing.expectEqual(@as(u32, 2), MAX_RINGS_PER_QUEUE);
-    try testing.expectEqual(@as(u32, 1), ringsPerQueue(.zero_copy, true));
-    try testing.expectEqual(@as(u32, 1), ringsPerQueue(.buf_ring, true));
+    try testing.expectEqual(@as(u32, 2), ringsPerQueue(.zero_copy, true));
+    try testing.expectEqual(@as(u32, 2), ringsPerQueue(.buf_ring, true));
     try testing.expectEqual(@as(u32, 1), ringsPerQueue(.user_ents, true));
     try testing.expectEqual(@as(u32, 1), ringsPerQueue(.zero_copy, false));
     try testing.expectEqual(@as(u32, 1), ringsPerQueue(.buf_ring, false));

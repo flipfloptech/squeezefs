@@ -100,7 +100,11 @@ in 7 — THE KILL MATRIX twice, with a `lookup` and a `create` parked > 5 s at t
 station (`stalest_worker_pass_ms` 30 s) and the watchdog's error lines failing the row, and lever (a)'s
 lane-park unit test once — where every one-ring head that day was 3/3. Two rings stay the A/B lever
 `SQUEEZEFS_FUSE_RINGS_PER_QUEUE=2` until the stall and the write row are fixed; then the derivation
-flips back (its shape is kept). The 4k write IOPS gap (≈ 380–430 k vs the 727 k bar) stays open.
+flips back (its shape is kept). **Flipped back the same night**, once the three reds were pinned (next
+section) and the last of them — THE KILL MATRIX's fsck `[C4] staging-custody orphan`, a ring record a
+kill left between a promotion's commit and its ring release — was fixed by the dismount pass judging
+its residents (`rung-10-dismount-corpse.md`; 180 two-ring kill-matrix runs clean after it). The 4k
+write IOPS gap (≈ 380–430 k vs the 727 k bar) stays open.
 
 ## The stall and the kill matrix (2026-10-19, the reds behind the one-ring return)
 

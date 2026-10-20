@@ -521,8 +521,10 @@ pub const Seams = struct {
     slow_reads: std.atomic.Value(u32) = .init(0),
     slow_read_ms: std.atomic.Value(u64) = .init(0),
     /// 1 ⇒ every lane of the device publishes `held = 1` and waits here
-    /// BEFORE its next park (after the pass's disarm + scan + pump), so a
-    /// test can place N publishes between two lane passes. Futex words.
+    /// BEFORE its next park whose pass PUMPED a request (after the pass's
+    /// disarm + scan + pump; an idle pass never holds), so a test can place
+    /// N publishes between two lane passes with the pumped SQEs unsubmitted.
+    /// Futex words.
     hold_before_park: std.atomic.Value(u32) = .init(0),
     held: std.atomic.Value(u32) = .init(0),
     /// Armed count: the next lane pass declares its ring dead (the

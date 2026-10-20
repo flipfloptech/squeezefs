@@ -862,7 +862,7 @@ fn workerPasses(w: *Worker) void {
         }
         if (sealed) w.disconnected = true;
         if (w.disconnected and w.active_count == 0) break;
-        holdIfArmed(&dev.seams);
+        holdIfArmed(&dev.seams, pass_fills);
 
         // THE enter (`ring_park.park`): flushes every SQE pushed this pass
         // (requests + the re-armed wake) and parks for the FIRST event of
@@ -881,9 +881,13 @@ fn workerPasses(w: *Worker) void {
 }
 
 /// The hold seam: park-adjacent, so a test can place N publishes between
-/// two lane passes (`Seams.hold_before_park`).
-fn holdIfArmed(seams: *Seams) void {
-    if (seams.hold_before_park.load(.acquire) == 0) return;
+/// two lane passes (`Seams.hold_before_park`). Only a pass that PUMPED a
+/// request holds: the test arms the seam after an earlier request's
+/// completion woke it, and the idle pass that completion leaves races the
+/// arm — held, it published `held` with nothing in the SQ (the 2026-10-20
+/// gate red: `dev_dma_inflight` read 0 under the hold).
+fn holdIfArmed(seams: *Seams, pass_fills: usize) void {
+    if (pass_fills == 0 or seams.hold_before_park.load(.acquire) == 0) return;
     seams.held.store(1, .release);
     futex.wakeAll(&seams.held);
     while (seams.hold_before_park.load(.acquire) != 0) futex.wait(&seams.hold_before_park, 1);
@@ -2480,15 +2484,11 @@ test "a fiber waiting on a device write parks only itself: a second fiber homed 
     try dev.writeBlock(0, &payload);
     const inflight0 = stats.dev_dma_inflight.load();
 
-    // The lane holds BEFORE its park: the write is pumped into the SQ but
-    // never submitted, so the DMA stays held without a sleep.
+    // The lane holds BEFORE its park, on the pass that pumps the write: the
+    // SQE is in the SQ but never submitted, so the DMA stays held without a
+    // sleep. The seam ignores the idle pass the warm-up's completion leaves,
+    // which races this arm (`holdIfArmed`).
     const seams = &dev.seams;
-    seams.held.store(0, .release);
-    seams.hold_before_park.store(1, .release);
-    defer {
-        seams.hold_before_park.store(0, .release);
-        futex.wakeAll(&seams.hold_before_park);
-    }
     const S = struct {
         fn write(d: *Device, p: *const [4096]u8) DeviceError!void {
             return d.writeBlock(4096, p);
@@ -2502,9 +2502,20 @@ test "a fiber waiting on a device write parks only itself: a second fiber homed 
     const lane = sqz.metaLanes()[0];
     const fiber_parks0 = stats.dev_wait_fiber_parks.load();
     const raw_parks0 = stats.dev_wait_raw_parks.load();
+    seams.held.store(0, .release);
+    seams.hold_before_park.store(1, .release);
     var writer = try sqz.spawnOn(lane, S.write, .{ dev, &payload });
+    // Every exit lifts the hold AND joins the writer (`await` is
+    // idempotent): a fiber left behind would run its write against a
+    // device the deferred `deinit` destroyed.
+    defer {
+        seams.hold_before_park.store(0, .release);
+        futex.wakeAll(&seams.hold_before_park);
+        _ = writer.await(io) catch {};
+    }
     while (seams.held.load(.acquire) == 0) futex.wait(&seams.held, 0);
-    // The DMA is held: one request in flight, its waiter parked as a fiber.
+    // The held pass pumped the write: the gauge rose before its queue push,
+    // and its waiter parks as a fiber.
     try testing.expectEqual(inflight0 + 1, stats.dev_dma_inflight.load());
     while (stats.dev_wait_fiber_parks.load() == fiber_parks0 and stats.dev_wait_raw_parks.load() == raw_parks0) std.atomic.spinLoopHint();
     var ran: futex.Word = .init(0);

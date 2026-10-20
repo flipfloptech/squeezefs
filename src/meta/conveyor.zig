@@ -200,6 +200,18 @@ pub fn windowHoldFor(flush_interval_ms: u64) ?WindowHold {
     return .{ .ceiling_ns = flush_interval_ms * std.time.ns_per_ms };
 }
 
+/// The applier venue's width, `clamp(cpus / 8, 2, 4)` (decision 0003
+/// §AW.3): a fixed set of handler lanes an eighth of the cores wide — the
+/// windows of one hot directory queue on one lane and keep its leaf lock
+/// off the cross-lane handoff; the floor of 2 is the width at which a
+/// window's apply overlaps the next's reservation at all (a lone window
+/// applies inline anyway); the cap of 4 is where the measured gain stopped
+/// (`docs/evidence/rung-10-create-path.md`: four pinned lanes against a
+/// rotation over 32 doubled the apply's CPU on cold caches).
+pub fn applierParallelism(cpus: u32) u32 {
+    return @min(4, @max(2, cpus / 8));
+}
+
 /// The window round-trip estimator (handoff → terminal outcome; `core/rtt.zig`,
 /// RFC 6298 — the hold's deadline is where a round trip stops being a round
 /// trip and starts being a stall), fed on the lane thread at every window's
@@ -3001,6 +3013,15 @@ test "batch caps tie: txs max(64, cpus × 2), bytes max(256 KiB, ring/16) clampe
     try testing.expectEqual(@as(usize, 64), queueCapacity(10));
     try testing.expectEqual(@as(usize, 2048), queueCapacity(2048));
     try testing.expectEqual(@as(usize, 8192), queueCapacity(1 << 20));
+}
+
+test "applier venue width tie: clamp(cpus / 8, 2, 4) — 2 up to 23 cores, 3 at 24, 4 from 32 on" {
+    try testing.expectEqual(@as(u32, 2), applierParallelism(1));
+    try testing.expectEqual(@as(u32, 2), applierParallelism(8));
+    try testing.expectEqual(@as(u32, 2), applierParallelism(23));
+    try testing.expectEqual(@as(u32, 3), applierParallelism(24));
+    try testing.expectEqual(@as(u32, 4), applierParallelism(32));
+    try testing.expectEqual(@as(u32, 4), applierParallelism(256));
 }
 
 test "the error table is the ONE table: every member maps onto a core member with its errno and class" {

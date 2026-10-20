@@ -744,7 +744,7 @@ pub const KvBackend = struct {
             .door = be.slots.doorSeam(),
             .window_hold = conveyor.windowHoldFor(flush_ms),
             .caller = .{ .idle = exec.lane.laneIdleBesidesCaller, .polls = exec.lane.lanePolls },
-            .applier = be.applierSeam(opts.env),
+            .applier = be.applierSeam(opts.env, cpus),
         });
         errdefer be.cv.deinit();
         try be.startPass();
@@ -1123,7 +1123,7 @@ pub const KvBackend = struct {
             .caller = .{ .idle = exec.lane.laneIdleBesidesCaller, .polls = exec.lane.lanePolls },
             .pre_admission = .{ .ctx = &js.park_gate, .wait = joinedPreAdmission },
             .window_hold = conveyor.windowHoldFor(flush_ms),
-            .applier = be.applierSeam(opts.env),
+            .applier = be.applierSeam(opts.env, cpus),
         });
         errdefer be.cv.deinit();
         try be.startPass();
@@ -1558,8 +1558,10 @@ pub const KvBackend = struct {
     /// which the reclaim's destroy batches share: unlinks ran at half speed
     /// with the appliers queued behind them). A refused spawn applies
     /// inline.
-    fn applierSeam(be: *KvBackend, env: *const std.process.Environ.Map) conveyor.ApplySeam {
-        const n = knobs.intKnob("SQUEEZEFS_META_APPLIERS", u32, env);
+    /// The applier venue (decision 0003 §AW.3): `applierParallelism(cpus)`
+    /// handler lanes unless the knob names a width; 0 is the inline arm.
+    fn applierSeam(be: *KvBackend, env: *const std.process.Environ.Map, cpus: u32) conveyor.ApplySeam {
+        const n = knobs.optIntKnob("SQUEEZEFS_META_APPLIERS", u32, env) orelse conveyor.applierParallelism(cpus);
         if (n == 0) return conveyor.inline_applier;
         return .{ .ctx = be, .spawn = &spawnApplier, .parallelism = n };
     }

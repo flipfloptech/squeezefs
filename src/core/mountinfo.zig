@@ -84,6 +84,19 @@ pub fn hasId(text: []const u8, id: u64) bool {
     return entryOf(text, id) != null;
 }
 
+/// Is a mount of this superblock (`major:minor`) attached somewhere? The
+/// anonymous device a FUSE connection takes is reissued once its
+/// superblock dies, so a connection id that is attached again under a
+/// new mount is another connection's.
+pub fn hasDev(text: []const u8, major: u32, minor: u32) bool {
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        const e = parseLine(line) orelse continue;
+        if (e.dev_major == major and e.dev_minor == minor) return true;
+    }
+    return false;
+}
+
 /// The first mount whose parent is `id` (a mount stacked inside it makes
 /// the plain `umount2` of `id` EBUSY).
 pub fn firstChildOf(text: []const u8, id: u64) ?Entry {
@@ -142,13 +155,17 @@ test "entryAt: the exact mountpoint, the last line wins, a prefix is not a match
     try testing.expectEqual(@as(u64, 94), entryAt(shadowed, "/build/tmp/mnt-7").?.id);
 }
 
-test "entryOf, hasId and firstChildOf: the mount by id carries its device; a detached mount's id is gone; the tmpfs under mnt-7 is its child" {
+test "entryOf, hasId, hasDev and firstChildOf: the mount by id carries its device; a detached mount's id is gone; a device is found under any path; the tmpfs under mnt-7 is its child" {
     const m = entryOf(sample, 92).?;
     try testing.expectEqual(@as(u32, 0), m.dev_major);
     try testing.expectEqual(@as(u32, 47), m.dev_minor);
     try testing.expect(entryOf(sample, 9000) == null);
     try testing.expect(hasId(sample, 90));
     try testing.expect(!hasId(sample, 9000));
+    try testing.expect(hasDev(sample, 0, 45));
+    try testing.expect(hasDev(sample, 0, 48));
+    try testing.expect(!hasDev(sample, 0, 49));
+    try testing.expect(!hasDev(sample, 8, 45));
     try testing.expectEqualStrings("/build/tmp/mnt-7/sub", firstChildOf(sample, 90).?.mountpoint);
     try testing.expect(firstChildOf(sample, 91) == null);
 }
@@ -160,6 +177,7 @@ fn lineFuzz(_: void, smith: *std.testing.Smith) !void {
     _ = parseLine(text);
     _ = entryAt(text, "/m");
     _ = hasId(text, 1);
+    _ = hasDev(text, 0, 1);
     _ = firstChildOf(text, 1);
 }
 

@@ -368,6 +368,44 @@ const Watched = struct {
         const t = self.target orelse return .{};
         return holders.census(self.gpa, self.io, t, self.text, &.{ linux.getpid(), daemon_pid }, null);
     }
+
+    /// `census` once the mount LEFT the table (the lazy verdict's holders
+    /// left behind): the kernel reissues a freed mount id to the next
+    /// mount anywhere on the host, so the id is trusted only while no
+    /// ATTACHED mount carries it — a detached mount never returns to the
+    /// table, and its id stays taken while a holder references it, so an
+    /// attached mount under our id means ours is gone with every holder,
+    /// and whatever the census would name is that other mount's.
+    fn censusDetached(self: *const Watched, daemon_pid: linux.pid_t) holders.Census {
+        const t = self.target orelse return .{};
+        if (self.scratch.len == 0) return .{};
+        if (mountinfo.hasId(mountinfo.read(self.io, self.scratch), t.mount_id)) return .{};
+        return self.census(daemon_pid);
+    }
+
+    /// The lazy verdict once the daemon is gone and the mount has left the
+    /// table: did it die with holders still on the detached superblock, or
+    /// did the kernel end its connection first (the orderly exit)? The
+    /// CONNECTION is the fact, not a holder census: a freed mount id is
+    /// reissued to the next mount on the host — to a lazily detached one
+    /// too, which no table shows — so the census named another mount's
+    /// holders and an orderly `umount -l` under the gate's parallel shards
+    /// read "died without unmounting". With fusectl mounted the connection
+    /// lives exactly while `connections/<minor>` stands (the superblock's
+    /// kill removes it, and a superblock with holders is not killed), and
+    /// a reissued minor is an attached mount's (`hasDev`). Without fusectl
+    /// the census stands, guarded by the id's reissue to an attached mount.
+    fn diedWithHolders(self: *const Watched, daemon_pid: linux.pid_t) bool {
+        const t = self.target orelse return false;
+        if (self.scratch.len == 0) return false;
+        var pb: [128]u8 = undefined;
+        if (Io.Dir.cwd().access(self.io, transport.session.fusectl_connections, .{})) |_| {
+            const conn = std.fmt.bufPrint(&pb, "{s}/{d}", .{ transport.session.fusectl_connections, t.dev_minor }) catch return false;
+            Io.Dir.cwd().access(self.io, conn, .{}) catch return false;
+            return !mountinfo.hasDev(mountinfo.read(self.io, self.scratch), t.dev_major, t.dev_minor);
+        } else |_| {}
+        return self.censusDetached(daemon_pid).busy();
+    }
 };
 
 /// Signal the daemon serving `mountpoint` (TERM, or USR2 under `lazy`)
@@ -405,13 +443,13 @@ pub fn signalLocated(gpa: std.mem.Allocator, io: Io, mountpoint: []const u8, laz
             // Detached and gone: the daemon's own unmount, unless it left
             // holders behind on a lazily detached mount (then it died
             // before the kernel ended the connection).
-            if (lazy and watched.census(pid).busy()) return .{ .died = pid };
+            if (lazy and watched.diedWithHolders(pid)) return .{ .died = pid };
             return .{ .exited = pid };
         }
         if (detached) {
             // The census is a /proc walk: at the document cadence, not the
             // liveness quantum.
-            if (lazy and polls % STATS_POLL_EVERY == 0 and watched.census(pid).busy()) return .{ .detached_held = pid };
+            if (lazy and polls % STATS_POLL_EVERY == 0 and watched.censusDetached(pid).busy()) return .{ .detached_held = pid };
         } else if (!lazy and polls % STATS_POLL_EVERY == 0) {
             // Still attached and serving: did the daemon's census refuse?
             if (refusals_before) |before| if (readStats(gpa, io, mountpoint)) |now_text| {

@@ -5807,7 +5807,11 @@ test "smoke: `umount --lazy` of a BUSY mount — the verb returns at once naming
     {
         const r = try rig.squeezefs(&.{ "umount", "-l", rig.mp });
         defer rig.freeRun(r);
-        if (!r.term.success()) std.debug.print("\n--- umount -l (unheld): {f}\n{s}\n", .{ r.term, r.stderr });
+        if (!r.term.success()) {
+            const text = try rig.readLog();
+            defer gpa.free(text);
+            std.debug.print("\n--- umount -l (unheld): {f}\n{s}\n--- the daemon's log since the remount ---\n{s}\n", .{ r.term, r.stderr, text[@min(ready2, text.len)..] });
+        }
         try testing.expect(r.term.success());
     }
     _ = try rig.awaitLog("lazy stop requested (SIGUSR2): unmounting", ready2, 10 * std.time.ns_per_s);
@@ -5817,6 +5821,74 @@ test "smoke: `umount --lazy` of a BUSY mount — the verb returns at once naming
     try testing.expect(std.mem.indexOf(u8, final[ready2..], "clean unmount") != null);
     try testing.expect(std.mem.indexOf(u8, final[ready2..], "detached lazily") == null);
     try expectSupervisorSilent(final[ready2..]);
+    try testing.expectEqual(@as(usize, 0), try fuseMountsOf(gpa, io, rig.mp));
+}
+
+test "smoke: `umount --lazy`'s verdict under MOUNT-ID CHURN — the kernel reissues the mount id the daemon's own unmount frees to the next mount on the host; with every lower id held and a tmpfs mounted and lazily unmounted every few ms behind a 100 ms holder, the freed id lands on a HELD mount inside the verb's poll: the verb still reports the orderly exit (red: `daemon … died without unmounting` on a clean cycle — the gate's parallel shards)" {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    try rig.formatSet(true);
+    try rig.env.put("SQUEEZEFS_TEST_SUPERVISOR_PROBE_MS", "250");
+    var cb: [192]u8 = undefined;
+    const churn_dir = try std.fmt.bufPrint(&cb, "{s}/churn", .{rig.work});
+    try Io.Dir.cwd().createDirPath(io, churn_dir);
+    // The churn (its own session, so one signal to the group ends every
+    // sleep): a tmpfs mounted, lazily unmounted at once behind a 300 s
+    // holder (a sleep's cwd — no id it takes is freed during the row),
+    // back to back while the id it gets is a HOLE below the frontier
+    // (every id the host frees, ours among them, is taken within one
+    // iteration), and every 10 ms once at the frontier. The row's FUSE
+    // mount is made once the holes are filled, so the id its unmount frees
+    // is a hole: the next churn mount's, held for the rest of the row.
+    var script: [1024]u8 = undefined;
+    const churn_script = try std.fmt.bufPrint(&script, "d={s}; F=$(awk '{{ if ($1 + 0 > m) m = $1 + 0 }} END {{ print m }}' /proc/self/mountinfo); k=0; ready=0; while [ ! -e {s}/stop ]; do mount -t tmpfs none $d 2>/dev/null || {{ sleep 0.01; continue; }}; id=$(awk -v mp=$d '$5 == mp {{ i = $1 }} END {{ print i }}' /proc/self/mountinfo); (cd $d && sleep 300) & umount -l $d 2>/dev/null; k=$((k+1)); [ $k -gt 20000 ] && exit 3; if [ \"$id\" -gt \"$F\" ]; then F=$id; [ $ready = 1 ] || {{ ready=1; touch {s}/churn-ready; }}; sleep 0.01; fi; done; exit 0", .{ churn_dir, rig.work, rig.work });
+    var churn = try std.process.spawn(io, .{ .argv = &.{ "setsid", "sh", "-c", churn_script }, .cwd = .{ .path = rig.work }, .environ_map = &rig.env, .stdin = .ignore, .stdout = .ignore, .stderr = .inherit });
+    const churn_pid = churn.id.?;
+    var stop_buf: [192]u8 = undefined;
+    const stop_path = try std.fmt.bufPrint(&stop_buf, "{s}/stop", .{rig.work});
+    defer {
+        Io.Dir.cwd().writeFile(io, .{ .sub_path = stop_path, .data = "" }) catch {};
+        _ = linux.kill(-churn_pid, .TERM);
+        _ = churn.wait(io) catch {};
+        var zb: [192:0]u8 = undefined;
+        if (std.fmt.bufPrintSentinel(&zb, "{s}", .{churn_dir}, 0)) |z| {
+            _ = linux.umount2(z.ptr, linux.MNT.DETACH);
+        } else |_| {}
+    }
+    var ready_buf: [192]u8 = undefined;
+    const ready_path = try std.fmt.bufPrint(&ready_buf, "{s}/churn-ready", .{rig.work});
+    {
+        const t0 = clock.monotonicNs();
+        while (true) {
+            if (Io.Dir.cwd().access(io, ready_path, .{})) |_| break else |_| {}
+            if (clock.monotonicNs() - t0 > 60 * std.time.ns_per_s) return error.ChurnNotReady;
+            try std.Thread.yield();
+        }
+    }
+    {
+        const r = try rig.squeezefs(&.{ "mount", "--daemon", "--supervise", "--log-file", rig.log_path, rig.meta_uri, rig.mp });
+        defer rig.freeRun(r);
+        try testing.expect(r.term.success());
+    }
+    const ready = try rig.awaitReady(0);
+    {
+        const r = try rig.squeezefs(&.{ "umount", "-l", rig.mp });
+        defer rig.freeRun(r);
+        if (!r.term.success()) {
+            const text = try rig.readLog();
+            defer gpa.free(text);
+            std.debug.print("\n--- umount -l under mount-id churn: {f}\n{s}\n--- the daemon's log ---\n{s}\n", .{ r.term, r.stderr, text[@min(ready, text.len)..] });
+        }
+        try testing.expect(r.term.success());
+        try testing.expect(std.mem.indexOf(u8, r.stderr, "died") == null);
+    }
+    _ = try rig.awaitLog("exited (wait status 0x0); done", ready, 20 * std.time.ns_per_s);
+    const final = try rig.readLog();
+    defer gpa.free(final);
+    try testing.expect(std.mem.indexOf(u8, final[ready..], "clean unmount") != null);
     try testing.expectEqual(@as(usize, 0), try fuseMountsOf(gpa, io, rig.mp));
 }
 

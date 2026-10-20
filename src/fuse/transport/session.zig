@@ -1881,10 +1881,16 @@ pub const Session = struct {
     }
 
     /// Is the mount at our path still the one we made? An unreadable table
-    /// (no procfs) answers yes: the path is then the only fact there is.
+    /// (no procfs, no buffer for it) answers yes: the path is then the only
+    /// fact there is — a "no" here skips the daemon's own unmount and
+    /// leaves a dead connection in the table.
     fn stillOurs(self: *Session) bool {
         const want = self.mount_id orelse return true;
-        const e = self.mountEntry() orelse return false;
+        const buf = self.gpa.alloc(u8, mountinfo.READ_BYTES) catch return true;
+        defer self.gpa.free(buf);
+        const text = mountinfo.read(self.io, buf);
+        if (text.len == 0) return true;
+        const e = mountinfo.entryAt(text, self.mountpoint) orelse return false;
         return e.id == want;
     }
 

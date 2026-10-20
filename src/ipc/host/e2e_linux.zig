@@ -423,8 +423,9 @@ test "smoke: THE INTERCEPTION HOST — format → mount -o interception → the 
     while (clock.monotonicNs() < stream_stale_at) sleepMs(50);
 
     // 3. Reads on the sync fast path. A cold ALIGNED ring read is the
-    //    handler's dest lease: a ranged DMA straight into the arena (zero
-    //    daemon copies, never published — demoted, not warmed, no ghost
+    //    direct-drive READ: the leg the ladder resolved DMAs straight into
+    //    the arena on the service thread's own shard (zero daemon copies,
+    //    no lane handoff, never published — demoted, not warmed, no ghost
     //    touch); a cold UNALIGNED read is a RANGED window too (decision
     //    0003 §K2: every strictly sub-block random read — the 256 KiB
     //    ceiling that sent it to the whole-block walk was the read-LRU's
@@ -435,11 +436,16 @@ test "smoke: THE INTERCEPTION HOST — format → mount -o interception → the 
     const rbuf = try gpa.alloc(u8, 512 * 1024 + 100);
     defer gpa.free(rbuf);
     const demotes0 = try rig.stat("ipc_fast_path_miss_demotions");
-    const dma0 = try rig.stat("read_dest_dma_bytes");
+    const dd_reads0 = try rig.stat("ipc_dd_read_serves");
+    const dma0 = try rig.stat("ipc_read_arena_dma_bytes");
+    const handoffs0 = try rig.stat("ipc_read_handoffs");
     const esc0 = try rig.stat("ranged_read_ghost_escalations");
     try testing.expectEqual(@as(usize, 512 * 1024), try served(s.pread(b.id, rbuf[0 .. 512 * 1024], 1 * MiB)));
     try expectPattern(rbuf[0 .. 512 * 1024], 1 * MiB);
-    try testing.expect((try rig.stat("read_dest_dma_bytes")) >= dma0 + 512 * 1024);
+    try testing.expectEqual(dd_reads0 + 1, try rig.stat("ipc_dd_read_serves"));
+    try testing.expectEqual(dma0 + 512 * 1024, try rig.stat("ipc_read_arena_dma_bytes"));
+    try testing.expectEqual(handoffs0, try rig.stat("ipc_read_handoffs"));
+    try testing.expectEqual(@as(u64, 0), try rig.stat("ipc_dd_read_fallbacks_post"));
     try testing.expectEqual(rbuf.len, try served(s.pread(b.id, rbuf, 1 * MiB + 100)));
     try expectPattern(rbuf, 1 * MiB + 100);
     try testing.expectEqual(demotes0 + 2, try rig.stat("ipc_fast_path_miss_demotions"));

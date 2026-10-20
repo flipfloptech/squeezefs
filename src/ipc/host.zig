@@ -248,6 +248,7 @@ pub const IpcHost = struct {
             n_fds += 1;
         }
         const direct_write = knobs.boolKnob("SQUEEZEFS_IL_DIRECT_WRITE", d.env);
+        const direct_read = knobs.boolKnob("SQUEEZEFS_IL_DIRECT_READ", d.env);
         if (n_fds != 0) {
             const owned_fds = try gpa.dupe(linux.fd_t, fds[0..n_fds]);
             errdefer gpa.free(owned_fds);
@@ -274,11 +275,13 @@ pub const IpcHost = struct {
             .inval = &self.inval,
             .dd = self.dd,
             .direct_write = direct_write,
+            .direct_read = direct_read,
             .max_file_size = d.max_file_size,
             .owners = ceiling,
             .drain_budget = geometry.slots,
         });
         errdefer self.sink.deinit();
+        if (self.dd) |dd| dd.read_fallback = self.sink.readFallback();
         // The owners (threads spawn on admission).
         self.owners = try gpa.alloc(*service.Owner, ceiling);
         errdefer gpa.free(self.owners);

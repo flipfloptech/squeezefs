@@ -74,6 +74,20 @@
 //! (`abortDirectWrite`) and the write takes the sever → handoff path with
 //! its clause counted.
 //!
+//! THE DIRECT-DRIVE READ (§4.2; `SQUEEZEFS_IL_DIRECT_READ`): a ring read
+//! every tier missed paid a lane handoff — a fiber spawn, a lane wake and
+//! the FULL read handler per cold 4 KiB read — where the FUSE worker
+//! bridges the same block as `READ_FIXED(fd → slot)` on its own ring with
+//! no lane at all (the whole 4k randread row of
+//! `rung-10-localfs-comparison.md` is direct legs). Here the leg the warm
+//! ladder resolved (`WarmLadder.resolveDirectLeg`: cold ∧ passthrough ∧
+//! 4 KiB-aligned ∧ single block ∧ no write-side custody, the incarnation
+//! snapshot taken BEFORE the DMA) becomes ONE `READ` SQE on MY shard with
+//! the arena window as the destination — zero daemon copies — and the CQE
+//! runs the leg's recheck (incarnation still ∧ the map still binds; charter
+//! §6.3's validation after the bytes are in hand): valid ⇒ the ACK; else
+//! the handler re-serves the op through the ordinary read handoff.
+//!
 //! Completion ordering: none is promised across ops — a slot completes
 //! when ITS CQE is drained, the shard CQ is consumed in CQE order by
 //! whichever consumer holds `cq_gate`; within one op the postlude precedes
@@ -96,6 +110,7 @@ const thread_name = @import("../../core/thread_name.zig");
 const knobs = @import("../../core/knobs.zig");
 const uring128 = @import("../../io/uring128.zig");
 const open_table = @import("../../fuse/handler/open_table.zig");
+const fsv = @import("../../fuse/transport/filesystem_vtable.zig");
 const write_admit = @import("../../data/write_admit.zig");
 const seams = @import("../../data/write_seams.zig");
 const session_mod = @import("session.zig");
@@ -152,16 +167,35 @@ pub const Config = struct {
     }
 };
 
-/// One in-flight write.
+/// One in-flight op.
 const Pending = struct {
     c: Completion,
-    direct: write_admit.WritePath.DirectBegun,
-    /// The bounce source (the unaligned leg); null = the arena itself.
-    slab: ?severed_pool.Slab,
+    kind: union(enum) {
+        write: struct {
+            direct: write_admit.WritePath.DirectBegun,
+            /// The bounce source (the unaligned leg); null = the arena itself.
+            slab: ?severed_pool.Slab,
+        },
+        read: struct {
+            /// The leg's post-DMA recheck (`warm_ladder.directLegRecheck`).
+            hook: fsv.CompletionHook,
+            /// The op as dequeued: the fallback's handoff re-runs the FULL
+            /// handler from it.
+            s: *Session,
+            op: DataOp,
+        },
+    },
     len: u32,
     nodeid: u64,
     offset: u64,
     in_use: bool,
+};
+
+/// The sink's read handoff, for a direct read whose recheck failed: the
+/// handler owns the truth (never lossy, never fabricating).
+pub const ReadFallback = struct {
+    ctx: *anyopaque,
+    call: *const fn (ctx: *anyopaque, s: *Session, op: DataOp, c: Completion) void,
 };
 
 pub const Shard = struct {
@@ -281,7 +315,10 @@ pub const Shard = struct {
                 };
                 if (!counted) reaps.inc();
                 counted = true;
-                self.engine.finishWrite(p, cqe.res);
+                switch (p.kind) {
+                    .write => self.engine.finishWrite(p, cqe.res),
+                    .read => self.engine.finishRead(p, cqe.res),
+                }
             }
         }
     }
@@ -340,7 +377,10 @@ pub const Shard = struct {
             leaked += 1;
             // The guard back with the word re-stabilized; the client -EIO;
             // the mapping share stays out for the process's life.
-            self.engine.wp.abortDirectWrite(self.engine.io, p.direct);
+            switch (p.kind) {
+                .write => |w| self.engine.wp.abortDirectWrite(self.engine.io, w.direct),
+                .read => {},
+            }
             const slot = p.c.session.m.slot(p.c.slot_index) catch unreachable;
             _ = p.c.session.inflight.fetchSub(1, .monotonic);
             @import("../slot_core.zig").completeAndWake(slot, -@as(i64, @backingInt(linux.E.IO)));
@@ -366,6 +406,8 @@ pub const Engine = struct {
     latch: bool,
     shards: []Shard,
     stop: Atomic(bool) = .init(false),
+    /// Set by the sink before `start` (the sink is built after the engine).
+    read_fallback: ?ReadFallback = null,
 
     pub const Deps = struct {
         io: Io,
@@ -497,11 +539,84 @@ pub const Engine = struct {
             const file: uring128.File = if (self.fixed_files) .{ .fixed = vol.ordinal } else .{ .raw = self.vol_fds[vol.ordinal] };
             uring128.prepWrite(sqe, file, src, d.begun.dest);
             sqe.user_data = idx;
-            shard.slab[idx] = .{ .c = c, .direct = d, .slab = slab, .len = len, .nodeid = op.binding.ino, .offset = op.desc.offset, .in_use = true };
+            shard.slab[idx] = .{ .c = c, .kind = .{ .write = .{ .direct = d, .slab = slab } }, .len = len, .nodeid = op.binding.ino, .offset = op.desc.offset, .in_use = true };
             _ = shard.inflight.fetchAdd(1, .monotonic);
         }
         _ = shard.pending_submits.fetchAdd(1, .release);
         return true;
+    }
+
+    /// The direct-drive READ (spec §4.2; `SQUEEZEFS_IL_DIRECT_READ`): the
+    /// leg the warm ladder resolved after every tier missed — `{fd, off,
+    /// len}` of a cold, passthrough, 4 KiB-aligned single-block window —
+    /// becomes ONE `READ` SQE on MY shard with the arena window as the DMA
+    /// destination (the ladder validated the window against the arena;
+    /// `len == op.desc.len` by the leg's contract). The CQE runs the leg's
+    /// recheck (incarnation ∧ binding, after the bytes are in hand) and
+    /// completes `len`, or hands the op to the handler. True = taken;
+    /// false = refused before any DMA (no slab entry / no SQE), counted —
+    /// the caller hands off as if no leg had been offered.
+    pub fn tryDirectRead(self: *Engine, owner: u16, s: *Session, op: DataOp, leg: fsv.DirectLeg, c: Completion) bool {
+        const hook = leg.hook orelse return false;
+        if (leg.len != op.desc.len or leg.len > op.window.len) return false;
+        // The arena page is the DMA destination only on the device grain.
+        if (@intFromPtr(op.window.ptr) % DMA_ALIGN != 0) return false;
+        // The leg names a raw device fd; the shard registered the same
+        // table at init, so the fixed index is the fd's ordinal.
+        const file: uring128.File = blk: {
+            if (self.fixed_files) for (self.vol_fds, 0..) |fd, i| {
+                if (fd == leg.fd) break :blk .{ .fixed = @intCast(i) };
+            };
+            break :blk .{ .raw = leg.fd };
+        };
+        const shard = self.shardOf(owner);
+        {
+            shard.state.lockUncancelable(self.io);
+            defer shard.state.unlock(self.io);
+            if (shard.free_n == 0) {
+                stats.ipc_dd_read_refusals.inc();
+                return false;
+            }
+            const sqe = shard.ring.getSqe() orelse blk: {
+                shard.submitLocked();
+                break :blk shard.ring.getSqe() orelse {
+                    stats.ipc_dd_read_refusals.inc();
+                    return false;
+                };
+            };
+            shard.free_n -= 1;
+            const idx = shard.free[shard.free_n];
+            uring128.prepRead(sqe, file, op.window[0..leg.len], leg.off);
+            sqe.user_data = idx;
+            shard.slab[idx] = .{ .c = c, .kind = .{ .read = .{ .hook = hook, .s = s, .op = op } }, .len = leg.len, .nodeid = op.binding.ino, .offset = op.desc.offset, .in_use = true };
+            _ = shard.inflight.fetchAdd(1, .monotonic);
+        }
+        _ = shard.pending_submits.fetchAdd(1, .release);
+        return true;
+    }
+
+    /// The read's CQE postlude: exact ∧ the recheck holds ⇒ the bytes in the
+    /// arena are the block's, the ACK; else the handler re-serves the op
+    /// (the window is rewritten in full: a torn DMA is never surfaced).
+    fn finishRead(self: *Engine, p: Pending, res: i32) void {
+        const r = p.kind.read;
+        const exact = res == @as(i32, @intCast(p.len));
+        if (r.hook.run(exact)) {
+            stats.ipc_dd_read_serves.inc();
+            stats.ipc_dd_read_bytes.add(p.len);
+            stats.ipc_read_arena_dma_bytes.add(p.len);
+            stats.ipc_ops_read.inc();
+            stats.ipc_bytes_out.add(p.len);
+            p.c.complete(@intCast(p.len));
+            return;
+        }
+        stats.ipc_dd_read_fallbacks_post.inc();
+        const fb = self.read_fallback orelse {
+            // No handler to fall back to (a lab): the client's EIO.
+            p.c.fail(.IO);
+            return;
+        };
+        fb.call(fb.ctx, r.s, r.op, p.c);
     }
 
     /// No slab entry or no SQE: the guard back, the handoff path.
@@ -516,8 +631,9 @@ pub const Engine = struct {
     /// The CQE postlude (module doc): exact ⇒ the patch's postlude, the
     /// ledger, the ACK, the invalidation; short or failed ⇒ the EIO law.
     fn finishWrite(self: *Engine, p: Pending, res: i32) void {
+        const w = p.kind.write;
         const dma: seams.DmaError!void = if (res == @as(i32, @intCast(p.len))) {} else error.InputOutput;
-        if (self.wp.finishDirectWrite(self.io, p.direct, dma)) {
+        if (self.wp.finishDirectWrite(self.io, w.direct, dma)) {
             stats.ipc_dd_inline_serves.inc();
             stats.ipc_dd_write_bytes.add(p.len);
             stats.ipc_ops_write.inc();
@@ -530,7 +646,7 @@ pub const Engine = struct {
             stats.ipc_dd_write_dma_errors.inc();
             p.c.fail(errors.toErrno(e));
         }
-        if (p.slab) |sl| self.pool.put(sl);
+        if (w.slab) |sl| self.pool.put(sl);
     }
 
     pub fn inflightTotal(self: *Engine) u32 {
@@ -732,5 +848,122 @@ test "the dd lane: a W1-shaped 4 KiB overwrite serves INLINE — one SQE on the 
     try testing.expectEqual(reaper0 + 1, stats.ipc_dd_reaper_reaps.load());
     try lab.readBack(b.offset + 7 * 4096, &back);
     for (back) |v| try testing.expectEqual(@as(u8, 0x99), v);
+    try testing.expectEqual(@as(u32, 0), engine.inflightTotal());
+}
+
+fn submitRead(s: *Session, idx: u32, binding: u64, offset: u64, len: u32) !struct { op: DataOp, c: Completion, gen: u64 } {
+    const slot = try s.m.slot(idx);
+    const gen = slot_core.tryClaim(slot).?;
+    const window = try s.m.slotWindow(idx);
+    @memset(window[0..len], 0);
+    slot_core.publishDescriptor(slot, .{ .op = .read, .binding = binding, .offset = offset, .len = len, .arena_off = @as(u64, idx) * s.layout.slab });
+    slot_core.publishSubmitted(slot);
+    try testing.expect(slot_core.tryBeginServe(slot));
+    try testing.expect(s.beginInflight());
+    s.map.retain();
+    const desc = slot_core.snapshot(slot);
+    return .{ .op = .{ .op = .read, .desc = desc, .binding = s.binding(binding).?.*, .t0_ns = clock.monotonicNs(), .window = window[0..len] }, .c = .{ .session = s, .slot_index = idx, .latch = true }, .gen = gen };
+}
+
+/// The lab's leg recheck: records every call and answers what the test armed.
+const RecheckProbe = struct {
+    var calls: u32 = 0;
+    var last_ok: bool = false;
+    var verdict: bool = true;
+
+    fn call(_: ?*anyopaque, _: *const [6]u64, ok: bool) bool {
+        calls += 1;
+        last_ok = ok;
+        return verdict and ok;
+    }
+};
+
+/// The lab's read fallback: completes the op with a sentinel length.
+const FallbackProbe = struct {
+    var calls: u32 = 0;
+
+    fn call(_: *anyopaque, _: *Session, _: DataOp, c: Completion) void {
+        calls += 1;
+        c.complete(7);
+    }
+};
+
+test "the dd lane's READ: the leg the ladder resolved becomes one READ SQE on the owner's shard with the arena window as the DMA destination — the device bytes land in the slot, the recheck runs with the bytes in hand, the client gets DONE(len); a failed recheck hands the op to the read fallback (nothing fabricated), and without a fallback the client reads -EIO" {
+    const gpa = testing.allocator;
+    const lab = try Lab.init(gpa);
+    defer lab.deinit(gpa);
+    const fds = [_]linux.fd_t{lab.fd};
+    const engine = try Engine.init(gpa, .{ .io = testing.io, .wp = lab.wp, .vols = &lab.f.vols, .vol_fds = &fds, .pool = &lab.pool, .inval = &lab.inval, .opens = null, .cfg = .{ .shards = 2, .coop_taskrun = true, .lane_flush = true, .inline_reap = true }, .latch = true });
+    defer engine.deinit();
+    try engine.start();
+    var ts = try session_mod.TestSession.init(gpa, lab_geometry);
+    defer ts.deinit();
+    const s = ts.s;
+    _ = s.bind(.{ .ino = 2, .rights = .{ .read = true, .write = true, .odirect = true } }, false, .mount).?;
+    const b = try lab.f.publishBlock(2, 0, 0xAA);
+    // Page 5 of the block carries its own pattern on the "device".
+    var img: [wt.BS]u8 = @splat(0xAA);
+    @memset(img[5 * 4096 ..][0..4096], 0x5A);
+    try testing.expectEqual(@as(usize, wt.BS), linux.pwrite(lab.fd, &img, img.len, @intCast(b.offset)));
+    const serves0 = stats.ipc_dd_read_serves.load();
+    const ops0 = stats.ipc_ops_read.load();
+    const dma0 = stats.ipc_read_arena_dma_bytes.load();
+    RecheckProbe.calls = 0;
+    RecheckProbe.verdict = true;
+    const hook: fsv.CompletionHook = .{ .ctx = null, .token = .{ 2, 0, 0, 0, 0, 0 }, .call = &RecheckProbe.call };
+    const r = try submitRead(s, 1, 1, 5 * 4096, 4096);
+    try testing.expect(engine.tryDirectRead(0, s, r.op, .{ .fd = lab.fd, .off = b.offset + 5 * 4096, .len = 4096, .hook = hook }, r.c));
+    try testing.expectEqual(@as(u32, 1), engine.shards[0].inflight.load(.monotonic));
+    const deadline = clock.monotonicNs() + 5 * std.time.ns_per_s;
+    while (!slot_core.isDoneFor(try s.m.slot(1), r.gen) and clock.monotonicNs() < deadline) {
+        engine.flushLane(0);
+        sleepNs(100 * std.time.ns_per_us);
+    }
+    try testing.expectEqual(@as(i64, 4096), slot_core.result(try s.m.slot(1)));
+    try testing.expectEqual(@as(u32, 1), RecheckProbe.calls);
+    try testing.expect(RecheckProbe.last_ok);
+    for (r.op.window[0..4096]) |v| try testing.expectEqual(@as(u8, 0x5A), v);
+    slot_core.release(try s.m.slot(1));
+    try testing.expectEqual(serves0 + 1, stats.ipc_dd_read_serves.load());
+    try testing.expectEqual(ops0 + 1, stats.ipc_ops_read.load());
+    try testing.expectEqual(dma0 + 4096, stats.ipc_read_arena_dma_bytes.load());
+    try testing.expectEqual(@as(u32, 0), s.inflight.load(.monotonic));
+    // A moved block: the recheck refuses, the fallback owns the op.
+    const post0 = stats.ipc_dd_read_fallbacks_post.load();
+    RecheckProbe.verdict = false;
+    FallbackProbe.calls = 0;
+    engine.read_fallback = .{ .ctx = @ptrCast(engine), .call = &FallbackProbe.call };
+    const r2 = try submitRead(s, 2, 1, 5 * 4096, 4096);
+    try testing.expect(engine.tryDirectRead(1, s, r2.op, .{ .fd = lab.fd, .off = b.offset + 5 * 4096, .len = 4096, .hook = hook }, r2.c));
+    const deadline2 = clock.monotonicNs() + 5 * std.time.ns_per_s;
+    while (!slot_core.isDoneFor(try s.m.slot(2), r2.gen) and clock.monotonicNs() < deadline2) {
+        engine.flushLane(1);
+        sleepNs(100 * std.time.ns_per_us);
+    }
+    try testing.expectEqual(@as(i64, 7), slot_core.result(try s.m.slot(2)));
+    try testing.expectEqual(@as(u32, 1), FallbackProbe.calls);
+    try testing.expectEqual(post0 + 1, stats.ipc_dd_read_fallbacks_post.load());
+    try testing.expectEqual(serves0 + 1, stats.ipc_dd_read_serves.load());
+    slot_core.release(try s.m.slot(2));
+    // No fallback wired (a lab): the EIO law.
+    engine.read_fallback = null;
+    const r3 = try submitRead(s, 3, 1, 5 * 4096, 4096);
+    try testing.expect(engine.tryDirectRead(0, s, r3.op, .{ .fd = lab.fd, .off = b.offset + 5 * 4096, .len = 4096, .hook = hook }, r3.c));
+    const deadline3 = clock.monotonicNs() + 5 * std.time.ns_per_s;
+    while (!slot_core.isDoneFor(try s.m.slot(3), r3.gen) and clock.monotonicNs() < deadline3) {
+        engine.flushLane(0);
+        sleepNs(100 * std.time.ns_per_us);
+    }
+    try testing.expectEqual(-@as(i64, @backingInt(linux.E.IO)), slot_core.result(try s.m.slot(3)));
+    slot_core.release(try s.m.slot(3));
+    // A leg without a hook, or a window off the DMA grain, is never taken.
+    const r4 = try submitRead(s, 4, 1, 5 * 4096, 4096);
+    try testing.expect(!engine.tryDirectRead(0, s, r4.op, .{ .fd = lab.fd, .off = b.offset + 5 * 4096, .len = 4096, .hook = null }, r4.c));
+    var shifted = r4.op;
+    shifted.window = r4.op.window[512..];
+    shifted.desc.len = 4096 - 512;
+    try testing.expect(!engine.tryDirectRead(0, s, shifted, .{ .fd = lab.fd, .off = b.offset + 5 * 4096 + 512, .len = 4096 - 512, .hook = hook }, r4.c));
+    r4.c.complete(0);
+    slot_core.release(try s.m.slot(4));
     try testing.expectEqual(@as(u32, 0), engine.inflightTotal());
 }

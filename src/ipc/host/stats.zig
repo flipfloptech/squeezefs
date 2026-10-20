@@ -9,7 +9,7 @@
 //! Engagement identity (charter §7): an il row is INVALID unless
 //! `Δ(ipc_ops_read + ipc_ops_write)` accounts for its ops. The per-lane
 //! closures are rendered as booleans beside the instruments:
-//!   reads : `fast_path_serves + read_handoffs ≡ ops_read`
+//!   reads : `fast_path_serves + read_handoffs + dd_read_serves ≡ ops_read`
 //!   writes: `dd_inline_serves + write_handoffs ≡ ops_write`
 //!   dd    : `dd_inline_serves + dd_write_fallbacks ≡ dd_submits_attempted`
 //! (a closure read mid-flight may be one op off; the quiescent read closes).
@@ -160,6 +160,18 @@ pub const stats = struct {
     pub var ipc_dd_leaked_inflight: counters.ShardedCounter = .{};
     /// Rings built on the degraded (plain) setup after `COOP_TASKRUN` refused.
     pub var ipc_dd_plain_rings: counters.ShardedCounter = .{};
+    /// Cold ring reads DMA'd from the device STRAIGHT INTO THE ARENA on
+    /// the service thread's shard (the direct device leg the warm ladder
+    /// resolved after every tier missed; `SQUEEZEFS_IL_DIRECT_READ`).
+    pub var ipc_dd_read_serves: counters.ShardedCounter = .{};
+    pub var ipc_dd_read_bytes: counters.ShardedCounter = .{};
+    /// Direct reads whose post-DMA recheck failed (the binding or the
+    /// incarnation moved under the DMA, or a short/failed CQE): the handler
+    /// owns the truth — a read handoff follows, nothing fabricated.
+    pub var ipc_dd_read_fallbacks_post: counters.ShardedCounter = .{};
+    /// Legs the lane refused BEFORE any DMA (no slab entry, no SQE): the
+    /// handoff path, counted.
+    pub var ipc_dd_read_refusals: counters.ShardedCounter = .{};
 
     // ---- coherence (KD-11's residual windows) ----
     pub var ipc_inval_notifies: counters.ShardedCounter = .{};
@@ -178,7 +190,7 @@ pub const Closure = struct {
 
 pub fn closure() Closure {
     return .{
-        .reads = stats.ipc_fast_path_serves.load() + stats.ipc_read_handoffs.load() == stats.ipc_ops_read.load(),
+        .reads = stats.ipc_fast_path_serves.load() + stats.ipc_read_handoffs.load() + stats.ipc_dd_read_serves.load() == stats.ipc_ops_read.load(),
         .writes = stats.ipc_dd_inline_serves.load() + stats.ipc_write_handoffs.load() == stats.ipc_ops_write.load(),
         .dd = stats.ipc_dd_inline_serves.load() + stats.ipc_dd_write_fallbacks.load() == ddSubmitsAttempted(),
     };

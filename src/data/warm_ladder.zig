@@ -358,9 +358,18 @@ pub const WarmLadder = struct {
 
     /// The direct device leg after the probe declined: `{fd, off, len}`
     /// when the WHOLE reply can DMA from the device into the app's pages
-    /// (cold = not in any tier, no flight open), else null.
+    /// (cold = not in any tier, no flight open), else null. The transport's
+    /// face: offered only on a zero-copy session.
     pub fn directLeg(self: *WarmLadder, ino: u64, offset: u64, size: u32, odirect: bool) ?fsv.DirectLeg {
         if (!self.direct_leg_armed) return null;
+        return self.resolveDirectLeg(ino, offset, size, odirect);
+    }
+
+    /// The leg's resolution without the transport's arming: the IPC host's
+    /// direct-drive READ (`ipc/host/direct.zig`) DMAs the same leg into the
+    /// session arena on its own ring, whatever the FUSE session's buffer
+    /// mode — its arming is `SQUEEZEFS_IL_DIRECT_READ`.
+    pub fn resolveDirectLeg(self: *WarmLadder, ino: u64, offset: u64, size: u32, odirect: bool) ?fsv.DirectLeg {
         const rp = self.rp;
         const device_true = rp.cfg.direct_device_true and odirect;
         if (!directLegEligible(rp.cfg.passthrough, device_true, offset, size, rp.cfg.block_size)) return null;

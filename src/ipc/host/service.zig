@@ -31,9 +31,12 @@
 //! The completion order is `session.Completion`'s. The sink is a vtable so
 //! the loop runs over a stub in tests; `DataPlaneSink` is the product:
 //! the SYNC READ FAST PATH (`WarmLadder.probe` into the arena — ONE copy;
-//! EOF; a demote drops the guard FIRST — structural in the ladder — then
-//! hands the FULL read handler to a FUSE lane homed on the arena's node,
-//! never a runtime inject queue: the hop measured ~130 µs/op), WRITES by
+//! EOF; a demote drops the guard FIRST — structural in the ladder — then a
+//! cold miss the direct device leg admits DMAs straight into the arena on
+//! the owner's direct-drive shard (`direct.zig`, `SQUEEZEFS_IL_DIRECT_READ`),
+//! every other demote hands the FULL read handler to a FUSE lane homed on
+//! the arena's node, never a runtime inject queue: the hop measured
+//! ~130 µs/op), WRITES by
 //! sever-at-dequeue (the W1-shaped inline arm on the direct-drive lane,
 //! else the ONE arena read into a pooled slab or a placed assembly BEFORE
 //! the handoff counter moves — a client scribble after it is inert), the
@@ -442,8 +445,9 @@ pub const DataPlaneSink = struct {
     placed: *placed.Registry,
     inval: *inval_mod.Invalidator,
     dd: ?*direct.Engine,
-    /// `SQUEEZEFS_IL_DIRECT_WRITE`.
+    /// `SQUEEZEFS_IL_DIRECT_WRITE` / `SQUEEZEFS_IL_DIRECT_READ`.
     direct_write: bool,
+    direct_read: bool,
     max_file_size: u64,
     /// The synthetic request identity: the daemon's own (authorization
     /// happened at the fd screen).
@@ -481,6 +485,7 @@ pub const DataPlaneSink = struct {
         inval: *inval_mod.Invalidator,
         dd: ?*direct.Engine,
         direct_write: bool,
+        direct_read: bool,
         max_file_size: u64,
         owners: u16,
         /// The deferral depth per owner (= the geometry's slots).
@@ -513,6 +518,7 @@ pub const DataPlaneSink = struct {
             .inval = d.inval,
             .dd = d.dd,
             .direct_write = d.direct_write,
+            .direct_read = d.direct_read,
             .max_file_size = d.max_file_size,
             .uid = linux.geteuid(),
             .gid = linux.getegid(),
@@ -538,7 +544,7 @@ pub const DataPlaneSink = struct {
         // (the lanes' law, applied here so a nodeid never reaches the plane).
         const key_ino = if (route_table.isRoutable(op.binding.ino)) route_table.effectiveIno(op.binding.ino) else return c.fail(.INVAL);
         switch (op.op) {
-            .read => self.serveRead(s, op, key_ino, c),
+            .read => self.serveRead(owner, s, op, key_ino, c),
             .write => self.serveWrite(owner, s, op, key_ino, c),
             _ => unreachable,
         }
@@ -560,7 +566,7 @@ pub const DataPlaneSink = struct {
 
     // ---- the sync READ fast path (§2) ----
 
-    fn serveRead(self: *DataPlaneSink, s: *Session, op: DataOp, key_ino: u64, c: Completion) void {
+    fn serveRead(self: *DataPlaneSink, owner: u16, s: *Session, op: DataOp, key_ino: u64, c: Completion) void {
         if (op.desc.len == 0) {
             // The liveness ping: nothing to read, nothing to demote.
             stats.ipc_ops_read.inc();
@@ -592,12 +598,36 @@ pub const DataPlaneSink = struct {
                     .miss, .write_side => stats.ipc_fast_path_miss_demotions.inc(),
                     .pre_screen => stats.ipc_fast_path_policy_demotions.inc(),
                 }
-                // The guard is already dropped (structural in the ladder):
-                // the FULL handler on a lane homed on the arena's node.
-                stats.ipc_read_handoffs.inc();
-                self.spawnOnLane(s, c, readHandoff, .{ self, op, c });
+                // The guard is already dropped (structural in the ladder).
+                // A cold miss the direct device leg admits DMAs straight
+                // into the arena on MY shard (`direct.zig`); everything
+                // else is the FULL handler on a lane homed on the arena's
+                // node.
+                if (why == .miss and self.direct_read) if (self.dd) |dd| {
+                    if (self.plane.ladder.resolveDirectLeg(key_ino, op.desc.offset, op.desc.len, op.binding.rights.odirect)) |leg| {
+                        if (dd.tryDirectRead(owner, s, op, leg, c)) return;
+                    }
+                };
+                self.readHandoffOn(s, op, c);
             },
         }
+    }
+
+    /// The read handoff: the FULL handler on a lane homed on the session's
+    /// node (the demote path, and the dd read's post-DMA fallback).
+    fn readHandoffOn(self: *DataPlaneSink, s: *Session, op: DataOp, c: Completion) void {
+        stats.ipc_read_handoffs.inc();
+        self.spawnOnLane(s, c, readHandoff, .{ self, op, c });
+    }
+
+    fn readFallbackFn(ctx: *anyopaque, s: *Session, op: DataOp, c: Completion) void {
+        const self: *DataPlaneSink = @ptrCast(@alignCast(ctx));
+        self.readHandoffOn(s, op, c);
+    }
+
+    /// The engine's face on the handoff (`direct.Engine.read_fallback`).
+    pub fn readFallback(self: *DataPlaneSink) direct.ReadFallback {
+        return .{ .ctx = self, .call = &readFallbackFn };
     }
 
     /// A handoff onto a FUSE-class lane homed on the session's node; a lane

@@ -55,6 +55,9 @@ pub const FakeDevice = struct {
     fail_next_read: ?seams.ReadError = null,
     fail_next_flush: ?seams.DmaError = null,
     hook: ?Hook = null,
+    /// Runs inside `flush` (after the injection verdict, before the flush
+    /// is recorded): the window a barrier is in flight.
+    flush_hook: ?Hook = null,
     /// Deny `write_fixed` (a non-zc session).
     no_write_fixed: bool = false,
     /// Every call sequence the test asserts order on.
@@ -171,12 +174,18 @@ pub const FakeDevice = struct {
     fn flush(ctx: *anyopaque, vol: u64) seams.DmaError!void {
         const self: *FakeDevice = @ptrCast(@alignCast(ctx));
         self.lock.lockUncancelable(std.testing.io);
+        self.trace.append(self.gpa, .flush) catch {
+            self.lock.unlock(std.testing.io);
+            return error.OutOfMemory;
+        };
+        const injected = self.fail_next_flush;
+        self.fail_next_flush = null;
+        const hook = self.flush_hook;
+        self.lock.unlock(std.testing.io);
+        if (hook) |h| h.call(h.ctx, self, vol, 0, 0);
+        if (injected) |e| return e;
+        self.lock.lockUncancelable(std.testing.io);
         defer self.lock.unlock(std.testing.io);
-        self.trace.append(self.gpa, .flush) catch return error.OutOfMemory;
-        if (self.fail_next_flush) |e| {
-            self.fail_next_flush = null;
-            return e;
-        }
         self.flushes.append(self.gpa, vol) catch return error.OutOfMemory;
     }
 

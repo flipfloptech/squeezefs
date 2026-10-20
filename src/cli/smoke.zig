@@ -8969,6 +8969,15 @@ test "smoke: THE STAGED READ'S IDENTITY WINDOW — a 256 KiB staged file; an O_D
     try testing.expectEqual(@as(?u64, 1), numberAfter(t, "\"fsync_promoted_files\":"));
     try testing.expectEqual(@as(?u64, 1), numberAfter(t, "\"layout_promoted_packed\":"));
     try testing.expectEqual(@as(?u64, 0), numberAfter(t, "\"staged_payload_lost_reads\":"));
+    // The promotion's durability order (DUR-1 on the promotion arms): the
+    // tenant's volume barriered (or declared write-through) BEFORE the
+    // packed layout published; the ring record departed and its cover
+    // round (the meta barrier past the publish) released it.
+    try testing.expectEqual(@as(u64, 1), (numberAfter(t, "\"promotion_barriers\":") orelse 0) + (numberAfter(t, "\"promotion_barrier_write_through_skips\":") orelse 0));
+    try testing.expectEqual(@as(?u64, 1), numberAfter(t, "\"staging_departures_deferred\":"));
+    try testing.expectEqual(@as(?u64, 1), numberAfter(t, "\"staging_departed_released\":"));
+    try testing.expectEqual(@as(?u64, 0), numberAfter(t, "\"staging_departed_held\":"));
+    try testing.expectEqual(@as(?u64, 1), numberAfter(t, "\"staging_cover_rounds\":"));
     try rig.umount();
 }
 

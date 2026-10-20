@@ -80,11 +80,14 @@ pub const stats = struct {
     pub var staging_put_bytes_spill: counters.ShardedCounter = .{};
     pub var layout_promoted_inline: counters.ShardedCounter = .{};
     pub var layout_promoted_own_block: counters.ShardedCounter = .{};
+    /// A drain's cover round (`drainOnce`) whose meta barrier failed: the
+    /// released ring records stay held for the next round.
+    pub var writeback_cover_rounds_failed: counters.ShardedCounter = .{};
 };
 
 pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
     try w.print("{{\"writeback_queue_cap\":{d},\"writeback_queue_depth\":{d}", .{ stats.writeback_queue_cap.load(), stats.writeback_queue_depth.load() });
-    inline for (.{ "writeback_enqueued_spill", "writeback_enqueued_wt_fallback", "writeback_enqueued_flush", "writeback_sync_flushes_on_full_queue", "writeback_superseded_noops", "writeback_stale_token_retries", "writeback_retry_exhaustions", "writeback_orphan_discards", "writeback_eof_discards", "writeback_fence_noops", "writeback_errors_latched", "writeback_errors_reported", "writeback_flushed", "durable_upload_bytes_writeback", "staging_put_bytes_spill", "layout_promoted_inline", "layout_promoted_own_block" }) |name| {
+    inline for (.{ "writeback_enqueued_spill", "writeback_enqueued_wt_fallback", "writeback_enqueued_flush", "writeback_sync_flushes_on_full_queue", "writeback_superseded_noops", "writeback_stale_token_retries", "writeback_retry_exhaustions", "writeback_orphan_discards", "writeback_eof_discards", "writeback_fence_noops", "writeback_errors_latched", "writeback_errors_reported", "writeback_flushed", "durable_upload_bytes_writeback", "staging_put_bytes_spill", "layout_promoted_inline", "layout_promoted_own_block", "writeback_cover_rounds_failed" }) |name| {
         try w.print(",\"{s}\":{d}", .{ name, @field(stats, name).load() });
     }
     try w.writeAll("}");
@@ -444,7 +447,10 @@ pub const Worker = struct {
     }
 
     /// Drain every queued unit once (the test's deterministic pass and the
-    /// fsync's "flush what is staged for this ino").
+    /// fsync's "flush what is staged for this ino"), then ONE cover round
+    /// for the ring records the units released (`staging.Segment.cover`:
+    /// their publishes durable, their slots punched — the write-back's
+    /// barrier batching; a no-op when nothing departed).
     pub fn drainOnce(self: *Worker, io: Io, deps: Deps) u32 {
         var n: u32 = 0;
         var budget_units = self.depth.load(.monotonic);
@@ -454,6 +460,9 @@ pub const Worker = struct {
             _ = self.runUnit(io, deps, &u);
             n += 1;
         }
+        if (n != 0) deps.seg.cover(io) catch {
+            stats.writeback_cover_rounds_failed.inc();
+        };
         return n;
     }
 

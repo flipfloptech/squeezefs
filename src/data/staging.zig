@@ -30,6 +30,17 @@
 //! concurrent callers by `SyncCoalescer` — every request that arrived before
 //! a sync started is answered by it, so a storm of fsyncs costs one sync
 //! per batch, never one per call.
+//!
+//! **Departure** (the same law on the way OUT): a key leaves the ring when
+//! the metadata stops naming its record — a promotion's layout commit, a
+//! truncate to zero, a destroy. The two homes of a synced file must agree
+//! at every cut: as long as the publish that stopped naming the record is
+//! not durable, recovery reads the OLD layout and expects the record whole,
+//! so the departed copy stays on the segment (no tombstone, no punch, its
+//! slot live for placement) until a COVER ROUND — the meta barrier past that
+//! publish (`CoverSeam`, the plane binds it) — lands (`Segment.cover`). The
+//! block a promotion DMA'd is the plane's: it flushes the volume BEFORE the
+//! publish (DUR-1), so a durable layout never names bytes a cut took.
 
 const std = @import("std");
 const testkit = @import("../core/testkit.zig");
@@ -144,6 +155,17 @@ pub const stats = struct {
     pub var staging_superseded_held: counters.Gauge = .{};
     pub var staging_superseded_held_bytes: counters.Gauge = .{};
     pub var staging_superseded_released: counters.ShardedCounter = .{};
+    /// The departure law (module doc): `staging_departures_deferred` —
+    /// keys that left the ring with their copies held for a cover round;
+    /// `staging_departed_held` / `staging_departed_held_bytes` — the copies
+    /// held now; `staging_departed_released` — copies a round let go;
+    /// `staging_cover_rounds` — rounds run (one meta barrier each, the
+    /// lane's coalescing across concurrent rounds).
+    pub var staging_departures_deferred: counters.ShardedCounter = .{};
+    pub var staging_departed_held: counters.Gauge = .{};
+    pub var staging_departed_held_bytes: counters.Gauge = .{};
+    pub var staging_departed_released: counters.ShardedCounter = .{};
+    pub var staging_cover_rounds: counters.ShardedCounter = .{};
     /// §J.2's ring ledger: `staging_appends` / `staging_append_bytes` — the
     /// extending writes that landed IN PLACE (bytes moved = the bytes);
     /// `staging_restages` / `staging_restage_bytes` — whole images re-staged
@@ -157,38 +179,12 @@ pub const stats = struct {
 };
 
 pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
-    try w.print("{{\"current_staged_write_bytes\":{d},\"staged_writes_in_flight\":{d},\"staging_cell_state_bytes\":{d},\"staging_tables_bytes\":{d},\"staging_over_cap_refusals\":{d},\"staging_ring_full_refusals\":{d},\"staging_pressure_kicks\":{d},\"staging_recovery_records\":{d},\"staging_recovery_torn_records\":{d},\"staging_generation_discards\":{d},\"staging_foreign_scope_refusals\":{d},\"staging_owner_live_refusals\":{d},\"staging_member_residue_roots\":{d},\"staged_payload_lost_reads\":{d},\"dismount_promoted_files\":{d},\"dismount_promoted_bytes\":{d},\"dismount_promote_failures\":{d},\"dismount_corpse_residents_destroyed\":{d},\"dismount_unnamed_residents_destroyed\":{d},\"fsync_promoted_files\":{d},\"staging_fsync_syncs\":{d},\"staging_fsync_bytes\":{d},\"staging_fsync_coalesced\":{d},\"staging_superseded_held\":{d},\"staging_superseded_held_bytes\":{d},\"staging_superseded_released\":{d},\"staging_appends\":{d},\"staging_append_bytes\":{d},\"staging_restages\":{d},\"staging_restage_bytes\":{d}}}", .{
-        stats.current_staged_write_bytes.load(),
-        stats.staged_writes_in_flight.load(),
-        stats.staging_cell_state_bytes.load(),
-        stats.staging_tables_bytes.load(),
-        stats.staging_over_cap_refusals.load(),
-        stats.staging_ring_full_refusals.load(),
-        stats.staging_pressure_kicks.load(),
-        stats.staging_recovery_records.load(),
-        stats.staging_recovery_torn_records.load(),
-        stats.staging_generation_discards.load(),
-        stats.staging_foreign_scope_refusals.load(),
-        stats.staging_owner_live_refusals.load(),
-        stats.staging_member_residue_roots.load(),
-        stats.staged_payload_lost_reads.load(),
-        stats.dismount_promoted_files.load(),
-        stats.dismount_promoted_bytes.load(),
-        stats.dismount_promote_failures.load(),
-        stats.dismount_corpse_residents_destroyed.load(),
-        stats.dismount_unnamed_residents_destroyed.load(),
-        stats.fsync_promoted_files.load(),
-        stats.staging_fsync_syncs.load(),
-        stats.staging_fsync_bytes.load(),
-        stats.staging_fsync_coalesced.load(),
-        stats.staging_superseded_held.load(),
-        stats.staging_superseded_held_bytes.load(),
-        stats.staging_superseded_released.load(),
-        stats.staging_appends.load(),
-        stats.staging_append_bytes.load(),
-        stats.staging_restages.load(),
-        stats.staging_restage_bytes.load(),
-    });
+    try w.writeAll("{");
+    inline for (.{ "current_staged_write_bytes", "staged_writes_in_flight", "staging_cell_state_bytes", "staging_tables_bytes", "staging_over_cap_refusals", "staging_ring_full_refusals", "staging_pressure_kicks", "staging_recovery_records", "staging_recovery_torn_records", "staging_generation_discards", "staging_foreign_scope_refusals", "staging_owner_live_refusals", "staging_member_residue_roots", "staged_payload_lost_reads", "dismount_promoted_files", "dismount_promoted_bytes", "dismount_promote_failures", "dismount_corpse_residents_destroyed", "dismount_unnamed_residents_destroyed", "fsync_promoted_files", "staging_fsync_syncs", "staging_fsync_bytes", "staging_fsync_coalesced", "staging_superseded_held", "staging_superseded_held_bytes", "staging_superseded_released", "staging_departures_deferred", "staging_departed_held", "staging_departed_held_bytes", "staging_departed_released", "staging_cover_rounds", "staging_appends", "staging_append_bytes", "staging_restages", "staging_restage_bytes" }, 0..) |name, i| {
+        if (i != 0) try w.writeByte(',');
+        try w.print("\"{s}\":{d}", .{ name, @field(stats, name).load() });
+    }
+    try w.writeAll("}");
 }
 
 pub fn writePhasesJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
@@ -515,6 +511,16 @@ pub const Backing = struct {
     pub const none: Backing = .{};
 };
 
+/// The departure law's round (module doc): every layout publish committed
+/// before the call is durable on return — the meta barrier (the plane binds
+/// the backend's coalesced barrier). A segment with no seam (a RAM image,
+/// the portable tests) releases a departed copy at once: nothing durable
+/// is owed to it.
+pub const CoverSeam = struct {
+    ctx: ?*anyopaque = null,
+    run: *const fn (ctx: ?*anyopaque, io: Io) DurableError!void,
+};
+
 /// A placed record.
 pub const Extent = struct {
     rec_off: u64,
@@ -554,7 +560,12 @@ pub const Extent = struct {
 /// tombstone, no punch, no reuse — until its successor is durable or its
 /// key leaves the ring (the deferral holds one reference): a power cut
 /// after an unsynced overwrite must find the old, synced copy whole
-/// (recovery takes the higher generation that survived), never a hole.
+/// (recovery takes the higher generation that survived), never a hole. A
+/// DEPARTED copy (its key left: promoted, truncated away, destroyed) keeps
+/// its bytes the same way until a cover round past its departure lands
+/// (module doc "Departure"); the superseded copies of a departing key
+/// become departed with it — the old synced image is what a cut before
+/// the publish's durability must find.
 const Cell = struct {
     refs: std.atomic.Value(u32) = .init(0),
     retired: std.atomic.Value(bool) = .init(false),
@@ -571,11 +582,16 @@ const Cell = struct {
     /// The retired list (under the segment lock).
     prev_retired: ?*Cell = null,
     next_retired: ?*Cell = null,
-    /// Superseded (module doc of the struct): the reclaim waits for a sync
-    /// covering this key's copy at or past `successor_generation`, or for
-    /// the key to leave.
-    superseded: bool = false,
-    successor_generation: u64 = 0,
+    /// The deferral that holds one reference (module doc of the struct):
+    /// `.superseded` waits for a sync covering this key's copy at or past
+    /// `hold_seq` (its successor's generation) or for the key to leave;
+    /// `.departed` waits for the cover round numbered `hold_seq` (or a
+    /// later one) to land. One reason at a time: a superseded copy whose
+    /// key departs becomes departed.
+    hold: Hold = .none,
+    hold_seq: u64 = 0,
+
+    const Hold = enum(u8) { none, superseded, departed };
 };
 
 pub const PutError = error{
@@ -616,6 +632,12 @@ pub const Segment = struct {
     /// The index sequence: bumped at every index flip (release); a sync
     /// batch reads it at its start (acquire) — `Cell.indexed_seq`.
     indexed_seq: std.atomic.Value(u64) = .init(1),
+    /// The departure law's round (module doc); null = a departed copy
+    /// releases at once.
+    cover_seam: ?CoverSeam = null,
+    /// Cover rounds started so far (under the lock): a departure waits for
+    /// round `cover_started + 1` — one that starts after it.
+    cover_started: u64 = 0,
 
     /// Every live or pending record occupies ≥ 1 grain of its own, so the
     /// cell population is bounded by `capacity / grain`; one more for the
@@ -696,13 +718,24 @@ pub const Segment = struct {
     pub fn deinit(self: *Segment) void {
         assert(self.durable.head == null and !self.durable.running);
         stats.staging_tables_bytes.sub(self.tablesBytes());
-        // Superseded copies still held leave with the session (the next
-        // mount's recovery takes the higher generation).
+        // Superseded and departed copies still held leave with the session
+        // (the next mount's recovery takes the higher generation; a
+        // departed record its layout no longer names is the dismount
+        // pass's `unnamed`).
         var r = self.retired_head;
-        while (r) |c| : (r = c.next_retired) if (c.superseded) {
-            stats.staging_superseded_held.sub(1);
-            stats.staging_superseded_held_bytes.sub(c.extent.end() - c.extent.rec_off);
-        };
+        while (r) |c| : (r = c.next_retired) {
+            switch (c.hold) {
+                .none => {},
+                .superseded => {
+                    stats.staging_superseded_held.sub(1);
+                    stats.staging_superseded_held_bytes.sub(c.extent.end() - c.extent.rec_off);
+                },
+                .departed => {
+                    stats.staging_departed_held.sub(1);
+                    stats.staging_departed_held_bytes.sub(c.extent.end() - c.extent.rec_off);
+                },
+            }
+        }
         for (self.cells) |*c| if (c.hash) |h| self.destroyState(h);
         self.index.deinit(self.gpa);
         self.pending.deinit(self.gpa);
@@ -860,13 +893,13 @@ pub const Segment = struct {
                 // The superseded copy stays whole until this one is durable
                 // (`Cell` doc): the deferral's reference, then the retire. A
                 // RAM image has no durability to wait for.
-                old.superseded = true;
-                old.successor_generation = generation;
+                old.hold = .superseded;
+                old.hold_seq = generation;
                 _ = old.refs.fetchAdd(1, .monotonic);
                 stats.staging_superseded_held.add(1);
                 stats.staging_superseded_held_bytes.add(old.extent.end() - old.extent.rec_off);
             }
-            self.retireLocked(old, !old.superseded);
+            self.retireLocked(old, old.hold != .superseded);
         } else {
             gop.value_ptr.* = cell;
         }
@@ -943,22 +976,97 @@ pub const Segment = struct {
     /// Remove `key` iff present (and, when `expect_generation` is given,
     /// iff the resident copy carries it — the promotion's generation gate:
     /// a re-stage that landed since keeps its entry). True iff removed. The
-    /// key leaves the ring: every superseded copy of it is released too.
+    /// key leaves the ring; with a cover seam bound its copies — the
+    /// resident one and every superseded one — DEPART: whole on the
+    /// segment until the round that starts after this instant lands
+    /// (`cover`; the `Cell` doc). Without one they are released at once.
     pub fn remove(self: *Segment, key: StagingKey, expect_generation: ?u64) bool {
         self.lock.lock();
         defer self.lock.unlock();
         const cell = self.index.get(key.bytes().*) orelse return false;
         if (expect_generation) |g| if (cell.extent.generation != g) return false;
         _ = self.index.remove(key.bytes().*);
-        self.retireLocked(cell, true);
-        self.releaseSupersededLocked(key.bytes(), std.math.maxInt(u64));
+        if (self.cover_seam == null) {
+            self.retireLocked(cell, true);
+            self.releaseSupersededLocked(key.bytes(), std.math.maxInt(u64));
+            return true;
+        }
+        stats.staging_departures_deferred.inc();
+        const seq = self.cover_started + 1;
+        // The deferral's reference, then the retire (no tombstone).
+        _ = cell.refs.fetchAdd(1, .monotonic);
+        self.departLocked(cell, seq);
+        self.retireLocked(cell, false);
+        // A superseded copy's deferral reference carries over to its
+        // departure: the sync that would have released it will never come.
+        var cur = self.retired_head;
+        while (cur) |c| : (cur = c.next_retired) {
+            if (c.hold != .superseded or !std.mem.eql(u8, &c.key, key.bytes())) continue;
+            stats.staging_superseded_held.sub(1);
+            stats.staging_superseded_held_bytes.sub(c.extent.end() - c.extent.rec_off);
+            self.departLocked(c, seq);
+        }
         return true;
+    }
+
+    fn departLocked(_: *Segment, cell: *Cell, seq: u64) void {
+        cell.hold = .departed;
+        cell.hold_seq = seq;
+        stats.staging_departed_held.add(1);
+        stats.staging_departed_held_bytes.add(cell.extent.end() - cell.extent.rec_off);
+    }
+
+    /// Departed copies held now (the dismount's and the tests' observable).
+    pub fn departedHeld(self: *Segment) u32 {
+        self.lock.lock();
+        defer self.lock.unlock();
+        return self.departedHeldLocked();
+    }
+
+    fn departedHeldLocked(self: *Segment) u32 {
+        var n: u32 = 0;
+        var cur = self.retired_head;
+        while (cur) |c| : (cur = c.next_retired) n += @intFromBool(c.hold == .departed);
+        return n;
+    }
+
+    /// The departure law's round (module doc): ONE `cover` run — the meta
+    /// barrier past every publish committed before this call — then every
+    /// departed copy that left before the round started is released
+    /// (tombstoned, punched, its cell back in the pool). A copy that
+    /// departed WHILE the round ran waits for the next one. Nothing held
+    /// ⇒ no round. A failed round releases nothing (the next one retries);
+    /// the error is the caller's to count.
+    pub fn cover(self: *Segment, io: Io) DurableError!void {
+        const seam = self.cover_seam orelse return;
+        const ticket: u64 = blk: {
+            self.lock.lock();
+            defer self.lock.unlock();
+            if (self.departedHeldLocked() == 0) return;
+            self.cover_started += 1;
+            break :blk self.cover_started;
+        };
+        try seam.run(seam.ctx, io);
+        stats.staging_cover_rounds.inc();
+        self.lock.lock();
+        defer self.lock.unlock();
+        var cur = self.retired_head;
+        while (cur) |c| {
+            cur = c.next_retired;
+            if (c.hold != .departed or c.hold_seq > ticket) continue;
+            c.hold = .none;
+            stats.staging_departed_held.sub(1);
+            stats.staging_departed_held_bytes.sub(c.extent.end() - c.extent.rec_off);
+            stats.staging_departed_released.inc();
+            self.tombstoneLocked(c.extent.rec_off);
+            if (c.refs.fetchSub(1, .acq_rel) == 1) self.reclaimCellLocked(c);
+        }
     }
 
     /// Retire a cell: onto the retired list, out of the index's reference;
     /// `tombstone` = BOTH slots' magic zeroed so a recovery scan never
-    /// adopts the copy (a superseded copy keeps its magic until its
-    /// release — `Cell` doc). The last reference reclaims the bytes.
+    /// adopts the copy (a superseded or departed copy keeps its magic until
+    /// its release — `Cell` doc). The last reference reclaims the bytes.
     /// release pairs with `Lease.release`'s acq_rel.
     fn retireLocked(self: *Segment, cell: *Cell, tombstone_now: bool) void {
         if (tombstone_now) self.tombstoneLocked(cell.extent.rec_off);
@@ -999,7 +1107,7 @@ pub const Segment = struct {
         var cur = self.retired_head;
         while (cur) |c| {
             cur = c.next_retired;
-            if (!c.superseded or c.successor_generation > up_to or !std.mem.eql(u8, &c.key, key)) continue;
+            if (c.hold != .superseded or c.hold_seq > up_to or !std.mem.eql(u8, &c.key, key)) continue;
             self.releaseOneSupersededLocked(c);
         }
     }
@@ -1011,14 +1119,14 @@ pub const Segment = struct {
         var cur = self.retired_head;
         while (cur) |c| {
             cur = c.next_retired;
-            if (!c.superseded) continue;
+            if (c.hold != .superseded) continue;
             if (self.index.get(c.key)) |live_cell| if (live_cell.indexed_seq >= start_seq) continue;
             self.releaseOneSupersededLocked(c);
         }
     }
 
     fn releaseOneSupersededLocked(self: *Segment, c: *Cell) void {
-        c.superseded = false;
+        c.hold = .none;
         stats.staging_superseded_held.sub(1);
         stats.staging_superseded_held_bytes.sub(c.extent.end() - c.extent.rec_off);
         stats.staging_superseded_released.inc();
@@ -1033,7 +1141,7 @@ pub const Segment = struct {
     }
 
     fn reclaimCellLocked(self: *Segment, cell: *Cell) void {
-        assert(!cell.superseded);
+        assert(cell.hold == .none);
         const e = cell.extent;
         self.unlinkRetiredLocked(cell);
         // A shadowed cell's bytes live on under its successor: free the cell alone.
@@ -1067,9 +1175,9 @@ pub const Segment = struct {
 
     /// First fit over the live set — the indexed extents, the pending
     /// placements and the retired cells not yet reclaimed (a leased copy, a
-    /// superseded copy held for its successor's durability; a shadowed
-    /// cell's extent is its successor's, already counted); null when
-    /// nothing fits.
+    /// superseded copy held for its successor's durability, a departed
+    /// copy held for its cover round; a shadowed cell's extent is its
+    /// successor's, already counted); null when nothing fits.
     fn findHoleLocked(self: *Segment, need: u64) ?u64 {
         var n: usize = 0;
         var it = self.index.valueIterator();
@@ -1594,7 +1702,9 @@ pub fn appendStaged(pool: *Pool, seg: *Segment, key: StagingKey, at: u64, data: 
 }
 
 /// The promotion released the ring entry (generation-gated: a re-stage that
-/// landed since keeps its copy and its charge). True iff released.
+/// landed since keeps its copy and its charge): the key leaves the ring
+/// and the pool at once; its copies depart (`Segment.remove`) — the slot is
+/// the ring's again at the cover round. True iff released.
 pub fn releaseStaged(pool: *Pool, seg: *Segment, key: StagingKey, generation: u64) bool {
     if (!seg.remove(key, generation)) return false;
     _ = pool.credit(key.file_id, generation);
@@ -3172,6 +3282,163 @@ test "a synced copy survives an unsynced re-stage: the superseded copy keeps its
     try testing.expectEqual(held0, stats.staging_superseded_held.load());
 }
 
+/// The departure law's counting seam: every cover round recorded; `hold`
+/// parks the round until the test releases it; `fail_next` answers one EIO.
+const CoverCounter = struct {
+    rounds: u32 = 0,
+    hold: futex.Word = .init(0),
+    in_flight: std.atomic.Value(u32) = .init(0),
+    fail_next: bool = false,
+
+    fn seam(self: *CoverCounter) CoverSeam {
+        return .{ .ctx = self, .run = run };
+    }
+
+    fn run(ctx: ?*anyopaque, _: Io) DurableError!void {
+        const self: *CoverCounter = @ptrCast(@alignCast(ctx.?));
+        _ = self.in_flight.fetchAdd(1, .acq_rel);
+        defer _ = self.in_flight.fetchSub(1, .acq_rel);
+        while (self.hold.load(.acquire) != 0) futex.wait(&self.hold, 1);
+        self.rounds += 1;
+        if (self.fail_next) {
+            self.fail_next = false;
+            return error.InputOutput;
+        }
+    }
+
+    fn release(self: *CoverCounter) void {
+        self.hold.store(0, .release);
+        futex.wakeAll(&self.hold);
+    }
+};
+
+test "the departure law: a key that leaves the ring (a promotion's release) keeps its copies — the resident one AND the superseded one — whole on the segment (magic, slot, no punch, not a placement hole) until a cover round that STARTED after the departure lands (red before: tombstoned and punched at once — a cut before the publish's durability found the old layout naming a hole); the cut model: recovery after the departure adopts the synced copy; the round releases what departed before it began and not what departed while it ran; a failed round releases nothing; nothing departed ⇒ no round; a RAM image with no seam releases at once" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var seam: SyncSeam = .{};
+    defer seam.calls.deinit(gpa);
+    defer seam.reclaims.deinit(gpa);
+    var rounds: CoverCounter = .{};
+    const image = try gpa.alloc(u8, 64 * 4096);
+    defer gpa.free(image);
+    @memset(image, 0);
+    var seg = try Segment.init(gpa, image, seam.backing());
+    defer seg.deinit();
+    seg.cover_seam = rounds.seam();
+    const k = tkey(1, 11);
+    const a: [5000]u8 = @splat('a');
+    const b: [3000]u8 = @splat('b');
+    const def0 = stats.staging_departures_deferred.load();
+    const held0 = stats.staging_departed_held.load();
+    const hb0 = stats.staging_departed_held_bytes.load();
+    const rel0 = stats.staging_departed_released.load();
+    const rounds0 = stats.staging_cover_rounds.load();
+    const sup0 = stats.staging_superseded_held.load();
+    // A synced copy, an unsynced re-stage over it (superseded, held), then
+    // the promotion's release: the layout commit stopped naming the key.
+    try seg.put(k, &a, 1, 0, 0);
+    try seg.syncResident(io, k);
+    const a_ext = seg.residentExtent(k).?;
+    try seg.put(k, &b, 2, 0, 0);
+    const b_ext = seg.residentExtent(k).?;
+    try testing.expectEqual(sup0 + 1, stats.staging_superseded_held.load());
+    try testing.expect(seg.remove(k, 2));
+    try testing.expect(seg.get(k) == null); // the key is gone from the index …
+    try testing.expect(!isTombstone(image, a_ext.rec_off)); // … but both copies keep their magic …
+    try testing.expect(!isTombstone(image, b_ext.rec_off));
+    try testing.expectEqual(@as(usize, 0), seam.reclaims.items.len); // … and their slots.
+    try testing.expectEqual(def0 + 1, stats.staging_departures_deferred.load());
+    try testing.expectEqual(held0 + 2, stats.staging_departed_held.load());
+    try testing.expectEqual(hb0 + (a_ext.end() - a_ext.rec_off) + (b_ext.end() - b_ext.rec_off), stats.staging_departed_held_bytes.load());
+    try testing.expectEqual(sup0, stats.staging_superseded_held.load()); // the superseded hold became the departure's
+    try testing.expectEqual(@as(u32, 2), seg.departedHeld());
+    // Not a placement hole: a third record of their size lands elsewhere.
+    try seg.put(tkey(2, 22), &a, 3, 0, 0);
+    const c_ext = seg.residentExtent(tkey(2, 22)).?;
+    try testing.expect(c_ext.end() <= a_ext.rec_off or a_ext.end() <= c_ext.rec_off);
+    try testing.expect(c_ext.end() <= b_ext.rec_off or b_ext.end() <= c_ext.rec_off);
+    // The cut before the publish is durable: the old (staged) layout names
+    // the key, and recovery over the image finds it — the unsynced copy's
+    // pages lost, the synced one whole.
+    {
+        var cut = try gpa.dupe(u8, image);
+        defer gpa.free(cut);
+        @memset(cut[@intCast(b_ext.rec_off)..@intCast(b_ext.end())], 0);
+        var rec = try Segment.init(gpa, cut, .none);
+        defer rec.deinit();
+        const rep = rec.recover();
+        try testing.expectEqual(@as(u64, 2), rep.adopted);
+        const l = rec.get(k).?;
+        defer l.release();
+        try testing.expectEqualSlices(u8, &a, l.bytes());
+    }
+    // The round: both copies let go — tombstoned, punched, their cells back.
+    const free_before = seg.free_cells.items.len;
+    try seg.cover(io);
+    try testing.expectEqual(@as(u32, 1), rounds.rounds);
+    try testing.expect(isTombstone(image, a_ext.rec_off));
+    try testing.expect(isTombstone(image, b_ext.rec_off));
+    try testing.expectEqual(@as(usize, 2), seam.reclaims.items.len);
+    try testing.expectEqual(free_before + 2, seg.free_cells.items.len);
+    try testing.expectEqual(held0, stats.staging_departed_held.load());
+    try testing.expectEqual(hb0, stats.staging_departed_held_bytes.load());
+    try testing.expectEqual(rel0 + 2, stats.staging_departed_released.load());
+    try testing.expectEqual(rounds0 + 1, stats.staging_cover_rounds.load());
+    try testing.expectEqual(@as(u32, 0), seg.departedHeld());
+    // Nothing departed: no round is run.
+    try seg.cover(io);
+    try testing.expectEqual(@as(u32, 1), rounds.rounds);
+    // A failed round releases nothing; the next one does.
+    try testing.expect(seg.remove(tkey(2, 22), 3));
+    rounds.fail_next = true;
+    try testing.expectError(error.InputOutput, seg.cover(io));
+    try testing.expect(!isTombstone(image, c_ext.rec_off));
+    try testing.expectEqual(@as(u32, 1), seg.departedHeld());
+    try seg.cover(io);
+    try testing.expect(isTombstone(image, c_ext.rec_off));
+    try testing.expectEqual(@as(u32, 0), seg.departedHeld());
+    try testing.expectEqual(@as(u32, 3), rounds.rounds);
+    // A departure WHILE a round runs waits for the next round: its publish
+    // may have committed after the barrier started.
+    const k3 = tkey(3, 33);
+    const k4 = tkey(4, 44);
+    try seg.put(k3, &a, 4, 0, 0);
+    try seg.put(k4, &b, 5, 0, 0);
+    try testing.expect(seg.remove(k3, 4));
+    rounds.hold.store(1, .release);
+    const Req = struct {
+        fn run(s: *Segment, io_: Io, out: *anyerror!void) void {
+            out.* = s.cover(io_);
+        }
+    };
+    var result: anyerror!void = {};
+    var group: Io.Group = .init;
+    group.async(io, Req.run, .{ &seg, io, &result });
+    while (rounds.in_flight.load(.acquire) == 0) try std.Thread.yield();
+    try testing.expect(seg.remove(k4, 5));
+    try testing.expectEqual(@as(u32, 2), seg.departedHeld());
+    rounds.release();
+    group.await(io) catch |e| switch (e) {
+        error.Canceled => unreachable,
+    };
+    try result;
+    try testing.expectEqual(@as(u32, 1), seg.departedHeld()); // k3 released, k4 held
+    try testing.expect(seg.get(k4) == null);
+    try seg.cover(io);
+    try testing.expectEqual(@as(u32, 0), seg.departedHeld());
+    try testing.expectEqual(@as(?*Cell, null), seg.retired_head);
+    // A RAM image with no seam: the release is immediate, as before.
+    var r = try ramSegment(gpa, 16 * 4096);
+    defer gpa.free(r.image);
+    defer r.seg.deinit();
+    try r.seg.put(k, &a, 9, 0, 0);
+    const e = r.seg.residentExtent(k).?;
+    try testing.expect(r.seg.remove(k, 9));
+    try testing.expect(isTombstone(r.image, e.rec_off));
+    try testing.expectEqual(@as(u32, 0), r.seg.departedHeld());
+    try testing.expectEqual(def0 + 4, stats.staging_departures_deferred.load());
+}
+
 test "the sync coalescer: a sync in flight absorbs every request that arrives meanwhile into ONE following sync over their union span — 1 + 16 requests cost 2 syncs with 15 coalesced; the leader returns on its own sync; a failure reaches every member of its batch and no other" {
     const gpa = testing.allocator;
     const io = testing.io;
@@ -3405,7 +3672,7 @@ test "model: the generation gate holds; recycled generations fail (a stale relea
 }
 
 test "stats JSON names every instrument" {
-    var buf: [2048]u8 = undefined;
+    var buf: [4096]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
     try writeStatsJson(&w);
     const out = w.buffered();
@@ -3416,6 +3683,10 @@ test "stats JSON names every instrument" {
     try testing.expect(std.mem.indexOf(u8, out, "\"staging_fsync_syncs\":") != null);
     try testing.expect(std.mem.indexOf(u8, out, "\"staging_fsync_bytes\":") != null);
     try testing.expect(std.mem.indexOf(u8, out, "\"staging_fsync_coalesced\":") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "\"staging_departures_deferred\":") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "\"staging_departed_held_bytes\":") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "\"staging_departed_released\":") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "\"staging_cover_rounds\":") != null);
     try testing.expect(std.mem.endsWith(u8, out, "}"));
     var pbuf: [4096]u8 = undefined;
     var pw: std.Io.Writer = .fixed(&pbuf);

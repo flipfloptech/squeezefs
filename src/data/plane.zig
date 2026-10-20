@@ -241,6 +241,18 @@ pub const stats = struct {
     /// Own-block images landed for a layout promotion (staged/inline → striped).
     pub var own_block_dmas: counters.ShardedCounter = .{};
     pub var own_block_dma_bytes: counters.ShardedCounter = .{};
+    /// The promotion arms' data barrier (DUR-1, `promotion_barriers`):
+    /// `promotion_barriers` — barrier requests between a promotion's DMA
+    /// and its publish; `promotion_barriers_coalesced` — the requests a
+    /// flush another promotion led answered (flushes issued = requests −
+    /// coalesced); `promotion_barrier_write_through_skips` — a write-through
+    /// volume owes none. The cover rounds that release the departed ring
+    /// copies afterwards: `promotion_cover_rounds_failed` (a meta barrier
+    /// that failed; the copies stay held for the next round).
+    pub var promotion_barriers: counters.ShardedCounter = .{};
+    pub var promotion_barriers_coalesced: counters.ShardedCounter = .{};
+    pub var promotion_barrier_write_through_skips: counters.ShardedCounter = .{};
+    pub var promotion_cover_rounds_failed: counters.ShardedCounter = .{};
     /// Direct stores of a held slot (`WRITE_FIXED(device ← slot)`) through
     /// the seam, and their bytes (held-store bytes: every one a byte no
     /// daemon pass touched).
@@ -300,7 +312,7 @@ pub fn writeStatsJson(w: *Io.Writer) Io.Writer.Error!void {
     inline for (.{ "data_volumes", "data_staging_on", "data_nvme_tier_on", "block_refs_drift_rows" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, @field(stats, name).load() });
     }
-    inline for (.{ "layout_map_merges", "layout_map_merge_blocks", "layout_map_merge_failures", "layout_map_merge_clipped_blocks", "layout_map_merges_shipped", "foreign_publish_kvmap_refusals", "layout_publishes_served", "kvmap_sweep_spawn_refusals", "promotions_run", "promotions_stale", "promotions_failed", "own_block_dmas", "own_block_dma_bytes", "held_stores", "held_store_bytes", "held_store_failures", "hold_gate_admits", "hold_gate_overlay_admits", "hold_gate_declines", "prefetch_fibers", "prefetch_fiber_refusals", "hold_ceremony_fibers", "bindings_freed", "device_read_bounces", "data_device_read_bytes", "write_side_read_dma_bytes", "compose_read_dma_bytes", "pack_read_dma_bytes" }) |name| {
+    inline for (.{ "layout_map_merges", "layout_map_merge_blocks", "layout_map_merge_failures", "layout_map_merge_clipped_blocks", "layout_map_merges_shipped", "foreign_publish_kvmap_refusals", "layout_publishes_served", "kvmap_sweep_spawn_refusals", "promotions_run", "promotions_stale", "promotions_failed", "own_block_dmas", "own_block_dma_bytes", "promotion_barriers", "promotion_barriers_coalesced", "promotion_barrier_write_through_skips", "promotion_cover_rounds_failed", "held_stores", "held_store_bytes", "held_store_failures", "hold_gate_admits", "hold_gate_overlay_admits", "hold_gate_declines", "prefetch_fibers", "prefetch_fiber_refusals", "hold_ceremony_fibers", "bindings_freed", "device_read_bounces", "data_device_read_bytes", "write_side_read_dma_bytes", "compose_read_dma_bytes", "pack_read_dma_bytes" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, @field(stats, name).load() });
     }
     try w.print("\"data_unresolved_volume\":{d},\"kvmap_resolve_failures\":{d},\"kvmap_head_put_unlocked\":{d},\"release_free_unheld\":{d},\"layout_map_merge_displaced_overflow\":{d}}}", .{ counters.tripwireCount("data_unresolved_volume"), counters.tripwireCount("kvmap_resolve_failures"), counters.tripwireCount("kvmap_head_put_unlocked"), counters.tripwireCount("release_free_unheld"), counters.tripwireCount("layout_map_merge_displaced_overflow") });
@@ -400,6 +412,10 @@ pub const DataPlane = struct {
     reclaim_free: seams.ReclaimFree,
     /// Levels (3.5) and (3.7) with the promotion's order (module doc).
     locks: layout.PublishLocks = .{},
+    /// The promotion arms' data barrier per volume (`fsync.BarrierCoalescer`,
+    /// DUR-1: the DMA'd block flushed BEFORE the layout naming it publishes;
+    /// concurrent promotions on a volume ride one flush).
+    promotion_barriers: [router.MAX_VOLUMES]fsync_mod.BarrierCoalescer = @splat(.{}),
     /// The block-map publish's pooled working set (`merge_scratch`): the
     /// record, the fold and the tx's arena of one merge, never the heap.
     publish_scratch: merge_scratch.Pool,
@@ -1041,6 +1057,10 @@ pub const DataPlane = struct {
         const st = &self.stage.?;
         st.seg = staging.Segment.init(gpa, st.mapped.map, st.mapped.backing()) catch return error.OutOfMemory;
         errdefer st.seg.deinit();
+        // The departure law's round: the backend's coalesced barrier (the
+        // layout publish that stopped naming a record durable before the
+        // record's slot is punched).
+        st.seg.cover_seam = .{ .ctx = self, .run = &coverRun };
         const rep = st.seg.recover();
         st.pool = staging.Pool.init(gpa, capacity, .{ .ctx = self, .pressure = &promotionPressure, .promote = &promoteHook, .dismount = &dismountHook });
         st.pool.seedFromRecovery(&st.seg) catch return error.OutOfMemory;
@@ -1149,6 +1169,12 @@ pub const DataPlane = struct {
                     log.info("dismount promotion: {d} staged file(s) ({d} B) promoted, 0 failed; {d} corpse record(s) and {d} unnamed record(s) destroyed", .{ t.promoted, t.promoted_bytes, t.corpses, t.unnamed });
                 }
             } else |e| log.err("dismount promotion pass: {s}", .{@errorName(e)});
+            // ONE cover round for every record the pass released: the
+            // publishes durable, then the slots punched (a cleanly unmounted
+            // ring scans empty). A failed round leaves them held; the next
+            // mount's pass destroys what nothing names.
+            self.coverDeparted(io);
+            if (st.seg.departedHeld() != 0) log.err("dismount promotion: {d} released ring record(s) stay on the segment — the meta barrier that would cover their layouts failed; the next mount's pass destroys them", .{st.seg.departedHeld()});
         }
         if (self.packer) |*p| p.sealAll();
         _ = self.reclaimer.drainSync(io);
@@ -1330,9 +1356,11 @@ pub const DataPlane = struct {
 
     /// ONE whole-block image landed on a fresh block (the promotion to
     /// striped / the own-block arm): placement by the router, the mint, the
-    /// transform, the DMA — the proof minted by the completion. The caller
-    /// publishes the layout naming `mapping` in its own transaction and
-    /// calls `abandonOwnBlock` if that fails.
+    /// transform, the DMA — the proof minted by the completion — and the
+    /// volume's barrier over it (`promotionBarrier`: DUR-1, the block is on
+    /// stable storage before any layout names it). The caller publishes the
+    /// layout naming `mapping` in its own transaction and calls
+    /// `abandonOwnBlock` if that fails.
     pub fn ownBlock(self: *DataPlane, io: Io, ino: u64, image: []const u8) Error!OwnBlock {
         if (image.len > self.block_size) return error.FileTooBig;
         const tag = (self.rt.pickVolume() catch return error.OutOfMemory) orelse return error.NoSpaceLeft;
@@ -1358,6 +1386,7 @@ pub const DataPlane = struct {
         errdefer guard.abandon();
         if (self.test_own_block_poison) try self.poisonMint(tag, minted.offset);
         self.deviceWrite(tag, minted.offset, stored) catch |e| return mapDma(e);
+        try self.promotionBarrier(io, v);
         v.alloc.publishBlock(minted.idx);
         guard.disarm();
         stats.own_block_dmas.inc();
@@ -1372,6 +1401,22 @@ pub const DataPlane = struct {
         // `inline_max` — and a transformed image shorter than the chunk both
         // publish; the tail of a fresh mint is unnamed and never read).
         return .{ .mapping = Mapping.wholeBlock(tag, minted.offset, minted.stamp), .proof = .{ .vol_tag = tag, .offset = minted.offset, .len = layout.ceilGrain(stored.len), .completed_ns = clock.monotonicNs() }, .alloc = v.alloc, .idx = minted.idx };
+    }
+
+    /// DUR-1 for the promotion arms (charter §6.1 "block I/O before the
+    /// metadata type flip"; `fsync.BarrierCoalescer`): the volume the
+    /// promotion DMA'd onto is flushed BEFORE the layout naming the block
+    /// publishes, so a publish the journal's cadence makes durable never
+    /// names bytes a power cut took from the device's volatile cache. One
+    /// flush per batch of concurrent promotions; a write-through volume
+    /// owes none.
+    fn promotionBarrier(self: *DataPlane, io: Io, v: *const seams.VolumeInfo) Error!void {
+        if (!v.write_cache_volatile) {
+            stats.promotion_barrier_write_through_skips.inc();
+            return;
+        }
+        stats.promotion_barriers.inc();
+        return self.promotion_barriers[v.ordinal].request(io, self.deviceSeam(), v.vol_tag, &stats.promotion_barriers_coalesced);
     }
 
     /// `SQUEEZEFS_TEST_OWN_BLOCK_POISON`: the minted block whole as 0xAA —
@@ -1676,13 +1721,37 @@ pub const DataPlane = struct {
     /// The ring entry leaves (a promotion landed, a re-stage superseded it,
     /// an unlink, a layout that moved away): generation-gated when known
     /// (null = whatever copy is resident — the layout no longer names it).
+    /// The filesystem's face, on a handler fiber: the copies depart
+    /// (`staging.Segment.remove`) and a cover round runs on a task of its
+    /// own — the caller's commit is acked already and owes no barrier wait.
     pub fn releaseStaged(self: *DataPlane, key_: staging.StagingKey, generation: ?u64) void {
         const st = &(self.stage orelse return);
-        if (generation) |g| {
-            _ = staging.releaseStaged(&st.pool, &st.seg, key_, g);
-            return;
-        }
-        if (st.seg.remove(key_, null)) _ = st.pool.credit(key_.file_id, null);
+        const departed = if (generation) |g| staging.releaseStaged(&st.pool, &st.seg, key_, g) else blk: {
+            const removed = st.seg.remove(key_, null);
+            if (removed) _ = st.pool.credit(key_.file_id, null);
+            break :blk removed;
+        };
+        if (!departed) return;
+        self.tasks.spawn(self.io, coverTask, .{self}) catch self.coverDeparted(self.io);
+    }
+
+    fn coverTask(self: *DataPlane) Io.Cancelable!void {
+        self.coverDeparted(self.io);
+    }
+
+    /// ONE cover round (`staging.Segment.cover`): the departed ring copies
+    /// whose publish the meta barrier made durable are released. A failed
+    /// round is counted; the copies stay held for the next.
+    fn coverDeparted(self: *DataPlane, io: Io) void {
+        const st = &(self.stage orelse return);
+        st.seg.cover(io) catch {
+            stats.promotion_cover_rounds_failed.inc();
+        };
+    }
+
+    fn coverRun(ctx: ?*anyopaque, _: Io) staging.DurableError!void {
+        const self: *DataPlane = @ptrCast(@alignCast(ctx.?));
+        self.backend.fsync() catch return error.InputOutput;
     }
 
     /// This client's ring image (the RMW source of a re-stage); the lease
@@ -1810,6 +1879,10 @@ pub const DataPlane = struct {
             if (self.packer) |*p| p.releaseTenantRef(d);
             self.releaseHolds().drop(&.{d});
         }
+        // The departed record's cover round, after the locks (the meta
+        // barrier is a park); the dismount pass runs ONE round for all of
+        // its residents (`dismount`).
+        if (pass == .live and verdict != .kept) self.coverDeparted(io);
         return verdict;
     }
 
@@ -1909,7 +1982,7 @@ pub const DataPlane = struct {
             return false;
         };
         self.backend.commit(t) catch return false;
-        self.releaseStaged(k, generation);
+        _ = staging.releaseStaged(&self.stage.?.pool, &self.stage.?.seg, k, generation);
         pack.stats.layout_promoted_inline.inc();
         return true;
     }
@@ -1934,7 +2007,7 @@ pub const DataPlane = struct {
             return false;
         };
         self.ownBlockPublished(ob);
-        self.releaseStaged(k, generation);
+        _ = staging.releaseStaged(&self.stage.?.pool, &self.stage.?.seg, k, generation);
         pack.stats.layout_promoted_block.inc();
         return true;
     }
@@ -1952,7 +2025,15 @@ pub const DataPlane = struct {
             log.debug("promotion ino {d}: the pack arm is stopped", .{ino});
             return .{ .ok = false };
         };
+        // DUR-1: the tenant's DMA on stable storage before the packed
+        // layout naming it publishes.
+        if (self.vols.byTag(tag)) |v| self.promotionBarrier(io, v) catch |e| {
+            p.abandonPrepared(prepared);
+            log.debug("promotion ino {d}: the pack arm's barrier failed ({t})", .{ ino, e });
+            return .{ .ok = false };
+        };
         const t = self.backend.begin(@src()) catch {
+            p.abandonPrepared(prepared);
             return .{ .ok = false };
         };
         const outcome = p.commitLocked(prepared, .{

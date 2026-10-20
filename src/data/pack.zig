@@ -756,6 +756,13 @@ pub const Packer = struct {
         return .{ .committed = prev.durableCopy() };
     }
 
+    /// A prepared tenant the caller cannot commit (its barrier or its
+    /// transaction failed before `commitLocked`): the slot is abandoned —
+    /// never under the stripe.
+    pub fn abandonPrepared(self: *Packer, prepared: Prepared) void {
+        self.releaseLandedSite(prepared.tenant);
+    }
+
     /// The tenant's own reference leaves without a commit: TERMINAL when the
     /// pack sealed and every sibling was deleted — so never under the
     /// stripe.

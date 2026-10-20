@@ -43,6 +43,8 @@ const clock = @import("../core/clock.zig");
 const log = @import("../core/log.zig");
 const knobs = @import("../core/knobs.zig");
 const dlm = @import("../meta/dlm.zig");
+const jc = @import("../meta/journal_core.zig");
+const tick = @import("../sync/tick.zig");
 const staging = @import("staging.zig");
 const seams = @import("write_seams.zig");
 const device_overlay = @import("device_overlay.zig");
@@ -316,6 +318,104 @@ pub fn planBarriers(bits: u64, vols: *const seams.Volumes, out: *[256]u32) []u32
     }
     return out[0..n];
 }
+
+/// The promotion's data barrier (DUR-1 for the ONE promotion primitive,
+/// charter §6.1 "block I/O before the metadata type flip"): a promotion
+/// that DMA'd its image asks for ITS volume's flush before it publishes the
+/// layout naming the block, and is answered by a flush that STARTED after
+/// it asked — the journal lane's barrier law, the staging ring's
+/// `SyncCoalescer` shape: a request joins the pending batch; with no flush
+/// running it leads at once, else it parks; the leader issues ONE flush,
+/// hands every member its result and makes the oldest request that arrived
+/// meanwhile the next leader (one wake per waiter). So a promotion storm on
+/// one volume (the pressure pass, the dismount's residents) costs one flush
+/// per batch, never one per promotion; a lone promotion pays its own. A
+/// write-through volume owes none (the caller's `planBarriers` law).
+/// Nothing allocated: the waiter lives on the caller's frame; the lock
+/// guards the list alone and is never held across the flush.
+pub const BarrierCoalescer = struct {
+    lock: jc.SpinLock = .{},
+    head: ?*Waiter = null,
+    tail: ?*Waiter = null,
+    running: bool = false,
+
+    pub const Waiter = struct {
+        next: ?*Waiter = null,
+        /// 0 parked, 1 woken (`tick.wake`).
+        state: Atomic(u32) = .init(0),
+        /// Under the lock: pending → leader (with `batch`) or done (with
+        /// `result`). Read after the wake's acquire.
+        role: enum { pending, leader, done } = .pending,
+        batch: ?*Waiter = null,
+        result: seams.DmaError!void = {},
+    };
+
+    /// Pending requests (tests: the deterministic park observable).
+    pub fn pending(self: *BarrierCoalescer) u32 {
+        self.lock.lock();
+        defer self.lock.unlock();
+        var n: u32 = 0;
+        var cur = self.head;
+        while (cur) |w| : (cur = w.next) n += 1;
+        return n;
+    }
+
+    /// `vol_tag`'s acknowledged writes on stable storage before the return.
+    /// `coalesced` counts a request another's flush answered.
+    pub fn request(self: *BarrierCoalescer, io: Io, device: seams.DeviceSeam, vol_tag: u64, coalesced: *counters.ShardedCounter) seams.DmaError!void {
+        var w: Waiter = .{};
+        self.lock.lock();
+        if (self.tail) |t| t.next = &w else self.head = &w;
+        self.tail = &w;
+        if (!self.running) {
+            self.running = true;
+            self.takeBatchLocked(&w);
+            self.lock.unlock();
+        } else {
+            self.lock.unlock();
+            // acquire (in `park`) pairs with the leader's `tick.wake`
+            // release: `role`, `result` and the batch are visible.
+            while (w.state.load(.acquire) == 0) _ = tick.parkUncancelable(io, &w.state, null);
+            if (w.role == .done) {
+                coalesced.inc();
+                return w.result;
+            }
+            assert(w.role == .leader);
+        }
+        return self.lead(io, device, vol_tag, &w);
+    }
+
+    fn takeBatchLocked(self: *BarrierCoalescer, leader: *Waiter) void {
+        leader.role = .leader;
+        leader.batch = self.head;
+        self.head = null;
+        self.tail = null;
+    }
+
+    fn lead(self: *BarrierCoalescer, io: Io, device: seams.DeviceSeam, vol_tag: u64, w: *Waiter) seams.DmaError!void {
+        const result = device.flush(vol_tag);
+        self.lock.lock();
+        var cur = w.batch;
+        while (cur) |m| {
+            // A woken member returns and its frame dies: read `next` first.
+            const next = m.next;
+            if (m != w) {
+                m.result = result;
+                m.role = .done;
+                tick.wake(io, &m.state);
+            }
+            cur = next;
+        }
+        if (self.head) |successor| {
+            self.takeBatchLocked(successor);
+            tick.wake(io, &successor.state);
+        } else {
+            self.running = false;
+        }
+        self.lock.unlock();
+        return result;
+    }
+};
 
 // ---------------------------------------------------------------------------
 // §10.2 The ladder.
@@ -680,6 +780,74 @@ test "touched_table_word_law: stamp ORs bits and bumps the generation in ONE CAS
     try testing.expectEqual(@as(usize, 0), planBarriers(0, &f.vols, &out).len);
     try testing.expectEqual(@as(usize, 1), planBarriers(TouchedTable.ALL_BIT, &f.vols, &out).len);
     try testing.expectEqual(@as(usize, 0), planBarriers(0b10, &f.vols, &out).len); // only the write-through volume touched
+}
+
+test "the promotion's barrier coalescer (DUR-1 for the promotion arms): a flush in flight absorbs every request that arrives meanwhile into ONE following flush — 1 + 16 requests cost 2 flushes with 15 coalesced, every one answered by a flush that started after it asked; a failed flush reaches its batch alone; a lone request pays its own flush" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var dev = wt.FakeDevice.init(gpa);
+    defer dev.deinit();
+    // The hook runs inside the device's flush: the leader's flush is held
+    // in flight until the test releases it.
+    const Gate = struct {
+        hold: std.atomic.Value(u32) = .init(0),
+        in_flight: std.atomic.Value(u32) = .init(0),
+        fn call(ctx: *anyopaque, _: *wt.FakeDevice, _: u64, _: u64, _: u64) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            _ = self.in_flight.fetchAdd(1, .acq_rel);
+            defer _ = self.in_flight.fetchSub(1, .acq_rel);
+            while (self.hold.load(.acquire) != 0) std.Thread.yield() catch {};
+        }
+    };
+    var gate: Gate = .{};
+    dev.flush_hook = .{ .ctx = &gate, .call = &Gate.call };
+    var bc: BarrierCoalescer = .{};
+    var coalesced: counters.ShardedCounter = .{};
+    const Req = struct {
+        fn run(b: *BarrierCoalescer, io_: Io, d: seams.DeviceSeam, c: *counters.ShardedCounter, out: *anyerror!void) void {
+            out.* = b.request(io_, d, wt.VOL_A, c);
+        }
+    };
+    // A lone request: its own flush.
+    try bc.request(io, dev.seam(), wt.VOL_A, &coalesced);
+    try testing.expectEqual(@as(usize, 1), dev.flushes.items.len);
+    try testing.expectEqual(@as(u64, 0), coalesced.load());
+    // The leader's flush is held; sixteen more arrive and park.
+    const n = 16;
+    gate.hold.store(1, .release);
+    var results: [n + 1]anyerror!void = undefined;
+    var group: Io.Group = .init;
+    group.async(io, Req.run, .{ &bc, io, dev.seam(), &coalesced, &results[0] });
+    while (gate.in_flight.load(.acquire) == 0) try std.Thread.yield();
+    for (1..n + 1) |i| group.async(io, Req.run, .{ &bc, io, dev.seam(), &coalesced, &results[i] });
+    while (bc.pending() != n) try std.Thread.yield();
+    try testing.expectEqual(@as(usize, 1), dev.flushes.items.len); // the second flush has not been issued
+    gate.hold.store(0, .release);
+    group.await(io) catch |e| switch (e) {
+        error.Canceled => unreachable,
+    };
+    for (results) |r| try r;
+    // Three flushes in all: the lone one, the held leader's, ONE for the sixteen.
+    try testing.expectEqual(@as(usize, 3), dev.flushes.items.len);
+    try testing.expectEqual(@as(u64, n - 1), coalesced.load());
+    try testing.expectEqual(@as(u32, 0), bc.pending());
+    try testing.expect(!bc.running);
+    // A failure reaches its batch alone: the held leader's batch fails,
+    // the followers' flush succeeds.
+    gate.hold.store(1, .release);
+    dev.fail_next_flush = error.InputOutput;
+    var group2: Io.Group = .init;
+    group2.async(io, Req.run, .{ &bc, io, dev.seam(), &coalesced, &results[0] });
+    while (gate.in_flight.load(.acquire) == 0) try std.Thread.yield();
+    group2.async(io, Req.run, .{ &bc, io, dev.seam(), &coalesced, &results[1] });
+    while (bc.pending() != 1) try std.Thread.yield();
+    gate.hold.store(0, .release);
+    group2.await(io) catch |e| switch (e) {
+        error.Canceled => unreachable,
+    };
+    try testing.expectError(error.InputOutput, results[0]);
+    try results[1];
+    try testing.expectEqual(@as(usize, 4), dev.flushes.items.len);
 }
 
 const FsyncWorld = struct {

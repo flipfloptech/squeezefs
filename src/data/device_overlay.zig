@@ -304,42 +304,63 @@ pub const Core = struct {
         return decodeState(self.state.load(.acquire));
     }
 
-    fn wordBit(page: u32) struct { w: usize, m: u64 } {
-        return .{ .w = page / 64, .m = @as(u64, 1) << @intCast(page % 64) };
-    }
-
-    fn anyBit(words: *const [CLAIM_WORDS]Atomic(u64), first: u32, n: u32) bool {
+    /// The page range `[first, first + n)` as one mask per 64-page word:
+    /// `f(word_index, mask)` once per word the range touches. A 1 MiB
+    /// store is 256 pages = 4 words, so every claim, cover and release
+    /// below is four atomics, not 256 (measured 14 % of the handler's CPU
+    /// on 1M seq write ×4 as per-page SeqCst RMWs).
+    fn eachWord(first: u32, n: u32, ctx: anytype, comptime f: fn (@TypeOf(ctx), usize, u64) bool) bool {
+        const word_bits: u32 = @bitSizeOf(u64);
+        if (n == 0) return true;
         var p = first;
-        while (p < first + n) : (p += 1) {
-            const wb = wordBit(p);
-            if (words[wb.w].load(.seq_cst) & wb.m != 0) return true;
-        }
-        return false;
-    }
-
-    fn allBits(words: *const [CLAIM_WORDS]Atomic(u64), first: u32, n: u32) bool {
-        var p = first;
-        while (p < first + n) : (p += 1) {
-            const wb = wordBit(p);
-            if (words[wb.w].load(.seq_cst) & wb.m == 0) return false;
+        const end = first + n;
+        while (p < end) {
+            const w: usize = p / word_bits;
+            const lo: u6 = @intCast(p % word_bits);
+            const span: u32 = @min(end - p, word_bits - @as(u32, lo));
+            const bits: u64 = if (span == word_bits) std.math.maxInt(u64) else (@as(u64, 1) << @intCast(span)) - 1;
+            if (!f(ctx, w, bits << lo)) return false;
+            p += span;
         }
         return true;
     }
 
-    fn setBits(words: *[CLAIM_WORDS]Atomic(u64), first: u32, n: u32) void {
-        var p = first;
-        while (p < first + n) : (p += 1) {
-            const wb = wordBit(p);
-            _ = words[wb.w].fetchOr(wb.m, .seq_cst);
-        }
+    const Words = *const [CLAIM_WORDS]Atomic(u64);
+    const WordsMut = *[CLAIM_WORDS]Atomic(u64);
+
+    fn anyBit(words: Words, first: u32, n: u32) bool {
+        const none = eachWord(first, n, words, struct {
+            fn f(ws: Words, w: usize, m: u64) bool {
+                return ws[w].load(.seq_cst) & m == 0;
+            }
+        }.f);
+        return !none;
     }
 
-    fn clearBits(words: *[CLAIM_WORDS]Atomic(u64), first: u32, n: u32) void {
-        var p = first;
-        while (p < first + n) : (p += 1) {
-            const wb = wordBit(p);
-            _ = words[wb.w].fetchAnd(~wb.m, .seq_cst);
-        }
+    fn allBits(words: Words, first: u32, n: u32) bool {
+        return eachWord(first, n, words, struct {
+            fn f(ws: Words, w: usize, m: u64) bool {
+                return ws[w].load(.seq_cst) & m == m;
+            }
+        }.f);
+    }
+
+    fn setBits(words: WordsMut, first: u32, n: u32) void {
+        _ = eachWord(first, n, words, struct {
+            fn f(ws: WordsMut, w: usize, m: u64) bool {
+                _ = ws[w].fetchOr(m, .seq_cst);
+                return true;
+            }
+        }.f);
+    }
+
+    fn clearBits(words: WordsMut, first: u32, n: u32) void {
+        _ = eachWord(first, n, words, struct {
+            fn f(ws: WordsMut, w: usize, m: u64) bool {
+                _ = ws[w].fetchAnd(~m, .seq_cst);
+                return true;
+            }
+        }.f);
     }
 
     /// Under (3): range check → claim (an in-flight overlap refuses — law
@@ -1757,6 +1778,57 @@ test "overlay_core: coverage publishes only on a successful complete (law 3); th
     try testing.expect(e.readValid(snap));
     _ = try e.beginStore(0, 1);
     try testing.expect(!e.readValid(snap));
+}
+
+test "overlay_core: the word-wise claim bitmap ≡ the per-page one — any/all/set/clear over 2,000 random page ranges (word-crossing, word-aligned, whole-block) against a per-page reference; a 256-page claim touches exactly the four words it spans" {
+    var prng = std.Random.DefaultPrng.init(0x5e9);
+    const r = prng.random();
+    var words: [CLAIM_WORDS]Atomic(u64) = @splat(.init(0));
+    var ref: [MAX_OVERLAY_PAGES]bool = @splat(false);
+    var i: usize = 0;
+    while (i < 2000) : (i += 1) {
+        const first: u32 = r.uintLessThan(u32, MAX_OVERLAY_PAGES);
+        const max_n: u32 = @intCast(MAX_OVERLAY_PAGES - first);
+        const n: u32 = switch (r.uintLessThan(u8, 4)) {
+            0 => @min(max_n, 256), // the 1 MiB store
+            1 => @min(max_n, 1 + r.uintLessThan(u32, 130)), // word-crossing shapes
+            2 => max_n, // to the block's end
+            else => @min(max_n, 64), // one word or two halves
+        };
+        const any_ref = blk: {
+            for (ref[first .. first + n]) |b| if (b) break :blk true;
+            break :blk false;
+        };
+        const all_ref = blk: {
+            for (ref[first .. first + n]) |b| if (!b) break :blk false;
+            break :blk true;
+        };
+        try testing.expectEqual(any_ref, Core.anyBit(&words, first, n));
+        try testing.expectEqual(all_ref, Core.allBits(&words, first, n));
+        if (r.boolean()) {
+            Core.setBits(&words, first, n);
+            @memset(ref[first .. first + n], true);
+        } else {
+            Core.clearBits(&words, first, n);
+            @memset(ref[first .. first + n], false);
+        }
+        for (ref, 0..) |b, p| {
+            const got = words[p / 64].load(.monotonic) & (@as(u64, 1) << @intCast(p % 64)) != 0;
+            try testing.expectEqual(b, got);
+        }
+    }
+    // A 1 MiB store at page 256: words 4..7 set whole, every other word untouched.
+    var w2: [CLAIM_WORDS]Atomic(u64) = @splat(.init(0));
+    Core.setBits(&w2, 256, 256);
+    for (&w2, 0..) |*w, k| try testing.expectEqual(@as(u64, if (k >= 4 and k < 8) std.math.maxInt(u64) else 0), w.load(.monotonic));
+    try testing.expect(Core.allBits(&w2, 256, 256));
+    try testing.expect(!Core.anyBit(&w2, 0, 256));
+    try testing.expect(Core.anyBit(&w2, 255, 2));
+    Core.clearBits(&w2, 300, 100);
+    try testing.expect(!Core.allBits(&w2, 256, 256));
+    try testing.expect(Core.allBits(&w2, 256, 44));
+    try testing.expect(Core.allBits(&w2, 400, 112));
+    try testing.expect(!Core.anyBit(&w2, 300, 100));
 }
 
 test "overlay_core: freeze refuses new stores and the in-flight set drains to publishable; law 9 rollback requires terminal ∧ empty; fence_drop is terminal and never publishable; fed is reachable only from the freeze" {

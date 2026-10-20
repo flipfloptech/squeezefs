@@ -583,11 +583,14 @@ fn chunkInto(gpa: std.mem.Allocator, node: []const u32, which: u32, width: u32, 
     if (in_chunk != 0) try bounds.append(gpa, filled.*);
 }
 
-/// Per-group SQ entries: `max(next_pow2(width × depth + 8), 16)` — every
-/// member's REGISTERs plus the wake PollAdd and a commit batch in flight; the
-/// CQ is sized `sq × 2` by the ring binding (worst pass `2 × depth + 1`).
-pub fn sqEntries(width: u32, depth: u32) u32 {
-    return @intCast(@max(derive.nextPow2(@as(u64, width) * depth + 8), 16));
+/// Per-group SQ entries: `max(next_pow2(width × depth × (1 + bridge_pieces) + 8), 16)`
+/// — every member's REGISTERs or commits plus the wake PollAdd, and under
+/// zero copy every ent's bridge in up to `bridge_pieces` SQEs
+/// (`zc.BRIDGE_PIECES_MAX`; 1 on a session without bridges); the CQ is sized
+/// `sq × 2` by the ring binding. Clamped to the kernel's `IORING_MAX_ENTRIES`.
+pub fn sqEntries(width: u32, depth: u32, bridge_pieces: u32) u32 {
+    const want = derive.nextPow2(@as(u64, width) * depth * (1 + @as(u64, bridge_pieces)) + 8);
+    return @intCast(@min(@max(want, 16), 32768)); // IORING_MAX_ENTRIES: the kernel's SQ ceiling
 }
 
 // ---------------------------------------------------------------------------
@@ -1009,20 +1012,26 @@ test "drain groups: holes {4,6,14,16,22,24,30} on one node ⇒ 5 node chunks (6,
     try expectCoverage(&g, 32);
 }
 
-test "drain width = max(n/4, 1); sq entries = max(next_pow2(width × depth + 8), 16)" {
+test "drain width = max(n/4, 1); sq entries = max(next_pow2(width × depth × (1 + pieces) + 8), 16), at most the kernel's 32768" {
     try testing.expectEqual(@as(u32, 8), drainGroupWidth(32));
     try testing.expectEqual(@as(u32, 1), drainGroupWidth(3));
     try testing.expectEqual(@as(u32, 1), drainGroupWidth(0));
     try testing.expectEqual(@as(u32, 128), drainGroupWidth(512));
-    try testing.expectEqual(@as(u32, 512), sqEntries(8, 32));
-    try testing.expectEqual(@as(u32, 64), sqEntries(1, 32));
-    try testing.expectEqual(@as(u32, 16), sqEntries(1, 4));
-    try testing.expectEqual(@as(u32, 16), sqEntries(1, 8));
-    try testing.expectEqual(@as(u32, 32), sqEntries(1, 9));
-    try testing.expectEqual(@as(u32, 16), sqEntries(1, 1));
+    // No bridges (pieces 0): the register/commit shape alone.
+    try testing.expectEqual(@as(u32, 512), sqEntries(8, 32, 0));
+    try testing.expectEqual(@as(u32, 64), sqEntries(1, 32, 0));
+    try testing.expectEqual(@as(u32, 16), sqEntries(1, 4, 0));
+    try testing.expectEqual(@as(u32, 16), sqEntries(1, 8, 0));
+    try testing.expectEqual(@as(u32, 32), sqEntries(1, 9, 0));
+    try testing.expectEqual(@as(u32, 16), sqEntries(1, 1, 0));
     // 128 × 32 + 8 = 4104 → the next power of two above it.
-    try testing.expectEqual(@as(u32, 8192), sqEntries(128, 32));
-    try testing.expectEqual(@as(u32, 4096), sqEntries(127, 32));
+    try testing.expectEqual(@as(u32, 8192), sqEntries(128, 32, 0));
+    try testing.expectEqual(@as(u32, 4096), sqEntries(127, 32, 0));
+    // A zero-copy ring: every ent's bridge in up to 8 pieces beside its commit (16 × 9 + 8 = 152 → 256).
+    try testing.expectEqual(@as(u32, 256), sqEntries(1, 16, 8));
+    try testing.expectEqual(@as(u32, 512), sqEntries(1, 32, 8));
+    // The kernel's ceiling holds at any width.
+    try testing.expectEqual(@as(u32, 32768), sqEntries(128, 32, 8));
 }
 
 test "rings per queue: 2 where the FEATURES probe reads present on kmbuf/zc, 1 on UserEnts and wherever it reads absent; explicit wins up to the ceiling of 4; the shares split the depth ceil/rest with the queue's depth unchanged and ring 1's base at ring 0's depth" {

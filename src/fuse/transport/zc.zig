@@ -196,6 +196,48 @@ pub fn streamingFloor(block: u64) u64 {
     return block / 8; // block/8: W1's ceiling, the overlay's floor (charter §6.2 items 1–2)
 }
 
+// ---------------------------------------------------------------------------
+// The bridge's NOWAIT pieces (rung-10-seq-parity)
+// ---------------------------------------------------------------------------
+
+/// A `READ_FIXED`/`WRITE_FIXED` to a BLOCK DEVICE larger than its queue's
+/// `max_sectors` is refused by the block layer's NOWAIT attempt (a
+/// `REQ_NOWAIT` bio cannot be split: `bio_split_rw` → -EAGAIN) and
+/// re-issued on io-wq — the doomed attempt's CPU, an io-wq worker's wake
+/// (measured 192 µs mean, p50 8 µs, on 1M seq write ×4) and 0.9 cores of
+/// `iou-wrk`; iomap filesystems set no `REQ_NOWAIT` on their bios and pay
+/// none of it. So a bridge is pushed in pieces at or under the fd's
+/// ceiling — each one's bio needs no split and lands inline — up to this
+/// many pieces: the 1 MiB `max_write` over the smallest common NVMe
+/// `max_sectors_kb` (128 KiB; nvme-loop 1020 KiB, nvme-tcp 508 KiB). A
+/// ceiling that would need more pieces keeps the one-SQE push (the punt).
+pub const BRIDGE_PIECES_MAX: u32 = 8;
+
+/// Pieces for `len` under `ceiling` (0 = no ceiling: a regular file, a
+/// pipe, an unprobed fd): 1, or `ceil(len / ceiling)` within the bound.
+pub fn bridgePieces(len: u32, ceiling: u32) u32 {
+    if (ceiling == 0 or len <= ceiling) return 1;
+    const n: u32 = @intCast(derive.ceilDiv(len, ceiling));
+    return if (n > BRIDGE_PIECES_MAX) 1 else n;
+}
+
+/// The NOWAIT ceiling from the queue's sysfs facts: `max_sectors_kb`
+/// (the split bound) and `max_segments × page` (the registered table's
+/// one-page bvecs), the smaller; 0 when either is absent or unparsable.
+pub fn nowaitCeiling(max_sectors_kb: ?u64, max_segments: ?u64, page: u64) u32 {
+    const by_bytes = (max_sectors_kb orelse return 0) * derive.KiB;
+    const by_segs = (max_segments orelse return 0) * page;
+    const c = @min(by_bytes, by_segs);
+    return if (c == 0 or c > std.math.maxInt(u32)) 0 else @intCast(c);
+}
+
+/// A sysfs queue attribute's text: a decimal with a trailing newline.
+pub fn parseSysfsUnsigned(text: []const u8) ?u64 {
+    const t = std.mem.trim(u8, text, " \t\r\n");
+    if (t.len == 0) return null;
+    return std.fmt.parseInt(u64, t, 10) catch null;
+}
+
 /// The stability law (porting spec §5.2): page-cache folios are sound after
 /// an ACK-early (a later modification is a redirty = a new WRITE);
 /// O_DIRECT/GUP pages are NOT (the app owns them again at write(2)'s return
@@ -435,6 +477,27 @@ test "the hold shape: 4 KiB alignment, within one block, zero length never, no b
     try testing.expectEqual(patch_max, streamingFloor(block));
     try testing.expectEqual(@as(u64, 512 << 10), streamingFloor(block));
     try testing.expectEqual(@import("../../data/sole_owner_patch.zig").patchMaxDerived(block), streamingFloor(block));
+}
+
+test "the bridge's NOWAIT pieces: no ceiling or a fitting DMA is one piece; nvme-loop's 1020 KiB cuts 1 MiB in two, nvme-tcp's 508 KiB in three, a 128 KiB NVMe in eight (the bound); a ceiling needing more keeps the one-SQE push; the ceiling is the smaller of max_sectors_kb and max_segments × page, 0 when either is absent" {
+    const mib: u32 = 1 << 20;
+    try testing.expectEqual(@as(u32, 1), bridgePieces(mib, 0));
+    try testing.expectEqual(@as(u32, 1), bridgePieces(4096, 1020 << 10));
+    try testing.expectEqual(@as(u32, 1), bridgePieces(1020 << 10, 1020 << 10));
+    try testing.expectEqual(@as(u32, 2), bridgePieces(mib, 1020 << 10));
+    try testing.expectEqual(@as(u32, 3), bridgePieces(mib, 508 << 10));
+    try testing.expectEqual(@as(u32, 8), bridgePieces(mib, 128 << 10));
+    try testing.expectEqual(@as(u32, 1), bridgePieces(mib, 64 << 10));
+    try testing.expectEqual(@as(u32, 8), BRIDGE_PIECES_MAX);
+    // nvme-loop: 1020 KiB over 256 segments of a page ⇒ 1020 KiB; a 128 KiB / 33-segment NVMe ⇒ 128 KiB.
+    try testing.expectEqual(@as(u32, 1020 << 10), nowaitCeiling(1020, 256, 4096));
+    try testing.expectEqual(@as(u32, 128 << 10), nowaitCeiling(128, 33, 4096));
+    try testing.expectEqual(@as(u32, 16 << 10), nowaitCeiling(1020, 4, 4096));
+    try testing.expectEqual(@as(u32, 0), nowaitCeiling(null, 256, 4096));
+    try testing.expectEqual(@as(u32, 0), nowaitCeiling(1020, null, 4096));
+    try testing.expectEqual(@as(?u64, 1020), parseSysfsUnsigned("1020\n"));
+    try testing.expectEqual(@as(?u64, null), parseSysfsUnsigned("\n"));
+    try testing.expectEqual(@as(?u64, null), parseSysfsUnsigned("x"));
 }
 
 test "the stability class: O_DIRECT without FUSE_WRITE_CACHE is direct_gup; a writeback-cache write is page_cache even with O_DIRECT; a plain write is page_cache" {

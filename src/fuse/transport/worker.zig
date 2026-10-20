@@ -272,6 +272,14 @@ pub var owed_spin_hits: counters.ShardedCounter = .{};
 pub var owed_spin_falls: counters.ShardedCounter = .{};
 pub var owed_spin_skips: counters.ShardedCounter = .{};
 pub var owed_spin_ns: counters.ShardedCounter = .{};
+/// `transport_zc_bridge_splits` / `_pieces`: bridges pushed as more than one
+/// SQE (`zc.bridgePieces` under the fd's NOWAIT ceiling) and the SQEs they
+/// took; `transport_nowait_ceiling_probes` the fds probed once,
+/// `transport_nowait_ceiling_table_full` the fds a full table answered 0.
+pub var zc_bridge_splits: counters.ShardedCounter = .{};
+pub var zc_bridge_pieces: counters.ShardedCounter = .{};
+pub var nowait_ceiling_probes: counters.ShardedCounter = .{};
+pub var nowait_ceiling_table_full: counters.ShardedCounter = .{};
 /// `transport_held_write_phase_ns`: a HELD write's life on its worker, in
 /// three exact-sum phases — `to_store` delivery → its direct store's SQE
 /// pushed (the dispatch, the admission, the handler's hop to this ring),
@@ -491,19 +499,81 @@ pub fn prepRelease(sqe: *uring128.Sqe128, qid: u16, commit_id: u64, gent: u32) v
     sqe.user_data = tagOf(.release, gent);
 }
 
-/// The fd→slot bridge (`READ_FIXED(fd @ off → slot ent_idx)`, addr 0 = the
-/// slot's byte offset 0 under a kernel-registered zc slot).
-pub fn prepBridgeFetch(sqe: *uring128.Sqe128, fd: linux.fd_t, off: u64, len: u32, ent_idx: u16, gent: u32) void {
-    uring128.prepReadFixed(sqe, .{ .raw = fd }, ent_idx, off, len, 0);
+/// The fd→slot bridge (`READ_FIXED(fd @ off → slot ent_idx @ slot_off)`;
+/// `slot_off` is the byte offset into the kernel-registered zc slot — 0 for
+/// a whole bridge, a piece's start otherwise).
+pub fn prepBridgeFetch(sqe: *uring128.Sqe128, fd: linux.fd_t, off: u64, len: u32, ent_idx: u16, gent: u32, slot_off: u64) void {
+    uring128.prepReadFixed(sqe, .{ .raw = fd }, ent_idx, off, len, slot_off);
     sqe.user_data = tagOf(.bridge, gent);
 }
 
-/// The slot→fd bridge (`WRITE_FIXED(slot ent_idx → fd @ off)`): extraction
-/// into the bounce, or rung 4's direct store into a device.
-pub fn prepBridgeStore(sqe: *uring128.Sqe128, fd: linux.fd_t, off: u64, len: u32, ent_idx: u16, gent: u32) void {
-    uring128.prepWriteFixed(sqe, .{ .raw = fd }, ent_idx, off, len, 0);
+/// The slot→fd bridge (`WRITE_FIXED(slot ent_idx @ slot_off → fd @ off)`):
+/// extraction into the bounce, or rung 4's direct store into a device.
+pub fn prepBridgeStore(sqe: *uring128.Sqe128, fd: linux.fd_t, off: u64, len: u32, ent_idx: u16, gent: u32, slot_off: u64) void {
+    uring128.prepWriteFixed(sqe, .{ .raw = fd }, ent_idx, off, len, slot_off);
     sqe.user_data = tagOf(.bridge, gent);
 }
+
+/// The NOWAIT ceilings of the fds this worker bridges to (`zc.nowaitCeiling`),
+/// probed ONCE per fd from the queue's sysfs facts — a block device's
+/// `max_sectors_kb` and `max_segments`; a regular file, a pipe or an
+/// unreadable queue has none (0). Worker-owned, no lock; the table is the
+/// data devices plus the bounce memfds a worker meets (a session's fds).
+pub const NowaitCeilings = struct {
+    /// Enough for the data volumes (`router.MAX_VOLUMES`-class) and the
+    /// member queues' bounce fds; a full table answers 0 (counted).
+    const capacity = 16;
+    fds: [capacity]linux.fd_t = @splat(-1),
+    ceilings: [capacity]u32 = @splat(0),
+    len: u8 = 0,
+    /// A test's pin: a non-null value answers every fd (the pieces path
+    /// over a memfd stand-in).
+    force: ?u32 = null,
+
+    pub fn of(self: *NowaitCeilings, fd: linux.fd_t, page: u64) u32 {
+        if (self.force) |c| return c;
+        for (self.fds[0..self.len], self.ceilings[0..self.len]) |f, c| if (f == fd) return c;
+        const c = probe(fd, page);
+        if (self.len == capacity) {
+            nowait_ceiling_table_full.inc();
+            return 0;
+        }
+        self.fds[self.len] = fd;
+        self.ceilings[self.len] = c;
+        self.len += 1;
+        nowait_ceiling_probes.inc();
+        return c;
+    }
+
+    fn probe(fd: linux.fd_t, page: u64) u32 {
+        var st: linux.Statx = undefined;
+        if (linux.errno(linux.statx(fd, "", linux.AT.EMPTY_PATH, .{ .TYPE = true }, &st)) != .SUCCESS) return 0;
+        if (!linux.S.ISBLK(st.mode)) return 0;
+        var text: [32]u8 = undefined;
+        var pbuf: [96]u8 = undefined;
+        // A partition has no queue of its own: `../queue` is its disk's.
+        inline for (.{ "/sys/dev/block/{d}:{d}/queue/", "/sys/dev/block/{d}:{d}/../queue/" }) |dir| {
+            const sectors_path = std.mem.printSentinel(&pbuf, dir ++ "max_sectors_kb", .{ st.rdev_major, st.rdev_minor }, 0) catch return 0;
+            if (readSysfs(sectors_path, &text)) |sectors| {
+                const segments_path = std.mem.printSentinel(&pbuf, dir ++ "max_segments", .{ st.rdev_major, st.rdev_minor }, 0) catch return 0;
+                return zc.nowaitCeiling(sectors, readSysfs(segments_path, &text), page);
+            }
+        }
+        return 0;
+    }
+
+    /// One-time configuration read at the first bridge to an fd (never on
+    /// the I/O path proper: the answer is cached for the worker's life).
+    fn readSysfs(path: [:0]const u8, buf: []u8) ?u64 {
+        const fd_raw = linux.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+        if (linux.errno(fd_raw) != .SUCCESS) return null;
+        const fd: linux.fd_t = @intCast(fd_raw);
+        defer _ = linux.close(fd);
+        const n = linux.read(fd, buf.ptr, buf.len);
+        if (linux.errno(n) != .SUCCESS) return null;
+        return zc.parseSysfsUnsigned(buf[0..n]);
+    }
+};
 
 // ---------------------------------------------------------------------------
 // Shared session-level state every group reads.
@@ -676,6 +746,9 @@ pub const Shared = struct {
     /// pipe with no writer (`stall_pipe[0]`) and never complete.
     bridge_stall_remaining: std.atomic.Value(u32) = .init(0),
     stall_pipe: [2]linux.fd_t = .{ -1, -1 },
+    /// `SQUEEZEFS_TEST_ZC_BRIDGE_CEILING`: every bridge fd's NOWAIT ceiling
+    /// (0 = probe the fd's queue).
+    test_bridge_ceiling: u32 = 0,
     /// Test seam (in-process; the late-completion pin): the next N backstop
     /// ticks hold their worker in an unbounded park before the reap.
     tick_await_cqe_remaining: std.atomic.Value(u32) = .init(0),
@@ -770,6 +843,11 @@ const Pend = struct {
     kind: Kind,
     /// The bridge's DMA length.
     len: u32,
+    /// Pieces still owing a CQE (`zc.bridgePieces`): the pend resolves on
+    /// the last one, with `moved` bytes or the first failure.
+    pieces_left: u8 = 1,
+    moved: u32 = 0,
+    failed: i32 = 0,
     /// The reply's payload length when it differs from `len` (a short
     /// paged READ bridges its zero-completed pages: `len` ≥ `reply_len`);
     /// 0 = `len`.
@@ -899,6 +977,8 @@ pub const Group = struct {
     /// one RELEASE per retention, so one flag.
     release_teardown: []bool,
     last_scan_ns: u64 = 0,
+    /// The NOWAIT ceilings of the fds this worker bridged to (worker thread only).
+    ceilings: NowaitCeilings = .{},
     affinity: ?placement.CpuSet,
     thread: ?std.Thread = null,
     /// 0 starting, 1 armed, 2 failed, 3 failed with the typed kmbuf
@@ -1443,6 +1523,7 @@ pub const Group = struct {
         }
         current_group = self;
         defer current_group = null;
+        if (self.shared.test_bridge_ceiling != 0) self.ceilings.force = self.shared.test_bridge_ceiling;
         self.registerAll();
         self.started.store(1, .release);
         futex.wakeAll(&self.started);
@@ -1778,7 +1859,7 @@ pub const Group = struct {
     };
 
     fn initRing(self: *Group) RingError!void {
-        const entries: u16 = @intCast(geometry.sqEntries(@intCast(self.members.len), self.depth));
+        const entries: u16 = @intCast(geometry.sqEntries(@intCast(self.members.len), self.depth, if (self.shared.zeroCopy()) zc.BRIDGE_PIECES_MAX else 0));
         const ladder: []const u32 = if (self.shared.sqpoll) &sqpoll_ladder else &uring128.taskrun_ladder_flags;
         self.ring = uring128.ParkedRing128.initProbing(self.gpa, entries, ladder, &self.ring_rung) catch return error.RingSetupFailed;
         errdefer self.ring.deinit();
@@ -2008,22 +2089,44 @@ pub const Group = struct {
     /// Push one bridge on this ring and stamp its deadline. At most ONE pend
     /// per ent: a second is refused (the caller falls back). `fetch` moves
     /// fd → slot, else slot → fd.
+    /// Push a bridge: ONE tag, `zc.bridgePieces` SQEs — each at or under the
+    /// fd's NOWAIT ceiling so no piece's bio is split (a split REQ_NOWAIT bio
+    /// is -EAGAIN and an io-wq re-issue). The pend resolves at the last
+    /// piece's CQE. Refused (false) when the SQ cannot take every piece.
     fn pushBridge(self: *Group, gent: u32, pend: Pend, fd: linux.fd_t, off: u64, fetch: bool) bool {
         if (self.pends[gent] != null) return false;
         if (pend.len == 0) return false;
-        const sqe = self.takeSqe() orelse return false;
         var src_fd = fd;
         var src_off = off;
         if (fetch) if (self.stallSource()) |pipe_rd| {
             src_fd = pipe_rd;
             src_off = 0;
         };
+        const ceiling = self.ceilings.of(src_fd, self.shared.page);
+        const pieces = zc.bridgePieces(pend.len, ceiling);
+        if (self.ring.ring.sqSpaceLeft() < pieces) {
+            sq_full.fire("transport ring SQ cannot take a bridge's pieces after a flush");
+            return false;
+        }
         const e = self.entIdxOf(gent);
-        if (fetch) prepBridgeFetch(sqe, src_fd, src_off, pend.len, e, gent) else prepBridgeStore(sqe, src_fd, src_off, pend.len, e, gent);
+        var done: u32 = 0;
+        var i: u32 = 0;
+        while (i < pieces) : (i += 1) {
+            const plen: u32 = if (pieces == 1) pend.len else @min(ceiling, pend.len - done);
+            const sqe = self.takeSqe() orelse return false;
+            if (fetch) prepBridgeFetch(sqe, src_fd, src_off + done, plen, e, gent, done) else prepBridgeStore(sqe, src_fd, src_off + done, plen, e, gent, done);
+            done += plen;
+        }
         // Every bounce bridge names the window bytes in play (a staged body
         // read out of it, an extraction written into it).
         if (self.shared.slab != null and fd == self.bounceFd(gent)) self.noteBouncePopulated(gent, pend.len);
-        self.pends[gent] = pend;
+        var p = pend;
+        p.pieces_left = @intCast(pieces);
+        self.pends[gent] = p;
+        if (pieces > 1) {
+            zc_bridge_splits.inc();
+            zc_bridge_pieces.add(pieces);
+        }
         if (self.deadlines.stamp(gent, clock.monotonicNs())) zc_bridge_pends.add(1);
         zc_bridges.inc();
         return true;
@@ -2081,14 +2184,26 @@ pub const Group = struct {
             const gent: u32 = @intCast(g);
             log.err("transport: queue {d} ent {d}: {t} bridge of {d} bytes outstanding {d} ms — cancelling", .{ self.memberOf(gent).qid, self.entIdxOf(gent), self.pends[g].?.kind, self.pends[g].?.len, (now -| self.deadlines.born_ns[g]) / std.time.ns_per_ms });
             const sqe = self.takeSqe() orelse continue;
-            uring128.prepAsyncCancel(sqe, .{ .user_data = tagOf(.bridge, gent) });
+            // A split bridge: every piece carries the tag, so every piece is cancelled.
+            if (self.pends[g].?.pieces_left > 1) uring128.prepAsyncCancel(sqe, .{ .user_data_all = tagOf(.bridge, gent) }) else uring128.prepAsyncCancel(sqe, .{ .user_data = tagOf(.bridge, gent) });
             sqe.user_data = tagOf(.cancel, gent);
         }
     }
 
-    /// A bridge CQE: resolve the pend by its kind.
-    fn handleBridgeCqe(self: *Group, gent: u32, res: i32) void {
+    /// A bridge CQE: a piece before the last folds its verdict into the pend
+    /// (the bytes moved, or the first failure); the last resolves the pend by
+    /// its kind with the whole bridge's result.
+    fn handleBridgeCqe(self: *Group, gent: u32, piece_res: i32) void {
         const born = self.deadlines.born_ns[gent];
+        const live: *Pend = if (self.pends[gent]) |*p| p else return;
+        if (live.pieces_left > 1) {
+            if (piece_res < 0) {
+                if (live.failed == 0) live.failed = piece_res;
+            } else live.moved +|= @intCast(piece_res);
+            live.pieces_left -= 1;
+            return;
+        }
+        const res: i32 = if (live.failed != 0) live.failed else if (piece_res < 0) piece_res else @intCast(@min(live.moved +| @as(u32, @intCast(piece_res)), std.math.maxInt(i32)));
         const pend = self.clearPend(gent) orelse return;
         self.sampleBridgeRoundTrip(born, pend.len);
         const m = self.memberOf(gent);
@@ -2199,10 +2314,16 @@ pub const Group = struct {
 
     /// The cancel's OWN CQE: the four-arm ladder.
     fn handleCancelCqe(self: *Group, gent: u32, res: i32) void {
-        switch (zc.cancelAction(res, self.pends[gent] != null)) {
+        // A split bridge's CANCEL_ALL answers the pieces it cancelled: a
+        // positive count is the plain cancel's 0 (their CQEs follow).
+        const split = if (self.pends[gent]) |p| p.pieces_left > 1 else false;
+        const verdict = if (split and res > 0) 0 else res;
+        switch (zc.cancelAction(verdict, self.pends[gent] != null)) {
             .nothing, .await_original => {},
             .synthesize_lost => {
                 bridge_lost.fire("a bridge completion was posted but never reaped; synthesized");
+                // Every owed piece is lost: the synthesis stands for all of them.
+                if (self.pends[gent]) |*p| p.pieces_left = 1;
                 self.handleBridgeCqe(gent, -@as(i32, @intCast(@backingInt(linux.E.TIMEDOUT))));
             },
             .restamp => {
@@ -3556,7 +3677,7 @@ test "REGISTER SQE bytes: URING_CMD on fixed file 0, cmd_op 1 at +8, the 2-iovec
     try testing.expectEqual(@as(u16, 0), std.mem.readInt(u16, c[66..68], .little));
     try testing.expectEqual(tagOf(.commit, 3), sqe.user_data);
 
-    prepBridgeFetch(&sqe, 9, 8192, 4096, 5, 11);
+    prepBridgeFetch(&sqe, 9, 8192, 4096, 5, 11, 0);
     try testing.expectEqual(linux.IORING_OP.READ_FIXED, sqe.opcode);
     try testing.expectEqual(@as(i32, 9), sqe.fd);
     try testing.expectEqual(@as(u64, 8192), sqe.off);
@@ -3565,10 +3686,15 @@ test "REGISTER SQE bytes: URING_CMD on fixed file 0, cmd_op 1 at +8, the 2-iovec
     try testing.expectEqual(@as(u64, 0), sqe.addr);
     try testing.expectEqual(tagOf(.bridge, 11), sqe.user_data);
 
-    prepBridgeStore(&sqe, 9, 16384, 4096, 6, 12);
+    prepBridgeStore(&sqe, 9, 16384, 4096, 6, 12, 0);
     try testing.expectEqual(linux.IORING_OP.WRITE_FIXED, sqe.opcode);
     try testing.expectEqual(@as(u64, 16384), sqe.off);
     try testing.expectEqual(@as(u16, 6), sqe.buf_index);
+    try testing.expectEqual(tagOf(.bridge, 12), sqe.user_data);
+    // A piece: the slot's byte offset rides `addr`, the file offset advances with it, the tag is the bridge's.
+    prepBridgeStore(&sqe, 9, 16384 + (1020 << 10), 4096, 6, 12, 1020 << 10);
+    try testing.expectEqual(@as(u64, 1020 << 10), sqe.addr);
+    try testing.expectEqual(@as(u64, 16384 + (1020 << 10)), sqe.off);
     try testing.expectEqual(tagOf(.bridge, 12), sqe.user_data);
 }
 

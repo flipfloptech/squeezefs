@@ -1566,6 +1566,8 @@ pub const Session = struct {
         const stall = knobs.intKnob("SQUEEZEFS_TEST_ZC_BRIDGE_STALL", u32, env);
         const deadline_ms = knobs.intKnob("SQUEEZEFS_TEST_ZC_BRIDGE_DEADLINE_MS", u64, env);
         if (deadline_ms != 0) self.shared.bridge_deadline_ns = deadline_ms * std.time.ns_per_ms;
+        const ceiling = knobs.intKnob("SQUEEZEFS_TEST_ZC_BRIDGE_CEILING", u32, env);
+        if (ceiling != 0) self.shared.test_bridge_ceiling = ceiling;
         if (stall == 0) return;
         var fds: [2]linux.fd_t = undefined;
         if (linux.errno(linux.pipe2(&fds, .{ .CLOEXEC = true })) != .SUCCESS) return;
@@ -1994,6 +1996,10 @@ pub const Session = struct {
         try field(w, "transport_zc_fallbacks", worker.zc_fallbacks.load());
         try field(w, "transport_zc_readdir_latch", worker.zc_readdir_latch.load());
         try field(w, "transport_zc_bridges", worker.zc_bridges.load());
+        try field(w, "transport_zc_bridge_splits", worker.zc_bridge_splits.load());
+        try field(w, "transport_zc_bridge_pieces", worker.zc_bridge_pieces.load());
+        try field(w, "transport_nowait_ceiling_probes", worker.nowait_ceiling_probes.load());
+        try field(w, "transport_nowait_ceiling_table_full", worker.nowait_ceiling_table_full.load());
         try field(w, "transport_zc_bridge_pends", worker.zc_bridge_pends.load());
         try field(w, "transport_zc_bridge_cancels", worker.bridge_cancels.load());
         try field(w, "transport_zc_bridge_lost", worker.bridge_lost.load());
@@ -3650,6 +3656,65 @@ test "e2e zc WRITE, the overlay class (charter §6.2 item 1): a 1 MiB page-align
     try testing.expectEqual(after.holds, last.holds);
     try testing.expectEqual(@as(u64, 1), last.extractions - after.extractions);
     try expectLaws(before, last);
+    try testing.expectEqual(@as(u64, 0), slot.leases_outstanding.load());
+}
+
+test "e2e zc bridge in PIECES (rung-10-seq-parity): under a 256 KiB NOWAIT ceiling (SQUEEZEFS_TEST_ZC_BRIDGE_CEILING) a 1 MiB held write's direct store is FOUR WRITE_FIXED SQEs under one tag — the bytes byte-exact in the fd, directs +1, splits +1, pieces +4, every phase sampled once; a 4 KiB store stays one SQE; a short piece fails the whole bridge (the device stand-in truncated under the DMA) and the write still answers" {
+    if (venueMissing()) |why| return testkit.skipWhy(@src(), why);
+    var kb: [192]u8 = undefined;
+    if (kmbufMissing(&kb)) |why| return testkit.skipWhy(@src(), why);
+    const rig = try Rig.init(testing.allocator, 31, &.{.{ "SQUEEZEFS_TEST_ZC_BRIDGE_CEILING", "262144" }});
+    defer rig.deinit();
+    const dev_rc = linux.memfd_create("sqz-zc-pieces-dev", linux.MFD.CLOEXEC | linux.MFD.ALLOW_SEALING);
+    try testing.expect(linux.errno(dev_rc) == .SUCCESS);
+    const dev_fd: linux.fd_t = @intCast(dev_rc);
+    defer _ = linux.close(dev_fd);
+    try testing.expect(linux.errno(linux.ftruncate(dev_fd, 8 << 20)) == .SUCCESS);
+    rig.fs.hold_eligible = true;
+    const s = try rig.mountIt(.{ .mem_budget_bytes = 0 });
+    try testing.expectEqual(geometry.BufferMode.zero_copy, s.mode);
+    rig.fs.held_store = .{ .ctx = s, .fd = dev_fd, .store = &storeHeldThunk };
+    const before = Snapshot.take();
+    const splits0 = worker.zc_bridge_splits.load();
+    const pieces0 = worker.zc_bridge_pieces.load();
+    var pb: [256]u8 = undefined;
+    const fd = try openPath(rig.child(&pb, "scratch"), .{ .ACCMODE = .WRONLY, .CLOEXEC = true });
+    defer _ = linux.close(fd);
+    const mib: usize = 1 << 20;
+    const buf = try testing.allocator.alignedAlloc(u8, .fromByteUnits(4096), mib);
+    defer testing.allocator.free(buf);
+    for (buf, 0..) |*b, i| b.* = @truncate((i * 13) ^ (i >> 10));
+    try testing.expectEqual(mib, linux.pwrite(fd, buf.ptr, mib, 0));
+    const got = try testing.allocator.alloc(u8, mib);
+    defer testing.allocator.free(got);
+    try testing.expectEqual(mib, try preadAt(dev_fd, got, 0));
+    try testing.expectEqualSlices(u8, buf, got);
+    const mid = Snapshot.take();
+    try testing.expectEqual(@as(u64, 1), mid.holds - before.holds);
+    try testing.expectEqual(@as(u64, 1), mid.directs - before.directs);
+    try testing.expectEqual(@as(u64, mib), mid.direct_bytes - before.direct_bytes);
+    try testing.expectEqual(@as(u64, 0), mid.direct_failures - before.direct_failures);
+    try testing.expectEqual(@as(u64, 1), worker.zc_bridge_splits.load() - splits0);
+    try testing.expectEqual(@as(u64, 4), worker.zc_bridge_pieces.load() - pieces0);
+    try testing.expectEqual(@as(u64, 1), mid.phase_to_store - before.phase_to_store);
+    try testing.expectEqual(@as(u64, 1), mid.phase_store - before.phase_store);
+    try testing.expectEqual(@as(u64, 1), mid.phase_to_commit - before.phase_to_commit);
+    // A page-sized held write (the W1 class) is one SQE: no split.
+    try testing.expectEqual(@as(usize, 4096), linux.pwrite(fd, buf.ptr, 4096, 4096));
+    try testing.expectEqual(@as(u64, 1), worker.zc_bridge_splits.load() - splits0);
+    try testing.expectEqual(@as(u64, 2), worker.zc_write_directs.load() - before.directs);
+    // The stand-in is sealed at 2.5 pieces into the next 1 MiB: the third piece lands short, the
+    // fourth past the seal (EPERM) — ONE failed bridge (direct failures +1, never a torn success), and
+    // the handler's fallback answers the write (the echo filesystem's scratch is 64 KiB: EFBIG).
+    try testing.expect(linux.errno(linux.ftruncate(dev_fd, (2 << 20) + (640 << 10))) == .SUCCESS);
+    try testing.expect(linux.errno(linux.fcntl(dev_fd, linux.F.ADD_SEALS, linux.F.SEAL_GROW)) == .SUCCESS);
+    _ = linux.pwrite(fd, buf.ptr, mib, 2 << 20);
+    try testing.expectEqual(@as(u64, 1), rig.fs.direct_store_failures.load(.monotonic));
+    const after = Snapshot.take();
+    try testing.expectEqual(@as(u64, 2), worker.zc_bridge_splits.load() - splits0);
+    try testing.expectEqual(@as(u64, 1), after.direct_failures - before.direct_failures);
+    try testing.expectEqual(@as(u64, 2), after.directs - before.directs);
+    try expectLaws(before, after);
     try testing.expectEqual(@as(u64, 0), slot.leases_outstanding.load());
 }
 

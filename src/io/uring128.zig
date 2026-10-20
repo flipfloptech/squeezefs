@@ -600,9 +600,11 @@ pub fn prepPollAdd(sqe: *Sqe128, file: File, mask: u32) void {
     sqe.rw_flags = std.mem.nativeToLittle(u32, mask);
 }
 
-/// What an `ASYNC_CANCEL` targets: the request with this `user_data`, or
-/// every request on a fixed-file index (a transport bridge's slot ops).
-pub const CancelTarget = union(enum) { user_data: u64, fixed: u32 };
+/// What an `ASYNC_CANCEL` targets: the request with this `user_data` (the
+/// first match), every request with it (`user_data_all`: a bridge pushed
+/// in pieces), or every request on a fixed-file index (a transport
+/// bridge's slot ops).
+pub const CancelTarget = union(enum) { user_data: u64, user_data_all: u64, fixed: u32 };
 
 pub fn prepAsyncCancel(sqe: *Sqe128, target: CancelTarget) void {
     sqe.* = std.mem.zeroes(Sqe128);
@@ -610,6 +612,10 @@ pub fn prepAsyncCancel(sqe: *Sqe128, target: CancelTarget) void {
     sqe.fd = -1;
     switch (target) {
         .user_data => |ud| sqe.addr = ud,
+        .user_data_all => |ud| {
+            sqe.addr = ud;
+            sqe.rw_flags = linux.IORING_ASYNC_CANCEL_ALL;
+        },
         .fixed => |index| {
             sqe.fd = @intCast(index);
             sqe.rw_flags = linux.IORING_ASYNC_CANCEL_FD | linux.IORING_ASYNC_CANCEL_FD_FIXED;

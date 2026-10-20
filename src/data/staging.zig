@@ -630,6 +630,9 @@ pub const AppendError = error{
     NoRoom,
 };
 
+/// One grain-bitmap word covers this many grains (the word type's width).
+const WORD_BITS: usize = @bitSizeOf(u64);
+
 pub const Segment = struct {
     gpa: Allocator,
     image: []u8,
@@ -699,7 +702,7 @@ pub const Segment = struct {
 
     /// The grain bitmap's words at `cap`: one bit per grain.
     pub fn occupiedWords(cap: u64) usize {
-        return @intCast((cap / RECORD_ALIGN + 63) / 64);
+        return @intCast((cap / RECORD_ALIGN + WORD_BITS - 1) / WORD_BITS);
     }
 
     /// The RAM the fixed per-cell tables take at `cap`: `n = maxCells(cap)`
@@ -1263,26 +1266,26 @@ pub const Segment = struct {
         var g: usize = @intCast(off / RECORD_ALIGN);
         const end: usize = @intCast((off + len) / RECORD_ALIGN);
         while (g < end) : (g += 1) {
-            const mask = @as(u64, 1) << @intCast(g % 64);
+            const mask = @as(u64, 1) << @intCast(g % WORD_BITS);
             if (occupied) {
-                assert(self.occupied[g / 64] & mask == 0);
-                self.occupied[g / 64] |= mask;
+                assert(self.occupied[g / WORD_BITS] & mask == 0);
+                self.occupied[g / WORD_BITS] |= mask;
             } else {
-                assert(self.occupied[g / 64] & mask != 0);
-                self.occupied[g / 64] &= ~mask;
+                assert(self.occupied[g / WORD_BITS] & mask != 0);
+                self.occupied[g / WORD_BITS] &= ~mask;
             }
         }
     }
 
     fn grainOccupied(self: *const Segment, g: usize) bool {
-        return self.occupied[g / 64] & (@as(u64, 1) << @intCast(g % 64)) != 0;
+        return self.occupied[g / WORD_BITS] & (@as(u64, 1) << @intCast(g % WORD_BITS)) != 0;
     }
 
     /// Freed grains await the sweep.
     fn markDirtyLocked(self: *Segment, off: u64, len: u64) void {
         var g: usize = @intCast(off / RECORD_ALIGN);
         const end: usize = @intCast((off + len) / RECORD_ALIGN);
-        while (g < end) : (g += 1) self.dirty[g / 64] |= @as(u64, 1) << @intCast(g % 64);
+        while (g < end) : (g += 1) self.dirty[g / WORD_BITS] |= @as(u64, 1) << @intCast(g % WORD_BITS);
         stats.staging_dirty_free_bytes.add(len);
     }
 
@@ -1293,9 +1296,9 @@ pub const Segment = struct {
         const end: usize = @intCast((off + len) / RECORD_ALIGN);
         var reused: u64 = 0;
         while (g < end) : (g += 1) {
-            const mask = @as(u64, 1) << @intCast(g % 64);
-            if (self.dirty[g / 64] & mask != 0) {
-                self.dirty[g / 64] &= ~mask;
+            const mask = @as(u64, 1) << @intCast(g % WORD_BITS);
+            if (self.dirty[g / WORD_BITS] & mask != 0) {
+                self.dirty[g / WORD_BITS] &= ~mask;
                 reused += RECORD_ALIGN;
             }
         }
@@ -1348,14 +1351,14 @@ pub const Segment = struct {
                 const total: usize = @intCast(self.image.len / RECORD_ALIGN);
                 var g: usize = 0;
                 // The first dirty grain, a word at a time.
-                while (g < total and self.dirty[g / 64] == 0) g += 64;
-                while (g < total and self.dirty[g / 64] & (@as(u64, 1) << @intCast(g % 64)) == 0) g += 1;
+                while (g < total and self.dirty[g / WORD_BITS] == 0) g += WORD_BITS;
+                while (g < total and self.dirty[g / WORD_BITS] & (@as(u64, 1) << @intCast(g % WORD_BITS)) == 0) g += 1;
                 if (g >= total) return;
                 var e = g;
-                while (e < total and self.dirty[e / 64] & (@as(u64, 1) << @intCast(e % 64)) != 0) : (e += 1) {
-                    const mask = @as(u64, 1) << @intCast(e % 64);
-                    assert(self.occupied[e / 64] & mask == 0);
-                    self.occupied[e / 64] |= mask; // reserved for the punch
+                while (e < total and self.dirty[e / WORD_BITS] & (@as(u64, 1) << @intCast(e % WORD_BITS)) != 0) : (e += 1) {
+                    const mask = @as(u64, 1) << @intCast(e % WORD_BITS);
+                    assert(self.occupied[e / WORD_BITS] & mask == 0);
+                    self.occupied[e / WORD_BITS] |= mask; // reserved for the punch
                 }
                 break :blk .{ .off = @as(u64, g) * RECORD_ALIGN, .len = @as(u64, e - g) * RECORD_ALIGN };
             };
@@ -1367,9 +1370,9 @@ pub const Segment = struct {
             var g: usize = @intCast(run.off / RECORD_ALIGN);
             const end: usize = @intCast((run.off + run.len) / RECORD_ALIGN);
             while (g < end) : (g += 1) {
-                const mask = @as(u64, 1) << @intCast(g % 64);
-                self.occupied[g / 64] &= ~mask;
-                self.dirty[g / 64] &= ~mask;
+                const mask = @as(u64, 1) << @intCast(g % WORD_BITS);
+                self.occupied[g / WORD_BITS] &= ~mask;
+                self.dirty[g / WORD_BITS] &= ~mask;
             }
             stats.staging_dirty_free_bytes.sub(run.len);
         }
@@ -1396,16 +1399,16 @@ pub const Segment = struct {
         while (g < total) {
             // The run's start must lie below `hi`.
             if (g - run >= hi) return null;
-            if (g % 64 == 0 and g + 64 <= total) {
-                const word = self.occupied[g / 64];
+            if (g % WORD_BITS == 0 and g + WORD_BITS <= total) {
+                const word = self.occupied[g / WORD_BITS];
                 if (word == std.math.maxInt(u64)) {
                     run = 0;
-                    g += 64;
+                    g += WORD_BITS;
                     continue;
                 }
                 if (word == 0) {
-                    run += 64;
-                    g += 64;
+                    run += WORD_BITS;
+                    g += WORD_BITS;
                     if (run >= grains) {
                         const start = g - run;
                         return if (start < hi) start else null;

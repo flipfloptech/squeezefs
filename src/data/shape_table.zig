@@ -168,12 +168,27 @@ fn ShapeRowModel(comptime weakening: Weakening) type {
         /// 0, 1 publish; 2 reads.
         pub const thread_count: usize = 3;
         const reader = 2;
-        /// Publisher t writes ino `t + 1` with size `10 × (t + 1)`.
+        /// Publisher t writes ino `t + 1` with size `SIZE_STRIDE × (t + 1)`:
+        /// any stride above `thread_count` keeps every publisher's size
+        /// distinct from every ino, so a torn pair is never a coincidence.
+        const SIZE_STRIDE = 10;
+        /// The reader's program counters: the two `seq` reads (0 and 3), the
+        /// data loads between (1, 2), the retry/give-up arm (5) and DONE (9);
+        /// a publisher's: enter (0), two stores (1, 2), leave (3), DONE (9).
+        const PC_SEQ1 = 0;
+        const PC_LOAD_INO = 1;
+        const PC_LOAD_SIZE = 2;
+        const PC_SEQ2 = 3;
+        const PC_RETRY = 5;
+        const PC_DONE = 9;
+        const PC_STORE_INO = 1;
+        const PC_STORE_SIZE = 2;
+        const PC_LEAVE = 3;
         fn inoOf(t: usize) u8 {
             return @intCast(t + 1);
         }
         fn sizeOf(t: usize) u8 {
-            return @intCast(10 * (t + 1));
+            return @intCast(SIZE_STRIDE * (t + 1));
         }
 
         seq: u8 = 0,
@@ -195,71 +210,71 @@ fn ShapeRowModel(comptime weakening: Weakening) type {
             return .{};
         }
         pub fn done(self: *const Self, t: usize) bool {
-            return if (t == reader) self.rpc == 9 else self.ppc[t] == 9;
+            return if (t == reader) self.rpc == PC_DONE else self.ppc[t] == PC_DONE;
         }
         pub fn step(self: *Self, t: usize) void {
             if (t == reader) return self.readerStep();
             switch (self.ppc[t]) {
                 // enter: the CAS even → odd (a failed CAS is a no-op step —
                 // the publisher spins)
-                0 => {
+                PC_SEQ1 => {
                     if (weakening.no_entry_bump) {
-                        self.ppc[t] = 1;
+                        self.ppc[t] = PC_STORE_INO;
                     } else if (weakening.entry_without_cas) {
                         self.seq +%= 1;
-                        self.ppc[t] = 1;
+                        self.ppc[t] = PC_STORE_INO;
                     } else if (self.seq & 1 == 0) {
                         self.seq += 1;
-                        self.ppc[t] = 1;
+                        self.ppc[t] = PC_STORE_INO;
                     }
                 },
-                1 => {
+                PC_STORE_INO => {
                     self.ino = inoOf(t);
-                    self.ppc[t] = 2;
+                    self.ppc[t] = PC_STORE_SIZE;
                 },
-                2 => {
+                PC_STORE_SIZE => {
                     self.size = sizeOf(t);
-                    self.ppc[t] = 3;
+                    self.ppc[t] = PC_LEAVE;
                 },
                 // leave
-                3 => {
+                PC_LEAVE => {
                     self.seq +%= 1;
-                    self.ppc[t] = 9;
+                    self.ppc[t] = PC_DONE;
                 },
                 else => unreachable,
             }
         }
         fn readerStep(self: *Self) void {
             switch (self.rpc) {
-                0 => {
+                PC_SEQ1 => {
                     self.r_s1 = self.seq;
                     self.attempts += 1;
-                    self.rpc = if (self.r_s1 & 1 != 0) 5 else 1;
+                    self.rpc = if (self.r_s1 & 1 != 0) PC_RETRY else PC_LOAD_INO;
                 },
-                1 => {
+                PC_LOAD_INO => {
                     self.r_ino = self.ino;
-                    self.rpc = 2;
+                    self.rpc = PC_LOAD_SIZE;
                 },
-                2 => {
+                PC_LOAD_SIZE => {
                     self.r_size = self.size;
-                    self.rpc = 3;
+                    self.rpc = PC_SEQ2;
                 },
-                3 => {
+                PC_SEQ2 => {
                     if (self.seq != self.r_s1) {
-                        self.rpc = 5;
+                        self.rpc = PC_RETRY;
                     } else {
-                        self.taken = self.r_ino == 1;
+                        self.taken = self.r_ino == inoOf(0);
                         self.answer = self.r_size;
                         self.answered = true;
-                        self.rpc = 9;
+                        self.rpc = PC_DONE;
                     }
                 },
                 // retry or give up
-                5 => {
+                PC_RETRY => {
                     if (self.attempts >= peek_attempts) {
                         self.answered = true;
-                        self.rpc = 9;
-                    } else self.rpc = 0;
+                        self.rpc = PC_DONE;
+                    } else self.rpc = PC_SEQ1;
                 },
                 else => unreachable,
             }

@@ -19,7 +19,7 @@
 # The series: scripts/kernel/patches-7.2 — 0001–0026 copied from the Rust reference's
 # docker/kernel-sqz/patches-7.2 (dev 48e1c9b2; Koong's kmbuf + FUSE zero-copy v4, the sqz
 # transplants, FUSE_TIME_LIMITS, host-scoped fabric subsystems, per-queue bg accounting)
-# and this repo's 0027–0030 — with scripts/kernel/config-fragment, asserted as a checklist
+# and this repo's 0027–0033 — with scripts/kernel/config-fragment, asserted as a checklist
 # (fail loud). Two package families, chosen by the target's /etc/os-release:
 #
 # Debian/Ubuntu: linux 7.2.8 from kernel.org + the series, as .debs (bindeb-pkg). The

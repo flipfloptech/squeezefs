@@ -21,7 +21,7 @@ take the better design and add a row to the ledger in decision 0002 before diver
 ## Venue
 
 Linux only (charter §1.2). Every Linux venue is reached through `scripts/venue`, runs on
-the **sqz kernel series** (`scripts/kernel/patches-7.2/`, 0001–0030 on linux 7.2.y, plus
+the **sqz kernel series** (`scripts/kernel/patches-7.2/`, 0001–0033 on linux 7.2.y, plus
 `scripts/kernel/config-fragment`; `uname -r` carries `sqz`) with Zig 0.17.0 and the repo
 at the same absolute path, and runs commands as root:
 - `local` (`SQZ_VENUE=local`; the default when the controller is Linux): THIS host —

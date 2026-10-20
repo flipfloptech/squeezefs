@@ -16,6 +16,9 @@
 #                       libc, so it cannot be intercepted); every row prints its engagement line.
 #                       The four columns of docs/evidence/rung-10-client-bypass-rows.md are
 #                       `MX_ENGINE=psync` × {ram-ext4, ram-xfs, ram-sqz} and ram-sqz-il.
+#   ram-sqz-il-direct   the DIRECT ARM (charter §7 "The direct arm"; rung-10-client-direct.md): the
+#                       set mounted `-o interception=direct`, the same preload and engine — a root
+#                       fio reads the data devices itself under layout leases; the fifth column.
 # Extra matrix.sh knobs pass through the environment (MX_ROWS, MX_PROFILE, MX_ENGINE, …).
 set -euo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -83,11 +86,12 @@ case "$S" in
     quiet; ram; xfs_on "$(ramdev ost0)" ;;
   ram-sqz)
     quiet; ram; "$REPO/scripts/perf_mount.sh" --ram --fresh -- "$HERE/matrix.sh /mnt/sqz-perf $L" ;;
-  ram-sqz-il)
+  ram-sqz-il|ram-sqz-il-direct)
     quiet; ram
     SO=$REPO/zig-out-perf/lib/libsqueezefs_il.so
-    case "${MX_ENGINE:-psync}" in psync|libaio) ;; *) die "ram-sqz-il needs MX_ENGINE=psync or libaio (the shim interposes libc, not io_uring)" ;; esac
+    case "${MX_ENGINE:-psync}" in psync|libaio) ;; *) die "$S needs MX_ENGINE=psync or libaio (the shim interposes libc, not io_uring)" ;; esac
+    mopt=interception; [ "$S" = ram-sqz-il-direct ] && mopt=interception=direct
     # perf_mount.sh builds `dist shim` together, so the .so pairs with the daemon it mounts.
-    MX_ENGINE=${MX_ENGINE:-psync} MX_PRELOAD=$SO "$REPO/scripts/perf_mount.sh" --ram --fresh -o interception -- "$HERE/matrix.sh /mnt/sqz-perf $L" ;;
+    MX_ENGINE=${MX_ENGINE:-psync} MX_PRELOAD=$SO "$REPO/scripts/perf_mount.sh" --ram --fresh -o "$mopt" -- "$HERE/matrix.sh /mnt/sqz-perf $L" ;;
   *) die "unknown session '$S' (see the header)" ;;
 esac

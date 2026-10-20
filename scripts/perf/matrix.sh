@@ -32,10 +32,12 @@
 #                         4 shared files overran the host's derived admission cap, 2026-10-19).
 #   MX_PRELOAD  a shared object LD_PRELOADed into the ROW fio (never the lay-down):
 #               <tree>/zig-out-perf/lib/libsqueezefs_il.so is the bypass. On a SqueezeFS mount the
-#               row then prints its ENGAGEMENT line — the daemon's Δ ipc_ops_{read,write} against
-#               the fio ops and the FUSE READ/WRITE deltas (charter §7: a bypass row whose ring ops
-#               do not account for its I/O is INVALID; the FUSE counters must stay flat) — and
-#               writes <row>.ipc.txt. results.tsv's columns are the same in every mode.
+#               row then prints its ENGAGEMENT line — the daemon's Δ ipc_ops_{read,write} plus the
+#               direct arm's Δ ipc_direct_ops (a `-o interception=direct` mount: the client's own
+#               device reads) against the fio ops and the FUSE READ/WRITE deltas (charter §7: a
+#               bypass row whose ring and direct ops do not account for its I/O is INVALID; the
+#               FUSE counters must stay flat) — and writes <row>.ipc.txt. results.tsv's columns
+#               are the same in every mode.
 # A block device must be unmounted and carry no signature (blkid): the lay-down overwrites it.
 set -euo pipefail
 T=$1 L=$2
@@ -216,13 +218,15 @@ def d(suffix):
     ks = [k for k in fb if k.endswith("." + suffix) or k == suffix]
     return sum(fb[k] - fa.get(k, 0) for k in ks)
 ops = j["read"]["total_ios"] + j["write"]["total_ios"]
-ring = d("ipc_ops_read") + d("ipc_ops_write")
+# The direct arm's ops (the clients' pages folded at teardown) are the engagement law's third term.
+direct = d("ipc_direct_ops")
+ring = d("ipc_ops_read") + d("ipc_ops_write") + direct
 # FUSE READs are counted at the worker (inline serves never reach a handler); WRITEs at the handler,
 # where a ring write's handoff runs too — those are ring ops, not kernel ones.
 fuse = d("transport_ring_reads") + max(0, d("fuse_op_latency_ns.write.count") - d("ipc_write_handoffs"))
 verdict = "ENGAGED" if ops and ring >= 0.99 * ops and fuse <= 0.01 * ops else "NOT ENGAGED (row INVALID as a bypass row)"
-print("matrix: %s %s engagement: ring %d of %d fio ops (%.1f%%), FUSE READ+WRITE %d — %s; reads: fast_path %d handoffs %d dd %d; writes: dd_inline %d handoffs %d severs %d; sessions %d svc_threads %d dd_shards %d; wakes %d park_timeouts %d empty_passes %d cqe_wakes %d/%d collapsed; lane_gate_routes %d; rejects %d poisoned %d" % (
-    label, row, ring, ops, 100.0 * ring / ops if ops else 0, fuse, verdict,
+print("matrix: %s %s engagement: ring+direct %d of %d fio ops (%.1f%%; direct %d, leases %d granted / rechecks refused %d), FUSE READ+WRITE %d — %s; reads: fast_path %d handoffs %d dd %d; writes: dd_inline %d handoffs %d severs %d; sessions %d svc_threads %d dd_shards %d; wakes %d park_timeouts %d empty_passes %d cqe_wakes %d/%d collapsed; lane_gate_routes %d; rejects %d poisoned %d" % (
+    label, row, ring, ops, 100.0 * ring / ops if ops else 0, direct, d("ipc_leases_granted"), d("ipc_direct_rechecks_failed"), fuse, verdict,
     d("ipc_fast_path_serves"), d("ipc_read_handoffs"), d("ipc_dd_read_serves"),
     d("ipc_dd_inline_serves"), d("ipc_write_handoffs"), d("ipc_severs"),
     fb.get("ipc.ipc_sessions_active", fb.get("ipc_host.ipc_sessions_active", -1)), fb.get("ipc_host.ipc_service_threads", -1), fb.get("ipc_host.ipc_dd_shards", -1),

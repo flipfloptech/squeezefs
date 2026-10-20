@@ -2613,7 +2613,13 @@ fn decodersTotal(bytes: []const u8) void {
         var buf: [LAYOUT_HEADER_LEN + 4 + 65_536]u8 = undefined;
         const enc = l.encodeInto(buf[0..l.encodedLen()]);
         std.debug.assert(std.mem.eql(u8, enc, bytes));
+        // The head decode (the read view's fill) agrees with the full one
+        // on everything but the per-entry checks it leaves to each read.
+        const h = decodeHead(bytes, tgeo) catch unreachable;
+        std.debug.assert(h.kind == l.kind and h.flags == l.flags and h.size == l.size and h.entries.len == l.entries.len and h.data.len == l.data.len);
+        for (h.entries) |*e| _ = checkEntry(e, tgeo.chunk) catch unreachable;
     } else |_| {}
+    _ = decodeHead(bytes, tgeo) catch {};
     if (LayoutDelta.decode(bytes, tgeo)) |d| {
         var buf: [2 + 2 + 1 + 8 * 3 + 16 + 40 + 4 + 8 + 4 + 65_536]u8 = undefined;
         const enc = d.encodeInto(buf[0..d.encodedLen()]);
@@ -2629,7 +2635,7 @@ fn decodersTotalFuzz(_: void, smith: *std.testing.Smith) !void {
     decodersTotal(buf[0..len]);
 }
 
-test "fuzz: the layout, delta, mapping and xattr-layout decoders are total; whatever decodes re-encodes byte-identically" {
+test "fuzz: the layout, delta, mapping and xattr-layout decoders and decodeHead are total; whatever decodes re-encodes byte-identically and its head decode agrees" {
     try fuzzkit.fuzz({}, decodersTotalFuzz, .{
         .corpus = &.{
             // A packed header claiming body_len 56 with a garbage mapping.

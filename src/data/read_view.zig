@@ -104,7 +104,7 @@ const W_N: usize = 7;
 const W_FID: usize = 8; // 2 words
 const W_DC: usize = 10; // 5 words (MappingWire)
 const HEADER_WORDS: usize = 16;
-pub const HEADER_BYTES: usize = HEADER_WORDS * 8;
+pub const HEADER_BYTES: usize = HEADER_WORDS * WORD;
 
 /// `W_HEAD`: bits 0–7 the layout kind + 1 (0 = no layout record: an inline
 /// file never written), bit 8 a durable copy, bit 9 a kvmap head, bit 10 a
@@ -116,25 +116,33 @@ const HEAD_SWEEP: u64 = 1 << 10;
 const HEAD_MAP_GEN: u64 = 1 << 11;
 const HEAD_SWEEP_SHIFT: u6 = 32;
 
+/// The slot's word: every datum is stored and loaded as one `u64` (the
+/// acquire loads that order the seq recheck), bytes packed little-endian.
+const WORD: usize = @sizeOf(u64);
+
 /// One inline-map entry as the slot stores it: `MapEntryWire`'s 48 bytes
-/// as six little-endian words (block in word 0's low half).
-const ENTRY_WORDS: usize = layout.MAP_ENTRY_WIRE_LEN / 8;
-const MAPPING_WORDS: usize = layout.MAPPING_WIRE_LEN / 8;
+/// as six little-endian words (block in word 0's low half, the reserved
+/// bytes in its high half).
+const ENTRY_WORDS: usize = layout.MAP_ENTRY_WIRE_LEN / WORD;
+const ENTRY_RESERVED_SHIFT: u6 = @bitSizeOf(u8) * @offsetOf(layout.MapEntryWire, "reserved_le");
+const MAPPING_WORDS: usize = layout.MAPPING_WIRE_LEN / WORD;
 
 comptime {
-    std.debug.assert(ENTRY_WORDS * 8 == layout.MAP_ENTRY_WIRE_LEN);
-    std.debug.assert(MAPPING_WORDS * 8 == layout.MAPPING_WIRE_LEN);
+    std.debug.assert(ENTRY_WORDS * WORD == layout.MAP_ENTRY_WIRE_LEN);
+    std.debug.assert(MAPPING_WORDS * WORD == layout.MAPPING_WIRE_LEN);
     std.debug.assert(W_DC + MAPPING_WORDS <= HEADER_WORDS);
+    std.debug.assert(@offsetOf(layout.MapEntryWire, "mapping") == WORD);
+    std.debug.assert(ENTRY_RESERVED_SHIFT == 32);
 }
 
 /// The body words a slot needs for the widest record of `record_cap`
 /// bytes: an inline map's entries or an inline payload, both ≤ the cap.
 pub fn bodyWords(record_cap: usize) usize {
-    return (record_cap + 7) / 8;
+    return (record_cap + WORD - 1) / WORD;
 }
 
 pub fn slotBytes(record_cap: usize) usize {
-    return HEADER_BYTES + bodyWords(record_cap) * 8;
+    return HEADER_BYTES + bodyWords(record_cap) * WORD;
 }
 
 /// What a hit resolved.
@@ -275,7 +283,7 @@ pub const Table = struct {
             const gen = s.w[W_GEN].load(.acquire);
             const moves = s.w[W_MOVES].load(.acquire);
             const head = s.w[W_HEAD].load(.acquire);
-            const len = @min(s.w[W_N].load(.acquire), self.body_words * 8);
+            const len = @min(s.w[W_N].load(.acquire), self.body_words * WORD);
             const kind_tag: u8 = @truncate(head & HEAD_KIND_MASK);
             if (kind_tag != @as(u8, @backingInt(layout.Kind.inline_)) + 1) return null;
             var n: usize = 0;
@@ -284,10 +292,10 @@ pub const Table = struct {
                 var i: usize = 0;
                 while (i < n) {
                     const at: usize = @intCast(offset + i);
-                    const word = s.body[at / 8].load(.acquire);
+                    const word = s.body[at / WORD].load(.acquire);
                     const bytes = std.mem.toBytes(std.mem.nativeToLittle(u64, word));
-                    const from = at % 8;
-                    const take = @min(8 - from, n - i);
+                    const from = at % WORD;
+                    const take = @min(WORD - from, n - i);
                     @memcpy(out[i..][0..take], bytes[from..][0..take]);
                     i += take;
                 }
@@ -339,7 +347,7 @@ pub const Table = struct {
         } else null;
         var binding: ?layout.Mapping = null;
         if (entry) |e| {
-            if (e[0] >> 32 != 0) return null;
+            if (e[0] >> ENTRY_RESERVED_SHIFT != 0) return null;
             var m: [MAPPING_WORDS]u64 = undefined;
             @memcpy(&m, e[1..]);
             binding = mappingOfWords(m, geo.chunk) catch return null;
@@ -400,7 +408,7 @@ pub const Table = struct {
                 .staged, .packed_ => {},
             }
         }
-        if (body_src.len > self.body_words * 8) {
+        if (body_src.len > self.body_words * WORD) {
             stats.read_view_fill_refused.inc();
             return;
         }
@@ -436,8 +444,8 @@ pub const Table = struct {
         var i: usize = 0;
         var wi: usize = 0;
         while (i < body_src.len) : (wi += 1) {
-            var word: [8]u8 = @splat(0);
-            const take = @min(8, body_src.len - i);
+            var word: [WORD]u8 = @splat(0);
+            const take = @min(WORD, body_src.len - i);
             @memcpy(word[0..take], body_src[i..][0..take]);
             s.body[wi].store(std.mem.readInt(u64, &word, .little), .monotonic);
             i += take;

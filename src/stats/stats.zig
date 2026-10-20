@@ -329,6 +329,7 @@ pub const covered = [_]Covered{
     .{ .path = "src/data/read_hold.zig", .by = "src/data/plane.zig" },
     .{ .path = "src/data/read_lru.zig", .by = "src/data/plane.zig" },
     .{ .path = "src/data/read_path.zig", .by = "src/data/plane.zig" },
+    .{ .path = "src/data/read_view.zig", .by = "src/data/plane.zig" },
     .{ .path = "src/data/reclaim.zig", .by = "src/data/plane.zig" },
     .{ .path = "src/data/router.zig", .by = "src/data/plane.zig" },
     .{ .path = "src/data/single_flight_fill.zig", .by = "src/data/plane.zig" },

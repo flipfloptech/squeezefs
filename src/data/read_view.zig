@@ -22,7 +22,10 @@
 //!
 //! Replacement is 4-way set-associative FIFO by fill time with a refill
 //! floor (`REFILL_MIN_NS`): a set thrashed by five hot files is left to
-//! the KV path at most once per floor, never a 64 KiB copy per read.
+//! the KV path at most once per floor, never a 64 KiB copy per read. A
+//! fill is ONE per generation: a way already holding the ino as of the
+//! filler's generations is left alone, so the ops that missed on a slot
+//! mid-fill never queue fills of their own behind it.
 //! Memory is fixed at init — slots × (two header lines + the record cap)
 //! — so a reader's borrowed words never dangle, and the pool is a fixed
 //! budget component (`read_view_bytes`).
@@ -55,18 +58,23 @@ pub const stats = struct {
     /// filled within the refill floor, a record the head decode refused,
     /// or one wider than the slot.
     pub var read_view_fill_refused: counters.ShardedCounter = .{};
+    /// `read_view_fill_redundant`: a fill skipped because the way already
+    /// holds the ino as of the filler's generations (a concurrent filler,
+    /// or a torn read that was never stale).
+    pub var read_view_fill_redundant: counters.ShardedCounter = .{};
     /// `read_view_bytes`: the fixed pool (slots × slot bytes).
     pub var read_view_bytes: counters.Gauge = .{};
 };
 
 pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
-    try w.print("{{\"read_view_hits\":{d},\"read_view_misses\":{d},\"read_view_stale\":{d},\"read_view_torn\":{d},\"read_view_fills\":{d},\"read_view_fill_refused\":{d},\"read_view_bytes\":{d}}}", .{
+    try w.print("{{\"read_view_hits\":{d},\"read_view_misses\":{d},\"read_view_stale\":{d},\"read_view_torn\":{d},\"read_view_fills\":{d},\"read_view_fill_refused\":{d},\"read_view_fill_redundant\":{d},\"read_view_bytes\":{d}}}", .{
         stats.read_view_hits.load(),
         stats.read_view_misses.load(),
         stats.read_view_stale.load(),
         stats.read_view_torn.load(),
         stats.read_view_fills.load(),
         stats.read_view_fill_refused.load(),
+        stats.read_view_fill_redundant.load(),
         stats.read_view_bytes.load(),
     });
 }
@@ -214,8 +222,13 @@ pub const Table = struct {
         const set = self.setOf(ino);
         for (&set.ways) |*s| {
             const s0 = s.w[W_SEQ].load(.acquire);
-            if (s0 & 1 != 0) continue;
             if (s.w[W_INO].load(.acquire) != ino) continue;
+            // Mid-fill (seq odd): torn, not a miss — the fill in flight
+            // carries this ino current, so the caller's own fill is skipped.
+            if (s0 & 1 != 0) {
+                stats.read_view_torn.inc();
+                return null;
+            }
             const gen = s.w[W_GEN].load(.acquire);
             const moves = s.w[W_MOVES].load(.acquire);
             const size = s.w[W_SIZE].load(.acquire);
@@ -254,8 +267,11 @@ pub const Table = struct {
         const set = self.setOf(ino);
         for (&set.ways) |*s| {
             const s0 = s.w[W_SEQ].load(.acquire);
-            if (s0 & 1 != 0) continue;
             if (s.w[W_INO].load(.acquire) != ino) continue;
+            if (s0 & 1 != 0) {
+                stats.read_view_torn.inc();
+                return null;
+            }
             const gen = s.w[W_GEN].load(.acquire);
             const moves = s.w[W_MOVES].load(.acquire);
             const head = s.w[W_HEAD].load(.acquire);
@@ -395,6 +411,16 @@ pub const Table = struct {
             stats.read_view_fill_refused.inc();
             return;
         };
+        // One fill per generation: a way already holding `ino` as of this
+        // filler's generations (or newer — a concurrent filler got there
+        // first) is left alone. Without this, every op that read the slot
+        // mid-fill (a miss) queued a fill of its own, and 32 writers on one
+        // file kept the set lock busy with 36 KiB copies for good
+        // (rw4k-q32j1: 707 k fills for 3 M writes, p99 54 → 2,100 µs).
+        if (s.w[W_INO].load(.monotonic) == ino and s.w[W_GEN].load(.monotonic) >= gen and s.w[W_MOVES].load(.monotonic) >= moves) {
+            stats.read_view_fill_redundant.inc();
+            return;
+        }
         // The seq odd (acq_rel: no store below is hoisted above it), the
         // words, the seq even (release: every store is before it).
         _ = s.w[W_SEQ].fetchAdd(1, .acq_rel);
@@ -520,7 +546,15 @@ test "a filled ino hits with its size, kind and every block's binding (a hole pa
     // The refill under the new generation hits again, in the SAME way.
     const rec2 = try stripedRecord(testing.allocator, 4 * layout.DEFAULT_CHUNK, 768, 12);
     defer testing.allocator.free(rec2);
+    // A fill under the generation the way already holds is redundant
+    // (the ops that missed mid-fill never queue fills of their own).
+    const redundant0 = stats.read_view_fill_redundant.load();
+    const fills0 = stats.read_view_fills.load();
+    t.fill(ino, 4 * layout.DEFAULT_CHUNK, rec2, g, t.movesNow());
+    try testing.expectEqual(redundant0 + 1, stats.read_view_fill_redundant.load());
+    try testing.expectEqual(fills0, stats.read_view_fills.load());
     t.fill(ino, 4 * layout.DEFAULT_CHUNK, rec2, ino_witness.genOf(ino), t.movesNow());
+    try testing.expectEqual(fills0 + 1, stats.read_view_fills.load());
     const f2 = t.lookup(ino, 3) orelse return error.TestExpectedEqual;
     try testing.expectEqual(@as(u64, 12), f2.point.?.binding.?.vol_tag);
     try testing.expectEqual(@as(u64, 4 * layout.DEFAULT_CHUNK), f2.size);
@@ -624,8 +658,10 @@ test "replacement: the four ways of a set hold four inos; a fifth within the ref
     try testing.expectEqual(refused0 + 1, stats.read_view_fill_refused.load());
     try testing.expect(t.lookup(inos[4], 1) == null);
     for (inos[0..4]) |ino| try testing.expect(t.lookup(ino, 1) != null);
-    // A held ino refills at once (its own way), whatever the floor.
+    // A held ino refills at once (its own way) under a newer generation,
+    // whatever the floor.
     const fills0 = stats.read_view_fills.load();
+    ino_witness.touch(inos[2]);
     t.fill(inos[2], 5 * layout.DEFAULT_CHUNK, rec, ino_witness.genOf(inos[2]), 0);
     try testing.expectEqual(fills0 + 1, stats.read_view_fills.load());
     try testing.expectEqual(@as(u64, 5 * layout.DEFAULT_CHUNK), (t.lookup(inos[2], 1) orelse return error.TestExpectedEqual).size);
@@ -647,7 +683,7 @@ test "replacement: the four ways of a set hold four inos; a fifth within the ref
     try testing.expectEqual(@as(usize, 3), kept);
 }
 
-test "the seqlock under a racing filler: readers never see a binding of one record under the size of another — every hit is one fill's words, every torn read a miss" {
+test "the seqlock under a racing filler: readers never see a binding of one record under the size of another — every hit is one fill's words, every torn or stale read a miss" {
     var t = try Table.init(testing.allocator, 65_536, test_geo);
     defer t.deinit();
     const ino: u64 = 777;
@@ -663,8 +699,12 @@ test "the seqlock under a racing filler: readers never see a binding of one reco
             var i: u64 = 0;
             while (!stop.load(.acquire)) : (i += 1) {
                 const odd = i & 1 != 0;
+                // A record changed: the witness moves, then the fill (one
+                // per generation); a yield leaves the readers their window.
+                ino_witness.touch(ino);
                 tbl.fill(ino, if (odd) 2 else 1, if (odd) rb else ra, ino_witness.genOf(ino), 0);
                 fills += 1;
+                std.Thread.yield() catch {};
             }
         }
         fn reader(tbl: *Table, served: *u64, mismatched: *u64) void {

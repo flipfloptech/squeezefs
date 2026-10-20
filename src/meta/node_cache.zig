@@ -58,6 +58,7 @@ const epoch_core = @import("epoch_core.zig");
 const journal_core = @import("journal_core.zig");
 const alloc_ext = @import("alloc_ext.zig");
 const snapshot = @import("node_snapshot.zig");
+const ino_witness = @import("ino_witness.zig");
 const arc_swap = @import("../sync/arc_swap.zig");
 const sync = @import("../sync/sync.zig");
 
@@ -909,6 +910,13 @@ pub const CachedNode = struct {
             consume(records);
             return error.Superseded;
         };
+        // The inos whose views this apply stales (`ino_witness`), named
+        // before the records are consumed and bumped on every exit after
+        // the snapshot's publish (a failed apply's bump is spurious, never
+        // missing); a structural move changes no record's content.
+        const viewed: []const OwnedRec = if (structural or self.level != 0 or self.forestSlot() == null) &.{} else records;
+        const witnessed = WitnessSet.of(viewed);
+        defer witnessed.touch();
         // Every apply lowers the not-yet-durable floor; the tail rule reads
         // it back. acq_rel fetchMin paired with `takeDirtyFloor`'s swap.
         if (records.len != 0) _ = self.dirty_floor.fetchMin(floor, .acq_rel);
@@ -1003,6 +1011,35 @@ pub const CachedNode = struct {
         dirty.resyncCharge();
         try self.publishSnapshot(dirty, null);
     }
+
+    /// The viewed inos of one apply (`ino_witness.touch` per record,
+    /// deferred past the snapshot's publish): a batch wider than the
+    /// buffer names them all (`touchAll`) rather than a heap allocation
+    /// under the leaf lock.
+    const WitnessSet = struct {
+        inos: [32]u64 = undefined,
+        n: usize = 0,
+        overflow: bool = false,
+
+        fn of(records: []const OwnedRec) WitnessSet {
+            var s: WitnessSet = .{};
+            for (records) |*r| {
+                const ino = ino_witness.inoOfViewedKey(r.key.slice()) orelse continue;
+                if (s.n == s.inos.len) {
+                    s.overflow = true;
+                    break;
+                }
+                s.inos[s.n] = ino;
+                s.n += 1;
+            }
+            return s;
+        }
+
+        fn touch(self: *const WitnessSet) void {
+            if (self.overflow) return ino_witness.touchAll();
+            for (self.inos[0..self.n]) |ino| ino_witness.touch(ino);
+        }
+    };
 
     const KeySeq = struct { k: []const u8, seq: u64 };
 
@@ -1145,6 +1182,8 @@ pub const CachedNode = struct {
         try dirty.remergeStable(gpa);
         dirty.resyncCharge();
         try self.publishSnapshot(dirty, null);
+        // The rolled-out record was visible: its ino's views are stale.
+        if (self.level == 0 and self.forestSlot() != null) ino_witness.touchKey(k);
         return removed;
     }
 

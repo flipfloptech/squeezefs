@@ -402,18 +402,28 @@ pub fn forcedWidth(mode: BufferMode, explicit: ?u32) ?u32 {
 // ---------------------------------------------------------------------------
 
 /// The most io_urings (each a `sqz-fuse-ur<qid>` worker with its own ring)
-/// the transport registers on one kernel queue: 2. The kernel picks a
-/// request's queue by the submitting task's CPU (`task_cpu`), so one
-/// submitter's whole depth lands on one queue; its entry pick is LIFO over
-/// the queue's available entries, so a second ring's entries are taken only
-/// once the first ring's are all in userspace — 2 doubles the one-submitter
-/// ceiling (one worker saturated at ≈ 4.4 µs per 4 KiB write) and costs
-/// nothing idle; a third worker would serve only a queue whose first two
-/// are both saturated, a row no venue has shown (`SQUEEZEFS_FUSE_RINGS_PER_QUEUE`'s
-/// ceiling; the executor reserves this many driven lanes per queue).
-pub const MAX_RINGS_PER_QUEUE: u32 = 2;
+/// the transport registers on one kernel queue — `SQUEEZEFS_FUSE_RINGS_PER_QUEUE`'s
+/// ceiling and what the executor reserves driven lanes and the pass census
+/// stamps for; the derivation stays at `RINGS_PER_QUEUE_DERIVED`. 4 = the
+/// A/B room the 4k randread QD32×4 row asked for (`rung-10-fuse-boundary.md`):
+/// a cold 4 KiB read costs the worker ≈ 6.4 µs, so two workers per queue cap
+/// one submitter at ≈ 310 k reads/s and the row at 1.25 M where fio alone
+/// reaches 2–3 M against the boundary ruler; a third and fourth worker serve
+/// a queue whose first two are saturated, which that row's are.
+pub const MAX_RINGS_PER_QUEUE: u32 = 4;
 
-/// The derived count: `MAX_RINGS_PER_QUEUE` where the kernel's FEATURES
+/// The derived count on a kmbuf/zc session whose kernel has patch 0030: 2.
+/// The kernel picks a request's queue by the submitting task's CPU
+/// (`task_cpu`), so one submitter's whole depth lands on one queue; its entry
+/// pick is LIFO over the queue's available entries, so a second ring's
+/// entries are taken only once the first ring's are all in userspace — 2
+/// doubles the one-submitter ceiling (one worker saturated at ≈ 4.4 µs per
+/// 4 KiB write) and costs nothing idle. More than 2 is the lever's, not the
+/// derivation's, until the half-loaded worker's pass cost (the 4k randwrite
+/// QD32×4 row's +2.2 cores on two rings) is measured at 3 and 4.
+pub const RINGS_PER_QUEUE_DERIVED: u32 = 2;
+
+/// The derived count: `RINGS_PER_QUEUE_DERIVED` where the kernel's FEATURES
 /// probe reads `RINGS_PER_QUEUE` present (series patch 0030) AND the mode
 /// pins a ring to one queue (kmbuf/zc: the per-ring buffer ring is what the
 /// patch makes per-source); 1 on UserEnts (a ring there already serves a
@@ -428,7 +438,7 @@ pub const MAX_RINGS_PER_QUEUE: u32 = 2;
 /// thermal throttle (cooled: 0.99×; reads 1.11× / 1.70× / 1.29×).
 pub fn ringsPerQueue(mode: BufferMode, rings_feature: bool) u32 {
     return switch (mode) {
-        .buf_ring, .zero_copy => if (rings_feature) MAX_RINGS_PER_QUEUE else 1,
+        .buf_ring, .zero_copy => if (rings_feature) RINGS_PER_QUEUE_DERIVED else 1,
         .user_ents => 1,
     };
 }
@@ -446,14 +456,19 @@ pub fn resolveRingsPerQueue(explicit: ?u32, derived: u32) u32 {
 /// count.
 pub const RingShare = struct { base: u16, depth: u32 };
 
-/// The split of `depth` over `rings`: ring 0 takes `ceil(depth / rings)`,
-/// the last takes the rest, so the queue's depth (and the kmbuf regions'
-/// pinned bytes, sized per ring from its share) is unchanged by the count.
+/// The split of `depth` over `rings`: the first `depth mod rings` rings
+/// take `ceil(depth / rings)`, the rest `floor(depth / rings)` — every ring
+/// at least one entry while `depth ≥ rings` (a ring with no entry would
+/// never REGISTER and the arm barrier would never complete), the queue's
+/// depth (and the kmbuf regions' pinned bytes, sized per ring from its
+/// share) unchanged by the count. For two rings this is ring 0 ceil, ring 1
+/// the rest.
 pub fn ringShare(depth: u32, rings: u32, ring: u32) RingShare {
     std.debug.assert(rings >= 1 and ring < rings and depth >= rings);
-    const per: u32 = @intCast(derive.ceilDiv(depth, rings));
-    const base: u32 = per * ring;
-    return .{ .base = @intCast(base), .depth = @min(per, depth - base) };
+    const per: u32 = depth / rings;
+    const rem: u32 = depth % rings;
+    const base: u32 = per * ring + @min(ring, rem);
+    return .{ .base = @intCast(base), .depth = per + @intFromBool(ring < rem) };
 }
 
 /// `node_of(cpu)`: the NUMA node of a CPU, null for an unknown (offline or
@@ -1010,8 +1025,10 @@ test "drain width = max(n/4, 1); sq entries = max(next_pow2(width × depth + 8),
     try testing.expectEqual(@as(u32, 4096), sqEntries(127, 32));
 }
 
-test "rings per queue: 2 where the FEATURES probe reads present on kmbuf/zc, 1 on UserEnts and wherever it reads absent; explicit wins; the shares split the depth ceil/rest with the queue's depth unchanged and ring 1's base at ring 0's depth" {
-    try testing.expectEqual(@as(u32, 2), MAX_RINGS_PER_QUEUE);
+test "rings per queue: 2 where the FEATURES probe reads present on kmbuf/zc, 1 on UserEnts and wherever it reads absent; explicit wins up to the ceiling of 4; the shares split the depth ceil/rest with the queue's depth unchanged and ring 1's base at ring 0's depth" {
+    try testing.expectEqual(@as(u32, 2), RINGS_PER_QUEUE_DERIVED);
+    try testing.expectEqual(@as(u32, 4), MAX_RINGS_PER_QUEUE);
+    try testing.expect(RINGS_PER_QUEUE_DERIVED <= MAX_RINGS_PER_QUEUE);
     try testing.expectEqual(@as(u32, 2), ringsPerQueue(.zero_copy, true));
     try testing.expectEqual(@as(u32, 2), ringsPerQueue(.buf_ring, true));
     try testing.expectEqual(@as(u32, 1), ringsPerQueue(.user_ents, true));
@@ -1035,6 +1052,18 @@ test "rings per queue: 2 where the FEATURES probe reads present on kmbuf/zc, 1 o
     try testing.expectEqual(RingShare{ .base = 16, .depth = 16 }, ringShare(32, 2, 1));
     try testing.expectEqual(RingShare{ .base = 2, .depth = 2 }, ringShare(4, 2, 1));
     try testing.expectEqual(RingShare{ .base = 3, .depth = 2 }, ringShare(5, 2, 1));
+    // Four rings: ceil shares, the last takes the rest, the depth is whole.
+    for ([_]u32{ 4, 5, 9, 16, 17, 31, 32 }) |depth| {
+        var sum: u32 = 0;
+        for (0..4) |ring| {
+            const s = ringShare(depth, 4, @intCast(ring));
+            try testing.expectEqual(@as(u16, @intCast(sum)), s.base);
+            try testing.expect(s.depth >= 1 and s.depth <= derive.ceilDiv(depth, 4));
+            sum += s.depth;
+        }
+        try testing.expectEqual(depth, sum);
+    }
+    try testing.expectEqual(RingShare{ .base = 24, .depth = 8 }, ringShare(32, 4, 3));
 }
 
 test "the plan is total over a sweep of shapes and every result satisfies the kernel mirror" {

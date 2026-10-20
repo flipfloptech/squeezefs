@@ -217,8 +217,9 @@ def d(suffix):
     return sum(fb[k] - fa.get(k, 0) for k in ks)
 ops = j["read"]["total_ios"] + j["write"]["total_ios"]
 ring = d("ipc_ops_read") + d("ipc_ops_write")
-# FUSE READs are counted at the worker (inline serves never reach a handler); WRITEs at the handler.
-fuse = d("transport_ring_reads") + d("fuse_op_latency_ns.write.count")
+# FUSE READs are counted at the worker (inline serves never reach a handler); WRITEs at the handler,
+# where a ring write's handoff runs too — those are ring ops, not kernel ones.
+fuse = d("transport_ring_reads") + max(0, d("fuse_op_latency_ns.write.count") - d("ipc_write_handoffs"))
 verdict = "ENGAGED" if ops and ring >= 0.99 * ops and fuse <= 0.01 * ops else "NOT ENGAGED (row INVALID as a bypass row)"
 print("matrix: %s %s engagement: ring %d of %d fio ops (%.1f%%), FUSE READ+WRITE %d — %s; reads: fast_path %d handoffs %d dd %d; writes: dd_inline %d handoffs %d severs %d; sessions %d svc_threads %d dd_shards %d; wakes %d park_timeouts %d empty_passes %d cqe_wakes %d/%d collapsed; lane_gate_routes %d; rejects %d poisoned %d" % (
     label, row, ring, ops, 100.0 * ring / ops if ops else 0, fuse, verdict,

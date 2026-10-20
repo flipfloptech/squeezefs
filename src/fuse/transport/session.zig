@@ -1381,6 +1381,9 @@ pub const Session = struct {
         if (self.shared.sqpoll) log.info("transport: SQUEEZEFS_FUSE_SQPOLL=1 — the kernel submission poller (measured not recommended: the A/B control arm)", .{});
         self.shared.register_refuse_remaining.store(knobs.intKnob("SQUEEZEFS_TEST_FUSE_REGISTER_REFUSE", u32, env), .monotonic);
         self.shared.test_kmbuf_enomem = knobs.boolKnob("SQUEEZEFS_TEST_KMBUF_REGISTER_ENOMEM", env);
+        // The registry admits exactly the enum's spellings (the startup gate refused the rest).
+        self.shared.test_read_zero_fill = std.meta.stringToEnum(worker.ReadZeroFill, knobs.enumKnob("SQUEEZEFS_TEST_READ_ZERO_FILL", env)).?;
+        if (self.shared.test_read_zero_fill != .off) log.warn("transport: SQUEEZEFS_TEST_READ_ZERO_FILL={t} — every O_DIRECT READ is answered on the worker with no filesystem (the FUSE boundary ruler); the reader gets zeros or stale bytes", .{self.shared.test_read_zero_fill});
         self.armBridgeSeams(env);
         errdefer self.closeStallPipe();
 
@@ -3455,6 +3458,69 @@ test "e2e zc READ: /big moves through the fd-source leg from the fill pool (zc_s
         try testing.expectEqual(before.fd_body_fallbacks, after.fd_body_fallbacks);
         try testing.expectEqual(@as(u64, 0), slot.leases_outstanding.load());
         std.debug.print("\nzc read (READ_ZC_SERVE={s}): {d} reads, {d} user bytes, zc_serve {d}, bounce {d}, daemon copies {d}, enters {d}\n", .{ serve, reads, user_bytes, after.zc_serve_bytes - before.zc_serve_bytes, after.zc_bounce_bytes - before.zc_bounce_bytes, rig.fs.read_copies.load(.monotonic), after.enters - before.enters });
+    }
+}
+
+test "e2e read boundary ruler (SQUEEZEFS_TEST_READ_ZERO_FILL): under `bounce` every O_DIRECT ring READ is answered at its delivery with zeros — the filesystem's probe never serves it and its lane never sees it, each is a fast-dispatch serve whose body rode one bounce bridge (zc_bounce_bytes ≡ the replied bytes); under `prefilled` each is a header-only commit of the requested length with NO bridge; a buffered READ keeps the law under both; `off` serves the text" {
+    if (venueMissing()) |why| return testkit.skipWhy(@src(), why);
+    var kb: [192]u8 = undefined;
+    if (kmbufMissing(&kb)) |why| return testkit.skipWhy(@src(), why);
+    for ([_][]const u8{ "bounce", "prefilled", "off" }, 0..) |arm, i| {
+        const rig = try Rig.init(testing.allocator, 48 + @as(u32, @intCast(i)), &.{.{ "SQUEEZEFS_TEST_READ_ZERO_FILL", arm }});
+        defer rig.deinit();
+        const s = try rig.mountIt(.{ .mem_budget_bytes = 0 });
+        try testing.expectEqual(geometry.BufferMode.zero_copy, s.mode);
+        const want = std.meta.stringToEnum(worker.ReadZeroFill, arm).?;
+        try testing.expectEqual(want, s.shared.test_read_zero_fill);
+        var pb: [256]u8 = undefined;
+        // O_DIRECT: the kernel asks for the buffer (page-rounded), so a
+        // reply's length is the app's count (no readahead, no page-cache fill).
+        const fd = try openPath(rig.child(&pb, "hello"), .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .DIRECT = true });
+        defer _ = linux.close(fd);
+        const before = Snapshot.take();
+        const probes_before = rig.fs.probes_served.load(.monotonic);
+        var buf: [4096]u8 align(4096) = @splat(0xA5);
+        const n = try preadAt(fd, &buf, 0);
+        const after = Snapshot.take();
+        try expectLaws(before, after);
+        const reads = after.reads - before.reads;
+        try testing.expect(reads >= 1);
+        switch (want) {
+            .off => {
+                try testing.expectEqual(EchoFs.hello_text.len, n);
+                try testing.expectEqualSlices(u8, EchoFs.hello_text, buf[0..n]);
+                try testing.expectEqual(reads, rig.fs.probes_served.load(.monotonic) - probes_before);
+            },
+            .bounce, .prefilled => {
+                // The ruler answers the ASKED length (the kernel's page-rounded
+                // direct read of a short file), never the file's: no
+                // filesystem said how long it is.
+                try testing.expectEqual(buf.len, n);
+                // The filesystem never served the READ: no probe serve, no copy pass.
+                try testing.expectEqual(probes_before, rig.fs.probes_served.load(.monotonic));
+                try testing.expectEqual(@as(u64, 0), rig.fs.read_copies.load(.monotonic));
+                try testing.expectEqual(reads, after.serves - before.serves);
+                try testing.expectEqual(reads, after.zc_replies - before.zc_replies);
+                if (want == .bounce) {
+                    for (buf) |b| try testing.expectEqual(@as(u8, 0), b);
+                    try testing.expectEqual(reads, after.bridges - before.bridges);
+                    try testing.expectEqual(@as(u64, n), after.zc_bounce_bytes - before.zc_bounce_bytes);
+                } else {
+                    // No bridge, no bytes: the app's pages keep what they held.
+                    for (buf) |b| try testing.expectEqual(@as(u8, 0xA5), b);
+                    try testing.expectEqual(before.bridges, after.bridges);
+                    try testing.expectEqual(before.zc_bounce_bytes, after.zc_bounce_bytes);
+                }
+                // A buffered READ of the same file keeps the law: the text.
+                const bfd = try openPath(rig.child(&pb, "hello"), .{ .ACCMODE = .RDONLY, .CLOEXEC = true });
+                defer _ = linux.close(bfd);
+                var small: [64]u8 = undefined;
+                const m = try preadAt(bfd, &small, 0);
+                try testing.expectEqualSlices(u8, EchoFs.hello_text, small[0..m]);
+                try testing.expect(rig.fs.probes_served.load(.monotonic) > probes_before);
+            },
+        }
+        std.debug.print("\nread boundary ruler ({s}): {d} READ(s), {d} bytes, bridges {d}, enters {d}\n", .{ arm, reads, n, after.bridges - before.bridges, after.enters - before.enters });
     }
 }
 

@@ -606,6 +606,9 @@ pub const Slab = struct {
     }
 };
 
+/// `SQUEEZEFS_TEST_READ_ZERO_FILL`'s arms (the registry row's spellings).
+pub const ReadZeroFill = enum { off, prefilled, bounce };
+
 pub const Shared = struct {
     fuse_fd: linux.fd_t,
     plan: geometry.Plan,
@@ -662,6 +665,9 @@ pub const Shared = struct {
     /// `SQUEEZEFS_TEST_KMBUF_REGISTER_ENOMEM`: every kmbuf ring registration
     /// answers ENOMEM without reaching the kernel.
     test_kmbuf_enomem: bool = false,
+    /// `SQUEEZEFS_TEST_READ_ZERO_FILL`: the boundary ruler — every READ is
+    /// answered at its delivery with no filesystem (`serveZeroFill`).
+    test_read_zero_fill: ReadZeroFill = .off,
     /// `SQUEEZEFS_TEST_ZC_BRIDGE_STALL`: the next N reply bridges read a
     /// pipe with no writer (`stall_pipe[0]`) and never complete.
     bridge_stall_remaining: std.atomic.Value(u32) = .init(0),
@@ -3145,6 +3151,7 @@ pub const Group = struct {
     /// the direct device leg.
     fn dispatchRead(self: *Group, gent: u32, req: fsv.Request, in: abi.fuse_read_in, sref: slot.SlotRef) void {
         ring_reads.inc();
+        if (self.shared.test_read_zero_fill != .off and in.flags & @as(u32, @bitCast(linux.O{ .DIRECT = true })) != 0) return self.serveZeroFill(gent, req, in);
         const win = self.window(gent);
         if (self.shared.fs.probeRead(req, win)) |pr| {
             fast_dispatch_serves.inc();
@@ -3173,6 +3180,26 @@ pub const Group = struct {
         if (fusible) fused_read_demotions.inc();
         fast_dispatch_demotes.inc();
         self.dispatch(gent, req, sref, null);
+    }
+
+    /// The boundary ruler (`SQUEEZEFS_TEST_READ_ZERO_FILL`): an O_DIRECT
+    /// READ answered here (a buffered READ keeps the law: the harness reads
+    /// `.stats` through this path too, and the ruler's row is O_DIRECT),
+    /// counted a fast-dispatch serve so the partition law closes.
+    /// `prefilled` on a zc dest slot is a header-only commit of the
+    /// requested length (no bytes move — the round trip alone); `bounce`,
+    /// and `prefilled` wherever there is no dest slot, zero-fills the window
+    /// and takes the served-READ reply path (one memory-source bridge under
+    /// zc, the kmbuf/arena copy elsewhere).
+    fn serveZeroFill(self: *Group, gent: u32, req: fsv.Request, in: abi.fuse_read_in) void {
+        fast_dispatch_serves.inc();
+        const n: u32 = @intCast(@min(@as(usize, in.size), self.payload_len));
+        const dest_slot = self.shared.zeroCopy() and self.memberOf(gent).slots.ent(self.entIdxOf(gent)).dir == .dest;
+        if (self.shared.test_read_zero_fill == .prefilled and dest_slot) return self.commitPrefilled(gent, req.unique(), n);
+        const win = self.window(gent);
+        const len = @min(n, win.len);
+        @memset(win[0..len], 0);
+        self.commitRead(gent, req, in, codec.replyData(req.unique(), win[0..len]));
     }
 
     /// Arm (c) and every other opcode: the lane homed on the queue's CPU.

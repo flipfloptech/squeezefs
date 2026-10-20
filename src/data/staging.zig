@@ -863,24 +863,37 @@ pub const Segment = struct {
         /// bytes copied), whole against a racing in-place overwrite: the
         /// record's seqlock read before and after the copy (the second
         /// read a seq_cst RMW: it orders the copy's loads before it), a
-        /// moved or odd seq copies again.
-        pub fn copyRange(self: Lease, dst: []u8, off: u64) usize {
+        /// moved or odd seq copies again — a few spins, then a FIBER park
+        /// until a write drains (the writer may be a fiber of this very
+        /// lane: a thread yield here starved its CQE and wedged the pair).
+        pub fn copyRange(self: Lease, io: Io, dst: []u8, off: u64) usize {
             const e = self.cell.extent;
             if (off >= e.val_len) return 0;
             const n: usize = @intCast(@min(dst.len, e.val_len - off));
             const src = self.seg.image[@intCast(e.valOff() + off)..][0..n];
+            var spins: u32 = 0;
             while (true) {
                 const s0 = self.cell.seq.load(.acquire);
-                if (s0 & 1 != 0) {
-                    stats.staging_read_retries.inc();
-                    std.Thread.yield() catch {};
+                if (s0 & 1 == 0) {
+                    @memcpy(dst[0..n], src);
+                    if (self.cell.seq.fetchAdd(0, .seq_cst) == s0) return n;
+                }
+                stats.staging_read_retries.inc();
+                if (spins < READ_SPINS) {
+                    spins += 1;
+                    std.atomic.spinLoopHint();
                     continue;
                 }
-                @memcpy(dst[0..n], src);
-                if (self.cell.seq.fetchAdd(0, .seq_cst) == s0) return n;
-                stats.staging_read_retries.inc();
+                self.seg.inplace_drained.store(0, .monotonic);
+                if (self.seg.inplace_in_flight.load(.seq_cst) != 0) _ = tick.parkUntilUncancelable(io, &self.seg.inplace_drained, clock.monotonicNs() + READ_PARK_NS, null);
             }
         }
+
+        /// Spins before a reader parks on a grain mid-write: a write's
+        /// window is one page copy on another lane; the park's bound is
+        /// the write's own order of magnitude (the drain's wake ends it).
+        const READ_SPINS: u32 = 64;
+        const READ_PARK_NS: u64 = 200 * std.time.ns_per_us;
 
         /// Drop the reference; the last one out of a retired cell
         /// reclaims it. acq_rel pairs with `retire`'s release store.
@@ -3805,7 +3818,7 @@ test "the in-place overwrite: a write inside ONE grain of an UNSYNCED resident r
         defer l.release();
         try testing.expectEqualSlices(u8, &value, l.bytes());
         var out: [16384]u8 = undefined;
-        try testing.expectEqual(@as(usize, 16384), l.copyRange(&out, 0));
+        try testing.expectEqual(@as(usize, 16384), l.copyRange(io, &out, 0));
         try testing.expectEqualSlices(u8, &value, &out);
     }
     // The record verifies under its new header; recovery adopts generation 2.
@@ -3902,13 +3915,13 @@ test "the in-place overwrite: a write inside ONE grain of an UNSYNCED resident r
                 fill = if (fill == 'y') 'x' else 'y';
             }
         }
-        fn reader(s: *Segment, key: StagingKey, stop: *std.atomic.Value(bool), torn: *u32, copies: *u32) void {
+        fn reader(s: *Segment, io_: Io, key: StagingKey, stop: *std.atomic.Value(bool), torn: *u32, copies: *u32) void {
             var out: [4096]u8 = undefined;
             var n: u32 = 0;
             while (n < 4000) : (n += 1) {
                 const l = s.get(key) orelse break;
                 defer l.release();
-                _ = l.copyRange(&out, 0);
+                _ = l.copyRange(io_, &out, 0);
                 if (!std.mem.allEqual(u8, &out, out[0])) torn.* += 1;
             }
             copies.* = n;
@@ -3920,7 +3933,7 @@ test "the in-place overwrite: a write inside ONE grain of an UNSYNCED resident r
     var copies: u32 = 0;
     var race: Io.Group = .init;
     race.async(io, Race.writer, .{ &seg, io, k3, &stop });
-    race.async(io, Race.reader, .{ &seg, k3, &stop, &torn, &copies });
+    race.async(io, Race.reader, .{ &seg, io, k3, &stop, &torn, &copies });
     race.await(io) catch |err| switch (err) {
         error.Canceled => unreachable,
     };

@@ -3761,7 +3761,7 @@ pub const DataPlane = struct {
             const want: usize = @intCast(@min(len, dest.len));
             // Whole against a racing in-place overwrite (the record's
             // seqlock); the bytes past the value are zeros.
-            const n = lease.copyRange(dest[0..want], offset);
+            const n = lease.copyRange(self.io, dest[0..want], offset);
             @memset(dest[n..want], 0);
             return .{ .served = want };
         }

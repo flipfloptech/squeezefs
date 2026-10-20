@@ -102,6 +102,16 @@ pub const stats = struct {
     pub var dismount_promoted_files: counters.ShardedCounter = .{};
     pub var dismount_promoted_bytes: counters.ShardedCounter = .{};
     pub var dismount_promote_failures: counters.ShardedCounter = .{};
+    /// `dismount_corpse_residents_destroyed`: residents the dismount pass
+    /// destroyed because their ino has no live inode record (absent, or
+    /// `nlink == 0`) — a corpse's custody is destroyed, never promoted.
+    /// `dismount_unnamed_residents_destroyed`: residents of a live ino whose
+    /// layout does not name them (a crash between a promotion's commit and
+    /// its ring release, or a stage whose commit never landed) — residue
+    /// no read can reach, destroyed. Both leave the ring without a
+    /// promotion; neither is a `dismount_promote_failures` row.
+    pub var dismount_corpse_residents_destroyed: counters.ShardedCounter = .{};
+    pub var dismount_unnamed_residents_destroyed: counters.ShardedCounter = .{};
     /// `fsync_promoted_files`: promotions the fsync lever dispatched.
     pub var fsync_promoted_files: counters.ShardedCounter = .{};
     /// §J.2's ring ledger: `staging_appends` / `staging_append_bytes` — the
@@ -117,7 +127,7 @@ pub const stats = struct {
 };
 
 pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
-    try w.print("{{\"current_staged_write_bytes\":{d},\"staged_writes_in_flight\":{d},\"staging_cell_state_bytes\":{d},\"staging_tables_bytes\":{d},\"staging_over_cap_refusals\":{d},\"staging_ring_full_refusals\":{d},\"staging_pressure_kicks\":{d},\"staging_recovery_records\":{d},\"staging_recovery_torn_records\":{d},\"staging_generation_discards\":{d},\"staging_foreign_scope_refusals\":{d},\"staging_owner_live_refusals\":{d},\"staging_member_residue_roots\":{d},\"staged_payload_lost_reads\":{d},\"dismount_promoted_files\":{d},\"dismount_promoted_bytes\":{d},\"dismount_promote_failures\":{d},\"fsync_promoted_files\":{d},\"staging_appends\":{d},\"staging_append_bytes\":{d},\"staging_restages\":{d},\"staging_restage_bytes\":{d}}}", .{
+    try w.print("{{\"current_staged_write_bytes\":{d},\"staged_writes_in_flight\":{d},\"staging_cell_state_bytes\":{d},\"staging_tables_bytes\":{d},\"staging_over_cap_refusals\":{d},\"staging_ring_full_refusals\":{d},\"staging_pressure_kicks\":{d},\"staging_recovery_records\":{d},\"staging_recovery_torn_records\":{d},\"staging_generation_discards\":{d},\"staging_foreign_scope_refusals\":{d},\"staging_owner_live_refusals\":{d},\"staging_member_residue_roots\":{d},\"staged_payload_lost_reads\":{d},\"dismount_promoted_files\":{d},\"dismount_promoted_bytes\":{d},\"dismount_promote_failures\":{d},\"dismount_corpse_residents_destroyed\":{d},\"dismount_unnamed_residents_destroyed\":{d},\"fsync_promoted_files\":{d},\"staging_appends\":{d},\"staging_append_bytes\":{d},\"staging_restages\":{d},\"staging_restage_bytes\":{d}}}", .{
         stats.current_staged_write_bytes.load(),
         stats.staged_writes_in_flight.load(),
         stats.staging_cell_state_bytes.load(),
@@ -135,6 +145,8 @@ pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
         stats.dismount_promoted_files.load(),
         stats.dismount_promoted_bytes.load(),
         stats.dismount_promote_failures.load(),
+        stats.dismount_corpse_residents_destroyed.load(),
+        stats.dismount_unnamed_residents_destroyed.load(),
         stats.fsync_promoted_files.load(),
         stats.staging_appends.load(),
         stats.staging_append_bytes.load(),
@@ -1037,6 +1049,24 @@ pub const Staged = struct {
     kicked: bool,
 };
 
+/// The dismount pass's verdict on one resident (`PromotionHooks.dismount`).
+pub const DismountVerdict = enum {
+    /// Promoted: the entry left the ring onto its durable home.
+    promoted,
+    /// The promotion declined for a resource reason (no volume, the arm
+    /// refused, a commit failed): the entry stays resident — never-wrong,
+    /// the next mount adopts it.
+    kept,
+    /// The ino has no live inode record (absent, or `nlink == 0`): a
+    /// corpse's custody, destroyed — never promoted.
+    corpse,
+    /// The ino lives but its layout does not name this record (kind not
+    /// staged, another file id, no layout at all): residue of a crash
+    /// between a stage or promotion and the metadata that names it; no
+    /// read can reach it, so it is destroyed.
+    unnamed,
+};
+
 /// The three promotion points reach the ONE primitive through this seam
 /// (`data/pack.zig`'s prepare → commit); the ring never promotes inline.
 pub const PromotionHooks = struct {
@@ -1044,8 +1074,14 @@ pub const PromotionHooks = struct {
     /// Pressure: enqueue `file_id` to the merge worker (the hot path itself
     /// never promotes).
     pressure: ?*const fn (ctx: ?*anyopaque, key: StagingKey) void = null,
-    /// Promote now (dismount, fsync): true iff the entry left the ring.
+    /// Promote now (fsync, syncfs): true iff the entry left the ring. A
+    /// record the layout does not name stays: under a live mount an
+    /// unlinked-open file's custody is still read, and the dismount pass
+    /// judges what a crash left.
     promote: ?*const fn (ctx: ?*anyopaque, key: StagingKey) bool = null,
+    /// The dismount pass: promote, keep, or destroy a corpse's or an
+    /// unnamed record (nothing is in flight: the session is closed).
+    dismount: ?*const fn (ctx: ?*anyopaque, key: StagingKey) DismountVerdict = null,
 
     pub const none: PromotionHooks = .{};
 };
@@ -1234,21 +1270,41 @@ pub fn releaseStaged(pool: *Pool, seg: *Segment, key: StagingKey, generation: u6
 // §3.5 The promotion points.
 // ---------------------------------------------------------------------------
 
-/// The clean-unmount pass: every resident entry through the promote hook
-/// (failures leave the entry resident — never-wrong), then the caller seals
-/// the open packs before "Dismount clean".
-pub fn promoteAllAtDismount(gpa: Allocator, seg: *Segment, hooks: PromotionHooks) Allocator.Error!void {
-    const promote = hooks.promote orelse return;
+/// The dismount pass's verdicts, counted (the log line's numbers).
+pub const DismountTally = struct { promoted: u64 = 0, promoted_bytes: u64 = 0, kept: u64 = 0, corpses: u64 = 0, unnamed: u64 = 0 };
+
+/// The clean-unmount pass: every resident entry through the dismount hook
+/// — promoted, kept (a resource decline leaves the entry resident —
+/// never-wrong), or destroyed as a corpse's or an unnamed record (a clean
+/// unmount leaves no custody for an inode that does not exist, and none
+/// the metadata does not name) — then the caller seals the open packs
+/// before "Dismount clean".
+pub fn promoteAllAtDismount(gpa: Allocator, seg: *Segment, hooks: PromotionHooks) Allocator.Error!DismountTally {
+    var tally: DismountTally = .{};
+    const judge = hooks.dismount orelse return tally;
     const out = try seg.residentsAlloc(gpa);
     defer gpa.free(out);
-    for (out) |r| {
-        if (promote(hooks.ctx, r.key)) {
+    for (out) |r| switch (judge(hooks.ctx, r.key)) {
+        .promoted => {
+            tally.promoted += 1;
+            tally.promoted_bytes += r.cost;
             stats.dismount_promoted_files.inc();
             stats.dismount_promoted_bytes.add(r.cost);
-        } else {
+        },
+        .kept => {
+            tally.kept += 1;
             stats.dismount_promote_failures.inc();
-        }
-    }
+        },
+        .corpse => {
+            tally.corpses += 1;
+            stats.dismount_corpse_residents_destroyed.inc();
+        },
+        .unnamed => {
+            tally.unnamed += 1;
+            stats.dismount_unnamed_residents_destroyed.inc();
+        },
+    };
+    return tally;
 }
 
 /// `SQUEEZEFS_FSYNC_PROMOTE_STAGED`: fsync of a staged file also promotes it.
@@ -2319,9 +2375,16 @@ const Kicks = struct {
     pressure: u32 = 0,
     promoted: u32 = 0,
     fail_next: bool = false,
+    /// The dismount judgement of these inos (by the key's ino): a corpse's
+    /// record, an unnamed one; every other key promotes (or fails as the
+    /// promote hook does). The judge removes what it destroys, as the
+    /// plane's does.
+    seg: ?*Segment = null,
+    corpse_ino: ?u64 = null,
+    unnamed_ino: ?u64 = null,
 
     fn hooks(self: *Kicks) PromotionHooks {
-        return .{ .ctx = self, .pressure = onPressure, .promote = onPromote };
+        return .{ .ctx = self, .pressure = onPressure, .promote = onPromote, .dismount = onDismount };
     }
 
     fn onPressure(ctx: ?*anyopaque, _: StagingKey) void {
@@ -2329,14 +2392,24 @@ const Kicks = struct {
         self.pressure += 1;
     }
 
-    fn onPromote(ctx: ?*anyopaque, _: StagingKey) bool {
+    fn onPromote(ctx: ?*anyopaque, k: StagingKey) bool {
         const self: *Kicks = @ptrCast(@alignCast(ctx.?));
         if (self.fail_next) {
             self.fail_next = false;
             return false;
         }
         self.promoted += 1;
+        if (self.seg) |s| _ = s.remove(k, null);
         return true;
+    }
+
+    fn onDismount(ctx: ?*anyopaque, k: StagingKey) DismountVerdict {
+        const self: *Kicks = @ptrCast(@alignCast(ctx.?));
+        if (self.corpse_ino == k.ino() or self.unnamed_ino == k.ino()) {
+            if (self.seg) |s| _ = s.remove(k, null);
+            return if (self.corpse_ino == k.ino()) .corpse else .unnamed;
+        }
+        return if (onPromote(ctx, k)) .promoted else .kept;
     }
 };
 
@@ -2494,25 +2567,43 @@ test "the segment's fixed per-cell tables are gauged (R5): tablesBound(cap) = ma
     try testing.expectEqual(stats.staging_tables_bytes.load(), c.current());
 }
 
-test "the three promotion points: pressure rides stageWrite; the dismount pass promotes every resident (failures stay resident, counted); fsync promotes only under the lever (default off), a failure never fails it" {
+test "the three promotion points: pressure rides stageWrite; the dismount pass judges every resident — promoted, kept (a resource decline stays resident, counted FAILED), a corpse's record and an unnamed one destroyed (counted apart, never FAILED) — and the ring ends with the kept one alone; fsync promotes only under the lever (default off), a failure never fails it" {
     const gpa = testing.allocator;
     var kicks: Kicks = .{};
     var r = try ramSegment(gpa, 64 * 4096);
     defer gpa.free(r.image);
     defer r.seg.deinit();
+    kicks.seg = &r.seg;
     const v: [10]u8 = @splat(1);
     try r.seg.put(tkey(1, 1), &v, 1, 0, 0);
     try r.seg.put(tkey(2, 2), &v, 2, 0, 0);
     try r.seg.put(tkey(3, 3), &v, 3, 0, 0);
+    // The rm'd file's record (its inode destroyed) and a record no layout
+    // names (a kill between a promotion's commit and its ring release).
+    try r.seg.put(tkey(4, 4), &v, 4, 0, 0);
+    try r.seg.put(tkey(5, 5), &v, 5, 0, 0);
+    kicks.corpse_ino = 4;
+    kicks.unnamed_ino = 5;
     kicks.fail_next = true;
     const f0 = stats.dismount_promoted_files.load();
     const b0 = stats.dismount_promoted_bytes.load();
     const x0 = stats.dismount_promote_failures.load();
-    try promoteAllAtDismount(gpa, &r.seg, kicks.hooks());
+    const c0 = stats.dismount_corpse_residents_destroyed.load();
+    const n0 = stats.dismount_unnamed_residents_destroyed.load();
+    const tally = try promoteAllAtDismount(gpa, &r.seg, kicks.hooks());
+    try testing.expectEqual(DismountTally{ .promoted = 2, .promoted_bytes = 2 * 8192, .kept = 1, .corpses = 1, .unnamed = 1 }, tally);
     try testing.expectEqual(@as(u32, 2), kicks.promoted);
     try testing.expectEqual(f0 + 2, stats.dismount_promoted_files.load());
     try testing.expectEqual(b0 + 2 * 8192, stats.dismount_promoted_bytes.load());
     try testing.expectEqual(x0 + 1, stats.dismount_promote_failures.load());
+    try testing.expectEqual(c0 + 1, stats.dismount_corpse_residents_destroyed.load());
+    try testing.expectEqual(n0 + 1, stats.dismount_unnamed_residents_destroyed.load());
+    // The kept one is the ring's only resident; a destroyed record is gone.
+    try testing.expectEqual(@as(usize, 1), r.seg.live());
+    try testing.expect(r.seg.get(tkey(4, 4)) == null);
+    try testing.expect(r.seg.get(tkey(5, 5)) == null);
+    // The fsync lever takes the promote hook alone: no dismount verdicts.
+    kicks.seg = null;
     try testing.expect(!knobs.boolDefault("SQUEEZEFS_FSYNC_PROMOTE_STAGED"));
     const p0 = stats.fsync_promoted_files.load();
     promoteAtFsync(.{ .on = false }, kicks.hooks(), tkey(1, 1));

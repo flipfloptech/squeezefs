@@ -7461,6 +7461,148 @@ test "smoke: THE KILL MATRIX — kill -9 at 50/100/150 MiB of a 200 MiB dd and m
     }
 }
 
+/// The staged-then-promoted file the dismount-residue row kills inside:
+/// 4 MiB (one block) staged by fsync'd writes, then ONE write past the
+/// block — the promotion to its own block, whose commit the seam kills
+/// after (the ring record stays, the striped layout no longer names it).
+const residue_stage_script = "dd if=\"$1/image\" of=$2 bs=1M count=4 conv=fsync status=none && echo staged-ok";
+const residue_promote_script = "dd if=\"$1/image\" of=$2 bs=1M skip=4 seek=4 count=1 conv=notrunc status=none; echo promote-returned";
+
+/// Mount with the kill seam, stage `name` and kill the daemon inside its
+/// promotion: the ring keeps the 4 MiB record, the layout is striped.
+fn killInsidePromotion(rig: *Rig, name: []const u8) !void {
+    const gpa = rig.gpa;
+    try rig.env.put("SQUEEZEFS_TEST_PROMOTE_KILL_AFTER_COMMIT", "1");
+    defer rig.env.put("SQUEEZEFS_TEST_PROMOTE_KILL_AFTER_COMMIT", "0") catch {};
+    const mark = try rig.logLen();
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(mark);
+    {
+        const out = try rig.onMountArgv(residue_stage_script, &.{ "sh", "-e", "-c", residue_stage_script, "smoke", rig.work, name });
+        defer gpa.free(out);
+        try testing.expect(std.mem.indexOf(u8, out, "staged-ok") != null);
+    }
+    {
+        // Tolerant: the daemon dies under this write (dd ends ENOTCONN).
+        const r = try std.process.run(gpa, rig.io, .{ .argv = &.{ "sh", "-c", residue_promote_script, "smoke", rig.work, name }, .cwd = .{ .path = rig.mp }, .environ_map = &rig.env });
+        defer rig.freeRun(r);
+    }
+    try testing.expectEqual(std.process.Child.Term{ .signal = .KILL }, try rig.waitChild());
+    {
+        const text = try rig.readLog();
+        defer gpa.free(text);
+        try testing.expect(std.mem.indexOf(u8, text[mark..], "TEST SEAM SQUEEZEFS_TEST_PROMOTE_KILL_AFTER_COMMIT") != null);
+    }
+    try rig.umountAfterKill();
+}
+
+/// The dismount pass's tally off a log segment: `(promoted, failed,
+/// corpses, unnamed)` of its "dismount promotion:" line.
+const DismountLine = struct { promoted: u64, failed: u64, corpses: u64, unnamed: u64 };
+
+fn dismountLineOf(seg: []const u8) !DismountLine {
+    const at = std.mem.indexOf(u8, seg, "dismount promotion: ") orelse return error.NoDismountPromotionLine;
+    const line = seg[at..];
+    const failed_at = std.mem.indexOf(u8, line, "promoted, ") orelse return error.NoDismountPromotionLine;
+    return .{
+        .promoted = numberAfter(line, "dismount promotion: ") orelse 0,
+        .failed = numberAfter(line[failed_at..], "promoted, ") orelse 0,
+        .corpses = numberAfter(line, "failed; ") orelse return error.NoDismountTally,
+        .unnamed = numberAfter(line, "corpse record(s) and ") orelse return error.NoDismountTally,
+    };
+}
+
+test "smoke: KILL -9 BETWEEN A PROMOTION'S COMMIT AND ITS RING RELEASE (the kill matrix's two-ring [C4]) — a 4 MiB staged file promoted to its own block, the daemon killed after the layout committed: (a) remount without fsck → rm → clean unmount destroys the corpse's record (0 FAILED) → fsck clean; (b) fsck's own dismount destroys the record its live file's layout no longer names → the remount recovers 0 → the file byte-exact → rm → fsck clean" {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    try rig.formatSet(true);
+    try rig.createImage();
+    try rig.env.put("SQUEEZEFS_BLOCK_REFS_VERIFY", "1");
+    const image = try Io.Dir.cwd().openFile(io, rig.image, .{});
+    defer image.close(io);
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(0);
+    const baseline = try rig.usedKib();
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+
+    // (a) The corpse arm: the kill, the remount's own recovery adopts the
+    //     record (no fsck between), the file is rm'd, the clean unmount's
+    //     pass meets a record whose inode is gone.
+    try killInsidePromotion(rig, "a");
+    var mark = try rig.logLen();
+    _ = try remountAfterKill(rig, null);
+    {
+        const text = try rig.readLog();
+        defer gpa.free(text);
+        try testing.expectEqual(@as(u64, 1), numberAfter(text[mark..], "recovered ") orelse 0);
+    }
+    {
+        const out = try rig.onMount("rm a && echo ok");
+        defer gpa.free(out);
+    }
+    try rig.awaitUsedKib(baseline);
+    mark = try rig.logLen();
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+    {
+        const text = try rig.readLog();
+        defer gpa.free(text);
+        const d = try dismountLineOf(text[mark..]);
+        std.debug.print("\nsmoke[residue]: (a) the clean unmount after rm: {d} promoted, {d} FAILED, {d} corpse record(s), {d} unnamed record(s)\n", .{ d.promoted, d.failed, d.corpses, d.unnamed });
+        try testing.expectEqual(DismountLine{ .promoted = 0, .failed = 0, .corpses = 1, .unnamed = 0 }, d);
+    }
+    _ = try fsckClean(rig, "the clean unmount after the corpse's rm");
+
+    // (b) The unnamed arm: fsck's guarded open adopts the record and its
+    //     close destroys it — the file lives, its layout is striped.
+    try killInsidePromotion(rig, "b");
+    {
+        rig.freeRunOk(try rig.sh(rig.work, "cp --sparse=always vol.img vol.prefsck.img"));
+        const r = try rig.squeezefs(&.{ "fsck", "--offline", "--scrub", rig.meta_uri });
+        defer rig.freeRun(r);
+        if (!r.term.success() or std.mem.indexOf(u8, r.stdout, "findings: 0 (clean)") == null) {
+            std.debug.print("\n--- fsck --offline after the kill inside the promotion ({f}) ---\n{s}\n--- stderr ---\n{s}\n", .{ r.term, r.stdout, r.stderr });
+            rig.keepRefusedImage();
+            return error.FsckNotClean;
+        }
+        try testing.expectEqual(@as(u64, 1), numberAfter(r.stderr, "recovered ") orelse 0);
+        const d = try dismountLineOf(r.stderr);
+        std.debug.print("smoke[residue]: (b) fsck's dismount pass: {d} promoted, {d} FAILED, {d} corpse record(s), {d} unnamed record(s)\n", .{ d.promoted, d.failed, d.corpses, d.unnamed });
+        try testing.expectEqual(DismountLine{ .promoted = 0, .failed = 0, .corpses = 0, .unnamed = 1 }, d);
+    }
+    mark = try rig.logLen();
+    _ = try remountAfterKill(rig, .{ .replayed = 0, .torn = 0, .ring_records = 0, .ring_torn = 0 });
+    {
+        const text = try rig.readLog();
+        defer gpa.free(text);
+        try testing.expectEqual(@as(u64, 0), numberAfter(text[mark..], "recovered ") orelse 1);
+        var dir = try Io.Dir.cwd().openDir(io, rig.mp, .{});
+        defer dir.close(io);
+        // The promotion's own block IS the file: the 4 MiB image, no hole.
+        const c = try pageCensus(gpa, io, dir, "b", image, 0, 5 << 20);
+        try testing.expectEqual(@as(u64, 4 << 20), c.size);
+        try testing.expectEqual(@as(u64, 0), c.holes);
+    }
+    {
+        const out = try rig.onMount("rm b && echo ok");
+        defer gpa.free(out);
+    }
+    try rig.awaitUsedKib(baseline);
+    mark = try rig.logLen();
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+    {
+        const text = try rig.readLog();
+        defer gpa.free(text);
+        try testing.expectEqual(DismountLine{ .promoted = 0, .failed = 0, .corpses = 0, .unnamed = 0 }, try dismountLineOf(text[mark..]));
+    }
+    _ = try fsckClean(rig, "the clean unmount after the unnamed record's fsck");
+}
+
 // ---- fsck / scrub: OUR oracle over a real set (rung 8) ----
 
 /// `squeezefs fsck …` through the binary; the report's JSON, the exit code

@@ -210,13 +210,17 @@ const PromoteBody = struct {
         const files0 = staging.stats.dismount_promoted_files.load();
         const bytes0 = staging.stats.dismount_promoted_bytes.load();
         const failed0 = staging.stats.dismount_promote_failures.load();
+        const corpses0 = staging.stats.dismount_corpse_residents_destroyed.load();
+        const unnamed0 = staging.stats.dismount_unnamed_residents_destroyed.load();
         const live = staging.stats.staged_writes_in_flight.load();
         set.plane.?.close();
         set.plane = null;
         const files = staging.stats.dismount_promoted_files.load() - files0;
         const bytes = staging.stats.dismount_promoted_bytes.load() - bytes0;
         const failed = staging.stats.dismount_promote_failures.load() - failed0;
-        self.p.stdout.print("staging promote {s}: {d} staged file(s) found, {d} promoted ({d} B), {d} failed\n", .{ set.paths[0], live, files, bytes, failed }) catch {};
+        const corpses = staging.stats.dismount_corpse_residents_destroyed.load() - corpses0;
+        const unnamed = staging.stats.dismount_unnamed_residents_destroyed.load() - unnamed0;
+        self.p.stdout.print("staging promote {s}: {d} staged file(s) found, {d} promoted ({d} B), {d} failed; {d} corpse record(s) and {d} unnamed record(s) destroyed\n", .{ set.paths[0], live, files, bytes, failed, corpses, unnamed }) catch {};
         self.p.stdout.flush() catch {};
         return if (failed != 0) cli.exit_failed else cli.exit_ok;
     }

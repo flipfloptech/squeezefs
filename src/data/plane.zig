@@ -118,6 +118,7 @@ const seams = @import("write_seams.zig");
 const size_epoch = @import("size_epoch.zig");
 const write_admit = @import("write_admit.zig");
 const write_side_view = @import("write_side_view.zig");
+const writeback = @import("writeback.zig");
 const device_overlay = @import("device_overlay.zig");
 const sole_owner_patch = @import("sole_owner_patch.zig");
 const accumulate = @import("accumulate.zig");
@@ -1094,7 +1095,7 @@ pub const DataPlane = struct {
         st.seg = staging.Segment.init(gpa, st.mapped.map, st.mapped.backing()) catch return error.OutOfMemory;
         errdefer st.seg.deinit();
         const rep = st.seg.recover();
-        st.pool = staging.Pool.init(gpa, capacity, .{ .ctx = self, .pressure = &promotionPressure, .promote = &promoteHook });
+        st.pool = staging.Pool.init(gpa, capacity, .{ .ctx = self, .pressure = &promotionPressure, .promote = &promoteHook, .dismount = &dismountHook });
         st.pool.seedFromRecovery(&st.seg) catch return error.OutOfMemory;
         budget.authority.register(st.pool.component());
         // The live cells' value-hash states (R5: ≤ `cellStateBound(capacity)`)
@@ -1177,7 +1178,12 @@ pub const DataPlane = struct {
     /// calls it BEFORE the wire plane stops; `close` runs it once if nobody
     /// did (a bring-up failure's unwind). A promotion that fails leaves its
     /// resident staged (never lost: the ring is durable, the next mount
-    /// adopts it) and the pass is loud about it.
+    /// adopts it) and the pass is loud about it. A resident whose ino has
+    /// no live inode, or whose layout does not name it, is destroyed here
+    /// (`judgeAtDismount`): the ring release is the step AFTER a promotion's
+    /// or a destroy's commit, outside the transaction, so a kill between
+    /// the two leaves a record nothing names — kept, it is a `[C4]` orphan
+    /// once its inode is gone (THE KILL MATRIX under two rings per queue).
     pub fn dismount(self: *DataPlane) void {
         if (self.dismounted) return;
         self.dismounted = true;
@@ -1189,16 +1195,13 @@ pub const DataPlane = struct {
         self.tasks.wait(io) catch {};
         self.wp.quiesce(io);
         if (self.stage) |*st| {
-            const files0 = staging.stats.dismount_promoted_files.load();
-            const bytes0 = staging.stats.dismount_promoted_bytes.load();
-            const failed0 = staging.stats.dismount_promote_failures.load();
-            staging.promoteAllAtDismount(self.gpa, &st.seg, st.pool.hooks) catch |e| log.err("dismount promotion pass: {s}", .{@errorName(e)});
-            const failed = staging.stats.dismount_promote_failures.load() - failed0;
-            if (failed != 0) {
-                log.err("dismount promotion: {d} staged file(s) ({d} B) promoted, {d} FAILED — the failed residents stay in the staging ring (readable here, zeros elsewhere) until the next mount of this host promotes them", .{ staging.stats.dismount_promoted_files.load() - files0, staging.stats.dismount_promoted_bytes.load() - bytes0, failed });
-            } else {
-                log.info("dismount promotion: {d} staged file(s) ({d} B) promoted, 0 failed", .{ staging.stats.dismount_promoted_files.load() - files0, staging.stats.dismount_promoted_bytes.load() - bytes0 });
-            }
+            if (staging.promoteAllAtDismount(self.gpa, &st.seg, st.pool.hooks)) |t| {
+                if (t.kept != 0) {
+                    log.err("dismount promotion: {d} staged file(s) ({d} B) promoted, {d} FAILED — the failed residents stay in the staging ring (readable here, zeros elsewhere) until the next mount of this host promotes them; {d} corpse record(s) and {d} unnamed record(s) destroyed", .{ t.promoted, t.promoted_bytes, t.kept, t.corpses, t.unnamed });
+                } else {
+                    log.info("dismount promotion: {d} staged file(s) ({d} B) promoted, 0 failed; {d} corpse record(s) and {d} unnamed record(s) destroyed", .{ t.promoted, t.promoted_bytes, t.corpses, t.unnamed });
+                }
+            } else |e| log.err("dismount promotion pass: {s}", .{@errorName(e)});
         }
         if (self.packer) |*p| p.sealAll();
         _ = self.reclaimer.drainSync(io);
@@ -1798,36 +1801,89 @@ pub const DataPlane = struct {
         return self.promoteStaged(k);
     }
 
+    fn dismountHook(ctx: ?*anyopaque, k: staging.StagingKey) staging.DismountVerdict {
+        const self: *DataPlane = @ptrCast(@alignCast(ctx.?));
+        return self.judgeAtDismount(k);
+    }
+
     /// The ONE primitive (charter §6.1): dispatch on size — fits inline ⇒
     /// inline; `slot > CHUNK/2` ⇒ its own block; else a packed tenant. The
     /// identity is re-checked under the promotion's locks — the (3.5) stripe
     /// THEN the (3.7) layout lock (module doc; `PublishLocks.lockPromotion`)
     /// — (still staged, same file id, same ring generation); true iff the
     /// entry left the ring. A displaced durable copy is released after the
-    /// locks drop (RES-1).
+    /// locks drop (RES-1). A record the layout does not name stays: the
+    /// live points run beside the ops (an unlinked-open file reads its
+    /// custody until its FORGET); the dismount pass judges it.
     pub fn promoteStaged(self: *DataPlane, k: staging.StagingKey) bool {
+        return self.promoteUnder(k, .live) == .promoted;
+    }
+
+    /// The dismount pass's verdict on one resident (`staging.DismountVerdict`;
+    /// charter §6.1 "a corpse's custody is destroyed, never promoted"): the
+    /// ino's inode read under the promotion's locks — absent or `nlink == 0`
+    /// ⇒ `.corpse`; then the promotion — a record the layout does not name
+    /// (no layout, kind not staged, another file id) ⇒ `.unnamed`; a
+    /// resource decline ⇒ `.kept`. A corpse's or an unnamed record leaves
+    /// the ring (generation-gated, the pool credited). A spilled block
+    /// (`writeback.blockKey`) is write custody no layout names by design:
+    /// judged by its ino alone, kept while the ino lives.
+    pub fn judgeAtDismount(self: *DataPlane, k: staging.StagingKey) staging.DismountVerdict {
+        return self.promoteUnder(k, .dismount);
+    }
+
+    const PromotionPass = enum { live, dismount };
+
+    fn promoteUnder(self: *DataPlane, k: staging.StagingKey, pass: PromotionPass) staging.DismountVerdict {
         const io = self.io;
-        const st = &(self.stage orelse return false);
+        const st = &(self.stage orelse return .kept);
         const ino = k.ino();
         stats.promotions_run.inc();
         const lease = st.seg.get(k) orelse {
             stats.promotions_stale.inc();
-            return false;
+            return .kept;
         };
         defer lease.release();
         const generation = lease.generation();
         const image = lease.bytes();
         const locks = self.locks.lockPromotion(io, ino);
-        const out = self.promoteLocked(io, ino, k, generation, image);
+        const corpse = pass == .dismount and self.inoIsCorpse(ino);
+        const out: Promoted = if (corpse) .{ .ok = false } else self.promoteLocked(io, ino, k, generation, image);
+        const verdict: staging.DismountVerdict = if (out.ok) .promoted else if (corpse) .corpse else if (pass == .dismount and out.unnamed and writeback.blockOfKey(k) == null) .unnamed else .kept;
+        if (verdict == .corpse or verdict == .unnamed) {
+            log.debug("dismount promotion ino {d}: {s} record destroyed ({d} B)", .{ ino, @tagName(verdict), image.len });
+            _ = staging.releaseStaged(&st.pool, &st.seg, k, generation);
+        }
         locks.release(io);
         if (out.displaced) |d| {
             if (self.packer) |*p| p.releaseTenantRef(d);
             self.releaseHolds().drop(&.{d});
         }
-        return out.ok;
+        return verdict;
     }
 
-    const Promoted = struct { ok: bool, displaced: ?Mapping = null };
+    /// Under the promotion's locks: the ino has no live inode record. A
+    /// LOCAL ino's record is read here; a foreign slot's ino is its
+    /// holder's — `.gone` at the holder is a corpse, a held token is judged
+    /// by its carried layout alone (never this mount's projection). A read
+    /// that fails is no verdict (the record stays).
+    fn inoIsCorpse(self: *DataPlane, ino: u64) bool {
+        if (self.foreign_layout) |f| switch (f.lookup(f.ctx, self.gpa, ino) catch return false) {
+            .local => {},
+            .gone => return true,
+            .foreign => |x| {
+                if (x.layout) |v| self.gpa.free(v);
+                return false;
+            },
+        };
+        const v = (self.inodeRecord(ino) catch return false) orelse return true;
+        return v.nlink == 0;
+    }
+
+    /// `unnamed`: the layout does not name this record (none, kind not
+    /// staged, another file id) — residue to the dismount pass; a
+    /// generation race or a resource decline is not.
+    const Promoted = struct { ok: bool, displaced: ?Mapping = null, unnamed: bool = false };
 
     fn promoteLocked(self: *DataPlane, io: Io, ino: u64, k: staging.StagingKey, generation: u64, image: []const u8) Promoted {
         const st = &self.stage.?;
@@ -1839,16 +1895,21 @@ pub const DataPlane = struct {
         }) orelse {
             stats.promotions_stale.inc();
             log.debug("promotion ino {d}: stale — no layout record (the file is gone; the ring entry is an orphan)", .{ino});
-            return .{ .ok = false };
+            return .{ .ok = false, .unnamed = true };
         };
         defer self.gpa.free(cur_bytes.value);
         const cur = layout.XattrLayout.decode(cur_bytes.value, self.geo) catch |e| {
             log.debug("promotion ino {d}: the layout record failed to decode ({t})", .{ ino, e });
             return .{ .ok = false };
         };
-        if (cur.kind != .staged or !std.mem.eql(u8, &cur.file_id, &k.file_id) or st.seg.residentGeneration(k) != generation) {
+        if (cur.kind != .staged or !std.mem.eql(u8, &cur.file_id, &k.file_id)) {
             stats.promotions_stale.inc();
-            log.debug("promotion ino {d}: stale — layout kind {t}, file id {s}, resident generation {?d} vs leased {d}", .{ ino, cur.kind, if (std.mem.eql(u8, &cur.file_id, &k.file_id)) "same" else "DIFFERENT", st.seg.residentGeneration(k), generation });
+            log.debug("promotion ino {d}: stale — layout kind {t}, file id {s}: the layout does not name this record", .{ ino, cur.kind, if (std.mem.eql(u8, &cur.file_id, &k.file_id)) "same" else "DIFFERENT" });
+            return .{ .ok = false, .unnamed = true };
+        }
+        if (st.seg.residentGeneration(k) != generation) {
+            stats.promotions_stale.inc();
+            log.debug("promotion ino {d}: stale — resident generation {?d} vs leased {d}", .{ ino, st.seg.residentGeneration(k), generation });
             return .{ .ok = false };
         }
         const policy = if (self.packer) |*p| p.policy else pack.Policy{ .enabled = false, .max_slot = self.chunk / 2 };

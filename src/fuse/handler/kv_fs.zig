@@ -356,6 +356,9 @@ pub const Options = struct {
     /// `SQUEEZEFS_TEST_WRITE_POSTLUDE_HOLD`: a striped write parks inside
     /// its postlude's `I{ino}` section until `write_hold_release` fires.
     write_postlude_hold: bool = false,
+    /// `SQUEEZEFS_TEST_PROMOTE_KILL_AFTER_COMMIT`: the daemon SIGKILLs
+    /// itself between a staged file's promotion commit and its ring release.
+    promote_kill_after_commit: bool = false,
 };
 
 /// A held 4a set travelling with a transaction; it drops at the terminal
@@ -490,6 +493,8 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         /// BEFORE its postlude's `I{ino}` guard until `write_hold_release`
         /// fires (the window a size-setting commit crosses whole).
         write_hold_pre_guard: bool = false,
+        /// `Options.promote_kill_after_commit` (`promoteToStriped`).
+        promote_kill_after_commit: bool,
         /// Test seam: the times drain parks between its claims snapshot and
         /// its guards until `write_hold_release` fires (the window a
         /// size-setting commit can cross).
@@ -580,6 +585,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 .pending = try economy.PendingTimes.init(gpa),
                 .times_park = opts.times_park,
                 .write_hold = opts.write_postlude_hold,
+                .promote_kill_after_commit = opts.promote_kill_after_commit,
                 .locks = undefined,
                 .uid = opts.uid,
                 .gid = opts.gid,
@@ -3408,6 +3414,12 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 try self.publish(t, local, rec, new, proofs);
                 t_owned = false;
                 try self.commit(c, t);
+            }
+            if (self.promote_kill_after_commit) {
+                // The ring release below is outside the transaction: a kill
+                // here leaves a record the striped layout does not name.
+                log.err("TEST SEAM SQUEEZEFS_TEST_PROMOTE_KILL_AFTER_COMMIT: ino {d}: the striped layout committed, the staging-ring record NOT released — SIGKILL", .{local});
+                _ = linux.kill(linux.getpid(), .KILL);
             }
             // The layout names the own block now: its mint's live-owner
             // registration drops (decision 0003 §AH.1).

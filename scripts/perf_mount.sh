@@ -12,6 +12,8 @@
 #   scripts/perf_mount.sh --keep               # leave the set mounted on exit
 #   scripts/perf_mount.sh --scrub              # fsck --offline --scrub on exit (default: no scrub)
 #   scripts/perf_mount.sh --rm                 # macOS: delete the bench container and its volumes
+#   scripts/perf_mount.sh -o interception      # extra mount options (comma list; `interception` arms
+#                                              # the client bypass's session host for the shim/SDK)
 #   scripts/perf_mount.sh -- <command…>        # run one command against the mount instead of a shell
 #
 #   macOS (Apple `container`, a microVM): a container `sqz-bench` of its own
@@ -45,7 +47,7 @@ IMAGE=${SQZ_PERF_IMAGE:-squeezefs-dev:ubuntu2404}
 BASE_IMAGE=squeezefs-build:ubuntu2404
 MEM=${SQZ_PERF_MEM:-16G}
 
-fresh=0 rebuild=0 keep=0 remove=0 scrub=0
+fresh=0 rebuild=0 keep=0 remove=0 scrub=0 mopts=""
 mdts=2 osts=2 mdt_size=2G ost_size=16G cache_dir=/var/tmp/sqz-perf-cache
 mdt_devs=() ost_devs=() cmd=()
 die() { echo "perf_mount: $*" >&2; exit 1; }
@@ -63,6 +65,7 @@ while [ $# -gt 0 ]; do
     --mdt) mdt_devs+=("$2"); shift ;;
     --ost) ost_devs+=("$2"); shift ;;
     --cache-dir) cache_dir=$2; shift ;;
+    -o) mopts=$2; shift ;;
     --ram) [ -r /run/sqz-ramnvme/devs ] || die "--ram: run scripts/perf/ramnvme.sh up first"
       while IFS== read -r r d; do case "$r" in mdt*) mdt_devs+=("$d") ;; ost*) ost_devs+=("$d") ;; esac; done < /run/sqz-ramnvme/devs ;;
     --) shift; cmd=("$@"); break ;;
@@ -81,13 +84,13 @@ dirty=$(git -C "$REPO" status --porcelain --untracked-files=no 2>/dev/null | hea
 
 # ---------------------------------------------------------------------------
 # The session, run inside the container (macOS) or on the host (Linux).
-# Arguments: REPO FRESH REBUILD KEEP SCRUB MODE MNT CACHE HOSTINFO TARGETS… -- CMD…
+# Arguments: REPO FRESH REBUILD KEEP SCRUB MODE MNT CACHE HOSTINFO MOPTS TARGETS… -- CMD…
 # TARGETS are role:name:source — source is `vol` (a container volume to lay
 # out as a raw partition) or a device path (native).
 # ---------------------------------------------------------------------------
 read -r -d '' INNER <<'EOF' || true
 set -euo pipefail
-REPO=$1 FRESH=$2 REBUILD=$3 KEEP=$4 SCRUB=$5 MODE=$6 MNT=$7 CACHE=$8 HOSTINFO=$9; shift 9
+REPO=$1 FRESH=$2 REBUILD=$3 KEEP=$4 SCRUB=$5 MODE=$6 MNT=$7 CACHE=$8 HOSTINFO=$9 MOPTS=${10}; shift 10
 targets=(); while [ $# -gt 0 ] && [ "$1" != -- ]; do targets+=("$1"); shift; done; [ $# -gt 0 ] && shift
 die() { echo "perf_mount: $*" >&2; exit 1; }
 STATE=/var/lib/sqz-perf; [ "$MODE" = container ] && STATE=/build/perf
@@ -164,7 +167,7 @@ fi
 mkdir -p "$MNT"
 if ! mountpoint -q "$MNT"; then
   "$BIN" mount --daemon --supervise --log-file "$LOG" \
-    -o default_permissions,allow_other,fsname=squeezefs-perf "$META" "$MNT" \
+    -o "default_permissions,allow_other,fsname=squeezefs-perf${MOPTS:+,$MOPTS}" "$META" "$MNT" \
     || { tail -30 "$LOG" >&2 2>/dev/null; die "mount failed (log: $LOG)"; }
 fi
 DAEMON_PID=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["mount"]["pid"])' "$MNT/.stats" 2>/dev/null || true)
@@ -180,7 +183,7 @@ mkdir -p "$RUN"
   echo "layout      $layout"
   for m in "${metas[@]}" "${datas[@]}"; do printf '  %-6s -> %s  %s B\n' "$(basename "$m")" "$(readlink "$m")" "$(blockdev --getsize64 "$m" 2>/dev/null)"; done
   echo "cache       $CACHE"
-  echo "mount       $MNT  -o default_permissions,allow_other  (daemon pid ${DAEMON_PID:-?})"
+  echo "mount       $MNT  -o default_permissions,allow_other${MOPTS:+,$MOPTS}  (daemon pid ${DAEMON_PID:-?})"
   echo "env         $(env | grep '^SQUEEZEFS_' | tr '\n' ' ')"
   echo "load        $(cut -d' ' -f1-3 /proc/loadavg) at mount"
   echo "fuse        enable_uring=$(cat /sys/module/fuse/parameters/enable_uring)"
@@ -261,7 +264,7 @@ if [ "$(uname -s)" = Linux ]; then
   for d in "${ost_devs[@]}"; do targets+=("ost:ost$i:$d"); i=$((i + 1)); done
   hostinfo="native $(uname -n) $(grep -m1 'model name' /proc/cpuinfo 2>/dev/null | cut -d: -f2 | sed 's/^ //')"
   [ "$(id -u)" = 0 ] || exec sudo -E "$0" ${ORIG_ARGS[@]+"${ORIG_ARGS[@]}"}
-  exec bash -c "$INNER" perf_mount "$REPO" "$fresh" "$rebuild" "$keep" "$scrub" native /mnt/sqz-perf "$cache_dir" "$hostinfo" "${targets[@]}" -- ${cmd[@]+"${cmd[@]}"}
+  exec bash -c "$INNER" perf_mount "$REPO" "$fresh" "$rebuild" "$keep" "$scrub" native /mnt/sqz-perf "$cache_dir" "$hostinfo" "$mopts" "${targets[@]}" -- ${cmd[@]+"${cmd[@]}"}
 fi
 
 # ---------------------------------------------------------------------------
@@ -330,4 +333,4 @@ hostinfo="macOS $(sw_vers -productVersion) $(sysctl -n machdep.cpu.brand_string)
 
 targets=(); for t in "${tnames[@]}"; do n=${t%%:*}; r=${t#*:}; targets+=("${r%%:*}:$n:vol"); done
 tty_flags=(-i); [ -t 0 ] && tty_flags=(-it)
-exec container exec "${tty_flags[@]}" "$NAME" bash -c "$INNER" perf_mount "$REPO" "$fresh" "$rebuild" "$keep" "$scrub" container /mnt/sqz /build/perf/cache "$hostinfo" "${targets[@]}" -- ${cmd[@]+"${cmd[@]}"}
+exec container exec "${tty_flags[@]}" "$NAME" bash -c "$INNER" perf_mount "$REPO" "$fresh" "$rebuild" "$keep" "$scrub" container /mnt/sqz /build/perf/cache "$hostinfo" "$mopts" "${targets[@]}" -- ${cmd[@]+"${cmd[@]}"}

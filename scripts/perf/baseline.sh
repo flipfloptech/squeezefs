@@ -9,8 +9,14 @@
 #   slc                 the drive's SLC-cache knee: 56 GiB of 1 MiB sequential writes on perf-slc,
 #                       MiB/s per 5 s
 #   ssd-raw ssd-ext4 ssd-sqz   the scratch LVs (blkdiscard first)
-#   ram-raw ram-ext4 ram-sqz   ramnvme.sh's namespaces (up and down inside the session)
-# Extra matrix.sh knobs pass through the environment (MX_ROWS, MX_PROFILE, …).
+#   ram-raw ram-ext4 ram-xfs ram-sqz   ramnvme.sh's namespaces (up and down inside the session)
+#   ram-sqz-il          the CLIENT BYPASS (charter §7): the perf set mounted `-o interception`, the
+#                       rows run under LD_PRELOAD of this tree's zig-out-perf/lib/libsqueezefs_il.so
+#                       on fio's psync engine unless MX_ENGINE says libaio (io_uring never enters
+#                       libc, so it cannot be intercepted); every row prints its engagement line.
+#                       The four columns of docs/evidence/rung-10-client-bypass-rows.md are
+#                       `MX_ENGINE=psync` × {ram-ext4, ram-xfs, ram-sqz} and ram-sqz-il.
+# Extra matrix.sh knobs pass through the environment (MX_ROWS, MX_PROFILE, MX_ENGINE, …).
 set -euo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO=$(cd "$HERE/../.." && pwd)
@@ -36,6 +42,11 @@ cleanup() {
 trap cleanup EXIT
 ext4_on() {   # $1 device: mkfs, mount at $M, run the matrix, unmount
   mkfs.ext4 -q -F "$1"; mkdir -p "$M"; mount "$1" "$M"
+  "$HERE/matrix.sh" "$M" "$L"
+  umount "$M"; wipefs -q -a "$1"
+}
+xfs_on() {
+  mkfs.xfs -q -f "$1"; mkdir -p "$M"; mount "$1" "$M"
   "$HERE/matrix.sh" "$M" "$L"
   umount "$M"; wipefs -q -a "$1"
 }
@@ -68,7 +79,15 @@ case "$S" in
     quiet; ram; "$HERE/matrix.sh" "$(ramdev ost0)" "$L" ;;
   ram-ext4)
     quiet; ram; ext4_on "$(ramdev ost0)" ;;
+  ram-xfs)
+    quiet; ram; xfs_on "$(ramdev ost0)" ;;
   ram-sqz)
     quiet; ram; "$REPO/scripts/perf_mount.sh" --ram --fresh -- "$HERE/matrix.sh /mnt/sqz-perf $L" ;;
+  ram-sqz-il)
+    quiet; ram
+    SO=$REPO/zig-out-perf/lib/libsqueezefs_il.so
+    case "${MX_ENGINE:-psync}" in psync|libaio) ;; *) die "ram-sqz-il needs MX_ENGINE=psync or libaio (the shim interposes libc, not io_uring)" ;; esac
+    # perf_mount.sh builds `dist shim` together, so the .so pairs with the daemon it mounts.
+    MX_ENGINE=${MX_ENGINE:-psync} MX_PRELOAD=$SO "$REPO/scripts/perf_mount.sh" --ram --fresh -o interception -- "$HERE/matrix.sh /mnt/sqz-perf $L" ;;
   *) die "unknown session '$S' (see the header)" ;;
 esac

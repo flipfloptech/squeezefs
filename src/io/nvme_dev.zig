@@ -874,7 +874,12 @@ fn workerPasses(w: *Worker) void {
         // A dead ring's CQEs wake nobody: while it holds ops (§AR.4) the
         // backstop tick is what reaps them.
         const tick: ?u64 = if (w.ring_dead) (if (w.active_count > 0) nd.wake_unarmed_backstop_ns else null) else if (w.park.wake_armed) null else nd.wake_unarmed_backstop_ns;
+        // The idle seam brackets an untimed park with nothing queued or in
+        // flight: only a publish ends it (`Seams.idle_parked`).
+        const idle = w.active_count == 0 and tick == null;
+        if (idle) dev.seams.idle_parked.store(1, .release);
         _ = w.park.park(tick);
+        if (idle) dev.seams.idle_parked.store(0, .release);
         if (w.park.isDead() and !w.ring_dead) failInFlight(w);
         reap(w);
     }
@@ -2353,11 +2358,16 @@ test "wake coalescing: N publishes between two lane passes cost ONE eventfd writ
     defer tf.destroy();
     const dev = try Device.open(testing.allocator, tf.path);
     defer dev.deinit();
-    // Warm: after this completion the lane consumed its wake, disarmed the
-    // coalescer and parked.
+    // Warm: after this completion the lane consumed its wake and disarmed
+    // the coalescer; the first arrival below must find it PARKED, so wait
+    // for the idle park (its publish landing in the pass before that park
+    // is pumped there, and its eventfd write arms the coalescer after the
+    // pass's disarm: the 8 held publishes then all elide — `expected 3,
+    // found 2`, 9 of 300 under load).
     const warm = try dev.readBlock(0, 4096);
     warm.release();
     const seams = &dev.seams;
+    while (seams.idle_parked.load(.acquire) == 0) std.atomic.spinLoopHint();
     seams.held.store(0, .release);
     seams.hold_before_park.store(1, .release);
     const Reader = struct {
@@ -2391,10 +2401,17 @@ test "wake coalescing: N publishes between two lane passes cost ONE eventfd writ
         for (threads[0..spawned]) |t| t.join();
     }
     // The first arrival wakes the parked lane; the pass pumps it and holds
-    // BEFORE its park.
+    // BEFORE its park. Its publish is counted AFTER the eventfd write that
+    // woke the lane (`ring_park.Wake`: `written`, then `dev_wake_writes`),
+    // so the baselines wait for both counts — read at `held` alone they
+    // raced the arrival's thread (`expected 2, found 3`, 43 of 300 under
+    // load).
+    const w_before = Writes.of(dev);
+    const p_before = stats.dev_wake_writes.load() + stats.dev_wakes_elided.load();
     threads[0] = try std.Thread.spawn(.{}, Reader.run, .{ dev, &failed });
     spawned = 1;
     while (seams.held.load(.acquire) == 0) futex.wait(&seams.held, 0);
+    while (Writes.of(dev) == w_before or stats.dev_wake_writes.load() + stats.dev_wakes_elided.load() == p_before) std.atomic.spinLoopHint();
     const w0 = Writes.of(dev);
     const e0 = stats.dev_wakes_elided.load();
     const p0 = stats.dev_wake_writes.load() + e0;

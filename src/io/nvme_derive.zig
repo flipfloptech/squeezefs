@@ -527,6 +527,13 @@ pub const Seams = struct {
     /// Futex words.
     hold_before_park: std.atomic.Value(u32) = .init(0),
     held: std.atomic.Value(u32) = .init(0),
+    /// 1 while a lane of the device sits in an UNTIMED park with nothing
+    /// queued or in flight (stored before the enter, cleared after it
+    /// returns): a test whose next publish must be the one that wakes a
+    /// parked lane waits for it — a publish landing in the pass before
+    /// that park is pumped there instead, and its eventfd write arms the
+    /// coalescer AFTER that pass's disarm.
+    idle_parked: std.atomic.Value(u32) = .init(0),
     /// Armed count: the next lane pass declares its ring dead (the
     /// `ring_park` dead-ring verdict without a broken kernel) — every
     /// in-flight op and every later request answers `RingFailed`.

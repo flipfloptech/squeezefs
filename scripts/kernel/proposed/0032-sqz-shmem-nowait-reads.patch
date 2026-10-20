@@ -1,0 +1,106 @@
+From: SqueezeFS-Zig <sqz@localhost>
+Date: Tue, 20 Oct 2026 06:00:00 +0000
+Subject: [PATCH] sqz: shmem: honour IOCB_NOWAIT in shmem_file_read_iter and set FMODE_NOWAIT, so an io_uring read of a resident memfd page completes inline instead of punting to io-wq
+
+PROPOSED (scripts/kernel/proposed/, not in the series): compile-checked
+as mm/shmem.o against the 7.2.8 omarchy-sqz tree with 0001-0030 applied;
+NOT booted, NOT measured. The owner builds and boots; the daemon-side
+probe plan is below.
+
+Why (docs/evidence/rung-10-read-view.md). Under zero copy every byte the
+daemon produces in RAM reaches the app's pages by one io_uring
+READ_FIXED(memfd -> zc slot): the bounce window of a served reply, the
+fill-pool slab of a warm serve (SQUEEZEFS_READ_ZC_SERVE), an inline or
+staged file's body. shmem files carry no FMODE_NOWAIT (shmem_file_open
+sets FMODE_CAN_ODIRECT alone) and are not pollable, so
+io_file_supports_nowait() answers false and io_read() returns -EAGAIN at
+issue for EVERY such read: io_uring punts it to an io-wq worker, which
+then performs a plain blocking read of a page that was resident all
+along. Measured on the FUSE boundary ruler (rung-10-fuse-boundary.md):
+the `bounce` arm costs 2.6 cores of io-wq at 2.1 M reads/s beside the
+7.7 cores of the workers — 1.2 us of CPU and one wake-and-switch per
+served 4 KiB, for a 4 KiB copy that is 0.1 us.
+
+What: shmem_file_read_iter() takes a non-blocking path under
+IOCB_NOWAIT — a resident, up-to-date folio is served (unlocked, as the
+SGP_READ path serves it: it unlocks before the copy), a hole its zeros,
+and anything that would wait (a swapped-out entry, a folio not up to date
+or being truncated) is -EAGAIN, which io_uring answers by its ordinary
+punt — and shmem_file_open() declares FMODE_NOWAIT so the ring issues
+reads non-blocking in the first place. Writes are unchanged (no
+FMODE_NOWAIT write path is claimed: shmem_file_write_iter() takes the
+inode lock and may allocate; io_uring keeps punting them, as today).
+
+Probe plan: the boundary ruler's `bounce` arm before and after the boot
+(io-wq cores per read at equal IOPS; `iou-wrk-*` threads absent from
+the daemon's class table), then the warm 4k randread rows (a working
+set inside the hot tier, SQUEEZEFS_READ_ZC_SERVE on), THE KILL MATRIX
+and the zc e2e rows.
+---
+ mm/shmem.c | 43 +++++++++++++++++++++++++++++++++++++------
+ 1 file changed, 37 insertions(+), 6 deletions(-)
+
+--- a/mm/shmem.c
++++ b/mm/shmem.c
+@@ -2917,7 +2917,12 @@
+ 
+ static int shmem_file_open(struct inode *inode, struct file *file)
+ {
+-	file->f_mode |= FMODE_CAN_ODIRECT;
++	/*
++	 * FMODE_NOWAIT: shmem_file_read_iter() honours IOCB_NOWAIT, so an
++	 * io_uring read of a resident page completes inline instead of
++	 * being punted to io-wq for want of the flag.
++	 */
++	file->f_mode |= FMODE_CAN_ODIRECT | FMODE_NOWAIT;
+ 	return generic_file_open(inode, file);
+ }
+ 
+@@ -3307,15 +3312,40 @@
+ 			break;
+ 
+ 		index = iocb->ki_pos >> PAGE_SHIFT;
+-		error = shmem_get_folio(inode, index, 0, &folio, SGP_READ);
+-		if (error) {
+-			if (error == -EINVAL)
+-				error = 0;
+-			break;
++		if (iocb->ki_flags & IOCB_NOWAIT) {
++			/*
++			 * Non-blocking: serve a resident, up-to-date folio
++			 * (unlocked: the copy below needs no lock, as the
++			 * SGP_READ path unlocks before it copies) or a hole's
++			 * zeros; anything that would wait — a swapped-out
++			 * page, a folio under I/O or being truncated — is
++			 * -EAGAIN, and the caller retries from a context that
++			 * may block.
++			 */
++			folio = filemap_get_entry(mapping, index);
++			if (xa_is_value(folio)) {
++				folio = NULL;
++				error = -EAGAIN;
++				break;
++			}
++			if (folio && (!folio_test_uptodate(folio) ||
++				      folio->mapping != mapping)) {
++				folio_put(folio);
++				error = -EAGAIN;
++				break;
++			}
++		} else {
++			error = shmem_get_folio(inode, index, 0, &folio,
++						SGP_READ);
++			if (error) {
++				if (error == -EINVAL)
++					error = 0;
++				break;
++			}
++			if (folio)
++				folio_unlock(folio);
+ 		}
+ 		if (folio) {
+-			folio_unlock(folio);
+-
+ 			page = folio_file_page(folio, index);
+ 			if (PageHWPoison(page)) {
+ 				folio_put(folio);

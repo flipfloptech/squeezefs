@@ -1,6 +1,6 @@
 # Handoff — 2026-10-19: the first local performance wave
 
-**Checkpoint:** `dev` at the commit that adds this note (first on `8c1aa86`, amended on `c533315`); everything pushed. The
+**Checkpoint:** `dev` at the commit that adds this note (first on `8c1aa86`, amended on `c533315` and `c5e95b4`); everything pushed. The
 2026-10-18 note holds the release sequence, the owed lists, the rulings and the venue plan; this one
 adds the day's performance work. Venue: this host (`SQZ_VENUE=local`).
 
@@ -38,12 +38,18 @@ bandwidth bars cleared on the RAM substrate; write IOPS at 59 % of its bar is th
   QD32×1 even with two rings (a half-loaded worker parks per CQE). `SQUEEZEFS_FABRIC_IOPOLICY`
   round-robin (10-18). Pools register with the memory budget (the publish and transform scratch
   pools do now; the zstd codec pool is owed).
-- Two rings per queue were landed as the derived default (the read gain 1.43× / 1.73× clears the
-  §1.4 read bar; the 4k randwrite QD32×4 row −15 % flagged) and **taken back to one ring the same
-  evening** (`c533315`): the train on `039ae68` ran 3 reds in 7 — THE KILL MATRIX twice with a
-  lookup/create parked > 5 s at the metadata backend, lever (a)'s lane-park unit test once — where
-  every one-ring head was 3/3. Two rings are the A/B lever `SQUEEZEFS_FUSE_RINGS_PER_QUEUE=2` until
-  the stall and the write row are fixed (an agent has both); then the derivation flips back.
+- Two rings per queue: landed as the derived default, taken back to one the same evening (`c533315`:
+  the train on `039ae68` ran 3 reds in 7), and **restored that night** (`c5e95b4`, train 3/3) once every
+  red was pinned and fixed: the > 5 s lookups were the shared-hot-dir row's by-design wait on a killed
+  holder (logged on green one-ring gates too); the kill matrix's `umount2 → EBUSY` was the kernel
+  releasing the SIGKILLed daemon's mount references asynchronously (waited out, ≤ 1 s, at the seven
+  post-kill sites); its fsck `[C4] staging-custody orphan` was a ring record a kill left between a
+  promotion's commit and its ring release, which `rm` and the dismount pass never judged (fixed:
+  `rung-10-dismount-corpse.md`, 180 two-ring kill-matrix runs clean); lever (a)'s lane-park test had
+  a race of its own (held). The write row's 0.85× was the thermal throttle: cooled and interleaved,
+  two rings read 0.99× on 4k randwrite QD32×4 (+2.2 cores) and 1.11× / 1.70× / 1.29× on 4k reads.
+  `SQUEEZEFS_FUSE_RINGS_PER_QUEUE=1` is the control arm; the owed spin (`SQUEEZEFS_FUSE_OWED_SPIN`)
+  is neutral here and stays a lever for venues with a dear wake.
 - A wedge or panic found by a perf session is fixed or reverted before anything else lands (the
   fsync route was reverted within the hour and re-landed with its gate row; the overlay panic got
   its model).
@@ -58,18 +64,20 @@ bandwidth bars cleared on the RAM substrate; write IOPS at 59 % of its bar is th
   sideband cells (`rung-10-fsync-route.md`). `MetaSet.fsync` barriers every member (2.1 per fsync).
 - The lay-down's kernel inode-lock serialization on extending O_DIRECT writes; the 4k read's
   remaining 2.9 µs of kernel + three KV lookups; the zstd `CodecPool` unregistered with the budget.
-- Perf method: the 4k rows swing 12–43 % between sessions of one binary (20–35 % with two rings);
-  ≥ 4 legs per side, judged within a matrix; the venue's level drifted ≈ 25 % during one afternoon.
+- Perf method: a THERMAL THROTTLE was active on this host through 2026-10-19 (the owner disabled it
+  that evening; the box still heats): the 4k rows swung 12–43 % between sessions of one binary and the
+  venue's level drifted ≈ 25 % in one afternoon. `scripts/perf/matrix.sh` now waits before every row
+  for k10temp Tctl ≤ 70 °C (`MX_COOL_C`, bounded by `MX_COOL_MAX_S`) and records `tctl_c` per row;
+  one benchmark at a time, never queued behind another; ≥ 4 legs per side, judged within a matrix.
 
 ## Next levers (in order; the profiles are in the evidence notes)
 
 All four of the first list landed in the second wave (lever 5 as kernel patch 0030 + the daemon
 half; the fsync route; fresh-file publish; the read side). What follows:
 
-1. The two-ring daemon: its stall (a request to the metadata backend from a two-ring queue picked up
-   seconds late; the idle second worker's driven lane) and its 4k randwrite QD32×4 regression (0.85×:
-   a bounded spin / multi-CQE reap before the half-loaded worker parks); then the derivation back to
-   2 rings (an agent has both).
+1. 4k write IOPS (≈ 430 k vs the 727 k bar): the write's three KV lookups and journal entry per op;
+   lever 4's all-own default still regresses QD32×1 even with two rings (a half-loaded worker parks per
+   CQE), so the knee stays.
 2. `MetaSet.fsync` barriers every member (2.1 barriers per fsync): barrier the touched volume(s) or
    join the members' barriers.
 3. The lay-down: the kernel's exclusive inode lock on extending O_DIRECT writes (≈ 4 GB/s per

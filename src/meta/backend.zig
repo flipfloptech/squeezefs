@@ -407,6 +407,9 @@ pub const KvBackend = struct {
     /// the election winner, joined through its group at `close`.
     pass_fiber: ?*exec.fiber.Fiber = null,
     pass_group: Io.Group = .init,
+    /// `SQUEEZEFS_META_PASS_VENUE`: the election winner runs the pass (and
+    /// the apply) on its own thread instead of waking the lane's fiber.
+    pass_on_committer: bool = false,
     /// The applier fibers' group (decision 0003 §AW): joined at close,
     /// after the conveyor's quiesce (no window in flight ⇒ every applier
     /// has returned).
@@ -722,6 +725,7 @@ pub const KvBackend = struct {
         be.task.serial = &be.smo_lock;
         be.cache.installCheckpointKick(be.task.hook());
         const cpus: u32 = if (opts.cpus != 0) opts.cpus else derive.Facts.probe().cpus;
+        be.pass_on_committer = std.mem.eql(u8, knobs.enumKnob("SQUEEZEFS_META_PASS_VENUE", opts.env), "committer");
         be.cv = try conveyor.Conveyor.init(gpa, .{
             .io = io,
             .gpa = gpa,
@@ -742,7 +746,7 @@ pub const KvBackend = struct {
             .caps = conveyor.resolveCaps(opts.env, cpus, geo),
             .park_escalation_ns = conveyor.PARK_ESCALATION_NS,
             .door = be.slots.doorSeam(),
-            .window_hold = conveyor.windowHoldFor(flush_ms),
+            .window_hold = conveyor.windowHoldFromEnv(opts.env, flush_ms, geo.grain),
             .caller = .{ .idle = exec.lane.laneIdleBesidesCaller, .polls = exec.lane.lanePolls },
             .applier = be.applierSeam(opts.env, cpus),
         });
@@ -1099,6 +1103,7 @@ pub const KvBackend = struct {
         be.task.serial = &be.smo_lock;
         be.cache.installCheckpointKick(be.task.hook());
         const cpus: u32 = if (opts.cpus != 0) opts.cpus else derive.Facts.probe().cpus;
+        be.pass_on_committer = std.mem.eql(u8, knobs.enumKnob("SQUEEZEFS_META_PASS_VENUE", opts.env), "committer");
         be.cv = try conveyor.Conveyor.init(gpa, .{
             .io = io,
             .gpa = gpa,
@@ -1122,7 +1127,7 @@ pub const KvBackend = struct {
             .grant_fed = true,
             .caller = .{ .idle = exec.lane.laneIdleBesidesCaller, .polls = exec.lane.lanePolls },
             .pre_admission = .{ .ctx = &js.park_gate, .wait = joinedPreAdmission },
-            .window_hold = conveyor.windowHoldFor(flush_ms),
+            .window_hold = conveyor.windowHoldFromEnv(opts.env, flush_ms, be.geo.grain),
             .applier = be.applierSeam(opts.env, cpus),
         });
         errdefer be.cv.deinit();
@@ -1501,6 +1506,11 @@ pub const KvBackend = struct {
     /// committer is never cancelled) on the journal lane; a group member,
     /// so the lane recycles it at exit and `stopPass` joins it.
     fn startPass(be: *KvBackend) OpenError!void {
+        // The committer venue has no pass fiber: the election winner runs
+        // the pass itself. (A fiber here would run `runScheduledPass` on
+        // its tick while a committer holds leadership mid-pass — two
+        // passes over one batch buffer.)
+        if (be.pass_on_committer) return;
         exec.group.addMember(&be.pass_group);
         be.pass_fiber = be.lane.execLane().spawn(.group, .{ .group = passEntry }, std.mem.asBytes(&be), &be.pass_group, .blocked) catch {
             exec.group.removeMember(&be.pass_group);
@@ -1513,6 +1523,7 @@ pub const KvBackend = struct {
     /// first (nothing queued, no leader), so the fiber is parked or about
     /// to park; the stop latch is observed at its next poll.
     fn stopPass(be: *KvBackend) void {
+        if (be.pass_on_committer) return;
         // release pairs with the fiber's acquire loads in `passEntry`.
         be.pass_stop.store(true, .release);
         wakePass(be);
@@ -1561,6 +1572,9 @@ pub const KvBackend = struct {
     /// The applier venue (decision 0003 §AW.3): `applierParallelism(cpus)`
     /// handler lanes unless the knob names a width; 0 is the inline arm.
     fn applierSeam(be: *KvBackend, env: *const std.process.Environ.Map, cpus: u32) conveyor.ApplySeam {
+        // The committer venue applies on the pass's own thread: a window
+        // handed to an applier would put the venue's hop back on the path.
+        if (be.pass_on_committer) return conveyor.inline_applier;
         const n = knobs.optIntKnob("SQUEEZEFS_META_APPLIERS", u32, env) orelse conveyor.applierParallelism(cpus);
         if (n == 0) return conveyor.inline_applier;
         return .{ .ctx = be, .spawn = &spawnApplier, .parallelism = n };
@@ -1590,6 +1604,10 @@ pub const KvBackend = struct {
     /// thread (a committer) — same-lane callers take the ready FIFO.
     fn wakePass(ctx: *anyopaque) void {
         const be: *KvBackend = @ptrCast(@alignCast(ctx));
+        // The committer venue: the winner IS the pass, here and now — the
+        // election serializes passes whatever thread runs them, and the
+        // batch it drains is its own tx plus whatever queued behind it.
+        if (be.pass_on_committer) return be.cv.runScheduledPass();
         const f = be.pass_fiber orelse return;
         if (f.state.wake()) f.lane.enqueue(f);
     }
@@ -3913,6 +3931,101 @@ test "§AW the applier venue (SQUEEZEFS_META_APPLIERS=2): a 4-thread storm with 
         // Every window's apply leg was recorded (the inline arm records it
         // too: the phase is the applier's wherever it ran).
         try testing.expectEqual(cs.lane_handoffs.load(), cs.apply_total.snapshot().count);
+        be.close();
+    }
+    {
+        const be = try v.open();
+        defer be.close();
+        try testing.expect(be.replayStats().clean_unmount);
+        for (acked) |lane_acks| for (lane_acks) |ino| try testing.expect(try present(be, ino));
+    }
+}
+
+test "the applier's resolve starts from the committer's heap-admission leaves: on a quiet volume every record's leaf is the seed (resolve_seeded ≡ records, none descended); under a storm with checkpoints and splits seeded + descended ≡ records applied, every ack present" {
+    const gpa = testing.allocator;
+    const v = try TestVol.create(gpa, "resolve-seeds", "20");
+    defer v.destroy();
+    const be = try v.open();
+    defer be.close();
+    const cs = be.conveyorStats();
+    const seeded0 = cs.resolve_seeded.load();
+    const descended0 = cs.resolve_descended.load();
+    // Quiet: one committer, no SMO between the admission and the apply.
+    const quiet = 24;
+    for (0..quiet) |i| {
+        var nb: [24]u8 = undefined;
+        const n = std.fmt.bufPrint(&nb, "seed-{d}", .{i}) catch unreachable;
+        _ = try commitCreate(be, n);
+    }
+    try testing.expectEqual(seeded0 + recordsOfCreates(quiet), cs.resolve_seeded.load());
+    try testing.expectEqual(descended0, cs.resolve_descended.load());
+    // A storm with checkpoints: leaves split under the queued txs, their
+    // seeds go stale and the apply descends for those — never a record
+    // resolved by neither.
+    const threads = 4;
+    const per_thread = 60;
+    const Storm = struct {
+        fn run(b: *KvBackend, lane_id: usize) void {
+            for (0..per_thread) |i| {
+                var nb: [24]u8 = undefined;
+                const n = std.fmt.bufPrint(&nb, "seeds-{d}-{d}", .{ lane_id, i }) catch unreachable;
+                _ = commitCreate(b, n) catch unreachable;
+                if (i % 20 == 19) b.checkpointNow() catch unreachable;
+            }
+        }
+    };
+    var handles: [threads]std.Thread = undefined;
+    for (&handles, 0..) |*h, i| h.* = try std.Thread.spawn(.{}, Storm.run, .{ be, i });
+    for (handles) |h| h.join();
+    const total = recordsOfCreates(quiet + threads * per_thread);
+    // A revalidation retry re-resolves a member: ≥, exact when none retried.
+    try testing.expect(cs.resolve_seeded.load() - seeded0 + cs.resolve_descended.load() - descended0 >= total);
+    try testing.expect(cs.resolve_seeded.load() - seeded0 >= total / 2);
+}
+
+/// The records `n` `commitCreate`s stage — the inode `Put`, the dentry
+/// `Put`, the parent's Δ (the harness stages no park) — each resolved once.
+fn recordsOfCreates(n: usize) u64 {
+    return @as(u64, n) * 3;
+}
+
+test "the committer venue (SQUEEZEFS_META_PASS_VENUE=committer): a 4-thread storm with concurrent checkpoints — the election winner runs the pass and the apply on its own thread (the pass never ran on the lane), every ack present, drained ≡ acked, no window left, the reopen replays every acked record" {
+    const gpa = testing.allocator;
+    const v = try TestVol.create(gpa, "storm-committer-pass", "20");
+    defer v.destroy();
+    try v.env.put("SQUEEZEFS_META_PASS_VENUE", "committer");
+    const threads = 4;
+    const per_thread = 60;
+    var acked: [threads][per_thread]u64 = undefined;
+    {
+        const be = try v.open();
+        try testing.expect(be.pass_on_committer);
+        try testing.expectEqual(@as(u32, 1), be.cv.deps.applier.parallelism);
+        const Storm = struct {
+            fn run(b: *KvBackend, lane_id: usize, out: *[per_thread]u64) void {
+                for (0..per_thread) |i| {
+                    var nb: [24]u8 = undefined;
+                    const n = std.fmt.bufPrint(&nb, "cpass-{d}-{d}", .{ lane_id, i }) catch unreachable;
+                    out[i] = commitCreate(b, n) catch unreachable;
+                    if (i % 20 == 19) b.checkpointNow() catch unreachable;
+                }
+            }
+        };
+        var handles: [threads]std.Thread = undefined;
+        for (&handles, 0..) |*h, i| h.* = try std.Thread.spawn(.{}, Storm.run, .{ be, i, &acked[i] });
+        for (handles) |h| h.join();
+        for (acked) |lane_acks| for (lane_acks) |ino| try testing.expect(try present(be, ino));
+        const cs = be.conveyorStats();
+        try testing.expectEqual(threads * per_thread + guard.gate.OPEN_COMMITS, cs.acks.load());
+        try testing.expectEqual(@as(u64, 0), cs.refusals.load());
+        try testing.expectEqual(cs.drained_txs.load(), cs.acks.load() + cs.refusals.load());
+        try testing.expectEqual(cs.lane_handoffs.load(), be.laneSnapshot().lane_writes);
+        try testing.expectEqual(@as(u64, 0), cs.windows_inflight.load());
+        try testing.expectEqual(@as(u64, 0), cs.queued.load());
+        try testing.expectEqual(@as(u64, 0), cs.commit_parked.load());
+        try testing.expectEqual(@as(u64, 0), be.cache.heapPromised());
+        // The venue pin: no pass ran on the lane's thread.
+        try testing.expect(be.cv.passThread() != @as(u64, @intCast(be.lane.threadId())));
         be.close();
     }
     {

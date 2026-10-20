@@ -191,6 +191,9 @@ pub const WindowHold = struct {
     /// open, so a row measures the hold's pacing law apart from the gate's
     /// learning (the worth-gate tie rows judge that).
     pin_gate_open: bool = false,
+    /// `SQUEEZEFS_META_WINDOW_HOLD=pacing`: the pad-majority hold off, the
+    /// applier pacing kept.
+    pad_hold: bool = true,
 };
 
 /// The law from the ONE flush-interval knob (`checkpoint.flushIntervalMsFromEnv`):
@@ -198,6 +201,28 @@ pub const WindowHold = struct {
 pub fn windowHoldFor(flush_interval_ms: u64) ?WindowHold {
     if (flush_interval_ms == 0) return null;
     return .{ .ceiling_ns = flush_interval_ms * std.time.ns_per_ms };
+}
+
+/// The grain at and above which the §L pad hold is worth its wait: a
+/// pad-majority window on a 4 KiB-grain device wastes a page of ring per
+/// round trip; on a 512-B grain it wastes bytes (65 → 87 B per create
+/// measured) while the hold costs every member of the held batch a landing
+/// (`docs/evidence/rung-10-create-path.md`, wave 3; decision 0003 §BA).
+pub const PAD_HOLD_GRAIN_MIN: u64 = 4096;
+
+/// The §L pad hold's derivation from the device grain.
+pub fn padHoldFor(grain: u64) bool {
+    return grain >= PAD_HOLD_GRAIN_MIN;
+}
+
+/// `windowHoldFor` under the `SQUEEZEFS_META_WINDOW_HOLD` arm (`derived`
+/// = `padHoldFor(grain)` with the pacing hold).
+pub fn windowHoldFromEnv(env: *const std.process.Environ.Map, flush_interval_ms: u64, grain: u64) ?WindowHold {
+    const arm = knobs.enumKnob("SQUEEZEFS_META_WINDOW_HOLD", env);
+    if (std.mem.eql(u8, arm, "none")) return null;
+    var law = windowHoldFor(flush_interval_ms) orelse return null;
+    law.pad_hold = if (std.mem.eql(u8, arm, "derived")) padHoldFor(grain) else !std.mem.eql(u8, arm, "pacing");
+    return law;
 }
 
 /// The applier venue's width, `clamp(cpus / 8, 2, 4)` (decision 0003
@@ -695,6 +720,12 @@ pub const Stats = struct {
     windows_unshadowed: counters.ShardedCounter = .{},
     windows_pipelined: counters.ShardedCounter = .{},
     hold_bound_ns: counters.Gauge = .{},
+    /// `meta_conveyor_resolve_seeded` / `_descended`: the applier's leaf
+    /// resolutions served by the committer's heap-admission resolve (the
+    /// leaf still mapped and covering the key) against those that
+    /// descended the tree (no seed; the leaf superseded, split or moved).
+    resolve_seeded: counters.ShardedCounter = .{},
+    resolve_descended: counters.ShardedCounter = .{},
     /// The committer's ack spin (decision 0003 §AB.4): acks that landed
     /// inside the spin (no park, no wake), spins that fell through to the
     /// park, parks with no spin: no bound (no wake measured yet, or an ack
@@ -774,6 +805,7 @@ pub const Stats = struct {
             self.hold_bound_ns.load(),
             self.holds_pacing.load(),
         });
+        try w.print(",\"meta_conveyor_resolve_seeded\":{d},\"meta_conveyor_resolve_descended\":{d}", .{ self.resolve_seeded.load(), self.resolve_descended.load() });
         try w.print(",\"meta_commit_ack_spin_hits\":{d},\"meta_commit_ack_spin_falls\":{d},\"meta_commit_ack_spin_skips\":{d},\"meta_commit_ack_spin_busy\":{d},\"meta_commit_ack_spin_bound_ns\":{d},\"meta_commit_ack_spin_wake_ns\":{d},\"meta_commit_ack_spin_ack_ns\":{d}}}", .{
             self.ack_spin_hits.load(),
             self.ack_spin_falls.load(),
@@ -929,6 +961,16 @@ pub const Queued = struct {
     q: QueuedTx,
     done: *Done,
     enqueued_ns: u64,
+    /// Per record, the leaf the committer's heap admission resolved it to
+    /// (a retained reference; in `q`'s arena): the applier's resolve starts
+    /// here and descends only for a leaf superseded, split or moved since.
+    seeds: []*CachedNode = &.{},
+
+    /// The terminal outcome's teardown: the seeds' references, then the tx.
+    fn deinit(self: *Queued) void {
+        for (self.seeds) |n| n.release();
+        self.q.deinit();
+    }
 };
 
 const Core = conveyor_core.ConveyorCore(Queued);
@@ -1349,7 +1391,7 @@ pub const Conveyor = struct {
         var entry = try self.build(t, &done);
         const len = entry.q.len;
         self.enqueueOne(&entry, len) catch |e| {
-            entry.q.deinit();
+            entry.deinit();
             return e;
         };
         self.leadIfElected();
@@ -1414,7 +1456,7 @@ pub const Conveyor = struct {
         if (n == 0) return;
         _ = self.core.enqueueMany(scratch.entries[0..n]) catch {
             for (scratch.entries[0..n], scratch.tx_of[0..n]) |*e, i| {
-                e.item.q.deinit();
+                e.item.deinit();
                 results[i] = error.ConveyorFull;
             }
             return;
@@ -1452,11 +1494,11 @@ pub const Conveyor = struct {
         // so a refusal reserves nothing and the space retry's checkpoint
         // cycles never run behind an open reservation (a cycle's barrier
         // waits on the completed prefix, which would wait on this tx).
-        self.admitHeapPreQueue(&q) catch |e| {
+        const seeds = self.admitHeapPreQueue(&q) catch |e| {
             q.deinit();
             return e;
         };
-        return .{ .q = q, .done = done, .enqueued_ns = clock.monotonicNs() };
+        return .{ .q = q, .done = done, .enqueued_ns = clock.monotonicNs(), .seeds = seeds };
     }
 
     /// The heap admission of ONE tx on the committer's thread, under its
@@ -1464,8 +1506,9 @@ pub const Conveyor = struct {
     /// `heap_law.admitHeapLocked`, one promise per leaf, the space retry
     /// behind ≤ 2 return-room cycles, the final refusal typed). A stale
     /// leaf is re-resolved; the budget's exhaustion is the SMO protocol's
-    /// bug as it was.
-    fn admitHeapPreQueue(self: *Conveyor, q: *const QueuedTx) Error!void {
+    /// bug as it was. Answers the admitted tx's leaves per record — the
+    /// references kept, in `q`'s arena — as the applier's seeds.
+    fn admitHeapPreQueue(self: *Conveyor, q: *QueuedTx) Error![]*CachedNode {
         var arena_state = std.heap.ArenaAllocator.init(self.deps.gpa);
         defer arena_state.deinit();
         const arena = arena_state.allocator();
@@ -1476,7 +1519,7 @@ pub const Conveyor = struct {
         defer if (hold_active) self.deps.checkpoint.space_retry.end();
         var attempt: u32 = 0;
         while (attempt < COMMIT_RETRY_BUDGET) {
-            var r = try self.resolve(arena, &one);
+            var r = try self.resolve(arena, &one, .admission);
             const dirties = arena.alloc(*NodeDirty, r.lock_set.len) catch {
                 r.releaseRefs();
                 return error.OutOfMemory;
@@ -1497,12 +1540,19 @@ pub const Conveyor = struct {
                 return e;
             };
             self.unlockAll(r.lock_set);
-            r.releaseRefs();
             if (hold_active) {
                 self.deps.checkpoint.space_retry.end();
                 hold_active = false;
             }
-            if (refused.items.len == 0) return;
+            if (refused.items.len == 0) {
+                // Admitted: the resolved leaves are the applier's seeds (the
+                // references move; a copy that fails leaves none).
+                return q.arena.allocator().dupe(*CachedNode, r.leaves[0]) catch {
+                    r.releaseRefs();
+                    return &.{};
+                };
+            }
+            r.releaseRefs();
             const now = clock.monotonicNs();
             if (space_retry_started == 0) space_retry_started = now;
             const decision = heap_law.decideSpaceRetry(.{
@@ -1702,6 +1752,7 @@ pub const Conveyor = struct {
         }
         // The pad hold (§L) rides a window ON THE DEVICE: one in apply is
         // the appliers' to overlap with, not the device's busy time.
+        if (!law.pad_hold) return unheld;
         if (self.windowsInflight() <= self.in_apply.load(.acquire)) return unheld;
         if (self.isClosing()) return unheld;
         var sum: u64 = 0;
@@ -1785,7 +1836,7 @@ pub const Conveyor = struct {
         if (outcome) |_| self.stats.acks.inc() else |_| self.stats.refusals.inc();
         self.ack_spin.ack.sample(clock.monotonicNs() -| m.enqueued_ns);
         m.done.send(self.deps.io, outcome) catch {};
-        m.q.deinit();
+        m.deinit();
     }
 
     const Resolved = struct {
@@ -1806,7 +1857,10 @@ pub const Conveyor = struct {
     }
 
     /// A3: every record's leaf, latch-free; the union sorted and deduped.
-    fn resolve(self: *Conveyor, arena: Allocator, members: []const Queued) Error!Resolved {
+    /// `phase`: the applier's resolve counts its seeded and descended
+    /// records; the committer's admission resolve (no seeds yet) is not a
+    /// measure of the seed.
+    fn resolve(self: *Conveyor, arena: Allocator, members: []const Queued, comptime phase: enum { admission, apply }) Error!Resolved {
         var leaves = try arena.alloc([]*CachedNode, members.len);
         var leaf_of = try arena.alloc([]usize, members.len);
         var total: usize = 0;
@@ -1818,8 +1872,18 @@ pub const Conveyor = struct {
             leaves[qi] = try arena.alloc(*CachedNode, m.q.recs.len);
             leaf_of[qi] = try arena.alloc(usize, m.q.recs.len);
             for (m.q.recs, 0..) |r, ri| {
-                const t = self.treeFor(r.tree_id, r.key) orelse return error.Corrupt;
-                const leaf = t.resolveLeaf(r.key) catch |e| return mapTreeError(e);
+                const leaf = blk: {
+                    if (ri < m.seeds.len) {
+                        const seed = m.seeds[ri];
+                        if (!seed.state.isSuperseded() and !key.lessThan(r.key, seed.min_key) and !key.lessThan(seed.max_key, r.key)) {
+                            if (phase == .apply) self.stats.resolve_seeded.inc();
+                            break :blk seed.retain();
+                        }
+                    }
+                    if (phase == .apply) self.stats.resolve_descended.inc();
+                    const t = self.treeFor(r.tree_id, r.key) orelse return error.Corrupt;
+                    break :blk t.resolveLeaf(r.key) catch |e| return mapTreeError(e);
+                };
                 leaves[qi][ri] = leaf;
                 all[n] = leaf;
                 n += 1;
@@ -2171,7 +2235,7 @@ pub const Conveyor = struct {
                 return;
             }
             // A3.
-            var r = self.resolve(arena, members) catch |e| {
+            var r = self.resolve(arena, members, .apply) catch |e| {
                 self.abandonWindow(window, e);
                 return;
             };
@@ -3013,6 +3077,24 @@ test "batch caps tie: txs max(64, cpus × 2), bytes max(256 KiB, ring/16) clampe
     try testing.expectEqual(@as(usize, 64), queueCapacity(10));
     try testing.expectEqual(@as(usize, 2048), queueCapacity(2048));
     try testing.expectEqual(@as(usize, 8192), queueCapacity(1 << 20));
+}
+
+test "pad hold tie: the §L pad hold holds from a 4 KiB grain on (a pad-majority window wastes a page), not on a 512-B one; the knob's arms override it" {
+    try testing.expect(!padHoldFor(512));
+    try testing.expect(!padHoldFor(1));
+    try testing.expect(padHoldFor(4096));
+    try testing.expect(padHoldFor(16384));
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+    try testing.expect(!windowHoldFromEnv(&env, 50, 512).?.pad_hold);
+    try testing.expect(windowHoldFromEnv(&env, 50, 4096).?.pad_hold);
+    try testing.expectEqual(@as(?WindowHold, null), windowHoldFromEnv(&env, 0, 512));
+    try env.put("SQUEEZEFS_META_WINDOW_HOLD", "both");
+    try testing.expect(windowHoldFromEnv(&env, 50, 512).?.pad_hold);
+    try env.put("SQUEEZEFS_META_WINDOW_HOLD", "pacing");
+    try testing.expect(!windowHoldFromEnv(&env, 50, 4096).?.pad_hold);
+    try env.put("SQUEEZEFS_META_WINDOW_HOLD", "none");
+    try testing.expectEqual(@as(?WindowHold, null), windowHoldFromEnv(&env, 50, 4096));
 }
 
 test "applier venue width tie: clamp(cpus / 8, 2, 4) — 2 up to 23 cores, 3 at 24, 4 from 32 on" {

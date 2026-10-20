@@ -637,11 +637,41 @@ test "a reader whose kernel may still cache an answer served under a directory's
     try testing.expectEqual(drops0 + 1, cache.stats.dlm_token_kernel_pinned_drops.load());
     try testing.expectEqual(releases0, table.stats.dlm_token_releases.load());
     try testing.expect(plane.cache.describe(io, objectOf(2)) == null);
-    // A creates "five": the recall reaches B, the name its kernel.
+    // A creates "five": the recall reaches B, the name its kernel. The
+    // holder pins the recalled grant too (the mount sets both pins from
+    // the one TTL posture).
+    const pins0 = table.stats.dlm_token_recall_pins.load();
+    f.holder.setKernelPin(io, 60 * std.time.ns_per_s);
     const notes = [_]tx.NameNote{.{ .parent = objectOf(2), .name = "five" }};
     try hook.recall(hook.ctx, &.{objectOf(2)}, .{ .notes = &notes });
     try testing.expect(f.sinks[0].sawName(objectOf(2), "five"));
     hook.settle(hook.ctx, &.{objectOf(2)});
+    try testing.expectEqual(pins0 + 1, table.stats.dlm_token_recall_pins.load());
+    // B's kernel still serves every OTHER name it was told under the
+    // token (the directory's dentries outlive a PRUNE of the directory):
+    // the holder keeps the recalled grant for the pin, so A's NEXT changes
+    // — a stamp with no name, then an unlink — reach B's kernel too. (The
+    // coherence smoke's `d/x` read stale once: the parked parent stamp's
+    // drain recalled B between two of its lookups, and the unlink that
+    // followed found no reader.)
+    try hook.recall(hook.ctx, &.{objectOf(2)}, .{});
+    hook.settle(hook.ctx, &.{objectOf(2)});
+    try testing.expectEqual(pins0 + 2, table.stats.dlm_token_recall_pins.load());
+    const gone = [_]tx.NameNote{.{ .parent = objectOf(2), .name = "four" }};
+    try hook.recall(hook.ctx, &.{objectOf(2)}, .{ .notes = &gone });
+    try testing.expect(f.sinks[0].sawName(objectOf(2), "four"));
+    hook.settle(hook.ctx, &.{objectOf(2)});
+    // Past the pin the grant leaves at the next pass: nobody recalled.
+    f.holder.setKernelPin(io, 1);
+    try hook.recall(hook.ctx, &.{objectOf(2)}, .{});
+    hook.settle(hook.ctx, &.{objectOf(2)});
+    const expired0 = table.stats.dlm_token_recall_pins_expired.load();
+    const after_pin = [_]tx.NameNote{.{ .parent = objectOf(2), .name = "seven" }};
+    try hook.recall(hook.ctx, &.{objectOf(2)}, .{ .notes = &after_pin });
+    try testing.expect(!f.sinks[0].sawName(objectOf(2), "seven"));
+    try testing.expectEqual(expired0 + 1, table.stats.dlm_token_recall_pins_expired.load());
+    hook.settle(hook.ctx, &.{objectOf(2)});
+    f.holder.setKernelPin(io, 0);
     // A kernel that caches nothing: the next eviction RELEASES the token
     // (the holder's table stays the reader's live interest set) and the
     // holder's next change recalls nobody.

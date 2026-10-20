@@ -553,8 +553,12 @@ fn mountMain(ctx: *Ctx) u8 {
         // The read divert: a foreign slot's records come under a token or
         // answer the typed EAGAIN, never off this mount's cache; a token
         // whose records served the kernel stays this mount's at its holder
-        // for the kernel's longest peered TTL (decision 0003 §AG.2).
+        // for the kernel's longest peered TTL (decision 0003 §AG.2) — and,
+        // as the holder, this mount keeps a recalled reader registered as
+        // long, so its next change reaches a kernel that still serves what
+        // the token told it.
         wp.divert.setKernelPin(io, coherence.law.peered_ttls.longestNs());
+        wp.holder.setKernelPin(io, coherence.law.peered_ttls.longestNs());
         fs.bindDivert(&wp.divert);
         // The cross-owner plane's step sessions: a foreign holder's steps
         // ship over the wire plane's dialled links.

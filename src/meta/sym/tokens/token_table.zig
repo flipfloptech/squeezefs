@@ -134,6 +134,12 @@ pub const stats = struct {
     pub var dlm_token_grant_park_refusals: counters.ShardedCounter = .{};
     /// Live grants across every object (the table's population).
     pub var dlm_token_outstanding: counters.Gauge = .{};
+    /// Grants a recall's ack KEPT registered for the kernel pin (decision
+    /// 0003 §AG.2 at the holder): the reader's kernel may still serve
+    /// what it was told under the token, so the next change recalls it.
+    pub var dlm_token_recall_pins: counters.ShardedCounter = .{};
+    /// Pinned grants that left the table at their pin's end unclaimed.
+    pub var dlm_token_recall_pins_expired: counters.ShardedCounter = .{};
     /// Readers recalled per object per batch: buckets 1–8 exact, ≤16, ≤32,
     /// ≤64, >64 (the conveyor's group-size law; p99 = R in the broadcast
     /// shape).
@@ -421,7 +427,17 @@ pub fn coreError(e: Error) errors.Error {
 const Grant = struct {
     client: ClientId,
     under_recall: bool = false,
+    /// A recalled grant stays registered until this instant (decision
+    /// 0003 §AG.2's pin, at the holder): the reader's kernel may serve
+    /// what it was told under the token for the kernel's longest TTL, and
+    /// only a registered reader hears the next change's names. 0 = live.
+    recalled_until_ns: u64 = 0,
 };
+
+/// A pinned-recalled grant's expiry, FIFO (pins are one length, so acks
+/// enqueue in time order); a grant re-registered or re-recalled since
+/// leaves a stale entry the sweep skips (its `until` no longer matches).
+const Recalled = struct { object: Object, client: ClientId, until_ns: u64 };
 
 const Holders = struct {
     list: std.ArrayListUnmanaged(Grant) = .empty,
@@ -523,6 +539,12 @@ pub const Holder = struct {
     hold_wake: sync.Notify = .init,
     /// Published while a hold is standing (the test's deterministic window).
     holding: std.atomic.Value(u32) = .init(0),
+    /// How long a recalled grant stays registered (`setKernelPin`: the
+    /// mount's longest peered kernel TTL, decision 0003 §AG.2); 0 = a
+    /// recall's ack unregisters at once (a holder whose readers cache
+    /// nothing — the portable contracts' default).
+    kernel_pin_ns: u64 = 0,
+    recalled: std.ArrayListUnmanaged(Recalled) = .empty,
 
     pub fn init(gpa: Allocator, io: Io, identity: ClientId, oracle: LeaseOracle, cap_objects: u32, cap_clients: u32) Allocator.Error!Holder {
         var self: Holder = .{ .gpa = gpa, .io = io, .identity = identity, .oracle = oracle, .gate = GrantPassGate.init(gpa), .cap_objects = cap_objects, .cap_clients = cap_clients };
@@ -539,7 +561,20 @@ pub const Holder = struct {
         var ct = self.clients.valueIterator();
         while (ct.next()) |c| if (c.frame) |*f| f.objects.deinit(self.gpa);
         self.clients.deinit(self.gpa);
+        self.recalled.deinit(self.gpa);
         self.gate.deinit();
+    }
+
+    /// The kernel pin (decision 0003 §AG.2): a reader whose kernel was
+    /// answered under a token keeps hearing this holder's changes for
+    /// `ns` past a recall, so a change to a name the reader's kernel still
+    /// holds reaches it by name — the token's coherence lasts as long as
+    /// its answers may. The set's mounts share one TTL posture, so the
+    /// holder's own longest peered class is every reader's.
+    pub fn setKernelPin(self: *Holder, io: Io, ns: u64) void {
+        self.lock.lockUncancelable(io);
+        defer self.lock.unlock(io);
+        self.kernel_pin_ns = ns;
     }
 
     pub fn recallDeadlineNs(self: *const Holder) u64 {
@@ -562,7 +597,11 @@ pub const Holder = struct {
             self.objects.putAssumeCapacity(object, .{});
             break :blk self.objects.getPtr(object).?;
         };
-        if (h.find(client) != null) return true;
+        if (h.find(client)) |i| {
+            // A fresh ask on a pinned-recalled grant: live again.
+            h.list.items[i].recalled_until_ns = 0;
+            return true;
+        }
         try h.list.append(self.gpa, .{ .client = client });
         c.grants += 1;
         stats.dlm_token_outstanding.add(1);
@@ -591,14 +630,73 @@ pub const Holder = struct {
     }
 
     /// Retire a client's frame: every object it names leaves the table.
-    fn retireFrameLocked(self: *Holder, client: ClientId) u32 {
+    /// The frame's grants retire: unregistered, or — an ACK at a holder
+    /// with a kernel pin (`pin_from_ns` = the ack's instant) — kept
+    /// registered until the pin's end, so the next change recalls the
+    /// reader again while its kernel may still serve the token's answers.
+    /// An expiry or a sweep (`pin_from_ns` null) unregisters: a reader
+    /// that stopped acking is owed nothing.
+    fn retireFrameLocked(self: *Holder, client: ClientId, pin_from_ns: ?u64) u32 {
         const c = self.clients.getPtr(client) orelse return 0;
         var f = c.frame orelse return 0;
         c.frame = null;
         var n: u32 = 0;
-        for (f.objects.items) |o| n += @intFromBool(self.unregisterLocked(o, client));
+        for (f.objects.items) |o| {
+            if (pin_from_ns != null and self.kernel_pin_ns != 0) {
+                if (self.pinRecalledLocked(o, client, pin_from_ns.? +| self.kernel_pin_ns)) {
+                    n += 1;
+                    continue;
+                }
+            }
+            n += @intFromBool(self.unregisterLocked(o, client));
+        }
         f.objects.deinit(self.gpa);
         return n;
+    }
+
+    /// Keep `(object, client)` registered until `until_ns`; false when it
+    /// is not held (or the expiry list has no room: the grant leaves now).
+    fn pinRecalledLocked(self: *Holder, object: Object, client: ClientId, until_ns: u64) bool {
+        const h = self.objects.getPtr(object) orelse return false;
+        const i = h.find(client) orelse return false;
+        self.recalled.append(self.gpa, .{ .object = object, .client = client, .until_ns = until_ns }) catch return false;
+        h.list.items[i].under_recall = false;
+        h.list.items[i].recalled_until_ns = until_ns;
+        stats.dlm_token_recall_pins.inc();
+        return true;
+    }
+
+    /// An object about to be recalled: its pinned grants past their pin
+    /// leave now rather than hear one more recall (exact whatever the
+    /// FIFO's order; the sweep below is the bulk reclaimer).
+    fn dropExpiredPinsLocked(self: *Holder, object: Object, now_ns: u64) void {
+        var i: usize = 0;
+        while (true) {
+            const h = self.objects.getPtr(object) orelse return;
+            if (i >= h.list.items.len) return;
+            const g = h.list.items[i];
+            if (g.recalled_until_ns != 0 and g.recalled_until_ns <= now_ns) {
+                _ = self.unregisterLocked(object, g.client);
+                stats.dlm_token_recall_pins_expired.inc();
+                continue;
+            }
+            i += 1;
+        }
+    }
+
+    /// Pinned-recalled grants past their pin leave the table: the FIFO's
+    /// front while expired (one pin length ⇒ time order); a stale entry
+    /// (re-registered, re-recalled or dropped since) is skipped.
+    fn sweepPinsLocked(self: *Holder, now_ns: u64) void {
+        var drop: usize = 0;
+        while (drop < self.recalled.items.len and self.recalled.items[drop].until_ns <= now_ns) : (drop += 1) {
+            const r = self.recalled.items[drop];
+            const h = self.objects.getPtr(r.object) orelse continue;
+            const i = h.find(r.client) orelse continue;
+            if (h.list.items[i].recalled_until_ns != r.until_ns) continue;
+            if (self.unregisterLocked(r.object, r.client)) stats.dlm_token_recall_pins_expired.inc();
+        }
+        if (drop != 0) self.recalled.replaceRange(self.gpa, 0, drop, &.{}) catch unreachable;
     }
 
     /// A client the owner says EXPIRED loses every grant NOW; its pending
@@ -606,7 +704,7 @@ pub const Holder = struct {
     fn sweepClientLocked(self: *Holder, client: ClientId, summary: ?*RecallSummary) void {
         const c = self.clients.getPtr(client) orelse return;
         if (c.frame != null) {
-            const n = self.retireFrameLocked(client);
+            const n = self.retireFrameLocked(client, null);
             stats.dlm_token_recall_expired_with_lease.add(n);
             if (summary) |s| s.expired_with_lease += n;
         }
@@ -623,6 +721,7 @@ pub const Holder = struct {
     }
 
     fn sweepExpiredLocked(self: *Holder, now_ns: u64, summary: ?*RecallSummary) void {
+        self.sweepPinsLocked(now_ns);
         var expired: std.ArrayListUnmanaged(ClientId) = .empty;
         defer expired.deinit(self.gpa);
         var it = self.clients.iterator();
@@ -644,7 +743,7 @@ pub const Holder = struct {
         }
         for (overdue.items) |c| {
             const verdict = self.oracle.verdict(self.oracle.ctx, c, self.clients.get(c).?.contact_ns, now_ns);
-            const n = self.retireFrameLocked(c);
+            const n = self.retireFrameLocked(c, null);
             if (verdict == .live) {
                 stats.dlm_token_recall_timeouts_live.fire("a recall stood unacked past the lease TTL by a member the owner lists LIVE; the token is retired and the commit proceeds");
                 summary.timeouts_live += n;
@@ -696,6 +795,7 @@ pub const Holder = struct {
             self.last_send_ns = t0;
             self.last_ack_ns = t0;
             for (objects) |o| {
+                self.dropExpiredPinsLocked(o, t0);
                 const h = self.objects.getPtr(o) orelse continue;
                 var fanout: usize = 0;
                 for (h.list.items) |*g| {
@@ -806,9 +906,9 @@ pub const Holder = struct {
                 log.debug("tokens: stale recall ack frame {d} from client {x} matched nothing", .{ frame_id, client });
                 return 0;
             }
-            n = self.retireFrameLocked(client);
-            stats.dlm_token_recall_acks.add(n);
             self.last_ack_ns = clock.monotonicNs();
+            n = self.retireFrameLocked(client, self.last_ack_ns);
+            stats.dlm_token_recall_acks.add(n);
         }
         self.ack_wake.notifyWaiters(io);
         return n;

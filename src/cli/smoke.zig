@@ -178,6 +178,12 @@ const Rig = struct {
         // harness's environment (`SQUEEZEFS_FUSE_RINGS_PER_QUEUE=2 zig build
         // smoke …` gates the two-ring arm; the daemon's env is otherwise ours).
         if (knobs.present(proc_env.get(rings_knob))) |v| try self.env.put(rings_knob, v);
+        // The applier venue's A/B lever and the flush cadence reach the
+        // daemons the same way (`SQUEEZEFS_META_APPLIERS=0 zig build smoke …`
+        // gates the inline arm; a short cadence pins a drain inside a row).
+        for ([_][]const u8{ "SQUEEZEFS_META_APPLIERS", "SQUEEZEFS_META_FLUSH_INTERVAL_MS" }) |k| {
+            if (knobs.present(proc_env.get(k))) |v| try self.env.put(k, v);
+        }
         _ = linux.mkdir(self.work.ptr, 0o755);
         // The data dir's per-run folder (equals `work` unless the seam moved it).
         const data_work = try std.fmt.allocPrintSentinel(gpa, "{s}/smoke-{d}", .{ data_dir, pid }, 0);
@@ -2187,12 +2193,20 @@ test "smoke: INVALIDATION COHERENCE ACROSS DAEMONS (decision 0003 §AB.2, §AG.2
         defer gpa.free(after);
         try testing.expectEqualStrings("yes\n", after);
     }
-    // An unlink: B's kernel held the positive.
+    // An unlink: B's kernel held the positive. Between B's last walk of
+    // `d` and the unlink, A changes `d` itself — a recall of `d` that
+    // names no dentry, the shape the drain of the parent stamp parked by
+    // the create of `y` takes on its 50 ms cadence (decision 0003 §AV).
+    // It retired B's grant at the holder until the §AG.2 pin was the
+    // holder's too: B's kernel kept `d/x` for 60 s (its next walk of `d`
+    // would have re-registered B, but the unlink came first) and the
+    // unlink found no reader to tell — the full gate's race, that cadence
+    // against the row's shells.
     {
         const before = try b.onMount("test -e d/x && echo yes || echo no");
         defer gpa.free(before);
         try testing.expectEqualStrings("yes\n", before);
-        const gone = try rig.onMount("rm d/x && echo ok");
+        const gone = try rig.onMount("chmod 755 d && rm d/x && echo ok");
         gpa.free(gone);
         try awaitNotifierDrained(b);
         const after = try b.onMount("test -e d/x && echo yes || echo no");

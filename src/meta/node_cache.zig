@@ -3126,6 +3126,105 @@ test "probation on a FOREST leaf (header tree id 0): a leaf bounded by kind-7 ke
     try testing.expectEqual(reads0 + 2, stats.meta_kv_block_map_leaf_reads.load());
 }
 
+test "property: nextLive/prevLive over a leaf whose records sit in the base (frozen), in several overlay chunks and in both — puts, tombstones over base puts, re-puts after tombstones, orphan deltas — walk exactly the live set a flat mirror folds, in both directions" {
+    const gpa = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0xd1_7ec7);
+    const rnd = prng.random();
+    var case: usize = 0;
+    while (case < 24) : (case += 1) {
+        var vol = try Vol.init(2, 8);
+        defer vol.deinit();
+        vol.arm();
+        try vol.writeEmptyLeaf(0, 1, 0);
+        const leaf = (try vol.cache.load(Vol.addrOf(0))).?;
+        defer leaf.release();
+        // The mirror: every record ever applied, in seq order.
+        var mirror: std.ArrayListUnmanaged(Record) = .empty;
+        defer {
+            rec.deinitRecords(gpa, mirror.items);
+            mirror.deinit(gpa);
+        }
+        const KEYS = 160;
+        // Three phases: puts (then a freeze: the base), then a mix (the
+        // overlay, several chunks), with a freeze in the middle of some cases.
+        for (0..KEYS) |i| {
+            if (rnd.boolean()) {
+                const k = key.inodeKey(i);
+                const v = iv(i).encode();
+                const seq = try vol.apply(leaf, &k, .put, &v);
+                try mirror.append(gpa, try Record.put(gpa, &k, seq, &v));
+            }
+        }
+        try vol.freezeAndAppend(leaf);
+        const ops = 64 + rnd.uintLessThan(usize, 160);
+        for (0..ops) |n| {
+            const k = key.inodeKey(rnd.uintLessThan(u64, KEYS));
+            switch (rnd.uintLessThan(u8, 4)) {
+                0, 1 => {
+                    const v = iv(rnd.int(u64)).encode();
+                    const seq = try vol.apply(leaf, &k, .put, &v);
+                    try mirror.append(gpa, try Record.put(gpa, &k, seq, &v));
+                },
+                2 => {
+                    const seq = try vol.apply(leaf, &k, .delete, "");
+                    try mirror.append(gpa, try Record.delete(gpa, &k, seq));
+                },
+                else => {
+                    const d = InodeDelta.ctime(rnd.int(u64));
+                    const seq = try vol.apply(leaf, &k, .delta, d.encode().slice());
+                    try mirror.append(gpa, try Record.delta(gpa, &k, seq, d));
+                },
+            }
+            if (n == ops / 2 and rnd.boolean()) try vol.freezeAndAppend(leaf);
+        }
+        // The expected live set: fold every key's records newest-first.
+        var expect_keys: std.ArrayListUnmanaged([key.INODE_KEY_LEN]u8) = .empty;
+        defer expect_keys.deinit(gpa);
+        for (0..KEYS) |i| {
+            const k = key.inodeKey(i);
+            var newest_first: std.ArrayListUnmanaged(RecordRef) = .empty;
+            defer newest_first.deinit(gpa);
+            var j = mirror.items.len;
+            while (j > 0) {
+                j -= 1;
+                if (std.mem.eql(u8, mirror.items[j].key, &k)) try newest_first.append(gpa, mirror.items[j].ref());
+            }
+            var f = try rec.foldNewestFirst(gpa, newest_first.items);
+            defer f.deinit(gpa);
+            if (f.liveValue() != null) try expect_keys.append(gpa, k);
+        }
+        const s = leaf.snapshotLoad();
+        defer s.release();
+        // Forward.
+        var from: [key.INODE_KEY_LEN]u8 = key.inodeKey(0);
+        var got: usize = 0;
+        while (try s.value.nextLive(gpa, &from, null)) |entry| {
+            var e = entry;
+            defer e.deinit();
+            try testing.expect(got < expect_keys.items.len);
+            try testing.expectEqualSlices(u8, &expect_keys.items[got], e.key);
+            got += 1;
+            // Strictly after this key.
+            @memcpy(&from, e.key);
+            from[from.len - 1] +%= 1;
+            if (from[from.len - 1] == 0) break;
+        }
+        try testing.expectEqual(expect_keys.items.len, got);
+        // Backward.
+        var before: [key.INODE_KEY_LEN]u8 = key.inodeKey(KEYS);
+        var left = expect_keys.items.len;
+        while (try s.value.prevLive(gpa, &before)) |entry| {
+            var e = entry;
+            defer e.deinit();
+            try testing.expect(left > 0);
+            left -= 1;
+            try testing.expectEqualSlices(u8, &expect_keys.items[left], e.key);
+            @memcpy(&before, e.key);
+        }
+        try testing.expectEqual(@as(usize, 0), left);
+    }
+}
+
 test "reads proceed while a writer holds the node lock: the snapshot path takes no lock" {
     var vol = try Vol.init(2, 8);
     defer vol.deinit();

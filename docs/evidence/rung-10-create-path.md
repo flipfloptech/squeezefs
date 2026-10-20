@@ -118,11 +118,107 @@ loop's latency.
 4. **Directories**: a mkdir's parent nlink shift stays an exclusive Put per op on the shared leaf
    (fsck's census forbids parking it); 1 is what moves that row.
 
+## Wave 2 (2026-10-20; A = dev `0e3249b`, B = `perf/create-path-2`; scratch `~/tmp/createpath2/`)
+
+**Lever 1, the overlay's shape (`e0fd515`).** `NodeDirty.overlay` is a persistent chunked run
+(`node_snapshot.Run`): a spine of refcounted chunks of ≤ 32 records, immutable once published,
+shared by reference between the dirty half and every snapshot; an apply derives the next run
+(`RunEdit`) by copying the one chunk its record lands in and the spine, a publish is one reference.
+The first cut kept `OwnedRec`s inside the chunks and measured the SAME lane CPU as dev: with §AV the
+overlays at apply are small, so the O(n) re-merge of a small n was already cheap, and a 32-record
+chunk copy cost what it cost — three refcount atomics on three scattered `SharedBuf`s per record
+cloned, three more per record released (`applyLockedClass` self 3 → 18 %, `OwnedRec.deinit` 7 → 10 %
+of the lane; file removal 0.96×, directory removal 0.92×). The shape that pays is the chunk owning
+its records' BYTES in one arena (`ChunkRec`: 48 bytes of offsets, the head a range — a bset image in
+RAM): a copy is two memcpys, a chunk's death two frees, zero reference traffic. Red test: 256
+single-record applies on a leaf past 4,096 open records allocate within `Run.applyBytesBound(n,
+rec_bytes)` and no block reaches `smp_allocator`'s 32 KiB page-mapping class (dev: 86 KiB per apply at
+4 K). Measured alone (`-np 32 -u`, B/A, two legs each, interleaved): file creation 73.0–75.1 k
+against 63.6–70.9 k, removal 63.8–67.5 k against 61.3–63.6 k, directory creation 51.3–55.5 k against
+40.3–45.9 k, directory removal 38.9–41.0 k against 34.3–39.5 k; the lane's CPU per create 12.5 →
+11.5 µs, `leaf_lock_hold` −14 % (files) / −22 % (directories); the head's decoded inode value is no
+longer carried (one 64-byte decode per inode-delta apply).
+
+**Lever 2, the applier venue re-judged (`9078cf1`).** With the arena run the inline arm's lock
+handoffs no longer pay for an O(overlay) apply. `SQUEEZEFS_META_APPLIERS` at 0 / 2 / 4 on B
+(`-np 32`, legs interleaved, k/s):
+
+| row | 0 (inline) | 2 | 4 |
+|---|---|---|---|
+| `-u` file creation | 72.6–83.6 (3) | 75.5–78.8 | 76.1–81.2 |
+| `-u` file removal | 64.8–66.4 | 76.2–79.8 | 83.1–90.5 |
+| `-u` directory creation | 52.1–61.1 | 59.2–64.6 | 58.4–58.6 |
+| `-u` directory removal | 38.8–45.0 | 51.8–56.3 | 49.4–51.6 |
+| shared directory, file creation | 16.3–18.8 | 15.9–16.1 | 17.4–18.3 |
+| shared directory, directory creation | 10.3–11.1 | 10.7 | 10.7–12.3 |
+
+No row at 4 leaves its inline spread; 2 dips under it on the shared creates. The derived width
+`clamp(cpus / 8, 2, 4)` (= 4 here; `conveyor.applierParallelism`, decision 0003 §AW.3) SHIPS; 0
+stays the control arm. With it the create's `meta_tx_queue_wait` 55 → 26 µs and `meta_window_total`
+94 → 26 µs; the lane's CPU 3.8 → 2.2 s per 320 k creates, the four `sqz-fuse-ln` lanes 3.1 s.
+
+**Lever 3, the handler (`0c6147c`).** The thin-LTO profile of the 32 workers (the dist profile folds
+identical functions, so its symbols lie): `createChild` is 44 % of their CPU — `Conveyor.build` 12.6 %
+(the committer's §AW.2 heap admission: a resolve, the leaves' write locks and `projectedLogEnd` per
+tx — ≈ 12 µs), the dentry chain scan 11.6 % (`findChild` → `rangeCounted`/`nextLive`, once in the
+LOOKUP and once in the CREATE), the stripe verdict 8.4 % (its process-wide mutex 3.2 %), `readInodeOpt`
+5.1 %, `allocateIno` 4.7 % (the mint's census: `usedLeafBytes` over the trees, `heldBy`'s lock + copy +
+sort per create), the gather xattr range 4.4 %, `insertParentOf` 4.1 %. Taken: the verdict cache's
+mutex is a reader-writer lock — the probe (two per create, on every worker) holds it shared. It was
+the negative LOOKUP's cost: the drain worker's try-only probe found the mutex held on a third to a
+half of the lookups (`dir_stripe_verdict_try_refusals` 0.39–0.53 per op) and was DEMOTED to a handler
+fiber (a cross-lane handoff) — demotions 159–169 k per 320 k creates on A, 10–16 on B; the LOOKUP
+86–93 → 7.2–7.7 µs (A/B, same hour). Measured and not taken, with the reasons: the gather xattr (a
+range read of the parent's xattr chain per create, needed by the mint's gather arm — serving it from
+the inode record is an on-disk flag, a format change; a negative cache would have to be invalidated
+on the holder's shipped-record path too), the mint's census (≈ 3.5 µs; a per-lane ino window changes
+the rotor's balancing grain and must follow the lease generation — wave 3), the committer's heap
+admission (≈ 12 µs; it is §AW.2's law — a refusal after the reservation would be a hole — and the
+leaves' dirty state needs their locks; the tx's own resolved leaves could seed the resolve).
+
+**Lever 4, the ack fan-out** — not taken: with the venue on, the lane runs 2.2 s per 320 k creates
+(6.6 µs per create, half of it the acks' wakes) at ≈ 50 % of a core; it is no longer on the create's
+critical path, and the fan-out after the landing is the same chain wherever it runs.
+
+**A/B against dev** (`-np 32 -n 10000 -i 1`, each leg a fresh format on the RAM set, legs
+interleaved A B B A inside one hour, every phase started at Tctl ≤ 70 °C with no build or test of
+another tree running; this afternoon's host ran every leg of both arms ≈ 25 % below the midday
+level, so the ratios are the measurement):
+
+| row | A (dev) | B | B ÷ A |
+|---|---|---|---|
+| `-u` file creation /s | 48.6–49.6 k | 56.9–60.1 k | **1.19** |
+| `-u` file removal /s | 46.4–50.8 k | 58.3–59.4 k | **1.21** |
+| `-u` directory creation /s | 31.9–36.5 k | 42.5–49.3 k | **1.34** |
+| `-u` directory removal /s | 23.6–26.6 k | 34.1–37.9 k | **1.43** |
+| shared directory, file creation /s | 15.5–19.4 k | 16.3–17.3 k | 0.96 (inside A's spread) |
+| shared directory, directory creation /s | 10.4–12.3 k | 12.6–13.7 k | 1.16 |
+| the classic run: creation / removal / dir creation / dir removal | 45.0 / 41.6 / 35.9 / 29.7 k | 57.0 / 64.0 / 48.9 / 40.1 k | 1.27 / 1.54 / 1.36 / 1.35 |
+| file stat /s (the classic run) | 9.1 M | 7.8 M | the kernel's dcache serves it (4.6–7.4 k getattrs per 320 k stats reach the daemon); within the day's swing |
+
+The midday legs, at the host's faster level, put B at file creation 73–84 k, removal 83–91 k,
+directory creation 58–65 k, removal 50–56 k. Against ext4 / xfs on the substrate: file creation 58–84 k
+against 711 k / 471 k (8–12 %), removal 59–91 k against 573 k / 183 k, directory creation 46–65 k
+against 246 k / 369 k, directory removal 36–56 k against 456 k / 158 k. The bars are not on par: at 32
+ranks the rate is 32 ÷ (the LOOKUP + the CREATE), and the CREATE is 300–470 µs of which ≈ 42 µs is
+the handler's CPU and ≈ 100 µs the engine's (queue, window, the landing, the ack) — the rest is the
+closed loop's wakes: the kernel → worker dispatch, the committer's park and its ack wake, the
+request's demotions. ext4 acknowledges a create from RAM; the charter's ack is after the landing.
+
+The data rows (`scripts/perf/quiet.sh ram-sqz cr2-{A,B}-r1`, 20 s each, A then B): 4k randread
+QD32×4 959 k → 1.06 M IOPS, 4k randwrite QD32×4 754 k → 875 k, seq write 1 MiB QD16×4 33.9 → 39.3
+GB/s — no regression (both arms below the wave-1 level; the host's afternoon).
+
 ## Suites
 
-Unit families (`conveyor`, `meta.backend`, `kv_fs`, `kv_fs_stripes`, `economy`, `meta.tx`,
+Wave 1: unit families (`conveyor`, `meta.backend`, `kv_fs`, `kv_fs_stripes`, `economy`, `meta.tx`,
 `journal_lane`, `lifecycle`, `e2e`, `fsck`, `node_cache`, `exec`, `rails`, `knobs`, `stats`):
 610/646 passed, 36 skipped (`-Dfresh=true`). Smoke rows (THE KILL MATRIX and its two-ring row, A STRIPED DIRECTORY ON ONE DAEMON, THE
 SHARED HOT DIRECTORY ACROSS DAEMONS, A DEAD MANAGER HOLDING A STRIPED HOT DIRECTORY, kill -9 mid-tar
 on both cadences, KILL -9 BETWEEN A PROMOTION'S COMMIT AND ITS RING RELEASE): 46/46 (`-Dfresh=true`). `fsck
 --offline` clean after every session (≈ 40 of them). No full gate (the train gates).
+
+Wave 2: the same families plus `node_snapshot`, `smo`, `leaf_merge`, `checkpoint_cycle`, `meta.tree`
+(`-Dfresh=true`, with the applier venue on by default): 733/800 passed, 67 skipped; `rails` 29/29;
+the same smoke rows 46/46 (`-Dfresh=true`); `fsck --offline` clean after every one of the 41
+sessions. No full gate (the train gates).

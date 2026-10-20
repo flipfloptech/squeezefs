@@ -282,15 +282,12 @@ pub const Owner = struct {
         return false;
     }
 
-    /// The ring park's spin window: the governor's explicit window
-    /// verbatim; derived, the window the governor would grant this lane
-    /// with the single-session guard lifted (a park with MY ops in flight
-    /// is never the "productive" sync-RTT wait that guard protects — the
-    /// CQE is the next event, and on a RAM-class device it is microseconds
-    /// away) under the same busy ceiling and EWMA rail.
-    fn ringSpinNs(self: *Owner, now: u64) u64 {
-        self.sampleBusy(now);
-        return doorbell.SpinGovernor.windowUs(self.cfg.spin, self.ewma_park_ns, self.busy_pct, self.cfg.lanes, self.cfg.cores, @max(2, @as(u32, @intCast(self.n)))) * std.time.ns_per_us;
+    /// The ring park's spin window (`SpinGovernor.ringWindowUs`): a park
+    /// with MY ops in flight is never the "productive" sync-RTT wait the
+    /// doorbell governor's session guard protects — the CQE is the next
+    /// event, and on a RAM-class device it is microseconds away.
+    fn ringSpinNs(self: *Owner) u64 {
+        return doorbell.SpinGovernor.ringWindowUs(self.cfg.spin, self.ewma_park_ns) * std.time.ns_per_us;
     }
 
     /// `/proc/stat`'s first line → busy %, at most once per second.
@@ -329,7 +326,7 @@ pub const Owner = struct {
         self.sink.flush(self.sink.ctx, self.cfg.index);
         if (served == 0) {
             // The ring park when my ops are in flight, else the futex park.
-            const verdict = self.sink.park(self.sink.ctx, self.cfg.index, self.park.entries[0..self.park.n], self.epoch_seen, self.ringSpinNs(t0), doorbell.SERVICE_PARK_MAX_NS) orelse self.park.wait();
+            const verdict = self.sink.park(self.sink.ctx, self.cfg.index, self.park.entries[0..self.park.n], self.epoch_seen, self.ringSpinNs(), doorbell.SERVICE_PARK_MAX_NS) orelse self.park.wait();
             switch (verdict) {
                 .returned => stats.ipc_service_wakes.inc(),
                 .timed_out => stats.ipc_service_park_timeouts.inc(),

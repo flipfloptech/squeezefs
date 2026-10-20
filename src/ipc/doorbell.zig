@@ -248,6 +248,27 @@ pub const SpinGovernor = struct {
     pub const SPIN_WINDOW_US: u64 = 100;
     /// α = 1/8: the standing smoothing class.
     pub const EWMA_SHIFT: u6 = 3;
+    /// The ring park's spin regime: a lane whose parks (its own CQEs in
+    /// flight) end within this many µs is on a RAM-class device, where a
+    /// sleep costs more than the wait (a wake is 3–5 µs of scheduler
+    /// latency; brd through nvme-loop answers in 5–15); a longer wait is a
+    /// real device's and spinning it would burn the lane's core for nothing.
+    pub const RING_SPIN_RAIL_US: u64 = 50;
+
+    /// The ring park's window (`service.Owner.ringSpinNs`): the explicit
+    /// window verbatim; else, adaptive and inside the rail, twice the lane's
+    /// park EWMA capped at `SPIN_WINDOW_US` — no busy ceiling and no session
+    /// guard: a park with the lane's own ops in flight is bounded by the
+    /// device, never open-ended (MEASURED 2026-10-20, 32-job 4k rows on the
+    /// RAM namespace: a 20 µs window +5 % reads / +9 % writes where the
+    /// ceiling had disengaged the governor at 68 % busy; qd1 +16 %).
+    pub fn ringWindowUs(cfg: Config, ewma_park_ns: u64) u64 {
+        if (cfg.explicit_us) |us| return us;
+        if (!cfg.adaptive or ewma_park_ns == 0) return 0;
+        const ewma_us = ewma_park_ns / std.time.ns_per_us;
+        if (ewma_us > RING_SPIN_RAIL_US) return 0;
+        return @min(2 * @max(ewma_us, 1), SPIN_WINDOW_US);
+    }
 
     pub const Config = struct {
         /// `SQUEEZEFS_IPC_SPIN_US` verbatim (governor OFF; 0 = the
@@ -519,4 +540,15 @@ test "knob faces: the spin levers and the latch read their rows" {
     try testing.expectEqual(@as(?u32, 0), c1.explicit_us);
     try testing.expect(!c1.adaptive);
     try testing.expect(!latchFromEnv(&env));
+}
+
+test "the ring park's window: explicit verbatim; adaptive = 2 × the park EWMA inside the 50 µs rail, capped at the governor's window, 0 past the rail or unseeded or with the governor off" {
+    const adaptive: SpinGovernor.Config = .{ .explicit_us = null, .adaptive = true };
+    try testing.expectEqual(@as(u64, 7), SpinGovernor.ringWindowUs(.{ .explicit_us = 7, .adaptive = true }, 80 * std.time.ns_per_us));
+    try testing.expectEqual(@as(u64, 0), SpinGovernor.ringWindowUs(.{ .explicit_us = null, .adaptive = false }, 5 * std.time.ns_per_us));
+    try testing.expectEqual(@as(u64, 0), SpinGovernor.ringWindowUs(adaptive, 0));
+    try testing.expectEqual(@as(u64, 2), SpinGovernor.ringWindowUs(adaptive, 500));
+    try testing.expectEqual(@as(u64, 16), SpinGovernor.ringWindowUs(adaptive, 8 * std.time.ns_per_us));
+    try testing.expectEqual(SpinGovernor.SPIN_WINDOW_US, SpinGovernor.ringWindowUs(adaptive, SpinGovernor.RING_SPIN_RAIL_US * std.time.ns_per_us));
+    try testing.expectEqual(@as(u64, 0), SpinGovernor.ringWindowUs(adaptive, (SpinGovernor.RING_SPIN_RAIL_US + 1) * std.time.ns_per_us));
 }

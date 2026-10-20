@@ -72,6 +72,7 @@ pub const meta = struct {
     pub const checkpoint = @import("meta/checkpoint.zig");
     pub const node_snapshot = @import("meta/node_snapshot.zig");
     pub const node_cache = @import("meta/node_cache.zig");
+    pub const ino_witness = @import("meta/ino_witness.zig");
     pub const economy = @import("meta/economy.zig");
     pub const journal_lane = if (builtin.os.tag == .linux) @import("meta/journal_lane.zig") else struct {};
     pub const tx = @import("meta/tx.zig");
@@ -160,6 +161,8 @@ pub const data = struct {
     pub const prefetch = @import("data/prefetch.zig");
     pub const read_path = @import("data/read_path.zig");
     pub const warm_ladder = @import("data/warm_ladder.zig");
+    pub const read_view = @import("data/read_view.zig");
+    pub const read_view_model = @import("data/read_view_model.zig");
     pub const plane = if (builtin.os.tag == .linux) @import("data/plane.zig") else struct {};
     pub const plane_locks_model = @import("data/plane_locks_model.zig");
 };
@@ -294,6 +297,8 @@ test {
     _ = data.prefetch;
     _ = data.read_path;
     _ = data.warm_ladder;
+    _ = data.read_view;
+    _ = data.read_view_model;
     if (builtin.os.tag == .linux) _ = data.plane;
     _ = data.plane_locks_model;
     _ = exec;
@@ -315,6 +320,7 @@ test {
     _ = meta.checkpoint;
     _ = meta.node_snapshot;
     _ = meta.node_cache;
+    _ = meta.ino_witness;
     _ = meta.economy;
     _ = sync;
     if (builtin.os.tag == .linux) _ = meta.journal_lane;

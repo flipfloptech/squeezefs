@@ -633,6 +633,7 @@ fn mountMain(ctx: *Ctx) u8 {
     // the set's close on every exit.
     var moves = sym_slots.moves.Moves.init(io);
     be.bindMoves(&moves);
+    plane.bindMoves(&moves);
     const move_deadline_ms: ?u64 = if (wire) |wp| wp.moveDeadlineMs() else if (rplane) |rp| rp.moveDeadlineMs() else null;
     var move_gate: handler.move_gate.MoveGate = .{ .inner = if (rplane != null) reader_gate.filesystem() else filesystem.Filesystem.of(BackendFs, &fs), .moves = &moves, .deadline_ns = sym_slots.moves.deadlineNs(move_deadline_ms orelse 0) };
     const served_fs: filesystem.Filesystem = if (move_deadline_ms != null) move_gate.filesystem() else move_gate.inner;

@@ -93,6 +93,8 @@ const tx_mod = @import("../meta/tx.zig");
 const dlm = @import("../meta/dlm.zig");
 const jc = @import("../meta/journal_core.zig");
 const inos = @import("../meta/inos.zig");
+const ino_witness = @import("../meta/ino_witness.zig");
+const sym_moves = @import("../meta/sym/slots/moves.zig");
 const route_table = @import("../meta/routing/route_table.zig");
 const op_guard = @import("../fuse/handler/op_guard.zig");
 const fsv = @import("../fuse/transport/filesystem_vtable.zig");
@@ -128,6 +130,7 @@ const extent_overlay = @import("extent_overlay.zig");
 const cov = @import("write_coverage.zig");
 const fsync_mod = @import("fsync.zig");
 const read_path = @import("read_path.zig");
+const read_view = @import("read_view.zig");
 const read_size_class = @import("read_size_class.zig");
 const nvme_read_cache = @import("nvme_read_cache.zig");
 const sym_join = @import("../meta/sym/join.zig");
@@ -434,6 +437,9 @@ pub const DataPlane = struct {
     /// Promotion tasks (the pressure hook) on the meta pool.
     tasks: taskset.TaskSet = .init,
     shape: ShapeTable,
+    /// The per-ino read view (`read_view.zig`): what an op needs of an
+    /// inode's metadata without a KV lookup, staled by the ino witness.
+    view: read_view.Table,
     /// The per-ino size epochs (`size_epoch.SizeEpochs`): bumped by every
     /// size-setting commit (`noteSizeSet`), read at a write's landing
     /// (`write_admit.Outcome.size_epoch`) and a write-back unit's formation,
@@ -575,6 +581,7 @@ pub const DataPlane = struct {
             .rp = undefined,
             .ladder = undefined,
             .shape = undefined,
+            .view = undefined,
             .size_epochs = undefined,
             .file_id_seq = .init(@bitCast(clock.realtimeCoarseNs())),
             .refs_store = block_refs.RefStore.from(KvBackend, be),
@@ -592,6 +599,9 @@ pub const DataPlane = struct {
         budget.authority.register(self.publish_scratch.component());
         self.shape = try ShapeTable.init(gpa);
         errdefer self.shape.deinit(gpa);
+        self.view = try read_view.Table.init(gpa, record.xattrValueCap(@intCast(node_size)), self.geo);
+        errdefer self.view.deinit();
+        budget.authority.register(self.view.component());
         self.size_epochs = try size_epoch.SizeEpochs.init(gpa, SHAPE_STRIPES);
         errdefer self.size_epochs.deinit();
         self.windows = try kvmap.WindowCache.init(gpa, kvmap.windowBudgetBytes(opts.budget_bytes), cfg.chunk_size);
@@ -1207,6 +1217,7 @@ pub const DataPlane = struct {
         self.windows.deinit();
         self.sweeps.deinit(self.gpa);
         self.shape.deinit(self.gpa);
+        self.view.deinit();
         self.size_epochs.deinit();
         self.publish_scratch.deinit();
         self.gpa.destroy(self);
@@ -1292,6 +1303,7 @@ pub const DataPlane = struct {
         lease_epoch.recallWrites(ino);
         self.shape.forget(ino);
         self.size_epochs.forget(ino);
+        self.view.forget(ino);
     }
 
     /// A size-setting commit of `ino` is about to land (the truncate, the
@@ -2472,52 +2484,79 @@ pub const DataPlane = struct {
         return null;
     }
 
-    /// The `layoutPoint` visitor over a borrowed (or owned) layout record.
+    /// The `layoutPoint` visitor over a borrowed (or owned) layout record;
+    /// with a `fill` the record (or its absence) also goes into the read
+    /// view under the generations the caller captured before its lookups.
     const PointProbe = union(enum) { point: layout.Point, other_name, corrupt };
+    const ViewFill = struct { size: u64, gen: u64, moves: u64 };
     const PointQuery = struct {
-        geo: layout.Geometry,
+        plane: *DataPlane,
+        ino: u64,
         block: ?u32,
+        fill: ?ViewFill,
         fn visit(q: @This(), v: []const u8) PointProbe {
             const xv = record.XattrValue.decode(v) catch return .corrupt;
             if (!std.mem.eql(u8, xv.name, layout.LAYOUT_XATTR_NAME)) return .other_name;
-            return .{ .point = layout.resolvePoint(xv.value, q.geo, q.block) catch return .corrupt };
+            const p = layout.resolvePoint(xv.value, q.plane.geo, q.block) catch return .corrupt;
+            if (q.fill) |f| q.plane.view.fill(q.ino, f.size, xv.value, f.gen, f.moves);
+            return .{ .point = p };
         }
     };
 
-    /// What one op needs of `ino`'s layout (`layout.resolvePoint`) read off
-    /// the node cache's borrowed record: no copy, no allocation, O(log
-    /// entries) whatever the file's size (`docs/evidence/rung-10-
-    /// layoutlookup.md`). Null = no record (an inline file).
-    fn layoutPoint(self: *DataPlane, ino: u64, block: ?u32) Error!?layout.Point {
-        // A foreign record is the holder's, owned (`layoutRecord`).
+    /// What one op needs of `ino`: the inode record's size (null = no
+    /// inode; the parked claim folded by `claimedSize`) and the layout as
+    /// `layout.resolvePoint` reads it for `block` (null = no record: an
+    /// inline file never written). Served off the read view when it holds
+    /// the ino current (`read_view.zig`: no KV lookup, no divert ask);
+    /// else the divert's verdict, then the two store lookups off the node
+    /// cache's borrowed records (`docs/evidence/rung-10-layoutlookup.md`),
+    /// the view filled on the way out of a local lookup under the witness
+    /// generation and slot-move epoch read BEFORE them.
+    const Resolved = struct { size: ?u64, point: ?layout.Point };
+
+    fn resolveAt(self: *DataPlane, ino: u64, block: ?u32) Error!?Resolved {
+        if (self.view.lookup(ino, block)) |v| return .{ .size = v.size, .point = v.point };
         if (self.foreign_layout) |f| switch (try f.lookup(f.ctx, self.gpa, ino)) {
             .local => {},
             .gone => return null,
-            .foreign => |x| return self.foreignPoint(x.layout orelse return null, block),
+            // A foreign record is the holder's, owned (`layoutRecord`): never cached here.
+            .foreign => |x| return .{ .size = x.size, .point = if (x.layout) |v| try self.foreignPoint(v, block) else null },
         };
-        return self.layoutPointLocal(ino, block);
+        const gen = ino_witness.genOf(ino);
+        const moves = self.view.movesNow();
+        const size = try self.inodeRecordSize(ino);
+        // An inode-less layout is a destroy in flight: resolved, not cached.
+        // A `-o ro` reader's projection moves without a leaf apply (the
+        // checkpoint it adopts), so it is never cached either.
+        const fill: ?ViewFill = if (size != null and !self.backend.isReader()) .{ .size = size.?, .gen = gen, .moves = moves } else null;
+        const point = try self.layoutPointLocal(ino, block, fill);
+        return .{ .size = size, .point = point };
     }
 
     /// `layoutPoint` of a record the token page carried (owned; freed here).
     fn foreignPoint(self: *DataPlane, owned: []u8, block: ?u32) Error!?layout.Point {
         defer self.gpa.free(owned);
-        return switch (PointQuery.visit(.{ .geo = self.geo, .block = block }, owned)) {
+        return switch (PointQuery.visit(.{ .plane = self, .ino = 0, .block = block, .fill = null }, owned)) {
             .point => |p| p,
             .other_name, .corrupt => error.InputOutput,
         };
     }
 
-    /// `layoutPoint` of this mount's own slot (the foreign verdict already
-    /// `local`).
-    fn layoutPointLocal(self: *DataPlane, ino: u64, block: ?u32) Error!?layout.Point {
-        const q: PointQuery = .{ .geo = self.geo, .block = block };
+    /// The layout point of this mount's own slot (the foreign verdict
+    /// already `local`), off the borrowed record at the chain's slot 0 or
+    /// the owned chain copy; `fill` installs what it read into the view.
+    fn layoutPointLocal(self: *DataPlane, ino: u64, block: ?u32, fill: ?ViewFill) Error!?layout.Point {
+        const q: PointQuery = .{ .plane = self, .ino = ino, .block = block, .fill = fill };
         const h = key.xattrNameHash56(layout.LAYOUT_XATTR_NAME, self.name_key);
         switch ((self.backend.lookupView(self.gpa, key.TREE_XATTRS, &key.xattrKey(ino, h, 0), PointProbe, q, PointQuery.visit) catch |e| return KvBackend.coreError(e)) orelse .other_name) {
             .point => |p| return p,
             .corrupt => return error.InputOutput,
             .other_name => {},
         }
-        const owned = ((try self.layoutChain(self.gpa, ino, h)) orelse return null).value;
+        const owned = ((try self.layoutChain(self.gpa, ino, h)) orelse {
+            if (fill) |f| self.view.fill(ino, f.size, null, f.gen, f.moves);
+            return null;
+        }).value;
         defer self.gpa.free(owned);
         return switch (PointQuery.visit(q, owned)) {
             .point => |p| p,
@@ -2525,28 +2564,37 @@ pub const DataPlane = struct {
         };
     }
 
-    fn inodeSize(self: *DataPlane, ino: u64) Error!?u64 {
-        if (self.foreign_layout) |f| switch (try f.lookup(f.ctx, self.gpa, ino)) {
-            .local => {},
-            .gone => return null,
-            .foreign => |x| {
-                if (x.layout) |v| self.gpa.free(v);
-                return x.size;
-            },
-        };
-        return self.inodeSizeLocal(ino);
+    /// `layoutPoint`: the layout alone (the write side's map seams).
+    fn layoutPoint(self: *DataPlane, ino: u64, block: ?u32) Error!?layout.Point {
+        return ((try self.resolveAt(ino, block)) orelse return null).point;
     }
 
-    /// `inodeSize` of this mount's own slot: the inode record's size under
-    /// the parked size claim (decision 0003 §AL.5).
-    fn inodeSizeLocal(self: *DataPlane, ino: u64) Error!?u64 {
+    /// The inode's size as readers and growers see it: the record's under
+    /// the parked size claim (decision 0003 §AL.5); null = no inode.
+    fn inodeSize(self: *DataPlane, ino: u64) Error!?u64 {
+        const r = (try self.resolveAt(ino, null)) orelse return null;
+        return self.claimedSize(ino, r.size orelse return null);
+    }
+
+    fn claimedSize(self: *DataPlane, ino: u64, size: u64) u64 {
+        return @max(size, if (self.claims) |c| c.claimOf(c.ctx, ino) else 0);
+    }
+
+    /// The inode record's size off the borrowed record (unfolded).
+    fn inodeRecordSize(self: *DataPlane, ino: u64) Error!?u64 {
         const Size = struct {
             fn of(_: void, bytes: []const u8) ?u64 {
                 return (record.InodeValue.decode(bytes) catch return null).size;
             }
         };
         const size = (self.backend.lookupView(self.gpa, key.TREE_INODES, &key.inodeKey(ino), ?u64, {}, Size.of) catch |e| return KvBackend.coreError(e)) orelse return null;
-        return @max(size orelse return error.InputOutput, if (self.claims) |c| c.claimOf(c.ctx, ino) else 0);
+        return size orelse error.InputOutput;
+    }
+
+    /// The mount's slot-move epoch into the view (decision 0003 §X.1): a
+    /// lease transition stales every view filled before it.
+    pub fn bindMoves(self: *DataPlane, m: *const sym_moves.Moves) void {
+        self.view.bindMoves(&m.epoch);
     }
 
     fn mapLookup(ctx: *anyopaque, ino: u64, block: u32) ?Mapping {
@@ -2586,8 +2634,9 @@ pub const DataPlane = struct {
 
     fn mapView(ctx: *anyopaque, ino: u64) ?seams.FileView {
         const self: *DataPlane = @ptrCast(@alignCast(ctx));
-        const size = (self.inodeSize(ino) catch return null) orelse return null;
-        const l = (self.layoutPoint(ino, null) catch return null) orelse return .{ .kind = .inline_, .size = size, .map_resident = true };
+        const r = (self.resolveAt(ino, null) catch return null) orelse return null;
+        const size = self.claimedSize(ino, r.size orelse return null);
+        const l = r.point orelse return .{ .kind = .inline_, .size = size, .map_resident = true };
         // A tree-mapped head resolves through `kvmapLookup` as the inline
         // map does through the record: the map is resident either way.
         return .{ .kind = switch (l.kind) {
@@ -3426,36 +3475,19 @@ pub const DataPlane = struct {
     }
 
     fn metaFile(ctx: *anyopaque, ino: u64) ?read_path.FileInfo {
-        const self: *DataPlane = @ptrCast(@alignCast(ctx));
-        const size = (self.inodeSize(ino) catch return null) orelse return null;
-        const p = (self.layoutPoint(ino, null) catch return null) orelse return .{ .size = size, .kind = .inline_ };
-        return .{ .size = size, .kind = p.kind, .file_id = p.file_id, .durable_copy = p.durable_copy };
+        return (metaFileAt(ctx, ino, std.math.maxInt(u64)) orelse return null).info;
     }
 
-    /// `metaFile` + `metaBinding(block)` over ONE layout-record read and ONE
-    /// foreign-slot verdict (the warm ladder's per-read resolution: the
-    /// size and the record of a local file are two store lookups, the
-    /// divert asked once, not per lookup).
+    /// `metaFile` + `metaBinding(block)` over ONE resolution (`resolveAt`:
+    /// the read view, else one divert verdict and two store lookups — the
+    /// warm ladder's per-read resolution). A block past `u32` asks the
+    /// facts alone.
     fn metaFileAt(ctx: *anyopaque, ino: u64, block: u64) ?read_path.FileAt {
         const self: *DataPlane = @ptrCast(@alignCast(ctx));
         const b = std.math.cast(u32, block);
-        var size: u64 = undefined;
-        var point: ?layout.Point = undefined;
-        if (self.foreign_layout) |f| switch (f.lookup(f.ctx, self.gpa, ino) catch return null) {
-            .local => {
-                size = (self.inodeSizeLocal(ino) catch return null) orelse return null;
-                point = self.layoutPointLocal(ino, b) catch return null;
-            },
-            .gone => return null,
-            .foreign => |x| {
-                size = x.size;
-                point = if (x.layout) |v| (self.foreignPoint(v, b) catch return null) else null;
-            },
-        } else {
-            size = (self.inodeSizeLocal(ino) catch return null) orelse return null;
-            point = self.layoutPointLocal(ino, b) catch return null;
-        }
-        const p = point orelse return .{ .info = .{ .size = size, .kind = .inline_ }, .binding = null };
+        const r = (self.resolveAt(ino, b) catch return null) orelse return null;
+        const size = self.claimedSize(ino, r.size orelse return null);
+        const p = r.point orelse return .{ .info = .{ .size = size, .kind = .inline_ }, .binding = null };
         const info: read_path.FileInfo = .{ .size = size, .kind = p.kind, .file_id = p.file_id, .durable_copy = p.durable_copy };
         if (p.kind != .striped or b == null) return .{ .info = info, .binding = null };
         return .{ .info = info, .binding = if (p.kvmap) |head| self.kvmapLookup(ino, head, b.?) else p.binding };
@@ -3466,8 +3498,11 @@ pub const DataPlane = struct {
         return mapLookup(ctx, ino, @intCast(block));
     }
 
+    /// The inline payload: off the view when it holds the ino, else the
+    /// record's owned copy.
     fn metaInlineData(ctx: *anyopaque, ino: u64, offset: u64, out: []u8) usize {
         const self: *DataPlane = @ptrCast(@alignCast(ctx));
+        if (self.view.inlineData(ino, offset, out)) |n| return n;
         const rec = (self.layoutRecord(ino) catch return 0) orelse return 0;
         defer self.gpa.free(rec.value);
         const l = layout.XattrLayout.decode(rec.value, self.geo) catch return 0;
@@ -3971,6 +4006,8 @@ pub const DataPlane = struct {
         try read_path.writeStatsJson(w);
         try w.writeAll(",\"warm_ladder\":");
         try warm_ladder.writeStatsJson(w);
+        try w.writeAll(",\"read_view\":");
+        try read_view.writeStatsJson(w);
         try w.writeAll(",\"layout\":");
         try layout.writeStatsJson(w);
         try w.writeAll(",\"kvmap\":");

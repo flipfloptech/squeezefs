@@ -123,7 +123,7 @@ pub const Kind = enum(u8) {
     packed_ = 2,
     striped = 3,
 
-    fn fromByte(b: u8) DecodeError!Kind {
+    pub fn fromByte(b: u8) DecodeError!Kind {
         return switch (b) {
             0 => .inline_,
             1 => .staged,
@@ -525,9 +525,7 @@ pub const Layout = struct {
         if (self.flags & F_MAP_INLINE == 0) return null;
         const idx = std.sort.lowerBound(MapEntryWire, self.entries, block, entryBlockOrder);
         if (idx == self.entries.len or self.entries[idx].block() != block) return null;
-        const e = &self.entries[idx];
-        if (!std.mem.allEqual(u8, &e.reserved_le, 0)) return error.Corrupt;
-        return try Mapping.decode(e.mapping, chunk);
+        return try checkEntry(&self.entries[idx], chunk);
     }
 
     fn entryBlockOrder(block: u32, e: MapEntryWire) std.math.Order {
@@ -813,13 +811,29 @@ pub const Point = struct {
     binding: ?Mapping,
 };
 
+/// `decode` short of the inline map's entries: the header and the body's
+/// framing checked, `entries` borrowed UNCHECKED from `bytes` (the read
+/// view copies them and checks the one entry each read lands on, as
+/// `resolvePoint` does).
+pub fn decodeHead(bytes: []const u8, geo: Geometry) LayoutError!Layout {
+    const l = try Layout.decodeShape(bytes, geo);
+    try l.validateHead(geo);
+    return l;
+}
+
+/// The one inline-map entry's check `resolvePoint` applies where it lands
+/// (`validate`'s per-entry law): zero reserved bytes, the window law.
+pub fn checkEntry(e: *const MapEntryWire, chunk: u64) LayoutError!Mapping {
+    if (!std.mem.allEqual(u8, &e.reserved_le, 0)) return error.Corrupt;
+    return try Mapping.decode(e.mapping, chunk);
+}
+
 /// The per-op read of a layout record, O(log entries) whatever the file's
 /// size: `decode`'s checks on the header and on the ONE inline-map entry the
 /// search lands on, never on the rest of the map (the full `decode` of every
 /// publish's read-modify-write and fsck's walk check those).
 pub fn resolvePoint(bytes: []const u8, geo: Geometry, block: ?u32) LayoutError!Point {
-    const l = try Layout.decodeShape(bytes, geo);
-    try l.validateHead(geo);
+    const l = try decodeHead(bytes, geo);
     return .{
         .kind = l.kind,
         .size = l.size,

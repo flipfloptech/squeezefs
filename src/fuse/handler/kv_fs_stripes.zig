@@ -94,7 +94,13 @@ pub fn Stripes(comptime Fs: type) type {
         fs: *Fs,
         plane: *Plane,
         core: Core,
-        lock: sync.Mutex = .init,
+        /// The verdict cache's lock: the verdict's probe (two per create,
+        /// on every FUSE worker) reads SHARED; installs, forgets and the
+        /// miss path's inserts write. One mutex here refused a third of the
+        /// drain workers' inline probes (`dir_stripe_verdict_try_refusals`
+        /// 0.32–0.39 per create on mdtest -np 32) into handler-fiber
+        /// demotions and parked the rest behind each other.
+        lock: sync.RwLock = .init,
         maps: std.AutoHashMapUnmanaged(u64, StripeMap) = .empty,
         /// stripe → its directory (the ancestry walk's hop; 0 = unknown).
         stripe_of: std.AutoHashMapUnmanaged(u64, u64) = .empty,
@@ -213,6 +219,17 @@ pub fn Stripes(comptime Fs: type) type {
             self.lock.lockUncancelable(self.io);
         }
 
+        /// The probe's shared hold — refused only while a WRITER holds the
+        /// cache (an install, a forget, a miss's insert).
+        fn lockCacheShared(self: *Self) Error!void {
+            if (node_cache.try_only) {
+                if (self.lock.tryLockShared(self.io)) return;
+                stats.dir_stripe_verdict_try_refusals.inc();
+                return error.WouldBlock;
+            }
+            self.lock.lockSharedUncancelable(self.io);
+        }
+
         fn installLocked(self: *Self, map: StripeMap) void {
             if (self.maps.count() >= MAPS_CACHE_MAX) {
                 self.maps.clearRetainingCapacity();
@@ -237,8 +254,8 @@ pub fn Stripes(comptime Fs: type) type {
         pub fn verdictOf(self: *Self, global: u64) Error!Verdict {
             const g = self.plane.localGen(global);
             {
-                try self.lockCache();
-                defer self.lock.unlock(self.io);
+                try self.lockCacheShared();
+                defer self.lock.unlockShared(self.io);
                 if (self.maps.get(global)) |m| {
                     stats.dir_stripe_verdict_hits.inc();
                     return .{ .striped = m };
@@ -309,8 +326,8 @@ pub fn Stripes(comptime Fs: type) type {
 
         /// The directory a stripe belongs to, if known here.
         pub fn stripeOwner(self: *Self, ino: u64) ?u64 {
-            self.lock.lockUncancelable(self.io);
-            defer self.lock.unlock(self.io);
+            self.lock.lockSharedUncancelable(self.io);
+            defer self.lock.unlockShared(self.io);
             const owner = self.stripe_of.get(ino) orelse return null;
             return if (owner == 0) null else owner;
         }
@@ -690,7 +707,7 @@ test "a verdict install is all or nothing: an allocation failure caches no part 
     try testing.expectEqual(d, st.migrating.items[0]);
 }
 
-test "the drain worker's try-only probe never queues behind the verdict cache's lock: a held lock answers WouldBlock at once with nobody parked (the lane re-asks); a free lock serves the probe" {
+test "the drain worker's try-only probe never queues behind the verdict cache's lock: a WRITER-held lock answers WouldBlock at once with nobody parked (the lane re-asks); a free lock serves the probe; another reader inside shares it" {
     const gpa = testing.allocator;
     const io = testing.io;
     var store = try kv_fs.MemStore.init(gpa);
@@ -745,4 +762,14 @@ test "the drain worker's try-only probe never queues behind the verdict cache's 
     var p2: Prober = .{ .fs = &fs, .io = io };
     p2.run();
     try testing.expectEqual(d, (try p2.result).nodeid);
+    // Another READER inside the cache (a verdict's probe on another
+    // worker): the probe shares the hold and is served, no refusal.
+    const refusals1 = stats.dir_stripe_verdict_try_refusals.load();
+    st.lock.lockSharedUncancelable(io);
+    var p3: Prober = .{ .fs = &fs, .io = io };
+    const th3 = try std.Thread.spawn(.{}, Prober.run, .{&p3});
+    th3.join();
+    st.lock.unlockShared(io);
+    try testing.expectEqual(d, (try p3.result).nodeid);
+    try testing.expectEqual(refusals1, stats.dir_stripe_verdict_try_refusals.load());
 }

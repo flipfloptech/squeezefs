@@ -597,6 +597,55 @@ pub const SqzIo = struct {
         return fdwatch.readable(fd);
     }
 
+    pub const FsyncRangeError = error{ InputOutput, NoSpaceLeft, DiskQuota, Unexpected };
+
+    /// `[off, off + len)` of `fd` durable: `IORING_OP_FSYNC` with the range
+    /// in `off`/`len` and `IORING_FSYNC_DATASYNC` — the kernel's
+    /// `vfs_fsync_range`: the range's dirty pages written and waited for,
+    /// the metadata that reaches them committed, the device's cache
+    /// flushed; the same path `msync(MS_SYNC)` takes for a shared mapping
+    /// of the range. On a lane fiber the SQE rides its lane's ring and the
+    /// fiber parks until the CQE (the kernel runs FSYNC on io-wq, so the
+    /// lane thread never blocks); off a lane (a raw thread) the raw
+    /// `fdatasync(2)` of the whole file — a superset of the range. Never a
+    /// cancellation point (charter §9: a durability leg is never
+    /// cancelled); a cancelled SQE reports as EIO.
+    pub fn fsyncRange(io_handle: Io, fd: linux.fd_t, off: u64, len: u64) FsyncRangeError!void {
+        const f = lane_mod.currentFiber() orelse {
+            return switch (linux.errno(linux.fdatasync(fd))) {
+                .SUCCESS => {},
+                .IO => error.InputOutput,
+                .NOSPC => error.NoSpaceLeft,
+                .DQUOT => error.DiskQuota,
+                else => error.Unexpected,
+            };
+        };
+        const old = io_handle.swapCancelProtection(.blocked);
+        defer _ = io_handle.swapCancelProtection(old);
+        if (!f.lane.armRingOp(f, prepFsyncRange, .{ fd, off, len })) return error.Unexpected;
+        const res = awaitRingOp(f) catch |err| switch (err) {
+            error.Canceled => unreachable, // protection is blocked above
+        };
+        if (res >= 0) return;
+        return switch (@as(linux.E, @fromBackingInt(@as(u16, @intCast(-res))))) {
+            .NOSPC => error.NoSpaceLeft,
+            .DQUOT => error.DiskQuota,
+            .IO, .CANCELED => error.InputOutput,
+            else => error.Unexpected,
+        };
+    }
+
+    /// `prep_fsync` then the range: std's prep resets every field, and
+    /// `io_fsync_prep` reads the range from `off`/`len` (0/0 = the whole
+    /// file). The SQE's `len` is 32 bits: a span past it is the whole file.
+    fn prepFsyncRange(sqe: *linux.io_uring_sqe, fd: linux.fd_t, off: u64, len: u64) void {
+        sqe.prep_fsync(fd, linux.IORING_FSYNC_DATASYNC);
+        if (len <= std.math.maxInt(u32)) {
+            sqe.off = off;
+            sqe.len = @intCast(len);
+        }
+    }
+
     /// `main`: the calling thread becomes the `main` lane and drives
     /// `function(args)` to completion; returns its result.
     pub fn run(self: *SqzIo, comptime function: anytype, args: std.meta.ArgsTuple(@TypeOf(function))) (Lane.StartError || Io.ConcurrentError)!ReturnOf(function) {
@@ -1546,6 +1595,33 @@ test "runBlocking from a fiber parks it and the sqz-blk worker wakes it; the job
     var fut = try io.concurrent(S.task, .{ sqz, 41 });
     try testing.expectEqual(@as(u32, 42), fut.await(io));
     try testing.expect(sqz.blocking_pool.threads() >= 1);
+}
+
+test "fsyncRange from a fiber is ONE SQE on its lane's ring (the fiber parks, the lane thread never blocks), off a lane the raw fdatasync; a closed fd is a loud error on both" {
+    const sqz = try SqzIo.testInstance();
+    defer sqz.deinit();
+    const io = sqz.io();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try tmp.dir.createFile(testing.io, "seg", .{ .truncate = true });
+    defer file.close(testing.io);
+    try file.writeStreamingAll(testing.io, "staged bytes");
+    const S = struct {
+        fn task(io_: Io, fd: linux.fd_t) SqzIo.FsyncRangeError!void {
+            return SqzIo.fsyncRange(io_, fd, 0, 4096);
+        }
+    };
+    const ops0 = stats.ring_ops.load();
+    var fut = try io.concurrent(S.task, .{ io, file.handle });
+    try fut.await(io);
+    try testing.expectEqual(ops0 + 1, stats.ring_ops.load());
+    // Off a lane: the raw syscall, no ring op.
+    try SqzIo.fsyncRange(io, file.handle, 0, 4096);
+    try testing.expectEqual(ops0 + 1, stats.ring_ops.load());
+    // A fd nobody holds.
+    try testing.expectError(error.Unexpected, SqzIo.fsyncRange(io, -1, 0, 4096));
+    var fut2 = try io.concurrent(S.task, .{ io, @as(linux.fd_t, -1) });
+    try testing.expectError(error.Unexpected, fut2.await(io));
 }
 
 test "run: the calling thread becomes the main lane, drives the root to completion and returns its result; the root may spawn and await" {

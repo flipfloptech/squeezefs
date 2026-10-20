@@ -235,7 +235,7 @@ MISC = ["put_obj", "held_stores", "patch_writes", "own_block_dmas", "overlay_sto
         "journal_lane_park_backstop_ticks", "parked_gate_waits", "parked_gate_cold_flushes",
         "daemon_cpu_ns", "mem_budget_bytes", "mem_budget_level", "direct_device_true",
         "manager_verbs", "writer_guard_mode", "symmetric_meta"]
-FSYNC_PHASES = ["intent_barrier", "data_flush", "staged_promote", "data_barrier",
+FSYNC_PHASES = ["intent_barrier", "data_flush", "staged_promote", "staged_sync", "data_barrier",
                 "meta_publish", "meta_barrier", "extent_barrier"]
 # `fuse_op_latency_ns`'s classes (`src/fuse/handler/op_trace.zig` OpClass).
 OP_CLASSES = ["lookup", "getattr", "setattr", "mkdir", "create", "unlink", "rename", "readdir", "read", "write", "other"]

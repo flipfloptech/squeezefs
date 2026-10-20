@@ -20,12 +20,23 @@
 //! the scan's last-wins exact; a mount-recovered entry seeds the ledger at
 //! generation 0, which no live assignment can forge (the counter starts at 1
 //! — the generation ABA model below pins it).
+//!
+//! **Durability** (charter §1 item 10, the owner's ruling of 2026-10-19): a
+//! resident's bytes are the page cache's until something syncs them — the
+//! daemon's death keeps them, a power cut does not. fsync, fdatasync and
+//! syncfs make the ino's resident record reach stable storage before their
+//! ack (`Segment.syncResident` / `syncAll`): ONE ranged sync of the segment
+//! file over the record's span (`Backing.durable`), coalesced across
+//! concurrent callers by `SyncCoalescer` — every request that arrived before
+//! a sync started is answered by it, so a storm of fsyncs costs one sync
+//! per batch, never one per call.
 
 const std = @import("std");
 const testkit = @import("../core/testkit.zig");
 const fuzzkit = @import("../core/fuzzkit.zig");
 const builtin = @import("builtin");
 const linux = std.os.linux;
+const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const assert = std.debug.assert;
 
@@ -37,6 +48,8 @@ const knobs = @import("../core/knobs.zig");
 const log = @import("../core/log.zig");
 const budget = @import("../mem/budget.zig");
 const jc = @import("../meta/journal_core.zig");
+const tick = @import("../sync/tick.zig");
+const futex = @import("../sync/futex.zig");
 const layout = @import("layout.zig");
 const explorer = @import("../model/explorer.zig");
 
@@ -114,6 +127,16 @@ pub const stats = struct {
     pub var dismount_unnamed_residents_destroyed: counters.ShardedCounter = .{};
     /// `fsync_promoted_files`: promotions the fsync lever dispatched.
     pub var fsync_promoted_files: counters.ShardedCounter = .{};
+    /// The staged bytes' durability at fsync (module doc):
+    /// `staging_fsync_syncs` — ranged syncs of the segment file issued (one
+    /// per batch); `staging_fsync_bytes` — the spans they covered;
+    /// `staging_fsync_coalesced` — requests answered by a sync another
+    /// request led (requests ≡ syncs + coalesced); `staging_fsync_sync_ns`
+    /// — the wall of one sync, from issue to its completion.
+    pub var staging_fsync_syncs: counters.ShardedCounter = .{};
+    pub var staging_fsync_bytes: counters.ShardedCounter = .{};
+    pub var staging_fsync_coalesced: counters.ShardedCounter = .{};
+    pub var staging_fsync_sync_ns: counters.ShardedLatencyHistogram = .{};
     /// §J.2's ring ledger: `staging_appends` / `staging_append_bytes` — the
     /// extending writes that landed IN PLACE (bytes moved = the bytes);
     /// `staging_restages` / `staging_restage_bytes` — whole images re-staged
@@ -127,7 +150,7 @@ pub const stats = struct {
 };
 
 pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
-    try w.print("{{\"current_staged_write_bytes\":{d},\"staged_writes_in_flight\":{d},\"staging_cell_state_bytes\":{d},\"staging_tables_bytes\":{d},\"staging_over_cap_refusals\":{d},\"staging_ring_full_refusals\":{d},\"staging_pressure_kicks\":{d},\"staging_recovery_records\":{d},\"staging_recovery_torn_records\":{d},\"staging_generation_discards\":{d},\"staging_foreign_scope_refusals\":{d},\"staging_owner_live_refusals\":{d},\"staging_member_residue_roots\":{d},\"staged_payload_lost_reads\":{d},\"dismount_promoted_files\":{d},\"dismount_promoted_bytes\":{d},\"dismount_promote_failures\":{d},\"dismount_corpse_residents_destroyed\":{d},\"dismount_unnamed_residents_destroyed\":{d},\"fsync_promoted_files\":{d},\"staging_appends\":{d},\"staging_append_bytes\":{d},\"staging_restages\":{d},\"staging_restage_bytes\":{d}}}", .{
+    try w.print("{{\"current_staged_write_bytes\":{d},\"staged_writes_in_flight\":{d},\"staging_cell_state_bytes\":{d},\"staging_tables_bytes\":{d},\"staging_over_cap_refusals\":{d},\"staging_ring_full_refusals\":{d},\"staging_pressure_kicks\":{d},\"staging_recovery_records\":{d},\"staging_recovery_torn_records\":{d},\"staging_generation_discards\":{d},\"staging_foreign_scope_refusals\":{d},\"staging_owner_live_refusals\":{d},\"staging_member_residue_roots\":{d},\"staged_payload_lost_reads\":{d},\"dismount_promoted_files\":{d},\"dismount_promoted_bytes\":{d},\"dismount_promote_failures\":{d},\"dismount_corpse_residents_destroyed\":{d},\"dismount_unnamed_residents_destroyed\":{d},\"fsync_promoted_files\":{d},\"staging_fsync_syncs\":{d},\"staging_fsync_bytes\":{d},\"staging_fsync_coalesced\":{d},\"staging_appends\":{d},\"staging_append_bytes\":{d},\"staging_restages\":{d},\"staging_restage_bytes\":{d}}}", .{
         stats.current_staged_write_bytes.load(),
         stats.staged_writes_in_flight.load(),
         stats.staging_cell_state_bytes.load(),
@@ -148,6 +171,9 @@ pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
         stats.dismount_corpse_residents_destroyed.load(),
         stats.dismount_unnamed_residents_destroyed.load(),
         stats.fsync_promoted_files.load(),
+        stats.staging_fsync_syncs.load(),
+        stats.staging_fsync_bytes.load(),
+        stats.staging_fsync_coalesced.load(),
         stats.staging_appends.load(),
         stats.staging_append_bytes.load(),
         stats.staging_restages.load(),
@@ -160,6 +186,8 @@ pub fn writePhasesJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
     try stats.backing_sync_ns.snapshot().writeJson(w);
     try w.writeAll(",\"backing_reclaim\":");
     try stats.backing_reclaim_ns.snapshot().writeJson(w);
+    try w.writeAll(",\"fsync_sync\":");
+    try stats.staging_fsync_sync_ns.snapshot().writeJson(w);
     try w.writeAll("}");
 }
 
@@ -446,13 +474,24 @@ pub fn isTombstone(image: []const u8, rec_off: u64) bool {
 // §3.2 The segment — placement, two-phase replace, leases, recovery.
 // ---------------------------------------------------------------------------
 
-/// What backs the image: the Linux ring binds `msync`/`fallocate`+`madvise`;
-/// a RAM image (tests, the portable core) binds nothing.
+/// A sync of the backing file failed: the bytes are the page cache's still
+/// (the daemon serves them), but a power cut may lose them — the fsync
+/// answers EIO.
+pub const DurableError = error{InputOutput};
+
+/// What backs the image: the Linux ring binds `msync`/`fallocate`+`madvise`
+/// and the ranged sync; a RAM image (tests, the portable core) binds
+/// nothing — or a test's counting seam.
 pub const Backing = struct {
     ctx: ?*anyopaque = null,
     /// Flush `[off, off + len)` (MS_ASYNC: the write is ordered, the
     /// promotion's own DMA reads the mapping, never the file).
     sync: ?*const fn (ctx: ?*anyopaque, off: u64, len: u64) void = null,
+    /// `[off, off + len)` on stable storage before this returns (the
+    /// ranged `fdatasync` of the segment file: its dirty pages written and
+    /// waited for, the metadata that reaches them committed, the device's
+    /// cache flushed). The fsync law's leg; a caller parks through `io`.
+    durable: ?*const fn (ctx: ?*anyopaque, io: Io, off: u64, len: u64) DurableError!void = null,
     /// Return `[off, off + len)` to the host (punch + drop pages) after a
     /// tombstone; a cleanly unmounted dir scans EMPTY.
     reclaim: ?*const fn (ctx: ?*anyopaque, off: u64, len: u64) void = null,
@@ -542,6 +581,8 @@ pub const Segment = struct {
     free_cells: std.ArrayList(u32) = .empty,
     /// Placement scratch (live extents, sorted) — sized once.
     scratch: []Extent,
+    /// The fsync law's batcher over `backing.durable` (module doc).
+    durable: SyncCoalescer = .{},
 
     /// Every live or pending record occupies ≥ 1 grain of its own, so the
     /// cell population is bounded by `capacity / grain`; one more for the
@@ -620,6 +661,7 @@ pub const Segment = struct {
     }
 
     pub fn deinit(self: *Segment) void {
+        assert(self.durable.head == null and !self.durable.running);
         stats.staging_tables_bytes.sub(self.tablesBytes());
         for (self.cells) |*c| if (c.hash) |h| self.destroyState(h);
         self.index.deinit(self.gpa);
@@ -679,6 +721,38 @@ pub const Segment = struct {
         defer self.lock.unlock();
         const cell = self.index.get(key.bytes().*) orelse return null;
         return cell.extent.generation;
+    }
+
+    /// The resident record's bytes on the image — both header slots, the
+    /// key and the value, grain-rounded — or null without a resident copy.
+    pub fn residentSpan(self: *Segment, key: StagingKey) ?Span {
+        self.lock.lock();
+        defer self.lock.unlock();
+        const cell = self.index.get(key.bytes().*) orelse return null;
+        const e = cell.extent;
+        return .{ .off = e.rec_off, .len = stride(e.key_len, e.val_len) };
+    }
+
+    // ---- the fsync law (module doc) ----
+
+    /// fsync / fdatasync of `key`'s ino: its resident record on stable
+    /// storage before the return — one coalesced ranged sync over the
+    /// record's span. No resident copy (promoted, released, never staged
+    /// here) ⇒ nothing is owed. A RAM image with no `durable` binding owes
+    /// nothing either (the portable tests' segments).
+    pub fn syncResident(self: *Segment, io: Io, key: StagingKey) DurableError!void {
+        if (self.backing.durable == null) return;
+        const span = self.residentSpan(key) orelse return;
+        return self.durable.request(self, io, span);
+    }
+
+    /// syncfs: every resident record on stable storage — one coalesced
+    /// sync over the whole image (the kernel writes only its dirty pages);
+    /// an empty ring owes nothing.
+    pub fn syncAll(self: *Segment, io: Io) DurableError!void {
+        if (self.backing.durable == null) return;
+        if (self.live() == 0) return;
+        return self.durable.request(self, io, .{ .off = 0, .len = self.image.len });
     }
 
     // ---- the two-phase replace ----
@@ -1025,6 +1099,121 @@ pub const Segment = struct {
 
 pub const Resident = struct { key: StagingKey, cost: u64, generation: u64 };
 
+/// A byte range of the image.
+pub const Span = struct { off: u64, len: u64 };
+
+/// The fsync law's batcher (module doc; the journal lane's barrier law —
+/// "answered once a sync that STARTED after this request completed"): a
+/// request joins the PENDING batch (an intrusive FIFO of on-frame waiters
+/// and the union span of their records); with no sync running it leads
+/// that batch at once, else it parks. The leader issues ONE `durable` over
+/// the batch's span, hands every member its result and, if requests
+/// arrived meanwhile, makes the oldest of them the next leader (one wake
+/// per waiter, no herd) — otherwise the batcher idles. A sync in flight
+/// never covers a request that arrived after it started: the request's
+/// record may have landed after the kernel's dirty walk. Nothing is
+/// allocated: the waiter lives on the caller's frame; the lock guards the
+/// lists alone and is never held across the sync.
+pub const SyncCoalescer = struct {
+    lock: jc.SpinLock = .{},
+    /// The pending batch: requests no sync has started for.
+    head: ?*Waiter = null,
+    tail: ?*Waiter = null,
+    lo: u64 = std.math.maxInt(u64),
+    hi: u64 = 0,
+    /// A leader is between taking a batch and handing it over.
+    running: bool = false,
+
+    pub const Waiter = struct {
+        next: ?*Waiter = null,
+        /// The tick word: 0 parked, 1 woken (`tick.wake`).
+        state: std.atomic.Value(u32) = .init(0),
+        /// Under the lock: pending → leader (with `batch`/`lo`/`hi`) or done
+        /// (with `result`). Read after the wake's acquire.
+        role: enum { pending, leader, done } = .pending,
+        batch: ?*Waiter = null,
+        lo: u64 = 0,
+        hi: u64 = 0,
+        result: DurableError!void = {},
+    };
+
+    /// Pending requests (tests: the deterministic park observable).
+    pub fn pending(self: *SyncCoalescer) u32 {
+        self.lock.lock();
+        defer self.lock.unlock();
+        var n: u32 = 0;
+        var cur = self.head;
+        while (cur) |w| : (cur = w.next) n += 1;
+        return n;
+    }
+
+    pub fn request(self: *SyncCoalescer, seg: *Segment, io: Io, span: Span) DurableError!void {
+        var w: Waiter = .{};
+        self.lock.lock();
+        if (self.tail) |t| t.next = &w else self.head = &w;
+        self.tail = &w;
+        self.lo = @min(self.lo, span.off);
+        self.hi = @max(self.hi, span.off + span.len);
+        if (!self.running) {
+            self.running = true;
+            self.takeBatchLocked(&w);
+            self.lock.unlock();
+        } else {
+            self.lock.unlock();
+            // acquire (in `park`) pairs with the leader's `tick.wake`
+            // release: `role`, `result` and the batch are visible.
+            while (w.state.load(.acquire) == 0) _ = tick.parkUncancelable(io, &w.state, null);
+            if (w.role == .done) {
+                stats.staging_fsync_coalesced.inc();
+                return w.result;
+            }
+            assert(w.role == .leader);
+        }
+        return self.lead(seg, io, &w);
+    }
+
+    /// The pending batch becomes `leader`'s; the pending list empties.
+    fn takeBatchLocked(self: *SyncCoalescer, leader: *Waiter) void {
+        leader.role = .leader;
+        leader.batch = self.head;
+        leader.lo = self.lo;
+        leader.hi = self.hi;
+        self.head = null;
+        self.tail = null;
+        self.lo = std.math.maxInt(u64);
+        self.hi = 0;
+    }
+
+    fn lead(self: *SyncCoalescer, seg: *Segment, io: Io, w: *Waiter) DurableError!void {
+        const durable = seg.backing.durable.?;
+        const t0 = clock.monotonicNs();
+        const result = durable(seg.backing.ctx, io, w.lo, w.hi - w.lo);
+        stats.staging_fsync_sync_ns.record(clock.monotonicNs() - t0);
+        stats.staging_fsync_syncs.inc();
+        stats.staging_fsync_bytes.add(w.hi - w.lo);
+        self.lock.lock();
+        var cur = w.batch;
+        while (cur) |m| {
+            // A woken member returns and its frame dies: read `next` first.
+            const next = m.next;
+            if (m != w) {
+                m.result = result;
+                m.role = .done;
+                tick.wake(io, &m.state);
+            }
+            cur = next;
+        }
+        if (self.head) |successor| {
+            self.takeBatchLocked(successor);
+            tick.wake(io, &successor.state);
+        } else {
+            self.running = false;
+        }
+        self.lock.unlock();
+        return result;
+    }
+};
+
 // ---------------------------------------------------------------------------
 // §3.3–§3.4 The pool: budget, ledger, generations, the high-water.
 // ---------------------------------------------------------------------------
@@ -1307,7 +1496,11 @@ pub fn promoteAllAtDismount(gpa: Allocator, seg: *Segment, hooks: PromotionHooks
     return tally;
 }
 
-/// `SQUEEZEFS_FSYNC_PROMOTE_STAGED`: fsync of a staged file also promotes it.
+/// `SQUEEZEFS_FSYNC_PROMOTE_STAGED`: the alternative posture of the fsync
+/// law — fsync of a staged file PROMOTES it (the bytes leave the ring for
+/// the data volume, visible to every client; the data barrier covers the
+/// block) instead of syncing its ring record in place; off (shipped) the
+/// record stays staged and the ranged sync makes it durable.
 pub const FsyncLever = struct {
     on: bool,
 
@@ -1317,7 +1510,8 @@ pub const FsyncLever = struct {
 };
 
 /// The fsync point: iff the lever is on, promote BEFORE the data barrier
-/// (so the barrier covers the block). A failure never fails the fsync.
+/// (so the barrier covers the block). A failure never fails the fsync: the
+/// entry stays resident and the ranged sync that follows makes it durable.
 pub fn promoteAtFsync(lever: FsyncLever, hooks: PromotionHooks, key: StagingKey) void {
     if (!lever.on) return;
     const promote = hooks.promote orelse return;
@@ -1325,7 +1519,8 @@ pub fn promoteAtFsync(lever: FsyncLever, hooks: PromotionHooks, key: StagingKey)
 }
 
 /// The syncfs point: `promoteAtFsync` for EVERY resident entry (the lever
-/// gates it the same way; a failure leaves the entry resident).
+/// gates it the same way; a failure leaves the entry resident for the
+/// whole-ring sync that follows).
 pub fn promoteAllAtSyncfs(gpa: Allocator, lever: FsyncLever, seg: *Segment, hooks: PromotionHooks) Allocator.Error!void {
     if (!lever.on) return;
     if (hooks.promote == null) return;
@@ -1626,6 +1821,7 @@ pub const GenerationAbaModel = struct {
 
 pub const Ring = if (builtin.os.tag == .linux) struct {
     const uring_fs = @import("../io/uring_fs.zig");
+    const sqz_io = @import("../exec/sqz_io.zig");
 
     /// Plaintext user payload on passthrough volumes and every staged key
     /// in the headers: private to the daemon's uid.
@@ -1652,6 +1848,23 @@ pub const Ring = if (builtin.os.tag == .linux) struct {
             stats.backing_sync_ns.record(clock.monotonicNs() - t0);
         }
 
+        /// The fsync law's sync (`Backing.durable`): `IORING_OP_FSYNC` over
+        /// the span on the caller's lane ring — the ranged `vfs_fsync_range`
+        /// a shared mapping's `msync(MS_SYNC)` runs, with the fiber parked
+        /// instead of the lane thread (`SqzIo.fsyncRange`). Measured on
+        /// this host (`docs/evidence/rung-10-staged-fsync-durability.md`):
+        /// the range costs what a whole-file `fdatasync` costs on a clean
+        /// ring and never pays for another writer's unsynced pages where
+        /// the host filesystem honours it (ext4: 1.0 vs 2.8 ms under 64
+        /// dirty pages).
+        fn durable(ctx: ?*anyopaque, io: Io, off: u64, len: u64) DurableError!void {
+            const self: *MappedSegment = @ptrCast(@alignCast(ctx.?));
+            sqz_io.SqzIo.fsyncRange(io, self.fd, off, len) catch |e| {
+                log.err("staging segment: the ranged sync of [{d}, +{d}) failed ({s}) — the staged bytes stay the page cache's (served, not power-cut durable); the fsync answers EIO", .{ off, len, @errorName(e) });
+                return error.InputOutput;
+            };
+        }
+
         /// Punch the hole (the host reclaims the blocks) and drop the pages
         /// (the RSS the dead extent held); neither is correctness — a
         /// tombstoned record is never adopted — so their errnos are ignored.
@@ -1676,7 +1889,7 @@ pub const Ring = if (builtin.os.tag == .linux) struct {
         }
 
         pub fn backing(self: *MappedSegment) Backing {
-            return .{ .ctx = self, .sync = sync, .reclaim = reclaim, .nextData = nextData };
+            return .{ .ctx = self, .sync = sync, .reclaim = reclaim, .nextData = nextData, .durable = durable };
         }
 
         /// The census face of an `inspectSegment` view: hole-skipping
@@ -2616,6 +2829,164 @@ test "the three promotion points: pressure rides stageWrite; the dismount pass j
     try testing.expectEqual(@as(u32, 3), kicks.promoted);
 }
 
+/// The fsync law's counting seam: every `durable` call recorded; `hold`
+/// parks the call until the test releases it (the in-flight sync a storm
+/// piles up behind); `fail_next` answers one call EIO.
+const SyncSeam = struct {
+    calls: std.ArrayList(Span) = .empty,
+    hold: futex.Word = .init(0),
+    in_flight: std.atomic.Value(u32) = .init(0),
+    fail_next: bool = false,
+
+    fn backing(self: *SyncSeam) Backing {
+        return .{ .ctx = self, .durable = durable };
+    }
+
+    fn durable(ctx: ?*anyopaque, _: Io, off: u64, len: u64) DurableError!void {
+        const self: *SyncSeam = @ptrCast(@alignCast(ctx.?));
+        _ = self.in_flight.fetchAdd(1, .acq_rel);
+        defer _ = self.in_flight.fetchSub(1, .acq_rel);
+        while (self.hold.load(.acquire) != 0) futex.wait(&self.hold, 1);
+        self.calls.append(testing.allocator, .{ .off = off, .len = len }) catch @panic("OOM");
+        if (self.fail_next) {
+            self.fail_next = false;
+            return error.InputOutput;
+        }
+    }
+
+    fn release(self: *SyncSeam) void {
+        self.hold.store(0, .release);
+        futex.wakeAll(&self.hold);
+    }
+};
+
+test "the fsync law (charter §1 item 10, 2026-10-19): fsync of a resident issues ONE ranged sync covering exactly its record — both header slots, the key and the value, grain-rounded —, counted with its bytes; a key with no resident issues none; a RAM image with no durable binding owes nothing; syncfs syncs the whole image once and an empty ring not at all; a failed sync is the caller's EIO" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var seam: SyncSeam = .{};
+    defer seam.calls.deinit(gpa);
+    const image = try gpa.alloc(u8, 64 * 4096);
+    defer gpa.free(image);
+    @memset(image, 0);
+    var seg = try Segment.init(gpa, image, seam.backing());
+    defer seg.deinit();
+    const v: [5000]u8 = @splat(0x42);
+    try seg.put(tkey(1, 11), &v, 7, 0, 0);
+    const syncs0 = stats.staging_fsync_syncs.load();
+    const bytes0 = stats.staging_fsync_bytes.load();
+    const co0 = stats.staging_fsync_coalesced.load();
+    const hist0 = stats.staging_fsync_sync_ns.snapshot().count;
+    // The record: headers + key in the first grain, 5000 B of value in two
+    // more — exactly the stride.
+    try seg.syncResident(io, tkey(1, 11));
+    try testing.expectEqual(@as(usize, 1), seam.calls.items.len);
+    const span = seg.residentSpan(tkey(1, 11)).?;
+    try testing.expectEqual(span, seam.calls.items[0]);
+    try testing.expectEqual(stride(KEY_LEN, 5000), span.len);
+    try testing.expectEqual(syncs0 + 1, stats.staging_fsync_syncs.load());
+    try testing.expectEqual(bytes0 + span.len, stats.staging_fsync_bytes.load());
+    try testing.expectEqual(co0, stats.staging_fsync_coalesced.load());
+    try testing.expectEqual(hist0 + 1, stats.staging_fsync_sync_ns.snapshot().count);
+    // No resident under the key: nothing owed, nothing issued.
+    try seg.syncResident(io, tkey(2, 22));
+    try testing.expectEqual(@as(usize, 1), seam.calls.items.len);
+    try testing.expect(seg.residentSpan(tkey(2, 22)) == null);
+    // syncfs: the whole image, once; empty ⇒ nothing.
+    try seg.syncAll(io);
+    try testing.expectEqual(@as(usize, 2), seam.calls.items.len);
+    try testing.expectEqual(Span{ .off = 0, .len = image.len }, seam.calls.items[1]);
+    try testing.expect(seg.remove(tkey(1, 11), 7));
+    try seg.syncAll(io);
+    try testing.expectEqual(@as(usize, 2), seam.calls.items.len);
+    // A failed sync: EIO to the caller; the next one is clean again.
+    try seg.put(tkey(3, 33), &v, 8, 0, 0);
+    seam.fail_next = true;
+    try testing.expectError(error.InputOutput, seg.syncResident(io, tkey(3, 33)));
+    try seg.syncResident(io, tkey(3, 33));
+    try testing.expectEqual(@as(usize, 4), seam.calls.items.len);
+    // A RAM image with no binding (the portable tests' segments).
+    var r = try ramSegment(gpa, 16 * 4096);
+    defer gpa.free(r.image);
+    defer r.seg.deinit();
+    try r.seg.put(tkey(4, 44), &v, 9, 0, 0);
+    const syncs1 = stats.staging_fsync_syncs.load();
+    try r.seg.syncResident(io, tkey(4, 44));
+    try r.seg.syncAll(io);
+    try testing.expectEqual(syncs1, stats.staging_fsync_syncs.load());
+}
+
+test "the sync coalescer: a sync in flight absorbs every request that arrives meanwhile into ONE following sync over their union span — 1 + 16 requests cost 2 syncs with 15 coalesced; the leader returns on its own sync; a failure reaches every member of its batch and no other" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var seam: SyncSeam = .{};
+    defer seam.calls.deinit(gpa);
+    const image = try gpa.alloc(u8, 256 * 4096);
+    defer gpa.free(image);
+    @memset(image, 0);
+    var seg = try Segment.init(gpa, image, seam.backing());
+    defer seg.deinit();
+    const v: [100]u8 = @splat(0x11);
+    const n = 16;
+    var i: u64 = 0;
+    while (i <= n) : (i += 1) try seg.put(tkey(@intCast(i), i + 1), &v, i + 1, 0, 0);
+    const Req = struct {
+        fn run(s: *Segment, io_: Io, key: StagingKey, out: *anyerror!void) void {
+            out.* = s.syncResident(io_, key);
+        }
+    };
+    const syncs0 = stats.staging_fsync_syncs.load();
+    const co0 = stats.staging_fsync_coalesced.load();
+    // The leader's sync is held in flight; sixteen more arrive and park.
+    seam.hold.store(1, .release);
+    var results: [n + 1]anyerror!void = undefined;
+    var group: Io.Group = .init;
+    group.async(io, Req.run, .{ &seg, io, tkey(0, 1), &results[0] });
+    while (seam.in_flight.load(.acquire) == 0) try std.Thread.yield();
+    i = 1;
+    while (i <= n) : (i += 1) group.async(io, Req.run, .{ &seg, io, tkey(@intCast(i), i + 1), &results[i] });
+    while (seg.durable.pending() != n) try std.Thread.yield();
+    try testing.expectEqual(@as(usize, 0), seam.calls.items.len);
+    seam.release();
+    group.await(io) catch |e| switch (e) {
+        error.Canceled => unreachable,
+    };
+    for (results) |r| try r;
+    // Two syncs: the leader's own record, then ONE over the sixteen.
+    try testing.expectEqual(@as(usize, 2), seam.calls.items.len);
+    try testing.expectEqual(seg.residentSpan(tkey(0, 1)).?, seam.calls.items[0]);
+    var lo: u64 = std.math.maxInt(u64);
+    var hi: u64 = 0;
+    i = 1;
+    while (i <= n) : (i += 1) {
+        const s = seg.residentSpan(tkey(@intCast(i), i + 1)).?;
+        lo = @min(lo, s.off);
+        hi = @max(hi, s.off + s.len);
+    }
+    try testing.expectEqual(Span{ .off = lo, .len = hi - lo }, seam.calls.items[1]);
+    try testing.expectEqual(syncs0 + 2, stats.staging_fsync_syncs.load());
+    try testing.expectEqual(co0 + n - 1, stats.staging_fsync_coalesced.load());
+    try testing.expectEqual(@as(u32, 0), seg.durable.pending());
+    try testing.expect(!seg.durable.running);
+    // A failure reaches its batch alone: the held leader's batch fails,
+    // the followers' batch (its own sync) succeeds.
+    seam.hold.store(1, .release);
+    seam.fail_next = true;
+    var group2: Io.Group = .init;
+    group2.async(io, Req.run, .{ &seg, io, tkey(0, 1), &results[0] });
+    while (seam.in_flight.load(.acquire) == 0) try std.Thread.yield();
+    i = 1;
+    while (i <= 3) : (i += 1) group2.async(io, Req.run, .{ &seg, io, tkey(@intCast(i), i + 1), &results[i] });
+    while (seg.durable.pending() != 3) try std.Thread.yield();
+    seam.release();
+    group2.await(io) catch |e| switch (e) {
+        error.Canceled => unreachable,
+    };
+    try testing.expectError(error.InputOutput, results[0]);
+    i = 1;
+    while (i <= 3) : (i += 1) try results[i];
+    try testing.expectEqual(@as(usize, 4), seam.calls.items.len);
+}
+
 test "the residents census under stages landing: sized and filled under ONE lock hold, every census is whole — a census sized by live() and filled after met a stage in between one entry past its buffer (xfstests generic/013: fsstress's sync under four writers, syncfs's promote pass)" {
     const gpa = testing.allocator;
     var r = try ramSegment(gpa, 8192 * 4096);
@@ -2784,7 +3155,14 @@ test "stats JSON names every instrument" {
     try testing.expect(std.mem.indexOf(u8, out, "\"staging_cell_state_bytes\":") != null);
     try testing.expect(std.mem.indexOf(u8, out, "\"staging_tables_bytes\":") != null);
     try testing.expect(std.mem.indexOf(u8, out, "\"staged_payload_lost_reads\":") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "\"staging_fsync_syncs\":") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "\"staging_fsync_bytes\":") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "\"staging_fsync_coalesced\":") != null);
     try testing.expect(std.mem.endsWith(u8, out, "}"));
+    var pbuf: [4096]u8 = undefined;
+    var pw: std.Io.Writer = .fixed(&pbuf);
+    try writePhasesJson(&pw);
+    try testing.expect(std.mem.indexOf(u8, pw.buffered(), "\"fsync_sync\":") != null);
 }
 
 fn recordFuzz(_: void, smith: *std.testing.Smith) !void {
@@ -2910,6 +3288,13 @@ test "linux: a ring under a tmp dir — 0700/0600 modes, mmap put/get, a remount
     const l = seg.get(tkey(1, 11)).?;
     try testing.expectEqualSlices(u8, &v, l.bytes());
     l.release();
+    // The fsync law's sync through the real binding (off a lane: the raw
+    // fdatasync), counted with the record's span.
+    const syncs0 = stats.staging_fsync_syncs.load();
+    const bytes0 = stats.staging_fsync_bytes.load();
+    try seg.syncResident(testing.io, tkey(1, 11));
+    try testing.expectEqual(syncs0 + 1, stats.staging_fsync_syncs.load());
+    try testing.expectEqual(bytes0 + stride(KEY_LEN, 5000), stats.staging_fsync_bytes.load());
     try seg.put(tkey(2, 22), "two", 8, 0, 0);
     try testing.expect(seg.remove(tkey(2, 22), 8));
     seg.deinit();

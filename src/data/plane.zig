@@ -1618,13 +1618,17 @@ pub const DataPlane = struct {
         return self.wp.holdsCustody(ino);
     }
 
-    /// fsync (charter §6.4) through `fsync.zig`'s legs; the meta barrier is
-    /// the backend's coalesced barrier.
+    /// fsync (charter §6.4) through `fsync.zig`'s legs — the staged leg
+    /// over this ring (`staged_key` names the ino's resident record); the
+    /// meta barrier is the backend's coalesced barrier.
     pub fn fsync(self: *DataPlane, io: Io, ino: u64, staged_key: ?staging.StagingKey) Error!void {
         var ctx = self.wp.fsyncCtx();
         ctx.meta_sync = .{ .ctx = self, .sync = &metaSync };
         ctx.staged_key = staged_key;
-        if (self.stage) |*st| ctx.promotion = st.pool.hooks;
+        if (self.stage) |*st| {
+            ctx.promotion = st.pool.hooks;
+            ctx.staged_segment = &st.seg;
+        }
         var prof = fsync_mod.Prof.start();
         defer prof.finish();
         fsync_mod.fsync(ctx, io, ino, &prof) catch |e| return switch (e) {

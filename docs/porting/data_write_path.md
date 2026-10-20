@@ -1090,7 +1090,8 @@ pinned (`:83-89`).
 `FsyncPhase { IntentBarrier=0, DataFlush=1, StagedPromote=2, DataBarrier=3,
 MetaPublish=4, MetaBarrier=5, ExtentBarrier=6, Total=7 }`, names
 `intent_barrier/data_flush/staged_promote/data_barrier/meta_publish/meta_barrier/
-extent_barrier/total` (`:314-323`). `FsyncProf::mark(phase)` records the span since
+extent_barrier/total` (`:314-323`). **Zig adds `staged_sync`** between `staged_promote` and
+`data_barrier` (the staged record's ranged sync, below); `fuse_syncfs_phase_ns` carries it too. `FsyncProf::mark(phase)` records the span since
 the previous boundary and moves it; `Drop` records 0 ns for every unmarked leg and
 `total = last − t0` ⇒ `Σ phases ≡ total` to the nanosecond on every exit, equal
 counts per phase (`:340-369`).
@@ -1109,10 +1110,20 @@ DATA FLUSH: flush_memory_buffers_driven(FsyncDurable) + flush_active_blocks_with
    → the step once more                                       → mark DataFlush
 STAGED PROMOTE (lever OFF by default; promote_staged_file dispatches on size)
                                                                → mark StagedPromote
-DATA BARRIER: step = fsync_barrier_step(ino, touched_lever); legs = staging sync_key
-   (file_id) + one dev.flush() per target; legs ≥ 2 ∧ parallel ⇒ join_all, every leg
-   to completion, first error wins (never cancel a sibling — a dropped barrier future
-   fails the coalescer's queued waiters); barrier_out?; fsync_barrier_done(observed)
+STAGED SYNC [Zig; charter §1 item 10, 2026-10-19; 0002 row 549]: the ino's resident ring
+   record on stable storage — Segment.syncResident: ONE IORING_OP_FSYNC|DATASYNC over the
+   record's span on the handler fiber's lane ring (vfs_fsync_range, what msync(MS_SYNC)
+   runs), coalesced across concurrent fsyncs by SyncCoalescer (every request that arrived
+   before a sync started is answered by it; leadership handed to the oldest pending); a
+   promoted record (the lever) owes none; a failure is EIO. The reference's leg was
+   `staging.sync_key(file_id)` = NvmeShard::sync_all = File::sync_all() of the WHOLE shard
+   on the blocking pool per call, uncoalesced (R/fuse_client.rs:23420-23460,
+   R/tiering/nvme.rs:1214,1723) — the port had dropped it; syncfs syncs the whole ring once
+   (Segment.syncAll).                                          → mark StagedSync
+DATA BARRIER: step = fsync_barrier_step(ino, touched_lever); legs = one dev.flush() per
+   target (the reference joined the staging leg here); legs ≥ 2 ∧ parallel ⇒ join_all,
+   every leg to completion, first error wins (never cancel a sibling — a dropped barrier
+   future fails the coalescer's queued waiters); barrier_out?; fsync_barrier_done(observed)
                                                                → mark DataBarrier
 META PUBLISH: close_rewrite_epoch(ino, token)?; persist_dirty_layout_if_needed?
                                                                → mark MetaPublish
@@ -1126,7 +1137,9 @@ that name the blocks; a failed leg fails the fsync with the touched bits left se
 (`:23246-23250`). Counters: `fsync_calls`, `fsync_data_namespaces_{touched,flushed}`,
 `fsync_write_through_skips`, `fsync_noop_clean` (no legs, nothing touched),
 `fsync_parallel_joins`, `fsync_promoted_{files,inline_files,bytes}`,
-`fsync_promote_{failures,noops}`, `fsync_flush_enospc_retries`.
+`fsync_promote_{failures,noops}`, `fsync_flush_enospc_retries`; Zig's staged leg:
+`staging_fsync_{syncs,bytes,coalesced}` (requests ≡ syncs + coalesced) and the
+`staging_fsync_sync_ns` histogram (`staging_backing_phase_ns.fsync_sync`).
 
 ### 10.3 The per-ino stripe word (`TouchedTable`, `fsync_economy.rs:130-219`)
 
@@ -1177,7 +1190,7 @@ namespaces are `write_through_skips`.
 | `SQUEEZEFS_WRITE_GUARD_NARROW` | bool, on (`:221`) | **R:** second shared-mode lever (ledger 85) | not carried |
 | `SQUEEZEFS_FSYNC_TOUCHED_NAMESPACES` | bool, on (`:252`) | A/B lever | barrier only touched namespaces |
 | `SQUEEZEFS_FSYNC_PARALLEL_LEGS` | bool, on (`:253`) | A/B lever | joined legs |
-| `SQUEEZEFS_FSYNC_PROMOTE_STAGED` | bool, off (`:254`) | A/B lever (measured +26 % per fsync unconditional) | fsync promotes staged |
+| `SQUEEZEFS_FSYNC_PROMOTE_STAGED` | bool, off (`:254`) | A/B lever (measured +26 % per fsync unconditional) | the alternative posture: fsync promotes staged instead of the in-place ranged sync |
 | `SQUEEZEFS_TEST_UPLOAD_STALL_MS` / `_WRITE_STALL_MS` / `_INVAL_TAIL_STALL_MS` / `_CHECKOUT_STALL_MS` / `_ROUTER_DISPATCH_STALL_MS` / `_ATTR_PUBLISH_STALL_MS` | int ms, 0 (`:396-404`) | `SQUEEZEFS_TEST_*` seams | the pinned windows |
 | `SQUEEZEFS_TEST_OVERLAY_BYTES` | bool, 0 (`:409`) | seam | Bytes vehicle on with overlay off |
 | `SQUEEZEFS_TEST_OVERLAY_CAPTURE_STALL_MS`, `set_test_settle_transient_failures` | cell / seam | seams | §5.1 interleave pin; injected settle transients |

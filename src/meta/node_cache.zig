@@ -973,12 +973,16 @@ pub const CachedNode = struct {
             }
             dirty.head_bytes += r.headBytes();
             dirty.overlay_bytes += r.recordRef().encodedLen();
-            // Run-precedence guard: mount replay applies ORIGINAL seqs,
-            // which may sort below records already published. Fold order
-            // requires "tail ≥ stable per key", so a non-monotonic apply
-            // re-merges the whole overlay into a fresh stable run instead
-            // of riding the tail (replay-only cost, bounded by the window).
-            const monotonic = r.seq > dirty.max_applied_seq;
+            // Run-precedence guard: fold order requires "tail ≥ stable PER
+            // KEY" (the tail is a `(key, seq)` run of its own), so a
+            // record older than its key's newest stable record re-merges
+            // the whole overlay into a fresh stable run instead of riding
+            // the tail: mount replay's original seqs, and a window applied
+            // after a later one that carried the same key (two windows in
+            // flight share a key only under a SHARED guard — a Δ merge;
+            // §AW). A record older than another KEY's is free: the tail
+            // insert is sorted.
+            const monotonic = r.seq > dirty.max_applied_seq or r.seq > newestStableSeqOf(dirty, r.key.slice());
             dirty.max_applied_seq = @max(dirty.max_applied_seq, r.seq);
             if (monotonic) {
                 const tpos = std.sort.partitionPoint(OwnedRec, dirty.snap_tail.items, KeySeq{ .k = r.key.slice(), .seq = r.seq }, keySeqLessEq);
@@ -1021,6 +1025,14 @@ pub const CachedNode = struct {
         var i = end;
         while (i > 0 and std.mem.eql(u8, items[i - 1].key.slice(), k)) i -= 1;
         return i;
+    }
+
+    /// The newest seq the STABLE mirror holds for `k` (0 when none): the
+    /// per-key bound a tail insert must exceed.
+    fn newestStableSeqOf(dirty: *const NodeDirty, k: []const u8) u64 {
+        const recs = dirty.snap_stable.value.recs;
+        const g = snapshot.runGroup(recs, k);
+        return if (g.hi > g.lo) recs[g.hi - 1].seq else 0;
     }
 
     /// Writer-side fold of "everything older than the record being applied"

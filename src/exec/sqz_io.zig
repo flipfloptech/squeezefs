@@ -573,6 +573,18 @@ pub const SqzIo = struct {
         return spawnTyped(self.pickMeta() orelse abortAllDead("meta"), function, args, .unblocked);
     }
 
+    /// A GROUP member on the `sqz-meta` pool, round-robin (the conveyor's
+    /// applier fibers, decision 0003 §AW): fire-and-forget, joined through
+    /// the group at teardown.
+    pub fn spawnMetaGroup(self: *SqzIo, g: *Io.Group, comptime function: anytype, args: std.meta.ArgsTuple(@TypeOf(function))) Io.ConcurrentError!void {
+        return self.spawnGroupOn(self.pickMeta() orelse return error.ConcurrencyUnavailable, g, function, args);
+    }
+
+    /// The pool's width (the applier venue's parallelism).
+    pub fn metaLaneCount(self: *const SqzIo) u32 {
+        return self.meta_count;
+    }
+
     /// The lease lane (the heartbeat venue).
     pub fn spawnLease(self: *SqzIo, comptime function: anytype, args: std.meta.ArgsTuple(@TypeOf(function))) Io.ConcurrentError!Io.Future(ReturnOf(function)) {
         const idx = self.lease_index orelse return error.ConcurrencyUnavailable;

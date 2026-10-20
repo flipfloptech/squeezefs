@@ -407,6 +407,10 @@ pub const KvBackend = struct {
     /// the election winner, joined through its group at `close`.
     pass_fiber: ?*exec.fiber.Fiber = null,
     pass_group: Io.Group = .init,
+    /// The applier fibers' group (decision 0003 §AW): joined at close,
+    /// after the conveyor's quiesce (no window in flight ⇒ every applier
+    /// has returned).
+    apply_group: Io.Group = .init,
     pass_stop: std.atomic.Value(bool) = .init(false),
     ino: inos.InoWatermark,
     replay: ReplayStats,
@@ -740,6 +744,7 @@ pub const KvBackend = struct {
             .door = be.slots.doorSeam(),
             .window_hold = conveyor.windowHoldFor(flush_ms),
             .caller = .{ .idle = exec.lane.laneIdleBesidesCaller, .polls = exec.lane.lanePolls },
+            .applier = be.applierSeam(opts.env),
         });
         errdefer be.cv.deinit();
         try be.startPass();
@@ -1118,6 +1123,7 @@ pub const KvBackend = struct {
             .caller = .{ .idle = exec.lane.laneIdleBesidesCaller, .polls = exec.lane.lanePolls },
             .pre_admission = .{ .ctx = &js.park_gate, .wait = joinedPreAdmission },
             .window_hold = conveyor.windowHoldFor(flush_ms),
+            .applier = be.applierSeam(opts.env),
         });
         errdefer be.cv.deinit();
         try be.startPass();
@@ -1542,6 +1548,40 @@ pub const KvBackend = struct {
             if (!ticked) _ = f.lane.timers.cancel(f);
             if (ticked and be.cv.leaderHeld()) be.cv.noteVenueTickRescue();
         }
+    }
+
+    /// The applier venue (decision 0003 §AW; `SQUEEZEFS_META_APPLIERS`, 0 =
+    /// the inline control arm, shipped): a window's RAM apply, encode and
+    /// submit as a group fiber on one of N handler lanes (`sqz-fuse-ln<i>`:
+    /// one per CPU, idle while the drain workers run the handlers on their
+    /// own lanes; the `sqz-meta` pool where there are none — the tests —
+    /// which the reclaim's destroy batches share: unlinks ran at half speed
+    /// with the appliers queued behind them). A refused spawn applies
+    /// inline.
+    fn applierSeam(be: *KvBackend, env: *const std.process.Environ.Map) conveyor.ApplySeam {
+        const n = knobs.intKnob("SQUEEZEFS_META_APPLIERS", u32, env);
+        if (n == 0) return conveyor.inline_applier;
+        return .{ .ctx = be, .spawn = &spawnApplier, .parallelism = n };
+    }
+
+    fn spawnApplier(ctx: *anyopaque, w: *conveyor.Window) bool {
+        const be: *KvBackend = @ptrCast(@alignCast(ctx));
+        const sqz = exec.SqzIo.fromIo(be.io);
+        // A FIXED set of lanes, the venue's width wide, chosen by the
+        // window's affinity (its parent-side tree): the appliers' caches
+        // stay warm (the rotation over every handler lane spread the
+        // windows over 32 idle threads and doubled the apply's CPU), and
+        // the windows of one hot directory queue on one lane instead of
+        // handing its leaf lock between lanes (a shared directory's
+        // creates ran 0.84× with the round-robin).
+        const fuse = sqz.fuseLanes();
+        const lane = if (fuse.len == 0) sqz.homeLane(null, null) else blk: {
+            const k = @min(fuse.len, be.cv.deps.applier.parallelism);
+            const l = fuse[@intCast(w.affinity % k)];
+            break :blk if (l.alive.load(.acquire)) l else sqz.homeLane(null, null);
+        };
+        sqz.spawnGroupOn(lane, &be.apply_group, conveyor.Conveyor.applyWindow, .{ be.cv, w }) catch return false;
+        return true;
     }
 
     /// `conveyor.PassSeam.wake`: the election winner's one wake, from any
@@ -2782,9 +2822,11 @@ pub const KvBackend = struct {
             }
             be.cv.close();
             // Nothing queued, no leader, no window in flight: the registry
-            // holds no user reservation past this point.
+            // holds no user reservation past this point, and every applier
+            // fiber has returned (the group join is the witness).
             be.cv.quiesce();
             be.stopPass();
+            exec.group.awaitGroup(&be.apply_group, exec.lane.currentFiber(), &.{}) catch {};
             // The slot cadence's flight joined while the task and the lane
             // still serve its cycles.
             be.slots.quiesce();
@@ -3815,6 +3857,60 @@ test "4-thread commit storm with concurrent checkpoints, then reopen: every ack 
         try testing.expectEqual(@as(u64, 0), cs.commit_parked.load());
         try testing.expectEqual(@as(u64, 0), be.cache.heapPromised());
         std.debug.print("\nstorm: {d} commits in {d} passes (group-size buckets 1:{d} 2:{d} 3:{d} 4:{d} ≤8:{d} >8:{d}), windows hwm {d}, lane parks {d}\n", .{ threads * per_thread, cs.leader_passes.load(), cs.group_size.load(0), cs.group_size.load(1), cs.group_size.load(2), cs.group_size.load(3), cs.group_size.load(4) + cs.group_size.load(5) + cs.group_size.load(6) + cs.group_size.load(7), cs.group_size.load(8) + cs.group_size.load(9) + cs.group_size.load(10) + cs.group_size.load(11), cs.windows_inflight_hwm.load(), be.laneSnapshot().parks });
+        be.close();
+    }
+    {
+        const be = try v.open();
+        defer be.close();
+        try testing.expect(be.replayStats().clean_unmount);
+        for (acked) |lane_acks| for (lane_acks) |ino| try testing.expect(try present(be, ino));
+    }
+}
+
+// Decision 0003 §AW: the applier venue's arm of the lever — every window's
+// RAM apply, encode and submit run on an applier fiber off the journal
+// lane (the `sqz-meta` pool here: no handler lanes), two of them in
+// parallel, windows handed off before they are applied and possibly
+// applied out of reservation order (the per-key tail fast path, the lane's
+// late-predecessor fold); the contract is the serial pass's.
+test "§AW the applier venue (SQUEEZEFS_META_APPLIERS=2): a 4-thread storm with concurrent checkpoints — every ack present, drained ≡ acked, no window or applier left, the promises closed, the reopen replays every acked record; the appliers ran every window (the pass applied none inline past the alone ones)" {
+    const gpa = testing.allocator;
+    const v = try TestVol.create(gpa, "storm-appliers", "20");
+    defer v.destroy();
+    try v.env.put("SQUEEZEFS_META_APPLIERS", "2");
+    const threads = 4;
+    const per_thread = 60;
+    var acked: [threads][per_thread]u64 = undefined;
+    {
+        const be = try v.open();
+        try testing.expectEqual(@as(u32, 2), be.cv.deps.applier.parallelism);
+        const Storm = struct {
+            fn run(b: *KvBackend, lane_id: usize, out: *[per_thread]u64) void {
+                for (0..per_thread) |i| {
+                    var nb: [24]u8 = undefined;
+                    const n = std.fmt.bufPrint(&nb, "applied-{d}-{d}", .{ lane_id, i }) catch unreachable;
+                    out[i] = commitCreate(b, n) catch unreachable;
+                    if (i % 20 == 19) b.checkpointNow() catch unreachable;
+                }
+            }
+        };
+        var handles: [threads]std.Thread = undefined;
+        for (&handles, 0..) |*h, i| h.* = try std.Thread.spawn(.{}, Storm.run, .{ be, i, &acked[i] });
+        for (handles) |h| h.join();
+        for (acked) |lane_acks| for (lane_acks) |ino| try testing.expect(try present(be, ino));
+        const cs = be.conveyorStats();
+        try testing.expectEqual(threads * per_thread + guard.gate.OPEN_COMMITS, cs.acks.load());
+        try testing.expectEqual(@as(u64, 0), cs.refusals.load());
+        try testing.expectEqual(cs.drained_txs.load(), cs.acks.load() + cs.refusals.load());
+        try testing.expectEqual(cs.lane_handoffs.load(), be.laneSnapshot().lane_writes);
+        try testing.expectEqual(@as(u64, 0), cs.windows_inflight.load());
+        try testing.expectEqual(@as(u32, 0), be.cv.in_apply.load(.acquire));
+        try testing.expectEqual(@as(u64, 0), cs.queued.load());
+        try testing.expectEqual(@as(u64, 0), cs.commit_parked.load());
+        try testing.expectEqual(@as(u64, 0), be.cache.heapPromised());
+        // Every window's apply leg was recorded (the inline arm records it
+        // too: the phase is the applier's wherever it ran).
+        try testing.expectEqual(cs.lane_handoffs.load(), cs.apply_total.snapshot().count);
         be.close();
     }
     {

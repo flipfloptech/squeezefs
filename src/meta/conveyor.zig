@@ -19,29 +19,39 @@
 //! The pass (`runScheduledPass`) runs until the queue is empty and
 //! leadership is released (`unleadAndRecheck`). On a mounted volume the
 //! pass is a fiber on the volume's journal lane (`backend.zig`; charter
-//! §5.2 "both stages on ONE OS thread per writable volume", decision 0002
-//! row 6): stage A hands its window to stage B on the SAME thread, so a
-//! task wake and a device CQE are one `io_uring_enter` wait. The portable
-//! contracts below bind the seam to an inline call.
+//! §5.2, decision 0002 row 6): it orders, admits and reserves on the
+//! thread that owns the ring; since decision 0003 §AW the RAM apply, the
+//! encode and the submit are an APPLIER's — a fiber the pass spawns per
+//! window on the applier venue (the backend: a fixed set of handler lanes,
+//! `applierParallelism` wide) — so the lane's serial work per tx is the
+//! reservation and the ack, and the applies of several windows overlap on
+//! other cores. The portable contracts bind the pass seam to an inline
+//! call and the applier to the pass's own thread (stage A whole, as the
+//! reference ran it).
 //!
-//! Stage A per drained batch, the survey's 14 steps:
+//! Stage A per drained batch, the survey's 14 steps in §AW's order:
 //!   A0 drain (caps: `max(64, cpus × 2)` txs / `max(256 KiB, ring/16)`
 //!   bytes clamped to the ring's admissible capacity; NO timers) → A1 the
 //!   liveness flags → A2 ONE ring admission for Σ sizes BEFORE any node
 //!   lock (a parked committer holds no node lock; the park kicks the
 //!   checkpoint task with the park mark and escalates through the
-//!   journal-failure lattice past `PARK_ESCALATION_NS`) → A3 resolve every
-//!   record's leaf latch-free → A4 lock the UNION ascending by address,
-//!   deduped → A5 revalidate every member (any member moved ⇒ drop ALL,
-//!   re-resolve ALL) → A6 heap admission (`heap_law.admitHeapLocked`: a
-//!   refused member answers `NoSpace`; one retry behind ≤ 2 return-room
-//!   cycles when budget can return) → A7 pre-images, first touch per
-//!   `(tree, key)` → A8 ONE contiguous reservation inside the window, per-tx
-//!   seqs stamped back-to-back → A9 apply in queue order (a member whose
-//!   apply fails is rolled OUT in-window and fails alone) → A10 the
-//!   writeback threshold → unlock → A11 the threshold kick → A12 SUBMIT the
-//!   survivors as ordinary checksummed entries in the one reservation (no
-//!   mega-entry) → A13 hand the window to stage B.
+//!   journal-failure lattice past `PARK_ESCALATION_NS`) → A8 ONE
+//!   contiguous reservation, per-tx seqs stamped back-to-back (the
+//!   registry's open entry holds the checkpoint tail back until the lane
+//!   completes it, after the apply and the landing) → the handoff to the
+//!   applier, which runs: A3 resolve every record's leaf latch-free → A4
+//!   lock the UNION ascending by address, deduped → A5 revalidate every
+//!   member (any member moved ⇒ drop ALL, re-resolve ALL; the seqs are the
+//!   window's) → A7 pre-images, first touch per `(tree, key)` → A9 apply
+//!   in queue order (a member whose apply fails is rolled OUT in-window and
+//!   its range is left an unwritten hole) → A10 the writeback threshold →
+//!   unlock → A11 the threshold kick → A12 SUBMIT the survivors as ordinary
+//!   checksummed entries in the one reservation (no mega-entry) → A13 hand
+//!   the window to stage B. A6, the heap admission (`heap_law.
+//!   admitHeapLocked`: a refused tx answers `NoSpace`; one retry behind ≤ 2
+//!   return-room cycles when budget can return), is the COMMITTER's before
+//!   it enqueues: a refusal reserves nothing, and its retry's checkpoint
+//!   cycles never run behind an open reservation of its own.
 //!
 //! Stage B is the lane's: awaits the writes in handoff order, completes the
 //! reservations in journal order, the completed-prefix wait, the hole
@@ -221,8 +231,21 @@ pub const RttEstimator = core_rtt.RttEstimator;
 /// the burst's first, unpaced hold still weighed it 0.39 after eight and
 /// read 0.92–0.94). An ON gate tracks the RFC 6298 mean per hold and
 /// closes below `GAIN_CLOSE` (opened at `GAIN_OPEN`: the band).
-pub fn holdWorthIt(gain_mean: ?u64, open: bool) bool {
-    return (gain_mean orelse 0) >= (if (open) GAIN_CLOSE else GAIN_OPEN);
+pub fn holdWorthIt(gain_mean: ?u64, open: bool, batch_len: usize) bool {
+    return (gain_mean orelse 0) >= gainLine(open, batch_len);
+}
+
+/// The line a hold's collection must clear, scaled by the batch it would
+/// lengthen: a hold removes `g·c/(n+c)` of the window's pad, so the ½-entry
+/// line §L measured at its n̄ of 1.56 entries is a QUARTER of the pad — the
+/// same quarter at any n is `c ≥ n/3` (the close line keeps the 2:1 band).
+/// A seven-entry batch of creates collected 0.4 per hold (5 % of its pad)
+/// and the ½ line alone kept the gate open: every window waited one round
+/// trip for the applier-fed pipeline to drain (62 % of the passes held,
+/// 170 µs each), the committers' closed loop ran at the hold's pace.
+pub fn gainLine(open: bool, batch_len: usize) u64 {
+    const n: u64 = @intCast(batch_len);
+    return if (open) @max(GAIN_CLOSE, n * GAIN_UNIT / 6) else @max(GAIN_OPEN, n * GAIN_UNIT / 3);
 }
 
 /// The gain estimator's fixed point: one collected entry = 1024 (the
@@ -269,15 +292,17 @@ pub const WorthGate = struct {
     /// Holds left in the running burst (0 = none running).
     burst_left: u32 = 0,
     burst_sum: u64 = 0,
+    /// The sampled holds' batch sizes (the line the burst's mean is held to).
+    burst_batch_sum: usize = 0,
     burst_n: u32 = 0,
 
     pub const Verdict = enum { hold, probe, decline };
 
-    /// Whether an eligible pad-majority window is held: by the ON gate, by
-    /// a running or due probe burst, or declined.
-    pub fn decide(self: *WorthGate) Verdict {
+    /// Whether an eligible pad-majority window of `batch_len` entries is
+    /// held: by the ON gate, by a running or due probe burst, or declined.
+    pub fn decide(self: *WorthGate, batch_len: usize) Verdict {
         if (self.open) {
-            if (holdWorthIt(self.gain.mean(), true)) return .hold;
+            if (holdWorthIt(self.gain.mean(), true, batch_len)) return .hold;
             self.open = false;
         }
         if (self.burst_left == 0) {
@@ -286,6 +311,7 @@ pub const WorthGate = struct {
             self.countdown = 0;
             self.burst_left = HOLD_PROBE_FORMING + HOLD_PROBE_BURST;
             self.burst_sum = 0;
+            self.burst_batch_sum = 0;
             self.burst_n = 0;
         }
         self.burst_left -= 1;
@@ -296,19 +322,20 @@ pub const WorthGate = struct {
     /// (the EWMA tracks) or a `.probe` (the burst tallies its sampled
     /// holds; at its end the mean seeds the EWMA afresh — the gate opens
     /// iff the mean says so).
-    pub fn observe(self: *WorthGate, verdict: Verdict, collected: u64) void {
+    pub fn observe(self: *WorthGate, verdict: Verdict, collected: u64, batch_len: usize) void {
         switch (verdict) {
             .hold => self.gain.sample(collected),
             .probe => {
                 const position = HOLD_PROBE_FORMING + HOLD_PROBE_BURST - 1 - self.burst_left;
                 if (position >= HOLD_PROBE_FORMING) {
                     self.burst_sum += collected;
+                    self.burst_batch_sum += batch_len;
                     self.burst_n += 1;
                 }
                 if (self.burst_left == 0) {
                     self.gain = .{};
                     self.gain.sample(if (self.burst_n == 0) 0 else self.burst_sum / self.burst_n);
-                    self.open = holdWorthIt(self.gain.mean(), false);
+                    self.open = holdWorthIt(self.gain.mean(), false, if (self.burst_n == 0) batch_len else self.burst_batch_sum / self.burst_n);
                 }
             },
             .decline => unreachable,
@@ -647,6 +674,9 @@ pub const Stats = struct {
     /// gain_milli`: the live gain (entries collected per hold × 1000).
     holds_not_worth: counters.ShardedCounter = .{},
     hold_probes: counters.ShardedCounter = .{},
+    /// `meta_conveyor_holds_pacing`: holds for the applier venue's width
+    /// (§AW) — the windows in apply, not the pad, held the batch.
+    holds_pacing: counters.ShardedCounter = .{},
     hold_gain_milli: counters.Gauge = .{},
     windows_held: counters.ShardedCounter = .{},
     windows_unshadowed: counters.ShardedCounter = .{},
@@ -684,6 +714,9 @@ pub const Stats = struct {
     /// latency the law spends; its tail sits under `window_total`'s).
     pass_hold: counters.ShardedLatencyHistogram = .{},
     pass_total: counters.ShardedLatencyHistogram = .{},
+    /// `apply_total`: the applier's leg (§AW) — the pass's handoff → the
+    /// window submitted (resolve, the union lock, the apply, the encode).
+    apply_total: counters.ShardedLatencyHistogram = .{},
     window_total: counters.ShardedLatencyHistogram = .{},
     /// `lock_phase_ns.leaf_lock_hold`: first acquire → every guard dropped
     /// (its tail must sit ≪ device latency — the "never across I/O" law).
@@ -694,7 +727,7 @@ pub const Stats = struct {
         for (GroupSizeHistogram.labels, 0..) |l, i| {
             try w.print("{s}\"{s}\":{d}", .{ if (i == 0) "" else ",", l, self.group_size.load(i) });
         }
-        try w.print("}},\"meta_commit_group_bytes\":{d},\"meta_conveyor_leader_passes\":{d},\"meta_conveyor_group_commits\":{d},\"meta_conveyor_group_txs\":{d},\"meta_conveyor_lane_handoffs\":{d},\"meta_conveyor_windows_inflight\":{d},\"meta_conveyor_windows_inflight_hwm\":{d},\"meta_conveyor_queued\":{d},\"meta_commit_parked\":{d},\"meta_conveyor_drained_txs\":{d},\"meta_conveyor_acks\":{d},\"meta_conveyor_refusals\":{d},\"meta_kv_journal_full_stalls\":{d},\"meta_conveyor_park_tick_rescues\":{d},\"manager_dependency_stalls\":{d},\"meta_conveyor_rollbacks\":{d},\"meta_conveyor_compensations\":{d},\"meta_conveyor_divergences_failed_volume\":{d},\"meta_conveyor_compensation_write_failures\":{d},\"meta_conveyor_pass_panics\":{d},\"meta_conveyor_windows_abandoned_failed_volume\":{d},\"meta_conveyor_holds\":{d},\"meta_conveyor_hold_landings\":{d},\"meta_conveyor_hold_deadlines\":{d},\"meta_conveyor_holds_not_worth\":{d},\"meta_conveyor_hold_probes\":{d},\"meta_conveyor_hold_gain_milli\":{d},\"meta_conveyor_windows_held\":{d},\"meta_conveyor_windows_unshadowed\":{d},\"meta_conveyor_windows_pipelined\":{d},\"meta_conveyor_hold_bound_ns\":{d}", .{
+        try w.print("}},\"meta_commit_group_bytes\":{d},\"meta_conveyor_leader_passes\":{d},\"meta_conveyor_group_commits\":{d},\"meta_conveyor_group_txs\":{d},\"meta_conveyor_lane_handoffs\":{d},\"meta_conveyor_windows_inflight\":{d},\"meta_conveyor_windows_inflight_hwm\":{d},\"meta_conveyor_queued\":{d},\"meta_commit_parked\":{d},\"meta_conveyor_drained_txs\":{d},\"meta_conveyor_acks\":{d},\"meta_conveyor_refusals\":{d},\"meta_kv_journal_full_stalls\":{d},\"meta_conveyor_park_tick_rescues\":{d},\"manager_dependency_stalls\":{d},\"meta_conveyor_rollbacks\":{d},\"meta_conveyor_compensations\":{d},\"meta_conveyor_divergences_failed_volume\":{d},\"meta_conveyor_compensation_write_failures\":{d},\"meta_conveyor_pass_panics\":{d},\"meta_conveyor_windows_abandoned_failed_volume\":{d},\"meta_conveyor_holds\":{d},\"meta_conveyor_hold_landings\":{d},\"meta_conveyor_hold_deadlines\":{d},\"meta_conveyor_holds_not_worth\":{d},\"meta_conveyor_hold_probes\":{d},\"meta_conveyor_hold_gain_milli\":{d},\"meta_conveyor_windows_held\":{d},\"meta_conveyor_windows_unshadowed\":{d},\"meta_conveyor_windows_pipelined\":{d},\"meta_conveyor_hold_bound_ns\":{d},\"meta_conveyor_holds_pacing\":{d}", .{
             self.group_bytes.load(),
             self.leader_passes.load(),
             self.group_commits.load(),
@@ -726,6 +759,7 @@ pub const Stats = struct {
             self.windows_unshadowed.load(),
             self.windows_pipelined.load(),
             self.hold_bound_ns.load(),
+            self.holds_pacing.load(),
         });
         try w.print(",\"meta_commit_ack_spin_hits\":{d},\"meta_commit_ack_spin_falls\":{d},\"meta_commit_ack_spin_skips\":{d},\"meta_commit_ack_spin_busy\":{d},\"meta_commit_ack_spin_bound_ns\":{d},\"meta_commit_ack_spin_wake_ns\":{d},\"meta_commit_ack_spin_ack_ns\":{d}}}", .{
             self.ack_spin_hits.load(),
@@ -753,6 +787,8 @@ pub const Stats = struct {
         try self.pass_hold.snapshot().writeJson(w);
         try w.writeAll(",\"meta_pass_total\":");
         try self.pass_total.snapshot().writeJson(w);
+        try w.writeAll(",\"meta_apply_total\":");
+        try self.apply_total.snapshot().writeJson(w);
         try w.writeAll(",\"meta_window_total\":");
         try self.window_total.snapshot().writeJson(w);
         try w.writeAll(",\"leaf_lock_hold\":");
@@ -884,10 +920,13 @@ pub const Queued = struct {
 
 const Core = conveyor_core.ConveyorCore(Queued);
 
-/// A window past its RAM apply, SUBMITTED, in the lane's hands until
-/// `finish` (the reference's `ConveyorWindow`). Heap-allocated: the lane
-/// and the hooks address it by pointer; its arena owns the members' copies
-/// and the undo pre-images.
+/// A reserved batch: the pass's from the reservation to the handoff, its
+/// APPLIER's (the first member's committer, §AW) through the RAM apply,
+/// the encode and the submit, then in the lane's hands until `finish`
+/// (the reference's `ConveyorWindow`). Heap-allocated: the lane and the
+/// hooks address it by pointer; its arena owns the members' copies and the
+/// undo pre-images — the pass writes it before the handoff, the applier
+/// after, never both.
 pub const Window = struct {
     conveyor: *Conveyor,
     arena: std.heap.ArenaAllocator,
@@ -905,6 +944,17 @@ pub const Window = struct {
     /// Surviving entries (the lane's accounting).
     entries: u64,
     t_handoff_ns: u64,
+    /// The pass's drain instant (the applier's phase accounting).
+    t_pass_ns: u64 = 0,
+    /// The window-fill hold preceded the batch (the handoff's class).
+    held: bool = false,
+    /// The applier venue's affinity (§AW): the tree of the first member's
+    /// LAST record — a namespace op stages its parent-side record last,
+    /// the object every sibling's op shares — so windows on one hot leaf
+    /// take one applier lane's FIFO (an in-order apply, no leaf-lock
+    /// handoff between lanes) while windows on different directories
+    /// spread over the venue.
+    affinity: u64 = 0,
     /// The token union the pass took in flight at A1½ (arena-owned);
     /// settled at the terminal outcome.
     token_union: []const u64 = &.{},
@@ -1019,6 +1069,28 @@ pub const PassSeam = struct {
     wake: *const fn (ctx: *anyopaque) void,
 };
 
+/// The applier venue (§AW): where a reserved window's second half — the
+/// RAM apply, the encode, the submit — runs. `spawn` starts
+/// `Conveyor.applyWindow(w)` as its own fiber and answers true; false =
+/// the venue refuses (the pass applies inline). `parallelism` is the
+/// venue's width: the pass holds a drained batch while that many windows
+/// are in apply (another one would only queue behind them and contend
+/// for their leaves). The backend binds the `sqz-meta` pool; the portable
+/// contracts bind the inline applier (`inline_applier`).
+pub const ApplySeam = struct {
+    ctx: *anyopaque,
+    spawn: *const fn (ctx: *anyopaque, w: *Window) bool,
+    parallelism: u32,
+};
+
+/// The contracts' applier: refused, so the pass applies on its own thread
+/// before it submits — stage A whole, as the reference ran it.
+pub const inline_applier: ApplySeam = .{ .ctx = undefined, .spawn = &refuseSpawn, .parallelism = 1 };
+
+fn refuseSpawn(_: *anyopaque, _: *Window) bool {
+    return false;
+}
+
 /// Stage B's binding: the journal lane (Linux) or the in-RAM lane.
 pub const LaneSeam = struct {
     ctx: *anyopaque,
@@ -1095,6 +1167,8 @@ pub const Deps = struct {
     /// The committer's executor (decision 0003 §AB.4); null = never spin
     /// (the portable contracts' inline pass, a thread off any lane).
     caller: ?CallerSeam = null,
+    /// The applier venue (§AW); the inline applier by default.
+    applier: ApplySeam = inline_applier,
 };
 
 /// The committer's thread as the ack spin sees it (the backend binds the
@@ -1159,6 +1233,10 @@ pub const Conveyor = struct {
     rtt: RttEstimator = .{},
     /// The worth gate (pass-fiber-owned).
     gate: WorthGate = .{},
+    /// Windows handed to an applier and not yet submitted (§AW): the
+    /// pass's pacing input; `applied` notifies every leave.
+    in_apply: std.atomic.Value(u32) = .init(0),
+    applied: sync.Notify = .init,
     stats: Stats = .{},
 
     pub fn init(gpa: Allocator, deps: Deps) Allocator.Error!*Conveyor {
@@ -1357,7 +1435,98 @@ pub const Conveyor = struct {
                 error.OutOfMemory => error.OutOfMemory,
             };
         };
+        // A6, the committer's (§AW): the heap promise BEFORE the enqueue,
+        // so a refusal reserves nothing and the space retry's checkpoint
+        // cycles never run behind an open reservation (a cycle's barrier
+        // waits on the completed prefix, which would wait on this tx).
+        self.admitHeapPreQueue(&q) catch |e| {
+            q.deinit();
+            return e;
+        };
         return .{ .q = q, .done = done, .enqueued_ns = clock.monotonicNs() };
+    }
+
+    /// The heap admission of ONE tx on the committer's thread, under its
+    /// leaves' write locks (the same law the pass ran for the batch:
+    /// `heap_law.admitHeapLocked`, one promise per leaf, the space retry
+    /// behind ≤ 2 return-room cycles, the final refusal typed). A stale
+    /// leaf is re-resolved; the budget's exhaustion is the SMO protocol's
+    /// bug as it was.
+    fn admitHeapPreQueue(self: *Conveyor, q: *const QueuedTx) Error!void {
+        var arena_state = std.heap.ArenaAllocator.init(self.deps.gpa);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const one = [_]Queued{.{ .q = q.*, .done = undefined, .enqueued_ns = 0 }};
+        var cycled_for_space = false;
+        var space_retry_started: u64 = 0;
+        var hold_active = false;
+        defer if (hold_active) self.deps.checkpoint.space_retry.end();
+        var attempt: u32 = 0;
+        while (attempt < COMMIT_RETRY_BUDGET) {
+            var r = try self.resolve(arena, &one);
+            const dirties = arena.alloc(*NodeDirty, r.lock_set.len) catch {
+                r.releaseRefs();
+                return error.OutOfMemory;
+            };
+            self.lockAll(r.lock_set, dirties);
+            if (stale(&one, &r)) {
+                self.unlockAll(r.lock_set);
+                r.releaseRefs();
+                tree.stats.meta_kv_commit_smo_retries.inc();
+                attempt += 1;
+                continue;
+            }
+            var refused: std.ArrayList(heap_law.Refused) = .empty;
+            defer refused.deinit(self.deps.gpa);
+            self.admitHeap(arena, &one, &r, dirties, &refused) catch |e| {
+                self.unlockAll(r.lock_set);
+                r.releaseRefs();
+                return e;
+            };
+            self.unlockAll(r.lock_set);
+            r.releaseRefs();
+            if (hold_active) {
+                self.deps.checkpoint.space_retry.end();
+                hold_active = false;
+            }
+            if (refused.items.len == 0) return;
+            const now = clock.monotonicNs();
+            if (space_retry_started == 0) space_retry_started = now;
+            const decision = heap_law.decideSpaceRetry(.{
+                .cycled_for_space = cycled_for_space,
+                .heap_promised = self.deps.cache.heapPromised(),
+                .pending_free = self.deps.alloc.pendingCount(),
+                .elapsed_ns = now - space_retry_started,
+                .wall_bound_ns = self.deps.park_escalation_ns,
+            });
+            switch (decision) {
+                .retry_after_cycles => {
+                    cycled_for_space = true;
+                    self.deps.checkpoint.space_retry.begin();
+                    hold_active = true;
+                    var runs: u32 = 0;
+                    while (true) {
+                        if (!self.deps.checkpoint.checkpointNow(self.deps.checkpoint.ctx)) {
+                            log.warn("meta volume {s}: checkpoint cycle for heap headroom failed (the refused tx will be answered on the retry)", .{self.deps.volume});
+                            break;
+                        }
+                        runs += 1;
+                        if (!heap_law.continueSpaceRetryCycles(runs, self.deps.alloc.pendingCount())) break;
+                    }
+                },
+                .final_refusal => {
+                    const rf = refused.items[0];
+                    const e = heap_law.finalizeRefusal(self.deps.checkpoint.posture, self.deps.volume, rf.why, self.deps.cache.heapPromised());
+                    if (self.deps.grant_fed) self.stats.manager_dependency_stalls.inc();
+                    return if (self.deps.grant_fed) error.GrantExhausted else e;
+                },
+            }
+            // A space retry spends the budget as a stale leaf does (the
+            // pass's shape).
+            attempt += 1;
+        }
+        log.err("meta volume {s}: commit retry budget exhausted (revalidation never passed — SMO protocol bug)", .{self.deps.volume});
+        return error.RetryBudgetExhausted;
     }
 
     fn enqueueOne(self: *Conveyor, entry: *Queued, len: u64) Error!void {
@@ -1472,25 +1641,55 @@ pub const Conveyor = struct {
         return self.deps.geo.padOf(self.deps.core.headPos() + entry_bytes) > entry_bytes;
     }
 
-    /// The window-fill hold (§L): a pad-majority batch waits until NOTHING
-    /// is in flight — every window issued before it has reached its
-    /// terminal outcome — a park on `landed` per landing, bounded by the
-    /// round-trip predictor's deadline from the hold's start; then the
-    /// pass re-drains what arrived meanwhile into the same window. In the
-    /// paced regime that is the one in-flight window's landing; in the
-    /// unpaced regime (several in flight: the gate's probe) it is the
-    /// newest's landing ≈ one round trip — a probe that ended at the FIRST
-    /// landing measured a fraction of the gain and kept the gate off
-    /// (`rand-4k-write`: 0.77–0.9 per probe against 2.3 collected per paced
-    /// hold). Register-then-check on every iteration: a landing's wake
-    /// between the in-flight read and the park is never lost. Holds nothing
-    /// when no law is armed, nothing is in flight (a lone committer never
-    /// waits), the batch is entry-majority, the predictor has no sample
-    /// yet, the measured gain says a hold collects nothing (`holdWorthIt`,
-    /// probed one window in `HOLD_PROBE_PERIOD`), or the volume is closing.
+    /// The window-fill hold (§L, amended §AW): a pad-majority batch waits
+    /// for the NEXT landing — a park on `landed`, bounded by the round-trip
+    /// predictor's deadline from the hold's start; then the pass re-drains
+    /// what arrived meanwhile into the same window. In the paced regime
+    /// (one window in flight) that landing empties the flight, as §L
+    /// measured it; in the pipelined regime the appliers keep several in
+    /// flight and a wait for the newest's landing held the pass — the one
+    /// serial stage left — for the whole depth (62 % of mdtest's passes,
+    /// 141 µs each: the closed loop ran at the hold's pace). §L's probe of
+    /// the unpaced regime under the serial pass (`rand-4k-write` 0.77–0.9
+    /// per first-landing probe against 2.3 per paced hold) predates §L.6,
+    /// which parks that shape's stamps: it commits no entry to hold.
+    /// Register-then-check: a landing's wake between the in-flight read and
+    /// the park is never lost. Holds nothing when no law is armed, nothing
+    /// is in flight (a lone committer never waits), the batch is
+    /// entry-majority, the predictor has no sample yet, the measured gain
+    /// says a hold collects less than its batch's quarter of the pad
+    /// (`holdWorthIt`, probed one window in `HOLD_PROBE_PERIOD`), or the
+    /// volume is closing.
     fn holdForFill(self: *Conveyor, batch: []Queued) HeldBatch {
         const unheld: HeldBatch = .{ .batch = batch, .held = false };
         const law = self.deps.window_hold orelse return unheld;
+        if (self.isClosing()) return unheld;
+        // The applier pacing (§AW): with the venue's width of windows in
+        // apply, another window would queue behind them and contend for
+        // their leaves — the pass holds until one leaves (or the
+        // predictor's deadline) and re-drains what arrived.
+        if (self.in_apply.load(.acquire) >= self.deps.applier.parallelism) {
+            const bound = self.rtt.bound(law.ceiling_ns);
+            if (bound == 0) return unheld;
+            const io = self.deps.io;
+            var n = self.applied.notified();
+            _ = n.enable(io);
+            if (self.in_apply.load(.acquire) < self.deps.applier.parallelism) {
+                n.cancel(io);
+                return unheld;
+            }
+            self.stats.holds_pacing.inc();
+            const t0 = clock.monotonicNs();
+            switch (n.waitUntilUncancelable(io, t0 + bound)) {
+                .deadline => self.stats.hold_deadlines.inc(),
+                .notified => self.stats.hold_landings.inc(),
+            }
+            self.stats.pass_hold.record(clock.monotonicNs() -| t0);
+            return self.redrainHeld(batch);
+        }
+        // The pad hold (§L) rides a window ON THE DEVICE: one in apply is
+        // the appliers' to overlap with, not the device's busy time.
+        if (self.windowsInflight() <= self.in_apply.load(.acquire)) return unheld;
         if (self.isClosing()) return unheld;
         var sum: u64 = 0;
         for (batch) |m| sum += m.q.len;
@@ -1505,7 +1704,7 @@ pub const Conveyor = struct {
             n.cancel(io);
             return unheld;
         }
-        const verdict: WorthGate.Verdict = if (law.pin_gate_open) .hold else self.gate.decide();
+        const verdict: WorthGate.Verdict = if (law.pin_gate_open) .hold else self.gate.decide(batch.len);
         switch (verdict) {
             .decline => {
                 n.cancel(io);
@@ -1518,33 +1717,35 @@ pub const Conveyor = struct {
         self.stats.holds.inc();
         const t0 = clock.monotonicNs();
         const deadline = t0 + bound;
-        const flight_empty = while (true) {
-            switch (n.waitUntilUncancelable(io, deadline)) {
-                .deadline => break false,
-                .notified => {},
-            }
-            // A landing: register again, then re-read the flight.
-            n = self.landed.notified();
-            _ = n.enable(io);
-            if (self.windowsInflight() == 0) {
-                n.cancel(io);
-                break true;
-            }
+        // ONE landing ends the hold (§AW): in the paced regime it is the
+        // flight's emptying, as before; in the pipelined regime — the
+        // appliers keep several windows in flight — it is the next window's
+        // landing, the cohort's re-arrival, while a wait for an EMPTY flight
+        // held the pass (the one serial stage left) for the whole depth:
+        // 62 % of mdtest's passes held 141 µs each and the closed loop ran
+        // at the hold's pace.
+        const landed = switch (n.waitUntilUncancelable(io, deadline)) {
+            .deadline => false,
+            .notified => true,
         };
-        if (flight_empty) self.stats.hold_landings.inc() else self.stats.hold_deadlines.inc();
+        if (landed) self.stats.hold_landings.inc() else self.stats.hold_deadlines.inc();
         self.stats.pass_hold.record(clock.monotonicNs() -| t0);
-        // The re-drain under the caps' remainder: FIFO is kept (the new
-        // members follow the held ones); the caps bound the whole window.
-        const rest: Caps = .{ .max_txs = self.deps.caps.max_txs -| batch.len, .max_bytes = self.deps.caps.max_bytes -| sum };
-        if (rest.max_txs == 0 or batch.len >= self.batch_buf.len) {
-            self.gate.observe(verdict, 0);
-            self.stats.hold_gain_milli.set(self.gate.gainMilli());
-            return .{ .batch = batch, .held = true };
-        }
-        const more = self.core.drainBatch(rest, self.batch_buf[batch.len..]);
+        const held = self.redrainHeld(batch);
         // The hold's gain: what the re-drain collected (the gate's sample).
-        self.gate.observe(verdict, @as(u64, more.len) * GAIN_UNIT);
+        self.gate.observe(verdict, @as(u64, held.batch.len - batch.len) * GAIN_UNIT, batch.len);
         self.stats.hold_gain_milli.set(self.gate.gainMilli());
+        return held;
+    }
+
+    /// The re-drain after a hold, under the caps' remainder: FIFO is kept
+    /// (the new members follow the held ones); the caps bound the whole
+    /// window.
+    fn redrainHeld(self: *Conveyor, batch: []Queued) HeldBatch {
+        var sum: u64 = 0;
+        for (batch) |m| sum += m.q.len;
+        const rest: Caps = .{ .max_txs = self.deps.caps.max_txs -| batch.len, .max_bytes = self.deps.caps.max_bytes -| sum };
+        if (rest.max_txs == 0 or batch.len >= self.batch_buf.len) return .{ .batch = batch, .held = true };
+        const more = self.core.drainBatch(rest, self.batch_buf[batch.len..]);
         return .{ .batch = self.batch_buf[0 .. batch.len + more.len], .held = true };
     }
 
@@ -1840,171 +2041,152 @@ pub const Conveyor = struct {
         // Every exit below either transfers the admission or releases it.
         defer if (admission) |a| self.deps.core.release(a);
 
-        var cycled_for_space = false;
-        var space_retry_started: u64 = 0;
-        var hold_active = false;
-        defer if (hold_active) self.deps.checkpoint.space_retry.end();
-        const t_locks = clock.monotonicNs();
+        // A7': the window — its arena takes the members, the failure slots
+        // and the token union BEFORE anything is reserved: past this point
+        // no allocation can fail a batch whose range is on the ring.
+        const w = gpa.create(Window) catch {
+            self.failBatch(members.items, error.OutOfMemory);
+            return;
+        };
+        w.* = .{ .conveyor = self, .arena = std.heap.ArenaAllocator.init(gpa), .members = &.{}, .failed = &.{}, .res = undefined, .seq_base = 0, .undo = &.{}, .image = null, .entries = 0, .t_handoff_ns = 0, .t_pass_ns = t_pass, .held = held };
+        const wa = w.arena.allocator();
+        const window_members = wa.dupe(Queued, members.items) catch {
+            w.arena.deinit();
+            gpa.destroy(w);
+            self.failBatch(members.items, error.OutOfMemory);
+            return;
+        };
+        const failed = wa.alloc(?Error, members.items.len) catch {
+            w.arena.deinit();
+            gpa.destroy(w);
+            self.failBatch(members.items, error.OutOfMemory);
+            return;
+        };
+        @memset(failed, null);
+        w.token_union = wa.dupe(u64, token_union) catch {
+            w.arena.deinit();
+            gpa.destroy(w);
+            self.failBatch(members.items, error.OutOfMemory);
+            return;
+        };
+        // A8: ONE contiguous reservation; the members' seqs stamped
+        // back-to-back. From here the batch is a window: every exit
+        // completes the reservation (§AW: the apply follows the
+        // reservation, on the applier's thread; the registry's open entry
+        // holds the checkpoint tail back until the lane completes it,
+        // which is after the apply and the landing).
+        const reg = self.deps.reg.reserveRegistered(self.deps.core, admission.?) catch {
+            // The core transferred the claim before the registry's
+            // append failed (the one way a reservation fails): the range
+            // is the ring's, unregistered — complete nothing, fail loud.
+            w.arena.deinit();
+            gpa.destroy(w);
+            admission = null;
+            log.err("meta volume {s}: the batch reservation could not be registered (out of memory) — its range stays an unwritten hole", .{self.deps.volume});
+            _ = self.deps.latch.noteFailure(.journal_write);
+            self.failBatch(members.items, error.OutOfMemory);
+            return;
+        };
+        admission = null;
+        var stamp_cursor = reg.seq_base;
+        for (window_members) |*m| {
+            _ = m.q.stampSeqs(stamp_cursor);
+            stamp_cursor += m.q.len;
+        }
+        w.members = window_members;
+        w.failed = failed;
+        w.res = reg.res;
+        w.seq_base = reg.seq_base;
+        if (window_members[0].q.recs.len != 0) {
+            const last = window_members[0].q.recs[window_members[0].q.recs.len - 1];
+            // Fibonacci hashing: neighbouring tree objects spread over the lanes.
+            if (self.treeFor(last.tree_id, last.key)) |t| w.affinity = (@intFromPtr(t) *% 0x9E3779B97F4A7C15) >> 32;
+        }
+        // From here every exit finishes the window: the union is its.
+        union_settled = true;
+        // Tracked before the handoff: the hold law counts it in flight and
+        // the lane's rollback hook can name it.
+        self.track(w) catch {
+            self.abandonWindow(w, error.OutOfMemory);
+            return;
+        };
+        self.stats.pass_total.record(clock.monotonicNs() -| t_pass);
+        // A8½: the handoff to an APPLIER (§AW): a fiber on the applier
+        // venue runs the second half while this pass drains the next
+        // batch and the lane lands the earlier windows. A window with
+        // NOTHING in flight beside it — a serial chain of ops, one at a
+        // time — is applied here instead: the handoff's wake and the
+        // venue's scheduling cost that chain ≈ 30 µs per op (a shared
+        // directory's mkdirs, serialized by its exclusive guard, ran 0.72×)
+        // and overlap nothing. The portable contracts apply inline too, as
+        // does a venue that refuses the spawn.
+        const alone = self.windowsInflight() == 1;
+        _ = self.in_apply.fetchAdd(1, .acq_rel);
+        const a = self.deps.applier;
+        if (alone or !a.spawn(a.ctx, w)) self.applyWindow(w);
+    }
+
+    /// A window left its applier (submitted, or abandoned on its way): the
+    /// pass's pacing wake.
+    fn leftApply(self: *Conveyor) void {
+        _ = self.in_apply.fetchSub(1, .acq_rel);
+        self.applied.notifyWaiters(self.deps.io);
+    }
+
+    /// Stage A's second half on the APPLIER's thread (§AW): A3 resolve →
+    /// A4 lock the union → A5 revalidate (re-resolve on a moved leaf; the
+    /// seqs are the window's already) → A7 pre-images → A9 apply in queue
+    /// order → A10 the threshold → unlock → A11 the kick → A12 encode →
+    /// A13 submit. Every exit completes the reservation: a refusal before
+    /// any apply abandons the window (nothing to roll back); a member
+    /// whose apply fails is rolled out in-window and its range left an
+    /// unwritten hole, as before.
+    pub fn applyWindow(self: *Conveyor, window: *Window) void {
+        const gpa = self.deps.gpa;
+        const t_apply = clock.monotonicNs();
+        defer self.leftApply();
+        var arena_state = std.heap.ArenaAllocator.init(gpa);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const members = window.members;
+        const wa = window.arena.allocator();
         var attempt: u32 = 0;
-        const window: *Window = while (true) : (attempt += 1) {
+        while (true) : (attempt += 1) {
             if (attempt >= COMMIT_RETRY_BUDGET) {
                 log.err("meta volume {s}: commit retry budget exhausted (revalidation never passed — SMO protocol bug)", .{self.deps.volume});
-                self.failBatch(members.items, error.RetryBudgetExhausted);
+                self.abandonWindow(window, error.RetryBudgetExhausted);
                 return;
             }
             // A3.
-            var r = self.resolve(arena, members.items) catch |e| {
-                self.failBatch(members.items, e);
+            var r = self.resolve(arena, members) catch |e| {
+                self.abandonWindow(window, e);
                 return;
             };
             // A4.
             const dirties = arena.alloc(*NodeDirty, r.lock_set.len) catch {
                 r.releaseRefs();
-                self.failBatch(members.items, error.OutOfMemory);
+                self.abandonWindow(window, error.OutOfMemory);
                 return;
             };
             const t_leaf = clock.monotonicNs();
             self.lockAll(r.lock_set, dirties);
             // A5.
-            if (stale(members.items, &r)) {
+            if (stale(members, &r)) {
                 self.unlockAll(r.lock_set);
                 self.stats.leaf_lock_hold.record(clock.monotonicNs() -| t_leaf);
                 r.releaseRefs();
                 tree.stats.meta_kv_commit_smo_retries.inc();
                 continue;
             }
-            // A6.
-            var refused: std.ArrayList(heap_law.Refused) = .empty;
-            defer refused.deinit(self.deps.gpa);
-            self.admitHeap(arena, members.items, &r, dirties, &refused) catch |e| {
-                self.unlockAll(r.lock_set);
-                r.releaseRefs();
-                self.failBatch(members.items, e);
-                return;
-            };
-            if (hold_active) {
-                self.deps.checkpoint.space_retry.end();
-                hold_active = false;
-            }
-            if (refused.items.len != 0) {
-                self.unlockAll(r.lock_set);
-                self.stats.leaf_lock_hold.record(clock.monotonicNs() -| t_leaf);
-                r.releaseRefs();
-                self.deps.core.release(admission.?);
-                admission = null;
-                const now = clock.monotonicNs();
-                if (space_retry_started == 0) space_retry_started = now;
-                const decision = heap_law.decideSpaceRetry(.{
-                    .cycled_for_space = cycled_for_space,
-                    .heap_promised = self.deps.cache.heapPromised(),
-                    .pending_free = self.deps.alloc.pendingCount(),
-                    .elapsed_ns = now - space_retry_started,
-                    .wall_bound_ns = self.deps.park_escalation_ns,
-                });
-                switch (decision) {
-                    .retry_after_cycles => {
-                        cycled_for_space = true;
-                        self.deps.checkpoint.space_retry.begin();
-                        hold_active = true;
-                        var runs: u32 = 0;
-                        while (true) {
-                            if (!self.deps.checkpoint.checkpointNow(self.deps.checkpoint.ctx)) {
-                                log.warn("meta volume {s}: checkpoint cycle for heap headroom failed (the refused members will be answered on the retry)", .{self.deps.volume});
-                                break;
-                            }
-                            runs += 1;
-                            if (!heap_law.continueSpaceRetryCycles(runs, self.deps.alloc.pendingCount())) break;
-                        }
-                    },
-                    .final_refusal => {
-                        var i = refused.items.len;
-                        while (i > 0) {
-                            i -= 1;
-                            const rf = refused.items[i];
-                            const e = heap_law.finalizeRefusal(self.deps.checkpoint.posture, self.deps.volume, rf.why, self.deps.cache.heapPromised());
-                            var m = members.orderedRemove(rf.member);
-                            if (self.deps.grant_fed) self.stats.manager_dependency_stalls.inc();
-                            self.answer(&m, if (self.deps.grant_fed) error.GrantExhausted else e);
-                        }
-                        if (members.items.len == 0) return;
-                    },
-                }
-                var survivors: u64 = 0;
-                for (members.items) |m| survivors += m.q.len;
-                admission = self.admitUserBudget(survivors, &err) orelse {
-                    self.failBatch(members.items, err);
-                    return;
-                };
-                continue;
-            }
             // A7: pre-images, first touch per (tree, key).
-            const w = gpa.create(Window) catch {
+            window.undo = self.captureUndo(wa, members, &r) catch |e| {
                 self.unlockAll(r.lock_set);
                 r.releaseRefs();
-                self.failBatch(members.items, error.OutOfMemory);
+                self.abandonWindow(window, e);
                 return;
             };
-            w.* = .{ .conveyor = self, .arena = std.heap.ArenaAllocator.init(gpa), .members = &.{}, .failed = &.{}, .res = undefined, .seq_base = 0, .undo = &.{}, .image = null, .entries = 0, .t_handoff_ns = 0 };
-            const wa = w.arena.allocator();
-            const undo = self.captureUndo(wa, members.items, &r) catch |e| {
-                self.unlockAll(r.lock_set);
-                r.releaseRefs();
-                w.arena.deinit();
-                gpa.destroy(w);
-                self.failBatch(members.items, e);
-                return;
-            };
-            // The window's own copies, allocated BEFORE anything is reserved
-            // or applied: past this point no allocation can fail a batch
-            // whose records are already in RAM.
-            const window_members = wa.dupe(Queued, members.items) catch {
-                self.unlockAll(r.lock_set);
-                r.releaseRefs();
-                w.arena.deinit();
-                gpa.destroy(w);
-                self.failBatch(members.items, error.OutOfMemory);
-                return;
-            };
-            const failed = wa.alloc(?Error, members.items.len) catch {
-                self.unlockAll(r.lock_set);
-                r.releaseRefs();
-                w.arena.deinit();
-                gpa.destroy(w);
-                self.failBatch(members.items, error.OutOfMemory);
-                return;
-            };
-            @memset(failed, null);
-            w.token_union = wa.dupe(u64, token_union) catch {
-                self.unlockAll(r.lock_set);
-                r.releaseRefs();
-                w.arena.deinit();
-                gpa.destroy(w);
-                self.failBatch(members.items, error.OutOfMemory);
-                return;
-            };
-            // A8: ONE contiguous reservation inside the window.
-            const reg = self.deps.reg.reserveRegistered(self.deps.core, admission.?) catch {
-                // The core transferred the claim before the registry's
-                // append failed (the one way a reservation fails): the range
-                // is the ring's, unregistered — complete nothing, fail loud.
-                self.unlockAll(r.lock_set);
-                r.releaseRefs();
-                w.arena.deinit();
-                gpa.destroy(w);
-                admission = null;
-                log.err("meta volume {s}: the batch reservation could not be registered (out of memory) — its range stays an unwritten hole", .{self.deps.volume});
-                _ = self.deps.latch.noteFailure(.journal_write);
-                self.failBatch(members.items, error.OutOfMemory);
-                return;
-            };
-            admission = null;
-            var stamp_cursor = reg.seq_base;
-            for (window_members) |*m| {
-                _ = m.q.stampSeqs(stamp_cursor);
-                stamp_cursor += m.q.len;
-            }
             // A9: apply in queue order; a failing member rolls out alone.
-            self.applyMembers(window_members, &r, dirties, reg, failed);
+            self.applyMembers(members, &r, dirties, window.res.start, window.seq_base, window.failed);
             // A10: the writeback threshold, inside the window.
             var threshold_crossed = false;
             for (r.lock_set, dirties) |n, d| {
@@ -2020,16 +2202,9 @@ pub const Conveyor = struct {
             r.releaseRefs();
             // A11.
             if (threshold_crossed) self.deps.checkpoint.kickThreshold(self.deps.checkpoint.ctx);
-            w.members = window_members;
-            w.failed = failed;
-            w.res = reg.res;
-            w.seq_base = reg.seq_base;
-            w.undo = undo;
-            break w;
-        };
-        // From here every exit finishes the window: the union is its.
-        union_settled = true;
-        self.stats.pass_leaf_locks.record(clock.monotonicNs() -| t_locks);
+            break;
+        }
+        self.stats.pass_leaf_locks.record(clock.monotonicNs() -| t_apply);
 
         // A12: the survivors' entries, ONE submission, outside every lock.
         var parts: std.ArrayList(journal.BatchPart) = .empty;
@@ -2057,7 +2232,7 @@ pub const Conveyor = struct {
             encode_failed = window.image == null;
         }
         window.t_handoff_ns = clock.monotonicNs();
-        self.stats.pass_total.record(window.t_handoff_ns -| t_pass);
+        self.stats.apply_total.record(window.t_handoff_ns -| t_apply);
         if (encode_failed) {
             // A failed write with nothing landed — the lane's verdict for
             // it, run here (nothing was submitted).
@@ -2074,14 +2249,9 @@ pub const Conveyor = struct {
             return;
         }
         // A13: handoff. The window's class for the pacing law (§L).
-        self.track(window) catch {
-            self.abandonWindow(window, error.OutOfMemory);
-            return;
-        };
         self.stats.lane_handoffs.inc();
-        if (held) self.stats.windows_held.inc() else if (window.acct().padMajority()) self.stats.windows_unshadowed.inc() else self.stats.windows_pipelined.inc();
+        if (window.held) self.stats.windows_held.inc() else if (window.acct().padMajority()) self.stats.windows_unshadowed.inc() else self.stats.windows_pipelined.inc();
         self.deps.lane.submit(self.deps.lane.ctx, window) catch |e| {
-            self.untrack(window);
             self.abandonWindow(window, e);
         };
     }
@@ -2127,11 +2297,11 @@ pub const Conveyor = struct {
     /// contribution is the member's ENTRY START (FIND-SMO-TAIL §1b: a leaf
     /// holding only rec[j>0] of a multi-leaf tx must not pin the tail
     /// mid-entry). A member whose apply fails is rolled OUT in-window.
-    fn applyMembers(self: *Conveyor, members: []Queued, r: *const Resolved, dirties: []*NodeDirty, reg: jc.InflightRegistry.Registered, failed: []?Error) void {
+    fn applyMembers(self: *Conveyor, members: []Queued, r: *const Resolved, dirties: []*NodeDirty, res_start: u64, seq_base: u64, failed: []?Error) void {
         const gpa = self.deps.gpa;
         const poison = test_seams.poison_apply_ino.load(.monotonic);
-        var pos_cursor = reg.res.start;
-        var stamp_cursor = reg.seq_base;
+        var pos_cursor = res_start;
+        var stamp_cursor = seq_base;
         var group: std.ArrayList(OwnedRec) = .empty;
         defer group.deinit(gpa);
         for (members, 0..) |*m, qi| {
@@ -2239,7 +2409,8 @@ pub const Conveyor = struct {
             self.stats.windows_abandoned_failed_volume.inc();
             log.info("meta volume {s}: a conveyor window was refused by the lane on a FAILED volume — rolled back, every member answered", .{self.deps.volume});
         } else {
-            self.stats.pass_panics.fire("a conveyor window was abandoned before stage B observed its write on a HEALTHY volume");
+            var why: [160]u8 = undefined;
+            self.stats.pass_panics.fire(std.fmt.bufPrint(&why, "a conveyor window was abandoned before stage B observed its write on a HEALTHY volume ({s}, {d} members)", .{ @errorName(err), w.members.len }) catch "a conveyor window was abandoned before stage B observed its write on a HEALTHY volume");
         }
         self.completeAbandoned(w.res);
         self.rollbackFailedTx(w.span(), w.undo);
@@ -2575,6 +2746,11 @@ pub const RamLane = struct {
     durability_passes: u64 = 0,
     acks: u64 = 0,
     ack_order: std.ArrayList(u64) = .empty,
+    /// Landed windows whose reservations completed, awaiting the
+    /// completed prefix (an earlier window still with its applier, §AW);
+    /// its length mirrored for the device thread's lock-free poll.
+    completed: std.ArrayList(Held) = .empty,
+    completed_pending: std.atomic.Value(usize) = .init(0),
 
     pub const Held = struct { w: *Window, landed: bool = false, fail: bool = false, issued_ns: u64 = 0 };
 
@@ -2584,7 +2760,9 @@ pub const RamLane = struct {
 
     pub fn deinit(self: *RamLane) void {
         assert(self.held.items.len == 0);
+        assert(self.completed.items.len == 0);
         self.held.deinit(self.gpa);
+        self.completed.deinit(self.gpa);
         self.ack_order.deinit(self.gpa);
     }
 
@@ -2619,7 +2797,16 @@ pub const RamLane = struct {
     /// landed; the poll is lock-free.
     pub fn landDue(self: *RamLane, device_ns: u64) bool {
         const head = self.head_issued_ns.load(.acquire);
-        if (head == std.math.maxInt(u64) or clock.monotonicNs() < head +| device_ns) return false;
+        if (head == std.math.maxInt(u64) or clock.monotonicNs() < head +| device_ns) {
+            // A completed group awaiting its prefix (§AW) is pumped by the
+            // device thread too: its missing predecessor may have been
+            // completed as abandoned, which submits nothing.
+            if (self.completed_pending.load(.acquire) == 0) return false;
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+            self.pump();
+            return false;
+        }
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         if (self.held.items.len == 0) return false;
@@ -2629,9 +2816,10 @@ pub const RamLane = struct {
         return true;
     }
 
-    /// Whether nothing is held (lock-free; the device thread's exit test).
+    /// Whether nothing is held or awaiting its prefix (lock-free; the
+    /// device thread's exit test).
     pub fn drained(self: *const RamLane) bool {
-        return self.head_issued_ns.load(.acquire) == std.math.maxInt(u64);
+        return self.head_issued_ns.load(.acquire) == std.math.maxInt(u64) and self.completed_pending.load(.acquire) == 0;
     }
 
     fn barrierFn(ctx: *anyopaque) Error!void {
@@ -2672,24 +2860,40 @@ pub const RamLane = struct {
     /// successor; reservations completed in journal order (failed ones too);
     /// ONE prefix wait; verdicts (rollback hook, latch, hole checkpoint);
     /// the apply-hole checkpoint before any survivor's ack; ONE barrier
-    /// (strict) else `needs_flush`; acks in journal order.
+    /// (strict) else `needs_flush`; acks in journal order. The prefix wait
+    /// is a CHECK here, never a park under the lane's lock: a window
+    /// reserved earlier may still be in its applier's hands (§AW) and
+    /// reach `submit` — which needs this lock — after a later one landed;
+    /// the landed group waits in `completed` and the next pump (that
+    /// submit's, a landing's, the test's) runs its verdicts.
     pub fn pump(self: *RamLane) void {
         while (self.held.items.len != 0 and self.held.items[0].landed) {
             var n: usize = 0;
             while (n < self.held.items.len and self.held.items[n].landed) : (n += 1) {}
-            const group = self.gpa.dupe(Held, self.held.items[0..n]) catch return;
-            defer self.gpa.free(group);
+            const landed = self.gpa.dupe(Held, self.held.items[0..n]) catch return;
+            defer self.gpa.free(landed);
             self.held.replaceRange(self.gpa, 0, n, &.{}) catch unreachable;
-            self.durability_passes += 1;
-            var prefix: u64 = 0;
-            for (group) |h| {
+            for (landed) |h| {
                 if (!h.fail) {
                     self.image.writeOps(h.w.ops()) catch {};
                 }
                 self.reg.complete(self.core, h.w.res);
-                prefix = @max(prefix, h.w.res.paddedEnd());
             }
-            self.reg.waitCompletedUpto(prefix);
+            self.completed.appendSlice(self.gpa, landed) catch @panic("RamLane (a test double): out of memory");
+            self.completed_pending.store(self.completed.items.len, .release);
+        }
+        if (self.completed.items.len == 0) return;
+        var prefix: u64 = 0;
+        for (self.completed.items) |h| prefix = @max(prefix, h.w.res.paddedEnd());
+        if (self.reg.completedUpto() < prefix) return;
+        {
+            self.durability_passes += 1;
+            const group = self.completed.toOwnedSlice(self.gpa) catch @panic("RamLane (a test double): out of memory");
+            defer self.gpa.free(group);
+            self.completed_pending.store(0, .release);
+            // Journal order for the verdicts and the acks (the submits
+            // may have arrived out of it).
+            core_sort.stable(Held, group, {}, heldStartLess);
             const cv = self.conveyor.?;
             var hole_end: ?u64 = null;
             var any_ok = false;
@@ -2733,6 +2937,10 @@ pub const RamLane = struct {
     fn checkpointPast(self: *RamLane, pos: u64) bool {
         const f = self.checkpoint_past orelse return true;
         return f(self.checkpoint_ctx.?, pos);
+    }
+
+    fn heldStartLess(_: void, a: Held, b: Held) bool {
+        return a.w.res.start < b.w.res.start;
     }
 };
 
@@ -3963,7 +4171,10 @@ test "4-thread commit storm with concurrent checkpoints: every ack present, repl
     try testing.expectEqual(@as(u64, 0), h.cv.stats.refusals.load());
     try testing.expectEqual(h.cv.stats.drained_txs.load(), h.cv.stats.acks.load() + h.cv.stats.refusals.load());
     try testing.expectEqual(h.cv.stats.leader_passes.load(), h.cv.stats.group_size.total());
-    try testing.expectEqual(h.cv.stats.lane_handoffs.load(), h.lane.durability_passes);
+    // A landed window whose predecessor was still with its applier (§AW)
+    // waits for it and shares its durability pass: passes ≤ handoffs.
+    try testing.expect(h.lane.durability_passes <= h.cv.stats.lane_handoffs.load());
+    try testing.expectEqual(h.cv.stats.lane_handoffs.load(), @as(u64, h.lane.ack_order.items.len));
     try testing.expectEqual(@as(u64, 0), h.cv.stats.windows_inflight.load());
     try testing.expectEqual(@as(u64, 0), h.cv.stats.queued.load());
     try testing.expectEqual(@as(u64, 0), h.cv.stats.commit_parked.load());
@@ -4033,47 +4244,73 @@ test "§L tie: the pad arithmetic — a sub-page window costs one grain whatever
     try testing.expectEqual(@as(u64, 50 * std.time.ns_per_ms), windowHoldFor(50).?.ceiling_ns);
 }
 
-test "§L tie: the worth gate — OFF declines 159 eligible windows then probes 2 forming + 8 sampled holds whose MEAN opens it at ½ an entry; ON tracks the EWMA per hold and closes below ¼ (the 2:1 band); a burst's mean below ½ leaves it closed" {
-    try testing.expect(!holdWorthIt(null, false) and !holdWorthIt(null, true));
-    try testing.expect(!holdWorthIt(GAIN_OPEN - 1, false));
-    try testing.expect(holdWorthIt(GAIN_OPEN, false));
+test "§L tie: the worth gate — OFF declines 159 eligible windows then probes 2 forming + 8 sampled holds whose MEAN opens it at ½ an entry; ON tracks the EWMA per hold and closes below ¼ (the 2:1 band); a burst's mean below ½ leaves it closed; the line scales with the batch (a quarter of the pad: c ≥ n/3) so a seven-entry batch collecting 0.4 declines" {
+    // The small-write shapes (n̄ ≤ 1.5): the ½ / ¼ lines as measured.
+    try testing.expect(!holdWorthIt(null, false, 1) and !holdWorthIt(null, true, 1));
+    try testing.expect(!holdWorthIt(GAIN_OPEN - 1, false, 1));
+    try testing.expect(holdWorthIt(GAIN_OPEN, false, 1));
     // The band: an open gate stays open down to a quarter.
-    try testing.expect(holdWorthIt(GAIN_CLOSE, true) and !holdWorthIt(GAIN_CLOSE - 1, true));
-    try testing.expect(holdWorthIt(GAIN_OPEN - 1, true));
+    try testing.expect(holdWorthIt(GAIN_CLOSE, true, 1) and !holdWorthIt(GAIN_CLOSE - 1, true, 1));
+    try testing.expect(holdWorthIt(GAIN_OPEN - 1, true, 1));
     try testing.expectEqual(GAIN_UNIT / 2, GAIN_OPEN);
     try testing.expectEqual(GAIN_UNIT / 4, GAIN_CLOSE);
+    // The batch-scaled line: n/3 to open, n/6 to stay open — the ½ line
+    // at n = 1 (n/3 < ½), 2⅓ entries at n = 7; the create shape's 0.4
+    // per hold on seven-entry batches is declined and closes an open gate.
+    try testing.expectEqual(GAIN_OPEN, gainLine(false, 1));
+    try testing.expectEqual(GAIN_CLOSE, gainLine(true, 1));
+    try testing.expectEqual(7 * GAIN_UNIT / 3, gainLine(false, 7));
+    try testing.expectEqual(7 * GAIN_UNIT / 6, gainLine(true, 7));
+    try testing.expect(!holdWorthIt(GAIN_UNIT * 2 / 5, false, 7) and !holdWorthIt(GAIN_UNIT * 2 / 5, true, 7));
+    try testing.expect(holdWorthIt(3 * GAIN_UNIT, false, 7));
     try testing.expectEqual(@as(u32, 2), HOLD_PROBE_FORMING);
     try testing.expectEqual(@as(u32, 8), HOLD_PROBE_BURST);
     try testing.expectEqual(@as(u32, 160), HOLD_PROBE_PERIOD);
     var g: WorthGate = .{};
     // OFF: the first 159 eligible windows are declined, the 160th starts a burst.
-    for (0..HOLD_PROBE_PERIOD - 1) |_| try testing.expectEqual(WorthGate.Verdict.decline, g.decide());
+    for (0..HOLD_PROBE_PERIOD - 1) |_| try testing.expectEqual(WorthGate.Verdict.decline, g.decide(1));
     // rand-4k-write's shape: the forming holds collect little (the unpaced
     // regime), the paced holds 1.375 — the burst's mean opens the gate.
     for (0..HOLD_PROBE_FORMING) |_| {
-        try testing.expectEqual(WorthGate.Verdict.probe, g.decide());
-        g.observe(.probe, GAIN_UNIT / 2);
+        try testing.expectEqual(WorthGate.Verdict.probe, g.decide(1));
+        g.observe(.probe, GAIN_UNIT / 2, 1);
     }
     for (0..HOLD_PROBE_BURST) |i| {
-        try testing.expectEqual(WorthGate.Verdict.probe, g.decide());
-        g.observe(.probe, if (i % 10 < 3) 2 * GAIN_UNIT else GAIN_UNIT);
+        try testing.expectEqual(WorthGate.Verdict.probe, g.decide(1));
+        g.observe(.probe, if (i % 10 < 3) 2 * GAIN_UNIT else GAIN_UNIT, 1);
     }
     try testing.expectEqual(@as(u64, 1375), g.gainMilli()); // 11/8 entries per hold
-    try testing.expectEqual(WorthGate.Verdict.hold, g.decide());
+    try testing.expectEqual(WorthGate.Verdict.hold, g.decide(1));
     // ON: the EWMA tracks; empty holds close it in thirteen (1.375 ×
     // 0.875¹³ < ¼ — the band's lower line), after which it declines again.
     var holds_until_closed: u32 = 0;
-    while (g.decide() == .hold) : (holds_until_closed += 1) g.observe(.hold, 0);
+    while (g.decide(1) == .hold) : (holds_until_closed += 1) g.observe(.hold, 0, 1);
     try testing.expectEqual(@as(u32, 13), holds_until_closed);
     // fsync-4k's shape: a burst whose mean is 0.125 leaves the gate closed.
     var f: WorthGate = .{};
-    for (0..HOLD_PROBE_PERIOD - 1) |_| _ = f.decide();
+    for (0..HOLD_PROBE_PERIOD - 1) |_| _ = f.decide(1);
     for (0..HOLD_PROBE_FORMING + HOLD_PROBE_BURST) |i| {
-        try testing.expectEqual(WorthGate.Verdict.probe, f.decide());
-        f.observe(.probe, if (i == 5) GAIN_UNIT else 0);
+        try testing.expectEqual(WorthGate.Verdict.probe, f.decide(1));
+        f.observe(.probe, if (i == 5) GAIN_UNIT else 0, 1);
     }
     try testing.expectEqual(@as(u64, 125), f.gainMilli());
-    try testing.expectEqual(WorthGate.Verdict.decline, f.decide());
+    try testing.expectEqual(WorthGate.Verdict.decline, f.decide(1));
+    // The create shape: a burst collecting 0.4 per hold on seven-entry
+    // batches (above the ½ line, a twentieth of the pad) stays closed; an
+    // open gate meeting it closes.
+    var c: WorthGate = .{};
+    for (0..HOLD_PROBE_PERIOD - 1) |_| _ = c.decide(7);
+    for (0..HOLD_PROBE_FORMING + HOLD_PROBE_BURST) |_| {
+        try testing.expectEqual(WorthGate.Verdict.probe, c.decide(7));
+        c.observe(.probe, GAIN_UNIT * 2 / 5, 7);
+    }
+    try testing.expectEqual(@as(u64, 399), c.gainMilli());
+    try testing.expectEqual(WorthGate.Verdict.decline, c.decide(7));
+    var o: WorthGate = .{ .open = true };
+    o.gain.sample(GAIN_UNIT * 2 / 5);
+    try testing.expectEqual(WorthGate.Verdict.hold, o.decide(1));
+    try testing.expectEqual(WorthGate.Verdict.decline, o.decide(7));
+    try testing.expect(!o.open);
 }
 
 // THE §L RED TEST (red at f27c501: 16 windows per committer round, pad

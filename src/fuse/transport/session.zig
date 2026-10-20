@@ -1994,6 +1994,13 @@ pub const Session = struct {
         try w.writeAll("\"transport_zc_write_hold_ns\":");
         try slot.zc_write_hold_ns.snapshot().writeJson(w);
         try w.writeByte(',');
+        try w.writeAll("\"transport_held_write_phase_ns\":{\"to_store\":");
+        try worker.held_write_to_store_ns.snapshot().writeJson(w);
+        try w.writeAll(",\"store\":");
+        try worker.held_write_store_ns.snapshot().writeJson(w);
+        try w.writeAll(",\"to_commit\":");
+        try worker.held_write_to_commit_ns.snapshot().writeJson(w);
+        try w.writeAll("},");
         try field(w, "transport_zc_write_extractions", slot.zc_write_extractions.load());
         try field(w, "transport_zc_write_extract_bytes", slot.zc_write_extract_bytes.load());
         try field(w, "transport_zc_write_lazy_extractions", slot.zc_write_lazy_extractions.load());
@@ -2316,9 +2323,16 @@ const Snapshot = struct {
     direct_legs: u64,
     bridges: u64,
     late_demotions: u64,
+    /// The held write's three phase counts (each a sample per direct store).
+    phase_to_store: u64,
+    phase_store: u64,
+    phase_to_commit: u64,
 
     fn take() Snapshot {
         return .{
+            .phase_to_store = worker.held_write_to_store_ns.snapshot().count,
+            .phase_store = worker.held_write_store_ns.snapshot().count,
+            .phase_to_commit = worker.held_write_to_commit_ns.snapshot().count,
             .bridge_cancels = worker.bridge_cancels.load(),
             .bridge_lost = worker.bridge_lost.load(),
             .bridge_orphans = worker.bridge_orphans.load(),
@@ -3538,6 +3552,11 @@ test "e2e zc WRITE, the overlay class (charter §6.2 item 1): a 1 MiB page-align
     try testing.expectEqual(@as(u64, 0), mid.extractions - before.extractions);
     try testing.expectEqual(@as(u64, 0), mid.direct_failures - before.direct_failures);
     try testing.expectEqual(@as(u64, 0), mid.direct_refusals - before.direct_refusals);
+    // The held write's three phases each sampled the one direct store (delivery → store pushed →
+    // its CQE → the commit pushed): the latency split's instrument.
+    try testing.expectEqual(@as(u64, 1), mid.phase_to_store - before.phase_to_store);
+    try testing.expectEqual(@as(u64, 1), mid.phase_store - before.phase_store);
+    try testing.expectEqual(@as(u64, 1), mid.phase_to_commit - before.phase_to_commit);
     // 1 MiB at 3.5 MiB straddles the 4 MiB block edge: two pieces ⇒ extracted at delivery (EFBIG from
     // the scratch array is the echo filesystem's answer, the counters the transport's).
     _ = linux.pwrite(fd, buf.ptr, mib, (3 << 20) + (512 << 10));

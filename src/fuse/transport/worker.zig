@@ -268,6 +268,16 @@ pub var owed_spin_hits: counters.ShardedCounter = .{};
 pub var owed_spin_falls: counters.ShardedCounter = .{};
 pub var owed_spin_skips: counters.ShardedCounter = .{};
 pub var owed_spin_ns: counters.ShardedCounter = .{};
+/// `transport_held_write_phase_ns`: a HELD write's life on its worker, in
+/// three exact-sum phases — `to_store` delivery → its direct store's SQE
+/// pushed (the dispatch, the admission, the handler's hop to this ring),
+/// `store` the push → the device CQE (the DMA and its queueing), `to_commit`
+/// the CQE → the commit pushed (the handler's postlude and its hop back).
+/// `delivery → commit` = the three summed; fio's clat less that sum is the
+/// kernel's share (pre-delivery queueing, the post-commit completion).
+pub var held_write_to_store_ns: counters.ShardedLatencyHistogram = .{};
+pub var held_write_store_ns: counters.ShardedLatencyHistogram = .{};
+pub var held_write_to_commit_ns: counters.ShardedLatencyHistogram = .{};
 /// `transport_residency_replies`: fresh deliveries answered ENOTCONN
 /// after the drain.
 pub var residency_replies: counters.ShardedCounter = .{};
@@ -794,6 +804,9 @@ const StoreCell = struct {
     fd: linux.fd_t = -1,
     off: u64 = 0,
     len: u32 = 0,
+    /// When the store's CQE landed (0 = none pending): the commit that
+    /// follows closes the `to_commit` phase and clears it.
+    done_ns: u64 = 0,
 };
 
 /// A fused READ frame (arm (b)): the request re-polled through the
@@ -1850,6 +1863,11 @@ pub const Group = struct {
         self.bounce_idle_tick[gent] = mem_budget.authority.ticks();
         ring_replies.inc();
         self.commits_pushed += 1;
+        const cell = &self.store_cells[gent];
+        if (cell.done_ns != 0) {
+            held_write_to_commit_ns.record(clock.monotonicNs() -| cell.done_ns);
+            cell.done_ns = 0;
+        }
     }
 
     /// The RETAIN commit: the request ends, the slot's pages stay
@@ -1868,6 +1886,11 @@ pub const Group = struct {
         self.bounce_idle_tick[gent] = mem_budget.authority.ticks();
         ring_replies.inc();
         self.commits_pushed += 1;
+        const cell = &self.store_cells[gent];
+        if (cell.done_ns != 0) {
+            held_write_to_commit_ns.record(clock.monotonicNs() -| cell.done_ns);
+            cell.done_ns = 0;
+        }
         if (m.slots.ent(e).release_pending) self.pushRelease(gent, commit_id, .handler);
     }
 
@@ -2129,6 +2152,9 @@ pub const Group = struct {
                 } else {
                     zc_write_direct_failures.inc();
                 }
+                const now = clock.monotonicNs();
+                held_write_store_ns.record(now -| born);
+                cell.done_ns = now;
                 cell.res = res;
                 cell.event.set(self.shared.io);
             },
@@ -2212,7 +2238,9 @@ pub const Group = struct {
                 zc_write_direct_refusals.inc();
                 cell.res = -@as(i32, @intCast(@backingInt(linux.E.BUSY)));
                 cell.event.set(self.shared.io);
+                continue;
             }
+            held_write_to_store_ns.record(self.deadlines.born_ns[gent] -| ent.owed_since_ns.load(.monotonic));
         }
     }
 

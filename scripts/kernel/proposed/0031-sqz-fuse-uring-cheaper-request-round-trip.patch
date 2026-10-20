@@ -60,16 +60,31 @@ This patch takes the FUSE-uring-specific terms that are not the protocol:
 4. fuse_aio_complete() bumps fc->attr_version (a connection-wide atomic)
    under fi->lock for every completed async direct I/O; the synchronous
    path bumps only for writes (fuse_write_update_attr). A read changes
-   nothing the bump guards, and at 1.25 M reads/s the atomic and the
-   per-file lock are contended across every CPU completing one file's
-   reads. Bump for writes only. (This is fs/fuse/file.c, not the uring
-   transport; it is here because the profile put it on the same path.)
+   nothing the bump guards. Bump for writes only. (This is fs/fuse/file.c,
+   not the uring transport; it is here because the profile put it on the
+   same path. bpftrace puts fi->lock at 0.5 % of the workers' spinlock
+   slowpath entries, so what this saves is the global atomic64 RMW per
+   completed read, not lock contention.)
+
+What bpftrace counted on the product's row (5 s at 1.2 M reads/s): per
+read 1.0 delivery task work, 1.0 COMMIT_AND_FETCH, 6 queue->lock trips
+(5 on the daemon's side, 1 on the submitter's) entering the slowpath 0.5
+times (get_next 10 %, req_end 8.6 %, commit_fetch 8.2 %, send 7.4 %,
+send_in_task 5.6 % of the workers' slowpath entries, the submitter's
+queue_bq_req 95 % of fio's); 59 % of the workers' slowpath entries are
+__queue_work — the nvmet-loop target's pool lock under the daemon's
+READ_FIXED, the substrate's, which ext4 pays in fio's context (0.43 us
+per read there). The workers issue 1.07 wakeups per read (fio's ring and
+the nvmet kworker) and receive 0.67 (the kworker's completion).
 
 Expected saving, from the profile: 0.25-0.35 us of the worker's ~2.0 us
 kernel share per read (the header copies ~0.1, the zc allocations ~0.1,
-the lock trip and the attr_version bump ~0.05-0.15), i.e. 12-17 % of the
+the lock trip ~0.05, the attr_version atomic ~0.03), i.e. 12-17 % of the
 round trip's kernel cost and 4-5 % of today's 6.4 us daemon cost per
-cold 4 KiB read. The daemon's probe plan: the boundary ruler row
+cold 4 KiB read. A further 0.1-0.2 us sits in the remaining queue->lock
+sections (one section per commit_fetch would need the header copy under
+the lock or a lock-free entry lookup by buf_index) — a follow-up once
+this one is measured. The daemon's probe plan: the boundary ruler row
 (SQUEEZEFS_TEST_READ_ZERO_FILL=prefilled, 4k randread QD32x4) before and
 after the boot, daemon cores per read at equal IOPS (fio is the ceiling
 there), and the flat perf profile's _copy_to_iter / iov_iter_advance /

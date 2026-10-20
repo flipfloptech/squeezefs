@@ -780,10 +780,11 @@ pub const Shared = struct {
     /// class (`> block/8`, the streaming write) runs when it leaves this
     /// thread — `cpu`: the queue's CPU lane like every data-class request
     /// (the shipped arm); `node`: round-robin over the node's handler
-    /// lanes; `node_only`: the same, and never the worker's own lane. The
-    /// measured arms (rung-10-seq-parity): neither shortened the round —
+    /// lanes; `node_only`: the same, and never the worker's own lane; `own`:
+    /// always the worker's own lane, past the own-depth share. The measured
+    /// arms (rung-10-seq-parity): `node` and `node_only` shortened no round —
     /// the device phase stood at ≈ 490 µs with the worker freed of handler
-    /// work, and the hops cost 0.3–1.4 cores.
+    /// work, and the hops cost 0.3–1.4 cores; `own` is wave 2's arm.
     stream_lanes: StreamLanes = .cpu,
     /// The no-open posture (`Config.no_open`, decision 0003 §AF): a FLUSH
     /// is probed here first, and its drain is the data class.
@@ -791,7 +792,7 @@ pub const Shared = struct {
     /// The executor's budget the driven lane's fiber reserve derives from.
     budget_bytes: u64 = 0,
 
-    pub const StreamLanes = enum(u8) { cpu, node, node_only };
+    pub const StreamLanes = enum(u8) { cpu, node, node_only, own };
 
     pub fn nodeOf(self: *const Shared, qid: u16) ?u16 {
         const n = self.node_of(self.node_ctx, qid) orelse return null;
@@ -1586,15 +1587,19 @@ pub const Group = struct {
 
     /// Where a held write's handler runs (pure; `Shared.stream_lanes`):
     /// `own` = the worker's own lane (the own-depth share has room, and the
-    /// class is not barred from it); `spread` = a spilled write of the
-    /// overlay class (`> block/8`, the hold class's own line) under `node`
-    /// or `node_only` takes a node-round-robin lane instead of the queue's
-    /// CPU lane. A W1-class write never spreads; `cpu` never spreads.
+    /// class is not barred from it; under `own` the overlay class takes it
+    /// whatever the share — its handler is ≈ 16 µs of CPU against a ≈ 500 µs
+    /// device phase, and every hop off the worker is two wakes each way);
+    /// `spread` = a spilled write of the overlay class (`> block/8`, the hold
+    /// class's own line) under `node` or `node_only` takes a node-round-robin
+    /// lane instead of the queue's CPU lane. A W1-class write never spreads
+    /// and keeps the share; `cpu` never spreads.
     pub const Placement = struct { own: bool, spread: bool };
 
     pub fn heldWritePlacement(held: bool, len: u32, block: u64, lanes: Shared.StreamLanes, own_room: bool) Placement {
         if (!held) return .{ .own = false, .spread = false };
         const streaming = lanes != .cpu and zc.holdClass(len, zc.streamingFloor(block)) == .overlay;
+        if (streaming and lanes == .own) return .{ .own = true, .spread = false };
         const own = own_room and !(streaming and lanes == .node_only);
         return .{ .own = own, .spread = streaming and !own };
     }
@@ -3766,8 +3771,12 @@ test "a held write's placement (SQUEEZEFS_FUSE_STREAM_LANES): the overlay class 
     // `node_only`: the streaming class never takes the worker's lane.
     try testing.expectEqual(P{ .own = false, .spread = true }, Group.heldWritePlacement(true, mib, block, .node_only, true));
     try testing.expectEqual(P{ .own = false, .spread = true }, Group.heldWritePlacement(true, mib, block, .node_only, false));
+    // `own`: the streaming class takes the worker's lane whatever the share; the share still rules W1.
+    try testing.expectEqual(P{ .own = true, .spread = false }, Group.heldWritePlacement(true, mib, block, .own, false));
+    try testing.expectEqual(P{ .own = true, .spread = false }, Group.heldWritePlacement(true, mib, block, .own, true));
+    try testing.expectEqual(P{ .own = false, .spread = false }, Group.heldWritePlacement(true, w1, block, .own, false));
     // W1 (at the line and under it) keeps the CPU lane under every arm.
-    for ([_]Shared.StreamLanes{ .cpu, .node, .node_only }) |arm| {
+    for ([_]Shared.StreamLanes{ .cpu, .node, .node_only, .own }) |arm| {
         try testing.expectEqual(P{ .own = true, .spread = false }, Group.heldWritePlacement(true, w1, block, arm, true));
         try testing.expectEqual(P{ .own = false, .spread = false }, Group.heldWritePlacement(true, 4096, block, arm, false));
     }

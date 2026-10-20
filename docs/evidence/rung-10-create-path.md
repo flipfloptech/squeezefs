@@ -30,7 +30,7 @@ before and after, `perf record -a -g` mid-phase; `sdiff.py`: the per-op split).
   stable run every 8 records (an 80 KiB array mmap'd and unmapped with a TLB shootdown across the
   daemon's threads).
 
-## Lever 1 — the parent's stamp is parked (decision 0003 §AV; `3c3ceb6`)
+## Lever 1 — the parent's stamp is parked (decision 0003 §AV; `96d8b98`)
 
 A create, symlink or unlink of a non-directory child stages inode + dentry — two records on fresh,
 exclusively guarded keys — and PARKS the parent's stamp (`PendingTimes.park` under the shared
@@ -41,59 +41,88 @@ drains ONE entry, strict mode stages the Δ as before. Measured: creates 43.7 k 
 38.2 k → 53.3 k/s; journal 225 → 182 B per create; the lane 21.8 → 15.1 µs per create (still 93 % of
 a core).
 
-## Lever 2 — the apply leaves the lane (decision 0003 §AW; `a2350ce`)
+## Lever 2 — the pass reserves first; the apply can leave the lane (decision 0003 §AW; `e9519fb`)
 
-The pass drains, recalls, admits, RESERVES and stamps, then hands the window to an applier fiber
-(a fixed set of four handler lanes, `clamp(cpus/8, 2, 4)`) that resolves, locks the union, captures
-the pre-images, applies, encodes and submits; the heap admission is the committer's before it
-enqueues; the lane completes the reservation after the landing, after the apply (the tail law
-stands); the tail fast path is per key; the §L hold rides a window on the device, ends at the next
-landing, its gate's line scales with the batch (`c ≥ n/3`), and a batch drained with the appliers
-full waits for one to leave. The contracts' applier is inline (stage A whole, as before).
+The pass drains, recalls, admits, RESERVES and stamps, then hands the window to an applier
+(`Conveyor.applyWindow`: resolve, the union lock, the pre-images, the apply, the threshold, the
+encode, the submit); the heap admission is the committer's before it enqueues; the lane completes
+the reservation after the landing, after the apply (the tail law stands); the tail fast path is per
+key; the §L hold rides a window on the device, ends at the next landing, its gate's line scales with
+the batch (`c ≥ n/3`), and a batch drained with the appliers full waits for one to leave. The
+applier VENUE is the A/B lever `SQUEEZEFS_META_APPLIERS` = N handler lanes (a window on the lane its
+parent-side tree hashes to; a window alone in flight applies inline); **0 ships**: the inline
+applier on the pass's thread.
 
-What the measurements said on the way (all `-np 32 -u`, one session each):
+What the venue's arms measured on the way (`-np 32 -u`, one session each unless noted):
 
-| variant | creates/s | removals/s | lane µs/create | note |
+| arm | creates/s | removals/s | lane µs/create | note |
 |---|---|---|---|---|
-| lever 1 alone | 61.9 k | 53.3 k | 15.1 | the lane at 93 % |
-| + the committer as applier (its own worker lane) | 56–60 k | 53–63 k | 4.7 | the §L hold held 62 % of the passes 170 µs each; the appliers' leaf locks held 114 µs per 1.4-entry window at 32 concurrent, and the workers' FUSE queues stalled behind them |
-| + no hold at all | 57 k | 63 k | 10.5 | 230 k windows of 1.4 entries; `leaf_lock_hold` 114 µs |
-| + appliers on the 2 `sqz-meta` lanes | 63.7 k | **33.8 k** | 5.8 | the reclaim's destroy batches share the pool |
-| + appliers over all 32 handler lanes | 63.1 k | 59.4 k | 6.4 | cold threads: the apply's CPU doubled |
-| **+ four pinned handler lanes (landed)** | **68.4 k** | **63.1 k** | 6.3 | `leaf_lock_hold` 67 µs per 2.1 entries; create 375 µs |
+| lever 1 alone (the inline arm) | 61.9 k | 53.3 k | 15.1 | the lane at 93 % |
+| the committer as applier (its own worker lane) | 56–60 k | 53–63 k | 4.7 | the §L hold held 62 % of the passes 170 µs each; 32 concurrent appliers held their leaves 114 µs per 1.4-entry window and stalled the workers' FUSE queues |
+| no hold at all | 57 k | 63 k | 10.5 | 230 k windows of 1.4 entries; `leaf_lock_hold` 114 µs |
+| the 2 `sqz-meta` lanes | 63.7 k | **33.8 k** | 5.8 | the reclaim's destroy batches share the pool |
+| all 32 handler lanes, round-robin | 63.1 k | 59.4 k | 6.4 | cold threads: the apply's CPU per create doubled |
+| four pinned handler lanes (3 legs) | 69.0 k | 62.2 k | 6.3 | files 1.48× / 1.55× and directory removal 1.33× against dev — but **directory creation 0.93×** (41.8–42.4 k against 41.2–47.7 k) and a shared directory's creates 0.84× |
+| + affinity by the parent-side tree | 63.9 k | 62.8 k | — | the shared directory's creates back to 0.97×, its mkdirs 0.72× |
+| + a window alone in flight applies inline | 60.2 k | 57.9 k | — | the shared mkdirs 0.91×; `-u` directory creation 0.89× |
 
-The lane is no longer the ceiling (`sqz-jrnl` 2.0 s of a 7 s phase). The ceiling now: the apply's
-intrinsic cost on the appliers (15–17 µs of CPU per create: the O(overlay) re-merge and snapshot
-destroy, the pre-image lookups, two allocations per record, a snapshot publish per record group)
-and the closed loop's latency (LOOKUP 41 µs + CREATE 375 µs at 32 ranks).
+The lane stops being the ceiling under the lever (`sqz-jrnl` 2.0 s of a 7 s phase), but the serial
+hot-leaf shapes — every rank's mkdir rewriting a parent whose record shares one leaf with 31 others,
+a shared directory's creates — pay the handoff and the appliers' lock handoffs (an applier's
+`leaf_lock_hold` 67 µs per 2.1 entries against the serial pass's 13 µs per entry), and the owner's
+rule is that a regression is a defect: the lever ships off, its arm pinned by the `§AW` storm test
+(`SQUEEZEFS_META_APPLIERS=2`: every ack present, the reopen replays every record).
 
-## A/B against dev
+## A/B against dev (the shipped default)
 
-TBD-AB
+A = dev (`74e5402`, the main tree's dist build), B = this branch (`e9519fb`, the create path identical to the landed `c86f5bc`); `mdtest -n 10000 -i 1`,
+each leg a fresh format on the RAM set, legs interleaved, every phase started at Tctl ≤ 70 °C.
+
+| row | A (dev) | B | B ÷ A |
+|---|---|---|---|
+| `-np 32 -u` file creation /s | 36.5–49.8 k, mean 44.0 k (4 legs) | 61.3–71.8 k, mean 64.2 k (4) | **1.46** |
+| `-np 32 -u` file removal /s | 32.8–41.8 k, mean 38.2 k (4) | 53.3–56.3 k, mean 54.9 k (4) | **1.44** |
+| `-np 32 -u` directory creation /s | 43.3–44.5 k, mean 43.9 k (3) | 45.4–51.2 k, mean 49.0 k (3) | **1.12** |
+| `-np 32 -u` directory removal /s | 37.2–40.7 k, mean 38.4 k (3) | 38.8–44.4 k, mean 42.2 k (3) | **1.10** |
+| `-np 32` shared directory, file creation /s | 14.4–16.5 k, mean 15.2 k (3) | 15.1–15.7 k, mean 15.3 k (3) | 1.01 |
+| `-np 32` shared directory, directory creation /s | 11.1–13.3 k, mean 12.0 k (3) | 10.5–12.2 k, mean 11.6 k (3) | 0.97 (inside A's spread) |
+| file stat /s (`-np 32 -u`, unchanged path) | 10.9 M | 10.9 M | 1.00 |
+
+Against the substrate's local filesystems (`rung-10-localfs-comparison.md`): file creation 64 k
+against ext4's 711 k (9 %, was 5.8 %) and xfs's 471 k; file removal 55 k against 573 k / 183 k;
+directory creation 49 k against 246 k / 369 k; directory removal 42 k against 456 k / 158 k. The
+target of 200 k was not reached; the bars are not on par.
+
+The data rows (`scripts/perf/quiet.sh ram-sqz cr-{A,B}`, 20 s each, A then B at the same dev head):
+4k randread QD32×4 1.07 M → 1.24 M IOPS, 4k randwrite QD32×4 1.042 M → 1.040 M, seq write 1 MiB
+QD16×4 52.5 → 52.9 GB/s — no regression.
 
 ## The remaining gap and what closes it
 
-1. **The overlay's shape** (the largest term, every variant): `NodeDirty.overlay` is one sorted array
-   re-cloned into the stable run every 8 applies and freed with the previous snapshot; a leaf that
-   outruns its writeback holds thousands of records. A persistent run (immutable chunks shared
-   between snapshots, an insert copying one chunk) makes an apply O(log n) and the publish O(1):
-   the apply's CPU per create drops from ≈ 15 to ≈ 3 µs by the profile's shares. With it the
-   applier venue carries ≥ 1 M txs/s and four appliers hold their leaves microseconds, not tens.
-2. **The closed loop**: at 32 ranks the rate is 32 ÷ (lookup + create latency). After 1, the create
-   is ≈ the window round trip (device 14 µs + the lane's issue and ack ≈ 50 µs) plus the handler's
-   own ≈ 60 µs: ≈ 110 µs ⇒ ≈ 250 k/s at 32 ranks; ext4's 711 k needs the handler's pre-commit work
-   cut too (the `user.squeezefs.gather` xattr range per create, the stripe verdict's process-wide
-   mutex, `allocateIno`'s lease-table scan and allocation per mint — ≈ 10 µs of the worker's 40).
-3. **The ack fan-out** (one eventfd write per member on the lane, 10 % of it): the applier parks for
-   the landing and fans the window's acks out itself.
+At 32 ranks the rate is 32 ÷ (the LOOKUP + the CREATE latency): 41 + 375–430 µs today. The engine's
+serial stage is gone under the lever; what is left is the apply's intrinsic cost and the closed
+loop's latency.
+
+1. **The overlay's shape** (the largest term under every arm): `NodeDirty.overlay` is one sorted
+   array re-cloned into the stable run every 8 applies and freed with the previous snapshot; a leaf
+   that outruns its writeback holds thousands of records (mean 150–230 at apply after lever 1, max
+   4,299). A persistent run — immutable chunks shared between snapshots, an insert copying one
+   chunk — makes an apply O(log n) and the publish O(1); by the profile's shares the apply's CPU per
+   create drops from ≈ 15 to ≈ 3 µs and an applier holds a hot leaf microseconds, which is what
+   lets the lever ship ON for the directory rows too (the path to ≈ 250 k/s at 32 ranks).
+2. **The handler's own ≈ 60 µs per create**: the `user.squeezefs.gather` xattr range per create,
+   the stripe verdict's process-wide mutex, `allocateIno`'s lease-table scan and allocation per
+   mint, the negative LOOKUP's 41 µs (28 on dev) — the FUSE side's share of ext4's 711 k.
+3. **The ack fan-out** (one eventfd write per member on the lane): the applier parks for the landing
+   and fans its window's acks out itself.
 4. **Directories**: a mkdir's parent nlink shift stays an exclusive Put per op on the shared leaf
    (fsck's census forbids parking it); 1 is what moves that row.
 
 ## Suites
 
 Unit families (`conveyor`, `meta.backend`, `kv_fs`, `kv_fs_stripes`, `economy`, `meta.tx`,
-`journal_lane`, `lifecycle`, `e2e`, `fsck`, `node_cache`, `exec`): 535/564 passed, 29 skipped. Smoke
-rows (THE KILL MATRIX and its two-ring row, A STRIPED DIRECTORY ON ONE DAEMON, THE SHARED HOT
-DIRECTORY ACROSS DAEMONS, A DEAD MANAGER HOLDING A STRIPED HOT DIRECTORY, kill -9 mid-tar on both
-cadences, KILL -9 BETWEEN A PROMOTION'S COMMIT AND ITS RING RELEASE): 46/46. `fsck --offline` clean
-after every session. No full gate (the train gates).
+`journal_lane`, `lifecycle`, `e2e`, `fsck`, `node_cache`, `exec`, `rails`, `knobs`, `stats`):
+610/646 passed, 36 skipped (`-Dfresh=true`). Smoke rows (THE KILL MATRIX and its two-ring row, A STRIPED DIRECTORY ON ONE DAEMON, THE
+SHARED HOT DIRECTORY ACROSS DAEMONS, A DEAD MANAGER HOLDING A STRIPED HOT DIRECTORY, kill -9 mid-tar
+on both cadences, KILL -9 BETWEEN A PROMOTION'S COMMIT AND ITS RING RELEASE): 46/46 (`-Dfresh=true`). `fsck
+--offline` clean after every session (≈ 40 of them). No full gate (the train gates).

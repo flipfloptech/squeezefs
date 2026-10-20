@@ -6991,6 +6991,145 @@ test "smoke: KERNEL AIO on the plain mount (no shim): io_submit of 8 × 4 KiB PW
     }
 }
 
+/// `reads` random 4 KiB O_DIRECT PREADs of `path` (kernel aio, `depth` per
+/// submit), every event's `res` the page, every page byte-exact against
+/// `pattern` (the same bytes on the host fs) — the perf matrix's
+/// `rr4k` shape in miniature. Offsets below `len` (4 KiB-aligned).
+fn aioRandomReads(path: [:0]const u8, pattern: [:0]const u8, len: u64, reads: usize, depth: usize, seed: u64) !void {
+    const aio = @import("../shim/aio.zig");
+    const page: usize = 4096;
+    var ctx: aio.io_context_t = 0;
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.syscall2(.io_setup, @intCast(depth), @intFromPtr(&ctx))));
+    defer _ = linux.syscall1(.io_destroy, ctx);
+    const rc = linux.open(path.ptr, .{ .ACCMODE = .RDONLY, .DIRECT = true, .CLOEXEC = true }, 0);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(rc));
+    const fd: linux.fd_t = @intCast(rc);
+    defer _ = linux.close(fd);
+    const prc = linux.open(pattern.ptr, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(prc));
+    const pfd: linux.fd_t = @intCast(prc);
+    defer _ = linux.close(pfd);
+    const gpa = testing.allocator;
+    const buf = try gpa.alignedAlloc(u8, .fromByteUnits(page), depth * page);
+    defer gpa.free(buf);
+    const want = try gpa.alloc(u8, page);
+    defer gpa.free(want);
+    const cbs = try gpa.alloc(aio.Iocb, depth);
+    defer gpa.free(cbs);
+    const ptrs = try gpa.alloc(*aio.Iocb, depth);
+    defer gpa.free(ptrs);
+    const evs = try gpa.alloc(aio.IoEvent, depth);
+    defer gpa.free(evs);
+    var prng = std.Random.DefaultPrng.init(seed);
+    const rnd = prng.random();
+    var offs = try gpa.alloc(u64, depth);
+    defer gpa.free(offs);
+    var done: usize = 0;
+    while (done < reads) {
+        const n = @min(depth, reads - done);
+        for (cbs[0..n], 0..) |*cb, i| {
+            offs[i] = rnd.uintLessThan(u64, len / page) * page;
+            cb.* = .{ .data = i, .key = 0, .aio_rw_flags = 0, .aio_lio_opcode = aio.IOCB_CMD_PREAD, .aio_reqprio = 0, .aio_fildes = fd, .buf = @intFromPtr(buf.ptr + i * page), .nbytes = page, .offset = @intCast(offs[i]), .__pad3 = 0, .flags = 0, .resfd = 0 };
+            ptrs[i] = cb;
+        }
+        try testing.expectEqual(n, linux.syscall3(.io_submit, ctx, n, @intFromPtr(ptrs.ptr)));
+        var got: usize = 0;
+        while (got < n) {
+            const ts: linux.timespec = .{ .sec = 30, .nsec = 0 };
+            const r = linux.syscall5(.io_getevents, ctx, 1, n - got, @intFromPtr(evs.ptr + got), @intFromPtr(&ts));
+            try testing.expectEqual(linux.E.SUCCESS, linux.errno(r));
+            try testing.expect(r > 0);
+            got += r;
+        }
+        for (evs[0..n]) |ev| {
+            try testing.expectEqual(@as(i64, page), ev.res);
+            const i: usize = @intCast(ev.data);
+            try testing.expectEqual(page, linux.pread(pfd, want.ptr, page, @intCast(offs[i])));
+            try testing.expectEqualSlices(u8, want, buf[i * page ..][0..page]);
+        }
+        done += n;
+    }
+}
+
+test "smoke: THE READ VIEW — a 16 MiB striped file (no cache path), its custody landed; 512 random 4 KiB O_DIRECT reads (QD 8) byte-exact: every probe and every post-DMA recheck resolves off the per-ino view (read_view_hits ≥ 2 per read, no view miss after the first read's fill, at most the atime echo's refill); a truncate stales the view (a read at the old length is EOF, read_view_stale moved), an overwrite's publish stales it again (the new bytes read back), the must-stay-0 set clean" {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    try rig.formatSet(false);
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(0);
+    const file_len: u64 = 16 << 20;
+    var script: [512]u8 = undefined;
+    gpa.free(try rig.shOk(rig.work, try std.fmt.bufPrint(&script, "head -c {d} /dev/urandom > pattern && cp pattern {s}/f && sync -f {s}", .{ file_len, rig.mp, rig.mp })));
+    var fb: [192]u8 = undefined;
+    const f = try std.fmt.bufPrintSentinel(&fb, "{s}/f", .{rig.mp}, 0);
+    var pb: [linux.PATH_MAX]u8 = undefined;
+    const pattern = try std.fmt.bufPrintSentinel(&pb, "{s}/pattern", .{rig.work}, 0);
+    // One read first: the view fills off the KV path for this file.
+    try aioRandomReads(f, pattern, file_len, 1, 1, 1);
+    const t0 = try rig.stats();
+    defer gpa.free(t0);
+    const reads: usize = 512;
+    try aioRandomReads(f, pattern, file_len, reads, 8, 2);
+    const t1 = try rig.stats();
+    defer gpa.free(t1);
+    const hits = numberAfter(t1, "\"read_view_hits\":").? - numberAfter(t0, "\"read_view_hits\":").?;
+    const misses = numberAfter(t1, "\"read_view_misses\":").? - numberAfter(t0, "\"read_view_misses\":").?;
+    const fills = numberAfter(t1, "\"read_view_fills\":").? - numberAfter(t0, "\"read_view_fills\":").?;
+    const stale = numberAfter(t1, "\"read_view_stale\":").? - numberAfter(t0, "\"read_view_stale\":").?;
+    const ring_reads = numberAfter(t1, "\"transport_ring_reads\":").? - numberAfter(t0, "\"transport_ring_reads\":").?;
+    std.debug.print("\nsmoke: the read view over {d} random 4 KiB O_DIRECT reads ({d} ring reads): view hits {d}, misses {d}, fills {d}, stale {d}; direct legs {d}, fast-dispatch serves {d}\n", .{ reads, ring_reads, hits, misses, fills, stale, numberAfter(t1, "\"direct_leg_offers\":").? - numberAfter(t0, "\"direct_leg_offers\":").?, numberAfter(t1, "\"fast_dispatch_serves\":").? - numberAfter(t0, "\"fast_dispatch_serves\":").? });
+    // The probe's resolution and the recheck's binding: two hits per read
+    // at least, none of them a KV lookup (a miss would have filled).
+    try testing.expect(hits >= 2 * reads);
+    try testing.expectEqual(@as(u64, 0), misses);
+    // The one admissible refill inside the loop: the first read's atime
+    // echo (relatime: mtime > atime) drains as an inode record.
+    try testing.expect(stale <= 1);
+    try testing.expect(fills <= 2);
+    // A truncate: the inode and layout records land, the witness moves,
+    // the first read after it finds the view stale and refills; a read at
+    // the old length is EOF (res 0), never the stale size's bytes.
+    gpa.free(try rig.shOk(rig.work, try std.fmt.bufPrint(&script, "truncate -s {d} {s}/f && truncate -s {d} pattern", .{ file_len / 2, rig.mp, file_len / 2 })));
+    {
+        const aio = @import("../shim/aio.zig");
+        var ctx: aio.io_context_t = 0;
+        try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.syscall2(.io_setup, 1, @intFromPtr(&ctx))));
+        defer _ = linux.syscall1(.io_destroy, ctx);
+        const rc = linux.open(f.ptr, .{ .ACCMODE = .RDONLY, .DIRECT = true, .CLOEXEC = true }, 0);
+        try testing.expectEqual(linux.E.SUCCESS, linux.errno(rc));
+        const fd: linux.fd_t = @intCast(rc);
+        defer _ = linux.close(fd);
+        const buf = try gpa.alignedAlloc(u8, .fromByteUnits(4096), 4096);
+        defer gpa.free(buf);
+        var cb: aio.Iocb = .{ .data = 0, .key = 0, .aio_rw_flags = 0, .aio_lio_opcode = aio.IOCB_CMD_PREAD, .aio_reqprio = 0, .aio_fildes = fd, .buf = @intFromPtr(buf.ptr), .nbytes = 4096, .offset = @intCast(file_len - 4096), .__pad3 = 0, .flags = 0, .resfd = 0 };
+        var ptr: *aio.Iocb = &cb;
+        try testing.expectEqual(@as(usize, 1), linux.syscall3(.io_submit, ctx, 1, @intFromPtr(&ptr)));
+        var ev: aio.IoEvent = undefined;
+        const ts: linux.timespec = .{ .sec = 30, .nsec = 0 };
+        try testing.expectEqual(@as(usize, 1), linux.syscall5(.io_getevents, ctx, 1, 1, @intFromPtr(&ev), @intFromPtr(&ts)));
+        try testing.expectEqual(@as(i64, 0), ev.res);
+    }
+    // Reads inside the new length: the first finds the view stale (the
+    // truncate's records moved the witness) and refills it.
+    try aioRandomReads(f, pattern, file_len / 2, 64, 8, 3);
+    const t2 = try rig.stats();
+    defer gpa.free(t2);
+    try testing.expect(numberAfter(t2, "\"read_view_stale\":").? > numberAfter(t1, "\"read_view_stale\":").?);
+    // An overwrite of page 5 (its publish lands a new binding): the view
+    // stales again and the new bytes read back.
+    gpa.free(try rig.shOk(rig.work, try std.fmt.bufPrint(&script, "head -c 4096 /dev/urandom > page && dd if=page of={s}/f bs=4096 seek=5 conv=notrunc status=none && dd if=page of=pattern bs=4096 seek=5 conv=notrunc status=none && sync -f {s}", .{ rig.mp, rig.mp })));
+    try aioRandomReads(f, pattern, 6 * 4096, 32, 4, 4);
+    const t3 = try rig.stats();
+    defer gpa.free(t3);
+    try testing.expect(numberAfter(t3, "\"read_view_stale\":").? > numberAfter(t2, "\"read_view_stale\":").?);
+    try expectMustStayZero(t3);
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+}
+
 /// The streaming overwrite row's shape: one job, QD16, 1 MiB O_DIRECT
 /// sequential writes over a laid-down file, time-based — the perf matrix's
 /// `sw1m-q16j1`. 16 writes of ONE ino in flight on the one FUSE queue the

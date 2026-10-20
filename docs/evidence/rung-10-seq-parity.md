@@ -100,3 +100,83 @@ kv_fs / e2e 366 pass (2 skipped), the pieces rows 52/52, overlay_core 64/64, rai
 green: the data plane WITH / WITHOUT a cache path, A STREAMING OVERWRITE NEVER WEDGES THE DAEMON, `sync
 -f` IS A DURABILITY POINT (43/43), THE KILL MATRIX (40/40, fsck clean); every perf session's `fsck
 --offline` clean, `direct-store failures 0`, `bridge cancels 0`.
+
+## Wave 2 (2026-10-20, `perf/seq-parity-2`): the split re-taken, the hop lever, the kernel lever
+
+**The split on `329a3c9`** (the read view `7c7b0f8` and the Shared-class prelude `6eebd2c` landed between the
+waves; same rows, `trace.bt` on the write row, one session each). 1M seq write ×4 **52.4 GB/s** at 4.93
+daemon cores (was 49–50 at 5.6–6.1): fio clat 1,157 µs = the kernel's view **711** (was 805) + **446** of a
+filled CQE waiting on fio's thread; the kernel's: delivery 69, the daemon 572 (was 680) — `to_store`
+**92** (was 198–238; p50 ≤ 32, p90 ≤ 256: the prelude is two read-view hits and no token read, 16 µs of
+CPU on the worker where it was 45), `store` 485 (the device, unchanged), `to_commit` 50 — and
+`fuse_uring_req_end` 11. The worker's 68 µs per write: the handler 23 % (was 46), the inline two-piece
+`WRITE_FIXED` 17 % (`bio_split_io_at`'s 255-bvec scan 4.8 %, the sg table 5 %), the commit + delivery
+(`io_uring_cmd`) 17 % (`unpin_folio` 5.9 %, `io_buffer_unregister` 3.8 %, the imu memset 3.4 %), the local
+task work 14 %, `schedule` 5 %. The read row: 46 µs per 1 MiB read, **52 % of it the per-page terms**
+(`unpin_folio` 15.2, `folio_mark_dirty_lock` + `folio_unlock` 7.4, `io_buffer_unregister` 4.8, memset 5.6,
+`io_buffer_register_bvec` 3.2, `bio_split_io_at` 6.1, the sg table 7.8, kmalloc 2.2); the io-wq core of
+the first wave is gone (0.00 `iou-wrk`; it WAS the NOWAIT split punt of every 1 MiB `READ_FIXED`),
+`transport_fd_body_fallbacks` 0, the probe and the recheck two view hits per read. What remains
+serialized on the worker: the kernel's per-page zero-copy bookkeeping (the install's 256-bvec imu, the
+commit's 256 unpins), the two-piece submission, the handler's 16 µs.
+
+**Correction to binder (c).** The daemon ring's `uring_lock` is NOT taken for a kmbuf select on a zc
+WRITE: `fuse_uring_req_has_copyable_payload` already answers false for `in_pages` with two in-args, so
+`fuse_uring_prep_buffer` returns before any select. fio's extra ≈ 10 µs per FUSE submit is the request's
+build — `fuse_io_priv`, the 256-entry folio and descriptor arrays, the `pages[256]` scratch, the request
+— and the 256-iteration descriptor loop; 0033 shortens the loop's product, not the allocations.
+
+**Daemon levers measured.** (1) `SQUEEZEFS_FUSE_RINGS_PER_QUEUE` 2 / 3 / 4 (admitted by `b17f162`) on
+sw1m ×4: 53.4 / 50.9 / 52.0 GB/s at 4.93 / 5.00 / 5.41 cores — the queue's depth over more workers buys
+nothing on the sequential rows (the device phase stands); the derivation stays 2. (2) **The streaming
+write's lane: `own`** (`211ab11`, `3ed3f5b`): the overlay class always on its delivering worker's own lane,
+past the own-depth share — with the handler at 16 µs against a ≈ 500 µs device phase, a spill is two
+wakes each way for nothing. Legs own cpu cpu own: sw1m 52,675 / 52,403 vs 52,107 / 51,070 (**1.018×** at
+4.69 vs 4.83 cores), sw4m 41,418 / 48,244 vs 40,396 / 46,168 (1.036×; the row's own spread 15 %), sr1m
+untouched by construction (no held write; its 63–66 vs 65–66 is the row's session swing). Ships; W1
+keeps the share (the 4k write knee). (3) The commit's unpins cannot be deferred by the daemon: they run in
+`fuse_request_end` inside the kernel's COMMIT processing, before the request's completion reaches fio —
+a kernel lever (0033 below, or `IOCB_DIO_CALLER_COMP`: the release in fio's completion task work). (4) The
+kmbuf select: already skipped (above).
+
+**Kernel lever 0033** (`scripts/kernel/proposed/0033-sqz-fuse-coalesce-large-folio-user-pages.patch`,
+`e11d0d5`; compile-checked W=1 as the whole fuse module — fuse.ko, cuse.ko, virtiofs.ko — against 7.2.8 +
+0001–0030 + the proposed 0031, and applying to the pristine tree; unbooted). `fuse_get_user_pages` records
+one descriptor PER PAGE even inside a 2 MiB THP folio ("Currently, all folios in FUSE are one page"); the
+patch coalesces a page continuing the previous descriptor's folio into it, and `fuse_release_user_pages`
+gives back a descriptor's pins at once (`unpin_user_folio(folio, pages spanned)`: GUP pins a large folio
+once per page). Every consumer already takes a `(folio, offset, length)` triple whose length may exceed a
+page — `fuse_copy_folio`, the uring copy path, the zc bvec (a multi-page bvec; `io_import_kbuf` imports
+it with `iov_iter_bvec` + `iov_iter_advance`), virtiofs's `sg_set_folio`. **Expected saving, from the
+trace, when the app's buffer is THP-backed (fio's is; `transparent_hugepage=always` here):** the ring
+worker's CPU −≈ 24 µs of 46 per 1 MiB read (−52 %) and −≈ 17 of 68 per write (−25 %); no imu allocation
+per request (1–2 bvecs fit 0031's 32-folio scratch); the DMA's bio one bvec, so `bio_split_rw`'s scan,
+the sg mapping and nvmet's `bio_add_page` loop are O(1) — a shorter `store` phase; and on the ring thread
+that serializes a queue's depth, latency beyond the CPU share. Nothing changes for 4 KiB-page buffers.
+Probe plan in the patch header.
+
+**A/B** (A = `dev` `561bb90` in the main tree, B = this branch `3ed3f5b`; legs A B B A, `sw1m|sw4m|sr1m`;
+then the full matrix on each).
+
+| row | ext4 | xfs | A (legs) | B (legs) | B ÷ A | daemon cores A → B |
+|---|---|---|---|---|---|---|
+| seq write 1M QD16×4 (MiB/s) | 70,480 | 70,563 | 53,249, 53,047 | 52,172, 53,556 | 0.995 | 4.90 → 4.66 (−5 %) |
+| seq write 4M QD4×4 | — | — | 39,798, 52,921 | 52,862, 52,089 | 1.13 (A's spread 28 %: the row's two states) | 3.82 → 4.08 |
+| seq read 1M QD16×4 | 81,833 | 82,903 | 62,719, 62,799 | 62,717, 66,052 | 1.03 (untouched by construction) | 2.93 → 3.00 |
+
+The full matrices (`w2full-{A,B}-r1`, the seq rows after the 4k rows): sw1m ×4 A 42,550 (p99 8.4 ms, a
+disturbed leg) vs B **57,361** (81 % of ext4), sw4m 46,526 vs 40,553, sr1m ×4 73,373 vs 71,052 (87–89 %),
+sr1m ×1 53,650 vs 52,617, sw1m ×1 33,548 vs 34,075; the 4k and 64k rows within their known session swings
+(rr4k QD1 / QD32×1 / QD32×4 0.92 / 0.84 / 1.01, rw4k 1.22 / 1.01 / 1.03, 64k 1.01 / 1.00 — one pair each,
+the QD1 and QD32×1 rows swing 12–43 % between sessions of one binary; the lever touches no read and no
+W1 write by construction). **Standing after wave 2: 1M seq write 53–57 GB/s = 75–81 % of ext4 at 4.7
+daemon cores (the first wave's 49–50 at 5.6–6.1); 1M seq read 63–73 = 77–89 %.** The next 20 % is the
+kernel's: 0033's per-folio bookkeeping on the ring thread (≈ 17–24 µs of 46–68 per request), and fio's
+own submit cost through FUSE (≈ 440 µs of every clat is a CQE waiting on fio's thread).
+
+**Suites** (`scripts/venue test`, the rebased branch): transport / write_admit / device_overlay / data.plane /
+nvme_dev / kv_fs / e2e 351 pass (3 skip); placement + knobs 81/81; the overlay-class and pieces e2e rows,
+the SQPOLL row 67/67 alone (one KILL by the hang limit inside a 190-test shard under a loaded host — not
+reproduced); rails 29/29. Smoke rows green: the data plane WITH / WITHOUT a cache path, A STREAMING
+OVERWRITE NEVER WEDGES THE DAEMON, `sync -f` (43/43), THE KILL MATRIX (40/40, fsck clean); every perf
+session's `fsck --offline` clean.

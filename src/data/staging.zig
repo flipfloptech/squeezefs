@@ -1096,7 +1096,7 @@ pub const Segment = struct {
     fn supersededSyncedLocked(self: *Segment, key: *const [KEY_LEN]u8) bool {
         var cur = self.retired_head;
         while (cur) |c| : (cur = c.next_retired) {
-            if (c.hold == .superseded and c.synced and std.mem.eql(u8, &c.key, key)) return true;
+            if (c.hold == .superseded and std.mem.eql(u8, &c.key, key) and (c.synced or self.coveredByRunningSync(c))) return true;
         }
         return false;
     }

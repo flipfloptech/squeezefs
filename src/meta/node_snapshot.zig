@@ -7,7 +7,7 @@
 //! §7.1; the reference's `node_cache.rs` `RecordIndex`/`FoldMemo`/
 //! `NodeSnapshot`).
 //!
-//! Three sorted sources, every one immutable once published:
+//! Two sorted sources, both immutable once published:
 //!
 //! - `base`: the `RecordIndex` — a k-way merge of every SERIALIZED bset
 //!   image (the extent's frames oldest → newest, then every frozen delta
@@ -15,16 +15,16 @@
 //!   24-byte `IdxRec`s that borrow the images zero-copy. Shared across
 //!   publishes by refcount; a freeze extends it INCREMENTALLY (the k-way
 //!   rebuild per freeze was 37 % of the reference's serial create path).
-//! - `stable`: the open-delta records older than the last re-merge,
-//!   `(key, seq)` ascending, shared across publishes by refcount.
-//! - `tail`: the ≤ `OVERLAY_TAIL_MAX` open-delta records applied since —
-//!   the ONLY per-publish copy (the whole-overlay clone per apply was ~44 %
-//!   of the serial create path).
+//! - `overlay`: the open-delta records, a `(key, seq)` ascending `Run` of
+//!   refcounted chunks the dirty half derives the next from by copying the
+//!   chunks it touches (`RunEdit`): a publish is one reference, an apply
+//!   O(records applied). (The former stable/tail split re-cloned the whole
+//!   overlay every 8 applies — 15 µs of a create's apply CPU on a leaf of
+//!   thousands of open records, `docs/evidence/rung-10-create-path.md`.)
 //!
-//! Fold precedence per key: `tail` ≥ `stable` > `base`, kept by the
-//! apply path's run-precedence guard (`node_cache.zig`). `lookup` is the
-//! D7-slimmed read: the newest overlay record's materialized head serves
-//! with zero decodes; a bset-resident key probes the 8-cell populate-once
+//! Fold precedence per key: `overlay` > `base`. `lookup` is the D7-slimmed
+//! read: the newest overlay record's materialized head serves with zero
+//! decodes; a bset-resident key probes the 8-cell populate-once
 //! `FoldMemo`; only a cold fold runs THE algebra (`record.foldNewestFirst`)
 //! — and property tests pin memo and head serves byte-equal to it.
 //!
@@ -430,15 +430,14 @@ pub const RecordIndex = struct {
 // ---------------------------------------------------------------------------
 
 /// The materialized folded outcome riding the newest overlay record of a
-/// key (D7.a): `fold(this record ∪ everything older)`. A plain-`Put` head
-/// borrows the record's own value by refcount; a delta-folded head owns a
-/// fresh buffer (`materialized`), the part the §5.7 budget charges.
+/// key (D7.a): `fold(this record ∪ everything older)`, in the record's
+/// reference-counted form (`OwnedRec`). A plain-`Put` head borrows the
+/// record's own value by refcount; a delta-folded head owns a fresh buffer
+/// (`materialized`), the part the §5.7 budget charges. Inside the run the
+/// head is a `HeadRef` into the chunk's arena.
 pub const Head = union(enum) {
     live: struct {
         value: Bytes,
-        /// The decoded INODE value, carried across inode-delta applies so
-        /// each delta costs one decode of itself, not of the base.
-        decoded: ?rec.InodeValue,
         materialized: bool,
     },
     tombstone,
@@ -446,7 +445,7 @@ pub const Head = union(enum) {
 
     pub fn clone(self: Head) Head {
         return switch (self) {
-            .live => |l| .{ .live = .{ .value = l.value.clone(), .decoded = l.decoded, .materialized = l.materialized } },
+            .live => |l| .{ .live = .{ .value = l.value.clone(), .materialized = l.materialized } },
             .tombstone => .tombstone,
             .absent => .absent,
         };
@@ -465,30 +464,6 @@ pub const Head = union(enum) {
             .live => |l| if (l.materialized) l.value.len else 0,
             else => 0,
         };
-    }
-
-    /// The borrowed algebra view (`record.foldForward`'s `prev`).
-    pub fn asFolded(self: *const Head) rec.FoldedHead {
-        return switch (self.*) {
-            .live => |l| .{ .live = .{ .value = l.value.slice(), .decoded = l.decoded, .materialized = false } },
-            .tombstone => .tombstone,
-            .absent => .absent,
-        };
-    }
-
-    /// Adopt an algebra outcome: an owned buffer moves into a fresh
-    /// `SharedBuf`; a borrowed one (a `Put`'s own bytes) is `own` retained.
-    pub fn fromFolded(gpa: Allocator, folded: rec.FoldedHead, own: Bytes) Allocator.Error!Head {
-        switch (folded) {
-            .live => |l| {
-                if (!l.materialized) return .{ .live = .{ .value = own.clone(), .decoded = l.decoded, .materialized = false } };
-                const owned: []u8 = @constCast(l.value);
-                errdefer gpa.free(owned);
-                return .{ .live = .{ .value = try Bytes.fromOwned(gpa, owned), .decoded = l.decoded, .materialized = true } };
-            },
-            .tombstone => return .tombstone,
-            .absent => return .absent,
-        }
     }
 };
 
@@ -571,20 +546,20 @@ pub const OwnedRec = struct {
 /// Run helpers over a `(key asc, seq asc)` overlay run.
 const RunCtx = struct { k: []const u8 };
 
-fn runKeyLess(ctx: RunCtx, r: OwnedRec) bool {
-    return key.order(r.key.slice(), ctx.k) == .lt;
+fn runKeyLess(ctx: RunCtx, r: RecView) bool {
+    return key.order(r.key(), ctx.k) == .lt;
 }
 
-fn runKeyLessEq(ctx: RunCtx, r: OwnedRec) bool {
-    return key.order(r.key.slice(), ctx.k) != .gt;
+fn runKeyLessEq(ctx: RunCtx, r: RecView) bool {
+    return key.order(r.key(), ctx.k) != .gt;
 }
 
 /// `[lo, hi)` of `run`'s records with key `k` (seq ascending).
-pub fn runGroup(run: []const OwnedRec, k: []const u8) Range {
+pub fn runGroup(run: *const Run, k: []const u8) Range {
     const ctx: RunCtx = .{ .k = k };
     return .{
-        .lo = std.sort.partitionPoint(OwnedRec, run, ctx, runKeyLess),
-        .hi = std.sort.partitionPoint(OwnedRec, run, ctx, runKeyLessEq),
+        .lo = run.partitionPoint(ctx, runKeyLess),
+        .hi = run.partitionPoint(ctx, runKeyLessEq),
     };
 }
 
@@ -733,21 +708,519 @@ pub const FoldMemo = struct {
 // The snapshot.
 // ---------------------------------------------------------------------------
 
-/// Published open-delta records newer than the last `stable` re-merge:
-/// the per-apply publish clones only this run, so it stays small by
-/// construction.
-pub const OVERLAY_TAIL_MAX: usize = 8;
+// ---------------------------------------------------------------------------
+// The overlay run: a persistent chunked `(key asc, seq asc)` sequence.
+// ---------------------------------------------------------------------------
 
-/// A `(key asc, seq asc)` run of overlay records, shared by refcount.
+/// Records per chunk. 32: the per-apply copy is one chunk — ≤ 33 records of
+/// 48 bytes and their arena (≈ 100 bytes a record on the inode and dentry
+/// shapes), two memcpys of a few KiB inside one `smp_allocator` size class
+/// (a block past its 32 KiB largest class maps pages, and its free is a
+/// munmap with a TLB shootdown across the daemon's threads: the former
+/// shape's whole-overlay clones) — and the spine of a 4,000-record overlay
+/// is ≈ 170 slots.
+pub const CHUNK_MAX: usize = 32;
+
+/// The D7.a head of a chunk record. `none`: no head, or invalidated — the
+/// read falls back to the from-scratch fold. A live head's bytes live in
+/// the chunk's arena: a plain `Put`'s head IS the record's value
+/// (`materialized` false, nothing extra charged); a delta-folded head is a
+/// range of its own (`materialized` true — the §5.7 charge).
+pub const HeadRef = union(enum) {
+    none,
+    live: struct { off: u32, len: u32, materialized: bool },
+    tombstone,
+    absent,
+};
+
+/// One overlay record as a chunk stores it: the wire fields as ranges of the
+/// chunk's arena, the `(key, seq)` order key, the §4.6 pt 2 floor, the head.
+/// 48 bytes and no references: a chunk copy is two memcpys, a chunk's death
+/// two frees. (The reference-counted `OwnedRec` is the record's form on the
+/// way IN — the apply's input — and on the way OUT, `Run.flatten`.)
+pub const ChunkRec = struct {
+    seq: u64,
+    /// The record's own §4.6 pt 2 floor contribution — `OwnedRec.entry_floor`.
+    entry_floor: u64,
+    key_off: u32,
+    val_off: u32,
+    val_len: u32,
+    key_len: u16,
+    kind: RecordKind,
+    head: HeadRef,
+};
+
+comptime {
+    assert(@sizeOf(ChunkRec) == 48);
+}
+
+/// The §5.7 budget charge of a record's head (0 when none): the fixed
+/// per-head overhead plus the bytes a delta-folded head owns.
+pub fn headCharge(r: ChunkRec) usize {
+    return switch (r.head) {
+        .none => 0,
+        .live => |l| FOLD_HEAD_OVERHEAD + @as(usize, if (l.materialized) l.len else 0),
+        .tombstone, .absent => FOLD_HEAD_OVERHEAD,
+    };
+}
+
+/// The head a record enters the run with.
+pub const HeadIn = union(enum) {
+    none,
+    /// A plain `Put`'s head: the record's own value.
+    own_value,
+    /// A delta-folded value — copied into the arena, charged as materialized.
+    folded: []const u8,
+    tombstone,
+    absent,
+
+    /// `OwnedRec.folded` in this form (a head riding in with an SMO's
+    /// leftover record; a non-materialized live head IS the record's own
+    /// value — `RecView.toOwned` builds it so).
+    pub fn of(h: ?Head) HeadIn {
+        const head = h orelse return .none;
+        return switch (head) {
+            .live => |l| if (l.materialized) .{ .folded = l.value.slice() } else .own_value,
+            .tombstone => .tombstone,
+            .absent => .absent,
+        };
+    }
+
+    fn extraBytes(self: HeadIn) usize {
+        return switch (self) {
+            .folded => |f| f.len,
+            else => 0,
+        };
+    }
+};
+
+/// The served form of a head.
+pub const HeadView = union(enum) { live: []const u8, tombstone, absent };
+
+/// A borrowed view of one overlay record, valid while its run is held.
+pub const RecView = struct {
+    chunk: *const Chunk,
+    rec: *const ChunkRec,
+
+    pub fn key(self: RecView) []const u8 {
+        return self.chunk.bytes.items[self.rec.key_off..][0..self.rec.key_len];
+    }
+
+    pub fn value(self: RecView) []const u8 {
+        return self.chunk.bytes.items[self.rec.val_off..][0..self.rec.val_len];
+    }
+
+    pub fn seq(self: RecView) u64 {
+        return self.rec.seq;
+    }
+
+    pub fn kind(self: RecView) RecordKind {
+        return self.rec.kind;
+    }
+
+    pub fn ref(self: RecView) RecordRef {
+        return .{ .key = self.key(), .seq = self.rec.seq, .kind = self.rec.kind, .value = self.value() };
+    }
+
+    /// The head, null when the record carries none.
+    pub fn head(self: RecView) ?HeadView {
+        return switch (self.rec.head) {
+            .none => null,
+            .live => |l| .{ .live = self.chunk.bytes.items[l.off..][0..l.len] },
+            .tombstone => .tombstone,
+            .absent => .absent,
+        };
+    }
+
+    /// The record in its reference-counted form (fresh copies of its bytes).
+    fn toOwned(self: RecView, gpa: Allocator) Allocator.Error!OwnedRec {
+        const k = try Bytes.copy(gpa, self.key());
+        errdefer k.deinit();
+        const v = try Bytes.copy(gpa, self.value());
+        errdefer v.deinit();
+        var out = OwnedRec.init(k, self.rec.seq, self.rec.kind, v);
+        out.entry_floor = self.rec.entry_floor;
+        out.folded = switch (self.rec.head) {
+            .none => null,
+            .live => |l| if (l.materialized)
+                .{ .live = .{ .value = try Bytes.copy(gpa, self.chunk.bytes.items[l.off..][0..l.len]), .materialized = true } }
+            else
+                .{ .live = .{ .value = v.clone(), .materialized = false } },
+            .tombstone => .tombstone,
+            .absent => .absent,
+        };
+        return out;
+    }
+};
+
+/// A non-empty `(key asc, seq asc)` piece of the run: its records and the
+/// arena their bytes live in. Immutable once a run holding it is published;
+/// shared between runs by refcount; grown in place only by the one edit that
+/// owns it alone. A copy compacts: the arena bytes of cleared heads and of
+/// records a split moved out stay until then.
+pub const Chunk = struct {
+    recs: std.ArrayListUnmanaged(ChunkRec),
+    bytes: std.ArrayListUnmanaged(u8),
+
+    pub const empty: Chunk = .{ .recs = .empty, .bytes = .empty };
+
+    pub fn deinit(self: *Chunk, gpa: Allocator) void {
+        self.recs.deinit(gpa);
+        self.bytes.deinit(gpa);
+        self.* = undefined;
+    }
+
+    pub fn len(self: *const Chunk) usize {
+        return self.recs.items.len;
+    }
+
+    pub fn view(self: *const Chunk, i: usize) RecView {
+        return .{ .chunk = self, .rec = &self.recs.items[i] };
+    }
+
+    fn recBytes(r: ChunkRec) usize {
+        const head: usize = switch (r.head) {
+            .live => |l| if (l.materialized) l.len else 0,
+            else => 0,
+        };
+        return @as(usize, r.key_len) + r.val_len + head;
+    }
+
+    /// Append `r`'s bytes and head to the arena (reserved by the caller);
+    /// the record with the new offsets.
+    fn placeAssumeCapacity(self: *Chunk, r: RecordRef, entry_floor: u64, head: HeadIn) ChunkRec {
+        const key_off: u32 = @intCast(self.bytes.items.len);
+        self.bytes.appendSliceAssumeCapacity(r.key);
+        const val_off: u32 = @intCast(self.bytes.items.len);
+        self.bytes.appendSliceAssumeCapacity(r.value);
+        const h: HeadRef = switch (head) {
+            .none => .none,
+            .own_value => .{ .live = .{ .off = val_off, .len = @intCast(r.value.len), .materialized = false } },
+            .folded => |f| blk: {
+                const off: u32 = @intCast(self.bytes.items.len);
+                self.bytes.appendSliceAssumeCapacity(f);
+                break :blk .{ .live = .{ .off = off, .len = @intCast(f.len), .materialized = true } };
+            },
+            .tombstone => .tombstone,
+            .absent => .absent,
+        };
+        return .{
+            .seq = r.seq,
+            .entry_floor = entry_floor,
+            .key_off = key_off,
+            .val_off = val_off,
+            .val_len = @intCast(r.value.len),
+            .key_len = @intCast(r.key.len),
+            .kind = r.kind,
+            .head = h,
+        };
+    }
+
+    /// Insert `r` at `at` (the chunk is the caller's alone). Nothing changes
+    /// when the reservation fails.
+    fn insertRec(self: *Chunk, gpa: Allocator, at: usize, r: RecordRef, entry_floor: u64, head: HeadIn) Allocator.Error!void {
+        try self.bytes.ensureUnusedCapacity(gpa, r.key.len + r.value.len + head.extraBytes());
+        try self.recs.ensureUnusedCapacity(gpa, 1);
+        const c = self.placeAssumeCapacity(r, entry_floor, head);
+        self.recs.insertAssumeCapacity(at, c);
+    }
+
+    /// A compacted copy of records `[from, to)` with room for `extra_recs`
+    /// more records and `extra_bytes` more arena bytes.
+    fn copyRange(self: *const Chunk, gpa: Allocator, from: usize, to: usize, extra_recs: usize, extra_bytes: usize) Allocator.Error!Chunk {
+        var out: Chunk = .empty;
+        errdefer out.deinit(gpa);
+        var live: usize = 0;
+        for (self.recs.items[from..to]) |r| live += recBytes(r);
+        try out.recs.ensureTotalCapacityPrecise(gpa, to - from + extra_recs);
+        try out.bytes.ensureTotalCapacityPrecise(gpa, live + extra_bytes);
+        for (self.recs.items[from..to]) |*r| {
+            const rv: RecView = .{ .chunk = self, .rec = r };
+            const head: HeadIn = switch (r.head) {
+                .none => .none,
+                .live => |l| if (l.materialized) .{ .folded = self.bytes.items[l.off..][0..l.len] } else .own_value,
+                .tombstone => .tombstone,
+                .absent => .absent,
+            };
+            out.recs.appendAssumeCapacity(out.placeAssumeCapacity(rv.ref(), r.entry_floor, head));
+        }
+        return out;
+    }
+};
+
+/// One spine entry: a chunk and the run index of its first record.
+pub const Slot = struct { chunk: *Arc(Chunk), start: u32 };
+
+/// The open-delta overlay as readers and the dirty half share it: a spine of
+/// refcounted chunks, each a non-empty `(key asc, seq asc)` piece of about
+/// `CHUNK_MAX` records, immutable once published. The dirty half derives the
+/// next run through `RunEdit`, which copies the chunks the records land in
+/// and the spine and shares every other chunk — so an apply is O(records
+/// applied), a publish one reference, and the run a reader holds is exact
+/// whatever applied since (the former stable/tail split re-cloned the whole
+/// overlay every 8 applies and cloned a tail per publish).
+///
+/// Searches are two-level — the spine by each chunk's last record, then the
+/// chunk — so a lookup costs the binary search a flat array would.
 pub const Run = struct {
-    recs: []OwnedRec,
+    slots: []Slot,
+    len: usize,
 
-    pub const empty: Run = .{ .recs = &.{} };
+    pub const empty: Run = .{ .slots = &.{}, .len = 0 };
 
     pub fn deinit(self: *Run, gpa: Allocator) void {
-        for (self.recs) |*r| r.deinit();
-        if (self.recs.len != 0) gpa.free(self.recs);
+        for (self.slots) |s| s.chunk.release();
+        if (self.slots.len != 0) gpa.free(self.slots);
         self.* = undefined;
+    }
+
+    /// The bytes one apply of one record of `rec_bytes` wire bytes
+    /// allocates for the run, at most: the chunk it lands in copied (≤
+    /// `CHUNK_MAX + 1` records, their arena; a split's half or an owned
+    /// chunk's in-place growth at most as much again), their boxes, the
+    /// spine (chunks are at least half full after their split — the first
+    /// grows from 1) and the run's box. Independent of the overlay length
+    /// but for the spine's one slot per chunk.
+    pub fn applyBytesBound(n: usize, rec_bytes: usize) usize {
+        const chunk = (CHUNK_MAX + 1) * (@sizeOf(ChunkRec) + rec_bytes);
+        const spine = (n / (CHUNK_MAX / 2) + 2) * @sizeOf(Slot);
+        return 2 * chunk + 2 * @sizeOf(Arc(Chunk)) + spine + @sizeOf(Arc(Run));
+    }
+
+    /// A cursor: `ci == slots.len` is the end.
+    pub const Pos = struct { ci: usize, off: usize };
+
+    fn slotStartLessEq(i: usize, s: Slot) bool {
+        return s.start <= i;
+    }
+
+    /// The cursor of run index `i` (`len` is the end).
+    pub fn posOf(self: *const Run, i: usize) Pos {
+        assert(i <= self.len);
+        if (i == self.len) return .{ .ci = self.slots.len, .off = 0 };
+        const ci = std.sort.partitionPoint(Slot, self.slots, i, slotStartLessEq) - 1;
+        return .{ .ci = ci, .off = i - self.slots[ci].start };
+    }
+
+    pub fn index(self: *const Run, p: Pos) usize {
+        if (p.ci == self.slots.len) return self.len;
+        return self.slots[p.ci].start + p.off;
+    }
+
+    pub fn rec(self: *const Run, p: Pos) RecView {
+        return self.slots[p.ci].chunk.value.view(p.off);
+    }
+
+    /// The record at run index `i` (a spine search; walks use `Pos`).
+    pub fn at(self: *const Run, i: usize) RecView {
+        return self.rec(self.posOf(i));
+    }
+
+    pub fn next(self: *const Run, p: Pos) Pos {
+        assert(p.ci < self.slots.len);
+        if (p.off + 1 < self.slots[p.ci].chunk.value.len()) return .{ .ci = p.ci, .off = p.off + 1 };
+        return .{ .ci = p.ci + 1, .off = 0 };
+    }
+
+    pub fn prev(self: *const Run, p: Pos) Pos {
+        if (p.off > 0) return .{ .ci = p.ci, .off = p.off - 1 };
+        assert(p.ci > 0);
+        return .{ .ci = p.ci - 1, .off = self.slots[p.ci - 1].chunk.value.len() - 1 };
+    }
+
+    /// The first run index whose record fails `pred` (true on a prefix of
+    /// the run): the spine by each chunk's LAST record — a chunk whose
+    /// last satisfies the predicate lies wholly in the prefix — then that
+    /// chunk's records.
+    pub fn partitionPoint(self: *const Run, context: anytype, comptime pred: fn (@TypeOf(context), RecView) bool) usize {
+        var lo: usize = 0;
+        var hi: usize = self.slots.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            const c = &self.slots[mid].chunk.value;
+            if (pred(context, c.view(c.len() - 1))) lo = mid + 1 else hi = mid;
+        }
+        if (lo == self.slots.len) return self.len;
+        const s = self.slots[lo];
+        const c = &s.chunk.value;
+        var a: usize = 0;
+        var b: usize = c.len();
+        while (a < b) {
+            const mid = a + (b - a) / 2;
+            if (pred(context, c.view(mid))) a = mid + 1 else b = mid;
+        }
+        return s.start + a;
+    }
+
+    /// Every record in its reference-counted form, one owned array (the
+    /// SMO's take-over and the rollback's rebuild); the run is untouched.
+    pub fn flatten(self: *const Run, gpa: Allocator) Allocator.Error![]OwnedRec {
+        const out = try gpa.alloc(OwnedRec, self.len);
+        var n: usize = 0;
+        errdefer {
+            for (out[0..n]) |*r| r.deinit();
+            gpa.free(out);
+        }
+        for (self.slots) |s| {
+            const c = &s.chunk.value;
+            for (0..c.len()) |i| {
+                out[n] = try c.view(i).toOwned(gpa);
+                n += 1;
+            }
+        }
+        assert(n == self.len);
+        return out;
+    }
+
+    /// A run over `recs`, already `(key asc, seq asc)`, in chunks of
+    /// `CHUNK_MAX` (their bytes copied; the slice stays the caller's, its
+    /// elements are consumed on every outcome).
+    pub fn fromSorted(gpa: Allocator, recs: []OwnedRec) Allocator.Error!Run {
+        defer for (recs) |*r| r.deinit();
+        const n_chunks = (recs.len + CHUNK_MAX - 1) / CHUNK_MAX;
+        if (n_chunks == 0) return .empty;
+        var slots: std.ArrayListUnmanaged(Slot) = .empty;
+        errdefer {
+            for (slots.items) |s| s.chunk.release();
+            slots.deinit(gpa);
+        }
+        try slots.ensureTotalCapacityPrecise(gpa, n_chunks);
+        var done: usize = 0;
+        while (done < recs.len) {
+            const take = @min(CHUNK_MAX, recs.len - done);
+            var chunk: Chunk = .empty;
+            errdefer chunk.deinit(gpa);
+            var bytes: usize = 0;
+            for (recs[done..][0..take]) |*r| bytes += r.key.len + r.value.len + HeadIn.of(r.folded).extraBytes();
+            try chunk.recs.ensureTotalCapacityPrecise(gpa, take);
+            try chunk.bytes.ensureTotalCapacityPrecise(gpa, bytes);
+            for (recs[done..][0..take]) |*r| chunk.recs.appendAssumeCapacity(chunk.placeAssumeCapacity(r.recordRef(), r.entry_floor, HeadIn.of(r.folded)));
+            const c = try Arc(Chunk).create(gpa, chunk);
+            chunk = .empty;
+            slots.appendAssumeCapacity(.{ .chunk = c, .start = @intCast(done) });
+            done += take;
+        }
+        return .{ .slots = try slots.toOwnedSlice(gpa), .len = recs.len };
+    }
+};
+
+/// The dirty half's working copy of a run: the chunks it touched are copies
+/// it owns alone (`strongCount() == 1` — the base run, which must outlive
+/// the edit, keeps every shared chunk at ≥ 2), the rest are the base's.
+/// `finish` yields the immutable successor; `abandon` drops the copies and
+/// leaves the base as it was.
+pub const RunEdit = struct {
+    slots: std.ArrayListUnmanaged(Slot),
+    len: usize,
+
+    pub fn begin(gpa: Allocator, base: *const Run) Allocator.Error!RunEdit {
+        var slots: std.ArrayListUnmanaged(Slot) = .empty;
+        // Room for one split without a second spine allocation.
+        try slots.ensureTotalCapacityPrecise(gpa, base.slots.len + 1);
+        for (base.slots) |s| slots.appendAssumeCapacity(.{ .chunk = s.chunk.retain(), .start = s.start });
+        return .{ .slots = slots, .len = base.len };
+    }
+
+    pub fn abandon(self: *RunEdit, gpa: Allocator) void {
+        for (self.slots.items) |s| s.chunk.release();
+        self.slots.deinit(gpa);
+        self.* = undefined;
+    }
+
+    pub fn finish(self: *RunEdit, gpa: Allocator) Allocator.Error!Run {
+        const len = self.len;
+        const slots = try self.slots.toOwnedSlice(gpa);
+        self.* = undefined;
+        return .{ .slots = slots, .len = len };
+    }
+
+    /// A read view (searches and walks) of the edit as it stands.
+    pub fn view(self: *const RunEdit) Run {
+        return .{ .slots = self.slots.items, .len = self.len };
+    }
+
+    fn owned(s: Slot) bool {
+        return s.chunk.strongCount() == 1;
+    }
+
+    /// Replace the chunk at `ci` with a compacted copy this edit owns alone,
+    /// with room for `extra_recs` records and `extra_bytes` arena bytes.
+    fn copyChunk(self: *RunEdit, gpa: Allocator, ci: usize, extra_recs: usize, extra_bytes: usize) Allocator.Error!void {
+        const s = &self.slots.items[ci];
+        const old = &s.chunk.value;
+        var fresh = try old.copyRange(gpa, 0, old.len(), extra_recs, extra_bytes);
+        const c = Arc(Chunk).create(gpa, fresh) catch |e| {
+            fresh.deinit(gpa);
+            return e;
+        };
+        s.chunk.release();
+        s.chunk = c;
+    }
+
+    /// Drop the head of the record at run index `i` (in a chunk this edit
+    /// owns alone — copied first when shared); the charge it carried.
+    pub fn clearHead(self: *RunEdit, gpa: Allocator, i: usize) Allocator.Error!usize {
+        const p = self.view().posOf(i);
+        if (!owned(self.slots.items[p.ci])) try self.copyChunk(gpa, p.ci, 0, 0);
+        const r = &self.slots.items[p.ci].chunk.value.recs.items[p.off];
+        const freed = headCharge(r.*);
+        r.head = .none;
+        return freed;
+    }
+
+    /// Insert `r` with `head` at run index `pos` (the caller's partition
+    /// point; the bytes are copied). The chunk holding `pos` takes it — at
+    /// a chunk boundary the chunk ENDING there, so a record and its same-key
+    /// predecessor share the one copy; a chunk past `CHUNK_MAX` splits in
+    /// half. Returns the head's charge.
+    pub fn insert(self: *RunEdit, gpa: Allocator, pos: usize, r: RecordRef, entry_floor: u64, head: HeadIn) Allocator.Error!usize {
+        assert(pos <= self.len);
+        const need = r.key.len + r.value.len + head.extraBytes();
+        if (self.slots.items.len == 0) {
+            var chunk: Chunk = .empty;
+            errdefer chunk.deinit(gpa);
+            try chunk.insertRec(gpa, 0, r, entry_floor, head);
+            const c = try Arc(Chunk).create(gpa, chunk);
+            self.slots.appendAssumeCapacity(.{ .chunk = c, .start = 0 });
+            self.len = 1;
+            return headCharge(c.value.recs.items[0]);
+        }
+        var ci: usize = undefined;
+        if (pos == self.len) {
+            ci = self.slots.items.len - 1;
+        } else {
+            const p = self.view().posOf(pos);
+            ci = if (p.off == 0 and p.ci > 0) p.ci - 1 else p.ci;
+        }
+        if (!owned(self.slots.items[ci])) try self.copyChunk(gpa, ci, 1, need);
+        const s = &self.slots.items[ci];
+        const off = pos - s.start;
+        try s.chunk.value.insertRec(gpa, off, r, entry_floor, head);
+        const charge = headCharge(s.chunk.value.recs.items[off]);
+        self.len += 1;
+        for (self.slots.items[ci + 1 ..]) |*t| t.start += 1;
+        // An over-full chunk splits; failing to (no memory) leaves a longer
+        // chunk, never a wrong run — the next insert into it tries again.
+        if (s.chunk.value.len() > CHUNK_MAX) self.split(gpa, ci) catch {};
+        return charge;
+    }
+
+    /// Split the chunk at `ci` (owned alone) in half: the upper half is
+    /// copied into a fresh chunk, the lower keeps its arena (compacted at
+    /// its next copy). Every allocation precedes the first mutation, so a
+    /// failure leaves the chunk whole.
+    fn split(self: *RunEdit, gpa: Allocator, ci: usize) Allocator.Error!void {
+        assert(owned(self.slots.items[ci]));
+        const whole = &self.slots.items[ci].chunk.value;
+        const half = whole.len() / 2;
+        var upper = try whole.copyRange(gpa, half, whole.len(), 0, 0);
+        const right = Arc(Chunk).create(gpa, upper) catch |e| {
+            upper.deinit(gpa);
+            return e;
+        };
+        errdefer right.release();
+        try self.slots.insert(gpa, ci + 1, .{ .chunk = right, .start = @intCast(self.slots.items[ci].start + half) });
+        self.slots.items[ci].chunk.value.recs.shrinkRetainingCapacity(half);
     }
 };
 
@@ -775,29 +1248,25 @@ pub const LiveEntry = struct {
 
 pub const NodeSnapshot = struct {
     base: *Arc(RecordIndex),
-    stable: *Arc(Run),
-    /// ≤ `OVERLAY_TAIL_MAX`; owned by this snapshot.
-    tail: []OwnedRec,
+    /// The open-delta overlay as of this publish.
+    overlay: *Arc(Run),
     memo: FoldMemo,
 
-    /// A snapshot with no overlay over `base` (takes both references).
-    pub fn init(base: *Arc(RecordIndex), stable: *Arc(Run), tail: []OwnedRec, charge: ?*counters.Gauge) NodeSnapshot {
-        assert(tail.len <= OVERLAY_TAIL_MAX);
-        return .{ .base = base, .stable = stable, .tail = tail, .memo = .init(charge) };
+    /// A snapshot of `overlay` over `base` (takes both references).
+    pub fn init(base: *Arc(RecordIndex), overlay: *Arc(Run), charge: ?*counters.Gauge) NodeSnapshot {
+        return .{ .base = base, .overlay = overlay, .memo = .init(charge) };
     }
 
     pub fn deinit(self: *NodeSnapshot, gpa: Allocator) void {
         self.memo.deinit(gpa);
-        for (self.tail) |*r| r.deinit();
-        if (self.tail.len != 0) gpa.free(self.tail);
-        self.stable.release();
+        self.overlay.release();
         self.base.release();
         self.* = undefined;
     }
 
     /// Records in the open-delta overlay.
     pub fn overlayLen(self: *const NodeSnapshot) usize {
-        return self.stable.value.recs.len + self.tail.len;
+        return self.overlay.value.len;
     }
 
     /// Total indexed records across serialized sources (not folded).
@@ -822,29 +1291,23 @@ pub const NodeSnapshot = struct {
         return .{ .total = idx.entries.len, .distinct = distinct };
     }
 
-    const Groups = struct { tg: Range, sg: Range, bg: Range };
+    const Groups = struct { og: Range, bg: Range };
 
     fn groups(self: *const NodeSnapshot, k: []const u8) Groups {
         return .{
-            .tg = runGroup(self.tail, k),
-            .sg = runGroup(self.stable.value.recs, k),
+            .og = runGroup(&self.overlay.value, k),
             .bg = self.base.value.groupBounds(k),
         };
     }
 
     /// The newest record seq this node holds for `k` across every source,
     /// or null when the key is unknown here. Order-independent (max per
-    /// group), so safe mid-replay before the fold-order invariant is
-    /// re-established — replay's per-key LWW gate reads it.
+    /// group), so safe mid-replay — replay's per-key LWW gate reads it.
     pub fn newestSeqOf(self: *const NodeSnapshot, k: []const u8) ?u64 {
         const g = self.groups(k);
         var newest: ?u64 = null;
-        // Runs are (key, seq) ascending: a group's last is its newest.
-        if (g.tg.hi > g.tg.lo) newest = self.tail[g.tg.hi - 1].seq;
-        if (g.sg.hi > g.sg.lo) {
-            const s = self.stable.value.recs[g.sg.hi - 1].seq;
-            newest = if (newest) |n| @max(n, s) else s;
-        }
+        // The run is (key, seq) ascending: a group's last is its newest.
+        if (g.og.hi > g.og.lo) newest = self.overlay.value.at(g.og.hi - 1).seq();
         // Base groups are (seq desc): the group's first is its newest.
         if (g.bg.hi > g.bg.lo) {
             const b = self.base.value.entries[g.bg.lo].seq;
@@ -853,10 +1316,9 @@ pub const NodeSnapshot = struct {
         return newest;
     }
 
-    /// The newest overlay record of `k` (tail ≥ stable per key), if any.
-    fn newestOverlay(self: *const NodeSnapshot, g: Groups) ?*const OwnedRec {
-        if (g.tg.hi > g.tg.lo) return &self.tail[g.tg.hi - 1];
-        if (g.sg.hi > g.sg.lo) return &self.stable.value.recs[g.sg.hi - 1];
+    /// The newest overlay record of `k`, if any.
+    fn newestOverlay(self: *const NodeSnapshot, g: Groups) ?RecView {
+        if (g.og.hi > g.og.lo) return self.overlay.value.at(g.og.hi - 1);
         return null;
     }
 
@@ -879,21 +1341,19 @@ pub const NodeSnapshot = struct {
     };
 
     fn gather(self: *const NodeSnapshot, gpa: Allocator, g: Groups, out: *Gather) Allocator.Error!void {
-        const n = (g.tg.hi - g.tg.lo) + (g.sg.hi - g.sg.lo) + (g.bg.hi - g.bg.lo);
+        const n = (g.og.hi - g.og.lo) + (g.bg.hi - g.bg.lo);
         const dst: []RecordRef = if (n <= out.inline_buf.len) out.inline_buf[0..n] else blk: {
             out.heap = try gpa.alloc(RecordRef, n);
             break :blk out.heap.?;
         };
+        const run = &self.overlay.value;
         var i: usize = 0;
-        var t = g.tg.hi;
-        while (t > g.tg.lo) : (i += 1) {
-            t -= 1;
-            dst[i] = self.tail[t].recordRef();
-        }
-        var s = g.sg.hi;
-        while (s > g.sg.lo) : (i += 1) {
-            s -= 1;
-            dst[i] = self.stable.value.recs[s].recordRef();
+        var p = run.posOf(g.og.hi);
+        var o = g.og.hi;
+        while (o > g.og.lo) : (i += 1) {
+            o -= 1;
+            p = run.prev(p);
+            dst[i] = run.rec(p).ref();
         }
         for (g.bg.lo..g.bg.hi) |b| {
             dst[i] = self.base.value.recordRef(b);
@@ -912,10 +1372,10 @@ pub const NodeSnapshot = struct {
         const g = self.groups(k);
         const newest = self.newestOverlay(g);
         if (newest) |n| {
-            if (n.folded) |h| {
+            if (n.head()) |h| {
                 stats.meta_kv_fold_head_serves.inc();
                 return switch (h) {
-                    .live => |l| .{ .live = .{ .value = l.value.slice(), .held = null } },
+                    .live => |v| .{ .live = .{ .value = v, .held = null } },
                     .tombstone => .tombstone,
                     .absent => .absent,
                 };
@@ -933,7 +1393,7 @@ pub const NodeSnapshot = struct {
         // record refs ReleaseSafe fills on every from-scratch fold (13 % of
         // the FUSE worker's cycles on rand-4k, `docs/evidence/rung-10-dev-
         // perf.md` §3.4).
-        const top: RecordRef = if (newest) |n| n.recordRef() else if (g.bg.hi > g.bg.lo) self.base.value.recordRef(g.bg.lo) else return .absent;
+        const top: RecordRef = if (newest) |n| n.ref() else if (g.bg.hi > g.bg.lo) self.base.value.recordRef(g.bg.lo) else return .absent;
         switch (top.kind) {
             .put => return .{ .live = .{ .value = top.value, .held = null } },
             .delete => return .tombstone,
@@ -977,15 +1437,13 @@ pub const NodeSnapshot = struct {
         const g = self.groups(k);
         var depth: u32 = 0;
         var head: ?rec.LayoutVersions = null;
-        var t = g.tg.hi;
-        while (t > g.tg.lo) {
-            t -= 1;
-            if (!chainStep(self.tail[t].recordRef(), &depth, &head)) return .{ .depth = depth, .head = head };
-        }
-        var s = g.sg.hi;
-        while (s > g.sg.lo) {
-            s -= 1;
-            if (!chainStep(self.stable.value.recs[s].recordRef(), &depth, &head)) return .{ .depth = depth, .head = head };
+        const run = &self.overlay.value;
+        var p = run.posOf(g.og.hi);
+        var o = g.og.hi;
+        while (o > g.og.lo) {
+            o -= 1;
+            p = run.prev(p);
+            if (!chainStep(run.rec(p).ref(), &depth, &head)) return .{ .depth = depth, .head = head };
         }
         for (g.bg.lo..g.bg.hi) |b| {
             if (!chainStep(self.base.value.recordRef(b), &depth, &head)) break;
@@ -1009,14 +1467,13 @@ pub const NodeSnapshot = struct {
     /// the next live separator wherever it is).
     pub fn nextLive(self: *NodeSnapshot, gpa: Allocator, from: []const u8, end_inclusive: ?[]const u8) FoldError!?LiveEntry {
         const idx = &self.base.value;
-        const stable = self.stable.value.recs;
+        const run = &self.overlay.value;
         var bi = idx.firstAtOrAfter(from);
-        var si = std.sort.partitionPoint(OwnedRec, stable, RunCtx{ .k = from }, runKeyLess);
-        var ti = std.sort.partitionPoint(OwnedRec, self.tail, RunCtx{ .k = from }, runKeyLess);
+        var oi = run.partitionPoint(RunCtx{ .k = from }, runKeyLess);
+        var op = run.posOf(oi);
         while (true) {
             var k: ?[]const u8 = if (bi < idx.entries.len) idx.keyAt(idx.entries[bi]) else null;
-            if (si < stable.len) k = minKey(k, stable[si].key.slice());
-            if (ti < self.tail.len) k = minKey(k, self.tail[ti].key.slice());
+            if (oi < run.len) k = minKey(k, run.rec(op).key());
             const cand = k orelse return null;
             if (end_inclusive) |end| if (key.order(cand, end) == .gt) return null;
             var look = try self.lookup(gpa, cand);
@@ -1027,8 +1484,10 @@ pub const NodeSnapshot = struct {
             look.deinit();
             // Advance every source past this key.
             while (bi < idx.entries.len and std.mem.eql(u8, idx.keyAt(idx.entries[bi]), cand)) bi += 1;
-            while (si < stable.len and std.mem.eql(u8, stable[si].key.slice(), cand)) si += 1;
-            while (ti < self.tail.len and std.mem.eql(u8, self.tail[ti].key.slice(), cand)) ti += 1;
+            while (oi < run.len and std.mem.eql(u8, run.rec(op).key(), cand)) {
+                oi += 1;
+                op = run.next(op);
+            }
         }
     }
 
@@ -1036,14 +1495,14 @@ pub const NodeSnapshot = struct {
     /// `nextLive`'s mirror, the §4.6a left-sibling probe.
     pub fn prevLive(self: *NodeSnapshot, gpa: Allocator, before: []const u8) FoldError!?LiveEntry {
         const idx = &self.base.value;
-        const stable = self.stable.value.recs;
+        const run = &self.overlay.value;
         var bi = idx.firstAtOrAfter(before);
-        var si = std.sort.partitionPoint(OwnedRec, stable, RunCtx{ .k = before }, runKeyLess);
-        var ti = std.sort.partitionPoint(OwnedRec, self.tail, RunCtx{ .k = before }, runKeyLess);
+        var oi = run.partitionPoint(RunCtx{ .k = before }, runKeyLess);
+        // `op` sits ON index `oi`; the record below is `prev(op)`.
+        var op = run.posOf(oi);
         while (true) {
             var k: ?[]const u8 = if (bi > 0) idx.keyAt(idx.entries[bi - 1]) else null;
-            if (si > 0) k = maxKey(k, stable[si - 1].key.slice());
-            if (ti > 0) k = maxKey(k, self.tail[ti - 1].key.slice());
+            if (oi > 0) k = maxKey(k, run.rec(run.prev(op)).key());
             const cand = k orelse return null;
             var look = try self.lookup(gpa, cand);
             switch (look) {
@@ -1052,8 +1511,10 @@ pub const NodeSnapshot = struct {
             }
             look.deinit();
             while (bi > 0 and std.mem.eql(u8, idx.keyAt(idx.entries[bi - 1]), cand)) bi -= 1;
-            while (si > 0 and std.mem.eql(u8, stable[si - 1].key.slice(), cand)) si -= 1;
-            while (ti > 0 and std.mem.eql(u8, self.tail[ti - 1].key.slice(), cand)) ti -= 1;
+            while (oi > 0 and std.mem.eql(u8, run.rec(run.prev(op)).key(), cand)) {
+                oi -= 1;
+                op = run.prev(op);
+            }
         }
     }
 
@@ -1095,26 +1556,28 @@ pub const NodeSnapshot = struct {
     pub fn foldBytesUpperWith(self: *const NodeSnapshot, extra: []Extra, part_budget: usize, durable_tail: u64) Projection {
         std.sort.block(Extra, extra, {}, extraKeyLess);
         const idx = &self.base.value;
-        const stable = self.stable.value.recs;
+        const run = &self.overlay.value;
         var b: usize = 0;
-        var s: usize = 0;
-        var t: usize = 0;
+        var o: usize = 0;
+        var op = run.posOf(0);
         var x: usize = 0;
         var total: usize = 0;
         var parts: usize = 1;
         var acc: usize = 0;
         while (true) {
             var k: ?[]const u8 = if (b < idx.entries.len) idx.keyAt(idx.entries[b]) else null;
-            if (s < stable.len) k = minKey(k, stable[s].key.slice());
-            if (t < self.tail.len) k = minKey(k, self.tail[t].key.slice());
+            if (o < run.len) k = minKey(k, run.rec(op).key());
             if (x < extra.len) k = minKey(k, extra[x].key);
             const cur = k orelse break;
             var be: usize = 0;
             while (b + be < idx.entries.len and std.mem.eql(u8, idx.keyAt(idx.entries[b + be]), cur)) be += 1;
-            var se: usize = 0;
-            while (s + se < stable.len and std.mem.eql(u8, stable[s + se].key.slice(), cur)) se += 1;
-            var te: usize = 0;
-            while (t + te < self.tail.len and std.mem.eql(u8, self.tail[t + te].key.slice(), cur)) te += 1;
+            // The overlay's group: `[op, oq)`, `oe` records.
+            var oe: usize = 0;
+            var oq = op;
+            while (o + oe < run.len and std.mem.eql(u8, run.rec(oq).key(), cur)) {
+                oe += 1;
+                oq = run.next(oq);
+            }
             var xe: usize = 0;
             while (x + xe < extra.len and std.mem.eql(u8, extra[x + xe].key, cur)) xe += 1;
 
@@ -1143,17 +1606,14 @@ pub const NodeSnapshot = struct {
                         base_kind = e.kind;
                     }
                 }
-                for (stable[s .. s + se]) |*r| {
-                    if (establishes(r.kind) and r.seq >= base_seq) {
-                        base_seq = r.seq;
-                        base_kind = r.kind;
+                var q = op;
+                for (0..oe) |_| {
+                    const r = run.rec(q);
+                    if (establishes(r.kind()) and r.seq() >= base_seq) {
+                        base_seq = r.seq();
+                        base_kind = r.kind();
                     }
-                }
-                for (self.tail[t .. t + te]) |*r| {
-                    if (establishes(r.kind) and r.seq >= base_seq) {
-                        base_seq = r.seq;
-                        base_kind = r.kind;
-                    }
+                    q = run.next(q);
                 }
                 if (base_kind == .delete and base_seq < durable_tail and xe == 0) {
                     // A covered tombstone and everything it shadows leave
@@ -1166,12 +1626,12 @@ pub const NodeSnapshot = struct {
                     for (b..b + be) |i| if (idx.entries[i].seq >= base_seq) {
                         group += idx.recordRef(i).encodedLen();
                     };
-                    for (stable[s .. s + se]) |*r| if (r.seq >= base_seq) {
-                        group += r.recordRef().encodedLen();
-                    };
-                    for (self.tail[t .. t + te]) |*r| if (r.seq >= base_seq) {
-                        group += r.recordRef().encodedLen();
-                    };
+                    q = op;
+                    for (0..oe) |_| {
+                        const r = run.rec(q);
+                        if (r.seq() >= base_seq) group += r.ref().encodedLen();
+                        q = run.next(q);
+                    }
                     for (extra[x .. x + xe]) |e| group += e.len;
                 }
             }
@@ -1183,8 +1643,8 @@ pub const NodeSnapshot = struct {
             }
             acc += group;
             b += be;
-            s += se;
-            t += te;
+            o += oe;
+            op = oq;
             x += xe;
         }
         return .{ .bytes = total, .parts = parts };
@@ -1231,9 +1691,9 @@ fn emptyRun(gpa: Allocator) !*Arc(Run) {
 fn snapshotOver(gpa: Allocator, sources: []Bytes) !*Arc(NodeSnapshot) {
     const idx = try Arc(RecordIndex).create(gpa, try RecordIndex.build(gpa, sources, null));
     errdefer idx.release();
-    const stable = try emptyRun(gpa);
-    errdefer stable.release();
-    return Arc(NodeSnapshot).create(gpa, NodeSnapshot.init(idx, stable, &.{}, null));
+    const overlay = try emptyRun(gpa);
+    errdefer overlay.release();
+    return Arc(NodeSnapshot).create(gpa, NodeSnapshot.init(idx, overlay, null));
 }
 
 test "IdxRec is 24 bytes" {
@@ -1466,6 +1926,182 @@ test "foldBytesUpperWith: pending base-establishers shadow residents, deltas rid
     // Greedy parts: a budget below one group forces a part per group.
     try testing.expectEqual(@as(usize, 3), s.foldBytesUpperWith(&none, 1, 0).parts);
     try testing.expectEqual(@as(usize, 2), s.foldBytesUpperWith(&none, 2 * put_len, 0).parts);
+}
+
+fn ownedPut(gpa: Allocator, k: []const u8, seq: u64) !OwnedRec {
+    const v = iv(seq).encode();
+    return OwnedRec.fromRecordRef(gpa, .{ .key = k, .seq = seq, .kind = .put, .value = &v });
+}
+
+test "property: a run edited by random sorted inserts equals the flat sorted array — chunks split at CHUNK_MAX and stay non-empty, the spine's starts are exact, posOf/next/prev/at/partitionPoint agree with the array, a published run is untouched by the edits after it" {
+    const gpa = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x5eed_c4ea);
+    const rnd = prng.random();
+    var mirror: std.ArrayListUnmanaged(OwnedRec) = .empty;
+    defer {
+        for (mirror.items) |*r| r.deinit();
+        mirror.deinit(gpa);
+    }
+    var cur = try Arc(Run).create(gpa, Run.empty);
+    defer cur.release();
+    // A reader's run from the middle of the history, checked at the end.
+    var held: ?*Arc(Run) = null;
+    defer if (held) |h| h.release();
+    var held_len: usize = 0;
+    var seq: u64 = 1;
+    const N = 700;
+    for (0..N) |step| {
+        // Mostly fresh keys at random places, some repeats (a key's seq
+        // group), seqs ascending.
+        const k: [key.INODE_KEY_LEN]u8 = if (rnd.uintLessThan(u8, 4) == 0 and mirror.items.len > 0)
+            mirror.items[rnd.uintLessThan(usize, mirror.items.len)].key.slice()[0..key.INODE_KEY_LEN].*
+        else
+            key.inodeKey(rnd.uintLessThan(u64, 10_000));
+        var r = try ownedPut(gpa, &k, seq);
+        defer r.deinit();
+        seq += 1;
+        // The mirror's sorted insert.
+        const ctx: RunCtx = .{ .k = r.key.slice() };
+        const pos = std.sort.partitionPoint(OwnedRec, mirror.items, ctx, mirrorKeyLessEq);
+        try mirror.insert(gpa, pos, r.clone());
+        var edit = try RunEdit.begin(gpa, &cur.value);
+        _ = try edit.insert(gpa, pos, r.recordRef(), r.entry_floor, .own_value);
+        const next = try Arc(Run).create(gpa, try edit.finish(gpa));
+        cur.release();
+        cur = next;
+        if (step == N / 2) {
+            held = cur.retain();
+            held_len = cur.value.len;
+        } else if (step == N / 2 + 1) {
+            // One insert after the hold: one chunk copied (two if it
+            // split), every other chunk shared with the held run.
+            var shared: usize = 0;
+            for (held.?.value.slots) |s| shared += @intFromBool(s.chunk.strongCount() > 1);
+            try testing.expect(shared + 1 >= held.?.value.slots.len);
+            try testing.expect(cur.value.len == held_len + 1);
+        }
+    }
+    const run = &cur.value;
+    try testing.expectEqual(mirror.items.len, run.len);
+    // Shape: every chunk non-empty and ≤ CHUNK_MAX; starts exact.
+    var expect_start: usize = 0;
+    for (run.slots) |s| {
+        const n = s.chunk.value.len();
+        try testing.expect(n > 0 and n <= CHUNK_MAX);
+        try testing.expectEqual(expect_start, s.start);
+        expect_start += n;
+    }
+    try testing.expect(run.slots.len >= N / CHUNK_MAX);
+    // Content and cursors.
+    var p = run.posOf(0);
+    for (mirror.items, 0..) |*m, i| {
+        try testing.expect(m.recordRef().eql(run.at(i).ref()));
+        try testing.expect(m.recordRef().eql(run.rec(p).ref()));
+        try testing.expectEqual(i, run.index(p));
+        try testing.expectEqual(p, run.posOf(i));
+        if (i > 0) try testing.expect(mirror.items[i - 1].recordRef().eql(run.rec(run.prev(p)).ref()));
+        // Every record carries its Put head: the record's own value.
+        try testing.expectEqualSlices(u8, m.value.slice(), run.at(i).head().?.live);
+        p = run.next(p);
+    }
+    try testing.expectEqual(run.len, run.index(p));
+    // Groups: every key's `[lo, hi)` equals the array's.
+    for (0..64) |_| {
+        const k = key.inodeKey(rnd.uintLessThan(u64, 10_000));
+        const ctx: RunCtx = .{ .k = &k };
+        try testing.expectEqual(Range{
+            .lo = std.sort.partitionPoint(OwnedRec, mirror.items, ctx, mirrorKeyLess),
+            .hi = std.sort.partitionPoint(OwnedRec, mirror.items, ctx, mirrorKeyLessEq),
+        }, runGroup(run, &k));
+    }
+    // The held run is the history's middle, exactly, whatever applied since.
+    const h = &held.?.value;
+    try testing.expectEqual(held_len, h.len);
+    var hp = h.posOf(0);
+    var mi: usize = 0;
+    for (0..h.len) |_| {
+        // Every held record is in the final mirror, in order.
+        const hr = h.rec(hp).ref();
+        while (!mirror.items[mi].recordRef().eql(hr)) mi += 1;
+        mi += 1;
+        hp = h.next(hp);
+    }
+    // Round trip through the flat forms: records and heads alike.
+    const flat = try run.flatten(gpa);
+    defer gpa.free(flat);
+    for (flat) |*f| try testing.expect(f.folded != null and f.folded.? == .live and !f.folded.?.live.materialized);
+    var rebuilt = try Run.fromSorted(gpa, flat);
+    defer rebuilt.deinit(gpa);
+    try testing.expectEqual(run.len, rebuilt.len);
+    for (0..run.len) |i| {
+        try testing.expect(run.at(i).ref().eql(rebuilt.at(i).ref()));
+        try testing.expectEqualSlices(u8, run.at(i).head().?.live, rebuilt.at(i).head().?.live);
+    }
+}
+
+fn mirrorKeyLess(ctx: RunCtx, r: OwnedRec) bool {
+    return key.order(r.key.slice(), ctx.k) == .lt;
+}
+
+fn mirrorKeyLessEq(ctx: RunCtx, r: OwnedRec) bool {
+    return key.order(r.key.slice(), ctx.k) != .gt;
+}
+
+test "RunEdit.clearHead copies a shared chunk once and mutates the copy: the published run's record keeps its head, the edit's loses it (its charge returned); an insert into a chunk the edit owns grows it in place (one chunk box per touched chunk); a delta-folded head is copied into the arena and charged as materialized" {
+    const gpa = testing.allocator;
+    var recs: [5]OwnedRec = undefined;
+    for (&recs, 0..) |*r, i| r.* = try ownedPut(gpa, &key.inodeKey(10 * (i + 1)), i + 1);
+    for (&recs) |*r| r.folded = .{ .live = .{ .value = r.value.clone(), .materialized = false } };
+    const base = try Arc(Run).create(gpa, try Run.fromSorted(gpa, &recs));
+    defer base.release();
+    try testing.expectEqual(@as(usize, 1), base.value.slots.len);
+    var edit = try RunEdit.begin(gpa, &base.value);
+    // Shared: the copy.
+    try testing.expectEqual(@as(u64, 2), base.value.slots[0].chunk.strongCount());
+    try testing.expectEqual(FOLD_HEAD_OVERHEAD, try edit.clearHead(gpa, 2));
+    try testing.expectEqual(@as(u64, 1), base.value.slots[0].chunk.strongCount());
+    try testing.expectEqual(@as(u64, 1), edit.slots.items[0].chunk.strongCount());
+    try testing.expect(base.value.at(2).head() != null);
+    try testing.expect(edit.view().at(2).head() == null);
+    try testing.expectEqual(@as(usize, 0), try edit.clearHead(gpa, 2));
+    // Owned now: an insert grows the same chunk; no second box.
+    const box_before = edit.slots.items[0].chunk;
+    var r = try ownedPut(gpa, &key.inodeKey(25), 9);
+    defer r.deinit();
+    try testing.expectEqual(FOLD_HEAD_OVERHEAD + 3, try edit.insert(gpa, 2, r.recordRef(), 7, .{ .folded = "xyz" }));
+    try testing.expect(edit.slots.items[0].chunk == box_before);
+    try testing.expectEqual(@as(usize, 6), edit.view().len);
+    try testing.expectEqualSlices(u8, &key.inodeKey(25), edit.view().at(2).key());
+    try testing.expectEqualSlices(u8, "xyz", edit.view().at(2).head().?.live);
+    try testing.expectEqual(@as(u64, 7), edit.view().at(2).rec.entry_floor);
+    try testing.expectEqualSlices(u8, &key.inodeKey(30), edit.view().at(3).key());
+    var next = try edit.finish(gpa);
+    defer next.deinit(gpa);
+    try testing.expectEqual(@as(usize, 5), base.value.len);
+    try testing.expectEqual(@as(usize, 6), next.len);
+    // The flat form carries the materialized head as its own buffer.
+    const flat = try next.flatten(gpa);
+    defer {
+        for (flat) |*f| f.deinit();
+        gpa.free(flat);
+    }
+    try testing.expect(flat[2].folded.?.live.materialized);
+    try testing.expectEqualSlices(u8, "xyz", flat[2].folded.?.live.value.slice());
+    try testing.expectEqual(FOLD_HEAD_OVERHEAD + 3, flat[2].headBytes());
+    // Key 30 (now at 3) lost its head above; key 40 keeps its Put head.
+    try testing.expect(flat[3].folded == null);
+    try testing.expect(!flat[4].folded.?.live.materialized);
+    try testing.expectEqualSlices(u8, flat[4].value.slice(), flat[4].folded.?.live.value.slice());
+}
+
+test "Run.applyBytesBound tie: two chunk copies of CHUNK_MAX + 1 records and their arena with their boxes, one slot per half-full chunk plus two, the run's box; ChunkRec is 48 bytes" {
+    try testing.expectEqual(@as(usize, 48), @sizeOf(ChunkRec));
+    const copy = (CHUNK_MAX + 1) * (48 + 100);
+    try testing.expectEqual(2 * copy + 2 * @sizeOf(Arc(Chunk)) + 2 * @sizeOf(Slot) + @sizeOf(Arc(Run)), Run.applyBytesBound(0, 100));
+    try testing.expectEqual(2 * copy + 2 * @sizeOf(Arc(Chunk)) + (4096 / (CHUNK_MAX / 2) + 2) * @sizeOf(Slot) + @sizeOf(Arc(Run)), Run.applyBytesBound(4096, 100));
+    // The copy's two blocks are size-class blocks under smp_allocator (its
+    // largest class is 32 KiB; past it a block maps pages).
+    try testing.expect(copy < 32 * 1024);
 }
 
 test "FoldMemo: populate-once, bounded at 8 cells, charges both gauges and credits exactly on deinit" {

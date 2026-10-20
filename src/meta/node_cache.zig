@@ -12,7 +12,8 @@
 //! - `applyLocked` is THE RAM-mutation choke point: the partitioning gate
 //!   (reader ⇒ refuse; interior ∧ ¬authority ⇒ refuse; the slot-lease
 //!   verdict), `markDirty`, the dirty-floor stamp, the D7.a head
-//!   materialization, the inversion guard, the bounded tail publish.
+//!   materialization, the inversion guard, the chunk-copy insert into the
+//!   persistent overlay run and its one-reference publish.
 //! - `freezeLocked` freezes the open delta under the lock into a 4 KiB-padded
 //!   bset image whose records join the snapshot's base index incrementally;
 //!   `appendFrozen` writes it OUTSIDE the lock through the `NodeLoader`.
@@ -415,22 +416,14 @@ pub const FrozenDelta = struct {
 /// writeback/SMO task).
 pub const NodeDirty = struct {
     /// Open-delta records, `(key asc, seq asc)` — the AUTHORITATIVE merged
-    /// view (freeze, SMO take-over and rollback operate on it).
-    overlay: std.ArrayListUnmanaged(OwnedRec) = .empty,
+    /// view (freeze, SMO take-over and rollback operate on it), an
+    /// immutable run every published snapshot shares by reference: an
+    /// apply derives the next (`snapshot.RunEdit`) and swaps it here.
+    overlay: *Arc(Run),
     /// Encoded size of `overlay` (writeback threshold input).
     overlay_bytes: usize = 0,
     /// Bytes of materialized heads riding `overlay` records.
     head_bytes: usize = 0,
-    /// Publish mirrors of `overlay`: `merge(snap_stable, snap_tail) ==
-    /// overlay` at every publish point; `snap_stable` is shared with the
-    /// published snapshots, `snap_tail` holds the ≤ `OVERLAY_TAIL_MAX`
-    /// records applied since the last re-merge.
-    snap_stable: *Arc(Run),
-    snap_tail: std.ArrayListUnmanaged(OwnedRec) = .empty,
-    /// Highest record seq ever applied — the run-precedence guard: an
-    /// apply at-or-below it (mount replay's original seqs) forces a stable
-    /// re-merge, keeping "tail ≥ stable per key" true everywhere else.
-    max_applied_seq: u64 = 0,
     frozen: ?FrozenDelta = null,
     /// Node-relative offset of the unwritten tail (advances per append).
     tail_offset: usize,
@@ -460,7 +453,7 @@ pub const NodeDirty = struct {
     }
 
     pub fn overlayLen(self: *const NodeDirty) usize {
-        return self.overlay.items.len;
+        return self.overlay.value.len;
     }
 
     /// The not-yet-durable floor of the records still in the OPEN delta —
@@ -469,9 +462,11 @@ pub const NodeDirty = struct {
     /// the open records are not part of.
     pub fn overlayFloor(self: *const NodeDirty) ?u64 {
         var floor: ?u64 = null;
-        for (self.overlay.items) |*r| {
-            const f = @min(r.entry_floor, r.seq);
-            floor = if (floor) |x| @min(x, f) else f;
+        for (self.overlay.value.slots) |s| {
+            for (s.chunk.value.recs.items) |r| {
+                const f = @min(r.entry_floor, r.seq);
+                floor = if (floor) |x| @min(x, f) else f;
+            }
         }
         return floor;
     }
@@ -581,12 +576,10 @@ pub const NodeDirty = struct {
     pub fn takeOverlay(self: *NodeDirty, gpa: Allocator) Allocator.Error![]OwnedRec {
         const fresh = try Arc(Run).create(gpa, Run.empty);
         errdefer fresh.release();
-        const out = try self.overlay.toOwnedSlice(gpa);
+        const out = try self.overlay.value.flatten(gpa);
         self.overlay_bytes = 0;
         self.head_bytes = 0;
-        self.snap_stable.release();
-        self.snap_stable = fresh;
-        self.clearTail();
+        self.swapOverlay(fresh);
         self.resyncCharge();
         // The SMO taking the delta is the one the promise was for: its
         // claims already drew the budget the promise held.
@@ -594,24 +587,11 @@ pub const NodeDirty = struct {
         return out;
     }
 
-    fn clearTail(self: *NodeDirty) void {
-        for (self.snap_tail.items) |*r| r.deinit();
-        self.snap_tail.clearRetainingCapacity();
-    }
-
-    /// Re-merge: the stable mirror becomes a clone of the whole overlay and
-    /// the tail empties.
-    fn remergeStable(self: *NodeDirty, gpa: Allocator) Allocator.Error!void {
-        const recs = try gpa.alloc(OwnedRec, self.overlay.items.len);
-        errdefer gpa.free(recs);
-        for (self.overlay.items, recs) |*src, *dst| dst.* = src.clone();
-        const fresh = Arc(Run).create(gpa, .{ .recs = recs }) catch |e| {
-            for (recs) |*r| r.deinit();
-            return e;
-        };
-        self.snap_stable.release();
-        self.snap_stable = fresh;
-        self.clearTail();
+    /// Install the next run (takes the reference); the published snapshots
+    /// keep theirs.
+    fn swapOverlay(self: *NodeDirty, next: *Arc(Run)) void {
+        self.overlay.release();
+        self.overlay = next;
     }
 
     /// Bring the budget gauge in line with this open delta's bytes
@@ -624,11 +604,7 @@ pub const NodeDirty = struct {
     }
 
     pub fn deinit(self: *NodeDirty, gpa: Allocator) void {
-        for (self.overlay.items) |*r| r.deinit();
-        self.overlay.deinit(gpa);
-        self.clearTail();
-        self.snap_tail.deinit(gpa);
-        self.snap_stable.release();
+        self.overlay.release();
         if (self.frozen) |*f| f.deinit(gpa);
         // The accounting is deinit-owned: whatever this open delta still
         // charges leaves the gauge with it.
@@ -707,16 +683,17 @@ pub const CachedNode = struct {
             return e;
         };
         errdefer base.release();
-        const stable = try Arc(Run).create(gpa, Run.empty);
-        errdefer stable.release();
-        const snap = try Arc(NodeSnapshot).create(gpa, NodeSnapshot.init(base, stable, &.{}, &cache.cached_bytes));
+        const overlay = try Arc(Run).create(gpa, Run.empty);
+        errdefer overlay.release();
+        const snap = try Arc(NodeSnapshot).create(gpa, NodeSnapshot.init(base, overlay, &cache.cached_bytes));
         errdefer snap.release();
         const min_key = try gpa.dupe(u8, ld.header.min_key);
         errdefer gpa.free(min_key);
         const max_key = try gpa.dupe(u8, ld.header.max_key);
         errdefer gpa.free(max_key);
-        const dirty_stable = try Arc(Run).create(gpa, Run.empty);
-        errdefer dirty_stable.release();
+        // The dirty half shares the empty run with the first snapshot.
+        const dirty_overlay = overlay.retain();
+        errdefer dirty_overlay.release();
         const self = try gpa.create(CachedNode);
         self.* = .{
             .cache = cache,
@@ -732,7 +709,7 @@ pub const CachedNode = struct {
             .snapshot = .init(snap),
             .lock = .init,
             .dirty = .{
-                .snap_stable = dirty_stable,
+                .overlay = dirty_overlay,
                 .tail_offset = ld.tail_offset,
                 .charge = &cache.cached_bytes,
                 .heap_promised = &cache.heap_promised,
@@ -920,94 +897,90 @@ pub const CachedNode = struct {
         // Every apply lowers the not-yet-durable floor; the tail rule reads
         // it back. acq_rel fetchMin paired with `takeDirtyFloor`'s swap.
         if (records.len != 0) _ = self.dirty_floor.fetchMin(floor, .acq_rel);
-        // Reserve the inserts up front so a refusal below cannot leave a
-        // record half-applied.
-        try dirty.overlay.ensureUnusedCapacity(gpa, records.len);
-        try dirty.snap_tail.ensureUnusedCapacity(gpa, records.len);
-        var applied: usize = 0;
-        errdefer consume(records[applied..]);
+        // The working copy of the run: the chunks the records land in are
+        // copied, the rest stay shared with the published snapshots. A
+        // failure below drops the copy whole — the published run stands,
+        // the records are consumed either way — so no record is ever
+        // half-applied.
+        var edit = snapshot.RunEdit.begin(gpa, &dirty.overlay.value) catch |e| {
+            consume(records);
+            return e;
+        };
+        errdefer edit.abandon(gpa);
+        var taken: usize = 0;
+        errdefer consume(records[taken..]);
+        var head_bytes = dirty.head_bytes;
+        var overlay_bytes = dirty.overlay_bytes;
         for (records) |*moved| {
             var r = moved.*;
             moved.* = undefined;
+            taken += 1;
+            // The run copies the record's bytes; its references end here.
+            defer r.deinit();
             // Stamp (or tighten) the record's own floor contribution so an
             // SMO leftover transfer can rebuild successor floors exactly.
             r.entry_floor = @min(r.entry_floor, floor);
-            const items = dirty.overlay.items;
-            const pos = std.sort.partitionPoint(OwnedRec, items, KeySeq{ .k = r.key.slice(), .seq = r.seq }, keySeqLessEq);
-            const gend = std.sort.partitionPoint(OwnedRec, items, KeyOnly{ .k = r.key.slice() }, keyLessEq);
+            const k = r.key.slice();
+            const run = edit.view();
+            const pos = run.partitionPoint(KeySeq{ .k = k, .seq = r.seq }, keySeqLessEq);
+            const gend = run.partitionPoint(KeyOnly{ .k = k }, keyLessEq);
             const key_newest = pos == gend;
-            const prev_is_same_key = pos > 0 and std.mem.eql(u8, items[pos - 1].key.slice(), r.key.slice());
+            const prev_is_same_key = pos > 0 and std.mem.eql(u8, run.at(pos - 1).key(), k);
             // D7.a head materialization: fold-forward against the folded
             // outcome of everything older than `r` for this key. Put and
             // Delete shadow everything below, so their heads are
             // self-defining; the fold-below is fetched only for Delta. A
             // corrupt base/delta surfaces at read time exactly as before —
-            // the apply never changes semantics over it (no head).
-            if (r.folded == null) {
-                r.folded = switch (r.kind) {
-                    .put => .{ .live = .{ .value = r.value.clone(), .decoded = null, .materialized = false } },
-                    .delete => .tombstone,
-                    .delta => blk: {
-                        const prev: ?Head = if (prev_is_same_key)
-                            (if (items[pos - 1].folded) |h| h.clone() else self.foldBelowLocked(items[groupStart(items, pos, r.key.slice())..pos], r.key.slice()) catch null)
-                        else
-                            self.foldBelowLocked(&.{}, r.key.slice()) catch null;
-                        const p = prev orelse break :blk null;
-                        defer p.deinit();
-                        const prev_view = p.asFolded();
-                        const next = rec.foldForward(gpa, &prev_view, r.kind, r.value.slice()) catch break :blk null;
-                        break :blk Head.fromFolded(gpa, next, r.value) catch blk2: {
-                            var n = next;
-                            n.deinit(gpa);
-                            break :blk2 null;
-                        };
-                    },
-                };
-            }
+            // the apply never changes semantics over it (no head). A head
+            // riding in (an SMO's leftover) is taken as it is.
+            var fold_buf: ?[]const u8 = null;
+            defer if (fold_buf) |b| gpa.free(b);
+            const head: snapshot.HeadIn = if (r.folded != null) .of(r.folded) else switch (r.kind) {
+                .put => .own_value,
+                .delete => .tombstone,
+                .delta => blk: {
+                    var prev: rec.FoldedHead = if (prev_is_same_key)
+                        (if (run.at(pos - 1).head()) |h| foldedOf(h) else self.foldBelowLocked(&run, run.partitionPoint(KeyOnly{ .k = k }, keyLess), pos, k) catch break :blk .none)
+                    else
+                        self.foldBelowLocked(&run, 0, 0, k) catch break :blk .none;
+                    defer prev.deinit(gpa);
+                    const next = rec.foldForward(gpa, &prev, r.kind, r.value.slice()) catch break :blk .none;
+                    switch (next) {
+                        .live => |l| {
+                            if (!l.materialized) break :blk .own_value;
+                            fold_buf = l.value;
+                            break :blk .{ .folded = l.value };
+                        },
+                        .tombstone => break :blk .tombstone,
+                        .absent => break :blk .absent,
+                    }
+                },
+            };
+            overlay_bytes += r.recordRef().encodedLen();
+            // The sorted insert: any seq order — mount replay's original
+            // seqs, two in-flight windows applied in either order (§AW) —
+            // lands at its `(key, seq)` place; the run stays exact.
+            head_bytes += try edit.insert(gpa, pos, r.recordRef(), r.entry_floor, head);
             // Single-head-per-key: the superseded newest below loses its
             // head (never read again — lookups take the group's newest).
-            if (prev_is_same_key) {
-                dirty.head_bytes -= items[pos - 1].headBytes();
-                items[pos - 1].clearHead();
-            }
+            // In the copy: the published snapshot's record keeps serving.
+            if (prev_is_same_key) head_bytes -= try edit.clearHead(gpa, pos - 1);
             // Per-key inversion guard: records above `r` folded without it
             // — their heads are stale. Invalidate; reads fall back to the
             // from-scratch fold (byte-identical by the algebra theorem).
             if (!key_newest) {
-                for (items[pos..gend]) |*above| {
-                    dirty.head_bytes -= above.headBytes();
-                    above.clearHead();
-                }
-            }
-            dirty.head_bytes += r.headBytes();
-            dirty.overlay_bytes += r.recordRef().encodedLen();
-            // Run-precedence guard: fold order requires "tail ≥ stable PER
-            // KEY" (the tail is a `(key, seq)` run of its own), so a
-            // record older than its key's newest stable record re-merges
-            // the whole overlay into a fresh stable run instead of riding
-            // the tail: mount replay's original seqs, and a window applied
-            // after a later one that carried the same key (two windows in
-            // flight share a key only under a SHARED guard — a Δ merge;
-            // §AW). A record older than another KEY's is free: the tail
-            // insert is sorted.
-            const monotonic = r.seq > dirty.max_applied_seq or r.seq > newestStableSeqOf(dirty, r.key.slice());
-            dirty.max_applied_seq = @max(dirty.max_applied_seq, r.seq);
-            if (monotonic) {
-                const tpos = std.sort.partitionPoint(OwnedRec, dirty.snap_tail.items, KeySeq{ .k = r.key.slice(), .seq = r.seq }, keySeqLessEq);
-                dirty.snap_tail.insertAssumeCapacity(tpos, r.clone());
-                dirty.overlay.insertAssumeCapacity(pos, r);
-                applied += 1;
-            } else {
-                dirty.overlay.insertAssumeCapacity(pos, r);
-                applied += 1;
-                try dirty.remergeStable(gpa);
+                for (pos + 1..gend + 1) |i| head_bytes -= try edit.clearHead(gpa, i);
             }
         }
-        // Publish: share the stable run, clone only the small tail. Tail
-        // overflow re-merges into a fresh stable run, amortizing the full
-        // clone over OVERLAY_TAIL_MAX applies.
-        if (dirty.snap_tail.items.len > snapshot.OVERLAY_TAIL_MAX) try dirty.remergeStable(gpa);
-        assert(dirty.snap_stable.value.recs.len + dirty.snap_tail.items.len == dirty.overlay.items.len);
+        const next = try edit.finish(gpa);
+        const boxed = Arc(Run).create(gpa, next) catch |e| {
+            var n = next;
+            n.deinit(gpa);
+            return e;
+        };
+        dirty.swapOverlay(boxed);
+        dirty.head_bytes = head_bytes;
+        dirty.overlay_bytes = overlay_bytes;
         dirty.resyncCharge();
         try self.publishSnapshot(dirty, null);
     }
@@ -1044,58 +1017,57 @@ pub const CachedNode = struct {
     const KeySeq = struct { k: []const u8, seq: u64 };
 
     /// `(r.key, r.seq) <= (ctx.k, ctx.seq)`.
-    fn keySeqLessEq(ctx: KeySeq, r: OwnedRec) bool {
-        return switch (key.order(r.key.slice(), ctx.k)) {
+    fn keySeqLessEq(ctx: KeySeq, r: snapshot.RecView) bool {
+        return switch (key.order(r.key(), ctx.k)) {
             .lt => true,
             .gt => false,
-            .eq => r.seq <= ctx.seq,
+            .eq => r.seq() <= ctx.seq,
         };
     }
 
     const KeyOnly = struct { k: []const u8 };
 
-    fn keyLessEq(ctx: KeyOnly, r: OwnedRec) bool {
-        return key.order(r.key.slice(), ctx.k) != .gt;
+    fn keyLessEq(ctx: KeyOnly, r: snapshot.RecView) bool {
+        return key.order(r.key(), ctx.k) != .gt;
     }
 
-    fn groupStart(items: []const OwnedRec, end: usize, k: []const u8) usize {
-        var i = end;
-        while (i > 0 and std.mem.eql(u8, items[i - 1].key.slice(), k)) i -= 1;
-        return i;
+    fn keyLess(ctx: KeyOnly, r: snapshot.RecView) bool {
+        return key.order(r.key(), ctx.k) == .lt;
     }
 
-    /// The newest seq the STABLE mirror holds for `k` (0 when none): the
-    /// per-key bound a tail insert must exceed.
-    fn newestStableSeqOf(dirty: *const NodeDirty, k: []const u8) u64 {
-        const recs = dirty.snap_stable.value.recs;
-        const g = snapshot.runGroup(recs, k);
-        return if (g.hi > g.lo) recs[g.hi - 1].seq else 0;
+    /// A served head as the algebra's `prev` (borrowed; the run is held).
+    fn foldedOf(h: snapshot.HeadView) rec.FoldedHead {
+        return switch (h) {
+            .live => |v| .{ .live = .{ .value = v, .decoded = null, .materialized = false } },
+            .tombstone => .tombstone,
+            .absent => .absent,
+        };
     }
 
     /// Writer-side fold of "everything older than the record being applied"
-    /// for one key: the given lock-held overlay group below it, newest
+    /// for one key: the lock-held overlay group `[lo, hi)` below it, newest
     /// first, then the current base group. With no overlay records below,
     /// the published snapshot's memo may already carry the base fold —
     /// probed without touching the read counters. Cold by construction.
-    fn foldBelowLocked(self: *CachedNode, overlay_below: []const OwnedRec, k: []const u8) rec.FoldError!Head {
+    fn foldBelowLocked(self: *CachedNode, run: *const Run, lo: usize, hi: usize, k: []const u8) rec.FoldError!rec.FoldedHead {
         const gpa = self.cache.gpa;
         const cur = self.snapshot.load();
         defer cur.release();
-        if (overlay_below.len == 0) {
+        if (hi == lo) {
             if (cur.value.memo.probe(k)) |cell| {
-                // The memo already pays for the buffer; the head borrows it.
-                return .{ .live = .{ .value = cell.value.clone(), .decoded = null, .materialized = false } };
+                // The memo's buffer dies with its snapshot: a copy outlives it.
+                return .{ .live = .{ .value = try gpa.dupe(u8, cell.value.slice()), .decoded = null, .materialized = true } };
             }
         }
         const bg = cur.value.base.value.groupBounds(k);
-        const n = overlay_below.len + (bg.hi - bg.lo);
+        const n = (hi - lo) + (bg.hi - bg.lo);
         const refs = try gpa.alloc(RecordRef, n);
         defer gpa.free(refs);
         var i: usize = 0;
-        var o = overlay_below.len;
-        while (o > 0) : (i += 1) {
+        var o = hi;
+        while (o > lo) : (i += 1) {
             o -= 1;
-            refs[i] = overlay_below[o].recordRef();
+            refs[i] = run.at(o).ref();
         }
         for (bg.lo..bg.hi) |b| {
             refs[i] = cur.value.base.value.recordRef(b);
@@ -1106,18 +1078,16 @@ pub const CachedNode = struct {
             .absent => return .absent,
             .tombstone => return .tombstone,
             .put => |p| {
-                // Either arm owns a fresh buffer (folded or copied) — one
-                // copy beats threading provenance through the fold, and the
-                // head then serves refcounted for its whole life.
-                const owned: []u8 = if (p.owned) @constCast(p.value) else try gpa.dupe(u8, p.value);
-                errdefer gpa.free(owned);
-                return .{ .live = .{ .value = try Bytes.fromOwned(gpa, owned), .decoded = null, .materialized = true } };
+                // Either arm owns a fresh buffer (folded or copied): the
+                // outcome outlives the snapshot the borrowed bytes belong to.
+                const owned: []const u8 = if (p.owned) p.value else try gpa.dupe(u8, p.value);
+                return .{ .live = .{ .value = owned, .decoded = null, .materialized = true } };
             },
         }
     }
 
-    /// Publish a snapshot of the mirrors over `base` (null = the current
-    /// base), with a fresh memo.
+    /// Publish a snapshot of the dirty half's run over `base` (null = the
+    /// current base), with a fresh memo: one reference, no copy.
     fn publishSnapshot(self: *CachedNode, dirty: *NodeDirty, base_override: ?*Arc(RecordIndex)) Allocator.Error!void {
         const gpa = self.cache.gpa;
         const base = base_override orelse blk: {
@@ -1126,19 +1096,9 @@ pub const CachedNode = struct {
             break :blk cur.value.base.retain();
         };
         errdefer base.release();
-        const tail = try gpa.alloc(OwnedRec, dirty.snap_tail.items.len);
-        var cloned: usize = 0;
-        errdefer {
-            for (tail[0..cloned]) |*r| r.deinit();
-            gpa.free(tail);
-        }
-        for (dirty.snap_tail.items, tail) |*src, *dst| {
-            dst.* = src.clone();
-            cloned += 1;
-        }
-        const stable = dirty.snap_stable.retain();
-        errdefer stable.release();
-        const fresh = try Arc(NodeSnapshot).create(gpa, NodeSnapshot.init(base, stable, tail, &self.cache.cached_bytes));
+        const overlay = dirty.overlay.retain();
+        errdefer overlay.release();
+        const fresh = try Arc(NodeSnapshot).create(gpa, NodeSnapshot.init(base, overlay, &self.cache.cached_bytes));
         self.snapshot.store(fresh);
     }
 
@@ -1150,36 +1110,48 @@ pub const CachedNode = struct {
     /// `newestSeqOf`. Returns how many records were removed.
     pub fn removeOverlayRecordsLocked(self: *CachedNode, dirty: *NodeDirty, k: []const u8, span: SeqSpan) Allocator.Error!usize {
         const gpa = self.cache.gpa;
+        // Rollback is cold: rebuild the run from a flat copy of the
+        // survivors and publish the corrected view.
+        const all = try dirty.overlay.value.flatten(gpa);
+        // The array alone; its elements are consumed below on every path.
+        defer gpa.free(all);
+        var kept: usize = 0;
         var removed: usize = 0;
-        var i: usize = 0;
-        while (i < dirty.overlay.items.len) {
-            const r = &dirty.overlay.items[i];
+        for (all) |*r| {
             if (std.mem.eql(u8, r.key.slice(), k) and span.contains(r.seq)) {
-                var victim = dirty.overlay.orderedRemove(i);
-                victim.deinit();
+                r.deinit();
                 removed += 1;
             } else {
-                i += 1;
+                all[kept] = r.*;
+                kept += 1;
             }
         }
-        if (removed == 0) return 0;
+        const survivors = all[0..kept];
+        if (removed == 0) {
+            for (survivors) |*r| r.deinit();
+            return 0;
+        }
         // D7.a stale-head guard: a surviving record NEWER than the removed
         // range folded the removed records into its head — the
         // concurrent-Δtime rollback race shape. Invalidate those heads;
         // older survivors' heads folded nothing that was removed and stay.
-        const g = snapshot.runGroup(dirty.overlay.items, k);
-        for (dirty.overlay.items[g.lo..g.hi]) |*r| {
-            if (r.seq > span.lo) r.clearHead();
+        var overlay_bytes: usize = 0;
+        var head_bytes: usize = 0;
+        for (survivors) |*r| {
+            if (std.mem.eql(u8, r.key.slice(), k) and r.seq > span.lo) r.clearHead();
+            overlay_bytes += r.recordRef().encodedLen();
+            head_bytes += r.headBytes();
         }
-        dirty.overlay_bytes = 0;
-        dirty.head_bytes = 0;
-        for (dirty.overlay.items) |*r| {
-            dirty.overlay_bytes += r.recordRef().encodedLen();
-            dirty.head_bytes += r.headBytes();
-        }
-        // Rollback is cold: resync the mirrors with a full re-merge and
-        // publish the corrected view.
-        try dirty.remergeStable(gpa);
+        // `fromSorted` consumes the survivors on every outcome.
+        const rebuilt = try Run.fromSorted(gpa, survivors);
+        const boxed = Arc(Run).create(gpa, rebuilt) catch |e| {
+            var r = rebuilt;
+            r.deinit(gpa);
+            return e;
+        };
+        dirty.swapOverlay(boxed);
+        dirty.overlay_bytes = overlay_bytes;
+        dirty.head_bytes = head_bytes;
         dirty.resyncCharge();
         try self.publishSnapshot(dirty, null);
         // The rolled-out record was visible: its ino's views are stale.
@@ -1212,13 +1184,13 @@ pub const CachedNode = struct {
         // node write lock on the serialized writeback/SMO task.
         if (self.state.isFreezing() and !self.state.isSuperseded()) {
             freeze_latched_recovered.fire("FREEZING latched with no frozen delta — lifecycle word restored, freeze retried");
-            if (dirty.overlay.items.len == 0) {
+            if (dirty.overlay.value.len == 0) {
                 _ = self.state.endFreeze();
             } else {
                 self.state.abortFreeze();
             }
         }
-        if (dirty.overlay.items.len == 0) {
+        if (dirty.overlay.value.len == 0) {
             // A rollback emptied the overlay under this lock and left the
             // word DIRTY with nothing to write: the EMPTY freeze (begin →
             // end) closes it, so the node is collectable and evictable
@@ -1244,8 +1216,22 @@ pub const CachedNode = struct {
         errdefer self.state.abortFreeze();
         if (testFreezeFailArmed()) return error.InjectedFreezeFailure;
 
-        // Shadow-fold: one linear pass over per-key runs of the sorted overlay.
-        const items = dirty.overlay.items;
+        // Shadow-fold: one linear pass over per-key groups of the sorted
+        // overlay, through a flat view of the run's records.
+        const run = &dirty.overlay.value;
+        const items = try gpa.alloc(snapshot.RecView, run.len);
+        defer gpa.free(items);
+        {
+            var n: usize = 0;
+            for (run.slots) |s| {
+                const c = &s.chunk.value;
+                for (0..c.len()) |i| {
+                    items[n] = c.view(i);
+                    n += 1;
+                }
+            }
+            assert(n == run.len);
+        }
         var records: std.ArrayListUnmanaged(rec.Record) = .empty;
         errdefer {
             rec.deinitRecords(gpa, records.items);
@@ -1257,21 +1243,21 @@ pub const CachedNode = struct {
         var i: usize = 0;
         while (i < items.len) {
             var j = i + 1;
-            while (j < items.len and std.mem.eql(u8, items[j].key.slice(), items[i].key.slice())) j += 1;
-            // Newest base-establishing record in the run (runs are seq-
-            // ascending); none ⇒ delta-only run, keep everything.
+            while (j < items.len and std.mem.eql(u8, items[j].key(), items[i].key())) j += 1;
+            // Newest base-establishing record in the group (groups are
+            // seq-ascending); none ⇒ delta-only group, keep everything.
             var keep_from = i;
             var k = j;
             while (k > i) {
                 k -= 1;
-                if (items[k].kind == .put or items[k].kind == .delete) {
+                if (items[k].kind() == .put or items[k].kind() == .delete) {
                     keep_from = k;
                     break;
                 }
             }
             dropped += keep_from - i;
-            for (items[keep_from..j]) |*r| records.appendAssumeCapacity(try r.toRecord(gpa));
-            for (items[i..j]) |*r| horizon = @max(horizon, r.seq);
+            for (items[keep_from..j]) |r| records.appendAssumeCapacity(try r.ref().toRecord(gpa));
+            for (items[i..j]) |r| horizon = @max(horizon, r.seq());
             i = j;
         }
         if (dropped > 0) stats.meta_kv_node_freeze_shadow_dropped.add(dropped);
@@ -1320,21 +1306,19 @@ pub const CachedNode = struct {
             return e;
         };
         errdefer new_base.release();
-        const empty_stable = try Arc(Run).create(gpa, Run.empty);
-        errdefer empty_stable.release();
-        const fresh = try Arc(NodeSnapshot).create(gpa, NodeSnapshot.init(new_base, empty_stable, &.{}, &self.cache.cached_bytes));
-        const mirror_stable = try Arc(Run).create(gpa, Run.empty);
+        const emptied = try Arc(Run).create(gpa, Run.empty);
+        errdefer emptied.release();
+        const fresh = try Arc(NodeSnapshot).create(gpa, NodeSnapshot.init(new_base, emptied, &self.cache.cached_bytes));
         // The last fallible step succeeded — the freeze WILL publish
-        // (everything below is infallible RAM bookkeeping).
-        for (dirty.overlay.items) |*r| r.deinit();
-        dirty.overlay.clearRetainingCapacity();
+        // (everything below is infallible RAM bookkeeping). The frozen
+        // records leave the open delta: the dirty half shares the empty
+        // run with the new snapshot; the old run dies with the snapshots
+        // over it.
+        dirty.swapOverlay(emptied.retain());
         dirty.overlay_bytes = 0;
         // The heads freeze away with their records; the first post-freeze
         // read repopulates through the memo instead.
         dirty.head_bytes = 0;
-        dirty.snap_stable.release();
-        dirty.snap_stable = mirror_stable;
-        dirty.clearTail();
         dirty.resyncCharge();
         dirty.frozen = .{ .records = frozen_records, .horizon = horizon, .frame_len = frame_len };
         self.snapshot.store(fresh);
@@ -3555,6 +3539,10 @@ test "the cache registers as a sheddable mem_budget component: gauge, 64 MiB flo
 const LiveBytes = struct {
     inner: Allocator,
     live: usize = 0,
+    /// Bytes requested by every alloc and every growth, cumulative.
+    allocated: usize = 0,
+    /// The largest block ever requested.
+    largest: usize = 0,
 
     fn allocator(self: *LiveBytes) Allocator {
         return .{ .ptr = self, .vtable = &vtable };
@@ -3562,22 +3550,36 @@ const LiveBytes = struct {
 
     const vtable: Allocator.VTable = .{ .alloc = alloc, .resize = resize, .remap = remap, .free = free };
 
+    fn noteGrowth(self: *LiveBytes, old_len: usize, new_len: usize) void {
+        if (new_len > old_len) self.allocated += new_len - old_len;
+        self.largest = @max(self.largest, new_len);
+    }
+
     fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
         const self: *LiveBytes = @ptrCast(@alignCast(ctx));
         const p = self.inner.rawAlloc(len, alignment, ret_addr);
-        if (p != null) self.live += len;
+        if (p != null) {
+            self.live += len;
+            self.noteGrowth(0, len);
+        }
         return p;
     }
     fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
         const self: *LiveBytes = @ptrCast(@alignCast(ctx));
         const ok = self.inner.rawResize(memory, alignment, new_len, ret_addr);
-        if (ok) self.live = self.live - memory.len + new_len;
+        if (ok) {
+            self.live = self.live - memory.len + new_len;
+            self.noteGrowth(memory.len, new_len);
+        }
         return ok;
     }
     fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
         const self: *LiveBytes = @ptrCast(@alignCast(ctx));
         const p = self.inner.rawRemap(memory, alignment, new_len, ret_addr);
-        if (p != null) self.live = self.live - memory.len + new_len;
+        if (p != null) {
+            self.live = self.live - memory.len + new_len;
+            self.noteGrowth(memory.len, new_len);
+        }
         return p;
     }
     fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
@@ -3641,4 +3643,87 @@ test "R5 measure: the charge of N cached nodes with M records each — every nod
     // What stays allocated is the cache's own tables (the clock ring and
     // the shard maps keep their grown capacity): under a page, no node.
     try testing.expect(live.live - live_empty < bset.NODE_PAGE);
+}
+
+/// One window of `n` single-record applies on `leaf` (distinct keys at
+/// pseudo-random sorted positions — a create storm's dirents) and what the
+/// cache's allocator saw across the applies alone.
+const ApplyWindow = struct { bytes: usize, largest: usize };
+
+fn applyWindow(live: *LiveBytes, leaf: *CachedNode, rnd: std.Random, seq: *u64, n: usize) !ApplyWindow {
+    const gpa = testing.allocator;
+    var bytes: usize = 0;
+    var largest: usize = 0;
+    for (0..n) |_| {
+        const k = key.inodeKey(rnd.int(u48));
+        const v = iv(seq.*).encode();
+        var recs = [_]OwnedRec{try OwnedRec.fromRecordRef(gpa, .{ .key = &k, .seq = seq.*, .kind = .put, .value = &v })};
+        const d = leaf.lockWrite(testing.io);
+        defer leaf.unlockWrite(testing.io);
+        const before = live.allocated;
+        live.largest = 0;
+        try leaf.applyLocked(d, &recs, seq.*);
+        bytes += live.allocated - before;
+        largest = @max(largest, live.largest);
+        seq.* += 1;
+    }
+    return .{ .bytes = bytes, .largest = largest };
+}
+
+test "the RAM apply is O(records applied): on a hot leaf whose overlay has grown past 4,000 records an apply allocates what it allocates at 256 — one chunk's copy, the spine and the snapshot, Run.applyBytesBound — and never a block smp_allocator would map as pages" {
+    var live: LiveBytes = .{ .inner = testing.allocator };
+    const cgpa = live.allocator();
+    const gpa = testing.allocator;
+    var ram = try RamLoader.init(gpa, NODE_SIZE);
+    defer ram.deinit(gpa);
+    const layout = try NodeLayout.new(NODE_SIZE, null);
+    const cache = try NodeCache.init(cgpa, testing.io, .{ .layout = layout, .heap_base = 0, .budget_bytes = 8 * NODE_SIZE, .writeback_delta_bytes = std.math.maxInt(usize) }, ram.loader());
+    defer cache.deinit();
+    {
+        var w = try node.writeNode(gpa, layout, .{ .node_addr = 0, .node_seq = 1, .tree_id = key.KIND_INTERIOR, .level = 0, .min_key = "", .max_key = &key.KEY_SPACE_MAX }, &.{}, 0, null);
+        defer w.deinit(gpa);
+        ram.write(w.node_addr, w.image);
+    }
+    const leaf = (try cache.load(0)).?;
+    defer leaf.release();
+    var prng = std.Random.DefaultPrng.init(0xc4ea7e);
+    const rnd = prng.random();
+    var seq: u64 = 1;
+    // Warm up to 256 records, measure 256 applies there; grow past 4,096,
+    // measure 256 applies there.
+    _ = try applyWindow(&live, leaf, rnd, &seq, 256);
+    const small = try applyWindow(&live, leaf, rnd, &seq, 256);
+    _ = try applyWindow(&live, leaf, rnd, &seq, 4096 - 512);
+    const large = try applyWindow(&live, leaf, rnd, &seq, 256);
+    const n_small: usize = 512;
+    const n_large: usize = 4096 + 256;
+    {
+        const d = leaf.lockWrite(testing.io);
+        defer leaf.unlockWrite(testing.io);
+        try testing.expectEqual(n_large, d.overlayLen());
+    }
+    // The tie: every apply's bytes are inside the formula at its overlay
+    // length — a chunk copy (or a split's half, or an owned chunk's
+    // growth) with its arena, their boxes, the spine, the run's box and
+    // the published snapshot. The records are inode Puts: key + value.
+    const rec_bytes: usize = key.INODE_KEY_LEN + rec.INODE_VALUE_LEN;
+    const publish_fixed: usize = @sizeOf(Arc(NodeSnapshot));
+    try testing.expect(small.bytes <= 256 * (snapshot.Run.applyBytesBound(n_small, rec_bytes) + publish_fixed));
+    try testing.expect(large.bytes <= 256 * (snapshot.Run.applyBytesBound(n_large, rec_bytes) + publish_fixed));
+    // No block of a warm apply reaches smp_allocator's page-mapping line
+    // (a block past its largest size class, 32 KiB, is an mmap and, at its
+    // free, a munmap with a TLB shootdown across every thread).
+    const smp_largest_size_class: usize = 32 * 1024;
+    try testing.expect(large.largest < smp_largest_size_class);
+    try testing.expect(large.largest <= snapshot.Run.applyBytesBound(n_large, rec_bytes));
+    // The view is the overlay: the newest applied key is live with its value.
+    const k = key.inodeKey(rnd.int(u48));
+    const v = iv(seq).encode();
+    var recs = [_]OwnedRec{try OwnedRec.fromRecordRef(gpa, .{ .key = &k, .seq = seq, .kind = .put, .value = &v })};
+    {
+        const d = leaf.lockWrite(testing.io);
+        defer leaf.unlockWrite(testing.io);
+        try leaf.applyLocked(d, &recs, seq);
+    }
+    try expectLive(leaf, &k, &v);
 }

@@ -176,6 +176,18 @@ the rotor's balancing grain and must follow the lease generation — wave 3), th
 admission (≈ 12 µs; it is §AW.2's law — a refusal after the reservation would be a hole — and the
 leaves' dirty state needs their locks; the tx's own resolved leaves could seed the resolve).
 
+**The gate's red (decision 0003 §AZ).** The full gate on the branch read `d/x` on B stale once in
+INVALIDATION COHERENCE ACROSS DAEMONS. Reproduced deterministically (a 300 ms pause before the
+unlink: 3/8 red, BOTH applier arms; the arm only re-phases the drain tick), then pinned without a
+timer: a recall's ack RETIRED the reader's grant at the holder, so after a change to `d` naming no
+dentry (the §AV drain of the parked parent stamp on its 50 ms cadence) the reader was unregistered
+while its kernel still served every dentry the token had answered; the unlink that followed found no
+reader to tell. The §AG.2 pin lived at the reader alone. Fixed at the holder: a recalled grant stays
+registered for the kernel pin (`Holder.setKernelPin`, `dlm_token_recall_pins`); the row now runs the
+window itself (`chmod d && rm d/x` after B's walk): red 3/3 without the pin, 10/10 with it, the inline
+arm 2/2. `nextLive`/`prevLive` over mixed base/overlay layouts were checked on the way (a new
+property test): exact.
+
 **Lever 4, the ack fan-out** — not taken: with the venue on, the lane runs 2.2 s per 320 k creates
 (6.6 µs per create, half of it the acks' wakes) at ≈ 50 % of a core; it is no longer on the create's
 critical path, and the fan-out after the landing is the same chain wherever it runs.

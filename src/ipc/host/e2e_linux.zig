@@ -25,6 +25,7 @@ const log = @import("../../core/log.zig");
 const wire = @import("../wire.zig");
 const client = @import("../client.zig");
 const rendezvous = @import("../rendezvous.zig");
+const Atomic = std.atomic.Value;
 
 comptime {
     if (builtin.os.tag != .linux) @compileError("ipc/host/e2e_linux is Linux only; gate the import on builtin.os.tag");
@@ -670,7 +671,7 @@ test "smoke: THE INTERCEPTION HOST, death — kill -9 the daemon under a parked 
     rig.passed = true;
 }
 
-test "smoke: THE DIRECT ARM — mount -o interception=direct → a root session is granted the arm (the lease page sealed and mapped, the data devices open) → a striped file's lease → a direct pread lands the device's bytes byte-exact from the client's own thread (ipc_ops_read flat, il_direct_ops +1) → a truncate through the kernel between the lease and the read moves the stripe's epoch: the recheck refuses, the lease is re-asked, the read answers the new EOF → a kernel write admitted on the inode invalidates the lease (re-asked, the new bytes read) → an inline-born file's lease is refused (kind) and the ring serves it → the engagement law closes with the direct term → kill -9 the daemon: the next direct read sees the dead heartbeat and falls through (never a serve under a lease nobody can invalidate)" {
+test "smoke: THE DIRECT ARM — mount -o interception=direct → a root session is granted the arm (the lease page sealed and mapped, the data devices open) → a striped file's lease → a direct pread lands the device's bytes byte-exact from the client's own thread (ipc_ops_read flat, il_direct_ops +1) → a truncate through the kernel between the lease and the read moves the stripe's epoch: the recheck refuses, the lease is re-asked, the read answers the new EOF → a kernel write admitted on the inode invalidates the lease (re-asked, the new bytes read) → an inline-born file's lease is refused (kind) and the ring serves it → THE WRITE ARM: a direct write of a resident page is one pwrite on the device under a write lease (byte-exact through O_DIRECT, ipc_ops_write flat, the same lease serves the read), an extending write is the ring's, fsync acks the note and syncs the device, a write held in flight makes a kernel truncate WAIT at the recall and the next write finds the lease recalled → kill -9 the daemon: the next direct read sees the dead heartbeat and falls through (never a serve under a lease nobody can invalidate)" {
     const io = testing.io;
     if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
     const gpa = testing.allocator;
@@ -719,17 +720,22 @@ test "smoke: THE DIRECT ARM — mount -o interception=direct → a root session 
     defer gpa.free(rbuf);
     const ops0 = try rig.stat("ipc_ops_read");
     const page = s.statsPage();
+    // (The 4 MiB ring writes above asked once each way and were refused —
+    // an inline-born file, then an extending write — so the counts below
+    // are relative.)
+    const asks0 = page.il_lease_asks.load(.monotonic);
+    const granted0 = try rig.stat("ipc_leases_granted");
     try testing.expectEqual(@as(usize, 64 * 1024), try served(s.pread(b.id, rbuf, 1 * MiB)));
     try expectPattern(rbuf, 1 * MiB);
     try testing.expectEqual(ops0, try rig.stat("ipc_ops_read"));
     try testing.expectEqual(@as(u64, 1), page.il_direct_ops.load(.monotonic));
-    try testing.expectEqual(@as(u64, 1), page.il_lease_asks.load(.monotonic));
-    try testing.expectEqual(@as(u64, 1), try rig.stat("ipc_leases_granted"));
+    try testing.expectEqual(asks0 + 1, page.il_lease_asks.load(.monotonic));
+    try testing.expectEqual(granted0 + 1, try rig.stat("ipc_leases_granted"));
     // Block 1 under the same lease, then a read past EOF.
     try testing.expectEqual(@as(usize, 4096), try served(s.pread(b.id, rbuf[0..4096], BLOCK + 8192)));
     try expectPattern(rbuf[0..4096], BLOCK + 8192);
     try testing.expectEqual(@as(usize, 0), try served(s.pread(b.id, rbuf[0..4096], 2 * BLOCK)));
-    try testing.expectEqual(@as(u64, 1), page.il_lease_asks.load(.monotonic));
+    try testing.expectEqual(asks0 + 1, page.il_lease_asks.load(.monotonic));
 
     // 2. The window: a truncate lands between the client's lease and its
     //    read. The lease (8 MiB) still names block 0's bytes at 1 MiB; the
@@ -738,7 +744,7 @@ test "smoke: THE DIRECT ARM — mount -o interception=direct → a root session 
     if (linux.errno(linux.ftruncate(kfd, 4096)) != .SUCCESS) return error.TestTruncate;
     try testing.expectEqual(@as(usize, 0), try served(s.pread(b.id, rbuf, 1 * MiB)));
     try testing.expectEqual(@as(u64, 1), page.il_direct_rechecks_failed.load(.monotonic));
-    try testing.expectEqual(@as(u64, 2), page.il_lease_asks.load(.monotonic));
+    try testing.expectEqual(asks0 + 2, page.il_lease_asks.load(.monotonic));
     // (The re-asked lease may be refused while the clipped block's custody
     // drains — the ring then answers the EOF; either way the stale lease
     // served nothing.)
@@ -779,12 +785,109 @@ test "smoke: THE DIRECT ARM — mount -o interception=direct → a root session 
         const ring0 = try rig.stat("ipc_ops_read");
         try testing.expectEqual(@as(usize, 100), try served(s.pread(sb.id, rbuf[0..4096], 0)));
         try expectPattern(rbuf[0..100], 0x9000);
-        try testing.expectEqual(kind0 + 1, try rig.stat("ipc_leases_refused_kind"));
-        try testing.expectEqual(ring0 + 1, try rig.stat("ipc_ops_read"));
-        // The backoff: the second read asks nothing and rides the ring.
+        // The backoff: the second read, inside the window, asks nothing
+        // and rides the ring (the counts read back to back: a `.stats`
+        // read of this debug build can take a good part of the window).
+        const asks_after_first = page.il_lease_asks.load(.monotonic);
         try testing.expectEqual(@as(usize, 100), try served(s.pread(sb.id, rbuf[0..4096], 0)));
+        try testing.expectEqual(asks_after_first, page.il_lease_asks.load(.monotonic));
         try testing.expectEqual(kind0 + 1, try rig.stat("ipc_leases_refused_kind"));
         try testing.expectEqual(ring0 + 2, try rig.stat("ipc_ops_read"));
+    }
+
+    // 4b. THE DIRECT WRITE ARM (decision 0003 §AY). The session holds the
+    //     write arm (root writes the image files); the file is one resident
+    //     block of 4 KiB: a direct write of page 0 is one pwrite on the
+    //     device under a WRITE lease, byte-exact through an O_DIRECT kernel
+    //     fd, with ipc_ops_write flat.
+    try testing.expect(s.features & wire.FEATURE_DIRECT_WRITE != 0);
+    try testing.expectEqual(@as(u64, 1), try rig.stat("ipc_direct_write_sessions"));
+    const dfd = try rig.openOnMount("direct.dat", .{ .ACCMODE = .RDONLY, .DIRECT = true, .CLOEXEC = true });
+    defer _ = linux.close(dfd);
+    const wops0 = try rig.stat("ipc_ops_write");
+    const wleases0 = try rig.stat("ipc_write_leases_granted");
+    const wpage = try gpa.alignedAlloc(u8, .fromByteUnits(4096), 4096);
+    defer gpa.free(wpage);
+    pattern(wpage, 0xD1EC_0000);
+    try testing.expectEqual(@as(usize, 4096), try served(s.pwrite(b.id, wpage, 0)));
+    try testing.expectEqual(@as(u64, 1), page.il_direct_writes.load(.monotonic));
+    try testing.expectEqual(wops0, try rig.stat("ipc_ops_write"));
+    try testing.expectEqual(wleases0 + 1, try rig.stat("ipc_write_leases_granted"));
+    try testing.expectEqual(@as(u64, 1), try rig.stat("ipc_write_leases_live"));
+    try testing.expectEqual(@as(usize, 4096), linux.pread(dfd, rbuf.ptr, 4096, 0));
+    try expectPattern(rbuf[0..4096], 0xD1EC_0000);
+    // The same page read direct: the lease is one object for both arms.
+    try testing.expectEqual(@as(usize, 4096), try served(s.pread(b.id, rbuf[0..4096], 0)));
+    try expectPattern(rbuf[0..4096], 0xD1EC_0000);
+    // An extending write is the ring's (size-neutral law); the lease stands.
+    pattern(wpage, 0xD1EC_1000);
+    try testing.expectEqual(@as(usize, 4096), try served(s.pwrite(b.id, wpage, 4096)));
+    try testing.expectEqual(@as(u64, 1), page.il_direct_writes.load(.monotonic));
+    try testing.expectEqual(wops0 + 1, try rig.stat("ipc_ops_write"));
+    try rig.awaitStat("parked_buffers", 0);
+
+    // 4c. fsync on the direct arm: the pending note sent and acked (the
+    //     daemon's dirty mark and KD-11 notify), the device fdatasync'd.
+    try testing.expect(s.directFsync(b.id));
+    try testing.expect((try rig.stat("ipc_direct_write_notes")) >= 1);
+    try testing.expect((try rig.stat("ipc_direct_writes")) >= 1);
+
+    // 4d. THE RECALL: a client write held in flight (the ledger's count,
+    //     exactly what a pwrite in progress holds) while a truncate through
+    //     the kernel wants the inode: the daemon's exclusive guard recalls
+    //     the lease and WAITS; the truncate lands only once the write
+    //     exits, and the client's next write finds the lease recalled.
+    {
+        // The ring write above recalled the lease (every kernel-path
+        // admission does) and moved the epoch (its arm left bytes off the
+        // device): this write drops the stale lease at the epoch check and
+        // a fresh write lease comes with its second attempt.
+        pattern(wpage, 0xD1EC_2000);
+        const rechecks0 = page.il_direct_rechecks_failed.load(.monotonic);
+        try testing.expectEqual(@as(usize, 4096), try served(s.pwrite(b.id, wpage, 0)));
+        try testing.expectEqual(@as(u64, 2), page.il_direct_writes.load(.monotonic));
+        try testing.expectEqual(rechecks0 + 1, page.il_direct_rechecks_failed.load(.monotonic));
+        try testing.expectEqual(@as(u64, 0), page.il_direct_writes_recalled.load(.monotonic));
+        const l = s.direct.?.leaseFor(b.id) orelse return error.TestNoLease;
+        defer l.drop();
+        try testing.expect(l.writable);
+        const words = &page.lease_ledger[l.slot];
+        try testing.expect(client.direct_client_core.enterWrite(words, l.tag));
+        const Truncator = struct {
+            fd: linux.fd_t,
+            done: *Atomic(bool),
+            fn run(self: @This()) void {
+                _ = linux.ftruncate(self.fd, 0);
+                self.done.store(true, .release);
+            }
+        };
+        var done: Atomic(bool) = .init(false);
+        const recalls0 = try rig.stat("ipc_write_lease_recalls");
+        const t = try std.Thread.spawn(.{}, Truncator.run, .{Truncator{ .fd = kfd, .done = &done }});
+        // The daemon waits on the count: the truncate does not land.
+        sleepMs(150);
+        try testing.expect(!done.load(.acquire));
+        try testing.expectEqual(recalls0 + 1, try rig.stat("ipc_write_lease_recalls"));
+        try testing.expectEqual(@as(u64, 0), try rig.stat("ipc_write_leases_forced"));
+        // The write exits: the daemon drains and the truncate lands.
+        if (client.direct_client_core.exitWrite(words)) client.futex.wakeSharedAll(&words.inflight);
+        t.join();
+        try testing.expect(done.load(.acquire));
+        try testing.expectEqual(@as(u64, 1), try rig.stat("ipc_write_lease_recalls_drained"));
+        try testing.expectEqual(@as(u64, 0), try rig.stat("ipc_write_leases_live"));
+        // The next write finds the old lease dead — at the epoch check
+        // (the truncate's commit moved it) or at entry (recalled) — and
+        // re-asks: the file is empty now, so the ring extends it.
+        pattern(wpage, 0xD1EC_3000);
+        const rechecks1 = page.il_direct_rechecks_failed.load(.monotonic);
+        try testing.expectEqual(@as(usize, 4096), try served(s.pwrite(b.id, wpage, 0)));
+        try testing.expect(page.il_direct_rechecks_failed.load(.monotonic) + page.il_direct_writes_recalled.load(.monotonic) > rechecks1);
+        try testing.expectEqual(@as(u64, 2), page.il_direct_writes.load(.monotonic));
+        // The bytes through the arm (the ring write's grow reaches the
+        // kernel's size on the KD-11 sideband, not before this read).
+        try rig.awaitStat("parked_buffers", 0);
+        try testing.expectEqual(@as(usize, 4096), try served(s.pread(b.id, rbuf[0..4096], 0)));
+        try expectPattern(rbuf[0..4096], 0xD1EC_3000);
     }
 
     // 5. Kill -9 the daemon: the lease page's epochs can no longer move,

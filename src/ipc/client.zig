@@ -37,10 +37,11 @@ const sizing = @import("sizing.zig");
 const rendezvous = @import("rendezvous.zig");
 const rl = @import("rendezvous_linux.zig");
 const shm = @import("shm.zig");
-const futex = @import("../sync/futex.zig");
 const clock = @import("../core/clock.zig");
 const knobs = @import("../core/knobs.zig");
 pub const direct_client = @import("direct_client.zig");
+pub const direct_client_core = @import("write_lease_core.zig");
+pub const futex = @import("../sync/futex.zig");
 const derive = @import("../core/derive.zig");
 
 pub const Kind = wire.ClientKind;
@@ -276,7 +277,8 @@ pub const Session = struct {
         var direct: ?direct_client.Direct = null;
         var direct_state: DirectState = .off;
         if (features & wire.FEATURE_DIRECT != 0 and knobs.boolKnob("SQUEEZEFS_IL_DIRECT", opts.env)) {
-            if (direct_client.Direct.establish(sock)) |d| {
+            const write = features & wire.FEATURE_DIRECT_WRITE != 0 and knobs.boolKnob("SQUEEZEFS_IL_DIRECT_WRITE_ARM", opts.env);
+            if (direct_client.Direct.establish(sock, write)) |d| {
                 direct = d;
                 direct_state = .on;
             } else |e| direct_state = switch (e) {
@@ -393,10 +395,12 @@ pub const Session = struct {
     /// Best-effort, silent, NEVER on a poisoned session (the atfork child
     /// must not unbind a binding the parent still uses).
     pub fn unbind(self: *Session, id: u64) void {
-        if (self.direct) |*d| d.forget(id);
+        const lease = if (self.direct) |*d| d.forget(id) else null;
+        defer if (lease) |l| l.drop();
         if (self.poisoned()) return;
         self.ctl_lock.lock();
         defer self.ctl_lock.unlock();
+        if (lease) |l| self.sendNoteLocked(l, id, false);
         const req: wire.Unbind = .{ .binding_id = id };
         rl.sendCtl(self.ctl, wire.frameBytes(&req), null) catch {};
     }
@@ -406,10 +410,16 @@ pub const Session = struct {
     /// defers the unbind instead of parking on a lock the interrupted
     /// thread may hold). A poisoned session answers true (nothing to send).
     pub fn tryUnbind(self: *Session, id: u64) bool {
-        if (self.direct) |*d| d.forget(id);
-        if (self.poisoned()) return true;
+        if (self.poisoned()) {
+            if (self.direct) |*d| if (d.forget(id)) |l| l.drop();
+            return true;
+        }
         if (!self.ctl_lock.tryLock()) return false;
         defer self.ctl_lock.unlock();
+        if (self.direct) |*d| if (d.forget(id)) |l| {
+            self.sendNoteLocked(l, id, false);
+            l.drop();
+        };
         const req: wire.Unbind = .{ .binding_id = id };
         rl.sendCtl(self.ctl, wire.frameBytes(&req), null) catch {};
         return true;
@@ -730,18 +740,85 @@ pub const Session = struct {
 
     fn directStats(self: *Session) direct_client.Stats {
         const page = self.statsPage();
-        return .{ .ops = &page.il_direct_ops, .bytes = &page.il_direct_bytes, .rechecks_failed = &page.il_direct_rechecks_failed, .asks = &page.il_lease_asks };
+        return .{
+            .ops = &page.il_direct_ops,
+            .bytes = &page.il_direct_bytes,
+            .rechecks_failed = &page.il_direct_rechecks_failed,
+            .asks = &page.il_lease_asks,
+            .writes = &page.il_direct_writes,
+            .write_bytes = &page.il_direct_write_bytes,
+            .write_notes = &page.il_direct_write_notes,
+            .writes_recalled = &page.il_direct_writes_recalled,
+            .ledger = &page.lease_ledger,
+        };
     }
 
     /// The direct arm's lease ask under the ctl lock (`Direct.pread`'s asker).
-    pub fn ask(self: *Session, d: *direct_client.Direct, binding: u64, stats: direct_client.Stats) ?*direct_client.Lease {
+    pub fn ask(self: *Session, d: *direct_client.Direct, binding: u64, stats: direct_client.Stats, want_write: bool) ?*direct_client.Lease {
         if (self.poisoned()) return null;
         self.ctl_lock.lock();
         defer self.ctl_lock.unlock();
-        return d.ask(self.ctl, binding, stats);
+        return d.ask(self.ctl, binding, stats, want_write);
+    }
+
+    /// The write arm's batched postlude note under the ctl lock
+    /// (`Direct.pwrite`'s noter); `ack` waits for the daemon's `WriteNoteOk`.
+    pub fn note(self: *Session, l: *direct_client.Lease, binding: u64, stats: direct_client.Stats, ack: bool) void {
+        if (self.poisoned()) return;
+        self.ctl_lock.lock();
+        defer self.ctl_lock.unlock();
+        self.sendNoteLocked(l, binding, ack);
+        _ = stats.write_notes.fetchAdd(1, .monotonic);
+    }
+
+    fn sendNoteLocked(self: *Session, l: *direct_client.Lease, binding: u64, ack: bool) void {
+        const n = direct_client.Direct.takeNote(l, binding, ack) orelse return;
+        rl.sendCtl(self.ctl, wire.frameBytes(&n), null) catch return;
+        if (!ack) return;
+        var buf: [wire.CTL_MSG_MAX]u8 = undefined;
+        const r = rl.recvCtl(self.ctl, &buf) catch return;
+        if (r.fd) |f| _ = linux.close(f);
+    }
+
+    /// The direct write: `served`, `errno` (a write landed under a forced
+    /// recall: EIO), a `fallthrough` (poisoned under the heartbeat), or null
+    /// (the ring's op).
+    pub fn directPwrite(self: *Session, binding: u64, src: []const u8, offset: u64) ?Outcome {
+        const d = &(self.direct orelse return null);
+        if (self.poisoned()) return null;
+        if (!self.heartbeatAlive(clock.monotonicNs())) {
+            self.poison();
+            return .fallthrough;
+        }
+        return switch (d.pwrite(binding, src, offset, self.directStats(), self)) {
+            .served => |n| .{ .served = n },
+            .eio => .{ .errno = .IO },
+            .ring => null,
+        };
+    }
+
+    /// `fsync`/`fdatasync` of a bound fd on the direct write arm: the
+    /// pending note sent and ACKED (the stamp lands before the kernel's
+    /// FSYNC the caller makes next), then `fdatasync` on every device
+    /// written since the last. False = a device sync failed (the caller's
+    /// real fsync reports the kernel's own verdict regardless).
+    pub fn directFsync(self: *Session, binding: u64) bool {
+        const d = &(self.direct orelse return true);
+        const l = d.leaseFor(binding) orelse return true;
+        defer l.drop();
+        if (!l.writable) return true;
+        self.note(l, binding, self.directStats(), true);
+        return d.fdatasyncDirty(l);
     }
 
     pub fn pwrite(self: *Session, binding: u64, src: []const u8, offset: u64) Outcome {
+        if (src.len == 0) return .{ .served = 0 };
+        if (self.directPwrite(binding, src, offset)) |o| return o;
+        return self.pwriteRing(binding, src, offset);
+    }
+
+    /// The ring alone (the shim asked the direct arm itself, before its gate).
+    pub fn pwriteRing(self: *Session, binding: u64, src: []const u8, offset: u64) Outcome {
         if (src.len == 0) return .{ .served = 0 };
         // The write path only reads `src`; the shared body takes a mutable
         // slice for the read direction's copy-out.

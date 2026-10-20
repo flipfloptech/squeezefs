@@ -155,6 +155,14 @@ pub fn deviceReadable(st_mode: u32, st_uid: u32, st_gid: u32, peer_uid: u32, pee
     return st_mode & 0o004 != 0;
 }
 
+/// The write arm's screen: the write bit that is the peer's.
+pub fn deviceWritable(st_mode: u32, st_uid: u32, st_gid: u32, peer_uid: u32, peer_gid: u32) bool {
+    if (peer_uid == 0) return true;
+    if (st_uid == peer_uid) return st_mode & 0o200 != 0;
+    if (st_gid == peer_gid) return st_mode & 0o020 != 0;
+    return st_mode & 0o002 != 0;
+}
+
 /// Rung 2: the daemon's uid must be root or the mount owner. Deliberately
 /// NO "or our own uid" disjunct: the conservative predicate only costs
 /// passthrough on a mount served by a third-party service account.
@@ -663,4 +671,11 @@ test "the direct arm's device screen: root always; the owner by the owner bit, t
     try testing.expect(!deviceReadable(0o660, 0, 6, 1000, 7));
     try testing.expect(deviceReadable(0o664, 0, 6, 1000, 7));
     try testing.expect(!deviceReadable(0o660, 1000, 6, 2000, 7));
+    try testing.expect(deviceWritable(0o600, 1000, 6, 0, 0));
+    try testing.expect(deviceWritable(0o600, 1000, 6, 1000, 1000));
+    try testing.expect(!deviceWritable(0o400, 1000, 6, 1000, 1000));
+    try testing.expect(deviceWritable(0o660, 0, 6, 1000, 6));
+    try testing.expect(!deviceWritable(0o640, 0, 6, 1000, 6));
+    try testing.expect(!deviceWritable(0o664, 0, 6, 1000, 7));
+    try testing.expect(deviceWritable(0o666, 0, 6, 1000, 7));
 }

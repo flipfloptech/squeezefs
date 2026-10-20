@@ -48,6 +48,7 @@ const kv_fs = @import("../fuse/handler/kv_fs.zig");
 const route_table = @import("../meta/routing/route_table.zig");
 const plane_mod = @import("../data/plane.zig");
 const router = @import("../data/router.zig");
+const lease_epoch = @import("../data/lease_epoch.zig");
 const layout = @import("layout.zig");
 const wire = @import("wire.zig");
 const sizing = @import("sizing.zig");
@@ -177,8 +178,10 @@ pub const IpcHost = struct {
     inval: inval.Invalidator,
     dd: ?*direct.Engine,
     sink: *service.DataPlaneSink,
-    /// The direct arm's host half (`-o interception=direct`).
+    /// The direct arm's host half (`-o interception=direct`) and its
+    /// write-lease registry (the recall hook's owner).
     direct_host: ?direct_lease.DirectHost,
+    write_leases: direct_lease.WriteLeases,
     stop: Atomic(bool) = .init(false),
     armed_at_ns: u64,
 
@@ -223,6 +226,7 @@ pub const IpcHost = struct {
             .dd = null,
             .sink = undefined,
             .direct_host = null,
+            .write_leases = undefined,
             .armed_at_ns = clock.monotonicNs(),
         };
         if (d.direct_clients) {
@@ -232,6 +236,8 @@ pub const IpcHost = struct {
             };
         }
         errdefer if (self.direct_host) |*dh| dh.deinit();
+        self.write_leases.init(gpa, d.io, d.plane);
+        errdefer self.write_leases.deinit();
         self.sessions = try gpa.alloc(?*Session, ctl_cap);
         errdefer gpa.free(self.sessions);
         @memset(self.sessions, null);
@@ -371,6 +377,8 @@ pub const IpcHost = struct {
     /// Teardown in order (module doc).
     pub fn disarm(self: *IpcHost) void {
         self.stop.store(true, .release);
+        // 0. No mutation chokepoint recalls into a dying host.
+        lease_epoch.disarmRecall();
         // 1. Every live session poisoned (the shutdown broadcast — silent)
         //    and torn down (handoffs joined).
         while (self.takeAny()) |s| {
@@ -414,6 +422,7 @@ pub const IpcHost = struct {
             dh.deinit();
             self.direct_host = null;
         }
+        self.write_leases.deinit();
     }
 
     pub fn deinit(self: *IpcHost) void {
@@ -572,6 +581,11 @@ pub const IpcHost = struct {
                 features |= wire.FEATURE_DIRECT;
                 s.direct_granted = true;
                 hs.ipc_direct_sessions.inc();
+                if (dh.grantsWrite(peer.?)) {
+                    features |= wire.FEATURE_DIRECT_WRITE;
+                    s.direct_write_granted = true;
+                    hs.ipc_direct_write_sessions.inc();
+                }
             } else {
                 hs.ipc_direct_refused_access.inc();
                 log.warn("ipc: the direct arm is refused to pid {d} (uid {d}, gid {d}): it cannot open every data device node; the ring serves it", .{ peer.?.pid, peer.?.uid, peer.?.gid });
@@ -784,6 +798,7 @@ pub const IpcHost = struct {
             .unbind => {
                 const req = wire.decodeFixed(wire.Unbind, frame) catch return self.malformed(s);
                 if (s.unbind(req.binding_id)) |ino| {
+                    self.write_leases.release(s, ino);
                     if (!self.inoBoundAnywhere(ino)) self.inval.onLastUnbind(ino, clock.realtimeCoarseS());
                 }
             },
@@ -802,11 +817,16 @@ pub const IpcHost = struct {
             .lease_req => {
                 const req = wire.decodeFixed(wire.LeaseReq, frame) catch return self.malformed(s);
                 var out: [wire.CTL_MSG_MAX]u8 = undefined;
+                const want_write = req.flags & wire.LEASE_WRITE != 0;
                 const verdict: direct_lease.LeaseVerdict = blk: {
                     if (!s.direct_granted or self.direct_host == null) break :blk .{ .refused = .disabled };
                     const b = s.binding(req.binding_id) orelse break :blk .{ .refused = .binding };
                     if (!b.rights.read) break :blk .{ .refused = .binding };
-                    break :blk direct_lease.buildLease(self.d.plane, b.ino, &out);
+                    if (want_write and (!s.direct_write_granted or !b.rights.write)) break :blk .{ .refused = .write };
+                    // A new lease on this binding's inode supersedes the
+                    // session's old one (the client dropped it).
+                    self.write_leases.release(s, b.ino);
+                    break :blk direct_lease.buildLease(self.d.plane, b.ino, want_write, &self.write_leases, s, &out);
                 };
                 switch (verdict) {
                     .ok => |n| rl.sendCtl(s.ctl, out[0..n], null) catch {},
@@ -815,6 +835,28 @@ pub const IpcHost = struct {
                         const reply: wire.LeaseRefused = .{ .class = @backingInt(class) };
                         rl.sendCtl(s.ctl, wire.frameBytes(&reply), null) catch {};
                     },
+                }
+                s.touch(clock.monotonicNs());
+            },
+            .write_note => {
+                const note = wire.decodeFixed(wire.WriteNote, frame) catch return self.malformed(s);
+                if (s.direct_write_granted) if (s.binding(note.binding_id)) |b| {
+                    // The postlude of `count` landed device writes: the
+                    // dirty mark (the stamp at the open's flush/release),
+                    // the kernel's cache told (KD-11), the volumes touched
+                    // for the fsync barrier.
+                    self.d.opens.noteDurableWrite(b.ino);
+                    _ = self.inval.onWrite(b.ino, note.max_end, clock.realtimeCoarseS());
+                    if (self.d.plane.wp.patchDeps().touched) |t| {
+                        var mask = note.vols_mask;
+                        while (mask != 0) : (mask &= mask - 1) t.stamp(t.ctx, route_table.effectiveIno(b.ino), @ctz(mask));
+                    }
+                    hs.ipc_direct_write_notes.inc();
+                    hs.ipc_direct_writes.add(note.count);
+                };
+                if (note.flags & wire.NOTE_ACK != 0) {
+                    const reply: wire.WriteNoteOk = .{};
+                    rl.sendCtl(s.ctl, wire.frameBytes(&reply), null) catch {};
                 }
                 s.touch(clock.monotonicNs());
             },
@@ -940,7 +982,12 @@ pub const IpcHost = struct {
             hs.ipc_direct_ops.add(page.il_direct_ops.load(.monotonic));
             hs.ipc_direct_bytes.add(page.il_direct_bytes.load(.monotonic));
             hs.ipc_direct_rechecks_failed.add(page.il_direct_rechecks_failed.load(.monotonic));
+            hs.ipc_direct_write_bytes.add(page.il_direct_write_bytes.load(.monotonic));
+            hs.ipc_direct_writes_recalled.add(page.il_direct_writes_recalled.load(.monotonic));
         }
+        // The client's write leases go with it (its syscalls completed
+        // with the process; a stale count waits for nobody).
+        self.write_leases.release(s, null);
         self.owners[s.owner].kick();
         _ = linux.shutdown(s.ctl, linux.SHUT.RDWR);
         _ = linux.close(s.ctl);

@@ -349,6 +349,11 @@ pub const Table = struct {
     /// `write_lock_wait[_mode]`, then stamps. Uncancelable: a handler is
     /// never cancelled (charter §9).
     pub fn acquire(self: *Table, io: Io, ino: u64, mode: Mode) Guard {
+        // An exclusive hold is a mutation (a truncate, a setattr, an
+        // extending or CoW write, an unlink): the inode's direct WRITE
+        // leases are recalled BEFORE the hold, with nothing held here
+        // (decision 0003 §AY).
+        if (mode == .exclusive) lease_epoch.recallWrites(if (route_table.isRoutable(ino)) route_table.effectiveIno(ino) else ino);
         const stripe = self.stripeOf(ino);
         const cell = &self.locks[stripe];
         var since: u64 = undefined;
@@ -452,11 +457,13 @@ pub const Admission = struct {
 /// classified → revalidate → at most one upgrade. The caller validated the
 /// range (`validateRange`) and answers `wlen == 0` before coming here.
 pub fn admitWrite(table: *Table, io: Io, probe: Probe, shared_enabled: bool, ino: u64, offset: u64, end: u64) Admission {
-    // A write admitted on this inode may hold bytes in RAM the device does
-    // not yet: every direct client's lease of it is invalid from here
-    // (`data/lease_epoch.zig`; a nodeid routes to its key ino as the plane's
-    // tables do).
-    lease_epoch.bump(if (route_table.isRoutable(ino)) route_table.effectiveIno(ino) else ino);
+    // A kernel write on this inode: every direct client's WRITE lease of it
+    // is recalled first (decision 0003 §AY — a shared-class write may still
+    // land an overlay over a block the client patches); the READ leases'
+    // epoch moves only for an arm that leaves bytes off the device
+    // (`write_admit`'s dispatch). A nodeid routes to its key ino as the
+    // plane's tables do.
+    lease_epoch.recallWrites(if (route_table.isRoutable(ino)) route_table.effectiveIno(ino) else ino);
     const admit_shared = shared_enabled and sharedCandidate(probe, ino, offset, end) != null;
     if (!admit_shared) {
         return .{ .guard = table.acquire(io, ino, .exclusive), .shared_snapshot = null, .upgraded = false };

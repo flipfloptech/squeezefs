@@ -65,6 +65,7 @@ const cov = @import("write_coverage.zig");
 const epoch_mod = @import("write_epoch.zig");
 const pipeline = @import("write_pipeline.zig");
 const device_overlay = @import("device_overlay.zig");
+const lease_epoch = @import("lease_epoch.zig");
 const sole_owner_patch = @import("sole_owner_patch.zig");
 const accumulate = @import("accumulate.zig");
 const extent = @import("extent_overlay.zig");
@@ -728,6 +729,30 @@ pub const WritePath = struct {
 
     pub const PatchError = sole_owner_patch.PatchError;
 
+    /// The direct WRITE lease's per-block oracle (decision 0003 §AY): the
+    /// W1 state half under a TRY-locked block guard — custody, the
+    /// authoritative map, passthrough, whole and undamaged, the durable
+    /// sole-owner verdict and the fence pair — then the word re-stabilized
+    /// under a new generation (nothing was written). `.eligible` = a client
+    /// may patch this block in place under a lease; `.busy` = the block
+    /// guard is held (the caller refuses `moved`, the client retries);
+    /// `.ineligible` = one of W1's own declines (shared, decorated,
+    /// foreign, custody): the ring serves the file's writes.
+    pub const LeaseProbe = enum { eligible, busy, ineligible };
+
+    pub fn probeDirectWriteLease(self: *WritePath, io: Io, ino: u64, block: u32) LeaseProbe {
+        const guard = self.locks.tryAcquire(io, ino, block) orelse return .busy;
+        defer guard.release(io);
+        const verdict = sole_owner_patch.beginInPlace(self.patchDeps(), ino, block, 0) catch return .ineligible;
+        switch (verdict) {
+            .begun => |b| {
+                sole_owner_patch.abandonInPlace(self.patchDeps(), b);
+                return .eligible;
+            },
+            .declined => return .ineligible,
+        }
+    }
+
     /// A begun direct write the lane could not submit (no slab entry, a
     /// full SQ, an unknown volume): re-stabilize the word under a new
     /// generation (content unchanged, so no purge), hand the guard back;
@@ -1146,6 +1171,12 @@ pub const WritePath = struct {
             }
             break :blk .accumulate_park;
         };
+        // The read leases (decision 0003 §AX.3): every arm but the in-place
+        // patch leaves bytes the device does not hold (an overlay record, a
+        // RAM extent, a staged file) — a direct client's cached layout of
+        // the inode is stale from here. The patch landed on the device: the
+        // leases stand (a direct client's own writes bump nothing).
+        if (arm != .patch) lease_epoch.bump(req.ino);
         // The guard is dropped: act on the hint.
         switch (hint) {
             .none => {},

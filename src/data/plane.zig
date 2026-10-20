@@ -116,6 +116,7 @@ const verbs = @import("../wire/verbs.zig");
 const record_ship = @import("../meta/sym/xv/record_ship.zig");
 const seams = @import("write_seams.zig");
 const size_epoch = @import("size_epoch.zig");
+const lease_epoch = @import("lease_epoch.zig");
 const shape_table = @import("shape_table.zig");
 const write_admit = @import("write_admit.zig");
 const write_side_view = @import("write_side_view.zig");
@@ -1288,6 +1289,7 @@ pub const DataPlane = struct {
     }
 
     pub fn forgetShape(self: *DataPlane, ino: u64) void {
+        lease_epoch.recallWrites(ino);
         self.shape.forget(ino);
         self.size_epochs.forget(ino);
     }
@@ -1312,6 +1314,9 @@ pub const DataPlane = struct {
     /// BEFORE its 4a set and released after the commit landed; the plane's
     /// own sections take it inside.
     pub fn lockLayout(self: *DataPlane, io: Io, ino: u64) layout.LayoutLocks.Guard {
+        // A layout RMW of the inode (every publish, any origin): its direct
+        // WRITE leases are recalled before the lock (decision 0003 §AY).
+        lease_epoch.recallWrites(ino);
         return self.locks.layouts.acquire(io, ino);
     }
 
@@ -3769,7 +3774,9 @@ pub const DataPlane = struct {
     /// device-overlay record, parked extents, a staged entry) is not
     /// quiescent — the task defers and re-plans.
     pub fn moverQuiescent(self: *DataPlane, ino: u64, block_index: u32) bool {
-        return !self.wp.writeSideView().hasCustody(ino, block_index);
+        // A write-leased inode is a client's to write in place: the mover's
+        // copy would go stale under it (decision 0003 §AY).
+        return !self.wp.writeSideView().hasCustody(ino, block_index) and !lease_epoch.inoWriteLeased(ino);
     }
 
     /// D3's seam (`defrag --fold`): the inos holding parked W2 extents, and

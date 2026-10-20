@@ -44,41 +44,43 @@ pub const Symbol = struct {
 
 pub const table = [_]Symbol{
     // positional data
-    .{ .name = "pread" },                                                .{ .name = "pread64" },                                              .{ .name = "pwrite" },                                                     .{ .name = "pwrite64" },
+    .{ .name = "pread" },                                                      .{ .name = "pread64" },                                              .{ .name = "pwrite" },                                               .{ .name = "pwrite64" },
     // offsetful data
-    .{ .name = "read" },                                                 .{ .name = "write" },
+    .{ .name = "read" },                                                       .{ .name = "write" },
     // vector data
-                                                   .{ .name = "readv" },                                                      .{ .name = "writev" },
-    .{ .name = "preadv" },                                               .{ .name = "preadv64" },                                             .{ .name = "pwritev" },                                                    .{ .name = "pwritev64" },
-    .{ .name = "preadv2" },                                              .{ .name = "preadv64v2" },                                           .{ .name = "pwritev2" },                                                   .{ .name = "pwritev64v2" },
+                                                   .{ .name = "readv" },                                                .{ .name = "writev" },
+    .{ .name = "preadv" },                                                     .{ .name = "preadv64" },                                             .{ .name = "pwritev" },                                              .{ .name = "pwritev64" },
+    .{ .name = "preadv2" },                                                    .{ .name = "preadv64v2" },                                           .{ .name = "pwritev2" },                                             .{ .name = "pwritev64v2" },
     // lseek
-    .{ .name = "lseek" },                                                .{ .name = "lseek64" },
+    .{ .name = "lseek" },                                                      .{ .name = "lseek64" },
     // f_pos-consuming passthroughs
-                                                 .{ .name = "sendfile" },                                                   .{ .name = "sendfile64" },
-    .{ .name = "copy_file_range" },                                      .{ .name = "splice" },
+                                                 .{ .name = "sendfile" },                                             .{ .name = "sendfile64" },
+    .{ .name = "copy_file_range" },                                            .{ .name = "splice" },
     // spawn
-                                                  .{ .name = "posix_spawn" },                                                .{ .name = "posix_spawnp" },
+                                                  .{ .name = "posix_spawn" },                                          .{ .name = "posix_spawnp" },
     // detection
-    .{ .name = "open" },                                                 .{ .name = "open64" },                                               .{ .name = "openat" },                                                     .{ .name = "openat64" },
-    .{ .name = "creat" },                                                .{ .name = "creat64" },                                              .{ .name = "openat2" },
+    .{ .name = "open" },                                                       .{ .name = "open64" },                                               .{ .name = "openat" },                                               .{ .name = "openat64" },
+    .{ .name = "creat" },                                                      .{ .name = "creat64" },                                              .{ .name = "openat2" },
     // lifecycle
-                                                       .{ .name = "close" },
-    .{ .name = "close_range" },                                          .{ .name = "dup" },                                                  .{ .name = "dup2" },                                                       .{ .name = "dup3" },
-    .{ .name = "fcntl" },                                                .{ .name = "fcntl64" },
+                                                 .{ .name = "close" },
+    .{ .name = "close_range" },                                                .{ .name = "dup" },                                                  .{ .name = "dup2" },                                                 .{ .name = "dup3" },
+    .{ .name = "fcntl" },                                                      .{ .name = "fcntl64" },
+    // the direct write arm's postlude (decision 0003 §AY)
+                                                 .{ .name = "fsync" },                                                .{ .name = "fdatasync" },
     // mmap
-                                                 .{ .name = "mmap" },                                                       .{ .name = "mmap64" },
+    .{ .name = "mmap" },                                                       .{ .name = "mmap64" },
     // fd-creator hygiene
-    .{ .name = "socket" },                                               .{ .name = "eventfd" },                                              .{ .name = "epoll_create" },                                               .{ .name = "epoll_create1" },
-    .{ .name = "timerfd_create" },                                       .{ .name = "inotify_init" },                                         .{ .name = "inotify_init1" },                                              .{ .name = "memfd_create" },
-    .{ .name = "accept" },                                               .{ .name = "accept4" },                                              .{ .name = "signalfd" },                                                   .{ .name = "signalfd4" },
-    .{ .name = "pipe" },                                                 .{ .name = "pipe2" },                                                .{ .name = "socketpair" },
+                                                  .{ .name = "socket" },                                               .{ .name = "eventfd" },
+    .{ .name = "epoll_create" },                                               .{ .name = "epoll_create1" },                                        .{ .name = "timerfd_create" },                                       .{ .name = "inotify_init" },
+    .{ .name = "inotify_init1" },                                              .{ .name = "memfd_create" },                                         .{ .name = "accept" },                                               .{ .name = "accept4" },
+    .{ .name = "signalfd" },                                                   .{ .name = "signalfd4" },                                            .{ .name = "pipe" },                                                 .{ .name = "pipe2" },
+    .{ .name = "socketpair" },
     // libaio
-                                                    .{ .name = "io_setup", .version = aio.Versions.io_setup },
-    .{ .name = "io_destroy", .version = aio.Versions.io_destroy },       .{ .name = "io_submit", .version = aio.Versions.io_submit },         .{ .name = "io_getevents", .version = aio.Versions.io_getevents },         .{ .name = "io_pgetevents", .version = aio.Versions.io_pgetevents },
-    .{ .name = "io_cancel", .version = aio.Versions.io_cancel },
+                                                    .{ .name = "io_setup", .version = aio.Versions.io_setup },           .{ .name = "io_destroy", .version = aio.Versions.io_destroy },       .{ .name = "io_submit", .version = aio.Versions.io_submit },
+    .{ .name = "io_getevents", .version = aio.Versions.io_getevents },         .{ .name = "io_pgetevents", .version = aio.Versions.io_pgetevents }, .{ .name = "io_cancel", .version = aio.Versions.io_cancel },
     // libaio's queue face (composed from the rows above, never resolved)
-            .{ .name = "io_queue_init", .version = aio.Versions.io_queue_init }, .{ .name = "io_queue_release", .version = aio.Versions.io_queue_release }, .{ .name = "io_queue_run", .version = aio.Versions.io_queue_run },
-    .{ .name = "io_queue_wait", .version = aio.Versions.io_queue_wait },
+            .{ .name = "io_queue_init", .version = aio.Versions.io_queue_init },
+    .{ .name = "io_queue_release", .version = aio.Versions.io_queue_release }, .{ .name = "io_queue_run", .version = aio.Versions.io_queue_run },   .{ .name = "io_queue_wait", .version = aio.Versions.io_queue_wait },
     // the linked-mode API
     .{ .name = "squeezefs_il_bind", .api = true },
 };
@@ -86,8 +88,10 @@ pub const table = [_]Symbol{
 /// The libc/libaio interpositions: the spec's 59 + `openat2` + `signalfd4`
 /// + libaio's four-symbol queue face (`io_queue_init/release/run/wait`,
 /// which libaio binds to its OWN `io_setup`/`io_getevents` internally —
-/// fio's libaio engine created its context through it uncounted).
-pub const INTERPOSED: usize = 65;
+/// fio's libaio engine created its context through it uncounted) + the
+/// direct write arm's `fsync`/`fdatasync` (decision 0003 §AY: the postlude
+/// note acked and the devices flushed before the kernel's FSYNC).
+pub const INTERPOSED: usize = 67;
 
 comptime {
     var n: usize = 0;
@@ -512,6 +516,26 @@ pub const wrappers = struct {
         }
         if (r) |f| return f(fd);
         return @intCast(sys.libcResult(linux.close(fd)));
+    }
+
+    pub fn fsync(fd: c_int) callconv(.c) c_int {
+        const r = real("fsync");
+        if (lifecycle.enter()) {
+            defer lifecycle.leave();
+            if (ready()) |st| ops.fsyncPre(st, fd);
+        }
+        if (r) |f| return f(fd);
+        return @intCast(sys.libcResult(linux.fsync(fd)));
+    }
+
+    pub fn fdatasync(fd: c_int) callconv(.c) c_int {
+        const r = real("fdatasync");
+        if (lifecycle.enter()) {
+            defer lifecycle.leave();
+            if (ready()) |st| ops.fsyncPre(st, fd);
+        }
+        if (r) |f| return f(fd);
+        return @intCast(sys.libcResult(linux.fdatasync(fd)));
     }
 
     pub fn close_range(first: c_uint, last: c_uint, flags: c_int) callconv(.c) c_int {

@@ -79,8 +79,12 @@ fn ringPositional(st: *State, cell: *fd_table.Cell, op: Op, buf: []u8, offset: u
         return .real;
     }
     // The direct arm (charter §7 "The direct arm") before the lane gate: the
-    // gate prices the ring's copies, which the device read never pays.
-    if (op == .read) if (s.directPread(cell.binding.id, buf, offset)) |o| switch (o) {
+    // gate prices the ring's copies, which the device I/O never pays.
+    const direct: ?client.Outcome = switch (op) {
+        .read => s.directPread(cell.binding.id, buf, offset),
+        else => s.directPwrite(cell.binding.id, buf, offset),
+    };
+    if (direct) |o| switch (o) {
         .served => |n| return .{ .served = n },
         .errno => |e| return .{ .errno = e },
         .fallthrough => {
@@ -95,7 +99,7 @@ fn ringPositional(st: *State, cell: *fd_table.Cell, op: Op, buf: []u8, offset: u
     }
     const outcome = switch (op) {
         .read => s.preadRing(cell.binding.id, buf, offset),
-        else => s.pwrite(cell.binding.id, buf, offset),
+        else => s.pwriteRing(cell.binding.id, buf, offset),
     };
     switch (outcome) {
         .served => |n| return .{ .served = n },
@@ -433,6 +437,17 @@ fn noteDemote(st: *State, fd: sys.fd_t) void {
 /// real close returns).
 pub fn closePre(st: *State, fd: sys.fd_t) void {
     if (st.table.onClose(fd)) |d| st.release(d);
+}
+
+/// `fsync`/`fdatasync` BEFORE the real call: a bound fd on the direct
+/// write arm sends and acks its pending postlude note and `fdatasync`s the
+/// devices it wrote (decision 0003 §AY), so the kernel's FSYNC that follows
+/// finds the stamp owed and the bytes flushed. Every other fd: nothing.
+pub fn fsyncPre(st: *State, fd: sys.fd_t) void {
+    const pin = st.table.lookup(fd) orelse return;
+    defer if (pin.unpin()) |d| st.release(d);
+    const s = sessionOf(st, pin.cell);
+    _ = s.directFsync(pin.cell.binding.id);
 }
 
 /// `dup*`/`fcntl(F_DUPFD*)` after the real call succeeded.

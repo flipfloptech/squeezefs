@@ -199,6 +199,23 @@ pub const stats = struct {
     pub var ipc_leases_refused_custody: counters.ShardedCounter = .{};
     pub var ipc_leases_refused_binding: counters.ShardedCounter = .{};
     pub var ipc_leases_refused_moved: counters.ShardedCounter = .{};
+    pub var ipc_leases_refused_write: counters.ShardedCounter = .{};
+    // ---- the direct WRITE arm (decision 0003 §AY) ----
+    /// Sessions granted the write arm at HELLO (every node writable by them).
+    pub var ipc_direct_write_sessions: counters.ShardedCounter = .{};
+    /// Write leases granted / live; recalls run, drained after a wait, and
+    /// FORCED past the bound (must stay 0: a client wedged mid-write).
+    pub var ipc_write_leases_granted: counters.ShardedCounter = .{};
+    pub var ipc_write_leases_live: counters.Gauge = .{};
+    pub var ipc_write_lease_recalls: counters.ShardedCounter = .{};
+    pub var ipc_write_lease_recalls_drained: counters.ShardedCounter = .{};
+    pub var ipc_write_leases_forced: counters.Tripwire = .init("ipc_write_leases_forced");
+    /// The clients' direct writes and bytes (their pages folded at
+    /// teardown), their batched postlude notes.
+    pub var ipc_direct_writes: counters.ShardedCounter = .{};
+    pub var ipc_direct_write_bytes: counters.ShardedCounter = .{};
+    pub var ipc_direct_write_notes: counters.ShardedCounter = .{};
+    pub var ipc_direct_writes_recalled: counters.ShardedCounter = .{};
 
     // ---- coherence (KD-11's residual windows) ----
     pub var ipc_inval_notifies: counters.ShardedCounter = .{};

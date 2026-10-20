@@ -21,6 +21,8 @@ pub const ring_core = @import("ring_core.zig");
 pub const ring_core_model = @import("ring_core_model.zig");
 pub const doorbell = @import("doorbell.zig");
 pub const doorbell_model = @import("doorbell_model.zig");
+pub const write_lease_core = @import("write_lease_core.zig");
+pub const write_lease_model = @import("write_lease_model.zig");
 pub const wire = @import("wire.zig");
 pub const sizing = @import("sizing.zig");
 pub const rendezvous = @import("rendezvous.zig");
@@ -116,6 +118,8 @@ test {
     _ = ring_core_model;
     _ = doorbell;
     _ = doorbell_model;
+    _ = write_lease_core;
+    _ = write_lease_model;
     _ = wire;
     _ = sizing;
     _ = rendezvous;

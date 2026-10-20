@@ -74,7 +74,108 @@ pub fn loadFrom(page: [*]const Row, ino: u64) u64 {
     return page[stripeOf(ino)].load(.acquire);
 }
 
+// ---------------------------------------------------------------------------
+// WRITE leases (decision 0003 §AY): the inode stripes that hold one (the
+// recall's fast "none" check), the block-key stripes under one (the read
+// path's deposit gate: no tier may shadow a block a client writes in place),
+// and the recall hook the host installs.
+// ---------------------------------------------------------------------------
+
+/// Block-key stripes: 16× the inode stripes, so a 3 GiB file's 768 leased
+/// blocks blind a sixth of the deposit gate, not all of it.
+pub const KEY_STRIPES: usize = STRIPES * 16;
+
+/// A leased block's key.
+pub const Key = struct { vol_tag: u64, offset: u64 };
+
+var write_leased_inos: [STRIPES]Atomic(u32) = @splat(.init(0));
+var write_leased_keys: [KEY_STRIPES]Atomic(u32) = @splat(.init(0));
+
+pub const RecallHook = struct {
+    ctx: *anyopaque,
+    /// Recall every write lease of `ino` and return once no client write
+    /// is in flight under any of them (bounded; decision 0003 §AY).
+    recall: *const fn (ctx: *anyopaque, ino: u64) void,
+};
+
+var recall_hook: Atomic(?*const RecallHook) = .init(null);
+
+pub fn armRecall(hook: *const RecallHook) void {
+    recall_hook.store(hook, .release);
+}
+
+pub fn disarmRecall() void {
+    recall_hook.store(null, .release);
+}
+
+pub fn keyStripeOf(vol_tag: u64, offset: u64) usize {
+    return @intCast(dlm.splitmix64(vol_tag ^ dlm.splitmix64(offset)) & (KEY_STRIPES - 1));
+}
+
+/// A write lease on `ino` over `keys` begins: the stripes count it.
+pub fn noteWriteLease(ino: u64, keys: []const Key) void {
+    _ = write_leased_inos[stripeOf(ino)].fetchAdd(1, .acq_rel);
+    for (keys) |k| _ = write_leased_keys[keyStripeOf(k.vol_tag, k.offset)].fetchAdd(1, .acq_rel);
+}
+
+pub fn dropWriteLease(ino: u64, keys: []const Key) void {
+    _ = write_leased_inos[stripeOf(ino)].fetchSub(1, .acq_rel);
+    for (keys) |k| _ = write_leased_keys[keyStripeOf(k.vol_tag, k.offset)].fetchSub(1, .acq_rel);
+}
+
+/// Some write lease stands on `ino`'s stripe (conservative: a collision
+/// reads leased).
+pub fn inoWriteLeased(ino: u64) bool {
+    return write_leased_inos[stripeOf(ino)].load(.acquire) != 0;
+}
+
+/// The deposit gate: a block on a leased key stripe stays out of every tier.
+pub fn keyWriteLeased(vol_tag: u64, offset: u64) bool {
+    return write_leased_keys[keyStripeOf(vol_tag, offset)].load(.acquire) != 0;
+}
+
+/// The mutation chokepoints' face: nothing when no write lease stands on
+/// the stripe (one load); else the host's recall, which returns once every
+/// client write under the inode's leases has drained.
+pub fn recallWrites(ino: u64) void {
+    if (!inoWriteLeased(ino)) return;
+    const h = recall_hook.load(.acquire) orelse return;
+    h.recall(h.ctx, ino);
+}
+
 const testing = std.testing;
+
+test "write leases: the inode stripe and the key stripes count a lease in and out; the recall face is silent without a lease and calls the hook with one" {
+    const ino: u64 = 0x9a9a;
+    const keys = [_]Key{ .{ .vol_tag = 1, .offset = 4 << 20 }, .{ .vol_tag = 1, .offset = 8 << 20 } };
+    const Probe = struct {
+        var calls: u32 = 0;
+        var last: u64 = 0;
+        fn recall(_: *anyopaque, i: u64) void {
+            calls += 1;
+            last = i;
+        }
+    };
+    var sink: u8 = 0;
+    const hook: RecallHook = .{ .ctx = &sink, .recall = &Probe.recall };
+    armRecall(&hook);
+    defer disarmRecall();
+    try testing.expect(!inoWriteLeased(ino));
+    recallWrites(ino);
+    try testing.expectEqual(@as(u32, 0), Probe.calls);
+    noteWriteLease(ino, &keys);
+    try testing.expect(inoWriteLeased(ino));
+    try testing.expect(keyWriteLeased(1, 4 << 20));
+    try testing.expect(keyWriteLeased(1, 8 << 20));
+    recallWrites(ino);
+    try testing.expectEqual(@as(u32, 1), Probe.calls);
+    try testing.expectEqual(ino, Probe.last);
+    dropWriteLease(ino, &keys);
+    try testing.expect(!inoWriteLeased(ino));
+    try testing.expect(!keyWriteLeased(1, 4 << 20));
+    recallWrites(ino);
+    try testing.expectEqual(@as(u32, 1), Probe.calls);
+}
 
 test "the lease epoch: a bump moves exactly its stripe; a shared page inherits the private counts and takes every later bump; unshare folds the page back" {
     const ino: u64 = 0x5151;

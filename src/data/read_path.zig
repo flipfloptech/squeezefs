@@ -78,6 +78,7 @@ const nvme_read_cache = @import("nvme_read_cache.zig");
 const purge = @import("purge.zig");
 const single_flight = @import("single_flight_fill.zig");
 const admission = @import("admission.zig");
+const lease_epoch = @import("lease_epoch.zig");
 const prefetch = @import("prefetch.zig");
 const transform = @import("transform.zig");
 
@@ -871,6 +872,10 @@ pub const ReadPath = struct {
     /// block outside this member's lifetimes serves binding-validated and
     /// stays out of every tier.
     fn depositable(self: *ReadPath, key: BlockKey) bool {
+        // A block a direct client writes in place under a WRITE lease stays
+        // out of every tier: the inode is device-true while the lease
+        // stands (decision 0003 §AY; `lease_epoch.keyWriteLeased`).
+        if (lease_epoch.keyWriteLeased(key.vol_tag, key.offset)) return false;
         const a = self.allocatorOf(key) orelse return true;
         return a.fillDepositable(key.blockIdx(self.stride()));
     }

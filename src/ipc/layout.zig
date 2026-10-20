@@ -21,6 +21,7 @@
 //! reference shim can never map a port session by accident.
 
 const std = @import("std");
+const write_lease_core = @import("write_lease_core.zig");
 const fuzzkit = @import("../core/fuzzkit.zig");
 const derive = @import("../core/derive.zig");
 const sizing = @import("../mem/sizing.zig");
@@ -439,8 +440,20 @@ pub const ClientStatsPage = extern struct {
     il_direct_bytes: Atomic(u64) = .init(0),
     il_direct_rechecks_failed: Atomic(u64) = .init(0),
     il_lease_asks: Atomic(u64) = .init(0),
-    _reserved: [PAGE_BYTES - 48 - 8 * (PRELOAD_REASONS + PRELOAD_REFUSE_CLASSES) - 32]u8 = @splat(0),
+    /// The direct WRITE arm's counts (folded alike) and the WRITE-LEASE
+    /// LEDGER (`write_lease_core.Words` per lease slot: the daemon writes
+    /// `ino` at grant and `recall`; the client counts `inflight`) — the one
+    /// protocol region of this page; everything else stays display-only.
+    il_direct_writes: Atomic(u64) = .init(0),
+    il_direct_write_bytes: Atomic(u64) = .init(0),
+    il_direct_write_notes: Atomic(u64) = .init(0),
+    il_direct_writes_recalled: Atomic(u64) = .init(0),
+    lease_ledger: [WRITE_LEASES_PER_SESSION]write_lease_core.Words = @splat(.{}),
+    _reserved: [PAGE_BYTES - 48 - 8 * (PRELOAD_REASONS + PRELOAD_REFUSE_CLASSES) - 64 - WRITE_LEASES_PER_SESSION * @sizeOf(write_lease_core.Words)]u8 = @splat(0),
 };
+
+/// Write leases a session may hold at once (one per bound fd it writes).
+pub const WRITE_LEASES_PER_SESSION: usize = 32;
 
 comptime {
     assert(@sizeOf(ClientStatsPage) == PAGE_BYTES);
@@ -453,6 +466,8 @@ comptime {
     assert(@offsetOf(ClientStatsPage, "preload_passthrough_ops") == 48);
     assert(@offsetOf(ClientStatsPage, "preload_bind_refused") == 48 + 8 * PRELOAD_REASONS);
     assert(@offsetOf(ClientStatsPage, "il_direct_ops") == 48 + 8 * (PRELOAD_REASONS + PRELOAD_REFUSE_CLASSES));
+    assert(@offsetOf(ClientStatsPage, "lease_ledger") == 48 + 8 * (PRELOAD_REASONS + PRELOAD_REFUSE_CLASSES) + 64);
+    assert(@offsetOf(ClientStatsPage, "lease_ledger") % 8 == 0);
 }
 
 // ---------------------------------------------------------------------------

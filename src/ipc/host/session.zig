@@ -55,11 +55,13 @@ pub const PoisonReason = enum {
     host_shutdown,
     idle_reap,
     shed,
+    /// A write lease recalled past its bound with a client write in flight.
+    write_lease_forced,
 
     /// A client's protocol violation (the tripwire) vs the host's own act.
     pub fn violation(self: PoisonReason) bool {
         return switch (self) {
-            .slot_out_of_range, .slot_not_submitted, .over_admission, .ctl_malformed => true,
+            .slot_out_of_range, .slot_not_submitted, .over_admission, .ctl_malformed, .write_lease_forced => true,
             .host_shutdown, .idle_reap, .shed => false,
         };
     }
@@ -88,8 +90,10 @@ pub const Session = struct {
     last_active_ns: Atomic(u64),
     admitted_ns: u64,
     torn_down: Atomic(bool) = .init(false),
-    /// The direct arm granted at HELLO (`DirectHello` / `LeaseReq` answered).
+    /// The direct arm granted at HELLO (`DirectHello` / `LeaseReq` answered),
+    /// and its write arm (WRITE leases, `WriteNote`).
     direct_granted: bool = false,
+    direct_write_granted: bool = false,
     poisoned: Atomic(bool) = .init(false),
     /// The handoff fibers (joined at teardown).
     group: Io.Group = .init,

@@ -672,3 +672,171 @@ test "shim smoke: the LD_PRELOAD battery — plain-file parity with the shim sil
         std.debug.print("shim smoke row 4c (kill -9 mid-op): {s}\n", .{std.mem.trim(u8, r.stdout, "\n")});
     }
 }
+
+/// The direct write arm's writer (decision 0003 §AY): `<file> <pages>
+/// [fsync_every]` — pages of one repeated u64 sequence number pwritten
+/// O_DIRECT at scattered offsets of the pre-sized file, `acked <off> <seq>`
+/// per landed write and `synced <seq>` per fsync, line-flushed; the first
+/// failed call is an `error` line and exit 1 (loud, never a hang).
+const direct_writer_src =
+    \\#define _GNU_SOURCE
+    \\#include <errno.h>
+    \\#include <fcntl.h>
+    \\#include <stdio.h>
+    \\#include <stdlib.h>
+    \\#include <sys/stat.h>
+    \\#include <unistd.h>
+    \\int main(int argc, char **argv) {
+    \\    if (argc < 3) return 3;
+    \\    unsigned long pages = strtoul(argv[2], 0, 10);
+    \\    unsigned long fs_every = argc > 3 ? strtoul(argv[3], 0, 10) : 0;
+    \\    int fd = open(argv[1], O_RDWR | O_DIRECT);
+    \\    if (fd < 0) { fprintf(stderr, "error open errno %d\n", errno); return 2; }
+    \\    struct stat st; if (fstat(fd, &st)) return 2;
+    \\    unsigned long npages = (unsigned long)st.st_size / 4096; if (!npages) return 3;
+    \\    void *buf; if (posix_memalign(&buf, 4096, 4096)) return 2;
+    \\    setvbuf(stdout, NULL, _IOLBF, 0);
+    \\    for (unsigned long i = 1; i <= pages; i++) {
+    \\        unsigned long off = ((i * 2654435761UL) % npages) * 4096;
+    \\        unsigned long *w = buf; for (int k = 0; k < 512; k++) w[k] = i;
+    \\        ssize_t n = pwrite(fd, buf, 4096, (off_t)off);
+    \\        if (n != 4096) { fprintf(stderr, "error pwrite seq %lu off %lu: %zd errno %d\n", i, off, n, errno); return 1; }
+    \\        printf("acked %lu %lu\n", off, i);
+    \\        if (fs_every && i % fs_every == 0) {
+    \\            if (fsync(fd)) { fprintf(stderr, "error fsync seq %lu errno %d\n", i, errno); return 1; }
+    \\            printf("synced %lu\n", i);
+    \\        }
+    \\    }
+    \\    return 0;
+    \\}
+;
+
+/// `acked <off> <seq>` lines → the last acked sequence per offset; every
+/// such page must read (through the kernel, no shim) as one repeated u64
+/// ≥ that sequence (a write in flight at the kill may have landed newer).
+fn verifyAcked(gpa: std.mem.Allocator, out: []const u8, path: [:0]const u8) !struct { pages: usize, acked: usize } {
+    var last = std.AutoHashMapUnmanaged(u64, u64).empty;
+    defer last.deinit(gpa);
+    var acked: usize = 0;
+    var it = std.mem.splitScalar(u8, out, '\n');
+    while (it.next()) |line| {
+        if (!std.mem.startsWith(u8, line, "acked ")) continue;
+        var f = std.mem.tokenizeScalar(u8, line[6..], ' ');
+        const off = std.fmt.parseInt(u64, f.next() orelse continue, 10) catch continue;
+        const seq = std.fmt.parseInt(u64, f.next() orelse continue, 10) catch continue;
+        try last.put(gpa, off, seq);
+        acked += 1;
+    }
+    const rc = linux.open(path, .{ .ACCMODE = .RDONLY, .DIRECT = true, .CLOEXEC = true }, 0);
+    if (linux.errno(rc) != .SUCCESS) return error.OpenFailed;
+    const fd: linux.fd_t = @intCast(rc);
+    defer _ = linux.close(fd);
+    const page = try gpa.alignedAlloc(u8, .fromByteUnits(4096), 4096);
+    defer gpa.free(page);
+    var pages: usize = 0;
+    var kv = last.iterator();
+    while (kv.next()) |e| {
+        if (linux.pread(fd, page.ptr, 4096, @intCast(e.key_ptr.*)) != 4096) return error.ReadFailed;
+        const words = std.mem.bytesAsSlice(u64, page);
+        const first = words[0];
+        for (words) |w| if (w != first) {
+            std.debug.print("\n--- page @{d}: torn ({d} vs {d}) ---\n", .{ e.key_ptr.*, first, w });
+            return error.TornPage;
+        };
+        if (first < e.value_ptr.*) {
+            std.debug.print("\n--- page @{d}: acked seq {d}, device holds {d} ---\n", .{ e.key_ptr.*, e.value_ptr.*, first });
+            return error.AckedWriteLost;
+        }
+        pages += 1;
+    }
+    return .{ .pages = pages, .acked = acked };
+}
+
+test "shim smoke: THE DIRECT WRITE ARM — a `-o interception=direct` mount, a root writer under LD_PRELOAD pwriting pages straight to the device under write leases: kill -9 the WRITER mid-run ⇒ every acked page reads back (nothing acked is lost); kill -9 the DAEMON with writes in flight ⇒ the writer fails loud and, after a remount, every acked page reads back (the device holds only acked bytes, the layout unchanged); the dm-log-writes cut after fsync'd writes ⇒ every synced page survives the replay to the last flush" {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    // The C rows need `zig cc` on the venue's PATH; without it the row says
+    // so and passes (the in-process e2e holds the arm's law regardless).
+    const writer = (try rig.cc("direct_writer", direct_writer_src)) orelse {
+        std.debug.print("shim smoke rows 5a-5c (the direct write arm): PENDING — no `zig cc` on PATH for the writer\n", .{});
+        return;
+    };
+    defer gpa.free(writer);
+    try rig.formatSet();
+    const armed = try rig.mount(&.{ "-o", "interception=direct" });
+    try testing.expect(armed);
+    defer rig.kill9();
+    var fpath: [256]u8 = undefined;
+    const f = try std.fmt.bufPrintSentinel(&fpath, "{s}/f", .{rig.mp}, 0);
+    // The resident file: 8 MiB through the kernel, no shim.
+    {
+        const r = try rig.sh(rig.mp, "dd if=/dev/zero of=f bs=1M count=8 oflag=direct conv=fsync status=none");
+        defer rig.freeRun(r);
+        try testing.expect(r.term.success());
+    }
+    // 5a: the writer killed mid-run.
+    {
+        const script = try std.fmt.allocPrint(gpa, "{s} f 100000000 > {s}/writer-a.out 2> {s}/writer-a.err & w=$!; sleep 0.4; kill -9 $w; rc=0; wait $w || rc=$?; echo \"writer rc=$rc\"", .{ writer, rig.work, rig.work });
+        defer gpa.free(script);
+        const r = try rig.preload(rig.mp, script);
+        defer rig.freeRun(r);
+        var ob: [256]u8 = undefined;
+        const out = try Io.Dir.cwd().readFileAlloc(io, try std.fmt.bufPrint(&ob, "{s}/writer-a.out", .{rig.work}), gpa, .limited(64 << 20));
+        defer gpa.free(out);
+        const v = try verifyAcked(gpa, out, f);
+        try testing.expect(v.acked > 100);
+        const tail = try rig.statsTail();
+        defer gpa.free(tail);
+        const direct_writes = numberAfter(tail, "\"ipc_direct_writes\":") orelse 0;
+        try testing.expect(direct_writes > 0);
+        try testing.expectEqual(@as(u64, 0), numberAfter(tail, "\"ipc_write_leases_forced\":") orelse 0);
+        try testing.expectEqual(@as(u64, 0), numberAfter(tail, "\"ipc_write_leases_live\":") orelse 0);
+        std.debug.print("shim smoke row 5a (kill -9 the writer): {d} pages acked, every last-acked page intact; ipc_direct_writes {d}, leases forced 0; {s}\n", .{ v.acked, direct_writes, std.mem.trim(u8, r.stdout, "\n") });
+    }
+    // 5b: the daemon killed with writes in flight.
+    {
+        // (The writer's streams land OUTSIDE the mount: it is dead after the kill.)
+        const script = try std.fmt.allocPrint(gpa, "{s} {s}/f 100000000 > {s}/writer-b.out 2> {s}/writer-b.err & w=$!; sleep 0.4; kill -9 {d}; rc=0; wait $w || rc=$?; echo \"writer rc=$rc\"; cat {s}/writer-b.err", .{ writer, rig.mp, rig.work, rig.work, rig.child_pid, rig.work });
+        defer gpa.free(script);
+        const r = try rig.preload(rig.work, script);
+        defer rig.freeRun(r);
+        // Loud: a non-zero exit with an error line; never a hang (the
+        // heartbeat ladder poisons within a second).
+        try testing.expect(std.mem.indexOf(u8, r.stdout, "writer rc=0") == null);
+        try testing.expect(std.mem.indexOf(u8, r.stdout, "error ") != null);
+        var ob: [256]u8 = undefined;
+        const out = try Io.Dir.cwd().readFileAlloc(io, try std.fmt.bufPrint(&ob, "{s}/writer-b.out", .{rig.work}), gpa, .limited(64 << 20));
+        defer gpa.free(out);
+        rig.kill9();
+        const remounted = try rig.mount(&.{ "-o", "interception=direct" });
+        try testing.expect(remounted);
+        const v = try verifyAcked(gpa, out, f);
+        try testing.expect(v.acked > 100);
+        std.debug.print("shim smoke row 5b (kill -9 the daemon under writes): {d} pages acked before the kill, every last-acked page intact after the remount; the writer: {s}\n", .{ v.acked, std.mem.trim(u8, r.stdout, "\n") });
+    }
+    // 5c: the power cut (dm-log-writes) after fsync'd direct writes: the
+    //     script (`direct_cut.sh`, embedded) over loop devices; SKIP when
+    //     the venue has no dm-log-writes or no replay-log.
+    {
+        var cut_dir: [256]u8 = undefined;
+        const w = try std.fmt.bufPrint(&cut_dir, "{s}/cut", .{rig.work});
+        _ = linux.mkdir(@ptrCast(w.ptr), 0o755);
+        var sp_buf: [256]u8 = undefined;
+        const sp = try std.fmt.bufPrint(&sp_buf, "{s}/direct_cut.sh", .{rig.work});
+        try Io.Dir.cwd().writeFile(io, .{ .sub_path = sp, .data = direct_cut_script });
+        const r = try std.process.run(gpa, io, .{ .argv = &.{ "bash", sp, rig.bin, rig.so, writer, w }, .environ_map = &rig.env });
+        defer rig.freeRun(r);
+        std.debug.print("shim smoke row 5c (the dm-log-writes cut): {s}\n", .{std.mem.trim(u8, r.stdout, "\n")});
+        if (std.mem.indexOf(u8, r.stdout, "direct_cut: SKIP") == null) {
+            if (!r.term.success()) std.debug.print("--- direct_cut stderr ---\n{s}\n", .{r.stderr});
+            try testing.expect(r.term.success());
+            try testing.expect(std.mem.indexOf(u8, r.stdout, "direct_cut: PASS") != null);
+        }
+    }
+}
+
+/// The power-cut row's script (its header is the method).
+const direct_cut_script = @embedFile("direct_cut.sh");

@@ -209,6 +209,9 @@ pub const Tag = enum(u32) {
     lease_req = 14,
     lease_ok = 15,
     lease_refused = 16,
+    // The direct WRITE arm (decision 0003 §AY).
+    write_note = 17,
+    write_note_ok = 18,
     _,
 };
 
@@ -217,14 +220,17 @@ pub fn tagOf(raw: []const u8) DecodeError!Tag {
     if (raw.len < 4) return error.Truncated;
     const v = std.mem.readInt(u32, raw[0..4], .little);
     return switch (v) {
-        1...16 => @fromBackingInt(@intCast(v)),
+        1...18 => @fromBackingInt(@intCast(v)),
         else => error.BadTag,
     };
 }
 
 /// `SessionOk.features`: the daemon granted this session the direct arm
-/// (its uid can open every data device node; `DirectHello` is answered).
+/// (its uid can open every data device node; `DirectHello` is answered),
+/// and the direct WRITE arm (every node writable by it too: the client
+/// opens the nodes `O_RDWR` and may ask WRITE leases).
 pub const FEATURE_DIRECT: u64 = 1 << 0;
+pub const FEATURE_DIRECT_WRITE: u64 = 1 << 1;
 
 /// The direct arm's limits: device paths as the daemon opened them
 /// (`/dev/nvmeXnY`-class), at most this many volumes per lease frame, at
@@ -257,10 +263,13 @@ pub const DirectOk = extern struct {
     }
 };
 
-/// client → daemon: the layout lease of a binding.
+/// client → daemon: the layout lease of a binding; `LEASE_WRITE` asks a
+/// WRITE lease (a ledger slot, the tiers device-true for the inode).
+pub const LEASE_WRITE: u32 = 1;
+
 pub const LeaseReq = extern struct {
     tag: u32 = @backingInt(Tag.lease_req),
-    _pad: u32 = 0,
+    flags: u32 = 0,
     binding_id: u64,
 };
 
@@ -277,11 +286,16 @@ pub const LeaseRefuseClass = enum(u32) {
     binding = 4,
     /// A publish moved under the build (retry).
     moved = 5,
+    /// A WRITE lease was asked and refused: no write access (the device
+    /// screen, the binding's rights), a block the W1 patch would not take
+    /// (shared, decorated, foreign), or the session's ledger is full — the
+    /// client may hold a READ lease instead.
+    write = 6,
     _,
 
     pub fn fromU32(v: u32) ?LeaseRefuseClass {
         return switch (v) {
-            1...5 => @fromBackingInt(v),
+            1...6 => @fromBackingInt(v),
             else => null,
         };
     }
@@ -317,6 +331,12 @@ pub const LeaseOkHeader = extern struct {
     /// compares the stripe to this).
     epoch: u64,
     block_size: u64,
+    /// `LEASE_WRITE` when granted writable: `slot` is the session ledger's
+    /// entry and `grant` its generation (the client's writes enter under
+    /// both).
+    flags: u32 = 0,
+    slot: u32 = 0,
+    grant: u64 = 0,
 };
 
 pub const LeaseOk = struct {
@@ -324,6 +344,9 @@ pub const LeaseOk = struct {
     size: u64,
     epoch: u64,
     block_size: u64,
+    writable: bool = false,
+    slot: u32 = 0,
+    tag: u64 = 0,
     /// Viewed in the datagram (byte-aligned: the receive buffer is bytes).
     entries: []align(1) const LeaseEntry,
 
@@ -335,7 +358,7 @@ pub const LeaseOk = struct {
         if (l.entries.len > LEASE_MAX_ENTRIES) return error.StringTooLong;
         const n = l.encodedLen();
         if (out.len < n) return error.BufferTooSmall;
-        const h: LeaseOkHeader = .{ .n_entries = @intCast(l.entries.len), .ino = l.ino, .size = l.size, .epoch = l.epoch, .block_size = l.block_size };
+        const h: LeaseOkHeader = .{ .n_entries = @intCast(l.entries.len), .ino = l.ino, .size = l.size, .epoch = l.epoch, .block_size = l.block_size, .flags = if (l.writable) LEASE_WRITE else 0, .slot = l.slot, .grant = l.tag };
         @memcpy(out[0..@sizeOf(LeaseOkHeader)], std.mem.asBytes(&h));
         @memcpy(out[@sizeOf(LeaseOkHeader)..][0 .. l.entries.len * @sizeOf(LeaseEntry)], std.mem.sliceAsBytes(l.entries));
         return n;
@@ -350,11 +373,12 @@ pub const LeaseOk = struct {
         if (h.tag != @backingInt(Tag.lease_ok)) return error.BadTag;
         if (h.n_entries > LEASE_MAX_ENTRIES) return error.BadString;
         if (h.block_size == 0 or h.block_size % 4096 != 0) return error.BadString;
+        if (h.flags & ~LEASE_WRITE != 0) return error.BadString;
         if (raw.len != @sizeOf(LeaseOkHeader) + @as(usize, h.n_entries) * @sizeOf(LeaseEntry)) return error.Truncated;
         const bytes = raw[@sizeOf(LeaseOkHeader)..];
         const entries = std.mem.bytesAsSlice(LeaseEntry, bytes);
         for (entries) |e| if (e._pad != 0 or e._pad2 != 0 or (e.vol != LeaseEntry.UNMAPPED and e.vol >= DIRECT_MAX_VOLS)) return error.BadString;
-        return .{ .ino = h.ino, .size = h.size, .epoch = h.epoch, .block_size = h.block_size, .entries = entries };
+        return .{ .ino = h.ino, .size = h.size, .epoch = h.epoch, .block_size = h.block_size, .writable = h.flags & LEASE_WRITE != 0, .slot = h.slot, .tag = h.grant, .entries = entries };
     }
 };
 
@@ -531,6 +555,26 @@ pub const AdminReply = struct {
     }
 };
 
+/// client → daemon: the direct WRITE arm's batched postlude — `count`
+/// device writes under `binding`'s lease landed, reaching `max_end`, on
+/// the volumes of `vols_mask`; `NOTE_ACK` asks a `WriteNoteOk` (the
+/// client's fsync orders the stamp before the kernel's FSYNC).
+pub const NOTE_ACK: u32 = 1;
+
+pub const WriteNote = extern struct {
+    tag: u32 = @backingInt(Tag.write_note),
+    flags: u32 = 0,
+    binding_id: u64,
+    max_end: u64,
+    count: u32,
+    vols_mask: u32,
+};
+
+pub const WriteNoteOk = extern struct {
+    tag: u32 = @backingInt(Tag.write_note_ok),
+    _pad: u32 = 0,
+};
+
 comptime {
     assert(@sizeOf(Hello) == 112);
     assert(@offsetOf(Hello, "build_commit") == 16);
@@ -557,7 +601,9 @@ comptime {
     assert(@sizeOf(LeaseReq) == 16);
     assert(@sizeOf(LeaseRefused) == 8);
     assert(@sizeOf(LeaseEntry) == 16);
-    assert(@sizeOf(LeaseOkHeader) == 40);
+    assert(@sizeOf(LeaseOkHeader) == 56);
+    assert(@sizeOf(WriteNote) == 32);
+    assert(@sizeOf(WriteNoteOk) == 8);
     assert(@sizeOf(LeaseOkHeader) + LEASE_MAX_ENTRIES * @sizeOf(LeaseEntry) <= CTL_MSG_MAX);
 }
 
@@ -583,6 +629,12 @@ pub fn decodeFixed(comptime T: type, raw: []const u8) DecodeError!T {
         if (v.n_vols > DIRECT_MAX_VOLS or v.block_size == 0 or v.page_bytes == 0) return error.BadString;
         for (&v.paths) |*p| if (std.mem.indexOfScalar(u8, p, 0) == null) return error.BadString;
     }
+    if (T == LeaseReq) {
+        if (v.flags & ~LEASE_WRITE != 0) return error.BadString;
+    }
+    if (T == WriteNote) {
+        if (v.flags & ~NOTE_ACK != 0 or v.count == 0) return error.BadString;
+    }
     if (T == BindOk) {
         if (v.rights._pad != 0) return error.BadString;
     }
@@ -604,6 +656,8 @@ pub fn tagFor(comptime T: type) Tag {
         DirectOk => .direct_ok,
         LeaseReq => .lease_req,
         LeaseRefused => .lease_refused,
+        WriteNote => .write_note,
+        WriteNoteOk => .write_note_ok,
         else => @compileError("not a fixed ctl frame: " ++ @typeName(T)),
     };
 }
@@ -693,7 +747,7 @@ test "ctl round-trip of every fixed variant through the ONE decoder; the tag dis
     try testing.expectError(error.BadTag, decodeFixed(Bind, frameBytes(&unbind)[0..8]));
     try testing.expectError(error.Truncated, decodeFixed(Hello, frameBytes(&hello)[0..111]));
     try testing.expectError(error.Truncated, decodeFixed(Bind, frameBytes(&unbind)));
-    try testing.expectError(error.BadTag, tagOf(&[_]u8{ 17, 0, 0, 0 }));
+    try testing.expectError(error.BadTag, tagOf(&[_]u8{ 19, 0, 0, 0 }));
     try testing.expectError(error.Truncated, tagOf(&[_]u8{ 1, 0 }));
     // A bad class word; an unterminated commit; a rights pad bit.
     const badref: Refuse = .{ .class = 42 };
@@ -740,6 +794,8 @@ test "decoders are total on garbage: no decoder panics on arbitrary bytes of arb
         _ = decodeFixed(DirectOk, raw) catch {};
         _ = decodeFixed(LeaseReq, raw) catch {};
         _ = decodeFixed(LeaseRefused, raw) catch {};
+        _ = decodeFixed(WriteNote, raw) catch {};
+        _ = decodeFixed(WriteNoteOk, raw) catch {};
         // A valid frame with its tag forced: either refuses or decodes to itself.
         if (len == @sizeOf(Hello)) {
             std.mem.writeInt(u32, buf[0..4], @backingInt(Tag.hello), .little);
@@ -798,7 +854,7 @@ fn ctlFramesFuzz(_: void, smith: *std.testing.Smith) !void {
         try std.testing.expectEqual(l.entries.len, back.entries.len);
         for (l.entries, back.entries) |a, b| try std.testing.expectEqual(a.dev_off, b.dev_off);
     } else |_| {}
-    inline for (.{ Hello, SessionOk, Refuse, Bind, BindOk, BindRefused, Unbind, AdminHello, AdminOk, DirectHello, DirectOk, LeaseReq, LeaseRefused }) |T| {
+    inline for (.{ Hello, SessionOk, Refuse, Bind, BindOk, BindRefused, Unbind, AdminHello, AdminOk, DirectHello, DirectOk, LeaseReq, LeaseRefused, WriteNote, WriteNoteOk }) |T| {
         if (decodeFixed(T, raw)) |v| try std.testing.expectEqualSlices(u8, raw, frameBytes(&v)) else |_| {}
     }
 }
@@ -809,13 +865,21 @@ test "fuzz: the il0 blob, the admin datagrams and every fixed ctl frame decode t
 
 test "the direct arm's frames: a lease round-trips header and entries; a lying count, an unaligned block size, an out-of-range volume or a padded entry refuse; DirectOk's paths must terminate; the refuse classes round-trip" {
     const entries = [_]LeaseEntry{ .{ .vol = 0, .dev_off = 4 << 20 }, .{ .vol = LeaseEntry.UNMAPPED, .dev_off = 0 }, .{ .vol = 1, .dev_off = 12 << 20 } };
-    const l: LeaseOk = .{ .ino = 77, .size = 10 << 20, .epoch = 9, .block_size = 4 << 20, .entries = &entries };
+    const l: LeaseOk = .{ .ino = 77, .size = 10 << 20, .epoch = 9, .block_size = 4 << 20, .writable = true, .slot = 3, .tag = 0xABCD, .entries = &entries };
     var out: [256]u8 = undefined;
     const n = try l.encode(&out);
     try testing.expectEqual(@sizeOf(LeaseOkHeader) + 3 * @sizeOf(LeaseEntry), n);
     const back = try LeaseOk.decode(out[0..n]);
     try testing.expectEqual(@as(u64, 77), back.ino);
     try testing.expectEqual(@as(u64, 9), back.epoch);
+    try testing.expect(back.writable);
+    try testing.expectEqual(@as(u32, 3), back.slot);
+    try testing.expectEqual(@as(u64, 0xABCD), back.tag);
+    const wn: WriteNote = .{ .binding_id = 5, .max_end = 1 << 20, .count = 7, .vols_mask = 0b11, .flags = NOTE_ACK };
+    const wnd = try decodeFixed(WriteNote, frameBytes(&wn));
+    try testing.expectEqual(@as(u32, 7), wnd.count);
+    const wn0: WriteNote = .{ .binding_id = 5, .max_end = 0, .count = 0, .vols_mask = 0 };
+    try testing.expectError(error.BadString, decodeFixed(WriteNote, frameBytes(&wn0)));
     try testing.expectEqual(@as(usize, 3), back.entries.len);
     for (entries, back.entries) |a, b| {
         try testing.expectEqual(a.vol, b.vol);

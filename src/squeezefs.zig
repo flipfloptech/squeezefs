@@ -146,6 +146,7 @@ pub const data = struct {
     pub const writeback = @import("data/writeback.zig");
     pub const size_epoch = @import("data/size_epoch.zig");
     pub const shape_table = @import("data/shape_table.zig");
+    pub const lease_epoch = @import("data/lease_epoch.zig");
     pub const fsync = @import("data/fsync.zig");
     pub const read_size_class = @import("data/read_size_class.zig");
     pub const read_fill_pool = @import("data/read_fill_pool.zig");
@@ -279,6 +280,7 @@ test {
     _ = data.writeback;
     _ = data.size_epoch;
     _ = data.shape_table;
+    _ = data.lease_epoch;
     _ = data.fsync;
     _ = data.read_size_class;
     _ = data.read_fill_pool;

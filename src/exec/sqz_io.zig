@@ -647,6 +647,52 @@ pub const SqzIo = struct {
         };
     }
 
+    pub const WriteAtError = error{ InputOutput, NoSpaceLeft, DiskQuota, ShortWrite, Unexpected };
+
+    /// `buf` into `fd` at `off`, whole: `IORING_OP_WRITE` on the fiber's
+    /// lane ring (the kernel's buffered write — a page's copy is one atom
+    /// against the daemon's death, where a memcpy into a shared mapping is
+    /// not; no page fault, no `mmap_lock`), the fiber parked until the CQE;
+    /// off a lane the raw `pwrite(2)`. Never a cancellation point (a write
+    /// a durability law orders is never left half-issued).
+    pub fn writeAt(io_handle: Io, fd: linux.fd_t, buf: []const u8, off: u64) WriteAtError!void {
+        const f = lane_mod.currentFiber() orelse {
+            var done: usize = 0;
+            while (done < buf.len) {
+                const rc = linux.pwrite(fd, buf.ptr + done, buf.len - done, @intCast(off + done));
+                switch (linux.errno(rc)) {
+                    .SUCCESS => {
+                        if (rc == 0) return error.ShortWrite;
+                        done += @intCast(rc);
+                    },
+                    .INTR => {},
+                    .IO => return error.InputOutput,
+                    .NOSPC => return error.NoSpaceLeft,
+                    .DQUOT => return error.DiskQuota,
+                    else => return error.Unexpected,
+                }
+            }
+            return;
+        };
+        const old = io_handle.swapCancelProtection(.blocked);
+        defer _ = io_handle.swapCancelProtection(old);
+        if (!f.lane.armRingOp(f, prepWriteAt, .{ fd, buf, off })) return error.Unexpected;
+        const res = awaitRingOp(f) catch |err| switch (err) {
+            error.Canceled => unreachable, // protection is blocked above
+        };
+        if (res >= 0) return if (@as(usize, @intCast(res)) == buf.len) {} else error.ShortWrite;
+        return switch (@as(linux.E, @fromBackingInt(@as(u16, @intCast(-res))))) {
+            .NOSPC => error.NoSpaceLeft,
+            .DQUOT => error.DiskQuota,
+            .IO, .CANCELED => error.InputOutput,
+            else => error.Unexpected,
+        };
+    }
+
+    fn prepWriteAt(sqe: *linux.io_uring_sqe, fd: linux.fd_t, buf: []const u8, off: u64) void {
+        sqe.prep_write(fd, buf, off);
+    }
+
     /// `prep_fsync` then the range: std's prep resets every field, and
     /// `io_fsync_prep` reads the range from `off`/`len` (0/0 = the whole
     /// file). The SQE's `len` is 32 bits: a span past it is the whole file.

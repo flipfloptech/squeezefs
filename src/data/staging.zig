@@ -178,6 +178,17 @@ pub const stats = struct {
     pub var staging_departed_held_bytes: counters.Gauge = .{};
     pub var staging_departed_released: counters.ShardedCounter = .{};
     pub var staging_cover_rounds: counters.ShardedCounter = .{};
+    /// The in-place overwrite (`Segment.overwriteInPlace`):
+    /// `staging_inplace_overwrites` / `staging_inplace_bytes` — writes that
+    /// landed in the resident record's own grain (header-first, no new
+    /// slot, no image moved); `staging_inplace_declined_synced` — writes
+    /// that re-staged instead because a sync covered the record (the
+    /// two-copy form keeps the synced bytes); `staging_read_retries` — a
+    /// reader's copy that met a grain mid-write and copied again.
+    pub var staging_inplace_overwrites: counters.ShardedCounter = .{};
+    pub var staging_inplace_bytes: counters.ShardedCounter = .{};
+    pub var staging_inplace_declined_synced: counters.ShardedCounter = .{};
+    pub var staging_read_retries: counters.ShardedCounter = .{};
     /// §J.2's ring ledger: `staging_appends` / `staging_append_bytes` — the
     /// extending writes that landed IN PLACE (bytes moved = the bytes);
     /// `staging_restages` / `staging_restage_bytes` — whole images re-staged
@@ -192,7 +203,7 @@ pub const stats = struct {
 
 pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
     try w.writeAll("{");
-    inline for (.{ "current_staged_write_bytes", "staged_writes_in_flight", "staging_cell_state_bytes", "staging_tables_bytes", "staging_over_cap_refusals", "staging_ring_full_refusals", "staging_pressure_kicks", "staging_recovery_records", "staging_recovery_torn_records", "staging_generation_discards", "staging_foreign_scope_refusals", "staging_owner_live_refusals", "staging_member_residue_roots", "staged_payload_lost_reads", "dismount_promoted_files", "dismount_promoted_bytes", "dismount_promote_failures", "dismount_corpse_residents_destroyed", "dismount_unnamed_residents_destroyed", "fsync_promoted_files", "staging_fsync_syncs", "staging_fsync_bytes", "staging_fsync_coalesced", "staging_superseded_held", "staging_superseded_held_bytes", "staging_superseded_released", "staging_departures_deferred", "staging_departed_held", "staging_departed_held_bytes", "staging_departed_released", "staging_cover_rounds", "staging_dirty_free_bytes", "staging_sweep_runs", "staging_sweep_punched_bytes", "staging_appends", "staging_append_bytes", "staging_restages", "staging_restage_bytes" }, 0..) |name, i| {
+    inline for (.{ "current_staged_write_bytes", "staged_writes_in_flight", "staging_cell_state_bytes", "staging_tables_bytes", "staging_over_cap_refusals", "staging_ring_full_refusals", "staging_pressure_kicks", "staging_recovery_records", "staging_recovery_torn_records", "staging_generation_discards", "staging_foreign_scope_refusals", "staging_owner_live_refusals", "staging_member_residue_roots", "staged_payload_lost_reads", "dismount_promoted_files", "dismount_promoted_bytes", "dismount_promote_failures", "dismount_corpse_residents_destroyed", "dismount_unnamed_residents_destroyed", "fsync_promoted_files", "staging_fsync_syncs", "staging_fsync_bytes", "staging_fsync_coalesced", "staging_superseded_held", "staging_superseded_held_bytes", "staging_superseded_released", "staging_departures_deferred", "staging_departed_held", "staging_departed_held_bytes", "staging_departed_released", "staging_cover_rounds", "staging_dirty_free_bytes", "staging_sweep_runs", "staging_sweep_punched_bytes", "staging_inplace_overwrites", "staging_inplace_bytes", "staging_inplace_declined_synced", "staging_read_retries", "staging_appends", "staging_append_bytes", "staging_restages", "staging_restage_bytes" }, 0..) |name, i| {
         if (i != 0) try w.writeByte(',');
         try w.print("\"{s}\":{d}", .{ name, @field(stats, name).load() });
     }
@@ -496,6 +507,7 @@ pub fn isTombstone(image: []const u8, rec_off: u64) bool {
 /// (the daemon serves them), but a power cut may lose them — the fsync
 /// answers EIO.
 pub const DurableError = error{InputOutput};
+pub const WriteError = error{ InputOutput, NoSpaceLeft };
 
 /// What backs the image: the Linux ring binds `msync`/`fallocate`+`madvise`
 /// and the ranged sync; a RAM image (tests, the portable core) binds
@@ -510,6 +522,12 @@ pub const Backing = struct {
     /// waited for, the metadata that reaches them committed, the device's
     /// cache flushed). The fsync law's leg; a caller parks through `io`.
     durable: ?*const fn (ctx: ?*anyopaque, io: Io, off: u64, len: u64) DurableError!void = null,
+    /// `data` into the segment file at `off` through the host's write path
+    /// (an io_uring WRITE on the caller's lane ring, the fiber parked): a
+    /// page's copy is one atom against the daemon's death, where a memcpy
+    /// into the shared mapping is not — the in-place overwrite's grain
+    /// (`Segment.overwriteInPlace`). Null = the image is written directly.
+    write: ?*const fn (ctx: ?*anyopaque, io: Io, off: u64, data: []const u8) WriteError!void = null,
     /// Return `[off, off + len)` to the host (punch + drop pages): a free
     /// run of tombstoned records, from a sweep (`Segment.sweepDirty`) —
     /// never per record on a hot path; a cleanly unmounted dir scans EMPTY.
@@ -597,6 +615,10 @@ const Cell = struct {
     /// supersession and departure deferrals protect. An unsynced copy is
     /// released the moment it is superseded or departs.
     synced: bool = false,
+    /// The record's seqlock against an in-place overwrite: odd while a
+    /// grain is being rewritten; a reader's copy (`Lease.copyRange`) that
+    /// saw it move copies again — a grain is read whole or not at all.
+    seq: std.atomic.Value(u32) = .init(0),
     /// The retired list (under the segment lock).
     prev_retired: ?*Cell = null,
     next_retired: ?*Cell = null,
@@ -630,6 +652,21 @@ pub const AppendError = error{
     NoRoom,
 };
 
+pub const OverwriteError = error{
+    OutOfMemory,
+    NotResident,
+    Stale,
+    /// Not inside one grain of the image: the caller re-stages.
+    NoRoom,
+    /// A sync covered the record (or covers it now): its bytes are a
+    /// promise the two-copy replace keeps; the caller re-stages.
+    Synced,
+    /// The host's write failed: the record is as it was (the old header
+    /// still names the old bytes).
+    InputOutput,
+    NoSpaceLeft,
+};
+
 /// One grain-bitmap word covers this many grains (the word type's width).
 const WORD_BITS: usize = @bitSizeOf(u64);
 
@@ -659,6 +696,16 @@ pub const Segment = struct {
     dirty: []u64,
     /// One sweep at a time (under the lock): a second caller returns.
     sweeping: bool = false,
+    /// In-place overwrites between their check and their flip: a sync
+    /// leader waits for zero before it issues (`SyncCoalescer.lead`), so a
+    /// record it covers is never half-rewritten under its dirty walk;
+    /// seq_cst against the leader's `running` (Dekker: one side sees the
+    /// other).
+    inplace_in_flight: std.atomic.Value(u32) = .init(0),
+    /// The leader's park word for that wait (`tick`): the last write out
+    /// wakes it — a fiber park, never a spin on the lane thread (the writer
+    /// may be a fiber of the same lane).
+    inplace_drained: std.atomic.Value(u32) = .init(0),
     /// The fsync law's batcher over `backing.durable` (module doc).
     durable: SyncCoalescer = .{},
     /// Retired cells not yet reclaimed (`Cell` doc), under the lock.
@@ -810,6 +857,29 @@ pub const Segment = struct {
 
         pub fn generation(self: Lease) u64 {
             return self.cell.extent.generation;
+        }
+
+        /// `dst` ← the value at `off` (clipped to the value's end; the
+        /// bytes copied), whole against a racing in-place overwrite: the
+        /// record's seqlock read before and after the copy (the second
+        /// read a seq_cst RMW: it orders the copy's loads before it), a
+        /// moved or odd seq copies again.
+        pub fn copyRange(self: Lease, dst: []u8, off: u64) usize {
+            const e = self.cell.extent;
+            if (off >= e.val_len) return 0;
+            const n: usize = @intCast(@min(dst.len, e.val_len - off));
+            const src = self.seg.image[@intCast(e.valOff() + off)..][0..n];
+            while (true) {
+                const s0 = self.cell.seq.load(.acquire);
+                if (s0 & 1 != 0) {
+                    stats.staging_read_retries.inc();
+                    std.Thread.yield() catch {};
+                    continue;
+                }
+                @memcpy(dst[0..n], src);
+                if (self.cell.seq.fetchAdd(0, .seq_cst) == s0) return n;
+                stats.staging_read_retries.inc();
+            }
         }
 
         /// Drop the reference; the last one out of a retired cell
@@ -1055,6 +1125,113 @@ pub const Segment = struct {
         // The index's reference and our lease leave; the last one out frees
         // the cell alone (shadowed: the record lives on under the successor).
         if (old.refs.fetchSub(2, .acq_rel) == 2) self.reclaimCellLocked(old);
+    }
+
+    /// The in-place overwrite: `data` lands in the resident record's OWN
+    /// grain (`at` and `at + data.len` inside one grain of the value, the
+    /// value's length unchanged) iff no sync covered the record — an
+    /// unsynced record owes nothing to a cut, and a kill keeps the page
+    /// cache, so the order below is what makes the write atomic against
+    /// the daemon's death: (1) the header with the NEW checksum — over the
+    /// old grains plus the new one, hashed from the mapping and `data` —
+    /// into the slot that is NOT current (the current slot still names the
+    /// old bytes whole: a kill here recovers the old record); (2) the grain
+    /// through the host's write path (`Backing.write`: one page's copy, one
+    /// atom — a kill after it recovers the new record, the new slot the
+    /// valid one); (3) the RAM flip. Readers see old or new, never torn
+    /// (`Lease.copyRange`'s seqlock); writers of a key are the caller's to
+    /// serialize (the ino's layout lock). Not a new slot, not a copy of the
+    /// image, not a superseded cell, nothing to punch — the 4 KiB rewrite
+    /// of a small file at the cost of one hash of its image.
+    pub fn overwriteInPlace(self: *Segment, io: Io, key: StagingKey, at: u64, data: []const u8, expect_generation: u64, generation: u64, fencing: u64) OverwriteError!void {
+        assert(data.len != 0);
+        const cell: *Cell, const ext: Extent = blk: {
+            self.lock.lock();
+            defer self.lock.unlock();
+            const c = self.index.get(key.bytes().*) orelse return error.NotResident;
+            const e = c.extent;
+            if (e.generation != expect_generation) return error.Stale;
+            if (at + data.len > e.val_len or at / RECORD_ALIGN != (at + data.len - 1) / RECORD_ALIGN) return error.NoRoom;
+            if (c.synced) {
+                stats.staging_inplace_declined_synced.inc();
+                return error.Synced;
+            }
+            // Registered BEFORE the running-sync probe (Dekker with the
+            // leader's `running`, both seq_cst): a sync that starts now
+            // waits for this write; one already running declines it.
+            _ = self.inplace_in_flight.fetchAdd(1, .seq_cst);
+            if (self.coveredByRunningSync(c)) {
+                _ = self.inplace_in_flight.fetchSub(1, .seq_cst);
+                stats.staging_inplace_declined_synced.inc();
+                return error.Synced;
+            }
+            _ = c.refs.fetchAdd(1, .monotonic);
+            self.bumpSeqLocked(c); // odd: a grain is moving
+            break :blk .{ c, e };
+        };
+        errdefer {
+            self.lock.lock();
+            self.bumpSeqLocked(cell);
+            self.inplaceDoneLocked(io);
+            if (cell.refs.fetchSub(1, .acq_rel) == 1 and cell.retired.load(.acquire)) self.reclaimCellLocked(cell);
+            self.lock.unlock();
+        }
+        const voff: usize = @intCast(ext.valOff());
+        const value = self.image[voff .. voff + ext.val_len];
+        // The new value's hash from the parts that stay and the part that
+        // comes (the record's writers are serialized by the caller).
+        const state = try self.createState();
+        errdefer self.destroyState(state);
+        state.* = .init();
+        state.update(value[0..@intCast(at)]);
+        state.update(data);
+        state.update(value[@intCast(at + data.len)..]);
+        const slot = ext.slot.other();
+        writeHeader(self.image, ext.rec_off, slot, key.bytes(), ext.val_len, generation, fencing, state);
+        if (self.backing.sync) |sy| sy(self.backing.ctx, ext.rec_off, RECORD_ALIGN);
+        const grain_off = ext.valOff() + at;
+        if (self.backing.write) |w| {
+            try w(self.backing.ctx, io, grain_off, data);
+        } else {
+            @memcpy(self.image[@intCast(grain_off)..][0..data.len], data);
+        }
+        self.lock.lock();
+        defer self.lock.unlock();
+        self.bumpSeqLocked(cell); // even: the grain is whole
+        self.inplaceDoneLocked(io);
+        if (cell.retired.load(.acquire)) {
+            // Gone meanwhile (the key left): the bytes belong to a record
+            // nothing names.
+            self.destroyState(state);
+            if (cell.refs.fetchSub(1, .acq_rel) == 1) self.reclaimCellLocked(cell);
+            return error.Stale;
+        }
+        if (cell.hash) |h| self.destroyState(h);
+        cell.hash = state;
+        cell.extent.slot = slot;
+        cell.extent.generation = generation;
+        cell.indexed_seq = self.indexed_seq.fetchAdd(1, .release);
+        _ = cell.refs.fetchSub(1, .acq_rel);
+        stats.staging_inplace_overwrites.inc();
+        stats.staging_inplace_bytes.add(data.len);
+    }
+
+    /// The record's seqlock step, on the cell and on every shadowed cell
+    /// still leased over the same record (an in-place append's
+    /// predecessors share its bytes): release pairs with `copyRange`'s
+    /// acquire.
+    fn bumpSeqLocked(self: *Segment, cell: *Cell) void {
+        _ = cell.seq.fetchAdd(1, .release);
+        var cur = self.retired_head;
+        while (cur) |c| : (cur = c.next_retired) {
+            if (c.shadowed and c.extent.rec_off == cell.extent.rec_off) _ = c.seq.fetchAdd(1, .release);
+        }
+    }
+
+    /// One in-place write out; the last one wakes a sync leader parked on
+    /// the drain (`SyncCoalescer.lead`).
+    fn inplaceDoneLocked(self: *Segment, io: Io) void {
+        if (self.inplace_in_flight.fetchSub(1, .seq_cst) == 1) tick.wake(io, &self.inplace_drained);
     }
 
     /// Remove `key` iff present (and, when `expect_generation` is given,
@@ -1661,6 +1838,15 @@ pub const SyncCoalescer = struct {
 
     fn lead(self: *SyncCoalescer, seg: *Segment, io: Io, w: *Waiter) DurableError!u64 {
         const durable = seg.backing.durable.?;
+        // An in-place overwrite between its check and its flip finishes
+        // first (µs; a fiber park — the writer may share this lane): the
+        // sync's dirty walk never meets a half-rewritten record; one that
+        // starts now sees this batch running and declines.
+        while (seg.inplace_in_flight.load(.seq_cst) != 0) {
+            seg.inplace_drained.store(0, .monotonic);
+            if (seg.inplace_in_flight.load(.seq_cst) == 0) break;
+            _ = tick.parkUncancelable(io, &seg.inplace_drained, null);
+        }
         const t0 = clock.monotonicNs();
         const result = durable(seg.backing.ctx, io, w.lo, w.hi - w.lo);
         stats.staging_fsync_sync_ns.record(clock.monotonicNs() - t0);
@@ -1930,6 +2116,26 @@ pub fn appendStaged(pool: *Pool, seg: *Segment, key: StagingKey, at: u64, data: 
     try pool.charge(key.file_id, cost, generation);
     stats.staging_appends.inc();
     stats.staging_append_bytes.add(data.len);
+    return .{ .generation = generation, .kicked = false };
+}
+
+/// The in-place overwrite inside one grain of the resident record (a
+/// fresh generation, the ledger row re-stamped at the same cost); `null`
+/// = not in place (no ring, no resident copy, a synced record, a span
+/// outside one grain, the copy moved under the caller): the caller
+/// re-stages the whole image. Never kicks the drain: the footprint is the
+/// same. An I/O failure is the caller's EIO: the record stays as it was.
+pub fn overwriteStaged(pool: *Pool, seg: *Segment, io: Io, key: StagingKey, at: u64, data: []const u8, fencing: u64) (error{ OutOfMemory, InputOutput, NoSpaceLeft })!?Staged {
+    const resident = pool.generationOf(key.file_id) orelse return null;
+    const generation = pool.nextGeneration();
+    seg.overwriteInPlace(io, key, at, data, resident, generation, fencing) catch |e| switch (e) {
+        error.NotResident, error.Stale, error.NoRoom, error.Synced => return null,
+        error.OutOfMemory => return error.OutOfMemory,
+        error.InputOutput => return error.InputOutput,
+        error.NoSpaceLeft => return error.NoSpaceLeft,
+    };
+    const cost = pool.costOf(key.file_id) orelse 0;
+    try pool.charge(key.file_id, cost, generation);
     return .{ .generation = generation, .kicked = false };
 }
 
@@ -2353,6 +2559,17 @@ pub const Ring = if (builtin.os.tag == .linux) struct {
             };
         }
 
+        /// The in-place grain (`Backing.write`): `IORING_OP_WRITE` on the
+        /// caller's lane ring into the segment file — the page cache the
+        /// mapping shares, one page's copy in the kernel.
+        fn write(ctx: ?*anyopaque, io: Io, off: u64, data: []const u8) WriteError!void {
+            const self: *MappedSegment = @ptrCast(@alignCast(ctx.?));
+            sqz_io.SqzIo.writeAt(io, self.fd, data, off) catch |e| return switch (e) {
+                error.NoSpaceLeft, error.DiskQuota => error.NoSpaceLeft,
+                else => error.InputOutput,
+            };
+        }
+
         /// Punch the hole (the host reclaims the blocks) and drop the pages
         /// (the RSS the dead extent held); neither is correctness — a
         /// tombstoned record is never adopted — so their errnos are ignored.
@@ -2377,7 +2594,7 @@ pub const Ring = if (builtin.os.tag == .linux) struct {
         }
 
         pub fn backing(self: *MappedSegment) Backing {
-            return .{ .ctx = self, .sync = sync, .reclaim = reclaim, .nextData = nextData, .durable = durable };
+            return .{ .ctx = self, .sync = sync, .reclaim = reclaim, .nextData = nextData, .durable = durable, .write = write };
         }
 
         /// The census face of an `inspectSegment` view: hole-skipping
@@ -3223,7 +3440,7 @@ test "the live cells' value-hash states are gauged (R5): N staged records carry 
     try testing.expectEqual(stats.staging_cell_state_bytes.load(), c.current());
 }
 
-test "the segment's fixed per-cell tables are gauged (R5): tablesBound(cap) = maxCells × (Cell + u32) + the two grain bitmaps + indexSlots × (1 + KEY_LEN + ptr); an open segment carries exactly it in staging_tables_bytes (the live tables agree term by term, the std map's capacity law pinned), puts move nothing, deinit returns it; the component is attribution-only; the tables are ≈ 4.4 % of the ring" {
+test "the segment's fixed per-cell tables are gauged (R5): tablesBound(cap) = maxCells × (Cell + u32) + the two grain bitmaps + indexSlots × (1 + KEY_LEN + ptr); an open segment carries exactly it in staging_tables_bytes (the live tables agree term by term, the std map's capacity law pinned), puts move nothing, deinit returns it; the component is attribution-only; the tables are ≈ 4.5 % of the ring" {
     const gpa = testing.allocator;
     // The tie, restated: n = cap / grain + 1 cells, one bit per grain.
     const cap: u64 = 64 * 4096;
@@ -3232,6 +3449,7 @@ test "the segment's fixed per-cell tables are gauged (R5): tablesBound(cap) = ma
     try testing.expectEqual(@as(u64, 128), Segment.indexSlots(@intCast(n)));
     try testing.expectEqual(@as(usize, 1), Segment.occupiedWords(cap));
     try testing.expectEqual(n * @sizeOf(Cell) + n * @sizeOf(u32) + 2 * 8 + 128 * (1 + KEY_LEN + @sizeOf(*Cell)), Segment.tablesBound(cap));
+    try testing.expectEqual(@as(usize, 120), @sizeOf(Cell));
     // The std map's capacity law at the boundary: 80 % load, power of two.
     try testing.expectEqual(@as(u64, 16), Segment.indexSlots(12));
     try testing.expectEqual(@as(u64, 32), Segment.indexSlots(13));
@@ -3250,17 +3468,18 @@ test "the segment's fixed per-cell tables are gauged (R5): tablesBound(cap) = ma
     try testing.expectEqual(g0 + Segment.tablesBound(cap), stats.staging_tables_bytes.load());
     seg.deinit();
     try testing.expectEqual(g0, stats.staging_tables_bytes.load());
-    // The share of the ring: 24,899,828 B at the venue's 546 MiB ring
-    // (139,777 cells × (112 + 4) B + 2 × 2,184 bitmap words × 8 B +
+    // The share of the ring: 26,018,044 B at the venue's 546 MiB ring
+    // (139,777 cells × (120 + 4) B + 2 × 2,184 bitmap words × 8 B +
     // 262,144 index slots × 33 B; the sorted-extent scratch and the pending
-    // list — 80 B per cell — left with the grain bitmaps, 2026-10-20) and
-    // 2,986,100 B at 64 MiB — 4.3–4.4 % of either, the index's
-    // power-of-two rounding the swing.
+    // list — 80 B per cell — left with the grain bitmaps, the cell grew
+    // 112 → 120 B with the record seqlock, 2026-10-20) and 3,117,180 B at
+    // 64 MiB — 4.5–4.6 % of either, the index's power-of-two rounding the
+    // swing.
     const venue_ring: u64 = 546 * derive.MiB;
-    try testing.expectEqual(@as(u64, 24_899_828), Segment.tablesBound(venue_ring));
-    try testing.expectEqual(@as(u64, 2_986_100), Segment.tablesBound(64 * derive.MiB));
-    try testing.expect(Segment.tablesBound(venue_ring) * 1000 / venue_ring == 43);
-    try testing.expect(Segment.tablesBound(64 * derive.MiB) * 1000 / (64 * derive.MiB) == 44);
+    try testing.expectEqual(@as(u64, 26_018_044), Segment.tablesBound(venue_ring));
+    try testing.expectEqual(@as(u64, 3_117_180), Segment.tablesBound(64 * derive.MiB));
+    try testing.expect(Segment.tablesBound(venue_ring) * 1000 / venue_ring == 45);
+    try testing.expect(Segment.tablesBound(64 * derive.MiB) * 1000 / (64 * derive.MiB) == 46);
     // The R5 component: attribution-only (the tables live with the segment), heap, not page cache.
     const c = tablesComponent();
     try testing.expectEqualStrings("staging_tables", c.name);
@@ -3549,6 +3768,164 @@ test "a synced copy survives an unsynced re-stage: the superseded copy keeps its
     try seg.put(tkey(6, 66), &b, 12, 0, 0);
     try testing.expectEqual(d_ext.rec_off, seg.residentExtent(tkey(6, 66)).?.rec_off);
     try testing.expectEqual(dirty_before + (d_ext.end() - d_ext.rec_off) - stride(KEY_LEN, b.len), seg.dirtyFreeBytes());
+}
+
+test "the in-place overwrite: a write inside ONE grain of an UNSYNCED resident record lands in the record's own grain — header-first (the other slot carries the new checksum before the grain moves: a kill between recovers the OLD record, a kill after the NEW), no new slot, no superseded cell, nothing freed, the generation and hash state move on (an append continues from it); a synced record, a record a running sync covers, a span across two grains and a write past the value decline (the caller re-stages); readers copy a grain whole under a racing writer (never a torn grain) — red before: every rewrite moved the image into a fresh slot" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var seam: SyncSeam = .{};
+    defer seam.calls.deinit(gpa);
+    defer seam.reclaims.deinit(gpa);
+    const image = try gpa.alloc(u8, 64 * 4096);
+    defer gpa.free(image);
+    @memset(image, 0);
+    var seg = try Segment.init(gpa, image, seam.backing());
+    defer seg.deinit();
+    const k = tkey(1, 11);
+    var value: [16384]u8 = @splat('a');
+    try seg.put(k, &value, 1, 0, 0);
+    const e0 = seg.residentExtent(k).?;
+    const ov0 = stats.staging_inplace_overwrites.load();
+    const de0 = stats.staging_inplace_declined_synced.load();
+    const free0 = seg.free_cells.items.len;
+    // Grain 1 (bytes 4096..8192) rewritten in place.
+    const patch: [4096]u8 = @splat('b');
+    try seg.overwriteInPlace(io, k, 4096, &patch, 1, 2, 0);
+    const e1 = seg.residentExtent(k).?;
+    try testing.expectEqual(e0.rec_off, e1.rec_off); // the same slot …
+    try testing.expectEqual(e0.slot.other(), e1.slot); // … the other header
+    try testing.expectEqual(@as(u64, 2), e1.generation);
+    try testing.expectEqual(free0, seg.free_cells.items.len); // no cell moved
+    try testing.expectEqual(@as(u64, 0), seg.dirtyFreeBytes());
+    try testing.expectEqual(@as(?*Cell, null), seg.retired_head);
+    try testing.expectEqual(ov0 + 1, stats.staging_inplace_overwrites.load());
+    @memcpy(value[4096..8192], &patch);
+    {
+        const l = seg.get(k).?;
+        defer l.release();
+        try testing.expectEqualSlices(u8, &value, l.bytes());
+        var out: [16384]u8 = undefined;
+        try testing.expectEqual(@as(usize, 16384), l.copyRange(&out, 0));
+        try testing.expectEqualSlices(u8, &value, &out);
+    }
+    // The record verifies under its new header; recovery adopts generation 2.
+    try testing.expect(verifyRecordAt(image, e1.rec_off, readHeaderAt(image, e1.rec_off, e1.slot).?, e1.slot));
+    {
+        const cut = try gpa.dupe(u8, image);
+        defer gpa.free(cut);
+        var rec = try Segment.init(gpa, cut, .none);
+        defer rec.deinit();
+        _ = rec.recover();
+        const l = rec.get(k).?;
+        defer l.release();
+        try testing.expectEqual(@as(u64, 2), l.generation());
+        try testing.expectEqualSlices(u8, &value, l.bytes());
+    }
+    // Header-first: a kill after the new header but before the grain
+    // leaves the OLD record whole — recovery over an image with the new
+    // header and the old grain adopts generation 2's predecessor's bytes
+    // under the still-valid old slot.
+    {
+        const cut = try gpa.dupe(u8, image);
+        defer gpa.free(cut);
+        const patch2: [4096]u8 = @splat('c');
+        // The header of generation 3 lands (slot e1.slot.other()); the grain does not.
+        var state: ValueHash = .init();
+        state.update(value[0..8192]);
+        state.update(&patch2);
+        state.update(value[12288..]);
+        writeHeader(cut, e1.rec_off, e1.slot.other(), k.bytes(), 16384, 3, 0, &state);
+        var rec2 = try Segment.init(gpa, cut, .none);
+        defer rec2.deinit();
+        _ = rec2.recover();
+        const l = rec2.get(k).?;
+        defer l.release();
+        try testing.expectEqual(@as(u64, 2), l.generation());
+        try testing.expectEqualSlices(u8, &value, l.bytes());
+        // … and once the grain lands, generation 3 is the record.
+        @memcpy(cut[@intCast(e1.valOff() + 8192)..][0..4096], &patch2);
+        var rec3 = try Segment.init(gpa, cut, .none);
+        defer rec3.deinit();
+        _ = rec3.recover();
+        const l3 = rec3.get(k).?;
+        defer l3.release();
+        try testing.expectEqual(@as(u64, 3), l3.generation());
+        try testing.expectEqualSlices(u8, &patch2, l3.bytes()[8192..12288]);
+    }
+    // The hash state continues: an in-place append after the overwrite verifies.
+    try seg.put(k, &value, 4, 0, reserveFor(KEY_LEN, value.len, .append)); // a fresh slot with append slack
+    try seg.overwriteInPlace(io, k, 0, &patch, 4, 5, 0);
+    const tail: [100]u8 = @splat('t');
+    try seg.appendInPlace(k, 16384, &tail, 5, 6, 0);
+    const e6 = seg.residentExtent(k).?;
+    try testing.expect(verifyRecordAt(image, e6.rec_off, readHeaderAt(image, e6.rec_off, e6.slot).?, e6.slot));
+    // Declines: across two grains, past the value, a stale generation.
+    try testing.expectError(error.NoRoom, seg.overwriteInPlace(io, k, 4000, &patch, 6, 7, 0));
+    try testing.expectError(error.NoRoom, seg.overwriteInPlace(io, k, 16384, &patch, 6, 7, 0));
+    try testing.expectError(error.Stale, seg.overwriteInPlace(io, k, 0, &patch, 5, 7, 0));
+    // A synced record keeps the two-copy form.
+    try seg.syncResident(io, k);
+    try testing.expectError(error.Synced, seg.overwriteInPlace(io, k, 0, &patch, 6, 7, 0));
+    try testing.expectEqual(de0 + 1, stats.staging_inplace_declined_synced.load());
+    // A record a RUNNING sync covers declines too (the dirty walk is on).
+    const k2 = tkey(2, 22);
+    try seg.put(k2, &value, 8, 0, 0);
+    seam.hold.store(1, .release);
+    const Req = struct {
+        fn run(s: *Segment, io_: Io, out: *anyerror!void) void {
+            out.* = s.syncAll(io_);
+        }
+    };
+    var result: anyerror!void = {};
+    var group: Io.Group = .init;
+    group.async(io, Req.run, .{ &seg, io, &result });
+    while (seam.in_flight.load(.acquire) == 0) try std.Thread.yield();
+    try testing.expectError(error.Synced, seg.overwriteInPlace(io, k2, 0, &patch, 8, 9, 0));
+    seam.release();
+    group.await(io) catch |err| switch (err) {
+        error.Canceled => unreachable,
+    };
+    try result;
+    // Readers never see a torn grain: a writer alternates grain 0 between
+    // all-'x' and all-'y' while a reader copies it and checks uniformity.
+    const k3 = tkey(3, 33);
+    var v3: [8192]u8 = @splat('x');
+    try seg.put(k3, &v3, 10, 0, 0);
+    const Race = struct {
+        fn writer(s: *Segment, io_: Io, key: StagingKey, stop: *std.atomic.Value(bool)) void {
+            var gen: u64 = 10;
+            var fill: u8 = 'y';
+            while (!stop.load(.acquire)) {
+                const g: [4096]u8 = @splat(fill);
+                s.overwriteInPlace(io_, key, 0, &g, gen, gen + 1, 0) catch return;
+                gen += 1;
+                fill = if (fill == 'y') 'x' else 'y';
+            }
+        }
+        fn reader(s: *Segment, key: StagingKey, stop: *std.atomic.Value(bool), torn: *u32, copies: *u32) void {
+            var out: [4096]u8 = undefined;
+            var n: u32 = 0;
+            while (n < 4000) : (n += 1) {
+                const l = s.get(key) orelse break;
+                defer l.release();
+                _ = l.copyRange(&out, 0);
+                if (!std.mem.allEqual(u8, &out, out[0])) torn.* += 1;
+            }
+            copies.* = n;
+            stop.store(true, .release);
+        }
+    };
+    var stop: std.atomic.Value(bool) = .init(false);
+    var torn: u32 = 0;
+    var copies: u32 = 0;
+    var race: Io.Group = .init;
+    race.async(io, Race.writer, .{ &seg, io, k3, &stop });
+    race.async(io, Race.reader, .{ &seg, k3, &stop, &torn, &copies });
+    race.await(io) catch |err| switch (err) {
+        error.Canceled => unreachable,
+    };
+    try testing.expectEqual(@as(u32, 0), torn);
+    try testing.expectEqual(@as(u32, 4000), copies);
 }
 
 /// The departure law's counting seam: every cover round recorded; `hold`

@@ -1755,6 +1755,20 @@ pub const DataPlane = struct {
         return s.generation;
     }
 
+    /// The in-place overwrite inside one grain of the resident record
+    /// (`staging.overwriteStaged`): the new generation, or null when the
+    /// caller must re-stage (no ring, no resident copy, a synced record, a
+    /// span outside one grain).
+    pub fn overwriteStaged(self: *DataPlane, io: Io, key_: staging.StagingKey, at: u64, data: []const u8) Error!?u64 {
+        const st = &(self.stage orelse return null);
+        const s = (staging.overwriteStaged(&st.pool, &st.seg, io, key_, at, data, 1) catch |e| return switch (e) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.InputOutput => error.InputOutput,
+            error.NoSpaceLeft => error.NoSpaceLeft,
+        }) orelse return null;
+        return s.generation;
+    }
+
     /// The ring entry leaves (a promotion landed, a re-stage superseded it,
     /// an unlink, a layout that moved away): generation-gated when known
     /// (null = whatever copy is resident — the layout no longer names it).
@@ -3654,13 +3668,11 @@ pub const DataPlane = struct {
         const k = staging.StagingKey.init(file_id, ino);
         if (st.seg.get(k)) |lease| {
             defer lease.release();
-            const bytes = lease.bytes();
             const want: usize = @intCast(@min(len, dest.len));
-            @memset(dest[0..want], 0);
-            if (offset < bytes.len) {
-                const n = @min(want, bytes.len - offset);
-                @memcpy(dest[0..n], bytes[@intCast(offset)..][0..n]);
-            }
+            // Whole against a racing in-place overwrite (the record's
+            // seqlock); the bytes past the value are zeros.
+            const n = lease.copyRange(dest[0..want], offset);
+            @memset(dest[n..want], 0);
             return .{ .served = want };
         }
         if (st.pool.generationOf(file_id) != null) return .in_flight;

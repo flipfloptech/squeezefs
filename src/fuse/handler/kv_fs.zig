@@ -348,7 +348,7 @@ pub fn assertStore(comptime T: type) void {
 /// the product; `NoData` is the volume-less set).
 pub fn assertData(comptime T: type) void {
     comptime {
-        for ([_][]const u8{ "hasVolumes", "stagingOn", "blockSize", "inlineMax", "geometry", "refsSeam", "noteShape", "forgetShape", "noteSizeSet", "sizeSetSince", "isPassthrough", "canStoreHeld", "write", "zeroExtension", "custodyFloor", "barrierData", "read", "ownBlock", "abandonOwnBlock", "ownBlockPublished", "holdReleases", "dropReleases", "freeBindings", "flushCustody", "releaseIno", "hasWriteCustody", "fsync", "statfs", "mintFileId", "stageImage", "appendStaged", "releaseStaged", "stagedLease", "readMappingImage", "lockLayout", "stageKvmapShrink", "stageKvmapCorpse", "drainKvmapSweep", "publishForeign" }) |name| {
+        for ([_][]const u8{ "hasVolumes", "stagingOn", "blockSize", "inlineMax", "geometry", "refsSeam", "noteShape", "forgetShape", "noteSizeSet", "sizeSetSince", "isPassthrough", "canStoreHeld", "write", "zeroExtension", "custodyFloor", "barrierData", "read", "ownBlock", "abandonOwnBlock", "ownBlockPublished", "holdReleases", "dropReleases", "freeBindings", "flushCustody", "releaseIno", "hasWriteCustody", "fsync", "statfs", "mintFileId", "stageImage", "appendStaged", "overwriteStaged", "releaseStaged", "stagedLease", "readMappingImage", "lockLayout", "stageKvmapShrink", "stageKvmapCorpse", "drainKvmapSweep", "publishForeign" }) |name| {
             if (!@hasDecl(T, name)) @compileError(@typeName(T) ++ " is not a kv_fs Data face: lacks `" ++ name ++ "`");
         }
     }
@@ -2982,6 +2982,14 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                     generation = g;
                     in_place = true;
                 }
+            } else if (keep_identity and end <= probe.size) {
+                // An overwrite inside the image: into the record's own
+                // grain when the record owes no durability yet (the ring's
+                // in-place law), else the two-copy re-stage below.
+                if (try self.data.overwriteStaged(self.io, k, a.offset, data)) |g| {
+                    generation = g;
+                    in_place = true;
+                }
             }
             if (!in_place) {
                 const buf = try self.gpa.alloc(u8, @intCast(layout.ceilGrain(size)));
@@ -4138,6 +4146,9 @@ pub const NoData = struct {
     pub fn stageImage(_: *NoData, _: staging.StagingKey, _: []const u8, _: staging.Slack) Error!u64 {
         return error.NotSupported;
     }
+    pub fn overwriteStaged(_: *NoData, _: Io, _: staging.StagingKey, _: u64, _: []const u8) Error!?u64 {
+        return null;
+    }
     pub fn appendStaged(_: *NoData, _: staging.StagingKey, _: u64, _: []const u8) Error!?u64 {
         return null;
     }
@@ -5061,6 +5072,15 @@ const SettlingData = struct {
         const s = (staging.appendStaged(&r.pool, &r.seg, k, at, data, 1) catch return error.OutOfMemory) orelse return null;
         return s.generation;
     }
+    pub fn overwriteStaged(self: *SettlingData, io: Io, k: staging.StagingKey, at: u64, data: []const u8) Error!?u64 {
+        const r = self.ring orelse return null;
+        const s = (staging.overwriteStaged(&r.pool, &r.seg, io, k, at, data, 1) catch |e| return switch (e) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.InputOutput => error.InputOutput,
+            error.NoSpaceLeft => error.NoSpaceLeft,
+        }) orelse return null;
+        return s.generation;
+    }
     pub fn releaseStaged(self: *SettlingData, k: staging.StagingKey, generation: ?u64) void {
         const r = self.ring orelse return;
         if (generation) |g| {
@@ -5619,7 +5639,7 @@ test "the staged append law (repro-port: fstests generic/069 `append_writer` —
     h.release(f);
 }
 
-test "a size-neutral overwrite inside a staged image commits NOTHING (§L.6 for the staged arm): the image re-staged under the resident identity, the stamp parked (fold-visible: mtime moves, the size stands), zero transactions — red before: one commit per rewrite publishing the layout record already stored, the 1.1 k/s staged arm's second half; a write that grows the file, a straddling one and a KILLPRIV one keep their transaction" {
+test "a size-neutral overwrite inside a staged image commits NOTHING (§L.6 for the staged arm) and, inside one grain of an unsynced record, lands IN PLACE (no re-stage, no image moved): the stamp parked (fold-visible: mtime moves, the size stands), zero transactions — red before: one commit per rewrite publishing the layout record already stored, the 1.1 k/s staged arm's second half; a write that grows the file, a straddling one and a KILLPRIV one keep their transaction" {
     const H = HarnessOf(SettlingData);
     var h: H = undefined;
     try h.init();
@@ -5630,6 +5650,8 @@ test "a size-neutral overwrite inside a staged image commits NOTHING (§L.6 for 
     h.data.ring = try SettlingData.RamRing.init(64 << 20, 32 << 20);
     defer h.data.ring.?.deinit();
     const parked0 = fuse_write_staged_parked.load();
+    const inplace0 = staging.stats.staging_inplace_overwrites.load();
+    const restages0 = staging.stats.staging_restages.load();
     const f = try h.create(1, "small", 0o644);
     const lf = try H.Fs.localOf(f);
     var image: [16384]u8 = @splat('A');
@@ -5640,6 +5662,8 @@ test "a size-neutral overwrite inside a staged image commits NOTHING (§L.6 for 
     for (0..4) |i| try testing.expectEqual(@as(?linux.E, null), h.write(f, @intCast(4096 * i), &patch, 0).errno());
     try testing.expectEqual(commits0, h.store.commits);
     try testing.expectEqual(parked0 + 4, fuse_write_staged_parked.load());
+    try testing.expectEqual(inplace0 + 4, staging.stats.staging_inplace_overwrites.load());
+    try testing.expectEqual(restages0, staging.stats.staging_restages.load());
     try testing.expect(h.fs.pending.parked(lf) != null);
     try testing.expectEqual(@as(u64, image.len), (try h.getattr(f)).size);
     @memset(&image, 'B');

@@ -1755,6 +1755,21 @@ pub const DataPlane = struct {
         return s.generation;
     }
 
+    /// The staged arm's fast-path view of `ino` (the read view: no KV
+    /// lookup when it holds the ino current): its identity and the size
+    /// readers see (the parked claim folded); null = not a staged file, or
+    /// a foreign slot. A staged layout belongs to a regular file by
+    /// construction.
+    pub const StagedPoint = struct { size: u64, file_id: layout.FileId };
+
+    pub fn stagedPoint(self: *DataPlane, ino: u64) Error!?StagedPoint {
+        if (self.stage == null) return null;
+        const r = (try self.resolveAt(ino, null)) orelse return null;
+        const p = r.point orelse return null;
+        if (p.kind != .staged) return null;
+        return .{ .size = self.claimedSize(ino, r.size orelse return null), .file_id = p.file_id };
+    }
+
     /// The in-place overwrite inside one grain of the resident record
     /// (`staging.overwriteStaged`): the new generation, or null when the
     /// caller must re-stage (no ring, no resident copy, a synced record, a

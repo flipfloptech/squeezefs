@@ -235,6 +235,11 @@ pub var fuse_parent_times_parked: counters.ShardedCounter = .{};
 /// are the ring's, durable at the ino's fsync. The arm's steady state
 /// (every rewrite of a small file) costs the ring put alone.
 pub var fuse_write_staged_parked: counters.ShardedCounter = .{};
+/// `fuse_write_staged_fast`: the parked staged overwrites that took the
+/// fast path — identity and size off the read view, the grain in place —
+/// with no layout or inode record read (two KV lookups and a decode per
+/// write otherwise).
+pub var fuse_write_staged_fast: counters.ShardedCounter = .{};
 /// `fuse_write_times_drain_failed_ticks`: drain cadence ticks met on a
 /// FAILED store (the fail-stop latch): every commit refuses until remount,
 /// so the tick drains nothing and the parked refinements stay fold-visible
@@ -348,7 +353,7 @@ pub fn assertStore(comptime T: type) void {
 /// the product; `NoData` is the volume-less set).
 pub fn assertData(comptime T: type) void {
     comptime {
-        for ([_][]const u8{ "hasVolumes", "stagingOn", "blockSize", "inlineMax", "geometry", "refsSeam", "noteShape", "forgetShape", "noteSizeSet", "sizeSetSince", "isPassthrough", "canStoreHeld", "write", "zeroExtension", "custodyFloor", "barrierData", "read", "ownBlock", "abandonOwnBlock", "ownBlockPublished", "holdReleases", "dropReleases", "freeBindings", "flushCustody", "releaseIno", "hasWriteCustody", "fsync", "statfs", "mintFileId", "stageImage", "appendStaged", "overwriteStaged", "releaseStaged", "stagedLease", "readMappingImage", "lockLayout", "stageKvmapShrink", "stageKvmapCorpse", "drainKvmapSweep", "publishForeign" }) |name| {
+        for ([_][]const u8{ "hasVolumes", "stagingOn", "blockSize", "inlineMax", "geometry", "refsSeam", "noteShape", "forgetShape", "noteSizeSet", "sizeSetSince", "isPassthrough", "canStoreHeld", "write", "zeroExtension", "custodyFloor", "barrierData", "read", "ownBlock", "abandonOwnBlock", "ownBlockPublished", "holdReleases", "dropReleases", "freeBindings", "flushCustody", "releaseIno", "hasWriteCustody", "fsync", "statfs", "mintFileId", "stageImage", "appendStaged", "overwriteStaged", "stagedPoint", "releaseStaged", "stagedLease", "readMappingImage", "lockLayout", "stageKvmapShrink", "stageKvmapCorpse", "drainKvmapSweep", "publishForeign" }) |name| {
             if (!@hasDecl(T, name)) @compileError(@typeName(T) ++ " is not a kv_fs Data face: lacks `" ++ name ++ "`");
         }
     }
@@ -2864,6 +2869,32 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             // (3.7) themselves inside their (3.5).
             var layout_lock: ?Data.LayoutGuard = self.data.lockLayout(self.io, local);
             errdefer if (layout_lock) |g| g.release(self.io);
+            // The staged arm's fast path (its steady state: a 4 KiB rewrite
+            // inside a small file's image): the identity and size off the
+            // read view, the grain into the resident record in place, the
+            // stamp parked — no record read, no record written. Anything it
+            // declines (a growing or straddling write, a synced record, a
+            // KILLPRIV write, a foreign slot, a missing resident) takes the
+            // arms below with the record in hand.
+            if (self.data.hasVolumes() and self.data.stagingOn() and self.times_park and a.write_flags & abi.FUSE_WRITE_KILL_SUIDGID == 0 and !self.foreignSlot(a.ino)) {
+                if (try self.data.stagedPoint(local)) |sp| if (end <= sp.size) {
+                    const data = try self.payloadBytes(a);
+                    if (try self.data.overwriteStaged(self.io, staging.StagingKey.init(sp.file_id, local), a.offset, data)) |_| {
+                        {
+                            var g = self.locks.lockManyUncancelable(self.io, &.{.{ .ino = local, .mode = .shared }}, &.{}) catch unreachable; // one request fits every plan
+                            defer g.release(self.io);
+                            try self.parkWriteTimes(local, 0);
+                        }
+                        self.dropLayoutLock(&layout_lock);
+                        self.data.noteShape(local, sp.size, .staged);
+                        fuse_write_staged.inc();
+                        fuse_write_staged_parked.inc();
+                        fuse_write_staged_fast.inc();
+                        write_admit.noteInlineWrite(data.len);
+                        return .{ .size = @intCast(data.len) };
+                    }
+                };
+            }
             // A striped file's write needs its layout's kind alone (the
             // plane resolves the blocks): no copy of the record.
             const striped = self.data.hasVolumes() and ((try self.layoutKindView(local)) orelse .inline_) == .striped;
@@ -4149,6 +4180,10 @@ pub const NoData = struct {
     pub fn overwriteStaged(_: *NoData, _: Io, _: staging.StagingKey, _: u64, _: []const u8) Error!?u64 {
         return null;
     }
+    pub const StagedPoint = struct { size: u64, file_id: layout.FileId };
+    pub fn stagedPoint(_: *NoData, _: u64) Error!?StagedPoint {
+        return null;
+    }
     pub fn appendStaged(_: *NoData, _: staging.StagingKey, _: u64, _: []const u8) Error!?u64 {
         return null;
     }
@@ -5072,6 +5107,22 @@ const SettlingData = struct {
         const s = (staging.appendStaged(&r.pool, &r.seg, k, at, data, 1) catch return error.OutOfMemory) orelse return null;
         return s.generation;
     }
+    /// The fast path's view, off the store's records (the plane's read
+    /// view stands in for both lookups there).
+    pub fn stagedPoint(self: *SettlingData, ino: u64) Error!?NoData.StagedPoint {
+        if (!self.staging or self.ring == null) return null;
+        const store = self.store orelse return null;
+        const xk = key.xattrKey(ino, key.xattrNameHash56(LAYOUT_XATTR, store.nameKey()), 0);
+        const bytes = (store.lookup(testing.allocator, key.TREE_XATTRS, &xk) catch return error.InputOutput) orelse return null;
+        defer testing.allocator.free(bytes);
+        const xv = record.XattrValue.decode(bytes) catch return error.InputOutput;
+        const l = Layout.decode(xv.value, .default) catch return error.InputOutput;
+        if (l.kind != .staged) return null;
+        const iv = (store.lookup(testing.allocator, key.TREE_INODES, &key.inodeKey(ino)) catch return error.InputOutput) orelse return null;
+        defer testing.allocator.free(iv);
+        const v = InodeValue.decode(iv) catch return error.InputOutput;
+        return .{ .size = v.size, .file_id = l.file_id };
+    }
     pub fn overwriteStaged(self: *SettlingData, io: Io, k: staging.StagingKey, at: u64, data: []const u8) Error!?u64 {
         const r = self.ring orelse return null;
         const s = (staging.overwriteStaged(&r.pool, &r.seg, io, k, at, data, 1) catch |e| return switch (e) {
@@ -5652,6 +5703,7 @@ test "a size-neutral overwrite inside a staged image commits NOTHING (§L.6 for 
     const parked0 = fuse_write_staged_parked.load();
     const inplace0 = staging.stats.staging_inplace_overwrites.load();
     const restages0 = staging.stats.staging_restages.load();
+    const fast0 = fuse_write_staged_fast.load();
     const f = try h.create(1, "small", 0o644);
     const lf = try H.Fs.localOf(f);
     var image: [16384]u8 = @splat('A');
@@ -5664,6 +5716,7 @@ test "a size-neutral overwrite inside a staged image commits NOTHING (§L.6 for 
     try testing.expectEqual(parked0 + 4, fuse_write_staged_parked.load());
     try testing.expectEqual(inplace0 + 4, staging.stats.staging_inplace_overwrites.load());
     try testing.expectEqual(restages0, staging.stats.staging_restages.load());
+    try testing.expectEqual(fast0 + 4, fuse_write_staged_fast.load());
     try testing.expect(h.fs.pending.parked(lf) != null);
     try testing.expectEqual(@as(u64, image.len), (try h.getattr(f)).size);
     @memset(&image, 'B');

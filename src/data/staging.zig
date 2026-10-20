@@ -579,6 +579,11 @@ const Cell = struct {
     /// The segment's index sequence at this cell's index flip: a sync that
     /// started after it covers the bytes written before it.
     indexed_seq: u64 = 0,
+    /// A sync covered this record (the key's fsync, a syncAll begun after
+    /// its index flip, or it was recovered off the file): what the
+    /// supersession and departure deferrals protect. An unsynced copy is
+    /// released the moment it is superseded or departs.
+    synced: bool = false,
     /// The retired list (under the segment lock).
     prev_retired: ?*Cell = null,
     next_retired: ?*Cell = null,
@@ -618,13 +623,19 @@ pub const Segment = struct {
     backing: Backing,
     lock: jc.SpinLock = .{},
     index: std.AutoHashMapUnmanaged([KEY_LEN]u8, *Cell) = .empty,
-    pending: std.ArrayList(Extent) = .empty,
     /// The placement cursor: records go at/after it, wrapping.
     write_offset: u64 = 0,
     cells: []Cell,
     free_cells: std.ArrayList(u32) = .empty,
-    /// Placement scratch (live extents, sorted) — sized once.
-    scratch: []Extent,
+    /// The live set at the grain: bit `g` set = grain `g` belongs to an
+    /// indexed record, a placement in flight or a retired copy not yet
+    /// reclaimed (a shadowed cell shares its successor's grains). Placement
+    /// is a first-fit scan of clear runs from the cursor, wrapping — O(need)
+    /// where the cursor leads free space, one pass over the words on a full
+    /// ring — never a sort of the live extents: that scan (O(n log n) + an
+    /// O(n²) fit check under the lock, per put) serialized every staged
+    /// write of a mount at ≈ 1 k/s once the held copies grew the set.
+    occupied: []u64,
     /// The fsync law's batcher over `backing.durable` (module doc).
     durable: SyncCoalescer = .{},
     /// Retired cells not yet reclaimed (`Cell` doc), under the lock.
@@ -666,19 +677,24 @@ pub const Segment = struct {
         return std.math.ceilPowerOfTwo(u64, @as(u64, n) * percent / std.hash_map.default_max_load_percentage + 1) catch unreachable;
     }
 
+    /// The grain bitmap's words at `cap`: one bit per grain.
+    pub fn occupiedWords(cap: u64) usize {
+        return @intCast((cap / RECORD_ALIGN + 63) / 64);
+    }
+
     /// The RAM the fixed per-cell tables take at `cap`: `n = maxCells(cap)`
-    /// cells, `n` free-list and pending slots, `n + 1` scratch extents and
-    /// the key index's slot arrays (its 3-word header is not counted).
-    /// Every table is sized ONCE at `init` and lives with the segment.
+    /// cells, `n` free-list slots, the grain bitmap and the key index's slot
+    /// arrays (its 3-word header is not counted). Every table is sized ONCE
+    /// at `init` and lives with the segment.
     pub fn tablesBound(cap: u64) u64 {
         const n: u64 = maxCells(cap);
-        return n * @sizeOf(Cell) + n * @sizeOf(u32) + n * @sizeOf(Extent) + (n + 1) * @sizeOf(Extent) + indexSlots(@intCast(n)) * INDEX_SLOT_BYTES;
+        return n * @sizeOf(Cell) + n * @sizeOf(u32) + @as(u64, occupiedWords(cap)) * @sizeOf(u64) + indexSlots(@intCast(n)) * INDEX_SLOT_BYTES;
     }
 
     /// What this segment's tables take — the same terms read off the live
     /// tables (`tablesBound(capacity)` by construction; the tie test says so).
     pub fn tablesBytes(self: *const Segment) u64 {
-        return @as(u64, self.cells.len) * @sizeOf(Cell) + @as(u64, self.free_cells.capacity) * @sizeOf(u32) + @as(u64, self.pending.capacity) * @sizeOf(Extent) + @as(u64, self.scratch.len) * @sizeOf(Extent) + @as(u64, self.index.capacity()) * INDEX_SLOT_BYTES;
+        return @as(u64, self.cells.len) * @sizeOf(Cell) + @as(u64, self.free_cells.capacity) * @sizeOf(u32) + @as(u64, self.occupied.len) * @sizeOf(u64) + @as(u64, self.index.capacity()) * INDEX_SLOT_BYTES;
     }
 
     /// A cell's value-hash state, gauged at birth; `destroyState` undoes it.
@@ -703,14 +719,12 @@ pub const Segment = struct {
         errdefer free.deinit(gpa);
         var i: u32 = @intCast(n);
         while (i > 0) : (i -= 1) free.appendAssumeCapacity(i - 1);
-        const scratch = try gpa.alloc(Extent, n + 1);
-        errdefer gpa.free(scratch);
-        var self: Segment = .{ .gpa = gpa, .image = image, .backing = backing, .cells = cells, .free_cells = free, .scratch = scratch };
+        const occupied = try gpa.alloc(u64, occupiedWords(image.len));
+        errdefer gpa.free(occupied);
+        @memset(occupied, 0);
+        var self: Segment = .{ .gpa = gpa, .image = image, .backing = backing, .cells = cells, .free_cells = free, .occupied = occupied };
         errdefer self.index.deinit(gpa);
         try self.index.ensureTotalCapacity(gpa, @intCast(n));
-        errdefer self.pending.deinit(gpa);
-        // Precise: the pending list is one of the gauged fixed tables.
-        try self.pending.ensureTotalCapacityPrecise(gpa, n);
         stats.staging_tables_bytes.add(self.tablesBytes());
         return self;
     }
@@ -738,10 +752,9 @@ pub const Segment = struct {
         }
         for (self.cells) |*c| if (c.hash) |h| self.destroyState(h);
         self.index.deinit(self.gpa);
-        self.pending.deinit(self.gpa);
         self.free_cells.deinit(self.gpa);
         self.gpa.free(self.cells);
-        self.gpa.free(self.scratch);
+        self.gpa.free(self.occupied);
         self.* = undefined;
     }
 
@@ -817,7 +830,7 @@ pub const Segment = struct {
     pub fn syncResident(self: *Segment, io: Io, key: StagingKey) DurableError!void {
         if (self.backing.durable == null) return;
         const e = self.residentExtent(key) orelse return;
-        _ = try self.durable.request(self, io, .{ .off = e.rec_off, .len = stride(e.key_len, e.val_len) });
+        _ = try self.durable.request(self, io, .{ .off = e.rec_off, .len = stride(e.key_len, e.val_len) }, key);
         self.lock.lock();
         defer self.lock.unlock();
         self.releaseSupersededLocked(key.bytes(), e.generation);
@@ -837,24 +850,58 @@ pub const Segment = struct {
     pub fn syncAll(self: *Segment, io: Io) DurableError!void {
         if (self.backing.durable == null) return;
         if (self.live() == 0) return;
-        const start_seq = try self.durable.request(self, io, .{ .off = 0, .len = self.image.len });
+        const start_seq = try self.durable.request(self, io, .{ .off = 0, .len = self.image.len }, null);
         self.lock.lock();
         defer self.lock.unlock();
         self.releaseSupersededCoveredLocked(start_seq);
     }
 
+    /// The leader's marking after a sync landed (under the segment lock,
+    /// BEFORE the batch is handed over): every copy of `key` indexed
+    /// before the sync began is synced — the resident one and its held
+    /// predecessors (a re-stage that landed meanwhile is not: its pages
+    /// may have missed the kernel's dirty walk); `null` = the whole image.
+    fn markSyncedLocked(self: *Segment, key: ?[KEY_LEN]u8, start_seq: u64) void {
+        if (key) |k| {
+            if (self.index.get(k)) |c| if (c.indexed_seq < start_seq) {
+                c.synced = true;
+            };
+            var cur = self.retired_head;
+            while (cur) |c| : (cur = c.next_retired) {
+                if (c.indexed_seq < start_seq and std.mem.eql(u8, &c.key, &k)) c.synced = true;
+            }
+            return;
+        }
+        var it = self.index.valueIterator();
+        while (it.next()) |c| if (c.*.indexed_seq < start_seq) {
+            c.*.synced = true;
+        };
+        var cur = self.retired_head;
+        while (cur) |c| : (cur = c.next_retired) if (c.indexed_seq < start_seq) {
+            c.synced = true;
+        };
+    }
+
+    /// A copy a sync IN FLIGHT will cover (indexed before it began, inside
+    /// its span): as good as synced for the deferrals — the sync's caller
+    /// is about to be told so.
+    fn coveredByRunningSync(self: *Segment, cell: *const Cell) bool {
+        return self.durable.covers(cell.extent.rec_off, cell.extent.end(), cell.indexed_seq);
+    }
+
     // ---- the two-phase replace ----
 
-    /// Phase 1 under the lock: `live` = every indexed extent (INCLUDING the
-    /// current copy of this key) ∪ the pending placements, sorted;
-    /// candidates = the aligned cursor, 0, and the end of every live extent
-    /// (first fit over the holes promotion/unlink punched); at/after the
-    /// cursor first, then wrapped. No fit ⇒ `RingFull`, loud — never
-    /// destroys a live entry. Phase 1b outside the lock: the bytes.
-    /// Phase 2 under the lock: flip the index, drop the pending entry,
-    /// retire the superseded copy. A same-key replace is ATOMIC for
-    /// readers and torn-write immune (a crash between the phases leaves two
-    /// copies; recovery dedups by generation).
+    /// Phase 1 under the lock: the first clear run of the grain bitmap that
+    /// holds the record (the live set INCLUDES the current copy of this key
+    /// and every placement in flight), at/after the cursor first, then
+    /// wrapped; its grains are taken. No fit ⇒ `RingFull`, loud — never
+    /// destroys a live entry. Phase 1b outside the lock: the bytes. Phase 2
+    /// under the lock: flip the index, retire the superseded copy — HELD
+    /// (no tombstone, no punch) iff a sync covered it, released at once
+    /// otherwise (an unsynced copy owes nothing to a cut; held, it would
+    /// grow the live set until the key's first fsync). A same-key replace
+    /// is ATOMIC for readers and torn-write immune (a crash between the
+    /// phases leaves two copies; recovery dedups by generation).
     pub fn put(self: *Segment, key: StagingKey, value: []const u8, generation: u64, fencing: u64, reserve: u64) PutError!void {
         const need = @max(reserve, stride(KEY_LEN, value.len));
         assert(derive.isAligned(need, RECORD_ALIGN));
@@ -870,29 +917,34 @@ pub const Segment = struct {
                 return error.RingFull;
             };
             const e: Extent = .{ .rec_off = rec_off, .key_len = KEY_LEN, .val_len = @intCast(value.len), .generation = generation, .reserved = need };
-            self.pending.appendAssumeCapacity(e);
+            self.markLocked(rec_off, need, true);
             self.write_offset = e.end();
             if (self.write_offset >= self.image.len) self.write_offset = 0;
             break :blk e;
         };
         stats.staged_writes_in_flight.add(1);
+        errdefer {
+            self.lock.lock();
+            self.markLocked(placed.rec_off, placed.reserved, false);
+            self.lock.unlock();
+            stats.staged_writes_in_flight.sub(1);
+        }
         const state = try self.createState();
         state.* = valueHash(value);
         writeRecord(self.image, placed.rec_off, key.bytes(), value, generation, fencing, state);
         if (self.backing.sync) |s| s(self.backing.ctx, placed.rec_off, stride(KEY_LEN, value.len));
         self.lock.lock();
         defer self.lock.unlock();
-        self.dropPendingLocked(placed.rec_off);
         const cell = self.allocCellLocked();
         cell.* = .{ .refs = .init(1), .extent = placed, .key = key.bytes().*, .hash = state, .indexed_seq = self.indexed_seq.fetchAdd(1, .release) };
         const gop = self.index.getOrPutAssumeCapacity(key.bytes().*);
         if (gop.found_existing) {
             const old = gop.value_ptr.*;
             gop.value_ptr.* = cell;
-            if (self.backing.durable != null) {
-                // The superseded copy stays whole until this one is durable
-                // (`Cell` doc): the deferral's reference, then the retire. A
-                // RAM image has no durability to wait for.
+            if (old.synced or self.coveredByRunningSync(old)) {
+                // The superseded SYNCED copy stays whole until this one is
+                // durable (`Cell` doc): the deferral's reference, then the
+                // retire.
                 old.hold = .superseded;
                 old.hold_seq = generation;
                 _ = old.refs.fetchAdd(1, .monotonic);
@@ -963,7 +1015,10 @@ pub const Segment = struct {
         ne.val_len = @intCast(new_len);
         ne.generation = generation;
         ne.slot = slot;
-        cell.* = .{ .refs = .init(1), .extent = ne, .key = key.bytes().*, .hash = state, .indexed_seq = self.indexed_seq.fetchAdd(1, .release) };
+        // The record keeps the bytes a sync covered: the successor is as
+        // synced as the copy it grew (its tail is not, but the old header's
+        // slot still names the synced image whole).
+        cell.* = .{ .refs = .init(1), .extent = ne, .key = key.bytes().*, .hash = state, .indexed_seq = self.indexed_seq.fetchAdd(1, .release), .synced = old.synced };
         self.index.putAssumeCapacity(key.bytes().*, cell);
         old.shadowed = true;
         old.retired.store(true, .release);
@@ -986,7 +1041,10 @@ pub const Segment = struct {
         const cell = self.index.get(key.bytes().*) orelse return false;
         if (expect_generation) |g| if (cell.extent.generation != g) return false;
         _ = self.index.remove(key.bytes().*);
-        if (self.cover_seam == null) {
+        // Nothing to protect without a seam, or when no copy of the key was
+        // ever synced (a superseded copy is held only when synced): release
+        // at once.
+        if (self.cover_seam == null or !(cell.synced or self.coveredByRunningSync(cell) or self.supersededSyncedLocked(key.bytes()))) {
             self.retireLocked(cell, true);
             self.releaseSupersededLocked(key.bytes(), std.math.maxInt(u64));
             return true;
@@ -1007,6 +1065,14 @@ pub const Segment = struct {
             self.departLocked(c, seq);
         }
         return true;
+    }
+
+    fn supersededSyncedLocked(self: *Segment, key: *const [KEY_LEN]u8) bool {
+        var cur = self.retired_head;
+        while (cur) |c| : (cur = c.next_retired) {
+            if (c.hold == .superseded and c.synced and std.mem.eql(u8, &c.key, key)) return true;
+        }
+        return false;
     }
 
     fn departLocked(_: *Segment, cell: *Cell, seq: u64) void {
@@ -1145,7 +1211,10 @@ pub const Segment = struct {
         const e = cell.extent;
         self.unlinkRetiredLocked(cell);
         // A shadowed cell's bytes live on under its successor: free the cell alone.
-        if (!cell.shadowed) if (self.backing.reclaim) |r| r(self.backing.ctx, e.rec_off, e.end() - e.rec_off);
+        if (!cell.shadowed) {
+            if (self.backing.reclaim) |r| r(self.backing.ctx, e.rec_off, e.end() - e.rec_off);
+            self.markLocked(e.rec_off, e.end() - e.rec_off, false);
+        }
         if (cell.hash) |h| self.destroyState(h);
         cell.* = .{};
         const idx: usize = (@intFromPtr(cell) - @intFromPtr(self.cells.ptr)) / @sizeOf(Cell);
@@ -1159,73 +1228,73 @@ pub const Segment = struct {
         return &self.cells[idx];
     }
 
-    fn dropPendingLocked(self: *Segment, rec_off: u64) void {
-        for (self.pending.items, 0..) |p, i| {
-            if (p.rec_off == rec_off) {
-                _ = self.pending.swapRemove(i);
-                return;
+    /// Take or return the grains of `[off, off + len)` in the live set.
+    fn markLocked(self: *Segment, off: u64, len: u64, occupied: bool) void {
+        assert(derive.isAligned(off, RECORD_ALIGN) and derive.isAligned(len, RECORD_ALIGN));
+        var g: usize = @intCast(off / RECORD_ALIGN);
+        const end: usize = @intCast((off + len) / RECORD_ALIGN);
+        while (g < end) : (g += 1) {
+            const mask = @as(u64, 1) << @intCast(g % 64);
+            if (occupied) {
+                assert(self.occupied[g / 64] & mask == 0);
+                self.occupied[g / 64] |= mask;
+            } else {
+                assert(self.occupied[g / 64] & mask != 0);
+                self.occupied[g / 64] &= ~mask;
             }
         }
-        unreachable;
     }
 
-    fn extentLess(_: void, a: Extent, b: Extent) bool {
-        return a.rec_off < b.rec_off;
+    fn grainOccupied(self: *const Segment, g: usize) bool {
+        return self.occupied[g / 64] & (@as(u64, 1) << @intCast(g % 64)) != 0;
     }
 
-    /// First fit over the live set — the indexed extents, the pending
-    /// placements and the retired cells not yet reclaimed (a leased copy, a
-    /// superseded copy held for its successor's durability, a departed
-    /// copy held for its cover round; a shadowed cell's extent is its
-    /// successor's, already counted); null when nothing fits.
+    /// First fit over the live set — the grain bitmap — for `need` bytes:
+    /// the first clear run at/after the cursor, else the first one starting
+    /// below it (a run may straddle the cursor); null when nothing fits.
     fn findHoleLocked(self: *Segment, need: u64) ?u64 {
-        var n: usize = 0;
-        var it = self.index.valueIterator();
-        while (it.next()) |c| {
-            self.scratch[n] = c.*.extent;
-            n += 1;
-        }
-        for (self.pending.items) |p| {
-            self.scratch[n] = p;
-            n += 1;
-        }
-        var r = self.retired_head;
-        while (r) |c| : (r = c.next_retired) {
-            if (c.shadowed) continue;
-            self.scratch[n] = c.extent;
-            n += 1;
-        }
-        const live_set = self.scratch[0..n];
-        std.mem.sort(Extent, live_set, {}, extentLess);
-        const cap = self.image.len;
-        const cursor = derive.alignUp(self.write_offset, RECORD_ALIGN);
-        // Pass 1: candidates at/after the cursor; pass 2: wrapped below it.
-        // A candidate's fit is always judged against the whole ring, so a
-        // hole straddling the cursor is found from its own start.
-        if (self.tryCandidatesLocked(live_set, need, cursor, cap, cap)) |off| return off;
-        if (self.tryCandidatesLocked(live_set, need, 0, cursor, cap)) |off| return off;
+        const grains: usize = @intCast(need / RECORD_ALIGN);
+        const total: usize = @intCast(self.image.len / RECORD_ALIGN);
+        const cursor: usize = @intCast(derive.alignUp(self.write_offset, RECORD_ALIGN) / RECORD_ALIGN);
+        if (self.findRunLocked(cursor, total, grains, total)) |g| return @as(u64, g) * RECORD_ALIGN;
+        if (self.findRunLocked(0, cursor, grains, total)) |g| return @as(u64, g) * RECORD_ALIGN;
         return null;
     }
 
-    /// Candidates inside `[lo, hi)`: `lo` itself and the end of every live
-    /// extent; the first that fits `[c, c + need)` inside `[0, cap)` with no
-    /// live overlap.
-    fn tryCandidatesLocked(_: *Segment, live_set: []const Extent, need: u64, lo: u64, hi: u64, cap: u64) ?u64 {
-        if (fits(live_set, lo, need, cap)) return lo;
-        for (live_set) |e| {
-            const c = e.end();
-            if (c < lo or c >= hi) continue;
-            if (fits(live_set, c, need, cap)) return c;
+    /// The first run of `grains` clear bits that STARTS in `[lo, hi)` and
+    /// ends at or before `total`; a word of ones is skipped whole, a word of
+    /// zeros counted whole.
+    fn findRunLocked(self: *const Segment, lo: usize, hi: usize, grains: usize, total: usize) ?usize {
+        var g = lo;
+        var run: usize = 0;
+        while (g < total) {
+            // The run's start must lie below `hi`.
+            if (g - run >= hi) return null;
+            if (g % 64 == 0 and g + 64 <= total) {
+                const word = self.occupied[g / 64];
+                if (word == std.math.maxInt(u64)) {
+                    run = 0;
+                    g += 64;
+                    continue;
+                }
+                if (word == 0) {
+                    run += 64;
+                    g += 64;
+                    if (run >= grains) {
+                        const start = g - run;
+                        return if (start < hi) start else null;
+                    }
+                    continue;
+                }
+            }
+            if (self.grainOccupied(g)) run = 0 else run += 1;
+            g += 1;
+            if (run == grains) {
+                const start = g - run;
+                return if (start < hi) start else null;
+            }
         }
         return null;
-    }
-
-    fn fits(live_set: []const Extent, c: u64, need: u64, hi: u64) bool {
-        if (c + need > hi) return false;
-        for (live_set) |e| {
-            if (c < e.end() and e.rec_off < c + need) return false;
-        }
-        return true;
     }
 
     // ---- recovery ----
@@ -1248,7 +1317,7 @@ pub const Segment = struct {
     pub fn recover(self: *Segment) RecoverReport {
         self.lock.lock();
         defer self.lock.unlock();
-        assert(self.index.count() == 0 and self.pending.items.len == 0);
+        assert(self.index.count() == 0);
         var rep: RecoverReport = .{};
         var off: u64 = 0;
         var max_end: u64 = 0;
@@ -1284,7 +1353,8 @@ pub const Segment = struct {
                 // Later offset wins a tie: the scan is ascending.
                 if (h.generation >= old.extent.generation) {
                     gop.value_ptr.* = self.allocCellLocked();
-                    gop.value_ptr.*.* = .{ .refs = .init(1), .extent = e, .key = k };
+                    gop.value_ptr.*.* = .{ .refs = .init(1), .extent = e, .key = k, .synced = true };
+                    self.markLocked(e.rec_off, e.reserved, true);
                     self.retireLocked(old, true);
                 } else {
                     self.tombstone(off);
@@ -1293,7 +1363,8 @@ pub const Segment = struct {
                 rep.superseded += 1;
             } else {
                 gop.value_ptr.* = self.allocCellLocked();
-                gop.value_ptr.*.* = .{ .refs = .init(1), .extent = e, .key = k };
+                gop.value_ptr.*.* = .{ .refs = .init(1), .extent = e, .key = k, .synced = true };
+                self.markLocked(e.rec_off, e.reserved, true);
                 rep.adopted += 1;
                 rep.bytes += stride(h.key_len, h.val_len);
             }
@@ -1325,6 +1396,11 @@ pub const Segment = struct {
         }
         assert(n == out.len);
         return out;
+    }
+
+    /// Extent order by offset (the tests' no-overlap law).
+    pub fn extentLess(_: void, a: Extent, b: Extent) bool {
+        return a.rec_off < b.rec_off;
     }
 
     /// The live extents (tests: the no-overlap law).
@@ -1365,8 +1441,12 @@ pub const SyncCoalescer = struct {
     tail: ?*Waiter = null,
     lo: u64 = std.math.maxInt(u64),
     hi: u64 = 0,
-    /// A leader is between taking a batch and handing it over.
+    /// A leader is between taking a batch and handing it over; the batch
+    /// it leads (`covers`).
     running: bool = false,
+    run_lo: u64 = 0,
+    run_hi: u64 = 0,
+    run_start_seq: u64 = 0,
 
     pub const Waiter = struct {
         next: ?*Waiter = null,
@@ -1381,8 +1461,19 @@ pub const SyncCoalescer = struct {
         /// The segment's index sequence when the batch was taken: a cell
         /// indexed before it was written before the sync began.
         start_seq: u64 = 0,
+        /// The key whose record the span is (null: the whole image) — what
+        /// the leader marks synced once the sync landed.
+        key: ?[KEY_LEN]u8 = null,
         result: DurableError!void = {},
     };
+
+    /// Whether the sync in flight covers `[off, end)` for a cell indexed at
+    /// `indexed_seq` — a copy the leader is about to mark synced.
+    pub fn covers(self: *SyncCoalescer, off: u64, end: u64, indexed_seq: u64) bool {
+        self.lock.lock();
+        defer self.lock.unlock();
+        return self.running and indexed_seq < self.run_start_seq and off < self.run_hi and self.run_lo < end;
+    }
 
     /// Pending requests (tests: the deterministic park observable).
     pub fn pending(self: *SyncCoalescer) u32 {
@@ -1396,8 +1487,8 @@ pub const SyncCoalescer = struct {
 
     /// `span` durable; answers the index sequence the covering sync began
     /// at (`Waiter.start_seq`).
-    pub fn request(self: *SyncCoalescer, seg: *Segment, io: Io, span: Span) DurableError!u64 {
-        var w: Waiter = .{};
+    pub fn request(self: *SyncCoalescer, seg: *Segment, io: Io, span: Span, key: ?StagingKey) DurableError!u64 {
+        var w: Waiter = .{ .key = if (key) |k| k.bytes().* else null };
         self.lock.lock();
         if (self.tail) |t| t.next = &w else self.head = &w;
         self.tail = &w;
@@ -1430,6 +1521,9 @@ pub const SyncCoalescer = struct {
         leader.hi = self.hi;
         // acquire pairs with the index flip's release `fetchAdd`.
         leader.start_seq = seg.indexed_seq.load(.acquire);
+        self.run_lo = leader.lo;
+        self.run_hi = leader.hi;
+        self.run_start_seq = leader.start_seq;
         self.head = null;
         self.tail = null;
         self.lo = std.math.maxInt(u64);
@@ -1443,6 +1537,15 @@ pub const SyncCoalescer = struct {
         stats.staging_fsync_sync_ns.record(clock.monotonicNs() - t0);
         stats.staging_fsync_syncs.inc();
         stats.staging_fsync_bytes.add(w.hi - w.lo);
+        if (result) |_| {
+            // The copies this sync covered are synced — marked before the
+            // batch is handed over, so a re-stage sees either the running
+            // sync (`covers`) or the mark, never a gap.
+            seg.lock.lock();
+            var m = w.batch;
+            while (m) |mw| : (m = mw.next) seg.markSyncedLocked(mw.key, w.start_seq);
+            seg.lock.unlock();
+        } else |_| {}
         self.lock.lock();
         var cur = w.batch;
         while (cur) |m| {
@@ -2991,14 +3094,15 @@ test "the live cells' value-hash states are gauged (R5): N staged records carry 
     try testing.expectEqual(stats.staging_cell_state_bytes.load(), c.current());
 }
 
-test "the segment's fixed per-cell tables are gauged (R5): tablesBound(cap) = maxCells × (Cell + u32 + 2 × Extent) + Extent + indexSlots × (1 + KEY_LEN + ptr); an open segment carries exactly it in staging_tables_bytes (the live tables agree term by term, the std map's capacity law pinned), puts move nothing, deinit returns it; the component is attribution-only; the tables are ≈ 6.3 % of the ring" {
+test "the segment's fixed per-cell tables are gauged (R5): tablesBound(cap) = maxCells × (Cell + u32) + the grain bitmap + indexSlots × (1 + KEY_LEN + ptr); an open segment carries exactly it in staging_tables_bytes (the live tables agree term by term, the std map's capacity law pinned), puts move nothing, deinit returns it; the component is attribution-only; the tables are ≈ 4.4 % of the ring" {
     const gpa = testing.allocator;
-    // The tie, restated: n = cap / grain + 1 cells.
+    // The tie, restated: n = cap / grain + 1 cells, one bit per grain.
     const cap: u64 = 64 * 4096;
     const n: u64 = cap / RECORD_ALIGN + 1;
     try testing.expectEqual(n, Segment.maxCells(cap));
     try testing.expectEqual(@as(u64, 128), Segment.indexSlots(@intCast(n)));
-    try testing.expectEqual(n * @sizeOf(Cell) + n * @sizeOf(u32) + (2 * n + 1) * @sizeOf(Extent) + 128 * (1 + KEY_LEN + @sizeOf(*Cell)), Segment.tablesBound(cap));
+    try testing.expectEqual(@as(usize, 1), Segment.occupiedWords(cap));
+    try testing.expectEqual(n * @sizeOf(Cell) + n * @sizeOf(u32) + 8 + 128 * (1 + KEY_LEN + @sizeOf(*Cell)), Segment.tablesBound(cap));
     // The std map's capacity law at the boundary: 80 % load, power of two.
     try testing.expectEqual(@as(u64, 16), Segment.indexSlots(12));
     try testing.expectEqual(@as(u64, 32), Segment.indexSlots(13));
@@ -3009,7 +3113,6 @@ test "the segment's fixed per-cell tables are gauged (R5): tablesBound(cap) = ma
     try testing.expectEqual(Segment.tablesBound(cap), seg.tablesBytes());
     try testing.expectEqual(g0 + Segment.tablesBound(cap), stats.staging_tables_bytes.load());
     try testing.expectEqual(@as(u64, Segment.indexSlots(@intCast(n))), @as(u64, seg.index.capacity()));
-    try testing.expectEqual(n, @as(u64, seg.pending.capacity));
     try testing.expectEqual(n, @as(u64, seg.free_cells.capacity));
     // Puts and removes move cells between the fixed tables; the gauge is still.
     const v: [100]u8 = @splat(7);
@@ -3018,16 +3121,17 @@ test "the segment's fixed per-cell tables are gauged (R5): tablesBound(cap) = ma
     try testing.expectEqual(g0 + Segment.tablesBound(cap), stats.staging_tables_bytes.load());
     seg.deinit();
     try testing.expectEqual(g0, stats.staging_tables_bytes.load());
-    // The share of the ring: 36,047,084 B at the venue's 546 MiB ring
-    // (139,777 cells × (112 + 4 + 80) B + 262,144 index slots × 33 B; the
-    // cell grew 80 → 112 B with the retired list, the index sequence and
-    // the supersession, 2026-10-19) and 4,292,844 B at 64 MiB — 6.3 % of
-    // either, the index's power-of-two rounding the swing.
+    // The share of the ring: 24,882,356 B at the venue's 546 MiB ring
+    // (139,777 cells × (112 + 4) B + 2,184 bitmap words × 8 B + 262,144
+    // index slots × 33 B; the sorted-extent scratch and the pending list
+    // — 80 B per cell — left with the grain bitmap, 2026-10-20) and
+    // 2,984,052 B at 64 MiB — 4.3–4.4 % of either, the index's
+    // power-of-two rounding the swing.
     const venue_ring: u64 = 546 * derive.MiB;
-    try testing.expectEqual(@as(u64, 36_047_084), Segment.tablesBound(venue_ring));
-    try testing.expectEqual(@as(u64, 4_292_844), Segment.tablesBound(64 * derive.MiB));
-    try testing.expect(Segment.tablesBound(venue_ring) * 1000 / venue_ring == 62);
-    try testing.expect(Segment.tablesBound(64 * derive.MiB) * 1000 / (64 * derive.MiB) == 63);
+    try testing.expectEqual(@as(u64, 24_882_356), Segment.tablesBound(venue_ring));
+    try testing.expectEqual(@as(u64, 2_984_052), Segment.tablesBound(64 * derive.MiB));
+    try testing.expect(Segment.tablesBound(venue_ring) * 1000 / venue_ring == 43);
+    try testing.expect(Segment.tablesBound(64 * derive.MiB) * 1000 / (64 * derive.MiB) == 44);
     // The R5 component: attribution-only (the tables live with the segment), heap, not page cache.
     const c = tablesComponent();
     try testing.expectEqualStrings("staging_tables", c.name);
@@ -3179,7 +3283,7 @@ test "the fsync law (charter §1 item 10, 2026-10-19): fsync of a resident issue
     try testing.expectEqual(syncs1, stats.staging_fsync_syncs.load());
 }
 
-test "a synced copy survives an unsynced re-stage: the superseded copy keeps its magic, its cell and its slot (no tombstone, no punch, not a placement hole) until the key's next sync — a cut that takes the new copy recovers the old one whole; the key's sync releases every copy up to the generation it covered (a chain at once); a key that leaves releases its copies; syncAll releases a copy only if its successor was indexed before the sync began" {
+test "a synced copy survives an unsynced re-stage: the superseded copy keeps its magic, its cell and its slot (no tombstone, no punch, not a placement hole) until the key's next sync — a cut that takes the new copy recovers the old one whole; a copy NEVER synced is released the moment it is superseded (held, it grew the live set until the first fsync: the 1 k/s staged arm); the key's sync releases every synced copy up to the generation it covered; a key that leaves releases its copies; syncAll releases a copy only if its successor was indexed before the sync began, and a copy superseded WHILE a sync that covers it runs is held" {
     const gpa = testing.allocator;
     const io = testing.io;
     var seam: SyncSeam = .{};
@@ -3227,22 +3331,25 @@ test "a synced copy survives an unsynced re-stage: the superseded copy keeps its
         try testing.expectEqualSlices(u8, &a, l.bytes());
         try testing.expectEqual(@as(u64, 1), l.generation());
     }
-    // A second re-stage before any sync: the chain A → B → C held whole.
+    // A second re-stage before any sync: the UNSYNCED copy (generation 2)
+    // is released at once — tombstoned, punched — while the synced one
+    // stays held (red before: the chain A → B → C held whole, so a stream
+    // of overwrites with no fsync grew the live set without bound).
     try seg.put(k, &a, 4, 0, 0);
-    try testing.expectEqual(held0 + 2, stats.staging_superseded_held.load());
+    try testing.expectEqual(held0 + 1, stats.staging_superseded_held.load());
     try testing.expect(!isTombstone(image, a_ext.rec_off));
-    try testing.expect(!isTombstone(image, b_ext.rec_off));
-    // The key's sync covers generation 4: both superseded copies let go —
-    // tombstoned, punched, their cells back in the pool.
+    try testing.expect(isTombstone(image, b_ext.rec_off));
+    try testing.expectEqual(@as(usize, 1), seam.reclaims.items.len);
+    // The key's sync covers generation 4: the synced copy lets go —
+    // tombstoned, punched, its cell back in the pool.
     const free_before = seg.free_cells.items.len;
     try seg.syncResident(io, k);
     try testing.expect(isTombstone(image, a_ext.rec_off));
-    try testing.expect(isTombstone(image, b_ext.rec_off));
     try testing.expectEqual(@as(usize, 2), seam.reclaims.items.len);
-    try testing.expectEqual(free_before + 2, seg.free_cells.items.len);
+    try testing.expectEqual(free_before + 1, seg.free_cells.items.len);
     try testing.expectEqual(held0, stats.staging_superseded_held.load());
     try testing.expectEqual(hb0, stats.staging_superseded_held_bytes.load());
-    try testing.expectEqual(rel0 + 2, stats.staging_superseded_released.load());
+    try testing.expectEqual(rel0 + 1, stats.staging_superseded_released.load());
     try testing.expectEqual(@as(?*Cell, null), seg.retired_head);
     // A key that leaves (unlink, a promotion's release) releases its held
     // copies at once.
@@ -3254,11 +3361,14 @@ test "a synced copy survives an unsynced re-stage: the superseded copy keeps its
     try testing.expectEqual(@as(?*Cell, null), seg.retired_head);
     // syncAll: a copy whose successor was indexed before the sync began
     // lets go; one re-staged WHILE the sync ran stays held (its successor's
-    // pages may have missed the kernel's dirty walk).
+    // pages may have missed the kernel's dirty walk) — and so does a copy
+    // never synced before that the running sync covers (its caller is
+    // about to be told it is durable).
     const k2 = tkey(3, 33);
     try seg.put(k, &a, 6, 0, 0);
+    try seg.syncResident(io, k);
     try seg.put(k, &b, 7, 0, 0); // k: one held copy, successor indexed before the sync
-    try seg.put(k2, &a, 8, 0, 0);
+    try seg.put(k2, &a, 8, 0, 0); // k2: never synced
     try testing.expectEqual(held0 + 1, stats.staging_superseded_held.load());
     seam.hold.store(1, .release);
     const Req = struct {
@@ -3279,6 +3389,16 @@ test "a synced copy survives an unsynced re-stage: the superseded copy keeps its
     try result;
     try testing.expectEqual(held0 + 1, stats.staging_superseded_held.load()); // k's released, k2's held
     try seg.syncResident(io, k2);
+    try testing.expectEqual(held0, stats.staging_superseded_held.load());
+    // A re-stage of a never-synced key under NO sync: released at once,
+    // nothing held, the slot a hole again.
+    const k3 = tkey(4, 44);
+    try seg.put(k3, &a, 10, 0, 0);
+    const d_ext = seg.residentExtent(k3).?;
+    const reclaims_before = seam.reclaims.items.len;
+    try seg.put(k3, &b, 11, 0, 0);
+    try testing.expect(isTombstone(image, d_ext.rec_off));
+    try testing.expectEqual(reclaims_before + 1, seam.reclaims.items.len);
     try testing.expectEqual(held0, stats.staging_superseded_held.load());
 }
 
@@ -3389,6 +3509,7 @@ test "the departure law: a key that leaves the ring (a promotion's release) keep
     try seg.cover(io);
     try testing.expectEqual(@as(u32, 1), rounds.rounds);
     // A failed round releases nothing; the next one does.
+    try seg.syncResident(io, tkey(2, 22));
     try testing.expect(seg.remove(tkey(2, 22), 3));
     rounds.fail_next = true;
     try testing.expectError(error.InputOutput, seg.cover(io));
@@ -3404,6 +3525,8 @@ test "the departure law: a key that leaves the ring (a promotion's release) keep
     const k4 = tkey(4, 44);
     try seg.put(k3, &a, 4, 0, 0);
     try seg.put(k4, &b, 5, 0, 0);
+    try seg.syncResident(io, k3);
+    try seg.syncResident(io, k4);
     try testing.expect(seg.remove(k3, 4));
     rounds.hold.store(1, .release);
     const Req = struct {
@@ -3427,6 +3550,14 @@ test "the departure law: a key that leaves the ring (a promotion's release) keep
     try seg.cover(io);
     try testing.expectEqual(@as(u32, 0), seg.departedHeld());
     try testing.expectEqual(@as(?*Cell, null), seg.retired_head);
+    // A key never synced owes nothing to a cut: its removal releases at
+    // once, seam or not.
+    const k5 = tkey(5, 55);
+    try seg.put(k5, &a, 12, 0, 0);
+    const k5_ext = seg.residentExtent(k5).?;
+    try testing.expect(seg.remove(k5, 12));
+    try testing.expect(isTombstone(image, k5_ext.rec_off));
+    try testing.expectEqual(@as(u32, 0), seg.departedHeld());
     // A RAM image with no seam: the release is immediate, as before.
     var r = try ramSegment(gpa, 16 * 4096);
     defer gpa.free(r.image);

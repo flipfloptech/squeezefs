@@ -717,10 +717,10 @@ test "C4 through the staging face: an orphan custody record is quarantined then 
     const staging = @import("../../data/staging.zig");
     const Face = struct {
         gpa: Allocator,
-        residents: std.ArrayList(staging.Resident),
-        fn residentsFn(ctx: *anyopaque, g: Allocator) census.Error![]staging.Resident {
+        residents: std.ArrayList(staging.Census),
+        fn residentsFn(ctx: *anyopaque, g: Allocator) census.Error![]staging.Census {
             const self: *@This() = @ptrCast(@alignCast(ctx));
-            return g.dupe(staging.Resident, self.residents.items);
+            return g.dupe(staging.Census, self.residents.items);
         }
         fn image(ctx: *anyopaque, g: Allocator, k: staging.StagingKey) census.Error!?[]u8 {
             const self: *@This() = @ptrCast(@alignCast(ctx));

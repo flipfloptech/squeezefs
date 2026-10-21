@@ -4847,14 +4847,14 @@ const SettlingData = struct {
         seg: staging.Segment,
         pool: staging.Pool,
 
-        fn init(cap: usize, pool_bytes: u64) !*RamRing {
+        fn init(cap: usize) !*RamRing {
             const r = try testing.allocator.create(RamRing);
             errdefer testing.allocator.destroy(r);
             r.image = try testing.allocator.alloc(u8, cap);
             errdefer testing.allocator.free(r.image);
             @memset(r.image, 0);
             r.seg = try staging.Segment.init(testing.allocator, r.image, .none);
-            r.pool = staging.Pool.init(testing.allocator, pool_bytes, .none);
+            r.pool = staging.Pool.init(testing.allocator, .none);
             return r;
         }
 
@@ -5103,7 +5103,7 @@ const SettlingData = struct {
         self.staged_images += 1;
         self.staged_max = @max(self.staged_max, image.len);
         if (self.ring) |r| {
-            const s = staging.stageWrite(&r.pool, &r.seg, k, image, 1, slack) catch |e| return switch (e) {
+            const s = staging.stageWrite(&r.pool, &r.seg, null, k, image, 1, slack) catch |e| return switch (e) {
                 error.StorageFull => error.NoSpaceLeft,
                 error.OutOfMemory => error.OutOfMemory,
             };
@@ -5146,7 +5146,7 @@ const SettlingData = struct {
     pub fn releaseStaged(self: *SettlingData, k: staging.StagingKey, generation: ?u64) void {
         const r = self.ring orelse return;
         if (generation) |g| {
-            _ = staging.releaseStaged(&r.pool, &r.seg, k, g);
+            _ = staging.releaseStaged(&r.pool, &r.seg, null, k, g);
         } else if (r.seg.remove(k, null)) _ = r.pool.credit(k.file_id, null);
     }
     pub fn stagedLease(self: *SettlingData, k: staging.StagingKey) ?staging.Segment.Lease {
@@ -5649,7 +5649,7 @@ test "the staged append law (repro-port: fstests generic/069 `append_writer` —
     defer h.data.deinit();
     h.data.store = &h.store;
     h.data.staging = true;
-    h.data.ring = try SettlingData.RamRing.init(64 << 20, 32 << 20);
+    h.data.ring = try SettlingData.RamRing.init(64 << 20);
     defer h.data.ring.?.deinit();
     const appends0 = staging.stats.staging_appends.load();
     const abytes0 = staging.stats.staging_append_bytes.load();
@@ -5709,7 +5709,7 @@ test "a size-neutral overwrite inside a staged image commits NOTHING (§L.6 for 
     defer h.data.deinit();
     h.data.store = &h.store;
     h.data.staging = true;
-    h.data.ring = try SettlingData.RamRing.init(64 << 20, 32 << 20);
+    h.data.ring = try SettlingData.RamRing.init(64 << 20);
     defer h.data.ring.?.deinit();
     const parked0 = fuse_write_staged_parked.load();
     const inplace0 = staging.stats.staging_inplace_overwrites.load();
@@ -5758,7 +5758,7 @@ test "the staged arm's rebuilt image ZEROES the gap between the resident bytes a
     defer h.data.deinit();
     h.data.store = &h.store;
     h.data.staging = true;
-    h.data.ring = try SettlingData.RamRing.init(64 << 20, 32 << 20);
+    h.data.ring = try SettlingData.RamRing.init(64 << 20);
     defer h.data.ring.?.deinit();
     const f = try h.create(1, "gap", 0o644);
     const head: [100]u8 = @splat('A');

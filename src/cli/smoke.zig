@@ -7150,6 +7150,13 @@ fn dataPlanePass(rig: *Rig, cache: bool) !void {
     } else {
         try rig.awaitUsedKib(baseline + small_n * (4 << 10));
     }
+    // What the write cache's drain packed by now (the LRU eviction runs
+    // beside the row: a count read earlier is a moment's).
+    if (cache) {
+        const tail = try rig.statsTail();
+        defer gpa.free(tail);
+        packed_before_rm = numberAfter(tail, "\"layout_promoted_packed\":") orelse 0;
+    }
     // umount: the dismount promotion; the census through `status`.
     try rig.umount();
     try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
@@ -7172,10 +7179,9 @@ fn dataPlanePass(rig: *Rig, cache: bool) !void {
         defer gpa.free(text);
         const seg = text[ready_at..];
         try testing.expect(std.mem.indexOf(u8, seg, "clean unmount") != null);
-        // Every small file left the ring: by the dispatch at pressure
-        // before the rm, or by the dismount pass (the schedule is the
-        // budget's: the write cache under a 1 GiB budget holds the storm,
-        // so the pass promotes nearly all of them).
+        // Every small file left the ring: by the write cache's LRU drain
+        // before the umount, or by the dismount pass (the schedule is the
+        // budget's).
         if (cache) try testing.expect((numberAfter(seg, "dismount promotion: ") orelse 0) + packed_before_rm >= small_files_staged);
     }
     // Remount: the small files intact (packed reads), rm → the baseline,

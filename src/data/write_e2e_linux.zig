@@ -251,7 +251,7 @@ test "e2e(nvme_dev): a 4 MiB sequential write through accumulation is 1 copy + 1
     @memset(image, 0);
     var seg = try staging.Segment.init(gpa, image, .none);
     defer seg.deinit();
-    var pool = staging.Pool.init(gpa, 8 * BS, .none);
+    var pool = staging.Pool.init(gpa, .none);
     defer pool.deinit();
     var worker = try writeback.Worker.init(gpa, 4);
     defer worker.deinit();

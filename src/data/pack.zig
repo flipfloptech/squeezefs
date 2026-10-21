@@ -415,6 +415,9 @@ pub const CommitCtx = struct {
     commit: CommitSeam,
     pool: *staging.Pool,
     seg: *staging.Segment,
+    /// The write cache's core (the released resident leaves it); null in
+    /// the portable tests.
+    cache: ?*staging.WriteCache = null,
     geo: Geometry,
 };
 
@@ -750,7 +753,7 @@ pub const Packer = struct {
             self.releaseLandedSite(prepared.tenant);
             return .{ .failed = .commit };
         };
-        _ = staging.releaseStaged(c.pool, c.seg, sk, c.generation);
+        _ = staging.releaseStaged(c.pool, c.seg, c.cache, sk, c.generation);
         prepared.tenant.pack.landed();
         stats.layout_promoted_packed.inc();
         return .{ .committed = prev.durableCopy() };
@@ -1416,7 +1419,7 @@ const Fixture = struct {
         f.packer = try Packer.init(gpa, CHUNK, Policy.resolve(true, null, CHUNK), f.world.allocSeam(), f.world.dmaSeam(), f.world.readSeam(), 8);
         f.locks = try gpa.create(layout.PublishLocks);
         f.locks.* = .{};
-        f.pool = staging.Pool.init(gpa, 64 * derive.MiB, .none);
+        f.pool = staging.Pool.init(gpa, .none);
         f.image = try gpa.alloc(u8, 8 * derive.MiB);
         @memset(f.image, 0);
         f.seg = try staging.Segment.init(gpa, f.image, .none);
@@ -1442,7 +1445,7 @@ const Fixture = struct {
 
     /// Stage a file: the ring entry + the staged layout record.
     fn stage(self: *Fixture, ino: u64, seed: u8, payload: []const u8) !staging.Staged {
-        const s = try staging.stageWrite(&self.pool, &self.seg, staging.StagingKey.init(fid(seed), ino), payload, 0, .none);
+        const s = try staging.stageWrite(&self.pool, &self.seg, null, staging.StagingKey.init(fid(seed), ino), payload, 0, .none);
         try self.world.setLayout(ino, layout.Layout.staged(payload.len, fid(seed), null));
         return s;
     }

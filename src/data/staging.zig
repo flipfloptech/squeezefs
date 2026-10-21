@@ -57,6 +57,7 @@ const tick = @import("../sync/tick.zig");
 const futex = @import("../sync/futex.zig");
 const layout = @import("layout.zig");
 const explorer = @import("../model/explorer.zig");
+const cache_mod = @import("../mem/cache.zig");
 
 pub const FileId = layout.FileId;
 
@@ -82,9 +83,15 @@ pub const stats = struct {
     /// destroys a live entry; the write takes its own-block arm — the ring
     /// is a cache, never the set's capacity).
     pub var staging_ring_full_refusals: counters.ShardedCounter = .{};
-    /// `staging_pressure_kicks`: high-water crossings that enqueued a
-    /// promotion.
+    /// `staging_pressure_kicks`: high-water crossings that kicked the write
+    /// cache's drain (`evictUntil` through the promote sink).
     pub var staging_pressure_kicks: counters.ShardedCounter = .{};
+    /// The write cache's sink: `write_cache_evict_promotions` — residents
+    /// the LRU eviction promoted; `write_cache_inline_evictions_declined` —
+    /// an insert at the bound met a victim and declined to promote it under
+    /// the writer's lock (the write took its own-block arm).
+    pub var write_cache_evict_promotions: counters.ShardedCounter = .{};
+    pub var write_cache_inline_evictions_declined: counters.ShardedCounter = .{};
     /// `staging_recovery_records`: records a recovery scan adopted.
     pub var staging_recovery_records: counters.ShardedCounter = .{};
     /// `staging_recovery_torn_records`: headers whose checksum or geometry
@@ -157,7 +164,7 @@ pub const stats = struct {
 
 pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
     try w.writeAll("{");
-    inline for (.{ "current_staged_write_bytes", "staged_writes_in_flight", "staging_cell_state_bytes", "staging_tables_bytes", "staging_over_cap_refusals", "staging_ring_full_refusals", "staging_pressure_kicks", "staging_recovery_records", "staging_recovery_torn_records", "staging_generation_discards", "staging_foreign_scope_refusals", "staging_owner_live_refusals", "staged_payload_lost_reads", "dismount_promoted_files", "dismount_promoted_bytes", "dismount_promote_failures", "dismount_corpse_residents_destroyed", "dismount_unnamed_residents_destroyed", "fsync_promoted_files", "staging_dirty_free_bytes", "staging_sweep_runs", "staging_sweep_punched_bytes", "staging_inplace_overwrites", "staging_inplace_bytes", "staging_read_retries", "staging_appends", "staging_append_bytes", "staging_restages", "staging_restage_bytes" }, 0..) |name, i| {
+    inline for (.{ "current_staged_write_bytes", "staged_writes_in_flight", "staging_cell_state_bytes", "staging_tables_bytes", "staging_over_cap_refusals", "staging_ring_full_refusals", "staging_pressure_kicks", "write_cache_evict_promotions", "write_cache_inline_evictions_declined", "staging_recovery_records", "staging_recovery_torn_records", "staging_generation_discards", "staging_foreign_scope_refusals", "staging_owner_live_refusals", "staged_payload_lost_reads", "dismount_promoted_files", "dismount_promoted_bytes", "dismount_promote_failures", "dismount_corpse_residents_destroyed", "dismount_unnamed_residents_destroyed", "fsync_promoted_files", "staging_dirty_free_bytes", "staging_sweep_runs", "staging_sweep_punched_bytes", "staging_inplace_overwrites", "staging_inplace_bytes", "staging_read_retries", "staging_appends", "staging_append_bytes", "staging_restages", "staging_restage_bytes" }, 0..) |name, i| {
         if (i != 0) try w.writeByte(',');
         try w.print("\"{s}\":{d}", .{ name, @field(stats, name).load() });
     }
@@ -238,6 +245,21 @@ pub const StagingKey = extern struct {
 
     pub fn bytes(self: *const StagingKey) *const [KEY_LEN]u8 {
         return @ptrCast(self);
+    }
+
+    /// The write cache's index hash: the whole key (one entry per key).
+    pub fn hash(self: StagingKey) u64 {
+        return checksum.hash64(self.bytes());
+    }
+
+    /// The write cache's shard: the ino alone, so every key of an inode
+    /// shares a shard (`invalidateIno` takes one lock).
+    pub fn shardHash(self: StagingKey) u64 {
+        return checksum.hash64(&self.ino_le);
+    }
+
+    pub fn eql(a: StagingKey, b: StagingKey) bool {
+        return std.mem.eql(u8, a.bytes(), b.bytes());
     }
 };
 
@@ -1373,10 +1395,10 @@ pub const Segment = struct {
     /// a caller that sized by `live()` and then filled met a stage landing
     /// in between (syncfs under four fsstress writers) one entry past its
     /// buffer. The caller frees the slice.
-    pub fn residentsAlloc(self: *Segment, gpa: Allocator) Allocator.Error![]Resident {
+    pub fn residentsAlloc(self: *Segment, gpa: Allocator) Allocator.Error![]Census {
         self.lock.lock();
         defer self.lock.unlock();
-        const out = try gpa.alloc(Resident, self.index.count());
+        const out = try gpa.alloc(Census, self.index.count());
         var n: usize = 0;
         var it = self.index.valueIterator();
         while (it.next()) |c| {
@@ -1421,7 +1443,7 @@ pub const Segment = struct {
     }
 };
 
-pub const Resident = struct { key: StagingKey, cost: u64, generation: u64 };
+pub const Census = struct { key: StagingKey, cost: u64, generation: u64 };
 
 /// A byte range of the image.
 pub const Span = struct { off: u64, len: u64 };
@@ -1442,8 +1464,6 @@ pub const StageError = error{
 
 pub const Staged = struct {
     generation: u64,
-    /// The high-water fired and a promotion was enqueued.
-    kicked: bool,
 };
 
 /// The dismount pass's verdict on one resident (`PromotionHooks.dismount`).
@@ -1468,10 +1488,8 @@ pub const DismountVerdict = enum {
 /// (`data/pack.zig`'s prepare → commit); the ring never promotes inline.
 pub const PromotionHooks = struct {
     ctx: ?*anyopaque = null,
-    /// Pressure: enqueue `file_id` to the merge worker (the hot path itself
-    /// never promotes).
-    pressure: ?*const fn (ctx: ?*anyopaque, key: StagingKey) void = null,
-    /// Promote now (fsync, syncfs): true iff the entry left the ring. A
+    /// Promote now (fsync, syncfs, the write cache's eviction): true iff
+    /// the entry left the ring. A
     /// record the layout does not name stays: under a live mount an
     /// unlinked-open file's custody is still read, and the dismount pass
     /// judges what a crash left.
@@ -1487,9 +1505,6 @@ const LedgerRow = struct { cost: u64, generation: u64 };
 
 pub const Pool = struct {
     gpa: Allocator,
-    /// The write half of the ring budget (¼ of the dirs' aggregate capacity
-    /// by default — `cache/mod.rs`'s config, a set fact).
-    max_write_bytes: u64,
     hooks: PromotionHooks,
     lock: jc.SpinLock = .{},
     /// Every charge/credit goes through the ledger so the gauge can never
@@ -1503,8 +1518,8 @@ pub const Pool = struct {
     /// nothing 1 did not.
     ring_full_episode: std.atomic.Value(bool) = .init(false),
 
-    pub fn init(gpa: Allocator, max_write_bytes: u64, hooks: PromotionHooks) Pool {
-        return .{ .gpa = gpa, .max_write_bytes = max_write_bytes, .hooks = hooks };
+    pub fn init(gpa: Allocator, hooks: PromotionHooks) Pool {
+        return .{ .gpa = gpa, .hooks = hooks };
     }
 
     pub fn deinit(self: *Pool) void {
@@ -1513,21 +1528,8 @@ pub const Pool = struct {
         self.* = undefined;
     }
 
-    /// `max − max/4`: arm the drain at 75 % so the merge worker credits
-    /// space BEFORE the pool hard-fills and a writer meets `StorageFull`;
-    /// the quarter is one promotion batch's worth of headroom at the
-    /// 4 MiB/500 ms batch law.
-    pub fn highWater(self: *const Pool) u64 {
-        return self.max_write_bytes - self.max_write_bytes / 4;
-    }
-
     pub fn currentBytes(self: *const Pool) u64 {
         return self.current.load(.monotonic);
-    }
-
-    /// A re-stage charges the DELTA over its prior cost.
-    pub fn overCap(self: *const Pool, prior_cost: u64, padded: u64) bool {
-        return self.current.load(.monotonic) - prior_cost + padded > self.max_write_bytes;
     }
 
     pub fn nextGeneration(self: *Pool) u64 {
@@ -1574,26 +1576,6 @@ pub const Pool = struct {
         return row.cost;
     }
 
-    /// The R5 component: sheddable (the never-lossy mechanism is the
-    /// promotion kick), kernel-reclaimable (the bytes are page cache over
-    /// the mapping), weight = its share of the Red shed.
-    pub fn component(self: *Pool) budget.Component {
-        return budget.Component.init("staging_mmap", 0, 1, .{ .gauge = &stats.current_staged_write_bytes }, .{ .ctx = self, .call = shedToTarget }).kernelReclaimable();
-    }
-
-    /// The write cache's R5 component: the residents' bytes in the memfd
-    /// — PINNED (shmem pages are swap-only; the kernel reclaims nothing of
-    /// them), sheddable through the pressure promotion, weight = its share
-    /// of the Red shed; `max_write_bytes` is its bound.
-    pub fn writeCacheComponent(self: *Pool) budget.Component {
-        return budget.Component.init("write_cache", 0, 1, .{ .gauge = &stats.current_staged_write_bytes }, .{ .ctx = self, .call = shedToTarget });
-    }
-
-    fn shedToTarget(ctx: *anyopaque, _: u64) void {
-        const self: *Pool = @ptrCast(@alignCast(ctx));
-        if (self.hooks.pressure) |p| p(self.hooks.ctx, StagingKey.init(layout.zero_file_id, 0));
-    }
-
     /// Seed the ledger from a recovered segment at generation 0, and the
     /// generation counter PAST every generation the segment still carries:
     /// a re-stage of a recovered record must out-rank it on the next scan
@@ -1609,21 +1591,116 @@ pub const Pool = struct {
     }
 };
 
-/// §3.4 Admission: the cost is the record's ring footprint; over the cap
-/// ⇒ kick the promoter and refuse `StorageFull` (the caller's spill
-/// escalation — never a byte recorded that the pool cannot hold); place
+// ---------------------------------------------------------------------------
+// §3.4 The write cache: the ONE cache core over the ring (`mem/cache.zig`),
+// `Cache(Resident, PromoteSink)` — the recency order (a resident's touch is
+// its last write or read), the bound from `SQUEEZEFS_WRITE_CACHE_PCT`, and
+// the eviction that PROMOTES the least recently used resident to the data
+// volumes before its grains are released (owner ruling 2026-10-21: LRU,
+// the sharding the one approximation).
+// ---------------------------------------------------------------------------
+
+/// One resident as the cache core sees it: the ring key, its ino (the
+/// shard), the bytes it charges (its reserved stride) and the generation
+/// the record carries (the sink's gate: a superseded entry owes nothing).
+/// No epoch: a resident's bytes are the truth whatever landed on the inode
+/// since (the staging key's generation gate is the identity law), so the
+/// instance binds no `EpochSource`.
+pub const Resident = struct {
+    key: StagingKey,
+    ino: u64,
+    epoch: u64 = 0,
+    bytes: u32,
+    generation: u64,
+
+    pub const Key = StagingKey;
+};
+
+/// The write direction's sink: an eviction for the BOUND promotes the
+/// resident through the plane's primitive (the data volume's DMA and its
+/// flush, the layout publish) and releases it iff it left the ring —
+/// `kept` backs the pass off (a declined promotion loses no byte); an
+/// `invalidate` (the caller superseded or removed the record: a re-stage, a
+/// promotion that landed, an unlink) and `deinit` release at once. A sink
+/// run INLINE by an insert (`stageWrite` under a writer's layout lock)
+/// never promotes — a promotion takes ANOTHER ino's layout lock, and two
+/// writers evicting each other's residents would deadlock — it answers
+/// `kept`, the insert refuses, the writer takes its own-block arm and the
+/// drain task (`evictUntil` off every lock) makes the room.
+pub const PromoteSink = struct {
+    pool: *Pool,
+    hooks: PromotionHooks,
+
+    pub const runs_under_lock = false;
+
+    /// Set around `Cache.insert` by `stageWrite` (thread-local: the insert
+    /// never parks between the set and the clear).
+    threadlocal var inline_insert: bool = false;
+
+    pub fn onEvict(self: *PromoteSink, e: *const Resident, why: cache_mod.Why) cache_mod.Outcome {
+        switch (why) {
+            .invalidate, .deinit, .stale => return .released,
+            .bound => {},
+        }
+        if (inline_insert) {
+            stats.write_cache_inline_evictions_declined.inc();
+            return .kept;
+        }
+        const g = self.pool.generationOf(e.key.file_id) orelse return .released;
+        if (g != e.generation) return .released;
+        const promote = self.hooks.promote orelse return .kept;
+        if (promote(self.hooks.ctx, e.key)) {
+            stats.write_cache_evict_promotions.inc();
+            return .released;
+        }
+        return if (self.pool.generationOf(e.key.file_id) == null) .released else .kept;
+    }
+};
+
+pub const WriteCache = cache_mod.Cache(Resident, PromoteSink);
+
+/// The cache's per-shard item table: one item per possible resident at the
+/// smallest record (two grains: the header and one of value).
+pub fn writeCacheItemsPerShard(bound: u64, shards: u32) usize {
+    return @intCast(@max(bound / (2 * RECORD_ALIGN) / shards, 16));
+}
+
+/// Touch `key` in the cache (its last write or read): a shard lock, a map
+/// probe, a relink. A key the cache does not hold is a miss (the portable
+/// tests, a double) — nothing else happens.
+pub fn touch(cache: ?*WriteCache, key: StagingKey) void {
+    const c = cache orelse return;
+    _ = c.lookup(key, {}, noVisit);
+}
+
+fn noVisit(_: void, _: *const Resident) void {}
+
+/// §3.4 Admission: the cost is the record's ring footprint; the cache core
+/// admits it at the head of its shard (`insert` — a key the core holds is
+/// invalidated first: the re-stage supersedes it) or refuses `StorageFull`
+/// at the bound (the caller's own-block arm — never a byte recorded the
+/// ring cannot hold; the drain task makes room off every lock); place
 /// (two-phase, never destroying a live entry); ledger row `(cost,
-/// generation)`; past the high-water enqueue the entry to the merge worker.
-pub fn stageWrite(pool: *Pool, seg: *Segment, key: StagingKey, payload: []const u8, fencing: u64, slack: Slack) StageError!Staged {
+/// generation)`.
+pub fn stageWrite(pool: *Pool, seg: *Segment, cache: ?*WriteCache, key: StagingKey, payload: []const u8, fencing: u64, slack: Slack) StageError!Staged {
     const padded = reserveFor(KEY_LEN, payload.len, slack);
     const prior_row = pool.costOf(key.file_id);
-    const prior = prior_row orelse 0;
-    if (pool.overCap(prior, padded)) {
-        stats.staging_over_cap_refusals.inc();
-        if (pool.hooks.pressure) |p| p(pool.hooks.ctx, key);
-        return error.StorageFull;
-    }
     const generation = pool.nextGeneration();
+    if (cache) |c| {
+        if (prior_row != null) _ = c.invalidateKey(key);
+        PromoteSink.inline_insert = true;
+        defer PromoteSink.inline_insert = false;
+        switch (c.insert(.{ .key = key, .ino = key.ino(), .bytes = @intCast(padded), .generation = generation }, .{})) {
+            .inserted => {},
+            .exists, .refused => {
+                stats.staging_over_cap_refusals.inc();
+                return error.StorageFull;
+            },
+        }
+    }
+    errdefer if (cache) |c| {
+        _ = c.invalidateKey(key);
+    };
     seg.put(key, payload, generation, fencing, padded) catch |e| switch (e) {
         error.RingFull => {
             if (!pool.ring_full_episode.swap(true, .acq_rel)) log.warn("staging ring full: a {d} B record found no hole in a {d} B segment with {d} live entries — the write takes its own-block arm until the ring drains (counted staging_ring_full_refusals; never destroying a live entry)", .{ padded, seg.capacity(), seg.live() });
@@ -1639,15 +1716,7 @@ pub fn stageWrite(pool: *Pool, seg: *Segment, key: StagingKey, payload: []const 
         stats.staging_restage_bytes.add(2 * payload.len);
     }
     try pool.charge(key.file_id, padded, generation);
-    var kicked = false;
-    if (pool.currentBytes() > pool.highWater()) {
-        stats.staging_pressure_kicks.inc();
-        if (pool.hooks.pressure) |p| {
-            p(pool.hooks.ctx, key);
-            kicked = true;
-        }
-    }
-    return .{ .generation = generation, .kicked = kicked };
+    return .{ .generation = generation };
 }
 
 /// §J.2: an extending write into the resident record's slack, in place —
@@ -1667,7 +1736,7 @@ pub fn appendStaged(pool: *Pool, seg: *Segment, key: StagingKey, at: u64, data: 
     try pool.charge(key.file_id, cost, generation);
     stats.staging_appends.inc();
     stats.staging_append_bytes.add(data.len);
-    return .{ .generation = generation, .kicked = false };
+    return .{ .generation = generation };
 }
 
 /// The in-place overwrite inside one grain of the resident record (a
@@ -1684,16 +1753,17 @@ pub fn overwriteStaged(pool: *Pool, seg: *Segment, io: Io, key: StagingKey, at: 
     };
     const cost = pool.costOf(key.file_id) orelse 0;
     try pool.charge(key.file_id, cost, generation);
-    return .{ .generation = generation, .kicked = false };
+    return .{ .generation = generation };
 }
 
 /// The promotion released the ring entry (generation-gated: a re-stage that
 /// landed since keeps its copy and its charge): the key leaves the ring
 /// and the pool at once; its copies depart (`Segment.remove`) — the slot is
 /// the ring's again at the cover round. True iff released.
-pub fn releaseStaged(pool: *Pool, seg: *Segment, key: StagingKey, generation: u64) bool {
+pub fn releaseStaged(pool: *Pool, seg: *Segment, cache: ?*WriteCache, key: StagingKey, generation: u64) bool {
     if (!seg.remove(key, generation)) return false;
     _ = pool.credit(key.file_id, generation);
+    if (cache) |c| _ = c.invalidateKey(key);
     return true;
 }
 
@@ -2544,9 +2614,9 @@ test "in-place append (§J.2): the appended bytes land in the reserved slack and
     try testing.expectEqual(@as(u64, 0), third.recover().adopted);
     // The pool face: appendStaged re-stamps the ledger's generation at the
     // same cost, counts the append; a missing row is null.
-    var pool = Pool.init(gpa, 1 << 20, .none);
+    var pool = Pool.init(gpa, .none);
     defer pool.deinit();
-    const s1 = try stageWrite(&pool, &third, k, &v, 0, .append);
+    const s1 = try stageWrite(&pool, &third, null, k, &v, 0, .append);
     const cost = pool.costOf(k.file_id).?;
     const ap0 = stats.staging_appends.load();
     const ab0 = stats.staging_append_bytes.load();
@@ -2560,7 +2630,7 @@ test "in-place append (§J.2): the appended bytes land in the reserved slack and
     // A re-stage under the resident key counts 2 × the image moved.
     const rs0 = stats.staging_restages.load();
     const rb0 = stats.staging_restage_bytes.load();
-    _ = try stageWrite(&pool, &third, k, &v, 0, .none);
+    _ = try stageWrite(&pool, &third, null, k, &v, 0, .none);
     try testing.expectEqual(rs0 + 1, stats.staging_restages.load());
     try testing.expectEqual(rb0 + 2 * v.len, stats.staging_restage_bytes.load());
 }
@@ -2690,7 +2760,6 @@ test "recovery scan: the true geometry survives (every live record adopted, byte
 }
 
 const Kicks = struct {
-    pressure: u32 = 0,
     promoted: u32 = 0,
     fail_next: bool = false,
     /// The dismount judgement of these inos (by the key's ino): a corpse's
@@ -2702,12 +2771,7 @@ const Kicks = struct {
     unnamed_ino: ?u64 = null,
 
     fn hooks(self: *Kicks) PromotionHooks {
-        return .{ .ctx = self, .pressure = onPressure, .promote = onPromote, .dismount = onDismount };
-    }
-
-    fn onPressure(ctx: ?*anyopaque, _: StagingKey) void {
-        const self: *Kicks = @ptrCast(@alignCast(ctx.?));
-        self.pressure += 1;
+        return .{ .ctx = self, .promote = onPromote, .dismount = onDismount };
     }
 
     fn onPromote(ctx: ?*anyopaque, k: StagingKey) bool {
@@ -2731,12 +2795,11 @@ const Kicks = struct {
     }
 };
 
-test "pool: the ledger charges the delta on a re-stage and credits on release so the gauge never ratchets; over the cap refuses StorageFull after a kick; the 75 % high-water (max − max/4) enqueues a promotion; generations start at 1 and recovery seeds 0" {
+test "pool: the ledger charges the delta on a re-stage and credits on release so the gauge never ratchets; generations start at 1 and recovery seeds 0; a stale release is a no-op" {
     const gpa = testing.allocator;
     var kicks: Kicks = .{};
-    var pool = Pool.init(gpa, 16 * 4096, kicks.hooks());
+    var pool = Pool.init(gpa, kicks.hooks());
     defer pool.deinit();
-    try testing.expectEqual(@as(u64, 12 * 4096), pool.highWater());
     try testing.expectEqual(FIRST_GENERATION, pool.next_generation.load(.monotonic));
     var r = try ramSegment(gpa, 64 * 4096);
     defer gpa.free(r.image);
@@ -2744,52 +2807,107 @@ test "pool: the ledger charges the delta on a re-stage and credits on release so
     const k = tkey(1, 1);
     const g0 = stats.current_staged_write_bytes.load();
     const v: [100]u8 = @splat(1);
-    const s1 = try stageWrite(&pool, &r.seg, k, &v, 0, .none);
+    const s1 = try stageWrite(&pool, &r.seg, null, k, &v, 0, .none);
     try testing.expectEqual(@as(u64, 1), s1.generation);
-    try testing.expect(!s1.kicked);
     try testing.expectEqual(@as(u64, 8192), pool.currentBytes());
     try testing.expectEqual(g0 + 8192, stats.current_staged_write_bytes.load());
     // Re-stage the same file_id larger: the delta is charged, one row.
     const v2: [5000]u8 = @splat(2);
-    const s2 = try stageWrite(&pool, &r.seg, k, &v2, 0, .none);
+    const s2 = try stageWrite(&pool, &r.seg, null, k, &v2, 0, .none);
     try testing.expectEqual(@as(u64, 2), s2.generation);
     try testing.expectEqual(@as(u64, 12288), pool.currentBytes());
     try testing.expectEqual(@as(?u64, 2), pool.generationOf(k.file_id));
-    // Past the high-water: kicked.
     const big: [9 * 4096 - 10]u8 = @splat(3);
-    const s3 = try stageWrite(&pool, &r.seg, tkey(2, 2), &big, 0, .none);
-    try testing.expect(pool.currentBytes() > pool.highWater());
-    try testing.expect(s3.kicked);
-    try testing.expectEqual(@as(u32, 1), kicks.pressure);
-    // Over the cap: refused, kicked again, nothing placed, no charge.
+    _ = try stageWrite(&pool, &r.seg, null, tkey(2, 2), &big, 0, .none);
     const cur = pool.currentBytes();
-    const live_before = r.seg.live();
-    const refusals = stats.staging_over_cap_refusals.load();
-    try testing.expectError(error.StorageFull, stageWrite(&pool, &r.seg, tkey(3, 3), &big, 0, .none));
-    try testing.expectEqual(cur, pool.currentBytes());
-    try testing.expectEqual(live_before, r.seg.live());
-    try testing.expectEqual(@as(u32, 2), kicks.pressure);
-    try testing.expectEqual(refusals + 1, stats.staging_over_cap_refusals.load());
     // A stale generation release is a no-op; the live one credits and removes.
-    try testing.expect(!releaseStaged(&pool, &r.seg, k, 1));
+    try testing.expect(!releaseStaged(&pool, &r.seg, null, k, 1));
     try testing.expectEqual(cur, pool.currentBytes());
-    try testing.expect(releaseStaged(&pool, &r.seg, k, 2));
+    try testing.expect(releaseStaged(&pool, &r.seg, null, k, 2));
     try testing.expectEqual(cur - 12288, pool.currentBytes());
     try testing.expect(r.seg.get(k) == null);
     try testing.expectEqual(@as(?u64, null), pool.generationOf(k.file_id));
     // Recovery seeds the ledger at generation 0 with the exact footprints.
-    var pool2 = Pool.init(gpa, 16 * 4096, .none);
+    var pool2 = Pool.init(gpa, .none);
     defer pool2.deinit();
     try pool2.seedFromRecovery(&r.seg);
     try testing.expectEqual(@as(?u64, RECOVERED_GENERATION), pool2.generationOf(tkey(2, 2).file_id));
     try testing.expectEqual(@as(u64, 10 * 4096), pool2.currentBytes());
-    // The budget component is sheddable and kernel-reclaimable; its shed kicks the promoter.
-    const c = pool.component();
-    try testing.expectEqualStrings("staging_mmap", c.name);
-    try testing.expect(c.kernel_reclaimable);
-    try testing.expectEqual(@as(u64, 1), c.weight);
-    c.shed.?.call(c.shed.?.ctx, 0);
-    try testing.expectEqual(@as(u32, 3), kicks.pressure);
+}
+
+test "the write cache over the ONE cache core (owner ruling 2026-10-21): a stage inserts the resident at the head of its shard; a touch (a read, an in-place write) moves it to the head; the drain's eviction promotes the LEAST RECENTLY USED resident first through the sink and releases it iff it left the ring (a declined promotion keeps it and backs the pass off); an insert at the bound never promotes under the writer's lock — it declines, the stage answers StorageFull (the own-block arm) — and the drain makes the room; a re-stage supersedes its entry without a promotion; a release invalidates without one; the stats family names the instance" {
+    const gpa = testing.allocator;
+    var kicks: Kicks = .{};
+    var r = try ramSegment(gpa, 64 * 4096);
+    defer gpa.free(r.image);
+    defer r.seg.deinit();
+    kicks.seg = &r.seg;
+    var pool = Pool.init(gpa, kicks.hooks());
+    defer pool.deinit();
+    var sink: PromoteSink = .{ .pool = &pool, .hooks = kicks.hooks() };
+    // One shard: the order is exact; four records of 8 KiB fit the bound.
+    const bound: u64 = 4 * 8192;
+    const c = try WriteCache.init(gpa, &sink, bound, 1, writeCacheItemsPerShard(bound, 1), null);
+    defer c.deinit();
+    const v: [100]u8 = @splat(1);
+    for (1..5) |i| _ = try stageWrite(&pool, &r.seg, c, tkey(@intCast(i), i), &v, 0, .none);
+    try testing.expectEqual(bound, c.currentBytes());
+    try testing.expectEqual(@as(u64, 4), c.stats.fills.load());
+    // The fifth at the bound: the inline eviction declines (the writer's
+    // lock), the stage refuses; nothing promoted, nothing placed.
+    const declined0 = stats.write_cache_inline_evictions_declined.load();
+    const refusals0 = stats.staging_over_cap_refusals.load();
+    try testing.expectError(error.StorageFull, stageWrite(&pool, &r.seg, c, tkey(5, 5), &v, 0, .none));
+    try testing.expectEqual(declined0 + 1, stats.write_cache_inline_evictions_declined.load());
+    try testing.expectEqual(refusals0 + 1, stats.staging_over_cap_refusals.load());
+    try testing.expectEqual(@as(u32, 0), kicks.promoted);
+    try testing.expectEqual(@as(usize, 4), r.seg.live());
+    try testing.expect(r.seg.get(tkey(5, 5)) == null);
+    // A touch of the oldest (key 1: a read) moves it to the head; the drain
+    // to half the bound promotes keys 2 then 3 — LRU first — and releases
+    // them; 1 and 4 stay.
+    touch(c, tkey(1, 1));
+    const p = c.evictUntil(bound / 2);
+    try testing.expectEqual(@as(u32, 2), p.released);
+    try testing.expectEqual(@as(u32, 0), p.kept);
+    try testing.expectEqual(@as(u32, 2), kicks.promoted);
+    try testing.expect(r.seg.get(tkey(2, 2)) == null and r.seg.get(tkey(3, 3)) == null);
+    try testing.expect(r.seg.get(tkey(1, 1)) != null and r.seg.get(tkey(4, 4)) != null);
+    try testing.expectEqual(bound / 2, c.currentBytes());
+    // A declined promotion keeps the victim and backs the pass off.
+    kicks.fail_next = true;
+    const q = c.evictUntil(0);
+    try testing.expectEqual(@as(u32, 0), q.released);
+    try testing.expectEqual(@as(u32, 1), q.kept);
+    try testing.expectEqual(@as(usize, 2), r.seg.live());
+    // A re-stage of key 4 (larger) supersedes its entry: no promotion, the
+    // new bytes charged, the segment's copy replaced.
+    const v2: [5000]u8 = @splat(2);
+    const promoted_before = kicks.promoted;
+    _ = try stageWrite(&pool, &r.seg, c, tkey(4, 4), &v2, 0, .none);
+    try testing.expectEqual(promoted_before, kicks.promoted);
+    try testing.expectEqual(@as(u64, 8192 + 12288), c.currentBytes());
+    try testing.expectEqual(@as(usize, 2), r.seg.live());
+    // A release (the promotion landed elsewhere, an unlink) invalidates
+    // the entry without a promotion.
+    try testing.expect(releaseStaged(&pool, &r.seg, c, tkey(1, 1), pool.generationOf(tkey(1, 1).file_id).?));
+    try testing.expectEqual(promoted_before, kicks.promoted);
+    try testing.expectEqual(@as(u64, 12288), c.currentBytes());
+    try testing.expect(!c.contains(tkey(1, 1)));
+    // The instance's family.
+    var buf: [2048]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try c.stats.writeJson(&w, "write_cache");
+    // Four left through the sink (two promoted at the bound, two
+    // invalidated: the re-stage and the release), two were kept (the
+    // declined inline eviction, the declined promotion), one hit (the
+    // touch), one insert refused (the bound), five fills.
+    try testing.expect(std.mem.indexOf(u8, w.buffered(), "\"write_cache_hits\":1,") != null);
+    try testing.expect(std.mem.indexOf(u8, w.buffered(), "\"write_cache_fills\":5,") != null);
+    try testing.expect(std.mem.indexOf(u8, w.buffered(), "\"write_cache_evictions\":4,") != null);
+    try testing.expect(std.mem.indexOf(u8, w.buffered(), "\"write_cache_invalidations\":2,") != null);
+    try testing.expect(std.mem.indexOf(u8, w.buffered(), "\"write_cache_sink_kept\":2,") != null);
+    try testing.expect(std.mem.indexOf(u8, w.buffered(), "\"write_cache_insert_refusals\":1,") != null);
 }
 
 test "the live cells' value-hash states are gauged (R5): N staged records carry N × @sizeOf(ValueHash) in staging_cell_state_bytes, an in-place append replaces a state for a state, a release frees it, deinit frees the rest; the bound is the cell population × the state, under one grain per record; the component is attribution-only" {
@@ -2904,7 +3022,7 @@ test "the segment's per-cell tables are gauged (R5): tablesBound(cap) = maxCells
     try testing.expectEqual(stats.staging_tables_bytes.load(), c.current());
 }
 
-test "the three promotion points: pressure rides stageWrite; the dismount pass judges every resident — promoted, kept (a resource decline stays resident, counted FAILED), a corpse's record and an unnamed one destroyed (counted apart, never FAILED) — and the ring ends with the kept one alone; fsync promotes only under the lever (default off), a failure never fails it" {
+test "the promotion points: the dismount pass judges every resident — promoted, kept (a resource decline stays resident, counted FAILED), a corpse's record and an unnamed one destroyed (counted apart, never FAILED) — and the ring ends with the kept one alone; fsync promotes only under the lever (default off), a failure never fails it" {
     const gpa = testing.allocator;
     var kicks: Kicks = .{};
     var r = try ramSegment(gpa, 64 * 4096);
@@ -3124,14 +3242,14 @@ test "the residents census under stages landing: sized and filled under ONE lock
 
 test "the reader's view: resident ⇒ the bytes; ledger-only ⇒ in flight; neither ⇒ size-consistent zeros, counted and warned" {
     const gpa = testing.allocator;
-    var pool = Pool.init(gpa, 16 * 4096, .none);
+    var pool = Pool.init(gpa, .none);
     defer pool.deinit();
     var r = try ramSegment(gpa, 64 * 4096);
     defer gpa.free(r.image);
     defer r.seg.deinit();
     const k = tkey(5, 55);
     const v: [300]u8 = @splat(9);
-    _ = try stageWrite(&pool, &r.seg, k, &v, 0, .none);
+    _ = try stageWrite(&pool, &r.seg, null, k, &v, 0, .none);
     switch (resolveStagedRead(&pool, &r.seg, k, 0, 100, 300)) {
         .resident => |l| {
             defer l.release();
@@ -3304,10 +3422,10 @@ test "linux: the write cache (charter §6.1 'Staged', 2026-10-21) — the ring i
     {
         var seg = try Segment.init(gpa, a.image(), a.backing());
         defer seg.deinit();
-        var p = Pool.init(gpa, cap, .none);
+        var p = Pool.init(gpa, .none);
         defer p.deinit();
-        for (1..4) |i| _ = try stageWrite(&p, &seg, tkey(@intCast(i), i), "a resident", 0, .none);
-        _ = try stageWrite(&p, &seg, tkey(2, 2), "re-staged", 0, .none);
+        for (1..4) |i| _ = try stageWrite(&p, &seg, null, tkey(@intCast(i), i), "a resident", 0, .none);
+        _ = try stageWrite(&p, &seg, null, tkey(2, 2), "re-staged", 0, .none);
         try testing.expectEqual(@as(?*Cell, null), seg.retired_head);
         try testing.expectEqual(@as(usize, 3), seg.live());
     }
@@ -3350,12 +3468,12 @@ test "linux: the write cache (charter §6.1 'Staged', 2026-10-21) — the ring i
         try testing.expectEqualStrings("re-staged", l.bytes());
         l.release();
         // The seed: generations 1..4 were minted; the next is 5.
-        var p = Pool.init(gpa, cap, .none);
+        var p = Pool.init(gpa, .none);
         defer p.deinit();
         try p.seedFromRecovery(&seg);
         try testing.expectEqual(@as(u64, 5), p.next_generation.load(.monotonic));
         // A re-stage of a recovered record out-ranks it.
-        _ = try stageWrite(&p, &seg, tkey(2, 2), "again", 0, .none);
+        _ = try stageWrite(&p, &seg, null, tkey(2, 2), "again", 0, .none);
         try testing.expectEqual(@as(?u64, 5), seg.residentGeneration(tkey(2, 2)));
     }
     // A clean release frees the claim: the next bind of the member is fresh.

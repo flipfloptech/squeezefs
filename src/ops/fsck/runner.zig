@@ -536,7 +536,7 @@ pub const linux = if (builtin.os.tag == .linux) struct {
             return .{ .ctx = self, .vtable = &vtable };
         }
 
-        fn residentsFn(ctx: *anyopaque, gpa: Allocator) Error![]staging.Resident {
+        fn residentsFn(ctx: *anyopaque, gpa: Allocator) Error![]staging.Census {
             const self: *StagingBind = @ptrCast(@alignCast(ctx));
             const seg = &self.plane.stage.?.seg;
             return seg.residentsAlloc(gpa);

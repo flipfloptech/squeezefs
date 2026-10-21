@@ -191,6 +191,9 @@ pub const Deps = struct {
     stripes: *layout.MetaStripes,
     pool: *staging.Pool,
     seg: *staging.Segment,
+    /// The write cache's core (the spill's admission and recency); null in
+    /// the portable tests.
+    cache: ?*staging.WriteCache = null,
     transform: accumulate.TransformSeam = .passthrough,
     scratch: []u8 = &.{},
     /// The D0 latch's custody poison (`nvme_dev` custody hooks): a fenced
@@ -271,7 +274,7 @@ pub fn flushOne(deps: Deps, io: Io, unit: *Unit) Disposition {
                         stats.writeback_orphan_discards.inc();
                         fsck_guard.deinit();
                         mint.abandon();
-                        _ = staging.releaseStaged(deps.pool, deps.seg, key, staged_gen);
+                        _ = staging.releaseStaged(deps.pool, deps.seg, deps.cache, key, staged_gen);
                         return .orphan_discarded;
                     },
                     error.WriterGuardFenced => {
@@ -301,7 +304,7 @@ pub fn flushOne(deps: Deps, io: Io, unit: *Unit) Disposition {
             stats.writeback_eof_discards.inc();
             fsck_guard.deinit();
             mint.abandon();
-            _ = staging.releaseStaged(deps.pool, deps.seg, key, staged_gen);
+            _ = staging.releaseStaged(deps.pool, deps.seg, deps.cache, key, staged_gen);
             return .eof_discarded;
         }
         // 7. Disarm, purge the recycled key, free displaced, release the
@@ -315,7 +318,7 @@ pub fn flushOne(deps: Deps, io: Io, unit: *Unit) Disposition {
             _ = deps.free.free(io, d);
         }
         displaced.dropHolds();
-        _ = staging.releaseStaged(deps.pool, deps.seg, key, staged_gen);
+        _ = staging.releaseStaged(deps.pool, deps.seg, deps.cache, key, staged_gen);
         stats.writeback_flushed.inc();
         return .flushed;
     }
@@ -368,7 +371,7 @@ pub fn spillParkedBlock(table: *accumulate.Table, deps: Deps, io: Io, worker: *W
 fn spillValid(table: *accumulate.Table, deps: Deps, io: Io, worker: *Worker, e: *accumulate.Entry, bs: u64) SpillError!void {
     const key = blockKey(e.key.ino, e.key.block);
     const fencing = deps.map.currentFencing(e.key.ino);
-    const staged = staging.stageWrite(deps.pool, deps.seg, key, e.repr.full.data[0..@intCast(bs)], fencing, .none) catch |err| switch (err) {
+    const staged = staging.stageWrite(deps.pool, deps.seg, deps.cache, key, e.repr.full.data[0..@intCast(bs)], fencing, .none) catch |err| switch (err) {
         error.StorageFull => return error.StorageFull,
         error.OutOfMemory => return error.OutOfMemory,
     };
@@ -521,7 +524,7 @@ pub fn promoteStaged(pd: PromoteDeps, io: Io, key: staging.StagingKey, size: u64
                 return .failed;
             };
             lease.release();
-            _ = staging.releaseStaged(d.pool, d.seg, key, gen);
+            _ = staging.releaseStaged(d.pool, d.seg, d.cache, key, gen);
             stats.layout_promoted_inline.inc();
             return .inline_;
         },
@@ -571,7 +574,7 @@ const WbWorld = struct {
         w.image = try gpa.alloc(u8, 64 * wt.BS);
         @memset(w.image, 0);
         w.seg = try staging.Segment.init(gpa, w.image, .none);
-        w.pool = staging.Pool.init(gpa, 32 * wt.BS, .none);
+        w.pool = staging.Pool.init(gpa, .none);
         w.worker = try Worker.init(gpa, 4);
         w.stripes = .{};
         return w;
@@ -677,10 +680,10 @@ test "never-lossy dispositions: a superseded unit is a contractual no-op (newest
     try w.f.map.create(2, .striped, 0);
     var data: [wt.BS]u8 = @splat(0x01);
     // Stage twice: the first unit's generation is superseded.
-    const g1 = try staging.stageWrite(&w.pool, &w.seg, blockKey(2, 0), &data, 1, .none);
+    const g1 = try staging.stageWrite(&w.pool, &w.seg, null, blockKey(2, 0), &data, 1, .none);
     var unit_a: Unit = .{ .ino = 2, .block = 0, .key = blockKey(2, 0), .owner_generation = g1.generation, .min_size = wt.BS, .old_binding = null };
     @memset(&data, 0x02);
-    const g2 = try staging.stageWrite(&w.pool, &w.seg, blockKey(2, 0), &data, 1, .none);
+    const g2 = try staging.stageWrite(&w.pool, &w.seg, null, blockKey(2, 0), &data, 1, .none);
     try testing.expectEqual(Disposition.superseded_noop, flushOne(w.deps(), io, &unit_a));
     var unit_b: Unit = .{ .ino = 2, .block = 0, .key = blockKey(2, 0), .owner_generation = g2.generation, .min_size = wt.BS, .old_binding = null };
     // Stale token: the first merge refuses, the unit re-presents the current generation.
@@ -692,7 +695,7 @@ test "never-lossy dispositions: a superseded unit is a contractual no-op (newest
     w.f.dev.peek(wt.VOL_A, w.f.map.seam().lookup(2, 0).?.offset, &got);
     try testing.expect(std.mem.allEqual(u8, &got, 0x02));
     // NotFound: the ino is gone — orphan discarded, ring entry released, mint returned.
-    const g3 = try staging.stageWrite(&w.pool, &w.seg, blockKey(3, 0), &data, 1, .none);
+    const g3 = try staging.stageWrite(&w.pool, &w.seg, null, blockKey(3, 0), &data, 1, .none);
     var unit_c: Unit = .{ .ino = 3, .block = 0, .key = blockKey(3, 0), .owner_generation = g3.generation, .min_size = wt.BS, .old_binding = null };
     const used = w.f.alloc_a.usedBlocks();
     try testing.expectEqual(Disposition.orphan_discarded, flushOne(w.deps(), io, &unit_c));
@@ -700,7 +703,7 @@ test "never-lossy dispositions: a superseded unit is a contractual no-op (newest
     try testing.expect(w.seg.residentGeneration(blockKey(3, 0)) == null);
     // Transient: requeue, bytes stay staged, the next pass lands.
     try w.f.map.create(4, .striped, 0);
-    const g4 = try staging.stageWrite(&w.pool, &w.seg, blockKey(4, 0), &data, 1, .none);
+    const g4 = try staging.stageWrite(&w.pool, &w.seg, null, blockKey(4, 0), &data, 1, .none);
     var unit_d: Unit = .{ .ino = 4, .block = 0, .key = blockKey(4, 0), .owner_generation = g4.generation, .min_size = wt.BS, .old_binding = null };
     w.f.map.fail_next_merge = error.Transient;
     try testing.expectEqual(Disposition.retry, flushOne(w.deps(), io, &unit_d));
@@ -708,7 +711,7 @@ test "never-lossy dispositions: a superseded unit is a contractual no-op (newest
     try testing.expectEqual(Disposition.flushed, flushOne(w.deps(), io, &unit_d));
     // Fence + poisoned custody: a verified no-op, the bytes stay staged for the remount.
     try w.f.map.create(5, .striped, 0);
-    const g5 = try staging.stageWrite(&w.pool, &w.seg, blockKey(5, 0), &data, 1, .none);
+    const g5 = try staging.stageWrite(&w.pool, &w.seg, null, blockKey(5, 0), &data, 1, .none);
     var unit_e: Unit = .{ .ino = 5, .block = 0, .key = blockKey(5, 0), .owner_generation = g5.generation, .min_size = wt.BS, .old_binding = null };
     const P = struct {
         fn poisoned() bool {
@@ -733,13 +736,13 @@ test "writeback_requeue_on_full_queue_never_goes_sticky: a full queue flushes sy
     // Fill the 4-slot queue with units for inos that exist.
     while (i < 14) : (i += 1) {
         try w.f.map.create(i, .striped, 0);
-        const g = try staging.stageWrite(&w.pool, &w.seg, blockKey(i, 0), &data, 1, .none);
+        const g = try staging.stageWrite(&w.pool, &w.seg, null, blockKey(i, 0), &data, 1, .none);
         w.worker.enqueue(io, w.deps(), .{ .ino = i, .block = 0, .key = blockKey(i, 0), .owner_generation = g.generation, .min_size = wt.BS, .old_binding = null }, .flush);
     }
     try testing.expectEqual(@as(u64, 4), w.worker.depth.load(.monotonic));
     // The fifth: the queue is full ⇒ flushed synchronously now.
     try w.f.map.create(14, .striped, 0);
-    const g = try staging.stageWrite(&w.pool, &w.seg, blockKey(14, 0), &data, 1, .none);
+    const g = try staging.stageWrite(&w.pool, &w.seg, null, blockKey(14, 0), &data, 1, .none);
     const sync0 = stats.writeback_sync_flushes_on_full_queue.load();
     w.worker.enqueue(io, w.deps(), .{ .ino = 14, .block = 0, .key = blockKey(14, 0), .owner_generation = g.generation, .min_size = wt.BS, .old_binding = null }, .flush);
     try testing.expectEqual(sync0 + 1, stats.writeback_sync_flushes_on_full_queue.load());
@@ -747,7 +750,7 @@ test "writeback_requeue_on_full_queue_never_goes_sticky: a full queue flushes sy
     try testing.expectEqual(@as(u32, 4), w.worker.drainOnce(io, w.deps()));
     // A unit whose ladder is exhausted still requeues and lands: five transients then success.
     try w.f.map.create(15, .striped, 0);
-    const g15 = try staging.stageWrite(&w.pool, &w.seg, blockKey(15, 0), &data, 1, .none);
+    const g15 = try staging.stageWrite(&w.pool, &w.seg, null, blockKey(15, 0), &data, 1, .none);
     var u: Unit = .{ .ino = 15, .block = 0, .key = blockKey(15, 0), .owner_generation = g15.generation, .min_size = wt.BS, .old_binding = null, .ladder = .{ .base_ns = 1, .cap_ns = 1, .attempts_max = 2 } };
     const ex0 = stats.writeback_retry_exhaustions.load();
     var k: u32 = 0;
@@ -780,7 +783,7 @@ test "the promotion primitive dispatches on size: fits inline ⇒ inline; a larg
     const fid: layout.FileId = .{ 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9 };
     const k = staging.StagingKey.init(fid, 20);
     var small: [100]u8 = @splat(0x5C);
-    _ = try staging.stageWrite(&w.pool, &w.seg, k, &small, 1, .none);
+    _ = try staging.stageWrite(&w.pool, &w.seg, null, k, &small, 1, .none);
     try testing.expectEqual(Promoted.inline_, promoteStaged(pd, io, k, 100));
     try testing.expectEqual(@as(u32, 1), Inl.published);
     try testing.expectEqual(@as(usize, 100), Inl.last_len);
@@ -789,7 +792,7 @@ test "the promotion primitive dispatches on size: fits inline ⇒ inline; a larg
     try w.f.map.create(21, .staged, wt.BS / 2);
     const k2 = staging.StagingKey.init(fid, 21);
     var big: [wt.BS / 2]u8 = @splat(0x6D);
-    _ = try staging.stageWrite(&w.pool, &w.seg, k2, &big, 1, .none);
+    _ = try staging.stageWrite(&w.pool, &w.seg, null, k2, &big, 1, .none);
     try testing.expectEqual(Promoted.own_block, promoteStaged(pd, io, k2, wt.BS / 2));
     try testing.expect(w.seg.residentGeneration(k2) == null);
     const b = w.f.map.seam().lookup(21, 0).?;

@@ -133,6 +133,7 @@ const read_path = @import("read_path.zig");
 const read_view = @import("read_view.zig");
 const read_size_class = @import("read_size_class.zig");
 const nvme_read_cache = @import("nvme_read_cache.zig");
+const cache_mod = @import("../mem/cache.zig");
 const sym_join = @import("../meta/sym/join.zig");
 const guard_proc = @import("../meta/guard/proc.zig");
 const purge = @import("purge.zig");
@@ -345,8 +346,19 @@ const Staging = struct {
     marker: staging.Marker,
     seg: staging.Segment,
     pool: staging.Pool,
+    /// The ONE cache core over the ring (`mem/cache.zig`,
+    /// `Cache(Resident, PromoteSink)`): the recency order, the bound, the
+    /// LRU eviction that promotes.
+    sink: staging.PromoteSink,
+    cache: *staging.WriteCache,
+    /// The bound the knob derived (the memfd holds it; the core's bound
+    /// follows the budget).
+    bound: u64,
     /// A sweep task is spawned or running (`sweepRing`): one at a time.
     sweep_armed: Atomic(bool) = .init(false),
+    /// A drain task (`evictUntil` through the promote sink) is spawned or
+    /// running: one at a time.
+    drain_armed: Atomic(bool) = .init(false),
 };
 
 /// The transformed set's state (decision 0003 §K10): the immutable
@@ -730,6 +742,8 @@ pub const DataPlane = struct {
         // Open sweeps (a shrink or an unlink the previous daemon left mid-
         // sweep) regenerate their jobs from the durable cursor.
         self.adoptSweeps();
+        // The write cache's bound settles now that a promotion can run.
+        self.settleWriteCache();
         log.info("data plane: {d} data volume(s), block {d} B, chunk {d} B, inline_max {d} B, inline map cap {d} entries, map chunk {d} ops, sweep threshold {d} blocks, transform {s}/{s}, staging {s}, direct-store face pending the session", .{ opened, cfg.block_size, cfg.chunk_size, inline_max, self.inlineMapCap(), self.kvmap_chunk, kvmap.sweepThresholdBlocks(self.kvmap_chunk), @tagName(cfg.compression), cfg.encryption.name(), if (self.stage != null) "ON" else "off" });
         return self;
     }
@@ -1052,20 +1066,83 @@ pub const DataPlane = struct {
             },
         };
         errdefer ram.release();
-        self.stage = .{ .ram = ram, .marker = ours, .seg = undefined, .pool = undefined };
+        self.stage = .{ .ram = ram, .marker = ours, .seg = undefined, .pool = undefined, .sink = undefined, .cache = undefined, .bound = undefined };
         const st = &self.stage.?;
         const r = &st.ram;
         if (r.found) |f| log.info("write cache: this member's previous incarnation (appender {d}, node {x:0>16}, pid {d}) is dead — its ring ({d} MiB) handed over by its supervisor, recovered here as the successor's", .{ f.appender_id, f.node_token, f.owner_pid, r.capacity() >> 20 });
         st.seg = staging.Segment.init(gpa, r.image(), r.backing()) catch return error.OutOfMemory;
         errdefer st.seg.deinit();
         const rep = st.seg.recover();
-        st.pool = staging.Pool.init(gpa, r.capacity(), .{ .ctx = self, .pressure = &promotionPressure, .promote = &promoteHook, .dismount = &dismountHook });
+        st.pool = staging.Pool.init(gpa, .{ .ctx = self, .promote = &promoteHook, .dismount = &dismountHook });
         st.pool.seedFromRecovery(&st.seg) catch return error.OutOfMemory;
-        budget.authority.register(st.pool.writeCacheComponent());
+        // The cache core: the knob's bound, striped by the cores; the
+        // recovered residents enter in scan order (no recency survives a
+        // death) under a bound that holds them all — the plane is not
+        // complete yet (no packer), so nothing may promote here; the bound
+        // settles to the knob's once it is (`settleWriteCache`).
+        st.bound = capacity;
+        st.sink = .{ .pool = &st.pool, .hooks = st.pool.hooks };
+        const shards = cache_mod.shardsFor(opts.facts.cpus, capacity, WRITE_CACHE_MIN_SHARD);
+        st.cache = staging.WriteCache.init(gpa, &st.sink, @max(capacity, st.pool.currentBytes()), shards, staging.writeCacheItemsPerShard(capacity, shards), null) catch return error.OutOfMemory;
+        errdefer st.cache.deinit();
+        {
+            const residents = st.seg.residentsAlloc(gpa) catch return error.OutOfMemory;
+            defer gpa.free(residents);
+            for (residents) |c| _ = st.cache.insert(.{ .key = c.key, .ino = c.key.ino(), .bytes = @intCast(c.cost), .generation = c.generation }, .{});
+        }
+        budget.authority.register(budget.Component.init("write_cache", 0, 1, .{ .gauge = &staging.stats.current_staged_write_bytes }, .{ .ctx = self, .call = &shedWriteCache }));
         budget.authority.register(staging.cellStateComponent());
         budget.authority.register(staging.tablesComponent());
-        log.info("write cache: {d} MiB in a sealed memfd (SQUEEZEFS_WRITE_CACHE_PCT of system RAM under the budget; fsync promotes), recovered {d} record(s) ({d} B), {d} torn, {d} superseded", .{ r.capacity() >> 20, rep.adopted, rep.bytes, rep.torn, rep.superseded });
+        log.info("write cache: {d} MiB in a sealed memfd (SQUEEZEFS_WRITE_CACHE_PCT of system RAM under the budget; fsync promotes; LRU over {d} shard(s)), recovered {d} record(s) ({d} B), {d} torn, {d} superseded", .{ r.capacity() >> 20, shards, rep.adopted, rep.bytes, rep.torn, rep.superseded });
     }
+
+    /// The smallest shard of the write cache: a shard must hold a few
+    /// whole-block records or the sharding's approximation of the LRU is
+    /// the whole cache — 4 × the 4 MiB block.
+    const WRITE_CACHE_MIN_SHARD: u64 = 16 * derive.MiB;
+
+    /// The write cache's bound settles to the knob's once the plane is
+    /// complete (the packer exists: the eviction may promote): recovered
+    /// residents over it leave in scan order through the drain.
+    fn settleWriteCache(self: *DataPlane) void {
+        const st = &(self.stage orelse return);
+        if (st.cache.currentBytes() > st.bound) self.armDrain();
+        st.cache.setBound(st.bound);
+    }
+
+    /// The R5 shed (Red: the authority's target) and the high-water kick:
+    /// ONE drain task runs `evictUntil` — the LRU tail promoted first,
+    /// released as it leaves — off every writer's lock (a sink under a
+    /// writer's layout lock would take another ino's: the lock law).
+    fn shedWriteCache(ctx: *anyopaque, target: u64) void {
+        const self: *DataPlane = @ptrCast(@alignCast(ctx));
+        const st = &(self.stage orelse return);
+        st.cache.setBound(@min(st.bound, @max(target, staging.RECORD_ALIGN)));
+        self.armDrain();
+    }
+
+    fn armDrain(self: *DataPlane) void {
+        const st = &(self.stage orelse return);
+        if (st.drain_armed.swap(true, .acq_rel)) return;
+        staging.stats.staging_pressure_kicks.inc();
+        self.tasks.spawn(self.io, drainTask, .{self}) catch st.drain_armed.store(false, .release);
+    }
+
+    /// The drain: evict to the LOW water (three quarters of the bound) so
+    /// a burst of stages lands without meeting the bound, in LRU order;
+    /// a kept victim ends the pass (the next kick retries).
+    fn drainTask(self: *DataPlane) Io.Cancelable!void {
+        const st = &(self.stage orelse return);
+        defer st.drain_armed.store(false, .release);
+        const bound = st.cache.stats.bound_bytes.load();
+        _ = st.cache.evictUntil(bound - bound / WRITE_CACHE_DRAIN_DIVISOR);
+    }
+
+    /// The high water that kicks the drain and the low water it drains to:
+    /// 7/8 and 3/4 of the bound — a quarter of the bound of headroom is a
+    /// burst's worth at the promotion's pace, an eighth the trigger's.
+    const WRITE_CACHE_KICK_DIVISOR: u64 = 8;
+    const WRITE_CACHE_DRAIN_DIVISOR: u64 = 4;
 
     /// The write cache's descriptors for the supervisor (the memfd and the
     /// claim: `mount` announces them beside the journal tails); null on a
@@ -1085,6 +1162,7 @@ pub const DataPlane = struct {
 
     fn closeStaging(self: *DataPlane) void {
         if (self.stage) |*st| {
+            st.cache.deinit();
             st.pool.deinit();
             st.seg.deinit();
             st.ram.release();
@@ -1660,10 +1738,16 @@ pub const DataPlane = struct {
     /// place).
     pub fn stageImage(self: *DataPlane, key_: staging.StagingKey, image: []const u8, slack: staging.Slack) Error!u64 {
         const st = &(self.stage orelse return error.NotSupported);
-        const s = staging.stageWrite(&st.pool, &st.seg, key_, image, 1, slack) catch |e| return switch (e) {
-            error.StorageFull => error.NoSpaceLeft,
-            error.OutOfMemory => error.OutOfMemory,
+        const s = staging.stageWrite(&st.pool, &st.seg, st.cache, key_, image, 1, slack) catch |e| switch (e) {
+            error.StorageFull => {
+                self.armDrain();
+                return error.NoSpaceLeft;
+            },
+            error.OutOfMemory => return error.OutOfMemory,
         };
+        // The high water: the drain evicts the LRU tail to the low water.
+        const bound = st.cache.stats.bound_bytes.load();
+        if (st.cache.currentBytes() >= bound - bound / WRITE_CACHE_KICK_DIVISOR) self.armDrain();
         // The lazy reclaim's trigger: an eighth of the ring freed and not
         // yet punched ⇒ one sweep task (`staging.Segment.sweepDirty`).
         if (staging.stats.staging_dirty_free_bytes.load() >= st.seg.capacity() / RING_SWEEP_DIVISOR and !st.sweep_armed.swap(true, .acq_rel)) {
@@ -1690,6 +1774,7 @@ pub const DataPlane = struct {
     pub fn appendStaged(self: *DataPlane, key_: staging.StagingKey, at: u64, data: []const u8) Error!?u64 {
         const st = &(self.stage orelse return null);
         const s = (staging.appendStaged(&st.pool, &st.seg, key_, at, data, 1) catch return error.OutOfMemory) orelse return null;
+        staging.touch(st.cache, key_);
         return s.generation;
     }
 
@@ -1795,6 +1880,7 @@ pub const DataPlane = struct {
     pub fn overwriteStaged(self: *DataPlane, io: Io, key_: staging.StagingKey, at: u64, data: []const u8) Error!?u64 {
         const st = &(self.stage orelse return null);
         const s = (try staging.overwriteStaged(&st.pool, &st.seg, io, key_, at, data, 1)) orelse return null;
+        staging.touch(st.cache, key_);
         return s.generation;
     }
 
@@ -1825,9 +1911,10 @@ pub const DataPlane = struct {
     pub fn releaseStaged(self: *DataPlane, key_: staging.StagingKey, generation: ?u64) void {
         const st = &(self.stage orelse return);
         if (generation) |g| {
-            _ = staging.releaseStaged(&st.pool, &st.seg, key_, g);
+            _ = staging.releaseStaged(&st.pool, &st.seg, st.cache, key_, g);
         } else if (st.seg.remove(key_, null)) {
             _ = st.pool.credit(key_.file_id, null);
+            _ = st.cache.invalidateKey(key_);
         }
     }
 
@@ -1835,7 +1922,9 @@ pub const DataPlane = struct {
     /// pins the cell until released.
     pub fn stagedLease(self: *DataPlane, key_: staging.StagingKey) ?staging.Segment.Lease {
         const st = &(self.stage orelse return null);
-        return st.seg.get(key_);
+        const l = st.seg.get(key_) orelse return null;
+        staging.touch(st.cache, key_);
+        return l;
     }
 
     /// The whole image a mapping names (a packed tenant / an own block):
@@ -1882,16 +1971,6 @@ pub const DataPlane = struct {
     }
 
     // ---- the promotion primitive (staging → inline / own block / packed) ----
-
-    fn promotionPressure(ctx: ?*anyopaque, k: staging.StagingKey) void {
-        const self: *DataPlane = @ptrCast(@alignCast(ctx.?));
-        if (k.ino() == 0) return;
-        self.tasks.spawn(self.io, promoteTask, .{ self, k }) catch {};
-    }
-
-    fn promoteTask(self: *DataPlane, k: staging.StagingKey) Io.Cancelable!void {
-        _ = self.promoteStaged(k);
-    }
 
     fn promoteHook(ctx: ?*anyopaque, k: staging.StagingKey) bool {
         const self: *DataPlane = @ptrCast(@alignCast(ctx.?));
@@ -1949,7 +2028,7 @@ pub const DataPlane = struct {
         const verdict: staging.DismountVerdict = if (out.ok) .promoted else if (corpse) .corpse else if (pass == .dismount and out.unnamed and writeback.blockOfKey(k) == null) .unnamed else .kept;
         if (verdict == .corpse or verdict == .unnamed) {
             log.debug("dismount promotion ino {d}: {s} record destroyed ({d} B)", .{ ino, @tagName(verdict), image.len });
-            _ = staging.releaseStaged(&st.pool, &st.seg, k, generation);
+            _ = staging.releaseStaged(&st.pool, &st.seg, st.cache, k, generation);
         }
         locks.release(io);
         if (out.displaced) |d| {
@@ -2058,7 +2137,7 @@ pub const DataPlane = struct {
             return false;
         };
         self.backend.commit(t) catch return false;
-        _ = staging.releaseStaged(&self.stage.?.pool, &self.stage.?.seg, k, generation);
+        _ = staging.releaseStaged(&self.stage.?.pool, &self.stage.?.seg, self.stage.?.cache, k, generation);
         pack.stats.layout_promoted_inline.inc();
         return true;
     }
@@ -2083,7 +2162,7 @@ pub const DataPlane = struct {
             return false;
         };
         self.ownBlockPublished(ob);
-        _ = staging.releaseStaged(&self.stage.?.pool, &self.stage.?.seg, k, generation);
+        _ = staging.releaseStaged(&self.stage.?.pool, &self.stage.?.seg, self.stage.?.cache, k, generation);
         pack.stats.layout_promoted_block.inc();
         return true;
     }
@@ -2123,6 +2202,7 @@ pub const DataPlane = struct {
             .commit = .{ .ctx = self, .commit = &packCommit },
             .pool = &st.pool,
             .seg = &st.seg,
+            .cache = st.cache,
             .geo = self.geo,
         }, t);
         return switch (outcome) {
@@ -4056,6 +4136,11 @@ pub const DataPlane = struct {
         try kvmap.writeStatsJson(w);
         try w.writeAll(",\"staging\":");
         try staging.writeStatsJson(w);
+        if (self.stage) |*st| {
+            try w.writeAll(",\"write_cache\":{");
+            try st.cache.stats.writeJson(w, "write_cache");
+            try w.writeAll("}");
+        }
         try w.writeAll(",\"staging_backing_phase_ns\":");
         try staging.writePhasesJson(w);
         try w.writeAll(",\"pack\":");

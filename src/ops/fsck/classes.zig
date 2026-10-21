@@ -92,7 +92,7 @@ pub const StagingFace = struct {
 
     pub const VTable = struct {
         /// Every resident custody record (owned by `gpa`).
-        residents: *const fn (*anyopaque, Allocator) Error![]staging.Resident,
+        residents: *const fn (*anyopaque, Allocator) Error![]staging.Census,
         /// The verbatim record image for the quarantine copy (owned), null = gone.
         image: *const fn (*anyopaque, Allocator, staging.StagingKey) Error!?[]u8,
         /// Retire a record at its generation; false = already gone.

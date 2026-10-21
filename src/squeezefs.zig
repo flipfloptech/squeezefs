@@ -155,6 +155,7 @@ pub const data = struct {
     pub const hot_tier = @import("data/hot_tier.zig");
     pub const read_lru = @import("data/read_lru.zig");
     pub const read_hold = @import("data/read_hold.zig");
+    pub const read_cache = @import("data/read_cache.zig");
     pub const nvme_read_cache = @import("data/nvme_read_cache.zig");
     pub const purge = @import("data/purge.zig");
     pub const single_flight_fill = @import("data/single_flight_fill.zig");
@@ -292,6 +293,7 @@ test {
     _ = data.hot_tier;
     _ = data.read_lru;
     _ = data.read_hold;
+    _ = data.read_cache;
     _ = data.nvme_read_cache;
     _ = data.purge;
     _ = data.single_flight_fill;

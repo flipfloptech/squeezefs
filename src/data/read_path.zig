@@ -74,6 +74,7 @@ const fill_pool = @import("read_fill_pool.zig");
 const hot_tier = @import("hot_tier.zig");
 const read_lru = @import("read_lru.zig");
 const read_hold = @import("read_hold.zig");
+const read_cache = @import("read_cache.zig");
 const nvme_read_cache = @import("nvme_read_cache.zig");
 const purge = @import("purge.zig");
 const single_flight = @import("single_flight_fill.zig");
@@ -530,6 +531,10 @@ pub const Config = struct {
     hot_budget: u64,
     read_mem_limit: u64,
     mem_budget: u64,
+    /// `SQUEEZEFS_READ_CACHE_PCT` resolved (`read_cache.resolveReadCacheBytes`;
+    /// 0 = the tier off). The fixture's default is off: its rows pin the
+    /// whole-block ladder and arm the grain cache by name.
+    read_cache_bytes: u64 = 0,
     admission_policy: admission.Policy,
     fill_pct: u64,
     prefetch: prefetch.Config,
@@ -552,6 +557,7 @@ pub const Config = struct {
             .hot_budget = hot,
             .read_mem_limit = read_mem,
             .mem_budget = mem_budget,
+            .read_cache_bytes = read_cache.resolveReadCacheBytes(knobs.intKnob("SQUEEZEFS_READ_CACHE_PCT", u64, env), facts, mem_budget),
             .admission_policy = admission.Policy.fromEnv(env, hot),
             .fill_pct = knobs.intKnob("SQUEEZEFS_READ_ADMISSION_FILL_PCT", u64, env),
             .prefetch = prefetch.Config.fromEnv(env, hot, block_size, mem_budget),
@@ -646,6 +652,9 @@ pub const Seams = struct {
     /// entered — the probe→enter window a whole sibling flight can fit in.
     before_flight: ?*const fn (ctx: ?*anyopaque, key: BlockKey) void = null,
     before_flight_ctx: ?*anyopaque = null,
+    /// `SQUEEZEFS_TEST_READ_CACHE_VERIFY`: every read cache serve is
+    /// re-read from the device and compared (`read_cache_stale_served`).
+    verify_grain_serves: bool = false,
 };
 
 pub const ReadPath = struct {
@@ -661,6 +670,8 @@ pub const ReadPath = struct {
     hot: *hot_tier.HotTier,
     lru: *read_lru.ReadLru,
     hold: *read_hold.Hold,
+    /// The read cache of device grains (charter §6.3; `read_cache.zig`).
+    grains: *read_cache.ReadCache,
     nvme: nvme_read_cache.Cache,
     tiers: purge.Tiers,
     flights: *single_flight.FlightTable(MAX_FLIGHTS),
@@ -734,6 +745,11 @@ pub const ReadPath = struct {
         errdefer lru.deinit();
         const hold = try read_hold.Hold.init(gpa, pool, hold_blocks);
         errdefer hold.deinit();
+        // The grain cache lives on passthrough volumes alone: a ranged
+        // window is a device window there; a transformed block's bytes
+        // are a decoded image, never a device grain.
+        const grains = try read_cache.ReadCache.init(gpa, cfg.block_size, if (cfg.passthrough) cfg.read_cache_bytes else 0, cfg.cores);
+        errdefer grains.deinit();
         const flights = try gpa.create(single_flight.FlightTable(MAX_FLIGHTS));
         errdefer gpa.destroy(flights);
         flights.* = single_flight.FlightTable(MAX_FLIGHTS).init(pool);
@@ -752,6 +768,7 @@ pub const ReadPath = struct {
             .hot = hot,
             .lru = lru,
             .hold = hold,
+            .grains = grains,
             .nvme = nvme,
             .tiers = undefined,
             .flights = flights,
@@ -759,7 +776,7 @@ pub const ReadPath = struct {
             .pipelines = .{ .pipes = undefined },
             .settle = .{},
         };
-        self.tiers = .{ .hot = hot, .lru = lru, .hold = hold, .nvme = &self.nvme };
+        self.tiers = .{ .hot = hot, .lru = lru, .hold = hold, .grains = grains, .nvme = &self.nvme };
         hot.sink = .{ .ctx = self, .on_evict = &hotVictim };
         lru.sink = .{ .ctx = self, .on_evict = &lruVictim };
         if (cfg.read_lane) hold.setBudget(read_hold.holdBudgetBytes(cfg.mem_budget, cfg.block_size, 1, 0));
@@ -772,6 +789,7 @@ pub const ReadPath = struct {
         self.hot.deinit();
         self.lru.deinit();
         self.hold.deinit();
+        self.grains.deinit();
         self.nvme.deinit();
         self.adm.deinit();
         self.gpa.destroy(self.flights);
@@ -822,6 +840,7 @@ pub const ReadPath = struct {
         mem.register(self.hot.component());
         mem.register(self.lru.component());
         mem.register(self.hold.component());
+        if (self.grains.enabled()) mem.register(self.grains.component());
         mem.register(self.pool.component());
         mem.register(self.nvme.component());
         mem.register(self.ranged_bounce.componentNamed("ranged_buf_pool", RANGED_POOL_FLOOR, 2));

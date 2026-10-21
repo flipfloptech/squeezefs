@@ -681,6 +681,8 @@ pub const DataPlane = struct {
         errdefer self.rp.deinit();
         self.rp.registerComponents(&budget.authority);
         self.rp.issuer = .{ .ctx = self, .issue = &issuePrefetch };
+        self.rp.seams.verify_grain_serves = knobs.boolKnob("SQUEEZEFS_TEST_READ_CACHE_VERIFY", opts.env);
+        if (self.rp.grains.enabled()) log.info("data plane: the read cache holds {d} MiB of device grains over {d} shard(s) (SQUEEZEFS_READ_CACHE_PCT)", .{ rcfg.read_cache_bytes >> 20, self.rp.grains.shardCount() });
 
         // 6. The write path.
         const wcfg = write_admit.Config.fromEnv(opts.env, cfg.block_size, opts.budget_bytes);
@@ -4149,6 +4151,8 @@ pub const DataPlane = struct {
         try hot_tier.writeStatsJson(w);
         try w.writeAll(",\"nvme_read_cache\":");
         try nvme_read_cache.writeStatsJson(w);
+        try w.writeAll(",\"read_cache\":");
+        try self.rp.grains.writeStatsJson(w);
         try w.writeAll(",\"prefetch\":");
         try prefetch.writeStatsJson(w);
         try w.writeAll(",\"placement\":");

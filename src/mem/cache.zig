@@ -642,6 +642,43 @@ pub fn Cache(comptime Entry: type, comptime Sink: type) type {
             return p;
         }
 
+        /// The census face: the next entry at or after `cursor` (the shard
+        /// in the cursor's high half, the item slot in its low half) that
+        /// `pick` selects, as a COPY, the cursor moved past it; null at the
+        /// end. One shard lock at a time, nothing allocated.
+        pub fn censusNext(self: *Self, cursor: *u64, ctx: anytype, comptime pick: fn (@TypeOf(ctx), *const Entry) bool) ?Entry {
+            if (!self.enabled()) return null;
+            var si: usize = @intCast(cursor.* >> 32);
+            var slot: usize = @intCast(cursor.* & std.math.maxInt(u32));
+            while (si < self.shards.len) : ({
+                si += 1;
+                slot = 0;
+            }) {
+                const s = &self.shards[si];
+                s.lock.lock();
+                defer s.lock.unlock();
+                while (slot < s.items.len) : (slot += 1) {
+                    const it = &s.items[slot];
+                    if (it.state != .free and pick(ctx, &it.entry)) {
+                        cursor.* = (@as(u64, si) << 32) | (slot + 1);
+                        return it.entry;
+                    }
+                }
+            }
+            cursor.* = @as(u64, si) << 32;
+            return null;
+        }
+
+        /// Evict the tail of `key`'s shard (one entry, through the sink);
+        /// false when the shard is empty or its tail was kept.
+        pub fn evictOne(self: *Self, key: Key) bool {
+            if (!self.enabled()) return false;
+            const s = self.shardOf(key);
+            const bytes = s.bytes.load(.monotonic);
+            if (bytes == 0) return false;
+            return self.evictShardTo(s, bytes - 1, 0).released > 0;
+        }
+
         // ---- the bound under pressure ----
 
         /// Evict tails across the shards until the entry bytes ≤ `target`

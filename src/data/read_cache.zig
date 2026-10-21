@@ -79,10 +79,11 @@ pub const stats = struct {
     /// `read_cache_grain_purges`: grains dropped through the ONE purge (a
     /// local write, a free, a token recall).
     pub var read_cache_grain_purges: counters.ShardedCounter = .{};
-    /// `read_cache_grain_stale_refusals`: serves withdrawn by the caller's
-    /// binding recheck after the copy (a loss, retried — never a stale
-    /// byte); the core's own `stale_refusals` are the epoch's.
-    pub var read_cache_grain_stale_refusals: counters.ShardedCounter = .{};
+    /// `read_cache_grain_binding_refusals`: serves withdrawn by the
+    /// caller's binding recheck after the copy (a loss, retried — never a
+    /// stale byte); the core's `read_cache_grain_stale_refusals` are the
+    /// epoch's.
+    pub var read_cache_grain_binding_refusals: counters.ShardedCounter = .{};
     /// `read_cache_grain_slab_exhausted`: a deposit found no free slot and
     /// evicted the tail first.
     pub var read_cache_grain_slab_exhausted: counters.ShardedCounter = .{};
@@ -393,9 +394,9 @@ pub const ReadCache = struct {
     pub fn writeStatsJson(self: *const ReadCache, w: *std.Io.Writer) std.Io.Writer.Error!void {
         try w.writeAll("{");
         try self.core.stats.writeJson(w, "read_cache_grain");
-        try w.print(",\"read_cache_grain_purges\":{d},\"read_cache_grain_stale_refusals\":{d},\"read_cache_grain_slab_exhausted\":{d},\"read_cache_grain_window_puts\":{d},\"read_cache_stale_served\":{d}}}", .{
+        try w.print(",\"read_cache_grain_purges\":{d},\"read_cache_grain_binding_refusals\":{d},\"read_cache_grain_slab_exhausted\":{d},\"read_cache_grain_window_puts\":{d},\"read_cache_stale_served\":{d}}}", .{
             stats.read_cache_grain_purges.load(),
-            stats.read_cache_grain_stale_refusals.load(),
+            stats.read_cache_grain_binding_refusals.load(),
             stats.read_cache_grain_slab_exhausted.load(),
             stats.read_cache_grain_window_puts.load(),
             stats.read_cache_stale_served.load(),
@@ -575,7 +576,7 @@ test "the read cache: the ranged purge drops exactly the written grains, the blo
     try rc.writeStatsJson(&w);
     const s = w.buffered();
     try testing.expect(s[0] == '{' and s[s.len - 1] == '}');
-    for ([_][]const u8{ "read_cache_grain_hits", "read_cache_grain_evictions", "read_cache_grain_stale_refusals", "read_cache_grain_purges", "read_cache_grain_window_puts", "read_cache_stale_served", "read_cache_grain_bound_bytes" }) |k| {
+    for ([_][]const u8{ "read_cache_grain_hits", "read_cache_grain_evictions", "read_cache_grain_binding_refusals", "read_cache_grain_purges", "read_cache_grain_window_puts", "read_cache_stale_served", "read_cache_grain_bound_bytes" }) |k| {
         try testing.expect(std.mem.indexOf(u8, s, k) != null);
     }
 }

@@ -1371,7 +1371,7 @@ pub const ReadPath = struct {
                     self.verifyGrainServe(key.?, rel_s, out);
                     return;
                 }
-                read_cache.stats.read_cache_grain_stale_refusals.inc();
+                read_cache.stats.read_cache_grain_binding_refusals.inc();
                 stats.stale_binding_rebinds.inc();
             }
         }

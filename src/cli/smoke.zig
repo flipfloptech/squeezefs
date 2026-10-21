@@ -1847,7 +1847,7 @@ fn matrixCreateScript(gpa: std.mem.Allocator) ![]u8 {
     return w.toOwnedSlice();
 }
 
-test "smoke: THE TWO-DAEMON MATRIX — mount A (the manager) → mount B as a SECOND PROCESS joined over TCP (no flock, the region over the wire, the page as its ledger) → `appenders`/`clients` show both → B creates 2,000 files in its own directories (0 lease conflicts, rotor mints) → A reads B's files under tokens (grants; the second read is served from the cache; a write on B recalls and A's third read is fresh) → `tar -x` on B into a directory A owns (cross-owner intents, 0 stuck, closure) → `chmod` from A on B's file (the record ship; B's stat sees it) → a 200 MiB `dd` on B (every block a ranged grant pulled from A; `df` per the rule on both; the sha round trip from A; `rm` ships the frees to A) → A writes 8 MiB into B's file (the promotion and every block-map merge SHIP as layout publishes to B, the size claim as one setattr; the sha equal on both) → closure + invariant tripwires 0 on both → umount B (page Free, the member row gone) → umount A" {
+test "smoke: THE TWO-DAEMON MATRIX — mount A (the manager) → mount B as a SECOND PROCESS joined over TCP (no flock, the region over the wire, the page as its ledger) → `appenders`/`clients` show both → B creates 2,000 files in its own directories (0 lease conflicts, rotor mints) → A reads B's files under tokens (grants; the second read is served from the cache; a write on B recalls and A's third read is fresh) → `tar -x` on B into a directory A owns (cross-owner intents, 0 stuck, closure) → `chmod` from A on B's file (the record ship; B's stat sees it) → a 200 MiB `dd` on B (every block a ranged grant pulled from A; `df` per the rule on both; the sha round trip from A; A's O_DIRECT re-read of one window is a READ CACHE grain hit and B's size-changing rewrite recalls it — A's next read is fresh, 0 stale serves under the verify seam; `rm` ships the frees to A) → A writes 8 MiB into B's file (the promotion and every block-map merge SHIP as layout publishes to B, the size claim as one setattr; the sha equal on both) → closure + invariant tripwires 0 on both → umount B (page Free, the member row gone) → umount A" {
     const io = testing.io;
     if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
     const gpa = testing.allocator;
@@ -1865,9 +1865,13 @@ test "smoke: THE TWO-DAEMON MATRIX — mount A (the manager) → mount B as a SE
     // classes.
     const a_ttls = [_][]const u8{ "SQUEEZEFS_FUSE_ATTR_TTL_MS", "SQUEEZEFS_FUSE_ENTRY_TTL_MS", "SQUEEZEFS_FUSE_DIR_ENTRY_TTL_MS", "SQUEEZEFS_FUSE_NEGATIVE_TTL_MS" };
     for (a_ttls) |k| try rig.env.put(k, "60000");
+    // A judges every read cache serve against the device (the coherence
+    // step below: `read_cache_stale_served` must stay 0).
+    try rig.env.put("SQUEEZEFS_TEST_READ_CACHE_VERIFY", "1");
     try rig.spawnMount(&.{});
     _ = try rig.awaitReady(0);
     for (a_ttls) |k| _ = rig.env.swapRemove(k);
+    _ = rig.env.swapRemove("SQUEEZEFS_TEST_READ_CACHE_VERIFY");
     // The manager's endpoint lands in tree 0 at its first checkpoint; the
     // joiner polls the projection for it (bounded) — nothing to wait for.
     const b = try Peer.init(rig, "b");
@@ -2042,6 +2046,46 @@ test "smoke: THE TWO-DAEMON MATRIX — mount A (the manager) → mount B as a SE
         // file; A sees every granted block B has not freed back.
         try testing.expectEqual(matrix_dd_blocks * matrix_block_kib, used_b);
         try testing.expectEqual((granted_blocks - b_freed) * matrix_block_kib, used_a);
+        // THE READ CACHE ACROSS THE SET (charter §6.3's coherence law): A
+        // reads the file's last 4 KiB O_DIRECT twice — the first a device
+        // read whose window the grain cache deposits, the second a grain
+        // hit (no device read) — then B shrinks the file by that window and
+        // writes it back as zeros (two size-changing commits: each recalls
+        // A's token, and A purges the layout's keys and bumps the inode's
+        // epoch BEFORE B is acked); A's third read serves B's zeros, every
+        // serve on A judged against the device by the verify seam.
+        {
+            const win_idx = matrix_dd_blocks * matrix_block_kib * 1024 / 4096 - 1;
+            var cmd_buf: [256]u8 = undefined;
+            const read_cmd = try std.fmt.bufPrint(&cmd_buf, "dd if=b-data/big bs=4096 skip={d} count=1 iflag=direct status=none | sha256sum | cut -d' ' -f1", .{win_idx});
+            const sa0 = try rig.onMount("cat .stats");
+            defer gpa.free(sa0);
+            const hits0 = numberAfter(sa0, "\"read_cache_grain_hits\":") orelse 0;
+            const first = try rig.onMount(read_cmd);
+            defer gpa.free(first);
+            const second = try rig.onMount(read_cmd);
+            defer gpa.free(second);
+            try testing.expectEqualStrings(first, second);
+            const sa1 = try rig.onMount("cat .stats");
+            defer gpa.free(sa1);
+            const hits1 = numberAfter(sa1, "\"read_cache_grain_hits\":") orelse 0;
+            try testing.expect(hits1 > hits0);
+            const recalls0 = numberAfter(tb, "\"dlm_token_recalls\":") orelse 0;
+            var w_buf: [320]u8 = undefined;
+            const write_cmd = try std.fmt.bufPrint(&w_buf, "truncate -s {d} b-data/big && dd if=/dev/zero of=b-data/big bs=4096 seek={d} count=1 conv=notrunc oflag=direct status=none && sync -d b-data/big", .{ win_idx * 4096, win_idx });
+            const w = try b.onMount(write_cmd);
+            gpa.free(w);
+            const third = try rig.onMount(read_cmd);
+            defer gpa.free(third);
+            try testing.expectEqualStrings("ad7facb2586fc6e966c004d7d1d16b024f5805ff7cb47c7a85dabd8b48892ca7\n", third);
+            const sa2 = try rig.onMount("cat .stats");
+            defer gpa.free(sa2);
+            try testing.expectEqual(@as(?u64, 0), numberAfter(sa2, "\"read_cache_stale_served\":"));
+            const tb_rc = try b.stats();
+            defer gpa.free(tb_rc);
+            try testing.expect((numberAfter(tb_rc, "\"dlm_token_recalls\":") orelse 0) > recalls0);
+            std.debug.print("smoke: matrix: the read cache across the set — A's grain hits {d} → {d} (the second O_DIRECT read), B's shrink + rewrite recalled A ({d} → {d} recalls on B), A's third read is B's zeros, stale serves 0 (verify seam)\n", .{ hits0, hits1, recalls0, numberAfter(tb_rc, "\"dlm_token_recalls\":") orelse 0 });
+        }
         const rm = try b.onMount("rm b-data/big");
         gpa.free(rm);
         // The forget → the terminal frees → the shipper's batch at the

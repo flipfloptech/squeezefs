@@ -78,6 +78,7 @@ const death_ledger = membership.death_ledger;
 const join_ladder = membership.join_ladder;
 const volume_bind = membership.volume_bind;
 const tokens = @import("tokens.zig");
+const lease_epoch = @import("../../data/lease_epoch.zig");
 const xv = @import("xv.zig");
 const dir_rename = xv.dir_rename;
 const alloc_lease = @import("../../data/sym_planes/alloc_lease.zig");
@@ -1613,8 +1614,14 @@ pub const RecallSink = struct {
         _ = dp.recallPurgeCensus();
     }
 
+    /// A recalled object's inode: its lease epoch moves (a foreign write
+    /// bumps it the way a local admission does — the read cache's grains
+    /// filled under the old epoch are stale refusals from here, and a
+    /// direct client's layout lease on it drops), then the kernel's view
+    /// is invalidated through the session's seam when one is bound.
     fn noteRecalled(ctx: *anyopaque, object: u64) void {
         const self: *RecallSink = @ptrCast(@alignCast(ctx));
+        lease_epoch.bump(object);
         const seam = self.notify orelse return;
         var inval: tokens.divert.KernelInvalidator = .{ .notify = seam };
         inval.noteRecalled(object);
@@ -2389,6 +2396,16 @@ test "linux: THE SAME-NODE SUCCESSOR IS REACHED — a member joins at a dead inc
     try testing.expectEqual(@as(usize, 2), plane.peers.count());
     try testing.expect(plane.peers.by_client.get(client).?.link.endpointNow().eql(plane.advertised));
     try testing.expect(plane.peers.by_holder.get(r1.appenderId()).?.link.endpointNow().eql(plane.advertised));
+}
+
+test "the reader's recall sink bumps the recalled object's lease epoch BEFORE any kernel invalidation and whether or not a session is bound — a foreign write reaches the read cache's epoch law and a direct client's lease the way a local admission does" {
+    var rs: RecallSink = .{};
+    const object: u64 = 0x7a7a_0042;
+    const e0 = lease_epoch.load(object);
+    rs.sink().noteRecalled(@ptrCast(&rs), object);
+    try testing.expectEqual(e0 + 1, lease_epoch.load(object));
+    rs.sink().noteRecalled(@ptrCast(&rs), object);
+    try testing.expectEqual(e0 + 2, lease_epoch.load(object));
 }
 
 test "client ids: one per member id, stable, distinct across two members; the parked scopes' client key of a session's proven peer IS the token client id of that member (one membership verdict for both sweeps)" {

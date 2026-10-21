@@ -371,17 +371,26 @@ pub const MapSeam = struct {
 // The read tiers' purge and the terminal free.
 // ---------------------------------------------------------------------------
 
-/// ONE purge helper covers all four read tiers (charter §6.3: a forgotten
+/// ONE purge helper covers all five read tiers (charter §6.3: a forgotten
 /// tier is a stale-serve class). The read path fills it; absent = nothing
-/// is cached yet.
+/// is cached yet. `purgeRange` is the in-place write's form: the whole-
+/// block tiers drop the block, the read cache exactly the rewritten
+/// grains (`purge.purgeBlockRange`); a seam without the ranged arm purges
+/// the block.
 pub const PurgeSeam = struct {
     ctx: ?*anyopaque = null,
     purge_fn: ?*const fn (ctx: ?*anyopaque, binding: Binding) void = null,
+    purge_range_fn: ?*const fn (ctx: ?*anyopaque, binding: Binding, rel_s: u64, len: u64) void = null,
 
     pub const none: PurgeSeam = .{};
 
     pub fn purge(self: PurgeSeam, binding: Binding) void {
         if (self.purge_fn) |f| f(self.ctx, binding);
+    }
+
+    pub fn purgeRange(self: PurgeSeam, binding: Binding, rel_s: u64, len: u64) void {
+        if (self.purge_range_fn) |f| return f(self.ctx, binding, rel_s, len);
+        self.purge(binding);
     }
 };
 

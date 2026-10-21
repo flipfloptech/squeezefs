@@ -174,6 +174,9 @@ pub const stats = struct {
     pub var read_copy_hot_serve_bytes: counters.ShardedCounter = .{};
     pub var read_copy_hold_serve_bytes: counters.ShardedCounter = .{};
     pub var read_copy_cache_serve_bytes: counters.ShardedCounter = .{};
+    /// The read cache's grain serves (`read_cache.zig`), the warm ledger's
+    /// fifth arm.
+    pub var read_copy_grain_serve_bytes: counters.ShardedCounter = .{};
     pub var read_copy_fill_slice_bytes: counters.ShardedCounter = .{};
     pub var read_copy_bounce_bytes: counters.ShardedCounter = .{};
     pub var read_dest_dma_bytes: counters.ShardedCounter = .{};
@@ -1353,6 +1356,25 @@ pub const ReadPath = struct {
                 stats.stale_binding_rebinds.inc();
             }
         }
+        // (7g) The READ CACHE — the grains a ranged window deposited
+        //      (charter §6.3's read cache tier): a RAM serve before the
+        //      disk tier, binding-rechecked like every other.
+        if (key != null and !device_true) {
+            if (self.grains.get(key.?, rel_s, rel_e, out)) |n| {
+                stats.read_copy_dest_bytes.add(n);
+                stats.read_copy_warm_serve_bytes.add(n);
+                stats.read_copy_grain_serve_bytes.add(n);
+                if (self.bindingIs(ino, b, key.?)) {
+                    stats.cache_hits.inc();
+                    if (flags.odirect) stats.read_odirect_tier_serves.inc();
+                    if (self.cfg.read_lane) self.hold.credit(key.?, slice_len);
+                    self.verifyGrainServe(key.?, rel_s, out);
+                    return;
+                }
+                read_cache.stats.read_cache_grain_stale_refusals.inc();
+                stats.stale_binding_rebinds.inc();
+            }
+        }
         // (7) NVMe read cache — copied out before anything else.
         if (key != null and !device_true) {
             if (self.nvme.getRange(key.?, rel_s, rel_e, out)) |n| {
@@ -1422,6 +1444,36 @@ pub const ReadPath = struct {
         stats.read_copy_dest_bytes.add(out.len);
     }
 
+    /// The read cache's deposit of a ranged window `[rel_s, rel_s +
+    /// data.len)` of `key`'s block that a DMA just landed (the lane's
+    /// ranged read, the warm ladder's direct leg, the IPC host's
+    /// direct-drive READ) for `ino` under its lease `epoch` as read BEFORE
+    /// the DMA (a bump during the DMA makes the grain stale at once):
+    /// validated at the insert against the pre-DMA word `before`, gated
+    /// like every tier deposit (`depositable`: no client write lease on
+    /// the key, the allocator admits), frozen at Yellow, declined at Red.
+    /// The caller's binding recheck follows and purges on a loss.
+    pub fn depositWindow(self: *ReadPath, key: BlockKey, rel_s: u64, data: []const u8, ino: u64, epoch: u64, before: u64) void {
+        if (!self.grains.enabled() or !self.grains.windowEligible(rel_s, rel_s + data.len)) return;
+        const lvl = self.level();
+        if (lvl == .red or !self.depositable(key)) return;
+        var still_ctx: StillCtx = .{ .rp = self, .key = key, .before = before };
+        _ = self.grains.putValidated(key, rel_s, data, ino, epoch, .{ .ctx = &still_ctx, .call = &stillValidate }, lvl != .green);
+    }
+
+    /// `SQUEEZEFS_TEST_READ_CACHE_VERIFY`: after a grain serve passed its
+    /// binding recheck, re-read the window from the device and compare;
+    /// a difference fires `read_cache_stale_served`. A concurrent writer
+    /// between the serve and the re-read would differ legitimately, so the
+    /// seam is for rows whose writes are sequenced.
+    fn verifyGrainServe(self: *ReadPath, key: BlockKey, rel_s: u64, served: []const u8) void {
+        if (!self.seams.verify_grain_serves) return;
+        const b = self.acquireBounce(served.len) catch return;
+        defer self.releaseBounce(b);
+        _ = self.vols.read_range(self.vols.ctx, key.vol_tag, key.offset + rel_s, b.bytes[0..served.len], .pooled) catch return;
+        if (!std.mem.eql(u8, served, b.bytes[0..served.len])) read_cache.stats.read_cache_stale_served.fire("a read cache grain serve differed from the device after its binding recheck");
+    }
+
     fn fillClass(self: *ReadPath, ino: u64, device_true: bool, now: u64) FillClass {
         if (!device_true and self.streamingFresh(ino, now)) return .demand_stream;
         return .demand;
@@ -1468,6 +1520,7 @@ pub const ReadPath = struct {
             stats.ranged_read_bytes.add(win.len());
             self.adm.governor.noteForeground(win.len(), clock.monotonicNs());
             if (win.bounced(req_len)) stats.ranged_read_unaligned_bounces.inc();
+            const epoch = lease_epoch.load(ino);
             if (direct) {
                 if (try self.vols.read_range(self.vols.ctx, k.vol_tag, k.offset + win.aligned_start, out, .registered) == .dma) {
                     stats.read_dest_dma_bytes.add(win.len());
@@ -1485,7 +1538,10 @@ pub const ReadPath = struct {
                 }
             }
             if (self.seams.after_dma) |f| f(self.seams.after_dma_ctx, k);
-            // Bytes in hand FIRST, then the two checks.
+            // Bytes in hand FIRST: the deposit (validated at the insert
+            // against `before`), then the two checks — a loss purges what
+            // the deposit may have left (`loseForeign`'s order).
+            if (!device_true) self.depositWindow(k, win.aligned_start, if (direct) out else bounce.?.bytes[0..@intCast(win.len())], ino, epoch, before);
             const incarnation_ok = self.still(k, before);
             const current = self.currentBinding(ino, b);
             if (incarnation_ok and current != null and current.?.eql(k)) {
@@ -1498,6 +1554,7 @@ pub const ReadPath = struct {
                 }
                 return;
             }
+            if (!device_true) _ = self.grains.purgeRange(k, win.aligned_start, win.len());
             stats.stale_binding_rebinds.inc();
             stats.ranged_read_rebinds.inc();
             key = current;
@@ -2100,7 +2157,7 @@ const Fixture = struct {
     dev_fd: ?std.os.linux.fd_t = null,
     rp: *ReadPath = undefined,
 
-    pub fn init(gpa: Allocator, cfg_over: struct { passthrough: bool = true, ranged_threshold: u64 = 256 * derive.KiB, direct_device_true: bool = false, read_lane: bool = true, rebind_cap: u32 = MAX_REBINDS, hot_budget: u64 = 4 * bs, policy: admission.Policy = .second_touch, compression: ?transform.Compression = null }) !*Fixture {
+    pub fn init(gpa: Allocator, cfg_over: struct { passthrough: bool = true, ranged_threshold: u64 = 256 * derive.KiB, direct_device_true: bool = false, read_lane: bool = true, rebind_cap: u32 = MAX_REBINDS, hot_budget: u64 = 4 * bs, policy: admission.Policy = .second_touch, compression: ?transform.Compression = null, read_cache_bytes: u64 = 0 }) !*Fixture {
         const self = try gpa.create(Fixture);
         errdefer gpa.destroy(self);
         const xcfg: transform.VolumeTransform = .{ .compression = cfg_over.compression orelse .none, .block_size = @intCast(bs) };
@@ -2140,6 +2197,7 @@ const Fixture = struct {
             .hot_budget = cfg_over.hot_budget,
             .read_mem_limit = 4 * rsc.SMALL_FILL_MAX,
             .mem_budget = 64 * bs,
+            .read_cache_bytes = cfg_over.read_cache_bytes,
             .admission_policy = cfg_over.policy,
             .fill_pct = 5,
             .prefetch = .{ .window_cap = 8, .share_pct = 50, .hot_budget = cfg_over.hot_budget, .lane_armed = cfg_over.read_lane, .depth_pin = null, .lane_budget_cap = 8 * bs },
@@ -3162,6 +3220,156 @@ test "two members over one volume: a fill of A's block whose DMA lands BEFORE th
     f.bindings[0] = try a.mintAndWrite(f, 9, 0x5A);
     try testing.expectEqual(@as(usize, 1 << 20), try f.rp.read(io, 8, 0, 1 << 20, .{ .buf = buf }, .{}));
     for (buf) |byte| try testing.expectEqual(@as(u8, 0x5A), byte);
+}
+
+test "the read cache: a cold ranged 4 KiB read deposits its window and the second read is a grain hit with no device read (O_DIRECT too); a neighbouring grain misses; the W1-class ranged purge drops exactly the written grain and the re-read fetches the device's new bytes while the block's other grains stay; a whole-block purge drops them all; a window wider than the bounce slot is not deposited; device-true never deposits nor serves; a transformed volume has no grain cache" {
+    const io = testing.io;
+    const g = read_cache.GRAIN;
+    {
+        // `.always`: no ghost escalation, so the ranged path alone is judged.
+        const f = try Fixture.init(testing.allocator, .{ .read_cache_bytes = 64 * g, .policy = .always });
+        defer f.deinit();
+        try testing.expect(f.rp.grains.enabled());
+        f.size = 2 * Fixture.bs;
+        f.bind(0, 3);
+        const key = BlockKey.init(Fixture.vol_tag, 3 * Fixture.bs);
+        const buf = try alignedBuf(testing.allocator, 1 << 20);
+        defer testing.allocator.free(buf);
+        const hits0 = f.rp.grains.core.stats.hits.load();
+        const grain0 = stats.read_copy_grain_serve_bytes.load();
+        // Cold: the lease DMA, the window deposited.
+        try testing.expectEqual(@as(usize, 4096), try f.rp.read(io, 7, 8192, 4096, .{ .buf = buf[0..4096], .registered = true }, .{}));
+        try Fixture.expected(3 * Fixture.bs + 8192, buf[0..4096]);
+        try testing.expectEqual(@as(u64, 1), f.device_reads.load(.monotonic));
+        try testing.expect(f.rp.grains.contains(key, 8192, 8192 + g));
+        try testing.expect(!f.rp.hot.contains(key) and !f.rp.nvme.has(key) and !f.rp.hold.contains(key));
+        // Warm: the grain serves, the device untouched; O_DIRECT rides it.
+        const odirect0 = stats.read_odirect_tier_serves.load();
+        @memset(buf[0..4096], 0);
+        try testing.expectEqual(@as(usize, 4096), try f.rp.read(io, 7, 8192, 4096, .{ .buf = buf[0..4096], .registered = true }, .{ .odirect = true }));
+        try Fixture.expected(3 * Fixture.bs + 8192, buf[0..4096]);
+        try testing.expectEqual(@as(u64, 1), f.device_reads.load(.monotonic));
+        try testing.expectEqual(hits0 + 1, f.rp.grains.core.stats.hits.load());
+        try testing.expectEqual(grain0 + 4096, stats.read_copy_grain_serve_bytes.load());
+        try testing.expectEqual(odirect0 + 1, stats.read_odirect_tier_serves.load());
+        // A sub-grain unaligned read inside the grain is a hit too (the
+        // window is the grain); the next grain misses and deposits.
+        try testing.expectEqual(@as(usize, 100), try f.rp.read(io, 7, 8192 + 17, 100, .{ .buf = buf[0..100] }, .{}));
+        try Fixture.expected(3 * Fixture.bs + 8192 + 17, buf[0..100]);
+        try testing.expectEqual(@as(u64, 1), f.device_reads.load(.monotonic));
+        try testing.expectEqual(@as(usize, 4096), try f.rp.read(io, 7, 8192 + g, 4096, .{ .buf = buf[0..4096] }, .{}));
+        try testing.expectEqual(@as(u64, 2), f.device_reads.load(.monotonic));
+        try testing.expect(f.rp.grains.contains(key, 8192, 8192 + 2 * g));
+        // W1 rewrites grain [8192, 8192 + g) on the device: the ranged purge
+        // drops it alone; the re-read fetches the NEW bytes, the neighbour
+        // still serves warm.
+        @memset(f.device[@intCast(3 * Fixture.bs + 8192)..][0..@intCast(g)], 0xEE);
+        _ = purge.purgeBlockRange(f.rp.tiers, key, 8192, g);
+        try testing.expect(!f.rp.grains.contains(key, 8192, 8192 + g) and f.rp.grains.contains(key, 8192 + g, 8192 + 2 * g));
+        try testing.expectEqual(@as(usize, 4096), try f.rp.read(io, 7, 8192, 4096, .{ .buf = buf[0..4096] }, .{}));
+        for (buf[0..4096]) |byte| try testing.expectEqual(@as(u8, 0xEE), byte);
+        try testing.expectEqual(@as(u64, 3), f.device_reads.load(.monotonic));
+        try testing.expectEqual(@as(usize, 4096), try f.rp.read(io, 7, 8192 + g, 4096, .{ .buf = buf[0..4096] }, .{}));
+        try testing.expectEqual(@as(u64, 3), f.device_reads.load(.monotonic));
+        // The whole-block purge (a free, a displacement) empties the block.
+        try testing.expect(purge.purgeBlockKey(f.rp.tiers, key) >= 1);
+        try testing.expect(!f.rp.grains.contains(key, 8192, 8192 + 2 * g));
+        // A 128 KiB window: ranged (under the fixture's 256 KiB threshold)
+        // but wider than the bounce slot — never deposited.
+        const puts0 = read_cache.stats.read_cache_grain_window_puts.load();
+        try testing.expectEqual(@as(usize, 128 * derive.KiB), try f.rp.read(io, 7, 0, 128 * derive.KiB, .{ .buf = buf[0 .. 128 * derive.KiB], .registered = true }, .{}));
+        try testing.expectEqual(puts0, read_cache.stats.read_cache_grain_window_puts.load());
+        try testing.expect(!f.rp.grains.contains(key, 0, g));
+    }
+    {
+        // Device-true: no deposit, no serve.
+        const f = try Fixture.init(testing.allocator, .{ .read_cache_bytes = 64 * g, .direct_device_true = true, .policy = .always });
+        defer f.deinit();
+        f.size = Fixture.bs;
+        f.bind(0, 2);
+        const key = BlockKey.init(Fixture.vol_tag, 2 * Fixture.bs);
+        const buf = try alignedBuf(testing.allocator, 4096);
+        defer testing.allocator.free(buf);
+        for (0..2) |_| _ = try f.rp.read(io, 7, 0, 4096, .{ .buf = buf, .registered = true }, .{ .odirect = true });
+        try testing.expectEqual(@as(u64, 2), f.device_reads.load(.monotonic));
+        try testing.expect(!f.rp.grains.contains(key, 0, g));
+        // A buffered read on the same mount deposits and the next serves.
+        for (0..2) |_| _ = try f.rp.read(io, 7, 0, 4096, .{ .buf = buf, .registered = true }, .{});
+        try testing.expectEqual(@as(u64, 3), f.device_reads.load(.monotonic));
+        try testing.expect(f.rp.grains.contains(key, 0, g));
+    }
+    {
+        const f = try Fixture.init(testing.allocator, .{ .read_cache_bytes = 64 * g, .compression = .lz4 });
+        defer f.deinit();
+        try testing.expect(!f.rp.grains.enabled());
+    }
+}
+
+test "two members over one volume: B's read cache holds grains of A's block; A's overwrite recalls B's token and the recall's scoped purge drops the grains BEFORE B acks, so B's next read serves A's new bytes — never the cached grain — with `read_cache_stale_served` 0 under the verify seam; a recall landing between B's DMA and its deposit leaves no grain behind" {
+    const io = testing.io;
+    const g = read_cache.GRAIN;
+    const f = try Fixture.init(testing.allocator, .{ .read_cache_bytes = 64 * g, .policy = .always });
+    defer f.deinit();
+    f.rp.seams.verify_grain_serves = true;
+    var a: ForeignWriter = try .init();
+    defer a.deinit();
+    const buf = try alignedBuf(testing.allocator, 4096);
+    defer testing.allocator.free(buf);
+    f.size = Fixture.bs;
+    f.bindings[0] = try a.mintAndWrite(f, 9, 0x11);
+    const key9 = BlockKey.init(Fixture.vol_tag, 9 * Fixture.bs);
+    const stale0 = read_cache.stats.read_cache_stale_served.load();
+    // B reads A's grain twice: the cold DMA deposits (a foreign key — the
+    // binding recheck after the deposit is its proof), the second serves
+    // warm (the seam's verify re-read is the fixture's second device read).
+    const hits0 = f.rp.grains.core.stats.hits.load();
+    for (0..2) |_| {
+        try testing.expectEqual(@as(usize, 4096), try f.rp.read(io, 7, 4 * g, 4096, .{ .buf = buf, .registered = true }, .{}));
+        for (buf) |byte| try testing.expectEqual(@as(u8, 0x11), byte);
+    }
+    try testing.expectEqual(hits0 + 1, f.rp.grains.core.stats.hits.load());
+    try testing.expectEqual(@as(u64, 2), f.device_reads.load(.monotonic));
+    try testing.expect(f.rp.grains.contains(key9, 4 * g, 5 * g));
+    // A overwrites the block IN PLACE: its commit recalls B's token and
+    // B's sink purges every key the layout names before the ack; then A's
+    // bytes land. B's third read misses and serves the new bytes.
+    const entries = [_]layout.MapEntryWire{(layout.MapEntry{ .block = 0, .mapping = f.bindings[0].? }).encode()};
+    const l = layout.Layout.stripedInline(Fixture.bs, &entries);
+    try testing.expectEqual(@as(?u32, 1), f.rp.purgeRecalledLayout(&l));
+    try testing.expect(!f.rp.grains.contains(key9, 4 * g, 5 * g));
+    @memset(f.device[@intCast(9 * Fixture.bs)..][0..@intCast(Fixture.bs)], 0x22);
+    try testing.expectEqual(@as(usize, 4096), try f.rp.read(io, 7, 4 * g, 4096, .{ .buf = buf, .registered = true }, .{}));
+    for (buf) |byte| try testing.expectEqual(@as(u8, 0x22), byte);
+    try testing.expectEqual(@as(u64, 3), f.device_reads.load(.monotonic));
+    // Warm again, verified against the device: no stale serve.
+    try testing.expectEqual(@as(usize, 4096), try f.rp.read(io, 7, 4 * g, 4096, .{ .buf = buf, .registered = true }, .{}));
+    for (buf) |byte| try testing.expectEqual(@as(u8, 0x22), byte);
+    try testing.expectEqual(hits0 + 2, f.rp.grains.core.stats.hits.load());
+    try testing.expectEqual(@as(u64, 4), f.device_reads.load(.monotonic));
+    try testing.expectEqual(stale0, read_cache.stats.read_cache_stale_served.load());
+    // The recall inside B's fill: after the DMA, before the deposit. The
+    // deposit lands, the binding recheck sees the revoked binding and
+    // purges the grain — nothing of the old lifetime survives.
+    try testing.expect(purge.purgeBlockKey(f.rp.tiers, key9) >= 1);
+    const Recall = struct {
+        var armed: bool = false;
+        fn run(fx: *Fixture) void {
+            if (!armed) return;
+            armed = false;
+            const e = [_]layout.MapEntryWire{(layout.MapEntry{ .block = 0, .mapping = fx.bindings[0].? }).encode()};
+            const ll = layout.Layout.stripedInline(Fixture.bs, &e);
+            fx.bindings[0] = null;
+            _ = fx.rp.purgeRecalledLayout(&ll);
+        }
+    };
+    Recall.armed = true;
+    f.after_read = &Recall.run;
+    defer f.after_read = null;
+    const rebinds0 = stats.stale_binding_rebinds.load();
+    try testing.expectEqual(@as(usize, 4096), try f.rp.read(io, 7, 4 * g, 4096, .{ .buf = buf, .registered = true }, .{}));
+    try testing.expect(stats.stale_binding_rebinds.load() > rebinds0);
+    try testing.expect(!f.rp.grains.contains(key9, 4 * g, 5 * g));
+    try testing.expectEqual(stale0, read_cache.stats.read_cache_stale_served.load());
 }
 
 test "the recall's census fallback drops every FOREIGN key and keeps every key of this member's lifetimes; a block-map tree head is not enumerable (the census); the deposit-only paths never deposit a foreign key" {

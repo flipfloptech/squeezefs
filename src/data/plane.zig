@@ -3664,12 +3664,17 @@ pub const DataPlane = struct {
 
     /// ONE purge helper (charter §6.3) as the write side's seam.
     fn purgeSeam(self: *DataPlane) seams.PurgeSeam {
-        return .{ .ctx = self, .purge_fn = &purgeBinding };
+        return .{ .ctx = self, .purge_fn = &purgeBinding, .purge_range_fn = &purgeBindingRange };
     }
 
     fn purgeBinding(ctx: ?*anyopaque, b: Mapping) void {
         const self: *DataPlane = @ptrCast(@alignCast(ctx.?));
         _ = purge.purgeBlockKey(self.rp.tiers, BlockKey.fromMapping(b));
+    }
+
+    fn purgeBindingRange(ctx: ?*anyopaque, b: Mapping, rel_s: u64, len: u64) void {
+        const self: *DataPlane = @ptrCast(@alignCast(ctx.?));
+        _ = purge.purgeBlockRange(self.rp.tiers, BlockKey.fromMapping(b), rel_s, len);
     }
 
     fn reclaimPurge(ctx: ?*anyopaque, vol: u16, idx: u64) void {

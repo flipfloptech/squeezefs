@@ -2585,7 +2585,7 @@ pub const Group = struct {
         switch (pend.kind) {
             .reply_bounce, .reply_fd => {
                 const msg = self.parkedMsg(gent) orelse {
-                    if (pend.hook) |h| _ = h.run(ok);
+                    if (pend.hook) |h| _ = h.run(ok, &.{});
                     return;
                 };
                 if (ok) {
@@ -2595,7 +2595,7 @@ pub const Group = struct {
                         zc_serve_bytes.add(pend.len);
                     } else zc_bounce_bytes.add(pend.len);
                     self.resumeParked(gent);
-                    if (pend.hook) |h| _ = h.run(true);
+                    if (pend.hook) |h| _ = h.run(true, &.{});
                     return;
                 }
                 if (pend.kind == .reply_fd) {
@@ -2603,7 +2603,7 @@ pub const Group = struct {
                     // view is pinned until the hook runs, AFTER the copy).
                     zc_fd_body_fallbacks.inc();
                     const restaged = self.bridgeBounce(gent, msg.body, false, msg.zero_pad);
-                    if (pend.hook) |h| _ = h.run(false);
+                    if (pend.hook) |h| _ = h.run(false, &.{});
                     if (restaged) return;
                 }
                 if (pend.readdir_probe and efault) {
@@ -2624,15 +2624,16 @@ pub const Group = struct {
                 // The device moved `res` bytes whatever the slot's fate.
                 if (res > 0) zc_direct_leg_dma_bytes.add(@intCast(res));
                 if (m.slots.ent(e).owing() == null) {
-                    if (pend.hook) |h| _ = h.run(ok);
+                    if (pend.hook) |h| _ = h.run(ok, &.{});
                     return;
                 }
                 // THE LAW: the post-DMA recheck (incarnation + binding) runs
                 // AFTER the bytes landed; a failed recheck WITHDRAWS the
                 // prefilled reply — the ordinary ladder re-serves the whole
                 // body (its bounce overwrites whatever landed), never
-                // unvalidated device bytes in the app's pages.
-                const validated = if (pend.hook) |h| h.run(ok) else true;
+                // unvalidated device bytes in the app's pages. The landed
+                // window is the hook's to deposit (the read cache).
+                const validated = if (pend.hook) |h| h.run(ok, if (ok) self.window(gent)[0..pend.len] else &.{}) else true;
                 if (ok and validated) {
                     zc_direct_legs.inc();
                     zc_serve_bytes.add(pend.len);
@@ -2942,7 +2943,7 @@ pub const Group = struct {
                     else
                         self.bridgeBounce(gent, r.body, probe, r.zero_pad);
                     if (!pushed) {
-                        if (hook) |h| _ = h.run(false);
+                        if (hook) |h| _ = h.run(false, &.{});
                     }
                     if (pushed) {
                         // The commit FOLLOWS the bridge CQE: the slot stays
@@ -3062,7 +3063,7 @@ pub const Group = struct {
                     const n = @min(fs.body.len, win.len);
                     @memcpy(win[0..n], fs.body[0..n]);
                     zc_fd_source_copies.inc();
-                    if (fs.done) |h| _ = h.run(true);
+                    if (fs.done) |h| _ = h.run(true, &.{});
                     break :blk codec.replyData(fs.unique, win[0..n]);
                 },
             };
@@ -3718,7 +3719,7 @@ pub const Group = struct {
         const n = @min(fs.body.len, win.len);
         @memcpy(win[0..n], fs.body[0..n]);
         zc_fd_source_copies.inc();
-        if (fs.done) |h| _ = h.run(true);
+        if (fs.done) |h| _ = h.run(true, &.{});
         self.commitRead(gent, req, in, codec.replyData(fs.unique, win[0..n]));
     }
 
@@ -3836,7 +3837,7 @@ pub const Group = struct {
                 self.store_cells[g].res = -@as(i32, @intCast(@backingInt(linux.E.NOTCONN)));
                 self.store_cells[g].event.set(self.shared.io);
             }
-            if (pend.hook) |h| _ = h.run(false);
+            if (pend.hook) |h| _ = h.run(false, &.{});
         };
         while (self.extract_inbox.tryPop()) |g| {
             self.extract_cells[g].res = -@as(i32, @intCast(@backingInt(linux.E.NOTCONN)));

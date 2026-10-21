@@ -730,7 +730,7 @@ pub const Engine = struct {
     fn finishRead(self: *Engine, p: Pending, res: i32) void {
         const r = p.kind.read;
         const exact = res == @as(i32, @intCast(p.len));
-        if (r.hook.run(exact)) {
+        if (r.hook.run(exact, if (exact) r.op.window[0..p.len] else &.{})) {
             stats.ipc_dd_read_serves.inc();
             stats.ipc_dd_read_bytes.add(p.len);
             stats.ipc_read_arena_dma_bytes.add(p.len);
@@ -1000,7 +1000,7 @@ const RecheckProbe = struct {
     var last_ok: bool = false;
     var verdict: bool = true;
 
-    fn call(_: ?*anyopaque, _: *const [6]u64, ok: bool) bool {
+    fn call(_: ?*anyopaque, _: *const [6]u64, ok: bool, _: []const u8) bool {
         calls += 1;
         last_ok = ok;
         return verdict and ok;

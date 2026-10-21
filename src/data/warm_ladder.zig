@@ -46,6 +46,8 @@ const derive = @import("../core/derive.zig");
 const layout = @import("layout.zig");
 const rsc = @import("read_size_class.zig");
 const read_path = @import("read_path.zig");
+const read_cache = @import("read_cache.zig");
+const lease_epoch = @import("lease_epoch.zig");
 const hot_tier = @import("hot_tier.zig");
 const fsv = @import("../fuse/transport/filesystem_vtable.zig");
 const codec = @import("../fuse/codec.zig");
@@ -73,6 +75,11 @@ pub const stats = struct {
     pub var fast_dispatch_serve_hot: counters.ShardedCounter = .{};
     pub var fast_dispatch_serve_hold: counters.ShardedCounter = .{};
     pub var fast_dispatch_serve_cache: counters.ShardedCounter = .{};
+    /// READs the read cache's grains served inline (`read_cache.zig`).
+    pub var fast_dispatch_serve_grains: counters.ShardedCounter = .{};
+    /// Direct legs whose landed window the recheck accepted and the read
+    /// cache deposited (the cold read's one copy, at the CQE).
+    pub var direct_leg_deposits: counters.ShardedCounter = .{};
     /// Direct legs the predicate admitted (the transport bridges them).
     pub var direct_leg_offers: counters.ShardedCounter = .{};
     /// Direct legs whose post-DMA recheck failed (the reply withdrawn).
@@ -101,7 +108,7 @@ pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
         stats.fast_dispatch_serve_cache.load(),
         stats.direct_leg_offers.load(),
     });
-    try w.print(",\"direct_leg_recheck_failures\":{d},\"direct_leg_custody_declines\":{d},\"fast_dispatch_fd_source_serves\":{d},\"fast_dispatch_hold_ceremonies\":{d}}}", .{ stats.direct_leg_recheck_failures.load(), stats.direct_leg_custody_declines.load(), stats.fast_dispatch_fd_source_serves.load(), stats.fast_dispatch_hold_ceremonies.load() });
+    try w.print(",\"direct_leg_recheck_failures\":{d},\"direct_leg_custody_declines\":{d},\"fast_dispatch_fd_source_serves\":{d},\"fast_dispatch_hold_ceremonies\":{d},\"fast_dispatch_serve_grains\":{d},\"direct_leg_deposits\":{d}}}", .{ stats.direct_leg_recheck_failures.load(), stats.direct_leg_custody_declines.load(), stats.fast_dispatch_fd_source_serves.load(), stats.fast_dispatch_hold_ceremonies.load(), stats.fast_dispatch_serve_grains.load(), stats.direct_leg_deposits.load() });
 }
 
 /// Why the ladder declined (the handler owns the request from here).
@@ -113,7 +120,7 @@ pub const Demote = enum(u8) {
 };
 
 /// Which rung served (the ledger's warm split).
-pub const Arm = enum(u8) { inline_, staged, hot, hold, cache };
+pub const Arm = enum(u8) { inline_, staged, hot, hold, grains, cache };
 
 pub const Verdict = union(enum) {
     served: struct { n: usize, arm: Arm, view: ?[]const u8 = null, pinned: ?Pinned = null },
@@ -219,6 +226,11 @@ pub const WarmLadder = struct {
                 stats.fast_dispatch_serve_hold.inc();
                 read_path.stats.read_copy_warm_serve_bytes.add(v.n);
                 read_path.stats.read_copy_hold_serve_bytes.add(v.n);
+            },
+            .grains => {
+                stats.fast_dispatch_serve_grains.inc();
+                read_path.stats.read_copy_warm_serve_bytes.add(v.n);
+                read_path.stats.read_copy_grain_serve_bytes.add(v.n);
             },
             .cache => {
                 stats.fast_dispatch_serve_cache.inc();
@@ -343,6 +355,15 @@ pub const WarmLadder = struct {
                     }
                     stats.ipc_hold_probe_misses.inc();
                 }
+                // The read cache's grains (charter §6.3): a RAM window
+                // serve, one lock, before the disk tier. The binding is
+                // current structurally here (the guard, the live map).
+                if (rp.grains.get(k, rel_s, rel_e, out)) |n| {
+                    read_path.stats.cache_hits.inc();
+                    if (rp.cfg.read_lane) rp.hold.credit(k, out.len);
+                    if (odirect) read_path.stats.read_odirect_tier_serves.inc();
+                    return .{ .n = n, .arm = .grains };
+                }
                 if (rp.nvme.getRange(k, rel_s, rel_e, out)) |n| {
                     @memset(out[n..], 0);
                     read_path.stats.cache_hits.inc();
@@ -394,24 +415,43 @@ pub const WarmLadder = struct {
         // the binding AFTER (a dead-lifetime key never DMAs at all).
         const before = rp.incarnationSnapshot(k) orelse return null;
         stats.direct_leg_offers.inc();
-        return .{ .fd = fd, .off = k.offset + (offset - b * rp.cfg.block_size), .len = size, .hook = .{ .ctx = self, .token = .{ ino, b, k.vol_tag, k.offset, before, 0 }, .call = &directLegRecheck } };
+        // The token: the block index and the block-relative offset share a
+        // word (both < 2³²: the block-map width, the block size); the
+        // lease epoch is read BEFORE the DMA, as the ranged read's is.
+        const rel = offset - b * rp.cfg.block_size;
+        return .{ .fd = fd, .off = k.offset + rel, .len = size, .hook = .{ .ctx = self, .token = .{ ino, (b << 32) | rel, k.vol_tag, k.offset, before, lease_epoch.load(ino) }, .call = &directLegRecheck } };
     }
 
     /// The post-DMA recheck (worker thread, at the CQE): `incarnation still
     /// (the pre-DMA snapshot) ∧ the CURRENT map still binds (ino, block) →
     /// key` — the read path's (a) ∧ (b), linearized at this recheck.
-    fn directLegRecheck(ctx: ?*anyopaque, token: *const [6]u64, ok: bool) bool {
+    /// `landed` is the window the DMA filled (the slot's bytes): the read
+    /// cache deposits it FIRST (validated against the snapshot under its
+    /// lock) and a failed recheck purges it — the deposit-then-recheck
+    /// order every tier fill keeps (`ReadPath.loseForeign`).
+    fn directLegRecheck(ctx: ?*anyopaque, token: *const [6]u64, ok: bool, landed: []const u8) bool {
         const self: *WarmLadder = @ptrCast(@alignCast(ctx.?));
         if (!ok) return false;
         const k = BlockKey.init(token[2], token[3]);
         const rp = self.rp;
-        const valid = rp.incarnationStill(k, token[4]) and (if (rp.meta.binding(rp.meta.ctx, token[0], token[1])) |cur| BlockKey.fromMapping(cur).eql(k) else false);
-        if (!valid) stats.direct_leg_recheck_failures.inc();
+        const ino = token[0];
+        const b = token[1] >> 32;
+        const rel = token[1] & std.math.maxInt(u32);
+        const deposit = landed.len != 0 and rp.grains.enabled();
+        if (deposit) {
+            rp.depositWindow(k, rel, landed, ino, token[5], token[4]);
+            stats.direct_leg_deposits.inc();
+        }
+        const valid = rp.incarnationStill(k, token[4]) and (if (rp.meta.binding(rp.meta.ctx, ino, b)) |cur| BlockKey.fromMapping(cur).eql(k) else false);
+        if (!valid) {
+            if (deposit) _ = rp.grains.purgeRange(k, rel, landed.len);
+            stats.direct_leg_recheck_failures.inc();
+        }
         return valid;
     }
 
     /// The fd-source CQE hook: release the view's pin.
-    fn fdSourceDone(ctx: ?*anyopaque, token: *const [6]u64, _: bool) bool {
+    fn fdSourceDone(ctx: ?*anyopaque, token: *const [6]u64, _: bool, _: []const u8) bool {
         const self: *WarmLadder = @ptrCast(@alignCast(ctx.?));
         switch (token[0]) {
             0 => self.rp.hot.unpin(.{ .slot = @intCast(token[1]), .len = @intCast(token[2]) }),
@@ -585,7 +625,7 @@ test "a cold direct-leg read resolves its file ONCE and its binding TWICE — th
     const leg = ladder.directLeg(7, 8192, 4096, true) orelse return error.TestExpectedEqual;
     try testing.expectEqual(@as(u64, 2 * F.bs + 8192), leg.off);
     const hook = leg.hook.?;
-    try testing.expect(hook.call(hook.ctx, &hook.token, true));
+    try testing.expect(hook.call(hook.ctx, &hook.token, true, &.{}));
     try testing.expectEqual(files0 + 1, f.file_calls.load(.monotonic));
     try testing.expectEqual(binds0 + 2, f.binding_calls.load(.monotonic));
     // The binding moves between the probe and the bytes: the leg DMAs the
@@ -594,7 +634,7 @@ test "a cold direct-leg read resolves its file ONCE and its binding TWICE — th
     const leg2 = ladder.directLeg(7, 4096, 4096, true) orelse return error.TestExpectedEqual;
     f.bind(0, 5);
     const failures0 = stats.direct_leg_recheck_failures.load();
-    try testing.expect(!leg2.hook.?.call(leg2.hook.?.ctx, &leg2.hook.?.token, true));
+    try testing.expect(!leg2.hook.?.call(leg2.hook.?.ctx, &leg2.hook.?.token, true, &.{}));
     try testing.expectEqual(failures0 + 1, stats.direct_leg_recheck_failures.load());
     // A leg for another request than the probe's resolves fresh.
     try testing.expectEqual(Verdict{ .demote = .miss }, ladder.probe(7, 0, 4096, true, window));
@@ -604,6 +644,61 @@ test "a cold direct-leg read resolves its file ONCE and its binding TWICE — th
     try testing.expectEqual(@as(u64, 3 * F.bs), leg3.off);
     try testing.expectEqual(files1 + 1, f.file_calls.load(.monotonic));
     try testing.expectEqual(binds1 + 1, f.binding_calls.load(.monotonic));
+}
+
+test "the read cache on the queue thread: a cold probe demotes and the direct leg's CQE hook DEPOSITS the landed window (then rechecks), so the next probe of the same window serves it inline as the `grains` arm with no device read; an unaligned sub-grain request hits the same grain; a failed recheck purges what the hook deposited; the IPC ring arm's probe is the same call" {
+    const F = read_path.TestFixture;
+    const g = read_cache.GRAIN;
+    const f = try F.init(testing.allocator, .{ .read_cache_bytes = 64 * g, .policy = .always });
+    defer f.deinit();
+    f.size = 2 * F.bs;
+    f.bind(0, 2);
+    f.bind(1, 3);
+    f.dev_fd = 3;
+    var guards = try op_guard.Table.init(testing.allocator, 64);
+    defer guards.deinit();
+    var ladder: WarmLadder = .{ .rp = f.rp, .guards = &guards, .io = testing.io, .direct_leg_armed = true };
+    const window = try testing.allocator.alignedAlloc(u8, .fromByteUnits(4096), 1 << 20);
+    defer testing.allocator.free(window);
+    const key2 = BlockKey.init(F.vol_tag, 2 * F.bs);
+    // Cold: the probe declines, the leg is offered; the transport's DMA
+    // lands the device's bytes in the window (simulated here), the hook
+    // deposits and validates.
+    try testing.expectEqual(Verdict{ .demote = .miss }, ladder.probe(7, 8192, 4096, false, window));
+    const leg = ladder.directLeg(7, 8192, 4096, false) orelse return error.TestExpectedEqual;
+    @memcpy(window[0..4096], f.device[@intCast(2 * F.bs + 8192)..][0..4096]);
+    const deposits0 = stats.direct_leg_deposits.load();
+    try testing.expect(leg.hook.?.run(true, window[0..4096]));
+    try testing.expectEqual(deposits0 + 1, stats.direct_leg_deposits.load());
+    try testing.expect(f.rp.grains.contains(key2, 8192, 8192 + g));
+    // Warm: the probe serves the grain inline — no lane, no device.
+    const reads0 = f.device_reads.load(.monotonic);
+    const grains0 = stats.fast_dispatch_serve_grains.load();
+    @memset(window[0..4096], 0);
+    const v = ladder.probe(7, 8192, 4096, true, window);
+    try testing.expectEqual(@as(usize, 4096), v.served.n);
+    try testing.expectEqual(Arm.grains, v.served.arm);
+    try F.expected(2 * F.bs + 8192, window[0..4096]);
+    try testing.expectEqual(reads0, f.device_reads.load(.monotonic));
+    try testing.expectEqual(grains0 + 1, stats.fast_dispatch_serve_grains.load());
+    // A sub-grain unaligned request inside the deposited window hits too.
+    const v2 = ladder.probe(7, 8192 + 100, 300, false, window);
+    try testing.expectEqual(@as(usize, 300), v2.served.n);
+    try F.expected(2 * F.bs + 8192 + 100, window[0..300]);
+    // The neighbouring grain is cold: a demote, the leg; the binding moves
+    // under the DMA — the hook deposits, the recheck fails and the grain is
+    // purged with the reply withdrawn.
+    try testing.expectEqual(Verdict{ .demote = .miss }, ladder.probe(7, 8192 + g, 4096, false, window));
+    const leg2 = ladder.directLeg(7, 8192 + g, 4096, false) orelse return error.TestExpectedEqual;
+    f.bind(0, 5);
+    try testing.expect(!leg2.hook.?.run(true, window[0..4096]));
+    try testing.expect(!f.rp.grains.contains(key2, 8192 + g, 8192 + 2 * g));
+    // A leg that landed nothing deposits nothing.
+    f.bind(0, 2);
+    try testing.expectEqual(Verdict{ .demote = .miss }, ladder.probe(7, 3 * g, 4096, false, window));
+    const leg3 = ladder.directLeg(7, 3 * g, 4096, false) orelse return error.TestExpectedEqual;
+    try testing.expect(!leg3.hook.?.run(false, &.{}));
+    try testing.expect(!f.rp.grains.contains(key2, 3 * g, 4 * g));
 }
 
 test "the warm ladder never blocks: a cold block demotes (miss), a held guard demotes (contended) without waiting, a tier-resident block serves byte-exact and EOF-clamped into the window, oversize and device-true O_DIRECT pre-screen; serves + demotes ≡ probes" {

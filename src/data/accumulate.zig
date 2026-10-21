@@ -1656,7 +1656,7 @@ fn foldInPlaceLocked(table: *Table, deps: UploadDeps, e: *Entry) ?Disposition {
             extent.stats.fold_inplace_dmas.inc();
         } else |_| break;
     }
-    sole_owner_patch.finishInPlace(pdeps, begun, dma, "W2 in-place fold") catch {
+    sole_owner_patch.finishInPlace(pdeps, begun, bs, dma, "W2 in-place fold") catch {
         extent.stats.fold_inplace_dma_errors.inc();
         extent.stats.fold_inplace_write_bytes.add(written);
         return .stay_parked;
@@ -1757,7 +1757,7 @@ fn drainInPlaceLocked(table: *Table, deps: UploadDeps, e: *Entry) ?Disposition {
         } else |_| break;
     }
     stats.drain_inplace_write_bytes.add(written);
-    sole_owner_patch.finishInPlace(pdeps, begun, dma, "in-place drain") catch {
+    sole_owner_patch.finishInPlace(pdeps, begun, table.block_size, dma, "in-place drain") catch {
         stats.drain_inplace_dma_errors.inc();
         return .stay_parked;
     };
@@ -1825,7 +1825,7 @@ fn drainDirtyInPlaceLocked(table: *Table, deps: UploadDeps, e: *Entry) ?Disposit
         p = q;
     }
     stats.drain_inplace_write_bytes.add(written);
-    sole_owner_patch.finishInPlace(pdeps, begun, dma, "in-place dirty drain") catch {
+    sole_owner_patch.finishInPlace(pdeps, begun, table.block_size, dma, "in-place dirty drain") catch {
         stats.drain_inplace_dma_errors.inc();
         return .stay_parked;
     };

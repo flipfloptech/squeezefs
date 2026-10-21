@@ -167,13 +167,17 @@ pub const HoldHint = struct {
 /// the ordinary ladder, never unvalidated device bytes in an app's pages).
 /// For an fd-source serve it releases the served view's pin. `token` is
 /// the filesystem's own facts (no allocation per op on the worker).
+/// `landed` is the bridge's destination as the CQE left it — the direct
+/// leg's window (the read cache's deposit, charter §6.3), empty for a
+/// hook that moved nothing the filesystem may read (an fd-source serve, a
+/// leg whose slot was given up).
 pub const CompletionHook = struct {
     ctx: ?*anyopaque,
     token: [6]u64 = @splat(0),
-    call: *const fn (ctx: ?*anyopaque, token: *const [6]u64, ok: bool) bool,
+    call: *const fn (ctx: ?*anyopaque, token: *const [6]u64, ok: bool, landed: []const u8) bool,
 
-    pub fn run(self: CompletionHook, ok: bool) bool {
-        return self.call(self.ctx, &self.token, ok);
+    pub fn run(self: CompletionHook, ok: bool, landed: []const u8) bool {
+        return self.call(self.ctx, &self.token, ok, landed);
     }
 };
 

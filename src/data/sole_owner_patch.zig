@@ -286,13 +286,15 @@ pub fn abandonInPlace(deps: Deps, b: Begun) void {
 
 /// The postlude on BOTH exits of an in-place DMA, for any arm (`arm`
 /// names it in the loud line): publish (re-stabilize under the NEW
-/// generation), purge the key from the four read tiers, then — exact ⇒
-/// the fsync touched stamp; failed ⇒ loud, the error for exactly this
-/// write (the block's old bytes intact outside the window).
-pub fn finishInPlace(deps: Deps, b: Begun, dma: seams.DmaError!void, arm: []const u8) PatchError!void {
+/// generation), purge the key from the read tiers — the window `[rel,
+/// rel + len)` alone from the read cache's grains, the block from the
+/// whole-block tiers —, then — exact ⇒ the fsync touched stamp; failed ⇒
+/// loud, the error for exactly this write (the block's old bytes intact
+/// outside the window).
+pub fn finishInPlace(deps: Deps, b: Begun, len: u64, dma: seams.DmaError!void, arm: []const u8) PatchError!void {
     const vol = deps.vols.byTag(b.vol_tag) orelse return error.VolumeFailed;
     vol.alloc.publishBlock(b.idx);
-    deps.purge.purge(b.mapping);
+    deps.purge.purgeRange(b.mapping, b.rel, len);
     dma catch |e| {
         log.err("{s} ino {d} block {d} rel {d}: DMA failed ({s}) — EIO for exactly this write; the block is re-stabilized with its old bytes intact outside the window", .{ arm, b.ino, b.block, b.rel, @errorName(e) });
         return switch (e) {
@@ -311,7 +313,7 @@ pub fn finishInPlace(deps: Deps, b: Begun, dma: seams.DmaError!void, arm: []cons
 /// W1's postlude: `finishInPlace`, then the ledger (`patch_writes`,
 /// `patch_write_bytes`; a failure counts `patch_dma_errors`).
 pub fn finishPatch(deps: Deps, b: Begun, len: u64, dma: seams.DmaError!void) PatchError!void {
-    finishInPlace(deps, b, dma, "W1 patch") catch |e| {
+    finishInPlace(deps, b, len, dma, "W1 patch") catch |e| {
         stats.patch_dma_errors.inc();
         return e;
     };

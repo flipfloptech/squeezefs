@@ -353,14 +353,25 @@ const Staging = struct {
     /// LRU eviction that promotes.
     sink: staging.PromoteSink,
     cache: *staging.WriteCache,
-    /// The bound the knob derived (the memfd holds it; the core's bound
-    /// follows the budget).
+    /// The knob's percentage: the core's bound is re-derived from it over
+    /// the LIVE budget at every sampler tick (`rederiveWriteCache`), capped
+    /// by the memfd's capacity.
+    pct: u64,
+    /// The bound at the mount (the memfd's capacity: the knob over the
+    /// budget the mount resolved); the live bound never exceeds it.
     bound: u64,
     /// A sweep task is spawned or running (`sweepRing`): one at a time.
     sweep_armed: Atomic(bool) = .init(false),
     /// A drain task (`evictUntil` through the promote sink) is spawned or
     /// running: one at a time.
     drain_armed: Atomic(bool) = .init(false),
+    /// The budget's pending shed target (`shedWriteCache`): the drain
+    /// evicts to the lower of it and the low water, then resets it. A shed
+    /// is ONE pass — the bound stays the knob's, so the cache refills once
+    /// the pressure recedes (the first cut lowered the bound to the target
+    /// for the mount's life: one Red tick under the gate's shared cage
+    /// collapsed every write cache to one record).
+    shed_target: Atomic(u64) = .init(std.math.maxInt(u64)),
 };
 
 /// The transformed set's state (decision 0003 §K10): the immutable
@@ -1075,10 +1086,10 @@ pub const DataPlane = struct {
             },
         };
         errdefer ram.release();
-        self.stage = .{ .ram = ram, .marker = ours, .seg = undefined, .pool = undefined, .sink = undefined, .cache = undefined, .bound = undefined };
+        self.stage = .{ .ram = ram, .marker = ours, .seg = undefined, .pool = undefined, .sink = undefined, .cache = undefined, .pct = knobs.intKnob("SQUEEZEFS_WRITE_CACHE_PCT", u64, opts.env), .bound = undefined };
         const st = &self.stage.?;
         const r = &st.ram;
-        if (r.found) |f| log.info("write cache: this member's previous incarnation (appender {d}, node {x:0>16}, pid {d}) is dead — its ring ({d} MiB) handed over by its supervisor, recovered here as the successor's", .{ f.appender_id, f.node_token, f.owner_pid, r.capacity() >> 20 });
+        if (r.found) |f| log.info("write cache: this member's previous incarnation (appender {d}, node {x:0>16}, pid {d}) is dead — its ring ({d} MiB) handed over by its supervisor; its residents are the successor's (the scan below adopts them)", .{ f.appender_id, f.node_token, f.owner_pid, r.capacity() >> 20 });
         st.seg = staging.Segment.init(gpa, r.image(), r.backing()) catch return error.OutOfMemory;
         errdefer st.seg.deinit();
         const rep = st.seg.recover();
@@ -1099,7 +1110,7 @@ pub const DataPlane = struct {
             defer gpa.free(residents);
             for (residents) |c| _ = st.cache.insert(.{ .key = c.key, .ino = c.key.ino(), .bytes = @intCast(c.cost), .generation = c.generation }, .{});
         }
-        budget.authority.register(budget.Component.init("write_cache", 0, 1, .{ .gauge = &staging.stats.current_staged_write_bytes }, .{ .ctx = self, .call = &shedWriteCache }));
+        budget.authority.register(budget.Component.init("write_cache", 0, 1, .{ .func = .{ .ctx = self, .call = &writeCacheGauge } }, .{ .ctx = self, .call = &shedWriteCache }));
         budget.authority.register(staging.cellStateComponent());
         budget.authority.register(staging.tablesComponent());
         log.info("write cache: {d} MiB in a sealed memfd (SQUEEZEFS_WRITE_CACHE_PCT of system RAM under the budget; fsync promotes; LRU over {d} shard(s)), recovered {d} record(s) ({d} B), {d} torn, {d} superseded", .{ r.capacity() >> 20, shards, rep.adopted, rep.bytes, rep.torn, rep.superseded });
@@ -1119,14 +1130,38 @@ pub const DataPlane = struct {
         st.cache.setBound(st.bound);
     }
 
+    /// The component's gauge: the RESIDENT bytes (the records the memfd
+    /// holds — a punched run is the kernel's again), never the sealed
+    /// reservation. The sampler's tick is also where the bound follows the
+    /// live budget.
+    fn writeCacheGauge(ctx: *anyopaque) u64 {
+        const self: *DataPlane = @ptrCast(@alignCast(ctx));
+        self.rederiveWriteCache(budget.authority.budgetBytes());
+        return staging.stats.current_staged_write_bytes.load();
+    }
+
+    /// The live bound for the authority's budget `budget_now`: the knob's
+    /// percentage of `budget ÷ 0.7` (the machine's RAM over the live fleet
+    /// share, or the cage's 0.8 scaled), capped by the memfd — the same
+    /// law as the read cache's (`read_cache.rederive`).
+    fn rederiveWriteCache(self: *DataPlane, budget_now: u64) void {
+        const st = &(self.stage orelse return);
+        if (budget_now == 0 or !st.cache.enabled()) return;
+        const ram_proxy = budget_now / cache_mod.SOLO_BUDGET_TENTHS *| 10;
+        st.cache.setBound(@min(cache_mod.derivedBound(st.pct, ram_proxy, budget_now), st.bound));
+    }
+
     /// The R5 shed (Red: the authority's target) and the high-water kick:
     /// ONE drain task runs `evictUntil` — the LRU tail promoted first,
     /// released as it leaves — off every writer's lock (a sink under a
-    /// writer's layout lock would take another ino's: the lock law).
+    /// writer's layout lock would take another ino's: the lock law) and off
+    /// the sampler's thread (a promotion is a DMA and a publish). The shed
+    /// is one pass to the target; the bound is untouched.
     fn shedWriteCache(ctx: *anyopaque, target: u64) void {
         const self: *DataPlane = @ptrCast(@alignCast(ctx));
         const st = &(self.stage orelse return);
-        st.cache.setBound(@min(st.bound, @max(target, staging.RECORD_ALIGN)));
+        _ = st.shed_target.fetchMin(target, .acq_rel);
+        staging.stats.write_cache_budget_sheds.inc();
         self.armDrain();
     }
 
@@ -1138,13 +1173,15 @@ pub const DataPlane = struct {
     }
 
     /// The drain: evict to the LOW water (three quarters of the bound) so
-    /// a burst of stages lands without meeting the bound, in LRU order;
-    /// a kept victim ends the pass (the next kick retries).
+    /// a burst of stages lands without meeting the bound — or to the
+    /// budget's shed target when one is pending, whichever is lower — in
+    /// LRU order; a kept victim ends the pass (the next kick retries).
     fn drainTask(self: *DataPlane) Io.Cancelable!void {
         const st = &(self.stage orelse return);
         defer st.drain_armed.store(false, .release);
         const bound = st.cache.stats.bound_bytes.load();
-        _ = st.cache.evictUntil(bound - bound / WRITE_CACHE_DRAIN_DIVISOR);
+        const shed = st.shed_target.swap(std.math.maxInt(u64), .acq_rel);
+        _ = st.cache.evictUntil(@min(bound - bound / WRITE_CACHE_DRAIN_DIVISOR, shed));
     }
 
     /// The high water that kicks the drain and the low water it drains to:

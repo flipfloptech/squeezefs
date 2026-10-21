@@ -92,6 +92,9 @@ pub const stats = struct {
     /// the writer's lock (the write took its own-block arm).
     pub var write_cache_evict_promotions: counters.ShardedCounter = .{};
     pub var write_cache_inline_evictions_declined: counters.ShardedCounter = .{};
+    /// The budget's Red sheds the write cache answered (one drain pass to
+    /// the authority's target each; the bound is untouched).
+    pub var write_cache_budget_sheds: counters.ShardedCounter = .{};
     /// `staging_recovery_records`: records a recovery scan adopted.
     pub var staging_recovery_records: counters.ShardedCounter = .{};
     /// `staging_recovery_torn_records`: headers whose checksum or geometry
@@ -164,7 +167,7 @@ pub const stats = struct {
 
 pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
     try w.writeAll("{");
-    inline for (.{ "current_staged_write_bytes", "staged_writes_in_flight", "staging_cell_state_bytes", "staging_tables_bytes", "staging_over_cap_refusals", "staging_ring_full_refusals", "staging_pressure_kicks", "write_cache_evict_promotions", "write_cache_inline_evictions_declined", "staging_recovery_records", "staging_recovery_torn_records", "staging_generation_discards", "staging_foreign_scope_refusals", "staging_owner_live_refusals", "staged_payload_lost_reads", "dismount_promoted_files", "dismount_promoted_bytes", "dismount_promote_failures", "dismount_corpse_residents_destroyed", "dismount_unnamed_residents_destroyed", "fsync_promoted_files", "staging_dirty_free_bytes", "staging_sweep_runs", "staging_sweep_punched_bytes", "staging_inplace_overwrites", "staging_inplace_bytes", "staging_read_retries", "staging_appends", "staging_append_bytes", "staging_restages", "staging_restage_bytes" }, 0..) |name, i| {
+    inline for (.{ "current_staged_write_bytes", "staged_writes_in_flight", "staging_cell_state_bytes", "staging_tables_bytes", "staging_over_cap_refusals", "staging_ring_full_refusals", "staging_pressure_kicks", "write_cache_evict_promotions", "write_cache_inline_evictions_declined", "write_cache_budget_sheds", "staging_recovery_records", "staging_recovery_torn_records", "staging_generation_discards", "staging_foreign_scope_refusals", "staging_owner_live_refusals", "staged_payload_lost_reads", "dismount_promoted_files", "dismount_promoted_bytes", "dismount_promote_failures", "dismount_corpse_residents_destroyed", "dismount_unnamed_residents_destroyed", "fsync_promoted_files", "staging_dirty_free_bytes", "staging_sweep_runs", "staging_sweep_punched_bytes", "staging_inplace_overwrites", "staging_inplace_bytes", "staging_read_retries", "staging_appends", "staging_append_bytes", "staging_restages", "staging_restage_bytes" }, 0..) |name, i| {
         if (i != 0) try w.writeByte(',');
         try w.print("\"{s}\":{d}", .{ name, @field(stats, name).load() });
     }

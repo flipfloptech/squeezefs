@@ -759,6 +759,10 @@ pub const MemBudget = struct {
                 .green => {},
             }
             self.level_raw.store(@backingInt(next), .monotonic);
+            // The edge, with the arm that binds it (Red at 80 % is otherwise
+            // silent: only the ≥ 95 % unreclaimable arm warns), so a log
+            // explains a shed's promotions and purges.
+            log.info("mem_budget: {s} -> {s} — pressure {d} B of the {d} B budget ({d}%): gauges {d} B, rss {d} B, unreclaimable {d} B", .{ @tagName(prev), @tagName(next), pressure_now, budget_now, pct, pressure_gauges, rss_max, unreclaim_max });
         }
 
         // EVERY Red tick sheds, not just the entry edge. The reference also

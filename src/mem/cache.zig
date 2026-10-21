@@ -460,7 +460,9 @@ pub fn Cache(comptime Entry: type, comptime Sink: type) type {
                     if (under_lock) self.releaseLocked(s, idx, .stale) else s.items[idx].state = .evicting;
                 }
             }
-            if (!under_lock) if (stale_idx) |idx| self.finishOutside(s, idx, .stale);
+            if (!under_lock) if (stale_idx) |idx| {
+                _ = self.finishOutside(s, idx, .stale);
+            };
             self.stats.misses.inc();
             return found;
         }
@@ -1073,6 +1075,45 @@ test "the core: a census walks the LIVE entries once (never the capacity) — an
     defer off.deinit();
     cursor = 0;
     try testing.expectEqual(@as(?TestEntry, null), off.censusNext(&cursor, &d, All.pick));
+}
+
+test "the core (promote sink): a STALE entry's lookup is a refusal that hands the entry to the outside-lock sink — `.kept` keeps it indexed (the bytes are not on the volume yet; the next lookup asks again), `.released` drops it; the lookup is a miss either way" {
+    var sink: PromoteSink = .{};
+    defer sink.deinit();
+    const Epochs = struct {
+        var table: [16]u64 = @splat(0);
+        fn of(_: ?*anyopaque, ino: u64) u64 {
+            return table[ino];
+        }
+    };
+    Epochs.table = @splat(0);
+    const C = Cache(TestEntry, PromoteSink);
+    const c = try C.init(testing.allocator, &sink, 8, 1, 8, .{ .call = &Epochs.of });
+    defer c.deinit();
+    sink.cache = c;
+    try testing.expectEqual(InsertOutcome.inserted, c.insert(mk(5, 0, 0, 1, 50), .{}));
+    var seen: Seen = .{};
+    defer seen.slots.deinit(testing.allocator);
+    try testing.expect(c.lookup(.{ .ino = 5, .off = 0 }, &seen, Seen.visit));
+    // The inode's epoch moves; the sink cannot take the resident yet.
+    Epochs.table[5] = 1;
+    sink.refuse_slot = 50;
+    try testing.expect(!c.lookup(.{ .ino = 5, .off = 0 }, &seen, Seen.visit));
+    try testing.expectEqual(@as(u64, 1), c.stats.stale_refusals.load());
+    try testing.expectEqual(@as(u64, 1), c.stats.sink_kept.load());
+    try testing.expectEqual(@as(u64, 0), c.stats.evictions.load());
+    try testing.expect(c.contains(.{ .ino = 5, .off = 0 }));
+    try testing.expectEqual(@as(u64, 1), c.currentBytes());
+    try testing.expectEqual(@as(?bool, true), sink.visible_during_sink);
+    // Asked again on the next lookup; once the sink takes it, it is gone.
+    sink.refuse_slot = null;
+    try testing.expect(!c.lookup(.{ .ino = 5, .off = 0 }, &seen, Seen.visit));
+    try testing.expectEqual(@as(u64, 2), c.stats.stale_refusals.load());
+    try testing.expectEqualSlices(u32, &.{50}, sink.promoted.items);
+    try testing.expect(!c.contains(.{ .ino = 5, .off = 0 }));
+    try testing.expectEqual(@as(u64, 0), c.currentBytes());
+    try testing.expectEqual(@as(u64, 1), c.stats.evictions.load());
+    try testing.expectEqualSlices(u32, &.{50}, seen.slots.items);
 }
 
 test "the core: invalidateKey and invalidateKeys drop held keys through the sink and count; an absent key is nothing; a disabled instance (bound 0) misses, refuses and invalidates nothing" {

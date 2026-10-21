@@ -1865,12 +1865,16 @@ test "smoke: THE TWO-DAEMON MATRIX — mount A (the manager) → mount B as a SE
     // classes.
     const a_ttls = [_][]const u8{ "SQUEEZEFS_FUSE_ATTR_TTL_MS", "SQUEEZEFS_FUSE_ENTRY_TTL_MS", "SQUEEZEFS_FUSE_DIR_ENTRY_TTL_MS", "SQUEEZEFS_FUSE_NEGATIVE_TTL_MS" };
     for (a_ttls) |k| try rig.env.put(k, "60000");
-    // A judges every read cache serve against the device (the coherence
-    // step below: `read_cache_stale_served` must stay 0).
+    // A fills its read cache from the lane (the zero-copy leg lands in the
+    // app's pages and deposits nothing) and judges every serve against
+    // the device (the coherence step below: `read_cache_stale_served`
+    // must stay 0).
+    try rig.env.put("SQUEEZEFS_READ_CACHE_FILL", "lane");
     try rig.env.put("SQUEEZEFS_TEST_READ_CACHE_VERIFY", "1");
     try rig.spawnMount(&.{});
     _ = try rig.awaitReady(0);
     for (a_ttls) |k| _ = rig.env.swapRemove(k);
+    _ = rig.env.swapRemove("SQUEEZEFS_READ_CACHE_FILL");
     _ = rig.env.swapRemove("SQUEEZEFS_TEST_READ_CACHE_VERIFY");
     // The manager's endpoint lands in tree 0 at its first checkpoint; the
     // joiner polls the projection for it (bounded) — nothing to wait for.

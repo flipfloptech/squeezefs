@@ -5920,7 +5920,7 @@ test "§L.6 the write-stamp park (repro-port: frag-512b-write — 533 k size-neu
     wake = h.fs.times_drain_wake.notified();
     try testing.expect(wake.enable(testing.io));
     wake.waitUncancelable(testing.io);
-    // The drain over the cap's population: ⌈512 / 16⌉ entries.
+    // The drain over the cap's population: ⌈cap / 16⌉ entries.
     const commits_cap = h.store.commits;
     try testing.expectEqual(economy.PENDING_TIMES_DRAIN_CAP, try h.fs.drainPendingTimes(&ctx));
     try testing.expectEqual(commits_cap + (economy.PENDING_TIMES_DRAIN_CAP + dlm.max_requests - 1) / dlm.max_requests, h.store.commits);

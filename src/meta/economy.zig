@@ -751,8 +751,13 @@ pub const PENDING_TIMES_DRAIN_BATCH: usize = 128;
 /// The parked population that wakes the drain AHEAD of its cadence tick:
 /// bounds the map and the crash-loss window by COUNT, not just time (a
 /// refinement is µs-grade time polish, but an unbounded map under a storm
-/// would be an unbounded loss on a kill).
-pub const PENDING_TIMES_DRAIN_CAP: u64 = 512;
+/// would be an unbounded loss on a kill). 4,096 (was 512): a thousand hot
+/// small files rewritten in place park a stamp each, and at 512 every
+/// second park woke the drain — 100 k inode records journaled a second for
+/// time polish, each landing staling the ino's read view and staged point
+/// (63 % of the staged fast path's lookups missed). 160 KiB of map; the
+/// cadence tick still drains everything within its 50 ms.
+pub const PENDING_TIMES_DRAIN_CAP: u64 = 4096;
 
 /// A parked refinement: the kernel's post-op times for one ino.
 /// A parked refinement: the stamp, and an extending striped write's size
@@ -1946,8 +1951,8 @@ test "pending times: signed monotone max on park and fold (pre-epoch stamps neve
     try testing.expect(!pending.retire(1));
     try testing.expectEqual(@as(u64, 1), pending.len());
     try testing.expectEqual(g0 + 1, stats.meta_kv_times_echo_pending.load());
-    // The cap: the 512th distinct ino crosses it; re-parks of a parked ino
-    // do not grow the population.
+    // The cap: the 4,096th distinct ino crosses it; re-parks of a parked
+    // ino do not grow the population.
     var ino: u64 = 1000;
     while (pending.len() < PENDING_TIMES_DRAIN_CAP - 1) : (ino += 1) {
         try testing.expectEqual(Park.parked, try pending.park(ino, 1, 1));
@@ -1956,7 +1961,7 @@ test "pending times: signed monotone max on park and fold (pre-epoch stamps neve
     try testing.expectEqual(Park.parked_wake_drain, try pending.park(ino, 1, 1));
     try testing.expectEqual(PENDING_TIMES_DRAIN_CAP, pending.len());
     try testing.expectEqual(@as(usize, 128), PENDING_TIMES_DRAIN_BATCH);
-    try testing.expectEqual(@as(u64, 512), PENDING_TIMES_DRAIN_CAP);
+    try testing.expectEqual(@as(u64, 4096), PENDING_TIMES_DRAIN_CAP);
 }
 
 test "drain: batches of ≤ 128 inos, ONE tx each; the advance only (times vs ctime mask); stale and destroyed members stage nothing; durable ≡ served after the drain" {

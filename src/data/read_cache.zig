@@ -19,9 +19,10 @@
 //! the same device-offset space every tier is addressed by, so the ONE
 //! purge (`purge.zig`) reaches it with the block key alone: `purge(block)`
 //! probes the block's grains, `purgeRange(block, rel, len)` exactly the
-//! grains an in-place write (W1) rewrote. The key HASHES the block part
-//! only, so every grain of a block lives in one shard of the core and a
-//! window serve, a deposit and a purge each take one lock.
+//! grains an in-place write (W1) rewrote. The key's SHARD hash covers the
+//! block part only, so every grain of a block lives in one shard of the
+//! core and a window serve, a deposit and a purge each take one lock; the
+//! index's hash is the grain's own.
 //!
 //! The direction-specific parts are the Sink and the fill path: on
 //! eviction the DROP sink releases the grain's slab slot under the lock
@@ -109,14 +110,18 @@ pub fn slabSlots(budget_bytes: u64, shards: u32, cores: u32) u32 {
     return @intCast(budget_bytes / GRAIN + shards + @as(u64, cores) * WINDOW_MAX_GRAINS);
 }
 
-/// A grain's key: the block it belongs to (hashed — one shard per block)
-/// and its device offset (compared).
+/// A grain's key: its device offset (the index's hash and the comparison)
+/// and the block it belongs to (the SHARD's hash — one shard per block).
 pub const GrainKey = struct {
     vol_tag: u64,
     block_off: u64,
     offset: u64,
 
     pub fn hash(self: GrainKey) u64 {
+        return BlockKey.init(self.vol_tag, self.offset).hash();
+    }
+
+    pub fn shardHash(self: GrainKey) u64 {
         return BlockKey.init(self.vol_tag, self.block_off).hash();
     }
 
@@ -420,12 +425,15 @@ test "tie: 25 % of 100 GiB RAM is a 25 GiB read cache; a cage below the solo 70 
     try testing.expectEqual(@as(usize, 16), WINDOW_MAX_GRAINS);
     // Slots: grains + shards + one window per core.
     try testing.expectEqual(@as(u32, 1024 + 2 + 2 * 16), slabSlots(4 * derive.MiB, 2, 2));
-    // Every grain of a block hashes to the block; grains compare by offset.
+    // Every grain of a block SHARDS to the block; the index hashes and
+    // compares the grain (one hash for both made a block's grains one
+    // probe cluster: the lanes burned 96 % of the box on the first A/B).
     const a: GrainKey = .{ .vol_tag = 1, .block_off = 1 << 22, .offset = (1 << 22) + 4096 };
     const b: GrainKey = .{ .vol_tag = 1, .block_off = 1 << 22, .offset = (1 << 22) + 8192 };
-    try testing.expectEqual(a.hash(), b.hash());
+    try testing.expectEqual(a.shardHash(), b.shardHash());
+    try testing.expect(a.hash() != b.hash());
     try testing.expect(!a.eql(b));
-    try testing.expectEqual(BlockKey.init(1, 1 << 22).hash(), a.hash());
+    try testing.expectEqual(BlockKey.init(1, 1 << 22).hash(), a.shardHash());
 }
 
 fn fillGrain(buf: []u8, tag: u8) void {

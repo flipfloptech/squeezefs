@@ -11,12 +11,16 @@
 //! imports no plane.
 //!
 //! `Cache(Entry, Sink)`:
-//!   - `Entry` is a plain value with `key: Key` (`Key.hash() u64`,
-//!     `Key.eql()`), `ino: u64`, `epoch: u64` (the inode's lease/witness
-//!     epoch it was filled under) and `bytes: u32` (the memory it charges).
-//!     The shard is `key.hash() & mask`: a Key whose hash covers only part
-//!     of the key (a block, not the grain) keeps related entries in one
-//!     shard so `lookupMany` and a ranged invalidation take one lock.
+//!   - `Entry` is a plain value with `key: Key` (`Key.hash() u64` over the
+//!     WHOLE key — the index's hash, distinct per entry —, `Key.eql()`,
+//!     and optionally `Key.shardHash() u64`), `ino: u64`, `epoch: u64` (the
+//!     inode's lease/witness epoch it was filled under) and `bytes: u32`
+//!     (the memory it charges). The shard is `shardHash() & mask` when the
+//!     Key declares it (a hash over PART of the key — a block, not the
+//!     grain — keeps related entries in one shard so `lookupMany` and a
+//!     ranged invalidation take one lock), else `hash() & mask`. The two
+//!     must differ when related keys share a shard: one hash for both
+//!     made every grain of a block one probe cluster of the shard's map.
 //!   - `Sink` has `onEvict(*Sink, *const Entry, Why) Outcome` and the
 //!     comptime `runs_under_lock`. A sink that runs under the lock (the
 //!     drop sink: a slot's reference released, never blocking) is called
@@ -376,7 +380,8 @@ pub fn Cache(comptime Entry: type, comptime Sink: type) type {
         }
 
         pub fn shardIndex(self: *const Self, key: Key) usize {
-            return @intCast(key.hash() & self.mask);
+            const h = if (@hasDecl(Key, "shardHash")) key.shardHash() else key.hash();
+            return @intCast(h & self.mask);
         }
 
         fn shardOf(self: *Self, key: Key) *Shard {
@@ -743,8 +748,11 @@ const TestKey = struct {
     ino: u64,
     off: u64,
 
-    /// The shard covers the ino alone: one ino's entries share a shard.
     pub fn hash(self: TestKey) u64 {
+        return std.hash.Wyhash.hash(0, std.mem.asBytes(&self));
+    }
+    /// The shard covers the ino alone: one ino's entries share a shard.
+    pub fn shardHash(self: TestKey) u64 {
         return std.hash.Wyhash.hash(0, std.mem.asBytes(&self.ino));
     }
     pub fn eql(a: TestKey, b: TestKey) bool {

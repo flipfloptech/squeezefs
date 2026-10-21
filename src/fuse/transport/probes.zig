@@ -357,7 +357,7 @@ pub fn modeGauge(m: geometry.BufferMode) u64 {
         .user_ents => 0,
         .buf_ring => 1,
         .zero_copy => 2,
-        .mainline_pool => 3,
+        .mainline_pool => 3, // the gauge word after the legacy rungs (`transport_buffer_mode`'s doc)
     };
 }
 

@@ -594,6 +594,14 @@ pub fn prepCommitMainline(sqe: *uring128.Sqe128, qid: u16, commit_id: u64, gent:
     sqe.user_data = tagOf(.commit, gent);
 }
 
+/// The pool → fd store (`WRITE_FIXED(pool @ addr → fd @ off)`): a pooled
+/// hold's direct device write. `addr` is the USER address inside the
+/// registered pool (a user buffer, unlike the zc slot's byte offset).
+pub fn prepPoolStore(sqe: *uring128.Sqe128, fd: linux.fd_t, off: u64, len: u32, addr: u64, gent: u32) void {
+    uring128.prepWriteFixed(sqe, .{ .raw = fd }, Pool.POOL_INDEX, off, len, addr);
+    sqe.user_data = tagOf(.bridge, gent);
+}
+
 /// The zero-copy slot of ring-local entry `ent_idx` in this ring's
 /// fixed-buffer table: the entry itself on the legacy rung (the headers sit
 /// at `depth`), `1 + ent_idx` on the mainline rung (the pool sits at 0).
@@ -1162,6 +1170,10 @@ pub const Group = struct {
     /// into the slot by `commitReady` before the next delivery).
     meta_out: codec.OutBuf = undefined,
     held_len: []u32,
+    /// Per gent: the held WRITE sits in the POOL buffer (mainline, copied
+    /// by the kernel), so its direct store reads the pool at `POOL_INDEX`
+    /// by user address, not the zc slot by offset.
+    held_pool: []bool,
     /// Per gent: the bounce window's page-rounded high-water since its
     /// last punch (0 = no pages), and the budget tick the ent last went
     /// idle (committed) — the idle-trim law's inputs.
@@ -1190,8 +1202,7 @@ pub const Group = struct {
     ceilings: NowaitCeilings = .{},
     affinity: ?placement.CpuSet,
     thread: ?std.Thread = null,
-    /// 0 starting, 1 armed, 2 failed, 3 failed with the typed kmbuf
-    /// ENOMEM refusal (`StartError.KmbufRingEnomem`).
+    /// `Started`: 0 starting, 1 armed, else the typed failure.
     started: futex.Word = .init(0),
     /// 1 once the drain flushed its synthesized commits (the session's
     /// `umount2` waits for it so no blocked caller still holds the mount).
@@ -1253,6 +1264,30 @@ pub const Group = struct {
     /// collision's ENOTCONN).
     pub const StartError = error{ ThreadSpawnFailed, RingSetupFailed, KmbufRingEnomem, MainlinePoolRefused };
     const RingError = error{ RingSetupFailed, KmbufRingEnomem, MainlinePoolRefused };
+    /// The `started` word: the worker thread stores it once, `start` reads it.
+    const Started = enum(u32) {
+        starting = 0,
+        armed = 1,
+        ring_failed = 2,
+        kmbuf_enomem = 3,
+        pool_refused = 4,
+
+        fn ofRingError(e: RingError) Started {
+            return switch (e) {
+                error.KmbufRingEnomem => .kmbuf_enomem,
+                error.MainlinePoolRefused => .pool_refused,
+                error.RingSetupFailed => .ring_failed,
+            };
+        }
+
+        fn toStartError(self: Started) StartError {
+            return switch (self) {
+                .kmbuf_enomem => error.KmbufRingEnomem,
+                .pool_refused => error.MainlinePoolRefused,
+                else => error.RingSetupFailed,
+            };
+        }
+    };
 
     /// Allocate the group's tables and buffers (startup; nothing per op).
     pub fn init(gpa: std.mem.Allocator, shared: *Shared, index: u16, qids: []const u16, share: geometry.RingShare, affinity: ?placement.CpuSet) InitError!*Group {
@@ -1291,6 +1326,7 @@ pub const Group = struct {
             .bridge_parked = &.{},
             .local_msgs = &.{},
             .held_len = &.{},
+            .held_pool = &.{},
             .bounce_populated = &.{},
             .bounce_idle_tick = &.{},
             .fused = undefined,
@@ -1374,6 +1410,9 @@ pub const Group = struct {
         self.held_len = try gpa.alloc(u32, gents);
         errdefer gpa.free(self.held_len);
         @memset(self.held_len, 0);
+        self.held_pool = try gpa.alloc(bool, gents);
+        errdefer gpa.free(self.held_pool);
+        @memset(self.held_pool, false);
         self.bounce_populated = try gpa.alloc(u32, gents);
         errdefer gpa.free(self.bounce_populated);
         @memset(self.bounce_populated, 0);
@@ -1436,7 +1475,7 @@ pub const Group = struct {
             l.deinit();
             self.lane = null;
         }
-        if (self.started.load(.acquire) == 1) {
+        if (self.started.load(.acquire) == @backingInt(Started.armed)) {
             // The kmbuf region holds every in-flight request's payload (a
             // LOOKUP's name, a WRITE's data): unmapped only here, once no
             // handler can still read it — never at the worker's exit, which
@@ -1457,6 +1496,7 @@ pub const Group = struct {
         for (self.bounce_populated) |b| zc_bounce_resident_bytes.sub(b);
         self.gpa.free(self.bounce_idle_tick);
         self.gpa.free(self.bounce_populated);
+        self.gpa.free(self.held_pool);
         self.gpa.free(self.held_len);
         self.gpa.free(self.local_msgs);
         self.gpa.free(self.bridge_parked);
@@ -1578,7 +1618,7 @@ pub const Group = struct {
     pub fn requestBounceTrim(self: *Group, min_idle_ticks: u64) void {
         if (self.shared.slab == null) return;
         self.bounce_trim_request.store(min_idle_ticks + 1, .release);
-        if (self.started.load(.acquire) == 1) _ = self.ring.wake();
+        if (self.started.load(.acquire) == @backingInt(Started.armed)) _ = self.ring.wake();
     }
 
     /// The pass half: punch every populated window whose ent owes nothing
@@ -1674,7 +1714,7 @@ pub const Group = struct {
     /// The unconditional wake (shutdown): the worker must wake to read
     /// `active == false` whatever the coalescer says.
     pub fn forceWake(self: *Group) void {
-        if (self.started.load(.acquire) == 1) self.ring.forceWake();
+        if (self.started.load(.acquire) == @backingInt(Started.armed)) self.ring.forceWake();
     }
 
     // ---- lifecycle ----
@@ -1684,18 +1724,12 @@ pub const Group = struct {
     pub fn start(self: *Group) StartError!void {
         assert(self.thread == null);
         self.thread = std.Thread.spawn(.{}, threadMain, .{self}) catch return error.ThreadSpawnFailed;
-        while (self.started.load(.acquire) == 0) futex.wait(&self.started, 0);
-        switch (self.started.load(.acquire)) {
-            1 => {},
-            else => |failed| {
-                self.thread.?.join();
-                self.thread = null;
-                return switch (failed) {
-                    3 => error.KmbufRingEnomem,
-                    4 => error.MainlinePoolRefused,
-                    else => error.RingSetupFailed,
-                };
-            },
+        while (self.started.load(.acquire) == @backingInt(Started.starting)) futex.wait(&self.started, @backingInt(Started.starting));
+        const word: Started = @fromBackingInt(@intCast(self.started.load(.acquire)));
+        if (word != .armed) {
+            self.thread.?.join();
+            self.thread = null;
+            return word.toStartError();
         }
     }
 
@@ -1770,11 +1804,7 @@ pub const Group = struct {
         self.applyAffinity();
         self.initRing() catch |e| {
             _ = self.shared.barrier.complete(.failed);
-            self.started.store(switch (e) {
-                error.KmbufRingEnomem => 3,
-                error.MainlinePoolRefused => 4,
-                error.RingSetupFailed => 2,
-            }, .release);
+            self.started.store(@backingInt(Started.ofRingError(e)), .release);
             futex.wakeAll(&self.started);
             return;
         };
@@ -1784,7 +1814,7 @@ pub const Group = struct {
                 if (self.kmb) |*k| k.teardown(&self.ring.ring);
                 self.kmb = null;
                 _ = self.shared.barrier.complete(.failed);
-                self.started.store(2, .release);
+                self.started.store(@backingInt(Started.ring_failed), .release);
                 futex.wakeAll(&self.started);
                 return;
             };
@@ -1793,7 +1823,7 @@ pub const Group = struct {
         defer current_group = null;
         if (self.shared.test_bridge_ceiling != 0) self.ceilings.force = self.shared.test_bridge_ceiling;
         self.registerAll();
-        self.started.store(1, .release);
+        self.started.store(@backingInt(Started.armed), .release);
         futex.wakeAll(&self.started);
         defer pass_stamps.clear(self.index);
         self.runLoop();
@@ -2444,14 +2474,18 @@ pub const Group = struct {
             sq_full.fire("transport ring SQ cannot take a bridge's pieces after a flush");
             return false;
         }
-        // The slot's index in THIS ring's table (the pool shifts it by one).
+        // The slot's index in THIS ring's table (the pool shifts it by one);
+        // a pooled hold's store reads the POOL buffer by its user address.
         const e = self.zcSlot(self.entIdxOf(gent));
+        const pool_src: ?[*]u8 = if (!fetch and pend.kind == .direct_store and self.held_pool[gent]) self.poolWindow(gent).ptr else null;
         var done: u32 = 0;
         var i: u32 = 0;
         while (i < pieces) : (i += 1) {
             const plen: u32 = if (pieces == 1) pend.len else @min(ceiling, pend.len - done);
             const sqe = self.takeSqe() orelse return false;
-            if (fetch) prepBridgeFetch(sqe, src_fd, src_off + done, plen, e, gent, done) else prepBridgeStore(sqe, src_fd, src_off + done, plen, e, gent, done);
+            if (pool_src) |p| {
+                prepPoolStore(sqe, src_fd, src_off + done, plen, @intFromPtr(p) + done, gent);
+            } else if (fetch) prepBridgeFetch(sqe, src_fd, src_off + done, plen, e, gent, done) else prepBridgeStore(sqe, src_fd, src_off + done, plen, e, gent, done);
             done += plen;
         }
         // Every bounce bridge names the window bytes in play (a staged body
@@ -2679,6 +2713,9 @@ pub const Group = struct {
         const self: *Group = @ptrCast(@alignCast(ctx.?));
         const cell = &self.extract_cells[gent];
         if (cell.done_len != 0) return self.bounce(gent)[0..cell.done_len];
+        // A pooled hold's bytes are in hand (the lease answers them before
+        // reaching here); the belt for a caller that asks the face anyway.
+        if (self.held_pool[gent]) return self.poolWindow(gent)[0..self.held_len[gent]];
         if (!self.shared.isActive()) return error.SessionClosed;
         cell.event.reset();
         cell.res = 0;
@@ -3415,6 +3452,7 @@ pub const Group = struct {
         m.slots.onDeliver(ent_idx, unique, commit_id, now);
         ring_requests.inc();
         self.extract_cells[gent].done_len = 0;
+        self.held_pool[gent] = false;
         const ent = m.slots.ent(ent_idx);
         if (ent.lease.leased()) {
             // A previous lease still reads this buffer: never hand it out again.
@@ -3446,6 +3484,10 @@ pub const Group = struct {
                 pool_zc_deliveries.inc();
             }
             if (ent.dir == .source and announced > 0) return self.deliverPagedWrite(gent, announced);
+            // A WRITE the kernel copied into the pool: hold it THERE when the
+            // shape and the filesystem's gate admit it — the pool is a
+            // registered buffer, so the device write reads it directly.
+            if (op == .write and announced > 0 and self.tryHoldPooled(gent, announced)) return;
         } else if (self.shared.zeroCopy()) {
             const op = (abi.decodePrefix(abi.fuse_in_header, &hdr.in_out) orelse return self.failEnt(gent, .INVAL)).op();
             ent.dir = zc.dirOf(op, self.shared.readdirLatch());
@@ -3488,6 +3530,36 @@ pub const Group = struct {
         if (!self.pushBridge(gent, .{ .kind = .write_extract, .len = @intCast(announced) }, self.bounceFd(gent), self.bounceOffset(gent), false)) {
             return self.failEnt(gent, .IO);
         }
+    }
+
+    /// A WRITE delivered through the mainline pool (no zc flag: the kernel
+    /// copied the bytes into the queue's pool buffer, a registered buffer
+    /// of this ring): HELD in the pool iff the shape (`zc.holdShape`) and
+    /// the filesystem's gate say so — the handler then stores it by
+    /// `WRITE_FIXED(device ← pool @ window)` with no daemon copy (charter
+    /// §6.2 item 1's lever (b) on a copied payload), or reads the bytes in
+    /// hand (never a bridge: `PayloadLease.bytes` answers `data`). False
+    /// when not held: the plain lease path follows.
+    fn tryHoldPooled(self: *Group, gent: u32, announced: usize) bool {
+        if (self.shared.pool == null) return false;
+        const m = self.memberOf(gent);
+        const ent_idx = self.entIdxOf(gent);
+        const hdr = self.headerOf(gent);
+        const ent = m.slots.ent(ent_idx);
+        const win = abi.decodePrefix(abi.fuse_write_in, &hdr.op_in) orelse return false;
+        // The announced payload is the data alone (the write_in rode op_in).
+        if (@as(usize, win.size) != announced) return false;
+        const pool_win = self.poolWindow(gent);
+        if (win.size > pool_win.len) return false;
+        ent.class = zc.PayloadClass.classify(win.flags, win.write_flags);
+        const hint: fsv.HoldHint = .{ .ino = std.mem.readInt(u64, hdr.in_out[16..24], .little), .offset = win.offset, .len = win.size, .class = ent.class };
+        if (!zc.holdShape(win.offset, win.size, self.shared.block_size) or !self.shared.fs.writeHoldEligible(hint)) return false;
+        ent.held = true;
+        self.held_len[gent] = win.size;
+        self.held_pool[gent] = true;
+        const lease = slot.PayloadLease.acquireHeldPooled(&ent.lease, self.waker(), pool_win[0..win.size], ent.class, m.qid, self.slotIdx(ent_idx), gent, self.heldFace());
+        self.deliverParsed(gent, pool_win[0..announced], announced, lease);
+        return true;
     }
 
     /// The at-delivery extraction landed: the WRITE dispatches now over a
@@ -4018,7 +4090,7 @@ const testing = std.testing;
 
 test "REGISTER SQE bytes: URING_CMD on fixed file 0, cmd_op 1 at +8, the 2-iovec array at +16 with len 2 at +24, buf_index 0, qid at +64, the union u16 at +66 zero; COMMIT carries commit_id at +56 and cmd_op 2" {
     var sqe: uring128.Sqe128 = undefined;
-    var iovs: [2]std.posix.iovec = .{ .{ .base = @ptrFromInt(0x1000), .len = 288 }, .{ .base = @ptrFromInt(0x2000), .len = 1 << 20 } };
+    var iovs: [2]RegIov = .{ .{ .base = @ptrFromInt(0x1000), .len = 288 }, .{ .base = @ptrFromInt(0x2000), .len = 1 << 20 } };
     prepRegister(&sqe, 7, &iovs, 3);
     const raw: *const [128]u8 = @ptrCast(&sqe);
     try testing.expectEqual(@backingInt(linux.IORING_OP.URING_CMD), raw[0]);

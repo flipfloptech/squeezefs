@@ -2080,6 +2080,7 @@ pub const Session = struct {
         try field(w, "transport_pool_offset_off_boundary", worker.pool_offset_off_boundary.load());
         try field(w, "transport_pool_setup_late_cqes", worker.pool_setup_late_cqes.load());
         try field(w, "transport_pool_zc_unarmed", worker.pool_zc_unarmed.load());
+        try field(w, "transport_pool_write_holds", slot.pool_write_holds.load());
         try field(w, "transport_zc_bounce_bytes", worker.zc_bounce_resident_bytes.load());
         try field(w, "transport_zc_bounce_reserve_bytes", zc_bounce_slab_bytes.load());
         try field(w, "transport_zc_bounce_trimmed_bytes", worker.zc_bounce_trimmed_bytes.load());
@@ -3633,6 +3634,50 @@ test "e2e mainline pools (Linux ≥ 7.3; skips where INIT offers no bufpool): `a
         try testing.expectEqual(@as(u64, 0), worker.pool_offset_off_boundary.load());
         try testing.expectEqual(@as(u64, 0), worker.pool_setup_late_cqes.load());
         try testing.expectEqual(@as(u64, 0), worker.pool_zc_unarmed.load());
+    }
+    // The POOLED hold: a copied WRITE (a zero-message open carries no
+    // zero-copy grant — SQUEEZEFS_FUSE_ZC_OPEN=0 under no_open keeps it) is
+    // held in its pool buffer and stored to the device straight from it.
+    {
+        const rig = try Rig.init(testing.allocator, 67, &.{.{ "SQUEEZEFS_FUSE_ZC_OPEN", "0" }});
+        defer rig.deinit();
+        const dev_rc = linux.memfd_create("sqz-pool-hold-dev", linux.MFD.CLOEXEC);
+        try testing.expect(linux.errno(dev_rc) == .SUCCESS);
+        const dev_fd: linux.fd_t = @intCast(dev_rc);
+        defer _ = linux.close(dev_fd);
+        try testing.expect(linux.errno(linux.ftruncate(dev_fd, 8 << 20)) == .SUCCESS);
+        rig.fs.hold_eligible = true;
+        rig.fs.no_open = true;
+        const s = try rig.mountIt(.{ .mem_budget_bytes = 0, .no_open = true });
+        try testing.expectEqual(geometry.BufferMode.mainline_pool, s.mode);
+        try testing.expect(s.noOpen());
+        try testing.expectEqual(s.zeroCopyArmed(), rig.fs.caps.?.zc_create_only);
+        rig.fs.held_store = .{ .ctx = s, .fd = dev_fd, .store = &storeHeldThunk };
+        const ph0 = slot.pool_write_holds.load();
+        const pz0 = worker.pool_zc_deliveries.load();
+        var pb: [256]u8 = undefined;
+        const fd = try openPath(rig.child(&pb, "scratch"), .{ .ACCMODE = .WRONLY, .CLOEXEC = true });
+        defer _ = linux.close(fd);
+        const mib: usize = 1 << 20;
+        const buf = try testing.allocator.alignedAlloc(u8, .fromByteUnits(4096), mib);
+        defer testing.allocator.free(buf);
+        for (buf, 0..) |*b, i| b.* = @truncate((i * 11) ^ (i >> 10));
+        try testing.expectEqual(mib, linux.pwrite(fd, buf.ptr, mib, 0));
+        try testing.expectEqual(@as(u64, 1), rig.fs.held_writes.load(.monotonic));
+        try testing.expectEqual(@as(u64, 1), rig.fs.direct_stores.load(.monotonic));
+        try testing.expectEqual(@as(u64, 0), rig.fs.lazy_extracts.load(.monotonic));
+        try testing.expectEqual(ph0 + 1, slot.pool_write_holds.load());
+        try testing.expectEqual(pz0, worker.pool_zc_deliveries.load());
+        const got = try testing.allocator.alloc(u8, mib);
+        defer testing.allocator.free(got);
+        try testing.expectEqual(mib, try preadAt(dev_fd, got, 0));
+        try testing.expectEqualSlices(u8, buf, got);
+        // The same bytes are in hand: a declining filesystem reads them with no bridge.
+        rig.fs.hold_eligible = false;
+        const tail = "pooled tail";
+        try testing.expectEqual(@as(usize, tail.len), linux.pwrite(fd, tail, tail.len, 4096));
+        try testing.expectEqualSlices(u8, tail, rig.fs.scratch[4096..][0..tail.len]);
+        try testing.expectEqual(ph0 + 1, slot.pool_write_holds.load());
     }
     for ([_][]const u8{ "bufring", "zc" }, 0..) |mode, i| {
         const rig = try Rig.init(testing.allocator, 65 + @as(u32, @intCast(i)), &.{modeEnv(mode)});

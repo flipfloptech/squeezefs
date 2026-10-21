@@ -130,6 +130,10 @@ pub var retain_refused: counters.Tripwire = .init("transport_zc_retain_refused")
 /// a slot whose pages are not a held WRITE, or a session without retention
 /// — committed plain instead.
 pub var retain_refused_class: counters.ShardedCounter = .{};
+/// `transport_pool_write_holds`: mainline WRITEs held in their POOL buffer
+/// (copied there by the kernel, stored to the device straight from it —
+/// no zc slot, no daemon copy); a subset of `transport_zc_write_holds`.
+pub var pool_write_holds: counters.ShardedCounter = .{};
 /// `transport_zc_direction_refusals`: a reply body aimed at a WRITE
 /// (`ITER_SOURCE`) slot — a `READ_FIXED` into it would be -EFAULT — refused
 /// header-only -EIO.
@@ -358,7 +362,20 @@ pub const PayloadLease = struct {
         return l;
     }
 
-    /// The direct leg's coordinates, or null when the payload is in hand.
+    /// Worker side at a HELD delivery whose bytes are ALSO in hand (the
+    /// mainline pool: a WRITE the kernel copied into the queue's pool, a
+    /// registered buffer the ring can `WRITE_FIXED` from directly — charter
+    /// §6.2 item 1's lever (b) with no zc slot): the direct leg has its
+    /// coordinates, `bytes` answers `data` with no bridge.
+    pub fn acquireHeldPooled(state: *LeaseState, waker: Waker, data: []const u8, class: zc.PayloadClass, qid: u16, ent_idx: u16, gent: u32, face: HeldFace) PayloadLease {
+        var l = acquireHeld(state, waker, @intCast(data.len), class, qid, ent_idx, gent, face);
+        l.data = data;
+        pool_write_holds.inc();
+        return l;
+    }
+
+    /// The direct leg's coordinates, or null when the payload is only in
+    /// hand (a pooled hold carries both).
     pub fn heldSource(self: PayloadLease) ?HeldSource {
         if (!self.held) return null;
         return .{ .qid = self.qid, .buf_index = self.ent_idx, .len = self.held_len };
@@ -374,10 +391,11 @@ pub const PayloadLease = struct {
         return src.len;
     }
 
-    /// The payload as a view: `data` when in hand, else the extracted
-    /// bounce view (valid until the reply is submitted).
+    /// The payload as a view: `data` when in hand (a plain lease, or a
+    /// pooled hold), else the extracted bounce view (valid until the reply
+    /// is submitted).
     pub fn bytes(self: PayloadLease, io: Io) ExtractError![]const u8 {
-        if (!self.held) return self.data;
+        if (!self.held or self.data.len != 0) return self.data;
         const face = self.face orelse return error.SlotNotHeld;
         return face.extract(face.ctx, self.gent, io);
     }
@@ -981,6 +999,19 @@ test "a held lease answers heldSource with the slot coordinates and extracts thr
     try testing.expectEqualSlices(u8, "inhand", dst[0..6]);
     try testing.expectEqual(@as(u32, 1), face.calls);
     plain.release();
+    // A pooled hold: the slot coordinates AND the bytes in hand — the face
+    // is never asked, both hold counters move.
+    var s3: LeaseState = .{};
+    const pooled0 = pool_write_holds.load();
+    const pooled = PayloadLease.acquireHeldPooled(&s3, waker, "pooledby", .page_cache, 2, 6, 10, .{ .ctx = &face, .extract = Face.extract });
+    try testing.expectEqual(holds + 2, zc_write_holds.load());
+    try testing.expectEqual(pooled0 + 1, pool_write_holds.load());
+    try testing.expectEqual(HeldSource{ .qid = 2, .buf_index = 6, .len = 8 }, pooled.heldSource().?);
+    try testing.expectEqualSlices(u8, "pooledby", try pooled.bytes(testing.io));
+    try testing.expectEqual(@as(usize, 8), try pooled.extract(testing.io, &dst));
+    try testing.expectEqualSlices(u8, "pooledby", dst[0..8]);
+    try testing.expectEqual(@as(u32, 1), face.calls);
+    pooled.release();
 }
 
 test "REGISTER failures back off 1, 2, 4 … 64 ms (monotone, ≥ base, ≤ max) then retire on the 8th; success resets; the nearest deadline bounds the park and is consumed once due" {

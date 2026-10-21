@@ -1,0 +1,154 @@
+From 1a478df03a87f2fe8f438c608afe0a8af5df1640 Mon Sep 17 00:00:00 2001
+From: Justin Oberdorf <109311040+flipfloptech@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 15:32:57 -0400
+Subject: [RFC PATCH] fuse: io-uring: zero-copy default for zero-message opens
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Since 7.3 io-uring zero-copy is granted per open file: the server sets
+FOPEN_IO_URING_ZERO_COPY in the FUSE_OPEN / FUSE_CREATE reply and the
+read and write paths take args->zero_copy from ff->open_flags.
+
+A server that implements zero-message opens — answers the first
+FUSE_OPEN with ENOSYS so fc->no_open latches and every later open and
+release of a regular file is local — sends no reply that could carry
+the flag: none of its files are ever zero-copied, although the serving
+queue was created with FUSE_URING_ZERO_COPY by a privileged server. The
+two features exclude each other today, and both are worth having: on
+the same filesystem zero-message opens measured open/close from four
+threads 6.6x (the RELEASE work was the bound), open + 4 KiB read + close
+5.6x and mdtest file creation 1.18x (OPEN + RELEASE were 27 % of
+mdtest's requests), while zero-copy measured 1 MiB sequential writes
+1.9-2.5x with the server's io-wq share going 26 % -> 2.6 %, and 4 KiB
+random reads 1.04-1.08x. A server must choose per MOUNT between the
+data rows and the metadata rows.
+
+Add an INIT flag, FUSE_IO_URING_ZERO_COPY_DEFAULT, advertised beside
+FUSE_HAS_IO_URING_BUFPOOL and honoured when echoed on a connection that
+negotiated FUSE_OVER_IO_URING: a regular file the kernel opens locally
+under fc->no_open gets FOPEN_IO_URING_ZERO_COPY in its open_flags, as if
+a reply had set it. A served OPEN/CREATE reply still states its own
+flags (before the first ENOSYS, and for a server that serves opens the
+bit changes nothing); directories are untouched; a queue not created
+zero-copy keeps copying (can_zero_copy_req() checks queue->zero_copy
+too), so echoing the bit on a copying queue costs nothing; the
+CAP_SYS_ADMIN check stays on FUSE_URING_ZERO_COPY at ADD_QUEUE, which
+the bit does not bypass.
+
+The bit number (46) is a placeholder for the maintainer's allocation;
+the minor bump to 7.47 likewise.
+
+Signed-off-by: Justin Oberdorf <109311040+flipfloptech@users.noreply.github.com>
+---
+ fs/fuse/file.c            |  2 ++
+ fs/fuse/fuse_i.h          |  7 +++++++
+ fs/fuse/inode.c           |  8 ++++++--
+ include/uapi/linux/fuse.h | 10 +++++++++-
+ 4 files changed, 24 insertions(+), 3 deletions(-)
+
+diff --git a/fs/fuse/file.c b/fs/fuse/file.c
+index 9a36d0329e22..f071d7a52a44 100644
+--- a/fs/fuse/file.c
++++ b/fs/fuse/file.c
+@@ -154,6 +154,8 @@ struct fuse_file *fuse_file_open(struct fuse_mount *fm, u64 nodeid,
+ 	ff->fh = 0;
+ 	/* Default for no-open */
+ 	ff->open_flags = FOPEN_KEEP_CACHE | (isdir ? FOPEN_CACHE_DIR : 0);
++	if (!isdir && fc->io_uring_zc_default)
++		ff->open_flags |= FOPEN_IO_URING_ZERO_COPY;
+ 	if (open) {
+ 		/* Store outarg for fuse_finish_open() */
+ 		struct fuse_open_out *outargp = &ff->args->open_outarg;
+diff --git a/fs/fuse/fuse_i.h b/fs/fuse/fuse_i.h
+index c8d4c5f3af7e..983e72d449a6 100644
+--- a/fs/fuse/fuse_i.h
++++ b/fs/fuse/fuse_i.h
+@@ -555,6 +555,13 @@ struct fuse_conn {
+ 	/** @no_opendir: Is opendir/releasedir not implemented by fs? */
+ 	unsigned no_opendir:1;
+ 
++	/**
++	 * @io_uring_zc_default: a local (no_open) open of a regular file is
++	 * zero-copy over io-uring, as if its reply had set
++	 * FOPEN_IO_URING_ZERO_COPY
++	 */
++	unsigned io_uring_zc_default:1;
++
+ 	/** @no_fsync: Is fsync not implemented by fs? */
+ 	unsigned no_fsync:1;
+ 
+diff --git a/fs/fuse/inode.c b/fs/fuse/inode.c
+index e9552be3637b..34ea01f2501c 100644
+--- a/fs/fuse/inode.c
++++ b/fs/fuse/inode.c
+@@ -1405,8 +1405,11 @@ static void process_init_reply(struct fuse_args *args, int error)
+ 				else
+ 					ok = false;
+ 			}
+-			if (flags & FUSE_OVER_IO_URING && fuse_uring_enabled())
++			if (flags & FUSE_OVER_IO_URING && fuse_uring_enabled()) {
+ 				io_uring_enabled = true;
++				if (flags & FUSE_IO_URING_ZERO_COPY_DEFAULT)
++					fc->io_uring_zc_default = 1;
++			}
+ 
+ 			if (flags & FUSE_REQUEST_TIMEOUT)
+ 				timeout = arg->request_timeout;
+@@ -1481,7 +1484,8 @@ static struct fuse_init_args *fuse_new_init(struct fuse_mount *fm)
+ 		flags |= FUSE_PASSTHROUGH;
+ 
+ 	if (fuse_uring_enabled())
+-		flags |= FUSE_OVER_IO_URING | FUSE_HAS_IO_URING_BUFPOOL;
++		flags |= FUSE_OVER_IO_URING | FUSE_HAS_IO_URING_BUFPOOL |
++			 FUSE_IO_URING_ZERO_COPY_DEFAULT;
+ 
+ 	ia->in.flags = flags;
+ 	ia->in.flags2 = flags >> 32;
+diff --git a/include/uapi/linux/fuse.h b/include/uapi/linux/fuse.h
+index 7435e09c87fe..264a77c07117 100644
+--- a/include/uapi/linux/fuse.h
++++ b/include/uapi/linux/fuse.h
+@@ -248,6 +248,9 @@
+  *  - add bufpool offset field to fuse_uring_ent_in_out struct
+  *  - add FUSE_URING_ZERO_COPY, FUSE_URING_ENT_ZERO_COPY, and
+  *    FOPEN_IO_URING_ZERO_COPY flag
++ *
++ *  7.47
++ *  - add FUSE_IO_URING_ZERO_COPY_DEFAULT
+  */
+ 
+ #ifndef _LINUX_FUSE_H
+@@ -283,7 +286,7 @@
+ #define FUSE_KERNEL_VERSION 7
+ 
+ /** Minor version number of this interface */
+-#define FUSE_KERNEL_MINOR_VERSION 46
++#define FUSE_KERNEL_MINOR_VERSION 47
+ 
+ /** The node ID of the root inode */
+ #define FUSE_ROOT_ID 1
+@@ -464,6 +467,10 @@ struct fuse_file_lock {
+  * FUSE_REQUEST_TIMEOUT: kernel supports timing out requests.
+  *			 init_out.request_timeout contains the timeout (in secs)
+  * FUSE_HAS_IO_URING_BUFPOOL: kernel supports io-uring buffer pools
++ * FUSE_IO_URING_ZERO_COPY_DEFAULT: a regular file the kernel opens locally
++ *				    (after FUSE_OPEN answered ENOSYS) behaves as
++ *				    if its open reply had set
++ *				    FOPEN_IO_URING_ZERO_COPY
+  */
+ #define FUSE_ASYNC_READ		(1 << 0)
+ #define FUSE_POSIX_LOCKS	(1 << 1)
+@@ -512,6 +519,7 @@ struct fuse_file_lock {
+ #define FUSE_OVER_IO_URING	(1ULL << 41)
+ #define FUSE_REQUEST_TIMEOUT	(1ULL << 42)
+ #define FUSE_HAS_IO_URING_BUFPOOL (1ULL << 43)
++#define FUSE_IO_URING_ZERO_COPY_DEFAULT (1ULL << 46)
+ 
+ /**
+  * CUSE INIT request/reply flags
+
+base-commit: c03c1a14507dfaf8b856c2608f9ac216021fc222
+-- 
+2.56.0
+

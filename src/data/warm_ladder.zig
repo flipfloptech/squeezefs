@@ -386,11 +386,11 @@ pub const WarmLadder = struct {
     /// face: offered only on a zero-copy session.
     pub fn directLeg(self: *WarmLadder, ino: u64, offset: u64, size: u32, odirect: bool) ?fsv.DirectLeg {
         if (!self.direct_leg_armed) return null;
-        // The leg lands in the app's pages this process never sees: with
-        // the read cache on and the window grain-eligible, the lane's
-        // ranged read (a bounce, one copy, the deposit) fills the cache
-        // instead (`SQUEEZEFS_READ_CACHE_FILL=lane`; `leg` is the control
-        // arm). Device-true reads keep the leg: they are never deposited.
+        // The leg lands in the app's pages this process never sees: under
+        // `SQUEEZEFS_READ_CACHE_FILL=lane` a grain-eligible cold read takes
+        // the lane instead (a bounce, one copy, the deposit) — measured a
+        // regression on the RAM NVMe, so `leg` ships. Device-true reads
+        // keep the leg: they are never deposited.
         const rp = self.rp;
         if (rp.grains.enabled() and rp.cfg.read_cache_fill == .lane and size <= read_cache.WINDOW_MAX and !(rp.cfg.direct_device_true and odirect)) {
             stats.direct_leg_cache_demotes.inc();
@@ -674,16 +674,17 @@ test "the read cache on the queue thread: a cold probe demotes; on a zero-copy F
     const window = try testing.allocator.alignedAlloc(u8, .fromByteUnits(4096), 1 << 20);
     defer testing.allocator.free(window);
     const key2 = BlockKey.init(F.vol_tag, 2 * F.bs);
-    // On a zero-copy FUSE session the leg lands in the app's pages: with
-    // the cache on, the ladder declines it so the lane fills (the shipped
-    // arm); the control arm offers it.
+    // On a zero-copy FUSE session the leg lands in the app's pages: the
+    // shipped arm offers it (no fill from FUSE); the `lane` arm declines
+    // it so the lane fills.
     try testing.expectEqual(Verdict{ .demote = .miss }, ladder.probe(7, 8192, 4096, false, window));
+    try testing.expect(ladder.directLeg(7, 8192, 4096, false) != null);
+    f.rp.cfg.read_cache_fill = .lane;
     const demotes0 = stats.direct_leg_cache_demotes.load();
+    try testing.expectEqual(Verdict{ .demote = .miss }, ladder.probe(7, 8192, 4096, false, window));
     try testing.expectEqual(@as(?fsv.DirectLeg, null), ladder.directLeg(7, 8192, 4096, false));
     try testing.expectEqual(demotes0 + 1, stats.direct_leg_cache_demotes.load());
     f.rp.cfg.read_cache_fill = .leg;
-    try testing.expectEqual(Verdict{ .demote = .miss }, ladder.probe(7, 8192, 4096, false, window));
-    try testing.expect(ladder.directLeg(7, 8192, 4096, false) != null);
     // The IPC direct-drive's leg (`resolveDirectLeg`): the DMA lands in the
     // session arena this process owns (simulated here), the hook deposits
     // the landed window and validates.

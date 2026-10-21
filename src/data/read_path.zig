@@ -550,7 +550,7 @@ pub const Config = struct {
     /// `SQUEEZEFS_READ_CACHE_FILL`: a cold grain-eligible read on a zero-copy
     /// FUSE session takes the lane (and deposits) or the direct leg (and
     /// fills nothing).
-    read_cache_fill: ReadCacheFill = .lane,
+    read_cache_fill: ReadCacheFill = .leg,
     admission_policy: admission.Policy,
     fill_pct: u64,
     prefetch: prefetch.Config,
@@ -581,7 +581,7 @@ pub const Config = struct {
             .read_cache_bytes = read_cache.resolveReadCacheBytes(read_cache_pct, facts, mem_budget),
             .read_cache_pct = read_cache_pct,
             .read_cache_capacity = read_cache.derivedCapacity(read_cache_pct, machine_ram),
-            .read_cache_fill = if (std.mem.eql(u8, knobs.enumKnob("SQUEEZEFS_READ_CACHE_FILL", env), "leg")) .leg else .lane,
+            .read_cache_fill = if (std.mem.eql(u8, knobs.enumKnob("SQUEEZEFS_READ_CACHE_FILL", env), "lane")) .lane else .leg,
             .admission_policy = admission.Policy.fromEnv(env, hot),
             .fill_pct = knobs.intKnob("SQUEEZEFS_READ_ADMISSION_FILL_PCT", u64, env),
             .prefetch = prefetch.Config.fromEnv(env, hot, block_size, mem_budget),

@@ -248,3 +248,30 @@ as measured: an all-own write's passes are 0.35 per write and its enters 0.54 �
 no longer where the time goes, and the batching park's premise (≥ 2 owed completions per pass) still
 reads false (0.12 spins per write, each for one completion). Parity through FUSE is the client
 bypass's row (`rung-10-client-direct-writes.md`: 3.0 M).
+
+**Gate 57 on this branch (four reds), attributed.** THE WRITE-BACK TIMER UNDER A WRITER STORM failed at
+`rig.stats()` with `Transport endpoint is not connected` — its daemon died mid-storm — and three unit
+shards (`meta.backend` D4, `wire.tls_e2e` SCOPING, the session's late-commit seam row) ended
+`terminated with signal KILL`: no `HUNG TEST:` verdict (the hang watch exits 124 with every stack), no
+OOM record in the journal, four unrelated processes. Reproduced on the branch: the storm row **10/10**
+fresh on the defaults (fsck clean, 0 tripwire lines; parked ≤ 8 / 32 MiB, gate waits 1.7–2.0 k, cold
+flushes 1.65–1.93 k, residency max 1,049–1,068 ms), 1/1 at `RINGS_PER_QUEUE=2` and 1/1 at
+`WRITE_OWN_DEPTH=8`; the three tests 5/5 each alone and 3/3 each under a parallel dist build (walls
+within their cost rows once the venue's slot waits are subtracted; neither D4 nor the TLS row mounts a
+FUSE session). Two later targeted runs on the box lost one DIFFERENT session e2e row each to a bare
+SIGKILL, and one of this note's own `grep … squeezefs-unit` pipelines was `Killed` — the sweep the smoke
+harness already names (`judgeDeath`: "a concurrent runner swept the venue, `pkill -9 -x squeezefs` /
+`umount -l`"); a `bpftrace` probe on `kill(…, SIGKILL)` is armed for the next one. The
+`fsck_findings` / `block_untracked_free_refusals` lines beside the storm failure are the merged-census
+row's seam-ON arm, printed for the record in every green gate.
+
+**What the gate did find** (`506527c`): a ring's kmbuf region is `nextPow2(share) × payload`, and the
+ceil/rest split of 32 over three rings (11/11/10) pinned 16 + 16 + 16 MiB per queue — **+512 MiB pinned,
++570 MiB RSS per mount** (1.53 → 2.10 GiB measured on a format+mount of the gate binary), which a
+16-shard gate pays sixteen times over. The shares are now halvings of the largest (16/8/8; 8/8/8/8; two
+rings unchanged), so the regions never exceed the one-ring region (the tie test over depths 3–32):
+a three-ring mount is +45 MiB RSS and +32 threads (1.57 GiB, 152 threads, mount 180–215 ms vs 1.53
+GiB, 120, 160–180). A static cores ÷ queues bound was not taken: the queues are the CPUs, so it reads 1
+on every host. Two e2e rigs pin one ring per queue by name (the SQPOLL ladder: every ring a kernel
+poller; the late-commit seam: spent by the worker that ticks, which must be the owing one), and the
+smoke rig's `.stats` read judges an external SIGKILL of its daemon as the venue's sweep (SKIP, loud).

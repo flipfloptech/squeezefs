@@ -541,6 +541,12 @@ pub const Config = struct {
     /// 0 = the tier off). The fixture's default is off: its rows pin the
     /// whole-block ladder and arm the grain cache by name.
     read_cache_bytes: u64 = 0,
+    /// The knob's percentage and the slab's reservation (the percentage
+    /// of the MACHINE's RAM, `derive.Facts.probe()`): the live bound is
+    /// re-derived from the authority's budget up to it. The fixture's
+    /// reservation is its bound.
+    read_cache_pct: u64 = read_cache.DEFAULT_PCT,
+    read_cache_capacity: u64 = 0,
     /// `SQUEEZEFS_READ_CACHE_FILL`: a cold grain-eligible read on a zero-copy
     /// FUSE session takes the lane (and deposits) or the direct leg (and
     /// fills nothing).
@@ -552,6 +558,11 @@ pub const Config = struct {
     pub fn fromEnv(env: *const std.process.Environ.Map, block_size: u64, passthrough: bool, facts: derive.Facts, mem_budget: u64) Config {
         const read_mem = hot_tier.resolveReadMemLimit(knobs.optIntKnob("SQUEEZEFS_READ_MEM_CACHE_MB", u64, env), facts, mem_budget);
         const hot = hot_tier.resolveHotBudget(knobs.optIntKnob("SQUEEZEFS_READ_HOT_BLOCK_CACHE_MB", u64, env), block_size, read_mem);
+        const read_cache_pct = knobs.intKnob("SQUEEZEFS_READ_CACHE_PCT", u64, env);
+        // The reservation: the knob's share of the MACHINE (the facts
+        // here are the fleet share's; the mount's own CLI and supervisor
+        // make that share 3 at mount time).
+        const machine_ram = if (builtin.os.tag == .linux) derive.Facts.probe().total_ram else facts.total_ram;
         const cap_seam = knobs.intKnob("SQUEEZEFS_TEST_READ_REBIND_LADDER_CAP", u32, env);
         return .{
             .block_size = block_size,
@@ -567,7 +578,9 @@ pub const Config = struct {
             .hot_budget = hot,
             .read_mem_limit = read_mem,
             .mem_budget = mem_budget,
-            .read_cache_bytes = read_cache.resolveReadCacheBytes(knobs.intKnob("SQUEEZEFS_READ_CACHE_PCT", u64, env), facts, mem_budget),
+            .read_cache_bytes = read_cache.resolveReadCacheBytes(read_cache_pct, facts, mem_budget),
+            .read_cache_pct = read_cache_pct,
+            .read_cache_capacity = read_cache.derivedCapacity(read_cache_pct, machine_ram),
             .read_cache_fill = if (std.mem.eql(u8, knobs.enumKnob("SQUEEZEFS_READ_CACHE_FILL", env), "leg")) .leg else .lane,
             .admission_policy = admission.Policy.fromEnv(env, hot),
             .fill_pct = knobs.intKnob("SQUEEZEFS_READ_ADMISSION_FILL_PCT", u64, env),
@@ -759,7 +772,7 @@ pub const ReadPath = struct {
         // The grain cache lives on passthrough volumes alone: a ranged
         // window is a device window there; a transformed block's bytes
         // are a decoded image, never a device grain.
-        const grains = try read_cache.ReadCache.init(gpa, cfg.block_size, if (cfg.passthrough) cfg.read_cache_bytes else 0, cfg.cores);
+        const grains = try read_cache.ReadCache.init(gpa, cfg.block_size, cfg.read_cache_pct, if (cfg.passthrough) cfg.read_cache_bytes else 0, cfg.read_cache_capacity, cfg.cores);
         errdefer grains.deinit();
         const flights = try gpa.create(single_flight.FlightTable(MAX_FLIGHTS));
         errdefer gpa.destroy(flights);
@@ -2206,6 +2219,7 @@ const Fixture = struct {
             .read_mem_limit = 4 * rsc.SMALL_FILL_MAX,
             .mem_budget = 64 * bs,
             .read_cache_bytes = cfg_over.read_cache_bytes,
+            .read_cache_capacity = cfg_over.read_cache_bytes,
             .admission_policy = cfg_over.policy,
             .fill_pct = 5,
             .prefetch = .{ .window_cap = 8, .share_pct = 50, .hot_budget = cfg_over.hot_budget, .lane_armed = cfg_over.read_lane, .depth_pin = null, .lane_budget_cap = 8 * bs },

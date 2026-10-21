@@ -103,6 +103,12 @@ pub fn resolveReadCacheBytes(pct: u64, facts: derive.Facts, budget_bytes: u64) u
     return cache.resolveBound(pct, facts, budget_bytes);
 }
 
+/// The slab's reservation: the knob's share of the machine's RAM, the
+/// most the live bound can grow to (a lazily populated mapping).
+pub fn derivedCapacity(pct: u64, machine_ram: u64) u64 {
+    return cache.derivedBound(pct, machine_ram, machine_ram);
+}
+
 /// Slab slots for a budget: one per grain plus one per shard for the
 /// deposit that triggers an eviction, plus the in-flight headroom of one
 /// window per core (a window's slots are acquired before its shard lock).
@@ -164,27 +170,54 @@ pub const ReadCache = struct {
     sink: DropSink,
     core: *Core,
     block_size: u64,
+    /// The bound at init (0 = the tier off for the mount's life).
     budget_bytes: u64,
+    /// `SQUEEZEFS_READ_CACHE_PCT`, for the live re-derivation.
+    pct: u64,
+    /// The slab's reservation: the bound can grow to this and no further.
+    capacity_bytes: u64,
 
     pub const InitError = Allocator.Error || fill_pool.InitError;
     pub const PutOutcome = enum { inserted, refused, ineligible };
 
-    /// `budget_bytes == 0` disables the tier (every probe misses, every
+    /// `budget_bytes` is the bound at init (`cache.resolveBound` over the
+    /// mount's facts; 0 disables the tier: every probe misses, every
     /// deposit refuses, one slot and one shard are allocated).
-    pub fn init(gpa: Allocator, block_size: u64, budget_bytes: u64, cores: u32) InitError!*ReadCache {
+    /// `capacity_bytes` is the slab's reservation — the percentage of the
+    /// MACHINE's RAM (`derive.Facts.probe()`, before the fleet share
+    /// divides it): a lazily populated mapping, so an unreached bound costs
+    /// nothing; the live bound re-derived at every budget tick
+    /// (`rederive`) grows up to it when the share drops (the mount's own
+    /// CLI and supervisor are three `squeezefs` processes at mount time:
+    /// every supervised mount resolves its first budget at a third).
+    pub fn init(gpa: Allocator, block_size: u64, pct: u64, budget_bytes: u64, capacity_bytes: u64, cores: u32) InitError!*ReadCache {
         assert(block_size >= GRAIN and derive.isAligned(block_size, GRAIN));
         const self = try gpa.create(ReadCache);
         errdefer gpa.destroy(self);
-        const shard_count = if (budget_bytes == 0) 1 else cache.shardsFor(cores, budget_bytes, MIN_SHARD_BYTES);
-        const slots = if (budget_bytes == 0) 1 else slabSlots(budget_bytes, shard_count, cores);
+        const cap = @max(capacity_bytes, budget_bytes);
+        const shard_count = if (budget_bytes == 0) 1 else cache.shardsFor(cores, cap, MIN_SHARD_BYTES);
+        const slots = if (budget_bytes == 0) 1 else slabSlots(cap, shard_count, cores);
         const slab = try fill_pool.Pool.initRam(gpa, @intCast(GRAIN), slots);
         errdefer slab.deinit();
-        // Items per shard: its share of grains + one for the deposit that
-        // evicts + one window of headroom.
-        const per_shard: usize = @intCast(budget_bytes / shard_count / GRAIN + 1 + WINDOW_MAX_GRAINS);
-        self.* = .{ .gpa = gpa, .slab = slab, .sink = .{ .slab = slab }, .core = undefined, .block_size = block_size, .budget_bytes = budget_bytes };
+        // Items per shard: its share of the RESERVATION's grains + one for
+        // the deposit that evicts + one window of headroom.
+        const per_shard: usize = @intCast(cap / shard_count / GRAIN + 1 + WINDOW_MAX_GRAINS);
+        self.* = .{ .gpa = gpa, .slab = slab, .sink = .{ .slab = slab }, .core = undefined, .block_size = block_size, .budget_bytes = budget_bytes, .pct = pct, .capacity_bytes = cap };
         self.core = try Core.init(gpa, &self.sink, budget_bytes, shard_count, per_shard, .{ .call = &leaseEpochOf });
         return self;
+    }
+
+    /// The live bound for the authority's budget `budget_now`: the
+    /// percentage of `budget ÷ 0.7` (= the machine's RAM over the live
+    /// share, or the cage's 0.8 scaled), capped by the reservation.
+    pub fn rederive(self: *ReadCache, budget_now: u64) void {
+        if (!self.enabled() or budget_now == 0) return;
+        const ram_proxy = budget_now / cache.SOLO_BUDGET_TENTHS *| 10;
+        self.core.setBound(@min(cache.derivedBound(self.pct, ram_proxy, budget_now), self.capacity_bytes));
+    }
+
+    pub fn boundBytes(self: *const ReadCache) u64 {
+        return self.core.bound;
     }
 
     pub fn deinit(self: *ReadCache) void {
@@ -368,9 +401,11 @@ pub const ReadCache = struct {
     }
 
     /// The RAM this tier holds: its slab's resident bytes (entries plus the
-    /// freed slots the kernel still backs), as the read LRU gauges.
+    /// freed slots the kernel still backs), as the read LRU gauges. The
+    /// sampler's tick is also where the bound follows the live budget.
     fn gaugeFn(ctx: *anyopaque) u64 {
         const self: *ReadCache = @ptrCast(@alignCast(ctx));
+        self.rederive(budget.authority.budgetBytes());
         return self.slab.residentBytes();
     }
 
@@ -443,7 +478,7 @@ fn fillGrain(buf: []u8, tag: u8) void {
 test "the read cache: a deposited window serves grain-exact, partial and unaligned windows, touches move an entry to the head, the tail is the least recently used, an absent grain is a miss, 0 bytes is off" {
     const bs: u64 = 64 * GRAIN;
     // Budget 4 grains in ONE shard.
-    const rc = try ReadCache.init(testing.allocator, bs, 4 * GRAIN, 1);
+    const rc = try ReadCache.init(testing.allocator, bs, DEFAULT_PCT, 4 * GRAIN, 4 * GRAIN, 1);
     defer rc.deinit();
     try testing.expectEqual(@as(usize, 1), rc.shardCount());
     const blk = BlockKey.init(3, 2 * bs);
@@ -503,7 +538,7 @@ test "the read cache: a deposited window serves grain-exact, partial and unalign
     var wide: [WINDOW_MAX + GRAIN]u8 = undefined;
     try testing.expectEqual(ReadCache.PutOutcome.ineligible, rc.putValidated(blk, 0, &wide, 7, 0, .always, false));
     // Off.
-    const off = try ReadCache.init(testing.allocator, bs, 0, 1);
+    const off = try ReadCache.init(testing.allocator, bs, DEFAULT_PCT, 0, 0, 1);
     defer off.deinit();
     try testing.expect(!off.enabled());
     try testing.expectEqual(ReadCache.PutOutcome.refused, off.putValidated(blk, 0, &g, 7, 0, .always, false));
@@ -513,7 +548,7 @@ test "the read cache: a deposited window serves grain-exact, partial and unalign
 
 test "the read cache: the ranged purge drops exactly the written grains, the block purge every grain of the block and nothing of its neighbour, the census names blocks the selector picks, a refused validation deposits nothing, freeze is net-zero growth, shed evicts tails, the component gauges the slab and sheds through the core, the stats family names the core's and its own" {
     const bs: u64 = 64 * GRAIN;
-    const rc = try ReadCache.init(testing.allocator, bs, 8 * GRAIN, 1);
+    const rc = try ReadCache.init(testing.allocator, bs, DEFAULT_PCT, 8 * GRAIN, 8 * GRAIN, 1);
     defer rc.deinit();
     const a = BlockKey.init(1, 0);
     const b = BlockKey.init(1, bs);
@@ -591,7 +626,7 @@ test "the read cache: the ranged purge drops exactly the written grains, the blo
 
 test "the read cache: a grain filled under an inode's lease epoch is refused (and dropped) once that epoch moved — the lookup's coherence law; a fill under the new epoch serves" {
     const bs: u64 = 64 * GRAIN;
-    const rc = try ReadCache.init(testing.allocator, bs, 8 * GRAIN, 1);
+    const rc = try ReadCache.init(testing.allocator, bs, DEFAULT_PCT, 8 * GRAIN, 8 * GRAIN, 1);
     defer rc.deinit();
     const ino: u64 = 0x4e4e_0001;
     const blk = BlockKey.init(2, bs);
@@ -614,9 +649,45 @@ test "the read cache: a grain filled under an inode's lease epoch is refused (an
     try testing.expectEqual(@as(u8, 0x44), out[0]);
 }
 
+test "the read cache: the bound follows the live budget — a mount-time third grows to the reservation when the share drops, a cage shrink evicts down; off stays off" {
+    const bs: u64 = 64 * GRAIN;
+    // Init at a third of RAM's share (the mount's census of 3), the
+    // reservation the machine's quarter.
+    const gib = derive.GiB;
+    const rc = try ReadCache.init(testing.allocator, bs, 25, 16 * GRAIN, 48 * GRAIN, 1);
+    defer rc.deinit();
+    try testing.expectEqual(@as(u64, 16 * GRAIN), rc.boundBytes());
+    // The live budget: 70 % of a machine whose quarter is 48 grains ⇒ the
+    // reservation (within the derivation's integer rounding); a bigger
+    // budget is capped there exactly.
+    const b48: u64 = 48 * GRAIN * 4 * 7 / 10;
+    rc.rederive(b48);
+    try testing.expectEqual(@min(cache.derivedBound(25, b48 / 7 * 10, b48), 48 * GRAIN), rc.boundBytes());
+    try testing.expect(rc.boundBytes() + GRAIN > 48 * GRAIN);
+    rc.rederive(10 * gib);
+    try testing.expectEqual(@as(u64, 48 * GRAIN), rc.boundBytes());
+    var g: [GRAIN]u8 = undefined;
+    fillGrain(&g, 0x5c);
+    const blk = BlockKey.init(1, 0);
+    for (0..20) |i| try testing.expectEqual(ReadCache.PutOutcome.inserted, rc.putValidated(blk, @as(u64, i) * GRAIN, &g, 7, 0, .always, false));
+    try testing.expectEqual(@as(u64, 20 * GRAIN), rc.currentBytes());
+    // A cage shrinks the budget: 70 % of a machine whose quarter is 8
+    // grains ⇒ the LRU tail evicts down to the new bound (7 whole grains
+    // fit under the rounded bound; the oldest went first).
+    const b8: u64 = 8 * GRAIN * 4 * 7 / 10;
+    rc.rederive(b8);
+    try testing.expectEqual(cache.derivedBound(25, b8 / 7 * 10, b8), rc.boundBytes());
+    try testing.expect(rc.currentBytes() <= rc.boundBytes() and rc.currentBytes() >= 7 * GRAIN);
+    try testing.expect(rc.contains(blk, 19 * GRAIN, 20 * GRAIN) and !rc.contains(blk, 0, GRAIN));
+    const off = try ReadCache.init(testing.allocator, bs, 0, 0, 48 * GRAIN, 1);
+    defer off.deinit();
+    off.rederive(10 * gib);
+    try testing.expect(!off.enabled());
+}
+
 test "the read cache: a served grain pinned across an eviction keeps its bytes until the copy is done (the slot is not reused while pinned)" {
     const bs: u64 = 16 * GRAIN;
-    const rc = try ReadCache.init(testing.allocator, bs, GRAIN, 1);
+    const rc = try ReadCache.init(testing.allocator, bs, DEFAULT_PCT, GRAIN, GRAIN, 1);
     defer rc.deinit();
     const a = BlockKey.init(9, 0);
     var g: [GRAIN]u8 = undefined;
@@ -641,7 +712,7 @@ test "the read cache: a served grain pinned across an eviction keeps its bytes u
 
 test "the read cache: a sharded instance keeps every grain of a block in one shard and evicts each shard's own tail" {
     const bs: u64 = 1024 * GRAIN;
-    const rc = try ReadCache.init(testing.allocator, bs, 32 * MIN_SHARD_BYTES, 32);
+    const rc = try ReadCache.init(testing.allocator, bs, DEFAULT_PCT, 32 * MIN_SHARD_BYTES, 32 * MIN_SHARD_BYTES, 32);
     defer rc.deinit();
     try testing.expect(rc.shardCount() > 1);
     var win: [2 * GRAIN]u8 = undefined;

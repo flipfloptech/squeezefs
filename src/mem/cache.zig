@@ -379,6 +379,19 @@ pub fn Cache(comptime Entry: type, comptime Sink: type) type {
             return self.bound != 0;
         }
 
+        /// Re-derive the bound live (the authority's budget moved: a fleet
+        /// share changed, a cage was resized): the shards' shares follow;
+        /// a smaller bound evicts down to it through the sink. Never turns
+        /// a disabled instance on (its tables were sized for nothing).
+        pub fn setBound(self: *Self, bound: u64) void {
+            if (!self.enabled() or bound == self.bound) return;
+            const b = @max(bound, 1);
+            self.bound = b;
+            for (self.shards) |*s| s.max_bytes = b / self.shards.len;
+            self.stats.bound_bytes.set(b);
+            if (self.currentBytes() > b) _ = self.evictUntil(b);
+        }
+
         pub fn shardIndex(self: *const Self, key: Key) usize {
             const h = if (@hasDecl(Key, "shardHash")) key.shardHash() else key.hash();
             return @intCast(h & self.mask);
@@ -978,6 +991,28 @@ test "the core (promote sink): the sink runs OUTSIDE the lock with the entry sti
     comp.shed.?.call(comp.shed.?.ctx, 0);
     try testing.expectEqual(@as(u64, 0), c.currentBytes());
     try testing.expectEqual(@as(u64, 0), comp.current());
+}
+
+test "the core: setBound re-derives the shards' shares live — a larger bound admits more, a smaller one evicts down through the sink; a disabled instance stays off" {
+    var sink: DropSink = .{};
+    defer sink.deinit();
+    const C = Cache(TestEntry, DropSink);
+    const c = try C.init(testing.allocator, &sink, 2, 1, 8, null);
+    defer c.deinit();
+    for (1..3) |i| try testing.expectEqual(InsertOutcome.inserted, c.insert(mk(1, i, 0, 1, @intCast(i)), .{}));
+    c.setBound(4);
+    try testing.expectEqual(@as(u64, 4), c.stats.bound_bytes.load());
+    for (3..5) |i| try testing.expectEqual(InsertOutcome.inserted, c.insert(mk(1, i, 0, 1, @intCast(i)), .{}));
+    try testing.expectEqual(@as(u64, 4), c.currentBytes());
+    try testing.expectEqual(@as(usize, 0), sink.released.items.len);
+    c.setBound(1);
+    try testing.expectEqual(@as(u64, 1), c.currentBytes());
+    try testing.expectEqualSlices(u32, &.{ 1, 2, 3 }, sink.released.items);
+    try testing.expect(c.contains(.{ .ino = 1, .off = 4 }));
+    const off = try C.init(testing.allocator, &sink, 0, 1, 1, null);
+    defer off.deinit();
+    off.setBound(8);
+    try testing.expect(!off.enabled());
 }
 
 test "the core: invalidateKey and invalidateKeys drop held keys through the sink and count; an absent key is nothing; a disabled instance (bound 0) misses, refuses and invalidates nothing" {

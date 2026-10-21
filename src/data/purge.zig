@@ -176,7 +176,7 @@ test "the ONE purge drops a key from every tier that holds it and counts the hit
     hold.setBudget(4 * bs);
     var nvme = try nvme_read_cache.Cache.initRam(testing.allocator, 1, 8 * nvme_read_cache.GRAIN);
     defer nvme.deinit();
-    const grains = try read_cache.ReadCache.init(testing.allocator, bs, 8 * read_cache.GRAIN, 1);
+    const grains = try read_cache.ReadCache.init(testing.allocator, bs, read_cache.DEFAULT_PCT, 8 * read_cache.GRAIN, 8 * read_cache.GRAIN, 1);
     defer grains.deinit();
     var tiers: Tiers = .{ .hot = hot, .lru = lru, .hold = hold, .grains = grains, .nvme = &nvme };
 
@@ -222,7 +222,7 @@ test "the ranged purge drops the whole block from the whole-block tiers and exac
     hold.setBudget(4 * bs);
     var nvme = try nvme_read_cache.Cache.initRam(testing.allocator, 1, 8 * nvme_read_cache.GRAIN);
     defer nvme.deinit();
-    const grains = try read_cache.ReadCache.init(testing.allocator, bs, 64 * read_cache.GRAIN, 1);
+    const grains = try read_cache.ReadCache.init(testing.allocator, bs, read_cache.DEFAULT_PCT, 64 * read_cache.GRAIN, 64 * read_cache.GRAIN, 1);
     defer grains.deinit();
     var tiers: Tiers = .{ .hot = hot, .lru = lru, .hold = hold, .grains = grains, .nvme = &nvme };
     const k = BlockKey.init(4, 2 * bs);
@@ -268,7 +268,7 @@ test "the census purge drops exactly the keys its selector picks, from every tie
     hold.setBudget(8 * bs);
     var nvme = try nvme_read_cache.Cache.initRam(testing.allocator, 2, 16 * nvme_read_cache.GRAIN);
     defer nvme.deinit();
-    const grains = try read_cache.ReadCache.init(testing.allocator, bs, 16 * read_cache.GRAIN, 1);
+    const grains = try read_cache.ReadCache.init(testing.allocator, bs, read_cache.DEFAULT_PCT, 16 * read_cache.GRAIN, 16 * read_cache.GRAIN, 1);
     defer grains.deinit();
     const tiers: Tiers = .{ .hot = hot, .lru = lru, .hold = hold, .grains = grains, .nvme = &nvme };
     // Volume 1 is "foreign" (picked), volume 2 is not; each key in a

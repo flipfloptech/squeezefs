@@ -70,15 +70,17 @@ cannot overlap them.
 
 ## Tests
 
-Unit `fmt test rails` (the shipped arm): see the report; the §BC storm, the §BB rows and the lane's
-§BB.4 under the conveyor's cover green; the §AW venue storm pinned to its arm. Smoke (the shipped arm):
-INVALIDATION COHERENCE, SHARED HOT DIRECTORY, DEAD MANAGER, THE KILL ROWS, THE KILL MATRIX, kill -9
-mid-tar ×2, THE REPLAY PROOF, the durability-points row. fsck clean after every session.
+Unit `fmt test rails`: **2900/2990 passed, 90 skipped**, rails 29/29, fmt clean (the §BC storm, the §BB
+rows, the lane's §BB.4 under the conveyor's cover; the §AW venue storm pinned to its arm). Smoke, the
+shipped arm: INVALIDATION COHERENCE, SHARED HOT DIRECTORY, DEAD MANAGER, THE KILL ROWS (a)(b), THE
+KILL MATRIX, kill -9 mid-tar ×2, THE REPLAY PROOF, the durability-points row — **50/50**; the same
+battery under `SQUEEZEFS_META_APPLY=self` — **49/49**; INVALIDATION COHERENCE ×5. fsck clean after
+every session.
 
 ## Risks and what was not verified
 
 - `self` at 64 ranks: the hot-leaf convoy (0.3–0.6×); it ships off. Under `self` a window's members
   answer themselves before the window is submitted: the fsync cover is the conveyor's high-water mark
   (BC.4) — a barrier waits for every reserved window, including one whose members are still applying.
-- Not run: the smoke battery under `SQUEEZEFS_META_APPLY=self` (the rig forwards the knob now); a quiet
-  shared-directory pair; the data rows under `self`; the NVMe substrate.
+- Not run: a quiet shared-directory pair; the data rows (the shipped arm is dev's apply path; `self`
+  touches no data row); the NVMe substrate; the full gate (the train's).

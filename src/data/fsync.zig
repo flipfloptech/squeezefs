@@ -1,25 +1,24 @@
 //! fsync (charter §6.4; `docs/porting/data_write_path.md` §10): the
 //! exact-sum `fsync_phase_ns` family (`intent_barrier / data_flush /
-//! staged_promote / staged_sync / data_barrier / meta_publish /
-//! meta_barrier / extent_barrier / total`), barrier only the data
+//! staged_promote / data_barrier / meta_publish / meta_barrier /
+//! extent_barrier / total`), barrier only the data
 //! namespaces the ino TOUCHED (a per-ino stripe word stamped at every
 //! layout publish and in-place DMA; CAS stamp; conservative clear),
 //! write-through namespaces skip, independent legs joined and ALL awaited
 //! (never cancel a sibling — a dropped barrier future fails the coalescer's
-//! queued waiters), the intent barrier first, the staged record's ranged
-//! sync and the data barrier strictly before the meta legs that name the
-//! blocks (DUR-1), the meta barrier last. `fsync` takes NO inode write
-//! guard. Strict vs coalesced is the backend's own barrier API (the
+//! queued waiters), the intent barrier first, the staged promotion and
+//! the data barrier strictly before the meta legs that name the blocks
+//! (DUR-1), the meta barrier last. `fsync` takes NO inode write guard.
+//! Strict vs coalesced is the backend's own barrier API (the
 //! `MetaSyncSeam`).
 //!
-//! The staged leg (charter §1 item 10, amended 2026-10-19): a staged ino's
-//! bytes live in the staging ring's mmap, the page cache's until synced; the
-//! fsync makes the resident record reach stable storage (`Segment.
-//! syncResident`: ONE ranged sync of the segment file, coalesced across
-//! concurrent fsyncs) BEFORE the meta barrier that makes the layout naming
-//! it durable — a durable layout must never name bytes a power cut took.
-//! Under `SQUEEZEFS_FSYNC_PROMOTE_STAGED` the promotion runs first and a
-//! promoted record owes no sync (its block is the data barrier's).
+//! The staged leg (charter §1 item 10 and §6.1 "Staged", amended
+//! 2026-10-21): a staged ino's bytes live in the write cache — RAM, which
+//! no sync can make durable where it lies — so the fsync PROMOTES the
+//! resident to the data volumes (`staging.promoteAtFsync`) BEFORE the data
+//! barrier that covers its block and the meta barrier that makes the layout
+//! naming it durable; a promotion the plane declines is an fsync that
+//! cannot be acked (EIO).
 //!
 //! The touched table: one `AtomicU64` per stripe over the splitmix mix at
 //! the DLM width — low 32 bits = per-device ordinal bits (`MAX_ORDINAL =
@@ -62,7 +61,6 @@ pub const Phase = enum(u8) {
     intent_barrier,
     data_flush,
     staged_promote,
-    staged_sync,
     data_barrier,
     meta_publish,
     meta_barrier,
@@ -82,7 +80,6 @@ pub const stats = struct {
     pub var fsync_noop_clean: counters.ShardedCounter = .{};
     pub var fsync_parallel_joins: counters.ShardedCounter = .{};
     pub var fsync_flush_enospc_retries: counters.ShardedCounter = .{};
-    pub var fsync_promote_noops: counters.ShardedCounter = .{};
     pub var fsync_promote_failures: counters.ShardedCounter = .{};
     /// The write cache's fsync answered EIO: a resident the promotion left
     /// in the ring (a resource decline) cannot be made durable.
@@ -98,7 +95,7 @@ pub const stats = struct {
 
 pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
     try w.writeAll("{");
-    inline for (.{ "fsync_calls", "fsync_data_namespaces_touched", "fsync_data_namespaces_flushed", "fsync_write_through_skips", "fsync_noop_clean", "fsync_parallel_joins", "fsync_flush_enospc_retries", "fsync_promote_noops", "fsync_promote_failures", "fsync_promote_refusals", "fsync_touched_unresolved", "syncfs_calls", "syncfs_custody_inos", "syncfs_parked_blocks" }) |name| {
+    inline for (.{ "fsync_calls", "fsync_data_namespaces_touched", "fsync_data_namespaces_flushed", "fsync_write_through_skips", "fsync_noop_clean", "fsync_parallel_joins", "fsync_flush_enospc_retries", "fsync_promote_failures", "fsync_promote_refusals", "fsync_touched_unresolved", "syncfs_calls", "syncfs_custody_inos", "syncfs_parked_blocks" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, @field(stats, name).load() });
     }
     try w.writeAll("\"fsync_phase_ns\":{");
@@ -155,7 +152,6 @@ pub const SyncfsPhase = enum(u8) {
     times_drain,
     data_flush,
     staged_promote,
-    staged_sync,
     data_barrier,
     meta_publish,
     meta_barrier,
@@ -170,7 +166,6 @@ pub const SyncfsPhaseNs = struct {
     times_drain: counters.ShardedLatencyHistogram = .{},
     data_flush: counters.ShardedLatencyHistogram = .{},
     staged_promote: counters.ShardedLatencyHistogram = .{},
-    staged_sync: counters.ShardedLatencyHistogram = .{},
     data_barrier: counters.ShardedLatencyHistogram = .{},
     meta_publish: counters.ShardedLatencyHistogram = .{},
     meta_barrier: counters.ShardedLatencyHistogram = .{},
@@ -442,14 +437,11 @@ pub const Levers = struct {
     touched_namespaces: bool = true,
     /// `SQUEEZEFS_FSYNC_PARALLEL_LEGS`.
     parallel_legs: bool = true,
-    /// `SQUEEZEFS_FSYNC_PROMOTE_STAGED`.
-    promote_staged: staging.FsyncLever = .{ .on = false },
 
     pub fn fromEnv(env: *const std.process.Environ.Map) Levers {
         return .{
             .touched_namespaces = knobs.boolKnob("SQUEEZEFS_FSYNC_TOUCHED_NAMESPACES", env),
             .parallel_legs = knobs.boolKnob("SQUEEZEFS_FSYNC_PARALLEL_LEGS", env),
-            .promote_staged = staging.FsyncLever.fromEnv(env),
         };
     }
 };
@@ -471,8 +463,7 @@ pub const Ctx = struct {
     meta_sync: MetaSyncSeam,
     /// The S11 FlushExtents force (rung 6); absent = 0 ns leg.
     extent_barrier: ?MetaSyncSeam = null,
-    /// The staged file's key when the ino is staged (the promote lever,
-    /// then the ranged sync of its record).
+    /// The staged file's key when the ino is staged (the promotion).
     staged_key: ?staging.StagingKey = null,
     promotion: staging.PromotionHooks = .none,
     /// The staging ring (the staged legs of both ladders; null = staging off).
@@ -503,28 +494,14 @@ pub fn fsync(ctx: Ctx, io: Io, ino: u64, prof: *Prof) Error!void {
     // STAGED PROMOTE: the write cache's law (a RAM record cannot be made
     // durable where it lies: it leaves for the data volumes BEFORE the data
     // barrier, so the barrier covers its block; one still resident after
-    // the attempt is an fsync that cannot be acked — EIO), or the lever's
-    // posture on a file-backed ring.
-    if (ctx.staged_key) |k| {
-        if (ctx.staged_segment) |seg| {
-            const law = staging.fsyncLaw(seg.backing);
-            if (staging.promoteAtFsync(law, ctx.levers.promote_staged, seg, ctx.promotion, k) == .kept and law == .promote) {
-                stats.fsync_promote_refusals.inc();
-                return error.InputOutput;
-            }
-        }
-    } else if (ctx.levers.promote_staged.on) {
-        stats.fsync_promote_noops.inc();
-    }
-    prof.mark(.staged_promote);
-    // STAGED SYNC (a file-backed ring): the record still resident reaches
-    // stable storage (a promoted one left the ring and owes nothing).
-    // Before the meta legs: a durable layout must never name bytes a power
-    // cut took.
+    // the attempt is an fsync that cannot be acked — EIO).
     if (ctx.staged_key) |k| if (ctx.staged_segment) |seg| {
-        seg.syncResident(io, k) catch return error.InputOutput;
+        if (staging.promoteAtFsync(seg, ctx.promotion, k) == .kept) {
+            stats.fsync_promote_refusals.inc();
+            return error.InputOutput;
+        }
     };
-    prof.mark(.staged_sync);
+    prof.mark(.staged_promote);
     // DATA BARRIER: observe → plan → legs joined and ALL awaited → clear.
     const observed = ctx.touched.observe(ino);
     const bits: u64 = if (ctx.levers.touched_namespaces) TouchedTable.bitsOf(observed) else TouchedTable.ALL_BIT;
@@ -605,21 +582,16 @@ pub fn syncfs(ctx: Ctx, gpa: Allocator, io: Io, prof: *SyncfsProf) Error!void {
         _ = w.drainOnce(io, d);
     };
     prof.mark(.data_flush);
-    // STAGED PROMOTE (the lever's posture, OFF by default) — then STAGED
-    // SYNC: every record still resident reaches stable storage in ONE
-    // whole-ring sync (the kernel writes its dirty pages alone), exactly as
-    // at a per-file fsync.
+    // STAGED PROMOTE: every resident, exactly as at a per-file fsync (the
+    // write cache's law); any kept is a syncfs that cannot be acked.
     if (ctx.staged_segment) |seg| {
-        const law = staging.fsyncLaw(seg.backing);
-        const kept = try staging.promoteAllAtSyncfs(gpa, law, ctx.levers.promote_staged, seg, ctx.promotion);
-        if (kept != 0 and law == .promote) {
+        const kept = try staging.promoteAllAtSyncfs(gpa, seg, ctx.promotion);
+        if (kept != 0) {
             stats.fsync_promote_refusals.add(kept);
             return error.InputOutput;
         }
     }
     prof.mark(.staged_promote);
-    if (ctx.staged_segment) |seg| seg.syncAll(io) catch return error.InputOutput;
-    prof.mark(.staged_sync);
     // DATA BARRIER: every volatile namespace; the stripe words snapshotted
     // before it clear after it (a stamp since keeps its bits).
     const observed = try gpa.alloc(u64, ctx.touched.words.len);
@@ -886,12 +858,11 @@ const FsyncWorld = struct {
     /// ranged sync as an event and a span.
     ring_image: []u8,
     ring: staging.Segment,
-    ring_syncs: std.ArrayList(staging.Span) = .empty,
     promoted: u32 = 0,
     /// The promote hook declines (a resource refusal): the record stays.
     promote_decline: bool = false,
 
-    const Event = enum { intent, data_write, data_flush, staged_sync, merge, meta_sync };
+    const Event = enum { intent, data_write, data_flush, merge, meta_sync };
 
     fn init(gpa: Allocator) !*FsyncWorld {
         const w = try gpa.create(FsyncWorld);
@@ -900,7 +871,7 @@ const FsyncWorld = struct {
         errdefer gpa.free(ring_image);
         @memset(ring_image, 0);
         w.* = .{ .f = try wt.Fixture.init(gpa, 32), .table = try accumulate.Table.init(gpa, @intCast(wt.BS), 8), .epochs = epoch_mod.Epochs.init(gpa, wt.BS, true), .locks = try seams.BlockLocks.init(gpa, 64), .touched = try TouchedTable.init(gpa, 64), .gov = try pipeline.Governor.init(gpa, wt.BS, 2, .adaptive, null, pipeline.capBytes(1 << 30)), .ov = undefined, .ring_image = ring_image, .ring = undefined };
-        w.ring = try staging.Segment.init(gpa, ring_image, .{ .ctx = w, .durable = &ringDurable });
+        w.ring = try staging.Segment.init(gpa, ring_image, .none);
         w.ov = try device_overlay.Overlay.init(gpa, .{ .block_size = wt.BS, .patch_max = wt.BS / 8 }, .{ .device = w.f.dev.seam(), .map = w.f.map.seam(), .free = w.f.frees.seam(), .purge = .none, .vols = &w.f.vols, .picker = .{ .ctx = w.f.alloc_a, .pick = &pickA }, .epochs = &w.epochs, .stripes = &w.stripes, .governor = &w.gov }, 16);
         return w;
     }
@@ -915,19 +886,12 @@ const FsyncWorld = struct {
         self.events.deinit(gpa);
         self.ring.deinit();
         gpa.free(self.ring_image);
-        self.ring_syncs.deinit(gpa);
         self.f.deinit();
         gpa.destroy(self);
     }
 
-    fn ringDurable(ctx: ?*anyopaque, _: Io, off: u64, len: u64) staging.DurableError!void {
-        const self: *FsyncWorld = @ptrCast(@alignCast(ctx.?));
-        self.ring_syncs.append(self.f.gpa, .{ .off = off, .len = len }) catch @panic("OOM");
-        self.events.append(self.f.gpa, .staged_sync) catch @panic("OOM");
-    }
-
-    /// The lever's promote hook: the record leaves the ring (the plane's
-    /// primitive moved it to a block the data barrier covers).
+    /// The promote hook: the record leaves the ring (the plane's primitive
+    /// moved it to a block the data barrier covers).
     fn promote(ctx: ?*anyopaque, key: staging.StagingKey) bool {
         const self: *FsyncWorld = @ptrCast(@alignCast(ctx.?));
         if (self.promote_decline) return false;
@@ -996,7 +960,6 @@ fn orderLawHolds(events: []const FsyncWorld.Event) bool {
                 if (seen_merge) return false;
                 seen_flush = true;
             },
-            .staged_sync => if (seen_merge) return false,
             .merge => seen_merge = true,
             .meta_sync => seen_meta = true,
         }
@@ -1008,90 +971,17 @@ test "the ordering law audit: the lawful sequence passes; a reordered leg (a mer
     const E = FsyncWorld.Event;
     try testing.expect(orderLawHolds(&.{ .intent, .data_write, .data_write, .data_flush, .merge, .meta_sync }));
     try testing.expect(orderLawHolds(&.{ .intent, .data_flush, .meta_sync })); // a clean ino: barrier + meta
-    try testing.expect(orderLawHolds(&.{ .intent, .staged_sync, .meta_sync })); // a staged ino: its record synced, then the meta barrier
     try testing.expect(!orderLawHolds(&.{ .intent, .data_write, .merge, .data_flush, .meta_sync })); // meta publish before the data barrier (DUR-1 broken)
     try testing.expect(!orderLawHolds(&.{ .intent, .data_flush, .data_write, .merge, .meta_sync })); // a DMA after the barrier
     try testing.expect(!orderLawHolds(&.{ .intent, .data_write, .data_flush, .meta_sync, .merge })); // the meta barrier not last
-    try testing.expect(!orderLawHolds(&.{ .intent, .meta_sync, .staged_sync })); // the staged bytes synced after the layout was made durable
-    try testing.expect(!orderLawHolds(&.{ .intent, .data_write, .data_flush, .merge, .staged_sync, .meta_sync })); // after a publish that may name them
     try testing.expect(!orderLawHolds(&.{ .data_write, .intent, .data_flush, .meta_sync })); // the intent not first
     try testing.expect(!orderLawHolds(&[_]E{.intent}));
 }
 
-test "the staged leg (charter §1 item 10, 2026-10-19): fsync of a staged ino issues exactly ONE ranged sync covering its resident record, after the data flush and before the meta barrier (red before: zero syncs — the ring's pages were the page cache's); an ino with no resident issues none and pays nothing new; a record the lever promoted owes no sync; syncfs syncs the whole ring once; the phases stay exact-sum with staged_sync a leg" {
+test "the write cache's law (charter §6.1 'Staged', 2026-10-21): fsync PROMOTES the resident before the data barrier — the record leaves the ring, the legs keep the ordering law; a promotion the plane declines is an fsync that cannot be acked: EIO, counted fsync_promote_refusals, the record kept; an ino with no resident owes nothing; syncfs promotes every resident and answers EIO for any kept (red before: the record was 'synced' in place by a ranged sync of a file the write cache does not have)" {
     const io = testing.io;
     const w = try FsyncWorld.init(testing.allocator);
     defer w.deinit(testing.allocator);
-    try w.f.map.create(5, .staged, 0);
-    const key = staging.StagingKey.init(@splat(0x5a), 5);
-    const payload: [6000]u8 = @splat(0x33);
-    try w.ring.put(key, &payload, 1, 0, 0);
-    var ctx = w.mkCtx();
-    ctx.staged_key = key;
-    const syncs0 = stats.fsync_phase_ns[@backingInt(Phase.staged_sync)].snapshot().count;
-    var prof = Prof.start();
-    try fsync(ctx, io, 5, &prof);
-    prof.finish();
-    try testing.expectEqual(@as(usize, 1), w.ring_syncs.items.len);
-    try testing.expectEqual(w.ring.residentSpan(key).?, w.ring_syncs.items[0]);
-    try testing.expectEqual(staging.stride(staging.KEY_LEN, payload.len), w.ring_syncs.items[0].len);
-    try testing.expectEqualSlices(FsyncWorld.Event, &.{ .intent, .staged_sync, .meta_sync }, w.events.items);
-    try testing.expect(orderLawHolds(w.events.items));
-    try testing.expectEqual(syncs0 + 1, stats.fsync_phase_ns[@backingInt(Phase.staged_sync)].snapshot().count);
-    var sum: u64 = 0;
-    for (prof.legs) |l| sum += l;
-    try testing.expectEqual(prof.total(), sum);
-    // A striped ino (no staged key) and a staged key with no resident
-    // (released since the layout was read): no sync, nothing new.
-    w.events.clearRetainingCapacity();
-    try w.f.map.create(6, .striped, 0);
-    var prof2 = Prof.start();
-    try fsync(w.mkCtx(), io, 6, &prof2);
-    prof2.finish();
-    try testing.expectEqual(@as(usize, 1), w.ring_syncs.items.len);
-    try testing.expectEqualSlices(FsyncWorld.Event, &.{ .intent, .meta_sync }, w.events.items);
-    try testing.expect(w.ring.remove(key, 1));
-    var prof3 = Prof.start();
-    try fsync(ctx, io, 5, &prof3);
-    prof3.finish();
-    try testing.expectEqual(@as(usize, 1), w.ring_syncs.items.len);
-    // The lever: the promotion takes the record out of the ring first, so
-    // the sync leg finds nothing (its block is the data barrier's).
-    try w.ring.put(key, &payload, 2, 0, 0);
-    ctx.levers.promote_staged = .{ .on = true };
-    var prof4 = Prof.start();
-    try fsync(ctx, io, 5, &prof4);
-    prof4.finish();
-    try testing.expectEqual(@as(u32, 1), w.promoted);
-    try testing.expectEqual(@as(usize, 1), w.ring_syncs.items.len);
-    try testing.expect(w.ring.residentSpan(key) == null);
-    // syncfs: residents ⇒ ONE whole-ring sync; an empty ring ⇒ none.
-    try w.ring.put(key, &payload, 3, 0, 0);
-    try w.ring.put(staging.StagingKey.init(@splat(0x5b), 7), &payload, 4, 0, 0);
-    var sprof = SyncfsProf.start();
-    try syncfs(w.mkCtx(), testing.allocator, io, &sprof);
-    var phases: SyncfsPhaseNs = .{};
-    sprof.finish(&phases);
-    try testing.expectEqual(@as(usize, 2), w.ring_syncs.items.len);
-    try testing.expectEqual(staging.Span{ .off = 0, .len = w.ring_image.len }, w.ring_syncs.items[1]);
-    var ssum: u64 = 0;
-    inline for (@typeInfo(SyncfsPhase).@"enum".field_names[0..SyncfsPhase.legs]) |name| ssum += @field(phases, name).snapshot().sum_ns;
-    try testing.expectEqual(phases.total.snapshot().sum_ns, ssum);
-    try testing.expect(w.ring.remove(key, 3));
-    try testing.expect(w.ring.remove(staging.StagingKey.init(@splat(0x5b), 7), 4));
-    var sprof2 = SyncfsProf.start();
-    try syncfs(w.mkCtx(), testing.allocator, io, &sprof2);
-    try testing.expectEqual(@as(usize, 2), w.ring_syncs.items.len);
-}
-
-test "the write cache's law (charter §6.1 'Staged', 2026-10-21): on a RAM-backed ring fsync PROMOTES the resident before the data barrier with no lever asked — the record leaves the ring, no ranged sync is issued (none exists); a promotion the plane declines is an fsync that cannot be acked: EIO, counted fsync_promote_refusals, the record kept; an ino with no resident owes nothing; syncfs promotes every resident and answers EIO for any kept; a file-backed ring keeps the lever's semantics (red before: the RAM record was 'synced' in place by a seam that could not exist)" {
-    const io = testing.io;
-    const w = try FsyncWorld.init(testing.allocator);
-    defer w.deinit(testing.allocator);
-    // The same segment re-bound as the write cache: RAM alone.
-    w.ring.deinit();
-    w.ring = try staging.Segment.init(testing.allocator, w.ring_image, .{ .ctx = w, .ram = true });
-    try testing.expectEqual(staging.FsyncLaw.promote, staging.fsyncLaw(w.ring.backing));
     try w.f.map.create(5, .staged, 0);
     const key = staging.StagingKey.init(@splat(0x5a), 5);
     const payload: [6000]u8 = @splat(0x33);
@@ -1103,16 +993,16 @@ test "the write cache's law (charter §6.1 'Staged', 2026-10-21): on a RAM-backe
     try fsync(ctx, io, 5, &prof);
     prof.finish();
     try testing.expectEqual(@as(u32, 1), w.promoted);
-    try testing.expect(w.ring.residentSpan(key) == null);
-    try testing.expectEqual(@as(usize, 0), w.ring_syncs.items.len);
+    try testing.expect(w.ring.residentGeneration(key) == null);
     try testing.expectEqualSlices(FsyncWorld.Event, &.{ .intent, .meta_sync }, w.events.items);
+    try testing.expect(orderLawHolds(w.events.items));
     // Declined: EIO, the record kept, counted.
     try w.ring.put(key, &payload, 2, 0, 0);
     w.promote_decline = true;
     var prof2 = Prof.start();
     try testing.expectError(error.InputOutput, fsync(ctx, io, 5, &prof2));
     try testing.expectEqual(refusals0 + 1, stats.fsync_promote_refusals.load());
-    try testing.expect(w.ring.residentSpan(key) != null);
+    try testing.expect(w.ring.residentGeneration(key) != null);
     w.promote_decline = false;
     // No resident: nothing owed, no promotion counted.
     try testing.expect(w.ring.remove(key, 2));

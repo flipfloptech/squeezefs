@@ -12,7 +12,7 @@ BIN=$1 SO=$2 WRITER=$3 W=$4
 REPLAY=${REPLAY:-/build/suites/xfstests-dev/src/log-writes/replay-log}
 if ! modprobe dm-log-writes 2>/dev/null; then echo "direct_cut: SKIP (no dm-log-writes)"; exit 0; fi
 if [ ! -x "$REPLAY" ]; then echo "direct_cut: SKIP (no replay-log at $REPLAY)"; exit 0; fi
-mkdir -p "$W/mnt" "$W/cache"
+mkdir -p "$W/mnt"
 LOG=$W/daemon.log
 truncate -s 256M "$W/meta.img"; truncate -s 1G "$W/data.img"; truncate -s 2G "$W/log.img"; truncate -s 1G "$W/replay.img"
 LM=$(losetup -f --show "$W/meta.img") || { echo "direct_cut: SKIP (no loop device)"; exit 0; }
@@ -31,7 +31,7 @@ trap cleanup EXIT
 SZ=$(blockdev --getsz "$LD")
 dmsetup create "$DM" --table "0 $SZ log-writes $LD $LL" || { echo "direct_cut: SKIP (dmsetup create failed)"; exit 0; }
 ln -sfn "/dev/mapper/$DM" "$W/ost0"
-"$BIN" format --force --single-writer --disk-cache-paths "$W/cache" "sqmeta://$LM" "sqdata://$W/ost0" > "$W/format.log" 2>&1 || { cat "$W/format.log"; echo "direct_cut: FAIL (format)"; exit 1; }
+"$BIN" format --force --single-writer "sqmeta://$LM" "sqdata://$W/ost0" > "$W/format.log" 2>&1 || { cat "$W/format.log"; echo "direct_cut: FAIL (format)"; exit 1; }
 SQUEEZEFS_TEST_IPC_ALLOW_DIRTY=1 "$BIN" mount --daemon --supervise --log-file "$LOG" -o default_permissions,allow_other,interception=direct "sqmeta://$LM" "$W/mnt" || { tail -20 "$LOG"; echo "direct_cut: FAIL (mount)"; exit 1; }
 pid=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["mount"]["pid"])' "$W/mnt/.stats")
 # A resident striped file: 8 MiB laid down through the kernel, synced.

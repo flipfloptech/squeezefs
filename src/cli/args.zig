@@ -1,5 +1,5 @@
 //! The CLI grammar (charter §8): `format`, `mount`, `umount`, `status`,
-//! `clients`, `df`, `bench`, `clone`, `tune`, `config`, `staging`, `claim
+//! `clients`, `df`, `bench`, `clone`, `tune`, `config`, `claim
 //! clear`, `--version`, `--help`, parsed into ONE typed `Verb`. Flags and
 //! positionals mix freely; `--` ends the flags; a value rides `--flag VALUE`
 //! or `--flag=VALUE` (`-o OPTS` / `-oOPTS`). Every integer goes through the
@@ -54,9 +54,6 @@ pub const Format = struct {
     encryption: transform.Encryption = .none,
     /// `--encrypt-key PATH|-`: the operator key file (stdin as `-`).
     encrypt_key: ?[]const u8 = null,
-    /// `--disk-cache-paths a,b`: absolute staging/cache roots recorded in
-    /// the set config (none = cache-less).
-    disk_cache_paths: []const u8 = "",
 };
 
 pub const Mount = struct {
@@ -200,17 +197,11 @@ pub const Tune = struct {
 
 pub const Config = union(enum) {
     show: struct { target: Target, json: bool = false },
-    set_cache_paths: struct { target: Target, paths: []const u8, force: bool = false },
     /// `set-fabric-endpoints <sqmeta-uri> vol-<tag>=<trtype>:<traddr>:<trsvcid>:<subnqn>[,<path>…]…`
     /// (`ops_nvmet_keys.md` §3.7: the per-data-volume `FabricEndpoint`
     /// inside `set_config` — one subsystem, one or more paths).
     set_fabric_endpoints: struct { target: Target, specs: RepeatList },
     get_fabric_endpoints: struct { target: Target, json: bool = false },
-};
-
-pub const Staging = union(enum) {
-    list: struct { target: Target, json: bool = false },
-    promote: struct { target: Target },
 };
 
 pub const ClaimClear = struct {
@@ -379,7 +370,6 @@ pub const Verb = union(enum) {
     clone: Clone,
     tune: Tune,
     config: Config,
-    staging: Staging,
     claim_clear: ClaimClear,
     appenders: Appenders,
     appender_clear: AppenderClear,
@@ -421,12 +411,11 @@ pub const Refusal = union(enum) {
     rekey_shape: enum { no_key, key_without_rekey, other_arm, offline },
     /// `--encrypt-key` on a plaintext set.
     key_without_encrypt,
-    bad_cache_path: []const u8,
     /// A set-level target must be a `sqmeta://` URI or an absolute mountpoint.
     bad_target: []const u8,
     /// A clone path must be absolute inside the set.
     bad_set_path: []const u8,
-    /// `config`/`staging`/`claim` need a sub-verb.
+    /// `config`/`claim` need a sub-verb.
     missing_subverb: []const u8,
     unknown_subverb: struct { verb: []const u8, word: []const u8 },
     /// `bench --hash`: a phase, shape or bracket flag beside the CPU bench.
@@ -478,7 +467,6 @@ pub const Refusal = union(enum) {
                 .other_arm => try w.writeAll("defrag --rekey runs alone: every block of the set is rewritten onto the new key; run the other arms in their own invocation"),
                 .offline => try w.writeAll("defrag --rekey runs on a LIVE mount (the sweep is the mount's fabric; the window opens in its config): pass the mountpoint, not the sqmeta:// set"),
             },
-            .bad_cache_path => |p| try w.print("cache path member '{s}' is not an absolute path outside the system roots (/, /home, /etc, /usr, /var, /boot, /root), or repeats", .{p}),
             .bad_target => |t| try w.print("'{s}' is neither a sqmeta://<absolute path>[,…] URI nor an absolute mountpoint", .{t}),
             .bad_set_path => |t| try w.print("clone: '{s}' is not an absolute path inside the set (`/dir/file`)", .{t}),
             .missing_subverb => |v| try w.print("{s}: missing the sub-verb", .{v}),
@@ -512,7 +500,7 @@ pub const Error = error{Refused};
 pub fn usage(verb: ?std.meta.Tag(Verb)) []const u8 {
     const all =
         \\usage: squeezefs <verb> [flags] …
-        \\  squeezefs format [--single-writer] [--meta-node-kib N] [--meta-journal-mb N] [--block-size BYTES] [--compress none|lz4|zstd] [--encrypt none|aes-256-gcm|chacha20-poly1305 --encrypt-key PATH|-] [--disk-cache-paths a,b] [--force] sqmeta://<path> [sqdata://<path>…]
+        \\  squeezefs format [--single-writer] [--meta-node-kib N] [--meta-journal-mb N] [--block-size BYTES] [--compress none|lz4|zstd] [--encrypt none|aes-256-gcm|chacha20-poly1305 --encrypt-key PATH|-] [--force] sqmeta://<path> [sqdata://<path>…]
         \\  squeezefs mount [-o opt[,opt…]] [--daemon --log-file PATH [--supervise]] [--join host:port] [--encrypt-key PATH|-] sqmeta://<path> <mountpoint>
         \\  squeezefs umount [--lazy|-l] <mountpoint>
         \\  squeezefs status sqmeta://<path>|<mountpoint>
@@ -521,9 +509,6 @@ pub fn usage(verb: ?std.meta.Tag(Verb)) []const u8 {
         \\  squeezefs clone sqmeta://<path>|<mountpoint> /src/file /dest/file
         \\  squeezefs tune [--apply]
         \\  squeezefs config show [--json] sqmeta://<path>|<mountpoint>
-        \\  squeezefs config set-cache-paths [--force] sqmeta://<path>|<mountpoint> <abs path>[,…]
-        \\  squeezefs staging list [--json] sqmeta://<path>|<mountpoint>
-        \\  squeezefs staging promote sqmeta://<path>
         \\  squeezefs claim clear sqmeta://<path>
         \\  squeezefs appenders [--json] sqmeta://<path>
         \\  squeezefs appender clear sqmeta://<path> <id>
@@ -570,7 +555,7 @@ pub fn usage(verb: ?std.meta.Tag(Verb)) []const u8 {
     ;
     const v = verb orelse return all;
     return switch (v) {
-        .format => "usage: squeezefs format [--single-writer] [--meta-node-kib 64|128|256|512|1024] [--meta-journal-mb N] [--block-size BYTES] [--compress none|lz4|zstd] [--encrypt none|aes-256-gcm|chacha20-poly1305 --encrypt-key PATH|-] [--disk-cache-paths a,b] [--force] sqmeta://<path> [sqdata://<path>…]\n",
+        .format => "usage: squeezefs format [--single-writer] [--meta-node-kib 64|128|256|512|1024] [--meta-journal-mb N] [--block-size BYTES] [--compress none|lz4|zstd] [--encrypt none|aes-256-gcm|chacha20-poly1305 --encrypt-key PATH|-] [--force] sqmeta://<path> [sqdata://<path>…]\n",
         .mount => "usage: squeezefs mount [-o opt[,opt…]] [--daemon --log-file PATH [--supervise]] [--join host:port] [--encrypt-key PATH|-] sqmeta://<path> <mountpoint>\n",
         .nvmeof => "usage: squeezefs nvmeof share [--subnqn NQN] [--transport tcp|loop] [--ip ADDR]… [--port N] [--allow-host NQN]… [--create-size SIZE] [--ns-uuid UUID] <backing>\n       squeezefs nvmeof unshare <subnqn>\n       squeezefs nvmeof list [--json]\n       squeezefs nvmeof status [--json]\n       squeezefs nvmeof restore\n       squeezefs nvmeof adopt <subnqn>\n       squeezefs nvmeof target status [--json] | setup | systemd-unit | stop\n       squeezefs nvmeof connect [--transport tcp|loop] [--ip ADDR] [--port N] [--hostnqn NQN --hostid UUID] [--host-traddr ADDR] [--host-iface IF] [--nr-io-queues N] [--ns-uuid UUID] <subnqn>\n       squeezefs nvmeof disconnect [--identity-only [--hostnqn NQN --hostid UUID]] <subnqn>\n       squeezefs nvmeof resv-report [--json] [--pr-matrix --peer <dev> [--force]] <dev>\n",
         .storage => "usage: squeezefs storage list [--json]\n       squeezefs storage validate <path>\n",
@@ -582,8 +567,7 @@ pub fn usage(verb: ?std.meta.Tag(Verb)) []const u8 {
         .df => "usage: squeezefs df [--json] sqmeta://<path>|<mountpoint>\n",
         .clone => "usage: squeezefs clone sqmeta://<path>|<mountpoint> /src/file /dest/file\n",
         .tune => "usage: squeezefs tune [--apply]\n",
-        .config => "usage: squeezefs config show [--json] sqmeta://<path>|<mountpoint>\n       squeezefs config set-cache-paths [--force] sqmeta://<path>|<mountpoint> <abs path>[,…]\n       squeezefs config set-fabric-endpoints sqmeta://<path> vol-<tag>=<tcp|loop>:<traddr>:<trsvcid>:<subnqn>[,<path>…]…\n       squeezefs config get-fabric-endpoints [--json] sqmeta://<path>|<mountpoint>\n",
-        .staging => "usage: squeezefs staging list [--json] sqmeta://<path>|<mountpoint>\n       squeezefs staging promote sqmeta://<path>\n",
+        .config => "usage: squeezefs config show [--json] sqmeta://<path>|<mountpoint>\n       squeezefs config set-fabric-endpoints sqmeta://<path> vol-<tag>=<tcp|loop>:<traddr>:<trsvcid>:<subnqn>[,<path>…]…\n       squeezefs config get-fabric-endpoints [--json] sqmeta://<path>|<mountpoint>\n",
         .claim_clear => "usage: squeezefs claim clear sqmeta://<path>\n",
         .appenders => "usage: squeezefs appenders [--json] sqmeta://<path>\n",
         .appender_clear => "usage: squeezefs appender clear sqmeta://<path> <id>\n",
@@ -717,7 +701,6 @@ pub fn parse(argv: []const []const u8, diag: *Refusal) Error!Verb {
     if (std.mem.eql(u8, verb, "clone")) return parseClone(words, diag);
     if (std.mem.eql(u8, verb, "tune")) return parseTune(words, diag);
     if (std.mem.eql(u8, verb, "config")) return parseConfig(words, diag);
-    if (std.mem.eql(u8, verb, "staging")) return parseStaging(words, diag);
     if (std.mem.eql(u8, verb, "claim")) return parseClaim(words, diag);
     if (std.mem.eql(u8, verb, "appenders")) return parseAppenders(words, diag);
     if (std.mem.eql(u8, verb, "appender")) return parseAppenderClear(words, diag);
@@ -1238,29 +1221,6 @@ fn parseConfig(words: []const []const u8, diag: *Refusal) Error!Verb {
         try checkTarget(target, diag);
         return .{ .config = .{ .show = .{ .target = target, .json = json } } };
     }
-    if (std.mem.eql(u8, sub, "set-cache-paths")) {
-        var c: Cursor = .{ .verb = "config set-cache-paths", .words = rest, .diag = diag };
-        var force = false;
-        while (try c.step()) |f| {
-            if (std.mem.eql(u8, f.name, "--force")) force = true else return c.unknown(f);
-        }
-        const pos = c.pos();
-        if (pos.len < 1) {
-            diag.* = .{ .missing_positional = .{ .verb = c.verb, .what = target_what } };
-            return error.Refused;
-        }
-        try checkTarget(pos[0], diag);
-        if (pos.len < 2) {
-            diag.* = .{ .missing_positional = .{ .verb = c.verb, .what = "the cache paths (comma-separated absolute paths)" } };
-            return error.Refused;
-        }
-        if (pos.len > 2) {
-            diag.* = .{ .extra_positional = .{ .verb = c.verb, .word = pos[2] } };
-            return error.Refused;
-        }
-        try checkCachePaths(pos[1], diag);
-        return .{ .config = .{ .set_cache_paths = .{ .target = pos[0], .paths = pos[1], .force = force } } };
-    }
     if (std.mem.eql(u8, sub, "set-fabric-endpoints")) {
         var c: Cursor = .{ .verb = "config set-fabric-endpoints", .words = rest, .diag = diag };
         while (try c.step()) |f| return c.unknown(f);
@@ -1301,30 +1261,6 @@ fn parseConfig(words: []const []const u8, diag: *Refusal) Error!Verb {
         return .{ .config = .{ .get_fabric_endpoints = .{ .target = target, .json = json } } };
     }
     diag.* = .{ .unknown_subverb = .{ .verb = "config", .word = sub } };
-    return error.Refused;
-}
-
-fn parseStaging(words: []const []const u8, diag: *Refusal) Error!Verb {
-    const sub = try subverb("staging", words, diag);
-    const rest = words[1..];
-    if (std.mem.eql(u8, sub, "list")) {
-        var c: Cursor = .{ .verb = "staging list", .words = rest, .diag = diag };
-        var json = false;
-        while (try c.step()) |f| {
-            if (std.mem.eql(u8, f.name, "--json")) json = true else return c.unknown(f);
-        }
-        const target = try exactlyOne(&c, target_what);
-        try checkTarget(target, diag);
-        return .{ .staging = .{ .list = .{ .target = target, .json = json } } };
-    }
-    if (std.mem.eql(u8, sub, "promote")) {
-        var c: Cursor = .{ .verb = "staging promote", .words = rest, .diag = diag };
-        while (try c.step()) |f| return c.unknown(f);
-        const target = try exactlyOne(&c, "the sqmeta:// volume");
-        try checkUri(.meta, target, diag);
-        return .{ .staging = .{ .promote = .{ .target = target } } };
-    }
-    diag.* = .{ .unknown_subverb = .{ .verb = "staging", .word = sub } };
     return error.Refused;
 }
 
@@ -1862,26 +1798,6 @@ fn parseBench(words: []const []const u8, diag: *Refusal) Error!Verb {
     return .{ .bench = out };
 }
 
-/// The `--disk-cache-paths` / `set-cache-paths` member law: absolute,
-/// outside the system roots, no repeats (`set_config.cachePathAdmissible`).
-fn checkCachePaths(raw: []const u8, diag: *Refusal) Error!void {
-    var seen: [MAX_CACHE_PATHS][]const u8 = undefined;
-    var n_seen: usize = 0;
-    var it = cachePaths(raw);
-    while (it.next()) |path| {
-        if (!set_config.cachePathAdmissible(path) or n_seen == seen.len) {
-            diag.* = .{ .bad_cache_path = path };
-            return error.Refused;
-        }
-        for (seen[0..n_seen]) |q| if (std.mem.eql(u8, q, path)) {
-            diag.* = .{ .bad_cache_path = path };
-            return error.Refused;
-        };
-        seen[n_seen] = path;
-        n_seen += 1;
-    }
-}
-
 fn parseFormat(words: []const []const u8, diag: *Refusal) Error!Verb {
     var c: Cursor = .{ .verb = "format", .words = words, .diag = diag };
     var out: Format = .{ .meta_uri = undefined, .data_uris = &.{} };
@@ -1921,8 +1837,6 @@ fn parseFormat(words: []const []const u8, diag: *Refusal) Error!Verb {
             };
         } else if (std.mem.eql(u8, f.name, "--encrypt-key")) {
             out.encrypt_key = try c.value(f);
-        } else if (std.mem.eql(u8, f.name, "--disk-cache-paths")) {
-            out.disk_cache_paths = try c.value(f);
         } else return c.unknown(f);
     }
     if (out.encryption != .none and out.encrypt_key == null) {
@@ -1933,7 +1847,6 @@ fn parseFormat(words: []const []const u8, diag: *Refusal) Error!Verb {
         diag.* = .key_without_encrypt;
         return error.Refused;
     }
-    try checkCachePaths(out.disk_cache_paths, diag);
     // Positionals: exactly one sqmeta://; the sqdata:// words are the TAIL
     // of argv (one spelling: `… sqmeta://m sqdata://a sqdata://b`), so the
     // verb can borrow them as one slice of the caller's argv.
@@ -1966,24 +1879,6 @@ fn parseFormat(words: []const []const u8, diag: *Refusal) Error!Verb {
     out.data_uris = try dataTail(words, diag);
     return .{ .format = out };
 }
-
-/// `--disk-cache-paths a,b` as an iterator over its members (empty = none).
-pub fn cachePaths(raw: []const u8) CachePathIterator {
-    return .{ .inner = std.mem.splitScalar(u8, raw, ','), .empty = raw.len == 0 };
-}
-
-pub const CachePathIterator = struct {
-    inner: std.mem.SplitIterator(u8, .scalar),
-    empty: bool,
-
-    pub fn next(self: *CachePathIterator) ?[]const u8 {
-        if (self.empty) return null;
-        return self.inner.next();
-    }
-};
-
-/// `set_config.MAX_CACHE_PATHS`: the grammar's own bound on one argv word.
-pub const MAX_CACHE_PATHS: usize = set_config.MAX_CACHE_PATHS;
 
 /// The `sqdata://` words as the tail of argv: from the first one on, every
 /// word must be a valid data URI (a flag or another positional after it is
@@ -2156,23 +2051,17 @@ test "format refusals: a sixth node size, an out-of-range journal, junk integers
     try testing.expect(r == .unknown_flag);
 }
 
-test "format: the data-plane flags — block size (power of two in the window), compress, encrypt + key (both or neither), cache paths (absolute, no system root, no repeat)" {
+test "format: the data-plane flags — block size (power of two in the window), compress, encrypt + key (both or neither); a cache-path flag is unknown (the write cache needs none)" {
     var d: Refusal = undefined;
     var buf: [512]u8 = undefined;
-    const v = try parse(av(&.{ "format", "--block-size", "1048576", "--compress=zstd", "--encrypt", "chacha20-poly1305", "--encrypt-key", "/etc/squeezefs/keys/x.key", "--disk-cache-paths", "/build/c1,/build/c2", "sqmeta:///m", "sqdata:///d" }), &d);
+    const v = try parse(av(&.{ "format", "--block-size", "1048576", "--compress=zstd", "--encrypt", "chacha20-poly1305", "--encrypt-key", "/etc/squeezefs/keys/x.key", "sqmeta:///m", "sqdata:///d" }), &d);
     try testing.expectEqual(@as(u32, 1 << 20), v.format.block_size);
     try testing.expectEqual(transform.Compression.zstd, v.format.compression);
     try testing.expectEqual(transform.Encryption.chacha20poly1305, v.format.encryption);
     try testing.expectEqualStrings("/etc/squeezefs/keys/x.key", v.format.encrypt_key.?);
-    var it = cachePaths(v.format.disk_cache_paths);
-    try testing.expectEqualStrings("/build/c1", it.next().?);
-    try testing.expectEqualStrings("/build/c2", it.next().?);
-    try testing.expect(it.next() == null);
     const plain = try parse(av(&.{ "format", "sqmeta:///m" }), &d);
     try testing.expectEqual(transform.DEFAULT_BLOCK_SIZE, plain.format.block_size);
     try testing.expect(plain.format.compression == .none and plain.format.encryption == .none and plain.format.encrypt_key == null);
-    var none = cachePaths(plain.format.disk_cache_paths);
-    try testing.expect(none.next() == null);
     const stdin_key = try parse(av(&.{ "format", "--encrypt", "aes-256-gcm", "--encrypt-key", "-", "sqmeta:///m" }), &d);
     try testing.expectEqualStrings("-", stdin_key.format.encrypt_key.?);
     var r = try refusal(av(&.{ "format", "--block-size", "3145728", "sqmeta:///m" }));
@@ -2189,13 +2078,8 @@ test "format: the data-plane flags — block size (power of two in the window), 
     try testing.expect(std.mem.indexOf(u8, text(&buf, r), "--encrypt-key") != null);
     r = try refusal(av(&.{ "format", "--encrypt-key", "/k", "sqmeta:///m" }));
     try testing.expect(r == .key_without_encrypt);
-    r = try refusal(av(&.{ "format", "--disk-cache-paths", "/build/c,/home", "sqmeta:///m" }));
-    try testing.expect(r == .bad_cache_path);
-    try testing.expectEqualStrings("/home", r.bad_cache_path);
-    r = try refusal(av(&.{ "format", "--disk-cache-paths", "/build/c,/build/c", "sqmeta:///m" }));
-    try testing.expect(r == .bad_cache_path);
-    r = try refusal(av(&.{ "format", "--disk-cache-paths", "rel", "sqmeta:///m" }));
-    try testing.expect(r == .bad_cache_path);
+    r = try refusal(av(&.{ "format", "--disk-cache-paths", "/build/c", "sqmeta:///m" }));
+    try testing.expect(r == .unknown_flag);
 }
 
 test "mount: -o glued or spaced, --daemon/--supervise/--log-file, two positionals in order" {
@@ -2247,7 +2131,7 @@ test "umount and status take exactly one positional; umount's --lazy/-l is the e
     try testing.expect((try refusal(av(&.{"status"}))) == .missing_positional);
 }
 
-test "rung-5 verbs: clients/df/config show/staging list take [--json] TARGET (URI or mountpoint); clone TARGET SRC DEST with absolute set paths; tune [--apply]; set-cache-paths validates the member law; staging promote and claim clear take a URI only; sub-verbs refuse by name" {
+test "rung-5 verbs: clients/df/config show take [--json] TARGET (URI or mountpoint); clone TARGET SRC DEST with absolute set paths; tune [--apply]; claim clear takes a URI only; a cache-path verb and the staging verb are unknown; sub-verbs refuse by name" {
     var d: Refusal = undefined;
     const cl = try parse(av(&.{ "clients", "--json", "/mnt/sqz" }), &d);
     try testing.expect(cl.clients.json and std.mem.eql(u8, cl.clients.target, "/mnt/sqz"));
@@ -2265,19 +2149,10 @@ test "rung-5 verbs: clients/df/config show/staging list take [--json] TARGET (UR
     try testing.expect((try refusal(av(&.{ "tune", "x" }))) == .extra_positional);
     const cs = try parse(av(&.{ "config", "show", "--json", "sqmeta:///dev/m" }), &d);
     try testing.expect(cs.config.show.json);
-    const cp = try parse(av(&.{ "config", "set-cache-paths", "--force", "/mnt/sqz", "/build/c1,/build/c2" }), &d);
-    try testing.expect(cp.config.set_cache_paths.force);
-    try testing.expectEqualStrings("/build/c1,/build/c2", cp.config.set_cache_paths.paths);
-    try testing.expect((try refusal(av(&.{ "config", "set-cache-paths", "/mnt/sqz", "/home" }))) == .bad_cache_path);
-    try testing.expect((try refusal(av(&.{ "config", "set-cache-paths", "/mnt/sqz" }))) == .missing_positional);
+    try testing.expect((try refusal(av(&.{ "config", "set-cache-paths", "/mnt/sqz", "/build/c1" }))) == .unknown_subverb);
     try testing.expect((try refusal(av(&.{"config"}))) == .missing_subverb);
     try testing.expect((try refusal(av(&.{ "config", "list" }))) == .unknown_subverb);
-    const sl = try parse(av(&.{ "staging", "list", "/mnt/sqz" }), &d);
-    try testing.expectEqualStrings("/mnt/sqz", sl.staging.list.target);
-    const sp = try parse(av(&.{ "staging", "promote", "sqmeta:///dev/m" }), &d);
-    try testing.expectEqualStrings("sqmeta:///dev/m", sp.staging.promote.target);
-    try testing.expect((try refusal(av(&.{ "staging", "promote", "/mnt/sqz" }))) == .bad_uri);
-    try testing.expect((try refusal(av(&.{ "staging", "drain", "sqmeta:///dev/m" }))) == .unknown_subverb);
+    try testing.expect((try refusal(av(&.{ "staging", "list", "/mnt/sqz" }))) == .unknown_verb);
     const cc = try parse(av(&.{ "claim", "clear", "sqmeta:///dev/m,/dev/n" }), &d);
     try testing.expectEqualStrings("sqmeta:///dev/m,/dev/n", cc.claim_clear.meta_uri);
     try testing.expect((try refusal(av(&.{ "claim", "clear", "/mnt" }))) == .bad_uri);

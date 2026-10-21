@@ -55,7 +55,7 @@ if [[ "$(basename "$0")" == umount.* ]]; then
   if ! findmnt -n -o FSROOT -M "$target" 2>/dev/null | grep -qx /; then exec umount -i "$target"; fi
   rc=0
   "$SQZ_BIN" umount "$target" || rc=$?
-  # The set's slices and cache go down with the mount (the mount helper
+  # The set's slices go down with the mount (the mount helper
   # recorded which set serves this mountpoint), so the test's own dm device
   # above them can be removed by its cleanup. A refused umount (BUSY: a
   # holder) leaves everything standing.
@@ -110,11 +110,10 @@ log="$SET_DIR/daemon-$(date +%Y%m%d-%H%M%S)-$$.log"
 # One line per mount in the set's own ledger, so a run's daemons are findable.
 echo "$(date +%s) mount $dir -o $all log $log" >> "$SET_DIR/mounts.log"
 # The set's slices over the device handed over (re-pointed when they
-# stand: a dm-flakey target now, the loop a moment ago), the cache's ext4
-# mounted; the umount helper finds the set by the mountpoint's tag. A mount
-# that fails takes them down again (the test's cleanup removes its device).
+# stand: a dm-flakey target now, the loop a moment ago); the umount helper
+# finds the set by the mountpoint's tag. A mount that fails takes them down
+# again (the test's cleanup removes its device).
 suite_slices_up "$dev"
-suite_cache_mount
 mkdir -p /run/squeezefs-suites && echo "$SET_ID" > "/run/squeezefs-suites/mnt-$(printf '%s' "$dir" | md5sum | cut -c1-16)"
 mount_failed() { suite_slices_down; rm -f "/run/squeezefs-suites/mnt-$(printf '%s' "$dir" | md5sum | cut -c1-16)"; }
 # The zero-copy kmbuf ring needs order-8 contiguous pages per queue; a

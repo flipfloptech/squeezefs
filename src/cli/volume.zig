@@ -284,25 +284,6 @@ fn refused(p: cli.Process, e: offline.Error, verb: []const u8) u8 {
     return cli.exit_failed;
 }
 
-/// The set config's cache paths (the KD-8 roots): read off member 0's
-/// control tree through a probe-class open of the set; a set with no
-/// record (never formatted by this binary) rebinds nothing.
-fn stagingRoots(gpa: std.mem.Allocator, io: Io, opts: offline.Options, paths: []const []const u8, out: *std.ArrayList([]u8)) void {
-    const set = meta_set.MetaSet.open(gpa, io, paths, .{ .env = opts.env, .pool = opts.pool, .cache_budget_bytes = opts.cache_budget_bytes, .cpus = opts.cpus, .read_only = true }) catch return;
-    defer set.close();
-    const value = (set.lookup(gpa, key.TREE_CONTROL, set_config.CONTROL_KEY) catch return) orelse return;
-    defer gpa.free(value);
-    var diag: set_config.Refusal = undefined;
-    var cfg = set_config.decode(gpa, value, &diag) catch return;
-    defer cfg.deinit(gpa);
-    for (cfg.cache_paths) |cp| out.append(gpa, gpa.dupe(u8, cp) catch return) catch return;
-}
-
-fn freeRoots(gpa: std.mem.Allocator, roots: *std.ArrayList([]u8)) void {
-    for (roots.items) |r| gpa.free(r);
-    roots.deinit(gpa);
-}
-
 const AddCtx = struct {
     p: cli.Process,
     opts: offline.Options,
@@ -322,12 +303,7 @@ const AddCtx = struct {
                 break :blk .{ .list = slots.items };
             },
         };
-        var roots: std.ArrayList([]u8) = .empty;
-        defer freeRoots(gpa, &roots);
-        stagingRoots(gpa, io, self.opts, self.paths, &roots);
-        var opts = self.opts;
-        opts.staging_roots = @ptrCast(roots.items);
-        const r = offline.addMeta(gpa, io, opts, self.paths, self.device, take) catch |e| return refused(self.p, e, "add-meta");
+        const r = offline.addMeta(gpa, io, self.opts, self.paths, self.device, take) catch |e| return refused(self.p, e, "add-meta");
         defer gpa.free(r.taken);
         self.p.stdout.print("volume add-meta: {s} joined as member {d} at epoch {d}{s}; took {d} slot(s) [", .{ self.device, r.position, r.epoch, if (r.resumed) " (a crashed run resumed)" else "", r.taken.len }) catch {};
         for (r.taken, 0..) |s, i| self.p.stdout.print("{s}{d}", .{ if (i == 0) "" else ", ", s }) catch {};
@@ -345,12 +321,7 @@ const RemoveCtx = struct {
 
     fn run(self: *RemoveCtx, io: Io) u8 {
         const gpa = self.p.gpa;
-        var roots: std.ArrayList([]u8) = .empty;
-        defer freeRoots(gpa, &roots);
-        stagingRoots(gpa, io, self.opts, self.paths, &roots);
-        var opts = self.opts;
-        opts.staging_roots = @ptrCast(roots.items);
-        const r = offline.removeMeta(gpa, io, opts, self.paths, self.victim) catch |e| return refused(self.p, e, "remove-meta");
+        const r = offline.removeMeta(gpa, io, self.opts, self.paths, self.victim) catch |e| return refused(self.p, e, "remove-meta");
         self.p.stdout.print("volume remove-meta: {s} retired at epoch {d} (tombstone written LAST); {d} slot(s) moved onto the survivors, {d} records copied. Mount with the survivors' URI (the tombstone refuses discovery if listed).\n", .{ self.victim, r.epoch, r.moved_slots, r.records_copied }) catch {};
         self.p.stdout.flush() catch {};
         return cli.exit_ok;

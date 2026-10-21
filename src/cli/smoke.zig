@@ -7,7 +7,7 @@
 //! stats dump (the `.stats` inode's stand-in until rung 5).
 //!
 //! Rung 4 adds the data plane (charter §6, §13): a SET of two sparse
-//! 2 GiB data volumes, with and without a cache path (staging + the NVMe
+//! 2 GiB data volumes, with and without the write cache (staging
 //! tier ON / OFF), files of any size through `dd`/`cp`/`truncate`,
 //! random 4 KiB overwrites against a mirrored image, 1000 packed 64 KiB
 //! files and their census after the dismount promotion, an 8-way `cp`
@@ -126,11 +126,10 @@ const Rig = struct {
     set_uri: []u8,
     mp: [:0]u8,
     log_path: [:0]u8,
-    /// The data set (rung 4): two sparse volumes, the cache path, the
-    /// random image every stage draws from.
+    /// The data set (rung 4): two sparse volumes, the random image every
+    /// stage draws from.
     d0: [:0]u8,
     d1: [:0]u8,
-    cache: [:0]u8,
     data_uri: []u8,
     image: [:0]u8,
     log_file: ?Io.File = null,
@@ -168,7 +167,6 @@ const Rig = struct {
             .log_path = try std.fmt.allocPrintSentinel(gpa, "/build/tmp/smoke-{d}/daemon.log", .{pid}, 0),
             .d0 = try std.fmt.allocPrintSentinel(gpa, "{s}/smoke-{d}/d0.img", .{ data_dir, pid }, 0),
             .d1 = try std.fmt.allocPrintSentinel(gpa, "{s}/smoke-{d}/d1.img", .{ data_dir, pid }, 0),
-            .cache = try std.fmt.allocPrintSentinel(gpa, "{s}/smoke-{d}/cache", .{ data_dir, pid }, 0),
             .data_uri = try std.fmt.allocPrint(gpa, "sqdata://{s}/smoke-{d}/d0.img,{s}/smoke-{d}/d1.img", .{ data_dir, pid, data_dir, pid }),
             .image = try std.fmt.allocPrintSentinel(gpa, "/build/tmp/smoke-{d}/image", .{pid}, 0),
             .env = std.process.Environ.Map.init(gpa),
@@ -252,7 +250,6 @@ const Rig = struct {
         self.gpa.free(self.log_path);
         self.gpa.free(self.d0);
         self.gpa.free(self.d1);
-        self.gpa.free(self.cache);
         self.gpa.free(self.data_uri);
         self.gpa.free(self.image);
         self.gpa.destroy(self);
@@ -265,30 +262,29 @@ const Rig = struct {
         try f.setLength(self.io, volume_len);
     }
 
-    /// The SET: the meta volume, two sparse data volumes, the format with
-    /// or without the cache path (staging + the NVMe tier ON / OFF).
-    fn formatSet(self: *Rig, cache: bool) !void {
-        return self.formatSetWith(cache, &.{});
+    /// The SET: the meta volume, two sparse data volumes, the mount WITH
+    /// the write cache (every mount's default) or WITHOUT it (the
+    /// cache-less posture: `SQUEEZEFS_WRITE_CACHE_PCT=0` in the rig's
+    /// env — every write past inline striped, no promotion pass).
+    fn formatSet(self: *Rig, write_cache: bool) !void {
+        return self.formatSetWith(write_cache, &.{});
     }
 
     /// `formatSet` with extra format flags (`--block-size`).
-    fn formatSetWith(self: *Rig, cache: bool, extra: []const []const u8) !void {
-        return self.formatSetSized(cache, extra, data_len);
+    fn formatSetWith(self: *Rig, write_cache: bool, extra: []const []const u8) !void {
+        return self.formatSetSized(write_cache, extra, data_len);
     }
 
     /// `formatSetWith` over data volumes of `data_bytes` each (a row that
     /// fills the set to ENOSPC wants it small).
-    fn formatSetSized(self: *Rig, cache: bool, extra: []const []const u8, data_bytes: u64) !void {
-        // `cache = false` is the CACHE-LESS posture the row asks for: no
-        // write cache either (every mount holds one by default).
-        if (!cache) try self.env.put("SQUEEZEFS_WRITE_CACHE_PCT", "0");
+    fn formatSetSized(self: *Rig, write_cache: bool, extra: []const []const u8, data_bytes: u64) !void {
+        if (!write_cache) try self.env.put("SQUEEZEFS_WRITE_CACHE_PCT", "0");
         try self.createMetaVolume();
         for ([_][]const u8{ self.d0, self.d1 }) |dp| {
             const f = try Io.Dir.cwd().createFile(self.io, dp, .{ .truncate = true });
             defer f.close(self.io);
             try f.setLength(self.io, data_bytes);
         }
-        if (cache) _ = linux.mkdir(self.cache.ptr, 0o700);
         var argv: [12][]const u8 = undefined;
         var n: usize = 0;
         argv[n] = "format";
@@ -296,11 +292,6 @@ const Rig = struct {
         for (extra) |a| {
             argv[n] = a;
             n += 1;
-        }
-        if (cache) {
-            argv[n] = "--disk-cache-paths";
-            argv[n + 1] = self.cache;
-            n += 2;
         }
         argv[n] = self.meta_uri;
         argv[n + 1] = self.data_uri;
@@ -1363,7 +1354,7 @@ fn smokeJoinerIdentity(n: u32) wire_verbs.WireIdentity {
     return .{ .node_token = 0x5A0E_0000 + n, .writer_id = 0x7000 + n, .mount_slot = 0x5000 + n, .reserved = 0 };
 }
 
-test "smoke: THE N-DAEMON POSTURE, the manager half — format (the symmetric default; meta + 2 data, cache path) → mount A: the listener is up, .stats names the pid and the wire endpoint, the durable endpoint:{0} record agrees → a second PROCESS dials A over TCP with the secret read off the device: JoinAppender, M rotor slots, a first touch, SlotBusy on A's native slot, a membership join → `appenders` lists its region Live and `clients` lists the member → a joiner that DIES is evicted at T_owner and its death recorded in the ledger → the live joiner releases, leaves (region Free) → `umount` signals A and A's own close detaches" {
+test "smoke: THE N-DAEMON POSTURE, the manager half — format (the symmetric default; meta + 2 data) → mount A: the listener is up, .stats names the pid and the wire endpoint, the durable endpoint:{0} record agrees → a second PROCESS dials A over TCP with the secret read off the device: JoinAppender, M rotor slots, a first touch, SlotBusy on A's native slot, a membership join → `appenders` lists its region Live and `clients` lists the member → a joiner that DIES is evicted at T_owner and its death recorded in the ledger → the live joiner releases, leaves (region Free) → `umount` signals A and A's own close detaches" {
     const io = testing.io;
     if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
     const gpa = testing.allocator;
@@ -2392,10 +2383,9 @@ test "smoke: THE ONLINE VOLUME ROW ACROSS DAEMONS — mount A (the manager) + B 
     try rig.env.put("SQUEEZEFS_MW_BIND", "127.0.0.1:0");
     var t_owner_text: [8]u8 = undefined;
     try rig.env.put("SQUEEZEFS_TEST_MEMBERSHIP_T_OWNER_MS", try std.fmt.bufPrint(&t_owner_text, "{d}", .{smoke_t_owner_ms}));
-    // fsync promotes a staged file (the A/B lever's ON arm): each file
-    // lands its block through the router's placement at its own fsync, so
-    // the row reads placement per file instead of at B's dismount.
-    try rig.env.put("SQUEEZEFS_FSYNC_PROMOTE_STAGED", "1");
+    // fsync promotes a staged file (the write cache's law): each file lands
+    // its block through the router's placement at its own fsync, so the
+    // row reads placement per file instead of at B's dismount.
     // A holds the online arm of d2 until its holder answered a data-plane
     // verb for a volume it has not armed (or T_owner passed): a joiner that
     // learnt d2 before A's arm would ask A for it inside the window — A's
@@ -2625,7 +2615,7 @@ fn convertVerifyScript(gpa: std.mem.Allocator) ![]u8 {
     return w.toOwnedSlice();
 }
 
-test "smoke: `volume enable-symmetric` — format --single-writer (meta + 2 data, a cache path) → mount, a tree of 201 files, the verb REFUSES the mounted volume (exit 1, MOUNTED) → clean umount → the verb converts (the link claimed, the ring re-based, the stamp) → a second run refuses (already symmetric) → mount A: the MANAGER posture (manager_lease held, symmetric_meta 1, appenders 1 page mgr), every file intact → B JOINS as a second process (appender 1), creates in its own slots, A reads B's files under tokens → umount B, umount A → `fsck --offline --scrub` 0 findings" {
+test "smoke: `volume enable-symmetric` — format --single-writer (meta + 2 data) → mount, a tree of 201 files, the verb REFUSES the mounted volume (exit 1, MOUNTED) → clean umount → the verb converts (the link claimed, the ring re-based, the stamp) → a second run refuses (already symmetric) → mount A: the MANAGER posture (manager_lease held, symmetric_meta 1, appenders 1 page mgr), every file intact → B JOINS as a second process (appender 1), creates in its own slots, A reads B's files under tokens → umount B, umount A → `fsck --offline --scrub` 0 findings" {
     const io = testing.io;
     if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
     const gpa = testing.allocator;
@@ -2906,7 +2896,6 @@ test "smoke: TWO MOUNTS OF ONE SET ON ONE HOST — each member holds its OWN wri
         const sb = try b.stats();
         defer gpa.free(sb);
         try testing.expectEqual(@as(?u64, 0), numberAfter(sb, "\"staging_recovery_records\":"));
-        try testing.expectEqual(@as(?u64, 0), numberAfter(sb, "\"staging_member_residue_roots\":"));
         const sa = try rig.stats();
         defer gpa.free(sa);
         try testing.expectEqual(a_staged, numberAfter(sa, "\"current_staged_write_bytes\":") orelse 0);
@@ -6189,7 +6178,7 @@ fn awaitShippedFreesSettled(b: *Peer, rig: *Rig) !u64 {
 /// A data volume of three 4 MiB(+4 KiB) chunks: two reserved, one usable.
 const data_volume_len: u64 = 3 * ((4 << 20) + 4096) + 4096;
 
-test "smoke: a SET format — meta + 2 data files + lz4 + aes-256-gcm + a cache path → both data superblocks written and read back → status lists both tags → a re-format refuses on the meta AND on a data volume → a mount with no key refuses naming every source → with the key it mounts, logs the set config and the key id, serves, unmounts → renumbered or blank data devices refuse the mount by name" {
+test "smoke: a SET format — meta + 2 data files + lz4 + aes-256-gcm → both data superblocks written and read back → status lists both tags → a re-format refuses on the meta AND on a data volume → a mount with no key refuses naming every source → with the key it mounts, logs the set config and the key id, serves, unmounts → renumbered or blank data devices refuse the mount by name" {
     const io = testing.io;
     if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
     const gpa = testing.allocator;
@@ -6203,11 +6192,9 @@ test "smoke: a SET format — meta + 2 data files + lz4 + aes-256-gcm + a cache 
     var d0: [128]u8 = undefined;
     var d1: [128]u8 = undefined;
     var key_path: [128]u8 = undefined;
-    var cache_path: [128]u8 = undefined;
     const d0p = try std.fmt.bufPrint(&d0, "{s}/d0.img", .{rig.work});
     const d1p = try std.fmt.bufPrint(&d1, "{s}/d1.img", .{rig.work});
     const kp = try std.fmt.bufPrint(&key_path, "{s}/set.key", .{rig.work});
-    const cp = try std.fmt.bufPrint(&cache_path, "{s}/cache", .{rig.work});
     for ([_][]const u8{ d0p, d1p }) |dp| {
         const f = try Io.Dir.cwd().createFile(io, dp, .{ .truncate = true });
         defer f.close(io);
@@ -6220,11 +6207,9 @@ test "smoke: a SET format — meta + 2 data files + lz4 + aes-256-gcm + a cache 
     }
     var data_uri: [320]u8 = undefined;
     const du = try std.fmt.bufPrint(&data_uri, "sqdata://{s},{s}", .{ d0p, d1p });
-    var cache_flag: [160]u8 = undefined;
-    const cf = try std.fmt.bufPrint(&cache_flag, "{s}", .{cp});
     // The set format.
     {
-        const r = try rig.squeezefs(&.{ "format", "--compress", "lz4", "--encrypt", "aes-256-gcm", "--encrypt-key", kp, "--disk-cache-paths", cf, rig.meta_uri, du });
+        const r = try rig.squeezefs(&.{ "format", "--compress", "lz4", "--encrypt", "aes-256-gcm", "--encrypt-key", kp, rig.meta_uri, du });
         defer rig.freeRun(r);
         if (!r.term.success()) std.debug.print("\nformat: {s}\n", .{r.stderr});
         try testing.expect(r.term.success());
@@ -6232,7 +6217,6 @@ test "smoke: a SET format — meta + 2 data files + lz4 + aes-256-gcm + a cache 
         try testing.expect(std.mem.indexOf(u8, r.stdout, "data volumes 2 (VOLUME_LIFECYCLE") != null);
         try testing.expect(std.mem.indexOf(u8, r.stdout, "chunk 4198400 B") != null);
         try testing.expect(std.mem.indexOf(u8, r.stdout, " 1 blocks (4 MiB)") != null);
-        try testing.expect(std.mem.indexOf(u8, r.stdout, "disk cache paths 1:") != null);
         try testing.expectEqual(@as(usize, 2), std.mem.count(u8, r.stdout, "vol-"));
     }
     // Both data files carry the identity at sector 0 and the tail.
@@ -6358,7 +6342,7 @@ const bench_terms = @import("bench.zig").StatsTerms;
 /// O_APPEND write (one drain per append).
 const xform_appends = 40;
 
-test "smoke: THE TRANSFORMED APPEND on a set without a cache path (decision 0003 §AK) — lz4, then aes-256-gcm: a file past the inline bound grows by 40 fsync'd 72 B appends and reads back exact (the write side seeded a transformed block's image through a block-sized buffer the chunk-sized read window refused: EIO at the first write past 4 KiB); a transformed block cannot be patched in place, so each drain lands the block's framed image whole — trimmed to its live bytes: ≤ the stored bound of the file's bytes per drain (8,192 B on aes-256-gcm for a 7,880 B file), where the untrimmed image of an encrypted set was the whole block; a read past the image's plaintext within EOF serves zeros" {
+test "smoke: THE TRANSFORMED APPEND on a cache-less mount (decision 0003 §AK) — lz4, then aes-256-gcm: a file past the inline bound grows by 40 fsync'd 72 B appends and reads back exact (the write side seeded a transformed block's image through a block-sized buffer the chunk-sized read window refused: EIO at the first write past 4 KiB); a transformed block cannot be patched in place, so each drain lands the block's framed image whole — trimmed to its live bytes: ≤ the stored bound of the file's bytes per drain (8,192 B on aes-256-gcm for a 7,880 B file), where the untrimmed image of an encrypted set was the whole block; a read past the image's plaintext within EOF serves zeros" {
     const io = testing.io;
     if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
     const gpa = testing.allocator;
@@ -6430,7 +6414,7 @@ test "smoke: THE TRANSFORMED APPEND on a set without a cache path (decision 0003
 /// A data volume: 2 GiB sparse on the venue's ext4 = 510 usable 4 MiB
 /// blocks past the superblock chunk; two of them hold the pass's peak
 /// (200 MiB `dd` + 100 MiB copy + 8 × 50 MiB storm ≈ 175 blocks) and, on
-/// the set WITHOUT a cache path, 100 one-block 64 KiB files.
+/// the cache-less mount, 100 one-block 64 KiB files.
 const data_len: u64 = 2 << 30;
 /// The random image on ext4 every stage slices (`image_mib` ≥ 200 for the
 /// `dd`, 100 for the copy, 8 × 50 MiB at 25 MiB strides = 225, 1000 × 64 KiB
@@ -6445,7 +6429,7 @@ const storm_stride_mib: u64 = 25;
 /// The packed candidates on the staging set: 64 KiB (> inline_max, ≪ the
 /// 2 MiB max slot) × 1000 = 62.5 MiB.
 const small_files_staged: usize = 1000;
-/// Without a cache path a 64 KiB file is one striped block: 100 of them
+/// Without the write cache a 64 KiB file is one striped block: 100 of them
 /// = 400 MiB of the set's 4080 MiB.
 const small_files_striped: usize = 100;
 const small_len: u64 = 64 << 10;
@@ -6943,7 +6927,7 @@ fn zcKernel() bool {
     return transport.probes.driver.probeKmbuf(@intCast(derive.facts().page_size)).opcodes() != null;
 }
 
-/// THE DATA-PLANE PASS on a fresh set (with or without a cache path).
+/// THE DATA-PLANE PASS on a fresh set (with or without the write cache).
 fn dataPlanePass(rig: *Rig, cache: bool) !void {
     const gpa = rig.gpa;
     const io = rig.io;
@@ -6966,7 +6950,7 @@ fn dataPlanePass(rig: *Rig, cache: bool) !void {
             const legs = if (zc_legs) "held-slot direct store ON, direct device leg ON, fd-source probe serve ON" else "held-slot direct store off, direct device leg off, fd-source probe serve off";
             try testing.expect(std.mem.indexOf(u8, seg, legs) != null);
         } else {
-            try testing.expect(std.mem.indexOf(u8, seg, "staging and the NVMe read tier are OFF") != null);
+            try testing.expect(std.mem.indexOf(u8, seg, "no write cache (SQUEEZEFS_WRITE_CACHE_PCT yields 0 B") != null);
         }
     }
     const baseline = try rig.usedKib();
@@ -7170,7 +7154,7 @@ fn dataPlanePass(rig: *Rig, cache: bool) !void {
     }
 }
 
-test "smoke: the data plane WITH a cache path — dd 200 MiB sha round trip, cp 100 MiB + cmp, truncate, 4 KiB overwrites, 1000 packed 64 KiB files and their census, the 8-way storm with every ledger closed, rm → df baseline" {
+test "smoke: the data plane WITH the write cache — dd 200 MiB sha round trip, cp 100 MiB + cmp, truncate, 4 KiB overwrites, 1000 packed 64 KiB files and their census, the 8-way storm with every ledger closed, rm → df baseline" {
     const io = testing.io;
     if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
     const rig = try Rig.init(testing.allocator, io);
@@ -7178,7 +7162,7 @@ test "smoke: the data plane WITH a cache path — dd 200 MiB sha round trip, cp 
     try dataPlanePass(rig, true);
 }
 
-test "smoke: the data plane WITHOUT a cache path — staging and the NVMe tier OFF, every write beyond inline striped; the same pass with 100 one-block files" {
+test "smoke: the data plane WITHOUT the write cache (SQUEEZEFS_WRITE_CACHE_PCT=0) — staging OFF, every write beyond inline striped; the same pass with 100 one-block files" {
     const io = testing.io;
     if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
     const rig = try Rig.init(testing.allocator, io);
@@ -7243,7 +7227,7 @@ fn kernelAioPass(path: [:0]const u8, n: usize, o_direct: bool) !void {
     try testing.expectEqualSlices(u8, wbuf, rbuf);
 }
 
-/// The kernel-aio pass on a set WITH or WITHOUT a cache path: a fresh
+/// The kernel-aio pass on a mount WITH or WITHOUT the write cache: a fresh
 /// file, the same file again (`O_TRUNC` over an existing striped file), a
 /// fresh file under `O_DIRECT`; then the whole bytes read back through
 /// `cat | sha256sum` against the expected image.
@@ -7273,12 +7257,12 @@ fn kernelAioStage(rig: *Rig, cache: bool) !void {
     const tail = try rig.stats();
     defer testing.allocator.free(tail);
     try expectMustStayZero(tail);
-    std.debug.print("\nsmoke: kernel aio on the plain mount ({s} cache path): 3 passes × {d} PWRITE + {d} PREAD byte-exact (fresh, O_TRUNC over striped, O_DIRECT); write routing inline {d} / staged {d} / striped {d}, promotions {d}, held-slot stores {d}, extractions {d}\n", .{ if (cache) "with a" else "no", n, n, numberAfter(tail, "\"fuse_write_inline\":") orelse 0, numberAfter(tail, "\"fuse_write_staged\":") orelse 0, numberAfter(tail, "\"fuse_write_striped\":") orelse 0, numberAfter(tail, "\"fuse_write_promotions_to_striped\":") orelse 0, numberAfter(tail, "\"held_stores\":") orelse 0, numberAfter(tail, "\"transport_zc_write_extractions\":") orelse 0 });
+    std.debug.print("\nsmoke: kernel aio on the plain mount ({s} write cache): 3 passes × {d} PWRITE + {d} PREAD byte-exact (fresh, O_TRUNC over striped, O_DIRECT); write routing inline {d} / staged {d} / striped {d}, promotions {d}, held-slot stores {d}, extractions {d}\n", .{ if (cache) "with the" else "no", n, n, numberAfter(tail, "\"fuse_write_inline\":") orelse 0, numberAfter(tail, "\"fuse_write_staged\":") orelse 0, numberAfter(tail, "\"fuse_write_striped\":") orelse 0, numberAfter(tail, "\"fuse_write_promotions_to_striped\":") orelse 0, numberAfter(tail, "\"held_stores\":") orelse 0, numberAfter(tail, "\"transport_zc_write_extractions\":") orelse 0 });
     try rig.umount();
     try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
 }
 
-test "smoke: KERNEL AIO on the plain mount (no shim): io_submit of 8 × 4 KiB PWRITEs into a fresh file (the inline → striped promotion under concurrent writes), again over the existing file, under O_DIRECT; every io_getevents res the page, byte-exact read-back — on a set WITHOUT a cache path (every write beyond inline striped) and WITH one" {
+test "smoke: KERNEL AIO on the plain mount (no shim): io_submit of 8 × 4 KiB PWRITEs into a fresh file (the inline → striped promotion under concurrent writes), again over the existing file, under O_DIRECT; every io_getevents res the page, byte-exact read-back — on a mount WITHOUT the write cache (every write beyond inline striped) and WITH it" {
     const io = testing.io;
     if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
     {
@@ -7353,7 +7337,7 @@ fn aioRandomReads(path: [:0]const u8, pattern: [:0]const u8, len: u64, reads: us
     }
 }
 
-test "smoke: THE READ VIEW — a 16 MiB striped file (no cache path), its custody landed; 512 random 4 KiB O_DIRECT reads (QD 8) byte-exact: every probe and every post-DMA recheck resolves off the per-ino view (read_view_hits ≥ 2 per read, no view miss after the first read's fill, at most the atime echo's refill); a truncate stales the view (a read at the old length is EOF, read_view_stale moved), an overwrite's publish stales it again (the new bytes read back), the must-stay-0 set clean" {
+test "smoke: THE READ VIEW — a 16 MiB striped file (no write cache), its custody landed; 512 random 4 KiB O_DIRECT reads (QD 8) byte-exact: every probe and every post-DMA recheck resolves off the per-ino view (read_view_hits ≥ 2 per read, no view miss after the first read's fill, at most the atime echo's refill); a truncate stales the view (a read at the old length is EOF, read_view_stale moved), an overwrite's publish stales it again (the new bytes read back), the must-stay-0 set clean" {
     const io = testing.io;
     if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
     const gpa = testing.allocator;
@@ -7493,7 +7477,7 @@ fn aioStreamOverwrite(path: [:0]const u8, file_len: u64, depth: usize, len: usiz
     return written;
 }
 
-test "smoke: A STREAMING OVERWRITE NEVER WEDGES THE DAEMON — format (no cache path), one 1 GiB file laid down, then ONE job's QD16 1 MiB sequential O_DIRECT overwrite of it (fio where present, else the smoke's kernel-aio writer) long enough to drain the fresh supply and run on block-grant top-ups: every write answered inside the row's bound, fuse_op_watchdog_overdue 0, lock_ticked_reregisters 0, the gauges clean, an orderly unmount (rung-10-fsync-route: a top-up winner parked on its journal ticket under a same-lane minter's spin)" {
+test "smoke: A STREAMING OVERWRITE NEVER WEDGES THE DAEMON — format (no write cache), one 1 GiB file laid down, then ONE job's QD16 1 MiB sequential O_DIRECT overwrite of it (fio where present, else the smoke's kernel-aio writer) long enough to drain the fresh supply and run on block-grant top-ups: every write answered inside the row's bound, fuse_op_watchdog_overdue 0, lock_ticked_reregisters 0, the gauges clean, an orderly unmount (rung-10-fsync-route: a top-up winner parked on its journal ticket under a same-lane minter's spin)" {
     const io = testing.io;
     if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
     const rig = try Rig.init(testing.allocator, io);
@@ -8089,7 +8073,7 @@ const syncfs_base_bytes: u64 = 4 << 20;
 /// (its mtime is a parked stamp under the coalesced cadence, §L.6).
 const syncfs_patch_bytes: u64 = 8192;
 
-test "smoke: `sync -f` IS A DURABILITY POINT FOR THE DAEMON'S WRITE CUSTODY — format (no cache path: every write beyond inline striped) → mount → the test process holds `f` and `g` OPEN and closes neither (no RELEASE, no FLUSH drains them; it spawns nothing while it holds them): 1 MiB + 1000 B into the fresh `f` (a partial block parked in RAM), 8 KiB over the head of the fsync'd `g` (a size-neutral write: its mtime parked) → syncfs(2) on the mount returns → kill -9 the daemon → fsck --offline clean → remount → `f` is the image byte for byte, `g` carries the overwrite and the mtime the holder saw" {
+test "smoke: `sync -f` IS A DURABILITY POINT FOR THE DAEMON'S WRITE CUSTODY — format (no write cache: every write beyond inline striped) → mount → the test process holds `f` and `g` OPEN and closes neither (no RELEASE, no FLUSH drains them; it spawns nothing while it holds them): 1 MiB + 1000 B into the fresh `f` (a partial block parked in RAM), 8 KiB over the head of the fsync'd `g` (a size-neutral write: its mtime parked) → syncfs(2) on the mount returns → kill -9 the daemon → fsck --offline clean → remount → `f` is the image byte for byte, `g` carries the overwrite and the mtime the holder saw" {
     const io = testing.io;
     if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
     const gpa = testing.allocator;
@@ -8319,7 +8303,7 @@ fn closeDrainRow(no_open: bool) !void {
     try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
 }
 
-test "smoke: A NO-OPEN CLOSE IS THE WRITE-BACK DRAIN (decision 0003 §AF) — format (no cache path: a partial block parks in RAM) → mount with SQUEEZEFS_FUSE_NO_OPEN=1 (the daemon latches the connection at ready: its own `.stats` open, the ONE OPEN answered ENOSYS) → `g` written and read → 1 MiB + 1000 B into a fresh `f` (a CREATE: no RELEASE will ever come) and appended to `g` (no OPEN at all) by plain redirections → kill -9 the moment the last close returned: nothing parked, nothing owed, no RELEASE, ≥ 2 FLUSH drains, ONE OPEN → fsck --offline clean → remount → both files whole" {
+test "smoke: A NO-OPEN CLOSE IS THE WRITE-BACK DRAIN (decision 0003 §AF) — format (no write cache: a partial block parks in RAM) → mount with SQUEEZEFS_FUSE_NO_OPEN=1 (the daemon latches the connection at ready: its own `.stats` open, the ONE OPEN answered ENOSYS) → `g` written and read → 1 MiB + 1000 B into a fresh `f` (a CREATE: no RELEASE will ever come) and appended to `g` (no OPEN at all) by plain redirections → kill -9 the moment the last close returned: nothing parked, nothing owed, no RELEASE, ≥ 2 FLUSH drains, ONE OPEN → fsck --offline clean → remount → both files whole" {
     if (venueMissing(testing.io)) |why| return testkit.skipWhy(@src(), why);
     try closeDrainRow(true);
 }
@@ -8400,7 +8384,7 @@ fn orderedCheck(io: Io, dir: Io.Dir, image: Io.File, step: OrderedStep, k: usize
     return size;
 }
 
-test "smoke: THE ORDERED LAW'S KILL ROW (decision 0003 §AL.5 with §AJ.4) — format (no cache path: a partial block parks in RAM), the write-back timer posture, every promotion's own block POISONED with 0xAA before its image grain lands (SQUEEZEFS_TEST_OWN_BLOCK_POISON: the bytes a recycled block's previous owner leaves where a block device elides its discard) → per step a 100 B file grows by one grain at byte 8,192 (the gap [100, 8192) crosses the poisoned tail) and the daemon is killed -9: the moment the write returned / once the timer landed it / after conv=fsync / after an fsynced growth and a truncate-up into the tail → fsck --offline clean → remount → the file at its last durable size (unsynced: 100 B or whole; fsynced: whole) and every byte below it its own, never the poison" {
+test "smoke: THE ORDERED LAW'S KILL ROW (decision 0003 §AL.5 with §AJ.4) — format (no write cache: a partial block parks in RAM), the write-back timer posture, every promotion's own block POISONED with 0xAA before its image grain lands (SQUEEZEFS_TEST_OWN_BLOCK_POISON: the bytes a recycled block's previous owner leaves where a block device elides its discard) → per step a 100 B file grows by one grain at byte 8,192 (the gap [100, 8192) crosses the poisoned tail) and the daemon is killed -9: the moment the write returned / once the timer landed it / after conv=fsync / after an fsynced growth and a truncate-up into the tail → fsck --offline clean → remount → the file at its last durable size (unsynced: 100 B or whole; fsynced: whole) and every byte below it its own, never the poison" {
     const io = testing.io;
     if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
     const gpa = testing.allocator;
@@ -8448,14 +8432,14 @@ test "smoke: THE ORDERED LAW'S KILL ROW (decision 0003 §AL.5 with §AJ.4) — f
 }
 
 /// The owed row's writer: an extending write that parks a partial block
-/// (no cache path), the pattern the remount checks.
+/// (no write cache), the pattern the remount checks.
 const owed_write_bytes: usize = (1 << 20) + 1000;
 
 fn owedByte(i: usize) u8 {
     return @truncate(i *% 31 +% 7);
 }
 
-test "smoke: CUSTODY NO CLOSE COVERS IS DRAINED ONCE IDLE (decision 0003 §AF) — no-open, no cache path, the owed idle horizon at 0 (the seam), the connection latched at ready (no RELEASE would drain `m` either): a writer creates `m` and writes 1 MiB + 1000 B (a parked partial block) and holds its fd OPEN — no close, so no FLUSH follows the write: the class a mapping written back after its fd closed (`fuse_vma_close` at munmap) and an async write landing after its close share ⇒ the ino is owed → the reclaim cadence drains it (parked 0, owed 0, ONE idle drain, no FLUSH drain) → kill -9 with the fd still open → fsck --offline clean → remount → the bytes are there" {
+test "smoke: CUSTODY NO CLOSE COVERS IS DRAINED ONCE IDLE (decision 0003 §AF) — no-open, no write cache, the owed idle horizon at 0 (the seam), the connection latched at ready (no RELEASE would drain `m` either): a writer creates `m` and writes 1 MiB + 1000 B (a parked partial block) and holds its fd OPEN — no close, so no FLUSH follows the write: the class a mapping written back after its fd closed (`fuse_vma_close` at munmap) and an async write landing after its close share ⇒ the ino is owed → the reclaim cadence drains it (parked 0, owed 0, ONE idle drain, no FLUSH drain) → kill -9 with the fd still open → fsck --offline clean → remount → the bytes are there" {
     const io = testing.io;
     if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
     const gpa = testing.allocator;
@@ -8527,7 +8511,7 @@ test "smoke: CUSTODY NO CLOSE COVERS IS DRAINED ONCE IDLE (decision 0003 §AF) �
 /// The close-burst row: forked appenders sharing one fd.
 const burst_children: usize = 200;
 
-test "smoke: A CLOSE BURST COALESCES ITS DRAINS (decision 0003 §AF) — no-open, no cache path: `log` written past inline (its close drains), then a shell holds it open for append and 200 forked `/bin/echo` children write a line each through it — every child's exit closes its copy, a FLUSH with custody ⇒ ONE drains (the first), the rest defer to the reclaim cadence's next tick (drains ≤ 2 + the windows the burst spanned, drains + deferred ≥ 200; drained each, they re-uploaded a whole block per close: 57,000× amplification measured) → the deferred custody lands (owed 0, parked 0) → kill -9 → fsck --offline clean → remount → every line there" {
+test "smoke: A CLOSE BURST COALESCES ITS DRAINS (decision 0003 §AF) — no-open, no write cache: `log` written past inline (its close drains), then a shell holds it open for append and 200 forked `/bin/echo` children write a line each through it — every child's exit closes its copy, a FLUSH with custody ⇒ ONE drains (the first), the rest defer to the reclaim cadence's next tick (drains ≤ 2 + the windows the burst spanned, drains + deferred ≥ 200; drained each, they re-uploaded a whole block per close: 57,000× amplification measured) → the deferred custody lands (owed 0, parked 0) → kill -9 → fsck --offline clean → remount → every line there" {
     const io = testing.io;
     if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
     const gpa = testing.allocator;
@@ -8586,7 +8570,7 @@ test "smoke: A CLOSE BURST COALESCES ITS DRAINS (decision 0003 §AF) — no-open
 }
 
 /// The write-back timer rows' files (decision 0003 §AJ): a partial block
-/// each on a set without a cache path (parked in RAM until a drain), a
+/// each on a cache-less mount (parked in RAM until a drain), a
 /// pattern per file so a swapped or torn body is caught.
 const wb_file_bytes: usize = (1 << 20) + 1000;
 
@@ -8677,7 +8661,7 @@ fn wbJudge(gpa: std.mem.Allocator, path: [:0]const u8, file: usize) !WbFile {
     return .{ .head = head, .tail = tail };
 }
 
-test "smoke: THE WRITE-BACK TIMER — CLOSE IS LOCAL, THE BOUND HOLDS (decision 0003 §AJ: close is no durability point; an acked unsynced write leaves daemon memory within T_wb) — format (no cache path: a partial block parks in RAM) → mount under SQUEEZEFS_WRITEBACK_POSTURE=timer (no-open; the daemon's own close at ready is the ONE FLUSH, answered ENOSYS: the kernel's `no_flush`) → 8 files created, written past inline and closed, each reopened and closed 4 times: no FLUSH reaches the daemon past the latch (ENOSYS still the one, no worker serve, no demotion, no drain), no RELEASE → `f` written and closed, never synced: the timer lands it (owed 0, parked 0, every residency ≥ the age: nothing landed before it came of age) → 16 more written and closed and kill -9 AT ONCE → fsck --offline clean → remount → `f` and the 8 whole; each write(2) of the 16 (1 MiB, then its 1000 B tail: one FUSE WRITE each) whole or absent (zeros, or past a length reverted to a write boundary), never torn, never another file's bytes" {
+test "smoke: THE WRITE-BACK TIMER — CLOSE IS LOCAL, THE BOUND HOLDS (decision 0003 §AJ: close is no durability point; an acked unsynced write leaves daemon memory within T_wb) — format (no write cache: a partial block parks in RAM) → mount under SQUEEZEFS_WRITEBACK_POSTURE=timer (no-open; the daemon's own close at ready is the ONE FLUSH, answered ENOSYS: the kernel's `no_flush`) → 8 files created, written past inline and closed, each reopened and closed 4 times: no FLUSH reaches the daemon past the latch (ENOSYS still the one, no worker serve, no demotion, no drain), no RELEASE → `f` written and closed, never synced: the timer lands it (owed 0, parked 0, every residency ≥ the age: nothing landed before it came of age) → 16 more written and closed and kill -9 AT ONCE → fsck --offline clean → remount → `f` and the 8 whole; each write(2) of the 16 (1 MiB, then its 1000 B tail: one FUSE WRITE each) whole or absent (zeros, or past a length reverted to a write boundary), never torn, never another file's bytes" {
     const io = testing.io;
     if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
     const gpa = testing.allocator;
@@ -8764,7 +8748,7 @@ test "smoke: THE WRITE-BACK TIMER — CLOSE IS LOCAL, THE BOUND HOLDS (decision 
     try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
 }
 
-test "smoke: UNDER THE WRITE-BACK TIMER fsync, fdatasync AND syncfs ARE STILL DURABILITY POINTS — the timer held ten minutes away (the seam), no cache path: `s1` written + fsync, `s2` + fdatasync, `s3` + syncfs(2), `s4` written and closed with no sync → kill -9 at once → fsck --offline clean → remount → s1, s2, s3 whole; s4's parked tail absent (zeros, or past a length reverted to the head): the unsynced write younger than T_wb the owner's ruling lets a crash lose, never torn" {
+test "smoke: UNDER THE WRITE-BACK TIMER fsync, fdatasync AND syncfs ARE STILL DURABILITY POINTS — the timer held ten minutes away (the seam), no write cache: `s1` written + fsync, `s2` + fdatasync, `s3` + syncfs(2), `s4` written and closed with no sync → kill -9 at once → fsck --offline clean → remount → s1, s2, s3 whole; s4's parked tail absent (zeros, or past a length reverted to the head): the unsynced write younger than T_wb the owner's ruling lets a crash lose, never torn" {
     const io = testing.io;
     if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
     const gpa = testing.allocator;
@@ -8832,7 +8816,7 @@ const wb_storm_writers: usize = 16;
 const wb_storm_files: usize = 12;
 const wb_storm_cap: u64 = 8;
 
-test "smoke: THE WRITE-BACK TIMER UNDER A WRITER STORM — the memory bound (decision 0003 §AJ): no cache path, SQUEEZEFS_PARKED_BUFFERS=8 (the budget's parked-buffer component), 16 writers each create, write 1 MiB + 1000 B (two write(2)s) and close 12 files (a partial block each, every close local): at every sample the parked buffers stay ≤ 8 and their bytes ≤ 8 blocks — a writer past the cap parks at the gate or lands the coldest custody itself (gate waits + cold flushes ≥ 1), nothing grows without bound → the storm ends, the timer lands the rest (owed 0, parked 0) → kill -9 → fsck --offline clean → remount → all 192 files whole" {
+test "smoke: THE WRITE-BACK TIMER UNDER A WRITER STORM — the memory bound (decision 0003 §AJ): no write cache, SQUEEZEFS_PARKED_BUFFERS=8 (the budget's parked-buffer component), 16 writers each create, write 1 MiB + 1000 B (two write(2)s) and close 12 files (a partial block each, every close local): at every sample the parked buffers stay ≤ 8 and their bytes ≤ 8 blocks — a writer past the cap parks at the gate or lands the coldest custody itself (gate waits + cold flushes ≥ 1), nothing grows without bound → the storm ends, the timer lands the rest (owed 0, parked 0) → kill -9 → fsck --offline clean → remount → all 192 files whole" {
     const io = testing.io;
     if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
     const gpa = testing.allocator;
@@ -9378,7 +9362,6 @@ test "smoke: THE STAGED READ'S IDENTITY WINDOW — a 256 KiB staged file; an O_D
     var fb: [linux.PATH_MAX]u8 = undefined;
     const fifo = try std.fmt.bufPrintSentinel(&fb, "{s}/staged-read.fifo", .{rig.work}, 0);
     try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.mknodat(linux.AT.FDCWD, fifo.ptr, linux.S.IFIFO | 0o600, 0)));
-    try rig.env.put("SQUEEZEFS_FSYNC_PROMOTE_STAGED", "1");
     try rig.env.put("SQUEEZEFS_DIRECT_DEVICE_TRUE", "1");
     try rig.env.put("SQUEEZEFS_TEST_STAGED_READ_HOLD", fifo);
     try rig.formatSet(true);
@@ -9412,16 +9395,12 @@ test "smoke: THE STAGED READ'S IDENTITY WINDOW — a 256 KiB staged file; an O_D
     try testing.expectEqual(@as(?u64, 0), numberAfter(t, "\"staged_payload_lost_reads\":"));
     // The promotion's durability order (DUR-1 on the promotion arms): the
     // tenant's volume barriered (or declared write-through) BEFORE the
-    // packed layout published. The record was never fsync'd (cp, then the
-    // syncfs's promote leg runs before its sync leg), so its departure
-    // owes no cover round: released at once, nothing held.
+    // packed layout published.
     try testing.expectEqual(@as(u64, 1), (numberAfter(t, "\"promotion_barriers\":") orelse 0) + (numberAfter(t, "\"promotion_barrier_write_through_skips\":") orelse 0));
-    try testing.expectEqual(@as(?u64, 0), numberAfter(t, "\"staging_departures_deferred\":"));
-    try testing.expectEqual(@as(?u64, 0), numberAfter(t, "\"staging_departed_held\":"));
     try rig.umount();
 }
 
-test "smoke: FSCK AND SCRUB — format (a cache path) → fill (dirs, 200 packed small files, hard links, three fsync'd 20 MiB files, a clone) → umount → `fsck --offline --scrub` 0 findings over every block → mount, 8-way storm, kill -9 → `fsck --offline` 0 findings → remount, clean umount → a planted stray reference is exactly [C3]+[C8] on its block (exit 1), `--repair` plans, `--repair --apply` releases it, clean → a planted orphan inode is exactly [C9], destroyed on apply, clean → `merge-reports` of two residue shards ≡ the whole run" {
+test "smoke: FSCK AND SCRUB — format → fill (dirs, 200 packed small files, hard links, three fsync'd 20 MiB files, a clone) → umount → `fsck --offline --scrub` 0 findings over every block → mount, 8-way storm, kill -9 → `fsck --offline` 0 findings → remount, clean umount → a planted stray reference is exactly [C3]+[C8] on its block (exit 1), `--repair` plans, `--repair --apply` releases it, clean → a planted orphan inode is exactly [C9], destroyed on apply, clean → `merge-reports` of two residue shards ≡ the whole run" {
     const io = testing.io;
     if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
     const gpa = testing.allocator;
@@ -9694,7 +9673,7 @@ fn volumeIdOfPath(rig: *Rig, path: []const u8) !?[]u8 {
     return null;
 }
 
-test "smoke: THE JOBS MATRIX — format (1 MiB blocks, a cache path) → fill (packed, striped, a 1.5 GiB block-map file) → umount, clone, remount → `volume add-data <mp>` ONLINE (the new volume live, the rebalance on the fabric, `backend_fill_spread` ≤ 10 pp) → `volume remove-data <mp> d0` → `job pause/resume/throttle` live → the drain retires d0 (every block moved once; df within the window) → `undrain` refused after retire → `defrag --pack <mp>` on a half-empty pack → `remove-data d1` at 25 % → kill -9 mid-drain → remount adopts and completes it → `fsck --online` 0 findings → a second daemon enrolls as a REMOTE WORKER over TCP and runs a job → `fsck --offline` clean" {
+test "smoke: THE JOBS MATRIX — format (1 MiB blocks) → fill (packed, striped, a 1.5 GiB block-map file) → umount, clone, remount → `volume add-data <mp>` ONLINE (the new volume live, the rebalance on the fabric, `backend_fill_spread` ≤ 10 pp) → `volume remove-data <mp> d0` → `job pause/resume/throttle` live → the drain retires d0 (every block moved once; df within the window) → `undrain` refused after retire → `defrag --pack <mp>` on a half-empty pack → `remove-data d1` at 25 % → kill -9 mid-drain → remount adopts and completes it → `fsck --online` 0 findings → a second daemon enrolls as a REMOTE WORKER over TCP and runs a job → `fsck --offline` clean" {
     const io = testing.io;
     if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
     const gpa = testing.allocator;
@@ -9712,9 +9691,8 @@ test "smoke: THE JOBS MATRIX — format (1 MiB blocks, a cache path) → fill (p
         defer f.close(io);
         try f.setLength(io, matrix_vol_len);
     }
-    _ = linux.mkdir(rig.cache.ptr, 0o700);
     {
-        const r = try rig.squeezefs(&.{ "format", "--block-size", try std.fmt.bufPrint(&bs_buf, "{d}", .{kvmap_block}), "--disk-cache-paths", rig.cache, rig.meta_uri, rig.data_uri });
+        const r = try rig.squeezefs(&.{ "format", "--block-size", try std.fmt.bufPrint(&bs_buf, "{d}", .{kvmap_block}), rig.meta_uri, rig.data_uri });
         defer rig.freeRun(r);
         if (!r.term.success()) std.debug.print("\nformat: {s}\n", .{r.stderr});
         try testing.expect(r.term.success());
@@ -10141,7 +10119,7 @@ fn awaitJobMidRun(rig: *Rig, job_id: []const u8, bound_ns: u64) !void {
     return error.JobNeverMidRun;
 }
 
-test "smoke: DEFRAG --fold AND --meta ON A LIVE MOUNT — format (64 KiB meta nodes, 1 MiB blocks, a cache path) → three fsync'd striped files held OPEN with 12 sector-aligned 512 B writes parked as W2 extents (parked_extent_bytes ≥ 12 pages) → `defrag --fold <mp>` folds every one in place (12 page DMAs for 6 KiB of user bytes ≤ the §J 8× bound, parked_extent_bytes 0, every byte exact after the close) → a forest of 8,000 files cut to 800 and rewritten 4× → `defrag --meta --throttle 1` runs under the duty cycle: `job cancel` mid-run → cancelled; a second at throttle 1: `job pause` → paused → `resume` → running → kill -9 mid-job → remount adopts it and it completes by plan regeneration → compactions + merges ≥ 1, nodes walked after ≤ before, `fsck --online` 0 findings" {
+test "smoke: DEFRAG --fold AND --meta ON A LIVE MOUNT — format (64 KiB meta nodes, 1 MiB blocks) → three fsync'd striped files held OPEN with 12 sector-aligned 512 B writes parked as W2 extents (parked_extent_bytes ≥ 12 pages) → `defrag --fold <mp>` folds every one in place (12 page DMAs for 6 KiB of user bytes ≤ the §J 8× bound, parked_extent_bytes 0, every byte exact after the close) → a forest of 8,000 files cut to 800 and rewritten 4× → `defrag --meta --throttle 1` runs under the duty cycle: `job cancel` mid-run → cancelled; a second at throttle 1: `job pause` → paused → `resume` → running → kill -9 mid-job → remount adopts it and it completes by plan regeneration → compactions + merges ≥ 1, nodes walked after ≤ before, `fsck --online` 0 findings" {
     const io = testing.io;
     if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
     const gpa = testing.allocator;
@@ -10469,10 +10447,9 @@ test "smoke: ONLINE FSCK THROUGH THE ADMIN LANE — the fill (dirs, 200 packed f
         std.debug.print("smoke[fsck-online]: 3 online runs inside the 8-way cp storm: 0 findings; shield engagement over the runs {d} (current-era + epoch + in-flight exemptions + suspects cleared)\n", .{exempted});
     }
     try rig.expectAlive("the storm");
-    // 4. The two-daemon set. The rig's daemons share ONE cache path (the
-    // set's format decision) but never one ring: each member binds its own
-    // root under it (0003 §T.1) — B joins beside A's LIVE residents (the
-    // fill's packed files, still staged) and recovers none of them.
+    // 4. The two-daemon set. Each member holds its OWN write cache (0003
+    // §T.1) — B joins beside A's LIVE residents (the fill's packed files,
+    // still staged) and recovers none of them.
     const a_staged = blk: {
         const sa = try rig.stats();
         defer gpa.free(sa);
@@ -10690,10 +10667,10 @@ test "smoke: THE FLEET'S MERGED BLOCK CENSUS — mount A + B JOINED with the fle
     try rig.createImage();
     try rig.spawnMount(&.{});
     _ = try rig.awaitReady(0);
-    // B: the fsync lever (its staged files pack at the fsync) and the seam.
-    var env_seam = try envWith(gpa, &rig.env, &.{ .{ "SQUEEZEFS_FSYNC_PROMOTE_STAGED", "1" }, .{ "SQUEEZEFS_TEST_SHIP_EVERY_FREE", "1" } });
+    // B: its staged files pack at the fsync (the write cache's law) and the seam.
+    var env_seam = try envWith(gpa, &rig.env, &.{.{ "SQUEEZEFS_TEST_SHIP_EVERY_FREE", "1" }});
     defer env_seam.deinit();
-    var env_fixed = try envWith(gpa, &rig.env, &.{.{ "SQUEEZEFS_FSYNC_PROMOTE_STAGED", "1" }});
+    var env_fixed = try envWith(gpa, &rig.env, &.{});
     defer env_fixed.deinit();
     const b = try Peer.init(rig, "b");
     defer b.deinit();
@@ -10838,7 +10815,7 @@ const reuse_row_data_bytes: u64 = 3 * 64 * reuse_row_block;
 /// the file.
 const reuse_row_window_read = "dd if=\"$2\" iflag=direct,skip_bytes skip=524288 bs=1048576 count=1 status=none | sha256sum";
 
-test "smoke: A MEMBER'S CACHED COPY OF ANOTHER MEMBER'S BLOCKS NEVER OUTLIVES THE BLOCKS' RE-USE (0003 §W.2) — two 192 MiB data volumes of 1 MiB blocks, no cache path (every write beyond inline striped) → mount A (the manager) + B JOINED (the dest lease off: its window reads are whole-block fills that deposit) → A writes `f` (two blocks, fsync'd) → B reads it until its tiers hold its blocks → A fills the set to ENOSPC → A `rm f`: the delete recalls B's token and B purges the blocks' keys before it acks (scoped purges ≥ 1 on B) → A writes `g` (two blocks, fsync'd) into the blocks the rm freed → B reads `g`: sha-equal to A's, never `f`'s bytes" {
+test "smoke: A MEMBER'S CACHED COPY OF ANOTHER MEMBER'S BLOCKS NEVER OUTLIVES THE BLOCKS' RE-USE (0003 §W.2) — two 192 MiB data volumes of 1 MiB blocks, no write cache (every write beyond inline striped) → mount A (the manager) + B JOINED (the dest lease off: its window reads are whole-block fills that deposit) → A writes `f` (two blocks, fsync'd) → B reads it until its tiers hold its blocks → A fills the set to ENOSPC → A `rm f`: the delete recalls B's token and B purges the blocks' keys before it acks (scoped purges ≥ 1 on B) → A writes `g` (two blocks, fsync'd) into the blocks the rm freed → B reads `g`: sha-equal to A's, never `f`'s bytes" {
     const io = testing.io;
     if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
     const gpa = testing.allocator;
@@ -11060,7 +11037,7 @@ fn removeKeyDirFile(key_id_hex: []const u8) void {
     _ = linux.unlink(path.ptr);
 }
 
-test "smoke: THE REKEY ROW — format (1 MiB blocks, lz4 + aes-256-gcm, key A, a cache path) → fill (40 packed 64 KiB files, three fsync'd 20 MiB incompressible striped files, an 8 MiB compressible one) → umount/remount (the packs) → `defrag --rekey --encrypt-key B --throttle 50 <mp>` opens the window and sweeps every block onto B through the ONE mover while a write lands under B → the window closes (rekey_window_open 0, windows_closed 1, len drift 0), every file byte-exact → `config show` names B and no next key → a mount with key A refuses by id, with B serves every file → a second rotation to C at 10 % killed -9 mid-sweep → remount under B resolves C from the key dir, adopts the job, converges and flips to C → fsck --offline --scrub clean under C" {
+test "smoke: THE REKEY ROW — format (1 MiB blocks, lz4 + aes-256-gcm, key A) → fill (40 packed 64 KiB files, three fsync'd 20 MiB incompressible striped files, an 8 MiB compressible one) → umount/remount (the packs) → `defrag --rekey --encrypt-key B --throttle 50 <mp>` opens the window and sweeps every block onto B through the ONE mover while a write lands under B → the window closes (rekey_window_open 0, windows_closed 1, len drift 0), every file byte-exact → `config show` names B and no next key → a mount with key A refuses by id, with B serves every file → a second rotation to C at 10 % killed -9 mid-sweep → remount under B resolves C from the key dir, adopts the job, converges and flips to C → fsck --offline --scrub clean under C" {
     const io = testing.io;
     if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
     const gpa = testing.allocator;
@@ -11073,7 +11050,6 @@ test "smoke: THE REKEY ROW — format (1 MiB blocks, lz4 + aes-256-gcm, key A, a
         defer f.close(io);
         try f.setLength(io, matrix_vol_len);
     }
-    _ = linux.mkdir(rig.cache.ptr, 0o700);
     const key_a = try makeKeyFile(rig, "a.key");
     defer gpa.free(key_a);
     const key_b = try makeKeyFile(rig, "b.key");
@@ -11088,7 +11064,7 @@ test "smoke: THE REKEY ROW — format (1 MiB blocks, lz4 + aes-256-gcm, key A, a
         if (ids_installed >= 2) removeKeyDirFile(&key_c_id);
     }
     {
-        const r = try rig.squeezefs(&.{ "format", "--block-size", try std.fmt.bufPrint(&bs_buf, "{d}", .{kvmap_block}), "--compress", "lz4", "--encrypt", "aes-256-gcm", "--encrypt-key", key_a, "--disk-cache-paths", rig.cache, rig.meta_uri, rig.data_uri });
+        const r = try rig.squeezefs(&.{ "format", "--block-size", try std.fmt.bufPrint(&bs_buf, "{d}", .{kvmap_block}), "--compress", "lz4", "--encrypt", "aes-256-gcm", "--encrypt-key", key_a, rig.meta_uri, rig.data_uri });
         defer rig.freeRun(r);
         if (!r.term.success()) std.debug.print("\nformat: {s}\n", .{r.stderr});
         try testing.expect(r.term.success());

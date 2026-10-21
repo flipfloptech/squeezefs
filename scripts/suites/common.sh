@@ -29,7 +29,7 @@
 # an accepted exception class), no `nosuid`, no TTL change, no writeback.
 #
 # Scratch is bounded: one metadata volume (1 GiB sparse) + two data volumes
-# (8 GiB sparse each) + a staging/cache path per set, all under
+# (8 GiB sparse each) per set, all under
 # `/build/tmp/suites-<suite>-<date>-<pid>/` on the venue's ext4 (sparse files,
 # real block semantics; never /build/ext — AGENTS.md "Test data and disk").
 # `scripts/venue trim` returns the blocks after a run.
@@ -210,13 +210,13 @@ suite_format() {
   local tag=$1; shift
   suite_set_paths "$tag"
   local d=${SUITE_SETDIR[$tag]}
-  rm -rf "$d"; mkdir -p "$d/cache"; chmod 0700 "$d/cache"
+  rm -rf "$d"; mkdir -p "$d"
   truncate -s "${SUITE_META_MIB}M" "$d/meta.img"
   truncate -s "${SUITE_DATA_GIB}G" "$d/d0.img" "$d/d1.img"
   # `--single-writer`: the suites are one mount on one host; the symmetric
-  # join ladder is the N-daemon matrix's business. The cache path turns the
-  # staging ring and the NVMe tier ON (the production shape of a client).
-  "$SQZ_BIN" format --single-writer --disk-cache-paths "$d/cache" "$@" "${SUITE_META[$tag]}" "sqdata://$d/d0.img,$d/d1.img" \
+  # join ladder is the N-daemon matrix's business. The write cache is every
+  # mount's (RAM; the production shape of a client).
+  "$SQZ_BIN" format --single-writer "$@" "${SUITE_META[$tag]}" "sqdata://$d/d0.img,$d/d1.img" \
     >"$d/format.out" 2>&1 || { cat "$d/format.out" >&2; suite_die "format failed ($tag)"; }
   suite_log "formatted $tag: $(head -1 "$d/format.out")"
 }

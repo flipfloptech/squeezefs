@@ -145,7 +145,6 @@ export BRK_MNT="$MNT" BRK_SCRATCH="$SCRATCH"
 source "$ROW_FILE"
 : "${ROW_KIND:?row must set ROW_KIND}" "${ROW_INSTRUMENT:?row must set ROW_INSTRUMENT}"
 ROW_NEEDS_SHIM=${ROW_NEEDS_SHIM:-0}
-ROW_NEEDS_STAGING=${ROW_NEEDS_STAGING:-0}
 # A transformed row (`rand-4k-read-zstd` …) names its set's format
 # (`ROW_FORMAT_OPTS`); an explicit --format-opts still wins.
 [ -n "$FORMAT_OPTS" ] || FORMAT_OPTS=${ROW_FORMAT_OPTS:-}
@@ -228,19 +227,9 @@ format_set() {  # $1 = set index, $2 = posture
   set_uris "$1"
   local flags=()
   [ "$2" = single-writer ] && flags+=(--single-writer)
-  # A row of the staged arm (`ROW_NEEDS_STAGING=1`) formats the set with a
-  # staging root under the scratch: cache paths are a FORMAT decision
-  # (charter §6.1); without them a file past the inline bound goes striped
-  # and the row would measure the wrong arm.
-  local staging_note=""
-  if [ "${ROW_NEEDS_STAGING:-0}" = 1 ]; then
-    mkdir -p "$SCRATCH/cache-$1"
-    flags+=(--disk-cache-paths "$SCRATCH/cache-$1")
-    staging_note=" (staging root $SCRATCH/cache-$1)"
-  fi
   # shellcheck disable=SC2206
   [ -n "$FORMAT_OPTS" ] && flags+=($FORMAT_OPTS)
-  log "format set $1 ($2): ${flags[*]} $META_URI $DATA_URI$staging_note"
+  log "format set $1 ($2): ${flags[*]} $META_URI $DATA_URI"
   "$BIN_A" format "${flags[@]}" "$META_URI" "$DATA_URI" > "$SCRATCH/format-$1.log" 2>&1 || { cat "$SCRATCH/format-$1.log" >&2; exit 1; }
   substrate_after_format "$BIN_A" "$1"
 }

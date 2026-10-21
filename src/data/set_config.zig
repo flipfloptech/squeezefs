@@ -8,8 +8,10 @@
 //!
 //! The codec is canonical, total, versioned and checksummed, every field by
 //! position (`ledger.zig`'s discipline): a 128 B little-endian head, then
-//! `n_data` data-volume records (64 B fixed + the uri), then `n_cache_paths`
-//! length-framed paths, then hash64 over everything before it. A lying
+//! `n_data` data-volume records (64 B fixed + the uri), then hash64 over
+//! everything before it (the cache paths that once followed the records
+//! went with disk-based caching, 2026-10-21: a record naming any is
+//! refused by name — the write cache needs no path). A lying
 //! length is never an allocation authority: every count is checked against
 //! the bytes actually present before anything is allocated. The reference
 //! kept this as a `serde_json` xattr `user.squeezefs.format_config` on ino
@@ -60,7 +62,6 @@ pub const VERSION: u16 = 2;
 /// volumes is past any operator; 4096 is `PATH_MAX`.
 pub const MAX_DATA_VOLUMES: usize = 4096;
 pub const MAX_URI_LEN: usize = 4096;
-pub const MAX_CACHE_PATHS: usize = 256;
 
 /// `active | disabled | draining | retired`: `Active → Draining → Retired`,
 /// `Draining → Active` on undrain, `Active ↔ Disabled` (the fail-stop
@@ -282,6 +283,8 @@ pub const HeadWire = extern struct {
     /// per-mount data key already makes reuse harmless.
     nonce_floor_le: [8]u8,
     n_data_le: [2]u8,
+    /// Once the count of the cache paths that followed the data records;
+    /// 0 since 2026-10-21 (a record naming any is refused: `cache_paths`).
     n_cache_paths_le: [2]u8,
     /// 0 = derived (`layout.inlineMax`); a format-time override pins the
     /// inline ceiling for the set's life (a file's layout class is a
@@ -293,7 +296,7 @@ pub const HeadWire = extern struct {
 pub const HEAD_LEN: usize = @sizeOf(HeadWire);
 
 /// Head flag bit 0: a KEY-ROTATION WINDOW is open — a `RekeyWire` follows
-/// the cache paths (charter §6.5 + `ops_nvmet_keys.md` §7.4: `{scheme,
+/// the data records (charter §6.5 + `ops_nvmet_keys.md` §7.4: `{scheme,
 /// salt, key_id}` stays the key EVERY block is readable under once no
 /// window is open; `next` is the key new writes wrap under meanwhile; the
 /// sweep flips the primary to `next` LAST, after the last block's publish
@@ -362,7 +365,6 @@ pub const Config = struct {
     /// primary; `closeRekey` makes it the primary.
     next_key: ?KeyRef = null,
     data: []DataVolume,
-    cache_paths: [][]const u8,
 
     pub fn deinit(self: *Config, gpa: Allocator) void {
         for (self.data) |d| {
@@ -370,8 +372,6 @@ pub const Config = struct {
             if (d.fabric) |f| freeEndpoint(gpa, f);
         }
         gpa.free(self.data);
-        for (self.cache_paths) |p| gpa.free(p);
-        gpa.free(self.cache_paths);
         self.* = undefined;
     }
 
@@ -403,20 +403,10 @@ pub const Config = struct {
             if (s.fabric) |f| d.fabric = try cloneEndpoint(gpa, f);
             n_data += 1;
         }
-        out.cache_paths = try gpa.alloc([]const u8, self.cache_paths.len);
-        var n_paths: usize = 0;
-        errdefer {
-            for (out.cache_paths[0..n_paths]) |p| gpa.free(p);
-            gpa.free(out.cache_paths);
-        }
-        for (self.cache_paths, out.cache_paths) |s, *p| {
-            p.* = try gpa.dupe(u8, s);
-            n_paths += 1;
-        }
         return out;
     }
 
-    /// The encoded length (head + records + paths + the window + checksum).
+    /// The encoded length (head + records + the window + checksum).
     pub fn encodedLen(self: *const Config) usize {
         var n: usize = HEAD_LEN + CHECKSUM_LEN;
         if (self.next_key != null) n += REKEY_LEN;
@@ -424,7 +414,6 @@ pub const Config = struct {
             n += DATA_VOLUME_FIXED_LEN + d.uri.len;
             if (d.fabric) |f| n += f.encodedLen();
         }
-        for (self.cache_paths) |p| n += 2 + p.len;
         return n;
     }
 
@@ -451,8 +440,8 @@ pub const Config = struct {
     /// The JSON twin of `writeSummary` (`.config`, `config show --json`,
     /// `df --json`): `{set_uuid, config_generation, block_size, chunk_size,
     /// capacity_bytes, compression, encryption, key_id?, inline_max, data[{
-    /// vol_tag, state, device_uuid, uri, capacity_blocks, volume_len}],
-    /// cache_paths[]}` — exactly the registered volumes, snake_case
+    /// vol_tag, state, device_uuid, uri, capacity_blocks, volume_len}]}`
+    /// — exactly the registered volumes, snake_case
     /// (`stats_cli.md` §1.5, §7 Q18).
     pub fn writeJson(self: *const Config, w: *std.Io.Writer) std.Io.Writer.Error!void {
         try w.writeAll("{\"set_uuid\":\"");
@@ -471,11 +460,6 @@ pub const Config = struct {
                 try f.writeJson(w);
             }
             try w.writeByte('}');
-        }
-        try w.writeAll("],\"cache_paths\":[");
-        for (self.cache_paths, 0..) |p, i| {
-            if (i != 0) try w.writeByte(',');
-            try w.print("\"{s}\"", .{p});
         }
         try w.writeAll("]}");
     }
@@ -500,13 +484,6 @@ pub const Config = struct {
             }
             try w.writeAll("\n");
         }
-        if (self.cache_paths.len == 0) {
-            try w.writeAll("  cache-less (no disk cache paths)\n");
-        } else {
-            try w.print("  disk cache paths {d}:", .{self.cache_paths.len});
-            for (self.cache_paths) |p| try w.print(" {s}", .{p});
-            try w.writeAll("\n");
-        }
     }
 };
 
@@ -523,7 +500,7 @@ pub fn writeVolTag(w: *std.Io.Writer, tag: u64) std.Io.Writer.Error!void {
 // The codec.
 // ---------------------------------------------------------------------------
 
-pub const EncodeError = error{ RecordTooLarge, TooManyDataVolumes, UriTooLong, TooManyCachePaths, CachePathTooLong, BadFabricEndpoint, OutOfMemory };
+pub const EncodeError = error{ RecordTooLarge, TooManyDataVolumes, UriTooLong, BadFabricEndpoint, OutOfMemory };
 
 /// The endpoint laws every writer and reader hold: an NQN of the grammar,
 /// 1..=`MAX_FABRIC_PATHS` paths each of a valid shape, no path twice (the
@@ -563,8 +540,6 @@ pub fn encode(gpa: Allocator, cfg: *const Config, cap: usize) EncodeError![]u8 {
         if (d.uri.len > MAX_URI_LEN) return error.UriTooLong;
         if (d.fabric) |f| if (!endpointShapeValid(f)) return error.BadFabricEndpoint;
     }
-    if (cfg.cache_paths.len > MAX_CACHE_PATHS) return error.TooManyCachePaths;
-    for (cfg.cache_paths) |p| if (p.len > MAX_URI_LEN) return error.CachePathTooLong;
     const len = cfg.encodedLen();
     if (len > cap) return error.RecordTooLarge;
     const out = try gpa.alloc(u8, len);
@@ -586,7 +561,7 @@ pub fn encode(gpa: Allocator, cfg: *const Config, cap: usize) EncodeError![]u8 {
     h.set_uuid = cfg.set_uuid;
     std.mem.writeInt(u64, &h.nonce_floor_le, cfg.nonce_floor, .little);
     std.mem.writeInt(u16, &h.n_data_le, @intCast(cfg.data.len), .little);
-    std.mem.writeInt(u16, &h.n_cache_paths_le, @intCast(cfg.cache_paths.len), .little);
+    h.n_cache_paths_le = .{ 0, 0 };
     std.mem.writeInt(u32, &h.inline_max_le, cfg.inline_max, .little);
     h.reserved = @splat(0);
     out[0..HEAD_LEN].* = std.mem.toBytes(h);
@@ -620,12 +595,6 @@ pub fn encode(gpa: Allocator, cfg: *const Config, cap: usize) EncodeError![]u8 {
             off += f.subnqn.len;
         }
     }
-    for (cfg.cache_paths) |p| {
-        std.mem.writeInt(u16, out[off..][0..2], @intCast(p.len), .little);
-        off += 2;
-        @memcpy(out[off..][0..p.len], p);
-        off += p.len;
-    }
     if (cfg.next_key) |nk| {
         out[off..][0..REKEY_LEN].* = std.mem.toBytes(RekeyWire{ .kdf_salt = nk.kdf_salt, .key_id = nk.key_id });
         off += REKEY_LEN;
@@ -652,6 +621,8 @@ pub const DecodeError = error{
     /// A uri with a NUL or not absolute; a non-empty uri on a retired
     /// record; a duplicate tag or device uuid.
     BadRecord,
+    /// The record names disk cache paths (a pre-write-cache format).
+    CachePaths,
     OutOfMemory,
 };
 
@@ -668,6 +639,10 @@ pub const Refusal = union(enum) {
     truncated,
     trailing_bytes,
     bad_record: usize,
+    /// The record names format-declared cache paths — a set formatted
+    /// before 2026-10-21; the write cache needs none and the file-backed
+    /// ring is gone: reformat.
+    cache_paths: usize,
 
     pub fn write(self: Refusal, w: *std.Io.Writer) std.Io.Writer.Error!void {
         switch (self) {
@@ -683,6 +658,7 @@ pub const Refusal = union(enum) {
             .truncated => try w.writeAll("set_config record declares more data volumes or paths than its bytes hold"),
             .trailing_bytes => try w.writeAll("set_config record has bytes after its declared structure"),
             .bad_record => |i| try w.print("set_config data volume record {d} is malformed (uri not absolute, a NUL, a retired record with a uri, or a duplicate tag/device)", .{i}),
+            .cache_paths => |n| try w.print("set_config record declares {d} disk cache path(s) — a set formatted before the write cache (2026-10-21); disk-based caching is gone: reformat the set", .{n}),
         }
     }
 };
@@ -702,13 +678,14 @@ fn refuse(diag: ?*Refusal, r: Refusal) DecodeError {
         .truncated => error.Truncated,
         .trailing_bytes => error.TrailingBytes,
         .bad_record => error.BadRecord,
+        .cache_paths => error.CachePaths,
     };
 }
 
 /// The decoder in its exact check order: length → magic → version →
 /// checksum → head fields → `n_data × 64 ≤ remaining` (the allocation
 /// authority is the bytes present) → each record's fixed part and its uri
-/// length against the remaining bytes → the paths likewise → exactly the
+/// length against the remaining bytes → exactly the
 /// checksum left → record laws. Total.
 /// The record's generation alone, under the head's magic, version and
 /// the total checksum (the manager's `ResolveSetConfig` reply head: the
@@ -776,13 +753,13 @@ pub fn decode(gpa: Allocator, bytes: []const u8, diag: ?*Refusal) DecodeError!Co
     if (!transform.blockSizeValid(block_size) or chunk_size != transform.chunkSizeFor(tcfg)) return refuse(diag, .{ .bad_geometry = .{ .block = block_size, .chunk = chunk_size } });
     const n_data: usize = std.mem.readInt(u16, &h.n_data_le, .little);
     const n_paths: usize = std.mem.readInt(u16, &h.n_cache_paths_le, .little);
+    if (n_paths != 0) return refuse(diag, .{ .cache_paths = n_paths });
     var off: usize = HEAD_LEN;
     // The counts against the bytes present, before any allocation (the
     // window's fixed tail included).
     const tail_fixed: usize = if (flags & FLAG_REKEY_WINDOW != 0) REKEY_LEN else 0;
     if (sum_off - off < tail_fixed) return refuse(diag, .truncated);
     if (n_data > MAX_DATA_VOLUMES or n_data * DATA_VOLUME_FIXED_LEN > sum_off - off - tail_fixed) return refuse(diag, .truncated);
-    if (n_paths > MAX_CACHE_PATHS or n_paths * 2 > sum_off - off - tail_fixed - n_data * DATA_VOLUME_FIXED_LEN) return refuse(diag, .truncated);
     var cfg: Config = .{
         .config_generation = std.mem.readInt(u64, &h.config_generation_le, .little),
         .set_uuid = h.set_uuid,
@@ -797,7 +774,6 @@ pub fn decode(gpa: Allocator, bytes: []const u8, diag: ?*Refusal) DecodeError!Co
         .nonce_floor = std.mem.readInt(u64, &h.nonce_floor_le, .little),
         .inline_max = std.mem.readInt(u32, &h.inline_max_le, .little),
         .data = &.{},
-        .cache_paths = &.{},
     };
     const data = try gpa.alloc(DataVolume, n_data);
     var n_done: usize = 0;
@@ -853,23 +829,6 @@ pub fn decode(gpa: Allocator, bytes: []const u8, diag: ?*Refusal) DecodeError!Co
         };
         n_done += 1;
     }
-    const paths = try gpa.alloc([]const u8, n_paths);
-    var p_done: usize = 0;
-    errdefer {
-        for (paths[0..p_done]) |p| gpa.free(p);
-        gpa.free(paths);
-    }
-    for (paths) |*p| {
-        if (sum_off - off < 2) return refuse(diag, .truncated);
-        const len: usize = std.mem.readInt(u16, bytes[off..][0..2], .little);
-        off += 2;
-        if (len > sum_off - off) return refuse(diag, .truncated);
-        const path = bytes[off..][0..len];
-        off += len;
-        if (len == 0 or path[0] != '/' or std.mem.indexOfScalar(u8, path, 0) != null) return refuse(diag, .{ .bad_record = n_data });
-        p.* = try gpa.dupe(u8, path);
-        p_done += 1;
-    }
     if (flags & FLAG_REKEY_WINDOW != 0) {
         if (sum_off - off < REKEY_LEN) return refuse(diag, .truncated);
         const rk = std.mem.bytesToValue(RekeyWire, bytes[off..][0..REKEY_LEN]);
@@ -880,7 +839,6 @@ pub fn decode(gpa: Allocator, bytes: []const u8, diag: ?*Refusal) DecodeError!Co
     }
     if (off != sum_off) return refuse(diag, .trailing_bytes);
     cfg.data = data;
-    cfg.cache_paths = paths;
     return cfg;
 }
 
@@ -894,9 +852,8 @@ pub const KeyRef = struct {
 };
 
 /// The record of a fresh set: generation 1, every data volume `active`,
-/// capacity Σ usable bytes, the key ref iff encrypted. `data` and
-/// `cache_paths` are copied.
-pub fn birth(gpa: Allocator, set_uuid: [16]u8, tcfg: transform.VolumeTransform, key: ?KeyRef, data: []const DataVolume, cache_paths: []const []const u8) Allocator.Error!Config {
+/// capacity Σ usable bytes, the key ref iff encrypted. `data` is copied.
+pub fn birth(gpa: Allocator, set_uuid: [16]u8, tcfg: transform.VolumeTransform, key: ?KeyRef, data: []const DataVolume) Allocator.Error!Config {
     assert((key != null) == (tcfg.encryption != .none));
     var cfg: Config = .{
         .config_generation = 1,
@@ -912,7 +869,6 @@ pub fn birth(gpa: Allocator, set_uuid: [16]u8, tcfg: transform.VolumeTransform, 
         .nonce_floor = 0,
         .inline_max = 0,
         .data = @constCast(data),
-        .cache_paths = @constCast(cache_paths),
     };
     // `clone` only reads the borrowed slices; the result owns its own.
     var out = try cfg.clone(gpa);
@@ -941,11 +897,7 @@ pub const VerbError = error{
     /// The transition the state machine forbids (incl. anything out of
     /// `retired`).
     IllegalTransition,
-    /// A path that is not absolute, is a denylisted system root, or
-    /// repeats.
-    BadCachePath,
     TooManyDataVolumes,
-    TooManyCachePaths,
     /// A fabric endpoint whose subnqn or transport/adrfam shape is not one
     /// the record represents.
     BadFabricEndpoint,
@@ -956,45 +908,6 @@ fn finish(prev: *const Config, next: Config) Mutation {
     n.config_generation = prev.config_generation + 1;
     n.recomputeCapacity();
     return .{ .next = n, .lifecycle_bit_needed = n.lifecycleDiverged() and !prev.lifecycleDiverged() };
-}
-
-/// ENG-4: a cache path may never be a system root the wipe would destroy.
-pub const cache_path_denylist = [_][]const u8{ "/", "/home", "/etc", "/usr", "/var", "/boot", "/root" };
-
-pub fn cachePathAdmissible(path: []const u8) bool {
-    if (path.len == 0 or path[0] != '/' or path.len > MAX_URI_LEN or std.mem.indexOfScalar(u8, path, 0) != null) return false;
-    // Strip trailing slashes for the denylist compare (`/home/` is `/home`).
-    const trimmed = if (path.len > 1) std.mem.trimEnd(u8, path, "/") else path;
-    for (cache_path_denylist) |d| if (std.mem.eql(u8, d, trimmed)) return false;
-    return true;
-}
-
-/// `config set-cache-paths`: replace the list (the wipe/recreate of the
-/// directories is the verb's, before this record; content safety does not
-/// depend on it — staging generation-binding discards foreign content).
-pub fn setCachePaths(gpa: Allocator, prev: *const Config, paths: []const []const u8) VerbError!Mutation {
-    if (paths.len > MAX_CACHE_PATHS) return error.TooManyCachePaths;
-    for (paths, 0..) |p, i| {
-        if (!cachePathAdmissible(p)) return error.BadCachePath;
-        for (paths[0..i]) |q| if (std.mem.eql(u8, p, q)) return error.BadCachePath;
-    }
-    var next = try prev.clone(gpa);
-    errdefer next.deinit(gpa);
-    for (next.cache_paths) |p| gpa.free(p);
-    gpa.free(next.cache_paths);
-    next.cache_paths = &.{};
-    const list = try gpa.alloc([]const u8, paths.len);
-    var done: usize = 0;
-    errdefer {
-        for (list[0..done]) |p| gpa.free(p);
-        gpa.free(list);
-    }
-    for (paths, list) |p, *q| {
-        q.* = try gpa.dupe(u8, p);
-        done += 1;
-    }
-    next.cache_paths = list;
-    return finish(prev, next);
 }
 
 /// `volume add-data`: a new `active` record. Refuses a tag, device or uri
@@ -1282,7 +1195,7 @@ fn fixture(gpa: Allocator) !Config {
         .{ .vol_tag = 0x1111_2222_3333_4444, .state = .active, .device_uuid = @splat(1), .added_ts = 1_700_000_000, .capacity_blocks = 254, .volume_len = 1 << 30, .uri = "/dev/nvme0n1" },
         .{ .vol_tag = 0x5555_6666_7777_8888, .state = .active, .device_uuid = @splat(2), .added_ts = 1_700_000_001, .capacity_blocks = 510, .volume_len = 2 << 30, .uri = "/build/tmp/d1.img" },
     };
-    return birth(gpa, test_set_uuid, .{ .compression = .lz4, .encryption = .aes256gcm, .block_size = 4 << 20 }, .{ .kdf_salt = @splat(0x55), .key_id = .{ 1, 2, 3, 4, 5, 6, 7, 8 } }, &vols, &.{ "/build/cache/a", "/build/cache/b" });
+    return birth(gpa, test_set_uuid, .{ .compression = .lz4, .encryption = .aes256gcm, .block_size = 4 << 20 }, .{ .kdf_salt = @splat(0x55), .key_id = .{ 1, 2, 3, 4, 5, 6, 7, 8 } }, &vols);
 }
 
 test "the head is 128 B and the record fixed part 64 B at the spec's offsets; birth: generation 1, every volume active, capacity Σ usable; encode∘decode = id; the record is small (≈ 300 B for two volumes)" {
@@ -1303,7 +1216,17 @@ test "the head is 128 B and the record fixed part 64 B at the spec's offsets; bi
     try testing.expectEqualStrings("SQZSETCF", bytes[0..8]);
     try testing.expectEqual(VERSION, std.mem.readInt(u16, bytes[8..10], .little));
     try testing.expectEqual(@as(u16, 2), std.mem.readInt(u16, bytes[104..106], .little));
-    try testing.expectEqual(@as(u16, 2), std.mem.readInt(u16, bytes[106..108], .little));
+    try testing.expectEqual(@as(u16, 0), std.mem.readInt(u16, bytes[106..108], .little)); // no cache paths, ever
+    // A record naming cache paths (a pre-write-cache format) is refused by name.
+    {
+        const old = try gpa.dupe(u8, bytes);
+        defer gpa.free(old);
+        std.mem.writeInt(u16, old[106..108], 1, .little);
+        checksum.stamp(old, old.len - CHECKSUM_LEN);
+        var d2: Refusal = undefined;
+        try testing.expectError(error.CachePaths, decode(gpa, old, &d2));
+        try testing.expect(d2 == .cache_paths);
+    }
     var diag: Refusal = undefined;
     var back = try decode(gpa, bytes, &diag);
     defer back.deinit(gpa);
@@ -1320,15 +1243,13 @@ test "the head is 128 B and the record fixed part 64 B at the spec's offsets; bi
         try testing.expectEqual(a.capacity_blocks, b.capacity_blocks);
         try testing.expectEqualStrings(a.uri, b.uri);
     }
-    try testing.expectEqual(@as(usize, 2), back.cache_paths.len);
-    try testing.expectEqualStrings("/build/cache/b", back.cache_paths[1]);
     // Re-encoding the decoded record is byte-identical (canonical).
     const again = try encode(gpa, &back, test_cap);
     defer gpa.free(again);
     try testing.expectEqualSlices(u8, bytes, again);
     // A one-member plaintext set has not diverged and carries no key.
     const one = [_]DataVolume{cfg.data[0]};
-    var solo = try birth(gpa, test_set_uuid, .{ .block_size = 1 << 20 }, null, &one, &.{});
+    var solo = try birth(gpa, test_set_uuid, .{ .block_size = 1 << 20 }, null, &one);
     defer solo.deinit(gpa);
     try testing.expect(!solo.lifecycleDiverged());
     try testing.expectEqual(@as(u8, 0), solo.key_scheme);
@@ -1339,7 +1260,6 @@ test "the head is 128 B and the record fixed part 64 B at the spec's offsets; bi
     try testing.expect(std.mem.indexOf(u8, out.written(), "vol-1111222233334444 active /dev/nvme0n1 254 blocks") != null);
     try testing.expect(std.mem.indexOf(u8, out.written(), "aes-256-gcm") != null);
     try testing.expect(std.mem.indexOf(u8, out.written(), "/etc/squeezefs/keys/0102030405060708.key") != null);
-    try testing.expect(std.mem.indexOf(u8, out.written(), "disk cache paths 2: /build/cache/a /build/cache/b") != null);
 }
 
 fn v4Path(a: u8, b: u8, c: u8, d: u8, port: u16) FabricPath {
@@ -1557,7 +1477,7 @@ test "the rotation window: openRekey sets the head flag and a 40 B tail that rou
     var same = try openRekey(gpa, &opened.next, nk);
     defer same.next.deinit(gpa);
     try testing.expectEqual(@as(u64, 3), same.next.config_generation);
-    var plaintext = try birth(gpa, test_set_uuid, .{ .compression = .none, .encryption = .none, .block_size = 1 << 20 }, null, &.{}, &.{});
+    var plaintext = try birth(gpa, test_set_uuid, .{ .compression = .none, .encryption = .none, .block_size = 1 << 20 }, null, &.{});
     defer plaintext.deinit(gpa);
     try testing.expectError(error.IllegalTransition, openRekey(gpa, &plaintext, nk));
     try testing.expectError(error.IllegalTransition, closeRekey(gpa, &cfg));
@@ -1598,12 +1518,12 @@ test "the rotation window: openRekey sets the head flag and a 40 B tail that rou
     try testing.expectError(error.ReservedNotZero, decode(gpa, unknown_flag, null));
 }
 
-test "writeJson names exactly the registered volumes with their tags, states, device uuids and uris, the cache paths, and the key id only on an encrypted set" {
+test "writeJson names exactly the registered volumes with their tags, states, device uuids and uris, and the key id only on an encrypted set" {
     const vols = [_]DataVolume{
         .{ .vol_tag = 0xfeed, .state = .active, .device_uuid = @splat(1), .added_ts = 0, .capacity_blocks = 10, .volume_len = 1 << 30, .uri = "/dev/d0" },
         .{ .vol_tag = 0xbeef, .state = .active, .device_uuid = @splat(2), .added_ts = 0, .capacity_blocks = 20, .volume_len = 2 << 30, .uri = "/dev/d1" },
     };
-    var cfg = try birth(std.testing.allocator, @splat(7), .{ .compression = .lz4, .block_size = 1 << 20 }, null, &vols, &.{ "/build/c1", "/build/c2" });
+    var cfg = try birth(std.testing.allocator, @splat(7), .{ .compression = .lz4, .block_size = 1 << 20 }, null, &vols);
     defer cfg.deinit(std.testing.allocator);
     var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer out.deinit();
@@ -1614,7 +1534,7 @@ test "writeJson names exactly the registered volumes with their tags, states, de
     try std.testing.expect(std.mem.indexOf(u8, text, "{\"vol_tag\":\"vol-000000000000feed\",\"state\":\"active\",\"device_uuid\":\"01010101-0101-0101-0101-010101010101\",\"uri\":\"/dev/d0\",\"capacity_blocks\":10,\"volume_len\":1073741824}") != null);
     // `birth` stamps every member active; a later transition shows by name.
     try std.testing.expect(std.mem.indexOf(u8, text, "\"vol_tag\":\"vol-000000000000beef\",\"state\":\"active\"") != null);
-    try std.testing.expect(std.mem.endsWith(u8, text, "\"cache_paths\":[\"/build/c1\",\"/build/c2\"]}"));
+    try std.testing.expect(std.mem.endsWith(u8, text, "\"volume_len\":2147483648}]}"));
     try std.testing.expect(std.mem.indexOf(u8, text, "key_id") == null);
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, text, "\"vol_tag\""));
     cfg.data[1].state = .draining;
@@ -1755,24 +1675,17 @@ test "fuzz: the set_config decoder is total on arbitrary bytes" {
     }
 }
 
-test "verbs: set-cache-paths (denylist, relative, duplicate refused), add-data (duplicates refused; the second member needs the bit), the lifecycle state machine (retired terminal, uri cleared), generation strictly monotone, capacity recomputed, the nonce floor never lowers" {
+test "verbs: add-data (duplicates refused; the second member needs the bit), the lifecycle state machine (retired terminal, uri cleared), generation strictly monotone, capacity recomputed, the nonce floor never lowers" {
     const gpa = testing.allocator;
     const one = [_]DataVolume{.{ .vol_tag = 0xaaaa, .state = .active, .device_uuid = @splat(0xa), .added_ts = 1, .capacity_blocks = 100, .volume_len = 1 << 30, .uri = "/dev/a" }};
-    var c0 = try birth(gpa, test_set_uuid, .{ .compression = .zstd, .block_size = 1 << 20 }, null, &one, &.{});
+    var c0 = try birth(gpa, test_set_uuid, .{ .compression = .zstd, .block_size = 1 << 20 }, null, &one);
     defer c0.deinit(gpa);
     try testing.expect(!c0.lifecycleDiverged());
-    // Cache paths.
-    try testing.expectError(error.BadCachePath, setCachePaths(gpa, &c0, &.{"/home"}));
-    try testing.expectError(error.BadCachePath, setCachePaths(gpa, &c0, &.{"/var/"}));
-    try testing.expectError(error.BadCachePath, setCachePaths(gpa, &c0, &.{"relative"}));
-    try testing.expectError(error.BadCachePath, setCachePaths(gpa, &c0, &.{ "/build/c", "/build/c" }));
-    var m1 = try setCachePaths(gpa, &c0, &.{ "/build/c1", "/build/c2" });
+    // A mutation with no lifecycle change of its own: generation +1, no bit.
+    var m1 = finish(&c0, try c0.clone(gpa));
     defer m1.next.deinit(gpa);
     try testing.expect(!m1.lifecycle_bit_needed);
     try testing.expectEqual(@as(u64, 2), m1.next.config_generation);
-    try testing.expectEqual(@as(usize, 2), m1.next.cache_paths.len);
-    try testing.expectEqualStrings("/build/c2", m1.next.cache_paths[1]);
-    try testing.expect(cachePathAdmissible("/home/x") and !cachePathAdmissible("/") and !cachePathAdmissible("/root/"));
     // add-data.
     const new: DataVolume = .{ .vol_tag = 0xbbbb, .state = .draining, .device_uuid = @splat(0xb), .added_ts = 2, .capacity_blocks = 200, .volume_len = 2 << 30, .uri = "/dev/b" };
     try testing.expectError(error.DuplicateVolume, addDataVolume(gpa, &m1.next, .{ .vol_tag = 0xaaaa, .state = .active, .device_uuid = @splat(0xc), .added_ts = 2, .capacity_blocks = 1, .volume_len = 1, .uri = "/dev/c" }));

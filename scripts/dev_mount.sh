@@ -21,8 +21,8 @@
 #
 # The set is small and shaped like a real one: TWO metadata members (the MDTs,
 # 256 MiB each — a 2-member set on the symmetric plane, each member hosting
-# half the slot keyspace) and TWO data volumes (the OSTs, 1 GiB each), plus a
-# staging/cache directory. On macOS every target is a RAW virtio-blk partition:
+# half the slot keyspace) and TWO data volumes (the OSTs, 1 GiB each); the
+# write cache is RAM. On macOS every target is a RAW virtio-blk partition:
 # each is its own container volume (a virtio-blk disk in the VM) laid out as a
 # 16 MiB ext4 at the front — the runtime refuses to start a container whose
 # volume does not mount as ext4 — and an MBR partition 1 from 16 MiB to the end
@@ -184,7 +184,7 @@ fi
 
 if [ "$FRESH" = 1 ]; then
   mountpoint -q "$MNT" && "$BIN" umount "$MNT"
-  rm -rf "$SET" "$DEV/formatted"; mkdir -p "$SET/cache"
+  rm -rf "$SET" "$DEV/formatted"; mkdir -p "$SET"
 fi
 # A set from before the 2 MDT + 2 OST layout is never reformatted silently.
 [ -f "$SET/meta.img" ] && [ ! -f "$DEV/formatted" ] \
@@ -225,7 +225,7 @@ prep_target mdt0 256M; prep_target mdt1 256M; prep_target ost0 1G; prep_target o
 if [ ! -f "$DEV/formatted" ]; then
   echo "dev_mount: formatting 2 MDTs + 2 OSTs ($(readlink "$TGT/mdt0" | sed 's|/dev/.*|raw virtio-blk partitions|; s|^/build.*|sparse image files|')) …"
   force=(); [ "$FRESH" = 1 ] && force=(--force)
-  "$BIN" format ${force[@]+"${force[@]}"} --disk-cache-paths "$SET/cache" "$META" "$DATA" > "$DEV/format.log" 2>&1 \
+  "$BIN" format ${force[@]+"${force[@]}"} "$META" "$DATA" > "$DEV/format.log" 2>&1 \
     || { cat "$DEV/format.log" >&2; die "format failed"; }
   touch "$DEV/formatted"
 fi
@@ -276,7 +276,7 @@ cat <<BANNER
   squeezefs dev mount — $(uname -r), $(nproc) cpus, $(free -g | awk 'NR==2{print $2}') GiB
   mount      $MNT   ($(df -h "$MNT" | awk 'NR==2{print $2" total, "$4" free"}'))
   MDTs       $(readlink "$TGT/mdt0"), $(readlink "$TGT/mdt1")   (2 metadata members, 256 MiB each)
-  OSTs       $(readlink "$TGT/ost0"), $(readlink "$TGT/ost1")   (2 data volumes, 1 GiB each; staging in $SET/cache)
+  OSTs       $(readlink "$TGT/ost0"), $(readlink "$TGT/ost1")   (2 data volumes, 1 GiB each; the write cache in RAM)
   binary     $BIN   ($("$BIN" --version))
   daemon log $LOG
   tools      $(fio --version 2>/dev/null || echo "fio: absent"), ior + mdtest $(command -v ior >/dev/null && echo "(io500's 5528b36)" || echo ": absent"), $(mpirun --version 2>/dev/null | head -1 | sed 's/^mpirun (//; s/).*//' || echo "mpirun: absent")

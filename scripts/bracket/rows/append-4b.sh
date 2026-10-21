@@ -7,8 +7,6 @@
 # instrument's own correctness verdict.
 ROW_KIND=data-append
 ROW_NEEDS_SHIM=0
-# The staged arm needs a staging root: the harness formats the set with one.
-ROW_NEEDS_STAGING=1
 AP_WRITERS=${AP_WRITERS:-$BRK_NUMJOBS}
 ROW_INSTRUMENT="appends.py writers=$AP_WRITERS (4 B O_APPEND integers per writer, read back in order)"
 

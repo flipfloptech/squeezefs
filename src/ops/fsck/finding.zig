@@ -34,7 +34,6 @@ pub const Verb = enum {
     verify_content_then_repair_allocator_or_quarantine,
     recount_and_set_refcount,
     quarantine_then_discard_custody,
-    quarantine_staging_dir,
     recompute_accounting,
     release_stale_block_refs,
     destroy_unreferenced_inode,
@@ -45,8 +44,9 @@ pub const Verb = enum {
     recover_dead_appender,
 };
 
-/// C5's verdict classes (the v4 marker + `staging.bindVerdict`).
-pub const StagingVerdict = enum { dead, foreign_scope, unreadable };
+/// C5 (the staging dir's marker) went with disk-based caching
+/// (2026-10-21): the class number stays reserved so reports keep their
+/// numbering; nothing is ever filed under it.
 /// C7's verified arm that failed.
 pub const ScrubArm = enum { aead, frame, read, short_read };
 /// C1's raw-key defect class (`key.RawKeyDefect`'s tag).
@@ -66,7 +66,6 @@ pub const Finding = union(enum) {
     c2_lost: struct { vol_tag: u64, block_idx: u64, ino: u64, block_index: u32, unrepairable_shape: bool },
     c3_refcount: struct { vol_tag: u64, block_idx: u64, expected: u32, actual: u32 },
     c4_orphan: struct { file_id: [16]u8, ino: u64 },
-    c5_staging: struct { verdict: StagingVerdict },
     c6_drift: struct { vol_tag: u64, loss: u64, leak: u64 },
     c7_scrub: struct { ino: u64, block_index: u32, vol_tag: u64, block_idx: u64, arm: ScrubArm },
     c8_drift: struct { vol_tag: u64, block_idx: u64, durable: u32, derived: u32 },
@@ -99,7 +98,6 @@ pub const Finding = union(enum) {
             .c2_leaked, .c2_lost => .c2,
             .c3_refcount => .c3,
             .c4_orphan => .c4,
-            .c5_staging => .c5,
             .c6_drift => .c6,
             .c7_scrub => .c7,
             .c8_drift => .c8,
@@ -136,7 +134,6 @@ pub const Finding = union(enum) {
             .c2_lost => |l| if (l.unrepairable_shape) .quarantine_mapping else .verify_content_then_repair_allocator_or_quarantine,
             .c3_refcount => .recount_and_set_refcount,
             .c4_orphan => .quarantine_then_discard_custody,
-            .c5_staging => .quarantine_staging_dir,
             .c6_drift => .recompute_accounting,
             .c7_scrub => .quarantine_mapping,
             .c8_drift => .release_stale_block_refs,
@@ -192,7 +189,6 @@ pub const Finding = union(enum) {
             .c2_lost => |f| try w.print("vol-{x:0>16} block {d} ← ino {d} index {d} — lost: referenced but {s}", .{ f.vol_tag, f.block_idx, f.ino, f.block_index, if (f.unrepairable_shape) "out of range / unaligned / unknown volume" else "untracked by the allocator" }),
             .c3_refcount => |f| try w.print("vol-{x:0>16} block {d} — refcount {d} vs {d} reference(s)", .{ f.vol_tag, f.block_idx, f.actual, f.expected }),
             .c4_orphan => |f| try w.print("staging custody {x} ino {d} — orphan: the ino has no live record", .{ &f.file_id, f.ino }),
-            .c5_staging => |f| try w.print("staging dir — marker {t}: not rebindable to this set", .{f.verdict}),
             .c6_drift => |f| try w.print("vol-{x:0>16} — capacity drift: {d} referenced-but-clear (LOSS), {d} set-but-unreferenced (leak)", .{ f.vol_tag, f.loss, f.leak }),
             .c7_scrub => |f| try w.print("ino {d} index {d} vol-{x:0>16} block {d} — scrub {t} failed", .{ f.ino, f.block_index, f.vol_tag, f.block_idx, f.arm }),
             .c8_drift => |f| try w.print("vol-{x:0>16} block {d} — durable refs {d} vs derived {d}", .{ f.vol_tag, f.block_idx, f.durable, f.derived }),

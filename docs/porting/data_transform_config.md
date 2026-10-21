@@ -586,11 +586,12 @@ every META volume with the `set_config` record in volume 0's control tree (posit
 → summary (block, chunk, capacity, transform, key id + the three resolution sources, data volumes
 with tags, cache paths or "cache-less"). Flags kept: `--block-size`, `--capacity`, `--compression
 {none,lz4,zstd}`, `--encrypt-algo {none,aes256gcm,chacha20}`, `--encrypt-key <path|->`,
-`--disk-cache-paths a,b`, `--force`, `--full`, `--meta-node-kib`, `--meta-journal-mb`,
-`--single-writer`. Deleted: `--inodes`, the six cache-size flags, `--dismount-wait`,
-`--upload-delay`, `--fuse-io-uring-sqpoll-idle-ms`, `--meta-slots` (already refused),
-`--multi-writer`/`--symmetric` no-ops, `--data-lv`/`--meta-lv` aliases, `--ip/--port/--subnqn`.
-`mount --disk-cache-paths` stays a LOUD instant error (`main.rs:2815-2831`).
+`--force`, `--full`, `--meta-node-kib`, `--meta-journal-mb`, `--single-writer`. Deleted:
+`--inodes`, the six cache-size flags, `--dismount-wait`, `--upload-delay`,
+`--fuse-io-uring-sqpoll-idle-ms`, `--meta-slots` (already refused), `--multi-writer`/`--symmetric`
+no-ops, `--data-lv`/`--meta-lv` aliases, `--ip/--port/--subnqn`, and — 2026-10-21, 0002 row 550 —
+`--disk-cache-paths` (the write cache is RAM on every mount; a `set_config` record naming cache
+paths is refused by name: reformat).
 
 ---
 

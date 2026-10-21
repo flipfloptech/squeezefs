@@ -138,7 +138,6 @@ pub const Engine = struct {
             .c2_lost => |x| if (x.unrepairable_shape) self.quarantineMapping(f, x.ino, x.block_index, x.vol_tag, x.block_idx) else self.c2LostVerify(f, x.ino, x.block_index, x.vol_tag, x.block_idx),
             .c3_refcount => |x| self.c3Recount(f, x.vol_tag, x.block_idx),
             .c4_orphan => |x| self.c4Discard(f, x.file_id, x.ino),
-            .c5_staging => self.c5Quarantine(f),
             .c6_drift => |x| self.c6Recompute(x.vol_tag),
             .c7_scrub => |x| self.quarantineMapping(f, x.ino, x.block_index, x.vol_tag, x.block_idx),
             .c8_drift => |x| self.c8Release(f, x.vol_tag, x.block_idx, x.durable, x.derived),
@@ -284,14 +283,6 @@ pub const Engine = struct {
             return if (face.vtable.remove(face.ctx, sk, r.generation)) .{ .applied = "custody retired after quarantine" } else .{ .refused = "the record moved under us" };
         };
         return .{ .refused = "healed: the custody is gone" };
-    }
-
-    fn c5Quarantine(self: *Engine, f: Finding) Error!Outcome {
-        const face = self.pass.host.staging orelse return .{ .refused = "no staging dir" };
-        if (face.vtable.marker(face.ctx) == null) return .{ .refused = "healed: the marker rebinds" };
-        if (self.hook(f)) return .{ .refused = "aborted before the move-aside (re-detected next run)" };
-        try face.vtable.quarantineDir(face.ctx, &self.q);
-        return .{ .applied = "the staging dir copied then moved aside" };
     }
 
     fn c6Recompute(self: *Engine, vol_tag: u64) Error!Outcome {
@@ -636,7 +627,6 @@ fn planDetail(f: Finding) []const u8 {
         .verify_content_then_repair_allocator_or_quarantine => "verify the content; good ⇒ recover the block at the counted references, else quarantine the mapping",
         .recount_and_set_refcount => "lease every referencer ascending, recount, set the refcount",
         .quarantine_then_discard_custody => "copy the custody image, then retire it at its generation",
-        .quarantine_staging_dir => "copy the marker and every segment, then move the dir aside",
         .recompute_accounting => "the allocator's reconcile: complete limbo frees, evict tracked blocks from the free list",
         .release_stale_block_refs => "judge every record of the block, release those whose owner's layout does not name it (offline only)",
         .destroy_unreferenced_inode => "quarantine the inode + every xattr, release its references, destroy in ONE tx",

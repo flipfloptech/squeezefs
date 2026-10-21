@@ -222,9 +222,11 @@ delta/kvmap laws keep the per-publish term O(batch) regardless (charter §5.6).
 3. W2 staged rider (`:18639-18712`): a sub-image overwrite ≤ 25 % of the image, non-extending, under the fold
    thresholds rides an `active_block_ext:` extent record instead of the whole-image RMW; it bumps the stage
    generation FIRST (`:18688`) so a racing promotion's generation check aborts.
-4. `stripe_threshold = inline_max` with NO staging dirs, else `block_size` (`:18714-18718`) — **staging paths are a
-   FORMAT decision** (`mount` rejects `--disk-cache-paths`, `R/main.rs:2822-2829`; `config set-cache-paths` changes
-   them) and a cache-less set has only inline and striped.
+4. `stripe_threshold = inline_max` with NO staging dirs, else `block_size` (`:18714-18718`) — the reference's
+   staging paths were a FORMAT decision (`mount` rejected `--disk-cache-paths`, `R/main.rs:2822-2829`; `config
+   set-cache-paths` changed them). **Zig (2026-10-21, 0002 row 550): the staging ring is the WRITE CACHE in RAM on
+   every mount — no path, no format flag; `SQUEEZEFS_WRITE_CACHE_PCT=0` is the cache-less mount** (inline and
+   striped alone).
 5. RMW seed: inline from the RAM LRU/`data_key` (`:18754-18764`); staged from the ring (`read_staged_into`,
    `:18767-18777`) or, on a ring miss, the promoted mapping through the BINDING-VALIDATED loop (`:18806-18890`:
    `read_mapping_window` → re-resolve `freshest_layout_identity` → `still_bound` ⇔ type staged ∧ same file_id ∧
@@ -398,7 +400,7 @@ Ledger-lock invariant (`:1414-1425`): every executor-side ledger access is an `*
 |---|---|---|
 | Staging-pool pressure | merge worker `start_merge_worker` (`:2156-2207`) | batch ≤ 4 MiB or 500 ms flush timeout (`:2166-2167`), promoted at once while `gauge > high_water` (`:2181-2185`); `promote_batch` (`:2213-2260`) re-arms the pack arm (`begin_promotion_batch`), dedups file_ids, runs the primitive per item; failures leave the entry resident (never-wrong) |
 | Clean unmount | `promote_all_staged_files_at_dismount` (`R/fuse_client.rs:24869`) over `resident_staged_files` (`R/cache/nvme.rs:1620-1622`) | gauges `dismount_promoted_{files,bytes,inline_files}`, `dismount_promote_failures`; then `seal_open_packs` before "Dismount clean". **Zig adds the judgement** (`staging.DismountVerdict`, `plane.judgeAtDismount`; `docs/evidence/rung-10-dismount-corpse.md`): a resident whose ino has no live inode (absent or `nlink == 0`) is a corpse's custody — destroyed, never promoted (`dismount_corpse_residents_destroyed`); a resident of a live ino whose layout does not name it (no layout, kind not staged, another file id — the ring release is the step AFTER a promotion's commit, outside the transaction, so a kill between the two leaves one) is destroyed as unreachable residue (`dismount_unnamed_residents_destroyed`); only a resource decline stays resident (never-wrong). A spilled block (`writeback.blockKey`) is judged by its ino alone. |
-| `fsync` | `R/fuse_client.rs:23338-23370` iff `SQUEEZEFS_FSYNC_PROMOTE_STAGED=1` | placed BEFORE the barrier step so the data barrier covers the block and the meta barrier last names it; a failure never fails the fsync. **Zig (charter §1 item 10, 2026-10-19; 0002 row 549):** the lever is the ALTERNATIVE posture; off, the record stays staged and fsync/fdatasync make it power-cut durable in place — `Segment.syncResident`: ONE `IORING_OP_FSYNC` over the record's span on the handler's lane ring, coalesced across concurrent fsyncs (`SyncCoalescer`), after the promote leg and before the meta barrier; `syncfs` syncs the whole ring once when it has residents (`Segment.syncAll`). The reference's `sync_key` leg (§10.2 of `data_write_path.md`) was a whole-shard `File::sync_all` per call on the blocking pool |
+| `fsync` | `R/fuse_client.rs:23338-23370` iff `SQUEEZEFS_FSYNC_PROMOTE_STAGED=1` | **Zig (2026-10-21, 0002 row 550): promote-at-fsync is THE law of the write cache — fsync/fdatasync/syncfs promote the ino's residents before the ack, a declined promotion is EIO; the lever and the ranged sync went with the file ring.** The reference: placed BEFORE the barrier step so the data barrier covers the block and the meta barrier last names it; a failure never fails the fsync. **Zig (charter §1 item 10, 2026-10-19; 0002 row 549):** the lever is the ALTERNATIVE posture; off, the record stays staged and fsync/fdatasync make it power-cut durable in place — `Segment.syncResident`: ONE `IORING_OP_FSYNC` over the record's span on the handler's lane ring, coalesced across concurrent fsyncs (`SyncCoalescer`), after the promote leg and before the meta barrier; `syncfs` syncs the whole ring once when it has residents (`Segment.syncAll`). The reference's `sync_key` leg (§10.2 of `data_write_path.md`) was a whole-shard `File::sync_all` per call on the blocking pool |
 
 ### 3.6 Recovery after a crash (`R/cache/nvme.rs:1131-1148, 1238-1297`; `R/tiering/nvme.rs:1142-1212`)
 Generation gate first (dead generation ⇒ wipe), format fence second, read-cache wipe, then `recover_index` on each
@@ -678,7 +680,7 @@ answer instead). A pack placed off its key's volume escaped fsck's open-pack exe
 | `SQUEEZEFS_INLINE_MAX_BYTES` (:166) | Int `4096..=INLINE_MAX_CEILING` | 4096 (derived) | the inline ceiling override up to the format bound; published `inline_max_bytes` | lever |
 | `SQUEEZEFS_SMALL_FILE_PACKING` (:167) | Bool | on | the packed promotion arm; `0` = one-block-per-file control (read funnel lever-independent) | lever |
 | `SQUEEZEFS_PACK_MAX_SLOT_BYTES` (:168) | Int `GRAIN..=CHUNK` | derived `CHUNK/2` | own-block threshold (= compaction victim line); published `pack_max_slot_bytes` | lever |
-| `SQUEEZEFS_FSYNC_PROMOTE_STAGED` (:254) | Bool | off | the fsync law's alternative posture: fsync of a staged file promotes it (cross-client visibility at fsync) instead of syncing its ring record in place | lever |
+| `SQUEEZEFS_FSYNC_PROMOTE_STAGED` (:254) | Bool | off | RETIRED 2026-10-21 (successor `SQUEEZEFS_WRITE_CACHE_PCT`): promote-at-fsync is the write cache's law | retired |
 | `SQUEEZEFS_PUBLISH_COALESCE_MAX` (:169) | Int `0..=2^20` | 64 | per-ino publish coalescing window; `≤ 1` = serialized | lever |
 | `SQUEEZEFS_LAYOUT_DELTA_MAX_CHAIN` (:170) | Int `0..=2^20` | 64 | delta chain cap before a full re-base; `0` = full Puts only | lever |
 | `SQUEEZEFS_PUBLISH_COMMIT_GROUP_MAX` (:171) | Int `0..=2^20` | 0 (= derive from `META_COMMIT_BATCH_TXS`) | delta-class saves per multi-ino tx; `1` = per-save | lever |

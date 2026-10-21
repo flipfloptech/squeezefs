@@ -1,8 +1,10 @@
 //! The NVMe read cache — the mmap segment ring (charter §6.3 "NVMe read
 //! cache (mmap)"; `docs/porting/data_read_path.md` §2.4, §2.5, §13 Q3, Q9,
-//! Q10). The core is PORTABLE over any `[]u8` image (tests on every host);
-//! the Linux binding (`Ring`) opens the format-declared cache paths — the
-//! same dirs as staging, 0700 / 0600 — and maps them shared.
+//! Q10). The core is PORTABLE over any `[]u8` image (tests on every host).
+//! Its Linux binding under the format-declared cache dir went with
+//! disk-based caching (the owner's ruling, 2026-10-21): a production mount
+//! holds the tier DISABLED; the RAM double serves the read ladder's tests
+//! until the unified cache core replaces the tiers.
 //!
 //! On-media frame (Q9 — the reference's `0xCAFEBABE ‖ key_len ‖ val_len`
 //! had no checksum, an integer magic and a 4 KiB key pad): ONE 64 B
@@ -49,7 +51,6 @@ const assert = std.debug.assert;
 const counters = @import("../core/counters.zig");
 const derive = @import("../core/derive.zig");
 const checksum = @import("../core/checksum.zig");
-const knobs = @import("../core/knobs.zig");
 const budget = @import("../mem/budget.zig");
 const jc = @import("../meta/journal_core.zig");
 const staging = @import("staging.zig");
@@ -112,17 +113,6 @@ pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
         stats.read_cache_shards.load(),
         stats.read_cache_torn_frames.load(),
     });
-}
-
-/// `--read-disk-cache-size` else `aggregate_capacity / 4`.
-pub fn resolveReadDiskBudget(explicit_mib: ?u64, aggregate_capacity: u64) u64 {
-    if (explicit_mib) |m| return m * derive.MiB;
-    return aggregate_capacity / DEFAULT_BUDGET_DIVISOR;
-}
-
-/// The knob row (`SQUEEZEFS_READ_DISK_CACHE_MB`) over the resolver.
-pub fn budgetFromEnv(env: *const std.process.Environ.Map, aggregate_capacity: u64) u64 {
-    return resolveReadDiskBudget(knobs.optIntKnob("SQUEEZEFS_READ_DISK_CACHE_MB", u64, env), aggregate_capacity);
 }
 
 /// Record footprint: one header grain + the value rounded to the grain.
@@ -421,17 +411,15 @@ pub const Shard = struct {
 pub const Cache = struct {
     gpa: Allocator,
     shards: []Shard,
-    /// Owned images (the RAM double); the Linux binding owns its mappings.
+    /// Owned images (the RAM double).
     owned_images: [][]u8,
-    mapped: []MappedShard,
     enabled: bool,
 
-    pub const MappedShard = if (builtin.os.tag == .linux) Ring.Mapped else struct {};
-
-    /// A cache-less volume (no format-declared cache paths): every put
-    /// returns `.skipped`, every probe misses — the tier simply is not there.
+    /// The tier is not there (every production mount since the disk-based
+    /// cache dir went, 2026-10-21): every put returns `.skipped`, every
+    /// probe misses.
     pub fn initDisabled(gpa: Allocator) Cache {
-        return .{ .gpa = gpa, .shards = &.{}, .owned_images = &.{}, .mapped = &.{}, .enabled = false };
+        return .{ .gpa = gpa, .shards = &.{}, .owned_images = &.{}, .enabled = false };
     }
 
     /// The RAM double: `shard_count` images of `per_shard` bytes.
@@ -454,7 +442,7 @@ pub const Cache = struct {
             sbuilt += 1;
         }
         stats.read_cache_shards.set(shard_count);
-        return .{ .gpa = gpa, .shards = shards, .owned_images = images, .mapped = &.{}, .enabled = true };
+        return .{ .gpa = gpa, .shards = shards, .owned_images = images, .enabled = true };
     }
 
     pub fn deinit(self: *Cache) void {
@@ -462,10 +450,6 @@ pub const Cache = struct {
         if (self.shards.len > 0) self.gpa.free(self.shards);
         for (self.owned_images) |im| self.gpa.free(im);
         if (self.owned_images.len > 0) self.gpa.free(self.owned_images);
-        if (builtin.os.tag == .linux) {
-            for (self.mapped) |*m| m.close();
-            if (self.mapped.len > 0) self.gpa.free(self.mapped);
-        }
         self.* = undefined;
     }
 
@@ -548,59 +532,6 @@ pub const Cache = struct {
 pub var paused_publishes: counters.ShardedCounter = .{};
 
 // ---------------------------------------------------------------------------
-// The Linux binding: `<cache_root>/cache_segment/shard-N`, wiped at open.
-// ---------------------------------------------------------------------------
-
-pub const Ring = if (builtin.os.tag == .linux) struct {
-    pub const SEGMENT_DIR = "cache_segment";
-
-    pub const Mapped = struct {
-        fd: linux.fd_t,
-        map: []align(4096) u8,
-
-        pub fn close(self: *Mapped) void {
-            _ = linux.munmap(self.map.ptr, self.map.len);
-            _ = linux.close(self.fd);
-            self.* = undefined;
-        }
-    };
-
-    /// Open `shard_count` segments of `per_shard` bytes under the staging
-    /// root (the SAME dirs as staging: 0700 dirs, 0600 files — plaintext
-    /// payload on passthrough volumes is private to the daemon's uid),
-    /// WIPE them (cold on purpose), map them shared, build the cache.
-    pub fn open(gpa: Allocator, root_path: []const u8, shard_count: u32, per_shard: u64) !Cache {
-        assert(derive.isAligned(per_shard, GRAIN));
-        const root_fd = try staging.Ring.openRoot(root_path);
-        defer _ = linux.close(root_fd);
-        _ = linux.mkdirat(root_fd, SEGMENT_DIR, staging.Ring.DIR_MODE);
-        const mapped = try gpa.alloc(Mapped, shard_count);
-        errdefer gpa.free(mapped);
-        var built: usize = 0;
-        errdefer for (mapped[0..built]) |*m| m.close();
-        var name_buf: [32]u8 = undefined;
-        for (mapped, 0..) |*m, i| {
-            const name = try std.mem.printSentinel(&name_buf, "shard-{d}", .{i}, 0);
-            const seg = try staging.Ring.openSegmentIn(root_fd, SEGMENT_DIR, name, per_shard);
-            // Cold on purpose: drop every page of a previous session.
-            _ = linux.fallocate(seg.fd, linux.FALLOC.FL_PUNCH_HOLE | linux.FALLOC.FL_KEEP_SIZE, 0, @intCast(seg.map.len));
-            m.* = .{ .fd = seg.fd, .map = seg.map[0..@intCast(per_shard)] };
-            built += 1;
-        }
-        const shards = try gpa.alloc(Shard, shard_count);
-        errdefer gpa.free(shards);
-        var sbuilt: usize = 0;
-        errdefer for (shards[0..sbuilt]) |*s| s.deinit();
-        for (shards, mapped) |*s, *m| {
-            s.* = try Shard.init(gpa, m.map);
-            sbuilt += 1;
-        }
-        stats.read_cache_shards.set(shard_count);
-        return .{ .gpa = gpa, .shards = shards, .owned_images = &.{}, .mapped = mapped, .enabled = true };
-    }
-} else struct {};
-
-// ---------------------------------------------------------------------------
 
 const testing = std.testing;
 
@@ -620,13 +551,6 @@ test "frame: encode/decode round-trips; any flipped header byte refuses; footpri
     try testing.expectEqual(@as(u64, 2 * GRAIN), footprint(1));
     try testing.expectEqual(@as(u64, 2 * GRAIN), footprint(GRAIN));
     try testing.expectEqual(@as(u64, 3 * GRAIN), footprint(GRAIN + 1));
-    try testing.expectEqual(@as(u64, 256 * derive.MiB), resolveReadDiskBudget(null, derive.GiB));
-    try testing.expectEqual(@as(u64, 10 * derive.MiB), resolveReadDiskBudget(10, derive.GiB));
-    var env = std.process.Environ.Map.init(testing.allocator);
-    defer env.deinit();
-    try testing.expectEqual(@as(u64, 256 * derive.MiB), budgetFromEnv(&env, derive.GiB));
-    try env.put("SQUEEZEFS_READ_DISK_CACHE_MB", "12");
-    try testing.expectEqual(@as(u64, 12 * derive.MiB), budgetFromEnv(&env, derive.GiB));
 }
 
 test "two-phase put: validated at the index insert; a refusal voids the frame; replace supersedes; wrap evicts geometry-complete; ranges clamp; purge" {
@@ -727,38 +651,6 @@ test "a pinned entry is never overwritten: the placement bumps past it; the purg
     s.unpin(idx);
     try testing.expect(!s.cells[idx].live);
     try testing.expectEqual(free_before + 1, s.free_len);
-}
-
-test "Linux binding: segments under <root>/cache_segment are 0600 in 0700 dirs, wiped at open, and serve round-trips" {
-    if (builtin.os.tag != .linux) return testkit.skip(@src(), .no_linux, "nvme_read_cache: Linux only");
-    var path_buf: [96]u8 = undefined;
-    const dir: []const u8 = blk: {
-        std.Io.Dir.accessAbsolute(testing.io, "/build", .{}) catch break :blk "/tmp";
-        break :blk "/build";
-    };
-    const root = try std.fmt.bufPrint(&path_buf, "{s}/sqz-readcache-{d}", .{ dir, linux.getpid() });
-    defer std.Io.Dir.cwd().deleteTree(testing.io, root) catch {};
-    var cache = try Ring.open(testing.allocator, root, 2, 8 * GRAIN);
-    defer cache.deinit();
-    var v: [2 * GRAIN]u8 = @splat(0xC3);
-    const k = BlockKey.init(3, 0);
-    try testing.expectEqual(PutOutcome.published, cache.putValidated(k, &v, 7, .always, false));
-    var out: [GRAIN]u8 = undefined;
-    try testing.expectEqual(@as(?usize, GRAIN), cache.getRange(k, GRAIN, 2 * GRAIN, &out));
-    try testing.expectEqual(@as(u8, 0xC3), out[GRAIN - 1]);
-    var sub_buf: [128]u8 = undefined;
-    const sub = try std.mem.printSentinel(&sub_buf, "{s}/{s}/shard-0", .{ root, Ring.SEGMENT_DIR }, 0);
-    var st: linux.Statx = undefined;
-    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.statx(linux.AT.FDCWD, sub, 0, .{ .MODE = true }, &st)));
-    try testing.expectEqual(@as(u16, 0o600), st.mode & 0o777);
-    var root_z: [128]u8 = undefined;
-    const rootz = try std.mem.printSentinel(&root_z, "{s}", .{root}, 0);
-    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.statx(linux.AT.FDCWD, rootz, 0, .{ .MODE = true }, &st)));
-    try testing.expectEqual(@as(u16, 0o700), st.mode & 0o777);
-    // Reopen: cold — the index is empty even though the file persists.
-    cache.deinit();
-    cache = try Ring.open(testing.allocator, root, 2, 8 * GRAIN);
-    try testing.expect(!cache.has(k));
 }
 
 fn cacheHeaderFuzz(_: void, smith: *std.testing.Smith) !void {

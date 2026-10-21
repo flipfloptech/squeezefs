@@ -1563,7 +1563,7 @@ test "Config.fromEnv reads every row once: defaults derive; levers log when non-
     try testing.expect(c.rewrite_shadow);
     try testing.expectEqual(@as(u64, 1024), c.parked_cap);
     try testing.expectEqual(pipeline.DepthOverride.adaptive, c.depth_override);
-    try testing.expect(c.fsync.touched_namespaces and c.fsync.parallel_legs and !c.fsync.promote_staged.on);
+    try testing.expect(c.fsync.touched_namespaces and c.fsync.parallel_legs);
     try env.put("SQUEEZEFS_PATCH_MAX_BYTES", "0");
     try env.put("SQUEEZEFS_DEVICE_OVERLAY", "0");
     try env.put("SQUEEZEFS_WRITE_PIPELINE_DEPTH_BLOCKS", "0");

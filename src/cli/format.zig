@@ -14,8 +14,8 @@
 //! `set_config` control record written by the format transaction into
 //! tree 0 of member 0 (`data/set_config.zig`): block size, chunk, the
 //! transform, the key reference, every data volume with its `vol_tag`,
-//! the cache paths. A set with no data volume is legal and records an
-//! empty list.
+//! (the write cache needs no path: every mount holds one in RAM). A set
+//! with no data volume is legal and records an empty list.
 //!
 //! The order, with NO destructive step before every verdict: parse → key
 //! material + salt + key id (an encrypted set) → the io pool → the
@@ -310,14 +310,7 @@ pub fn run(p: cli.Process, f: args.Format) u8 {
     }
 
     // The record (its cap is the per-volume record-value cap).
-    var cache_paths: [args.MAX_CACHE_PATHS][]const u8 = undefined;
-    var n_paths: usize = 0;
-    var it = args.cachePaths(f.disk_cache_paths);
-    while (it.next()) |cp| {
-        cache_paths[n_paths] = cp;
-        n_paths += 1;
-    }
-    var cfg = set_config.birth(p.gpa, set.set_uuid, tcfg, key_ref, records[0..n_data], cache_paths[0..n_paths]) catch {
+    var cfg = set_config.birth(p.gpa, set.set_uuid, tcfg, key_ref, records[0..n_data]) catch {
         p.stderr.writeAll("squeezefs format: out of memory\n") catch {};
         return cli.exit_failed;
     };

@@ -1,13 +1,12 @@
 #!/usr/bin/env bash
 # mkfs(8) helper for the external suites: `mkfs.fuse.squeezefs [-f] [--]
 # <device> [squeezefs format flags…]` formats a SET on the ONE device
-# (`setpaths.sh`: dm-linear slices for the metadata volume, two data volumes
-# and an ext4 for the staging root, all over the device xfstests hands over —
-# its TEST_DEV/SCRATCH_DEV loop, or a dm target the test put over it) with
-# `squeezefs format --single-writer --disk-cache-paths`. xfstests'
+# (`setpaths.sh`: dm-linear slices for the metadata volume and two data
+# volumes, all over the device xfstests hands over — its TEST_DEV/SCRATCH_DEV
+# loop, or a dm target the test put over it) with `squeezefs format
+# --single-writer`; the write cache is RAM, nothing to format. xfstests'
 # `_scratch_mkfs` runs `yes | mkfs -t fuse.squeezefs -- $SCRATCH_DEV` before
-# every scratch test: a reformat (`--force`) drops the previous life's
-# staging ring (a fresh ext4). Installed as /sbin/mkfs.fuse.squeezefs.
+# every scratch test. Installed as /sbin/mkfs.fuse.squeezefs.
 set -euo pipefail
 ENV_FILE=${SQZ_SUITES_ENV:-/run/squeezefs-suites.env}
 [ -f "$ENV_FILE" ] && source "$ENV_FILE"
@@ -34,10 +33,6 @@ suite_set_of "$dev"
 suite_slices_down
 suite_slices_up "$dev"
 trap suite_slices_down EXIT
-# The staging root: a fresh ext4 on the cache slice (a reformat must not
-# inherit the previous life's staging ring).
-mkfs.ext4 -q -F "$SLICE_CACHE" >/dev/null 2>&1 || die "mkfs.ext4 on $SLICE_CACHE failed"
-suite_cache_mount
 # Without -f the format runs as the operator would: a volume already
 # formatted refuses (generic/740 asks exactly that of a foreign filesystem).
 [ "$force" = 1 ] && extra+=(--force)
@@ -46,7 +41,7 @@ suite_cache_mount
 # into its golden output — generic/631, 634, 732, 754, 800); a refusal is
 # the diagnosis and goes to stderr with the exit code.
 rc=0
-out=$("$SQZ_BIN" format --single-writer --disk-cache-paths "$SET_DIR/cache" "${extra[@]}" "sqmeta://$SLICE_META" "sqdata://$SLICE_D0,$SLICE_D1" 2>&1) || rc=$?
+out=$("$SQZ_BIN" format --single-writer "${extra[@]}" "sqmeta://$SLICE_META" "sqdata://$SLICE_D0,$SLICE_D1" 2>&1) || rc=$?
 if [ "$rc" = 0 ]; then
   printf '%s\n' "$(date +%s) format $dev" "$out" >> "$SET_DIR/formats.log"
   exit 0

@@ -709,7 +709,7 @@ test "C13 / C16 / C17 through their faces: an orphan image is planned to return 
     _ = p;
 }
 
-test "C4/C5 through the staging face: an orphan custody record is quarantined then retired; a dead marker is a C5 finding whose repair moves the dir aside" {
+test "C4 through the staging face: an orphan custody record is quarantined then retired; a joiner's and a current-era custody are scoped out" {
     const gpa = testing.allocator;
     const set = try RamSet.init(gpa);
     defer set.deinit();
@@ -718,15 +718,9 @@ test "C4/C5 through the staging face: an orphan custody record is quarantined th
     const Face = struct {
         gpa: Allocator,
         residents: std.ArrayList(staging.Resident),
-        verdict: ?finding.StagingVerdict = null,
-        dir_quarantined: bool = false,
         fn residentsFn(ctx: *anyopaque, g: Allocator) census.Error![]staging.Resident {
             const self: *@This() = @ptrCast(@alignCast(ctx));
             return g.dupe(staging.Resident, self.residents.items);
-        }
-        fn marker(ctx: *anyopaque) ?finding.StagingVerdict {
-            const self: *@This() = @ptrCast(@alignCast(ctx));
-            return self.verdict;
         }
         fn image(ctx: *anyopaque, g: Allocator, k: staging.StagingKey) census.Error!?[]u8 {
             const self: *@This() = @ptrCast(@alignCast(ctx));
@@ -741,12 +735,7 @@ test "C4/C5 through the staging face: an orphan custody record is quarantined th
             };
             return false;
         }
-        fn quarantineDir(ctx: *anyopaque, q: *classes.Quarantine) census.Error!void {
-            const self: *@This() = @ptrCast(@alignCast(ctx));
-            try q.putRecord(.c5, "staging-segment", "segment-image");
-            self.dir_quarantined = true;
-        }
-        const vtable: classes.StagingFace.VTable = .{ .residents = &residentsFn, .marker = &marker, .image = &image, .remove = &remove, .quarantineDir = &quarantineDir };
+        const vtable: classes.StagingFace.VTable = .{ .residents = &residentsFn, .image = &image, .remove = &remove };
     };
     var face: Face = .{ .gpa = gpa, .residents = .empty };
     defer face.residents.deinit(gpa);
@@ -778,11 +767,6 @@ test "C4/C5 through the staging face: an orphan custody record is quarantined th
     try testing.expectEqual(@as(usize, 3), face.residents.items.len);
     try testing.expectEqual(@as(usize, 1), sink.puts.items.len);
     _ = set.scope.foreign_live.remove(joiner_slot);
-    face.verdict = .dead;
-    var r2 = try ram.runHost(set, &h, .{ .repair = repairOpts(&sink, true) });
-    defer r2.deinit(gpa);
-    try ram.expectClasses(r2, &.{.c5});
-    try testing.expect(face.dir_quarantined);
 }
 
 test "the kill-9 convergence seam: an apply aborted after the quarantine mutates nothing; the next run re-detects; a second apply plans zero (idempotent)" {

@@ -616,11 +616,11 @@ shutdown. `set/get-fabric-endpoints` (rung 8), `data-volume list/enable/disable`
 state offline, admin lane live; rung 7/8), `metadata-volume *` (live only). Twelve verbs
 are `removed_verb` stubs (§7 Q7).
 
-**PORT:** `config get-cache-paths URI`, `config set-cache-paths URI PATHS… [--force]` over
-the rung-4 `set_config` record in the control tree (`P:src/cli/status.zig:160-202` reads it;
-the write is one control-tree transaction under the writer guard); the dir precheck/wipe
-law as above with the port's `format --disk-cache-paths` validator (`P:src/cli/args.zig:130`:
-absolute, outside `/`, `/home`, `/etc`, `/usr`, `/var`, `/boot`, `/root`, no repeats).
+**PORT:** `config show [--json]` and the fabric-endpoint verbs over the rung-4 `set_config`
+record in the control tree. `set-cache-paths`/`get-cache-paths` and `format --disk-cache-paths`
+went with disk-based caching (2026-10-21, 0002 row 550): the staging ring is the WRITE CACHE
+in RAM on every mount, `SQUEEZEFS_WRITE_CACHE_PCT` of system RAM; a `set_config` record that
+names cache paths is refused by name (reformat).
 
 ### 4.4 `staging`
 
@@ -635,10 +635,11 @@ by mounting with `-o client_slot=<hex8>`"). `discard` enumerates every destroyed
 design". `slot_residue_for_set` (`config_ops.rs:3664`) feeds `clients` (§4.7). The charter
 names `staging` without subverbs; there is no `list/promote/drain` in the reference.
 
-**PORT:** `staging list URI|mountpoint` (this node's staging roots for the set with
-`live_owner`, live units, bytes — the `clients` residue block as its own verb), `staging
-adopt --slot`, `staging discard --slot` as above; promotion of staged files is `umount`'s
-teardown (charter §8), and a drain is `fsync`/`umount`, never a verb.
+**PORT:** no `staging` verb (removed 2026-10-21 with the on-disk roots, 0002 row 550): the
+write cache is RAM, a dead daemon's ring is held by its supervisor for the member's next mount
+(`squeezefs mount` recovers it; `kill` the supervisor discards it), promotion of staged files
+is `fsync`'s law and `umount`'s teardown (charter §6.1, §8), and a drain is `fsync`/`umount`,
+never a verb.
 
 ### 4.5 `claim clear`
 

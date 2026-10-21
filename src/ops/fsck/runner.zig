@@ -254,9 +254,9 @@ pub const linux = if (builtin.os.tag == .linux) struct {
         b.xforms = try xforms.toOwnedSlice(gpa);
         if (plane) |pl| {
             b.verifier = try scrub.Verifier.init(gpa, .{ .ctx = pl, .read = &readBlock }, pl.chunk, b.xforms);
-            // C4/C5 over THIS member's root (0003 §T.1): the plane's ring
-            // and the marker its bind stamped.
-            if (pl.stagingRoot()) |root| b.staging_face = .{ .plane = pl, .root = root };
+            // C4 over the write cache's residents (0003 §T.1: this
+            // member's ring).
+            if (pl.stage != null) b.staging_face = .{ .plane = pl };
         }
         b.host = .{
             .gpa = gpa,
@@ -528,10 +528,9 @@ pub const linux = if (builtin.os.tag == .linux) struct {
         }
     };
 
-    /// The staging ring (C4/C5) over the plane's segment + the marker file.
+    /// The write cache (C4) over the plane's segment.
     const StagingBind = struct {
         plane: *plane_mod.DataPlane,
-        root: []const u8,
 
         pub fn face(self: *StagingBind) classes.StagingFace {
             return .{ .ctx = self, .vtable = &vtable };
@@ -541,17 +540,6 @@ pub const linux = if (builtin.os.tag == .linux) struct {
             const self: *StagingBind = @ptrCast(@alignCast(ctx));
             const seg = &self.plane.stage.?.seg;
             return seg.residentsAlloc(gpa);
-        }
-
-        fn markerFn(ctx: *anyopaque) ?finding.StagingVerdict {
-            const self: *StagingBind = @ptrCast(@alignCast(ctx));
-            const pl = self.plane;
-            const found = staging.Ring.readMarker(pl.backend.pool, self.root) catch return .unreadable;
-            return switch (staging.bindVerdict(found, pl.stage.?.marker)) {
-                .absent, .match, .upgrade => null,
-                .dead => .dead,
-                .foreign_owner => .foreign_scope,
-            };
         }
 
         fn imageFn(ctx: *anyopaque, gpa: Allocator, k: staging.StagingKey) Error!?[]u8 {
@@ -566,19 +554,7 @@ pub const linux = if (builtin.os.tag == .linux) struct {
             return self.plane.stage.?.seg.remove(k, generation);
         }
 
-        fn quarantineDirFn(ctx: *anyopaque, q: *classes.Quarantine) Error!void {
-            const self: *StagingBind = @ptrCast(@alignCast(ctx));
-            // The segment image is the dir's whole content: copied, then
-            // every record retired (the marker is restamped by the next open).
-            const seg = &self.plane.stage.?.seg;
-            try q.putRecord(.c5, "staging-segment", seg.image);
-            const gpa = self.plane.gpa;
-            const out = try seg.residentsAlloc(gpa);
-            defer gpa.free(out);
-            for (out) |r| _ = seg.remove(r.key, r.generation);
-        }
-
-        const vtable: classes.StagingFace.VTable = .{ .residents = &residentsFn, .marker = &markerFn, .image = &imageFn, .remove = &removeFn, .quarantineDir = &quarantineDirFn };
+        const vtable: classes.StagingFace.VTable = .{ .residents = &residentsFn, .image = &imageFn, .remove = &removeFn };
     };
 
     /// C14/C15 off the devices: every volume's appender pages (appender 0
@@ -1077,8 +1053,15 @@ pub const linux = if (builtin.os.tag == .linux) struct {
             const d = std.fmt.allocPrint(self.gpa, "{s}/{x}-{d}", .{ self.home, clock.realtimeCoarseNs(), linux_os.getpid() }) catch return error.OutOfMemory;
             errdefer self.gpa.free(d);
             var zbuf: [linux_os.PATH_MAX:0]u8 = undefined;
-            const zh = std.fmt.bufPrintSentinel(&zbuf, "{s}", .{self.home}, 0) catch return error.Io;
-            _ = linux_os.mkdir(zh, 0o700);
+            // The home and its parents, 0700 (the host's state directory
+            // may not exist yet on a fresh host).
+            var end: usize = 1;
+            while (end <= self.home.len) : (end += 1) {
+                if (end == self.home.len or self.home[end] == '/') {
+                    const zh = std.fmt.bufPrintSentinel(&zbuf, "{s}", .{self.home[0..end]}, 0) catch return error.Io;
+                    _ = linux_os.mkdir(zh, 0o700);
+                }
+            }
             const zd = std.fmt.bufPrintSentinel(&zbuf, "{s}", .{d}, 0) catch return error.Io;
             if (linux_os.errno(linux_os.mkdir(zd, 0o700)) != .SUCCESS) return error.Io;
             self.manifest.writer.print("{{\"schema\":1,\"created_unix\":{d},\"entries\":[", .{clock.realtimeCoarseS()}) catch return error.OutOfMemory;

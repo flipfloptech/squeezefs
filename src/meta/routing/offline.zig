@@ -1,5 +1,5 @@
 //! The OFFLINE set verbs (Linux; charter §5.4 "`add-meta`/`remove-meta` are
-//! offline; set changes drain staging then rebind the generation stamp";
+//! offline; a set change rebinds the generation stamp";
 //! §8 `volume {add-meta, remove-meta, repair-set, list}`; `docs/porting/
 //! dynamic_routing.md` §4): membership changes over a set NO daemon has
 //! mounted — every member walks its D0 door (a live writer refuses, even
@@ -17,11 +17,11 @@
 //! says. Member 0 — slot 0's host, the native keyspace, the `set_config`
 //! home — is never retired and slot 0 never moves (`ledger.nativeSlotOf`).
 //!
-//! KD-8: a membership change changes the set epoch, never the set uuid, so
-//! every member's staging root (0003 §T.1) is rebound in two phases: refuse
-//! while any member is live or any staged custody is pending, write the
-//! DUAL marker `{E, prev = E_old}` (the owner kept), flip, then `{E}`
-//! (`staging.bindVerdict` reads a dual marker as same-epoch).
+//! KD-8: a membership change changes the set epoch, never the set uuid; a
+//! member's write cache (0003 §T.1 over the memfd ring, 2026-10-21) needs
+//! no rebind — a ring its supervisor holds across the change binds at the
+//! new epoch as an UPGRADE (`staging.bindVerdict`: the older epoch, the
+//! same identity and member), its residents recovered.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -37,7 +37,6 @@ const inos = @import("../inos.zig");
 const backend = @import("../backend.zig");
 const geometry = @import("../geometry.zig");
 const uring_fs = @import("../../io/uring_fs.zig");
-const staging = @import("../../data/staging.zig");
 const set_config = @import("../../data/set_config.zig");
 const route_table = @import("route_table.zig");
 const discovery = @import("discovery.zig");
@@ -67,8 +66,6 @@ pub const Error = error{
     TooFewTakeable,
     StampBudget,
     CapacityRefused,
-    StagingCustodyLive,
-    StagingRefused,
     /// `repair-set`'s "not inferable" arms.
     NotInferable,
     Io,
@@ -86,9 +83,6 @@ pub const Options = struct {
     pool: *uring_fs.Pool,
     cache_budget_bytes: u64,
     cpus: u32,
-    /// The set config's cache paths (the KD-8 rebind walks every member
-    /// root under each); empty on a cache-less set.
-    staging_roots: []const []const u8 = &.{},
 };
 
 /// One member as observed, with its decoded record owned.
@@ -167,78 +161,6 @@ fn mapMigrate(e: migrate.Error) Error {
 /// construction) — the census the `--take-slots k` ranking reads.
 fn slotLoad(stamp: ledger.MembershipStamp, slot: u16) u64 {
     return (stamp.cursorFor(slot) orelse inos.LOCAL_INO_BASE) - inos.LOCAL_INO_BASE;
-}
-
-// ---------------------------------------------------------------------------
-// KD-8: the staging drain barrier + the generation rebind.
-// ---------------------------------------------------------------------------
-
-pub const Rebind = struct {
-    set_uuid: [16]u8,
-    old_epoch: u64,
-    new_epoch: u64,
-};
-
-/// Phase 1: every MEMBER root (0003 §T.1) under every cache path bound to
-/// this set must have no live owner and hold NO staged custody (a unit a
-/// member has yet to drain would be discarded by the rebind); then the
-/// DUAL marker, its owner kept.
-pub fn stagingRebindPrepare(gpa: Allocator, pool: *uring_fs.Pool, containers: []const []const u8, r: Rebind) Error!void {
-    for (containers) |container| {
-        var it = staging.Ring.MemberIter.open(container) orelse continue;
-        defer it.close();
-        while (it.next()) |slot| {
-            var buf: [linux.PATH_MAX]u8 = undefined;
-            const root = staging.Ring.memberRootPath(&buf, container, slot) catch return error.StagingRefused;
-            const m = (try boundMarker(gpa, pool, root, r)) orelse continue;
-            var next = m;
-            next.set_epoch = r.new_epoch;
-            next.prev_set_epoch = r.old_epoch;
-            try writeMarker(pool, root, next);
-        }
-    }
-}
-
-/// Phase 2: the single new-epoch marker on every rebound member root.
-pub fn stagingRebindFinalize(gpa: Allocator, pool: *uring_fs.Pool, containers: []const []const u8, r: Rebind) Error!void {
-    for (containers) |container| {
-        var it = staging.Ring.MemberIter.open(container) orelse continue;
-        defer it.close();
-        while (it.next()) |slot| {
-            var buf: [linux.PATH_MAX]u8 = undefined;
-            const root = staging.Ring.memberRootPath(&buf, container, slot) catch return error.StagingRefused;
-            const m = (try boundMarker(gpa, pool, root, r)) orelse continue;
-            var next = m;
-            next.set_epoch = r.new_epoch;
-            next.prev_set_epoch = null;
-            try writeMarker(pool, root, next);
-        }
-    }
-    rstats.staging_rebind_barriers.inc();
-}
-
-/// A member root's marker iff it is bound to this set: a live owner or a
-/// pending custody unit refuses the rebind; another set's root (or none)
-/// is not this rebind's.
-fn boundMarker(gpa: Allocator, pool: *uring_fs.Pool, root: []const u8, r: Rebind) Error!?staging.Marker {
-    const staging_verb = @import("../../cli/staging_verb.zig");
-    const row = staging_verb.inspectRoot(gpa, pool, root, r.set_uuid);
-    if (row.binding == .foreign or row.binding == .none) return null;
-    if (row.owner_live) {
-        log.err("staging drain barrier refused (KD-8): the member root {s} is held LIVE (appender {d}, pid {d}) — unmount every member of the set first; nothing was changed", .{ root, row.appender_id, row.owner_pid });
-        return error.StagingCustodyLive;
-    }
-    if (row.live_units != 0) {
-        log.err("staging drain barrier refused (KD-8): {d} pending write-custody unit(s) remain under {s} — mount the filesystem as that member (mount slot {x:0>8}), let writeback drain (`sync -f` the mount, then a clean unmount), then re-run; nothing was changed", .{ row.live_units, root, row.mount_slot });
-        return error.StagingCustodyLive;
-    }
-    return (staging.Ring.readMarker(pool, root) catch return error.StagingRefused) orelse null;
-}
-
-fn writeMarker(pool: *uring_fs.Pool, root: []const u8, m: staging.Marker) Error!void {
-    const fd = staging.Ring.openRoot(root) catch return error.StagingRefused;
-    defer _ = linux.close(fd);
-    staging.Ring.writeMarker(pool, root, fd, m) catch return error.StagingRefused;
 }
 
 // ---------------------------------------------------------------------------
@@ -351,10 +273,6 @@ pub fn addMeta(gpa: Allocator, io: Io, opts: Options, paths: []const []const u8,
             else => error.Io,
         };
     }
-    // 9. KD-8 phase 1.
-    const rebind: Rebind = .{ .set_uuid = disc.set_uuid, .old_epoch = disc.set_epoch, .new_epoch = epoch };
-    try stagingRebindPrepare(gpa, opts.pool, opts.staging_roots, rebind);
-
     // 11. Every member open through its door, the joiner too.
     const opened = try gpa.alloc(*KvBackend, n + 1);
     defer gpa.free(opened);
@@ -397,10 +315,9 @@ pub fn addMeta(gpa: Allocator, io: Io, opts: Options, paths: []const []const u8,
     }
     // 14. Teardown of every source's copy.
     for (opened[0..n]) |be| for (taken) |slot| be.dropTree(slot) catch |e| return mapMigrate(migrate.mapBackendError(e));
-    // 15. The doors release at close; KD-8 phase 2.
+    // 15. The doors release at close.
     for (opened[0..n_open]) |be| be.close();
     n_open = 0;
-    try stagingRebindFinalize(gpa, opts.pool, opts.staging_roots, rebind);
     return .{ .position = position, .epoch = epoch, .taken = try gpa.dupe(u16, taken), .records_copied = records, .resumed = resumed };
 }
 
@@ -552,9 +469,6 @@ pub fn removeMeta(gpa: Allocator, io: Io, opts: Options, paths: []const []const 
             return error.CapacityRefused;
         }
     }
-    // KD-8 phase 1 with the survivor set's epoch.
-    const rebind: Rebind = .{ .set_uuid = disc.set_uuid, .old_epoch = disc.set_epoch, .new_epoch = epoch };
-    try stagingRebindPrepare(gpa, opts.pool, opts.staging_roots, rebind);
     // Every victim slot onto the survivor with the most free extents at
     // its placement: a slot WITH a tree is copied and its cursor travels;
     // a virgin slot (no tree, no cell — most of a member's hosted set)
@@ -607,7 +521,6 @@ pub fn removeMeta(gpa: Allocator, io: Io, opts: Options, paths: []const []const 
     try checkpointMember(victim_be);
     for (opened[0..n_open]) |be| be.close();
     n_open = 0;
-    try stagingRebindFinalize(gpa, opts.pool, opts.staging_roots, rebind);
     return .{ .epoch = epoch, .moved_slots = @intCast(victim_slots.len), .records_copied = records };
 }
 
@@ -773,8 +686,6 @@ pub fn writeError(w: *Io.Writer, e: Error, verb: []const u8) Io.Writer.Error!voi
         error.TooFewTakeable => try w.writeAll("too few slots are takeable (every member keeps at least one) — the W-granularity limit"),
         error.StampBudget => try w.print("the taken slots do not fit one stamp ({d} runs / {d} cursors)", .{ ledger.STAMP_MAX_RUNS, ledger.STAMP_MAX_CURSORS }),
         error.CapacityRefused => try w.writeAll("the §5.2 capacity preflight refused (see the log for the numbers); nothing was changed"),
-        error.StagingCustodyLive => try w.writeAll("the KD-8 staging drain barrier refused (see the log); nothing was changed"),
-        error.StagingRefused => try w.writeAll("a staging root's marker could not be written"),
         error.NotInferable => try w.writeAll("the stampless state is not inferable (see above)"),
         error.Io => try w.writeAll("device I/O failed"),
         error.Corrupt => try w.writeAll("a routing/protocol inconsistency (see the log)"),

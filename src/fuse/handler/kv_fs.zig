@@ -5140,11 +5140,7 @@ const SettlingData = struct {
     }
     pub fn overwriteStaged(self: *SettlingData, io: Io, k: staging.StagingKey, at: u64, data: []const u8) Error!?u64 {
         const r = self.ring orelse return null;
-        const s = (staging.overwriteStaged(&r.pool, &r.seg, io, k, at, data, 1) catch |e| return switch (e) {
-            error.OutOfMemory => error.OutOfMemory,
-            error.InputOutput => error.InputOutput,
-            error.NoSpaceLeft => error.NoSpaceLeft,
-        }) orelse return null;
+        const s = (try staging.overwriteStaged(&r.pool, &r.seg, io, k, at, data, 1)) orelse return null;
         return s.generation;
     }
     pub fn releaseStaged(self: *SettlingData, k: staging.StagingKey, generation: ?u64) void {

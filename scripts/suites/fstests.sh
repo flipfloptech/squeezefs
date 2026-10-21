@@ -75,7 +75,6 @@ SQZ_BIN=$SQZ_BIN
 SUITE_MOUNT_OPTS=$SUITE_MOUNT_OPTS
 SUITE_META_MIB=$SUITE_META_MIB
 SUITE_DATA_GIB=$SUITE_DATA_GIB
-SUITE_CACHE_GIB=${SUITE_CACHE_GIB:-4}
 ENV
   ln -sf "$SUITES_DIR/mount.squeezefs" /sbin/mount.fuse.squeezefs
   # umount(8) names its helper by the type's PREFIX: `umount.fuse -t fuse.squeezefs`.
@@ -138,8 +137,8 @@ fstests_unmount_all() {
 }
 
 fstests_detach_loops() {
-  # A set's slices (and its cache mount) a test left standing go first:
-  # the loop is busy under them.
+  # A set's slices a test left standing go first: the loop is busy under
+  # them.
   local id
   for id in set-test set-scratch; do
     SET_ID=$id; SET_DIR="$SETS/$id"; suite_slice_paths; suite_slices_down

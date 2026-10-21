@@ -1,6 +1,6 @@
 //! The one CLI binary's verbs (charter §8): `format`, `mount` (`--daemon
 //! --supervise --log-file`), `umount`, `status`, `clients`, `df`, `bench`,
-//! `clone`, `tune`, `config`, `staging`, `claim clear`, `--version`.
+//! `clone`, `tune`, `config`, `claim clear`, `--version`.
 //! `src/main.zig` runs the knob gate first (charter §1.6) and then hands
 //! argv to `run`.
 //!
@@ -34,7 +34,6 @@ pub const appenders = if (is_linux) @import("appenders.zig") else struct {};
 pub const df = if (is_linux) @import("df.zig") else struct {};
 pub const clone = if (is_linux) @import("clone.zig") else struct {};
 pub const config_verb = if (is_linux) @import("config_verb.zig") else struct {};
-pub const staging_verb = if (is_linux) @import("staging_verb.zig") else struct {};
 pub const volume = if (is_linux) @import("volume.zig") else struct {};
 /// Portable `merge-reports`; the offline/online harnesses are Linux inside.
 pub const fsck_verb = @import("fsck.zig");
@@ -109,7 +108,6 @@ pub fn run(p: Process) u8 {
         .clone => |c| return if (is_linux) clone.run(p, c) else linuxOnly(p, "clone"),
         .tune => |t| return tune.run(p, t),
         .config => |c| return if (is_linux) config_verb.run(p, c) else linuxOnly(p, "config"),
-        .staging => |s| return if (is_linux) staging_verb.run(p, s) else linuxOnly(p, "staging"),
         .claim_clear => |c| return if (is_linux) claim.run(p, c) else linuxOnly(p, "claim clear"),
         .appenders => |a| return if (is_linux) appenders.run(p, a) else linuxOnly(p, "appenders"),
         .appender_clear => |a| return if (is_linux) appenders.runClear(p, a) else linuxOnly(p, "appender clear"),
@@ -163,7 +161,6 @@ test {
         _ = df;
         _ = clone;
         _ = config_verb;
-        _ = staging_verb;
         _ = volume;
         _ = job;
         _ = defrag_verb;

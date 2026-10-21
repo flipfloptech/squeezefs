@@ -157,22 +157,10 @@ pub const BlockKey = read_size_class.BlockKey;
 // ---------------------------------------------------------------------------
 
 /// The staging segment takes a QUARTER of the cache root's free space
-/// (`cache/mod.rs`'s write-half law: the read tier and the host's own
-/// files share the device) and never more than an EIGHTH of the memory
-/// budget: the ring is a shared mapping whose recovery scan touches every
-/// grain, so its resident pages are the daemon's RSS — an eighth leaves
-/// the fill pool, the hot tier and the arenas their shares and still holds
-/// hundreds of whole-block entries at the venue's budget.
-pub const STAGING_SHARE_DIVISOR: u64 = 4;
-pub const STAGING_BUDGET_DIVISOR: u64 = 8;
-/// The ring must hold at least a few whole-block entries or it is not a
-/// ring: 16 × the 4 MiB block.
-pub const STAGING_FLOOR: u64 = 64 * derive.MiB;
-/// The write cache's floor (the same reason): a percentage of RAM below it
-/// is no cache — the mount runs cache-less, loud.
-pub const WRITE_CACHE_FLOOR: u64 = STAGING_FLOOR;
-/// The sole staging segment of this wave (per-path shards are owed).
-pub const STAGING_SEGMENT_NAME: [:0]const u8 = "seg-0";
+/// The write cache's floor: the ring must hold at least a few whole-block
+/// entries or it is not a ring — 16 × the 4 MiB block; a percentage of RAM
+/// below it is no cache and the mount runs cache-less, loud.
+pub const WRITE_CACHE_FLOOR: u64 = 64 * derive.MiB;
 
 /// THIS mount's staging owner (0003 §T.1): volume 0's appender identity —
 /// the manager's `(node, home-volume index)` at appender 0, a joiner's
@@ -212,9 +200,8 @@ pub const SHAPE_STRIPES: usize = shape_table.STRIPES;
 pub const stats = struct {
     /// `data_volumes`: active data volumes bound.
     pub var data_volumes: counters.Gauge = .{};
-    /// `data_staging_on` / `data_nvme_tier_on`: 1 when the cache paths arm them.
+    /// `data_staging_on`: 1 when the write cache is bound.
     pub var data_staging_on: counters.Gauge = .{};
-    pub var data_nvme_tier_on: counters.Gauge = .{};
     /// `layout_map_merges`: ONE transaction per `MapSeam.merge`.
     pub var layout_map_merges: counters.ShardedCounter = .{};
     pub var layout_map_merge_blocks: counters.ShardedCounter = .{};
@@ -253,9 +240,7 @@ pub const stats = struct {
     /// and its publish; `promotion_barriers_coalesced` — the requests a
     /// flush another promotion led answered (flushes issued = requests −
     /// coalesced); `promotion_barrier_write_through_skips` — a write-through
-    /// volume owes none. The cover rounds that release the departed ring
-    /// copies afterwards: `promotion_cover_rounds_failed` (a meta barrier
-    /// that failed; the copies stay held for the next round).
+    /// volume owes none.
     pub var promotion_barriers: counters.ShardedCounter = .{};
     /// The staged fast path's point cache (`stagedPoint`): hits served
     /// without a lookup, misses that went to the read view and the store.
@@ -263,7 +248,6 @@ pub const stats = struct {
     pub var staged_point_misses: counters.ShardedCounter = .{};
     pub var promotion_barriers_coalesced: counters.ShardedCounter = .{};
     pub var promotion_barrier_write_through_skips: counters.ShardedCounter = .{};
-    pub var promotion_cover_rounds_failed: counters.ShardedCounter = .{};
     /// Direct stores of a held slot (`WRITE_FIXED(device ← slot)`) through
     /// the seam, and their bytes (held-store bytes: every one a byte no
     /// daemon pass touched).
@@ -320,10 +304,10 @@ pub const stats = struct {
 
 pub fn writeStatsJson(w: *Io.Writer) Io.Writer.Error!void {
     try w.writeAll("{");
-    inline for (.{ "data_volumes", "data_staging_on", "data_nvme_tier_on", "block_refs_drift_rows" }) |name| {
+    inline for (.{ "data_volumes", "data_staging_on", "block_refs_drift_rows" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, @field(stats, name).load() });
     }
-    inline for (.{ "layout_map_merges", "layout_map_merge_blocks", "layout_map_merge_failures", "layout_map_merge_clipped_blocks", "layout_map_merges_shipped", "foreign_publish_kvmap_refusals", "layout_publishes_served", "kvmap_sweep_spawn_refusals", "promotions_run", "promotions_stale", "promotions_failed", "own_block_dmas", "own_block_dma_bytes", "promotion_barriers", "staged_point_hits", "staged_point_misses", "promotion_barriers_coalesced", "promotion_barrier_write_through_skips", "promotion_cover_rounds_failed", "held_stores", "held_store_bytes", "held_store_failures", "hold_gate_admits", "hold_gate_overlay_admits", "hold_gate_declines", "prefetch_fibers", "prefetch_fiber_refusals", "hold_ceremony_fibers", "bindings_freed", "device_read_bounces", "data_device_read_bytes", "write_side_read_dma_bytes", "compose_read_dma_bytes", "pack_read_dma_bytes" }) |name| {
+    inline for (.{ "layout_map_merges", "layout_map_merge_blocks", "layout_map_merge_failures", "layout_map_merge_clipped_blocks", "layout_map_merges_shipped", "foreign_publish_kvmap_refusals", "layout_publishes_served", "kvmap_sweep_spawn_refusals", "promotions_run", "promotions_stale", "promotions_failed", "own_block_dmas", "own_block_dma_bytes", "promotion_barriers", "staged_point_hits", "staged_point_misses", "promotion_barriers_coalesced", "promotion_barrier_write_through_skips", "held_stores", "held_store_bytes", "held_store_failures", "hold_gate_admits", "hold_gate_overlay_admits", "hold_gate_declines", "prefetch_fibers", "prefetch_fiber_refusals", "hold_ceremony_fibers", "bindings_freed", "device_read_bounces", "data_device_read_bytes", "write_side_read_dma_bytes", "compose_read_dma_bytes", "pack_read_dma_bytes" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, @field(stats, name).load() });
     }
     try w.print("\"data_unresolved_volume\":{d},\"kvmap_resolve_failures\":{d},\"kvmap_head_put_unlocked\":{d},\"release_free_unheld\":{d},\"layout_map_merge_displaced_overflow\":{d}}}", .{ counters.tripwireCount("data_unresolved_volume"), counters.tripwireCount("kvmap_resolve_failures"), counters.tripwireCount("kvmap_head_put_unlocked"), counters.tripwireCount("release_free_unheld"), counters.tripwireCount("layout_map_merge_displaced_overflow") });
@@ -347,14 +331,11 @@ pub const HeldStoreFace = struct {
 };
 
 const Staging = struct {
-    /// Where the ring lives: the write cache's memfd (every mount, sized by
-    /// `SQUEEZEFS_WRITE_CACHE_PCT`), or THIS member's root under a cache
-    /// path with its live claim held for the ring's life (0003 §T.1).
-    home: union(enum) {
-        ram: staging.Ring.Ram,
-        dir: struct { root: staging.Ring.Bound, mapped: staging.Ring.MappedSegment },
-    },
-    /// The marker the bind stamped (the online fsck's C5 re-reads against it).
+    /// The write cache's memfd (every mount, sized by
+    /// `SQUEEZEFS_WRITE_CACHE_PCT`), the member's claim held for its life
+    /// (0003 §T.1).
+    ram: staging.Ring.Ram,
+    /// The marker the bind stamped.
     marker: staging.Marker,
     seg: staging.Segment,
     pool: staging.Pool,
@@ -664,23 +645,18 @@ pub const DataPlane = struct {
         if (!self.passthrough) try self.openTransform(gpa, io, cfg, tcfg, opts);
         errdefer self.closeTransform();
 
-        // 4. Staging + the NVMe tier under THIS member's root of the cache
-        //    path (or OFF, loud). A `-o ro` reader stages nothing and binds
-        //    no member's root (0003 §T.1).
-        var nvme: nvme_read_cache.Cache = nvme_read_cache.Cache.initDisabled(gpa);
+        // 4. The write cache (or OFF, loud). A `-o ro` reader stages
+        //    nothing and holds no member's claim (0003 §T.1).
+        const nvme: nvme_read_cache.Cache = nvme_read_cache.Cache.initDisabled(gpa);
         if (opened > 0 and be.isReader()) {
-            log.info("data plane: a `-o ro` reader holds no write cache and binds no member's staging root — staging and the NVMe read tier are OFF on this mount", .{});
+            log.info("data plane: a `-o ro` reader holds no write cache — staging is OFF on this mount", .{});
         } else if (opts.write_cache_bytes >= WRITE_CACHE_FLOOR and opened > 0) {
             try self.openWriteCache(gpa, opts);
-        } else if (cfg.cache_paths.len > 0 and opened > 0) {
-            try self.openStaging(gpa, io, cfg, opts);
-            nvme = self.openNvmeTier(gpa, opts);
         } else {
-            log.info("data plane: no write cache (SQUEEZEFS_WRITE_CACHE_PCT yields {d} B, under the {d} MiB floor) and no cache paths — staging and the NVMe read tier are OFF: a write ≤ inline_max ({d} B) stays inline, anything larger goes STRIPED (no packed layout, no promotion pass at dismount)", .{ opts.write_cache_bytes, WRITE_CACHE_FLOOR >> 20, inline_max });
+            log.info("data plane: no write cache (SQUEEZEFS_WRITE_CACHE_PCT yields {d} B, under the {d} MiB floor) — staging is OFF: a write ≤ inline_max ({d} B) stays inline, anything larger goes STRIPED (no packed layout, no promotion pass at dismount)", .{ opts.write_cache_bytes, WRITE_CACHE_FLOOR >> 20, inline_max });
         }
         errdefer self.closeStaging();
         stats.data_staging_on.set(@intFromBool(self.stage != null));
-        stats.data_nvme_tier_on.set(@intFromBool(nvme.enabled));
 
         // 5. The read path over the plane's seams.
         var rcfg = read_path.Config.fromEnv(opts.env, cfg.block_size, self.passthrough, opts.facts, opts.budget_bytes);
@@ -748,7 +724,7 @@ pub const DataPlane = struct {
         // Open sweeps (a shrink or an unlink the previous daemon left mid-
         // sweep) regenerate their jobs from the durable cursor.
         self.adoptSweeps();
-        log.info("data plane: {d} data volume(s), block {d} B, chunk {d} B, inline_max {d} B, inline map cap {d} entries, map chunk {d} ops, sweep threshold {d} blocks, transform {s}/{s}, staging {s}, NVMe tier {s}, direct-store face pending the session", .{ opened, cfg.block_size, cfg.chunk_size, inline_max, self.inlineMapCap(), self.kvmap_chunk, kvmap.sweepThresholdBlocks(self.kvmap_chunk), @tagName(cfg.compression), cfg.encryption.name(), if (self.stage != null) "ON" else "off", if (nvme.enabled) "ON" else "off" });
+        log.info("data plane: {d} data volume(s), block {d} B, chunk {d} B, inline_max {d} B, inline map cap {d} entries, map chunk {d} ops, sweep threshold {d} blocks, transform {s}/{s}, staging {s}, direct-store face pending the session", .{ opened, cfg.block_size, cfg.chunk_size, inline_max, self.inlineMapCap(), self.kvmap_chunk, kvmap.sweepThresholdBlocks(self.kvmap_chunk), @tagName(cfg.compression), cfg.encryption.name(), if (self.stage != null) "ON" else "off" });
         return self;
     }
 
@@ -1042,69 +1018,6 @@ pub const DataPlane = struct {
         }
     }
 
-    /// The staging ring under THIS member's root of the first cache path
-    /// (0003 §T.1): the root bound with its live claim (a live owner's root
-    /// refused, another member's never adopted), the segment sized from the
-    /// root's free space, the recovery scan seeding the pool's ledger; the
-    /// other members' ownerless residue reported loud.
-    fn openStaging(self: *DataPlane, gpa: Allocator, io: Io, cfg: *const set_config.Config, opts: Options) OpenError!void {
-        _ = io;
-        const container = cfg.cache_paths[0];
-        const ours = stagingOwnerMarker(self.backend);
-        var refusal: staging.Ring.BindRefusal = .{};
-        var root = staging.Ring.bindMember(self.backend.pool, container, ours, &.{STAGING_SEGMENT_NAME}, &refusal) catch |e| switch (e) {
-            error.OwnerLive => {
-                if (refusal.owner) |o| {
-                    if (o.identity() == ours.identity()) {
-                        log.err("staging root {s}/{s}{x:0>8}: held LIVE by another mount of this member scope (appender {d}, node {x:0>16}, pid {d}) — two mounts present one member (mount slot {x:0>8}); refusing (never adopted): unmount the other, or mount at another mount point (a joiner's member scope derives from it)", .{ container, staging.Ring.MEMBER_DIR_PREFIX, ours.mount_slot, o.appender_id, o.node_token, o.owner_pid, ours.mount_slot });
-                    } else {
-                        log.err("staging root {s}/{s}{x:0>8}: held LIVE by a mount of ANOTHER SET on this cache path (staging identity {x:0>16}, appender {d}, node {x:0>16}, pid {d}) — refusing (never adopted, never wiped): give each set its own cache path (`config set-cache-paths`)", .{ container, staging.Ring.MEMBER_DIR_PREFIX, ours.mount_slot, o.identity(), o.appender_id, o.node_token, o.owner_pid });
-                    }
-                } else {
-                    log.err("staging root {s}/{s}{x:0>8}: held LIVE by another process (no readable marker) — refusing (never adopted)", .{ container, staging.Ring.MEMBER_DIR_PREFIX, ours.mount_slot });
-                }
-                return error.StagingOwnerLive;
-            },
-            error.ForeignOwner => {
-                const o = refusal.owner.?;
-                log.err("staging root {s}/{s}{x:0>8}: its marker names ANOTHER member (mount slot {x:0>8}, appender {d}, node {x:0>16}, last pid {d}) — its ring is that member's custody; refusing (never adopted, never wiped)", .{ container, staging.Ring.MEMBER_DIR_PREFIX, ours.mount_slot, o.mount_slot, o.appender_id, o.node_token, o.owner_pid });
-                return error.StagingForeignOwner;
-            },
-            else => {
-                log.err("staging root under {s}: cannot bind this member's root ({s})", .{ container, @errorName(e) });
-                return error.StagingRefused;
-            },
-        };
-        errdefer root.release();
-        if (root.verdict == .match) if (root.found) |f| if (f.owner_pid != ours.owner_pid or f.node_token != ours.node_token) {
-            log.info("staging root {s}: this member's previous incarnation (appender {d}, node {x:0>16}, pid {d}) is dead — its ring recovers here as the successor's", .{ root.path(), f.appender_id, f.node_token, f.owner_pid });
-        };
-        _ = staging.Ring.residueCensus(self.backend.pool, container, ours.mount_slot, STAGING_SEGMENT_NAME);
-        const capacity = stagingCapacity(root.fd, opts.budget_bytes);
-        var mapped = staging.Ring.openSegment(root.fd, STAGING_SEGMENT_NAME, capacity) catch |e| {
-            log.err("staging root {s}: cannot open the segment ({s})", .{ root.path(), @errorName(e) });
-            return error.StagingRefused;
-        };
-        errdefer mapped.close();
-        self.stage = .{ .home = .{ .dir = .{ .root = root, .mapped = mapped } }, .marker = ours, .seg = undefined, .pool = undefined };
-        const st = &self.stage.?;
-        st.seg = staging.Segment.init(gpa, st.home.dir.mapped.map, st.home.dir.mapped.backing()) catch return error.OutOfMemory;
-        errdefer st.seg.deinit();
-        // The departure law's round: the backend's coalesced barrier (the
-        // layout publish that stopped naming a record durable before the
-        // record's slot is punched).
-        st.seg.cover_seam = .{ .ctx = self, .run = &coverRun };
-        const rep = st.seg.recover();
-        st.pool = staging.Pool.init(gpa, capacity, .{ .ctx = self, .pressure = &promotionPressure, .promote = &promoteHook, .dismount = &dismountHook });
-        st.pool.seedFromRecovery(&st.seg) catch return error.OutOfMemory;
-        budget.authority.register(st.pool.component());
-        // The live cells' value-hash states (R5: ≤ `cellStateBound(capacity)`)
-        // and the segment's fixed per-cell tables (= `tablesBound(capacity)`).
-        budget.authority.register(staging.cellStateComponent());
-        budget.authority.register(staging.tablesComponent());
-        log.info("staging ring {s}/{s}/{s}: {d} MiB, recovered {d} record(s) ({d} B), {d} torn, {d} superseded", .{ st.home.dir.root.path(), staging.Ring.SEGMENT_DIR, STAGING_SEGMENT_NAME, capacity >> 20, rep.adopted, rep.bytes, rep.torn, rep.superseded });
-    }
-
     /// The write cache (charter §6.1 "Staged", owner ruling 2026-10-21):
     /// the ring in a sealed memfd of `opts.write_cache_bytes` (25 % of
     /// system RAM by default, under the R5 budget), bound through the
@@ -1117,7 +1030,7 @@ pub const DataPlane = struct {
         const ours = stagingOwnerMarker(self.backend);
         const capacity = derive.alignDown(opts.write_cache_bytes, staging.RECORD_ALIGN);
         var refusal: staging.Ring.BindRefusal = .{};
-        var ram = staging.Ring.Ram.bind(self.backend.pool, ours, capacity, &refusal) catch |e| switch (e) {
+        var ram = staging.Ring.Ram.bind(ours, capacity, &refusal) catch |e| switch (e) {
             error.OwnerLive => {
                 log.err("write cache of mount slot {x:0>8} (staging identity {x:0>16}): held LIVE by another mount presenting this member scope — refusing (never adopted): unmount the other, or mount at another mount point (a joiner's member scope derives from it)", .{ ours.mount_slot, ours.identity() });
                 return error.StagingOwnerLive;
@@ -1133,13 +1046,12 @@ pub const DataPlane = struct {
             },
         };
         errdefer ram.release();
-        self.stage = .{ .home = .{ .ram = ram }, .marker = ours, .seg = undefined, .pool = undefined };
+        self.stage = .{ .ram = ram, .marker = ours, .seg = undefined, .pool = undefined };
         const st = &self.stage.?;
-        const r = &st.home.ram;
+        const r = &st.ram;
         if (r.found) |f| log.info("write cache: this member's previous incarnation (appender {d}, node {x:0>16}, pid {d}) is dead — its ring ({d} MiB) handed over by its supervisor, recovered here as the successor's", .{ f.appender_id, f.node_token, f.owner_pid, r.capacity() >> 20 });
         st.seg = staging.Segment.init(gpa, r.image(), r.backing()) catch return error.OutOfMemory;
         errdefer st.seg.deinit();
-        st.seg.cover_seam = .{ .ctx = self, .run = &coverRun };
         const rep = st.seg.recover();
         st.pool = staging.Pool.init(gpa, r.capacity(), .{ .ctx = self, .pressure = &promotionPressure, .promote = &promoteHook, .dismount = &dismountHook });
         st.pool.seedFromRecovery(&st.seg) catch return error.OutOfMemory;
@@ -1154,10 +1066,7 @@ pub const DataPlane = struct {
     /// file-backed ring or with staging off.
     pub fn writeCacheFds(self: *const DataPlane) ?struct { memfd: linux.fd_t, claim: linux.fd_t } {
         const st = &(self.stage orelse return null);
-        return switch (st.home) {
-            .ram => |*r| .{ .memfd = r.memfd, .claim = r.claim },
-            .dir => null,
-        };
+        return .{ .memfd = st.ram.memfd, .claim = st.ram.claim };
     }
 
     /// After the dismount pass: the write cache holds no record (every
@@ -1165,80 +1074,14 @@ pub const DataPlane = struct {
     /// supervisor may discard it. False with residents kept.
     pub fn writeCacheDrained(self: *DataPlane) bool {
         const st = &(self.stage orelse return true);
-        return switch (st.home) {
-            .ram => st.seg.live() == 0 and st.seg.departedHeld() == 0,
-            .dir => true,
-        };
-    }
-
-    /// The member root this plane's staging ring and NVMe tier live under;
-    /// null with staging off or on the write cache.
-    pub fn stagingRoot(self: *const DataPlane) ?[]const u8 {
-        const st = &(self.stage orelse return null);
-        return switch (st.home) {
-            .dir => |*d| d.root.path(),
-            .ram => null,
-        };
-    }
-
-    /// `struct statfs` of the 64-bit ABIs (`fstatfs(2)`; std carries no
-    /// wrapper): only `f_bsize` and `f_bavail` are read.
-    const StatfsWire = extern struct {
-        f_type: i64,
-        f_bsize: i64,
-        f_blocks: u64,
-        f_bfree: u64,
-        f_bavail: u64,
-        f_files: u64,
-        f_ffree: u64,
-        f_fsid: [2]i32,
-        f_namelen: i64,
-        f_frsize: i64,
-        f_flags: i64,
-        f_spare: [4]i64,
-    };
-
-    /// `clamp(free/4, 64 MiB, budget/8)` on the 4 KiB grain (module constants).
-    pub fn stagingCapacityFor(free_bytes: u64, budget_bytes: u64) u64 {
-        const ceiling = @max(budget_bytes / STAGING_BUDGET_DIVISOR, STAGING_FLOOR);
-        const share = std.math.clamp(free_bytes / STAGING_SHARE_DIVISOR, STAGING_FLOOR, ceiling);
-        return derive.alignDown(share, staging.RECORD_ALIGN);
-    }
-
-    fn stagingCapacity(root_fd: linux.fd_t, budget_bytes: u64) u64 {
-        var sfs: StatfsWire = undefined;
-        const rc = linux.syscall2(.fstatfs, @as(usize, @bitCast(@as(isize, root_fd))), @intFromPtr(&sfs));
-        const free: u64 = if (linux.errno(rc) == .SUCCESS and sfs.f_bsize > 0) sfs.f_bavail * @as(u64, @intCast(sfs.f_bsize)) else STAGING_FLOOR * STAGING_SHARE_DIVISOR;
-        return stagingCapacityFor(free, budget_bytes);
-    }
-
-    /// The NVMe read tier under this member's root (`openStaging` bound it).
-    fn openNvmeTier(self: *DataPlane, gpa: Allocator, opts: Options) nvme_read_cache.Cache {
-        var aggregate: u64 = 0;
-        for (self.vols.rows[0..self.vols.n()]) |r| aggregate += r.?.alloc.capacityBlocks() * self.block_size;
-        const tier_budget = nvme_read_cache.budgetFromEnv(opts.env, aggregate);
-        if (tier_budget == 0) return nvme_read_cache.Cache.initDisabled(gpa);
-        const shards = nvme_read_cache.shardPlan(tier_budget, opts.facts.cpus, self.chunk);
-        const per_shard = derive.alignDown(tier_budget / @max(shards, 1), nvme_read_cache.GRAIN);
-        if (per_shard < self.chunk + nvme_read_cache.GRAIN) return nvme_read_cache.Cache.initDisabled(gpa);
-        const root = self.stagingRoot().?;
-        return nvme_read_cache.Ring.open(gpa, root, shards, per_shard) catch |e| {
-            log.err("NVMe read tier under {s}: cannot open ({s}) — the tier is OFF", .{ root, @errorName(e) });
-            return nvme_read_cache.Cache.initDisabled(gpa);
-        };
+        return st.seg.live() == 0;
     }
 
     fn closeStaging(self: *DataPlane) void {
         if (self.stage) |*st| {
             st.pool.deinit();
             st.seg.deinit();
-            switch (st.home) {
-                .ram => |*r| r.release(),
-                .dir => |*d| {
-                    d.mapped.close();
-                    d.root.release();
-                },
-            }
+            st.ram.release();
             self.stage = null;
         }
     }
@@ -1276,14 +1119,9 @@ pub const DataPlane = struct {
                     log.info("dismount promotion: {d} staged file(s) ({d} B) promoted, 0 failed; {d} corpse record(s) and {d} unnamed record(s) destroyed", .{ t.promoted, t.promoted_bytes, t.corpses, t.unnamed });
                 }
             } else |e| log.err("dismount promotion pass: {s}", .{@errorName(e)});
-            // ONE cover round for every record the pass released: the
-            // publishes durable, then the slots punched (a cleanly unmounted
-            // ring scans empty). A failed round leaves them held; the next
-            // mount's pass destroys what nothing names.
-            self.coverDeparted(io);
-            // The freed grains punched: a cleanly unmounted ring scans empty.
+            // The freed grains punched: a drained ring holds no data (the
+            // supervisor discards it).
             st.seg.sweepDirty();
-            if (st.seg.departedHeld() != 0) log.err("dismount promotion: {d} released ring record(s) stay on the segment — the meta barrier that would cover their layouts failed; the next mount's pass destroys them", .{st.seg.departedHeld()});
         }
         if (self.packer) |*p| p.sealAll();
         _ = self.reclaimer.drainSync(io);
@@ -1946,52 +1784,26 @@ pub const DataPlane = struct {
 
     /// The in-place overwrite inside one grain of the resident record
     /// (`staging.overwriteStaged`): the new generation, or null when the
-    /// caller must re-stage (no ring, no resident copy, a synced record, a
-    /// span outside one grain).
+    /// caller must re-stage (no ring, no resident copy, a span outside one
+    /// grain).
     pub fn overwriteStaged(self: *DataPlane, io: Io, key_: staging.StagingKey, at: u64, data: []const u8) Error!?u64 {
         const st = &(self.stage orelse return null);
-        const s = (staging.overwriteStaged(&st.pool, &st.seg, io, key_, at, data, 1) catch |e| return switch (e) {
-            error.OutOfMemory => error.OutOfMemory,
-            error.InputOutput => error.InputOutput,
-            error.NoSpaceLeft => error.NoSpaceLeft,
-        }) orelse return null;
+        const s = (try staging.overwriteStaged(&st.pool, &st.seg, io, key_, at, data, 1)) orelse return null;
         return s.generation;
     }
 
     /// The ring entry leaves (a promotion landed, a re-stage superseded it,
     /// an unlink, a layout that moved away): generation-gated when known
     /// (null = whatever copy is resident — the layout no longer names it).
-    /// The filesystem's face, on a handler fiber: the copies depart
-    /// (`staging.Segment.remove`) and a cover round runs on a task of its
-    /// own — the caller's commit is acked already and owes no barrier wait.
+    /// The filesystem's face, on a handler fiber: the copies leave
+    /// (`staging.Segment.remove`).
     pub fn releaseStaged(self: *DataPlane, key_: staging.StagingKey, generation: ?u64) void {
         const st = &(self.stage orelse return);
-        const departed = if (generation) |g| staging.releaseStaged(&st.pool, &st.seg, key_, g) else blk: {
-            const removed = st.seg.remove(key_, null);
-            if (removed) _ = st.pool.credit(key_.file_id, null);
-            break :blk removed;
-        };
-        if (!departed) return;
-        self.tasks.spawn(self.io, coverTask, .{self}) catch self.coverDeparted(self.io);
-    }
-
-    fn coverTask(self: *DataPlane) Io.Cancelable!void {
-        self.coverDeparted(self.io);
-    }
-
-    /// ONE cover round (`staging.Segment.cover`): the departed ring copies
-    /// whose publish the meta barrier made durable are released. A failed
-    /// round is counted; the copies stay held for the next.
-    fn coverDeparted(self: *DataPlane, io: Io) void {
-        const st = &(self.stage orelse return);
-        st.seg.cover(io) catch {
-            stats.promotion_cover_rounds_failed.inc();
-        };
-    }
-
-    fn coverRun(ctx: ?*anyopaque, _: Io) staging.DurableError!void {
-        const self: *DataPlane = @ptrCast(@alignCast(ctx.?));
-        self.backend.fsync() catch return error.InputOutput;
+        if (generation) |g| {
+            _ = staging.releaseStaged(&st.pool, &st.seg, key_, g);
+        } else if (st.seg.remove(key_, null)) {
+            _ = st.pool.credit(key_.file_id, null);
+        }
     }
 
     /// This client's ring image (the RMW source of a re-stage); the lease
@@ -2122,7 +1934,6 @@ pub const DataPlane = struct {
         // The departed record's cover round, after the locks (the meta
         // barrier is a park); the dismount pass runs ONE round for all of
         // its residents (`dismount`).
-        if (pass == .live and verdict != .kept) self.coverDeparted(io);
         return verdict;
     }
 
@@ -4399,15 +4210,6 @@ test "the staged point cache (the read view's validation law over one line): a f
     try testing.expectEqual(s + 1, e.w[0].load(.acquire));
     e.w[0].store(s + 2, .release);
     try testing.expectEqual(@as(u64, 16384), c.lookup(7, 3, 1).?.size);
-}
-
-test "stagingCapacity law: clamp(free/4, 64 MiB, budget/8) on the record grain" {
-    const budget_bytes: u64 = 16 * derive.GiB;
-    try testing.expectEqual(STAGING_FLOOR, DataPlane.stagingCapacityFor(1 << 20, budget_bytes));
-    try testing.expectEqual(@as(u64, 2 * derive.GiB), DataPlane.stagingCapacityFor(1 << 40, budget_bytes));
-    try testing.expectEqual(@as(u64, 1 << 30), DataPlane.stagingCapacityFor(4 * derive.GiB, budget_bytes));
-    // A budget below 8 × the floor keeps the floor (never a non-ring).
-    try testing.expectEqual(STAGING_FLOOR, DataPlane.stagingCapacityFor(1 << 40, 100 * derive.MiB));
 }
 
 test "foldInserts: the inserts fold ascending whatever order the epoch fed them; a replaced binding is displaced, a same-reference re-publish is not" {

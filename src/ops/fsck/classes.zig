@@ -85,7 +85,7 @@ pub const IntentRegistry = struct {
     isOpen: *const fn (?*anyopaque, global_ino: u64) bool,
 };
 
-/// The staging dir (C4/C5) over the v4 segment + marker.
+/// The write cache's residents (C4) over the plane's segment.
 pub const StagingFace = struct {
     ctx: *anyopaque,
     vtable: *const VTable,
@@ -93,14 +93,10 @@ pub const StagingFace = struct {
     pub const VTable = struct {
         /// Every resident custody record (owned by `gpa`).
         residents: *const fn (*anyopaque, Allocator) Error![]staging.Resident,
-        /// The marker's bind verdict against this set; null = rebindable.
-        marker: *const fn (*anyopaque) ?finding.StagingVerdict,
         /// The verbatim record image for the quarantine copy (owned), null = gone.
         image: *const fn (*anyopaque, Allocator, staging.StagingKey) Error!?[]u8,
         /// Retire a record at its generation; false = already gone.
         remove: *const fn (*anyopaque, staging.StagingKey, generation: u64) bool,
-        /// Move the whole dir aside after its copy (C5's repair).
-        quarantineDir: *const fn (*anyopaque, *Quarantine) Error!void,
     };
 };
 
@@ -546,7 +542,7 @@ pub const Pass = struct {
         self.counters.c1_ms = msBetween(t0, t1);
         defer self.counters.classes_ms = msBetween(t1, clock.monotonicNs());
         try self.c2c3c6();
-        try self.c4c5();
+        try self.c4();
         try self.c8();
         try self.c11();
         try self.c12();
@@ -644,12 +640,11 @@ pub const Pass = struct {
         if (!recordSatisfiesSchema(kind, kv.key, kv.value, host.geo)) try self.suspect(.{ .c1_semantic = .{ .vol = host.meta_vol, .slot = slot, .key = kb } });
     }
 
-    // ---- C4 / C5: the staging dir ----
+    // ---- C4: the write cache's residents ----
 
     /// C4: a live custody record whose ino has no live record (`NotFound`
-    /// or `nlink == 0`); sharded by the custody's ino. C5: the marker's
-    /// bind verdict against this set.
-    fn c4c5(self: *Pass) Error!void {
+    /// or `nlink == 0`); sharded by the custody's ino.
+    fn c4(self: *Pass) Error!void {
         const face = self.host.staging orelse return;
         const gpa = self.gpa;
         const residents = try face.vtable.residents(face.ctx, gpa);
@@ -670,7 +665,6 @@ pub const Pass = struct {
             const v = self.host.readInode(gpa, ino) catch continue; // an infrastructure error is never a finding
             if (v == null or v.?.nlink == 0) try self.suspect(.{ .c4_orphan = .{ .file_id = r.key.file_id, .ino = ino } });
         }
-        if (face.vtable.marker(face.ctx)) |verdict| try self.suspect(.{ .c5_staging = .{ .verdict = verdict } });
     }
 
     // ---- C2 / C3 / C6: the allocator vs the census ----
@@ -1428,10 +1422,6 @@ pub const Pass = struct {
                 gpa.free(img);
                 const v = try host.readInode(gpa, f.ino);
                 return v == null or v.?.nlink == 0;
-            },
-            .c5_staging => {
-                const face = host.staging orelse return false;
-                return face.vtable.marker(face.ctx) != null;
             },
             .c6_drift => |f| {
                 const v = host.volume(f.vol_tag) orelse return false;

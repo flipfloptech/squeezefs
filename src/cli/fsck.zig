@@ -4,8 +4,9 @@
 //! withSet`: the flock + the claim — a live mount refuses by name), the
 //! plane bound, the engine run, the report printed, exit 1 iff findings
 //! (also a dry-run `--repair` with findings), `--repair --apply` under
-//! that same D0-guarded open with the quarantine dir on the first cache
-//! path (or `--quarantine-dir`). ONLINE (a mountpoint): the engine is
+//! that same D0-guarded open with the quarantine dir at
+//! `/var/lib/squeezefs/quarantine/<set uuid>` (or `--quarantine-dir`).
+//! ONLINE (a mountpoint): the engine is
 //! `runner.linux.JobBody`, the fabric's `JobType.fsck` body the serving
 //! daemon registered over its live binding; the CLI SUBMITS through the
 //! daemon's admin lane (`admin_lane.zig`), waits for the job's terminal
@@ -22,8 +23,14 @@ const cli = @import("cli.zig");
 const args = @import("args.zig");
 const fsck = @import("../ops/fsck.zig");
 const finding = fsck.finding;
+const set_config = @import("../data/set_config.zig");
 
 const is_linux = builtin.os.tag == .linux;
+
+/// Where `--repair --apply` quarantines without `--quarantine-dir`: the
+/// host's state directory, one subdirectory per set (0700, created by the
+/// sink with its parents).
+pub const default_quarantine_root = "/var/lib/squeezefs/quarantine";
 
 /// `fsck merge-reports [--json] FILE…`.
 pub fn runMerge(p: cli.Process, m: args.FsckMerge) u8 {
@@ -95,7 +102,6 @@ const linux_arm = if (is_linux) struct {
             inject(p.env, set) catch |e| return self.failed("the injection seam failed ({s})", .{@errorName(e)});
             const facts = derive.facts();
             const budget_bytes = mem_budget.authority.resolveBudgetNow(.{ .io = set.io, .env = p.env, .facts = facts });
-            const cache_root: ?[]const u8 = if (set.cfg.cache_paths.len != 0) set.cfg.cache_paths[0] else null;
             const bound = runner.linux.bind(gpa, set.io, set.be, set.plane, .{
                 .env = p.env,
                 .mode = .offline,
@@ -103,17 +109,19 @@ const linux_arm = if (is_linux) struct {
                 .shard = if (a.shards) |s| .{ .k = s.k, .n = s.n } else null,
             }) catch |e| return self.failed("cannot bind the set ({s})", .{@errorName(e)});
             defer runner.linux.destroy(bound);
-            // The quarantine home: `--quarantine-dir`, else `<first cache
-            // path>/quarantine` — REQUIRED on a cache-less set when an
-            // action quarantines.
+            // The quarantine home: `--quarantine-dir`, else the host's
+            // `/var/lib/squeezefs/quarantine/<set uuid>` (an operator
+            // artefact, 0700; the cache dir that once held it is gone).
             var sink: ?runner.linux.DirSink = null;
             defer if (sink) |*s| s.deinit();
             var ropts: ?fsck.classes.Quarantine.Sink = null;
             if (a.repair and a.apply) {
                 var home_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
                 const home: []const u8 = a.quarantine_dir orelse blk: {
-                    const root = cache_root orelse return self.failed("--apply needs a quarantine home: the set has no cache path — pass --quarantine-dir DIR", .{});
-                    break :blk std.fmt.bufPrint(&home_buf, "{s}/quarantine", .{root}) catch return self.failed("the quarantine path is too long", .{});
+                    var w: std.Io.Writer = .fixed(&home_buf);
+                    w.writeAll(default_quarantine_root ++ "/") catch return self.failed("the quarantine path is too long", .{});
+                    set_config.writeUuid(&w, set.cfg.set_uuid) catch return self.failed("the quarantine path is too long", .{});
+                    break :blk w.buffered();
                 };
                 sink = runner.linux.DirSink.init(gpa, set.be.pool, home) catch return self.failed("out of memory", .{});
                 ropts = sink.?.sink();

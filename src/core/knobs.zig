@@ -96,6 +96,7 @@ pub const MIB_MAX: i128 = BYTES_MAX >> 20;
 pub const registry = [_]Knob{
     // ---- R5 memory budget ----
     .{ .key = "SQUEEZEFS_MEM_BUDGET_MB", .kind = .{ .int = .{ .lo = 1, .hi = MIB_MAX } }, .default = "derived", .class = .derived_override, .doc = "R5 memory budget, MiB (absolute > cgroup memory.max × 0.8 > 70 % RAM)." },
+    .{ .key = "SQUEEZEFS_WRITE_CACHE_PCT", .kind = .{ .int = .{ .lo = 0, .hi = 100 } }, .default = "25", .class = .derived_override, .doc = "The WRITE cache — the staging ring every mount holds in RAM (a kernel-held sealed memfd; charter §6.1 'Staged') — as a percentage of SYSTEM RAM: the cgroup cage when one binds, else the machine's RAM, divided by the fleet share like every system root, and never above the R5 budget it lives under (owner ruling 2026-10-21: 25 % write + 25 % read = Lustre's max_cached_mb posture). 0 = no write cache: a small write goes straight to the data volumes (inline, a packed slot or its own block)." },
     .{ .key = "SQUEEZEFS_TRANSPORT_MEM_MAX", .kind = .{ .int = .{ .lo = 1, .hi = MIB_MAX } }, .default = "derived", .class = .derived_override, .doc = "Transport payload-buffer cap, MiB (absolute > pct > derived budget/8)." },
     .{ .key = "SQUEEZEFS_TRANSPORT_MEM_PCT", .kind = .{ .int = .{ .lo = 1, .hi = 100 } }, .default = "derived", .class = .derived_override, .doc = "Transport payload-buffer cap as a percentage of the R5 budget." },
 

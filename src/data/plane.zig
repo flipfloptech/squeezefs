@@ -374,6 +374,10 @@ pub const Options = struct {
     env: *const std.process.Environ.Map,
     facts: derive.Facts,
     budget_bytes: u64,
+    /// The write cache's bytes (`mem_budget.writeCacheBytesFrom`: the
+    /// staging ring's RAM capacity); 0 = no write cache — a verb's plane,
+    /// or the operator's `SQUEEZEFS_WRITE_CACHE_PCT=0`.
+    write_cache_bytes: u64 = 0,
     /// The volume key (an encrypted set); zeroized by the caller after.
     derived_key: ?transform.DerivedKey,
     /// An open rotation window's NEXT key (`set_config.next_key`): new

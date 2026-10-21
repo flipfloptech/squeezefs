@@ -185,6 +185,9 @@ const Ctx = struct {
     sqz: *SqzIo,
     facts: derive.Facts,
     budget_bytes: u64,
+    /// The write cache (the staging ring in RAM): `SQUEEZEFS_WRITE_CACHE_PCT`
+    /// of the system root under the budget; 0 = none.
+    write_cache_bytes: u64,
     budget_host: mem_budget.Host,
     /// The member paths as spelled (canonical order is discovery's).
     paths: []const []const u8,
@@ -370,6 +373,7 @@ pub fn run(p: cli.Process, m: args.Mount) u8 {
     const facts = derive.facts();
     const host: mem_budget.Host = .{ .io = p.io, .env = p.env, .facts = facts };
     const budget_bytes = mem_budget.authority.resolveBudgetNow(host);
+    const write_cache_bytes = mem_budget.authority.resolveWriteCacheNow(host, budget_bytes);
     const sqz = SqzIo.init(p.gpa, .{
         .env = p.env,
         .facts = facts,
@@ -390,6 +394,7 @@ pub fn run(p: cli.Process, m: args.Mount) u8 {
         .sqz = sqz,
         .facts = facts,
         .budget_bytes = budget_bytes,
+        .write_cache_bytes = write_cache_bytes,
         .budget_host = host,
         .paths = meta.paths,
         .meta_uri = m.meta_uri,
@@ -464,7 +469,7 @@ fn mountMain(ctx: *Ctx) u8 {
     defer guards.deinit();
     var opens = open_table.OpenTable.init(gpa, open_table.derivedCapacity(facts.possible_cpus, fuse_geometry.Q_DEPTH_DESIRED)) catch return ctx.failed("out of memory (open table)", .{});
     defer opens.deinit();
-    const plane = plane_mod.DataPlane.open(gpa, io, ctx.sqz, be, &cfg, .{ .env = env, .facts = facts, .budget_bytes = ctx.budget_bytes, .derived_key = ctx.derived_key, .derived_next = ctx.derived_next, .guards = &guards }) catch |e| return ctx.failed("the data plane could not open ({s}) — see the log", .{@errorName(e)});
+    const plane = plane_mod.DataPlane.open(gpa, io, ctx.sqz, be, &cfg, .{ .env = env, .facts = facts, .budget_bytes = ctx.budget_bytes, .write_cache_bytes = ctx.write_cache_bytes, .derived_key = ctx.derived_key, .derived_next = ctx.derived_next, .guards = &guards }) catch |e| return ctx.failed("the data plane could not open ({s}) — see the log", .{@errorName(e)});
     if (ctx.derived_key) |*k| k.zeroize();
     if (ctx.derived_next) |*k| k.zeroize();
     var plane_open = true;

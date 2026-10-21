@@ -3,7 +3,7 @@
 Owner's rulings (2026-10-21): two caches in percent of SYSTEM RAM (`SQUEEZEFS_READ_CACHE_PCT`,
 `SQUEEZEFS_WRITE_CACHE_PCT`, each default 25 — Lustre's `max_cached_mb` posture) under the memory budget;
 the read cache evicts on **plain LRU**; ONE cache model, used forward for reading and reversed for writing.
-Charter §6.3, decision 0003 §BE. Venue: the workstation (`7.2.8-9.33-omarchy-sqz`), the RAM NVMe set, the
+Charter §6.3, decision 0003 §BF. Venue: the workstation (`7.2.8-9.33-omarchy-sqz`), the RAM NVMe set, the
 venue held alone per session on a daemon-free box, Tctl ≤ 70 °C per row, 20 s rows (`results.tsv` rows
 `rc-*`). A = dev `12768c8`, B = this branch.
 
@@ -76,4 +76,4 @@ re-reads until the hit lands, and is not judged under budget Red).
 
 **Owed**: the leg that lands in the cache's own memfd slab and replies by `READ_FIXED` (no lane hop cold,
 zero-pass warm — the FUSE zero-copy row's path to warm); a lock-free tokened-inode predicate so a holder's
-W1 recalls readers at once (§BE.8); one order over the hot tier's slots and the grains (§BE.9).
+W1 recalls readers at once (§BF.8); one order over the hot tier's slots and the grains (§BF.9).

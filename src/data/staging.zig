@@ -538,9 +538,28 @@ pub const Backing = struct {
     /// grain (a cleanly unmounted 546 MiB ring is all holes and sat fully
     /// resident at every mount before this). Null = scan every grain.
     nextData: ?*const fn (ctx: ?*anyopaque, off: u64) ?u64 = null,
+    /// The image is RAM alone (the write cache's memfd): nothing it holds
+    /// can be made durable where it lies, so the fsync law PROMOTES the
+    /// record (`fsyncLaw`), and a record recovered off it was never
+    /// promised durable (`recover` adopts it unsynced — the in-place arm
+    /// stays open to it, no supersession hold is owed).
+    ram: bool = false,
 
     pub const none: Backing = .{};
 };
+
+/// What an fsync of a resident record owes (charter §6.1 "Staged", owner
+/// ruling 2026-10-21): on the RAM write cache the record is PROMOTED to the
+/// data volumes before the ack; on a file-backed ring its span is synced
+/// in place; a RAM image with no binding at all (the portable tests) owes
+/// nothing.
+pub const FsyncLaw = enum { promote, sync, none };
+
+pub fn fsyncLaw(b: Backing) FsyncLaw {
+    if (b.ram) return .promote;
+    if (b.durable != null) return .sync;
+    return .none;
+}
 
 /// The departure law's round (module doc): every layout publish committed
 /// before the call is durable on return — the meta barrier (the plane binds
@@ -678,8 +697,13 @@ pub const Segment = struct {
     index: std.AutoHashMapUnmanaged([KEY_LEN]u8, *Cell) = .empty,
     /// The placement cursor: records go at/after it, wrapping.
     write_offset: u64 = 0,
-    cells: []Cell,
-    free_cells: std.ArrayList(u32) = .empty,
+    /// The cells, in chunks of `CELL_CHUNK` allocated as the population
+    /// grows (a chunk never moves: the index and the leases hold cell
+    /// pointers); `maxCells(capacity)` is the bound, never the allocation —
+    /// a write cache of a quarter of RAM would pin a gigabyte of empty
+    /// cells at mount.
+    cells: std.ArrayList([]Cell) = .empty,
+    free_cells: std.ArrayList(*Cell) = .empty,
     /// The live set at the grain: bit `g` set = grain `g` belongs to an
     /// indexed record, a placement in flight or a retired copy not yet
     /// reclaimed (a shadowed cell shares its successor's grains). Placement
@@ -737,6 +761,11 @@ pub const Segment = struct {
     /// (state + fingerprint) beside the key and the cell pointer.
     const INDEX_SLOT_BYTES: u64 = 1 + KEY_LEN + @sizeOf(*Cell);
 
+    /// Cells per chunk: 480 KiB of cells, one allocation per 4,096 live
+    /// records — a growth step a put pays once in four thousand, under the
+    /// lock (the index doubles on its own law beside it).
+    pub const CELL_CHUNK: usize = 4096;
+
     /// The key index's slot count for `n` entries — the std hash map's own
     /// law (`capacityForSize`): `n / load + 1` rounded up to a power of two
     /// at its default load (`std.hash_map.default_max_load_percentage`).
@@ -752,19 +781,22 @@ pub const Segment = struct {
         return @intCast((cap / RECORD_ALIGN + WORD_BITS - 1) / WORD_BITS);
     }
 
-    /// The RAM the fixed per-cell tables take at `cap`: `n = maxCells(cap)`
-    /// cells, `n` free-list slots, the two grain bitmaps and the key index's slot
-    /// arrays (its 3-word header is not counted). Every table is sized ONCE
-    /// at `init` and lives with the segment.
+    /// The MOST RAM the per-cell tables can take at `cap`: `n = maxCells(cap)`
+    /// cells, `n` free-list slots, the two grain bitmaps and the key index's
+    /// slot arrays (its 3-word header is not counted) — the ceiling a full
+    /// ring of one-grain records reaches; the tables grow toward it a chunk
+    /// at a time (`tablesBytes` is the live figure).
     pub fn tablesBound(cap: u64) u64 {
         const n: u64 = maxCells(cap);
-        return n * @sizeOf(Cell) + n * @sizeOf(u32) + 2 * @as(u64, occupiedWords(cap)) * @sizeOf(u64) + indexSlots(@intCast(n)) * INDEX_SLOT_BYTES;
+        return n * @sizeOf(Cell) + n * @sizeOf(*Cell) + 2 * @as(u64, occupiedWords(cap)) * @sizeOf(u64) + indexSlots(@intCast(n)) * INDEX_SLOT_BYTES;
     }
 
-    /// What this segment's tables take — the same terms read off the live
-    /// tables (`tablesBound(capacity)` by construction; the tie test says so).
+    /// What this segment's tables take now — the chunks allocated, the free
+    /// list's capacity, the two bitmaps and the index's capacity.
     pub fn tablesBytes(self: *const Segment) u64 {
-        return @as(u64, self.cells.len) * @sizeOf(Cell) + @as(u64, self.free_cells.capacity) * @sizeOf(u32) + @as(u64, self.occupied.len + self.dirty.len) * @sizeOf(u64) + @as(u64, self.index.capacity()) * INDEX_SLOT_BYTES;
+        var cells: u64 = 0;
+        for (self.cells.items) |chunk| cells += chunk.len;
+        return cells * @sizeOf(Cell) + @as(u64, self.free_cells.capacity) * @sizeOf(*Cell) + @as(u64, self.occupied.len + self.dirty.len) * @sizeOf(u64) + @as(u64, self.index.capacity()) * INDEX_SLOT_BYTES;
     }
 
     /// A cell's value-hash state, gauged at birth; `destroyState` undoes it.
@@ -781,25 +813,40 @@ pub const Segment = struct {
 
     pub fn init(gpa: Allocator, image: []u8, backing: Backing) Allocator.Error!Segment {
         assert(derive.isAligned(image.len, RECORD_ALIGN));
-        const n = maxCells(image.len);
-        const cells = try gpa.alloc(Cell, n);
-        errdefer gpa.free(cells);
-        @memset(cells, .{});
-        var free = try std.ArrayList(u32).initCapacity(gpa, n);
-        errdefer free.deinit(gpa);
-        var i: u32 = @intCast(n);
-        while (i > 0) : (i -= 1) free.appendAssumeCapacity(i - 1);
         const occupied = try gpa.alloc(u64, occupiedWords(image.len));
         errdefer gpa.free(occupied);
         @memset(occupied, 0);
         const dirty = try gpa.alloc(u64, occupiedWords(image.len));
         errdefer gpa.free(dirty);
         @memset(dirty, 0);
-        var self: Segment = .{ .gpa = gpa, .image = image, .backing = backing, .cells = cells, .free_cells = free, .occupied = occupied, .dirty = dirty };
+        var self: Segment = .{ .gpa = gpa, .image = image, .backing = backing, .occupied = occupied, .dirty = dirty };
         errdefer self.index.deinit(gpa);
-        try self.index.ensureTotalCapacity(gpa, @intCast(n));
+        errdefer self.free_cells.deinit(gpa);
+        errdefer {
+            for (self.cells.items) |chunk| gpa.free(chunk);
+            self.cells.deinit(gpa);
+        }
+        try self.growCellsLocked();
+        try self.index.ensureTotalCapacity(gpa, @intCast(@min(CELL_CHUNK, maxCells(image.len))));
         stats.staging_tables_bytes.add(self.tablesBytes());
         return self;
+    }
+
+    /// One more chunk of cells onto the free list (under the lock; never
+    /// past `maxCells`, which a hole for a record guarantees).
+    fn growCellsLocked(self: *Segment) Allocator.Error!void {
+        const before = self.tablesBytes();
+        const want: usize = @min(CELL_CHUNK, maxCells(self.image.len) - self.cells.items.len * CELL_CHUNK);
+        assert(want != 0);
+        try self.cells.ensureUnusedCapacity(self.gpa, 1);
+        // Precise: the free list holds every cell at once, no more.
+        try self.free_cells.ensureTotalCapacityPrecise(self.gpa, self.cells.items.len * CELL_CHUNK + want);
+        const chunk = try self.gpa.alloc(Cell, want);
+        @memset(chunk, .{});
+        self.cells.appendAssumeCapacity(chunk);
+        var i: usize = want;
+        while (i > 0) : (i -= 1) self.free_cells.appendAssumeCapacity(&chunk[i - 1]);
+        if (self.cells.items.len > 1) stats.staging_tables_bytes.add(self.tablesBytes() - before);
     }
 
     pub fn deinit(self: *Segment) void {
@@ -823,10 +870,13 @@ pub const Segment = struct {
                 },
             }
         }
-        for (self.cells) |*c| if (c.hash) |h| self.destroyState(h);
+        for (self.cells.items) |chunk| {
+            for (chunk) |*c| if (c.hash) |h| self.destroyState(h);
+            self.gpa.free(chunk);
+        }
+        self.cells.deinit(self.gpa);
         self.index.deinit(self.gpa);
         self.free_cells.deinit(self.gpa);
-        self.gpa.free(self.cells);
         self.gpa.free(self.occupied);
         stats.staging_dirty_free_bytes.sub(self.dirtyFreeBytesLocked());
         self.gpa.free(self.dirty);
@@ -1042,14 +1092,18 @@ pub const Segment = struct {
             stats.staged_writes_in_flight.sub(1);
         }
         const state = try self.createState();
+        errdefer self.destroyState(state);
         state.* = valueHash(value);
         writeRecord(self.image, placed.rec_off, key.bytes(), value, generation, fencing, state);
         if (self.backing.sync) |s| s(self.backing.ctx, placed.rec_off, stride(KEY_LEN, value.len));
         self.lock.lock();
         defer self.lock.unlock();
-        const cell = self.allocCellLocked();
+        const cell = try self.allocCellLocked();
+        const gop = self.index.getOrPut(self.gpa, key.bytes().*) catch |e| {
+            self.free_cells.appendAssumeCapacity(cell);
+            return e;
+        };
         cell.* = .{ .refs = .init(1), .extent = placed, .key = key.bytes().*, .hash = state, .indexed_seq = self.indexed_seq.fetchAdd(1, .release) };
-        const gop = self.index.getOrPutAssumeCapacity(key.bytes().*);
         if (gop.found_existing) {
             const old = gop.value_ptr.*;
             gop.value_ptr.* = cell;
@@ -1122,7 +1176,11 @@ pub const Segment = struct {
             if (old.refs.fetchSub(1, .acq_rel) == 1) self.reclaimCellLocked(old);
             return error.Stale;
         }
-        const cell = self.allocCellLocked();
+        const cell = self.allocCellLocked() catch |e| {
+            self.destroyState(state);
+            if (old.refs.fetchSub(1, .acq_rel) == 1) self.reclaimCellLocked(old);
+            return e;
+        };
         var ne = ext;
         ne.val_len = @intCast(new_len);
         ne.generation = generation;
@@ -1131,7 +1189,7 @@ pub const Segment = struct {
         // synced as the copy it grew (its tail is not, but the old header's
         // slot still names the synced image whole).
         cell.* = .{ .refs = .init(1), .extent = ne, .key = key.bytes().*, .hash = state, .indexed_seq = self.indexed_seq.fetchAdd(1, .release), .synced = old.synced };
-        self.index.putAssumeCapacity(key.bytes().*, cell);
+        self.index.putAssumeCapacity(key.bytes().*, cell); // the key is present: a replace never grows the map
         old.shadowed = true;
         old.retired.store(true, .release);
         self.linkRetiredLocked(old);
@@ -1439,15 +1497,15 @@ pub const Segment = struct {
         }
         if (cell.hash) |h| self.destroyState(h);
         cell.* = .{};
-        const idx: usize = (@intFromPtr(cell) - @intFromPtr(self.cells.ptr)) / @sizeOf(Cell);
-        self.free_cells.appendAssumeCapacity(@intCast(idx));
+        self.free_cells.appendAssumeCapacity(cell);
     }
 
-    fn allocCellLocked(self: *Segment) *Cell {
-        // Bounded by construction (`maxCells`): a hole for a record exists
-        // only while a cell for it does.
-        const idx = self.free_cells.pop().?;
-        return &self.cells[idx];
+    /// A free cell, the next chunk allocated when the list is empty
+    /// (bounded by construction: a hole for a record exists only while a
+    /// cell for it can).
+    fn allocCellLocked(self: *Segment) Allocator.Error!*Cell {
+        if (self.free_cells.items.len == 0) try self.growCellsLocked();
+        return self.free_cells.pop().?;
     }
 
     /// Take or return the grains of `[off, off + len)` in the live set.
@@ -1623,6 +1681,9 @@ pub const Segment = struct {
         torn: u64 = 0,
         superseded: u64 = 0,
         bytes: u64 = 0,
+        /// The scan stopped short: no RAM for another cell (the records
+        /// past the stop stay on the segment unadopted — loud).
+        out_of_memory: bool = false,
     };
 
     /// §3.6: a linear header scan at the grain over an EMPTY index. A valid,
@@ -1632,7 +1693,9 @@ pub const Segment = struct {
     /// grain; a tombstone or a zero grain steps one grain; a HOLE is
     /// skipped whole (`Backing.nextData`). Same-key copies: the higher
     /// generation wins (a crash between the replace's phases left both),
-    /// equal ⇒ the later offset. `write_offset` = the max end.
+    /// equal ⇒ the later offset. `write_offset` = the max end. A record off a
+    /// FILE was synced by the host's writeback (its supersession is held);
+    /// off the RAM write cache it was never promised durable.
     pub fn recover(self: *Segment) RecoverReport {
         self.lock.lock();
         defer self.lock.unlock();
@@ -1666,13 +1729,19 @@ pub const Segment = struct {
             }
             const e: Extent = .{ .rec_off = off, .key_len = h.key_len, .val_len = h.val_len, .generation = h.generation, .reserved = stride(h.key_len, h.val_len), .slot = cur.slot };
             const k: [KEY_LEN]u8 = self.image[@intCast(off + RECORD_HEADER_LEN)..][0..KEY_LEN].*;
-            const gop = self.index.getOrPutAssumeCapacity(k);
+            const gop = self.index.getOrPut(self.gpa, k) catch {
+                rep.out_of_memory = true;
+                break;
+            };
             if (gop.found_existing) {
                 const old = gop.value_ptr.*;
                 // Later offset wins a tie: the scan is ascending.
                 if (h.generation >= old.extent.generation) {
-                    gop.value_ptr.* = self.allocCellLocked();
-                    gop.value_ptr.*.* = .{ .refs = .init(1), .extent = e, .key = k, .synced = true };
+                    gop.value_ptr.* = self.allocCellLocked() catch {
+                        rep.out_of_memory = true;
+                        break;
+                    };
+                    gop.value_ptr.*.* = .{ .refs = .init(1), .extent = e, .key = k, .synced = !self.backing.ram };
                     self.markLocked(e.rec_off, e.reserved, true);
                     self.retireLocked(old, true);
                 } else {
@@ -1681,8 +1750,12 @@ pub const Segment = struct {
                 }
                 rep.superseded += 1;
             } else {
-                gop.value_ptr.* = self.allocCellLocked();
-                gop.value_ptr.*.* = .{ .refs = .init(1), .extent = e, .key = k, .synced = true };
+                gop.value_ptr.* = self.allocCellLocked() catch {
+                    _ = self.index.remove(k);
+                    rep.out_of_memory = true;
+                    break;
+                };
+                gop.value_ptr.*.* = .{ .refs = .init(1), .extent = e, .key = k, .synced = !self.backing.ram };
                 self.markLocked(e.rec_off, e.reserved, true);
                 rep.adopted += 1;
                 rep.bytes += stride(h.key_len, h.val_len);
@@ -1694,6 +1767,7 @@ pub const Segment = struct {
         stats.staging_recovery_records.add(rep.adopted);
         stats.staging_recovery_torn_records.add(rep.torn);
         if (rep.torn != 0) log.warn("staging recovery: dropped {d} torn record(s) (bad header or checksum) in a {d} B segment; adopted {d}", .{ rep.torn, self.image.len, rep.adopted });
+        if (rep.out_of_memory) log.err("staging recovery: out of memory after {d} record(s) — the rest of the {d} B segment stays unadopted until a mount with more RAM", .{ rep.adopted, self.image.len });
         return rep;
     }
 
@@ -1715,6 +1789,20 @@ pub const Segment = struct {
         }
         assert(n == out.len);
         return out;
+    }
+
+    /// The highest generation any resident carries (the pool's seed after a
+    /// recovery: a fresh generation must beat every one still on the
+    /// segment, or a superseded copy a cut left would win the next scan).
+    pub fn maxGeneration(self: *Segment) u64 {
+        self.lock.lock();
+        defer self.lock.unlock();
+        var g: u64 = 0;
+        var it = self.index.valueIterator();
+        while (it.next()) |c| g = @max(g, c.*.extent.generation);
+        var cur = self.retired_head;
+        while (cur) |c| : (cur = c.next_retired) g = @max(g, c.extent.generation);
+        return g;
     }
 
     /// Extent order by offset (the tests' no-overlap law).
@@ -2058,16 +2146,31 @@ pub const Pool = struct {
         return budget.Component.init("staging_mmap", 0, 1, .{ .gauge = &stats.current_staged_write_bytes }, .{ .ctx = self, .call = shedToTarget }).kernelReclaimable();
     }
 
+    /// The write cache's R5 component: the residents' bytes in the memfd
+    /// — PINNED (shmem pages are swap-only; the kernel reclaims nothing of
+    /// them), sheddable through the pressure promotion, weight = its share
+    /// of the Red shed; `max_write_bytes` is its bound.
+    pub fn writeCacheComponent(self: *Pool) budget.Component {
+        return budget.Component.init("write_cache", 0, 1, .{ .gauge = &stats.current_staged_write_bytes }, .{ .ctx = self, .call = shedToTarget });
+    }
+
     fn shedToTarget(ctx: *anyopaque, _: u64) void {
         const self: *Pool = @ptrCast(@alignCast(ctx));
         if (self.hooks.pressure) |p| p(self.hooks.ctx, StagingKey.init(layout.zero_file_id, 0));
     }
 
-    /// Seed the ledger from a recovered segment at generation 0.
+    /// Seed the ledger from a recovered segment at generation 0, and the
+    /// generation counter PAST every generation the segment still carries:
+    /// a re-stage of a recovered record must out-rank it on the next scan
+    /// (a cut between the re-stage's fsync and the old copy's release left
+    /// both; the scan takes the higher generation — a counter restarting at
+    /// 1 handed the OLD bytes back).
     pub fn seedFromRecovery(self: *Pool, seg: *Segment) Allocator.Error!void {
         const out = try seg.residentsAlloc(self.gpa);
         defer self.gpa.free(out);
         for (out) |r| try self.charge(r.key.file_id, r.cost, RECOVERED_GENERATION);
+        const floor = seg.maxGeneration() + 1;
+        if (floor > self.next_generation.load(.monotonic)) self.next_generation.store(floor, .monotonic);
     }
 };
 
@@ -2216,24 +2319,45 @@ pub const FsyncLever = struct {
     }
 };
 
-/// The fsync point: iff the lever is on, promote BEFORE the data barrier
-/// (so the barrier covers the block). A failure never fails the fsync: the
-/// entry stays resident and the ranged sync that follows makes it durable.
-pub fn promoteAtFsync(lever: FsyncLever, hooks: PromotionHooks, key: StagingKey) void {
-    if (!lever.on) return;
-    const promote = hooks.promote orelse return;
-    if (promote(hooks.ctx, key)) stats.fsync_promoted_files.inc();
+/// What the fsync point's promotion found.
+pub const FsyncPromote = enum {
+    /// The resident left the ring for its durable home.
+    promoted,
+    /// Nothing resident under the key (promoted already, never staged
+    /// here): nothing owed.
+    absent,
+    /// Resident and NOT promoted (a resource decline, a commit failure):
+    /// on the RAM write cache the fsync cannot be acked — EIO.
+    kept,
+};
+
+/// The fsync point: promote BEFORE the data barrier (so the barrier covers
+/// the block) when the ring's law says so (`FsyncLaw.promote`: the RAM
+/// write cache) or the lever asks it of a file-backed ring. On a file ring
+/// a failure never fails the fsync — the ranged sync that follows makes the
+/// record durable; on the RAM ring the caller answers `kept` with EIO.
+pub fn promoteAtFsync(law: FsyncLaw, lever: FsyncLever, seg: *Segment, hooks: PromotionHooks, key: StagingKey) FsyncPromote {
+    if (law != .promote and !lever.on) return .absent;
+    if (seg.residentGeneration(key) == null) return .absent;
+    const promote = hooks.promote orelse return .kept;
+    if (promote(hooks.ctx, key)) {
+        stats.fsync_promoted_files.inc();
+        return .promoted;
+    }
+    // Gone meanwhile (a pressure promotion raced): nothing owed.
+    return if (seg.residentGeneration(key) != null) .kept else .absent;
 }
 
-/// The syncfs point: `promoteAtFsync` for EVERY resident entry (the lever
-/// gates it the same way; a failure leaves the entry resident for the
-/// whole-ring sync that follows).
-pub fn promoteAllAtSyncfs(gpa: Allocator, lever: FsyncLever, seg: *Segment, hooks: PromotionHooks) Allocator.Error!void {
-    if (!lever.on) return;
-    if (hooks.promote == null) return;
+/// The syncfs point: `promoteAtFsync` for EVERY resident entry; answers
+/// how many stayed resident (the RAM write cache's syncfs answers EIO for
+/// any; a file ring's whole-ring sync covers them).
+pub fn promoteAllAtSyncfs(gpa: Allocator, law: FsyncLaw, lever: FsyncLever, seg: *Segment, hooks: PromotionHooks) Allocator.Error!u64 {
+    if (law != .promote and !lever.on) return 0;
     const out = try seg.residentsAlloc(gpa);
     defer gpa.free(out);
-    for (out) |r| promoteAtFsync(lever, hooks, r.key);
+    var kept: u64 = 0;
+    for (out) |r| kept += @intFromBool(promoteAtFsync(law, lever, seg, hooks, r.key) == .kept);
+    return kept;
 }
 
 // ---------------------------------------------------------------------------
@@ -2547,6 +2671,12 @@ pub const Ring = if (builtin.os.tag == .linux) struct {
     pub const MappedSegment = struct {
         fd: linux.fd_t,
         map: []align(4096) u8,
+        /// `.file`: a segment file under a member root (MS_ASYNC ordering,
+        /// the ranged sync, the grain through the host's write path);
+        /// `.ram`: the write cache's memfd — a grain write is a memcpy into
+        /// the mapping (shmem has no `page_mkwrite`, no inode lock on the
+        /// path), nothing is synced, the fsync law promotes.
+        form: enum { file, ram } = .file,
 
         fn sync(ctx: ?*anyopaque, off: u64, len: u64) void {
             const self: *MappedSegment = @ptrCast(@alignCast(ctx.?));
@@ -2607,7 +2737,10 @@ pub const Ring = if (builtin.os.tag == .linux) struct {
         }
 
         pub fn backing(self: *MappedSegment) Backing {
-            return .{ .ctx = self, .sync = sync, .reclaim = reclaim, .nextData = nextData, .durable = durable, .write = write };
+            return switch (self.form) {
+                .file => .{ .ctx = self, .sync = sync, .reclaim = reclaim, .nextData = nextData, .durable = durable, .write = write },
+                .ram => .{ .ctx = self, .reclaim = reclaim, .nextData = nextData, .ram = true },
+            };
         }
 
         /// The census face of an `inspectSegment` view: hole-skipping
@@ -2930,6 +3063,248 @@ pub const Ring = if (builtin.os.tag == .linux) struct {
         stats.staging_member_residue_roots.set(n);
         return n;
     }
+
+    // ---- the write cache: the ring in a sealed memfd ----
+
+    /// The write cache's ring (charter §6.1 "Staged", owner ruling
+    /// 2026-10-21): the segment in a kernel-held, size-sealed memfd — the
+    /// journal tail's trick — whose first grain is the marker and whose
+    /// rest is the image. The pages outlive the daemon: the mount hands the
+    /// memfd and its CLAIM to the supervisor (`supervisor.TailFrame`), and
+    /// after a `kill -9` the supervisor LISTENS on the claim and hands the
+    /// memfd to the member's next mount, which recovers the residents
+    /// (the kill -9 law for an acked unsynced write; a synced one was
+    /// promoted before its ack). A clean dismount empties the ring and
+    /// says so (`drained`), and the supervisor discards it.
+    ///
+    /// The claim is an ABSTRACT unix socket named by the ring's identity
+    /// and member scope (`\0squeezefs-staging-<identity>-<slot>`): bound
+    /// by the live daemon (never listening — a connect answers
+    /// ECONNREFUSED: `OwnerLive`), kept bound by the supervisor's copy of
+    /// the fd after the death, listening then (a connect reaches the
+    /// handover). No filesystem anywhere, per network namespace, released
+    /// by the kernel with its last holder.
+    pub const Ram = struct {
+        memfd: linux.fd_t,
+        /// The bound claim socket (the live claim; handed to the supervisor).
+        claim: linux.fd_t,
+        mapped: MappedSegment,
+        verdict: BindVerdict,
+        found: ?Marker,
+
+        /// The marker's grain; the image follows.
+        pub const HEADER: u64 = RECORD_ALIGN;
+        pub const MEMFD_NAME = "sqz-write-cache";
+        pub const CLAIM_PREFIX = "squeezefs-staging-";
+        /// The successor's wait for the supervisor's handover frame, and the
+        /// bound retries while the supervisor's socket closes behind it.
+        const HANDOVER_WAIT_MS: i32 = 5_000;
+        const CLAIM_RETRIES: u32 = 200;
+        const CLAIM_RETRY_NS: u64 = 10 * std.time.ns_per_ms;
+
+        pub fn claimName(buf: *[64]u8, identity: u64, slot: u32) []const u8 {
+            return std.fmt.bufPrint(buf, CLAIM_PREFIX ++ "{x:0>16}-{x:0>8}", .{ identity, slot }) catch unreachable;
+        }
+
+        fn claimAddr(ours: Marker, addr: *linux.sockaddr.un) linux.socklen_t {
+            var nbuf: [64]u8 = undefined;
+            const name = claimName(&nbuf, ours.identity(), ours.mount_slot);
+            addr.* = .{ .path = @splat(0) };
+            @memcpy(addr.path[1 .. 1 + name.len], name);
+            return @intCast(@sizeOf(linux.sa_family_t) + 1 + name.len);
+        }
+
+        fn seqpacket() ?linux.fd_t {
+            const rc = linux.socket(linux.AF.UNIX, linux.SOCK.SEQPACKET | linux.SOCK.CLOEXEC, 0);
+            if (linux.errno(rc) != .SUCCESS) return null;
+            return @intCast(rc);
+        }
+
+        /// `bind` the claim; null = held by another (a live daemon or a
+        /// supervisor after a death).
+        fn tryClaim(ours: Marker) BindError!?linux.fd_t {
+            const fd = seqpacket() orelse return error.OpenFailed;
+            var addr: linux.sockaddr.un = undefined;
+            const len = claimAddr(ours, &addr);
+            switch (linux.errno(linux.bind(fd, @ptrCast(&addr), len))) {
+                .SUCCESS => return fd,
+                .ADDRINUSE => {
+                    _ = linux.close(fd);
+                    return null;
+                },
+                else => {
+                    _ = linux.close(fd);
+                    return error.OpenFailed;
+                },
+            }
+        }
+
+        /// The handover: connect to the claim's holder; a holder that does
+        /// not listen is a LIVE daemon (`OwnerLive` — after the retries: a
+        /// supervisor between its daemon's death and its `listen` is caught
+        /// by them); a listening one is the supervisor of a dead one, which
+        /// answers one frame with the memfd.
+        fn receiveFromSupervisor(ours: Marker) BindError!linux.fd_t {
+            const rl = @import("../ipc/rendezvous_linux.zig");
+            const c = seqpacket() orelse return error.OpenFailed;
+            defer _ = linux.close(c);
+            var addr: linux.sockaddr.un = undefined;
+            const len = claimAddr(ours, &addr);
+            var tries: u32 = 0;
+            while (true) : (tries += 1) {
+                switch (linux.errno(linux.connect(c, @ptrCast(&addr), len))) {
+                    .SUCCESS => break,
+                    .CONNREFUSED, .AGAIN => {
+                        if (tries == CLAIM_RETRIES) return error.OwnerLive;
+                        const ts: linux.timespec = .{ .sec = 0, .nsec = @intCast(CLAIM_RETRY_NS) };
+                        _ = linux.nanosleep(&ts, null);
+                    },
+                    else => return error.OpenFailed,
+                }
+            }
+            var pfd = [_]linux.pollfd{.{ .fd = c, .events = linux.POLL.IN, .revents = 0 }};
+            const prc = linux.poll(&pfd, 1, HANDOVER_WAIT_MS);
+            if (linux.errno(prc) != .SUCCESS or prc == 0) return error.OwnerLive;
+            var buf: [16]u8 = undefined;
+            const got = rl.recvCtl(c, &buf) catch return error.OwnerLive;
+            return got.fd orelse error.OwnerLive;
+        }
+
+        /// Bind THIS member's write cache: the claim taken (fresh: a new
+        /// memfd of `capacity`, the marker stamped); the claim held by a
+        /// supervisor: its memfd adopted — the marker read off grain 0 and
+        /// judged (`bindVerdict`: a foreign member's ring is refused, never
+        /// adopted; a dead one wiped), the recovered size kept whatever
+        /// `capacity` says now (the pool and the tables follow the image);
+        /// held by a live daemon: refused `OwnerLive`.
+        pub fn bind(pool: *uring_fs.Pool, ours: Marker, want_capacity: u64, refusal: *BindRefusal) BindError!Ram {
+            _ = pool;
+            refusal.* = .{};
+            assert(derive.isAligned(want_capacity, RECORD_ALIGN) and want_capacity >= RECORD_ALIGN);
+            if (try tryClaim(ours)) |fresh_claim| {
+                errdefer _ = linux.close(fresh_claim);
+                const memfd = createMemfd(HEADER + want_capacity) catch return error.OpenFailed;
+                errdefer _ = linux.close(memfd);
+                var mapped = mapMemfd(memfd) catch return error.OpenFailed;
+                errdefer mapped.close();
+                stampMarker(mapped.map, ours);
+                return .{ .memfd = memfd, .claim = fresh_claim, .mapped = mapped, .verdict = .absent, .found = null };
+            }
+            const memfd = receiveFromSupervisor(ours) catch |e| {
+                if (e == error.OwnerLive) stats.staging_owner_live_refusals.inc();
+                return e;
+            };
+            errdefer _ = linux.close(memfd);
+            var mapped = mapMemfd(memfd) catch return error.OpenFailed;
+            errdefer mapped.close();
+            const found: ?Marker = Marker.decode(mapped.map[0..MARKER_LEN]) catch null;
+            const verdict: BindVerdict = if (found == null) .dead else bindVerdict(found, ours);
+            switch (verdict) {
+                .absent, .match => {},
+                .upgrade => stampMarker(mapped.map, ours),
+                .dead => {
+                    wipeRam(&mapped);
+                    stampMarker(mapped.map, ours);
+                    stats.staging_generation_discards.inc();
+                },
+                .foreign_owner => {
+                    refusal.owner = found;
+                    stats.staging_foreign_scope_refusals.inc();
+                    return error.ForeignOwner;
+                },
+            }
+            // Our own claim: the supervisor closes its socket right after
+            // the handover; the name frees with it.
+            var tries: u32 = 0;
+            const own_claim: linux.fd_t = while (true) : (tries += 1) {
+                if (try tryClaim(ours)) |fd| break fd;
+                if (tries == CLAIM_RETRIES) {
+                    refusal.owner = found;
+                    stats.staging_owner_live_refusals.inc();
+                    return error.OwnerLive;
+                }
+                const ts: linux.timespec = .{ .sec = 0, .nsec = @intCast(CLAIM_RETRY_NS) };
+                _ = linux.nanosleep(&ts, null);
+            };
+            return .{ .memfd = memfd, .claim = own_claim, .mapped = mapped, .verdict = verdict, .found = found };
+        }
+
+        /// The image: the memfd past the marker's grain.
+        pub fn image(self: *Ram) []align(4096) u8 {
+            return @alignCast(self.mapped.map[HEADER..]);
+        }
+
+        pub fn capacity(self: *const Ram) u64 {
+            return self.mapped.map.len - HEADER;
+        }
+
+        /// The segment's backing over the image (offsets are the image's:
+        /// the seams add the header).
+        pub fn backing(self: *Ram) Backing {
+            return .{ .ctx = self, .reclaim = reclaimRam, .nextData = nextDataRam, .ram = true };
+        }
+
+        fn reclaimRam(ctx: ?*anyopaque, off: u64, len: u64) void {
+            const self: *Ram = @ptrCast(@alignCast(ctx.?));
+            MappedSegment.reclaim(&self.mapped, HEADER + off, len);
+        }
+
+        fn nextDataRam(ctx: ?*anyopaque, off: u64) ?u64 {
+            const self: *Ram = @ptrCast(@alignCast(ctx.?));
+            const d = MappedSegment.nextData(&self.mapped, HEADER + off) orelse return null;
+            return d - HEADER;
+        }
+
+        /// Any byte of data past the marker (`SEEK_DATA`): what the
+        /// supervisor asks before it holds a dead daemon's ring for a
+        /// successor — a drained ring is discarded.
+        pub fn holdsData(memfd: linux.fd_t) bool {
+            const rc = linux.lseek(memfd, @intCast(HEADER), SEEK_DATA);
+            return linux.errno(rc) == .SUCCESS;
+        }
+
+        pub fn release(self: *Ram) void {
+            self.mapped.close();
+            _ = linux.close(self.memfd);
+            _ = linux.close(self.claim);
+            self.* = undefined;
+        }
+
+        fn createMemfd(len: u64) !linux.fd_t {
+            const rc = linux.memfd_create(MEMFD_NAME, linux.MFD.CLOEXEC | linux.MFD.ALLOW_SEALING);
+            if (linux.errno(rc) != .SUCCESS) return error.OpenFailed;
+            const fd: linux.fd_t = @intCast(rc);
+            errdefer _ = linux.close(fd);
+            if (linux.errno(linux.ftruncate(fd, @intCast(len))) != .SUCCESS) return error.GrowFailed;
+            // Size-sealed: a holder maps a length that cannot change under
+            // it; writes stay the daemon's (the punch frees pages, not size).
+            const seals: u32 = linux.F.SEAL_SHRINK | linux.F.SEAL_GROW | linux.F.SEAL_SEAL;
+            if (linux.errno(linux.fcntl(fd, linux.F.ADD_SEALS, seals)) != .SUCCESS) return error.OpenFailed;
+            return fd;
+        }
+
+        fn mapMemfd(fd: linux.fd_t) !MappedSegment {
+            var st: linux.Statx = undefined;
+            if (linux.errno(linux.statx(fd, "", linux.AT.EMPTY_PATH, .{ .SIZE = true }, &st)) != .SUCCESS) return error.OpenFailed;
+            const len: usize = @intCast(st.size);
+            if (len < HEADER + RECORD_ALIGN or !derive.isAligned(len, RECORD_ALIGN)) return error.OpenFailed;
+            const m = linux.mmap(null, len, .{ .READ = true, .WRITE = true }, .{ .TYPE = .SHARED }, fd, 0);
+            if (linux.errno(m) != .SUCCESS) return error.MapFailed;
+            const ptr: [*]align(4096) u8 = @ptrFromInt(m);
+            return .{ .fd = fd, .map = ptr[0..len], .form = .ram };
+        }
+
+        fn stampMarker(map: []align(4096) u8, ours: Marker) void {
+            const bytes = ours.encode();
+            @memcpy(map[0..MARKER_LEN], &bytes);
+            @memset(map[MARKER_LEN..HEADER], 0);
+        }
+
+        /// `dead`: every page past the marker punched.
+        fn wipeRam(mapped: *MappedSegment) void {
+            MappedSegment.reclaim(mapped, HEADER, mapped.map.len - HEADER);
+        }
+    };
 
     /// `dead`: wipe the segment tree (every file under it) before restamping.
     pub fn wipeSegments(root_fd: linux.fd_t, names: []const [:0]const u8) void {
@@ -3453,7 +3828,7 @@ test "the live cells' value-hash states are gauged (R5): N staged records carry 
     try testing.expectEqual(stats.staging_cell_state_bytes.load(), c.current());
 }
 
-test "the segment's fixed per-cell tables are gauged (R5): tablesBound(cap) = maxCells × (Cell + u32) + the two grain bitmaps + indexSlots × (1 + KEY_LEN + ptr); an open segment carries exactly it in staging_tables_bytes (the live tables agree term by term, the std map's capacity law pinned), puts move nothing, deinit returns it; the component is attribution-only; the tables are ≈ 4.5 % of the ring" {
+test "the segment's per-cell tables are gauged (R5): tablesBound(cap) = maxCells × (Cell + ptr) + the two grain bitmaps + indexSlots × (1 + KEY_LEN + ptr) is the CEILING; a small segment carries exactly it (one chunk holds every cell), a large one grows toward it a chunk of 4,096 cells at a time; puts inside a chunk move nothing, deinit returns it; the component is attribution-only; the ceiling is ≈ 4.6 % of the ring" {
     const gpa = testing.allocator;
     // The tie, restated: n = cap / grain + 1 cells, one bit per grain.
     const cap: u64 = 64 * 4096;
@@ -3461,7 +3836,7 @@ test "the segment's fixed per-cell tables are gauged (R5): tablesBound(cap) = ma
     try testing.expectEqual(n, Segment.maxCells(cap));
     try testing.expectEqual(@as(u64, 128), Segment.indexSlots(@intCast(n)));
     try testing.expectEqual(@as(usize, 1), Segment.occupiedWords(cap));
-    try testing.expectEqual(n * @sizeOf(Cell) + n * @sizeOf(u32) + 2 * 8 + 128 * (1 + KEY_LEN + @sizeOf(*Cell)), Segment.tablesBound(cap));
+    try testing.expectEqual(n * @sizeOf(Cell) + n * @sizeOf(*Cell) + 2 * 8 + 128 * (1 + KEY_LEN + @sizeOf(*Cell)), Segment.tablesBound(cap));
     try testing.expectEqual(@as(usize, 120), @sizeOf(Cell));
     // The std map's capacity law at the boundary: 80 % load, power of two.
     try testing.expectEqual(@as(u64, 16), Segment.indexSlots(12));
@@ -3481,18 +3856,32 @@ test "the segment's fixed per-cell tables are gauged (R5): tablesBound(cap) = ma
     try testing.expectEqual(g0 + Segment.tablesBound(cap), stats.staging_tables_bytes.load());
     seg.deinit();
     try testing.expectEqual(g0, stats.staging_tables_bytes.load());
-    // The share of the ring: 26,018,044 B at the venue's 546 MiB ring
-    // (139,777 cells × (120 + 4) B + 2 × 2,184 bitmap words × 8 B +
-    // 262,144 index slots × 33 B; the sorted-extent scratch and the pending
-    // list — 80 B per cell — left with the grain bitmaps, the cell grew
-    // 112 → 120 B with the record seqlock, 2026-10-20) and 3,117,180 B at
-    // 64 MiB — 4.5–4.6 % of either, the index's power-of-two rounding the
-    // swing.
+    // A ring past one chunk starts with ONE chunk and grows: 8 MiB = 2,049
+    // cells' ceiling, the first 4,096-cell chunk holds them all; 64 MiB =
+    // 16,385 cells — the open segment carries one chunk (4,096 cells, the
+    // free list and the index sized to it) and the bitmaps, under the bound.
+    {
+        const big: u64 = 64 * derive.MiB;
+        const image = try gpa.alloc(u8, big);
+        defer gpa.free(image);
+        @memset(image[0..4096], 0);
+        var bseg = try Segment.init(gpa, image, .none);
+        defer bseg.deinit();
+        try testing.expectEqual(@as(usize, 1), bseg.cells.items.len);
+        try testing.expectEqual(Segment.CELL_CHUNK, bseg.cells.items[0].len);
+        try testing.expectEqual(Segment.CELL_CHUNK * (@sizeOf(Cell) + @sizeOf(*Cell)) + 2 * Segment.occupiedWords(big) * 8 + Segment.indexSlots(Segment.CELL_CHUNK) * (1 + KEY_LEN + @sizeOf(*Cell)), bseg.tablesBytes());
+        try testing.expect(bseg.tablesBytes() < Segment.tablesBound(big));
+    }
+    // The ceiling's share of the ring: 26,577,152 B at the venue's 546 MiB
+    // ring (139,777 cells × (120 + 8) B + 2 × 2,184 bitmap words × 8 B +
+    // 262,144 index slots × 33 B; the free list holds cell POINTERS since
+    // the chunks, 2026-10-21) and 3,182,720 B at 64 MiB — 4.6–4.7 % of
+    // either, the index's power-of-two rounding the swing.
     const venue_ring: u64 = 546 * derive.MiB;
-    try testing.expectEqual(@as(u64, 26_018_044), Segment.tablesBound(venue_ring));
-    try testing.expectEqual(@as(u64, 3_117_180), Segment.tablesBound(64 * derive.MiB));
-    try testing.expect(Segment.tablesBound(venue_ring) * 1000 / venue_ring == 45);
-    try testing.expect(Segment.tablesBound(64 * derive.MiB) * 1000 / (64 * derive.MiB) == 46);
+    try testing.expectEqual(@as(u64, 26_577_152), Segment.tablesBound(venue_ring));
+    try testing.expectEqual(@as(u64, 3_182_720), Segment.tablesBound(64 * derive.MiB));
+    try testing.expect(Segment.tablesBound(venue_ring) * 1000 / venue_ring == 46);
+    try testing.expect(Segment.tablesBound(64 * derive.MiB) * 1000 / (64 * derive.MiB) == 47);
     // The R5 component: attribution-only (the tables live with the segment), heap, not page cache.
     const c = tablesComponent();
     try testing.expectEqualStrings("staging_tables", c.name);
@@ -3537,18 +3926,28 @@ test "the three promotion points: pressure rides stageWrite; the dismount pass j
     try testing.expectEqual(@as(usize, 1), r.seg.live());
     try testing.expect(r.seg.get(tkey(4, 4)) == null);
     try testing.expect(r.seg.get(tkey(5, 5)) == null);
-    // The fsync lever takes the promote hook alone: no dismount verdicts.
+    // The fsync point takes the promote hook alone: no dismount verdicts.
+    // A file-backed ring asks only under the lever; the write cache's law
+    // asks always; a declined promotion is `kept`, a hook that leaves no
+    // resident is `absent`, a key with no resident never calls the hook.
     kicks.seg = null;
     try testing.expect(!knobs.boolDefault("SQUEEZEFS_FSYNC_PROMOTE_STAGED"));
     const p0 = stats.fsync_promoted_files.load();
-    promoteAtFsync(.{ .on = false }, kicks.hooks(), tkey(1, 1));
+    try testing.expectEqual(FsyncPromote.absent, promoteAtFsync(.sync, .{ .on = false }, &r.seg, kicks.hooks(), tkey(1, 1)));
     try testing.expectEqual(@as(u32, 2), kicks.promoted);
     kicks.fail_next = true;
-    promoteAtFsync(.{ .on = true }, kicks.hooks(), tkey(1, 1));
+    try testing.expectEqual(FsyncPromote.kept, promoteAtFsync(.sync, .{ .on = true }, &r.seg, kicks.hooks(), tkey(1, 1)));
     try testing.expectEqual(p0, stats.fsync_promoted_files.load());
-    promoteAtFsync(.{ .on = true }, kicks.hooks(), tkey(1, 1));
+    kicks.fail_next = true;
+    try testing.expectEqual(FsyncPromote.kept, promoteAtFsync(.promote, .{ .on = false }, &r.seg, kicks.hooks(), tkey(1, 1)));
+    try testing.expectEqual(FsyncPromote.absent, promoteAtFsync(.promote, .{ .on = false }, &r.seg, kicks.hooks(), tkey(9, 9)));
+    try testing.expectEqual(@as(u32, 2), kicks.promoted);
+    // The hook promotes: the record is gone (the hook removed it).
+    kicks.seg = &r.seg;
+    try testing.expectEqual(FsyncPromote.promoted, promoteAtFsync(.promote, .{ .on = false }, &r.seg, kicks.hooks(), tkey(1, 1)));
     try testing.expectEqual(p0 + 1, stats.fsync_promoted_files.load());
     try testing.expectEqual(@as(u32, 3), kicks.promoted);
+    try testing.expectEqual(FsyncPromote.absent, promoteAtFsync(.promote, .{ .on = false }, &r.seg, kicks.hooks(), tkey(1, 1)));
 }
 
 /// The fsync law's counting seam: every `durable` call recorded; `hold`
@@ -4377,6 +4776,97 @@ fn recordFuzz(_: void, smith: *std.testing.Smith) !void {
 
 test "fuzz: the record header reader, the verifier and the marker decoder are total" {
     try fuzzkit.fuzz({}, recordFuzz, .{});
+}
+
+test "linux: the write cache (charter §6.1 'Staged', 2026-10-21) — the ring in a sealed memfd behind the member's claim: a second bind of the same member while the first lives is OwnerLive (never a second ring); the first dies (its fds gone, its supervisor holding the memfd and the claim) and hands the ring to the successor over the claim: every resident recovered whole, UNSYNCED (the in-place arm stays open: no supersession hold on a re-stage), the generation counter seeded past the recovered ones (a cut that keeps both copies finds the re-stage higher); the law is promote; a clean release frees the claim and the next bind is fresh" {
+    if (builtin.os.tag != .linux) return testkit.skip(@src(), .no_linux, "staging: Linux only");
+    const gpa = testing.allocator;
+    const uring_fs = @import("../io/uring_fs.zig");
+    const rl = @import("../ipc/rendezvous_linux.zig");
+    const pool = try uring_fs.Pool.init(gpa, uring_fs.Config.fixed(1, 1024));
+    defer pool.deinit();
+    // A uuid of this process and this test: the claim is a host-wide name.
+    var uuid: [16]u8 = @splat(0x7C);
+    std.mem.writeInt(u32, uuid[0..4], @intCast(linux.getpid()), .little);
+    std.mem.writeInt(u64, uuid[4..12], @bitCast(clock.monotonicNs()), .little);
+    const cap: u64 = 64 * 4096;
+    const owner: Marker = .{ .set_uuid = uuid, .set_epoch = 1, .node_token = 0xA0, .mount_slot = 7, .appender_id = 0, .owner_pid = 1111 };
+    const next: Marker = .{ .set_uuid = uuid, .set_epoch = 1, .node_token = 0xA0, .mount_slot = 7, .appender_id = 0, .owner_pid = 2222 };
+    const live0 = stats.staging_owner_live_refusals.load();
+    var refusal: Ring.BindRefusal = .{};
+    var a = try Ring.Ram.bind(pool, owner, cap, &refusal);
+    try testing.expectEqual(BindVerdict.absent, a.verdict);
+    try testing.expectEqual(cap, a.capacity());
+    try testing.expectEqual(FsyncLaw.promote, fsyncLaw(a.backing()));
+    try testing.expectEqual(@as(?Marker, owner), Marker.decode(a.mapped.map[0..MARKER_LEN]) catch null);
+    // The daemon's own ring: residents, one of them re-staged (unsynced:
+    // the superseded copy is released at once, nothing held).
+    {
+        var seg = try Segment.init(gpa, a.image(), a.backing());
+        defer seg.deinit();
+        var p = Pool.init(gpa, cap, .none);
+        defer p.deinit();
+        for (1..4) |i| _ = try stageWrite(&p, &seg, tkey(@intCast(i), i), "a resident", 0, .none);
+        _ = try stageWrite(&p, &seg, tkey(2, 2), "re-staged", 0, .none);
+        try testing.expectEqual(@as(u32, 0), stats.staging_superseded_held.load());
+        try testing.expectEqual(@as(usize, 3), seg.live());
+    }
+    // A second mount of this member while the first lives: refused.
+    try testing.expectError(error.OwnerLive, Ring.Ram.bind(pool, next, cap, &refusal));
+    try testing.expectEqual(live0 + 1, stats.staging_owner_live_refusals.load());
+    // The death: the supervisor's copies of the memfd and the claim outlive
+    // the daemon's fds; it listens and hands the memfd to ONE successor.
+    const sup_memfd: linux.fd_t = @intCast(linux.dup(a.memfd));
+    const sup_claim: linux.fd_t = @intCast(linux.dup(a.claim));
+    a.release();
+    try testing.expect(Ring.Ram.holdsData(sup_memfd));
+    const Supervisor = struct {
+        fn run(claim: linux.fd_t, memfd: linux.fd_t) void {
+            _ = linux.listen(claim, 1);
+            const rc = linux.accept4(claim, null, null, linux.SOCK.CLOEXEC);
+            if (linux.errno(rc) != .SUCCESS) return;
+            const conn: linux.fd_t = @intCast(rc);
+            rl.sendCtl(conn, &.{ 3, 0, 0 }, memfd) catch {};
+            _ = linux.close(conn);
+            _ = linux.close(claim);
+            _ = linux.close(memfd);
+        }
+    };
+    const t = try std.Thread.spawn(.{}, Supervisor.run, .{ sup_claim, sup_memfd });
+    var b = try Ring.Ram.bind(pool, next, cap / 2, &refusal);
+    t.join();
+    var b_open = true;
+    defer if (b_open) b.release();
+    try testing.expectEqual(BindVerdict.match, b.verdict);
+    try testing.expectEqual(owner, b.found.?);
+    try testing.expectEqual(cap, b.capacity()); // the recovered size, not the new derivation
+    {
+        var seg = try Segment.init(gpa, b.image(), b.backing());
+        defer seg.deinit();
+        const rep = seg.recover();
+        try testing.expectEqual(@as(u64, 3), rep.adopted);
+        try testing.expectEqual(@as(u64, 0), rep.torn);
+        const l = seg.get(tkey(2, 2)).?;
+        try testing.expectEqualStrings("re-staged", l.bytes());
+        try testing.expect(!l.cell.synced);
+        l.release();
+        // The seed: generations 1..4 were minted; the next is 5.
+        var p = Pool.init(gpa, cap, .none);
+        defer p.deinit();
+        try p.seedFromRecovery(&seg);
+        try testing.expectEqual(@as(u64, 5), p.next_generation.load(.monotonic));
+        // A re-stage of a recovered record holds nothing (RAM owes no cut).
+        _ = try stageWrite(&p, &seg, tkey(2, 2), "again", 0, .none);
+        try testing.expectEqual(@as(u32, 0), stats.staging_superseded_held.load());
+        try testing.expectEqual(@as(?u64, 5), seg.residentGeneration(tkey(2, 2)));
+    }
+    // A clean release frees the claim: the next bind of the member is fresh.
+    b.release();
+    b_open = false;
+    var c = try Ring.Ram.bind(pool, next, cap, &refusal);
+    defer c.release();
+    try testing.expectEqual(BindVerdict.absent, c.verdict);
+    try testing.expect(!Ring.Ram.holdsData(c.memfd));
 }
 
 test "linux: the member scope (0003 §T.1) — two owners over ONE cache path: each binds its own member root and B never adopts A's residents; a second claim on A's LIVE root refuses naming A; A dead, a FOREIGN member on A's root refuses (never adopted, never wiped); A's successor (the same member, a new incarnation) adopts every resident" {

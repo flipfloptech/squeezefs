@@ -279,6 +279,9 @@ const Rig = struct {
     /// `formatSetWith` over data volumes of `data_bytes` each (a row that
     /// fills the set to ENOSPC wants it small).
     fn formatSetSized(self: *Rig, cache: bool, extra: []const []const u8, data_bytes: u64) !void {
+        // `cache = false` is the CACHE-LESS posture the row asks for: no
+        // write cache either (every mount holds one by default).
+        if (!cache) try self.env.put("SQUEEZEFS_WRITE_CACHE_PCT", "0");
         try self.createMetaVolume();
         for ([_][]const u8{ self.d0, self.d1 }) |dp| {
             const f = try Io.Dir.cwd().createFile(self.io, dp, .{ .truncate = true });
@@ -2852,13 +2855,15 @@ fn stagingRecoveredOf(log_text: []const u8, member_root_tail: []const u8) ?u64 {
     var it = std.mem.splitScalar(u8, log_text, '\n');
     var last: ?u64 = null;
     while (it.next()) |line| {
-        if (std.mem.indexOf(u8, line, "staging ring ") == null or std.mem.indexOf(u8, line, member_root_tail) == null) continue;
+        const ring = std.mem.indexOf(u8, line, "staging ring ") != null and std.mem.indexOf(u8, line, member_root_tail) != null;
+        const cache = std.mem.indexOf(u8, line, "write cache: ") != null and std.mem.indexOf(u8, line, "recovered ") != null;
+        if (!ring and !cache) continue;
         last = numberAfter(line, "recovered ");
     }
     return last;
 }
 
-test "smoke: TWO MOUNTS OF ONE SET ON ONE HOST, one cache path — each member binds its OWN staging root (0003 §T.1): A (the manager) stages 200 files, B joins beside A's LIVE ring and recovers 0 records; `staging list` shows both roots live; a SECOND SET formatted on the same cache path is refused at its mount naming A's live claim (never wiping A's ring); B's dismount promotes its own 8 files, A's dismount A's 200 — every one sha-equal after a remount; fsck --offline --scrub 0 findings" {
+test "smoke: TWO MOUNTS OF ONE SET ON ONE HOST — each member holds its OWN write cache (0003 §T.1 over the memfd ring): A (the manager) stages 200 files, B joins beside A's LIVE ring and recovers 0 records; B's dismount promotes its own 8 files, A's dismount A's 200 — every one sha-equal after a remount; fsck --offline --scrub 0 findings" {
     const io = testing.io;
     if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
     const gpa = testing.allocator;
@@ -2910,15 +2915,6 @@ test "smoke: TWO MOUNTS OF ONE SET ON ONE HOST, one cache path — each member b
         try testing.expectEqual(@as(?u64, 0), stagingRecoveredOf(at, "/member-00000000"));
         std.debug.print("smoke: member scope: A stages {d} files ({d} B charged) in member-00000000; B joined beside them and recovered {d} record(s) in its own root\n", .{ scope_a_files, a_staged, stagingRecoveredOf(text, "/member-") orelse 0 });
     }
-    // Both roots under the cache path, both owners live.
-    {
-        const r = try rig.squeezefs(&.{ "staging", "list", "--json", rig.meta_uri });
-        defer rig.freeRun(r);
-        try testing.expect(r.term.success());
-        try testing.expect(std.mem.indexOf(u8, r.stdout, "/member-00000000\",\"binding\":\"bound\",\"mount_slot\":0,\"appender_id\":0,") != null);
-        try testing.expectEqual(@as(usize, 2), std.mem.count(u8, r.stdout, "\"owner_live\":true"));
-        std.debug.print("smoke: member scope: staging list: {s}", .{r.stdout});
-    }
     // B's own residents.
     {
         script.clearRetainingCapacity();
@@ -2926,48 +2922,6 @@ test "smoke: TWO MOUNTS OF ONE SET ON ONE HOST, one cache path — each member b
         const out = try b.onMount(script.written());
         defer gpa.free(out);
         try testing.expectEqual(scope_b_files, try std.fmt.parseInt(usize, std.mem.trimEnd(u8, out, "\n"), 10));
-    }
-    // A SECOND SET on the same cache path: its manager's root IS A's
-    // member root name — the live claim refuses it (the old ladder read
-    // A's marker as another set's and WIPED A's live ring).
-    {
-        const c_img = try std.fmt.allocPrint(gpa, "{s}/c-vol.img", .{rig.work});
-        defer gpa.free(c_img);
-        const c_uri = try std.fmt.allocPrint(gpa, "sqmeta://{s}", .{c_img});
-        defer gpa.free(c_uri);
-        const c_data = try std.fmt.allocPrint(gpa, "sqdata://{s}/c-d0.img,{s}/c-d1.img", .{ rig.work, rig.work });
-        defer gpa.free(c_data);
-        const c_log = try std.fmt.allocPrint(gpa, "{s}/daemon-c.log", .{rig.work});
-        defer gpa.free(c_log);
-        const c_mp = try std.fmt.allocPrintSentinel(gpa, "/build/tmp/mnt-{d}-c", .{linux.getpid()}, 0);
-        defer gpa.free(c_mp);
-        _ = linux.mkdir(c_mp.ptr, 0o755);
-        defer _ = linux.rmdir(c_mp.ptr);
-        defer _ = linux.umount2(c_mp.ptr, linux.MNT.DETACH);
-        script.clearRetainingCapacity();
-        try script.writer.print("truncate -s {d} c-vol.img && truncate -s {d} c-d0.img && truncate -s {d} c-d1.img && echo ok", .{ volume_len, data_len, data_len });
-        const made = try rig.shOk(rig.work, script.written());
-        gpa.free(made);
-        {
-            const r = try rig.squeezefs(&.{ "format", "--disk-cache-paths", rig.cache, c_uri, c_data });
-            defer rig.freeRun(r);
-            if (!r.term.success()) std.debug.print("\nformat C: {s}\n", .{r.stderr});
-            try testing.expect(r.term.success());
-        }
-        const r = try rig.squeezefs(&.{ "mount", "--daemon", "--log-file", c_log, c_uri, c_mp });
-        defer rig.freeRun(r);
-        if (r.term.success()) _ = rig.squeezefs(&.{ "umount", c_mp }) catch {};
-        try testing.expectEqual(std.process.Child.Term{ .exited = 1 }, r.term);
-        try testing.expect(std.mem.indexOf(u8, r.stderr, "StagingOwnerLive") != null);
-        const c_text = try Io.Dir.cwd().readFileAlloc(io, c_log, gpa, .limited(1 << 20));
-        defer gpa.free(c_text);
-        try testing.expect(std.mem.indexOf(u8, c_text, "held LIVE by a mount of ANOTHER SET on this cache path") != null);
-        try testing.expectEqual(@as(usize, 0), try fuseMountsOf(gpa, io, c_mp));
-        const sa = try rig.stats();
-        defer gpa.free(sa);
-        try testing.expectEqual(a_staged, numberAfter(sa, "\"current_staged_write_bytes\":") orelse 0);
-        try testing.expectEqual(@as(?u64, 0), numberAfter(sa, "\"staging_generation_discards\":"));
-        std.debug.print("smoke: member scope: a second set on the same cache path refused at its mount (StagingOwnerLive); A's ring intact ({d} B charged), 0 discards\n", .{a_staged});
     }
     // B's dismount promotes ITS residents; A's ring is untouched.
     const mark_b = try b.logLen();
@@ -6994,6 +6948,7 @@ fn dataPlanePass(rig: *Rig, cache: bool) !void {
     const gpa = rig.gpa;
     const io = rig.io;
     const label: []const u8 = if (cache) "cache" else "no-cache";
+    var packed_before_rm: u64 = 0;
     const zc_legs = zcKernel();
     if (cache) try rig.env.put("SQUEEZEFS_MEM_BUDGET_MB", std.fmt.comptimePrint("{d}", .{cache_row_budget_mib}));
     try rig.formatSet(cache);
@@ -7006,11 +6961,12 @@ fn dataPlanePass(rig: *Rig, cache: bool) !void {
         const seg = text[0..ready_at];
         try testing.expect(std.mem.indexOf(u8, seg, "data plane: 2 data volume(s)") != null);
         if (cache) {
-            try testing.expect(std.mem.indexOf(u8, seg, "staging ON, NVMe tier ON") != null);
+            try testing.expect(std.mem.indexOf(u8, seg, "write cache: ") != null);
+            try testing.expect(std.mem.indexOf(u8, seg, "staging ON") != null);
             const legs = if (zc_legs) "held-slot direct store ON, direct device leg ON, fd-source probe serve ON" else "held-slot direct store off, direct device leg off, fd-source probe serve off";
             try testing.expect(std.mem.indexOf(u8, seg, legs) != null);
         } else {
-            try testing.expect(std.mem.indexOf(u8, seg, "the set declares NO cache paths — staging and the NVMe read tier are OFF") != null);
+            try testing.expect(std.mem.indexOf(u8, seg, "staging and the NVMe read tier are OFF") != null);
         }
     }
     const baseline = try rig.usedKib();
@@ -7089,6 +7045,7 @@ fn dataPlanePass(rig: *Rig, cache: bool) !void {
             const packed_online = numberAfter(tail, "\"layout_promoted_packed\":") orelse 0;
             std.debug.print("smoke[{s}]: {d} small file(s) packed by the dispatch before rm\n", .{ label, packed_online });
             try testing.expect(packed_online > 0);
+            packed_before_rm = packed_online;
             // The held-slot store and the direct leg are zc legs.
             try testing.expectEqual(zc_legs, (numberAfter(tail, "\"held_stores\":") orelse 0) > 0);
             try testing.expectEqual(zc_legs, (numberAfter(tail, "\"transport_zc_direct_legs\":") orelse 0) > 0);
@@ -7160,7 +7117,11 @@ fn dataPlanePass(rig: *Rig, cache: bool) !void {
         defer gpa.free(text);
         const seg = text[ready_at..];
         try testing.expect(std.mem.indexOf(u8, seg, "clean unmount") != null);
-        if (cache) try testing.expect((numberAfter(seg, "dismount promotion: ") orelse 0) >= small_files_staged);
+        // Every small file left the ring: by the dispatch at pressure
+        // before the rm, or by the dismount pass (the schedule is the
+        // budget's: the write cache under a 1 GiB budget holds the storm,
+        // so the pass promotes nearly all of them).
+        if (cache) try testing.expect((numberAfter(seg, "dismount promotion: ") orelse 0) + packed_before_rm >= small_files_staged);
     }
     // Remount: the small files intact (packed reads), rm → the baseline,
     // the reclaim ledger closed, a clean unmount.
@@ -9489,12 +9450,19 @@ test "smoke: FSCK AND SCRUB — format (a cache path) → fill (dirs, 200 packed
         try testing.expect(std.mem.indexOf(u8, out, "filled") != null);
     }
     try rig.expectAlive("the staged + striped + packed fill and hard links");
+    // The fill's `sync -f` PROMOTED the staged residents (the write cache's
+    // law): what the dismount pass finds is what the syncfs left.
+    const synced_promoted = blk: {
+        const st = try rig.stats();
+        defer gpa.free(st);
+        break :blk numberAfter(st, "\"fsync_promoted_files\":") orelse 0;
+    };
     const mark_dismount = try rig.logLen();
     try rig.umount();
     try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
     {
-        // Every staged resident promoted at the dismount, none failed, and
-        // the allocator's anomaly tripwire never fired.
+        // Every staged resident promoted — by the syncfs or at the dismount
+        // —, none failed, and the allocator's anomaly tripwire never fired.
         const text = try rig.readLog();
         defer gpa.free(text);
         const tail = text[mark_dismount..];
@@ -9504,10 +9472,10 @@ test "smoke: FSCK AND SCRUB — format (a cache path) → fill (dirs, 200 packed
         };
         const line = tail[line_at..];
         const promoted = numberAfter(line, "dismount promotion: ") orelse return error.NoDismountPromotionLine;
-        try testing.expect(promoted >= 1);
+        try testing.expect(promoted + synced_promoted >= 200);
         try testing.expect(std.mem.indexOf(u8, line[0..@min(line.len, 200)], ", 0 failed") != null);
         try testing.expect(std.mem.indexOf(u8, tail, "block_claim_anomalies") == null);
-        std.debug.print("\nsmoke[fsck]: the dismount promoted {d} staged file(s) beside fresh striped blocks (the rung-8 defect's pin)\n", .{promoted});
+        std.debug.print("\nsmoke[fsck]: the syncfs promoted {d} and the dismount {d} staged file(s) beside fresh striped blocks (the rung-8 defect's pin)\n", .{ synced_promoted, promoted });
     }
     // The clone (an offline verb: the same guarded open fsck takes) shares
     // big0's blocks — the refcount-2 shape C3/C8 must read as healthy.

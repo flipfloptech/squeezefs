@@ -470,6 +470,10 @@ fn mountMain(ctx: *Ctx) u8 {
     var opens = open_table.OpenTable.init(gpa, open_table.derivedCapacity(facts.possible_cpus, fuse_geometry.Q_DEPTH_DESIRED)) catch return ctx.failed("out of memory (open table)", .{});
     defer opens.deinit();
     const plane = plane_mod.DataPlane.open(gpa, io, ctx.sqz, be, &cfg, .{ .env = env, .facts = facts, .budget_bytes = ctx.budget_bytes, .write_cache_bytes = ctx.write_cache_bytes, .derived_key = ctx.derived_key, .derived_next = ctx.derived_next, .guards = &guards }) catch |e| return ctx.failed("the data plane could not open ({s}) — see the log", .{@errorName(e)});
+    // The write cache's memfd and claim to the supervisor (charter §6.1
+    // "Staged"): from here a crash of this process keeps every resident
+    // for the member's next mount.
+    announceWriteCache(plane);
     if (ctx.derived_key) |*k| k.zeroize();
     if (ctx.derived_next) |*k| k.zeroize();
     var plane_open = true;
@@ -943,6 +947,9 @@ fn mountMain(ctx: *Ctx) u8 {
     // SET bits at the frontier (the rung-8 dismount defect). No FUSE
     // request is in flight (the session is closed); the wire still serves.
     plane.dismount();
+    // The write cache drained by the pass: the supervisor discards it
+    // instead of holding an empty ring for a successor.
+    if (plane.writeCacheDrained()) announceWriteCacheDrained();
     // The wire BEFORE the planes and the backend it serves over: every
     // connection severed, the token hook disarmed on every pass — and
     // every seam the planes hold INTO it unbound first (nothing may reach
@@ -1033,6 +1040,37 @@ fn announceTails(be: *meta_set.MetaSet, env: *const std.process.Environ.Map) voi
         sent += 1;
     }
     log.info("journal tails: {d} volume(s) handed to the supervisor (a crash of this process is replayed to the device before the writer claim is released); acks {s}", .{ sent, if (at_apply) "precede the landing (the ext4 posture)" else "follow the landing" });
+}
+
+/// The write cache's memfd and its claim over the supervisor's socket
+/// (two frames, one fd each — the discipline). Without a supervisor the
+/// posture is said once: a crash of this process loses the ring's
+/// unsynced residents (a power cut's exposure; synced bytes were promoted).
+fn announceWriteCache(plane: *plane_mod.DataPlane) void {
+    const fds = plane.writeCacheFds() orelse return;
+    const sock = journal_tail.supervisor_sock.load(.acquire);
+    if (sock < 0) {
+        log.info("write cache: no supervisor holds the ring — a crash of this process loses its unsynced residents (every fsync'd byte was promoted to the data volumes); `--daemon --supervise` keeps them for the next mount", .{});
+        return;
+    }
+    const claim_frame = (cli.supervisor.TailFrame{ .kind = .write_cache_claim, .index = 0 }).encode();
+    const ring_frame = (cli.supervisor.TailFrame{ .kind = .write_cache, .index = 0 }).encode();
+    ipc_rl.sendCtl(sock, &claim_frame, fds.claim) catch |e| {
+        log.err("write cache: cannot hand the claim to the supervisor ({s}) — a crash loses the ring's unsynced residents", .{@errorName(e)});
+        return;
+    };
+    ipc_rl.sendCtl(sock, &ring_frame, fds.memfd) catch |e| {
+        log.err("write cache: cannot hand the memfd to the supervisor ({s}) — a crash loses the ring's unsynced residents", .{@errorName(e)});
+        return;
+    };
+    log.info("write cache: the memfd and its claim handed to the supervisor (a crash of this process keeps every resident for this member's next mount)", .{});
+}
+
+fn announceWriteCacheDrained() void {
+    const sock = journal_tail.supervisor_sock.load(.acquire);
+    if (sock < 0) return;
+    const frame = (cli.supervisor.TailFrame{ .kind = .write_cache_drained, .index = 0 }).encode();
+    ipc_rl.sendCtl(sock, &frame, null) catch {};
 }
 
 fn stripeFloor(be: *meta_set.MetaSet) sym_xv.stripe.Floor {

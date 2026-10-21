@@ -71,6 +71,7 @@ const clock = @import("../core/clock.zig");
 const knobs = @import("../core/knobs.zig");
 const mountinfo = @import("../core/mountinfo.zig");
 const journal_tail = @import("../meta/journal_tail.zig");
+const staging = @import("../data/staging.zig");
 
 pub const PROBE_INTERVAL_NS: u64 = 5 * std.time.ns_per_s;
 pub const HEARTBEAT_STALE_NS: u64 = 2 * PROBE_INTERVAL_NS;
@@ -178,8 +179,10 @@ pub fn probeKind(attached: bool) ProbeKind {
     return if (attached) .control_inode else .heartbeat;
 }
 
-/// One frame on the tail socket: what the fd beside it is.
-pub const TailFrameKind = enum(u8) { tail = 1, guard = 2 };
+/// One frame on the tail socket: what the fd beside it is. The write
+/// cache's three (charter §6.1 "Staged"): its memfd, its CLAIM socket, and
+/// — no fd — the dismount's word that the ring is drained (discard it).
+pub const TailFrameKind = enum(u8) { tail = 1, guard = 2, write_cache = 3, write_cache_claim = 4, write_cache_drained = 5 };
 
 pub const TailFrame = struct {
     kind: TailFrameKind,
@@ -200,6 +203,9 @@ pub const TailFrame = struct {
         const kind: TailFrameKind = switch (b[0]) {
             1 => .tail,
             2 => .guard,
+            3 => .write_cache,
+            4 => .write_cache_claim,
+            5 => .write_cache_drained,
             else => return null,
         };
         return .{ .kind = kind, .index = std.mem.readInt(u16, b[1..3], .little) };
@@ -221,12 +227,19 @@ pub const linux_loop = if (builtin.os.tag == .linux) struct {
     const completion = @import("../sync/completion.zig");
     const rendezvous = @import("../ipc/rendezvous_linux.zig");
 
-    /// The fds the daemon sent: its journal tails and its writer guards.
+    /// The fds the daemon sent: its journal tails, its writer guards, and
+    /// the write cache's memfd and claim (charter §6.1 "Staged": after the
+    /// daemon's death the ring is HELD for the member's next mount unless
+    /// the dismount said it was drained).
     pub const Tails = struct {
         gpa: std.mem.Allocator,
         sock: ?linux.fd_t,
         tails: std.ArrayList(struct { index: u16, fd: linux.fd_t }) = .empty,
         guards: std.ArrayList(linux.fd_t) = .empty,
+        write_cache: ?linux.fd_t = null,
+        write_cache_claim: ?linux.fd_t = null,
+        write_cache_drained: bool = false,
+        write_cache_listening: bool = false,
         /// The daemon's end closed (its death, or its exit): nothing more
         /// arrives; the queued frames were drained first.
         hup: bool = false,
@@ -236,8 +249,16 @@ pub const linux_loop = if (builtin.os.tag == .linux) struct {
             self.tails.deinit(self.gpa);
             self.releaseGuards();
             self.guards.deinit(self.gpa);
+            self.dropWriteCache();
             if (self.sock) |s| _ = linux.close(s);
             self.sock = null;
+        }
+
+        fn dropWriteCache(self: *Tails) void {
+            if (self.write_cache) |fd| _ = linux.close(fd);
+            if (self.write_cache_claim) |fd| _ = linux.close(fd);
+            self.write_cache = null;
+            self.write_cache_claim = null;
         }
 
         /// Park up to `timeout_ns` on the socket: frames are taken as they
@@ -278,6 +299,11 @@ pub const linux_loop = if (builtin.os.tag == .linux) struct {
                     log.warn("supervisor: an unreadable frame on the tail socket ({d} bytes) — dropped", .{got.len});
                     continue;
                 };
+                if (frame.kind == .write_cache_drained) {
+                    if (got.fd) |fd| _ = linux.close(fd);
+                    self.write_cache_drained = true;
+                    continue;
+                }
                 const fd = got.fd orelse {
                     log.warn("supervisor: a tail frame without a descriptor — dropped", .{});
                     continue;
@@ -285,6 +311,17 @@ pub const linux_loop = if (builtin.os.tag == .linux) struct {
                 const kept = switch (frame.kind) {
                     .tail => if (self.tails.append(self.gpa, .{ .index = frame.index, .fd = fd })) true else |_| false,
                     .guard => if (self.guards.append(self.gpa, fd)) true else |_| false,
+                    .write_cache => blk: {
+                        if (self.write_cache) |old| _ = linux.close(old);
+                        self.write_cache = fd;
+                        break :blk true;
+                    },
+                    .write_cache_claim => blk: {
+                        if (self.write_cache_claim) |old| _ = linux.close(old);
+                        self.write_cache_claim = fd;
+                        break :blk true;
+                    },
+                    .write_cache_drained => unreachable,
                 };
                 if (!kept) _ = linux.close(fd);
             }
@@ -294,6 +331,7 @@ pub const linux_loop = if (builtin.os.tag == .linux) struct {
         /// guards released. Idempotent; logged per tail.
         pub fn replayAndRelease(self: *Tails) void {
             self.drain();
+            self.listenWriteCacheClaim();
             for (self.tails.items) |t| {
                 var path: [journal_tail.PATH_CAP]u8 = undefined;
                 var path_len: usize = 0;
@@ -310,6 +348,74 @@ pub const linux_loop = if (builtin.os.tag == .linux) struct {
         fn releaseGuards(self: *Tails) void {
             for (self.guards.items) |g| _ = linux.close(g);
             self.guards.clearRetainingCapacity();
+        }
+
+        /// The daemon is dead and its write cache holds residents (not
+        /// drained by a dismount, data past the marker): LISTEN on the claim
+        /// the daemon bound — the name is still ours — and hand the memfd to
+        /// the member's next mount (`staging.Ring.Ram.bind` connects, takes
+        /// ONE frame, then binds the claim itself); then exit. A drained or
+        /// empty ring is discarded at once. The hold has no deadline: the
+        /// ring is acked custody (the kill -9 law), and the operator who
+        /// wants it gone kills this process — every fsync'd byte is on the
+        /// data volumes already.
+        pub fn holdWriteCacheForSuccessor(self: *Tails) void {
+            const memfd = self.write_cache orelse return;
+            const claim = self.write_cache_claim orelse {
+                log.err("supervisor: the write cache's memfd arrived without its claim — {d} B of acked unsynced custody cannot be handed over; discarded", .{memfdLen(memfd)});
+                self.dropWriteCache();
+                return;
+            };
+            if (self.write_cache_drained or !staging.Ring.Ram.holdsData(memfd)) {
+                self.dropWriteCache();
+                return;
+            }
+            self.listenWriteCacheClaim();
+            if (self.write_cache == null) return;
+            log.warn("supervisor: holding the dead daemon's write cache ({d} MiB of memfd, residents unpromoted) for this member's next mount — mount the set at this mount point to recover them; kill this process (pid {d}) to discard them (every fsync'd byte is on the data volumes)", .{ memfdLen(memfd) >> 20, linux.getpid() });
+            while (true) {
+                const rc = linux.accept4(claim, null, null, linux.SOCK.CLOEXEC);
+                switch (linux.errno(rc)) {
+                    .SUCCESS => {},
+                    .INTR, .AGAIN, .CONNABORTED => continue,
+                    else => {
+                        log.err("supervisor: accept on the write cache's claim failed — discarding {d} B of unsynced custody", .{memfdLen(memfd)});
+                        self.dropWriteCache();
+                        return;
+                    },
+                }
+                const conn: linux.fd_t = @intCast(rc);
+                const frame = (TailFrame{ .kind = .write_cache, .index = 0 }).encode();
+                const sent = if (rendezvous.sendCtl(conn, &frame, memfd)) true else |_| false;
+                _ = linux.close(conn);
+                if (sent) {
+                    log.info("supervisor: the write cache handed to the successor mount; done", .{});
+                    self.dropWriteCache();
+                    return;
+                }
+            }
+        }
+
+        /// `listen` on the claim the moment the daemon is known dead —
+        /// BEFORE the tails' replay, which can take a while: a successor
+        /// mounting meanwhile connects (its retries cover the gap) instead
+        /// of reading a bound, silent name as a live owner. Idempotent.
+        pub fn listenWriteCacheClaim(self: *Tails) void {
+            const memfd = self.write_cache orelse return;
+            const claim = self.write_cache_claim orelse return;
+            if (self.write_cache_listening) return;
+            if (linux.errno(linux.listen(claim, 1)) != .SUCCESS) {
+                log.err("supervisor: cannot listen on the write cache's claim — {d} B of acked unsynced custody cannot be handed over; discarded", .{memfdLen(memfd)});
+                self.dropWriteCache();
+                return;
+            }
+            self.write_cache_listening = true;
+        }
+
+        fn memfdLen(fd: linux.fd_t) u64 {
+            var st: linux.Statx = undefined;
+            if (linux.errno(linux.statx(fd, "", linux.AT.EMPTY_PATH, .{ .SIZE = true }, &st)) != .SUCCESS) return 0;
+            return st.size;
         }
     };
 
@@ -528,10 +634,12 @@ pub const linux_loop = if (builtin.os.tag == .linux) struct {
             if (reaped) {
                 tails.replayAndRelease();
                 log.info("supervisor: daemon {d} exited (wait status 0x{x}); done", .{ pid, @as(u32, @bitCast(status)) });
+                tails.holdWriteCacheForSuccessor();
                 return if (escalated) 1 else 0;
             }
             if (!alive(pid)) {
                 tails.replayAndRelease();
+                tails.holdWriteCacheForSuccessor();
                 return if (escalated) 1 else 0;
             }
             var is_attached = attached(gpa, io, mountpoint, mount_id);
@@ -564,6 +672,7 @@ pub const linux_loop = if (builtin.os.tag == .linux) struct {
                 .escalate => |for_ns| {
                     escalated = true;
                     escalate(io, pid, conn, for_ns, kind, policy, &tails);
+                    tails.holdWriteCacheForSuccessor();
                     return 1;
                 },
             }
@@ -681,13 +790,13 @@ test "fuzz: the supervisor's waiting-count parser is total on arbitrary text" {
 }
 
 test "tail frame: encode/decode round-trips both kinds; a wrong length or kind is refused" {
-    inline for (.{ TailFrameKind.tail, TailFrameKind.guard }) |k| {
+    inline for (.{ TailFrameKind.tail, TailFrameKind.guard, TailFrameKind.write_cache, TailFrameKind.write_cache_claim, TailFrameKind.write_cache_drained }) |k| {
         const f: TailFrame = .{ .kind = k, .index = 513 };
         const d = TailFrame.decode(&f.encode()).?;
         try testing.expectEqual(k, d.kind);
         try testing.expectEqual(@as(u16, 513), d.index);
     }
-    try testing.expectEqual(@as(?TailFrame, null), TailFrame.decode(&.{ 3, 0, 0 }));
+    try testing.expectEqual(@as(?TailFrame, null), TailFrame.decode(&.{ 6, 0, 0 }));
     try testing.expectEqual(@as(?TailFrame, null), TailFrame.decode(&.{ 1, 0 }));
     try testing.expectEqual(@as(?TailFrame, null), TailFrame.decode(&.{}));
 }

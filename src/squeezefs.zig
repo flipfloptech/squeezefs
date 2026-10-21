@@ -203,6 +203,7 @@ pub const stats = @import("stats/stats.zig");
 
 // ---- memory (portable logic; the cgroup/proc readers are Linux-only inside) ----
 pub const mem_budget = @import("mem/budget.zig");
+pub const mem_cache = @import("mem/cache.zig");
 pub const process_allocator = @import("mem/process_allocator.zig");
 
 // ---- I/O: the ring-park primitive, the io_uring file layer + metadata device posture (Linux only) ----
@@ -351,6 +352,7 @@ test {
     _ = meta.conveyor_core;
     _ = core_sort;
     _ = mem_budget;
+    _ = mem_cache;
     _ = process_allocator;
     _ = align_probe;
     if (builtin.os.tag == .linux) _ = ring_park;

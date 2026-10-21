@@ -589,7 +589,7 @@ with tags, cache paths or "cache-less"). Flags kept: `--block-size`, `--capacity
 `--force`, `--full`, `--meta-node-kib`, `--meta-journal-mb`, `--single-writer`. Deleted:
 `--inodes`, the six cache-size flags, `--dismount-wait`, `--upload-delay`,
 `--fuse-io-uring-sqpoll-idle-ms`, `--meta-slots` (already refused), `--multi-writer`/`--symmetric`
-no-ops, `--data-lv`/`--meta-lv` aliases, `--ip/--port/--subnqn`, and — 2026-10-21, 0002 row 550 —
+no-ops, `--data-lv`/`--meta-lv` aliases, `--ip/--port/--subnqn`, and — 2026-10-21, 0002 row 551 —
 `--disk-cache-paths` (the write cache is RAM on every mount; a `set_config` record naming cache
 paths is refused by name: reformat).
 

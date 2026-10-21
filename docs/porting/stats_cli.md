@@ -618,7 +618,7 @@ are `removed_verb` stubs (§7 Q7).
 
 **PORT:** `config show [--json]` and the fabric-endpoint verbs over the rung-4 `set_config`
 record in the control tree. `set-cache-paths`/`get-cache-paths` and `format --disk-cache-paths`
-went with disk-based caching (2026-10-21, 0002 row 550): the staging ring is the WRITE CACHE
+went with disk-based caching (2026-10-21, 0002 row 551): the staging ring is the WRITE CACHE
 in RAM on every mount, `SQUEEZEFS_WRITE_CACHE_PCT` of system RAM; a `set_config` record that
 names cache paths is refused by name (reformat).
 
@@ -635,7 +635,7 @@ by mounting with `-o client_slot=<hex8>`"). `discard` enumerates every destroyed
 design". `slot_residue_for_set` (`config_ops.rs:3664`) feeds `clients` (§4.7). The charter
 names `staging` without subverbs; there is no `list/promote/drain` in the reference.
 
-**PORT:** no `staging` verb (removed 2026-10-21 with the on-disk roots, 0002 row 550): the
+**PORT:** no `staging` verb (removed 2026-10-21 with the on-disk roots, 0002 row 551): the
 write cache is RAM, a dead daemon's ring is held by its supervisor for the member's next mount
 (`squeezefs mount` recovers it; `kill` the supervisor discards it), promotion of staged files
 is `fsync`'s law and `umount`'s teardown (charter §6.1, §8), and a drain is `fsync`/`umount`,

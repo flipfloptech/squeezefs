@@ -1190,7 +1190,7 @@ namespaces are `write_through_skips`.
 | `SQUEEZEFS_WRITE_GUARD_NARROW` | bool, on (`:221`) | **R:** second shared-mode lever (ledger 85) | not carried |
 | `SQUEEZEFS_FSYNC_TOUCHED_NAMESPACES` | bool, on (`:252`) | A/B lever | barrier only touched namespaces |
 | `SQUEEZEFS_FSYNC_PARALLEL_LEGS` | bool, on (`:253`) | A/B lever | joined legs |
-| `SQUEEZEFS_FSYNC_PROMOTE_STAGED` | bool, off (`:254`) | RETIRED 2026-10-21 | promote-at-fsync is the write cache's law (0002 row 550); successor `SQUEEZEFS_WRITE_CACHE_PCT` |
+| `SQUEEZEFS_FSYNC_PROMOTE_STAGED` | bool, off (`:254`) | RETIRED 2026-10-21 | promote-at-fsync is the write cache's law (0002 row 551); successor `SQUEEZEFS_WRITE_CACHE_PCT` |
 | `SQUEEZEFS_TEST_UPLOAD_STALL_MS` / `_WRITE_STALL_MS` / `_INVAL_TAIL_STALL_MS` / `_CHECKOUT_STALL_MS` / `_ROUTER_DISPATCH_STALL_MS` / `_ATTR_PUBLISH_STALL_MS` | int ms, 0 (`:396-404`) | `SQUEEZEFS_TEST_*` seams | the pinned windows |
 | `SQUEEZEFS_TEST_OVERLAY_BYTES` | bool, 0 (`:409`) | seam | Bytes vehicle on with overlay off |
 | `SQUEEZEFS_TEST_OVERLAY_CAPTURE_STALL_MS`, `set_test_settle_transient_failures` | cell / seam | seams | §5.1 interleave pin; injected settle transients |

@@ -7,7 +7,7 @@ sixteen lanes, the io-wq punt of every grain written through the host's write pa
 filesystem and no local device, so disk-based caching goes and every mount holds a WRITE
 cache in RAM — the staging ring in a kernel-held, size-sealed memfd — beside the READ cache
 (another agent's), each a knob in percent of system RAM, 25 + 25 (Lustre's `max_cached_mb`
-posture). Charter §6.1 "Staged" and item 10 amended; decision 0002 row 550. Branch
+posture). Charter §6.1 "Staged" and item 10 amended; decision 0002 row 551. Branch
 `perf/staged-arm-3` on dev `12768c8`:
 
 | sha | piece |

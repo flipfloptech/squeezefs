@@ -56,8 +56,10 @@ fan-out took 254 µs of every member's queue wait and parked every spinner past 
 
 ## Tests
 
-Unit `fmt test rails` and the smoke battery: see the report. The §BD leaf-set test (≤ 2 takes at the
-apply, none at the admission), the §BC storm, the §BB rows green.
+Unit `fmt test rails`: **2901/2991 passed, 90 skipped**, rails 29/29. Smoke (coherence, shared hot dir,
+dead manager, kill rows (a)(b), kill matrix, kill -9 mid-tar ×2, replay proof, durability points):
+**50/50**; INVALIDATION COHERENCE ×5. The §BD leaf-set test (≤ 2 takes at the apply, none at the
+admission), the §BC storm, the §BB rows green. fsck clean after every session.
 
 ## Risks
 

@@ -686,7 +686,7 @@ pub const KvBackend = struct {
             .core = &be.core,
             .registry = &be.reg,
             .ring_stats = &be.ring_stats,
-            .hooks = .{ .ctx = be, .rollback = laneRollbackHook, .checkpoint_past = laneCheckpointPastHook, .barrier_started = laneBarrierStartedHook, .barrier_landed = laneBarrierLandedHook },
+            .hooks = .{ .ctx = be, .rollback = laneRollbackHook, .checkpoint_past = laneCheckpointPastHook, .barrier_started = laneBarrierStartedHook, .barrier_landed = laneBarrierLandedHook, .cover_upto = laneCoverHook },
             .test_error_logs = opts.test_error_logs,
         }) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -759,6 +759,7 @@ pub const KvBackend = struct {
             .applier = be.applierSeam(opts.env, cpus),
             .ack_at_apply = ackAtApply(opts.env, flush_ms),
             .tail = be.tailSeam(),
+            .self_apply = std.mem.eql(u8, knobs.enumKnob("SQUEEZEFS_META_APPLY", opts.env), "self"),
         });
         errdefer be.cv.deinit();
         try be.startPass();
@@ -1067,7 +1068,7 @@ pub const KvBackend = struct {
             .core = &be.core,
             .registry = &be.reg,
             .ring_stats = &be.ring_stats,
-            .hooks = .{ .ctx = be, .rollback = laneRollbackHook, .checkpoint_past = laneCheckpointPastHook, .barrier_started = laneBarrierStartedHook, .barrier_landed = laneBarrierLandedHook },
+            .hooks = .{ .ctx = be, .rollback = laneRollbackHook, .checkpoint_past = laneCheckpointPastHook, .barrier_started = laneBarrierStartedHook, .barrier_landed = laneBarrierLandedHook, .cover_upto = laneCoverHook },
             .test_error_logs = opts.test_error_logs,
         }) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -1143,6 +1144,7 @@ pub const KvBackend = struct {
             .applier = be.applierSeam(opts.env, cpus),
             .ack_at_apply = ackAtApply(opts.env, flush_ms),
             .tail = be.tailSeam(),
+            .self_apply = std.mem.eql(u8, knobs.enumKnob("SQUEEZEFS_META_APPLY", opts.env), "self"),
         });
         errdefer be.cv.deinit();
         try be.startPass();
@@ -1917,6 +1919,12 @@ pub const KvBackend = struct {
     fn laneBarrierStartedHook(ctx: ?*anyopaque) u64 {
         const be: *KvBackend = @ptrCast(@alignCast(ctx.?));
         return be.cp.barrierStarted();
+    }
+
+    /// §BB.4 under §BC: the conveyor's reservation high-water mark.
+    fn laneCoverHook(ctx: ?*anyopaque) u64 {
+        const be: *KvBackend = @ptrCast(@alignCast(ctx.?));
+        return be.cv.reservedHwm();
     }
 
     fn laneBarrierLandedHook(ctx: ?*anyopaque, ticket: u64) void {
@@ -3588,6 +3596,70 @@ test "§BB.1 the ack at the apply: under the coalesced cadence this mount's kern
     }
 }
 
+test "§BC self-apply: a 4-thread storm of this mount's kernel's creates — every member applied itself (self_applies ≡ commits, acks at the apply ≡ commits, no applier venue entered), every ack present and replayed after the reopen; one member poisoned mid-storm rolls out ALONE as a PAD over its range (its window's survivors stand, nothing rolled back, no hole), and the strict and venue arms park every commit until the landing" {
+    const gpa = testing.allocator;
+    const v = try TestVol.create(gpa, "self-apply", "600000");
+    defer v.destroy();
+    const threads = 4;
+    const per_thread = 50;
+    var acked: [threads][per_thread]u64 = undefined;
+    // The poisoned ino: the first thread's 25th create fails its apply.
+    const poison_index: usize = 24;
+    {
+        const be = try v.open();
+        const Storm = struct {
+            fn run(b: *KvBackend, lane_id: usize, out: *[per_thread]u64) void {
+                for (0..per_thread) |i| {
+                    var nb: [24]u8 = undefined;
+                    const n = std.fmt.bufPrint(&nb, "self-{d}-{d}", .{ lane_id, i }) catch unreachable;
+                    if (lane_id == 0 and i == poison_index) {
+                        // Staged first: the poison names the ino it minted.
+                        const t = b.begin(@src()) catch unreachable;
+                        t.kernel_origin = true;
+                        const victim = stageCreate(b, t, n, 0) catch unreachable;
+                        conveyor.test_seams.poison_apply_ino.store(victim, .monotonic);
+                        out[i] = victim;
+                        const r = b.commit(t);
+                        conveyor.test_seams.poison_apply_ino.store(0, .monotonic);
+                        if (r) |_| unreachable else |e| std.debug.assert(e == error.Corrupt);
+                        continue;
+                    }
+                    out[i] = commitCreateKernel(b, n) catch unreachable;
+                }
+            }
+        };
+        const cs = be.conveyorStats();
+        const applies0 = cs.self_applies.load();
+        const early0 = cs.acks_at_apply.load();
+        const rollbacks0 = cs.rollbacks.load();
+        var handles: [threads]std.Thread = undefined;
+        for (&handles, 0..) |*h, i| h.* = try std.Thread.spawn(.{}, Storm.run, .{ be, i, &acked[i] });
+        for (handles) |h| h.join();
+        for (acked, 0..) |lane_acks, lane_id| for (lane_acks, 0..) |ino, i| {
+            const victim = lane_id == 0 and i == poison_index;
+            try testing.expectEqual(!victim, try present(be, ino));
+        };
+        try testing.expectEqual(@as(u64, threads * per_thread), cs.self_applies.load() - applies0);
+        try testing.expectEqual(@as(u64, threads * per_thread), cs.acks_at_apply.load() - early0);
+        try testing.expectEqual(rollbacks0, cs.rollbacks.load());
+        try testing.expectEqual(@as(u64, 0), cs.tail_slot_misses.load());
+        try testing.expectEqual(@as(u32, 0), be.cv.in_apply.load(.acquire));
+        try testing.expectEqual(@as(u64, 0), cs.windows_inflight.load());
+        try be.fsync();
+        try testing.expectEqual(@as(u32, 0), be.tail.?.image.writtenCount());
+        be.close();
+    }
+    {
+        const be = try v.open();
+        defer be.close();
+        try testing.expect(be.replayStats().clean_unmount);
+        for (acked, 0..) |lane_acks, lane_id| for (lane_acks, 0..) |ino, i| {
+            const victim = lane_id == 0 and i == poison_index;
+            try testing.expectEqual(!victim, try present(be, ino));
+        };
+    }
+}
+
 test "§BB.5 a journal write that fails AFTER its window was acked: the commit returned Ok and its record STANDS (no rollback), the volume latches FAILED at once (one loud line), the tail still holds the window for the supervisor's replay" {
     const gpa = testing.allocator;
     const v = try TestVol.create(gpa, "acked-fail", "600000");
@@ -4087,6 +4159,8 @@ test "4-thread commit storm with concurrent checkpoints, then reopen: every ack 
 test "§AW the applier venue (SQUEEZEFS_META_APPLIERS=2): a 4-thread storm with concurrent checkpoints — every ack present, drained ≡ acked, no window or applier left, the promises closed, the reopen replays every acked record; the appliers ran every window (the pass applied none inline past the alone ones)" {
     const gpa = testing.allocator;
     const v = try TestVol.create(gpa, "storm-appliers", "20");
+    // The applier venue is this row's subject (§BC's control arm).
+    try v.env.put("SQUEEZEFS_META_APPLY", "venue");
     defer v.destroy();
     try v.env.put("SQUEEZEFS_META_APPLIERS", "2");
     const threads = 4;

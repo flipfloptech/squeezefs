@@ -734,6 +734,10 @@ pub const Stats = struct {
     /// hole; a tail slot missed; a verdict that beat the applier's answer).
     acks_at_apply: counters.ShardedCounter = .{},
     acks_at_landing: counters.ShardedCounter = .{},
+    /// `meta_conveyor_self_handoffs` / `meta_conveyor_self_applies`:
+    /// windows whose members applied themselves (§BC), and the members.
+    self_handoffs: counters.ShardedCounter = .{},
+    self_applies: counters.ShardedCounter = .{},
     /// `meta_conveyor_acked_write_failures`: a journal write that failed
     /// AFTER its window was acked (§BB.5): no rollback, the volume FAILED.
     acked_write_failures: counters.ShardedCounter = .{},
@@ -820,7 +824,7 @@ pub const Stats = struct {
             self.hold_bound_ns.load(),
             self.holds_pacing.load(),
         });
-        try w.print(",\"meta_conveyor_resolve_seeded\":{d},\"meta_conveyor_resolve_descended\":{d},\"meta_conveyor_acks_at_apply\":{d},\"meta_conveyor_acks_at_landing\":{d},\"meta_conveyor_acked_write_failures\":{d},\"meta_conveyor_tail_slot_misses\":{d}", .{ self.resolve_seeded.load(), self.resolve_descended.load(), self.acks_at_apply.load(), self.acks_at_landing.load(), self.acked_write_failures.load(), self.tail_slot_misses.load() });
+        try w.print(",\"meta_conveyor_resolve_seeded\":{d},\"meta_conveyor_resolve_descended\":{d},\"meta_conveyor_acks_at_apply\":{d},\"meta_conveyor_acks_at_landing\":{d},\"meta_conveyor_acked_write_failures\":{d},\"meta_conveyor_tail_slot_misses\":{d},\"meta_conveyor_self_handoffs\":{d},\"meta_conveyor_self_applies\":{d}", .{ self.resolve_seeded.load(), self.resolve_descended.load(), self.acks_at_apply.load(), self.acks_at_landing.load(), self.acked_write_failures.load(), self.tail_slot_misses.load(), self.self_handoffs.load(), self.self_applies.load() });
         try w.print(",\"meta_commit_ack_spin_hits\":{d},\"meta_commit_ack_spin_falls\":{d},\"meta_commit_ack_spin_skips\":{d},\"meta_commit_ack_spin_busy\":{d},\"meta_commit_ack_spin_bound_ns\":{d},\"meta_commit_ack_spin_wake_ns\":{d},\"meta_commit_ack_spin_ack_ns\":{d}}}", .{
             self.ack_spin_hits.load(),
             self.ack_spin_falls.load(),
@@ -894,10 +898,25 @@ pub const Outcome = Error!void;
 /// committer's spin polls it lock-free; its park learns the ack → resume
 /// wake from it (decision 0003 §AB.4).
 pub const Done = struct {
-    ch: sync.Oneshot(Outcome) = .init,
+    ch: sync.Oneshot(Signal) = .init,
+    /// The terminal outcome of a member that applied itself and waits for
+    /// the landing (§BC: a served verb, a control record, a tool).
+    landing: sync.Oneshot(Outcome) = .init,
     acked_ns: std.atomic.Value(u64) = .init(0),
+    /// `ch` carried the turn: the terminal outcome goes to `landing`.
+    turned: bool = false,
 
     pub const init: Done = .{};
+
+    /// What the committer's park receives: its terminal outcome, or its
+    /// TURN — the window is reserved, its seq stamped; the committer
+    /// applies its own transaction (`Conveyor.applyOwn`, §BC).
+    pub const Signal = union(enum) {
+        outcome: Outcome,
+        turn: Turn,
+    };
+
+    pub const Turn = struct { w: *Window, idx: u32 };
 
     pub fn send(self: *Done, io: Io, outcome: Outcome) error{ReceiverGone}!void {
         // The stamp BEFORE the send: once the channel holds the outcome the
@@ -906,8 +925,20 @@ pub const Done = struct {
         // spinner's acquire — a non-zero stamp is an outcome on its way
         // (the receiver's recv waits out the channel's lock for it).
         self.acked_ns.store(@max(clock.monotonicNs(), 1), .release);
-        try self.ch.send(io, outcome);
+        if (self.turned) {
+            try self.landing.send(io, outcome);
+        } else {
+            try self.ch.send(io, .{ .outcome = outcome });
+        }
         holdAfterSend();
+    }
+
+    /// The pass hands the member its turn (§BC); `send` after it answers
+    /// through `landing`.
+    pub fn sendTurn(self: *Done, io: Io, w: *Window, idx: u32) error{ReceiverGone}!void {
+        self.turned = true;
+        self.acked_ns.store(@max(clock.monotonicNs(), 1), .release);
+        try self.ch.send(io, .{ .turn = .{ .w = w, .idx = idx } });
     }
 
     fn holdAfterSend() void {
@@ -916,8 +947,17 @@ pub const Done = struct {
         while (test_seams.hold_after_send.load(.acquire) != 0) std.Thread.yield() catch {};
     }
 
-    pub fn recvUncancelable(self: *Done, io: Io) error{SenderGone}!Outcome {
+    pub fn recvUncancelable(self: *Done, io: Io) error{SenderGone}!Signal {
         return self.ch.recvUncancelable(io);
+    }
+
+    /// The terminal outcome of a member on the applier venue (the
+    /// contracts' receivers: no turn is ever sent to them).
+    pub fn recvOutcome(self: *Done, io: Io) error{SenderGone}!Outcome {
+        return switch (try self.ch.recvUncancelable(io)) {
+            .outcome => |o| o,
+            .turn => unreachable,
+        };
     }
 };
 
@@ -980,6 +1020,9 @@ pub const Queued = struct {
     /// (a retained reference; in `q`'s arena): the applier's resolve starts
     /// here and descends only for a leaf superseded, split or moved since.
     seeds: []*CachedNode = &.{},
+    /// A `commitGroup` member: its committer parks on its siblings in
+    /// turn, so it never applies itself (§BC).
+    grouped: bool = false,
 
     /// The terminal outcome's teardown: the seeds' references, then the tx.
     fn deinit(self: *Queued) void {
@@ -1039,6 +1082,36 @@ pub const Window = struct {
     /// Parties that must leave before the window is freed: the lane's
     /// verdict, plus the applier while it answers ahead of the landing.
     parties: std.atomic.Value(u8) = .init(1),
+    /// §BC: the members applied themselves (one `Part` each, arena-owned);
+    /// the last to finish built the image and submitted. `pending` counts
+    /// the members still applying.
+    self_applied: bool = false,
+    parts: []Part = &.{},
+    pending: std.atomic.Value(u32) = .init(0),
+
+    /// One self-applying member's share of the window (§BC): its own
+    /// arena (the members apply concurrently), its sub-range and seq, its
+    /// ops (the window's image is their concatenation), its pre-images,
+    /// its tail slot, and whether it answered itself at the apply.
+    pub const Part = struct {
+        arena: std.heap.ArenaAllocator,
+        start: u64,
+        seq: u64,
+        /// The member's entry length (its `QueuedTx` dies with its ack).
+        len: u64,
+        ops: []const journal.WriteOp = &.{},
+        header_bytes: u64 = 0,
+        undo: []tx.UndoKey = &.{},
+        tail_slot: ?u32 = null,
+        answered: bool = false,
+    };
+
+    /// A self-applied window with a member answered ahead of the landing:
+    /// nothing in it may be rolled back (§BB.5).
+    fn anyAnswered(self: *const Window) bool {
+        for (self.parts) |p| if (p.answered) return true;
+        return false;
+    }
 
     pub const ACK_NONE: u8 = 0;
     pub const ACK_APPLIER: u8 = 1;
@@ -1056,6 +1129,7 @@ pub const Window = struct {
         // acq_rel: the last party sees every other party's writes.
         if (self.parties.fetchSub(1, .acq_rel) == 1) {
             if (self.image) |*img| img.deinit();
+            for (self.parts) |*p| p.arena.deinit();
             self.arena.deinit();
             self.conveyor.deps.gpa.destroy(self);
         }
@@ -1065,9 +1139,12 @@ pub const Window = struct {
         return SeqSpan.stamped(self.seq_base, self.res.len);
     }
 
-    /// Whether a member was rolled out at apply (the window has a hole the
-    /// survivors' ack must wait a checkpoint past).
+    /// Whether a member was rolled out at apply leaving a HOLE the
+    /// survivors' ack must wait a checkpoint past. A self-applied window
+    /// (§BC) writes a PAD entry over a rolled-out member's range — a chain
+    /// link, never a hole.
     pub fn applyHoles(self: *const Window) bool {
+        if (self.self_applied) return false;
         for (self.failed) |f| if (f != null) return true;
         return false;
     }
@@ -1287,6 +1364,11 @@ pub const Deps = struct {
     ack_at_apply: bool = false,
     /// The journal tail (§BB.2); null = none (the contracts, a reader).
     tail: ?TailSeam = null,
+    /// §BC: every member applies its OWN transaction on its committer's
+    /// thread once the pass reserved and stamped the window (no applier
+    /// hop, per-tx leaf locks); false = the applier venue (§AW; the
+    /// portable contracts' default, `SQUEEZEFS_META_APPLY=venue`).
+    self_apply: bool = false,
 };
 
 /// The committer's thread as the ack spin sees it (the backend binds the
@@ -1326,6 +1408,9 @@ pub const Conveyor = struct {
     /// law) plus the one a pass tracks before the lane refuses it — so
     /// `track` never allocates under the spin lock (charter §1.3).
     inflight_lock: jc.SpinLock = .{},
+    /// The end of the furthest window reserved (§BB.4 under §BC: what an
+    /// fsync must see landed, read by the lane through `Hooks.cover_upto`).
+    reserved_hwm: std.atomic.Value(u64) = .init(0),
     inflight: std.AutoHashMapUnmanaged(u64, *Window) = .empty,
     inflight_cap: usize,
     /// The thread the last pass ran on (`std.Thread.getCurrentId`): the
@@ -1508,10 +1593,11 @@ pub const Conveyor = struct {
                 continue;
             }
             d.* = .init;
-            const entry = self.build(t, d) catch |e| {
+            var entry = self.build(t, d) catch |e| {
                 r.* = e;
                 continue;
             };
+            entry.grouped = true;
             scratch.entries[n] = .{ .item = entry, .len = entry.q.len };
             scratch.tx_of[n] = i;
             n += 1;
@@ -1724,7 +1810,7 @@ pub const Conveyor = struct {
         } else {
             if (spinForAck(done, bound)) {
                 self.stats.ack_spin_hits.inc();
-                return done.recvUncancelable(self.deps.io) catch error.Corrupt;
+                return self.takeSignal(done.recvUncancelable(self.deps.io) catch return error.Corrupt);
             }
             self.stats.ack_spin_falls.inc();
         }
@@ -1736,7 +1822,16 @@ pub const Conveyor = struct {
             // gap holds its work, not the wake's cost.
             if (acked != 0 and resumed > acked and caller.?.polls() == polls0 +% 1) self.ack_spin.wake.sample(resumed - acked);
         }
-        return r;
+        return self.takeSignal(r);
+    }
+
+    /// The park's signal: the outcome, or the turn — the committer applies
+    /// its own transaction here, on its thread (§BC).
+    fn takeSignal(self: *Conveyor, sig: Done.Signal) Error!void {
+        return switch (sig) {
+            .outcome => |o| o,
+            .turn => |t| self.applyOwn(t.w, t.idx),
+        };
     }
 
     // ---- the pass (stage A) ----
@@ -2228,6 +2323,9 @@ pub const Conveyor = struct {
             return;
         };
         admission = null;
+        // The reservation high-water mark the lane's fsync cover reads
+        // (§BB.4 under §BC); monotonic: positions only grow.
+        _ = self.reserved_hwm.fetchMax(reg.res.paddedEnd(), .release);
         var stamp_cursor = reg.seq_base;
         for (window_members) |*m| {
             _ = m.q.stampSeqs(stamp_cursor);
@@ -2251,6 +2349,12 @@ pub const Conveyor = struct {
             return;
         };
         self.stats.pass_total.record(clock.monotonicNs() -| t_pass);
+        // §BC: every member applies its own transaction on its committer's
+        // thread — the pass only reserved, stamped and serialized. A group
+        // commit's members park one after another on ONE thread, so a
+        // window holding one takes the applier venue (its members' turns
+        // could not all be taken while the first waits for the landing).
+        if (self.deps.self_apply and !anyGrouped(window_members)) return self.handToMembers(w);
         // A8½: the handoff to an APPLIER (§AW): a fiber on the applier
         // venue runs the second half while this pass drains the next
         // batch and the lane lands the earlier windows. A window with
@@ -2264,6 +2368,233 @@ pub const Conveyor = struct {
         _ = self.in_apply.fetchAdd(1, .acq_rel);
         const a = self.deps.applier;
         if (alone or !a.spawn(a.ctx, w)) self.applyWindow(w);
+    }
+
+    /// §BC: the members' turns. Each gets its sub-range, its seq and its
+    /// own arena, then the signal; the last to finish applying submits the
+    /// window (`submitSelfApplied`). A member whose committer is gone (it
+    /// cannot be: the park is uncancelable) is rolled out as a PAD.
+    fn handToMembers(self: *Conveyor, w: *Window) void {
+        const gpa = self.deps.gpa;
+        const wa = w.arena.allocator();
+        const n = w.members.len;
+        w.parts = wa.alloc(Window.Part, n) catch {
+            self.abandonWindow(w, error.OutOfMemory);
+            return;
+        };
+        var pos = w.res.start;
+        var seq = w.seq_base;
+        for (w.parts, w.members) |*p, *m| {
+            p.* = .{ .arena = std.heap.ArenaAllocator.init(gpa), .start = pos, .seq = seq, .len = m.q.len };
+            pos += m.q.len;
+            seq += m.q.len;
+        }
+        w.self_applied = true;
+        w.pending.store(@intCast(n), .release);
+        self.stats.self_handoffs.inc();
+        var gone: u32 = 0;
+        for (w.members, 0..) |*m, i| {
+            m.done.sendTurn(self.deps.io, w, @intCast(i)) catch {
+                w.failed[i] = error.Corrupt;
+                gone += 1;
+            };
+        }
+        // A member nobody applies: its range a PAD, its share of `pending`
+        // ours (its committer left nothing to answer).
+        var k: u32 = 0;
+        while (k < gone) : (k += 1) {
+            if (w.pending.fetchSub(1, .acq_rel) == 1) self.submitSelfApplied(w);
+        }
+    }
+
+    /// §BC: ONE member's apply on its own committer's thread — A3 resolve
+    /// (seeded) → A4 lock ITS leaves (ascending) → A5 revalidate → A7 its
+    /// pre-images → A9 apply → A10 the threshold → unlock → A12 its own
+    /// ops (a PAD over its range if it rolled out) → the tail → the ack
+    /// (this mount's kernel's own op, §BB.1) → the window's submit when it
+    /// is the last member. A served verb, a control record or a tool waits
+    /// for the landing. Returns the member's terminal outcome.
+    pub fn applyOwn(self: *Conveyor, w: *Window, idx: u32) Outcome {
+        const m = &w.members[idx];
+        const p = &w.parts[idx];
+        const a = p.arena.allocator();
+        const members = w.members[idx .. idx + 1];
+        const failed = w.failed[idx .. idx + 1];
+        const done = m.done;
+        const kernel_origin = m.q.kernel_origin;
+        const len = m.q.len;
+        const t_apply = clock.monotonicNs();
+        self.stats.self_applies.inc();
+        var attempt: u32 = 0;
+        while (failed[0] == null) : (attempt += 1) {
+            if (attempt >= COMMIT_RETRY_BUDGET) {
+                log.err("meta volume {s}: commit retry budget exhausted (revalidation never passed — SMO protocol bug)", .{self.deps.volume});
+                failed[0] = error.RetryBudgetExhausted;
+                break;
+            }
+            var r = self.resolve(a, members, .apply) catch |e| {
+                failed[0] = e;
+                break;
+            };
+            const dirties = a.alloc(*NodeDirty, r.lock_set.len) catch {
+                r.releaseRefs();
+                failed[0] = error.OutOfMemory;
+                break;
+            };
+            const t_leaf = clock.monotonicNs();
+            self.lockAll(r.lock_set, dirties);
+            if (stale(members, &r)) {
+                self.unlockAll(r.lock_set);
+                self.stats.leaf_lock_hold.record(clock.monotonicNs() -| t_leaf);
+                r.releaseRefs();
+                tree.stats.meta_kv_commit_smo_retries.inc();
+                continue;
+            }
+            p.undo = self.captureUndo(a, members, &r) catch |e| {
+                self.unlockAll(r.lock_set);
+                r.releaseRefs();
+                failed[0] = e;
+                break;
+            };
+            self.applyMembers(members, &r, dirties, p.start, p.seq, failed);
+            var threshold_crossed = false;
+            for (r.lock_set, dirties) |n, d| {
+                if (d.overlayBytes() >= self.deps.cache.cfg.writeback_delta_bytes) {
+                    if (self.treeOf(n)) |t| {
+                        t.enqueueMaintenance(n.addr);
+                        threshold_crossed = true;
+                    }
+                }
+            }
+            self.unlockAll(r.lock_set);
+            self.stats.leaf_lock_hold.record(clock.monotonicNs() -| t_leaf);
+            r.releaseRefs();
+            if (threshold_crossed) self.deps.checkpoint.kickThreshold(self.deps.checkpoint.ctx);
+            break;
+        }
+        self.stats.pass_leaf_locks.record(clock.monotonicNs() -| t_apply);
+        // A12, the member's own: its entry, or a PAD over its range.
+        const sub = Reservation.unpadded(p.start, len);
+        var ops: std.ArrayList(journal.WriteOp) = .empty;
+        if (failed[0] == null) {
+            const encoded: Error!u64 = blk: {
+                const frames = m.q.framesAlloc() catch break :blk error.OutOfMemory;
+                break :blk journal.partOps(a, self.deps.ring_layout, self.deps.geo, self.deps.appender_id, .{ .res = sub, .records = frames }, &ops) catch |e| switch (e) {
+                    error.OutOfMemory => error.OutOfMemory,
+                    else => error.Corrupt,
+                };
+            };
+            if (encoded) |hb| {
+                p.header_bytes = hb;
+            } else |e| {
+                // Applied, unencodable: its records leave as a failed write's
+                // would (seq-conditional), its range becomes a PAD.
+                self.rollbackFailedTx(SeqSpan.stamped(p.seq, len), p.undo);
+                failed[0] = e;
+                ops.clearRetainingCapacity();
+            }
+        }
+        if (failed[0] != null) {
+            p.header_bytes = journal.partOps(a, self.deps.ring_layout, self.deps.geo, self.deps.appender_id, .{ .res = sub, .records = &.{}, .pad = true }, &ops) catch 0;
+        }
+        p.ops = ops.items;
+        if (self.deps.door) |d| d.frontier(d.ctx, &m.q.door, p.start + len);
+        self.stats.apply_total.record(clock.monotonicNs() -| t_apply);
+        // The ack ahead of the landing (§BB.1): this mount's kernel's own
+        // op, its bytes in the tail first; a failed member's error is its
+        // outcome now whatever its origin — nothing of it will land.
+        const outcome: Outcome = if (failed[0]) |e| e else {};
+        var early = kernel_origin and (self.deps.ack_at_apply or failed[0] != null);
+        if (early and failed[0] == null) if (self.deps.tail) |t| {
+            p.tail_slot = t.claim(t.ctx, p.seq, p.ops);
+            if (p.tail_slot == null) {
+                self.stats.tail_slot_misses.fire("the journal tail's slot table refused a member; acked at the landing");
+                early = false;
+            }
+        };
+        if (early) {
+            p.answered = true;
+            self.stats.acks_at_apply.inc();
+            self.answerOne(m, outcome, false);
+        }
+        // The last member to finish writes the window. Nothing of `w` is
+        // touched past this point by a member that answered itself: the
+        // lane may finish and free the window at once.
+        if (w.pending.fetchSub(1, .acq_rel) == 1) self.submitSelfApplied(w);
+        if (early) return outcome;
+        return done.landing.recvUncancelable(self.deps.io) catch error.Corrupt;
+    }
+
+    /// §BC: every member applied (or rolled out) — the window's image from
+    /// their ops, the handoff to the lane. Runs on the last member's thread.
+    fn submitSelfApplied(self: *Conveyor, w: *Window) void {
+        const gpa = self.deps.gpa;
+        const wa = w.arena.allocator();
+        var entry_bytes: u64 = 0;
+        var header_bytes: u64 = 0;
+        var survivors: u64 = 0;
+        var undo_n: usize = 0;
+        for (w.parts, w.failed) |p, f| {
+            header_bytes += p.header_bytes;
+            undo_n += p.undo.len;
+            if (f == null) {
+                survivors += 1;
+                entry_bytes += p.len;
+            }
+        }
+        w.entries = survivors;
+        // The undo of the whole window, for the lane's rollback of a
+        // window nobody was acked from.
+        if (wa.alloc(tx.UndoKey, undo_n)) |undo| {
+            var i: usize = 0;
+            for (w.parts) |p| {
+                @memcpy(undo[i .. i + p.undo.len], p.undo);
+                i += p.undo.len;
+            }
+            w.undo = undo;
+        } else |_| {}
+        w.image = if (wa.alloc([]const journal.WriteOp, w.parts.len)) |member_ops| blk: {
+            for (w.parts, member_ops) |p, *mo| mo.* = p.ops;
+            break :blk journal.buildWindowFromOps(gpa, self.deps.ring_layout, self.deps.geo, self.deps.appender_id, w.res, member_ops, entry_bytes, header_bytes) catch null;
+        } else |_| null;
+        w.t_handoff_ns = clock.monotonicNs();
+        if (w.image == null) {
+            self.abandonSelfApplied(w, error.OutOfMemory);
+            return;
+        }
+        self.stats.lane_handoffs.inc();
+        if (w.held) self.stats.windows_held.inc() else if (w.acct().padMajority()) self.stats.windows_unshadowed.inc() else self.stats.windows_pipelined.inc();
+        self.deps.lane.submit(self.deps.lane.ctx, w) catch |e| self.abandonSelfApplied(w, e);
+    }
+
+    /// A self-applied window the lane never took: a window with a member
+    /// answered ahead of the landing rolls nothing back and latches the
+    /// volume FAILED (§BB.5); one nobody was acked from rolls back as any
+    /// abandoned window.
+    fn abandonSelfApplied(self: *Conveyor, w: *Window, err: Error) void {
+        if (!w.anyAnswered()) return self.abandonWindow(w, err);
+        self.stats.acked_write_failures.inc();
+        if (self.deps.latch.failStop()) {
+            log.err("meta volume {s}: an ACKED window could not be handed to the journal lane ({s}) — volume marked FAILED; mutations return EIO until remount; the supervisor's tail replay carries the acked bytes", .{ self.deps.volume, @errorName(err) });
+        }
+        self.completeAbandoned(w.res);
+        self.finishWindow(w, err);
+    }
+
+    /// One member's terminal bookkeeping: the tee, its kernel's
+    /// invalidation, the lease epochs, the guards, and — unless it is the
+    /// committer answering itself — the send.
+    fn answerOne(self: *Conveyor, m: *Queued, outcome: Outcome, send: bool) void {
+        if (outcome) |_| {
+            if (self.tee.load(.acquire)) |tee| tee.note(tee.ctx, m.q.recs);
+        } else |_| {}
+        if (self.kernel.load(.acquire)) |view| noteKernel(view, &m.q, if (outcome) |_| false else |_| true);
+        noteLease(&m.q);
+        m.q.guards.release();
+        if (outcome) |_| self.stats.acks.inc() else |_| self.stats.refusals.inc();
+        self.ack_spin.ack.sample(clock.monotonicNs() -| m.enqueued_ns);
+        if (send) m.done.send(self.deps.io, outcome) catch {};
+        m.deinit();
     }
 
     /// A window left its applier (submitted, or abandoned on its way): the
@@ -2428,6 +2759,15 @@ pub const Conveyor = struct {
         }
     }
 
+    fn anyGrouped(members: []const Queued) bool {
+        for (members) |m| if (m.grouped) return true;
+        return false;
+    }
+
+    pub fn reservedHwm(self: *const Conveyor) u64 {
+        return self.reserved_hwm.load(.acquire);
+    }
+
     /// Every member is a request this mount's kernel sent (`tx.kernel_origin`).
     fn kernelOriginOnly(members: []const Queued) bool {
         for (members) |m| if (!m.q.kernel_origin) return false;
@@ -2577,7 +2917,8 @@ pub const Conveyor = struct {
         // §BB.5: the lane claims the answer BEFORE it rolls back; a window
         // the applier already answered keeps its RAM (the ack stands) and
         // the volume latches FAILED — the tail's replay retries the bytes.
-        if (w.claimAck(Window.ACK_LANE)) {
+        const acked = if (w.self_applied) w.anyAnswered() else !w.claimAck(Window.ACK_LANE);
+        if (!acked) {
             self.rollbackFailedTx(span, w.undo);
             return;
         }
@@ -2630,12 +2971,31 @@ pub const Conveyor = struct {
         self.stats.window_total.record(rtt);
         // The answer, unless the applier gave it ahead of the landing
         // (§BB.1); the rollback arm claimed it already (§BB.5).
+        if (w.self_applied) {
+            // The members that waited for the landing (§BC: a served verb,
+            // a control record, a tool; a member whose tail slot was
+            // refused); the others answered themselves at the apply.
+            for (w.members, w.parts, w.failed) |*m, *p, f| {
+                if (p.answered) continue;
+                self.stats.acks_at_landing.inc();
+                self.answerOne(m, if (f) |e| e else result, true);
+            }
+            // The tail slots of a window that LANDED; a failed write's stay
+            // written for the supervisor's replay (§BB.5).
+            if (result) |_| {
+                for (w.parts) |p| if (p.tail_slot) |slot| if (self.deps.tail) |t| t.release(t.ctx, slot);
+            } else |_| {}
+            w.release();
+            return;
+        }
         const owner = w.ack_owner.load(.acquire);
         if (owner == Window.ACK_LANE or w.claimAck(Window.ACK_LANE)) {
             self.stats.acks_at_landing.inc();
             self.answerMembers(w, result);
         }
-        if (w.tail_slot) |slot| if (self.deps.tail) |t| t.release(t.ctx, slot);
+        if (result) |_| {
+            if (w.tail_slot) |slot| if (self.deps.tail) |t| t.release(t.ctx, slot);
+        } else |_| {}
         w.release();
     }
 
@@ -3704,7 +4064,7 @@ test "the ack spin: an ack landing inside the bound is a hit (the outcome on its
     const t = try std.Thread.spawn(.{}, Sender.run, .{&done});
     try testing.expect(spinForAck(&done, 5 * std.time.ns_per_s));
     t.join();
-    try (try done.recvUncancelable(testing.io));
+    try (try done.recvOutcome(testing.io));
     var never: Done = .init;
     const t0 = clock.monotonicNs();
     try testing.expect(!spinForAck(&never, 200 * std.time.ns_per_us));
@@ -3725,7 +4085,7 @@ test "Done.send writes nothing once the receiver can take the outcome: a committ
         }
     };
     const t = try std.Thread.spawn(.{}, Sender.run, .{done});
-    try (try done.recvUncancelable(testing.io));
+    try (try done.recvOutcome(testing.io));
     while (test_seams.send_held.load(.acquire) == 0) std.Thread.yield() catch {};
     // The receiver's frame moves on: every byte of it is someone else's now.
     @memset(std.mem.asBytes(done), 0xA5);
@@ -4053,8 +4413,8 @@ test "rollback: a failed window answers JournalWriteFailed, its records are roll
     h.lane.failWindow(0);
     h.lane.land(1);
     h.lane.pump();
-    try testing.expectError(error.JournalWriteFailed, try da.recvUncancelable(testing.io));
-    try try db.recvUncancelable(testing.io);
+    try testing.expectError(error.JournalWriteFailed, try da.recvOutcome(testing.io));
+    try try db.recvOutcome(testing.io);
     try testing.expect(!try h.present(ino_a));
     try testing.expect(try h.present(ino_b));
     // The parent's newest record is still B's (A's Δ was removed, B's stands).
@@ -4102,7 +4462,7 @@ test "an escaped record (a freeze raced the failed write) is compensated through
     for (h.vol.trees.items) |tr| try h.vol.flushPass(tr);
     h.lane.failWindow(0);
     h.lane.pump();
-    try testing.expectError(error.JournalWriteFailed, try d.recvUncancelable(testing.io));
+    try testing.expectError(error.JournalWriteFailed, try d.recvOutcome(testing.io));
     try testing.expect(h.cv.stats.compensations.load() > 0);
     try testing.expect(!try h.present(victim));
     try testing.expect(try h.present(base));
@@ -4150,7 +4510,7 @@ test "a compensation entry whose device write fails is the fail-stop lattice's o
     h.lane.failWindow(0);
     h.lane.pump();
     try log.testing.expectAllFired();
-    try testing.expectError(error.JournalWriteFailed, try d.recvUncancelable(testing.io));
+    try testing.expectError(error.JournalWriteFailed, try d.recvOutcome(testing.io));
     try testing.expectEqual(failures0 + 1, h.cv.stats.compensation_write_failures.load());
     try testing.expectEqual(site0, counters.tripwireCount("conveyor_divergence_compensation"));
     try testing.expectEqual(@as(u64, 0), h.cv.stats.divergence_compensation.load());
@@ -4210,7 +4570,7 @@ test "a rollback that cannot complete on a volume ALREADY FAILED is the counted 
     h.lane.failWindow(0);
     h.lane.pump();
     h.lane.oom_on_rollback = null;
-    try testing.expectError(error.JournalWriteFailed, try d.recvUncancelable(testing.io));
+    try testing.expectError(error.JournalWriteFailed, try d.recvOutcome(testing.io));
     try testing.expectEqual(failed0 + 1, h.cv.stats.divergences_failed_volume.load());
     try testing.expectEqual(div0, h.cv.stats.divergence_rollback.load());
     try testing.expectEqual(site0, counters.tripwireCount("conveyor_divergence_rollback"));

@@ -714,7 +714,35 @@ pub fn buildEntryWrite(gpa: Allocator, layout: RingLayout, geo: CoreGeometry, ap
 pub const BatchPart = struct {
     res: Reservation,
     records: []const RecordFrame,
+    /// The member rolled out at apply: a PAD entry over its exact range
+    /// (no hole — the chain walks past it, so a survivor behind it that
+    /// was acked ahead of the landing is reachable at replay).
+    pad: bool = false,
 };
+
+/// One member's ops into `ops` (the self-applying committer builds its
+/// own, §BC): its framed entry, or a PAD entry over its range when it
+/// rolled out. Answers the page-header bytes appended.
+pub fn partOps(arena: Allocator, layout: RingLayout, geo: CoreGeometry, appender_id: u32, part: BatchPart, ops: *std.ArrayList(WriteOp)) Error!u64 {
+    if (part.pad) return padOps(arena, layout, geo, appender_id, part.res.start, part.res.len, ops);
+    return entryOps(arena, layout, geo, appender_id, part.res, part.records, ops);
+}
+
+/// A conveyor window's write from its members' ops already built
+/// (`partOps`, each on its committer): the window's PAD entry, then the
+/// ring's aligned form. `entry_bytes` = Σ the surviving members' lengths.
+pub fn buildWindowFromOps(gpa: Allocator, layout: RingLayout, geo: CoreGeometry, appender_id: u32, window: Reservation, member_ops: []const []const WriteOp, entry_bytes: u64, header_bytes: u64) Error!WriteImage {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    errdefer arena.deinit();
+    const a = arena.allocator();
+    var n: usize = 0;
+    for (member_ops) |m| n += m.len;
+    var ops: std.ArrayList(WriteOp) = try .initCapacity(a, n + 8);
+    for (member_ops) |m| ops.appendSliceAssumeCapacity(m);
+    const header_ops_bytes = header_bytes + try padOps(a, layout, geo, appender_id, window.end(), window.pad, &ops);
+    const aligned = try alignedOps(a, layout, geo, window.start, window.paddedEnd(), ops.items);
+    return .{ .arena = arena, .ops = aligned, .acct = accountWindow(geo, window, entry_bytes, header_ops_bytes, aligned) };
+}
 
 /// A conveyor batch's write: N ordinary checksummed entries at back-to-back
 /// reservations inside ONE registered `window` (its span and its pad — the
@@ -733,8 +761,8 @@ pub fn buildBatchWrite(gpa: Allocator, layout: RingLayout, geo: CoreGeometry, ap
     var header_ops_bytes: u64 = 0;
     var entry_bytes: u64 = 0;
     for (parts) |p| {
-        header_ops_bytes += try entryOps(a, layout, geo, appender_id, p.res, p.records, &ops);
-        entry_bytes += p.res.len;
+        header_ops_bytes += try partOps(a, layout, geo, appender_id, p, &ops);
+        if (!p.pad) entry_bytes += p.res.len;
     }
     header_ops_bytes += try padOps(a, layout, geo, appender_id, window.end(), window.pad, &ops);
     const aligned = try alignedOps(a, layout, geo, window.start, window.paddedEnd(), ops.items);

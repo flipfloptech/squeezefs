@@ -400,6 +400,11 @@ pub const Hooks = struct {
     /// `barrierLanded`): the lane's barriers and the checkpointer's move the
     /// ring, the allocator's coverage clock and the elision tail on one clock.
     barrier_landed: ?*const fn (ctx: ?*anyopaque, ticket: u64) void = null,
+    /// §BB.4 under §BC: the end of the furthest USER window reserved so far
+    /// (the conveyor's), which a barrier request must see landed — a window
+    /// whose members are still applying it is reserved and acked before the
+    /// lane sees it. Null = the lane's own pending windows.
+    cover_upto: ?*const fn (ctx: ?*anyopaque) u64 = null,
 };
 
 // ---------------------------------------------------------------------------
@@ -1033,7 +1038,7 @@ pub const JournalLane = struct {
         switch (c.kind) {
             .barrier => {
                 c.need_barrier = w.barriers_started + 1;
-                c.cover_upto = self.pendingEnd();
+                c.cover_upto = self.coverNow();
                 w.fsync_waiters.appendAssumeCapacity(idx);
                 w.needs_flush = true;
                 w.flush_due_ns = 0;
@@ -1454,26 +1459,22 @@ pub const JournalLane = struct {
         w.flush_due_ns = @max(now, w.last_barrier_ns + self.cadence.interval_ns);
     }
 
-    /// The end of the furthest window admitted so far (0 with none): what
-    /// a barrier request admitted now must see landed (§BB.4).
-    fn pendingEnd(self: *JournalLane) u64 {
-        const w = &self.w;
+    /// What a barrier request admitted now must see landed (§BB.4): every
+    /// user window reserved so far (`Hooks.cover_upto`; §BC: reserved and
+    /// acked before the lane sees it), else the lane's own pending windows.
+    fn coverNow(self: *JournalLane) u64 {
         var end: u64 = 0;
+        const w = &self.w;
         for (w.pending.items) |idx| end = @max(end, self.cells[idx].window.paddedEnd());
         for (w.group.items) |idx| end = @max(end, self.cells[idx].window.paddedEnd());
+        if (self.hooks.cover_upto) |f| end = @max(end, f(self.hooks.ctx));
         return end;
     }
 
-    /// The lowest position of a pending window NOT yet landed (∞ with
-    /// none): every window below it is on the device.
-    fn unlandedFloor(self: *JournalLane) u64 {
-        const w = &self.w;
-        var floor: u64 = std.math.maxInt(u64);
-        for (w.pending.items) |idx| {
-            const c = &self.cells[idx];
-            if (!c.landed) floor = @min(floor, c.window.start);
-        }
-        return floor;
+    /// The registry's completed prefix: every reservation below it landed
+    /// (or completed as a hole).
+    fn landedFloor(self: *JournalLane) u64 {
+        return self.registry.completedUpto();
     }
 
     /// The oldest fsync request's cover (∞ with no waiter).
@@ -1491,7 +1492,7 @@ pub const JournalLane = struct {
         // admitted before the request landed — the FSYNC must follow their
         // CQEs (the ring orders nothing between SQEs); the landing's CQE
         // wakes this fiber, so the hold is no tick's.
-        if (w.fsync_waiters.items.len != 0 and self.firstCover() > self.unlandedFloor()) {
+        if (w.fsync_waiters.items.len != 0 and self.firstCover() > self.landedFloor()) {
             w.flush_held_for_cover = true;
             return;
         }
@@ -1509,7 +1510,7 @@ pub const JournalLane = struct {
         w.flush_held_for_cover = false;
         w.barrier_in_flight = kind;
         w.barrier_landed = false;
-        w.barrier_floor = self.unlandedFloor();
+        w.barrier_floor = self.landedFloor();
         // The DUR-3 ticket BEFORE the device op (a wasted ticket on an issue
         // failure only makes later pushes wait for a later barrier).
         w.barrier_ticket = if (self.hooks.barrier_started) |f| f(self.hooks.ctx) else 0;

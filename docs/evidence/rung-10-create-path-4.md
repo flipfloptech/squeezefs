@@ -22,25 +22,22 @@ point as before the old (INVALIDATION COHERENCE ×5 green).
 ## The tail (`meta/journal_tail.zig`) and the replay's proof
 
 Per writable volume a size-sealed memfd: a header (device path, ring segments, grain), a slot table of
-2× the lane's cells (48 B: state, seq_base, two covering runs), a MIRROR of the ring at its own
-offsets. The applier copies the window's ops into the mirror and publishes the slot before the lane
-handoff; the lane's verdict frees it. The bytes the lane writes ARE the replay's: idempotent, a landed
-slot skipped. The daemon sends each tail's fd and the writer guard's fd over a `SOCK_SEQPACKET`
-socketpair the intermediate made before the second fork; the supervisor parks in `poll` on it (a death
-is a `POLLHUP`, seen at once) and at the death writes every written slot to the device in seq order,
-`fsync`s, then closes the guard fds — the `flock`'s open file description is shared, so the dead claim
-holds until the device is complete; a successor waits it out in `guard.proc`'s 5 s bound.
-
-**THE REPLAY PROOF (smoke):** a `--daemon --supervise` mount under the landing-hold seam
-(`SQUEEZEFS_TEST_JOURNAL_HOLD_LANDING`), three creates acked, `kill -9` → "7 un-landed window(s),
-28672 bytes replayed and barriered", then "writer guard released", fsck clean, the remount finds all
-three. The foreground control arm loses its create ("lost"), fsck clean: the window. The coalesced
-`kill -9 mid-tar -x` row runs supervised now (the second proof); THE KILL MATRIX stands as written.
-Unit: the tail's codec, claim/replay in seq order with landed slots skipped and a second replay
-byte-identical, the wrap's two runs, a segmented ring's split, the memfd's seals and `replayFd`; the
-lane's §BB.4 (an fsync behind an un-landed window waits for its landing); the backend's ack at the
-apply (the commit returns under the hold, fsync parks, the landing frees the slot; the landing and
-strict arms keep the commit parked) and the acked write failure (the record stands, FAILED at once).
+2× the lane's cells (state, seq_base, two covering runs), a MIRROR of the ring at its own offsets. The
+applier copies the window's ops into the mirror and publishes the slot before the lane handoff; the
+lane's verdict frees it; the bytes the lane writes ARE the replay's (idempotent, a landed slot skipped).
+The daemon sends each tail's fd and the writer guard's fd over a `SOCK_SEQPACKET` socketpair made before
+the second fork; the supervisor parks in `poll` on it (a death is a `POLLHUP`) and at the death writes
+every written slot in seq order, `fsync`s, then closes the guard fds — the `flock`'s open file
+description is shared, so the dead claim holds until the device is complete (a successor waits it out
+in `guard.proc`'s 5 s bound). **THE REPLAY PROOF (smoke):** a supervised mount under the landing-hold
+seam, three creates acked, `kill -9` → "7 un-landed window(s), 28672 bytes replayed and barriered",
+then "writer guard released", fsck clean, the remount finds all three; the foreground control arm
+loses its create: the window. The coalesced `kill -9 mid-tar -x` row runs supervised (the second
+proof); THE KILL MATRIX stands. Unit: the tail's codec, claim/replay in seq order with landed slots
+skipped and a second replay byte-identical, the wrap, a segmented ring, the memfd's seals and
+`replayFd`; the lane's §BB.4; the backend's ack at the apply (a kernel commit returns under the hold,
+fsync parks, the landing frees the slot; a served verb's commit, the landing arm and strict mode keep
+the commit parked) and the acked write failure (the record stands, FAILED at once).
 
 ## Group commit (§BB.6) — a measure, not built
 

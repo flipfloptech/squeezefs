@@ -30,8 +30,10 @@ and the path no longer a FUSE mount, returned 0.
 ## 2. The contract (0003 §S)
 
 **Default — refuse loud.** `squeezefs umount <mnt>` runs the holder census (`src/cli/holders.zig`) before
-it signals: every process's `cwd`/`root`/`exe` through `statx(STATX_MNT_ID, AT_STATX_DONT_SYNC)` on the
-`/proc` magic links, every fd through `fdinfo`'s `mnt_id`, mappings through `maps` by device number,
+it signals: every process's `cwd`/`root`/`exe` and every `fd/<n>` through `statx(STATX_MNT_ID,
+AT_STATX_DONT_SYNC)` on the `/proc` magic links (never `fdinfo`: a seq_file whose read generates the whole
+document — a desktop indexer's fanotify fd is 8.6 MB and 160–300 ms a read, and the census ran three
+times per `umount --lazy`: 6.9 s on the train under a gate, 2026-10-21), mappings through `maps` by device number,
 mounts stacked inside by parent id — keyed by the kernel's MOUNT ID (`src/core/mountinfo.zig`), never by
 path text. A held mount answers `error.Busy` (EBUSY through the ONE table) with the holders named, exit
 1, nothing signalled; the mount keeps serving. The verb `chdir`s to `/` first so it is never its own

@@ -5981,11 +5981,18 @@ test "smoke: `umount --lazy` of a BUSY mount — the verb returns at once naming
         const r = try rig.squeezefs(&.{ "umount", "--lazy", rig.mp });
         defer rig.freeRun(r);
         const took_ms = (clock.monotonicNs() - t0) / std.time.ns_per_ms;
-        if (!r.term.success() or took_ms > 5000) std.debug.print("\n--- umount --lazy: rc {f} after {d} ms; stdout:\n{s}\nstderr:\n{s}\n", .{ r.term, took_ms, r.stdout, r.stderr });
+        const named = std.mem.indexOf(u8, r.stdout, "detached") != null and std.mem.indexOf(u8, r.stdout, pid_s) != null;
+        // The daemon's log says which way its census went (the holder found
+        // and the detach, or "unmounting": the orderly stop over a holder
+        // the census missed, whose teardown ends the connection under it).
+        if (!r.term.success() or took_ms > 5000 or !named) {
+            const since = try rig.readLog();
+            defer gpa.free(since);
+            std.debug.print("\n--- umount --lazy: rc {f} after {d} ms; stdout:\n{s}\nstderr:\n{s}\n--- the daemon's log since the signal ---\n{s}\n", .{ r.term, took_ms, r.stdout, r.stderr, since[@min(lazy_mark, since.len)..] });
+        }
         try testing.expect(r.term.success());
         try testing.expect(took_ms <= 5000);
-        try testing.expect(std.mem.indexOf(u8, r.stdout, "detached") != null);
-        try testing.expect(std.mem.indexOf(u8, r.stdout, pid_s) != null);
+        try testing.expect(named);
     }
     try testing.expectEqual(@as(usize, 0), try fuseMountsOf(gpa, io, rig.mp));
     try testing.expect(alive(pid));

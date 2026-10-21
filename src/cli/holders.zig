@@ -8,13 +8,20 @@
 //!
 //! What pins a mount (what makes a plain `umount2` EBUSY): a process's
 //! cwd, root or exe on it, an open fd, a mapped file, a mount stacked
-//! inside it. Per process: `cwd`/`root`/`exe` through `statx(STATX_MNT_ID,
-//! AT_STATX_DONT_SYNC)` on the magic links (the mount id of the target's
-//! path; DONT_SYNC keeps a FUSE target from issuing a GETATTR — the
-//! daemon runs this census on its own mount), every fd through
-//! `fdinfo/<n>`'s `mnt_id:` line (a text read, no path resolution — an fd
-//! on a hung filesystem costs nothing), mappings through `maps` by device
-//! number (the anon `0:<minor>` of the superblock). One entry per process
+//! inside it. Per process: `cwd`/`root`/`exe` and every `fd/<n>` through
+//! `statx(STATX_MNT_ID, AT_STATX_DONT_SYNC)` on the magic links (the
+//! mount id of the target's path, resolved from the open file itself — no
+//! lookup on the target filesystem; DONT_SYNC keeps a FUSE target from
+//! issuing a GETATTR — the daemon runs this census on its own mount — and
+//! an fd on a hung filesystem answers from its inode's cache), mappings
+//! through `maps` by device number (the anon `0:<minor>` of the
+//! superblock). NEVER through `fdinfo/<n>`: that is a seq_file whose read
+//! generates the whole document — a fanotify or inotify instance prints
+//! every mark (one desktop indexer's fd: 8.6 MB, 160–300 ms a read), an
+//! epoll its registered fds, an io_uring its registered files and buffers
+//! — so a census over the host's fds cost what the host's fds cost (0.4 s
+//! idle, 0.7–2.6 s under a gate's load, three walks per `umount --lazy`:
+//! 6.9 s on the train), not what the holders cost. One entry per process
 //! (its first reference, in that order), one per stacked mount. A
 //! per-thread cwd (`unshare(CLONE_FS)`) is not walked. Unreadable
 //! processes are skipped — another user's under an unprivileged verb; a
@@ -136,31 +143,8 @@ pub const Target = struct {
     }
 };
 
-/// `mnt_id:\t<n>` out of a `/proc/<pid>/fdinfo/<fd>` document.
-pub fn parseFdinfoMountId(text: []const u8) ?u64 {
-    var lines = std.mem.splitScalar(u8, text, '\n');
-    while (lines.next()) |line| {
-        if (!std.mem.startsWith(u8, line, "mnt_id:")) continue;
-        const v = std.mem.trim(u8, line["mnt_id:".len..], " \t\r");
-        return std.fmt.parseInt(u64, v, 10) catch null; // decimal, as proc(5) prints it
-    }
-    return null;
-}
-
-/// `ino:\t<n>` out of a `/proc/<pid>/fdinfo/<fd>` document (the open
-/// file's inode number); null when the kernel prints none.
-pub fn parseFdinfoIno(text: []const u8) ?u64 {
-    var lines = std.mem.splitScalar(u8, text, '\n');
-    while (lines.next()) |line| {
-        if (!std.mem.startsWith(u8, line, "ino:")) continue;
-        const v = std.mem.trim(u8, line["ino:".len..], " \t\r");
-        return std.fmt.parseInt(u64, v, 10) catch null; // decimal, as proc(5) prints it
-    }
-    return null;
-}
-
 /// The one process whose fds on the inodes `fd_ino` accepts hold nothing
-/// (module doc); an fd whose fdinfo names no inode still holds.
+/// (module doc).
 pub const Exempt = struct {
     pid: linux.pid_t,
     fd_ino: *const fn (ino: u64) bool,
@@ -189,14 +173,17 @@ fn skipped(skip: []const linux.pid_t, pid: linux.pid_t) bool {
     return false;
 }
 
-/// The mount id of the path a magic link points at; null when the link is
-/// unreadable (a kernel thread, another user's process) or the kernel
-/// reports no mount id.
-fn linkMountId(link: [*:0]const u8) ?u64 {
+/// What a magic link points at: the mount id of the target's path and
+/// its inode number; null when the link is unreadable (a kernel thread,
+/// another user's process, an fd closed meanwhile) or the kernel reports
+/// no mount id.
+const LinkTarget = struct { mnt_id: u64, ino: u64 };
+
+fn linkTarget(link: [*:0]const u8) ?LinkTarget {
     var st: linux.Statx = undefined;
-    const rc = linux.statx(linux.AT.FDCWD, link, linux.AT.STATX_DONT_SYNC, .{ .MNT_ID = true }, &st);
+    const rc = linux.statx(linux.AT.FDCWD, link, linux.AT.STATX_DONT_SYNC, .{ .MNT_ID = true, .INO = true }, &st);
     if (linux.errno(rc) != .SUCCESS or !st.mask.MNT_ID) return null;
-    return st.mnt_id;
+    return .{ .mnt_id = st.mnt_id, .ino = st.ino };
 }
 
 /// A proc file whole (owned). It reports size 0, so it is read until EOF,
@@ -229,9 +216,10 @@ fn processHolds(gpa: std.mem.Allocator, io: Io, pid: linux.pid_t, target: Target
     var pb: [64:0]u8 = undefined;
     inline for (.{ .cwd, .root, .exe }) |via| {
         const link = std.fmt.bufPrintSentinel(&pb, "/proc/{d}/{s}", .{ pid, @tagName(via) }, 0) catch return null;
-        if (linkMountId(link.ptr)) |id| if (id == target.mount_id) return .{ .pid = pid, .via = via };
+        if (linkTarget(link.ptr)) |t| if (t.mnt_id == target.mount_id) return .{ .pid = pid, .via = via };
     }
-    // Every fd through fdinfo's mount id.
+    // Every fd through its magic link's mount id (module doc: never the
+    // fdinfo document).
     {
         const fd_dir = std.fmt.bufPrint(&pb, "/proc/{d}/fd", .{pid}) catch return null;
         if (Io.Dir.cwd().openDir(io, fd_dir, .{ .iterate = true })) |d| {
@@ -240,13 +228,11 @@ fn processHolds(gpa: std.mem.Allocator, io: Io, pid: linux.pid_t, target: Target
             var it = dir.iterate();
             while (it.next(io) catch null) |ent| {
                 const fd = std.fmt.parseInt(u32, ent.name, 10) catch continue; // the fd number, decimal
-                var ib: [64]u8 = undefined;
-                var fb: [512]u8 = undefined;
-                const info = std.fmt.bufPrint(&ib, "/proc/{d}/fdinfo/{d}", .{ pid, fd }) catch continue;
-                const text = Io.Dir.cwd().readFile(io, info, &fb) catch continue;
-                const id = parseFdinfoMountId(text) orelse continue;
-                if (id != target.mount_id) continue;
-                if (exempt_ino) |exempt| if (parseFdinfoIno(text)) |ino| if (exempt(ino)) continue;
+                var lb: [64:0]u8 = undefined;
+                const link = std.fmt.bufPrintSentinel(&lb, "/proc/{d}/fd/{d}", .{ pid, fd }, 0) catch continue;
+                const t = linkTarget(link.ptr) orelse continue;
+                if (t.mnt_id != target.mount_id) continue;
+                if (exempt_ino) |exempt| if (exempt(t.ino)) continue;
                 return .{ .pid = pid, .via = .fd, .fd = fd };
             }
         } else |_| {}
@@ -315,18 +301,6 @@ pub fn censusAt(gpa: std.mem.Allocator, io: Io, mountpoint: []const u8, skip: []
 
 const testing = std.testing;
 
-test "fdinfo: the mnt_id line; a document without one is null" {
-    try testing.expectEqual(@as(?u64, 45), parseFdinfoMountId("pos:\t0\nflags:\t02100002\nmnt_id:\t45\nino:\t1\n"));
-    try testing.expectEqual(@as(?u64, null), parseFdinfoMountId("pos:\t0\nflags:\t02\n"));
-    try testing.expectEqual(@as(?u64, null), parseFdinfoMountId("mnt_id:\tx\n"));
-}
-
-test "fdinfo: the ino line (a control document's generation ino is 2⁶⁴ − 2³² and up); a document without one is null" {
-    try testing.expectEqual(@as(?u64, 18446744069414584320), parseFdinfoIno("pos:\t0\nflags:\t0400000\nmnt_id:\t46\nino:\t18446744069414584320\n"));
-    try testing.expectEqual(@as(?u64, null), parseFdinfoIno("pos:\t0\nmnt_id:\t46\n"));
-    try testing.expectEqual(@as(?u64, null), parseFdinfoIno("ino:\t-1\n"));
-}
-
 test "maps: the device in hex; an anonymous mapping (00:00 inode 0) and a short line are null" {
     const d = parseMapsDevice("ffff8000-ffff9000 r-xp 00000000 00:2f 1234  /build/tmp/mnt-7/lib.so").?;
     try testing.expectEqual(@as(u32, 0), d.major);
@@ -364,13 +338,11 @@ test "the census line names up to MAX_NAMED and counts the rest" {
 fn linesFuzz(_: void, smith: *std.testing.Smith) !void {
     var buf: [512]u8 = undefined;
     const len = smith.slice(&buf);
-    _ = parseFdinfoMountId(buf[0..len]);
-    _ = parseFdinfoIno(buf[0..len]);
     _ = parseMapsDevice(buf[0..len]);
 }
 
-test "fuzz: the fdinfo and maps line parsers are total on arbitrary text" {
-    try fuzzkit.fuzz({}, linesFuzz, .{ .corpus = &.{ fuzzkit.slice("mnt_id:\t45\n"), fuzzkit.slice("ino:\t18446744069414584320\n"), fuzzkit.slice("a-b r-xp 0 00:2f 1 /x") } });
+test "fuzz: the maps line parser is total on arbitrary text" {
+    try fuzzkit.fuzz({}, linesFuzz, .{ .corpus = &.{ fuzzkit.slice("a-b r-xp 0 00:2f 1 /x"), fuzzkit.slice("aaaa-bbbb rw-p 00000000 00:00 0") } });
 }
 
 test "a proc file is read to EOF, not to its stat size (0): /proc/self/maps comes back whole; the cap is StreamTooLong, never a short read" {

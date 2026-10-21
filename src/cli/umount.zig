@@ -88,8 +88,10 @@ pub const DAEMON_EXIT_WAIT_NS: u64 = transport.worker.RESIDENCY_NS + tick_law.ti
 const EXIT_POLL_NS: u64 = 20 * std.time.ns_per_ms;
 
 /// Polls between two reads of the daemon's `.stats` while it still serves
-/// (its refusal counter): a render is a cold document, read at the
-/// drain's lease budget (100 ms), not at the liveness quantum.
+/// (its refusal counter), and between two holder censuses once a lazy
+/// detach is seen: a render is a cold document and a census a `/proc`
+/// walk, read at the drain's lease budget (100 ms), not at the liveness
+/// quantum.
 const STATS_POLL_EVERY: u64 = transport.worker.DRAIN_LEASE_BUDGET_NS / EXIT_POLL_NS;
 
 /// Root's path: `umount2(path, 0)` with the bounded EBUSY retry; the
@@ -159,8 +161,9 @@ pub const Signalled = union(enum) {
     /// after ours and found a holder); it keeps serving.
     busy: linux.pid_t,
     /// `--lazy`: the mount is detached and the daemon serves the holders
-    /// left on it; it exits when the last leaves.
-    detached_held: linux.pid_t,
+    /// left on it (the census that found them — the verb names them from
+    /// it, no second walk); it exits when the last leaves.
+    detached_held: struct { pid: linux.pid_t, holders: holders.Census },
     /// The daemon is still alive at the deadline (never detached from
     /// under it: its drains may still owe the kernel replies).
     still_alive: linux.pid_t,
@@ -437,7 +440,13 @@ pub fn signalLocated(gpa: std.mem.Allocator, io: Io, mountpoint: []const u8, laz
     var polls: u64 = 0;
     while (true) : (polls += 1) {
         const is_alive = alive(io, pid);
-        if (!detached and !watched.attached()) detached = true;
+        // The cold reads run at the document cadence — and the census at
+        // the poll that first sees the detach: the verb's "at once".
+        var cold_due = polls % STATS_POLL_EVERY == 0;
+        if (!detached and !watched.attached()) {
+            detached = true;
+            cold_due = true;
+        }
         if (!is_alive) {
             if (!detached) return .{ .died = pid };
             // Detached and gone: the daemon's own unmount, unless it left
@@ -447,10 +456,11 @@ pub fn signalLocated(gpa: std.mem.Allocator, io: Io, mountpoint: []const u8, laz
             return .{ .exited = pid };
         }
         if (detached) {
-            // The census is a /proc walk: at the document cadence, not the
-            // liveness quantum.
-            if (lazy and polls % STATS_POLL_EVERY == 0 and watched.censusDetached(pid).busy()) return .{ .detached_held = pid };
-        } else if (!lazy and polls % STATS_POLL_EVERY == 0) {
+            if (lazy and cold_due) {
+                const c = watched.censusDetached(pid);
+                if (c.busy()) return .{ .detached_held = .{ .pid = pid, .holders = c } };
+            }
+        } else if (!lazy and cold_due) {
             // Still attached and serving: did the daemon's census refuse?
             if (refusals_before) |before| if (readStats(gpa, io, mountpoint)) |now_text| {
                 defer gpa.free(now_text);
@@ -524,8 +534,8 @@ pub fn run(p: cli.Process, u: args.Umount) u8 {
             return cli.exit_ok;
         },
         .busy => |pid| return refuseBusy(p, path, watched.census(pid)),
-        .detached_held => |pid| {
-            p.stdout.print("squeezefs umount: {s} detached; daemon {d} serves the {f} until the last leaves, then tears down (its supervisor logs the exit)\n", .{ path, pid, watched.census(pid) }) catch {};
+        .detached_held => |d| {
+            p.stdout.print("squeezefs umount: {s} detached; daemon {d} serves the {f} until the last leaves, then tears down (its supervisor logs the exit)\n", .{ path, d.pid, d.holders }) catch {};
             return cli.exit_ok;
         },
         .died => |pid| {

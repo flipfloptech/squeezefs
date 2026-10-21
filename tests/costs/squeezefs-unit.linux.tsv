@@ -55,9 +55,7 @@ cli.fsck.test.the grammar: the mode defaults by target kind; the lattice refuses
 cli.fusermount.test.fusermount3: a refused mount (a missing mountpoint) is a typed HelperFailed, no fd leaks	3567	3756
 cli.fusermount.test.fusermount3: the _FUSE_COMMFD handshake yields a /dev/fuse fd whose first request is INIT; -u detaches the mount	5938	6106
 cli.holders.test.a proc file is read to EOF, not to its stat size (0): /proc/self/maps comes back whole; the cap is StreamTooLong, never a short read	301	301
-cli.holders.test.fdinfo: the ino line (a control document's generation ino is 2⁶⁴ − 2³² and up); a document without one is null	15	15
-cli.holders.test.fdinfo: the mnt_id line; a document without one is null	20	18
-cli.holders.test.fuzz: the fdinfo and maps line parsers are total on arbitrary text	15	16
+cli.holders.test.fuzz: the maps line parser is total on arbitrary text	15	16
 cli.holders.test.maps: the device in hex; an anonymous mapping (00:00 inode 0) and a short line are null	11	12
 cli.holders.test.the census line names up to MAX_NAMED and counts the rest	18	19
 cli.holders.test.the census over a real mount: a child holding ONLY a mapping of a file on a tmpfs we mount (no fd on it, cwd elsewhere) is found by mmap — /proc/<pid>/maps reports size 0 and must be read to EOF; after it dies nobody holds it	223779	222079

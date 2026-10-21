@@ -1712,21 +1712,26 @@ fn serve(ctx: *Ctx, session: *Session, vs: *VirtualSource) void {
             // stop's own sender reading `.stats`/`.config`/`.trace` holds
             // nothing (`squeezefs umount` polls `.stats` for this verdict).
             const exempt: holders.Exempt = .{ .pid = daemon.Signals.stopSender(), .fd_ino = &handler.virtual_inodes.isVirtualIno };
+            // The census' cost is said on every verdict: `umount --lazy`
+            // waits for it, and a walk the host's process table makes slow
+            // is this line's to show.
+            const census_start = clock.monotonicNs();
             const c = holders.censusAt(ctx.p.gpa, ctx.p.io, ctx.mountpoint, &.{linux.getpid()}, exempt);
+            const census_ms = (clock.monotonicNs() - census_start) / std.time.ns_per_ms;
             if (c != null and c.?.busy()) {
                 if (!lazy) {
-                    log.warn("{s} but {s} is busy ({f}) — not unmounting; still serving (`squeezefs umount` retries when they are gone; `--lazy` detaches now and serves them to the end)", .{ what, ctx.mountpoint, c.? });
+                    log.warn("{s} but {s} is busy ({f}; census {d} ms) — not unmounting; still serving (`squeezefs umount` retries when they are gone; `--lazy` detaches now and serves them to the end)", .{ what, ctx.mountpoint, c.?, census_ms });
                     transport.session.umount_busy_refusals.inc();
                     continue;
                 }
                 if (session.detachLazily()) {
-                    log.warn("{s}: {s} detached lazily with {f} — serving them until the kernel ends the connection, then tearing down", .{ what, ctx.mountpoint, c.? });
+                    log.warn("{s}: {s} detached lazily with {f} (census {d} ms) — serving them until the kernel ends the connection, then tearing down", .{ what, ctx.mountpoint, c.?, census_ms });
                 } else {
-                    log.warn("{s}: {s} is no longer attached — the connection ends when its last holder leaves ({f})", .{ what, ctx.mountpoint, c.? });
+                    log.warn("{s}: {s} is no longer attached — the connection ends when its last holder leaves ({f}; census {d} ms)", .{ what, ctx.mountpoint, c.?, census_ms });
                 }
                 continue;
             }
-            log.info("{s}: unmounting {s}", .{ what, ctx.mountpoint });
+            log.info("{s}: unmounting {s} (census {d} ms, {s})", .{ what, ctx.mountpoint, census_ms, if (c == null) "no entry for the mountpoint in the table" else "no holder" });
             return;
         }
         // acquire pairs with the hook's release.

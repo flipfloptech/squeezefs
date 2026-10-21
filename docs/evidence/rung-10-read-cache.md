@@ -74,6 +74,18 @@ deposit a stale refusal (the tests stamp the live epoch now), and A's atime echo
 flush cadence) bumped the two-daemon step's epoch between its first two reads (a correct re-fetch; the step
 re-reads until the hit lands, and is not judged under budget Red).
 
+**The ring arm and the cache, made explicit** (THE INTERCEPTION HOST row, after a gate red at its ghost step):
+a cold ALIGNED grain-class ring read is the direct-drive READ — its DMA lands in the session arena this
+process owns, so the CQE hook deposits the window (`direct_leg_deposits`) and the next read of it is a
+fast-path grain serve (no dd read, no lane); a cold read wider than 64 KiB (the row's 512 KiB-class reads)
+is outside the grain class — never deposited, never served from the grains — so the ghost's second touch
+still escalates to the whole-block fill exactly as before, and the hot tier's block then outranks the
+grains. What the gate saw was not a hit: `rangedEscalation` refuses under budget Red, and the first cut's
+idle footprint — a 27 GiB reservation's item table memset at mount, 511 MB of RSS per daemon — pushed the
+fleet-divided smoke daemons toward it. The core's item table is now page-allocated and materialized lazily
+(zero = free; a bump cursor and a free chain), so an idle instance costs its live items; the row judges its
+deposit/hit and ghost/warm arms only below Red and says so otherwise.
+
 **Owed**: the leg that lands in the cache's own memfd slab and replies by `READ_FIXED` (no lane hop cold,
 zero-pass warm — the FUSE zero-copy row's path to warm); a lock-free tokened-inode predicate so a holder's
 W1 recalls readers at once (§BF.8); one order over the hot tier's slots and the grains (§BF.9).

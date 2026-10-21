@@ -235,7 +235,12 @@ pub fn Cache(comptime Entry: type, comptime Sink: type) type {
         const KeyMap = std.HashMapUnmanaged(Key, u32, KeyContext, std.hash_map.default_max_load_percentage);
         const InoMap = std.AutoHashMapUnmanaged(u64, u32);
 
-        const State = enum(u8) { free, live, evicting };
+        /// `.free` is the ZERO value: an item table is page-allocated and
+        /// never initialized, so an item never taken is a zero page the
+        /// kernel has not backed (an idle instance costs its live items,
+        /// not its reservation — the first cut's memset of a 27 GiB
+        /// reservation's table was 511 MB of RSS per idle daemon).
+        const State = enum(u8) { free = 0, live, evicting };
 
         const Item = struct {
             entry: Entry = undefined,
@@ -253,12 +258,34 @@ pub fn Cache(comptime Entry: type, comptime Sink: type) type {
             map: KeyMap = .empty,
             inos: InoMap = .empty,
             items: []Item,
-            free: []u32,
-            free_len: usize,
+            /// Items `[0, fresh)` have been taken at least once; the rest
+            /// are untouched zero pages. A freed item chains through
+            /// `next` from `free_head`.
+            fresh: u32 = 0,
+            free_head: u32 = NIL,
             head: u32 = NIL,
             tail: u32 = NIL,
             bytes: Atomic(u64) align(std.atomic.cache_line) = .init(0),
             max_bytes: u64,
+
+            fn hasRoom(s: *const Shard) bool {
+                return s.free_head != NIL or s.fresh < s.items.len;
+            }
+
+            /// A free item: the chain first, then the bump cursor.
+            fn takeLocked(s: *Shard) ?u32 {
+                if (s.free_head != NIL) {
+                    const idx = s.free_head;
+                    s.free_head = s.items[idx].next;
+                    return idx;
+                }
+                if (s.fresh < s.items.len) {
+                    const idx = s.fresh;
+                    s.fresh += 1;
+                    return idx;
+                }
+                return null;
+            }
 
             fn linkHead(s: *Shard, idx: u32) void {
                 const it = &s.items[idx];
@@ -318,8 +345,8 @@ pub fn Cache(comptime Entry: type, comptime Sink: type) type {
                 s.unlink(idx);
                 _ = s.bytes.fetchSub(it.entry.bytes, .monotonic);
                 it.state = .free;
-                s.free[s.free_len] = idx;
-                s.free_len += 1;
+                it.next = s.free_head;
+                s.free_head = idx;
             }
         };
 
@@ -345,14 +372,12 @@ pub fn Cache(comptime Entry: type, comptime Sink: type) type {
             var built: usize = 0;
             errdefer for (shards[0..built]) |*s| destroyShard(gpa, s);
             for (shards) |*s| {
-                const items = try gpa.alloc(Item, per_shard_items);
-                errdefer gpa.free(items);
-                @memset(items, .{});
-                const free = try gpa.alloc(u32, per_shard_items);
-                errdefer gpa.free(free);
-                var i: u32 = 0;
-                while (i < per_shard_items) : (i += 1) free[i] = @intCast(per_shard_items - 1 - i);
-                s.* = .{ .items = items, .free = free, .free_len = per_shard_items, .max_bytes = bound / shard_count };
+                // Page-allocated and NOT initialized: zero pages until taken
+                // (`State.free` is 0; a free item's other fields are never
+                // read).
+                const items = try std.heap.page_allocator.alloc(Item, per_shard_items);
+                errdefer std.heap.page_allocator.free(items);
+                s.* = .{ .items = items, .max_bytes = bound / shard_count };
                 try s.map.ensureTotalCapacity(gpa, @intCast(per_shard_items));
                 try s.inos.ensureTotalCapacity(gpa, @intCast(per_shard_items));
                 built += 1;
@@ -366,15 +391,16 @@ pub fn Cache(comptime Entry: type, comptime Sink: type) type {
         fn destroyShard(gpa: Allocator, s: *Shard) void {
             s.map.deinit(gpa);
             s.inos.deinit(gpa);
-            gpa.free(s.items);
-            gpa.free(s.free);
+            std.heap.page_allocator.free(s.items);
         }
 
         /// Every live entry goes to the sink as `.deinit` (its answer is
         /// not consulted: the instance's storage is the instance's).
         pub fn deinit(self: *Self) void {
             for (self.shards) |*s| {
-                for (s.items) |*it| if (it.state != .free) {
+                // Only the items ever taken can be live: the rest are
+                // untouched pages.
+                for (s.items[0..s.fresh]) |*it| if (it.state != .free) {
                     _ = self.sink.onEvict(&it.entry, .deinit);
                 };
                 destroyShard(self.gpa, s);
@@ -567,7 +593,7 @@ pub fn Cache(comptime Entry: type, comptime Sink: type) type {
                     s.lock.unlock();
                     return .exists;
                 }
-                if (s.free_len == 0 or s.bytes.load(.monotonic) + entry.bytes > @max(bound, entry.bytes)) {
+                if (!s.hasRoom() or s.bytes.load(.monotonic) + entry.bytes > @max(bound, entry.bytes)) {
                     // A concurrent insert took the room: once more, then refuse.
                     s.lock.unlock();
                     continue;
@@ -577,8 +603,7 @@ pub fn Cache(comptime Entry: type, comptime Sink: type) type {
                     self.stats.insert_refusals.inc();
                     return .refused;
                 }
-                s.free_len -= 1;
-                const idx = s.free[s.free_len];
+                const idx = s.takeLocked().?;
                 s.items[idx] = .{ .entry = entry, .state = .live };
                 s.map.putAssumeCapacity(entry.key, idx);
                 s.inoLink(idx);
@@ -1114,6 +1139,31 @@ test "the core (promote sink): a STALE entry's lookup is a refusal that hands th
     try testing.expectEqual(@as(u64, 0), c.currentBytes());
     try testing.expectEqual(@as(u64, 1), c.stats.evictions.load());
     try testing.expectEqualSlices(u32, &.{50}, seen.slots.items);
+}
+
+test "the core: the item table materializes lazily — only items ever taken are touched (the bump cursor), freed items are reused through the chain before the cursor moves, and a full shard refuses" {
+    var sink: DropSink = .{};
+    defer sink.deinit();
+    const C = Cache(TestEntry, DropSink);
+    const c = try C.init(testing.allocator, &sink, 64, 1, 4, null);
+    defer c.deinit();
+    const s = &c.shards[0];
+    try testing.expectEqual(@as(u32, 0), s.fresh);
+    for (1..4) |i| try testing.expectEqual(InsertOutcome.inserted, c.insert(mk(1, i, 0, 1, @intCast(i)), .{}));
+    try testing.expectEqual(@as(u32, 3), s.fresh);
+    try testing.expect(c.invalidateKey(.{ .ino = 1, .off = 2 }));
+    try testing.expect(c.invalidateKey(.{ .ino = 1, .off = 3 }));
+    // Two freed items chain; two inserts reuse them and the cursor stays.
+    for (5..7) |i| try testing.expectEqual(InsertOutcome.inserted, c.insert(mk(1, i, 0, 1, @intCast(i)), .{}));
+    try testing.expectEqual(@as(u32, 3), s.fresh);
+    try testing.expectEqual(NIL, s.free_head);
+    // The fourth item is the last; a fifth has no room (the bound admits
+    // 64 bytes, the table 4 items) — refused, nothing evicted.
+    try testing.expectEqual(InsertOutcome.inserted, c.insert(mk(1, 7, 0, 1, 7), .{}));
+    try testing.expectEqual(@as(u32, 4), s.fresh);
+    try testing.expectEqual(InsertOutcome.refused, c.insert(mk(1, 8, 0, 1, 8), .{}));
+    try testing.expectEqual(@as(u64, 4), c.currentBytes());
+    try testing.expectEqual(@as(usize, 2), sink.released.items.len);
 }
 
 test "the core: invalidateKey and invalidateKeys drop held keys through the sink and count; an absent key is nothing; a disabled instance (bound 0) misses, refuses and invalidates nothing" {

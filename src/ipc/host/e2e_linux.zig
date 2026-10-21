@@ -438,6 +438,36 @@ test "smoke: THE INTERCEPTION HOST — format → mount -o interception → the 
     //    the service thread with exactly its bytes on the arena copy ledger.
     const rbuf = try gpa.alloc(u8, 512 * 1024 + 100);
     defer gpa.free(rbuf);
+    // 3a. THE READ CACHE on the ring arm (charter §6.3): a cold ALIGNED
+    //     4 KiB ring read is the direct-drive READ whose DMA lands in the
+    //     session arena — memory this process owns — so its CQE hook
+    //     DEPOSITS the window (`direct_leg_deposits`); the second read of
+    //     the window is a fast-path serve from the grains (no dd read, no
+    //     lane) with exactly its bytes on the arena copy ledger. The
+    //     grain step precedes the ghost steps below: the escalation warms
+    //     the whole block into the hot tier, which outranks the grains. A
+    //     deposit is declined under budget Red (the tier's law), so the
+    //     hit arm is judged only below it.
+    {
+        const g0 = try rig.stat("read_cache_grain_hits");
+        const dep0 = try rig.stat("direct_leg_deposits");
+        const dd0 = try rig.stat("ipc_dd_read_serves");
+        const fp0 = try rig.stat("ipc_fast_path_serves");
+        const gc0 = try rig.stat("ipc_read_arena_copy_bytes");
+        try testing.expectEqual(@as(usize, 4096), try served(s.pread(b.id, rbuf[0..4096], 2 * MiB)));
+        try expectPattern(rbuf[0..4096], 2 * MiB);
+        try testing.expectEqual(dd0 + 1, try rig.stat("ipc_dd_read_serves"));
+        const level = try rig.stat("mem_budget_level");
+        if (level != 2) {
+            try testing.expectEqual(dep0 + 1, try rig.stat("direct_leg_deposits"));
+            try testing.expectEqual(@as(usize, 4096), try served(s.pread(b.id, rbuf[0..4096], 2 * MiB)));
+            try expectPattern(rbuf[0..4096], 2 * MiB);
+            try testing.expectEqual(g0 + 1, try rig.stat("read_cache_grain_hits"));
+            try testing.expectEqual(fp0 + 1, try rig.stat("ipc_fast_path_serves"));
+            try testing.expectEqual(gc0 + 4096, try rig.stat("ipc_read_arena_copy_bytes"));
+            try testing.expectEqual(dd0 + 1, try rig.stat("ipc_dd_read_serves"));
+        } else std.debug.print("smoke[interception]: budget Red at the grain step — the deposit and the hit are not judged on this run\n", .{});
+    }
     const demotes0 = try rig.stat("ipc_fast_path_miss_demotions");
     const dd_reads0 = try rig.stat("ipc_dd_read_serves");
     const dma0 = try rig.stat("ipc_read_arena_dma_bytes");
@@ -456,15 +486,22 @@ test "smoke: THE INTERCEPTION HOST — format → mount -o interception → the 
     try testing.expectEqual(rbuf.len, try served(s.pread(b.id, rbuf, 1 * MiB + 100)));
     try expectPattern(rbuf, 1 * MiB + 100);
     try testing.expectEqual(demotes0 + 3, try rig.stat("ipc_fast_path_miss_demotions"));
-    try testing.expectEqual(esc0 + 1, try rig.stat("ranged_read_ghost_escalations"));
-    const serves0 = try rig.stat("ipc_fast_path_serves");
-    const copy0 = try rig.stat("ipc_read_arena_copy_bytes");
-    const ops_read0 = try rig.stat("ipc_ops_read");
-    try testing.expectEqual(@as(usize, 512 * 1024), try served(s.pread(b.id, rbuf[0 .. 512 * 1024], 1 * MiB)));
-    try expectPattern(rbuf[0 .. 512 * 1024], 1 * MiB);
-    try testing.expectEqual(serves0 + 1, try rig.stat("ipc_fast_path_serves"));
-    try testing.expectEqual(copy0 + 512 * 1024, try rig.stat("ipc_read_arena_copy_bytes"));
-    try testing.expectEqual(ops_read0 + 1, try rig.stat("ipc_ops_read"));
+    // The ghost's second touch escalates unless the budget is Red (the
+    // admission's law: `rangedEscalation` refuses under Red) — a 512 KiB
+    // window is outside the read cache's grain class, so no serve stands
+    // between the two touches; under Red the warm-serve arm is not judged.
+    const red = (try rig.stat("mem_budget_level")) == 2;
+    if (!red) {
+        try testing.expectEqual(esc0 + 1, try rig.stat("ranged_read_ghost_escalations"));
+        const serves0 = try rig.stat("ipc_fast_path_serves");
+        const copy0 = try rig.stat("ipc_read_arena_copy_bytes");
+        const ops_read0 = try rig.stat("ipc_ops_read");
+        try testing.expectEqual(@as(usize, 512 * 1024), try served(s.pread(b.id, rbuf[0 .. 512 * 1024], 1 * MiB)));
+        try expectPattern(rbuf[0 .. 512 * 1024], 1 * MiB);
+        try testing.expectEqual(serves0 + 1, try rig.stat("ipc_fast_path_serves"));
+        try testing.expectEqual(copy0 + 512 * 1024, try rig.stat("ipc_read_arena_copy_bytes"));
+        try testing.expectEqual(ops_read0 + 1, try rig.stat("ipc_ops_read"));
+    } else std.debug.print("smoke[interception]: budget Red at the ghost step — the escalation and the warm serve are not judged on this run\n", .{});
     try testing.expect((try rig.stat("ipc_read_demote_bytes")) >= 2 * 512 * 1024);
     // The engagement identity closes.
     {

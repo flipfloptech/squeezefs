@@ -75,6 +75,18 @@ in charter §7 and decision 0003 §AX/§AY.
    booted, unmeasured; fio's submit cost).
 3. Measure the three kernel patches now that they are booted: the read/seq rows A/B against the
    10-20 numbers (same daemon, new kernel).
+3b. **The kernel series against mainline** (`rung-10-kernel-mainline.md`, 2026-10-21): the kmbuf +
+   zero-copy base the daemon's BufRing/ZeroCopy modes speak is NOT upstream and will not be — 7.3
+   took FUSE buffer pools (`ADD_QUEUE`/`ADD_BUFPOOL`, zero-copy per `FOPEN_IO_URING_ZERO_COPY`,
+   i.e. unreachable under our zero-message opens). The daemon REQUIRES only FUSE-over-io_uring
+   (6.14); every patch of ours degrades to a probed posture (UserEnts on a mainline kernel).
+   Four of ours are in upstream form under `scripts/kernel/upstream/` (0028, 0029 re-targeted,
+   0032, 0033 — the owner posts; replace the noreply Signed-off-by first); 0027 is upstream in
+   `fuse/for-next` (`989db66818a4`). `scripts/kernel/patches-mainline/` + `build-host-kernel
+   --local --mainline` build `linux-mainline-sqz` (7.3 + 7 patches, Omarchy's config as seed) as a
+   boot entry BELOW the default — never booted yet (the owner's). Next there: the daemon's port to
+   the mainline pool/zc UAPI (full tier) + an upstream proposal for zero-copy under `no_open`; 0026/
+   0030/0031 re-expressed on it; 0023 as an RFC with a maintainer-allocated INIT bit.
 4. Smaller owed items: `MetaSet.fsync` barriers every member; the dismount pass pays one flush per
    resident; the pool ledger does not count held copies; `serve` borrows an overlay record across
    device reads with no hold; the allocator's give-back belt fired once; a FAILED volume's in-place

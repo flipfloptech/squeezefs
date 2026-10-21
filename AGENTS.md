@@ -38,7 +38,10 @@ at the same absolute path, and runs commands as root:
   with makepkg, installed with pacman (`7.2.x-N-omarchy-sqz`; owner ruling 2026-10-16).
   After an Omarchy bump run `--prepare-only` first: it applies everything at `--fuzz=0` in
   minutes and a conflict means refreshing the patch in `scripts/kernel/patches-7.2/`.
-  Reboot into it yourself. Build slots: one per 4 threads and per 8 GiB
+  Reboot into it yourself. `--mainline` (Arch only) builds a SECOND entry, `linux-mainline-sqz`
+  (mainline 7.3 + `scripts/kernel/patches-mainline/`, the series re-expressed on mainline: no
+  kmbuf/zero-copy there, upstream took another UAPI — the daemon runs UserEnts on it), placed
+  below the default in Limine; `docs/evidence/rung-10-kernel-mainline.md` has the tables. Build slots: one per 4 threads and per 8 GiB
   (`SQZ_VENUE_SLOTS` overrides; every controller of one build root must agree).
 - `vm` (the default on the Mac): the macOS `container` `sqz-zig` — aarch64, Ubuntu 24.04,
   this repo mounted rw at the same path.

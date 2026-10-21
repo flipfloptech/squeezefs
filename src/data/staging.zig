@@ -1882,17 +1882,18 @@ pub fn resolveStagedRead(pool: *Pool, seg: *Segment, key: StagingKey, offset: u6
 // ---------------------------------------------------------------------------
 
 pub const MARKER_MAGIC = "SQZM".*;
-/// v3: the v2 marker (sqzhash128's low 64 bits, 0003 §M) naming its OWNER —
-/// the member's appender id and the incarnation's pid beside the `(node,
-/// mount slot)` pair (0003 §T.1); a v1/v2 marker is Corrupt to this binary
-/// and its ring is wiped loud.
-pub const MARKER_VERSION: u16 = 3;
+/// v4: the v3 marker naming its OWNER — the member's appender id and the
+/// incarnation's pid beside the `(node, mount slot)` pair (0003 §T.1) —
+/// plus the MEMBER identity the mount presents on the fabric (0003 §BG: the
+/// PR registrant; 0 on a local device); an older marker is Corrupt to this
+/// binary and its ring is wiped loud.
+pub const MARKER_VERSION: u16 = 4;
 /// The marker names the previous set epoch too (an `add-meta` rebind in
 /// flight).
 pub const MARKER_FLAG_DUAL: u16 = 1 << 0;
 const MARKER_FLAGS_KNOWN: u16 = MARKER_FLAG_DUAL;
 
-/// 80 B, checksummed; compared as BYTES.
+/// 88 B, checksummed; compared as BYTES.
 pub const StagingMarkerWire = extern struct {
     magic: [4]u8,
     version_le: [2]u8,
@@ -1906,6 +1907,7 @@ pub const StagingMarkerWire = extern struct {
     prev_set_epoch_le: [8]u8,
     appender_id_le: [4]u8,
     owner_pid_le: [4]u8,
+    member_le: [8]u8,
     csum_le: [8]u8,
 };
 
@@ -1913,8 +1915,8 @@ pub const MARKER_LEN: usize = @sizeOf(StagingMarkerWire);
 const MARKER_CHECKSUM_OFF: usize = @offsetOf(StagingMarkerWire, "csum_le");
 
 comptime {
-    assert(MARKER_LEN == 80);
-    assert(MARKER_CHECKSUM_OFF == 72);
+    assert(MARKER_LEN == 88);
+    assert(MARKER_CHECKSUM_OFF == 80);
 }
 
 /// The ring's identity: `hash64(set_uuid ‖ "staging")`. WHY: a ring binds to
@@ -1932,6 +1934,25 @@ pub fn stagingIdentity(set_uuid: [16]u8) u64 {
     return h.finalLow64();
 }
 
+/// The MEMBER identity a mount presents (0003 §BG): `hash64(hostnqn ‖ 0 ‖
+/// hostid)` of its fabric host identity — the PR registrant the device
+/// fences between, stable across the member's incarnations (an explicit
+/// pair, `/etc/nvme`'s, or the machine-id derivation salted by the mount
+/// point) and different for two identities on one host. WHY a separate
+/// member beside the mount slot: a `--single-writer` D0 winner and the
+/// manager both present slot 0, and a second identity on the same host
+/// that preempts a stopped holder's key past T_owner is ANOTHER member —
+/// its ring is its own; the fenced holder's residents stay the holder's
+/// (the flush-window exposure, loud). A local device (no fabric record)
+/// has one member per host: 0.
+pub fn memberIdentity(hostnqn: []const u8, hostid: []const u8) u64 {
+    var h: checksum.Hasher = .init();
+    h.update(hostnqn);
+    h.update(&[_]u8{0});
+    h.update(hostid);
+    return h.finalLow64();
+}
+
 pub const MarkerError = error{Corrupt};
 
 pub const Marker = struct {
@@ -1943,6 +1964,10 @@ pub const Marker = struct {
     /// incarnation that stamped it (the refusal names them).
     node_token: u64,
     mount_slot: u32,
+    /// The member identity (`memberIdentity`; 0 on a local device): with
+    /// the mount slot, the member scope — a different member under the
+    /// same slot is a peer, never a successor.
+    member: u64 = 0,
     appender_id: u32 = 0,
     owner_pid: u32 = 0,
     content_version: u32 = 1,
@@ -1967,6 +1992,7 @@ pub const Marker = struct {
             .prev_set_epoch_le = undefined,
             .appender_id_le = undefined,
             .owner_pid_le = undefined,
+            .member_le = undefined,
             .csum_le = @splat(0),
         };
         std.mem.writeInt(u16, &w.version_le, MARKER_VERSION, .little);
@@ -1979,12 +2005,13 @@ pub const Marker = struct {
         std.mem.writeInt(u64, &w.prev_set_epoch_le, self.prev_set_epoch orelse 0, .little);
         std.mem.writeInt(u32, &w.appender_id_le, self.appender_id, .little);
         std.mem.writeInt(u32, &w.owner_pid_le, self.owner_pid, .little);
+        std.mem.writeInt(u64, &w.member_le, self.member, .little);
         var bytes = std.mem.toBytes(w);
         checksum.stamp(&bytes, MARKER_CHECKSUM_OFF);
         return bytes;
     }
 
-    /// Total: exactly 72 B, magic, version, known flags, the checksum, and
+    /// Total: exactly 88 B, magic, version, known flags, the checksum, and
     /// an identity that IS the derivation of the uuid it carries (a marker
     /// whose identity disagrees with its own uuid was not written by us).
     pub fn decode(bytes: []const u8) MarkerError!Marker {
@@ -2000,6 +2027,7 @@ pub const Marker = struct {
             .set_epoch = std.mem.readInt(u64, &w.set_epoch_le, .little),
             .node_token = std.mem.readInt(u64, &w.node_token_le, .little),
             .mount_slot = std.mem.readInt(u32, &w.mount_slot_le, .little),
+            .member = std.mem.readInt(u64, &w.member_le, .little),
             .appender_id = std.mem.readInt(u32, &w.appender_id_le, .little),
             .owner_pid = std.mem.readInt(u32, &w.owner_pid_le, .little),
             .content_version = std.mem.readInt(u32, &w.content_version_le, .little),
@@ -2033,15 +2061,15 @@ pub const BindVerdict = enum {
 };
 
 /// §3.1 `bind_staging_generation`'s ladder as a pure verdict, member-scoped
-/// (0003 §T.1): the member is the mount slot (the root's name); a different
-/// node token under the same slot is that member's next incarnation — a
-/// reboot's successor — never a peer.
+/// (0003 §T.1, §BG): the member is the mount slot AND the member identity
+/// the mount presents; a different node token under the same member is
+/// that member's next incarnation — a reboot's successor — never a peer.
 pub fn bindVerdict(found: ?Marker, ours: Marker) BindVerdict {
     const f = found orelse return .absent;
     if (f.identity() != ours.identity()) return .dead;
     const same_epoch = f.set_epoch == ours.set_epoch or (f.prev_set_epoch != null and f.prev_set_epoch.? == ours.set_epoch);
     if (!same_epoch and f.set_epoch > ours.set_epoch) return .dead;
-    if (f.mount_slot != ours.mount_slot) return .foreign_owner;
+    if (f.mount_slot != ours.mount_slot or f.member != ours.member) return .foreign_owner;
     if (same_epoch and f.prev_set_epoch == null) return .match;
     return .upgrade;
 }
@@ -2194,13 +2222,15 @@ pub const Ring = if (builtin.os.tag == .linux) struct {
         const CLAIM_RETRIES: u32 = 200;
         const CLAIM_RETRY_NS: u64 = 10 * std.time.ns_per_ms;
 
-        pub fn claimName(buf: *[64]u8, identity: u64, slot: u32) []const u8 {
-            return std.fmt.bufPrint(buf, CLAIM_PREFIX ++ "{x:0>16}-{x:0>8}", .{ identity, slot }) catch unreachable;
+        /// The claim's name: the ring's identity (the set), the mount slot
+        /// and the member identity — the member scope (0003 §T.1, §BG).
+        pub fn claimName(buf: *[64]u8, identity: u64, slot: u32, member: u64) []const u8 {
+            return std.fmt.bufPrint(buf, CLAIM_PREFIX ++ "{x:0>16}-{x:0>8}-{x:0>16}", .{ identity, slot, member }) catch unreachable;
         }
 
         fn claimAddr(ours: Marker, addr: *linux.sockaddr.un) linux.socklen_t {
             var nbuf: [64]u8 = undefined;
-            const name = claimName(&nbuf, ours.identity(), ours.mount_slot);
+            const name = claimName(&nbuf, ours.identity(), ours.mount_slot, ours.member);
             addr.* = .{ .path = @splat(0) };
             @memcpy(addr.path[1 .. 1 + name.len], name);
             return @intCast(@sizeOf(linux.sa_family_t) + 1 + name.len);
@@ -3271,13 +3301,14 @@ test "the reader's view: resident ⇒ the bytes; ledger-only ⇒ in flight; neit
     try testing.expectEqual(@as(u64, 300), lostStagedRangeLen(0, std.math.maxInt(u64), 300));
 }
 
-test "the marker: 80 B, checksummed, names its owner (node, mount slot, appender, pid), identity = hash64(set_uuid ‖ \"staging\") and checked against its own uuid; every refusal; the member-scoped bind ladder's verdicts (0003 §T.1)" {
+test "the marker: 88 B, checksummed, names its owner (node, mount slot, member, appender, pid), identity = hash64(set_uuid ‖ \"staging\") and checked against its own uuid; every refusal; the member-scoped bind ladder's verdicts (0003 §T.1, §BG: a different member under the same slot is a peer)" {
     const uuid: [16]u8 = .{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 };
-    const m: Marker = .{ .set_uuid = uuid, .set_epoch = 3, .node_token = 0xABC, .mount_slot = 2, .appender_id = 5, .owner_pid = 31337 };
+    const m: Marker = .{ .set_uuid = uuid, .set_epoch = 3, .node_token = 0xABC, .mount_slot = 2, .member = 0xB0B0, .appender_id = 5, .owner_pid = 31337 };
     const bytes = m.encode();
-    try testing.expectEqual(@as(usize, 80), bytes.len);
+    try testing.expectEqual(@as(usize, 88), bytes.len);
     try testing.expectEqual(@as(u32, 5), std.mem.readInt(u32, bytes[64..68], .little));
     try testing.expectEqual(@as(u32, 31337), std.mem.readInt(u32, bytes[68..72], .little));
+    try testing.expectEqual(@as(u64, 0xB0B0), std.mem.readInt(u64, bytes[72..80], .little));
     try testing.expectEqualSlices(u8, "SQZM", bytes[0..4]);
     try testing.expectEqualSlices(u8, &uuid, bytes[8..24]);
     var want: checksum.Hasher = .init();
@@ -3289,7 +3320,7 @@ test "the marker: 80 B, checksummed, names its owner (node, mount slot, appender
     const back = try Marker.decode(&bytes);
     try testing.expectEqual(m, back);
     // Refusals: length, a flipped byte, a foreign identity for the carried uuid, an unknown flag, a non-dual prev epoch.
-    try testing.expectError(error.Corrupt, Marker.decode(bytes[0..79]));
+    try testing.expectError(error.Corrupt, Marker.decode(bytes[0..87]));
     var bad = bytes;
     bad[20] ^= 1;
     try testing.expectError(error.Corrupt, Marker.decode(&bad));
@@ -3328,6 +3359,25 @@ test "the marker: 80 B, checksummed, names its owner (node, mount slot, appender
     try testing.expectEqual(BindVerdict.foreign_owner, bindVerdict(peer, m));
     peer.node_token = m.node_token;
     try testing.expectEqual(BindVerdict.foreign_owner, bindVerdict(peer, m));
+    // The same slot under ANOTHER member identity (a second fabric
+    // identity on this host — the one that preempts a stopped holder's
+    // key): a peer, never adopted (0003 §BG).
+    var second_identity = m;
+    second_identity.member = 0xC0C0;
+    try testing.expectEqual(BindVerdict.foreign_owner, bindVerdict(second_identity, m));
+    // The claim's name is the member scope: the set, the slot, the member.
+    var nb1: [64]u8 = undefined;
+    var nb2: [64]u8 = undefined;
+    var nb3: [64]u8 = undefined;
+    const n_ours = Ring.Ram.claimName(&nb1, m.identity(), m.mount_slot, m.member);
+    try testing.expectEqualStrings(n_ours, Ring.Ram.claimName(&nb2, predecessor.identity(), predecessor.mount_slot, predecessor.member));
+    try testing.expect(!std.mem.eql(u8, n_ours, Ring.Ram.claimName(&nb3, second_identity.identity(), second_identity.mount_slot, second_identity.member)));
+    try testing.expect(!std.mem.eql(u8, n_ours, Ring.Ram.claimName(&nb3, peer.identity(), peer.mount_slot, peer.member)));
+    // The member identity: the pair hashed with a separator (no
+    // concatenation ambiguity), 0 is a local device's.
+    try testing.expect(memberIdentity("nqn.a", "id") != memberIdentity("nqn.", "aid"));
+    try testing.expectEqual(memberIdentity("nqn.a", "id"), memberIdentity("nqn.a", "id"));
+    try testing.expect(memberIdentity("nqn.a", "id") != 0);
     // A dual marker naming our epoch as its previous one matches the set (upgrade restamps it canonical).
     var ours_next = m;
     ours_next.set_epoch = 4;
@@ -3400,7 +3450,7 @@ test "fuzz: the record header reader, the verifier and the marker decoder are to
     try fuzzkit.fuzz({}, recordFuzz, .{});
 }
 
-test "linux: the write cache (charter §6.1 'Staged', 2026-10-21) — the ring in a sealed memfd behind the member's claim: a second bind of the same member while the first lives is OwnerLive (never a second ring); the first dies (its fds gone, its supervisor holding the memfd and the claim) and hands the ring to the successor over the claim: every resident recovered whole, the generation counter seeded past the recovered ones (a kill that keeps both copies of a re-stage finds the newer higher); a clean release frees the claim and the next bind is fresh" {
+test "linux: the write cache (charter §6.1 'Staged', 2026-10-21) — the ring in a sealed memfd behind the member's claim: a second bind of the same member while the first lives is OwnerLive (never a second ring) while a SECOND MEMBER identity at the same slot binds its own ring beside it (0003 §BG); the first dies (its fds gone, its supervisor holding the memfd and the claim) and hands the ring to the successor over the claim: every resident recovered whole, the generation counter seeded past the recovered ones (a kill that keeps both copies of a re-stage finds the newer higher); a clean release frees the claim and the next bind is fresh" {
     if (builtin.os.tag != .linux) return testkit.skip(@src(), .no_linux, "staging: Linux only");
     const gpa = testing.allocator;
     const rl = @import("../ipc/rendezvous_linux.zig");
@@ -3432,6 +3482,19 @@ test "linux: the write cache (charter §6.1 'Staged', 2026-10-21) — the ring i
     // A second mount of this member while the first lives: refused.
     try testing.expectError(error.OwnerLive, Ring.Ram.bind(next, cap, &refusal));
     try testing.expectEqual(live0 + 1, stats.staging_owner_live_refusals.load());
+    // A second MEMBER (another fabric identity on this host, the same set
+    // and slot — the one that preempts a stopped holder past T_owner):
+    // its own fresh ring beside the live one, never the holder's.
+    {
+        var second = next;
+        second.member = memberIdentity("nqn.2014-08.org.nvmexpress:uuid:b0b0", "b0b0");
+        var ring_b = try Ring.Ram.bind(second, cap, &refusal);
+        defer ring_b.release();
+        try testing.expectEqual(BindVerdict.absent, ring_b.verdict);
+        try testing.expect(ring_b.memfd != a.memfd);
+        try testing.expectEqual(@as(?Marker, second), Marker.decode(ring_b.mapped.map[0..MARKER_LEN]) catch null);
+        try testing.expectEqual(live0 + 1, stats.staging_owner_live_refusals.load());
+    }
     // The death: the supervisor's copies of the memfd and the claim outlive
     // the daemon's fds; it listens and hands the memfd to ONE successor.
     const sup_memfd: linux.fd_t = @intCast(linux.dup(a.memfd));

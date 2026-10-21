@@ -33,7 +33,12 @@ quarter of RAM would have pinned a gigabyte of empty cells and index at mount; `
 stays the ceiling (24.3 MB per 546 MiB: 4.2 %), the live figure the gauge.
 
 **The claim and the handover (the kill -9 law).** The member's live claim is an abstract unix
-socket `\0squeezefs-staging-<identity>-<slot>`: bound by the live daemon and never listening
+socket `\0squeezefs-staging-<identity>-<slot>-<member>` (the member identity: the fabric host
+pair the mount presents, the PR registrant — decision 0003 §BG, from the first gate's one red:
+a second identity on the same host preempting a SIGSTOPped holder past T_owner met the
+holder's live claim under the shared slot 0 and died `StagingOwnerLive`; now it binds its own
+ring, and the fenced holder's residents stay the holder's exposure, loud): bound by the live
+daemon and never listening
 (a second mount presenting the member scope connects, meets a silent holder — ECONNREFUSED
 through 2 s of retries — and is refused `OwnerLive`); the mount sends the claim and the memfd
 to its supervisor as two tail-socket frames. At the daemon's death the supervisor LISTENS on

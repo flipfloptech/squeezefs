@@ -60,6 +60,7 @@ const align_probe = @import("../../io/align_probe.zig");
 const pr = @import("../../meta/guard/pr.zig");
 const proc = @import("../../meta/guard/proc.zig");
 const set_config = @import("../../data/set_config.zig");
+const staging = @import("../../data/staging.zig");
 const initiator = @import("initiator.zig");
 const multipath = @import("multipath.zig");
 const configfs = @import("configfs.zig");
@@ -211,6 +212,14 @@ pub const Plan = struct {
     pub fn pair(self: *const Plan) ?initiator.HostPair {
         const id = &(self.identity orelse return null);
         return .{ .hostnqn = id.hostnqn(), .hostid = id.hostid() };
+    }
+
+    /// The write cache's MEMBER identity (0003 §BG: the PR registrant the
+    /// mount presents; 0 when the set has no fabric record — a local
+    /// device's one member per host).
+    pub fn memberIdentity(self: *const Plan) u64 {
+        const id = &(self.identity orelse return 0);
+        return staging.memberIdentity(id.hostnqn(), id.hostid());
     }
 
     /// Bind every data volume of `cfg` (in place: a bound volume's `uri`
@@ -676,6 +685,24 @@ test "the mount identity: the explicit pair wins; the derived default is salted 
     const e = resolveMountIdentityWith(&env, &etc, null, "/mnt/a");
     try testing.expectEqual(initiator.IdentitySource.explicit, e.identity.source);
     try testing.expectEqualStrings("2c2c2c2c-2c2c-4c2c-8c2c-2c2c2c2c2c2c", e.identity.hostid());
+    // The write cache's member scope follows the identity (0003 §BG): a
+    // plan with none is the local device's one member (0); two mount
+    // points' derived identities are two members; the explicit pair is
+    // one member wherever it mounts.
+    var none = Plan.init(gpa);
+    defer none.deinit();
+    try testing.expectEqual(@as(u64, 0), none.memberIdentity());
+    var pa = Plan.init(gpa);
+    defer pa.deinit();
+    pa.identity = a1.identity;
+    var pb = Plan.init(gpa);
+    defer pb.deinit();
+    pb.identity = b.identity;
+    try testing.expect(pa.memberIdentity() != 0 and pa.memberIdentity() != pb.memberIdentity());
+    pb.identity = a2.identity;
+    try testing.expectEqual(pa.memberIdentity(), pb.memberIdentity());
+    pa.identity = e.identity;
+    try testing.expectEqual(staging.memberIdentity(e.identity.hostnqn(), e.identity.hostid()), pa.memberIdentity());
 }
 
 test "a plan over a config with no records and no explicit pair binds nothing; a half pair refuses; a non-NVMe path has no controller" {

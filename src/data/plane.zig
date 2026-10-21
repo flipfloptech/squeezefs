@@ -163,12 +163,14 @@ pub const BlockKey = read_size_class.BlockKey;
 /// below it is no cache and the mount runs cache-less, loud.
 pub const WRITE_CACHE_FLOOR: u64 = 64 * derive.MiB;
 
-/// THIS mount's staging owner (0003 §T.1): volume 0's appender identity —
-/// the manager's `(node, home-volume index)` at appender 0, a joiner's
-/// `(node, mount-point slot)` at its appender id, a `--single-writer` D0
-/// winner's `(node, 0)` — on the set's identity, with this incarnation's
-/// pid. The mount slot is the member scope (its root's name).
-fn stagingOwnerMarker(be: *KvBackend) staging.Marker {
+/// THIS mount's staging owner (0003 §T.1, §BG): volume 0's appender
+/// identity — the manager's `(node, home-volume index)` at appender 0, a
+/// joiner's `(node, mount-point slot)` at its appender id, a
+/// `--single-writer` D0 winner's `(node, 0)` — on the set's identity, with
+/// this incarnation's pid and the MEMBER identity the mount presents on
+/// the fabric (`member`: `staging.memberIdentity` of its host pair, 0 on a
+/// local device). The member scope is `(mount slot, member)`.
+fn stagingOwnerMarker(be: *KvBackend, member: u64) staging.Marker {
     const v0 = be.volumes[0];
     var node: u64 = undefined;
     var slot: u32 = undefined;
@@ -186,7 +188,7 @@ fn stagingOwnerMarker(be: *KvBackend) staging.Marker {
         slot = 0;
         appender = manager_appender_id;
     }
-    return .{ .set_uuid = be.setUuid(), .set_epoch = be.setEpoch(), .node_token = node, .mount_slot = slot, .appender_id = appender, .owner_pid = @intCast(linux.getpid()) };
+    return .{ .set_uuid = be.setUuid(), .set_epoch = be.setEpoch(), .node_token = node, .mount_slot = slot, .member = member, .appender_id = appender, .owner_pid = @intCast(linux.getpid()) };
 }
 
 /// The manager's appender id (the format-time fixed ring's).
@@ -379,10 +381,17 @@ pub const Options = struct {
     env: *const std.process.Environ.Map,
     facts: derive.Facts,
     budget_bytes: u64,
-    /// The write cache's bytes (`mem_budget.writeCacheBytesFrom`: the
-    /// staging ring's RAM capacity); 0 = no write cache — a verb's plane,
-    /// or the operator's `SQUEEZEFS_WRITE_CACHE_PCT=0`.
+    /// The write cache's bytes (`cache.resolveBound` of
+    /// `SQUEEZEFS_WRITE_CACHE_PCT`: the staging ring's RAM capacity); 0 =
+    /// no write cache — a verb's plane, or the operator's
+    /// `SQUEEZEFS_WRITE_CACHE_PCT=0`.
     write_cache_bytes: u64 = 0,
+    /// The member identity the mount presents on the fabric
+    /// (`staging.memberIdentity` of its host pair; 0 on a local device):
+    /// with the mount slot, the write cache's member scope (0003 §BG) — a
+    /// second identity on this host that preempts a stopped holder binds
+    /// its own ring beside the holder's.
+    member_identity: u64 = 0,
     /// The volume key (an encrypted set); zeroized by the caller after.
     derived_key: ?transform.DerivedKey,
     /// An open rotation window's NEXT key (`set_config.next_key`): new
@@ -1047,17 +1056,17 @@ pub const DataPlane = struct {
     /// (pinned RAM: shmem pages are swap-only, never reclaimable; its shed
     /// is the pressure promotion).
     fn openWriteCache(self: *DataPlane, gpa: Allocator, opts: Options) OpenError!void {
-        const ours = stagingOwnerMarker(self.backend);
+        const ours = stagingOwnerMarker(self.backend, opts.member_identity);
         const capacity = derive.alignDown(opts.write_cache_bytes, staging.RECORD_ALIGN);
         var refusal: staging.Ring.BindRefusal = .{};
         var ram = staging.Ring.Ram.bind(ours, capacity, &refusal) catch |e| switch (e) {
             error.OwnerLive => {
-                log.err("write cache of mount slot {x:0>8} (staging identity {x:0>16}): held LIVE by another mount presenting this member scope — refusing (never adopted): unmount the other, or mount at another mount point (a joiner's member scope derives from it)", .{ ours.mount_slot, ours.identity() });
+                log.err("write cache of mount slot {x:0>8} member {x:0>16} (staging identity {x:0>16}): held LIVE by another mount presenting this member scope — refusing (never adopted): unmount the other, or mount at another mount point (a joiner's member scope and a derived fabric identity derive from it)", .{ ours.mount_slot, ours.member, ours.identity() });
                 return error.StagingOwnerLive;
             },
             error.ForeignOwner => {
                 const o = refusal.owner.?;
-                log.err("write cache of mount slot {x:0>8}: the ring handed over names ANOTHER member (mount slot {x:0>8}, appender {d}, node {x:0>16}, last pid {d}) — its custody; refusing (never adopted, never wiped)", .{ ours.mount_slot, o.mount_slot, o.appender_id, o.node_token, o.owner_pid });
+                log.err("write cache of mount slot {x:0>8} member {x:0>16}: the ring handed over names ANOTHER member (mount slot {x:0>8}, member {x:0>16}, appender {d}, node {x:0>16}, last pid {d}) — its custody; refusing (never adopted, never wiped)", .{ ours.mount_slot, ours.member, o.mount_slot, o.member, o.appender_id, o.node_token, o.owner_pid });
                 return error.StagingForeignOwner;
             },
             else => {

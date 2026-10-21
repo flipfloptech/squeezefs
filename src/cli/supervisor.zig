@@ -553,13 +553,14 @@ pub const linux_loop = if (builtin.os.tag == .linux) struct {
             const now = clock.monotonicNs();
             switch (state.observe(now, ok, policy)) {
                 .healthy, .escalated => {},
-                .recovered => log.warn("supervisor: daemon {d} answers again", .{pid}),
-                // The FIRST miss is silent: an orderly teardown has an instant
-                // where the control inode fails while the mount is still in the
-                // table, and a daemon that then exits never "missed" anything
-                // (the lazy-umount row's law: no verdict on an orderly cycle).
-                // A daemon still unresponsive at the next probe is said from then on.
-                .grace => |for_ns| if (for_ns >= policy.probe_interval_ns) log.warn("supervisor: daemon {d} missed a probe ({s}; {d} s unresponsive; grace window {d} s)", .{ pid, kind.text(), for_ns / std.time.ns_per_s, policy.unresponsive_after_ns / std.time.ns_per_s }),
+                .recovered => log.info("supervisor: daemon {d} answers again after a missed probe", .{pid}),
+                // A miss inside the grace window says nothing: the escalation
+                // lines ("unresponsive for N s", the SIGQUIT, the kill) carry the
+                // verdict, and an orderly teardown has an instant where the
+                // control inode fails while the mount is still in the table —
+                // a probe landing there is no event (the lazy-umount row's law:
+                // no verdict on an orderly cycle). The miss is counted.
+                .grace => {},
                 .escalate => |for_ns| {
                     escalated = true;
                     escalate(io, pid, conn, for_ns, kind, policy, &tails);

@@ -471,7 +471,7 @@ test "the report: a blank volume is one line; a v4 volume prints the superblock,
     var roots = [_]ledger.TreeRoot{ .{ .id = .control, .node_addr = sb.heap.start, .node_seq = 7 }, .{ .id = .native_slot, .node_addr = sb.heap.start + sb.node_size, .node_seq = 8 } };
     const rec = ledger.bootstrapRecord(&roots, 42, 9, ledger.MembershipStamp.oneMember(sb.set_uuid));
     const vols = [_]set_config.DataVolume{.{ .vol_tag = 0xfeed, .state = .active, .device_uuid = @splat(1), .added_ts = 0, .capacity_blocks = 10, .volume_len = 1 << 30, .uri = "/dev/d0" }};
-    var conf = try set_config.birth(testing.allocator, sb.set_uuid, .{ .compression = .lz4, .block_size = 1 << 20 }, null, &vols, &.{});
+    var conf = try set_config.birth(testing.allocator, sb.set_uuid, .{ .compression = .lz4, .block_size = 1 << 20 }, null, &vols);
     defer conf.deinit(testing.allocator);
     try writeReport(&out.writer, "sqmeta:///x", .{ .prior = .formatted, .sb = sb, .slot = .primary, .volume_len = sb.volume_len }, rec, .{ .config = conf }, &.{.{ .vol_tag = 0xfeed, .references = 3, .blocks = 2 }}, true);
     try testing.expect(std.mem.indexOf(u8, out.written(), "vol-000000000000feed active /dev/d0") != null);

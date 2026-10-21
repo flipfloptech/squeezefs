@@ -683,7 +683,7 @@ test "a plan over a config with no records and no explicit pair binds nothing; a
     var env = std.process.Environ.Map.init(gpa);
     defer env.deinit();
     const vols = [_]set_config.DataVolume{.{ .vol_tag = 0x1111_2222_3333_4444, .state = .active, .device_uuid = @splat(1), .added_ts = 1_700_000_000, .capacity_blocks = 254, .volume_len = 1 << 30, .uri = "/build/tmp/mount-fabric-d0.img" }};
-    var cfg = try set_config.birth(gpa, @splat(7), .{ .compression = .none, .encryption = .none, .block_size = 4 << 20 }, null, &vols, &.{});
+    var cfg = try set_config.birth(gpa, @splat(7), .{ .compression = .none, .encryption = .none, .block_size = 4 << 20 }, null, &vols);
     defer cfg.deinit(gpa);
     var plan = Plan.init(gpa);
     defer plan.deinit();

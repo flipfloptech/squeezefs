@@ -3596,6 +3596,32 @@ test "§BB.1 the ack at the apply: under the coalesced cadence this mount's kern
     }
 }
 
+test "§BD the leaf set of a create: on a volume with room a kernel create takes at most TWO leaf write locks (the child's inode leaf and the parent's dentry leaf — one leaf when both records share it) at the apply and NONE at the admission (the lock-free fast path charges and releases the leaves' in-flight bytes, charged ≡ released once the commit returned)" {
+    const gpa = testing.allocator;
+    const v = try TestVol.create(gpa, "leaf-set", "600000");
+    defer v.destroy();
+    const be = try v.open();
+    defer be.close();
+    _ = try commitCreate(be, "base");
+    const cs = be.conveyorStats();
+    const adm0 = cs.leaf_takes_admission.snapshot().count;
+    const app0 = cs.leaf_takes_apply.snapshot().count;
+    const fast0 = cs.heap_admit_fast.load();
+    const locked0 = cs.heap_admit_locked.load();
+    const ino = try commitCreateKernel(be, "two-leaves");
+    try testing.expect(try present(be, ino));
+    try testing.expectEqual(adm0, cs.leaf_takes_admission.snapshot().count);
+    const takes = cs.leaf_takes_apply.snapshot().count - app0;
+    try testing.expect(takes >= 1 and takes <= 2);
+    try testing.expectEqual(fast0 + 1, cs.heap_admit_fast.load());
+    try testing.expectEqual(locked0, cs.heap_admit_locked.load());
+    // The charge is released once the apply published the bytes: every
+    // leaf's in-flight word is back at zero after the commit returned.
+    try be.fsync();
+    try testing.expectEqual(cs.inflight_charged_bytes.load(), cs.inflight_released_bytes.load());
+    try testing.expect(cs.inflight_charged_bytes.load() > 0);
+}
+
 test "§BC self-apply: a 4-thread storm of this mount's kernel's creates — every member applied itself (self_applies ≡ commits, acks at the apply ≡ commits, no applier venue entered), every ack present and replayed after the reopen; one member poisoned mid-storm rolls out ALONE as a PAD over its range (its window's survivors stand, nothing rolled back, no hole), and the strict and venue arms park every commit until the landing" {
     const gpa = testing.allocator;
     const v = try TestVol.create(gpa, "self-apply", "600000");

@@ -738,6 +738,15 @@ pub const Stats = struct {
     /// windows whose members applied themselves (§BC), and the members.
     self_handoffs: counters.ShardedCounter = .{},
     self_applies: counters.ShardedCounter = .{},
+    /// `meta_conveyor_heap_admit_fast` / `_locked`: heap admissions by
+    /// the lock-free fast path (§BD) against the locked law.
+    heap_admit_fast: counters.ShardedCounter = .{},
+    heap_admit_locked: counters.ShardedCounter = .{},
+    /// `meta_conveyor_inflight_charged_bytes` / `_released_bytes`: the fast
+    /// path's bytes charged onto leaves and given back — equal once every
+    /// commit returned (the §BD conservation).
+    inflight_charged_bytes: counters.ShardedCounter = .{},
+    inflight_released_bytes: counters.ShardedCounter = .{},
     /// `meta_conveyor_turn_spin_hits` / `_falls`: turns found by the
     /// committer's spin against those that parked (§BC).
     turn_spin_hits: counters.ShardedCounter = .{},
@@ -788,12 +797,12 @@ pub const Stats = struct {
     /// `lock_phase_ns.leaf_lock_hold`: first acquire → every guard dropped
     /// (its tail must sit ≪ device latency — the "never across I/O" law).
     leaf_lock_hold: counters.ShardedLatencyHistogram = .{},
-    /// `lock_phase_ns.leaf_wait_{inodes,dentries,other}`: the wait to
-    /// ACQUIRE one leaf's write lock, by its tree — the hot leaf's class
-    /// (§BC: the serializer once the hops are gone).
-    leaf_wait_inodes: counters.ShardedLatencyHistogram = .{},
-    leaf_wait_dentries: counters.ShardedLatencyHistogram = .{},
-    leaf_wait_other: counters.ShardedLatencyHistogram = .{},
+    /// `lock_phase_ns.leaf_takes_{admission,apply}`: every leaf write lock
+    /// taken, by phase, with the wait to acquire it — the leaf set of an
+    /// op (a create: two takes at the apply, none at the admission on a
+    /// volume with room, §BD) and the serializer's cost (§BC).
+    leaf_takes_admission: counters.ShardedLatencyHistogram = .{},
+    leaf_takes_apply: counters.ShardedLatencyHistogram = .{},
 
     pub fn writeJson(self: *const Stats, w: *std.Io.Writer) std.Io.Writer.Error!void {
         try w.print("{{\"meta_commit_group_size\":{{", .{});
@@ -834,7 +843,8 @@ pub const Stats = struct {
             self.hold_bound_ns.load(),
             self.holds_pacing.load(),
         });
-        try w.print(",\"meta_conveyor_resolve_seeded\":{d},\"meta_conveyor_resolve_descended\":{d},\"meta_conveyor_acks_at_apply\":{d},\"meta_conveyor_acks_at_landing\":{d},\"meta_conveyor_acked_write_failures\":{d},\"meta_conveyor_tail_slot_misses\":{d},\"meta_conveyor_self_handoffs\":{d},\"meta_conveyor_self_applies\":{d},\"meta_conveyor_turn_spin_hits\":{d},\"meta_conveyor_turn_spin_falls\":{d}", .{ self.resolve_seeded.load(), self.resolve_descended.load(), self.acks_at_apply.load(), self.acks_at_landing.load(), self.acked_write_failures.load(), self.tail_slot_misses.load(), self.self_handoffs.load(), self.self_applies.load(), self.turn_spin_hits.load(), self.turn_spin_falls.load() });
+        try w.print(",\"meta_conveyor_resolve_seeded\":{d},\"meta_conveyor_resolve_descended\":{d},\"meta_conveyor_acks_at_apply\":{d},\"meta_conveyor_acks_at_landing\":{d},\"meta_conveyor_acked_write_failures\":{d},\"meta_conveyor_tail_slot_misses\":{d},\"meta_conveyor_self_handoffs\":{d},\"meta_conveyor_self_applies\":{d},\"meta_conveyor_turn_spin_hits\":{d},\"meta_conveyor_turn_spin_falls\":{d},\"meta_conveyor_heap_admit_fast\":{d},\"meta_conveyor_heap_admit_locked\":{d}", .{ self.resolve_seeded.load(), self.resolve_descended.load(), self.acks_at_apply.load(), self.acks_at_landing.load(), self.acked_write_failures.load(), self.tail_slot_misses.load(), self.self_handoffs.load(), self.self_applies.load(), self.turn_spin_hits.load(), self.turn_spin_falls.load(), self.heap_admit_fast.load(), self.heap_admit_locked.load() });
+        try w.print(",\"meta_conveyor_inflight_charged_bytes\":{d},\"meta_conveyor_inflight_released_bytes\":{d}", .{ self.inflight_charged_bytes.load(), self.inflight_released_bytes.load() });
         try w.print(",\"meta_commit_ack_spin_hits\":{d},\"meta_commit_ack_spin_falls\":{d},\"meta_commit_ack_spin_skips\":{d},\"meta_commit_ack_spin_busy\":{d},\"meta_commit_ack_spin_bound_ns\":{d},\"meta_commit_ack_spin_wake_ns\":{d},\"meta_commit_ack_spin_ack_ns\":{d}}}", .{
             self.ack_spin_hits.load(),
             self.ack_spin_falls.load(),
@@ -867,12 +877,10 @@ pub const Stats = struct {
         try self.window_total.snapshot().writeJson(w);
         try w.writeAll(",\"leaf_lock_hold\":");
         try self.leaf_lock_hold.snapshot().writeJson(w);
-        try w.writeAll(",\"leaf_wait_inodes\":");
-        try self.leaf_wait_inodes.snapshot().writeJson(w);
-        try w.writeAll(",\"leaf_wait_dentries\":");
-        try self.leaf_wait_dentries.snapshot().writeJson(w);
-        try w.writeAll(",\"leaf_wait_other\":");
-        try self.leaf_wait_other.snapshot().writeJson(w);
+        try w.writeAll(",\"leaf_takes_admission\":");
+        try self.leaf_takes_admission.snapshot().writeJson(w);
+        try w.writeAll(",\"leaf_takes_apply\":");
+        try self.leaf_takes_apply.snapshot().writeJson(w);
         try w.writeAll("}");
     }
 };
@@ -1060,9 +1068,27 @@ pub const Queued = struct {
     /// A `commitGroup` member: its committer parks on its siblings in
     /// turn, so it never applies itself (§BC).
     grouped: bool = false,
+    /// §BD: the admission's lock-free fast path charged this member's
+    /// bytes onto its seed leaves' `inflight_admitted`; released after the
+    /// apply published them (or at the teardown of a member never applied).
+    inflight_held: bool = false,
+
+    /// §BD: give the seed leaves their in-flight bytes back (idempotent).
+    fn releaseInflight(self: *Queued, stats_: *Stats) void {
+        if (!self.inflight_held) return;
+        self.inflight_held = false;
+        var bytes: u64 = 0;
+        for (self.q.recs, self.seeds) |r, n| {
+            const b = heap_law.encodedLen(r);
+            bytes += b;
+            _ = n.inflight_admitted.fetchSub(b, .acq_rel);
+        }
+        stats_.inflight_released_bytes.add(bytes);
+    }
 
     /// The terminal outcome's teardown: the seeds' references, then the tx.
-    fn deinit(self: *Queued) void {
+    fn deinit(self: *Queued, stats_: *Stats) void {
+        self.releaseInflight(stats_);
         for (self.seeds) |n| n.release();
         self.q.deinit();
     }
@@ -1576,7 +1602,7 @@ pub const Conveyor = struct {
         var entry = try self.build(t, &done);
         const len = entry.q.len;
         self.enqueueOne(&entry, len) catch |e| {
-            entry.deinit();
+            entry.deinit(&self.stats);
             return e;
         };
         self.leadIfElected();
@@ -1642,7 +1668,7 @@ pub const Conveyor = struct {
         if (n == 0) return;
         _ = self.core.enqueueMany(scratch.entries[0..n]) catch {
             for (scratch.entries[0..n], scratch.tx_of[0..n]) |*e, i| {
-                e.item.deinit();
+                e.item.deinit(&self.stats);
                 results[i] = error.ConveyorFull;
             }
             return;
@@ -1680,11 +1706,12 @@ pub const Conveyor = struct {
         // so a refusal reserves nothing and the space retry's checkpoint
         // cycles never run behind an open reservation (a cycle's barrier
         // waits on the completed prefix, which would wait on this tx).
-        const seeds = self.admitHeapPreQueue(&q) catch |e| {
+        var inflight_held = false;
+        const seeds = self.admitHeapPreQueue(&q, &inflight_held) catch |e| {
             q.deinit();
             return e;
         };
-        return .{ .q = q, .done = done, .enqueued_ns = clock.monotonicNs(), .seeds = seeds };
+        return .{ .q = q, .done = done, .enqueued_ns = clock.monotonicNs(), .seeds = seeds, .inflight_held = inflight_held };
     }
 
     /// The heap admission of ONE tx on the committer's thread, under its
@@ -1694,11 +1721,64 @@ pub const Conveyor = struct {
     /// leaf is re-resolved; the budget's exhaustion is the SMO protocol's
     /// bug as it was. Answers the admitted tx's leaves per record — the
     /// references kept, in `q`'s arena — as the applier's seeds.
-    fn admitHeapPreQueue(self: *Conveyor, q: *QueuedTx) Error![]*CachedNode {
+    fn admitHeapPreQueue(self: *Conveyor, q: *QueuedTx, inflight_held: *bool) Error![]*CachedNode {
         var arena_state = std.heap.ArenaAllocator.init(self.deps.gpa);
         defer arena_state.deinit();
         const arena = arena_state.allocator();
         const one = [_]Queued{.{ .q = q.*, .done = undefined, .enqueued_ns = 0 }};
+        // §BD: the lock-free fast path — on a volume with room, a leaf whose
+        // published log end plus every byte admitted onto it without the
+        // lock plus this transaction's fits in place takes NO lock: the
+        // bytes are charged to the leaf's in-flight word (released after
+        // the apply publishes them) and the resolved leaves are the seeds.
+        // A leaf that does not fit, or a volume near its reserve, takes the
+        // locked law below.
+        if (heap_law.fastPathRoom(self.deps.alloc.freeExtents(), self.deps.alloc.reserveExtents(), self.deps.caps.max_txs) and !self.deps.checkpoint.posture.isFull()) {
+            var r = try self.resolve(arena, &one, .admission);
+            const layout = self.deps.cache.cfg.layout;
+            var totals_buf: [32]usize = @splat(0);
+            const fits = blk: {
+                if (r.lock_set.len > totals_buf.len) break :blk false;
+                const totals = totals_buf[0..r.lock_set.len];
+                for (q.recs, r.leaf_of[0]) |rec, gi| totals[gi] += heap_law.encodedLen(rec);
+                var charged: usize = 0;
+                var ok = true;
+                while (charged < r.lock_set.len) : (charged += 1) {
+                    const n = r.lock_set[charged];
+                    const mine = totals[charged];
+                    // acq_rel: the charge is ordered against the apply's
+                    // release of earlier bytes and its unlock's hint.
+                    const before = n.inflight_admitted.fetchAdd(mine, .acq_rel);
+                    const h = n.logHint();
+                    if (!heap_law.fastPathFits(layout, h.fixed, h.overlay, @intCast(before), mine)) {
+                        _ = n.inflight_admitted.fetchSub(mine, .acq_rel);
+                        ok = false;
+                        break;
+                    }
+                }
+                if (!ok) {
+                    var i: usize = 0;
+                    while (i < charged) : (i += 1) _ = r.lock_set[i].inflight_admitted.fetchSub(totals[i], .acq_rel);
+                }
+                break :blk ok;
+            };
+            if (fits) {
+                self.stats.heap_admit_fast.inc();
+                var charged_bytes: u64 = 0;
+                for (totals_buf[0..r.lock_set.len]) |t| charged_bytes += t;
+                self.stats.inflight_charged_bytes.add(charged_bytes);
+                inflight_held.* = true;
+                return q.arena.allocator().dupe(*CachedNode, r.leaves[0]) catch {
+                    for (r.lock_set, totals_buf[0..r.lock_set.len]) |n, t| _ = n.inflight_admitted.fetchSub(t, .acq_rel);
+                    self.stats.inflight_released_bytes.add(charged_bytes);
+                    inflight_held.* = false;
+                    r.releaseRefs();
+                    return error.OutOfMemory;
+                };
+            }
+            r.releaseRefs();
+        }
+        self.stats.heap_admit_locked.inc();
         var cycled_for_space = false;
         var space_retry_started: u64 = 0;
         var hold_active = false;
@@ -1710,7 +1790,7 @@ pub const Conveyor = struct {
                 r.releaseRefs();
                 return error.OutOfMemory;
             };
-            self.lockAll(r.lock_set, dirties);
+            self.lockAll(r.lock_set, dirties, .admission);
             if (stale(&one, &r)) {
                 self.unlockAll(r.lock_set);
                 r.releaseRefs();
@@ -2045,7 +2125,7 @@ pub const Conveyor = struct {
         if (outcome) |_| self.stats.acks.inc() else |_| self.stats.refusals.inc();
         self.ack_spin.ack.sample(clock.monotonicNs() -| m.enqueued_ns);
         m.done.send(self.deps.io, outcome) catch {};
-        m.deinit();
+        m.deinit(&self.stats);
     }
 
     const Resolved = struct {
@@ -2129,16 +2209,15 @@ pub const Conveyor = struct {
         return false;
     }
 
-    fn lockAll(self: *Conveyor, lock_set: []*CachedNode, dirties: []*NodeDirty) void {
+    fn lockAll(self: *Conveyor, lock_set: []*CachedNode, dirties: []*NodeDirty, phase: enum { admission, apply }) void {
+        const h = switch (phase) {
+            .admission => &self.stats.leaf_takes_admission,
+            .apply => &self.stats.leaf_takes_apply,
+        };
         for (lock_set, dirties) |n, *d| {
             const t0 = clock.monotonicNs();
             d.* = n.lockWrite(self.deps.io);
-            const waited = clock.monotonicNs() -| t0;
-            switch (n.tree_id) {
-                key.TREE_INODES => self.stats.leaf_wait_inodes.record(waited),
-                key.TREE_DENTRIES => self.stats.leaf_wait_dentries.record(waited),
-                else => self.stats.leaf_wait_other.record(waited),
-            }
+            h.record(clock.monotonicNs() -| t0);
         }
     }
 
@@ -2502,7 +2581,7 @@ pub const Conveyor = struct {
                 break;
             };
             const t_leaf = clock.monotonicNs();
-            self.lockAll(r.lock_set, dirties);
+            self.lockAll(r.lock_set, dirties, .apply);
             if (stale(members, &r)) {
                 self.unlockAll(r.lock_set);
                 self.stats.leaf_lock_hold.record(clock.monotonicNs() -| t_leaf);
@@ -2529,6 +2608,7 @@ pub const Conveyor = struct {
             self.unlockAll(r.lock_set);
             self.stats.leaf_lock_hold.record(clock.monotonicNs() -| t_leaf);
             r.releaseRefs();
+            m.releaseInflight(&self.stats);
             if (threshold_crossed) self.deps.checkpoint.kickThreshold(self.deps.checkpoint.ctx);
             break;
         }
@@ -2654,7 +2734,7 @@ pub const Conveyor = struct {
         if (outcome) |_| self.stats.acks.inc() else |_| self.stats.refusals.inc();
         self.ack_spin.ack.sample(clock.monotonicNs() -| m.enqueued_ns);
         if (send) m.done.send(self.deps.io, outcome) catch {};
-        m.deinit();
+        m.deinit(&self.stats);
     }
 
     /// A window left its applier (submitted, or abandoned on its way): the
@@ -2700,7 +2780,7 @@ pub const Conveyor = struct {
                 return;
             };
             const t_leaf = clock.monotonicNs();
-            self.lockAll(r.lock_set, dirties);
+            self.lockAll(r.lock_set, dirties, .apply);
             // A5.
             if (stale(members, &r)) {
                 self.unlockAll(r.lock_set);
@@ -2731,6 +2811,9 @@ pub const Conveyor = struct {
             self.unlockAll(r.lock_set);
             self.stats.leaf_lock_hold.record(clock.monotonicNs() -| t_leaf);
             r.releaseRefs();
+            // §BD: the unlock published the leaves' log ends with these
+            // bytes in them; the in-flight charge goes.
+            for (members) |*m| m.releaseInflight(&self.stats);
             // A11.
             if (threshold_crossed) self.deps.checkpoint.kickThreshold(self.deps.checkpoint.ctx);
             break;
@@ -3199,7 +3282,7 @@ pub const Conveyor = struct {
             }
             const set = lock_set[0..out];
             const dirties = arena.alloc(*NodeDirty, set.len) catch return self.divergedFromReplay(site, "out of memory taking the rollback's locks; the window's records stay applied");
-            self.lockAll(set, dirties);
+            self.lockAll(set, dirties, .apply);
             var is_stale = false;
             for (undo, leaves) |u, leaf| {
                 if (leaf.state.isSuperseded() or key.lessThan(u.key, leaf.min_key) or key.lessThan(leaf.max_key, u.key)) is_stale = true;
@@ -3275,7 +3358,7 @@ pub const Conveyor = struct {
             }
             const set = lock_set[0..out];
             const dirties = arena.alloc(*NodeDirty, set.len) catch break;
-            self.lockAll(set, dirties);
+            self.lockAll(set, dirties, .apply);
             var is_stale = false;
             for (comps, leaves) |c, leaf| {
                 if (leaf.state.isSuperseded() or key.lessThan(c.key, leaf.min_key) or key.lessThan(leaf.max_key, c.key)) is_stale = true;

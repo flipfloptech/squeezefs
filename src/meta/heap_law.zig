@@ -318,6 +318,23 @@ pub const Refused = struct {
     why: NoSpace,
 };
 
+/// Decision 0003 §BD: the lock-free admission's room — a volume with at
+/// least twice the compaction reserve plus one extent per transaction the
+/// conveyor can hold in flight (`caps.txs`), so a leaf the fast path
+/// over-admitted (its hint read before a concurrent apply) splits at
+/// writeback from extents that exist; near the reserve every admission
+/// takes the locked law.
+pub fn fastPathRoom(free_extents: u64, reserve_extents: u64, txs_in_flight_cap: u64) bool {
+    return free_extents >= 2 * reserve_extents + txs_in_flight_cap;
+}
+
+/// §BD: the fast path's fit on ONE leaf from its published hint and the
+/// bytes already admitted onto it without the lock: the projected log end
+/// with every in-flight byte and this transaction's in place.
+pub fn fastPathFits(layout: NodeLayout, hint_fixed: usize, hint_overlay: usize, inflight: usize, mine: usize) bool {
+    return hint_fixed + layout.appendFrameLen(hint_overlay + inflight + mine) <= layout.nodeSize();
+}
+
 /// The encoded (bset) length of a staged record.
 pub fn encodedLen(r: tx.Rec) usize {
     return record.RECORD_HEADER_LEN + r.key.len + r.value.len;

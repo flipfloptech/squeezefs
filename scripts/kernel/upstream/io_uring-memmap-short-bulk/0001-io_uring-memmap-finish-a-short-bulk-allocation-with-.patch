@@ -1,0 +1,79 @@
+From 7b19a3cec94f25009770540fc65627c17c0b6085 Mon Sep 17 00:00:00 2001
+From: Justin Oberdorf <109311040+flipfloptech@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 13:00:38 -0400
+Subject: [PATCH] io_uring/memmap: finish a short bulk allocation with
+ reclaiming pages
+To: Jens Axboe <axboe@kernel.dk>
+Cc: Pavel Begunkov <asml.silence@gmail.com>,
+    io-uring@vger.kernel.org,
+    linux-kernel@vger.kernel.org
+
+io_region_allocate_pages() backs a kernel-allocated region with one
+compound allocation and, when that fails, with alloc_pages_bulk_node(),
+treating any short count as -ENOMEM.
+
+The bulk allocator is not a reclaiming allocator.  It batches order-0
+pages from the per-cpu lists of a zone that sits above its low
+watermark plus the request, and when no zone qualifies it falls back to
+the regular allocator for a single page; with memcg kmem accounting
+online - the default as soon as any memory cgroup exists - a
+__GFP_ACCOUNT request skips the batch and returns that one page.  So a
+region whose compound allocation fails, which for a costly order (a
+1 MiB region is order 8 with 4 KiB pages) is routine once the page
+cache has filled and fragmented memory, comes back short, and the whole
+registration fails with -ENOMEM while gigabytes of clean page cache
+could be reclaimed.
+
+Observed with a FUSE-over-io-uring server registering kernel-allocated
+buffer rings of 32 x 1 MiB per queue: on a 62 GiB x86_64 host whose
+54 GiB page cache had been churned by buffered 4 KiB random reads
+(MemFree 345-472 MiB while registering, a few MiB of it in free
+order >= 8 blocks of ZONE_NORMAL) the registration failed with -ENOMEM
+in 10 of 10 attempts, each after five retries over 1.2 s.  With this
+change, 0 of 10 failed under the same pressure (0 MiB free at
+order >= 8, so every compound attempt failed and the page-by-page
+finish carried the registration).
+
+Finish a short region page by page with alloc_page() and the same gfp,
+which may enter direct reclaim, as vm_area_alloc_pages() does when the
+bulk allocator comes back short for vmalloc.  Fail with -ENOMEM only if
+a single page cannot be had, or once the task has a fatal signal
+pending (no reclaiming on behalf of a task that is going away).  The
+failure path is unchanged and releases every page allocated so far.
+
+Signed-off-by: Justin Oberdorf <109311040+flipfloptech@users.noreply.github.com>
+---
+ io_uring/memmap.c | 16 ++++++++++++++++
+ 1 file changed, 16 insertions(+)
+
+diff --git a/io_uring/memmap.c b/io_uring/memmap.c
+index d4d716946971..4727272ec52a 100644
+--- a/io_uring/memmap.c
++++ b/io_uring/memmap.c
+@@ -192,6 +192,22 @@ static int io_region_allocate_pages(struct io_mapped_region *mr,
+ 
+ 	nr_allocated = alloc_pages_bulk_node(gfp, NUMA_NO_NODE,
+ 					     mr->nr_pages, pages);
++	/*
++	 * The bulk allocator draws on the free lists above the low watermark
++	 * and reclaims for at most one page (it returns a single page under
++	 * memcg kmem accounting): finish a short region with the reclaiming
++	 * single-page allocator, as vm_area_alloc_pages() does.
++	 */
++	while (nr_allocated < mr->nr_pages) {
++		struct page *page;
++
++		if (fatal_signal_pending(current))
++			break;
++		page = alloc_page(gfp);
++		if (!page)
++			break;
++		pages[nr_allocated++] = page;
++	}
+ 	if (nr_allocated != mr->nr_pages) {
+ 		if (nr_allocated)
+ 			release_pages(pages, nr_allocated);
+
+base-commit: c03c1a14507dfaf8b856c2608f9ac216021fc222
+prerequisite-patch-id: 11ec6de75e395287bd2e76264e83c2f562aed168
+prerequisite-patch-id: 952024229c731bc566e353081f1f97bf1f9fdd4d

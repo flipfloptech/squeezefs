@@ -1,0 +1,187 @@
+From 29539f16207e99f8a14a93f58f74d4bc871e0383 Mon Sep 17 00:00:00 2001
+From: Jimmy Zuber <jamz@amazon.com>
+Date: Thu, 20 Aug 2026 13:01:57 +0000
+Subject: [PATCH 6/7] fuse: allow FUSE_SYNCFS for privileged userspace servers
+
+Propagating syncfs()/sync() to a FUSE server via FUSE_SYNCFS lets the
+server flush its own cached or intermediate state when userspace asks the
+filesystem to sync.  This is currently enabled only for virtiofs and
+fuseblk, because an untrusted server can use it to stall sync()
+indefinitely (see commit 2d82ab251ef0 ("virtiofs: propagate sync() to file
+server"), and commit d3906d8f3cee ("fuse: enable FUSE_SYNCFS for all
+fuseblk servers")).  Both of those mount types require host privilege to
+set up, so the server is trusted not to abuse it.
+
+There is nothing virtiofs- or block-specific about wanting to handle
+syncfs(), though.  A plain /dev/fuse server is just as entitled to
+participate in the sync() path -- so that data it has buffered reaches
+stable storage when the user asks for it -- provided it is equally
+trusted.
+
+The trust property that virtiofs and fuseblk satisfy is that neither can
+be mounted without CAP_SYS_ADMIN in the initial user namespace (neither
+sets FS_USERNS_MOUNT).  A plain fuse mount does set FS_USERNS_MOUNT, so its
+existence guarantees no such privilege; the privilege has to be checked
+rather than assumed.
+
+Add an opt-in INIT flag, FUSE_HAS_SYNCFS, and honor it only when the
+server opened /dev/fuse with CAP_SYS_ADMIN in the initial user namespace,
+recorded at mount time via file_ns_capable().  This is the same privilege
+that mounting virtiofs or fuseblk requires, applied to the process that
+actually services (and could stall) the connection.  Checking the device
+opener's capability -- rather than the mount's user namespace -- avoids
+treating an unprivileged server that merely happens to run in the initial
+user namespace (e.g. a normal sshfs mount) as trusted.
+
+The flag is only advertised to servers that pass this check, so an
+unprivileged server is never invited to opt in (and is ignored by
+fuse_syncfs_enable() if it sets the flag anyway).
+
+Signed-off-by: Jimmy Zuber <jamz@amazon.com>
+Assisted-by: Claude:claude-opus-4-8 [Claude-Code]
+Signed-off-by: Miklos Szeredi <mszeredi@redhat.com>
+(cherry picked from commit 989db66818a40b48da6ff06329ff2f5d0c866f93)
+---
+ fs/fuse/fuse_i.h          |  9 +++++++++
+ fs/fuse/inode.c           | 28 ++++++++++++++++++++++++++++
+ include/uapi/linux/fuse.h | 12 +++++++++++-
+ 3 files changed, 48 insertions(+), 1 deletion(-)
+
+diff --git a/fs/fuse/fuse_i.h b/fs/fuse/fuse_i.h
+index c8d4c5f3af7e..97d356588d00 100644
+--- a/fs/fuse/fuse_i.h
++++ b/fs/fuse/fuse_i.h
+@@ -391,6 +391,7 @@ struct fuse_fs_context {
+ 	bool no_control:1;
+ 	bool no_force_umount:1;
+ 	bool legacy_opts_show:1;
++	bool syncfs_capable:1;
+ 	enum fuse_dax_mode dax_mode;
+ 	unsigned int max_read;
+ 	unsigned int blksize;
+@@ -675,6 +676,14 @@ struct fuse_conn {
+ 	/** @sync_fs: Propagate syncfs() to server */
+ 	unsigned int sync_fs:1;
+ 
++	/**
++	 * @syncfs_capable: the privilege required to honor FUSE_HAS_SYNCFS was
++	 * present when /dev/fuse was opened (CAP_SYS_ADMIN in the initial user
++	 * namespace), i.e. the same privilege that mounting virtiofs/fuseblk
++	 * requires.
++	 */
++	unsigned int syncfs_capable:1;
++
+ 	/** @init_security: Initialize security xattrs when creating a new inode */
+ 	unsigned int init_security:1;
+ 
+diff --git a/fs/fuse/inode.c b/fs/fuse/inode.c
+index 223a9628607f..c5acdcbc89e1 100644
+--- a/fs/fuse/inode.c
++++ b/fs/fuse/inode.c
+@@ -803,6 +803,15 @@ static int fuse_opt_fd(struct fs_context *fsc, struct file *file)
+ 	if (file->f_cred->user_ns != fsc->user_ns)
+ 		return invalfc(fsc, "wrong user namespace for fuse device");
+ 
++	/*
++	 * Record whether the server opened /dev/fuse with CAP_SYS_ADMIN in the
++	 * initial user namespace -- the same privilege that mounting virtiofs
++	 * or fuseblk requires.  Only such servers are trusted to receive
++	 * FUSE_SYNCFS (see fuse_syncfs_enable()).
++	 */
++	ctx->syncfs_capable = file_ns_capable(file, &init_user_ns,
++					      CAP_SYS_ADMIN);
++
+ 	ctx->fud = fuse_dev_grab(file);
+ 
+ 	return 0;
+@@ -1269,6 +1278,16 @@ struct fuse_init_args {
+ 	struct fuse_mount *fm;
+ };
+ 
++/*
++ * A server can stall syncfs()/sync(), so only honor FUSE_HAS_SYNCFS for
++ * servers that opened /dev/fuse with CAP_SYS_ADMIN in the initial user
++ * namespace -- the same privilege required to mount virtiofs or fuseblk.
++ */
++static bool fuse_syncfs_enable(struct fuse_conn *fc, u64 flags)
++{
++	return (flags & FUSE_HAS_SYNCFS) && fc->syncfs_capable;
++}
++
+ static void process_init_reply(struct fuse_args *args, int error)
+ {
+ 	struct fuse_init_args *ia = container_of(args, typeof(*ia), args);
+@@ -1414,6 +1433,9 @@ static void process_init_reply(struct fuse_args *args, int error)
+ 
+ 			if (flags & FUSE_REQUEST_TIMEOUT)
+ 				timeout = arg->request_timeout;
++
++			if (fuse_syncfs_enable(fc, flags))
++				fc->sync_fs = 1;
+ 		} else {
+ 			ra_pages = fc->max_read / PAGE_SIZE;
+ 			fc->no_lock = 1;
+@@ -1483,6 +1505,11 @@ static struct fuse_init_args *fuse_new_init(struct fuse_mount *fm)
+ 		flags |= FUSE_SUBMOUNTS;
+ 	if (IS_ENABLED(CONFIG_FUSE_PASSTHROUGH))
+ 		flags |= FUSE_PASSTHROUGH;
++	/* Only offered to sufficiently privileged servers; see
++	 * fuse_syncfs_enable().
++	 */
++	if (fm->fc->syncfs_capable)
++		flags |= FUSE_HAS_SYNCFS;
+ 
+ 	if (fuse_uring_enabled())
+ 		flags |= FUSE_OVER_IO_URING | FUSE_HAS_IO_URING_BUFPOOL;
+@@ -1774,6 +1801,7 @@ int fuse_fill_super_common(struct super_block *sb, struct fuse_fs_context *ctx)
+ 
+ 	fc->default_permissions = ctx->default_permissions;
+ 	fc->allow_other = ctx->allow_other;
++	fc->syncfs_capable = ctx->syncfs_capable;
+ 	fc->user_id = ctx->user_id;
+ 	fc->group_id = ctx->group_id;
+ 	fc->legacy_opts_show = ctx->legacy_opts_show;
+diff --git a/include/uapi/linux/fuse.h b/include/uapi/linux/fuse.h
+index f472e175da65..cf4361192b16 100644
+--- a/include/uapi/linux/fuse.h
++++ b/include/uapi/linux/fuse.h
+@@ -248,6 +248,9 @@
+  *  - add bufpool offset field to fuse_uring_ent_in_out struct
+  *  - add FUSE_URING_ZERO_COPY, FUSE_URING_ENT_ZERO_COPY, and
+  *    FOPEN_IO_URING_ZERO_COPY flag
++ *
++ *  7.47
++ *  - add FUSE_HAS_SYNCFS opt-in flag for privileged userspace servers
+  */
+ 
+ #ifndef _LINUX_FUSE_H
+@@ -283,7 +286,7 @@
+ #define FUSE_KERNEL_VERSION 7
+ 
+ /** Minor version number of this interface */
+-#define FUSE_KERNEL_MINOR_VERSION 46
++#define FUSE_KERNEL_MINOR_VERSION 47
+ 
+ /** The node ID of the root inode */
+ #define FUSE_ROOT_ID 1
+@@ -464,6 +467,12 @@ struct fuse_file_lock {
+  * FUSE_REQUEST_TIMEOUT: kernel supports timing out requests.
+  *			 init_out.request_timeout contains the timeout (in secs)
+  * FUSE_HAS_IO_URING_BUFPOOL: kernel supports io-uring buffer pools
++ * FUSE_HAS_SYNCFS: server requests that syncfs()/sync() be propagated as
++ *		FUSE_SYNCFS requests.  Since an untrusted server can use this
++ *		to stall sync(), it is only honored when /dev/fuse was opened
++ *		with CAP_SYS_ADMIN in the initial user namespace (the same
++ *		privilege that mounting virtiofs or fuseblk requires).
++ *		Insufficiently privileged servers ignore it.
+  * FUSE_TIME_LIMITS: kernel honors init_out.time_{min,max} as the superblock
+  *		     inode-timestamp range (sqz-private)
+  */
+@@ -514,6 +523,7 @@ struct fuse_file_lock {
+ #define FUSE_OVER_IO_URING	(1ULL << 41)
+ #define FUSE_REQUEST_TIMEOUT	(1ULL << 42)
+ #define FUSE_HAS_IO_URING_BUFPOOL (1ULL << 43)
++#define FUSE_HAS_SYNCFS		(1ULL << 44)
+ /*
+  * sqz-private: deliberately far above the upstream watermark (bit 44,
+  * FUSE_HAS_SYNCFS, is the last allocated in-tree) so an upstream collision is

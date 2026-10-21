@@ -1,0 +1,198 @@
+From c5b0d609561a61ae45ca78756fb3d6221a13e5f4 Mon Sep 17 00:00:00 2001
+From: Justin Oberdorf <109311040+flipfloptech@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 13:02:26 -0400
+Subject: [PATCH] fuse: io-uring: end requests a stopped server never claimed
+ on abort
+To: Miklos Szeredi <miklos@szeredi.hu>
+Cc: Bernd Schubert <bernd@bsbernd.com>,
+    Joanne Koong <joannelkoong@gmail.com>,
+    fuse-devel@lists.linux.dev,
+    linux-kernel@vger.kernel.org
+
+A request handed to a ring entry by a foreign submitter
+(fuse_uring_queue_fuse_req() / fuse_uring_queue_bq_req()) waits on
+ent_w_req_queue in FRRS_FUSE_REQ until the ring task runs
+fuse_uring_send_in_task() - with IORING_SETUP_DEFER_TASKRUN, only when
+the server's ring thread next enters io_uring_enter().  A server that
+is stopped (SIGSTOP) or blocked never runs it, and nothing else ends
+the request: fuse_uring_abort_end_requests() ends fuse_req_queue and
+the background queue, the entry teardown takes ent_in_userspace and
+ent_avail_queue.  The caller sleeps uninterruptibly in
+request_wait_answer() (FR_PENDING was cleared at the assignment) until
+the server runs again, and a FUSE_REQUEST_TIMEOUT abort frees no one:
+fuse_uring_request_expired() finds the request, fuse_abort_conn() runs,
+the waiter stays in D state while the async teardown logs the stuck
+entry every FUSE_URING_TEARDOWN_INTERVAL.
+
+Measured: a SIGSTOPped server answering FUSE_SYNCFS, a host-wide
+sync(2), request_timeout 15 s - the connection aborted at 15 s, the
+sync still held at 45 s (and until SIGCONT), with
+"ent-req-queue ... state=3" in dmesg every 50 ms.
+
+Mark the entry tw_pending under the queue lock when a request is
+dispatched to the ring task; the task work claims its request under the
+lock (clearing the mark) before it touches it; the abort ends the
+request of every still-pending entry (-ECONNABORTED) and leaves the
+entry on ent_w_req_queue without one.  When the task finally runs it
+hands such an entry to the teardown (FRRS_USERSPACE, its command
+completed -ENOTCONN, its pool buffer recycled); a dying task
+(tw.cancel) frees it as before.  The synchronous paths
+(COMMIT_AND_FETCH, the task work's own next-request fetch) never set
+the mark: their request is in the running task's hands.
+
+Also let the expiry check tolerate an entry whose request the abort
+ended, and log the stuck entry state once, as stop_debug_log intends
+(it was set and never read).
+
+Signed-off-by: Justin Oberdorf <109311040+flipfloptech@users.noreply.github.com>
+---
+ fs/fuse/dev_uring.c   | 60 ++++++++++++++++++++++++++++++++++++++++---
+ fs/fuse/dev_uring_i.h |  7 +++++
+ 2 files changed, 64 insertions(+), 3 deletions(-)
+
+diff --git a/fs/fuse/dev_uring.c b/fs/fuse/dev_uring.c
+index c6dd420c4034..2ba83d66686c 100644
+--- a/fs/fuse/dev_uring.c
++++ b/fs/fuse/dev_uring.c
+@@ -194,6 +194,35 @@ static void fuse_uring_abort_end_queue_requests(struct fuse_ring_queue *queue)
+ 	fuse_dev_end_requests(&req_list);
+ }
+ 
++/*
++ * End every request handed to a ring task whose task work has not run yet:
++ * a stopped (SIGSTOP) or blocked server never claims it, and neither the
++ * abort nor the entry teardown reaches FRRS_FUSE_REQ entries - the caller
++ * would wait in request_wait_answer() until the server runs again, and a
++ * request timeout's abort would free no one.  The entry stays on
++ * ent_w_req_queue without a request; fuse_uring_send_in_task() hands it to
++ * the teardown when the task runs.
++ */
++static void fuse_uring_abort_end_dispatched(struct fuse_ring_queue *queue)
++{
++	struct fuse_ring_ent *ent;
++	struct fuse_req *req;
++	LIST_HEAD(req_list);
++
++	spin_lock(&queue->lock);
++	list_for_each_entry(ent, &queue->ent_w_req_queue, list) {
++		req = ent->fuse_req;
++		if (!ent->tw_pending || !req)
++			continue;
++		ent->fuse_req = NULL;
++		list_add_tail(&req->list, &req_list);
++	}
++	spin_unlock(&queue->lock);
++
++	/* must not hold queue lock to avoid order issues with fi->lock */
++	fuse_dev_end_requests(&req_list);
++}
++
+ void fuse_uring_abort_end_requests(struct fuse_ring *ring)
+ {
+ 	int qid;
+@@ -213,6 +242,7 @@ void fuse_uring_abort_end_requests(struct fuse_ring *ring)
+ 		spin_unlock(&fch->bg_lock);
+ 		spin_unlock(&queue->lock);
+ 		fuse_uring_abort_end_queue_requests(queue);
++		fuse_uring_abort_end_dispatched(queue);
+ 	}
+ }
+ 
+@@ -226,6 +256,8 @@ static bool ent_list_request_expired(struct fuse_chan *fch, struct list_head *li
+ 		return false;
+ 
+ 	req = ent->fuse_req;
++	if (!req)
++		return false;
+ 
+ 	return time_is_before_jiffies(req->create_time +
+ 				      fch->timeout.req_timeout);
+@@ -541,7 +573,8 @@ static void fuse_uring_async_stop_queues(struct work_struct *work)
+ 	 * If there are still queue references left
+ 	 */
+ 	if (atomic_read(&ring->queue_refs) > 0) {
+-		if (time_after(jiffies,
++		if (!ring->stop_debug_log &&
++		    time_after(jiffies,
+ 			       ring->teardown_time + FUSE_URING_TEARDOWN_TIMEOUT))
+ 			fuse_uring_log_ent_state(ring);
+ 
+@@ -1739,10 +1772,28 @@ static void fuse_uring_send_in_task(struct io_tw_req tw_req, io_tw_token_t tw)
+ 	struct io_uring_cmd *cmd = io_uring_cmd_from_tw(tw_req);
+ 	struct fuse_ring_ent *ent = uring_cmd_to_ring_ent(cmd);
+ 	struct fuse_ring_queue *queue = ent->queue;
++	struct fuse_req *req;
+ 	int err;
+ 
++	spin_lock(&queue->lock);
++	req = ent->fuse_req;
++	ent->tw_pending = false;
++	if (!req && !tw.cancel) {
++		/* the abort ended the request: the teardown takes the entry */
++		fuse_uring_recycle_buffer(ent);
++		ent->state = FRRS_USERSPACE;
++		list_move_tail(&ent->list, &queue->ent_in_userspace);
++		ent->cmd = NULL;
++	}
++	spin_unlock(&queue->lock);
++
++	if (!req && !tw.cancel) {
++		io_uring_cmd_done(cmd, -ENOTCONN, issue_flags);
++		return;
++	}
++
+ 	if (!tw.cancel) {
+-		err = fuse_uring_prepare_send(ent, ent->fuse_req, issue_flags);
++		err = fuse_uring_prepare_send(ent, req, issue_flags);
+ 		if (err) {
+ 			if (!fuse_uring_get_next_fuse_req(ent, queue,
+ 							  issue_flags))
+@@ -1760,7 +1811,8 @@ static void fuse_uring_send_in_task(struct io_tw_req tw_req, io_tw_token_t tw)
+ 
+ 		io_uring_cmd_done(cmd, err, issue_flags);
+ 
+-		fuse_uring_req_end(ent, ent->fuse_req, err, issue_flags);
++		if (req)
++			fuse_uring_req_end(ent, req, err, issue_flags);
+ 		kfree(ent);
+ 		if (atomic_dec_and_test(&queue->ring->queue_refs))
+ 			wake_up_all(&queue->ring->stop_waitq);
+@@ -1825,6 +1877,7 @@ void fuse_uring_queue_fuse_req(struct fuse_iqueue *fiq, struct fuse_req *req)
+ 	}
+ 
+ 	fuse_uring_add_req_to_ring_ent(ent, req);
++	ent->tw_pending = true;
+ 	spin_unlock(&queue->lock);
+ 	fuse_uring_dispatch_ent(ent);
+ 	return;
+@@ -1876,6 +1929,7 @@ bool fuse_uring_queue_bq_req(struct fuse_req *req)
+ 				       list);
+ 	if (ent && req && !fuse_uring_prep_buffer(ent, req)) {
+ 		fuse_uring_add_req_to_ring_ent(ent, req);
++		ent->tw_pending = true;
+ 		spin_unlock(&queue->lock);
+ 		fuse_uring_dispatch_ent(ent);
+ 	} else {
+diff --git a/fs/fuse/dev_uring_i.h b/fs/fuse/dev_uring_i.h
+index 263d0f8b9714..a866a6503927 100644
+--- a/fs/fuse/dev_uring_i.h
++++ b/fs/fuse/dev_uring_i.h
+@@ -95,6 +95,13 @@ struct fuse_ring_ent {
+ 	enum fuse_ring_req_state state;
+ 
+ 	struct fuse_req *fuse_req;
++
++	/*
++	 * fuse_req was handed to the ring task (fuse_uring_dispatch_ent) and
++	 * its task work has not claimed it yet: fuse_uring_abort_end_requests()
++	 * may end it - the task may be stopped and never run
++	 */
++	bool tw_pending;
+ };
+ 
+ struct fuse_ring_queue {
+
+base-commit: c03c1a14507dfaf8b856c2608f9ac216021fc222
+prerequisite-patch-id: 11ec6de75e395287bd2e76264e83c2f562aed168
+prerequisite-patch-id: 952024229c731bc566e353081f1f97bf1f9fdd4d
+prerequisite-patch-id: f5a3e6b24f178d49161dbbfad89e8b7fe70b1285

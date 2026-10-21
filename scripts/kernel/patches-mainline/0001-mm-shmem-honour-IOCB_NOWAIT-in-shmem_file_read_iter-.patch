@@ -1,0 +1,104 @@
+From 66a303e7fa38a06f4bf99d1520611ad19e4a41de Mon Sep 17 00:00:00 2001
+From: Justin Oberdorf <109311040+flipfloptech@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 12:59:58 -0400
+Subject: [PATCH 1/7] mm/shmem: honour IOCB_NOWAIT in shmem_file_read_iter()
+ and set FMODE_NOWAIT
+
+shmem files do not set FMODE_NOWAIT (shmem_file_open() sets
+FMODE_CAN_ODIRECT alone) and are not pollable, so io_uring's
+io_file_supports_nowait() answers false and io_read() returns -EAGAIN
+at issue time for every read of a shmem/memfd file: the read is punted
+to an io-wq worker, which then performs a plain blocking read of a page
+that was resident all along.
+
+Measured with a FUSE-over-io-uring server that serves replies out of a
+memfd (one IORING_OP_READ_FIXED from the memfd into the client's pages
+per 4 KiB read, 2.1 M reads/s): the io-wq workers cost 2.6 CPU cores
+beside the 7.7 cores of the server's ring threads - 1.2 us of CPU and
+one wake-and-switch per served 4 KiB, for a 4 KiB copy that is 0.1 us.
+
+Take a non-blocking path in shmem_file_read_iter() under IOCB_NOWAIT: a
+resident, up-to-date folio is served (unlocked, as the SGP_READ path
+serves it: it unlocks before the copy), a hole its zeros, and anything
+that would wait - a swapped-out entry, a folio that is not up to date or
+whose mapping changed under truncation - is -EAGAIN, which io_uring
+answers with its ordinary punt.  Declare FMODE_NOWAIT in
+shmem_file_open() so io_uring issues reads non-blocking in the first
+place.
+
+Writes are unchanged: no FMODE_NOWAIT write path is claimed, because
+shmem_file_write_iter() takes the inode lock and may allocate, and
+io_uring keeps punting buffered writes of a regular file without
+FOP_BUFFER_WASYNC as it does today.
+
+Signed-off-by: Justin Oberdorf <109311040+flipfloptech@users.noreply.github.com>
+---
+ mm/shmem.c | 46 ++++++++++++++++++++++++++++++++++++++--------
+ 1 file changed, 38 insertions(+), 8 deletions(-)
+
+diff --git a/mm/shmem.c b/mm/shmem.c
+index 848316eaa7f4..5523f6013536 100644
+--- a/mm/shmem.c
++++ b/mm/shmem.c
+@@ -2936,7 +2936,12 @@ static int shmem_mmap_prepare(struct vm_area_desc *desc)
+ 
+ static int shmem_file_open(struct inode *inode, struct file *file)
+ {
+-	file->f_mode |= FMODE_CAN_ODIRECT;
++	/*
++	 * FMODE_NOWAIT: shmem_file_read_iter() honours IOCB_NOWAIT, so an
++	 * io_uring read of a resident page completes inline instead of
++	 * being punted to io-wq for want of the flag.
++	 */
++	file->f_mode |= FMODE_CAN_ODIRECT | FMODE_NOWAIT;
+ 	return generic_file_open(inode, file);
+ }
+ 
+@@ -3326,15 +3331,40 @@ static ssize_t shmem_file_read_iter(struct kiocb *iocb, struct iov_iter *to)
+ 			break;
+ 
+ 		index = iocb->ki_pos >> PAGE_SHIFT;
+-		error = shmem_get_folio(inode, index, 0, &folio, SGP_READ);
+-		if (error) {
+-			if (error == -EINVAL)
+-				error = 0;
+-			break;
++		if (iocb->ki_flags & IOCB_NOWAIT) {
++			/*
++			 * Non-blocking: serve a resident, up-to-date folio
++			 * (unlocked: the copy below needs no lock, as the
++			 * SGP_READ path unlocks before it copies) or a hole's
++			 * zeros; anything that would wait — a swapped-out
++			 * page, a folio under I/O or being truncated — is
++			 * -EAGAIN, and the caller retries from a context that
++			 * may block.
++			 */
++			folio = filemap_get_entry(mapping, index);
++			if (xa_is_value(folio)) {
++				folio = NULL;
++				error = -EAGAIN;
++				break;
++			}
++			if (folio && (!folio_test_uptodate(folio) ||
++				      folio->mapping != mapping)) {
++				folio_put(folio);
++				error = -EAGAIN;
++				break;
++			}
++		} else {
++			error = shmem_get_folio(inode, index, 0, &folio,
++						SGP_READ);
++			if (error) {
++				if (error == -EINVAL)
++					error = 0;
++				break;
++			}
++			if (folio)
++				folio_unlock(folio);
+ 		}
+ 		if (folio) {
+-			folio_unlock(folio);
+-
+ 			page = folio_file_page(folio, index);
+ 			if (PageHWPoison(page)) {
+ 				folio_put(folio);

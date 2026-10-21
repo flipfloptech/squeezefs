@@ -53,7 +53,6 @@ src/cli/bench.zig:746 | 4096 | cd11088850f976f9 | OWED: derive it or document it
 src/cli/bench.zig:820 | 0o755 | c82d9c423af06a02 | a file mode (POSIX permission bits)
 src/cli/bench.zig:825 | 0o755 | c10207cc03e81135 | a file mode (POSIX permission bits)
 src/cli/bench.zig:982 | 20 | 6146699a8b837262 | a size — OWED: derive from derive.Facts or document the physical/format reason
-src/cli/config_verb.zig:319 | 0o700 | 73964b46956fba4d | a file mode (POSIX permission bits)
 src/cli/df.zig:97 | 100 | 82217739ed768167 | a percentage — OWED: derive it (charter §1.5) or document the measured reason
 src/cli/df.zig:98 | 20 | c2c122e9ce1254e3 | a percentage — OWED: derive it (charter §1.5) or document the measured reason
 src/cli/df.zig:98 | 20 | c2c122e9ce1254e3 | a percentage — OWED: derive it (charter §1.5) or document the measured reason
@@ -131,7 +130,6 @@ src/data/layout.zig:952 | 4 | f552a1bd33b64efe | OWED: derive it or document it 
 src/data/layout.zig:987 | 4 | 2e9e3938eaffb306 | OWED: derive it or document it on the line (charter §1.5)
 src/data/layout.zig:989 | 4 | f552a1bd33b64efe | OWED: derive it or document it on the line (charter §1.5)
 src/data/nvme_read_cache.zig:149 | 56 | 97f6dfc9c3ca789e | OWED: derive it or document it on the line (charter §1.5)
-src/data/nvme_read_cache.zig:559 | 4096 | 78e671ecc8862f6f | OWED: derive it or document it on the line (charter §1.5)
 src/data/pack.zig:283 | 1000 | 5dbb614c5d8ae749 | OWED: derive it or document it on the line (charter §1.5)
 src/data/prefetch.zig:223 | 64 | 54bcb91f3bc4a0bd | a percentage — OWED: derive it (charter §1.5) or document the measured reason
 src/data/prefetch.zig:223 | 64 | 54bcb91f3bc4a0bd | a percentage — OWED: derive it (charter §1.5) or document the measured reason
@@ -148,7 +146,6 @@ src/data/router.zig:165 | 1_000_000 | e0fb20575464e90d | OWED: derive it or docu
 src/data/set_config.zig:253 | 8 | 9af90aab308374f9 | OWED: derive it or document it on the line (charter §1.5)
 src/data/set_config.zig:415 | 20 | 725fad97122284a8 | a size — OWED: derive from derive.Facts or document the physical/format reason
 src/data/staging.zig:1487 | 16 | 898bed1307f37008 | OWED: derive it or document it on the line (charter §1.5)
-src/data/staging.zig:1585 | 4096 | 78e671ecc8862f6f | OWED: derive it or document it on the line (charter §1.5)
 src/data/sym_planes/alloc_lease.zig:612 | 64 | eda73ad536227786 | OWED: derive it or document it on the line (charter §1.5)
 src/data/sym_planes/alloc_lease.zig:613 | 64 | f6ce30667925f9d2 | a percentage — OWED: derive it (charter §1.5) or document the measured reason
 src/data/sym_planes/block_grant.zig:116 | 1000 | 7523c5611d8cc4b9 | a timing/retry constant — OWED: its measured WHY on the line or a derivation (charter §1.5)

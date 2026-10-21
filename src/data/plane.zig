@@ -671,7 +671,7 @@ pub const DataPlane = struct {
         } else if (opts.write_cache_bytes >= WRITE_CACHE_FLOOR and opened > 0) {
             try self.openWriteCache(gpa, opts);
         } else {
-            log.info("data plane: no write cache (SQUEEZEFS_WRITE_CACHE_PCT yields {d} B, under the {d} MiB floor) — staging is OFF: a write ≤ inline_max ({d} B) stays inline, anything larger goes STRIPED (no packed layout, no promotion pass at dismount)", .{ opts.write_cache_bytes, WRITE_CACHE_FLOOR >> 20, inline_max });
+            log.info("data plane: no write cache (SQUEEZEFS_WRITE_CACHE_PCT yields {d} B, under the {d} MiB floor) — staging is OFF: a write ≤ inline_max ({d} B) stays inline, anything larger goes STRIPED (no packed layout, no promotion pass at dismount)", .{ opts.write_cache_bytes, WRITE_CACHE_FLOOR / derive.MiB, inline_max });
         }
         errdefer self.closeStaging();
         stats.data_staging_on.set(@intFromBool(self.stage != null));

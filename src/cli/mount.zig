@@ -111,6 +111,7 @@ const transport = @import("../fuse/transport.zig");
 const fuse_geometry = @import("../fuse/geometry.zig");
 const mount_options = @import("../fuse/mount_options.zig");
 const mem_budget = @import("../mem/budget.zig");
+const cache_core = @import("../mem/cache.zig");
 const key = @import("../meta/key.zig");
 const set_config = @import("../data/set_config.zig");
 const lifecycle_stats = @import("../ops/lifecycle/stats.zig").stats;
@@ -373,7 +374,7 @@ pub fn run(p: cli.Process, m: args.Mount) u8 {
     const facts = derive.facts();
     const host: mem_budget.Host = .{ .io = p.io, .env = p.env, .facts = facts };
     const budget_bytes = mem_budget.authority.resolveBudgetNow(host);
-    const write_cache_bytes = mem_budget.authority.resolveWriteCacheNow(host, budget_bytes);
+    const write_cache_bytes = cache_core.resolveBound(knobs.intKnob("SQUEEZEFS_WRITE_CACHE_PCT", u64, p.env), facts, budget_bytes);
     const sqz = SqzIo.init(p.gpa, .{
         .env = p.env,
         .facts = facts,

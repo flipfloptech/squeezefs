@@ -2142,7 +2142,7 @@ pub const Ring = if (builtin.os.tag == .linux) struct {
     /// The memfd's mapping: the punch and the hole scan over it.
     pub const MappedSegment = struct {
         fd: linux.fd_t,
-        map: []align(4096) u8,
+        map: []align(std.heap.page_size_min) u8,
 
         /// Punch the hole (the kernel frees the pages) and drop the
         /// mapping's PTEs; neither is correctness — a tombstoned record is
@@ -2321,7 +2321,7 @@ pub const Ring = if (builtin.os.tag == .linux) struct {
         }
 
         /// The image: the memfd past the marker's grain.
-        pub fn image(self: *Ram) []align(4096) u8 {
+        pub fn image(self: *Ram) []align(std.heap.page_size_min) u8 {
             return @alignCast(self.mapped.map[HEADER..]);
         }
 
@@ -2381,11 +2381,11 @@ pub const Ring = if (builtin.os.tag == .linux) struct {
             if (len < HEADER + RECORD_ALIGN or !derive.isAligned(len, RECORD_ALIGN)) return error.OpenFailed;
             const m = linux.mmap(null, len, .{ .READ = true, .WRITE = true }, .{ .TYPE = .SHARED }, fd, 0);
             if (linux.errno(m) != .SUCCESS) return error.MapFailed;
-            const ptr: [*]align(4096) u8 = @ptrFromInt(m);
+            const ptr: [*]align(std.heap.page_size_min) u8 = @ptrFromInt(m);
             return .{ .fd = fd, .map = ptr[0..len] };
         }
 
-        fn stampMarker(map: []align(4096) u8, ours: Marker) void {
+        fn stampMarker(map: []align(std.heap.page_size_min) u8, ours: Marker) void {
             const bytes = ours.encode();
             @memcpy(map[0..MARKER_LEN], &bytes);
             @memset(map[MARKER_LEN..HEADER], 0);

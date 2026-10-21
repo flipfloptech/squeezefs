@@ -128,18 +128,6 @@ pub fn resolveBudget(facts: derive.Facts, explicit_mb: ?u64, cgroup_max: ?u64) u
     return resolveBudgetFrom(null, env_bytes, cgroup_max, facts.total_ram);
 }
 
-/// The WRITE cache's bytes (`SQUEEZEFS_WRITE_CACHE_PCT`; charter §6.1
-/// "Staged"): `pct` % of the SYSTEM root the budget itself derives from —
-/// the cgroup cage when one binds, else RAM — divided by the fleet share
-/// BEFORE the percentage like every system root, and never above `budget`
-/// (the R5 authority is the ceiling; its pressure levels shed the cache
-/// through its component). 100 GiB of RAM at the 25 % default ⇒ 25 GiB.
-pub fn writeCacheBytesFrom(cgroup_max: ?u64, ram: u64, share: u32, pct: u64, budget: u64) u64 {
-    const root = fleetSharedRoot(cgroup_max orelse ram, share);
-    const want: u64 = @intCast(@min(@as(u128, root) * pct / 100, std.math.maxInt(u64)));
-    return @min(want, budget);
-}
-
 pub const TickInputs = struct { budget: u64, rss: u64, unreclaimable: u64 };
 
 /// Per-tick input composition: the cgroup unreclaimable sample is ONE
@@ -850,18 +838,6 @@ pub const MemBudget = struct {
         return self.resolveBudgetShared(host, fleetShare(host.io, host.env, host.census));
     }
 
-    /// The write cache's bytes under `budget` (`writeCacheBytesFrom` over
-    /// the same cage and share the budget read).
-    pub fn resolveWriteCacheNow(self: *MemBudget, host: Host, budget: u64) u64 {
-        _ = self;
-        var level_buf: [2][std.Io.Dir.max_path_bytes]u8 = undefined;
-        const cage = readCgroupCage(host.io, &level_buf);
-        const pct = knobs.intKnob("SQUEEZEFS_WRITE_CACHE_PCT", u64, host.env);
-        return writeCacheBytesFrom(if (cage) |c| c.effective() else null, host.facts.total_ram, fleetShare(host.io, host.env, host.census), pct, budget);
-    }
-
-    /// `resolveBudgetNow` for a share the caller already read: the tick
-    /// divides its budget and its unreclaimable sample by ONE census.
     fn resolveBudgetShared(self: *MemBudget, host: Host, share: u32) u64 {
         const flag = self.flag_budget.load(.monotonic);
         var level_buf: [2][std.Io.Dir.max_path_bytes]u8 = undefined;
@@ -1155,21 +1131,6 @@ test "resolveBudget(facts) tie: explicit MiB > tenths(cgroup, 8) > tenths(ram, 7
     try testing.expectEqual(derive.tenths(251_000_000_000, 7), resolveBudget(facts, null, null));
     // A 0 RAM fact (off-Linux probe) derives a 0 budget: the authority idles Green.
     try testing.expectEqual(@as(u64, 0), resolveBudget(derive.Facts.synthetic(1, 0), null, null));
-}
-
-test "the write cache tie: 25 % of SYSTEM RAM — 100 GiB ⇒ 25 GiB; the cgroup cage is the root when one binds; the fleet share divides the root before the percentage; the budget is the ceiling; 0 % is no cache" {
-    const ram = 100 * GiB;
-    const budget = derive.tenths(ram, 7);
-    try testing.expectEqual(25 * GiB, writeCacheBytesFrom(null, ram, 1, 25, budget));
-    // The cage binds: 40 GiB caged ⇒ 10 GiB, whatever the machine holds.
-    try testing.expectEqual(10 * GiB, writeCacheBytesFrom(40 * GiB, ram, 1, 25, budget));
-    // Four co-located daemons split the root first: 25 GiB ÷ 4.
-    try testing.expectEqual(25 * GiB / 4, writeCacheBytesFrom(null, ram, 4, 25, budget));
-    // The R5 budget caps it: 100 % of RAM asked, 70 % of RAM is the ceiling.
-    try testing.expectEqual(budget, writeCacheBytesFrom(null, ram, 1, 100, budget));
-    try testing.expectEqual(@as(u64, 0), writeCacheBytesFrom(null, ram, 1, 0, budget));
-    // The read cache's 25 beside it stays under the 70 % authority.
-    try testing.expect(2 * writeCacheBytesFrom(null, ram, 1, 25, budget) < budget);
 }
 
 test "fleet share divides the memory ROOT, derived tier only; ceil, never floor" {

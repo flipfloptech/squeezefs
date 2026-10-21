@@ -135,3 +135,116 @@ the read side's 2.9 µs is the same floor); (3) the metadata engine's per-lookup
 table's arc-swap RMW, `read-cost` item 3) and a per-ino binding witness for the W1 patch (one load
 instead of a KV descent: full tier, with a model). Parity through FUSE is not on this list: the
 client bypass (charter §3) is the row's parity path, as the comparison note said.
+
+## Wave 2 (2026-10-20): four rings per queue, all-own — 1.15 M → 1.50 M
+
+Head `329a3c9` (the read view serves the write prelude; two rings, depth 8). Owner's direction:
+"performance oriented first — squeeze out the last bit we can." Sessions `ram-sqz-rw4b-*`, the same
+venue and thermal rule (one benchmark on the host, Tctl ≤ 70 °C and load < 3 before each session; the
+host was shared with four other agents' builds and sessions, so the legs waited and a few are single).
+
+**The split, re-profiled** (`rw4b-prof-r1`, QD32×4, 1,149.6 k at 16.6 host cores = 14.4 µs per write;
+22.99 M writes). The daemon 10.0 µs: the uring workers **7.05** (8.10 cores, saturated) + the lanes
+2.96 averaged (4.8 per spilled write; 62 % spilled at depth 8). The worker's 7.05: kernel inside
+`io_uring_enter` **4.7** — the FUSE commit+fetch cmd 1.4 (its `queue->lock` 0.25 of it), the
+`WRITE_FIXED` issue 1.3 (`blk_mq` → nvme-loop → the nvmet workqueue's pool lock 0.26 and its kworker
+kick 0.2: the substrate's, paid by ext4 in fio's context), the completions' task work 1.1, cq-wait
+0.45, the eventfd reads/writes 0.3 — and userspace 2.35: the own handler 1.76 averaged (4.6 per own
+write: `WritePath.write` 0.9 of which the W1 fence pair, the block lock, the `I{ino}` guard and
+`resolveAt` 0.3; the store request's inbox push and the fiber's park), the reap, dispatch and fiber
+spawn 0.7, the pass 0.17, clock reads 0.23, counters 0.1. Ledger per write: KV lookups **0.0005**
+(the read view: 1.00 hits), divert asks 0 (lever (b), the route-table RMW, is off the write path
+already), journal entries 0, enters 0.44, passes 0.37, sleeps 0.04 + 0.08, timer arms 0.07, own 38 %,
+cross-lane wakes 1.29, wake writes 0.27, owed spins 0.08; held-write phases to_store 24.7 µs, store
+30.6, to_commit 21.1 of fio's 101 µs p50. Lever (d): the device write is issued inline on the worker
+(`blkdev_direct_IO` under `io_write`, no `IOSQE_ASYNC`, 31 io-wq samples of 150 k on the host), so
+the 4k patch pays no punt; the 1.3 µs is the block layer plus the loop target's hand-off.
+
+**Lever (a), rings per queue × the own depth** (the knob pair on one binary — `SQUEEZEFS_FUSE_RINGS_PER_QUEUE`
+2/3/4, `SQUEEZEFS_FUSE_WRITE_OWN_DEPTH` 8/0 — legs interleaved, cooled; IOPS per leg; daemon cores;
+`tctl` start>end per row in `results.tsv`):
+
+| arm | rw4k-q32j4 | daemon cores | rw64k-q16j4 | rw4k-q32j1 | rw4k-q1j1 | worker µs/write · enters · spins per write |
+|---|---|---|---|---|---|---|
+| 2 rings, depth 8 (dev) | 1,147 k / 1,145 k | 11.58 / 11.56 | 579 k / 578 k | 604 k / 427 k | 123 k / 90 k | 7.07 · 0.46 · 0.06 |
+| 3 rings, depth 8 | 1,270 k / 1,220 k | 14.85 / 14.37 | 626 k / 633 k | 416 k / 725 k | 107 k / 101 k | 8.88 · 0.94 · 0.21 |
+| 4 rings, depth 8 | 1,255 k / 1,230 k | 17.28 / 17.01 | 636 k / 607 k | 768 k / 436 k | 123 k / 122 k | 10.92 · 1.49 · 0.78 |
+| 3 rings, all-own | 1,396 k | 11.66 | 678 k | 694 k | 117 k | 8.33 · 0.54 · 0.12 |
+| **4 rings, all-own** | **1,506 k / 1,504 k** | 14.83 / 14.83 | 681 k / 675 k | 430 k / 761 k | 89 k / 97 k | 9.83 · 0.86 · 0.50 |
+| 4 rings, all-own, no spin | 1,522 k / 1,504 k | 14.51 / 14.58 | 682 k / 678 k | 425 k / 428 k | 110 k / 111 k | — |
+| 3 rings, all-own, no spin | 1,409 k | 11.67 | 691 k | 706 k | 110 k | — |
+
+At depth 8 a third or fourth ring buys 7–9 % for 25–50 % more cores: the workers come off saturation
+and go back to the per-CQE regime (enters 0.46 → 1.49, spins 0.06 → 0.78 per write — 3.9 of the 4-ring
+arm's 14.8 worker cores were the owed spin). All-own fills those gaps with the handler: three rings
+reach 1.40 M (1,396 / 1,397 k) at the two-ring arm's cores, four rings 1.50 M (fio at 89 %) at a
+proportional 14.8. The owed spin is neutral on every arm (the no-spin rows), as the owner found
+before; it stays. The one-submitter row keeps its two placement modes on every arm (0.42–0.43 M and
+0.69–0.77 M). **The read rows decide between 3 and 4** (all-own, cooled, one leg each; the two-ring
+numbers are `rung-10-read-view.md`'s):
+
+| arm | rr4k-q1j1 | rr4k-q32j1 | rr4k-q32j4 (daemon cores, fio %) | rr64k-q16j4 |
+|---|---|---|---|---|
+| 2 rings (dev) | 126 k | 713 k | 1,741 k (7.9, 83 %) | 929 k |
+| 3 rings, all-own | 114 k | 772 k | **1,902 k** (11.3, 96 %) | **963 k** (7.9) |
+| 4 rings, all-own | 141 k / 142 k | 856 k / 806 k | 1,810 k / 1,807 k (13.5, 96 %) | 928 k / 909 k (8.8) |
+
+Three rings take the 4k read row to 96 % of ext4 (1.98–2.03 M, fio-bound there at 99 % as here at
+96 %) and the 64k read row above ext4 (903 k); the fourth ring gives 5 % of it back (fio and four
+workers on one `queue->lock`) for 20 % more cores, and buys 7 % on the 4k write row. **Shipped: three
+rings and depth 0** (`c680fb4`): `RINGS_PER_QUEUE_DERIVED = 3` with the reason on the line — the
+workers one submitter keeps busy, the daemon's per-op cost over the submitter's (≈ 7 µs against
+fio's 2.5), rounded up; a static cores ÷ queues reads 1 on every host (the queues are the CPUs,
+charter §4); 4 stays the write row's lever. The knee of 8 was the one- and two-ring measurement, and
+with the convoy gone (wave 1) the own handler is what a half-loaded worker should be doing.
+
+**A/B, the shipped defaults** (A = `329a3c9` from a pinned worktree — two rings, depth 8; B = `c680fb4`
+— three rings, depth 0; one leg at a time, cooled; IOPS per leg, (max − min) ÷ mean, daemon cores, Tctl
+start>end per leg):
+
+| row | A legs | B legs | B ÷ A | daemon cores A → B | tctl A / B |
+|---|---|---|---|---|---|
+| rw4k-q1j1 | 123 / 90 / 120 / 123 / 121 k (29 %) | 117 / 108 / 125 / 123 k (14 %) | 1.03 | 0.75 → 0.73 | 55>69 56>59 60>70 58>70 64>65 / 66>69 64>68 59>63 62>69 |
+| rw4k-q32j1 | 604 / 427 / 596 / 599 / 598 k (31 %) | 694 / 688 / 697 / 701 k (2 %) | **1.23** | 2.77 → 3.00 | 69>62 59>72 70>60 70>59 65>60 / 69>67 68>64 63>60 69>68 |
+| rw4k-q32j4 | 1,147 / 1,145 / 1,139 / 1,135 / 1,150 k (1 %) | **1,396 / 1,397 / 1,393 / 1,404 k** (1 %) | **1.22** | 11.58 → 11.67 | 62>67 53>70 60>68 59>68 60>68 / 67>74 64>71 60>69 68>71 |
+| rw64k-q16j4 | 579 / 578 / 568 / 570 / 570 k (2 %) | 678 / 684 / 684 / 682 k (1 %) | **1.19** | 9.25 → 9.39 | 67>71 70>71 68>76 68>71 68>70 / 54>77 70>79 69>72 70>75 |
+
+**The full matrix** (legs A4 B7 B8 A5; mean B ÷ mean A; MiB/s on the sequential rows):
+
+| row | A legs 1/4 | B legs 2/3 | B ÷ A | daemon cores A → B |
+|---|---|---|---|---|
+| rr4k-q1j1 / q32j1 / q32j4 | 142 / 114 k · 800 / 467 k · 1,750 / 1,685 k | 130 / 127 k · 502 / 917 k · **1,879 / 1,879 k** | 1.01 · 1.12 · **1.09** | 0.72 → 0.66 · 2.00 → 2.77 · 7.77 → 11.20 |
+| rw4k-q1j1 / q32j1 / q32j4 | 100 / 92 k · 594 / 520 k · 1,148 / 1,025 k | 97 / 99 k · 694 / 698 k · **1,402 / 1,401 k** | 1.02 · 1.25 · **1.29** | 0.69 → 0.69 · 2.82 → 3.00 · 11.11 → 11.67 |
+| rr64k / rw64k QD16×4 | 920 / 883 k · 572 / 520 k | 964 / 959 k · 697 / 681 k | 1.07 · **1.26** | 6.15 → 7.88 · 8.81 → 9.43 |
+| sr1m ×1 / ×4 | 51,577 / 49,141 · 72,576 / 67,897 | 58,481 / 58,656 · 70,683 / 70,608 | 1.16 · 1.01 | 1.60 → 1.94 · 3.18 → 3.46 |
+| sw1m ×1 / ×4 · sw4m ×4 | 33,990 / 32,638 · 48,789 / 48,667 · 41,046 / 42,179 | 34,008 / 33,805 · 58,332 / 58,283 · 42,072 / 40,182 | 1.02 · **1.20** · 0.99 | 1.62 → 1.62 · 4.48 → 5.10 · 3.55 → 3.46 |
+
+No row regresses: the one-submitter read row keeps its two placement modes on both arms (A 800 / 467 k,
+B 502 / 917 k), `sw4m` 0.99 is inside its 3–5 % spreads; the sequential 1 MiB ×4 write rose 20 % (the
+held overlay class runs on the worker's own lane too under depth 0, with three workers per queue).
+The 4k write row sits at 1 % spread on four legs; the read row at 0 %.
+
+**The row against ext4/xfs**: 4k randwrite QD32×4 ext4 1,963 k at 8.1 host cores, xfs 1,941 k,
+SqueezeFS **415 k (wave 0) → 1,040 k (wave 1) → 1,400 k** (18.1 host cores, the daemon 11.7) —
+**71 % of ext4** (four rings: 1,505 k, 77 %, the lever). Beside it: 4k randread QD32×4 1,879 k = 93–95 %
+of ext4/xfs, 64k randread 964 k above ext4's 903 k, 64k randwrite 690 k.
+
+**Smoke rows green on the branch**: KERNEL AIO on the plain mount, the data plane WITH / WITHOUT a cache
+path, THE KILL MATRIX, A STREAMING OVERWRITE NEVER WEDGES THE DAEMON, THE READ VIEW. Suites: geometry
+109, knobs 55, rails 42, transport 149, session 129 (3 skipped), e2e 113 (3 skipped), exec 142,
+lifecycle 80, kv_fs 96, write_admit 78, sole_owner_patch 44, data.plane 49, shape 118 (4 skipped).
+
+**What remains on the row, and the path to 1.9 M.** At three rings the workers are at 0.97 cores each
+and fio at 81 %; the per-write worker CPU is 8.3 µs of which ≈ 5.5 kernel (the commit+fetch cmd and
+its queue lock, the `WRITE_FIXED` issue and the loop target's hand-off, the task work, the park/wake)
+and ≈ 2.8 ours (the own handler 4.6 per write less the lane it replaced). In order: (1) the series'
+per-op cost — proposed patch 0031 (the round trip), the `queue->lock` the fetch and the submitter
+share, the task-work hop per delivery (read + write pay the same ≈ 2.3–2.9 µs floor); (2) the handler's
+remaining 4.6 µs: the fiber spawn and two parks per write (`Lane.spawn` 0.28, the store cell's
+`futexWait` 0.3, the reply's finalize), the W1 fence pair and the four-tier purge, ≈ 12 clock reads
+and ≈ 20 counter increments per write (0.3 + 0.1 µs; the exact-sum phase families are the
+observability contract, so a `now` carried through the pass rather than their removal); (3) lever (c)
+as measured: an all-own write's passes are 0.35 per write and its enters 0.54 — the pass boundary is
+no longer where the time goes, and the batching park's premise (≥ 2 owed completions per pass) still
+reads false (0.12 spins per write, each for one completion). Parity through FUSE is the client
+bypass's row (`rung-10-client-direct-writes.md`: 3.0 M).

@@ -738,6 +738,10 @@ pub const Stats = struct {
     /// windows whose members applied themselves (§BC), and the members.
     self_handoffs: counters.ShardedCounter = .{},
     self_applies: counters.ShardedCounter = .{},
+    /// `meta_conveyor_turn_spin_hits` / `_falls`: turns found by the
+    /// committer's spin against those that parked (§BC).
+    turn_spin_hits: counters.ShardedCounter = .{},
+    turn_spin_falls: counters.ShardedCounter = .{},
     /// `meta_conveyor_acked_write_failures`: a journal write that failed
     /// AFTER its window was acked (§BB.5): no rollback, the volume FAILED.
     acked_write_failures: counters.ShardedCounter = .{},
@@ -824,7 +828,7 @@ pub const Stats = struct {
             self.hold_bound_ns.load(),
             self.holds_pacing.load(),
         });
-        try w.print(",\"meta_conveyor_resolve_seeded\":{d},\"meta_conveyor_resolve_descended\":{d},\"meta_conveyor_acks_at_apply\":{d},\"meta_conveyor_acks_at_landing\":{d},\"meta_conveyor_acked_write_failures\":{d},\"meta_conveyor_tail_slot_misses\":{d},\"meta_conveyor_self_handoffs\":{d},\"meta_conveyor_self_applies\":{d}", .{ self.resolve_seeded.load(), self.resolve_descended.load(), self.acks_at_apply.load(), self.acks_at_landing.load(), self.acked_write_failures.load(), self.tail_slot_misses.load(), self.self_handoffs.load(), self.self_applies.load() });
+        try w.print(",\"meta_conveyor_resolve_seeded\":{d},\"meta_conveyor_resolve_descended\":{d},\"meta_conveyor_acks_at_apply\":{d},\"meta_conveyor_acks_at_landing\":{d},\"meta_conveyor_acked_write_failures\":{d},\"meta_conveyor_tail_slot_misses\":{d},\"meta_conveyor_self_handoffs\":{d},\"meta_conveyor_self_applies\":{d},\"meta_conveyor_turn_spin_hits\":{d},\"meta_conveyor_turn_spin_falls\":{d}", .{ self.resolve_seeded.load(), self.resolve_descended.load(), self.acks_at_apply.load(), self.acks_at_landing.load(), self.acked_write_failures.load(), self.tail_slot_misses.load(), self.self_handoffs.load(), self.self_applies.load(), self.turn_spin_hits.load(), self.turn_spin_falls.load() });
         try w.print(",\"meta_commit_ack_spin_hits\":{d},\"meta_commit_ack_spin_falls\":{d},\"meta_commit_ack_spin_skips\":{d},\"meta_commit_ack_spin_busy\":{d},\"meta_commit_ack_spin_bound_ns\":{d},\"meta_commit_ack_spin_wake_ns\":{d},\"meta_commit_ack_spin_ack_ns\":{d}}}", .{
             self.ack_spin_hits.load(),
             self.ack_spin_falls.load(),
@@ -981,6 +985,9 @@ pub const AckSpin = struct {
     ack: RttEstimator = .{},
     /// Ack → the committer resumed after a park.
     wake: RttEstimator = .{},
+    /// Enqueue → the TURN (§BC): the pass's drain, recall, admission and
+    /// reservation ahead of this member — what the turn spin waits out.
+    turn: RttEstimator = .{},
 
     pub const Reading = struct { wake_ns: u64, ack_ns: u64, bound_ns: u64 };
 
@@ -1002,6 +1009,24 @@ pub fn spinForAck(done: *const Done, bound_ns: u64) bool {
         std.atomic.spinLoopHint();
     }
     return true;
+}
+
+/// §BC: the turn spin's cap — twice the park/resume wake measured for
+/// §AB.4 (17.5 µs of a QD1 create): the CPU a spin may burn is at most
+/// twice the wake it saves, and a committer waiting for its turn on a busy
+/// FUSE lane has no idle park to measure the wake with. A send to a
+/// spinning receiver costs the pass no wake syscall (a parked waiter alone
+/// is woken), so the spin pays on both sides of the turn.
+pub const TURN_SPIN_CAP_NS: u64 = 2 * 17_500;
+
+/// The pure rule (tie-tested): twice the turn's predicted latency, within
+/// the cap; the cap itself before the first sample (it bootstraps the
+/// predictor); a turn predicted past the cap is parked for (every spin
+/// would fall through).
+pub fn turnSpinBound(turn_srtt_ns: ?u64) u64 {
+    const t = turn_srtt_ns orelse return TURN_SPIN_CAP_NS;
+    if (t > TURN_SPIN_CAP_NS) return 0;
+    return @min(2 * t, TURN_SPIN_CAP_NS);
 }
 
 /// The pure rule (tie-tested): `2·W` when the ack's mean is within it, else 0.
@@ -1790,6 +1815,17 @@ pub const Conveyor = struct {
     fn park(self: *Conveyor, done: *Done) Error!void {
         self.stats.commit_parked.add(1);
         defer self.stats.commit_parked.sub(1);
+        if (self.deps.self_apply) {
+            // §BC: the signal is the TURN, a pass's drain away; spin for it
+            // within the rule, else park.
+            const bound = turnSpinBound(self.ack_spin.turn.mean());
+            if (bound != 0 and spinForAck(done, bound)) {
+                self.stats.turn_spin_hits.inc();
+            } else {
+                self.stats.turn_spin_falls.inc();
+            }
+            return self.takeSignal(done.recvUncancelable(self.deps.io) catch return error.Corrupt);
+        }
         const rd = self.ack_spin.read();
         const bound = rd.bound_ns;
         // Published on change only: a store per park would bounce the
@@ -1830,7 +1866,10 @@ pub const Conveyor = struct {
     fn takeSignal(self: *Conveyor, sig: Done.Signal) Error!void {
         return switch (sig) {
             .outcome => |o| o,
-            .turn => |t| self.applyOwn(t.w, t.idx),
+            .turn => |t| blk: {
+                self.ack_spin.turn.sample(clock.monotonicNs() -| t.w.members[t.idx].enqueued_ns);
+                break :blk self.applyOwn(t.w, t.idx);
+            },
         };
     }
 
@@ -4050,6 +4089,14 @@ test "the ack spin's bound (decision 0003 §AB.4): no measured wake ⇒ no spin;
     try testing.expectEqual(@as(u64, 0), a.read().bound_ns);
     a.wake.sample(17_500);
     try testing.expectEqual(@as(u64, 35_000), a.read().bound_ns);
+}
+
+test "the turn spin's tie (§BC): the cap before a sample; 2× the turn's mean within the cap; 0 past it" {
+    try testing.expectEqual(TURN_SPIN_CAP_NS, turnSpinBound(null));
+    try testing.expectEqual(@as(u64, 20_000), turnSpinBound(10_000));
+    try testing.expectEqual(TURN_SPIN_CAP_NS, turnSpinBound(20_000));
+    try testing.expectEqual(TURN_SPIN_CAP_NS, turnSpinBound(TURN_SPIN_CAP_NS));
+    try testing.expectEqual(@as(u64, 0), turnSpinBound(TURN_SPIN_CAP_NS + 1));
 }
 
 test "the ack spin: an ack landing inside the bound is a hit (the outcome on its way: the recv takes it); none inside is a fall-through after the whole bound" {

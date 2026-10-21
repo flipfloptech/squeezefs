@@ -380,7 +380,14 @@ const Rig = struct {
     /// that it is ONE document every tool can parse.
     fn stats(self: *Rig) ![]u8 {
         var script: [160]u8 = undefined;
-        const text = try self.shOk(self.work, try std.fmt.bufPrint(&script, "cat {s}/.stats", .{self.mp}));
+        const text = self.shOk(self.work, try std.fmt.bufPrint(&script, "cat {s}/.stats", .{self.mp})) catch |e| {
+            // An unreadable .stats on a daemon that died of a SIGKILL this
+            // test never sent is the venue's sweep (`judgeDeath`: the row
+            // SKIPS loud), not the row's failure — the writer-storm row read
+            // `Transport endpoint is not connected` here on gate 57.
+            try self.expectAlive(".stats");
+            return e;
+        };
         errdefer self.gpa.free(text);
         try expectStrictStats(self.gpa, text);
         return text;

@@ -3173,8 +3173,11 @@ test "e2e: a reply published after a backstop tick's reap and before the next pa
     if (venueMissing()) |why| return testkit.skipWhy(@src(), why);
     // A cross-thread race: on the merged arm the handler publishes on the
     // worker's own thread and arms no coalescer (decision 0003 §AB.3), so
-    // the pin runs on the handler-lane arm, where the race lives.
-    const rig = try Rig.init(testing.allocator, 10, &.{.{ "SQUEEZEFS_FUSE_HANDLERS_ON_WORKER", "0" }});
+    // the pin runs on the handler-lane arm, where the race lives. ONE ring
+    // per queue: the seam is spent by the worker that ticks and holds it
+    // until ITS coalescer arms — with several workers on the parked
+    // request's queue that must be the one owing it, and the rig says so.
+    const rig = try Rig.init(testing.allocator, 10, &.{ .{ "SQUEEZEFS_FUSE_HANDLERS_ON_WORKER", "0" }, .{ "SQUEEZEFS_FUSE_RINGS_PER_QUEUE", "1" } });
     defer rig.deinit();
     const s = try rig.mountIt(.{ .mem_budget_bytes = 0 });
     var pb: [256]u8 = undefined;

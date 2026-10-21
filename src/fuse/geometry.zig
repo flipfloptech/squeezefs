@@ -465,19 +465,36 @@ pub fn resolveRingsPerQueue(explicit: ?u32, derived: u32) u32 {
 /// count.
 pub const RingShare = struct { base: u16, depth: u32 };
 
-/// The split of `depth` over `rings`: the first `depth mod rings` rings
-/// take `ceil(depth / rings)`, the rest `floor(depth / rings)` — every ring
-/// at least one entry while `depth ≥ rings` (a ring with no entry would
-/// never REGISTER and the arm barrier would never complete), the queue's
-/// depth (and the kmbuf regions' pinned bytes, sized per ring from its
-/// share) unchanged by the count. For two rings this is ring 0 ceil, ring 1
-/// the rest.
+/// The split of `depth` over `rings`, PINNED-EXACT: a ring's kmbuf region
+/// is `nextPow2(share) × payload` (the kernel's buffer ring takes a power
+/// of two of entries, `zc.ringEntriesFor`), so an even split pins more than
+/// the queue would alone — 32 over three rings as 11/11/10 pinned 16 + 16 +
+/// 16 MiB per queue instead of 32 (+512 MiB per mount at the default depth,
+/// rung-10-write-iops wave 2's gate). The shares are HALVINGS: start from the
+/// whole depth and, until there are `rings` shares, split the largest into
+/// ceil/floor halves; `nextPow2(ceil(e / 2)) ≤ nextPow2(e) / 2`, so the sum
+/// of the regions never exceeds the one-ring region. Ring 0 takes the
+/// largest share (the kernel's LIFO entry pick fills it first: it is the
+/// hot ring), every ring at least one entry while `depth ≥ rings` (a ring
+/// with no entry would never REGISTER and the arm barrier would never
+/// complete), the queue's depth unchanged by the count. Two rings: ring 0
+/// ceil, ring 1 the rest, as before; 32 over three: 16 / 8 / 8; over four:
+/// 8 / 8 / 8 / 8.
 pub fn ringShare(depth: u32, rings: u32, ring: u32) RingShare {
     std.debug.assert(rings >= 1 and ring < rings and depth >= rings);
-    const per: u32 = depth / rings;
-    const rem: u32 = depth % rings;
-    const base: u32 = per * ring + @min(ring, rem);
-    return .{ .base = @intCast(base), .depth = per + @intFromBool(ring < rem) };
+    var shares: [MAX_RINGS_PER_QUEUE]u32 = @splat(0);
+    shares[0] = depth;
+    var n: usize = 1;
+    while (n < rings) : (n += 1) {
+        // The list is kept sorted descending: the largest share is first.
+        const e = shares[0];
+        shares[0] = e - e / 2;
+        shares[n] = e / 2;
+        std.mem.sort(u32, shares[0 .. n + 1], {}, std.sort.desc(u32));
+    }
+    var base: u32 = 0;
+    for (shares[0..ring]) |x| base += x;
+    return .{ .base = @intCast(base), .depth = shares[ring] };
 }
 
 /// `node_of(cpu)`: the NUMA node of a CPU, null for an unknown (offline or
@@ -1070,16 +1087,31 @@ test "rings per queue: 3 where the FEATURES probe reads present on kmbuf/zc (the
     try testing.expectEqual(RingShare{ .base = 16, .depth = 16 }, ringShare(32, 2, 1));
     try testing.expectEqual(RingShare{ .base = 2, .depth = 2 }, ringShare(4, 2, 1));
     try testing.expectEqual(RingShare{ .base = 3, .depth = 2 }, ringShare(5, 2, 1));
-    // Four rings: ceil shares, the last takes the rest, the depth is whole.
-    for ([_]u32{ 4, 5, 9, 16, 17, 31, 32 }) |depth| {
-        var sum: u32 = 0;
-        for (0..4) |ring| {
-            const s = ringShare(depth, 4, @intCast(ring));
-            try testing.expectEqual(@as(u16, @intCast(sum)), s.base);
-            try testing.expect(s.depth >= 1 and s.depth <= derive.ceilDiv(depth, 4));
-            sum += s.depth;
+    // Three and four rings: halvings of the largest — 32 is 16/8/8 and
+    // 8/8/8/8, ring 0 the largest, bases contiguous, the depth whole, and
+    // the kmbuf regions (nextPow2 of each share) never pin more than the
+    // one-ring region does (the pinned-exactness tie).
+    try testing.expectEqual(RingShare{ .base = 0, .depth = 16 }, ringShare(32, 3, 0));
+    try testing.expectEqual(RingShare{ .base = 16, .depth = 8 }, ringShare(32, 3, 1));
+    try testing.expectEqual(RingShare{ .base = 24, .depth = 8 }, ringShare(32, 3, 2));
+    try testing.expectEqual(RingShare{ .base = 24, .depth = 8 }, ringShare(32, 4, 3));
+    for ([_]u32{ 3, 4, 5, 9, 10, 12, 16, 17, 31, 32 }) |depth| {
+        for ([_]u32{ 3, 4 }) |rings| {
+            if (depth < rings) continue;
+            var sum: u32 = 0;
+            var pinned: u64 = 0;
+            var prev: u32 = std.math.maxInt(u32);
+            for (0..rings) |ring| {
+                const s = ringShare(depth, rings, @intCast(ring));
+                try testing.expectEqual(@as(u16, @intCast(sum)), s.base);
+                try testing.expect(s.depth >= 1 and s.depth <= prev);
+                prev = s.depth;
+                sum += s.depth;
+                pinned += derive.nextPow2(s.depth);
+            }
+            try testing.expectEqual(depth, sum);
+            try testing.expect(pinned <= derive.nextPow2(depth));
         }
-        try testing.expectEqual(depth, sum);
     }
     try testing.expectEqual(RingShare{ .base = 24, .depth = 8 }, ringShare(32, 4, 3));
 }

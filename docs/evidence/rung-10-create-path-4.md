@@ -78,6 +78,30 @@ families 181/186. Smoke battery (coherence, shared hot directory, dead manager, 
 kill matrix, kill -9 mid-tar ×2, the replay proof, the supervise rows, busy/lazy umounts, `sync -f`,
 the durability-points row, the block-map tree) 58/58; INVALIDATION COHERENCE ×5.
 
+## The first gate's two defects (`~/tmp/sqz-gate-58/59-create4.log`)
+
+1. **A DEAD MANAGER HOLDING A STRIPED HOT DIRECTORY wedged.** B's log (`/build/tmp/smoke-2136151/daemon-b.log`):
+   the reclaim against the remounted manager answered `UnknownLease` ("the prior lease is not
+   custody") — the one verdict that poisons a joined mount (`appender_park_expiries` fired, every
+   volume FAILED); the storm's creates parked at the move gate 48 s, the cross-owner intents stuck,
+   the storm child unkillable in a request B never answered. The cause: A had acked B's slot leases at
+   the apply, died unsupervised within the flush window, and came back without them. **The fix:** the
+   apply ack is this mount's kernel's alone (`tx.kernel_origin`); a wire-served step, a control record
+   (a lease, a grant, the claim, a membership page), a job's or a tool's commit is acked at the landing —
+   every word of the symmetric protocol means durable (charter §5.5), so a peer never holds a lease or
+   an attested step its holder's device lacks. The row then 10/10 under load (8 × `yes` + a parallel
+   unit run; `~/tmp/w4cp/dm/`), the backend's §BB test proves a served verb's commit still parks.
+2. **Two `squeezefs-unit` shards became zombies and the gates ran to their caps.** Shard 12's "10 s
+   random-op storm" (an in-process FUSE session) passed its hang limit under the gate's load; the hang
+   watch's `exit_group` could not end a process whose own threads were parked in requests on the
+   mount it served (D state in `fuse_open` / `fuse_direct_read_iter`; the fd table lives while they
+   do, so the connection never ends and the build runner never sees the shard end). The hang watch
+   now aborts the FUSE connections of this process's pid-tagged squeezefs mounts before it exits
+   (`/sys/fs/fuse/connections/<minor>/abort`), so a hung shard is reported in minutes, never at the
+   gate's cap — the smoke rig's dead-daemon mounts included (the storm child's `wait4` of defect 1
+   would have returned the same way). Why the storm test itself passed its limit twice on this branch
+   and on none of the eight gates before it is not established.
+
 ## Risks and what was not verified
 
 - The symmetric death ladder does not WAIT for a dead peer's replay: the order is time's (`T_owner`

@@ -107,8 +107,6 @@ pub const MetaSet = struct {
     /// Per volume: the mint set (its first ≤ 64 hosted slots) and rotor.
     rotors: []router.MintRotor,
     mint_rr: std.atomic.Value(u64) = .init(0),
-    /// The slot decision's tie-break cursor (apart from the member pick's).
-    slot_rr: std.atomic.Value(u64) = .init(0),
     set_uuid: [16]u8,
     hash_seed: u64,
     /// `hash_seed` expanded once at mount: the set's name key.
@@ -626,7 +624,15 @@ pub const MetaSet = struct {
         var hb: [route_table.MAX_VOLUMES]?u32 = undefined;
         const v: route_table.VolumeIndex = if (home) parent_v else @intCast(router.pickMintVolume(parent_v, self.healths(hb[0..self.volumes.len]), &self.mint_rr));
         if (v != parent_v) rstats.routing_mint_volume_picks.inc();
-        const rr = self.slot_rr.fetchAdd(1, .monotonic);
+        // The rotor's tie-break is the COMMITTER'S THREAD (decision 0003
+        // §BC.2): equal headroom ties resolve to one rotor slot per worker
+        // lane, so a lane's mints append to its own slot tree's edge — the
+        // 32 ranks of a storm spread over 32 leaves rather than taking
+        // every rotor tree's rightmost leaf in turn (the one serializer
+        // left once the hops were gone: `leaf_wait_other` 41 µs per take,
+        // 3.9 takes per create). The headroom law still moves a lane off a
+        // tree over the cap.
+        const rr = laneCursor();
         const slot = self.volumes[v].slots.mintSlot(parent_slot, v == parent_v, gather, rr) orelse self.rotors[v].pickSlot();
         const be = self.volumeOfSlot(slot);
         const local = be.allocateInoInSlot(slot) catch |e| return switch (e) {
@@ -634,6 +640,12 @@ pub const MetaSet = struct {
             else => error.Io,
         };
         return route_table.effectiveIno(inos.makeGlobalIno(local, slot, inos.ROUTING_WIDTH));
+    }
+
+    /// The calling thread's cursor into the rotor: Fibonacci-hashed so
+    /// adjacent thread ids land on different slots.
+    fn laneCursor() u64 {
+        return (@as(u64, @intCast(std.Thread.getCurrentId())) *% 0x9E3779B97F4A7C15) >> 32;
     }
 
     /// The filesystem's directory-parent memo for the handover's subtree

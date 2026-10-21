@@ -788,6 +788,12 @@ pub const Stats = struct {
     /// `lock_phase_ns.leaf_lock_hold`: first acquire → every guard dropped
     /// (its tail must sit ≪ device latency — the "never across I/O" law).
     leaf_lock_hold: counters.ShardedLatencyHistogram = .{},
+    /// `lock_phase_ns.leaf_wait_{inodes,dentries,other}`: the wait to
+    /// ACQUIRE one leaf's write lock, by its tree — the hot leaf's class
+    /// (§BC: the serializer once the hops are gone).
+    leaf_wait_inodes: counters.ShardedLatencyHistogram = .{},
+    leaf_wait_dentries: counters.ShardedLatencyHistogram = .{},
+    leaf_wait_other: counters.ShardedLatencyHistogram = .{},
 
     pub fn writeJson(self: *const Stats, w: *std.Io.Writer) std.Io.Writer.Error!void {
         try w.print("{{\"meta_commit_group_size\":{{", .{});
@@ -861,6 +867,12 @@ pub const Stats = struct {
         try self.window_total.snapshot().writeJson(w);
         try w.writeAll(",\"leaf_lock_hold\":");
         try self.leaf_lock_hold.snapshot().writeJson(w);
+        try w.writeAll(",\"leaf_wait_inodes\":");
+        try self.leaf_wait_inodes.snapshot().writeJson(w);
+        try w.writeAll(",\"leaf_wait_dentries\":");
+        try self.leaf_wait_dentries.snapshot().writeJson(w);
+        try w.writeAll(",\"leaf_wait_other\":");
+        try self.leaf_wait_other.snapshot().writeJson(w);
         try w.writeAll("}");
     }
 };
@@ -2118,7 +2130,16 @@ pub const Conveyor = struct {
     }
 
     fn lockAll(self: *Conveyor, lock_set: []*CachedNode, dirties: []*NodeDirty) void {
-        for (lock_set, dirties) |n, *d| d.* = n.lockWrite(self.deps.io);
+        for (lock_set, dirties) |n, *d| {
+            const t0 = clock.monotonicNs();
+            d.* = n.lockWrite(self.deps.io);
+            const waited = clock.monotonicNs() -| t0;
+            switch (n.tree_id) {
+                key.TREE_INODES => self.stats.leaf_wait_inodes.record(waited),
+                key.TREE_DENTRIES => self.stats.leaf_wait_dentries.record(waited),
+                else => self.stats.leaf_wait_other.record(waited),
+            }
+        }
     }
 
     fn unlockAll(self: *Conveyor, lock_set: []*CachedNode) void {

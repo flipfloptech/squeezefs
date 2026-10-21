@@ -1022,22 +1022,20 @@ pub const PendingTimes = struct {
         }
     }
 
-    /// Snapshot up to one batch of parked inos (any order) — BEFORE any
-    /// gate or guard, so a drain with no work touches nothing. A full
-    /// batch tells the drain to loop.
-    pub fn drainBatch(self: *PendingTimes, out: *[PENDING_TIMES_DRAIN_BATCH]u64) []u64 {
-        var n: usize = 0;
+    /// Every parked ino, appended to `out` — the drain's snapshot, taken
+    /// BEFORE any gate or guard (a drain with no work touches nothing) and
+    /// ONCE per tick: what parks while the tick drains is the next tick's.
+    /// (Re-snapshotting a batch at a time from the first stripe on never
+    /// reached the last stripes under a storm of re-parks and never ended:
+    /// 95 k records a second journaled for time polish, every one staling
+    /// its ino's views.)
+    pub fn snapshotParked(self: *PendingTimes, gpa: Allocator, out: *std.ArrayList(u64)) Allocator.Error!void {
         for (&self.stripes) |*s| {
             s.lock.lock();
             defer s.lock.unlock();
             var it = s.map.keyIterator();
-            while (it.next()) |k| {
-                if (n == out.len) return out[0..n];
-                out[n] = k.*;
-                n += 1;
-            }
+            while (it.next()) |k| try out.append(gpa, k.*);
         }
-        return out[0..n];
     }
 };
 
@@ -1995,10 +1993,16 @@ test "drain: batches of ≤ 128 inos, ONE tx each; the advance only (times vs ct
     var gc: u64 = 0;
     var stale: u64 = 0;
     var batches: u64 = 0;
-    while (true) {
-        var buf: [PENDING_TIMES_DRAIN_BATCH]u64 = undefined;
-        const batch = pending.drainBatch(&buf);
-        if (batch.len == 0) break;
+    // The drain's shape: the tick's population snapshotted ONCE, drained
+    // a batch at a time.
+    var snapshot: std.ArrayList(u64) = .empty;
+    defer snapshot.deinit(gpa);
+    try pending.snapshotParked(gpa, &snapshot);
+    try testing.expectEqual(@as(usize, 303), snapshot.items.len);
+    var rest_all: []const u64 = snapshot.items;
+    while (rest_all.len != 0) {
+        const batch = rest_all[0..@min(rest_all.len, PENDING_TIMES_DRAIN_BATCH)];
+        rest_all = rest_all[batch.len..];
         batches += 1;
         try testing.expect(batch.len <= PENDING_TIMES_DRAIN_BATCH);
         var t = newTx();
@@ -2028,7 +2032,6 @@ test "drain: batches of ≤ 128 inos, ONE tx each; the advance only (times vs ct
         }
         for (batch) |i| _ = pending.retire(i);
         staged_total += records;
-        if (batch.len < PENDING_TIMES_DRAIN_BATCH) break;
     }
     try testing.expectEqual(@as(u64, 3), batches);
     try testing.expectEqual(@as(u64, 3), entries);

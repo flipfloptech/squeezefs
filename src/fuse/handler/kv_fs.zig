@@ -3434,11 +3434,16 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         /// holding another holder's ino is its door's).
         pub fn drainPendingTimes(self: *Self, c: *Ctx) Error!u64 {
             var total: u64 = 0;
-            var buf: [economy.PENDING_TIMES_DRAIN_BATCH]u64 = undefined;
-            while (true) {
-                const snapshot = self.pending.drainBatch(&buf);
-                if (snapshot.len == 0) return total;
-                var rest = snapshot;
+            // The tick's population, once: an ino re-parked while the tick
+            // drains is the next tick's (the cadence's bound), never this
+            // one's again.
+            var parked: std.ArrayList(u64) = .empty;
+            defer parked.deinit(self.gpa);
+            try self.pending.snapshotParked(self.gpa, &parked);
+            var rest_all: []u64 = parked.items;
+            while (rest_all.len != 0) {
+                var rest = rest_all[0..@min(rest_all.len, economy.PENDING_TIMES_DRAIN_BATCH)];
+                rest_all = rest_all[rest.len..];
                 while (rest.len != 0) {
                     // rest[0]'s home-mates to the front.
                     var n: usize = 1;
@@ -3453,8 +3458,8 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                     }
                     rest = rest[n..];
                 }
-                if (snapshot.len < buf.len) return total;
             }
+            return total;
         }
 
         /// THE HANDOVER'S STEP 0 (`sym_handover.TimesDrain`; charter §5.5):

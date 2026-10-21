@@ -148,7 +148,23 @@ process without our handler, so the verb compares `.stats`' `build.commit` with 
   once in the first full gate with a C9 "stated gap" finding on the two-daemon set (`invariant_tripwires`
   1) and passed on the re-run and in the second gate: not touched by this rung, noted for its owner.
 
-## 7. Owed
+## 7. The census' cost (2026-10-21, the train red on `5b4e210`)
+
+The lazy-umount row's `umount --lazy` took 6904 and 5933 ms on the train (its law: ≤ 5 s) after passing
+alone; by hand, under the full smoke's load, a 6031 ms verb was three `/proc` censuses — the daemon's on
+SIGUSR2 2577 ms, the verb's after the detach 2353 ms, the verb's second for its stdout line 983 ms —
+and 1055–1076 ms idle (331–343 ms a census, one process's fanotify fd at 8.6 MB of `fdinfo` alone
+160–300 ms). The fix: every fd through `statx(STATX_MNT_ID | STATX_INO, AT_STATX_DONT_SYNC)` on
+`/proc/<pid>/fd/<n>` (the open file's own path; no seq_file generation), the verb's verdict carrying
+the census it took (one walk, not two), the census at the poll that first sees the detach. Idle: the
+verb 178–204 ms, the daemon's census 76–80 ms (the remainder is `maps`, 11 MB over ~800 processes).
+The daemon's stop lines now say the census' cost. The same cost pushed the `-o ro` reader row's A+B
+leave past its 3 s T_owner (four censuses: B's verb and daemon, A's verb and daemon), where the live A
+evicted B's lost-leave row before leaving and the successor had no dead row to exclude; that row now
+reads the outcome from A's log and asserts the law of the branch that happened (its loop under load,
+the numbers: the runs below).
+
+## 8. Owed
 
 - The census does not walk a per-thread cwd/root (`unshare(CLONE_FS)`) nor another mount namespace;
   mappings of a bind of the same superblock elsewhere match by device (an over-count the operator's retry

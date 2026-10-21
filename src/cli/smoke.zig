@@ -1582,6 +1582,28 @@ fn numberAfter(text: []const u8, key: []const u8) ?u64 {
     return std.fmt.parseInt(u64, text[i + key.len .. j], 10) catch null;
 }
 
+/// Members a manager's log says it evicted at T_owner (the wire plane's
+/// tick line `cluster wire: tick — N evicted at T_owner, …`, logged only
+/// on a tick that did something), summed over `text`.
+fn evictedAtTOwner(text: []const u8) u64 {
+    const key = "cluster wire: tick — ";
+    var total: u64 = 0;
+    var rest = text;
+    while (std.mem.indexOf(u8, rest, key)) |i| {
+        rest = rest[i + key.len ..];
+        var j: usize = 0;
+        while (j < rest.len and std.ascii.isDigit(rest[j])) j += 1;
+        total += std.fmt.parseInt(u64, rest[0..j], 10) catch 0;
+    }
+    return total;
+}
+
+test "evictedAtTOwner sums the tick lines' eviction counts; a tick that only reaped counts nothing" {
+    try testing.expectEqual(@as(u64, 0), evictedAtTOwner("info: cluster wire: tick — 0 evicted at T_owner, 1 reaped at the grace deadline; ledger: 1 death record(s) standing\n"));
+    try testing.expectEqual(@as(u64, 3), evictedAtTOwner("cluster wire: tick — 1 evicted at T_owner, 0 reaped\nother line\ncluster wire: tick — 2 evicted at T_owner, 0 reaped\n"));
+    try testing.expectEqual(@as(u64, 0), evictedAtTOwner("nothing here"));
+}
+
 /// A SECOND daemon of the rig's set at its own mount point with its own
 /// log (the two-daemon matrix: A is the rig's child, B a `Peer`). With a
 /// `node` name the daemon runs in its own UTS namespace under that
@@ -5084,11 +5106,26 @@ test "smoke: THE `-o ro` READER OF A LIVE SET — C mounts `-o ro` beside A (the
         try testing.expectEqual(@as(?u64, 0), numberAfter(tc, "\"dlm_token_recall_timeouts_live\":"));
     }
     // The writers leave cleanly: C's lease lapses, no writer face stands,
-    // C becomes the quiescent reader of their last checkpoint.
+    // C becomes the quiescent reader of their last checkpoint. B's lost
+    // leave keeps its row at A — until B's T_owner deadline, where a LIVE
+    // A evicts it and deletes the row; whether A's own stop came first is
+    // real time (B's teardown, two `umount` censuses, A's teardown — under
+    // a gate's load they exceeded the row's 3 s T_owner), so the outcome
+    // is read from A's log, never assumed.
+    const leave_mark = try rig.logLen();
+    const leave_t0 = clock.monotonicNs();
     try b.umount();
     try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try b.waitExit());
+    const b_gone_ms = (clock.monotonicNs() - leave_t0) / std.time.ns_per_ms;
     try rig.umount();
     try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+    const a_gone_ms = (clock.monotonicNs() - leave_t0) / std.time.ns_per_ms;
+    const b_evicted = blk: {
+        const text = try rig.readLog();
+        defer gpa.free(text);
+        break :blk evictedAtTOwner(text[@min(leave_mark, text.len)..]) != 0;
+    };
+    std.debug.print("smoke: -o ro: B left at {d} ms, A at {d} ms (T_owner {d} ms); A {s} B's row before leaving\n", .{ b_gone_ms, a_gone_ms, smoke_t_owner_ms, if (b_evicted) "EVICTED" else "kept" });
     {
         // The reader's root is its holder's until the lease lapses: the
         // walk to `.stats` may answer EAGAIN in between (the tolerant read).
@@ -5134,12 +5171,16 @@ test "smoke: THE `-o ro` READER OF A LIVE SET — C mounts `-o ro` beside A (the
         try testing.expect(std.mem.indexOf(u8, text, "a writer appeared (ledger_advance) under the quiescent reader — every metadata op now answers ESTALE") != null);
         std.debug.print("smoke: -o ro: A mounted again — C fail-stopped (ESTALE on ls and cat; .stats readable)\n", .{});
     }
-    // B's row outlived its lost leave; A's successor proved its pid dead
-    // and opened no grace for it (the remount below is a fresh join).
+    // B's row outlived its lost leave: A's successor proved its pid dead
+    // and opened no grace for it (the remount below is a fresh join). When
+    // the first A evicted B at T_owner instead, its delete left the
+    // successor no row to exclude — a dead row counted then would be a
+    // row that survived its eviction.
     {
         const ta = try rig.onMount("cat .stats");
         defer gpa.free(ta);
-        try testing.expect((numberAfter(ta, "\"membership_grace_dead_rows\":") orelse 0) >= 1);
+        const dead_rows = numberAfter(ta, "\"membership_grace_dead_rows\":") orelse 0;
+        if (b_evicted) try testing.expectEqual(@as(u64, 0), dead_rows) else try testing.expect(dead_rows >= 1);
     }
     // Remount C: a token reader of the live set again.
     try c.umount();

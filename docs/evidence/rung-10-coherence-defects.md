@@ -172,7 +172,14 @@ deadline — the window the grace exists for; the mount's typed refusal names it
 - The smoke row now runs B with the lost-leave seam and asserts A's successor excluded B's dead
   row (`membership_grace_dead_rows ≥ 1`) before C's remount. Red without the exclusion (the counter
   bumped, the row still expected): C's remount refused `grace_refused` (smoke.zig:4803, C exited
-  code 1). Green with it.
+  code 1). Green with it. The row's premise — B's row still in tree 0 when A's successor mounts —
+  holds only while A stops within T_owner (3 s) of B's last renewal: a LIVE A evicts B at its
+  deadline and deletes the row (`Owner.evict`), and under a gate's load the leave (B's teardown,
+  four `umount` censuses, A's teardown) exceeded it (the train on `5b4e210`, 2 of 4 runs:
+  `membership_grace_dead_rows` 0). The row reads A's log for the eviction and asserts the law of the
+  branch that ran: no eviction → `≥ 1`; evicted → exactly 0 (a dead row counted then is a row that
+  survived its eviction). Forced by hand (a 4 s pause before A's umount): `A EVICTED B's row`, 0,
+  the rest of the row green (`rung-10-umount-busy.md` §7 has the census' cost).
 - `shard` "a successor's grace expects no same-host predecessor whose pid is proven dead …": a dead
   row is not expected, a live one, another host's and a torn one are; a roster of dead rows opens no
   grace and a reader's fresh join is granted, where the roster that expected the dead row refuses

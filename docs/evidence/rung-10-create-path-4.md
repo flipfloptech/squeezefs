@@ -1,98 +1,88 @@
 # Rung 10 — the create path, wave 4: the ack after the apply, the journal tail (2026-10-20)
 
-Continues `rung-10-create-path-3.md`. **The owner's ruling (2026-10-20):** SqueezeFS takes the
-Lustre/ext4 posture for metadata — an op is acked once applied in RAM and durable at the next commit;
-`fsync`/`fsyncdir`/`syncfs` durable on return — under two conditions: a DAEMON crash stays lossless,
-and group commit. Venue: this workstation (32 threads, `7.2.8-9.30-omarchy-sqz`), the RAM NVMe set
-(512-B grain), A = dev `561bb90` (the main tree's dist build), B = `perf/create-path-4`. Scratch
-`~/tmp/createpath2/` (legs `w2-{A,B}-w4r*`), `~/tmp/w4cp/`.
+Continues `rung-10-create-path-3.md`. **The owner's ruling (2026-10-20):** the Lustre/ext4 posture for
+metadata — acked once applied in RAM, durable at the next commit, `fsync`/`fsyncdir`/`syncfs` durable
+on return — under two conditions: a daemon crash stays lossless; group commit. Venue: this workstation
+(32 threads, `7.2.8-9.30-omarchy-sqz`), the RAM NVMe set (512-B grain); A = dev `561bb90` (mdtest) /
+`a43bda8` (data rows), B = `perf/create-path-4`. Scratch `~/tmp/createpath2/` (`w2-{A,B}-w4r*`),
+`~/tmp/w4cp/`.
 
-## The law (charter §1 item 10, §5.2 "The ack point", §5.3 fsync; decision 0003 §BB; the ledger spec §3.4)
+## The law (charter §1 item 10, §5.2 "The ack point", §5.3; decision 0003 §BB; the ledger spec §3.4)
 
-Under the coalesced cadence a member is acked once its window's RAM apply is published, its encoded
-image is in the volume's **journal tail** and the window is in the lane's hands; the landing and the
-barrier follow on the flush cadence (50 ms derived; `0` = strict keeps the ack after the barrier;
-`SQUEEZEFS_META_ACK_POINT=landing` is the A/B control arm). The crash matrix: a daemon crash is
-lossless (the supervisor replays the tail before it releases the writer claim); a power cut loses at
-most the flush window of un-fsync'd metadata — ext4's posture, its 5 s commit interval against our
-50 ms; a mount without a supervisor has no replay (said once at mount). A write that fails after an
-ack rolls nothing back: the volume latches FAILED at once (ext4's journal abort); an fsync parked under
-it answers `VolumeFailed`. The §AG.2 recall is the pass's A1½, before the reservation, so before the
-new ack point as before the old (INVALIDATION COHERENCE ×5 below).
+A member is acked once its window's RAM apply is published, its image is in the volume's **journal
+tail** and the window is in the lane's hands; the landing and the barrier follow on the flush cadence
+(50 ms derived; `0` = strict acks after the barrier; `SQUEEZEFS_META_ACK_POINT=landing` is the control
+arm). A daemon crash is lossless — the supervisor replays the tail before it releases the writer claim;
+a power cut loses at most the flush window of un-fsync'd metadata (ext4's posture, its 5 s against our
+50 ms); a mount without a supervisor has no replay (said once at mount). A write that fails after an
+ack rolls nothing back: FAILED at once (ext4's journal abort); an fsync parked under it answers
+`VolumeFailed`. The §AG.2 recall is the pass's A1½, before the reservation, so before the new ack
+point as before the old (INVALIDATION COHERENCE ×5 green).
 
-## The tail (`meta/journal_tail.zig`) and the replay
+## The tail (`meta/journal_tail.zig`) and the replay's proof
 
-Per writable volume a size-sealed memfd: a 4288-B header (device path, ring segments, grain), a slot
-table of 2× the lane's cells (48 B each: state, seq_base, two covering runs), a MIRROR of the ring at
-its own offsets. The applier copies the window's aligned ops into the mirror and publishes the slot
-(release) before the lane handoff; the lane's verdict frees it. The bytes the lane writes ARE the
-replay's: no second codec, idempotent by construction, a landed slot skipped. The daemon sends each
-tail's fd and the writer guard's fd over a `SOCK_SEQPACKET` socketpair the intermediate created before
-the second fork; the supervisor parks in `poll` on it (the daemon's death is a `POLLHUP`, seen at once
-rather than a 5 s probe later), and at the death writes every written slot to the device in seq order,
-`fsync`s, logs it, and only then closes the guard fds — the `flock`'s open file description is
-shared, so the dead claim holds until the device is complete, and a successor's `flock` waits it out
-inside `guard.proc`'s 5 s bound (the dead locker is not this binary's pid, so the retry runs).
+Per writable volume a size-sealed memfd: a header (device path, ring segments, grain), a slot table of
+2× the lane's cells (48 B: state, seq_base, two covering runs), a MIRROR of the ring at its own
+offsets. The applier copies the window's ops into the mirror and publishes the slot before the lane
+handoff; the lane's verdict frees it. The bytes the lane writes ARE the replay's: idempotent, a landed
+slot skipped. The daemon sends each tail's fd and the writer guard's fd over a `SOCK_SEQPACKET`
+socketpair the intermediate made before the second fork; the supervisor parks in `poll` on it (a death
+is a `POLLHUP`, seen at once) and at the death writes every written slot to the device in seq order,
+`fsync`s, then closes the guard fds — the `flock`'s open file description is shared, so the dead claim
+holds until the device is complete; a successor waits it out in `guard.proc`'s 5 s bound.
 
-**The replay's proof (smoke THE REPLAY PROOF):** a `--daemon --supervise` mount under the landing-hold
-seam (`SQUEEZEFS_TEST_JOURNAL_HOLD_LANDING`: every window admitted after ready stays un-issued), `mkdir
-d && touch d/x d/y && echo hello > d/z` acked, `kill -9` the daemon → the supervisor's line "journal
-tail of volume 0: 7 un-landed window(s), 28672 bytes replayed and barriered", then "writer guard
-released", then "done"; `fsck --offline --scrub` clean; the remount finds `d/x`, `d/y`, `d/z = hello`.
-The control arm — the same on a FOREGROUND mount — loses `e/w` ("lost"), fsck clean: the window.
-The coalesced `kill -9 mid-tar -x` row now runs supervised and is the replay's second proof (every
-entry tar was acked on present whole); the strict arm stays foreground. THE KILL MATRIX stands as
-written (fsync'd bytes exact; the unsynced whole or a hole).
+**THE REPLAY PROOF (smoke):** a `--daemon --supervise` mount under the landing-hold seam
+(`SQUEEZEFS_TEST_JOURNAL_HOLD_LANDING`), three creates acked, `kill -9` → "7 un-landed window(s),
+28672 bytes replayed and barriered", then "writer guard released", fsck clean, the remount finds all
+three. The foreground control arm loses its create ("lost"), fsck clean: the window. The coalesced
+`kill -9 mid-tar -x` row runs supervised now (the second proof); THE KILL MATRIX stands as written.
+Unit: the tail's codec, claim/replay in seq order with landed slots skipped and a second replay
+byte-identical, the wrap's two runs, a segmented ring's split, the memfd's seals and `replayFd`; the
+lane's §BB.4 (an fsync behind an un-landed window waits for its landing); the backend's ack at the
+apply (the commit returns under the hold, fsync parks, the landing frees the slot; the landing and
+strict arms keep the commit parked) and the acked write failure (the record stands, FAILED at once).
 
-Unit: the tail's codec round-trip and refusals; claim + replay in seq order, a released slot skipped,
-a second replay byte-identical, a filling slot never replayed, the wrap's two runs, a segmented ring's
-split at the extent boundary; the memfd's seals and `replayFd` against a file device. The lane's
-§BB.4 (an fsync behind an un-landed window waits for its landing; no flush tick while held). The
-backend's ack at the apply (the commit returns under the hold, fsync parks, the landing frees the slot;
-the landing arm and strict mode keep the commit parked) and the acked write failure (the record
-stands, FAILED at once, fsync `VolumeFailed`, the tail keeps the window). Three durable-at-ack rows
-of the guard gate pinned to the landing arm.
+## Group commit (§BB.6) — a measure, not built
 
-## Group commit (§BB.6) — not built; the measure
+Entries per lane write (`-np 32 -u`): fc 3.26 → 3.70, fr 3.32 → 4.07, dc 4.11 → 4.64, dr 1.99 → 2.22
+(A → B): the early ack lets committers re-enter sooner, so the pass drains wider. Byte-granular
+reservations need the shared-grain write serialization and the tail's per-entry rebuild — next wave.
 
-The pass's batch is the group. Entries per lane write (`meta_kv_journal_entries / lane_handoffs`,
-`-np 32 -u`): fc 3.26 → 3.70, fr 3.32 → 4.07, dc 4.11 → 4.64, dr 1.99 → 2.22 (A → B): the early ack
-lets committers re-enter sooner, so the pass drains wider. Byte-granular per-committer reservations
-need two laws this wave had no room for (two writes to one grain serialized on the lane; the tail's
-replay rebuilding a shared grain from entries).
+## A/B (`mdtest -n 10000`, the quietest legs; loads at the phases' ends ≤ 6 unless noted)
 
-## A/B (`mdtest -np 32 -n 10000 -u`, the quietest legs; load at each phase's end in brackets)
+`-np 32 -u`, four legs a side over four interleaved rounds, means: file creation A 104.9 k → B 97.8 k
+(0.93×; legs 98.5–112.3 against 80.4–105.7), removal 103.1 → 108.9 k (1.06×), directory creation
+62.5 → 62.2 k, removal 57.0 → 56.6 k. `-np 64 -u` (one pair, L6–14): creation 92.7 → **129.4 k**
+(1.40×), removal 77.6 → 106.4 k (1.37×), directories 53.4 → 61.7 k, 51.0 → 52.3 k. `-np 8 -u`
+(L7–11): 94.7 → 102.9 k, 83.5 → 97.7 k, 68.6 → 73.4 k, 49.8 → 62.5 k. Stat 10.08 → 10.34 M/s. Eight
+appliers at 32 ranks: 108.9 k, the queue wait 26 → 12 µs. The shared directory met loads of 10–26 on
+every leg (other tenants); B led all eight phases of two pairs without a quiet pair to stand on.
 
-| leg | file creation | file removal | dir creation | dir removal |
-|---|---|---|---|---|
-| A r1/1 (L1) | 112.3 k | 111.1 k | 64.2 k | 58.5 k |
-| B r1/3 (L1–2) | 105.7 k | 114.5 k | 69.6 k | 57.6 k |
-| A r2/4 (L5–6) | 110.1 k | 109.1 k | 63.7 k | 57.6 k |
-| B r2/3 (L6–8) | 104.8 k | 109.8 k | 56.6 k | 56.2 k |
-| B, 8 appliers (L1) | 108.9 k | — | — | — |
+**Neutral at 32 ranks on this substrate, +37–40 % at 64.** The 32-rank create went 250 → 263 µs: the
+queue wait 21 → 26 µs, `leaf_lock_hold` 68 → 95 µs per window (3.3 → 3.8 txs), the §AW pacing holds
+33 k → 50 k. 100 % of windows ack at the apply (`tail_slot_misses` 0). What left the critical path —
+the lane's round trip, `device` 12.6 µs, `meta_window_total` 54 µs — is small on RAM; what came back —
+committers one round trip sooner — lands on the appliers' serialization over the hot inode leaf (§BA).
+At 64 ranks that concurrency was what the loop lacked. On an NVMe (a 30–100 µs write plus a barrier)
+the round trip the law removes is the create's largest term.
 
-Other agents' builds and benchmarks shared the host through the rounds (loads 5–20 on half the legs;
-those are in the logs, not the table). **The ack point is throughput-neutral on this substrate**: the
-create's mean 250 → 263 µs, inside the commit the queue wait 21 → 26 µs and `leaf_lock_hold` 68 → 95
-µs per window (3.3 → 3.8 txs). 100 % of windows ack at the apply (`meta_conveyor_acks_at_apply`;
-`_at_landing` 10 per phase: the mount's own; `tail_slot_misses` 0). What the lever removed from the
-critical path — the lane's round trip, `device` 12.6 µs, `meta_window_total` 54 µs — is small on a
-RAM namespace, and what it added — committers back in the queue one round trip sooner — lands on the
-appliers' serialization over the hot inode leaf (§BA: the appliers' waits for each other's leaves are
-most of the hold; the §AW pacing holds rose 33 k → 50 k per phase). The gain the law buys is the
-device's: on an NVMe whose write is 30–100 µs plus a barrier, one round trip leaves every create.
-Eight appliers (`SQUEEZEFS_META_APPLIERS=8`): the queue wait 26 → 12 µs, the create 244 µs, the rate
-inside A's spread — the venue widened, the leaf the same.
+**Data rows unchanged** (A `a43bda8`, both at busy < 0.5 cores): rr4k-q32j4 1.739 → 1.748 M IOPS,
+rw4k-q32j4 1.140 → 1.145 M, sw1m-q16j4 52.1 → 52.6 k. fsck clean after every session.
 
-The reference bars: ext4 711 k / 573 k (file creation / removal), 246 k / 456 k (directories); xfs
-471 k / 183 k, 369 k / 158 k.
+Bars: ext4 711 k / 573 k (file creation / removal), 246 k / 456 k (directories); xfs 471 k / 183 k.
+
+## Tests
+
+Unit `fmt test rails`: 2896/2986 passed, 90 skipped, rails 29/29; after the rebase onto `a43bda8` the
+families 181/186. Smoke battery (coherence, shared hot directory, dead manager, the kill rows, the
+kill matrix, kill -9 mid-tar ×2, the replay proof, the supervise rows, busy/lazy umounts, `sync -f`,
+the durability-points row, the block-map tree) 58/58; INVALIDATION COHERENCE ×5.
 
 ## Risks and what was not verified
 
-- The symmetric death ladder does not WAIT for a dead peer's replay; it is ordered by time alone
-  (`T_owner` 45 s against a replay of milliseconds on RAM, under a second on NVMe) and by the PR
-  registration being the host's (it outlives the daemon until the ladder preempts it). A supervisor
-  that itself died with its daemon leaves no replay (documented; the power-cut window applies).
-- Group commit (§BB.6) is a measure, not a mechanism, this wave.
-- The NVMe-substrate A/B (where the lever's gain lives) was not run; the data rows and the `-np 8/64`
-  and shared-directory shapes under a quiet host are owed if the host's other tenants permit.
+- The symmetric death ladder does not WAIT for a dead peer's replay: the order is time's (`T_owner`
+  45 s against a replay of milliseconds on RAM, under a second on NVMe) and the PR registration's
+  (the host's; it outlives the daemon until the ladder preempts it). A supervisor dead with its daemon
+  leaves no replay (the window applies — documented).
+- Not run: the NVMe-substrate A/B (the lever's gain), a quiet shared-directory pair, dm-log-writes
+  rows for the power cut (the foreground arm of THE REPLAY PROOF is the window's witness).

@@ -232,6 +232,12 @@ pub const stats = struct {
     pub var promotions_run: counters.ShardedCounter = .{};
     pub var promotions_stale: counters.ShardedCounter = .{};
     pub var promotions_failed: counters.ShardedCounter = .{};
+    /// The write cache's recall (charter §6.1 "coherence"): a foreign
+    /// reader's grant ask promoted this mount's residents of the ino
+    /// (`recall_promotions`), or found them unpromotable — the reader then
+    /// reads zeros, counted on its side (`recall_promotion_failures`).
+    pub var recall_promotions: counters.ShardedCounter = .{};
+    pub var recall_promotion_failures: counters.ShardedCounter = .{};
     /// Own-block images landed for a layout promotion (staged/inline → striped).
     pub var own_block_dmas: counters.ShardedCounter = .{};
     pub var own_block_dma_bytes: counters.ShardedCounter = .{};
@@ -307,7 +313,7 @@ pub fn writeStatsJson(w: *Io.Writer) Io.Writer.Error!void {
     inline for (.{ "data_volumes", "data_staging_on", "block_refs_drift_rows" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, @field(stats, name).load() });
     }
-    inline for (.{ "layout_map_merges", "layout_map_merge_blocks", "layout_map_merge_failures", "layout_map_merge_clipped_blocks", "layout_map_merges_shipped", "foreign_publish_kvmap_refusals", "layout_publishes_served", "kvmap_sweep_spawn_refusals", "promotions_run", "promotions_stale", "promotions_failed", "own_block_dmas", "own_block_dma_bytes", "promotion_barriers", "staged_point_hits", "staged_point_misses", "promotion_barriers_coalesced", "promotion_barrier_write_through_skips", "held_stores", "held_store_bytes", "held_store_failures", "hold_gate_admits", "hold_gate_overlay_admits", "hold_gate_declines", "prefetch_fibers", "prefetch_fiber_refusals", "hold_ceremony_fibers", "bindings_freed", "device_read_bounces", "data_device_read_bytes", "write_side_read_dma_bytes", "compose_read_dma_bytes", "pack_read_dma_bytes" }) |name| {
+    inline for (.{ "layout_map_merges", "layout_map_merge_blocks", "layout_map_merge_failures", "layout_map_merge_clipped_blocks", "layout_map_merges_shipped", "foreign_publish_kvmap_refusals", "layout_publishes_served", "kvmap_sweep_spawn_refusals", "promotions_run", "promotions_stale", "promotions_failed", "recall_promotions", "recall_promotion_failures", "own_block_dmas", "own_block_dma_bytes", "promotion_barriers", "staged_point_hits", "staged_point_misses", "promotion_barriers_coalesced", "promotion_barrier_write_through_skips", "held_stores", "held_store_bytes", "held_store_failures", "hold_gate_admits", "hold_gate_overlay_admits", "hold_gate_declines", "prefetch_fibers", "prefetch_fiber_refusals", "hold_ceremony_fibers", "bindings_freed", "device_read_bounces", "data_device_read_bytes", "write_side_read_dma_bytes", "compose_read_dma_bytes", "pack_read_dma_bytes" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, @field(stats, name).load() });
     }
     try w.print("\"data_unresolved_volume\":{d},\"kvmap_resolve_failures\":{d},\"kvmap_head_put_unlocked\":{d},\"release_free_unheld\":{d},\"layout_map_merge_displaced_overflow\":{d}}}", .{ counters.tripwireCount("data_unresolved_volume"), counters.tripwireCount("kvmap_resolve_failures"), counters.tripwireCount("kvmap_head_put_unlocked"), counters.tripwireCount("release_free_unheld"), counters.tripwireCount("layout_map_merge_displaced_overflow") });
@@ -1790,6 +1796,25 @@ pub const DataPlane = struct {
         const st = &(self.stage orelse return null);
         const s = (try staging.overwriteStaged(&st.pool, &st.seg, io, key_, at, data, 1)) orelse return null;
         return s.generation;
+    }
+
+    /// The write cache's RECALL (charter §6.1 "coherence", 2026-10-21): a
+    /// foreign reader asks the token holder for `ino`; before the grant is
+    /// served, this mount's resident of the ino — if any — is PROMOTED to
+    /// the data volumes (the ONE primitive, under its locks), so the page
+    /// the reader gets names a durable copy and no foreign read ever meets
+    /// size-consistent zeros for bytes that exist. An ino with no resident
+    /// costs one staged-point lookup.
+    pub fn recallResidents(self: *DataPlane, ino: u64) void {
+        if (self.stage == null) return;
+        const sp = (self.stagedPoint(ino) catch return) orelse return;
+        if (self.promoteStaged(staging.StagingKey.init(sp.file_id, ino))) {
+            stats.recall_promotions.inc();
+        } else if (self.stagedLease(staging.StagingKey.init(sp.file_id, ino))) |l| {
+            l.release();
+            stats.recall_promotion_failures.inc();
+            log.warn("write cache recall: ino {d}'s resident could not be promoted for a foreign reader (see the promotion's own line) — the reader meets zeros", .{ino});
+        }
     }
 
     /// The ring entry leaves (a promotion landed, a re-stage superseded it,

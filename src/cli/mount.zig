@@ -566,6 +566,9 @@ fn mountMain(ctx: *Ctx) u8 {
     if (wire) |wp| {
         vs.renderer.sources.mount.wire_endpoint = wp.endpointText();
         vs.renderer.sources.wire = wp;
+        // The write cache's recall: a foreign reader's grant promotes this
+        // mount's residents of the object first (charter §6.1 coherence).
+        wp.holder.prepare = .{ .ctx = plane, .run = &recallResidentsForGrant };
         // The read divert: a foreign slot's records come under a token or
         // answer the typed EAGAIN, never off this mount's cache; a token
         // whose records served the kernel stays this mount's at its holder
@@ -1071,6 +1074,12 @@ fn announceWriteCacheDrained() void {
     if (sock < 0) return;
     const frame = (cli.supervisor.TailFrame{ .kind = .write_cache_drained, .index = 0 }).encode();
     ipc_rl.sendCtl(sock, &frame, null) catch {};
+}
+
+/// `tokens.table.PrepareSeam` over the plane: the object is the ino.
+fn recallResidentsForGrant(ctx: *anyopaque, _: Io, object: u64) void {
+    const plane: *plane_mod.DataPlane = @ptrCast(@alignCast(ctx));
+    plane.recallResidents(object);
 }
 
 fn stripeFloor(be: *meta_set.MetaSet) sym_xv.stripe.Floor {

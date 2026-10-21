@@ -48,6 +48,12 @@ const ns_per_s: u64 = std.time.ns_per_s;
 pub const Object = u64;
 pub const ClientId = u64;
 
+/// `Holder.prepare`: what runs before a grant of `object` is served.
+pub const PrepareSeam = struct {
+    ctx: *anyopaque,
+    run: *const fn (ctx: *anyopaque, io: Io, object: Object) void,
+};
+
 // ---------------------------------------------------------------------------
 // Constants — value and WHY.
 // ---------------------------------------------------------------------------
@@ -539,6 +545,12 @@ pub const Holder = struct {
     hold_wake: sync.Notify = .init,
     /// Published while a hold is standing (the test's deterministic window).
     holding: std.atomic.Value(u32) = .init(0),
+    /// The write cache's RECALL (charter §6.1 "coherence", 2026-10-21):
+    /// run before a foreign reader's grant of an object is served — the
+    /// holder promotes its staged residents of that ino to the data volumes
+    /// so the page names a durable copy; a foreign reader never reads zeros
+    /// for staged bytes that exist (`plane.recallResidents`).
+    prepare: ?PrepareSeam = null,
     /// How long a recalled grant stays registered (`setKernelPin`: the
     /// mount's longest peered kernel TTL, decision 0003 §AG.2); 0 = a
     /// recall's ack unregisters at once (a holder whose readers cache
@@ -974,6 +986,10 @@ pub const Holder = struct {
     pub fn serveGrant(self: *Holder, io: Io, ask: GrantAsk, source: RecordSource, scratch: []u8) Error!GrantReply {
         const now = clock.monotonicNs();
         if (self.refuseExpired(ask.client)) return .not_member;
+        // The write cache's recall BEFORE the registration: the promotion's
+        // own publish runs a pass over the object, which this grant then
+        // reads post-commit (the gate's law below).
+        if (self.prepare) |p| p.run(p.ctx, io, ask.object);
         const park_deadline = now + self.recallDeadlineNs();
         var attempt: u32 = 0;
         while (true) : (attempt += 1) {

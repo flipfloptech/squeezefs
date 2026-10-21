@@ -3274,6 +3274,77 @@ test "smoke: MutualTls on this kernel — `key tls-init`/`tls-issue` ×3 through
 /// Plaintext matrix's shape, byte for byte).
 const mtls_dd_mib: u64 = 200;
 
+test "smoke: THE WRITE CACHE'S RECALL (charter §6.1 coherence, 2026-10-21) — mount A (the manager) and B (joined over TCP): B writes a 64 KiB file (staged in B's write cache, never fsync'd) and A reads it at once: A's grant ask RECALLS B's residents of the ino — B promotes them before the page is served — and A reads the bytes (sha equal), never zeros (`staged_payload_lost_reads` 0 on A; B's `recall_promotions` 1); the reverse direction likewise; a second read of the same file asks no promotion (the record left the ring); A's own staged files stay staged when nobody foreign reads them (red before: A read 64 KiB of zeros, `staged_payload_lost_reads` 1)" {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    try rig.env.put("SQUEEZEFS_MW_BIND", "127.0.0.1:0");
+    var t_owner_text: [8]u8 = undefined;
+    try rig.env.put("SQUEEZEFS_TEST_MEMBERSHIP_T_OWNER_MS", try std.fmt.bufPrint(&t_owner_text, "{d}", .{smoke_t_owner_ms}));
+    try rig.formatSet(true);
+    try rig.createImage();
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(0);
+    const b = try Peer.init(rig, "b");
+    defer b.deinit();
+    try b.spawn(&.{});
+    _ = try b.awaitReady();
+    // B's file: 64 KiB past the inline ceiling, under the block — staged
+    // in B's write cache, no fsync, no promotion of its own.
+    {
+        const out = try b.onMount("mkdir -p b && dd if=\"$1/image\" of=b/staged bs=64k count=1 status=none && sha256sum b/staged | cut -c1-64");
+        defer gpa.free(out);
+        const sb = try b.stats();
+        defer gpa.free(sb);
+        try testing.expect((numberAfter(sb, "\"fuse_write_staged\":") orelse 0) >= 1);
+        try testing.expectEqual(@as(?u64, 0), numberAfter(sb, "\"recall_promotions\":"));
+        // A reads it at once: the bytes, never zeros.
+        const seen = try rig.onMount("sha256sum b/staged | cut -c1-64");
+        defer gpa.free(seen);
+        try testing.expectEqualStrings(out, seen);
+        const sa = try rig.stats();
+        defer gpa.free(sa);
+        try testing.expectEqual(@as(?u64, 0), numberAfter(sa, "\"staged_payload_lost_reads\":"));
+        const sb2 = try b.stats();
+        defer gpa.free(sb2);
+        try testing.expectEqual(@as(?u64, 1), numberAfter(sb2, "\"recall_promotions\":"));
+        try testing.expectEqual(@as(?u64, 0), numberAfter(sb2, "\"recall_promotion_failures\":"));
+        // A second read: the record left B's ring; nothing more to promote.
+        const again = try rig.onMount("sha256sum b/staged | cut -c1-64");
+        defer gpa.free(again);
+        try testing.expectEqualStrings(out, again);
+        const sb3 = try b.stats();
+        defer gpa.free(sb3);
+        try testing.expectEqual(@as(?u64, 1), numberAfter(sb3, "\"recall_promotions\":"));
+        std.debug.print("\nsmoke[recall]: B's staged 64 KiB read by A at once: sha {s}; A lost reads 0, B recall promotions {d}\n", .{ out[0..16], numberAfter(sb3, "\"recall_promotions\":") orelse 0 });
+    }
+    // The reverse: A stages, B reads; A's other staged file stays staged.
+    {
+        const out = try rig.onMount("mkdir -p a && dd if=\"$1/image\" of=a/staged bs=64k count=1 skip=1 status=none && dd if=\"$1/image\" of=a/kept bs=64k count=1 skip=2 status=none && sha256sum a/staged | cut -c1-64");
+        defer gpa.free(out);
+        const seen = try b.onMount("sha256sum a/staged | cut -c1-64");
+        defer gpa.free(seen);
+        try testing.expectEqualStrings(out, seen);
+        const sb = try b.stats();
+        defer gpa.free(sb);
+        try testing.expectEqual(@as(?u64, 0), numberAfter(sb, "\"staged_payload_lost_reads\":"));
+        const sa = try rig.stats();
+        defer gpa.free(sa);
+        try testing.expectEqual(@as(?u64, 1), numberAfter(sa, "\"recall_promotions\":"));
+        // `kept` nobody foreign read: still a resident of A's ring (its
+        // 64 KiB charged), and the recall was the only promotion run.
+        try testing.expect((numberAfter(sa, "\"current_staged_write_bytes\":") orelse 0) >= 64 * 1024);
+        try testing.expectEqual(@as(?u64, 1), numberAfter(sa, "\"promotions_run\":"));
+        std.debug.print("smoke[recall]: A's staged 64 KiB read by B at once: sha {s}; B lost reads 0, A recall promotions 1, A's unread file still staged\n", .{out[0..16]});
+    }
+    try b.umount();
+    try b.expectCleanExit("B's unmount");
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+}
+
 test "smoke: THE TWO-DAEMON MATRIX over MutualTls on KERNEL TLS — `key tls-init` + `tls-issue` ×2 → mount A (SQUEEZEFS_WIRE_CHANNEL=mutual_tls, node-a) → mount B (node-b) JOINED over TLS (.stats: channel 1, handshakes, 0 refusals) → A reads B's file under a token, B's write recalls it → B's mkdir under A's root (a cross-owner intent) → a 200 MiB dd on B, the sha from A equal (the Plaintext row's result) → 0 MAC failures and 0 refusals on both → a THIRD daemon under a FOREIGN CA is refused (its mount fails naming the CA, A counts tls_refused_untrusted) → a PLAINTEXT daemon is refused by name at the handshake bound (A counts plaintext_refused) → umount B, A; on a kernel without the tls ULP the row is the ledger's other_step skip" {
     const io = testing.io;
     if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);

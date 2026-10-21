@@ -2631,9 +2631,11 @@ pub const Group = struct {
                 // AFTER the bytes landed; a failed recheck WITHDRAWS the
                 // prefilled reply — the ordinary ladder re-serves the whole
                 // body (its bounce overwrites whatever landed), never
-                // unvalidated device bytes in the app's pages. The landed
-                // window is the hook's to deposit (the read cache).
-                const validated = if (pend.hook) |h| h.run(ok, if (ok) self.window(gent)[0..pend.len] else &.{}) else true;
+                // unvalidated device bytes in the app's pages. The leg landed
+                // in the APP'S pages (the dest slot), which this process
+                // never sees — the hook gets no window to deposit (the read
+                // cache fills from the lane; `SQUEEZEFS_READ_CACHE_FILL`).
+                const validated = if (pend.hook) |h| h.run(ok, &.{}) else true;
                 if (ok and validated) {
                     zc_direct_legs.inc();
                     zc_serve_bytes.add(pend.len);

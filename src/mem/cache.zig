@@ -189,6 +189,21 @@ pub const Stats = struct {
 
 const NIL: u32 = std.math.maxInt(u32);
 
+/// A census cursor over a sharded instance: the shard in the high half,
+/// the item slot in the low half (a shard's item table is u32-indexed).
+pub const Cursor = packed struct(u64) {
+    slot: u32,
+    shard: u32,
+
+    pub fn pack(self: Cursor) u64 {
+        return @bitCast(self);
+    }
+
+    pub fn unpack(v: u64) Cursor {
+        return @bitCast(v);
+    }
+};
+
 pub fn Cache(comptime Entry: type, comptime Sink: type) type {
     comptime {
         if (!@hasDecl(Entry, "Key")) @compileError(@typeName(Entry) ++ " needs a `Key` type with hash() and eql()");
@@ -642,30 +657,26 @@ pub fn Cache(comptime Entry: type, comptime Sink: type) type {
             return p;
         }
 
-        /// The census face: the next entry at or after `cursor` (the shard
-        /// in the cursor's high half, the item slot in its low half) that
-        /// `pick` selects, as a COPY, the cursor moved past it; null at the
-        /// end. One shard lock at a time, nothing allocated.
+        /// The census face: the next entry at or after `cursor` (a
+        /// `Cursor`: the shard above, the item slot below) that `pick`
+        /// selects, as a COPY, the cursor moved past it; null at the end.
+        /// One shard lock at a time, nothing allocated.
         pub fn censusNext(self: *Self, cursor: *u64, ctx: anytype, comptime pick: fn (@TypeOf(ctx), *const Entry) bool) ?Entry {
             if (!self.enabled()) return null;
-            var si: usize = @intCast(cursor.* >> 32);
-            var slot: usize = @intCast(cursor.* & std.math.maxInt(u32));
-            while (si < self.shards.len) : ({
-                si += 1;
-                slot = 0;
-            }) {
-                const s = &self.shards[si];
+            var c = Cursor.unpack(cursor.*);
+            while (c.shard < self.shards.len) : (c = .{ .shard = c.shard + 1, .slot = 0 }) {
+                const s = &self.shards[c.shard];
                 s.lock.lock();
                 defer s.lock.unlock();
-                while (slot < s.items.len) : (slot += 1) {
-                    const it = &s.items[slot];
+                while (c.slot < s.items.len) : (c.slot += 1) {
+                    const it = &s.items[c.slot];
                     if (it.state != .free and pick(ctx, &it.entry)) {
-                        cursor.* = (@as(u64, si) << 32) | (slot + 1);
+                        cursor.* = (Cursor{ .shard = c.shard, .slot = c.slot + 1 }).pack();
                         return it.entry;
                     }
                 }
             }
-            cursor.* = @as(u64, si) << 32;
+            cursor.* = (Cursor{ .shard = c.shard, .slot = 0 }).pack();
             return null;
         }
 

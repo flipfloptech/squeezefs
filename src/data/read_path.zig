@@ -509,6 +509,9 @@ pub const Flags = struct {
     lane_pre_fed: bool = false,
 };
 
+/// `SQUEEZEFS_READ_CACHE_FILL`'s arms.
+pub const ReadCacheFill = enum { lane, leg };
+
 pub const Config = struct {
     block_size: u64,
     /// `transform.isPassthrough`: no decode, ranged windows legal.
@@ -538,6 +541,10 @@ pub const Config = struct {
     /// 0 = the tier off). The fixture's default is off: its rows pin the
     /// whole-block ladder and arm the grain cache by name.
     read_cache_bytes: u64 = 0,
+    /// `SQUEEZEFS_READ_CACHE_FILL`: a cold grain-eligible read on a zero-copy
+    /// FUSE session takes the lane (and deposits) or the direct leg (and
+    /// fills nothing).
+    read_cache_fill: ReadCacheFill = .lane,
     admission_policy: admission.Policy,
     fill_pct: u64,
     prefetch: prefetch.Config,
@@ -561,6 +568,7 @@ pub const Config = struct {
             .read_mem_limit = read_mem,
             .mem_budget = mem_budget,
             .read_cache_bytes = read_cache.resolveReadCacheBytes(knobs.intKnob("SQUEEZEFS_READ_CACHE_PCT", u64, env), facts, mem_budget),
+            .read_cache_fill = if (std.mem.eql(u8, knobs.enumKnob("SQUEEZEFS_READ_CACHE_FILL", env), "leg")) .leg else .lane,
             .admission_policy = admission.Policy.fromEnv(env, hot),
             .fill_pct = knobs.intKnob("SQUEEZEFS_READ_ADMISSION_FILL_PCT", u64, env),
             .prefetch = prefetch.Config.fromEnv(env, hot, block_size, mem_budget),

@@ -78,8 +78,11 @@ pub const stats = struct {
     /// READs the read cache's grains served inline (`read_cache.zig`).
     pub var fast_dispatch_serve_grains: counters.ShardedCounter = .{};
     /// Direct legs whose landed window the recheck accepted and the read
-    /// cache deposited (the cold read's one copy, at the CQE).
+    /// cache deposited (the IPC direct-drive's arena at its CQE).
     pub var direct_leg_deposits: counters.ShardedCounter = .{};
+    /// Direct legs declined so the lane's ranged read fills the read cache
+    /// (`SQUEEZEFS_READ_CACHE_FILL=lane`).
+    pub var direct_leg_cache_demotes: counters.ShardedCounter = .{};
     /// Direct legs the predicate admitted (the transport bridges them).
     pub var direct_leg_offers: counters.ShardedCounter = .{};
     /// Direct legs whose post-DMA recheck failed (the reply withdrawn).
@@ -108,7 +111,7 @@ pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
         stats.fast_dispatch_serve_cache.load(),
         stats.direct_leg_offers.load(),
     });
-    try w.print(",\"direct_leg_recheck_failures\":{d},\"direct_leg_custody_declines\":{d},\"fast_dispatch_fd_source_serves\":{d},\"fast_dispatch_hold_ceremonies\":{d},\"fast_dispatch_serve_grains\":{d},\"direct_leg_deposits\":{d}}}", .{ stats.direct_leg_recheck_failures.load(), stats.direct_leg_custody_declines.load(), stats.fast_dispatch_fd_source_serves.load(), stats.fast_dispatch_hold_ceremonies.load(), stats.fast_dispatch_serve_grains.load(), stats.direct_leg_deposits.load() });
+    try w.print(",\"direct_leg_recheck_failures\":{d},\"direct_leg_custody_declines\":{d},\"fast_dispatch_fd_source_serves\":{d},\"fast_dispatch_hold_ceremonies\":{d},\"fast_dispatch_serve_grains\":{d},\"direct_leg_deposits\":{d},\"direct_leg_cache_demotes\":{d}}}", .{ stats.direct_leg_recheck_failures.load(), stats.direct_leg_custody_declines.load(), stats.fast_dispatch_fd_source_serves.load(), stats.fast_dispatch_hold_ceremonies.load(), stats.fast_dispatch_serve_grains.load(), stats.direct_leg_deposits.load(), stats.direct_leg_cache_demotes.load() });
 }
 
 /// Why the ladder declined (the handler owns the request from here).
@@ -383,6 +386,16 @@ pub const WarmLadder = struct {
     /// face: offered only on a zero-copy session.
     pub fn directLeg(self: *WarmLadder, ino: u64, offset: u64, size: u32, odirect: bool) ?fsv.DirectLeg {
         if (!self.direct_leg_armed) return null;
+        // The leg lands in the app's pages this process never sees: with
+        // the read cache on and the window grain-eligible, the lane's
+        // ranged read (a bounce, one copy, the deposit) fills the cache
+        // instead (`SQUEEZEFS_READ_CACHE_FILL=lane`; `leg` is the control
+        // arm). Device-true reads keep the leg: they are never deposited.
+        const rp = self.rp;
+        if (rp.grains.enabled() and rp.cfg.read_cache_fill == .lane and size <= read_cache.WINDOW_MAX and !(rp.cfg.direct_device_true and odirect)) {
+            stats.direct_leg_cache_demotes.inc();
+            return null;
+        }
         return self.resolveDirectLeg(ino, offset, size, odirect);
     }
 
@@ -646,7 +659,7 @@ test "a cold direct-leg read resolves its file ONCE and its binding TWICE — th
     try testing.expectEqual(binds1 + 1, f.binding_calls.load(.monotonic));
 }
 
-test "the read cache on the queue thread: a cold probe demotes and the direct leg's CQE hook DEPOSITS the landed window (then rechecks), so the next probe of the same window serves it inline as the `grains` arm with no device read; an unaligned sub-grain request hits the same grain; a failed recheck purges what the hook deposited; the IPC ring arm's probe is the same call" {
+test "the read cache on the queue thread: a cold probe demotes; on a zero-copy FUSE session the direct leg is declined so the lane fills (the control arm offers it); the IPC direct-drive's leg DEPOSITS its landed arena window at the CQE hook (then rechecks), so the next probe of the same window serves it inline as the `grains` arm with no device read; an unaligned sub-grain request hits the same grain; a failed recheck purges what the hook deposited" {
     const F = read_path.TestFixture;
     const g = read_cache.GRAIN;
     const f = try F.init(testing.allocator, .{ .read_cache_bytes = 64 * g, .policy = .always });
@@ -661,11 +674,21 @@ test "the read cache on the queue thread: a cold probe demotes and the direct le
     const window = try testing.allocator.alignedAlloc(u8, .fromByteUnits(4096), 1 << 20);
     defer testing.allocator.free(window);
     const key2 = BlockKey.init(F.vol_tag, 2 * F.bs);
-    // Cold: the probe declines, the leg is offered; the transport's DMA
-    // lands the device's bytes in the window (simulated here), the hook
-    // deposits and validates.
+    // On a zero-copy FUSE session the leg lands in the app's pages: with
+    // the cache on, the ladder declines it so the lane fills (the shipped
+    // arm); the control arm offers it.
     try testing.expectEqual(Verdict{ .demote = .miss }, ladder.probe(7, 8192, 4096, false, window));
-    const leg = ladder.directLeg(7, 8192, 4096, false) orelse return error.TestExpectedEqual;
+    const demotes0 = stats.direct_leg_cache_demotes.load();
+    try testing.expectEqual(@as(?fsv.DirectLeg, null), ladder.directLeg(7, 8192, 4096, false));
+    try testing.expectEqual(demotes0 + 1, stats.direct_leg_cache_demotes.load());
+    f.rp.cfg.read_cache_fill = .leg;
+    try testing.expectEqual(Verdict{ .demote = .miss }, ladder.probe(7, 8192, 4096, false, window));
+    try testing.expect(ladder.directLeg(7, 8192, 4096, false) != null);
+    // The IPC direct-drive's leg (`resolveDirectLeg`): the DMA lands in the
+    // session arena this process owns (simulated here), the hook deposits
+    // the landed window and validates.
+    try testing.expectEqual(Verdict{ .demote = .miss }, ladder.probe(7, 8192, 4096, false, window));
+    const leg = ladder.resolveDirectLeg(7, 8192, 4096, false) orelse return error.TestExpectedEqual;
     @memcpy(window[0..4096], f.device[@intCast(2 * F.bs + 8192)..][0..4096]);
     const deposits0 = stats.direct_leg_deposits.load();
     try testing.expect(leg.hook.?.run(true, window[0..4096]));
@@ -689,14 +712,14 @@ test "the read cache on the queue thread: a cold probe demotes and the direct le
     // under the DMA — the hook deposits, the recheck fails and the grain is
     // purged with the reply withdrawn.
     try testing.expectEqual(Verdict{ .demote = .miss }, ladder.probe(7, 8192 + g, 4096, false, window));
-    const leg2 = ladder.directLeg(7, 8192 + g, 4096, false) orelse return error.TestExpectedEqual;
+    const leg2 = ladder.resolveDirectLeg(7, 8192 + g, 4096, false) orelse return error.TestExpectedEqual;
     f.bind(0, 5);
     try testing.expect(!leg2.hook.?.run(true, window[0..4096]));
     try testing.expect(!f.rp.grains.contains(key2, 8192 + g, 8192 + 2 * g));
     // A leg that landed nothing deposits nothing.
     f.bind(0, 2);
     try testing.expectEqual(Verdict{ .demote = .miss }, ladder.probe(7, 3 * g, 4096, false, window));
-    const leg3 = ladder.directLeg(7, 3 * g, 4096, false) orelse return error.TestExpectedEqual;
+    const leg3 = ladder.resolveDirectLeg(7, 3 * g, 4096, false) orelse return error.TestExpectedEqual;
     try testing.expect(!leg3.hook.?.run(false, &.{}));
     try testing.expect(!f.rp.grains.contains(key2, 3 * g, 4 * g));
 }

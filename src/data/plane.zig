@@ -1768,6 +1768,22 @@ pub const DataPlane = struct {
     /// construction.
     pub const StagedPoint = struct { size: u64, file_id: layout.FileId };
 
+    /// The cached point alone (no lookup on a miss): the write's first
+    /// question, asked of every write — a striped write pays two atomic
+    /// loads, never a record read (the fill through `resolveAt` on every
+    /// write cost the striped rows 6–13 % and thrashed the read view).
+    pub fn stagedPointCached(self: *DataPlane, ino: u64) ?StagedPoint {
+        if (self.stage == null) return null;
+        const hit = self.staged_points.lookup(ino, ino_witness.genOf(ino), self.view.movesNow()) orelse {
+            stats.staged_point_misses.inc();
+            return null;
+        };
+        stats.staged_point_hits.inc();
+        return .{ .size = self.claimedSize(ino, hit.size), .file_id = hit.file_id };
+    }
+
+    /// The point through the read view and the store, cached on the way
+    /// out (the staged arm's slow path warms it for the next write).
     pub fn stagedPoint(self: *DataPlane, ino: u64) Error!?StagedPoint {
         if (self.stage == null) return null;
         // The witness and the move epoch BEFORE the lookups (the read
@@ -1775,11 +1791,6 @@ pub const DataPlane = struct {
         // what the entry carries.
         const gen = ino_witness.genOf(ino);
         const moves = self.view.movesNow();
-        if (self.staged_points.lookup(ino, gen, moves)) |hit| {
-            stats.staged_point_hits.inc();
-            return .{ .size = self.claimedSize(ino, hit.size), .file_id = hit.file_id };
-        }
-        stats.staged_point_misses.inc();
         const r = (try self.resolveAt(ino, null)) orelse return null;
         const p = r.point orelse return null;
         if (p.kind != .staged) return null;

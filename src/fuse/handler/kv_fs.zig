@@ -353,7 +353,7 @@ pub fn assertStore(comptime T: type) void {
 /// the product; `NoData` is the volume-less set).
 pub fn assertData(comptime T: type) void {
     comptime {
-        for ([_][]const u8{ "hasVolumes", "stagingOn", "blockSize", "inlineMax", "geometry", "refsSeam", "noteShape", "forgetShape", "noteSizeSet", "sizeSetSince", "isPassthrough", "canStoreHeld", "write", "zeroExtension", "custodyFloor", "barrierData", "read", "ownBlock", "abandonOwnBlock", "ownBlockPublished", "holdReleases", "dropReleases", "freeBindings", "flushCustody", "releaseIno", "hasWriteCustody", "fsync", "statfs", "mintFileId", "stageImage", "appendStaged", "overwriteStaged", "stagedPoint", "releaseStaged", "stagedLease", "readMappingImage", "lockLayout", "stageKvmapShrink", "stageKvmapCorpse", "drainKvmapSweep", "publishForeign" }) |name| {
+        for ([_][]const u8{ "hasVolumes", "stagingOn", "blockSize", "inlineMax", "geometry", "refsSeam", "noteShape", "forgetShape", "noteSizeSet", "sizeSetSince", "isPassthrough", "canStoreHeld", "write", "zeroExtension", "custodyFloor", "barrierData", "read", "ownBlock", "abandonOwnBlock", "ownBlockPublished", "holdReleases", "dropReleases", "freeBindings", "flushCustody", "releaseIno", "hasWriteCustody", "fsync", "statfs", "mintFileId", "stageImage", "appendStaged", "overwriteStaged", "stagedPoint", "stagedPointCached", "releaseStaged", "stagedLease", "readMappingImage", "lockLayout", "stageKvmapShrink", "stageKvmapCorpse", "drainKvmapSweep", "publishForeign" }) |name| {
             if (!@hasDecl(T, name)) @compileError(@typeName(T) ++ " is not a kv_fs Data face: lacks `" ++ name ++ "`");
         }
     }
@@ -2877,7 +2877,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             // KILLPRIV write, a foreign slot, a missing resident) takes the
             // arms below with the record in hand.
             if (self.data.hasVolumes() and self.data.stagingOn() and self.times_park and a.write_flags & abi.FUSE_WRITE_KILL_SUIDGID == 0 and !self.foreignSlot(a.ino)) {
-                if (try self.data.stagedPoint(local)) |sp| if (end <= sp.size) {
+                if (self.data.stagedPointCached(local)) |sp| if (end <= sp.size) {
                     const data = try self.payloadBytes(a);
                     if (try self.data.overwriteStaged(self.io, staging.StagingKey.init(sp.file_id, local), a.offset, data)) |_| {
                         {
@@ -3004,6 +3004,9 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             const keep_identity = rec != null and rec.?.layout.kind == .staged;
             const file_id = if (keep_identity) rec.?.layout.file_id else self.data.mintFileId(local);
             const k = staging.StagingKey.init(file_id, local);
+            // The fast path's point warmed for the next write of this file
+            // (a miss, or a stale entry the witness moved past).
+            if (keep_identity) _ = try self.data.stagedPoint(local);
             // The resident image's length is the file's size (the ring holds
             // the whole payload), so an extending write appends at its offset.
             var in_place = false;
@@ -4184,6 +4187,9 @@ pub const NoData = struct {
     pub fn stagedPoint(_: *NoData, _: u64) Error!?StagedPoint {
         return null;
     }
+    pub fn stagedPointCached(_: *NoData, _: u64) ?StagedPoint {
+        return null;
+    }
     pub fn appendStaged(_: *NoData, _: staging.StagingKey, _: u64, _: []const u8) Error!?u64 {
         return null;
     }
@@ -5108,7 +5114,11 @@ const SettlingData = struct {
         return s.generation;
     }
     /// The fast path's view, off the store's records (the plane's read
-    /// view stands in for both lookups there).
+    /// view stands in for both lookups there); the cached face is the same
+    /// read (the double has no cache to warm).
+    pub fn stagedPointCached(self: *SettlingData, ino: u64) ?NoData.StagedPoint {
+        return self.stagedPoint(ino) catch null;
+    }
     pub fn stagedPoint(self: *SettlingData, ino: u64) Error!?NoData.StagedPoint {
         if (!self.staging or self.ring == null) return null;
         const store = self.store orelse return null;

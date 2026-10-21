@@ -3092,6 +3092,17 @@ fn commitCreate(be: *KvBackend, name: []const u8) !u64 {
     return ino;
 }
 
+/// `commitCreate` as this mount's kernel's own op (`kernel_origin`): the
+/// shape the apply ack applies to (§BB.1); the plain form is a tool's or
+/// a served verb's, acked at the landing.
+fn commitCreateKernel(be: *KvBackend, name: []const u8) !u64 {
+    const t = try be.begin(@src());
+    t.kernel_origin = true;
+    const ino = try stageCreate(be, t, name, 0);
+    try be.commit(t);
+    return ino;
+}
+
 fn present(be: *KvBackend, ino: u64) !bool {
     const got = try be.lookup(testing.allocator, key.TREE_INODES, &key.inodeKey(ino));
     defer if (got) |g| testing.allocator.free(g);
@@ -3483,7 +3494,7 @@ test "the lane's hole checkpoint never waits on the SMO lock: a window failing w
     try be.checkpointNow();
 }
 
-test "§BB.1 the ack at the apply: under the coalesced cadence a commit returns while its journal write is still un-issued (the landing-hold seam), its record is readable, the tail holds its window; an fsync behind it parks until the write lands; the landing frees the tail slot; the landing arm and strict mode keep the commit parked" {
+test "§BB.1 the ack at the apply: under the coalesced cadence this mount's kernel's own commit returns while its journal write is still un-issued (the landing-hold seam), its record is readable, the tail holds its window; an fsync behind it parks until the write lands; the landing frees the tail slot; a served verb's (non-kernel) commit, the landing arm and strict mode keep the commit parked" {
     const gpa = testing.allocator;
     const v = try TestVol.create(gpa, "ack-apply", "600000");
     defer v.destroy();
@@ -3494,7 +3505,7 @@ test "§BB.1 the ack at the apply: under the coalesced cadence a commit returns 
     journal_lane.test_seams.delay_issue.store(1, .release);
     defer journal_lane.test_seams.delay_issue.store(0, .release);
     // The commit returns: nothing landed (the seam), the record is RAM's.
-    const ino = try commitCreate(be, "early");
+    const ino = try commitCreateKernel(be, "early");
     try testing.expect(try present(be, ino));
     try testing.expectEqual(acks0 + 1, be.conveyorStats().acks_at_apply.load());
     try testing.expectEqual(@as(u32, 1), be.tail.?.image.writtenCount());
@@ -3521,6 +3532,31 @@ test "§BB.1 the ack at the apply: under the coalesced cadence a commit returns 
     try testing.expectEqual(@as(u32, 0), be.tail.?.image.writtenCount());
     try testing.expectEqual(@as(u64, 0), be.conveyorStats().tail_slot_misses.load());
 
+    // A commit that is not this mount's kernel's (a served verb, a
+    // control record, a tool) parks until the landing under the apply arm
+    // too: the symmetric protocol's words mean durable (§BB.1).
+    {
+        const landing0 = be.conveyorStats().acks_at_landing.load();
+        journal_lane.test_seams.delay_issue.store(1, .release);
+        const Tool = struct {
+            fn run(b: *KvBackend, out2: *?anyerror, done2: *std.atomic.Value(u32)) void {
+                out2.* = if (commitCreate(b, "served")) |_| null else |e| e;
+                done2.store(1, .release);
+            }
+        };
+        var out2: ?anyerror = null;
+        var done2 = std.atomic.Value(u32).init(0);
+        const t2 = try std.Thread.spawn(.{}, Tool.run, .{ be, &out2, &done2 });
+        const p0 = be.laneSnapshot().parks;
+        const dl = clock.monotonicNs() + 5 * std.time.ns_per_s;
+        while (be.laneSnapshot().parks < p0 + 4 and clock.monotonicNs() < dl) try testing.io.sleep(.fromMilliseconds(5), .awake);
+        try testing.expectEqual(@as(u32, 0), done2.load(.acquire));
+        journal_lane.test_seams.delay_issue.store(0, .release);
+        t2.join();
+        try testing.expectEqual(@as(?anyerror, null), out2);
+        try testing.expectEqual(landing0 + 1, be.conveyorStats().acks_at_landing.load());
+    }
+
     // The control arm: the commit parks until the landing.
     inline for (.{ .{ "600000", "landing" }, .{ "0", "apply" } }) |arm| {
         const v2 = try TestVol.create(gpa, "ack-landing", arm[0]);
@@ -3533,7 +3569,7 @@ test "§BB.1 the ack at the apply: under the coalesced cadence a commit returns 
         journal_lane.test_seams.delay_issue.store(1, .release);
         const Committer = struct {
             fn run(b: *KvBackend, out2: *?anyerror, done2: *std.atomic.Value(u32)) void {
-                out2.* = if (commitCreate(b, "held")) |_| null else |e| e;
+                out2.* = if (commitCreateKernel(b, "held")) |_| null else |e| e;
                 done2.store(1, .release);
             }
         };
@@ -3564,7 +3600,7 @@ test "§BB.5 a journal write that fails AFTER its window was acked: the commit r
     // issue is delayed until the applier's ack is observed.
     journal_lane.test_seams.delay_issue.store(1, .release);
     defer journal_lane.test_seams.delay_issue.store(0, .release);
-    const ino = try commitCreate(be, "acked");
+    const ino = try commitCreateKernel(be, "acked");
     try testing.expect(try present(be, ino));
     try testing.expectEqual(@as(u32, 1), be.tail.?.image.writtenCount());
     journal_lane.test_seams.fail_windows.store(1, .release);

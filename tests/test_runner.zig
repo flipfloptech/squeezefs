@@ -647,7 +647,57 @@ const heartbeat = struct {
         writeStderr(w.buffered());
         dumpThreads();
         dumpUserStacks();
+        abortOwnFuseConnections();
         std.os.linux.exit_group(hung_exit_code);
+    }
+
+    /// Before the exit: abort every FUSE connection of a squeezefs mount this
+    /// test process owns (`/build/tmp/mnt-<pid>…`: the in-process session
+    /// rigs' and the smoke rigs' pid-tagged mountpoints). A thread of ours
+    /// parked in a request on a mount we serve would otherwise keep the
+    /// process a zombie past `exit_group` (the fd table lives while it
+    /// does, so the connection never ends and the build runner never sees
+    /// the shard end — two gates of 2026-10-20 ran to their caps that way);
+    /// a child of ours parked on a rig's dead daemon is freed the same way.
+    fn abortOwnFuseConnections() void {
+        const linux = std.os.linux;
+        var buf: [1 << 20]u8 = undefined;
+        const text = Io.Dir.cwd().readFile(runner_threaded_io, "/proc/self/mountinfo", &buf) catch return;
+        var tag_buf: [32]u8 = undefined;
+        const tag = std.fmt.bufPrint(&tag_buf, "/mnt-{d}", .{linux.getpid()}) catch return;
+        var lines = std.mem.tokenizeScalar(u8, text, '\n');
+        while (lines.next()) |line| {
+            // `ID PARENT MAJ:MIN ROOT MOUNTPOINT OPTS… - FSTYPE SOURCE SUPEROPTS`.
+            var it = std.mem.tokenizeScalar(u8, line, ' ');
+            _ = it.next() orelse continue;
+            _ = it.next() orelse continue;
+            const majmin = it.next() orelse continue;
+            _ = it.next() orelse continue;
+            const mp = it.next() orelse continue;
+            while (it.next()) |tok| {
+                if (std.mem.eql(u8, tok, "-")) break;
+            } else continue;
+            const fstype = it.next() orelse continue;
+            if (!std.mem.startsWith(u8, fstype, "fuse")) continue;
+            const at = std.mem.indexOf(u8, mp, tag) orelse continue;
+            const rest = mp[at + tag.len ..];
+            if (rest.len != 0 and rest[0] != '-' and rest[0] != '/') continue;
+            const colon = std.mem.indexOfScalar(u8, majmin, ':') orelse continue;
+            var pb: [96:0]u8 = undefined;
+            const path = std.fmt.bufPrintSentinel(&pb, "/sys/fs/fuse/connections/{s}/abort", .{majmin[colon + 1 ..]}, 0) catch continue;
+            const fd_rc = linux.open(path.ptr, .{ .ACCMODE = .WRONLY, .CLOEXEC = true }, 0);
+            if (linux.errno(fd_rc) != .SUCCESS) continue;
+            const fd: linux.fd_t = @intCast(fd_rc);
+            defer _ = linux.close(fd);
+            var msg: [256]u8 = undefined;
+            var w: Io.Writer = .fixed(&msg);
+            if (linux.errno(linux.write(fd, "1", 1)) == .SUCCESS) {
+                w.print("hang watch: aborted the FUSE connection of {s} ({s}) so every parked request returns and the process can exit\n", .{ mp, majmin }) catch {};
+            } else {
+                w.print("hang watch: could not abort the FUSE connection of {s} ({s})\n", .{ mp, majmin }) catch {};
+            }
+            writeStderr(w.buffered());
+        }
     }
 
     /// Raw: the stuck test may hold `std.debug`'s stderr lock.

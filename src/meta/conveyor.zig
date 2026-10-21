@@ -727,10 +727,11 @@ pub const Stats = struct {
     resolve_seeded: counters.ShardedCounter = .{},
     resolve_descended: counters.ShardedCounter = .{},
     /// `meta_conveyor_acks_at_apply` / `_at_landing`: windows answered by
-    /// the applier ahead of the landing (§BB.1: the coalesced cadence, no
-    /// apply hole, a tail slot) against windows answered by the lane's
-    /// verdict (strict mode; a window with an apply hole; a tail slot
-    /// missed; a verdict that beat the applier's answer).
+    /// the applier ahead of the landing (§BB.1: the coalesced cadence, every
+    /// member this mount's kernel's own op, no apply hole, a tail slot)
+    /// against windows answered by the lane's verdict (strict mode; a
+    /// wire-served, control, job or tool commit; a window with an apply
+    /// hole; a tail slot missed; a verdict that beat the applier's answer).
     acks_at_apply: counters.ShardedCounter = .{},
     acks_at_landing: counters.ShardedCounter = .{},
     /// `meta_conveyor_acked_write_failures`: a journal write that failed
@@ -2390,11 +2391,17 @@ pub const Conveyor = struct {
         // A13: handoff. The window's class for the pacing law (§L).
         self.stats.lane_handoffs.inc();
         if (window.held) self.stats.windows_held.inc() else if (window.acct().padMajority()) self.stats.windows_unshadowed.inc() else self.stats.windows_pipelined.inc();
-        // §BB.1: the ack ahead of the landing — a window with an apply hole
-        // waits for the hole checkpoint at the landing; the image goes to
-        // the tail BEFORE the handoff (a crash after the ack finds it
-        // there); a slot refused falls back to the landing (counted).
-        var ack_now = self.deps.ack_at_apply and !window.applyHoles();
+        // §BB.1: the ack ahead of the landing — for a window of THIS mount's
+        // kernel's own ops alone: a wire-served step, a control record (a
+        // lease, a grant, the claim), a job's or a tool's commit is acked at
+        // the landing, so every word of the symmetric protocol still means
+        // DURABLE (charter §5.5: idempotent against durable state — a lease
+        // a dead manager had acked and lost poisoned its appender at the
+        // reclaim, UnknownLease). A window with an apply hole waits for the
+        // hole checkpoint at the landing; the image goes to the tail BEFORE
+        // the handoff (a crash after the ack finds it there); a slot refused
+        // falls back to the landing (counted).
+        var ack_now = self.deps.ack_at_apply and !window.applyHoles() and kernelOriginOnly(window.members);
         if (ack_now) if (self.deps.tail) |t| {
             window.tail_slot = t.claim(t.ctx, window.seq_base, window.ops());
             if (window.tail_slot == null) {
@@ -2419,6 +2426,12 @@ pub const Conveyor = struct {
             }
             window.release();
         }
+    }
+
+    /// Every member is a request this mount's kernel sent (`tx.kernel_origin`).
+    fn kernelOriginOnly(members: []const Queued) bool {
+        for (members) |m| if (!m.q.kernel_origin) return false;
+        return true;
     }
 
     /// Complete a reservation whose bytes never land (the hole completes

@@ -3,7 +3,7 @@
 Owner's rulings (2026-10-21): two caches in percent of SYSTEM RAM (`SQUEEZEFS_READ_CACHE_PCT`,
 `SQUEEZEFS_WRITE_CACHE_PCT`, each default 25 — Lustre's `max_cached_mb` posture) under the memory budget;
 the read cache evicts on **plain LRU**; ONE cache model, used forward for reading and reversed for writing.
-Charter §6.3, decision 0003 §BD. Venue: the workstation (`7.2.8-9.33-omarchy-sqz`), the RAM NVMe set, the
+Charter §6.3, decision 0003 §BE. Venue: the workstation (`7.2.8-9.33-omarchy-sqz`), the RAM NVMe set, the
 venue held alone per session on a daemon-free box, Tctl ≤ 70 °C per row, 20 s rows (`results.tsv` rows
 `rc-*`). A = dev `12768c8`, B = this branch.
 
@@ -64,6 +64,16 @@ set's grains each missed once, 54.0 M hits; warm 64.7 M hits, 0 misses, 0 evicti
 Daemon cost at 3.23 M: `sqz-ipc-svc` 10.2 cores (3.2 µs per serve) vs 9.5 at 1.35 M on dev. The ring arm
 through the cache sits at ext4's psync figure with no device trust (the direct arm's 3.08 M needs it).
 
+**The gate's catch** (gate 65 on the rebased branch): THE SHARED HOT DIRECTORY ACROSS DAEMONS red 9/10 on the
+branch, 0/1 on dev, green with the cache off — `RecallSink.purgeCensus` 34 % of the box: the core's census
+walked the whole item table (7.1 M slots at a 27 GiB reservation) on EVERY token recall of an EMPTY cache,
+creates parked past the watchdog and C's readdir view went stale behind timed-out wire verbs. The census now
+walks each shard's LRU list with a per-walk visit mark (O(live); an empty shard is one lock): 39 s and dev's
+create rates. Two test-side flakes under the gate's shard: a sibling test's `lease_epoch` bump made a unit
+deposit a stale refusal (the tests stamp the live epoch now), and A's atime echo (an inode-record tx within the
+flush cadence) bumped the two-daemon step's epoch between its first two reads (a correct re-fetch; the step
+re-reads until the hit lands, and is not judged under budget Red).
+
 **Owed**: the leg that lands in the cache's own memfd slab and replies by `READ_FIXED` (no lane hop cold,
 zero-pass warm — the FUSE zero-copy row's path to warm); a lock-free tokened-inode predicate so a holder's
-W1 recalls readers at once (§BD.8); one order over the hot tier's slots and the grains (§BD.9).
+W1 recalls readers at once (§BE.8); one order over the hot tier's slots and the grains (§BE.9).

@@ -988,9 +988,13 @@ pub const CachedNode = struct {
     /// The viewed inos of one apply (`ino_witness.touch` per record,
     /// deferred past the snapshot's publish): a batch wider than the
     /// buffer names them all (`touchAll`) rather than a heap allocation
-    /// under the leaf lock.
+    /// under the leaf lock. 256 entries (2 KiB of frame): a times-drain
+    /// window over a thousand parked small files lands a hundred-odd inode
+    /// records on one leaf, and at 32 every such apply staled every view
+    /// and every staged point of the mount — 63 % of the staged fast
+    /// path's lookups missed on the 16-job rewrite row.
     const WitnessSet = struct {
-        inos: [32]u64 = undefined,
+        inos: [256]u64 = undefined,
         n: usize = 0,
         overflow: bool = false,
 

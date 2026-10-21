@@ -242,13 +242,8 @@ pub fn mintChoice(in: MintInputs) MintChoice {
         };
         return .{ .smallest = best.slot };
     }
-    // 3. The cursor's own tree while it is under the ceiling (decision
-    // 0003 §BC.2: the cursor is the committer's thread, so a lane's mints
-    // append to ONE tree's edge — its inode window — instead of taking
-    // every rotor tree's rightmost leaf in turn); at or over it, the most
-    // signed headroom `a_max − bytes`, ties by the cursor.
+    // 3. The most signed headroom `a_max − bytes`, ties by the rr cursor.
     var best_i = in.rr % in.rotor.len;
-    if (in.rotor[best_i].bytes < in.a_max) return .{ .rotor = in.rotor[best_i].slot };
     var best_h: i128 = @as(i128, in.a_max) - in.rotor[best_i].bytes;
     for (in.rotor, 0..) |r, i| {
         const h: i128 = @as(i128, in.a_max) - r.bytes;
@@ -1136,13 +1131,6 @@ test "mint_choice: affinity below the ceiling; a spill to the most-headroom roto
     try testing.expectEqual(@as(u16, 5), mintChoice(over).rotor);
     over.parent_leased_non_native = false;
     try testing.expectEqual(@as(u16, 5), mintChoice(over).rotor);
-    // §BC.2: the cursor's own tree takes the mint while under the ceiling
-    // (slot 6 at 8 of 10 nodes), the most headroom only once it is at it.
-    var lane = over;
-    lane.rr = 1;
-    try testing.expectEqual(@as(u16, 6), mintChoice(lane).rotor);
-    lane.rr = 2;
-    try testing.expectEqual(@as(u16, 5), mintChoice(lane).rotor);
     // All strictly over (≥ a_max + node): overflow under the cap.
     const all_over = [_]RotorTree{ .{ .slot = 5, .bytes = 11 * node }, .{ .slot = 6, .bytes = 13 * node } };
     var o = over;

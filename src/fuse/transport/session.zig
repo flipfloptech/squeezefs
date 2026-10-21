@@ -3230,7 +3230,11 @@ test "e2e: the REGISTER refusal seam — the first 5 pushes are refused, back of
 
 test "e2e: SQUEEZEFS_FUSE_SQPOLL=1 — the lever builds the ring on the SQPOLL ladder and the mount still serves" {
     if (venueMissing()) |why| return testkit.skipWhy(@src(), why);
-    const rig = try Rig.init(testing.allocator, 7, &.{.{ "SQUEEZEFS_FUSE_SQPOLL", "1" }});
+    // One ring per queue: every SQPOLL ring is a kernel poller thread, and
+    // the derived three per queue would be 96 of them spinning on a 32-CPU
+    // venue — the row tests the ladder, not the count (it hung past its
+    // limit under a loaded host on three rings).
+    const rig = try Rig.init(testing.allocator, 7, &.{ .{ "SQUEEZEFS_FUSE_SQPOLL", "1" }, .{ "SQUEEZEFS_FUSE_RINGS_PER_QUEUE", "1" } });
     defer rig.deinit();
     const s = try rig.mountIt(.{ .mem_budget_bytes = 0 });
     try testing.expect(s.shared.sqpoll);

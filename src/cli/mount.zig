@@ -871,7 +871,7 @@ fn mountMain(ctx: *Ctx) u8 {
     //    one interval away; a page still 0 reads as a missed probe).
     if (ctx.heartbeat) |h| h.beat();
     // The session's posture, not the knob's: a mainline zero-copy session
-    // serves opens (decision 0003 §AO) and has nothing to latch.
+    // serves opens (decision 0003 §BE) and has nothing to latch.
     if (session.noOpen()) latchNoOpen(ctx.mountpoint);
     log.info("ready: {s} mounted at {s} (pid {d}; {d} queue(s) × depth {d}; budget {d} MiB; TTLs attr {d} ms entry {d} ms dir_entry {d} ms negative {d} ms)", .{ ctx.meta_uri, ctx.mountpoint, linux.getpid(), session.plan.nqueues, session.plan.depth, ctx.budget_bytes >> 20, ctx.opts.ttls.attr_ns / std.time.ns_per_ms, ctx.opts.ttls.entry_ns / std.time.ns_per_ms, ctx.opts.ttls.dir_entry_ns / std.time.ns_per_ms, ctx.opts.ttls.negative_ns / std.time.ns_per_ms });
     if (ctx.reporter) |*r| {

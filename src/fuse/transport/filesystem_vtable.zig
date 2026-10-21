@@ -134,7 +134,7 @@ pub const InitCaps = struct {
     read_zc_serve: bool = false,
     /// Payload retention negotiated: `replyRetain` is available.
     retention: bool = false,
-    /// Mainline zero-copy is granted per open file (decision 0003 §AO):
+    /// Mainline zero-copy is granted per open file (decision 0003 §BE):
     /// `zc_open` asks the filesystem to SERVE regular-file opens and mark
     /// every OPEN/CREATE reply `FOPEN_IO_URING_ZERO_COPY` (the session
     /// already dropped zero-message opens for this mount); `zc_create_only`

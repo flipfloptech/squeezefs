@@ -1,5 +1,12 @@
 # Porting spec — kmbuf buffer rings, FUSE zero-copy, payload retention, FUSE_TIME_LIMITS, per-queue bg accounting (squeezefs → Zig)
 
+> **SUPERSEDED for the shipped contract (2026-10-21, decision 0003 §BE):** the kmbuf
+> buffer-ring + zero-copy UAPI this spec describes was rejected upstream; Linux 7.3 ships
+> buffer pools and per-file zero-copy, and the transport's PRIMARY rung is
+> `MainlinePool` — `fuse_mainline_pools.md`. §3–§5 and §7 below remain the spec of the
+> TRANSITIONAL rungs (`BufRing`, `ZeroCopy`, retention) on the 7.2-sqz kernel until their
+> owner-ruled deletion; §2.4 (`FUSE_TIME_LIMITS`) and §8 stay in force on both strata.
+
 Scope: the sqz-kernel half of the FUSE-over-io_uring transport (charter §3, §4
 "Buffer-mode lattice", §6.2 item 1, §6.3 "zc serve"). Every claim cites `file:line` in
 `/Users/joberdorf/Source/squeezefs` (daemon) or a patch in

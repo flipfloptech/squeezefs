@@ -907,7 +907,7 @@ pub const Session = struct {
     rings_per_queue: u32 = 1,
     /// `SQUEEZEFS_READ_ZC_SERVE` ∧ zero-copy: what INIT told the filesystem.
     read_zc_serve: bool = false,
-    /// The open posture AFTER the lattice (decision 0003 §AO): `Config.no_open`
+    /// The open posture AFTER the lattice (decision 0003 §BE): `Config.no_open`
     /// unless a mainline zero-copy session serves opens to grant zero-copy per
     /// file (`zc_open`); `zc_create_only` = mainline zero-copy under kept
     /// zero-message opens (CREATE replies alone carry the flag).
@@ -1594,7 +1594,7 @@ pub const Session = struct {
         return probes.zeroCopyArmed(self.mode, self.verdicts);
     }
 
-    /// The open posture (decision 0003 §AO): mainline grants zero-copy per
+    /// The open posture (decision 0003 §BE): mainline grants zero-copy per
     /// open file, through a flag only an OPEN/CREATE reply can carry, and a
     /// zero-message open carries none. On a mainline zero-copy session
     /// `SQUEEZEFS_FUSE_ZC_OPEN` (default 1) therefore SERVES opens — the
@@ -1608,7 +1608,7 @@ pub const Session = struct {
         self.no_open = p.no_open;
         self.zc_open = p.zc_open;
         self.zc_create_only = p.zc_create_only;
-        if (self.zc_open and cfg_no_open) log.info("transport: MainlinePool zero-copy serves OPEN (SQUEEZEFS_FUSE_ZC_OPEN=1): zero-message opens are off for this mount so every regular-file open can carry FOPEN_IO_URING_ZERO_COPY (decision 0003 §AO)", .{});
+        if (self.zc_open and cfg_no_open) log.info("transport: MainlinePool zero-copy serves OPEN (SQUEEZEFS_FUSE_ZC_OPEN=1): zero-message opens are off for this mount so every regular-file open can carry FOPEN_IO_URING_ZERO_COPY (decision 0003 §BE)", .{});
         if (self.zc_create_only) log.info("transport: MainlinePool zero-copy under zero-message opens (SQUEEZEFS_FUSE_ZC_OPEN=0): CREATE replies alone carry FOPEN_IO_URING_ZERO_COPY — a re-opened file copies", .{});
     }
 
@@ -2245,7 +2245,7 @@ pub const Session = struct {
     }
 };
 
-/// The open posture table (decision 0003 §AO): `pool_zc` is a MainlinePool
+/// The open posture table (decision 0003 §BE): `pool_zc` is a MainlinePool
 /// session whose queues are zero-copy; `zc_open_lever` is
 /// `SQUEEZEFS_FUSE_ZC_OPEN`. Every other session keeps the mount's
 /// `no_open`; a mainline zero-copy one serves opens under the lever (so the
@@ -2671,7 +2671,7 @@ const TeardownWatchdog = struct {
     }
 };
 
-test "the open posture table (decision 0003 §AO): every rung but mainline zero-copy keeps the mount's no_open; mainline zero-copy under SQUEEZEFS_FUSE_ZC_OPEN=1 serves opens with the flag whatever the mount read; under 0 it keeps zero-message opens and grants CREATE alone (or both replies when the mount already serves opens)" {
+test "the open posture table (decision 0003 §BE): every rung but mainline zero-copy keeps the mount's no_open; mainline zero-copy under SQUEEZEFS_FUSE_ZC_OPEN=1 serves opens with the flag whatever the mount read; under 0 it keeps zero-message opens and grants CREATE alone (or both replies when the mount already serves opens)" {
     for ([_]bool{ true, false }) |cfg| {
         for ([_]bool{ true, false }) |lever| {
             try testing.expectEqual(OpenPosture{ .no_open = cfg, .zc_open = false, .zc_create_only = false }, openPosture(cfg, false, lever));

@@ -208,7 +208,7 @@ pub fn Dispatcher(comptime Transport: type) type {
         drain_coalesce_ns: u64,
         writeback: open_table.Posture,
         /// Mainline zero-copy is granted PER OPEN FILE (`FOPEN_IO_URING_
-        /// ZERO_COPY` on the OPEN/CREATE reply; decision 0003 §AO): the
+        /// ZERO_COPY` on the OPEN/CREATE reply; decision 0003 §BE): the
         /// bit every regular-file open reply carries on such a session, 0
         /// elsewhere. Set at `initFilesystem` from the session's caps.
         zc_open_flag: u32 = 0,
@@ -412,7 +412,7 @@ pub fn Dispatcher(comptime Transport: type) type {
         }
 
         /// After INIT negotiated, before the session is ready. `zc_open`
-        /// (decision 0003 §AO): the session is a mainline zero-copy one
+        /// (decision 0003 §BE): the session is a mainline zero-copy one
         /// whose opens must be SERVED so the reply can grant zero-copy —
         /// the open posture becomes the control arm's (OPEN served,
         /// RELEASE counted, `FOPEN_NOFLUSH` on clean handles), whatever the
@@ -1154,7 +1154,7 @@ test "no-open (decision 0003 §AF): OPEN answers ENOSYS before the filesystem or
     try testing.expectEqual(@as(?codec.Reply, null), ctl.d.probeMeta(fl, Rig.meta(2, 50), &out));
 }
 
-test "mainline zero-copy per open file (decision 0003 §AO): `zc_open` at INIT turns a no-open dispatcher into the open-serving arm — OPEN reaches the filesystem, its reply and a CREATE's carry FOPEN_IO_URING_ZERO_COPY over the filesystem's flags, the open table counts opens, the filesystem learns no_open=false; `zc_create_only` keeps ENOSYS opens and marks CREATE alone; a plain INIT marks nothing" {
+test "mainline zero-copy per open file (decision 0003 §BE): `zc_open` at INIT turns a no-open dispatcher into the open-serving arm — OPEN reaches the filesystem, its reply and a CREATE's carry FOPEN_IO_URING_ZERO_COPY over the filesystem's flags, the open table counts opens, the filesystem learns no_open=false; `zc_create_only` keeps ENOSYS opens and marks CREATE alone; a plain INIT marks nothing" {
     const zcf = abi.FOPEN_IO_URING_ZERO_COPY;
     // (a) serve opens with the flag.
     {

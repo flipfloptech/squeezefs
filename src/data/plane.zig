@@ -157,10 +157,11 @@ pub const BlockKey = read_size_class.BlockKey;
 // Constants with their reasons.
 // ---------------------------------------------------------------------------
 
-/// The staging segment takes a QUARTER of the cache root's free space
 /// The write cache's floor: the ring must hold at least a few whole-block
 /// entries or it is not a ring — 16 × the 4 MiB block; a percentage of RAM
-/// below it is no cache and the mount runs cache-less, loud.
+/// below it is no cache and the mount runs cache-less, loud; above it, the
+/// budget component's floor (what a Red shed leaves resident) and the
+/// least the live bound derives to.
 pub const WRITE_CACHE_FLOOR: u64 = 64 * derive.MiB;
 
 /// THIS mount's staging owner (0003 §T.1, §BG): volume 0's appender
@@ -1110,7 +1111,11 @@ pub const DataPlane = struct {
             defer gpa.free(residents);
             for (residents) |c| _ = st.cache.insert(.{ .key = c.key, .ino = c.key.ino(), .bytes = @intCast(c.cost), .generation = c.generation }, .{});
         }
-        budget.authority.register(budget.Component.init("write_cache", 0, 1, .{ .func = .{ .ctx = self, .call = &writeCacheGauge } }, .{ .ctx = self, .call = &shedWriteCache }));
+        // The floor: the ring's few whole blocks a Red shed leaves resident
+        // (the budget's floor law, §2.4) — under the gate's shared cage
+        // every daemon reads Red at every tick, and a floorless write cache
+        // was emptied each second.
+        budget.authority.register(budget.Component.init("write_cache", @min(WRITE_CACHE_FLOOR, capacity), 1, .{ .func = .{ .ctx = self, .call = &writeCacheGauge } }, .{ .ctx = self, .call = &shedWriteCache }));
         budget.authority.register(staging.cellStateComponent());
         budget.authority.register(staging.tablesComponent());
         log.info("write cache: {d} MiB in a sealed memfd (SQUEEZEFS_WRITE_CACHE_PCT of system RAM under the budget; fsync promotes; LRU over {d} shard(s)), recovered {d} record(s) ({d} B), {d} torn, {d} superseded", .{ r.capacity() >> 20, shards, rep.adopted, rep.bytes, rep.torn, rep.superseded });
@@ -1142,13 +1147,13 @@ pub const DataPlane = struct {
 
     /// The live bound for the authority's budget `budget_now`: the knob's
     /// percentage of `budget ÷ 0.7` (the machine's RAM over the live fleet
-    /// share, or the cage's 0.8 scaled), capped by the memfd — the same
-    /// law as the read cache's (`read_cache.rederive`).
+    /// share, or the cage's 0.8 scaled), never below the floor, capped by
+    /// the memfd — the same law as the read cache's (`read_cache.rederive`).
     fn rederiveWriteCache(self: *DataPlane, budget_now: u64) void {
         const st = &(self.stage orelse return);
         if (budget_now == 0 or !st.cache.enabled()) return;
         const ram_proxy = budget_now / cache_mod.SOLO_BUDGET_TENTHS *| 10;
-        st.cache.setBound(@min(cache_mod.derivedBound(st.pct, ram_proxy, budget_now), st.bound));
+        st.cache.setBound(@min(@max(cache_mod.derivedBound(st.pct, ram_proxy, budget_now), WRITE_CACHE_FLOOR), st.bound));
     }
 
     /// The R5 shed (Red: the authority's target) and the high-water kick:

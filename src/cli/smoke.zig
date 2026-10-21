@@ -7111,6 +7111,17 @@ fn dataPlanePass(rig: *Rig, cache: bool) !void {
             std.debug.print("smoke[{s}]: {d} small file(s) packed by the dispatch before rm\n", .{ label, packed_online });
             try testing.expect(packed_online > 0);
             packed_before_rm = packed_online;
+            // The budget's Red sheds (the pinned 1 GiB reads Red under the
+            // gate's shared cage) are ONE drain pass each: the bound stays
+            // the knob's (never below the ring's floor) and the small files
+            // left through the pack dispatch, never refused into their own
+            // blocks. (The first cut lowered the bound to the shed's target
+            // for the mount's life: 1,000 own blocks, 389 MiB above the
+            // baseline after the rm.)
+            const sheds = numberAfter(tail, "\"write_cache_budget_sheds\":") orelse 0;
+            const bound = numberAfter(tail, "\"write_cache_bound_bytes\":") orelse 0;
+            std.debug.print("smoke[{s}]: write cache under the budget: {d} Red shed(s), {d} evict promotion(s), bound {d} MiB, {d} over-cap refusal(s)\n", .{ label, sheds, numberAfter(tail, "\"write_cache_evict_promotions\":") orelse 0, bound >> 20, numberAfter(tail, "\"staging_over_cap_refusals\":") orelse 0 });
+            try testing.expect(bound >= 64 << 20);
             // The held-slot store and the direct leg are zc legs.
             try testing.expectEqual(zc_legs, (numberAfter(tail, "\"held_stores\":") orelse 0) > 0);
             try testing.expectEqual(zc_legs, (numberAfter(tail, "\"transport_zc_direct_legs\":") orelse 0) > 0);

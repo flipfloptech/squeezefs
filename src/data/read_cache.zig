@@ -485,7 +485,7 @@ test "the read cache: a deposited window serves grain-exact, partial and unalign
     var win: [2 * GRAIN]u8 = undefined;
     fillGrain(win[0..GRAIN], 0xA1);
     fillGrain(win[GRAIN..], 0xA2);
-    try testing.expectEqual(ReadCache.PutOutcome.inserted, rc.putValidated(blk, 8 * GRAIN, &win, 7, 0, .always, false));
+    try testing.expectEqual(ReadCache.PutOutcome.inserted, rc.putValidated(blk, 8 * GRAIN, &win, 7, lease_epoch.load(7), .always, false));
     try testing.expectEqual(@as(u64, 2 * GRAIN), rc.currentBytes());
     var out: [2 * GRAIN]u8 = undefined;
     try testing.expectEqual(@as(?usize, 2 * GRAIN), rc.get(blk, 8 * GRAIN, 10 * GRAIN, &out));
@@ -507,15 +507,15 @@ test "the read cache: a deposited window serves grain-exact, partial and unalign
     // was just served). The fifth evicts exactly it.
     var g: [GRAIN]u8 = undefined;
     fillGrain(&g, 0xB1);
-    try testing.expectEqual(ReadCache.PutOutcome.inserted, rc.putValidated(blk, 20 * GRAIN, &g, 7, 0, .always, false));
+    try testing.expectEqual(ReadCache.PutOutcome.inserted, rc.putValidated(blk, 20 * GRAIN, &g, 7, lease_epoch.load(7), .always, false));
     fillGrain(&g, 0xB2);
-    try testing.expectEqual(ReadCache.PutOutcome.inserted, rc.putValidated(blk, 21 * GRAIN, &g, 7, 0, .always, false));
+    try testing.expectEqual(ReadCache.PutOutcome.inserted, rc.putValidated(blk, 21 * GRAIN, &g, 7, lease_epoch.load(7), .always, false));
     try testing.expectEqual(@as(u64, 4 * GRAIN), rc.currentBytes());
     // Touch grain 9 again so the order (MRU → LRU) is 9, 21, 20, 8.
     try testing.expectEqual(@as(?usize, GRAIN), rc.get(blk, 9 * GRAIN, 10 * GRAIN, out[0..GRAIN]));
     const ev0 = rc.core.stats.evictions.load();
     fillGrain(&g, 0xC1);
-    try testing.expectEqual(ReadCache.PutOutcome.inserted, rc.putValidated(blk, 30 * GRAIN, &g, 7, 0, .always, false));
+    try testing.expectEqual(ReadCache.PutOutcome.inserted, rc.putValidated(blk, 30 * GRAIN, &g, 7, lease_epoch.load(7), .always, false));
     try testing.expectEqual(ev0 + 1, rc.core.stats.evictions.load());
     try testing.expect(!rc.contains(blk, 8 * GRAIN, 9 * GRAIN));
     try testing.expect(rc.contains(blk, 9 * GRAIN, 10 * GRAIN));
@@ -523,25 +523,25 @@ test "the read cache: a deposited window serves grain-exact, partial and unalign
     try testing.expect(rc.contains(blk, 30 * GRAIN, 31 * GRAIN));
     // The next victim is 20 (LRU after 8), not 9 (touched) — exact recency.
     fillGrain(&g, 0xC2);
-    try testing.expectEqual(ReadCache.PutOutcome.inserted, rc.putValidated(blk, 31 * GRAIN, &g, 7, 0, .always, false));
+    try testing.expectEqual(ReadCache.PutOutcome.inserted, rc.putValidated(blk, 31 * GRAIN, &g, 7, lease_epoch.load(7), .always, false));
     try testing.expect(!rc.contains(blk, 20 * GRAIN, 21 * GRAIN));
     try testing.expect(rc.contains(blk, 9 * GRAIN, 10 * GRAIN));
     // A replaced grain carries the new bytes.
     fillGrain(&g, 0xD9);
-    try testing.expectEqual(ReadCache.PutOutcome.inserted, rc.putValidated(blk, 9 * GRAIN, &g, 7, 0, .always, false));
+    try testing.expectEqual(ReadCache.PutOutcome.inserted, rc.putValidated(blk, 9 * GRAIN, &g, 7, lease_epoch.load(7), .always, false));
     try testing.expectEqual(@as(?usize, GRAIN), rc.get(blk, 9 * GRAIN, 10 * GRAIN, out[0..GRAIN]));
     try testing.expectEqual(@as(u8, 0xD9), out[0]);
     try testing.expectEqual(@as(u64, 4 * GRAIN), rc.currentBytes());
     // Ineligible windows: unaligned, too wide, past the block.
-    try testing.expectEqual(ReadCache.PutOutcome.ineligible, rc.putValidated(blk, 1, &g, 7, 0, .always, false));
-    try testing.expectEqual(ReadCache.PutOutcome.ineligible, rc.putValidated(blk, bs - GRAIN, &win, 7, 0, .always, false));
+    try testing.expectEqual(ReadCache.PutOutcome.ineligible, rc.putValidated(blk, 1, &g, 7, lease_epoch.load(7), .always, false));
+    try testing.expectEqual(ReadCache.PutOutcome.ineligible, rc.putValidated(blk, bs - GRAIN, &win, 7, lease_epoch.load(7), .always, false));
     var wide: [WINDOW_MAX + GRAIN]u8 = undefined;
-    try testing.expectEqual(ReadCache.PutOutcome.ineligible, rc.putValidated(blk, 0, &wide, 7, 0, .always, false));
+    try testing.expectEqual(ReadCache.PutOutcome.ineligible, rc.putValidated(blk, 0, &wide, 7, lease_epoch.load(7), .always, false));
     // Off.
     const off = try ReadCache.init(testing.allocator, bs, DEFAULT_PCT, 0, 0, 1);
     defer off.deinit();
     try testing.expect(!off.enabled());
-    try testing.expectEqual(ReadCache.PutOutcome.refused, off.putValidated(blk, 0, &g, 7, 0, .always, false));
+    try testing.expectEqual(ReadCache.PutOutcome.refused, off.putValidated(blk, 0, &g, 7, lease_epoch.load(7), .always, false));
     try testing.expectEqual(@as(?usize, null), off.get(blk, 0, GRAIN, out[0..GRAIN]));
     try testing.expect(!off.purge(blk));
 }
@@ -554,8 +554,8 @@ test "the read cache: the ranged purge drops exactly the written grains, the blo
     const b = BlockKey.init(1, bs);
     var win: [4 * GRAIN]u8 = undefined;
     fillGrain(&win, 0x11);
-    try testing.expectEqual(ReadCache.PutOutcome.inserted, rc.putValidated(a, 0, &win, 7, 0, .always, false));
-    try testing.expectEqual(ReadCache.PutOutcome.inserted, rc.putValidated(b, 4 * GRAIN, win[0 .. 2 * GRAIN], 8, 0, .always, false));
+    try testing.expectEqual(ReadCache.PutOutcome.inserted, rc.putValidated(a, 0, &win, 7, lease_epoch.load(7), .always, false));
+    try testing.expectEqual(ReadCache.PutOutcome.inserted, rc.putValidated(b, 4 * GRAIN, win[0 .. 2 * GRAIN], 8, lease_epoch.load(8), .always, false));
     try testing.expectEqual(@as(u64, 6 * GRAIN), rc.currentBytes());
     // W1 rewrote [GRAIN + 100, 2 × GRAIN + 100) of a: grains 1 and 2 go.
     try testing.expectEqual(@as(u32, 2), rc.purgeRange(a, GRAIN + 100, GRAIN));
@@ -591,12 +591,12 @@ test "the read cache: the ranged purge drops exactly the written grains, the blo
         }
     };
     const free_before = rc.slab.freeSlots();
-    try testing.expectEqual(ReadCache.PutOutcome.refused, rc.putValidated(a, 0, &win, 7, 0, .{ .ctx = null, .call = &Refuse.no }, false));
+    try testing.expectEqual(ReadCache.PutOutcome.refused, rc.putValidated(a, 0, &win, 7, lease_epoch.load(7), .{ .ctx = null, .call = &Refuse.no }, false));
     try testing.expectEqual(free_before, rc.slab.freeSlots());
     try testing.expectEqual(@as(u64, 0), rc.currentBytes());
     // Freeze: 4 grains in, then a frozen 2-grain deposit evicts 2 first.
-    try testing.expectEqual(ReadCache.PutOutcome.inserted, rc.putValidated(a, 0, &win, 7, 0, .always, false));
-    try testing.expectEqual(ReadCache.PutOutcome.inserted, rc.putValidated(b, 0, win[0 .. 2 * GRAIN], 8, 0, .always, true));
+    try testing.expectEqual(ReadCache.PutOutcome.inserted, rc.putValidated(a, 0, &win, 7, lease_epoch.load(7), .always, false));
+    try testing.expectEqual(ReadCache.PutOutcome.inserted, rc.putValidated(b, 0, win[0 .. 2 * GRAIN], 8, lease_epoch.load(8), .always, true));
     try testing.expectEqual(@as(u64, 4 * GRAIN), rc.currentBytes());
     try testing.expect(!rc.contains(a, 0, 2 * GRAIN));
     try testing.expect(rc.contains(a, 2 * GRAIN, 4 * GRAIN));
@@ -669,7 +669,7 @@ test "the read cache: the bound follows the live budget — a mount-time third g
     var g: [GRAIN]u8 = undefined;
     fillGrain(&g, 0x5c);
     const blk = BlockKey.init(1, 0);
-    for (0..20) |i| try testing.expectEqual(ReadCache.PutOutcome.inserted, rc.putValidated(blk, @as(u64, i) * GRAIN, &g, 7, 0, .always, false));
+    for (0..20) |i| try testing.expectEqual(ReadCache.PutOutcome.inserted, rc.putValidated(blk, @as(u64, i) * GRAIN, &g, 7, lease_epoch.load(7), .always, false));
     try testing.expectEqual(@as(u64, 20 * GRAIN), rc.currentBytes());
     // A cage shrinks the budget: 70 % of a machine whose quarter is 8
     // grains ⇒ the LRU tail evicts down to the new bound (7 whole grains
@@ -692,7 +692,7 @@ test "the read cache: a served grain pinned across an eviction keeps its bytes u
     const a = BlockKey.init(9, 0);
     var g: [GRAIN]u8 = undefined;
     fillGrain(&g, 0x5A);
-    try testing.expectEqual(ReadCache.PutOutcome.inserted, rc.putValidated(a, 0, &g, 7, 0, .always, false));
+    try testing.expectEqual(ReadCache.PutOutcome.inserted, rc.putValidated(a, 0, &g, 7, lease_epoch.load(7), .always, false));
     // Pin the entry's slot as a serve would, evict it by depositing another
     // grain, and check the pinned slot still reads the old bytes and the
     // new grain took a different slot.
@@ -700,7 +700,7 @@ test "the read cache: a served grain pinned across an eviction keeps its bytes u
     try testing.expectEqual(@as(usize, 1), rc.core.lookupMany(&.{ReadCache.grainKey(a, 0)}, &pins, ReadCache.Pins.visit));
     const slot = pins.slots[0];
     fillGrain(&g, 0xC3);
-    try testing.expectEqual(ReadCache.PutOutcome.inserted, rc.putValidated(a, GRAIN, &g, 7, 0, .always, false));
+    try testing.expectEqual(ReadCache.PutOutcome.inserted, rc.putValidated(a, GRAIN, &g, 7, lease_epoch.load(7), .always, false));
     try testing.expect(!rc.contains(a, 0, GRAIN));
     try testing.expectEqual(@as(u8, 0x5A), rc.slab.bytes(slot)[0]);
     var pins2: ReadCache.Pins = .{ .slab = rc.slab };
@@ -720,8 +720,8 @@ test "the read cache: a sharded instance keeps every grain of a block in one sha
     var k: u64 = 0;
     while (k < 64) : (k += 1) {
         const blk = BlockKey.init(5, k * bs);
-        try testing.expectEqual(ReadCache.PutOutcome.inserted, rc.putValidated(blk, 0, &win, 7, 0, .always, false));
-        try testing.expectEqual(ReadCache.PutOutcome.inserted, rc.putValidated(blk, 10 * GRAIN, &win, 7, 0, .always, false));
+        try testing.expectEqual(ReadCache.PutOutcome.inserted, rc.putValidated(blk, 0, &win, 7, lease_epoch.load(7), .always, false));
+        try testing.expectEqual(ReadCache.PutOutcome.inserted, rc.putValidated(blk, 10 * GRAIN, &win, 7, lease_epoch.load(7), .always, false));
         try testing.expectEqual(rc.core.shardIndex(ReadCache.grainKey(blk, 0)), rc.core.shardIndex(ReadCache.grainKey(blk, 11 * GRAIN)));
     }
     try testing.expectEqual(@as(u64, 64 * 4 * GRAIN), rc.currentBytes());
@@ -733,10 +733,10 @@ test "the read cache: a sharded instance keeps every grain of a block in one sha
     fillGrain(&filler, 0x01);
     var off: u64 = 20 * GRAIN;
     while (vs.bytes.load(.monotonic) + GRAIN <= vs.max_bytes) : (off += GRAIN) {
-        try testing.expectEqual(ReadCache.PutOutcome.inserted, rc.putValidated(victim_blk, off, &filler, 7, 0, .always, false));
+        try testing.expectEqual(ReadCache.PutOutcome.inserted, rc.putValidated(victim_blk, off, &filler, 7, lease_epoch.load(7), .always, false));
     }
     const ev0 = rc.core.stats.evictions.load();
-    try testing.expectEqual(ReadCache.PutOutcome.inserted, rc.putValidated(victim_blk, off, &filler, 7, 0, .always, false));
+    try testing.expectEqual(ReadCache.PutOutcome.inserted, rc.putValidated(victim_blk, off, &filler, 7, lease_epoch.load(7), .always, false));
     try testing.expectEqual(ev0 + 1, rc.core.stats.evictions.load());
     try testing.expectEqual(others_before, rc.currentBytes() - vs.bytes.load(.monotonic));
     // The evicted grain was this shard's oldest deposit: grain 0 of block 0.

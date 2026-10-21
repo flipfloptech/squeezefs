@@ -35,6 +35,7 @@ const hot_tier = @import("hot_tier.zig");
 const read_lru = @import("read_lru.zig");
 const read_hold = @import("read_hold.zig");
 const read_cache = @import("read_cache.zig");
+const lease_epoch = @import("lease_epoch.zig");
 const nvme_read_cache = @import("nvme_read_cache.zig");
 
 pub const BlockKey = rsc.BlockKey;
@@ -188,7 +189,7 @@ test "the ONE purge drops a key from every tier that holds it and counts the hit
     _ = pool.unpin(s);
     try testing.expectEqual(hot_tier.PutOutcome.inserted, lru.putValidated(k, pool.bytes(s)[0..bs], .always, false));
     try testing.expectEqual(nvme_read_cache.PutOutcome.published, nvme.putValidated(k, pool.bytes(s)[0..bs], 1, .always, false));
-    try testing.expectEqual(read_cache.ReadCache.PutOutcome.inserted, grains.putValidated(k, 0, pool.bytes(s)[0..bs], 7, 0, .always, false));
+    try testing.expectEqual(read_cache.ReadCache.PutOutcome.inserted, grains.putValidated(k, 0, pool.bytes(s)[0..bs], 7, lease_epoch.load(7), .always, false));
     try testing.expect(hot.contains(k) and lru.contains(k) and hold.contains(k) and nvme.has(k) and grains.contains(k, 0, bs));
 
     const calls_before = stats.read_tier_purges.load();
@@ -231,8 +232,8 @@ test "the ranged purge drops the whole block from the whole-block tiers and exac
     try testing.expectEqual(hot_tier.PutOutcome.inserted, hot.putClassValidated(k, s, @intCast(bs), .protected, .always, false));
     _ = pool.unpin(s);
     const g = read_cache.GRAIN;
-    try testing.expectEqual(read_cache.ReadCache.PutOutcome.inserted, grains.putValidated(k, 0, pool.bytes(s)[0 .. 4 * g], 7, 0, .always, false));
-    try testing.expectEqual(read_cache.ReadCache.PutOutcome.inserted, grains.putValidated(k, 8 * g, pool.bytes(s)[0 .. 2 * g], 7, 0, .always, false));
+    try testing.expectEqual(read_cache.ReadCache.PutOutcome.inserted, grains.putValidated(k, 0, pool.bytes(s)[0 .. 4 * g], 7, lease_epoch.load(7), .always, false));
+    try testing.expectEqual(read_cache.ReadCache.PutOutcome.inserted, grains.putValidated(k, 8 * g, pool.bytes(s)[0 .. 2 * g], 7, lease_epoch.load(7), .always, false));
     const range_calls = stats.read_tier_range_purges.load();
     // W1 rewrote grain 1: the hot tier loses the block, the cache grain 1 alone.
     try testing.expectEqual(@as(u32, 2), purgeBlockRange(tiers, k, g, g));
@@ -289,7 +290,7 @@ test "the census purge drops exactly the keys its selector picks, from every tie
         _ = pool.unpin(s);
         try testing.expectEqual(hot_tier.PutOutcome.inserted, lru.putValidated(k, pool.bytes(s)[0..bs], .always, false));
         try testing.expectEqual(nvme_read_cache.PutOutcome.published, nvme.putValidated(k, pool.bytes(s)[0..bs], 1, .always, false));
-        if (i != 2) try testing.expectEqual(read_cache.ReadCache.PutOutcome.inserted, grains.putValidated(k, 0, pool.bytes(s)[0..bs], 7, 0, .always, false));
+        if (i != 2) try testing.expectEqual(read_cache.ReadCache.PutOutcome.inserted, grains.putValidated(k, 0, pool.bytes(s)[0..bs], 7, lease_epoch.load(7), .always, false));
     }
     const calls0 = stats.read_tier_purges.load();
     try testing.expectEqual(@as(u32, 2), purgeCensus(tiers, select));

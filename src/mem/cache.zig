@@ -167,6 +167,9 @@ pub const Stats = struct {
     sink_released: counters.ShardedCounter = .{},
     sink_kept: counters.ShardedCounter = .{},
     insert_refusals: counters.ShardedCounter = .{},
+    /// Live entries a census walk visited (a census costs the live
+    /// entries, never the capacity).
+    census_visits: counters.ShardedCounter = .{},
     bytes: counters.Gauge = .{},
     bound_bytes: counters.Gauge = .{},
     shards: counters.Gauge = .{},
@@ -174,7 +177,7 @@ pub const Stats = struct {
     /// The family's keys, each prefixed (`<prefix>_hits`, …), inside the
     /// caller's braces.
     pub fn writeJson(self: *const Stats, w: *std.Io.Writer, prefix: []const u8) std.Io.Writer.Error!void {
-        try w.print("\"{s}_hits\":{d},\"{s}_misses\":{d},\"{s}_fills\":{d},\"{s}_evictions\":{d},\"{s}_stale_refusals\":{d},\"{s}_invalidations\":{d},\"{s}_sink_released\":{d},\"{s}_sink_kept\":{d},\"{s}_insert_refusals\":{d},\"{s}_bytes\":{d},\"{s}_bound_bytes\":{d},\"{s}_shards\":{d}", .{
+        try w.print("\"{s}_hits\":{d},\"{s}_misses\":{d},\"{s}_fills\":{d},\"{s}_evictions\":{d},\"{s}_stale_refusals\":{d},\"{s}_invalidations\":{d},\"{s}_sink_released\":{d},\"{s}_sink_kept\":{d},\"{s}_insert_refusals\":{d},\"{s}_census_visits\":{d},\"{s}_bytes\":{d},\"{s}_bound_bytes\":{d},\"{s}_shards\":{d}", .{
             prefix, self.hits.load(),
             prefix, self.misses.load(),
             prefix, self.fills.load(),
@@ -184,6 +187,7 @@ pub const Stats = struct {
             prefix, self.sink_released.load(),
             prefix, self.sink_kept.load(),
             prefix, self.insert_refusals.load(),
+            prefix, self.census_visits.load(),
             prefix, self.bytes.load(),
             prefix, self.bound_bytes.load(),
             prefix, self.shards.load(),
@@ -194,7 +198,7 @@ pub const Stats = struct {
 const NIL: u32 = std.math.maxInt(u32);
 
 /// A census cursor over a sharded instance: the shard in the high half,
-/// the item slot in the low half (a shard's item table is u32-indexed).
+/// the walk's generation in the low half (0 = a new walk).
 pub const Cursor = packed struct(u64) {
     slot: u32,
     shard: u32,
@@ -239,6 +243,8 @@ pub fn Cache(comptime Entry: type, comptime Sink: type) type {
             next: u32 = NIL,
             ino_prev: u32 = NIL,
             ino_next: u32 = NIL,
+            /// The census generation that last visited this item.
+            seen: u32 = 0,
             state: State = .free,
         };
 
@@ -324,6 +330,8 @@ pub fn Cache(comptime Entry: type, comptime Sink: type) type {
         bound: u64,
         epochs: ?EpochSource,
         stats: Stats = .{},
+        /// Census generations (`censusNext`): one per walk, never 0.
+        census_gen: Atomic(u32) = .init(0),
 
         /// `bound == 0` disables the instance (every lookup misses, every
         /// insert refuses). `per_shard_items` bounds the item table per
@@ -675,26 +683,40 @@ pub fn Cache(comptime Entry: type, comptime Sink: type) type {
             return p;
         }
 
-        /// The census face: the next entry at or after `cursor` (a
-        /// `Cursor`: the shard above, the item slot below) that `pick`
-        /// selects, as a COPY, the cursor moved past it; null at the end.
-        /// One shard lock at a time, nothing allocated.
+        /// The census face: the next LIVE entry `pick` selects that this
+        /// walk has not visited, as a COPY, one shard lock at a time, nothing
+        /// allocated. The cursor is a `Cursor` — the shard above, the walk's
+        /// generation below (0 = a new walk) — and the walk is over each
+        /// shard's LRU LIST with a per-item visit mark, so a census costs
+        /// the LIVE entries, never the item table's capacity (the first cut
+        /// walked 7.1 M slots of an EMPTY cache per token recall and the
+        /// recall-heavy rows ran 30× slower); a shard without entries costs
+        /// one lock. An entry inserted or moved mid-walk is visited at most
+        /// once more (a deposit behind the walk is the depositor's to settle).
         pub fn censusNext(self: *Self, cursor: *u64, ctx: anytype, comptime pick: fn (@TypeOf(ctx), *const Entry) bool) ?Entry {
             if (!self.enabled()) return null;
             var c = Cursor.unpack(cursor.*);
-            while (c.shard < self.shards.len) : (c = .{ .shard = c.shard + 1, .slot = 0 }) {
+            if (c.slot == 0) c.slot = self.census_gen.fetchAdd(1, .monotonic) +% 1;
+            if (c.slot == 0) c.slot = self.census_gen.fetchAdd(1, .monotonic) +% 1;
+            const gen = c.slot;
+            while (c.shard < self.shards.len) : (c.shard += 1) {
                 const s = &self.shards[c.shard];
                 s.lock.lock();
                 defer s.lock.unlock();
-                while (c.slot < s.items.len) : (c.slot += 1) {
-                    const it = &s.items[c.slot];
-                    if (it.state != .free and pick(ctx, &it.entry)) {
-                        cursor.* = (Cursor{ .shard = c.shard, .slot = c.slot + 1 }).pack();
+                if (s.map.count() == 0) continue;
+                var idx = s.head;
+                while (idx != NIL) : (idx = s.items[idx].next) {
+                    const it = &s.items[idx];
+                    if (it.seen == gen) continue;
+                    it.seen = gen;
+                    self.stats.census_visits.inc();
+                    if (pick(ctx, &it.entry)) {
+                        cursor.* = (Cursor{ .shard = c.shard, .slot = gen }).pack();
                         return it.entry;
                     }
                 }
             }
-            cursor.* = (Cursor{ .shard = c.shard, .slot = 0 }).pack();
+            cursor.* = (Cursor{ .shard = c.shard, .slot = gen }).pack();
             return null;
         }
 
@@ -1013,6 +1035,44 @@ test "the core: setBound re-derives the shards' shares live — a larger bound a
     defer off.deinit();
     off.setBound(8);
     try testing.expect(!off.enabled());
+}
+
+test "the core: a census walks the LIVE entries once (never the capacity) — an empty instance visits nothing, three entries over a capacity of 8 cost three visits, every live entry is named exactly once, a new walk sees them again, a disabled instance names nothing" {
+    var sink: DropSink = .{};
+    defer sink.deinit();
+    const C = Cache(TestEntry, DropSink);
+    const c = try C.init(testing.allocator, &sink, 8, 2, 8, null);
+    defer c.deinit();
+    const All = struct {
+        fn pick(_: *const u8, _: *const TestEntry) bool {
+            return true;
+        }
+    };
+    const d: u8 = 0;
+    var cursor: u64 = 0;
+    try testing.expectEqual(@as(?TestEntry, null), c.censusNext(&cursor, &d, All.pick));
+    try testing.expectEqual(@as(u64, 0), c.stats.census_visits.load());
+    for (1..4) |i| try testing.expectEqual(InsertOutcome.inserted, c.insert(mk(@intCast(i), 0, 0, 1, @intCast(i)), .{}));
+    cursor = 0;
+    var seen: [4]bool = @splat(false);
+    var n: usize = 0;
+    while (c.censusNext(&cursor, &d, All.pick)) |e| : (n += 1) {
+        try testing.expect(!seen[e.slot]);
+        seen[e.slot] = true;
+    }
+    try testing.expectEqual(@as(usize, 3), n);
+    try testing.expectEqual(@as(u64, 3), c.stats.census_visits.load());
+    // A second walk (a new cursor) names them again; the exhausted cursor
+    // names nothing more.
+    try testing.expectEqual(@as(?TestEntry, null), c.censusNext(&cursor, &d, All.pick));
+    cursor = 0;
+    n = 0;
+    while (c.censusNext(&cursor, &d, All.pick)) |_| n += 1;
+    try testing.expectEqual(@as(usize, 3), n);
+    const off = try C.init(testing.allocator, &sink, 0, 1, 1, null);
+    defer off.deinit();
+    cursor = 0;
+    try testing.expectEqual(@as(?TestEntry, null), off.censusNext(&cursor, &d, All.pick));
 }
 
 test "the core: invalidateKey and invalidateKeys drop held keys through the sink and count; an absent key is nothing; a disabled instance (bound 0) misses, refuses and invalidates nothing" {

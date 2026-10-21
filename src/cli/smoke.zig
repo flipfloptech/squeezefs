@@ -181,7 +181,7 @@ const Rig = struct {
         // The applier venue's A/B lever and the flush cadence reach the
         // daemons the same way (`SQUEEZEFS_META_APPLIERS=0 zig build smoke …`
         // gates the inline arm; a short cadence pins a drain inside a row).
-        for ([_][]const u8{ "SQUEEZEFS_META_APPLIERS", "SQUEEZEFS_META_FLUSH_INTERVAL_MS", "SQUEEZEFS_META_PASS_VENUE", "SQUEEZEFS_META_WINDOW_HOLD", "SQUEEZEFS_META_ACK_POINT", "SQUEEZEFS_META_APPLY" }) |k| {
+        for ([_][]const u8{ "SQUEEZEFS_META_APPLIERS", "SQUEEZEFS_META_FLUSH_INTERVAL_MS", "SQUEEZEFS_META_PASS_VENUE", "SQUEEZEFS_META_WINDOW_HOLD", "SQUEEZEFS_META_ACK_POINT", "SQUEEZEFS_META_APPLY", "SQUEEZEFS_READ_CACHE_PCT", "SQUEEZEFS_READ_CACHE_FILL" }) |k| {
             if (knobs.present(proc_env.get(k))) |v| try self.env.put(k, v);
         }
         _ = linux.mkdir(self.work.ptr, 0o755);
@@ -2067,13 +2067,27 @@ test "smoke: THE TWO-DAEMON MATRIX — mount A (the manager) → mount B as a SE
             const hits0 = numberAfter(sa0, "\"read_cache_grain_hits\":") orelse 0;
             const first = try rig.onMount(read_cmd);
             defer gpa.free(first);
-            const second = try rig.onMount(read_cmd);
-            defer gpa.free(second);
-            try testing.expectEqualStrings(first, second);
-            const sa1 = try rig.onMount("cat .stats");
-            defer gpa.free(sa1);
-            const hits1 = numberAfter(sa1, "\"read_cache_grain_hits\":") orelse 0;
-            try testing.expect(hits1 > hits0);
+            // The re-reads until one is a grain hit: the first read's atime
+            // echo drains as an inode record on A within the flush cadence
+            // and bumps the ino's lease epoch (a stale refusal re-deposits —
+            // correct, never a stale byte), so the hit may be the third
+            // read; under budget Red A deposits nothing and the hit arm is
+            // not judged (the coherence arm below always is).
+            var hits1: u64 = hits0;
+            var level: u64 = 0;
+            var stale: u64 = 0;
+            var tries: u32 = 0;
+            while (tries < 5 and hits1 <= hits0) : (tries += 1) {
+                const again = try rig.onMount(read_cmd);
+                defer gpa.free(again);
+                try testing.expectEqualStrings(first, again);
+                const sa1 = try rig.onMount("cat .stats");
+                defer gpa.free(sa1);
+                hits1 = numberAfter(sa1, "\"read_cache_grain_hits\":") orelse 0;
+                level = numberAfter(sa1, "\"mem_budget_level\":") orelse 0;
+                stale = numberAfter(sa1, "\"read_cache_grain_stale_refusals\":") orelse 0;
+            }
+            if (level == 2) std.debug.print("smoke: matrix: the read cache across the set — A at budget level {d}: the grain hit is not judged on this run\n", .{level}) else try testing.expect(hits1 > hits0);
             const recalls0 = numberAfter(tb, "\"dlm_token_recalls\":") orelse 0;
             var w_buf: [320]u8 = undefined;
             const write_cmd = try std.fmt.bufPrint(&w_buf, "truncate -s {d} b-data/big && dd if=/dev/zero of=b-data/big bs=4096 seek={d} count=1 conv=notrunc oflag=direct status=none && sync -d b-data/big", .{ win_idx * 4096, win_idx });
@@ -2088,7 +2102,7 @@ test "smoke: THE TWO-DAEMON MATRIX — mount A (the manager) → mount B as a SE
             const tb_rc = try b.stats();
             defer gpa.free(tb_rc);
             try testing.expect((numberAfter(tb_rc, "\"dlm_token_recalls\":") orelse 0) > recalls0);
-            std.debug.print("smoke: matrix: the read cache across the set — A's grain hits {d} → {d} (the second O_DIRECT read), B's shrink + rewrite recalled A ({d} → {d} recalls on B), A's third read is B's zeros, stale serves 0 (verify seam)\n", .{ hits0, hits1, recalls0, numberAfter(tb_rc, "\"dlm_token_recalls\":") orelse 0 });
+            std.debug.print("smoke: matrix: the read cache across the set — A's grain hits {d} → {d} after {d} re-read(s) (epoch stale refusals {d}, budget level {d}), B's shrink + rewrite recalled A ({d} → {d} recalls on B), A's next read is B's zeros, stale serves 0 (verify seam)\n", .{ hits0, hits1, tries, stale, level, recalls0, numberAfter(tb_rc, "\"dlm_token_recalls\":") orelse 0 });
         }
         const rm = try b.onMount("rm b-data/big");
         gpa.free(rm);

@@ -334,7 +334,7 @@ fn served(o: client.Outcome) !usize {
     };
 }
 
-test "smoke: THE INTERCEPTION HOST — format → mount -o interception → the il0 xattr → a session in-process over the ONE client library → bind → ring pwrite 4 MiB (sever-at-dequeue) read back through the kernel path byte-exact → a 4 MiB stream of 1 MiB pieces places into ONE assembly adopted by ONE merge → a cold read then a warm read on the sync fast path (arena_copy_bytes ≡ bytes) → a W1-shaped 4 KiB overwrite serves INLINE on the dd lane (patch_edge_rmw_reads 0) → 8 no-wait tickets complete in offset order → the fd screen's refusals → kernel fsync → umount with the live session tears down cleanly (the client poisoned, no mount left)" {
+test "smoke: THE INTERCEPTION HOST — format → mount -o interception → the il0 xattr → a session in-process over the ONE client library → bind → ring pwrite 4 MiB (sever-at-dequeue, the write cache's one record) read back through the kernel path byte-exact → the second block's pieces pool while the record promotes (the file striped from here) → a third block's 4 MiB stream of 1 MiB pieces places into ONE assembly adopted by ONE merge → a cold read then a warm read on the sync fast path (arena_copy_bytes ≡ bytes) → a W1-shaped 4 KiB overwrite serves INLINE on the dd lane (patch_edge_rmw_reads 0) → 8 no-wait tickets complete in offset order → the fd screen's refusals → kernel fsync → umount with the live session tears down cleanly (the client poisoned, no mount left)" {
     const io = testing.io;
     if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
     const gpa = testing.allocator;
@@ -397,26 +397,40 @@ test "smoke: THE INTERCEPTION HOST — format → mount -o interception → the 
 
     // 2. Block 1 as ONE 4 MiB pwrite: the client stages 4 flights of 1 MiB
     //    under one doorbell, so the pass drains every sibling before its
-    //    flush spawns the handoffs. The file is striped now and block 1 has
-    //    no entry: the four chunks sever into ONE assembly, the first merge
-    //    adopts it full, its siblings ride the adoption.
+    //    flush spawns the handoffs. Under the write cache (charter §6.1
+    //    "Staged") block 0 is ONE 4 MiB record in the ring and the file is
+    //    still staged at the sever, so placement is not eligible (a
+    //    resident striped layout is its screen): the chunks sever POOLED;
+    //    the first handoff's extending write promotes the record to its own
+    //    block — the file is striped from here — and the chunks land
+    //    striped. Later chunks may have placed once that promotion landed
+    //    (their partial assembly reaps unadopted: the first merge of the
+    //    block was a pooled one) — never an adoption, never a fallback.
     const block1 = try gpa.alloc(u8, BLOCK);
     defer gpa.free(block1);
     pattern(block1, BLOCK);
     try testing.expectEqual(BLOCK, try served(s.pwrite(b.id, block1, BLOCK)));
     try testing.expectEqual(@as(u64, 8), try rig.stat("ipc_ops_write"));
-    // ≥ 4: block 0's later chunks may have placed too once the first
-    // handoff promoted the file (their assembly reaps unadopted: the first
-    // merge of that block was a pooled one).
+    try testing.expect((try rig.stat("ipc_placed_severs")) <= 3);
+    try testing.expectEqual(@as(u64, 0), try rig.stat("ipc_placed_adoptions"));
+    try testing.expectEqual(@as(u64, 0), try rig.stat("ipc_placed_sever_fallbacks"));
+    try testing.expectEqual(BLOCK, linux.pread(kfd, back.ptr, back.len, @intCast(BLOCK)));
+    try expectPattern(back, BLOCK);
+    //    Block 2 as ONE 4 MiB pwrite: the file is striped and block 2 has
+    //    no entry — the four chunks sever into ONE assembly, the first
+    //    merge adopts it full, its siblings ride the adoption.
+    pattern(block1, 2 * BLOCK);
+    try testing.expectEqual(BLOCK, try served(s.pwrite(b.id, block1, 2 * BLOCK)));
+    try testing.expectEqual(@as(u64, 12), try rig.stat("ipc_ops_write"));
     try testing.expect((try rig.stat("ipc_placed_severs")) >= 4);
     try testing.expectEqual(@as(u64, 1), try rig.stat("ipc_placed_adoptions"));
     try testing.expectEqual(@as(u64, 0), try rig.stat("ipc_placed_adoption_refusals"));
     try testing.expectEqual(@as(u64, 0), try rig.stat("ipc_placed_sever_fallbacks"));
-    try testing.expectEqual(BLOCK, linux.pread(kfd, back.ptr, back.len, @intCast(BLOCK)));
+    try testing.expectEqual(BLOCK, linux.pread(kfd, back.ptr, back.len, @intCast(2 * BLOCK)));
     // The kernel-path read-backs ran contiguous: a CLASSIFIED stream, which
     // vetoes ranged windows file-wide while fresh (`prefetch.STALE_NS`).
     const stream_stale_at = clock.monotonicNs() + prefetch.STALE_NS;
-    try expectPattern(back, BLOCK);
+    try expectPattern(back, 2 * BLOCK);
     // Every parked block uploads (the write-through) before the W1 row.
     try rig.awaitStat("parked_buffers", 0);
     // Step 3 judges the COLD ladder, so the stream must be stale first: on a
@@ -747,19 +761,27 @@ test "smoke: THE DIRECT ARM — mount -o interception=direct → a root session 
     try testing.expectEqual(BLOCK, try served(s.pwrite(b.id, block, 0)));
     pattern(block, BLOCK);
     try testing.expectEqual(BLOCK, try served(s.pwrite(b.id, block, BLOCK)));
+    // The write asks above were refused and PARKED the binding for the
+    // client's refusal backoff (`REFUSE_BACKOFF_NS`: one ask per backoff,
+    // never one per op): a read inside the park is the ring's without an
+    // ask. Under the write cache the two 4 MiB writes land in RAM fast
+    // enough that the read below fell inside it — wait the park out (the
+    // backoff is the client's law, not a synchronization).
+    const park_until = clock.monotonicNs() + client.direct_client.REFUSE_BACKOFF_NS;
     try rig.awaitStat("parked_buffers", 0);
     const kfd = try rig.openOnMount("direct.dat", .{ .ACCMODE = .RDWR, .CLOEXEC = true });
     defer _ = linux.close(kfd);
     if (linux.errno(linux.fsync(kfd)) != .SUCCESS) return error.TestFsync;
+    while (clock.monotonicNs() < park_until) sleepMs(20);
 
     // 1. The direct read: the device's bytes, no ring op.
     const rbuf = try gpa.alignedAlloc(u8, .fromByteUnits(4096), 64 * 1024);
     defer gpa.free(rbuf);
     const ops0 = try rig.stat("ipc_ops_read");
     const page = s.statsPage();
-    // (The 4 MiB ring writes above asked once each way and were refused —
-    // an inline-born file, then an extending write — so the counts below
-    // are relative.)
+    // (The 4 MiB ring writes above asked and were refused — an inline-born
+    // file, a staged one, an extending write: whichever asks the park let
+    // through — so the counts below are relative.)
     const asks0 = page.il_lease_asks.load(.monotonic);
     const granted0 = try rig.stat("ipc_leases_granted");
     try testing.expectEqual(@as(usize, 64 * 1024), try served(s.pread(b.id, rbuf, 1 * MiB)));

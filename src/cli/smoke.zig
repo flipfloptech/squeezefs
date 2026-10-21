@@ -492,13 +492,7 @@ const Rig = struct {
 
     fn spawnMountOf(self: *Rig, meta_uri: []const u8, extra: []const []const u8) !void {
         std.debug.assert(self.child == null);
-        if (self.log_file == null) {
-            self.log_file = try Io.Dir.cwd().createFile(self.io, self.log_path, .{ .truncate = false });
-            // At the end: a `--log-file` daemon of this rig appended to the
-            // same file before (its sink is O_APPEND; a child's stderr
-            // writes at this description's offset).
-            _ = linux.lseek(self.log_file.?.handle, 0, linux.SEEK.END);
-        }
+        if (self.log_file == null) self.log_file = try openLogAppend(self.log_path);
         var argv: [16][]const u8 = undefined;
         var n: usize = 0;
         argv[n] = self.bin;
@@ -613,6 +607,18 @@ const Rig = struct {
         return text.len;
     }
 };
+
+/// A rig's log file for a child's stdout/stderr, O_APPEND like a
+/// `--log-file` daemon's sink: a supervised daemon and its supervisor of
+/// the same rig append to this file too — AFTER a later foreground child
+/// started (a supervisor holding a dead daemon's write cache logs its
+/// handover once the successor is up) — and a description writing at its
+/// own offset overwrote their lines.
+fn openLogAppend(path: [:0]const u8) !Io.File {
+    const rc = linux.open(path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true, .CLOEXEC = true }, 0o644);
+    if (linux.errno(rc) != .SUCCESS) return error.LogOpenFailed;
+    return .{ .handle = @intCast(rc), .flags = .{ .nonblocking = false } };
+}
 
 fn alive(pid: linux.pid_t) bool {
     // A zombie still answers kill(0); `waitpid(WNOHANG)` would reap it out
@@ -1666,7 +1672,7 @@ const Peer = struct {
     fn spawn(self: *Peer, extra: []const []const u8) !void {
         std.debug.assert(self.child == null);
         const rig = self.rig;
-        if (self.log_file == null) self.log_file = try Io.Dir.cwd().createFile(rig.io, self.log_path, .{ .truncate = false });
+        if (self.log_file == null) self.log_file = try openLogAppend(self.log_path);
         var argv: [24][]const u8 = undefined;
         var n: usize = 0;
         if (self.node) |node| {
@@ -6508,17 +6514,21 @@ const small_len: u64 = 64 << 10;
 /// blocks, plus one open pack per data volume that the DISMOUNT seal may
 /// close short.
 const pack_census_bound: u64 = (small_files_staged * small_len + (2 << 20) - 1) / (2 << 20) + 2;
-/// The cache-path row's daemon budget, pinned. The staging ring is budget/8
-/// (`DataPlane.stagingCapacityFor`'s ceiling), and the storm must overflow
-/// it beside the small files, so the plane's dispatch packs them online: the
-/// open packs the post-rm census judges (leak67). A derived budget on a big
-/// host (kamrui, 61 GiB) gave a ring the storm never filled; nothing packed,
-/// and the row passed without judging a pack. The VM's free-space share gave
-/// 204–234 MiB, so its storm reached high water only sometimes. 1 GiB caps
-/// the ring at 128 MiB on every venue.
+/// The write-cache row's daemon budget, pinned. The write cache's bound is
+/// `SQUEEZEFS_WRITE_CACHE_PCT` of `budget ÷ 0.7` (`cache.derivedBound`:
+/// 25 % of 1.43 GiB = 365 MiB here), and the storm beside the small files
+/// must overflow it, so the LRU drain packs the small files (the oldest)
+/// online: the open packs the post-rm census judges (leak67). A derived
+/// budget on a big host (kamrui, 61 GiB) gave a ring the storm never
+/// filled; nothing packed, and the row passed without judging a pack. Under
+/// the gate's shared cage this budget also reads Red (the cage's
+/// unreclaimable over the daemon census): the shed is one drain pass to the
+/// budget's target, the small files still leave through the pack dispatch.
 const cache_row_budget_mib: u64 = 1024;
+/// The bound the pinned budget derives (`cache.derivedBound(25, …)`), MiB.
+const cache_row_ring_mib: u64 = cache_row_budget_mib * 10 / 7 * 25 / 100;
 comptime {
-    if (cache_row_budget_mib / 8 + small_files_staged * small_len / (1 << 20) >= storm_files * storm_mib) @compileError("the storm no longer overflows the cache-path row's staging ring");
+    if (cache_row_ring_mib >= storm_files * storm_mib + small_files_staged * small_len / (1 << 20)) @compileError("the storm no longer overflows the write-cache row's ring");
 }
 /// 4 KiB overwrites against the mirrored image: page-aligned (the W1
 /// patch class on a striped file) and at arbitrary byte offsets (the
@@ -7969,18 +7979,29 @@ test "smoke: THE KILL MATRIX — kill -9 at 50/100/150 MiB of a 200 MiB dd and m
 /// 4 MiB (one block) staged by fsync'd writes, then ONE write past the
 /// block — the promotion to its own block, whose commit the seam kills
 /// after (the ring record stays, the striped layout no longer names it).
-const residue_stage_script = "dd if=\"$1/image\" of=$2 bs=1M count=4 conv=fsync status=none && echo staged-ok";
+const residue_stage_script = "dd if=\"$1/image\" of=$2 bs=1M count=4 status=none && echo staged-ok";
 const residue_promote_script = "dd if=\"$1/image\" of=$2 bs=1M skip=4 seek=4 count=1 conv=notrunc status=none; echo promote-returned";
 
-/// Mount with the kill seam, stage `name` and kill the daemon inside its
-/// promotion: the ring keeps the 4 MiB record, the layout is striped.
+/// Mount with the kill seam (`--daemon --supervise`: the write cache is a
+/// memfd the SUPERVISOR holds across the daemon's death and hands to the
+/// member's next mount — a foreground mount's ring dies with it, charter
+/// §6.1 "a mount without a supervisor has a power cut's exposure"), stage
+/// `name` (no fsync: an fsync IS a promotion under the write cache's law —
+/// the record must still be resident for the extending write to promote
+/// it) and kill the daemon inside its promotion: the ring keeps the 4 MiB
+/// record, the layout is striped.
 fn killInsidePromotion(rig: *Rig, name: []const u8) !void {
     const gpa = rig.gpa;
     try rig.env.put("SQUEEZEFS_TEST_PROMOTE_KILL_AFTER_COMMIT", "1");
     defer rig.env.put("SQUEEZEFS_TEST_PROMOTE_KILL_AFTER_COMMIT", "0") catch {};
     const mark = try rig.logLen();
-    try rig.spawnMount(&.{});
-    _ = try rig.awaitReady(mark);
+    {
+        const r = try rig.squeezefs(&.{ "mount", "--daemon", "--supervise", "--log-file", rig.log_path, rig.meta_uri, rig.mp });
+        defer rig.freeRun(r);
+        if (!r.term.success()) std.debug.print("\ndaemon mount: {s}\n", .{r.stderr});
+        try testing.expect(r.term.success());
+    }
+    const ready = try rig.awaitReady(mark);
     {
         const out = try rig.onMountArgv(residue_stage_script, &.{ "sh", "-e", "-c", residue_stage_script, "smoke", rig.work, name });
         defer gpa.free(out);
@@ -7991,7 +8012,9 @@ fn killInsidePromotion(rig: *Rig, name: []const u8) !void {
         const r = try std.process.run(gpa, rig.io, .{ .argv = &.{ "sh", "-c", residue_promote_script, "smoke", rig.work, name }, .cwd = .{ .path = rig.mp }, .environ_map = &rig.env });
         defer rig.freeRun(r);
     }
-    try testing.expectEqual(std.process.Child.Term{ .signal = .KILL }, try rig.waitChild());
+    // The seam's SIGKILL: the supervisor reaps the daemon, replays the
+    // tails and holds the ring (its record unreleased) for the successor.
+    _ = try rig.awaitLog("exited (wait status 0x9); done", ready, 30 * std.time.ns_per_s);
     {
         const text = try rig.readLog();
         defer gpa.free(text);
@@ -8016,7 +8039,7 @@ fn dismountLineOf(seg: []const u8) !DismountLine {
     };
 }
 
-test "smoke: KILL -9 BETWEEN A PROMOTION'S COMMIT AND ITS RING RELEASE (the kill matrix's two-ring [C4]) — a 4 MiB staged file promoted to its own block, the daemon killed after the layout committed: (a) remount without fsck → rm → clean unmount destroys the corpse's record (0 FAILED) → fsck clean; (b) fsck's own dismount destroys the record its live file's layout no longer names → the remount recovers 0 → the file byte-exact → rm → fsck clean" {
+test "smoke: KILL -9 BETWEEN A PROMOTION'S COMMIT AND ITS RING RELEASE (the kill matrix's two-ring [C4]) — a 4 MiB staged file promoted to its own block, the daemon killed after the layout committed: (a) remount without fsck → rm → clean unmount destroys the corpse's record (0 FAILED) → fsck clean; (b) fsck --offline judges the device alone (the ring is the supervisor's custody) → the remount adopts the record its live file's layout no longer names → the file byte-exact → the clean unmount destroys it UNNAMED → the next mount recovers 0 → rm → fsck clean" {
     const io = testing.io;
     if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
     const gpa = testing.allocator;
@@ -8061,8 +8084,13 @@ test "smoke: KILL -9 BETWEEN A PROMOTION'S COMMIT AND ITS RING RELEASE (the kill
     }
     _ = try fsckClean(rig, "the clean unmount after the corpse's rm");
 
-    // (b) The unnamed arm: fsck's guarded open adopts the record and its
-    //     close destroys it — the file lives, its layout is striped.
+    // (b) The unnamed arm: `fsck --offline` judges the device alone — it
+    //     presents no member (no mount point, no write cache), so the ring
+    //     stays the supervisor's custody, unseen — and the striped layout
+    //     names the block: clean, nothing recovered. The remount adopts the
+    //     record its live file's layout no longer names; the file is the
+    //     layout's bytes; the clean unmount's pass destroys the record as
+    //     UNNAMED; the next mount recovers 0.
     try killInsidePromotion(rig, "b");
     {
         rig.freeRunOk(try rig.sh(rig.work, "cp --sparse=always vol.img vol.prefsck.img"));
@@ -8073,23 +8101,43 @@ test "smoke: KILL -9 BETWEEN A PROMOTION'S COMMIT AND ITS RING RELEASE (the kill
             rig.keepRefusedImage();
             return error.FsckNotClean;
         }
-        try testing.expectEqual(@as(u64, 1), numberAfter(r.stderr, "recovered ") orelse 0);
-        const d = try dismountLineOf(r.stderr);
-        std.debug.print("smoke[residue]: (b) fsck's dismount pass: {d} promoted, {d} FAILED, {d} corpse record(s), {d} unnamed record(s)\n", .{ d.promoted, d.failed, d.corpses, d.unnamed });
-        try testing.expectEqual(DismountLine{ .promoted = 0, .failed = 0, .corpses = 0, .unnamed = 1 }, d);
+        try testing.expect(std.mem.indexOf(u8, r.stderr, "recovered ") == null);
+        try testing.expect(std.mem.indexOf(u8, r.stderr, "dismount promotion: ") == null);
+        std.debug.print("smoke[residue]: (b) fsck --offline after the kill: clean; the ring untouched (the supervisor's custody)\n", .{});
     }
     mark = try rig.logLen();
-    _ = try remountAfterKill(rig, .{ .replayed = 0, .torn = 0, .ring_records = 0, .ring_torn = 0 });
+    // The fsck's guarded open replayed and checkpointed: this open is clean
+    // by design (the explicit form); the ring record is read here.
+    _ = try remountAfterKill(rig, .{ .replayed = 0, .torn = 0, .ring_records = 1, .ring_torn = 0 });
     {
         const text = try rig.readLog();
         defer gpa.free(text);
-        try testing.expectEqual(@as(u64, 0), numberAfter(text[mark..], "recovered ") orelse 1);
+        try testing.expectEqual(@as(u64, 1), numberAfter(text[mark..], "recovered ") orelse 0);
         var dir = try Io.Dir.cwd().openDir(io, rig.mp, .{});
         defer dir.close(io);
         // The promotion's own block IS the file: the 4 MiB image, no hole.
         const c = try pageCensus(gpa, io, dir, "b", image, 0, 5 << 20);
         try testing.expectEqual(@as(u64, 4 << 20), c.size);
         try testing.expectEqual(@as(u64, 0), c.holes);
+    }
+    mark = try rig.logLen();
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+    {
+        const text = try rig.readLog();
+        defer gpa.free(text);
+        const d = try dismountLineOf(text[mark..]);
+        std.debug.print("smoke[residue]: (b) the clean unmount: {d} promoted, {d} FAILED, {d} corpse record(s), {d} unnamed record(s)\n", .{ d.promoted, d.failed, d.corpses, d.unnamed });
+        try testing.expectEqual(DismountLine{ .promoted = 0, .failed = 0, .corpses = 0, .unnamed = 1 }, d);
+    }
+    _ = try fsckClean(rig, "the clean unmount after the unnamed record");
+    mark = try rig.logLen();
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(mark);
+    {
+        const text = try rig.readLog();
+        defer gpa.free(text);
+        try testing.expectEqual(@as(u64, 0), numberAfter(text[mark..], "recovered ") orelse 1);
     }
     {
         const out = try rig.onMount("rm b && echo ok");
@@ -8104,7 +8152,7 @@ test "smoke: KILL -9 BETWEEN A PROMOTION'S COMMIT AND ITS RING RELEASE (the kill
         defer gpa.free(text);
         try testing.expectEqual(DismountLine{ .promoted = 0, .failed = 0, .corpses = 0, .unnamed = 0 }, try dismountLineOf(text[mark..]));
     }
-    _ = try fsckClean(rig, "the clean unmount after the unnamed record's fsck");
+    _ = try fsckClean(rig, "the clean unmount after the unnamed record's rm");
 }
 
 // ---- fsck / scrub: OUR oracle over a real set (rung 8) ----

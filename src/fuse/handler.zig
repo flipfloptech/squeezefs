@@ -125,7 +125,7 @@ pub const ring = struct {
         fn fsInit(ctx: *anyopaque, caps: fsv.InitCaps) void {
             // A filesystem that refuses INIT refuses the mount: the session
             // fails loud before it is ready (charter §1.8).
-            of(ctx).d.initFilesystem(caps.negotiated, caps.minor) catch |e| {
+            of(ctx).d.initFilesystem(caps.negotiated, caps.minor, caps.zc_open, caps.zc_create_only) catch |e| {
                 std.debug.panic("filesystem init refused after INIT negotiated: {t}", .{e});
             };
         }

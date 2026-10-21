@@ -1,8 +1,8 @@
-//! The four PROBE ladders and the buffer-mode lattice decision (charter §3
+//! The PROBE ladders and the buffer-mode lattice decision (charter §3
 //! "Capability discipline: every kernel feature is PROBE-detected at
 //! runtime … never by kernel version. Post-probe refusals fail the mount
 //! loud; the probe is the only degrade point"; `docs/porting/
-//! fuse_kmbuf_zc.md` §2, §6).
+//! fuse_mainline_pools.md` §2, `fuse_kmbuf_zc.md` §2, §6).
 //!
 //! Each ladder is a PURE state machine over injected syscall results —
 //! unit-tested with every verdict on every host — plus a Linux driver that
@@ -13,6 +13,20 @@
 //! the session turns into a loud mount failure naming the probe. Never a
 //! downgrade (decision 0002 ledger: the reference's doc comment promised one
 //! its code did not do).
+//!
+//! Three strata since 2026-10-21 (charter §4 amended): the MAINLINE stratum
+//! (Linux ≥ 7.3: the INIT offer carries `FUSE_HAS_IO_URING_BUFPOOL` — the
+//! bit IS the probe, like TIME_LIMITS; the daemon writes `fuse.enable_uring=Y`
+//! BEFORE `mount(2)` so the offer is complete on the first mount after boot
+//! too), the LEGACY stratum (the 7.2-sqz kmbuf series: the opcode ladder
+//! reads present) and the STOCK stratum (neither). The opcode COLLISION
+//! (legacy `RELEASE_PAYLOAD`/`FEATURES` = 3/4 = mainline `ADD_QUEUE`/
+//! `ADD_BUFPOOL`) is resolved HERE: the legacy command probes
+//! (`legacyProbesApply`) run only on a legacy rung, so no mainline kernel
+//! ever sees opcode 3 with the legacy meaning (it would create queue 0
+//! without the zero-copy flag), and no legacy kernel ever sees opcode 3 with
+//! the mainline meaning. A kernel offering bit 43 resolves mainline whatever
+//! the ladder says (the two UAPIs cannot coexist in one `dev_uring.c`).
 //!
 //! What differs from the reference (0002 ledger rows): the zc capability
 //! is `CapEff` bit 21 from `/proc/self/status`, not `euid == 0` (a root
@@ -68,12 +82,16 @@ pub const ladder = [_]abi.KmbufRegisterOpcodes{ abi.KMBUF_OPCODES_7_1, abi.KMBUF
 // Gauges: the published verdicts (0 = absent / not probed).
 // ---------------------------------------------------------------------------
 
-/// `transport_buffer_mode`: 0 UserEnts, 1 BufRing, 2 ZeroCopy.
+/// `transport_buffer_mode`: 0 UserEnts, 1 BufRing, 2 ZeroCopy, 3 MainlinePool.
 pub var mode_gauge: counters.Gauge = .{};
 /// `transport_probe_kmbuf`: the confirmed REGISTER opcode (38 or 37), 0 absent.
 pub var kmbuf_gauge: counters.Gauge = .{};
-/// `transport_probe_zc`: 1 when the zc surface is present (kmbuf ∧ cap ∧ sparse).
+/// `transport_probe_zc`: 1 when the zc surface is present (legacy: kmbuf ∧
+/// cap ∧ sparse; mainline: bufpool ∧ cap ∧ sparse — the pool queues are
+/// created zero-copy).
 pub var zc_gauge: counters.Gauge = .{};
+/// `transport_probe_bufpool`: 1 when INIT offered `FUSE_HAS_IO_URING_BUFPOOL`.
+pub var bufpool_gauge: counters.Gauge = .{};
 /// `transport_probe_retention`: 1 when RELEASE_PAYLOAD answered the probe shape.
 pub var retention_gauge: counters.Gauge = .{};
 /// `transport_probe_time_limits`: 1 when the kernel offered bit 62.
@@ -202,15 +220,31 @@ pub fn ringsPerQueueVerdict(mask: u32) Verdict {
 // 3. The zero-copy surface (porting spec §2.2, fixed per the quirk ledger)
 // ---------------------------------------------------------------------------
 
-/// The zc surface is a conjunction: the kmbuf ring (zc never rides without
-/// BUF_RING) ∧ the kernel's gate (`capable(CAP_SYS_ADMIN)` — read from
-/// CapEff, never `euid`) ∧ a sparse fixed-buffer table registers (5.19+:
-/// the per-ent slot shape the kernel fills at delivery).
-pub fn zcVerdict(kmbuf: KmbufVerdict, cap_sys_admin: bool, sparse_ok: bool) Verdict {
-    if (kmbuf == .absent) return .absent;
+/// The zc surface is a conjunction: a payload carrier the kernel zero-copies
+/// beside (the legacy kmbuf ring — zc never rides without BUF_RING — or the
+/// mainline buffer pool) ∧ the kernel's gate (`capable(CAP_SYS_ADMIN)` —
+/// read from CapEff, never `euid`) ∧ a sparse fixed-buffer table registers
+/// (5.19+: the per-ent slot shape the kernel fills at delivery).
+pub fn zcVerdict(kmbuf: KmbufVerdict, bufpool: Verdict, cap_sys_admin: bool, sparse_ok: bool) Verdict {
+    if (kmbuf == .absent and bufpool == .absent) return .absent;
     if (!cap_sys_admin) return .absent;
     if (!sparse_ok) return .absent;
     return .present;
+}
+
+// ---------------------------------------------------------------------------
+// 3b. The mainline buffer-pool stratum — the INIT bit IS the probe
+// ---------------------------------------------------------------------------
+
+/// `FUSE_HAS_IO_URING_BUFPOOL` (bit 43) in the INIT offer: the kernel speaks
+/// the mainline pool UAPI. The kernel sets it beside FUSE_OVER_IO_URING iff
+/// `fuse.enable_uring` read Y when it SENT the INIT; the session writes Y
+/// before `mount(2)`, so the offer is complete on every mount (the first
+/// after boot included). No command probe exists that is side-effect free on
+/// both strata: opcode 3 is ADD_QUEUE there (it would create queue 0) and
+/// RELEASE_PAYLOAD on the legacy kernel.
+pub fn bufpoolVerdict(offered_flags: u64) Verdict {
+    return if (offered_flags & abi.FUSE_HAS_IO_URING_BUFPOOL != 0) .present else .absent;
 }
 
 /// Will the connection HAVE its ring when the INIT reply lands — the zc
@@ -258,7 +292,7 @@ pub fn timeLimitsVerdict(offered_flags: u64) Verdict {
 // The lattice decision (porting spec §6, as a pure table)
 // ---------------------------------------------------------------------------
 
-pub const Lever = enum { auto, user, bufring, zc };
+pub const Lever = enum { auto, user, bufring, zc, pool };
 
 pub fn leverFromKnob(s: []const u8) Lever {
     return std.meta.stringToEnum(Lever, s) orelse .auto;
@@ -266,6 +300,9 @@ pub fn leverFromKnob(s: []const u8) Lever {
 
 pub const Verdicts = struct {
     kmbuf: KmbufVerdict,
+    /// The mainline pool UAPI (INIT bit 43).
+    bufpool: Verdict = .absent,
+    /// The zero-copy surface over whichever carrier is present.
     zc: Verdict,
 };
 
@@ -274,24 +311,45 @@ pub const ResolveError = error{
     KmbufAbsent,
     /// `zc` asked while the zc surface read absent (no cap, or no sparse table).
     ZeroCopyAbsent,
+    /// `pool` asked while INIT did not offer `FUSE_HAS_IO_URING_BUFPOOL`.
+    BufpoolAbsent,
 };
 
-/// `auto` ⇒ the highest confirmed rung; an explicit rung is taken only when
-/// its probes confirm it, else the typed refusal (the caller fails the
-/// mount naming it). `user` is always available.
+/// `auto` ⇒ the highest confirmed rung — the mainline pool wherever the
+/// kernel offers it (the primary contract), else the legacy kmbuf rungs,
+/// else UserEnts; an explicit rung is taken only when its probes confirm
+/// it, else the typed refusal (the caller fails the mount naming it).
+/// `user` is always available. The mainline rung's zero-copy arm is not a
+/// rung of its own: `zc` on `Verdicts` says whether its queues are created
+/// zero-copy (`poolZeroCopy`).
 pub fn resolveBufferMode(v: Verdicts, lever: Lever) ResolveError!geometry.BufferMode {
     switch (lever) {
         .user => return .user_ents,
-        .bufring => return if (v.kmbuf == .present) .buf_ring else error.KmbufAbsent,
+        .bufring => return if (v.kmbuf == .present and v.bufpool == .absent) .buf_ring else error.KmbufAbsent,
         .zc => {
-            if (v.kmbuf == .absent) return error.KmbufAbsent;
+            if (v.kmbuf == .absent or v.bufpool == .present) return error.KmbufAbsent;
             return if (v.zc == .present) .zero_copy else error.ZeroCopyAbsent;
         },
+        .pool => return if (v.bufpool == .present) .mainline_pool else error.BufpoolAbsent,
         .auto => {
+            if (v.bufpool == .present) return .mainline_pool;
             if (v.kmbuf == .absent) return .user_ents;
             return if (v.zc == .present) .zero_copy else .buf_ring;
         },
     }
+}
+
+/// Whether a MainlinePool session creates its queues zero-copy: the zc
+/// surface (CapEff bit 21 ∧ the sparse table) under the mode.
+pub fn poolZeroCopy(mode: geometry.BufferMode, v: Verdicts) bool {
+    return mode == .mainline_pool and v.zc == .present;
+}
+
+/// Whether the session's slots take the app's pages (a zero-copy session
+/// of either stratum): the legacy ZeroCopy rung, or MainlinePool with its
+/// queues created zero-copy.
+pub fn zeroCopyArmed(mode: geometry.BufferMode, v: Verdicts) bool {
+    return mode == .zero_copy or poolZeroCopy(mode, v);
 }
 
 pub fn modeGauge(m: geometry.BufferMode) u64 {
@@ -299,16 +357,26 @@ pub fn modeGauge(m: geometry.BufferMode) u64 {
         .user_ents => 0,
         .buf_ring => 1,
         .zero_copy => 2,
+        .mainline_pool => 3,
     };
 }
 
+/// The legacy kmbuf rungs (the 7.2-sqz series' UAPI).
 pub fn usesKmbuf(m: geometry.BufferMode) bool {
-    return m != .user_ents;
+    return m == .buf_ring or m == .zero_copy;
+}
+
+/// The legacy COMMAND probes (`RELEASE_PAYLOAD` = 3 for retention,
+/// `FEATURES` = 4 for rings per queue) may be sent only on a legacy rung:
+/// their opcodes are mainline's `ADD_QUEUE`/`ADD_BUFPOOL`.
+pub fn legacyProbesApply(m: geometry.BufferMode) bool {
+    return usesKmbuf(m);
 }
 
 /// Publish every verdict (after the mode is decided).
 pub fn publish(v: Verdicts, retention: Verdict, rings_per_queue: Verdict, time_limits: Verdict, cap: bool, mode: geometry.BufferMode) void {
     kmbuf_gauge.set(if (v.kmbuf.opcodes()) |p| p.register else 0);
+    bufpool_gauge.set(v.bufpool.gauge());
     zc_gauge.set(v.zc.gauge());
     retention_gauge.set(retention.gauge());
     rings_per_queue_gauge.set(rings_per_queue.gauge());
@@ -491,12 +559,16 @@ test "the FEATURES verdict table: a non-negative result is the mask (bit 0 ⇒ r
     try testing.expectEqual(@as(u32, 0), featuresMask(null));
 }
 
-test "the zc surface is a conjunction of kmbuf, CapEff bit 21 and the sparse table; CapEff parses from /proc/self/status text" {
+test "the zc surface is a conjunction of a carrier (kmbuf or the mainline pool), CapEff bit 21 and the sparse table; CapEff parses from /proc/self/status text" {
     const present: KmbufVerdict = .{ .present = abi.KMBUF_OPCODES_7_1 };
-    try testing.expectEqual(Verdict.present, zcVerdict(present, true, true));
-    try testing.expectEqual(Verdict.absent, zcVerdict(present, false, true));
-    try testing.expectEqual(Verdict.absent, zcVerdict(present, true, false));
-    try testing.expectEqual(Verdict.absent, zcVerdict(.absent, true, true));
+    try testing.expectEqual(Verdict.present, zcVerdict(present, .absent, true, true));
+    try testing.expectEqual(Verdict.absent, zcVerdict(present, .absent, false, true));
+    try testing.expectEqual(Verdict.absent, zcVerdict(present, .absent, true, false));
+    try testing.expectEqual(Verdict.absent, zcVerdict(.absent, .absent, true, true));
+    // The mainline carrier: the pool stands in for the kmbuf ring.
+    try testing.expectEqual(Verdict.present, zcVerdict(.absent, .present, true, true));
+    try testing.expectEqual(Verdict.absent, zcVerdict(.absent, .present, false, true));
+    try testing.expectEqual(Verdict.absent, zcVerdict(.absent, .present, true, false));
     try testing.expectEqual(@as(?bool, true), capSysAdminFromStatus("Name:\tx\nCapInh:\t0000000000000000\nCapEff:\t00000000a82465fb\nCapBnd:\t0\n"));
     try testing.expectEqual(@as(?bool, false), capSysAdminFromStatus("CapEff:\t00000000a80465fb\n"));
     try testing.expectEqual(@as(?bool, true), capSysAdminFromStatus("CapEff: 0000000000200000"));
@@ -535,10 +607,46 @@ test "the lattice table: auto takes the highest confirmed rung; user always; an 
     try testing.expectError(error.KmbufAbsent, resolveBufferMode(stock, .bufring));
     try testing.expectError(error.KmbufAbsent, resolveBufferMode(stock, .zc));
     try testing.expectError(error.ZeroCopyAbsent, resolveBufferMode(kmbuf_only, .zc));
+    try testing.expectError(error.BufpoolAbsent, resolveBufferMode(full, .pool));
+    try testing.expectError(error.BufpoolAbsent, resolveBufferMode(stock, .pool));
     try testing.expectEqual(Lever.zc, leverFromKnob("zc"));
+    try testing.expectEqual(Lever.pool, leverFromKnob("pool"));
     try testing.expectEqual(Lever.auto, leverFromKnob("auto"));
     try testing.expectEqual(@as(u64, 2), modeGauge(.zero_copy));
-    try testing.expect(usesKmbuf(.buf_ring) and usesKmbuf(.zero_copy) and !usesKmbuf(.user_ents));
+    try testing.expectEqual(@as(u64, 3), modeGauge(.mainline_pool));
+    try testing.expect(usesKmbuf(.buf_ring) and usesKmbuf(.zero_copy) and !usesKmbuf(.user_ents) and !usesKmbuf(.mainline_pool));
+    try testing.expect(zeroCopyArmed(.zero_copy, full) and !zeroCopyArmed(.buf_ring, full) and !zeroCopyArmed(.user_ents, full));
+}
+
+test "the mainline stratum: INIT bit 43 is the bufpool probe; auto takes MainlinePool over every legacy rung; its zero-copy arm follows the zc surface; the legacy command probes (opcodes 3/4, mainline's ADD_QUEUE/ADD_BUFPOOL) apply only to the legacy rungs; an explicit bufring/zc on a mainline kernel is refused naming kmbuf" {
+    try testing.expectEqual(Verdict.present, bufpoolVerdict(abi.FUSE_OVER_IO_URING | abi.FUSE_HAS_IO_URING_BUFPOOL));
+    try testing.expectEqual(Verdict.absent, bufpoolVerdict(abi.FUSE_OVER_IO_URING));
+    try testing.expectEqual(Verdict.absent, bufpoolVerdict(abi.FUSE_HAS_SYNCFS | abi.FUSE_TIME_LIMITS));
+    const mainline_zc: Verdicts = .{ .kmbuf = .absent, .bufpool = .present, .zc = .present };
+    const mainline_copy: Verdicts = .{ .kmbuf = .absent, .bufpool = .present, .zc = .absent };
+    // A kernel offering bit 43 resolves mainline whatever the ladder says.
+    const both: Verdicts = .{ .kmbuf = .{ .present = abi.KMBUF_OPCODES_7_1 }, .bufpool = .present, .zc = .present };
+    try testing.expectEqual(geometry.BufferMode.mainline_pool, try resolveBufferMode(mainline_zc, .auto));
+    try testing.expectEqual(geometry.BufferMode.mainline_pool, try resolveBufferMode(mainline_copy, .auto));
+    try testing.expectEqual(geometry.BufferMode.mainline_pool, try resolveBufferMode(both, .auto));
+    try testing.expectEqual(geometry.BufferMode.mainline_pool, try resolveBufferMode(mainline_copy, .pool));
+    try testing.expectEqual(geometry.BufferMode.user_ents, try resolveBufferMode(mainline_zc, .user));
+    try testing.expectError(error.KmbufAbsent, resolveBufferMode(mainline_zc, .bufring));
+    try testing.expectError(error.KmbufAbsent, resolveBufferMode(mainline_zc, .zc));
+    try testing.expectError(error.KmbufAbsent, resolveBufferMode(both, .zc));
+    try testing.expect(poolZeroCopy(.mainline_pool, mainline_zc));
+    try testing.expect(!poolZeroCopy(.mainline_pool, mainline_copy));
+    try testing.expect(!poolZeroCopy(.zero_copy, mainline_zc));
+    try testing.expect(zeroCopyArmed(.mainline_pool, mainline_zc) and !zeroCopyArmed(.mainline_pool, mainline_copy));
+    try testing.expect(legacyProbesApply(.buf_ring) and legacyProbesApply(.zero_copy));
+    try testing.expect(!legacyProbesApply(.mainline_pool) and !legacyProbesApply(.user_ents));
+    try testing.expectEqual(@as(?u32, 1), geometry.forcedWidth(.mainline_pool, null));
+    publish(mainline_zc, .absent, .absent, .present, true, .mainline_pool);
+    try testing.expectEqual(@as(u64, 3), mode_gauge.load());
+    try testing.expectEqual(@as(u64, 1), bufpool_gauge.load());
+    try testing.expectEqual(@as(u64, 1), zc_gauge.load());
+    try testing.expectEqual(@as(u64, 0), kmbuf_gauge.load());
+    try testing.expectEqual(@as(u64, 0), retention_gauge.load());
 }
 
 test "linux: the ladders live on this kernel — kmbuf present with its pair (logged), the sparse table registers, CapEff reads this process's capability" {

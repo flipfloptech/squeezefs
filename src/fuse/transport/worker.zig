@@ -83,6 +83,7 @@ const pass_stamps = @import("pass_stamps.zig");
 const slot = @import("slot.zig");
 const zc = @import("zc.zig");
 const kmbuf = @import("kmbuf.zig");
+const probes = @import("probes.zig");
 const commit_queue = @import("commit_queue.zig");
 const fsv = @import("filesystem_vtable.zig");
 const counters = @import("../../core/counters.zig");
@@ -320,6 +321,34 @@ pub var kmbuf_attached_deliveries: counters.ShardedCounter = .{};
 /// `transport_kmbuf_attachment_breach` (must-stay-0): a CQE bid at or past
 /// the ring — a protocol breach; the session shuts down.
 pub var kmbuf_attachment_breach: counters.Tripwire = .init("transport_kmbuf_attachment_breach");
+
+// ---- the mainline pool family (`transport_pool_*`) ----
+
+/// `transport_pool_deliveries`: MainlinePool deliveries that named a pool
+/// buffer (the header's `offset` with a payload or a reply window).
+pub var pool_deliveries: counters.ShardedCounter = .{};
+/// `transport_pool_zc_deliveries`: deliveries flagged `FUSE_URING_ENT_ZERO_COPY`
+/// — the app's pages in the entry's slot (a zc file's READ or WRITE).
+pub var pool_zc_deliveries: counters.ShardedCounter = .{};
+/// `transport_pool_offset_breach` (must-stay-0): a delivery's pool offset
+/// past the queue's region — a protocol breach; the session shuts down.
+pub var pool_offset_breach: counters.Tripwire = .init("transport_pool_offset_breach");
+/// `transport_pool_offset_off_boundary` (must-stay-0): a pool offset that is
+/// not a `payload_sz` multiple — the kernel split the pool by a
+/// `max_payload_sz` the geometry mirror did not predict (counted; the
+/// bytes are still the kernel's).
+pub var pool_offset_off_boundary: counters.Tripwire = .init("transport_pool_offset_off_boundary");
+/// `transport_pool_setup_late_cqes` (must-stay-0): an ADD_QUEUE/ADD_BUFPOOL
+/// completion reaching the pass (the kernel answers them inline in
+/// `initRing`'s enter).
+pub var pool_setup_late_cqes: counters.Tripwire = .init("transport_pool_setup_late_cqes");
+/// `transport_pool_queues_added`: queues created by ADD_QUEUE + ADD_BUFPOOL
+/// (= `transport_queues` on an armed MainlinePool session).
+pub var pool_queues_added: counters.ShardedCounter = .{};
+/// `transport_pool_zc_unarmed` (must-stay-0): a delivery flagged zero-copy
+/// on a session whose queues were created copying — the request is
+/// answered EIO (its pages sit in a slot this session never registered).
+pub var pool_zc_unarmed: counters.Tripwire = .init("transport_pool_zc_unarmed");
 /// `transport_zc_replies`: paged replies whose body rode the slot
 /// (prefilled, direct leg or bridged) — the kernel's folio copy skipped.
 pub var zc_replies: counters.ShardedCounter = .{};
@@ -436,7 +465,10 @@ fn noteCommitBatch(n: u32) void {
 // user_data tags
 // ---------------------------------------------------------------------------
 
-pub const OpKind = enum(u8) { register = 1, commit = 2, bridge = 3, cancel = 4, release = 5 };
+/// `setup`: a MainlinePool queue's ADD_QUEUE / ADD_BUFPOOL, reaped
+/// synchronously in `initRing` (the kernel answers inline); one reaching
+/// the pass is counted and dropped.
+pub const OpKind = enum(u8) { register = 1, commit = 2, bridge = 3, cancel = 4, release = 5, setup = 6 };
 
 pub fn tagOf(kind: OpKind, gent: u32) u64 {
     return (uring128.Tag{ .kind = @backingInt(kind), .a = @intCast(gent), .b = 0, .c = 0 }).pack();
@@ -464,7 +496,7 @@ fn cmdBytes(commit_id: u64, qid: u16, union_flags: u16, queue_depth: u16) [uring
 
 /// A REGISTER for a UserEnts ent: `addr` = the 2-iovec array, `len` = 2,
 /// `buf_index` 0, the command `{flags 0, commit_id 0, qid}`.
-pub fn prepRegister(sqe: *uring128.Sqe128, qid: u16, iovs: *const [2]std.posix.iovec, gent: u32) void {
+pub fn prepRegister(sqe: *uring128.Sqe128, qid: u16, iovs: *const [2]RegIov, gent: u32) void {
     const cmd = cmdBytes(0, qid, 0, 0);
     uring128.prepUringCmd(sqe, .{ .fixed = 0 }, abi.FUSE_IO_URING_CMD_REGISTER, &cmd);
     sqe.addr = @intFromPtr(iovs);
@@ -497,6 +529,85 @@ pub fn prepRelease(sqe: *uring128.Sqe128, qid: u16, commit_id: u64, gent: u32) v
     const cmd = cmdBytes(commit_id, qid, 0, 0);
     uring128.prepUringCmd(sqe, .{ .fixed = 0 }, abi.FUSE_IO_URING_CMD_RELEASE_PAYLOAD, &cmd);
     sqe.user_data = tagOf(.release, gent);
+}
+
+// ---- the mainline buffer-pool UAPI (uapi 7.46; fuse_mainline_pools.md §1) ----
+
+fn mainlineCmdBytes(req: abi.fuse_uring_cmd_req_mainline) [uring128.cmd_len]u8 {
+    var cmd: [uring128.cmd_len]u8 = @splat(0);
+    cmd[0..@sizeOf(abi.fuse_uring_cmd_req_mainline)].* = abi.encode(req);
+    return cmd;
+}
+
+/// A REGISTER's iovec pair on the mainline rung: `iov[0]` the 288 B header,
+/// `iov[1]` `{NULL, 0}` — the kernel refuses any payload iovec on a pool
+/// queue (`payload->iov_base || payload->iov_len` ⇒ EINVAL). The same bytes
+/// as `std.posix.iovec` with a nullable base.
+pub const RegIov = extern struct { base: ?[*]u8, len: usize };
+
+comptime {
+    assert(@sizeOf(RegIov) == @sizeOf(std.posix.iovec) and @sizeOf([2]RegIov) == 32);
+}
+
+/// Every command on a REGISTERED pool queue imports through the pool:
+/// `IORING_URING_CMD_FIXED` in `uring_cmd_flags` + `buf_index = POOL_INDEX`
+/// (the index ADD_BUFPOOL recorded; a mismatch is the kernel's EINVAL).
+fn markPoolFixed(sqe: *uring128.Sqe128) void {
+    sqe.rw_flags = abi.IORING_URING_CMD_FIXED;
+    sqe.buf_index = Pool.POOL_INDEX;
+}
+
+/// ADD_QUEUE (opcode 3): create `qid`, zero-copy iff `zero_copy` (CAP_SYS_ADMIN).
+pub fn prepAddQueue(sqe: *uring128.Sqe128, qid: u16, zero_copy: bool) void {
+    const cmd = mainlineCmdBytes(abi.fuse_uring_cmd_req_mainline.addQueue(qid, zero_copy));
+    uring128.prepUringCmd(sqe, .{ .fixed = 0 }, abi.FUSE_IO_URING_CMD_ADD_QUEUE, &cmd);
+    sqe.user_data = tagOf(.setup, 0);
+}
+
+/// ADD_BUFPOOL (opcode 4): hand `qid` its pool region, REGISTERED (the
+/// FIXED flag + the pool's index on this ring).
+pub fn prepAddBufpool(sqe: *uring128.Sqe128, qid: u16, region: []const u8) void {
+    const cmd = mainlineCmdBytes(abi.fuse_uring_cmd_req_mainline.addBufpool(qid, @intFromPtr(region.ptr), @intCast(region.len)));
+    uring128.prepUringCmd(sqe, .{ .fixed = 0 }, abi.FUSE_IO_URING_CMD_ADD_BUFPOOL, &cmd);
+    markPoolFixed(sqe);
+    sqe.user_data = tagOf(.setup, 1);
+}
+
+/// A REGISTER on the mainline rung: the header iovec pair, the FIXED pool
+/// index, `ent_zero_copy_buf_index` = the entry's zc slot (0 on a queue
+/// created without zero-copy — the kernel refuses a non-zero index there).
+pub fn prepRegisterMainline(sqe: *uring128.Sqe128, qid: u16, iovs: *const [2]RegIov, zc_slot: u16, gent: u32) void {
+    const cmd = mainlineCmdBytes(abi.fuse_uring_cmd_req_mainline.register(qid, zc_slot));
+    uring128.prepUringCmd(sqe, .{ .fixed = 0 }, abi.FUSE_IO_URING_CMD_REGISTER, &cmd);
+    sqe.addr = @intFromPtr(iovs);
+    sqe.len = abi.REGISTER_IOVEC_COUNT;
+    markPoolFixed(sqe);
+    sqe.user_data = tagOf(.register, gent);
+}
+
+/// COMMIT_AND_FETCH on the mainline rung: the FIXED pool index on every
+/// commit (the kernel imports the reply payload through it).
+pub fn prepCommitMainline(sqe: *uring128.Sqe128, qid: u16, commit_id: u64, gent: u32) void {
+    const cmd = mainlineCmdBytes(abi.fuse_uring_cmd_req_mainline.commit(qid, commit_id));
+    uring128.prepUringCmd(sqe, .{ .fixed = 0 }, abi.FUSE_IO_URING_CMD_COMMIT_AND_FETCH, &cmd);
+    markPoolFixed(sqe);
+    sqe.user_data = tagOf(.commit, gent);
+}
+
+/// The zero-copy slot of ring-local entry `ent_idx` in this ring's
+/// fixed-buffer table: the entry itself on the legacy rung (the headers sit
+/// at `depth`), `1 + ent_idx` on the mainline rung (the pool sits at 0).
+pub fn zcSlotOf(mode: geometry.BufferMode, ent_idx: u16) u16 {
+    return switch (mode) {
+        .mainline_pool => Pool.POOL_INDEX + 1 + ent_idx,
+        .zero_copy, .buf_ring, .user_ents => ent_idx,
+    };
+}
+
+/// The sparse fixed-buffer table a mainline ring registers: the pool slot
+/// plus one zc slot per entry on a zero-copy queue.
+pub fn mainlineTableSlots(zero_copy: bool, depth: u32) u32 {
+    return 1 + (if (zero_copy) depth else 0);
 }
 
 /// The fd→slot bridge (`READ_FIXED(fd @ off → slot ent_idx @ slot_off)`;
@@ -680,6 +791,82 @@ pub const Slab = struct {
     }
 };
 
+/// The MainlinePool payload pool (charter §4 amended 2026-10-21;
+/// `docs/porting/fuse_mainline_pools.md` §3): ONE anonymous mapping for
+/// every queue, `depth × payload_sz` per queue at `qid × queue_span`,
+/// page-aligned, THP-hinted. A queue's span is handed to the kernel ONCE
+/// (`ADD_BUFPOOL` by the queue's first ring; the kernel splits it into
+/// `len / max_payload_sz` buffers — `payload_sz` is that mirror, so a
+/// buffer is `payload_sz` at `k × payload_sz`) and registered as fixed
+/// buffer `POOL_INDEX` on EVERY ring of the queue, so a request's `offset`
+/// (the header word the kernel writes per delivery) names the same bytes
+/// whichever ring delivers it and every REGISTER/COMMIT carries the one
+/// index the kernel recorded. `depth` buffers per queue = one per entry
+/// across the queue's rings, so the kernel never parks a fetch for want of
+/// a buffer. Session-owned: it outlives every group (a handler may read a
+/// request's payload after its worker exited — the kmbuf region's law).
+/// Pinned once by the registration (the kernel GUPs it), never per request:
+/// the memory the arena gauge accounts on this rung.
+pub const Pool = struct {
+    span: []align(ARENA_ALIGN) u8,
+    nqueues: u32,
+    depth: u32,
+    buf_size: u32,
+
+    /// The pool's fixed-buffer index on every ring of its queue; the zc
+    /// slots follow at `1 + ent`.
+    pub const POOL_INDEX: u16 = 0;
+
+    pub fn init(nqueues: u32, depth: u32, payload_sz: u32) error{PoolMapFailed}!Pool {
+        const qspan: usize = @as(usize, payload_sz) * depth;
+        const span: usize = qspan * nqueues;
+        // Born zeroed, page-aligned (payload_sz is a page multiple by the
+        // plan: `payloadFor` rounds through `pages_for × page`).
+        const rc = linux.mmap(null, span, .{ .READ = true, .WRITE = true }, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0);
+        if (linux.errno(rc) != .SUCCESS) {
+            log.err("transport: mmap of the {d}-byte mainline payload pool failed ({t})", .{ span, linux.errno(rc) });
+            return error.PoolMapFailed;
+        }
+        const base: [*]align(ARENA_ALIGN) u8 = @ptrFromInt(rc);
+        _ = linux.madvise(base, span, linux.MADV.HUGEPAGE);
+        return .{ .span = base[0..span], .nqueues = nqueues, .depth = depth, .buf_size = payload_sz };
+    }
+
+    pub fn deinit(self: *Pool) void {
+        _ = linux.munmap(self.span.ptr, self.span.len);
+        self.* = undefined;
+    }
+
+    pub fn queueSpan(self: *const Pool) usize {
+        return @as(usize, self.buf_size) * self.depth;
+    }
+
+    /// The queue's region: what ADD_BUFPOOL names and every ring registers.
+    pub fn queueRegion(self: *Pool, qid: u16) []align(ARENA_ALIGN) u8 {
+        const qspan = self.queueSpan();
+        return @alignCast(self.span[@as(usize, qid) * qspan ..][0..qspan]);
+    }
+
+    /// The delivered request's `payload_len`-byte window at `offset` within
+    /// the queue's region, null when it would run past the region (the
+    /// breach the worker shuts down on).
+    pub fn window(self: *Pool, qid: u16, offset: u32, payload_len: usize) ?[]u8 {
+        const region = self.queueRegion(qid);
+        if (@as(usize, offset) + payload_len > region.len) return null;
+        return region[offset..][0..payload_len];
+    }
+
+    /// Whether `offset` sits on a buffer boundary (the kernel's split by
+    /// `max_payload_sz`, which `payload_sz` mirrors).
+    pub fn onBoundary(self: *const Pool, offset: u32) bool {
+        return offset % self.buf_size == 0;
+    }
+
+    pub fn bytes(self: *const Pool) u64 {
+        return self.span.len;
+    }
+};
+
 /// `SQUEEZEFS_TEST_READ_ZERO_FILL`'s arms (the registry row's spellings).
 pub const ReadZeroFill = enum { off, prefilled, bounce };
 
@@ -704,6 +891,16 @@ pub const Shared = struct {
     /// The lattice rung (decided ONCE by the probes) and its resources.
     mode: geometry.BufferMode = .user_ents,
     kmbuf_opcodes: ?abi.KmbufRegisterOpcodes = null,
+    /// The slots take the app's pages: the legacy ZeroCopy rung, or
+    /// MainlinePool whose queues are created zero-copy (`probes.zeroCopyArmed`).
+    zc_armed: bool = false,
+    /// MainlinePool: the session's pool (`Pool`), and per queue whether its
+    /// first ring already issued ADD_QUEUE + ADD_BUFPOOL (the session starts
+    /// the groups in order, so a queue's later rings read it set; a clear
+    /// flag there is a bring-up bug, failed loud rather than met as the
+    /// kernel's EINVAL).
+    pool: ?*Pool = null,
+    pool_added: []std.atomic.Value(bool) = &.{},
     /// Payload retention negotiated (zc ∧ the RELEASE probe present).
     retention: bool = false,
     page: usize = 4096,
@@ -809,12 +1006,20 @@ pub const Shared = struct {
         return self.active.load(.acquire);
     }
 
+    /// The legacy kmbuf rungs (the per-ring buffer ring + fixed headers).
     pub fn usesKmbuf(self: *const Shared) bool {
-        return self.mode != .user_ents;
+        return probes.usesKmbuf(self.mode);
     }
 
+    /// The mainline pool rung (ADD_QUEUE/ADD_BUFPOOL, the pool at
+    /// `Pool.POOL_INDEX`, `IORING_URING_CMD_FIXED` on every command).
+    pub fn mainline(self: *const Shared) bool {
+        return self.mode == .mainline_pool;
+    }
+
+    /// The slots take the app's pages (either stratum).
     pub fn zeroCopy(self: *const Shared) bool {
-        return self.mode == .zero_copy;
+        return self.zc_armed;
     }
 
     pub fn readdirLatch(self: *const Shared) zc.ReaddirLatch {
@@ -935,7 +1140,9 @@ pub const Group = struct {
     /// UserEnts: ONE anonymous mapping for every member's payload buffers.
     arena: []align(ARENA_ALIGN) u8,
     headers: kmbuf.Headers,
-    iovs: [][2]std.posix.iovec,
+    /// Per gent, the REGISTER's iovec pair (UserEnts: header + arena
+    /// buffer; MainlinePool: header + `{NULL, 0}`; unused under kmbuf).
+    iovs: [][2]RegIov,
     cells: commit_queue.Queue,
     /// The group's ring: built ON the worker thread (`SINGLE_ISSUER`).
     ring: uring128.ParkedRing128 = undefined,
@@ -1040,9 +1247,12 @@ pub const Group = struct {
     pub const InitError = std.mem.Allocator.Error || error{ArenaMapFailed};
     /// `KmbufRingEnomem`: the kmbuf ring's region allocation refused after
     /// every retry (`kmbuf.Error`), typed so the daemon's refusal can name
-    /// the levers.
-    pub const StartError = error{ ThreadSpawnFailed, RingSetupFailed, KmbufRingEnomem };
-    const RingError = error{ RingSetupFailed, KmbufRingEnomem };
+    /// the levers. `MainlinePoolRefused`: the kernel refused ADD_QUEUE or
+    /// ADD_BUFPOOL after the bufpool probe read present (the post-probe
+    /// refusal; on a legacy kernel under the test seam, the opcode
+    /// collision's ENOTCONN).
+    pub const StartError = error{ ThreadSpawnFailed, RingSetupFailed, KmbufRingEnomem, MainlinePoolRefused };
+    const RingError = error{ RingSetupFailed, KmbufRingEnomem, MainlinePoolRefused };
 
     /// Allocate the group's tables and buffers (startup; nothing per op).
     pub fn init(gpa: std.mem.Allocator, shared: *Shared, index: u16, qids: []const u16, share: geometry.RingShare, affinity: ?placement.CpuSet) InitError!*Group {
@@ -1050,12 +1260,15 @@ pub const Group = struct {
         const gents: usize = @as(usize, qids.len) * depth;
         const payload_len: usize = shared.plan.payload_sz;
         const stride: usize = @intCast(derive.alignUp(payload_len, ARENA_ALIGN));
-        // Width 1 under kmbuf/zc: the fixed index 0 / bgid 0 serve one queue.
-        assert(!shared.usesKmbuf() or qids.len == 1);
+        // Width 1 under kmbuf/zc and the mainline pool: the fixed index 0 /
+        // bgid 0 / the pool index serve one queue.
+        assert(!shared.mode.ringPerQueue() or qids.len == 1);
         // A second ring on a queue exists only there (the kernel's per-source
-        // buffer ring, patch 0030); UserEnts groups take the whole depth.
-        assert(share.base == 0 or shared.usesKmbuf());
+        // buffer ring, patch 0030; mainline's per-queue pool); UserEnts
+        // groups take the whole depth.
+        assert(share.base == 0 or shared.mode.ringPerQueue());
         assert(share.base + depth <= shared.plan.depth);
+        assert(!shared.mainline() or shared.pool != null);
 
         const self = try gpa.create(Group);
         errdefer gpa.destroy(self);
@@ -1108,9 +1321,9 @@ pub const Group = struct {
         self.members = members;
         self.headers = kmbuf.Headers.init(@intCast(gents), shared.page) catch return error.ArenaMapFailed;
         errdefer self.headers.deinit();
-        self.iovs = try gpa.alloc([2]std.posix.iovec, gents);
+        self.iovs = try gpa.alloc([2]RegIov, gents);
         errdefer gpa.free(self.iovs);
-        if (!shared.usesKmbuf()) {
+        if (shared.mode == .user_ents) {
             // Born zeroed, page-aligned, non-aliasing; THP-hinted.
             const span = stride * gents;
             const rc = linux.mmap(null, span, .{ .READ = true, .WRITE = true }, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0);
@@ -1130,11 +1343,17 @@ pub const Group = struct {
             h.* = abi.zeroed(abi.fuse_uring_req_header);
             // The kernel reads the ent's payload length at REGISTER.
             h.ring_ent_in_out.payload_sz = @intCast(payload_len);
-            if (!shared.usesKmbuf()) {
-                self.iovs[g] = .{
+            switch (shared.mode) {
+                .user_ents => self.iovs[g] = .{
                     .{ .base = @ptrCast(h), .len = @sizeOf(abi.fuse_uring_req_header) },
                     .{ .base = self.arenaPtr(@intCast(g)), .len = payload_len },
-                };
+                },
+                // The pool queue takes no payload iovec: `{NULL, 0}`.
+                .mainline_pool => self.iovs[g] = .{
+                    .{ .base = @ptrCast(h), .len = @sizeOf(abi.fuse_uring_req_header) },
+                    .{ .base = null, .len = 0 },
+                },
+                .buf_ring, .zero_copy => {},
             }
         }
         self.cells = try commit_queue.Queue.init(gpa, gents, self.waker());
@@ -1265,27 +1484,66 @@ pub const Group = struct {
     }
 
     /// The ent's payload window the handler serves into / the worker
-    /// applies a reply into: the arena buffer (UserEnts); the attached kmbuf
-    /// buffer (BufRing, and a zc slot with no paged body); the bounce window
-    /// (a zc slot holding the app's READ destination pages — the body is
-    /// staged here and bridged into the slot). Empty when a kmbuf ent has
-    /// no attachment (a payload-less request: its reply is header-only).
+    /// applies a reply into: the copy window (`copyWindow`), or — on a zc
+    /// slot holding the app's READ destination pages — the bounce window
+    /// (the body is staged here and bridged into the slot). Empty when a
+    /// kmbuf ent has no attachment (a payload-less request: its reply is
+    /// header-only).
     pub fn window(self: *Group, gent: u32) []u8 {
-        switch (self.shared.mode) {
-            .user_ents => return self.arenaPtr(gent)[0..self.payload_len],
-            .buf_ring => return self.attachedWindow(gent),
-            .zero_copy => {
-                const m = self.memberOf(gent);
-                const e = self.entIdxOf(gent);
-                if (m.slots.ent(e).dir == .dest) return self.bounce(gent);
-                return self.attachedWindow(gent);
-            },
+        if (self.shared.zeroCopy()) {
+            const m = self.memberOf(gent);
+            const e = self.entIdxOf(gent);
+            if (m.slots.ent(e).dir == .dest) return self.bounce(gent);
         }
+        return self.copyWindow(gent);
+    }
+
+    /// The window the kernel COPIES through for this ent's current request
+    /// (the in-payload at delivery, the out-struct and a copied body at
+    /// commit): the arena buffer (UserEnts), the attached kmbuf buffer
+    /// (BufRing / ZeroCopy), the pool buffer at the header's `offset`
+    /// (MainlinePool — re-read per delivery: the kernel rewrites the word
+    /// each time, 0 when none was selected, in which case nothing is ever
+    /// written through it).
+    fn copyWindow(self: *Group, gent: u32) []u8 {
+        return switch (self.shared.mode) {
+            .user_ents => self.arenaPtr(gent)[0..self.payload_len],
+            .buf_ring, .zero_copy => self.attachedWindow(gent),
+            .mainline_pool => self.poolWindow(gent),
+        };
     }
 
     fn attachedWindow(self: *Group, gent: u32) []u8 {
         const k = &(self.kmb orelse return &.{});
         return self.attached[gent].window(k.region, k.buf_size, self.payload_len);
+    }
+
+    /// The pool buffer the header's `offset` names (validated at delivery
+    /// by `poolOffsetOk`; a window read before any delivery is offset 0 —
+    /// the queue's first buffer, which nothing writes through before a
+    /// delivery names it).
+    fn poolWindow(self: *Group, gent: u32) []u8 {
+        const p = self.shared.pool orelse return &.{};
+        const off = self.headerOf(gent).ring_ent_in_out.offset;
+        return p.window(self.memberOf(gent).qid, off, self.payload_len) orelse &.{};
+    }
+
+    /// The delivery's pool offset law: within the queue's region (else the
+    /// breach the session fails on), on a buffer boundary (else the mirror
+    /// tripwire — the kernel split the pool by a `max_payload_sz` the plan
+    /// did not predict; the bytes are still the kernel's, so it is counted,
+    /// not fatal).
+    fn poolOffsetOk(self: *Group, gent: u32) bool {
+        const p = self.shared.pool orelse return true;
+        const off = self.headerOf(gent).ring_ent_in_out.offset;
+        if (p.window(self.memberOf(gent).qid, off, self.payload_len) == null) return false;
+        if (!p.onBoundary(off)) pool_offset_off_boundary.fire("pool offset not a payload_sz multiple");
+        return true;
+    }
+
+    /// This ring's fixed-buffer index of the ent's zero-copy slot.
+    fn zcSlot(self: *const Group, ent_idx: u16) u16 {
+        return zcSlotOf(self.shared.mode, ent_idx);
     }
 
     /// The gent's bounce window in the session slab (zc only).
@@ -1432,7 +1690,11 @@ pub const Group = struct {
             else => |failed| {
                 self.thread.?.join();
                 self.thread = null;
-                return if (failed == 3) error.KmbufRingEnomem else error.RingSetupFailed;
+                return switch (failed) {
+                    3 => error.KmbufRingEnomem,
+                    4 => error.MainlinePoolRefused,
+                    else => error.RingSetupFailed,
+                };
             },
         }
     }
@@ -1508,7 +1770,11 @@ pub const Group = struct {
         self.applyAffinity();
         self.initRing() catch |e| {
             _ = self.shared.barrier.complete(.failed);
-            self.started.store(if (e == error.KmbufRingEnomem) 3 else 2, .release);
+            self.started.store(switch (e) {
+                error.KmbufRingEnomem => 3,
+                error.MainlinePoolRefused => 4,
+                error.RingSetupFailed => 2,
+            }, .release);
             futex.wakeAll(&self.started);
             return;
         };
@@ -1889,9 +2155,71 @@ pub const Group = struct {
             k.teardown(&self.ring.ring);
             self.kmb = null;
         };
+        if (self.shared.mainline()) try self.setupMainlinePool();
         if (!self.ring.armWake()) return error.RingSetupFailed;
         const posture = if (self.shared.sqpoll) "sqpoll" else uring128.taskrun_ladder[self.ring_rung].name;
-        log.info("transport: group {d} (qids {d}..{d}, {d} members × depth {d} at slots {d}.., {t}) ring armed on rung {d} ({s}), sq {d}, payload {d} B, arena {d} B, kmbuf {d} B", .{ self.index, self.members[0].qid, self.members[self.members.len - 1].qid, self.members.len, self.depth, self.ring_base, self.shared.mode, self.ring_rung, posture, entries, self.payload_len, self.arena.len, if (self.kmb) |k| k.pinnedBytes() else 0 });
+        log.info("transport: group {d} (qids {d}..{d}, {d} members × depth {d} at slots {d}.., {t}) ring armed on rung {d} ({s}), sq {d}, payload {d} B, arena {d} B, kmbuf {d} B, pool {d} B", .{ self.index, self.members[0].qid, self.members[self.members.len - 1].qid, self.members.len, self.depth, self.ring_base, self.shared.mode, self.ring_rung, posture, entries, self.payload_len, self.arena.len, if (self.kmb) |k| k.pinnedBytes() else 0, if (self.shared.pool) |p| p.queueSpan() else 0 });
+    }
+
+    /// The mainline rung's per-ring setup (fuse_mainline_pools.md §3): the
+    /// fixed-buffer table (the queue's pool region at `POOL_INDEX`, one
+    /// sparse zc slot per entry on a zero-copy queue), then — on the queue's
+    /// FIRST ring only — `ADD_QUEUE` (zero-copy iff armed) and the
+    /// REGISTERED `ADD_BUFPOOL`, both answered inline in one enter and
+    /// checked before any REGISTER; a later ring of the queue finds the
+    /// pool added (the session starts the rings in order). Every refusal
+    /// is post-probe and fails the mount loud, typed `MainlinePoolRefused`
+    /// (a kernel that offered bit 43 and refuses these is a protocol
+    /// breach; the test seam on a legacy kernel meets its RELEASE_PAYLOAD
+    /// here — the opcode collision answered ENOTCONN, never a REGISTER).
+    fn setupMainlinePool(self: *Group) RingError!void {
+        const pool = self.shared.pool.?;
+        const qid = self.members[0].qid;
+        const region = pool.queueRegion(qid);
+        const slots = mainlineTableSlots(self.shared.zeroCopy(), self.depth);
+        self.ring.ring.registerBuffersSparse(slots) catch |e| {
+            log.err("transport: group {d}: the fixed-buffer table ({d} slots) refused ({s}) — the mount fails", .{ self.index, slots, @errorName(e) });
+            return error.RingSetupFailed;
+        };
+        errdefer self.ring.ring.unregisterBuffers() catch {};
+        self.ring.ring.registerBuffersUpdate(Pool.POOL_INDEX, &.{.{ .base = region.ptr, .len = region.len }}) catch |e| {
+            log.err("transport: group {d}: registering queue {d}'s {d}-byte pool at index {d} refused ({s}) — RLIMIT_MEMLOCK without CAP_IPC_LOCK is the usual cause; the mount fails", .{ self.index, qid, region.len, Pool.POOL_INDEX, @errorName(e) });
+            return error.RingSetupFailed;
+        };
+        const added = &self.shared.pool_added[qid];
+        if (self.ring_base != 0) {
+            if (!added.load(.acquire)) {
+                log.err("transport: group {d}: queue {d}'s pool was not added by its first ring before this ring registered — the mount fails", .{ self.index, qid });
+                return error.RingSetupFailed;
+            }
+            return;
+        }
+        const zc_on = self.shared.zeroCopy();
+        const q_sqe = self.ring.getSqe() orelse return error.RingSetupFailed;
+        prepAddQueue(q_sqe, qid, zc_on);
+        const p_sqe = self.ring.getSqe() orelse return error.RingSetupFailed;
+        prepAddBufpool(p_sqe, qid, region);
+        _ = self.ring.ring.submitAndWait(2) catch |e| {
+            log.err("transport: group {d}: submitting ADD_QUEUE/ADD_BUFPOOL for queue {d} failed ({s}) — the mount fails", .{ self.index, qid, @errorName(e) });
+            return error.MainlinePoolRefused;
+        };
+        var cqes: [2]uring128.Cqe32 = undefined;
+        const n = self.ring.ring.copyCqes(&cqes, 2) catch 0;
+        var queue_res: ?i32 = null;
+        var pool_res: ?i32 = null;
+        for (cqes[0..n]) |c| {
+            const t = decodeTag(c.user_data) orelse continue;
+            if (t.kind != .setup) continue;
+            if (t.gent == 0) queue_res = c.res else pool_res = c.res;
+        }
+        const qr = queue_res orelse -@as(i32, @intCast(@backingInt(linux.E.TIME)));
+        const pr = pool_res orelse -@as(i32, @intCast(@backingInt(linux.E.TIME)));
+        if (qr != 0 or pr != 0) {
+            log.err("transport: group {d}: queue {d}: ADD_QUEUE(zero_copy={}) → {d}, ADD_BUFPOOL({d} B at index {d}) → {d} — refused after the bufpool probe read present; the mount fails (the probe is the only degrade point, charter §3; ENOTCONN here is a legacy kernel answering RELEASE_PAYLOAD to opcode 3 — the collision guard)", .{ self.index, qid, zc_on, qr, pool.queueSpan(), Pool.POOL_INDEX, pr });
+            return error.MainlinePoolRefused;
+        }
+        added.store(true, .release);
+        pool_queues_added.inc();
     }
 
     // ---- SQE pushes (append only; the loop-bottom enter flushes) ----
@@ -1929,11 +2257,13 @@ pub const Group = struct {
             self.onRegisterRefused(member_slot, ent_idx, .AGAIN, now);
             return;
         };
-        if (self.shared.usesKmbuf()) {
-            const flags = zc.initFlags(self.shared.zeroCopy(), self.shared.retention);
-            prepRegisterKmbuf(sqe, m.qid, ent_idx, flags, if (self.shared.zeroCopy()) @intCast(self.depth) else 0, gent);
-        } else {
-            prepRegister(sqe, m.qid, &self.iovs[gent], gent);
+        switch (self.shared.mode) {
+            .buf_ring, .zero_copy => {
+                const flags = zc.initFlags(self.shared.zeroCopy(), self.shared.retention);
+                prepRegisterKmbuf(sqe, m.qid, ent_idx, flags, if (self.shared.zeroCopy()) @intCast(self.depth) else 0, gent);
+            },
+            .mainline_pool => prepRegisterMainline(sqe, m.qid, &self.iovs[gent], if (self.shared.zeroCopy()) self.zcSlot(ent_idx) else 0, gent),
+            .user_ents => prepRegister(sqe, m.qid, &self.iovs[gent], gent),
         }
         m.slots.onRegisterSubmitted(ent_idx);
         registers.inc();
@@ -1981,7 +2311,7 @@ pub const Group = struct {
             m.slots.abandon(e);
             return;
         };
-        prepCommit(sqe, m.qid, commit_id, gent, 0);
+        if (self.shared.mainline()) prepCommitMainline(sqe, m.qid, commit_id, gent) else prepCommit(sqe, m.qid, commit_id, gent, 0);
         m.slots.onCommitSubmitted(e);
         self.bounce_idle_tick[gent] = mem_budget.authority.ticks();
         ring_replies.inc();
@@ -2114,7 +2444,8 @@ pub const Group = struct {
             sq_full.fire("transport ring SQ cannot take a bridge's pieces after a flush");
             return false;
         }
-        const e = self.entIdxOf(gent);
+        // The slot's index in THIS ring's table (the pool shifts it by one).
+        const e = self.zcSlot(self.entIdxOf(gent));
         var done: u32 = 0;
         var i: u32 = 0;
         while (i < pieces) : (i += 1) {
@@ -2597,7 +2928,7 @@ pub const Group = struct {
                     return;
                 }
                 if (msg.kind == .fd_body) commit_queue.fd_body_fallbacks.inc();
-                const win = self.attachedWindow(gent);
+                const win = self.copyWindow(gent);
                 _ = slot.applyReply(hdr, win, r);
                 if (msg.kind == .reply_retain) {
                     if (dir == .source and ent.held and ent.class == .page_cache and self.shared.retention) {
@@ -2968,6 +3299,10 @@ pub const Group = struct {
             cqe_tag_unknown.fire("CQE tag no transport push produced");
             return;
         };
+        if (tag.kind == .setup) {
+            pool_setup_late_cqes.fire("ADD_QUEUE/ADD_BUFPOOL completion reached the pass");
+            return;
+        }
         if (tag.gent >= self.headers.depth) {
             cqe_tag_unknown.fire("CQE gent out of range");
             return;
@@ -2977,6 +3312,7 @@ pub const Group = struct {
             .cancel => return self.handleCancelCqe(tag.gent, cqe.res),
             .release => return self.handleReleaseCqe(tag.gent, cqe.res),
             .register, .commit => {},
+            .setup => unreachable,
         }
         if (cqe.res < 0) return self.handleCqeError(tag, cqe.err());
         self.deliver(tag.gent, tag.kind == .register, cqe.flags);
@@ -3086,12 +3422,38 @@ pub const Group = struct {
             return self.failEnt(gent, .IO);
         }
         const announced: usize = hdr.ring_ent_in_out.payload_sz;
-        if (self.shared.zeroCopy()) {
+        if (self.shared.mainline()) {
+            // The pool offset law, then the direction: mainline states a
+            // zero-copied delivery in the header (`FUSE_URING_ENT_ZERO_COPY`)
+            // and zero-copies READ (the slot a DEST) and WRITE (a SOURCE) only
+            // — no opcode mirror, no readdir latch.
+            if (!self.poolOffsetOk(gent)) {
+                pool_offset_breach.fire("pool offset past the queue's region");
+                log.err("transport: queue {d} ent {d}: pool offset {d} + payload {d} past the queue's {d}-byte region — protocol breach, the session fails", .{ m.qid, ent_idx, hdr.ring_ent_in_out.offset, self.payload_len, self.shared.pool.?.queueSpan() });
+                _ = self.shared.shutdown();
+                return;
+            }
+            pool_deliveries.inc();
+            const op = (abi.decodePrefix(abi.fuse_in_header, &hdr.in_out) orelse return self.failEnt(gent, .INVAL)).op();
+            ent.dir = zc.mainlineDirOf(op, hdr.ring_ent_in_out.flags);
+            if (ent.dir != .none) {
+                if (!self.shared.zeroCopy()) {
+                    // The kernel zero-copied on a queue this session created
+                    // copying: no slab, no slot to bridge — refuse the one request.
+                    pool_zc_unarmed.fire("ENT_ZERO_COPY on a session without zero-copy");
+                    return self.failEnt(gent, .IO);
+                }
+                pool_zc_deliveries.inc();
+            }
+            if (ent.dir == .source and announced > 0) return self.deliverPagedWrite(gent, announced);
+        } else if (self.shared.zeroCopy()) {
             const op = (abi.decodePrefix(abi.fuse_in_header, &hdr.in_out) orelse return self.failEnt(gent, .INVAL)).op();
             ent.dir = zc.dirOf(op, self.shared.readdirLatch());
             if (ent.dir == .source and announced > 0) return self.deliverPagedWrite(gent, announced);
         }
-        const win = if (self.shared.zeroCopy() and ent.dir == .dest) self.attachedWindow(gent) else self.window(gent);
+        // The in-payload is always in the copy window (a DEST slot's request
+        // carries none: its header rode `op_in`).
+        const win = self.copyWindow(gent);
         const capped = @min(announced, win.len);
         self.deliverParsed(gent, win[0..capped], capped, null);
     }
@@ -3142,7 +3504,7 @@ pub const Group = struct {
     /// (after a direct leg fell through): the header is intact.
     fn redeliver(self: *Group, gent: u32) void {
         const hdr = self.headerOf(gent);
-        const win = self.attachedWindow(gent);
+        const win = self.copyWindow(gent);
         const capped = @min(@as(usize, hdr.ring_ent_in_out.payload_sz), win.len);
         const delivery = codec.Delivery.fromRing(&hdr.in_out, &hdr.op_in, win[0..capped], capped) catch return self.failEnt(gent, .INVAL);
         const parsed = codec.parse(delivery) catch |e| return self.failEnt(gent, codec.parseErrno(e));
@@ -3731,8 +4093,80 @@ test "kmbuf / zc / retention SQE bytes: a kmbuf REGISTER carries no iovecs, init
     try testing.expectEqual(tagOf(.release, 3), sqe.user_data);
 }
 
+test "mainline SQE bytes (uapi 7.46): ADD_QUEUE is cmd_op 3 with the zero-copy bit in flags at +48 and no FIXED flag; ADD_BUFPOOL is cmd_op 4 with uaddr at +72, len at +80, reserved 0 at +84, IORING_URING_CMD_FIXED at +28 and buf_index 0; a REGISTER carries the header iovec pair (payload {NULL, 0}), FIXED + buf_index 0 and ent_zero_copy_buf_index at +72 = 1 + ent on a zc queue; a COMMIT carries FIXED + buf_index 0 with commit_id at +56; the slot and table laws" {
+    var sqe: uring128.Sqe128 = undefined;
+    const raw: *[128]u8 = @ptrCast(&sqe);
+    prepAddQueue(&sqe, 9, true);
+    try testing.expectEqual(@as(u8, @backingInt(linux.IORING_OP.URING_CMD)), raw[0]);
+    try testing.expectEqual(@as(u32, 3), std.mem.readInt(u32, raw[8..12], .little));
+    try testing.expectEqual(abi.FUSE_URING_ADD_QUEUE_ZERO_COPY, std.mem.readInt(u64, raw[48..56], .little));
+    try testing.expectEqual(@as(u16, 9), std.mem.readInt(u16, raw[64..66], .little));
+    try testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, raw[28..32], .little));
+    for (raw[66..128]) |b| try testing.expectEqual(@as(u8, 0), b);
+    try testing.expectEqual(tagOf(.setup, 0), sqe.user_data);
+    prepAddQueue(&sqe, 9, false);
+    try testing.expectEqual(@as(u64, 0), std.mem.readInt(u64, raw[48..56], .little));
+    var region: [8192]u8 align(4096) = undefined;
+    prepAddBufpool(&sqe, 9, &region);
+    try testing.expectEqual(@as(u32, 4), std.mem.readInt(u32, raw[8..12], .little));
+    try testing.expectEqual(@as(u64, 0), std.mem.readInt(u64, raw[48..56], .little));
+    try testing.expectEqual(@intFromPtr(&region), std.mem.readInt(u64, raw[72..80], .little));
+    try testing.expectEqual(@as(u32, 8192), std.mem.readInt(u32, raw[80..84], .little));
+    try testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, raw[84..88], .little));
+    try testing.expectEqual(abi.IORING_URING_CMD_FIXED, std.mem.readInt(u32, raw[28..32], .little));
+    try testing.expectEqual(Pool.POOL_INDEX, std.mem.readInt(u16, raw[40..42], .little));
+    try testing.expectEqual(tagOf(.setup, 1), sqe.user_data);
+    var hdr: abi.fuse_uring_req_header = abi.zeroed(abi.fuse_uring_req_header);
+    const iovs: [2]RegIov = .{ .{ .base = @ptrCast(&hdr), .len = 288 }, .{ .base = null, .len = 0 } };
+    prepRegisterMainline(&sqe, 9, &iovs, zcSlotOf(.mainline_pool, 5), 3);
+    try testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, raw[8..12], .little));
+    try testing.expectEqual(@intFromPtr(&iovs), std.mem.readInt(u64, raw[16..24], .little));
+    try testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, raw[24..28], .little));
+    try testing.expectEqual(abi.IORING_URING_CMD_FIXED, std.mem.readInt(u32, raw[28..32], .little));
+    try testing.expectEqual(@as(u16, 0), std.mem.readInt(u16, raw[40..42], .little));
+    try testing.expectEqual(@as(u16, 9), std.mem.readInt(u16, raw[64..66], .little));
+    // The legacy union's bytes (+66, +68) are mainline padding: zero.
+    try testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, raw[66..70], .little));
+    try testing.expectEqual(@as(u16, 6), std.mem.readInt(u16, raw[72..74], .little));
+    for (raw[74..128]) |b| try testing.expectEqual(@as(u8, 0), b);
+    try testing.expectEqual(tagOf(.register, 3), sqe.user_data);
+    // The iovec pair's second entry is {NULL, 0} on the wire.
+    const iov_bytes: *const [32]u8 = @ptrCast(&iovs);
+    for (iov_bytes[16..32]) |b| try testing.expectEqual(@as(u8, 0), b);
+    prepCommitMainline(&sqe, 9, 0x77, 3);
+    try testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, raw[8..12], .little));
+    try testing.expectEqual(@as(u64, 0x77), std.mem.readInt(u64, raw[56..64], .little));
+    try testing.expectEqual(abi.IORING_URING_CMD_FIXED, std.mem.readInt(u32, raw[28..32], .little));
+    try testing.expectEqual(@as(u16, 0), std.mem.readInt(u16, raw[40..42], .little));
+    for (raw[66..128]) |b| try testing.expectEqual(@as(u8, 0), b);
+    try testing.expectEqual(tagOf(.commit, 3), sqe.user_data);
+    // The slot law: the pool at 0 shifts every zc slot by one on mainline;
+    // the legacy rungs keep ent = slot (their headers sit at depth).
+    try testing.expectEqual(@as(u16, 1), zcSlotOf(.mainline_pool, 0));
+    try testing.expectEqual(@as(u16, 32), zcSlotOf(.mainline_pool, 31));
+    try testing.expectEqual(@as(u16, 31), zcSlotOf(.zero_copy, 31));
+    try testing.expectEqual(@as(u32, 33), mainlineTableSlots(true, 32));
+    try testing.expectEqual(@as(u32, 1), mainlineTableSlots(false, 32));
+}
+
+test "the mainline pool: one span, a queue's region at qid × depth × payload_sz, a window at the header's offset within it, null past the region; offsets on the payload_sz grid are the boundaries" {
+    var p = try Pool.init(3, 4, 8192);
+    defer p.deinit();
+    try testing.expectEqual(@as(u64, 3 * 4 * 8192), p.bytes());
+    try testing.expectEqual(@as(usize, 4 * 8192), p.queueSpan());
+    try testing.expectEqual(@intFromPtr(p.span.ptr) + 2 * 4 * 8192, @intFromPtr(p.queueRegion(2).ptr));
+    const w = p.window(2, 8192, 8192).?;
+    try testing.expectEqual(@intFromPtr(p.queueRegion(2).ptr) + 8192, @intFromPtr(w.ptr));
+    w[0] = 0x5A;
+    try testing.expectEqual(@as(u8, 0x5A), p.span[2 * 4 * 8192 + 8192]);
+    try testing.expect(p.window(2, 3 * 8192, 8192) != null);
+    try testing.expect(p.window(2, 4 * 8192, 8192) == null);
+    try testing.expect(p.window(2, 3 * 8192 + 1, 8192) == null);
+    try testing.expect(p.onBoundary(0) and p.onBoundary(3 * 8192) and !p.onBoundary(4096));
+}
+
 test "tags: every op kind round-trips for ents 0, 1, 31, 255 and 16383; the wake/reserved values and a foreign kind decode to null (the unknown-tag tripwire's input)" {
-    for ([_]OpKind{ .register, .commit, .bridge, .cancel, .release }) |k| {
+    for ([_]OpKind{ .register, .commit, .bridge, .cancel, .release, .setup }) |k| {
         for ([_]u32{ 0, 1, 31, 255, 16383 }) |g| {
             const d = decodeTag(tagOf(k, g)).?;
             try testing.expectEqual(k, d.kind);

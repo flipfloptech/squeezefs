@@ -122,6 +122,13 @@ pub const FUSE_ALLOW_IDMAP: u64 = 1 << 40;
 /// "no opt-out" (charter §4).
 pub const FUSE_OVER_IO_URING: u64 = 1 << 41;
 pub const FUSE_REQUEST_TIMEOUT: u64 = 1 << 42;
+/// uapi 7.46 / Linux ≥ 7.3 (flags2 bit 11): the kernel speaks the mainline
+/// buffer-pool UAPI (`ADD_QUEUE`, `ADD_BUFPOOL`, per-entry zero-copy slots,
+/// `FOPEN_IO_URING_ZERO_COPY`). Offered beside FUSE_OVER_IO_URING whenever
+/// `fuse.enable_uring` reads Y at INIT. The bit IS the probe of the
+/// MainlinePool rung (fuse_mainline_pools.md §2); never offered by the
+/// 7.2-sqz series or any stock kernel before 7.3.
+pub const FUSE_HAS_IO_URING_BUFPOOL: u64 = 1 << 43;
 /// uapi 7.47 (flags2 bit 12; `scripts/kernel/patches-7.2/0027-sqz-fuse-
 /// allow-FUSE_SYNCFS-…` backports it to the venue's 7.2.6-sqz at
 /// upstream's bit): the server asks for syncfs(2)/sync(2) as
@@ -186,6 +193,12 @@ pub const FOPEN_NOFLUSH: u32 = 1 << 5;
 /// uapi 7.38 / Linux ≥ 6.2.
 pub const FOPEN_PARALLEL_DIRECT_WRITES: u32 = 1 << 6;
 pub const FOPEN_PASSTHROUGH: u32 = 1 << 7;
+/// uapi 7.46 / Linux ≥ 7.3: READ/WRITE on this open file ride zero-copy
+/// (honored only on a queue created with `FUSE_URING_ADD_QUEUE_ZERO_COPY`
+/// and only for a request carrying page payload). Mainline grants zc PER
+/// OPEN FILE — a zero-message open (`no_open`) carries the kernel's own
+/// `FOPEN_KEEP_CACHE` alone, so an OPEN/CREATE reply is the only carrier.
+pub const FOPEN_IO_URING_ZERO_COPY: u32 = 1 << 8;
 
 /// `fuse_release_in.release_flags`.
 pub const FUSE_RELEASE_FLUSH: u32 = 1 << 0;
@@ -599,12 +612,43 @@ pub const FUSE_IO_URING_CMD_REGISTER: u32 = 1;
 pub const FUSE_IO_URING_CMD_COMMIT_AND_FETCH: u32 = 2;
 /// sqz patch 0029 ("uapi 7.47"): ends a retained slot; doubles as the
 /// retention PROBE opcode (RELEASE with an impossible commit id: -ENOTCONN /
-/// -ENOENT ⇒ present, anything else ⇒ absent).
+/// -ENOENT ⇒ present, anything else ⇒ absent). COLLIDES with mainline's
+/// `ADD_QUEUE` (= 3, Linux ≥ 7.3): sent ONLY after the kmbuf ladder read
+/// present (a legacy rung), never on a kernel that offered
+/// `FUSE_HAS_IO_URING_BUFPOOL` — there the same bytes would create queue 0
+/// without the zero-copy flag.
 pub const FUSE_IO_URING_CMD_RELEASE_PAYLOAD: u32 = 3;
 /// sqz patch 0030: answers the `FUSE_URING_FEAT_*` mask inline (the CQE
 /// result); a kernel without the patch answers -EINVAL (the opcode switch's
-/// default) — the probe.
+/// default) — the probe. COLLIDES with mainline's `ADD_BUFPOOL` (= 4):
+/// gated like RELEASE_PAYLOAD (on a mainline kernel before any ADD_QUEUE it
+/// would read -EINVAL — harmless, and still never sent).
 pub const FUSE_IO_URING_CMD_FEATURES: u32 = 4;
+
+// ---- the mainline buffer-pool UAPI (uapi 7.46, Linux ≥ 7.3; fuse_mainline_pools.md §1) ----
+
+/// Create queue `qid` (`cmd_req.flags` ⊆ `FUSE_URING_ADD_QUEUE_ZERO_COPY`,
+/// EINVAL otherwise; EEXIST on a queue that exists; EPERM for zero-copy
+/// without CAP_SYS_ADMIN). Completes inline: 0, never -EIOCBQUEUED.
+pub const FUSE_IO_URING_CMD_ADD_QUEUE: u32 = 3;
+/// Hand queue `qid` its payload pool (`cmd_req.bufpool.{uaddr,len}`; the
+/// kernel splits it into `len / max_payload_sz` buffers; `flags` and
+/// `bufpool.reserved` must be 0; EINVAL on a queue that does not exist or
+/// already committed to a payload mode). With `IORING_URING_CMD_FIXED` +
+/// `sqe.buf_index` the pool is REGISTERED: every later REGISTER and
+/// COMMIT_AND_FETCH on that queue must carry the same flag and index.
+pub const FUSE_IO_URING_CMD_ADD_BUFPOOL: u32 = 4;
+/// `cmd_req.flags` on ADD_QUEUE: the queue's entries zero-copy.
+pub const FUSE_URING_ADD_QUEUE_ZERO_COPY: u64 = 1 << 0;
+/// `fuse_uring_ent_in_out.flags` on delivery: this request's page payload
+/// sits in the entry's zero-copy slot (`ent_zero_copy_buf_index`), not in
+/// the pool buffer; `payload_sz` still counts it. The kernel states the
+/// direction by the opcode: READ (`out_pages` = the slot is a DEST) or
+/// WRITE (`in_pages` = a SOURCE) — the only two opcodes it zero-copies.
+pub const FUSE_URING_ENT_ZERO_COPY: u64 = 1 << 0;
+/// `sqe.uring_cmd_flags`: `sqe.buf_index` names a registered buffer the
+/// command imports through (`io_uring_cmd_import_fixed`).
+pub const IORING_URING_CMD_FIXED: u32 = 1 << 0;
 /// `FUSE_IO_URING_CMD_FEATURES` result bit: several io_urings may REGISTER
 /// entries on one queue (each entry served and committed by the ring that
 /// registered it; a ring still serves one queue).
@@ -652,13 +696,18 @@ pub const SQE_LEN_OFFSET: usize = 24;
 pub const REGISTER_IOVEC_COUNT: u32 = 2;
 
 pub const fuse_uring_ent_in_out = extern struct {
+    /// Mainline: `FUSE_URING_ENT_ZERO_COPY` on a zero-copied delivery; the
+    /// 7.2-sqz series leaves it 0.
     flags: u64,
     /// The request's `unique` on delivery; echoed on COMMIT_AND_FETCH.
     commit_id: u64,
     /// Bytes the kernel placed in the payload (delivery) / bytes we placed
     /// (commit). Pre-set to the ent's payload length at REGISTER.
     payload_sz: u32,
-    padding: u32,
+    /// Mainline: the byte offset of this request's payload buffer within
+    /// the queue's pool (0 when none was selected — a payload-less request,
+    /// whose reply is header-only). Padding (0) on the 7.2-sqz series.
+    offset: u32,
     reserved: u64,
 };
 
@@ -686,6 +735,44 @@ pub const fuse_uring_cmd_req = extern struct {
     /// The union member's other name.
     pub fn commitFlags(self: fuse_uring_cmd_req) u16 {
         return self.init_flags;
+    }
+};
+
+/// Mainline's `fuse_uring_cmd_req` (40 B of the 80-byte command area, uapi
+/// 7.46): `flags` @0, `commit_id` @8, `qid` @16, `padding[6]` @18, then the
+/// union @24 — `bufpool { uaddr u64 @24; len u32 @32; reserved u32 @36 }` on
+/// ADD_BUFPOOL, `ent_zero_copy_buf_index u16 @24` on REGISTER (must be 0 on
+/// a non-zero-copy queue), zero on COMMIT_AND_FETCH and ADD_QUEUE. The legacy
+/// struct's `init_flags`/`queue_depth` fall inside mainline's padding, which
+/// the kernel never reads, so a legacy-shaped REGISTER is well-formed there
+/// (the evidence note's finding); the converse — this struct on the 7.2-sqz
+/// kernel — is never sent (the probe decides the rung before any command).
+pub const fuse_uring_cmd_req_mainline = extern struct {
+    flags: u64,
+    commit_id: u64,
+    qid: u16,
+    padding: [6]u8,
+    /// `bufpool.uaddr` | `ent_zero_copy_buf_index` (low 16 bits).
+    u0: u64,
+    /// `bufpool.len`.
+    u1: u32,
+    /// `bufpool.reserved` (must be 0).
+    u2: u32,
+
+    pub fn addQueue(qid: u16, zero_copy: bool) fuse_uring_cmd_req_mainline {
+        return .{ .flags = if (zero_copy) FUSE_URING_ADD_QUEUE_ZERO_COPY else 0, .commit_id = 0, .qid = qid, .padding = @splat(0), .u0 = 0, .u1 = 0, .u2 = 0 };
+    }
+
+    pub fn addBufpool(qid: u16, uaddr: u64, len: u32) fuse_uring_cmd_req_mainline {
+        return .{ .flags = 0, .commit_id = 0, .qid = qid, .padding = @splat(0), .u0 = uaddr, .u1 = len, .u2 = 0 };
+    }
+
+    pub fn register(qid: u16, ent_zero_copy_buf_index: u16) fuse_uring_cmd_req_mainline {
+        return .{ .flags = 0, .commit_id = 0, .qid = qid, .padding = @splat(0), .u0 = ent_zero_copy_buf_index, .u1 = 0, .u2 = 0 };
+    }
+
+    pub fn commit(qid: u16, commit_id: u64) fuse_uring_cmd_req_mainline {
+        return .{ .flags = 0, .commit_id = commit_id, .qid = qid, .padding = @splat(0), .u0 = 0, .u1 = 0, .u2 = 0 };
     }
 };
 
@@ -775,13 +862,22 @@ comptime {
     assertLayout(fuse_notify_delete_out, 24, .{ .{ "parent", 0 }, .{ "child", 8 }, .{ "namelen", 16 }, .{ "padding", 20 } });
     assertLayout(fuse_notify_prune_out, 16, .{ .{ "count", 0 }, .{ "padding", 4 }, .{ "spare", 8 } });
 
-    assertLayout(fuse_uring_ent_in_out, 32, .{ .{ "flags", 0 }, .{ "commit_id", 8 }, .{ "payload_sz", 16 }, .{ "padding", 20 }, .{ "reserved", 24 } });
+    assertLayout(fuse_uring_ent_in_out, 32, .{ .{ "flags", 0 }, .{ "commit_id", 8 }, .{ "payload_sz", 16 }, .{ "offset", 20 }, .{ "reserved", 24 } });
     assertLayout(fuse_uring_req_header, 288, .{ .{ "in_out", 0 }, .{ "op_in", 128 }, .{ "ring_ent_in_out", 256 } });
     assertLayout(fuse_uring_cmd_req, 24, .{ .{ "flags", 0 }, .{ "commit_id", 8 }, .{ "qid", 16 }, .{ "init_flags", 18 }, .{ "queue_depth", 20 }, .{ "padding", 22 } });
+    assertLayout(fuse_uring_cmd_req_mainline, 40, .{ .{ "flags", 0 }, .{ "commit_id", 8 }, .{ "qid", 16 }, .{ "padding", 18 }, .{ "u0", 24 }, .{ "u1", 32 }, .{ "u2", 36 } });
     assertLayout(io_uring_buf_reg, 40, .{ .{ "ring_addr", 0 }, .{ "ring_entries", 8 }, .{ "bgid", 12 }, .{ "flags", 14 }, .{ "resv", 16 } });
     // The command area holds the request with room to spare; the in_out
     // region holds either header.
     std.debug.assert(@sizeOf(fuse_uring_cmd_req) <= SQE128_CMD_LEN);
+    std.debug.assert(@sizeOf(fuse_uring_cmd_req_mainline) <= SQE128_CMD_LEN);
+    // The legacy union sits inside mainline's padding: a legacy REGISTER is
+    // well-formed on a mainline kernel (its union at 24 reads zero).
+    std.debug.assert(@offsetOf(fuse_uring_cmd_req, "init_flags") >= @offsetOf(fuse_uring_cmd_req_mainline, "padding"));
+    std.debug.assert(@sizeOf(fuse_uring_cmd_req) <= @offsetOf(fuse_uring_cmd_req_mainline, "u0"));
+    std.debug.assert(FUSE_IO_URING_CMD_ADD_QUEUE == FUSE_IO_URING_CMD_RELEASE_PAYLOAD);
+    std.debug.assert(FUSE_IO_URING_CMD_ADD_BUFPOOL == FUSE_IO_URING_CMD_FEATURES);
+    std.debug.assert(FUSE_HAS_IO_URING_BUFPOOL == @as(u64, 1 << 11) << 32);
     std.debug.assert(SQE128_CMD_OFFSET + SQE128_CMD_LEN == SQE128_LEN);
     std.debug.assert(@sizeOf(fuse_in_header) <= FUSE_URING_IN_OUT_HEADER_SZ);
     std.debug.assert(@sizeOf(fuse_out_header) <= FUSE_URING_IN_OUT_HEADER_SZ);
@@ -847,7 +943,7 @@ const all_structs = .{
     fuse_ioctl_out,           fuse_ioctl_iovec,            fuse_poll_out,               fuse_lseek_out,              fuse_dirent,
     fuse_direntplus,          fuse_notify_poll_wakeup_out, fuse_notify_inval_inode_out, fuse_notify_inval_entry_out, fuse_notify_store_out,
     fuse_notify_retrieve_out, fuse_notify_delete_out,      fuse_notify_prune_out,       fuse_uring_ent_in_out,       fuse_uring_req_header,
-    fuse_uring_cmd_req,       io_uring_buf_reg,
+    fuse_uring_cmd_req,       io_uring_buf_reg,            fuse_uring_cmd_req_mainline,
 };
 
 test "the wire is little-endian native: a u32 at offset 0 lands low byte first" {
@@ -894,6 +990,31 @@ test "uring ABI pins: req header 288 (op_in@128, ring_ent@256), cmd_req 24 (qid@
     var reg = zeroed(io_uring_buf_reg);
     reg.ring_addr = 4096;
     try testing.expectEqual(@as(u32, 4096), reg.bufSize());
+}
+
+test "mainline uring ABI pins (uapi 7.46): cmd_req 40 (padding[6]@18, union@24: bufpool uaddr@24 len@32 reserved@36 | ent_zero_copy_buf_index u16@24), ent_in_out.offset@20, ADD_QUEUE/ADD_BUFPOOL collide with the legacy 3/4, HAS_IO_URING_BUFPOOL = flags2 bit 11, FOPEN_IO_URING_ZERO_COPY = 1<<8" {
+    try testing.expectEqual(@as(usize, 40), @sizeOf(fuse_uring_cmd_req_mainline));
+    try testing.expectEqual(@as(usize, 24), @offsetOf(fuse_uring_cmd_req_mainline, "u0"));
+    try testing.expectEqual(@as(usize, 32), @offsetOf(fuse_uring_cmd_req_mainline, "u1"));
+    try testing.expectEqual(@as(usize, 36), @offsetOf(fuse_uring_cmd_req_mainline, "u2"));
+    try testing.expectEqual(@as(usize, 20), @offsetOf(fuse_uring_ent_in_out, "offset"));
+    const pool = fuse_uring_cmd_req_mainline.addBufpool(3, 0x7f00_0000_1000, 32 << 20);
+    const b = encode(pool);
+    try testing.expectEqual(@as(u64, 0x7f00_0000_1000), std.mem.readInt(u64, b[24..32], .little));
+    try testing.expectEqual(@as(u32, 32 << 20), std.mem.readInt(u32, b[32..36], .little));
+    try testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, b[36..40], .little));
+    try testing.expectEqual(@as(u16, 3), std.mem.readInt(u16, b[16..18], .little));
+    const reg = encode(fuse_uring_cmd_req_mainline.register(7, 12));
+    try testing.expectEqual(@as(u16, 12), std.mem.readInt(u16, reg[24..26], .little));
+    try testing.expect(std.mem.allEqual(u8, reg[26..40], 0));
+    try testing.expectEqual(FUSE_URING_ADD_QUEUE_ZERO_COPY, fuse_uring_cmd_req_mainline.addQueue(0, true).flags);
+    try testing.expectEqual(@as(u64, 0), fuse_uring_cmd_req_mainline.addQueue(0, false).flags);
+    try testing.expectEqual(@as(u64, 99), fuse_uring_cmd_req_mainline.commit(1, 99).commit_id);
+    try testing.expectEqual(FUSE_IO_URING_CMD_RELEASE_PAYLOAD, FUSE_IO_URING_CMD_ADD_QUEUE);
+    try testing.expectEqual(FUSE_IO_URING_CMD_FEATURES, FUSE_IO_URING_CMD_ADD_BUFPOOL);
+    try testing.expectEqual(@as(u32, 1 << 11), flags2Of(FUSE_HAS_IO_URING_BUFPOOL));
+    try testing.expectEqual(@as(u32, 1 << 8), FOPEN_IO_URING_ZERO_COPY);
+    try testing.expectEqual(@as(u32, 1), IORING_URING_CMD_FIXED);
 }
 
 test "capability bits: OVER_IO_URING = 1<<41 = flags2 bit 9; TIME_LIMITS = 1<<62 = flags2 bit 30; INIT_EXT 1<<30; KILLPRIV_V2 1<<28; fold/split round-trip" {

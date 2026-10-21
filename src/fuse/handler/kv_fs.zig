@@ -4610,7 +4610,7 @@ fn HarnessOf(comptime Data: type) type {
             self.opens = try open_table.OpenTable.init(testing.allocator, 64);
             self.unique = 2;
             self.d = LoopDispatcher.init(&self.lb, .{ .fs = filesystem.Filesystem.of(Fs, &self.fs), .io = testing.io, .registry = &self.reg, .guards = &self.guards, .opens = &self.opens, .no_open = no_open, .writeback = writeback });
-            if (no_open or writeback == .timer) try self.d.initFilesystem(abi.FUSE_HANDLE_KILLPRIV_V2, 45);
+            if (no_open or writeback == .timer) try self.d.initFilesystem(abi.FUSE_HANDLE_KILLPRIV_V2, 45, false, false);
         }
 
         fn deinit(self: *Self) void {
@@ -6592,7 +6592,7 @@ test "no-open through the POSIX layer (decision 0003 §AF): INIT hands the postu
     try ctl.initPosture(false);
     defer ctl.deinit();
     defer ctl.data.deinit();
-    try ctl.d.initFilesystem(abi.FUSE_HANDLE_KILLPRIV_V2, 45);
+    try ctl.d.initFilesystem(abi.FUSE_HANDLE_KILLPRIV_V2, 45, false, false);
     const cc = ctl.call(.{ .create = .{ .name = "f", .flags = 0, .mode = 0o644, .umask = 0, .open_flags = 0 } }, 1);
     const ctl_open = abi.decodeExact(abi.fuse_open_out, cc.outBytes()[@sizeOf(abi.fuse_entry_out)..]).?;
     try testing.expect(ctl_open.open_flags & abi.FOPEN_NOFLUSH != 0);

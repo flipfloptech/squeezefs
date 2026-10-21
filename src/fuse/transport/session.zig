@@ -222,6 +222,12 @@ pub const MountError = error{
     /// loud, never degrade; `Config.refusal` carries the region and levers.
     KmbufRingEnomem,
     SlabFailed,
+    /// The MainlinePool pool mapping failed (startup memory).
+    PoolMapFailed,
+    /// The kernel refused ADD_QUEUE or ADD_BUFPOOL after the bufpool probe
+    /// read present (the post-probe refusal, named in the log); under the
+    /// test seam on a legacy kernel, the opcode collision's ENOTCONN.
+    MainlinePoolRefused,
     /// `SQUEEZEFS_TEST_FUSE_FAIL_AFTER_INIT_REPLY`: the bring-up failed by
     /// the seam after the INIT reply, before any queue registered.
     InjectedStartupFailure,
@@ -901,6 +907,13 @@ pub const Session = struct {
     rings_per_queue: u32 = 1,
     /// `SQUEEZEFS_READ_ZC_SERVE` ∧ zero-copy: what INIT told the filesystem.
     read_zc_serve: bool = false,
+    /// The open posture AFTER the lattice (decision 0003 §AO): `Config.no_open`
+    /// unless a mainline zero-copy session serves opens to grant zero-copy per
+    /// file (`zc_open`); `zc_create_only` = mainline zero-copy under kept
+    /// zero-message opens (CREATE replies alone carry the flag).
+    no_open: bool = false,
+    zc_open: bool = false,
+    zc_create_only: bool = false,
     /// The request timeout the kernel applies, seconds (0 = none).
     request_timeout_s: u16 = 0,
     /// The connection ended (not by DESTROY) while the session still held
@@ -920,6 +933,10 @@ pub const Session = struct {
     slab: ?worker.Slab = null,
     slab_component: mem_budget.Component = undefined,
     kmbuf_component: mem_budget.Component = undefined,
+    /// MainlinePool: the session's payload pool (one region per queue, the
+    /// arena of this rung) and the per-queue "pool added" flags.
+    pool: ?worker.Pool = null,
+    pool_added: []std.atomic.Value(bool) = &.{},
     ready: std.atomic.Value(bool) = .init(false),
     destroyed: std.atomic.Value(bool) = .init(false),
     closed: bool = false,
@@ -1030,10 +1047,10 @@ pub const Session = struct {
         return at.g.storeFromForeign(at.gent, fd, off, src.len, io);
     }
 
-    /// Whether `storeHeld` can land anything: a zero-copy session (a held
-    /// payload exists only there).
+    /// Whether `storeHeld` can land anything: a zero-copy session of either
+    /// stratum (a held payload exists only there).
     pub fn heldStoreArmed(self: *const Session) bool {
-        return self.mode == .zero_copy;
+        return self.zeroCopyArmed();
     }
 
     /// The fd-source serve lever as INIT resolved it.
@@ -1211,7 +1228,14 @@ pub const Session = struct {
         self.unmounter = cfg.unmounter;
         self.on_shutdown = cfg.on_shutdown;
 
-        // 0. The device and the mount: root opens `/dev/fuse` and calls
+        // 0. `fuse.enable_uring=Y` BEFORE the mount: the kernel composes the
+        //    INIT offer (FUSE_OVER_IO_URING and, on mainline, the bufpool
+        //    bit that IS the MainlinePool probe) from the parameter as it
+        //    reads when the INIT is SENT — at `mount(2)`. Written again
+        //    after the INIT read (idempotent) for the fusermount3 path,
+        //    whose mount preceded this call.
+        ensureKernelUringEnabled(self.io);
+        //    The device and the mount: root opens `/dev/fuse` and calls
         //    `mount(2)`; an unprivileged mount arrives with the fd
         //    `fusermount3` sent (already mounted).
         if (cfg.fuse_fd) |fd| {
@@ -1284,13 +1308,14 @@ pub const Session = struct {
         //    offer (`probes.ringAtReply`).
         ensureKernelUringEnabled(self.io);
         try self.resolveMode(env, init_in.folded());
+        self.resolveOpenPosture(env, cfg.no_open);
         const topology: geometry.Topology = .{ .ctx = &self.topo, .node_of = nodeOfCpu };
         self.drain_groups = try geometry.drainGroupPlan(gpa, self.plan.nqueues, qid_is_cpu, topology, geometry.forcedWidth(self.mode, geometry.drainGroupWidthOverride(env)));
         errdefer self.drain_groups.deinit(gpa);
 
         // 4. The reply word; the filesystem's init hook sees the negotiation.
         const asked_timeout_s = geometry.resolveRequestTimeoutS(geometry.requestTimeoutOverride(env), cfg.request_timeout_s);
-        const wants: codec.InitWants = .{ .writeback_cache = cfg.opts.write_back and !cfg.opts.read_only, .request_timeout_s = asked_timeout_s, .atomic_o_trunc = !cfg.no_open };
+        const wants: codec.InitWants = .{ .writeback_cache = cfg.opts.write_back and !cfg.opts.read_only, .request_timeout_s = asked_timeout_s, .atomic_o_trunc = !self.no_open };
         self.init_reply = codec.buildInitReply(init_in, self.plan, wants) catch {
             log.err("transport: unsupported FUSE protocol {d}.{d} (need 7.{d}+)", .{ init_in.major, init_in.minor, codec.MIN_SUPPORTED_MINOR });
             self.sideband.replyInline(codec.replyError(self.init_unique, .INVAL));
@@ -1303,7 +1328,7 @@ pub const Session = struct {
         self.request_timeout_s = if (self.init_reply.requestTimeoutS() != 0) geometry.kernelRequestTimeoutS(self.init_reply.requestTimeoutS(), geometry.readMaxRequestTimeout(self.io)) else 0;
         request_timeout_gauge.set(self.request_timeout_s);
         if (asked_timeout_s != 0) self.warnRequestTimeout(asked_timeout_s, init_in.folded());
-        const read_zc_serve = knobs.boolKnob("SQUEEZEFS_READ_ZC_SERVE", env) and self.mode == .zero_copy;
+        const read_zc_serve = knobs.boolKnob("SQUEEZEFS_READ_ZC_SERVE", env) and self.zeroCopyArmed();
         self.read_zc_serve = read_zc_serve;
 
         // 5. Write the reply classically (the kernel refuses REGISTER until
@@ -1318,19 +1343,23 @@ pub const Session = struct {
             @memcpy(frame[codec.OUT_HEADER_LEN..], r.out);
             try self.sideband.writeOnce(&frame);
         }
+        // The legacy COMMAND probes ride opcodes 3/4 — mainline's ADD_QUEUE
+        // and ADD_BUFPOOL — so they run only on a legacy rung
+        // (`probes.legacyProbesApply`): on a mainline kernel the retention
+        // probe's bytes would create queue 0 without the zero-copy flag.
         if (self.mode == .zero_copy) self.retention = probes.driver.probeRetention(self.fuse_fd);
         // The FEATURES probe (series patch 0030), after the reply like the
         // retention probe: it decides how many rings each queue gets.
-        self.rings_feature = probes.ringsPerQueueVerdict(probes.driver.probeFeatures(self.fuse_fd));
+        if (probes.legacyProbesApply(self.mode)) self.rings_feature = probes.ringsPerQueueVerdict(probes.driver.probeFeatures(self.fuse_fd));
         try self.resolveRingsPerQueue(env);
         probes.publish(self.verdicts, self.retention, self.rings_feature, self.time_limits, probes.driver.capSysAdmin(self.io, env), self.mode);
         geometry.gauges.publishRingsPerQueue(self.rings_per_queue);
-        fs.init(.{ .negotiated = self.init_reply.negotiated, .minor = self.init_reply.minor(), .plan = self.plan, .io = self.io, .buffer_mode = self.mode, .read_zc_serve = read_zc_serve, .retention = self.retention == .present });
+        fs.init(.{ .negotiated = self.init_reply.negotiated, .minor = self.init_reply.minor(), .plan = self.plan, .io = self.io, .buffer_mode = self.mode, .read_zc_serve = read_zc_serve, .retention = self.retention == .present, .zc_open = self.zc_open, .zc_create_only = self.zc_create_only });
         errdefer {
             self.failStartup();
             self.destroyOnce();
         }
-        log.info("transport: INIT 7.{d} → 7.{d}: flags 0x{x} (over_io_uring={}, time_limits={}, request_timeout {d} s), max_write {d}, max_pages {d}, max_background {d}, queues {d} × depth {d}, payload {d} B, {d} drain group(s) (width {d}) × {d} ring(s) per queue, buffer mode {t} (kmbuf {?d}, retention {t}, rings per queue {t})", .{ init_in.minor, self.init_reply.minor(), self.init_reply.negotiated, self.init_reply.has(abi.FUSE_OVER_IO_URING), self.init_reply.timeLimits(), self.request_timeout_s, self.plan.max_write, self.plan.max_pages, self.plan.max_background, self.plan.nqueues, self.plan.depth, self.plan.payload_sz, self.drain_groups.count(), self.drain_groups.maxWidth(), self.rings_per_queue, self.mode, if (self.verdicts.kmbuf.opcodes()) |p| p.register else null, self.retention, self.rings_feature });
+        log.info("transport: INIT 7.{d} → 7.{d}: flags 0x{x} (over_io_uring={}, time_limits={}, request_timeout {d} s), max_write {d}, max_pages {d}, max_background {d}, queues {d} × depth {d}, payload {d} B, {d} drain group(s) (width {d}) × {d} ring(s) per queue, buffer mode {t} (bufpool {t}, kmbuf {?d}, zero-copy {}, retention {t}, rings per queue {t})", .{ init_in.minor, self.init_reply.minor(), self.init_reply.negotiated, self.init_reply.has(abi.FUSE_OVER_IO_URING), self.init_reply.timeLimits(), self.request_timeout_s, self.plan.max_write, self.plan.max_pages, self.plan.max_background, self.plan.nqueues, self.plan.depth, self.plan.payload_sz, self.drain_groups.count(), self.drain_groups.maxWidth(), self.rings_per_queue, self.mode, self.verdicts.bufpool, if (self.verdicts.kmbuf.opcodes()) |p| p.register else null, self.zeroCopyArmed(), self.retention, self.rings_feature });
         if (knobs.boolKnob("SQUEEZEFS_TEST_FUSE_FAIL_AFTER_INIT_REPLY", env)) {
             log.err("transport: SQUEEZEFS_TEST_FUSE_FAIL_AFTER_INIT_REPLY — the bring-up fails after the INIT reply, before any queue registers", .{});
             return error.InjectedStartupFailure;
@@ -1340,7 +1369,7 @@ pub const Session = struct {
         //    budget component), then the workers: one per drain group, the
         //    arena as ONE budget component, the arm barrier counting
         //    submissions.
-        if (self.mode == .zero_copy) {
+        if (self.zeroCopyArmed()) {
             self.slab = worker.Slab.init(self.gpa, self.plan.nqueues, self.plan.depth, self.plan.payload_sz) catch return error.SlabFailed;
             zc_bounce_slab_bytes.set(self.slab.?.bytes());
             // Non-sheddable (a populated window is a delivery in flight or
@@ -1352,6 +1381,18 @@ pub const Session = struct {
         errdefer if (self.slab) |*s| {
             s.deinit();
             zc_bounce_slab_bytes.set(0);
+        };
+        // The mainline pool: ONE mapping, one region per queue, owned here
+        // (a handler may still read a request's payload after its worker
+        // exited); every ring of a queue registers the queue's region.
+        if (self.mode == .mainline_pool) {
+            self.pool = worker.Pool.init(self.plan.nqueues, self.plan.depth, self.plan.payload_sz) catch return error.PoolMapFailed;
+            self.pool_added = try gpa.alloc(std.atomic.Value(bool), self.plan.nqueues);
+            for (self.pool_added) |*a| a.* = .init(false);
+        }
+        errdefer if (self.pool) |*p| {
+            p.deinit();
+            gpa.free(self.pool_added);
         };
         const read_fusion_lever = knobs.boolKnob("SQUEEZEFS_FUSE_READ_FUSION", env);
         self.shared = .{
@@ -1365,12 +1406,15 @@ pub const Session = struct {
             .qid_is_cpu = qid_is_cpu,
             // Arm (b) exists only on a zero-copy session; on the lattice's
             // other rungs the lever is inert.
-            .read_fusion_on = read_fusion_lever and self.mode == .zero_copy,
+            .read_fusion_on = read_fusion_lever and self.zeroCopyArmed(),
             .sqpoll = knobs.boolKnob("SQUEEZEFS_FUSE_SQPOLL", env),
             .node_of = nodeOfCpu,
             .node_ctx = &self.topo,
             .mode = self.mode,
             .kmbuf_opcodes = self.verdicts.kmbuf.opcodes(),
+            .zc_armed = self.zeroCopyArmed(),
+            .pool = if (self.pool) |*p| p else null,
+            .pool_added = self.pool_added,
             .retention = self.retention == .present,
             .page = facts.page_size,
             .block_size = cfg.block_size,
@@ -1382,7 +1426,7 @@ pub const Session = struct {
             .rings_per_queue = self.rings_per_queue,
             .write_own_depth = knobs.intKnob("SQUEEZEFS_FUSE_WRITE_OWN_DEPTH", u32, env),
             .stream_lanes = streamLanesKnob(env),
-            .no_open = cfg.no_open,
+            .no_open = self.no_open,
             .budget_bytes = cfg.mem_budget_bytes,
         };
         if (self.shared.stream_lanes != .own) log.info("transport: SQUEEZEFS_FUSE_STREAM_LANES={t} — the streaming write's lane placement (the measured A/B arm; `own` is the shipped one)", .{self.shared.stream_lanes});
@@ -1431,12 +1475,16 @@ pub const Session = struct {
                 kmbuf_pinned += @as(u64, qids.len) * zc.ringEntriesFor(share.depth) * derive.alignUp(self.plan.payload_sz, facts.page_size);
             }
         }
+        // The mainline pool IS this rung's arena: the kernel writes into
+        // its pages at delivery and the registration pins them.
+        if (self.pool) |*p| total_arena += p.bytes();
         arena_bytes.set(total_arena);
         // Non-sheddable: the kernel writes into these pages at delivery
-        // (the arena on UserEnts; the kmbuf regions on the other rungs).
+        // (the arena on UserEnts, the pool on MainlinePool; the kmbuf
+        // regions on the legacy rungs).
         self.arena_component = mem_budget.Component.init("transport_payload_arena", total_arena, 0, .{ .gauge = &arena_bytes }, null);
         if (cfg.budget) |b| b.register(self.arena_component);
-        if (self.mode != .user_ents) {
+        if (probes.usesKmbuf(self.mode)) {
             self.kmbuf_component = mem_budget.Component.init("transport_kmbuf_region", kmbuf_pinned, 0, .{ .gauge = &kmbuf.pinned_bytes }, null);
             if (cfg.budget) |b| b.register(self.kmbuf_component);
         }
@@ -1453,6 +1501,7 @@ pub const Session = struct {
                 return switch (e) {
                     error.RingSetupFailed => error.RingSetupFailed,
                     error.ThreadSpawnFailed => error.ThreadSpawnFailed,
+                    error.MainlinePoolRefused => error.MainlinePoolRefused,
                     error.KmbufRingEnomem => {
                         if (cfg.refusal) |r| {
                             const buf_size: u32 = @intCast(derive.alignUp(self.plan.payload_sz, facts.page_size));
@@ -1508,29 +1557,64 @@ pub const Session = struct {
         return .{ .ctx = self, .call = &logWorkerCensus };
     }
 
-    /// The probes and the lattice decision (ONCE per mount): kmbuf by the
+    /// The probes and the lattice decision (ONCE per mount): the mainline
+    /// pool by the INIT offer's bit 43 (or the test seam), kmbuf by the
     /// opcode ladder on a scratch ring, zc by `CapEff` + the sparse table,
     /// the lever from the registry; an explicit rung the probes refuse fails
     /// the mount loud naming the probe (the only degrade point is the probe).
     fn resolveMode(self: *Session, env: *const std.process.Environ.Map, offered: u64) MountError!void {
         const page: u32 = @intCast(self.facts.page_size);
+        const bufpool_v: probes.Verdict = if (knobs.boolKnob("SQUEEZEFS_TEST_MAINLINE_POOLS", env)) .present else probes.bufpoolVerdict(offered);
+        // The kmbuf ladder is a scratch-ring probe with no connection side
+        // effect, so it runs on every stratum; the lattice ranks bit 43 above
+        // its verdict.
         const kmbuf_v: probes.KmbufVerdict = if (knobs.boolKnob("SQUEEZEFS_TEST_KMBUF_ABSENT", env)) .absent else probes.driver.probeKmbuf(page);
         const cap = probes.driver.capSysAdmin(self.io, env);
         // The ring the reply will create (the parameter after our write,
         // `probes.ringAtReply`); the sparse table is the zc slot shape
-        // (depth + the headers slot).
+        // (depth + the headers slot legacy, depth + the pool slot mainline).
         const ring_at_reply = probes.ringAtReply(offered, readEnableUring(self.io));
         const sparse_ok = ring_at_reply and probes.driver.probeSparse(self.plan.depth + 1);
-        self.verdicts = .{ .kmbuf = kmbuf_v, .zc = probes.zcVerdict(kmbuf_v, cap, sparse_ok) };
+        self.verdicts = .{ .kmbuf = kmbuf_v, .bufpool = bufpool_v, .zc = probes.zcVerdict(kmbuf_v, bufpool_v, cap, sparse_ok) };
         const lever = probes.leverFromKnob(knobs.enumKnob("SQUEEZEFS_FUSE_BUFFER_MODE", env));
         self.mode = probes.resolveBufferMode(self.verdicts, lever) catch |e| {
-            log.err("transport: SQUEEZEFS_FUSE_BUFFER_MODE={t} refused by the {s} probe (kmbuf {t}, CAP_SYS_ADMIN {}, sparse table {}) — the mount fails: the probe is the only degrade point (charter §3)", .{ lever, switch (e) {
+            log.err("transport: SQUEEZEFS_FUSE_BUFFER_MODE={t} refused by the {s} probe (bufpool {t}, kmbuf {t}, CAP_SYS_ADMIN {}, sparse table {}) — the mount fails: the probe is the only degrade point (charter §3)", .{ lever, switch (e) {
                 error.KmbufAbsent => "kmbuf",
                 error.ZeroCopyAbsent => "zero-copy",
-            }, self.verdicts.kmbuf, cap, sparse_ok });
+                error.BufpoolAbsent => "bufpool",
+            }, bufpool_v, self.verdicts.kmbuf, cap, sparse_ok });
             return error.BufferModeRefused;
         };
         if (lever != .auto) log.info("transport: SQUEEZEFS_FUSE_BUFFER_MODE={t} — the A/B pin (auto would take {t})", .{ lever, probes.resolveBufferMode(self.verdicts, .auto) catch unreachable });
+        if (self.mode == .mainline_pool and self.verdicts.zc == .absent) log.info("transport: MainlinePool without zero-copy (CAP_SYS_ADMIN {}, sparse table {}): the pool queues are created copying", .{ cap, sparse_ok });
+    }
+
+    /// The session's slots take the app's pages (either stratum's zero copy).
+    pub fn zeroCopyArmed(self: *const Session) bool {
+        return probes.zeroCopyArmed(self.mode, self.verdicts);
+    }
+
+    /// The open posture (decision 0003 §AO): mainline grants zero-copy per
+    /// open file, through a flag only an OPEN/CREATE reply can carry, and a
+    /// zero-message open carries none. On a mainline zero-copy session
+    /// `SQUEEZEFS_FUSE_ZC_OPEN` (default 1) therefore SERVES opens — the
+    /// control arm's posture, one OPEN round trip per open (13 µs measured)
+    /// and an asynchronous RELEASE — so every data op on every file is
+    /// zero-copy; 0 keeps the mount's zero-message opens and grants
+    /// zero-copy to CREATE-opened files alone. Pure over the lattice and
+    /// the knob (`openPosture`); every other rung keeps `Config.no_open`.
+    fn resolveOpenPosture(self: *Session, env: *const std.process.Environ.Map, cfg_no_open: bool) void {
+        const p = openPosture(cfg_no_open, probes.poolZeroCopy(self.mode, self.verdicts), knobs.boolKnob("SQUEEZEFS_FUSE_ZC_OPEN", env));
+        self.no_open = p.no_open;
+        self.zc_open = p.zc_open;
+        self.zc_create_only = p.zc_create_only;
+        if (self.zc_open and cfg_no_open) log.info("transport: MainlinePool zero-copy serves OPEN (SQUEEZEFS_FUSE_ZC_OPEN=1): zero-message opens are off for this mount so every regular-file open can carry FOPEN_IO_URING_ZERO_COPY (decision 0003 §AO)", .{});
+        if (self.zc_create_only) log.info("transport: MainlinePool zero-copy under zero-message opens (SQUEEZEFS_FUSE_ZC_OPEN=0): CREATE replies alone carry FOPEN_IO_URING_ZERO_COPY — a re-opened file copies", .{});
+    }
+
+    /// Whether this mount runs zero-message opens (after the lattice).
+    pub fn noOpen(self: *const Session) bool {
+        return self.no_open;
     }
 
     /// `SQUEEZEFS_FUSE_RINGS_PER_QUEUE` over the derivation: an explicit
@@ -1540,7 +1624,10 @@ pub const Session = struct {
         const feature = self.rings_feature == .present;
         const derived = geometry.ringsPerQueue(self.mode, feature);
         const explicit = knobs.optIntKnob("SQUEEZEFS_FUSE_RINGS_PER_QUEUE", u32, env);
-        if (explicit) |n| if (n > 1 and !feature) {
+        // MainlinePool admits several rings without a patch (the pool is
+        // user memory each ring registers at one index); the FEATURES
+        // refusal is the legacy rungs'.
+        if (explicit) |n| if (n > 1 and !feature and probes.usesKmbuf(self.mode)) {
             log.err("transport: SQUEEZEFS_FUSE_RINGS_PER_QUEUE={d} refused by the FEATURES probe (FUSE_URING_FEAT_RINGS_PER_QUEUE absent: the kernel lacks series patch 0030, so a second ring on a queue would have its buffers recycled into the first's) — the mount fails: the probe is the only degrade point (charter §3)", .{n});
             return error.RingsPerQueueRefused;
         };
@@ -1935,6 +2022,12 @@ pub const Session = struct {
             self.slab = null;
             zc_bounce_slab_bytes.set(0);
         }
+        // After every group: the rings' registrations of the pool are gone.
+        if (self.pool) |*p| {
+            p.deinit();
+            self.pool = null;
+            self.gpa.free(self.pool_added);
+        }
         self.closeStallPipe();
         self.gpa.free(self.groups);
         self.gpa.free(self.qid_group);
@@ -1966,6 +2059,7 @@ pub const Session = struct {
         try field(w, "transport_arena_bytes", arena_bytes.load());
         try field(w, "transport_buffer_mode", probes.mode_gauge.load());
         try field(w, "transport_probe_kmbuf", probes.kmbuf_gauge.load());
+        try field(w, "transport_probe_bufpool", probes.bufpool_gauge.load());
         try field(w, "transport_probe_zc", probes.zc_gauge.load());
         try field(w, "transport_probe_retention", probes.retention_gauge.load());
         try field(w, "transport_probe_rings_per_queue", probes.rings_per_queue_gauge.load());
@@ -1979,6 +2073,13 @@ pub const Session = struct {
         try field(w, "transport_kmbuf_register_retries", kmbuf.register_retries.load());
         try field(w, "transport_kmbuf_attached_deliveries", worker.kmbuf_attached_deliveries.load());
         try field(w, "transport_kmbuf_attachment_breach", worker.kmbuf_attachment_breach.load());
+        try field(w, "transport_pool_queues_added", worker.pool_queues_added.load());
+        try field(w, "transport_pool_deliveries", worker.pool_deliveries.load());
+        try field(w, "transport_pool_zc_deliveries", worker.pool_zc_deliveries.load());
+        try field(w, "transport_pool_offset_breach", worker.pool_offset_breach.load());
+        try field(w, "transport_pool_offset_off_boundary", worker.pool_offset_off_boundary.load());
+        try field(w, "transport_pool_setup_late_cqes", worker.pool_setup_late_cqes.load());
+        try field(w, "transport_pool_zc_unarmed", worker.pool_zc_unarmed.load());
         try field(w, "transport_zc_bounce_bytes", worker.zc_bounce_resident_bytes.load());
         try field(w, "transport_zc_bounce_reserve_bytes", zc_bounce_slab_bytes.load());
         try field(w, "transport_zc_bounce_trimmed_bytes", worker.zc_bounce_trimmed_bytes.load());
@@ -2142,6 +2243,20 @@ pub const Session = struct {
         try w.print("\"{s}\":{d},", .{ name, v });
     }
 };
+
+/// The open posture table (decision 0003 §AO): `pool_zc` is a MainlinePool
+/// session whose queues are zero-copy; `zc_open_lever` is
+/// `SQUEEZEFS_FUSE_ZC_OPEN`. Every other session keeps the mount's
+/// `no_open`; a mainline zero-copy one serves opens under the lever (so the
+/// reply can grant zero-copy per file), or keeps zero-message opens and
+/// grants it to CREATE-opened files alone.
+pub const OpenPosture = struct { no_open: bool, zc_open: bool, zc_create_only: bool };
+
+pub fn openPosture(cfg_no_open: bool, pool_zc: bool, zc_open_lever: bool) OpenPosture {
+    if (!pool_zc) return .{ .no_open = cfg_no_open, .zc_open = false, .zc_create_only = false };
+    if (zc_open_lever) return .{ .no_open = false, .zc_open = true, .zc_create_only = false };
+    return .{ .no_open = cfg_no_open, .zc_open = !cfg_no_open, .zc_create_only = cfg_no_open };
+}
 
 /// Read `enable_uring`; write `Y` when it does not read enabled. A one-shot
 /// control write through the raw syscalls (sysfs refuses `O_TRUNC` opens
@@ -2554,6 +2669,19 @@ const TeardownWatchdog = struct {
         self.thread.join();
     }
 };
+
+test "the open posture table (decision 0003 §AO): every rung but mainline zero-copy keeps the mount's no_open; mainline zero-copy under SQUEEZEFS_FUSE_ZC_OPEN=1 serves opens with the flag whatever the mount read; under 0 it keeps zero-message opens and grants CREATE alone (or both replies when the mount already serves opens)" {
+    for ([_]bool{ true, false }) |cfg| {
+        for ([_]bool{ true, false }) |lever| {
+            try testing.expectEqual(OpenPosture{ .no_open = cfg, .zc_open = false, .zc_create_only = false }, openPosture(cfg, false, lever));
+        }
+    }
+    try testing.expectEqual(OpenPosture{ .no_open = false, .zc_open = true, .zc_create_only = false }, openPosture(true, true, true));
+    try testing.expectEqual(OpenPosture{ .no_open = false, .zc_open = true, .zc_create_only = false }, openPosture(false, true, true));
+    try testing.expectEqual(OpenPosture{ .no_open = true, .zc_open = false, .zc_create_only = true }, openPosture(true, true, false));
+    try testing.expectEqual(OpenPosture{ .no_open = false, .zc_open = true, .zc_create_only = false }, openPosture(false, true, false));
+    try testing.expectEqualStrings("1", knobs.row("SQUEEZEFS_FUSE_ZC_OPEN").default);
+}
 
 test "e2e: a LOOKUP and a GETATTR the filesystem answers from RAM never leave the worker — zero handler-lane dispatches, the probe served each, `serves + demotes ≡ LOOKUP + GETATTR`; a declining probe still answers through the lane (decision 0003 §AB.1)" {
     if (venueMissing()) |why| return testkit.skipWhy(@src(), why);
@@ -3382,6 +3510,132 @@ test "e2e lattice: the stock stratum (the SQUEEZEFS_TEST_KMBUF_ABSENT seam, a st
     }
     for ([_][]const u8{ "bufring", "zc" }, 0..) |mode, i| {
         const rig = try Rig.init(testing.allocator, 43 + @as(u32, @intCast(i)), &.{ seam, modeEnv(mode) });
+        defer rig.deinit();
+        log.testing.expectErrorLogs(1);
+        try testing.expectError(error.BufferModeRefused, rig.mountIt(.{ .mem_budget_bytes = 0 }));
+        try log.testing.expectAllFired();
+    }
+}
+
+/// The kernel's stratum by its INIT offer, read off a probe mount of EchoFs
+/// under `auto` (the only place the offer is visible): true on a mainline
+/// kernel (bit 43). One mount + unmount; null when the venue is missing.
+fn mainlineKernel(n: u32) !bool {
+    const rig = try Rig.init(testing.allocator, n, &.{});
+    defer rig.deinit();
+    const s = try rig.mountIt(.{ .mem_budget_bytes = 0 });
+    return s.verdicts.bufpool == .present;
+}
+
+test "e2e lattice: the mainline stratum (SQUEEZEFS_TEST_MAINLINE_POOLS answers the bufpool probe) — `auto` resolves MainlinePool over the kmbuf ladder's verdict, the legacy command probes are never sent (retention and rings-per-queue read absent, the derived rings need no FEATURES), the pool is mapped; on a kernel without the pool UAPI the first ring's ADD_QUEUE meets the legacy kernel's RELEASE_PAYLOAD and the mount fails LOUD with the typed MainlinePoolRefused — nothing registered, nothing mounted, nothing pinned; on a mainline kernel the same row mounts and serves; an explicit `pool` without the offer is refused by the bufpool probe" {
+    if (venueMissing()) |why| return testkit.skipWhy(@src(), why);
+    const seam: [2][]const u8 = .{ "SQUEEZEFS_TEST_MAINLINE_POOLS", "1" };
+    const live = try mainlineKernel(60);
+    {
+        const rig = try Rig.init(testing.allocator, 61, &.{seam});
+        defer rig.deinit();
+        if (live) {
+            const s = try rig.mountIt(.{ .mem_budget_bytes = 0 });
+            try testing.expectEqual(geometry.BufferMode.mainline_pool, s.mode);
+            try testing.expect(s.pool != null);
+            try testing.expectEqual(@as(u64, 3), probes.mode_gauge.load());
+        } else {
+            // This thread logs "group N failed to start"; the worker thread
+            // logs the refusal line naming both commands' results.
+            log.testing.expectErrorLogs(1);
+            try testing.expectError(error.MainlinePoolRefused, rig.mountIt(.{ .mem_budget_bytes = 0, .test_error_logs = 1 }));
+            try log.testing.expectAllFired();
+            var mi_buf: [64 * 1024]u8 = undefined;
+            const table = try Io.Dir.cwd().readFile(testing.io, "/proc/self/mountinfo", &mi_buf);
+            try testing.expectEqual(@as(?u32, null), mountinfoMinor(table, rig.path));
+        }
+        // The lattice's verdicts under the seam, legacy or live alike
+        // (published before any ring starts): the pool ranked above kmbuf
+        // (whose scratch-ring ladder still reports this kernel's truth:
+        // the opcode pair here, 0 on a mainline kernel), neither legacy
+        // command probe sent.
+        try testing.expectEqual(@as(u64, 1), probes.bufpool_gauge.load());
+        if (live) try testing.expectEqual(@as(u64, 0), probes.kmbuf_gauge.load());
+        try testing.expectEqual(@as(u64, 0), probes.retention_gauge.load());
+        try testing.expectEqual(@as(u64, 0), probes.rings_per_queue_gauge.load());
+        try testing.expectEqual(@as(u64, 3), probes.mode_gauge.load());
+    }
+    if (!live) {
+        const rig = try Rig.init(testing.allocator, 62, &.{modeEnv("pool")});
+        defer rig.deinit();
+        log.testing.expectErrorLogs(1);
+        try testing.expectError(error.BufferModeRefused, rig.mountIt(.{ .mem_budget_bytes = 0 }));
+        try log.testing.expectAllFired();
+    }
+}
+
+test "e2e mainline pools (Linux ≥ 7.3; skips where INIT offers no bufpool): `auto` mounts MainlinePool — every queue ADD_QUEUE'd and pooled (pool_queues_added ≡ queues), rings per queue the derived 3 with no FEATURES probe, the arena gauge is the pool; reads of /big and writes to /scratch serve byte-exact through the pool (pool_deliveries move, the offsets stay on the payload grid: off_boundary 0, breach 0) and the laws close; with zero-copy armed (CAP_SYS_ADMIN) an opened file's READ and WRITE are flagged ENT_ZERO_COPY (pool_zc_deliveries move) and a 1 MiB aligned write is HELD and stored straight from the slot; an explicit `bufring`/`zc` is refused naming kmbuf" {
+    if (venueMissing()) |why| return testkit.skipWhy(@src(), why);
+    if (!try mainlineKernel(63)) {
+        var kb: [192]u8 = undefined;
+        return testkit.skipWhy(@src(), testkit.venue.kernelFeatureAbsent(&kb, "the mainline buffer-pool UAPI (FUSE_HAS_IO_URING_BUFPOOL, Linux ≥ 7.3)"));
+    }
+    {
+        const rig = try Rig.init(testing.allocator, 64, &.{});
+        defer rig.deinit();
+        const dev_rc = linux.memfd_create("sqz-pool-write-dev", linux.MFD.CLOEXEC);
+        try testing.expect(linux.errno(dev_rc) == .SUCCESS);
+        const dev_fd: linux.fd_t = @intCast(dev_rc);
+        defer _ = linux.close(dev_fd);
+        try testing.expect(linux.errno(linux.ftruncate(dev_fd, 8 << 20)) == .SUCCESS);
+        rig.fs.hold_eligible = true;
+        const before = Snapshot.take();
+        const pd0 = worker.pool_deliveries.load();
+        const pz0 = worker.pool_zc_deliveries.load();
+        const pq0 = worker.pool_queues_added.load();
+        const s = try rig.mountIt(.{ .mem_budget_bytes = 0 });
+        try testing.expectEqual(geometry.BufferMode.mainline_pool, s.mode);
+        try testing.expectEqual(probes.Verdict.present, s.verdicts.bufpool);
+        try testing.expectEqual(probes.Verdict.absent, s.retention);
+        try testing.expectEqual(geometry.RINGS_PER_QUEUE_DERIVED, s.rings_per_queue);
+        try testing.expectEqual(@as(u64, s.plan.nqueues), worker.pool_queues_added.load() - pq0);
+        try testing.expectEqual(s.pool.?.bytes(), arena_bytes.load());
+        try testing.expectEqual(@as(u64, 0), kmbuf.pinned_bytes.load());
+        const zc_on = s.zeroCopyArmed();
+        try testing.expectEqual(zc_on, s.slab != null);
+        try testing.expectEqual(zc_on, rig.fs.caps.?.zc_open);
+        rig.fs.held_store = .{ .ctx = s, .fd = dev_fd, .store = &storeHeldThunk };
+        var pb: [256]u8 = undefined;
+        const big = try testing.allocator.alloc(u8, EchoFs.big_len);
+        defer testing.allocator.free(big);
+        try testing.expectEqual(EchoFs.big_len, try readWhole(rig.child(&pb, "big"), big));
+        for (big, 0..) |b, j| if (b != EchoFs.bigByte(j)) return error.BigPatternMismatch;
+        const data = "mainline pool bytes";
+        try testing.expectEqual(data.len, try writeWhole(rig.child(&pb, "scratch"), data));
+        try testing.expectEqualSlices(u8, data, rig.fs.scratch[0..data.len]);
+        try testing.expect(worker.pool_deliveries.load() > pd0);
+        if (zc_on) {
+            try testing.expect(worker.pool_zc_deliveries.load() > pz0);
+            const fd = try openPath(rig.child(&pb, "scratch"), .{ .ACCMODE = .WRONLY, .CLOEXEC = true });
+            defer _ = linux.close(fd);
+            const mib: usize = 1 << 20;
+            const buf = try testing.allocator.alignedAlloc(u8, .fromByteUnits(4096), mib);
+            defer testing.allocator.free(buf);
+            for (buf, 0..) |*b, i| b.* = @truncate((i * 7) ^ (i >> 12));
+            try testing.expectEqual(mib, linux.pwrite(fd, buf.ptr, mib, 0));
+            try testing.expectEqual(@as(u64, 1), rig.fs.held_writes.load(.monotonic));
+            try testing.expectEqual(@as(u64, 1), rig.fs.direct_stores.load(.monotonic));
+            const got = try testing.allocator.alloc(u8, mib);
+            defer testing.allocator.free(got);
+            try testing.expectEqual(mib, try preadAt(dev_fd, got, 0));
+            try testing.expectEqualSlices(u8, buf, got);
+        } else {
+            try testing.expectEqual(pz0, worker.pool_zc_deliveries.load());
+        }
+        const after = Snapshot.take();
+        try expectLaws(before, after);
+        try testing.expectEqual(@as(u64, 0), worker.pool_offset_breach.load());
+        try testing.expectEqual(@as(u64, 0), worker.pool_offset_off_boundary.load());
+        try testing.expectEqual(@as(u64, 0), worker.pool_setup_late_cqes.load());
+        try testing.expectEqual(@as(u64, 0), worker.pool_zc_unarmed.load());
+    }
+    for ([_][]const u8{ "bufring", "zc" }, 0..) |mode, i| {
+        const rig = try Rig.init(testing.allocator, 65 + @as(u32, @intCast(i)), &.{modeEnv(mode)});
         defer rig.deinit();
         log.testing.expectErrorLogs(1);
         try testing.expectError(error.BufferModeRefused, rig.mountIt(.{ .mem_budget_bytes = 0 }));

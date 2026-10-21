@@ -134,6 +134,15 @@ pub const InitCaps = struct {
     read_zc_serve: bool = false,
     /// Payload retention negotiated: `replyRetain` is available.
     retention: bool = false,
+    /// Mainline zero-copy is granted per open file (decision 0003 §AO):
+    /// `zc_open` asks the filesystem to SERVE regular-file opens and mark
+    /// every OPEN/CREATE reply `FOPEN_IO_URING_ZERO_COPY` (the session
+    /// already dropped zero-message opens for this mount); `zc_create_only`
+    /// keeps zero-message opens and marks CREATE replies alone (the one
+    /// reply a no-open connection still sends — a created file's first
+    /// open is zero-copy, a re-open is not).
+    zc_open: bool = false,
+    zc_create_only: bool = false,
 };
 
 /// The hold gate's input: the WRITE's shape and class, decided ON THE
@@ -702,8 +711,10 @@ const EchoFsImpl = struct {
                     return h.fail(.NOSYS);
                 }
                 if (self.attrOf(ino) == null) return h.fail(.NOENT);
-                // DIRECT_IO: every read and write reaches the daemon.
-                h.reply(codec.replyOpen(&out, u, ino, abi.FOPEN_DIRECT_IO));
+                // DIRECT_IO: every read and write reaches the daemon. A
+                // mainline zero-copy session's opens carry the per-file grant.
+                const zc_flag: u32 = if (self.caps != null and self.caps.?.zc_open) abi.FOPEN_IO_URING_ZERO_COPY else 0;
+                h.reply(codec.replyOpen(&out, u, ino, abi.FOPEN_DIRECT_IO | zc_flag));
             },
             .opendir => h.reply(codec.replyOpen(&out, u, ino, 0)),
             .release => {

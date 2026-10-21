@@ -148,6 +148,22 @@ pub fn dirOf(op: abi.Opcode, latch: ReaddirLatch) Dir {
     return .none;
 }
 
+/// The mainline rung's direction (fuse_mainline_pools.md §4): the kernel
+/// STATES a zero-copied delivery in `fuse_uring_ent_in_out.flags`
+/// (`FUSE_URING_ENT_ZERO_COPY`) — the quirk-3 resolution, no opcode mirror,
+/// no readdir latch — and zero-copies exactly READ (`out_pages`: a DEST)
+/// and WRITE (`in_pages`: a SOURCE); any other opcode flagged is a kernel
+/// the daemon does not know, read as copyable (the flag is then a lie the
+/// commit's EIO guard meets, never a bridge into a slot that is not there).
+pub fn mainlineDirOf(op: abi.Opcode, ent_flags: u64) Dir {
+    if (ent_flags & abi.FUSE_URING_ENT_ZERO_COPY == 0) return .none;
+    return switch (op) {
+        .write => .source,
+        .read => .dest,
+        else => .none,
+    };
+}
+
 // ---------------------------------------------------------------------------
 // The hold predicate and the stability class (porting spec §4.4, §5.2)
 // ---------------------------------------------------------------------------
@@ -460,6 +476,18 @@ test "the paged mirror is not track-keyed: READ/READLINK out-paged always, WRITE
     try testing.expectEqual(Dir.none, dirOf(.getattr, .unresolved));
     try testing.expectEqual(Dir.none, dirOf(.lookup, .paged));
     try testing.expect(!inPaged(.read) and inPaged(.write));
+}
+
+test "the mainline direction is the kernel's word, not a mirror: ENT_ZERO_COPY on a READ is a DEST slot, on a WRITE a SOURCE; unflagged READ/WRITE copy through the pool; a flagged opcode the kernel does not zero-copy (readdir, readlink) reads copyable" {
+    const f = abi.FUSE_URING_ENT_ZERO_COPY;
+    try testing.expectEqual(Dir.dest, mainlineDirOf(.read, f));
+    try testing.expectEqual(Dir.source, mainlineDirOf(.write, f));
+    try testing.expectEqual(Dir.none, mainlineDirOf(.read, 0));
+    try testing.expectEqual(Dir.none, mainlineDirOf(.write, 0));
+    try testing.expectEqual(Dir.none, mainlineDirOf(.readdir, f));
+    try testing.expectEqual(Dir.none, mainlineDirOf(.readlink, f));
+    try testing.expectEqual(Dir.none, mainlineDirOf(.getattr, f | 2));
+    try testing.expectEqual(Dir.dest, mainlineDirOf(.read, f | 2));
 }
 
 test "the hold shape: 4 KiB alignment, within one block, zero length never, no bound of its own (a whole-payload 1 MiB write holds, a 4 MiB block-sized write holds); the class splits on PATCH_MAX = block/8 — at or under it W1, above it the overlay" {

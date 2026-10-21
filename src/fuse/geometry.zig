@@ -375,9 +375,23 @@ pub var gauges: Gauges = .{};
 // Drain groups (charter §4; fuse_uring_transport.md §3)
 // ---------------------------------------------------------------------------
 
-/// The buffer-mode lattice (charter §4): kmbuf/zc registration is per ring
-/// per queue, so those sessions keep width 1.
-pub const BufferMode = enum { user_ents, buf_ring, zero_copy };
+/// The buffer-mode lattice (charter §4, amended 2026-10-21): `mainline_pool`
+/// is the PRIMARY rung — mainline's buffer-pool UAPI (Linux ≥ 7.3: one user
+/// pool per queue, registered on each of the queue's rings, per-entry
+/// zero-copy slots granted per open file); `buf_ring` / `zero_copy` are the
+/// TRANSITIONAL rungs of the 7.2-sqz kmbuf series. Every rung but
+/// `user_ents` registers per ring per queue, so those sessions keep width 1.
+pub const BufferMode = enum {
+    user_ents,
+    buf_ring,
+    zero_copy,
+    mainline_pool,
+
+    /// A ring serves ONE queue (the per-ring buffer resources are the queue's).
+    pub fn ringPerQueue(m: BufferMode) bool {
+        return m != .user_ents;
+    }
+};
 
 /// `max(n / 4, 1)`: the cpus/4 drain-parallelism slope. Measured 2026-08-05
 /// on a 32-possible single-node box: widths 1–8 at IOPS par on a ~340 k
@@ -389,10 +403,11 @@ pub fn drainGroupWidth(n: u32) u32 {
     return @max(n / 4, 1);
 }
 
-/// `BufRing | ZeroCopy ⇒ 1`; `UserEnts ⇒ the explicit knob`, else derived.
+/// `BufRing | ZeroCopy | MainlinePool ⇒ 1` (a ring's pool or buffer ring is
+/// one queue's); `UserEnts ⇒ the explicit knob`, else derived.
 pub fn forcedWidth(mode: BufferMode, explicit: ?u32) ?u32 {
     return switch (mode) {
-        .buf_ring, .zero_copy => 1,
+        .buf_ring, .zero_copy, .mainline_pool => 1,
         .user_ents => if (explicit) |w| @intCast(derive.clamp(w, 1, MAX_QUEUES)) else null,
     };
 }
@@ -445,9 +460,16 @@ pub const RINGS_PER_QUEUE_DERIVED: u32 = 3;
 /// left between a promotion's commit and its ring release, judged at
 /// dismount since `rung-10-dismount-corpse.md`) and the write row was the
 /// thermal throttle (cooled: 0.99×; reads 1.11× / 1.70× / 1.29×).
+/// On `mainline_pool` the count needs no kernel patch: the pool is user
+/// memory every ring of the queue registers at the same index and the
+/// kernel keys a buffer by its offset, not by a ring — so the derived 3
+/// applies there as the legacy measurement carried over (the per-op cost
+/// ratio is the same daemon against the same submitter), to be re-measured
+/// on 7.3 (`rung-10-fuse-mainline-uapi.md`'s plan).
 pub fn ringsPerQueue(mode: BufferMode, rings_feature: bool) u32 {
     return switch (mode) {
         .buf_ring, .zero_copy => if (rings_feature) RINGS_PER_QUEUE_DERIVED else 1,
+        .mainline_pool => RINGS_PER_QUEUE_DERIVED,
         .user_ents => 1,
     };
 }
@@ -1069,6 +1091,12 @@ test "rings per queue: 3 where the FEATURES probe reads present on kmbuf/zc (the
     try testing.expectEqual(@as(u32, 1), ringsPerQueue(.user_ents, true));
     try testing.expectEqual(@as(u32, 1), ringsPerQueue(.zero_copy, false));
     try testing.expectEqual(@as(u32, 1), ringsPerQueue(.buf_ring, false));
+    // MainlinePool needs no FEATURES patch: the pool is user memory every
+    // ring registers at one index; the derived count applies either way.
+    try testing.expectEqual(@as(u32, 3), ringsPerQueue(.mainline_pool, false));
+    try testing.expectEqual(@as(u32, 3), ringsPerQueue(.mainline_pool, true));
+    try testing.expect(BufferMode.mainline_pool.ringPerQueue() and !BufferMode.user_ents.ringPerQueue());
+    try testing.expectEqual(@as(?u32, 1), forcedWidth(.mainline_pool, 5));
     try testing.expectEqual(@as(u32, 1), resolveRingsPerQueue(1, 2));
     try testing.expectEqual(@as(u32, 2), resolveRingsPerQueue(2, 1));
     try testing.expectEqual(@as(u32, 2), resolveRingsPerQueue(null, 2));

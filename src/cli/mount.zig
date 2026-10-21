@@ -743,7 +743,7 @@ fn mountMain(ctx: *Ctx) u8 {
     // The zc legs: the held-slot direct store on a zero-copy session, the
     // direct device leg, the fd-source probe serve.
     var held_store: HeldStore = .{ .session = session };
-    plane.armSession(if (session.heldStoreArmed()) held_store.face() else null, session.mode == .zero_copy, session.readZcServe());
+    plane.armSession(if (session.heldStoreArmed()) held_store.face() else null, session.zeroCopyArmed(), session.readZcServe());
     // 3b. `-o interception`: the client bypass's session host (charter §7)
     //     — the listeners, the admission, the service threads on demand,
     //     the direct-drive lanes — then the `il0` xattr the shim/SDK read.
@@ -870,7 +870,9 @@ fn mountMain(ctx: *Ctx) u8 {
     //    supervisor's first probe can read it (the watchdog's first tick is
     //    one interval away; a page still 0 reads as a missed probe).
     if (ctx.heartbeat) |h| h.beat();
-    if (no_open) latchNoOpen(ctx.mountpoint);
+    // The session's posture, not the knob's: a mainline zero-copy session
+    // serves opens (decision 0003 §AO) and has nothing to latch.
+    if (session.noOpen()) latchNoOpen(ctx.mountpoint);
     log.info("ready: {s} mounted at {s} (pid {d}; {d} queue(s) × depth {d}; budget {d} MiB; TTLs attr {d} ms entry {d} ms dir_entry {d} ms negative {d} ms)", .{ ctx.meta_uri, ctx.mountpoint, linux.getpid(), session.plan.nqueues, session.plan.depth, ctx.budget_bytes >> 20, ctx.opts.ttls.attr_ns / std.time.ns_per_ms, ctx.opts.ttls.entry_ns / std.time.ns_per_ms, ctx.opts.ttls.dir_entry_ns / std.time.ns_per_ms, ctx.opts.ttls.negative_ns / std.time.ns_per_ms });
     if (ctx.reporter) |*r| {
         r.ready();

@@ -207,6 +207,11 @@ pub fn Dispatcher(comptime Transport: type) type {
         no_open: bool,
         drain_coalesce_ns: u64,
         writeback: open_table.Posture,
+        /// Mainline zero-copy is granted PER OPEN FILE (`FOPEN_IO_URING_
+        /// ZERO_COPY` on the OPEN/CREATE reply; decision 0003 §AO): the
+        /// bit every regular-file open reply carries on such a session, 0
+        /// elsewhere. Set at `initFilesystem` from the session's caps.
+        zc_open_flag: u32 = 0,
 
         /// FUSE-2: exactly one reply per delivered request. The value owes
         /// a reply from construction; `reply`/`fail` consume it; `deinit`
@@ -406,12 +411,32 @@ pub fn Dispatcher(comptime Transport: type) type {
             return .{ .unique = 0, .uid = 0, .gid = 0, .pid = 0, .io = self.io, .trace = trace, .wd_slot = null, .window = &.{} };
         }
 
-        /// After INIT negotiated, before the session is ready.
-        pub fn initFilesystem(self: *Self, negotiated: u64, minor: u32) Error!void {
+        /// After INIT negotiated, before the session is ready. `zc_open`
+        /// (decision 0003 §AO): the session is a mainline zero-copy one
+        /// whose opens must be SERVED so the reply can grant zero-copy —
+        /// the open posture becomes the control arm's (OPEN served,
+        /// RELEASE counted, `FOPEN_NOFLUSH` on clean handles), whatever the
+        /// mount read from `SQUEEZEFS_FUSE_NO_OPEN`; `zc_create_only` keeps
+        /// zero-message opens and grants zero-copy to CREATE-opened files
+        /// alone (the only reply a no-open connection still sends).
+        pub fn initFilesystem(self: *Self, negotiated: u64, minor: u32, zc_open: bool, zc_create_only: bool) Error!void {
+            if (zc_open) {
+                self.no_open = false;
+                self.opens.no_open = false;
+                self.zc_open_flag = abi.FOPEN_IO_URING_ZERO_COPY;
+            } else if (zc_create_only) {
+                self.zc_open_flag = abi.FOPEN_IO_URING_ZERO_COPY;
+            }
             var trace = op_trace.OpTrace.begin(0, .other);
             defer trace.finish();
             var ctx = self.sessionCtx(&trace);
             try self.fs.vtable.init(self.fs.impl, &ctx, .{ .negotiated = negotiated, .minor = minor, .no_open = self.no_open, .writeback_timer = self.writeback == .timer });
+        }
+
+        /// The open posture after INIT (the session's `no_open` may have
+        /// been overridden by the zero-copy open arm).
+        pub fn servesOpen(self: *const Self) bool {
+            return !self.no_open;
         }
 
         /// The session's teardown hook (DESTROY arrived, or the connection
@@ -549,7 +574,7 @@ pub fn Dispatcher(comptime Transport: type) type {
                     defer if (g) |gg| gg.release(self.io);
                     const o = try fs.vtable.open(fs.impl, c, .{ .ino = ino, .flags = a.flags, .open_flags = a.open_flags });
                     _ = try self.opens.addOpen(ino);
-                    return codec.replyOpen(out, u, o.fh, o.open_flags);
+                    return codec.replyOpen(out, u, o.fh, o.open_flags | self.zc_open_flag);
                 },
                 .opendir => |a| {
                     const o = try fs.vtable.opendir(fs.impl, c, .{ .ino = ino, .flags = a.flags, .open_flags = a.open_flags });
@@ -562,7 +587,7 @@ pub fn Dispatcher(comptime Transport: type) type {
                     // No-open: once the connection latched, no RELEASE comes
                     // for this file — a count would strand.
                     if (!self.no_open) _ = try self.opens.addOpen(cr.entry.nodeid);
-                    return codec.replyCreate(out, u, cr.entry, cr.fh, cr.open_flags);
+                    return codec.replyCreate(out, u, cr.entry, cr.fh, cr.open_flags | self.zc_open_flag);
                 },
                 .read => |r| {
                     const d = try fs.vtable.read(fs.impl, c, .{ .ino = ino, .fh = r.fh, .offset = r.offset, .size = r.size, .flags = r.flags });
@@ -1064,7 +1089,7 @@ test "no-open (decision 0003 §AF): OPEN answers ENOSYS before the filesystem or
     try rig.initPosture(true);
     defer rig.deinit();
     try testing.expect(rig.opens.no_open);
-    try rig.d.initFilesystem(0, 45);
+    try rig.d.initFilesystem(0, 45, false, false);
     try testing.expectEqual(@as(?bool, true), rig.fsi.init_no_open);
     const s = Loopback.slot(2);
     // CREATE: the entry's lookup reference, no open count.
@@ -1129,6 +1154,56 @@ test "no-open (decision 0003 §AF): OPEN answers ENOSYS before the filesystem or
     try testing.expectEqual(@as(?codec.Reply, null), ctl.d.probeMeta(fl, Rig.meta(2, 50), &out));
 }
 
+test "mainline zero-copy per open file (decision 0003 §AO): `zc_open` at INIT turns a no-open dispatcher into the open-serving arm — OPEN reaches the filesystem, its reply and a CREATE's carry FOPEN_IO_URING_ZERO_COPY over the filesystem's flags, the open table counts opens, the filesystem learns no_open=false; `zc_create_only` keeps ENOSYS opens and marks CREATE alone; a plain INIT marks nothing" {
+    const zcf = abi.FOPEN_IO_URING_ZERO_COPY;
+    // (a) serve opens with the flag.
+    {
+        var rig: Rig = undefined;
+        try rig.initPosture(true);
+        defer rig.deinit();
+        try rig.d.initFilesystem(0, 45, true, false);
+        try testing.expect(rig.d.servesOpen() and !rig.opens.no_open);
+        try testing.expectEqual(@as(?bool, false), rig.fsi.init_no_open);
+        const s = Loopback.slot(2);
+        rig.d.dispatch(.{ .create = .{ .name = "f", .flags = 0, .mode = 0o644, .umask = 0, .open_flags = 0 } }, Rig.meta(2, 1), s, null);
+        const c = rig.lb.captured(s).?;
+        const co = abi.decodeExact(abi.fuse_open_out, c.outBytes()[128..144]).?;
+        try testing.expectEqual(abi.FOPEN_KEEP_CACHE | zcf, co.open_flags);
+        try testing.expectEqual(@as(u32, 1), rig.opens.get(50).?.count);
+        rig.d.dispatch(.{ .open = .{ .flags = 0, .open_flags = 0 } }, Rig.meta(4, 50), s, null);
+        try testing.expectEqual(@as(u32, 1), rig.fsi.open_calls);
+        try testing.expectEqual(zcf, rig.lb.outAs(s, abi.fuse_open_out).?.open_flags);
+        try testing.expectEqual(@as(u32, 2), rig.opens.get(50).?.count);
+    }
+    // (b) keep zero-message opens; CREATE alone carries the flag.
+    {
+        var rig: Rig = undefined;
+        try rig.initPosture(true);
+        defer rig.deinit();
+        try rig.d.initFilesystem(0, 45, false, true);
+        try testing.expect(!rig.d.servesOpen() and rig.opens.no_open);
+        try testing.expectEqual(@as(?bool, true), rig.fsi.init_no_open);
+        const s = Loopback.slot(3);
+        rig.d.dispatch(.{ .create = .{ .name = "f", .flags = 0, .mode = 0o644, .umask = 0, .open_flags = 0 } }, Rig.meta(2, 1), s, null);
+        const co = abi.decodeExact(abi.fuse_open_out, rig.lb.captured(s).?.outBytes()[128..144]).?;
+        try testing.expectEqual(abi.FOPEN_KEEP_CACHE | zcf, co.open_flags);
+        try testing.expectEqual(@as(u32, 0), rig.opens.get(50).?.count);
+        rig.d.dispatch(.{ .open = .{ .flags = 0, .open_flags = 0 } }, Rig.meta(4, 50), s, null);
+        try testing.expectEqual(linux.E.NOSYS, rig.lb.captured(s).?.errno().?);
+        try testing.expectEqual(@as(u32, 0), rig.fsi.open_calls);
+    }
+    // The other rungs: nothing added.
+    {
+        var rig: Rig = undefined;
+        try rig.init();
+        defer rig.deinit();
+        try rig.d.initFilesystem(0, 45, false, false);
+        const s = Loopback.slot(4);
+        rig.d.dispatch(.{ .open = .{ .flags = 0, .open_flags = 0 } }, Rig.meta(4, 50), s, null);
+        try testing.expectEqual(@as(u32, 0), rig.lb.outAs(s, abi.fuse_open_out).?.open_flags);
+    }
+}
+
 test "no-open close bursts (decision 0003 §AF): a FLUSH with custody drains on the lane and stamps the ino; the next close with custody inside the coalescing window is answered by the worker's probe with no drain, the ino owed `deferred` for the reclaim cadence; past the window a close drains again; with no window every close drains" {
     var rig: Rig = undefined;
     try rig.initPosture(true);
@@ -1176,7 +1251,7 @@ test "the write-back timer (decision 0003 §AJ): INIT hands the posture down; a 
         var rig: Rig = undefined;
         try rig.initWriteback(no_open, .timer);
         defer rig.deinit();
-        try rig.d.initFilesystem(abi.FUSE_HANDLE_KILLPRIV_V2, 45);
+        try rig.d.initFilesystem(abi.FUSE_HANDLE_KILLPRIV_V2, 45, false, false);
         try testing.expectEqual(@as(?bool, true), rig.fsi.init_writeback_timer);
         try testing.expectEqual(open_table.Posture.timer, rig.opens.posture);
         try rig.opens.noteLookup(50);

@@ -181,7 +181,7 @@ const Rig = struct {
         // The applier venue's A/B lever and the flush cadence reach the
         // daemons the same way (`SQUEEZEFS_META_APPLIERS=0 zig build smoke …`
         // gates the inline arm; a short cadence pins a drain inside a row).
-        for ([_][]const u8{ "SQUEEZEFS_META_APPLIERS", "SQUEEZEFS_META_FLUSH_INTERVAL_MS", "SQUEEZEFS_META_PASS_VENUE", "SQUEEZEFS_META_WINDOW_HOLD" }) |k| {
+        for ([_][]const u8{ "SQUEEZEFS_META_APPLIERS", "SQUEEZEFS_META_FLUSH_INTERVAL_MS", "SQUEEZEFS_META_PASS_VENUE", "SQUEEZEFS_META_WINDOW_HOLD", "SQUEEZEFS_META_ACK_POINT", "SQUEEZEFS_META_APPLY" }) |k| {
             if (knobs.present(proc_env.get(k))) |v| try self.env.put(k, v);
         }
         _ = linux.mkdir(self.work.ptr, 0o755);

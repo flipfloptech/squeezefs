@@ -3600,6 +3600,7 @@ test "§BC self-apply: a 4-thread storm of this mount's kernel's creates — eve
     const gpa = testing.allocator;
     const v = try TestVol.create(gpa, "self-apply", "600000");
     defer v.destroy();
+    try v.env.put("SQUEEZEFS_META_APPLY", "self");
     const threads = 4;
     const per_thread = 50;
     var acked: [threads][per_thread]u64 = undefined;

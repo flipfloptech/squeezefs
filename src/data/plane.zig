@@ -2073,7 +2073,9 @@ pub const DataPlane = struct {
     /// inline; `slot > CHUNK/2` ⇒ its own block; else a packed tenant. The
     /// identity is re-checked under the promotion's locks — the (3.5) stripe
     /// THEN the (3.7) layout lock (module doc; `PublishLocks.lockPromotion`)
-    /// — (still staged, same file id, same ring generation); true iff the
+    /// — (still staged, same file id) and the resident promoted is the one
+    /// READ under them (`promoteUnder`: a re-stage since the census is the
+    /// newer image, promoted in the older one's stead); true iff the
     /// entry left the ring. A displaced durable copy is released after the
     /// locks drop (RES-1). A record the layout does not name stays: the
     /// live points run beside the ops (an unlinked-open file reads its
@@ -2102,15 +2104,41 @@ pub const DataPlane = struct {
         const st = &(self.stage orelse return .kept);
         const ino = k.ino();
         stats.promotions_run.inc();
-        const lease = st.seg.get(k) orelse {
+        var lease = st.seg.get(k) orelse {
             stats.promotions_stale.inc();
             return .kept;
         };
+        const census_generation = lease.generation();
+        if (self.test_promotion_hold) |path| if (!self.promotion_held.swap(true, .acq_rel)) holdPromotion(io, ino, path);
+        const locks = self.locks.lockPromotion(io, ino);
+        // The resident to promote is the one under the locks: every writer of
+        // the ino stages, appends and overwrites under its (3.7), so the
+        // record read here cannot move until they drop. A record a NEWER
+        // write re-staged between the census that handed us the key (syncfs's,
+        // the LRU drain's, a recall's) and the locks has nothing to promote at
+        // the census's generation — and judging it `kept` answered EIO to a
+        // benign race (LTP ftest01–08: siblings' sync() against a writer, 1,407
+        // lines in one run). syncfs's law (charter §1 item 10, §6.1 "syncfs
+        // promotes every resident": every write acked before the call is on
+        // stable storage at its return) is met by promoting the CURRENT image:
+        // a re-stage is the whole file and an in-place write a fresh
+        // generation of the same record, so the newer image carries every byte
+        // the census's did. ONE re-lease is the whole loop — (3.7) pins it.
+        if (st.seg.residentGeneration(k) != census_generation) {
+            lease.release();
+            stats.promotions_restaged.inc();
+            lease = st.seg.get(k) orelse {
+                // Gone under the locks (its writer's failed commit released
+                // it, a truncate to zero): nothing resident, nothing owed —
+                // the fsync point reads `.absent` off the ring.
+                locks.release(io);
+                stats.promotions_stale.inc();
+                return .kept;
+            };
+        }
         defer lease.release();
         const generation = lease.generation();
         const image = lease.bytes();
-        if (self.test_promotion_hold) |path| if (!self.promotion_held.swap(true, .acq_rel)) holdPromotion(io, ino, path);
-        const locks = self.locks.lockPromotion(io, ino);
         const corpse = pass == .dismount and self.inoIsCorpse(ino);
         const out: Promoted = if (corpse) .{ .ok = false } else self.promoteLocked(io, ino, k, generation, image);
         const verdict: staging.DismountVerdict = if (out.ok) .promoted else if (corpse) .corpse else if (pass == .dismount and out.unnamed and writeback.blockOfKey(k) == null) .unnamed else .kept;

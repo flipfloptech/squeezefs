@@ -8470,6 +8470,93 @@ test "smoke: THE CONTROL ARM'S CLOSE DRAIN (SQUEEZEFS_FUSE_NO_OPEN=0) — the sa
     try closeDrainRow(false);
 }
 
+/// The unmount law's files (fstests generic/029's shape, the mapping left
+/// out — the loss needs none; `$1` = the work dir). `t`: 5,120 B (past
+/// inline_max) truncated DOWN into inline range and UP again, then its
+/// tail `[2048, 5120)` rewritten — a size-neutral write past the image the
+/// layout record names. `s`: a striped file (past the block) with ONE
+/// size-neutral overwrite inside it, its custody parked under the
+/// write-back timer. `v`: `t`'s dance then fdatasync (`sync -d`, the
+/// rig sync rail's form) — the tail is owed from the ack on. The expected
+/// images beside them in the work dir.
+const unmount_owes_setup =
+    \\x() { head -c "$1" /dev/zero | tr '\0' X; }
+    \\y() { head -c "$1" /dev/zero | tr '\0' Y; }
+    \\{ x 2048; y 3072; } > "$1/exp-t"
+    \\{ x 2048; y 3072; x 4193280; } > "$1/exp-s"
+    \\x 5120 > t && truncate -s 2048 t && truncate -s 5120 t && y 3072 | dd of=t bs=3072 seek=2048 oflag=seek_bytes conv=notrunc iflag=fullblock status=none
+    \\x 4198400 > s && sync -d s && y 3072 | dd of=s bs=3072 seek=2048 oflag=seek_bytes conv=notrunc iflag=fullblock status=none
+    \\x 5120 > v && truncate -s 2048 v && truncate -s 5120 v && y 3072 | dd of=v bs=3072 seek=2048 oflag=seek_bytes conv=notrunc iflag=fullblock status=none && sync -d v
+    \\for f in t s v; do e=exp-$f; [ $f = v ] && e=exp-t; if cmp -s $f "$1/$e"; then echo $f-whole; else echo $f-LOST; fi; done
+;
+const unmount_owes_check = "for f in t s v; do e=exp-$f; [ $f = v ] && e=exp-t; if cmp -s $f \"$1/$e\"; then echo $f-whole; else echo $f-LOST; fi; done";
+
+/// One posture of the unmount law's row: the files written, every byte
+/// read back on the same mount, the ORDERLY unmount the moment the last
+/// write returned (no fsync of `t` or `s`, no wait for the timer), the
+/// remount: every byte there. Then the fsync'd dance killed -9 at once:
+/// fsck clean, the remount reads the fsync'd tail.
+fn unmountOwesRow(write_cache: bool) !void {
+    const io = testing.io;
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    try rig.formatSet(write_cache);
+    try rig.env.put("SQUEEZEFS_BLOCK_REFS_VERIFY", "1");
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(0);
+    {
+        const out = try rig.onMount(unmount_owes_setup);
+        defer gpa.free(out);
+        std.debug.print("\nsmoke[unmount owes, write_cache={}]: on the writing mount: {s}\n", .{ write_cache, std.mem.trim(u8, out, "\n") });
+        // The fsync'd dance reads whole on its own mount: the promotion
+        // kept the tail the record's size did not name.
+        try testing.expect(std.mem.indexOf(u8, out, "v-whole") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "LOST") == null);
+    }
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+    var mark = try rig.logLen();
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(mark);
+    {
+        const out = try rig.onMount(unmount_owes_check);
+        defer gpa.free(out);
+        std.debug.print("smoke[unmount owes, write_cache={}]: after the orderly unmount and the remount: {s}\n", .{ write_cache, std.mem.trim(u8, out, "\n") });
+        try testing.expect(std.mem.indexOf(u8, out, "t-whole") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "s-whole") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "v-whole") != null);
+    }
+    // The kill arm: the fsync'd dance's tail is owed across a crash.
+    {
+        const out = try rig.onMount("rm -f t s v && " ++ unmount_owes_setup);
+        defer gpa.free(out);
+        try testing.expect(std.mem.indexOf(u8, out, "v-whole") != null);
+    }
+    try rig.kill();
+    const recovered = try fsckClean(rig, "the kill after the fsync'd dance");
+    mark = try rig.logLen();
+    _ = try remountAfterKill(rig, recovered);
+    {
+        const out = try rig.onMount("if cmp -s v \"$1/exp-t\"; then echo v-whole; else echo v-LOST; fi");
+        defer gpa.free(out);
+        std.debug.print("smoke[unmount owes, write_cache={}]: after the kill and the remount: {s}\n", .{ write_cache, std.mem.trim(u8, out, "\n") });
+        try testing.expect(std.mem.indexOf(u8, out, "v-whole") != null);
+    }
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+}
+
+test "smoke: AN ORDERLY UNMOUNT LANDS EVERY ACKED WRITE (fstests generic/029; charter §6.1 'Staged', decision 0003 §AJ) — WITH the write cache: `t` 5,120 B truncated down to 2,048 and up again, its tail rewritten (the staged arm's size-neutral write past the record's image); `s` a striped file with one overwrite inside it (custody parked under the write-back timer); `v` the dance then fsync — all three read whole on the writing mount → the orderly unmount the moment the last write returned → remount → every byte there; then the fsync'd dance killed -9 → fsck --offline clean → remount → its tail there" {
+    if (venueMissing(testing.io)) |why| return testkit.skipWhy(@src(), why);
+    try unmountOwesRow(true);
+}
+
+test "smoke: AN ORDERLY UNMOUNT LANDS EVERY ACKED WRITE — WITHOUT the write cache (SQUEEZEFS_WRITE_CACHE_PCT=0: every write past inline parks a partial block in RAM): the same files, the same unmount at once, the same remount — every byte there; the fsync'd dance killed -9 → fsck clean → remount → whole" {
+    if (venueMissing(testing.io)) |why| return testkit.skipWhy(@src(), why);
+    try unmountOwesRow(false);
+}
+
 /// The ordered law's kill row: a small file's size before its growth — a
 /// resident image (below the inline bound), so the growth promotes it.
 const ordered_small: u64 = 100;

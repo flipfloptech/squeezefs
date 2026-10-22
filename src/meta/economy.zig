@@ -1011,17 +1011,6 @@ pub const PendingTimes = struct {
         }
     }
 
-    /// Every ino holding a parked size claim, appended to `out` (the
-    /// dismount's landing pass, §AL.5).
-    pub fn claimants(self: *PendingTimes, gpa: Allocator, out: *std.ArrayList(u64)) Allocator.Error!void {
-        for (&self.stripes) |*s| {
-            s.lock.lock();
-            defer s.lock.unlock();
-            var it = s.map.iterator();
-            while (it.next()) |e| if (e.value_ptr.size != 0) try out.append(gpa, e.key_ptr.*);
-        }
-    }
-
     /// Every parked ino, appended to `out` — the drain's snapshot, taken
     /// BEFORE any gate or guard (a drain with no work touches nothing) and
     /// ONCE per tick: what parks while the tick drains is the next tick's.

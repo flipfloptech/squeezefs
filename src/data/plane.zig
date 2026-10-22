@@ -1688,6 +1688,14 @@ pub const DataPlane = struct {
         self.wp.flushIno(io, ino);
     }
 
+    /// The unmount's landing pass (charter §8 `umount`): every ino holding
+    /// write-side custody drains as at its RELEASE (`WritePath.flushAll`),
+    /// before the filesystem's dismount sweep journals the size claims
+    /// behind it.
+    pub fn flushAllCustody(self: *DataPlane, io: Io) void {
+        self.wp.flushAll(io);
+    }
+
     /// The no-open FLUSH's try-only probe (decision 0003 §AF): whether
     /// `releaseIno` would land anything for `ino` (`WritePath.holdsCustody`).
     /// The write-back timer's drain of one ino (decision 0003 §AJ).

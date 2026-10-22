@@ -613,7 +613,7 @@ pub fn syncfs(ctx: Ctx, gpa: Allocator, io: Io, prof: *SyncfsProf) Error!void {
 }
 
 /// The unique prefix of an ascending slice, in place.
-fn dedupeSorted(xs: []u64) []u64 {
+pub fn dedupeSorted(xs: []u64) []u64 {
     if (xs.len == 0) return xs;
     var n: usize = 1;
     for (xs[1..]) |x| {

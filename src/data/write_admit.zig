@@ -1502,6 +1502,38 @@ pub const WritePath = struct {
         _ = self.epochs.close(io, ino, self.closeSeams());
     }
 
+    /// Every ino holding write-side custody right now — a parked block, an
+    /// open overlay record, a rewrite epoch open or saving — ascending and
+    /// distinct in `out` (the syncfs census's population, `fsync.syncfs`).
+    pub fn custodyInos(self: *WritePath, gpa: Allocator, out: *std.ArrayList(u64)) Allocator.Error![]u64 {
+        var keys: std.ArrayList(accumulate.Key) = .empty;
+        defer keys.deinit(gpa);
+        try self.table.censusKeys(gpa, &keys);
+        try out.ensureUnusedCapacity(gpa, keys.items.len);
+        for (keys.items) |k| out.appendAssumeCapacity(k.ino);
+        try self.overlay.registry.censusInos(gpa, out);
+        try self.epochs.censusInos(gpa, out);
+        std.mem.sort(u64, out.items, {}, std.sort.asc(u64));
+        return fsync_mod.dedupeSorted(out.items);
+    }
+
+    /// The unmount's landing (charter §8 `umount`: an orderly unmount
+    /// leaves no acked write in RAM): every ino the census finds holding
+    /// custody through the RELEASE drain (`flushIno`) — the size
+    /// claimants' and the size-neutral writers' alike (an overwrite inside
+    /// a file under the write-back timer parks custody and no claim:
+    /// fstests generic/029 lost such a tail at an unmount within T_wb).
+    /// The staged residents are the dismount pass's (`DataPlane.dismount`).
+    pub fn flushAll(self: *WritePath, io: Io) void {
+        var inos: std.ArrayList(u64) = .empty;
+        defer inos.deinit(self.gpa);
+        const holders = self.custodyInos(self.gpa, &inos) catch {
+            log.err("the unmount's landing pass could not list the custody holders (out of memory): their bytes stay in RAM", .{});
+            return;
+        };
+        for (holders) |ino| self.flushIno(io, ino);
+    }
+
     /// The pre-clip settle (a truncate, an O_TRUNC open, the corpse
     /// destroy): the ino's write-side custody lands or drops before its
     /// layout is read and clipped — exactly `flushIno` (a parked block's

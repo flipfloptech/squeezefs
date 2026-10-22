@@ -353,7 +353,7 @@ pub fn assertStore(comptime T: type) void {
 /// the product; `NoData` is the volume-less set).
 pub fn assertData(comptime T: type) void {
     comptime {
-        for ([_][]const u8{ "hasVolumes", "stagingOn", "blockSize", "inlineMax", "geometry", "refsSeam", "noteShape", "forgetShape", "noteSizeSet", "sizeSetSince", "isPassthrough", "canStoreHeld", "write", "zeroExtension", "custodyFloor", "barrierData", "read", "ownBlock", "abandonOwnBlock", "ownBlockPublished", "holdReleases", "dropReleases", "freeBindings", "flushCustody", "releaseIno", "hasWriteCustody", "fsync", "statfs", "mintFileId", "stageImage", "appendStaged", "overwriteStaged", "stagedPoint", "stagedPointCached", "releaseStaged", "stagedLease", "readMappingImage", "lockLayout", "stageKvmapShrink", "stageKvmapCorpse", "drainKvmapSweep", "publishForeign" }) |name| {
+        for ([_][]const u8{ "hasVolumes", "stagingOn", "blockSize", "inlineMax", "geometry", "refsSeam", "noteShape", "forgetShape", "noteSizeSet", "sizeSetSince", "isPassthrough", "canStoreHeld", "write", "zeroExtension", "custodyFloor", "barrierData", "read", "ownBlock", "abandonOwnBlock", "ownBlockPublished", "holdReleases", "dropReleases", "freeBindings", "flushCustody", "flushAllCustody", "releaseIno", "hasWriteCustody", "fsync", "statfs", "mintFileId", "stageImage", "appendStaged", "overwriteStaged", "stagedPoint", "stagedPointCached", "releaseStaged", "stagedLease", "readMappingImage", "lockLayout", "stageKvmapShrink", "stageKvmapCorpse", "drainKvmapSweep", "publishForeign" }) |name| {
             if (!@hasDecl(T, name)) @compileError(@typeName(T) ++ " is not a kv_fs Data face: lacks `" ++ name ++ "`");
         }
     }
@@ -1625,10 +1625,11 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         }
 
         pub fn destroy(self: *Self, c: *Ctx, _: filesystem.DestroyArgs) void {
-            // The dismount sweep: every gathered corpse destroyed, then
-            // every parked stamp journaled (the dismount's durability point).
+            // The dismount sweep: every gathered corpse destroyed, every
+            // write custody landed, then every parked stamp journaled (the
+            // dismount's durability point).
             self.reclaimDrain(c) catch |e| log.err("kv_fs: dismount reclaim drain failed: {t}", .{e});
-            self.landClaims();
+            self.landCustody();
             _ = self.drainPendingTimes(c) catch |e| log.err("kv_fs: dismount times drain failed: {t} ({d} refinement(s) stay parked)", .{ e, self.pending.len() });
             self.data_live = false;
         }
@@ -3051,7 +3052,18 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             // no journal bytes. The bytes are the ring's, durable at the
             // ino's fsync (the record's own law); a KILLPRIV write keeps the
             // transaction (its mode strip is a record).
-            if (keep_identity and end <= probe.size and self.times_park and a.write_flags & abi.FUSE_WRITE_KILL_SUIDGID == 0) {
+            // THE RECORD'S SIZE IS THE IMAGE'S LENGTH: the promotion
+            // dispatches on it and its inline arm clips the image to it
+            // (`DataPlane.promoteInline`). A truncate-up raises the inode's
+            // size alone, so a write inside the INODE's size but past the
+            // record's image re-stages a longer image here and publishes
+            // the size it rang (fstests generic/029: 5,120 B truncated to
+            // 2,048 and back, the tail rewritten — the record said 2,048,
+            // the promotion landed 2,048 bytes of the 5,120 B image, and
+            // the tail read zeros after the remount). An in-place overwrite
+            // never lengthens the image.
+            const record_names_image = keep_identity and (in_place or rec.?.layout.size == size);
+            if (record_names_image and end <= probe.size and self.times_park and a.write_flags & abi.FUSE_WRITE_KILL_SUIDGID == 0) {
                 {
                     var g = self.locks.lockManyUncancelable(self.io, &.{.{ .ino = local, .mode = .shared }}, &.{}) catch unreachable; // one request fits every plan
                     defer g.release(self.io);
@@ -3422,12 +3434,17 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         /// the next drain journals the claim whole (§AL.5): the dismount
         /// and the handover's step 0 — a claim is never dropped with its
         /// bytes still in RAM.
-        fn landClaims(self: *Self) void {
+        /// The dismount's landing pass (charter §8 `umount`: an orderly
+        /// unmount leaves no acked write in RAM): EVERY write custody of
+        /// the mount lands — the size claimants' (§AL.5: their claims
+        /// journal behind it in the times drain that follows) and the
+        /// size-neutral writers' (an overwrite inside a file under the
+        /// write-back timer parks custody and no claim, §AJ: close is no
+        /// durability point, so the unmount is — the pass that landed the
+        /// claimants alone left such a tail in RAM, fstests generic/029).
+        fn landCustody(self: *Self) void {
             if (!self.data_live or !self.data.hasVolumes()) return;
-            var held: std.ArrayList(u64) = .empty;
-            defer held.deinit(self.gpa);
-            self.pending.claimants(self.gpa, &held) catch |e| log.err("kv_fs: the claims' landing pass could not list them ({t}): their sizes stay at the durable length", .{e});
-            for (held.items) |ino| self.data.flushCustody(self.io, ino);
+            self.data.flushAllCustody(self.io);
         }
 
         /// THE TIMES DRAIN (decision 0003 §L.6; charter §5.2 "Journal
@@ -4167,6 +4184,7 @@ pub const NoData = struct {
     pub fn dropReleases(_: *NoData, _: []const layout.MapEntry) void {}
     pub fn freeBindings(_: *NoData, _: Io, _: []const Mapping) void {}
     pub fn flushCustody(_: *NoData, _: Io, _: u64) void {}
+    pub fn flushAllCustody(_: *NoData, _: Io) void {}
     pub fn releaseIno(_: *NoData, _: Io, _: u64) void {}
     pub fn drainAged(_: *NoData, _: Io, _: u64, _: u64) open_table.Drained {
         return .{ .landed = false, .kept_born_ns = null };
@@ -5059,6 +5077,12 @@ const SettlingData = struct {
         self.write_back_drains += 1;
         if (self.custody_of == ino) self.custody_of = null;
     }
+    /// The unmount's landing pass: every armed custody lands — the merge
+    /// (`flushCustody`'s) and the write-back custody (`releaseIno`'s).
+    pub fn flushAllCustody(self: *SettlingData, io: Io) void {
+        if (self.merge) |m| self.flushCustody(io, m.ino);
+        if (self.custody_of) |ino| self.releaseIno(io, ino);
+    }
     /// The timer's drain: the armed custody lands whatever the cutoff.
     pub fn drainAged(self: *SettlingData, _: Io, ino: u64, _: u64) open_table.Drained {
         if (self.custody_of != ino) return .{ .landed = false, .kept_born_ns = null };
@@ -5554,6 +5578,42 @@ test "decision 0003 §AL.5 with §AF/§AJ — a size claim rides each posture's 
     _ = try h.fs.drainPendingTimes(&ctx);
     try testing.expectEqual(@as(u64, 8300), (try h.fs.readInodeStored(l)).?.size);
     h.release(f);
+}
+
+test "the dismount sweep lands EVERY write custody, not the size claimants' alone (charter §8 `umount`; fstests generic/029 under the write-back timer: an overwrite INSIDE a file parks custody and no size claim, and an orderly unmount within T_wb left its bytes in RAM): `destroy` lands the size-neutral writer's custody as it lands a claimant's, and the claimant's claim journals behind it" {
+    const H = HarnessOf(SettlingData);
+    var h: H = undefined;
+    try h.initWriteback(false, .timer);
+    defer h.deinit();
+    defer h.data.deinit();
+    h.data.store = &h.store;
+    var trace = op_trace.OpTrace.begin(0, .other);
+    defer trace.finish();
+    var ctx: filesystem.Ctx = .{ .unique = 0, .uid = 0, .gid = 0, .pid = 0, .io = testing.io, .trace = &trace, .wd_slot = null, .window = &.{} };
+    const f = try h.create(1, "f", 0o644);
+    const l = try H.Fs.localOf(f);
+    const big: [8192]u8 = @splat('X');
+    try testing.expectEqual(@as(?linux.E, null), h.write(f, 0, &big, 0).errno());
+    _ = try h.fs.drainPendingTimes(&ctx);
+    // The overwrite inside the file: custody parked, no claim (§L.6).
+    h.data.custody_of = l;
+    h.data.custody_floor = 0;
+    try testing.expectEqual(@as(?linux.E, null), h.write(f, 100, big[0..100], 0).errno());
+    try testing.expectEqual(@as(u64, 0), h.fs.pending.claimOf(l));
+    try testing.expect(h.data.hasWriteCustody(l));
+    h.release(f);
+    // The claimant beside it: an extension whose claim is parked.
+    const g = try h.create(1, "g", 0o644);
+    const lg = try H.Fs.localOf(g);
+    try testing.expectEqual(@as(?linux.E, null), h.write(g, 0, &big, 0).errno());
+    try testing.expectEqual(@as(u64, 8192), h.fs.pending.claimOf(lg));
+    h.release(g);
+    const drains0 = h.data.write_back_drains;
+    h.fs.destroy(&ctx, .{});
+    try testing.expect(!h.data.hasWriteCustody(l));
+    try testing.expect(h.data.write_back_drains > drains0);
+    try testing.expectEqual(@as(u64, 0), h.fs.pending.claimOf(lg));
+    try testing.expectEqual(@as(u64, 8192), (try h.fs.readInodeStored(lg)).?.size);
 }
 
 test "decision 0003 §AL — a striped truncate-up asks the plane for the extension law's zeros over [old size, new size) BEFORE its custody lands and its size commits (a kill leaves the old size or the zeros, never what the EOF block held past EOF); an inline grow and a shrink ask nothing" {

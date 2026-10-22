@@ -2350,14 +2350,20 @@ const Vol = struct {
 
     /// Apply ONE record through the commit-path shape and return its seq.
     fn apply(self: *Vol, n: *CachedNode, k: []const u8, kind: RecordKind, value: []const u8) !u64 {
-        const gpa = testing.allocator;
         const seq = self.next_seq;
         self.next_seq += 1;
+        try applyAt(n, k, kind, value, seq);
+        return seq;
+    }
+
+    /// `apply` at a chosen seq: an earlier window's record landing after a
+    /// later window's (decision 0003 §AW.4's either-order applies).
+    fn applyAt(n: *CachedNode, k: []const u8, kind: RecordKind, value: []const u8, seq: u64) !void {
+        const gpa = testing.allocator;
         var recs = [_]OwnedRec{try OwnedRec.fromRecordRef(gpa, .{ .key = k, .seq = seq, .kind = kind, .value = value })};
         const d = n.lockWrite(testing.io);
         defer n.unlockWrite(testing.io);
         try n.applyLocked(d, &recs, seq);
-        return seq;
     }
 
     /// Freeze the open delta and append it so its records become
@@ -2761,12 +2767,48 @@ test "a rollback that empties the overlay leaves a DIRTY word with nothing to wr
 
 const Mirror = struct { r: Record, frozen: bool = false, removed: bool = false };
 
-test "property: over random histories (puts, deltas, deletes, freezes, rollback removals) head and memo serves equal the from-scratch fold" {
+/// The by-seq oracle: the surviving mirror records of `k`, newest seq
+/// first (stable on ties), folded from scratch — the charter's per-key
+/// last-writer-wins by record seq, whatever order the records were applied
+/// in.
+fn oracleFold(gpa: Allocator, mirror: []const Mirror, k: []const u8) !rec.Folded {
+    var survivors: std.ArrayListUnmanaged(RecordRef) = .empty;
+    defer survivors.deinit(gpa);
+    for (mirror) |m| {
+        if (!m.removed and std.mem.eql(u8, m.r.key, k)) try survivors.append(gpa, m.r.ref());
+    }
+    std.sort.block(RecordRef, survivors.items, {}, struct {
+        fn newer(_: void, a: RecordRef, b: RecordRef) bool {
+            return a.seq > b.seq;
+        }
+    }.newer);
+    return rec.foldNewestFirst(gpa, survivors.items);
+}
+
+fn expectOracle(gpa: Allocator, leaf: *CachedNode, mirror: []const Mirror, k: []const u8) !void {
+    var want = try oracleFold(gpa, mirror, k);
+    defer want.deinit(gpa);
+    const s = leaf.snapshotLoad();
+    defer s.release();
+    var got1 = try s.value.lookup(gpa, k);
+    defer got1.deinit();
+    var got2 = try s.value.lookup(gpa, k);
+    defer got2.deinit();
+    if (want.liveValue()) |wv| {
+        try testing.expectEqualSlices(u8, wv, got1.liveValue() orelse return error.TestExpectedLive);
+        try testing.expectEqualSlices(u8, wv, got2.liveValue() orelse return error.TestExpectedLive);
+    } else {
+        try testing.expectEqual(@as(?[]const u8, null), got1.liveValue());
+        try testing.expectEqual(@as(?[]const u8, null), got2.liveValue());
+    }
+}
+
+test "property: over random histories (puts, deltas, deletes, freezes, rollback removals, and records applied BELOW the newest seq — an earlier window landing after a later one, across a freeze) head and memo serves equal the by-seq fold" {
     const gpa = testing.allocator;
     var prng = std.Random.DefaultPrng.init(0xd7_f01d);
     const rnd = prng.random();
     var case: usize = 0;
-    while (case < 48) : (case += 1) {
+    while (case < 64) : (case += 1) {
         var vol = try Vol.init(2, 8);
         defer vol.deinit();
         vol.arm();
@@ -2778,29 +2820,38 @@ test "property: over random histories (puts, deltas, deletes, freezes, rollback 
             for (mirror.items) |*m| m.r.deinit(gpa);
             mirror.deinit(gpa);
         }
+        // Every minted seq is even; a straggler takes an odd seq below the
+        // mint — a window reserved earlier whose apply came later (§AW.4).
+        vol.next_seq = 2;
+        var stragglers: std.ArrayListUnmanaged(u64) = .empty;
+        defer stragglers.deinit(gpa);
         const ops = 1 + rnd.uintLessThan(usize, 48);
         for (0..ops) |_| {
             const kidx = rnd.uintLessThan(u64, 4);
             const k = key.inodeKey(kidx);
-            switch (rnd.uintLessThan(u8, 6)) {
+            switch (rnd.uintLessThan(u8, 8)) {
                 0 => {
                     const v = iv(rnd.int(u64)).encode();
                     const seq = try vol.apply(leaf, &k, .put, &v);
+                    vol.next_seq += 1;
                     try mirror.append(gpa, .{ .r = try Record.put(gpa, &k, seq, &v) });
                 },
                 1 => {
                     const t = rnd.int(u64);
                     const d = InodeDelta.times(t, t +% 1);
                     const seq = try vol.apply(leaf, &k, .delta, d.encode().slice());
+                    vol.next_seq += 1;
                     try mirror.append(gpa, .{ .r = try Record.delta(gpa, &k, seq, d) });
                 },
                 2 => {
                     const d = InodeDelta.ctime(rnd.int(u64));
                     const seq = try vol.apply(leaf, &k, .delta, d.encode().slice());
+                    vol.next_seq += 1;
                     try mirror.append(gpa, .{ .r = try Record.delta(gpa, &k, seq, d) });
                 },
                 3 => {
                     const seq = try vol.apply(leaf, &k, .delete, "");
+                    vol.next_seq += 1;
                     try mirror.append(gpa, .{ .r = try Record.delete(gpa, &k, seq) });
                 },
                 4 => {
@@ -2808,6 +2859,25 @@ test "property: over random histories (puts, deltas, deletes, freezes, rollback 
                     for (mirror.items) |*m| if (!m.removed) {
                         m.frozen = true;
                     };
+                },
+                5, 6 => {
+                    // The straggler: an unused odd seq below the mint, a
+                    // Δtime merge (the one record class two in-flight
+                    // windows share, §AW.4) or a Put.
+                    if (vol.next_seq < 4) continue;
+                    const seq = 1 + 2 * rnd.uintLessThan(u64, (vol.next_seq - 2) / 2);
+                    if (std.mem.indexOfScalar(u64, stragglers.items, seq) != null) continue;
+                    try stragglers.append(gpa, seq);
+                    if (rnd.boolean()) {
+                        const t = rnd.int(u64);
+                        const d = InodeDelta.times(t, t +% 1);
+                        try Vol.applyAt(leaf, &k, .delta, d.encode().slice(), seq);
+                        try mirror.append(gpa, .{ .r = try Record.delta(gpa, &k, seq, d) });
+                    } else {
+                        const v = iv(rnd.int(u64)).encode();
+                        try Vol.applyAt(leaf, &k, .put, &v, seq);
+                        try mirror.append(gpa, .{ .r = try Record.put(gpa, &k, seq, &v) });
+                    }
                 },
                 else => {
                     // The depth-newest LIVE overlay record of this key.
@@ -2830,34 +2900,87 @@ test "property: over random histories (puts, deltas, deletes, freezes, rollback 
                     mirror.items[pick].removed = true;
                 },
             }
-        }
-        const s = leaf.snapshotLoad();
-        defer s.release();
-        for (0..4) |kidx| {
-            const k = key.inodeKey(kidx);
-            var survivors: std.ArrayListUnmanaged(RecordRef) = .empty;
-            defer survivors.deinit(gpa);
-            var i = mirror.items.len;
-            while (i > 0) {
-                i -= 1;
-                const m = mirror.items[i];
-                if (!m.removed and std.mem.eql(u8, m.r.key, &k)) try survivors.append(gpa, m.r.ref());
-            }
-            var want = try rec.foldNewestFirst(gpa, survivors.items);
-            defer want.deinit(gpa);
-            var got1 = try s.value.lookup(gpa, &k);
-            defer got1.deinit();
-            var got2 = try s.value.lookup(gpa, &k);
-            defer got2.deinit();
-            if (want.liveValue()) |wv| {
-                try testing.expectEqualSlices(u8, wv, got1.liveValue() orelse return error.TestExpectedLive);
-                try testing.expectEqualSlices(u8, wv, got2.liveValue() orelse return error.TestExpectedLive);
-            } else {
-                try testing.expectEqual(@as(?[]const u8, null), got1.liveValue());
-                try testing.expectEqual(@as(?[]const u8, null), got2.liveValue());
-            }
+            // After every step: each key's lookup (a head serve, a memo
+            // hit or a cold fold) is the by-seq fold.
+            for (0..4) |ki| try expectOracle(gpa, leaf, mirror.items, &key.inodeKey(ki));
         }
     }
+}
+
+test "an overlay record BELOW a frozen base record of its key — §AW.4's either-order applies with the checkpointer's freeze between them: the lookup, the Δ apply's fold-below and the head shortcut order the two sources by seq (a head serves only above everything the base holds); the straggler neither trips the fold's newest-first contract nor serves a stale head" {
+    const gpa = testing.allocator;
+    var vol = try Vol.init(2, 8);
+    defer vol.deinit();
+    vol.arm();
+    try vol.writeEmptyLeaf(0, 1, 0);
+    const leaf = (try vol.cache.load(Vol.addrOf(0))).?;
+    defer leaf.release();
+    var mirror: std.ArrayListUnmanaged(Mirror) = .empty;
+    defer {
+        for (mirror.items) |*m| m.r.deinit(gpa);
+        mirror.deinit(gpa);
+    }
+    const S = struct {
+        fn step(m: *std.ArrayListUnmanaged(Mirror), l: *CachedNode, k: []const u8, kind: RecordKind, seq: u64, d: ?InodeDelta, v: ?InodeValue) !void {
+            const g = testing.allocator;
+            switch (kind) {
+                .put => {
+                    const enc = v.?.encode();
+                    try Vol.applyAt(l, k, .put, &enc, seq);
+                    try m.append(g, .{ .r = try Record.put(g, k, seq, &enc) });
+                },
+                .delta => {
+                    try Vol.applyAt(l, k, .delta, d.?.encode().slice(), seq);
+                    try m.append(g, .{ .r = try Record.delta(g, k, seq, d.?) });
+                },
+                .delete => unreachable,
+            }
+        }
+    };
+    // The head shortcut: the straggler lands with a head, then a newer Δ
+    // rides on it while a base record (seq 210) lies between the two —
+    // the head must not be the Δ's `prev` (the fold would skip Δ210's
+    // mtime), and the straggler's own head must not serve while the base
+    // is newer.
+    const k2 = key.inodeKey(8);
+    try S.step(&mirror, leaf, &k2, .put, 11, null, iv(2));
+    try vol.freezeAndAppend(leaf);
+    try S.step(&mirror, leaf, &k2, .delta, 210, InodeDelta.times(210, 211), null);
+    try vol.freezeAndAppend(leaf);
+    try S.step(&mirror, leaf, &k2, .delta, 110, InodeDelta.ctime(110), null);
+    try expectOracle(gpa, leaf, mirror.items, &k2);
+    try S.step(&mirror, leaf, &k2, .delta, 310, InodeDelta.ctime(310), null);
+    try expectOracle(gpa, leaf, mirror.items, &k2);
+    // The fold's input contract: base [200, 10], overlay [300] with a
+    // head; the straggler 100 lands below 300 and clears its head; the
+    // next read gathers overlay-then-base — [300, 100, 200, 10] is not
+    // newest-first — and the next Δ's fold-below walks the same shape.
+    const k = key.inodeKey(7);
+    try S.step(&mirror, leaf, &k, .put, 10, null, iv(1));
+    try vol.freezeAndAppend(leaf);
+    try S.step(&mirror, leaf, &k, .delta, 200, InodeDelta.times(200, 201), null);
+    try vol.freezeAndAppend(leaf);
+    try S.step(&mirror, leaf, &k, .delta, 300, InodeDelta.ctime(300), null);
+    try expectOracle(gpa, leaf, mirror.items, &k);
+    try S.step(&mirror, leaf, &k, .delta, 100, InodeDelta.times(100, 101), null);
+    try expectOracle(gpa, leaf, mirror.items, &k);
+    try S.step(&mirror, leaf, &k, .delta, 400, InodeDelta.ctime(400), null);
+    try expectOracle(gpa, leaf, mirror.items, &k);
+    // A freeze of the inverted overlay, then more of both: the index
+    // orders by seq whatever frame a record reached the device in.
+    try vol.freezeAndAppend(leaf);
+    try S.step(&mirror, leaf, &k, .delta, 150, InodeDelta.ctime(150), null);
+    try S.step(&mirror, leaf, &k, .delta, 500, InodeDelta.times(500, 501), null);
+    try expectOracle(gpa, leaf, mirror.items, &k);
+    try expectOracle(gpa, leaf, mirror.items, &k2);
+    // The reload from the device agrees: the straggler's frame is newer
+    // than the frame holding the record that outranks it.
+    try vol.freezeAndAppend(leaf);
+    _ = vol.cache.discardAllNodes();
+    const reloaded = (try vol.cache.load(Vol.addrOf(0))).?;
+    defer reloaded.release();
+    try expectOracle(gpa, reloaded, mirror.items, &k);
+    try expectOracle(gpa, reloaded, mirror.items, &k2);
 }
 
 // ---- §5.7 accounting and eviction ----

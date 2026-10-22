@@ -3077,11 +3077,16 @@ fn unlinkPath(path: []const u8) void {
 
 /// One create under the root through `economy.stageCreate`; the ino.
 fn stageCreate(be: *KvBackend, t: *KvTx, name: []const u8, value_len: usize) !u64 {
+    return stageCreateAt(be, t, name, value_len, 1000);
+}
+
+/// `stageCreate` with the parent's Δtime stamp at `now`.
+fn stageCreateAt(be: *KvBackend, t: *KvTx, name: []const u8, value_len: usize, now: u64) !u64 {
     const ino = be.allocateIno();
     const parent_value: record.InodeValue = .{ .mode = economy.S.IFDIR | 0o755, .nlink = 2 };
     // The dentry names the GLOBAL ino (charter §5.4: `(local − 2)·W + slot
     // + 2`, slot 0 on the single volume).
-    _ = try economy.stageCreate(t, .{ .name_key = be.nameKey(), .now = 1000, .parent = 1, .parent_value = parent_value, .name = name, .mode = economy.S.IFREG | 0o644, .uid = 0, .gid = 0, .local_ino = ino, .global_ino = inos.makeGlobalIno(ino, 0, inos.ROUTING_WIDTH) });
+    _ = try economy.stageCreate(t, .{ .name_key = be.nameKey(), .now = now, .parent = 1, .parent_value = parent_value, .name = name, .mode = economy.S.IFREG | 0o644, .uid = 0, .gid = 0, .local_ino = ino, .global_ino = inos.makeGlobalIno(ino, 0, inos.ROUTING_WIDTH) });
     if (value_len > 0) {
         const v = try be.gpa.alloc(u8, value_len);
         defer be.gpa.free(v);
@@ -3104,11 +3109,23 @@ fn commitCreate(be: *KvBackend, name: []const u8) !u64 {
 /// shape the apply ack applies to (§BB.1); the plain form is a tool's or
 /// a served verb's, acked at the landing.
 fn commitCreateKernel(be: *KvBackend, name: []const u8) !u64 {
+    return commitCreateKernelAt(be, name, 1000);
+}
+
+/// `commitCreateKernel` stamping the parent's Δtime at `now`.
+fn commitCreateKernelAt(be: *KvBackend, name: []const u8, now: u64) !u64 {
     const t = try be.begin(@src());
     t.kernel_origin = true;
-    const ino = try stageCreate(be, t, name, 0);
+    const ino = try stageCreateAt(be, t, name, 0, now);
     try be.commit(t);
     return ino;
+}
+
+/// The parent's folded inode value: its mtime (the Δtime merges' witness).
+fn parentMtime(be: *KvBackend) !u64 {
+    const got = (try be.lookup(testing.allocator, key.TREE_INODES, &key.inodeKey(1))) orelse return error.TestExpectedLive;
+    defer testing.allocator.free(got);
+    return (try record.InodeValue.decode(got)).mtime;
 }
 
 fn present(be: *KvBackend, ino: u64) !bool {
@@ -4277,6 +4294,101 @@ test "the applier's resolve starts from the committer's heap-admission leaves: o
 /// `Put`, the parent's Δ (the harness stages no park) — each resolved once.
 fn recordsOfCreates(n: usize) u64 {
     return @as(u64, n) * 3;
+}
+
+test "§AW.4 two windows apply in either order, with the checkpointer's freeze between them: W1 (the older seqs, Δtime 1001) is held before its apply, W2 (Δtime 2002 on the same parent) applies and is acked, the parent's leaf freezes — its base now holds W2's Δ — then W1 lands its Δ BELOW it; the parent's mtime is W2's (the seq decides, never the apply order), the read never trips the fold's newest-first contract nor serves a stale head, the next Δ applies over both sources, and the reopen agrees" {
+    const gpa = testing.allocator;
+    const v = try TestVol.create(gpa, "aw4-freeze", "600000");
+    defer v.destroy();
+    const be = try v.open();
+    var closed = false;
+    defer if (!closed) be.close();
+    _ = try commitCreate(be, "base");
+    try testing.expectEqual(@as(u64, 1000), try parentMtime(be));
+    // W0 un-landed in the lane: every window behind it is spawned to an
+    // applier (never applied inline on the pass as an `alone` window).
+    journal_lane.test_seams.delay_issue.store(1, .release);
+    defer journal_lane.test_seams.delay_issue.store(0, .release);
+    _ = try commitCreateKernelAt(be, "w0", 1000);
+    // W1: its applier parks before its resolve.
+    conveyor.test_seams.hold_next_apply.store(1, .release);
+    defer conveyor.test_seams.hold_next_apply.store(0, .release);
+    const Committer = struct {
+        fn run(b: *KvBackend, name: []const u8, now: u64, out: *anyerror!u64, done: *std.atomic.Value(u32)) void {
+            out.* = commitCreateKernelAt(b, name, now);
+            done.store(1, .release);
+        }
+    };
+    var out1: anyerror!u64 = error.TestUnexpectedResult;
+    var done1 = std.atomic.Value(u32).init(0);
+    const t1 = try std.Thread.spawn(.{}, Committer.run, .{ be, "w1", 1001, &out1, &done1 });
+    const deadline = clock.monotonicNs() + 10 * std.time.ns_per_s;
+    while (conveyor.test_seams.apply_held.load(.acquire) == 0 and clock.monotonicNs() < deadline) try testing.io.sleep(.fromMilliseconds(1), .awake);
+    try testing.expectEqual(@as(u32, 1), conveyor.test_seams.apply_held.load(.acquire));
+    conveyor.test_seams.apply_held.store(0, .release);
+    try testing.expectEqual(@as(u32, 0), done1.load(.acquire));
+    // W2: reserved after W1 (its seqs are higher), applied and acked
+    // while W1 waits; the parent reads W2's stamp.
+    const acks0 = be.conveyorStats().acks_at_apply.load();
+    _ = try commitCreateKernelAt(be, "w2", 2002);
+    try testing.expectEqual(acks0 + 1, be.conveyorStats().acks_at_apply.load());
+    try testing.expectEqual(@as(u32, 0), done1.load(.acquire));
+    try testing.expectEqual(@as(u64, 2002), try parentMtime(be));
+    // The checkpointer's lock window on the parent's leaf: the open
+    // overlay (W2's Δ among it) becomes base.
+    {
+        const t = be.treeForKey(key.TREE_INODES, &key.inodeKey(1)) orelse return error.TestUnexpectedResult;
+        const leaf = try t.resolveLeaf(&key.inodeKey(1));
+        defer leaf.release();
+        {
+            const d = leaf.lockWrite(be.io);
+            defer leaf.unlockWrite(be.io);
+            try testing.expect((try leaf.freezeLocked(d, be.cache.cfg.layout)) != null);
+        }
+        try testing.expect(try be.cache.appendFrozen(leaf));
+    }
+    try testing.expectEqual(@as(u64, 2002), try parentMtime(be));
+    // W1 lands: its Δ's seq is below the frozen one's. The seq decides
+    // the fold — W2's stamp stands over W1's older one.
+    conveyor.test_seams.hold_next_apply.store(0, .release);
+    conveyor.test_seams.apply_release.notifyWaiters(be.io);
+    t1.join();
+    _ = try out1;
+    try testing.expectEqual(@as(u64, 2002), try parentMtime(be));
+    // The next Δ's apply folds below itself over the same two sources.
+    _ = try commitCreateKernelAt(be, "w3", 3003);
+    try testing.expectEqual(@as(u64, 3003), try parentMtime(be));
+    // Another straggler shape on the live overlay: W4 is held, W5 (4004)
+    // applies, W4 (1004) lands below it — no freeze this time (the
+    // inversion guard's own case) — then W6 (5005) rides on top.
+    conveyor.test_seams.hold_next_apply.store(1, .release);
+    var out4: anyerror!u64 = error.TestUnexpectedResult;
+    var done4 = std.atomic.Value(u32).init(0);
+    const t4 = try std.Thread.spawn(.{}, Committer.run, .{ be, "w4", 1004, &out4, &done4 });
+    while (conveyor.test_seams.apply_held.load(.acquire) == 0 and clock.monotonicNs() < deadline) try testing.io.sleep(.fromMilliseconds(1), .awake);
+    try testing.expectEqual(@as(u32, 1), conveyor.test_seams.apply_held.load(.acquire));
+    conveyor.test_seams.apply_held.store(0, .release);
+    _ = try commitCreateKernelAt(be, "w5", 4004);
+    try testing.expectEqual(@as(u64, 4004), try parentMtime(be));
+    conveyor.test_seams.hold_next_apply.store(0, .release);
+    conveyor.test_seams.apply_release.notifyWaiters(be.io);
+    t4.join();
+    _ = try out4;
+    try testing.expectEqual(@as(u64, 4004), try parentMtime(be));
+    _ = try commitCreateKernelAt(be, "w6", 5005);
+    try testing.expectEqual(@as(u64, 5005), try parentMtime(be));
+    journal_lane.test_seams.delay_issue.store(0, .release);
+    try be.fsync();
+    const names = [_][]const u8{ "w0", "w1", "w2", "w3", "w4", "w5", "w6" };
+    for (names) |n| try testing.expect(try dentryPresent(be, n));
+    be.close();
+    closed = true;
+    // The reopen: the node's frames (W2's Δ in an earlier frame than W1's
+    // older one) and the journal's replay fold by seq alike.
+    const be2 = try v.open();
+    defer be2.close();
+    try testing.expectEqual(@as(u64, 5005), try parentMtime(be2));
+    for (names) |n| try testing.expect(try dentryPresent(be2, n));
 }
 
 test "the committer venue (SQUEEZEFS_META_PASS_VENUE=committer): a 4-thread storm with concurrent checkpoints — the election winner runs the pass and the apply on its own thread (the pass never ran on the lane), every ack present, drained ≡ acked, no window left, the reopen replays every acked record" {

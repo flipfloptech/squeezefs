@@ -900,6 +900,13 @@ pub const TestSeams = struct {
     /// may take the outcome and leave); `send_held` publishes the hold.
     hold_after_send: std.atomic.Value(u32) = .init(0),
     send_held: std.atomic.Value(u32) = .init(0),
+    /// 1 ⇒ the NEXT window's applier parks before its resolve (2 while it
+    /// holds; `apply_held` publishes it) until the test stores 0 and
+    /// notifies `apply_release` — the §AW.4 shape pinned: a later window
+    /// applies, a freeze runs, THEN the held window lands its older seqs.
+    hold_next_apply: std.atomic.Value(u32) = .init(0),
+    apply_held: std.atomic.Value(u32) = .init(0),
+    apply_release: sync.Notify = .init,
 };
 
 pub var test_seams: TestSeams = .{};
@@ -2700,6 +2707,7 @@ pub const Conveyor = struct {
         const gpa = self.deps.gpa;
         const t_apply = clock.monotonicNs();
         defer self.leftApply();
+        self.holdApplyForTest();
         var arena_state = std.heap.ArenaAllocator.init(gpa);
         defer arena_state.deinit();
         const arena = arena_state.allocator();
@@ -2840,6 +2848,25 @@ pub const Conveyor = struct {
                 self.answerMembers(window, {});
             }
             window.release();
+        }
+    }
+
+    /// `test_seams.hold_next_apply`: the one armed window's applier parks
+    /// (never spins: it shares its lane with the window it must let pass)
+    /// until the test releases it; register-then-check against the release.
+    fn holdApplyForTest(self: *Conveyor) void {
+        if (test_seams.hold_next_apply.load(.acquire) != 1) return;
+        if (test_seams.hold_next_apply.cmpxchgStrong(1, 2, .acq_rel, .acquire) != null) return;
+        test_seams.apply_held.store(1, .release);
+        const io = self.deps.io;
+        while (test_seams.hold_next_apply.load(.acquire) == 2) {
+            var n = test_seams.apply_release.notified();
+            _ = n.enable(io);
+            if (test_seams.hold_next_apply.load(.acquire) != 2) {
+                n.cancel(io);
+                break;
+            }
+            n.waitUncancelable(io);
         }
     }
 

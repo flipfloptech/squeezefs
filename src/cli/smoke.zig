@@ -5049,6 +5049,137 @@ test "smoke: A STRIPED DIRECTORY ON ONE DAEMON — mkdir hot → the explicit fl
     _ = try fsckClean(rig, "the striped directory row");
 }
 
+/// xfstests' `common/renameat2` matrix under `RENAME_EXCHANGE` (generic/025:
+/// every (src kind, dst kind) over none/regu/symb/dire/tree, same directory
+/// and across two), with the parents' `st_nlink` judged against the law
+/// after the setup, after the swap and after the cleanup — then the
+/// surviving shapes `keep/p1..p7` (a dir ↔ file swap across parents, a
+/// dir ↔ dir, a same-parent file ↔ dir, a tree ↔ symlink) whose counts the
+/// remount must answer unchanged. `renameat2(2)` through glibc's wrapper
+/// (no `renameat2` binary in the image).
+const exchange_matrix_py =
+    \\import ctypes, os, sys
+    \\libc = ctypes.CDLL(None, use_errno=True)
+    \\libc.renameat2.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    \\AT_FDCWD, RENAME_EXCHANGE = -100, 2
+    \\def xchg(a, b):
+    \\    if libc.renameat2(AT_FDCWD, a.encode(), AT_FDCWD, b.encode(), RENAME_EXCHANGE) != 0:
+    \\        return ctypes.get_errno()
+    \\    return 0
+    \\def setup(p, k):
+    \\    if k == 'regu': open(p, 'w').write('foo\n')
+    \\    elif k == 'symb': os.symlink('foo', p)
+    \\    elif k == 'dire': os.mkdir(p)
+    \\    elif k == 'tree': os.mkdir(p); open(p + '/bar', 'w').write('foo\n')
+    \\def cleanup(p):
+    \\    if os.path.isdir(p) and not os.path.islink(p):
+    \\        if os.path.exists(p + '/bar'): os.unlink(p + '/bar')
+    \\        os.rmdir(p)
+    \\    elif os.path.lexists(p): os.unlink(p)
+    \\def kind(p):
+    \\    if not os.path.lexists(p): return 'none'
+    \\    if os.path.islink(p): return 'symb'
+    \\    if os.path.isdir(p): return 'tree' if os.path.exists(p + '/bar') else 'dire'
+    \\    return 'regu'
+    \\isdir = lambda k: k in ('dire', 'tree')
+    \\def nl(p): return os.lstat(p).st_nlink
+    \\def judge(label, px, py, want_x, want_y):
+    \\    got = (nl(px), nl(py))
+    \\    if got != (want_x, want_y):
+    \\        sys.exit('%s: nlink(%s, %s) = %r, the law says %r' % (label, px, py, got, (want_x, want_y)))
+    \\kinds = ['none', 'regu', 'symb', 'dire', 'tree']
+    \\def matrix(src, dst, px, py, base_x, base_y, label):
+    \\    for s in kinds:
+    \\        for d in kinds:
+    \\            cell = '%s %s/%s' % (label, s, d)
+    \\            setup(src, s); setup(dst, d)
+    \\            same = px == py
+    \\            x_dirs = isdir(s) + (isdir(d) if same else 0)
+    \\            y_dirs = isdir(d) + (isdir(s) if same else 0)
+    \\            judge(cell + ' after setup', px, py, base_x + x_dirs, base_y + y_dirs)
+    \\            e = xchg(src, dst)
+    \\            if s == 'none' or d == 'none':
+    \\                if e != 2: sys.exit('%s: exchange with an absent side answered errno %d, not ENOENT' % (cell, e))
+    \\            else:
+    \\                if e != 0: sys.exit('%s: exchange failed: %s' % (cell, os.strerror(e)))
+    \\                if (kind(src), kind(dst)) != (d, s): sys.exit('%s: kinds after the swap %r' % (cell, (kind(src), kind(dst))))
+    \\                if not same: x_dirs, y_dirs = isdir(d), isdir(s)
+    \\            judge(cell + ' after the swap', px, py, base_x + x_dirs, base_y + y_dirs)
+    \\            cleanup(src); cleanup(dst)
+    \\            judge(cell + ' after the cleanup', px, py, base_x, base_y)
+    \\os.chdir(sys.argv[1])
+    \\os.mkdir('t'); os.mkdir('t/x'); os.mkdir('t/y')
+    \\matrix('t/src', 't/dst', 't', 't', 4, 4, 'samedir')
+    \\matrix('t/x/src', 't/y/dst', 't/x', 't/y', 2, 2, 'crossdir')
+    \\os.rmdir('t/x'); os.rmdir('t/y'); os.rmdir('t')
+    \\os.mkdir('keep')
+    \\for p in 'p1 p2 p3 p4 p5 p6 p7'.split(): os.mkdir('keep/' + p)
+    \\setup('keep/p1/d', 'dire'); setup('keep/p2/f', 'regu')
+    \\setup('keep/p3/d1', 'dire'); setup('keep/p4/d2', 'dire')
+    \\setup('keep/p5/f1', 'regu'); setup('keep/p5/d', 'dire')
+    \\setup('keep/p6/a', 'tree'); setup('keep/p7/l', 'symb')
+    \\for a, b in (('keep/p1/d', 'keep/p2/f'), ('keep/p3/d1', 'keep/p4/d2'), ('keep/p5/f1', 'keep/p5/d'), ('keep/p6/a', 'keep/p7/l')):
+    \\    e = xchg(a, b)
+    \\    if e: sys.exit('%s <-> %s: %s' % (a, b, os.strerror(e)))
+    \\print('matrix done')
+;
+
+/// The surviving shapes' counts, `keep/p1..p7` — the law: 2 + the
+/// directories each holds AFTER the swaps (p2 and p7 received a directory,
+/// p1 and p6 gave theirs up, p3/p4 traded one for one, p5 swapped in place).
+const exchange_keep_nlinks = "2 3 3 3 3 2 3\n";
+const exchange_keep_stat = "stat -c %h keep/p1 keep/p2 keep/p3 keep/p4 keep/p5 keep/p6 keep/p7 | tr '\\n' ' ' | sed 's/ $/\\n/'; test -d keep/p2/f; test -f keep/p1/d; test -d keep/p3/d1; test -d keep/p4/d2; test -d keep/p5/f1; test -f keep/p5/d; test -L keep/p6/a; test -f keep/p7/l/bar";
+
+test "smoke: RENAME_EXCHANGE AND THE PARENTS' NLINK (fstests generic/025: the matrix's cross-directory dir ↔ file swaps shifted no parent count — the cleanup's rmdir fired `dir_nlink_underflows` ×4 and the other parent stayed inflated; both tests PASSED their golden output and fsck saw nothing, the parents being gone) — xfstests' renameat2 matrix (5 × 5 kinds, same directory and across two) with every parent's st_nlink judged after the setup, the swap and the cleanup → the surviving shapes keep/p1..p7 at `2 3 3 3 3 2 3` → `dir_nlink_underflows` 0 → umount, remount: the same counts off the records → fsck --offline --scrub 0 findings" {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    try rig.formatSet(true);
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(0);
+    {
+        const py = try std.fmt.allocPrint(gpa, "{s}/exchange_matrix.py", .{rig.work});
+        defer gpa.free(py);
+        try Io.Dir.cwd().writeFile(io, .{ .sub_path = py, .data = exchange_matrix_py });
+        const script = try std.fmt.allocPrint(gpa, "python3 {s} .", .{py});
+        defer gpa.free(script);
+        const out = try rig.onMountTimed(script, 600);
+        defer gpa.free(out);
+        try testing.expectEqualStrings("matrix done\n", out);
+    }
+    {
+        const out = try rig.onMount(exchange_keep_stat);
+        defer gpa.free(out);
+        try testing.expectEqualStrings(exchange_keep_nlinks, out);
+    }
+    {
+        const ta = try rig.stats();
+        defer gpa.free(ta);
+        try testing.expectEqual(@as(?u64, 0), numberAfter(ta, "\"dir_nlink_underflows\":"));
+        try expectMustStayZero(ta);
+    }
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+    // The remount answers off the records: the same counts, the same kinds.
+    const mark = try rig.logLen();
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(mark);
+    {
+        const out = try rig.onMount(exchange_keep_stat);
+        defer gpa.free(out);
+        try testing.expectEqualStrings(exchange_keep_nlinks, out);
+        const ta = try rig.stats();
+        defer gpa.free(ta);
+        try testing.expectEqual(@as(?u64, 0), numberAfter(ta, "\"dir_nlink_underflows\":"));
+    }
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+    _ = try fsckClean(rig, "the rename-exchange nlink row");
+    std.debug.print("\nsmoke: rename exchange — the 50-cell matrix judged at every step, keep/p1..p7 at {s}", .{exchange_keep_nlinks});
+}
+
 test "smoke: THE `-o ro` READER OF A LIVE SET — C mounts `-o ro` beside A (the manager) and B (joined): no flock, no claim, no region; a member-reader + token client (TTLs 0, reader_staleness_bound_ms 0) reading B's 2,000 files and A's tree under tokens (0 local reads) → B writes ⇒ C's next read is fresh → A and B leave ⇒ C becomes the QUIESCENT reader of their last checkpoint → A mounts again ⇒ C fail-stops ESTALE at its next op (`.stats` still readable) → remount C ⇒ a token reader again — B's membership leave is LOST (`SQUEEZEFS_TEST_MEMBERSHIP_LEAVE_LOST`): its row outlives it, and A's successor must not expect a member whose pid is proven dead (decision 0003 §AG.5), or its grace refuses C's remount" {
     const io = testing.io;
     if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);

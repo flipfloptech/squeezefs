@@ -112,7 +112,7 @@ the default is called shipped, and the RFC exists so both can hold at once.
   and `fmt` green (the literal rail: the worker's `started` word is an enum; two stale rows retired).
   The gate is the orchestrator's.
 
-## 6. Live validation owed (the owner boots `7.3.0-1.7-mainline-sqz`)
+## 6. Live validation owed (the owner boots `7.3.0-1.7-mainline-sqz`; items 1 and 2's gate rows ran on 2026-10-22 — §9; item 3's unknowns and §7 stay owed)
 
 1. `scripts/venue test "e2e mainline pools"`: `auto` mounts `mainline_pool`, `pool_queues_added ≡
    queues`, rings per queue 3, the arena gauge = the pool, /big and /scratch byte-exact through the pool
@@ -159,3 +159,73 @@ the zc slot's source. The `Pool` pins `nqueues × depth × payload_sz` at regist
 queues × 32 × 1 MiB): the same as the kmbuf regions, but now charged through `IORING_REGISTER_BUFFERS`
 (memlock without `CAP_IPC_LOCK`). The legacy rungs' code paths gained a `mode` switch each; the full
 suite says they still hold on 9.33.
+
+## 9. Live on 7.3 (2026-10-22, the workstation on `7.3.0-1.7-mainline-sqz`; branch `fix/mainline-gate-7.3`)
+
+**What the probe reported.** Every root mount's INIT line reads `buffer mode mainline_pool (bufpool
+present, kmbuf null, zero-copy true, retention absent, rings per queue absent)` — the offer carries
+bit 43, the kmbuf ladder finds no opcode, the zc surface is up (CAP_SYS_ADMIN + the sparse table), no
+legacy probe is sent, the derived 3 rings per queue. The daemon's mount: 32 queues × depth 21, payload
+1 MiB, 96 workers, `MainlinePool zero-copy serves OPEN (SQUEEZEFS_FUSE_ZC_OPEN=1)`; the data plane arms
+every zc leg (`held-slot direct store ON, direct device leg ON, fd-source probe serve ON`). The bring-up's
+success arm ran for real (§8's first risk): "e2e mainline pools" passes (ADD_QUEUE + the registered
+ADD_BUFPOOL on every queue, /big and /scratch byte-exact through the pool, the zc'd READ/WRITE, the 1 MiB
+held slot store, the pooled hold under the lever at 0, every law 0), and the WITH-cache data-plane row
+counts 243 held stores and 1,496 direct legs over its pass.
+
+**The first gate on it** (`.gate-train/local-7b8bb0f1c330-20261022T015655Z.log`, dev `7b8bb0f`; the
+second run identical): 62/75 steps, 3,135/3,257 tests, **112 skipped, 10 failed**. The last 9.33 gate
+(`d0fcaf8`): 75/75, 3,166/3,261, 95 skipped.
+
+*What skips, and why* (every one `testkit.skipWhy` naming the kernel feature, by design): the 16
+`session` e2e rows of the legacy rungs and the 2 `kmbuf` rows, `uring128`'s kmbuf row and the smoke's
+late-bring-up refusal — "the kmbuf register opcode (BufRing; zero-copy and retention ride it) absent on
+7.3.0-1.7-mainline-sqz" (the kmbuf UAPI is not in the mainline series); "e2e mainline pools" and the
+mainline stratum's live arm no longer skip. The rest of the 112 are the gate's usual `other_step` rows
+(the smoke under the unit runner, the nvmet tier, the shim).
+
+*The ten reds — one cause, in two shapes.* Nine were the posture: on this kernel `auto` is MainlinePool
+with zero-copy queues, so `SQUEEZEFS_FUSE_ZC_OPEN=1` (§BE.3's default) serves opens whatever
+`SQUEEZEFS_FUSE_NO_OPEN` read — every row judging zero-message opens saw served opens and no ENOSYS
+latch: `session` "a no-open session" (INIT kept ATOMIC_O_TRUNC), the smoke's seven §AF/§AJ rows (no
+`fuse_open_enosys`, FLUSH drains on served handles, `.stats` WRONLY opens refused at OPEN, the close
+burst's drains over its bound). The tenth shape was the stratum: "the stock stratum" seam hid kmbuf
+alone and the offer kept the pool (`.mainline_pool`, wanted `.user_ents`); the fused poll row judged
+`mode == .zero_copy`; `dataPlanePass` judged the zc legs by the kmbuf ladder alone.
+
+*What changed* (`91904da`): every no-open row pins the posture it tests on both strata —
+`SQUEEZEFS_FUSE_ZC_OPEN=0` beside `SQUEEZEFS_FUSE_NO_OPEN=1` (`no_open_pin` in `session.zig`, `pinNoOpen`
+in `smoke.zig`; inert on the legacy rungs, so 9.33 runs the same mount) and the e2e rows assert
+`s.noOpen()`; `EchoFs` mirrors the lifecycle's flip (`InitCaps.zc_open` clears its `no_open`);
+`SQUEEZEFS_TEST_KMBUF_ABSENT` hides the bufpool offer too (the stock stratum is a pre-7.3 kernel with
+neither UAPI; the row asserts the bufpool verdict/gauge and refuses `pool`); the fused poll judges
+`zeroCopyArmed()` (16 fusions of 16 reads on MainlinePool); `dataPlanePass` reads the daemon's INIT line
+(`bufpool present`, `zero-copy true`) beside its own kmbuf probe — a kernel with either carrier must arm
+the legs. Under the pin the no-open rows read exactly their 9.33 numbers here: the close drain's ONE
+ENOSYS and 2 FLUSH drains, the burst's 1 drain (bound 2) + 401 deferred, the write-back timer's 1,079 ms
+landing (10 residencies, mean 1,034 ms), the idle drain's 1, 200 whole `.stats` documents over 199
+generations, O_TRUNC's ONE ENOSYS on each daemon.
+
+*A product defect the posture uncovered* (`efaaf1d`; not a posture question): under served opens
+(mainline's default — and the control arm `SQUEEZEFS_FUSE_NO_OPEN=0` on every kernel) B's `: > d/a` over
+A's file wedged 48 s in `open` and answered EIO — "move gate: open met a slot move that did not resolve
+in 48000 ms (last answer SlotMoved)". `KvFs.open`'s ATOMIC_O_TRUNC arm ran the LOCAL size path on a slot
+another appender holds; `setattr` had the foreign-slot ship (§AL.6) and the OPEN arm never reached it,
+because under zero-message opens no OPEN carries O_TRUNC. The arm now delegates to `setattr(size 0)` on a
+foreign slot. Red first: the new smoke row "O_TRUNC UNDER SERVED OPENS TRUNCATES" (the O_TRUNC body under
+`SQUEEZEFS_FUSE_NO_OPEN=0`: red without the fix — the 48 s EIO —, green with it; `slot_move_unresolved` 0
+on both daemons, asserted on the no-open row too). Known and unchanged: the shipped setattr carries no
+`kill_suidgid`, so a foreign-slot truncate (SETATTR or O_TRUNC) does not strip S_ISUID/S_ISGID.
+
+*The mount's default posture on mainline* stays §BE.3's (a): zero-copy per open file by serving opens.
+Nothing found here says it is wrong — the one defect was in the control arm's code, exposed by the
+posture, and is fixed; the trade (one 13 µs OPEN per open against 2× on every large write) is the
+measured one and the 7.3 A/B (series 2 of §7) is still owed before the default is called shipped. Nothing
+was measured in this pass (the venue was shared with the gate train and another agent).
+
+*Counts.* The ten rows + the new row + the control-arm close drain: **5/5 each** (the eight smoke rows as
+one filtered process, 48/48 × 5, 52–56 s a run; the unit e2e rows 45/46 × 5 with the fused poll's BufRing
+arm skipping by name). The whole unit suite once, `-Dfresh=true`: **2,870 / 2,982 passed, 112 skipped,
+0 failed** (the skips: 17 `session` kmbuf rows — the fused poll's BufRing arm now among them, after its
+`auto` arm passes —, 2 `kmbuf`, 1 `uring128`, the `other_step` rows); `rails` 29/29; `zig fmt --check`
+clean. The full gate is the orchestrator's.

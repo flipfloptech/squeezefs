@@ -330,6 +330,13 @@ suite_umount() {
   if grep -q " $mnt " /proc/mounts; then
     # Anything a suite left behind with its cwd on the mount keeps umount EBUSY.
     fuser -k -M -m "$mnt" >/dev/null 2>&1 || true
+    # A test killed mid-run (the fail-early stop) leaves its mounts stacked
+    # inside ours and its loop devices on files of ours: holders no process
+    # census sees (2026-10-22: landlock04's loop0 kept the mount EBUSY after a
+    # "no holder" census and forced the lazy detach). Deepest mount first.
+    local m d
+    for m in $(awk -v p="$mnt/" 'index($5, p) == 1 { print $5 }' /proc/self/mountinfo | sort -r); do umount "$m" 2>/dev/null || umount -l "$m" 2>/dev/null || true; done
+    for d in $(losetup -ln -O NAME,BACK-FILE 2>/dev/null | awk -v p="$mnt/" 'index($2, p) == 1 { print $1 }'); do losetup -d "$d" 2>/dev/null || suite_log "loop device $d (backed under $mnt) would not detach"; done
     "$SQZ_BIN" umount "$mnt" >>"$RESULTS/harness.log" 2>&1 || { suite_log "squeezefs umount $tag refused; detaching"; umount -l "$mnt" || true; }
   fi
   local pid=${SUITE_PID[$tag]:-}

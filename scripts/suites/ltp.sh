@@ -83,6 +83,16 @@ ltp_control_cmd() {
   if [ "$rc" != 0 ] && [ "$rc" != 32 ]; then echo venue; else echo ours; fi
 }
 
+# The tests must start with SIGINT (2) and SIGQUIT (3) at their defaults:
+# `kill11` sends both to a child and waits. Prints the leader's SigIgn
+# mask; the exit code is the verdict.
+ltp_check_dispositions() {
+  local mask
+  mask=$(awk '/^SigIgn/{print $2}' "/proc/$1/status" 2>/dev/null)
+  echo "${mask:-unreadable}"
+  [ -n "$mask" ] && [ $(( 0x$mask & 0x6 )) -eq 0 ]
+}
+
 # One runtest file on a fresh set. Ids of OUR failures (`file/tag`) to $3.
 ltp_run() {
   local file=$1 n=$2 failures=$3
@@ -103,17 +113,32 @@ ltp_run() {
   # times inside a 30 s budget — ≈ 50 µs per OPEN across the ring is the
   # transport's cost, not a semantic; LTP's own advice is this multiplier).
   local console="$RESULTS/kirk-$tag.console"
-  (cd "$KIRK_DIR" && exec setsid env LTPROOT="$LTP_PREFIX" TMPDIR="$tmp" LTP_TIMEOUT_MUL=${LTP_TIMEOUT_MUL:-4} timeout -s KILL $((LTP_TIMEOUT_S + 120)) \
+  # kirk is an asynchronous list of this (non-interactive, no job control)
+  # shell, which bash starts with SIGINT and SIGQUIT IGNORED; SIG_IGN
+  # survives exec, so without `--default-signal` every test inherits it
+  # through setsid/timeout/kirk/sh. LTP's library resets SIGINT in the test
+  # process and never SIGQUIT: kill11's SIGQUIT child could not die and the
+  # test was "broken (2m 0s)" on every run since eea8892 (2026-10-18,
+  # 2026-10-22) — while its ext4 control, run in the foreground, passed.
+  (cd "$KIRK_DIR" && exec setsid env --default-signal=INT,QUIT LTPROOT="$LTP_PREFIX" TMPDIR="$tmp" LTP_TIMEOUT_MUL=${LTP_TIMEOUT_MUL:-4} timeout -s KILL $((LTP_TIMEOUT_S + 120)) \
      ./kirk --no-colors --tmp-dir "$ktmp" --run-suite "$file" ${LTP_PATTERN:+--run-pattern "$LTP_PATTERN"} --json-report "$report" --suite-timeout "$LTP_TIMEOUT_S" --exec-timeout "$LTP_EXEC_TIMEOUT_S" "${skip[@]}") > "$console" 2>&1 &
   KIRK_PGID=$!
   # FAIL EARLY (owner ruling 2026-10-17): the first failing tag that is
   # neither a ledger row nor the venue's (its control run on ext4 fails
-  # too — judged right here, off the runtest file's command) ends the file;
-  # kirk is interrupted (SIGINT: it still writes the report of what ran).
-  local first_ours="" seen="$RESULTS/ltp-$tag.seen" t cmd v
+  # too — judged right here, off the runtest file's command) ends the file.
+  local first_ours="" seen="$RESULTS/ltp-$tag.seen" t cmd v dispositions_checked="" mask
   : > "$seen"
   suite_ledger_rows ltp | cut -f1 > "$RESULTS/ledger-ids.txt"
   while kill -0 "$KIRK_PGID" 2>/dev/null; do
+    # The group leader is `timeout` once the exec chain has run: its
+    # dispositions are what every test gets.
+    if [ -z "$dispositions_checked" ] && [ "$(cat "/proc/$KIRK_PGID/comm" 2>/dev/null)" = timeout ]; then
+      dispositions_checked=1
+      if ! mask=$(ltp_check_dispositions "$KIRK_PGID"); then
+        kill -KILL -- "-$KIRK_PGID" 2>/dev/null || true
+        suite_die "kirk's tests would run with SIGINT/SIGQUIT ignored (SigIgn $mask): LTP's kill11 cannot pass that way"
+      fi
+    fi
     for t in $(grep -oE '^[A-Za-z0-9_.+-]+: (fail|broken|timeout)' "$console" 2>/dev/null | cut -d: -f1); do
       grep -qxF "$t" "$seen" && continue
       echo "$t" >> "$seen"
@@ -128,8 +153,10 @@ ltp_run() {
   done
   if [ -n "$first_ours" ]; then
     suite_log "$file run $n: $first_ours failed, passes on ext4 and is no ledger row — stopping the file here (fail early)"
-    # kirk ignores SIGINT when its output is no terminal: the group is killed
-    # and the rows below come off its console (the report is never written).
+    # A stop must not wait on the running test (its exec-timeout is 900 s):
+    # the group is killed and the rows below come off kirk's console (the
+    # report is never written). What the killed test leaves on the mount
+    # (a loop device, a stacked mount) is `suite_umount`'s to clear.
     kill -KILL -- "-$KIRK_PGID" 2>/dev/null || true
     SUITE_JUDGE_NO_STALE=1
   fi

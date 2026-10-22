@@ -50,7 +50,7 @@
 #
 #   scripts/venue scripts/suites/tarx.sh                 # the 3-run gate
 #   SUITE_RUNS=1 scripts/venue scripts/suites/tarx.sh
-#   TARX_SRC=/path/to/linux/fs TARX_REPS=2 …             # the corpus by hand; 2 extractions per arm
+#   TARX_SRC=/path/to/linux/fs TARX_REPS=1 …             # the corpus by hand; one extraction per arm
 #   TARX_PHASES=parallel SUITE_RUNS=1 …                  # one phase (triage)
 set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
@@ -65,8 +65,14 @@ TARX_SRC=${TARX_SRC:-}
 TARX_ENTRIES_MIN=2000
 TARX_ENTRIES_MAX=3000
 # Extractions per arm, each into a fresh subdirectory (the reference's
-# `--tarx-reps`; 1 = the box's shape). The wall is per extraction.
-TARX_REPS=${TARX_REPS:-1}
+# `--tarx-reps`). The wall is per extraction, the law a MEAN over the arm's
+# extractions: one extraction per arm read 0.86×, 1.02×, 1.09× and 1.10×
+# of S0 on one box in one day (2026-10-22) — a single 1.3 s extraction is
+# noise at the gate's width, and B's first arm also pays its ring growths'
+# drains (`rung-10-fuse-mainline-uapi.md` §10 / `ring_growth.zig`), which
+# three extractions amortize. Three is the smallest count whose spread
+# measured inside the gate.
+TARX_REPS=${TARX_REPS:-3}
 # Phase 2's concurrency.
 TARX_PAR=${TARX_PAR:-$(( $(nproc) / 4 ))}
 [ "$TARX_PAR" -ge 2 ] || TARX_PAR=2

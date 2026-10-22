@@ -1125,6 +1125,132 @@ pub const SealModel = struct {
     }
 };
 
+/// The seal's CENSUS against a tenant release. One committed tenant (the
+/// pin + 1 = refcount 2); the sealer takes its census `{refcount, released}`
+/// and raises `sealed`; the releaser reads `sealed` unlocked (`openPackAt`),
+/// then decides under the pin lock (`lockOpen`): an OPEN pack counts the
+/// release (`released + 1`, the refcount down, one locked step), a SEALED
+/// one runs the plain ladder outside the lock (the refcount down alone).
+/// Invariant: the census satisfies `refcount + released = committed +
+/// inflight + 1`. Weakening (the shipped order): the flag goes up BEFORE the
+/// census's critical section — a releaser that sees it runs the ladder, and
+/// the census then reads a refcount the ladder already lowered (LTP fs,
+/// 2026-10-22: `pack_pin_refcount_drift` once in 72 tests).
+pub const SealCensusWeakening = enum { none, flag_before_census };
+
+pub fn SealCensusModel(comptime weakening: SealCensusWeakening) type {
+    return struct {
+        const Self = @This();
+        pub const thread_count: usize = 2;
+        const S = 0;
+        const R = 1;
+
+        refcount: u8 = 2,
+        released: u8 = 0,
+        sealed: bool = false,
+        census_taken: bool = false,
+        census_refcount: u8 = 0,
+        census_released: u8 = 0,
+        /// The releaser's unlocked read of `sealed`.
+        r_saw_sealed: bool = false,
+        ladder_releases: u8 = 0,
+        s_pc: u8 = 0,
+        r_pc: u8 = 0,
+
+        pub fn init() Self {
+            return .{};
+        }
+
+        pub fn done(self: *const Self, t: usize) bool {
+            return switch (t) {
+                S => self.s_pc == switch (weakening) {
+                    .none => 2, // lock{census, flag}; the pin's release
+                    .flag_before_census => 3, // flag; lock{census}; the pin's release
+                },
+                R => self.r_pc == 3, // the unlocked read, the locked decision, the ladder (the decision ends at 3 when it counted the release)
+                else => unreachable,
+            };
+        }
+
+        pub fn step(self: *Self, t: usize) void {
+            switch (t) {
+                S => self.stepSealer(),
+                R => self.stepReleaser(),
+                else => unreachable,
+            }
+        }
+
+        fn census(self: *Self) void {
+            self.census_refcount = self.refcount;
+            self.census_released = self.released;
+            self.census_taken = true;
+        }
+
+        fn stepSealer(self: *Self) void {
+            switch (weakening) {
+                .none => switch (self.s_pc) {
+                    // lock{ census; sealed }: the census precedes the flag.
+                    0 => {
+                        self.census();
+                        self.sealed = true;
+                    },
+                    // The pin's release, outside the lock.
+                    1 => self.refcount -= 1,
+                    else => unreachable,
+                },
+                .flag_before_census => switch (self.s_pc) {
+                    // The CAS outside the lock, then lock{ census }, then
+                    // the pin's release.
+                    0 => self.sealed = true,
+                    1 => self.census(),
+                    2 => self.refcount -= 1,
+                    else => unreachable,
+                },
+            }
+            self.s_pc += 1;
+        }
+
+        fn stepReleaser(self: *Self) void {
+            switch (self.r_pc) {
+                // `openPackAt`: the unlocked read.
+                0 => {
+                    self.r_saw_sealed = self.sealed;
+                    self.r_pc = if (self.r_saw_sealed) 2 else 1;
+                },
+                // `lockOpen`: lock{ sealed? → the ladder : released + 1,
+                // refcount − 1 }.
+                1 => {
+                    if (self.sealed) {
+                        self.r_pc = 2;
+                        return;
+                    }
+                    self.released += 1;
+                    self.refcount -= 1;
+                    self.r_pc = 3;
+                },
+                // The plain ladder, outside the lock.
+                2 => {
+                    self.refcount -= 1;
+                    self.ladder_releases += 1;
+                    self.r_pc = 3;
+                },
+                else => unreachable,
+            }
+        }
+
+        pub fn invariant(self: *const Self) !void {
+            // committed 1 + inflight 0 + the pin.
+            if (self.census_taken and @as(u32, self.census_refcount) + self.census_released != 2) return error.CensusDrift;
+        }
+
+        pub fn final(self: *const Self) !void {
+            if (!self.sealed or !self.census_taken) return error.NoSeal;
+            if (self.refcount != 0) return error.PinOrTenantLeaked;
+            if (@as(u32, self.released) + self.ladder_releases != 1) return error.TenantReleasedTwice;
+        }
+    };
+}
+
 // ---------------------------------------------------------------------------
 // Tests — the law, the core, the crash contract over RAM seams.
 // ---------------------------------------------------------------------------
@@ -1209,6 +1335,9 @@ const World = struct {
     commit_fail_next: bool = false,
     commits: u32 = 0,
     geo: Geometry = .default,
+    /// The test's pin: runs inside the seal's census, at its refcount read
+    /// (a tenant release arriving mid-census).
+    on_refcount: ?struct { ctx: *anyopaque, call: *const fn (*anyopaque) void } = null,
 
     fn deinit(self: *World) void {
         self.refcounts.deinit(self.gpa);
@@ -1265,6 +1394,7 @@ const World = struct {
 
     fn refcount(ctx: *anyopaque, vol_tag: u64, offset: u64) u32 {
         const self: *World = @ptrCast(@alignCast(ctx));
+        if (self.on_refcount) |h| h.call(h.ctx);
         return self.refcounts.get(.{ vol_tag, offset }) orelse 0;
     }
 
@@ -1731,6 +1861,58 @@ test "a tenant released while its pack is still OPEN (an unlink, a rewrite's dis
     f.packer.releaseTenantRef(m61);
     try testing.expectEqual(term0 + 1, stats.pack_terminal_frees.load());
     try testing.expectEqual(@as(u32, 0), World.refcount(&f.world, 0x11, 0));
+}
+
+test "the seal's census and its flag are ONE step against a tenant release: a release that observes the pack SEALED (and so runs the plain ladder) left strictly after the census read the refcount — the census never meets the flag already up, drift 0, the tenant's reference leaves exactly once (LTP fs 2026-10-22, ftest01: a packed file re-staged while its pack sealed FULL fired pack_pin_refcount_drift once in 72 tests; the shipped seal raised the flag first and its census then read a refcount the ladder had already lowered)" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    const f = try Fixture.init(gpa);
+    defer f.deinit();
+    const g = (try f.stage(70, 1, &fill(3000, 's'))).generation;
+    try testing.expectEqual(std.meta.Tag(CommitOutcome).committed, std.meta.activeTag(try f.promote(io, 70, 1, g)));
+    try testing.expectEqual(@as(u32, 2), World.refcount(&f.world, 0x11, 0));
+    const open = f.packer.openPack(.{ .vol_tag = 0x11, .scope = 0 }).?;
+    const m70 = World.current(&f.world, 70).?.durableCopy().?;
+    // The releaser (`freeBindings` of the displaced tenant) arrives while
+    // the seal's census reads the refcount: it runs the release face only
+    // if the pack it sees is already SEALED — the ladder's own decision
+    // (`openPackAt`); an OPEN pack would have it wait for the pin lock the
+    // census holds, and then it runs after the seal.
+    const Racer = struct {
+        packer: *Packer,
+        pack: *OpenPack,
+        m: Mapping,
+        ran_inside_census: bool = false,
+
+        fn call(ctx: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (self.ran_inside_census or !self.pack.isSealed()) return;
+            self.ran_inside_census = true;
+            self.packer.releaseTenantRef(self.m);
+        }
+    };
+    var racer: Racer = .{ .packer = &f.packer, .pack = open, .m = m70 };
+    f.world.on_refcount = .{ .ctx = &racer, .call = &Racer.call };
+    const drift0 = stats.pack_pin_refcount_drift.load();
+    stats.pack_pin_refcount_drift.resetLogBudgetForTest();
+    try testing.expect(f.packer.sealBlock(0x11, 0));
+    f.world.on_refcount = null;
+    try testing.expectEqual(drift0, stats.pack_pin_refcount_drift.load());
+    // The flag went up after the census: the racer never saw it inside.
+    try testing.expect(!racer.ran_inside_census);
+    // The pin left at the seal; the tenant's release after it is the
+    // plain ladder, terminal — once.
+    try testing.expectEqual(@as(u32, 1), World.refcount(&f.world, 0x11, 0));
+    const term0 = stats.pack_terminal_frees.load();
+    f.packer.releaseTenantRef(m70);
+    try testing.expectEqual(term0 + 1, stats.pack_terminal_frees.load());
+    try testing.expectEqual(@as(u32, 0), World.refcount(&f.world, 0x11, 0));
+    try testing.expectEqual(@as(u32, 0), open.released.load(.monotonic));
+}
+
+test "model: the seal's census against a tenant release holds with the census inside the flag's critical section and fails with the flag raised first (the shipped order: the ladder lowers the refcount the census then reads)" {
+    try explorer.expectHolds(SealCensusModel(.none), .{});
+    try explorer.expectFails(SealCensusModel(.flag_before_census), .{}, error.InvariantViolated);
 }
 
 test "crash contract over the RAM seams: ≥ 1 committed tenant ⇒ the block recovers ALLOCATED at refcount N from the refs; a prepared-but-uncommitted tenant leaves nothing durable (the torn slot DMA is invisible); no committed tenant ⇒ FREE" {

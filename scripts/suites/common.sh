@@ -1,10 +1,14 @@
 #!/usr/bin/env bash
 # The ONE harness for the external conformance suites (charter §11 "Gates":
 # release gate = pjdfstest + full LTP + full fstests `-g auto` all passing,
-# adjudicated by-design exceptions only). Sourced by `pjdfstest.sh`,
-# `ltp.sh`, `fstests.sh`; runs inside the Linux venue (`scripts/venue`) as
-# root. Nothing here is a product path: the product is the `squeezefs`
-# binary this harness formats, mounts, drives, unmounts and fscks.
+# adjudicated by-design exceptions only) and the two release rows beside
+# them (owner, 2026-10-22): `mdtest.sh` (an `mpirun` of mdtest) and
+# `tarx.sh` (the reference's `sym-tarx` gate 2 — a joined writer's `tar -x`
+# against the manager's own — plus the parallel single-mount form). Sourced
+# by `pjdfstest.sh`, `ltp.sh`, `fstests.sh`, `mdtest.sh`, `tarx.sh`; runs
+# inside the Linux venue (`scripts/venue`) as root. Nothing here is a
+# product path: the product is the `squeezefs` binary this harness formats,
+# mounts, drives, unmounts and fscks.
 #
 # FAIL EARLY, FAIL HARD (owner ruling 2026-10-17): a run stops at the first
 # failing test that is not an adjudicated ledger row (LTP: nor the venue's,
@@ -13,8 +17,14 @@
 #
 #   suite_prepare <suite>        packages (lockfile-checked) + results dir
 #   suite_mount <tag>            format a set and mount it with the release posture
+#   suite_mount_pair <tag> <peer> format a SYMMETRIC set, mount its manager at <tag>
+#                                and a second daemon of the same set, JOINED, at <peer>
 #   suite_umount <tag>           orderly `squeezefs umount` (the daemon exits)
 #   suite_fsck <tag>             `fsck --offline --scrub`: 0 findings is part of the pass
+#   suite_stats_snapshot <tag> <label>   the mount's `.stats` document to the results dir
+#   suite_stat <file> <key>      one counter off a snapshot (by leaf name)
+#   suite_stats_delta <before> <after> <key…>   Σ of the keys' deltas
+#   suite_judge_mount <tag> <label>  the live mount's must-stay-0 set + the watchdog's log
 #   suite_judge <suite> <file>   the adjudication ledger over the run's failure ids
 #   suite_run_count <n>          the multi-run discipline's run index (log only)
 #
@@ -198,6 +208,8 @@ suite_prepare() {
 # ---- the set: format + mount with the release posture ----------------------
 
 declare -A SUITE_MNT SUITE_META SUITE_PID SUITE_SETDIR
+# peer tag → the set's tag (`suite_mount_peer`): a peer leaves before its manager.
+declare -A SUITE_PEER_OF
 
 suite_set_paths() {
   local tag=$1
@@ -206,6 +218,14 @@ suite_set_paths() {
   SUITE_META[$tag]="sqmeta://${SUITE_SETDIR[$tag]}/meta.img"
 }
 
+# `--single-writer` (SUITE_SINGLE_WRITER=1, the default): a suite is one
+# mount on one host; the symmetric join ladder is the N-daemon matrix's
+# business — except `suite_mount_pair`'s set (tarx.sh's A-B-B-A row: two
+# daemons of one set on this host), formatted in the default symmetric
+# posture. The write cache is every mount's (RAM; the production shape of
+# a client).
+SUITE_SINGLE_WRITER=${SUITE_SINGLE_WRITER:-1}
+
 suite_format() {
   local tag=$1; shift
   suite_set_paths "$tag"
@@ -213,21 +233,18 @@ suite_format() {
   rm -rf "$d"; mkdir -p "$d"
   truncate -s "${SUITE_META_MIB}M" "$d/meta.img"
   truncate -s "${SUITE_DATA_GIB}G" "$d/d0.img" "$d/d1.img"
-  # `--single-writer`: the suites are one mount on one host; the symmetric
-  # join ladder is the N-daemon matrix's business. The write cache is every
-  # mount's (RAM; the production shape of a client).
-  "$SQZ_BIN" format --single-writer "$@" "${SUITE_META[$tag]}" "sqdata://$d/d0.img,$d/d1.img" \
+  local writers=()
+  [ "$SUITE_SINGLE_WRITER" = 1 ] && writers=(--single-writer)
+  "$SQZ_BIN" format "${writers[@]}" "$@" "${SUITE_META[$tag]}" "sqdata://$d/d0.img,$d/d1.img" \
     >"$d/format.out" 2>&1 || { cat "$d/format.out" >&2; suite_die "format failed ($tag)"; }
-  suite_log "formatted $tag: $(head -1 "$d/format.out")"
+  suite_log "formatted $tag${writers[0]:+ (single writer)}: $(head -1 "$d/format.out")"
 }
 
-# Mount `tag` (formatting it unless SUITE_KEEP_SET=1 and it exists).
-# Extra args after the tag go to `mount` verbatim (e.g. -o ro).
-suite_mount() {
-  local tag=$1; shift
-  suite_set_paths "$tag"
-  [ -f "${SUITE_SETDIR[$tag]}/meta.img" ] && [ "${SUITE_KEEP_SET:-0}" = 1 ] || suite_format "$tag"
-  local mnt=${SUITE_MNT[$tag]} log="$RESULTS/daemon-$tag.log"
+# One daemon of set `set_tag`'s metadata, mounted at `mnt`, logging to
+# `log`; extra args go to `mount` verbatim. Records the daemon's pid under
+# `tag` (its `.stats`).
+suite_spawn_daemon() {
+  local tag=$1 set_tag=$2 mnt=$3 log=$4; shift 4
   mkdir -p "$mnt"
   # The kmbuf ring wants order-8 contiguous pages; a fragmented venue
   # (other agents' daemons, a hot page cache) answers ENOMEM. Compact and
@@ -239,10 +256,10 @@ suite_mount() {
   # stack) and aborted — a wedge becomes evidence, never a hung suite.
   local attempt
   for attempt in 1 2 3; do
-    "$SQZ_BIN" mount --daemon --supervise --log-file "$log" -o "$SUITE_MOUNT_OPTS" "$@" "${SUITE_META[$tag]}" "$mnt" && break
+    "$SQZ_BIN" mount --daemon --supervise --log-file "$log" -o "$SUITE_MOUNT_OPTS" "$@" "${SUITE_META[$set_tag]}" "$mnt" && break
     if [ "$attempt" -lt 3 ] && grep -q 'ENOMEM (order-8' "$log"; then
       suite_log "mount $tag: kmbuf ENOMEM (fragmented venue); compacting memory and retrying ($attempt/3)"
-      sync -f "${SUITE_SETDIR[$tag]}"; { echo 3 > /proc/sys/vm/drop_caches; echo 1 > /proc/sys/vm/compact_memory; } 2>/dev/null || true; sleep 2
+      sync -f "${SUITE_SETDIR[$set_tag]}"; { echo 3 > /proc/sys/vm/drop_caches; echo 1 > /proc/sys/vm/compact_memory; } 2>/dev/null || true; sleep 2
       continue
     fi
     tail -40 "$log" >&2; suite_die "mount failed ($tag)"
@@ -250,6 +267,48 @@ suite_mount() {
   grep -q " $mnt fuse.squeezefs " /proc/mounts || suite_die "$mnt is not in /proc/mounts after a ready mount"
   SUITE_PID[$tag]=$(grep -o '"pid":[0-9]*' "$mnt/.stats" | head -1 | cut -d: -f2)
   suite_log "mounted $tag at $mnt (daemon pid ${SUITE_PID[$tag]}, -o $SUITE_MOUNT_OPTS $*)"
+}
+
+# Mount `tag` (formatting it unless SUITE_KEEP_SET=1 and it exists).
+# Extra args after the tag go to `mount` verbatim (e.g. -o ro).
+suite_mount() {
+  local tag=$1; shift
+  suite_set_paths "$tag"
+  [ -f "${SUITE_SETDIR[$tag]}/meta.img" ] && [ "${SUITE_KEEP_SET:-0}" = 1 ] || suite_format "$tag"
+  suite_spawn_daemon "$tag" "$tag" "${SUITE_MNT[$tag]}" "$RESULTS/daemon-$tag.log" "$@"
+}
+
+# ---- two daemons of one set on one host (tarx.sh's A-B-B-A row) ------------
+#
+# The set is formatted in the default SYMMETRIC posture (`--single-writer`
+# is the opt-out); the first daemon wins D0 and is the MANAGER, the second
+# finds the manager's listener through the page and JOINS as appender 1
+# (charter §5.7; the smoke's TWO MOUNTS OF ONE SET ON ONE HOST row). Both
+# members live on this host, so the ONE listener binds loopback
+# (`SQUEEZEFS_MW_BIND`, a registry knob; `auto` would advertise the
+# default route's address to a wire no second host is on). `suite_umount`,
+# `suite_daemon_alerts` and `suite_judge_mount` take either tag; the set's
+# fsck is `suite_fsck <tag>` after BOTH are unmounted (the peer first: the
+# manager's clean close is the set's).
+suite_mount_pair() {
+  local tag=$1 peer=$2; shift 2
+  export SQUEEZEFS_MW_BIND=${SUITE_MW_BIND:-127.0.0.1:0}
+  local SUITE_SINGLE_WRITER=0
+  suite_mount "$tag" "$@"
+  suite_mount_peer "$tag" "$peer" "$@"
+}
+
+# A second daemon of `tag`'s (mounted, symmetric) set at `mnt-<peer>`.
+suite_mount_peer() {
+  local tag=$1 peer=$2; shift 2
+  SUITE_SETDIR[$peer]=${SUITE_SETDIR[$tag]}
+  SUITE_META[$peer]=${SUITE_META[$tag]}
+  SUITE_MNT[$peer]="$RESULTS/mnt-$peer"
+  SUITE_PEER_OF[$peer]=$tag
+  local log="$RESULTS/daemon-$peer.log"
+  suite_spawn_daemon "$peer" "$tag" "${SUITE_MNT[$peer]}" "$log" "$@"
+  grep -q 'mounted JOINED as appender' "$log" || { tail -20 "$log" >&2; suite_die "$peer did not JOIN $tag's set (no 'mounted JOINED as appender' line)"; }
+  suite_log "$peer JOINED $tag's set: $(grep -o 'mounted JOINED as appender [0-9]*' "$log" | head -1)"
 }
 
 suite_umount() {
@@ -307,6 +366,72 @@ suite_daemon_alerts() {
   fi
 }
 
+# ---- the mount's `.stats` document ----------------------------------------
+#
+# A snapshot is the whole document (`cat`, never `cp`: the virtual file has
+# no size for copy_file_range to trust) to
+# `$RESULTS/stats-<tag>-<label>.json`; a counter is read by its LEAF name,
+# first match in document order (every name below is unique in the
+# document; `scripts/bracket/brk.py`'s `flatten` reads it the same way).
+suite_stats_snapshot() {
+  local tag=$1 label=$2 out="$RESULTS/stats-$1-$2.json"
+  cat "${SUITE_MNT[$tag]}/.stats" > "$out" || suite_die "cannot read ${SUITE_MNT[$tag]}/.stats ($label)"
+  echo "$out"
+}
+suite_stat() {   # file key → the value (0 when the key is absent, said on stderr)
+  python3 - "$1" "$2" <<'PY'
+import json, sys
+def leaves(o, out):
+    if isinstance(o, dict):
+        for k, v in o.items():
+            if not isinstance(v, (dict, list)) and k not in out: out[k] = v
+        for v in o.values(): leaves(v, out)
+    elif isinstance(o, list):
+        for v in o: leaves(v, out)
+    return out
+d = leaves(json.load(open(sys.argv[1])), {})
+if sys.argv[2] not in d: print("suite_stat: no leaf named %s in %s" % (sys.argv[2], sys.argv[1]), file=sys.stderr)
+print(d.get(sys.argv[2], 0))
+PY
+}
+suite_stats_delta() {   # before after key… → Σ (after − before) over the keys
+  local before=$1 after=$2; shift 2
+  python3 - "$before" "$after" "$@" <<'PY'
+import json, sys
+def leaves(o, out):
+    if isinstance(o, dict):
+        for k, v in o.items():
+            if not isinstance(v, (dict, list)) and k not in out: out[k] = v
+        for v in o.values(): leaves(v, out)
+    elif isinstance(o, list):
+        for v in o: leaves(v, out)
+    return out
+b = leaves(json.load(open(sys.argv[1])), {}); a = leaves(json.load(open(sys.argv[2])), {})
+missing = [k for k in sys.argv[3:] if k not in a]
+if missing: print("suite_stats_delta: no leaf named %s" % ", ".join(missing), file=sys.stderr)
+print(sum(int(a.get(k, 0)) - int(b.get(k, 0)) for k in sys.argv[3:]))
+PY
+}
+
+# The live mount's health after a workload (owner, 2026-10-22: every
+# tripwire judged, the FUSE op watchdog never overdue): `.stats` readable,
+# `invariant_tripwires` 0, `fuse_op_watchdog_overdue` 0, and no `FUSE op
+# watchdog:` line in the daemon's log (the watchdog's report of an op past
+# its class's threshold — logged, never cancelled; charter §4). The
+# snapshot is kept as `stats-<tag>-<label>.json`. Returns 1 on a finding.
+suite_judge_mount() {
+  local tag=$1 label=$2 rc=0
+  local snap; snap=$(suite_stats_snapshot "$tag" "$label") || return 1
+  local tw od
+  tw=$(suite_stat "$snap" invariant_tripwires); od=$(suite_stat "$snap" fuse_op_watchdog_overdue)
+  [ "$tw" = 0 ] || { suite_log "$tag ($label): invariant_tripwires=$tw (must stay 0)"; rc=1; }
+  [ "$od" = 0 ] || { suite_log "$tag ($label): fuse_op_watchdog_overdue=$od (must stay 0)"; rc=1; }
+  local n; n=$(grep -c 'FUSE op watchdog:' "$RESULTS/daemon-$tag.log" 2>/dev/null || true)
+  [ "${n:-0}" = 0 ] || { suite_log "$tag ($label): the FUSE op watchdog logged $n overdue op(s):"; grep 'FUSE op watchdog:' "$RESULTS/daemon-$tag.log" | head -5 | cut -c1-240 | sed 's/^/    /' >&2; rc=1; }
+  [ "$rc" = 0 ] && suite_log "$tag ($label): .stats readable, invariant_tripwires 0, fuse_op_watchdog_overdue 0, no watchdog line"
+  return $rc
+}
+
 # `fsck --offline --scrub` over the unmounted set: 0 findings (exit 0) is
 # part of every suite's pass. The JSON report is kept.
 suite_fsck() {
@@ -328,6 +453,8 @@ suite_cleanup() {
   local tag
   # A suite's own first step (fstests: its `check` process group, its sets).
   if [ -n "${SUITE_CLEANUP_HOOK:-}" ]; then "$SUITE_CLEANUP_HOOK" || true; fi
+  # Joined peers before their managers (a manager's clean close is the set's).
+  for tag in "${!SUITE_PEER_OF[@]}"; do [ -n "${SUITE_MNT[$tag]:-}" ] && suite_umount "$tag" || true; done
   for tag in "${!SUITE_MNT[@]}"; do [ -n "${SUITE_MNT[$tag]}" ] && suite_umount "$tag" || true; done
   # Never leave OUR daemons or mounts behind on the shared venue (other
   # agents' daemons are theirs: listed, never signalled).
@@ -364,7 +491,9 @@ suite_clean_build() {
 # id did not fail in this run is STALE (exit 3) — the ledger never rots:
 # a fixed defect's row goes, or the suite stopped covering it and the row
 # says so. Ids are the suite's own: pjdfstest `chmod/12.t#3`, LTP the test
-# tag (`utimensat01`), fstests `generic/003`.
+# tag (`utimensat01`), fstests `generic/003`, mdtest `np32/<check>`
+# (`np32/phase:File creation`), tarx `abba/<check>` and `parallel/<check>`
+# (`abba/wall`, `abba/tree:b1@a`).
 suite_ledger_rows() {
   local suite=$1
   local f="$REPO/docs/gates/$suite-exceptions.md"

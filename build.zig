@@ -43,8 +43,11 @@
 //!                            (tests/costs/) from this venue's gate runs.
 //!   zig build suites-smoke — the ~2-minute pjdfstest subset against a fresh
 //!                            mount (scripts/suites/pjdfstest.sh; Linux, root).
-//!   zig build gate-release — pjdfstest + LTP + fstests -g auto, three clean
-//!                            runs each under the adjudication ledgers
+//!   zig build gate-release — pjdfstest + LTP + fstests -g auto + the two
+//!                            release rows (an mpirun of mdtest; the
+//!                            reference's sym-tarx `tar -x` row + its
+//!                            parallel form), three clean runs each under
+//!                            the adjudication ledgers
 //!                            (docs/gates/*-exceptions.md): the release gate.
 //!   zig build dist         — the dist profile artifact + split debug info.
 //!   zig build shim         — libsqueezefs_il.so (the LD_PRELOAD shim) into lib/ (Linux).
@@ -221,7 +224,7 @@ pub fn build(b: *std.Build) void {
     // The gate steps are declared here so the steps below can hang off them;
     // their dependencies are wired where each piece lands.
     const gate_step = b.step("gate", "fmt + unit tests + rails + smoke + bench-smoke + shim/nvmet/sdk smokes + suites-smoke, side by side (the per-commit gate)");
-    const gate_release_step = b.step("gate-release", "gate + bench-compare against the committed baseline + the external suites (pjdfstest, LTP, fstests -g auto; 3 clean runs each, adjudicated; Linux venue, root, hours) — run with -Drelease-gate=true: skips fail");
+    const gate_release_step = b.step("gate-release", "gate + bench-compare against the committed baseline + the external suites (pjdfstest, LTP, fstests -g auto) + the release rows (mdtest under mpirun, the sym-tarx tar -x row; 3 clean runs each, adjudicated; Linux venue, root, hours) — run with -Drelease-gate=true: skips fail");
 
     // ---- static rails: source-scanning convention tests (charter §11) ----
     const rails_tests = b.addTest(.{
@@ -471,9 +474,13 @@ pub fn build(b: *std.Build) void {
     //      `suites-smoke` = the ~2-minute pjdfstest subset against a fresh
     //      mount (one run; part of the gate); the release gate above also
     //      runs the full pjdfstest + LTP (fs, syscalls) + fstests `-g auto`
-    //      with the 3-run discipline and the adjudication ledgers (hours;
-    //      never per commit). Both drive the binary THIS build emitted
-    //      (`--bin`), so a stale install can never be judged. ----
+    //      and the two release rows of 2026-10-22 — `mdtest.sh` (an mpirun
+    //      of mdtest at -np 32 and 64) and `tarx.sh` (the reference's
+    //      sym-tarx A-B-B-A row over two mounts of one set + the parallel
+    //      single-mount form) — with the 3-run discipline and the
+    //      adjudication ledgers (hours; never per commit). All drive the
+    //      binary THIS build emitted (`--bin`), so a stale install can
+    //      never be judged. ----
     const suites_smoke_step = b.step("suites-smoke", "pjdfstest gate subset (~2 min) against a fresh mount (Linux venue, root)");
     if (target.result.os.tag == .linux) {
         const smoke = b.addSystemCommand(&.{ "bash", "scripts/suites/pjdfstest.sh", "--bin" });
@@ -486,7 +493,7 @@ pub fn build(b: *std.Build) void {
         shards.venue_steps.append(b.allocator, &smoke.step) catch @panic("OOM");
         suites_smoke_step.dependOn(&smoke.step);
         gate_step.dependOn(suites_smoke_step);
-        inline for (.{ "pjdfstest.sh", "ltp.sh", "fstests.sh" }) |script| {
+        inline for (.{ "pjdfstest.sh", "ltp.sh", "fstests.sh", "mdtest.sh", "tarx.sh" }) |script| {
             const run = b.addSystemCommand(&.{ "bash", "scripts/suites/" ++ script, "--bin" });
             run.addFileArg(exe.getEmittedBin());
             run.has_side_effects = true;

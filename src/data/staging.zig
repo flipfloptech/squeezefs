@@ -1858,7 +1858,11 @@ pub fn promoteAtFsync(seg: *Segment, hooks: PromotionHooks, key: StagingKey) Fsy
             stats.fsync_promoted_files.inc();
             return .promoted;
         },
-        .unnamed, .declined => {},
+        .unnamed => {
+            stats.fsync_promote_superseded.inc();
+            return .absent;
+        },
+        .declined => {},
     }
     // Gone meanwhile (a pressure promotion raced): nothing owed.
     return if (seg.residentGeneration(key) != null) .kept else .absent;

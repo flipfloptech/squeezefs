@@ -140,6 +140,14 @@ next landing on top of it, and its model must include the fold's ordering invari
      arm) pays the growths' drains; B's checkpoint flush 13 vs A's 7 cycles per extraction (≤ 20 ms).
      The joined conveyor's queue cells and the lane's inbound cap stay sized by the floor ring (128)
      across growth — a throughput cap under many committers, not a correctness matter.
+     **The wall's bimodality (12:51–12:56: A 1.66 → 0.97 s between arms, MISS 1.54×) was the laptop
+     ON BATTERY** (`rung-10-tarx-wall-validity.md`: every latency the daemon measures shifted
+     ×1.5–2.5 uniformly, the budget Green, no stall counter moved; upower: discharging 12:29–13:05).
+     The row now refuses battery, pins the clock (boost off, restored), records the host posture per
+     arm and judges the phase VALID only with one posture and each mount's arms within 1.20× — else
+     INVALID, re-run on a fresh set, never a pass. 3/3 PASSED on mains at 0.866× / 0.838× / 0.904×.
+     Residual: a2 is always 1.05–1.18× a1 (the set's kv root grows 3 levels in b2/a2, SMO retries
+     0 → 20, the journal thread +30–70 % CPU) — the A-spread bound sits close to it.
    - **The mdtest legs' heap finding is the designed posture, not a leak:** after mass removal the
      emptied, tombstone-heavy leaves (1,408 of them after np64, holding 1,485 of 4,030 extents) fold
      only under heap pressure (`posture.isFull()` / `merge_backlog`), a later write, or

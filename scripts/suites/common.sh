@@ -27,6 +27,8 @@
 #   suite_judge_mount <tag> <label>  the live mount's must-stay-0 set + the watchdog's log
 #   suite_judge <suite> <file>   the adjudication ledger over the run's failure ids
 #   suite_run_count <n>          the multi-run discipline's run index (log only)
+#   suite_host_posture           the host's clock posture (mains, governor, boost, cap) in one line
+#   suite_pin_clock / suite_unpin_clock   boost off for a timing row's run, restored after
 #
 # Posture (charter §1.6 "never a silent fallback to a weaker posture"): the
 # suites mount EXACTLY what production mounts. `-o default_permissions`
@@ -465,6 +467,7 @@ suite_cleanup() {
   local tag
   # A suite's own first step (fstests: its `check` process group, its sets).
   if [ -n "${SUITE_CLEANUP_HOOK:-}" ]; then "$SUITE_CLEANUP_HOOK" || true; fi
+  suite_unpin_clock || true
   # Joined peers before their managers (a manager's clean close is the set's).
   for tag in "${!SUITE_PEER_OF[@]}"; do [ -n "${SUITE_MNT[$tag]:-}" ] && suite_umount "$tag" || true; done
   for tag in "${!SUITE_MNT[@]}"; do [ -n "${SUITE_MNT[$tag]}" ] && suite_umount "$tag" || true; done
@@ -556,6 +559,75 @@ suite_judge() {
 # stops at the first non-pass.
 SUITE_RUNS=${SUITE_RUNS:-3}
 suite_run_count() { suite_log "run $1 of $SUITE_RUNS on $("$SQZ_BIN" --version)"; }
+
+# ---- the host's clock (a timing row's venue) --------------------------------
+#
+# A wall law divides one measurement by another, so the host's clock must
+# hold still across both. It does not by itself (2026-10-22, this
+# workstation): a laptop on battery runs its SoC in the firmware's battery
+# power regime — tarx read 1.3–2.2 s per extraction on battery against
+# 0.65–0.9 s on mains, arms minutes apart 2.5× apart as the boost budget
+# came and went, every op's latency and the daemon's CPU per op shifted
+# uniformly; and on mains a thermal guard's cap (this box's
+# sqz-thermal-governor: `scaling_max_freq` 5.19 → 4.0 GHz at 84 °C, back
+# 30 s later) flips inside nearly every 40 s phase and moves a
+# single-threaded extraction 1.2–1.3×, while a co-tenant's burst shares the
+# SoC's power budget and does the same with nothing in sysfs to show it.
+# The posture line records it; the pin takes the boost out for the run.
+SUITE_BOOST_CTL=/sys/devices/system/cpu/cpufreq/boost
+SUITE_BOOST_SAVED=""
+SUITE_MAX_KHZ_SAVED=""
+# A thermal guard's record of the cap it currently intends (this box's
+# sqz-thermal-governor writes it on every step): the unpin restores THAT
+# when it exists, since the guard's steps during the run were clamped away.
+SUITE_CLOCK_CAP_FILE=${SUITE_CLOCK_CAP_FILE:-/run/sqz-thermal-governor/cap_khz}
+
+# `mains=<on|off|none> gov=<governor> epp=<preference> boost=<0|1>
+# max_khz=<scaling_max_freq>` (cpu0's policy; a field a host lacks is
+# omitted; `mains=none` is a host without a mains supply, i.e. not a laptop).
+suite_host_posture() {
+  local mains=none ps t on
+  for ps in /sys/class/power_supply/*; do
+    [ -r "$ps/type" ] && t=$(cat "$ps/type") || continue
+    [ "$t" = Mains ] || continue
+    on=$(cat "$ps/online" 2>/dev/null || echo 0)
+    if [ "$on" = 1 ]; then mains=on; break; else mains=off; fi
+  done
+  local cf=/sys/devices/system/cpu/cpu0/cpufreq out="mains=$mains"
+  [ -r $cf/scaling_governor ] && out="$out gov=$(cat $cf/scaling_governor)"
+  [ -r $cf/energy_performance_preference ] && out="$out epp=$(cat $cf/energy_performance_preference)"
+  [ -r $SUITE_BOOST_CTL ] && out="$out boost=$(cat $SUITE_BOOST_CTL)"
+  [ -r $cf/scaling_max_freq ] && out="$out max_khz=$(cat $cf/scaling_max_freq)"
+  echo "$out"
+}
+
+# Pin the clock for a timing row: boost off (`cpufreq/boost`), so every
+# core's ceiling is the nominal frequency (3.0 GHz here against 5.19 GHz
+# boosted) — the thermal guard's cap writes above it clamp to it and
+# change nothing, the SoC stays inside its sustained power budget, and the
+# ceiling is the same for every arm. Restored by `suite_unpin_clock` (the
+# suite's cleanup calls it): boost back, then `scaling_max_freq` written
+# back to every policy — the guard's current cap (SUITE_CLOCK_CAP_FILE)
+# when there is one, else the value found at pin time (re-enabling boost
+# lifts it to the hardware maximum, which would drop a guard's cap until
+# its next step). A host without the control (a VM, an intel_pstate box:
+# `no_turbo` is not handled) is said and left alone.
+suite_pin_clock() {
+  if [ ! -w "$SUITE_BOOST_CTL" ]; then suite_log "clock pin: no $SUITE_BOOST_CTL on this host — the clock is not pinned; the posture rules alone judge the measurement"; return 0; fi
+  SUITE_BOOST_SAVED=$(cat "$SUITE_BOOST_CTL")
+  SUITE_MAX_KHZ_SAVED=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq)
+  echo 0 > "$SUITE_BOOST_CTL"
+  suite_log "clock pinned: boost $SUITE_BOOST_SAVED -> 0 (ceiling $(cat /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq) kHz; scaling_max_freq was $SUITE_MAX_KHZ_SAVED) for the run; restored after"
+}
+suite_unpin_clock() {
+  [ -n "$SUITE_BOOST_SAVED" ] || return 0
+  echo "$SUITE_BOOST_SAVED" > "$SUITE_BOOST_CTL" || true
+  local p khz=$SUITE_MAX_KHZ_SAVED from="pin time"
+  if [ -r "$SUITE_CLOCK_CAP_FILE" ]; then khz=$(cat "$SUITE_CLOCK_CAP_FILE"); from="the guard's $SUITE_CLOCK_CAP_FILE"; fi
+  for p in /sys/devices/system/cpu/cpufreq/policy*; do echo "$khz" > "$p/scaling_max_freq" 2>/dev/null || true; done
+  suite_log "clock unpinned: boost restored to $SUITE_BOOST_SAVED, scaling_max_freq to $khz ($from)"
+  SUITE_BOOST_SAVED=""; SUITE_MAX_KHZ_SAVED=""
+}
 
 # Wall time helper: `suite_timed <label> cmd…` logs elapsed seconds.
 suite_timed() {

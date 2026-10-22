@@ -36,6 +36,23 @@
 # never overdue on both; `fsck --offline --scrub` clean after both unmount
 # (B first, then the manager).
 #
+# THE WALL LAW'S VALIDITY (2026-10-22; `common.sh` "the host's clock"):
+# the law divides B's wall by S0, so both must be measurements of the
+# daemons, not of the host's clock. On a laptop on battery one extraction
+# read 0.8–2.2 s minutes apart on BOTH mounts (every op's latency shifted
+# ×1.5–2.5 uniformly and the daemon's CPU per op with it; no cache shed,
+# no budget pressure, no stall counter moved): the row REFUSES to run on
+# battery. For the run the harness PINS the clock (boost off, restored
+# after; TARX_PIN_CLOCK=0 leaves it: the thermal guard's cap then flips
+# inside most phases). Within a phase the host posture is recorded at
+# every arm boundary and must not change, and each mount's two arms must
+# agree within TARX_S0_SPREAD (1.20×; A's drift over a phase on mains
+# measured 1.11–1.15×, B's 1.03–1.13× with b1's ring growths). A phase
+# that breaks either is INVALID — logged with the arms and postures, never
+# a pass — and re-run on a fresh set, up to TARX_ABBA_ATTEMPTS times; a
+# run whose every attempt was invalid fails (`abba/invalid`). The law is
+# unchanged.
+#
 # PHASE 2 — the parallel single-mount form (the owner's words: "parallel
 # tar"): N = nproc/4 concurrent extractions of the same tarball into N
 # fresh directories on ONE mount (the release posture, single writer), all
@@ -52,6 +69,7 @@
 #   SUITE_RUNS=1 scripts/venue scripts/suites/tarx.sh
 #   TARX_SRC=/path/to/linux/fs TARX_REPS=1 …             # the corpus by hand; one extraction per arm
 #   TARX_PHASES=parallel SUITE_RUNS=1 …                  # one phase (triage)
+#   TARX_PIN_CLOCK=0 …                                   # the host's clock as it is (the posture rules alone)
 set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 
@@ -81,6 +99,12 @@ TARX_PHASES=${TARX_PHASES:-"abba parallel"}
 # The gate-2 law's two bounds (the reference's; `sym_rows_lib.sh`).
 TARX_WALL_RATIO=1.10
 TARX_VERBS_PER_ENTRY=0.05
+# The phase's validity (the module comment): each mount's two arms within
+# this ratio of each other and the host posture constant across the phase,
+# else INVALID and re-run; the clock pinned for the run.
+TARX_S0_SPREAD=1.20
+TARX_ABBA_ATTEMPTS=${TARX_ABBA_ATTEMPTS:-3}
+TARX_PIN_CLOCK=${TARX_PIN_CLOCK:-1}
 # Wall bound per extraction (`timeout -s KILL`): a 2,400-entry extraction
 # is seconds; past this it is a wedge to read.
 TARX_TIMEOUT_S=${TARX_TIMEOUT_S:-900}
@@ -144,16 +168,21 @@ tarx_cleanup() {
 
 # ---- phase 1: the A-B-B-A row -------------------------------------------------
 
-# One arm on mount `tag`: snapshots of both daemons, `mkdir` of the
-# destination (the directory this mount created — under `/`, the ONE
-# shipped step for B), TARX_REPS extractions each into a fresh
-# subdirectory, snapshots again. The wall per extraction (s) in
-# TARX_ARM_WALL (no subshell: a failure must reach TARX_STOP).
+# One arm on mount `tag`: snapshots of both daemons and the host posture,
+# `mkdir` of the destination (the directory this mount created — under
+# `/`, the ONE shipped step for B), TARX_REPS extractions each into a fresh
+# subdirectory, snapshots and the posture again. The wall per extraction
+# (s) in TARX_ARM_WALL, the posture in TARX_ARM_POSTURE (`before` when the
+# arm ended as it began, else `before -> after`); every posture seen goes
+# to TARX_POSTURES (no subshell: a failure must reach TARX_STOP).
 TARX_ARM_WALL=""
+TARX_ARM_POSTURE=""
+TARX_POSTURES=()
 tarx_arm() {   # label tag
   local label=$1 tag=$2 mnt=${SUITE_MNT[$2]}
-  local dest="$mnt/tarx-$label" r rc=0
+  local dest="$mnt/tarx-$label" r rc=0 p0 p1
   suite_stats_snapshot "$TAG_A" "$label-0" >/dev/null; suite_stats_snapshot "$TAG_B" "$label-0" >/dev/null
+  p0=$(suite_host_posture)
   local t0 t1
   t0=$(date +%s.%N)
   mkdir "$dest"
@@ -162,9 +191,12 @@ tarx_arm() {   # label tag
     timeout -s KILL "$TARX_TIMEOUT_S" tar -xf "$TARBALL" -C "$dest/r$r" > "$RESULTS/tar-$label-r$r.out" 2>&1 || { rc=$?; break; }
   done
   t1=$(date +%s.%N)
+  p1=$(suite_host_posture)
   suite_stats_snapshot "$TAG_A" "$label-1" >/dev/null; suite_stats_snapshot "$TAG_B" "$label-1" >/dev/null
   [ "$rc" = 0 ] || { head -5 "$RESULTS/tar-$label-r$r.out" | sed 's/^/    /' >&2; tarx_fail "abba/extract:$label" "tar -x on $tag exit $rc (137 = the $TARX_TIMEOUT_S s wall bound)"; }
   TARX_ARM_WALL=$(python3 -c "print(f'{($t1 - $t0) / $TARX_REPS:.3f}')")
+  TARX_POSTURES+=("$p0" "$p1")
+  if [ "$p0" = "$p1" ]; then TARX_ARM_POSTURE=$p0; else TARX_ARM_POSTURE="$p0 -> $p1"; fi
 }
 
 # The arm's census off its snapshots: `<Σ wire verbs on B> <handovers A>
@@ -176,14 +208,19 @@ tarx_census() {   # label
 }
 
 TAG_A=""; TAG_B=""
-tarx_abba() {   # n
-  local n=$1
-  TAG_A="run$n-a"; TAG_B="run$n-b"
+# Set when the attempt's S0 was no measurement (the module comment): the
+# wall law is not judged, the caller re-runs the phase on a fresh set.
+TARX_INVALID=0
+tarx_abba() {   # n attempt
+  local n=$1 k=$2 run="run$n"
+  [ "$k" = 1 ] || run="run${n}t$k"
+  TAG_A="$run-a"; TAG_B="$run-b"
+  TARX_INVALID=0; TARX_POSTURES=()
   suite_mount_pair "$TAG_A" "$TAG_B"
   local mnt_a=${SUITE_MNT[$TAG_A]} mnt_b=${SUITE_MNT[$TAG_B]}
-  suite_log "run $n phase 1: A (manager) at $mnt_a, B (joined) at $mnt_b; A-B-B-A over $TARX_ENTRIES entries × $TARX_REPS extraction(s) per arm"
+  suite_log "run $n phase 1 (attempt $k of $TARX_ABBA_ATTEMPTS): A (manager) at $mnt_a, B (joined) at $mnt_b; A-B-B-A over $TARX_ENTRIES entries × $TARX_REPS extraction(s) per arm; host $(suite_host_posture)"
   local rows="$RESULTS/rows-run$n.tsv"
-  printf 'arm\tmount\twall_s_per_rep\tentries_per_s\twire_verbs_B\tverbs_per_entry\thandovers_A\thandovers_B\tmanager_verbs_A\tframes_sent_B\trenewals_B\n' > "$rows"
+  [ -s "$rows" ] || printf 'attempt\tarm\tmount\twall_s_per_rep\tentries_per_s\twire_verbs_B\tverbs_per_entry\thandovers_A\thandovers_B\tmanager_verbs_A\tframes_sent_B\trenewals_B\thost_posture\n' > "$rows"
   declare -A wall
   local label side tag w wire ha hb mv fr rn vpe eps
   for label in a1 b1 b2 a2; do
@@ -193,8 +230,8 @@ tarx_abba() {   # n
     eps=$(python3 -c "print(f'{$TARX_ENTRIES / max(float(\"$w\"), 0.001):.0f}')")
     read -r wire ha hb mv fr rn <<< "$(tarx_census "$label")"
     vpe=$(python3 -c "print(f'{$wire / ($TARX_ENTRIES * $TARX_REPS):.4f}')")
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$label" "$side" "$w" "$eps" "$wire" "$vpe" "$ha" "$hb" "$mv" "$fr" "${rn:-0}" >> "$rows"
-    suite_log "arm $label on $side ($tag): $w s per extraction ($eps entries/s); B's wire verbs $wire ($vpe per entry), handovers A $ha B $hb, manager verbs A +$mv, frames sent B +$fr, renewals B +${rn:-0}"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$k" "$label" "$side" "$w" "$eps" "$wire" "$vpe" "$ha" "$hb" "$mv" "$fr" "${rn:-0}" "$TARX_ARM_POSTURE" >> "$rows"
+    suite_log "arm $label on $side ($tag): $w s per extraction ($eps entries/s); B's wire verbs $wire ($vpe per entry), handovers A $ha B $hb, manager verbs A +$mv, frames sent B +$fr, renewals B +${rn:-0}; host $TARX_ARM_POSTURE"
     # THE ENGAGEMENT LAW on B's arms: verbs/entry < 0.05, no handover on
     # either side. (A's arms: recorded.)
     if [ "$side" = b ]; then
@@ -214,6 +251,25 @@ tarx_abba() {   # n
     [ "$TARX_STOP" = 0 ] || break
   done
   if [ "$TARX_STOP" = 0 ]; then
+    # THE PHASE'S VALIDITY before the law: one host posture across the
+    # phase, and each mount's two arms within TARX_S0_SPREAD of each other;
+    # else INVALID (the law is not judged on it; the caller re-runs the
+    # phase on a fresh set).
+    local postures spread_a spread_b
+    postures=$(printf '%s\n' "${TARX_POSTURES[@]}" | sort -u | paste -sd'|')
+    spread_a=$(python3 -c "a, b = float('${wall[a1]}'), float('${wall[a2]}'); print(f'{max(a, b) / max(min(a, b), 0.001):.3f}')")
+    spread_b=$(python3 -c "a, b = float('${wall[b1]}'), float('${wall[b2]}'); print(f'{max(a, b) / max(min(a, b), 0.001):.3f}')")
+    local arms="a1 ${wall[a1]} b1 ${wall[b1]} b2 ${wall[b2]} a2 ${wall[a2]} s"
+    if [ "$(printf '%s\n' "$postures" | tr '|' '\n' | grep -c .)" != 1 ]; then
+      TARX_INVALID=1
+      suite_log "INVALID run $n attempt $k: the host posture changed during the phase — $postures ($arms): the walls measured the host's clock, not the daemons"
+    elif python3 -c "import sys; sys.exit(0 if $spread_a > $TARX_S0_SPREAD or $spread_b > $TARX_S0_SPREAD else 1)"; then
+      TARX_INVALID=1
+      suite_log "INVALID run $n attempt $k: a mount's two arms disagree (A ${spread_a}x, B ${spread_b}x; bound ${TARX_S0_SPREAD}x; $arms; host $postures): the venue is not quiet, the walls are no measurement of the daemons"
+    fi
+    printf 'attempt %s: %s; spread A %sx B %sx; host %s; %s\n' "$k" "$arms" "$spread_a" "$spread_b" "$postures" "$([ "$TARX_INVALID" = 0 ] && echo VALID || echo INVALID)" >> "$RESULTS/attempts-run$n.txt"
+  fi
+  if [ "$TARX_STOP" = 0 ] && [ "$TARX_INVALID" = 0 ]; then
     # THE WALL LAW: B's mean ≤ 1.10 × S0 (A's mean); both orders beside.
     local verdict
     verdict=$(python3 - "${wall[b1]}" "${wall[b2]}" "${wall[a1]}" "${wall[a2]}" "$TARX_WALL_RATIO" <<'PY'
@@ -276,12 +332,25 @@ tarx_parallel() {   # n
   suite_fsck "$tag" || tarx_fail "parallel/fsck" "fsck --offline --scrub found something after the parallel extractions"
 }
 
+# Phase 1 until an attempt is VALID (a failed check stops at once; an
+# INVALID attempt is re-run on a fresh set); every attempt invalid fails
+# the run — never a pass.
+tarx_abba_attempts() {   # n
+  local n=$1 k
+  for k in $(seq 1 "$TARX_ABBA_ATTEMPTS"); do
+    tarx_abba "$n" "$k"
+    [ "$TARX_STOP" = 0 ] && [ "$TARX_INVALID" = 1 ] || return 0
+    [ "$k" = "$TARX_ABBA_ATTEMPTS" ] || suite_log "run $n: attempt $k was INVALID; re-running phase 1 on a fresh set ($((k + 1)) of $TARX_ABBA_ATTEMPTS)"
+  done
+  tarx_fail "abba/invalid" "every one of $TARX_ABBA_ATTEMPTS attempts was INVALID (S0 unstable or the host posture moved; attempts-run$n.txt) — the venue is not the row's; quiet it and re-run"
+}
+
 tarx_run() {   # n
   local n=$1 phase
   : > "$RESULTS/rows-run$n.tsv"
   for phase in $TARX_PHASES; do
     case $phase in
-      abba) tarx_abba "$n" ;;
+      abba) tarx_abba_attempts "$n" ;;
       parallel) tarx_parallel "$n" ;;
       *) suite_die "unknown phase '$phase' (TARX_PHASES: abba parallel)" ;;
     esac
@@ -297,6 +366,12 @@ tarx_run() {   # n
 main() {
   SUITE_CLEANUP_HOOK=tarx_cleanup
   suite_prepare tarx
+  # A laptop on battery is not the row's venue (the module comment): refused
+  # before a set is formatted, never a run that reads as a pass or a fail.
+  local posture; posture=$(suite_host_posture)
+  case " $posture " in *" mains=off "*) suite_die "the host is on battery ($posture): the SoC's battery power regime is not a venue for a wall law — on mains, re-run" ;; esac
+  [ "$TARX_PIN_CLOCK" = 1 ] && suite_pin_clock || suite_log "clock not pinned (TARX_PIN_CLOCK=$TARX_PIN_CLOCK)"
+  suite_log "host posture: $(suite_host_posture)"
   tarx_corpus
   suite_ledger_rows tarx | cut -f1 > "$RESULTS/ledger-ids.txt"
   local n verdict=0

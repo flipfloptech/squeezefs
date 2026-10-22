@@ -1670,7 +1670,7 @@ test "rename EXCHANGE: two Deletes, two Puts re-occupying the vacated slots, bot
     const old_sib = pos(1, "a", 0, 900, S.IFREG);
     const old = pos(1, "a", 1, 42_000, S.IFREG);
     const new_sib = pos(2, "b", 0, 901, S.IFREG);
-    const new = pos(2, "b", 1, 60_000, S.IFDIR);
+    const new = pos(2, "b", 1, 60_000, S.IFLNK);
     const old_chain = [_][]const u8{ &old_sib.key, &old.key };
     const new_chain = [_][]const u8{ &new_sib.key, &new.key };
     var t = newTx();
@@ -1687,7 +1687,7 @@ test "rename EXCHANGE: two Deletes, two Puts re-occupying the vacated slots, bot
     try testing.expectEqualSlices(u8, &old.key, t.staged.items[3].key);
     const oa = try stagedDentry(&t, 3, 1, "a");
     try testing.expectEqual(@as(u64, 60_000), oa.child_ino);
-    try testing.expectEqual(ftByte(S.IFDIR), oa.file_type);
+    try testing.expectEqual(ftByte(S.IFLNK), oa.file_type);
     _ = try stagedDelta(&t, 4, 1, record.DELTA_TIMES);
     _ = try stagedDelta(&t, 5, 2, record.DELTA_TIMES);
     _ = try stagedDelta(&t, 6, 42, record.DELTA_CTIME);
@@ -1714,6 +1714,84 @@ test "rename EXCHANGE: two Deletes, two Puts re-occupying the vacated slots, bot
     try testing.expectError(error.InvalidFlags, stageRename(&t3, .{ .name_key = &seed, .now = t_now, .old_parent = 1, .old_name = "a", .new_parent = 1, .new_name = "b", .flags = .{ .exchange = true, .noreplace = true }, .old_pos = old, .new_pos = new1 }));
     try testing.expectError(error.InvalidFlags, stageRename(&t3, .{ .name_key = &seed, .now = t_now, .old_parent = 1, .old_name = "a", .new_parent = 1, .new_name = "b", .flags = .{ .exchange = true }, .old_pos = old, .new_pos = new1, .whiteout = .{ .local = 9, .global = 9 } }));
     try testing.expect(t3.isEmpty());
+}
+
+test "rename EXCHANGE parent nlink law (fstests generic/025: the matrix's cross-directory dir ↔ file swaps left the parents' counts un-shifted — the cleanup's rmdir then fired the underflow guard ×4 and the other parent stayed inflated): a `..` moves only when the kinds differ across parents — dir(a) ↔ file(b): old −1 / new +1; file(a) ↔ dir(b): old +1 / new −1 — as exclusive Puts; every other cell (file ↔ file, dir ↔ dir, any same-parent swap) moves nothing: Δtimes under SHARED" {
+    const Cell = struct { a_mode: u32, b_mode: u32, cross: bool, old_delta: i32, new_delta: i32 };
+    // The law table, one row per (src kind, dst kind) × (same, cross).
+    const table = [_]Cell{
+        .{ .a_mode = S.IFREG, .b_mode = S.IFREG, .cross = false, .old_delta = 0, .new_delta = 0 },
+        .{ .a_mode = S.IFDIR, .b_mode = S.IFDIR, .cross = false, .old_delta = 0, .new_delta = 0 },
+        .{ .a_mode = S.IFDIR, .b_mode = S.IFREG, .cross = false, .old_delta = 0, .new_delta = 0 },
+        .{ .a_mode = S.IFREG, .b_mode = S.IFDIR, .cross = false, .old_delta = 0, .new_delta = 0 },
+        .{ .a_mode = S.IFREG, .b_mode = S.IFLNK, .cross = true, .old_delta = 0, .new_delta = 0 },
+        .{ .a_mode = S.IFDIR, .b_mode = S.IFDIR, .cross = true, .old_delta = 0, .new_delta = 0 },
+        .{ .a_mode = S.IFDIR, .b_mode = S.IFREG, .cross = true, .old_delta = -1, .new_delta = 1 },
+        .{ .a_mode = S.IFLNK, .b_mode = S.IFDIR, .cross = true, .old_delta = 1, .new_delta = -1 },
+    };
+    for (table) |cell| {
+        const new_parent: u64 = if (cell.cross) 2 else 1;
+        const old = pos(1, "a", 0, 42_000, cell.a_mode);
+        const new = pos(new_parent, "b", 0, 60_000, cell.b_mode);
+        var t = newTx();
+        defer t.deinit();
+        const out = try stageRename(&t, .{ .name_key = &seed, .now = t_now, .old_parent = 1, .old_name = "a", .new_parent = new_parent, .new_name = "b", .flags = .{ .exchange = true }, .old_pos = old, .new_pos = new, .src_local = 42, .dest_local = 60, .old_parent_value = dirValue(3), .new_parent_value = dirValue(3) });
+        // The dentry surgery is the same in every cell; the parent records
+        // follow the law.
+        try expectDentryDelete(&t, 0, &old.key);
+        try expectDentryDelete(&t, 1, &new.key);
+        _ = try stagedDentry(&t, 2, new_parent, "b");
+        _ = try stagedDentry(&t, 3, 1, "a");
+        const shifts = cell.old_delta != 0;
+        if (shifts) {
+            const op = try stagedInode(&t, 4);
+            try testing.expectEqual(@as(u64, 1), try key.decodeInodeKey(t.staged.items[4].key));
+            try testing.expectEqual(@as(u32, @intCast(3 + cell.old_delta)), op.nlink);
+            try testing.expectEqual(t_now, op.mtime);
+            try testing.expectEqual(t_now, op.ctime);
+            const np = try stagedInode(&t, 5);
+            try testing.expectEqual(@as(u64, 2), try key.decodeInodeKey(t.staged.items[5].key));
+            try testing.expectEqual(@as(u32, @intCast(3 + cell.new_delta)), np.nlink);
+            try testing.expectEqual(t_now, np.mtime);
+            try testing.expectEqual(dlm.Mode.exclusive, out.guards.inodeMode(1).?);
+            try testing.expectEqual(dlm.Mode.exclusive, out.guards.inodeMode(2).?);
+            try testing.expectEqual(op, (try foldInode(&t, 1, dirValue(3))).?);
+            try testing.expectEqual(np, (try foldInode(&t, 2, dirValue(3))).?);
+            _ = try stagedDelta(&t, 6, 42, record.DELTA_CTIME);
+            _ = try stagedDelta(&t, 7, 60, record.DELTA_CTIME);
+            try testing.expectEqual(@as(usize, 8), t.staged.items.len);
+        } else {
+            _ = try stagedDelta(&t, 4, 1, record.DELTA_TIMES);
+            try testing.expectEqual(dlm.Mode.shared, out.guards.inodeMode(1).?);
+            if (cell.cross) {
+                _ = try stagedDelta(&t, 5, 2, record.DELTA_TIMES);
+                try testing.expectEqual(dlm.Mode.shared, out.guards.inodeMode(2).?);
+            }
+            // No parent record moves nlink: the fold over either parent is
+            // its base count.
+            try testing.expectEqual(@as(u32, 3), (try foldInode(&t, 1, dirValue(3))).?.nlink);
+            try testing.expectEqual(@as(usize, if (cell.cross) 8 else 7), t.staged.items.len);
+        }
+        try testing.expectEqual(@as(u64, 1), try entriesOf(&t));
+    }
+
+    // The underflow floor holds on the shifting cell too (a parent record
+    // already short): counted, never below 2.
+    const before = stats.dir_nlink_underflows.load();
+    var t2 = newTx();
+    defer t2.deinit();
+    _ = try stageRename(&t2, .{ .name_key = &seed, .now = t_now, .old_parent = 1, .old_name = "a", .new_parent = 2, .new_name = "b", .flags = .{ .exchange = true }, .old_pos = pos(1, "a", 0, 60_000, S.IFDIR), .new_pos = pos(2, "b", 0, 42_000, S.IFREG), .src_local = 60, .dest_local = 42, .old_parent_value = dirValue(2), .new_parent_value = dirValue(2) });
+    try testing.expectEqual(@as(u32, 2), (try stagedInode(&t2, 4)).nlink);
+    try testing.expectEqual(@as(u32, 3), (try stagedInode(&t2, 5)).nlink);
+    try testing.expectEqual(before + 1, stats.dir_nlink_underflows.load());
+    // Unreadable parents on a shifting swap: nothing staged for them, the
+    // exclusive class still planned (the non-exchange directory move's shape).
+    var t3 = newTx();
+    defer t3.deinit();
+    const o3 = try stageRename(&t3, .{ .name_key = &seed, .now = t_now, .old_parent = 1, .old_name = "a", .new_parent = 2, .new_name = "b", .flags = .{ .exchange = true }, .old_pos = pos(1, "a", 0, 60_000, S.IFDIR), .new_pos = pos(2, "b", 0, 42_000, S.IFREG) });
+    try testing.expectEqual(@as(usize, 4), t3.staged.items.len);
+    try testing.expectEqual(dlm.Mode.exclusive, o3.guards.inodeMode(1).?);
+    try testing.expectEqual(dlm.Mode.exclusive, o3.guards.inodeMode(2).?);
 }
 
 test "rename WHITEOUT: the char-0:0 whiteout inode and its dentry at the OLD name (in the slot the Delete freed) ride the same entry" {

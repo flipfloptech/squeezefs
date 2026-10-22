@@ -1205,9 +1205,11 @@ pub const DataPlane = struct {
 
     /// The high water that kicks the drain and the low water it drains to:
     /// 7/8 and 3/4 of the bound — a quarter of the bound of headroom is a
-    /// burst's worth at the promotion's pace, an eighth the trigger's.
+    /// burst's worth at the promotion's pace, an eighth the trigger's. The
+    /// low water is the ring's (`staging.WRITE_CACHE_DRAIN_DIVISOR`): the
+    /// ring-full episode closes at the same mark.
     const WRITE_CACHE_KICK_DIVISOR: u64 = 8;
-    const WRITE_CACHE_DRAIN_DIVISOR: u64 = 4;
+    const WRITE_CACHE_DRAIN_DIVISOR = staging.WRITE_CACHE_DRAIN_DIVISOR;
 
     /// The write cache's descriptors for the supervisor (the memfd and the
     /// claim: `mount` announces them beside the journal tails); null on a

@@ -81,8 +81,12 @@ pub const stats = struct {
     pub var staging_over_cap_refusals: counters.ShardedCounter = .{};
     /// `staging_ring_full_refusals`: a placement found no hole (never
     /// destroys a live entry; the write takes its own-block arm — the ring
-    /// is a cache, never the set's capacity).
+    /// is a cache, never the set's capacity). Every refusal counts here;
+    /// `staging_ring_full_episodes` counts the EPISODES (`Pool.RingFull`):
+    /// the first refusal opens one (ONE warning), the drain that frees a
+    /// quarter of the ring closes it (one info line).
     pub var staging_ring_full_refusals: counters.ShardedCounter = .{};
+    pub var staging_ring_full_episodes: counters.ShardedCounter = .{};
     /// `staging_pressure_kicks`: high-water crossings that kicked the write
     /// cache's drain (`evictUntil` through the promote sink).
     pub var staging_pressure_kicks: counters.ShardedCounter = .{};
@@ -172,7 +176,7 @@ pub const stats = struct {
 
 pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
     try w.writeAll("{");
-    inline for (.{ "current_staged_write_bytes", "staged_writes_in_flight", "staging_cell_state_bytes", "staging_tables_bytes", "staging_over_cap_refusals", "staging_ring_full_refusals", "staging_pressure_kicks", "write_cache_evict_promotions", "write_cache_inline_evictions_declined", "write_cache_budget_sheds", "staging_recovery_records", "staging_recovery_torn_records", "staging_generation_discards", "staging_foreign_scope_refusals", "staging_owner_live_refusals", "staged_payload_lost_reads", "dismount_promoted_files", "dismount_promoted_bytes", "dismount_promote_failures", "dismount_corpse_residents_destroyed", "dismount_unnamed_residents_destroyed", "fsync_promoted_files", "fsync_promote_superseded", "staging_dirty_free_bytes", "staging_sweep_runs", "staging_sweep_punched_bytes", "staging_inplace_overwrites", "staging_inplace_bytes", "staging_read_retries", "staging_appends", "staging_append_bytes", "staging_restages", "staging_restage_bytes" }, 0..) |name, i| {
+    inline for (.{ "current_staged_write_bytes", "staged_writes_in_flight", "staging_cell_state_bytes", "staging_tables_bytes", "staging_over_cap_refusals", "staging_ring_full_refusals", "staging_ring_full_episodes", "staging_pressure_kicks", "write_cache_evict_promotions", "write_cache_inline_evictions_declined", "write_cache_budget_sheds", "staging_recovery_records", "staging_recovery_torn_records", "staging_generation_discards", "staging_foreign_scope_refusals", "staging_owner_live_refusals", "staged_payload_lost_reads", "dismount_promoted_files", "dismount_promoted_bytes", "dismount_promote_failures", "dismount_corpse_residents_destroyed", "dismount_unnamed_residents_destroyed", "fsync_promoted_files", "fsync_promote_superseded", "staging_dirty_free_bytes", "staging_sweep_runs", "staging_sweep_punched_bytes", "staging_inplace_overwrites", "staging_inplace_bytes", "staging_read_retries", "staging_appends", "staging_append_bytes", "staging_restages", "staging_restage_bytes" }, 0..) |name, i| {
         if (i != 0) try w.writeByte(',');
         try w.print("\"{s}\":{d}", .{ name, @field(stats, name).load() });
     }
@@ -327,6 +331,14 @@ pub fn reserveFor(key_len: u64, val_len: u64, slack: Slack) u64 {
 /// §J.2's bound on ring bytes moved per appended byte (the tie test
 /// restates the chain): `1 + 2(1 + s)/s` at slack fraction `s = ¼`.
 pub const STAGED_APPEND_MOVED_BOUND: u64 = 11;
+
+/// The write cache's low water as a divisor of its bound: the drain
+/// (`DataPlane.drainTask`) evicts to `bound − bound/4` — a quarter of the
+/// bound of headroom is a burst's worth at the promotion's pace — and a
+/// ring-full episode (`Pool.RingFull`) closes once the charged footprint
+/// fell a quarter of the ring below its open: the drain's own target,
+/// so the two never disagree on what "drained" means.
+pub const WRITE_CACHE_DRAIN_DIVISOR: u64 = 4;
 
 pub const RecordHeader = struct {
     key_len: u32,
@@ -1535,14 +1547,55 @@ pub const Pool = struct {
     ledger: std.AutoHashMapUnmanaged(FileId, LedgerRow) = .empty,
     current: std.atomic.Value(u64) = .init(0),
     next_generation: std.atomic.Value(u64) = .init(FIRST_GENERATION),
-    /// The ring is in a FULL episode (a placement found no hole and the
-    /// caller took its own-block arm): one warning per episode, cleared by
-    /// the next placement that lands — 291 identical lines per burst said
-    /// nothing 1 did not.
-    ring_full_episode: std.atomic.Value(bool) = .init(false),
+    /// The ring-full EPISODE (under `lock`): opened by the first placement
+    /// that found no hole, closed by the drain that frees a quarter of the
+    /// ring (`WRITE_CACHE_DRAIN_DIVISOR`) since it opened — never by a
+    /// placement that lands: a near-full ring lands its small records
+    /// between the large ones it refuses, and an episode ended by any
+    /// landing logged one line per refusal (generic/475: 5,790 lines in
+    /// 161 s, every one already counted). One warning at the open, one
+    /// info line with the tally at the close.
+    ring_full: RingFull = .{},
+
+    pub const RingFull = struct {
+        open: bool = false,
+        since_ns: u64 = 0,
+        refusals: u64 = 0,
+        /// The charged footprint at the open; the episode closes once the
+        /// footprint is a quarter of the ring below it.
+        charged_at_open: u64 = 0,
+        drain_below: u64 = 0,
+    };
 
     pub fn init(gpa: Allocator, hooks: PromotionHooks) Pool {
         return .{ .gpa = gpa, .hooks = hooks };
+    }
+
+    /// A placement found no hole for a `need` B record in `seg`: the first
+    /// refusal of an episode is the one that logs; every refusal counts.
+    fn noteRingFull(self: *Pool, seg: *Segment, need: u64) void {
+        const opened: ?RingFull = blk: {
+            self.lock.lock();
+            defer self.lock.unlock();
+            self.ring_full.refusals += 1;
+            if (self.ring_full.open) break :blk null;
+            const charged = self.current.load(.monotonic);
+            self.ring_full = .{ .open = true, .since_ns = clock.monotonicNs(), .refusals = 1, .charged_at_open = charged, .drain_below = charged -| seg.capacity() / WRITE_CACHE_DRAIN_DIVISOR };
+            break :blk self.ring_full;
+        };
+        const e = opened orelse return;
+        stats.staging_ring_full_episodes.inc();
+        log.warn("staging ring full: a {d} B record found no hole in a {d} B segment ({d} live entries, {d} B charged) — writes take their own-block arm while the ring stays full (counted staging_ring_full_refusals; one line per episode: the next is the drain's)", .{ need, seg.capacity(), seg.live(), e.charged_at_open });
+    }
+
+    /// Under `lock`, after a credit: the drain reached a quarter of the
+    /// ring below the open's footprint — the episode closes; the caller
+    /// logs the tally outside the lock.
+    fn ringFullDrainedLocked(self: *Pool) ?RingFull {
+        if (!self.ring_full.open or self.current.load(.monotonic) > self.ring_full.drain_below) return null;
+        const e = self.ring_full;
+        self.ring_full = .{};
+        return e;
     }
 
     pub fn deinit(self: *Pool) void {
@@ -1589,14 +1642,18 @@ pub const Pool = struct {
     /// Credit `file_id`'s row (promotion released it, unlink, a stale
     /// re-stage). Generation-gated when given. Answers the credited cost.
     pub fn credit(self: *Pool, file_id: FileId, expect_generation: ?u64) ?u64 {
-        self.lock.lock();
-        defer self.lock.unlock();
-        const row = self.ledger.get(file_id) orelse return null;
-        if (expect_generation) |g| if (row.generation != g) return null;
-        _ = self.ledger.remove(file_id);
-        _ = self.current.fetchSub(row.cost, .monotonic);
-        stats.current_staged_write_bytes.sub(row.cost);
-        return row.cost;
+        const cost: u64, const drained: ?RingFull = blk: {
+            self.lock.lock();
+            defer self.lock.unlock();
+            const row = self.ledger.get(file_id) orelse return null;
+            if (expect_generation) |g| if (row.generation != g) return null;
+            _ = self.ledger.remove(file_id);
+            _ = self.current.fetchSub(row.cost, .monotonic);
+            stats.current_staged_write_bytes.sub(row.cost);
+            break :blk .{ row.cost, self.ringFullDrainedLocked() };
+        };
+        if (drained) |e| log.info("staging ring drained: the full episode is over after {d} refusal(s) in {d} ms ({d} B charged at its open, {d} B now) — placements resume", .{ e.refusals, (clock.monotonicNs() -| e.since_ns) / std.time.ns_per_ms, e.charged_at_open, self.current.load(.monotonic) });
+        return cost;
     }
 
     /// Seed the ledger from a recovered segment at generation 0, and the
@@ -1728,12 +1785,11 @@ pub fn stageWrite(pool: *Pool, seg: *Segment, cache: ?*WriteCache, key: StagingK
     };
     seg.put(key, payload, generation, fencing, padded) catch |e| switch (e) {
         error.RingFull => {
-            if (!pool.ring_full_episode.swap(true, .acq_rel)) log.warn("staging ring full: a {d} B record found no hole in a {d} B segment with {d} live entries — the write takes its own-block arm until the ring drains (counted staging_ring_full_refusals; never destroying a live entry)", .{ padded, seg.capacity(), seg.live() });
+            pool.noteRingFull(seg, padded);
             return error.StorageFull;
         },
         error.OutOfMemory => return error.OutOfMemory,
     };
-    pool.ring_full_episode.store(false, .release);
     if (prior_row != null) {
         // A re-stage under a resident key moved the image out of the ring
         // (the caller's RMW source) and back in.
@@ -2760,6 +2816,129 @@ test "placement never overlaps and reuses punched holes first-fit; a record that
     try testing.expectEqualSlices(u8, &ten, l.bytes());
 }
 
+/// The oracle of the hole search: a clear run of `grains` grains anywhere
+/// in the live set, read bit by bit (no words, no cursor).
+fn oracleHasHole(seg: *const Segment, grains: usize) bool {
+    const total: usize = @intCast(seg.image.len / RECORD_ALIGN);
+    var run: usize = 0;
+    var g: usize = 0;
+    while (g < total) : (g += 1) {
+        if (seg.grainOccupied(g)) run = 0 else run += 1;
+        if (run >= grains) return true;
+    }
+    return false;
+}
+
+test "placement completeness: a hole exists ⇒ the first-fit search finds it — 4,000 random puts (1–12 grains of footprint, with and without the append slack), replaces, removes, held leases (retired copies stay live), sweeps and random cursor positions; each RingFull is checked against a bit-by-bit oracle, each placement is inside the image and overlaps nothing; a hole below a cursor in the partial tail word is found by the wrapped leg (the ring-full line of generic/475 named 2,827–5,049 live entries in a 7.4 GB segment: the records were there, the search was not the defect)" {
+    const gpa = testing.allocator;
+    const cap_grains: usize = 300; // not a multiple of the 64-grain word: the tail word is partial
+    var r = try ramSegment(gpa, cap_grains * 4096);
+    defer gpa.free(r.image);
+    defer r.seg.deinit();
+    var prng = std.Random.DefaultPrng.init(0x5eed_4a11);
+    const rnd = prng.random();
+    const n_keys: usize = 64;
+    var resident: [n_keys]bool = @splat(false);
+    var leases: [n_keys]?Segment.Lease = @splat(null);
+    defer for (&leases) |*l| if (l.*) |x| x.release();
+    const buf = try gpa.alloc(u8, 12 * 4096);
+    defer gpa.free(buf);
+    var refusals: u32 = 0;
+    var placements: u32 = 0;
+    var generation: u64 = 1;
+    for (0..4000) |_| {
+        const i = rnd.uintLessThan(usize, n_keys);
+        const k = tkey(@intCast(i), i);
+        switch (rnd.uintLessThan(u8, 10)) {
+            0...5 => {
+                // A put: 1–12 grains of footprint, with or without slack.
+                const val_len = rnd.intRangeAtMost(usize, 1, 11 * 4096);
+                const slack: Slack = if (rnd.boolean()) .append else .none;
+                const need = reserveFor(KEY_LEN, val_len, slack);
+                const grains: usize = @intCast(need / RECORD_ALIGN);
+                @memset(buf[0..val_len], @intCast(i));
+                r.seg.put(k, buf[0..val_len], generation, 0, need) catch |e| {
+                    try testing.expectEqual(error.RingFull, e);
+                    // The law: no hole of that size exists anywhere.
+                    try testing.expect(!oracleHasHole(&r.seg, grains));
+                    refusals += 1;
+                    continue;
+                };
+                generation += 1;
+                placements += 1;
+                resident[i] = true;
+                const l = r.seg.get(k).?;
+                defer l.release();
+                try testing.expect(l.cell.extent.end() <= r.seg.capacity());
+                try testing.expectEqual(need, l.cell.extent.reserved);
+            },
+            6...7 => {
+                if (resident[i]) {
+                    try testing.expect(r.seg.remove(k, null));
+                    resident[i] = false;
+                }
+            },
+            8 => {
+                // Hold a lease (a retired copy under it stays live for
+                // placement) or drop one.
+                if (leases[i]) |l| {
+                    l.release();
+                    leases[i] = null;
+                } else if (resident[i]) leases[i] = r.seg.get(k);
+            },
+            else => {
+                r.seg.sweepDirty();
+                // The cursor at a random grain: every position is a legal
+                // start for the two-leg scan.
+                r.seg.lock.lock();
+                r.seg.write_offset = rnd.uintLessThan(u64, cap_grains) * RECORD_ALIGN;
+                r.seg.lock.unlock();
+            },
+        }
+        // The live extents never overlap (the leased retired copies are
+        // not in the index; `markLocked` asserts their grains apart).
+        var ext: [n_keys]Extent = undefined;
+        const live = r.seg.liveExtents(&ext);
+        std.mem.sort(Extent, live, {}, Segment.extentLess);
+        for (live[1..], 0..) |e, j| try testing.expect(live[j].end() <= e.rec_off);
+    }
+    // The walk exercised both verdicts.
+    try testing.expect(refusals > 50);
+    try testing.expect(placements > 1000);
+    // A wrapped hole: records fill the ring, the cursor sits past the
+    // LAST free run, and a record of exactly that run's size lands there.
+    for (&leases) |*l| if (l.*) |x| {
+        x.release();
+        l.* = null;
+    };
+    for (0..n_keys) |i| if (resident[i]) {
+        _ = r.seg.remove(tkey(@intCast(i), i), null);
+        resident[i] = false;
+    };
+    r.seg.sweepDirty();
+    try testing.expectEqual(@as(usize, 0), r.seg.live());
+    for (r.seg.occupied) |w| try testing.expectEqual(@as(u64, 0), w); // every grain back
+    // The fill from grain 0 (a cursor the random walk left at an odd grain
+    // would leave two one-grain remainders: first fit, not a defect).
+    r.seg.lock.lock();
+    r.seg.write_offset = 0;
+    r.seg.lock.unlock();
+    const two: [10]u8 = @splat(9);
+    var placed: usize = 0;
+    while (true) : (placed += 1) r.seg.put(tkey(1, 1000 + placed), &two, 1, 0, 0) catch break;
+    try testing.expectEqual(cap_grains / 2, placed);
+    try testing.expect(r.seg.remove(tkey(1, 1000 + 3), null)); // the hole at grains [6, 8)
+    r.seg.lock.lock();
+    r.seg.write_offset = (cap_grains - 1) * RECORD_ALIGN; // the cursor in the partial tail word, past the hole
+    r.seg.lock.unlock();
+    try r.seg.put(tkey(2, 2000), &two, 1, 0, 0);
+    const l2 = r.seg.get(tkey(2, 2000)).?;
+    defer l2.release();
+    try testing.expectEqual(@as(u64, 6 * RECORD_ALIGN), l2.cell.extent.rec_off);
+    try testing.expectError(error.RingFull, r.seg.put(tkey(3, 3000), &two, 1, 0, 0));
+    try testing.expect(!oracleHasHole(&r.seg, 2));
+}
+
 test "recovery scan: the true geometry survives (every live record adopted, bytes intact, write_offset = max end); false magic inside a value interior is never a header; a torn header or payload is dropped loud and the scan resyncs; two copies of one key keep the higher generation" {
     const gpa = testing.allocator;
     var r = try ramSegment(gpa, 64 * 4096);
@@ -2898,6 +3077,60 @@ test "pool: the ledger charges the delta on a re-stage and credits on release so
     try pool2.seedFromRecovery(&r.seg);
     try testing.expectEqual(@as(?u64, RECOVERED_GENERATION), pool2.generationOf(tkey(2, 2).file_id));
     try testing.expectEqual(@as(u64, 10 * 4096), pool2.currentBytes());
+}
+
+test "the ring-full EPISODE: a full ring refusing large records while small ones land between them is ONE episode (one warning line, every refusal counted) — 60 refusals interleaved with 60 landings open exactly one; a release that leaves the footprint above the drain mark keeps it open; the release that brings the footprint a quarter of the ring below the open closes it (the info line's tally); the next refusal opens a second (generic/475: 5,790 lines in 161 s from an episode ended by any landing)" {
+    const gpa = testing.allocator;
+    var pool = Pool.init(gpa, .none);
+    defer pool.deinit();
+    const cap_grains = 16;
+    var r = try ramSegment(gpa, cap_grains * 4096);
+    defer gpa.free(r.image);
+    defer r.seg.deinit();
+    const small: [10]u8 = @splat(1); // 2 grains
+    const large: [3 * 4096]u8 = @splat(2); // 4 grains
+    var held: [cap_grains / 2]StagingKey = undefined;
+    for (&held, 0..) |*k, i| {
+        k.* = tkey(@intCast(i), i);
+        _ = try stageWrite(&pool, &r.seg, null, k.*, &small, 0, .none);
+    }
+    try testing.expectEqual(@as(u64, cap_grains * 4096), pool.currentBytes());
+    const episodes0 = stats.staging_ring_full_episodes.load();
+    const refusals0 = stats.staging_ring_full_refusals.load();
+    // The thrash: a 4-grain record never fits, a 2-grain one lands in the
+    // hole a release opens, 60 times over.
+    var next: usize = 100;
+    for (0..60) |i| {
+        try testing.expectError(error.StorageFull, stageWrite(&pool, &r.seg, null, tkey(9, 9), &large, 0, .none));
+        try testing.expect(pool.ring_full.open);
+        const slot = &held[i % held.len];
+        try testing.expect(releaseStaged(&pool, &r.seg, null, slot.*, pool.generationOf(slot.file_id).?));
+        try testing.expect(pool.ring_full.open); // one record freed is not a quarter of the ring
+        slot.* = tkey(@intCast(next), next);
+        _ = try stageWrite(&pool, &r.seg, null, slot.*, &small, 0, .none);
+        next += 1;
+    }
+    try testing.expectEqual(episodes0 + 1, stats.staging_ring_full_episodes.load());
+    try testing.expectEqual(refusals0 + 60, stats.staging_ring_full_refusals.load());
+    try testing.expectEqual(@as(u64, 60), pool.ring_full.refusals);
+    try testing.expectEqual(@as(u64, cap_grains * 4096), pool.ring_full.charged_at_open);
+    try testing.expectEqual(@as(u64, cap_grains * 4096 - cap_grains * 4096 / WRITE_CACHE_DRAIN_DIVISOR), pool.ring_full.drain_below);
+    // The drain: the footprint must fall a quarter of the ring (4 grains =
+    // two small records) below the open before the episode closes.
+    const residents = try r.seg.residentsAlloc(gpa);
+    defer gpa.free(residents);
+    try testing.expect(residents.len >= 3);
+    try testing.expect(releaseStaged(&pool, &r.seg, null, residents[0].key, residents[0].generation));
+    try testing.expect(pool.ring_full.open);
+    try testing.expect(releaseStaged(&pool, &r.seg, null, residents[1].key, residents[1].generation));
+    try testing.expect(!pool.ring_full.open);
+    try testing.expectEqual(@as(u64, 0), pool.ring_full.refusals);
+    // Below the mark a refusal is a NEW episode.
+    _ = try stageWrite(&pool, &r.seg, null, tkey(50, 50), &small, 0, .none);
+    _ = try stageWrite(&pool, &r.seg, null, tkey(51, 51), &small, 0, .none);
+    try testing.expectError(error.StorageFull, stageWrite(&pool, &r.seg, null, tkey(9, 9), &large, 0, .none));
+    try testing.expectEqual(episodes0 + 2, stats.staging_ring_full_episodes.load());
+    try testing.expectEqual(refusals0 + 61, stats.staging_ring_full_refusals.load());
 }
 
 test "the write cache over the ONE cache core (owner ruling 2026-10-21): a stage inserts the resident at the head of its shard; a touch (a read, an in-place write) moves it to the head; the drain's eviction promotes the LEAST RECENTLY USED resident first through the sink and releases it iff it left the ring (a declined promotion keeps it and backs the pass off); an insert at the bound never promotes under the writer's lock — it declines, the stage answers StorageFull (the own-block arm) — and the drain makes the room; a re-stage supersedes its entry without a promotion; a release invalidates without one; the stats family names the instance" {

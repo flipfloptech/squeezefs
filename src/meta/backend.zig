@@ -266,6 +266,14 @@ pub const OpenOptions = struct {
 /// no ring, every tree a projection at the newest checkpoint.
 pub const Posture = enum { manager, joined, reader };
 
+/// The mount's supervisor hand-off for a tail created after the announce
+/// (`KvBackend.tail_announce`): `index` is the volume's set index, `fd`
+/// the new tail's memfd; false = the send failed (said by the caller).
+pub const TailAnnounce = struct {
+    ctx: ?*anyopaque,
+    announce: *const fn (ctx: ?*anyopaque, index: u16, fd: std.os.linux.fd_t) bool,
+};
+
 /// `openJoined`'s inputs beyond `OpenOptions`.
 pub const JoinOptions = struct {
     /// The mount point: the joiner's `mount_slot` derives from it.
@@ -416,6 +424,11 @@ pub const KvBackend = struct {
     /// reader. Created right after the lane (the slot table is sized to
     /// twice the lane's cells).
     tail: ?journal_tail.linux_tail.Tail = null,
+    /// Hands a tail the mount created AFTER the announce (a JOINED ring's
+    /// growth re-creates it over the grown layout) to the supervisor;
+    /// installed by the mount beside its own announce, null = no
+    /// supervisor (the tail then serves the ack point alone).
+    tail_announce: ?TailAnnounce = null,
     /// The applier fibers' group (decision 0003 §AW): joined at close,
     /// after the conveyor's quiesce (no window in flight ⇒ every applier
     /// has returned).
@@ -1122,6 +1135,9 @@ pub const KvBackend = struct {
         be.cp.space_wake = .{ .notify = &be.space_notify, .io = io };
         be.task = checkpoint_cycle.CheckpointTask.init(&be.cp, io);
         be.task.serial = &be.smo_lock;
+        // The ring's growth after each cadence tick (spec §3.3; the task
+        // thread, under the SMO lock, outside any cycle).
+        be.task.after_tick = .{ .ctx = js, .run = &sym.joined.JoinedSet.afterTick };
         be.cache.installCheckpointKick(be.task.hook());
         const cpus: u32 = if (opts.cpus != 0) opts.cpus else derive.Facts.probe().cpus;
         be.pass_on_committer = std.mem.eql(u8, knobs.enumKnob("SQUEEZEFS_META_PASS_VENUE", opts.env), "committer");
@@ -1148,6 +1164,7 @@ pub const KvBackend = struct {
             .grant_fed = true,
             .caller = .{ .idle = exec.lane.laneIdleBesidesCaller, .polls = exec.lane.lanePolls },
             .pre_admission = .{ .ctx = &js.park_gate, .wait = joinedPreAdmission },
+            .growth_gate = js.growthGateSeam(),
             .window_hold = conveyor.windowHoldFromEnv(opts.env, flush_ms, be.geo.grain),
             .applier = be.applierSeam(opts.env, cpus),
             .ack_at_apply = ackAtApply(opts.env, flush_ms),
@@ -2661,6 +2678,60 @@ pub const KvBackend = struct {
         be.smo_lock.lockUncancelable(be.io);
         defer be.smo_lock.unlock(be.io);
         return be.cp.checkpointNow();
+    }
+
+    /// The ring a JOINED appender's journal is drained at: `head ==
+    /// reusable_upto`, no reservation open, no admission outstanding — the
+    /// fixpoint the growth's cover cycles reach under the growth gate.
+    pub fn ringDrained(be: *KvBackend) bool {
+        return be.core.headPos() == be.core.reusableUpto() and be.reg.openCount() == 0 and be.core.admitted() == 0;
+    }
+
+    pub const SwapRingError = error{ NotDrained, BadTable };
+
+    /// REPLACE-WHEN-DRAINED (charter §5.5; spec §3.3; `sym/joined.zig`
+    /// `growRingIfDue`): the joined ring's segment table grew by the
+    /// segment the manager carved — the journal's page map changes under
+    /// every logical position, so it runs only at a drained ring with the
+    /// growth gate closed (no pass inside, no window in flight) on the
+    /// checkpoint task under the SMO lock: nothing else reads the geometry
+    /// then. Positions continue across the swap (the head is a byte
+    /// position over the table; the replay's chain walk starts AT the page's
+    /// tail, so a mid-page head needs no header rewrite, and every entry
+    /// header carries its position, so an old segment's bytes never read as
+    /// new). The core keeps its head and watermark (equal) and its
+    /// admission counters (net zero); the geometry, the layout, the
+    /// structural writer's and the conveyor's copies move; the tail memfd
+    /// is re-created over the grown layout and handed to the supervisor
+    /// (the old one's slots are all free — its replay writes nothing).
+    pub fn swapRing(be: *KvBackend, table: *const sym.appender_page.SegmentTable, appender_id: u32) SwapRingError!void {
+        std.debug.assert(be.posture == .joined);
+        if (!be.ringDrained()) return error.NotDrained;
+        const part = sym.appender_page.ringPartOf(appender_id, table);
+        var exts: [sym.appender_page.RING_SEGMENTS_MAX]journal.ExtentRef = undefined;
+        for (part.slice(), 0..) |s, i| exts[i] = .{ .start = s.start, .len = s.len };
+        const layout = journal.RingLayout.fromSegments(exts[0..part.len]) catch return error.BadTable;
+        const geo = journal.productionGeometry(layout.pages, be.dev.mode.grain());
+        if (geo.pages <= be.geo.pages) return error.BadTable;
+        be.core.geo = geo;
+        be.geo = geo;
+        be.ring_layout = layout;
+        be.smo_journal.layout = layout;
+        be.smo_journal.geo = geo;
+        be.cv.swapRing(be.env, layout, geo);
+        if (be.tail != null) {
+            if (openTail(be.path, layout, geo)) |t| {
+                be.tail.?.deinit();
+                be.tail = t;
+                if (be.tail_announce) |a| {
+                    if (!a.announce(a.ctx, be.index, t.fd)) log.warn("meta volume {s}: the grown ring's journal tail could not be handed to the supervisor — a crash of this process has the flush-window exposure on this ring", .{be.path});
+                }
+            } else |_| {
+                // The old tail stays: a window into the grown segment finds
+                // no mirror slot and is acked at its landing instead.
+                log.warn("meta volume {s}: the journal tail could not be re-created over the grown ring — windows into the new segment are acked at their landing", .{be.path});
+            }
+        }
     }
 
     // @anchor:ops_defrag_meta_faces — the D4 arm's two faces (rung 10).

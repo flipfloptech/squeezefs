@@ -1394,6 +1394,13 @@ pub const Deps = struct {
     /// the manager, whose home shard is itself): a parked joiner's
     /// committers wait here holding nothing; an expired park fails them.
     pre_admission: ?PreAdmission = null,
+    /// A JOINED appender's ring-growth gate (`sym/ring_growth.zig`): the
+    /// pass enters it BEFORE it reads the ring (`holdForFill` reads the
+    /// geometry and the head) and leaves it after `runBatch`; a window's
+    /// terminal outcome rings `windowLeft`. A growth swaps `ring_layout`,
+    /// `geo` and `caps` only with no pass inside and no window in flight.
+    /// Null = the manager (region 0's fixed ring never grows).
+    growth_gate: ?GrowthGate = null,
     /// The window-fill hold (§L): armed on a coalesced cadence (the
     /// backend passes the flush interval as the deadline's ceiling); null
     /// on the strict cadence and in the portable contracts' default.
@@ -1431,6 +1438,16 @@ pub const CallerSeam = struct {
 pub const PreAdmission = struct {
     ctx: *anyopaque,
     wait: *const fn (ctx: *anyopaque) error{Expired}!void,
+};
+
+/// The ring-growth gate's seam (`sym/ring_growth.zig` `Gate`).
+pub const GrowthGate = struct {
+    ctx: *anyopaque,
+    /// Parks while a growth drains the ring; returns with the pass inside.
+    enter: *const fn (ctx: *anyopaque) void,
+    leave: *const fn (ctx: *anyopaque) void,
+    /// A stage-B window reached its terminal outcome.
+    windowLeft: *const fn (ctx: *anyopaque) void,
 };
 
 // ---------------------------------------------------------------------------
@@ -1530,6 +1547,19 @@ pub const Conveyor = struct {
 
     pub fn windowsInflight(self: *const Conveyor) u64 {
         return self.stats.windows_inflight.load();
+    }
+
+    /// A JOINED ring's growth landed (`sym/joined.zig` `growRingIfDue`):
+    /// the pass reads the layout, the geometry and the caps on its next
+    /// entry. The caller holds the growth gate closed with no pass inside
+    /// and no window in flight — the only state in which these words have
+    /// no concurrent reader. The byte cap follows the ring (`resolveCaps`'
+    /// law); the tx cap is the CPU's.
+    pub fn swapRing(self: *Conveyor, env: *const std.process.Environ.Map, layout: journal.RingLayout, geo: jc.CoreGeometry) void {
+        std.debug.assert(self.deps.growth_gate != null and self.windowsInflight() == 0);
+        self.deps.ring_layout = layout;
+        self.deps.geo = geo;
+        self.deps.caps.max_bytes = resolveBatchBytes(knobs.optIntKnob("SQUEEZEFS_META_COMMIT_BATCH_BYTES", u64, env), ringUserCapacity(geo));
     }
 
     /// Yield until nothing is queued, nobody leads and no window is in
@@ -1916,6 +1946,11 @@ pub const Conveyor = struct {
     pub fn pass(self: *Conveyor) void {
         self.pass_thread.store(@intCast(std.Thread.getCurrentId()), .release);
         while (true) {
+            // The growth gate before the pass's first read of the ring (the
+            // caps at the drain, the geometry and the head at the hold): a
+            // growth swaps them only while no pass is inside.
+            if (self.deps.growth_gate) |g| g.enter(g.ctx);
+            defer if (self.deps.growth_gate) |g| g.leave(g.ctx);
             const batch = self.core.drainBatch(self.deps.caps, self.batch_buf);
             if (batch.len == 0) {
                 if (!self.core.unleadAndRecheck()) return;
@@ -3008,9 +3043,14 @@ pub const Conveyor = struct {
     }
 
     fn untrack(self: *Conveyor, w: *Window) void {
-        self.inflight_lock.lock();
-        defer self.inflight_lock.unlock();
-        if (self.inflight.remove(w.res.start)) self.stats.windows_inflight.sub(1);
+        const removed = blk: {
+            self.inflight_lock.lock();
+            defer self.inflight_lock.unlock();
+            const r = self.inflight.remove(w.res.start);
+            if (r) self.stats.windows_inflight.sub(1);
+            break :blk r;
+        };
+        if (removed) if (self.deps.growth_gate) |g| g.windowLeft(g.ctx);
     }
 
     fn lookupInflight(self: *Conveyor, start: u64) ?*Window {

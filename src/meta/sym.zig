@@ -24,6 +24,7 @@ pub const appender_page = @import("sym/appender_page.zig");
 pub const appender_dir = @import("sym/appender_dir.zig");
 pub const region = @import("sym/region.zig");
 pub const extent_grant = @import("sym/extent_grant.zig");
+pub const ring_growth = @import("sym/ring_growth.zig");
 pub const manager = @import("sym/manager.zig");
 pub const join = @import("sym/join.zig");
 pub const enable_symmetric = @import("sym/enable_symmetric.zig");
@@ -95,6 +96,7 @@ test {
     _ = appender_dir;
     _ = region;
     _ = extent_grant;
+    _ = ring_growth;
     _ = manager;
     _ = join;
     _ = enable_symmetric;

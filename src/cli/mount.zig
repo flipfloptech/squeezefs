@@ -1031,19 +1031,32 @@ fn announceTails(be: *meta_set.MetaSet, env: *const std.process.Environ.Map) voi
     for (be.volumes, 0..) |vol, i| {
         const t = vol.tail orelse continue;
         const index: u16 = @intCast(i);
-        const tail_frame = (cli.supervisor.TailFrame{ .kind = .tail, .index = index }).encode();
-        const guard_frame = (cli.supervisor.TailFrame{ .kind = .guard, .index = index }).encode();
-        ipc_rl.sendCtl(sock, &tail_frame, t.fd) catch |e| {
-            log.err("volume {d}: cannot hand the journal tail to the supervisor ({s}) — a crash has the flush-window exposure", .{ index, @errorName(e) });
+        if (!announceTail(null, index, t.fd)) {
+            log.err("volume {d}: cannot hand the journal tail to the supervisor — a crash has the flush-window exposure", .{index});
             continue;
-        };
+        }
+        const guard_frame = (cli.supervisor.TailFrame{ .kind = .guard, .index = index }).encode();
         ipc_rl.sendCtl(sock, &guard_frame, vol.guard_fd) catch |e| {
             log.err("volume {d}: cannot hand the writer guard to the supervisor ({s}) — a successor may open the volume before the replay", .{ index, @errorName(e) });
             continue;
         };
+        // A tail the volume re-creates later (a JOINED ring's growth) rides
+        // the same socket; the supervisor replays every tail it holds in
+        // order, a retired one's slots all free.
+        vol.tail_announce = .{ .ctx = null, .announce = &announceTail };
         sent += 1;
     }
     log.info("journal tails: {d} volume(s) handed to the supervisor (a crash of this process is replayed to the device before the writer claim is released); acks {s}", .{ sent, if (at_apply) "precede the landing (the ext4 posture)" else "follow the landing" });
+}
+
+/// One tail frame + its memfd over the supervisor's socket
+/// (`KvBackend.tail_announce`).
+fn announceTail(_: ?*anyopaque, index: u16, fd: std.os.linux.fd_t) bool {
+    const sock = journal_tail.supervisor_sock.load(.acquire);
+    if (sock < 0) return false;
+    const frame = (cli.supervisor.TailFrame{ .kind = .tail, .index = index }).encode();
+    ipc_rl.sendCtl(sock, &frame, fd) catch return false;
+    return true;
 }
 
 /// The write cache's memfd and its claim over the supervisor's socket

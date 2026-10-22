@@ -1247,6 +1247,15 @@ pub const CheckpointTask = struct {
     /// checkpoint — held around every `runOnce`; the tests' solo task runs
     /// unlocked.
     serial: ?*Io.Mutex = null,
+    /// Runs after every cadence tick but the shutdown's, under `serial`:
+    /// a JOINED appender's ring growth (`sym/joined.zig` `growRingIfDue`),
+    /// which runs cover cycles of its own and must never nest in one.
+    after_tick: ?AfterTick = null,
+
+    pub const AfterTick = struct {
+        ctx: *anyopaque,
+        run: *const fn (ctx: *anyopaque) void,
+    };
 
     pub fn init(cp: *Checkpointer, io: Io) CheckpointTask {
         const period = ckpt.checkpointTickPeriodMs(cp.cfg.flush_interval_ms) * ns_per_ms;
@@ -1307,6 +1316,7 @@ pub const CheckpointTask = struct {
                 self.stopped.store(true, .release);
                 return false;
             }
+            if (self.after_tick) |a| a.run(a.ctx);
         } else {
             self.cp.drainMaintenance(DrainBudget.bounded(drain_deadline.?)) catch |e| {
                 log.warn("kv maintenance pass failed on {s}: {s} (state stays RAM-consistent; the cadence tick retries)", .{ self.cp.cfg.volume, @errorName(e) });

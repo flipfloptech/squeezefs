@@ -58,6 +58,9 @@ const page = @import("appender_page.zig");
 const dir = @import("appender_dir.zig");
 const region = @import("region.zig");
 const grant = @import("extent_grant.zig");
+const ring_growth = @import("ring_growth.zig");
+const checkpoint = @import("../checkpoint.zig");
+const conveyor = @import("../conveyor.zig");
 const join = @import("join.zig");
 const manager = @import("manager.zig");
 const cr = @import("control_records.zig");
@@ -108,6 +111,18 @@ pub const stats = struct {
     /// to: a dead holder's grants are recalled by no one once its slots
     /// are recovered.
     pub var joined_dead_holder_planes_dropped: counters.ShardedCounter = .{};
+    /// Ring growths this joiner applied (`growRingIfDue`: the manager's
+    /// segment named by the page and the journal swapped onto it).
+    pub var joined_ring_grows: counters.ShardedCounter = .{};
+    /// The manager declined a growth (no room under the ring budget, a
+    /// short run, the table full): asked again only at a fresh stall or a
+    /// changed ring.
+    pub var joined_ring_grow_declined: counters.ShardedCounter = .{};
+    /// A growth whose drain did not reach the fixpoint inside one landing
+    /// ceiling, or whose verb failed: the gate reopened, retried next tick.
+    pub var joined_ring_grow_deferrals: counters.ShardedCounter = .{};
+    /// The measured commit rate the ring derives from (bytes/s, EWMA).
+    pub var joined_commit_ewma_bytes_per_s: counters.Gauge = .{};
 };
 
 /// `mount_slot` of a joiner (charter §5.7 "a remount at another mount
@@ -123,7 +138,7 @@ pub fn joinerMountSlot(mountpoint: []const u8) u32 {
 /// How long a joiner polls the projection for the manager's endpoint
 /// record: three checkpoint cadences (the record is a ring-0 control
 /// entry the manager's next cycle lands; the joiner has no ring replay).
-pub const ENDPOINT_POLL_MAX_MS: u64 = 3 * @import("../checkpoint.zig").CHECKPOINT_MAX_AGE_MS;
+pub const ENDPOINT_POLL_MAX_MS: u64 = 3 * checkpoint.CHECKPOINT_MAX_AGE_MS;
 pub const ENDPOINT_POLL_STEP_MS: u64 = 100;
 
 /// The grant mirror's compaction reserve: one split's two images — the
@@ -351,6 +366,18 @@ pub const JoinedSet = struct {
     /// `T_park_max` expires it. Armed here with the env-derived clocks; the
     /// membership grant's `T_owner` refines `t_park_max_ms`.
     park_gate: park.ParkGate,
+    /// The ring-growth gate (`ring_growth.zig`): the conveyor's passes
+    /// enter it; `growRingIfDue` closes it to drain and swap the ring.
+    gate: ring_growth.Gate,
+    /// The growth decision's words (spec §3.3; touched by the checkpoint
+    /// task alone): the stall count as of the last decision, the ring size
+    /// the manager last declined at, the commit-rate EWMA and its fold
+    /// marks (the head and the clock at the last fold).
+    stalls_at_last_grow: u64 = 0,
+    grow_declined_at: u64 = ring_growth.NEVER_DECLINED,
+    commit_ewma_bytes_per_s: u64 = 0,
+    head_at_last_fold: ?u64 = null,
+    fold_mark_ns: u64 = 0,
 
     /// The joined door (module doc): the census, the endpoint and the
     /// secret off the projection, the dial, `JoinAppender`. The region's
@@ -405,6 +432,7 @@ pub const JoinedSet = struct {
             .writers_known = writers_known,
             .granted_bits = .{},
             .park_gate = park.ParkGate.arm(be.io, be.stamp.member_position, park.tParkMaxMs(grant.failoverBoundMs(0, 0), park.graceMs(shard.tOwnerMsFromEnv(be.env)))),
+            .gate = ring_growth.Gate.init(be.io),
         };
         errdefer self.link.deinit();
         // `--join` names a listener the record may not yet carry: the
@@ -829,11 +857,197 @@ pub const JoinedSet = struct {
         self.writePages(true) catch return error.Io;
         self.tail_written = rec.journal_tail_seq;
         self.be.slots.pageLanded(r);
-        // The rate folds on the checkpoint clock alone (a kicked cadence
+        // The rates fold on the checkpoint clock alone (a kicked cadence
         // would sample a fraction of a cycle).
         self.foldSmoRate();
+        self.foldCommitRate();
         self.poolCadence();
         self.be.slots.kickCadence();
+    }
+
+    // ---- the ring's growth (spec §3.3, the joiner's side) ----
+
+    /// The commit-rate fold per cycle (`ring_growth.foldCommitRate`): the
+    /// ring derivation's measured input (charter §5.5 "`clamp(2 ×
+    /// ewma_commit_bytes/s × CHECKPOINT_MAX_AGE, …)`").
+    fn foldCommitRate(self: *JoinedSet) void {
+        const now = clock.monotonicNs();
+        const head = self.be.core.headPos();
+        self.commit_ewma_bytes_per_s = ring_growth.foldCommitRate(self.commit_ewma_bytes_per_s, head, self.head_at_last_fold, now -| self.fold_mark_ns);
+        self.head_at_last_fold = head;
+        self.fold_mark_ns = now;
+        stats.joined_commit_ewma_bytes_per_s.set(self.commit_ewma_bytes_per_s);
+    }
+
+    /// The conveyor's growth-gate seam.
+    pub fn growthGateSeam(self: *JoinedSet) conveyor.GrowthGate {
+        return .{ .ctx = &self.gate, .enter = &gateEnter, .leave = &gateLeave, .windowLeft = &gateWindowLeft };
+    }
+
+    fn gateEnter(ctx: *anyopaque) void {
+        const g: *ring_growth.Gate = @ptrCast(@alignCast(ctx));
+        g.enter();
+    }
+
+    fn gateLeave(ctx: *anyopaque) void {
+        const g: *ring_growth.Gate = @ptrCast(@alignCast(ctx));
+        g.leave();
+    }
+
+    fn gateWindowLeft(ctx: *anyopaque) void {
+        const g: *ring_growth.Gate = @ptrCast(@alignCast(ctx));
+        g.noteWindowLeft();
+    }
+
+    /// The checkpoint task's `after_tick` seam.
+    pub fn afterTick(ctx: *anyopaque) void {
+        const self: *JoinedSet = @ptrCast(@alignCast(ctx));
+        self.growRingIfDue();
+    }
+
+    fn windowEmpty(self: *JoinedSet) bool {
+        return self.gate.passesInside() == 0 and self.be.cv.windowsInflight() == 0;
+    }
+
+    /// `joined_grow_ring_if_due` (spec §3.3), on the checkpoint task after
+    /// a cadence tick, under the SMO lock: the decision (`ring_growth.
+    /// judge`: derived above current, or a fresh ring-admission stall, and
+    /// no standing decline at this size) → DRAIN-THEN-GROW: the gate closes
+    /// (every pass parks before its first read of the ring), the window
+    /// empties — cycles run meanwhile so a pass parked at ring admission
+    /// can advance and leave — bounded by one landing ceiling; cover cycles
+    /// to the FIXPOINT (`head == reusable_upto`, nothing open), bounded
+    /// `FIXPOINT_COVER_CYCLES_MAX`; `GrowRing(step)` over the wire; the page
+    /// names the grown table in BOTH directory slots + barrier BEFORE any
+    /// position is written under the new map (the directory-first law);
+    /// the swap (`KvBackend.swapRing`). A page write that fails leaves the
+    /// carve under the manager's pending witness (re-answered verbatim at
+    /// the next ask, returned at the leave); a refused swap re-writes the
+    /// page WITHOUT the segment (never in place). Nothing here is the
+    /// cycle's error: the tick landed before growth was decided.
+    pub fn growRingIfDue(self: *JoinedSet) void {
+        const be = self.be;
+        if (self.left or be.cv.isClosing() or be.lane.latch.isFailed() or self.park_gate.isParked()) return;
+        const r = self.core();
+        const current = r.ringBytes();
+        const stalls = be.cv.stats.full_stalls.load();
+        const derived = region.ringBytesDerived(self.commit_ewma_bytes_per_s, be.cp.cfg.max_age_ms, be.sb.volume_len);
+        const step = switch (ring_growth.judge(.{
+            .current = current,
+            .derived = derived,
+            .ceiling = region.ringCeiling(be.sb.volume_len),
+            .stalls = stalls,
+            .stalls_at_last_grow = self.stalls_at_last_grow,
+            .declined_at = self.grow_declined_at,
+            .segments = r.table.len,
+            .node_size = be.sb.node_size,
+        })) {
+            .idle => return,
+            .at_ceiling => {
+                self.stalls_at_last_grow = stalls;
+                return;
+            },
+            .table_full => {
+                self.stalls_at_last_grow = stalls;
+                self.grow_declined_at = current;
+                stats.joined_ring_grow_declined.inc();
+                log.debug("meta volume {s}: joined appender {d}'s ring wants more than {d} B (derived {d}) but its table is at {d} segments — declined (joined_ring_grow_declined)", .{ be.path, self.appenderId(), current, derived, r.table.len });
+                return;
+            },
+            .ask => |s| s,
+        };
+        // The gate: passes park from here; the window empties.
+        _ = self.gate.close();
+        var opened = false;
+        defer if (!opened) self.gate.open();
+        const ceiling_ns = checkpoint.checkpointLandingCeilingMs(be.cp.cfg.max_age_ms, be.cp.cfg.flush_interval_ms) * std.time.ns_per_ms;
+        const round_ns = checkpoint.checkpointTickPeriodMs(be.cp.cfg.flush_interval_ms) * std.time.ns_per_ms;
+        const deadline = clock.monotonicNs() + ceiling_ns;
+        while (!self.windowEmpty()) {
+            // A pass inside may be parked at ring admission (the storm filled
+            // the ring behind the tick that just ran): a cycle advances the
+            // tail it waits for, one per round.
+            be.cp.checkpointCycle(true) catch |e| {
+                stats.joined_ring_grow_deferrals.inc();
+                log.warn("meta volume {s}: joined appender {d}'s growth drain cycle failed ({s}) — growth retried next tick", .{ be.path, self.appenderId(), @errorName(e) });
+                return;
+            };
+            const now = clock.monotonicNs();
+            if (self.gate.awaitDrained(@min(deadline, now + round_ns), self, windowEmpty)) break;
+            if (clock.monotonicNs() >= deadline or be.cv.isClosing()) {
+                stats.joined_ring_grow_deferrals.inc();
+                log.debug("meta volume {s}: joined appender {d}'s window did not empty inside the {d} ms landing ceiling ({d} pass(es) inside, {d} window(s) in flight) — growth retried next tick", .{ be.path, self.appenderId(), ceiling_ns / std.time.ns_per_ms, self.gate.passesInside(), be.cv.windowsInflight() });
+                return;
+            }
+        }
+        // The cover to the fixpoint: a cycle's own flush journals its SMOs
+        // past the head its tail was computed from, so the cycle after it
+        // covers them; with the gate closed the term converges.
+        var covers: u64 = 0;
+        while (!be.ringDrained() and covers < checkpoint.FIXPOINT_COVER_CYCLES_MAX) : (covers += 1) {
+            be.cp.checkpointCycle(true) catch |e| {
+                stats.joined_ring_grow_deferrals.inc();
+                log.warn("meta volume {s}: joined appender {d}'s growth cover cycle failed ({s}) — growth retried next tick", .{ be.path, self.appenderId(), @errorName(e) });
+                return;
+            };
+        }
+        if (!be.ringDrained()) {
+            stats.joined_ring_grow_deferrals.inc();
+            log.debug("meta volume {s}: joined appender {d}'s ring is not drained after {d} cover cycles (head {d}, reusable_upto {d}, {d} reservation(s) open) — growth retried next tick", .{ be.path, self.appenderId(), covers, be.core.headPos(), be.core.reusableUpto(), be.reg.openCount() });
+            return;
+        }
+        const head = be.core.headPos();
+        const own = self.appenderId();
+        const answer = self.wire.growRing(own, step) catch |e| {
+            stats.joined_ring_grow_deferrals.inc();
+            switch (e) {
+                error.Deferred, error.MembershipPending => log.debug("meta volume {s}: joined appender {d}'s GrowRing deferred by the manager ({s}) — retried next tick", .{ be.path, own, @errorName(e) }),
+                else => log.warn("meta volume {s}: joined appender {d}'s GrowRing failed ({s}) — retried next tick", .{ be.path, own, @errorName(e) }),
+            }
+            return;
+        };
+        const seg = answer orelse {
+            self.stalls_at_last_grow = stalls;
+            self.grow_declined_at = current;
+            stats.joined_ring_grow_declined.inc();
+            log.info("meta volume {s}: the manager declined joined appender {d}'s GrowRing ({d} B wanted at {d} B) — the ring stays until a fresh stall or a changed ring (joined_ring_grow_declined)", .{ be.path, own, step, current });
+            return;
+        };
+        // The page names the grown table: a TABLE CHANGE, both directory
+        // slots + barrier before any position is written under the new map.
+        const old_table = r.table;
+        var grown = r.table;
+        grown.push(seg) catch {
+            // Screened by `judge` (the table had room); the carve stays
+            // under the manager's pending witness.
+            stats.joined_ring_grow_deferrals.inc();
+            return;
+        };
+        r.setTable(grown);
+        r.page.head_hint = head;
+        r.page.ledger_tail_seq = head;
+        self.writePages(false) catch |e| {
+            r.setTable(old_table);
+            log.err("meta volume {s}: joined appender {d}'s page could not name its grown ring ({s}) — the segment at 0x{x} ({d} B) the manager carved is named by no page; the manager answers it again at the next GrowRing and returns it at this identity's leave or death", .{ be.path, own, @errorName(e), seg.start, seg.len });
+            return;
+        };
+        be.swapRing(&grown, own) catch |e| {
+            // The never-in-place law: the page must not name a table the
+            // ring does not write under — the segment comes off again.
+            r.setTable(old_table);
+            const undone: []const u8 = if (self.writePages(false)) |_| "ok" else |_| "failed";
+            log.err("meta volume {s}: joined appender {d}'s ring swap refused ({s}) after its page named the grown table — the page rewritten without it ({s}); the segment at 0x{x} ({d} B) stays under the identity's pending witness for the manager's next verb to answer or return", .{ be.path, own, @errorName(e), undone, seg.start, seg.len });
+            return;
+        };
+        r.ring_layout = be.ring_layout;
+        r.geo = be.geo;
+        self.tail_written = head;
+        self.stalls_at_last_grow = stalls;
+        self.grow_declined_at = ring_growth.NEVER_DECLINED;
+        stats.joined_ring_grows.inc();
+        self.gate.open();
+        opened = true;
+        log.info("meta volume {s}: joined appender {d}'s ring grew by one segment of {d} B at 0x{x} ({d} → {d} B, {d} segment(s); derived {d} B/s × 2 × {d} ms, stalls {d}; joined_ring_grows, joined_wire_ring_grows)", .{ be.path, own, seg.len, seg.start, current, r.ringBytes(), r.table.len, self.commit_ewma_bytes_per_s, be.cp.cfg.max_age_ms, stalls });
     }
 
     // ---- the slot verbs over the wire ----
@@ -894,10 +1108,38 @@ pub const JoinedSet = struct {
         };
         be.checkpointNow() catch {};
         if (self.core().page.ledger_tail_seq != be.core.headPos()) be.checkpointNow() catch {};
-        // The pool's word for the leave: the mirror's unclaimed runs.
+        // The pool's word for the leave: the mirror's unclaimed runs. The
+        // leave frame carries `GRANT_WIRE_MAX` runs; a pool a storm
+        // fragmented wider (found by the ring-growth row: 20 runs after
+        // 572 commits) returns them through `ReturnExtents` first — the
+        // same screened return law, no run cap — and leaves with none.
         var runs: std.ArrayList(grant.GrantRun) = .empty;
         defer runs.deinit(self.gpa);
         self.unclaimedRuns(&runs) catch {};
+        var returned_ahead: usize = 0;
+        if (runs.items.len > join_ladder.GRANT_WIRE_MAX) {
+            var wire_runs: std.ArrayList(verbs.GrantRunWire) = .empty;
+            defer wire_runs.deinit(self.gpa);
+            for (runs.items) |r| wire_runs.append(self.gpa, .{ .start = r.start, .len = r.len, .reserved = 0 }) catch break;
+            if (wire_runs.items.len == runs.items.len) {
+                if (self.wire.returnExtents(self.appenderId(), wire_runs.items)) |_| {
+                    returned_ahead = runs.items.len;
+                    {
+                        self.bits_lock.lockUncancelable(be.io);
+                        defer self.bits_lock.unlock(be.io);
+                        for (runs.items) |r| {
+                            var e = r.start;
+                            while (e < r.end()) : (e += 1) self.granted_bits.unset(@intCast(e));
+                            self.returned += r.len;
+                        }
+                    }
+                    stats.extent_grant_returns.inc();
+                    runs.clearRetainingCapacity();
+                } else |e| {
+                    log.warn("meta volume {s}: appender {d}'s {d} unclaimed run(s) did not return ahead of its leave ({s}) — the leave carries them", .{ be.path, self.appenderId(), runs.items.len, @errorName(e) });
+                }
+            }
+        }
         var jr = &self.joiner.region.?;
         jr.grant.deinit();
         jr.grant = grant.RegionGrant.init(self.gpa);
@@ -906,7 +1148,7 @@ pub const JoinedSet = struct {
             log.err("meta volume {s}: appender {d} could not leave cleanly ({s}) — its page stays Live for the next open's recovery", .{ be.path, self.appenderId(), @errorName(e) });
             return;
         };
-        log.info("meta volume {s}: appender {d} left ({s}); {d} extent(s) returned with the page", .{ be.path, self.appenderId(), if (left.already) "already" else "page Free", runs.items.len });
+        log.info("meta volume {s}: appender {d} left ({s}); {d} extent run(s) returned with the page, {d} ahead of it", .{ be.path, self.appenderId(), if (left.already) "already" else "page Free", runs.items.len, returned_ahead });
     }
 
     /// The per-volume words of the `.stats` family on a joiner.

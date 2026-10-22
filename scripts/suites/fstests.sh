@@ -113,6 +113,7 @@ SUITE_META_MIB=$SUITE_META_MIB
 SUITE_DATA_GIB=$SUITE_DATA_GIB
 SUITE_META_MIN_MIB=$SUITE_META_MIN_MIB
 SUITE_DATA_MIN_MIB=$SUITE_DATA_MIN_MIB
+SUITE_SINGLE_WRITER=$SUITE_SINGLE_WRITER
 SUITE_SETS_DIR=$SETS/sets
 ENV
   cp "$SETS/suites.env" /run/squeezefs-suites.env
@@ -203,11 +204,45 @@ fstests_fsck_set() {
   return 1
 }
 
+# The host sysctls tests set for their own run and restore in their
+# `_cleanup` — generic/460 (`vm.dirty_*ratio`), 597 and 598
+# (`fs.protected_*`), 750 and 795 (one-shot writes). Two ways that restore
+# is lost: a fail-early KILL of `check` ends a test before its cleanup,
+# and xfstests restores a saved value only when it is non-zero — on a
+# host tuned through `vm.dirty_bytes` (this workstation: 256 MiB / 64 MiB)
+# the ratios read 0, so 460's `echo 100` cleared the bytes and its cleanup
+# put nothing back (2026-10-22: the host ran at dirty_ratio 100 until a
+# sysctl reload). The harness snapshots them before `check` and writes
+# them back after: bytes first where the host uses bytes (writing a bytes
+# knob zeroes its ratio twin), ratios otherwise.
+FSTESTS_SYSCTLS=(vm.dirty_bytes vm.dirty_background_bytes vm.dirty_ratio vm.dirty_background_ratio fs.protected_symlinks fs.protected_hardlinks fs.protected_regular fs.protected_fifos)
+declare -A FSTESTS_SYSCTL_SAVED
+fstests_sysctl_save() {
+  local k
+  for k in "${FSTESTS_SYSCTLS[@]}"; do FSTESTS_SYSCTL_SAVED[$k]=$(sysctl -n "$k" 2>/dev/null || echo ""); done
+}
+fstests_sysctl_restore() {
+  [ -n "${FSTESTS_SYSCTL_SAVED[vm.dirty_bytes]:-}" ] || return 0
+  local k v changed=()
+  for k in "${FSTESTS_SYSCTLS[@]}"; do [ "$(sysctl -n "$k" 2>/dev/null)" = "${FSTESTS_SYSCTL_SAVED[$k]}" ] || changed+=("$k"); done
+  [ ${#changed[@]} -gt 0 ] || return 0
+  for k in fs.protected_symlinks fs.protected_hardlinks fs.protected_regular fs.protected_fifos; do
+    v=${FSTESTS_SYSCTL_SAVED[$k]}; [ -n "$v" ] && sysctl -qw "$k=$v" 2>/dev/null || true
+  done
+  if [ "${FSTESTS_SYSCTL_SAVED[vm.dirty_bytes]}" != 0 ]; then sysctl -qw "vm.dirty_bytes=${FSTESTS_SYSCTL_SAVED[vm.dirty_bytes]}" 2>/dev/null || true
+  else sysctl -qw "vm.dirty_ratio=${FSTESTS_SYSCTL_SAVED[vm.dirty_ratio]}" 2>/dev/null || true; fi
+  if [ "${FSTESTS_SYSCTL_SAVED[vm.dirty_background_bytes]}" != 0 ]; then sysctl -qw "vm.dirty_background_bytes=${FSTESTS_SYSCTL_SAVED[vm.dirty_background_bytes]}" 2>/dev/null || true
+  else sysctl -qw "vm.dirty_background_ratio=${FSTESTS_SYSCTL_SAVED[vm.dirty_background_ratio]}" 2>/dev/null || true; fi
+  suite_log "host sysctls a test left changed were restored: ${changed[*]}"
+  FSTESTS_SYSCTL_SAVED=()
+}
+
 # One `check` pass. Failure ids (`generic/NNN`) to $2.
 fstests_run() {
   local n=$1 failures=$2
   : > "$failures"
   fstests_sets "$n"
+  fstests_sysctl_save
   local exclude=()
   if [ -s "$FSTESTS_VENUE_EXCLUDE" ]; then grep -v '^#' "$FSTESTS_VENUE_EXCLUDE" | awk '{print $1}' | grep . > "$RESULTS/venue-exclude.list" || true; [ -s "$RESULTS/venue-exclude.list" ] && exclude=(-E "$RESULTS/venue-exclude.list"); fi
   local what=()
@@ -249,6 +284,7 @@ fstests_run() {
   fi
   wait "$CHECK_PGID" || rc=$?
   CHECK_PGID=""
+  fstests_sysctl_restore
   t1=$(date +%s)
   # The summary block: `Ran: …`, `Not run: …`, `Failures: …`, `Failed N of M tests`.
   # A pass stopped early has none: its counts are the results dir's.
@@ -328,6 +364,7 @@ fstests_run() {
 CHECK_PGID=""
 fstests_cleanup() {
   if [ -n "$CHECK_PGID" ]; then kill -KILL -- "-$CHECK_PGID" 2>/dev/null || true; CHECK_PGID=""; fi
+  fstests_sysctl_restore
   [ -n "${SETS:-}" ] || return 0
   fstests_unmount_all
   fstests_detach_loops

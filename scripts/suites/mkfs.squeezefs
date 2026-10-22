@@ -4,15 +4,20 @@
 # (`setpaths.sh`: dm-linear slices for the metadata volume and two data
 # volumes, all over the device xfstests hands over — its TEST_DEV/SCRATCH_DEV
 # loop, a dm target the test put over it, or a device of the test's own such
-# as generic/620's 17 TB dm-hugedisk) with `squeezefs format
-# --single-writer`; the write cache is RAM, nothing to format. xfstests'
-# `_scratch_mkfs` runs `yes | mkfs -t fuse.squeezefs -- $SCRATCH_DEV` before
-# every scratch test. Installed as /sbin/mkfs.fuse.squeezefs.
+# as generic/620's 17 TB dm-hugedisk) with `squeezefs format`, in the
+# class the harness chose (`SUITE_SINGLE_WRITER` off the env file:
+# `--single-writer` by default, the symmetric default format with
+# `SUITE_SINGLE_WRITER=0` — under it a test's second mount of one device
+# JOINS the first daemon, charter §5.7); the write cache is RAM, nothing to
+# format. xfstests' `_scratch_mkfs` runs `yes | mkfs -t fuse.squeezefs --
+# $SCRATCH_DEV` before every scratch test. Installed as
+# /sbin/mkfs.fuse.squeezefs.
 set -euo pipefail
 ENV_FILE=${SQZ_SUITES_ENV:-/run/squeezefs-suites.env}
 [ -f "$ENV_FILE" ] && source "$ENV_FILE"
 source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/setpaths.sh"
 SQZ_BIN=${SQZ_BIN:-squeezefs}
+SUITE_SINGLE_WRITER=${SUITE_SINGLE_WRITER:-1}
 
 die() { echo "mkfs.squeezefs: $*" >&2; exit 1; }
 
@@ -41,8 +46,9 @@ trap suite_slices_down EXIT
 # the set's own ledger (a test that runs `_scratch_mkfs` bare captures them
 # into its golden output — generic/631, 634, 732, 754, 800); a refusal is
 # the diagnosis and goes to stderr with the exit code.
+[ "$SUITE_SINGLE_WRITER" = 1 ] && extra+=(--single-writer)
 rc=0
-out=$("$SQZ_BIN" format --single-writer "${extra[@]}" "sqmeta://$SLICE_META" "sqdata://$SLICE_D0,$SLICE_D1" 2>&1) || rc=$?
+out=$("$SQZ_BIN" format "${extra[@]}" "sqmeta://$SLICE_META" "sqdata://$SLICE_D0,$SLICE_D1" 2>&1) || rc=$?
 if [ "$rc" = 0 ]; then
   printf '%s\n' "$(date +%s) format $dev" "$out" >> "$SET_DIR/formats.log"
   exit 0

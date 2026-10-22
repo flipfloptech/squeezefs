@@ -1,18 +1,7 @@
-# xfstests tests excluded in the sqz-zig container venue (check -E), one per line:
-#   <test>  <why it is the venue's, never a filesystem semantic>
-generic/564  needs `ulimit -f` (RLIMIT_FSIZE) raised: "cannot modify limit: Operation not permitted" in the container
-generic/597  sets the fs.protected_symlinks sysctl: /proc/sys is read-only in the container
-generic/598  sets the fs.protected_regular sysctl: /proc/sys is read-only in the container
-generic/750  writes /proc/sys/vm/compact_memory in its loop: /proc/sys is read-only in the container
-generic/795  writes /proc/sys/vm/drop_caches in its loop: /proc/sys is read-only in the container
-generic/426  exportfs: open_by_handle_at(2) answers EPERM on EVERY handle in the container (CapEff lacks CAP_DAC_READ_SEARCH; the ext4 control fails the same way) — nothing to judge here; see the evidence note's export-handle stance
-generic/467  exportfs: as generic/426
-generic/477  exportfs: as generic/426
-generic/756  exportfs: as generic/426 (the 2026-10-10 "returned 1 incorrectly on an unlinked file" was errno 1 = EPERM, never a handle served)
-generic/777  exportfs: as generic/426
-generic/310  clears dmesg (`dmesg -c`): "clear kernel buffer failed: Operation not permitted" in the container (no CAP_SYSLOG)
-generic/394  needs `ulimit -f` raised: "cannot modify limit: Operation not permitted" in the container
-generic/460  writes /proc/sys/vm/dirty_*ratio: /proc/sys is read-only in the container
-generic/504  `exec {fd}<> file; flock -x $fd` then `grep :$ino /proc/locks`: no row appears for an ext4 file in the container either (control 2026-10-11: rc 0, 0 rows), while python's flock(2) on our mount shows `FLOCK ADVISORY WRITE … 00:27:2` — the shape is the venue's (util-linux flock-by-fd under this container), not a lock semantic
-generic/519  FIBMAP "requires root privileges" inside the container (CAP_SYS_RAWIO absent); `_require_fibmap` passes on the ioctl's presence alone
-generic/650  CPU hotplug stress (offlines and onlines random CPUs under fsstress): on the Omarchy workstation (AMD Strix Halo, 7.2.8) an offlined CPU does not come back — "CPUN failed to report alive state" — so the test left 8 of 32 CPUs offline until a reboot, and every nvme fabrics connect on the host then answered EXDEV (blk-mq hctx mapped to offline CPUs: the gate's nvmet rows). A host hazard for everything else on the venue, never a filesystem semantic
+# xfstests tests excluded on the venue (check -E), one per line:
+#   <test>  <why it is the venue's, never a filesystem semantic — with the evidence from THIS host>
+# Audited 2026-10-22 on the Omarchy workstation (docs/evidence/rung-10-adjudication-audit.md):
+# every container-era row (ulimit -f, /proc/sys, CAP_DAC_READ_SEARCH, CAP_SYSLOG, CAP_SYS_RAWIO,
+# /proc/locks) was run with its exclusion lifted and judged; what passed left the list, what the
+# product fails is a ledger row or a fix item, never a row here.
+generic/650  CPU hotplug stress (offlines and onlines random CPUs under fsstress): on the Omarchy workstation (AMD Strix Halo, 7.2.8) an offlined CPU does not come back — "CPUN failed to report alive state" — so the test left 8 of 32 CPUs offline until a reboot, and every nvme fabrics connect on the host then answered EXDEV (blk-mq hctx mapped to offline CPUs: the gate's nvmet rows). A host hazard for everything else on the venue, never a filesystem semantic. Not re-run on 7.3.0-1.7-mainline-sqz (2026-10-22): a re-test needs an idle venue and a reboot in hand — the owner's call

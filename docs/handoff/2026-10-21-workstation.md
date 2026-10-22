@@ -1,12 +1,23 @@
-# Handoff — 2026-10-21: the fourth wave (the two caches, the mainline UAPI), create 7 reverted
+# Handoff — 2026-10-21/22: the fourth wave (the two caches, the mainline UAPI), the mainline kernel booted
 
-**Checkpoint:** `dev` at the commit that adds this note, on `d0fcaf8` (the write cache); everything
-pushed; the gate train **3/3 green on `d0fcaf8`** (403 / 215 / 213 s). Kernel `7.2.8-9.33-omarchy-sqz`
-(series 0001–0033) — **the next step is the owner's reboot into `linux-mainline-sqz 7.3.0-1.7`**
-(the Limine entry below the default; `fuse enable_uring=1` comes from `/etc/modprobe.d/squeezefs-fuse.conf`
-so it holds on any kernel; the mainline module tree ships nvmet, nvme-loop, brd, null_blk). The
-10-18/19/20 notes hold the release sequence, the bar, the rulings and the venue plan. **The release
-window still waits for the owner's go.**
+**Checkpoint (amended 2026-10-22):** `dev` at the commit that adds this amendment, on `948a324`;
+everything pushed; the gate train **3/3 green on `84eacfe`** on the MAINLINE kernel, `948a324` gated
+green once (gate 78), its train runs pending. **The host runs `7.3.0-1.7-mainline-sqz` since
+2026-10-22 ~01:50 UTC** (mainline 7.3 + the 7 patches of `scripts/kernel/patches-mainline/`; the
+FUSE transport takes its `mainline_pool` rung by probe — `bufpool present, kmbuf absent, zero-copy
+true`; 116 tests skip by kernel feature, every one named). `linux-omarchy-sqz` 9.33 stays the Limine
+default for a fallback boot. The 10-18/19/20 notes hold the release sequence, the bar, the rulings
+and the venue plan. **The release window still waits for the owner's go.**
+
+## 2026-10-22 on the mainline kernel (each through its own full gate, then the train)
+
+| commit | what |
+|---|---|
+| `3b8f547` | **the gate on 7.3**: the §AF no-open rows pin the posture they test (`SQUEEZEFS_FUSE_ZC_OPEN=0`; under §BE's default a mainline zero-copy session SERVES opens, so zero-message opens and mainline zc exclude each other); the stock-stratum seam hides both carriers; fused poll and the write-cache data-plane row judge "zero-copy armed" on either stratum; **a product defect**: an `O_TRUNC` open of a foreign-slot file under served opens ran the local size path and wedged 48 s to EIO — it ships like `SETATTR(size 0)` now (new red row). `rung-10-fuse-mainline-uapi.md` §9 "live on 7.3" |
+| `2b9659c` (create 7b) | wave 7 re-landed: BD.4/BD.5 unchanged (innocent) + the train's panic fixed at its root — **a key's records fold by SEQ across the overlay and the base** (§AW.4's either-order applies + a freeze between them put the later record in the base and the earlier in the overlay below it; `foldNewestFirst` asserted newest-first; latent since 10-20) — and what the honest fold exposed: **the manager's record-seq space is monotone across its incarnations** (the open took its seq offset from an empty replay window after a clean unmount). §BD.7–BD.9; red tests shown panicking on the old tree; train 3/3 |
+| `00aed7e` | **the two release rows** (owner, 2026-10-22): `scripts/suites/mdtest.sh`, `scripts/suites/tarx.sh`, both in `zig build gate-release` (item 5 below has the laws and the first runs) |
+| `84eacfe` | **the striped row's daemon death** (1 run in 85; the train's striped death): `Striping.persisted`, the per-directory "last persisted" stamp a fold reads and writes on every `stat`/`lookup` of a striped directory, had no lock — two folds past the cadence both committed D's times and both `put` at once (`std.hash_map` pointer_stability). It has an owner now (`persisted_lock`; the commit runs outside it) |
+| `948a324` | **a joined appender's ring GROWS** — the joiner's half of GrowRing (spec §3.3 `joined_grow_ring_if_due`) was never ported: every wire joiner lived at the 512 KiB floor for its mount's life. New `src/meta/sym/ring_growth.zig` (the pure decision, the growth gate — a Dekker pair with the conveyor's passes, modelled), judged once per landed checkpoint cycle; the ring geometry swaps under a drained window, the tail memfd re-created and handed to the supervisor. The tarx row's wall law: **1.137× → 1.022×** (B's journal-full stalls 2,346 → 8, barriers 4,801 → 171, metadata bytes 313 → 126 MB). A clean leave whose pool fragmented past 16 runs refused itself — fixed in the same commit |
 
 ## Rulings taken today (owner, 2026-10-21)
 
@@ -64,15 +75,19 @@ next landing on top of it, and its model must include the fold's ordering invari
 
 ## Owed / next (in order)
 
-1. **Reboot into `linux-mainline-sqz 7.3.0-1.7`** (owner) → `scripts/venue status` →
-   `provision-local-venue` check → the "e2e mainline pools" row, the smoke, one full gate → the
-   matrix (pool vs user_ents; `SQUEEZEFS_FUSE_ZC_OPEN` 1 vs 0; 7.3 vs 9.33 numbers side by side).
-   Rows that need the kmbuf/zc UAPI skip on mainline — expected. If mainline is red for the kernel's
-   reasons, boot 9.33 again (still the default entry) and say what failed.
-2. **Create wave 7 re-landed fixed** (agent `01a16101`): the fold-order law stated and modelled; then
-   the remaining binders — the appliers' mutual leaf waits (62 of 109 µs per window on `venue`),
-   `self` with reclaim destroy groups on removals, atomic-open patch 0034 (still not drafted after
-   three waves).
+1. **DONE 2026-10-22:** the mainline boot, the gate green on it (`3b8f547`), create 7b (`2b9659c`).
+   **Still owed on 7.3:** the matrix (pool vs user_ents; `SQUEEZEFS_FUSE_ZC_OPEN` 1 vs 0; 7.3 vs
+   9.33 side by side — one benchmark at a time, cooled ≤ 70 °C) and §BE.3's default re-judged on
+   those numbers; the 9.33 kernel has NOT run the day's landings (every change is conditional on the
+   probed rung; boot it once before the release and run one gate).
+2. The create path's remaining binders — the appliers' mutual leaf waits (62 of 109 µs per window
+   on `venue`), `self` with reclaim destroy groups on removals, atomic-open patch 0034 (still not
+   drafted). From create 7b's report, owed: the DEAD MANAGER row's hang on the train was B parking
+   TWICE (the second reclaim → `UnknownLease` → poisoned, one cross-owner create parked forever at
+   `[handler_entry]`) — a load sensitivity of `T_owner`; the replay gate drops a straggler Δ the node
+   never saw (an exact-seq gate would keep it); the shipped setattr carries no `kill_suidgid`, so a
+   foreign-slot truncate does not strip S_ISUID/S_ISGID at the holder; under doubled load `A
+   MEMBER'S CACHED COPY…` and `THE ORDERED LAW'S KILL ROW` each failed once (`~/tmp/cp7b/runs/`).
 3. The write cache's remainder (`rung-10-write-cache.md`): the FUSE transport is 52 % of the
    small-file profile (the mainline port's territory), per-grain checksums, clock stamps, the witness
    generation, per-lane regions named. The read cache's: the FUSE zc leg landing in the cache's own
@@ -115,6 +130,15 @@ next landing on top of it, and its model must include the fold's ordering invari
      2,268 times in six extractions (A: once), 4,632 checkpoint barriers (A: 171), its pass
      admission 128 ms vs 10 ms per extraction, twice the metadata device bytes. The row is a
      release blocker until the ring grows under a sustained commit stream (or the law is re-judged).
+     **Fixed the same day (`948a324`): the ring grows (3 growths inside B's first extraction,
+     524288 → 16 MiB); the row passed 3/3 at 1.022× / 1.094× / 0.856×.** Residual: b1 (the first B
+     arm) pays the growths' drains; B's checkpoint flush 13 vs A's 7 cycles per extraction (≤ 20 ms).
+     The joined conveyor's queue cells and the lane's inbound cap stay sized by the floor ring (128)
+     across growth — a throughput cap under many committers, not a correctness matter.
+   - **The mdtest legs' heap finding is the designed posture, not a leak:** after mass removal the
+     emptied, tombstone-heavy leaves (1,408 of them after np64, holding 1,485 of 4,030 extents) fold
+     only under heap pressure (`posture.isFull()` / `merge_backlog`), a later write, or
+     `defrag --meta`; a quiet-time sweep would be a new law.
 6. The release window (owner's go), the 200 G venue (owner's inventory), the upstream postings
    (owner: Signed-off-by, 5 items), patches 0031–0033 still unmeasured, the smaller owed items of
    the 10-20 note (item 4 there) unchanged.

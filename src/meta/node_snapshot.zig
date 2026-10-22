@@ -22,11 +22,19 @@
 //!   overlay every 8 applies — 15 µs of a create's apply CPU on a leaf of
 //!   thousands of open records, `docs/evidence/rung-10-create-path.md`.)
 //!
-//! Fold precedence per key: `overlay` > `base`. `lookup` is the D7-slimmed
-//! read: the newest overlay record's materialized head serves with zero
-//! decodes; a bset-resident key probes the 8-cell populate-once
+//! Fold precedence per key is the record SEQ across both sources, never the
+//! source: the overlay usually rides above the base, but two in-flight
+//! windows apply in either order (decision 0003 §AW.4) and the
+//! checkpointer's freeze may run between the two applies, so an earlier
+//! window's record can land in the overlay BELOW a later window's record
+//! the base already holds. Every fold merges the two seq-sorted groups by
+//! seq (`gather`), and a materialized head — the fold up to ITS record's
+//! seq — serves only while the base holds nothing newer for the key.
+//! `lookup` is the D7-slimmed read: the newest overlay record's head serves
+//! with zero decodes; a bset-resident key probes the 8-cell populate-once
 //! `FoldMemo`; only a cold fold runs THE algebra (`record.foldNewestFirst`)
-//! — and property tests pin memo and head serves byte-equal to it.
+//! — and property tests pin memo and head serves byte-equal to it over
+//! histories whose apply order is not their seq order.
 //!
 //! Readers never allocate on the warm path (head serve, memo hit): the
 //! views they hand out borrow the snapshot, valid for as long as the
@@ -55,6 +63,12 @@ pub const stats = struct {
     /// reads as the D7.b effectiveness rate.
     pub var meta_kv_fold_memo_hits: counters.ShardedCounter = .{};
     pub var meta_kv_fold_memo_misses: counters.ShardedCounter = .{};
+    /// `meta_kv_fold_base_above`: point lookups that found the base holding
+    /// a record NEWER than the overlay's newest for the key — an earlier
+    /// window's record applied after a later window's was frozen (decision
+    /// 0003 §AW.4 with a freeze between the two applies); the fold merged
+    /// the two sources by seq instead of serving the head.
+    pub var meta_kv_fold_base_above: counters.ShardedCounter = .{};
     /// `meta_kv_fold_memo_bytes`: Σ memo bytes alive, Drop-exact; rides the
     /// node-cache budget too.
     pub var meta_kv_fold_memo_bytes: counters.Gauge = .{};
@@ -1322,8 +1336,47 @@ pub const NodeSnapshot = struct {
         return null;
     }
 
-    /// Scratch for one key's gather: the overlay groups plus the base group,
-    /// newest first. Inline up to 64 records; longer chains (cold by
+    /// Whether the base holds a record of the key NEWER than `seq` — the
+    /// §AW.4 inversion: an earlier window's record applied after a later
+    /// window's was frozen. Base groups are seq-descending: one compare.
+    fn baseAbove(self: *const NodeSnapshot, g: Groups, seq: u64) bool {
+        return g.bg.hi > g.bg.lo and self.base.value.entries[g.bg.lo].seq > seq;
+    }
+
+    /// The newest record of `k` across both sources (null: unknown here).
+    fn newestRef(self: *const NodeSnapshot, g: Groups) ?RecordRef {
+        if (self.newestOverlay(g)) |n| {
+            if (!self.baseAbove(g, n.seq())) return n.ref();
+        }
+        if (g.bg.hi > g.bg.lo) return self.base.value.recordRef(g.bg.lo);
+        return null;
+    }
+
+    /// Walk one key's records of both sources newest-first — the overlay
+    /// group from its end, the base group from its start, merged by seq
+    /// (an exact tie: the overlay first, as before the merge). `visit`
+    /// returns false to stop.
+    fn walkNewestFirst(self: *const NodeSnapshot, g: Groups, ctx: anytype, comptime visit: fn (@TypeOf(ctx), RecordRef) bool) void {
+        const run = &self.overlay.value;
+        var o = g.og.hi;
+        var p = run.posOf(g.og.hi);
+        var b = g.bg.lo;
+        while (o > g.og.lo or b < g.bg.hi) {
+            const take_overlay = if (o == g.og.lo) false else if (b == g.bg.hi) true else run.rec(run.prev(p)).seq() >= self.base.value.entries[b].seq;
+            const r: RecordRef = if (take_overlay) blk: {
+                o -= 1;
+                p = run.prev(p);
+                break :blk run.rec(p).ref();
+            } else blk: {
+                defer b += 1;
+                break :blk self.base.value.recordRef(b);
+            };
+            if (!visit(ctx, r)) return;
+        }
+    }
+
+    /// Scratch for one key's gather: the overlay group and the base group
+    /// merged newest first. Inline up to 64 records; longer chains (cold by
     /// definition — the memo serves the repeat) spill to the heap.
     const Gather = struct {
         inline_buf: [64]RecordRef = undefined,
@@ -1338,28 +1391,20 @@ pub const NodeSnapshot = struct {
         fn deinit(self: *Gather, gpa: Allocator) void {
             if (self.heap) |h| gpa.free(h);
         }
+
+        fn push(self: *Gather, r: RecordRef) bool {
+            const dst = if (self.heap) |h| h else &self.inline_buf;
+            dst[self.len] = r;
+            self.len += 1;
+            return true;
+        }
     };
 
     fn gather(self: *const NodeSnapshot, gpa: Allocator, g: Groups, out: *Gather) Allocator.Error!void {
         const n = (g.og.hi - g.og.lo) + (g.bg.hi - g.bg.lo);
-        const dst: []RecordRef = if (n <= out.inline_buf.len) out.inline_buf[0..n] else blk: {
-            out.heap = try gpa.alloc(RecordRef, n);
-            break :blk out.heap.?;
-        };
-        const run = &self.overlay.value;
-        var i: usize = 0;
-        var p = run.posOf(g.og.hi);
-        var o = g.og.hi;
-        while (o > g.og.lo) : (i += 1) {
-            o -= 1;
-            p = run.prev(p);
-            dst[i] = run.rec(p).ref();
-        }
-        for (g.bg.lo..g.bg.hi) |b| {
-            dst[i] = self.base.value.recordRef(b);
-            i += 1;
-        }
-        out.len = n;
+        if (n > out.inline_buf.len) out.heap = try gpa.alloc(RecordRef, n);
+        self.walkNewestFirst(g, out, Gather.push);
+        assert(out.len == n);
     }
 
     /// Fold one key — the D7-slimmed read path:
@@ -1372,7 +1417,13 @@ pub const NodeSnapshot = struct {
         const g = self.groups(k);
         const newest = self.newestOverlay(g);
         if (newest) |n| {
-            if (n.head()) |h| {
+            // The head is the fold up to n's seq: it serves only while the
+            // base holds nothing newer for the key (§AW.4: an earlier
+            // window's record landing after a later window's was frozen
+            // — the base above the overlay — folds cold, by seq).
+            if (self.baseAbove(g, n.seq())) {
+                stats.meta_kv_fold_base_above.inc();
+            } else if (n.head()) |h| {
                 stats.meta_kv_fold_head_serves.inc();
                 return switch (h) {
                     .live => |v| .{ .live = .{ .value = v, .held = null } },
@@ -1387,13 +1438,13 @@ pub const NodeSnapshot = struct {
             assert(self.newestSeqOf(k).? == cell.horizon);
             return .{ .live = .{ .value = cell.value.slice(), .held = null } };
         }
-        // The newest record decides alone unless it is a Delta (the fold
-        // stops at the first Put or Delete — `rec.foldNewestFirst`): the
-        // common base-resident key folds with no gather scratch, whose 64
-        // record refs ReleaseSafe fills on every from-scratch fold (13 % of
-        // the FUSE worker's cycles on rand-4k, `docs/evidence/rung-10-dev-
-        // perf.md` §3.4).
-        const top: RecordRef = if (newest) |n| n.ref() else if (g.bg.hi > g.bg.lo) self.base.value.recordRef(g.bg.lo) else return .absent;
+        // The newest record (by seq, across both sources) decides alone
+        // unless it is a Delta (the fold stops at the first Put or Delete —
+        // `rec.foldNewestFirst`): the common base-resident key folds with
+        // no gather scratch, whose 64 record refs ReleaseSafe fills on
+        // every from-scratch fold (13 % of the FUSE worker's cycles on
+        // rand-4k, `docs/evidence/rung-10-dev-perf.md` §3.4).
+        const top = self.newestRef(g) orelse return .absent;
         switch (top.kind) {
             .put => return .{ .live = .{ .value = top.value, .held = null } },
             .delete => return .tombstone,
@@ -1434,27 +1485,15 @@ pub const NodeSnapshot = struct {
     /// `(base_version, version)` pair (null when the chain is empty or its
     /// head is unversioned). Counting only — no record decode.
     pub fn deltaChainProbe(self: *const NodeSnapshot, k: []const u8) ChainProbe {
-        const g = self.groups(k);
-        var depth: u32 = 0;
-        var head: ?rec.LayoutVersions = null;
-        const run = &self.overlay.value;
-        var p = run.posOf(g.og.hi);
-        var o = g.og.hi;
-        while (o > g.og.lo) {
-            o -= 1;
-            p = run.prev(p);
-            if (!chainStep(run.rec(p).ref(), &depth, &head)) return .{ .depth = depth, .head = head };
-        }
-        for (g.bg.lo..g.bg.hi) |b| {
-            if (!chainStep(self.base.value.recordRef(b), &depth, &head)) break;
-        }
-        return .{ .depth = depth, .head = head };
+        var probe: ChainProbe = .{ .depth = 0, .head = null };
+        self.walkNewestFirst(self.groups(k), &probe, chainStep);
+        return probe;
     }
 
-    fn chainStep(r: RecordRef, depth: *u32, head: *?rec.LayoutVersions) bool {
+    fn chainStep(probe: *ChainProbe, r: RecordRef) bool {
         if (r.kind != .delta) return false;
-        if (depth.* == 0) head.* = rec.layoutDeltaVersions(r.value);
-        depth.* += 1;
+        if (probe.depth == 0) probe.head = rec.layoutDeltaVersions(r.value);
+        probe.depth += 1;
         return true;
     }
 

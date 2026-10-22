@@ -162,6 +162,14 @@ pub const stats = struct {
     pub var meta_kv_node_freeze_shadow_dropped: counters.ShardedCounter = .{};
     /// A flush appended a parked frozen delta and KEPT the open records' floor.
     pub var meta_kv_flush_floor_kept: counters.ShardedCounter = .{};
+    /// `meta_kv_apply_base_above` / `_between`: a Δ's apply met the base
+    /// out of the overlay's order — a base record at or above the Δ's seq
+    /// stayed out of its fold-below, or one between the Δ and the overlay
+    /// record below it refused that record's head as the fold's start
+    /// (decision 0003 §AW.4: an earlier window's record applied after a
+    /// later window's was frozen).
+    pub var meta_kv_apply_base_above: counters.ShardedCounter = .{};
+    pub var meta_kv_apply_base_between: counters.ShardedCounter = .{};
     /// `meta_kv_freeze_locked_ns`: a leaf's freeze under its write lock —
     /// the flatten, the shadow fold, the frame encode and the base index's
     /// incremental extension (decision 0003 §BE: the committers' wait).
@@ -932,9 +940,15 @@ pub const CachedNode = struct {
             const key_newest = pos == gend;
             const prev_is_same_key = pos > 0 and std.mem.eql(u8, run.at(pos - 1).key(), k);
             // D7.a head materialization: fold-forward against the folded
-            // outcome of everything older than `r` for this key. Put and
-            // Delete shadow everything below, so their heads are
-            // self-defining; the fold-below is fetched only for Delta. A
+            // outcome of everything older than `r` for this key — older by
+            // SEQ, across the overlay AND the base (decision 0003 §AW.4:
+            // two in-flight windows apply in either order, and a freeze
+            // between the two applies leaves the later window's record in
+            // the base above the earlier's seq). Put and Delete shadow
+            // everything below, so their heads are self-defining; the
+            // fold-below is fetched only for Delta: the previous overlay
+            // record's head (the fold up to ITS seq) stands in for the
+            // walk unless a base record lies between the two seqs. A
             // corrupt base/delta surfaces at read time exactly as before —
             // the apply never changes semantics over it (no head). A head
             // riding in (an SMO's leftover) is taken as it is.
@@ -944,10 +958,11 @@ pub const CachedNode = struct {
                 .put => .own_value,
                 .delete => .tombstone,
                 .delta => blk: {
-                    var prev: rec.FoldedHead = if (prev_is_same_key)
-                        (if (run.at(pos - 1).head()) |h| foldedOf(h) else self.foldBelowLocked(&run, run.partitionPoint(KeyOnly{ .k = k }, keyLess), pos, k) catch break :blk .none)
+                    const prev_head: ?snapshot.HeadView = if (prev_is_same_key) run.at(pos - 1).head() else null;
+                    var prev: rec.FoldedHead = if (prev_head != null and !self.baseBetweenLocked(k, run.at(pos - 1).seq(), r.seq))
+                        foldedOf(prev_head.?)
                     else
-                        self.foldBelowLocked(&run, 0, 0, k) catch break :blk .none;
+                        self.foldBelowLocked(&run, run.partitionPoint(KeyOnly{ .k = k }, keyLess), pos, k, r.seq) catch break :blk .none;
                     defer prev.deinit(gpa);
                     const next = rec.foldForward(gpa, &prev, r.kind, r.value.slice()) catch break :blk .none;
                     switch (next) {
@@ -1053,34 +1068,61 @@ pub const CachedNode = struct {
         };
     }
 
+    /// Does the current base hold a record of `k` with a seq strictly
+    /// between `lo_seq` and `hi_seq`? Base groups are seq-descending: skip
+    /// what is at or above `hi_seq`, judge the first below it.
+    fn baseBetweenLocked(self: *CachedNode, k: []const u8, lo_seq: u64, hi_seq: u64) bool {
+        const cur = self.snapshot.load();
+        defer cur.release();
+        const idx = &cur.value.base.value;
+        const bg = idx.groupBounds(k);
+        var b = bg.lo;
+        while (b < bg.hi and idx.entries[b].seq >= hi_seq) b += 1;
+        const between = b < bg.hi and idx.entries[b].seq > lo_seq;
+        if (between) stats.meta_kv_apply_base_between.inc();
+        return between;
+    }
+
     /// Writer-side fold of "everything older than the record being applied"
-    /// for one key: the lock-held overlay group `[lo, hi)` below it, newest
-    /// first, then the current base group. With no overlay records below,
-    /// the published snapshot's memo may already carry the base fold —
-    /// probed without touching the read counters. Cold by construction.
-    fn foldBelowLocked(self: *CachedNode, run: *const Run, lo: usize, hi: usize, k: []const u8) rec.FoldError!rec.FoldedHead {
+    /// for one key — older by seq: the lock-held overlay group `[lo, hi)`
+    /// below it and the base records below `below_seq`, merged newest
+    /// first (the base may hold NEWER records than an overlay record,
+    /// §AW.4; they are not below `r` and stay out). With nothing of the key
+    /// in the overlay below and the whole base group below, the published
+    /// snapshot's memo may already carry the base fold — probed without
+    /// touching the read counters. Cold by construction.
+    fn foldBelowLocked(self: *CachedNode, run: *const Run, lo: usize, hi: usize, k: []const u8, below_seq: u64) rec.FoldError!rec.FoldedHead {
         const gpa = self.cache.gpa;
         const cur = self.snapshot.load();
         defer cur.release();
-        if (hi == lo) {
+        const idx = &cur.value.base.value;
+        const bg = idx.groupBounds(k);
+        var b0 = bg.lo;
+        while (b0 < bg.hi and idx.entries[b0].seq >= below_seq) b0 += 1;
+        if (b0 != bg.lo) stats.meta_kv_apply_base_above.inc();
+        if (hi == lo and b0 == bg.lo) {
             if (cur.value.memo.probe(k)) |cell| {
                 // The memo's buffer dies with its snapshot: a copy outlives it.
                 return .{ .live = .{ .value = try gpa.dupe(u8, cell.value.slice()), .decoded = null, .materialized = true } };
             }
         }
-        const bg = cur.value.base.value.groupBounds(k);
-        const n = (hi - lo) + (bg.hi - bg.lo);
+        const n = (hi - lo) + (bg.hi - b0);
         const refs = try gpa.alloc(RecordRef, n);
         defer gpa.free(refs);
         var i: usize = 0;
         var o = hi;
-        while (o > lo) : (i += 1) {
-            o -= 1;
-            refs[i] = run.at(o).ref();
-        }
-        for (bg.lo..bg.hi) |b| {
-            refs[i] = cur.value.base.value.recordRef(b);
-            i += 1;
+        var b = b0;
+        while (i < n) : (i += 1) {
+            // Two seq-descending sources; an exact tie takes the overlay
+            // first (the order the concatenation had).
+            const take_overlay = if (o == lo) false else if (b == bg.hi) true else run.at(o - 1).seq() >= idx.entries[b].seq;
+            if (take_overlay) {
+                o -= 1;
+                refs[i] = run.at(o).ref();
+            } else {
+                refs[i] = idx.recordRef(b);
+                b += 1;
+            }
         }
         const folded = try rec.foldNewestFirst(gpa, refs);
         switch (folded) {
@@ -2947,10 +2989,18 @@ test "an overlay record BELOW a frozen base record of its key — §AW.4's eithe
     try vol.freezeAndAppend(leaf);
     try S.step(&mirror, leaf, &k2, .delta, 210, InodeDelta.times(210, 211), null);
     try vol.freezeAndAppend(leaf);
+    const above0 = snapshot.stats.meta_kv_fold_base_above.load();
+    const apply_above0 = stats.meta_kv_apply_base_above.load();
+    const between0 = stats.meta_kv_apply_base_between.load();
     try S.step(&mirror, leaf, &k2, .delta, 110, InodeDelta.ctime(110), null);
+    try testing.expectEqual(apply_above0 + 1, stats.meta_kv_apply_base_above.load());
     try expectOracle(gpa, leaf, mirror.items, &k2);
+    try testing.expectEqual(above0 + 2, snapshot.stats.meta_kv_fold_base_above.load());
     try S.step(&mirror, leaf, &k2, .delta, 310, InodeDelta.ctime(310), null);
+    try testing.expectEqual(between0 + 1, stats.meta_kv_apply_base_between.load());
     try expectOracle(gpa, leaf, mirror.items, &k2);
+    // 310 is above everything in the base: its head serves again.
+    try testing.expectEqual(above0 + 2, snapshot.stats.meta_kv_fold_base_above.load());
     // The fold's input contract: base [200, 10], overlay [300] with a
     // head; the straggler 100 lands below 300 and clears its head; the
     // next read gathers overlay-then-base — [300, 100, 200, 10] is not

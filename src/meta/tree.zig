@@ -800,8 +800,9 @@ pub const KvTree = struct {
                 // Per-key LWW replay gate: an old-ledger mount reads node
                 // bsets that already materialized part of the window; a
                 // record whose seq is ≤ the node's newest for the key is
-                // already folded in — re-applying it would sort an overlay
-                // record BELOW the base and break the newest-first order.
+                // already folded in — re-applying it would hold one record
+                // in both sources (the folds merge the two by seq, so the
+                // order would stand, the duplicate would not).
                 const snap = leaf.snapshotLoad();
                 defer snap.release();
                 if (snap.value.newestSeqOf(k)) |newest| {

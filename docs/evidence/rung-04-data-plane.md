@@ -130,6 +130,7 @@ reads its last intact image.
 | `incarnation_model.FillModel` ×6 laws (2 reuse cycles) | 106 | both fence weakenings per law; a load/store acquire resurrects a freed block; a load/store release releases twice |
 | `staging.GenerationAbaModel` | 4 | recycled generations: a stale release frees the re-staged sole copy |
 | `pack.PinModel` / `pack.SealModel` | 9 / 4 | the nonzero check removed: the pin arithmetic; a load-then-store seal releases the pin twice |
+| `pack.SealCensusModel` (the seal's census vs a tenant release; 2026-10-22, LTP fs `pack_pin_refcount_drift`) | 17 | `flag_before_census` (the shipped order: the flag CAS'd outside the pin lock, the census under it after): a release that saw the flag ran the ladder and the census read the lowered refcount |
 | `write_epoch_model.CloseVisibilityModel` (the save vs a writer on its block; the follow-up commit) | 22 | `unbind_before_save` (the epoch out of sight before its merge): the writer patches/bases on the A key the save displaces; `base_from_map` (the base from the durable map under a shadow): the park's complement misses the bytes only B held |
 | `plane_locks_model.PromotionOrderModel` (a staged promotion vs an upload on inos colliding on both tables; the lock-order commit) | 16 | the promotion taking the layout lock first (HEAD's order, the stripe inside `pack.commit`): the ABBA wedge |
 | `plane_locks_model.HeadFoldModel` (a truncate vs a sweep chunk on one tree-mapped head) | 17 | the truncate outside the layout lock (the pre-fix kv_fs): the chunk's Put restores the old size |

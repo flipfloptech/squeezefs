@@ -119,7 +119,7 @@ pub const stats = struct {
     /// changed ring.
     pub var joined_ring_grow_declined: counters.ShardedCounter = .{};
     /// A growth whose drain did not reach the fixpoint inside one landing
-    /// ceiling, or whose verb failed: the gate reopened, retried next tick.
+    /// ceiling, or whose verb failed: the gate reopened, retried next cycle.
     pub var joined_ring_grow_deferrals: counters.ShardedCounter = .{};
     /// The measured commit rate the ring derives from (bytes/s, EWMA).
     pub var joined_commit_ewma_bytes_per_s: counters.Gauge = .{};
@@ -378,6 +378,10 @@ pub const JoinedSet = struct {
     commit_ewma_bytes_per_s: u64 = 0,
     head_at_last_fold: ?u64 = null,
     fold_mark_ns: u64 = 0,
+    /// The checkpoint seq the growth was last judged at: one judgment per
+    /// CYCLE (the reference's cadence — a stall's park-kicked cycle lands
+    /// first, then the growth), never per 50 ms tick.
+    grow_judged_at_seq: u64 = 0,
 
     /// The joined door (module doc): the census, the endpoint and the
     /// secret off the projection, the dial, `JoinAppender`. The region's
@@ -899,9 +903,13 @@ pub const JoinedSet = struct {
         g.noteWindowLeft();
     }
 
-    /// The checkpoint task's `after_tick` seam.
+    /// The checkpoint task's `after_tick` seam: the growth is judged once
+    /// per cycle that landed (an idle tick judges nothing).
     pub fn afterTick(ctx: *anyopaque) void {
         const self: *JoinedSet = @ptrCast(@alignCast(ctx));
+        const seq = self.be.cp.checkpointSeq();
+        if (seq == self.grow_judged_at_seq) return;
+        self.grow_judged_at_seq = seq;
         self.growRingIfDue();
     }
 
@@ -969,14 +977,14 @@ pub const JoinedSet = struct {
             // tail it waits for, one per round.
             be.cp.checkpointCycle(true) catch |e| {
                 stats.joined_ring_grow_deferrals.inc();
-                log.warn("meta volume {s}: joined appender {d}'s growth drain cycle failed ({s}) — growth retried next tick", .{ be.path, self.appenderId(), @errorName(e) });
+                log.warn("meta volume {s}: joined appender {d}'s growth drain cycle failed ({s}) — growth retried next cycle", .{ be.path, self.appenderId(), @errorName(e) });
                 return;
             };
             const now = clock.monotonicNs();
             if (self.gate.awaitDrained(@min(deadline, now + round_ns), self, windowEmpty)) break;
             if (clock.monotonicNs() >= deadline or be.cv.isClosing()) {
                 stats.joined_ring_grow_deferrals.inc();
-                log.debug("meta volume {s}: joined appender {d}'s window did not empty inside the {d} ms landing ceiling ({d} pass(es) inside, {d} window(s) in flight) — growth retried next tick", .{ be.path, self.appenderId(), ceiling_ns / std.time.ns_per_ms, self.gate.passesInside(), be.cv.windowsInflight() });
+                log.debug("meta volume {s}: joined appender {d}'s window did not empty inside the {d} ms landing ceiling ({d} pass(es) inside, {d} window(s) in flight) — growth retried next cycle", .{ be.path, self.appenderId(), ceiling_ns / std.time.ns_per_ms, self.gate.passesInside(), be.cv.windowsInflight() });
                 return;
             }
         }
@@ -987,13 +995,13 @@ pub const JoinedSet = struct {
         while (!be.ringDrained() and covers < checkpoint.FIXPOINT_COVER_CYCLES_MAX) : (covers += 1) {
             be.cp.checkpointCycle(true) catch |e| {
                 stats.joined_ring_grow_deferrals.inc();
-                log.warn("meta volume {s}: joined appender {d}'s growth cover cycle failed ({s}) — growth retried next tick", .{ be.path, self.appenderId(), @errorName(e) });
+                log.warn("meta volume {s}: joined appender {d}'s growth cover cycle failed ({s}) — growth retried next cycle", .{ be.path, self.appenderId(), @errorName(e) });
                 return;
             };
         }
         if (!be.ringDrained()) {
             stats.joined_ring_grow_deferrals.inc();
-            log.debug("meta volume {s}: joined appender {d}'s ring is not drained after {d} cover cycles (head {d}, reusable_upto {d}, {d} reservation(s) open) — growth retried next tick", .{ be.path, self.appenderId(), covers, be.core.headPos(), be.core.reusableUpto(), be.reg.openCount() });
+            log.debug("meta volume {s}: joined appender {d}'s ring is not drained after {d} cover cycles (head {d}, reusable_upto {d}, {d} reservation(s) open) — growth retried next cycle", .{ be.path, self.appenderId(), covers, be.core.headPos(), be.core.reusableUpto(), be.reg.openCount() });
             return;
         }
         const head = be.core.headPos();
@@ -1001,8 +1009,12 @@ pub const JoinedSet = struct {
         const answer = self.wire.growRing(own, step) catch |e| {
             stats.joined_ring_grow_deferrals.inc();
             switch (e) {
-                error.Deferred, error.MembershipPending => log.debug("meta volume {s}: joined appender {d}'s GrowRing deferred by the manager ({s}) — retried next tick", .{ be.path, own, @errorName(e) }),
-                else => log.warn("meta volume {s}: joined appender {d}'s GrowRing failed ({s}) — retried next tick", .{ be.path, own, @errorName(e) }),
+                // The manager's `Deferred` (its ring 0 full for a beat) and
+                // a manager out of reach (its death is the membership's
+                // business: `T_self` parks this appender) are the cadence's;
+                // anything else is the wire's failure, loud.
+                error.Deferred, error.MembershipPending, error.HolderUnreachable, error.ConnectionLost, error.ListenerRefused => log.debug("meta volume {s}: joined appender {d}'s GrowRing did not land this cycle ({s}) — retried next cycle", .{ be.path, own, @errorName(e) }),
+                else => log.warn("meta volume {s}: joined appender {d}'s GrowRing failed ({s}) — retried next cycle", .{ be.path, own, @errorName(e) }),
             }
             return;
         };

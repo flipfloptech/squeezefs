@@ -2305,17 +2305,12 @@ test "linux: A JOINER'S CLEAN UNMOUNT AND REJOIN while the manager stays up — 
     }
 }
 
-test "linux: A JOINED APPENDER'S RING GROWS UNDER A JOURNAL-FULL STORM (charter §5.5 'growth = replace-when-drained (GrowRing, one doubling step)'; spec §3.3's joiner side; found by the tarx row: B's ring stayed at its 512 KiB floor for the mount's life — 2,268 journal-full stalls against the manager's one, the manager's ring budget unspent): B joins at the floor; a storm of commits into its slot parks at ring admission; the cadence after the stall closes the growth gate, drains the ring to its fixpoint, asks GrowRing and swaps the journal onto the grown table — the page names it in both directory slots, the manager carved it (appender_ring_grows), every record of the storm reads back through B, the pass resumes; B's clean leave returns every segment and a rejoin starts at the hint, not the floor" {
+test "linux: A JOINED APPENDER'S RING GROWS UNDER A JOURNAL-FULL STORM (charter §5.5 'growth = replace-when-drained (GrowRing, one doubling step)'; spec §3.3's joiner side; found by the tarx row: B's ring stayed at its 512 KiB floor for the mount's life — 2,268 journal-full stalls against the manager's one, the manager's ring budget unspent): B joins at the floor; a storm of commits into its slot fills the ring while no cycle can reclaim it (the SMO lock held) and parks at ring admission; the cadence after the stall closes the growth gate, drains the ring to its fixpoint, asks GrowRing and swaps the journal onto the grown table — the page names it in both directory slots, the manager carved it (appender_ring_grows), the storm goes on under it and every record reads back through B; B's clean leave returns every segment and a rejoin starts at the hint, not the floor" {
     const gpa = testing.allocator;
     const s = try meta_set.TestSet.create(gpa, "ring-grow", 1);
     defer s.destroy();
     try s.env.put("SQUEEZEFS_MW_BIND", "127.0.0.1:0");
     try s.env.put("SQUEEZEFS_SYM_MINT_SLOTS", "1");
-    // No age-driven cycle: the floor ring fills before anything reclaims
-    // it, so the FIRST growth is the stall's (the row's shape) — the
-    // park-kicked cycle then primes the commit-rate EWMA, and the derived
-    // size (2 × rate × max_age) carries the later growths.
-    try s.env.put("SQUEEZEFS_CHECKPOINT_MAX_AGE_MS", "600000");
     const set = try s.open();
     defer set.close();
     var locks = try dlm.Manager.init(gpa, 64);
@@ -2330,10 +2325,50 @@ test "linux: A JOINED APPENDER'S RING GROWS UNDER A JOURNAL-FULL STORM (charter 
     const grows0 = manager.stats.appender_ring_grows.load();
     const wire_grows0 = join_ladder.stats.joined_wire_ring_grows.load();
     const conflicts0 = manager.stats.extent_grant_conflicts.load();
-    var keys: std.ArrayList([key.INODE_KEY_LEN]u8) = .empty;
-    defer keys.deinit(gpa);
+    // The storm, on its own thread: one record per commit into B's slot
+    // until told to stop (or the bound says the law never fired); the keys
+    // it wrote are read back by the test after the join.
+    const Storm = struct {
+        const value: [1536]u8 = @splat(0x5A);
+        bj: *KvBackend,
+        b: *meta_set.MetaSet,
+        slot: u16,
+        gpa: std.mem.Allocator,
+        keys: std.ArrayList([key.INODE_KEY_LEN]u8) = .empty,
+        /// Commits acked so far (the test's observable; `keys` is the
+        /// storm's own until the join).
+        committed: std.atomic.Value(usize) = .init(0),
+        stop: std.atomic.Value(bool) = .init(false),
+        /// Set when the storm ended (by the stop word, the bound or a
+        /// failure); `failed` is read after the join.
+        done: std.atomic.Value(bool) = .init(false),
+        failed: ?anyerror = null,
+
+        const BOUND: usize = 20_000;
+
+        fn run(self: *@This()) void {
+            self.runInner() catch |e| {
+                self.failed = e;
+            };
+            self.done.store(true, .release);
+        }
+
+        fn runInner(self: *@This()) !void {
+            var i: usize = 0;
+            while (i < BOUND and !self.stop.load(.acquire)) : (i += 1) {
+                const local = try self.bj.allocateInoInSlot(self.slot);
+                const k = key.inodeKey(key.guestLocalIno(self.slot, local));
+                const t = try self.bj.begin(@src());
+                try t.stagePut(key.TREE_INODES, &k, &value);
+                try self.bj.commit(t);
+                try self.keys.append(self.gpa, k);
+                _ = self.committed.fetchAdd(1, .release);
+            }
+        }
+    };
     var me: u32 = 0;
     var grown_bytes: u64 = 0;
+    var floor_bytes: u64 = 0;
     {
         const b = try meta_set.MetaSet.open(gpa, s.io(), s.pathList(), open_opts);
         defer b.close();
@@ -2343,29 +2378,32 @@ test "linux: A JOINED APPENDER'S RING GROWS UNDER A JOURNAL-FULL STORM (charter 
         defer held.deinit(gpa);
         try bj.slots.table.heldBy(me, &held);
         try testing.expectEqual(@as(usize, 1), held.items.len);
-        const slot = held.items[0];
-        const floor_bytes = bj.ring_layout.ringBytes();
+        floor_bytes = bj.ring_layout.ringBytes();
         const floor_pages = bj.geo.pages;
         try testing.expectEqual(@as(usize, 1), bj.joined.?.core().table.len);
-        // The storm: records of a size that fills the floor ring in a few
-        // dozen windows (every window is at least a sector on the padded
-        // ring); it runs until the ring grew — the growth closes the gate
-        // on the pass, so the storm's own commits park through it — or the
-        // bound says the law did not fire.
-        const value: [1536]u8 = @splat(0x5A);
-        var i: usize = 0;
-        while (i < 6000 and bj.joined.?.core().table.len < 2) : (i += 1) {
-            const local = try bj.allocateInoInSlot(slot);
-            const k = key.inodeKey(key.guestLocalIno(slot, local));
-            const t = try bj.begin(@src());
-            try t.stagePut(key.TREE_INODES, &k, &value);
-            try bj.commit(t);
-            try keys.append(gpa, k);
-        }
+        var storm: Storm = .{ .bj = bj, .b = b, .slot = held.items[0], .gpa = gpa };
+        defer storm.keys.deinit(gpa);
+        // The SMO lock held: no cycle (the ring-pressure cycle at half a
+        // ring included) can reclaim the floor ring, so the storm fills it
+        // and its pass parks at ring admission — the stall, observed; then
+        // the lock goes and the next tick's growth has its trigger.
+        bj.smo_lock.lockUncancelable(bj.io);
+        const th = try std.Thread.spawn(.{}, Storm.run, .{&storm});
+        while (bj.cv.stats.full_stalls.load() == 0 and !storm.done.load(.acquire)) std.Thread.yield() catch {};
+        bj.smo_lock.unlock(bj.io);
+        while (bj.joined.?.core().table.len < 2 and !storm.done.load(.acquire)) std.Thread.yield() catch {};
+        const grown_at = storm.committed.load(.acquire);
+        // The storm goes on under the grown ring (positions continue across
+        // the swap, the gate reopened) before it is stopped.
+        while (storm.committed.load(.acquire) < grown_at + 512 and !storm.done.load(.acquire)) std.Thread.yield() catch {};
+        storm.stop.store(true, .release);
+        th.join();
+        if (storm.failed) |e| return e;
         const stalls = bj.cv.stats.full_stalls.load();
-        std.debug.print("\nring grow: {d} commits, {d} journal-full stalls, ring {d} → {d} B in {d} segment(s)\n", .{ i, stalls, floor_bytes, bj.ring_layout.ringBytes(), bj.joined.?.core().table.len });
+        std.debug.print("\nring grow: {d} commits ({d} before the growth), {d} journal-full stalls, ring {d} → {d} B in {d} segment(s)\n", .{ storm.keys.items.len, grown_at, stalls, floor_bytes, bj.ring_layout.ringBytes(), bj.joined.?.core().table.len });
         // The law: the ring grew by at least one doubling step; the
         // journal, the structural writer and the conveyor write under it.
+        try testing.expect(stalls >= 1);
         try testing.expect(bj.joined.?.core().table.len >= 2);
         try testing.expect(bj.ring_layout.ringBytes() >= 2 * floor_bytes);
         try testing.expect(bj.geo.pages > floor_pages);
@@ -2373,7 +2411,6 @@ test "linux: A JOINED APPENDER'S RING GROWS UNDER A JOURNAL-FULL STORM (charter 
         try testing.expectEqual(bj.core.geometry().pages, bj.geo.pages);
         try testing.expectEqual(bj.smo_journal.geo.pages, bj.geo.pages);
         try testing.expect(bj.cv.deps.geo.pages == bj.geo.pages);
-        try testing.expect(stalls >= 1);
         try testing.expect(manager.stats.appender_ring_grows.load() > grows0);
         try testing.expect(join_ladder.stats.joined_wire_ring_grows.load() > wire_grows0);
         try testing.expectEqual(conflicts0, manager.stats.extent_grant_conflicts.load());
@@ -2385,33 +2422,31 @@ test "linux: A JOINED APPENDER'S RING GROWS UNDER A JOURNAL-FULL STORM (charter 
             try testing.expectEqual(bj.joined.?.core().table.len, p.segments.len);
             try testing.expect(p.segments.eql(&bj.joined.?.core().table));
         }
-        // The storm goes on under the grown ring (positions continue across
-        // the swap), then every record of it reads back through B.
-        for (0..512) |_| {
-            const local = try bj.allocateInoInSlot(slot);
-            const k = key.inodeKey(key.guestLocalIno(slot, local));
-            const t = try bj.begin(@src());
-            try t.stagePut(key.TREE_INODES, &k, &value);
-            try bj.commit(t);
-            try keys.append(gpa, k);
-        }
         try bj.checkpointNow();
-        for (keys.items) |k| {
+        for (storm.keys.items) |k| {
             const v = (try b.lookup(gpa, key.TREE_INODES, &k)) orelse return error.TestRecordLost;
             defer gpa.free(v);
-            try testing.expectEqualSlices(u8, &value, v);
+            try testing.expectEqualSlices(u8, &Storm.value, v);
         }
     }
     // The clean leave returned the ring whole (the page Free, no segment
-    // named); the rejoin under the same identity starts at the hint the
-    // growths wrote — never back at the floor.
-    try testing.expect((try be0.sym.?.manager.readPageOf(me)) == null or (try be0.sym.?.manager.readPageOf(me)).?.state == .free);
+    // named); the rejoin under the same identity asks the hint the growths
+    // wrote and lands above the floor — what the heap's runs and the
+    // budget's remainder give of it at that moment (spec §3.1: "a hinted
+    // ask above the remainder lands the remainder and grows later"), never
+    // the floor again.
+    {
+        const p = (try be0.sym.?.manager.readPageOf(me)).?;
+        try testing.expectEqual(page.State.free, p.state);
+        try testing.expectEqual(@as(u8, 0), p.segments.len);
+    }
     {
         const b = try meta_set.MetaSet.open(gpa, s.io(), s.pathList(), open_opts);
         defer b.close();
         const bj = b.volumes[0];
         try testing.expectEqual(me, bj.joined.?.appenderId());
-        try testing.expect(bj.ring_layout.ringBytes() >= grown_bytes);
+        std.debug.print("ring grow: the rejoin's ring {d} B (hint {d} B, floor {d} B)\n", .{ bj.ring_layout.ringBytes(), grown_bytes, floor_bytes });
+        try testing.expect(bj.ring_layout.ringBytes() > floor_bytes);
     }
 }
 

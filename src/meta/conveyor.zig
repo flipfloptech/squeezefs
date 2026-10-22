@@ -2531,25 +2531,19 @@ pub const Conveyor = struct {
         w.self_applied = true;
         w.pending.store(@intCast(n), .release);
         self.stats.self_handoffs.inc();
-        // The turns fan out as a binary tree: the pass wakes member 0, each
-        // member wakes 2i+1 and 2i+2 before its own apply — the pass pays
-        // one send per batch and the fan-out's depth is log₂ n (at 64 ranks
-        // a serial fan-out on the lane fiber took 254 µs of every member's
-        // queue wait and parked every spinner past its bound).
-        self.relayTurn(w, 0);
-    }
-
-    /// Hand member `idx` its turn; a member whose committer is gone (it
-    /// cannot be: the park is uncancelable) is rolled out as a PAD, its
-    /// share of `pending` taken here, and its subtree relayed by us.
-    fn relayTurn(self: *Conveyor, w: *Window, idx: u32) void {
-        if (idx >= w.members.len) return;
-        w.members[idx].done.sendTurn(self.deps.io, w, idx) catch {
-            w.failed[idx] = error.Corrupt;
-            self.relayTurn(w, 2 * idx + 1);
-            self.relayTurn(w, 2 * idx + 2);
+        var gone: u32 = 0;
+        for (w.members, 0..) |*m, i| {
+            m.done.sendTurn(self.deps.io, w, @intCast(i)) catch {
+                w.failed[i] = error.Corrupt;
+                gone += 1;
+            };
+        }
+        // A member nobody applies: its range a PAD, its share of `pending`
+        // ours (its committer left nothing to answer).
+        var k: u32 = 0;
+        while (k < gone) : (k += 1) {
             if (w.pending.fetchSub(1, .acq_rel) == 1) self.submitSelfApplied(w);
-        };
+        }
     }
 
     /// §BC: ONE member's apply on its own committer's thread — A3 resolve
@@ -2560,9 +2554,6 @@ pub const Conveyor = struct {
     /// is the last member. A served verb, a control record or a tool waits
     /// for the landing. Returns the member's terminal outcome.
     pub fn applyOwn(self: *Conveyor, w: *Window, idx: u32) Outcome {
-        // The fan-out's next level first: two siblings start while we apply.
-        self.relayTurn(w, 2 * idx + 1);
-        self.relayTurn(w, 2 * idx + 2);
         const m = &w.members[idx];
         const p = &w.parts[idx];
         const a = p.arena.allocator();

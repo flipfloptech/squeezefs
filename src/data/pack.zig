@@ -18,8 +18,10 @@
 //! block is PINNED at `refcount = committed + in-flight + 1` (the packer's
 //! own +1 minted by the placed allocation; every tenant adds one at reserve),
 //! so no sequence of tenant deletes can free it under a DMA; the pin's
-//! arithmetic and the seal's single sealer are model-checked below, and the
-//! seal re-checks the arithmetic (`pack_pin_refcount_drift`, Q-15). Seals:
+//! arithmetic, the seal's single sealer and the seal's census against a
+//! tenant release are model-checked below, and the seal re-checks the
+//! arithmetic in its census — taken under the pin lock BEFORE the flag
+//! goes up (`pack_pin_refcount_drift`, Q-15). Seals:
 //! FULL, DISMOUNT, DRAIN — no BATCH (the co-writer frame it closed was
 //! retired with the symmetric plane; the gauge family matches the enum,
 //! Q-21/Q-22), no idle seal (one half-empty block per volume per scope is
@@ -224,14 +226,18 @@ pub const OpenPack = struct {
     /// unlink's corpse, a rewrite's displaced copy, a compactor's refused
     /// republish): the pin arithmetic's fourth word.
     released: std.atomic.Value(u32) = .init(0),
-    /// CAS false→true: the first sealer runs the seal.
+    /// False→true exactly once, by `Packer.seal` under the pin lock AFTER
+    /// its census (`Census`): an observer of the flag is past the census.
     sealed: std.atomic.Value(bool) = .init(false),
     /// Serializes every (RAM refcount step, tenant-word step) pair of an
-    /// OPEN pack with the seal's snapshot, so the seal's arithmetic is
-    /// exact: `refcount + released ≡ committed + inflight + 1`. Held only
-    /// while `!sealed` (a release under it is nonterminal by the pin — a
-    /// RAM decrement, never the terminal ladder's park); once sealed the
-    /// words are history and every release runs the plain ladder.
+    /// OPEN pack with the seal's census AND its flag, so the seal's
+    /// arithmetic is exact: `refcount + released ≡ committed + inflight +
+    /// 1`. Held only while `!sealed` (a release under it is nonterminal by
+    /// the pin — a RAM decrement, never the terminal ladder's park); once
+    /// sealed the words are history and every release runs the plain
+    /// ladder — a release that saw the flag saw it after the census, so
+    /// the ladder's decrement is never in a census (the flag raised before
+    /// the census let one in: LTP fs 2026-10-22, `pack_pin_refcount_drift`).
     pin_lock: jc.SpinLock = .{},
 
     /// `[prev, prev + slot_len)` iff it fits the chunk. acq_rel: the
@@ -241,8 +247,10 @@ pub const OpenPack = struct {
         return if (prev + slot_len <= self.chunk) prev else null;
     }
 
-    /// True for exactly one caller. acq_rel pairs with the loads in
-    /// `runSeal`; the loser's acquire sees the winner's seal.
+    /// True for exactly one caller. The packer calls it under the pin lock
+    /// with its census taken (`Packer.seal`); the release half of acq_rel
+    /// orders that census before the flag, so `isSealed`'s acquire read of
+    /// `true` (an open-tenant release deciding on the ladder) is past it.
     pub fn trySeal(self: *OpenPack) bool {
         return self.sealed.cmpxchgStrong(false, true, .acq_rel, .acquire) == null;
     }
@@ -260,9 +268,10 @@ pub const OpenPack = struct {
         _ = self.committed.fetchAdd(1, .acq_rel);
     }
 
-    /// The pin lock, taken only while the pack is OPEN (the seal's CAS
-    /// precedes its snapshot, so a holder that sees `!sealed` is inside
-    /// the arithmetic the seal will read). False = sealed, nothing held.
+    /// The pin lock, taken only while the pack is OPEN (the seal's census
+    /// and its flag share the lock, so a holder that sees `!sealed` steps
+    /// before the census and a caller that sees `sealed` is past it).
+    /// False = sealed, nothing held.
     pub fn lockOpen(self: *OpenPack) bool {
         if (self.isSealed()) return false;
         self.pin_lock.lock();
@@ -527,12 +536,12 @@ pub const Packer = struct {
                     if (pinned) _ = pack.inflight.fetchAdd(1, .acq_rel);
                     pack.pin_lock.unlock();
                     if (!pinned) {
-                        if (pack.trySeal()) self.runSeal(row, pack, .full);
+                        if (self.seal(pack)) |c| self.runSeal(row, pack, c, .full);
                         continue;
                     }
                     return .{ .pack = pack, .off = off, .slot_len = slot_len };
                 }
-                if (pack.trySeal()) self.runSeal(row, pack, .full);
+                if (self.seal(pack)) |c| self.runSeal(row, pack, c, .full);
                 continue;
             }
             const ctx: RefillCtx = .{ .packer = self, .key = k, .row = row };
@@ -607,26 +616,45 @@ pub const Packer = struct {
         }
     };
 
-    /// Vacate the row, check the pin arithmetic, release the pin (the
-    /// router ladder's verdict), count the seal kind. A terminal release
-    /// with `committed == 0` is an ABANDONED pack.
-    fn runSeal(self: *Packer, row: *Row, pack: *OpenPack, kind: SealKind) void {
+    /// The seal's census: the four words of the pin arithmetic as the
+    /// pack closed.
+    const Census = struct { committed: u32, inflight: u32, released: u32, refcount: u32 };
+
+    /// THE seal: its census and its flag in ONE critical section under the
+    /// pin lock, the census FIRST — every tenant step of the open pack
+    /// landed whole or not at all against the census, and a release that
+    /// observes `sealed` (and so runs the plain ladder, no `released + 1`)
+    /// observes it after the census, so the ladder's decrement is never in
+    /// it. The flag raised before the census admitted exactly that: a
+    /// tenant displaced as its pack sealed FULL lowered the refcount the
+    /// census then read (LTP fs 2026-10-22, `pack_pin_refcount_drift`).
+    /// Null = another sealer closed it first.
+    fn seal(self: *Packer, pack: *OpenPack) ?Census {
+        pack.pin_lock.lock();
+        defer pack.pin_lock.unlock();
+        if (pack.isSealed()) return null;
+        const c: Census = .{
+            .committed = pack.committed.load(.acquire),
+            .inflight = pack.inflight.load(.acquire),
+            .released = pack.released.load(.acquire),
+            .refcount = self.alloc.refcount(self.alloc.ctx, pack.vol_tag, pack.base),
+        };
+        const won = pack.trySeal();
+        assert(won); // the flag moves only here, under the lock
+        return c;
+    }
+
+    /// Vacate the row, check the pin arithmetic of the census, release
+    /// the pin (the router ladder's verdict), count the seal kind. A
+    /// terminal release with `committed == 0` is an ABANDONED pack.
+    fn runSeal(self: *Packer, row: *Row, pack: *OpenPack, c: Census, kind: SealKind) void {
         assert(pack.isSealed());
         _ = row.pack.cmpxchgStrong(pack, null, .acq_rel, .acquire);
-        // The snapshot under the pin lock: every tenant step of the open
-        // pack landed whole or not at all against it; `sealed` is already
-        // set, so a release arriving after it runs the plain ladder.
-        pack.pin_lock.lock();
-        const committed = pack.committed.load(.acquire);
-        const inflight = pack.inflight.load(.acquire);
-        const released = pack.released.load(.acquire);
-        const refcount = self.alloc.refcount(self.alloc.ctx, pack.vol_tag, pack.base);
-        pack.pin_lock.unlock();
-        if (refcount + released != committed + inflight + 1) {
+        if (c.refcount + c.released != c.committed + c.inflight + 1) {
             stats.pack_pin_refcount_drift.fire("pack seal: refcount + released ≠ committed + inflight + 1");
         }
         switch (self.alloc.release(self.alloc.ctx, pack.vol_tag, pack.base)) {
-            .terminal => if (committed == 0 and inflight == 0) stats.pack_blocks_abandoned.inc(),
+            .terminal => if (c.committed == 0 and c.inflight == 0) stats.pack_blocks_abandoned.inc(),
             .nonterminal => {},
             .untracked => stats.pack_release_untracked_noops.fire("pack seal: the pin's block is untracked"),
         }
@@ -663,7 +691,7 @@ pub const Packer = struct {
         for (self.rows) |*r| {
             if (!r.used) continue;
             const p = r.pack.load(.acquire) orelse continue;
-            if (p.trySeal()) self.runSeal(r, p, kind);
+            if (self.seal(p)) |c| self.runSeal(r, p, c, kind);
         }
     }
 
@@ -684,8 +712,8 @@ pub const Packer = struct {
             if (!r.used) continue;
             const p = r.pack.load(.acquire) orelse continue;
             if (p.vol_tag == vol_tag and p.base == base) {
-                if (p.trySeal()) {
-                    self.runSeal(r, p, .drain);
+                if (self.seal(p)) |c| {
+                    self.runSeal(r, p, c, .drain);
                     return true;
                 }
                 return false;

@@ -70,12 +70,6 @@ fstests_build() {
   # The unprivileged users xfstests' `_require_user` wants.
   local u; for u in fsgqa 123456-fsgqa fsgqa2; do id "$u" >/dev/null 2>&1 || useradd -m "$u"; done
   # The mount/umount/mkfs/fsck helpers util-linux dispatches to.
-  cat > /run/squeezefs-suites.env <<ENV
-SQZ_BIN=$SQZ_BIN
-SUITE_MOUNT_OPTS=$SUITE_MOUNT_OPTS
-SUITE_META_MIB=$SUITE_META_MIB
-SUITE_DATA_GIB=$SUITE_DATA_GIB
-ENV
   ln -sf "$SUITES_DIR/mount.squeezefs" /sbin/mount.fuse.squeezefs
   # umount(8) names its helper by the type's PREFIX: `umount.fuse -t fuse.squeezefs`.
   ln -sf "$SUITES_DIR/mount.squeezefs" /sbin/umount.fuse
@@ -87,13 +81,26 @@ ENV
 # The two sets: TEST (long-lived across the run) and SCRATCH (every test
 # re-mkfses it). Both formatted fresh per run; each set ONE sparse image
 # behind a loop device (detached by `fstests_detach_loops`) that the helpers
-# carve into the metadata volume, the two data volumes and the staging
-# root's ext4 (`setpaths.sh`): every byte of a set's state under the device
-# the test cuts, errors or logs.
+# carve into the metadata volume and the two data volumes (`setpaths.sh`):
+# every byte of a set's state under the device the test cuts, errors or
+# logs. A test that hands the helpers a device of its own (dmhugedisk's
+# 17 TB snapshot, a thin volume) gets a set keyed by the device's name,
+# its logs under `$SETS/sets/<name>` — the helpers learn that directory
+# from their env file, written here per run.
 fstests_sets() {
   local n=$1
   SETS="$RESULTS/run$n"
-  mkdir -p "$SETS/set-test" "$SETS/set-scratch" "$SETS/mnt-test" "$SETS/mnt-scratch" "$SETS/results"
+  mkdir -p "$SETS/set-test" "$SETS/set-scratch" "$SETS/mnt-test" "$SETS/mnt-scratch" "$SETS/results" "$SETS/sets" "$SETS/bin"
+  # check's mount(8): a bare mount of an untypable block device is ours
+  # (`mount.typed`; generic/620 mounts its hugedisk without `-t`).
+  ln -sf "$SUITES_DIR/mount.typed" "$SETS/bin/mount"
+  cat > /run/squeezefs-suites.env <<ENV
+SQZ_BIN=$SQZ_BIN
+SUITE_MOUNT_OPTS=$SUITE_MOUNT_OPTS
+SUITE_META_MIB=$SUITE_META_MIB
+SUITE_DATA_GIB=$SUITE_DATA_GIB
+SUITE_SETS_DIR=$SETS/sets
+ENV
   truncate -s "$(suite_set_bytes)" "$SETS/set-test/meta.img" "$SETS/set-scratch/meta.img"
   TEST_LOOP=$(losetup -f --show "$SETS/set-test/meta.img") || suite_die "losetup (test)"
   SCRATCH_LOOP=$(losetup -f --show "$SETS/set-scratch/meta.img") || suite_die "losetup (scratch)"
@@ -138,11 +145,15 @@ fstests_unmount_all() {
 
 fstests_detach_loops() {
   # A set's slices a test left standing go first: the loop is busy under
-  # them.
-  local id
-  for id in set-test set-scratch; do
-    SET_ID=$id; SET_DIR="$SETS/$id"; suite_slice_paths; suite_slices_down
-    rm -f "/run/squeezefs-suites/$id.dir"
+  # them. Every set of this run — the two loop sets and any raw-device set
+  # a test brought (its `.dir` names a directory under this run's).
+  local id f
+  for f in /run/squeezefs-suites/*.dir; do
+    [ -f "$f" ] || continue
+    id=$(basename "$f" .dir)
+    case "$(cat "$f")" in "$SETS"/*) ;; *) continue ;; esac
+    SET_ID=$id; suite_slice_paths; suite_slices_down
+    rm -f "$f"
   done
   rm -f /run/squeezefs-suites/mnt-* 2>/dev/null
   [ -n "${TEST_LOOP:-}" ] && losetup -d "$TEST_LOOP" 2>/dev/null; TEST_LOOP=""
@@ -155,15 +166,25 @@ fstests_fsck_set() {
   local out="$RESULTS/fsck-$which-run$n.json"
   local dev; dev=$([ "$which" = test ] && echo "$TEST_LOOP" || echo "$SCRATCH_LOOP")
   # The SCRATCH device is any test's to leave as it likes (`_require_scratch_nocheck`:
-  # generic/740 ends with a foreign mkfs on it); only a squeezefs volume is scrubbed.
+  # generic/740 ends with a foreign mkfs on it, generic/620 a dm-snapshot's
+  # COW store); only a squeezefs volume is scrubbed. (Every test that checks
+  # its scratch had it fscked by `_check_scratch_fs` already.)
   if [ "$which" = scratch ]; then
     suite_set_of "$dev"; suite_slices_up "$dev"
     local st; st=$("$SQZ_BIN" status "sqmeta://$SLICE_META" 2>/dev/null | grep -v '^info\|^debug' | head -1)
     suite_slices_down
-    case "$st" in *"not formatted"*) suite_log "fsck $which (run $n): skipped — the last test left the scratch device $(echo "$st" | sed 's/.*not formatted/not formatted/' | cut -c1-120)"; return 0 ;; esac
+    case "$st" in *"SqueezeFS metadata volume"*) ;; *) suite_log "fsck $which (run $n): skipped — the last test left the scratch device $(echo "$st" | sed 's/^sqmeta:[^ ]*: //' | cut -c1-120)"; return 0 ;; esac
   fi
   "$SUITES_DIR/fsck.squeezefs" "$dev" > "$out" 2>"$out.err" || rc=$?
   if [ "$rc" = 0 ]; then suite_log "fsck --offline --scrub $which (run $n): 0 findings"; return 0; fi
+  # A scratch that carries a superblock but opens as no set (generic/620's
+  # transient dm-snapshot leaves its COW chunks — copies of the hugedisk's
+  # own set — on the scratch device): the last test's leftover, no finding.
+  # Every test that checks its scratch had it fscked by `_check_scratch_fs`.
+  if [ "$which" = scratch ] && grep -q 'cannot open metadata set' "$out"; then
+    suite_log "fsck $which (run $n): skipped — the last test left the scratch device unopenable ($(grep -o 'cannot open metadata set.*' "$out" | head -1 | cut -c1-160))"
+    return 0
+  fi
   suite_log "fsck --offline --scrub $which (run $n): exit $rc — $out"; head -c 1500 "$out" >&2; echo >&2; grep -v '^info\|^debug' "$out.err" | head -10 >&2
   return 1
 }
@@ -189,7 +210,7 @@ fstests_run() {
   # reconfigure": generic/294, 306, 452's `-o remount,ro`); the classic
   # mount(2) applies the flag and ignores the options, as the daemon's
   # contract says. Helpers run the same under either API.
-  (cd "$FSTESTS_DIR" && exec setsid env LIBMOUNT_FORCE_MOUNT2=always timeout -s KILL "$FSTESTS_TIMEOUT_S" ./check -R xunit "${exclude[@]}" "${what[@]}") > "$RESULTS/check-run$n.out" 2>&1 &
+  (cd "$FSTESTS_DIR" && exec setsid env LIBMOUNT_FORCE_MOUNT2=always PATH="$SETS/bin:$PATH" timeout -s KILL "$FSTESTS_TIMEOUT_S" ./check -R xunit "${exclude[@]}" "${what[@]}") > "$RESULTS/check-run$n.out" 2>&1 &
   CHECK_PGID=$!
   # FAIL EARLY (owner ruling 2026-10-17): the first failing test that is not
   # a ledger row ends the pass — that failure is the work; the hours of
@@ -244,7 +265,10 @@ fstests_run() {
   (cd "$SETS/results" && for f in */*.notrun; do [ -f "$f" ] && cat "$f"; echo; done 2>/dev/null | grep . | sort | uniq -c | sort -rn | head -40) > "$RESULTS/notrun-reasons-run$n.txt" || true
   fstests_unmount_all
   local ok=0
-  for m in "$SETS/set-test" "$SETS/set-scratch"; do
+  # Every set's daemons: the two loop sets and the raw-device sets tests brought.
+  local sets=("$SETS/set-test" "$SETS/set-scratch")
+  for m in "$SETS"/sets/*/; do [ -d "$m" ] && sets+=("${m%/}"); done
+  for m in "${sets[@]}"; do
     local logs; logs=$(ls "$m"/daemon-*.log 2>/dev/null | wc -l)
     cat "$m"/daemon-*.log 2>/dev/null | grep -E "$SUITE_ALERT_RE" > "$RESULTS/daemon-$(basename "$m")-run$n.alerts" || true
     local na; na=$(wc -l < "$RESULTS/daemon-$(basename "$m")-run$n.alerts")

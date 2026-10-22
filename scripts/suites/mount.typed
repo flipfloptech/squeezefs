@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# `check`'s mount(8) (fstests.sh links it as `<run>/bin/mount`, first on
+# check's PATH: xfstests takes `MOUNT_PROG=$(type -P mount)`). A test that
+# mounts a device BARE — generic/620's `_mount $DMHUGEDISK_DEV $SCRATCH_MNT`
+# — leaves the type to mount(8), which asks libblkid (it knows no FUSE
+# filesystem's superblock) and then tries /etc/filesystems — a HOST
+# setting the harness never touches, and on this host every kernel
+# filesystem in turn (exFAT, ntfs3, … in dmesg) before EINVAL. Here a bare
+# mount of a block device libblkid cannot type gets `-t fuse.squeezefs`,
+# the typing an operator (or blkid for a kernel filesystem) would supply;
+# anything typed, bound, moved, remounted or not a block device goes to
+# mount(8) unchanged.
+set -u
+case $0 in */*) here=$(cd "$(dirname "$0")" && pwd) ;; *) here=$(dirname "$(type -P "$0")") ;; esac
+real=$(PATH=$(printf '%s' "$PATH" | tr ':' '\n' | grep -vx "$here" | paste -sd:) type -P mount) || { echo "mount.typed: no mount(8) on PATH" >&2; exit 1; }
+
+args=("$@") n=$# i=0 typed=1 pos=()
+while [ "$i" -lt "$n" ]; do
+  a=${args[$i]}
+  case "$a" in
+    -t|--types|-t*|--types=*) typed=0 ;;
+    -B|--bind|-M|--move|-R|--rbind|-a|--all|-h|--help|-V|--version|-l|--show-labels|-T|--fstab|-N|--namespace) typed=0 ;;
+    -o|--options) i=$((i + 1)); [[ ",${args[$i]:-}," =~ ,(remount|bind|rbind|move|loop)[,=] ]] && typed=0 ;;
+    -o*) [[ ",${a#-o}," =~ ,(remount|bind|rbind|move|loop)[,=] ]] && typed=0 ;;
+    --options=*) [[ ",${a#--options=}," =~ ,(remount|bind|rbind|move|loop)[,=] ]] && typed=0 ;;
+    -*) ;;
+    *) pos+=("$a") ;;
+  esac
+  i=$((i + 1))
+done
+if [ "$typed" = 1 ] && [ "${#pos[@]}" = 2 ] && [ -b "${pos[0]}" ]; then
+  # blkid(8)'s low-level probe: exit 2 with nothing printed = no superblock it knows.
+  type=$(blkid -p -s TYPE -o value "${pos[0]}" 2>/dev/null); rc=$?
+  [ "$rc" = 2 ] && [ -z "$type" ] && exec "$real" -t fuse.squeezefs "$@"
+fi
+exec "$real" "$@"

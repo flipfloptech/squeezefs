@@ -3,7 +3,8 @@
 # <device> [squeezefs format flags…]` formats a SET on the ONE device
 # (`setpaths.sh`: dm-linear slices for the metadata volume and two data
 # volumes, all over the device xfstests hands over — its TEST_DEV/SCRATCH_DEV
-# loop, or a dm target the test put over it) with `squeezefs format
+# loop, a dm target the test put over it, or a device of the test's own such
+# as generic/620's 17 TB dm-hugedisk) with `squeezefs format
 # --single-writer`; the write cache is RAM, nothing to format. xfstests'
 # `_scratch_mkfs` runs `yes | mkfs -t fuse.squeezefs -- $SCRATCH_DEV` before
 # every scratch test. Installed as /sbin/mkfs.fuse.squeezefs.

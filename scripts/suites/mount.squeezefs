@@ -8,9 +8,10 @@
 # promotes staged files first, the final checkpoint lands) instead of the
 # bare umount2 that gives a type-fuse mount no DESTROY.
 #
-# <dev> is the set's ONE device (xfstests' TEST_DEV/SCRATCH_DEV loop, or a
-# dm target the test put over it): the helper stands the set's slices over
-# it — the metadata volume, the data volumes, the staging root's ext4
+# <dev> is the set's ONE device (xfstests' TEST_DEV/SCRATCH_DEV loop, a dm
+# target the test put over it, or a device of the test's own — generic/620's
+# 17 TB dm-hugedisk): the helper stands the set's slices over it — the
+# metadata volume and the two data volumes, sized to the device
 # (`setpaths.sh`) — and the daemon mounts the metadata slice. The mount posture is the RELEASE posture
 # (`default_permissions,allow_other`) PLUS the caller's options: `ro`,
 # `noatime`, `nodiratime`, `sync`, `dirsync`, `nosuid`, `nodev`, `noexec`

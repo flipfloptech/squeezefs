@@ -9050,13 +9050,17 @@ test "smoke: THE WRITE-BACK TIMER UNDER A WRITER STORM — the memory bound (dec
     try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
 }
 
-test "smoke: O_TRUNC UNDER NO-OPEN TRUNCATES (decision 0003 §AF: INIT drops FUSE_ATOMIC_O_TRUNC, so the open's truncate is a SETATTR(size 0) under the size setter's guard — with the flag kept, the kernel skips that SETATTR and no OPEN carries it) — every TTL class at 60 s: on A, `: > f` over a non-empty file empties it; B JOINS; A writes `d/a`, B empties it with `: >` (B's SETATTR ships to the holder) ⇒ both read size 0 and no byte; B writes `d/b`, A empties it ⇒ both read 0" {
+/// The O_TRUNC rows' body under one open posture: `: >` empties a striped
+/// and an inline file on one daemon, then across two (A's file emptied by
+/// B, B's by A). Under no-open the truncate is the kernel's SETATTR(size
+/// 0); under served opens the OPEN carries it — on a foreign-slot file
+/// either path is the holder's (decision 0003 §AL.6), shipped.
+fn oTruncRow(no_open: bool) !void {
     const io = testing.io;
-    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
     const gpa = testing.allocator;
     const rig = try Rig.init(gpa, io);
     defer rig.deinit();
-    try pinNoOpen(rig);
+    if (no_open) try pinNoOpen(rig) else try rig.env.put("SQUEEZEFS_FUSE_NO_OPEN", "0");
     try rig.env.put("SQUEEZEFS_MW_BIND", "127.0.0.1:0");
     var t_owner_text: [8]u8 = undefined;
     try rig.env.put("SQUEEZEFS_TEST_MEMBERSHIP_T_OWNER_MS", try std.fmt.bufPrint(&t_owner_text, "{d}", .{smoke_t_owner_ms}));
@@ -9109,10 +9113,28 @@ test "smoke: O_TRUNC UNDER NO-OPEN TRUNCATES (decision 0003 §AF: INIT drops FUS
         defer gpa.free(ta);
         const tb = try b.stats();
         defer gpa.free(tb);
-        std.debug.print("\nsmoke[O_TRUNC no-open]: OPENs answered ENOSYS A {d} / B {d}\n", .{ numberAfter(ta, "\"fuse_open_enosys\":") orelse 0, numberAfter(tb, "\"fuse_open_enosys\":") orelse 0 });
-        try testing.expect((numberAfter(ta, "\"fuse_open_enosys\":") orelse 0) >= 1);
-        try testing.expect((numberAfter(tb, "\"fuse_open_enosys\":") orelse 0) >= 1);
+        const enosys_a = numberAfter(ta, "\"fuse_open_enosys\":") orelse 0;
+        const enosys_b = numberAfter(tb, "\"fuse_open_enosys\":") orelse 0;
+        std.debug.print("\nsmoke[O_TRUNC, no_open={}]: OPENs answered ENOSYS A {d} / B {d}; slot moves unresolved A {d} / B {d}\n", .{ no_open, enosys_a, enosys_b, numberAfter(ta, "\"slot_move_unresolved\":") orelse 0, numberAfter(tb, "\"slot_move_unresolved\":") orelse 0 });
+        if (no_open) {
+            try testing.expect(enosys_a >= 1 and enosys_b >= 1);
+        } else {
+            try testing.expectEqual(@as(u64, 0), enosys_a + enosys_b);
+        }
+        // No truncate met the move gate's deadline on either side.
+        try testing.expectEqual(@as(?u64, 0), numberAfter(ta, "\"slot_move_unresolved\":"));
+        try testing.expectEqual(@as(?u64, 0), numberAfter(tb, "\"slot_move_unresolved\":"));
     }
+}
+
+test "smoke: O_TRUNC UNDER NO-OPEN TRUNCATES (decision 0003 §AF: INIT drops FUSE_ATOMIC_O_TRUNC, so the open's truncate is a SETATTR(size 0) under the size setter's guard — with the flag kept, the kernel skips that SETATTR and no OPEN carries it) — every TTL class at 60 s: on A, `: > f` over a non-empty file empties it; B JOINS; A writes `d/a`, B empties it with `: >` (B's SETATTR ships to the holder) ⇒ both read size 0 and no byte; B writes `d/b`, A empties it ⇒ both read 0" {
+    if (venueMissing(testing.io)) |why| return testkit.skipWhy(@src(), why);
+    try oTruncRow(true);
+}
+
+test "smoke: O_TRUNC UNDER SERVED OPENS TRUNCATES (the control open arm, SQUEEZEFS_FUSE_NO_OPEN=0 — and mainline's default posture, where SQUEEZEFS_FUSE_ZC_OPEN=1 serves opens for zero-copy: INIT keeps FUSE_ATOMIC_O_TRUNC and the OPEN carries the truncate) — the same rows: on A, `: > f` empties a striped and an inline file; B JOINS; B's `: > d/a` over A's file is the holder's truncate (shipped like a SETATTR — never a local commit the move gate re-issues to its 48 s deadline and answers EIO: found live on 7.3), both read 0; A empties B's `d/b` ⇒ both read 0; no OPEN answered ENOSYS, no slot move unresolved" {
+    if (venueMissing(testing.io)) |why| return testkit.skipWhy(@src(), why);
+    try oTruncRow(false);
 }
 
 /// `.stats` opened, fstat'ed and read whole through the same fd: the bytes

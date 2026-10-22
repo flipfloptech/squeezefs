@@ -2754,6 +2754,14 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             if (economy.isDirMode(v.mode)) return error.IsDir;
             // ATOMIC_O_TRUNC: the truncate rides the open (no separate SETATTR).
             if (a.flags & O_TRUNC != 0 and v.mode & S.IFMT == S.IFREG) {
+                // A foreign-slot file's size is its holder's (decision 0003
+                // §AL.6): the SETATTR path's shipped verb. The local commit
+                // below meets the holder's door, and the move gate re-issues
+                // it to its deadline (48 s, then EIO).
+                if (self.foreignSlot(a.ino)) {
+                    _ = try self.setattr(c, .{ .ino = a.ino, .attr = .{ .size = 0, .kill_suidgid = a.open_flags & abi.FUSE_OPEN_KILL_SUIDGID != 0 } });
+                    return .{ .fh = self.mintFh(), .open_flags = self.regularOpenFlags() };
+                }
                 const rec = try self.readLayout(local);
                 const kind = kindOf(rec);
                 self.freeLayout(rec);

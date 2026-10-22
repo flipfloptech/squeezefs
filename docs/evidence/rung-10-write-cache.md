@@ -198,6 +198,33 @@ budget ⇒ a 96 MiB bound in 4 shards, 1,000 × 64 KiB unsynced writes): 828 evi
 108 pressure kicks, 170 inline declines (172 own-block falls), `kill -9`, fsck clean, 1,000
 files byte-exact after the remount — the LRU eviction loses nothing.
 
+**The first gate's five reds** (`~/tmp/costs-wcache.log`; one of them, `umount --lazy`'s 6.9 s,
+was dev's holder census, fixed on dev in `cb76e65`). Two had one cause in the product: the
+budget shed set the core's bound to the target and nothing raised it — one Red tick left the
+write cache at ONE record for the mount's life (TWO MOUNTS OF ONE SET: 200 staged files read 0
+bytes; the WITH row: 1,000 small files in their OWN blocks, 389 MiB above the baseline). The
+gate's daemons read Red at every tick: a smoke daemon's RSS is 2.15 GB against a 2.5 GiB
+fleet-divided budget, and the cage's unreclaimable (sixteen test binaries beside the daemons)
+over 70 % of RAM is near 100 % whatever the census divides by. The law is the read cache's
+now: a shed is ONE drain pass to the authority's target, the bound follows the live budget at
+every tick (`derivedBound` of the knob, never below the ring's floor), and the component has
+the FLOOR the budget's §2.4 provides — `WRITE_CACHE_FLOOR` (64 MiB) stays resident through a
+Red shed (checked by hand under a forced Red + backstop, `~/tmp/lw/floorcheck.sh`: 25 MiB
+under the floor — no shed call, nothing promoted; 119 MiB — two sheds promoted 1,132 records
+down to 63 MiB, the bound intact, 0 refusals, 1,900/1,900 byte-exact). The budget logs its
+level edges with the binding arm. Three rows encoded the cache-less posture: the two-ring kill
+row staged with `conv=fsync` (an fsync IS a promotion: the seam never fired) on a foreground
+mount whose memfd dies with it (now `--daemon --supervise`; `fsck --offline` presents no
+member and leaves the ring to the supervisor, the next mount's dismount destroys the unnamed
+record); THE INTERCEPTION HOST's placed arm needs a STRIPED file at sever-at-dequeue, so with
+block 0 one staged record it engages from block 2; THE DIRECT ARM's read fell inside the
+client's 200 ms refusal backoff now that two 4 MiB writes land in RAM at once. The rig's log
+is O_APPEND (a supervisor's handover line landed after a foreground successor started).
+Re-run on the rebased head (`6a1f2fd`): the rows above in four parallel venue slots (47 + 44 +
+44 + 51 beyond the 39 always-run checks), `zig build costs` (the whole smoke tier as unbalanced
+shards: 59/59 steps, 3,134 passed, 95 skipped, 0 failed; nvmet-smoke 54/54), the tables
+regenerated (112 smoke rows).
+
 **Not verified here**: a full gate (the train's); the kamrui/aarch64 venue; the cache under a
 cgroup cage (the bound's scaling is the core's tie test only); a recall under the two-daemon
 matrix at scale (the RECALL row is one file each way).

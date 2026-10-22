@@ -9872,6 +9872,91 @@ test "smoke: A SYNCFS THAT MEETS A RE-STAGE OF ONE OF ITS RESIDENTS LANDS THE CU
     try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
 }
 
+test "smoke: A SYNCFS THAT MEETS A RESIDENT ITS LAYOUT NO LONGER NAMES OWES IT NOTHING — a 256 KiB staged file (never fsync'd); `truncate -s 0` of it from another process commits the empty layout under the writer's lock and parks on SQUEEZEFS_TEST_RING_RELEASE_HOLD before its ring release (the window after the lock dropped); `sync -f` of the mount from a third CPU meets the record resident and unnamed → exits 0, no error line, fsync_promote_refusals 0, fsync_promote_superseded 1, nothing promoted → released: the truncate returns → kill -9 → fsck --offline clean → remount → the file is empty (red: EIO to `sync -f` and `syncfs: a leg failed (InputOutput)` — 9 lines in one LTP fs run from ftest01–08's truncates against sibling sync() calls, after the re-stage fix)" {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    var fb: [linux.PATH_MAX]u8 = undefined;
+    const fifo = try std.fmt.bufPrintSentinel(&fb, "{s}/release.fifo", .{rig.work}, 0);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.mknodat(linux.AT.FDCWD, fifo.ptr, linux.S.IFIFO | 0o600, 0)));
+    try rig.env.put("SQUEEZEFS_TEST_RING_RELEASE_HOLD", fifo);
+    try rig.env.put("SQUEEZEFS_BLOCK_REFS_VERIFY", "1");
+    try rig.formatSet(true);
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(0);
+    {
+        const st = try rig.stats();
+        defer gpa.free(st);
+        if (numberAfter(st, "\"fuse_syncfs_armed\":") != 1) {
+            try rig.umount();
+            _ = try rig.waitChild();
+            return testkit.skip(@src(), .no_kernel_feature, "FUSE_HAS_SYNCFS not offered — syncfs(2) never reaches a plain /dev/fuse server");
+        }
+    }
+    var released = false;
+    defer if (!released) releaseHold(fifo);
+    var script: [512]u8 = undefined;
+    gpa.free(try rig.shOk(rig.work, try std.fmt.bufPrint(&script, "head -c {d} /dev/urandom > pattern && cp pattern {s}/f", .{ raced_syncfs_bytes, rig.mp })));
+    // The premise: `f` took the staged arm (the ring held the image).
+    {
+        const t = try rig.stats();
+        defer gpa.free(t);
+        std.debug.print("\nsmoke[unnamed sync -f]: after the write: fuse_write_staged {d}, fuse_write_striped {d}, ring-full own-block {d}, staged bytes {d}\n", .{ numberAfter(t, "\"fuse_write_staged\":") orelse 0, numberAfter(t, "\"fuse_write_striped\":") orelse 0, numberAfter(t, "\"fuse_write_staged_ring_full_own_block\":") orelse 0, numberAfter(t, "\"current_staged_write_bytes\":") orelse 0 });
+        try testing.expect((numberAfter(t, "\"fuse_write_staged\":") orelse 0) >= 1);
+        try testing.expect((numberAfter(t, "\"current_staged_write_bytes\":") orelse 0) >= raced_syncfs_bytes);
+    }
+    const mark = try rig.logLen();
+    // The truncate to zero: its tx (the empty inline layout) commits, the
+    // layout lock drops, and the ring release that follows parks on the
+    // seam — the record resident, the layout no longer naming it. Its
+    // worker is parked too: the sync goes through another CPU's queue.
+    var truncator = try std.process.spawn(io, .{ .argv = &.{ "taskset", "-c", "2", "truncate", "-s", "0", try std.fmt.bufPrint(&script, "{s}/f", .{rig.mp}) }, .environ_map = &rig.env, .stdin = .ignore, .stdout = .ignore, .stderr = .inherit });
+    _ = rig.awaitLog("SQUEEZEFS_TEST_RING_RELEASE_HOLD", mark, ready_wait_ns) catch |e| {
+        // The truncate's verdict and the counters name what it did instead.
+        std.debug.print("\nsmoke[unnamed sync -f]: no hold — truncate: {f}\n", .{try truncator.wait(io)});
+        if (try rig.statsTry()) |t| {
+            defer gpa.free(t);
+            std.debug.print("  fuse_truncate_restages {d}, fsync_promoted_files {d}, dismount/evict promotions {d}, staged bytes {d}\n", .{ numberAfter(t, "\"fuse_truncate_restages\":") orelse 0, numberAfter(t, "\"fsync_promoted_files\":") orelse 0, numberAfter(t, "\"write_cache_evict_promotions\":") orelse 0, numberAfter(t, "\"current_staged_write_bytes\":") orelse 0 });
+        }
+        return e;
+    };
+    var sync_script: [256]u8 = undefined;
+    gpa.free(try rig.shOk(rig.work, try std.fmt.bufPrint(&sync_script, "taskset -c 5 sync -f {s}", .{rig.mp})));
+    {
+        const text = try rig.readLog();
+        defer gpa.free(text);
+        const errors = std.mem.count(u8, text[mark..], "error(");
+        if (errors != 0) std.debug.print("\n--- the daemon's error lines during the sync -f ---\n{s}\n", .{text[mark..]});
+        try testing.expectEqual(@as(usize, 0), errors);
+    }
+    // The hold released before any unpinned request (the `.stats` read):
+    // one landing on the parked worker's ring would wait out the kernel's
+    // request timeout.
+    releaseHold(fifo);
+    released = true;
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try truncator.wait(io));
+    {
+        const t = try rig.stats();
+        defer gpa.free(t);
+        std.debug.print("\nsmoke[unnamed sync -f]: fuse_syncfs {d}, fsync_promoted_files {d}, fsync_promote_refusals {d}, fsync_promote_superseded {d}\n", .{ numberAfter(t, "\"fuse_syncfs\":") orelse 0, numberAfter(t, "\"fsync_promoted_files\":") orelse 0, numberAfter(t, "\"fsync_promote_refusals\":") orelse 0, numberAfter(t, "\"fsync_promote_superseded\":") orelse 0 });
+        try testing.expectEqual(@as(?u64, 1), numberAfter(t, "\"fuse_syncfs\":"));
+        try testing.expectEqual(@as(?u64, 0), numberAfter(t, "\"fsync_promote_refusals\":"));
+        try testing.expectEqual(@as(?u64, 1), numberAfter(t, "\"fsync_promote_superseded\":"));
+        try testing.expectEqual(@as(?u64, 0), numberAfter(t, "\"fsync_promoted_files\":"));
+    }
+    try rig.kill();
+    const recovered = try fsckClean(rig, "the kill after the sync -f over an unnamed record");
+    try rig.env.put("SQUEEZEFS_TEST_RING_RELEASE_HOLD", "off");
+    _ = try remountAfterKill(rig, recovered);
+    const size = try rig.onMount("stat -c %s f");
+    defer gpa.free(size);
+    try testing.expectEqualStrings("0", std.mem.trim(u8, size, " \n"));
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+}
+
 test "smoke: FSCK AND SCRUB — format → fill (dirs, 200 packed small files, hard links, three fsync'd 20 MiB files, a clone) → umount → `fsck --offline --scrub` 0 findings over every block → mount, 8-way storm, kill -9 → `fsck --offline` 0 findings → remount, clean umount → a planted stray reference is exactly [C3]+[C8] on its block (exit 1), `--repair` plans, `--repair --apply` releases it, clean → a planted orphan inode is exactly [C9], destroyed on apply, clean → `merge-reports` of two residue shards ≡ the whole run" {
     const io = testing.io;
     if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);

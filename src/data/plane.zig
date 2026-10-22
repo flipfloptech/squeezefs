@@ -506,6 +506,10 @@ pub const DataPlane = struct {
     /// parks on before its locks (null = no hold); `promotion_held` once it did.
     test_promotion_hold: ?[]const u8,
     promotion_held: Atomic(bool) = .init(false),
+    /// `SQUEEZEFS_TEST_RING_RELEASE_HOLD`: the FIFO the mount's first ring
+    /// release off a committed publish parks on (`releaseStaged`).
+    test_release_hold: ?[]const u8,
+    release_held: Atomic(bool) = .init(false),
     /// The token divert's layout face (bound by the daemon once the wire
     /// plane is up; null = a flat mount: every slot local).
     foreign_layout: ?ForeignLayout = null,
@@ -635,7 +639,8 @@ pub const DataPlane = struct {
             .windows = undefined,
             .crossing_kill_after = knobs.intKnob("SQUEEZEFS_TEST_KVMAP_CROSSING_KILL_AFTER", u32, opts.env),
             .test_own_block_poison = knobs.boolKnob("SQUEEZEFS_TEST_OWN_BLOCK_POISON", opts.env),
-            .test_promotion_hold = promotionHoldPath(opts.env),
+            .test_promotion_hold = holdPath(opts.env, "SQUEEZEFS_TEST_PROMOTION_HOLD"),
+            .test_release_hold = holdPath(opts.env, "SQUEEZEFS_TEST_RING_RELEASE_HOLD"),
             .zcrx_registry = zcrx.steering.Registry.init(gpa),
             .publish_scratch = undefined,
         };
@@ -1525,20 +1530,24 @@ pub const DataPlane = struct {
         self.deviceWrite(tag, offset, buf) catch |e| return mapDma(e);
     }
 
-    /// `SQUEEZEFS_TEST_PROMOTION_HOLD`'s FIFO path; `off` (the row's default)
-    /// = no hold.
-    fn promotionHoldPath(env: *const std.process.Environ.Map) ?[]const u8 {
-        const raw = knobs.parseStr(env.get("SQUEEZEFS_TEST_PROMOTION_HOLD")) orelse return null;
+    /// A FIFO-hold seam's path (`SQUEEZEFS_TEST_PROMOTION_HOLD`,
+    /// `SQUEEZEFS_TEST_RING_RELEASE_HOLD`); `off` (the rows' default) = no hold.
+    fn holdPath(env: *const std.process.Environ.Map, comptime key_name: []const u8) ?[]const u8 {
+        const raw = knobs.parseStr(env.get(key_name)) orelse return null;
         return if (std.mem.eql(u8, raw, "off")) null else raw;
     }
 
-    /// `SQUEEZEFS_TEST_PROMOTION_HOLD`: the mount's first promotion parks
-    /// between its census lease and its locks until a writer opens the FIFO
-    /// — the window a newer write of the file re-stages the resident in.
-    fn holdPromotion(io: Io, ino: u64, path: []const u8) void {
-        log.info("promotion of ino {d}: SQUEEZEFS_TEST_PROMOTION_HOLD — the census's record leased; holding before the locks until a writer opens {s}", .{ ino, path });
+    /// The FIFO hold: park until a writer opens `path` (the test's release).
+    /// `SQUEEZEFS_TEST_PROMOTION_HOLD`: the mount's first promotion, between
+    /// its census lease and its locks — the window a newer write of the file
+    /// re-stages the resident in. `SQUEEZEFS_TEST_RING_RELEASE_HOLD`: the
+    /// mount's first ring release off a committed publish, before the
+    /// record leaves — the window a sync point meets a record the layout no
+    /// longer names in.
+    fn holdOnFifo(io: Io, comptime key_name: []const u8, what: []const u8, ino: u64, path: []const u8) void {
+        log.info("{s} of ino {d}: " ++ key_name ++ " — holding until a writer opens {s}", .{ what, ino, path });
         const f = Io.Dir.cwd().openFile(io, path, .{}) catch |e| {
-            log.warn("promotion of ino {d}: the promotion hold could not open {s} ({t}); not holding", .{ ino, path, e });
+            log.warn("{s} of ino {d}: the " ++ key_name ++ " hold could not open {s} ({t}); not holding", .{ what, ino, path, e });
             return;
         };
         f.close(io);
@@ -1981,12 +1990,16 @@ pub const DataPlane = struct {
     pub fn recallResidents(self: *DataPlane, ino: u64) void {
         if (self.stage == null) return;
         const sp = (self.stagedPoint(ino) catch return) orelse return;
-        if (self.promoteStaged(staging.StagingKey.init(sp.file_id, ino))) {
-            stats.recall_promotions.inc();
-        } else if (self.stagedLease(staging.StagingKey.init(sp.file_id, ino))) |l| {
-            l.release();
-            stats.recall_promotion_failures.inc();
-            log.warn("write cache recall: ino {d}'s resident could not be promoted for a foreign reader (see the promotion's own line) — the reader meets zeros", .{ino});
+        switch (self.promoteStaged(staging.StagingKey.init(sp.file_id, ino))) {
+            .promoted => stats.recall_promotions.inc(),
+            // The layout moved away from the record: the reader's page names
+            // what the layout names, nothing of the record's.
+            .unnamed => {},
+            .declined => if (self.stagedLease(staging.StagingKey.init(sp.file_id, ino))) |l| {
+                l.release();
+                stats.recall_promotion_failures.inc();
+                log.warn("write cache recall: ino {d}'s resident could not be promoted for a foreign reader (see the promotion's own line) — the reader meets zeros", .{ino});
+            },
         }
     }
 
@@ -1997,6 +2010,7 @@ pub const DataPlane = struct {
     /// (`staging.Segment.remove`).
     pub fn releaseStaged(self: *DataPlane, key_: staging.StagingKey, generation: ?u64) void {
         const st = &(self.stage orelse return);
+        if (self.test_release_hold) |path| if (!self.release_held.swap(true, .acq_rel)) holdOnFifo(self.io, "SQUEEZEFS_TEST_RING_RELEASE_HOLD", "ring release", key_.ino(), path);
         if (generation) |g| {
             _ = staging.releaseStaged(&st.pool, &st.seg, st.cache, key_, g);
         } else if (st.seg.remove(key_, null)) {
@@ -2059,7 +2073,7 @@ pub const DataPlane = struct {
 
     // ---- the promotion primitive (staging → inline / own block / packed) ----
 
-    fn promoteHook(ctx: ?*anyopaque, k: staging.StagingKey) bool {
+    fn promoteHook(ctx: ?*anyopaque, k: staging.StagingKey) staging.LiveVerdict {
         const self: *DataPlane = @ptrCast(@alignCast(ctx.?));
         return self.promoteStaged(k);
     }
@@ -2075,13 +2089,19 @@ pub const DataPlane = struct {
     /// THEN the (3.7) layout lock (module doc; `PublishLocks.lockPromotion`)
     /// — (still staged, same file id) and the resident promoted is the one
     /// READ under them (`promoteUnder`: a re-stage since the census is the
-    /// newer image, promoted in the older one's stead); true iff the
+    /// newer image, promoted in the older one's stead); `.promoted` iff the
     /// entry left the ring. A displaced durable copy is released after the
-    /// locks drop (RES-1). A record the layout does not name stays: the
-    /// live points run beside the ops (an unlinked-open file reads its
-    /// custody until its FORGET); the dismount pass judges it.
-    pub fn promoteStaged(self: *DataPlane, k: staging.StagingKey) bool {
-        return self.promoteUnder(k, .live) == .promoted;
+    /// locks drop (RES-1). A record the layout does not name STAYS and is
+    /// `.unnamed` (the publish that moved away from it committed under
+    /// (3.7); its ring release follows that lock — `kv_fs.afterCommit` —
+    /// and an unlinked-open file reads its custody until its FORGET): the
+    /// live points owe it nothing; the dismount pass judges it.
+    pub fn promoteStaged(self: *DataPlane, k: staging.StagingKey) staging.LiveVerdict {
+        return switch (self.promoteUnder(k, .live)) {
+            .promoted => .promoted,
+            .unnamed => .unnamed,
+            .kept, .corpse => .declined,
+        };
     }
 
     /// The dismount pass's verdict on one resident (`staging.DismountVerdict`;
@@ -2109,7 +2129,7 @@ pub const DataPlane = struct {
             return .kept;
         };
         const census_generation = lease.generation();
-        if (self.test_promotion_hold) |path| if (!self.promotion_held.swap(true, .acq_rel)) holdPromotion(io, ino, path);
+        if (self.test_promotion_hold) |path| if (!self.promotion_held.swap(true, .acq_rel)) holdOnFifo(io, "SQUEEZEFS_TEST_PROMOTION_HOLD", "promotion", ino, path);
         const locks = self.locks.lockPromotion(io, ino);
         // The resident to promote is the one under the locks: every writer of
         // the ino stages, appends and overwrites under its (3.7), so the
@@ -2141,8 +2161,14 @@ pub const DataPlane = struct {
         const image = lease.bytes();
         const corpse = pass == .dismount and self.inoIsCorpse(ino);
         const out: Promoted = if (corpse) .{ .ok = false } else self.promoteLocked(io, ino, k, generation, image);
-        const verdict: staging.DismountVerdict = if (out.ok) .promoted else if (corpse) .corpse else if (pass == .dismount and out.unnamed and writeback.blockOfKey(k) == null) .unnamed else .kept;
-        if (verdict == .corpse or verdict == .unnamed) {
+        // A spilled block (`writeback.blockKey`) is custody no layout names
+        // by design: judged by its ino alone, never unnamed.
+        const unnamed = out.unnamed and writeback.blockOfKey(k) == null;
+        const verdict: staging.DismountVerdict = if (out.ok) .promoted else if (corpse) .corpse else if (unnamed) .unnamed else .kept;
+        // The dismount pass destroys what nothing names; a live point leaves
+        // an unnamed record to the release already on its way (the
+        // committed publish's `afterCommit`) or to the open file's FORGET.
+        if (pass == .dismount and (verdict == .corpse or verdict == .unnamed)) {
             log.debug("dismount promotion ino {d}: {s} record destroyed ({d} B)", .{ ino, @tagName(verdict), image.len });
             _ = staging.releaseStaged(&st.pool, &st.seg, st.cache, k, generation);
         }

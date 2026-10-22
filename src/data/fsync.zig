@@ -861,6 +861,9 @@ const FsyncWorld = struct {
     promoted: u32 = 0,
     /// The promote hook declines (a resource refusal): the record stays.
     promote_decline: bool = false,
+    /// The hook answers `unnamed`: the layout moved away from the record
+    /// under the writer's lock, its ring release still to come.
+    promote_unnamed: bool = false,
 
     const Event = enum { intent, data_write, data_flush, merge, meta_sync };
 
@@ -892,11 +895,12 @@ const FsyncWorld = struct {
 
     /// The promote hook: the record leaves the ring (the plane's primitive
     /// moved it to a block the data barrier covers).
-    fn promote(ctx: ?*anyopaque, key: staging.StagingKey) bool {
+    fn promote(ctx: ?*anyopaque, key: staging.StagingKey) staging.LiveVerdict {
         const self: *FsyncWorld = @ptrCast(@alignCast(ctx.?));
-        if (self.promote_decline) return false;
+        if (self.promote_decline) return .declined;
+        if (self.promote_unnamed) return .unnamed;
         self.promoted += 1;
-        return self.ring.remove(key, null);
+        return if (self.ring.remove(key, null)) .promoted else .declined;
     }
 
     fn pickA(ctx: ?*anyopaque, _: enospc.Place) ?*block_alloc.BlockAllocator {
@@ -978,7 +982,7 @@ test "the ordering law audit: the lawful sequence passes; a reordered leg (a mer
     try testing.expect(!orderLawHolds(&[_]E{.intent}));
 }
 
-test "the write cache's law (charter §6.1 'Staged', 2026-10-21): fsync PROMOTES the resident before the data barrier — the record leaves the ring, the legs keep the ordering law; a promotion the plane declines is an fsync that cannot be acked: EIO, counted fsync_promote_refusals, the record kept; an ino with no resident owes nothing; syncfs promotes every resident and answers EIO for any kept (red before: the record was 'synced' in place by a ranged sync of a file the write cache does not have)" {
+test "the write cache's law (charter §6.1 'Staged', 2026-10-21): fsync PROMOTES the resident before the data barrier — the record leaves the ring, the legs keep the ordering law; a promotion the plane declines is an fsync that cannot be acked: EIO, counted fsync_promote_refusals, the record kept; an ino with no resident owes nothing; syncfs promotes every resident and answers EIO for any kept (red before: the record was 'synced' in place by a ranged sync of a file the write cache does not have); a resident the layout NO LONGER NAMES (a truncate to zero committed, its ring release still to come) owes the point nothing: fsync and syncfs are acked, the record stays for its release, counted fsync_promote_superseded, never a refusal (red before: EIO per sibling sync() against a truncating writer — LTP ftest01–08, 9 lines in one fs run after the re-stage fix)" {
     const io = testing.io;
     const w = try FsyncWorld.init(testing.allocator);
     defer w.deinit(testing.allocator);
@@ -1023,6 +1027,23 @@ test "the write cache's law (charter §6.1 'Staged', 2026-10-21): fsync PROMOTES
     try testing.expectEqual(refusals0 + 2, stats.fsync_promote_refusals.load());
     w.promote_decline = false;
     try testing.expect(w.ring.remove(key, 5));
+    // Unnamed: the layout moved away from the record (a truncate to zero
+    // committed under the writer's lock; the ring release follows after it
+    // drops) — nothing owed: both points ack, the record stays for that
+    // release, no refusal counted.
+    const superseded0 = staging.stats.fsync_promote_superseded.load();
+    try w.ring.put(key, &payload, 6, 0, 0);
+    w.promote_unnamed = true;
+    var prof4 = Prof.start();
+    try fsync(ctx, io, 5, &prof4);
+    var sprof3 = SyncfsProf.start();
+    try syncfs(w.mkCtx(), testing.allocator, io, &sprof3);
+    w.promote_unnamed = false;
+    try testing.expectEqual(superseded0 + 2, staging.stats.fsync_promote_superseded.load());
+    try testing.expectEqual(refusals0 + 2, stats.fsync_promote_refusals.load());
+    try testing.expectEqual(@as(u32, 3), w.promoted);
+    try testing.expectEqual(@as(?u64, 6), w.ring.residentGeneration(key));
+    try testing.expect(w.ring.remove(key, 6));
 }
 
 test "fsync ladder: a parked partial block escalates to one durable upload, the data barrier covers only the touched namespace, the legs land strictly before the meta publish and the meta barrier last; phases sum exactly; the touched bits clear" {

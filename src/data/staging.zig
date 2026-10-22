@@ -144,7 +144,12 @@ pub const stats = struct {
     pub var dismount_corpse_residents_destroyed: counters.ShardedCounter = .{};
     pub var dismount_unnamed_residents_destroyed: counters.ShardedCounter = .{};
     /// `fsync_promoted_files`: residents the fsync law promoted.
+    /// `fsync_promote_superseded`: a sync point's promotion met a record
+    /// the layout no longer names (a publish away from it committed — a
+    /// truncate to zero, a destroy — its ring release following after the
+    /// writer's lock dropped): superseded bytes, nothing owed to the point.
     pub var fsync_promoted_files: counters.ShardedCounter = .{};
+    pub var fsync_promote_superseded: counters.ShardedCounter = .{};
     /// The in-place overwrite (`Segment.overwriteInPlace`):
     /// `staging_inplace_overwrites` / `staging_inplace_bytes` — writes that
     /// landed in the resident record's own grain (header-first, no new
@@ -167,7 +172,7 @@ pub const stats = struct {
 
 pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
     try w.writeAll("{");
-    inline for (.{ "current_staged_write_bytes", "staged_writes_in_flight", "staging_cell_state_bytes", "staging_tables_bytes", "staging_over_cap_refusals", "staging_ring_full_refusals", "staging_pressure_kicks", "write_cache_evict_promotions", "write_cache_inline_evictions_declined", "write_cache_budget_sheds", "staging_recovery_records", "staging_recovery_torn_records", "staging_generation_discards", "staging_foreign_scope_refusals", "staging_owner_live_refusals", "staged_payload_lost_reads", "dismount_promoted_files", "dismount_promoted_bytes", "dismount_promote_failures", "dismount_corpse_residents_destroyed", "dismount_unnamed_residents_destroyed", "fsync_promoted_files", "staging_dirty_free_bytes", "staging_sweep_runs", "staging_sweep_punched_bytes", "staging_inplace_overwrites", "staging_inplace_bytes", "staging_read_retries", "staging_appends", "staging_append_bytes", "staging_restages", "staging_restage_bytes" }, 0..) |name, i| {
+    inline for (.{ "current_staged_write_bytes", "staged_writes_in_flight", "staging_cell_state_bytes", "staging_tables_bytes", "staging_over_cap_refusals", "staging_ring_full_refusals", "staging_pressure_kicks", "write_cache_evict_promotions", "write_cache_inline_evictions_declined", "write_cache_budget_sheds", "staging_recovery_records", "staging_recovery_torn_records", "staging_generation_discards", "staging_foreign_scope_refusals", "staging_owner_live_refusals", "staged_payload_lost_reads", "dismount_promoted_files", "dismount_promoted_bytes", "dismount_promote_failures", "dismount_corpse_residents_destroyed", "dismount_unnamed_residents_destroyed", "fsync_promoted_files", "fsync_promote_superseded", "staging_dirty_free_bytes", "staging_sweep_runs", "staging_sweep_punched_bytes", "staging_inplace_overwrites", "staging_inplace_bytes", "staging_read_retries", "staging_appends", "staging_append_bytes", "staging_restages", "staging_restage_bytes" }, 0..) |name, i| {
         if (i != 0) try w.writeByte(',');
         try w.print("\"{s}\":{d}", .{ name, @field(stats, name).load() });
     }
@@ -1487,16 +1492,31 @@ pub const DismountVerdict = enum {
     unnamed,
 };
 
+/// A live promotion's verdict on one resident (`PromotionHooks.promote`).
+pub const LiveVerdict = enum {
+    /// Promoted: the entry left the ring onto its durable home.
+    promoted,
+    /// Declined for a resource reason (no volume, the arm refused, a
+    /// commit failed): the entry stays resident; a sync point cannot ack.
+    declined,
+    /// The ino's layout no longer names this record (kind not staged,
+    /// another file id, no layout at all): a publish away from it committed
+    /// under the writer's lock — a truncate to zero, a promotion, a destroy
+    /// — and the ring release follows after that lock drops, so a promotion
+    /// in between meets superseded bytes. Nothing is owed to a sync point
+    /// (the metadata that supersedes them is what the point's meta barrier
+    /// lands); the record stays until its release (an unlinked-open file
+    /// reads its custody until its FORGET; the dismount pass judges what a
+    /// crash left).
+    unnamed,
+};
+
 /// The three promotion points reach the ONE primitive through this seam
 /// (`data/pack.zig`'s prepare → commit); the ring never promotes inline.
 pub const PromotionHooks = struct {
     ctx: ?*anyopaque = null,
-    /// Promote now (fsync, syncfs, the write cache's eviction): true iff
-    /// the entry left the ring. A
-    /// record the layout does not name stays: under a live mount an
-    /// unlinked-open file's custody is still read, and the dismount pass
-    /// judges what a crash left.
-    promote: ?*const fn (ctx: ?*anyopaque, key: StagingKey) bool = null,
+    /// Promote now (fsync, syncfs, the write cache's eviction).
+    promote: ?*const fn (ctx: ?*anyopaque, key: StagingKey) LiveVerdict = null,
     /// The dismount pass: promote, keep, or destroy a corpse's or an
     /// unnamed record (nothing is in flight: the session is closed).
     dismount: ?*const fn (ctx: ?*anyopaque, key: StagingKey) DismountVerdict = null,
@@ -1652,10 +1672,12 @@ pub const PromoteSink = struct {
         const g = self.pool.generationOf(e.key.file_id) orelse return .released;
         if (g != e.generation) return .released;
         const promote = self.hooks.promote orelse return .kept;
-        if (promote(self.hooks.ctx, e.key)) {
+        if (promote(self.hooks.ctx, e.key) == .promoted) {
             stats.write_cache_evict_promotions.inc();
             return .released;
         }
+        // Declined, or unnamed (its release is on its way after the
+        // writer's lock): the pass backs off; the entry leaves on its release.
         return if (self.pool.generationOf(e.key.file_id) == null) .released else .kept;
     }
 };
@@ -1815,8 +1837,10 @@ pub fn promoteAllAtDismount(gpa: Allocator, seg: *Segment, hooks: PromotionHooks
 pub const FsyncPromote = enum {
     /// The resident left the ring for its durable home.
     promoted,
-    /// Nothing resident under the key (promoted already, never staged
-    /// here): nothing owed.
+    /// Nothing owed: nothing resident under the key (promoted already,
+    /// never staged here), or a resident the layout no longer names
+    /// (`LiveVerdict.unnamed`: superseded by a committed publish whose ring
+    /// release is on its way).
     absent,
     /// Resident and NOT promoted (a resource decline, a commit failure):
     /// on the RAM write cache the fsync cannot be acked — EIO.
@@ -1829,9 +1853,12 @@ pub const FsyncPromote = enum {
 pub fn promoteAtFsync(seg: *Segment, hooks: PromotionHooks, key: StagingKey) FsyncPromote {
     if (seg.residentGeneration(key) == null) return .absent;
     const promote = hooks.promote orelse return .kept;
-    if (promote(hooks.ctx, key)) {
-        stats.fsync_promoted_files.inc();
-        return .promoted;
+    switch (promote(hooks.ctx, key)) {
+        .promoted => {
+            stats.fsync_promoted_files.inc();
+            return .promoted;
+        },
+        .unnamed, .declined => {},
     }
     // Gone meanwhile (a pressure promotion raced): nothing owed.
     return if (seg.residentGeneration(key) != null) .kept else .absent;
@@ -2807,15 +2834,16 @@ const Kicks = struct {
         return .{ .ctx = self, .promote = onPromote, .dismount = onDismount };
     }
 
-    fn onPromote(ctx: ?*anyopaque, k: StagingKey) bool {
+    fn onPromote(ctx: ?*anyopaque, k: StagingKey) LiveVerdict {
         const self: *Kicks = @ptrCast(@alignCast(ctx.?));
         if (self.fail_next) {
             self.fail_next = false;
-            return false;
+            return .declined;
         }
+        if (self.unnamed_ino == k.ino()) return .unnamed;
         self.promoted += 1;
         if (self.seg) |s| _ = s.remove(k, null);
-        return true;
+        return .promoted;
     }
 
     fn onDismount(ctx: ?*anyopaque, k: StagingKey) DismountVerdict {
@@ -2824,7 +2852,7 @@ const Kicks = struct {
             if (self.seg) |s| _ = s.remove(k, null);
             return if (self.corpse_ino == k.ino()) .corpse else .unnamed;
         }
-        return if (onPromote(ctx, k)) .promoted else .kept;
+        return if (onPromote(ctx, k) == .promoted) .promoted else .kept;
     }
 };
 
@@ -3106,6 +3134,16 @@ test "the promotion points: the dismount pass judges every resident — promoted
     try testing.expectEqual(p0 + 1, stats.fsync_promoted_files.load());
     try testing.expectEqual(@as(u32, 3), kicks.promoted);
     try testing.expectEqual(FsyncPromote.absent, promoteAtFsync(&r.seg, kicks.hooks(), tkey(1, 1)));
+    // A resident the layout no longer names (`unnamed`): nothing owed —
+    // `absent`, counted superseded, the record left for its release.
+    const s0 = stats.fsync_promote_superseded.load();
+    try r.seg.put(tkey(5, 5), &v, 6, 0, 0);
+    try testing.expectEqual(FsyncPromote.absent, promoteAtFsync(&r.seg, kicks.hooks(), tkey(5, 5)));
+    try testing.expectEqual(s0 + 1, stats.fsync_promote_superseded.load());
+    try testing.expectEqual(p0 + 1, stats.fsync_promoted_files.load());
+    try testing.expectEqual(@as(?u64, 6), r.seg.residentGeneration(tkey(5, 5)));
+    try testing.expectEqual(@as(u64, 0), try promoteAllAtSyncfs(gpa, &r.seg, kicks.hooks()));
+    try testing.expect(r.seg.remove(tkey(5, 5), 6));
 }
 
 test "the in-place overwrite: a write inside ONE grain of a resident record lands in the record's own grain — header-first (the other slot carries the new checksum before the grain moves: a kill between recovers the OLD record, a kill after the NEW), no new slot, no superseded cell, nothing freed, the generation and hash state move on (an append continues from it); a span across two grains and a write past the value decline (the caller re-stages); readers copy a grain whole under a racing writer (never a torn grain) — red before: every rewrite moved the image into a fresh slot" {

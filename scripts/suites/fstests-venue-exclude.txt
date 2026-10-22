@@ -3,7 +3,6 @@
 generic/564  needs `ulimit -f` (RLIMIT_FSIZE) raised: "cannot modify limit: Operation not permitted" in the container
 generic/597  sets the fs.protected_symlinks sysctl: /proc/sys is read-only in the container
 generic/598  sets the fs.protected_regular sysctl: /proc/sys is read-only in the container
-generic/563  cgroup-writeback accounting over a loop device created ON the scratch loop device: the helpers key a set by its backing FILE, a loop over a loop resolves to /dev (harness shape, not a semantic)
 generic/750  writes /proc/sys/vm/compact_memory in its loop: /proc/sys is read-only in the container
 generic/795  writes /proc/sys/vm/drop_caches in its loop: /proc/sys is read-only in the container
 generic/426  exportfs: open_by_handle_at(2) answers EPERM on EVERY handle in the container (CapEff lacks CAP_DAC_READ_SEARCH; the ext4 control fails the same way) — nothing to judge here; see the evidence note's export-handle stance
@@ -16,14 +15,4 @@ generic/394  needs `ulimit -f` raised: "cannot modify limit: Operation not permi
 generic/460  writes /proc/sys/vm/dirty_*ratio: /proc/sys is read-only in the container
 generic/504  `exec {fd}<> file; flock -x $fd` then `grep :$ino /proc/locks`: no row appears for an ext4 file in the container either (control 2026-10-11: rc 0, 0 rows), while python's flock(2) on our mount shows `FLOCK ADVISORY WRITE … 00:27:2` — the shape is the venue's (util-linux flock-by-fd under this container), not a lock semantic
 generic/519  FIBMAP "requires root privileges" inside the container (CAP_SYS_RAWIO absent); `_require_fibmap` passes on the ioctl's presence alone
-generic/108  scsi_debug: the test mounts the filesystem on a scsi_debug disk, a block device with no backing file — the helpers key a set by its metadata image's directory (loop or dm-over-loop); the first pass on a venue WITH scsi_debug (the Omarchy workstation, 2026-10-17) wrote the set's data images into /dev. Harness shape, not a semantic
-generic/349  scsi_debug: as generic/108
-generic/350  scsi_debug: as generic/108
-generic/351  scsi_debug: as generic/108
-generic/704  scsi_debug: as generic/108
-generic/730  scsi_debug: as generic/108
-generic/731  scsi_debug: as generic/108
-generic/767  scsi_debug: as generic/108
-generic/803  scsi_debug: as generic/108
-generic/804  scsi_debug: as generic/108
 generic/650  CPU hotplug stress (offlines and onlines random CPUs under fsstress): on the Omarchy workstation (AMD Strix Halo, 7.2.8) an offlined CPU does not come back — "CPUN failed to report alive state" — so the test left 8 of 32 CPUs offline until a reboot, and every nvme fabrics connect on the host then answered EXDEV (blk-mq hctx mapped to offline CPUs: the gate's nvmet rows). A host hazard for everything else on the venue, never a filesystem semantic

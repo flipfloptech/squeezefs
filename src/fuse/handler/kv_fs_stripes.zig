@@ -505,6 +505,7 @@ const kv_fs = @import("kv_fs.zig");
 const filesystem = @import("filesystem.zig");
 const op_trace = @import("op_trace.zig");
 const abi = @import("../abi.zig");
+const codec = @import("../codec.zig");
 const inos = @import("../../meta/inos.zig");
 const tree = @import("../../meta/tree.zig");
 
@@ -705,6 +706,83 @@ test "a verdict install is all or nothing: an allocation failure caches no part 
     try testing.expect((try st.verdictOf(d)) == .striped);
     try testing.expectEqual(@as(usize, 1), st.migrating.items.len);
     try testing.expectEqual(d, st.migrating.items[0]);
+}
+
+test "two concurrent folds of one striped directory (a stat and a lookup of D on two workers, both past the cadence) persist D's times ONCE: the first claims the cadence slot before its commit, the second sees the claim and skips — one time batch, one stamp writer, D's record carrying the fold" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var store = try kv_fs.MemStore.init(gpa);
+    defer store.deinit();
+    var nodata: kv_fs.NoData = .{};
+    var fs = try kv_fs.MemFs.mount(gpa, io, &store, &nodata, .{ .dlm_stripes = 64 });
+    defer fs.unmount();
+    var plane = try kv_fs.MemFs.XvPlane.init(gpa, io, &store, &fs.locks, 1, 0, 7, OneHome.resolver(), .{}, 16 << 10);
+    defer plane.deinit();
+    try testing.expectEqual(@as(u32, 0), try fs.bindXv(&plane));
+    _ = try fs.bindStripes(64, .{ .fixed = 2 });
+    defer fs.unbindStripes();
+    var tr = op_trace.OpTrace.begin(0, .other);
+    defer tr.finish();
+    var window: [4096]u8 = undefined;
+    var c: filesystem.Ctx = .{ .unique = 1, .uid = 0, .gid = 0, .pid = 1, .io = io, .trace = &tr, .wd_slot = null, .window = &window };
+    const d = (try fs.mkdir(&c, .{ .parent = inos.ROOT_INO, .name = "hot", .mode = 0o755, .umask = 0 })).nodeid;
+    try fs.setxattr(&c, .{ .ino = d, .name = stripe.COMMAND_XATTR, .value = "64", .flags = 0 });
+    // A create into a stripe: the stripe's times pass D's, so every fold
+    // of D is a persist candidate.
+    _ = try fs.create(&c, .{ .parent = d, .name = "f", .mode = 0o644, .flags = 0, .umask = 0, .open_flags = 0 });
+    const before = (try fs.readInodeOpt(try kv_fs.MemFs.localOf(d))).?;
+    const seams = &stripe.test_seams;
+
+    // Fold A (another worker's `stat D`) wins the cadence check and holds
+    // before its persist.
+    const batches0 = stripe.stats.dir_stripe_time_batches.load();
+    seams.arm();
+    const Folder = struct {
+        fs: *kv_fs.MemFs,
+        io: Io,
+        ino: u64,
+        result: Error!filesystem.Attr = error.Unexpected,
+        fn run(self: *@This()) void {
+            var t = op_trace.OpTrace.begin(2, .other);
+            defer t.finish();
+            var ctx: filesystem.Ctx = .{ .unique = 2, .uid = 0, .gid = 0, .pid = 1, .io = self.io, .trace = &t, .wd_slot = null, .window = &.{} };
+            self.result = self.fs.getattr(&ctx, .{ .ino = self.ino, .fh = null });
+        }
+    };
+    var a: Folder = .{ .fs = &fs, .io = io, .ino = d };
+    const th = try std.Thread.spawn(.{}, Folder.run, .{&a});
+    // A failed expectation below must still release A and join it (its
+    // frame is this test's).
+    var joined = false;
+    defer if (!joined) {
+        seams.release(io);
+        th.join();
+    };
+    while (!seams.held()) try std.Thread.yield();
+
+    // Fold B (this worker's `lookup D`) runs to completion inside A's
+    // window: the cadence slot is A's, so B persists nothing.
+    const ent = try fs.lookup(&c, .{ .parent = inos.ROOT_INO, .name = "hot" });
+    const batches_after_b = stripe.stats.dir_stripe_time_batches.load();
+
+    seams.release(io);
+    th.join();
+    joined = true;
+    try testing.expectEqual(d, ent.nodeid);
+    try testing.expectEqual(batches0, batches_after_b);
+    const attr = try a.result;
+    try testing.expectEqual(batches0 + 1, stripe.stats.dir_stripe_time_batches.load());
+    // D's record carries the fold's times once; both folds answered them.
+    const after = (try fs.readInodeOpt(try kv_fs.MemFs.localOf(d))).?;
+    try testing.expect(economy.laterThan(after.mtime, before.mtime));
+    const shown = codec.attrFromInode(d, after, fs.blksize);
+    try testing.expectEqual(shown.mtime, attr.attr.mtime);
+    try testing.expectEqual(shown.mtimensec, attr.attr.mtimensec);
+    try testing.expectEqual(shown.mtime, ent.attr.mtime);
+    try testing.expectEqual(shown.mtimensec, ent.attr.mtimensec);
+    // A third fold within the cadence: fresh stamp, nothing persisted.
+    _ = try fs.getattr(&c, .{ .ino = d, .fh = null });
+    try testing.expectEqual(batches0 + 1, stripe.stats.dir_stripe_time_batches.load());
 }
 
 test "the drain worker's try-only probe never queues behind the verdict cache's lock: a WRITER-held lock answers WouldBlock at once with nobody parked (the lane re-asks); a free lock serves the probe; another reader inside shares it" {

@@ -134,6 +134,38 @@ comptime {
     assert(K_MAX == 64 and MIGRATION_SCAN_PAGE == 512 and CENSUS_DIRS_MAX == 1024);
 }
 
+/// Test seams (one acquire load when unarmed; never a sleep): the NEXT
+/// fold that wins the cadence check holds BEFORE it persists `D`'s times —
+/// the window a second fold of the same directory races over — and the
+/// folds after it run through. The hold parks through the plane's `Io` (a
+/// lane fiber parks, a raw thread waits in the kernel); `release` wakes it.
+pub const TestSeams = struct {
+    /// 0 = unarmed; 1 = armed for the next fold; 2 = that fold is held.
+    hold_before_persist: std.atomic.Value(u32) = .init(0),
+
+    fn holdBeforePersist(s: *TestSeams, io: Io) void {
+        if (s.hold_before_persist.load(.acquire) != 1) return;
+        if (s.hold_before_persist.cmpxchgStrong(1, 2, .acq_rel, .acquire) != null) return;
+        while (s.hold_before_persist.load(.acquire) == 2) io.futexWaitUncancelable(u32, &s.hold_before_persist.raw, 2);
+    }
+
+    pub fn arm(s: *TestSeams) void {
+        s.hold_before_persist.store(1, .release);
+    }
+
+    /// A fold is parked at the seam.
+    pub fn held(s: *const TestSeams) bool {
+        return s.hold_before_persist.load(.acquire) == 2;
+    }
+
+    pub fn release(s: *TestSeams, io: Io) void {
+        s.hold_before_persist.store(0, .release);
+        io.futexWake(u32, &s.hold_before_persist.raw, std.math.maxInt(u32));
+    }
+};
+
+pub var test_seams: TestSeams = .{};
+
 /// The striping width in force: the knob verbatim (1 = OFF), else K_MAX.
 pub fn resolveK(env: *const std.process.Environ.Map) u8 {
     return knobs.optIntKnob("SQUEEZEFS_SYM_DIR_STRIPES", u8, env) orelse K_MAX;
@@ -1198,6 +1230,7 @@ pub fn Striping(comptime Store: type) type {
             if (self.plane.isLocal(map.dir) and (economy.laterThan(folded.mtime, d.mtime) or economy.laterThan(folded.ctime, d.ctime))) {
                 const last = self.persisted.get(map.dir) orelse 0;
                 if (now -| last >= ops.CADENCE_TICK_NS) {
+                    test_seams.holdBeforePersist(self.plane.io);
                     var v = d;
                     v.mtime = folded.mtime;
                     v.ctime = folded.ctime;

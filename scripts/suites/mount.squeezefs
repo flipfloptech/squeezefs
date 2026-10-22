@@ -62,6 +62,17 @@ if [[ "$(basename "$0")" == umount.* ]]; then
   tag=/run/squeezefs-suites/mnt-$(printf '%s' "$target" | md5sum | cut -c1-16)
   if [ "$rc" = 0 ] && [ -f "$tag" ]; then
     SET_ID=$(cat "$tag"); SET_DIR=$(cat "/run/squeezefs-suites/$SET_ID.dir"); suite_slice_paths
+    # A successor of this set on its way up through the same slices holds
+    # the set's lock shared for its whole bring-up (generic/604: the mount
+    # racing this unmount waits out our daemon on the writer lock, then
+    # opens the data volumes — slices removed under it read as foreign);
+    # one already up serves the mountpoint again. Either way the set stays
+    # up and the successor's own umount takes it down.
+    exec 9>"/run/squeezefs-suites/$SET_ID.lock"
+    if ! flock -x -n 9 || findmnt -n -o FSTYPE -M "$target" 2>/dev/null | grep -qx fuse.squeezefs; then
+      echo "$(date +%s) umount $target rc=$rc: set $SET_ID stays up (a successor mount is up or on its way)" >> "$SET_DIR/mounts.log"
+      exit "$rc"
+    fi
     echo "$(date +%s) umount $target rc=$rc: set $SET_ID down" >> "$SET_DIR/mounts.log"
     suite_slices_down 2>>"$SET_DIR/mounts.log"
     rm -f "$tag"
@@ -109,13 +120,20 @@ suite_set_of "$dev"
 log="$SET_DIR/daemon-$(date +%Y%m%d-%H%M%S)-$$.log"
 # One line per mount in the set's own ledger, so a run's daemons are findable.
 echo "$(date +%s) mount $dir -o $all log $log" >> "$SET_DIR/mounts.log"
+# The set's lock, SHARED for the whole bring-up (the umount helper takes it
+# exclusively before it takes the slices down — the predecessor's unmount
+# racing this mount, generic/604). Held on fd 9 by this helper alone: the
+# daemon must not inherit it (`9>&-` below), or the set could never go down.
+mkdir -p /run/squeezefs-suites
+exec 9>"/run/squeezefs-suites/$SET_ID.lock"; flock -s 9
 # The set's slices over the device handed over (re-pointed when they
 # stand: a dm-flakey target now, the loop a moment ago); the umount helper
 # finds the set by the mountpoint's tag. A mount that fails takes them down
-# again (the test's cleanup removes its device).
+# again (the test's cleanup removes its device) — unless another bring-up
+# of the set is in flight.
 suite_slices_up "$dev"
-mkdir -p /run/squeezefs-suites && echo "$SET_ID" > "/run/squeezefs-suites/mnt-$(printf '%s' "$dir" | md5sum | cut -c1-16)"
-mount_failed() { suite_slices_down; rm -f "/run/squeezefs-suites/mnt-$(printf '%s' "$dir" | md5sum | cut -c1-16)"; }
+echo "$SET_ID" > "/run/squeezefs-suites/mnt-$(printf '%s' "$dir" | md5sum | cut -c1-16)"
+mount_failed() { flock -u 9; if flock -x -n 9; then suite_slices_down; fi; rm -f "/run/squeezefs-suites/mnt-$(printf '%s' "$dir" | md5sum | cut -c1-16)"; }
 # The zero-copy kmbuf ring needs order-8 contiguous pages per queue; a
 # fragmented venue (other agents' daemons, a hot page cache) answers
 # ENOMEM. Compact and retry, as `common.sh`'s `suite_mount` does — never a
@@ -130,7 +148,7 @@ while :; do
   # diagnosis and go to stderr.
   # `--supervise`: the release posture's external supervisor (common.sh's
   # `suite_mount` says why) — a death gets its wait status, a wedge its dump.
-  out=$("$SQZ_BIN" mount --daemon --supervise --log-file "$log" -o "$all" "sqmeta://$SLICE_META" "$dir" 2>&1) && exit 0
+  out=$("$SQZ_BIN" mount --daemon --supervise --log-file "$log" -o "$all" "sqmeta://$SLICE_META" "$dir" 2>&1 9>&-) && exit 0
   rc=$?
   if [ "$attempt" -lt 3 ] && grep -q 'ENOMEM (order-8' <<< "$out"; then
     echo "$(date +%s) mount $dir: kmbuf ENOMEM (fragmented venue); compacting memory, retry $attempt/3" >> "$SET_DIR/mounts.log"

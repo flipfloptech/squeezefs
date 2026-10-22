@@ -262,7 +262,11 @@ pub fn run(p: cli.Process, m: args.Mount) u8 {
         p.stderr.print("squeezefs mount: {f}\n", .{udiag}) catch {};
         return cli.exit_usage;
     };
-    // The mountpoint: an existing directory.
+    // The mountpoint: an existing directory. `AT_STATX_DONT_SYNC`: when a
+    // FUSE mount of ours stands there mid-teardown (the previous mount's
+    // unmount racing this one — the guard waits it out, `guard/proc.zig`),
+    // the cached root attrs answer and no request reaches the exiting
+    // daemon (its drains would answer it an error).
     var mp_buf: [linux.PATH_MAX:0]u8 = undefined;
     const mountpoint = std.fmt.bufPrintSentinel(&mp_buf, "{s}", .{m.mountpoint}, 0) catch {
         p.stderr.writeAll("squeezefs mount: the mountpoint path is too long\n") catch {};
@@ -270,7 +274,7 @@ pub fn run(p: cli.Process, m: args.Mount) u8 {
     };
     {
         var st: linux.Statx = undefined;
-        const rc = linux.statx(linux.AT.FDCWD, mountpoint.ptr, 0, .{ .TYPE = true }, &st);
+        const rc = linux.statx(linux.AT.FDCWD, mountpoint.ptr, linux.AT.STATX_DONT_SYNC, .{ .TYPE = true }, &st);
         if (linux.errno(rc) != .SUCCESS) {
             p.stderr.print("squeezefs mount: mountpoint {s}: {t}\n", .{ mountpoint, linux.errno(rc) }) catch {};
             return cli.exit_failed;

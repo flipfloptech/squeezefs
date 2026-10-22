@@ -924,17 +924,25 @@ test "smoke: format → mount → the POSIX pass through the shell → umount �
     try rig.spawnMount(&.{});
     const ready_at = try rig.awaitReady(0);
     try testing.expectEqual(@as(usize, 1), try fuseMountsOf(gpa, io, rig.mp));
-    // A second mount of the same volume is refused by layer A (EBUSY).
+    // A second mount of the same volume beside a LIVE mount is refused by
+    // layer A (EBUSY) AT ONCE — never the orderly-exit wait an exiting
+    // holder gets (`guard/proc.zig`'s law; the bound is half that ceiling,
+    // so a wait would be seen and a loaded venue never is).
     {
         var pb: [128:0]u8 = undefined;
         const mp2 = try std.fmt.bufPrintSentinel(&pb, "{s}-second", .{rig.mp}, 0);
         _ = linux.mkdir(mp2.ptr, 0o755);
         defer _ = linux.rmdir(mp2.ptr);
+        const t0 = clock.monotonicNs();
         const r = try rig.squeezefs(&.{ "mount", rig.meta_uri, mp2 });
         defer rig.freeRun(r);
+        const refused_ns = clock.monotonicNs() - t0;
         try testing.expectEqual(std.process.Child.Term{ .exited = 1 }, r.term);
         try testing.expect(std.mem.indexOf(u8, r.stderr, "single-writer guard") != null);
         try testing.expect(std.mem.indexOf(u8, r.stderr, "BUSY") != null);
+        try testing.expect(std.mem.indexOf(u8, r.stderr, "holds the writer lock") != null);
+        try testing.expect(std.mem.indexOf(u8, r.stderr, "is exiting") == null);
+        try testing.expect(refused_ns < proc.EXITING_HOLDER_WAIT_NS / 2);
     }
     // status while mounted: the guard is held.
     {
@@ -5808,6 +5816,177 @@ test "smoke: --daemon --supervise --log-file: the invoking process returns 0 onl
     try testing.expectEqual(@as(usize, 0), try fuseMountsOf(gpa, io, rig.mp));
     // Nothing of ours survives: no squeezefs process holds the volume.
     try testing.expect(!@import("status.zig").writerGuardHeld(testing.io, rig.img));
+}
+
+/// generic/604's file count, each file 8 KiB: past `inline_max`, so every
+/// one is STAGED (never fsync'd) and the dismount pass is a real promotion
+/// pass — the one the hold parks.
+const raced_umount_files: usize = 501;
+const raced_umount_file_bytes: usize = 8192;
+
+/// One raced cycle of the row below over the rig's current `--daemon
+/// --supervise` mount (`pid_a`): the files, the unmount in the background
+/// with a second mount at once, the second mount's wait judged, the
+/// release, the verdicts; the second daemon's pid. `log_file` is the
+/// rig's append sink for both verbs.
+fn racedUnmountCycle(rig: *Rig, fifo: [:0]const u8, log_file: Io.File, pid_a: linux.pid_t, label: []const u8) !linux.pid_t {
+    const io = rig.io;
+    const gpa = rig.gpa;
+    {
+        var script: [192]u8 = undefined;
+        gpa.free(try rig.shOk(rig.mp, try std.fmt.bufPrint(&script, "for i in $(seq 0 {d}); do printf '%0{d}d' $i > $i; done; echo filled", .{ raced_umount_files - 1, raced_umount_file_bytes })));
+    }
+    var released = false;
+    defer if (!released) releaseHold(fifo);
+    const mark = try rig.logLen();
+    // The unmount in the background and the second mount at once: what
+    // `_scratch_unmount & ; sleep 0.01s ; _scratch_mount` does. B's invoker
+    // returns only at B's ready line (or its refusal).
+    var umounter = try std.process.spawn(io, .{ .argv = &.{ rig.bin, "umount", rig.mp }, .environ_map = &rig.env, .stdin = .ignore, .stdout = .{ .file = log_file }, .stderr = .{ .file = log_file } });
+    var umounter_done = false;
+    defer if (!umounter_done) {
+        _ = umounter.wait(io) catch {};
+    };
+    const t0 = clock.monotonicNs();
+    var mounter = try std.process.spawn(io, .{ .argv = &.{ rig.bin, "mount", "--daemon", "--supervise", "--log-file", rig.log_path, rig.meta_uri, rig.mp }, .environ_map = &rig.env, .stdin = .ignore, .stdout = .{ .file = log_file }, .stderr = .{ .file = log_file } });
+    const mounter_pid = mounter.id.?;
+    var mounter_done = false;
+    defer if (!mounter_done) {
+        _ = linux.kill(mounter_pid, .KILL);
+        _ = mounter.wait(io) catch {};
+    };
+    // A parks in its dismount pass: its mount is off the table, its lock
+    // held, its process alive — the window generic/604 mounts into.
+    _ = try rig.awaitLog("SQUEEZEFS_TEST_PROMOTION_HOLD — holding", mark, ready_wait_ns);
+    // B met the lock and WAITS (its own line names the holder and why) —
+    // or, the red, it refused (or joined the exiting manager) and returned.
+    const waiting_i = blk: {
+        const deadline = clock.monotonicNs() + ready_wait_ns;
+        while (true) {
+            const t = try rig.readLog();
+            defer gpa.free(t);
+            if (std.mem.indexOf(u8, t[mark..], "holds it and is exiting (")) |i| break :blk mark + i;
+            if (!alive(mounter_pid)) {
+                mounter_done = true;
+                const term = try mounter.wait(io);
+                std.debug.print("\n--- {s}: the racing mount returned ({f}) instead of waiting for the exiting holder ---\n{s}\n", .{ label, term, t[mark..] });
+                return error.RacingMountRefused;
+            }
+            if (clock.monotonicNs() >= deadline) {
+                std.debug.print("\n--- {s}: the racing mount neither waited nor returned ---\n{s}\n", .{ label, t[mark..] });
+                return error.Timeout;
+            }
+            sleepMs(20);
+        }
+    };
+    try testing.expect(alive(mounter_pid));
+    try testing.expect(alive(pid_a));
+    try testing.expectEqual(@as(usize, 0), try fuseMountsOf(gpa, io, rig.mp));
+    // Released: A promotes, exits 0; its supervisor replays and lets the
+    // lock go; the umount verb's verdict is the orderly exit.
+    releaseHold(fifo);
+    released = true;
+    umounter_done = true;
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try umounter.wait(io));
+    _ = try rig.awaitLog("clean unmount", mark, exit_wait_ns);
+    mounter_done = true;
+    const term_b = try mounter.wait(io);
+    const waited_ns = clock.monotonicNs() - t0;
+    if (term_b != .exited or term_b.exited != 0) {
+        const t = try rig.readLog();
+        defer gpa.free(t);
+        std.debug.print("\n--- {s}: the racing mount returned ({f}) after the holder's release ---\n{s}\n", .{ label, term_b, t[mark..] });
+    }
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term_b);
+    try testing.expect(waited_ns < proc.EXITING_HOLDER_WAIT_NS);
+    const released_i = try rig.awaitLog("released it after", waiting_i, exit_wait_ns);
+    const ready_b = try rig.awaitLog("ready: ", released_i, ready_wait_ns);
+    _ = try rig.awaitLog("exited (wait status 0x0); done", mark, exit_wait_ns);
+    const after = try rig.readLog();
+    defer gpa.free(after);
+    const pid_b: linux.pid_t = @intCast(numberAfter(after[ready_b..], "(pid ") orelse return error.NoPid);
+    try testing.expect(pid_b != pid_a);
+    // Exactly one daemon of the set alive; the mount is B's, and B is its
+    // MANAGER (never a joiner of the exiting one).
+    try testing.expect(!alive(pid_a));
+    try testing.expect(alive(pid_b));
+    try testing.expectEqual(@as(usize, 1), try fuseMountsOf(gpa, io, rig.mp));
+    try testing.expect(std.mem.indexOf(u8, after[released_i..], "mounted in canonical order as manager") != null);
+    try testing.expect(std.mem.indexOf(u8, after[mark..], "joining as appender") == null);
+    try expectSupervisorSilent(after[mark..]);
+    {
+        var script: [192]u8 = undefined;
+        gpa.free(try rig.shOk(rig.mp, try std.fmt.bufPrint(&script, "for i in $(seq 0 {d}); do printf '%0{d}d' $i | cmp -s - $i; done; echo whole", .{ raced_umount_files - 1, raced_umount_file_bytes })));
+    }
+    // The dismount pass promoted what the hold parked; the mechanism's
+    // engagement gauge on B.
+    try testing.expect(std.mem.indexOf(u8, after[mark..], "dismount promotion: 0 staged") == null);
+    {
+        const st = try rig.stats();
+        defer gpa.free(st);
+        const rounds = numberAfter(st, "\"guard_exiting_holder_waits\":") orelse 0;
+        const why = after[waiting_i..@min(after.len, waiting_i + 240)];
+        std.debug.print("\nsmoke[mount races umount, {s}]: the second mount waited {d} ms behind the exiting holder ({d} round(s)); its first judgement: {s}\n", .{ label, waited_ns / std.time.ns_per_ms, rounds, why[0 .. std.mem.indexOfScalar(u8, why, '\n') orelse why.len] });
+        try testing.expect(rounds >= 1);
+    }
+    return pid_b;
+}
+
+/// The rig's current `--daemon --supervise` mount's daemon pid (its ready line after `from`).
+fn daemonMountReady(rig: *Rig, from: usize) !linux.pid_t {
+    const r = try rig.squeezefs(&.{ "mount", "--daemon", "--supervise", "--log-file", rig.log_path, rig.meta_uri, rig.mp });
+    defer rig.freeRun(r);
+    if (!r.term.success()) std.debug.print("\ndaemon mount: {s}\n", .{r.stderr});
+    try testing.expect(r.term.success());
+    const ready_i = try rig.awaitLog("ready: ", from, ready_wait_ns);
+    const text = try rig.readLog();
+    defer rig.gpa.free(text);
+    const pid: linux.pid_t = @intCast(numberAfter(text[ready_i..], "(pid ") orelse return error.NoPid);
+    _ = try rig.awaitLog("supervisor: watching daemon ", ready_i, ready_wait_ns);
+    return pid;
+}
+
+/// The orderly umount of a `--daemon --supervise` mount and its daemon's exit.
+fn umountDaemon(rig: *Rig, pid: linux.pid_t) !void {
+    try rig.umount();
+    const deadline = clock.monotonicNs() + exit_wait_ns;
+    while (alive(pid) and clock.monotonicNs() < deadline) sleepMs(20);
+    try testing.expect(!alive(pid));
+    try testing.expectEqual(@as(usize, 0), try fuseMountsOf(rig.gpa, rig.io, rig.mp));
+}
+
+test "smoke: A MOUNT THAT RACES THE PREVIOUS UNMOUNT WAITS, THEN SERVES (xfstests generic/604) — a `--daemon --supervise` mount, 501 staged 8 KiB files (never fsync'd) → `squeezefs umount` in the BACKGROUND and a second `--daemon --supervise` mount of the same set at once, the first daemon's dismount pass held on SQUEEZEFS_TEST_PROMOTION_HOLD (its mount already off the table, its writer lock held): the second mount meets the exiting holder's lock and WAITS — its log names the holder and why, it is alive and unmounted while the hold stands, never BUSY → released: the umount exits 0 (`clean unmount`, `exited (wait status 0x0)`), the second mount returns 0 within the orderly-exit ceiling as the set's MANAGER with `guard_exiting_holder_waits` ≥ 1, every file whole, exactly one daemon of the set alive, the supervisors silent → clean umount → `fsck --offline --scrub` 0 findings; the same cycle on a `--single-writer` set (the suites' posture) and on the SYMMETRIC default (where the join door must not be taken against an exiting manager) (red: `another writer holds the single-writer guard … (BUSY, refusal)` at once on the single-writer set — the release run's `-g auto` stopped at generic/604 — and `device I/O failed` from a join of the exiting manager on the symmetric one)" {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    var fb: [linux.PATH_MAX]u8 = undefined;
+    const fifo = try std.fmt.bufPrintSentinel(&fb, "{s}/promotion.fifo", .{rig.work}, 0);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.mknodat(linux.AT.FDCWD, fifo.ptr, linux.S.IFIFO | 0o600, 0)));
+    try rig.env.put("SQUEEZEFS_TEST_PROMOTION_HOLD", fifo);
+    if (rig.log_file == null) rig.log_file = try openLogAppend(rig.log_path);
+    const log_file = rig.log_file.?;
+    // Arm 1: the suites' posture.
+    try rig.formatSetWith(true, &.{"--single-writer"});
+    {
+        const pid_a = try daemonMountReady(rig, 0);
+        const pid_b = try racedUnmountCycle(rig, fifo, log_file, pid_a, "single-writer");
+        try umountDaemon(rig, pid_b);
+    }
+    try rig.env.put("SQUEEZEFS_TEST_PROMOTION_HOLD", "off");
+    _ = try fsckClean(rig, "the raced unmount cycle (single-writer)");
+    // Arm 2: the symmetric default — a fresh set.
+    try rig.env.put("SQUEEZEFS_TEST_PROMOTION_HOLD", fifo);
+    try rig.formatSet(true);
+    {
+        const mark = try rig.logLen();
+        const pid_a = try daemonMountReady(rig, mark);
+        const pid_b = try racedUnmountCycle(rig, fifo, log_file, pid_a, "symmetric");
+        try umountDaemon(rig, pid_b);
+    }
+    try rig.env.put("SQUEEZEFS_TEST_PROMOTION_HOLD", "off");
+    _ = try fsckClean(rig, "the raced unmount cycle (symmetric)");
 }
 
 test "smoke: THE REPLAY PROOF (charter §5.2 the ack point, decision 0003 §BB) — a `--daemon --supervise` mount under the landing-hold seam acks creates whose journal writes are never issued; kill -9 the daemon: the supervisor replays the journal tail to the device, barriers, and only then releases the writer guard; fsck clean; after the remount every acked create is present; the same creates on a FOREGROUND mount (no supervisor) are gone after its kill — the power-cut window; fsck clean" {

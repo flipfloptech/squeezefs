@@ -77,7 +77,8 @@ pub const Outcome = struct {
 };
 
 /// The dedicated door fd: `flock(LOCK_EX | LOCK_NB)`, held until `close`
-/// (udev's block-device locks waited out: `guard.proc.flockExclusive`).
+/// (udev's block-device locks and an exiting mount's hold waited out, a
+/// live mount refused at once: `guard.proc.flockExclusive`).
 fn takeDoor(io: Io, path: []const u8, locker: *?guard.proc.Holder) Error!linux.fd_t {
     var zbuf: [linux.PATH_MAX]u8 = undefined;
     const z = align_probe.pathZ(&zbuf, path) catch return error.DeviceRefused;
@@ -85,7 +86,7 @@ fn takeDoor(io: Io, path: []const u8, locker: *?guard.proc.Holder) Error!linux.f
     if (linux.errno(rc) != .SUCCESS) return error.DeviceRefused;
     const fd: linux.fd_t = @intCast(rc);
     errdefer _ = linux.close(fd);
-    return switch (guard.proc.flockExclusive(io, fd, null, locker)) {
+    return switch (guard.proc.flockExclusive(io, fd, .{}, locker)) {
         .SUCCESS => fd,
         .AGAIN => error.Mounted,
         else => error.DeviceRefused,

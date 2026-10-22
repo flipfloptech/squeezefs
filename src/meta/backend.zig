@@ -10,8 +10,14 @@
 //! 1. The D0 single-writer guard's layer A: `flock(LOCK_EX | LOCK_NB)` on a
 //!    DEDICATED daemon-lifetime fd (never a cache-owned one) — `EWOULDBLOCK`
 //!    refuses `Busy` loud before a byte is read, naming the claim holder
-//!    the probe reads. Layers B1/B2 (PR, the writer claim) are the GATE of
-//!    step 10 (`guard/gate.zig`).
+//!    the probe reads. A holder of this binary that is EXITING (an orderly
+//!    unmount in progress: its process gone with its supervisor's replay
+//!    holding the lock, its mount gone from the table, or its `squeezefs
+//!    umount` in flight) is WAITED OUT up to the orderly-exit ceiling
+//!    (`guard/proc.zig`'s wait law — the kernel's `s_umount` serialization
+//!    a filesystem's mount gets for free; xfstests generic/604); a LIVE
+//!    holder refuses at once. Layers B1/B2 (PR, the writer claim) are the
+//!    GATE of step 10 (`guard/gate.zig`).
 //! 2. The device: registered O_DIRECT (`uring_fs.registerMetaDevice`), the
 //!    io pool, the volume length.
 //! 3. Both superblock copies (DUR-5: a primary that classifies is
@@ -186,6 +192,10 @@ pub const Stats = struct {
     /// Retries of the writer flock behind a holder that is not this binary
     /// (udev's block-device locks — `guard.proc.flockExclusive`).
     guard_shared_lock_waits: counters.ShardedCounter = .{},
+    /// Retries of the writer flock behind an EXITING holder of this binary
+    /// (the previous mount's orderly unmount in progress — the wait law of
+    /// `guard/proc.zig`): the mechanism's engagement gauge.
+    guard_exiting_holder_waits: counters.ShardedCounter = .{},
     mounts: counters.ShardedCounter = .{},
     clean_unmounts: counters.ShardedCounter = .{},
     /// A reader's open left a live foreign lessee's slot un-projected: its
@@ -1697,7 +1707,8 @@ pub const KvBackend = struct {
     }
 
     /// Layer A of the D0 guard: `flock(LOCK_EX | LOCK_NB)` on the dedicated
-    /// fd. `EWOULDBLOCK` answers `Busy` at once, naming the on-volume claim
+    /// fd, an exiting holder of this binary waited out (`guard.proc`'s wait
+    /// law). `EWOULDBLOCK` answers `Busy`, naming the on-volume claim
     /// holder when the probe can read one (B:17770-17774): a loud refusal,
     /// or — under `opts.join_door` — the normal signal that a live manager
     /// holds the volume and this mount joins it (info, never an error).
@@ -1705,7 +1716,7 @@ pub const KvBackend = struct {
         const fd = try openGuardFd(path);
         errdefer _ = linux.close(fd);
         var locker: ?guard.proc.Holder = null;
-        switch (guard.proc.flockExclusive(io, fd, &stats.guard_shared_lock_waits, &locker)) {
+        switch (guard.proc.flockExclusive(io, fd, .{ .shared = &stats.guard_shared_lock_waits, .exiting = &stats.guard_exiting_holder_waits }, &locker)) {
             .SUCCESS => return fd,
             .AGAIN => {
                 if (!opts.join_door) stats.guard_busy_refusals.inc();

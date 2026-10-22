@@ -3,6 +3,38 @@
 //! `/proc/<pid>/stat`, and the `/etc/nvme/{hostnqn,hostid}` defaults —
 //! READ ONLY (quirk Q7: a mount never mints or writes host configuration;
 //! an absent file reads as empty).
+//!
+//! ## Layer A's wait law (`flockExclusive`)
+//!
+//! A mount whose `flock(LOCK_EX | LOCK_NB)` is refused judges the HOLDER
+//! each round, on kernel facts alone (never a request to it: a read of
+//! its `.stats` would be an fd on its mount — a HOLDER to its stop's
+//! census, and EBUSY to its own `umount2`):
+//!
+//! - not this binary (udev's block-device probes): waited out for
+//!   `SHARED_LOCK_WAIT_NS`, then refused (the row below);
+//! - this binary and EXITING — an orderly unmount in progress — waited
+//!   out for `EXITING_HOLDER_WAIT_NS` (the orderly-exit ceiling), then
+//!   refused. Exiting is one of (`Exiting`): the lock's creator pid is
+//!   gone or a zombie while the lock stands (its supervisor's replay
+//!   holds the guard's open file description — charter §5.2 "a
+//!   successor's `flock` waits out the replay"); the pid is alive and
+//!   its mount (its argv's mountpoint) has no FUSE entry in the mount
+//!   table (its own `umount2` landed and the dismount pass runs — or it
+//!   is still bringing up, which resolves to the next case within its
+//!   own bound); the pid is alive and attached, and a `squeezefs umount
+//!   <its mountpoint>` stands in the process table (the orderly stop's
+//!   verb, alive from before its census to the daemon's exit — the
+//!   analogue of the kernel's `s_umount`, which `umount(2)` takes at its
+//!   start and `mount(2)` serializes behind; xfstests generic/604);
+//! - this binary and LIVE (alive, attached, no verb in flight): refused
+//!   AT ONCE — the single-writer law. A holder that is no mount verb (an
+//!   offline verb's door) is live too.
+//!
+//! What this does not see: a holder stopped by a raw `kill -TERM` with
+//! its mount still attached (its census and drains, sub-second) — a mount
+//! racing that window refuses as before; once its mount leaves the table
+//! the wait applies.
 
 const std = @import("std");
 const fuzzkit = @import("../../core/fuzzkit.zig");
@@ -13,7 +45,11 @@ const Io = std.Io;
 const claim = @import("claim.zig");
 const clock = @import("../../core/clock.zig");
 const counters = @import("../../core/counters.zig");
+const log = @import("../../core/log.zig");
 const mountinfo = @import("../../core/mountinfo.zig");
+const tick_law = @import("../../sync/tick.zig");
+const args = @import("../../cli/args.zig");
+const umount_verb = @import("../../cli/umount.zig");
 
 comptime {
     if (builtin.os.tag != .linux) @compileError("guard/proc is Linux only (charter §1.2); gate the import on builtin.os.tag");
@@ -165,27 +201,188 @@ pub const SHARED_LOCK_WAIT_NS: u64 = 5 * std.time.ns_per_s;
 /// within a step of the release.
 pub const SHARED_LOCK_RETRY_MS: i64 = 5;
 
-/// `flock(fd, LOCK_EX | LOCK_NB)` that waits out udev's holders (above):
-/// `.SUCCESS`, `.AGAIN` when this binary holds it exclusively (or another
-/// holder outlasts the bound), or the call's other errno. `waits` counts
-/// each retry a holder caused; `locker` is the exclusive locker last seen
-/// (for the refusal's text, `writeLocker`).
-pub fn flockExclusive(io: Io, fd: linux.fd_t, waits: ?*counters.ShardedCounter, locker: *?Holder) linux.E {
-    const deadline = clock.monotonicNs() + SHARED_LOCK_WAIT_NS;
+/// The orderly-exit ceiling a mount waits out behind an EXITING holder of
+/// this binary (module doc): the umount verb's own bound on the signalled
+/// daemon's exit (`cli/umount.DAEMON_EXIT_WAIT_NS`: the session close's
+/// residency backstop plus one tick for the final checkpoint, the
+/// dismount pass and the lane's trailing barrier) plus two ticks — one
+/// for the verb's pre-signal census and `.stats` read (the wait may begin
+/// before the signal), one for the supervisor's replay after the exit
+/// (the un-landed windows of at most one flush interval; sub-second) —
+/// past it the holder is wedged and the refusal stands.
+pub const EXITING_HOLDER_WAIT_NS: u64 = umount_verb.DAEMON_EXIT_WAIT_NS + 2 * tick_law.tick_ns;
+/// The exiting wait's retry step: the umount verb's own exit-poll quantum
+/// (the smallest a teardown is observed at without spinning); each round
+/// re-judges the holder, so a stop the census refused is seen within one.
+pub const EXITING_RETRY_MS: i64 = 20;
+
+/// The retry counters `flockExclusive` feeds: one per class of holder
+/// waited out (each a mechanism's engagement gauge).
+pub const Waits = struct {
+    /// A holder that is not this binary (udev).
+    shared: ?*counters.ShardedCounter = null,
+    /// An exiting holder of this binary.
+    exiting: ?*counters.ShardedCounter = null,
+};
+
+/// `flock(fd, LOCK_EX | LOCK_NB)` that waits out udev's holders and the
+/// EXITING holders of this binary (module doc): `.SUCCESS`, `.AGAIN` when
+/// a LIVE holder of this binary has it (at once) or a waited-out holder
+/// outlasts its bound, or the call's other errno. `waits` counts each
+/// retry a holder caused; `locker` is the exclusive locker last seen, with
+/// its last judgement (for the refusal's text, `writeLocker`).
+pub fn flockExclusive(io: Io, fd: linux.fd_t, waits: Waits, locker: *?Holder) linux.E {
+    const start = clock.monotonicNs();
     var st: linux.Statx = undefined;
+    // The exiting holder named once per wait (the release line pairs it).
+    var waiting_on: ?linux.pid_t = null;
     while (true) {
         const e = linux.errno(linux.flock(fd, std.posix.LOCK.EX | std.posix.LOCK.NB));
+        if (e == .SUCCESS) {
+            if (waiting_on) |pid| log.info("writer lock: pid {d} released it after {d} ms — proceeding", .{ pid, (clock.monotonicNs() - start) / std.time.ns_per_ms });
+            return e;
+        }
         if (e != .AGAIN) return e;
         if (linux.errno(linux.statx(fd, "", linux.AT.EMPTY_PATH, .{ .INO = true, .MNT_ID = true }, &st)) != .SUCCESS) return .AGAIN;
         // Unreadable `/proc/locks`: the refusal stands.
-        if (lockerOf(&st) catch return .AGAIN) |h| {
+        var h = (lockerOf(&st) catch return .AGAIN) orelse Holder{ .pid = 0, .squeezefs = false };
+        if (h.pid != 0) {
+            h.exiting = judgeExiting(io, h.pid, h.squeezefs);
             locker.* = h;
-            if (h.squeezefs) return .AGAIN;
         }
-        if (clock.monotonicNs() >= deadline) return .AGAIN;
-        if (waits) |w| w.inc();
+        const now = clock.monotonicNs();
+        if (h.exiting) |why| {
+            if (now >= start + EXITING_HOLDER_WAIT_NS) return .AGAIN;
+            if (waiting_on != h.pid) {
+                waiting_on = h.pid;
+                log.info("writer lock: {f} holds it and is exiting ({s}) — waiting for its release (the orderly-exit ceiling, {d} s)", .{ h, why.text(), EXITING_HOLDER_WAIT_NS / std.time.ns_per_s });
+            }
+            if (waits.exiting) |w| w.inc();
+            io.sleep(.fromMilliseconds(EXITING_RETRY_MS), .awake) catch return .AGAIN;
+            continue;
+        }
+        if (h.squeezefs) return .AGAIN;
+        if (now >= start + SHARED_LOCK_WAIT_NS) return .AGAIN;
+        if (waits.shared) |w| w.inc();
         io.sleep(.fromMilliseconds(SHARED_LOCK_RETRY_MS), .awake) catch return .AGAIN;
     }
+}
+
+/// Why a holder of this binary reads as EXITING (module doc).
+pub const Exiting = enum {
+    /// The lock's creator pid is gone or a zombie while the lock stands:
+    /// an inheritor of its open file description holds it — the
+    /// supervisor's replay (charter §5.2).
+    replay,
+    /// Alive, a `squeezefs mount` whose mountpoint has no FUSE entry in
+    /// the mount table: its own `umount2` landed and its dismount pass
+    /// runs (or it is still bringing up).
+    detached,
+    /// Alive and attached, with a `squeezefs umount <mountpoint>` in the
+    /// process table: the orderly stop's verb.
+    umount_in_flight,
+
+    pub fn text(self: Exiting) []const u8 {
+        return switch (self) {
+            .replay => "its process is gone and its supervisor holds the lock through the journal tail's replay",
+            .detached => "its mount has left the mount table and its dismount pass runs",
+            .umount_in_flight => "a `squeezefs umount` of its mountpoint is in flight",
+        };
+    }
+};
+
+/// The one judgement of a locker (module doc): null = not exiting (a LIVE
+/// holder of this binary, or a foreign one). A creator that is gone or a
+/// zombie while its lock stands is the replay whatever its exe read as
+/// (a dead pid's `/proc/<pid>/exe` is unreadable, so `squeezefs` is false
+/// for every dead creator); a live foreign locker is never judged.
+pub fn judgeExiting(io: Io, pid: linux.pid_t, squeezefs: bool) ?Exiting {
+    if (startTicksOf(@intCast(pid)) == null) return .replay;
+    if (!squeezefs) return null;
+    var mp_buf: [linux.PATH_MAX]u8 = undefined;
+    const mountpoint = mountpointOfPid(pid, &mp_buf) orelse return null;
+    if (!fuseAttached(io, mountpoint)) return .detached;
+    return if (umountInFlight(io, mountpoint)) .umount_in_flight else null;
+}
+
+/// Is a FUSE mount attached at exactly `mountpoint` (the mount table, as
+/// the umount verb reads it — never a stat of the path)?
+fn fuseAttached(io: Io, mountpoint: []const u8) bool {
+    var buf: [mountinfo.READ_BYTES]u8 = undefined;
+    const e = mountinfo.entryAt(mountinfo.read(io, &buf), mountpoint) orelse return false;
+    return e.isFuse();
+}
+
+/// The mount verb's argv (NUL-separated, as `/proc/<pid>/cmdline` prints
+/// it) parsed by the CLI's own grammar; a relative mountpoint, a mount
+/// verb's `--help`, another verb: null.
+pub fn mountpointOfCmdline(cmdline: []const u8) ?[]const u8 {
+    const verb = verbOfCmdline(cmdline) orelse return null;
+    return switch (verb) {
+        .mount => |m| if (std.fs.path.isAbsolute(m.mountpoint)) m.mountpoint else null,
+        else => null,
+    };
+}
+
+/// Is `cmdline` the orderly stop's verb for `mountpoint` (`squeezefs
+/// umount [--lazy] <mountpoint>`)?
+pub fn cmdlineUmounts(cmdline: []const u8, mountpoint: []const u8) bool {
+    const verb = verbOfCmdline(cmdline) orelse return false;
+    return switch (verb) {
+        .umount => |u| std.mem.eql(u8, u.mountpoint, mountpoint),
+        else => false,
+    };
+}
+
+fn verbOfCmdline(cmdline: []const u8) ?args.Verb {
+    var argv: [32][]const u8 = undefined;
+    var n: usize = 0;
+    var words = std.mem.splitScalar(u8, cmdline, 0);
+    while (words.next()) |w| {
+        if (w.len == 0) continue;
+        if (n == argv.len) return null;
+        argv[n] = w;
+        n += 1;
+    }
+    var diag: args.Refusal = undefined;
+    return args.parse(argv[0..n], &diag) catch null;
+}
+
+/// Two PATH_MAX paths, the options and the flags fit; a longer argv is
+/// another program's.
+const CMDLINE_CAP: usize = 16 << 10;
+
+/// The mountpoint `pid`'s argv names (a `squeezefs mount` line), copied
+/// into `out`; null when it runs another verb or is unreadable.
+fn mountpointOfPid(pid: linux.pid_t, out: *[linux.PATH_MAX]u8) ?[]const u8 {
+    var pb: [64]u8 = undefined;
+    const path = std.fmt.bufPrintSentinel(&pb, "/proc/{d}/cmdline", .{pid}, 0) catch return null;
+    var buf: [CMDLINE_CAP]u8 = undefined;
+    const text = readSmall(path.ptr, &buf) orelse return null;
+    const mp = mountpointOfCmdline(text) orelse return null;
+    if (mp.len > out.len) return null;
+    @memcpy(out[0..mp.len], mp);
+    return out[0..mp.len];
+}
+
+/// Does a `squeezefs umount <mountpoint>` process stand in the process
+/// table (this process aside)? One `/proc` walk, every cmdline parsed by
+/// the grammar (`cli/umount.daemonByProcess`'s shape).
+pub fn umountInFlight(io: Io, mountpoint: []const u8) bool {
+    var cmdline_buf: [CMDLINE_CAP]u8 = undefined;
+    var proc_dir = Io.Dir.cwd().openDir(io, "/proc", .{ .iterate = true }) catch return false;
+    defer proc_dir.close(io);
+    var it = proc_dir.iterate();
+    while (it.next(io) catch null) |ent| {
+        const pid = std.fmt.parseInt(linux.pid_t, ent.name, 10) catch continue; // a pid directory, decimal
+        if (pid == linux.getpid()) continue;
+        var pb: [64]u8 = undefined;
+        const path = std.fmt.bufPrint(&pb, "/proc/{d}/cmdline", .{pid}) catch continue;
+        // A proc file reports size 0: read into a buffer, never sized by stat.
+        const cmdline = Io.Dir.cwd().readFile(io, path, &cmdline_buf) catch continue;
+        if (cmdlineUmounts(cmdline, mountpoint)) return true;
+    }
+    return false;
 }
 
 /// The locker of an exclusive `flock`, off `/proc/locks`.
@@ -195,6 +392,8 @@ pub const Holder = struct {
     /// whose exe is unreadable (another user's, a pid outside our
     /// namespace) is not — the bound refuses it.
     squeezefs: bool,
+    /// A squeezefs locker's last judgement (`judgeExiting`): null = live.
+    exiting: ?Exiting = null,
 
     /// `pid 1234 (systemd-udevd)`: the comm read now (a refusal's text).
     pub fn format(self: Holder, w: *Io.Writer) Io.Writer.Error!void {
@@ -207,9 +406,10 @@ pub const Holder = struct {
 };
 
 /// The subject of a refusal `flockExclusive` answered `.AGAIN`, naming the
-/// locker it last saw.
+/// locker it last saw and, for an exiting one, the ceiling it outlasted.
 pub fn writeLocker(w: *Io.Writer, locker: ?Holder) Io.Writer.Error!void {
     const h = locker orelse return w.writeAll("another process holds the writer lock");
+    if (h.exiting) |why| return w.print("{f} held the writer lock past the {d} s orderly-exit ceiling while exiting ({s})", .{ h, EXITING_HOLDER_WAIT_NS / std.time.ns_per_s, why.text() });
     if (h.squeezefs) return w.print("another squeezefs process, {f}, holds the writer lock", .{h});
     try w.print("{f}, not a squeezefs process, held the writer lock past the {d} s wait", .{ h, SHARED_LOCK_WAIT_NS / std.time.ns_per_s });
 }
@@ -404,9 +604,12 @@ test "flockExclusive waits out an EXCLUSIVE holder that is not this binary — s
         defer _ = linux.close(own);
         try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.flock(own, std.posix.LOCK.EX | std.posix.LOCK.NB)));
         var locker: ?Holder = null;
-        try testing.expectEqual(linux.E.AGAIN, flockExclusive(testing.io, fd, &waits, &locker));
+        var exiting_waits: counters.ShardedCounter = .{};
+        try testing.expectEqual(linux.E.AGAIN, flockExclusive(testing.io, fd, .{ .shared = &waits, .exiting = &exiting_waits }, &locker));
         try testing.expectEqual(@as(u64, 0), waits.load());
-        try testing.expect(locker != null and locker.?.squeezefs and locker.?.pid == linux.getpid());
+        try testing.expectEqual(@as(u64, 0), exiting_waits.load());
+        // This process runs no mount verb: a live holder, judged so.
+        try testing.expect(locker != null and locker.?.squeezefs and locker.?.pid == linux.getpid() and locker.?.exiting == null);
     }
     // The stand-in for the udev worker: flock(1) holding LOCK_EX until its
     // `cat` reads EOF on our pipe.
@@ -420,7 +623,7 @@ test "flockExclusive waits out an EXCLUSIVE holder that is not this binary — s
     const Opener = struct {
         fn run(f: linux.fd_t, w: *counters.ShardedCounter, out: *linux.E, done: *std.atomic.Value(bool)) void {
             var locker: ?Holder = null;
-            out.* = flockExclusive(testing.io, f, w, &locker);
+            out.* = flockExclusive(testing.io, f, .{ .shared = w }, &locker);
             done.store(true, .release);
         }
     };
@@ -525,7 +728,7 @@ test "an exclusive holder that is not this binary and outlasts the bound: flockE
     var held = false;
     const t = try std.Thread.spawn(.{}, Reader.run, .{ path, &held });
     var locker: ?Holder = null;
-    const e = flockExclusive(testing.io, fd, null, &locker);
+    const e = flockExclusive(testing.io, fd, .{}, &locker);
     t.join();
     try testing.expectEqual(linux.E.AGAIN, e);
     try testing.expect(held);
@@ -541,6 +744,145 @@ test "an exclusive holder that is not this binary and outlasts the bound: flockE
         std.debug.print("\nthe refusal: {s}\n", .{w.buffered()});
         return error.LockerUnnamed;
     }
+}
+
+test "the orderly-exit ceiling is the umount verb's exit bound plus two ticks (the pre-signal census, the replay) and dwarfs udev's wait; the exiting step is the verb's exit-poll quantum; a live foreign locker is never judged exiting" {
+    try testing.expectEqual(umount_verb.DAEMON_EXIT_WAIT_NS + 2 * tick_law.tick_ns, EXITING_HOLDER_WAIT_NS);
+    try testing.expect(EXITING_HOLDER_WAIT_NS > SHARED_LOCK_WAIT_NS);
+    try testing.expectEqual(@as(i64, 20), EXITING_RETRY_MS);
+    try testing.expectEqual(@as(?Exiting, null), judgeExiting(testing.io, linux.getpid(), false));
+    // This process (alive, no mount verb) is a live holder of this binary.
+    try testing.expectEqual(@as(?Exiting, null), judgeExiting(testing.io, linux.getpid(), true));
+}
+
+test "a cmdline is a mount verb's iff the CLI grammar reads it so, and its mountpoint must be absolute; the umount verb's cmdline names its mountpoint through the same grammar (flags in any order); other verbs, garbage and an empty line name nothing" {
+    const daemon_line = "squeezefs\x00mount\x00--daemon\x00--supervise\x00--log-file\x00/var/log/sqz.log\x00-o\x00default_permissions,allow_other\x00sqmeta:///dev/mapper/meta\x00/mnt/scratch\x00";
+    try testing.expectEqualStrings("/mnt/scratch", mountpointOfCmdline(daemon_line).?);
+    try testing.expectEqualStrings("/mnt/a", mountpointOfCmdline("squeezefs\x00mount\x00sqmeta:///x\x00/mnt/a\x00").?);
+    try testing.expect(mountpointOfCmdline("squeezefs\x00mount\x00sqmeta:///x\x00mnt\x00") == null);
+    try testing.expect(mountpointOfCmdline("squeezefs\x00umount\x00/mnt/a\x00") == null);
+    try testing.expect(mountpointOfCmdline("squeezefs\x00fsck\x00--offline\x00sqmeta:///x\x00") == null);
+    try testing.expect(mountpointOfCmdline("bash\x00-c\x00mount\x00") == null);
+    try testing.expect(mountpointOfCmdline("") == null);
+    try testing.expect(mountpointOfCmdline("squeezefs\x00") == null);
+    try testing.expect(cmdlineUmounts("squeezefs\x00umount\x00/mnt/a\x00", "/mnt/a"));
+    try testing.expect(cmdlineUmounts("squeezefs\x00umount\x00--lazy\x00/mnt/a\x00", "/mnt/a"));
+    try testing.expect(cmdlineUmounts("squeezefs\x00umount\x00/mnt/a\x00-l\x00", "/mnt/a"));
+    try testing.expect(!cmdlineUmounts("squeezefs\x00umount\x00/mnt/a\x00", "/mnt/ab"));
+    try testing.expect(!cmdlineUmounts("squeezefs\x00umount\x00/mnt/a\x00", "/mnt"));
+    try testing.expect(!cmdlineUmounts("squeezefs\x00mount\x00sqmeta:///x\x00/mnt/a\x00", "/mnt/a"));
+    try testing.expect(!cmdlineUmounts("umount\x00/mnt/a\x00", "/mnt/a"));
+    try testing.expect(!cmdlineUmounts("", "/mnt/a"));
+}
+
+test "umountInFlight: a process running `squeezefs umount <dir>` (a shell stand-in under that argv) is seen for exactly that directory and for no other; gone once it exits" {
+    _ = linux.mkdir("/build/tmp", 0o755);
+    var db: [64:0]u8 = undefined;
+    const dir = try std.fmt.bufPrintSentinel(&db, "/build/tmp/proc-umount-verb-{d}", .{linux.getpid()}, 0);
+    if (linux.errno(linux.mkdir(dir.ptr, 0o755)) != .SUCCESS) return testkit.skip(@src(), .no_device, "/build/tmp is not writable on this host (the venue's cache volume)");
+    defer Io.Dir.cwd().deleteTree(testing.io, dir) catch {};
+    // The stand-in: `/bin/sh` exec'd under the verb's argv (`squeezefs
+    // umount <dir>`), running the command file `umount` in `dir` (a
+    // shell's command file is its first word), which says ready on stdout
+    // and parks on stdin until EOF.
+    var sp: [96]u8 = undefined;
+    try Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = try std.fmt.bufPrint(&sp, "{s}/umount", .{dir}), .data = "echo ok\nread x\n" });
+    var park: [2]linux.fd_t = undefined;
+    var ready: [2]linux.fd_t = undefined;
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.pipe2(&park, .{ .CLOEXEC = true })));
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.pipe2(&ready, .{ .CLOEXEC = true })));
+    const rc = linux.fork();
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(rc));
+    if (rc == 0) {
+        _ = linux.chdir(dir.ptr);
+        _ = linux.dup2(park[0], 0);
+        _ = linux.dup2(ready[1], 1);
+        const argv = [_:null]?[*:0]const u8{ "squeezefs", "umount", dir.ptr };
+        const envp = [_:null]?[*:0]const u8{};
+        _ = linux.execve("/bin/sh", &argv, &envp);
+        linux.exit(127);
+    }
+    const verb: linux.pid_t = @intCast(rc);
+    _ = linux.close(park[0]);
+    _ = linux.close(ready[1]);
+    var reaped = false;
+    defer if (!reaped) {
+        _ = linux.close(park[1]);
+        var status: i32 = 0;
+        _ = linux.waitpid(verb, &status, 0);
+    };
+    var byte: [3]u8 = undefined;
+    _ = linux.read(ready[0], &byte, 3);
+    _ = linux.close(ready[0]);
+    try testing.expect(umountInFlight(testing.io, dir));
+    try testing.expect(!umountInFlight(testing.io, "/build/tmp/proc-umount-verb-other"));
+    try testing.expect(!umountInFlight(testing.io, "/build/tmp"));
+    // EOF on its stdin ends the verb.
+    _ = linux.close(park[1]);
+    var status: i32 = 0;
+    _ = linux.waitpid(verb, &status, 0);
+    reaped = true;
+    try testing.expect(!umountInFlight(testing.io, dir));
+}
+
+test "the replay hold: a writer lock whose CREATOR has exited while its open file description lives on (the supervisor's hold through the journal tail's replay) is judged `replay` and waited out — flockExclusive counts the exiting waits, names the holder, and succeeds once the description closes; the shared-holder counter stays 0" {
+    var path_buf: [64]u8 = undefined;
+    const path = (try scratch(&path_buf, "replay")) orelse return testkit.skip(@src(), .no_device, "/build/tmp is not writable on this host (the venue's cache volume)");
+    defer _ = linux.unlink(path.ptr);
+    // The description the lock will live on: opened here, so it outlives
+    // the child that takes the lock (the daemon) — this process is the
+    // supervisor's part.
+    const rc_s = linux.open(path.ptr, .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(rc_s));
+    const supervisor_fd: linux.fd_t = @intCast(rc_s);
+    var released = false;
+    defer if (!released) {
+        _ = linux.close(supervisor_fd);
+    };
+    const rc = linux.fork();
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(rc));
+    if (rc == 0) {
+        _ = linux.flock(supervisor_fd, std.posix.LOCK.EX | std.posix.LOCK.NB);
+        linux.exit(0);
+    }
+    const creator: linux.pid_t = @intCast(rc);
+    var status: i32 = 0;
+    _ = linux.waitpid(creator, &status, 0);
+    // The lock stands with a dead creator: `/proc/locks` names its pid,
+    // whose exe is unreadable now (not "squeezefs") — the replay all the same.
+    const seen = exclusiveLocker(path).?;
+    try testing.expectEqual(creator, seen.pid);
+    try testing.expectEqual(@as(?Exiting, .replay), judgeExiting(testing.io, creator, seen.squeezefs));
+    const rc2 = linux.open(path.ptr, .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(rc2));
+    const fd: linux.fd_t = @intCast(rc2);
+    defer _ = linux.close(fd);
+    var shared: counters.ShardedCounter = .{};
+    var exiting: counters.ShardedCounter = .{};
+    const Opener = struct {
+        fn run(f: linux.fd_t, w: Waits, out: *linux.E, holder: *?Holder, done: *std.atomic.Value(bool)) void {
+            out.* = flockExclusive(testing.io, f, w, holder);
+            done.store(true, .release);
+        }
+    };
+    var result: linux.E = .SUCCESS;
+    var locker: ?Holder = null;
+    var done: std.atomic.Value(bool) = .init(false);
+    const t = try std.Thread.spawn(.{}, Opener.run, .{ fd, Waits{ .shared = &shared, .exiting = &exiting }, &result, &locker, &done });
+    // The opener met the dead creator's lock and waits: only then release.
+    while (exiting.load() == 0 and !done.load(.acquire)) try std.Thread.yield();
+    _ = linux.close(supervisor_fd);
+    released = true;
+    t.join();
+    try testing.expectEqual(linux.E.SUCCESS, result);
+    try testing.expect(exiting.load() > 0);
+    try testing.expectEqual(@as(u64, 0), shared.load());
+    try testing.expect(locker != null and locker.?.pid == creator and locker.?.exiting == .replay);
+    // The refusal text an outlasted ceiling would carry names the class.
+    var buf: [256]u8 = undefined;
+    var w: Io.Writer = .fixed(&buf);
+    try writeLocker(&w, locker);
+    try testing.expect(std.mem.indexOf(u8, w.buffered(), "orderly-exit ceiling while exiting (its process is gone") != null);
 }
 
 /// `argv` ran and exited 0 (its output dropped).

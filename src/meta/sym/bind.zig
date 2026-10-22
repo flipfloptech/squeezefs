@@ -209,24 +209,45 @@ pub const AppenderSet = struct {
         self.budget_remaining = region.ringBudgetBytes(be.sb.heap.len) -| (rings_in_use + be.sb.journal.len);
     }
 
+    /// Appender 0's newest valid page image over its four slots (the
+    /// directory pair, the two ring-side), or null on a fresh volume.
+    fn readPage0(be: *backend.KvBackend, gpa: Allocator) backend.OpenError!?page.Page {
+        const offs = page.appender0PageOffsets(be.sb.journal.start);
+        var bufs: [4][page.PAGE_LEN]u8 = undefined;
+        var imgs: [4]?[]const u8 = .{ null, null, null, null };
+        for (offs, 0..) |off, i| {
+            const img = try be.dev.readRange(gpa, off, page.PAGE_LEN);
+            defer gpa.free(img);
+            @memcpy(&bufs[i], img[0..page.PAGE_LEN]);
+            imgs[i] = &bufs[i];
+        }
+        return page.newestValid(imgs) catch {
+            log.err("meta volume {s}: appender 0's page carries a layout this binary does not read — refusing the mount", .{be.path});
+            return error.UnsupportedFormat;
+        };
+    }
+
+    /// The seq offset ring 0's last incarnation ran at, as its page
+    /// recorded it (charter §5.5 "the record-seq space is monotone across
+    /// rings": raised above every departing member's slot floor). The open
+    /// installs it BEFORE the first reservation: the replay window carries
+    /// the offset only in the records stamped since the page's last write
+    /// — none after a clean unmount — and a fresh incarnation stamping
+    /// below the old one's frontier would put its records UNDER the old
+    /// incarnation's in every by-seq fold (a term-2 lease Put outranked by
+    /// the term-1 release's Delete).
+    pub fn page0SeqOffset(be: *backend.KvBackend) backend.OpenError!u64 {
+        const prior = (try readPage0(be, be.gpa)) orelse return 0;
+        return prior.seq_offset;
+    }
+
     /// Region 0 = the fixed ring: the page under THIS identity, Live,
     /// `is_manager`, `term + 1`, `recovered_by_term 0`, into the rotation
     /// (both directory slots first) + barrier.
     fn joinRegion0(self: *AppenderSet) backend.OpenError!void {
         const be = self.be;
         const offs = page.appender0PageOffsets(be.sb.journal.start);
-        var bufs: [4][page.PAGE_LEN]u8 = undefined;
-        var imgs: [4]?[]const u8 = .{ null, null, null, null };
-        for (offs, 0..) |off, i| {
-            const img = try be.dev.readRange(self.gpa, off, page.PAGE_LEN);
-            defer self.gpa.free(img);
-            @memcpy(&bufs[i], img[0..page.PAGE_LEN]);
-            imgs[i] = &bufs[i];
-        }
-        const prior = page.newestValid(imgs) catch {
-            log.err("meta volume {s}: appender 0's page carries a layout this binary does not read — refusing the mount", .{be.path});
-            return error.UnsupportedFormat;
-        };
+        const prior = try readPage0(be, self.gpa);
         var words: page.Page = prior orelse page.Page.free(0, 0, page.SegmentTable.one(.{ .start = be.sb.journal.start, .len = be.sb.journal.len }));
         if (prior) |p| if (p.state == .live) {
             self.page0_at_open = p.identity;

@@ -673,6 +673,14 @@ pub const KvBackend = struct {
         be.reg = try jc.InflightRegistry.init(gpa, recovery.head_pos, conveyor.queueCapacity(geo.pages));
         errdefer be.reg.deinit();
         be.reg.recoverSeqOffset(journal.seqOffsetOfWindow(recovery.entries));
+        // The record-seq space is monotone across this ring's INCARNATIONS
+        // (charter §5.5): the offset the last incarnation ran at lives in
+        // appender 0's page; the window's stamps carry it only for the
+        // records written since the page's last write (none after a clean
+        // unmount). Installed before the first reservation — the guard's
+        // claim, the bring-up cover — so no record of this incarnation
+        // sorts below the old one's.
+        if (sb.symmetricPlaneStamped()) be.reg.recoverSeqOffset(try sym.bind.AppenderSet.page0SeqOffset(be));
         try be.alignRingHead();
 
         // 9. The slot plane (the door from the first commit; the cycle's
@@ -4389,6 +4397,61 @@ test "§AW.4 two windows apply in either order, with the checkpointer's freeze b
     defer be2.close();
     try testing.expectEqual(@as(u64, 5005), try parentMtime(be2));
     for (names) |n| try testing.expect(try dentryPresent(be2, n));
+}
+
+test "the manager's record-seq space is monotone across its INCARNATIONS (charter §5.5 'monotone across rings'): a seq offset raised during a mount (a departing member's slot floor) survives a clean unmount in appender 0's page — the reopen's registry continues at or above the old frontier, so a Put the new incarnation stamps outranks the old incarnation's Put of the same key before and after a freeze and across another reopen (the by-seq fold's premise; the control tree's lease record across terms)" {
+    const gpa = testing.allocator;
+    const v = try TestVol.create(gpa, "seq-offset-remount", "600000");
+    defer v.destroy();
+    var k: [key.INODE_KEY_LEN]u8 = undefined;
+    var frontier0: u64 = 0;
+    var old_value: [record.INODE_VALUE_LEN]u8 = undefined;
+    {
+        const be = try v.open();
+        k = key.inodeKey(try commitCreate(be, "before"));
+        // A member leaves: its slot's floor is far above this ring's
+        // positions and the receiving ring's offset rises above it.
+        const floor: u64 = be.core.headPos() + (64 << 20);
+        _ = be.reg.raiseSeqFloor(&be.core, floor);
+        try testing.expect(be.reg.seqFrontier(&be.core) > floor);
+        // `before`'s inode record re-put under the raised offset.
+        const got = (try be.lookup(gpa, key.TREE_INODES, &k)) orelse return error.TestExpectedLive;
+        defer gpa.free(got);
+        old_value = got[0..record.INODE_VALUE_LEN].*;
+        const t = try be.begin(@src());
+        try t.stagePut(key.TREE_INODES, &k, &old_value);
+        try be.commit(t);
+        frontier0 = be.reg.seqFrontier(&be.core);
+        // The page carries the offset at the cycle; the clean unmount's
+        // own cycle leaves the window empty.
+        try be.checkpointNow();
+        be.close();
+    }
+    var new_value = try record.InodeValue.decode(&old_value);
+    new_value.mtime = 777_777;
+    const new_enc = new_value.encode();
+    {
+        const be = try v.open();
+        try testing.expect(be.reg.seqFrontier(&be.core) >= frontier0);
+        const t = try be.begin(@src());
+        try t.stagePut(key.TREE_INODES, &k, &new_enc);
+        try be.commit(t);
+        const r1 = (try be.lookup(gpa, key.TREE_INODES, &k)) orelse return error.TestExpectedLive;
+        defer gpa.free(r1);
+        try testing.expectEqualSlices(u8, &new_enc, r1);
+        try be.checkpointNow();
+        const r2 = (try be.lookup(gpa, key.TREE_INODES, &k)) orelse return error.TestExpectedLive;
+        defer gpa.free(r2);
+        try testing.expectEqualSlices(u8, &new_enc, r2);
+        be.close();
+    }
+    {
+        const be = try v.open();
+        defer be.close();
+        const r3 = (try be.lookup(gpa, key.TREE_INODES, &k)) orelse return error.TestExpectedLive;
+        defer gpa.free(r3);
+        try testing.expectEqualSlices(u8, &new_enc, r3);
+    }
 }
 
 test "the committer venue (SQUEEZEFS_META_PASS_VENUE=committer): a 4-thread storm with concurrent checkpoints — the election winner runs the pass and the apply on its own thread (the pass never ran on the lane), every ack present, drained ≡ acked, no window left, the reopen replays every acked record" {

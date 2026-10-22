@@ -67,3 +67,67 @@ admission), the §BC storm, the §BB rows green. fsck clean after every session.
   every admission — safe, slower, and the first wave's measurements apply to it.
 - `self` on removals: the venue-pathed reclaim groups hold leaves across the self-appliers; the lever is
   not shippable until the reclaim's destroy batches apply themselves too.
+
+## The train's red (2026-10-22; decision 0003 §BD.7–BD.9)
+
+Gate 73 was green; the train's five `-Dfresh` runs of the landed wave went red twice
+(`.gate-train/local-6a1f2fd402dc-20261021T235455Z.log` 751, 1067; `…T000244Z.log` 1184), so the five
+commits were reverted and re-landed here with the cause fixed.
+
+**The mechanism.** §AW.4: two in-flight windows apply in either order. The checkpointer's freeze between
+the two applies moves the LATER window's record into the base; the EARLIER window's record then lands in
+the overlay BELOW a base record of its key. `lookup`'s cold fold, `gather` and the Δ apply's
+`foldBelowLocked` read overlay-then-base as one newest-first sequence and `foldNewestFirst` asserted it
+(`record.zig:1310`): the applier storm's unit test died there under the gate's load, and THE STRIPED
+DIRECTORY's daemon died the same way (its `mkdir hot/sub` answered ENOTCONN). A silent second shape: a
+straggler's head (the fold up to its own seq) served over a newer base record. Latent since §AW
+(10-20); BD.5 is `self`-only and not on the venue path; BD.4 takes no part in the apply order — the
+gate's saturation reached the interleaving more often, that is all.
+
+**The red tests.** Node level: base `[Δ200, Put10]`, overlay `[Δ300]`, the straggler Δ100 lands and clears
+Δ300's head; the next read gathers `[300, 100, 200, 10]` — the panic, deterministic (shown on 5b4e210); a
+second key where the straggler's head shortcut skips Δ210 and serves ctime 110 for 211. Backend level,
+seam `conveyor.test_seams.hold_next_apply`: W1 held before its apply, W2 (Δtime 2002) applied and
+acked, the parent's leaf frozen by hand (the checkpointer's lock window), W1 (Δtime 1001) lands below —
+5b4e210 answers 1001 for the parent's mtime. The node_cache property test gained stragglers at odd seqs
+below the mint, judged against the by-seq fold after every step.
+
+**The fix** (`fix(meta): a key's records fold by SEQ…`): every walk over a key merges the two seq-sorted
+groups; a head serves only while the base holds nothing newer (`baseAbove`); the previous record's head
+is the Δ's fold start only when no base record lies between (`baseBetweenLocked`); the memo only when the
+whole base group is below. Three counters name the inversion's rate. No record class folds by source.
+
+**What the honest fold found next** (`fix(meta,sym): the manager's record-seq space is monotone across
+its INCARNATIONS`): with the fold by seq, THE `-o ro` READER and TWO MOUNTS OF ONE SET went red at A's
+remount — `alloc_lease: (busy)`, the term-3 lease Put at seq 2907408 under the term-1 release's Delete at
+2944057. The manager's open recovered its seq offset from the replay window alone (empty after a clean
+unmount) and never from appender 0's page, so an offset raised during the mount (a departing member's
+slot floor) was lost and the new incarnation stamped below its old frontier — charter §5.5's "monotone
+across rings" broken across incarnations. The open now takes the page's offset before its first
+reservation. Red: the raised offset survives the reopen (the frontier ≥ the old one), a new Put outranks
+the old before and after a freeze and across another reopen; both rows green.
+
+**Counts.** On `7.2.8-9.33-omarchy-sqz`, the full smoke running beside (load ≈ 24), the fold fix alone:
+the three red tests 100/100; the applier storm test 50/50 on the branch and 50/50 on dev + the fix (the
+counters 0 in every run); THE STRIPED DIRECTORY 10/10; THE DEAD MANAGER 10/10. On
+`7.3.0-1.7-mainline-sqz`, the final tree, the full smoke looped beside: the fold tests 100/100, the
+seq-offset test 100/100 (red on the unfixed open), the applier storm 50/50, THE DEAD MANAGER 30/30, THE
+STRIPED DIRECTORY 168/170 (dev 40/40 beside it) — the two deaths are the hash-map race below, not the
+fold; the whole `zig build test -Dfresh=true` 2871/2982 with 108 skipped and the 3 `fuse.transport.
+session` e2e tests red on dev alike on this kernel (the mainline transport, not the engine); rails 32/32.
+
+**Seen, not fixed.** (0) THE STRIPED DIRECTORY's daemon dies about once in 85 runs under load with
+`std.hash_map` `pointer_stability` tripped (`reached unreachable code` in `getOrPutContextAdapted`) under
+`kv_fs.getattr → foldIfStriped → verdictOf`'s cache insert — two mutators of the stripe verdict cache's
+map at once, though every mutation sits under `kv_fs_stripes.lock` (an `sync.RwLock`); the captured log is
+`~/tmp/cp7b/striped-hashmap-race-daemon.log`. The train's striped-row death had this symptom too (its
+daemon log was not printed); whether it was this or the fold is not established. (1) THE DEAD MANAGER's
+hang on the train was not the inversion: B parked twice —
+the first reclaim admitted (epoch 1), then `T_self reached` again and the second reclaim answered
+`UnknownLease` → POISONED → one cross-owner create parked forever at `[handler_entry]`, the storm child
+unkillable (A's log: `tick — 1 evicted at T_owner`); the renewal missed T_owner (3 s) under the gate's
+load, and a poisoned joined mount holds a parked op instead of answering it EIO. (2) The replay gate
+(`tree.zig`, `.replay`) skips a record whose seq is ≤ the node's newest for the key; a straggler Δ the
+node never saw is dropped at crash replay — an exact-seq gate would keep it. (3) Under the doubled load
+(the full smoke beside four loops) `A MEMBER'S CACHED COPY…` and `THE ORDERED LAW'S KILL ROW` each
+failed once (`~/tmp/cp7b/runs/load-4.log`, `load-6.log`).

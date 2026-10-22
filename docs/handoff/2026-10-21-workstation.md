@@ -82,17 +82,39 @@ next landing on top of it, and its model must include the fold's ordering invari
    row lives under Red (the write cache answers with its floor; the read cache skips judging). Worth
    an owner look at the budget's attribution — the cage's unreclaimable arm (16 test binaries +
    daemons) over 70 % of RAM is ≈ 100 % whatever the census divides by.
-5. **Two more release rows (owner, 2026-10-22), beside LTP and xfstests:** (a) an `mpirun` of mdtest
-   must pass (the perf shape — `mpirun --allow-run-as-root --oversubscribe -np 32`
-   `/opt/sqz-tools/bin/mdtest -n 10000 -u`; pass = 0 errors, fsck clean, tripwires 0, no daemon
-   alert); (b) the parallel `tar -x` the reference's acceptance ensured — its `sym-tarx` gate 2
-   (`~/Source/squeezefs/tests/run_mw_matrix.sh` `leg_sym_tarx`; `tests/cloud_sym_rows.sh`): the linux
-   `fs/` corpus (2,384–2,468 entries) extracted by a JOINED writer into a directory it created,
-   A-B-B-A against the manager's own extract S0; law wall ≤ 1.10× S0, wire verbs/entry < 0.05,
-   slot handovers 0, rpcs 0, fsck clean. Our tree has the single-mount concurrent form
-   (`scripts/bracket/rows/tar-x.sh`) and the contract (`docs/porting/sym_tokens_intents_striping.md`,
-   D1); the two need suite scripts under `scripts/suites/` (`mdtest.sh`, `tarx.sh`: fail early, the
-   ledger discipline of `fstests.sh`) — class C, run in the release window.
+5. **Two more release rows (owner, 2026-10-22), beside LTP and xfstests** — class C suites under
+   `scripts/suites/` (the discipline of `fstests.sh`: the installed binary, fail early at the first
+   unadjudicated check, a ledger `docs/gates/<suite>-exceptions.md` if a failure must be carried,
+   `fsck --offline --scrub` clean after every run, every tripwire judged, "N consecutive clean
+   run(s)"), both in `zig build gate-release`, run in the release window one at a time:
+   - `scripts/suites/mdtest.sh` — `mpirun --allow-run-as-root --oversubscribe -np 32` (then 64)
+     `/opt/sqz-tools/bin/mdtest -n 10000 -u -d <mnt>/mdtest`; pass = exit 0, the header names every
+     rank and item, every phase in the SUMMARY table at a positive rate, the tree empty after, `df`
+     (bytes and inodes) back to its baseline, `invariant_tripwires` 0, the FUSE op watchdog never
+     overdue, fsck clean; the rates go to `rates-run<n>-np<N>.tsv` (evidence, not the law).
+   - `scripts/suites/tarx.sh` — phase 1 the reference's `sym-tarx` gate 2 in our venue: a
+     pristine linux `fs/` (2,452 entries here: `/build/kernel/linux-mainline-v7.3/fs`; `/usr/src/
+     linux-mainline-sqz/fs` is the 143-entry headers tree, not the corpus) tarred once; two mounts
+     of one symmetric set on this host (`suite_mount_pair`: A the manager, B joined over loopback);
+     A-B-B-A arms (S0 on A, B twice into directories IT created, A again); law B's mean wall ≤ 1.10 ×
+     S0, B's wire verbs (`joined_wire_verbs + xv_* + slot_* + dir_stripe_ships + dlm_token_grants +
+     free_shipped_blocks`) per entry < 0.05, `slot_handovers` 0 on both, every tree byte-exact
+     (sha manifest + type/mode/path listing) through BOTH mounts, both daemons healthy, fsck clean
+     after both unmount. Phase 2 the parallel single-mount form: nproc/4 concurrent extractions
+     into fresh directories on one mount, all byte-exact, fsck clean.
+   - **First scoping runs (2026-10-22, `2b9659c` + the scripts, this box on 7.3.0-1.7):**
+     `mdtest.sh` PASSED (np32: file creation 97–100 k/s, removal 95 k/s, directory creation
+     102–104 k/s; np64: 94 k / 91 k / 85 k; `df` back to baseline in 5 s / 10 s; fsck clean).
+     `tarx.sh` phase 2 PASSED (8 extractions in 1.84 s, 10.7 k entries/s aggregate, all byte-exact);
+     phase 1's census is clean (B 0.0003–0.0057 wire verbs/entry, handovers 0, every tree
+     byte-exact through both mounts, tripwires 0, fsck clean) but **the wall law MISSES: B 1.156×
+     S0 at one extraction per arm, 1.137× at three** (A ≈ 0.80 s, B ≈ 0.92 s per 2,452 entries).
+     Localized, not fixed: the joiner's appender ring stays at its 512 KiB floor for the mount's life
+     (`joined_wire_ring_grows` 0, `appender_ring_grows` 0 — the manager had 49 MB of ring budget
+     unspent) against the manager's 16 MiB journal, so B's commits hit `meta_kv_journal_full_stalls`
+     2,268 times in six extractions (A: once), 4,632 checkpoint barriers (A: 171), its pass
+     admission 128 ms vs 10 ms per extraction, twice the metadata device bytes. The row is a
+     release blocker until the ring grows under a sustained commit stream (or the law is re-judged).
 6. The release window (owner's go), the 200 G venue (owner's inventory), the upstream postings
    (owner: Signed-off-by, 5 items), patches 0031–0033 still unmeasured, the smaller owed items of
    the 10-20 note (item 4 there) unchanged.

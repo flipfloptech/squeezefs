@@ -228,7 +228,7 @@ increments total + site and logs one line per site per second (`R:584-610`). The
 
 Closure identities (charter §10; already asserted by the smoke on the SIGUSR1 tail, `P:src/
 cli/smoke.zig:1352-1379`): `admit_write_{overlay,inplace,accumulate,inline}_bytes Σ ≡
-transport_zc_write_{extract,direct}_bytes + fuse_truncate_zero_tail_bytes + write_gap_zero_bytes`;
+transport_zc_write_{extract,direct}_bytes + write_gap_zero_bytes`;
 `read_user_bytes ≡ read_copy_dest_bytes + read_copy_bounce_bytes + read_dest_dma_bytes +
 read_zc_serve_bytes + read_zc_pool_serve_bytes`; `terminal_frees ≡ block_free_reclaim_queued
 + block_free_reclaim_elided`; `unpublished_mint_abandons ≤

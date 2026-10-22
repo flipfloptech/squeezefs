@@ -1365,8 +1365,9 @@ pub const DataPlane = struct {
     /// queue-thread gates (the W1 hold gate, the shared-mode probe) read
     /// it. It is the ONE publisher of the size: the plane's own map merges
     /// know the layout's data-reach floor, which can exceed the inode's
-    /// size (a shrink's zero tail), and a shape above the inode admits a
-    /// Shared write that extends the file under a shared guard — two such
+    /// size (a block landed whole under a sub-block EOF), and a shape
+    /// above the inode admits a Shared write that extends the file under
+    /// a shared guard — two such
     /// writes race their size Δs (field overwrite, not max) and the file
     /// ends shorter than its last write.
     pub const ClaimSource = struct {
@@ -3106,9 +3107,9 @@ pub const DataPlane = struct {
         stats.layout_map_merge_blocks.add(req.inserts.len);
         // The shape is NOT published here (fstests generic/013: `write_
         // shared_class_violation` ×60 per round): `size` is the layout's
-        // data-reach floor — the striped shrink's zero tail lands bytes
-        // past the new EOF and its upload's `min_size` is the old reach —
-        // never the inode's size the shared-mode classifier admits on.
+        // data-reach floor — an upload's `min_size` is its block's reach,
+        // past a sub-block EOF — never the inode's size the shared-mode
+        // classifier admits on.
         // The filesystem publishes the inode's size at its postlude.
         return out;
     }

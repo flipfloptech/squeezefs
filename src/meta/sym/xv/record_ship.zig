@@ -173,9 +173,9 @@ pub const Reply = struct {
 
 /// The holder's truncate face (decision 0003 §AL.6): a shipped size change
 /// runs the filesystem's own size path at the holder — the custody settle,
-/// the map clip and the shrink's zero tail, a grow's extension zeros landed
-/// before the size — never the size alone (a shrink left the bytes past the
-/// new EOF to read back after a grow; a grow exposed the EOF block's tail).
+/// the map clip, a grow's extension zeros landed before the size — never
+/// the size alone (a grow applied to the inode alone exposed the EOF
+/// block's tail).
 pub const TruncateFace = struct {
     ctx: *anyopaque,
     truncate: *const fn (ctx: *anyopaque, global: u64, size: u64) errors.Error!void,

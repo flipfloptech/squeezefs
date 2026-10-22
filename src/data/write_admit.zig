@@ -177,7 +177,7 @@ pub const stats = struct {
     /// `write_gap_zero_bytes`: the zeros the extension law admitted
     /// (`WritePath.zeroExtension`, decision 0003 §AL) — bytes the
     /// filesystem itself wrote, so the admission ledger ≡ WRITE payload
-    /// bytes + the truncate's zero tails + these.
+    /// bytes + these.
     pub var write_gap_zero_bytes: counters.ShardedCounter = .{};
     pub var write_shared_class_violation: counters.Tripwire = .init("write_shared_class_violation");
     /// The gate's cold flushes failed for a whole wall while fresh supply
@@ -2464,6 +2464,60 @@ test "decision 0003 §AL — a truncate-up past a recycled tail reads zeros: `ze
     try w.wp.zeroExtension(io, 80, World.striped(wt.BS), 3 * wt.BS);
     try testing.expectEqual(@as(u64, 6 * PAGE + 1 - 100), stats.write_gap_zero_bytes.load() - z0);
     try testing.expect(!w.wp.table.has(81, 0));
+}
+
+test "decision 0003 §AL.7 — a shrink's leftover is the extension law's: a block full of the file's OWN bytes whose size was clipped to mid-block with NO write (the shrink writes nothing) reads zeros past the clip on the next grow, whatever grows it — a truncate-up (`zeroExtension`), a write past EOF (the gap), an append at EOF followed by a grow (the bytes, then zeros) — live and on the device; nothing was owed at the shrink" {
+    const io = testing.io;
+    const w = try World.init(testing.allocator, .sync_inline, false);
+    defer w.deinit(testing.allocator);
+    var got: [wt.BS]u8 = undefined;
+    var own: [wt.BS]u8 = undefined;
+    fill(&own, 0x51);
+    const Grow = enum { truncate_up, write_past_eof, append_then_grow };
+    for ([_]Grow{ .truncate_up, .write_past_eof, .append_then_grow }, 90..) |grow, ino| {
+        // The file's own bytes fill the block; the shrink clips the size to
+        // 100 and writes nothing.
+        const b = try w.f.publishBlock(ino, 0, 0x51);
+        try w.f.dev.seam().vtable.write(&w.f.dev, b.vol_tag, b.offset, &own);
+        const clip: u64 = 100;
+        w.f.map.files.getPtr(ino).?.size = clip;
+        const z0 = stats.write_gap_zero_bytes.load();
+        var payload: [PAGE]u8 = undefined;
+        fill(&payload, 0x77);
+        var eof: u64 = clip;
+        var gap_end: u64 = undefined;
+        switch (grow) {
+            .truncate_up => {
+                gap_end = 6 * PAGE + 1;
+                try w.wp.zeroExtension(io, ino, World.striped(clip), gap_end);
+            },
+            .write_past_eof => {
+                gap_end = 5 * PAGE + 3;
+                _ = try w.wp.write(io, .{ .ino = ino, .offset = gap_end, .payload = .{ .bytes = &payload }, .class = .entire_op, .file = World.striped(clip) });
+            },
+            .append_then_grow => {
+                // The append continues the file; its own bytes beyond stay
+                // past EOF, and the grow zeroes from the NEW EOF.
+                _ = try w.wp.write(io, .{ .ino = ino, .offset = clip, .payload = .{ .bytes = payload[0..50] }, .class = .entire_op, .file = World.striped(clip) });
+                eof = clip + 50;
+                w.f.map.files.getPtr(ino).?.size = eof;
+                gap_end = 4 * PAGE;
+                try w.wp.zeroExtension(io, ino, World.striped(eof), gap_end);
+            },
+        }
+        try testing.expectEqual(gap_end - eof, stats.write_gap_zero_bytes.load() - z0);
+        for ([_]bool{ false, true }) |drained| {
+            if (drained) {
+                w.wp.flushIno(io, ino);
+                w.wp.quiesce(io);
+            }
+            try readBlockNow(w, io, ino, 0, &got);
+            try testing.expectEqualSlices(u8, own[0..clip], got[0..clip]);
+            if (grow == .append_then_grow) try testing.expectEqualSlices(u8, payload[0..50], got[clip..eof]);
+            try expectZeros(if (drained) "the grown range on the device" else "the grown range through the write side's view", got[@intCast(eof)..@intCast(gap_end)], eof);
+            if (grow == .write_past_eof) try testing.expectEqualSlices(u8, &payload, got[@intCast(gap_end)..][0..PAGE]);
+        }
+    }
 }
 
 test "the D3 fold seam (defrag --fold): `foldTargets` names the inos holding parked W2 extents (ascending, deduped — a full-buffer park is not a target), `foldParked` kicks each through the EXISTING fold — sole-owner passthrough blocks land in place at the page grain and retire, device ÷ user ≤ the §J in-place bound, the bindings unchanged, bytes exact; nothing left parked as an extent; a second census is empty" {

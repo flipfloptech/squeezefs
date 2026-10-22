@@ -20,8 +20,8 @@
 //! one block when the set declares cache paths; else `striped`, promoting
 //! the resident payload DURABLY to its own block BEFORE the type flip), the
 //! truncate per kind (passthrough shrink of a packed tenant = the mapping
-//! clip; a striped shrink clips the map and zero-completes the kept tail
-//! so a later grow reads zeros), the destroy rider (`−ref` records ride the
+//! clip; a striped shrink clips the map — the kept tail is the extension
+//! law's, written as zeros by the next grow), the destroy rider (`−ref` records ride the
 //! corpse's destroy entry, every freed block through the reclaimer AFTER
 //! the commit) — and the data plane supplies the block-level acts behind
 //! them (the striped admission per piece, the reads, the own-block DMA,
@@ -156,9 +156,9 @@ pub const STATFS_BSIZE: u32 = 4096;
 /// `f_ffree`: inos are a monotone 64-bit watermark, never reused; the
 /// report is the remaining watermark space (an over-report, never under).
 pub const INO_SPACE: u64 = 1 << 56;
-/// A truncate's zero-complete of the kept partial block and a corpse's
-/// binding gather bound the on-stack work: the inline map's deepest cap
-/// at the 256 KiB node (`(64 KiB − framing) / 48`) is 1,364 entries.
+/// A truncate's map clip and a corpse's binding gather bound the on-stack
+/// work: the inline map's deepest cap at the 256 KiB node (`(64 KiB −
+/// framing) / 48`) is 1,364 entries.
 pub const MAX_BINDINGS_PER_INO: usize = 1400;
 
 /// `renameat2(2)` flags (uapi `linux/fs.h`; `std.os.linux` carries none).
@@ -261,14 +261,11 @@ pub var fuse_write_promotions_to_striped: counters.ShardedCounter = .{};
 /// the set's capacity (rung 9: the fsstress 20-writer burst).
 pub var fuse_write_staged_ring_full_own_block: counters.ShardedCounter = .{};
 /// Truncates by arm: the packed passthrough clip (zero device writes),
-/// the striped map clip (+ the kept tail's zero-complete), the re-stage.
+/// the striped map clip (zero device writes: the kept tail is the
+/// extension law's, decision 0003 §AL.1), the re-stage.
 pub var fuse_truncate_packed_clips: counters.ShardedCounter = .{};
 pub var fuse_truncate_striped_clips: counters.ShardedCounter = .{};
 pub var fuse_truncate_restages: counters.ShardedCounter = .{};
-/// The kept partial block's zero-complete after a striped shrink: bytes the
-/// filesystem itself admitted (the admission ledger ≡ WRITE payload bytes +
-/// these).
-pub var fuse_truncate_zero_tail_bytes: counters.ShardedCounter = .{};
 /// `fuse_killpriv_clears`: KILLPRIV_V2 strips folded into a commit.
 pub var fuse_killpriv_clears: counters.ShardedCounter = .{};
 /// `fuse_killpriv_negotiated`: 0/1 from the INIT reply.
@@ -1568,9 +1565,18 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                         return;
                     }
                     // Blocks at or past the new end leave the map (their
-                    // `−ref` rides this tx); the kept partial block is
-                    // zero-completed AFTER the commit through the write
-                    // path, so a later grow or gap write reads zeros.
+                    // `−ref` rides this tx). The kept partial block's bytes
+                    // past the new end are NOT written here: a mapped EOF
+                    // block's tail is never the file's, and every grow
+                    // lands [EOF, min(new end, block end)) as the write
+                    // path's zeros first (`DataPlane.zeroExtension`,
+                    // decision 0003 §AL.1) — so a shrink has no write that
+                    // can fail (ENOSPC on a full set, EIO under a failing
+                    // device) and nothing owed beyond the law every grow
+                    // already pays. (Until 2026-10-22 the shrink wrote the
+                    // tail's zeros itself after the commit and logged an
+                    // error per refused write: generic/475 under dm-error,
+                    // 1,549 lines for zeros the next grow wrote again.)
                     const bs = self.block_size;
                     const keep_blocks: u64 = (size + bs - 1) / bs;
                     var kept: std.ArrayList(layout.MapEntryWire) = .empty;
@@ -1586,25 +1592,6 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                     fuse_truncate_striped_clips.inc();
                 },
             }
-        }
-
-        /// The striped shrink's tail: zeros over `[size, min(block_end,
-        /// old_size))` of the kept partial block through the write path
-        /// (one sub-block write; it seeds from the mapped block and lands
-        /// with the file's custody).
-        fn zeroTailAfterShrink(self: *Self, ino: u64, size: u64, old_size: u64) void {
-            const bs = self.block_size;
-            if (size == 0 or size % bs == 0 or size >= old_size) return;
-            const block_end = (size / bs + 1) * bs;
-            const end = @min(block_end, old_size);
-            const zeros = self.gpa.alloc(u8, @intCast(end - size)) catch return;
-            defer self.gpa.free(zeros);
-            @memset(zeros, 0);
-            _ = self.data.write(self.io, ino, size, .{ .bytes = zeros }, .entire_op, .{ .kind = .striped, .size = size, .map_resident = true }, null) catch |e| {
-                log.err("kv_fs: ino {d}: the truncate's tail zero-complete failed ({s}) — bytes past the new end may read back after a grow", .{ ino, @errorName(e) });
-                return;
-            };
-            fuse_truncate_zero_tail_bytes.add(zeros.len);
         }
 
         // ---- the ops ----
@@ -2189,7 +2176,6 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             } else if (clip) |cl| _ = self.pending.retireIfStill(local, cl.after);
             if (a.attr.size) |sz| {
                 self.afterCommit(&after);
-                if (kind == .striped and sz < old_size) self.zeroTailAfterShrink(local, sz, old_size);
                 self.data.noteShape(local, sz, if (kind == .striped) .striped else .inline_);
             }
             return self.attrReply(a.ino, out.value);
@@ -3516,8 +3502,8 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
 
         /// The holder's truncate face (decision 0003 §AL.6): a non-holder's
         /// shipped size change runs THIS filesystem's size path — the
-        /// settle, the clip, the zero tail, the extension zeros — on the
-        /// wire service's own op context.
+        /// settle, the clip, the extension zeros — on the wire service's
+        /// own op context.
         pub fn servedTruncateFace(self: *Self) sym_xv.record_ship.TruncateFace {
             return .{ .ctx = self, .truncate = &servedTruncate };
         }
@@ -4813,6 +4799,9 @@ const SettlingData = struct {
     /// The last extension law asked of the plane (`zeroExtension`) and
     /// the custody flushes that had run before it.
     extension: ?struct { old_size: u64, new_size: u64, flushes_before: u32 } = null,
+    /// The plane can land no byte: every striped `write` answers this (a
+    /// full set's ENOSPC, a failing device's EIO), recorded nowhere.
+    write_refuse: ?write_admit.Error = null,
     /// The write-back custody a test arms (`hasWriteCustody`) and the
     /// RELEASE-class drains that landed it (`releaseIno`).
     custody_of: ?u64 = null,
@@ -5016,11 +5005,13 @@ const SettlingData = struct {
     /// The striped data write: recorded, every byte acked, the landing
     /// stamped with the ino's size epoch as the plane's is.
     pub fn write(self: *SettlingData, _: Io, ino: u64, offset: u64, payload: write_admit.Payload, _: op_guard.Class, view: seams.FileView, _: ?write_admit.ParkHook) write_admit.Error!write_admit.Outcome {
+        if (self.write_refuse) |e| return e;
         const n = payload.len();
         self.writes.append(testing.allocator, .{ .offset = offset, .len = n, .view_size = view.size }) catch return error.OutOfMemory;
         return .{ .written = n, .size_claim = offset + n, .size_epoch = self.epochsOf().current(ino), .pieces = 1 };
     }
     pub fn zeroExtension(self: *SettlingData, _: Io, _: u64, old_size: u64, new_size: u64) write_admit.Error!void {
+        if (self.write_refuse) |e| return e; // the plane's zeros go through its write
         self.extension = .{ .old_size = old_size, .new_size = new_size, .flushes_before = self.flushes };
     }
     pub fn read(_: *SettlingData, _: Io, _: u64, _: u64, _: []u8, _: bool, _: bool) Error!usize {
@@ -5676,6 +5667,46 @@ test "decision 0003 §AL — a striped truncate-up asks the plane for the extens
     in.size = 10;
     try testing.expectEqual(@as(?linux.E, null), h.setattr(f, in).errno());
     try testing.expect(h.data.extension == null);
+    h.release(f);
+}
+
+test "a striped shrink asks the plane for NO write of its own: the kept block's bytes past the new EOF are owed by the extension law (decision 0003 §AL.1 — every grow of a mapped EOF block lands [EOF, min(new end, block end)) as the write path's zeros first), so a plane that can land no byte (a full set's ENOSPC, a failing device's EIO) refuses nothing and logs nothing — the truncate succeeds, the size moves, the next grow asks for the zeros over the whole kept tail (generic/475 under dm-error: 1,549 `tail zero-complete failed (NoSpaceLeft)` error lines for a zero write the grow repeats anyway)" {
+    const H = HarnessOf(SettlingData);
+    var h: H = undefined;
+    try h.init();
+    defer h.deinit();
+    defer h.data.deinit();
+    h.data.store = &h.store;
+    const f = try h.create(1, "f", 0o644);
+    // Two blocks and a bit, striped; then the plane can land nothing.
+    const bs = layout.DEFAULT_CHUNK;
+    const big: []u8 = try testing.allocator.alloc(u8, 2 * bs + 5);
+    defer testing.allocator.free(big);
+    @memset(big, 'X');
+    try testing.expectEqual(@as(?linux.E, null), h.write(f, 0, big, 0).errno());
+    const writes0 = h.data.writes.items.len;
+    const clips0 = fuse_truncate_striped_clips.load();
+    h.data.write_refuse = error.NoSpaceLeft;
+    var in = abi.zeroed(abi.fuse_setattr_in);
+    in.valid = abi.FATTR_SIZE;
+    in.size = bs + 10; // a kept partial block: [bs + 10, 2 bs) is the tail
+    try testing.expectEqual(@as(?linux.E, null), h.setattr(f, in).errno());
+    try testing.expectEqual(in.size, (try h.getattr(f)).size);
+    try testing.expectEqual(clips0 + 1, fuse_truncate_striped_clips.load());
+    try testing.expectEqual(writes0, h.data.writes.items.len); // nothing asked of the plane
+    try testing.expect(h.data.extension == null);
+    // The grow pays the tail (and refuses when the plane cannot — the size
+    // then stays): the zeros asked are exactly [old size, new size).
+    in.size = bs + 5000;
+    try testing.expectEqual(@as(?linux.E, linux.E.NOSPC), h.setattr(f, in).errno());
+    try testing.expectEqual(@as(u64, bs + 10), (try h.getattr(f)).size);
+    h.data.write_refuse = null;
+    h.data.extension = null;
+    try testing.expectEqual(@as(?linux.E, null), h.setattr(f, in).errno());
+    const x = h.data.extension.?;
+    try testing.expectEqual(@as(u64, bs + 10), x.old_size);
+    try testing.expectEqual(in.size, x.new_size);
+    try testing.expectEqual(in.size, (try h.getattr(f)).size);
     h.release(f);
 }
 

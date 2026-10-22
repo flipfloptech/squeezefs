@@ -761,7 +761,7 @@ const SiteWriter = struct {
 
 pub const Closure = struct {
     /// `Σ admit_write_*_bytes ≡ transport WRITE payload bytes + the
-    /// truncate's zero tails` (every user byte admitted once).
+    /// extension law's zeros` (every user byte admitted once).
     admission_bytes: u64,
     transport_write_bytes: u64,
     /// `read_user_bytes ≡ Σ read copy/dma/zc serve bytes`.
@@ -817,7 +817,7 @@ pub fn closure() Closure {
         .data_device_read_bytes = plane_read_total,
         .device_read_arms = plane_read_arms + rp.read_dma_ranged_bytes.load() + rp.read_dma_block_demand_bytes.load() + rp.read_dma_block_prefetch_bytes.load() + rp.read_dma_block_lane_bytes.load() + rp.read_dma_image_bytes.load() + rp.read_dma_window_bytes.load(),
         .admission_bytes = wa.admit_write_overlay_bytes.load() + wa.admit_write_inplace_bytes.load() + wa.admit_write_accumulate_bytes.load() + wa.admit_write_inline_bytes.load(),
-        .transport_write_bytes = slot.zc_write_extract_bytes.load() + zc_direct + window_writes + kv_fs.fuse_truncate_zero_tail_bytes.load() + wa.write_gap_zero_bytes.load(),
+        .transport_write_bytes = slot.zc_write_extract_bytes.load() + zc_direct + window_writes + wa.write_gap_zero_bytes.load(),
         .read_user_bytes = rp.read_user_bytes.load(),
         .read_copy_bytes = rp.read_copy_dest_bytes.load() + rp.read_copy_bounce_bytes.load() + rp.read_dest_dma_bytes.load() + rp.read_zc_serve_bytes.load() + rp.read_zc_pool_serve_bytes.load(),
         .terminal_frees = reclaim.stats.terminal_frees.load(),

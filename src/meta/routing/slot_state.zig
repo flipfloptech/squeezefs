@@ -14,7 +14,6 @@ const cr = @import("../sym/control_records.zig");
 const page = @import("../sym/appender_page.zig");
 const lease_table = @import("../sym/slots/lease_table.zig");
 const tree = @import("../tree.zig");
-const journal = @import("../journal.zig");
 
 pub const SlotState = cr.SlotState;
 pub const Root = cr.Root;
@@ -51,39 +50,71 @@ pub fn encode(s: SlotState) [cr.SlotStateWire.LEN]u8 {
 pub const decode = cr.SlotStateWire.decode;
 
 /// A guest slot's root as an OFFLINE reader (status/df/fsck, a mount's
-/// open) must see it: tree 0's word overridden by appender 0's page entry
+/// open) must see it: tree 0's word overridden by its LESSEE's page entry
 /// when the page is the live home (`lease_table.settleEntry`: a `Live` or
-/// `Releasing` entry at the record's generation under the manager — the
-/// two-homes law; a conflict is C14's). A slot leased but never minted has
-/// no root yet (`root.addr == 0`).
-/// `lessee`: the appender a `leased` / `releasing` record names (null when
-/// unleased) — another appender's tree is a projection to this mount.
+/// `Releasing` entry at the record's generation under the page's owner —
+/// the two-homes law, "a slot's root is named by tree 0 OR by its
+/// lessee's page at every instant"; a conflict is C14's). A `Leased`
+/// record's words are the grant-time snapshot: the lessee's SMOs move
+/// the root and its pool recycles the image the snapshot names, so a
+/// reader at tree 0's word alone reads a home the lessee left. A slot
+/// leased but never minted has no root yet (`root.addr == 0`).
+/// `lessee`: the appender whose page the root was adopted from, else the
+/// one a `leased` / `releasing` record names (null when unleased) —
+/// another appender's tree is a projection to this mount.
 pub const GuestRoot = struct { slot: u16, root: Root, cursor: u64, extents: u64, lessee: ?u32 };
 
 pub const FoldError = error{ Corrupt, Conflict, OutOfMemory };
 
+/// What the folded tree 0 is to its pages.
+pub const Tree0View = enum {
+    /// A writer's open: tree 0 replayed from its ring, at least as new as
+    /// every page (T1 lands the record before any page names the slot) —
+    /// an entry above its generation is residue or C14.
+    replayed,
+    /// A reader's open: the checkpointed PROJECTION, no ring — it lags the
+    /// manager's ring by up to one checkpoint, so a page entry ABOVE its
+    /// generation is a lease the projection has not caught up with, and the
+    /// page is that slot's live home: adopted, the highest generation
+    /// winning. (A lease the projection names whose lessee's page no
+    /// longer carries it is the mirror case: the word is a home the lessee
+    /// left, and the caller re-points until the manager's next record names
+    /// the release.)
+    projected,
+};
+
 /// Fold tree 0's `slot_state` records (`kvs`, the scan range's) with the
-/// page's entries into `out` — every record, a never-minted slot with
-/// `root.addr == 0` (its cursor is still a floor).
-pub fn foldGuestRoots(gpa: std.mem.Allocator, kvs: []const tree.KeyValue, page0: ?page.Page, out: *std.ArrayList(GuestRoot)) FoldError!void {
+/// entries of `pages` — appender 0's and every live lessee's, each
+/// settled under its owner — into `out`: every record, a never-minted
+/// slot with `root.addr == 0` (its cursor is still a floor).
+pub fn foldGuestRoots(gpa: std.mem.Allocator, kvs: []const tree.KeyValue, pages: []const page.Page, view: Tree0View, out: *std.ArrayList(GuestRoot)) FoldError!void {
     for (kvs) |kv| {
         const slot = slotOfKey(kv.key) orelse continue;
         const v = decode(kv.value) catch return error.Corrupt;
         var root = v.root;
         var cursor = v.cursor;
         var extents: u64 = v.slot_tree_extents;
-        if (page0) |p0| for (p0.slotEntries()) |e| if (e.slot == slot) {
-            switch (lease_table.settleEntry(v, e, journal.FIXED_RING_APPENDER)) {
-                .adopt, .complete_release => |a| if (a.words.root.seq >= root.seq) {
+        var g = v.g;
+        var lessee: ?u32 = if (v.variant == .unleased) null else v.appender_id;
+        for (pages) |p| for (p.slotEntries()) |e| if (e.slot == slot) {
+            const ahead = view == .projected and e.g > v.g;
+            const verdict: lease_table.Settle = if (ahead)
+                .{ .adopt = .{ .g = e.g, .words = .{ .root = .{ .addr = e.root_addr, .seq = e.root_seq }, .cursor = e.cursor, .extents = e.slot_tree_extents } } }
+            else
+                lease_table.settleEntry(v, e, p.appender_id);
+            switch (verdict) {
+                .adopt, .complete_release => |a| if (a.g > g or (a.g == g and a.words.root.seq >= root.seq)) {
                     root = a.words.root;
                     cursor = @max(cursor, a.words.cursor);
                     extents = a.words.extents;
+                    g = a.g;
+                    if (ahead) lessee = p.appender_id;
                 },
                 .conflict => return error.Conflict,
                 .drop_entry, .stale_entry => {},
             }
         };
-        try out.append(gpa, .{ .slot = slot, .root = root, .cursor = cursor, .extents = extents, .lessee = if (v.variant == .unleased) null else v.appender_id });
+        try out.append(gpa, .{ .slot = slot, .root = root, .cursor = cursor, .extents = extents, .lessee = lessee });
     }
 }
 
@@ -107,7 +138,7 @@ test "the routing face: keys in slot index order inside the scan range; the publ
     try testing.expectError(error.Corrupt, decode(encode(v)[0..27]));
 }
 
-test "the offline fold: tree 0's root stands alone; a Live page entry at the record's g under the manager overrides it when newer; a leased-never-minted slot folds with root 0; a Live entry under another lessee is the conflict" {
+test "the offline fold: tree 0's root stands alone; a Live page entry at the record's g under the manager overrides it when newer; a leased-never-minted slot folds with root 0; a Live entry under another lessee is the conflict; a slot leased to appender 5 takes ITS page's newer root (the two-homes law), never appender 0's stale entry for it" {
     const gpa = testing.allocator;
     const leased: cr.SlotState = .{ .variant = .leased, .appender_id = 0, .g = 2, .root = .{ .addr = 4096, .seq = 1 }, .cursor = 5 };
     const virgin: cr.SlotState = .{ .variant = .leased, .appender_id = 0, .g = 1, .root = .{ .addr = 0, .seq = 0 }, .cursor = 2 };
@@ -116,13 +147,13 @@ test "the offline fold: tree 0's root stands alone; a Live page entry at the rec
     try p0.setSlots(&.{.{ .slot = 3, .state = .live, .g = 2, .slot_tree_extents = 7, .root_addr = 8192, .root_seq = 9, .cursor = 50 }});
     var out: std.ArrayList(GuestRoot) = .empty;
     defer out.deinit(gpa);
-    try foldGuestRoots(gpa, &kvs, null, &out);
+    try foldGuestRoots(gpa, &kvs, &.{}, .replayed, &out);
     try testing.expectEqual(@as(usize, 2), out.items.len);
     try testing.expectEqual(@as(u64, 4096), out.items[0].root.addr);
     try testing.expectEqual(@as(u64, 0), out.items[1].root.addr);
     try testing.expectEqual(@as(u64, 2), out.items[1].cursor);
     out.clearRetainingCapacity();
-    try foldGuestRoots(gpa, &kvs, p0, &out);
+    try foldGuestRoots(gpa, &kvs, &.{p0}, .replayed, &out);
     try testing.expectEqual(@as(u64, 8192), out.items[0].root.addr);
     try testing.expectEqual(@as(u64, 50), out.items[0].cursor);
     try testing.expectEqual(@as(u64, 7), out.items[0].extents);
@@ -131,5 +162,53 @@ test "the offline fold: tree 0's root stands alone; a Live page entry at the rec
     other.appender_id = 5;
     const kvs2 = [_]tree.KeyValue{.{ .key = @constCast(keyOf(3).slice()), .value = @constCast(&other.encode()) }};
     out.clearRetainingCapacity();
-    try testing.expectError(error.Conflict, foldGuestRoots(gpa, &kvs2, p0, &out));
+    try testing.expectError(error.Conflict, foldGuestRoots(gpa, &kvs2, &.{p0}, .replayed, &out));
+    // Slot 3 leased to appender 5 at g 3: appender 0's page still carries
+    // its entry at g 2 (stale residue, dropped), appender 5's page names
+    // the root its SMOs moved to — the fold takes the lessee's.
+    var moved = leased;
+    moved.appender_id = 5;
+    moved.g = 3;
+    const kvs3 = [_]tree.KeyValue{.{ .key = @constCast(keyOf(3).slice()), .value = @constCast(&moved.encode()) }};
+    var p5 = page.Page.free(5, 1, page.SegmentTable.one(.{ .start = 0, .len = 4096 }));
+    try p5.setSlots(&.{.{ .slot = 3, .state = .live, .g = 3, .slot_tree_extents = 2, .root_addr = 16384, .root_seq = 12, .cursor = 60 }});
+    out.clearRetainingCapacity();
+    try foldGuestRoots(gpa, &kvs3, &.{ p0, p5 }, .replayed, &out);
+    try testing.expectEqual(@as(u64, 16384), out.items[0].root.addr);
+    try testing.expectEqual(@as(u64, 12), out.items[0].root.seq);
+    try testing.expectEqual(@as(u64, 60), out.items[0].cursor);
+    try testing.expectEqual(@as(?u32, 5), out.items[0].lessee);
+    // Without the lessee's page the fold stands at the grant-time word.
+    out.clearRetainingCapacity();
+    try foldGuestRoots(gpa, &kvs3, &.{p0}, .replayed, &out);
+    try testing.expectEqual(@as(u64, 4096), out.items[0].root.addr);
+}
+
+test "the projected fold (a reader's tree 0, no ring): a page entry ABOVE the record's generation is a lease the projection has not caught up with — adopted with its owner as the lessee, the highest generation winning over an older lessee's live entry; the replayed fold judges the same entry stale residue" {
+    const gpa = testing.allocator;
+    // The projection still says Unleased at g 1 (root 4096); appender 5's
+    // page says Live at g 2 (its grant landed after the checkpoint),
+    // appender 0's page carries a Live entry at g 1 for the slot it held.
+    const unleased_: cr.SlotState = .{ .variant = .unleased, .appender_id = 0, .g = 1, .root = .{ .addr = 4096, .seq = 1 }, .cursor = 5 };
+    const kvs = [_]tree.KeyValue{.{ .key = @constCast(keyOf(3).slice()), .value = @constCast(&unleased_.encode()) }};
+    var p0 = page.Page.free(0, 1, page.SegmentTable.one(.{ .start = 0, .len = 4096 }));
+    try p0.setSlots(&.{.{ .slot = 3, .state = .live, .g = 1, .slot_tree_extents = 1, .root_addr = 8192, .root_seq = 2, .cursor = 6 }});
+    var p5 = page.Page.free(5, 1, page.SegmentTable.one(.{ .start = 0, .len = 4096 }));
+    try p5.setSlots(&.{.{ .slot = 3, .state = .live, .g = 2, .slot_tree_extents = 2, .root_addr = 16384, .root_seq = 12, .cursor = 60 }});
+    var out: std.ArrayList(GuestRoot) = .empty;
+    defer out.deinit(gpa);
+    try foldGuestRoots(gpa, &kvs, &.{ p0, p5 }, .projected, &out);
+    try testing.expectEqual(@as(u64, 16384), out.items[0].root.addr);
+    try testing.expectEqual(@as(u64, 60), out.items[0].cursor);
+    try testing.expectEqual(@as(?u32, 5), out.items[0].lessee);
+    // Page order does not decide: the generation does.
+    out.clearRetainingCapacity();
+    try foldGuestRoots(gpa, &kvs, &.{ p5, p0 }, .projected, &out);
+    try testing.expectEqual(@as(u64, 16384), out.items[0].root.addr);
+    // The same entries against a REPLAYED tree 0: an Unleased record
+    // makes both Live entries stale residue — tree 0's word stands.
+    out.clearRetainingCapacity();
+    try foldGuestRoots(gpa, &kvs, &.{ p0, p5 }, .replayed, &out);
+    try testing.expectEqual(@as(u64, 4096), out.items[0].root.addr);
+    try testing.expectEqual(@as(?u32, null), out.items[0].lessee);
 }

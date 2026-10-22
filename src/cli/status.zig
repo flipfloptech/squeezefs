@@ -195,10 +195,12 @@ pub fn readRefCensus(gpa: std.mem.Allocator, io: Io, env: *const std.process.Env
         // Appender 0's page is the lessee's live home of the slots it
         // names (the two-homes law): its roots override tree 0's grant-
         // time words.
-        const page0 = try readAppender0Page(gpa, &dev, sb);
+        var pages: std.ArrayList(appender_page.Page) = .empty;
+        defer pages.deinit(gpa);
+        if (try readAppender0Page(gpa, &dev, sb)) |p0| try pages.append(gpa, p0);
         var roots: std.ArrayList(slot_state.GuestRoot) = .empty;
         defer roots.deinit(gpa);
-        slot_state.foldGuestRoots(gpa, kvs.items, page0, &roots) catch |e| return switch (e) {
+        slot_state.foldGuestRoots(gpa, kvs.items, pages.items, .projected, &roots) catch |e| return switch (e) {
             error.OutOfMemory => error.OutOfMemory,
             error.Corrupt, error.Conflict => error.Unexpected,
         };

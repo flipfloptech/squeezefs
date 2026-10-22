@@ -494,6 +494,196 @@ test "linux: THE MANAGER'S KILL WITH A LIVE LESSEE (charter §5.5 'Extent grants
     try testing.expectEqual(maintained, walked);
 }
 
+/// B compacts the root of its tree of `slot` (the root's image retires
+/// through B's SMO context), cycles once — serialized behind B's own
+/// cadence on the SMO lock, so the page naming the moved root is on the
+/// device when this returns — and on until the free is covered into B's
+/// pool.
+fn compactRootAndCover(bj: *KvBackend, slot: u16) !void {
+    const t = bj.slotTree(slot).?;
+    {
+        bj.smo_lock.lockUncancelable(bj.io);
+        defer bj.smo_lock.unlock(bj.io);
+        const n = try t.getNode(t.rootPtr().addr);
+        defer n.release();
+        var out: smo.MaintenanceOutcome = .{};
+        try testing.expect(try smo.compactForDefrag(t, &bj.smo_ctx, n, &out));
+    }
+    try bj.checkpointNow();
+    var cycles: u32 = 0;
+    while (bj.alloc.pendingCount() != 0 and cycles < 4) : (cycles += 1) try bj.checkpointNow();
+    try testing.expectEqual(@as(u64, 0), bj.alloc.pendingCount());
+}
+
+/// The root tree 0's `slot_state` record of `slot` names on `be`.
+fn tree0Root(gpa: std.mem.Allocator, be: *KvBackend, slot: u16) !tree.RootPtr {
+    const v = (try be.lookup(gpa, key.TREE_CONTROL, cr.slotStateKey(slot).slice())) orelse return error.TestSlotUnrecorded;
+    defer gpa.free(v);
+    const st = try cr.SlotStateWire.decode(v);
+    return .{ .addr = st.root.addr, .seq = st.root.seq };
+}
+
+/// The `slot_state` record of `slot` as a READER's projection of tree 0
+/// holds it (the checkpointed leaf image, no ring).
+fn projectedSlotState(gpa: std.mem.Allocator, reader: *MetaSet, slot: u16) !cr.SlotState {
+    const v = (try reader.lookup(gpa, key.TREE_CONTROL, cr.slotStateKey(slot).slice())) orelse return error.TestSlotUnrecorded;
+    defer gpa.free(v);
+    return try cr.SlotStateWire.decode(v);
+}
+
+test "linux: A LESSEE'S ROOT HAS TWO HOMES AND A READER FOLLOWS THE LIVE ONE (charter §5.5, spec §1.2 'Two durable homes at every instant'; found by the online fsck row — `fsck`'s storage-trust open of the two-daemon set refused 'the projection's roots stayed stale through 64 re-points'): A mints a slot tree; B takes it by handover and compacts the root — tree 0 keeps the grant-time root (whether or not A's checkpoint has landed the grant yet), B's page names the live one; a read-only open of the set opens B's slot at the root B's PAGE names; after B's pool recycles the grant-time image under a fresh node the open still succeeds (no record of A's ever renames a home B left, so no re-point could have waited it out)" {
+    const gpa = testing.allocator;
+    const s = try meta_set.TestSet.create(gpa, "reader-lessee-home", 1);
+    defer s.destroy();
+    try s.env.put("SQUEEZEFS_MW_BIND", "127.0.0.1:0");
+    // No cycle by age during the row: tree 0's device image moves only
+    // with the handover's own cycles and the test's `checkpointNow`.
+    try s.env.put("SQUEEZEFS_CHECKPOINT_MAX_AGE_MS", "60000");
+    const set = try s.open();
+    defer set.close();
+    var locks = try dlm.Manager.init(gpa, 64);
+    defer locks.deinit();
+    const bound = try xv.set_bind.Bound.create(gpa, s.io(), set, &locks, &s.env);
+    defer bound.destroy(gpa);
+    const plane = (try wire_plane.WirePlane.start(gpa, s.io(), set, &s.env, 4, 1 << 30, &bound.plane, false)).?;
+    defer plane.stop();
+    const be0 = set.volumes[0];
+    const slot = try managerRotorSlot(gpa, be0);
+    try fillSlot(be0, slot, 1, &@as([200]u8, @splat('a')));
+    try be0.checkpointNow();
+    const b = try MetaSet.open(gpa, s.io(), s.pathList(), .{ .env = &s.env, .cache_budget_bytes = 64 << 20, .cpus = 4, .join = .{ .mountpoint = "/build/tmp/mnt-reader-lessee-home-b", .endpoint = plane.advertised } });
+    defer b.close();
+    const bj = b.volumes[0];
+    const me = bj.joined.?.appenderId();
+    try testing.expectEqual(acquire.Verbs.OfferResult.offered, try be0.slots.verbs.offerSlot(lt.MANAGER, slot, me, std.math.maxInt(u64)));
+    const sink = bj.slots.carriageSink();
+    sink.offered(sink.ctx, slot, lt.MANAGER);
+    try testing.expect(bj.slots.table.view(slot).leasedBy(me));
+    // B's first cycle: its page names the slot (page-homed from here on —
+    // the overflow law's tree-0 publication runs only for a slot the page
+    // does not name). Tree 0's words are the grant-time root, the root
+    // B's tree stands at before its first SMO.
+    try bj.checkpointNow();
+    const grant_time = try tree0Root(gpa, be0, slot);
+    try testing.expectEqual(grant_time, bj.slotTree(slot).?.rootPtr());
+    const g_b = bj.slots.table.view(slot).g;
+    // B's root moves: the grant-time image retires into B's pool (its
+    // bytes intact), B's cycle refreshes its page with the live root;
+    // tree 0 keeps the grant-time words.
+    try compactRootAndCover(bj, slot);
+    const live1 = bj.slotTree(slot).?.rootPtr();
+    try testing.expect(live1.addr != grant_time.addr);
+    try testing.expect(!bj.alloc.isAllocated(bj.cache.addrExtent(grant_time.addr)));
+    try testing.expectEqual(grant_time, try tree0Root(gpa, be0, slot));
+    const ro: meta_set.OpenOptions = .{ .env = &s.env, .cache_budget_bytes = 64 << 20, .cpus = 4, .read_only = true };
+    // 0. Before A's next checkpoint: whether the reader's tree 0 already
+    //    carries the grant (the handover's trailing cycle landed it) or
+    //    still predates it (the entry sits in A's ring: B's page Live at a
+    //    generation above the projection's is the slot's only durable home
+    //    — the lag the `projected` fold adopts through), the root the
+    //    reader opens is the one B's page names.
+    {
+        const reader = try MetaSet.open(gpa, s.io(), s.pathList(), ro);
+        defer reader.close();
+        const seen = try projectedSlotState(gpa, reader, slot);
+        try testing.expect(seen.g <= g_b);
+        const named = reader.volumes[0].guest_published.get(slot) orelse return error.TestSlotNotProjected;
+        std.debug.print("\nreader's root of B's slot {d} with tree 0 at g {d} (B's lease g {d}): 0x{x} seq {d}; B's live root 0x{x} seq {d}; the grant-time root 0x{x} seq {d}\n", .{ slot, seen.g, g_b, named.addr, named.seq, live1.addr, live1.seq, grant_time.addr, grant_time.seq });
+        try testing.expectEqual(live1, named);
+    }
+    // 1. A's checkpoint has landed the grant: tree 0 names B at the
+    //    grant-time words, B's page the live root — the reader opens B's.
+    try be0.checkpointNow();
+    {
+        const reader = try MetaSet.open(gpa, s.io(), s.pathList(), ro);
+        defer reader.close();
+        const seen = try projectedSlotState(gpa, reader, slot);
+        try testing.expect(seen.variant == .leased and seen.appender_id == me and seen.g == g_b);
+        try testing.expectEqual(grant_time, tree.RootPtr{ .addr = seen.root.addr, .seq = seen.root.seq });
+        try testing.expectEqual(live1, reader.volumes[0].guest_published.get(slot) orelse return error.TestSlotNotProjected);
+    }
+    // 2. The grant-time image recycled: B's next root claims the lowest
+    //    free extent of its pool — the image A's root lived in — so tree
+    //    0's word now names a node under another seq.
+    var rounds: u32 = 0;
+    while (!bj.alloc.isAllocated(bj.cache.addrExtent(grant_time.addr)) and rounds < 8) : (rounds += 1) try compactRootAndCover(bj, slot);
+    try testing.expect(bj.alloc.isAllocated(bj.cache.addrExtent(grant_time.addr)));
+    const live2 = bj.slotTree(slot).?.rootPtr();
+    try testing.expect(live2.addr != grant_time.addr or live2.seq != grant_time.seq);
+    {
+        const reader = MetaSet.open(gpa, s.io(), s.pathList(), ro) catch |e| {
+            std.debug.print("\nread-only open refused {s} after B recycled the grant-time image ({d} compaction round(s)); B's live root 0x{x} seq {d}\n", .{ @errorName(e), rounds, live2.addr, live2.seq });
+            return e;
+        };
+        defer reader.close();
+        try testing.expectEqual(live2, reader.volumes[0].guest_published.get(slot) orelse return error.TestSlotNotProjected);
+    }
+    // 3. The race inside ONE open: the reader has read B's page (naming
+    //    live2) and, before it opens the roots, B moves its root again and
+    //    its pool recycles live2's image under the new root. The lessee is
+    //    live and moving: its slot is left un-projected (a reader reads it
+    //    under a token from B), the open succeeds, nothing re-points.
+    const MoveOn = struct {
+        bj: *KvBackend,
+        slot: u16,
+        fired: u32 = 0,
+        fn call(ctx: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.fired += 1;
+            compactRootAndCover(self.bj, self.slot) catch return;
+            compactRootAndCover(self.bj, self.slot) catch return;
+        }
+    };
+    var move_on: MoveOn = .{ .bj = bj, .slot = slot };
+    backend.test_seams.reader_after_pages = .{ .ctx = &move_on, .call = &MoveOn.call };
+    defer backend.test_seams = .{};
+    const skipped0 = backend.stats.reader_foreign_roots_skipped.load();
+    {
+        const reader = try MetaSet.open(gpa, s.io(), s.pathList(), ro);
+        defer reader.close();
+        backend.test_seams = .{};
+        const live3 = bj.slotTree(slot).?.rootPtr();
+        std.debug.print("B moved on inside the reader's open: the page named 0x{x} seq {d}, B's root is 0x{x} seq {d}, that image allocated {}; hook fired {d}, foreign roots skipped +{d}\n", .{ live2.addr, live2.seq, live3.addr, live3.seq, bj.alloc.isAllocated(bj.cache.addrExtent(live2.addr)), move_on.fired, backend.stats.reader_foreign_roots_skipped.load() - skipped0 });
+        try testing.expectEqual(@as(u32, 1), move_on.fired);
+        try testing.expect(live3.addr == live2.addr and live3.seq != live2.seq);
+        try testing.expectEqual(skipped0 + 1, backend.stats.reader_foreign_roots_skipped.load());
+        try testing.expect(reader.volumes[0].slotTree(slot) == null);
+        try testing.expect(reader.volumes[0].guest_published.get(slot) == null);
+    }
+    // 4. The same race on a slot the MANAGER holds: its page names the
+    //    root, and A moves on inside the reader's open, recycling the
+    //    image the page named. A's page is refreshed by the cycle that
+    //    covers the free, so the slot's homes re-read name the live root:
+    //    the reader retries that one slot and opens it there.
+    var a_slot: u16 = 0;
+    {
+        var held: std.ArrayList(u16) = .empty;
+        defer held.deinit(gpa);
+        try be0.slots.table.heldBy(lt.MANAGER, &held);
+        for (held.items) |s2| if (be0.stamp.native_slot != s2 and s2 != slot) {
+            a_slot = s2;
+            break;
+        };
+    }
+    try testing.expect(a_slot != 0);
+    try fillSlot(be0, a_slot, 1, &@as([200]u8, @splat('m')));
+    try be0.checkpointNow();
+    const a_root = be0.slotTree(a_slot).?.rootPtr();
+    var a_moves: MoveOn = .{ .bj = be0, .slot = a_slot };
+    backend.test_seams.reader_after_pages = .{ .ctx = &a_moves, .call = &MoveOn.call };
+    {
+        const reader = try MetaSet.open(gpa, s.io(), s.pathList(), ro);
+        defer reader.close();
+        backend.test_seams = .{};
+        const a_live = be0.slotTree(a_slot).?.rootPtr();
+        std.debug.print("A moved on inside the reader's open: the page named 0x{x} seq {d}, A's root is 0x{x} seq {d}; hook fired {d}\n", .{ a_root.addr, a_root.seq, a_live.addr, a_live.seq, a_moves.fired });
+        try testing.expectEqual(@as(u32, 1), a_moves.fired);
+        try testing.expect(a_live.seq != a_root.seq);
+        try testing.expectEqual(a_live, reader.volumes[0].guest_published.get(a_slot) orelse return error.TestSlotNotProjected);
+        try testing.expectEqual(skipped0 + 1, backend.stats.reader_foreign_roots_skipped.load());
+    }
+}
+
 // ---------------------------------------------------------------------------
 // THE MOVE MATRIX (0003 §X.1, §X.2): the filesystem over both members — A's
 // and B's planes bound the way `mount` binds them, B's behind the product's

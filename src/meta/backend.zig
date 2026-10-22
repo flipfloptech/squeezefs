@@ -188,6 +188,10 @@ pub const Stats = struct {
     guard_shared_lock_waits: counters.ShardedCounter = .{},
     mounts: counters.ShardedCounter = .{},
     clean_unmounts: counters.ShardedCounter = .{},
+    /// A reader's open left a live foreign lessee's slot un-projected: its
+    /// page's root was already behind the lessee's live tree (the slot is
+    /// read under a token from the lessee).
+    reader_foreign_roots_skipped: counters.ShardedCounter = .{},
 };
 
 pub var stats: Stats = .{};
@@ -227,6 +231,9 @@ pub const TestSeams = struct {
     /// C6: one dirty bitmap page landed — the cycle's later pages (in page
     /// order) and its record are not on the device.
     after_bitmap_page: ?node_cache.Hook = null,
+    /// A READER's open: tree 0 scanned and every live page read, no guest
+    /// root opened yet — the window in which a live lessee moves on.
+    reader_after_pages: ?node_cache.Hook = null,
 };
 
 pub var test_seams: TestSeams = .{};
@@ -392,6 +399,8 @@ pub const KvBackend = struct {
     guest_published: std.AutoHashMapUnmanaged(u16, tree.RootPtr) = .empty,
     /// The cursor floors tree 0's `slot_state` records carried at open.
     guest_cursor_floors: std.AutoHashMapUnmanaged(u16, u64) = .empty,
+    /// A reader's last `RootStale`: what the refusal names.
+    reader_stale: ?ReaderStale = null,
     ring_layout: journal.RingLayout,
     geo: jc.CoreGeometry,
     core: jc.JournalCore,
@@ -1305,10 +1314,11 @@ pub const KvBackend = struct {
     fn openProjectionTrees(be: *KvBackend) (OpenError || error{RootStale})!void {
         const gpa = be.gpa;
         for (be.mounted.tree_roots) |r| {
-            const t = KvTree.openFromLedgerAsReader(gpa, be.cache, &be.mounted, r.id, &be.seq) catch |e| switch (e) {
+            var why: ?KvTree.Stale = null;
+            const t = KvTree.openFromLedgerAsReader(gpa, be.cache, &be.mounted, r.id, &be.seq, &why) catch |e| switch (e) {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.Io => return error.Io,
-                error.RootStale => return error.RootStale,
+                error.RootStale => return be.readerStale(.{ .what = .ledger_root, .slot = @backingInt(r.id), .root = .{ .addr = r.node_addr, .seq = r.node_seq }, .why = why }),
                 else => {
                     log.err("meta volume {s}: reader: ledger record {d}'s root {d} does not open ({s})", .{ be.path, be.mounted.seq, @backingInt(r.id), @errorName(e) });
                     return error.Corrupt;
@@ -1321,31 +1331,51 @@ pub const KvBackend = struct {
         try be.openGuestTrees(&.{}, null);
     }
 
-    /// A reader re-points at most this often before a stale root is
-    /// corruption: a writer's checkpoint cadence is tens of milliseconds, its
-    /// ledger slot write (the window in which the newest record is not yet
-    /// readable) shorter, so 64 steps of 2 ms outlast both.
-    const READER_REPOINTS_MAX: u32 = 64;
+    /// A reader re-points until BOTH bounds pass before a stale root is
+    /// corruption: one checkpoint LANDING CEILING of wall time — every home
+    /// the projection can lag behind is renamed by the manager's next
+    /// record, which its age law lands within `CHECKPOINT_MAX_AGE + 2 ×
+    /// tick` = 1,100 ms at the shipped knobs (the membership grant's
+    /// `checkpoint_ceiling_ms`, the quiescent poll's cadence) — AND 64
+    /// re-points (the former law's count): on a saturated device an
+    /// attempt's wall stretches with the manager's cycle (measured ~58 ms
+    /// an attempt beside a full smoke, ~2 ms idle: a leaf the manager
+    /// appends to every flush read torn 19 times in 1.1 s), so the count
+    /// outlasts a loaded manager where the clock alone refused early.
+    const READER_REPOINT_CEILING_MS: u64 = sym.membership.shard.CHECKPOINT_LANDING_CEILING_MS;
+    const READER_REPOINTS_MIN: u32 = 64;
+    const READER_REPOINT_STEP_MS: u64 = 2;
+
+    /// Both bounds passed: `since_ns` ago the root was first found stale,
+    /// `repoints` attempts since.
+    fn readerRepointExhausted(since_ns: u64, repoints: u32) bool {
+        return clock.monotonicNs() - since_ns >= READER_REPOINT_CEILING_MS * std.time.ns_per_ms and repoints >= READER_REPOINTS_MIN;
+    }
 
     /// `openProjectionTrees` as the reader's race with a live writer wants
     /// it: a root the record names that a later checkpoint retired (its
     /// extent reused — `RootStale`) drops what was opened, re-points at the
     /// newest record on the device and tries again — newest-valid-wins —
     /// until a record's roots all load, or the bound: a record whose roots
-    /// are gone with no newer record behind it is corruption.
+    /// are gone with no newer record behind it for a whole landing ceiling
+    /// and 64 re-points is corruption.
     fn openProjectionTreesRepointing(be: *KvBackend) OpenError!void {
         var repoints: u32 = 0;
+        const t0 = clock.monotonicNs();
         while (true) {
             be.openProjectionTrees() catch |e| switch (e) {
                 error.RootStale => {
-                    if (repoints == READER_REPOINTS_MAX) {
-                        log.err("meta volume {s}: reader: the projection's roots stayed stale through {d} re-points (record {d}) — refusing", .{ be.path, repoints, be.mounted.seq });
+                    if (readerRepointExhausted(t0, repoints)) {
+                        const waited_ms = (clock.monotonicNs() - t0) / std.time.ns_per_ms;
+                        const st = be.reader_stale orelse ReaderStale{ .what = .ledger_root };
+                        log.err("meta volume {s}: reader: the projection's roots stayed stale through {d} re-points over {d} ms (record {d}; last: {t}, slot/root id {d}, root 0x{x} seq {d}, lessee {?d}: {?f}) — refusing", .{ be.path, repoints, waited_ms, be.mounted.seq, st.what, st.slot, st.root.addr, st.root.seq, st.lessee, st.why });
                         return error.Corrupt;
                     }
                     repoints += 1;
                     try be.dropProjection();
-                    // Not newer yet: the writer's record is mid-write; a step later it reads.
-                    if (!try be.repointNewest()) be.io.sleep(.fromMilliseconds(2), .awake) catch {};
+                    // Not newer yet: the writer's record is mid-write or its
+                    // cycle has not landed; a step later it may read.
+                    if (!try be.repointNewest()) be.io.sleep(.fromMilliseconds(READER_REPOINT_STEP_MS), .awake) catch {};
                     continue;
                 },
                 else => |x| return x,
@@ -2105,34 +2135,46 @@ pub const KvBackend = struct {
         var kvs: std.ArrayList(tree.KeyValue) = .empty;
         defer tree.deinitKeyValues(gpa, &kvs);
         const scan = slot_state.scanRange();
-        // A READER walks tree 0 and reads page 0 live, beside the writers:
-        // a node retired under the walk, a page mid-write, the two homes
-        // read at different instants — each is its race (`RootStale`: it
-        // re-points), never the writer's loud refusal.
+        // A READER walks tree 0 and reads the pages live, beside the
+        // writers: a node retired under the walk, a page mid-write, the two
+        // homes read at different instants — each is its race (`RootStale`:
+        // it re-points), never the writer's loud refusal.
         const reader = be.posture == .reader;
         control.range(gpa, scan.start.slice(), scan.end.slice(), std.math.maxInt(usize), &kvs) catch |e| return switch (e) {
             error.OutOfMemory => error.OutOfMemory,
             error.Io => error.Io,
-            else => if (reader) error.RootStale else error.Corrupt,
+            else => if (reader) be.readerStale(.{ .what = .tree0_scan }) else error.Corrupt,
         };
-        // Appender 0's page: the lessee's home of every slot it names —
-        // at least as new as tree 0's grant-time word (the two-homes law);
-        // a Live entry at tree 0's generation under another lessee is C14.
-        const page0 = be.readAppender0Page() catch |e| switch (e) {
-            error.Corrupt => return if (reader) error.RootStale else error.Corrupt,
-            else => |x| return x,
-        };
+        // The pages folded with tree 0 (the two-homes law): a WRITER's open
+        // folds appender 0's — the lessee's home of the slots it names, at
+        // least as new as tree 0's grant-time word; a foreign lessee's tree
+        // is its projection at the word, never walked, and its arm and the
+        // recovery install the live root. A READER folds EVERY live page: a
+        // lessee's SMOs move its root and its pool recycles the image the
+        // word names, so the word alone is a home the lessee left — and no
+        // record of THIS ledger renames it while the lease stands, so no
+        // re-point could wait it out. A Live entry at tree 0's generation
+        // under another lessee is C14.
+        var pages: std.ArrayList(sym.appender_page.Page) = .empty;
+        defer pages.deinit(gpa);
+        if (reader) {
+            be.readLivePages(&pages) catch |e| switch (e) {
+                error.Corrupt => return be.readerStale(.{ .what = .pages }),
+                else => |x| return x,
+            };
+        } else if (try be.readAppender0Page()) |p0| try pages.append(gpa, p0);
+        if (reader) if (test_seams.reader_after_pages) |h| h.call(h.ctx);
         var roots: std.ArrayList(slot_state.GuestRoot) = .empty;
         defer roots.deinit(gpa);
-        slot_state.foldGuestRoots(gpa, kvs.items, page0, &roots) catch |e| switch (e) {
+        slot_state.foldGuestRoots(gpa, kvs.items, pages.items, if (reader) .projected else .replayed, &roots) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             error.Corrupt => {
-                if (reader) return error.RootStale;
+                if (reader) return be.readerStale(.{ .what = .fold });
                 log.err("meta volume {s}: a tree-0 slot_state record does not decode", .{be.path});
                 return error.Corrupt;
             },
             error.Conflict => {
-                if (reader) return error.RootStale;
+                if (reader) return be.readerStale(.{ .what = .fold });
                 log.err("meta volume {s}: a slot is Live on appender 0's page at tree 0's generation under another lessee — refusing the mount (C14; `squeezefs appender clear`)", .{be.path});
                 return error.Corrupt;
             },
@@ -2141,32 +2183,72 @@ pub const KvBackend = struct {
         // installs them): projections here, never walked (§U.1).
         var projections: std.ArrayList(key.ForestSlot) = .empty;
         defer projections.deinit(gpa);
-        for (roots.items) |r| {
-            try be.guest_cursor_floors.put(gpa, r.slot, r.cursor);
-            // The native slot's lease names the ledger's own native root
-            // (KD-SYM-2): the tree is already open under its native
-            // identity; a second KvTree over the same nodes would hold a
-            // root pointer no SMO of the native tree ever moves.
-            if (be.mounted.membership_stamp.native_slot == r.slot) continue;
-            // A granted, never-minted slot owns no extent yet.
-            if (r.root.addr == 0) continue;
-            const root: tree.RootPtr = .{ .addr = r.root.addr, .seq = r.root.seq };
-            if (r.lessee) |a| if (a != journal.FIXED_RING_APPENDER) try projections.append(gpa, key.guestForestSlot(r.slot));
-            const t = KvTree.openAsReader(gpa, be.cache, .{ .slot = key.guestForestSlot(r.slot) }, root, &be.seq) catch |e| switch (e) {
-                error.OutOfMemory => return error.OutOfMemory,
-                error.Io => return error.Io,
-                // A writer's open logs and refuses the stale root itself.
-                error.RootStale => if (be.posture == .reader) return error.RootStale else return error.Corrupt,
-                else => {
-                    log.err("meta volume {s}: slot {d}'s root 0x{x} does not open ({s})", .{ be.path, r.slot, root.addr, @errorName(e) });
-                    return error.Corrupt;
-                },
-            };
-            errdefer t.destroy();
-            t.seedNodeCount(r.extents);
-            be.seq.raiseTo(root.seq);
-            try be.trees.add(t);
-            try be.guest_published.put(gpa, r.slot, root);
+        for (roots.items) |r0| {
+            var r = r0;
+            var stale_since: ?u64 = null;
+            var retries: u32 = 0;
+            while (true) {
+                try be.guest_cursor_floors.put(gpa, r.slot, r.cursor);
+                // The native slot's lease names the ledger's own native root
+                // (KD-SYM-2): the tree is already open under its native
+                // identity; a second KvTree over the same nodes would hold a
+                // root pointer no SMO of the native tree ever moves.
+                if (be.mounted.membership_stamp.native_slot == r.slot) break;
+                // A granted, never-minted slot owns no extent yet.
+                if (r.root.addr == 0) break;
+                const root: tree.RootPtr = .{ .addr = r.root.addr, .seq = r.root.seq };
+                const foreign = if (r.lessee) |a| a != journal.FIXED_RING_APPENDER else false;
+                var why: ?KvTree.Stale = null;
+                const t = KvTree.openAsReader(gpa, be.cache, .{ .slot = key.guestForestSlot(r.slot) }, root, &be.seq, &why) catch |e| switch (e) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.Io => return error.Io,
+                    // A writer's open logs and refuses the stale root itself.
+                    error.RootStale => {
+                        if (!reader) return error.Corrupt;
+                        // A FOREIGN lessee's root gone stale behind its
+                        // newest durable home (its page, folded above): the
+                        // lessee is live and moving its tree — a reader reads
+                        // that slot under a token from it (charter §5.5),
+                        // never off the device, and a quiescent reader meets
+                        // no such lessee (a left one's slots are Unleased, a
+                        // dead one's roots stand still). The slot stays
+                        // un-projected; a re-point would chase a writer's
+                        // cadence, not a record.
+                        if (foreign) {
+                            stats.reader_foreign_roots_skipped.inc();
+                            break;
+                        }
+                        // The manager's own (held on its page, or unleased
+                        // and maintained by it): the home names the root the
+                        // tree moved to within one cycle of the move — its
+                        // page at that cycle's C4b, tree 0's record at the
+                        // next cycle's flush — so THIS slot's homes are
+                        // re-read and the slot retried, every tree already
+                        // opened kept (the frontier the reader saw); the
+                        // slot has one landing ceiling to settle. A whole
+                        // re-point here would chase a busy manager across
+                        // every slot at once and never land.
+                        const since = stale_since orelse clock.monotonicNs();
+                        stale_since = since;
+                        if (readerRepointExhausted(since, retries)) return be.readerStale(.{ .what = .guest_root, .slot = r.slot, .root = root, .lessee = r.lessee, .why = why });
+                        retries += 1;
+                        be.io.sleep(.fromMilliseconds(READER_REPOINT_STEP_MS), .awake) catch {};
+                        r = try be.refoldGuestRoot(control, r.slot);
+                        continue;
+                    },
+                    else => {
+                        log.err("meta volume {s}: slot {d}'s root 0x{x} does not open ({s})", .{ be.path, r.slot, root.addr, @errorName(e) });
+                        return error.Corrupt;
+                    },
+                };
+                errdefer t.destroy();
+                if (foreign) try projections.append(gpa, key.guestForestSlot(r.slot));
+                t.seedNodeCount(r.extents);
+                be.seq.raiseTo(root.seq);
+                try be.trees.add(t);
+                try be.guest_published.put(gpa, r.slot, root);
+                break;
+            }
         }
         // Before the first claim (the mints below).
         if (recovered) |a| try be.adoptReachableClaims(a, projections.items);
@@ -2252,6 +2334,88 @@ pub const KvBackend = struct {
             imgs[i] = &bufs[i];
         }
         return sym.appender_page.newestValid(imgs) catch return error.UnsupportedFormat;
+    }
+
+    /// A READER's fresh fold of ONE slot: every cached image dropped (the
+    /// writers append to leaves in place under unchanged addresses, so a
+    /// cached tree-0 leaf would serve the words the reader already found
+    /// stale; the opened trees keep their pointers and reload on demand),
+    /// tree 0's record of the slot and the live pages re-read, folded as
+    /// `openGuestTrees` folds them. A record gone or unreadable is the
+    /// whole projection's race (`RootStale`: the caller re-points).
+    fn refoldGuestRoot(be: *KvBackend, control: *KvTree, slot: u16) (OpenError || error{RootStale})!slot_state.GuestRoot {
+        const gpa = be.gpa;
+        _ = be.cache.discardAllNodes();
+        const k = slot_state.keyOf(slot);
+        const value = (control.lookup(gpa, k.slice()) catch |e| return switch (e) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.Io => error.Io,
+            else => be.readerStale(.{ .what = .tree0_scan, .slot = slot }),
+        }) orelse return be.readerStale(.{ .what = .tree0_scan, .slot = slot });
+        defer gpa.free(value);
+        var pages: std.ArrayList(sym.appender_page.Page) = .empty;
+        defer pages.deinit(gpa);
+        be.readLivePages(&pages) catch |e| switch (e) {
+            error.Corrupt => return be.readerStale(.{ .what = .pages, .slot = slot }),
+            else => |x| return x,
+        };
+        var out: std.ArrayList(slot_state.GuestRoot) = .empty;
+        defer out.deinit(gpa);
+        const kv = [_]tree.KeyValue{.{ .key = @constCast(k.slice()), .value = value }};
+        slot_state.foldGuestRoots(gpa, &kv, pages.items, .projected, &out) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Corrupt, error.Conflict => return be.readerStale(.{ .what = .fold, .slot = slot }),
+        };
+        if (out.items.len != 1) return be.readerStale(.{ .what = .fold, .slot = slot });
+        return out.items[0];
+    }
+
+    /// A reader's `RootStale` with its origin noted for the refusal line.
+    fn readerStale(be: *KvBackend, st: ReaderStale) error{RootStale} {
+        be.reader_stale = st;
+        return error.RootStale;
+    }
+
+    /// Every LIVE appender page of the volume, for a READER's fold:
+    /// appender 0's (its fixed four slots), then each directory pair's
+    /// newest image that is Live, with the ring-side pair where the
+    /// lessee's per-cycle writes land (`appender_dir.readPageOf`; one
+    /// chain walk) — appended to `out`. A page not Live names no live
+    /// home (its lessee left or is the recovery's); tree 0 alone speaks
+    /// for its slots. Nothing on a flat volume.
+    fn readLivePages(be: *KvBackend, out: *std.ArrayList(sym.appender_page.Page)) OpenError!void {
+        const gpa = be.gpa;
+        if (try be.readAppender0Page()) |p0| try out.append(gpa, p0);
+        if (!be.sb.symmetricPlaneStamped()) return;
+        const Reader = struct {
+            be: *KvBackend,
+            fn read(ctx: *anyopaque, offset: u64, buf: *[sym.appender_page.PAGE_LEN]u8) error{Io}!void {
+                const self: *@This() = @ptrCast(@alignCast(ctx));
+                const img = self.be.dev.readRange(self.be.gpa, offset, sym.appender_page.PAGE_LEN) catch return error.Io;
+                defer self.be.gpa.free(img);
+                @memcpy(buf, img[0..sym.appender_page.PAGE_LEN]);
+            }
+        };
+        var rd: Reader = .{ .be = be };
+        const reader: sym.appender_dir.PageReader = .{ .ctx = &rd, .read = &Reader.read };
+        var links: std.ArrayList(sym.appender_dir.Link) = .empty;
+        defer links.deinit(gpa);
+        sym.appender_dir.walkChain(gpa, reader, .{ .start = be.sb.appender_dir.start, .len = be.sb.appender_dir.len }, be.sb.node_size, .{ .start = be.sb.heap.start, .len = be.sb.heap.len }, be.sb.totalExtents(), &links) catch |e| return switch (e) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.Io => error.Io,
+            error.Corrupt => error.Corrupt,
+        };
+        for (links.items) |l| {
+            var pair: u32 = 0;
+            while (pair < l.header.pairs) : (pair += 1) {
+                const id = sym.appender_dir.appenderIdOf(l.header.chain_index, pair, l.header.pairs);
+                const p = (sym.appender_dir.readPageOf(reader, links.items, id) catch |e| return switch (e) {
+                    error.Io => error.Io,
+                    error.Corrupt => error.Corrupt,
+                }) orelse continue;
+                if (p.state == .live) try out.append(gpa, p);
+            }
+        }
     }
 
     /// The tree of routing slot `slot` on this volume, if it exists.
@@ -2686,6 +2850,10 @@ pub const KvBackend = struct {
     pub fn ringDrained(be: *KvBackend) bool {
         return be.core.headPos() == be.core.reusableUpto() and be.reg.openCount() == 0 and be.core.admitted() == 0;
     }
+
+    /// The root a reader's projection last found stale, where it was named
+    /// and why it was stale.
+    const ReaderStale = struct { what: enum { ledger_root, tree0_scan, pages, fold, guest_root }, slot: u16 = 0, root: tree.RootPtr = .{ .addr = 0, .seq = 0 }, lessee: ?u32 = null, why: ?KvTree.Stale = null };
 
     pub const SwapRingError = error{ NotDrained, BadTable };
 

@@ -178,6 +178,39 @@ pub fn readPair(reader: PageReader, link: Link, pair: u32) error{Io}!PairImages 
     return out;
 }
 
+/// The newest valid page of `appender_id` (≥ 1) off a walked chain
+/// (`links`): the pair's two directory slots, then — once a directory
+/// image names a first segment — the ring-side pair at its start, where
+/// the lessee's per-cycle writes land; newest-valid-wins over the four
+/// (`Manager.readFourSlots`'s law for a mount with no manager object: a
+/// reader's open, the manager's own before its arm). Null for an id past
+/// the chain or a pair no valid image names; a slot a foreign binary wrote
+/// is `Corrupt`.
+pub fn readPageOf(reader: PageReader, links: []const Link, appender_id: u32) error{ Io, Corrupt }!?page.Page {
+    if (links.len == 0) return null;
+    const loc = locate(appender_id, links[0].header.pairs);
+    if (loc.chain_index >= links.len) return null;
+    const imgs = try readPair(reader, links[loc.chain_index], loc.pair);
+    if (imgs.foreign) return error.Corrupt;
+    const dir_best = imgs.newest() orelse return null;
+    if (dir_best.segments.len == 0) return dir_best;
+    var best = dir_best;
+    var buf: [PAGE_LEN]u8 = undefined;
+    for (page.ringSideOffsets(dir_best.segments.items[0])) |off| {
+        try reader.read(reader.ctx, off, &buf);
+        switch (page.classify(&buf)) {
+            // A segment a Free image still names may be another
+            // appender's by now: only this identity's images compete.
+            .valid => |p| if (p.appender_id == appender_id and p.generation > best.generation) {
+                best = p;
+            },
+            .blank, .corrupt => {},
+            .foreign_layout => return error.Corrupt,
+        }
+    }
+    return best;
+}
+
 /// The lowest Free (or blank) pair across the chain — the next appender id
 /// — or null when every pair is taken (the caller grows the chain).
 pub fn lowestFreePair(reader: PageReader, links: []const Link) error{ Io, ForeignLayout }!?PairImages {

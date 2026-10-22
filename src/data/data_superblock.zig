@@ -697,6 +697,28 @@ test "the format plan: zero chunk 0 (sector 0 first) and the last chunk, the tai
     try testing.expectEqual(@as(u64, 3), done.format.v2.capacityBlocks());
 }
 
+test "the format plan is O(structures), never O(volume): a 17 TiB passthrough volume (fstests generic/620's dm-hugedisk; 'no disk size limit') writes exactly two chunks + two sectors, every step inside the first or the last chunk; the tail copy self-locates at volume_len − 4 KiB; capacity is u64 (chunks − 2)" {
+    const gpa = testing.allocator;
+    var sb = fixture();
+    sb.compression = .none;
+    sb.encryption = .none;
+    sb.chunk_size = 4 << 20;
+    sb.features_incompat = 0;
+    sb.volume_len = 17 << 40;
+    var plan = try planFormat(gpa, sb, 1, null);
+    defer plan.deinit();
+    var written: u64 = 0;
+    const last_chunk_start = (sb.chunkCount() - 1) * sb.chunk_size;
+    for (plan.steps) |s| {
+        written += s.bytes.len;
+        const end = s.offset + s.bytes.len;
+        try testing.expect(end <= sb.chunk_size or (s.offset >= last_chunk_start and end <= sb.volume_len));
+    }
+    try testing.expectEqual(2 * @as(u64, sb.chunk_size) + 2 * sector_len, written);
+    try testing.expectEqual((17 << 40) - 4096, sb.backupOffset());
+    try testing.expectEqual(@as(u64, (17 << 40) / (4 << 20) - 2), sb.capacityBlocks());
+}
+
 fn sectorFuzz(_: void, smith: *std.testing.Smith) !void {
     var buf: [sector_len]u8 = undefined;
     const len = smith.slice(&buf);

@@ -6903,6 +6903,21 @@ test "POSIX: rename — plain, replace, NOREPLACE → EEXIST, EXCHANGE, a direct
     try testing.expectEqual(@as(u32, 3), (try h.getattr(d2)).nlink);
     try testing.expectEqual(d2, (try h.entry(h.lookup(sub, ".."))).nodeid);
     try testing.expectEqual(sub, (try h.entry(h.lookup(d2, "moved"))).nodeid);
+    // An EXCHANGE of a directory with a file across parents moves the
+    // `..` the other way: d2 gives its directory up (3 → 2), d1 receives
+    // it (2 → 3), and back again (generic/025's crossdir dire/regu cell).
+    const f1 = try h.create(d1, "f", 0o644);
+    h.release(f1);
+    try testing.expectEqual(@as(?linux.E, null), h.call(.{ .rename2 = .{ .newdir = d1, .flags = RENAME_EXCHANGE, .name = "moved", .newname = "f" } }, d2).errno());
+    try testing.expectEqual(@as(u32, 3), (try h.getattr(d1)).nlink);
+    try testing.expectEqual(@as(u32, 2), (try h.getattr(d2)).nlink);
+    try testing.expectEqual(sub, (try h.entry(h.lookup(d1, "f"))).nodeid);
+    try testing.expectEqual(f1, (try h.entry(h.lookup(d2, "moved"))).nodeid);
+    try testing.expectEqual(d1, (try h.entry(h.lookup(sub, ".."))).nodeid);
+    try testing.expectEqual(@as(?linux.E, null), h.call(.{ .rename2 = .{ .newdir = d2, .flags = RENAME_EXCHANGE, .name = "f", .newname = "moved" } }, d1).errno());
+    try testing.expectEqual(@as(u32, 2), (try h.getattr(d1)).nlink);
+    try testing.expectEqual(@as(u32, 3), (try h.getattr(d2)).nlink);
+    try testing.expectEqual(d2, (try h.entry(h.lookup(sub, ".."))).nodeid);
     // A directory cannot replace a file and vice versa.
     try testing.expectEqual(linux.E.ISDIR, h.call(.{ .rename = .{ .newdir = 1, .flags = 0, .name = "w", .newname = "d1" } }, 1).errno().?);
     try testing.expectEqual(linux.E.NOTDIR, h.call(.{ .rename = .{ .newdir = 1, .flags = 0, .name = "d1", .newname = "w" } }, 1).errno().?);

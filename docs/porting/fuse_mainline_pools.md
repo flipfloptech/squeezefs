@@ -188,3 +188,16 @@ pool"; `slot` "a held lease …" (the pooled hold); `lifecycle` "mainline zero-c
 file"; `session` "the open posture table", "e2e lattice: the mainline stratum" (the seam:
 fail-loud on a legacy kernel, mounts on 7.3) and "e2e mainline pools" (live, skips without
 bit 43).
+
+**Rows on both strata.** A row judging the stock stratum hides BOTH carriers
+(`SQUEEZEFS_TEST_KMBUF_ABSENT` reads the kmbuf ladder and the bufpool offer absent: on a
+mainline kernel the ladder is absent already and the offer alone would keep the pool). A row
+judging zero-message opens (§AF/§AJ) pins `SQUEEZEFS_FUSE_ZC_OPEN=0` beside
+`SQUEEZEFS_FUSE_NO_OPEN=1` (`session.zig`'s `no_open_pin`, `smoke.zig`'s `pinNoOpen`): on a
+mainline zero-copy session the default lever serves opens whatever the mount read, and the
+lever is inert on the legacy rungs. A row judging a zero-copy session asks
+`Session.zeroCopyArmed()` (either stratum), never `mode == .zero_copy`; the smoke reads the
+daemon's INIT line (`bufpool present`, `zero-copy true`) beside its own kmbuf probe. The
+served-open control arm has its own cross-daemon O_TRUNC row ("O_TRUNC UNDER SERVED OPENS
+TRUNCATES"): on mainline it is the default posture, so every OPEN-carried path a no-open
+mount never sends must hold there too.

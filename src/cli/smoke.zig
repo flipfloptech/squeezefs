@@ -7000,12 +7000,21 @@ fn refCensus(report: []const u8) RefCensus {
     return out;
 }
 
-/// The daemon's transport stratum, by the transport's own kmbuf ladder run
-/// here: with the register opcode a root mount is ZeroCopy and the zc legs
-/// arm; without it (a stock distro kernel) the mount is UserEnts and they
-/// stay off — the row judges whichever stratum the kernel offers.
-fn zcKernel() bool {
-    return transport.probes.driver.probeKmbuf(@intCast(derive.facts().page_size)).opcodes() != null;
+/// The daemon's transport stratum, read off its INIT line in `seg` (the
+/// log up to `ready`) and judged against the kernel: the kmbuf ladder run
+/// here (the legacy ZeroCopy rung's carrier) or the bufpool offer the line
+/// reports (MainlinePool, Linux ≥ 7.3) makes a root mount zero-copy and
+/// arms the zc legs; a stock kernel offers neither, mounts UserEnts and
+/// keeps them off — the row judges whichever stratum the kernel offers,
+/// and a kernel with a carrier whose session is not zero-copy is red.
+fn sessionZeroCopy(seg: []const u8) !bool {
+    const at = std.mem.indexOf(u8, seg, "buffer mode ") orelse return error.InitLineMissing;
+    const line = seg[at .. std.mem.indexOfScalarPos(u8, seg, at, '\n') orelse seg.len];
+    const zc = std.mem.indexOf(u8, line, "zero-copy true") != null;
+    const kmbuf = transport.probes.driver.probeKmbuf(@intCast(derive.facts().page_size)).opcodes() != null;
+    const bufpool = std.mem.indexOf(u8, line, "bufpool present") != null;
+    try testing.expectEqual(kmbuf or bufpool, zc);
+    return zc;
 }
 
 /// THE DATA-PLANE PASS on a fresh set (with or without the write cache).
@@ -7014,17 +7023,18 @@ fn dataPlanePass(rig: *Rig, cache: bool) !void {
     const io = rig.io;
     const label: []const u8 = if (cache) "cache" else "no-cache";
     var packed_before_rm: u64 = 0;
-    const zc_legs = zcKernel();
     if (cache) try rig.env.put("SQUEEZEFS_MEM_BUDGET_MB", std.fmt.comptimePrint("{d}", .{cache_row_budget_mib}));
     try rig.formatSet(cache);
     try rig.createImage();
     try rig.spawnMount(&.{});
     const ready_at = try rig.awaitReady(0);
+    var zc_legs = false;
     {
         const text = try rig.readLog();
         defer gpa.free(text);
         const seg = text[0..ready_at];
         try testing.expect(std.mem.indexOf(u8, seg, "data plane: 2 data volume(s)") != null);
+        zc_legs = try sessionZeroCopy(seg);
         if (cache) {
             try testing.expect(std.mem.indexOf(u8, seg, "write cache: ") != null);
             try testing.expect(std.mem.indexOf(u8, seg, "staging ON") != null);
@@ -8379,6 +8389,15 @@ fn pwriteAll(fd: linux.fd_t, data: []const u8, off: u64) !void {
 const close_drain_script = "head -c 4096 \"$1/image\" > g && cat g > /dev/null && head -c {d} \"$1/image\" > f && head -c {d} \"$1/image\" >> g && echo written";
 const close_drain_check = "if head -c {d} \"$1/image\" | cmp -s - f; then echo f-whole; else echo f-LOST; fi; if {{ head -c 4096 \"$1/image\"; head -c {d} \"$1/image\"; }} | cmp -s - g; then echo g-whole; else echo g-LOST; fi";
 
+/// The no-open posture, pinned on every stratum (decision 0003 §BE.3): a
+/// MainlinePool zero-copy mount serves opens under SQUEEZEFS_FUSE_ZC_OPEN's
+/// default (mainline grants zero-copy per open file), so a §AF row judging
+/// zero-message opens holds the lever at 0 — inert on the legacy rungs.
+fn pinNoOpen(rig: *Rig) !void {
+    try rig.env.put("SQUEEZEFS_FUSE_NO_OPEN", "1");
+    try rig.env.put("SQUEEZEFS_FUSE_ZC_OPEN", "0");
+}
+
 /// One posture of the close drain row: write, close, (the control arm:
 /// wait for its asynchronous RELEASE to drain the parked blocks), kill -9,
 /// fsck, remount, both files whole.
@@ -8389,7 +8408,7 @@ fn closeDrainRow(no_open: bool) !void {
     defer rig.deinit();
     try rig.formatSet(false);
     try rig.createImage();
-    try rig.env.put("SQUEEZEFS_FUSE_NO_OPEN", if (no_open) "1" else "0");
+    if (no_open) try pinNoOpen(rig) else try rig.env.put("SQUEEZEFS_FUSE_NO_OPEN", "0");
     // The close posture: the A/B control arm of the write-back timer
     // (decision 0003 §AJ), kept tested.
     try rig.env.put("SQUEEZEFS_WRITEBACK_POSTURE", "close");
@@ -8584,7 +8603,7 @@ test "smoke: CUSTODY NO CLOSE COVERS IS DRAINED ONCE IDLE (decision 0003 §AF) �
     const rig = try Rig.init(gpa, io);
     defer rig.deinit();
     try rig.formatSet(false);
-    try rig.env.put("SQUEEZEFS_FUSE_NO_OPEN", "1");
+    try pinNoOpen(rig);
     try rig.env.put("SQUEEZEFS_WRITEBACK_POSTURE", "close");
     try rig.env.put("SQUEEZEFS_TEST_FUSE_OWED_IDLE_MS", "0");
     try rig.env.put("SQUEEZEFS_BLOCK_REFS_VERIFY", "1");
@@ -8657,7 +8676,7 @@ test "smoke: A CLOSE BURST COALESCES ITS DRAINS (decision 0003 §AF) — no-open
     defer rig.deinit();
     try rig.formatSet(false);
     try rig.createImage();
-    try rig.env.put("SQUEEZEFS_FUSE_NO_OPEN", "1");
+    try pinNoOpen(rig);
     try rig.env.put("SQUEEZEFS_WRITEBACK_POSTURE", "close");
     try rig.env.put("SQUEEZEFS_BLOCK_REFS_VERIFY", "1");
     try rig.spawnMount(&.{});
@@ -8806,7 +8825,7 @@ test "smoke: THE WRITE-BACK TIMER — CLOSE IS LOCAL, THE BOUND HOLDS (decision 
     const rig = try Rig.init(gpa, io);
     defer rig.deinit();
     try rig.formatSet(false);
-    try rig.env.put("SQUEEZEFS_FUSE_NO_OPEN", "1");
+    try pinNoOpen(rig);
     try rig.env.put("SQUEEZEFS_WRITEBACK_POSTURE", "timer");
     try rig.env.put("SQUEEZEFS_BLOCK_REFS_VERIFY", "1");
     try rig.spawnMount(&.{});
@@ -8893,7 +8912,7 @@ test "smoke: UNDER THE WRITE-BACK TIMER fsync, fdatasync AND syncfs ARE STILL DU
     const rig = try Rig.init(gpa, io);
     defer rig.deinit();
     try rig.formatSet(false);
-    try rig.env.put("SQUEEZEFS_FUSE_NO_OPEN", "1");
+    try pinNoOpen(rig);
     try rig.env.put("SQUEEZEFS_WRITEBACK_POSTURE", "timer");
     try rig.env.put("SQUEEZEFS_TEST_FUSE_OWED_IDLE_MS", "600000");
     try rig.env.put("SQUEEZEFS_BLOCK_REFS_VERIFY", "1");
@@ -8962,7 +8981,7 @@ test "smoke: THE WRITE-BACK TIMER UNDER A WRITER STORM — the memory bound (dec
     defer rig.deinit();
     try rig.formatSet(false);
     try rig.createImage();
-    try rig.env.put("SQUEEZEFS_FUSE_NO_OPEN", "1");
+    try pinNoOpen(rig);
     try rig.env.put("SQUEEZEFS_WRITEBACK_POSTURE", "timer");
     var cap_text: [8]u8 = undefined;
     try rig.env.put("SQUEEZEFS_PARKED_BUFFERS", try std.fmt.bufPrint(&cap_text, "{d}", .{wb_storm_cap}));
@@ -9037,7 +9056,7 @@ test "smoke: O_TRUNC UNDER NO-OPEN TRUNCATES (decision 0003 §AF: INIT drops FUS
     const gpa = testing.allocator;
     const rig = try Rig.init(gpa, io);
     defer rig.deinit();
-    try rig.env.put("SQUEEZEFS_FUSE_NO_OPEN", "1");
+    try pinNoOpen(rig);
     try rig.env.put("SQUEEZEFS_MW_BIND", "127.0.0.1:0");
     var t_owner_text: [8]u8 = undefined;
     try rig.env.put("SQUEEZEFS_TEST_MEMBERSHIP_T_OWNER_MS", try std.fmt.bufPrint(&t_owner_text, "{d}", .{smoke_t_owner_ms}));
@@ -9123,7 +9142,7 @@ test "smoke: THE VIRTUAL INODES WITHOUT AN OPEN (decision 0003 §AF) — under n
     const gpa = testing.allocator;
     const rig = try Rig.init(gpa, io);
     defer rig.deinit();
-    try rig.env.put("SQUEEZEFS_FUSE_NO_OPEN", "1");
+    try pinNoOpen(rig);
     try rig.formatSet(false);
     try rig.spawnMount(&.{});
     _ = try rig.awaitReady(0);

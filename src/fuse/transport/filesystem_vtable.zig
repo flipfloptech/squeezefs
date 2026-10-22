@@ -337,6 +337,8 @@ const EchoFsImpl = struct {
     /// kernel latches and opens locally); a FLUSH is answered by
     /// `probe_meta` unless `flush_custody` says the file holds write-back
     /// custody (then it takes the lane, counted in `flushes_dispatched`).
+    /// Cleared at INIT when the session serves opens for zero-copy
+    /// (`InitCaps.zc_open`) — the lifecycle's flip, mirrored.
     no_open: bool = false,
     flush_custody: bool = false,
     /// The write-back timer's close (decision 0003 §AJ): every FLUSH is
@@ -449,6 +451,7 @@ const EchoFsImpl = struct {
         const self = of(ctx);
         self.caps = caps;
         self.io = caps.io;
+        if (caps.zc_open) self.no_open = false;
         self.inited.add(1);
         if (caps.read_zc_serve and builtin.os.tag == .linux) self.buildPool();
     }

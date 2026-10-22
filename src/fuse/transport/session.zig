@@ -1564,11 +1564,16 @@ pub const Session = struct {
     /// the mount loud naming the probe (the only degrade point is the probe).
     fn resolveMode(self: *Session, env: *const std.process.Environ.Map, offered: u64) MountError!void {
         const page: u32 = @intCast(self.facts.page_size);
-        const bufpool_v: probes.Verdict = if (knobs.boolKnob("SQUEEZEFS_TEST_MAINLINE_POOLS", env)) .present else probes.bufpoolVerdict(offered);
+        // The stock stratum's seam hides BOTH fast-buffer UAPIs (a pre-7.3
+        // distro kernel offers neither): on a mainline kernel the kmbuf
+        // ladder already reads absent and the offer alone would keep the
+        // pool.
+        const stock_seam = knobs.boolKnob("SQUEEZEFS_TEST_KMBUF_ABSENT", env);
+        const bufpool_v: probes.Verdict = if (knobs.boolKnob("SQUEEZEFS_TEST_MAINLINE_POOLS", env)) .present else if (stock_seam) .absent else probes.bufpoolVerdict(offered);
         // The kmbuf ladder is a scratch-ring probe with no connection side
         // effect, so it runs on every stratum; the lattice ranks bit 43 above
         // its verdict.
-        const kmbuf_v: probes.KmbufVerdict = if (knobs.boolKnob("SQUEEZEFS_TEST_KMBUF_ABSENT", env)) .absent else probes.driver.probeKmbuf(page);
+        const kmbuf_v: probes.KmbufVerdict = if (stock_seam) .absent else probes.driver.probeKmbuf(page);
         const cap = probes.driver.capSysAdmin(self.io, env);
         // The ring the reply will create (the parameter after our write,
         // `probes.ringAtReply`); the sparse table is the zc slot shape
@@ -2368,6 +2373,12 @@ fn venueMissing() ?testkit.Why {
     return testkit.venue.mount(std.testing.io, &.{});
 }
 
+/// The no-open posture, pinned on every stratum (decision 0003 §BE.3): a
+/// mainline zero-copy session serves opens under the default lever, so a
+/// row judging zero-message opens holds the lever at 0 — the same mount
+/// on the legacy rungs, where the lever is inert.
+const no_open_pin: [2][]const u8 = .{ "SQUEEZEFS_FUSE_ZC_OPEN", "0" };
+
 /// The kernel side of BufRing by the session's own kmbuf ladder: a kernel
 /// without the register opcode (a stock distro kernel) mounts UserEnts only —
 /// no BufRing, and so no zero-copy and no retention, both riding it.
@@ -2735,13 +2746,14 @@ test "e2e: a LOOKUP and a GETATTR the filesystem answers from RAM never leave th
 
 test "e2e: a no-open session (decision 0003 §AF) — INIT drops FUSE_ATOMIC_O_TRUNC; the first OPEN answered ENOSYS latches the kernel, so 16 opens of /hello send ONE OPEN and no RELEASE; every close sends its FLUSH, answered on the worker by the probe (no handler dispatch); a FLUSH the probe declines (custody) drains on the CPU's lane, never the worker's; an O_TRUNC open reaches the filesystem as a SETATTR(size 0)" {
     if (venueMissing()) |why| return testkit.skipWhy(@src(), why);
-    const rig = try Rig.init(testing.allocator, 41, &.{});
+    const rig = try Rig.init(testing.allocator, 41, &.{no_open_pin});
     defer rig.deinit();
     rig.fs.no_open = true;
     // LOOKUP / GETATTR answer on the worker too: the only lane handlers
     // are the ones the row counts.
     rig.fs.meta_probe = true;
     const s = try rig.mountIt(.{ .mem_budget_bytes = 0, .no_open = true });
+    try testing.expect(s.noOpen() and rig.fs.no_open and !rig.fs.caps.?.zc_open);
     try testing.expect(rig.fs.caps.?.negotiated & abi.FUSE_ATOMIC_O_TRUNC == 0);
     const Helper = struct {
         fn readFiles(r: *Rig, result: *anyerror!void) void {
@@ -2804,12 +2816,13 @@ test "e2e: a no-open session (decision 0003 §AF) — INIT drops FUSE_ATOMIC_O_T
 
 test "e2e: the write-back timer's close (decision 0003 §AJ) — on the real kernel a FLUSH answered ENOSYS latches `no_flush`: after ONE open and close of /hello (the OPEN and the FLUSH that latch both postures), 32 more fds of it open and close and the closes send NO request at all — `transport_ring_requests` unmoved across them — and the whole session saw ONE OPEN, ONE FLUSH, no RELEASE" {
     if (venueMissing()) |why| return testkit.skipWhy(@src(), why);
-    const rig = try Rig.init(testing.allocator, 41, &.{});
+    const rig = try Rig.init(testing.allocator, 41, &.{no_open_pin});
     defer rig.deinit();
     rig.fs.no_open = true;
     rig.fs.flush_enosys = true;
     rig.fs.meta_probe = true;
-    _ = try rig.mountIt(.{ .mem_budget_bytes = 0, .no_open = true });
+    const s = try rig.mountIt(.{ .mem_budget_bytes = 0, .no_open = true });
+    try testing.expect(s.noOpen() and rig.fs.no_open);
     const Helper = struct {
         fn closes(r: *Rig, result: *anyerror!void) void {
             result.* = body(r);
@@ -3474,7 +3487,7 @@ test "e2e lattice: an explicit `bufring` mounts BufRing (no arena, every payload
     if (no_kmbuf) |why| return testkit.skipWhy(@src(), why);
 }
 
-test "e2e lattice: the stock stratum (the SQUEEZEFS_TEST_KMBUF_ABSENT seam, a stock distro kernel's verdicts on any venue) — `auto` mounts UserEnts with its arena, kmbuf/zc/retention read absent and publish 0; reads and writes serve byte-exact and the laws close; an explicit `bufring` and `zc` are refused loud naming kmbuf" {
+test "e2e lattice: the stock stratum (the SQUEEZEFS_TEST_KMBUF_ABSENT seam hides the kmbuf ladder AND the bufpool offer: a pre-7.3 distro kernel's verdicts on any venue) — `auto` mounts UserEnts with its arena, bufpool/kmbuf/zc/retention read absent and publish 0; reads and writes serve byte-exact and the laws close; an explicit `bufring` and `zc` are refused loud naming kmbuf, `pool` naming bufpool" {
     if (venueMissing()) |why| return testkit.skipWhy(@src(), why);
     const seam: [2][]const u8 = .{ "SQUEEZEFS_TEST_KMBUF_ABSENT", "1" };
     {
@@ -3484,12 +3497,15 @@ test "e2e lattice: the stock stratum (the SQUEEZEFS_TEST_KMBUF_ABSENT seam, a st
         const s = try rig.mountIt(.{ .mem_budget_bytes = 0 });
         try testing.expectEqual(geometry.BufferMode.user_ents, s.mode);
         try testing.expect(s.verdicts.kmbuf == .absent);
+        try testing.expectEqual(probes.Verdict.absent, s.verdicts.bufpool);
         try testing.expectEqual(probes.Verdict.absent, s.verdicts.zc);
         try testing.expectEqual(probes.Verdict.absent, s.retention);
         try testing.expect(!s.shared.retention);
         try testing.expect(s.slab == null);
+        try testing.expect(s.pool == null);
         try testing.expect(arena_bytes.load() > 0);
         try testing.expectEqual(@as(u64, 0), probes.mode_gauge.load());
+        try testing.expectEqual(@as(u64, 0), probes.bufpool_gauge.load());
         try testing.expectEqual(@as(u64, 0), probes.kmbuf_gauge.load());
         try testing.expectEqual(@as(u64, 0), probes.zc_gauge.load());
         try testing.expectEqual(@as(u64, 0), probes.retention_gauge.load());
@@ -3509,7 +3525,7 @@ test "e2e lattice: the stock stratum (the SQUEEZEFS_TEST_KMBUF_ABSENT seam, a st
         try testing.expectEqual(before.attached, after.attached);
         try testing.expectEqual(before.bridges, after.bridges);
     }
-    for ([_][]const u8{ "bufring", "zc" }, 0..) |mode, i| {
+    for ([_][]const u8{ "bufring", "zc", "pool" }, 0..) |mode, i| {
         const rig = try Rig.init(testing.allocator, 43 + @as(u32, @intCast(i)), &.{ seam, modeEnv(mode) });
         defer rig.deinit();
         log.testing.expectErrorLogs(1);
@@ -3639,7 +3655,7 @@ test "e2e mainline pools (Linux ≥ 7.3; skips where INIT offers no bufpool): `a
     // zero-copy grant — SQUEEZEFS_FUSE_ZC_OPEN=0 under no_open keeps it) is
     // held in its pool buffer and stored to the device straight from it.
     {
-        const rig = try Rig.init(testing.allocator, 67, &.{.{ "SQUEEZEFS_FUSE_ZC_OPEN", "0" }});
+        const rig = try Rig.init(testing.allocator, 67, &.{no_open_pin});
         defer rig.deinit();
         const dev_rc = linux.memfd_create("sqz-pool-hold-dev", linux.MFD.CLOEXEC);
         try testing.expect(linux.errno(dev_rc) == .SUCCESS);
@@ -4550,13 +4566,14 @@ test "e2e TIME_LIMITS: a utimensat with a time outside our advertised range is c
     try testing.expectEqual(abi.TIME_LIMITS_MIN_SEC, rig.fs.scratch_mtime.load(.acquire));
 }
 
-test "e2e fused poll: SQUEEZEFS_FUSE_READ_FUSION=1 on a zc session — a probe that declines its first poll is served by the fused re-poll (fusions > 0, late demotions 0); the partition law holds; on BufRing the lever is inert (demotions)" {
+test "e2e fused poll: SQUEEZEFS_FUSE_READ_FUSION=1 on a zc session (either stratum: the legacy ZeroCopy rung, or MainlinePool with zero-copy queues) — a probe that declines its first poll is served by the fused re-poll (fusions > 0, late demotions 0); the partition law holds; on BufRing and UserEnts the lever is inert (demotions)" {
     if (venueMissing()) |why| return testkit.skipWhy(@src(), why);
     var kb: [192]u8 = undefined;
     const no_kmbuf = kmbufMissing(&kb);
     for ([_][]const u8{ "auto", "bufring" }, 0..) |mode, i| {
-        // `auto` without kmbuf settles on UserEnts (the lever inert, judged
-        // below); an explicit `bufring` there is a refused mount.
+        // `auto` without kmbuf settles on MainlinePool (zero-copy under
+        // root: the fused arm) or UserEnts (the lever inert, judged below);
+        // an explicit `bufring` there is a refused mount.
         if (no_kmbuf != null and std.mem.eql(u8, mode, "bufring")) continue;
         const rig = try Rig.init(testing.allocator, 31 + @as(u32, @intCast(i)), &.{ modeEnv(mode), .{ "SQUEEZEFS_FUSE_READ_FUSION", "1" } });
         defer rig.deinit();
@@ -4572,7 +4589,7 @@ test "e2e fused poll: SQUEEZEFS_FUSE_READ_FUSION=1 on a zc session — a probe t
         }
         const after = Snapshot.take();
         try expectLaws(before, after);
-        if (s.mode == .zero_copy) {
+        if (s.zeroCopyArmed()) {
             try testing.expect(s.shared.read_fusion_on);
             try testing.expect(after.fusions - before.fusions >= 8);
             try testing.expectEqual(before.late_demotions, after.late_demotions);
@@ -4581,8 +4598,9 @@ test "e2e fused poll: SQUEEZEFS_FUSE_READ_FUSION=1 on a zc session — a probe t
             try testing.expect(!s.shared.read_fusion_on);
             try testing.expectEqual(before.fusions, after.fusions);
         }
-        std.debug.print("\nfused ({s}): reads {d}, serves {d}, fusions {d}, demotes {d}, late demotions {d}\n", .{ mode, after.reads - before.reads, after.serves - before.serves, after.fusions - before.fusions, after.demotes - before.demotes, after.late_demotions - before.late_demotions });
+        std.debug.print("\nfused ({s}, {t}): reads {d}, serves {d}, fusions {d}, demotes {d}, late demotions {d}\n", .{ mode, s.mode, after.reads - before.reads, after.serves - before.serves, after.fusions - before.fusions, after.demotes - before.demotes, after.late_demotions - before.late_demotions });
     }
+    // The BufRing arm is the kmbuf kernel's: a mainline venue judged `auto` alone.
     if (no_kmbuf) |why| return testkit.skipWhy(@src(), why);
 }
 

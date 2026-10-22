@@ -7280,6 +7280,132 @@ test "smoke: the data plane WITHOUT the write cache (SQUEEZEFS_WRITE_CACHE_PCT=0
     try dataPlanePass(rig, false);
 }
 
+/// The unlink-storm law row: directories × files per directory, and the
+/// files unlinked with an fd HELD (every `held_stride`-th), whose FORGET
+/// comes at the close — long after the unlink's commit.
+const unlink_storm_dirs: u64 = 20;
+const unlink_storm_files_per_dir: u64 = 1000;
+const unlink_storm_held_stride: u64 = 40;
+
+/// `df`'s used-inode count of the mount (the live-inode population as the
+/// kernel's statfs sees it — the mdtest row's law).
+fn usedInodes(rig: *Rig) !u64 {
+    const out = try rig.onMount("df -Pi . | tail -1 | awk '{print $3}'");
+    defer rig.gpa.free(out);
+    return std.fmt.parseInt(u64, std.mem.trim(u8, out, " \n"), 10) catch error.DfUnparsed;
+}
+
+/// Bounded poll until `df`'s used inodes return to `baseline`.
+fn awaitUsedInodes(rig: *Rig, baseline: u64, deadline_ns: u64) !u64 {
+    const deadline = clock.monotonicNs() + deadline_ns;
+    while (true) {
+        const n = try usedInodes(rig);
+        if (n == baseline or clock.monotonicNs() >= deadline) return n;
+        sleepMs(100);
+    }
+}
+
+/// `mkdir <prefix>0..dirs-1`, `files` touched in each, on the mount.
+fn createTree(rig: *Rig, prefix: []const u8) !void {
+    var script_buf: [512]u8 = undefined;
+    const script = try std.fmt.bufPrint(&script_buf, "d=0; while [ $d -lt {d} ]; do mkdir {s}$d; seq -f \"{s}$d/f%g\" 1 {d} | xargs touch; d=$((d+1)); done; echo created", .{ unlink_storm_dirs, prefix, prefix, unlink_storm_files_per_dir });
+    const out = try rig.onMountTimed(script, 300);
+    defer rig.gpa.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "created") != null);
+}
+
+fn removeTree(rig: *Rig, prefix: []const u8) !void {
+    var script_buf: [128]u8 = undefined;
+    const script = try std.fmt.bufPrint(&script_buf, "rm -rf {s}[0-9]*; echo removed", .{prefix});
+    const out = try rig.onMountTimed(script, 300);
+    defer rig.gpa.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "removed") != null);
+}
+
+test "smoke: THE UNLINK STORM'S INODE LAW (the mdtest row: ONE of 640,033 unlinked inodes never destroyed by the live daemon — its FORGET's try-only judgement met an SMO window, the set face answered Corrupt for WouldBlock and the corpse was judged 'live'; the next mount's sweep found it) — 20,000 files in 20 directories, 500 unlinked with an fd HELD (nlink 0, no FORGET until the close; the 20 directories pinned by them) → `rm -rf` → a second tree's storm → the closes → `rm -rf` it too: every unlinked inode is destroyed by the live daemon within the reclaim cadence (fuse_reclaim_destroys = the unlinks) and `df`'s inodes are back at the baseline WHILE MOUNTED → clean umount → fsck --offline --scrub 0 findings and NO corpse for its mount sweep" {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    try rig.formatSet(false);
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(0);
+    const inodes0 = try usedInodes(rig);
+    const before = try rig.statsTail();
+    defer gpa.free(before);
+    const destroys0 = numberAfter(before, "\"fuse_reclaim_destroys\":") orelse 0;
+    const deferred0 = numberAfter(before, "\"fuse_forget_judgements_deferred\":") orelse 0;
+    const per_tree = unlink_storm_dirs * (unlink_storm_files_per_dir + 1);
+    try createTree(rig, "d");
+    try testing.expectEqual(inodes0 + per_tree, try usedInodes(rig));
+    // The held fds: one file in `held_stride` of the first tree.
+    const held_n: usize = @intCast(unlink_storm_dirs * (unlink_storm_files_per_dir / unlink_storm_held_stride));
+    const held = try gpa.alloc(linux.fd_t, held_n);
+    defer gpa.free(held);
+    var opened: usize = 0;
+    defer for (held[0..opened]) |fd| {
+        _ = linux.close(fd);
+    };
+    for (0..unlink_storm_dirs) |d| {
+        var f: u64 = unlink_storm_held_stride;
+        while (f <= unlink_storm_files_per_dir) : (f += unlink_storm_held_stride) {
+            var path_buf: [256]u8 = undefined;
+            const path = try std.fmt.bufPrintSentinel(&path_buf, "{s}/d{d}/f{d}", .{ rig.mp, d, f }, 0);
+            held[opened] = try openRaw(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true });
+            opened += 1;
+        }
+    }
+    try testing.expectEqual(held_n, opened);
+    try removeTree(rig, "d");
+    // Every unheld file's corpse is destroyed at its FORGET; the held ones
+    // sit at nlink 0 — and so do the 20 directories: a held file's dentry
+    // pins its parent's, so their FORGETs come with the closes.
+    const hot = per_tree - held_n - unlink_storm_dirs;
+    {
+        const t = try awaitAtLeast(rig, "\"fuse_reclaim_destroys\":", destroys0 + hot, 60 * std.time.ns_per_s);
+        defer gpa.free(t);
+        try testing.expectEqual(destroys0 + hot, numberAfter(t, "\"fuse_reclaim_destroys\":") orelse 0);
+    }
+    // A second tree's storm between the unlinks and their FORGETs (splits,
+    // compactions), then the closes: RELEASE, then the FORGET of an inode
+    // at nlink 0 — judged long after its unlink's commit.
+    try createTree(rig, "e");
+    for (held[0..opened]) |fd| _ = linux.close(fd);
+    opened = 0;
+    // THE LAW: every unlinked inode is destroyed by the live daemon within
+    // the reclaim cadence — never only at the dismount or the next mount —
+    // and `df`'s inode count is back at its baseline while mounted.
+    try removeTree(rig, "e");
+    const removed = 2 * per_tree;
+    const inodes = try awaitUsedInodes(rig, inodes0, 60 * std.time.ns_per_s);
+    const tail = try awaitAtLeast(rig, "\"fuse_reclaim_destroys\":", destroys0 + removed, 10 * std.time.ns_per_s);
+    defer gpa.free(tail);
+    const destroys = numberAfter(tail, "\"fuse_reclaim_destroys\":") orelse 0;
+    const deferred = numberAfter(tail, "\"fuse_forget_judgements_deferred\":") orelse 0;
+    std.debug.print("\nsmoke[unlink storm law]: {d} removed ({d} with the fd held past the unlink) → destroys +{d}, forget judgements deferred +{d}, df inodes {d} (baseline {d})\n", .{ removed, held_n, destroys - destroys0, deferred - deferred0, inodes, inodes0 });
+    try testing.expectEqual(inodes0, inodes);
+    try testing.expectEqual(destroys0 + removed, destroys);
+    try expectMustStayZero(tail);
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+    {
+        const r = try rig.squeezefs(&.{ "fsck", "--offline", "--scrub", rig.meta_uri });
+        defer rig.freeRun(r);
+        if (!r.term.success() or std.mem.indexOf(u8, r.stdout, "findings: 0 (clean)") == null) {
+            std.debug.print("\n--- fsck --offline --scrub after the unlink storm ({f}) ---\n{s}\n--- stderr ---\n{s}\n", .{ r.term, r.stdout, r.stderr });
+            return error.FsckNotClean;
+        }
+        // fsck's own mount sweeps `nlink == 0` records the daemon left: a
+        // lost corpse surfaces HERE (an `nlink == 0` record is a legal
+        // census state, never a finding).
+        if (std.mem.indexOf(u8, r.stderr, "corpse sweep at mount:")) |i| {
+            std.debug.print("\n--- the live daemon left a corpse: {s}\n", .{r.stderr[i..@min(r.stderr.len, i + 160)]});
+            return error.CorpseLeftToTheMountSweep;
+        }
+    }
+}
+
 /// Kernel aio (the raw `io_setup`/`io_submit`/`io_getevents` syscalls — no
 /// shim, no libaio) against `path` on a mount: `n` PWRITEs of one 4 KiB
 /// page each in ONE `io_submit` (offsets `0, 4 KiB, …`: a fresh file's

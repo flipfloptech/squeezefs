@@ -2762,14 +2762,25 @@ pub const KvBackend = struct {
         return tree.routeContent(be.trees.load(), kind, k);
     }
 
+    /// A tree read's error onto the store's. `WouldBlock` is the try-only
+    /// contract (decision 0003 §AB.1: `node_cache.try_only` met a leaf the
+    /// cache does not hold, or an SMO window it will not wait out) and
+    /// must stay itself: the caller re-asks blocking or defers — a FORGET
+    /// whose corpse judgement read `Corrupt` instead judged the inode
+    /// live and lost its corpse until the next mount's sweep.
+    pub fn readError(e: tree.Error) Error {
+        return switch (e) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.Io => error.Io,
+            error.WouldBlock => error.WouldBlock,
+            else => error.Corrupt,
+        };
+    }
+
     /// Point lookup through the tree (latch-free); an owned copy.
     pub fn lookup(be: *KvBackend, gpa: Allocator, kind: u8, k: []const u8) Error!?[]u8 {
         const t = be.treeForKey(kind, k) orelse return error.Corrupt;
-        return t.lookup(gpa, k) catch |e| switch (e) {
-            error.OutOfMemory => error.OutOfMemory,
-            error.Io => error.Io,
-            else => error.Corrupt,
-        };
+        return t.lookup(gpa, k) catch |e| readError(e);
     }
 
     /// Range scan over `[start, end]` of one kind; both bounds route to the
@@ -2783,11 +2794,7 @@ pub const KvBackend = struct {
         if (kind == key.TREE_BLOCK_REFS) return be.rangeRefs(gpa, start, end, max, out);
         const t = be.treeForKey(kind, start) orelse return error.Corrupt;
         if (be.treeForKey(kind, end) != t) return error.Corrupt;
-        t.range(gpa, start, end, max, out) catch |e| return switch (e) {
-            error.OutOfMemory => error.OutOfMemory,
-            error.Io => error.Io,
-            else => error.Corrupt,
-        };
+        t.range(gpa, start, end, max, out) catch |e| return readError(e);
     }
 
     /// The refs range over every slot tree, PAGED soundly: each tree is
@@ -2802,11 +2809,7 @@ pub const KvBackend = struct {
         for (be.trees.load()) |t| {
             if (t.forest_slot == null) continue;
             const before = out.items.len;
-            t.range(gpa, start, end, max, out) catch |e| return switch (e) {
-                error.OutOfMemory => error.OutOfMemory,
-                error.Io => error.Io,
-                else => error.Corrupt,
-            };
+            t.range(gpa, start, end, max, out) catch |e| return readError(e);
             const got = out.items.len - before;
             if (got == max and max != std.math.maxInt(usize)) {
                 const last = out.items[out.items.len - 1].key;

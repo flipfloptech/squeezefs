@@ -36,6 +36,7 @@ const derive = @import("../core/derive.zig");
 const uring_fs = @import("../io/uring_fs.zig");
 const key = @import("key.zig");
 const tree = @import("tree.zig");
+const node_cache = @import("node_cache.zig");
 const merged_walk = @import("merged_walk.zig");
 const tx = @import("tx.zig");
 const ledger = @import("ledger.zig");
@@ -377,21 +378,13 @@ pub const MetaSet = struct {
     pub fn lookupCounted(self: *MetaSet, gpa: Allocator, kind: u8, k: []const u8, cost: *tree.WalkCost) Error!?[]u8 {
         const t = (try self.treeOfKey(kind, k)) orelse return null;
         cost.sources += 1;
-        return t.lookupCounted(gpa, k, cost) catch |e| switch (e) {
-            error.OutOfMemory => error.OutOfMemory,
-            error.Io => error.Io,
-            else => error.Corrupt,
-        };
+        return t.lookupCounted(gpa, k, cost) catch |e| KvBackend.readError(e);
     }
 
     /// `lookup` over the borrowed value (`KvTree.lookupView`): no copy.
     pub fn lookupView(self: *MetaSet, gpa: Allocator, kind: u8, k: []const u8, comptime T: type, ctx: anytype, comptime visit: fn (@TypeOf(ctx), []const u8) T) Error!?T {
         const t = (try self.treeOfKey(kind, k)) orelse return null;
-        return t.lookupView(gpa, k, T, ctx, visit) catch |e| switch (e) {
-            error.OutOfMemory => error.OutOfMemory,
-            error.Io => error.Io,
-            else => error.Corrupt,
-        };
+        return t.lookupView(gpa, k, T, ctx, visit) catch |e| KvBackend.readError(e);
     }
 
     /// Range scan over `[start, end]` of one kind. Bounds of an ino-major
@@ -472,11 +465,7 @@ pub const MetaSet = struct {
     };
 
     fn rangeIn(t: *tree.KvTree, gpa: Allocator, start: []const u8, end: []const u8, max: usize, out: *std.ArrayList(tree.KeyValue), cost: *tree.WalkCost) Error!void {
-        t.rangeCounted(gpa, start, end, max, out, cost) catch |e| return switch (e) {
-            error.OutOfMemory => error.OutOfMemory,
-            error.Io => error.Io,
-            else => error.Corrupt,
-        };
+        t.rangeCounted(gpa, start, end, max, out, cost) catch |e| return KvBackend.readError(e);
     }
 
     /// Commit `t`: the one member every record lives on; a tx spanning
@@ -1132,4 +1121,55 @@ test "a tx spanning two members never reaches a member: refused EIO on the tripw
         const got = (try set.lookup(gpa, key.TREE_INODES, &key.inodeKey(child))).?;
         defer gpa.free(got);
     }
+}
+
+test "the try-only read contract through the SET face (decision 0003 §AB.1): a lookup, a view and a range whose leaf the cache does not hold answer WouldBlock — never Corrupt (the same answer a try-only descent gives from an SMO's swap window, which it never waits out) — so a caller that keys on WouldBlock defers instead of failing (the FORGET corpse judgement: WouldBlock ⇒ gathered for the cadence; Corrupt → InputOutput was judged 'live' and the corpse dropped — the mdtest row: ONE unlinked inode of 640,033 never destroyed by the live daemon under 4,882 compactions, found by the next mount's sweep)" {
+    const gpa = testing.allocator;
+    const s = try TestSet.createClass(gpa, "try-only", 1, .single_writer);
+    defer s.destroy();
+    // 64 records of 4000 B: several 64 KiB leaves under an interior root,
+    // so after the reopen the root (pinned at open) is resident and no
+    // leaf is.
+    const N: u64 = 64;
+    const value = try gpa.alloc(u8, 4000);
+    defer gpa.free(value);
+    {
+        const set = try s.open();
+        for (0..N) |i| {
+            @memset(value, @truncate(i));
+            const t = try set.begin(@src());
+            try t.stagePut(key.TREE_INODES, &key.inodeKey(1000 + i), value);
+            try set.commit(t);
+        }
+        try set.checkpointNow();
+        set.close();
+    }
+    const set = try s.open();
+    defer set.close();
+    const first = key.inodeKey(1000);
+    const last = key.inodeKey(1000 + N - 1);
+    const Visit = struct {
+        fn len(_: void, v: []const u8) usize {
+            return v.len;
+        }
+    };
+    var kvs: std.ArrayList(tree.KeyValue) = .empty;
+    defer tree.deinitKeyValues(gpa, &kvs);
+    {
+        node_cache.try_only = true;
+        defer node_cache.try_only = false;
+        try testing.expectError(error.WouldBlock, set.lookup(gpa, key.TREE_INODES, &last));
+        try testing.expectError(error.WouldBlock, set.lookupView(gpa, key.TREE_INODES, &last, usize, {}, Visit.len));
+        try testing.expectError(error.WouldBlock, set.range(gpa, key.TREE_INODES, &first, &last, 8, &kvs));
+    }
+    // The blocking read pages the leaf in; the try-only repeat serves it.
+    const got = (try set.lookup(gpa, key.TREE_INODES, &last)).?;
+    defer gpa.free(got);
+    try testing.expectEqual(@as(usize, 4000), got.len);
+    node_cache.try_only = true;
+    defer node_cache.try_only = false;
+    const again = (try set.lookup(gpa, key.TREE_INODES, &last)).?;
+    defer gpa.free(again);
+    try testing.expectEqualSlices(u8, got, again);
+    try testing.expectEqual(@as(?usize, 4000), try set.lookupView(gpa, key.TREE_INODES, &last, usize, {}, Visit.len));
 }

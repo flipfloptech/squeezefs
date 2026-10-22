@@ -617,8 +617,10 @@ pub const RenameOutcome = struct {
 /// Routed same-volume rename — ONE whole-tx entry: EXCHANGE swap /
 /// NOREPLACE guard / replace with destination nlink accounting + ENOTEMPTY,
 /// the directory-move parent nlink shift (`..` now names the new parent:
-/// old `− 1`, new `+ 1`, as full `Put`s that carry the parents' times), the
-/// parents' `SharedTimes` otherwise, the moved inode's Δctime, the whiteout.
+/// old `− 1`, new `+ 1`, as full `Put`s that carry the parents' times; a
+/// cross-parent swap of a directory with a non-directory shifts the same
+/// way, towards the parent that receives the directory), the parents'
+/// `SharedTimes` otherwise, the moved inode's Δctime, the whiteout.
 /// Stage order is the reference's. Parents' guards: SHARED where they
 /// receive only a Δ, EXCLUSIVE where the directory move rewrites them.
 pub fn stageRename(t: *tx.KvTx, p: Rename) RenameError!RenameOutcome {
@@ -638,16 +640,32 @@ pub fn stageRename(t: *tx.KvTx, p: Rename) RenameError!RenameOutcome {
         try t.stageDelete(key.TREE_DENTRIES, &new_d.key);
         const nk = try stageDentryPut(t, p.name_key, p.new_parent, p.new_name, p.new_chain, old_d.child_ino, old_d.file_type);
         _ = try stageDentryPut(t, p.name_key, p.old_parent, p.old_name, p.old_chain, new_d.child_ino, new_d.file_type);
-        // Both parents' Δtimes + both swapped inodes' Δctimes ride the
-        // swap entry, deduped for the shared-parent / same-inode shapes.
-        try (SharedTimes{ .parent = p.old_parent, .now = p.now }).stage(t);
-        if (cross_dir) try (SharedTimes{ .parent = p.new_parent, .now = p.now }).stage(t);
+        // The parents' nlink law for a swap: a `..` moves only when the
+        // kinds differ ACROSS parents — dir(a) ↔ file(b): old −1 / new +1;
+        // file(a) ↔ dir(b): old +1 / new −1 (exclusive Puts, times folded
+        // in). file ↔ file and dir ↔ dir move nothing net, and a
+        // same-parent swap of any kinds moves nothing: Δtimes under SHARED
+        // (fstests generic/025: the un-shifted counts left the cleanup's
+        // rmdir firing the underflow guard ×4 and the other parent inflated).
+        const a_dir = @as(u32, old_d.file_type) << 12 == S.IFDIR;
+        const b_dir = @as(u32, new_d.file_type) << 12 == S.IFDIR;
+        if (cross_dir and a_dir != b_dir) {
+            const old_rec = try stageParentUpdate(t, p.old_parent, false, if (a_dir) -1 else 1, p.now, p.old_parent_value, false);
+            const new_rec = try stageParentUpdate(t, p.new_parent, false, if (a_dir) 1 else -1, p.now, p.new_parent_value, false);
+            plan.inode(p.old_parent, parentGuardFor(old_rec));
+            plan.inode(p.new_parent, parentGuardFor(new_rec));
+        } else {
+            // Both parents' Δtimes, deduped for the shared-parent shape.
+            try (SharedTimes{ .parent = p.old_parent, .now = p.now }).stage(t);
+            if (cross_dir) try (SharedTimes{ .parent = p.new_parent, .now = p.now }).stage(t);
+            plan.inode(p.old_parent, .shared);
+            plan.inode(p.new_parent, .shared);
+        }
+        // Both swapped inodes' Δctimes, deduped for the same-inode shape.
         if (p.src_local) |src| try t.stageDelta(key.TREE_INODES, &key.inodeKey(src), InodeDelta.ctime(p.now));
         if (p.dest_local) |dst| {
             if (p.src_local != dst) try t.stageDelta(key.TREE_INODES, &key.inodeKey(dst), InodeDelta.ctime(p.now));
         }
-        plan.inode(p.old_parent, .shared);
-        plan.inode(p.new_parent, .shared);
         if (p.src_local) |src| plan.inode(src, .exclusive);
         if (p.dest_local) |dst| plan.inode(dst, .exclusive);
         return .{ .guards = plan, .new_key = nk };

@@ -969,6 +969,14 @@ pub fn Striping(comptime Store: type) type {
         census: Census,
         k: u8,
         /// The last fold persisted per directory (the cadence bound).
+        /// Owned by `persisted_lock`: every fold of a striped directory
+        /// (any FUSE worker's `stat`/`lookup` of `D`) reads AND stamps it,
+        /// so the check-and-stamp is one critical section — two folds
+        /// racing it both persisted (two commits per cadence) and ran two
+        /// `put`s on this map at once (`std.hash_map`'s pointer_stability
+        /// panic, the striped smoke row's daemon death 1 run in 85). The
+        /// hold is a hash-map op; the commit runs outside it.
+        persisted_lock: sync.Mutex = .init,
         persisted: std.AutoHashMapUnmanaged(u64, u64) = .empty,
         /// What a flip the census triggered hands back (the filesystem's
         /// map cache, the migration's queue); null = the harness.
@@ -1228,20 +1236,42 @@ pub fn Striping(comptime Store: type) type {
             for (map.slice(), 0..) |s, i| vals[i] = self.src.inode(self.src.ctx, s) catch null;
             const folded = foldAttrs(d, vals[0..map.k]);
             if (self.plane.isLocal(map.dir) and (economy.laterThan(folded.mtime, d.mtime) or economy.laterThan(folded.ctime, d.ctime))) {
-                const last = self.persisted.get(map.dir) orelse 0;
-                if (now -| last >= ops.CADENCE_TICK_NS) {
-                    test_seams.holdBeforePersist(self.plane.io);
-                    var v = d;
-                    v.mtime = folded.mtime;
-                    v.ctime = folded.ctime;
-                    const t = self.plane.apply.store.begin(@src()) catch return error.OutOfMemory;
-                    t.stagePut(key.TREE_INODES, &key.inodeKey(route_table.effectiveIno(map.dir)), &v.encode()) catch return error.OutOfMemory;
-                    self.plane.apply.store.commit(t) catch return error.Io;
-                    self.persisted.put(self.plane.gpa, map.dir, now) catch return error.OutOfMemory;
-                    stats.dir_stripe_time_batches.inc();
-                }
+                // The cadence slot is claimed BEFORE the commit: a fold
+                // racing this one sees the claim and skips; a failed
+                // commit hands the slot back.
+                const last = (try self.claimPersist(map.dir, now)) orelse return folded;
+                errdefer self.unclaimPersist(map.dir, last);
+                test_seams.holdBeforePersist(self.plane.io);
+                var v = d;
+                v.mtime = folded.mtime;
+                v.ctime = folded.ctime;
+                const t = self.plane.apply.store.begin(@src()) catch return error.OutOfMemory;
+                t.stagePut(key.TREE_INODES, &key.inodeKey(route_table.effectiveIno(map.dir)), &v.encode()) catch return error.OutOfMemory;
+                self.plane.apply.store.commit(t) catch return error.Io;
+                stats.dir_stripe_time_batches.inc();
             }
             return folded;
+        }
+
+        /// The fold's cadence claim on `dir` (`persisted_lock`): the stamp it
+        /// replaces when a cadence has passed since it (the stamp is `now`
+        /// from here on), null while the last persist is still fresh.
+        fn claimPersist(self: *Self, dir: u64, now: u64) Error!?u64 {
+            self.persisted_lock.lockUncancelable(self.plane.io);
+            defer self.persisted_lock.unlock(self.plane.io);
+            const last = self.persisted.get(dir) orelse 0;
+            if (now -| last < ops.CADENCE_TICK_NS) return null;
+            self.persisted.put(self.plane.gpa, dir, now) catch return error.OutOfMemory;
+            return last;
+        }
+
+        /// A claim whose commit failed: the stamp goes back to `last` so the
+        /// next fold persists instead of waiting out this cadence.
+        fn unclaimPersist(self: *Self, dir: u64, last: u64) void {
+            self.persisted_lock.lockUncancelable(self.plane.io);
+            defer self.persisted_lock.unlock(self.plane.io);
+            // The key is the claim's own; nothing removes one.
+            self.persisted.putAssumeCapacity(dir, last);
         }
 
         /// `rmdir D` (the striped shape): ONE exclusive set over the

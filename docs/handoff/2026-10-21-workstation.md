@@ -82,7 +82,18 @@ next landing on top of it, and its model must include the fold's ordering invari
    row lives under Red (the write cache answers with its floor; the read cache skips judging). Worth
    an owner look at the budget's attribution — the cage's unreclaimable arm (16 test binaries +
    daemons) over 70 % of RAM is ≈ 100 % whatever the census divides by.
-5. The release window (owner's go), the 200 G venue (owner's inventory), the upstream postings
+5. **Two more release rows (owner, 2026-10-22), beside LTP and xfstests:** (a) an `mpirun` of mdtest
+   must pass (the perf shape — `mpirun --allow-run-as-root --oversubscribe -np 32`
+   `/opt/sqz-tools/bin/mdtest -n 10000 -u`; pass = 0 errors, fsck clean, tripwires 0, no daemon
+   alert); (b) the parallel `tar -x` the reference's acceptance ensured — its `sym-tarx` gate 2
+   (`~/Source/squeezefs/tests/run_mw_matrix.sh` `leg_sym_tarx`; `tests/cloud_sym_rows.sh`): the linux
+   `fs/` corpus (2,384–2,468 entries) extracted by a JOINED writer into a directory it created,
+   A-B-B-A against the manager's own extract S0; law wall ≤ 1.10× S0, wire verbs/entry < 0.05,
+   slot handovers 0, rpcs 0, fsck clean. Our tree has the single-mount concurrent form
+   (`scripts/bracket/rows/tar-x.sh`) and the contract (`docs/porting/sym_tokens_intents_striping.md`,
+   D1); the two need suite scripts under `scripts/suites/` (`mdtest.sh`, `tarx.sh`: fail early, the
+   ledger discipline of `fstests.sh`) — class C, run in the release window.
+6. The release window (owner's go), the 200 G venue (owner's inventory), the upstream postings
    (owner: Signed-off-by, 5 items), patches 0031–0033 still unmeasured, the smaller owed items of
    the 10-20 note (item 4 there) unchanged.
 

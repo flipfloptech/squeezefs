@@ -319,18 +319,21 @@ pub const Refused = struct {
 };
 
 /// Decision 0003 §BD: the lock-free admission's room — a volume with at
-/// least twice the compaction reserve plus `SPLIT_EXTENTS_PER_TX` extents
-/// per transaction the conveyor can hold in flight (`caps.txs`): every leaf
-/// an in-flight transaction could push past its node splits at writeback
-/// from extents that exist, so no promise is owed and no lock is taken;
-/// near the reserve every admission takes the locked law.
+/// least twice the compaction reserve plus one extent per transaction the
+/// conveyor can hold in flight (`caps.txs`), so a leaf the fast path
+/// over-admitted (its hint read before a concurrent apply) splits at
+/// writeback from extents that exist; near the reserve every admission
+/// takes the locked law.
 pub fn fastPathRoom(free_extents: u64, reserve_extents: u64, txs_in_flight_cap: u64) bool {
-    return free_extents >= 2 * reserve_extents + SPLIT_EXTENTS_PER_TX * txs_in_flight_cap;
+    return free_extents >= 2 * reserve_extents + txs_in_flight_cap;
 }
 
-/// A transaction's records touch two leaves (a create: the inode's and
-/// the dentry's) and a leaf's split takes two extents.
-pub const SPLIT_EXTENTS_PER_TX: u64 = 4;
+/// §BD: the fast path's fit on ONE leaf from its published hint and the
+/// bytes already admitted onto it without the lock: the projected log end
+/// with every in-flight byte and this transaction's in place.
+pub fn fastPathFits(layout: NodeLayout, hint_fixed: usize, hint_overlay: usize, inflight: usize, mine: usize) bool {
+    return hint_fixed + layout.appendFrameLen(hint_overlay + inflight + mine) <= layout.nodeSize();
+}
 
 /// The encoded (bset) length of a staged record.
 pub fn encodedLen(r: tx.Rec) usize {

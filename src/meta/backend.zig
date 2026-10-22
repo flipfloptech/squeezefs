@@ -3596,7 +3596,7 @@ test "§BB.1 the ack at the apply: under the coalesced cadence this mount's kern
     }
 }
 
-test "§BD the leaf set of a create: on a volume with room a kernel create takes at most TWO leaf write locks (the child's inode leaf and the parent's dentry leaf — one leaf when both records share it) at the apply and NONE at the admission (the lock-free fast path owes no promise where the room guarantees the split's extents)" {
+test "§BD the leaf set of a create: on a volume with room a kernel create takes at most TWO leaf write locks (the child's inode leaf and the parent's dentry leaf — one leaf when both records share it) at the apply and NONE at the admission (the lock-free fast path charges and releases the leaves' in-flight bytes, charged ≡ released once the commit returned)" {
     const gpa = testing.allocator;
     const v = try TestVol.create(gpa, "leaf-set", "600000");
     defer v.destroy();
@@ -3618,6 +3618,8 @@ test "§BD the leaf set of a create: on a volume with room a kernel create takes
     // The charge is released once the apply published the bytes: every
     // leaf's in-flight word is back at zero after the commit returned.
     try be.fsync();
+    try testing.expectEqual(cs.inflight_charged_bytes.load(), cs.inflight_released_bytes.load());
+    try testing.expect(cs.inflight_charged_bytes.load() > 0);
 }
 
 test "§BC self-apply: a 4-thread storm of this mount's kernel's creates — every member applied itself (self_applies ≡ commits, acks at the apply ≡ commits, no applier venue entered), every ack present and replayed after the reopen; one member poisoned mid-storm rolls out ALONE as a PAD over its range (its window's survivors stand, nothing rolled back, no hole), and the strict and venue arms park every commit until the landing" {

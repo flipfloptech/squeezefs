@@ -45,7 +45,6 @@
 //! `RamLoader` is the in-RAM volume the contracts run over.
 
 const std = @import("std");
-const clock = @import("../core/clock.zig");
 const counters = @import("../core/counters.zig");
 const log = @import("../core/log.zig");
 const derive = @import("../core/derive.zig");
@@ -162,10 +161,6 @@ pub const stats = struct {
     pub var meta_kv_node_freeze_shadow_dropped: counters.ShardedCounter = .{};
     /// A flush appended a parked frozen delta and KEPT the open records' floor.
     pub var meta_kv_flush_floor_kept: counters.ShardedCounter = .{};
-    /// `meta_kv_freeze_locked_ns`: a leaf's freeze under its write lock —
-    /// the flatten, the shadow fold, the frame encode and the base index's
-    /// incremental extension (decision 0003 §BE: the committers' wait).
-    pub var meta_kv_freeze_locked_ns: counters.ShardedLatencyHistogram = .{};
     /// Reader-side: stale-stamped hits refused / mappings dropped / re-reads.
     pub var meta_kv_revalidate_stale_serves: counters.ShardedCounter = .{};
     pub var meta_kv_revalidate_nodes_dropped: counters.ShardedCounter = .{};
@@ -623,6 +618,12 @@ pub const NodeDirty = struct {
 // The cached node.
 // ---------------------------------------------------------------------------
 
+/// `CachedNode.log_hint`'s packing: both halves are node offsets (a node
+/// is ≤ 4 GiB by the format), so 32 bits each.
+fn packLogHint(tail_offset: usize, frozen_frame_len: usize, overlay_bytes: usize) u64 {
+    return (@as(u64, @intCast(tail_offset + frozen_frame_len)) << 32) | @as(u64, @intCast(overlay_bytes & 0xFFFF_FFFF));
+}
+
 pub const CachedNode = struct {
     cache: *NodeCache,
     /// References held: the map's shard snapshots plus every caller that
@@ -656,6 +657,13 @@ pub const CachedNode = struct {
     dirty_floor: std.atomic.Value(u64),
     /// The slot tree this node belongs to on a forest volume (RAM-only).
     forest_slot: std.atomic.Value(u32),
+    /// The leaf's log-end inputs as of the last write unlock, packed
+    /// `(tail_offset + frozen frame) << 32 | overlay_bytes` (decision 0003
+    /// §BD: the heap admission's lock-free fast path reads them).
+    log_hint: std.atomic.Value(u64),
+    /// Bytes admitted onto this leaf without its lock and not yet applied
+    /// (§BD): the fast path's own reservation against the node's room.
+    inflight_admitted: std.atomic.Value(u64),
 
     /// Build from a verified extent (`loaded` borrows `buf`; both are
     /// consumed). Born clean with one reference, the caller's.
@@ -723,6 +731,8 @@ pub const CachedNode = struct {
             .pinned = .init(pinned),
             .dirty_floor = .init(no_floor),
             .forest_slot = .init(no_forest_slot),
+            .log_hint = .init(packLogHint(ld.tail_offset, 0, 0)),
+            .inflight_admitted = .init(0),
         };
         if (pinned) cache.pinned_nodes.add(1);
         // The extent buffer's own reference: the sources hold theirs.
@@ -767,7 +777,18 @@ pub const CachedNode = struct {
     }
 
     pub fn unlockWrite(self: *CachedNode, io: Io) void {
+        // The hint BEFORE the unlock: release pairs with the fast path's
+        // acquire load — a reader sees the log end this writer left.
+        const frozen: usize = if (self.dirty.frozen) |*f| f.frame_len else 0;
+        self.log_hint.store(packLogHint(self.dirty.tail_offset, frozen, self.dirty.overlay_bytes), .release);
         self.lock.unlock(io);
+    }
+
+    /// The last published log-end inputs (§BD): the fixed part (the tail
+    /// and a frozen frame) and the open overlay's bytes.
+    pub fn logHint(self: *const CachedNode) struct { fixed: usize, overlay: usize } {
+        const h = self.log_hint.load(.acquire);
+        return .{ .fixed = @intCast(h >> 32), .overlay = @intCast(h & 0xFFFF_FFFF) };
     }
 
     pub fn lockRead(self: *CachedNode, io: Io) *const NodeDirty {
@@ -1184,8 +1205,6 @@ pub const CachedNode = struct {
     pub fn freezeLocked(self: *CachedNode, dirty: *NodeDirty, layout: NodeLayout) FreezeError!?*const FrozenDelta {
         const gpa = self.cache.gpa;
         if (dirty.frozen) |*f| return f;
-        const t0 = clock.monotonicNs();
-        defer stats.meta_kv_freeze_locked_ns.record(clock.monotonicNs() -| t0);
         // RES-22 self-heal: FREEZING latched with NO frozen delta on a live
         // node is a freeze that never completed. The two known windows
         // (the W-A error escape below, the forced-freeze drop) are closed

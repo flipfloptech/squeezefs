@@ -65,6 +65,16 @@ SUITE_META_MIB=${SUITE_META_MIB:-1024}
 SUITE_DATA_GIB=${SUITE_DATA_GIB:-8}
 # The release posture; see the module comment for each option's WHY.
 SUITE_MOUNT_OPTS=${SUITE_MOUNT_OPTS:-default_permissions,allow_other}
+# A daemon log's loud lines (`suite_daemon_alerts`, fstests.sh's per-set
+# census): a `--log-file` line is `<epoch s>.<ms> <level>(<scope>): …`
+# (`cli/log_sink.zig`), a stderr line `<level>(<scope>): …`, and the warn
+# level's text is `warning` (`std.log.Level.asText`). The level token counts
+# at the line's start or after a blank (the prefix's), never mid-word; a
+# TRIPWIRE token counts anywhere. (Until 2026-10-22 the pattern was
+# `^(error|warn)\(`: anchored at column 0 under a prefixed log and naming a
+# level text that never occurs, it counted 1,407 `error(` lines as 0 alerts
+# and matched the TRIPWIRE token alone.)
+SUITE_ALERT_RE='(^|[[:space:]])(error|warning)\(|TRIPWIRE'
 # The venue's package family, from /etc/os-release (a derivative names its parent in
 # ID_LIKE: Omarchy says ID=omarchy ID_LIKE=arch):
 #   apt     Debian/Ubuntu. One lock per distro release (`apt.<ID>-<VERSION_ID>.lock`): each
@@ -345,15 +355,17 @@ suite_live_daemons() {
   return 0
 }
 
-# The daemon log's loud lines (errors, warnings, tripwires): printed and
-# counted; a tripwire line is a gate failure on its own.
+# The daemon log's loud lines (errors, warnings, tripwires; `SUITE_ALERT_RE`):
+# counted on every run (a 0 is part of the pass's evidence), printed when
+# there are any; a tripwire line is a gate failure on its own.
 suite_daemon_alerts() {
   local tag=$1
   local log="$RESULTS/daemon-$tag.log"
   [ -f "$log" ] || return 0
-  grep -E '^(error|warn)\(|TRIPWIRE' "$log" > "$RESULTS/daemon-$tag.alerts" || true
+  grep -E "$SUITE_ALERT_RE" "$log" > "$RESULTS/daemon-$tag.alerts" || true
   local n; n=$(wc -l < "$RESULTS/daemon-$tag.alerts")
-  [ "$n" = 0 ] || { suite_log "daemon $tag: $n alert line(s) (see daemon-$tag.alerts)"; head -20 "$RESULTS/daemon-$tag.alerts" >&2; }
+  suite_log "daemon $tag: $n alert line(s)$([ "$n" = 0 ] || echo " (see daemon-$tag.alerts)")"
+  [ "$n" = 0 ] || head -20 "$RESULTS/daemon-$tag.alerts" >&2
   if grep -q TRIPWIRE "$RESULTS/daemon-$tag.alerts"; then suite_log "TRIPWIRE fired in daemon $tag"; return 1; fi
   # A daemon the kernel OOM-killed (the venue's 16 GiB shared with other
   # agents' daemons) is a run failure with its cause named, never a silent

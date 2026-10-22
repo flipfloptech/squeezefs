@@ -246,7 +246,7 @@ fstests_run() {
   local ok=0
   for m in "$SETS/set-test" "$SETS/set-scratch"; do
     local logs; logs=$(ls "$m"/daemon-*.log 2>/dev/null | wc -l)
-    cat "$m"/daemon-*.log 2>/dev/null | grep -E '^(error|warn)\(|TRIPWIRE' > "$RESULTS/daemon-$(basename "$m")-run$n.alerts" || true
+    cat "$m"/daemon-*.log 2>/dev/null | grep -E "$SUITE_ALERT_RE" > "$RESULTS/daemon-$(basename "$m")-run$n.alerts" || true
     local na; na=$(wc -l < "$RESULTS/daemon-$(basename "$m")-run$n.alerts")
     suite_log "$(basename "$m"): $logs daemon log(s), $na alert line(s)"
     # A tripwire fails the run, on every daemon — a dm-error daemon's too

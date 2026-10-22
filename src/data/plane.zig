@@ -236,6 +236,10 @@ pub const stats = struct {
     pub var promotions_run: counters.ShardedCounter = .{};
     pub var promotions_stale: counters.ShardedCounter = .{};
     pub var promotions_failed: counters.ShardedCounter = .{};
+    /// `promotions_restaged`: a promotion handed its key by a census found
+    /// the record re-staged by a newer write before it held the locks, and
+    /// promoted the CURRENT resident (`promoteUnder`).
+    pub var promotions_restaged: counters.ShardedCounter = .{};
     /// The write cache's recall (charter §6.1 "coherence"): a foreign
     /// reader's grant ask promoted this mount's residents of the ino
     /// (`recall_promotions`), or found them unpromotable — the reader then
@@ -317,7 +321,7 @@ pub fn writeStatsJson(w: *Io.Writer) Io.Writer.Error!void {
     inline for (.{ "data_volumes", "data_staging_on", "block_refs_drift_rows" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, @field(stats, name).load() });
     }
-    inline for (.{ "layout_map_merges", "layout_map_merge_blocks", "layout_map_merge_failures", "layout_map_merge_clipped_blocks", "layout_map_merges_shipped", "foreign_publish_kvmap_refusals", "layout_publishes_served", "kvmap_sweep_spawn_refusals", "promotions_run", "promotions_stale", "promotions_failed", "recall_promotions", "recall_promotion_failures", "own_block_dmas", "own_block_dma_bytes", "promotion_barriers", "staged_point_hits", "staged_point_misses", "promotion_barriers_coalesced", "promotion_barrier_write_through_skips", "held_stores", "held_store_bytes", "held_store_failures", "hold_gate_admits", "hold_gate_overlay_admits", "hold_gate_declines", "prefetch_fibers", "prefetch_fiber_refusals", "hold_ceremony_fibers", "bindings_freed", "device_read_bounces", "data_device_read_bytes", "write_side_read_dma_bytes", "compose_read_dma_bytes", "pack_read_dma_bytes" }) |name| {
+    inline for (.{ "layout_map_merges", "layout_map_merge_blocks", "layout_map_merge_failures", "layout_map_merge_clipped_blocks", "layout_map_merges_shipped", "foreign_publish_kvmap_refusals", "layout_publishes_served", "kvmap_sweep_spawn_refusals", "promotions_run", "promotions_stale", "promotions_failed", "promotions_restaged", "recall_promotions", "recall_promotion_failures", "own_block_dmas", "own_block_dma_bytes", "promotion_barriers", "staged_point_hits", "staged_point_misses", "promotion_barriers_coalesced", "promotion_barrier_write_through_skips", "held_stores", "held_store_bytes", "held_store_failures", "hold_gate_admits", "hold_gate_overlay_admits", "hold_gate_declines", "prefetch_fibers", "prefetch_fiber_refusals", "hold_ceremony_fibers", "bindings_freed", "device_read_bounces", "data_device_read_bytes", "write_side_read_dma_bytes", "compose_read_dma_bytes", "pack_read_dma_bytes" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, @field(stats, name).load() });
     }
     try w.print("\"data_unresolved_volume\":{d},\"kvmap_resolve_failures\":{d},\"kvmap_head_put_unlocked\":{d},\"release_free_unheld\":{d},\"layout_map_merge_displaced_overflow\":{d}}}", .{ counters.tripwireCount("data_unresolved_volume"), counters.tripwireCount("kvmap_resolve_failures"), counters.tripwireCount("kvmap_head_put_unlocked"), counters.tripwireCount("release_free_unheld"), counters.tripwireCount("layout_map_merge_displaced_overflow") });
@@ -498,6 +502,10 @@ pub const DataPlane = struct {
     crossing_kill_after: u32,
     /// `SQUEEZEFS_TEST_OWN_BLOCK_POISON`.
     test_own_block_poison: bool,
+    /// `SQUEEZEFS_TEST_PROMOTION_HOLD`: the FIFO the mount's first promotion
+    /// parks on before its locks (null = no hold); `promotion_held` once it did.
+    test_promotion_hold: ?[]const u8,
+    promotion_held: Atomic(bool) = .init(false),
     /// The token divert's layout face (bound by the daemon once the wire
     /// plane is up; null = a flat mount: every slot local).
     foreign_layout: ?ForeignLayout = null,
@@ -627,6 +635,7 @@ pub const DataPlane = struct {
             .windows = undefined,
             .crossing_kill_after = knobs.intKnob("SQUEEZEFS_TEST_KVMAP_CROSSING_KILL_AFTER", u32, opts.env),
             .test_own_block_poison = knobs.boolKnob("SQUEEZEFS_TEST_OWN_BLOCK_POISON", opts.env),
+            .test_promotion_hold = promotionHoldPath(opts.env),
             .zcrx_registry = zcrx.steering.Registry.init(gpa),
             .publish_scratch = undefined,
         };
@@ -1516,6 +1525,25 @@ pub const DataPlane = struct {
         self.deviceWrite(tag, offset, buf) catch |e| return mapDma(e);
     }
 
+    /// `SQUEEZEFS_TEST_PROMOTION_HOLD`'s FIFO path; `off` (the row's default)
+    /// = no hold.
+    fn promotionHoldPath(env: *const std.process.Environ.Map) ?[]const u8 {
+        const raw = knobs.parseStr(env.get("SQUEEZEFS_TEST_PROMOTION_HOLD")) orelse return null;
+        return if (std.mem.eql(u8, raw, "off")) null else raw;
+    }
+
+    /// `SQUEEZEFS_TEST_PROMOTION_HOLD`: the mount's first promotion parks
+    /// between its census lease and its locks until a writer opens the FIFO
+    /// — the window a newer write of the file re-stages the resident in.
+    fn holdPromotion(io: Io, ino: u64, path: []const u8) void {
+        log.info("promotion of ino {d}: SQUEEZEFS_TEST_PROMOTION_HOLD — the census's record leased; holding before the locks until a writer opens {s}", .{ ino, path });
+        const f = Io.Dir.cwd().openFile(io, path, .{}) catch |e| {
+            log.warn("promotion of ino {d}: the promotion hold could not open {s} ({t}); not holding", .{ ino, path, e });
+            return;
+        };
+        f.close(io);
+    }
+
     /// The publish failed: the never-published mint returns, then its
     /// in-flight registration drops.
     pub fn abandonOwnBlock(self: *DataPlane, ob: OwnBlock) void {
@@ -2081,6 +2109,7 @@ pub const DataPlane = struct {
         defer lease.release();
         const generation = lease.generation();
         const image = lease.bytes();
+        if (self.test_promotion_hold) |path| if (!self.promotion_held.swap(true, .acq_rel)) holdPromotion(io, ino, path);
         const locks = self.locks.lockPromotion(io, ino);
         const corpse = pass == .dismount and self.inoIsCorpse(ino);
         const out: Promoted = if (corpse) .{ .ok = false } else self.promoteLocked(io, ino, k, generation, image);

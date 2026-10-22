@@ -9792,6 +9792,86 @@ test "smoke: THE STAGED READ'S IDENTITY WINDOW — a 256 KiB staged file; an O_D
     try rig.umount();
 }
 
+/// The raced `sync -f` row's file: 256 KiB staged (packed at its
+/// promotion), a 4 KiB page overwritten in place at page 3, 1000 B appended.
+const raced_syncfs_bytes: u64 = 256 << 10;
+const raced_syncfs_page: u64 = 3;
+const raced_syncfs_tail_bytes: u64 = 1000;
+
+test "smoke: A SYNCFS THAT MEETS A RE-STAGE OF ONE OF ITS RESIDENTS LANDS THE CURRENT IMAGE — a 256 KiB staged file (never fsync'd); `sync -f` of the mount from another process, its promotion of the file held by SQUEEZEFS_TEST_PROMOTION_HOLD between its census lease and its locks, while the file is written twice (a 4 KiB overwrite in place, a 1000 B append: two fresh ring generations) → released: `sync -f` exits 0, no error line, fsync_promote_refusals 0, promotions_restaged 1, the file promoted once → kill -9 (a foreground mount: the ring dies with the daemon) → fsck --offline clean → remount → the file is the twice-written image byte for byte (red: EIO to `sync -f` and `syncfs: a leg failed (InputOutput)` — 1,407 lines in one LTP fs run from ftest01–08's sibling sync() calls)" {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    var fb: [linux.PATH_MAX]u8 = undefined;
+    const fifo = try std.fmt.bufPrintSentinel(&fb, "{s}/promotion.fifo", .{rig.work}, 0);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.mknodat(linux.AT.FDCWD, fifo.ptr, linux.S.IFIFO | 0o600, 0)));
+    try rig.env.put("SQUEEZEFS_TEST_PROMOTION_HOLD", fifo);
+    // The C8 oracle at every mount (the remount after the kill judges it).
+    try rig.env.put("SQUEEZEFS_BLOCK_REFS_VERIFY", "1");
+    try rig.formatSet(true);
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(0);
+    // syncfs reaches a FUSE server only once INIT negotiated FUSE_HAS_SYNCFS.
+    {
+        const st = try rig.stats();
+        defer gpa.free(st);
+        if (numberAfter(st, "\"fuse_syncfs_armed\":") != 1) {
+            try rig.umount();
+            _ = try rig.waitChild();
+            return testkit.skip(@src(), .no_kernel_feature, "FUSE_HAS_SYNCFS not offered — syncfs(2) never reaches a plain /dev/fuse server");
+        }
+    }
+    var released = false;
+    defer if (!released) releaseHold(fifo);
+    // `f` staged whole; `want` is the image after both later writes.
+    var script: [768]u8 = undefined;
+    gpa.free(try rig.shOk(rig.work, try std.fmt.bufPrint(&script, "head -c {d} /dev/urandom > pattern && head -c 4096 /dev/urandom > page && head -c {d} /dev/urandom > tail && cp pattern {s}/f && cp pattern want && dd if=page of=want bs=4096 seek={d} conv=notrunc status=none && cat tail >> want", .{ raced_syncfs_bytes, raced_syncfs_tail_bytes, rig.mp, raced_syncfs_page })));
+    const mark = try rig.logLen();
+    // `sync -f <mnt>` is syncfs(2) on an fd of the mount: its census finds
+    // `f` resident and its promotion parks on the seam, holding the
+    // census's lease and none of the promotion locks — and its worker: the
+    // hold is a blocking open on the serving thread, so the writes below
+    // go through another CPU's queue (the staged read hold row's shape).
+    var syncer = try std.process.spawn(io, .{ .argv = &.{ "taskset", "-c", "5", "sync", "-f", rig.mp }, .environ_map = &rig.env, .stdin = .ignore, .stdout = .ignore, .stderr = .inherit });
+    _ = try rig.awaitLog("SQUEEZEFS_TEST_PROMOTION_HOLD", mark, ready_wait_ns);
+    // The newer writes land in the window: the staged arm's in-place
+    // overwrite (the same record, a fresh generation) and its in-place
+    // append (the record grown into its slack, a fresh generation again).
+    gpa.free(try rig.shOk(rig.work, try std.fmt.bufPrint(&script, "taskset -c 2 sh -e -c 'dd if=page of={s}/f bs=4096 seek={d} conv=notrunc status=none && cat tail >> {s}/f'", .{ rig.mp, raced_syncfs_page, rig.mp })));
+    releaseHold(fifo);
+    released = true;
+    // The promotion finds the census's generation gone and lands the
+    // current image: the syncfs is acked.
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try syncer.wait(io));
+    {
+        const text = try rig.readLog();
+        defer gpa.free(text);
+        const errors = std.mem.count(u8, text[mark..], "error(");
+        if (errors != 0) std.debug.print("\n--- the daemon's error lines during the raced sync -f ---\n{s}\n", .{text[mark..]});
+        try testing.expectEqual(@as(usize, 0), errors);
+    }
+    {
+        const t = try rig.stats();
+        defer gpa.free(t);
+        std.debug.print("\nsmoke[raced sync -f]: fuse_syncfs {d}, fsync_promoted_files {d}, fsync_promote_refusals {d}, promotions_restaged {d}, promotions_stale {d}\n", .{ numberAfter(t, "\"fuse_syncfs\":") orelse 0, numberAfter(t, "\"fsync_promoted_files\":") orelse 0, numberAfter(t, "\"fsync_promote_refusals\":") orelse 0, numberAfter(t, "\"promotions_restaged\":") orelse 0, numberAfter(t, "\"promotions_stale\":") orelse 0 });
+        try testing.expectEqual(@as(?u64, 1), numberAfter(t, "\"fuse_syncfs\":"));
+        try testing.expectEqual(@as(?u64, 0), numberAfter(t, "\"fsync_promote_refusals\":"));
+        try testing.expectEqual(@as(?u64, 1), numberAfter(t, "\"promotions_restaged\":"));
+        try testing.expectEqual(@as(?u64, 1), numberAfter(t, "\"fsync_promoted_files\":"));
+    }
+    // A foreground mount has no supervisor to hold the ring: what the
+    // remount reads is what the promotion landed on the data volumes.
+    try rig.kill();
+    const recovered = try fsckClean(rig, "the kill after the raced sync -f");
+    try rig.env.put("SQUEEZEFS_TEST_PROMOTION_HOLD", "off");
+    _ = try remountAfterKill(rig, recovered);
+    gpa.free(try rig.onMount("cmp \"$1/want\" f && echo f-whole"));
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+}
+
 test "smoke: FSCK AND SCRUB — format → fill (dirs, 200 packed small files, hard links, three fsync'd 20 MiB files, a clone) → umount → `fsck --offline --scrub` 0 findings over every block → mount, 8-way storm, kill -9 → `fsck --offline` 0 findings → remount, clean umount → a planted stray reference is exactly [C3]+[C8] on its block (exit 1), `--repair` plans, `--repair --apply` releases it, clean → a planted orphan inode is exactly [C9], destroyed on apply, clean → `merge-reports` of two residue shards ≡ the whole run" {
     const io = testing.io;
     if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);

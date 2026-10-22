@@ -76,10 +76,14 @@ next landing on top of it, and its model must include the fold's ordering invari
 ## Owed / next (in order)
 
 1. **DONE 2026-10-22:** the mainline boot, the gate green on it (`3b8f547`), create 7b (`2b9659c`).
-   **Still owed on 7.3:** the matrix (pool vs user_ents; `SQUEEZEFS_FUSE_ZC_OPEN` 1 vs 0; 7.3 vs
-   9.33 side by side — one benchmark at a time, cooled ≤ 70 °C) and §BE.3's default re-judged on
-   those numbers; the 9.33 kernel has NOT run the day's landings (every change is conditional on the
-   probed rung; boot it once before the release and run one gate).
+   **The 7.3 matrix ran** (`rung-10-fuse-mainline-uapi.md` §10): bandwidth at parity with 9.33
+   (64k 58.2 GB/s, seq read 74.6, seq write 52.7); 4k randread −31 % (1.30 vs 1.88 M, p50 64 → 90 µs),
+   4k randwrite −12 % (1.17 vs 1.33 M) — the round trip, where 9.33's 0030/0031 live. §BE.3's
+   zc-open default CONFIRMED (`ZC_OPEN=0` halves every bandwidth row and moves no 4k row); the pool
+   rung is 1.8× / 4.5–6× over the stock `user` rung. Next lever on 7.3: 0031 re-expressed on
+   mainline's `dev_uring.c` and posted; a per-request profile of the pool rung's 4k completion path.
+   The 9.33 kernel has NOT run the day's landings (every change is conditional on the probed rung;
+   boot it once before the release and run one gate).
 2. The create path's remaining binders — the appliers' mutual leaf waits (62 of 109 µs per window
    on `venue`), `self` with reclaim destroy groups on removals, atomic-open patch 0034 (still not
    drafted). From create 7b's report, owed: the DEAD MANAGER row's hang on the train was B parking

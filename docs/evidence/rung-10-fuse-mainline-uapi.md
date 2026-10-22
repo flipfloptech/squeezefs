@@ -229,3 +229,45 @@ arm skipping by name). The whole unit suite once, `-Dfresh=true`: **2,870 / 2,98
 0 failed** (the skips: 17 `session` kmbuf rows — the fused poll's BufRing arm now among them, after its
 `auto` arm passes —, 2 `kmbuf`, 1 `uring128`, the `other_step` rows); `rails` 29/29; `zig fmt --check`
 clean. The full gate is the orchestrator's.
+
+## 10. The 7.3 matrix (2026-10-22, `dev` `4efb8ec`, dist build, the RAM-NVMe set; one session at a time, the host cooled ≤ 70 °C between, `tctl_c` in `results.tsv`)
+
+Three sessions of §7's plan (series 1, 2 and the cross-kernel row of 3), one leg each, 20 s rows,
+the venue held by `scripts/perf/quiet.sh`. The daemon ran `transport_buffer_mode` 3 (MainlinePool)
+and `fuse_uring_rings_per_queue` 3 in every 7.3 session; the 9.33 column is the last `dev` session
+on the sqz kernel (`ram-sqz-rw3-striped-A`, 2026-10-21, kmbuf zero-copy, 3 rings).
+
+| row | 9.33 `auto` (kmbuf zc) | 7.3 `auto` (pool, zc, opens served) | 7.3 pool, `ZC_OPEN=0` (zero-message opens, copies) | 7.3 `user` (stock rung) |
+|---|---|---|---|---|
+| rr4k-q1j1 (IOPS / p50 µs) | — | 154 k / 5.3 | 101 k / 4.1 | 66 k / 7.8 |
+| rr4k-q32j4 | **1.88 M / 64** | **1.30 M / 90** | 1.33 M / 82 | 0.73 M / 173 |
+| rw4k-q1j1 | — | 102 k / 8.5 | 107 k / 8.3 | 51 k / 17.8 |
+| rw4k-q32j4 | **1.33 M / 86** | **1.17 M / 91** | 1.15 M / 91 | 0.78 M / 142 |
+| rr64k-q16j4 (GB/s) | 58 | **58.2** | 39.1 | 9.2 |
+| sr1m-q16j4 (GB/s) | 73–81 | **74.6** | 30.2 | 16.7 |
+| sw1m-q16j4 (GB/s) | 50.6–52.2 | **52.7** | 25.6 | 15.1 |
+
+**What it says.**
+
+- **§BE.3 holds: zero-copy per open file is what carries bandwidth.** Taking the opens away
+  (`ZC_OPEN=0`) leaves the 4k rows where they are (1.33 / 1.15 M — the same within a leg's
+  spread) and halves every bandwidth row (64k 58 → 39 GB/s, seq read 75 → 30, seq write 53 → 26:
+  the copies). The default stays (a); the RFC (`scripts/kernel/upstream/fuse-zc-no-open`) is worth
+  exactly the zero-message opens' metadata gain, still unmeasured (the open/close loops of §7).
+- **The pool rung's own worth on 7.3 is 1.8× on 4k IOPS and 4.5–6× on bandwidth over the stock
+  `user` rung** (series 1): the port earns its keep on a mainline kernel.
+- **The cross-kernel gap is in the 4k round trip, not the data path:** bandwidth rows are at
+  parity with 9.33 (58.2 / 74.6 / 52.7 against 58 / 73–81 / 50.6–52.2); 4k randread is −31 %
+  (1.30 vs 1.88 M, p50 64 → 90 µs at the same host cores ≈ 18 and daemon cores ≈ 11.5), 4k randwrite
+  −12 % (1.17 vs 1.33 M). The 9.33 series carries 0031 (one header copy per direction, per-entry
+  zero-copy scratch, one lock section per completion — "4–5 % of the read's cost" measured there)
+  and 0030; mainline's `dev_uring.c` has neither in that form (`rung-10-kernel-mainline.md`: 0031
+  part 4 is upstream as `fc60668db855`, the rest is written against kmbuf). The next lever on 7.3
+  is therefore the kernel's: 0031 re-expressed on mainline's request path and posted — and, on the
+  daemon's side, a per-request profile of the pool rung's completion path (`MX_PROFILE=1` on
+  `rr4k-q32j4`) to see what of the 26 µs the daemon owns.
+- QD1 4k reads: 154 k on `auto` against 101 k with `ZC_OPEN=0` — one leg each; the open posture
+  should not touch a QD1 read loop on an open file, so this is a spread question until A-B-B-A says
+  otherwise.
+
+Sessions: `/build/perf/mx/ram-sqz-rml73-{default,zcopen0,user}-r1/`; fsck clean after each.

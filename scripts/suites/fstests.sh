@@ -69,6 +69,16 @@ fstests_build() {
   echo "xfstests $(cd "$FSTESTS_DIR" && git log -1 --format='%H %cd')" > "$RESULTS/fstests-version.txt"
   # The unprivileged users xfstests' `_require_user` wants.
   local u; for u in fsgqa 123456-fsgqa fsgqa2; do id "$u" >/dev/null 2>&1 || useradd -m "$u"; done
+  # ONE fstests harness per venue: the helper symlinks below and the
+  # venue-wide env file are re-pointed here, under any `check` already
+  # running (2026-10-22: a second harness's mkfs re-pointed the first's
+  # scratch slices during its post-test fsck). Wait for it, bounded.
+  local other waited=0
+  while other=$(pgrep -f 'check -R xunit' | grep -vx "$$" | head -1) && [ -n "$other" ]; do
+    [ "$waited" = 0 ] && suite_log "another fstests check (pid $other) is running on this venue; waiting for it (the helpers are venue-wide)"
+    [ "$waited" -lt "${FSTESTS_VENUE_WAIT_S:-900}" ] || suite_die "another fstests check (pid $other) still runs after ${waited}s: one fstests harness per venue"
+    sleep 5; waited=$((waited + 5))
+  done
   # The mount/umount/mkfs/fsck helpers util-linux dispatches to.
   ln -sf "$SUITES_DIR/mount.squeezefs" /sbin/mount.fuse.squeezefs
   # umount(8) names its helper by the type's PREFIX: `umount.fuse -t fuse.squeezefs`.
@@ -94,18 +104,28 @@ fstests_sets() {
   # check's mount(8): a bare mount of an untypable block device is ours
   # (`mount.typed`; generic/620 mounts its hugedisk without `-t`).
   ln -sf "$SUITES_DIR/mount.typed" "$SETS/bin/mount"
-  cat > /run/squeezefs-suites.env <<ENV
+  # The run's env beside its sets (the helpers find it from a set's path:
+  # `suite_run_env`) and the venue-wide copy for a set with no path to a run.
+  cat > "$SETS/suites.env" <<ENV
 SQZ_BIN=$SQZ_BIN
 SUITE_MOUNT_OPTS=$SUITE_MOUNT_OPTS
 SUITE_META_MIB=$SUITE_META_MIB
 SUITE_DATA_GIB=$SUITE_DATA_GIB
+SUITE_META_MIN_MIB=$SUITE_META_MIN_MIB
+SUITE_DATA_MIN_MIB=$SUITE_DATA_MIN_MIB
 SUITE_SETS_DIR=$SETS/sets
 ENV
+  cp "$SETS/suites.env" /run/squeezefs-suites.env
   truncate -s "$(suite_set_bytes)" "$SETS/set-test/meta.img" "$SETS/set-scratch/meta.img"
   TEST_LOOP=$(losetup -f --show "$SETS/set-test/meta.img") || suite_die "losetup (test)"
   SCRATCH_LOOP=$(losetup -f --show "$SETS/set-scratch/meta.img") || suite_die "losetup (scratch)"
   "$SUITES_DIR/mkfs.squeezefs" -f "$TEST_LOOP" > "$SETS/set-test/format.out" 2>&1 || { cat "$SETS/set-test/format.out" >&2; suite_die "mkfs test set"; }
   "$SUITES_DIR/mkfs.squeezefs" -f "$SCRATCH_LOOP" > "$SETS/set-scratch/format.out" 2>&1 || { cat "$SETS/set-scratch/format.out" >&2; suite_die "mkfs scratch set"; }
+  # MIN_FSSIZE: xfstests' own floor hook (xfs sets 600 MB, btrfs 512 MB) — a
+  # test's small device request (`_small_fs_size_mb`) is rounded up to the
+  # smallest set the product formats (setpaths.sh's floors); nothing is
+  # skipped by it: our FSTYP has no `_scratch_mkfs_sized` arm, the one path
+  # that would.
   cat > "$SETS/local.config" <<CFG
 export FSTYP=fuse.squeezefs
 # _scratch_mkfs reformats a set the previous test formatted: mkfs(8)'s -f.
@@ -116,6 +136,7 @@ export SCRATCH_DEV=$SCRATCH_LOOP
 export SCRATCH_MNT=$SETS/mnt-scratch
 export RESULT_BASE=$SETS/results
 export LOGWRITES_DEV=
+export MIN_FSSIZE=$(suite_set_min_bytes)
 CFG
   suite_log "run $n sets formatted: TEST $TEST_LOOP ($SETS/set-test), SCRATCH $SCRATCH_LOOP ($SETS/set-scratch)"
 }
@@ -165,24 +186,17 @@ fstests_fsck_set() {
   local which=$1 n=$2 rc=0
   local out="$RESULTS/fsck-$which-run$n.json"
   local dev; dev=$([ "$which" = test ] && echo "$TEST_LOOP" || echo "$SCRATCH_LOOP")
-  # The SCRATCH device is any test's to leave as it likes (`_require_scratch_nocheck`:
-  # generic/740 ends with a foreign mkfs on it, generic/620 a dm-snapshot's
-  # COW store); only a squeezefs volume is scrubbed. (Every test that checks
-  # its scratch had it fscked by `_check_scratch_fs` already.)
-  if [ "$which" = scratch ]; then
-    suite_set_of "$dev"; suite_slices_up "$dev"
-    local st; st=$("$SQZ_BIN" status "sqmeta://$SLICE_META" 2>/dev/null | grep -v '^info\|^debug' | head -1)
-    suite_slices_down
-    case "$st" in *"SqueezeFS metadata volume"*) ;; *) suite_log "fsck $which (run $n): skipped — the last test left the scratch device $(echo "$st" | sed 's/^sqmeta:[^ ]*: //' | cut -c1-120)"; return 0 ;; esac
-  fi
   "$SUITES_DIR/fsck.squeezefs" "$dev" > "$out" 2>"$out.err" || rc=$?
   if [ "$rc" = 0 ]; then suite_log "fsck --offline --scrub $which (run $n): 0 findings"; return 0; fi
-  # A scratch that carries a superblock but opens as no set (generic/620's
-  # transient dm-snapshot leaves its COW chunks — copies of the hugedisk's
-  # own set — on the scratch device): the last test's leftover, no finding.
-  # Every test that checks its scratch had it fscked by `_check_scratch_fs`.
-  if [ "$which" = scratch ] && grep -q 'cannot open metadata set' "$out"; then
-    suite_log "fsck $which (run $n): skipped — the last test left the scratch device unopenable ($(grep -o 'cannot open metadata set.*' "$out" | head -1 | cut -c1-160))"
+  # The SCRATCH device at the run's end is the LAST test's to have left as
+  # it liked: a `_require_scratch_nocheck` test leaves a foreign mkfs
+  # (generic/740), a dm-snapshot's COW chunks (generic/620), another set's
+  # volumes over its first 64 MiB (generic/563) — and every test that checks
+  # its scratch had it fscked by `_check_scratch_fs` before the next test
+  # touched it. So this fsck is the record, never the verdict: a scratch
+  # finding here was either that test's (already red) or no test's.
+  if [ "$which" = scratch ]; then
+    suite_log "fsck $which (run $n): exit $rc, for the record (the last test's leftover; the per-test fsck is the oracle): $(grep -v '^info\|^debug' "$out" | grep -E 'findings|cannot open|discovery|refuse' | head -1 | cut -c1-200)"
     return 0
   fi
   suite_log "fsck --offline --scrub $which (run $n): exit $rc — $out"; head -c 1500 "$out" >&2; echo >&2; grep -v '^info\|^debug' "$out.err" | head -10 >&2

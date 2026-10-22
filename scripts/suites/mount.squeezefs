@@ -54,15 +54,19 @@ if [[ "$(basename "$0")" == umount.* ]]; then
   # the kernel's plain detach, silently (mount(8) prints nothing). Only a
   # daemon's own root gets the orderly `squeezefs umount`.
   if ! findmnt -n -o FSROOT -M "$target" 2>/dev/null | grep -qx /; then exec umount -i "$target"; fi
+  # The set serving this mountpoint (the mount helper recorded it), and its
+  # run's binary.
+  tag=/run/squeezefs-suites/mnt-$(printf '%s' "$target" | md5sum | cut -c1-16)
+  if [ -f "$tag" ]; then
+    SET_ID=$(cat "$tag"); SET_DIR=$(cat "/run/squeezefs-suites/$SET_ID.dir"); suite_slice_paths
+    suite_run_env "$SET_DIR"
+  fi
   rc=0
   "$SQZ_BIN" umount "$target" || rc=$?
-  # The set's slices go down with the mount (the mount helper
-  # recorded which set serves this mountpoint), so the test's own dm device
+  # The set's slices go down with the mount, so the test's own dm device
   # above them can be removed by its cleanup. A refused umount (BUSY: a
   # holder) leaves everything standing.
-  tag=/run/squeezefs-suites/mnt-$(printf '%s' "$target" | md5sum | cut -c1-16)
   if [ "$rc" = 0 ] && [ -f "$tag" ]; then
-    SET_ID=$(cat "$tag"); SET_DIR=$(cat "/run/squeezefs-suites/$SET_ID.dir"); suite_slice_paths
     # A successor of this set on its way up through the same slices holds
     # the set's lock shared for its whole bring-up (generic/604: the mount
     # racing this unmount waits out our daemon on the writer lock, then

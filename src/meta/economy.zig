@@ -71,10 +71,13 @@ pub const stats = struct {
     /// Σ over volumes.
     pub var meta_kv_times_echo_pending: counters.Gauge = .{};
     /// `dir_nlink_underflows`: a parent-side `nlink − 1` that the `> 2`
-    /// floor SUPPRESSED (POSIX-11). The count is then permanently one too
-    /// low for the subdirectories the parent still holds and `find`'s leaf
-    /// optimization (`nlink == 2` ⇒ no subdirs) skips them — a bug signal,
-    /// never routine; the floor stays because an underflow is worse.
+    /// floor SUPPRESSED (POSIX-11). The record was already short — a `+1`
+    /// missed upstream (generic/025's un-shifted RENAME_EXCHANGE) or a
+    /// `−1` not owed — so the floor masks a defect upstream, never causes
+    /// one: a bug signal, never routine; the floor stays because an
+    /// underflow is worse, and fsck's C10 judges no directory count
+    /// (`docs/porting/ops_fsck.md` §3.10), so this counter is the only
+    /// witness a short directory count leaves.
     pub var dir_nlink_underflows: counters.ShardedCounter = .{};
 };
 
@@ -260,7 +263,7 @@ pub fn stageParentUpdate(t: *tx.KvTx, parent: u64, shared: bool, nlink_delta: i3
             pv.nlink -= dec;
         } else {
             stats.dir_nlink_underflows.inc();
-            log.warn("directory nlink underflow guard fired on parent {d}: nlink {d} cannot absorb a -{d} parent-side decrement — the deficit is now permanent (POSIX-11; run fsck)", .{ parent, pv.nlink, dec });
+            log.warn("directory nlink underflow guard fired on parent {d}: nlink {d} cannot absorb a -{d} parent-side decrement — the count was already short (a +1 missed upstream, or this -1 is not owed; POSIX-11): the record stays at 2, and fsck's C10 does not census directory counts", .{ parent, pv.nlink, dec });
         }
     }
     try t.stagePut(key.TREE_INODES, &key.inodeKey(parent), &pv.encode());

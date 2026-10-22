@@ -3,8 +3,9 @@
 # full LTP): clone + build + install once (/build/ltp), then kirk (LTP's
 # runner since `runltp` was retired) per runtest file with the tests'
 # TMPDIR ON THE MOUNT, the failing tags folded to ids, every failure CONTROLLED against the venue's ext4 (/build) — a test
-# that fails identically with its TMPDIR on ext4 is the venue's
-# (container limits: loop devices, swap, cgroup v1, seccomp…) and is
+# that fails ON THE SAME ASSERTIONS with its TMPDIR on ext4, run from
+# kirk's cwd, is the venue's (the kernel's, the host's: a sysctl, a
+# missing feature, a filesystem LTP formats on its loop device) and is
 # listed as `venue`, never adjudicated as ours — then the adjudication
 # ledger (`docs/gates/ltp-exceptions.md`) over what remains, `fsck
 # --offline --scrub` after every file, the multi-run discipline.
@@ -47,7 +48,33 @@ ltp_build() {
     (cd "$LTP_SRC" && make -s autotools >"$RESULTS/ltp-build.log" 2>&1 && ./configure --prefix="$LTP_PREFIX" >>"$RESULTS/ltp-build.log" 2>&1 && make -s -j"$(nproc)" >>"$RESULTS/ltp-build.log" 2>&1 && make -s install >>"$RESULTS/ltp-build.log" 2>&1) \
       || { tail -30 "$RESULTS/ltp-build.log" >&2; suite_die "LTP build failed"; }
   fi
-  { echo "ltp $(cd "$LTP_SRC" && git log -1 --format='%H %cd')"; echo "kirk $(cd "$KIRK_DIR" && git log -1 --format='%H %cd')"; } > "$RESULTS/ltp-version.txt"
+  ltp_rebuild_modules
+  { echo "ltp $(cd "$LTP_SRC" && git log -1 --format='%H %cd')"; echo "kirk $(cd "$KIRK_DIR" && git log -1 --format='%H %cd')"; echo "modules for $(awk '/^LINUX_VERSION[[:space:]]*:=/ { print $3 }' "$LTP_SRC/include/mk/config.mk")"; } > "$RESULTS/ltp-version.txt"
+}
+
+# LTP's `configure` bakes the RUNNING kernel into `include/mk/config.mk`
+# (`LINUX_DIR`, `LINUX_VERSION`) and its module testcases (`init_module`,
+# `finit_module`, `delete_module`, the device-driver and insmod/lsmod rows)
+# build against it, so an install outlives the kernel it was built on: on
+# 2026-10-22 the modules carried `vermagic 7.2.8-7-omarchy-sqz` under
+# 7.3.0-1.7-mainline-sqz and seven tests failed ENOEXEC on both sides of
+# the control — classified "the venue's" every run. A kernel change
+# reconfigures (5 s) and rebuilds + reinstalls every module directory
+# (17 s); the rest of the install is kernel-independent.
+ltp_rebuild_modules() {
+  local built; built=$(awk '/^LINUX_VERSION[[:space:]]*:=/ { print $3 }' "$LTP_SRC/include/mk/config.mk" 2>/dev/null)
+  local running; running=$(uname -r)
+  [ "$built" != "$running" ] || return 0
+  [ -d "/lib/modules/$running/build" ] || suite_die "LTP's modules were built for kernel $built and /lib/modules/$running/build is absent: the module testcases cannot be rebuilt for this kernel"
+  suite_log "LTP's modules were built for kernel $built; reconfiguring for $running and rebuilding the module testcases"
+  local log="$RESULTS/ltp-modules.log" d
+  (cd "$LTP_SRC" && ./configure --prefix="$LTP_PREFIX" > "$log" 2>&1) || { tail -20 "$log" >&2; suite_die "LTP configure failed"; }
+  for d in $(cd "$LTP_SRC" && grep -rl 'include $(top_srcdir)/include/mk/module.mk' --include=Makefile testcases | xargs -n1 dirname); do
+    (cd "$LTP_SRC/$d" && { make -s clean >> "$log" 2>&1 || true; } && make -s >> "$log" 2>&1 && make -s install >> "$log" 2>&1) \
+      || { tail -20 "$log" >&2; suite_die "LTP module testcases in $d failed to rebuild for $running"; }
+  done
+  built=$(awk '/^LINUX_VERSION[[:space:]]*:=/ { print $3 }' "$LTP_SRC/include/mk/config.mk")
+  [ "$built" = "$running" ] || suite_die "LTP's config.mk still names kernel $built after configure"
 }
 
 # kirk's JSON report → one line per test: `tag<TAB>result<TAB>command`.
@@ -63,24 +90,84 @@ PY
 }
 
 # The control run: the failing tag's command with TMPDIR on ext4. Prints
-# `venue` if it fails there too, `ours` otherwise. LTP exit codes: 0 pass,
-# 32 TCONF (skipped), anything else a failure.
+# `venue` if it fails there too ON THE SAME ASSERTIONS, `ours` otherwise.
+# LTP exit codes: 0 pass, 32 TCONF (skipped), anything else a failure. The
+# test's own failing lines come from kirk's JSON report.
 ltp_control() {
-  local tag=$1 rows=$2 n=$3
+  local tag=$1 rows=$2 n=$3 report=$4
   local cmd; cmd=$(awk -F'\t' -v t="$tag" '$1 == t { print $3; exit }' "$rows")
-  ltp_control_cmd "$tag" "$cmd" "$n"
+  local ours="$RESULTS/ctl-$tag-run$n.ours"
+  if [ -s "$report" ]; then ltp_fail_lines report "$report" "$tag" > "$ours" 2>/dev/null || : > "$ours"; else ours=""; fi
+  ltp_control_cmd "$tag" "$cmd" "$n" "$ours"
+}
+
+# The failing assertions (TFAIL/TBROK lines) of one test, normalized so the
+# two sides compare: kirk's colours stripped, the tmpdir path, hex words and
+# numbers (pids, sizes, line numbers) folded. `report <json> <tag>` reads
+# kirk's report; `debug <debug.log> <tag>` the per-command stdout kirk logs
+# as it runs (the fail-early watcher, before the report exists); `out
+# <file>` a control's captured stdout.
+ltp_fail_lines() {
+  python3 - "$@" <<'PY'
+import ast, json, re, sys
+kind, src = sys.argv[1], sys.argv[2]
+tag = sys.argv[3] if len(sys.argv) > 3 else None
+text = None
+if kind == "report":
+    for t in json.load(open(src)).get("results", []):
+        if t["test_fqn"] == tag:
+            text = t["test"].get("log", "")
+elif kind == "debug":
+    for line in open(src, errors="replace"):
+        i = line.find(" - DEBUG - return data=")
+        if i < 0:
+            continue
+        try:
+            d = ast.literal_eval(line[i + len(" - DEBUG - return data="):].strip())
+        except (ValueError, SyntaxError):
+            continue
+        if isinstance(d, dict) and d.get("command") == tag:
+            text = d.get("stdout", "")
+else:
+    text = open(src, errors="replace").read()
+if text is None:
+    sys.exit(1)
+out = []
+for l in text.splitlines():
+    l = re.sub(r"\x1b\[[0-9;]*m", "", l)
+    if not re.search(r"\bT(FAIL|BROK)\b", l):
+        continue
+    l = re.sub(r"/build/tmp/\S+", "<tmp>", l)
+    l = re.sub(r"0x[0-9a-fA-F]+", "<hex>", l)
+    l = re.sub(r"\d+", "<n>", l)
+    out.append(l.strip())
+print("\n".join(sorted(out)))
+PY
 }
 
 # The control run of one command (`ltp_control` with the command in hand:
-# the fail-early watcher reads it off the runtest file before the report exists).
+# the fail-early watcher reads it off the runtest file before the report
+# exists). kirk runs every test from `testcases/bin` (`libkirk/ltp.py`
+# `_tc_folder`), so the control does too: a test that opens a sibling by a
+# relative name (`init_module01`: `init_module.ko`) failed ENOENT from any
+# other cwd and the control said "venue" for the wrong reason. `$4` names a
+# file of the test's own failing lines (`ltp_fail_lines`); the verdict is
+# `venue` only when the ext4 run fails on exactly those — a control that
+# fails differently is no control (owner ruling 2026-10-22: a skip needs
+# certainty), and the run is judged ours.
 ltp_control_cmd() {
-  local tag=$1 cmd=$2 n=$3
+  local tag=$1 cmd=$2 n=$3 ours=${4:-}
   [ -n "$cmd" ] || { echo ours; return; }
   local ctl="$SUITES_TMP/ltp-ctl-$n-$tag"; rm -rf "$ctl"; mkdir -p "$ctl"
-  local rc=0
-  (cd "$ctl" && PATH="$LTP_PREFIX/testcases/bin:$PATH" TMPDIR="$ctl" LTPROOT="$LTP_PREFIX" LTP_TIMEOUT_MUL=${LTP_TIMEOUT_MUL:-4} timeout -s KILL "$LTP_EXEC_TIMEOUT_S" sh -c "$cmd" > "$RESULTS/ctl-$tag-run$n.out" 2>&1) || rc=$?
+  local rc=0 out="$RESULTS/ctl-$tag-run$n.out"
+  (cd "$LTP_PREFIX/testcases/bin" && PATH="$LTP_PREFIX/testcases/bin:$PATH" TMPDIR="$ctl" LTPROOT="$LTP_PREFIX" LTP_TIMEOUT_MUL=${LTP_TIMEOUT_MUL:-4} timeout -s KILL "$LTP_EXEC_TIMEOUT_S" sh -c "$cmd" > "$out" 2>&1) || rc=$?
   rm -rf "$ctl"
-  if [ "$rc" != 0 ] && [ "$rc" != 32 ]; then echo venue; else echo ours; fi
+  if [ "$rc" = 0 ] || [ "$rc" = 32 ]; then echo ours; return; fi
+  [ -n "$ours" ] && [ -f "$ours" ] || { echo venue; return; }
+  ltp_fail_lines out "$out" > "$out.lines" 2>/dev/null || : > "$out.lines"
+  if cmp -s "$ours" "$out.lines"; then echo venue; return; fi
+  suite_log "$tag fails on ext4 too, but on different assertions (ours vs ext4: ctl-$tag-run$n.ours vs ctl-$tag-run$n.out.lines) — judged ours"
+  echo ours
 }
 
 # The tests must start with SIGINT (2) and SIGQUIT (3) at their defaults:
@@ -126,7 +213,7 @@ ltp_run() {
   # FAIL EARLY (owner ruling 2026-10-17): the first failing tag that is
   # neither a ledger row nor the venue's (its control run on ext4 fails
   # too — judged right here, off the runtest file's command) ends the file.
-  local first_ours="" seen="$RESULTS/ltp-$tag.seen" t cmd v dispositions_checked="" mask
+  local first_ours="" seen="$RESULTS/ltp-$tag.seen" t cmd v ours dispositions_checked="" mask
   : > "$seen"
   suite_ledger_rows ltp | cut -f1 > "$RESULTS/ledger-ids.txt"
   while kill -0 "$KIRK_PGID" 2>/dev/null; do
@@ -144,7 +231,12 @@ ltp_run() {
       echo "$t" >> "$seen"
       grep -qxF "$file/$t" "$RESULTS/ledger-ids.txt" && continue
       cmd=$(awk -v t="$t" '$1 == t { sub(/^[^ \t]+[ \t]+/, ""); print; exit }' "$LTP_PREFIX/runtest/$file")
-      v=$(ltp_control_cmd "$t" "$cmd" "$n")
+      # The test's own failing lines off kirk's debug log (its stdout is
+      # logged at completion, before the console row); absent, the control
+      # is judged by its exit code here and re-judged on the report after.
+      ours="$RESULTS/ctl-$t-run$n.ours"
+      ltp_fail_lines debug "$ktmp/kirk.root/latest/debug.log" "$t" > "$ours" 2>/dev/null || ours=""
+      v=$(ltp_control_cmd "$t" "$cmd" "$n" "$ours")
       [ "$v" = venue ] && continue
       first_ours=$t
       break 2
@@ -183,7 +275,7 @@ ltp_run() {
   local t v
   while read -r t; do
     [ -n "$t" ] || continue
-    v=$(ltp_control "$t" "$rows" "$n")
+    v=$(ltp_control "$t" "$rows" "$n" "$report")
     if [ "$v" = venue ]; then echo "$t" >> "$RESULTS/ltp-$tag.venue"; else echo "$file/$t" >> "$failures"; fi
   done < "$all"
   local nv no; nv=$(grep -c . "$RESULTS/ltp-$tag.venue" || true); no=$(grep -c . "$failures" || true)

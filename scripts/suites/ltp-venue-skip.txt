@@ -1,5 +1,8 @@
-# LTP tags skipped in the sqz-zig container venue (runltp -S), one per line:
-#   <tag>  <why it is the venue's: the control run that failed on ext4 too>
-# A row here is NEVER a filesystem semantic; the release box runs them.
-proc01  reads every /proc file; /proc/kmsg answers EPERM inside the container (fails on ext4 too — ltp-fs-run1.venue, 2026-10-10)
-setsockopt11  a CVE regression test that allocates until the kernel's OOM killer fires (anon-rss 15.9 GB at the kill): on the shared 16 GiB venue the second invocation took the squeezefs daemon down (supervisor: wait status 0x9) — a venue hazard, not a filesystem op
+# LTP tags skipped on the venue (kirk's --skip-file), one per line:
+#   <tag>  <why it is the venue's, with the evidence from THIS host>
+# A row here is NEVER a filesystem semantic and never touches the mount:
+# a test that does is run, judged, and ledgered or fixed (owner ruling
+# 2026-10-22). Audited 2026-10-22 on the Omarchy workstation
+# (docs/evidence/rung-10-adjudication-audit.md): proc01 passes there
+# (root holds CAP_SYSLOG, /proc/kmsg reads) and left this list.
+setsockopt11  CVE-2026-53362 reproducer: `tst_pollute_memory(0, …)` mmaps and fills EVERY free byte of RAM (MemFree − 128 MiB; with swap present — this host carries 219 GiB — the margin is 0) up to 64 times inside its 300 s runtime; no file of the mount is touched. On the 16 GiB VM its second pass took the squeezefs daemon down (supervisor: wait status 0x9); on this 109 GiB host it pushes every co-tenant daemon (the gate train's, a running -g auto's) into swap and starves the kmbuf ring's order-8 pages for the run's duration — a venue hazard for everything beside it, never a judgement of the product. Run it alone (`LTP_PATTERN='^setsockopt11$'`) when the venue is quiet.

@@ -54,4 +54,8 @@ stripes.
 **Counts.** By hand after the fix: (a) 0 errors 0 alerts; (b2) 0 errors 0 alerts. The new test
 100/100 under the venue's load. Unit filters green: `data.read_path` (64), `data.accumulate`,
 `data.layout`, `data.plane`, `data.warm_ladder`, `data.write_admit`, `ipc.host`; rails; fmt. Smoke
-rows and the xfstests subset: RESULTS BELOW.
+rows (fresh, under the venue's load): THE READ VIEW, KERNEL AIO, FALLOCATE — EVERY MODE'S LAW, THE
+STAGED READ'S IDENTITY WINDOW, THE ORDERED LAW'S KILL ROW, A STREAMING OVERWRITE NEVER WEDGES — all
+PASS. xfstests subset `generic/095 091 112 113 127 263` through `scripts/suites/fstests.sh`: **Passed
+all 6 tests**, 0 alert lines in every daemon log (test and scratch), fsck clean on both sets (the
+"did NOT pass" is the ledger's stale-row rule: a subset exercises no ledger row).

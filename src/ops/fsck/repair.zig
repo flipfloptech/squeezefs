@@ -216,9 +216,13 @@ pub const Engine = struct {
         const v = host.volume(vol_tag) orelse return .{ .refused = "unknown volume" };
         if (v.alloc.refcount(idx) != null) return .{ .refused = "healed: tracked now" };
         const m = (try self.currentMapping(ino, block_index, vol_tag, idx)) orelse return .{ .refused = "the mapping is no longer current" };
-        const verifier = self.opts.verifier orelse return .{ .refused = "no block reader: the content cannot be verified" };
-        const ok = verifier.verifyMapping(m) catch false;
-        if (!ok) return self.quarantineMapping(f, ino, block_index, vol_tag, idx);
+        // A reservation's bytes are nobody's (charter §6.6): the reference
+        // is what the allocator lost, there is no content to verify.
+        if (!m.unwritten) {
+            const verifier = self.opts.verifier orelse return .{ .refused = "no block reader: the content cannot be verified" };
+            const ok = verifier.verifyMapping(m) catch false;
+            if (!ok) return self.quarantineMapping(f, ino, block_index, vol_tag, idx);
+        }
         const c = try self.freshCensus();
         var n: u32 = 0;
         for (c.owners.items) |o| for (o.bindings) |b| if (b.vol_tag == vol_tag and b.block_idx == idx) {

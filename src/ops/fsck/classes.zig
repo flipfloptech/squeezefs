@@ -1930,6 +1930,7 @@ pub fn wireFields(w: layout.MappingWire) layout.Mapping {
         .len = std.mem.readInt(u32, &w.len_le, .little),
         .whole_block = w.flags & layout.M_WHOLE_BLOCK != 0,
         .damaged = w.flags & layout.M_DAMAGED != 0,
+        .unwritten = w.flags & layout.M_UNWRITTEN != 0,
     };
 }
 

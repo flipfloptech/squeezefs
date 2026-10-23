@@ -181,6 +181,11 @@ pub fn run(pass: *classes.Pass, cen: *const census.Census, v: *Verifier, throttl
     defer rows.deinit(gpa);
     for (cen.mappings.items) |m| {
         if (m.mapping.damaged) continue;
+        // A reservation names no bytes (charter §6.6): counted, never read.
+        if (m.mapping.unwritten) {
+            pass.counters.scrub_unwritten_skipped += 1;
+            continue;
+        }
         try rows.append(gpa, .{ .m = m, .off = m.mapping.offset + m.mapping.rel_off });
     }
     std.mem.sort(Row, rows.items, {}, rowLess);

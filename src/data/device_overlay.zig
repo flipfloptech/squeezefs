@@ -1413,7 +1413,11 @@ pub const Overlay = struct {
             // epoch (continuous C2/C3 visibility).
             const guard = rec.fsck_guard.?;
             rec.fsck_guard = null;
-            const v = self.deps.epochs.record(rec.key.ino, rec.key.block, rec.old_binding, new_key, proof, min_size, guard, true) catch |e| switch (e) {
+            // A Hole record over a RESERVED block (charter §6.6): the
+            // reservation is the map's key the save displaces — parked
+            // here as the A key (the gap serve stays the Hole's zeros).
+            const displaced_key = rec.old_binding orelse self.deps.map.reserved(rec.key.ino, rec.key.block);
+            const v = self.deps.epochs.record(rec.key.ino, rec.key.block, displaced_key, new_key, proof, min_size, guard, true) catch |e| switch (e) {
                 error.OutOfMemory => return error.OutOfMemory,
             };
             switch (v) {

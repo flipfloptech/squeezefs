@@ -148,6 +148,9 @@ pub const stats = struct {
     pub var scrub_readability_only: counters.ShardedCounter = .{};
     pub var scrub_failures: counters.ShardedCounter = .{};
     pub var scrub_pin_unstable_cleared: counters.ShardedCounter = .{};
+    /// UNWRITTEN bindings (fallocate reservations, charter §6.6): a
+    /// reference the census counts, bytes nobody reads — never scanned.
+    pub var scrub_unwritten_skipped: counters.ShardedCounter = .{};
     // ---- the repair engine ----
     pub var fsck_repairs_planned: counters.ShardedCounter = .{};
     pub var fsck_repairs_applied: counters.ShardedCounter = .{};

@@ -356,6 +356,7 @@ pub const Counters = struct {
     scrub_readability_only: u64 = 0,
     scrub_failures: u64 = 0,
     scrub_pin_unstable_cleared: u64 = 0,
+    scrub_unwritten_skipped: u64 = 0,
     // The per-suspect lookups' work (0003 §AC.6): elements examined to name
     // a C2-lost block's owner, a C9 candidate's block count, a C10
     // candidate's distinct names, the C17 routing check's stripes, the
@@ -472,6 +473,7 @@ pub const Counters = struct {
         s.scrub_readability_only.add(self.scrub_readability_only);
         s.scrub_failures.add(self.scrub_failures);
         s.scrub_pin_unstable_cleared.add(self.scrub_pin_unstable_cleared);
+        s.scrub_unwritten_skipped.add(self.scrub_unwritten_skipped);
     }
 };
 

@@ -269,7 +269,7 @@ pub const RamMap = struct {
         return .{ .ctx = self, .vtable = &vtable };
     }
 
-    const vtable: seams.MapSeam.VTable = .{ .lookup = &lookup, .view = &view, .merge = &merge, .current_fencing = &currentFencing, .size_epoch = &sizeEpoch };
+    const vtable: seams.MapSeam.VTable = .{ .lookup = &lookup, .reserved = &reserved, .view = &view, .merge = &merge, .current_fencing = &currentFencing, .size_epoch = &sizeEpoch };
 
     pub fn create(self: *RamMap, ino: u64, kind: seams.FileKind, size: u64) !void {
         try self.files.put(self.gpa, ino, .{ .kind = kind, .size = size });
@@ -311,8 +311,27 @@ pub const RamMap = struct {
         return if (self.files.get(ino)) |f| f.size else 0;
     }
 
+    /// The product's law: a reservation is a hole to `lookup`.
     fn lookup(ctx: *anyopaque, ino: u64, block: u32) ?Binding {
         const self: *RamMap = @ptrCast(@alignCast(ctx));
+        self.lock.lockUncancelable(std.testing.io);
+        defer self.lock.unlock(std.testing.io);
+        const f = self.files.get(ino) orelse return null;
+        const m = f.map.get(block) orelse return null;
+        return if (m.unwritten) null else m;
+    }
+
+    fn reserved(ctx: *anyopaque, ino: u64, block: u32) ?Binding {
+        const self: *RamMap = @ptrCast(@alignCast(ctx));
+        self.lock.lockUncancelable(std.testing.io);
+        defer self.lock.unlock(std.testing.io);
+        const f = self.files.get(ino) orelse return null;
+        const m = f.map.get(block) orelse return null;
+        return if (m.unwritten) m else null;
+    }
+
+    /// The raw binding at `block`, flag and all (a test's oracle).
+    pub fn bindingAt(self: *RamMap, ino: u64, block: u32) ?Binding {
         self.lock.lockUncancelable(std.testing.io);
         defer self.lock.unlock(std.testing.io);
         const f = self.files.get(ino) orelse return null;
@@ -341,9 +360,14 @@ pub const RamMap = struct {
         }
         if (req.fencing != self.fencing) return error.FencingTokenExpired;
         const f = self.files.getPtr(req.ino) orelse return error.NotFound;
-        // Every new binding needs a proof (the publish law).
+        // Every new binding needs a proof (the publish law); an UNWRITTEN
+        // one names no bytes, and a flip of the same reference is no new
+        // binding.
         for (req.inserts) |ins| {
-            var covered = false;
+            var covered = ins.binding.unwritten;
+            if (f.map.get(ins.block)) |old| if (old.sameRef(ins.binding, self.chunk)) {
+                covered = true;
+            };
             for (req.proofs) |p| if (p.vol_tag == ins.binding.vol_tag and p.offset <= ins.binding.offset and ins.binding.offset < p.offset + p.len) {
                 covered = true;
             };

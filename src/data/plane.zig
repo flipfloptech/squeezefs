@@ -2824,7 +2824,7 @@ pub const DataPlane = struct {
         return .{ .ctx = self, .vtable = &map_vtable };
     }
 
-    const map_vtable: seams.MapSeam.VTable = .{ .lookup = &mapLookup, .view = &mapView, .merge = &mapMerge, .current_fencing = &mapFencing, .size_epoch = &mapSizeEpoch };
+    const map_vtable: seams.MapSeam.VTable = .{ .lookup = &mapLookup, .reserved = &mapReserved, .view = &mapView, .merge = &mapMerge, .current_fencing = &mapFencing, .size_epoch = &mapSizeEpoch };
 
     /// The layout record of `ino`: the xattr chain at the layout name's
     /// hash, the record named `layout` (owned bytes) and its chain slot.
@@ -3029,11 +3029,30 @@ pub const DataPlane = struct {
         self.view.bindMoves(&m.epoch);
     }
 
-    fn mapLookup(ctx: *anyopaque, ino: u64, block: u32) ?Mapping {
-        const self: *DataPlane = @ptrCast(@alignCast(ctx));
+    /// The binding of `block` as the map stores it, flag and all (null =
+    /// a hole, or not striped).
+    fn rawBinding(self: *DataPlane, ino: u64, block: u32) ?Mapping {
         const p = (self.layoutPoint(ino, block) catch return null) orelse return null;
         if (p.kind != .striped) return null;
         return if (p.kvmap) |head| self.kvmapLookup(ino, head, block) else p.binding;
+    }
+
+    /// The ONE hide (`seams.MapSeam`'s law): an UNWRITTEN binding is a hole
+    /// to every reader and every write arm.
+    fn written(m: ?Mapping) ?Mapping {
+        const b = m orelse return null;
+        return if (b.unwritten) null else b;
+    }
+
+    fn mapLookup(ctx: *anyopaque, ino: u64, block: u32) ?Mapping {
+        const self: *DataPlane = @ptrCast(@alignCast(ctx));
+        return written(self.rawBinding(ino, block));
+    }
+
+    fn mapReserved(ctx: *anyopaque, ino: u64, block: u32) ?Mapping {
+        const self: *DataPlane = @ptrCast(@alignCast(ctx));
+        const m = self.rawBinding(ino, block) orelse return null;
+        return if (m.unwritten) m else null;
     }
 
     /// The tree-mapped resolve ladder: an index at or above a live sweep
@@ -3924,7 +3943,7 @@ pub const DataPlane = struct {
         const p = r.point orelse return .{ .info = .{ .size = size, .kind = .inline_ }, .binding = null };
         const info: read_path.FileInfo = .{ .size = size, .kind = p.kind, .file_id = p.file_id, .durable_copy = p.durable_copy };
         if (p.kind != .striped or b == null) return .{ .info = info, .binding = null };
-        return .{ .info = info, .binding = if (p.kvmap) |head| self.kvmapLookup(ino, head, b.?) else p.binding };
+        return .{ .info = info, .binding = written(if (p.kvmap) |head| self.kvmapLookup(ino, head, b.?) else p.binding) };
     }
 
     fn metaBinding(ctx: *anyopaque, ino: u64, block: u64) ?Mapping {

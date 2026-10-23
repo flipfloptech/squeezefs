@@ -179,6 +179,11 @@ pub const stats = struct {
     /// filesystem itself wrote, so the admission ledger ≡ WRITE payload
     /// bytes + these.
     pub var write_gap_zero_bytes: counters.ShardedCounter = .{};
+    /// `fallocate_blocks_reserved`: holes bound to fresh UNWRITTEN blocks
+    /// (`reserveRange`); `fallocate_blocks_zeroed`: written blocks flipped
+    /// to their unwritten twin by ZERO_RANGE — no device byte for either.
+    pub var fallocate_blocks_reserved: counters.ShardedCounter = .{};
+    pub var fallocate_blocks_zeroed: counters.ShardedCounter = .{};
     pub var write_shared_class_violation: counters.Tripwire = .init("write_shared_class_violation");
     /// The gate's cold flushes failed for a whole wall while fresh supply
     /// was VISIBLE on some volume: the plane is wrong, not full — the
@@ -200,7 +205,7 @@ pub fn noteInlineWrite(len: u64) void {
 
 pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
     try w.writeAll("{");
-    inline for (.{ "admit_write_overlay_bytes", "admit_write_inplace_bytes", "admit_write_accumulate_bytes", "admit_write_inline_bytes", "write_enospc_refusals", "write_pieces", "writes_admitted", "staging_sibling_probes", "restage_churn_removes", "restage_churn_bytes", "parked_gate_waits", "parked_gate_self_flushes", "parked_gate_cold_flushes", "parked_gate_wall_refusals", "write_gap_zero_bytes" }) |name| {
+    inline for (.{ "admit_write_overlay_bytes", "admit_write_inplace_bytes", "admit_write_accumulate_bytes", "admit_write_inline_bytes", "write_enospc_refusals", "write_pieces", "writes_admitted", "staging_sibling_probes", "restage_churn_removes", "restage_churn_bytes", "parked_gate_waits", "parked_gate_self_flushes", "parked_gate_cold_flushes", "parked_gate_wall_refusals", "write_gap_zero_bytes", "fallocate_blocks_reserved", "fallocate_blocks_zeroed" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, @field(stats, name).load() });
     }
     try w.print("\"write_shared_class_violation\":{d},\"parked_gate_wall_supply_visible\":{d},", .{ counters.tripwireCount("write_shared_class_violation"), counters.tripwireCount("parked_gate_wall_supply_visible") });
@@ -833,17 +838,27 @@ pub const WritePath = struct {
         return !enospc.storeCoversRing(self.vols.reachableFreeBytes(self.cfg.block_size), ring, extra);
     }
 
-    /// RAM-only: a block is HELD iff custody exists (parked, overlay, epoch)
-    /// or the write can land IN PLACE (passthrough ∧ undecorated whole-block
-    /// ∧ active volume ∧ `refcount == 1 ∧ !SHARED`); a hole below EOF holds
-    /// nothing; a cache miss answers "held" (the refusal must never fire on
-    /// a block whose mapping it could not see).
+    /// RAM-only: a block is HELD iff custody exists (parked, overlay, epoch),
+    /// the write can land IN PLACE (passthrough ∧ undecorated whole-block
+    /// ∧ active volume ∧ `refcount == 1 ∧ !SHARED`) or the file holds a
+    /// RESERVED block there it owns alone (a fallocate reservation lands in
+    /// place, charter §6.6 — on any volume class: the whole image is
+    /// written); a hole below EOF holds nothing; a cache miss answers
+    /// "held" (the refusal must never fire on a block whose mapping it
+    /// could not see).
     pub fn writeWouldCreateFreshCustody(self: *WritePath, ino: u64, file: ?seams.FileView, first: u32, last: u32) bool {
         const f = file orelse return false;
         if (!f.map_resident) return false;
         var b = first;
         while (b <= last) : (b += 1) {
             if (self.table.has(ino, b) or self.overlay.hasCustody(ino, b) or self.epochs.bindsBlock(ino, b)) continue;
+            if (self.map.reserved(ino, b)) |r| {
+                const v = self.vols.byTag(r.vol_tag) orelse return true;
+                if (!v.isActive()) return true;
+                const idx = v.alloc.idxOf(r.offset);
+                if (v.alloc.refcount(idx) != 1 or v.alloc.isShared(idx)) return true;
+                continue;
+            }
             const m = self.map.lookup(ino, b) orelse return true;
             const v = self.vols.byTag(m.vol_tag) orelse return true;
             if (!v.passthrough or !m.whole_block or !v.isActive()) return true;
@@ -1462,6 +1477,124 @@ pub const WritePath = struct {
         return floor;
     }
 
+    /// A reservation's mint: the placed grace-bounded mint, with the
+    /// allocation plane's RETRYABLE refusal (a grant window being refilled
+    /// by a reachable holder) retried a slice at a time up to the park wall
+    /// — the upload parks and comes back on its next pass, a synchronous
+    /// fallocate has no next pass; past the wall the refusal stands (EIO:
+    /// fallocate(2) owns no EAGAIN).
+    fn reserveMint(self: *WritePath, io: Io, ino: u64, block: u32) enospc.PlacedError!enospc.PlacedMint {
+        const started = clock.monotonicNs();
+        const wall_ns = enospc.pressureParkWallMs(0) * std.time.ns_per_ms;
+        while (true) {
+            return enospc.allocatePlacedMint(self.picker.picker(), .{ .ino = ino, .block = block }, io, self.valve, .{ .ctx = self, .run = &pressureHook }, false, .visible_supply) catch |e| switch (e) {
+                error.PlaneRefused => {
+                    if (clock.monotonicNs() - started >= wall_ns) return e;
+                    io.sleep(.fromMilliseconds(@intCast(enospc.pressureParkSliceMs(0))), .awake) catch {};
+                    continue;
+                },
+                else => e,
+            };
+        }
+    }
+
+    pub const Reserved = struct {
+        /// Holes bound to fresh UNWRITTEN blocks.
+        reserved: u32 = 0,
+        /// Written blocks flipped to their unwritten twin (ZERO_RANGE).
+        zeroed: u32 = 0,
+    };
+
+    /// THE RESERVATION (charter §6.6; decision 0003 §BH.2): every hole of
+    /// `[first, last]` bound to a fresh UNWRITTEN block — minted, published
+    /// in the allocator, never written — in merges of at most
+    /// `MergeOutcome.max_displaced` inserts each (one journal entry); with
+    /// `zero_existing` (ZERO_RANGE) every WRITTEN block of the range flips
+    /// to its unwritten twin in the same merges — the same reference, no
+    /// device I/O — and leaves every read tier. A block already reserved is
+    /// left alone. The mint waits for visible supply as the upload's does;
+    /// a full store refuses ENOSPC with the chunk's mints returned and the
+    /// earlier chunks standing (fallocate is idempotent). The caller holds
+    /// the inode's exclusive op guard with its write custody settled, so
+    /// no landing races the flip; the 4a guards are not held (the merge
+    /// takes the (3.5) stripe and the (3.7) layout lock).
+    pub fn reserveRange(self: *WritePath, io: Io, ino: u64, first: u32, last: u32, zero_existing: bool) Error!Reserved {
+        var out: Reserved = .{};
+        const cap = seams.MergeOutcome.max_displaced;
+        var b: u64 = first;
+        while (b <= last) {
+            var inserts: [cap]seams.MapInsert = undefined;
+            var mints: [cap]block_alloc.MintedBlockGuard = undefined;
+            var guards: [cap]block_alloc.InflightAllocGuard = undefined;
+            var flips: [cap]Binding = undefined;
+            var n: usize = 0;
+            var n_mints: usize = 0;
+            var n_flips: usize = 0;
+            var committed = false;
+            defer {
+                for (guards[0..n_mints]) |*g| g.deinit();
+                if (!committed) for (mints[0..n_mints]) |*m| m.abandon();
+            }
+            while (b <= last and n < cap) : (b += 1) {
+                const blk: u32 = @intCast(b);
+                if (self.map.reserved(ino, blk) != null) continue;
+                if (self.map.lookup(ino, blk)) |m| {
+                    if (!zero_existing) continue;
+                    inserts[n] = .{ .block = blk, .binding = m.withUnwritten(true) };
+                    flips[n_flips] = m;
+                    n += 1;
+                    n_flips += 1;
+                    continue;
+                }
+                const pm = self.reserveMint(io, ino, blk) catch |e| return switch (e) {
+                    error.StorageFull, error.NoHealthyBackends => error.NoSpaceLeft,
+                    error.ReadOnly => error.ReadOnlyFileSystem,
+                    error.PlaneRefused, error.NotFree => error.InputOutput,
+                };
+                mints[n_mints] = block_alloc.MintedBlockGuard.init(pm.alloc, pm.minted);
+                guards[n_mints] = block_alloc.InflightAllocGuard.register(pm.alloc, pm.minted.idx);
+                n_mints += 1;
+                // Allocated, never DMA'd: the word is stable at once (a
+                // landing's fence pair retires and re-publishes it).
+                pm.alloc.publishBlock(pm.minted.idx);
+                inserts[n] = .{ .block = blk, .binding = Binding.unwrittenBlock(pm.alloc.volTag(), pm.minted.offset, pm.minted.stamp) };
+                n += 1;
+            }
+            if (n == 0) continue;
+            var displaced: seams.MergeOutcome = .{};
+            {
+                const sg = self.stripes.acquire(io, ino);
+                defer sg.release(io);
+                displaced = while (true) {
+                    break self.map.merge(.{ .ino = ino, .inserts = inserts[0..n], .min_size = 0, .proofs = &.{}, .fencing = self.map.currentFencing(ino) }) catch |e| switch (e) {
+                        error.FencingTokenExpired => continue,
+                        error.WriterGuardFenced => {
+                            // W5: free nothing.
+                            for (mints[0..n_mints]) |*m| m.disarm();
+                            return error.WriterGuardFenced;
+                        },
+                        error.NotFound => return error.InputOutput,
+                        error.Transient => return error.InputOutput,
+                        error.OutOfMemory => return error.OutOfMemory,
+                    };
+                };
+            }
+            committed = true;
+            for (mints[0..n_mints]) |*m| m.disarm();
+            // A flipped block's bytes are nobody's now: out of every tier
+            // before the next landing can make the key reachable again.
+            for (flips[0..n_flips]) |m| self.purge.purge(m);
+            // Same references throughout: nothing displaced by construction.
+            for (displaced.slice()) |d| _ = self.free.free(io, d);
+            displaced.dropHolds();
+            out.reserved += @intCast(n_mints);
+            out.zeroed += @intCast(n_flips);
+        }
+        stats.fallocate_blocks_reserved.add(out.reserved);
+        stats.fallocate_blocks_zeroed.add(out.zeroed);
+        return out;
+    }
+
     fn lowestCovered(e: *const accumulate.Entry) u64 {
         switch (e.repr) {
             .full => {
@@ -1766,6 +1899,151 @@ test "the ENOSPC terminal law: a write that would CREATE custody against an exha
     try testing.expect(!enospc.freshSupplyExhausted(w.f.vols.candidates(&cands)));
     const o3 = try w.wp.write(io, .{ .ino = 12, .offset = 0, .payload = .{ .bytes = &half }, .class = .entire_op, .file = World.striped(0) });
     try testing.expectEqual(@as(u64, wt.BS / 2), o3.written);
+}
+
+test "the fallocate reservation (charter §6.6, decision 0003 §BH): `reserveRange` binds every hole of the range to a fresh UNWRITTEN block with no device byte written and leaves written blocks alone; the map's `lookup` sees a hole there and `reserved` the binding; a write inside the reservation lands IN PLACE (the whole block into the reserved one, the publish flips the flag: the same reference, the allocator's census unchanged, no mint, no free); ZERO_RANGE flips a written block to its unwritten twin with no I/O and purges it; a reservation on a clone-shared block is left to the fresh-mint path, which displaces it" {
+    const io = testing.io;
+    const w = try World.init(testing.allocator, .sync_inline, false);
+    defer w.deinit(testing.allocator);
+    // Block 0 written, blocks 1–3 holes; the file reaches 4 blocks.
+    _ = try w.f.publishBlock(30, 0, 0xAA);
+    w.f.map.files.getPtr(30).?.size = 4 * wt.BS;
+    const used_a0 = w.f.alloc_a.usedBlocks();
+    const used_b0 = w.f.alloc_b.usedBlocks();
+    const writes0 = w.f.dev.writes.items.len;
+    const r = try w.wp.reserveRange(io, 30, 0, 3, false);
+    try testing.expectEqual(@as(u32, 3), r.reserved);
+    try testing.expectEqual(@as(u32, 0), r.zeroed);
+    try testing.expectEqual(writes0, w.f.dev.writes.items.len); // no device byte
+    try testing.expectEqual(used_a0 + used_b0 + 3, w.f.alloc_a.usedBlocks() + w.f.alloc_b.usedBlocks()); // charged
+    try testing.expectEqual(@as(u64, 3), w.f.map.refs_added); // one +ref per reservation, none for block 0
+    const seam = w.f.map.seam();
+    for (1..4) |b| {
+        const blk: u32 = @intCast(b);
+        try testing.expect(seam.lookup(30, blk) == null); // a hole to every arm
+        const res = seam.reserved(30, blk).?;
+        try testing.expect(res.unwritten and res.whole_block);
+    }
+    try testing.expect(seam.reserved(30, 0) == null);
+    try testing.expect(seam.lookup(30, 0) != null);
+    // Idempotent: a second reservation of the same range binds nothing.
+    const again = try w.wp.reserveRange(io, 30, 0, 3, false);
+    try testing.expectEqual(@as(u32, 0), again.reserved);
+    try testing.expectEqual(@as(u64, 3), w.f.map.refs_added);
+    // The write inside the reservation: a half block parks (a hole's
+    // zero seed), its sibling completes the block — the landing takes the
+    // reserved block over: no mint, the same reference, the flag flipped.
+    const reserved_2 = seam.reserved(30, 2).?;
+    const landings0 = accumulate.stats.reserved_landings.load();
+    var half: [wt.BS / 2]u8 = undefined;
+    fill(&half, 0x30);
+    const o1 = try w.wp.write(io, .{ .ino = 30, .offset = 2 * wt.BS, .payload = .{ .bytes = &half }, .class = .shared, .file = World.striped(4 * wt.BS) });
+    try testing.expectEqual(@as(u32, 1), o1.count(.accumulate_park));
+    var rest: [wt.BS / 2]u8 = undefined;
+    fill(&rest, 0x31);
+    const o2 = try w.wp.write(io, .{ .ino = 30, .offset = 2 * wt.BS + wt.BS / 2, .payload = .{ .bytes = &rest }, .class = .shared, .file = World.striped(4 * wt.BS) });
+    try testing.expectEqual(@as(u32, 1), o2.count(.write_through));
+    w.wp.quiesce(io);
+    try testing.expectEqual(landings0 + 1, accumulate.stats.reserved_landings.load());
+    const written_2 = seam.lookup(30, 2).?;
+    try testing.expect(!written_2.unwritten);
+    try testing.expect(written_2.sameRef(reserved_2, wt.BS));
+    try testing.expect(seam.reserved(30, 2) == null);
+    try testing.expectEqual(used_a0 + used_b0 + 3, w.f.alloc_a.usedBlocks() + w.f.alloc_b.usedBlocks()); // no mint, no free
+    try testing.expectEqual(@as(u64, 3), w.f.map.refs_added); // the flip is no reference move
+    try testing.expectEqual(@as(u64, 0), w.f.map.refs_released);
+    try testing.expectEqual(@as(usize, 0), w.f.frees.freed.items.len);
+    var got: [wt.BS]u8 = undefined;
+    w.f.dev.peek(written_2.vol_tag, written_2.offset, &got);
+    try testing.expectEqualSlices(u8, &half, got[0 .. wt.BS / 2]);
+    try testing.expectEqualSlices(u8, &rest, got[wt.BS / 2 ..]);
+    // The landed block is W1's now: a page rewrite patches in place.
+    var page: [PAGE]u8 align(4096) = @splat(0x32);
+    const o3 = try w.wp.write(io, .{ .ino = 30, .offset = 2 * wt.BS + PAGE, .payload = .{ .bytes = &page }, .class = .shared, .file = World.striped(4 * wt.BS) });
+    try testing.expectEqual(@as(u32, 1), o3.count(.patch));
+    // ZERO_RANGE over blocks 0–1: the written block 0 flips (no I/O, its
+    // key purged), the reserved block 1 stands, nothing minted.
+    const writes1 = w.f.dev.writes.items.len;
+    const zeroed0 = stats.fallocate_blocks_zeroed.load();
+    const b0 = seam.lookup(30, 0).?;
+    const z = try w.wp.reserveRange(io, 30, 0, 1, true);
+    try testing.expectEqual(@as(u32, 0), z.reserved);
+    try testing.expectEqual(@as(u32, 1), z.zeroed);
+    try testing.expectEqual(zeroed0 + 1, stats.fallocate_blocks_zeroed.load());
+    try testing.expectEqual(writes1, w.f.dev.writes.items.len);
+    try testing.expect(seam.lookup(30, 0) == null);
+    try testing.expect(seam.reserved(30, 0).?.sameRef(b0, wt.BS));
+    try testing.expectEqual(@as(u64, 3), w.f.map.refs_added);
+    try testing.expectEqual(@as(u64, 0), w.f.map.refs_released);
+    // A clone shares block 3's reservation: a write there finds the block
+    // shared, declines the takeover and mints fresh; the publish displaces
+    // the reservation (freed by the upload), the clone keeps its own.
+    const res3 = seam.reserved(30, 3).?;
+    const idx3 = w.f.alloc_a.idxOf(res3.offset);
+    const on_a = res3.vol_tag == wt.VOL_A;
+    const alloc3 = if (on_a) w.f.alloc_a else w.f.alloc_b;
+    try testing.expect(alloc3.incrementRefcount(if (on_a) idx3 else w.f.alloc_b.idxOf(res3.offset)));
+    const declines0 = accumulate.stats.reserved_landing_declines.load();
+    var whole: [wt.BS]u8 align(4096) = undefined;
+    fill(&whole, 0x33);
+    const o4 = try w.wp.write(io, .{ .ino = 30, .offset = 3 * wt.BS, .payload = .{ .bytes = &whole }, .class = .shared, .file = World.striped(4 * wt.BS) });
+    try testing.expectEqual(@as(u32, 1), o4.count(.write_through));
+    w.wp.quiesce(io);
+    try testing.expectEqual(declines0 + 1, accumulate.stats.reserved_landing_declines.load());
+    // The fresh block rode the rewrite epoch with the reservation parked
+    // as its displaced key; the close's save publishes and frees it.
+    const drift0 = counters.tripwireCount("rewrite_shadow_displaced_drift");
+    w.wp.flushIno(io, 30);
+    try testing.expectEqual(drift0, counters.tripwireCount("rewrite_shadow_displaced_drift"));
+    const b3 = seam.lookup(30, 3).?;
+    try testing.expect(!b3.sameRef(res3, wt.BS));
+    try testing.expectEqual(@as(u64, 1), w.f.map.refs_released); // the reservation displaced (the clone's share stands)
+    try testing.expectEqual(@as(usize, 1), w.f.frees.freed.items.len);
+    try testing.expect(w.f.frees.freed.items[0].sameRef(res3, wt.BS));
+}
+
+test "the fallocate reservation under a FULL store: a write inside the reservation is admitted (the custody probe reads the reserved block as the file's own) and lands in place where a hole's write is refused ENOSPC before any byte; a reservation the store cannot cover refuses ENOSPC with its chunk's mints returned and the earlier blocks standing" {
+    const io = testing.io;
+    const w = try World.init(testing.allocator, .sync_inline, false);
+    defer w.deinit(testing.allocator);
+    try w.f.map.create(40, .striped, 4 * wt.BS);
+    try w.f.map.create(41, .striped, 4 * wt.BS);
+    _ = try w.wp.reserveRange(io, 40, 0, 1, false);
+    // Exhaust both volumes: every remaining block minted away.
+    while (w.f.alloc_a.allocateBlock()) |_| {} else |_| {}
+    while (w.f.alloc_b.allocateBlock()) |_| {} else |_| {}
+    var cands: [router.MAX_VOLUMES]*block_alloc.BlockAllocator = undefined;
+    try testing.expect(enospc.freshSupplyExhausted(w.f.vols.candidates(&cands)));
+    // A hole's write: refused before any byte (the terminal law).
+    var half: [wt.BS / 2]u8 = @splat(0x40);
+    const ref0 = stats.write_enospc_refusals.load();
+    try testing.expectError(error.NoSpaceLeft, w.wp.write(io, .{ .ino = 41, .offset = 0, .payload = .{ .bytes = &half }, .class = .shared, .file = World.striped(4 * wt.BS) }));
+    try testing.expectEqual(ref0 + 1, stats.write_enospc_refusals.load());
+    // The reservation's write: admitted, parked, landed in place.
+    const o1 = try w.wp.write(io, .{ .ino = 40, .offset = 0, .payload = .{ .bytes = &half }, .class = .shared, .file = World.striped(4 * wt.BS) });
+    try testing.expectEqual(@as(u64, wt.BS / 2), o1.written);
+    const o2 = try w.wp.write(io, .{ .ino = 40, .offset = wt.BS / 2, .payload = .{ .bytes = &half }, .class = .shared, .file = World.striped(4 * wt.BS) });
+    try testing.expectEqual(@as(u32, 1), o2.count(.write_through));
+    w.wp.quiesce(io);
+    try testing.expect(w.f.map.seam().lookup(40, 0) != null);
+    try testing.expect(!w.wp.table.has(40, 0));
+    // A whole-block write into the second reserved block: the overlay is
+    // off here, so the accumulation arm lands it in place too.
+    var whole: [wt.BS]u8 align(4096) = @splat(0x41);
+    const o3 = try w.wp.write(io, .{ .ino = 40, .offset = wt.BS, .payload = .{ .bytes = &whole }, .class = .shared, .file = World.striped(4 * wt.BS) });
+    try testing.expectEqual(@as(u32, 1), o3.count(.write_through));
+    try testing.expect(w.f.map.seam().lookup(40, 1) != null);
+    // A reservation the store cannot cover: ENOSPC, nothing leaked.
+    const used0 = w.f.alloc_a.usedBlocks() + w.f.alloc_b.usedBlocks();
+    const added0 = w.f.map.refs_added;
+    try testing.expectError(error.NoSpaceLeft, w.wp.reserveRange(io, 41, 0, 1, false));
+    try testing.expectEqual(used0, w.f.alloc_a.usedBlocks() + w.f.alloc_b.usedBlocks());
+    try testing.expectEqual(added0, w.f.map.refs_added);
+    try testing.expect(w.f.map.seam().reserved(41, 0) == null);
+    // Supply returns: the reservation lands.
+    _ = try w.f.alloc_a.freeBlock(5);
+    const r = try w.wp.reserveRange(io, 41, 0, 0, false);
+    try testing.expectEqual(@as(u32, 1), r.reserved);
 }
 
 test "the per-piece ladder (the accumulation control arm, overlay off): out-of-order O_DIRECT-style pieces of one block complete the coverage union and write through once; a partial tail parks; W2 parks a small non-adjacent write compactly and escalates at 25 %; the shared-mode handoff trips on an extending Shared write" {

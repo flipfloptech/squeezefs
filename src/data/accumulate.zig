@@ -137,6 +137,12 @@ pub const stats = struct {
     pub var write_through_blocks: counters.ShardedCounter = .{};
     pub var write_through_bytes: counters.ShardedCounter = .{};
     pub var write_through_fallbacks: counters.ShardedCounter = .{};
+    /// A whole-block landing took the file's RESERVED block over in place
+    /// (`pickDest`, decision 0003 §BH.3) — and the takeovers declined
+    /// because another owner shares the block (a clone): the fresh-mint
+    /// path displaced the reservation instead.
+    pub var reserved_landings: counters.ShardedCounter = .{};
+    pub var reserved_landing_declines: counters.ShardedCounter = .{};
     /// A flush waited the bark bound on another task's upload (must-stay-0:
     /// an upload is a bounded DMA + one transaction).
     pub var upload_join_overlong: counters.Tripwire = .init("upload_join_overlong");
@@ -194,7 +200,7 @@ pub const stats = struct {
 
 pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
     try w.writeAll("{");
-    inline for (.{ "write_through_blocks", "write_through_bytes", "write_through_fallbacks", "nt_copy_bytes", "active_block_cow_copies", "active_block_memset_elided_bytes", "active_block_ooo_runs", "active_block_run_table_completions", "overwrite_seed_deferred", "overwrite_seed_materialized", "overwrite_seed_skipped", "write_block_revisits", "parked_pool_refusals", "parked_pool_trimmed_cells", "durable_upload_bytes_escalation", "placed_merge_elides", "drain_inplace_drains", "drain_inplace_pages", "drain_inplace_dmas", "drain_inplace_write_bytes", "drain_inplace_seed_bytes", "drain_inplace_declines", "drain_inplace_dma_errors", "drain_inplace_dirty_drains", "extent_cap_fallbacks", "parked_ino_scans" }) |name| {
+    inline for (.{ "write_through_blocks", "write_through_bytes", "write_through_fallbacks", "nt_copy_bytes", "active_block_cow_copies", "active_block_memset_elided_bytes", "active_block_ooo_runs", "active_block_run_table_completions", "overwrite_seed_deferred", "overwrite_seed_materialized", "overwrite_seed_skipped", "write_block_revisits", "parked_pool_refusals", "parked_pool_trimmed_cells", "durable_upload_bytes_escalation", "placed_merge_elides", "drain_inplace_drains", "drain_inplace_pages", "drain_inplace_dmas", "drain_inplace_write_bytes", "drain_inplace_seed_bytes", "drain_inplace_declines", "drain_inplace_dma_errors", "drain_inplace_dirty_drains", "extent_cap_fallbacks", "parked_ino_scans", "reserved_landings", "reserved_landing_declines" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, @field(stats, name).load() });
     }
     try w.print("\"parked_full_buffer_bytes\":{d},\"parked_buffers\":{d},", .{ stats.parked_full_buffer_bytes.load(), stats.parked_buffers.load() });
@@ -1152,6 +1158,85 @@ const seams_transform = TransformSeam;
 
 pub const Disposition = pipeline.Disposition;
 
+/// A whole-block landing's DESTINATION (decision 0003 §BH.3): the file's
+/// RESERVED block at this index when this mount is its sole owner — the
+/// image lands IN PLACE under W1's fence pair (retire → DMA → publish) and
+/// the publish flips the flag, the same reference, so a write inside a
+/// fallocate reservation takes no fresh custody and cannot ENOSPC on a
+/// full store — else a fresh placed mint. A reservation an epoch binds, an
+/// open overlay record covers, a draining volume holds or another owner
+/// shares (a clone) is left to the fresh-mint path, whose publish
+/// displaces it (space-neutral after the commit).
+pub const Dest = struct {
+    alloc: *block_alloc.BlockAllocator,
+    idx: u64,
+    offset: u64,
+    stamp: u64,
+    vol_tag: u64,
+    /// The reservation taken over (null = a fresh mint).
+    reserved: ?Binding,
+    /// Armed for a fresh mint alone: a reservation is owned by the layout.
+    mint: block_alloc.MintedBlockGuard,
+
+    /// The WRITTEN binding the landing publishes.
+    pub fn key(self: *const Dest) Binding {
+        if (self.reserved) |r| return r.withUnwritten(false);
+        return Binding.wholeBlock(self.vol_tag, self.offset, self.stamp);
+    }
+
+    /// The census guard of an unpublished mint (decision 0003 §AH.1); a
+    /// reservation is durably referenced and registers nothing.
+    pub fn inflightGuard(self: *const Dest) block_alloc.InflightAllocGuard {
+        if (self.reserved != null) return .{ .alloc = self.alloc, .idx = self.idx, .armed = false };
+        return block_alloc.InflightAllocGuard.register(self.alloc, self.idx);
+    }
+
+    /// The DMA landed: the incarnation word stable under its generation.
+    pub fn publishBlock(self: *const Dest) void {
+        self.alloc.publishBlock(self.idx);
+    }
+
+    /// The error path: a mint returns to the allocator; a reservation is
+    /// re-stabilized and stands (its bytes are nobody's either way).
+    pub fn abandon(self: *Dest) void {
+        if (self.reserved != null) {
+            self.alloc.publishBlock(self.idx);
+            return;
+        }
+        self.mint.abandon();
+    }
+
+    /// Durable publication landed (or the fence: free nothing).
+    pub fn disarm(self: *Dest) void {
+        self.mint.disarm();
+    }
+};
+
+pub const DestError = enospc.PlacedError;
+
+/// `Dest` for `(ino, block)`: the reservation's takeover when the law
+/// admits it, else `enospc.allocatePlacedMint` with the caller's class.
+pub fn pickDest(deps: UploadDeps, io: Io, ino: u64, block: u32, under_guard: bool, wait: enospc.SupplyWait) DestError!Dest {
+    if (deps.map.reserved(ino, block)) |r| takeover: {
+        if (deps.epochs.bindsBlock(ino, block)) break :takeover;
+        if (deps.custody) |c| if (c.overlay_open(c.ctx, ino, block)) break :takeover;
+        const v = deps.vols.byTag(r.vol_tag) orelse break :takeover;
+        if (!v.isActive()) break :takeover;
+        const idx = v.alloc.idxOf(r.offset);
+        const sole = v.alloc.beginPatchSoleOwner(idx) catch break :takeover;
+        if (!sole) {
+            // Re-stabilize under the NEW generation (content unchanged).
+            v.alloc.publishBlock(idx);
+            stats.reserved_landing_declines.inc();
+            break :takeover;
+        }
+        stats.reserved_landings.inc();
+        return .{ .alloc = v.alloc, .idx = idx, .offset = r.offset, .stamp = r.incarnation, .vol_tag = r.vol_tag, .reserved = r, .mint = .{ .alloc = v.alloc, .minted = .{ .idx = idx, .offset = r.offset, .stamp = r.incarnation }, .armed = false } };
+    }
+    const pm = try enospc.allocatePlacedMint(deps.picker, .{ .ino = ino, .block = block }, io, deps.valve, null, under_guard, wait);
+    return .{ .alloc = pm.alloc, .idx = pm.minted.idx, .offset = pm.minted.offset, .stamp = pm.minted.stamp, .vol_tag = pm.alloc.volTag(), .reserved = null, .mint = block_alloc.MintedBlockGuard.init(pm.alloc, pm.minted) };
+}
+
 /// `pipeline_upload_parked_block`: the detached upload of `(ino, block)`.
 /// Returns the disposition (counted by the caller through
 /// `pipeline.countDisposition`). `prof` is the caller's phase profile
@@ -1230,12 +1315,13 @@ pub fn uploadParkedBlock(table: *Table, deps: UploadDeps, io: Io, ino: u64, bloc
             }
         }
         defer snap.release(&table.pool);
-        // UNLOCKED device phase: transform → allocate (unstable) → DMA → publish.
-        // The mint WAITS for visible supply (a window being refilled, a
-        // trim window, a pending drain): this upload returns a parked cell
-        // and has no cheaper arm, so it outranks a fresh overlay mint
-        // (which declines to accumulation at once) under scarce supply.
-        const pm = enospc.allocatePlacedMint(deps.picker, .{ .ino = ino, .block = block }, io, deps.valve, null, false, .visible_supply) catch |e| switch (e) {
+        // UNLOCKED device phase: transform → the destination (a reservation
+        // taken over, else a mint, unstable) → DMA → publish. The mint
+        // WAITS for visible supply (a window being refilled, a trim window,
+        // a pending drain): this upload returns a parked cell and has no
+        // cheaper arm, so it outranks a fresh overlay mint (which declines
+        // to accumulation at once) under scarce supply.
+        var dest = pickDest(deps, io, ino, block, false, .visible_supply) catch |e| switch (e) {
             error.StorageFull => {
                 // KD-1.7: the ENOSPC early-close frees parked supply; a
                 // release lets the next pass land, else the block stays
@@ -1253,18 +1339,17 @@ pub fn uploadParkedBlock(table: *Table, deps: UploadDeps, io: Io, ino: u64, bloc
                 return .stay_parked;
             },
         };
-        var mint = block_alloc.MintedBlockGuard.init(pm.alloc, pm.minted);
-        var fsck_guard = block_alloc.InflightAllocGuard.register(pm.alloc, pm.minted.idx);
-        const vol_tag = pm.alloc.volTag();
+        var fsck_guard = dest.inflightGuard();
+        const vol_tag = dest.vol_tag;
         const vol = deps.vols.byTag(vol_tag) orelse {
             fsck_guard.deinit();
-            mint.abandon();
+            dest.abandon();
             return .stay_parked;
         };
         const need = deps.transform.scratch_len(deps.transform.ctx, vol_tag);
         const scratch_pool: ?*transform.ScratchPool = if (need == 0) null else (deps.scratch orelse {
             fsck_guard.deinit();
-            mint.abandon();
+            dest.abandon();
             stats.write_through_fallbacks.inc();
             return .stay_parked;
         });
@@ -1280,15 +1365,15 @@ pub fn uploadParkedBlock(table: *Table, deps: UploadDeps, io: Io, ino: u64, bloc
             const plain = if (scratch_pool != null) snap.bytes()[0..transform.liveLen(snap.bytes())] else snap.bytes();
             const image = deps.transform.process_write(deps.transform.ctx, vol_tag, plain, scratch) catch {
                 fsck_guard.deinit();
-                mint.abandon();
+                dest.abandon();
                 stats.write_through_fallbacks.inc();
                 return .stay_parked;
             };
             prof.mark(.crypto);
             prof.mark(.allocate);
-            break :blk deps.device.write(vol_tag, pm.minted.offset, image) catch |e| {
+            break :blk deps.device.write(vol_tag, dest.offset, image) catch |e| {
                 fsck_guard.deinit();
-                mint.abandon();
+                dest.abandon();
                 stats.write_through_fallbacks.inc();
                 return switch (e) {
                     error.WriterGuardFenced, error.VolumeFailed => .fence_drop,
@@ -1297,8 +1382,8 @@ pub fn uploadParkedBlock(table: *Table, deps: UploadDeps, io: Io, ino: u64, bloc
             };
         };
         prof.mark(.dma);
-        pm.alloc.publishBlock(pm.minted.idx);
-        const new_key = Binding.wholeBlock(vol_tag, pm.minted.offset, pm.minted.stamp);
+        dest.publishBlock();
+        const new_key = dest.key();
         deps.purge.purge(new_key);
         // Re-lock, revalidate: entry present ∧ epoch unchanged ⇒ publish;
         // superseded ⇒ free the fresh offset, publish nothing (latest-wins).
@@ -1320,7 +1405,7 @@ pub fn uploadParkedBlock(table: *Table, deps: UploadDeps, io: Io, ino: u64, bloc
             defer g.release(io);
             const e = table.get(ino, block) orelse {
                 fsck_guard.deinit();
-                mint.abandon();
+                dest.abandon();
                 return .discarded;
             };
             // A newer write superseded the snapshot: it publishes all the same.
@@ -1333,23 +1418,28 @@ pub fn uploadParkedBlock(table: *Table, deps: UploadDeps, io: Io, ino: u64, bloc
             // own and the saving epoch's), never the checkout's snapshot —
             // and a FRESH block parks nothing; a non-striped shape (a
             // promotion in flight) takes the durable merge.
-            const live = deps.map.lookup(ino, block);
-            if (striped) {
+            // The map's binding, a reservation included: the epoch parks
+            // it as the displaced A key (the save's fold displaces it; the
+            // destroy, never the epoch, frees it on NotFound). A takeover
+            // publishes durably at once — the same reference, no shadow —
+            // so a second landing of the block finds it written.
+            const live = deps.map.lookup(ino, block) orelse deps.map.reserved(ino, block);
+            if (striped and dest.reserved == null) {
                 const v = deps.epochs.record(ino, block, live, new_key, proof, min_size, fsck_guard, true) catch {
-                    mint.abandon();
+                    dest.abandon();
                     return .stay_parked;
                 };
                 switch (v) {
                     .shadowed => |s| {
                         if (s.displaced_prev) |d| deps.purge.purge(d);
-                        mint.disarm();
+                        dest.disarm();
                         fed = true;
                         fed_hint = s.close_owed;
                     },
-                    .not_shadowed => fsck_guard = block_alloc.InflightAllocGuard.register(pm.alloc, pm.minted.idx),
+                    .not_shadowed => fsck_guard = dest.inflightGuard(),
                     .save_in_flight => {
                         // The mint stays visible to fsck across the wait.
-                        fsck_guard = block_alloc.InflightAllocGuard.register(pm.alloc, pm.minted.idx);
+                        fsck_guard = dest.inflightGuard();
                         await_save = true;
                         continue :publish;
                     },
@@ -1363,19 +1453,19 @@ pub fn uploadParkedBlock(table: *Table, deps: UploadDeps, io: Io, ino: u64, bloc
                         error.FencingTokenExpired => continue,
                         error.WriterGuardFenced => {
                             fsck_guard.deinit();
-                            mint.disarm(); // W5: free nothing
+                            dest.disarm(); // W5: free nothing
                             return .fence_drop;
                         },
                         error.NotFound => {
                             fsck_guard.deinit();
-                            mint.abandon();
+                            dest.abandon();
                             table.retire(e);
                             retired_by_us = true;
                             return .discarded;
                         },
                         error.Transient, error.OutOfMemory => {
                             fsck_guard.deinit();
-                            mint.abandon();
+                            dest.abandon();
                             e.upload_inflight = false;
                             stats.write_through_fallbacks.inc();
                             return .stay_parked;
@@ -1384,7 +1474,7 @@ pub fn uploadParkedBlock(table: *Table, deps: UploadDeps, io: Io, ino: u64, bloc
                     break;
                 }
                 fsck_guard.deinit();
-                mint.disarm();
+                dest.disarm();
                 var orphans: [8]Binding = undefined;
                 for (deps.epochs.supersede(ino, block, new_key, &orphans)) |o| _ = deps.free.free(io, o);
             }

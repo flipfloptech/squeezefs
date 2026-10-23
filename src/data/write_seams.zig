@@ -348,20 +348,34 @@ pub const ReleaseHolds = struct {
 /// (`size_epoch.SizeEpochs.current`): what a unit records at its formation
 /// and a write's landing stamps into its outcome, so the raise that follows
 /// can tell a size-setting commit that crossed it.
+///
+/// An UNWRITTEN binding (a fallocate reservation, `layout.M_UNWRITTEN`) is
+/// a HOLE to `lookup` — every arm seeds zeros, W1 and the overlay decline,
+/// the read side serves zeros — and is answered by `reserved` alone: the
+/// admission's custody probe (a reservation is custody the file holds) and
+/// the upload's destination choice (the landing writes the whole block in
+/// place and flips the flag, the same reference).
 pub const MapSeam = struct {
     ctx: *anyopaque,
     vtable: *const VTable,
 
     pub const VTable = struct {
         lookup: *const fn (ctx: *anyopaque, ino: u64, block: u32) ?Binding,
+        reserved: *const fn (ctx: *anyopaque, ino: u64, block: u32) ?Binding,
         view: *const fn (ctx: *anyopaque, ino: u64) ?FileView,
         merge: *const fn (ctx: *anyopaque, req: MergeRequest) MergeError!MergeOutcome,
         current_fencing: *const fn (ctx: *anyopaque, ino: u64) u64,
         size_epoch: *const fn (ctx: *anyopaque, ino: u64) u64,
     };
 
+    /// The WRITTEN binding of `block` (null = a hole, or a reservation).
     pub fn lookup(self: MapSeam, ino: u64, block: u32) ?Binding {
         return self.vtable.lookup(self.ctx, ino, block);
+    }
+
+    /// The UNWRITTEN binding of `block` (null = none, or a written one).
+    pub fn reserved(self: MapSeam, ino: u64, block: u32) ?Binding {
+        return self.vtable.reserved(self.ctx, ino, block);
     }
 
     pub fn view(self: MapSeam, ino: u64) ?FileView {

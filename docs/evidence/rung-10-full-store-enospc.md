@@ -68,10 +68,22 @@ two data-plane passes, the kill matrix, the two-ring [C4] row (its `df` baseline
 recovered record claims nothing), the ordered/orderly-unmount rows, the write-back timer rows, both
 two-daemon matrices, the recall, the replay proof, FSCK AND SCRUB, the jobs matrix, the kill rows (a).
 
-## The xfstests subset
+## The xfstests subset (`generic/750 475 476 015 027`, SUITE_RUNS=1)
 
-See the report row for `generic/750 475 476 015 027` (015/027 are `[not run]` here: `_scratch_mkfs_sized`
-is not supported for `fuse.squeezefs`).
+Two runs on this host (`d52344f`, then `72c7efd` with the promotion's one retry on another volume and the
+pack arm's per-VOLUME stop): **Passed all 5 tests** both times (015/027 `[not run]`: `_scratch_mkfs_sized`
+is not supported for `fuse.squeezefs`); fsck `--offline --scrub` 0 findings on both sets. The alert census
+over the scratch set's 54 daemon logs: **0 `TRIPWIRE` lines** (the must-stay-0 is gone; nothing else
+fired), 0 pack-refill warnings, 0 trim-wall warnings. generic/750's daemon: first run 2 `data store FULL`
+warnings + 1 close over 25 s of fsstress (before: 235 + 79 per-leg error lines in 19 s), second run no alert
+at all; generic/476's: one `FULL` line, 0 error lines. The first run's first `FULL` line read "520 MB free in
+sight" — the router's band held the just-filled volume until the health cadence rebuilt it, the promotion
+was placed there and refused; now a `no_space` promotion retries once on another volume with supply
+(`promotions_replaced`), and the second run's line reads "0 B free in sight". generic/475's 50 crash-loop
+daemons (dm-error: the meta volume latches FAILED by design): 15–35 `FULL` lines (one per daemon that
+filled), 24–26 `a leg failed (InputOutput)` lines — every one on a FAILED volume, a DMA or commit failure,
+the device's honest EIO — and ≈ 1,200 per-fsync `a leg failed (MetaBarrierFailed)` lines, the pre-existing
+FAILED-volume line (not this change's).
 
 **Seen, not fixed.** `data volume N: fresh supply EXHAUSTED (StorageFull latched …)` is an info line per
 re-latch (142 in 19 s under generic/750; the latch clears on every landed allocation and re-arms on the

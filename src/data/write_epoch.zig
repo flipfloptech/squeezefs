@@ -658,8 +658,12 @@ pub const Epochs = struct {
                 parked = true;
             };
             if (!parked) {
-                stats.rewrite_shadow_displaced_drift.fire("the save displaced a binding the epoch never parked");
-                log.err("rewrite epoch ino {d}: the save displaced vol {x} off {d} (unwritten {}) the epoch never parked — {d} parked key(s)", .{ e.ino, d.vol_tag, d.offset, d.unwritten, e.displaced.items.len });
+                // One line per site: the key rides the tripwire's own detail
+                // (a second `log.err` would be a second error line for the
+                // runner's "logs an error" law — the drift tests declare one).
+                var detail: [160]u8 = undefined;
+                const text = std.fmt.bufPrint(&detail, "the save displaced a binding the epoch never parked: ino {d} vol {x} off {d} (unwritten {}), {d} parked key(s)", .{ e.ino, d.vol_tag, d.offset, d.unwritten, e.displaced.items.len }) catch "the save displaced a binding the epoch never parked";
+                stats.rewrite_shadow_displaced_drift.fire(text);
                 drift[n_drift] = d;
                 n_drift += 1;
             }

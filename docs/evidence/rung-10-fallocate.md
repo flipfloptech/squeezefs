@@ -80,7 +80,31 @@ test "the rung-4 ops default to ENOSYS" pinned `!@hasDecl(MemFs, "fallocate")`)
   `fallocate03` **8/8 pass** (was 8 × EOPNOTSUPP), `mremap06` **3/3 pass** (was TBROK at its
   `fallocate()` setup); no daemon alert, fsck clean. Their ledger rows are deleted.
 - xfstests: the `auto`-group members gated on `falloc`/`fpunch`/`fzero`/`fcollapse`/`finsert` (171 tests;
-  most also require reflink/dax/… and `_notrun` for that) — RESULTS BELOW (filled by the run).
+  `grep -l '_require_xfs_io_command "f…"' tests/generic/*` ∩ `auto`). Pass 1 (through `scripts/suites/
+  fstests.sh`, fail-early): 157 ran before the stop — **29 PASSED** (generic/008 033 059 071 086 103 213
+  214 228 286 299 311 315 347 391 422 436 439 445 446 469 512 539 567 568 586 590 610 627 — every one
+  `_notrun` on `origin/dev`), 127 `_notrun` for another capability (62 + 13 reflink, 21 FIEMAP, 10
+  `_scratch_mkfs_sized`, 5 + 2 fcollapse/finsert at the kernel, 4 swapfiles, 3 shutdown, 2 dax, FITRIM,
+  quotas, defrag, geometry), **1 FAILED: generic/703** — the finding below. Pass 2 (generic/703 and the
+  14 tests after it): RESULTS BELOW.
+
+## The finding: the sync law (generic/703; pre-existing, fixed here)
+
+generic/703: `falloc 0 256M`, fio `ioengine=io_uring direct=1 bs=64K sync=1 rw=randwrite` for 10 s, a
+dm-flakey power cut, the digest must stand. It differed in EVERY 64 KiB slot — and the by-hand repro
+(a kill -9 instead of flakey) differed the same way on a file WRITTEN with zeros instead of fallocated:
+not a fallocate defect. `.stats` after the fio run: `fsync_calls 1` for 137 k O_DSYNC writes,
+`patch_ineligible_overlay 112 k`, `parked_buffers 16`, `writeback_timer_drains 18`. The mechanism:
+the kernel's FUSE DIRECT-I/O path sends no FUSE_FSYNC behind a dsync write — `fs/fuse/file.c`
+`fuse_write_flags` ORs the iocb's `O_DSYNC`/`O_SYNC` into `fuse_write_in.flags` and leaves the sync
+to the daemon (only the buffered path's `generic_write_sync` sends an FSYNC). The daemon ignored the
+flags: every O_DSYNC write was acked into RAM custody and landed by the write-back timer within
+`T_wb`; a kill inside that window lost it, while the application had been told it was durable.
+**The sync law** (`kv_fs.write`): a WRITE whose open flags carry `O_DSYNC` (or `O_SYNC`) runs the
+fsync ladder before its ack (`datasync` for DSYNC, the stamps too for SYNC; `fuse_write_sync_fsyncs`).
+By hand after the fix: 0 differing bytes on both files; the write pattern turns honest — the first
+landing takes the reservation over, every later 64 KiB write is a W1 patch in place (`patch_writes`
+30,682 of 31 k) at the fsync rate (10.4 k IOPS / 650 MiB/s, from the lying 44 k).
 
 ## Counts
 
@@ -88,9 +112,14 @@ test "the rung-4 ops default to ENOSYS" pinned `!@hasDecl(MemFs, "fallocate")`)
   `data.device_overlay`, `data.write_epoch`, `data.writeback`, `data.fsync`, `data.plane`,
   `data.read_path`, `ops.fsck`, `fuse.handler.kv_fs`, `fuse.handler.lifecycle`,
   `fuse.handler.filesystem`, `stats`; `zig fmt --check` clean.
-- loops: the new unit tests ×100 and the smoke row ×20 under the venue's load — RESULTS BELOW.
+- loops under the venue's load (two other agents' suites and a full gate beside): the new unit tests
+  (`fallocate`, `UNWRITTEN`, `punch of a tree-mapped`) **100/100**; the smoke row **20/20**.
 
 ## Seen, not fixed
+
+- **FIEMAP** (`FS_IOC_FIEMAP`): 21 of the subset `_notrun` "xfs_io fiemap failed" — the ioctl is not
+  served (a capability gap of the same family as fallocate was; the reservation would report
+  `FIEMAP_EXTENT_UNWRITTEN`).
 
 - `st_blocks` is `ceil(size / 512)` as before: a `KEEP_SIZE` reservation of an empty file reports 0
   blocks (ext4 reports the allocated ones). xfstests rows that judge `du` after `falloc -k` would see

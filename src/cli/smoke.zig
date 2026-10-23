@@ -10127,6 +10127,327 @@ test "smoke: THE VIRTUAL INODES WITHOUT AN OPEN (decision 0003 §AF) — under n
     try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
 }
 
+// ---------------------------------------------------------------------------
+// Inode flags (charter §4 "inode flags"; `fuse/handler/inode_flags.zig`).
+// ---------------------------------------------------------------------------
+
+/// A path under the mount's `t/` directory (the inode-flags row's tree).
+const FlagPaths = struct {
+    buf: [16][linux.PATH_MAX]u8 = undefined,
+    n: usize = 0,
+    mp: []const u8,
+
+    fn of(self: *FlagPaths, name: []const u8) [:0]const u8 {
+        const p = std.fmt.bufPrintSentinel(&self.buf[self.n], "{s}/t/{s}", .{ self.mp, name }, 0) catch unreachable;
+        self.n = (self.n + 1) % self.buf.len;
+        return p;
+    }
+};
+
+/// The errno of a raw syscall's return (null = success).
+fn errnoOf(rc: usize) ?linux.E {
+    const e = linux.errno(rc);
+    return if (e == .SUCCESS) null else e;
+}
+
+/// `want` or fail loud with what the op answered.
+fn expectErrno(label: []const u8, want: ?linux.E, rc: usize) !void {
+    const got = errnoOf(rc);
+    if (got != want) {
+        std.debug.print("\n--- {s}: expected {?t}, got {?t} ---\n", .{ label, want, got });
+        return error.WrongErrno;
+    }
+}
+
+/// `FS_IOC_GETFLAGS` of `path` (an O_RDONLY open; the kernel's private
+/// open under the hood is the daemon's business).
+fn getFlagsOf(path: [:0]const u8) !u32 {
+    const fd = try openRaw(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true });
+    defer _ = linux.close(fd);
+    var w: u32 = 0;
+    try expectErrno("FS_IOC_GETFLAGS", null, linux.ioctl(fd, handler.inode_flags.FS_IOC_GETFLAGS, @intFromPtr(&w)));
+    return w;
+}
+
+/// `FS_IOC_FSSETXATTR` of `path` with `xflags` (the second pair's set).
+fn fsSetXattrOf(path: [:0]const u8, xflags: u32) !void {
+    const fd = try openRaw(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true });
+    defer _ = linux.close(fd);
+    var x = handler.inode_flags.Fsxattr.zero;
+    x.fsx_xflags = xflags;
+    try expectErrno("FS_IOC_FSSETXATTR", null, linux.ioctl(fd, handler.inode_flags.FS_IOC_FSSETXATTR, @intFromPtr(&x)));
+}
+
+/// `FS_IOC_FSGETXATTR` of `path`: its `fsx_xflags`.
+fn fsGetXattrOf(path: [:0]const u8) !u32 {
+    const fd = try openRaw(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true });
+    defer _ = linux.close(fd);
+    var x = handler.inode_flags.Fsxattr.zero;
+    try expectErrno("FS_IOC_FSGETXATTR", null, linux.ioctl(fd, handler.inode_flags.FS_IOC_FSGETXATTR, @intFromPtr(&x)));
+    return x.fsx_xflags;
+}
+
+/// Every mutation of an IMMUTABLE regular file `imm` (its sibling `other`
+/// a plain file for the rename-onto and link-from probes): EPERM each, as
+/// `may_setattr`/`may_write_xattr`/`may_delete`/`vfs_link` answer on
+/// ext4. Under zero-message opens the kernel asks no OPEN, so a write-
+/// intent open SUCCEEDS and the first write is where the law answers.
+fn expectImmutableFileLaw(p: *FlagPaths, imm: []const u8, other: []const u8, fallocate_served: bool) !void {
+    const imm_p = p.of(imm);
+    {
+        const fd = try openRaw(imm_p, .{ .ACCMODE = .RDWR, .CLOEXEC = true });
+        defer _ = linux.close(fd);
+        try expectErrno("pwrite(imm, 0)", .PERM, linux.pwrite(fd, "X", 1, 0));
+        try expectErrno("pwrite(imm, EOF)", .PERM, linux.pwrite(fd, "X", 1, @intCast(fileSize(imm_p))));
+        try expectErrno("ftruncate(imm, 0)", .PERM, linux.ftruncate(fd, 0));
+        try expectErrno("fchmod(imm)", .PERM, linux.fchmod(fd, 0o600));
+        if (fallocate_served) try expectErrno("fallocate(imm)", .PERM, linux.fallocate(fd, 0, 0, 4096));
+    }
+    try expectErrno("truncate(imm, 0)", .PERM, linux.syscall2(.truncate, @intFromPtr(imm_p.ptr), 0));
+    try expectErrno("open(imm, O_WRONLY|O_TRUNC)", .PERM, linux.open(imm_p.ptr, .{ .ACCMODE = .WRONLY, .TRUNC = true, .CLOEXEC = true }, 0));
+    try expectErrno("chmod(imm)", .PERM, linux.fchmodat(linux.AT.FDCWD, imm_p.ptr, 0o600));
+    try expectErrno("chown(imm)", .PERM, linux.fchownat(linux.AT.FDCWD, imm_p.ptr, 1, 1, 0));
+    try expectErrno("utimensat(imm, NULL)", .PERM, linux.utimensat(linux.AT.FDCWD, imm_p.ptr, null, 0));
+    const epoch: [2]linux.timespec = .{ .{ .sec = 0, .nsec = 0 }, .{ .sec = 0, .nsec = 0 } };
+    try expectErrno("utimensat(imm, epoch)", .PERM, linux.utimensat(linux.AT.FDCWD, imm_p.ptr, &epoch, 0));
+    try expectErrno("setxattr(imm, user.new)", .PERM, linux.setxattr(imm_p.ptr, "user.new", "v", 1, 0));
+    try expectErrno("setxattr(imm, user.k replace)", .PERM, linux.setxattr(imm_p.ptr, "user.k", "w", 1, 0));
+    try expectErrno("removexattr(imm, user.k)", .PERM, linux.removexattr(imm_p.ptr, "user.k"));
+    try expectErrno("unlink(imm)", .PERM, linux.unlink(imm_p.ptr));
+    try expectErrno("rename(imm → gone)", .PERM, linux.rename(imm_p.ptr, p.of("gone").ptr));
+    try expectErrno("rename(other → imm)", .PERM, linux.rename(p.of(other).ptr, imm_p.ptr));
+    try expectErrno("link(imm, lnk)", .PERM, linux.link(imm_p.ptr, p.of("lnk").ptr));
+    // The reads and the attribute reads pass.
+    var v: [8]u8 = undefined;
+    try expectErrno("getxattr(imm, user.k)", null, linux.getxattr(imm_p.ptr, "user.k", &v, v.len));
+    {
+        const fd = try openRaw(imm_p, .{ .ACCMODE = .RDONLY, .CLOEXEC = true });
+        defer _ = linux.close(fd);
+        var b: [8]u8 = undefined;
+        try expectErrno("read(imm)", null, linux.read(fd, &b, b.len));
+    }
+    try testing.expectEqual(handler.inode_flags.FS_IMMUTABLE_FL, try getFlagsOf(imm_p));
+    try testing.expectEqual(handler.inode_flags.FS_XFLAG_IMMUTABLE, try fsGetXattrOf(imm_p));
+}
+
+/// Every mutation inside an IMMUTABLE directory `idir` (holding `child`):
+/// no entry made, none removed, the directory itself unmovable.
+fn expectImmutableDirLaw(p: *FlagPaths, idir: []const u8) !void {
+    var child_buf: [64]u8 = undefined;
+    const child = try std.fmt.bufPrint(&child_buf, "{s}/child", .{idir});
+    var new_buf: [64]u8 = undefined;
+    const new = try std.fmt.bufPrint(&new_buf, "{s}/new", .{idir});
+    try expectErrno("creat(idir/new)", .PERM, linux.open(p.of(new).ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .CLOEXEC = true }, 0o644));
+    try expectErrno("mkdir(idir/new)", .PERM, linux.mkdir(p.of(new).ptr, 0o755));
+    try expectErrno("mknod(idir/new)", .PERM, linux.mknodat(linux.AT.FDCWD, p.of(new).ptr, linux.S.IFIFO | 0o600, 0));
+    try expectErrno("symlink(idir/new)", .PERM, linux.symlink("other", p.of(new).ptr));
+    try expectErrno("link(other, idir/new)", .PERM, linux.link(p.of("other").ptr, p.of(new).ptr));
+    try expectErrno("unlink(idir/child)", .PERM, linux.unlink(p.of(child).ptr));
+    try expectErrno("rename(idir/child → idir/new)", .PERM, linux.rename(p.of(child).ptr, p.of(new).ptr));
+    try expectErrno("rename(other → idir/new)", .PERM, linux.rename(p.of("other").ptr, p.of(new).ptr));
+    try expectErrno("rename(idir/child → out)", .PERM, linux.rename(p.of(child).ptr, p.of("out").ptr));
+    try expectErrno("rename(idir → moved)", .PERM, linux.rename(p.of(idir).ptr, p.of("moved").ptr));
+    try expectErrno("rmdir(idir)", .PERM, linux.rmdir(p.of(idir).ptr));
+    try expectErrno("chmod(idir)", .PERM, linux.fchmodat(linux.AT.FDCWD, p.of(idir).ptr, 0o700));
+    try expectErrno("setxattr(idir)", .PERM, linux.setxattr(p.of(idir).ptr, "user.d", "v", 1, 0));
+    // Listing and stat pass; the child is still readable.
+    var st: linux.Statx = undefined;
+    try expectErrno("statx(idir/child)", null, linux.statx(linux.AT.FDCWD, p.of(child).ptr, 0, .{ .SIZE = true }, &st));
+    try testing.expectEqual(handler.inode_flags.FS_IMMUTABLE_FL, try getFlagsOf(p.of(idir)));
+}
+
+/// An APPEND-ONLY regular file `app`: appends through `O_APPEND` land,
+/// everything else answers EPERM; `utimes(NULL)` passes (the kernel's
+/// `may_setattr`: `ATTR_TOUCH` on an append-only inode is admitted).
+fn expectAppendFileLaw(p: *FlagPaths, app: []const u8, fallocate_served: bool) !void {
+    const app_p = p.of(app);
+    const size0 = fileSize(app_p);
+    {
+        const fd = try openRaw(app_p, .{ .ACCMODE = .WRONLY, .APPEND = true, .CLOEXEC = true });
+        defer _ = linux.close(fd);
+        try expectErrno("write(app, O_APPEND)", null, linux.write(fd, "tail\n", 5));
+        // Linux: a pwrite on an O_APPEND fd appends whatever its offset.
+        try expectErrno("pwrite(app, 0, O_APPEND)", null, linux.pwrite(fd, "more\n", 5, 0));
+        try expectErrno("ftruncate(app)", .PERM, linux.ftruncate(fd, 0));
+        try expectErrno("fchmod(app)", .PERM, linux.fchmod(fd, 0o600));
+        if (fallocate_served) {
+            // Preallocation alone is admitted on an append-only file.
+            try expectErrno("fallocate(app, KEEP_SIZE)", null, linux.fallocate(fd, 0x01, 0, 4096));
+            try expectErrno("fallocate(app, PUNCH_HOLE)", .PERM, linux.fallocate(fd, 0x02 | 0x01, 0, 4096));
+        }
+    }
+    try testing.expectEqual(size0 + 10, fileSize(app_p));
+    {
+        // No O_APPEND: the open passes (zero-message opens), the write is
+        // where the law answers — at EOF too.
+        const fd = try openRaw(app_p, .{ .ACCMODE = .WRONLY, .CLOEXEC = true });
+        defer _ = linux.close(fd);
+        try expectErrno("pwrite(app, 0)", .PERM, linux.pwrite(fd, "X", 1, 0));
+        try expectErrno("pwrite(app, EOF)", .PERM, linux.pwrite(fd, "X", 1, @intCast(fileSize(app_p))));
+    }
+    try expectErrno("truncate(app, 0)", .PERM, linux.syscall2(.truncate, @intFromPtr(app_p.ptr), 0));
+    try expectErrno("open(app, O_WRONLY|O_APPEND|O_TRUNC)", .PERM, linux.open(app_p.ptr, .{ .ACCMODE = .WRONLY, .APPEND = true, .TRUNC = true, .CLOEXEC = true }, 0));
+    try expectErrno("chmod(app)", .PERM, linux.fchmodat(linux.AT.FDCWD, app_p.ptr, 0o600));
+    try expectErrno("chown(app)", .PERM, linux.fchownat(linux.AT.FDCWD, app_p.ptr, 1, 1, 0));
+    const epoch: [2]linux.timespec = .{ .{ .sec = 0, .nsec = 0 }, .{ .sec = 0, .nsec = 0 } };
+    try expectErrno("utimensat(app, epoch)", .PERM, linux.utimensat(linux.AT.FDCWD, app_p.ptr, &epoch, 0));
+    try expectErrno("utimensat(app, NULL)", null, linux.utimensat(linux.AT.FDCWD, app_p.ptr, null, 0));
+    try expectErrno("setxattr(app)", .PERM, linux.setxattr(app_p.ptr, "user.new", "v", 1, 0));
+    try expectErrno("removexattr(app, user.k)", .PERM, linux.removexattr(app_p.ptr, "user.k"));
+    try expectErrno("unlink(app)", .PERM, linux.unlink(app_p.ptr));
+    try expectErrno("rename(app → gone)", .PERM, linux.rename(app_p.ptr, p.of("gone").ptr));
+    try expectErrno("rename(other → app)", .PERM, linux.rename(p.of("other").ptr, app_p.ptr));
+    try expectErrno("link(app, lnk)", .PERM, linux.link(app_p.ptr, p.of("lnk").ptr));
+    try testing.expectEqual(handler.inode_flags.FS_APPEND_FL, try getFlagsOf(app_p));
+    try testing.expectEqual(handler.inode_flags.FS_XFLAG_APPEND, try fsGetXattrOf(app_p));
+}
+
+/// An APPEND-ONLY directory `adir` (holding `child`): entries are made,
+/// none removed or renamed out (`may_delete`: `IS_APPEND(dir)`).
+fn expectAppendDirLaw(p: *FlagPaths, adir: []const u8) !void {
+    var child_buf: [64]u8 = undefined;
+    const child = try std.fmt.bufPrint(&child_buf, "{s}/child", .{adir});
+    var new_buf: [64]u8 = undefined;
+    const new = try std.fmt.bufPrint(&new_buf, "{s}/new", .{adir});
+    var new2_buf: [64]u8 = undefined;
+    const new2 = try std.fmt.bufPrint(&new2_buf, "{s}/new2", .{adir});
+    {
+        const rc = linux.open(p.of(new).ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .CLOEXEC = true }, 0o644);
+        try expectErrno("creat(adir/new)", null, rc);
+        _ = linux.close(@intCast(rc));
+    }
+    try expectErrno("mkdir(adir/newdir)", null, linux.mkdir(p.of("adir/newdir").ptr, 0o755));
+    try expectErrno("unlink(adir/child)", .PERM, linux.unlink(p.of(child).ptr));
+    try expectErrno("unlink(adir/new)", .PERM, linux.unlink(p.of(new).ptr));
+    try expectErrno("rmdir(adir/newdir)", .PERM, linux.rmdir(p.of("adir/newdir").ptr));
+    try expectErrno("rename(adir/new → adir/new2)", .PERM, linux.rename(p.of(new).ptr, p.of(new2).ptr));
+    try expectErrno("rename(adir/new → out)", .PERM, linux.rename(p.of(new).ptr, p.of("out").ptr));
+    // A rename INTO it that replaces an entry removes one: refused; onto
+    // a fresh name it is a create: admitted.
+    try expectErrno("rename(victim → adir/child)", .PERM, linux.rename(p.of("victim").ptr, p.of(child).ptr));
+    try expectErrno("rename(victim → adir/new2)", null, linux.rename(p.of("victim").ptr, p.of(new2).ptr));
+    try expectErrno("rmdir(adir)", .PERM, linux.rmdir(p.of(adir).ptr));
+    try expectErrno("chmod(adir)", .PERM, linux.fchmodat(linux.AT.FDCWD, p.of(adir).ptr, 0o700));
+    try testing.expectEqual(handler.inode_flags.FS_APPEND_FL, try getFlagsOf(p.of(adir)));
+}
+
+test "smoke: INODE FLAGS — IMMUTABLE AND APPEND-ONLY ARE LAWS, NOT HINTS (charter §4 inode flags): `chattr +i` on an inline file, a striped file and a directory, `chattr +a` on a file and a directory; `lsattr` shows them through FS_IOC_GETFLAGS and xfs_io's FS_IOC_FSGETXATTR agrees → every mutation of an immutable inode is EPERM (write at 0 and at EOF, truncate, O_TRUNC, chmod, chown, utimes, setxattr, removexattr, unlink, rename as source and as target, link, every create/unlink/rename inside the directory), reads and stats pass → an append-only file takes O_APPEND writes at EOF and refuses every other write, truncate, chmod, chown, explicit utimes, xattr changes, unlink, rename, link — `utimes(NULL)` passes; an append-only directory takes entries and gives none up → `chattr +d` (NODUMP) is EOPNOTSUPP, FS_IOC_FSSETXATTR sets and clears APPEND and GETFLAGS agrees → `chattr -i` restores the file: a write lands → the flags survive umount + fsck --offline --scrub clean + remount, the refusals still stand → cleared, everything removed, fsck clean" {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    try rig.formatSet(true);
+    try rig.createImage();
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(0);
+    var p: FlagPaths = .{ .mp = rig.mp };
+    // The tree: an inline immutable file, a striped one (past the inline
+    // bound), an immutable directory with a child, an append-only file and
+    // directory, and plain siblings for the rename/link probes; a user
+    // xattr on each flagged file BEFORE the flag (the removexattr probe).
+    {
+        const out = try rig.onMount("mkdir t && cd t && echo hello > imm && head -c 3000000 \"$1/image\" > imm_big && echo hello > app && mkdir idir adir && echo c > idir/child && echo c > adir/child && echo other > other && echo victim > victim && echo plain > plain && stat -c %s imm imm_big app");
+        defer gpa.free(out);
+        try testing.expectEqualStrings("6\n3000000\n6\n", out);
+    }
+    for ([_][]const u8{ "imm", "imm_big", "app" }) |f| try expectErrno("setxattr(user.k) before the flag", null, linux.setxattr(p.of(f).ptr, "user.k", "v", 1, 0));
+    // Is FALLOCATE served by this build (a plain file's preallocation)?
+    // Absent, the kernel answers EOPNOTSUPP itself and the law has no
+    // fallocate row to judge.
+    const fallocate_served = blk: {
+        const fd = try openRaw(p.of("plain"), .{ .ACCMODE = .RDWR, .CLOEXEC = true });
+        defer _ = linux.close(fd);
+        break :blk errnoOf(linux.fallocate(fd, 0x01, 0, 4096)) == null;
+    };
+    std.debug.print("\nsmoke[flags]: fallocate {s} on this build\n", .{if (fallocate_served) "served" else "absent (EOPNOTSUPP from the kernel)"});
+    // chattr/lsattr: the first ioctl pair, as e2fsprogs drives it.
+    {
+        const out = try rig.onMount("cd t && chattr +i imm imm_big idir && chattr +a app adir && lsattr -d imm imm_big idir app adir | awk '{print $1}' | tr -d -- '-' | tr '\\n' ' '");
+        defer gpa.free(out);
+        try testing.expectEqualStrings("i i i a a ", out);
+    }
+    try expectImmutableFileLaw(&p, "imm", "other", fallocate_served);
+    try expectImmutableFileLaw(&p, "imm_big", "other", fallocate_served);
+    try expectImmutableDirLaw(&p, "idir");
+    try expectAppendFileLaw(&p, "app", fallocate_served);
+    try expectAppendDirLaw(&p, "adir");
+    // The plain sibling is untouched by any of it.
+    try testing.expectEqual(@as(u32, 0), try getFlagsOf(p.of("plain")));
+    // A flag the record cannot hold is EOPNOTSUPP, never silently dropped
+    // (a flag change by a user without CAP_LINUX_IMMUTABLE is the KERNEL's
+    // EPERM before any request reaches the daemon: `fileattr_set_prepare`).
+    {
+        const out = try rig.onMount("cd t && (chattr +d plain 2>&1 || true) | grep -c 'Operation not supported' && lsattr -d plain | awk '{print $1}' | tr -d -- '-'");
+        defer gpa.free(out);
+        try testing.expectEqualStrings("1\n\n", out);
+    }
+    // The second pair: xfs_io's FS_IOC_FSSETXATTR sets APPEND on `other`,
+    // GETFLAGS and lsattr agree, FSSETXATTR clears it.
+    try fsSetXattrOf(p.of("other"), handler.inode_flags.FS_XFLAG_APPEND);
+    try testing.expectEqual(handler.inode_flags.FS_APPEND_FL, try getFlagsOf(p.of("other")));
+    {
+        const out = try rig.onMount("cd t && lsattr -d other | awk '{print $1}' | tr -d -- '-'");
+        defer gpa.free(out);
+        try testing.expectEqualStrings("a\n", out);
+        const fd = try openRaw(p.of("other"), .{ .ACCMODE = .WRONLY, .CLOEXEC = true });
+        defer _ = linux.close(fd);
+        try expectErrno("pwrite(other, 0) while append-only", .PERM, linux.pwrite(fd, "X", 1, 0));
+    }
+    try fsSetXattrOf(p.of("other"), 0);
+    try testing.expectEqual(@as(u32, 0), try getFlagsOf(p.of("other")));
+    // `chattr -i` restores: a write lands, the xattr goes; then +i again
+    // for the remount.
+    {
+        const out = try rig.onMount("cd t && chattr -i imm && echo appended >> imm && setfattr -x user.k imm && cat imm && chattr +i imm && lsattr -d imm | awk '{print $1}' | tr -d -- '-'");
+        defer gpa.free(out);
+        try testing.expectEqualStrings("hello\nappended\ni\n", out);
+    }
+    // The flags are the record's: umount, fsck clean, remount, the same.
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+    {
+        const r = try rig.squeezefs(&.{ "fsck", "--offline", "--scrub", rig.meta_uri });
+        defer rig.freeRun(r);
+        if (!r.term.success() or std.mem.indexOf(u8, r.stdout, "findings: 0 (clean)") == null) {
+            std.debug.print("\n--- fsck --offline --scrub with the flags set ({f}) ---\n{s}\n--- stderr ---\n{s}\n", .{ r.term, r.stdout, r.stderr });
+            return error.FsckNotClean;
+        }
+    }
+    const mark = try rig.logLen();
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(mark);
+    {
+        const out = try rig.onMount("cd t && lsattr -d imm imm_big idir app adir other plain | awk '{print $1}' | tr -d -- '-' | tr '\\n' ' '");
+        defer gpa.free(out);
+        try testing.expectEqualStrings("i i i a a   ", out);
+    }
+    try expectErrno("unlink(imm) after the remount", .PERM, linux.unlink(p.of("imm").ptr));
+    try expectErrno("unlink(idir/child) after the remount", .PERM, linux.unlink(p.of("idir/child").ptr));
+    {
+        const fd = try openRaw(p.of("app"), .{ .ACCMODE = .WRONLY, .CLOEXEC = true });
+        defer _ = linux.close(fd);
+        try expectErrno("pwrite(app, 0) after the remount", .PERM, linux.pwrite(fd, "X", 1, 0));
+    }
+    try expectImmutableFileLaw(&p, "imm_big", "other", fallocate_served);
+    // Cleared, everything goes.
+    {
+        const out = try rig.onMount("cd t && chattr -i imm imm_big idir && chattr -a app adir && cd .. && rm -rf t && ls | wc -l");
+        defer gpa.free(out);
+        try testing.expectEqualStrings("0\n", out);
+    }
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+    {
+        const r = try rig.squeezefs(&.{ "fsck", "--offline", "--scrub", rig.meta_uri });
+        defer rig.freeRun(r);
+        if (!r.term.success() or std.mem.indexOf(u8, r.stdout, "findings: 0 (clean)") == null) {
+            std.debug.print("\n--- fsck --offline --scrub after the flags were cleared ({f}) ---\n{s}\n--- stderr ---\n{s}\n", .{ r.term, r.stdout, r.stderr });
+            return error.FsckNotClean;
+        }
+    }
+}
+
 /// The frozen-daemon row's request timeout (the seam): the kernel's floor
 /// — it raises any shorter timeout to its check period.
 const frozen_timeout_s: u64 = fuse_geometry.REQUEST_TIMEOUT_CHECK_S;

@@ -157,6 +157,22 @@ fn inodeFieldBit(comptime name: []const u8) u16 {
 /// 0003 §Q).
 pub const INODE_FLAG_STRIPE: u32 = 1 << 0;
 
+/// `InodeValue.flags` bit 1: the inode is IMMUTABLE (Linux `FS_IMMUTABLE_FL`,
+/// `chattr +i`): no write, no size/mode/owner/time change, no xattr change,
+/// no unlink/rename/link of it, no entry made or removed inside it when a
+/// directory. Bit 2: APPEND-only (`FS_APPEND_FL`, `chattr +a`): writes
+/// only at EOF through `O_APPEND`, no truncate, no mode/owner/explicit-time
+/// change, no xattr change, no unlink/rename/link; a directory's entries
+/// may be added, never removed. The FUSE kernel never learns either (no
+/// `S_IMMUTABLE`/`S_APPEND` on a FUSE inode), so the daemon is the ONE
+/// enforcer (`fuse/handler/inode_flags.zig`, `kv_fs`). Both are the
+/// record's: durable, remount-stable, served through both ioctl pairs.
+pub const INODE_FLAG_IMMUTABLE: u32 = 1 << 1;
+pub const INODE_FLAG_APPEND: u32 = 1 << 2;
+/// The attribute flags a user sets (the `chattr` bits); `INODE_FLAG_STRIPE`
+/// is the format's own and never theirs to touch.
+pub const INODE_FLAGS_ATTR: u32 = INODE_FLAG_IMMUTABLE | INODE_FLAG_APPEND;
+
 pub const InodeValue = struct {
     mode: u32 = 0,
     uid: u32 = 0,
@@ -169,6 +185,20 @@ pub const InodeValue = struct {
     mtime: u64 = 0,
     ctime: u64 = 0,
     flags2: u32 = 0,
+
+    pub fn isImmutable(self: InodeValue) bool {
+        return self.flags & INODE_FLAG_IMMUTABLE != 0;
+    }
+
+    pub fn isAppendOnly(self: InodeValue) bool {
+        return self.flags & INODE_FLAG_APPEND != 0;
+    }
+
+    /// Immutable or append-only: the inode refuses the mutations both
+    /// refuse (unlink, rename, link, xattr changes, mode/owner changes).
+    pub fn isRestricted(self: InodeValue) bool {
+        return self.flags & INODE_FLAGS_ATTR != 0;
+    }
 
     pub fn encode(self: InodeValue) [INODE_VALUE_LEN]u8 {
         var w: InodeValueWire = undefined;

@@ -3442,6 +3442,129 @@ test "smoke: A RENAME THROUGH A JOINED MOUNT INTO THE MANAGER'S DIRECTORY RESOLV
     std.debug.print("smoke: joiner rename matrix: 12 renames over two mounts (11 cross-owner), the slowest {d} ms (bound {d} s); the tree equal through both, df -i used {s}; fsck clean\n", .{ max_ms, cross_owner_rename_bound_s, std.mem.trimEnd(u8, df_a, "\n") });
 }
 
+/// The wait channel of a daemon's thread by its comm (`/proc/<pid>/task/
+/// <tid>/{comm,wchan}`), or null when no thread carries the name.
+fn threadWchan(io: Io, pid: linux.pid_t, comm: []const u8, out: []u8) !?[]const u8 {
+    var dir_buf: [64]u8 = undefined;
+    var dir = Io.Dir.cwd().openDir(io, try std.fmt.bufPrint(&dir_buf, "/proc/{d}/task", .{pid}), .{ .iterate = true }) catch return null;
+    defer dir.close(io);
+    var it = dir.iterate();
+    while (try it.next(io)) |e| {
+        var p: [64]u8 = undefined;
+        var comm_buf: [64]u8 = undefined;
+        // procfs files have no size: a bounded read, never a sized one.
+        const c = dir.readFile(io, try std.fmt.bufPrint(&p, "{s}/comm", .{e.name}), &comm_buf) catch continue;
+        if (!std.mem.eql(u8, std.mem.trimEnd(u8, c, "\n"), comm)) continue;
+        const w = dir.readFile(io, try std.fmt.bufPrint(&p, "{s}/wchan", .{e.name}), out) catch return null;
+        return std.mem.trimEnd(u8, w, "\n");
+    }
+    return null;
+}
+
+test "smoke: THE SIDEBAND NEVER inode_locks A DIRECTORY ITS DAEMON OWES A REPLY ON (decision 0003 §AB.2; generic/589 under joins) — A (the manager) + B JOINED; B lists the root (its token on the root with the dentries) and creates INTO the root: the create's step ships to A, A's pass recalls the root from B — B acks at once and queues the name's INVAL_ENTRY — and HOLDS after the acks (the seam), B's create in flight with its kernel holding the root's i_rwsem the whole hold: B's sideband thread is never in `fuse_reverse_inval_entry` (red on dev: it sat there until the create completed — in generic/589 39 s, then an uninterruptible exit), B's INVAL_ENTRY was written as an INC_EPOCH (substituted ≥ 1); released: the create completes ≤ 2 s, B's next walk of the root sees the file (the epoch's revalidation), no grant of A's served slow; umount B, A → fsck 0 findings" {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    try rig.env.put("SQUEEZEFS_MW_BIND", "127.0.0.1:0");
+    var t_owner_text: [8]u8 = undefined;
+    try rig.env.put("SQUEEZEFS_TEST_MEMBERSHIP_T_OWNER_MS", try std.fmt.bufPrint(&t_owner_text, "{d}", .{smoke_t_owner_ms}));
+    var fb: [linux.PATH_MAX]u8 = undefined;
+    const fifo = try std.fmt.bufPrintSentinel(&fb, "{s}/recall-hold.fifo", .{rig.work}, 0);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.mknodat(linux.AT.FDCWD, fifo.ptr, linux.S.IFIFO | 0o600, 0)));
+    try rig.formatSet(true);
+    // A alone reads the seam: B's own passes hold nothing.
+    try rig.env.put("SQUEEZEFS_TEST_TOKEN_RECALL_HOLD", fifo);
+    try rig.spawnMount(&.{});
+    var released = false;
+    defer if (!released) releaseHold(fifo);
+    _ = try rig.awaitReady(0);
+    _ = rig.env.swapRemove("SQUEEZEFS_TEST_TOKEN_RECALL_HOLD");
+    const b = try Peer.init(rig, "b");
+    defer b.deinit();
+    try b.spawn(&.{});
+    _ = try b.awaitReady();
+    {
+        const text = try b.readLog();
+        defer gpa.free(text);
+        try testing.expect(std.mem.indexOf(u8, text, "mounted JOINED as appender 1") != null);
+    }
+    // B's token on the root, dentries included (the lookup of the name the
+    // create is about to make is served under it).
+    gpa.free(try b.onMount("ls -la . > /dev/null && test ! -e f"));
+    // B's create into the manager's root, in the background: its wall
+    // time in ms is its one line of output.
+    var touch_out_buf: [192]u8 = undefined;
+    const touch_out_path = try std.fmt.bufPrint(&touch_out_buf, "{s}/touch.out", .{rig.work});
+    const touch_out = try Io.Dir.cwd().createFile(io, touch_out_path, .{ .truncate = true });
+    defer touch_out.close(io);
+    const mark_a = try rig.logLen();
+    var touch = try std.process.spawn(io, .{ .argv = &.{ "sh", "-c", "t0=$(date +%s%N); touch f || exit 1; echo $(( ($(date +%s%N) - t0) / 1000000 ))" }, .cwd = .{ .path = b.mp }, .environ_map = &rig.env, .stdin = .ignore, .stdout = .{ .file = touch_out }, .stderr = .{ .file = touch_out } });
+    // A's pass recalled the root from B and holds: B acked (the hold runs
+    // after every ack) with the name's INVAL_ENTRY queued on its sideband,
+    // and B's create stays in flight, its kernel holding the root's lock.
+    _ = try rig.awaitLog("SQUEEZEFS_TEST_TOKEN_RECALL_HOLD — holding until a writer opens", mark_a, ready_wait_ns);
+    // The law's observable, sampled across the hold: B's sideband thread
+    // is never parked in the kernel's `fuse_reverse_inval_entry`.
+    var sampled: u32 = 0;
+    var in_kernel: u32 = 0;
+    var last_wchan_buf: [128]u8 = undefined;
+    var last_wchan: []const u8 = "";
+    {
+        const until = clock.monotonicNs() + 1500 * std.time.ns_per_ms;
+        var wbuf: [128]u8 = undefined;
+        while (clock.monotonicNs() < until) : (sleepMs(25)) {
+            const w = (try threadWchan(io, b.pid, "sqz-fuse-sb", &wbuf)) orelse continue;
+            sampled += 1;
+            @memcpy(last_wchan_buf[0..w.len], w);
+            last_wchan = last_wchan_buf[0..w.len];
+            if (std.mem.indexOf(u8, w, "fuse_reverse_inval_entry") != null) in_kernel += 1;
+        }
+    }
+    try testing.expect(sampled > 0);
+    // The create is still in flight under the hold.
+    try testing.expect(alive(touch.id.?));
+    // Released: the pass proceeds, A applies the step, B's create completes.
+    const t_release = clock.monotonicNs();
+    releaseHold(fifo);
+    released = true;
+    const touch_term = try touch.wait(io);
+    const create_ms = (clock.monotonicNs() - t_release) / std.time.ns_per_ms;
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, touch_term);
+    try testing.expect(create_ms <= cross_owner_rename_bound_s * std.time.ms_per_s);
+    const touch_wall = try Io.Dir.cwd().readFileAlloc(io, touch_out_path, gpa, .limited(64));
+    defer gpa.free(touch_wall);
+    // The file through both mounts; B's next walk revalidates under the
+    // moved epoch and finds it.
+    gpa.free(try b.onMount("test -f f && test \"$(ls | tr '\\n' ' ')\" = \"f \""));
+    gpa.free(try rig.onMount("test -f f"));
+    var substituted: u64 = 0;
+    {
+        const sb = try b.stats();
+        defer gpa.free(sb);
+        substituted = numberAfter(sb, "\"transport_notify_entry_epochs_substituted\":") orelse 0;
+        try expectIntentsAtRest(sb);
+        const sa = try rig.stats();
+        defer gpa.free(sa);
+        try expectIntentsAtRest(sa);
+        try testing.expect((numberAfter(sa, "\"dlm_token_recalls\":") orelse 0) >= 1);
+        const text = try rig.readLog();
+        defer gpa.free(text);
+        // The hold held the STEP (its serve is logged past 1 s, inside the
+        // reply bound); no grant of A's was ever slow — B's ack came at once.
+        try testing.expect(std.mem.indexOf(u8, text[mark_a..], "token_grant served in") == null);
+    }
+    try testing.expectEqual(@as(u32, 0), in_kernel);
+    try testing.expect(substituted >= 1);
+    try b.umount();
+    try b.expectCleanExit("B's unmount");
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+    _ = try fsckClean(rig, "the sideband law");
+    std.debug.print("smoke: sideband law: B's sideband sampled {d}× across the hold, {d} in fuse_reverse_inval_entry (last wchan {s}); INVAL_ENTRY → INC_EPOCH substituted {d}; the create completed {d} ms after the release ({s} ms wall); fsck clean\n", .{ sampled, in_kernel, last_wchan, substituted, create_ms, std.mem.trimEnd(u8, touch_wall, "\n") });
+}
+
 // ---------------------------------------------------------------------------
 // THE KILL ROWS (charter §5.5 "Death and recovery", "PARK-AND-RECLAIM",
 // §8 `appender clear`): two daemons over real TCP, `kill -9` of either.

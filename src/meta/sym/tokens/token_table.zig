@@ -329,12 +329,17 @@ pub const Seams = struct {
     /// released — the window a pass takes the object in flight DURING the
     /// read (the re-park + re-read arm).
     grant_hold_after_check: bool = false,
+    /// `SQUEEZEFS_TEST_TOKEN_RECALL_HOLD`: the FIFO the first pass whose
+    /// recall pushed a frame parks on after its acks (the daemon's arm of
+    /// the hold above: the requester's op in flight, its recall acked).
+    recall_hold_fifo: ?[]const u8 = null,
 
     pub fn fromEnv(env: *const std.process.Environ.Map) Seams {
         return .{
             .recall_deadline_ns = knobs.intKnob("SQUEEZEFS_TEST_TOKEN_RECALL_DEADLINE_MS", u64, env) * ns_per_ms,
             .conveyor_hold_post_recall = knobs.boolKnob("SQUEEZEFS_TEST_TOKEN_CONVEYOR_HOLD_POST_RECALL", env),
             .grant_hold_after_check = knobs.boolKnob("SQUEEZEFS_TEST_TOKEN_GRANT_HOLD_AFTER_CHECK", env),
+            .recall_hold_fifo = knobs.parseStr(env.get("SQUEEZEFS_TEST_TOKEN_RECALL_HOLD")),
         };
     }
 };
@@ -543,6 +548,8 @@ pub const Holder = struct {
     /// The test holds (`Seams`): released by `releaseHold`.
     hold: std.atomic.Value(u32) = .init(0),
     hold_wake: sync.Notify = .init,
+    /// The FIFO hold fired (it fires ONCE).
+    recall_hold_done: std.atomic.Value(bool) = .init(false),
     /// Published while a hold is standing (the test's deterministic window).
     holding: std.atomic.Value(u32) = .init(0),
     /// The write cache's RECALL (charter §6.1 "coherence", 2026-10-21):
@@ -896,7 +903,19 @@ pub const Holder = struct {
         stats.dlm_token_recall_rtt_total.record(t_end - t0);
         summary.acked = @intCast(@as(u64, summary.recalled) -| summary.expired_with_lease -| summary.timeouts_live);
         self.holdIfArmed(io, self.seams.conveyor_hold_post_recall);
+        if (self.seams.recall_hold_fifo) |path| if (!self.recall_hold_done.swap(true, .seq_cst)) holdOnFifo(io, path, summary);
         return summary;
+    }
+
+    /// The FIFO arm of the post-recall hold (`SQUEEZEFS_TEST_TOKEN_RECALL_HOLD`):
+    /// park until a writer opens `path` (the row's release).
+    fn holdOnFifo(io: Io, path: []const u8, summary: RecallSummary) void {
+        log.info("tokens: the pass recalled {d} grant(s) in {d} frame(s), {d} acked: SQUEEZEFS_TEST_TOKEN_RECALL_HOLD — holding until a writer opens {s}", .{ summary.recalled, summary.frames, summary.acked, path });
+        const f = Io.Dir.cwd().openFile(io, path, .{}) catch |e| {
+            log.warn("tokens: the SQUEEZEFS_TEST_TOKEN_RECALL_HOLD hold could not open {s} ({t}); not holding", .{ path, e });
+            return;
+        };
+        f.close(io);
     }
 
     /// The window's terminal outcome: the gate's refcount drops.

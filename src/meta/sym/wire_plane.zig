@@ -534,6 +534,9 @@ pub const WirePlane = struct {
         // peers' dialled links.
         self.holder = tokens.table.Holder.init(gpa, io, identity.writer_id, self.oracle.oracle(), TOKEN_OBJECTS_CAP, listener.deriveMaxConnections(raw_cpus, listener.raiseNofile())) catch return error.OutOfMemory;
         errdefer self.holder.deinit();
+        // The recall-hold FIFO is the daemon's seam (the contracts' seams
+        // in `Seams` stay the in-process rigs').
+        self.holder.seams.recall_hold_fifo = knobs.parseStr(env.get("SQUEEZEFS_TEST_TOKEN_RECALL_HOLD"));
         // The pushed frame names the holder by the word the readers key
         // their planes on: the holder's appender id on volume 0.
         self.pusher = .{ .volume = 0, .identity = if (be0.joined) |js| js.appenderId() else 0, .peers = self.peers.peers() };

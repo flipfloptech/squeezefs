@@ -266,7 +266,7 @@ with the ONE exception the knob doc already states, op_profile):
 
 ```
 { "build": {"train","commit","profile"},                                  # main.zig:15-24 Version
-  "mount": {"uid","gid","mountpoint","sqmeta_uri","sqdata_uri","read_only","writeback","direct_device_true"},
+  "mount": {"uid","gid","pid","mountpoint","mount_id","sqmeta_uri","sqdata_uri","read_only","writeback","direct_device_true"},  # pid + mount_id: this port's (what `umount` signals, and the daemon's own mount told from a bind)
   "stats_key_census": bool,
   "transport": {…Session.writeStatsJson…},                               # session.zig:1302
   "data": {…DataPlane.writeFamiliesJson…, "census": {…} iff armed},      # plane.zig:1806

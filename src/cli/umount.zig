@@ -11,7 +11,11 @@
 //!
 //! The daemon is found through the mount's own `.stats` inode (the
 //! `mount` family's `pid`): the one channel that names exactly the process
-//! serving THIS mountpoint. A mount that serves no document under a LIVE
+//! serving THIS mountpoint — and the orderly stop is sent only for the
+//! mount the daemon MADE (`isOwnMount`: the family's `mountpoint` and
+//! `mount_id`); a bind or a moved mountpoint of the same superblock is
+//! the kernel's plain detach, the daemon unsignalled (it serves the mounts
+//! of its superblock that remain and exits when the last goes). A mount that serves no document under a LIVE
 //! daemon — a FAILED volume whose ops answer EIO, a connection the kernel
 //! ended under it (ENOTCONN; fstests generic/475 under dm-error) — is
 //! found by its PROCESS instead (`daemonByProcess`: the one `squeezefs
@@ -119,6 +123,31 @@ pub fn daemonPidOf(stats_text: []const u8) ?linux.pid_t {
 /// the key is absent: an older daemon).
 pub fn refusalsOf(stats_text: []const u8) u64 {
     return json_scan.number(stats_text, "transport_umount_busy_refusals") orelse 0;
+}
+
+/// The id of the mount the daemon made, out of `.stats` (`mount.mount_id`);
+/// null when absent or 0 (an older daemon, or one whose mount table was
+/// unreadable at `mount(2)`).
+pub fn mountIdOf(stats_text: []const u8) ?u64 {
+    const id = json_scan.number(stats_text, "mount_id") orelse return null;
+    return if (id == 0) null else id;
+}
+
+/// Is the mount at `path` — its table entry `entry_id` — the daemon's OWN
+/// mount, the one its `mount(2)` made? Every other mount of its superblock
+/// (a bind of it or of a path inside it, a bind stacked over its own
+/// path, a mountpoint `mount --move`d elsewhere) reads the same `.stats`
+/// and names the same pid, but is the KERNEL's to detach: the daemon
+/// serves whatever mounts of its superblock remain and exits when the
+/// last goes (the kernel ends the connection), and a daemon signalled for
+/// a bind unmounted ITS path instead and left the bind dead. Own ⇔ the
+/// daemon's mountpoint is this path AND its published mount id is this
+/// entry's (a daemon publishing none is judged by the path alone).
+pub fn isOwnMount(stats_text: []const u8, entry_id: u64, path: []const u8) bool {
+    const mp = json_scan.string(stats_text, "mountpoint") orelse return true;
+    if (!std.mem.eql(u8, mp, path)) return false;
+    const id = mountIdOf(stats_text) orelse return true;
+    return id == entry_id;
 }
 
 /// Why the verb fell back to the external detach (each reported by name).
@@ -500,6 +529,22 @@ fn detachExternally(p: cli.Process, path: [:0]const u8) u8 {
     return cli.exit_failed;
 }
 
+/// The kernel's detach of a mount that is not the daemon's own (a bind, a
+/// move): root's `umount2` — plain with the bounded EBUSY retry, or
+/// `MNT_DETACH` under `--lazy` — else fusermount3; the daemon is not
+/// signalled.
+fn detachOther(p: cli.Process, path: [:0]const u8, lazy: bool) u8 {
+    if (linux.geteuid() == 0) {
+        const e = if (lazy) linux.errno(linux.umount2(path.ptr, linux.MNT.DETACH)) else umountAsRoot(path);
+        if (e == .SUCCESS) return cli.exit_ok;
+        p.stderr.print("squeezefs umount: umount2({s}) failed: {t} ({s})\n", .{ path, e, @errorName(errors.fromErrno(e)) }) catch {};
+        return cli.exit_failed;
+    }
+    if (if (lazy) fusermount.unmountLazy(p.io, path) else fusermount.unmount(p.io, path)) return cli.exit_ok;
+    p.stderr.print("squeezefs umount: fusermount3 -u {s} failed\n", .{path}) catch {};
+    return cli.exit_failed;
+}
+
 /// The refusal line: the typed class (`error.Busy`, EBUSY through the ONE
 /// table) and the holders.
 fn refuseBusy(p: cli.Process, path: []const u8, c: holders.Census) u8 {
@@ -525,6 +570,13 @@ pub fn run(p: cli.Process, u: args.Umount) u8 {
     }
     const located = locateDaemon(p.gpa, p.io, path);
     if (located == .process) p.stderr.print("squeezefs umount: {s}: its .stats inode is unreadable (its volume is FAILED, or the kernel ended its connection) but daemon {d} still serves it — signalling it and waiting for its exit\n", .{ path, located.process }) catch {};
+    // Another mountpoint of the daemon's superblock (`isOwnMount`): the
+    // kernel's detach, nothing signalled; the daemon serves what remains.
+    if (located == .stats) if (watched.target) |t| if (!isOwnMount(located.stats.text, t.mount_id, path)) {
+        defer p.gpa.free(located.stats.text);
+        p.stderr.print("squeezefs umount: {s} is a bind or a moved mountpoint of daemon {d}'s mount at {s}, not the mount it made — detached {s} without signalling the daemon, which serves the mounts of its superblock that remain and exits when the last goes\n", .{ path, located.stats.pid, json_scan.string(located.stats.text, "mountpoint") orelse "?", if (u.lazy) "lazily" else "plainly" }) catch {};
+        return detachOther(p, path, u.lazy);
+    };
     switch (signalLocated(p.gpa, p.io, path, u.lazy, p.build.commit, &watched, located)) {
         .exited => |pid| {
             if (!isFuseMount(p.io, p.gpa, path)) return cli.exit_ok;
@@ -578,6 +630,21 @@ test "the daemon pid is the mount family's `pid`; 0 or absent names no daemon; t
     try testing.expectEqualStrings("abc123", buildCommitOf("{\"build\":{\"train\":\"0.1.0\",\"commit\":\"abc123\",\"profile\":\"gate\"},\"mount\":{\"pid\":1}}").?);
     try testing.expect(buildCommitOf("{\"mount\":{\"pid\":1}}") == null);
     try testing.expectEqual(@as(u64, 3), refusalsOf("{\"transport\":{\"transport_umount_busy_retries\":9,\"transport_umount_busy_refusals\":3}}"));
+}
+
+test "the daemon's OWN mount is the one at its mountpoint carrying its published mount id; a bind elsewhere, a bind stacked over its path and a moved mountpoint are not; a daemon publishing no id (0, absent) is judged by the path alone" {
+    const doc = "{\"build\":{},\"mount\":{\"uid\":0,\"gid\":0,\"pid\":4242,\"mountpoint\":\"/mnt/a\",\"mount_id\":90,\"sqmeta_uri\":\"sqmeta:///dev/m\"}}";
+    try testing.expectEqual(@as(?u64, 90), mountIdOf(doc));
+    try testing.expect(isOwnMount(doc, 90, "/mnt/a"));
+    try testing.expect(!isOwnMount(doc, 93, "/mnt/b")); // a bind (or a move) elsewhere
+    try testing.expect(!isOwnMount(doc, 93, "/mnt/a")); // a bind stacked over the daemon's path
+    try testing.expect(!isOwnMount(doc, 90, "/mnt/b")); // the daemon's mount moved: the kernel's detach ends the connection
+    const no_id = "{\"mount\":{\"pid\":4242,\"mountpoint\":\"/mnt/a\",\"mount_id\":0}}";
+    try testing.expectEqual(@as(?u64, null), mountIdOf(no_id));
+    try testing.expect(isOwnMount(no_id, 93, "/mnt/a"));
+    try testing.expect(!isOwnMount(no_id, 93, "/mnt/b"));
+    try testing.expect(isOwnMount("{\"mount\":{\"pid\":4242,\"mountpoint\":\"/mnt/a\"}}", 1, "/mnt/a"));
+    try testing.expect(isOwnMount("{\"mount\":{\"pid\":4242}}", 1, "/mnt/a"));
 }
 
 test "the exit wait covers the workers' residency backstop plus one tick; the .stats poll rides the drain's lease budget" {

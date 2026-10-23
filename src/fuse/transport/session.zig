@@ -878,6 +878,10 @@ pub const Session = struct {
     /// was unreadable): the proof `unmount` demands before an `umount2` by
     /// path.
     mount_id: ?u64 = null,
+    /// The superblock's anonymous device at `mount(2)` (`major:minor`;
+    /// the minor is the fusectl connection id): what every other mount of
+    /// this connection — a bind, a moved mountpoint — carries in the table.
+    mount_dev: ?struct { major: u32, minor: u32 } = null,
     unmounter: ?Unmounter = null,
     on_shutdown: ?Hook = null,
     init_reply: codec.InitReply = undefined,
@@ -1269,7 +1273,10 @@ pub const Session = struct {
         // The mount's identity: every later `umount2` by path first proves
         // the mount at the path is still THIS one (a kernel-ended mount
         // may have a successor at the same path by the time we tear down).
-        if (self.mountEntry()) |e| self.mount_id = e.id;
+        if (self.mountEntry()) |e| {
+            self.mount_id = e.id;
+            self.mount_dev = .{ .major = e.dev_major, .minor = e.dev_minor };
+        }
 
         // 1. The classical INIT read on the sideband ring. The buffer covers
         //    any max_write the plan can reach (`limit × page`) plus a header
@@ -1765,10 +1772,12 @@ pub const Session = struct {
     /// queue, and a retained ent the kernel reclaims pins the exit) and
     /// synthesize an error for every owed slot (the blocked callers return,
     /// so the mount is not busy) → `umount2` → the disconnect ends the
-    /// workers' residency and the sideband → join → the filesystem's
-    /// `destroy` → close the fd. The one orderly path the drain cannot
-    /// cover is an EXTERNAL `umount(8)`: a type-`fuse` mount gets no
-    /// DESTROY, the kernel aborts the connection first.
+    /// workers' residency and the sideband (or, when another mount of the
+    /// superblock keeps the connection alive, `endIfHeldElsewhere` ends it
+    /// loud) → join → the filesystem's `destroy` → close the fd. The one
+    /// orderly path the drain cannot cover is an EXTERNAL `umount(8)`: a
+    /// type-`fuse` mount gets no DESTROY, the kernel aborts the connection
+    /// first.
     pub fn close(self: *Session) void {
         if (self.closed) return;
         self.closed = true;
@@ -1781,6 +1790,7 @@ pub const Session = struct {
             self.failStop();
         }
         self.unmount();
+        self.endIfHeldElsewhere();
         for (self.groups) |g| g.join();
         if (self.have_sideband) self.sideband.join();
         self.destroyOnce();
@@ -1960,7 +1970,7 @@ pub const Session = struct {
         return true;
     }
 
-    const MountIdentity = struct { id: u64, dev_minor: u32 };
+    const MountIdentity = struct { id: u64, dev_major: u32, dev_minor: u32 };
 
     /// The mount table's entry at our mountpoint (the last line wins), by
     /// value: the table's buffer does not outlive the call.
@@ -1969,7 +1979,46 @@ pub const Session = struct {
         defer self.gpa.free(buf);
         const text = mountinfo.read(self.io, buf);
         const e = mountinfo.entryAt(text, self.mountpoint) orelse return null;
-        return .{ .id = e.id, .dev_minor = e.dev_minor };
+        return .{ .id = e.id, .dev_major = e.dev_major, .dev_minor = e.dev_minor };
+    }
+
+    /// How many other mountpoints of this session's superblock the verdict
+    /// names (the rest are counted).
+    const HELD_ELSEWHERE_NAMED = 4;
+
+    /// After the daemon's own unmount: the kernel ends the connection inside
+    /// the `umount2` that drops the superblock's last reference, and the
+    /// workers' residency ends on that disconnect — unless another mount of
+    /// the superblock still stands (a bind the operator left, a moved
+    /// mountpoint, a propagated copy a holder keeps). The session is
+    /// drained and cannot serve them; waiting out the residency backstop
+    /// answered their requests ENOTCONN for 30 s and then exited the same
+    /// way. Name them and end the connection NOW (decision 0003 §S's
+    /// race-case law: a prompt, loud end beats 30 s of ENOTCONN): fusectl's
+    /// abort when mounted, else the device fd's close at the end of
+    /// `close` (the workers exit at once on `detached`). A bind is the
+    /// kernel's to detach, and `squeezefs umount` of one detaches it
+    /// plainly without signalling the daemon.
+    fn endIfHeldElsewhere(self: *Session) void {
+        const dev = self.mount_dev orelse return;
+        const buf = self.gpa.alloc(u8, mountinfo.READ_BYTES) catch return;
+        defer self.gpa.free(buf);
+        const text = mountinfo.read(self.io, buf);
+        if (!mountinfo.hasDev(text, dev.major, dev.minor)) return;
+        var names: [512]u8 = undefined;
+        var w: Io.Writer = .fixed(&names);
+        var n: usize = 0;
+        var lines = std.mem.splitScalar(u8, text, '\n');
+        while (lines.next()) |line| {
+            const e = mountinfo.parseLine(line) orelse continue;
+            if (e.dev_major != dev.major or e.dev_minor != dev.minor) continue;
+            n += 1;
+            if (n <= HELD_ELSEWHERE_NAMED) w.print("{s}{s}", .{ if (n == 1) "" else ", ", e.mountpoint }) catch {};
+        }
+        log.warn("transport: {d} other mount(s) of this superblock stand after the unmount of {s} ({s}{s}) — the session is drained and cannot serve them: ending the connection now instead of answering them ENOTCONN for the {d} s residency backstop; they answer ENOTCONN until unmounted (a bind is the kernel's to detach: `umount <path>`)", .{ n, self.mountpoint, w.buffered(), if (n > HELD_ELSEWHERE_NAMED) ", …" else "", worker.RESIDENCY_NS / std.time.ns_per_s });
+        _ = self.writeAbort(dev.minor);
+        // release pairs with the residency loop's acquire.
+        self.shared.detached.store(true, .release);
     }
 
     /// Is the mount at our path still the one we made? An unreadable table
@@ -2000,15 +2049,21 @@ pub const Session = struct {
     /// the raw syscalls, like `enable_uring`); false when fusectl is not
     /// mounted or refuses (`unmountDetached` then carries the abort).
     fn abortConnection(self: *Session, minor: u32) bool {
+        if (!self.writeAbort(minor)) return false;
+        log.warn("transport: ended its own FUSE connection {d} (fusectl abort) before the unmount of {s} — nothing parked on it can hold the detach (decision 0003 §AN)", .{ minor, self.mountpoint });
+        return true;
+    }
+
+    /// The raw control write; false when fusectl is not mounted or refuses.
+    fn writeAbort(self: *Session, minor: u32) bool {
+        _ = self;
         var path: [96]u8 = undefined;
         const p = std.fmt.bufPrintSentinel(&path, "{s}/{d}/abort", .{ fusectl_connections, minor }, 0) catch return false;
         const fd_rc = linux.open(p.ptr, .{ .ACCMODE = .WRONLY, .CLOEXEC = true }, 0);
         if (linux.errno(fd_rc) != .SUCCESS) return false;
         const fd: linux.fd_t = @intCast(fd_rc);
         defer _ = linux.close(fd);
-        if (linux.errno(linux.write(fd, "1", 1)) != .SUCCESS) return false;
-        log.warn("transport: ended its own FUSE connection {d} (fusectl abort) before the unmount of {s} — nothing parked on it can hold the detach (decision 0003 §AN)", .{ minor, self.mountpoint });
-        return true;
+        return linux.errno(linux.write(fd, "1", 1)) == .SUCCESS;
     }
 
     fn closeFd(self: *Session) void {

@@ -739,6 +739,9 @@ fn mountMain(ctx: *Ctx) u8 {
     // teardown joins its handlers (the serve path closes it explicitly).
     defer moves.close();
     vs.renderer.sources.session = session;
+    // The kernel's id of the mount just made: `squeezefs umount` tells
+    // this daemon's own mount from a bind or a move of its superblock by it.
+    vs.renderer.sources.mount.mount_id = session.mount_id orelse 0;
     // A recalled token's kernel view rides the session's notify seam; so
     // does a served record verb's (the holder's own kernel view).
     if (wire) |wp| {

@@ -139,6 +139,12 @@ pub const Mount = struct {
     /// own orderly teardown runs the unmount (charter §4 "Teardown").
     pid: u32 = 0,
     mountpoint: []const u8 = "",
+    /// The kernel's id of the mount the daemon made (0 until the session
+    /// is up, or when the mount table was unreadable): how `squeezefs
+    /// umount` tells the daemon's own mount from a bind or a moved
+    /// mountpoint of the same superblock, which it detaches without
+    /// signalling.
+    mount_id: u64 = 0,
     sqmeta_uri: []const u8 = "",
     sqdata_uri: []const u8 = "",
     read_only: bool = false,
@@ -457,7 +463,7 @@ fn writeMount(src: *Sources, w: *Writer) Error!void {
     const m = src.mount;
     try w.print("{{\"uid\":{d},\"gid\":{d},\"pid\":{d},\"mountpoint\":", .{ m.uid, m.gid, m.pid });
     try writeJsonString(w, m.mountpoint);
-    try w.writeAll(",\"sqmeta_uri\":");
+    try w.print(",\"mount_id\":{d},\"sqmeta_uri\":", .{m.mount_id});
     try writeJsonString(w, m.sqmeta_uri);
     try w.writeAll(",\"sqdata_uri\":");
     try writeJsonString(w, m.sqdata_uri);
@@ -1081,7 +1087,7 @@ test "duplicateKeys names a repeated key by its path, nested and at the top, and
 }
 
 test "render: the document parses, names every family in the schema's order with daemon last, ends with ONE newline, and the size is exactly the served bytes" {
-    var r = Renderer.init(testing.allocator, .{ .build = .{ .train = "0.1.0", .commit = "abc", .profile = "gate" }, .mount = .{ .uid = 7, .pid = 4242, .mountpoint = "/mnt/x", .wire_endpoint = "10.0.0.7:39123" } });
+    var r = Renderer.init(testing.allocator, .{ .build = .{ .train = "0.1.0", .commit = "abc", .profile = "gate" }, .mount = .{ .uid = 7, .pid = 4242, .mountpoint = "/mnt/x", .mount_id = 77, .wire_endpoint = "10.0.0.7:39123" } });
     defer r.deinit();
     const p = try r.render();
     defer p.deinit(testing.allocator);
@@ -1099,6 +1105,7 @@ test "render: the document parses, names every family in the schema's order with
     // The daemon's pid and the wire endpoint ride the mount family: what
     // `umount` signals and what a joiner dials.
     try testing.expect(std.mem.indexOf(u8, text, "\"pid\":4242,\"mountpoint\":") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "\"mountpoint\":\"/mnt/x\",\"mount_id\":77,") != null);
     try testing.expect(std.mem.indexOf(u8, text, "\"wire_endpoint\":\"10.0.0.7:39123\"") != null);
     try testing.expect(std.mem.indexOf(u8, text, "\"invariant_tripwires\":") != null);
     try testing.expect(std.mem.indexOf(u8, text, "\"lock_ticked_reregisters\":") != null);

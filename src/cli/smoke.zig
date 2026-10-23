@@ -52,6 +52,8 @@ const counters = @import("../core/counters.zig");
 const derive = @import("../core/derive.zig");
 const knobs = @import("../core/knobs.zig");
 const json_scan = @import("../core/json_scan.zig");
+const mountinfo = @import("../core/mountinfo.zig");
+const tick_law = @import("../sync/tick.zig");
 const handler = @import("../fuse/handler.zig");
 const transport = @import("../fuse/transport.zig");
 const fuse_geometry = @import("../fuse/geometry.zig");
@@ -2970,6 +2972,152 @@ test "smoke: TWO MOUNTS OF ONE SET ON ONE HOST — each member holds its OWN wri
     try rig.umount();
     try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
     std.debug.print("smoke: member scope: B promoted its {d}, A its {d}; every file sha-equal after the remount; fsck clean\n", .{ scope_b_files, scope_a_files });
+}
+
+/// The bound on the daemon's exit once the kernel ends its connection, and
+/// on an orderly stop that finds the connection held by a bind: two lock
+/// plane ticks — the teardown's quantum twice (a drain, the dismount pass
+/// and the final checkpoint are sub-second on a quiet mount), 7× under
+/// the 30 s residency backstop the bind case used to wait out.
+const bind_exit_bound_ns: u64 = 2 * tick_law.tick_ns;
+
+/// `mount --bind src dst` (the kernel's, the daemon not involved).
+fn bindMount(src: [:0]const u8, dst: [:0]const u8) !void {
+    _ = linux.mkdir(dst.ptr, 0o755);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.mount(src.ptr, dst.ptr, null, linux.MS.BIND, 0)));
+}
+
+/// Is anything mounted at exactly `path` (the mount table, never a stat)?
+fn mountedAt(gpa: std.mem.Allocator, io: Io, path: []const u8) !bool {
+    const buf = try gpa.alloc(u8, mountinfo.READ_BYTES);
+    defer gpa.free(buf);
+    return mountinfo.entryAt(mountinfo.read(io, buf), path) != null;
+}
+
+/// Poll the rig's daemon until it exits (its term) or the bound lapses
+/// (the wall is printed either way).
+fn awaitExitWithin(rig: *Rig, bound_ns: u64, what: []const u8) !std.process.Child.Term {
+    const t0 = clock.monotonicNs();
+    while (alive(rig.child_pid) and clock.monotonicNs() - t0 < bound_ns) sleepMs(10);
+    const wall_ms = (clock.monotonicNs() - t0) / std.time.ns_per_ms;
+    std.debug.print("smoke[bind]: {s}: the daemon {s} after {d} ms (bound {d} ms)\n", .{ what, if (alive(rig.child_pid)) "is STILL ALIVE" else "exited", wall_ms, bound_ns / std.time.ns_per_ms });
+    try testing.expect(!alive(rig.child_pid));
+    return rig.waitChild();
+}
+
+test "smoke: A BIND OF THE MOUNT IS THE KERNEL'S, NEVER THE DAEMON'S TO STOP (xfstests generic/409–411, 589 under the symmetric default) — mount, `mount --bind` it elsewhere, a file written through the mount reads through the bind; (a) the kernel's `umount` of the original: the daemon is not signalled, the bind KEEPS SERVING (`.stats`, the file sha-equal), `umount` of the bind drops the superblock's last reference and the daemon exits within two ticks, exit 0; (b) `squeezefs umount <bind>`: the kernel's plain detach naming daemon and mount, nothing signalled, the mount serves on; (c) `squeezefs umount <mount>` with the bind alive: the orderly stop ends its connection AT ONCE naming the bind (red: 30 s of `residency backstop lapsed` ×N groups), the bind answers ENOTCONN and detaches plainly; fsck --offline --scrub 0 findings after each" {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    try rig.env.put("SQUEEZEFS_MW_BIND", "127.0.0.1:0");
+    try rig.formatSet(true);
+    try rig.createImage();
+    const bind = try std.fmt.allocPrintSentinel(gpa, "{s}-bind", .{rig.mp}, 0);
+    defer gpa.free(bind);
+    defer {
+        _ = linux.umount2(bind.ptr, linux.MNT.DETACH);
+        _ = linux.rmdir(bind.ptr);
+    }
+    var cmd: [512]u8 = undefined;
+    // ---- (a) the kernel's umount of the original; the bind serves to the end ----
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(0);
+    try bindMount(rig.mp, bind);
+    {
+        const out = try rig.onMount("dd if=\"$1/image\" of=f bs=64k count=4 status=none && sha256sum f | cut -d' ' -f1 > \"$1/f.sha\" && echo ok");
+        defer gpa.free(out);
+        try testing.expectEqualStrings("ok\n", out);
+    }
+    // The file and the control document through the bind (cwd: the work dir).
+    const verify_bind_cmd = try std.fmt.allocPrint(gpa, "test \"$(sha256sum {s}/f | cut -d' ' -f1)\" = \"$(cat f.sha)\" && grep -q '\"pid\":' {s}/.stats && echo ok", .{ bind, bind });
+    defer gpa.free(verify_bind_cmd);
+    {
+        const out = try rig.shOk(rig.work, verify_bind_cmd);
+        defer gpa.free(out);
+        try testing.expectEqualStrings("ok\n", out);
+    }
+    const mark_a = try rig.logLen();
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.umount2(rig.mp.ptr, 0)));
+    try testing.expect(!try mountedAt(gpa, io, rig.mp));
+    try testing.expect(try mountedAt(gpa, io, bind));
+    // Not signalled, not torn down: the bind is served by the live daemon.
+    sleepMs(200);
+    try rig.expectAlive("the bind's service after the original's umount");
+    {
+        const out = try rig.shOk(rig.work, verify_bind_cmd);
+        defer gpa.free(out);
+        try testing.expectEqualStrings("ok\n", out);
+        const text = try rig.readLog();
+        defer gpa.free(text);
+        try testing.expect(std.mem.indexOf(u8, text[mark_a..], "stop requested") == null);
+        try testing.expect(std.mem.indexOf(u8, text[mark_a..], "tearing down") == null);
+    }
+    // The last reference: the kernel ends the connection, the daemon tears down.
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.umount2(bind.ptr, 0)));
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try awaitExitWithin(rig, bind_exit_bound_ns, "(a) the bind's umount dropped the last reference"));
+    {
+        const text = try rig.readLog();
+        defer gpa.free(text);
+        try testing.expect(std.mem.indexOf(u8, text[mark_a..], "the FUSE session ended (unmounted): tearing down") != null);
+        try testing.expect(std.mem.indexOf(u8, text[mark_a..], "residency backstop lapsed") == null);
+    }
+    _ = try fsckClean(rig, "(a) the kernel's umount of the original, then of the bind");
+    // ---- (b) the verb on the bind: the kernel's detach, the daemon unsignalled ----
+    const mark_b = try rig.logLen();
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(mark_b);
+    try bindMount(rig.mp, bind);
+    {
+        const r = try rig.squeezefs(&.{ "umount", bind });
+        defer rig.freeRun(r);
+        if (!r.term.success()) std.debug.print("\numount of the bind ({f}): {s}\n", .{ r.term, r.stderr });
+        try testing.expect(r.term.success());
+        try testing.expect(std.mem.indexOf(u8, r.stderr, "is a bind or a moved mountpoint of daemon") != null);
+        try testing.expect(std.mem.indexOf(u8, r.stderr, "without signalling the daemon") != null);
+    }
+    try testing.expect(!try mountedAt(gpa, io, bind));
+    try testing.expect(try mountedAt(gpa, io, rig.mp));
+    try rig.expectAlive("the mount's service after the bind's detach");
+    {
+        const out = try rig.onMount("test \"$(sha256sum f | cut -d' ' -f1)\" = \"$(cat \"$1/f.sha\")\" && echo ok");
+        defer gpa.free(out);
+        try testing.expectEqualStrings("ok\n", out);
+        const text = try rig.readLog();
+        defer gpa.free(text);
+        try testing.expect(std.mem.indexOf(u8, text[mark_b..], "stop requested") == null);
+    }
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try awaitExitWithin(rig, bind_exit_bound_ns, "(b) the orderly stop after the bind's detach"));
+    _ = try fsckClean(rig, "(b) the verb's plain detach of the bind");
+    // ---- (c) the orderly stop with the bind alive: prompt and loud, never the backstop ----
+    const mark_c = try rig.logLen();
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(mark_c);
+    try bindMount(rig.mp, bind);
+    const t0 = clock.monotonicNs();
+    try rig.umount();
+    const verb_ms = (clock.monotonicNs() - t0) / std.time.ns_per_ms;
+    std.debug.print("smoke[bind]: (c) `squeezefs umount` of the mount with the bind alive returned 0 after {d} ms\n", .{verb_ms});
+    try testing.expect(verb_ms <= bind_exit_bound_ns / std.time.ns_per_ms);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try awaitExitWithin(rig, bind_exit_bound_ns, "(c) the orderly stop with the bind alive"));
+    {
+        const text = try rig.readLog();
+        defer gpa.free(text);
+        try testing.expect(std.mem.indexOf(u8, text[mark_c..], "other mount(s) of this superblock stand after the unmount of") != null);
+        try testing.expect(std.mem.indexOf(u8, text[mark_c..], bind) != null);
+        try testing.expect(std.mem.indexOf(u8, text[mark_c..], "residency backstop lapsed") == null);
+    }
+    // The bind is a dead mount now (the connection ended): ENOTCONN, then the plain detach.
+    {
+        const r = try rig.sh(rig.work, try std.fmt.bufPrint(&cmd, "cat {s}/.stats", .{bind}));
+        defer rig.freeRun(r);
+        try testing.expect(!r.term.success());
+        try testing.expect(std.mem.indexOf(u8, r.stderr, "not connected") != null);
+    }
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.umount2(bind.ptr, 0)));
+    _ = try fsckClean(rig, "(c) the orderly stop with the bind alive");
 }
 
 /// The bound on one cross-owner rename with nothing moving (the law: a

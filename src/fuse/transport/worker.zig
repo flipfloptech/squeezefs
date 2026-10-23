@@ -4021,8 +4021,11 @@ pub const Group = struct {
 
     /// Stay resident up to 30 s answering fresh deliveries ENOTCONN, in
     /// bounded parks on this ring; exit on a disconnect, or at once when
-    /// the session detached the mount lazily (acquire pairs with
-    /// `unmountDetached`'s release).
+    /// the session detached the mount lazily or found the connection held
+    /// by another mount of the superblock after its own unmount (acquire
+    /// pairs with `unmountDetached`'s / `endIfHeldElsewhere`'s release).
+    /// The backstop lapses only when the kernel's end cannot be foreseen
+    /// — a holder inside a propagated copy the detach left lazily.
     fn residency(self: *Group) void {
         const deadline = clock.monotonicNs() + RESIDENCY_NS;
         while (!self.disconnected and !self.ring.isDead() and !self.shared.detached.load(.acquire)) {

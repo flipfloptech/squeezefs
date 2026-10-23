@@ -11170,6 +11170,197 @@ test "smoke: A FULL DATA STORE ANSWERS ENOSPC — NEVER EIO — AT write(2) AND 
     try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
 }
 
+/// The fallocate row's data store: two volumes of 48 blocks of 4 MiB (the
+/// default block) — small enough to fill to ENOSPC in seconds.
+const fallocate_row_data_bytes: u64 = 48 * (4 << 20);
+
+test "smoke: FALLOCATE — EVERY MODE'S LAW (charter §6.6; decision 0003 §BH) through xfs_io on a two-volume set of 4 MiB blocks: `falloc -k` reserves blocks `df` counts at once with the size standing and no device byte written, `falloc` raises the size over them, a read of the reservation is zeros; a write inside it lands IN PLACE (reserved_landings, `df` unchanged, the bytes exact) and the rest of the block still reads zeros; `fpunch` frees whole blocks (`df` returns them) and zeroes the edges inside written blocks (the neighbours intact); `fzero` zeroes a written block without returning its space (fallocate_blocks_zeroed) and reads zeros; `fcollapse`/`finsert`/`funshare` never reach the daemon — linux's FUSE client answers them EOPNOTSUPP itself (`fuse_file_fallocate`'s mode mask), the file standing whole; a full store refuses a hole's write ENOSPC and admits the reservation's → kill -9 → `fsck --offline --scrub` clean (the reservations are references, never scanned) → remount → every law re-read, the reservation's space still charged → unmount → fsck clean; no error line, no tripwire (red on dev: every xfs_io command 'Operation not supported')" {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    try rig.env.put("SQUEEZEFS_BLOCK_REFS_VERIFY", "1");
+    try rig.formatSetSized(true, &.{}, fallocate_row_data_bytes);
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(0);
+    const mark = try rig.logLen();
+    // 1. The reservation: `df` charges 3 blocks at once, the size stands,
+    //    nothing reaches the device; `falloc` raises the size; zeros.
+    {
+        const out = try rig.onMountTimed(
+            \\used0=$(df -kP . | tail -1 | awk '{print $3}')
+            \\xfs_io -f -c "falloc -k 0 12m" f1
+            \\used1=$(df -kP . | tail -1 | awk '{print $3}')
+            \\echo "size $(stat -c %s f1) charged $(( (used1 - used0) / 1024 ))"
+            \\xfs_io -c "falloc 0 12m" f1
+            \\used2=$(df -kP . | tail -1 | awk '{print $3}')
+            \\echo "size $(stat -c %s f1) charged $(( (used2 - used0) / 1024 ))"
+            \\echo "nonzero $(od -An -tx1 -v f1 | tr -d ' \n' | tr -d 0 | wc -c)"
+        , 120);
+        defer gpa.free(out);
+        std.debug.print("\nsmoke[fallocate]: reserve:\n{s}", .{out});
+        try testing.expect(std.mem.indexOf(u8, out, "size 0 charged 12\n") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "size 12582912 charged 12\n") != null);
+        try testing.expect(std.mem.endsWith(u8, out, "nonzero 0\n"));
+    }
+    {
+        const t = try rig.stats();
+        defer gpa.free(t);
+        try testing.expectEqual(@as(?u64, 3), numberAfter(t, "\"fallocate_blocks_reserved\":"));
+        try testing.expectEqual(@as(?u64, 0), numberAfter(t, "\"own_block_dmas\":"));
+        try testing.expectEqual(@as(?u64, 0), numberAfter(t, "\"write_through_blocks\":"));
+    }
+    // 2. The write inside the reservation lands in place: `df` unchanged,
+    //    the pattern exact, the block's other bytes still zeros.
+    {
+        const out = try rig.onMountTimed(
+            \\used0=$(df -kP . | tail -1 | awk '{print $3}')
+            \\xfs_io -c "pwrite -S 0xab 4m 1m" -c fsync f1 >/dev/null
+            \\used1=$(df -kP . | tail -1 | awk '{print $3}')
+            \\echo "delta $(( (used1 - used0) / 1024 ))"
+            \\echo "ab $(xfs_io -c "pread -v 4m 1m" f1 | grep -c 'ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab')"
+            \\echo "tail $(xfs_io -c "pread -v 5m 3m" f1 | grep '^[0-9a-f]*:' | grep -vc '00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00')"
+        , 120);
+        defer gpa.free(out);
+        std.debug.print("smoke[fallocate]: the write inside the reservation:\n{s}", .{out});
+        try testing.expect(std.mem.indexOf(u8, out, "delta 0\n") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "ab 65536\n") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "tail 0\n") != null);
+    }
+    {
+        const t = try rig.stats();
+        defer gpa.free(t);
+        try testing.expect((numberAfter(t, "\"reserved_landings\":") orelse 0) >= 1);
+        try testing.expectEqual(@as(?u64, 0), numberAfter(t, "\"reserved_landing_declines\":"));
+    }
+    // 3. PUNCH: block 1 (written) freed — `df` returns 4 MiB, zeros; the
+    //    edges: block 0 written whole, [100, 300) punched → zeros between
+    //    intact neighbours; the size stands.
+    {
+        const out = try rig.onMountTimed(
+            \\used0=$(df -kP . | tail -1 | awk '{print $3}')
+            \\xfs_io -c "fpunch 4m 4m" f1
+            \\i=0; while [ $i -lt 100 ]; do used1=$(df -kP . | tail -1 | awk '{print $3}'); [ $(( (used0 - used1) / 1024 )) -ge 4 ] && break; i=$((i+1)); sleep 0.1; done
+            \\echo "delta $(( (used1 - used0) / 1024 )) size $(stat -c %s f1)"
+            \\echo "punched $(xfs_io -c "pread -v 4m 1m" f1 | grep -c 'ab ab')"
+            \\xfs_io -c "pwrite -S 0xcd 0 4m" -c fsync -c "fpunch 100 200" f1 >/dev/null
+            \\echo "edge $(xfs_io -c "pread -v 96 8" f1 | head -1 | tr -s ' ' | cut -d' ' -f2-9) $(xfs_io -c "pread -v 296 8" f1 | head -1 | tr -s ' ' | cut -d' ' -f2-9)"
+            \\echo "zeros $(od -An -tx1 -v -j 100 -N 200 f1 | tr -d ' \n' | tr -d 0 | wc -c)"
+            \\echo "size $(stat -c %s f1)"
+        , 120);
+        defer gpa.free(out);
+        std.debug.print("smoke[fallocate]: punch:\n{s}", .{out});
+        try testing.expect(std.mem.indexOf(u8, out, "delta -4 size 12582912\n") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "punched 0\n") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "edge cd cd cd cd 00 00 00 00 00 00 00 00 cd cd cd cd\n") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "zeros 0\n") != null);
+        try testing.expect(std.mem.endsWith(u8, out, "size 12582912\n"));
+    }
+    // 4. ZERO_RANGE: block 2 written then zeroed without KEEP_SIZE's
+    //    space returning: `df` unchanged, zeros, the flip counted.
+    {
+        const out = try rig.onMountTimed(
+            \\xfs_io -c "pwrite -S 0xef 8m 4m" -c fsync f1 >/dev/null
+            \\used0=$(df -kP . | tail -1 | awk '{print $3}')
+            \\xfs_io -c "fzero -k 8m 4m" f1
+            \\used1=$(df -kP . | tail -1 | awk '{print $3}')
+            \\echo "delta $(( (used1 - used0) / 1024 )) ef $(xfs_io -c "pread -v 8m 4m" f1 | grep -c 'ef ef')"
+            \\xfs_io -c "fzero 12m 4m" f1
+            \\echo "size $(stat -c %s f1)"
+        , 120);
+        defer gpa.free(out);
+        std.debug.print("smoke[fallocate]: zero range:\n{s}", .{out});
+        try testing.expect(std.mem.indexOf(u8, out, "delta 0 ef 0\n") != null);
+        try testing.expect(std.mem.endsWith(u8, out, "size 16777216\n"));
+    }
+    {
+        const t = try rig.stats();
+        defer gpa.free(t);
+        try testing.expect((numberAfter(t, "\"fallocate_blocks_zeroed\":") orelse 0) >= 1);
+        try testing.expect((numberAfter(t, "\"fuse_fallocate_blocks_punched\":") orelse 0) >= 1);
+    }
+    // 5. COLLAPSE / INSERT / UNSHARE through the kernel: linux's FUSE
+    //    client refuses every mode but KEEP_SIZE, PUNCH_HOLE and ZERO_RANGE
+    //    before a request is formed (`fs/fuse/file.c` `fuse_file_fallocate`:
+    //    `mode & ~(KEEP_SIZE | PUNCH_HOLE | ZERO_RANGE) ⇒ -EOPNOTSUPP`, 7.3
+    //    and the 9.33 series alike) — the daemon's shift arms (served
+    //    through the dispatcher in the unit tests) are never asked: the
+    //    counters stay 0, the five-block file stands whole.
+    {
+        const out = try rig.onMountTimed(
+            \\xfs_io -f -c "pwrite -S 0x10 0 4m" -c "pwrite -S 0x11 4m 4m" -c "pwrite -S 0x12 8m 4m" -c "pwrite -S 0x13 12m 4m" -c "pwrite -S 0x14 16m 4m" -c fsync f2 >/dev/null
+            \\b() { xfs_io -c "pread -v $1 16" f2 | head -1 | tr -s ' ' | cut -d' ' -f2; }
+            \\xfs_io -c "fcollapse 4m 8m" f2 2>&1 | grep -c 'Operation not supported'
+            \\xfs_io -c "finsert 4m 4m" f2 2>&1 | grep -c 'Operation not supported'
+            \\xfs_io -c "funshare 0 4m" f2 2>&1 | grep -c 'Operation not supported'
+            \\echo "f2 $(stat -c %s f2) blocks $(b 0) $(b 4m) $(b 8m) $(b 12m) $(b 16m)"
+        , 120);
+        defer gpa.free(out);
+        std.debug.print("smoke[fallocate]: collapse / insert / unshare at the kernel:\n{s}", .{out});
+        try testing.expect(std.mem.indexOf(u8, out, "1\n1\n1\nf2 20971520 blocks 10 11 12 13 14\n") != null);
+    }
+    {
+        const t = try rig.stats();
+        defer gpa.free(t);
+        try testing.expectEqual(@as(?u64, 0), numberAfter(t, "\"fuse_fallocate_shifts\":"));
+        try testing.expectEqual(@as(?u64, 0), numberAfter(t, "\"fuse_fallocate_shift_refusals\":"));
+    }
+    // 6. The full store: a reservation made first, the store filled to
+    //    ENOSPC, a hole's write refused, the reservation's write admitted
+    //    and landed in place.
+    {
+        const out = try rig.onMountTimed(
+            \\xfs_io -f -c "falloc 0 8m" r
+            \\: > hole; xfs_io -c "truncate 8m" hole
+            \\j=0; while [ $j -lt 60 ] && dd if=/dev/zero of=fill$j bs=1M count=16 conv=fsync status=none 2>/dev/null; do j=$((j+1)); done; rm -f fill$j
+            \\echo "filled $j"
+            \\dd if=/dev/zero of=hole bs=1M count=4 conv=notrunc,fsync status=none 2>&1 | grep -c 'No space left on device'
+            \\xfs_io -c "pwrite -S 0x77 0 8m" -c fsync r >/dev/null && echo "reserved write ok"
+            \\echo "77 $(xfs_io -c "pread -v 0 8m" r | grep -c '77 77 77 77 77 77 77 77 77 77 77 77 77 77 77 77')"
+        , 600);
+        defer gpa.free(out);
+        std.debug.print("smoke[fallocate]: the full store:\n{s}", .{out});
+        try testing.expect(std.mem.indexOf(u8, out, "\n1\nreserved write ok\n77 524288\n") != null);
+    }
+    // 7. The kill: fsck clean, the remount re-reads every law, the
+    //    reservation's space still charged.
+    try rig.kill();
+    const recovered = try fsckClean(rig, "the fallocate matrix");
+    _ = try remountAfterKill(rig, recovered);
+    {
+        const out = try rig.onMountTimed(
+            \\b() { xfs_io -c "pread -v $1 16" $2 | head -1 | tr -s ' ' | cut -d' ' -f2; }
+            \\echo "f1 $(stat -c %s f1) $(b 0 f1) $(b 100 f1) $(b 4m f1) $(b 8m f1) $(b 12m f1)"
+            \\echo "f2 $(stat -c %s f2) $(b 0 f2) $(b 4m f2) $(b 8m f2) $(b 12m f2)"
+            \\echo "r $(xfs_io -c "pread -v 0 8m" r | grep -c '77 77 77 77 77 77 77 77 77 77 77 77 77 77 77 77')"
+        , 120);
+        defer gpa.free(out);
+        std.debug.print("smoke[fallocate]: after the remount:\n{s}", .{out});
+        try testing.expect(std.mem.indexOf(u8, out, "f1 16777216 cd 00 00 00 00\n") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "f2 20971520 10 11 12 13\n") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "r 524288\n") != null);
+    }
+    {
+        const text = try rig.readLog();
+        defer gpa.free(text);
+        const seg = text[mark..];
+        const errors = std.mem.count(u8, seg, "error(");
+        if (errors != 0) std.debug.print("--- the daemon's alert lines ---\n{s}\n", .{seg});
+        try testing.expectEqual(@as(usize, 0), errors);
+        try testing.expectEqual(@as(usize, 0), std.mem.count(u8, seg, "TRIPWIRE"));
+    }
+    {
+        const t = try rig.stats();
+        defer gpa.free(t);
+        try testing.expectEqual(@as(?u64, 0), numberAfter(t, "\"unwritten_mapping_served\":"));
+        try testing.expectEqual(@as(?u64, 0), numberAfter(t, "\"invariant_tripwires\":"));
+    }
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+    _ = try fsckClean(rig, "the clean unmount after the fallocate matrix");
+}
+
 test "smoke: FSCK AND SCRUB — format → fill (dirs, 200 packed small files, hard links, three fsync'd 20 MiB files, a clone) → umount → `fsck --offline --scrub` 0 findings over every block → mount, 8-way storm, kill -9 → `fsck --offline` 0 findings → remount, clean umount → a planted stray reference is exactly [C3]+[C8] on its block (exit 1), `--repair` plans, `--repair --apply` releases it, clean → a planted orphan inode is exactly [C9], destroyed on apply, clean → `merge-reports` of two residue shards ≡ the whole run" {
     const io = testing.io;
     if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);

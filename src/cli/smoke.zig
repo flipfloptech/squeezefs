@@ -2972,6 +2972,187 @@ test "smoke: TWO MOUNTS OF ONE SET ON ONE HOST — each member holds its OWN wri
     std.debug.print("smoke: member scope: B promoted its {d}, A its {d}; every file sha-equal after the remount; fsck clean\n", .{ scope_b_files, scope_a_files });
 }
 
+/// The bound on one cross-owner rename with nothing moving (the law: a
+/// cross-owner op resolves within its round trips — a handover's at most —
+/// never the move gate's fail-stop deadline, 90 s at the default T_owner).
+const cross_owner_rename_bound_s: u32 = 2;
+
+/// The rename matrix's shell: `r SRC DST` is one `mv` under the bound, its
+/// wall time in ms on stdout (a timed-out rename fails the script).
+const rename_matrix_prelude =
+    \\r() { t0=$(date +%s%N); timeout -s KILL 2 mv "$@" || { echo "rename $* did not resolve within 2 s (rc $?)" >&2; exit 1; }; echo "$(( ($(date +%s%N) - t0) / 1000000 ))"; }
+    \\
+;
+
+/// A mount's `.stats` at rest after cross-owner ops: no op answered the
+/// move gate's deadline, every intent retired, none stuck or open.
+fn expectIntentsAtRest(st: []const u8) !void {
+    try testing.expectEqual(@as(?u64, 0), numberAfter(st, "\"slot_move_unresolved\":"));
+    try testing.expectEqual(@as(?u64, 0), numberAfter(st, "\"xv_cross_owner_intents_stuck\":"));
+    try testing.expectEqual(@as(?u64, 0), numberAfter(st, "\"xv_cross_owner_intents_open\":"));
+    try testing.expectEqual(numberAfter(st, "\"xv_cross_owner_intents_minted\":") orelse 0, numberAfter(st, "\"xv_cross_owner_intents_retired\":") orelse 0);
+}
+
+/// Every line of `out` as a rename's ms, each within the bound; the max.
+fn renameMatrixMaxMs(out: []const u8) !u64 {
+    var max: u64 = 0;
+    var n: usize = 0;
+    var it = std.mem.splitScalar(u8, out, '\n');
+    while (it.next()) |line| {
+        if (line.len == 0) continue;
+        const ms = try std.fmt.parseInt(u64, line, 10);
+        try testing.expect(ms <= cross_owner_rename_bound_s * std.time.ms_per_s);
+        max = @max(max, ms);
+        n += 1;
+    }
+    try testing.expect(n > 0);
+    return max;
+}
+
+test "smoke: A RENAME THROUGH A JOINED MOUNT INTO THE MANAGER'S DIRECTORY RESOLVES ITS SLOT MOVE (F8; generic/732 under the symmetric default) — A (the manager) `mkdir A B; touch A/f; mv A/f B/`; B JOINED reads B/f and moves it into A (every object the manager's: the intent's home is B's OWN rotor slot, never slot 0), A moves it back, B again; the mirror (B's directories and file, A moving it, B back); each member's file between the OTHER's directories both ways; a rename whose two parents are two holders' — every rename ≤ 2 s, never the move gate's deadline; every file whole through BOTH mounts, nlink exact, `df -i` equal on both; minted ≡ retired; umount B, A → fsck --offline --scrub 0 findings" {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    try rig.env.put("SQUEEZEFS_MW_BIND", "127.0.0.1:0");
+    var t_owner_text: [8]u8 = undefined;
+    try rig.env.put("SQUEEZEFS_TEST_MEMBERSHIP_T_OWNER_MS", try std.fmt.bufPrint(&t_owner_text, "{d}", .{smoke_t_owner_ms}));
+    try rig.formatSet(true);
+    try rig.createImage();
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(0);
+    const b = try Peer.init(rig, "b");
+    defer b.deinit();
+    try b.spawn(&.{});
+    _ = try b.awaitReady();
+    {
+        const text = try b.readLog();
+        defer gpa.free(text);
+        try testing.expect(std.mem.indexOf(u8, text, "mounted JOINED as appender 1") != null);
+    }
+    var script: std.Io.Writer.Allocating = .init(gpa);
+    defer script.deinit();
+    var max_ms: u64 = 0;
+    // generic/732's prologue on A: `mkdir A B; touch A/f; mv A/f B/` — f
+    // carries 64 KiB of the image (the sha the matrix checks through both).
+    try script.writer.print("{s}mkdir A B && dd if=\"$1/image\" of=A/f bs=64k count=1 skip=0 status=none && r A/f B/ && sha256sum B/f | cut -d' ' -f1 > \"$1/f8-f.sha\"", .{rename_matrix_prelude});
+    {
+        const out = try rig.onMount(script.written());
+        defer gpa.free(out);
+        max_ms = @max(max_ms, try renameMatrixMaxMs(out));
+    }
+    // generic/732's body: `cat B/f` and `mv B/f A/` through the JOINED
+    // mount (both parents and the file the manager's: the intent's step 0
+    // is foreign), then A moves it back, then B again.
+    {
+        script.clearRetainingCapacity();
+        try script.writer.print("{s}cat B/f > /dev/null && r B/f A/", .{rename_matrix_prelude});
+        const out = try b.onMount(script.written());
+        defer gpa.free(out);
+        max_ms = @max(max_ms, try renameMatrixMaxMs(out));
+    }
+    {
+        script.clearRetainingCapacity();
+        try script.writer.print("{s}cat A/f > /dev/null && r A/f B/", .{rename_matrix_prelude});
+        const out = try rig.onMount(script.written());
+        defer gpa.free(out);
+        max_ms = @max(max_ms, try renameMatrixMaxMs(out));
+    }
+    {
+        script.clearRetainingCapacity();
+        try script.writer.print("{s}r B/f A/", .{rename_matrix_prelude});
+        const out = try b.onMount(script.written());
+        defer gpa.free(out);
+        max_ms = @max(max_ms, try renameMatrixMaxMs(out));
+    }
+    // The mirror: B's directories and B's file; the MANAGER moves it (every
+    // object the joiner's), B moves it back.
+    {
+        script.clearRetainingCapacity();
+        try script.writer.print("{s}mkdir C D && dd if=\"$1/image\" of=C/g bs=64k count=1 skip=1 status=none && sha256sum C/g | cut -d' ' -f1 > \"$1/f8-g.sha\"", .{rename_matrix_prelude});
+        gpa.free(try b.onMount(script.written()));
+        script.clearRetainingCapacity();
+        try script.writer.print("{s}r C/g D/", .{rename_matrix_prelude});
+        const out = try rig.onMount(script.written());
+        defer gpa.free(out);
+        max_ms = @max(max_ms, try renameMatrixMaxMs(out));
+        script.clearRetainingCapacity();
+        try script.writer.print("{s}r D/g C/", .{rename_matrix_prelude});
+        const out_b = try b.onMount(script.written());
+        defer gpa.free(out_b);
+        max_ms = @max(max_ms, try renameMatrixMaxMs(out_b));
+    }
+    // Each member's OWN file between the OTHER's directories, both ways:
+    // B's h (minted in B's rotor) between A's directories through B then
+    // A; A's i between B's directories through A then B.
+    {
+        script.clearRetainingCapacity();
+        try script.writer.print("{s}dd if=\"$1/image\" of=A/h bs=64k count=1 skip=2 status=none && sha256sum A/h | cut -d' ' -f1 > \"$1/f8-h.sha\" && r A/h B/", .{rename_matrix_prelude});
+        const out = try b.onMount(script.written());
+        defer gpa.free(out);
+        max_ms = @max(max_ms, try renameMatrixMaxMs(out));
+        script.clearRetainingCapacity();
+        try script.writer.print("{s}r B/h A/ && dd if=\"$1/image\" of=C/i bs=64k count=1 skip=3 status=none && sha256sum C/i | cut -d' ' -f1 > \"$1/f8-i.sha\" && r C/i D/", .{rename_matrix_prelude});
+        const out_a = try rig.onMount(script.written());
+        defer gpa.free(out_a);
+        max_ms = @max(max_ms, try renameMatrixMaxMs(out_a));
+        script.clearRetainingCapacity();
+        try script.writer.print("{s}r D/i C/", .{rename_matrix_prelude});
+        const out_b = try b.onMount(script.written());
+        defer gpa.free(out_b);
+        max_ms = @max(max_ms, try renameMatrixMaxMs(out_b));
+    }
+    // Two holders' parents: B moves its g from its C into A's A, A moves
+    // it back into C.
+    {
+        script.clearRetainingCapacity();
+        try script.writer.print("{s}r C/g A/", .{rename_matrix_prelude});
+        const out = try b.onMount(script.written());
+        defer gpa.free(out);
+        max_ms = @max(max_ms, try renameMatrixMaxMs(out));
+        script.clearRetainingCapacity();
+        try script.writer.print("{s}r A/g C/", .{rename_matrix_prelude});
+        const out_a = try rig.onMount(script.written());
+        defer gpa.free(out_a);
+        max_ms = @max(max_ms, try renameMatrixMaxMs(out_a));
+    }
+    // The tree through BOTH mounts: A{f,h} B{} C{g,i} D{}, every file
+    // sha-equal, nlink 1, every directory nlink 2, `df -i` equal.
+    const verify =
+        \\test "$(ls A | tr '\n' ' ')" = "f h " && test -z "$(ls B)" && test "$(ls C | tr '\n' ' ')" = "g i " && test -z "$(ls D)"
+        \\test "$(sha256sum A/f | cut -d' ' -f1)" = "$(cat "$1/f8-f.sha")"
+        \\test "$(sha256sum C/g | cut -d' ' -f1)" = "$(cat "$1/f8-g.sha")"
+        \\test "$(sha256sum A/h | cut -d' ' -f1)" = "$(cat "$1/f8-h.sha")"
+        \\test "$(sha256sum C/i | cut -d' ' -f1)" = "$(cat "$1/f8-i.sha")"
+        \\test "$(stat -c %h A/f C/g A/h C/i | tr '\n' ' ')" = "1 1 1 1 "
+        \\test "$(stat -c %h A B C D | tr '\n' ' ')" = "2 2 2 2 "
+        \\df -iP . | tail -1 | awk '{print $3}'
+    ;
+    const df_a = try rig.onMount(verify);
+    defer gpa.free(df_a);
+    const df_b = try b.onMount(verify);
+    defer gpa.free(df_b);
+    try testing.expectEqualStrings(df_a, df_b);
+    // Never the deadline on either; minted ≡ retired, nothing stuck.
+    {
+        const sa = try rig.stats();
+        defer gpa.free(sa);
+        try expectIntentsAtRest(sa);
+        const sb = try b.stats();
+        defer gpa.free(sb);
+        try expectIntentsAtRest(sb);
+        try testing.expect((numberAfter(sb, "\"xv_cross_owner_intents_minted\":") orelse 0) >= 4);
+    }
+    try b.umount();
+    try b.expectCleanExit("B's unmount");
+    gpa.free(try rig.onMount(verify));
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+    _ = try fsckClean(rig, "the joiner rename matrix");
+    std.debug.print("smoke: joiner rename matrix: 12 renames over two mounts (11 cross-owner), the slowest {d} ms (bound {d} s); the tree equal through both, df -i used {s}; fsck clean\n", .{ max_ms, cross_owner_rename_bound_s, std.mem.trimEnd(u8, df_a, "\n") });
+}
+
 // ---------------------------------------------------------------------------
 // THE KILL ROWS (charter §5.5 "Death and recovery", "PARK-AND-RECLAIM",
 // §8 `appender clear`): two daemons over real TCP, `kill -9` of either.

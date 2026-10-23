@@ -663,8 +663,13 @@ pub const Block = struct {
     }
 };
 
-/// The per-ino settle serialization: the (3.5) meta stripe every map
-/// publish funnels through (`layout.MetaStripes`).
+/// The per-ino settle serialization: the (3.5) META STRIPE every map
+/// publish funnels through (`layout.MetaStripes`) — the plane's own table
+/// (`plane.locks.stripes`, the one `MapSeam.merge` is called under), so a
+/// settle holding it meets no publish of the ino: a binding that moves
+/// under it is a mutator outside the discipline (the tripwire). Until
+/// 2026-10-23 the read path held a table of its own, which serialized
+/// settling readers against each other and nothing else.
 pub const Settle = layout.MetaStripes;
 
 /// Test seams (process atomics, one relaxed load each; zero cost unset).
@@ -702,7 +707,7 @@ pub const ReadPath = struct {
     adm: admission.Admission,
     /// One pipeline per ino (bounded table keyed by ino; a miss claims).
     pipelines: PipelineTable,
-    settle: Settle,
+    settle: *Settle,
     seams: Seams = .{},
     /// The speculative-fill issuer (null = plans are bookkept, never run).
     issuer: ?Issuer = null,
@@ -740,7 +745,7 @@ pub const ReadPath = struct {
 
     /// `nvme` is adopted (the caller built it: the RAM double, the Linux
     /// `Ring.open`, or `initDisabled`). `decode` null = passthrough.
-    pub fn init(gpa: Allocator, cfg: Config, meta: Meta, vols: Volumes, write_side: WriteSide, decode: ?Decode, nvme: nvme_read_cache.Cache, mem: ?*const budget.MemBudget) InitError!*ReadPath {
+    pub fn init(gpa: Allocator, cfg: Config, meta: Meta, vols: Volumes, write_side: WriteSide, decode: ?Decode, nvme: nvme_read_cache.Cache, mem: ?*const budget.MemBudget, settle: *Settle) InitError!*ReadPath {
         assert(cfg.block_size > 0 and derive.isAligned(cfg.block_size, rsc.LBA_GRAIN));
         const self = try gpa.create(ReadPath);
         errdefer gpa.destroy(self);
@@ -798,7 +803,7 @@ pub const ReadPath = struct {
             .flights = flights,
             .adm = adm,
             .pipelines = .{ .pipes = undefined },
-            .settle = .{},
+            .settle = settle,
         };
         self.tiers = .{ .hot = hot, .lru = lru, .hold = hold, .grains = grains, .nvme = &self.nvme };
         hot.sink = .{ .ctx = self, .on_evict = &hotVictim };
@@ -909,6 +914,53 @@ pub const ReadPath = struct {
     fn still(self: *ReadPath, key: BlockKey, before: u64) bool {
         const a = self.allocatorOf(key) orelse return true;
         return a.fillIncarnationStill(key.blockIdx(self.stride()), before);
+    }
+
+    /// THE LIFETIME of `key`'s block on this member's allocator (decision
+    /// 0003 §BI): its lifetime stamp while the cell is ALLOCATED, `dead`
+    /// for a cell in any other state (freed, in limbo, a grant window's,
+    /// virgin), null for a key no allocator here tracks (another member's
+    /// lifetime: the token's law, `foreignKey`). A device-true serve is
+    /// valid when the lifetime read before its DMA still stands after it
+    /// — a block freed and re-minted under the read (to another file, or
+    /// to the same index by a later mint) carries a new stamp — and the
+    /// map still binds it. The seqlock word (`fillIncarnation`/`still`) is
+    /// the TIERS' law: a cached copy must be of ONE generation, and a W1
+    /// patch's retire → publish moves the generation to evict the copies
+    /// of the page it rewrote. A device-true read deposits nothing, so the
+    /// generation is not its law: its bytes are the device's at the DMA's
+    /// instant, torn at the device's sector grain against a concurrent
+    /// in-place write of the SAME file at most — Linux's O_DIRECT law,
+    /// which ext4 and XFS give a direct read racing a direct overwrite —
+    /// never another lifetime's. Under a sustained in-place storm on one
+    /// block (xfstests generic/095: 45 mixed writers on a 1 MiB file) the
+    /// word is unstable more often than not, and a read judged by it lost
+    /// its ranged ladder, its whole-block walk and the settle in turn —
+    /// EIO and the settle's tripwire for a block whose lifetime never moved.
+    const Lifetime = union(enum) { untracked, dead, live: u64 };
+
+    fn lifetime(self: *ReadPath, key: BlockKey) Lifetime {
+        const a = self.allocatorOf(key) orelse return .untracked;
+        const idx = key.blockIdx(self.stride());
+        if (a.incarnationWord(idx) == 0) return .untracked;
+        return switch (a.stateOf(idx)) {
+            .allocated => .{ .live = a.stampOf(idx) },
+            else => .dead,
+        };
+    }
+
+    /// The device-true serve's verdict: the lifetime read before the DMA
+    /// (`before_lt`) stands after it; an untracked key keeps the seqlock
+    /// law over `before` (the pre-DMA word, null = unstable).
+    fn deviceServeValid(self: *ReadPath, key: BlockKey, before_lt: Lifetime, before: ?u64) bool {
+        switch (before_lt) {
+            .untracked => return if (before) |bf| self.still(key, bf) else false,
+            .dead => return false,
+            .live => |stamp| {
+                const now_lt = self.lifetime(key);
+                return now_lt == .live and now_lt.live == stamp;
+            },
+        }
     }
 
     /// A validated fill may deposit into the tiers (`fillDepositable`): a
@@ -1530,13 +1582,19 @@ pub const ReadPath = struct {
                 stats.read_copy_dest_bytes.add(out.len);
                 return;
             }
-            // The device leg refuses a dead-lifetime key BEFORE the DMA.
-            const before = self.fillIncarnation(k) orelse {
+            // The device leg refuses a dead lifetime BEFORE the DMA (a
+            // freed block, another member's); an UNSTABLE word (an in-place
+            // write in flight) is not one: the window is read and served
+            // under the lifetime law, and only its deposit — the tiers'
+            // law — waits for a stable generation.
+            const before_lt = self.lifetime(k);
+            const before: ?u64 = self.fillIncarnation(k);
+            if (before_lt == .dead or (before_lt == .untracked and before == null)) {
                 stats.stale_binding_rebinds.inc();
                 stats.ranged_read_rebinds.inc();
                 key = self.currentBinding(ino, b);
                 continue;
-            };
+            }
             stats.ranged_reads.inc();
             stats.ranged_read_bytes.add(win.len());
             self.adm.governor.noteForeground(win.len(), clock.monotonicNs());
@@ -1560,12 +1618,13 @@ pub const ReadPath = struct {
             }
             if (self.seams.after_dma) |f| f(self.seams.after_dma_ctx, k);
             // Bytes in hand FIRST: the deposit (validated at the insert
-            // against `before`), then the two checks — a loss purges what
-            // the deposit may have left (`loseForeign`'s order).
-            if (!device_true) self.depositWindow(k, win.aligned_start, if (direct) out else bounce.?.bytes[0..@intCast(win.len())], ino, epoch, before);
-            const incarnation_ok = self.still(k, before);
+            // against `before`; none under an unstable word), then the two
+            // checks — a loss purges what the deposit may have left
+            // (`loseForeign`'s order).
+            if (!device_true) if (before) |bf| self.depositWindow(k, win.aligned_start, if (direct) out else bounce.?.bytes[0..@intCast(win.len())], ino, epoch, bf);
+            const lifetime_ok = self.deviceServeValid(k, before_lt, before);
             const current = self.currentBinding(ino, b);
-            if (incarnation_ok and current != null and current.?.eql(k)) {
+            if (lifetime_ok and current != null and current.?.eql(k)) {
                 if (direct) {
                     if (lease) stats.read_dest_lease_bytes.add(req_len);
                 } else {
@@ -1767,8 +1826,11 @@ pub const ReadPath = struct {
     }
 
     /// §7.3: ONE serialized settle under the inode's meta stripe (the one
-    /// domain every map publish funnels through); retries exist only for
-    /// the invariant-violation case.
+    /// domain every map publish funnels through — the plane's (3.5) table);
+    /// the fetch is device-true under the lifetime law, so an in-place
+    /// write landing meanwhile is no loss; retries exist only for the
+    /// invariant-violation case (a binding or a lifetime moved under the
+    /// stripe: a mutator outside both disciplines).
     fn getBlockSettled(self: *ReadPath, io: Io, ino: u64, b: u64) Error!?Block {
         stats.stale_binding_escalations.inc();
         var attempt: u32 = 0;
@@ -1789,13 +1851,16 @@ pub const ReadPath = struct {
     // ---- the fills ----
 
     /// The device-true fetch: no tiers, no single-flight, no ghost, no
-    /// `cache_hits/misses`; decode still applies; the same verdict shape.
-    /// Counts into the fill phases (`fill_total` covers every fill).
+    /// `cache_hits/misses`; decode still applies; the same verdict shape,
+    /// judged by the LIFETIME law (`deviceServeValid`: nothing is
+    /// deposited, so the seqlock generation is not its law). Counts into
+    /// the fill phases (`fill_total` covers every fill).
     fn fetchBlockDeviceTrue(self: *ReadPath, key: BlockKey) Error!Block {
         var pc = PhaseClock.start();
+        const before_lt = self.lifetime(key);
         const before = self.fillIncarnation(key);
         var blk = try self.fetchIntoFresh(key, .demand, &pc);
-        blk.serve_valid = if (before) |bf| self.still(key, bf) else false;
+        blk.serve_valid = self.deviceServeValid(key, before_lt, before);
         pc.mark(&stats.read_fill_admission_ns);
         pc.mark(&stats.read_fill_deposit_ns);
         pc.total(&stats.read_fill_total_ns);
@@ -2177,6 +2242,8 @@ const Fixture = struct {
     /// The device fd the volumes seam answers (null = no direct leg).
     dev_fd: ?std.os.linux.fd_t = null,
     rp: *ReadPath = undefined,
+    /// The settle's stripes (the plane's (3.5) table in the product).
+    stripes: layout.MetaStripes = .{},
 
     pub fn init(gpa: Allocator, cfg_over: struct { passthrough: bool = true, ranged_threshold: u64 = 256 * derive.KiB, direct_device_true: bool = false, read_lane: bool = true, rebind_cap: u32 = MAX_REBINDS, hot_budget: u64 = 4 * bs, policy: admission.Policy = .second_touch, compression: ?transform.Compression = null, read_cache_bytes: u64 = 0 }) !*Fixture {
         const self = try gpa.create(Fixture);
@@ -2226,7 +2293,7 @@ const Fixture = struct {
         };
         const nvme = try nvme_read_cache.Cache.initRam(gpa, 1, 8 * bs);
         const decode: ?Decode = if (self.xform != null) .{ .ctx = self, .chunk = chunk, .decode = &xDecode, .frame_span = &xFrameSpan, .decode_range = &xDecodeRange } else null;
-        self.rp = try ReadPath.init(gpa, cfg, self.meta(), self.vols(), WriteSide.none, decode, nvme, null);
+        self.rp = try ReadPath.init(gpa, cfg, self.meta(), self.vols(), WriteSide.none, decode, nvme, null, &self.stripes);
         return self;
     }
 
@@ -2241,8 +2308,8 @@ const Fixture = struct {
 
     /// Bind block `b` to device block `dev_idx` (published stable).
     pub fn bind(self: *Fixture, b: usize, dev_idx: u64) void {
-        self.bindings[b] = Mapping.wholeBlock(vol_tag, dev_idx * self.chunk, 1);
         self.mint(dev_idx);
+        self.bindings[b] = Mapping.wholeBlock(vol_tag, dev_idx * self.chunk, self.alloc.stampOf(dev_idx));
     }
 
     /// `dev_idx` as THIS member's minted, published block (claimed once:
@@ -2851,6 +2918,76 @@ test "binding validation: a rebind between the fetch and the serve is a loss tha
     try Fixture.expected(final, buf);
     try testing.expectEqual(rb + 1, stats.stale_binding_rebinds.load());
     try testing.expect(f.rp.hot.contains(dead_key));
+}
+
+test "the lifetime law (decision 0003 §BI; xfstests generic/095): a read racing a sustained IN-PLACE write storm on its block — the seqlock word retired and republished under EVERY DMA — serves the block's bytes: the ranged 512 B direct read on its first window (nothing deposited: the tiers' law waits for a stable generation), the whole-block walk through its device-true leg, the settle under the stripe with no tripwire; a block whose LIFETIME moves under the read (freed and re-minted) is still a loss that re-resolves and never serves the other lifetime's bytes" {
+    const io = testing.io;
+    const f = try Fixture.init(testing.allocator, .{ .rebind_cap = 2 });
+    defer f.deinit();
+    f.size = Fixture.bs;
+    f.bind(0, 1);
+    const buf = try alignedBuf(testing.allocator, 1 << 20);
+    defer testing.allocator.free(buf);
+    // The storm: every DMA lands under a patch — the word retired before
+    // the recheck and republished under a new generation (W1's pair).
+    const Storm = struct {
+        var fx: *Fixture = undefined;
+        var patches: u32 = 0;
+        fn run(_: ?*anyopaque, k: BlockKey) void {
+            patches += 1;
+            fx.alloc.markIncarnationUnstable(k.blockIdx(Fixture.bs));
+            fx.alloc.publishBlock(k.blockIdx(Fixture.bs));
+        }
+    };
+    Storm.fx = f;
+    f.rp.seams.after_dma = &Storm.run;
+    const lost0 = stats.read_settle_lost_serialized.load();
+    const esc0 = stats.stale_binding_escalations.load();
+    const rebinds0 = stats.stale_binding_rebinds.load();
+    // 1. A 512 B direct read (the ranged leg) serves on its first window.
+    try testing.expectEqual(@as(usize, 512), try f.rp.read(io, 7, 4096, 512, .{ .buf = buf[0..512] }, .{ .odirect = true }));
+    try Fixture.expected(Fixture.bs + 4096, buf[0..512]);
+    try testing.expectEqual(@as(u32, 1), Storm.patches);
+    try testing.expectEqual(rebinds0, stats.stale_binding_rebinds.load());
+    // 2. The whole-block read: the tiered fill loses to the moving
+    //    generation (never deposited), the escalated device-true leg
+    //    serves under the lifetime; no settle, no tripwire.
+    const n = try f.rp.read(io, 7, 0, 1 << 20, .{ .buf = buf }, .{});
+    try testing.expectEqual(@as(usize, 1 << 20), n);
+    try Fixture.expected(Fixture.bs, buf);
+    try testing.expectEqual(esc0, stats.stale_binding_escalations.load());
+    try testing.expectEqual(lost0, stats.read_settle_lost_serialized.load());
+    try testing.expect(!f.rp.hot.contains(.init(Fixture.vol_tag, Fixture.bs)));
+    // 3. The word UNSTABLE before the DMA (a patch in flight at the
+    //    resolve): the ranged leg reads and serves all the same.
+    f.alloc.markIncarnationUnstable(1);
+    try testing.expectEqual(@as(usize, 512), try f.rp.read(io, 7, 8192, 512, .{ .buf = buf[0..512] }, .{ .odirect = true }));
+    try Fixture.expected(Fixture.bs + 8192, buf[0..512]);
+    f.alloc.publishBlock(1);
+    f.rp.seams.after_dma = null;
+    // 4. The lifetime moves under the read: the block freed and re-minted
+    //    (a new stamp), the map re-bound to the same key by the new mint —
+    //    the bytes in hand are the old lifetime's: a loss, re-resolved,
+    //    the new lifetime's bytes served once it stands still.
+    const Remint = struct {
+        var fx: *Fixture = undefined;
+        var armed: bool = true;
+        fn run(_: ?*anyopaque, k: BlockKey) void {
+            if (!armed) return;
+            armed = false;
+            const idx = k.blockIdx(Fixture.bs);
+            _ = fx.alloc.beginFree(idx) catch unreachable;
+            fx.alloc.finishFree(idx);
+            fx.bind(0, idx);
+        }
+    };
+    Remint.fx = f;
+    f.rp.seams.after_dma = &Remint.run;
+    const rebinds1 = stats.stale_binding_rebinds.load();
+    try testing.expectEqual(@as(usize, 512), try f.rp.read(io, 7, 12288, 512, .{ .buf = buf[0..512] }, .{ .odirect = true }));
+    try Fixture.expected(Fixture.bs + 12288, buf[0..512]);
+    try testing.expect(stats.stale_binding_rebinds.load() > rebinds1);
+    f.rp.seams.after_dma = null;
 }
 
 fn cohortBody(io: Io) !void {
@@ -3647,6 +3784,7 @@ const DeviceFixture = if (builtin.os.tag == .linux) struct {
     size: u64 = 0,
     bindings: [8]?Mapping = @splat(null),
     rp: *ReadPath = undefined,
+    stripes: layout.MetaStripes = .{},
 
     var seq: Atomic(u32) = .init(0);
 
@@ -3689,7 +3827,7 @@ const DeviceFixture = if (builtin.os.tag == .linux) struct {
             .prefetch = .{ .window_cap = 8, .share_pct = 50, .hot_budget = 4 * bs, .lane_armed = true, .depth_pin = null, .lane_budget_cap = 8 * bs },
         };
         const nvme = try nvme_read_cache.Cache.initRam(self.gpa, 1, 8 * bs);
-        self.rp = try ReadPath.init(self.gpa, cfg, .{ .ctx = self, .file = &metaFile, .binding = &metaBinding, .inline_data = &metaInline }, .{ .ctx = self, .allocator_of = &volAlloc, .read_range = &volRead, .device_fd = &volFd }, WriteSide.none, null, nvme, null);
+        self.rp = try ReadPath.init(self.gpa, cfg, .{ .ctx = self, .file = &metaFile, .binding = &metaBinding, .inline_data = &metaInline }, .{ .ctx = self, .allocator_of = &volAlloc, .read_range = &volRead, .device_fd = &volFd }, WriteSide.none, null, nvme, null, &self.stripes);
     }
 
     fn destroy(self: *DeviceFixture) void {

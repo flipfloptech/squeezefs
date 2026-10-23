@@ -736,7 +736,7 @@ pub const DataPlane = struct {
         var rcfg = read_path.Config.fromEnv(opts.env, cfg.block_size, self.passthrough, opts.facts, opts.budget_bytes);
         if (opened == 0) rcfg.read_lane = false;
         const decode: ?read_path.Decode = if (self.xform != null) .{ .ctx = self, .chunk = cfg.chunk_size, .decode = &decodeImage, .frame_span = &decodeFrameSpan, .decode_range = &decodeRange } else null;
-        self.rp = read_path.ReadPath.init(gpa, rcfg, self.meta(), self.readVolumes(), self.writeSide(), decode, nvme, &budget.authority) catch |e| switch (e) {
+        self.rp = read_path.ReadPath.init(gpa, rcfg, self.meta(), self.readVolumes(), self.writeSide(), decode, nvme, &budget.authority, &self.locks.stripes) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.Io,
         };

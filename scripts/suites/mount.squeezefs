@@ -4,9 +4,12 @@
 # util-linux's `/sbin/mount.fuse.squeezefs` symlink (installed by
 # scripts/suites/fstests.sh). Also answers as `/sbin/umount.fuse`
 # (util-linux's umount helper: `umount.<type> <dir> [-l] [-f] [-n] [-v]`),
-# so xfstests' `umount` runs the ORDERLY `squeezefs umount` (teardown
-# promotes staged files first, the final checkpoint lands) instead of the
-# bare umount2 that gives a type-fuse mount no DESTROY.
+# so xfstests' `umount` of a mount THIS helper made runs the ORDERLY
+# `squeezefs umount` (teardown promotes staged files first, the final
+# checkpoint lands) instead of the bare umount2 that gives a type-fuse
+# mount no DESTROY; any other mount of the superblock (a bind, a move) is
+# the kernel's plain detach, the daemon unsignalled (the persona's comment
+# below).
 #
 # <dev> is the set's ONE device (xfstests' TEST_DEV/SCRATCH_DEV loop, a dm
 # target the test put over it, or a device of the test's own — generic/620's
@@ -36,37 +39,55 @@ if [[ "$(basename "$0")" == umount.* ]]; then
   # fuse.squeezefs`, as umount(8) documents for `fuse.sshfs`): installed as
   # /sbin/umount.fuse, this answers every fuse.* unmount on the venue — ours
   # the orderly way, any other type's as the kernel's plain detach.
-  target="" type=""
+  target="" type="" lazy=""
   while [ $# -gt 0 ]; do
     case "$1" in
       -t) type=$2; shift ;;
       -N) shift ;;
-      -*) ;;                       # -l -f -n -v -r -i: the orderly umount is the one act
+      -l) lazy=-l ;;               # the kernel's lazy detach, or the daemon's lazy stop (below)
+      -*) ;;                       # -f -n -v -r -i: the orderly umount is the one act
       *) [ -z "$target" ] && target=$1 ;;
     esac
     shift
   done
   [ -n "$target" ] || die "usage: umount.fuse [-t fuse.<subtype>] <mountpoint>"
   [ -z "$type" ] && type=$(findmnt -n -o FSTYPE -M "$target" 2>/dev/null)
-  [ "$type" = fuse.squeezefs ] || exec umount -i "$target"
-  # A BIND of a path inside a squeezefs mount (generic/306 binds a file)
-  # carries our fstype in the mount table but has no daemon of its own:
-  # the kernel's plain detach, silently (mount(8) prints nothing). Only a
-  # daemon's own root gets the orderly `squeezefs umount`.
-  if ! findmnt -n -o FSROOT -M "$target" 2>/dev/null | grep -qx /; then exec umount -i "$target"; fi
-  # The set serving this mountpoint (the mount helper recorded it), and its
-  # run's binary.
+  [ "$type" = fuse.squeezefs ] || exec umount -i $lazy "$target"
+  # Only THE mount the mount helper made gets the orderly `squeezefs umount`
+  # (the daemon signalled, its teardown's promotion and checkpoint, its
+  # exit awaited): the helper tagged its mountpoint with the set and the
+  # MOUNT ID the kernel gave it. Every other mount carrying our fstype —
+  # a bind of a path inside it (generic/306 binds a file), a whole-tree
+  # bind (409–411: `mount --bind mpA mpB`), a bind stacked on the
+  # daemon's own path (589: `--bind DSTHEAD DSTHEAD`), a moved mountpoint
+  # (589's `--move`), a propagated copy — is another mountpoint of the
+  # same superblock with no daemon of its own: the kernel's plain detach,
+  # silently (mount(8) prints nothing), the daemon not signalled; it
+  # serves what remains and exits when the superblock's last mount goes
+  # (the kernel ends the connection). Until 2026-10-23 a whole-tree bind
+  # (FSROOT `/`) took the orderly path: the daemon unmounted ITS path at
+  # the first bind's unmount, the later ones met a dead connection.
   tag=/run/squeezefs-suites/mnt-$(printf '%s' "$target" | md5sum | cut -c1-16)
-  if [ -f "$tag" ]; then
-    SET_ID=$(cat "$tag"); SET_DIR=$(cat "/run/squeezefs-suites/$SET_ID.dir"); suite_slice_paths
-    suite_run_env "$SET_DIR"
-  fi
+  own_id=""
+  if [ -f "$tag" ]; then { read -r SET_ID; read -r own_id; } < "$tag"; fi
+  top_id=$(awk -v t="$target" '$5 == t { id = $1 } END { print id }' /proc/self/mountinfo)
+  if [ -z "$own_id" ] || [ "$top_id" != "$own_id" ]; then exec umount -i $lazy "$target"; fi
+  # The set serving this mountpoint, and its run's binary.
+  SET_DIR=$(cat "/run/squeezefs-suites/$SET_ID.dir"); suite_slice_paths
+  suite_run_env "$SET_DIR"
   rc=0
-  "$SQZ_BIN" umount "$target" || rc=$?
+  # `umount -l` of the daemon's own mount is the daemon's LAZY stop
+  # (decision 0003 §S shape (b)): detached now, its holders — a test's
+  # mounts stacked inside it after a fail-early kill (fstests.sh's
+  # `fstests_unmount_all` falls back to `umount -l` on a BUSY refusal) —
+  # served until the kernel ends the connection, then the teardown.
+  "$SQZ_BIN" umount ${lazy:+--lazy} "$target" || rc=$?
   # The set's slices go down with the mount, so the test's own dm device
   # above them can be removed by its cleanup. A refused umount (BUSY: a
-  # holder) leaves everything standing.
-  if [ "$rc" = 0 ] && [ -f "$tag" ]; then
+  # holder) leaves everything standing; so does the lazy stop (the daemon
+  # may still serve over the slices — the run's end or the next mkfs of
+  # the set takes them down).
+  if [ "$rc" = 0 ] && [ -z "$lazy" ]; then
     # A successor of this set on its way up through the same slices holds
     # the set's lock shared for its whole bring-up (generic/604: the mount
     # racing this unmount waits out our daemon on the writer lock, then
@@ -137,8 +158,14 @@ exec 9>"/run/squeezefs-suites/$SET_ID.lock"; flock -s 9
 # again (the test's cleanup removes its device) — unless another bring-up
 # of the set is in flight.
 suite_slices_up "$dev"
-echo "$SET_ID" > "/run/squeezefs-suites/mnt-$(printf '%s' "$dir" | md5sum | cut -c1-16)"
-mount_failed() { flock -u 9; if flock -x -n 9; then suite_slices_down; fi; rm -f "/run/squeezefs-suites/mnt-$(printf '%s' "$dir" | md5sum | cut -c1-16)"; }
+# The mountpoint's tag: the set (line 1) and, once the daemon is up, the
+# MOUNT ID of the mount it made (line 2: the newest mount at the path is
+# ours) — what the umount persona tells the daemon's own mount apart from
+# a bind, a stacked bind or a moved mount of the same superblock.
+tag="/run/squeezefs-suites/mnt-$(printf '%s' "$dir" | md5sum | cut -c1-16)"
+echo "$SET_ID" > "$tag"
+mount_failed() { flock -u 9; if flock -x -n 9; then suite_slices_down; fi; rm -f "$tag"; }
+mount_tagged() { printf '%s\n%s\n' "$SET_ID" "$(awk -v t="$dir" '$5 == t { id = $1 } END { print id }' /proc/self/mountinfo)" > "$tag"; }
 # The zero-copy kmbuf ring needs order-8 contiguous pages per queue; a
 # fragmented venue (other agents' daemons, a hot page cache) answers
 # ENOMEM. Compact and retry, as `common.sh`'s `suite_mount` does — never a
@@ -153,7 +180,7 @@ while :; do
   # diagnosis and go to stderr.
   # `--supervise`: the release posture's external supervisor (common.sh's
   # `suite_mount` says why) — a death gets its wait status, a wedge its dump.
-  out=$("$SQZ_BIN" mount --daemon --supervise --log-file "$log" -o "$all" "sqmeta://$SLICE_META" "$dir" 2>&1 9>&-) && exit 0
+  out=$("$SQZ_BIN" mount --daemon --supervise --log-file "$log" -o "$all" "sqmeta://$SLICE_META" "$dir" 2>&1 9>&-) && { mount_tagged; exit 0; }
   rc=$?
   if [ "$attempt" -lt 3 ] && grep -q 'ENOMEM (order-8' <<< "$out"; then
     echo "$(date +%s) mount $dir: kmbuf ENOMEM (fragmented venue); compacting memory, retry $attempt/3" >> "$SET_DIR/mounts.log"
@@ -182,9 +209,10 @@ while :; do
   if grep -q 'another writer holds the single-writer guard' <<< "$out" && grep -qE 'holds the writer lock \(claim:|claimed by a live writer \(claim:' "$log" 2>/dev/null; then
     lpid=$(grep -oE '(holds the writer lock|claimed by a live writer) \(claim: id=[0-9a-f]*, pid=[0-9]*' "$log" | head -1 | grep -o 'pid=[0-9]*' | cut -d= -f2)
     # On its way out = its own log says so ("stop requested"); a holder
-    # serving a live mount (the `mount` group's second mount of SCRATCH_DEV:
-    # generic/409–411, 589, 732 — the ledger's by-design rows) is refused
-    # at once, never waited for: twelve 60 s waits made one test 40 minutes.
+    # serving a live mount (the `mount` group's second mount of SCRATCH_DEV
+    # under `SUITE_SINGLE_WRITER=1`: generic/409–411, 589, 732 — under the
+    # symmetric default it JOINS and never comes here) is refused at once,
+    # never waited for: twelve 60 s waits made one test 40 minutes.
     # ("exiting": a daemon leaving on its own — a FAILED volume after dm-error
     # — whose claim stands by design until its pid is provably dead.)
     # A holder whose own mountpoint is no longer served is leaving too (a

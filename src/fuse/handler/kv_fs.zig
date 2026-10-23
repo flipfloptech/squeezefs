@@ -289,6 +289,9 @@ pub var fuse_fallocate_extends: counters.ShardedCounter = .{};
 pub var fuse_fallocate_promotions: counters.ShardedCounter = .{};
 pub var fuse_fallocate_shifts: counters.ShardedCounter = .{};
 pub var fuse_fallocate_shift_refusals: counters.ShardedCounter = .{};
+/// `fuse_write_sync_fsyncs`: WRITEs whose open flags carried O_DSYNC/O_SYNC
+/// and ran the fsync ladder before their ack (the sync law, `write`).
+pub var fuse_write_sync_fsyncs: counters.ShardedCounter = .{};
 /// `fuse_killpriv_clears`: KILLPRIV_V2 strips folded into a commit.
 pub var fuse_killpriv_clears: counters.ShardedCounter = .{};
 /// `fuse_killpriv_negotiated`: 0/1 from the INIT reply.
@@ -2570,9 +2573,10 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 // block flips, a hole is reserved, nothing past EOF needs a
                 // zero).
                 const first_b: u64 = if (zero) (a.offset + bs - 1) / bs else a.offset / bs;
-                const last_b: u64 = if (zero) (if (end / bs == 0) 0 else end / bs - 1) else (end - 1) / bs;
-                if (!zero or first_b <= last_b) {
-                    if (try self.fallocateReserve(c, local, end, @intCast(first_b), @intCast(last_b), zero)) changed = true;
+                // Exclusive: ZERO_RANGE's whole blocks lie INSIDE the range.
+                const end_b: u64 = if (zero) end / bs else (end - 1) / bs + 1;
+                if (first_b < end_b) {
+                    if (try self.fallocateReserve(c, local, end, @intCast(first_b), @intCast(end_b - 1), zero)) changed = true;
                 }
             }
             if (grows and end > size) {
@@ -3540,7 +3544,33 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         /// inline file; staged ≤ one block while the set stages (a
         /// non-striped file); else striped — promoting a resident payload
         /// to its own block DURABLY first.
+        /// THE SYNC LAW (charter §6.4; fstests generic/703): a WRITE whose
+        /// open flags carry `O_DSYNC` (or `O_SYNC`, which includes it) is
+        /// its own durability point. The kernel's DIRECT I/O path sends no
+        /// FUSE_FSYNC behind such a write — `fs/fuse/file.c`
+        /// `fuse_write_flags` ORs the dsync iocb's `O_DSYNC`/`O_SYNC` into
+        /// `fuse_write_in.flags` and leaves the sync to the daemon (the
+        /// buffered path's `generic_write_sync` is the one that sends an
+        /// FSYNC) — so the ack follows the fsync ladder: the bytes landed
+        /// and barriered, the metadata that makes them readable journaled
+        /// (`fsync`; `datasync` for `O_DSYNC`, the stamps too for `O_SYNC`).
+        /// Before this law an `O_DSYNC` io_uring writer's acked bytes sat in
+        /// RAM custody until the write-back timer, and a kill -9 lost them
+        /// (generic/703: `falloc 0 256M`, fio 64 KiB `direct=1 sync=1`
+        /// random writes, a power cut, the digest differed in every slot).
         pub fn write(self: *Self, c: *Ctx, a: filesystem.WriteArgs) Error!filesystem.Written {
+            const w = try self.writeArm(c, a);
+            if (a.flags & SYNC_FLAGS != 0 and w.size != 0 and !virtual_inodes.isVirtualIno(a.ino)) {
+                fuse_write_sync_fsyncs.inc();
+                try self.fsync(c, .{ .ino = a.ino, .fh = a.fh, .datasync = a.flags & O_SYNC_BIT == 0 });
+            }
+            return w;
+        }
+
+        const SYNC_FLAGS: u32 = @bitCast(linux.O{ .DSYNC = true, .SYNC = true });
+        const O_SYNC_BIT: u32 = @bitCast(linux.O{ .SYNC = true });
+
+        fn writeArm(self: *Self, c: *Ctx, a: filesystem.WriteArgs) Error!filesystem.Written {
             // A virtual inode is read-only: under no-open (decision 0003 §AF)
             // no OPEN refuses a write-intent open, so the mutation is
             // refused here — EACCES like every other virtual mutation.
@@ -5505,7 +5535,12 @@ fn HarnessOf(comptime Data: type) type {
         }
 
         fn write(self: *Self, ino: u64, offset: u64, data: []const u8, write_flags: u32) Loopback.Captured {
-            const in: abi.fuse_write_in = .{ .fh = 1, .offset = offset, .size = @intCast(data.len), .write_flags = write_flags, .lock_owner = 0, .flags = 0, .padding = 0 };
+            return self.writeFlags(ino, offset, data, write_flags, 0);
+        }
+
+        /// A WRITE under open flags (`fuse_write_in.flags`: O_DSYNC, O_SYNC …).
+        fn writeFlags(self: *Self, ino: u64, offset: u64, data: []const u8, write_flags: u32, flags: u32) Loopback.Captured {
+            const in: abi.fuse_write_in = .{ .fh = 1, .offset = offset, .size = @intCast(data.len), .write_flags = write_flags, .lock_owner = 0, .flags = flags, .padding = 0 };
             return self.call(.{ .write = .{ .in = in, .data = data } }, ino);
         }
 
@@ -7527,6 +7562,45 @@ fn awaitCoarseTickAfter(stamp: u64) void {
     while (!economy.laterThan(@bitCast(clock.realtimeCoarseNs()), stamp)) std.atomic.spinLoopHint();
 }
 
+test "the sync law (charter §6.4; fstests generic/703): a WRITE whose open flags carry O_DSYNC runs the fsync ladder before its ack — the ino's write custody lands (the plane's fsync), the parked stamp journals behind the store's barrier — as a datasync; O_SYNC as a full sync; a plain write leaves its custody to the timer; a zero-length sync write syncs nothing (red: the kernel's direct-IO path sends no FUSE_FSYNC behind a dsync write, and an acked O_DSYNC io_uring write sat in RAM until the write-back timer)" {
+    const H = HarnessOf(SettlingData);
+    var h: H = undefined;
+    try h.init();
+    defer h.deinit();
+    defer h.data.deinit();
+    h.data.store = &h.store;
+    const f = try h.create(1, "f", 0o644);
+    const local = try H.Fs.localOf(f);
+    const big: [8192]u8 = @splat('S');
+    // Striped (past the inline bound); the write-back custody armed.
+    try testing.expectEqual(@as(?linux.E, null), h.write(f, 0, &big, 0).errno());
+    h.data.custody_of = local;
+    const fsyncs0 = h.store.fsyncs;
+    const synced0 = fuse_write_sync_fsyncs.load();
+    // A plain write: the custody stays (the timer's).
+    try testing.expectEqual(@as(?linux.E, null), h.write(f, big.len, &big, 0).errno());
+    try testing.expectEqual(@as(?u64, local), h.data.custody_of);
+    try testing.expectEqual(synced0, fuse_write_sync_fsyncs.load());
+    // O_DSYNC: the plane's fsync landed the custody, the store barriered.
+    const dsync: u32 = @bitCast(linux.O{ .DSYNC = true });
+    try testing.expectEqual(@as(?linux.E, null), h.writeFlags(f, 2 * big.len, &big, 0, dsync).errno());
+    try testing.expectEqual(@as(?u64, null), h.data.custody_of);
+    try testing.expectEqual(synced0 + 1, fuse_write_sync_fsyncs.load());
+    try testing.expect(h.store.fsyncs > fsyncs0);
+    // O_SYNC (the kernel ORs both bits): the same ladder.
+    h.data.custody_of = local;
+    const osync: u32 = @bitCast(linux.O{ .DSYNC = true, .SYNC = true });
+    try testing.expectEqual(@as(?linux.E, null), h.writeFlags(f, 3 * big.len, &big, 0, osync).errno());
+    try testing.expectEqual(@as(?u64, null), h.data.custody_of);
+    try testing.expectEqual(synced0 + 2, fuse_write_sync_fsyncs.load());
+    // A zero-length sync write syncs nothing.
+    h.data.custody_of = local;
+    try testing.expectEqual(@as(?linux.E, null), h.writeFlags(f, 4 * big.len, &.{}, 0, dsync).errno());
+    try testing.expectEqual(@as(?u64, local), h.data.custody_of);
+    try testing.expectEqual(synced0 + 2, fuse_write_sync_fsyncs.load());
+    h.release(f);
+}
+
 test "fallocate (charter §6.6) — the mode law and the inline arms on a volume-less set: a zero length is EINVAL, an unknown bit, PUNCH without KEEP_SIZE and PUNCH with ZERO are EOPNOTSUPP, COLLAPSE with any other bit is EINVAL, a directory EISDIR; mode 0 inside the inline bound reserves nothing and extends the size with mtime/ctime, KEEP_SIZE there changes nothing (no stamp); past the bound EFBIG (the set's largest file); PUNCH zeroes the record's bytes and keeps the size; ZERO_RANGE past EOF extends" {
     var h: Harness = undefined;
     try h.init();
@@ -7671,6 +7745,19 @@ test "fallocate (charter §6.6) — the striped arms through the plane's face: a
     try testing.expectEqual(@as(?linux.E, null), h.fallocate(f, ZERO, 5 * bs, 2 * bs));
     try testing.expectEqual(SettlingData.Fallocated{ .ino = local, .first = 5, .last = 6, .zeroing = true }, h.data.reservations.items[4]);
     try testing.expectEqual(@as(u64, 7 * bs), (try h.getattr(f)).size);
+    // A ZERO_RANGE inside ONE block ([100, 300) of the written block 0, and
+    // [bs + 100, 2 bs) of block 1): an edge write each, NO whole block
+    // flipped — the block's other bytes are the file's.
+    const writes2 = h.data.writes.items.len;
+    const res2 = h.data.reservations.items.len;
+    h.data.setBound(local, 1, .written);
+    try testing.expectEqual(@as(?linux.E, null), h.fallocate(f, ZERO | KEEP, 100, 200));
+    try testing.expectEqual(@as(?linux.E, null), h.fallocate(f, ZERO | KEEP, bs + 100, bs - 100));
+    try testing.expectEqual(writes2 + 2, h.data.writes.items.len);
+    try testing.expectEqual(@as(u64, 200), h.data.writes.items[writes2].len);
+    try testing.expectEqual(@as(u64, bs - 100), h.data.writes.items[writes2 + 1].len);
+    try testing.expectEqual(res2, h.data.reservations.items.len);
+    try testing.expectEqual(SettlingData.Bound.written, h.data.boundAt(local, 1));
     // 5. COLLAPSE / INSERT: the block grain, the custody landed and
     //    barriered, the shift, the size.
     try testing.expectEqual(@as(?linux.E, .INVAL), h.fallocate(f, COLLAPSE, 100, bs));

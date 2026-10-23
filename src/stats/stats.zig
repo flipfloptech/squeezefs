@@ -86,6 +86,7 @@ const placement = @import("../exec/placement.zig");
 const cpu_class = @import("../exec/cpu_class.zig");
 const sqz_io = if (is_linux) @import("../exec/sqz_io.zig") else struct {};
 const tick = @import("../sync/tick.zig");
+const sync_mutex = @import("../sync/mutex.zig");
 const arc_swap = @import("../sync/arc_swap.zig");
 const lock_order = @import("../sync/lock_order.zig");
 const uring_fs = if (is_linux) @import("../io/uring_fs.zig") else struct {};
@@ -191,10 +192,29 @@ pub const Sources = struct {
     cpu: ?*cpu_class.Ledger = null,
     gpa: ?Allocator = null,
     io: ?Io = null,
+    /// ONE render at a time over these sources: a document build is a
+    /// cold op that MUTATES its own state — the CPU ledger's hash map
+    /// (`cpu_class.sample`), the renderer's size hint — and two LOOKUPs of
+    /// `.stats` on two handler lanes (the supervisor's probe beside
+    /// `squeezefs umount`'s poll, or any two readers) raced in it:
+    /// `std.HashMap.getOrPut` reached unreachable code and the daemon
+    /// died mid-teardown (fstests generic/410, 2026-10-23; the
+    /// `finishPass` class-170 panic of the 10-21 handoff is the same
+    /// race). Held only when an `Io` is bound (the daemon); the portable
+    /// rows render single-threaded.
+    render_lock: sync_mutex.Mutex = .init,
 
     pub fn keyCensusArmed(self: *const Sources) bool {
         const env = self.env orelse return false;
         return knobs.boolKnob("SQUEEZEFS_STATS_KEY_CENSUS", env);
+    }
+
+    fn lockRender(self: *Sources) void {
+        if (self.io) |io| self.render_lock.lockUncancelable(io);
+    }
+
+    fn unlockRender(self: *Sources) void {
+        if (self.io) |io| self.render_lock.unlock(io);
     }
 };
 
@@ -887,6 +907,8 @@ pub const Renderer = struct {
     /// The `.stats` document. One allocation when the hint holds
     /// (`stats_build_regrows` counts the renders it did not).
     pub fn render(self: *Renderer) Allocator.Error!Payload {
+        self.sources.lockRender();
+        defer self.sources.unlockRender();
         // The ledger pointer must follow the renderer (a moved Renderer).
         self.sources.cpu = &self.cpu;
         var out: Writer.Allocating = try .initCapacity(self.gpa, capacityHint(self.last_len));
@@ -900,6 +922,8 @@ pub const Renderer = struct {
 
     /// `.config`: the live twin of `status`' set summary.
     pub fn renderConfig(self: *Renderer, write_set: *const fn (*anyopaque, *Writer) Error!void, ctx: *anyopaque) Allocator.Error!Payload {
+        self.sources.lockRender();
+        defer self.sources.unlockRender();
         var out: Writer.Allocating = try .initCapacity(self.gpa, 4096);
         errdefer out.deinit();
         const w = &out.writer;
@@ -932,6 +956,8 @@ pub const Renderer = struct {
 /// The SIGUSR1 dump: one log line per family (`stats <name>: {…}`), the
 /// daemon line last. The same writers as the inode — there is ONE source.
 pub fn logFamilies(src: *Sources, gpa: Allocator) void {
+    src.lockRender();
+    defer src.unlockRender();
     var out: Writer.Allocating = .init(gpa);
     defer out.deinit();
     inline for (families) |f| {
@@ -1326,6 +1352,41 @@ test "renderConfig: build + mount + the set writer's object + the URIs, one newl
     try testing.expectEqual(@as(usize, 5), keys.items.len);
     try testing.expectEqualStrings("set", keys.items[2]);
     try testing.expect(std.mem.indexOf(u8, p.bytes(), "\"set\":{\"block_size\":4194304},\"sqmeta_uri\":\"sqmeta:///dev/m\",\"sqdata_uri\":\"sqdata:///dev/d\"}\n") != null);
+}
+
+test "render: concurrent renders of ONE renderer (eight threads, the CPU ledger walking /proc/self/task) serialize — every document parses, the ledger's classes never fall (the race corrupted the ledger's hash map and killed a daemon mid-teardown under fstests generic/410)" {
+    if (!is_linux) return testkit.skip(@src(), .other_step, "the CPU ledger walks /proc/self/task");
+    const Shared = struct {
+        r: *Renderer,
+        failed: std.atomic.Value(u32) = .init(0),
+        fn run(s: *@This()) void {
+            var i: usize = 0;
+            while (i < 40) : (i += 1) {
+                const p = s.r.render() catch {
+                    _ = s.failed.fetchAdd(1, .monotonic);
+                    return;
+                };
+                defer p.deinit(s.r.gpa);
+                var keys: std.ArrayList([]const u8) = .empty;
+                defer keys.deinit(s.r.gpa);
+                scanJson(s.r.gpa, p.bytes()[0 .. p.len - 1], &keys) catch {
+                    _ = s.failed.fetchAdd(1, .monotonic);
+                    return;
+                };
+            }
+        }
+    };
+    var r = Renderer.init(testing.allocator, .{ .gpa = testing.allocator, .io = testing.io });
+    defer r.deinit();
+    var s: Shared = .{ .r = &r };
+    var threads: [8]std.Thread = undefined;
+    for (&threads) |*t| t.* = try std.Thread.spawn(.{}, Shared.run, .{&s});
+    for (threads) |t| t.join();
+    try testing.expectEqual(@as(u32, 0), s.failed.load(.monotonic));
+    // The ledger is whole after the storm: a last single-threaded sample.
+    const p = try r.render();
+    defer p.deinit(testing.allocator);
+    try testing.expect(std.mem.indexOf(u8, p.bytes(), "\"daemon_cpu_ns_by_class\":{") != null);
 }
 
 test "the family table: every name once; familyByName resolves" {

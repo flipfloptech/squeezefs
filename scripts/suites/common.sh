@@ -230,13 +230,17 @@ suite_set_paths() {
   SUITE_META[$tag]="sqmeta://${SUITE_SETDIR[$tag]}/meta.img"
 }
 
-# `--single-writer` (SUITE_SINGLE_WRITER=1, the default): a suite is one
-# mount on one host; the symmetric join ladder is the N-daemon matrix's
-# business — except `suite_mount_pair`'s set (tarx.sh's A-B-B-A row: two
-# daemons of one set on this host), formatted in the default symmetric
-# posture. The write cache is every mount's (RAM; the production shape of
-# a client).
-SUITE_SINGLE_WRITER=${SUITE_SINGLE_WRITER:-1}
+# The format class: the SHIPPED default — symmetric (charter §5.7: the D0
+# winner is the manager, a later RW mount of the same set JOINS it), the
+# posture every suite judges (owner ruling 2026-10-23; until then the
+# suites formatted `--single-writer`, a 2026-10-10 harness choice under
+# which xfstests' `mount` group only ever confirmed the guard's BUSY
+# refusal of a second mount). `SUITE_SINGLE_WRITER=1` formats the
+# `--single-writer` class instead (one writer, no wire) for a run that
+# wants it. `suite_mount_pair`'s set (tarx.sh's A-B-B-A row) is symmetric
+# whatever the variable says. The write cache is every mount's (RAM; the
+# production shape of a client).
+SUITE_SINGLE_WRITER=${SUITE_SINGLE_WRITER:-0}
 
 suite_format() {
   local tag=$1; shift
@@ -292,8 +296,8 @@ suite_mount() {
 
 # ---- two daemons of one set on one host (tarx.sh's A-B-B-A row) ------------
 #
-# The set is formatted in the default SYMMETRIC posture (`--single-writer`
-# is the opt-out); the first daemon wins D0 and is the MANAGER, the second
+# The set is formatted in the SYMMETRIC posture whatever SUITE_SINGLE_WRITER
+# says; the first daemon wins D0 and is the MANAGER, the second
 # finds the manager's listener through the page and JOINS as appender 1
 # (charter §5.7; the smoke's TWO MOUNTS OF ONE SET ON ONE HOST row). Both
 # members live on this host, so the ONE listener binds loopback

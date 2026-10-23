@@ -55,8 +55,8 @@
 #
 # PHASE 2 — the parallel single-mount form (the owner's words: "parallel
 # tar"): N = nproc/4 concurrent extractions of the same tarball into N
-# fresh directories on ONE mount (the release posture, single writer), all
-# byte-exact, the mount healthy, fsck clean.
+# fresh directories on ONE mount (the release posture: a symmetric set's
+# solo manager), all byte-exact, the mount healthy, fsck clean.
 #
 # The multi-run discipline (SUITE_RUNS, default 3; the count aborts at the
 # first non-pass). FAIL EARLY (owner ruling 2026-10-17): the first failing

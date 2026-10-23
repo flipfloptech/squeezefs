@@ -62,7 +62,9 @@ SlotMoved) — answering EIO (the fail-stop lattice's deadline)` with the FUSE o
 Both sets fsck-clean; no tripwire. So under the SHIPPED default the five "by-design" rows
 cover a **product defect (F8)**: a rename through a joined mount, into a directory the manager
 holds, never resolves its slot move. The by-design rows stand only because the suites run the
-non-default class.
+non-default class. **Ruled (b) on 2026-10-23**: the suites default to the symmetric format and the
+five rows are gone — `rung-10-suites-symmetric-posture.md` (F8 `4c7cf3e`, F6 the persona, the verb,
+the 30 s wait, a `.stats` render race).
 
 ## 3. LTP — `docs/gates/ltp-exceptions.md` (5 rows), `ltp-venue-skip.txt` (2 rows), the control
 

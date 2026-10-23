@@ -192,9 +192,11 @@ final head waits on the rulings above.
    F3 (~1 day: advertise `FUSE_EXPORT_SUPPORT`, serve `LOOKUP(nodeid, ".")` for any inode, a durable
    parent for `..`). Recommendation: implement.
 2. generic/563's cgroup io charge: approve the proposed `by-design-fuse-io-charge` row (certain).
-3. The suites' format posture: `--single-writer` (today) or the shipped symmetric default (then
-   409/410/411/589/732 judge joins; F8 landed; 409–411/589 still mismatch on the harness's bind/move
-   unmount path — F6). Recommendation: symmetric.
+3. ~~The suites' format posture~~ **RULED 2026-10-23: the shipped symmetric default.**
+   `SUITE_SINGLE_WRITER=0` is every suite's default (`=1` keeps the `--single-writer` run possible);
+   409/410/411/589/732 judge joins and left the ledger; the umount persona's bind/move gap (F6), the
+   verb's bind behaviour, the 30 s residency wait behind a bind and a `.stats` render race that killed
+   a daemon mid-teardown are fixed — `rung-10-suites-symmetric-posture.md`.
 4. fallocate (F1): every mode EOPNOTSUPP; the porting spec says MUST; 31 xfstests `_notrun` + LTP
    `fallocate03`/`mremap06` behind it. In scope for the tag?
 5. Inode flags `FS_IOC_SETFLAGS` (F2; LTP `setxattr03`): in scope?
@@ -222,11 +224,12 @@ final head waits on the rulings above.
    backing files, stacked mounts); a raw `kill -TERM` with the mount attached is still an at-once
    BUSY for a racing mount; first-fit ring fragmentation (5 MB refused from ~77 % fill, no
    compaction); a2 systematically slower than a1 in tarx (SMO retries grow with the set).
-7. New since the audit: `exec/cpu_class.zig:101 finishPass` panic (a departed thread's ledger entry
-   with class 170 of 13) killed KILL ROWS (c)'s daemon once under load; the manager accepts
+7. New since the audit: ~~`exec/cpu_class.zig:101 finishPass` panic (a departed thread's ledger entry
+   with class 170 of 13) killed KILL ROWS (c)'s daemon once under load~~ (two `.stats` renders racing
+   in ONE ledger — fixed 2026-10-23, `Sources.render_lock`); the manager accepts
    `ReleaseSlot` from an appender whose region it recovered (sender fixed, serve-side screen owed);
-   a parked cross-directory rename holds the kernel's `s_vfs_rename_mutex`; the umount helper's
-   bind/move gap (F6); `fresh supply EXHAUSTED` info line per re-latch; `MetaBarrierFailed` per fsync
+   a parked cross-directory rename holds the kernel's `s_vfs_rename_mutex`; ~~the umount helper's
+   bind/move gap (F6)~~ (fixed 2026-10-23); `fresh supply EXHAUSTED` info line per re-latch; `MetaBarrierFailed` per fsync
    on a FAILED volume; a recovered-but-unnamed ring record judged only at a promotion point.
 8. Harness: the fail-early stop SIGKILLs kirk (no JSON report); subset runs end "ledger rc 3" on
    stale rows by design; local-venue daemons inherit the desktop's cgroup (the budget's

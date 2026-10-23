@@ -37,7 +37,7 @@
 //! (`fuse_change_attributes` reads only `FUSE_ATTR_SUBMOUNT`/`DAX` from
 //! the attr's flags), so the daemon enforces both itself in every mutating
 //! handler (`kv_fs`: the reference served a GDS ioctl only — decision 0002
-//! row 541).
+//! row 553).
 
 const std = @import("std");
 const linux = std.os.linux;

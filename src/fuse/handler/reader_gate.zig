@@ -51,7 +51,7 @@ pub const ReaderGate = struct {
     gate: Gate,
 
     pub fn filesystem(self: *ReaderGate) Filesystem {
-        return .{ .impl = self, .vtable = &vt };
+        return .{ .impl = self, .vtable = &vt, .export_support = self.inner.export_support };
     }
 
     const vt: VTable = build();

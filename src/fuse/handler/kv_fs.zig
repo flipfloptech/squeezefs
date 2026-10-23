@@ -101,6 +101,7 @@ const op_guard = @import("op_guard.zig");
 const op_trace = @import("op_trace.zig");
 const errors = @import("../../core/errors.zig");
 const counters = @import("../../core/counters.zig");
+const checksum = @import("../../core/checksum.zig");
 const clock = @import("../../core/clock.zig");
 const log = @import("../../core/log.zig");
 const key = @import("../../meta/key.zig");
@@ -456,6 +457,14 @@ const ChainBuf = struct {
     }
 };
 
+/// The set's entry generation (`KvFs.entry_generation`): the set uuid
+/// hashed under the format key and folded to the kernel's u32, never 0.
+pub fn entryGenerationOf(set_uuid: [16]u8) u32 {
+    const h = checksum.hash64(&set_uuid);
+    const folded: u32 = @truncate(h ^ (h >> 32));
+    return if (folded == 0) 1 else folded;
+}
+
 /// The layout record as stored: the decoded layout borrows `value`.
 pub const LayoutRec = struct {
     value: []u8,
@@ -499,6 +508,14 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         pub const Found = FoundT;
         /// The striping module over this filesystem (`kv_fs_stripes.zig`).
         pub const Stripes = kv_fs_stripes.Stripes(Self);
+        /// `FUSE_EXPORT_SUPPORT` (charter §4): the INIT reply advertises it
+        /// because this filesystem answers what the kernel's export
+        /// operations ask — `LOOKUP(nodeid, ".")` for any inode kind (the
+        /// handle decode, `fuse_get_dentry`) and `LOOKUP(dir, "..")` from
+        /// the directory's DURABLE parent (`fuse_get_parent`, the reconnect
+        /// walk to the root) — with the generation law `entry_generation`
+        /// states. `filesystem.Filesystem.of` reads the declaration.
+        pub const export_support = true;
 
         gpa: Allocator,
         io: Io,
@@ -545,6 +562,20 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         /// The `..` memo (module doc).
         parents_lock: jc.SpinLock = .{},
         parents: std.AutoHashMapUnmanaged(u64, u64) = .empty,
+        /// The entry generation (charter §4 `FUSE_EXPORT_SUPPORT`): the
+        /// kernel packs `(nodeid, i_generation)` into every file handle and
+        /// a decode after the inode left its cache compares the generation
+        /// `LOOKUP(nodeid, ".")` answers with the handle's (`fuse_get_dentry`:
+        /// unequal ⇒ ESTALE; `fuse_iget`: a cached inode re-looked-up under
+        /// another generation goes bad). So ONE value per ino for the set's
+        /// life — and inos are never reused (charter §5.3, §5.5: cursors are
+        /// floors), so one value per SET: the set uuid folded to the
+        /// kernel's u32 `i_generation` (a handle minted on a PREVIOUS format
+        /// of the same device answers ESTALE, never another file at the
+        /// same ino), never 0 (`exportfs` tooling reads 0 as "none"); the
+        /// root's is 0 (`fuse_lookup_name` forces it and warns once on any
+        /// other). A store without an identity (the tests' MemStore): 1.
+        entry_generation: u32,
         /// The reclaim gather.
         reclaim_lock: jc.SpinLock = .{},
         reclaim: std.ArrayList(u64) = .empty,
@@ -616,6 +647,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 .uid = opts.uid,
                 .gid = opts.gid,
                 .virtuals = virtual_inodes.Registry.init(gpa),
+                .entry_generation = if (@hasDecl(Store, "setUuid")) entryGenerationOf(store.setUuid()) else 1,
             };
             errdefer self.pending.deinit();
             self.locks = try dlm.Manager.init(gpa, opts.dlm_stripes);
@@ -1082,7 +1114,13 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         }
 
         fn entryOf(self: *Self, global: u64, v: InodeValue) filesystem.Entry {
-            return .{ .nodeid = global, .entry_ttl_ns = self.ttlsNow().entryTtlFor(economy.isDirMode(v.mode)), .attr_ttl_ns = self.attrTtlFor(v), .attr = self.attrOf(global, v) };
+            return .{ .nodeid = global, .generation = self.generationOf(global), .entry_ttl_ns = self.ttlsNow().entryTtlFor(economy.isDirMode(v.mode)), .attr_ttl_ns = self.attrTtlFor(v), .attr = self.attrOf(global, v) };
+        }
+
+        /// The generation every entry reply of `global` carries
+        /// (`entry_generation`'s law): the set's, the root's 0.
+        fn generationOf(self: *const Self, global: u64) u64 {
+            return if (global == inos.ROOT_INO) 0 else self.entry_generation;
         }
 
         fn attrReply(self: *Self, global: u64, v: InodeValue) filesystem.Attr {
@@ -1632,15 +1670,8 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             if (a.parent == inos.ROOT_INO) if (virtual_inodes.classOfName(a.name)) |class| {
                 if (self.virtual != null) return self.lookupVirtual(c, class);
             };
-            if (std.mem.eql(u8, a.name, ".")) {
-                const v = try self.readDir(try localOf(a.parent));
-                return self.entryOf(a.parent, v);
-            }
-            if (std.mem.eql(u8, a.name, "..")) {
-                const p = self.parentOf(a.parent) orelse return error.FileNotFound;
-                const v = try self.readDir(try localOf(p));
-                return self.entryOf(p, v);
-            }
+            if (std.mem.eql(u8, a.name, ".")) return self.lookupSelf(c, a.parent);
+            if (std.mem.eql(u8, a.name, "..")) return self.lookupParent(c, a.parent);
             c.stage(.meta_backend_start);
             const found = (try self.findChild(a.parent, a.name)) orelse {
                 c.stage(.meta_backend_done);
@@ -1656,6 +1687,105 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             c.stage(.meta_backend_done);
             if (economy.isDirMode(v.mode)) self.rememberParent(found.global, a.parent);
             return self.entryOf(found.global, v);
+        }
+
+        /// `LOOKUP(nodeid, ".")` — the kernel's handle decode
+        /// (`fuse_get_dentry`, charter §4 `FUSE_EXPORT_SUPPORT`): the inode
+        /// by nodeid alone, of ANY kind (a file's handle is decoded the same
+        /// way; the connected `.` never reaches the daemon — the VFS answers
+        /// it from its dcache). A corpse at nlink 0 (unlinked, its destroy
+        /// pending) answers ENOENT — the kernel's ESTALE: a handle dies with
+        /// its last name, never reopens a file nobody can name. A striped
+        /// directory answers its fold. A virtual generation ino answers its
+        /// frozen attrs (retired ⇒ ESTALE, as its GETATTR).
+        fn lookupSelf(self: *Self, c: *Ctx, ino: u64) Error!filesystem.Entry {
+            if (virtual_inodes.isVirtualIno(ino)) {
+                const size = self.virtuals.size(ino) orelse return error.StaleHandle;
+                return .{ .nodeid = ino, .generation = self.generationOf(ino), .entry_ttl_ns = 0, .attr_ttl_ns = 0, .attr = self.virtualAttr(ino, size) };
+            }
+            c.stage(.meta_backend_start);
+            defer c.stage(.meta_backend_done);
+            var v = try self.readInode(try localOf(ino));
+            if (v.nlink == 0) return error.FileNotFound;
+            if (economy.isDirMode(v.mode)) v = try self.foldIfStriped(ino, v);
+            return self.entryOf(ino, v);
+        }
+
+        /// `LOOKUP(dir, "..")` — the kernel's reconnect of an evicted
+        /// directory (`fuse_get_parent`, walked up to the root by
+        /// `reconnect_path`): the root's `..` is itself; any other
+        /// directory's is its DURABLE parent record (`economy.PARENT_XATTR`,
+        /// the logical parent: a striped directory, never its stripe —
+        /// `..` of a child named in a stripe is the hot directory), read
+        /// through the token divert for a foreign directory; the RAM memo
+        /// is consulted only for a directory created before the record
+        /// existed (an older volume: unknown until its next rename). A
+        /// non-directory has no `..` (ENOTDIR: the kernel asks it of
+        /// directories alone); a corpse (rmdir'd, its destroy pending) and
+        /// a parent that is gone answer ENOENT — the kernel's ESTALE.
+        fn lookupParent(self: *Self, c: *Ctx, dir: u64) Error!filesystem.Entry {
+            if (dir == inos.ROOT_INO) return self.entryOf(dir, try self.readDir(try localOf(dir)));
+            if (virtual_inodes.isVirtualIno(dir)) return error.NotDir;
+            c.stage(.meta_backend_start);
+            defer c.stage(.meta_backend_done);
+            const local = try localOf(dir);
+            const dv = try self.readInode(local);
+            if (!economy.isDirMode(dv.mode)) return error.NotDir;
+            if (dv.nlink == 0) return error.FileNotFound;
+            const p = (try self.memoDurableParent(dir)) orelse self.parentOf(dir) orelse return error.FileNotFound;
+            var pv = try self.readDir(try localOf(p));
+            if (pv.nlink == 0) return error.FileNotFound;
+            pv = try self.foldIfStriped(p, pv);
+            return self.entryOf(p, pv);
+        }
+
+        /// The directory's durable parent record, null when it carries none.
+        fn durableParentOf(self: *Self, dir_local: u64) Error!?u64 {
+            const v = (try self.xattrValue(dir_local, economy.PARENT_XATTR)) orelse return null;
+            defer self.gpa.free(v);
+            return economy.decodeParent(v) orelse error.InputOutput;
+        }
+
+        /// `durableParentOf`, remembered in the memo (the handover's subtree
+        /// credit and the ancestry walk read the memo alone).
+        fn memoDurableParent(self: *Self, dir: u64) Error!?u64 {
+            const p = (try self.durableParentOf(try localOf(dir))) orelse return null;
+            self.rememberParent(dir, p);
+            return p;
+        }
+
+        /// Stage the directory's durable parent record into `t` (mkdir's
+        /// own transaction; a rename's, for a directory whose logical
+        /// parent changes). A `fresh` mint's chain is empty (slot 0, no
+        /// probe); otherwise the record's existing key or the chain's
+        /// first free slot.
+        fn stageParentRecord(self: *Self, t: *tx.KvTx, dir_local: u64, parent_global: u64, comptime fresh: bool) Error!void {
+            const value = economy.encodeParent(parent_global);
+            if (fresh) return self.stageXattrPut(t, &key.xattrKey(dir_local, key.xattrNameHash56(economy.PARENT_XATTR, self.store.nameKey()), 0), economy.PARENT_XATTR, &value);
+            const k = try self.xattrKeyFor(dir_local, economy.PARENT_XATTR);
+            if (k.existing) |e| self.gpa.free(e);
+            try self.stageXattrPut(t, &k.k, economy.PARENT_XATTR, &value);
+        }
+
+        /// Set a directory's durable parent OUTSIDE the op's own transaction
+        /// (the cross-owner paths): a local-slot directory in a transaction
+        /// of its own under its exclusive guard, a foreign-slot one as ONE
+        /// shipped record verb to its holder (idempotent: a re-issue puts
+        /// the same value). A failure leaves the record at the old parent:
+        /// the reconnect then finds no name for the directory there and
+        /// the kernel treats the handle as detached — never a wrong path.
+        fn setDurableParent(self: *Self, c: *Ctx, dir_global: u64, parent_global: u64) Error!void {
+            if (self.foreignSlot(dir_global)) {
+                _ = try self.shipRecord(dir_global, .{ .setxattr = .{ .name = economy.PARENT_XATTR, .value = &economy.encodeParent(parent_global) } });
+                return;
+            }
+            const local = try localOf(dir_global);
+            const t = try self.beginExclusive(local, @src());
+            var t_owned = true;
+            errdefer if (t_owned) self.store.abandon(t);
+            try self.stageParentRecord(t, local, parent_global, false);
+            t_owned = false;
+            try self.commit(c, t);
         }
 
         /// `(parent, name)` → the dentry, through the striped prelude: a
@@ -2256,6 +2386,9 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                     error.OutOfMemory => error.OutOfMemory,
                 };
             if (out.parent == .parked_times) try self.parkParentTimes(parent, stamp);
+            // A directory's durable parent rides its own create (one record
+            // under the fresh ino's keys: the same leaf as its inode).
+            if (is_dir) try self.stageParentRecord(t, local, logical_parent, true);
             t_owned = false;
             self.commit(c, t) catch |e| {
                 if (self.redispatches(e)) return self.xvCreate(c, parent_global, logical_parent, name, child, local, global);
@@ -2294,6 +2427,19 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 var t_owned = true;
                 errdefer if (t_owned) self.store.abandon(t);
                 try self.stageXattrPut(t, &key.xattrKey(local, key.xattrNameHash56(economy.SYMLINK_XATTR, self.store.nameKey()), 0), economy.SYMLINK_XATTR, target);
+                t.token_quiet = true;
+                t_owned = false;
+                try self.commit(c, t);
+            }
+            // A directory's durable parent the same way: its own entry on
+            // the child's slot BEFORE the intent (a crash between leaves a
+            // record no inode owns — fsck's orphan-xattr class — never a
+            // directory without its `..`).
+            if (economy.isDirMode(mode)) {
+                const t = try self.store.begin(@src());
+                var t_owned = true;
+                errdefer if (t_owned) self.store.abandon(t);
+                try self.stageParentRecord(t, local, logical_parent, true);
                 t.token_quiet = true;
                 t_owned = false;
                 try self.commit(c, t);
@@ -2513,6 +2659,12 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 error.DentryChainOverflow => error.NoSpaceLeft,
                 error.OutOfMemory => error.OutOfMemory,
             };
+            // A directory's durable parent moves in the rename's own entry
+            // (both inodes are held exclusive); an exchange moves both.
+            if (logical.old != logical.new) {
+                if (old.isDir()) try self.stageParentRecord(t, old.local, logical.new, false);
+                if (flags.exchange) if (new) |n| if (n.isDir()) try self.stageParentRecord(t, n.local, logical.old, false);
+            }
             t_owned = false;
             self.commit(c, t) catch |e| {
                 if (self.redispatches(e)) return self.xvRename(c, a, logical, flags, whiteout, old, new);
@@ -2561,6 +2713,10 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 _ = try self.runPlan(c, &plan);
                 if (old0.isDir()) self.rememberParent(old0.global, logical.new);
                 if (n.isDir()) self.rememberParent(n.global, logical.old);
+                if (logical.old != logical.new) {
+                    if (old0.isDir()) self.moveDurableParent(c, old0.global, logical.new);
+                    if (n.isDir()) self.moveDurableParent(c, n.global, logical.old);
+                }
                 return;
             }
             var dest: ?struct { ino: u64, value: InodeValue } = null;
@@ -2575,19 +2731,36 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             _ = try self.runPlan(c, &plan);
             if (old0.isDir()) self.rememberParent(old0.global, logical.new);
             if (new0) |n| if (n.isDir()) self.forgetParent(n.global);
+            if (old0.isDir() and logical.old != logical.new) self.moveDurableParent(c, old0.global, logical.new);
         }
 
-        /// A rename whose intent its re-issue completed: the `..` memo as
-        /// `xvRename` leaves it, off the subjects its first attempt named
-        /// (the moved inode; a replaced or exchanged destination).
+        /// The cross-owner rename's durable-parent move: AFTER the intent
+        /// landed (the move is the rename's truth; this record is the
+        /// reconnect path's), so a refusal here never un-renames — it is
+        /// logged, and the directory's `..` stays at the old parent until
+        /// its next rename (`setDurableParent`'s failure law).
+        fn moveDurableParent(self: *Self, c: *Ctx, dir_global: u64, parent_global: u64) void {
+            self.setDurableParent(c, dir_global, parent_global) catch |e| log.warn("kv_fs: directory {d}'s durable parent record could not follow its rename to {d}: {t} (its handle reconnect answers ESTALE until its next rename)", .{ dir_global, parent_global, e });
+        }
+
+        /// A rename whose intent its re-issue completed: the `..` memo (and
+        /// a directory's durable parent — idempotent) as `xvRename` leaves
+        /// them, off the subjects its first attempt named (the moved inode;
+        /// a replaced or exchanged destination).
         fn ownRename(self: *Self, c: *Ctx, a0: filesystem.RenameArgs) Error!void {
             const m = c.move.?;
             const moved = m.subject orelse return error.InputOutput;
             const exchange = a0.flags & RENAME_EXCHANGE != 0;
-            if (try self.readInodeOpt(try localOf(moved))) |v| if (economy.isDirMode(v.mode)) self.rememberParent(moved, a0.newparent);
+            if (try self.readInodeOpt(try localOf(moved))) |v| if (economy.isDirMode(v.mode)) {
+                self.rememberParent(moved, a0.newparent);
+                if (a0.parent != a0.newparent) self.moveDurableParent(c, moved, a0.newparent);
+            };
             const dest = m.subject2 orelse return;
             if (!exchange) return self.forgetParent(dest);
-            if (try self.readInodeOpt(try localOf(dest))) |v| if (economy.isDirMode(v.mode)) self.rememberParent(dest, a0.parent);
+            if (try self.readInodeOpt(try localOf(dest))) |v| if (economy.isDirMode(v.mode)) {
+                self.rememberParent(dest, a0.parent);
+                if (a0.parent != a0.newparent) self.moveDurableParent(c, dest, a0.parent);
+            };
         }
 
         /// The ancestry walk's seams over this filesystem: the `..` memo
@@ -3804,12 +3977,15 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             var plain = codec.DirentWriter.init(c.window, a.size);
             var rich = codec.DirentPlusWriter.init(c.window, a.size);
             // `.` and `..`: nodeid 0 in the plus form (the kernel skips their
-            // dentry linkage); the `..` ino is the memo's, else the dir's own.
+            // dentry linkage); the `..` ino is the memo's, else the durable
+            // parent's (a directory listed before any lookup of it: the
+            // mount root after a remount, a reconnected handle), else the
+            // dir's own (an older volume's directory, or a corpse).
             if (pos == .start) {
                 if (!(try self.emit(&plain, &rich, plus, a.ino, key.READDIR_OFFSET_DOT, dv, ".", true))) return .{ .len = self.written(&plain, &rich, plus) };
             }
             if (pos == .start or pos == .after_dot) {
-                const p = self.parentOf(a.ino) orelse a.ino;
+                const p = self.parentOf(a.ino) orelse try self.memoDurableParent(a.ino) orelse a.ino;
                 const pv = (try self.readInodeOpt(try localOf(p))) orelse dv;
                 if (!(try self.emit(&plain, &rich, plus, p, key.READDIR_OFFSET_DOTDOT, pv, "..", true))) return .{ .len = self.written(&plain, &rich, plus) };
             }
@@ -6158,11 +6334,12 @@ test "§AV the parent-stamp park (mdtest -np 32 creates at 41 k/s: the parent's 
     const looked = try h.entry(h.lookup(1, "d"));
     try testing.expectEqual(served_mtime_ns, looked.attr.mtime * std.time.ns_per_s + looked.attr.mtimensec);
     // A directory child: the exclusive Put carries the folded stamp and
-    // the nlink shift — journaled, never parked.
+    // the nlink shift — journaled, never parked; the fourth record is the
+    // child's durable parent (`economy.PARENT_XATTR`).
     awaitCoarseTickAfter(served_mtime_ns);
     const sub = try h.mkdir(dir, "sub");
     try testing.expectEqual(commits0 + 65, h.store.commits);
-    try testing.expectEqual(records0 + 131, h.store.records_committed);
+    try testing.expectEqual(records0 + 132, h.store.records_committed);
     try testing.expectEqual(parked0 + 64, fuse_parent_times_parked.load());
     const after_mkdir = (try h.fs.readInodeStored(dl)).?;
     try testing.expectEqual(@as(u32, 3), after_mkdir.nlink);
@@ -6174,7 +6351,7 @@ test "§AV the parent-stamp park (mdtest -np 32 creates at 41 k/s: the parent's 
         try testing.expectEqual(@as(?linux.E, null), h.call(.{ .unlink = .{ .name = try std.fmt.bufPrint(&name_buf, "f{d}", .{i}) } }, dir).errno());
     }
     try testing.expectEqual(commits0 + 129, h.store.commits);
-    try testing.expectEqual(records0 + 259, h.store.records_committed);
+    try testing.expectEqual(records0 + 260, h.store.records_committed);
     try testing.expectEqual(parked0 + 128, fuse_parent_times_parked.load());
     try testing.expectEqual(after_mkdir.mtime, (try h.fs.readInodeStored(dl)).?.mtime);
     const served2 = try h.getattr(dir);
@@ -6183,24 +6360,24 @@ test "§AV the parent-stamp park (mdtest -np 32 creates at 41 k/s: the parent's 
     // carries the served stamp and nothing stays parked.
     try testing.expectEqual(@as(?linux.E, null), h.call(.{ .fsyncdir = .{ .fh = 1, .datasync = false } }, dir).errno());
     try testing.expectEqual(commits0 + 130, h.store.commits);
-    try testing.expectEqual(records0 + 260, h.store.records_committed);
+    try testing.expectEqual(records0 + 261, h.store.records_committed);
     try testing.expectEqual(@as(u64, 0), h.fs.pending.len());
     try testing.expectEqual(served2.mtime * std.time.ns_per_s + served2.mtimensec, (try h.fs.readInodeStored(dl)).?.mtime);
     // rmdir of the empty sub: the exclusive arm (nlink back to 2), 3 records.
     try testing.expectEqual(@as(?linux.E, null), h.call(.{ .rmdir = .{ .name = "sub" } }, dir).errno());
-    try testing.expectEqual(records0 + 263, h.store.records_committed);
+    try testing.expectEqual(records0 + 264, h.store.records_committed);
     try testing.expectEqual(@as(u32, 2), (try h.fs.readInodeStored(dl)).?.nlink);
     _ = sub;
     // Strict mode: the Δ rides the entry (3 records), nothing parks.
     h.fs.times_park = false;
     defer h.fs.times_park = true;
     const strict = try h.create(dir, "strict", 0o644);
-    try testing.expectEqual(records0 + 266, h.store.records_committed);
+    try testing.expectEqual(records0 + 267, h.store.records_committed);
     try testing.expectEqual(parked0 + 128, fuse_parent_times_parked.load());
     try testing.expectEqual(@as(u64, 0), h.fs.pending.len());
     h.release(strict);
     try testing.expectEqual(@as(?linux.E, null), h.call(.{ .unlink = .{ .name = "strict" } }, dir).errno());
-    try testing.expectEqual(records0 + 269, h.store.records_committed);
+    try testing.expectEqual(records0 + 270, h.store.records_committed);
 }
 
 /// One op on its own thread against a harness's filesystem (the rangelock

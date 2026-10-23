@@ -1315,7 +1315,7 @@ pub const Session = struct {
 
         // 4. The reply word; the filesystem's init hook sees the negotiation.
         const asked_timeout_s = geometry.resolveRequestTimeoutS(geometry.requestTimeoutOverride(env), cfg.request_timeout_s);
-        const wants: codec.InitWants = .{ .writeback_cache = cfg.opts.write_back and !cfg.opts.read_only, .request_timeout_s = asked_timeout_s, .atomic_o_trunc = !self.no_open };
+        const wants: codec.InitWants = .{ .writeback_cache = cfg.opts.write_back and !cfg.opts.read_only, .request_timeout_s = asked_timeout_s, .atomic_o_trunc = !self.no_open, .export_support = fs.export_support };
         self.init_reply = codec.buildInitReply(init_in, self.plan, wants) catch {
             log.err("transport: unsupported FUSE protocol {d}.{d} (need 7.{d}+)", .{ init_in.major, init_in.minor, codec.MIN_SUPPORTED_MINOR });
             self.sideband.replyInline(codec.replyError(self.init_unique, .INVAL));

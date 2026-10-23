@@ -98,7 +98,7 @@ pub const ring = struct {
         }
 
         pub fn filesystem(self: *Binding) fsv.Filesystem {
-            return .{ .ctx = self, .vtable = &vtable };
+            return .{ .ctx = self, .vtable = &vtable, .export_support = self.d.fs.export_support };
         }
 
         const vtable: fsv.Filesystem.VTable = .{

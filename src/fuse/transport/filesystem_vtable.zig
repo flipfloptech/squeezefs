@@ -216,6 +216,10 @@ pub const ProbeReply = union(enum) {
 pub const Filesystem = struct {
     ctx: *anyopaque,
     vtable: *const VTable,
+    /// The handler layer serves the kernel's export operations
+    /// (`handler.filesystem.Filesystem.export_support`): INIT advertises
+    /// `FUSE_EXPORT_SUPPORT` iff set (charter §4).
+    export_support: bool = false,
 
     pub const VTable = struct {
         /// After INIT negotiated, before the session is ready.

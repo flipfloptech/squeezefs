@@ -113,6 +113,30 @@ pub const SYMLINK_TARGET_MAX: usize = 4095;
 /// bodies out of the data plane).
 pub const SYMLINK_XATTR: []const u8 = "system.symlink";
 
+/// The xattr that carries a DIRECTORY's durable parent (charter §4
+/// `FUSE_EXPORT_SUPPORT`: the kernel reconnects an evicted directory's
+/// handle with `LOOKUP(dir, "..")`, after a cache drop or a remount, when
+/// no RAM memo holds the answer). The value is the LOGICAL parent's global
+/// ino (a striped directory, never its stripe), u64 LE; written by mkdir
+/// in the create's own transaction and moved by every rename that changes
+/// the directory's parent. Only directories carry it: a file has as many
+/// parents as names, and the kernel asks `..` of directories alone.
+/// Reserved by the allowlist (`kv_fs.xattrNameAllowed`): never listed,
+/// read, set or removed through FUSE.
+pub const PARENT_XATTR: []const u8 = "system.squeezefs.parent";
+
+pub fn encodeParent(parent: u64) [8]u8 {
+    var b: [8]u8 = undefined;
+    std.mem.writeInt(u64, &b, parent, .little);
+    return b;
+}
+
+/// Exactly the encoder's form decodes.
+pub fn decodeParent(bytes: []const u8) ?u64 {
+    if (bytes.len != 8) return null;
+    return std.mem.readInt(u64, bytes[0..8], .little);
+}
+
 /// The u8 `name_len` dentry envelope: one encoded dentry value fits here.
 const DENTRY_VALUE_MAX: usize = @sizeOf(record.DentryValueHeader) + record.NAME_MAX;
 
@@ -1174,8 +1198,26 @@ pub fn stageSetattr(t: *tx.KvTx, pending: *PendingTimes, ino: u64, stored: Inode
 const testing = std.testing;
 const inos = @import("inos.zig");
 const journal = @import("journal.zig");
+const fuzzkit = @import("../core/fuzzkit.zig");
 
 const seed: key.NameKey = .init(0xC0FFEE);
+
+fn parentRecordFuzz(_: void, smith: *std.testing.Smith) !void {
+    var buf: [32]u8 = undefined;
+    const len = smith.slice(&buf);
+    const bytes = buf[0..len];
+    // Exactly 8 bytes decode, and whatever decodes re-encodes to its input.
+    if (decodeParent(bytes)) |p| {
+        try testing.expectEqual(@as(usize, 8), len);
+        try testing.expectEqualSlices(u8, bytes, &encodeParent(p));
+    } else try testing.expect(len != 8);
+}
+
+test "fuzz: the directory parent record's decoder is total on arbitrary bytes; exactly the encoder's 8 bytes decode and round-trip" {
+    try fuzzkit.fuzz({}, parentRecordFuzz, .{});
+    try testing.expectEqual(@as(?u64, 0x0102030405060708), decodeParent(&encodeParent(0x0102030405060708)));
+    try testing.expectEqual(@as(?u64, null), decodeParent(&.{ 1, 2, 3 }));
+}
 const t_now: u64 = 1_700_000_000_000_000_000;
 
 fn dirValue(nlink: u32) InodeValue {

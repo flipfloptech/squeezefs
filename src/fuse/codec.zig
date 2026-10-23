@@ -858,7 +858,10 @@ pub const DirentPlusWriter = struct {
 /// What the filesystem asks of the negotiation; everything else is echoed
 /// iff the kernel offered it, or never.
 pub const InitWants = struct {
-    /// Honest only with a REAL generation (derived from the volume-set identity).
+    /// `FUSE_EXPORT_SUPPORT` (charter §4): the filesystem declared it serves
+    /// the export operations (`LOOKUP(nodeid, ".")` for any kind,
+    /// `LOOKUP(dir, "..")` from a durable parent) with a REAL generation
+    /// (the set's, `kv_fs.entry_generation`). Honest only then.
     export_support: bool = false,
     dont_mask: bool = false,
     writeback_cache: bool = false,

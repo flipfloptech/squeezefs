@@ -56,7 +56,7 @@ pub const MoveGate = struct {
     deadline_ns: u64,
 
     pub fn filesystem(self: *MoveGate) Filesystem {
-        return .{ .impl = self, .vtable = &vt };
+        return .{ .impl = self, .vtable = &vt, .export_support = self.inner.export_support };
     }
 
     const vt: VTable = build();

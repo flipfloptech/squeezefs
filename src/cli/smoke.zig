@@ -13013,6 +13013,14 @@ fn inoOfPath(path: [:0]const u8) !u64 {
     return st.ino;
 }
 
+/// The symlink's OWN ino (`name_to_handle_at` without AT_SYMLINK_FOLLOW
+/// names the link, not its target).
+fn inoOfLink(path: [:0]const u8) !u64 {
+    var st: linux.Statx = undefined;
+    if (linux.errno(linux.statx(linux.AT.FDCWD, path.ptr, linux.AT.SYMLINK_NOFOLLOW, .{ .INO = true }, &st)) != .SUCCESS) return error.StatxFailed;
+    return st.ino;
+}
+
 /// The fd's path as the kernel connected it (`/proc/self/fd/N`).
 fn pathOfFd(fd: linux.fd_t, buf: *[linux.PATH_MAX]u8) ![]const u8 {
     var pb: [64:0]u8 = undefined;
@@ -13049,7 +13057,7 @@ test "smoke: FILE HANDLES SURVIVE A CACHE DROP AND A REMOUNT (FUSE_EXPORT_SUPPOR
 
     // The tree: d/{f, h (a hard link of f), l → f, sub/{g}}; the bytes.
     {
-        const out = try rig.onMount("mkdir -p d/sub && printf 'aaaa-file' > d/f && ln d/f d/h && ln -s f d/l && printf 'bbbb-nested' > d/sub/g && sync");
+        const out = try rig.onMount("mkdir -p d/sub && printf 'aaaa-file' > d/f && ln d/f d/h && ln -s f d/l && printf 'bbbb-nested' > d/sub/g");
         gpa.free(out);
     }
     var pb: [6][192:0]u8 = undefined;
@@ -13069,6 +13077,8 @@ test "smoke: FILE HANDLES SURVIVE A CACHE DROP AND A REMOUNT (FUSE_EXPORT_SUPPOR
     try testing.expectEqual(ino_f, try inoOfPath(p_h));
     const ino_sub = try inoOfPath(p_sub);
     const ino_g = try inoOfPath(p_g);
+    const ino_l = try inoOfLink(p_l);
+    try testing.expect(ino_l != ino_f);
     // The mount fd for every decode (O_PATH would do; a directory fd is one).
     const mount_fd: linux.fd_t = @intCast(linux.open(rig.mp.ptr, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true }, 0));
     var mount_fd_open = true;
@@ -13092,6 +13102,14 @@ test "smoke: FILE HANDLES SURVIVE A CACHE DROP AND A REMOUNT (FUSE_EXPORT_SUPPOR
                 if (!std.mem.eql(u8, want, got)) std.debug.print("\n{s}: connected path {s}, want {s}\n", .{ what, got, want });
                 try testing.expectEqualStrings(want, got);
             }
+        }
+
+        /// A symlink's handle opens as an O_PATH fd (any other open of a
+        /// symlink is the VFS's ELOOP); its ino is the link's own.
+        fn opensLink(mfd: linux.fd_t, h: *const FileHandle, ino: u64, what: []const u8) !void {
+            const fd = try openedByHandle(mfd, h, .{ .ACCMODE = .RDONLY, .PATH = true, .NOFOLLOW = true }, what);
+            defer _ = linux.close(fd);
+            try testing.expectEqual(ino, try inoOfFd(fd));
         }
 
         fn stale(mfd: linux.fd_t, h: *const FileHandle, what: []const u8) !void {
@@ -13118,7 +13136,7 @@ test "smoke: FILE HANDLES SURVIVE A CACHE DROP AND A REMOUNT (FUSE_EXPORT_SUPPOR
     try dropInodeCaches(io);
     try Expect.opens(mount_fd, &h_f, ino_f, "aaaa-file", null, "f after drop");
     try Expect.opens(mount_fd, &h_g, ino_g, "bbbb-nested", null, "sub/g after drop");
-    try Expect.opens(mount_fd, &h_l, (try inoOfPath(p_l)), null, null, "l (the symlink itself) after drop");
+    try Expect.opensLink(mount_fd, &h_l, ino_l, "l (the symlink itself) after drop");
     try Expect.opens(mount_fd, &h_d, ino_d, null, p_d, "d after drop");
     try Expect.opens(mount_fd, &h_sub, ino_sub, null, p_sub, "sub after drop");
     {
@@ -13131,7 +13149,7 @@ test "smoke: FILE HANDLES SURVIVE A CACHE DROP AND A REMOUNT (FUSE_EXPORT_SUPPOR
     // 3. Renames: a file's handle follows the inode, a directory's handle
     //    reconnects at its NEW path.
     {
-        const out = try rig.onMount("mv d/f d/f2 && mkdir -p e && mv d/sub e/sub2 && sync");
+        const out = try rig.onMount("mv d/f d/f2 && mkdir -p e && mv d/sub e/sub2");
         gpa.free(out);
     }
     var pb2: [2][192:0]u8 = undefined;
@@ -13152,7 +13170,7 @@ test "smoke: FILE HANDLES SURVIVE A CACHE DROP AND A REMOUNT (FUSE_EXPORT_SUPPOR
     var pb3: [192:0]u8 = undefined;
     const h_gone = try handleOf(try std.fmt.bufPrintSentinel(&pb3, "{s}/d/gone", .{rig.mp}, 0));
     {
-        const out = try rig.onMount("rm d/f2 && rm d/x && rmdir d/gone && sync");
+        const out = try rig.onMount("rm d/f2 && rm d/x && rmdir d/gone");
         gpa.free(out);
     }
     try dropInodeCaches(io);
@@ -13160,7 +13178,7 @@ test "smoke: FILE HANDLES SURVIVE A CACHE DROP AND A REMOUNT (FUSE_EXPORT_SUPPOR
     try Expect.stale(mount_fd, &h_x, "x unlinked");
     try Expect.stale(mount_fd, &h_gone, "gone rmdir'd");
     {
-        const out = try rig.onMount("rm d/h && sync");
+        const out = try rig.onMount("rm d/h");
         gpa.free(out);
     }
     try dropInodeCaches(io);
@@ -13183,7 +13201,7 @@ test "smoke: FILE HANDLES SURVIVE A CACHE DROP AND A REMOUNT (FUSE_EXPORT_SUPPOR
     try Expect.opens(mount_fd2, &h_d, ino_d, null, p_d, "d after the remount");
     try Expect.opens(mount_fd2, &h_sub, ino_sub, null, p_sub2, "e/sub2 after the remount");
     try Expect.opens(mount_fd2, &h_g, ino_g, "bbbb-nested", null, "g after the remount");
-    try Expect.opens(mount_fd2, &h_l, (try inoOfPath(p_l)), null, null, "l after the remount");
+    try Expect.opensLink(mount_fd2, &h_l, ino_l, "l after the remount");
     try Expect.stale(mount_fd2, &h_x, "x after the remount");
     try Expect.stale(mount_fd2, &h_gone, "gone after the remount");
     try Expect.stale(mount_fd2, &h_f, "f after the remount");

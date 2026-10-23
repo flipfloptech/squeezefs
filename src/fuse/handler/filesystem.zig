@@ -353,6 +353,13 @@ const defaults = struct {
 pub const Filesystem = struct {
     impl: *anyopaque,
     vtable: *const VTable,
+    /// The filesystem serves the kernel's export operations — `LOOKUP(nodeid,
+    /// ".")` for any inode kind and `LOOKUP(dir, "..")` from a durable parent
+    /// — so INIT may advertise `FUSE_EXPORT_SUPPORT` (charter §4). Declared
+    /// by `T` as `pub const export_support = true`; a wrapper forwards its
+    /// inner's. Default false: a filesystem that never said so is never
+    /// advertised (the kernel would answer ESTALE on its own otherwise).
+    export_support: bool = false,
 
     /// Bind `T`: every vtable entry `T` declares as `pub fn <name>(self: *T,
     /// c: *Ctx, args: <Op>Args) Error!<Op>Reply` is wrapped; the rest
@@ -371,7 +378,7 @@ pub const Filesystem = struct {
                 return v;
             }
         };
-        return .{ .impl = impl, .vtable = &Holder.vt };
+        return .{ .impl = impl, .vtable = &Holder.vt, .export_support = @hasDecl(T, "export_support") and T.export_support };
     }
 
     fn Thunk(comptime T: type, comptime name: []const u8, comptime FnPtr: type) type {

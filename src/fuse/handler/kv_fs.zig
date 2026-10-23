@@ -2352,6 +2352,15 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         }
 
         pub fn setattr(self: *Self, c: *Ctx, a: filesystem.SetattrArgs) Error!filesystem.Attr {
+            return self.setattrJudged(c, a, true);
+        }
+
+        /// `setattr` with the inode-flags law judged (`judge_flags`) or
+        /// already judged by the caller's own law: fallocate's size rise
+        /// and stamps ride this path after `refuseFallocate` admitted the
+        /// mode (`vfs_fallocate` lets a pure preallocation extend an
+        /// append-only file, which `do_truncate`'s law would refuse).
+        fn setattrJudged(self: *Self, c: *Ctx, a: filesystem.SetattrArgs, judge_flags: bool) Error!filesystem.Attr {
             // Every mutation of a virtual inode refuses (EACCES, the
             // reference's class for a setattr on a control file).
             if (virtual_inodes.isVirtualIno(a.ino)) return error.AccessDenied;
@@ -2360,7 +2369,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 // A foreign-slot file: ONE shipped verb to its holder
                 // (charter §5.5 "Record-level mutations of a foreign-slot
                 // file"); the reply is the holder's folded record.
-                try refuseSetattr(try self.flagsRecordOf(a.ino), a.attr);
+                if (judge_flags) try refuseSetattr(try self.flagsRecordOf(a.ino), a.attr);
                 const req = a.attr.toEconomy();
                 // This writer's custody of the file lands (and its barrier
                 // runs) before the holder's size path reads the layout
@@ -2382,7 +2391,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 const probe = (try self.readInodeOpt(local)) orelse return error.FileNotFound;
                 // The flag law BEFORE the size path's side effects (its
                 // zeros, its custody settle).
-                try refuseSetattr(probe, a.attr);
+                if (judge_flags) try refuseSetattr(probe, a.attr);
                 if (!(probe.mode & S.IFMT == S.IFREG)) return error.InvalidArgument;
                 const rec = try self.readLayout(local);
                 kind = kindOf(rec);
@@ -2410,7 +2419,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             var stored = try self.readInode(local);
             // The flag law on the record in hand (the size path judged
             // its probe above, before its side effects).
-            if (a.attr.size == null) try refuseSetattr(stored, a.attr);
+            if (judge_flags and a.attr.size == null) try refuseSetattr(stored, a.attr);
             if (a.attr.size) |sz| {
                 // The size epoch moves BEFORE the clip, under the guards:
                 // a write whose bytes landed before this moment claims no
@@ -2524,8 +2533,13 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         /// moved; the size), never on an idempotent re-reservation.
         pub fn fallocate(self: *Self, c: *Ctx, a: filesystem.FallocateArgs) Error!void {
             if (virtual_inodes.isVirtualIno(a.ino)) return error.AccessDenied;
-            const local = try localOf(a.ino);
             const mode = a.mode;
+            // The inode-flags law first (`inode_flags.fallocateRefused`):
+            // an immutable file refuses, an append-only one admits a pure
+            // preallocation alone (mode 0 or KEEP_SIZE) — EPERM,
+            // `vfs_fallocate`'s own.
+            try self.refuseFallocate(a.ino, mode);
+            const local = try localOf(a.ino);
             if (mode & ~FALLOC.SERVED != 0) return error.NotSupported;
             if (a.length == 0) return error.InvalidArgument;
             const end = std.math.add(u64, a.offset, a.length) catch return error.FileTooBig;
@@ -2583,7 +2597,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 // The truncate-up path: the extension law's zeros on a
                 // mapped EOF block, the size epoch, the size and the stamps
                 // in ONE commit (`setattr`'s law for a size set).
-                _ = try self.setattr(c, .{ .ino = a.ino, .attr = .{ .size = end } });
+                _ = try self.setattrJudged(c, .{ .ino = a.ino, .attr = .{ .size = end } }, false);
                 fuse_fallocate_extends.inc();
                 return;
             }
@@ -2799,7 +2813,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         fn stampTimes(self: *Self, c: *Ctx, global: u64, local: u64) Error!void {
             _ = local;
             const stamp = now();
-            _ = try self.setattr(c, .{ .ino = global, .attr = .{ .mtime = stamp, .ctime = stamp } });
+            _ = try self.setattrJudged(c, .{ .ino = global, .attr = .{ .mtime = stamp, .ctime = stamp } }, false);
         }
 
         pub fn readlink(self: *Self, c: *Ctx, a: filesystem.ReadlinkArgs) Error!filesystem.Data {
@@ -7653,7 +7667,20 @@ test "fallocate (charter §6.6) — the mode law and the inline arms on a volume
     try testing.expectEqual(@as(u64, 1200), (try h.getattr(f)).size);
     // A shift on a volume-less set: the block grain is unreachable.
     try testing.expectEqual(@as(?linux.E, .INVAL), h.fallocate(f, COLLAPSE, 0, 100));
+    // The inode-flags law is the first line (`vfs_fallocate`'s): APPEND-
+    // only admits a pure preallocation alone (mode 0 and KEEP_SIZE: "we
+    // can only allow pure fallocate on append only files"), IMMUTABLE
+    // refuses every mode.
     h.release(f);
+    try testing.expectEqual(@as(?linux.E, null), setFlags(&h, f, inode_flags.FS_APPEND_FL, false));
+    try testing.expectEqual(@as(?linux.E, null), h.fallocate(f, KEEP, 0, 100));
+    try testing.expectEqual(@as(?linux.E, null), h.fallocate(f, 0, 0, 1300));
+    try testing.expectEqual(@as(?linux.E, .PERM), h.fallocate(f, PUNCH | KEEP, 0, 100));
+    try testing.expectEqual(@as(?linux.E, .PERM), h.fallocate(f, ZERO | KEEP, 0, 100));
+    try testing.expectEqual(@as(?linux.E, null), setFlags(&h, f, inode_flags.FS_IMMUTABLE_FL, false));
+    try testing.expectEqual(@as(?linux.E, .PERM), h.fallocate(f, KEEP, 0, 100));
+    try testing.expectEqual(@as(?linux.E, .PERM), h.fallocate(f, PUNCH | KEEP, 0, 100));
+    try testing.expectEqual(@as(?linux.E, null), setFlags(&h, f, 0, false));
 }
 
 test "fallocate (charter §6.6) — the striped arms through the plane's face: allocate reserves every block of the range (KEEP_SIZE: the size stands; without it the size rises through the truncate-up path with the extension law), an inline file past its bound promotes first; PUNCH settles the custody, zeroes a partial edge inside a WRITTEN block only (a hole or a reservation reads zeros already) and frees the whole blocks; ZERO_RANGE zeroes the edges and flips/reserves the whole blocks without freeing; COLLAPSE/INSERT need block alignment, shift the map after the custody landed and move the size; a shift the plane refuses is EOPNOTSUPP with the size standing; a refused reservation is ENOSPC" {

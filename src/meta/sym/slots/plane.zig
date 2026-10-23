@@ -1427,6 +1427,15 @@ pub const Plane = struct {
         return pv.leasedBy(self.me) and pv.state != .releasing;
     }
 
+    /// The slot an intent of this mount's is written into ALONE when its
+    /// step 0 is foreign (`xv/ops.Resolver.ownHome`): the lowest rotor
+    /// lease this region holds and is not releasing — a slot its own door
+    /// admits (a lazy rotor grant's tree is minted by that first commit).
+    /// Null = none held.
+    pub fn ownRotorSlot(self: *Plane) ?u16 {
+        return self.table.firstRotorHeldBy(self.me);
+    }
+
     /// The slot a child of `parent_slot` mints into on this volume: the
     /// gather arm first, then `mint_choice` over the rotor; null = the
     /// caller's rotor (an unarmed plane).

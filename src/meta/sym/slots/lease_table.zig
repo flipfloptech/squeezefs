@@ -792,6 +792,21 @@ pub const LeaseTable = struct {
         return if (self.held.get(holder)) |l| l.items.len else 0;
     }
 
+    /// The lowest rotor-marked lease of `holder` not mid-handover: the
+    /// home of an intent whose step 0 is foreign. Null = none held.
+    pub fn firstRotorHeldBy(self: *LeaseTable, holder: AppenderId) ?u16 {
+        self.lock.lock();
+        defer self.lock.unlock();
+        const l = self.held.get(holder) orelse return null;
+        var best: ?u16 = null;
+        for (l.items) |s| {
+            const v = self.view(s);
+            if (!v.rotor or v.state == .releasing) continue;
+            if (best == null or s < best.?) best = s;
+        }
+        return best;
+    }
+
     /// Rotor-marked leases of `holder` (the `2 × M` cap counts these only).
     pub fn rotorHeldBy(self: *LeaseTable, holder: AppenderId) usize {
         self.lock.lock();

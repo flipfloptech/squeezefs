@@ -971,3 +971,126 @@ test "linux: THE MOVE MATRIX — grant landed, B's install mid-way (0003 §X.1, 
 test "linux: THE MOVE MATRIX — door re-opened (0003 §X.1): B's five ops into the directory it now holds land locally, each one successful call's result, and A reads them through B" {
     try moveMatrix(.reopened);
 }
+
+// ---------------------------------------------------------------------------
+// THE JOINER'S INTENT HOME (found by generic/732 under the symmetric
+// default, `rung-10-adjudication-audit.md` §2.4 / F8): a rename through
+// the joined mount whose EVERY object the manager holds has a foreign step
+// 0, so its intent is written ALONE into "the mount's own rotor slot" —
+// and the joiner's resolver named slot 0 (the manager's native slot) as
+// that home. The joiner's own door refused the commit (another appender
+// leases slot 0: `SlotBusy` → `SlotMoved`), nothing moved, and the move
+// gate re-issued the same refusal until the fail-stop deadline (90 s, EIO).
+// No handover is involved: the law is that a cross-owner op resolves
+// within its round trips, never the deadline.
+// ---------------------------------------------------------------------------
+
+/// The bound on a cross-owner rename with nothing moving: generous against
+/// a loaded venue, far below the gate's deadline the defect answered at.
+const CROSS_OWNER_RENAME_BOUND_NS: u64 = 2 * std.time.ns_per_s;
+
+fn timedRename(f: filesystem.Filesystem, c: *filesystem.Ctx, parent: u64, name: []const u8, newparent: u64, newname: []const u8) !void {
+    const t0 = clock.monotonicNs();
+    try f.vtable.rename(f.impl, c, .{ .parent = parent, .name = name, .newparent = newparent, .newname = newname, .flags = 0 });
+    const took = clock.monotonicNs() - t0;
+    if (took > CROSS_OWNER_RENAME_BOUND_NS) {
+        std.debug.print("cross-owner rename {s} → {s} took {d} ms (bound {d} ms)\n", .{ name, newname, took / std.time.ns_per_ms, CROSS_OWNER_RENAME_BOUND_NS / std.time.ns_per_ms });
+        return error.RenameTooSlow;
+    }
+}
+
+test "linux: A JOINER'S RENAME WHOSE EVERY OBJECT IS THE MANAGER'S resolves within its round trips (F8, generic/732 under the symmetric default): B moves A's file between A's directories and back, A moves B's file between B's directories and back, and each moves the OTHER's file between the other's directories — every rename ≤ 2 s and never the move gate's deadline, the intent's home a slot the initiator LEASES (slot 0 is the manager's), minted ≡ retired on both, both members read the same tree" {
+    const gpa = testing.allocator;
+    const s = try meta_set.TestSet.create(gpa, "joiner-rename-home", 1);
+    defer s.destroy();
+    try s.env.put("SQUEEZEFS_MW_BIND", "127.0.0.1:0");
+    const io = s.io();
+    const set = try s.open();
+    defer set.close();
+    var a: Member = undefined;
+    try a.arm(gpa, io, set, &s.env);
+    defer a.disarm(gpa);
+    const be0 = set.volumes[0];
+    var tr = op_trace.OpTrace.begin(0, .other);
+    defer tr.finish();
+    var window: [4096]u8 = undefined;
+    var c = testCtx(io, &tr, &window);
+    const afs = a.face();
+    // A's directories and A's file: generic/732's `mkdir A B; touch A/f`.
+    const da = (try a.fs.mkdir(&c, .{ .parent = inos.ROOT_INO, .name = "A", .mode = 0o755, .umask = 0 })).nodeid;
+    const db = (try a.fs.mkdir(&c, .{ .parent = inos.ROOT_INO, .name = "B", .mode = 0o755, .umask = 0 })).nodeid;
+    const f = (try a.fs.create(&c, .{ .parent = da, .name = "f", .mode = 0o644, .flags = 0, .umask = 0, .open_flags = 0 })).entry.nodeid;
+    try timedRename(afs, &c, da, "f", db, "f");
+    try be0.checkpointNow();
+    // B joins behind the product's move gate at the product's deadline.
+    const b = try MetaSet.open(gpa, io, s.pathList(), .{ .env = &s.env, .cache_budget_bytes = 64 << 20, .cpus = 4, .join = .{ .mountpoint = "/build/tmp/mnt-joiner-rename-home-b", .endpoint = a.plane.advertised } });
+    defer b.close();
+    var mv = moves.Moves.init(io);
+    b.bindMoves(&mv);
+    defer mv.close();
+    var bm: Member = undefined;
+    try bm.arm(gpa, io, b, &s.env);
+    defer bm.disarm(gpa);
+    var gate: move_gate.MoveGate = .{ .inner = bm.face(), .moves = &mv, .deadline_ns = moves.deadlineNs(bm.plane.moveDeadlineMs()) };
+    const bfs = gate.filesystem();
+    const bj = b.volumes[0];
+    const me = bj.joined.?.appenderId();
+    // The joiner's intent home is a slot IT leases (its rotor), never the
+    // manager's native slot 0; its roll-forward homes are its own too.
+    {
+        const own = bm.bound.plane.resolver.ownHome(bm.bound.plane.resolver.ctx) orelse return error.NoOwnHome;
+        try testing.expect(own != 0);
+        try testing.expect(bj.slots.table.view(own).leasedBy(me) and bj.slots.table.view(own).rotor);
+        var buf: [512]u16 = undefined;
+        for (bm.bound.plane.resolver.localSlots(bm.bound.plane.resolver.ctx, &buf)) |sl| try testing.expect(bj.slots.table.view(sl).leasedBy(me));
+        try testing.expectEqual(@as(?u16, 0), a.bound.plane.resolver.ownHome(a.bound.plane.resolver.ctx));
+    }
+    // Process-wide counters: judged as deltas (another shard-mate's test
+    // leaves intents open on purpose).
+    const unresolved0 = move_gate.stats.slot_move_unresolved.load();
+    const minted0 = xv.intent.stats.xv_cross_owner_intents_minted.load();
+    const retired0 = xv.intent.stats.xv_cross_owner_intents_retired.load();
+    const open0 = xv.intent.stats.xv_cross_owner_intents_open.load();
+    // generic/732's shape: `cat B/f` then `mv B/f A/` through the joiner,
+    // then back through the manager, then once more through the joiner.
+    try testing.expectEqual(f, try lookupIno(bfs, &c, db, "f"));
+    try timedRename(bfs, &c, db, "f", da, "f");
+    try testing.expectEqual(f, try lookupIno(afs, &c, da, "f"));
+    try timedRename(afs, &c, da, "f", db, "f");
+    try timedRename(bfs, &c, db, "f", da, "f");
+    // The mirror: B's directories and B's file; the manager moves it
+    // (every object the joiner's), then the joiner moves it back.
+    const dc = (try bfs.vtable.mkdir(bfs.impl, &c, .{ .parent = inos.ROOT_INO, .name = "C", .mode = 0o755, .umask = 0 })).nodeid;
+    const dd = (try bfs.vtable.mkdir(bfs.impl, &c, .{ .parent = inos.ROOT_INO, .name = "D", .mode = 0o755, .umask = 0 })).nodeid;
+    const g = (try bfs.vtable.create(bfs.impl, &c, .{ .parent = dc, .name = "g", .mode = 0o644, .flags = 0, .umask = 0, .open_flags = 0 })).entry.nodeid;
+    try testing.expect(bj.slots.table.view(route_table.slotOf(dc)).leasedBy(me));
+    try testing.expect(bj.slots.table.view(route_table.slotOf(g)).leasedBy(me));
+    try timedRename(afs, &c, dc, "g", dd, "g");
+    try timedRename(bfs, &c, dd, "g", dc, "g");
+    // The other member's file between the other member's directories:
+    // B's file into A's directories through B, A's file into B's
+    // directories through A, and each back.
+    const h = (try bfs.vtable.create(bfs.impl, &c, .{ .parent = da, .name = "h", .mode = 0o644, .flags = 0, .umask = 0, .open_flags = 0 })).entry.nodeid;
+    try testing.expect(bj.slots.table.view(route_table.slotOf(h)).leasedBy(me));
+    try timedRename(bfs, &c, da, "h", db, "h");
+    try timedRename(afs, &c, db, "h", da, "h");
+    const i = (try a.fs.create(&c, .{ .parent = dc, .name = "i", .mode = 0o644, .flags = 0, .umask = 0, .open_flags = 0 })).entry.nodeid;
+    try timedRename(afs, &c, dc, "i", dd, "i");
+    try timedRename(bfs, &c, dd, "i", dc, "i");
+    // Never the deadline; every intent of this test's retired, none open.
+    try testing.expectEqual(unresolved0, move_gate.stats.slot_move_unresolved.load());
+    const minted = xv.intent.stats.xv_cross_owner_intents_minted.load() - minted0;
+    try testing.expect(minted >= 8);
+    try testing.expectEqual(minted, xv.intent.stats.xv_cross_owner_intents_retired.load() - retired0);
+    try testing.expectEqual(open0, xv.intent.stats.xv_cross_owner_intents_open.load());
+    // Both members read the same tree: f in A, g in C, h in A, i in C.
+    for ([_]filesystem.Filesystem{ afs, bfs }) |fs_| {
+        try testing.expectEqual(f, try lookupIno(fs_, &c, da, "f"));
+        try testing.expectEqual(@as(u64, 0), try lookupIno(fs_, &c, db, "f"));
+        try testing.expectEqual(g, try lookupIno(fs_, &c, dc, "g"));
+        try testing.expectEqual(@as(u64, 0), try lookupIno(fs_, &c, dd, "g"));
+        try testing.expectEqual(h, try lookupIno(fs_, &c, da, "h"));
+        try testing.expectEqual(i, try lookupIno(fs_, &c, dc, "i"));
+        for ([_]u64{ f, g, h, i }) |ino| try testing.expectEqual(@as(u32, 1), (try fs_.vtable.getattr(fs_.impl, &c, .{ .ino = ino, .fh = null })).attr.nlink);
+    }
+}

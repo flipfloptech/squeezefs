@@ -178,10 +178,17 @@ pub const Resolver = struct {
     homeOf: *const fn (ctx: *anyopaque, slot: u16) Home,
     /// Re-resolve `slot` at the manager after a `SlotMoved` answer.
     refresh: *const fn (ctx: *anyopaque, slot: u16) Home,
-    /// The slots this mount leases (the roll-forward's homes); the first
-    /// is the mount's own rotor slot (the home of an intent whose step 0
-    /// is foreign).
+    /// The slots this mount leases that hold a tree (the roll-forward's
+    /// homes).
     localSlots: *const fn (ctx: *anyopaque, out: []u16) []u16,
+    /// The home of an intent whose step 0 is foreign — written there
+    /// ALONE, so a slot this mount LEASES (its own door admits it): the
+    /// manager's native slot, a joiner's own rotor slot. Null = this mount
+    /// holds no slot (a joiner between its grants): the op is deferred,
+    /// never written into another appender's slot — that is this mount's
+    /// own door's refusal at every attempt (F8: the joiner's rename met
+    /// `SlotMoved` until the move gate's deadline).
+    ownHome: *const fn (ctx: *anyopaque) ?u16,
     /// The dialled session to appender `holder` (the striping's supply
     /// asks name a CREATOR, not a slot); null = no endpoint bound.
     linkOf: *const fn (ctx: *anyopaque, holder: AppenderId) ?Link,
@@ -550,13 +557,12 @@ pub fn Plane(comptime Store: type) type {
         // ---- execute ----
 
         /// The intent's home for this plan: step 0's slot when local (the
-        /// rider rides its entry), else the mount's own rotor slot.
-        fn intentHomeFor(self: *Self, step0: Step) u64 {
+        /// rider rides its entry), else a slot this mount leases
+        /// (`Resolver.ownHome`); null = none held.
+        fn intentHomeFor(self: *Self, step0: Step) ?u64 {
             const slot0 = route_table.slotOf(step0.homeIno());
             if (self.homeOfIno(step0.homeIno()) == .local) return intent.homeIno(slot0);
-            var buf: [1]u16 = undefined;
-            const own = self.resolver.localSlots(self.resolver.ctx, &buf);
-            return intent.homeIno(if (own.len == 0) 0 else own[0]);
+            return intent.homeIno(self.resolver.ownHome(self.resolver.ctx) orelse return null);
         }
 
         /// Execute `plan` under the op's held guards (`scope` is the
@@ -593,7 +599,10 @@ pub fn Plane(comptime Store: type) type {
                 error.TooManySteps => error.PlanTooLarge,
                 error.ValueTooLarge => error.ValueTooLarge,
             };
-            const home = self.intentHomeFor(plan.steps[0]);
+            // No slot of our own to write the intent into: deferred (the
+            // move gate's re-issue finds the next grant), never a commit
+            // into another appender's slot.
+            const home = self.intentHomeFor(plan.steps[0]) orelse return error.Deferred;
             const t1 = clock.monotonicNs();
             stats.xv_cross_owner_phase_plan.record(t1 - t0);
             // Step 0 + the intent, then the initiator's barrier. A full

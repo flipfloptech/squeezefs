@@ -202,13 +202,19 @@ pub const Holder = struct {
         return out[0..n];
     }
 
+    /// This holder's first lease (its rotor).
+    fn ownHome(ctx: *anyopaque) ?u16 {
+        const self: *Holder = @ptrCast(@alignCast(ctx));
+        return if (self.store.leased.items.len == 0) null else self.store.leased.items[0];
+    }
+
     fn linkOfFn(ctx: *anyopaque, holder: u32) ?ops.Link {
         const self: *Holder = @ptrCast(@alignCast(ctx));
         return if (holder == self.other().id) linkOf(&self.conn) else null;
     }
 
     fn resolver(self: *Holder) ops.Resolver {
-        return .{ .ctx = self, .homeOf = &homeOf, .refresh = &refresh, .localSlots = &localSlots, .linkOf = &linkOfFn };
+        return .{ .ctx = self, .homeOf = &homeOf, .refresh = &refresh, .localSlots = &localSlots, .ownHome = &ownHome, .linkOf = &linkOfFn };
     }
 
     /// The divert stand-in: a foreign object's record read at its holder.

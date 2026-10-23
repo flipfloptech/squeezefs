@@ -6,9 +6,10 @@
 //! slot plane's `SlotHolderCache.stepHome`: a slot another appender
 //! leases has no dialed session in this process until the wire join
 //! lands, so it resolves `unreachable_{holder}` — the typed EAGAIN, never
-//! a wrong local apply. The roll-forward homes are every slot with a tree
-//! on every member; the first is volume 0's native slot (the mount's own
-//! home for an intent whose step 0 is foreign).
+//! a wrong local apply. The roll-forward homes are every local slot with
+//! a tree on every member; the home of an intent whose step 0 is foreign
+//! is volume 0's native slot on the manager and the joiner's own rotor
+//! slot on a joiner (`ownHome`).
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -52,7 +53,7 @@ pub const Bound = struct {
         const be0 = set.volumes[0];
         const own_id: u32 = if (be0.sym) |s| s.identity.mount_slot else if (be0.joined) |j| j.appenderId() else 0;
         const term: u64 = if (be0.sym) |s| s.manager.term else if (be0.joined) |j| j.core().page.term else set.setEpoch();
-        self.plane = try SetPlane.init(gpa, io, set, locks, own_id, 0, term, .{ .ctx = self, .homeOf = &homeOf, .refresh = &refresh, .localSlots = &localSlots, .linkOf = &linkOf }, ops.Seams.fromEnv(env), record.xattrValueCap(set.nodeSize()));
+        self.plane = try SetPlane.init(gpa, io, set, locks, own_id, 0, term, .{ .ctx = self, .homeOf = &homeOf, .refresh = &refresh, .localSlots = &localSlots, .ownHome = &ownHome, .linkOf = &linkOf }, ops.Seams.fromEnv(env), record.xattrValueCap(set.nodeSize()));
         self.plane.stripe_k = stripe.resolveK(env);
         return self;
     }
@@ -130,14 +131,13 @@ pub const Bound = struct {
         return homeOf(ctx, slot);
     }
 
+    /// The roll-forward's homes: every slot with a tree whose home is
+    /// local — slot 0 (the native tree) included only where this mount
+    /// holds it (the manager, a flat set), never on a joiner.
     fn localSlots(ctx: *anyopaque, out: []u16) []u16 {
         const self: *Bound = @ptrCast(@alignCast(ctx));
         var n: usize = 0;
-        if (n < out.len) {
-            out[n] = 0;
-            n += 1;
-        }
-        var slot: u32 = 1;
+        var slot: u32 = 0;
         while (slot < route_table.W and n < out.len) : (slot += 1) {
             const s: u16 = @intCast(slot);
             const be = self.set.volumes[self.set.volumeIndexOfSlot(s)];
@@ -147,6 +147,19 @@ pub const Bound = struct {
             n += 1;
         }
         return out[0..n];
+    }
+
+    /// The home of an intent whose step 0 is foreign: volume 0's native
+    /// slot on the manager (and on a flat set: every slot is local), a
+    /// joiner's own rotor slot — slot 0 is the MANAGER's there (F8: the
+    /// joiner's rename of the manager's file between the manager's
+    /// directories wrote its intent into slot 0, its own door refused it
+    /// `SlotBusy` → `SlotMoved` at every re-issue, EIO at 90 s).
+    fn ownHome(ctx: *anyopaque) ?u16 {
+        const self: *Bound = @ptrCast(@alignCast(ctx));
+        const be0 = self.set.volumes[0];
+        if (be0.joined == null) return 0;
+        return be0.slots.ownRotorSlot();
     }
 };
 

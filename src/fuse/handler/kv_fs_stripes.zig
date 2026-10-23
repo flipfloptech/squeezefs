@@ -518,12 +518,15 @@ const OneHome = struct {
         out[0] = 0;
         return out[0..1];
     }
+    fn ownHome(_: *anyopaque) ?u16 {
+        return 0;
+    }
     fn linkOf(_: *anyopaque, _: u32) ?ops.Link {
         return null;
     }
     var ctx: u8 = 0;
     fn resolver() ops.Resolver {
-        return .{ .ctx = &ctx, .homeOf = &homeOf, .refresh = &homeOf, .localSlots = &localSlots, .linkOf = &linkOf };
+        return .{ .ctx = &ctx, .homeOf = &homeOf, .refresh = &homeOf, .localSlots = &localSlots, .ownHome = &ownHome, .linkOf = &linkOf };
     }
 };
 

@@ -544,9 +544,10 @@ pub const DataPlane = struct {
             local,
             /// Gone at its holder.
             gone,
-            /// The token page: the inode's size and the carried `layout`
-            /// xattr's value when one is held (owned by `gpa`).
-            foreign: struct { size: u64, layout: ?[]u8 },
+            /// The token page: the inode's size, its record flags and the
+            /// carried `layout` xattr's value when one is held (owned by
+            /// `gpa`).
+            foreign: struct { size: u64, flags: u32 = 0, layout: ?[]u8 },
         };
     };
 
@@ -1959,7 +1960,9 @@ pub const DataPlane = struct {
         const p = r.point orelse return null;
         if (p.kind != .staged) return null;
         const size = r.size orelse return null;
-        if (!self.backend.isReader()) self.staged_points.fill(ino, gen, moves, size, p.file_id);
+        // A restricted inode gets no fast-path entry: its every write must
+        // read the record (the law's arm).
+        if (!self.backend.isReader() and r.flags & record.INODE_FLAGS_ATTR == 0) self.staged_points.fill(ino, gen, moves, size, p.file_id);
         return .{ .size = self.claimedSize(ino, size), .file_id = p.file_id };
     }
 
@@ -2397,7 +2400,12 @@ pub const DataPlane = struct {
                 break :blk p;
             },
         };
-        if (out.ok) self.noteShape(ino, cur.size, if (d == .own_block) .striped else if (d == .inline_) .inline_ else .packed_) else if (out.no_space) {
+        if (out.ok) {
+            // The promoted shape is published unless the inode is
+            // restricted (the row would admit a Shared write that reads
+            // no record).
+            if (!self.restricted(ino)) self.noteShape(ino, cur.size, if (d == .own_block) .striped else if (d == .inline_) .inline_ else .packed_);
+        } else if (out.no_space) {
             log.debug("promotion ino {d}: the {t} arm found no free block on vol {x:0>16} (size {d}, stored {d})", .{ ino, d, tag, cur.size, stored_len });
         } else {
             stats.promotions_failed.inc();
@@ -2886,7 +2894,7 @@ pub const DataPlane = struct {
     /// with a `fill` the record (or its absence) also goes into the read
     /// view under the generations the caller captured before its lookups.
     const PointProbe = union(enum) { point: layout.Point, other_name, corrupt };
-    const ViewFill = struct { size: u64, gen: u64, moves: u64 };
+    const ViewFill = struct { size: u64, flags: u32, gen: u64, moves: u64 };
     const PointQuery = struct {
         plane: *DataPlane,
         ino: u64,
@@ -2896,7 +2904,7 @@ pub const DataPlane = struct {
             const xv = record.XattrValue.decode(v) catch return .corrupt;
             if (!std.mem.eql(u8, xv.name, layout.LAYOUT_XATTR_NAME)) return .other_name;
             const p = layout.resolvePoint(xv.value, q.plane.geo, q.block) catch return .corrupt;
-            if (q.fill) |f| q.plane.view.fill(q.ino, f.size, xv.value, f.gen, f.moves);
+            if (q.fill) |f| q.plane.view.fill(q.ino, .{ .size = f.size, .flags = f.flags }, xv.value, f.gen, f.moves);
             return .{ .point = p };
         }
     };
@@ -2910,25 +2918,26 @@ pub const DataPlane = struct {
     /// cache's borrowed records (`docs/evidence/rung-10-layoutlookup.md`),
     /// the view filled on the way out of a local lookup under the witness
     /// generation and slot-move epoch read BEFORE them.
-    const Resolved = struct { size: ?u64, point: ?layout.Point };
+    /// `flags`: the inode record's (`record.INODE_FLAG_*`; 0 with no record).
+    const Resolved = struct { size: ?u64, flags: u32 = 0, point: ?layout.Point };
 
     fn resolveAt(self: *DataPlane, ino: u64, block: ?u32) Error!?Resolved {
-        if (self.view.lookup(ino, block)) |v| return .{ .size = v.size, .point = v.point };
+        if (self.view.lookup(ino, block)) |v| return .{ .size = v.size, .flags = v.flags, .point = v.point };
         if (self.foreign_layout) |f| switch (try f.lookup(f.ctx, self.gpa, ino)) {
             .local => {},
             .gone => return null,
             // A foreign record is the holder's, owned (`layoutRecord`): never cached here.
-            .foreign => |x| return .{ .size = x.size, .point = if (x.layout) |v| try self.foreignPoint(v, block) else null },
+            .foreign => |x| return .{ .size = x.size, .flags = x.flags, .point = if (x.layout) |v| try self.foreignPoint(v, block) else null },
         };
         const gen = ino_witness.genOf(ino);
         const moves = self.view.movesNow();
-        const size = try self.inodeRecordSize(ino);
+        const facts = try self.inodeRecordFacts(ino);
         // An inode-less layout is a destroy in flight: resolved, not cached.
         // A `-o ro` reader's projection moves without a leaf apply (the
         // checkpoint it adopts), so it is never cached either.
-        const fill: ?ViewFill = if (size != null and !self.backend.isReader()) .{ .size = size.?, .gen = gen, .moves = moves } else null;
+        const fill: ?ViewFill = if (facts != null and !self.backend.isReader()) .{ .size = facts.?.size, .flags = facts.?.flags, .gen = gen, .moves = moves } else null;
         const point = try self.layoutPointLocal(ino, block, fill);
-        return .{ .size = size, .point = point };
+        return .{ .size = if (facts) |f| f.size else null, .flags = if (facts) |f| f.flags else 0, .point = point };
     }
 
     /// `layoutPoint` of a record the token page carried (owned; freed here).
@@ -2952,7 +2961,7 @@ pub const DataPlane = struct {
             .other_name => {},
         }
         const owned = ((try self.layoutChain(self.gpa, ino, h)) orelse {
-            if (fill) |f| self.view.fill(ino, f.size, null, f.gen, f.moves);
+            if (fill) |f| self.view.fill(ino, .{ .size = f.size, .flags = f.flags }, null, f.gen, f.moves);
             return null;
         }).value;
         defer self.gpa.free(owned);
@@ -2978,15 +2987,40 @@ pub const DataPlane = struct {
         return @max(size, if (self.claims) |c| c.claimOf(c.ctx, ino) else 0);
     }
 
-    /// The inode record's size off the borrowed record (unfolded).
-    fn inodeRecordSize(self: *DataPlane, ino: u64) Error!?u64 {
-        const Size = struct {
-            fn of(_: void, bytes: []const u8) ?u64 {
-                return (record.InodeValue.decode(bytes) catch return null).size;
+    /// The inode record's size and flags off the borrowed record (unfolded,
+    /// no copy); null = no record.
+    fn inodeRecordFacts(self: *DataPlane, ino: u64) Error!?read_view.InodeFacts {
+        const Facts = struct {
+            fn of(_: void, bytes: []const u8) ?read_view.InodeFacts {
+                const v = record.InodeValue.decode(bytes) catch return null;
+                return .{ .size = v.size, .flags = v.flags };
             }
         };
-        const size = (self.backend.lookupView(self.gpa, key.TREE_INODES, &key.inodeKey(ino), ?u64, {}, Size.of) catch |e| return KvBackend.coreError(e)) orelse return null;
-        return size orelse error.InputOutput;
+        const facts = (self.backend.lookupView(self.gpa, key.TREE_INODES, &key.inodeKey(ino), ?read_view.InodeFacts, {}, Facts.of) catch |e| return KvBackend.coreError(e)) orelse return null;
+        return facts orelse error.InputOutput;
+    }
+
+    /// The inode's record flags (`record.INODE_FLAG_*`) for the direct
+    /// arm's WRITE-lease screen (`ipc/host/direct_lease.buildLease`):
+    /// through the read view (filled from the record, staled by the
+    /// witness on every record change), a foreign slot's off its holder's
+    /// token. Null = no record (the lease's own `kind` refusal).
+    pub fn inodeRecordFlags(self: *DataPlane, ino: u64) ?u32 {
+        const r = (self.resolveAt(ino, null) catch return null) orelse return null;
+        if (r.size == null) return null;
+        return r.flags;
+    }
+
+    /// Is `ino` IMMUTABLE or APPEND-only as its record stands: through the
+    /// read view (a hit is current under the witness), else the record.
+    /// The promotion's shape publish asks before it publishes a row the
+    /// shared-mode admission would read (the admission and the staged-point
+    /// fill read the flags off their own resolve); so a restricted inode's
+    /// writes always meet the filesystem's record-reading arms, which
+    /// refuse (`kv_fs`). Unknown (no record) reads restricted.
+    fn restricted(self: *DataPlane, ino: u64) bool {
+        const fl = self.inodeRecordFlags(ino) orelse return true;
+        return fl & record.INODE_FLAGS_ATTR != 0;
     }
 
     /// The mount's slot-move epoch into the view (decision 0003 §X.1): a
@@ -4180,8 +4214,15 @@ pub const DataPlane = struct {
     /// kernel's; the table is keyed by the plane's effective ino.
     pub fn sharedProbe(self: *DataPlane, nodeid: u64, offset: u64, end: u64) ?op_guard.SharedProbe {
         _ = offset;
-        const snap = self.shape.peek(shapeProbeKey(nodeid) orelse return null) orelse return null;
+        const ino = shapeProbeKey(nodeid) orelse return null;
+        const snap = self.shape.peek(ino) orelse return null;
         if (!snap.striped_passthrough and self.passthrough) return null;
+        // The Shared arm reads no record: an IMMUTABLE/APPEND inode never
+        // takes it (the view's row, current under the witness; a miss
+        // declines — the exclusive arm reads the record and answers).
+        if (self.view.lookup(ino, null)) |v| {
+            if (v.flags & record.INODE_FLAGS_ATTR != 0) return null;
+        } else return null;
         return .{ .size_floor = snap.size, .meta_size = snap.size, .block_size = self.block_size, .range_fully_mapped = null, .narrow = end <= snap.size, .striped_passthrough = snap.striped_passthrough };
     }
 

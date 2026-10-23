@@ -91,6 +91,9 @@ pub const Setattr = struct {
     atime: ?u64 = null,
     mtime: ?u64 = null,
     ctime: ?u64 = null,
+    /// The attribute flags (`record.INODE_FLAGS_ATTR`) to carry: a shipped
+    /// FS_IOC_SETFLAGS/FSSETXATTR of a foreign-slot inode.
+    flags: ?u32 = null,
 
     pub fn toWire(self: Setattr) verbs.SetattrWire {
         var w: verbs.SetattrWire = .none;
@@ -122,6 +125,10 @@ pub const Setattr = struct {
             w.valid |= verbs.SETATTR_CTIME;
             w.ctime = @bitCast(v);
         }
+        if (self.flags) |v| {
+            w.valid |= verbs.SETATTR_FLAGS;
+            w.flags = v;
+        }
         return w;
     }
 
@@ -134,6 +141,7 @@ pub const Setattr = struct {
             .atime = if (w.valid & verbs.SETATTR_ATIME != 0) @bitCast(w.atime) else null,
             .mtime = if (w.valid & verbs.SETATTR_MTIME != 0) @bitCast(w.mtime) else null,
             .ctime = if (w.valid & verbs.SETATTR_CTIME != 0) @bitCast(w.ctime) else null,
+            .flags = if (w.valid & verbs.SETATTR_FLAGS != 0) w.flags else null,
         };
     }
 };
@@ -491,6 +499,8 @@ pub fn RecordShipService(comptime Store: type) type {
                     if (s.size) |sz| v.size = sz;
                     if (s.atime) |x| v.atime = x;
                     if (s.mtime) |x| v.mtime = x;
+                    // The attribute bits alone: STRIPE is the format's.
+                    if (s.flags) |f| v.flags = (v.flags & ~record.INODE_FLAGS_ATTR) | (f & record.INODE_FLAGS_ATTR);
                     v.ctime = s.ctime orelse now;
                     t.stagePut(key.TREE_INODES, &key.inodeKey(k), &v.encode()) catch return error.OutOfMemory;
                 },
@@ -605,6 +615,11 @@ test "the setattr words round-trip through the wire; the served sink: attrs-only
     try testing.expectEqual(@as(?u64, 123), back.mtime);
     try testing.expectEqual(@as(?u64, 9), back.size);
     try testing.expectEqual(@as(?u32, null), back.uid);
+    try testing.expectEqual(@as(?u32, null), back.flags);
+    // A shipped flag set carries the attribute bits alone (IMMUTABLE here).
+    const fl: Setattr = .{ .flags = record.INODE_FLAG_IMMUTABLE };
+    try testing.expectEqual(@as(?u32, record.INODE_FLAG_IMMUTABLE), Setattr.fromWire(fl.toWire()).flags);
+    try testing.expect(fl.toWire().valid == verbs.SETATTR_FLAGS);
     const Rec = struct {
         invals: u32 = 0,
         prunes: u32 = 0,

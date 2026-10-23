@@ -2043,7 +2043,7 @@ pub fn foreignLayoutOf(divert: *tokens.Divert, io: Io, gpa: Allocator, ino: u64)
         };
         break;
     };
-    return .{ .foreign = .{ .size = e.attrs.size, .layout = layout_rec } };
+    return .{ .foreign = .{ .size = e.attrs.size, .flags = e.attrs.flags, .layout = layout_rec } };
 }
 
 /// The token service's resolver over the set: a slot this process leases

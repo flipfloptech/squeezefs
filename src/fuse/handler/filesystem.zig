@@ -134,7 +134,12 @@ pub const Xattr = union(enum) {
 pub const Lseek = struct { offset: u64 };
 pub const Bmap = struct { block: u64 };
 pub const Poll = struct { revents: u32 };
+/// `data_len` bytes written into `Ctx.window[IOCTL_DATA_OFFSET..]`: the
+/// reply is `fuse_ioctl_out ‖ data` and the window IS the ent's reply
+/// payload, so the data sits where the commit lays it (no copy, no
+/// aliasing move of the out struct over it).
 pub const Ioctl = struct { out: abi.fuse_ioctl_out, data_len: usize };
+pub const IOCTL_DATA_OFFSET: usize = @sizeOf(abi.fuse_ioctl_out);
 
 // ---------------------------------------------------------------------------
 // SETATTR's decoded request.
@@ -155,6 +160,11 @@ pub const SetAttr = struct {
     lock_owner: ?u64 = null,
     /// `FATTR_KILL_SUIDGID`: the daemon owns the suid/sgid/caps clearing.
     kill_suidgid: bool = false,
+    /// An atime or mtime set EXPLICITLY (the kernel's `ATTR_TIMES_SET`:
+    /// `utimensat` with a value), as opposed to the `*_NOW` forms a
+    /// `touch`/`utimes(NULL)` sends — the append-only law admits the
+    /// latter alone (`inode_flags.setattrRefused`).
+    times_set: bool = false,
 
     pub fn fromWire(in: abi.fuse_setattr_in, now_ns: u64) SetAttr {
         const v = in.valid;
@@ -169,6 +179,7 @@ pub const SetAttr = struct {
             .fh = if (v & abi.FATTR_FH != 0) in.fh else null,
             .lock_owner = if (v & abi.FATTR_LOCKOWNER != 0) in.lock_owner else null,
             .kill_suidgid = v & abi.FATTR_KILL_SUIDGID != 0,
+            .times_set = (v & abi.FATTR_ATIME != 0 and v & abi.FATTR_ATIME_NOW == 0) or (v & abi.FATTR_MTIME != 0 and v & abi.FATTR_MTIME_NOW == 0),
         };
     }
 
@@ -484,8 +495,17 @@ test "SetAttr decodes by valid bits; *_NOW resolves to now; times are ns-exact a
     try testing.expectEqual(@as(?u64, 77), s.fh);
     try testing.expect(s.kill_suidgid);
     try testing.expect(!s.toEconomy().timesOnly());
+    // An explicit mtime beside a NOW atime is a set time (ATTR_TIMES_SET).
+    try testing.expect(s.times_set);
     // Saturation: a time_t past the i64-ns range never wraps.
     try testing.expectEqual(@as(i64, std.math.maxInt(i64)), @as(i64, @bitCast(timeNs(1 << 40, 0))));
     const echo = SetAttr.fromWire(.{ .valid = abi.FATTR_MTIME | abi.FATTR_CTIME, .padding = 0, .fh = 0, .size = 0, .lock_owner = 0, .atime = 0, .mtime = 1, .ctime = 2, .atimensec = 0, .mtimensec = 0, .ctimensec = 0, .mode = 0, .unused4 = 0, .uid = 0, .gid = 0, .unused5 = 0 }, now);
     try testing.expect(echo.toEconomy().timesOnly());
+    try testing.expect(echo.times_set);
+    // `touch`: both times NOW — not a set time; a ctime echo alone neither.
+    var touch = abi.zeroed(abi.fuse_setattr_in);
+    touch.valid = abi.FATTR_ATIME | abi.FATTR_ATIME_NOW | abi.FATTR_MTIME | abi.FATTR_MTIME_NOW;
+    try testing.expect(!SetAttr.fromWire(touch, now).times_set);
+    touch.valid = abi.FATTR_CTIME;
+    try testing.expect(!SetAttr.fromWire(touch, now).times_set);
 }

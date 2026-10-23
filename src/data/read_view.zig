@@ -103,6 +103,12 @@ const W_KVGEN: usize = 6;
 const W_N: usize = 7;
 const W_FID: usize = 8; // 2 words
 const W_DC: usize = 10; // 5 words (MappingWire)
+/// The inode record's `flags` word (`record.INODE_FLAG_*`): the write
+/// law's IMMUTABLE/APPEND bits, current under the witness generation like
+/// the size — the shared-mode admission and the staged-point fill read
+/// them here, so a restricted inode never reaches an arm that reads no
+/// record (`plane.sharedProbe`, `plane.stagedPoint`).
+const W_FLAGS: usize = 15;
 const HEADER_WORDS: usize = 16;
 pub const HEADER_BYTES: usize = HEADER_WORDS * WORD;
 
@@ -145,10 +151,19 @@ pub fn slotBytes(record_cap: usize) usize {
     return HEADER_BYTES + bodyWords(record_cap) * WORD;
 }
 
+/// The inode record's facts a fill installs beside the layout.
+pub const InodeFacts = struct {
+    size: u64,
+    /// `record.InodeValue.flags`.
+    flags: u32 = 0,
+};
+
 /// What a hit resolved.
 pub const Found = struct {
     /// The inode record's size (the caller folds the parked claim).
     size: u64,
+    /// The inode record's flags (`record.INODE_FLAG_*`).
+    flags: u32,
     /// The layout as `layout.resolvePoint` reads it; null = no record.
     point: ?layout.Point,
 };
@@ -243,6 +258,7 @@ pub const Table = struct {
             const head = s.w[W_HEAD].load(.acquire);
             const kvgen = s.w[W_KVGEN].load(.acquire);
             const n = s.w[W_N].load(.acquire);
+            const flags = s.w[W_FLAGS].load(.acquire);
             var fid: [2]u64 = undefined;
             for (&fid, 0..) |*f, i| f.* = s.w[W_FID + i].load(.acquire);
             var dc: [MAPPING_WORDS]u64 = undefined;
@@ -260,7 +276,7 @@ pub const Table = struct {
                 stats.read_view_stale.inc();
                 return null;
             }
-            const found = decodeFound(self.geo, size, head, kvgen, fid, dc, entry) orelse return null;
+            const found = decodeFound(self.geo, size, @truncate(flags), head, kvgen, fid, dc, entry) orelse return null;
             stats.read_view_hits.inc();
             return found;
         }
@@ -333,9 +349,9 @@ pub const Table = struct {
         return e;
     }
 
-    fn decodeFound(geo: layout.Geometry, size: u64, head: u64, kvgen: u64, fid: [2]u64, dc: [MAPPING_WORDS]u64, entry: ?[ENTRY_WORDS]u64) ?Found {
+    fn decodeFound(geo: layout.Geometry, size: u64, flags: u32, head: u64, kvgen: u64, fid: [2]u64, dc: [MAPPING_WORDS]u64, entry: ?[ENTRY_WORDS]u64) ?Found {
         const kind_tag: u8 = @truncate(head & HEAD_KIND_MASK);
-        if (kind_tag == 0) return .{ .size = size, .point = null };
+        if (kind_tag == 0) return .{ .size = size, .flags = flags, .point = null };
         const kind = layout.Kind.fromByte(kind_tag - 1) catch return null;
         var file_id: layout.FileId = undefined;
         std.mem.writeInt(u64, file_id[0..8], fid[0], .little);
@@ -352,7 +368,7 @@ pub const Table = struct {
             @memcpy(&m, e[1..]);
             binding = mappingOfWords(m, geo.chunk) catch return null;
         }
-        return .{ .size = size, .point = .{ .kind = kind, .size = size, .file_id = file_id, .durable_copy = durable_copy, .kvmap = kvmap, .binding = binding } };
+        return .{ .size = size, .flags = flags, .point = .{ .kind = kind, .size = size, .file_id = file_id, .durable_copy = durable_copy, .kvmap = kvmap, .binding = binding } };
     }
 
     fn mappingOfWords(words: [MAPPING_WORDS]u64, chunk: u64) layout.LayoutError!layout.Mapping {
@@ -365,10 +381,10 @@ pub const Table = struct {
 
     /// Install `ino`'s facts read under witness generation `gen` and
     /// slot-move epoch `moves` (both captured BEFORE the lookups that
-    /// produced `size` and `record`). `record` is the layout record's
+    /// produced `facts` and `record`). `record` is the layout record's
     /// bytes (null = none). A record the head decode refuses is not
     /// cached (the KV path reports it per op).
-    pub fn fill(self: *Table, ino: u64, size: u64, record: ?[]const u8, gen: u64, moves: u64) void {
+    pub fn fill(self: *Table, ino: u64, facts: InodeFacts, record: ?[]const u8, gen: u64, moves: u64) void {
         var head: u64 = 0;
         var kvgen: u64 = 0;
         var n: u64 = 0;
@@ -435,7 +451,8 @@ pub const Table = struct {
         s.w[W_INO].store(ino, .monotonic);
         s.w[W_GEN].store(gen, .monotonic);
         s.w[W_MOVES].store(moves, .monotonic);
-        s.w[W_SIZE].store(size, .monotonic);
+        s.w[W_SIZE].store(facts.size, .monotonic);
+        s.w[W_FLAGS].store(facts.flags, .monotonic);
         s.w[W_HEAD].store(head, .monotonic);
         s.w[W_KVGEN].store(kvgen, .monotonic);
         s.w[W_N].store(n, .monotonic);
@@ -529,7 +546,7 @@ test "a filled ino hits with its size, kind and every block's binding (a hole pa
     try testing.expect(t.lookup(ino, 0) == null);
     try testing.expectEqual(misses0 + 1, stats.read_view_misses.load());
     const g = ino_witness.genOf(ino);
-    t.fill(ino, 3 * layout.DEFAULT_CHUNK, rec, g, t.movesNow());
+    t.fill(ino, .{ .size = 3 * layout.DEFAULT_CHUNK }, rec, g, t.movesNow());
     // Every block resolves off the view; a hole past the map is null.
     var b: u32 = 0;
     while (b < 768) : (b += 7) {
@@ -558,10 +575,10 @@ test "a filled ino hits with its size, kind and every block's binding (a hole pa
     // (the ops that missed mid-fill never queue fills of their own).
     const redundant0 = stats.read_view_fill_redundant.load();
     const fills0 = stats.read_view_fills.load();
-    t.fill(ino, 4 * layout.DEFAULT_CHUNK, rec2, g, t.movesNow());
+    t.fill(ino, .{ .size = 4 * layout.DEFAULT_CHUNK }, rec2, g, t.movesNow());
     try testing.expectEqual(redundant0 + 1, stats.read_view_fill_redundant.load());
     try testing.expectEqual(fills0, stats.read_view_fills.load());
-    t.fill(ino, 4 * layout.DEFAULT_CHUNK, rec2, ino_witness.genOf(ino), t.movesNow());
+    t.fill(ino, .{ .size = 4 * layout.DEFAULT_CHUNK }, rec2, ino_witness.genOf(ino), t.movesNow());
     try testing.expectEqual(fills0 + 1, stats.read_view_fills.load());
     const f2 = t.lookup(ino, 3) orelse return error.TestExpectedEqual;
     try testing.expectEqual(@as(u64, 12), f2.point.?.binding.?.vol_tag);
@@ -572,13 +589,22 @@ test "a filled ino hits with its size, kind and every block's binding (a hole pa
     try testing.expect(t.lookup(ino, 3) != null);
     _ = epoch.fetchAdd(1, .release);
     try testing.expect(t.lookup(ino, 3) == null);
-    t.fill(ino, 4 * layout.DEFAULT_CHUNK, rec2, ino_witness.genOf(ino), t.movesNow());
+    t.fill(ino, .{ .size = 4 * layout.DEFAULT_CHUNK }, rec2, ino_witness.genOf(ino), t.movesNow());
     try testing.expect(t.lookup(ino, 3) != null);
     // No record: an inline file of zeros (size from the inode record).
-    t.fill(ino + 5, 17, null, ino_witness.genOf(ino + 5), t.movesNow());
+    t.fill(ino + 5, .{ .size = 17 }, null, ino_witness.genOf(ino + 5), t.movesNow());
     const none = t.lookup(ino + 5, 0) orelse return error.TestExpectedEqual;
     try testing.expectEqual(@as(u64, 17), none.size);
     try testing.expect(none.point == null);
+    try testing.expectEqual(@as(u32, 0), none.flags);
+    // The inode record's flags ride the row, with or without a layout, and
+    // a flag change (a record of the ino landed) stales it like the size.
+    t.fill(ino + 6, .{ .size = 9, .flags = 0b110 }, null, ino_witness.genOf(ino + 6), t.movesNow());
+    try testing.expectEqual(@as(u32, 0b110), (t.lookup(ino + 6, null) orelse return error.TestExpectedEqual).flags);
+    t.fill(ino + 7, .{ .size = 4 * layout.DEFAULT_CHUNK, .flags = 0b10 }, rec2, ino_witness.genOf(ino + 7), t.movesNow());
+    try testing.expectEqual(@as(u32, 0b10), (t.lookup(ino + 7, 3) orelse return error.TestExpectedEqual).flags);
+    ino_witness.touch(ino + 7);
+    try testing.expect(t.lookup(ino + 7, 3) == null);
     t.forget(ino);
     try testing.expect(t.lookup(ino, 3) == null);
     try testing.expect(t.lookup(ino + 5, 0) != null);
@@ -591,7 +617,7 @@ test "the kinds: a staged record carries its file id and durable copy, a packed 
     const copy = layout.Mapping.wholeBlock(3, 5 * layout.DEFAULT_CHUNK, 9);
     const staged = try layout.Layout.staged(1000, fid, copy).encodeAlloc(testing.allocator);
     defer testing.allocator.free(staged);
-    t.fill(10, 1000, staged, ino_witness.genOf(10), 0);
+    t.fill(10, .{ .size = 1000 }, staged, ino_witness.genOf(10), 0);
     const s = (t.lookup(10, 0) orelse return error.TestExpectedEqual).point.?;
     try testing.expectEqual(layout.Kind.staged, s.kind);
     try testing.expectEqualSlices(u8, &fid, &s.file_id);
@@ -600,14 +626,14 @@ test "the kinds: a staged record carries its file id and durable copy, a packed 
     const tenant = layout.Mapping.tenant(3, 5 * layout.DEFAULT_CHUNK, 9, 8192, 1000);
     const packed_rec = try layout.Layout.packedTenant(1000, fid, tenant).encodeAlloc(testing.allocator);
     defer testing.allocator.free(packed_rec);
-    t.fill(11, 1000, packed_rec, ino_witness.genOf(11), 0);
+    t.fill(11, .{ .size = 1000 }, packed_rec, ino_witness.genOf(11), 0);
     const p = (t.lookup(11, 0) orelse return error.TestExpectedEqual).point.?;
     try testing.expectEqual(layout.Kind.packed_, p.kind);
     try testing.expectEqual(@as(u32, 8192), p.durable_copy.?.rel_off);
     try testing.expectEqual(@as(u32, 1000), p.durable_copy.?.len);
     const kv = try layout.Layout.stripedKvmap(1 << 40, 77, 5).encodeAlloc(testing.allocator);
     defer testing.allocator.free(kv);
-    t.fill(12, 1 << 40, kv, ino_witness.genOf(12), 0);
+    t.fill(12, .{ .size = 1 << 40 }, kv, ino_witness.genOf(12), 0);
     const k = (t.lookup(12, 3) orelse return error.TestExpectedEqual).point.?;
     try testing.expectEqual(layout.Kind.striped, k.kind);
     try testing.expectEqual(@as(?u32, 77), k.kvmap.?.sweep);
@@ -615,7 +641,7 @@ test "the kinds: a staged record carries its file id and durable copy, a packed 
     try testing.expect(k.binding == null);
     const kv2 = try layout.Layout.stripedKvmap(1 << 40, null, null).encodeAlloc(testing.allocator);
     defer testing.allocator.free(kv2);
-    t.fill(13, 1 << 40, kv2, ino_witness.genOf(13), 0);
+    t.fill(13, .{ .size = 1 << 40 }, kv2, ino_witness.genOf(13), 0);
     const k2 = (t.lookup(13, null) orelse return error.TestExpectedEqual).point.?;
     try testing.expect(k2.kvmap.?.sweep == null and k2.kvmap.?.gen == null);
     // Inline: the payload at any offset, clamped at the length.
@@ -623,7 +649,7 @@ test "the kinds: a staged record carries its file id and durable copy, a packed 
     for (&payload, 0..) |*c, i| c.* = @truncate(i *% 31);
     const inl = try layout.Layout.inlineData(1000, &payload).encodeAlloc(testing.allocator);
     defer testing.allocator.free(inl);
-    t.fill(14, 1000, inl, ino_witness.genOf(14), 0);
+    t.fill(14, .{ .size = 1000 }, inl, ino_witness.genOf(14), 0);
     try testing.expectEqual(layout.Kind.inline_, (t.lookup(14, null) orelse return error.TestExpectedEqual).point.?.kind);
     var out: [4096]u8 = undefined;
     try testing.expectEqual(@as(?usize, 1000), t.inlineData(14, 0, &out));
@@ -638,7 +664,7 @@ test "the kinds: a staged record carries its file id and durable copy, a packed 
     try testing.expect(t.inlineData(99, 0, &out) == null);
     // A corrupt record: refused, counted, the ino still misses.
     const refused0 = stats.read_view_fill_refused.load();
-    t.fill(15, 5, &[_]u8{ 9, 9, 9 }, ino_witness.genOf(15), 0);
+    t.fill(15, .{ .size = 5 }, &[_]u8{ 9, 9, 9 }, ino_witness.genOf(15), 0);
     try testing.expectEqual(refused0 + 1, stats.read_view_fill_refused.load());
     try testing.expect(t.lookup(15, 0) == null);
 }
@@ -659,10 +685,10 @@ test "replacement: the four ways of a set hold four inos; a fifth within the ref
     }
     const rec = try stripedRecord(testing.allocator, 4 * layout.DEFAULT_CHUNK, 4, 1);
     defer testing.allocator.free(rec);
-    for (inos[0..4]) |ino| t.fill(ino, 4 * layout.DEFAULT_CHUNK, rec, ino_witness.genOf(ino), 0);
+    for (inos[0..4]) |ino| t.fill(ino, .{ .size = 4 * layout.DEFAULT_CHUNK }, rec, ino_witness.genOf(ino), 0);
     for (inos[0..4]) |ino| try testing.expect(t.lookup(ino, 1) != null);
     const refused0 = stats.read_view_fill_refused.load();
-    t.fill(inos[4], 4 * layout.DEFAULT_CHUNK, rec, ino_witness.genOf(inos[4]), 0);
+    t.fill(inos[4], .{ .size = 4 * layout.DEFAULT_CHUNK }, rec, ino_witness.genOf(inos[4]), 0);
     try testing.expectEqual(refused0 + 1, stats.read_view_fill_refused.load());
     try testing.expect(t.lookup(inos[4], 1) == null);
     for (inos[0..4]) |ino| try testing.expect(t.lookup(ino, 1) != null);
@@ -670,7 +696,7 @@ test "replacement: the four ways of a set hold four inos; a fifth within the ref
     // whatever the floor.
     const fills0 = stats.read_view_fills.load();
     ino_witness.touch(inos[2]);
-    t.fill(inos[2], 5 * layout.DEFAULT_CHUNK, rec, ino_witness.genOf(inos[2]), 0);
+    t.fill(inos[2], .{ .size = 5 * layout.DEFAULT_CHUNK }, rec, ino_witness.genOf(inos[2]), 0);
     try testing.expectEqual(fills0 + 1, stats.read_view_fills.load());
     try testing.expectEqual(@as(u64, 5 * layout.DEFAULT_CHUNK), (t.lookup(inos[2], 1) orelse return error.TestExpectedEqual).size);
     // Age the oldest way past the floor: the fifth takes it, the others stay.
@@ -681,7 +707,7 @@ test "replacement: the four ways of a set hold four inos; a fifth within the ref
     };
     const evicted = oldest.w[W_INO].load(.monotonic);
     oldest.filled_ns -= REFILL_MIN_NS;
-    t.fill(inos[4], 4 * layout.DEFAULT_CHUNK, rec, ino_witness.genOf(inos[4]), 0);
+    t.fill(inos[4], .{ .size = 4 * layout.DEFAULT_CHUNK }, rec, ino_witness.genOf(inos[4]), 0);
     try testing.expect(t.lookup(inos[4], 1) != null);
     try testing.expect(t.lookup(evicted, 1) == null);
     var kept: usize = 0;
@@ -699,7 +725,7 @@ test "the seqlock under a racing filler: readers never see a binding of one reco
     defer testing.allocator.free(a);
     const b = try stripedRecord(testing.allocator, 2, 768, 2);
     defer testing.allocator.free(b);
-    t.fill(ino, 1, a, ino_witness.genOf(ino), 0);
+    t.fill(ino, .{ .size = 1 }, a, ino_witness.genOf(ino), 0);
     const Race = struct {
         var stop: Atomic(bool) = .init(false);
         var fills: u64 = 0;
@@ -710,7 +736,7 @@ test "the seqlock under a racing filler: readers never see a binding of one reco
                 // A record changed: the witness moves, then the fill (one
                 // per generation); a yield leaves the readers their window.
                 ino_witness.touch(ino);
-                tbl.fill(ino, if (odd) 2 else 1, if (odd) rb else ra, ino_witness.genOf(ino), 0);
+                tbl.fill(ino, .{ .size = if (odd) 2 else 1 }, if (odd) rb else ra, ino_witness.genOf(ino), 0);
                 fills += 1;
                 std.Thread.yield() catch {};
             }

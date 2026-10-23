@@ -683,7 +683,6 @@ src/wire/verbs.zig:1546 | 3 | 079eae60a6b80069 | a size — OWED: derive from de
 src/wire/verbs.zig:1547 | 4 | 378c4e942aaf975e | a size — OWED: derive from derive.Facts or document the physical/format reason
 src/wire/verbs.zig:1548 | 5 | 0a82c51786514457 | a size — OWED: derive from derive.Facts or document the physical/format reason
 src/wire/verbs.zig:1549 | 6 | 878a05116bd2b21b | a size — OWED: derive from derive.Facts or document the physical/format reason
-src/wire/verbs.zig:1550 | 0x7F | 4ae765078fe54e7d | an encoding constant (magic, mask, flag bit, hash seed) — OWED: name it or document the table
 src/wire/verbs.zig:1601 | 4 | 1b122061cea76ffb | OWED: derive it or document it on the line (charter §1.5)
 src/wire/verbs.zig:1742 | 16 | 0b04229b001eaabf | OWED: derive it or document it on the line (charter §1.5)
 src/wire/verbs.zig:1743 | 32 | 032f2336b5c552fc | OWED: derive it or document it on the line (charter §1.5)

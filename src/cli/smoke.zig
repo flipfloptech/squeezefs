@@ -10187,21 +10187,57 @@ fn fsGetXattrOf(path: [:0]const u8) !u32 {
     return x.fsx_xflags;
 }
 
+/// The mount's open posture, read off the law itself: with regular-file
+/// OPENs served (mainline's zero-copy arm, `SQUEEZEFS_FUSE_ZC_OPEN=1`; the
+/// control arm `SQUEEZEFS_FUSE_NO_OPEN=0`) a write-intent open of an
+/// immutable file is the kernel's own `may_open` answer, EPERM at the
+/// open; under zero-message opens the kernel asks no OPEN, the open
+/// SUCCEEDS and the first write is where the law answers.
+const OpenPosture = enum { served, zero_message };
+
+fn openPostureOf(imm_p: [:0]const u8) !OpenPosture {
+    const rc = linux.open(imm_p.ptr, .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);
+    if (errnoOf(rc)) |e| {
+        try testing.expectEqual(linux.E.PERM, e);
+        return .served;
+    }
+    _ = linux.close(@intCast(rc));
+    return .zero_message;
+}
+
+/// A write-intent open the law refuses: EPERM at the open under served
+/// opens; under zero-message opens the fd, whose first write answers.
+fn openRefusedOrFd(posture: OpenPosture, label: []const u8, path: [:0]const u8, flags: linux.O) !?linux.fd_t {
+    const rc = linux.open(path.ptr, flags, 0);
+    switch (posture) {
+        .served => {
+            try expectErrno(label, .PERM, rc);
+            return null;
+        },
+        .zero_message => {
+            try expectErrno(label, null, rc);
+            return @intCast(rc);
+        },
+    }
+}
+
 /// Every mutation of an IMMUTABLE regular file `imm` (its sibling `other`
 /// a plain file for the rename-onto and link-from probes): EPERM each, as
-/// `may_setattr`/`may_write_xattr`/`may_delete`/`vfs_link` answer on
-/// ext4. Under zero-message opens the kernel asks no OPEN, so a write-
-/// intent open SUCCEEDS and the first write is where the law answers.
-fn expectImmutableFileLaw(p: *FlagPaths, imm: []const u8, other: []const u8, fallocate_served: bool) !void {
+/// `may_open`/`may_setattr`/`may_write_xattr`/`may_delete`/`vfs_link`
+/// answer on ext4.
+fn expectImmutableFileLaw(p: *FlagPaths, posture: OpenPosture, imm: []const u8, other: []const u8, fallocate_served: bool) !void {
     const imm_p = p.of(imm);
-    {
-        const fd = try openRaw(imm_p, .{ .ACCMODE = .RDWR, .CLOEXEC = true });
+    if (try openRefusedOrFd(posture, "open(imm, O_RDWR)", imm_p, .{ .ACCMODE = .RDWR, .CLOEXEC = true })) |fd| {
         defer _ = linux.close(fd);
         try expectErrno("pwrite(imm, 0)", .PERM, linux.pwrite(fd, "X", 1, 0));
         try expectErrno("pwrite(imm, EOF)", .PERM, linux.pwrite(fd, "X", 1, @intCast(fileSize(imm_p))));
         try expectErrno("ftruncate(imm, 0)", .PERM, linux.ftruncate(fd, 0));
         try expectErrno("fchmod(imm)", .PERM, linux.fchmod(fd, 0o600));
         if (fallocate_served) try expectErrno("fallocate(imm)", .PERM, linux.fallocate(fd, 0, 0, 4096));
+    }
+    if (try openRefusedOrFd(posture, "open(imm, O_WRONLY|O_APPEND)", imm_p, .{ .ACCMODE = .WRONLY, .APPEND = true, .CLOEXEC = true })) |fd| {
+        defer _ = linux.close(fd);
+        try expectErrno("write(imm, O_APPEND)", .PERM, linux.write(fd, "X", 1));
     }
     try expectErrno("truncate(imm, 0)", .PERM, linux.syscall2(.truncate, @intFromPtr(imm_p.ptr), 0));
     try expectErrno("open(imm, O_WRONLY|O_TRUNC)", .PERM, linux.open(imm_p.ptr, .{ .ACCMODE = .WRONLY, .TRUNC = true, .CLOEXEC = true }, 0));
@@ -10259,7 +10295,7 @@ fn expectImmutableDirLaw(p: *FlagPaths, idir: []const u8) !void {
 /// An APPEND-ONLY regular file `app`: appends through `O_APPEND` land,
 /// everything else answers EPERM; `utimes(NULL)` passes (the kernel's
 /// `may_setattr`: `ATTR_TOUCH` on an append-only inode is admitted).
-fn expectAppendFileLaw(p: *FlagPaths, app: []const u8, fallocate_served: bool) !void {
+fn expectAppendFileLaw(p: *FlagPaths, posture: OpenPosture, app: []const u8, fallocate_served: bool) !void {
     const app_p = p.of(app);
     const size0 = fileSize(app_p);
     {
@@ -10277,10 +10313,9 @@ fn expectAppendFileLaw(p: *FlagPaths, app: []const u8, fallocate_served: bool) !
         }
     }
     try testing.expectEqual(size0 + 10, fileSize(app_p));
-    {
-        // No O_APPEND: the open passes (zero-message opens), the write is
-        // where the law answers — at EOF too.
-        const fd = try openRaw(app_p, .{ .ACCMODE = .WRONLY, .CLOEXEC = true });
+    // No O_APPEND: `may_open`'s EPERM at a served open; under zero-message
+    // opens the write is where the law answers — at EOF too.
+    if (try openRefusedOrFd(posture, "open(app, O_WRONLY)", app_p, .{ .ACCMODE = .WRONLY, .CLOEXEC = true })) |fd| {
         defer _ = linux.close(fd);
         try expectErrno("pwrite(app, 0)", .PERM, linux.pwrite(fd, "X", 1, 0));
         try expectErrno("pwrite(app, EOF)", .PERM, linux.pwrite(fd, "X", 1, @intCast(fileSize(app_p))));
@@ -10331,12 +10366,16 @@ fn expectAppendDirLaw(p: *FlagPaths, adir: []const u8) !void {
     try testing.expectEqual(handler.inode_flags.FS_APPEND_FL, try getFlagsOf(p.of(adir)));
 }
 
-test "smoke: INODE FLAGS — IMMUTABLE AND APPEND-ONLY ARE LAWS, NOT HINTS (charter §4 inode flags): `chattr +i` on an inline file, a striped file and a directory, `chattr +a` on a file and a directory; `lsattr` shows them through FS_IOC_GETFLAGS and xfs_io's FS_IOC_FSGETXATTR agrees → every mutation of an immutable inode is EPERM (write at 0 and at EOF, truncate, O_TRUNC, chmod, chown, utimes, setxattr, removexattr, unlink, rename as source and as target, link, every create/unlink/rename inside the directory), reads and stats pass → an append-only file takes O_APPEND writes at EOF and refuses every other write, truncate, chmod, chown, explicit utimes, xattr changes, unlink, rename, link — `utimes(NULL)` passes; an append-only directory takes entries and gives none up → `chattr +d` (NODUMP) is EOPNOTSUPP, FS_IOC_FSSETXATTR sets and clears APPEND and GETFLAGS agrees → `chattr -i` restores the file: a write lands → the flags survive umount + fsck --offline --scrub clean + remount, the refusals still stand → cleared, everything removed, fsck clean" {
+/// The inode-flags row in one open posture: the venue's own (mainline's
+/// zero-copy arm serves regular-file opens) or zero-message opens pinned
+/// (`SQUEEZEFS_FUSE_NO_OPEN=1`: the kernel asks no OPEN and every refusal
+/// is the first mutating request's).
+fn inodeFlagsRow(no_open: bool) !void {
     const io = testing.io;
-    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
     const gpa = testing.allocator;
     const rig = try Rig.init(gpa, io);
     defer rig.deinit();
+    if (no_open) try pinNoOpen(rig);
     try rig.formatSet(true);
     try rig.createImage();
     try rig.spawnMount(&.{});
@@ -10347,11 +10386,11 @@ test "smoke: INODE FLAGS — IMMUTABLE AND APPEND-ONLY ARE LAWS, NOT HINTS (char
     // directory, and plain siblings for the rename/link probes; a user
     // xattr on each flagged file BEFORE the flag (the removexattr probe).
     {
-        const out = try rig.onMount("mkdir t && cd t && echo hello > imm && head -c 3000000 \"$1/image\" > imm_big && echo hello > app && mkdir idir adir && echo c > idir/child && echo c > adir/child && echo other > other && echo victim > victim && echo plain > plain && stat -c %s imm imm_big app");
+        const out = try rig.onMount("mkdir t && cd t && echo hello > imm && head -c 3000000 \"$1/image\" > imm_big && head -c 9000000 \"$1/image\" > imm_striped && echo hello > app && head -c 9000000 \"$1/image\" > app_striped && mkdir idir adir && echo c > idir/child && echo c > adir/child && echo other > other && echo victim > victim && echo plain > plain && stat -c %s imm imm_big imm_striped app app_striped");
         defer gpa.free(out);
-        try testing.expectEqualStrings("6\n3000000\n6\n", out);
+        try testing.expectEqualStrings("6\n3000000\n9000000\n6\n9000000\n", out);
     }
-    for ([_][]const u8{ "imm", "imm_big", "app" }) |f| try expectErrno("setxattr(user.k) before the flag", null, linux.setxattr(p.of(f).ptr, "user.k", "v", 1, 0));
+    for ([_][]const u8{ "imm", "imm_big", "imm_striped", "app", "app_striped" }) |f| try expectErrno("setxattr(user.k) before the flag", null, linux.setxattr(p.of(f).ptr, "user.k", "v", 1, 0));
     // Is FALLOCATE served by this build (a plain file's preallocation)?
     // Absent, the kernel answers EOPNOTSUPP itself and the law has no
     // fallocate row to judge.
@@ -10363,14 +10402,23 @@ test "smoke: INODE FLAGS — IMMUTABLE AND APPEND-ONLY ARE LAWS, NOT HINTS (char
     std.debug.print("\nsmoke[flags]: fallocate {s} on this build\n", .{if (fallocate_served) "served" else "absent (EOPNOTSUPP from the kernel)"});
     // chattr/lsattr: the first ioctl pair, as e2fsprogs drives it.
     {
-        const out = try rig.onMount("cd t && chattr +i imm imm_big idir && chattr +a app adir && lsattr -d imm imm_big idir app adir | awk '{print $1}' | tr -d -- '-' | tr '\\n' ' '");
+        const out = try rig.onMount("cd t && chattr +i imm imm_big imm_striped idir && chattr +a app app_striped adir && lsattr -d imm imm_big imm_striped idir app app_striped adir | awk '{print $1}' | tr -d -- '-' | tr '\\n' ' '");
         defer gpa.free(out);
-        try testing.expectEqualStrings("i i i a a ", out);
+        try testing.expectEqualStrings("i i i i a a a ", out);
     }
-    try expectImmutableFileLaw(&p, "imm", "other", fallocate_served);
-    try expectImmutableFileLaw(&p, "imm_big", "other", fallocate_served);
+    // Three write arms: inline (`imm`), the staged resident whose fast
+    // path reads no record (`imm_big`: its cached point is staled by the
+    // flag's own commit and never refilled), the striped passthrough file
+    // whose Shared-class admission reads no record (`imm_striped`: the
+    // probe declines off the view's flags).
+    const posture = try openPostureOf(p.of("imm"));
+    std.debug.print("smoke[flags]: regular-file opens {s} on this mount\n", .{if (posture == .served) "SERVED (the open answers may_open's EPERM)" else "zero-message (the first write answers)"});
+    try expectImmutableFileLaw(&p, posture, "imm", "other", fallocate_served);
+    try expectImmutableFileLaw(&p, posture, "imm_big", "other", fallocate_served);
+    try expectImmutableFileLaw(&p, posture, "imm_striped", "other", fallocate_served);
     try expectImmutableDirLaw(&p, "idir");
-    try expectAppendFileLaw(&p, "app", fallocate_served);
+    try expectAppendFileLaw(&p, posture, "app", fallocate_served);
+    try expectAppendFileLaw(&p, posture, "app_striped", fallocate_served);
     try expectAppendDirLaw(&p, "adir");
     // The plain sibling is untouched by any of it.
     try testing.expectEqual(@as(u32, 0), try getFlagsOf(p.of("plain")));
@@ -10390,9 +10438,10 @@ test "smoke: INODE FLAGS — IMMUTABLE AND APPEND-ONLY ARE LAWS, NOT HINTS (char
         const out = try rig.onMount("cd t && lsattr -d other | awk '{print $1}' | tr -d -- '-'");
         defer gpa.free(out);
         try testing.expectEqualStrings("a\n", out);
-        const fd = try openRaw(p.of("other"), .{ .ACCMODE = .WRONLY, .CLOEXEC = true });
-        defer _ = linux.close(fd);
-        try expectErrno("pwrite(other, 0) while append-only", .PERM, linux.pwrite(fd, "X", 1, 0));
+        if (try openRefusedOrFd(posture, "open(other, O_WRONLY) while append-only", p.of("other"), .{ .ACCMODE = .WRONLY, .CLOEXEC = true })) |fd| {
+            defer _ = linux.close(fd);
+            try expectErrno("pwrite(other, 0) while append-only", .PERM, linux.pwrite(fd, "X", 1, 0));
+        }
     }
     try fsSetXattrOf(p.of("other"), 0);
     try testing.expectEqual(@as(u32, 0), try getFlagsOf(p.of("other")));
@@ -10418,21 +10467,22 @@ test "smoke: INODE FLAGS — IMMUTABLE AND APPEND-ONLY ARE LAWS, NOT HINTS (char
     try rig.spawnMount(&.{});
     _ = try rig.awaitReady(mark);
     {
-        const out = try rig.onMount("cd t && lsattr -d imm imm_big idir app adir other plain | awk '{print $1}' | tr -d -- '-' | tr '\\n' ' '");
+        const out = try rig.onMount("cd t && lsattr -d imm imm_big imm_striped idir app app_striped adir other plain | awk '{print $1}' | tr -d -- '-' | tr '\\n' ' '");
         defer gpa.free(out);
-        try testing.expectEqualStrings("i i i a a   ", out);
+        try testing.expectEqualStrings("i i i i a a a   ", out);
     }
     try expectErrno("unlink(imm) after the remount", .PERM, linux.unlink(p.of("imm").ptr));
     try expectErrno("unlink(idir/child) after the remount", .PERM, linux.unlink(p.of("idir/child").ptr));
-    {
-        const fd = try openRaw(p.of("app"), .{ .ACCMODE = .WRONLY, .CLOEXEC = true });
+    if (try openRefusedOrFd(posture, "open(app, O_WRONLY) after the remount", p.of("app"), .{ .ACCMODE = .WRONLY, .CLOEXEC = true })) |fd| {
         defer _ = linux.close(fd);
         try expectErrno("pwrite(app, 0) after the remount", .PERM, linux.pwrite(fd, "X", 1, 0));
     }
-    try expectImmutableFileLaw(&p, "imm_big", "other", fallocate_served);
+    try expectImmutableFileLaw(&p, posture, "imm_big", "other", fallocate_served);
+    try expectImmutableFileLaw(&p, posture, "imm_striped", "other", fallocate_served);
+    try expectAppendFileLaw(&p, posture, "app_striped", fallocate_served);
     // Cleared, everything goes.
     {
-        const out = try rig.onMount("cd t && chattr -i imm imm_big idir && chattr -a app adir && cd .. && rm -rf t && ls | wc -l");
+        const out = try rig.onMount("cd t && chattr -i imm imm_big imm_striped idir && chattr -a app app_striped adir && cd .. && rm -rf t && ls | wc -l");
         defer gpa.free(out);
         try testing.expectEqualStrings("0\n", out);
     }
@@ -10446,6 +10496,16 @@ test "smoke: INODE FLAGS — IMMUTABLE AND APPEND-ONLY ARE LAWS, NOT HINTS (char
             return error.FsckNotClean;
         }
     }
+}
+
+test "smoke: INODE FLAGS — IMMUTABLE AND APPEND-ONLY ARE LAWS, NOT HINTS (charter §4 inode flags): `chattr +i` on an inline file, a staged file, a striped file and a directory, `chattr +a` on files and a directory; `lsattr` shows them through FS_IOC_GETFLAGS and xfs_io's FS_IOC_FSGETXATTR agrees → every mutation of an immutable inode is EPERM (write at 0 and at EOF, truncate, O_TRUNC, chmod, chown, utimes, setxattr, removexattr, unlink, rename as source and as target, link, every create/unlink/rename inside the directory), reads and stats pass → an append-only file takes O_APPEND writes at EOF and refuses every other write, truncate, chmod, chown, explicit utimes, xattr changes, unlink, rename, link — `utimes(NULL)` passes; an append-only directory takes entries and gives none up → `chattr +d` (NODUMP) is EOPNOTSUPP, FS_IOC_FSSETXATTR sets and clears APPEND and GETFLAGS agrees → `chattr -i` restores the file: a write lands → the flags survive umount + fsck --offline --scrub clean + remount, the refusals still stand → cleared, everything removed, fsck clean (the venue's open posture: served opens answer may_open's EPERM at the open)" {
+    if (venueMissing(testing.io)) |why| return testkit.skipWhy(@src(), why);
+    try inodeFlagsRow(false);
+}
+
+test "smoke: INODE FLAGS UNDER NO-OPEN (SQUEEZEFS_FUSE_NO_OPEN=1, the zero-message posture of the 7.2 rungs): the same row — the kernel asks no OPEN, so a write-intent open of an immutable or append-only file SUCCEEDS and the first write, truncate or O_TRUNC's SETATTR is where the law answers EPERM; every other refusal, the remount and the fsck as before" {
+    if (venueMissing(testing.io)) |why| return testkit.skipWhy(@src(), why);
+    try inodeFlagsRow(true);
 }
 
 /// The frozen-daemon row's request timeout (the seam): the kernel's floor

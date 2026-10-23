@@ -34,6 +34,7 @@ const clock = @import("../../core/clock.zig");
 const lease_epoch = @import("../../data/lease_epoch.zig");
 const purge = @import("../../data/purge.zig");
 const read_path = @import("../../data/read_path.zig");
+const record = @import("../../meta/record.zig");
 const write_lease_core = @import("../write_lease_core.zig");
 const session_mod = @import("session.zig");
 const layout_mod = @import("../../data/layout.zig");
@@ -327,6 +328,11 @@ pub fn buildLease(plane: *plane_mod.DataPlane, nodeid: u64, want_write: bool, wl
     var tag: u64 = 0;
     if (want_write) {
         const w = wl orelse return .{ .refused = .write };
+        // An immutable or append-only inode takes no direct write (the
+        // kernel path answers its every write EPERM; a lease would let
+        // the client's bytes land with no handler to refuse them). The
+        // flag set recalls a standing lease (`kv_fs.ioctl`).
+        if (plane.inodeRecordFlags(ino)) |fl| if (fl & record.INODE_FLAGS_ATTR != 0) return .{ .refused = .write };
         for (0..n_blocks) |b| {
             if (entries[b].vol == wire.LeaseEntry.UNMAPPED) continue;
             switch (plane.wp.probeDirectWriteLease(w.io, ino, @intCast(b))) {

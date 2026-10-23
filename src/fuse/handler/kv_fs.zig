@@ -114,6 +114,8 @@ const lock_order = @import("../../sync/lock_order.zig");
 const sync = @import("../../sync/sync.zig");
 const economy = @import("../../meta/economy.zig");
 const virtual_inodes = @import("virtual_inodes.zig");
+const inode_flags = @import("inode_flags.zig");
+const lease_epoch = @import("../../data/lease_epoch.zig");
 const inos = @import("../../meta/inos.zig");
 const jc = @import("../../meta/journal_core.zig");
 const route_table = @import("../../meta/routing/route_table.zig");
@@ -309,6 +311,13 @@ pub var dentry_without_inode: counters.Tripwire = .init("fuse_dentry_without_ino
 /// A stored layout record this binary cannot decode (must stay 0: the
 /// codec is total over the encoder's forms).
 pub var layout_record_corrupt: counters.Tripwire = .init("fuse_layout_record_corrupt");
+/// `fuse_inode_flag_refusals`: mutations refused EPERM by an inode's
+/// IMMUTABLE/APPEND flag (`inode_flags.zig`'s law): the write, setattr,
+/// xattr, name and open arms together.
+pub var fuse_inode_flag_refusals: counters.ShardedCounter = .{};
+/// `fuse_inode_flag_sets`: FS_IOC_SETFLAGS/FSSETXATTR requests that changed
+/// the record (a no-op set counts nothing).
+pub var fuse_inode_flag_sets: counters.ShardedCounter = .{};
 /// `fuse_reserved_xattr_refusals`: the allowlist's engagement — a set/get/
 /// remove of a name outside `user.*` (minus `user.squeezefs.`), `security.*`,
 /// `trusted.*` (a counter, not a tripwire: a probing tenant is not a
@@ -1098,6 +1107,115 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             const v = try self.readInode(ino);
             if (!economy.isDirMode(v.mode)) return error.NotDir;
             return v;
+        }
+
+        // ---- inode flags: the law's checks (`inode_flags.zig`) ----
+
+        /// The record of `global` read for a flag check alone: the holder's
+        /// folded record for a foreign object (its token: RAM while
+        /// cached), else this slot's record off the store with no copy
+        /// and no fold (the flags ride no parked refinement). Null = no
+        /// record (the caller's ENOENT, or an op whose own read says so).
+        fn attrFlagsOf(self: *Self, global: u64) Error!?u32 {
+            const local = try localOf(global);
+            if (try self.tokenServe(local, .{})) |served| {
+                defer served.release(self.io);
+                const e = served.entry orelse return null;
+                return e.attrs.flags;
+            }
+            const Flags = struct {
+                fn of(_: void, bytes: []const u8) ?u32 {
+                    return (InodeValue.decode(bytes) catch return null).flags;
+                }
+            };
+            const f = (self.store.lookupView(self.gpa, key.TREE_INODES, &key.inodeKey(local), ?u32, {}, Flags.of) catch |e| return storeErr(e)) orelse return null;
+            return f orelse error.InputOutput;
+        }
+
+        /// `attrFlagsOf` as a record carrying the flags alone (the law's
+        /// predicates read `InodeValue`); an absent record carries none.
+        fn flagsRecordOf(self: *Self, global: u64) Error!InodeValue {
+            return .{ .flags = (try self.attrFlagsOf(global)) orelse 0 };
+        }
+
+        fn flagRefusal() Error {
+            fuse_inode_flag_refusals.inc();
+            return error.PermissionDenied;
+        }
+
+        /// EPERM when `v` is immutable or append-only: the victim of an
+        /// unlink/rmdir/rename (`may_delete`), the source of a link
+        /// (`vfs_link`), the subject of a setxattr/removexattr
+        /// (`may_write_xattr`).
+        fn refuseRestricted(v: InodeValue) Error!void {
+            if (v.isRestricted()) return flagRefusal();
+        }
+
+        /// EPERM when a child may not be made in directory `dir` (`may_create`).
+        fn refuseCreateIn(dir: InodeValue) Error!void {
+            if (inode_flags.createInRefused(dir)) return flagRefusal();
+        }
+
+        /// EPERM when a child may not be removed from directory `dir`
+        /// (`may_delete`'s directory half).
+        fn refuseRemoveFrom(dir: InodeValue) Error!void {
+            if (inode_flags.removeFromRefused(dir)) return flagRefusal();
+        }
+
+        /// The directory law for the LOGICAL parent when it is not the key
+        /// parent (a striped directory's stripe carries no flags of its
+        /// own: the directory the caller named rules).
+        fn refuseLogicalParent(self: *Self, key_parent: u64, logical_parent: u64, comptime removing: bool) Error!void {
+            if (key_parent == logical_parent) return;
+            const dv = try self.flagsRecordOf(logical_parent);
+            if (removing) try refuseRemoveFrom(dv) else try refuseCreateIn(dv);
+        }
+
+        /// A RENAME's law (`may_delete` on the source name and a replaced
+        /// destination, `may_create` on a fresh destination name,
+        /// `vfs_rename`'s victims): the source directory gives an entry up;
+        /// the moved inode and a replaced destination are victims; the
+        /// destination directory takes an entry (fresh) or gives one up
+        /// (replaced); an exchange is two removals and two insertions.
+        fn refuseRename(self: *Self, a: filesystem.RenameArgs, logical: LogicalParents, old_pv: InodeValue, new_pv: InodeValue, src: InodeValue, dest: ?InodeValue, exchange: bool) Error!void {
+            try refuseRemoveFrom(old_pv);
+            try self.refuseLogicalParent(a.parent, logical.old, true);
+            try refuseRestricted(src);
+            if (dest) |d| {
+                try refuseRestricted(d);
+                try refuseRemoveFrom(new_pv);
+                try self.refuseLogicalParent(a.newparent, logical.new, true);
+            } else {
+                try refuseCreateIn(new_pv);
+                try self.refuseLogicalParent(a.newparent, logical.new, false);
+            }
+            // The exchanged destination lands under the source's directory.
+            if (exchange) try refuseCreateIn(old_pv);
+        }
+
+        /// A SETATTR's law over the record (`inode_flags.setattrRefused`).
+        fn refuseSetattr(v: InodeValue, attr: filesystem.SetAttr) Error!void {
+            if (!v.isRestricted()) return;
+            if (inode_flags.setattrRefused(v, attr.mode != null or attr.uid != null or attr.gid != null, attr.size != null, attr.times_set)) return flagRefusal();
+        }
+
+        /// A WRITE's law over the record an arm read before its bytes
+        /// land: an immutable file refuses; an append-only one admits an
+        /// `O_APPEND` write at its claimed EOF alone. The two arms that
+        /// read no record — the Shared class and the staged fast path —
+        /// are never reached by a restricted inode: the data plane's
+        /// admission probe and staged-point cache read the flags off its
+        /// view (`plane.sharedProbe`, `plane.stagedPoint`).
+        fn refuseWriteOn(self: *Self, v: InodeValue, local: u64, a: filesystem.WriteArgs) Error!void {
+            if (!v.isRestricted()) return;
+            if (inode_flags.writeRefused(v, a.flags, a.offset, self.claimedSize(local, v))) return flagRefusal();
+        }
+
+        /// A FALLOCATE's law (the handler's first line): immutable refuses,
+        /// append-only admits space preallocation alone (`vfs_fallocate`).
+        pub fn refuseFallocate(self: *Self, global: u64, mode: u32) Error!void {
+            const v = try self.flagsRecordOf(global);
+            if (v.isRestricted() and inode_flags.fallocateRefused(v, mode)) return flagRefusal();
         }
 
         fn attrOf(self: *Self, global: u64, v: InodeValue) abi.fuse_attr {
@@ -2224,6 +2342,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 // A foreign-slot file: ONE shipped verb to its holder
                 // (charter §5.5 "Record-level mutations of a foreign-slot
                 // file"); the reply is the holder's folded record.
+                try refuseSetattr(try self.flagsRecordOf(a.ino), a.attr);
                 const req = a.attr.toEconomy();
                 // This writer's custody of the file lands (and its barrier
                 // runs) before the holder's size path reads the layout
@@ -2243,6 +2362,9 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             errdefer if (layout_lock) |g| g.release(self.io);
             if (a.attr.size) |sz| {
                 const probe = (try self.readInodeOpt(local)) orelse return error.FileNotFound;
+                // The flag law BEFORE the size path's side effects (its
+                // zeros, its custody settle).
+                try refuseSetattr(probe, a.attr);
                 if (!(probe.mode & S.IFMT == S.IFREG)) return error.InvalidArgument;
                 const rec = try self.readLayout(local);
                 kind = kindOf(rec);
@@ -2268,6 +2390,9 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             var t_owned = true;
             errdefer if (t_owned) self.store.abandon(t);
             var stored = try self.readInode(local);
+            // The flag law on the record in hand (the size path judged
+            // its probe above, before its side effects).
+            if (a.attr.size == null) try refuseSetattr(stored, a.attr);
             if (a.attr.size) |sz| {
                 // The size epoch moves BEFORE the clip, under the guards:
                 // a write whose bytes landed before this moment claims no
@@ -2362,6 +2487,10 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             var t_owned = true;
             errdefer if (t_owned) self.store.abandon(t);
             const pv = try self.readDir(parent);
+            // An immutable directory takes no entry (`may_create`): the key
+            // parent's record is in hand; a striped directory's own too.
+            try refuseCreateIn(pv);
+            try self.refuseLogicalParent(parent_global, logical_parent, false);
             var chain: ChainBuf = .{ .gpa = self.gpa };
             defer chain.deinit();
             var kvs: std.ArrayList(tree.KeyValue) = .empty;
@@ -2409,6 +2538,8 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             const parent = try localOf(parent_global);
             const pv = try self.readDir(parent);
             if (pv.nlink == 0) return error.FileNotFound;
+            try refuseCreateIn(pv);
+            try self.refuseLogicalParent(parent_global, logical_parent, false);
             if (try self.findDentry(parent, name)) |f| {
                 if (isOwnChild(c, f.global)) return self.ownCreate(f.global, logical_parent);
                 return error.PathAlreadyExists;
@@ -2486,13 +2617,17 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             if (want_dir and !probe.isDir()) return error.NotDir;
             if (!want_dir and probe.isDir()) return error.IsDir;
             if (want_dir) if (self.stripes) |st| if (try st.mapOf(probe.global) != null) {
+                // `may_delete` for the striped rmdir (its own intent below).
+                try refuseRemoveFrom(try self.flagsRecordOf(parent_global));
+                try self.refuseLogicalParent(parent_global, logical_parent, true);
+                try refuseRestricted(try self.flagsRecordOf(probe.global));
                 c.stage(.meta_backend_start);
                 defer c.stage(.meta_backend_done);
                 try st.rmdir(parent_global, name, probe.global);
                 self.forgetParent(probe.global);
                 return;
             };
-            if (self.needsIntent(&.{ parent_global, probe.global })) return self.xvRemove(c, parent_global, name, probe, want_dir);
+            if (self.needsIntent(&.{ parent_global, probe.global })) return self.xvRemove(c, parent_global, logical_parent, name, probe, want_dir);
             var plan: economy.GuardPlan = .{};
             const shared = economy.unlinkParentShared(want_dir, parent, probe.local);
             plan.inode_reqs[0] = .{ .ino = parent, .mode = if (shared) .shared else .exclusive };
@@ -2508,14 +2643,21 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             const found = (try self.findDentry(parent, name)) orelse return error.FileNotFound;
             if (found.global != probe.global) return error.FileNotFound;
             const cv = try self.readInode(found.local);
-            if (want_dir and try self.dirHasEntries(found.local)) return error.DirectoryNotEmpty;
             const pv: ?InodeValue = if (shared) null else try self.readDir(parent);
+            // `may_delete` (before the ENOTEMPTY probe, as the kernel's
+            // order): an immutable or append-only victim stays; an
+            // immutable or append-only directory gives no entry up (the
+            // parked-times arm reads the parent's flags alone).
+            try refuseRestricted(cv);
+            try refuseRemoveFrom(pv orelse try self.flagsRecordOf(parent_global));
+            try self.refuseLogicalParent(parent_global, logical_parent, true);
+            if (want_dir and try self.dirHasEntries(found.local)) return error.DirectoryNotEmpty;
             const req: economy.Unlink = .{ .now = now(), .parent = parent, .name = name, .pos = found.pos, .child = found.local, .child_value = cv, .is_dir = want_dir, .parent_value = pv, .park_parent_times = self.times_park };
             const out = if (want_dir) try economy.stageRmdir(t, req) else try economy.stageUnlink(t, req);
             if (out.parent == .parked_times) try self.parkParentTimes(parent, req.now);
             t_owned = false;
             self.commit(c, t) catch |e| {
-                if (self.redispatches(e)) return self.xvRemove(c, parent_global, name, found, want_dir);
+                if (self.redispatches(e)) return self.xvRemove(c, parent_global, logical_parent, name, found, want_dir);
                 return e;
             };
             if (want_dir) self.forgetParent(found.global);
@@ -2524,9 +2666,12 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         /// The cross-owner unlink/rmdir: the name FIRST, the count second
         /// (its witness at the child's holder); a child with NO record is
         /// the dangling arm (the name goes alone, loud).
-        fn xvRemove(self: *Self, c: *Ctx, parent_global: u64, name: []const u8, found: Found, want_dir: bool) Error!void {
+        fn xvRemove(self: *Self, c: *Ctx, parent_global: u64, logical_parent: u64, name: []const u8, found: Found, want_dir: bool) Error!void {
             const cv = try self.readInodeOpt(found.local);
             if (cv == null) sym_xv.ops.stats.xv_cross_owner_dangling_names.fire("a name whose child has no record at its holder");
+            if (cv) |v| try refuseRestricted(v);
+            try refuseRemoveFrom(try self.flagsRecordOf(parent_global));
+            try self.refuseLogicalParent(parent_global, logical_parent, true);
             if (want_dir and try self.dirHasEntriesAt(found)) return error.DirectoryNotEmpty;
             const plan = sym_xv.steps.planUnlink(.{ .parent = parent_global, .name = name, .child = found.global, .child_value = cv, .is_dir = want_dir, .now = now() });
             noteSubjects(c, found.global, null);
@@ -2623,6 +2768,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             const old_pv = try self.readDir(old_parent);
             const new_pv: InodeValue = if (old_parent == new_parent) old_pv else try self.readDir(new_parent);
             const dest_value: ?InodeValue = if (new) |n| try self.readInode(n.local) else null;
+            try self.refuseRename(a, logical, old_pv, new_pv, try self.flagsRecordOf(old.global), dest_value, flags.exchange);
             const dest_has_entries = if (new) |n| (n.isDir() and try self.dirHasEntries(n.local)) else false;
             var wo: ?economy.Whiteout = null;
             if (whiteout) {
@@ -2703,6 +2849,13 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                     if (flags.noreplace) return error.PathAlreadyExists;
                     if (n.isDir() and try self.dirHasEntriesAt(n)) return error.DirectoryNotEmpty;
                 }
+            }
+            // The flag law over the holders' records (each its token's).
+            {
+                const old_pv = try self.flagsRecordOf(a.parent);
+                const new_pv = if (a.parent == a.newparent) old_pv else try self.flagsRecordOf(a.newparent);
+                const dv: ?InodeValue = if (new0) |n| (try self.readInodeOpt(n.local)) orelse return error.FileNotFound else null;
+                try self.refuseRename(a, logical, old_pv, new_pv, cv, dv, flags.exchange);
             }
             const stamp = now();
             if (flags.exchange) {
@@ -2859,7 +3012,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             a.newparent = try self.insertParentOf(a0.newparent, a0.newname);
             const parent = try localOf(a.newparent);
             const child = try localOf(a.ino);
-            if (self.needsIntent(&.{ a.newparent, a.ino })) return self.xvLink(c, a);
+            if (self.needsIntent(&.{ a.newparent, a.ino })) return self.xvLink(c, a, a0.newparent);
             var plan: economy.GuardPlan = .{};
             plan.inode_reqs[0] = .{ .ino = parent, .mode = .exclusive };
             plan.inode_reqs[1] = .{ .ino = child, .mode = .exclusive };
@@ -2873,6 +3026,11 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             const pv = try self.readDir(parent);
             const cv = try self.readInode(child);
             if (economy.isDirMode(cv.mode)) return error.AccessDenied;
+            // `vfs_link`: an immutable or append-only file gains no name;
+            // `may_create`: an immutable directory takes none.
+            try refuseRestricted(cv);
+            try refuseCreateIn(pv);
+            try self.refuseLogicalParent(a.newparent, a0.newparent, false);
             var chain: ChainBuf = .{ .gpa = self.gpa };
             defer chain.deinit();
             var kvs: std.ArrayList(tree.KeyValue) = .empty;
@@ -2886,7 +3044,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             };
             t_owned = false;
             self.commit(c, t) catch |e| {
-                if (self.redispatches(e)) return self.xvLink(c, a);
+                if (self.redispatches(e)) return self.xvLink(c, a, a0.newparent);
                 return e;
             };
             _ = self.pending.retire(child);
@@ -2895,12 +3053,15 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
 
         /// The cross-owner link: the count FIRST (its witness at the file's
         /// holder; EMLINK before any step), the insert second.
-        fn xvLink(self: *Self, c: *Ctx, a: filesystem.LinkArgs) Error!filesystem.Entry {
+        fn xvLink(self: *Self, c: *Ctx, a: filesystem.LinkArgs, logical_parent: u64) Error!filesystem.Entry {
             const parent = try localOf(a.newparent);
             const child = try localOf(a.ino);
-            _ = try self.readDir(parent);
+            const pv = try self.readDir(parent);
             const cv = try self.readInode(child);
             if (economy.isDirMode(cv.mode)) return error.AccessDenied;
+            try refuseRestricted(cv);
+            try refuseCreateIn(pv);
+            try self.refuseLogicalParent(a.newparent, logical_parent, false);
             if (try self.findDentry(parent, a.newname) != null) return error.PathAlreadyExists;
             const plan = sym_xv.steps.planLink(.{ .parent = a.newparent, .name = a.newname, .ino = a.ino, .child_value = cv, .now = now() }) catch return error.TooManyLinks;
             noteSubjects(c, a.ino, null);
@@ -2922,6 +3083,9 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             const local = try localOf(a.ino);
             const v = try self.readInode(local);
             if (economy.isDirMode(v.mode)) return error.IsDir;
+            // The served-open arm answers at the open what the kernel's
+            // `may_open` would (under zero-message opens the WRITE does).
+            if (inode_flags.openRefused(v, a.flags)) return flagRefusal();
             // ATOMIC_O_TRUNC: the truncate rides the open (no separate SETATTR).
             if (a.flags & O_TRUNC != 0 and v.mode & S.IFMT == S.IFREG) {
                 // A foreign-slot file's size is its holder's (decision 0003
@@ -3141,6 +3305,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             var t_owned = true;
             errdefer if (t_owned) self.store.abandon(t);
             var v = try self.readInode(local);
+            try self.refuseWriteOn(v, local, a);
             if (v.mode & S.IFMT != S.IFREG) return error.InvalidArgument;
             // The new image: the old bytes zero-extended to max(old, end), the write overlaid.
             const old_data: []const u8 = if (rec) |r| r.layout.data else &.{};
@@ -3176,6 +3341,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         fn writeStaged(self: *Self, c: *Ctx, local: u64, a: filesystem.WriteArgs, rec: ?LayoutRec, end: u64, layout_lock: *?Data.LayoutGuard) Error!?filesystem.Written {
             const data = try self.payloadBytes(a);
             const probe = try self.readInode(local);
+            try self.refuseWriteOn(probe, local, a);
             if (probe.mode & S.IFMT != S.IFREG) return error.InvalidArgument;
             const size = @max(probe.size, end);
             const extending = a.offset >= probe.size;
@@ -3383,6 +3549,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 return error.FileTooBig;
             }
             const probe = try self.readInode(local);
+            try self.refuseWriteOn(probe, local, a);
             if (probe.mode & S.IFMT != S.IFREG) return error.InvalidArgument;
             // The base is the ACCEPTED size: a claim parked by an earlier
             // write whose bytes are not durable yet is the extension law's
@@ -4154,6 +4321,8 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             if (std.mem.eql(u8, a.name, sym_xv.stripe.COMMAND_XATTR)) if (self.stripes) |st| {
                 c.stage(.meta_backend_start);
                 defer c.stage(.meta_backend_done);
+                // The flip is a mutation of the directory (`may_write_xattr`).
+                try refuseRestricted(try self.flagsRecordOf(a.ino));
                 if (self.foreignSlot(a.ino)) {
                     _ = try self.shipRecord(a.ino, .{ .setxattr = .{ .name = a.name, .value = a.value } });
                     return;
@@ -4165,6 +4334,9 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             if (a.value.len > record.xattrValueCap(self.store.nodeSize())) return error.ValueTooLarge;
             const local = try localOf(a.ino);
             if (self.foreignSlot(a.ino)) {
+                // `may_write_xattr`: an immutable or append-only inode's
+                // xattrs stand (the holder's record says which).
+                try refuseRestricted(try self.flagsRecordOf(a.ino));
                 const present = (try self.xattrValue(local, a.name)) != null;
                 if (a.flags & XATTR_CREATE != 0 and present) return error.PathAlreadyExists;
                 if (a.flags & XATTR_REPLACE != 0 and !present) return error.NoAttribute;
@@ -4175,6 +4347,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             var t_owned = true;
             errdefer if (t_owned) self.store.abandon(t);
             var v = try self.readInode(local);
+            try refuseRestricted(v);
             const k = try self.xattrKeyFor(local, a.name);
             if (k.existing) |e| self.gpa.free(e);
             if (a.flags & XATTR_CREATE != 0 and k.existing != null) return error.PathAlreadyExists;
@@ -4275,6 +4448,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             try screenXattr(a.name, error.PermissionDenied);
             const local = try localOf(a.ino);
             if (self.foreignSlot(a.ino)) {
+                try refuseRestricted(try self.flagsRecordOf(a.ino));
                 const rep = try self.shipRecord(a.ino, .{ .removexattr = .{ .name = a.name } });
                 if (rep.inode == null) return error.NoAttribute;
                 return;
@@ -4283,6 +4457,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             var t_owned = true;
             errdefer if (t_owned) self.store.abandon(t);
             var v = try self.readInode(local);
+            try refuseRestricted(v);
             var occ: [256]u8 = undefined;
             var n: usize = 0;
             const hit = (try self.findXattr(local, a.name, &occ, &n)) orelse return error.NoAttribute;
@@ -4293,6 +4468,63 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             t_owned = false;
             try self.commit(c, t);
             _ = self.pending.retire(local);
+        }
+
+        /// FS_IOC_GETFLAGS/SETFLAGS and FS_IOC_FSGETXATTR/FSSETXATTR
+        /// (`inode_flags.zig`: the request shape, the flag set, the law).
+        /// Any other command is ENOSYS, which the kernel answers as ENOTTY.
+        /// A SET is one record Put (the flags, a new ctime) under the
+        /// inode's exclusive guard; a foreign-slot inode's is ONE shipped
+        /// setattr verb carrying the attribute bits (charter §5.5).
+        pub fn ioctl(self: *Self, c: *Ctx, a: filesystem.IoctlArgs) Error!filesystem.Ioctl {
+            if (virtual_inodes.isVirtualIno(a.ino)) return error.NotImplemented;
+            const cmd = inode_flags.command(a.cmd) orelse return error.NotImplemented;
+            const ok: filesystem.Ioctl = .{ .out = .{ .result = 0, .flags = 0, .in_iovs = 0, .out_iovs = 0 }, .data_len = 0 };
+            const local = try localOf(a.ino);
+            if (!cmd.isSet()) {
+                const v = try self.readInode(local);
+                const n = inode_flags.encodeGet(cmd, v.flags, a.out_size, c.window[filesystem.IOCTL_DATA_OFFSET..]) catch return error.InvalidArgument;
+                return .{ .out = ok.out, .data_len = n };
+            }
+            if (a.out_size != 0) return error.InvalidArgument;
+            if (self.foreignSlot(a.ino)) {
+                const cur = try self.readInode(local);
+                const want = inode_flags.resolveSet(cmd, cur.flags, a.in) catch |e| return setFlagsError(e);
+                if (want == cur.flags) return ok;
+                _ = try self.shipRecord(a.ino, .{ .setattr = .{ .flags = want & record.INODE_FLAGS_ATTR } });
+                fuse_inode_flag_sets.inc();
+                return ok;
+            }
+            const t = try self.beginExclusive(local, @src());
+            var t_owned = true;
+            errdefer if (t_owned) self.store.abandon(t);
+            var v = try self.readInode(local);
+            const want = inode_flags.resolveSet(cmd, v.flags, a.in) catch |e| return setFlagsError(e);
+            if (want == v.flags) {
+                t_owned = false;
+                self.store.abandon(t);
+                return ok;
+            }
+            v.flags = want;
+            v.ctime = now();
+            try t.stagePut(key.TREE_INODES, &key.inodeKey(local), &v.encode());
+            t_owned = false;
+            try self.commit(c, t);
+            _ = self.pending.retire(local);
+            fuse_inode_flag_sets.inc();
+            // The write law tightened: a direct client's WRITE lease of the
+            // inode ends (one load when none stands; the lifecycle's
+            // exclusive guard recalled before the hold, this catches a
+            // grant that slipped in between — decision 0003 §AY).
+            if (want & record.INODE_FLAGS_ATTR != 0) lease_epoch.recallWrites(local);
+            return ok;
+        }
+
+        fn setFlagsError(e: inode_flags.SetError) Error {
+            return switch (e) {
+                error.NotSupported => error.NotSupported,
+                error.InvalidArgument => error.InvalidArgument,
+            };
         }
     };
 }
@@ -7351,6 +7583,261 @@ test "POSIX: xattrs — set/get/list/remove, the size probe, ERANGE, CREATE/REPL
     try testing.expectEqual(linux.E.NODATA, h.call(.{ .getxattr = .{ .name = "user.a", .size = 0 } }, f).errno().?);
     // The data record is untouched by the xattr traffic.
     try testing.expectEqualStrings("data", h.read(f, 0, 64).body);
+}
+
+// ---------------------------------------------------------------------------
+// Inode flags (charter §4; `inode_flags.zig`).
+// ---------------------------------------------------------------------------
+
+/// `ioctl(cmd)` on `ino` as the kernel's `fuse_priv_ioctl` sends it (`fh`
+/// 0 under zero-message opens, `FUSE_IOCTL_DIR` on a directory, in/out
+/// sizes by the command's direction).
+fn flagIoctl(h: *Harness, ino: u64, cmd: u32, in: []const u8, out_size: u32, dir: bool) Loopback.Captured {
+    const flags: u32 = if (dir) abi.FUSE_IOCTL_DIR else 0;
+    return h.call(.{ .ioctl = .{ .in = .{ .fh = 0, .flags = flags, .cmd = cmd, .arg = 0, .in_size = @intCast(in.len), .out_size = out_size }, .data = in } }, ino);
+}
+
+fn getFlags(h: *Harness, ino: u64, dir: bool) !u32 {
+    const c = flagIoctl(h, ino, inode_flags.FS_IOC_GETFLAGS, &.{}, inode_flags.FLAGS_WORD_LEN, dir);
+    if (c.errno()) |e| {
+        std.debug.print("FS_IOC_GETFLAGS: errno {t}\n", .{e});
+        return error.TestUnexpectedErrno;
+    }
+    const out = abi.decodeExact(abi.fuse_ioctl_out, c.outBytes()) orelse return error.TestBadReply;
+    try testing.expectEqual(@as(i32, 0), out.result);
+    try testing.expectEqual(@as(u32, 0), out.flags);
+    try testing.expectEqual(@as(usize, inode_flags.FLAGS_WORD_LEN), c.body.len);
+    return std.mem.readInt(u32, c.body[0..inode_flags.FLAGS_WORD_LEN], .little);
+}
+
+fn setFlags(h: *Harness, ino: u64, fl: u32, dir: bool) ?linux.E {
+    var w: [inode_flags.FLAGS_WORD_LEN]u8 = undefined;
+    std.mem.writeInt(u32, &w, fl, .little);
+    return flagIoctl(h, ino, inode_flags.FS_IOC_SETFLAGS, &w, 0, dir).errno();
+}
+
+fn setXflags(h: *Harness, ino: u64, xflags: u32) ?linux.E {
+    var x = inode_flags.Fsxattr.zero;
+    x.fsx_xflags = xflags;
+    return flagIoctl(h, ino, inode_flags.FS_IOC_FSSETXATTR, &std.mem.toBytes(x), 0, false).errno();
+}
+
+fn writeWith(h: *Harness, ino: u64, offset: u64, data: []const u8, o_flags: u32) ?linux.E {
+    const in: abi.fuse_write_in = .{ .fh = 1, .offset = offset, .size = @intCast(data.len), .write_flags = 0, .lock_owner = 0, .flags = o_flags, .padding = 0 };
+    return h.call(.{ .write = .{ .in = in, .data = data } }, ino).errno();
+}
+
+const o_wronly: u32 = @bitCast(linux.O{ .ACCMODE = .WRONLY });
+const o_append_w: u32 = @bitCast(linux.O{ .ACCMODE = .WRONLY, .APPEND = true });
+
+test "inode flags: the four ioctls serve the record — GETFLAGS 4 B and FSGETXATTR 28 B exactly (a wrong out_size EINVAL), SETFLAGS/FSSETXATTR store IMMUTABLE/APPEND, move ctime and count a set; the word read back is a no-op; a bit the record cannot hold is EOPNOTSUPP; an unknown command and a virtual inode are ENOSYS (the kernel's ENOTTY); a directory serves them too" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    const f = try h.create(1, "f", 0o644);
+    h.release(f);
+    const d = try h.mkdir(1, "d");
+    const sets0 = fuse_inode_flag_sets.load();
+    try testing.expectEqual(@as(u32, 0), try getFlags(&h, f, false));
+    const ctime0 = (try h.fs.readInodeOpt(try MemFs.localOf(f))).?.ctime;
+    awaitCoarseTickAfter(ctime0);
+    try testing.expectEqual(@as(?linux.E, null), setFlags(&h, f, inode_flags.FS_IMMUTABLE_FL, false));
+    try testing.expectEqual(inode_flags.FS_IMMUTABLE_FL, try getFlags(&h, f, false));
+    try testing.expect(economy.laterThan((try h.fs.readInodeOpt(try MemFs.localOf(f))).?.ctime, ctime0));
+    try testing.expectEqual(sets0 + 1, fuse_inode_flag_sets.load());
+    // The second pair agrees, and sets.
+    {
+        const c = flagIoctl(&h, f, inode_flags.FS_IOC_FSGETXATTR, &.{}, @sizeOf(inode_flags.Fsxattr), false);
+        try testing.expectEqual(@as(?linux.E, null), c.errno());
+        try testing.expectEqual(@as(usize, @sizeOf(inode_flags.Fsxattr)), c.body.len);
+        const x = std.mem.bytesToValue(inode_flags.Fsxattr, c.body[0..@sizeOf(inode_flags.Fsxattr)]);
+        try testing.expectEqual(inode_flags.FS_XFLAG_IMMUTABLE, x.fsx_xflags);
+        try testing.expectEqual(@as(u32, 0), x.fsx_projid);
+    }
+    try testing.expectEqual(@as(?linux.E, null), setXflags(&h, f, inode_flags.FS_XFLAG_APPEND));
+    try testing.expectEqual(inode_flags.FS_APPEND_FL, try getFlags(&h, f, false));
+    try testing.expectEqual(sets0 + 2, fuse_inode_flag_sets.load());
+    // The word read back: nothing moves (no set counted, ctime stands).
+    const ctime1 = (try h.fs.readInodeOpt(try MemFs.localOf(f))).?.ctime;
+    awaitCoarseTickAfter(ctime1);
+    try testing.expectEqual(@as(?linux.E, null), setFlags(&h, f, inode_flags.FS_APPEND_FL, false));
+    try testing.expectEqual(sets0 + 2, fuse_inode_flag_sets.load());
+    try testing.expectEqual(ctime1, (try h.fs.readInodeOpt(try MemFs.localOf(f))).?.ctime);
+    // Bits the record cannot hold.
+    try testing.expectEqual(linux.E.OPNOTSUPP, setFlags(&h, f, inode_flags.FS_APPEND_FL | 0x00000040, false).?); // + FS_NODUMP_FL
+    try testing.expectEqual(linux.E.OPNOTSUPP, setXflags(&h, f, 0x00000800).?); // FS_XFLAG_NODUMP
+    try testing.expectEqual(inode_flags.FS_APPEND_FL, try getFlags(&h, f, false));
+    // The argument sizes are the command's.
+    try testing.expectEqual(linux.E.INVAL, flagIoctl(&h, f, inode_flags.FS_IOC_GETFLAGS, &.{}, 8, false).errno().?);
+    try testing.expectEqual(linux.E.INVAL, flagIoctl(&h, f, inode_flags.FS_IOC_SETFLAGS, "ab", 0, false).errno().?);
+    // Not ours: ENOSYS, which the kernel's fuse_send_ioctl answers as ENOTTY.
+    try testing.expectEqual(linux.E.NOSYS, flagIoctl(&h, f, linux.IOCTL.IOR('f', 11, u64), &.{}, 8, false).errno().?);
+    try testing.expectEqual(linux.E.NOSYS, flagIoctl(&h, virtual_inodes.GEN_INO_FIRST, inode_flags.FS_IOC_GETFLAGS, &.{}, 4, false).errno().?);
+    // A directory.
+    try testing.expectEqual(@as(?linux.E, null), setFlags(&h, d, inode_flags.FS_IMMUTABLE_FL, true));
+    try testing.expectEqual(inode_flags.FS_IMMUTABLE_FL, try getFlags(&h, d, true));
+    // Cleared: the record's STRIPE bit is never touched (none here), the
+    // attribute bits go.
+    try testing.expectEqual(@as(?linux.E, null), setFlags(&h, f, 0, false));
+    try testing.expectEqual(@as(?linux.E, null), setFlags(&h, d, 0, true));
+    try testing.expectEqual(@as(u32, 0), try getFlags(&h, f, false));
+    try testing.expectEqual(@as(u32, 0), try getFlags(&h, d, true));
+}
+
+test "inode flags: IMMUTABLE refuses every mutating handler with EPERM — write at 0 and at EOF, setattr (mode, owner, size, NOW times, explicit times), setxattr/removexattr, unlink, rename as source and as target, link; reads, getattr and getxattr pass; an immutable directory takes no create/mkdir/mknod/symlink/link, gives no entry up (unlink, rename out, rmdir) and takes none in; chattr -i restores" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    const f = try h.create(1, "f", 0o644);
+    _ = h.write(f, 0, "hello", 0);
+    h.release(f);
+    try testing.expectEqual(@as(?linux.E, null), h.call(.{ .setxattr = .{ .name = "user.k", .value = "v", .flags = 0 } }, f).errno());
+    const other = try h.create(1, "other", 0o644);
+    h.release(other);
+    const d = try h.mkdir(1, "d");
+    const child = try h.create(d, "child", 0o644);
+    h.release(child);
+    const refusals0 = fuse_inode_flag_refusals.load();
+    try testing.expectEqual(@as(?linux.E, null), setFlags(&h, f, inode_flags.FS_IMMUTABLE_FL, false));
+    try testing.expectEqual(@as(?linux.E, null), setFlags(&h, d, inode_flags.FS_IMMUTABLE_FL, true));
+    // The file.
+    try testing.expectEqual(linux.E.PERM, writeWith(&h, f, 0, "X", o_wronly).?);
+    try testing.expectEqual(linux.E.PERM, writeWith(&h, f, 5, "X", o_append_w).?);
+    var sa = abi.zeroed(abi.fuse_setattr_in);
+    sa.valid = abi.FATTR_MODE;
+    sa.mode = 0o600;
+    try testing.expectEqual(linux.E.PERM, h.setattr(f, sa).errno().?);
+    sa.valid = abi.FATTR_UID;
+    sa.uid = 1;
+    try testing.expectEqual(linux.E.PERM, h.setattr(f, sa).errno().?);
+    sa.valid = abi.FATTR_SIZE;
+    sa.size = 0;
+    try testing.expectEqual(linux.E.PERM, h.setattr(f, sa).errno().?);
+    sa.valid = abi.FATTR_ATIME | abi.FATTR_ATIME_NOW | abi.FATTR_MTIME | abi.FATTR_MTIME_NOW;
+    try testing.expectEqual(linux.E.PERM, h.setattr(f, sa).errno().?);
+    sa.valid = abi.FATTR_MTIME;
+    sa.mtime = 7;
+    try testing.expectEqual(linux.E.PERM, h.setattr(f, sa).errno().?);
+    try testing.expectEqual(linux.E.PERM, h.call(.{ .setxattr = .{ .name = "user.n", .value = "v", .flags = 0 } }, f).errno().?);
+    try testing.expectEqual(linux.E.PERM, h.call(.{ .setxattr = .{ .name = "user.k", .value = "w", .flags = XATTR_REPLACE } }, f).errno().?);
+    try testing.expectEqual(linux.E.PERM, h.call(.{ .removexattr = .{ .name = "user.k" } }, f).errno().?);
+    try testing.expectEqual(linux.E.PERM, h.call(.{ .unlink = .{ .name = "f" } }, 1).errno().?);
+    try testing.expectEqual(linux.E.PERM, h.call(.{ .rename = .{ .newdir = 1, .flags = 0, .name = "f", .newname = "g" } }, 1).errno().?);
+    try testing.expectEqual(linux.E.PERM, h.call(.{ .rename = .{ .newdir = 1, .flags = 0, .name = "other", .newname = "f" } }, 1).errno().?);
+    try testing.expectEqual(linux.E.PERM, h.call(.{ .link = .{ .oldnodeid = f, .newname = "lnk" } }, 1).errno().?);
+    // The reads pass; the record stands.
+    try testing.expectEqualStrings("hello", h.read(f, 0, 64).body);
+    try testing.expectEqual(@as(u64, 5), (try h.getattr(f)).size);
+    try testing.expectEqualStrings("v", h.call(.{ .getxattr = .{ .name = "user.k", .size = 64 } }, f).body);
+    try testing.expectEqual(f, (try h.entry(h.lookup(1, "f"))).nodeid);
+    // The directory.
+    try testing.expectEqual(linux.E.PERM, h.call(.{ .create = .{ .name = "new", .flags = 0, .mode = 0o644, .umask = 0, .open_flags = 0 } }, d).errno().?);
+    try testing.expectEqual(linux.E.PERM, h.call(.{ .mkdir = .{ .name = "new", .mode = 0o755, .umask = 0 } }, d).errno().?);
+    try testing.expectEqual(linux.E.PERM, h.call(.{ .mknod = .{ .name = "new", .mode = S.IFIFO | 0o600, .rdev = 0, .umask = 0 } }, d).errno().?);
+    try testing.expectEqual(linux.E.PERM, h.call(.{ .symlink = .{ .name = "new", .link = "other" } }, d).errno().?);
+    try testing.expectEqual(linux.E.PERM, h.call(.{ .link = .{ .oldnodeid = other, .newname = "new" } }, d).errno().?);
+    try testing.expectEqual(linux.E.PERM, h.call(.{ .unlink = .{ .name = "child" } }, d).errno().?);
+    try testing.expectEqual(linux.E.PERM, h.call(.{ .rename = .{ .newdir = d, .flags = 0, .name = "child", .newname = "new" } }, d).errno().?);
+    try testing.expectEqual(linux.E.PERM, h.call(.{ .rename = .{ .newdir = 1, .flags = 0, .name = "child", .newname = "out" } }, d).errno().?);
+    try testing.expectEqual(linux.E.PERM, h.call(.{ .rename = .{ .newdir = d, .flags = 0, .name = "other", .newname = "new" } }, 1).errno().?);
+    try testing.expectEqual(linux.E.PERM, h.call(.{ .rename = .{ .newdir = 1, .flags = 0, .name = "d", .newname = "moved" } }, 1).errno().?);
+    try testing.expectEqual(linux.E.PERM, h.call(.{ .rmdir = .{ .name = "d" } }, 1).errno().?);
+    try testing.expectEqual(child, (try h.entry(h.lookup(d, "child"))).nodeid);
+    try testing.expect(fuse_inode_flag_refusals.load() >= refusals0 + 24);
+    // The flag itself may change (the kernel checked CAP_LINUX_IMMUTABLE):
+    // cleared, the file takes a write and the directory an entry.
+    try testing.expectEqual(@as(?linux.E, null), setFlags(&h, f, 0, false));
+    try testing.expectEqual(@as(?linux.E, null), setFlags(&h, d, 0, true));
+    try testing.expectEqual(@as(?linux.E, null), writeWith(&h, f, 5, "!", o_wronly));
+    try testing.expectEqualStrings("hello!", h.read(f, 0, 64).body);
+    try testing.expectEqual(@as(?linux.E, null), h.call(.{ .mkdir = .{ .name = "new", .mode = 0o755, .umask = 0 } }, d).errno());
+    try testing.expectEqual(@as(?linux.E, null), h.call(.{ .unlink = .{ .name = "child" } }, d).errno());
+}
+
+test "inode flags: APPEND-only admits an O_APPEND write at EOF alone (no O_APPEND, or any other offset: EPERM), refuses truncate, mode/owner and explicit times (NOW times pass), xattr changes, unlink, rename, link; an append-only directory takes entries and gives none up (unlink, rmdir, rename out, a replacing rename in) while a fresh rename in passes; the fallocate hook admits preallocation alone" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    const f = try h.create(1, "f", 0o644);
+    _ = h.write(f, 0, "hello", 0);
+    h.release(f);
+    try testing.expectEqual(@as(?linux.E, null), h.call(.{ .setxattr = .{ .name = "user.k", .value = "v", .flags = 0 } }, f).errno());
+    const d = try h.mkdir(1, "d");
+    const child = try h.create(d, "child", 0o644);
+    h.release(child);
+    const victim = try h.create(1, "victim", 0o644);
+    h.release(victim);
+    try testing.expectEqual(@as(?linux.E, null), setFlags(&h, f, inode_flags.FS_APPEND_FL, false));
+    try testing.expectEqual(@as(?linux.E, null), setFlags(&h, d, inode_flags.FS_APPEND_FL, true));
+    // Writes.
+    try testing.expectEqual(@as(?linux.E, null), writeWith(&h, f, 5, " tail", o_append_w));
+    try testing.expectEqual(linux.E.PERM, writeWith(&h, f, 10, "X", o_wronly).?);
+    try testing.expectEqual(linux.E.PERM, writeWith(&h, f, 0, "X", o_append_w).?);
+    try testing.expectEqual(linux.E.PERM, writeWith(&h, f, 11, "X", o_append_w).?);
+    try testing.expectEqualStrings("hello tail", h.read(f, 0, 64).body);
+    // Setattr.
+    var sa = abi.zeroed(abi.fuse_setattr_in);
+    sa.valid = abi.FATTR_SIZE;
+    try testing.expectEqual(linux.E.PERM, h.setattr(f, sa).errno().?);
+    sa.valid = abi.FATTR_MODE;
+    sa.mode = 0o600;
+    try testing.expectEqual(linux.E.PERM, h.setattr(f, sa).errno().?);
+    sa.valid = abi.FATTR_GID;
+    sa.gid = 1;
+    try testing.expectEqual(linux.E.PERM, h.setattr(f, sa).errno().?);
+    sa.valid = abi.FATTR_ATIME | abi.FATTR_MTIME;
+    sa.mtime = 7;
+    try testing.expectEqual(linux.E.PERM, h.setattr(f, sa).errno().?);
+    sa.valid = abi.FATTR_ATIME | abi.FATTR_ATIME_NOW | abi.FATTR_MTIME | abi.FATTR_MTIME_NOW;
+    try testing.expectEqual(@as(?linux.E, null), h.setattr(f, sa).errno());
+    // The rest of the victim law.
+    try testing.expectEqual(linux.E.PERM, h.call(.{ .setxattr = .{ .name = "user.n", .value = "v", .flags = 0 } }, f).errno().?);
+    try testing.expectEqual(linux.E.PERM, h.call(.{ .removexattr = .{ .name = "user.k" } }, f).errno().?);
+    try testing.expectEqual(linux.E.PERM, h.call(.{ .unlink = .{ .name = "f" } }, 1).errno().?);
+    try testing.expectEqual(linux.E.PERM, h.call(.{ .rename = .{ .newdir = 1, .flags = 0, .name = "f", .newname = "g" } }, 1).errno().?);
+    try testing.expectEqual(linux.E.PERM, h.call(.{ .rename = .{ .newdir = 1, .flags = 0, .name = "victim", .newname = "f" } }, 1).errno().?);
+    try testing.expectEqual(linux.E.PERM, h.call(.{ .link = .{ .oldnodeid = f, .newname = "lnk" } }, 1).errno().?);
+    // The directory: entries in, none out.
+    const new = try h.create(d, "new", 0o644);
+    h.release(new);
+    try testing.expectEqual(@as(?linux.E, null), h.call(.{ .mkdir = .{ .name = "newdir", .mode = 0o755, .umask = 0 } }, d).errno());
+    try testing.expectEqual(linux.E.PERM, h.call(.{ .unlink = .{ .name = "child" } }, d).errno().?);
+    try testing.expectEqual(linux.E.PERM, h.call(.{ .rmdir = .{ .name = "newdir" } }, d).errno().?);
+    try testing.expectEqual(linux.E.PERM, h.call(.{ .rename = .{ .newdir = d, .flags = 0, .name = "new", .newname = "new2" } }, d).errno().?);
+    try testing.expectEqual(linux.E.PERM, h.call(.{ .rename = .{ .newdir = 1, .flags = 0, .name = "new", .newname = "out" } }, d).errno().?);
+    try testing.expectEqual(linux.E.PERM, h.call(.{ .rename = .{ .newdir = d, .flags = 0, .name = "victim", .newname = "child" } }, 1).errno().?);
+    try testing.expectEqual(@as(?linux.E, null), h.call(.{ .rename = .{ .newdir = d, .flags = 0, .name = "victim", .newname = "fresh" } }, 1).errno());
+    try testing.expectEqual(linux.E.PERM, h.call(.{ .rmdir = .{ .name = "d" } }, 1).errno().?);
+    sa.valid = abi.FATTR_MODE;
+    try testing.expectEqual(linux.E.PERM, h.setattr(d, sa).errno().?);
+    // The fallocate hook (the handler's first line): preallocation alone.
+    try h.fs.refuseFallocate(f, 0);
+    try h.fs.refuseFallocate(f, 0x01); // FALLOC_FL_KEEP_SIZE
+    try testing.expectError(error.PermissionDenied, h.fs.refuseFallocate(f, 0x02 | 0x01)); // PUNCH_HOLE | KEEP_SIZE
+    try testing.expectEqual(@as(?linux.E, null), setFlags(&h, f, inode_flags.FS_IMMUTABLE_FL, false));
+    try testing.expectError(error.PermissionDenied, h.fs.refuseFallocate(f, 0x01));
+    try h.fs.refuseFallocate(victim, 0x02 | 0x01);
+}
+
+test "inode flags: the served-open arm answers at the OPEN what may_open would — write intent on an immutable file EPERM, read-only passes; append-only: write intent without O_APPEND EPERM, with it passes, any O_TRUNC EPERM (under zero-message opens the kernel asks no OPEN and the WRITE/SETATTR answer)" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    const f = try h.create(1, "f", 0o644);
+    _ = h.write(f, 0, "hello", 0);
+    h.release(f);
+    const o_rdonly: u32 = @bitCast(linux.O{ .ACCMODE = .RDONLY });
+    try testing.expectEqual(@as(?linux.E, null), setFlags(&h, f, inode_flags.FS_IMMUTABLE_FL, false));
+    try testing.expectEqual(linux.E.PERM, h.call(.{ .open = .{ .flags = o_wronly, .open_flags = 0 } }, f).errno().?);
+    try testing.expectEqual(linux.E.PERM, h.call(.{ .open = .{ .flags = o_rdonly | O_TRUNC, .open_flags = 0 } }, f).errno().?);
+    try testing.expectEqual(@as(?linux.E, null), h.call(.{ .open = .{ .flags = o_rdonly, .open_flags = 0 } }, f).errno());
+    h.release(f);
+    try testing.expectEqual(@as(?linux.E, null), setFlags(&h, f, inode_flags.FS_APPEND_FL, false));
+    try testing.expectEqual(linux.E.PERM, h.call(.{ .open = .{ .flags = o_wronly, .open_flags = 0 } }, f).errno().?);
+    try testing.expectEqual(linux.E.PERM, h.call(.{ .open = .{ .flags = o_append_w | O_TRUNC, .open_flags = 0 } }, f).errno().?);
+    try testing.expectEqual(@as(?linux.E, null), h.call(.{ .open = .{ .flags = o_append_w, .open_flags = 0 } }, f).errno());
+    h.release(f);
+    try testing.expectEqual(@as(u64, 5), (try h.getattr(f)).size);
 }
 
 const Il0Stub = struct {

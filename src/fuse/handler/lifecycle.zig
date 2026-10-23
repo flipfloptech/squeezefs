@@ -83,6 +83,7 @@ const transport_slot = @import("../transport/slot.zig");
 const seam = @import("transport_seam.zig");
 const filesystem = @import("filesystem.zig");
 const op_guard = @import("op_guard.zig");
+const inode_flags = @import("inode_flags.zig");
 const op_trace = @import("op_trace.zig");
 const watchdog = @import("watchdog.zig");
 const open_table = @import("open_table.zig");
@@ -712,8 +713,15 @@ pub fn Dispatcher(comptime Transport: type) type {
                     return codec.replyBmap(out, u, b.block);
                 },
                 .ioctl => |a| {
+                    // A flag SET (FS_IOC_SETFLAGS/FSSETXATTR) changes the
+                    // inode's write law: the whole-inode exclusive guard, so
+                    // no kernel write runs beside it and the inode's direct
+                    // WRITE leases are recalled before the hold (decision
+                    // 0003 §AY); a GET and every other command take none.
+                    const g: ?op_guard.Guard = if (inode_flags.isSetCommand(a.in.cmd)) self.guards.acquire(self.io, ino, .exclusive) else null;
+                    defer if (g) |gg| gg.release(self.io);
                     const r = try fs.vtable.ioctl(fs.impl, c, .{ .ino = ino, .fh = a.in.fh, .flags = a.in.flags, .cmd = a.in.cmd, .arg = a.in.arg, .in = a.data, .out_size = a.in.out_size });
-                    return codec.replyIoctl(out, u, r.out, c.window[0..r.data_len]);
+                    return codec.replyIoctl(out, u, r.out, c.window[filesystem.IOCTL_DATA_OFFSET..][0..r.data_len]);
                 },
                 .poll => |p| {
                     const r = try fs.vtable.poll(fs.impl, c, .{ .ino = ino, .fh = p.fh, .kh = p.kh, .flags = p.flags, .events = p.events });

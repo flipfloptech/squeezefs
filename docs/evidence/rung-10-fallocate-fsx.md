@@ -51,7 +51,10 @@ the writes', ZERO_RANGE over a parked hole lands zeros.
 **Counts.** fsx `-X` seeds 21 12 31 32 33 34 35 36: all pass (21 and 12 failed before). fsstress
 `-p 20 -r` ×4 rounds: no tripwire, fsck clean. Filters `fuse.handler.kv_fs` (109), `data.write_admit`
 (82), `data.write_epoch` (58), `data.accumulate`, `data.layout`, `fallocate` green; rails; fmt. The
-unit loop, the smoke rows and the xfstests subset `generic/012 013 127 075 091 112 263`: RESULTS BELOW.
+new tests **100/100** under the venue's load; the smoke rows FALLOCATE — EVERY MODE'S LAW, the data plane WITH the
+write cache, the cache-path overwrite and storm stages LOOPED, A STREAMING OVERWRITE NEVER WEDGES, THE ORDERED LAW'S
+KILL ROW — all PASS; the xfstests subset `generic/012 013 127 075 091 112 263`: **Passed all 7** (1 `_notrun`), 0 alert
+lines in every daemon log, fsck clean on both sets (the "did NOT pass" is the ledger's stale-row rule of a subset).
 
 **Seen, not fixed.** `writeZeros` and `zeroExtension` ignore a short `written` (the admission answers
 whole pieces today). The drift tripwire's `eql` match means a same-reference FLIP under a parked key

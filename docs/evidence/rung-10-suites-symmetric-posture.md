@@ -47,12 +47,29 @@ the second mount JOINS and the tests judge the join.
    the daemon's mount was the superblock's last. When another mount of the superblock stands (a bind the
    operator left; a moved copy; a propagated copy a holder keeps) the event cannot come, the drained
    session cannot serve them, and the daemon answered their requests ENOTCONN for 30 s before exiting
-   the same way. Now, right after its own `unmount`, the session reads the mount table once: a mount
-   still carrying its connection's `major:minor` means the end will not come — it names them (up to
-   four, the rest counted), ends the connection itself (fusectl's abort when mounted, else the device
-   fd's close at the end of `close`) and raises `Shared.detached`, so the workers' residency exits at
-   once (decision 0003 §S's race-case law: a prompt, loud end beats 30 s of ENOTCONN). The backstop
-   lapses only when the end cannot be foreseen (a holder inside a lazily detached propagated copy).
+   the same way. Now, BEFORE its own `unmount`, the session reads the mount table once: another mount
+   carrying its connection's `major:minor` (`mountinfo.othersOfSuperblock`: every entry but its own
+   id at its own path) means the end will not come — it names them (up to four, the rest counted),
+   ends the connection itself (fusectl's abort when mounted, else the device fd's close at the end of
+   `close`) and raises `Shared.detached`, so the workers' residency exits at once (decision 0003 §S's
+   race-case law: a prompt, loud end beats 30 s of ENOTCONN). The backstop lapses only when the end
+   cannot be foreseen (a holder inside a lazily detached propagated copy).
+   **The first cut read the table AFTER the unmount and aborted another daemon's connection** (gate 94,
+   `~/tmp/gate94-symmetric.log`: shard 1/16's mtls daemon logged `1 other mount(s) of this superblock
+   stand after the unmount of /build/tmp/mnt-1718474 (/build/tmp/mnt-1718481)` and shard 8/16's
+   ORDERED LAW row died at its first mount, `the INIT reply write returned -2` → `InitReplyFailed`).
+   The kernel frees a FUSE superblock's anonymous device inside the `umount2` that drops its last
+   reference and reissues it to the next `mount(2)` on the host, so after its own unmount the number
+   says nothing about the daemon's connection. Decision 0003 §AN.6: the verdict and the abort come
+   before the daemon's own `umount2` (its mount holds the superblock, so the number is its own), every
+   abort names the minor recorded at `mount(2)`, and `writeAbort` first asks the daemon's own device fd
+   whether its connection still stands (`poll` → POLLERR once the kernel ended it). Red first: smoke
+   "A DAEMON ENDS ONLY THE CONNECTION IT OWNS" holds A's teardown right after its `umount2`
+   (`SQUEEZEFS_TEST_FUSE_UNMOUNT_HOLD`), fills every lower number with a tmpfs so B's fresh mount is
+   given A's id (`A's connection id 99 … B's connection id 99 (A's id REISSUED to B)`), and on the
+   first cut A aborted B (`the FUSE connection … was aborted under its live mount (fail-stopped) —
+   exiting 1`); green after, B serves through A's teardown and both exit 0. The bind row (c) still
+   ends the connection in 470 ms.
    The alternative — treating the superblock's other mounts as HOLDERS (BUSY) or auto-taking the lazy
    shape — was rejected here: the kernel's `umount2` of the daemon's mount PROPAGATES to the peers of a
    shared mount (409–411's `mpA/dir` → `mpB/dir`, `mpC/dir`, `mpD/dir` go with it), and a bind is not

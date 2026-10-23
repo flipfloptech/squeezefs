@@ -1771,10 +1771,11 @@ pub const Session = struct {
     /// (reaping the verdicts: a RELEASE after the unmount meets a stopped
     /// queue, and a retained ent the kernel reclaims pins the exit) and
     /// synthesize an error for every owed slot (the blocked callers return,
-    /// so the mount is not busy) → `umount2` → the disconnect ends the
-    /// workers' residency and the sideband (or, when another mount of the
-    /// superblock keeps the connection alive, `endIfHeldElsewhere` ends it
-    /// loud) → join → the filesystem's `destroy` → close the fd. The one
+    /// so the mount is not busy) → when another mount of the superblock
+    /// would keep the connection alive past our unmount, `endIfHeldElsewhere`
+    /// ends it loud NOW, while our own mount still proves the connection id
+    /// ours → `umount2` → the disconnect ends the workers' residency and the
+    /// sideband → join → the filesystem's `destroy` → close the fd. The one
     /// orderly path the drain cannot cover is an EXTERNAL `umount(8)`: a
     /// type-`fuse` mount gets no DESTROY, the kernel aborts the connection
     /// first.
@@ -1789,8 +1790,9 @@ pub const Session = struct {
             log.warn("transport: a drain group did not drain within {d} ms — ending the connection before the unmount (decision 0003 §AN)", .{DRAIN_WAIT_NS / std.time.ns_per_ms});
             self.failStop();
         }
-        self.unmount();
         self.endIfHeldElsewhere();
+        self.unmount();
+        self.holdAfterUnmount();
         for (self.groups) |g| g.join();
         if (self.have_sideband) self.sideband.join();
         self.destroyOnce();
@@ -1895,12 +1897,26 @@ pub const Session = struct {
     /// park a host-wide sync on this connection before any teardown step.
     fn holdFailurePath(self: *Session) void {
         const path = knobs.parseStr(self.env.get("SQUEEZEFS_TEST_FUSE_STARTUP_FAIL_HOLD")) orelse return;
+        log.warn("transport: SQUEEZEFS_TEST_FUSE_STARTUP_FAIL_HOLD — the bring-up failed after mount(2); its failure path holds until a writer opens {s}", .{path});
+        holdOnFifo(path);
+    }
+
+    /// `SQUEEZEFS_TEST_FUSE_UNMOUNT_HOLD`: the teardown waits right after its
+    /// own unmount until a writer opens the FIFO — the window in which the
+    /// kernel has reissued this connection's id to whoever mounts next.
+    fn holdAfterUnmount(self: *Session) void {
+        const path = knobs.parseStr(self.env.get("SQUEEZEFS_TEST_FUSE_UNMOUNT_HOLD")) orelse return;
+        log.warn("transport: SQUEEZEFS_TEST_FUSE_UNMOUNT_HOLD — the teardown of {s} holds after its unmount until a writer opens {s}", .{ self.mountpoint, path });
+        holdOnFifo(path);
+    }
+
+    /// A blocking open of the FIFO for reading: returns once a writer opens it.
+    fn holdOnFifo(path: []const u8) void {
         var pb: [linux.PATH_MAX]u8 = undefined;
         const p = std.fmt.bufPrintSentinel(&pb, "{s}", .{path}, 0) catch return;
-        log.warn("transport: SQUEEZEFS_TEST_FUSE_STARTUP_FAIL_HOLD — the bring-up failed after mount(2); its failure path holds until a writer opens {s}", .{path});
         const rc = linux.open(p.ptr, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
         if (linux.errno(rc) != .SUCCESS) {
-            log.warn("transport: the failure-path hold could not open {s} ({t}); not holding", .{ path, linux.errno(rc) });
+            log.warn("transport: the hold could not open {s} ({t}); not holding", .{ path, linux.errno(rc) });
             return;
         }
         _ = linux.close(@intCast(rc));
@@ -1982,40 +1998,42 @@ pub const Session = struct {
         return .{ .id = e.id, .dev_major = e.dev_major, .dev_minor = e.dev_minor };
     }
 
-    /// How many other mountpoints of this session's superblock the verdict
-    /// names (the rest are counted).
-    const HELD_ELSEWHERE_NAMED = 4;
-
-    /// After the daemon's own unmount: the kernel ends the connection inside
+    /// Before the daemon's own unmount: the kernel ends the connection inside
     /// the `umount2` that drops the superblock's last reference, and the
     /// workers' residency ends on that disconnect — unless another mount of
-    /// the superblock still stands (a bind the operator left, a moved
-    /// mountpoint, a propagated copy a holder keeps). The session is
-    /// drained and cannot serve them; waiting out the residency backstop
-    /// answered their requests ENOTCONN for 30 s and then exited the same
-    /// way. Name them and end the connection NOW (decision 0003 §S's
-    /// race-case law: a prompt, loud end beats 30 s of ENOTCONN): fusectl's
-    /// abort when mounted, else the device fd's close at the end of
-    /// `close` (the workers exit at once on `detached`). A bind is the
-    /// kernel's to detach, and `squeezefs umount` of one detaches it
-    /// plainly without signalling the daemon.
+    /// the superblock stands (a bind the operator left, a moved mountpoint,
+    /// a propagated copy a holder keeps). The session is drained and cannot
+    /// serve them; waiting out the residency backstop answered their
+    /// requests ENOTCONN for 30 s and then exited the same way. Name them
+    /// and end the connection NOW (decision 0003 §S's race-case law: a
+    /// prompt, loud end beats 30 s of ENOTCONN): fusectl's abort when
+    /// mounted, else the device fd's close at the end of `close` (the
+    /// workers exit at once on `detached`). A bind is the kernel's to
+    /// detach, and `squeezefs umount` of one detaches it plainly without
+    /// signalling the daemon.
+    ///
+    /// THE LAW (decision 0003 §AN): a daemon ends only the connection it
+    /// owns, and the connection id proves ownership only while its own
+    /// mount holds the superblock — so the verdict is read and the abort
+    /// written BEFORE its `umount2`. After it the kernel has reissued the
+    /// `major:minor` to whoever mounted next, anywhere on the host (gate
+    /// 94: the verdict read after the unmount aborted another shard's fresh
+    /// connection inside its INIT).
     fn endIfHeldElsewhere(self: *Session) void {
+        if (!self.mounted.load(.acquire)) return;
+        const id = self.mount_id orelse return;
         const dev = self.mount_dev orelse return;
         const buf = self.gpa.alloc(u8, mountinfo.READ_BYTES) catch return;
         defer self.gpa.free(buf);
-        const text = mountinfo.read(self.io, buf);
-        if (!mountinfo.hasDev(text, dev.major, dev.minor)) return;
+        const others = mountinfo.othersOfSuperblock(mountinfo.read(self.io, buf), id, self.mountpoint, dev.major, dev.minor);
+        if (others.count == 0) return;
         var names: [512]u8 = undefined;
         var w: Io.Writer = .fixed(&names);
-        var n: usize = 0;
-        var lines = std.mem.splitScalar(u8, text, '\n');
-        while (lines.next()) |line| {
-            const e = mountinfo.parseLine(line) orelse continue;
-            if (e.dev_major != dev.major or e.dev_minor != dev.minor) continue;
-            n += 1;
-            if (n <= HELD_ELSEWHERE_NAMED) w.print("{s}{s}", .{ if (n == 1) "" else ", ", e.mountpoint }) catch {};
-        }
-        log.warn("transport: {d} other mount(s) of this superblock stand after the unmount of {s} ({s}{s}) — the session is drained and cannot serve them: ending the connection now instead of answering them ENOTCONN for the {d} s residency backstop; they answer ENOTCONN until unmounted (a bind is the kernel's to detach: `umount <path>`)", .{ n, self.mountpoint, w.buffered(), if (n > HELD_ELSEWHERE_NAMED) ", …" else "", worker.RESIDENCY_NS / std.time.ns_per_s });
+        for (others.names(), 0..) |mp, i| w.print("{s}{s}", .{ if (i == 0) "" else ", ", mp }) catch {};
+        log.warn("transport: {d} other mount(s) of this superblock stand beside {s} at its unmount ({s}{s}) — the session is drained and cannot serve them: ending the connection now instead of answering them ENOTCONN for the {d} s residency backstop; they answer ENOTCONN until unmounted (a bind is the kernel's to detach: `umount <path>`)", .{ others.count, self.mountpoint, w.buffered(), if (others.count > mountinfo.OTHERS_NAMED) ", …" else "", worker.RESIDENCY_NS / std.time.ns_per_s });
+        // release pairs with the sideband's acquire at the disconnect: our
+        // own end, not the kernel's under a live mount.
+        self.self_aborted.store(true, .release);
         _ = self.writeAbort(dev.minor);
         // release pairs with the residency loop's acquire.
         self.shared.detached.store(true, .release);
@@ -2035,12 +2053,14 @@ pub const Session = struct {
         return e.id == want;
     }
 
-    /// The mountpoint's device minor = the fusectl connection id, read from
-    /// `/proc/self/mountinfo` — NEVER a stat of the mountpoint: that is a
-    /// GETATTR to ourselves, which blocks forever on a connection whose INIT
-    /// reply was never written (the refused-mode path) and is a request to
-    /// our own mount on every other.
+    /// This connection's id = the mountpoint's device minor: the one the
+    /// table gave at `mount(2)`, else read from `/proc/self/mountinfo` now —
+    /// NEVER a stat of the mountpoint: that is a GETATTR to ourselves, which
+    /// blocks forever on a connection whose INIT reply was never written
+    /// (the refused-mode path) and is a request to our own mount on every
+    /// other.
     fn connectionMinor(self: *Session) ?u32 {
+        if (self.mount_dev) |dev| return dev.minor;
         const e = self.mountEntry() orelse return null;
         return e.dev_minor;
     }
@@ -2054,9 +2074,22 @@ pub const Session = struct {
         return true;
     }
 
-    /// The raw control write; false when fusectl is not mounted or refuses.
+    /// Is this daemon's own connection still connected? Its device fd IS the
+    /// connection, whatever number the table shows: `poll` answers POLLERR
+    /// once the kernel ended it (`fuse_dev_poll`: `!fiq->connected`) and
+    /// sends no request to ourselves.
+    fn connectionAlive(self: *const Session) bool {
+        if (self.fuse_fd < 0) return false;
+        var pfd = [_]linux.pollfd{.{ .fd = self.fuse_fd, .events = linux.POLL.IN, .revents = 0 }};
+        if (linux.errno(linux.poll(&pfd, 1, 0)) != .SUCCESS) return false;
+        return pfd[0].revents & (linux.POLL.ERR | linux.POLL.NVAL) == 0;
+    }
+
+    /// The raw control write; false when fusectl is not mounted or refuses —
+    /// or when this daemon's own connection has already ended: its number
+    /// is free then, and a connection found under it is another daemon's.
     fn writeAbort(self: *Session, minor: u32) bool {
-        _ = self;
+        if (!self.connectionAlive()) return false;
         var path: [96]u8 = undefined;
         const p = std.fmt.bufPrintSentinel(&path, "{s}/{d}/abort", .{ fusectl_connections, minor }, 0) catch return false;
         const fd_rc = linux.open(p.ptr, .{ .ACCMODE = .WRONLY, .CLOEXEC = true }, 0);

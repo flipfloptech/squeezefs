@@ -3105,7 +3105,7 @@ test "smoke: A BIND OF THE MOUNT IS THE KERNEL'S, NEVER THE DAEMON'S TO STOP (xf
     {
         const text = try rig.readLog();
         defer gpa.free(text);
-        try testing.expect(std.mem.indexOf(u8, text[mark_c..], "other mount(s) of this superblock stand after the unmount of") != null);
+        try testing.expect(std.mem.indexOf(u8, text[mark_c..], "other mount(s) of this superblock stand beside") != null);
         try testing.expect(std.mem.indexOf(u8, text[mark_c..], bind) != null);
         try testing.expect(std.mem.indexOf(u8, text[mark_c..], "residency backstop lapsed") == null);
     }
@@ -3118,6 +3118,147 @@ test "smoke: A BIND OF THE MOUNT IS THE KERNEL'S, NEVER THE DAEMON'S TO STOP (xf
     }
     try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.umount2(bind.ptr, 0)));
     _ = try fsckClean(rig, "(c) the orderly stop with the bind alive");
+}
+
+/// The `major:minor` of the mount at exactly `path` (the mount table, never
+/// a stat); null when nothing is mounted there.
+fn anonDevAt(gpa: std.mem.Allocator, io: Io, path: []const u8) !?u32 {
+    const buf = try gpa.alloc(u8, mountinfo.READ_BYTES);
+    defer gpa.free(buf);
+    return transport.session.mountinfoMinor(mountinfo.read(io, buf), path);
+}
+
+/// How many anonymous-device holes `takeAnonDevHoles` fills at most: a
+/// host whose free numbers below the target outnumber it keeps them, and
+/// the row reports that the reissue did not happen.
+const anon_dev_holes_max: usize = 256;
+
+/// The tmpfs mounts that fill the anonymous-device numbers below a target,
+/// so the next `mount(2)` on the host is given the target (the kernel issues
+/// the lowest free number; every mount of a nodev filesystem — fuse, tmpfs
+/// — draws from the one pool).
+const AnonDevHoles = struct {
+    gpa: std.mem.Allocator,
+    io: Io,
+    dir: []const u8,
+    paths: std.ArrayList([:0]u8) = .empty,
+    /// The target was the lowest free number when the fill ended.
+    reached: bool = false,
+
+    /// Mount tmpfs after tmpfs until one is given `target` (unmounted again:
+    /// the target is now the lowest free number) or a number above it (someone
+    /// else took the target meanwhile) or the bound.
+    fn fill(self: *AnonDevHoles, target: u32) !void {
+        var i: usize = 0;
+        while (i < anon_dev_holes_max) : (i += 1) {
+            const p = try std.fmt.allocPrintSentinel(self.gpa, "{s}/hole-{d}", .{ self.dir, i }, 0);
+            errdefer self.gpa.free(p);
+            _ = linux.mkdir(p.ptr, 0o755);
+            try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.mount("tmpfs", p.ptr, "tmpfs", 0, 0)));
+            const minor = (try anonDevAt(self.gpa, self.io, p)) orelse return error.HoleNotInTable;
+            if (minor < target) {
+                try self.paths.append(self.gpa, p);
+                continue;
+            }
+            _ = linux.umount2(p.ptr, 0);
+            _ = linux.rmdir(p.ptr);
+            self.gpa.free(p);
+            self.reached = minor == target;
+            return;
+        }
+    }
+
+    fn deinit(self: *AnonDevHoles) void {
+        for (self.paths.items) |p| {
+            _ = linux.umount2(p.ptr, linux.MNT.DETACH);
+            _ = linux.rmdir(p.ptr);
+            self.gpa.free(p);
+        }
+        self.paths.deinit(self.gpa);
+    }
+};
+
+test "smoke: A DAEMON ENDS ONLY THE CONNECTION IT OWNS (decision 0003 §AN, §S) — mount A → `kill -TERM` A, its teardown HELD right after its own umount2 (the seam: the kernel destroyed A's superblock and reissues its connection id) → every anonymous-device number below A's is filled with a tmpfs so a FRESH mount B (its own volume, A's mountpoint) is given A's id → B ready and serving → A released: A's teardown touches nothing (no `other mount(s) of this superblock`, no fusectl abort), B serves on, A exits 0, B's orderly umount exits 0 (red on 1fcef90: A's end-if-held verdict read the table AFTER its unmount, matched B's mount by the reissued `major:minor` and aborted B's connection — gate 94: shard 1/16's daemon ended shard 8/16's fresh connection 115 inside its INIT, `the INIT reply write returned -2`)" {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    try rig.formatSet(true);
+    // B's own volume: a meta-only set on the rig's second image.
+    const meta_uri2 = try std.fmt.allocPrint(gpa, "sqmeta://{s}", .{rig.img2});
+    defer gpa.free(meta_uri2);
+    {
+        const f = try Io.Dir.cwd().createFile(io, rig.img2, .{ .truncate = true });
+        defer f.close(io);
+        try f.setLength(io, volume_len);
+        const r = try rig.squeezefs(&.{ "format", meta_uri2 });
+        defer rig.freeRun(r);
+        if (!r.term.success()) std.debug.print("\nformat B: {s}\n", .{r.stderr});
+        try testing.expect(r.term.success());
+    }
+    var fb: [linux.PATH_MAX]u8 = undefined;
+    const fifo = try std.fmt.bufPrintSentinel(&fb, "{s}/unmount-hold.fifo", .{rig.work}, 0);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.mknodat(linux.AT.FDCWD, fifo.ptr, linux.S.IFIFO | 0o600, 0)));
+    try rig.env.put("SQUEEZEFS_TEST_FUSE_UNMOUNT_HOLD", fifo);
+    try rig.spawnMount(&.{});
+    var released = false;
+    defer if (!released) releaseHold(fifo);
+    _ = try rig.awaitReady(0);
+    const a_minor = (try anonDevAt(gpa, io, rig.mp)) orelse return error.MountNotInTable;
+    // A's orderly stop; its teardown holds once its own umount2 returned.
+    const mark = try rig.logLen();
+    _ = linux.kill(rig.child_pid, .TERM);
+    _ = try rig.awaitLog("holds after its unmount until a writer opens", mark, exit_wait_ns);
+    try testing.expect(!try mountedAt(gpa, io, rig.mp));
+    // A's id is free; make it the lowest free number, so B's mount(2) gets it.
+    var holes: AnonDevHoles = .{ .gpa = gpa, .io = io, .dir = rig.work };
+    defer holes.deinit();
+    try holes.fill(a_minor);
+    // B: a fresh daemon on its own volume at A's mountpoint, A still held.
+    var a_child = rig.child.?;
+    const a_pid = rig.child_pid;
+    rig.child = null;
+    _ = rig.env.swapRemove("SQUEEZEFS_TEST_FUSE_UNMOUNT_HOLD");
+    const mark_b = try rig.logLen();
+    try rig.spawnMountOf(meta_uri2, &.{});
+    _ = try rig.awaitReady(mark_b);
+    const b_minor = (try anonDevAt(gpa, io, rig.mp)) orelse return error.MountNotInTable;
+    std.debug.print("\nsmoke[own connection]: A's connection id {d}, {d} hole(s) below it filled, B's connection id {d} ({s})\n", .{ a_minor, holes.paths.items.len, b_minor, if (b_minor == a_minor) "A's id REISSUED to B" else if (holes.reached) "another mount took A's id first" else "the fill did not reach A's id" });
+    {
+        const out = try rig.onMount("grep -q '\"pid\":' .stats && echo ok");
+        defer gpa.free(out);
+        try testing.expectEqualStrings("ok\n", out);
+    }
+    // A released: its teardown's remaining steps run beside B's live connection.
+    releaseHold(fifo);
+    released = true;
+    {
+        const deadline = clock.monotonicNs() + exit_wait_ns;
+        while (alive(a_pid) and clock.monotonicNs() < deadline) sleepMs(10);
+        if (alive(a_pid)) {
+            printWedge(io, "A", a_pid, rig.log_path, gpa);
+            _ = linux.kill(a_pid, .KILL);
+        }
+        try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try a_child.wait(io));
+    }
+    try rig.expectAlive("B's service after A's teardown");
+    {
+        const out = try rig.onMount("grep -q '\"pid\":' .stats && echo ok");
+        defer gpa.free(out);
+        try testing.expectEqualStrings("ok\n", out);
+        const text = try rig.readLog();
+        defer gpa.free(text);
+        const tail = text[mark..];
+        try testing.expect(std.mem.indexOf(u8, tail, "other mount(s) of this superblock") == null);
+        try testing.expect(std.mem.indexOf(u8, tail, "ended its own FUSE connection") == null);
+        try testing.expect(std.mem.indexOf(u8, tail, "the INIT reply write returned") == null);
+        try testing.expect(std.mem.indexOf(u8, tail, "ended the FUSE connection under the live mount") == null);
+        try testing.expect(std.mem.indexOf(u8, tail, "residency backstop lapsed") == null);
+    }
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+    try testing.expectEqual(@as(usize, 0), try fuseMountsOf(gpa, io, rig.mp));
 }
 
 /// The bound on one cross-owner rename with nothing moving (the law: a

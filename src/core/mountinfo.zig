@@ -97,6 +97,42 @@ pub fn hasDev(text: []const u8, major: u32, minor: u32) bool {
     return false;
 }
 
+/// How many of a superblock's other mounts `othersOfSuperblock` names
+/// (the rest are counted).
+pub const OTHERS_NAMED = 4;
+
+/// The mounts of one superblock other than a daemon's own.
+pub const OtherMounts = struct {
+    count: usize = 0,
+    named: [OTHERS_NAMED][]const u8 = undefined,
+
+    /// The mountpoints named (slices of the table), at most `OTHERS_NAMED`.
+    pub fn names(self: *const OtherMounts) []const []const u8 {
+        return self.named[0..@min(self.count, OTHERS_NAMED)];
+    }
+};
+
+/// Every mount of the superblock `major:minor` except the daemon's own — the
+/// entry `own_id` at `own_path`: a bind of it (anywhere, or stacked over its
+/// own path), a propagated copy, the daemon's own mount `mount --move`d
+/// elsewhere (its id at another path). Meaningful only while the daemon's own
+/// mount is attached: its reference keeps the superblock alive, so the
+/// number IS its connection's. Once its own `umount2` dropped the last
+/// reference the kernel reissues the number at once, and an entry carrying
+/// it is another connection's.
+pub fn othersOfSuperblock(text: []const u8, own_id: u64, own_path: []const u8, major: u32, minor: u32) OtherMounts {
+    var out: OtherMounts = .{};
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        const e = parseLine(line) orelse continue;
+        if (e.dev_major != major or e.dev_minor != minor) continue;
+        if (e.id == own_id and std.mem.eql(u8, e.mountpoint, own_path)) continue;
+        if (out.count < OTHERS_NAMED) out.named[out.count] = e.mountpoint;
+        out.count += 1;
+    }
+    return out;
+}
+
 /// The first mount whose parent is `id` (a mount stacked inside it makes
 /// the plain `umount2` of `id` EBUSY).
 pub fn firstChildOf(text: []const u8, id: u64) ?Entry {
@@ -170,6 +206,44 @@ test "entryOf, hasId, hasDev and firstChildOf: the mount by id carries its devic
     try testing.expect(firstChildOf(sample, 91) == null);
 }
 
+test "othersOfSuperblock: the daemon's own entry (its id AT its path) is excluded; a bind elsewhere, a bind stacked over its path and its own mount moved count and are named up to OTHERS_NAMED; another device is not its business; after its own unmount a fresh mount carrying the reissued number is counted — the caller must not ask then" {
+    // Our mount: id 90, 0:45 at mnt-7. A bind of it at mnt-7-bind (id 95) and
+    // one stacked over our own path (id 96); a tmpfs under it (0:48) is not ours.
+    const binds = sample ++
+        \\95 22 0:45 / /build/tmp/mnt-7-bind rw,relatime - fuse squeezefs rw
+        \\96 22 0:45 / /build/tmp/mnt-7 rw,relatime - fuse squeezefs rw
+        \\
+    ;
+    const own = othersOfSuperblock(sample, 90, "/build/tmp/mnt-7", 0, 45);
+    try testing.expectEqual(@as(usize, 0), own.count);
+    try testing.expectEqual(@as(usize, 0), own.names().len);
+    const held = othersOfSuperblock(binds, 90, "/build/tmp/mnt-7", 0, 45);
+    try testing.expectEqual(@as(usize, 2), held.count);
+    try testing.expectEqualStrings("/build/tmp/mnt-7-bind", held.names()[0]);
+    try testing.expectEqualStrings("/build/tmp/mnt-7", held.names()[1]);
+    // Our own mount moved: its id stands at another path — a mount of our
+    // superblock the orderly stop cannot unmount by path, counted and named.
+    const moved = "22 1 0:21 / / rw,relatime - ext4 /dev/root rw\n90 22 0:45 / /build/tmp/elsewhere rw,relatime - fuse squeezefs rw\n";
+    const m = othersOfSuperblock(moved, 90, "/build/tmp/mnt-7", 0, 45);
+    try testing.expectEqual(@as(usize, 1), m.count);
+    try testing.expectEqualStrings("/build/tmp/elsewhere", m.names()[0]);
+    // The names are capped; the count is not.
+    var many: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer many.deinit();
+    try many.writer.writeAll(sample);
+    for (0..OTHERS_NAMED + 3) |i| try many.writer.print("{d} 22 0:45 / /build/tmp/b{d} rw - fuse squeezefs rw\n", .{ 100 + i, i });
+    const capped = othersOfSuperblock(many.written(), 90, "/build/tmp/mnt-7", 0, 45);
+    try testing.expectEqual(OTHERS_NAMED + 3, capped.count);
+    try testing.expectEqual(OTHERS_NAMED, capped.names().len);
+    try testing.expectEqualStrings("/build/tmp/b0", capped.names()[0]);
+    // After the daemon's own unmount the table has no entry of its mount and
+    // the kernel has reissued 0:45 to a fresh mount of another daemon (gate
+    // 94: shard 1/16's daemon aborted shard 8/16's connection by it): the
+    // verdict counts it — which is why the session asks BEFORE its unmount.
+    const reissued = "22 1 0:21 / / rw,relatime - ext4 /dev/root rw\n97 22 0:45 / /build/tmp/mnt-1718481 rw,relatime - fuse squeezefs rw\n";
+    try testing.expectEqual(@as(usize, 1), othersOfSuperblock(reissued, 90, "/build/tmp/mnt-7", 0, 45).count);
+}
+
 fn lineFuzz(_: void, smith: *std.testing.Smith) !void {
     var buf: [512]u8 = undefined;
     const len = smith.slice(&buf);
@@ -178,6 +252,7 @@ fn lineFuzz(_: void, smith: *std.testing.Smith) !void {
     _ = entryAt(text, "/m");
     _ = hasId(text, 1);
     _ = hasDev(text, 0, 1);
+    _ = othersOfSuperblock(text, 1, "/m", 0, 1);
     _ = firstChildOf(text, 1);
 }
 

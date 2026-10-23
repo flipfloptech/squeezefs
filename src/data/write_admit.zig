@@ -184,6 +184,10 @@ pub const stats = struct {
     /// to their unwritten twin by ZERO_RANGE — no device byte for either.
     pub var fallocate_blocks_reserved: counters.ShardedCounter = .{};
     pub var fallocate_blocks_zeroed: counters.ShardedCounter = .{};
+    /// `fallocate_custody_skips`: blocks a reservation left to the write
+    /// side's custody (a parked buffer, an overlay record, an epoch's
+    /// shadow binds them at its landing).
+    pub var fallocate_custody_skips: counters.ShardedCounter = .{};
     pub var write_shared_class_violation: counters.Tripwire = .init("write_shared_class_violation");
     /// The gate's cold flushes failed for a whole wall while fresh supply
     /// was VISIBLE on some volume: the plane is wrong, not full — the
@@ -205,7 +209,7 @@ pub fn noteInlineWrite(len: u64) void {
 
 pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
     try w.writeAll("{");
-    inline for (.{ "admit_write_overlay_bytes", "admit_write_inplace_bytes", "admit_write_accumulate_bytes", "admit_write_inline_bytes", "write_enospc_refusals", "write_pieces", "writes_admitted", "staging_sibling_probes", "restage_churn_removes", "restage_churn_bytes", "parked_gate_waits", "parked_gate_self_flushes", "parked_gate_cold_flushes", "parked_gate_wall_refusals", "write_gap_zero_bytes", "fallocate_blocks_reserved", "fallocate_blocks_zeroed" }) |name| {
+    inline for (.{ "admit_write_overlay_bytes", "admit_write_inplace_bytes", "admit_write_accumulate_bytes", "admit_write_inline_bytes", "write_enospc_refusals", "write_pieces", "writes_admitted", "staging_sibling_probes", "restage_churn_removes", "restage_churn_bytes", "parked_gate_waits", "parked_gate_self_flushes", "parked_gate_cold_flushes", "parked_gate_wall_refusals", "write_gap_zero_bytes", "fallocate_blocks_reserved", "fallocate_blocks_zeroed", "fallocate_custody_skips" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, @field(stats, name).load() });
     }
     try w.print("\"write_shared_class_violation\":{d},\"parked_gate_wall_supply_visible\":{d},", .{ counters.tripwireCount("write_shared_class_violation"), counters.tripwireCount("parked_gate_wall_supply_visible") });
@@ -1554,6 +1558,24 @@ pub const WritePath = struct {
             }
             while (b <= last and n < cap) : (b += 1) {
                 const blk: u32 = @intCast(b);
+                // A block the write side holds custody of — a parked
+                // buffer, an open overlay record, a rewrite epoch's shadow
+                // — is bound by its landing, not by the map yet: the
+                // reservation leaves it (a write there is admitted on a
+                // full store already, `writeWouldCreateFreshCustody`). A
+                // reservation minted under an epoch's shadow was the one
+                // binding the epoch's save displaced without parking
+                // (`rewrite_shadow_displaced_drift` under fsstress). For
+                // ZERO_RANGE the custody's bytes are not zeroed by a flip
+                // the map cannot see: the whole block's zeros go through
+                // the admission, where every arm orders them after it (the
+                // handler settled the custody first; this is the residue a
+                // transient close leaves).
+                if (self.table.has(ino, blk) or self.overlay.hasCustody(ino, blk) or self.epochs.bindsBlock(ino, blk)) {
+                    if (zero_existing) try self.writeZeros(io, ino, @as(u64, blk) * self.cfg.block_size, self.cfg.block_size, .{ .kind = .striped, .size = @as(u64, blk + 1) * self.cfg.block_size, .map_resident = true });
+                    stats.fallocate_custody_skips.inc();
+                    continue;
+                }
                 if (self.map.reserved(ino, blk) != null) continue;
                 if (self.map.lookup(ino, blk)) |m| {
                     if (!zero_existing) continue;
@@ -1916,6 +1938,63 @@ test "the ENOSPC terminal law: a write that would CREATE custody against an exha
     try testing.expect(!enospc.freshSupplyExhausted(w.f.vols.candidates(&cands)));
     const o3 = try w.wp.write(io, .{ .ino = 12, .offset = 0, .payload = .{ .bytes = &half }, .class = .entire_op, .file = World.striped(0) });
     try testing.expectEqual(@as(u64, wt.BS / 2), o3.written);
+}
+
+test "a reservation leaves the write side's custody alone (decision 0003 §BJ; fsstress's `rewrite_shadow_displaced_drift`): a block whose landing a rewrite epoch holds as its shadow — a hole in the map until the save — is not reserved under it, so the save displaces nothing it never parked and the block reads the write's bytes; a parked buffer's block is left the same way; ZERO_RANGE over such a block zeroes it through the admission (the custody's bytes, not a flip the map cannot see)" {
+    const io = testing.io;
+    const w = try World.init(testing.allocator, .sync_inline, false);
+    defer w.deinit(testing.allocator);
+    try w.f.map.create(60, .striped, 6 * wt.BS);
+    // A whole-block write into hole 1 writes through and rides the rewrite
+    // epoch: the map has no binding at 1 until the save.
+    var whole: [wt.BS]u8 align(4096) = undefined;
+    fill(&whole, 0x60);
+    const o1 = try w.wp.write(io, .{ .ino = 60, .offset = wt.BS, .payload = .{ .bytes = &whole }, .class = .shared, .file = World.striped(6 * wt.BS) });
+    try testing.expectEqual(@as(u32, 1), o1.count(.write_through));
+    w.wp.quiesce(io);
+    try testing.expect(w.wp.epochs.bindsBlock(60, 1));
+    try testing.expect(w.f.map.seam().lookup(60, 1) == null);
+    // A half-block write into hole 2 parks.
+    var half: [wt.BS / 2]u8 = undefined;
+    fill(&half, 0x61);
+    const o2 = try w.wp.write(io, .{ .ino = 60, .offset = 2 * wt.BS, .payload = .{ .bytes = &half }, .class = .shared, .file = World.striped(6 * wt.BS) });
+    try testing.expectEqual(@as(u32, 1), o2.count(.accumulate_park));
+    try testing.expect(w.wp.table.has(60, 2));
+    // The reservation over 0..3: holes 0 and 3 reserve; 1 (the epoch's) and
+    // 2 (the buffer's) are left to their landings.
+    const skips0 = stats.fallocate_custody_skips.load();
+    const r = try w.wp.reserveRange(io, 60, 0, 3, false);
+    try testing.expectEqual(@as(u32, 2), r.reserved);
+    try testing.expectEqual(skips0 + 2, stats.fallocate_custody_skips.load());
+    try testing.expect(w.f.map.seam().reserved(60, 0) != null);
+    try testing.expect(w.f.map.seam().reserved(60, 1) == null);
+    try testing.expect(w.f.map.seam().reserved(60, 2) == null);
+    try testing.expect(w.f.map.seam().reserved(60, 3) != null);
+    // The save and the landing: nothing displaced that was never parked,
+    // the bytes the writes' own.
+    const drift0 = counters.tripwireCount("rewrite_shadow_displaced_drift");
+    w.wp.flushIno(io, 60);
+    try testing.expectEqual(drift0, counters.tripwireCount("rewrite_shadow_displaced_drift"));
+    const b1 = w.f.map.seam().lookup(60, 1).?;
+    var got: [wt.BS]u8 = undefined;
+    w.f.dev.peek(b1.vol_tag, b1.offset, &got);
+    try testing.expectEqualSlices(u8, &whole, &got);
+    const b2 = w.f.map.seam().lookup(60, 2).?;
+    w.f.dev.peek(b2.vol_tag, b2.offset, &got);
+    try testing.expectEqualSlices(u8, &half, got[0 .. wt.BS / 2]);
+    // ZERO_RANGE over a block a parked buffer holds (block 4, a hole):
+    // zeros through the admission into the buffer, nothing flipped or
+    // reserved; the landing writes zeros.
+    const o3 = try w.wp.write(io, .{ .ino = 60, .offset = 4 * wt.BS, .payload = .{ .bytes = &half }, .class = .shared, .file = World.striped(6 * wt.BS) });
+    try testing.expectEqual(@as(u32, 1), o3.count(.accumulate_park));
+    const z = try w.wp.reserveRange(io, 60, 4, 4, true);
+    try testing.expectEqual(@as(u32, 0), z.zeroed);
+    try testing.expectEqual(@as(u32, 0), z.reserved);
+    try testing.expect(w.f.map.seam().reserved(60, 4) == null);
+    w.wp.flushIno(io, 60);
+    const b4 = w.f.map.seam().lookup(60, 4).?;
+    w.f.dev.peek(b4.vol_tag, b4.offset, &got);
+    try testing.expect(std.mem.allEqual(u8, &got, 0));
 }
 
 test "the fallocate reservation (charter §6.6, decision 0003 §BH): `reserveRange` binds every hole of the range to a fresh UNWRITTEN block with no device byte written and leaves written blocks alone; the map's `lookup` sees a hole there and `reserved` the binding; a write inside the reservation lands IN PLACE (the whole block into the reserved one, the publish flips the flag: the same reference, the allocator's census unchanged, no mint, no free); ZERO_RANGE flips a written block to its unwritten twin with no I/O and purges it; a reservation on a clone-shared block is left to the fresh-mint path, which displaces it" {

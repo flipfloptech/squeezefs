@@ -659,6 +659,7 @@ pub const Epochs = struct {
             };
             if (!parked) {
                 stats.rewrite_shadow_displaced_drift.fire("the save displaced a binding the epoch never parked");
+                log.err("rewrite epoch ino {d}: the save displaced vol {x} off {d} (unwritten {}) the epoch never parked — {d} parked key(s)", .{ e.ino, d.vol_tag, d.offset, d.unwritten, e.displaced.items.len });
                 drift[n_drift] = d;
                 n_drift += 1;
             }

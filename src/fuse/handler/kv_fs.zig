@@ -2695,7 +2695,16 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                     // frees and the edges it zeroes are the map's truth, not
                     // a parked buffer's (§AL's settle, as the truncate's).
                     self.settleCustody(local, .striped);
-                    const size = self.claimedSize(local, probe);
+                    // The size the edges' zero writes carry is read AFTER
+                    // the settle, off the record as it stands: the settle
+                    // (or the times drain racing it) journals the parked
+                    // size claim and retires it, so the entry probe plus
+                    // the claim it saw is stale by exactly that claim — and
+                    // a write carrying a size below its offset runs the
+                    // extension law, which zeroed [durable size, edge) of
+                    // real data (fsx on generic/127: zeros from the last
+                    // truncate's size to the punch's edge).
+                    const size = self.claimedSize(local, try self.readInode(local));
                     const first_whole = (off + bs - 1) / bs;
                     const end_whole = upto / bs; // exclusive
                     // The head edge: [off, min(upto, its block end)) when
@@ -5670,6 +5679,8 @@ const SettlingData = struct {
     data_barriers: u32 = 0,
     barrier_inos: usize = 0,
     in_release: ?struct { ctx: *anyopaque, call: *const fn (*anyopaque) void } = null,
+    /// Runs inside `flushCustody` (the settle): the times drain racing it.
+    on_flush: ?struct { ctx: *anyopaque, call: *const fn (*anyopaque) void } = null,
     write_back_drains: u32 = 0,
     /// The (3.7) balance observed inside the flush: a held lock there is
     /// the deadlock the plane's own merge would meet.
@@ -5936,6 +5947,7 @@ const SettlingData = struct {
         self.flushes += 1;
         self.locks_held_at_flush = self.base.layout_lock_held;
         self.locks_taken_at_flush = self.base.layout_locks_taken;
+        if (self.on_flush) |h| h.call(h.ctx);
         if (self.guards) |g| {
             if (g.tryAcquire(io, self.guard_nodeid, .shared)) |held| {
                 held.release(io);
@@ -7681,6 +7693,52 @@ test "fallocate (charter §6.6) — the mode law and the inline arms on a volume
     try testing.expectEqual(@as(?linux.E, .PERM), h.fallocate(f, KEEP, 0, 100));
     try testing.expectEqual(@as(?linux.E, .PERM), h.fallocate(f, PUNCH | KEEP, 0, 100));
     try testing.expectEqual(@as(?linux.E, null), setFlags(&h, f, 0, false));
+}
+
+test "a PUNCH/ZERO edge carries the file's size as it stands AFTER the settle (fsx on generic/127: zeros where data was written): a striped file whose acked writes hold a parked size claim past the durable size — the settle (the times drain racing it) journals the claim and retires it — zeroes an edge past the durable size with a write that names the claimed size, never the stale probe's (a write naming a size below its offset runs the extension law and zeroes [durable size, edge) of real data)" {
+    const H = HarnessOf(SettlingData);
+    var h: H = undefined;
+    try h.init();
+    defer h.deinit();
+    defer h.data.deinit();
+    h.data.store = &h.store;
+    const PUNCH = H.Fs.FALLOC.PUNCH_HOLE;
+    const KEEP = H.Fs.FALLOC.KEEP_SIZE;
+    const f = try h.create(1, "f", 0o644);
+    const local = try H.Fs.localOf(f);
+    // Striped at 8 KiB durable; the acked writes' claim says 100 000.
+    const big: [8192]u8 = @splat('X');
+    try testing.expectEqual(@as(?linux.E, null), h.write(f, 0, &big, 0).errno());
+    h.data.setBound(local, 0, .written);
+    _ = try h.fs.pending.parkClaim(local, .{ .mtime = 5, .ctime = 5, .size = 100_000 });
+    try testing.expectEqual(@as(u64, 100_000), h.fs.pending.claimOf(local));
+    try testing.expectEqual(@as(u64, 100_000), (try h.getattr(f)).size);
+    // The settle journals the claim as the drain would: the record's size
+    // becomes 100 000 and the parked claim retires.
+    const DrainOf = struct {
+        var hp: *H = undefined;
+        var ino: u64 = 0;
+        fn run(_: *anyopaque) void {
+            var v = hp.fs.readInode(ino) catch unreachable;
+            v.size = 100_000;
+            hp.store.upsert(key.TREE_INODES, &key.inodeKey(ino), &v.encode()) catch unreachable;
+            const cur = hp.fs.pending.parked(ino) orelse unreachable;
+            std.debug.assert(hp.fs.pending.retireIfStill(ino, cur));
+        }
+    };
+    DrainOf.hp = &h;
+    DrainOf.ino = local;
+    h.data.on_flush = .{ .ctx = &h, .call = &DrainOf.run };
+    const writes0 = h.data.writes.items.len;
+    // PUNCH [90 000, 95 000): an edge inside block 0, past the durable 8 KiB.
+    try testing.expectEqual(@as(?linux.E, null), h.fallocate(f, PUNCH | KEEP, 90_000, 5_000));
+    try testing.expectEqual(writes0 + 1, h.data.writes.items.len);
+    try testing.expectEqual(@as(u64, 90_000), h.data.writes.items[writes0].offset);
+    try testing.expectEqual(@as(u64, 5_000), h.data.writes.items[writes0].len);
+    try testing.expectEqual(@as(u64, 100_000), h.data.writes.items[writes0].view_size);
+    try testing.expectEqual(@as(u64, 100_000), (try h.getattr(f)).size);
+    h.data.on_flush = null;
+    h.release(f);
 }
 
 test "fallocate (charter §6.6) — the striped arms through the plane's face: allocate reserves every block of the range (KEEP_SIZE: the size stands; without it the size rises through the truncate-up path with the extension law), an inline file past its bound promotes first; PUNCH settles the custody, zeroes a partial edge inside a WRITTEN block only (a hole or a reservation reads zeros already) and frees the whole blocks; ZERO_RANGE zeroes the edges and flips/reserves the whole blocks without freeing; COLLAPSE/INSERT need block alignment, shift the map after the custody landed and move the size; a shift the plane refuses is EOPNOTSUPP with the size standing; a refused reservation is ENOSPC" {

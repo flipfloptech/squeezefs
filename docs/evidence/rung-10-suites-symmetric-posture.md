@@ -119,7 +119,9 @@ Three runs on this head (the first two stopped early on the defects above, fixed
 Both sets fsck-clean after every run; no tripwire. The five ledger rows are deleted: four pass on
 their merits under the join, and 589's failure is a PRODUCT defect, which is never a by-design row.
 
-**generic/589's wedge (unfixed; the kernel-view coherence owner's — decision 0003 §AB.2/§AG.2).**
+**generic/589's wedge (fixed — `rung-10-recall-notify-sideband.md`: the ack never waited on the notify; the
+45 s were a dead reader's `T_owner` after a `free_ship` panic at a member's teardown, now fixed, and the
+parked sideband is the sideband law's — the paragraph below is the dump's first reading).**
 Run `suites-fstests-20261023-093140-74130`, sub-case `move private to private`, daemon 174971 (log
 `set-scratch/daemon-20261023-095349-174922.log`): the test's 5th member of the scratch set — JOINED as
 appender 4 at `mpD/dir` — took fsstress's first `create (ino 1)` into the ROOT (the manager's

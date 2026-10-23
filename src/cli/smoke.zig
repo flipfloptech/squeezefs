@@ -11773,6 +11773,78 @@ test "smoke: FALLOCATE — EVERY MODE'S LAW (charter §6.6; decision 0003 §BH) 
     _ = try fsckClean(rig, "the clean unmount after the fallocate matrix");
 }
 
+test "smoke: FALLOCATE STRIPS THE SETID BITS (fstests generic/683; decision 0003 §BK: the kernel strips nothing around FUSE_FALLOCATE — the daemon owns `should_remove_suid` + the group rule) — mounted allow_other: over root's 192 KiB files `fallocate -o 64k -l 64k` by a non-owner outside the group without CAP_FSETID (setpriv) ⇒ 6666→666, 6676→676, 6766→766, 6777→777, 2676→676, 2777→777, 2666→666 (a non-member's sgid goes without group-exec); by root every mode kept; `.stats` fuse_fallocate_setid_strips = 7; B JOINS and the non-owner's `truncate -s 0` through B's mount over A's 6666 and 6676 files (the SHIPPED setattr's kill bit — FATTR_KILL_SUIDGID's law: suid always, sgid iff group-exec; handoff 2026-10-21 create 7b) lands 2666 and 676 at the holder, record_killpriv_strips = 2 on A, both views agree; no alert line" {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    try rig.env.put("SQUEEZEFS_MW_BIND", "127.0.0.1:0");
+    var t_owner_text: [8]u8 = undefined;
+    try rig.env.put("SQUEEZEFS_TEST_MEMBERSHIP_T_OWNER_MS", try std.fmt.bufPrint(&t_owner_text, "{d}", .{smoke_t_owner_ms}));
+    try rig.formatSet(true);
+    try rig.spawnMount(&.{ "-o", "default_permissions,allow_other" });
+    _ = try rig.awaitReady(0);
+    const mark = try rig.logLen();
+    // The caller of generic/683: a non-owner, outside the file's group, no
+    // capability (setpriv clears the effective set with the uid change).
+    const unpriv = "setpriv --reuid=65534 --regid=65534 --clear-groups";
+    // 1. The matrix: the unprivileged fallocate strips per the kernel's law
+    //    (S_ISUID when set; S_ISGID when set with group-exec; a caller
+    //    outside the group loses S_ISGID with any strip).
+    {
+        const out = try rig.onMount("chmod a+rx . && for m in 6666 6676 6766 6777 2676 2777 2666; do head -c 196608 /dev/zero > f$m && chmod $m f$m && " ++ unpriv ++ " fallocate -o 65536 -l 65536 f$m && stat -c '%a %s' f$m; done");
+        defer gpa.free(out);
+        try testing.expectEqualStrings("666 196608\n676 196608\n766 196608\n777 196608\n676 196608\n777 196608\n666 196608\n", out);
+    }
+    // 2. Root (CAP_FSETID) keeps every bit.
+    {
+        const out = try rig.onMount("for m in 6666 6676 6766 6777 2676 2777; do head -c 196608 /dev/zero > r$m && chmod $m r$m && fallocate -o 65536 -l 65536 r$m && stat -c %a r$m; done");
+        defer gpa.free(out);
+        try testing.expectEqualStrings("6666\n6676\n6766\n6777\n2676\n2777\n", out);
+    }
+    {
+        const t = try rig.stats();
+        defer gpa.free(t);
+        try testing.expectEqual(@as(?u64, 7), numberAfter(t, "\"fuse_fallocate_setid_strips\":"));
+    }
+    // 3. The shipped setattr: B's unprivileged truncate over A's files
+    //    carries FATTR_KILL_SUIDGID to B's daemon, the ship carries it to
+    //    the holder, the holder applies the local law.
+    const b = try Peer.init(rig, "b");
+    defer b.deinit();
+    try b.spawn(&.{ "-o", "default_permissions,allow_other" });
+    _ = try b.awaitReady();
+    {
+        const w = try rig.onMount("mkdir d && head -c 196608 /dev/zero > d/a && chmod 6666 d/a && head -c 196608 /dev/zero > d/b && chmod 6676 d/b && stat -c %a d/a d/b");
+        defer gpa.free(w);
+        try testing.expectEqualStrings("6666\n6676\n", w);
+        const t = try b.onMount("stat -c %a d/a d/b && " ++ unpriv ++ " truncate -s 0 d/a && " ++ unpriv ++ " truncate -s 0 d/b && stat -c '%a %s' d/a d/b");
+        defer gpa.free(t);
+        try testing.expectEqualStrings("6666\n6676\n2666 0\n676 0\n", t);
+        // A's kernel learns it from the holder's own notifier (bounded by
+        // the attr TTL otherwise).
+        const a = try rig.onMount("for i in $(seq 200); do [ \"$(stat -c %a d/a)\" = 2666 ] && [ \"$(stat -c %a d/b)\" = 676 ] && break; sleep 0.02; done; stat -c '%a %s' d/a d/b");
+        defer gpa.free(a);
+        try testing.expectEqualStrings("2666 0\n676 0\n", a);
+    }
+    {
+        const ta = try rig.stats();
+        defer gpa.free(ta);
+        try testing.expectEqual(@as(?u64, 2), numberAfter(ta, "\"record_killpriv_strips\":"));
+        try testing.expectEqual(@as(?u64, 0), numberAfter(ta, "\"invariant_tripwires\":"));
+    }
+    {
+        const text = try rig.readLog();
+        defer gpa.free(text);
+        const seg = text[@min(mark, text.len)..];
+        const errors = std.mem.count(u8, seg, "error(");
+        if (errors != 0) std.debug.print("--- the daemon's alert lines ---\n{s}\n", .{seg});
+        try testing.expectEqual(@as(usize, 0), errors);
+        try testing.expectEqual(@as(usize, 0), std.mem.count(u8, seg, "TRIPWIRE"));
+    }
+}
+
 test "smoke: FSCK AND SCRUB — format → fill (dirs, 200 packed small files, hard links, three fsync'd 20 MiB files, a clone) → umount → `fsck --offline --scrub` 0 findings over every block → mount, 8-way storm, kill -9 → `fsck --offline` 0 findings → remount, clean umount → a planted stray reference is exactly [C3]+[C8] on its block (exit 1), `--repair` plans, `--repair --apply` releases it, clean → a planted orphan inode is exactly [C9], destroyed on apply, clean → `merge-reports` of two residue shards ≡ the whole run" {
     const io = testing.io;
     if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);

@@ -1551,7 +1551,12 @@ pub const SETATTR_CTIME: u32 = 1 << 6;
 /// APPEND) replaced — a shipped FS_IOC_SETFLAGS/FSSETXATTR; the format's
 /// own bits are never a verb's to touch.
 pub const SETATTR_FLAGS: u32 = 1 << 7;
-pub const SETATTR_KNOWN: u32 = 0xFF;
+/// KILLPRIV_V2's bit on the ship: the holder strips S_ISUID (always) and
+/// S_ISGID (with group-exec) and drops `security.capability` as the local
+/// truncate does (`FATTR_KILL_SUIDGID` on a foreign-slot file's SETATTR-
+/// size, an O_TRUNC open's `FUSE_OPEN_KILL_SUIDGID`). Carries no value.
+pub const SETATTR_KILL_SUIDGID: u32 = 1 << 8;
+pub const SETATTR_KNOWN: u32 = 0x1FF;
 
 pub const SetattrWire = extern struct {
     valid: u32,
@@ -2207,7 +2212,9 @@ test "cross-owner payloads: a step with a name, the exact lookup, travelling gua
     try testing.expectEqualStrings("dir", dit.next().?.name);
     try testing.expectEqual(@as(?GuardDentry, null), dit.next());
     _ = try roundTrip(XvReleaseReq, .{ .volume = 0, .reserved = 0, .reserved2 = 0, .scope = 1 << 40 | 3, .ino = 9 });
-    const sa: SetattrWire = .{ .valid = SETATTR_MODE | SETATTR_MTIME | SETATTR_FLAGS, .mode = 0o644, .uid = 0, .gid = 0, .size = 0, .atime = 0, .mtime = 123, .ctime = 0, .flags = 2, .reserved = 0 };
+    const sa: SetattrWire = .{ .valid = SETATTR_MODE | SETATTR_MTIME | SETATTR_FLAGS | SETATTR_KILL_SUIDGID, .mode = 0o644, .uid = 0, .gid = 0, .size = 0, .atime = 0, .mtime = 123, .ctime = 0, .flags = 2, .reserved = 0 };
+    try testing.expect(sa.check());
+    try testing.expect(!(SetattrWire{ .valid = 1 << 9, .mode = 0, .uid = 0, .gid = 0, .size = 0, .atime = 0, .mtime = 0, .ctime = 0, .flags = 0, .reserved = 0 }).check());
     _ = try roundTrip(RecordShipReq, .{ .head = .{ .volume = 0, .kind = 1, .reserved = 0, .name_len = 0, .n_proofs = 0, .value_len = 0, .reserved3 = 0, .ino = 9, .lease_epoch = 2, .setattr = sa }, .name = "", .value = "" });
     const rs = try roundTrip(RecordShipReq, .{ .head = .{ .volume = 0, .kind = 2, .reserved = 0, .name_len = 6, .n_proofs = 0, .value_len = 3, .reserved3 = 0, .ino = 9, .lease_epoch = 2, .setattr = .none }, .name = "user.a", .value = "xyz" });
     try testing.expectEqualStrings("xyz", rs.value);

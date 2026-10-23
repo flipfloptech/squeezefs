@@ -1212,6 +1212,57 @@ test "decision 0003 §AL.6 — a shipped size change runs the HOLDER's own size 
     try testing.expectEqual(@as(u32, S.IFREG | 0o640), rep.inode.?.mode);
 }
 
+test "a shipped setattr CARRIES the kernel's kill_suidgid (FATTR_KILL_SUIDGID; handoff 2026-10-21 create 7b's sibling defect) and the holder applies the local law: S_ISUID always, S_ISGID iff group-exec, `security.capability` deleted, counted — a truncate through the armed face over a 6666 file lands as 2666; a chown over a 6776 file lands as 776; the bit alone (no field) changes nothing else; without the bit a chown keeps every setid bit" {
+    const gpa = testing.allocator;
+    const f = try TwoHolders.init(gpa, testing.io, .{}, .{});
+    defer f.deinit();
+    var view: HolderView = .{};
+    var rs_b: RecordShipService = .{ .plane = &f.b.plane, .sink = view.sink() };
+    rs_b.register(&f.b.svc);
+    const Rec = struct {
+        calls: u32 = 0,
+        fn run(ctx: *anyopaque, _: u64, _: u64) errors.Error!void {
+            @as(*@This(), @ptrCast(@alignCast(ctx))).calls += 1;
+        }
+    };
+    var rec: Rec = .{};
+    const face: record_ship.TruncateFace = .{ .ctx = &rec, .truncate = &Rec.run };
+    rs_b.armTruncate(&face);
+    const file = gino(50, 3);
+    try f.b.seedFile(file, 1);
+    const eff = route_table.effectiveIno(file);
+    const strips0 = record_ship.stats.record_killpriv_strips.load();
+    // The wire keeps the bit.
+    try testing.expect(record_ship.Setattr.fromWire((record_ship.Setattr{ .kill_suidgid = true }).toWire()).kill_suidgid);
+    try testing.expect(!record_ship.Setattr.fromWire((record_ship.Setattr{ .size = 1 }).toWire()).kill_suidgid);
+    // A 6666 file with a capability set: the shipped truncate strips the
+    // suid, keeps the sgid (no group-exec), drops the caps, counts once.
+    _ = (try record_ship.ship(f.a.plane.resolver, 0, file, .{ .setattr = .{ .mode = 0o6666 } }, 0)).?;
+    _ = (try record_ship.ship(f.a.plane.resolver, 0, file, .{ .setxattr = .{ .name = "security.capability", .value = "caps" } }, 0)).?;
+    try testing.expect((try rs_b.findXattr(eff, "security.capability")) != null);
+    const rep = (try record_ship.ship(f.a.plane.resolver, 0, file, .{ .setattr = .{ .size = 0, .kill_suidgid = true } }, 0)).?;
+    try testing.expectEqual(@as(u32, 1), rec.calls);
+    try testing.expectEqual(@as(u32, S.IFREG | 0o2666), rep.inode.?.mode);
+    try testing.expectEqual(@as(u32, S.IFREG | 0o2666), (try f.b.inode(file)).?.mode);
+    try testing.expect((try rs_b.findXattr(eff, "security.capability")) == null);
+    try testing.expectEqual(strips0 + 1, record_ship.stats.record_killpriv_strips.load());
+    // A group-exec 6776 file: a chown carrying the bit lands as 776 with
+    // the new owner; the same chown WITHOUT the bit keeps both setid bits.
+    _ = (try record_ship.ship(f.a.plane.resolver, 0, file, .{ .setattr = .{ .mode = 0o6776 } }, 0)).?;
+    const chown = (try record_ship.ship(f.a.plane.resolver, 0, file, .{ .setattr = .{ .uid = 1000, .kill_suidgid = true } }, 0)).?;
+    try testing.expectEqual(@as(u32, S.IFREG | 0o776), chown.inode.?.mode);
+    try testing.expectEqual(@as(u32, 1000), chown.inode.?.uid);
+    try testing.expectEqual(strips0 + 2, record_ship.stats.record_killpriv_strips.load());
+    _ = (try record_ship.ship(f.a.plane.resolver, 0, file, .{ .setattr = .{ .mode = 0o6776 } }, 0)).?;
+    const plain = (try record_ship.ship(f.a.plane.resolver, 0, file, .{ .setattr = .{ .uid = 1001 } }, 0)).?;
+    try testing.expectEqual(@as(u32, S.IFREG | 0o6776), plain.inode.?.mode);
+    // The bit with no other field: only the strip (a file without setid
+    // bits is left byte-identical in mode).
+    const bare = (try record_ship.ship(f.a.plane.resolver, 0, file, .{ .setattr = .{ .kill_suidgid = true } }, 0)).?;
+    try testing.expectEqual(@as(u32, S.IFREG | 0o776), bare.inode.?.mode);
+    try testing.expectEqual(strips0 + 3, record_ship.stats.record_killpriv_strips.load());
+}
+
 test "record ship: a chmod/setxattr/removexattr/layout publish of a FOREIGN-slot file lands at its holder as ONE verb each, under the holder's door, and the holder invalidates its own attr cache and kernel view (INVAL_INODE then PRUNE); the publish carries its DMA proofs to the holder's face and is REJECTED where no face is armed; a local file ships nothing; a slot-moved answer redirects once; ships ≡ served" {
     const gpa = testing.allocator;
     const f = try TwoHolders.init(gpa, testing.io, .{}, .{});

@@ -39,6 +39,7 @@ const record = @import("../../record.zig");
 const tree = @import("../../tree.zig");
 const tx = @import("../../tx.zig");
 const economy = @import("../../economy.zig");
+const CAPS_XATTR = economy.CAPS_XATTR;
 const route_table = @import("../../routing/route_table.zig");
 const layout = @import("../../../data/layout.zig");
 const token_cache = @import("../tokens/token_cache.zig");
@@ -55,6 +56,9 @@ pub const stats = struct {
     pub var record_ships: counters.ShardedCounter = .{};
     /// Verbs served at this holder.
     pub var record_served: counters.ShardedCounter = .{};
+    /// Shipped setattrs that carried KILLPRIV_V2's bit: the holder stripped
+    /// the setid bits (and the caps xattr) in the verb's tx.
+    pub var record_killpriv_strips: counters.ShardedCounter = .{};
     /// A served verb refused on its merits (must stay 0; a slot-moved
     /// answer is the requester's re-resolve, not a refusal).
     pub var record_refusals: counters.Tripwire = .init("record_refusals");
@@ -94,9 +98,13 @@ pub const Setattr = struct {
     /// The attribute flags (`record.INODE_FLAGS_ATTR`) to carry: a shipped
     /// FS_IOC_SETFLAGS/FSSETXATTR of a foreign-slot inode.
     flags: ?u32 = null,
+    /// KILLPRIV_V2 (`verbs.SETATTR_KILL_SUIDGID`): the holder strips the
+    /// setid bits and drops `security.capability` in the same tx.
+    kill_suidgid: bool = false,
 
     pub fn toWire(self: Setattr) verbs.SetattrWire {
         var w: verbs.SetattrWire = .none;
+        if (self.kill_suidgid) w.valid |= verbs.SETATTR_KILL_SUIDGID;
         if (self.mode) |v| {
             w.valid |= verbs.SETATTR_MODE;
             w.mode = v;
@@ -142,6 +150,7 @@ pub const Setattr = struct {
             .mtime = if (w.valid & verbs.SETATTR_MTIME != 0) @bitCast(w.mtime) else null,
             .ctime = if (w.valid & verbs.SETATTR_CTIME != 0) @bitCast(w.ctime) else null,
             .flags = if (w.valid & verbs.SETATTR_FLAGS != 0) w.flags else null,
+            .kill_suidgid = w.valid & verbs.SETATTR_KILL_SUIDGID != 0,
         };
     }
 };
@@ -501,6 +510,15 @@ pub fn RecordShipService(comptime Store: type) type {
                     if (s.mtime) |x| v.mtime = x;
                     // The attribute bits alone: STRIPE is the format's.
                     if (s.flags) |f| v.flags = (v.flags & ~record.INODE_FLAGS_ATTR) | (f & record.INODE_FLAGS_ATTR);
+                    // KILLPRIV_V2 at the holder: the mode strip and the
+                    // caps xattr's Delete ride this tx, as the local
+                    // truncate's `killpriv` (the writer's kernel told the
+                    // writer; the holder never sees the flag otherwise).
+                    if (s.kill_suidgid) {
+                        v.mode = economy.killSuidgidMode(v.mode);
+                        if (try self.findXattr(k, CAPS_XATTR)) |hit| t.stageDelete(key.TREE_XATTRS, &hit.k) catch return error.OutOfMemory;
+                        stats.record_killpriv_strips.inc();
+                    }
                     v.ctime = s.ctime orelse now;
                     t.stagePut(key.TREE_INODES, &key.inodeKey(k), &v.encode()) catch return error.OutOfMemory;
                 },

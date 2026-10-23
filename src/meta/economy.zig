@@ -89,6 +89,56 @@ pub const stats = struct {
 /// constants are `std.os.linux`'s on every host.
 pub const S = linux.S;
 
+// ---------------------------------------------------------------------------
+// The setid strips the daemon owns (charter §4 "inode flags" neighbour;
+// `fs/fuse/dir.c` `fuse_setattr`: under FUSE_HANDLE_KILLPRIV_V2 the kernel
+// DROPS its own ATTR_KILL_SUID/SGID/MODE from a setattr and sends nothing —
+// "the only sane way to reliably kill suid/sgid is to do it in the
+// userspace filesystem"; it tells the daemon on WRITE and SETATTR-size
+// through `FUSE_WRITE_KILL_SUIDGID` / `FATTR_KILL_SUIDGID`, and on
+// FALLOCATE not at all: `fuse_file_fallocate` runs `file_modified` →
+// `file_remove_privs` → `notify_change(ATTR_KILL_*)`, which `fuse_setattr`
+// swallows, so the request carries no flag and the daemon applies the
+// kernel's own rule from the request header's caller).
+// ---------------------------------------------------------------------------
+
+/// The capability xattr KILLPRIV drops beside the mode bits.
+pub const CAPS_XATTR: []const u8 = "security.capability";
+
+/// `kill_suidgid_mode` (the KILLPRIV_V2 flag's law): suid always; sgid iff
+/// group-exec.
+pub fn killSuidgidMode(mode: u32) u32 {
+    var m = mode & ~@as(u32, S.ISUID);
+    if (m & S.IXGRP != 0) m &= ~@as(u32, S.ISGID);
+    return m;
+}
+
+/// What a data modification's caller is to the setid rule.
+pub const Modifier = struct {
+    /// `capable(CAP_FSETID)`: the strip is skipped entirely.
+    cap_fsetid: bool,
+    /// `in_group_p(inode gid)`: the caller's effective gid or a
+    /// supplementary group is the file's.
+    in_group: bool,
+};
+
+/// The kernel's rule for an UNFLAGGED data modification (fallocate):
+/// `fs/attr.c` `setattr_should_drop_suidgid` on a regular file — kill
+/// S_ISUID when set; kill S_ISGID when set and the file is group-exec OR
+/// the caller is outside its group (`setattr_should_drop_sgid`); nothing
+/// when the caller has CAP_FSETID (the generic/683 golden: 6666 → 666 for
+/// a non-member, 6676 → 676, 2676 → 676; root keeps every bit; a member's
+/// non-exec sgid — 2666 — stays). Null = nothing changes.
+pub fn fallocateStripMode(mode: u32, m: Modifier) ?u32 {
+    const kill_suid = mode & S.ISUID != 0;
+    const kill_sgid = mode & S.ISGID != 0 and (mode & S.IXGRP != 0 or !m.in_group);
+    if (!(kill_suid or kill_sgid) or m.cap_fsetid) return null;
+    var out = mode;
+    if (kill_suid) out &= ~@as(u32, S.ISUID);
+    if (kill_sgid) out &= ~@as(u32, S.ISGID);
+    return out;
+}
+
 /// Dentry-value `file_type` byte from mode bits: `dt` such that
 /// `dt << 12 == mode & S_IFMT`.
 pub fn ftByte(mode: u32) u8 {

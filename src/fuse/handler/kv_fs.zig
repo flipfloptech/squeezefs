@@ -144,7 +144,7 @@ const Mapping = layout.Mapping;
 /// The xattr that carries a file's layout record (charter §5.1).
 pub const LAYOUT_XATTR: []const u8 = layout.LAYOUT_XATTR_NAME;
 /// The Linux capability xattr KILLPRIV_V2 drops.
-pub const CAPS_XATTR: []const u8 = "security.capability";
+pub const CAPS_XATTR = economy.CAPS_XATTR;
 /// `NAME_MAX`: `f_namelen` and every name op's ENAMETOOLONG bound.
 pub const NAME_MAX: usize = record.NAME_MAX;
 /// Corpses per destroy entry: the reclaim gather's measured fill (≈ 62 at
@@ -178,12 +178,8 @@ pub const O_DIRECT = filesystem.O_DIRECT;
 // KILLPRIV_V2.
 // ---------------------------------------------------------------------------
 
-/// `kill_suidgid_mode`: suid always; sgid iff group-exec.
-pub fn killSuidgidMode(mode: u32) u32 {
-    var m = mode & ~@as(u32, S.ISUID);
-    if (m & S.IXGRP != 0) m &= ~@as(u32, S.ISGID);
-    return m;
-}
+/// `kill_suidgid_mode`: suid always; sgid iff group-exec (`economy`'s).
+pub const killSuidgidMode = economy.killSuidgidMode;
 
 // ---------------------------------------------------------------------------
 // Instruments.
@@ -289,6 +285,9 @@ pub var fuse_fallocate_extends: counters.ShardedCounter = .{};
 pub var fuse_fallocate_promotions: counters.ShardedCounter = .{};
 pub var fuse_fallocate_shifts: counters.ShardedCounter = .{};
 pub var fuse_fallocate_shift_refusals: counters.ShardedCounter = .{};
+/// `fuse_fallocate_setid_strips`: fallocates that stripped S_ISUID/S_ISGID
+/// by the kernel's rule (`economy.fallocateStripMode`; generic/683).
+pub var fuse_fallocate_setid_strips: counters.ShardedCounter = .{};
 /// `fuse_write_sync_fsyncs`: WRITEs whose open flags carried O_DSYNC/O_SYNC
 /// and ran the fsync ladder before their ack (the sync law, `write`).
 pub var fuse_write_sync_fsyncs: counters.ShardedCounter = .{};
@@ -2378,7 +2377,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                     self.data.flushCustody(self.io, local);
                     try self.data.barrierData(self.io, &.{local});
                 }
-                const rep = try self.shipRecord(a.ino, .{ .setattr = .{ .mode = req.mode, .uid = req.uid, .gid = req.gid, .size = req.size, .atime = req.atime, .mtime = req.mtime, .ctime = req.ctime } });
+                const rep = try self.shipRecord(a.ino, .{ .setattr = .{ .mode = req.mode, .uid = req.uid, .gid = req.gid, .size = req.size, .atime = req.atime, .mtime = req.mtime, .ctime = req.ctime, .kill_suidgid = a.attr.kill_suidgid } });
                 return self.attrReply(a.ino, rep.inode orelse return error.FileNotFound);
             }
             var after: AfterCommit = .{};
@@ -2599,10 +2598,65 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 // in ONE commit (`setattr`'s law for a size set).
                 _ = try self.setattrJudged(c, .{ .ino = a.ino, .attr = .{ .size = end } }, false);
                 fuse_fallocate_extends.inc();
-                return;
-            }
-            if (changed) try self.stampTimes(c, a.ino, local);
+            } else if (changed) try self.stampTimes(c, a.ino, local);
+            try self.stripPrivsAfterFallocate(c, a.ino, local);
         }
+
+        /// The setid strip of a fallocate (`economy.fallocateStripMode`):
+        /// the kernel ran `file_modified` before the request and FUSE's
+        /// setattr swallowed its ATTR_KILL_* under KILLPRIV_V2, so the
+        /// daemon applies the rule itself from the header's caller —
+        /// `capable(CAP_FSETID)` and `in_group_p` read off
+        /// `/proc/<pid>/status` (`CapEff`, `Gid`, `Groups`), with the
+        /// header's uid 0 / gid as the fallback when the caller is gone.
+        /// Every successful fallocate, a no-op interior one included (the
+        /// kernel strips before it knows). The mode set rides `setattr`
+        /// (ctime; a foreign-slot file's ships); `security.capability` is
+        /// the kernel's own (its `security_inode_killpriv` sends the
+        /// REMOVEXATTR).
+        fn stripPrivsAfterFallocate(self: *Self, c: *Ctx, global: u64, local: u64) Error!void {
+            const v = try self.readInode(local);
+            if (v.mode & (S.ISUID | S.ISGID) == 0) return;
+            const m = callerModifier(self.io, c, v.gid);
+            const stripped = economy.fallocateStripMode(v.mode, m) orelse return;
+            fuse_fallocate_setid_strips.inc();
+            _ = try self.setattrJudged(c, .{ .ino = global, .attr = .{ .mode = stripped } }, false);
+        }
+
+        /// The caller's standing for the setid rule: `/proc/<pid>/status`
+        /// when it still names the process (CapEff bit 4 = CAP_FSETID; the
+        /// effective gid and the supplementary groups), else the header's
+        /// uid 0 as the capability and its gid as the one group.
+        fn callerModifier(io: Io, c: *Ctx, inode_gid: u32) economy.Modifier {
+            var m: economy.Modifier = .{ .cap_fsetid = c.uid == 0, .in_group = c.gid == inode_gid };
+            var path_buf: [64]u8 = undefined;
+            const path = std.fmt.bufPrint(&path_buf, "/proc/{d}/status", .{c.pid}) catch return m;
+            var buf: [8192]u8 = undefined;
+            const text = Io.Dir.cwd().readFile(io, path, &buf) catch return m;
+            var it = std.mem.splitScalar(u8, text, '\n');
+            while (it.next()) |line| {
+                if (std.mem.startsWith(u8, line, "CapEff:")) {
+                    const hex = std.mem.trim(u8, line["CapEff:".len..], " \t");
+                    const caps = std.fmt.parseInt(u64, hex, 16) catch continue; // proc(5): CapEff is hex
+                    m.cap_fsetid = caps & (1 << CAP_FSETID) != 0;
+                } else if (std.mem.startsWith(u8, line, "Gid:")) {
+                    // real, effective, saved, fs: the effective one.
+                    var f = std.mem.tokenizeAny(u8, line["Gid:".len..], " \t");
+                    _ = f.next();
+                    const egid = std.fmt.parseInt(u32, f.next() orelse continue, 10) catch continue; // proc(5): decimal ids
+                    m.in_group = egid == inode_gid;
+                } else if (std.mem.startsWith(u8, line, "Groups:")) {
+                    var g = std.mem.tokenizeAny(u8, line["Groups:".len..], " \t");
+                    while (g.next()) |tok| {
+                        const gid = std.fmt.parseInt(u32, tok, 10) catch continue; // proc(5): decimal ids
+                        if (gid == inode_gid) m.in_group = true;
+                    }
+                }
+            }
+            return m;
+        }
+
+        const CAP_FSETID: u6 = 4; // linux/capability.h
 
         /// Allocate's reservation of `[first, last]` on a striped file (a
         /// non-striped one promotes first, unless the range lies inside the
@@ -5415,6 +5469,68 @@ test "the drain worker's try-only LOOKUP / GETATTR (decision 0003 §AB.1) answer
     try testing.expect(h.d.probeMeta(.{ .lookup = .{ .name = ".stats" } }, meta, &out) == null);
 }
 
+test "the fallocate setid strip (fstests generic/683; `economy.fallocateStripMode` = `setattr_should_drop_suidgid`): S_ISUID killed when set; S_ISGID when set and the file is group-exec or the caller is outside its group (6666 → 666, 6676 → 676, 6766 → 766, 6777 → 777, 2676 → 676, 2777 → 777, 2666 → 666 for a non-member); CAP_FSETID keeps every bit; a member keeps a non-exec sgid (2666 stays, 6666 → 2666); no setid bit kills nothing" {
+    const out = economy.Modifier{ .cap_fsetid = false, .in_group = false };
+    const member = economy.Modifier{ .cap_fsetid = false, .in_group = true };
+    const root = economy.Modifier{ .cap_fsetid = true, .in_group = false };
+    const F = S.IFREG;
+    try testing.expectEqual(@as(?u32, F | 0o666), economy.fallocateStripMode(F | 0o6666, out));
+    try testing.expectEqual(@as(?u32, F | 0o676), economy.fallocateStripMode(F | 0o6676, out));
+    try testing.expectEqual(@as(?u32, F | 0o766), economy.fallocateStripMode(F | 0o6766, out));
+    try testing.expectEqual(@as(?u32, F | 0o777), economy.fallocateStripMode(F | 0o6777, out));
+    try testing.expectEqual(@as(?u32, F | 0o676), economy.fallocateStripMode(F | 0o2676, out));
+    try testing.expectEqual(@as(?u32, F | 0o777), economy.fallocateStripMode(F | 0o2777, out));
+    try testing.expectEqual(@as(?u32, F | 0o666), economy.fallocateStripMode(F | 0o2666, out));
+    try testing.expectEqual(@as(?u32, null), economy.fallocateStripMode(F | 0o2666, member));
+    try testing.expectEqual(@as(?u32, null), economy.fallocateStripMode(F | 0o666, out));
+    try testing.expectEqual(@as(?u32, F | 0o2666), economy.fallocateStripMode(F | 0o6666, member));
+    try testing.expectEqual(@as(?u32, F | 0o676), economy.fallocateStripMode(F | 0o6676, member));
+    for ([_]u32{ 0o6666, 0o6676, 0o6766, 0o6777, 0o2676, 0o2777 }) |m| try testing.expectEqual(@as(?u32, null), economy.fallocateStripMode(F | m, root));
+}
+
+test "fallocate strips the setid bits through the dispatcher (generic/683's matrix): a no-op interior `falloc` by a caller outside the file's group (uid 1001, no live pid: the header's standing) takes 6666 → 666, 6676 → 676, 2676 → 676 with the ctime stamped; the same by uid 0 keeps every bit; by a group member 6666 → 2666; a file without setid bits is untouched (no commit)" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    const f = try h.create(1, "f", 0o644);
+    const payload: [3000]u8 = @splat('X');
+    try testing.expectEqual(@as(?linux.E, null), h.write(f, 0, &payload, 0).errno());
+    const Case = struct { mode: u32, uid: u32, gid: u32, want: u32 };
+    const cases = [_]Case{
+        .{ .mode = 0o6666, .uid = 1001, .gid = 1001, .want = 0o666 },
+        .{ .mode = 0o6676, .uid = 1001, .gid = 1001, .want = 0o676 },
+        .{ .mode = 0o2676, .uid = 1001, .gid = 1001, .want = 0o676 },
+        .{ .mode = 0o6666, .uid = 0, .gid = 0, .want = 0o6666 },
+        .{ .mode = 0o6676, .uid = 0, .gid = 0, .want = 0o6676 },
+        .{ .mode = 0o6666, .uid = 1001, .gid = 1000, .want = 0o2666 }, // the file's group (gid 1000)
+    };
+    for (cases) |cs| {
+        var in = abi.zeroed(abi.fuse_setattr_in);
+        in.valid = abi.FATTR_MODE;
+        in.mode = cs.mode;
+        try testing.expectEqual(@as(?linux.E, null), h.setattr(f, in).errno());
+        const before = try h.getattr(f);
+        try testing.expectEqual(cs.mode, before.mode & 0o7777);
+        const strips0 = fuse_fallocate_setid_strips.load();
+        try testing.expectEqual(@as(?linux.E, null), h.fallocateAs(f, 0, 1000, 500, cs.uid, cs.gid, 0));
+        const after = try h.getattr(f);
+        try testing.expectEqual(cs.want, after.mode & 0o7777);
+        if (cs.want != cs.mode) {
+            try testing.expectEqual(strips0 + 1, fuse_fallocate_setid_strips.load());
+            try testing.expect(after.ctime > before.ctime or (after.ctime == before.ctime and after.ctimensec >= before.ctimensec));
+        } else try testing.expectEqual(strips0, fuse_fallocate_setid_strips.load());
+    }
+    // No setid bits: nothing read past the record, nothing committed.
+    var plain = abi.zeroed(abi.fuse_setattr_in);
+    plain.valid = abi.FATTR_MODE;
+    plain.mode = 0o644;
+    try testing.expectEqual(@as(?linux.E, null), h.setattr(f, plain).errno());
+    const commits = h.store.commits;
+    try testing.expectEqual(@as(?linux.E, null), h.fallocateAs(f, 0, 1000, 500, 1001, 1001, 0));
+    try testing.expectEqual(commits, h.store.commits);
+    h.release(f);
+}
+
 test "KILLPRIV_V2 mode law: suid always; sgid iff group-exec" {
     try testing.expectEqual(@as(u32, 0o755), killSuidgidMode(0o4755));
     try testing.expectEqual(@as(u32, 0o755), killSuidgidMode(0o6755));
@@ -5498,10 +5614,15 @@ fn HarnessOf(comptime Data: type) type {
         }
 
         fn call(self: *Self, req: codec.Request, nodeid: u64) Loopback.Captured {
+            return self.callAs(req, nodeid, 1000, 1000, 7);
+        }
+
+        /// A request under another caller's header (uid/gid/pid).
+        fn callAs(self: *Self, req: codec.Request, nodeid: u64, uid: u32, gid: u32, pid: u32) Loopback.Captured {
             const u = self.unique;
             self.unique += abi.FUSE_REQ_ID_STEP;
             const before = self.lb.replyCount(slot);
-            self.d.dispatch(req, .{ .unique = u, .nodeid = nodeid, .uid = 1000, .gid = 1000, .pid = 7 }, slot, null);
+            self.d.dispatch(req, .{ .unique = u, .nodeid = nodeid, .uid = uid, .gid = gid, .pid = pid }, slot, null);
             std.debug.assert(self.lb.replyCount(slot) == before + 1);
             const c = self.lb.captured(slot).?;
             std.debug.assert(c.header.unique == u);
@@ -5582,6 +5703,10 @@ fn HarnessOf(comptime Data: type) type {
 
         fn fallocate(self: *Self, ino: u64, mode: u32, offset: u64, length: u64) ?linux.E {
             return self.call(.{ .fallocate = .{ .fh = 1, .offset = offset, .length = length, .mode = mode, .padding = 0 } }, ino).errno();
+        }
+
+        fn fallocateAs(self: *Self, ino: u64, mode: u32, offset: u64, length: u64, uid: u32, gid: u32, pid: u32) ?linux.E {
+            return self.callAs(.{ .fallocate = .{ .fh = 1, .offset = offset, .length = length, .mode = mode, .padding = 0 } }, ino, uid, gid, pid).errno();
         }
 
         fn release(self: *Self, ino: u64) void {

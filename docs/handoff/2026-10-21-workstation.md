@@ -90,8 +90,8 @@ next landing on top of it, and its model must include the fold's ordering invari
    drafted). From create 7b's report, owed: the DEAD MANAGER row's hang on the train was B parking
    TWICE (the second reclaim → `UnknownLease` → poisoned, one cross-owner create parked forever at
    `[handler_entry]`) — a load sensitivity of `T_owner`; the replay gate drops a straggler Δ the node
-   never saw (an exact-seq gate would keep it); the shipped setattr carries no `kill_suidgid`, so a
-   foreign-slot truncate does not strip S_ISUID/S_ISGID at the holder; under doubled load `A
+   never saw (an exact-seq gate would keep it); ~~the shipped setattr carries no `kill_suidgid`~~ (DONE
+   2026-10-23, decision 0003 §BK: `SETATTR_KILL_SUIDGID` on the wire, applied at the holder); under doubled load `A
    MEMBER'S CACHED COPY…` and `THE ORDERED LAW'S KILL ROW` each failed once (`~/tmp/cp7b/runs/`).
 3. The write cache's remainder (`rung-10-write-cache.md`): the FUSE transport is 52 % of the
    small-file profile (the mainline port's territory), per-grain checksums, clock stamps, the witness

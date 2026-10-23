@@ -84,6 +84,11 @@ pub const stats = struct {
     /// The write cache's fsync answered EIO: a resident the promotion left
     /// in the ring (a resource decline) cannot be made durable.
     pub var fsync_promote_refusals: counters.ShardedCounter = .{};
+    /// The write cache's sync point answered ENOSPC: a resident no data
+    /// volume could allocate a block for (`LiveVerdict.no_space`) stays
+    /// resident and dirty; the next sync point retries (one per resident
+    /// per point: a syncfs counts every one it met).
+    pub var fsync_promote_enospc: counters.ShardedCounter = .{};
     /// Should stay 0: an ordinal above `MAX_ORDINAL` fell to `ALL_BIT`.
     pub var fsync_touched_unresolved: counters.ShardedCounter = .{};
     /// The mount-wide ladder (`syncfs`): its calls, the distinct inos its
@@ -95,7 +100,7 @@ pub const stats = struct {
 
 pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
     try w.writeAll("{");
-    inline for (.{ "fsync_calls", "fsync_data_namespaces_touched", "fsync_data_namespaces_flushed", "fsync_write_through_skips", "fsync_noop_clean", "fsync_parallel_joins", "fsync_flush_enospc_retries", "fsync_promote_failures", "fsync_promote_refusals", "fsync_touched_unresolved", "syncfs_calls", "syncfs_custody_inos", "syncfs_parked_blocks" }) |name| {
+    inline for (.{ "fsync_calls", "fsync_data_namespaces_touched", "fsync_data_namespaces_flushed", "fsync_write_through_skips", "fsync_noop_clean", "fsync_parallel_joins", "fsync_flush_enospc_retries", "fsync_promote_failures", "fsync_promote_refusals", "fsync_promote_enospc", "fsync_touched_unresolved", "syncfs_calls", "syncfs_custody_inos", "syncfs_parked_blocks" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, @field(stats, name).load() });
     }
     try w.writeAll("\"fsync_phase_ns\":{");
@@ -494,12 +499,19 @@ pub fn fsync(ctx: Ctx, io: Io, ino: u64, prof: *Prof) Error!void {
     // STAGED PROMOTE: the write cache's law (a RAM record cannot be made
     // durable where it lies: it leaves for the data volumes BEFORE the data
     // barrier, so the barrier covers its block; one still resident after
-    // the attempt is an fsync that cannot be acked — EIO).
-    if (ctx.staged_key) |k| if (ctx.staged_segment) |seg| {
-        if (staging.promoteAtFsync(seg, ctx.promotion, k) == .kept) {
+    // the attempt is an fsync that cannot be acked — EIO, or ENOSPC when
+    // the store had no block for it: the terminal law's word at the sync
+    // point, the bytes stay resident and dirty and the next point retries).
+    if (ctx.staged_key) |k| if (ctx.staged_segment) |seg| switch (staging.promoteAtFsync(seg, ctx.promotion, k)) {
+        .kept => {
             stats.fsync_promote_refusals.inc();
             return error.InputOutput;
-        }
+        },
+        .kept_no_space => {
+            stats.fsync_promote_enospc.inc();
+            return error.NoSpaceLeft;
+        },
+        .promoted, .absent => {},
     };
     prof.mark(.staged_promote);
     // DATA BARRIER: observe → plan → legs joined and ALL awaited → clear.
@@ -583,13 +595,14 @@ pub fn syncfs(ctx: Ctx, gpa: Allocator, io: Io, prof: *SyncfsProf) Error!void {
     };
     prof.mark(.data_flush);
     // STAGED PROMOTE: every resident, exactly as at a per-file fsync (the
-    // write cache's law); any kept is a syncfs that cannot be acked.
+    // write cache's law); any kept is a syncfs that cannot be acked — EIO
+    // for a decline, ENOSPC when every kept one was the store's refusal.
     if (ctx.staged_segment) |seg| {
         const kept = try staging.promoteAllAtSyncfs(gpa, seg, ctx.promotion);
-        if (kept != 0) {
-            stats.fsync_promote_refusals.add(kept);
-            return error.InputOutput;
-        }
+        stats.fsync_promote_refusals.add(kept.declined);
+        stats.fsync_promote_enospc.add(kept.no_space);
+        if (kept.declined != 0) return error.InputOutput;
+        if (kept.no_space != 0) return error.NoSpaceLeft;
     }
     prof.mark(.staged_promote);
     // DATA BARRIER: every volatile namespace; the stripe words snapshotted
@@ -861,6 +874,8 @@ const FsyncWorld = struct {
     promoted: u32 = 0,
     /// The promote hook declines (a resource refusal): the record stays.
     promote_decline: bool = false,
+    /// The store refused the block (`LiveVerdict.no_space`).
+    promote_no_space: bool = false,
     /// The hook answers `unnamed`: the layout moved away from the record
     /// under the writer's lock, its ring release still to come.
     promote_unnamed: bool = false,
@@ -898,6 +913,7 @@ const FsyncWorld = struct {
     fn promote(ctx: ?*anyopaque, key: staging.StagingKey) staging.LiveVerdict {
         const self: *FsyncWorld = @ptrCast(@alignCast(ctx.?));
         if (self.promote_decline) return .declined;
+        if (self.promote_no_space) return .no_space;
         if (self.promote_unnamed) return .unnamed;
         self.promoted += 1;
         return if (self.ring.remove(key, null)) .promoted else .declined;
@@ -1044,6 +1060,30 @@ test "the write cache's law (charter §6.1 'Staged', 2026-10-21): fsync PROMOTES
     try testing.expectEqual(@as(u32, 3), w.promoted);
     try testing.expectEqual(@as(?u64, 6), w.ring.residentGeneration(key));
     try testing.expect(w.ring.remove(key, 6));
+    // THE STORE'S REFUSAL (charter §8's terminal law at the sync point):
+    // a resident no data volume could allocate a block for is an fsync
+    // that answers ENOSPC — never EIO — counted fsync_promote_enospc, the
+    // record kept and dirty; syncfs likewise when every kept resident was
+    // the store's; a decline beside it keeps EIO (the worse word wins).
+    const enospc0 = stats.fsync_promote_enospc.load();
+    try w.ring.put(key, &payload, 7, 0, 0);
+    w.promote_no_space = true;
+    var prof5 = Prof.start();
+    try testing.expectError(error.NoSpaceLeft, fsync(ctx, io, 5, &prof5));
+    try testing.expectEqual(enospc0 + 1, stats.fsync_promote_enospc.load());
+    try testing.expectEqual(refusals0 + 2, stats.fsync_promote_refusals.load());
+    try testing.expectEqual(@as(?u64, 7), w.ring.residentGeneration(key));
+    try w.ring.put(staging.StagingKey.init(@splat(0x5b), 7), &payload, 8, 0, 0);
+    var sprof4 = SyncfsProf.start();
+    try testing.expectError(error.NoSpaceLeft, syncfs(w.mkCtx(), testing.allocator, io, &sprof4));
+    try testing.expectEqual(enospc0 + 3, stats.fsync_promote_enospc.load());
+    try testing.expectEqual(@as(usize, 2), w.ring.live());
+    // Space returned: the same residents promote, the point is acked.
+    w.promote_no_space = false;
+    var sprof5 = SyncfsProf.start();
+    try syncfs(w.mkCtx(), testing.allocator, io, &sprof5);
+    try testing.expectEqual(@as(u32, 5), w.promoted);
+    try testing.expectEqual(@as(usize, 0), w.ring.live());
 }
 
 test "fsync ladder: a parked partial block escalates to one durable upload, the data barrier covers only the touched namespace, the legs land strictly before the meta publish and the meta barrier last; phases sum exactly; the touched bits clear" {

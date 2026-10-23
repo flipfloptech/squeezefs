@@ -178,6 +178,20 @@ pub const Volumes = struct {
         }
         return out[0..n_out];
     }
+
+    /// The set's reachable free bytes (`statfs`'s free and the write
+    /// cache's claim read the same sum, so what `df` shows free is what a
+    /// write is admitted against): per volume the free list, the virgin
+    /// tail and the blocks inside open trim windows — supply, never a
+    /// deficit; block 0, the superblock chunk, is outside it.
+    pub fn reachableFreeBytes(self: *const Volumes, block_size: u64) u64 {
+        var free: u64 = 0;
+        for (self.rows[0..self.n()]) |*r| {
+            const a = r.*.?.alloc;
+            free += @min(a.reachableFreeBlocks(), a.capacityBlocks() - 1) * block_size;
+        }
+        return free;
+    }
 };
 
 // ---------------------------------------------------------------------------

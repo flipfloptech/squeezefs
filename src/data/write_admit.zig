@@ -494,6 +494,19 @@ pub const WritePath = struct {
     /// The volume's FAILED/fenced probe every fence arm classifies on
     /// (`seams.classifyFence`): the overlay's, the pipeline's, the epochs'.
     fence: ?seams.FenceProbe,
+    /// The write cache's resident footprint — its claim on the store's
+    /// free bytes ahead of every fresh custody (`enospc.storeCoversRing`);
+    /// the plane installs it with its staging ring, null = no write cache.
+    ring_claim: ?RingClaim = null,
+
+    pub const RingClaim = struct {
+        ctx: *anyopaque,
+        bytes: *const fn (*anyopaque) u64,
+
+        pub fn load(self: RingClaim) u64 {
+            return self.bytes(self.ctx);
+        }
+    };
 
     pub const Deps = struct {
         /// The mount's `Io` for the slow paths that free parked supply
@@ -808,6 +821,18 @@ pub const WritePath = struct {
 
     // ---- §8 the custody probe ----
 
+    /// The write cache's claim is UNCOVERED: the set's reachable free bytes
+    /// no longer cover the ring's resident footprint plus `extra` B of
+    /// growth (`enospc.storeCoversRing`; the module doc's terminal law, the
+    /// sync point's half). One atomic load while the ring is empty; false
+    /// with no write cache.
+    pub fn ringUncovered(self: *const WritePath, extra: u64) bool {
+        const claim = self.ring_claim orelse return false;
+        const ring = claim.load();
+        if (ring == 0 and extra == 0) return false;
+        return !enospc.storeCoversRing(self.vols.reachableFreeBytes(self.cfg.block_size), ring, extra);
+    }
+
     /// RAM-only: a block is HELD iff custody exists (parked, overlay, epoch)
     /// or the write can land IN PLACE (passthrough ∧ undecorated whole-block
     /// ∧ active volume ∧ `refcount == 1 ∧ !SHARED`); a hole below EOF holds
@@ -855,13 +880,15 @@ pub const WritePath = struct {
         }
         const first: u32 = @intCast(req.offset / bs);
         const last: u32 = @intCast((end - 1) / bs);
-        // §8: the ENOSPC terminal law, decided for the WHOLE write. The
-        // custody probe (a map lookup per block) is asked only once the
-        // set's fresh supply is exhausted: with supply the law admits
-        // whatever it would answer.
+        // §8: the ENOSPC terminal law, decided for the WHOLE write: the
+        // set's fresh supply exhausted, or the write cache's claim on the
+        // store uncovered (`ringUncovered`). The custody probe (a map lookup
+        // per block) is asked only once one of them holds: otherwise the law
+        // admits whatever it would answer.
         var cands: [router.MAX_VOLUMES]*block_alloc.BlockAllocator = undefined;
         const exhausted = enospc.freshSupplyExhausted(self.vols.candidates(&cands));
-        if (enospc.admitWrite(exhausted, exhausted and self.writeWouldCreateFreshCustody(req.ino, req.file, first, last)) == .refuse_enospc) {
+        const uncovered = !exhausted and self.ringUncovered(0);
+        if (enospc.admitWrite(exhausted, uncovered, (exhausted or uncovered) and self.writeWouldCreateFreshCustody(req.ino, req.file, first, last)) == .refuse_enospc) {
             stats.write_enospc_refusals.inc();
             return error.NoSpaceLeft;
         }

@@ -10645,6 +10645,150 @@ test "smoke: A SYNCFS THAT MEETS A RESIDENT ITS LAYOUT NO LONGER NAMES OWES IT N
     try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
 }
 
+/// The full-store row's files: 100 KiB — packable (≤ the 512 KiB max slot
+/// of a 1 MiB block), ten to a pack with 24 KiB of slack, so the
+/// residents' byte claim (`staging.StoreClaim`) admits a few more than the
+/// packs can hold and the sync point meets the store's refusal for exactly
+/// that remainder — the honest estimate's gap, the terminal law's case.
+const full_store_file_bytes: u64 = 100 << 10;
+/// The row's `dd` of one file from the pattern: `$2` the name; the stderr
+/// appended to `$1/dd.err` (the errno the application saw is judged there).
+const full_store_dd = "dd if=\"$1/pattern\" of=\"$2\" bs=102400 count=1 status=none 2>>\"$1/dd.err\"";
+
+test "smoke: A FULL DATA STORE ANSWERS ENOSPC — NEVER EIO — AT write(2) AND AT THE SYNC POINT, ONE LINE PER EPISODE (charter §8's terminal law, the sync point's half) — two 192 MiB data volumes of 1 MiB blocks, the write cache ON: 100 KiB files written (never synced) until write(2) refuses — the residents' claim on the store (`statfs` free counts it) covers the free blocks, `df` shows under one block free, every refusal says 'No space left on device' → `sync -f` promotes the residents into packs until the store has no block for the rest: exit 1 with ENOSPC, the daemon's ONE 'data store FULL' warning, no error line, no tripwire, fsync_promote_enospc ≥ 1 → fsync of every file: the kept ones answer ENOSPC (the same episode: still one line) and are removed → `sync -f` exits 0 → ten tenants of one pack removed: their block returns, a fresh file lands, the episode closes with its tally → kill -9 → fsck --offline clean → remount → every surviving file byte-equal to the pattern (red on dev: 'Input/output error' from `sync -f` and from dd's fsync, 'syncfs: a leg failed (InputOutput)' and 'fsync ino N: a leg failed (InputOutput)' per sync point — generic/750: 235 + 79 in 19 s; the write cache admitted every byte and the dismount pass FAILED 1,481 residents)" {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    // The C8 oracle at every mount (the remount after the kill judges it).
+    try rig.env.put("SQUEEZEFS_BLOCK_REFS_VERIFY", "1");
+    var bs_buf: [16]u8 = undefined;
+    try rig.formatSetSized(true, &.{ "--block-size", try std.fmt.bufPrint(&bs_buf, "{d}", .{reuse_row_block}) }, reuse_row_data_bytes);
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(0);
+    // syncfs reaches a FUSE server only once INIT negotiated FUSE_HAS_SYNCFS.
+    {
+        const st = try rig.stats();
+        defer gpa.free(st);
+        if (numberAfter(st, "\"fuse_syncfs_armed\":") != 1) {
+            try rig.umount();
+            _ = try rig.waitChild();
+            return testkit.skip(@src(), .no_kernel_feature, "FUSE_HAS_SYNCFS not offered — syncfs(2) never reaches a plain /dev/fuse server");
+        }
+    }
+    // 1. The fill: 100 KiB files, never synced, until write(2) refuses.
+    //    The store's free blocks (2 × 191 of 1 MiB) cover ≈ 3,911 claims.
+    const admitted: u64 = blk: {
+        var script: [512]u8 = undefined;
+        const out = try rig.onMountTimed(try std.fmt.bufPrint(&script, "head -c {d} /dev/urandom > \"$1/pattern\" && : > \"$1/dd.err\" && j=0; while [ $j -lt 6000 ] && sh -c '{s}' smoke \"$1\" fill$j; do j=$((j+1)); done; rm -f fill$j; echo $j; grep -c 'No space left on device' \"$1/dd.err\"; grep -c 'Input/output error' \"$1/dd.err\" || true; df -kP . | tail -1 | awk '{{print $4}}'", .{ full_store_file_bytes, full_store_dd }), 600);
+        defer gpa.free(out);
+        var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, out, "\n"), '\n');
+        const n = try std.fmt.parseInt(u64, lines.next() orelse return error.FillUnparsed, 10);
+        const enospc = try std.fmt.parseInt(u64, lines.next() orelse return error.FillUnparsed, 10);
+        const eio = try std.fmt.parseInt(u64, lines.next() orelse return error.FillUnparsed, 10);
+        const avail_kib = try std.fmt.parseInt(u64, lines.next() orelse return error.FillUnparsed, 10);
+        std.debug.print("\nsmoke[full store]: {d} × 100 KiB files admitted unsynced; the refusal: {d} × ENOSPC, {d} × EIO; df avail {d} KiB\n", .{ n, enospc, eio, avail_kib });
+        try testing.expect(n >= 3800 and n <= 3911);
+        try testing.expectEqual(@as(u64, 1), enospc);
+        try testing.expectEqual(@as(u64, 0), eio);
+        try testing.expect(avail_kib < reuse_row_block / 1024);
+        break :blk n;
+    };
+    {
+        const t = try rig.stats();
+        defer gpa.free(t);
+        try testing.expect((numberAfter(t, "\"fuse_write_staged_store_full_refusals\":") orelse 0) >= 1);
+        try testing.expect((numberAfter(t, "\"write_cache_claim_enospc_refusals\":") orelse 0) >= 1);
+        try testing.expectEqual(@as(?u64, 0), numberAfter(t, "\"full_store_episodes\":"));
+    }
+    // 2. The sync point: the residents promote into packs until the store
+    //    has no block for the rest — ENOSPC, never EIO; ONE warning.
+    const mark = try rig.logLen();
+    {
+        const out = try rig.onMountTimed("if sync -f . 2>\"$1/sync.err\"; then echo synced; else echo refused; fi; cat \"$1/sync.err\"", 600);
+        defer gpa.free(out);
+        std.debug.print("smoke[full store]: sync -f on the full store: {s}", .{out});
+        try testing.expect(std.mem.startsWith(u8, out, "refused\n"));
+        try testing.expect(std.mem.indexOf(u8, out, "No space left on device") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "Input/output error") == null);
+    }
+    const kept_after_syncfs: u64 = blk: {
+        const t = try rig.stats();
+        defer gpa.free(t);
+        const kept = numberAfter(t, "\"fsync_promote_enospc\":") orelse 0;
+        std.debug.print("smoke[full store]: fsync_promote_enospc {d}, promotions_enospc {d}, fsync_promoted_files {d}, full_store_episodes {d}, pack_refill_storage_full {d}\n", .{ kept, numberAfter(t, "\"promotions_enospc\":") orelse 0, numberAfter(t, "\"fsync_promoted_files\":") orelse 0, numberAfter(t, "\"full_store_episodes\":") orelse 0, numberAfter(t, "\"pack_refill_storage_full\":") orelse 0 });
+        try testing.expect(kept >= 1);
+        try testing.expect(kept < admitted / 4); // the estimate's gap, not the fill
+        try testing.expectEqual(@as(?u64, 0), numberAfter(t, "\"fsync_promote_refusals\":"));
+        try testing.expectEqual(@as(?u64, 1), numberAfter(t, "\"full_store_episodes\":"));
+        try testing.expectEqual(@as(?u64, 0), numberAfter(t, "\"invariant_tripwires\":"));
+        break :blk kept;
+    };
+    // 3. Every file's own fsync: the kept ones answer ENOSPC — the same
+    //    episode, no second line — and the application removes them.
+    {
+        const out = try rig.onMountTimed(": > \"$1/fsync.err\"; removed=0; for f in fill*; do if ! dd if=/dev/null of=\"$f\" conv=notrunc,fsync count=0 status=none 2>>\"$1/fsync.err\"; then rm -f \"$f\"; removed=$((removed+1)); fi; done; echo $removed; grep -c 'No space left on device' \"$1/fsync.err\" || true; grep -c 'Input/output error' \"$1/fsync.err\" || true", 900);
+        defer gpa.free(out);
+        var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, out, "\n"), '\n');
+        const removed = try std.fmt.parseInt(u64, lines.next() orelse return error.FsyncUnparsed, 10);
+        const enospc = try std.fmt.parseInt(u64, lines.next() orelse return error.FsyncUnparsed, 10);
+        const eio = try std.fmt.parseInt(u64, lines.next() orelse return error.FsyncUnparsed, 10);
+        std.debug.print("smoke[full store]: per-file fsync: {d} kept resident answered ENOSPC and were removed ({d} × ENOSPC, {d} × EIO on dd's stderr)\n", .{ removed, enospc, eio });
+        try testing.expectEqual(kept_after_syncfs, removed);
+        try testing.expectEqual(removed, enospc);
+        try testing.expectEqual(@as(u64, 0), eio);
+    }
+    {
+        const out = try rig.onMountTimed("sync -f . && echo synced", 600);
+        defer gpa.free(out);
+        try testing.expectEqualStrings("synced\n", out);
+    }
+    // 4. Space returns: nine files in ten removed (the packs' tenant sets
+    //    are the census's order, so a pack empties with probability 0.9¹⁰
+    //    — a third of ≈ 380 packs; their terminal frees land
+    //    asynchronously), then, a quiet wall past the last refusal, a
+    //    fresh file admitted and fsync'd — a promotion lands, the episode
+    //    closes with its tally.
+    {
+        const out = try rig.onMountTimed("for f in fill*; do i=${f#fill}; [ $((i % 10)) -eq 0 ] || rm -f \"$f\"; done; sleep 1.2; n=0; until dd if=\"$1/pattern\" of=fresh bs=102400 count=1 conv=fsync status=none 2>/dev/null; do n=$((n+1)); [ $n -lt 120 ] || exit 1; rm -f fresh; sleep 0.5; done; echo landed", 600);
+        defer gpa.free(out);
+        try testing.expectEqualStrings("landed\n", out);
+    }
+    // The log: ONE 'data store FULL' line for the whole episode, its close,
+    // no error line, no tripwire.
+    {
+        const text = try rig.readLog();
+        defer gpa.free(text);
+        const seg = text[mark..];
+        const full = std.mem.count(u8, seg, "data store FULL");
+        const closed = std.mem.count(u8, seg, "full-store episode closed");
+        const errors = std.mem.count(u8, seg, "error(");
+        const warnings = std.mem.count(u8, seg, "warning(");
+        std.debug.print("smoke[full store]: the daemon's log over the episode: {d} 'data store FULL' line(s), {d} close(s), {d} warning(s), {d} error(s), {d} TRIPWIRE line(s)\n", .{ full, closed, warnings, errors, std.mem.count(u8, seg, "TRIPWIRE") });
+        if (errors != 0 or warnings != full or full != 1) std.debug.print("--- the daemon's alert lines ---\n{s}\n", .{seg});
+        try testing.expectEqual(@as(usize, 1), full);
+        try testing.expectEqual(@as(usize, 1), closed);
+        try testing.expectEqual(@as(usize, 0), errors);
+        try testing.expectEqual(@as(usize, 1), warnings);
+        try testing.expectEqual(@as(usize, 0), std.mem.count(u8, seg, "TRIPWIRE"));
+    }
+    // 5. The kill: the ring is empty (every survivor promoted); fsck clean;
+    //    the remount reads every survivor whole.
+    try rig.kill();
+    const recovered = try fsckClean(rig, "the kill after the full-store episode");
+    _ = try remountAfterKill(rig, recovered);
+    {
+        const out = try rig.onMountTimed("n=0; bad=0; for f in fill* fresh; do n=$((n+1)); cmp -s \"$1/pattern\" \"$f\" || { bad=$((bad+1)); echo \"DIFF $f\"; }; done; echo \"$n files, $bad differ\"", 900);
+        defer gpa.free(out);
+        std.debug.print("smoke[full store]: after the remount: {s}", .{out});
+        try testing.expect(std.mem.endsWith(u8, out, " files, 0 differ\n"));
+        try testing.expect(std.mem.indexOf(u8, out, "DIFF") == null);
+    }
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+}
+
 test "smoke: FSCK AND SCRUB — format → fill (dirs, 200 packed small files, hard links, three fsync'd 20 MiB files, a clone) → umount → `fsck --offline --scrub` 0 findings over every block → mount, 8-way storm, kill -9 → `fsck --offline` 0 findings → remount, clean umount → a planted stray reference is exactly [C3]+[C8] on its block (exit 1), `--repair` plans, `--repair --apply` releases it, clean → a planted orphan inode is exactly [C9], destroyed on apply, clean → `merge-reports` of two residue shards ≡ the whole run" {
     const io = testing.io;
     if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);

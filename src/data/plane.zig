@@ -236,6 +236,10 @@ pub const stats = struct {
     pub var promotions_run: counters.ShardedCounter = .{};
     pub var promotions_stale: counters.ShardedCounter = .{};
     pub var promotions_failed: counters.ShardedCounter = .{};
+    /// A promotion the store refused its block (`Promoted.no_space`): apart
+    /// from `promotions_failed`, the resource declines — the full-store
+    /// episode's count.
+    pub var promotions_enospc: counters.ShardedCounter = .{};
     /// `promotions_restaged`: a promotion handed its key by a census found
     /// the record re-staged by a newer write before it held the locks, and
     /// promoted the CURRENT resident (`promoteUnder`).
@@ -321,7 +325,7 @@ pub fn writeStatsJson(w: *Io.Writer) Io.Writer.Error!void {
     inline for (.{ "data_volumes", "data_staging_on", "block_refs_drift_rows" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, @field(stats, name).load() });
     }
-    inline for (.{ "layout_map_merges", "layout_map_merge_blocks", "layout_map_merge_failures", "layout_map_merge_clipped_blocks", "layout_map_merges_shipped", "foreign_publish_kvmap_refusals", "layout_publishes_served", "kvmap_sweep_spawn_refusals", "promotions_run", "promotions_stale", "promotions_failed", "promotions_restaged", "recall_promotions", "recall_promotion_failures", "own_block_dmas", "own_block_dma_bytes", "promotion_barriers", "staged_point_hits", "staged_point_misses", "promotion_barriers_coalesced", "promotion_barrier_write_through_skips", "held_stores", "held_store_bytes", "held_store_failures", "hold_gate_admits", "hold_gate_overlay_admits", "hold_gate_declines", "prefetch_fibers", "prefetch_fiber_refusals", "hold_ceremony_fibers", "bindings_freed", "device_read_bounces", "data_device_read_bytes", "write_side_read_dma_bytes", "compose_read_dma_bytes", "pack_read_dma_bytes" }) |name| {
+    inline for (.{ "layout_map_merges", "layout_map_merge_blocks", "layout_map_merge_failures", "layout_map_merge_clipped_blocks", "layout_map_merges_shipped", "foreign_publish_kvmap_refusals", "layout_publishes_served", "kvmap_sweep_spawn_refusals", "promotions_run", "promotions_stale", "promotions_failed", "promotions_enospc", "promotions_restaged", "recall_promotions", "recall_promotion_failures", "own_block_dmas", "own_block_dma_bytes", "promotion_barriers", "staged_point_hits", "staged_point_misses", "promotion_barriers_coalesced", "promotion_barrier_write_through_skips", "held_stores", "held_store_bytes", "held_store_failures", "hold_gate_admits", "hold_gate_overlay_admits", "hold_gate_declines", "prefetch_fibers", "prefetch_fiber_refusals", "hold_ceremony_fibers", "bindings_freed", "device_read_bounces", "data_device_read_bytes", "write_side_read_dma_bytes", "compose_read_dma_bytes", "pack_read_dma_bytes" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, @field(stats, name).load() });
     }
     try w.print("\"data_unresolved_volume\":{d},\"kvmap_resolve_failures\":{d},\"kvmap_head_put_unlocked\":{d},\"release_free_unheld\":{d},\"layout_map_merge_displaced_overflow\":{d}}}", .{ counters.tripwireCount("data_unresolved_volume"), counters.tripwireCount("kvmap_resolve_failures"), counters.tripwireCount("kvmap_head_put_unlocked"), counters.tripwireCount("release_free_unheld"), counters.tripwireCount("layout_map_merge_displaced_overflow") });
@@ -510,6 +514,9 @@ pub const DataPlane = struct {
     /// release off a committed publish parks on (`releaseStaged`).
     test_release_hold: ?[]const u8,
     release_held: Atomic(bool) = .init(false),
+    /// The full-store episode at the promotion primitive (one line per
+    /// episode, `promoteUnder`).
+    store_full: enospc.FullStoreEpisode = .{},
     /// The token divert's layout face (bound by the daemon once the wire
     /// plane is up; null = a flat mount: every slot local).
     foreign_layout: ?ForeignLayout = null,
@@ -745,6 +752,9 @@ pub const DataPlane = struct {
             .fence = .{ .ctx = self, .poll = &fencePoll },
         }) catch return error.OutOfMemory;
         errdefer self.wp.deinit(io);
+        // The write cache's claim on the store (`enospc.storeCoversRing`):
+        // the ring's resident footprint, read ahead of every fresh custody.
+        if (self.stage) |*st| self.wp.ring_claim = .{ .ctx = &st.pool, .bytes = &ringClaimBytes };
         // The write side's R5 components (spec §2.5): the parked-buffer
         // pool's RAM (its cached cells return under the idle-trim law; the
         // drain-target shed is the write path's to bind) and the in-flight
@@ -1108,7 +1118,12 @@ pub const DataPlane = struct {
         st.seg = staging.Segment.init(gpa, r.image(), r.backing()) catch return error.OutOfMemory;
         errdefer st.seg.deinit();
         const rep = st.seg.recover();
-        st.pool = staging.Pool.init(gpa, .{ .ctx = self, .promote = &promoteHook, .dismount = &dismountHook });
+        st.pool = staging.Pool.init(gpa, .{ .ctx = self, .promote = &promoteHook, .dismount = &dismountHook, .begin_batch = &beginBatchHook });
+        // The residents' claim on the store (`staging.StoreClaim`): the
+        // primitive's dispatch — inline, a packed slot, a whole block — set
+        // before the seed so the recovered residents claim too.
+        const policy = pack.Policy.fromEnv(opts.env, self.chunk);
+        st.pool.claim_rule = .{ .inline_max = self.inline_max, .max_slot = if (policy.enabled) policy.max_slot else 0, .block = self.chunk };
         st.pool.seedFromRecovery(&st.seg) catch return error.OutOfMemory;
         // The cache core: the knob's bound, striped by the cores; the
         // recovered residents enter in scan order (no recency survives a
@@ -1200,6 +1215,7 @@ pub const DataPlane = struct {
         defer st.drain_armed.store(false, .release);
         const bound = st.cache.stats.bound_bytes.load();
         const shed = st.shed_target.swap(std.math.maxInt(u64), .acq_rel);
+        self.beginPromotionBatch();
         _ = st.cache.evictUntil(@min(bound - bound / WRITE_CACHE_DRAIN_DIVISOR, shed));
     }
 
@@ -1804,19 +1820,18 @@ pub const DataPlane = struct {
     /// holder's bitmap plus this writer's own window (a joiner reads the
     /// population the last grant reply carried, 0002 row 241); unarmed it
     /// is the free list, the virgin tail and the blocks inside open trim
-    /// windows — all supply, never a deficit. Block 0 (the superblock
-    /// chunk) is outside the capacity shown.
+    /// windows — all supply, never a deficit (`Volumes.reachableFreeBytes`),
+    /// LESS the write cache's residents' claim on it (`staging.StoreClaim`:
+    /// custody the next promotion lands on fresh blocks,
+    /// `enospc.storeCoversRing`) — so the free `df` shows is what a write
+    /// is admitted against. Block 0 (the superblock chunk) is outside the
+    /// capacity shown.
     pub fn statfs(self: *DataPlane) ?Space {
         if (self.vols.n() == 0) return null;
         var total: u64 = 0;
-        var free: u64 = 0;
-        for (self.vols.rows[0..self.vols.n()]) |r| {
-            const a = r.?.alloc;
-            const blocks = a.capacityBlocks() - 1;
-            total += blocks * self.block_size;
-            free += @min(a.reachableFreeBlocks(), blocks) * self.block_size;
-        }
-        return .{ .total_bytes = total, .free_bytes = free };
+        for (self.vols.rows[0..self.vols.n()]) |r| total += (r.?.alloc.capacityBlocks() - 1) * self.block_size;
+        const claim = if (self.stage) |*st| st.pool.claimedBytes() else 0;
+        return .{ .total_bytes = total, .free_bytes = self.vols.reachableFreeBytes(self.block_size) -| claim };
     }
 
     // ---- staging (the ring) ----
@@ -1830,11 +1845,41 @@ pub const DataPlane = struct {
         return f;
     }
 
+    fn ringClaimBytes(ctx: *anyopaque) u64 {
+        const pool: *staging.Pool = @ptrCast(@alignCast(ctx));
+        return pool.claimedBytes();
+    }
+
+    /// The write cache's admission AGAINST THE STORE (charter §6.2's
+    /// terminal law; `enospc.storeCoversRing`): a staged write leaving the
+    /// file `image_len` B long grows the residents' claim on the store
+    /// (`staging.StoreClaim`: inline nothing, a packed slot, a whole block)
+    /// by its claim over the key's resident claim, and that growth must fit
+    /// the set's free bytes beside the whole claim — the residents are
+    /// custody the next promotion lands on fresh blocks. False = the write
+    /// answers ENOSPC and stages nothing (counted
+    /// `write_cache_claim_enospc_refusals`); custody already held (an
+    /// overwrite inside the image, a re-stage at the same claim) grows
+    /// nothing and is admitted — the ladder keeps it. WHY: the ring
+    /// admitted on its own capacity alone and a filled store's small writes
+    /// were acked into it until the dismount pass FAILED them (generic/750:
+    /// 1,481 residents; generic/475: a 7 GiB memfd), every fsync of them
+    /// EIO.
+    pub fn writeCacheAdmits(self: *DataPlane, key_: staging.StagingKey, image_len: u64) bool {
+        const st = &(self.stage orelse return true);
+        const extra = st.pool.claim_rule.of(image_len) -| (st.pool.claimOf(key_.file_id) orelse 0);
+        if (extra == 0 or !self.wp.ringUncovered(extra)) return true;
+        enospc.stats.write_cache_claim_enospc_refusals.inc();
+        return false;
+    }
+
     /// Stage the WHOLE payload under `key` (admission, placement, ledger);
     /// the generation the layout record's publish is gated on. `slack` =
     /// `.append` when the write that stages it EXTENDS the image (§J.2: the
     /// slot reserves a quarter of the image so the next appends land in
-    /// place).
+    /// place). The store's side of the admission is `writeCacheAdmits`,
+    /// asked by the write arm first; a `NoSpaceLeft` here is the RING's
+    /// refusal (no hole, the bound) — the caller's own-block arm.
     pub fn stageImage(self: *DataPlane, key_: staging.StagingKey, image: []const u8, slack: staging.Slack) Error!u64 {
         const st = &(self.stage orelse return error.NotSupported);
         const s = staging.stageWrite(&st.pool, &st.seg, st.cache, key_, image, 1, slack) catch |e| switch (e) {
@@ -1993,12 +2038,15 @@ pub const DataPlane = struct {
     pub fn recallResidents(self: *DataPlane, ino: u64) void {
         if (self.stage == null) return;
         const sp = (self.stagedPoint(ino) catch return) orelse return;
+        self.beginPromotionBatch();
         switch (self.promoteStaged(staging.StagingKey.init(sp.file_id, ino))) {
             .promoted => stats.recall_promotions.inc(),
             // The layout moved away from the record: the reader's page names
             // what the layout names, nothing of the record's.
             .unnamed => {},
-            .declined => if (self.stagedLease(staging.StagingKey.init(sp.file_id, ino))) |l| {
+            // A corpse's bytes are no reader's.
+            .corpse => {},
+            .declined, .no_space => if (self.stagedLease(staging.StagingKey.init(sp.file_id, ino))) |l| {
                 l.release();
                 stats.recall_promotion_failures.inc();
                 log.warn("write cache recall: ino {d}'s resident could not be promoted for a foreign reader (see the promotion's own line) — the reader meets zeros", .{ino});
@@ -2086,6 +2134,17 @@ pub const DataPlane = struct {
         return self.judgeAtDismount(k);
     }
 
+    /// A promotion batch begins: the packed arm re-arms (`PromotionHooks.
+    /// begin_batch`; OQ-1's stop is for ONE batch).
+    fn beginBatchHook(ctx: ?*anyopaque) void {
+        const self: *DataPlane = @ptrCast(@alignCast(ctx.?));
+        self.beginPromotionBatch();
+    }
+
+    fn beginPromotionBatch(self: *DataPlane) void {
+        if (self.packer) |*p| p.beginPromotionBatch();
+    }
+
     /// The ONE primitive (charter §6.1): dispatch on size — fits inline ⇒
     /// inline; `slot > CHUNK/2` ⇒ its own block; else a packed tenant. The
     /// identity is re-checked under the promotion's locks — the (3.5) stripe
@@ -2103,7 +2162,9 @@ pub const DataPlane = struct {
         return switch (self.promoteUnder(k, .live)) {
             .promoted => .promoted,
             .unnamed => .unnamed,
-            .kept, .corpse => .declined,
+            .no_space => .no_space,
+            .corpse => .corpse,
+            .kept => .declined,
         };
     }
 
@@ -2117,12 +2178,21 @@ pub const DataPlane = struct {
     /// (`writeback.blockKey`) is write custody no layout names by design:
     /// judged by its ino alone, kept while the ino lives.
     pub fn judgeAtDismount(self: *DataPlane, k: staging.StagingKey) staging.DismountVerdict {
-        return self.promoteUnder(k, .dismount);
+        return switch (self.promoteUnder(k, .dismount)) {
+            .promoted => .promoted,
+            .corpse => .corpse,
+            .unnamed => .unnamed,
+            .kept, .no_space => .kept,
+        };
     }
 
     const PromotionPass = enum { live, dismount };
 
-    fn promoteUnder(self: *DataPlane, k: staging.StagingKey, pass: PromotionPass) staging.DismountVerdict {
+    /// The primitive's verdict before the pass's face: `no_space` is a kept
+    /// resident the store had no block for (`LiveVerdict.no_space`).
+    const Under = enum { promoted, kept, no_space, corpse, unnamed };
+
+    fn promoteUnder(self: *DataPlane, k: staging.StagingKey, pass: PromotionPass) Under {
         const io = self.io;
         const st = &(self.stage orelse return .kept);
         const ino = k.ino();
@@ -2162,12 +2232,16 @@ pub const DataPlane = struct {
         defer lease.release();
         const generation = lease.generation();
         const image = lease.bytes();
-        const corpse = pass == .dismount and self.inoIsCorpse(ino);
-        const out: Promoted = if (corpse) .{ .ok = false } else self.promoteLocked(io, ino, k, generation, image);
+        const dismount_corpse = pass == .dismount and self.inoIsCorpse(ino);
+        const out: Promoted = if (dismount_corpse) .{ .ok = false } else self.promoteLocked(io, ino, k, generation, image);
         // A spilled block (`writeback.blockKey`) is custody no layout names
         // by design: judged by its ino alone, never unnamed.
         const unnamed = out.unnamed and writeback.blockOfKey(k) == null;
-        const verdict: staging.DismountVerdict = if (out.ok) .promoted else if (corpse) .corpse else if (unnamed) .unnamed else .kept;
+        // A live point's FAILED promotion of a corpse's resident (the
+        // record read only then: a landing never pays it) owes nothing
+        // (`LiveVerdict.corpse`); the dismount pass destroys it.
+        const corpse = dismount_corpse or (!out.ok and !unnamed and self.inoIsCorpse(ino));
+        const verdict: Under = if (out.ok) .promoted else if (corpse) .corpse else if (unnamed) .unnamed else if (out.no_space) .no_space else .kept;
         // The dismount pass destroys what nothing names; a live point leaves
         // an unnamed record to the release already on its way (the
         // committed publish's `afterCommit`) or to the open file's FORGET.
@@ -2179,6 +2253,18 @@ pub const DataPlane = struct {
         if (out.displaced) |d| {
             if (self.packer) |*p| p.releaseTenantRef(d);
             self.releaseHolds().drop(&.{d});
+        }
+        // The full-store episode (`enospc.FullStoreEpisode`): one line when
+        // the store first refuses a promotion its block, one with the tally
+        // when a landing closes it — never one per sync point or per leg.
+        switch (verdict) {
+            .no_space => if (self.store_full.refused(clock.monotonicNs())) {
+                log.warn("data store FULL: the promotion of ino {d} ({d} B resident) found no free block on any data volume ({d} B free in sight, {d} B resident in the write cache) — its sync point answers ENOSPC, the bytes stay resident and dirty, the next sync point retries; one line per episode (counted full_store_episodes, fsync_promote_enospc): the next is the close's", .{ ino, image.len, self.vols.reachableFreeBytes(self.block_size), st.pool.currentBytes() });
+            },
+            .promoted => if (self.store_full.landed(clock.monotonicNs())) |c| {
+                log.info("data store: the full-store episode closed after {d} ms — {d} promotion(s) refused their block; a promotion landed ({d} B free in sight, {d} B resident in the write cache)", .{ (clock.monotonicNs() - c.since_ns) / std.time.ns_per_ms, c.refusals, self.vols.reachableFreeBytes(self.block_size), st.pool.currentBytes() });
+            },
+            .kept, .corpse, .unnamed => {},
         }
         // The departed record's cover round, after the locks (the meta
         // barrier is a park); the dismount pass runs ONE round for all of
@@ -2206,8 +2292,11 @@ pub const DataPlane = struct {
 
     /// `unnamed`: the layout does not name this record (none, kind not
     /// staged, another file id) — residue to the dismount pass; a
-    /// generation race or a resource decline is not.
-    const Promoted = struct { ok: bool, displaced: ?Mapping = null, unnamed: bool = false };
+    /// generation race or a resource decline is not. `no_space`: the arm
+    /// found no free block on the volume (the own-block mint's
+    /// `StorageFull`, the pack refill's) — the store's refusal, ENOSPC at
+    /// the sync point, never a resource decline's EIO.
+    const Promoted = struct { ok: bool, displaced: ?Mapping = null, unnamed: bool = false, no_space: bool = false };
 
     fn promoteLocked(self: *DataPlane, io: Io, ino: u64, k: staging.StagingKey, generation: u64, image: []const u8) Promoted {
         const st = &self.stage.?;
@@ -2256,7 +2345,7 @@ pub const DataPlane = struct {
         };
         const out: Promoted = switch (d) {
             .inline_ => .{ .ok = self.promoteInline(ino, cur, cur_bytes.coll_seq, image, k, generation) },
-            .own_block => .{ .ok = self.promoteOwnBlock(io, ino, cur, cur_bytes.coll_seq, tag, stored.bytes, k, generation) },
+            .own_block => self.promoteOwnBlock(io, ino, cur, cur_bytes.coll_seq, tag, stored.bytes, k, generation),
             .packed_ => blk: {
                 // The durable copy the pack commit displaces is a live owner
                 // until `promoteStaged` releases it (decision 0003 §AH.1).
@@ -2267,7 +2356,10 @@ pub const DataPlane = struct {
                 break :blk p;
             },
         };
-        if (out.ok) self.noteShape(ino, cur.size, if (d == .own_block) .striped else if (d == .inline_) .inline_ else .packed_) else {
+        if (out.ok) self.noteShape(ino, cur.size, if (d == .own_block) .striped else if (d == .inline_) .inline_ else .packed_) else if (out.no_space) {
+            stats.promotions_enospc.inc();
+            log.debug("promotion ino {d}: the {t} arm found no free block (size {d}, stored {d}) — ENOSPC at the sync point", .{ ino, d, cur.size, stored_len });
+        } else {
             stats.promotions_failed.inc();
             log.debug("promotion ino {d}: the {t} arm declined (size {d}, stored {d})", .{ ino, d, cur.size, stored_len });
         }
@@ -2287,29 +2379,29 @@ pub const DataPlane = struct {
         return true;
     }
 
-    fn promoteOwnBlock(self: *DataPlane, io: Io, ino: u64, prev: layout.Layout, coll_seq: u8, tag: u64, stored: []const u8, k: staging.StagingKey, generation: u64) bool {
+    fn promoteOwnBlock(self: *DataPlane, io: Io, ino: u64, prev: layout.Layout, coll_seq: u8, tag: u64, stored: []const u8, k: staging.StagingKey, generation: u64) Promoted {
         const ob = self.ownBlockStored(io, ino, tag, stored) catch |e| {
             log.debug("promotion ino {d}: own block refused ({t})", .{ ino, e });
-            return false;
+            return .{ .ok = false, .no_space = e == error.NoSpaceLeft };
         };
         const entries = [_]layout.MapEntryWire{(layout.MapEntry{ .block = 0, .mapping = ob.mapping }).encode()};
         const t = self.backend.begin(@src()) catch {
             self.abandonOwnBlock(ob);
-            return false;
+            return .{ .ok = false };
         };
         layout.publishLayout(t, .{ .ino = ino, .name_key = self.name_key, .coll_seq = coll_seq, .prev = prev, .layout = layout.Layout.stripedInline(prev.size, &entries), .proofs = &.{ob.proof} }, self.refsSeam(), self.geo) catch {
             self.backend.abandon(t);
             self.abandonOwnBlock(ob);
-            return false;
+            return .{ .ok = false };
         };
         self.backend.commit(t) catch {
             self.abandonOwnBlock(ob);
-            return false;
+            return .{ .ok = false };
         };
         self.ownBlockPublished(ob);
         _ = staging.releaseStaged(&self.stage.?.pool, &self.stage.?.seg, self.stage.?.cache, k, generation);
         pack.stats.layout_promoted_block.inc();
-        return true;
+        return .{ .ok = true };
     }
 
     /// The packed arm under the caller's (3.5) + (3.7): `pack.commitLocked`
@@ -2320,10 +2412,12 @@ pub const DataPlane = struct {
         const st = &self.stage.?;
         const prepared = (p.prepare(io, .{ .vol_tag = tag, .scope = self.scope }, stored, clock.monotonicNs()) catch |e| {
             log.debug("promotion ino {d}: pack prepare refused ({t})", .{ ino, e });
-            return .{ .ok = false };
+            return .{ .ok = false, .no_space = e == error.StorageFull };
         }) orelse {
+            // Stopped for the batch by a refill that found no free block
+            // (OQ-1): the store's refusal for every tenant behind it.
             log.debug("promotion ino {d}: the pack arm is stopped", .{ino});
-            return .{ .ok = false };
+            return .{ .ok = false, .no_space = true };
         };
         // DUR-1: the tenant's DMA on stable storage before the packed
         // layout naming it publishes.

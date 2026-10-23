@@ -260,6 +260,11 @@ pub var fuse_write_promotions_to_striped: counters.ShardedCounter = .{};
 /// own-block arm instead of answering ENOSPC — the ring is a cache, never
 /// the set's capacity (rung 9: the fsstress 20-writer burst).
 pub var fuse_write_staged_ring_full_own_block: counters.ShardedCounter = .{};
+/// `fuse_write_staged_store_full_refusals`: staged-arm writes answered
+/// ENOSPC before staging because the STORE's free bytes no longer cover
+/// the write cache's residents plus the image (`DataPlane.writeCacheAdmits`
+/// — the cache is never the set's capacity in the other direction either).
+pub var fuse_write_staged_store_full_refusals: counters.ShardedCounter = .{};
 /// Truncates by arm: the packed passthrough clip (zero device writes),
 /// the striped map clip (zero device writes: the kept tail is the
 /// extension law's, decision 0003 §AL.1), the re-stage.
@@ -351,7 +356,7 @@ pub fn assertStore(comptime T: type) void {
 /// the product; `NoData` is the volume-less set).
 pub fn assertData(comptime T: type) void {
     comptime {
-        for ([_][]const u8{ "hasVolumes", "stagingOn", "blockSize", "inlineMax", "geometry", "refsSeam", "noteShape", "forgetShape", "noteSizeSet", "sizeSetSince", "isPassthrough", "canStoreHeld", "write", "zeroExtension", "custodyFloor", "barrierData", "read", "ownBlock", "abandonOwnBlock", "ownBlockPublished", "holdReleases", "dropReleases", "freeBindings", "flushCustody", "flushAllCustody", "releaseIno", "hasWriteCustody", "fsync", "statfs", "mintFileId", "stageImage", "appendStaged", "overwriteStaged", "stagedPoint", "stagedPointCached", "releaseStaged", "stagedLease", "readMappingImage", "lockLayout", "stageKvmapShrink", "stageKvmapCorpse", "drainKvmapSweep", "publishForeign" }) |name| {
+        for ([_][]const u8{ "hasVolumes", "stagingOn", "blockSize", "inlineMax", "geometry", "refsSeam", "noteShape", "forgetShape", "noteSizeSet", "sizeSetSince", "isPassthrough", "canStoreHeld", "write", "zeroExtension", "custodyFloor", "barrierData", "read", "ownBlock", "abandonOwnBlock", "ownBlockPublished", "holdReleases", "dropReleases", "freeBindings", "flushCustody", "flushAllCustody", "releaseIno", "hasWriteCustody", "fsync", "statfs", "mintFileId", "writeCacheAdmits", "stageImage", "appendStaged", "overwriteStaged", "stagedPoint", "stagedPointCached", "releaseStaged", "stagedLease", "readMappingImage", "lockLayout", "stageKvmapShrink", "stageKvmapCorpse", "drainKvmapSweep", "publishForeign" }) |name| {
             if (!@hasDecl(T, name)) @compileError(@typeName(T) ++ " is not a kv_fs Data face: lacks `" ++ name ++ "`");
         }
     }
@@ -3007,6 +3012,15 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             // The fast path's point warmed for the next write of this file
             // (a miss, or a stale entry the witness moved past).
             if (keep_identity) _ = try self.data.stagedPoint(local);
+            // §8's terminal law at the write cache: the image's growth of
+            // the residents' claim on the store must fit the store's free
+            // bytes beside the whole claim (`DataPlane.writeCacheAdmits`) —
+            // else ENOSPC here, nothing staged, never the own-block arm
+            // (which would take a block the residents already claim).
+            if (!self.data.writeCacheAdmits(k, size)) {
+                fuse_write_staged_store_full_refusals.inc();
+                return error.NoSpaceLeft;
+            }
             // The resident image's length is the file's size (the ring holds
             // the whole payload), so an extending write appends at its offset.
             var in_place = false;
@@ -4199,6 +4213,9 @@ pub const NoData = struct {
     pub fn mintFileId(_: *NoData, _: u64) layout.FileId {
         return layout.zero_file_id;
     }
+    pub fn writeCacheAdmits(_: *NoData, _: staging.StagingKey, _: u64) bool {
+        return true;
+    }
     pub fn stageImage(_: *NoData, _: staging.StagingKey, _: []const u8, _: staging.Slack) Error!u64 {
         return error.NotSupported;
     }
@@ -4835,6 +4852,10 @@ const SettlingData = struct {
     /// refuses `NoSpaceLeft`.
     staging: bool = false,
     stage_refuse: bool = false,
+    /// The STORE cannot cover the write cache's residents plus the image
+    /// (`writeCacheAdmits` false): the staged arm answers ENOSPC, never the
+    /// own-block arm.
+    store_full: bool = false,
     staged_max: u64 = 0,
     staged_images: u32 = 0,
     /// A REAL RAM ring behind the staged arm (the append law's test): the
@@ -5126,6 +5147,11 @@ const SettlingData = struct {
     }
     pub fn mintFileId(_: *SettlingData, _: u64) layout.FileId {
         return layout.zero_file_id;
+    }
+    /// The store's side of the staged admission: the double's store covers
+    /// every image unless the test says the store is full.
+    pub fn writeCacheAdmits(self: *SettlingData, _: staging.StagingKey, _: u64) bool {
+        return !self.store_full;
     }
     pub fn stageImage(self: *SettlingData, k: staging.StagingKey, image: []const u8, slack: staging.Slack) Error!u64 {
         if (!self.staging) return error.NotSupported;
@@ -5771,6 +5797,42 @@ test "the staged arm when the ring is FULL: the write takes the own-block arm in
     try testing.expectEqual(@as(?linux.E, null), h.write(k, 0, one_mib[0..8192], 0).errno());
     try testing.expectEqual(@as(u32, 2), h.data.staged_images);
     h.release(k);
+}
+
+// The other direction of the same law: the ring is never the set's
+// capacity, so a STORE that cannot cover the ring's residents plus the
+// image refuses the write ENOSPC before anything is staged — never the
+// own-block arm, which would take a block the residents already claim
+// (generic/750: 1,481 residents admitted onto a filled 16 GiB scratch and
+// FAILED at the dismount; every fsync of them EIO).
+test "the staged arm when the STORE is full (the write cache's claim uncovered): a fresh file's write answers ENOSPC before staging — nothing rang, no own-block arm, no striped piece, counted fuse_write_staged_store_full_refusals; the store covering again, the same write stages (red: the write was acked into the ring and its fsync answered EIO)" {
+    const H = HarnessOf(SettlingData);
+    var h: H = undefined;
+    try h.init();
+    defer h.deinit();
+    defer h.data.deinit();
+    h.data.store = &h.store;
+    h.data.staging = true;
+    const refusals0 = fuse_write_staged_store_full_refusals.load();
+    const own_block0 = fuse_write_staged_ring_full_own_block.load();
+    const f = try h.create(1, "f", 0o644);
+    const image: []u8 = try testing.allocator.alloc(u8, 1 << 20);
+    defer testing.allocator.free(image);
+    @memset(image, 'A');
+    h.data.store_full = true;
+    try testing.expectEqual(@as(?linux.E, .NOSPC), h.write(f, 0, image, 0).errno());
+    try testing.expectEqual(@as(u32, 0), h.data.staged_images);
+    try testing.expectEqual(@as(u32, 0), h.data.own_blocks);
+    try testing.expectEqual(@as(usize, 0), h.data.writes.items.len);
+    try testing.expectEqual(refusals0 + 1, fuse_write_staged_store_full_refusals.load());
+    try testing.expectEqual(own_block0, fuse_write_staged_ring_full_own_block.load());
+    try testing.expectEqual(@as(u64, 0), (try h.getattr(f)).size);
+    // Space returned: the write stages.
+    h.data.store_full = false;
+    try testing.expectEqual(@as(?linux.E, null), h.write(f, 0, image, 0).errno());
+    try testing.expectEqual(@as(u32, 1), h.data.staged_images);
+    try testing.expectEqual(@as(u64, 1 << 20), (try h.getattr(f)).size);
+    h.release(f);
 }
 
 test "the staged append law (repro-port: fstests generic/069 `append_writer` — 4-byte O_APPEND writes re-staged a 1–2 MiB image each, ≈ 3 ms and 2–4 MiB moved per append on c36b531): M small appends to a staged file land IN PLACE in the record's slack — ring bytes moved ≤ 11 × bytes appended (§J.2), ONE commit per append carrying a Δ(size, mtime, ctime), the image byte-exact, a re-stage only when the slack is exhausted" {

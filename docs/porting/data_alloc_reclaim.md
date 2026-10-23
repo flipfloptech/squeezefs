@@ -741,7 +741,10 @@ quiesced mount verify ONLY, `kv/mod.rs:L519`), `pack_release_untracked_noops` (F
 `unpublished_mint_abandons` (FC:L6821), `reclaim_destroy_refused_release_failed` (growth = a failing
 meta volume, never a leak, FC:L6015-6021), `block_free_reclaim_park_tick_wakes` (≈ 0 while room
 flows — the lost-wake tripwire, FC:L7221-7223), `alloc_trim_window_parks` (≈ 0 except a full store
-under rewrite with elision, FC:L7253-7261), `block_free_reclaim_dismount_halts` (moves only between
+under rewrite with elision, FC:L7253-7261; **port: a `ShardedCounter`, never a tripwire — that regime's
+ordinary outcome, generic/750 fired the must-stay-0 ×3; beside it `alloc_trim_window_parked` (the parks
+in flight) and `alloc_trim_window_park_walls` (a park past the ceiling with the window still open: the
+device stalled, one warning per episode), 2026-10-22**), `block_free_reclaim_dismount_halts` (moves only between
 teardown and exit, FC:L7177-7184).
 
 Per-op counters (`counters.ShardedCounter`): `alloc_from_freelist`, `alloc_fresh_mints` (which

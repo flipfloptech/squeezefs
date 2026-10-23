@@ -453,7 +453,6 @@ pub const stats = struct {
     pub var block_claim_anomalies: counters.Tripwire = .init("block_claim_anomalies");
     pub var block_key_incarnation_exhausted: counters.Tripwire = .init("block_key_incarnation_exhausted");
     pub var block_live_free_refusals: counters.Tripwire = .init("block_live_free_refusals");
-    pub var alloc_trim_window_parks: counters.Tripwire = .init("alloc_trim_window_parks");
     /// An in-flight registration dropped with none held (decision 0003
     /// §AH.1: a release's hold and its drop are one pairing).
     pub var block_inflight_unheld_drops: counters.Tripwire = .init("block_inflight_unheld_drops");
@@ -481,9 +480,25 @@ pub const stats = struct {
     /// A publication's re-check found its block admitted after the gate
     /// and took it back OWED (0003 §Y.3).
     pub var block_quarantine_takebacks: counters.ShardedCounter = .{};
+    /// An allocation that met `StorageFull` with a trim claim window open
+    /// and parked for the window's return (`enospc.awaitTrimReturn`): a
+    /// full store under rewrite holds its free list inside the windows the
+    /// trim passes claim, so the park is that regime's ordinary outcome —
+    /// counted, never a tripwire (the fence-class ruling of 2026-10-19
+    /// applied; the must-stay-0 it was fired ×3 under generic/750 on a
+    /// 16 GiB scratch and ×7 under generic/475). ≈ 0 off that regime.
+    pub var alloc_trim_window_parks: counters.ShardedCounter = .{};
+    /// A park that reached the ceiling (`reclaim.PARK_BOUND_CEILING_MS`)
+    /// with the window still open: a trim pass holds its window for about
+    /// one manners tick (reclaim.zig's pacing), so the ceiling passing is
+    /// the device stalled on its discards, not the store full — one warning
+    /// per episode on the volume, the park continues (a window is supply).
+    pub var alloc_trim_window_park_walls: counters.ShardedCounter = .{};
     /// Levels.
     pub var alloc_fresh_supply_exhausted_latched: counters.Gauge = .{};
     pub var alloc_fresh_supply_exhausted_candidates: counters.Gauge = .{};
+    /// Allocations parked on a trim claim window right now.
+    pub var alloc_trim_window_parked: counters.Gauge = .{};
 };
 
 /// Number of allocators whose `StorageFull` latch is set: the write hot
@@ -493,10 +508,10 @@ pub var fresh_supply_latched: Atomic(usize) = .init(0);
 
 pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
     try w.writeAll("{");
-    inline for (.{ "alloc_from_freelist", "alloc_fresh_mints", "del_obj", "block_pin_stale_keys", "block_key_incarnation_unknown", "unpublished_offsets_recovered", "block_untracked_free_adjudicated", "shared_release_failures", "meta_kv_block_refs_recovered", "unpublished_mint_abandons", "dlm_quarantined_offsets", "dlm_quarantine_releases", "block_quarantine_deferred_frees", "block_quarantine_takebacks" }) |name| {
+    inline for (.{ "alloc_from_freelist", "alloc_fresh_mints", "del_obj", "block_pin_stale_keys", "block_key_incarnation_unknown", "unpublished_offsets_recovered", "block_untracked_free_adjudicated", "shared_release_failures", "meta_kv_block_refs_recovered", "unpublished_mint_abandons", "dlm_quarantined_offsets", "dlm_quarantine_releases", "block_quarantine_deferred_frees", "block_quarantine_takebacks", "alloc_trim_window_parks", "alloc_trim_window_park_walls", "alloc_trim_window_parked" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, @field(stats, name).load() });
     }
-    inline for (.{ "block_double_frees", "block_untracked_free_refusals", "block_claim_anomalies", "block_key_incarnation_exhausted", "block_live_free_refusals", "alloc_trim_window_parks", "block_inflight_unheld_drops" }) |name| {
+    inline for (.{ "block_double_frees", "block_untracked_free_refusals", "block_claim_anomalies", "block_key_incarnation_exhausted", "block_live_free_refusals", "block_inflight_unheld_drops" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, counters.tripwireCount(name) });
     }
     try w.print("\"alloc_fresh_supply_exhausted\":[{d},{d}]}}", .{ stats.alloc_fresh_supply_exhausted_latched.load(), stats.alloc_fresh_supply_exhausted_candidates.load() });
@@ -591,6 +606,10 @@ pub const BlockAllocator = struct {
     /// The return edge a parked allocation waits on (ONE `Notify` serves
     /// every supply edge of this allocator, Q10).
     supply_edge: sync_notify.Notify = .init,
+    /// A trim-window park on this volume passed its ceiling and said so
+    /// (`enospc.awaitTrimReturn`): one line per stall episode, cleared when
+    /// the window closes.
+    trim_wall_warned: Atomic(bool) = .init(false),
     /// Elided-discard debt, bytes (RAM-only).
     elided_debt_bytes: counters.Gauge = .{},
     /// The latched `StorageFull` word (0 = clear).
@@ -1492,6 +1511,11 @@ pub const BlockAllocator = struct {
 
     pub fn trimClaimed(self: *const BlockAllocator) u64 {
         return self.trim_claimed.load(.seq_cst);
+    }
+
+    /// Blocks inside open trim claim windows.
+    pub fn trimWindowedBlocks(self: *const BlockAllocator) u64 {
+        return self.trim_windowed.load(.acquire);
     }
 
     // ---- supply arithmetic (§1.6; §11 item 6) ----

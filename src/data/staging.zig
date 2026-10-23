@@ -152,8 +152,12 @@ pub const stats = struct {
     /// the layout no longer names (a publish away from it committed — a
     /// truncate to zero, a destroy — its ring release following after the
     /// writer's lock dropped): superseded bytes, nothing owed to the point.
+    /// `fsync_promote_corpses`: a sync point's promotion the store refused
+    /// met a resident whose ino has no live inode (unlinked, its FORGET's
+    /// destroy on its way): nothing owed to the point either.
     pub var fsync_promoted_files: counters.ShardedCounter = .{};
     pub var fsync_promote_superseded: counters.ShardedCounter = .{};
+    pub var fsync_promote_corpses: counters.ShardedCounter = .{};
     /// The in-place overwrite (`Segment.overwriteInPlace`):
     /// `staging_inplace_overwrites` / `staging_inplace_bytes` — writes that
     /// landed in the resident record's own grain (header-first, no new
@@ -176,7 +180,7 @@ pub const stats = struct {
 
 pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
     try w.writeAll("{");
-    inline for (.{ "current_staged_write_bytes", "staged_writes_in_flight", "staging_cell_state_bytes", "staging_tables_bytes", "staging_over_cap_refusals", "staging_ring_full_refusals", "staging_ring_full_episodes", "staging_pressure_kicks", "write_cache_evict_promotions", "write_cache_inline_evictions_declined", "write_cache_budget_sheds", "staging_recovery_records", "staging_recovery_torn_records", "staging_generation_discards", "staging_foreign_scope_refusals", "staging_owner_live_refusals", "staged_payload_lost_reads", "dismount_promoted_files", "dismount_promoted_bytes", "dismount_promote_failures", "dismount_corpse_residents_destroyed", "dismount_unnamed_residents_destroyed", "fsync_promoted_files", "fsync_promote_superseded", "staging_dirty_free_bytes", "staging_sweep_runs", "staging_sweep_punched_bytes", "staging_inplace_overwrites", "staging_inplace_bytes", "staging_read_retries", "staging_appends", "staging_append_bytes", "staging_restages", "staging_restage_bytes" }, 0..) |name, i| {
+    inline for (.{ "current_staged_write_bytes", "staged_writes_in_flight", "staging_cell_state_bytes", "staging_tables_bytes", "staging_over_cap_refusals", "staging_ring_full_refusals", "staging_ring_full_episodes", "staging_pressure_kicks", "write_cache_evict_promotions", "write_cache_inline_evictions_declined", "write_cache_budget_sheds", "staging_recovery_records", "staging_recovery_torn_records", "staging_generation_discards", "staging_foreign_scope_refusals", "staging_owner_live_refusals", "staged_payload_lost_reads", "dismount_promoted_files", "dismount_promoted_bytes", "dismount_promote_failures", "dismount_corpse_residents_destroyed", "dismount_unnamed_residents_destroyed", "fsync_promoted_files", "fsync_promote_superseded", "fsync_promote_corpses", "staging_dirty_free_bytes", "staging_sweep_runs", "staging_sweep_punched_bytes", "staging_inplace_overwrites", "staging_inplace_bytes", "staging_read_retries", "staging_appends", "staging_append_bytes", "staging_restages", "staging_restage_bytes" }, 0..) |name, i| {
         if (i != 0) try w.writeByte(',');
         try w.print("\"{s}\":{d}", .{ name, @field(stats, name).load() });
     }
@@ -1511,6 +1515,17 @@ pub const LiveVerdict = enum {
     /// Declined for a resource reason (no volume, the arm refused, a
     /// commit failed): the entry stays resident; a sync point cannot ack.
     declined,
+    /// Declined because NO DATA VOLUME COULD ALLOCATE the block (the
+    /// arm's `StorageFull`: the own-block mint, the pack refill): the entry
+    /// stays resident and dirty; a sync point answers ENOSPC — the store's
+    /// honest word, never EIO — and the next sync point retries.
+    no_space,
+    /// The promotion failed and the ino has no live inode (`nlink == 0`:
+    /// unlinked, its FORGET's destroy releases the record; an unlinked-open
+    /// file reads it until then): nothing is owed to a sync point — the
+    /// application removed the file; a full store answered ENOSPC to the
+    /// syncfs right after the `rm` of what it could not sync.
+    corpse,
     /// The ino's layout no longer names this record (kind not staged,
     /// another file id, no layout at all): a publish away from it committed
     /// under the writer's lock — a truncate to zero, a promotion, a destroy
@@ -1532,11 +1547,47 @@ pub const PromotionHooks = struct {
     /// The dismount pass: promote, keep, or destroy a corpse's or an
     /// unnamed record (nothing is in flight: the session is closed).
     dismount: ?*const fn (ctx: ?*anyopaque, key: StagingKey) DismountVerdict = null,
+    /// A promotion BATCH begins (one fsync, one syncfs pass, one dismount
+    /// pass, one drain pass, one recall): the packed arm a `StorageFull`
+    /// refill stopped for the previous batch re-arms (`pack.Packer.
+    /// beginPromotionBatch`, OQ-1) — never re-armed, the arm stayed dead
+    /// for the mount after the first full-store refill, and every small
+    /// file's sync point answered ENOSPC long after space returned.
+    begin_batch: ?*const fn (ctx: ?*anyopaque) void = null,
 
     pub const none: PromotionHooks = .{};
+
+    pub fn beginBatch(self: PromotionHooks) void {
+        if (self.begin_batch) |f| f(self.ctx);
+    }
 };
 
-const LedgerRow = struct { cost: u64, generation: u64 };
+/// `claim`: the resident's claim on the STORE (`StoreClaim.of` the image).
+const LedgerRow = struct { cost: u64, generation: u64, claim: u64 };
+
+/// A resident's claim on the STORE: the bytes its promotion lands on, by
+/// the primitive's dispatch on the image's length (`pack.dispatch`): fits
+/// inline ⇒ nothing; a packed slot (`layout.ceilGrain`, `pack.packSlotLen`)
+/// ⇒ the slot; past the pack's max slot ⇒ one whole block. The pool sums it
+/// (`claimedBytes`) for the admission against the store and for `df`
+/// (plane.zig: `writeCacheAdmits`, `statfs`; `enospc.storeCoversRing`);
+/// the ring footprint (`cost`) is the RAM side. A pool with no store
+/// behind it (the portable rigs) claims nothing.
+pub const StoreClaim = struct {
+    inline_max: u64 = 0,
+    /// 0 = packing off: every image above inline takes a block.
+    max_slot: u64 = 0,
+    /// 0 = no store behind the ring.
+    block: u64 = 0,
+
+    pub const none: StoreClaim = .{};
+
+    pub fn of(self: StoreClaim, image_len: u64) u64 {
+        if (self.block == 0 or image_len <= self.inline_max) return 0;
+        const slot = layout.ceilGrain(image_len);
+        return if (slot <= self.max_slot) slot else self.block;
+    }
+};
 
 pub const Pool = struct {
     gpa: Allocator,
@@ -1546,6 +1597,11 @@ pub const Pool = struct {
     /// ratchet: `Σ cost == current_staged_write_bytes`.
     ledger: std.AutoHashMapUnmanaged(FileId, LedgerRow) = .empty,
     current: std.atomic.Value(u64) = .init(0),
+    /// `Σ claim` over the ledger: the residents' claim on the store.
+    claimed: std.atomic.Value(u64) = .init(0),
+    /// The plane sets it before the ring is seeded (`StoreClaim.none` on a
+    /// pool with no store behind it).
+    claim_rule: StoreClaim = .none,
     next_generation: std.atomic.Value(u64) = .init(FIRST_GENERATION),
     /// The ring-full EPISODE (under `lock`): opened by the first placement
     /// that found no hole, closed by the drain that frees a quarter of the
@@ -1626,15 +1682,35 @@ pub const Pool = struct {
         return row.cost;
     }
 
-    /// Charge `cost` to `file_id` (replacing a prior row) at `generation`.
-    pub fn charge(self: *Pool, file_id: FileId, cost: u64, generation: u64) Allocator.Error!void {
+    /// The key's resident claim on the store (the plane's admission reads
+    /// the growth over it; none = no resident).
+    pub fn claimOf(self: *Pool, file_id: FileId) ?u64 {
+        self.lock.lock();
+        defer self.lock.unlock();
+        const row = self.ledger.get(file_id) orelse return null;
+        return row.claim;
+    }
+
+    /// The residents' claim on the store (`StoreClaim`), summed.
+    pub fn claimedBytes(self: *const Pool) u64 {
+        return self.claimed.load(.monotonic);
+    }
+
+    /// Charge `cost` to `file_id` (replacing a prior row) at `generation`;
+    /// `image_len` sets the row's store claim (null keeps the prior row's:
+    /// an in-place overwrite changes no length).
+    pub fn charge(self: *Pool, file_id: FileId, cost: u64, generation: u64, image_len: ?u64) Allocator.Error!void {
         self.lock.lock();
         defer self.lock.unlock();
         const gop = try self.ledger.getOrPut(self.gpa, file_id);
         const prior: u64 = if (gop.found_existing) gop.value_ptr.cost else 0;
-        gop.value_ptr.* = .{ .cost = cost, .generation = generation };
+        const prior_claim: u64 = if (gop.found_existing) gop.value_ptr.claim else 0;
+        const claim = if (image_len) |n| self.claim_rule.of(n) else prior_claim;
+        gop.value_ptr.* = .{ .cost = cost, .generation = generation, .claim = claim };
         _ = self.current.fetchSub(prior, .monotonic);
         _ = self.current.fetchAdd(cost, .monotonic);
+        _ = self.claimed.fetchSub(prior_claim, .monotonic);
+        _ = self.claimed.fetchAdd(claim, .monotonic);
         stats.current_staged_write_bytes.sub(prior);
         stats.current_staged_write_bytes.add(cost);
     }
@@ -1649,6 +1725,7 @@ pub const Pool = struct {
             if (expect_generation) |g| if (row.generation != g) return null;
             _ = self.ledger.remove(file_id);
             _ = self.current.fetchSub(row.cost, .monotonic);
+            _ = self.claimed.fetchSub(row.claim, .monotonic);
             stats.current_staged_write_bytes.sub(row.cost);
             break :blk .{ row.cost, self.ringFullDrainedLocked() };
         };
@@ -1665,7 +1742,15 @@ pub const Pool = struct {
     pub fn seedFromRecovery(self: *Pool, seg: *Segment) Allocator.Error!void {
         const out = try seg.residentsAlloc(self.gpa);
         defer self.gpa.free(out);
-        for (out) |r| try self.charge(r.key.file_id, r.cost, RECOVERED_GENERATION);
+        // A recovered record claims NOTHING on the store until a live write
+        // re-stages it: its standing is unjudged until a promotion point
+        // meets it (named and owed, or superseded by the publish the kill
+        // landed before its release — the two-ring [C4] row: the record of
+        // a file already on its own block held `df` a block above its
+        // baseline after the file's rm, until the dismount pass destroyed
+        // it). What a kill leaves in flight is a handful of records; a
+        // named one's sync point keeps the terminal verdict.
+        for (out) |r| try self.charge(r.key.file_id, r.cost, RECOVERED_GENERATION, null);
         const floor = seg.maxGeneration() + 1;
         if (floor > self.next_generation.load(.monotonic)) self.next_generation.store(floor, .monotonic);
     }
@@ -1796,7 +1881,7 @@ pub fn stageWrite(pool: *Pool, seg: *Segment, cache: ?*WriteCache, key: StagingK
         stats.staging_restages.inc();
         stats.staging_restage_bytes.add(2 * payload.len);
     }
-    try pool.charge(key.file_id, padded, generation);
+    try pool.charge(key.file_id, padded, generation, payload.len);
     return .{ .generation = generation };
 }
 
@@ -1814,7 +1899,7 @@ pub fn appendStaged(pool: *Pool, seg: *Segment, key: StagingKey, at: u64, data: 
         error.OutOfMemory => return error.OutOfMemory,
     };
     const cost = pool.costOf(key.file_id) orelse 0;
-    try pool.charge(key.file_id, cost, generation);
+    try pool.charge(key.file_id, cost, generation, at + data.len);
     stats.staging_appends.inc();
     stats.staging_append_bytes.add(data.len);
     return .{ .generation = generation };
@@ -1833,7 +1918,7 @@ pub fn overwriteStaged(pool: *Pool, seg: *Segment, io: Io, key: StagingKey, at: 
         error.OutOfMemory => return error.OutOfMemory,
     };
     const cost = pool.costOf(key.file_id) orelse 0;
-    try pool.charge(key.file_id, cost, generation);
+    try pool.charge(key.file_id, cost, generation, null);
     return .{ .generation = generation };
 }
 
@@ -1866,6 +1951,7 @@ pub fn promoteAllAtDismount(gpa: Allocator, seg: *Segment, hooks: PromotionHooks
     const judge = hooks.dismount orelse return tally;
     const out = try seg.residentsAlloc(gpa);
     defer gpa.free(out);
+    hooks.beginBatch();
     for (out) |r| switch (judge(hooks.ctx, r.key)) {
         .promoted => {
             tally.promoted += 1;
@@ -1901,15 +1987,25 @@ pub const FsyncPromote = enum {
     /// Resident and NOT promoted (a resource decline, a commit failure):
     /// on the RAM write cache the fsync cannot be acked — EIO.
     kept,
+    /// Resident and NOT promoted because the store could not allocate its
+    /// block (`LiveVerdict.no_space`): the fsync answers ENOSPC; the bytes
+    /// stay resident and dirty, the next sync point retries.
+    kept_no_space,
 };
 
 /// The fsync point (the write cache's law, module doc): promote BEFORE the
 /// data barrier, so the barrier covers the block; the caller answers
-/// `kept` with EIO.
+/// `kept` with EIO and `kept_no_space` with ENOSPC. One fsync is one
+/// promotion batch.
 pub fn promoteAtFsync(seg: *Segment, hooks: PromotionHooks, key: StagingKey) FsyncPromote {
     if (seg.residentGeneration(key) == null) return .absent;
+    hooks.beginBatch();
+    return promoteOne(seg, hooks, key);
+}
+
+fn promoteOne(seg: *Segment, hooks: PromotionHooks, key: StagingKey) FsyncPromote {
     const promote = hooks.promote orelse return .kept;
-    switch (promote(hooks.ctx, key)) {
+    const kept: FsyncPromote = switch (promote(hooks.ctx, key)) {
         .promoted => {
             stats.fsync_promoted_files.inc();
             return .promoted;
@@ -1918,19 +2014,33 @@ pub fn promoteAtFsync(seg: *Segment, hooks: PromotionHooks, key: StagingKey) Fsy
             stats.fsync_promote_superseded.inc();
             return .absent;
         },
-        .declined => {},
-    }
+        .corpse => {
+            stats.fsync_promote_corpses.inc();
+            return .absent;
+        },
+        .declined => .kept,
+        .no_space => .kept_no_space,
+    };
     // Gone meanwhile (a pressure promotion raced): nothing owed.
-    return if (seg.residentGeneration(key) != null) .kept else .absent;
+    return if (seg.residentGeneration(key) != null) kept else .absent;
 }
 
+/// What the syncfs point left resident.
+pub const SyncfsKept = struct { declined: u64 = 0, no_space: u64 = 0 };
+
 /// The syncfs point: `promoteAtFsync` for EVERY resident entry; answers
-/// how many stayed resident (the caller answers EIO for any).
-pub fn promoteAllAtSyncfs(gpa: Allocator, seg: *Segment, hooks: PromotionHooks) Allocator.Error!u64 {
+/// how many stayed resident by class (the caller answers EIO for any
+/// declined, else ENOSPC for any the store could not take).
+pub fn promoteAllAtSyncfs(gpa: Allocator, seg: *Segment, hooks: PromotionHooks) Allocator.Error!SyncfsKept {
     const out = try seg.residentsAlloc(gpa);
     defer gpa.free(out);
-    var kept: u64 = 0;
-    for (out) |r| kept += @intFromBool(promoteAtFsync(seg, hooks, r.key) == .kept);
+    var kept: SyncfsKept = .{};
+    hooks.beginBatch();
+    for (out) |r| switch (if (seg.residentGeneration(r.key) == null) FsyncPromote.absent else promoteOne(seg, hooks, r.key)) {
+        .kept => kept.declined += 1,
+        .kept_no_space => kept.no_space += 1,
+        .promoted, .absent => {},
+    };
     return kept;
 }
 
@@ -3005,6 +3115,7 @@ test "recovery scan: the true geometry survives (every live record adopted, byte
 const Kicks = struct {
     promoted: u32 = 0,
     fail_next: bool = false,
+    no_space_next: bool = false,
     /// The dismount judgement of these inos (by the key's ino): a corpse's
     /// record, an unnamed one; every other key promotes (or fails as the
     /// promote hook does). The judge removes what it destroys, as the
@@ -3023,6 +3134,10 @@ const Kicks = struct {
             self.fail_next = false;
             return .declined;
         }
+        if (self.no_space_next) {
+            self.no_space_next = false;
+            return .no_space;
+        }
         if (self.unnamed_ino == k.ino()) return .unnamed;
         self.promoted += 1;
         if (self.seg) |s| _ = s.remove(k, null);
@@ -3038,6 +3153,67 @@ const Kicks = struct {
         return if (onPromote(ctx, k) == .promoted) .promoted else .kept;
     }
 };
+
+test "THE RESIDENTS' CLAIM ON THE STORE (StoreClaim): inline claims nothing, a packable image its 4 KiB slot, one past the pack's max slot a whole block, packing off a block for anything above inline, no store nothing; the pool sums it — a stage charges it, a re-stage replaces it, an in-place append re-reads it off the grown image (across the pack bound: slot → block), an overwrite keeps it, a release credits it — and recovery seeds it off the footprint" {
+    const gpa = testing.allocator;
+    const rule: StoreClaim = .{ .inline_max = 4096, .max_slot = 512 << 10, .block = 1 << 20 };
+    try testing.expectEqual(@as(u64, 0), rule.of(0));
+    try testing.expectEqual(@as(u64, 0), rule.of(4096));
+    try testing.expectEqual(@as(u64, 8192), rule.of(4097));
+    try testing.expectEqual(@as(u64, 100 << 10), rule.of(100 << 10));
+    try testing.expectEqual(@as(u64, 512 << 10), rule.of(512 << 10));
+    try testing.expectEqual(@as(u64, 1 << 20), rule.of((512 << 10) + 1));
+    try testing.expectEqual(@as(u64, 1 << 20), rule.of(1 << 20));
+    try testing.expectEqual(@as(u64, 1 << 20), (StoreClaim{ .inline_max = 4096, .max_slot = 0, .block = 1 << 20 }).of(4097));
+    try testing.expectEqual(@as(u64, 0), StoreClaim.none.of(1 << 20));
+    var kicks: Kicks = .{};
+    var pool = Pool.init(gpa, kicks.hooks());
+    defer pool.deinit();
+    pool.claim_rule = rule;
+    var r = try ramSegment(gpa, 1024 * 4096);
+    defer gpa.free(r.image);
+    defer r.seg.deinit();
+    const k = tkey(1, 1);
+    const small: [100]u8 = @splat(1);
+    _ = try stageWrite(&pool, &r.seg, null, k, &small, 0, .none);
+    try testing.expectEqual(@as(u64, 0), pool.claimedBytes()); // inline
+    const mid = try gpa.alloc(u8, 500 << 10);
+    defer gpa.free(mid);
+    @memset(mid, 2);
+    _ = try stageWrite(&pool, &r.seg, null, k, mid, 0, .append);
+    try testing.expectEqual(@as(u64, 500 << 10), pool.claimedBytes()); // a packed slot
+    try testing.expectEqual(@as(?u64, 500 << 10), pool.claimOf(k.file_id));
+    // The in-place append carries the image past the pack bound: a block.
+    const tail = try gpa.alloc(u8, 20 << 10);
+    defer gpa.free(tail);
+    @memset(tail, 3);
+    try testing.expect((try appendStaged(&pool, &r.seg, k, 500 << 10, tail, 0)) != null);
+    try testing.expectEqual(@as(u64, 1 << 20), pool.claimedBytes());
+    // An overwrite inside the image keeps it.
+    try testing.expect((try overwriteStaged(&pool, &r.seg, testing.io, k, 0, &small, 0)) != null);
+    try testing.expectEqual(@as(u64, 1 << 20), pool.claimedBytes());
+    // A second resident adds; the release credits each.
+    const k2 = tkey(2, 2);
+    _ = try stageWrite(&pool, &r.seg, null, k2, mid[0 .. 10 << 10], 0, .none);
+    try testing.expectEqual(@as(u64, (1 << 20) + (12 << 10)), pool.claimedBytes()); // the slot is grain-aligned
+    try testing.expect(releaseStaged(&pool, &r.seg, null, k2, pool.generationOf(k2.file_id).?));
+    try testing.expectEqual(@as(u64, 1 << 20), pool.claimedBytes());
+    try testing.expect(releaseStaged(&pool, &r.seg, null, k, pool.generationOf(k.file_id).?));
+    try testing.expectEqual(@as(u64, 0), pool.claimedBytes());
+    // Recovery seeds no claim (a recovered record's standing is unjudged);
+    // the re-stage at a live generation charges it.
+    _ = try stageWrite(&pool, &r.seg, null, k2, mid[0 .. 10 << 10], 0, .none);
+    var pool2 = Pool.init(gpa, kicks.hooks());
+    defer pool2.deinit();
+    pool2.claim_rule = rule;
+    try pool2.seedFromRecovery(&r.seg);
+    try testing.expectEqual(@as(u64, 0), pool2.claimedBytes());
+    try testing.expect(pool2.currentBytes() > 0); // the footprint is charged
+    _ = try stageWrite(&pool2, &r.seg, null, k2, mid[0 .. 10 << 10], 0, .none);
+    try testing.expectEqual(@as(u64, 12 << 10), pool2.claimedBytes());
+    try testing.expect(releaseStaged(&pool2, &r.seg, null, k2, pool2.generationOf(k2.file_id).?));
+    try testing.expectEqual(@as(u64, 0), pool2.claimedBytes());
+}
 
 test "pool: the ledger charges the delta on a re-stage and credits on release so the gauge never ratchets; generations start at 1 and recovery seeds 0; a stale release is a no-op" {
     const gpa = testing.allocator;
@@ -3379,8 +3555,19 @@ test "the promotion points: the dismount pass judges every resident — promoted
     try testing.expectEqual(s0 + 1, stats.fsync_promote_superseded.load());
     try testing.expectEqual(p0 + 1, stats.fsync_promoted_files.load());
     try testing.expectEqual(@as(?u64, 6), r.seg.residentGeneration(tkey(5, 5)));
-    try testing.expectEqual(@as(u64, 0), try promoteAllAtSyncfs(gpa, &r.seg, kicks.hooks()));
+    try testing.expectEqual(SyncfsKept{}, try promoteAllAtSyncfs(gpa, &r.seg, kicks.hooks()));
     try testing.expect(r.seg.remove(tkey(5, 5), 6));
+    // The store's refusal (`LiveVerdict.no_space`): `kept_no_space` at the
+    // fsync point, counted apart by the syncfs point — the caller's ENOSPC.
+    try r.seg.put(tkey(7, 7), &v, 7, 0, 0);
+    kicks.no_space_next = true;
+    try testing.expectEqual(FsyncPromote.kept_no_space, promoteAtFsync(&r.seg, kicks.hooks(), tkey(7, 7)));
+    try testing.expectEqual(@as(?u64, 7), r.seg.residentGeneration(tkey(7, 7)));
+    kicks.no_space_next = true;
+    try testing.expectEqual(SyncfsKept{ .no_space = 1 }, try promoteAllAtSyncfs(gpa, &r.seg, kicks.hooks()));
+    kicks.fail_next = true;
+    try testing.expectEqual(SyncfsKept{ .declined = 1 }, try promoteAllAtSyncfs(gpa, &r.seg, kicks.hooks()));
+    try testing.expect(r.seg.remove(tkey(7, 7), 7));
 }
 
 test "the in-place overwrite: a write inside ONE grain of a resident record lands in the record's own grain — header-first (the other slot carries the new checksum before the grain moves: a kill between recovers the OLD record, a kill after the NEW), no new slot, no superseded cell, nothing freed, the generation and hash state move on (an append continues from it); a span across two grains and a write past the value decline (the caller re-stages); readers copy a grain whole under a racing writer (never a torn grain) — red before: every rewrite moved the image into a fresh slot" {

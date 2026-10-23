@@ -52,6 +52,7 @@ const counters = @import("../core/counters.zig");
 const clock = @import("../core/clock.zig");
 const log = @import("../core/log.zig");
 const derive = @import("../core/derive.zig");
+const jc = @import("../meta/journal_core.zig");
 const block_alloc = @import("block_alloc.zig");
 const reclaim = @import("reclaim.zig");
 
@@ -104,13 +105,19 @@ pub fn fenceBoundBaseMs(src: ?FenceBoundSource) u64 {
 
 pub const stats = struct {
     pub var write_fresh_block_enospc_refusals: counters.ShardedCounter = .{};
+    /// A write refused `ENOSPC` because the store's free bytes no longer
+    /// cover the write cache's resident footprint plus this write's growth
+    /// of it (`storeCoversRing`): the cache's claim on the store.
+    pub var write_cache_claim_enospc_refusals: counters.ShardedCounter = .{};
+    /// Full-store episodes at the promotion primitive (`FullStoreEpisode`).
+    pub var full_store_episodes: counters.ShardedCounter = .{};
     pub var alloc_pressure_parks: counters.ShardedCounter = .{};
     pub var alloc_pressure_park_wall_refusals: counters.ShardedCounter = .{};
     pub var alloc_valve_passes: counters.ShardedCounter = .{};
 };
 
 pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
-    try w.print("{{\"write_fresh_block_enospc_refusals\":{d},\"alloc_pressure_parks\":{d},\"alloc_pressure_park_wall_refusals\":{d},\"alloc_valve_passes\":{d}}}", .{ stats.write_fresh_block_enospc_refusals.load(), stats.alloc_pressure_parks.load(), stats.alloc_pressure_park_wall_refusals.load(), stats.alloc_valve_passes.load() });
+    try w.print("{{\"write_fresh_block_enospc_refusals\":{d},\"write_cache_claim_enospc_refusals\":{d},\"full_store_episodes\":{d},\"alloc_pressure_parks\":{d},\"alloc_pressure_park_wall_refusals\":{d},\"alloc_valve_passes\":{d}}}", .{ stats.write_fresh_block_enospc_refusals.load(), stats.write_cache_claim_enospc_refusals.load(), stats.full_store_episodes.load(), stats.alloc_pressure_parks.load(), stats.alloc_pressure_park_wall_refusals.load(), stats.alloc_valve_passes.load() });
 }
 
 // ---------------------------------------------------------------------------
@@ -144,15 +151,99 @@ pub const WriteAdmission = enum {
     refuse_enospc,
 };
 
-/// The staged write path's decision for the WHOLE write ahead of every
-/// block future (FC:L20845-20881).
-pub fn admitWrite(set_exhausted: bool, write_would_create_fresh_custody: bool) WriteAdmission {
-    if (set_exhausted and write_would_create_fresh_custody) {
+/// THE WRITE CACHE'S CLAIM ON THE STORE (charter §6.2's terminal law, the
+/// sync point's half): every resident of the ring is custody the next
+/// promotion lands on a fresh block, so the ring's footprint is a claim on
+/// the set's free bytes ahead of every later write. A write that would
+/// GROW the footprint by `extra` B is admitted only while
+/// `free ≥ ring + extra`; a write that creates fresh custody outside the
+/// ring is admitted only while `free ≥ ring`. WHY: the ring admitted on its
+/// own capacity alone — 25 % of RAM — and a filled store's small writes
+/// were acked into it until the dismount pass FAILED them (generic/750:
+/// 1,481 residents on a 16 GiB scratch; generic/475: a 7 GiB memfd), every
+/// fsync of them answering EIO where the write should have answered
+/// ENOSPC. The claim is bytes, not blocks: a packed promotion lands many
+/// residents per block and an own-block one rounds up to a block, so the
+/// footprint is the honest estimate between them; the sync point keeps the
+/// terminal verdict for what the estimate admits.
+pub fn storeCoversRing(free_bytes: u64, ring_bytes: u64, extra: u64) bool {
+    return free_bytes >= ring_bytes +| extra;
+}
+
+/// The write path's decision for the WHOLE write ahead of every block
+/// future (FC:L20845-20881): fresh custody is refused while the set is
+/// latched exhausted (`freshSupplyExhausted`) or while the write cache's
+/// claim is uncovered (`storeCoversRing` false); custody the daemon already
+/// holds keeps the ladder.
+pub fn admitWrite(set_exhausted: bool, ring_uncovered: bool, write_would_create_fresh_custody: bool) WriteAdmission {
+    if (!write_would_create_fresh_custody) return .admit;
+    if (set_exhausted) {
         stats.write_fresh_block_enospc_refusals.inc();
+        return .refuse_enospc;
+    }
+    if (ring_uncovered) {
+        stats.write_cache_claim_enospc_refusals.inc();
         return .refuse_enospc;
     }
     return .admit;
 }
+
+/// The FULL-STORE EPISODE at the promotion primitive (the ring-full
+/// latch's shape, `staging.Pool.RingFull`, 21a2308): ONE line when it
+/// opens, one with the tally when it closes — never one per sync point or
+/// per leg (generic/750: 235 `syncfs: a leg failed` and 79 `fsync …` error
+/// lines in 19 s; generic/475: 1,085 and 3,176). Opened by the first
+/// promotion the store refused for space (`refused`); a refusal never
+/// closes it (a quiet application's hourly fsync is the same episode); a
+/// promotion that LANDS closes it once the last refusal is a full park
+/// wall old (`QUIET_NS`): a store under rewrite lands and refuses within
+/// one wall — a free lands, the next mint takes it, the next fails — and an
+/// episode closed by any landing logged one line per flap. The landing
+/// side pays one relaxed load while no episode is open.
+pub const FullStoreEpisode = struct {
+    open: std.atomic.Value(bool) = .init(false),
+    lock: jc.SpinLock = .{},
+    since_ns: u64 = 0,
+    last_refusal_ns: u64 = 0,
+    refusals: u64 = 0,
+
+    /// The park wall's floor: past it the store's own verdict stands.
+    pub const QUIET_NS: u64 = PRESSURE_PARK_WALL_FLOOR_MS * std.time.ns_per_ms;
+
+    pub const Closed = struct { since_ns: u64, refusals: u64 };
+
+    /// A promotion the store refused for space: `true` iff it opened the
+    /// episode (the caller's one line).
+    pub fn refused(self: *FullStoreEpisode, now_ns: u64) bool {
+        self.lock.lock();
+        defer self.lock.unlock();
+        self.last_refusal_ns = now_ns;
+        if (self.open.load(.monotonic)) {
+            self.refusals += 1;
+            return false;
+        }
+        self.since_ns = now_ns;
+        self.refusals = 1;
+        self.open.store(true, .monotonic);
+        stats.full_store_episodes.inc();
+        return true;
+    }
+
+    /// A promotion landed: the episode's tally iff it closed (the last
+    /// refusal older than `QUIET_NS`).
+    pub fn landed(self: *FullStoreEpisode, now_ns: u64) ?Closed {
+        if (!self.open.load(.monotonic)) return null;
+        self.lock.lock();
+        defer self.lock.unlock();
+        if (!self.open.load(.monotonic) or now_ns -| self.last_refusal_ns < QUIET_NS) return null;
+        self.open.store(false, .monotonic);
+        return .{ .since_ns = self.since_ns, .refusals = self.refusals };
+    }
+
+    pub fn isOpen(self: *const FullStoreEpisode) bool {
+        return self.open.load(.monotonic);
+    }
+};
 
 // ---------------------------------------------------------------------------
 // The valve and the funnel (BA:L2174-2381).
@@ -194,23 +285,45 @@ pub const Valve = struct {
     }
 };
 
-/// Park on the allocator's supply edge until a trim claim window returns
-/// its block (bounded by the park ceiling: a window is pending supply,
-/// never a deficit — a full store under rewrite can hold its ENTIRE free
-/// list inside windows, and refusing then was a spurious TERMINAL ENOSPC,
-/// R7). Counted `alloc_trim_window_parks` (≈ 0 except exactly that regime).
-fn awaitTrimReturn(alloc: *BlockAllocator, io: Io) void {
-    block_alloc.stats.alloc_trim_window_parks.fire("an allocation parked on an open trim claim window");
-    const deadline = clock.monotonicNs() + reclaim.PARK_BOUND_CEILING_MS * std.time.ns_per_ms;
-    while (alloc.trimClaimed() > 0 and clock.monotonicNs() < deadline) {
+/// Park on the allocator's supply edge until the open trim claim window
+/// returns its blocks: a window is pending supply, never a deficit — a
+/// full store under rewrite can hold its ENTIRE free list inside the
+/// windows its trim passes claim, and refusing then was a spurious
+/// TERMINAL ENOSPC (R7). THE CLASS: that regime's ordinary outcome, counted
+/// `alloc_trim_window_parks` (≈ 0 off it; `alloc_trim_window_parked` while
+/// parked), never a tripwire — the must-stay-0 it was fired under
+/// generic/750 and generic/475 on a filled scratch, the fence-class ruling
+/// of 2026-10-19 again. The window closes by the pass that opened it within
+/// about one manners tick (`reclaim`'s pacing), so `ceiling_ns` passing
+/// with it still open is the device stalled on its discards, not the
+/// design: counted `alloc_trim_window_park_walls`, ONE warning per stall
+/// episode on the volume (`trim_wall_warned`, cleared at the close), and
+/// the park goes on — the window's blocks are supply in sight. Nothing
+/// here is a "cannot happen": the caller's predicate is the only gate
+/// (asserted), and a lost wake is the Notify's contract, not this site's.
+fn awaitTrimReturn(alloc: *BlockAllocator, io: Io, ceiling_ns: u64) void {
+    assert(alloc.trimClaimed() > 0);
+    block_alloc.stats.alloc_trim_window_parks.inc();
+    block_alloc.stats.alloc_trim_window_parked.add(1);
+    defer block_alloc.stats.alloc_trim_window_parked.sub(1);
+    const started = clock.monotonicNs();
+    var deadline = started + ceiling_ns;
+    var walled = false;
+    while (alloc.trimClaimed() > 0) {
         var n = alloc.supply_edge.notified();
         _ = n.enable(io);
         if (alloc.trimClaimed() == 0) {
             n.cancel(io);
-            return;
+            break;
         }
-        _ = n.waitUntilUncancelable(io, deadline);
+        if (n.waitUntilUncancelable(io, deadline) == .deadline and alloc.trimClaimed() > 0) {
+            block_alloc.stats.alloc_trim_window_park_walls.inc();
+            walled = true;
+            if (!alloc.trim_wall_warned.swap(true, .acq_rel)) log.warn("data volume {d}: an allocation has parked {d} ms on a trim claim window still open ({d} block(s) inside it, {d} parked) — a trim pass holds its window for about one manners tick, so the device is stalled on its discards; the store is not full, the park continues", .{ alloc.cfg.vol, (clock.monotonicNs() - started) / std.time.ns_per_ms, alloc.trimWindowedBlocks(), block_alloc.stats.alloc_trim_window_parked.load() });
+            deadline = clock.monotonicNs() + ceiling_ns;
+        }
     }
+    if (walled) alloc.trim_wall_warned.store(false, .release);
 }
 
 /// `allocate_block` through the ENOSPC valve: on `StorageFull`, an open
@@ -223,7 +336,7 @@ pub fn allocateWithValve(alloc: *BlockAllocator, io: Io, valve: ?Valve) AllocErr
         const err = if (alloc.allocateBlock()) |m| return m else |e| e;
         if (err != error.StorageFull) return err;
         if (alloc.trimClaimed() > 0) {
-            awaitTrimReturn(alloc, io);
+            awaitTrimReturn(alloc, io, reclaim.PARK_BOUND_CEILING_MS * std.time.ns_per_ms);
             continue;
         }
         const v = valve orelse return err;
@@ -375,9 +488,15 @@ test "fresh_block_writes_against_an_exhausted_set_are_refused_before_the_ack; ac
     try testing.expectEqual(@as(u64, 2), block_alloc.stats.alloc_fresh_supply_exhausted_latched.load());
     try testing.expectEqual(@as(u64, 2), block_alloc.stats.alloc_fresh_supply_exhausted_candidates.load());
     const refusals = stats.write_fresh_block_enospc_refusals.load();
-    try testing.expectEqual(WriteAdmission.refuse_enospc, admitWrite(true, true));
-    try testing.expectEqual(WriteAdmission.admit, admitWrite(true, false)); // a mapped block's rewrite lands in place
-    try testing.expectEqual(WriteAdmission.admit, admitWrite(false, true));
+    const claims = stats.write_cache_claim_enospc_refusals.load();
+    try testing.expectEqual(WriteAdmission.refuse_enospc, admitWrite(true, false, true));
+    try testing.expectEqual(WriteAdmission.admit, admitWrite(true, false, false)); // a mapped block's rewrite lands in place
+    try testing.expectEqual(WriteAdmission.admit, admitWrite(false, false, true));
+    try testing.expectEqual(refusals + 1, stats.write_fresh_block_enospc_refusals.load());
+    // The write cache's claim: uncovered ⇒ fresh custody refused, counted apart; held custody admitted.
+    try testing.expectEqual(WriteAdmission.refuse_enospc, admitWrite(false, true, true));
+    try testing.expectEqual(WriteAdmission.admit, admitWrite(false, true, false));
+    try testing.expectEqual(claims + 1, stats.write_cache_claim_enospc_refusals.load());
     try testing.expectEqual(refusals + 1, stats.write_fresh_block_enospc_refusals.load());
     // Supply returns on one volume: the set is no longer exhausted.
     _ = try a.freeBlock(0);
@@ -468,33 +587,83 @@ test "enospc_pressure_valve_drains_queued_reclaims_before_refusing; a_full_store
     try testing.expectEqual(@as(u32, 4), racer.drains); // three progressing passes + the one that proved exhaustion
 }
 
-test "allocation racing a trim claim window parks and lands on the returned block" {
-    const io = testing.io;
+/// A full store under rewrite: every block allocated, the one freed block
+/// claimed by a trim pass — the free list is entirely inside the window.
+fn fullStoreInsideTrimWindow() !struct { alloc: *BlockAllocator, guard: block_alloc.InflightAllocGuard } {
     const a = try mkAlloc(2, 0);
-    defer a.deinit();
+    errdefer a.deinit();
     _ = try a.allocateBlock();
     _ = try a.allocateBlock();
     _ = try a.freeBlock(1);
-    var g = a.claimFreeForTrim(1).?;
+    const g = a.claimFreeForTrim(1).?;
     try testing.expectEqual(@as(u64, 0), a.freeSupplyBlocks());
+    try testing.expect(a.freshSupplyVisible()); // the window IS supply
+    return .{ .alloc = a, .guard = g };
+}
+
+test "THE CLASS OF A TRIM-WINDOW PARK (the fence-class ruling applied): a full store under rewrite with its free list inside a trim claim window parks the allocation and lands it on the returned block — counted alloc_trim_window_parks, the gauge 1 while parked and 0 after, NO tripwire, NO error line (red: the must-stay-0 fired and logged an INVARIANT TRIPWIRE line — generic/750 ×3, generic/475 ×7)" {
+    const io = testing.io;
+    var f = try fullStoreInsideTrimWindow();
+    const a = f.alloc;
+    defer a.deinit();
     const Returner = struct {
-        fn run(io_: Io, alloc: *BlockAllocator, guard: *block_alloc.InflightAllocGuard) void {
+        fn run(io_: Io, alloc: *BlockAllocator, guard: *block_alloc.InflightAllocGuard, parked: *u64) void {
+            while (alloc.supply_edge.waiters(io_) == 0) std.Thread.yield() catch {};
+            parked.* = block_alloc.stats.alloc_trim_window_parked.load();
+            alloc.returnFromTrim(1, guard);
+            alloc.supply_edge.notifyWaiters(io_);
+        }
+    };
+    var parked_during: u64 = 0;
+    var fut = io.concurrent(Returner.run, .{ io, a, &f.guard, &parked_during }) catch |err| switch (err) {
+        error.ConcurrencyUnavailable => return testkit.skip(@src(), .no_concurrency, "the executor refused a unit of concurrency"),
+    };
+    const parks0 = block_alloc.stats.alloc_trim_window_parks.load();
+    const walls0 = block_alloc.stats.alloc_trim_window_park_walls.load();
+    const trips0 = counters.invariantTripwires();
+    const m = try allocateWithValve(a, io, null);
+    fut.await(io);
+    try testing.expectEqual(@as(u64, 1), m.idx);
+    try testing.expectEqual(parks0 + 1, block_alloc.stats.alloc_trim_window_parks.load());
+    try testing.expectEqual(walls0, block_alloc.stats.alloc_trim_window_park_walls.load());
+    try testing.expectEqual(@as(u64, 1), parked_during);
+    try testing.expectEqual(@as(u64, 0), block_alloc.stats.alloc_trim_window_parked.load());
+    try testing.expectEqual(trips0, counters.invariantTripwires());
+    try testing.expectEqual(@as(u64, 0), counters.tripwireCount("alloc_trim_window_parks"));
+}
+
+test "a trim-window park past its ceiling with the window STILL open is the device stalled, not the store full: counted alloc_trim_window_park_walls (one per ceiling), ONE warning per episode on the volume, the park goes on and lands on the returned block; the latch clears at the close" {
+    const io = testing.io;
+    var f = try fullStoreInsideTrimWindow();
+    const a = f.alloc;
+    defer a.deinit();
+    const ceiling_ns: u64 = 20 * std.time.ns_per_ms;
+    const parks0 = block_alloc.stats.alloc_trim_window_parks.load();
+    const walls0 = block_alloc.stats.alloc_trim_window_park_walls.load();
+    const trips0 = counters.invariantTripwires();
+    const Returner = struct {
+        fn run(io_: Io, alloc: *BlockAllocator, guard: *block_alloc.InflightAllocGuard, walls_before: u64) void {
+            // The window outlives three ceilings before the pass returns it.
+            while (block_alloc.stats.alloc_trim_window_park_walls.load() < walls_before + 3) std.Thread.yield() catch {};
             while (alloc.supply_edge.waiters(io_) == 0) std.Thread.yield() catch {};
             alloc.returnFromTrim(1, guard);
             alloc.supply_edge.notifyWaiters(io_);
         }
     };
-    var fut = io.concurrent(Returner.run, .{ io, a, &g }) catch |err| switch (err) {
+    var fut = io.concurrent(Returner.run, .{ io, a, &f.guard, walls0 }) catch |err| switch (err) {
         error.ConcurrencyUnavailable => return testkit.skip(@src(), .no_concurrency, "the executor refused a unit of concurrency"),
     };
-    const parks = counters.tripwireCount("alloc_trim_window_parks");
-    block_alloc.stats.alloc_trim_window_parks.resetLogBudgetForTest();
-    log.testing.expectErrorLogs(1);
-    const m = try allocateWithValve(a, io, null);
+    const t0 = clock.monotonicNs();
+    awaitTrimReturn(a, io, ceiling_ns);
     fut.await(io);
-    try log.testing.expectAllFired();
+    try testing.expect(clock.monotonicNs() - t0 >= 3 * ceiling_ns);
+    try testing.expectEqual(parks0 + 1, block_alloc.stats.alloc_trim_window_parks.load()); // one park spanning the walls
+    try testing.expect(block_alloc.stats.alloc_trim_window_park_walls.load() >= walls0 + 3);
+    try testing.expectEqual(@as(u64, 0), a.trimClaimed());
+    try testing.expect(!a.trim_wall_warned.load(.acquire));
+    try testing.expectEqual(trips0, counters.invariantTripwires());
+    const m = try a.allocateBlock();
     try testing.expectEqual(@as(u64, 1), m.idx);
-    try testing.expectEqual(parks + 1, counters.tripwireCount("alloc_trim_window_parks"));
 }
 
 test "the write path's grace-bounded mint: `.none` ⇒ byte-identical to the valve; `.visible_supply` on an exhausted set ⇒ terminal at once; with supply in sight ⇒ parks slices up to the wall then refuses loud; a free during the park lands the mint" {
@@ -585,9 +754,46 @@ test "allocatePlaced: pick + mint; StorageFull runs the pressure hook (not under
     try testing.expectError(error.NoHealthyBackends, allocatePlaced(.{ .ctx = null, .pick = &P.pick }, .{ .ino = 1, .block = 0 }, io, null, null, false, .none));
 }
 
+test "THE WRITE CACHE'S CLAIM ON THE STORE: the ring's footprint plus the write's growth of it must fit the set's free bytes — a new resident on a store with exactly its bytes free is admitted, one byte more is refused; a resident's same-size re-stage grows nothing; an uncovered ring refuses every fresh custody; the arithmetic saturates" {
+    try testing.expect(storeCoversRing(1 << 20, 0, 1 << 20));
+    try testing.expect(!storeCoversRing(1 << 20, 0, (1 << 20) + 1));
+    try testing.expect(storeCoversRing(1 << 20, 1 << 20, 0)); // the re-stage at the same cost
+    try testing.expect(!storeCoversRing(1 << 20, 1 << 20, 1)); // one byte of growth
+    try testing.expect(!storeCoversRing(10, 11, 0)); // the store shrank under the ring: no fresh custody
+    try testing.expect(storeCoversRing(0, 0, 0)); // an empty ring claims nothing
+    try testing.expect(!storeCoversRing(std.math.maxInt(u64) - 1, std.math.maxInt(u64), 1));
+}
+
+test "THE FULL-STORE EPISODE is one open and one close: the first refusal opens it (counted full_store_episodes), later refusals and interleaved landings within the quiet wall keep it open, a landing a full wall after the last refusal closes it with the tally; a refusal after the close opens the next" {
+    var e: FullStoreEpisode = .{};
+    const episodes0 = stats.full_store_episodes.load();
+    const t0: u64 = 10 * std.time.ns_per_s;
+    try testing.expect(!e.isOpen());
+    try testing.expectEqual(@as(?FullStoreEpisode.Closed, null), e.landed(t0)); // nothing open: the landing side's one load
+    try testing.expect(e.refused(t0));
+    try testing.expect(e.isOpen());
+    try testing.expectEqual(episodes0 + 1, stats.full_store_episodes.load());
+    // The store under rewrite: a free lands, the next mint takes it, the next fails — the episode, not its end.
+    try testing.expectEqual(@as(?FullStoreEpisode.Closed, null), e.landed(t0 + 1));
+    try testing.expect(!e.refused(t0 + 2));
+    try testing.expectEqual(@as(?FullStoreEpisode.Closed, null), e.landed(t0 + 2 + FullStoreEpisode.QUIET_NS - 1));
+    // A quiet application: its refusals an hour apart are the same episode.
+    try testing.expect(!e.refused(t0 + 3600 * std.time.ns_per_s));
+    try testing.expectEqual(episodes0 + 1, stats.full_store_episodes.load());
+    // The close: a landing a full wall after the last refusal.
+    const closed = e.landed(t0 + 3600 * std.time.ns_per_s + FullStoreEpisode.QUIET_NS).?;
+    try testing.expectEqual(t0, closed.since_ns);
+    try testing.expectEqual(@as(u64, 3), closed.refusals);
+    try testing.expect(!e.isOpen());
+    // The next refusal is the next episode.
+    try testing.expect(e.refused(t0 + 7200 * std.time.ns_per_s));
+    try testing.expectEqual(episodes0 + 2, stats.full_store_episodes.load());
+}
+
 test "stats JSON" {
     var buf: [512]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
     try writeStatsJson(&w);
     try testing.expect(std.mem.startsWith(u8, w.buffered(), "{\"write_fresh_block_enospc_refusals\":"));
+    try testing.expect(std.mem.indexOf(u8, w.buffered(), "\"write_cache_claim_enospc_refusals\":") != null);
 }

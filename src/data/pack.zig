@@ -458,7 +458,10 @@ pub const Packer = struct {
     opened: std.ArrayList(*OpenPack) = .empty,
     refill: Flight = .init,
     /// OQ-1: a `StorageFull` refill stops the arm for the rest of the
-    /// promotion batch (ONE aggregated WARN); `beginPromotionBatch` re-arms.
+    /// promotion batch (counted `pack_refill_storage_full` once per stop);
+    /// `beginPromotionBatch` re-arms — every batch's start calls it
+    /// (`staging.PromotionHooks.begin_batch`: an fsync, a syncfs pass, a
+    /// dismount pass, a drain pass, a recall).
     stopped: std.atomic.Value(bool) = .init(false),
     seq: std.atomic.Value(u64) = .init(0),
 
@@ -547,10 +550,14 @@ pub const Packer = struct {
             const ctx: RefillCtx = .{ .packer = self, .key = k, .row = row };
             _ = self.refill.run(io, k, &ctx, RefillCtx.compute) catch |e| switch (e) {
                 error.StorageFull => {
-                    // OQ-1: ONE aggregated line, the arm stops for the batch.
+                    // OQ-1: the arm stops for the batch, counted once per
+                    // stop. The loud line is the plane's full-store
+                    // episode's (`enospc.FullStoreEpisode`, one per
+                    // episode): a batch is one fsync, so a line here was
+                    // one per fsync on a full store (generic/475: ×41).
                     if (!self.stopped.swap(true, .acq_rel)) {
                         stats.pack_refill_storage_full.inc();
-                        log.warn("pack refill: vol {x:0>16} has no free block for the open pack — the packed arm stops for the rest of this promotion batch (own-block arm continues)", .{k.vol_tag});
+                        log.debug("pack refill: vol {x:0>16} has no free block for the open pack — the packed arm stops for the rest of this promotion batch", .{k.vol_tag});
                     }
                     continue;
                 },
@@ -1752,7 +1759,7 @@ test "commitLocked re-checks the identity under the caller's stripe + layout loc
     try testing.expectEqual(@as(u32, 2), World.refcount(&f.world, 0x11, 0));
 }
 
-test "a DMA error releases the tenant and errors (nothing published); a StorageFull refill stops the arm for the batch (ONE warn) and beginPromotionBatch re-arms it" {
+test "a DMA error releases the tenant and errors (nothing published); a StorageFull refill stops the arm for the batch (counted once; the loud line is the plane's full-store episode's) and beginPromotionBatch re-arms it" {
     const gpa = testing.allocator;
     const io = testing.io;
     const f = try Fixture.init(gpa);

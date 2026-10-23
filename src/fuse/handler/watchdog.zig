@@ -164,6 +164,9 @@ pub const OpSlot = struct {
     unique: u64 = 0,
     /// The coarse clock at the claim.
     start_ns: u64 = 0,
+    /// A second directory the kernel locks for the op (a rename's new
+    /// parent; 0 = none): `hasOpOn` judges both.
+    ino2: u64 = 0,
 
     pub fn setStation(self: *OpSlot, s: op_trace.Stage) void {
         self.station.store(@backingInt(s), .monotonic);
@@ -187,6 +190,13 @@ var next_home: std.atomic.Value(u32) = .init(0);
 pub const CensusHook = struct {
     ctx: *anyopaque,
     call: *const fn (ctx: *anyopaque) void,
+};
+
+/// The sideband's question of the registry: does this daemon owe a reply
+/// on a request whose kernel-side directory is `ino`?
+pub const InFlightProbe = struct {
+    ctx: *anyopaque,
+    hasOpOn: *const fn (ctx: *anyopaque, ino: u64) bool,
 };
 
 pub const Registry = struct {
@@ -269,6 +279,7 @@ pub const Registry = struct {
                 if (s.state.cmpxchgWeak(0, 1, .acq_rel, .monotonic) != null) continue;
                 s.opcode = @backingInt(opcode);
                 s.ino = ino;
+                s.ino2 = 0;
                 s.unique = unique;
                 s.start_ns = self.coarse_now_ns.load(.monotonic);
                 s.station.store(0, .monotonic);
@@ -313,6 +324,28 @@ pub const Registry = struct {
             if (s.state.load(.acquire) != 0) n += 1;
         }
         return n;
+    }
+
+    /// Is a request in flight whose kernel-side directory is `ino` (its
+    /// nodeid, or a rename's new parent)? The sideband's law (decision
+    /// 0003 §AB.2): a `FUSE_NOTIFY_INVAL_ENTRY` for such a parent would
+    /// park in the kernel on its `i_rwsem`, which the request holds.
+    pub fn hasOpOn(self: *const Registry, ino: u64) bool {
+        for (self.slots) |*s| {
+            // acquire pairs with the claim's acq_rel CAS.
+            if (s.state.load(.acquire) == 0) continue;
+            if (s.ino == ino or s.ino2 == ino) return true;
+        }
+        return false;
+    }
+
+    pub fn inFlightProbe(self: *Registry) InFlightProbe {
+        return .{ .ctx = self, .hasOpOn = &hasOpOnFn };
+    }
+
+    fn hasOpOnFn(ctx: *anyopaque, ino: u64) bool {
+        const self: *Registry = @ptrCast(@alignCast(ctx));
+        return self.hasOpOn(ino);
     }
 
     pub const TickReport = struct { in_flight: u32, overdue: u32 };
@@ -490,6 +523,28 @@ test "registry: claim/release recycle; a slot owns its cache line; exhaustion de
     try testing.expectEqual(@as(u32, 0), reg.inFlight());
     // Two adjacent slots are 64 bytes apart: no shared line.
     try testing.expectEqual(@as(usize, 64), @intFromPtr(&reg.slots[1]) - @intFromPtr(&reg.slots[0]));
+}
+
+test "registry: hasOpOn names a claimed slot's directory and a rename's second parent, nothing after the release, and a recycled slot forgets its predecessor's second parent" {
+    var reg = try Registry.init(testing.allocator, 1);
+    defer reg.deinit();
+    const probe = reg.inFlightProbe();
+    try testing.expect(!probe.hasOpOn(probe.ctx, 1));
+    const create = reg.claim(.create, 1, 10).?;
+    const rename = reg.claim(.rename2, 5, 11).?;
+    rename.ino2 = 9;
+    try testing.expect(reg.hasOpOn(1));
+    try testing.expect(reg.hasOpOn(5));
+    try testing.expect(reg.hasOpOn(9));
+    try testing.expect(!reg.hasOpOn(2));
+    reg.release(create);
+    try testing.expect(!probe.hasOpOn(probe.ctx, 1));
+    reg.release(rename);
+    try testing.expect(!reg.hasOpOn(9));
+    const again = reg.claim(.lookup, 5, 12).?;
+    defer reg.release(again);
+    try testing.expectEqual(@as(u64, 0), again.ino2);
+    try testing.expect(!reg.hasOpOn(9));
 }
 
 test "watchdog tick: an op past its class threshold is reported with op/ino/age/station and counted per observation; it vanishes at release; the scan covers every shard" {

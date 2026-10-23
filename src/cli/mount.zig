@@ -735,6 +735,13 @@ fn mountMain(ctx: *Ctx) u8 {
     // The wedge census names the drain workers' state while the session stands.
     registry.setCensusHook(session.censusHook());
     defer registry.setCensusHook(null);
+    // The sideband never `inode_lock`s a directory this daemon owes a reply
+    // on (decision 0003 §AB.2): it judges every `INVAL_ENTRY`'s parent
+    // against the registry (the probe outlives the session: a stack value
+    // of this frame, cleared before the session goes).
+    const in_flight_probe = registry.inFlightProbe();
+    session.setInFlightProbe(&in_flight_probe);
+    defer session.setInFlightProbe(null);
     // An early exit from here on ends every move park BEFORE the session's
     // teardown joins its handlers (the serve path closes it explicitly).
     defer moves.close();

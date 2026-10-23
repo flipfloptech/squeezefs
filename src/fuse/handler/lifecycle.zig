@@ -319,6 +319,11 @@ pub fn Dispatcher(comptime Transport: type) type {
             defer trace.finish();
             const wd = self.registry.claim(op, meta.nodeid, meta.unique);
             defer if (wd) |s| self.registry.release(s);
+            // A rename's kernel holds BOTH parents' `i_rwsem` (`lock_rename`).
+            if (wd) |s| switch (req) {
+                .rename, .rename2 => |a| s.ino2 = a.newdir,
+                else => {},
+            };
             var ctx: Ctx = .{
                 .unique = meta.unique,
                 .uid = meta.uid,

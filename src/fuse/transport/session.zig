@@ -150,6 +150,13 @@ pub var notify_epochs_sent: counters.ShardedCounter = .{};
 /// `transport_notify_nb_waits`: a caller of a non-blocking notify waited
 /// for a reserved cell.
 pub var notify_nb_waits: counters.ShardedCounter = .{};
+/// `transport_notify_entry_epochs_substituted`: an `INVAL_ENTRY` whose
+/// parent this daemon owes a reply on was written as an `INC_EPOCH`
+/// instead (decision 0003 §AB.2): the kernel's `fuse_reverse_inval_entry`
+/// takes the parent's `i_rwsem`, which the in-flight request holds, so
+/// the sideband would park behind its own daemon's op; the epoch bump is
+/// an atomic increment and every dentry revalidates at its next walk.
+pub var notify_entry_epochs_substituted: counters.ShardedCounter = .{};
 /// `transport_sideband_recycle_respins`: a sideband cell given back met its
 /// free list's cell still held by a taker between its dequeue CAS and its
 /// sequence store (the ring holds the pool's whole population, so the
@@ -320,6 +327,9 @@ const SbCell = struct {
     iov: [2]std.posix.iovec_const = undefined,
     /// Nobody waits: the sideband recycles the cell at the CQE.
     fire_and_forget: bool = true,
+    /// An `INVAL_ENTRY` frame's parent (0 = another frame): judged against
+    /// the in-flight registry at the write (`writeEntryOrEpoch`).
+    entry_parent: u64 = 0,
 };
 
 /// One of the sideband's cell pools: its free list — a ring holding the
@@ -464,12 +474,14 @@ const Sideband = struct {
         while (true) {
             if (self.pool.free.tryPop()) |i| {
                 self.cells[i].done.reset();
+                self.cells[i].entry_parent = 0;
                 return i;
             }
             if (!wait) return null;
             const gen = self.pool.freed.load(.acquire);
             if (self.pool.free.tryPop()) |i| {
                 self.cells[i].done.reset();
+                self.cells[i].entry_parent = 0;
                 return i;
             }
             // The lock plane's ticked park: a lost recycle costs one tick.
@@ -545,16 +557,45 @@ const Sideband = struct {
     /// `INVAL_ENTRY` from the shared pool, never waiting (its write waits
     /// on the parent's `i_rwsem`, which a request may hold while it waits
     /// on this very caller); no cell ⇒ the loop owes the kernel an epoch.
+    /// The parent rides the cell: the loop judges it against the in-flight
+    /// registry right before the write (`writeEntryOrEpoch`).
     fn notifyEntryOrEpoch(self: *Sideband, parent: u64, name: []const u8) void {
         if (self.disconnected or self.stop.load(.acquire)) return;
         if (self.takeCell(false)) |idx| {
             if (self.fillNotify(idx, codec.notifyInvalEntry, .{ parent, name, @as(u32, 0) })) |_| {
+                self.cells[idx].entry_parent = parent;
                 self.publish(idx);
                 return;
             } else |_| {}
         }
         notify_epochs_owed.inc();
         self.oweEpoch();
+    }
+
+    /// The loop's half of an `INVAL_ENTRY` (decision 0003 §AB.2): a parent
+    /// this daemon owes a reply on is NEVER `inode_lock`ed by this thread —
+    /// the kernel's `fuse_reverse_inval_entry` would park on the `i_rwsem`
+    /// the request holds (`lookup_open`, mkdir, unlink, rename hold it
+    /// exclusively; a lookup or readdir shared) for the op's whole life,
+    /// with every FORGET, classical reply and awaited notify behind it and
+    /// the daemon's own exit after them. The frame is rewritten in place
+    /// as an `INC_EPOCH`: an atomic increment the kernel takes with no
+    /// lock, after which every dentry revalidates at its next walk (its
+    /// coverage contains the name's). An op that arrives between this
+    /// check and the kernel's lock parks the write for that op's duration
+    /// alone — nothing of the op's depends on this thread.
+    fn writeEntryOrEpoch(self: *Sideband, idx: u32) void {
+        const c = &self.cells[idx];
+        const parent = c.entry_parent;
+        c.entry_parent = 0;
+        if (parent == 0) return;
+        const probe = self.session.in_flight.load(.acquire) orelse return;
+        if (!probe.hasOpOn(probe.ctx, parent)) return;
+        const frame = codec.notifyIncEpoch(&c.buf) catch return;
+        c.head_len = frame.head.len;
+        c.body = frame.body;
+        notify_entry_epochs_substituted.inc();
+        notify_epochs_sent.inc();
     }
 
     /// The loop writes an `INC_EPOCH` at its next turn.
@@ -708,6 +749,7 @@ const Sideband = struct {
     }
 
     fn pushWrite(self: *Sideband, idx: u32) void {
+        self.writeEntryOrEpoch(idx);
         const c = &self.cells[idx];
         const sqe = self.ring.getSqe() orelse {
             self.completeCell(idx, -@as(i32, @intCast(@backingInt(linux.E.AGAIN))));
@@ -897,6 +939,10 @@ pub const Session = struct {
     tx: fsv.Tx = undefined,
     sideband: Sideband = undefined,
     have_sideband: bool = false,
+    /// The handler's in-flight registry, bound by the daemon once the
+    /// session stands (release; the sideband's acquire): an `INVAL_ENTRY`
+    /// for a parent with a request in flight is written as an `INC_EPOCH`.
+    in_flight: std.atomic.Value(?*const watchdog.InFlightProbe) = .init(null),
     arena_component: mem_budget.Component = undefined,
     /// The lattice rung and the verdicts it was decided from.
     mode: geometry.BufferMode = .user_ents,
@@ -1132,6 +1178,12 @@ pub const Session = struct {
     /// §AB.2): no free cell ⇒ the sideband writes an `INC_EPOCH` instead.
     pub fn notifyInvalEntryOwed(self: *Session, parent: u64, name: []const u8) void {
         self.sideband.notifyEntryOrEpoch(parent, name);
+    }
+
+    /// Bind (or clear with null) the in-flight registry the sideband judges
+    /// an `INVAL_ENTRY`'s parent against; the probe outlives the session.
+    pub fn setInFlightProbe(self: *Session, probe: ?*const watchdog.InFlightProbe) void {
+        self.in_flight.store(probe, .release);
     }
 
     /// `FUSE_NOTIFY_INC_EPOCH` (every dentry stale at its next walk):
@@ -2327,6 +2379,7 @@ pub const Session = struct {
         try field(w, "transport_notify_epochs_owed", notify_epochs_owed.load());
         try field(w, "transport_notify_epochs_sent", notify_epochs_sent.load());
         try field(w, "transport_notify_nb_waits", notify_nb_waits.load());
+        try field(w, "transport_notify_entry_epochs_substituted", notify_entry_epochs_substituted.load());
         try field(w, "transport_sideband_recycle_respins", sideband_recycle_respins.load());
         try field(w, "transport_notify_pending", notify_pending.load());
         try w.print("\"transport_notify_dropped\":{d}", .{notify_dropped.load()});
@@ -3496,6 +3549,66 @@ test "e2e: notify frames ride the sideband — INVAL_INODE on a held inode succe
     try testing.expectEqual(@as(u64, 3), (notify_sent.load() + notify_enoent.load() + notify_failed.load()) - (sent + enoent + failed));
     try testing.expect(notify_sent.load() - sent >= 1);
     try testing.expect(notify_enoent.load() - enoent >= 1);
+}
+
+test "e2e: the sideband never inode_locks a directory this daemon owes a reply on (decision 0003 §AB.2) — an INVAL_ENTRY whose parent the in-flight registry names is written as an INC_EPOCH (substituted +1, epochs_sent +1, the dentry still revalidates: the next stat is a LOOKUP); one whose parent is free, or with no registry bound, is written as itself" {
+    if (venueMissing()) |why| return testkit.skipWhy(@src(), why);
+    const rig = try Rig.init(testing.allocator, 8, &.{});
+    defer rig.deinit();
+    const s = try rig.mountIt(.{ .mem_budget_bytes = 0 });
+    var pb: [256]u8 = undefined;
+    _ = try statSize(rig.child(&pb, "hello"));
+    const Probe = struct {
+        busy: u64,
+        fn hasOpOn(ctx: *anyopaque, ino: u64) bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return ino == self.busy;
+        }
+    };
+    var probe: Probe = .{ .busy = EchoFs.ino_root };
+    const seam: watchdog.InFlightProbe = .{ .ctx = &probe, .hasOpOn = &Probe.hasOpOn };
+    const Count = struct {
+        fn settled() u64 {
+            return notify_sent.load() + notify_enoent.load() + notify_failed.load();
+        }
+        fn waitSettled(n: u64) void {
+            const deadline = clock.monotonicNs() + 5 * std.time.ns_per_s;
+            while (settled() < n and clock.monotonicNs() < deadline) std.Thread.yield() catch {};
+        }
+    };
+    // The parent has a request in flight: the epoch, never the lock.
+    s.setInFlightProbe(&seam);
+    const sub0 = notify_entry_epochs_substituted.load();
+    const ep0 = notify_epochs_sent.load();
+    const sent0 = notify_sent.load();
+    const settled0 = Count.settled();
+    const forgets0 = rig.fs.forgets.load(.monotonic);
+    s.notifyInvalEntryOwed(EchoFs.ino_root, "hello");
+    Count.waitSettled(settled0 + 1);
+    try testing.expectEqual(sub0 + 1, notify_entry_epochs_substituted.load());
+    try testing.expectEqual(ep0 + 1, notify_epochs_sent.load());
+    try testing.expectEqual(sent0 + 1, notify_sent.load());
+    // The epoch moved under the kernel: the next walk finds the cached
+    // dentry invalid (`fuse_dentry_revalidate`'s epoch arm), drops it —
+    // its inode's FORGET follows — and looks the name up anew.
+    _ = try statSize(rig.child(&pb, "hello"));
+    const forget_deadline = clock.monotonicNs() + 5 * std.time.ns_per_s;
+    while (rig.fs.forgets.load(.monotonic) == forgets0 and clock.monotonicNs() < forget_deadline) std.Thread.yield() catch {};
+    try testing.expect(rig.fs.forgets.load(.monotonic) > forgets0);
+    // Another parent is free: the name itself.
+    probe.busy = EchoFs.ino_hello;
+    const settled1 = Count.settled();
+    s.notifyInvalEntryOwed(EchoFs.ino_root, "hello");
+    Count.waitSettled(settled1 + 1);
+    try testing.expectEqual(sub0 + 1, notify_entry_epochs_substituted.load());
+    try testing.expectEqual(ep0 + 1, notify_epochs_sent.load());
+    // No registry bound: the name itself.
+    s.setInFlightProbe(null);
+    const settled2 = Count.settled();
+    s.notifyInvalEntryOwed(EchoFs.ino_root, "hello");
+    Count.waitSettled(settled2 + 1);
+    try testing.expectEqual(sub0 + 1, notify_entry_epochs_substituted.load());
+    try testing.expectEqual(settled2 + 1, Count.settled());
 }
 
 test "e2e lattice: every probe verdict on this kernel (kmbuf present with its pair, zc present with CapEff, retention present, TIME_LIMITS present); auto mounts ZeroCopy with width 1, retention armed, no user arena; the gauges publish" {

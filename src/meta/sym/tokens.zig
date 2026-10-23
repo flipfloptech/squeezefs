@@ -28,6 +28,7 @@ pub const divert = @import("tokens/read_divert.zig");
 pub const ro = @import("tokens/ro_mount.zig");
 pub const grant_gate_model = @import("tokens/grant_gate_model.zig");
 pub const serve_stamp_model = @import("tokens/serve_stamp_model.zig");
+pub const recall_notify_model = @import("tokens/recall_notify_model.zig");
 pub const smoke = if (builtin.os.tag == .linux) @import("tokens/smoke_linux.zig") else struct {};
 
 pub const Holder = table.Holder;
@@ -101,6 +102,7 @@ test {
     _ = ro;
     _ = grant_gate_model;
     _ = serve_stamp_model;
+    _ = recall_notify_model;
     if (builtin.os.tag == .linux) _ = smoke;
 }
 

@@ -126,9 +126,32 @@ reply refreshes that view). Intermittent (10 of 11 sub-cases' `mpD/dir`/`mpC/dir
 same shape): it needs the member to hold a token on the root at its first create. The other members
 of the set stayed healthy; fsck clean; 409–411 passed the same shape many times in this run.
 
-## The broader confidence run
+## The broader confidence run (head `88945fa`, rebased on `07d0e74`)
 
-BROADER-RESULTS-PLACEHOLDER
+`FSTESTS_TESTS` = the `mount` group (050 067 085 491 604 620 632 633 644 645 656 696 697 698 699 766
+783 805) + 001 013 034 563 (`suites-fstests-20261023-114143-1198778`, 92 s wall): **8 PASS** — 001
+(7 s), 013 (14 s), 034 (6 s), 067 (7 s), 604 (6 s: the `umount &` + `mount` race, now under a
+symmetric set), 620 (3 s: the 17 TB hugedisk), 632 (2 s), 696 (5 s); **13 `_notrun`** on the kernel
+module's features (shutdown ×2, freeze ×3, idmapped ×5, ACLs ×2, casefold ×1); **1 failed =
+generic/563**, adjudicated `by-design-fuse-io-charge` (fails on, as it must). 0 alert lines on every
+set (test, scratch, `huge-test.620`, `loop2`); fsck 0 findings on both sets. (A subset run ends
+"ledger rc 3" on the rows it did not exercise, by design.)
+
+pjdfstest ×1 (`SUITE_RUNS=1`, the set `SYMMETRIC_PLANE stamped`; `suites-pjdfstest-20261023-114225-1210491`):
+**PASSED** — Files=238, Tests=8798, 0 failing subtests, 9 suite-declared TODOs, 205 s wall, 0 alert
+lines, fsck 0 findings, 0 ledger rows exercised.
+
+mdtest ×1 (`SUITE_RUNS=1`, -np 32 and 64, -n 10000 -u; `suites-mdtest-20261023-114600-1296402`):
+**PASSED** — -np 32 in 34 s (file creation 79,185/s, file stat 7.2 M/s, directory creation 57,118/s),
+-np 64 in 68 s (file creation 70,039/s, directory creation 53,944/s), `df` back to its baseline after
+3 s / 7 s, the mount healthy after each leg (tripwires 0, watchdog never overdue), 0 alert lines, fsck
+0 findings; 7,051,260 FUSE ops and 1,280,065 destroys at -np 64. The class costs nothing there.
+
+generic/732's own cleanup unmounts the MANAGER before the joiner (`_unmount $testdir1; _unmount
+$testdir2`): the joiner, parked without a manager, logs `appender 1 could not leave cleanly (Io) —
+its page stays Live for the next open's recovery` and one `kv checkpoint tick failed … Io` — the
+defined outcome (the next open recovers the page; fsck 0 findings), counted by the suite's alert
+census as the run's evidence (6 lines on the scratch set), not a failure.
 
 ## Seen, not fixed
 

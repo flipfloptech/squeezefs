@@ -74,6 +74,19 @@ pub const PoisonSink = struct {
     poison: *const fn (ctx: ?*anyopaque, reason: []const u8) void,
 };
 
+/// `T_self` judged by a COMMITTER at the pre-admission gate (charter §5.5
+/// "Two lease clocks": the deadline is the member's clock, never its
+/// beat's liveness). The beat judges it too, but the beat makes wire
+/// calls — the census, the re-point's dial, the endpoint's re-publication,
+/// a set-config learn — each bounded only by the dialer's reply bound, so
+/// a stalled beat let a LIVE member commit past `T_owner` while its home
+/// shard evicted it and recovered its region (the zombie writer). Bound by
+/// the member (`shard.Member.selfFenceSeam`): parks the gate when due.
+pub const SelfFence = struct {
+    ctx: *anyopaque,
+    fenceIfDue: *const fn (ctx: *anyopaque, now_ms: u64, now_mono_ns: u64) void,
+};
+
 pub const Pass = struct { gate: *ParkGate };
 
 pub const AckVerdict = enum { ok, eio };
@@ -91,10 +104,19 @@ pub const ParkGate = struct {
     /// crash shape on every volume.
     leave_refused: std.atomic.Value(bool) = .init(false),
     acks_held: std.atomic.Value(u32) = .init(0),
+    /// The member's `T_self` judgement for the committers (`bindSelfFence`
+    /// once the first grant is learnt; null = the beat's alone).
+    self_fence: ?SelfFence = null,
 
     /// `arm_symmetric_appender(home_volume, t_park_max)`.
     pub fn arm(io: Io, home_volume: u16, t_park_max_ms: u64) ParkGate {
         return .{ .io = io, .home_volume = home_volume, .t_park_max_ms = t_park_max_ms };
+    }
+
+    /// Bound by the joined half once the member learnt its first grant
+    /// (before it there is no deadline to judge).
+    pub fn bindSelfFence(self: *ParkGate, f: SelfFence) void {
+        self.self_fence = f;
     }
 
     pub fn word(self: *const ParkGate) Word {
@@ -138,11 +160,20 @@ pub const ParkGate = struct {
 
     /// The pre-admission gate consulted BEFORE ring admission: while PARKED
     /// a committer registers, re-checks and awaits `admission_wake`; it
-    /// never feeds the journal-failure escalation. EXPIRED fails it.
+    /// never feeds the journal-failure escalation. EXPIRED fails it. A
+    /// RUNNING gate judges `T_self` first (`SelfFence`): a committer past
+    /// the member's deadline parks the gate itself and waits like the rest.
     pub fn preAdmission(self: *ParkGate) error{Expired}!void {
         while (true) {
             switch (self.word()) {
-                .running => return,
+                .running => {
+                    if (self.self_fence) |f| {
+                        const now = clock.monotonicNs();
+                        f.fenceIfDue(f.ctx, now / std.time.ns_per_ms, now);
+                        if (self.word() != .running) continue;
+                    }
+                    return;
+                },
                 .expired => return error.Expired,
                 .parked => {},
             }
@@ -161,9 +192,11 @@ pub const ParkGate = struct {
 
     /// The parker's half: store PARKED (SeqCst), then load `inflight`
     /// (SeqCst) — what it saw in flight IS the acks the hold keeps. Answers
-    /// the in-flight count; a second park of a parked gate is idempotent.
-    pub fn park(self: *ParkGate, now_mono_ns: u64) u32 {
-        if (self.state.cmpxchgStrong(@backingInt(Word.running), @backingInt(Word.parked), .seq_cst, .seq_cst) != null) return self.inflight.load(.seq_cst);
+    /// the in-flight count when THIS call parked; null when the gate was
+    /// already parked or expired (a second park is idempotent — the CAS is
+    /// the one latch between the beat and the committers judging `T_self`).
+    pub fn park(self: *ParkGate, now_mono_ns: u64) ?u32 {
+        if (self.state.cmpxchgStrong(@backingInt(Word.running), @backingInt(Word.parked), .seq_cst, .seq_cst) != null) return null;
         self.parked_at_mono_ns.store(now_mono_ns, .release);
         const inflight = self.inflight.load(.seq_cst);
         stats.appender_parks.inc();
@@ -239,10 +272,13 @@ pub const ParkGate = struct {
         return true;
     }
 
-    /// A leave or shutdown over a standing park is REFUSED set-wide (the
-    /// latch stays: a parked appender's dismount is the crash shape).
+    /// A leave or shutdown over a standing park — or past the poison — is
+    /// REFUSED set-wide (the latch stays: a parked or FENCED appender's
+    /// dismount is the crash shape; a fenced one's region is already the
+    /// successor's, recovered from the ring and the page as it left them,
+    /// so a release written from here would land on a recovered region).
     pub fn leaveAllowed(self: *ParkGate) bool {
-        if (!self.isParked()) return true;
+        if (self.word() == .running) return true;
         self.leave_refused.store(true, .release);
         stats.appender_park_leave_refusals.inc();
         return false;
@@ -254,14 +290,16 @@ pub const ParkGate = struct {
 };
 
 /// `fence_at_t_self`: the ONE place the class splits — remote custody
-/// poisons, the symmetric appender parks.
-pub fn fenceAtTSelf(class: FenceClass, gate: ?*ParkGate, sink: PoisonSink, now_mono_ns: u64) void {
+/// poisons, the symmetric appender parks. True iff THIS call acted (the
+/// park landed here; a poison always does).
+pub fn fenceAtTSelf(class: FenceClass, gate: ?*ParkGate, sink: PoisonSink, now_mono_ns: u64) bool {
     switch (class) {
         .remote_custody => {
             stats.remote_custody_poisons.inc();
             sink.poison(sink.ctx, "T_self reached on a remote-custody lease");
+            return true;
         },
-        .symmetric_appender => _ = gate.?.park(now_mono_ns),
+        .symmetric_appender => return gate.?.park(now_mono_ns) != null,
     }
 }
 
@@ -333,11 +371,14 @@ test "the seven steps: a running gate admits; the park holds the in-flight count
     try testing.expectEqual(@as(u32, 1), g.inflight.load(.seq_cst));
     const parks0 = stats.appender_parks.load();
     // Step 1: T_self on the symmetric class parks (the remote class poisons).
-    fenceAtTSelf(.remote_custody, &g, p.sink(), 10);
+    try testing.expect(fenceAtTSelf(.remote_custody, &g, p.sink(), 10));
     try testing.expectEqual(@as(u32, 1), p.count);
     try testing.expect(!g.isParked());
-    fenceAtTSelf(.symmetric_appender, &g, p.sink(), 10);
+    try testing.expect(fenceAtTSelf(.symmetric_appender, &g, p.sink(), 10));
     try testing.expect(g.isParked());
+    // A second park is idempotent: not this call's.
+    try testing.expect(!fenceAtTSelf(.symmetric_appender, &g, p.sink(), 11));
+    try testing.expectEqual(@as(?u32, null), g.park(12));
     try testing.expectEqual(parks0 + 1, stats.appender_parks.load());
     try testing.expectEqual(@as(u64, 1), stats.appender_parked.load());
     // Step 2: a new committer withdraws; the in-flight one lands (its ack held).
@@ -366,7 +407,7 @@ test "the seven steps: a running gate admits; the park holds the in-flight count
     try testing.expectEqual(@as(u32, 1), p.count);
 }
 
-test "step 5 / the terminal poison: a park past T_park_max expires exactly once — the tripwire fires, the sink poisons, acks fail EIO, the pre-admission fails, expiry and release are exclusive; UnknownLease expires now" {
+test "step 5 / the terminal poison: a park past T_park_max expires exactly once — the tripwire fires, the sink poisons, acks fail EIO, the pre-admission fails, the leave is refused (the crash shape), expiry and release are exclusive; UnknownLease expires now" {
     var g = ParkGate.arm(testing.io, 0, 100);
     var p: Poison = .{};
     _ = g.park(1_000_000);
@@ -381,6 +422,9 @@ test "step 5 / the terminal poison: a park past T_park_max expires exactly once 
     try testing.expect(g.isExpired() and !g.admitsTokenService());
     try testing.expectEqual(AckVerdict.eio, g.holdAck());
     try testing.expectError(error.Expired, g.preAdmission());
+    // A fenced member's dismount is the crash shape: nothing durable.
+    try testing.expect(!g.leaveAllowed());
+    try testing.expect(g.leave_refused.load(.acquire));
     try testing.expect(!g.release(0, 0));
     try testing.expectEqual(ReclaimVerdict.fenced, reclaimUnderPark(&g, .granted, 2_000_000, 0, p.sink()));
     try testing.expectEqual(tw0 + 1, stats.appender_park_expiries.load());
@@ -395,12 +439,14 @@ test "step 5 / the terminal poison: a park past T_park_max expires exactly once 
     try testing.expectEqual(@as(u32, 2), p.count);
 }
 
-const Committer = struct {
+/// A committer through the gate (the pre-admission, the entry, the held
+/// ack): this module's and the shard's tests.
+pub const TestCommitter = struct {
     gate: *ParkGate,
     entered: bool = false,
     verdict: AckVerdict = .ok,
 
-    fn run(self: *Committer) void {
+    pub fn run(self: *TestCommitter) void {
         self.gate.preAdmission() catch return;
         if (self.gate.tryEnter()) |pass| {
             self.entered = true;
@@ -413,8 +459,8 @@ const Committer = struct {
 test "a committer parked at the pre-admission gate wakes on the release and lands; one parked on the ack hold wakes with ok" {
     var g = ParkGate.arm(testing.io, 0, 1 << 40);
     _ = g.park(1);
-    var c: Committer = .{ .gate = &g };
-    const th = try std.Thread.spawn(.{}, Committer.run, .{&c});
+    var c: TestCommitter = .{ .gate = &g };
+    const th = try std.Thread.spawn(.{}, TestCommitter.run, .{&c});
     // Let the committer reach the park (bounded spin on the waiter count).
     var spins: u32 = 0;
     while (g.admission_wake.waiters(testing.io) == 0 and spins < 1_000_000) : (spins += 1) std.Thread.yield() catch {};

@@ -250,6 +250,13 @@ pub const LeaseTable = struct {
         if (self.moves.load(.acquire)) |m| m.bump();
     }
 
+    /// The mount fail-stopped (its poison): no move resolves for it any
+    /// more — every caller parked on the epoch answers at once, no later
+    /// one waits.
+    pub fn closeMoves(self: *LeaseTable) void {
+        if (self.moves.load(.acquire)) |m| m.close();
+    }
+
     // ---- the recorded tails (rule 2's input) ----
 
     /// A release (or a recovery, or the arm's load of tree 0) recorded the

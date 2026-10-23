@@ -4955,6 +4955,204 @@ test "smoke: A DEAD MANAGER HOLDING A STRIPED HOT DIRECTORY (rung 10 recovery it
     _ = try fsckClean(rig, "the dead manager holding a striped directory");
 }
 
+/// How long a POISONED mount may take to answer an op that was parked or
+/// arrives after the poison: charter §5's fail-stop ("the daemon answers,
+/// never holds") within the lattice's bound — the op watchdog's 5 s
+/// station report plus the storm's retry pause, with headroom for a
+/// loaded venue. Far below the kernel's 135 s request timeout and the
+/// runner's hang limit, so a held op is a RED row, never a hung shard.
+const poison_fail_stop_bound_s: u64 = 20;
+
+/// Every `/proc/<pid>/task/*` kernel stack of a process (a storm child's
+/// FUSE wait): the diagnosis a held op prints.
+fn printKernelStacks(io: Io, pid: linux.pid_t) void {
+    var pb: [64]u8 = undefined;
+    var dir = Io.Dir.cwd().openDir(io, std.fmt.bufPrint(&pb, "/proc/{d}/task", .{pid}) catch return, .{ .iterate = true }) catch return;
+    defer dir.close(io);
+    var it = dir.iterate();
+    while (it.next(io) catch null) |ent| {
+        var sp: [96]u8 = undefined;
+        var wb: [64]u8 = undefined;
+        var wchan_buf: [64]u8 = undefined;
+        var buf: [4096]u8 = undefined;
+        const wchan = Io.Dir.cwd().readFile(io, std.fmt.bufPrint(&wb, "/proc/{d}/task/{s}/wchan", .{ pid, ent.name }) catch continue, &wchan_buf) catch "?";
+        std.debug.print("  task {s} wchan {s}\n", .{ ent.name, wchan });
+        const stack = Io.Dir.cwd().readFile(io, std.fmt.bufPrint(&sp, "/proc/{d}/task/{s}/stack", .{ pid, ent.name }) catch continue, &buf) catch continue;
+        std.debug.print("{s}", .{stack});
+    }
+}
+
+/// Abort the FUSE connection under `mp` through fusectl (what the hang
+/// watch does for a hung shard): every parked request returns EIO/ECONNABORTED
+/// and a child parked in one can be reaped. The row's RED path only.
+fn abortFuseConnectionOf(io: Io, mp: []const u8) void {
+    var mi_buf: [1 << 16]u8 = undefined;
+    const table = Io.Dir.cwd().readFile(io, "/proc/self/mountinfo", &mi_buf) catch return;
+    const minor = transport.session.mountinfoMinor(table, mp) orelse return;
+    var ab: [96]u8 = undefined;
+    const abort_path = std.fmt.bufPrintSentinel(&ab, "{s}/{d}/abort", .{ transport.session.fusectl_connections, minor }, 0) catch return;
+    const afd = linux.open(abort_path.ptr, .{ .ACCMODE = .WRONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(afd) != .SUCCESS) return;
+    _ = linux.write(@intCast(afd), "1", 1);
+    _ = linux.close(@intCast(afd));
+    std.debug.print("smoke: aborted the FUSE connection of {s} (minor {d}) so the row ends instead of hanging the shard\n", .{ mp, minor });
+}
+
+test "smoke: A LIVE MEMBER EVICTED AT T_OWNER UNDER THE DEAD MANAGER'S STRIPED HOT DIRECTORY (the flakes ledger's second shape, 2026-10-22) — A (the manager) holds `hot` striped over K = 64; B JOINED storms creates into it → kill -9 A ⇒ B PARKS at T_self → remount A (term 2) → B's reclaim lands in the grace window → B's member beat is HELD (SQUEEZEFS_TEST_MEMBERSHIP_BEAT_HOLD: no renewal, no reclaim beat, every other thread serving the storm) past T_owner ⇒ B's COMMITTERS park the gate at T_self on the member's own clock (its second park, with the beat still held: no commit past T_self), A evicts the silent B at T_owner (`tick — 1 evicted`) and recovers its region → released: the beat's reclaim meets the closed grace ⇒ UnknownLease ⇒ B POISONED (every volume FAILED, the move epoch closed) → the fail-stop: the storm's parked create and a fresh one answer EIO at once (never held), the storm child ends when told, `umount B` completes with the crash shape (no release, no page write; exit 1), A serves `hot` on (ls = find), no tripwire on A → fsck --offline --scrub 0 findings (red: a create held at the move gate for T_park_max per op, the storm child unkillable, the shard hung in wait4; B committed through the hold and its stop released 61 recovered slots: A's lookup wedged past the 51 s request timeout)" {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    try rig.env.put("SQUEEZEFS_MW_BIND", "127.0.0.1:0");
+    var t_owner_text: [8]u8 = undefined;
+    try rig.env.put("SQUEEZEFS_TEST_MEMBERSHIP_T_OWNER_MS", try std.fmt.bufPrint(&t_owner_text, "{d}", .{smoke_t_owner_ms}));
+    // The hold's FIFO is NAMED now and CREATED when the hold should begin.
+    var fb: [linux.PATH_MAX]u8 = undefined;
+    const fifo = try std.fmt.bufPrintSentinel(&fb, "{s}/beat.fifo", .{rig.work}, 0);
+    try rig.env.put("SQUEEZEFS_TEST_MEMBERSHIP_BEAT_HOLD", fifo);
+    try rig.formatSetWith(false, &.{});
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(0);
+    const b = try Peer.init(rig, "b");
+    defer b.deinit();
+    b.node = kill_peer_node;
+    try b.spawn(&.{});
+    _ = try b.awaitReady();
+    {
+        const mk = try rig.onMount("mkdir hot");
+        gpa.free(mk);
+        var sbuf: [256]u8 = undefined;
+        const out = try rig.onMount(try setStripesScript(&sbuf, "hot", 64));
+        gpa.free(out);
+    }
+    var storm_b = try Storm.start(rig, b.mp, "b", "b");
+    var storm_done = false;
+    defer if (!storm_done) storm_b.deinit(rig);
+    var released = false;
+    defer if (!released) releaseHold(fifo);
+    {
+        const warm = try awaitAtLeast(b, "\"dir_stripe_routed_mutations\":", stripe_matrix_phase_floor, kill_row_wait_ns);
+        gpa.free(warm);
+    }
+    // The first park and the reclaim: the DEAD MANAGER row's shape.
+    try rig.kill();
+    _ = try b.awaitLog("appender park: T_self reached with the home volume 0's manager unreachable — parked", 0, kill_row_wait_ns);
+    var mark = try rig.logLen();
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(mark);
+    {
+        const reclaimed = try awaitStats(b, &.{.{ .key = "\"appender_parked\":", .want = 0 }}, kill_row_wait_ns);
+        defer gpa.free(reclaimed);
+        try testing.expectEqual(@as(?u64, 0), numberAfter(reclaimed, "\"appender_park_expiries\":"));
+    }
+    const first_park_end = try b.awaitLog("admitted the reclaim", 0, kill_row_wait_ns);
+    // The hold: B's beat parks at its next tick; the storm goes on.
+    mark = try rig.logLen();
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.mknodat(linux.AT.FDCWD, fifo.ptr, linux.S.IFIFO | 0o600, 0)));
+    _ = try b.awaitLog("the member's beat holds", first_park_end, kill_row_wait_ns);
+    const t_hold = clock.monotonicNs();
+    // A evicts the silent B at T_owner while B serves: the eviction line.
+    {
+        const deadline = clock.monotonicNs() + kill_row_wait_ns;
+        while (true) {
+            const text = try rig.readLog();
+            defer gpa.free(text);
+            if (text.len > mark and evictedAtTOwner(text[mark..]) >= 1) break;
+            try rig.expectAlive("evicted at T_owner");
+            try b.expectAlive("evicted at T_owner");
+            if (clock.monotonicNs() >= deadline) return error.Timeout;
+            sleepMs(20);
+        }
+    }
+    const evicted_ms = (clock.monotonicNs() - t_hold) / std.time.ns_per_ms;
+    // B's committers parked the gate at T_self on the member's clock —
+    // the second park — BEFORE the beat is released: no commit of B's
+    // outlived its lease (red: the park came only with the beat, 3 s of
+    // commits into a region the manager was recovering).
+    const second_park = try b.awaitLog("appender park: T_self reached", first_park_end, kill_row_wait_ns);
+    {
+        const tb = try b.readLog();
+        defer gpa.free(tb);
+        try testing.expect(std.mem.indexOf(u8, tb, "BEAT_HOLD released") == null);
+    }
+    // Released: the beat's reclaim beat meets the successor's closed grace
+    // — UnknownLease: POISONED.
+    releaseHold(fifo);
+    released = true;
+    const poisoned_at = try b.awaitLog("this joined mount is POISONED", second_park, kill_row_wait_ns);
+    const t_poison = clock.monotonicNs();
+    // THE FAIL-STOP. (1) An op arriving on the poisoned mount answers EIO
+    // within the bound (a separate process: the storm's shell may be held).
+    {
+        var secs: [8]u8 = undefined;
+        const r = try std.process.run(gpa, io, .{ .argv = &.{ "timeout", "-s", "KILL", try std.fmt.bufPrint(&secs, "{d}", .{poison_fail_stop_bound_s}), "sh", "-c", "true > \"$0/hot/after-poison\"", b.mp }, .environ_map = &rig.env });
+        defer rig.freeRun(r);
+        const answered_ms = (clock.monotonicNs() - t_poison) / std.time.ns_per_ms;
+        if (r.term == .signal) {
+            std.debug.print("\nsmoke: a create arriving on the POISONED B was HELD past {d} s (never answered)\n", .{poison_fail_stop_bound_s});
+            printWedge(io, "b", b.pid, b.log_path, gpa);
+            abortFuseConnectionOf(io, b.mp);
+            return error.PoisonedMountHeldArrivingOp;
+        }
+        try testing.expect(!r.term.success());
+        if (std.mem.indexOf(u8, r.stderr, "Input/output error") == null) std.debug.print("\nsmoke: the poisoned B refused the create with: {s}\n", .{r.stderr});
+        try testing.expect(std.mem.indexOf(u8, r.stderr, "Input/output error") != null);
+        std.debug.print("\nsmoke: live member evicted: A evicted B {d} ms into the hold; B poisoned; a fresh create answered EIO {d} ms after the poison\n", .{ evicted_ms, answered_ms });
+    }
+    // (2) The storm child: told to stop, it must END — its create in
+    // flight at the poison answered, never held (the storm script retries
+    // a refused create and re-checks the sentinel).
+    const stop = try Io.Dir.cwd().createFile(io, storm_b.stop, .{ .truncate = true });
+    stop.close(io);
+    {
+        const pid = storm_b.child.id.?;
+        const deadline = clock.monotonicNs() + poison_fail_stop_bound_s * std.time.ns_per_s;
+        while (alive(pid) and clock.monotonicNs() < deadline) sleepMs(20);
+        if (alive(pid)) {
+            std.debug.print("\nsmoke: the storm child (pid {d}) is still parked in a request on the POISONED B {d} s after its stop sentinel — its kernel stacks:\n", .{ pid, poison_fail_stop_bound_s });
+            printKernelStacks(io, pid);
+            {
+                const text = try b.readLog();
+                defer gpa.free(text);
+                var it = std.mem.splitScalar(u8, text[poisoned_at..], '\n');
+                while (it.next()) |line| if (std.mem.indexOf(u8, line, "parked past station") != null) std.debug.print("  B: {s}\n", .{line[0..@min(line.len, 300)]});
+            }
+            abortFuseConnectionOf(io, b.mp);
+            return error.PoisonedMountHeldParkedOp;
+        }
+    }
+    _ = try storm_b.child.wait(io);
+    storm_done = true;
+    storm_b.err_file.close(io);
+    gpa.free(storm_b.stop);
+    gpa.free(storm_b.count);
+    // (3) `umount B` completes (the fenced member's dismount is the crash
+    // shape: it writes nothing — the exit says FAILED, 1); A serves on;
+    // the volume is sound.
+    try b.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 1 }, try b.waitExit());
+    {
+        const tb = try b.readLog();
+        defer gpa.free(tb);
+        try testing.expect(std.mem.indexOf(u8, tb, "the leave writes nothing (the crash shape") != null);
+        try testing.expect(std.mem.indexOf(u8, tb, "released by appender") == null);
+    }
+    {
+        const va = try hotView(rig, "a");
+        defer gpa.free(va);
+        try testing.expect(lsEqualsFind(va));
+        const ta = try rig.stats();
+        defer gpa.free(ta);
+        try testing.expect((numberAfter(ta, "\"membership_evictions\":") orelse 0) >= 1);
+        try testing.expectEqual(@as(?u64, 0), numberAfter(ta, "\"xv_cross_owner_steps_rejected\":"));
+        try testing.expectEqual(@as(?u64, 0), numberAfter(ta, "\"invariant_tripwires\":"));
+    }
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+    _ = try fsckClean(rig, "a live member evicted at T_owner");
+}
+
 /// The striped directory's population: 10,000 names over K = 64 stripes
 /// (≈ 156 per stripe — the readdir merge reads every stripe's page set
 /// several times over; the rename storm's 1,000 moves cross stripes with

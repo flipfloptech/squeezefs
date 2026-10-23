@@ -1108,6 +1108,18 @@ pub const JoinedSet = struct {
         if (self.left) return;
         self.left = true;
         const be = self.be;
+        // A FENCED member's dismount is the CRASH shape (charter §5.5: a
+        // park's expiry is the terminal poison; `leaveAllowed`'s law): its
+        // home shard evicted it, or will, and the manager recovers its
+        // region from the ring and the page as they stand — a release or a
+        // page write from here would land ON a recovered region (a
+        // poisoned member's stop shipped 61 `ReleaseSlot`s for slots the
+        // manager had recovered, and re-wrote the page the manager had set
+        // Recovered). The same for a park that stands: nothing durable.
+        if (!self.park_gate.leaveAllowed()) {
+            log.warn("meta volume {s}: appender {d} stops {s} — the leave writes nothing (the crash shape: its region is the manager's to recover; the page stays as the manager left it)", .{ be.path, self.appenderId(), if (self.park_gate.isExpired()) "FENCED (poisoned)" else "PARKED" });
+            return;
+        }
         // No refill lands under the leave (the pool's word is read below).
         self.refill.cancel(be.io);
         be.slots.releaseAllForLeave(self.appenderId());

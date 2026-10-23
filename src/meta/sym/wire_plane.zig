@@ -244,6 +244,12 @@ const JoinedHalf = struct {
     census: membership.census_view.CensusView,
     /// The members the last census commit retired (the beat's buffer).
     departed: std.ArrayList(membership.census_view.Departure) = .empty,
+    /// `SQUEEZEFS_TEST_MEMBERSHIP_BEAT_HOLD`: the FIFO path the beat parks
+    /// on ONCE — at the first tick that finds the path present — until a
+    /// writer opens it (the renewal pinned past `T_owner` while the mount
+    /// serves). Null = no hold.
+    beat_hold: ?[]const u8 = null,
+    beat_held: bool = false,
 
     /// A tenth of the shipped `T_self` floor (the smoke's `T_owner` of
     /// 3 s derives a 797 ms `T_self`; a tick every 80 ms meets a 265 ms
@@ -255,6 +261,7 @@ const JoinedHalf = struct {
         var name_buf: @import("../../core/thread_name.zig").CommBuf = undefined;
         _ = @import("../../core/thread_name.zig").nameCurrentThread(&name_buf, "sqz-member");
         while (!self.stop.load(.acquire)) {
+            self.holdBeatIfArmed();
             self.pullCensusIfDue();
             // The windows this writer holds ride the renewal (charter §5.5):
             // refreshed every beat from the writer plane once it is armed.
@@ -299,6 +306,23 @@ const JoinedHalf = struct {
             const ts: linux.timespec = .{ .sec = 0, .nsec = @intCast(TICK_MS * std.time.ns_per_ms) };
             _ = linux.nanosleep(&ts, null);
         }
+    }
+
+    /// `SQUEEZEFS_TEST_MEMBERSHIP_BEAT_HOLD`: the beat parks, once, at the
+    /// first tick that finds the FIFO present, until a writer opens it —
+    /// no renewal, no reclaim beat, while every other thread serves.
+    fn holdBeatIfArmed(self: *JoinedHalf) void {
+        const path = self.beat_hold orelse return;
+        if (self.beat_held) return;
+        Io.Dir.cwd().access(self.plane.io, path, .{}) catch return;
+        self.beat_held = true;
+        log.warn("cluster wire: SQUEEZEFS_TEST_MEMBERSHIP_BEAT_HOLD — the member's beat holds (no renewal) until a writer opens {s}", .{path});
+        const f = Io.Dir.cwd().openFile(self.plane.io, path, .{}) catch |e| {
+            log.warn("cluster wire: the beat hold could not open {s} ({t}); not holding", .{ path, e });
+            return;
+        };
+        f.close(self.plane.io);
+        log.warn("cluster wire: SQUEEZEFS_TEST_MEMBERSHIP_BEAT_HOLD released — the beat resumes", .{});
     }
 
     /// One census walk per renew interval (the renewal's own cadence; the
@@ -351,15 +375,17 @@ const JoinedHalf = struct {
 };
 
 /// The terminal poison of a joiner (`T_park_max` passed, `UnknownLease`
-/// before `T_self`): every volume latches FAILED — EIO until remount,
-/// never a silent weaker posture.
+/// before `T_self` or at a reclaim): every volume latches FAILED — EIO
+/// until remount, never a silent weaker posture — and the mount's move
+/// epoch closes, so every op parked on a move-class refusal answers now
+/// (`MetaSet.poison`).
 const Poison = struct {
     set: *MetaSet,
 
     fn poison(ctx: ?*anyopaque, reason: []const u8) void {
         const self: *Poison = @ptrCast(@alignCast(ctx.?));
-        for (self.set.volumes) |be| _ = be.lane.latch.failStop();
-        log.err("cluster wire: this joined mount is POISONED ({s}) — every volume latched FAILED (EIO until remount)", .{reason});
+        self.set.poison();
+        log.err("cluster wire: this joined mount is POISONED ({s}) — every volume latched FAILED (EIO until remount), every op parked on a slot move answered", .{reason});
     }
 
     fn sink(self: *Poison) membership.park_reclaim.PoisonSink {
@@ -503,6 +529,7 @@ pub const WirePlane = struct {
         self.divert.evict_after_serve = knobs.boolKnob("SQUEEZEFS_TEST_TOKEN_EVICT_AFTER_SERVE", env);
         self.leave_lost = knobs.boolKnob("SQUEEZEFS_TEST_MEMBERSHIP_LEAVE_LOST", env);
         self.online_arm_hold = knobs.boolKnob("SQUEEZEFS_TEST_ONLINE_ARM_HOLD", env);
+        if (self.joined) |j| j.beat_hold = knobs.parseStr(env.get("SQUEEZEFS_TEST_MEMBERSHIP_BEAT_HOLD"));
         // The token holder over this daemon's trees; the pusher over the
         // peers' dialled links.
         self.holder = tokens.table.Holder.init(gpa, io, identity.writer_id, self.oracle.oracle(), TOKEN_OBJECTS_CAP, listener.deriveMaxConnections(raw_cpus, listener.raiseNofile())) catch return error.OutOfMemory;
@@ -741,6 +768,10 @@ pub const WirePlane = struct {
         const clocks = j.member.clocks.?;
         // `T_park_max = failover_bound + grace` at the grant's `T_owner`.
         j.js.park_gate.t_park_max_ms = membership.park_reclaim.tParkMaxMs(@import("extent_grant.zig").failoverBoundMs(0, 0), clocks.grace_ms);
+        // The committers judge `T_self` at the pre-admission gate from here
+        // on (the first grant's deadline learnt): the beat below may stall
+        // in a wire call, the member's custody may not outlive its clock.
+        j.js.park_gate.bindSelfFence(j.member.selfFenceSeam());
         j.census.setRenewInterval(clocks.renew_ms * std.time.ns_per_ms);
         // The parked guard scopes' grace belt is the grant's `T_owner`.
         self.steps.plane.parked.bindLiveness(self.oracle.guardLiveness(), clocks.t_owner_ms * std.time.ns_per_ms);
@@ -805,7 +836,7 @@ pub const WirePlane = struct {
         if (self.joined) |j| {
             if (self.leave_lost) {
                 log.warn("cluster wire: SQUEEZEFS_TEST_MEMBERSHIP_LEAVE_LOST — the membership leave is not sent (the home shard keeps this member's row)", .{});
-            } else j.member.leave() catch log.err("cluster wire: the membership leave was refused over a standing park — the home shard records this mount's death", .{});
+            } else j.member.leave() catch log.err("cluster wire: the membership leave was refused over a standing park or past the poison — the home shard records this mount's death", .{});
         }
         self.listener.stop();
         stats.wire_listener_up.set(0);

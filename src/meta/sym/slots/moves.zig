@@ -84,8 +84,10 @@ pub const Moves = struct {
         };
     }
 
-    /// The mount's teardown: every park answers `closed` at once and no
-    /// later one waits (the release pairs with `park`'s acquire).
+    /// The mount's teardown — or its poison (the fail-stop lattice's
+    /// terminal verdict: no move resolves for a fenced member): every park
+    /// answers `closed` at once and no later one waits (the release pairs
+    /// with `park`'s acquire).
     pub fn close(self: *Moves) void {
         self.closed.store(true, .release);
         self.waiters.notifyWaiters(self.io);

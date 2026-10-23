@@ -641,6 +641,20 @@ pub const MetaSet = struct {
         for (self.volumes) |be| be.slots.table.bindMoves(m);
     }
 
+    /// The fail-stop lattice's terminal verdict on a joined mount (its
+    /// POISON: `T_park_max` passed, the home shard's `UnknownLease`): every
+    /// volume latched FAILED (mutations EIO until remount) AND the mount's
+    /// move epoch closed — an op parked on a move-class refusal (the root's
+    /// token serve answering MembershipPending to a member the shard
+    /// evicted) answers EIO now, not at the lattice's `T_park_max`, and no
+    /// later one waits: "the daemon answers, never holds" (a storm child
+    /// parked in such a request outlived SIGKILL and hung the shard).
+    pub fn poison(self: *MetaSet) void {
+        for (self.volumes) |be| _ = be.lane.latch.failStop();
+        if (self.posture == .reader) return;
+        for (self.volumes) |be| be.slots.table.closeMoves();
+    }
+
     /// The handover's step-0 drain over every member's plane (the
     /// filesystem's parked stamps of a slot, committed before its door
     /// closes).

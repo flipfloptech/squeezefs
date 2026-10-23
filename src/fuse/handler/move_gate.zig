@@ -10,7 +10,8 @@
 //! the top — every home it touches re-resolved. Bounded by the fail-stop
 //! lattice: past `deadline_ns` (`T_park_max` at the membership's T_owner)
 //! the op answers the TERMINAL `HolderUnresolved` (EIO), loud; the mount's
-//! close ends every park at once with the same answer.
+//! poison (`MetaSet.poison`: the lattice's terminal verdict on a joiner)
+//! and its close end every park at once with the same answer.
 //!
 //! The re-issue is idempotent by construction: the op's `MoveAttempt`
 //! rides `Ctx.move` across the attempts, and an op whose attempt left a
@@ -41,7 +42,8 @@ pub const stats = struct {
     pub var slot_move_park_wakes: counters.ShardedCounter = .{};
     pub var slot_move_repolls: counters.ShardedCounter = .{};
     /// Ops whose move did not resolve within the lattice's deadline (or
-    /// met the mount's close): answered `HolderUnresolved` (EIO), loud.
+    /// met the mount's poison or close): answered `HolderUnresolved` (EIO),
+    /// loud.
     pub var slot_move_unresolved: counters.ShardedCounter = .{};
     /// First refusal → the op's resolution, per op that met a move.
     pub var slot_move_ns: counters.ShardedLatencyHistogram = .{};
@@ -122,7 +124,7 @@ pub const MoveGate = struct {
             fn giveUp(e: anyerror, waited_ns: u64) R {
                 stats.slot_move_unresolved.inc();
                 stats.slot_move_ns.record(waited_ns);
-                log.warn("move gate: {s} met a slot move that did not resolve in {d} ms (last answer {s}) — answering EIO (the fail-stop lattice's deadline, or the mount's close)", .{ name, waited_ns / std.time.ns_per_ms, @errorName(e) });
+                log.warn("move gate: {s} met a slot move that did not resolve in {d} ms (last answer {s}) — answering EIO (the fail-stop lattice's deadline, the mount's poison, or its close)", .{ name, waited_ns / std.time.ns_per_ms, @errorName(e) });
                 return error.HolderUnresolved;
             }
         };

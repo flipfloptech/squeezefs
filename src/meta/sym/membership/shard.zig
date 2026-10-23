@@ -536,8 +536,20 @@ pub const Owner = struct {
             // A reclaim whose epoch this owner does not hold: admissible
             // only while the re-assertion half is open (the predecessor's
             // epochs died with it; an EXPECTED member's first join is a
-            // re-assertion even without an epoch).
-            const held = if (existing) |i| self.members.items[i].epoch == (req.prior_epoch orelse 0) else false;
+            // re-assertion even without an epoch). HELD: the epoch this
+            // owner granted the member, or ANY epoch ≤ it from the SAME
+            // incarnation (pid and boot) — a member that missed a grant's
+            // reply (the lost-reply window of its own reclaim, or a park
+            // past a renewal this owner served) names its last epoch; the
+            // verb is idempotent against the state held, never a poison of
+            // a live member. Another incarnation under the id (a remount:
+            // another pid) is no reclaimer of this epoch.
+            const held = if (existing) |i| blk: {
+                const m = &self.members.items[i];
+                const named = req.prior_epoch orelse 0;
+                if (m.epoch == named) break :blk true;
+                break :blk req.prior_epoch != null and named < m.epoch and m.pid == req.pid and std.mem.eql(u8, &m.boot, &req.boot);
+            } else false;
             if (!held and !self.graceOpenForReassert(now_ms)) {
                 stats.membership_reclaim_refusals.inc();
                 return .unknown_lease;
@@ -1094,17 +1106,37 @@ pub const Member = struct {
     }
 
     fn selfFence(self: *Member, now_mono_ns: u64) TickVerdict {
+        if (self.gate) |g| {
+            // The gate's CAS is the one latch between the beat and the
+            // committers judging `T_self` at the pre-admission gate: the
+            // count follows the park that landed. The words stay unfenced
+            // (the park re-arms for the reclaim's grant).
+            if (park.fenceAtTSelf(.symmetric_appender, g, self.poison, now_mono_ns)) {
+                stats.membership_self_fences.inc();
+                stats.membership_self_fenced.set(1);
+            }
+            return .parked;
+        }
         if (!self.words.fence()) return .fenced;
         stats.membership_self_fences.inc();
         stats.membership_self_fenced.set(1);
-        if (self.gate) |g| {
-            park.fenceAtTSelf(.symmetric_appender, g, self.poison, now_mono_ns);
-            // The park re-arms the words for the reclaim's grant.
-            self.words.fenced.store(false, .release);
-            return .parked;
-        }
-        park.fenceAtTSelf(.remote_custody, null, self.poison, now_mono_ns);
+        _ = park.fenceAtTSelf(.remote_custody, null, self.poison, now_mono_ns);
         return .fenced;
+    }
+
+    /// The pre-admission gate's `T_self` judgement (`park.SelfFence`): a
+    /// committer past the member's deadline parks the gate itself — the
+    /// beat may be stalled in a wire call; the deadline is the member's
+    /// clock. Nothing to judge before the first grant (no deadline learnt).
+    pub fn selfFenceSeam(self: *Member) park.SelfFence {
+        return .{ .ctx = self, .fenceIfDue = &selfFenceIfDue };
+    }
+
+    fn selfFenceIfDue(ctx: *anyopaque, now_ms: u64, now_mono_ns: u64) void {
+        const self: *Member = @ptrCast(@alignCast(ctx));
+        if (self.words.learnedLabel().label == 0) return;
+        if (self.words.fenced.load(.acquire)) return;
+        if (self.words.selfFenceDue(now_ms)) _ = self.selfFence(now_mono_ns);
     }
 
     /// `member_renewal_tick_decided` (M:3587-3626): a parked member runs
@@ -1302,6 +1334,42 @@ test "the owner: arm refuses a stale term; a join writes ONE row and grants an e
     try testing.expect(!o.leave(writerMemberId(testIdentity(2)), t));
     try testing.expectEqual(@as(usize, 1), deaths.list.items.len);
     try testing.expectEqual(@as(u64, 0), stats.membership_members.load());
+}
+
+test "the reclaim is idempotent against the state held (a lost grant reply): with the grace closed, a reclaim naming the epoch granted re-points; one naming a STALE epoch from the SAME incarnation (pid, boot) re-points too — never UnknownLease, never a poison of a live member; the same id from ANOTHER incarnation with a stale epoch is UnknownLease; an epoch above the held one is UnknownLease; a dead-and-evicted member's reclaim is UnknownLease" {
+    const gpa = testing.allocator;
+    const clocks = try LeaseClocks.derive(45_000, 0, 100);
+    var o = try Owner.arm(gpa, clocks, 0, 1, 0, &.{}, 0);
+    defer o.deinit();
+    const id = writerMemberId(testIdentity(1));
+    const e1 = o.join(joinReqOf(1, null, "/mnt/a"), 0).granted.epoch;
+    // The member reclaims naming e1 (a park past a renewal this owner
+    // served): the re-point grants e2 and acks e1 — but the reply is lost.
+    const g2 = o.join(joinReqOf(1, e1, "/mnt/a"), 100).granted;
+    try testing.expect(g2.epoch > e1);
+    try testing.expectEqual(e1, g2.ack_prior_epoch);
+    try testing.expect(o.renew(id, e1, 0, 200) == .unknown_lease);
+    // The member, still at e1, reclaims again: the same incarnation, a
+    // stale epoch — re-pointed, never UnknownLease.
+    const refusals0 = stats.membership_reclaim_refusals.load();
+    const g3 = o.join(joinReqOf(1, e1, "/mnt/a"), 300).granted;
+    try testing.expect(g3.epoch > g2.epoch);
+    try testing.expectEqual(e1, g3.ack_prior_epoch);
+    try testing.expect(o.renew(id, g3.epoch, 0, 400) == .granted);
+    try testing.expectEqual(refusals0, stats.membership_reclaim_refusals.load());
+    try testing.expectEqual(Liveness.live, o.liveness(id, 400));
+    // An epoch this owner never granted (above the held one): unknown.
+    try testing.expect(o.join(joinReqOf(1, g3.epoch + 7, "/mnt/a"), 500) == .unknown_lease);
+    // Another incarnation under the same id (another pid) naming a stale
+    // epoch: no reclaimer of this epoch.
+    var other = joinReqOf(1, e1, "/mnt/a");
+    other.pid = 999;
+    try testing.expect(o.join(other, 600) == .unknown_lease);
+    try testing.expectEqual(refusals0 + 2, stats.membership_reclaim_refusals.load());
+    try testing.expectEqual(Liveness.live, o.liveness(id, 600));
+    // Evicted at T_owner: the reclaim of a dead member is unknown.
+    try testing.expectEqual(@as(u32, 1), o.expireDue(400 + 45_000));
+    try testing.expect(o.join(joinReqOf(1, g3.epoch, "/mnt/a"), 400 + 45_001) == .unknown_lease);
 }
 
 test "grace, two halves on one deadline: a stranger is refused while the fresh half is open; an EXPECTED member's first join is a re-assertion; the fresh half closes early once every expected member re-asserted while the re-assertion half admits a prior epoch to the deadline; liveness reads unknown inside the window; the deadline ships the non-reclaimers with epoch 0 and the roster's key, once" {
@@ -1547,6 +1615,61 @@ test "UnknownLease before T_self fences terminally and never parks; a leave over
     var m2: Member = .{ .gpa = gpa, .id = writerMemberId(testIdentity(3)), .role = .writer, .link = dl.link(), .pid = 7, .boot = "boot-boot-boot-0".*, .endpoint = .none, .pr_key = 0, .mount = "/mnt/n", .gate = &gate, .poison = p.sink() };
     _ = gate.park(1);
     try testing.expectError(error.ParkedLeaveRefused, m2.leave());
+}
+
+test "T_self is the member's clock, never its beat's liveness: with the beat stalled, a committer at the pre-admission gate past the deadline PARKS the gate itself (one park, one self-fence, acks held), the committer waits, the beat's next tick runs the reclaim beat and the re-point releases it; before the first grant nothing fences; a renewal in time fences nothing" {
+    const gpa = testing.allocator;
+    const clocks = try LeaseClocks.derive(45_000, 0, 100);
+    var o = try Owner.arm(gpa, clocks, 0, 1, 0, &.{}, 0);
+    defer o.deinit();
+    manual_now_ms = 0;
+    var osvc: OwnerService = .{ .owner = &o, .now = &manualNow };
+    const me = testIdentity(4);
+    var dl: DirectLink = .{ .owner_svc = &osvc, .peer = me };
+    osvc.register(&dl.svc);
+    var gate = park.ParkGate.arm(testing.io, 0, 1 << 40);
+    var p: Poison = .{};
+    var m: Member = .{ .gpa = gpa, .id = writerMemberId(me), .role = .writer, .link = dl.link(), .pid = 7, .boot = "boot-boot-boot-0".*, .endpoint = .none, .pr_key = 0, .mount = "/mnt/m", .gate = &gate, .poison = p.sink() };
+    gate.bindSelfFence(m.selfFenceSeam());
+    // Before any grant there is no deadline: the gate admits.
+    try gate.preAdmission();
+    try testing.expect(!gate.isParked());
+    // The join anchors the deadline at the send instant. The committers'
+    // judgement uses the REAL monotonic clock, so the member's clock is
+    // anchored there too: the deadline lies T_self past now.
+    const t0 = clock.monotonicNs() / std.time.ns_per_ms;
+    try testing.expectEqual(Member.JoinOutcome.granted, m.join(t0, null));
+    try gate.preAdmission();
+    try testing.expect(!gate.isParked());
+    // The beat stalls (no tick). A committer arrives past the deadline:
+    // the words say due at `now ≥ deadline` — moved by a renewal anchored
+    // in the past, the owner's clock answering it.
+    manual_now_ms = 100;
+    m.words.renew_at_ms.store(0, .release);
+    try testing.expectEqual(TickVerdict.renewed, m.tick(t0 -| clocks.t_self_ms -| 1, 0));
+    try testing.expect(m.words.selfFenceDue(t0));
+    const fences0 = stats.membership_self_fences.load();
+    const parks0 = park.stats.appender_parks.load();
+    var c: park.TestCommitter = .{ .gate = &gate };
+    const th = try std.Thread.spawn(.{}, park.TestCommitter.run, .{&c});
+    var spins: u32 = 0;
+    while (gate.admission_wake.waiters(testing.io) == 0 and spins < 10_000_000) : (spins += 1) std.Thread.yield() catch {};
+    try testing.expect(gate.isParked());
+    try testing.expectEqual(parks0 + 1, park.stats.appender_parks.load());
+    try testing.expectEqual(fences0 + 1, stats.membership_self_fences.load());
+    try testing.expectEqual(@as(u32, 0), p.count);
+    // The beat resumes: the gate is parked, so its tick is the reclaim
+    // beat — the owner still holds the lease (a re-point), the gate
+    // releases, the committer lands. One self-fence in all.
+    manual_now_ms = 200;
+    try testing.expectEqual(TickVerdict.rejoined, m.tick(clock.monotonicNs() / std.time.ns_per_ms, 0));
+    th.join();
+    try testing.expect(c.entered);
+    try testing.expectEqual(park.AckVerdict.ok, c.verdict);
+    try testing.expect(!gate.isParked());
+    try testing.expectEqual(fences0 + 1, stats.membership_self_fences.load());
+    try testing.expectEqual(@as(u32, 0), p.count);
+    try gate.preAdmission();
 }
 
 test "the clients seam lists every member of the shard: a writer through its row's classifier (dead-pid proof applies), a reader as a live row" {

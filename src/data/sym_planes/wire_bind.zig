@@ -154,7 +154,8 @@ pub const HolderHandlers = struct {
         for (r.items, 0..) |b, i| blocks[i] = b;
         // The request id is the frame's correlation: a resend carries the
         // same one, so the dedup window keys `(lease_epoch, request_id)`.
-        const v = self.frees.execute(.{ .vol_tag = r.head.vol_tag, .blocks = blocks[0..r.items.len], .lease_epoch = r.head.lease_epoch, .request_id = req.correlation });
+        const sender: u64 = if (req.peer) |p| std.hash.Wyhash.hash(0, std.mem.asBytes(&p)) else 0;
+        const v = self.frees.execute(.{ .vol_tag = r.head.vol_tag, .blocks = blocks[0..r.items.len], .lease_epoch = r.head.lease_epoch, .request_id = req.correlation, .sender = sender });
         if (scratch.len < v.n) return Answer.refused(error.Unexpected, "reply scratch too small for the verdicts");
         for (v.slice(), 0..) |verdict, i| scratch[i] = @backingInt(verdict);
         return .{ .ok = .{ .free_blocks = .{ .head = .{ .n = v.n, .reserved = @splat(0) }, .verdicts = scratch[0..v.n] } } };

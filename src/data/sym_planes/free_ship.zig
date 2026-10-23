@@ -61,7 +61,12 @@ pub const FreeBlocksRequest = struct {
     vol_tag: u64,
     blocks: []const u64,
     lease_epoch: u64,
+    /// The frame's correlation at the holder — a per-SESSION counter, so
+    /// two members' batches carry equal ids: the dedup keys `sender` too.
     request_id: u64,
+    /// The holder's word for WHO asked (the wire peer's identity, hashed);
+    /// 0 on the shipper's side and in a single-member rig.
+    sender: u64 = 0,
 };
 
 pub const Verdicts = struct {
@@ -146,7 +151,7 @@ pub const DerivationProbe = struct {
     settle: *const fn (*anyopaque, idx: u64) bool,
 };
 
-const DedupEntry = struct { lease_epoch: u64, request_id: u64, verdicts: Verdicts, used: bool = false };
+const DedupEntry = struct { lease_epoch: u64, sender: u64, request_id: u64, verdicts: Verdicts, used: bool = false };
 
 pub const FreeExecutor = struct {
     alloc: *BlockAllocator,
@@ -155,27 +160,30 @@ pub const FreeExecutor = struct {
     grace: ?GraceProbe = null,
     derivation: ?DerivationProbe = null,
     lock: jc.SpinLock = .{},
-    dedup: [FREE_DEDUP_WINDOW]DedupEntry = @splat(.{ .lease_epoch = 0, .request_id = 0, .verdicts = .{} }),
+    dedup: [FREE_DEDUP_WINDOW]DedupEntry = @splat(.{ .lease_epoch = 0, .sender = 0, .request_id = 0, .verdicts = .{} }),
     dedup_next: usize = 0,
 
-    fn lookupDedup(self: *FreeExecutor, lease_epoch: u64, request_id: u64) ?Verdicts {
-        for (&self.dedup) |*e| if (e.used and e.lease_epoch == lease_epoch and e.request_id == request_id) return e.verdicts;
+    fn lookupDedup(self: *FreeExecutor, lease_epoch: u64, sender: u64, request_id: u64) ?Verdicts {
+        for (&self.dedup) |*e| if (e.used and e.lease_epoch == lease_epoch and e.sender == sender and e.request_id == request_id) return e.verdicts;
         return null;
     }
 
-    fn rememberDedup(self: *FreeExecutor, lease_epoch: u64, request_id: u64, v: Verdicts) void {
-        self.dedup[self.dedup_next] = .{ .lease_epoch = lease_epoch, .request_id = request_id, .verdicts = v, .used = true };
+    fn rememberDedup(self: *FreeExecutor, lease_epoch: u64, sender: u64, request_id: u64, v: Verdicts) void {
+        self.dedup[self.dedup_next] = .{ .lease_epoch = lease_epoch, .sender = sender, .request_id = request_id, .verdicts = v, .used = true };
         self.dedup_next = (self.dedup_next + 1) % FREE_DEDUP_WINDOW;
     }
 
-    /// Serve one batch: dedup by `(lease_epoch, request_id)` (a resend
-    /// gets the same verdicts, nothing re-executed), then the seven-row
-    /// table per block under the authority marker.
+    /// Serve one batch: dedup by `(lease_epoch, sender, request_id)` (a
+    /// resend gets the same verdicts, nothing re-executed; another member's
+    /// equal correlation is another batch — generic/589's joiners each
+    /// began their session's count at 1 and one's teardown flush read the
+    /// other's verdicts), then the seven-row table per block under the
+    /// authority marker.
     pub fn execute(self: *FreeExecutor, req: FreeBlocksRequest) Verdicts {
         assert(req.blocks.len <= FREE_BATCH_MAX);
         self.lock.lock();
         defer self.lock.unlock();
-        if (self.lookupDedup(req.lease_epoch, req.request_id)) |v| {
+        if (self.lookupDedup(req.lease_epoch, req.sender, req.request_id)) |v| {
             stats.free_dedup_replays.inc();
             return v;
         }
@@ -192,7 +200,7 @@ pub const FreeExecutor = struct {
                 .refused => stats.free_refused_blocks.inc(),
             }
         }
-        self.rememberDedup(req.lease_epoch, req.request_id, out);
+        self.rememberDedup(req.lease_epoch, req.sender, req.request_id, out);
         return out;
     }
 
@@ -433,6 +441,14 @@ pub const Shipper = struct {
                     return .failed;
                 },
             };
+            // A reply of another length is a holder answering some other
+            // batch: nothing of ours is judged by it — the blocks stay
+            // tracked (leak-safe, as the transport failures), never a panic.
+            if (verdicts.n != n) {
+                stats.free_ship_failures.inc();
+                log.warn("shipped frees on vol {x}: the holder answered {d} verdict(s) for {d} blocks — the batch stays tracked", .{ self.vol_tag, verdicts.n, n });
+                return .failed;
+            }
             for (batch[0..n], verdicts.slice()) |idx, v| switch (v) {
                 .freed => {
                     stats.free_ship_freed.inc();
@@ -607,6 +623,58 @@ test "the holder's seven-row verdict table: Freed iff the RAM count was 1, NonTe
     const v3 = ex.execute(.{ .vol_tag = 0xF1, .blocks = &.{0}, .lease_epoch = 1, .request_id = 2 });
     try log.testing.expectAllFired();
     try testing.expectEqual(FreeVerdict.refused, v3.buf[0]);
+}
+
+test "the dedup window is the SENDER's: two members whose sessions both count their correlation from 1 get their own verdicts (generic/589's teardown flush read another joiner's three verdicts for its one block and panicked on the lengths); the shipper never panics on a reply of another length — the batch stays tracked, counted a failure" {
+    const a = try testAlloc();
+    defer a.deinit();
+    var i: u64 = 0;
+    while (i < 4) : (i += 1) _ = try a.allocateBlock();
+    for (0..4) |k| a.publishBlock(k);
+    var ledger: RamLedger = .{};
+    var ladder: LocalLadder = .{ .alloc = a };
+    var ex: FreeExecutor = .{ .alloc = a, .durable = ledger.seam(), .ladder = ladder.seam() };
+    // Member A's first batch: three blocks under correlation 1.
+    const va = ex.execute(.{ .vol_tag = 0xF1, .blocks = &.{ 0, 1, 2 }, .lease_epoch = 1, .request_id = 1, .sender = 0xA });
+    try testing.expectEqual(@as(u8, 3), va.n);
+    // Member B's first batch, the same correlation: ITS one block, judged
+    // (block 3 freed), never A's replay.
+    const replays0 = stats.free_dedup_replays.load();
+    const vb = ex.execute(.{ .vol_tag = 0xF1, .blocks = &.{3}, .lease_epoch = 1, .request_id = 1, .sender = 0xB });
+    try testing.expectEqual(@as(u8, 1), vb.n);
+    try testing.expectEqual(FreeVerdict.freed, vb.buf[0]);
+    try testing.expectEqual(replays0, stats.free_dedup_replays.load());
+    try testing.expectEqual(block_alloc.State.free, a.stateOf(3));
+    // A's resend replays A's.
+    const va2 = ex.execute(.{ .vol_tag = 0xF1, .blocks = &.{ 0, 1, 2 }, .lease_epoch = 1, .request_id = 1, .sender = 0xA });
+    try testing.expectEqualSlices(FreeVerdict, va.slice(), va2.slice());
+    try testing.expectEqual(replays0 + 1, stats.free_dedup_replays.load());
+    // The shipper against a holder that answers another batch's verdicts.
+    const Foreign = struct {
+        fn send(_: *anyopaque, _: FreeBlocksRequest) ShipError!Verdicts {
+            var v: Verdicts = .{};
+            v.buf[0] = .freed;
+            v.buf[1] = .freed;
+            v.buf[2] = .refused;
+            v.n = 3;
+            return v;
+        }
+        fn resolve(_: *anyopaque) bool {
+            return false;
+        }
+    };
+    var tracking: Tracking = .{};
+    var epoch: Epoch = .{};
+    var x: u8 = 0;
+    var shipper: Shipper = .{ .vol_tag = 0xF1, .client = .{ .ctx = &x, .send = &Foreign.send, .resolve = &Foreign.resolve }, .tracking = tracking.seams(), .lease_epoch = epoch.seam() };
+    const target = shipper.freeTarget();
+    try testing.expect(target.ship(target.ctx, 0xF1, 0));
+    const failures0 = stats.free_ship_failures.load();
+    try testing.expectEqual(Shipper.FlushOutcome.failed, shipper.flush());
+    try testing.expectEqual(failures0 + 1, stats.free_ship_failures.load());
+    try testing.expectEqual(@as(u32, 0), tracking.purged);
+    try testing.expectEqual(@as(u32, 0), tracking.retired);
+    try testing.expectEqual(@as(u32, 0), tracking.released);
 }
 
 test "the untracked gate adjudicates a former lessee's allocated, unreferenced block as ours and refuses everything else; the served-publish screen refuses a released block" {

@@ -269,7 +269,7 @@ pub const RamMap = struct {
         return .{ .ctx = self, .vtable = &vtable };
     }
 
-    const vtable: seams.MapSeam.VTable = .{ .lookup = &lookup, .reserved = &reserved, .view = &view, .merge = &merge, .current_fencing = &currentFencing, .size_epoch = &sizeEpoch };
+    const vtable: seams.MapSeam.VTable = .{ .lookup = &lookup, .reserved = &reserved, .view = &view, .merge = &merge, .punch = &punch, .shift = &shift, .current_fencing = &currentFencing, .size_epoch = &sizeEpoch };
 
     pub fn create(self: *RamMap, ino: u64, kind: seams.FileKind, size: u64) !void {
         try self.files.put(self.gpa, ino, .{ .kind = kind, .size = size });
@@ -411,6 +411,73 @@ pub const RamMap = struct {
         }
         self.merges.append(self.gpa, .{ .ino = req.ino, .blocks = @intCast(inserts.len), .min_size = min_size, .fencing = req.fencing, .displaced = out.n_displaced }) catch return error.OutOfMemory;
         if (self.on_merge) |h| h(self);
+        return out;
+    }
+
+    /// The product's `punch`: the bindings of `[first, last]` leave, up to
+    /// the save's width per call, displaced and held.
+    fn punch(ctx: *anyopaque, ino: u64, first: u32, last: u32) seams.MergeError!seams.MergeOutcome {
+        const self: *RamMap = @ptrCast(@alignCast(ctx));
+        self.lock.lockUncancelable(std.testing.io);
+        defer self.lock.unlock(std.testing.io);
+        const f = self.files.getPtr(ino) orelse return error.NotFound;
+        var out: seams.MergeOutcome = .{};
+        var gone: [seams.MergeOutcome.max_displaced]u32 = undefined;
+        var it = f.map.iterator();
+        while (it.next()) |kv| {
+            if (out.n_displaced == gone.len) break;
+            if (kv.key_ptr.* < first or kv.key_ptr.* > last) continue;
+            gone[out.n_displaced] = kv.key_ptr.*;
+            out.displaced[out.n_displaced] = kv.value_ptr.*;
+            out.n_displaced += 1;
+        }
+        for (gone[0..out.n_displaced]) |b| _ = f.map.remove(b);
+        self.refs_released += out.n_displaced;
+        if (self.holds) |h| {
+            h.hold(out.slice());
+            out.holds = h;
+        }
+        return out;
+    }
+
+    /// The product's `shift` over the RAM map: the re-keyed bindings, the
+    /// collapse's removed ones displaced and held.
+    fn shift(ctx: *anyopaque, ino: u64, s: seams.MapSeam.Shift) seams.MapSeam.ShiftError!seams.MergeOutcome {
+        const self: *RamMap = @ptrCast(@alignCast(ctx));
+        self.lock.lockUncancelable(std.testing.io);
+        defer self.lock.unlock(std.testing.io);
+        const f = self.files.getPtr(ino) orelse return error.NotFound;
+        var out: seams.MergeOutcome = .{};
+        var next: std.AutoHashMapUnmanaged(u32, Binding) = .empty;
+        errdefer next.deinit(self.gpa);
+        var it = f.map.iterator();
+        while (it.next()) |kv| {
+            const b = kv.key_ptr.*;
+            const to: u32 = switch (s.dir) {
+                .collapse => blk: {
+                    if (b >= s.at and b < s.at + s.blocks) {
+                        if (out.n_displaced == seams.MergeOutcome.max_displaced) return error.Unsupported;
+                        out.displaced[out.n_displaced] = kv.value_ptr.*;
+                        out.n_displaced += 1;
+                        continue;
+                    }
+                    break :blk if (b >= s.at + s.blocks) b - s.blocks else b;
+                },
+                .insert => if (b >= s.at) b + s.blocks else b,
+            };
+            try next.put(self.gpa, to, kv.value_ptr.*);
+        }
+        f.map.deinit(self.gpa);
+        f.map = next;
+        self.refs_released += out.n_displaced;
+        switch (s.dir) {
+            .collapse => f.size -|= @as(u64, s.blocks) * self.chunk,
+            .insert => f.size += @as(u64, s.blocks) * self.chunk,
+        }
+        if (self.holds) |h| {
+            h.hold(out.slice());
+            out.holds = h;
+        }
         return out;
     }
 

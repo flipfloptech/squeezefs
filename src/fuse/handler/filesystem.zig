@@ -17,8 +17,8 @@
 //! (both opcodes land here with `flags`), link, open, read, write, flush,
 //! release, fsync, opendir, readdir, readdirplus, releasedir, fsyncdir,
 //! statfs, {set,get,list,remove}xattr, create, access (ENOSYS under
-//! `default_permissions` is honest). Rung 4 adds fallocate, lseek,
-//! copy_file_range, ioctl, bmap, poll; rung 10 syncfs (the kernel sends it
+//! `default_permissions` is honest), fallocate (charter §6.6, every mode).
+//! Rung 4 adds lseek, copy_file_range, ioctl, bmap, poll; rung 10 syncfs (the kernel sends it
 //! only once INIT negotiated `FUSE_HAS_SYNCFS`; its ENOSYS default clears
 //! `fc->sync_fs`). Never: getlk/setlk (POSIX_LOCKS is
 //! never advertised — the kernel arbitrates), notify_reply (no RETRIEVE is

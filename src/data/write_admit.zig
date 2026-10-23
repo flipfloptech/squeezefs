@@ -974,6 +974,23 @@ pub const WritePath = struct {
         stats.write_gap_zero_bytes.add(n);
     }
 
+    /// Zeros over `[offset, offset + len)` of a striped file, admitted like
+    /// any byte (a PUNCH_HOLE / ZERO_RANGE edge inside a written block,
+    /// charter §6.6): the extension law's static zero block, one write per
+    /// block-bounded piece, so every arm lands them (W1 in place for an
+    /// aligned sub-cap piece, the overlay, the accumulation arms).
+    pub fn writeZeros(self: *WritePath, io: Io, ino: u64, offset: u64, len: u64, file: seams.FileView) Error!void {
+        const bs = self.cfg.block_size;
+        var at = offset;
+        const end = offset + len;
+        while (at < end) {
+            const piece: usize = @intCast(@min(end - at, std.mem.alignForward(u64, at + 1, bs) - at));
+            assert(piece <= gap_zeros.len);
+            _ = try self.write(io, .{ .ino = ino, .offset = at, .payload = .{ .bytes = gap_zeros[0..piece] }, .class = .entire_op, .file = file });
+            at += piece;
+        }
+    }
+
     fn materialize(_: *WritePath, io: Io, p: Payload) ![]const u8 {
         return switch (p) {
             .bytes => |b| b,

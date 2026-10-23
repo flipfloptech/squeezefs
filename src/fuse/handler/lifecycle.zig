@@ -11,8 +11,9 @@
 //!   → mint the ONE reply obligation for the slot
 //!   → prologue: `fuse_ops`, the watchdog slot claim, `handler_entry`
 //!   → the level-1 op guard as the op's class demands (WRITE: the §2.4
-//!     admission; SETATTR-size: exclusive, the whole truncate; rung 3's
-//!     inline READ takes none — one KV snapshot read, nothing to guard)
+//!     admission; SETATTR-size and FALLOCATE: exclusive, the whole truncate
+//!     or layout change; rung 3's inline READ takes none — one KV snapshot
+//!     read, nothing to guard)
 //!   → the filesystem op (typed args in, typed reply or an error out)
 //!   → the accounting that must precede the reply (open count, lookup
 //!     references: a RELEASE the kernel sends after our OPEN reply must
@@ -728,6 +729,12 @@ pub fn Dispatcher(comptime Transport: type) type {
                     return codec.replyPoll(out, u, r.revents);
                 },
                 .fallocate => |a| {
+                    // A layout change of the whole file (a reservation, a
+                    // punch, a shift — charter §6.6): the whole-truncate
+                    // EXCLUSIVE guard, as SETATTR-size takes it (taker
+                    // list: "FALLOCATE").
+                    const g = self.guards.acquire(self.io, ino, .exclusive);
+                    defer g.release(self.io);
                     try fs.vtable.fallocate(fs.impl, c, .{ .ino = ino, .fh = a.fh, .offset = a.offset, .length = a.length, .mode = a.mode });
                     return codec.replyOk(u);
                 },

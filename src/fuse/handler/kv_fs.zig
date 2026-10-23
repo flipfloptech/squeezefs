@@ -274,6 +274,21 @@ pub var fuse_write_staged_store_full_refusals: counters.ShardedCounter = .{};
 pub var fuse_truncate_packed_clips: counters.ShardedCounter = .{};
 pub var fuse_truncate_striped_clips: counters.ShardedCounter = .{};
 pub var fuse_truncate_restages: counters.ShardedCounter = .{};
+/// fallocate by arm (charter §6.6): blocks reserved (holes bound
+/// UNWRITTEN) and zeroed (written blocks flipped) by allocate / ZERO_RANGE;
+/// whole blocks freed by PUNCH_HOLE and a COLLAPSE; edge bytes zeroed
+/// through the write admission; size extensions; non-striped files
+/// promoted for a reservation or a shift; shifts landed and refused
+/// (EOPNOTSUPP: a tree-mapped head, a shift past one journal entry, a
+/// volume-less set).
+pub var fuse_fallocate_blocks_reserved: counters.ShardedCounter = .{};
+pub var fuse_fallocate_blocks_zeroed: counters.ShardedCounter = .{};
+pub var fuse_fallocate_blocks_punched: counters.ShardedCounter = .{};
+pub var fuse_fallocate_edge_zero_bytes: counters.ShardedCounter = .{};
+pub var fuse_fallocate_extends: counters.ShardedCounter = .{};
+pub var fuse_fallocate_promotions: counters.ShardedCounter = .{};
+pub var fuse_fallocate_shifts: counters.ShardedCounter = .{};
+pub var fuse_fallocate_shift_refusals: counters.ShardedCounter = .{};
 /// `fuse_killpriv_clears`: KILLPRIV_V2 strips folded into a commit.
 pub var fuse_killpriv_clears: counters.ShardedCounter = .{};
 /// `fuse_killpriv_negotiated`: 0/1 from the INIT reply.
@@ -366,7 +381,7 @@ pub fn assertStore(comptime T: type) void {
 /// the product; `NoData` is the volume-less set).
 pub fn assertData(comptime T: type) void {
     comptime {
-        for ([_][]const u8{ "hasVolumes", "stagingOn", "blockSize", "inlineMax", "geometry", "refsSeam", "noteShape", "forgetShape", "noteSizeSet", "sizeSetSince", "isPassthrough", "canStoreHeld", "write", "zeroExtension", "custodyFloor", "barrierData", "read", "ownBlock", "abandonOwnBlock", "ownBlockPublished", "holdReleases", "dropReleases", "freeBindings", "flushCustody", "flushAllCustody", "releaseIno", "hasWriteCustody", "fsync", "statfs", "mintFileId", "writeCacheAdmits", "stageImage", "appendStaged", "overwriteStaged", "stagedPoint", "stagedPointCached", "releaseStaged", "stagedLease", "readMappingImage", "lockLayout", "stageKvmapShrink", "stageKvmapCorpse", "drainKvmapSweep", "publishForeign" }) |name| {
+        for ([_][]const u8{ "hasVolumes", "stagingOn", "blockSize", "inlineMax", "geometry", "refsSeam", "noteShape", "forgetShape", "noteSizeSet", "sizeSetSince", "isPassthrough", "canStoreHeld", "write", "zeroExtension", "custodyFloor", "barrierData", "read", "ownBlock", "abandonOwnBlock", "ownBlockPublished", "holdReleases", "dropReleases", "freeBindings", "flushCustody", "flushAllCustody", "releaseIno", "hasWriteCustody", "fsync", "statfs", "mintFileId", "writeCacheAdmits", "stageImage", "appendStaged", "overwriteStaged", "stagedPoint", "stagedPointCached", "releaseStaged", "stagedLease", "readMappingImage", "lockLayout", "stageKvmapShrink", "stageKvmapCorpse", "drainKvmapSweep", "publishForeign", "reserveBlocks", "punchBlocks", "shiftBlocks", "boundAt", "zeroRange" }) |name| {
             if (!@hasDecl(T, name)) @compileError(@typeName(T) ++ " is not a kv_fs Data face: lacks `" ++ name ++ "`");
         }
     }
@@ -2439,6 +2454,348 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 self.data.noteShape(local, sz, if (kind == .striped) .striped else .inline_);
             }
             return self.attrReply(a.ino, out.value);
+        }
+
+        // ---- fallocate (charter §6.6; decision 0003 §BH) ----
+
+        /// fallocate(2)'s mode bits (`include/uapi/linux/falloc.h`).
+        pub const FALLOC = struct {
+            pub const KEEP_SIZE: u32 = 0x01;
+            pub const PUNCH_HOLE: u32 = 0x02;
+            pub const NO_HIDE_STALE: u32 = 0x04;
+            pub const COLLAPSE_RANGE: u32 = 0x08;
+            pub const ZERO_RANGE: u32 = 0x10;
+            pub const INSERT_RANGE: u32 = 0x20;
+            pub const UNSHARE_RANGE: u32 = 0x40;
+            /// The modes this filesystem serves; any other bit is EOPNOTSUPP
+            /// (`NO_HIDE_STALE` among them: the VFS refuses it the same way).
+            pub const SERVED: u32 = KEEP_SIZE | PUNCH_HOLE | COLLAPSE_RANGE | ZERO_RANGE | INSERT_RANGE | UNSHARE_RANGE;
+        };
+
+        /// THE LAW PER MODE (charter §6.6), under the lifecycle's EXCLUSIVE
+        /// level-1 guard (taker list: "FALLOCATE": a layout change, as a
+        /// truncate):
+        ///
+        /// - mode 0 / `KEEP_SIZE` / `UNSHARE_RANGE` (allocate): `[off, end)`
+        ///   is RESERVED — every striped block of the range the map does not
+        ///   bind is minted and bound UNWRITTEN (`Data.reserveBlocks`: a
+        ///   durable reference, charged to the volume, no device byte; a
+        ///   1 GiB fallocate is 256 mints and one publish), so a later write
+        ///   inside it lands in place and cannot ENOSPC; reads serve zeros.
+        ///   An inline range reserves nothing (the record IS the storage); a
+        ///   staged or packed file promotes to striped first (its image on
+        ///   its own block, as a write past its arm does). Without
+        ///   `KEEP_SIZE` the size rises to `end` under the size epoch
+        ///   through the truncate-up path (the extension law's zeros on a
+        ///   mapped EOF block, mtime/ctime stamped). No reflink is exposed,
+        ///   so `UNSHARE_RANGE` adds nothing to allocate.
+        /// - `PUNCH_HOLE | KEEP_SIZE`: `[off, min(end, size))` reads zeros
+        ///   and returns its space — the write custody settled first, the
+        ///   whole blocks inside leave the map and are freed (`Data.
+        ///   punchBlocks`, `df` sees them back), a partial head or tail
+        ///   inside a WRITTEN block is zeroed through the write admission
+        ///   (in place when W1 admits it); an inline file's record is
+        ///   rewritten with zeros, a staged or packed image re-staged with
+        ///   them. The size never moves.
+        /// - `ZERO_RANGE` (± `KEEP_SIZE`): zeros without returning space —
+        ///   the partial edges as the punch's, every whole block of the range
+        ///   flipped to its UNWRITTEN twin or reserved fresh (the same
+        ///   `reserveBlocks`, zeroing); without `KEEP_SIZE` the size rises
+        ///   as allocate's does.
+        /// - `COLLAPSE_RANGE` / `INSERT_RANGE`: at the BLOCK grain only
+        ///   (`offset` and `length` multiples of the stripe block — the
+        ///   filesystem's block for fallocate(2)'s alignment law; else
+        ///   EINVAL, as every extent filesystem answers a sub-block shift):
+        ///   the map re-indexed in ONE transaction, the data unmoved
+        ///   (`Data.shiftBlocks`), a collapse's blocks freed, then the size
+        ///   commits (collapse: `end ≥ size` is EINVAL; insert: `off ≥ size`
+        ///   is EINVAL, the grown size over the ceiling EFBIG). A tree-
+        ///   mapped head or a shift wider than one journal entry answers
+        ///   EOPNOTSUPP, counted (`layout_shift_refusals`) — the map stands.
+        ///
+        /// Every size-growing mode screens the u32 block ceiling (EFBIG);
+        /// an immutable or append-only inode refuses EPERM (the inode-flags
+        /// law, `vfs_fallocate`'s); a foreign-slot file takes the striped
+        /// arm throughout (its records ship to the holder). mtime/ctime
+        /// stamp when the file changed (space reserved, zeroed, freed or
+        /// moved; the size), never on an idempotent re-reservation.
+        pub fn fallocate(self: *Self, c: *Ctx, a: filesystem.FallocateArgs) Error!void {
+            if (virtual_inodes.isVirtualIno(a.ino)) return error.AccessDenied;
+            const local = try localOf(a.ino);
+            const mode = a.mode;
+            if (mode & ~FALLOC.SERVED != 0) return error.NotSupported;
+            if (a.length == 0) return error.InvalidArgument;
+            const end = std.math.add(u64, a.offset, a.length) catch return error.FileTooBig;
+            const keep = mode & FALLOC.KEEP_SIZE != 0;
+            const punch = mode & FALLOC.PUNCH_HOLE != 0;
+            const zero = mode & FALLOC.ZERO_RANGE != 0;
+            const collapse = mode & FALLOC.COLLAPSE_RANGE != 0;
+            const insert = mode & FALLOC.INSERT_RANGE != 0;
+            // vfs_fallocate's combination law.
+            if (punch and !keep) return error.NotSupported;
+            if (punch and zero) return error.NotSupported;
+            if (collapse and mode != FALLOC.COLLAPSE_RANGE) return error.InvalidArgument;
+            if (insert and mode != FALLOC.INSERT_RANGE) return error.InvalidArgument;
+            const probe = (try self.readInodeOpt(local)) orelse return error.FileNotFound;
+            if (probe.mode & S.IFMT == S.IFDIR) return error.IsDir;
+            if (probe.mode & S.IFMT != S.IFREG) return error.InvalidArgument;
+            const grows = !keep and !punch and !collapse;
+            // Every mode that names blocks up to `end` (a KEEP_SIZE
+            // reservation included) screens the u32 block ceiling; a
+            // volume-less set holds no block past its inline bound.
+            if (!punch and !collapse and end > self.maxFileSize()) {
+                fuse_write_u32_index_refused.inc();
+                return error.FileTooBig;
+            }
+            if (!self.data.hasVolumes() and !punch and !collapse and end > self.inline_max) {
+                fuse_write_no_data_volume_refused.inc();
+                return error.FileTooBig;
+            }
+            const bs = self.block_size;
+            if (collapse or insert) {
+                if (a.offset % bs != 0 or a.length % bs != 0) return error.InvalidArgument;
+                return self.fallocateShift(c, local, probe, a.offset, a.length, insert);
+            }
+            const size = self.claimedSize(local, probe);
+            var changed = false;
+            if (punch or zero) {
+                const upto = @min(end, size);
+                if (a.offset < upto) {
+                    try self.fallocateZero(c, local, probe, a.offset, upto, zero, &changed);
+                }
+            }
+            if (!punch) {
+                // The reservation: allocate's whole range, ZERO_RANGE's whole
+                // blocks (the in-bounds edges were zeroed above; a whole
+                // block flips, a hole is reserved, nothing past EOF needs a
+                // zero).
+                const first_b: u64 = if (zero) (a.offset + bs - 1) / bs else a.offset / bs;
+                const last_b: u64 = if (zero) (if (end / bs == 0) 0 else end / bs - 1) else (end - 1) / bs;
+                if (!zero or first_b <= last_b) {
+                    if (try self.fallocateReserve(c, local, end, @intCast(first_b), @intCast(last_b), zero)) changed = true;
+                }
+            }
+            if (grows and end > size) {
+                // The truncate-up path: the extension law's zeros on a
+                // mapped EOF block, the size epoch, the size and the stamps
+                // in ONE commit (`setattr`'s law for a size set).
+                _ = try self.setattr(c, .{ .ino = a.ino, .attr = .{ .size = end } });
+                fuse_fallocate_extends.inc();
+                return;
+            }
+            if (changed) try self.stampTimes(c, a.ino, local);
+        }
+
+        /// Allocate's reservation of `[first, last]` on a striped file (a
+        /// non-striped one promotes first, unless the range lies inside the
+        /// inline bound and the file is inline: the record IS the storage).
+        /// True iff a block was reserved or zeroed.
+        fn fallocateReserve(self: *Self, c: *Ctx, local: u64, end: u64, first: u32, last: u32, zeroing: bool) Error!bool {
+            if (!self.data.hasVolumes()) return false;
+            var layout_lock: ?Data.LayoutGuard = self.data.lockLayout(self.io, local);
+            defer self.dropLayoutLock(&layout_lock);
+            const rec = try self.readLayout(local);
+            defer self.freeLayout(rec);
+            const kind = kindOf(rec);
+            if (kind != .striped) {
+                if (kind == .inline_ and end <= self.inline_max and !self.foreignSlot(globalOf(local))) return false;
+                const v = try self.readInode(local);
+                _ = try self.promoteToStriped(c, local, rec, v.size);
+                fuse_fallocate_promotions.inc();
+            }
+            self.dropLayoutLock(&layout_lock);
+            const r = self.data.reserveBlocks(self.io, local, first, last, zeroing) catch |e| return writeError(e);
+            fuse_fallocate_blocks_reserved.add(r.reserved);
+            fuse_fallocate_blocks_zeroed.add(r.zeroed);
+            return r.reserved != 0 or r.zeroed != 0;
+        }
+
+        /// PUNCH_HOLE's and ZERO_RANGE's in-bounds range `[off, upto)` per
+        /// layout kind: inline → the record's bytes zeroed in one tx;
+        /// staged / packed → the image re-staged with the zeros (the
+        /// truncate's re-stage); striped → the custody settled, the partial
+        /// edges inside WRITTEN blocks zeroed through the write admission,
+        /// and for the punch the whole blocks freed (ZERO_RANGE's whole
+        /// blocks are the reservation's). A foreign-slot file takes the
+        /// striped arm. `changed` is set when anything moved.
+        fn fallocateZero(self: *Self, c: *Ctx, local: u64, probe: InodeValue, off: u64, upto: u64, zeroing: bool, changed: *bool) Error!void {
+            const bs = self.block_size;
+            var layout_lock: ?Data.LayoutGuard = if (self.data.hasVolumes()) self.data.lockLayout(self.io, local) else null;
+            defer self.dropLayoutLock(&layout_lock);
+            const rec = try self.readLayout(local);
+            defer self.freeLayout(rec);
+            var kind = kindOf(rec);
+            if (kind != .striped and self.data.hasVolumes() and self.foreignSlot(globalOf(local))) {
+                _ = try self.promoteToStriped(c, local, rec, probe.size);
+                fuse_fallocate_promotions.inc();
+                kind = .striped;
+            }
+            switch (kind) {
+                .inline_ => {
+                    const r = rec orelse return; // never written: zeros already
+                    const data_end = @min(upto, r.layout.data.len);
+                    if (off >= data_end) return;
+                    const buf = try self.gpa.dupe(u8, r.layout.data);
+                    defer self.gpa.free(buf);
+                    @memset(buf[@intCast(off)..@intCast(data_end)], 0);
+                    const t = try self.beginExclusive(local, @src());
+                    var t_owned = true;
+                    errdefer if (t_owned) self.store.abandon(t);
+                    try self.publish(t, local, rec, Layout.inlineData(r.layout.size, buf), &.{});
+                    t_owned = false;
+                    try self.commit(c, t);
+                    changed.* = true;
+                },
+                .staged, .packed_ => {
+                    const r = rec.?;
+                    var after: AfterCommit = .{};
+                    defer self.dropAfter(&after);
+                    const image_len = @max(probe.size, @as(u64, if (r.layout.durableCopy()) |m| m.len else 0));
+                    const buf = try self.gpa.alloc(u8, @intCast(layout.ceilGrain(@max(image_len, 1))));
+                    defer self.gpa.free(buf);
+                    const got = try self.residentImage(local, rec, buf);
+                    const data_end = @min(upto, got);
+                    if (off >= data_end) return;
+                    @memset(buf[@intCast(off)..@intCast(data_end)], 0);
+                    const k = stagingKeyOf(local, r.layout);
+                    _ = try self.data.stageImage(k, buf[0..got], .none);
+                    const t = try self.beginExclusive(local, @src());
+                    var t_owned = true;
+                    errdefer if (t_owned) self.store.abandon(t);
+                    try self.publish(t, local, rec, Layout.staged(r.layout.size, r.layout.file_id, null), &.{});
+                    if (r.layout.durableCopy()) |m| after.push(0, m);
+                    self.holdAfter(&after);
+                    t_owned = false;
+                    try self.commit(c, t);
+                    self.afterCommit(&after);
+                    fuse_truncate_restages.inc();
+                    changed.* = true;
+                },
+                .striped => {
+                    self.dropLayoutLock(&layout_lock);
+                    // The custody lands first: the whole blocks the punch
+                    // frees and the edges it zeroes are the map's truth, not
+                    // a parked buffer's (§AL's settle, as the truncate's).
+                    self.settleCustody(local, .striped);
+                    const size = self.claimedSize(local, probe);
+                    const first_whole = (off + bs - 1) / bs;
+                    const end_whole = upto / bs; // exclusive
+                    // The head edge: [off, min(upto, its block end)) when
+                    // off is not block-aligned.
+                    if (off % bs != 0) {
+                        const edge_end = @min(upto, (off / bs + 1) * bs);
+                        try self.zeroEdge(local, off, edge_end, size, changed);
+                    }
+                    // The tail edge: [its block start, upto) when upto is
+                    // not block-aligned and lies in another block.
+                    if (upto % bs != 0 and upto / bs > off / bs) {
+                        try self.zeroEdge(local, (upto / bs) * bs, upto, size, changed);
+                    }
+                    if (!zeroing and first_whole < end_whole) {
+                        const freed = try self.data.punchBlocks(self.io, local, @intCast(first_whole), @intCast(end_whole - 1));
+                        fuse_fallocate_blocks_punched.add(freed);
+                        if (freed != 0) changed.* = true;
+                    }
+                },
+            }
+        }
+
+        /// A partial edge's zeros inside a WRITTEN block through the write
+        /// admission; a hole's or a reservation's reads zeros already.
+        fn zeroEdge(self: *Self, local: u64, from: u64, to: u64, size: u64, changed: *bool) Error!void {
+            if (to <= from) return;
+            if (self.data.boundAt(local, @intCast(from / self.block_size)) != .written) return;
+            self.data.zeroRange(self.io, local, from, to - from, size) catch |e| return writeError(e);
+            fuse_fallocate_edge_zero_bytes.add(to - from);
+            changed.* = true;
+        }
+
+        /// COLLAPSE_RANGE / INSERT_RANGE: the striped map's shift (a
+        /// non-striped file promotes first), then the size commit under
+        /// the size epoch with the stamps.
+        fn fallocateShift(self: *Self, c: *Ctx, local: u64, probe: InodeValue, off: u64, len: u64, insert: bool) Error!void {
+            const bs = self.block_size;
+            const size = self.claimedSize(local, probe);
+            if (insert) {
+                if (off >= size) return error.InvalidArgument;
+                const grown = std.math.add(u64, size, len) catch return error.FileTooBig;
+                if (grown > self.maxFileSize()) {
+                    fuse_write_u32_index_refused.inc();
+                    return error.FileTooBig;
+                }
+            } else if (off + len >= size) return error.InvalidArgument;
+            if (!self.data.hasVolumes()) {
+                fuse_fallocate_shift_refusals.inc();
+                return error.NotSupported;
+            }
+            {
+                var layout_lock: ?Data.LayoutGuard = self.data.lockLayout(self.io, local);
+                defer self.dropLayoutLock(&layout_lock);
+                const rec = try self.readLayout(local);
+                defer self.freeLayout(rec);
+                if (kindOf(rec) != .striped) {
+                    _ = try self.promoteToStriped(c, local, rec, probe.size);
+                    fuse_fallocate_promotions.inc();
+                }
+            }
+            // Every custody lands: the map the shift re-indexes is whole.
+            self.settleCustody(local, .striped);
+            try self.data.barrierData(self.io, &.{local});
+            const freed = self.data.shiftBlocks(self.io, local, .{ .at = @intCast(off / bs), .blocks = @intCast(len / bs), .dir = if (insert) .insert else .collapse }) catch |e| return switch (e) {
+                error.Unsupported => blk: {
+                    fuse_fallocate_shift_refusals.inc();
+                    break :blk error.NotSupported;
+                },
+                else => |x| x,
+            };
+            fuse_fallocate_blocks_punched.add(freed);
+            fuse_fallocate_shifts.inc();
+            const new_size = if (insert) size + len else size - len;
+            try self.commitSize(c, local, new_size);
+        }
+
+        /// A size set that owes the data plane nothing (the shift moved the
+        /// map): the size epoch bumps under the guards, the inode's size
+        /// and stamps commit in ONE record, the parked claim retires
+        /// (`setattr`'s tail without the truncate's clip and the extension
+        /// law — a shift's bytes past its new EOF are the moved blocks' own).
+        fn commitSize(self: *Self, c: *Ctx, local: u64, new_size: u64) Error!void {
+            if (self.foreignSlot(globalOf(local))) {
+                const stamp = now();
+                _ = try self.shipRecord(globalOf(local), .{ .setattr = .{ .mode = null, .uid = null, .gid = null, .size = new_size, .atime = null, .mtime = stamp, .ctime = stamp } });
+                self.data.noteShape(local, new_size, .striped);
+                return;
+            }
+            const t = try self.beginExclusive(local, @src());
+            var t_owned = true;
+            errdefer if (t_owned) self.store.abandon(t);
+            try self.data.noteSizeSet(local);
+            var stored = try self.readInode(local);
+            stored.size = self.claimedSize(local, stored);
+            const stamp = now();
+            const out = try economy.stageSetattr(t, &self.pending, local, stored, .{ .size = new_size, .mtime = stamp, .ctime = stamp }, stamp);
+            if (out.verdict == .absorbed) {
+                t_owned = false;
+                self.store.abandon(t);
+                return;
+            }
+            t_owned = false;
+            const clip = self.pending.clipClaim(local, new_size);
+            self.commit(c, t) catch |e| {
+                if (clip) |cl| _ = try self.pending.parkClaim(local, cl.before);
+                return e;
+            };
+            if (clip) |cl| _ = self.pending.retireIfStill(local, cl.after);
+            self.data.noteShape(local, new_size, .striped);
+        }
+
+        /// mtime/ctime of a fallocate that changed the file without moving
+        /// its size: a size-less SETATTR of the stamps (the economy's
+        /// absorber keeps an echo out; a foreign-slot file's ships).
+        fn stampTimes(self: *Self, c: *Ctx, global: u64, local: u64) Error!void {
+            _ = local;
+            const stamp = now();
+            _ = try self.setattr(c, .{ .ino = global, .attr = .{ .mtime = stamp, .ctime = stamp } });
         }
 
         pub fn readlink(self: *Self, c: *Ctx, a: filesystem.ReadlinkArgs) Error!filesystem.Data {
@@ -4671,6 +5028,27 @@ pub const NoData = struct {
         unreachable;
     }
     pub fn drainKvmapSweep(_: *NoData, _: u64, _: u64) void {}
+    /// fallocate's block-level acts (charter §6.6): every file of a
+    /// volume-less set is inline, so none is ever asked.
+    pub const Reserved = write_admit.WritePath.Reserved;
+    pub const Shift = seams.MapSeam.Shift;
+    pub const ShiftError = Error || error{Unsupported};
+    pub const Bound = enum { hole, reserved, written };
+    pub fn reserveBlocks(_: *NoData, _: Io, _: u64, _: u32, _: u32, _: bool) write_admit.Error!Reserved {
+        unreachable;
+    }
+    pub fn punchBlocks(_: *NoData, _: Io, _: u64, _: u32, _: u32) Error!u64 {
+        unreachable;
+    }
+    pub fn shiftBlocks(_: *NoData, _: Io, _: u64, _: Shift) ShiftError!u64 {
+        unreachable;
+    }
+    pub fn boundAt(_: *NoData, _: u64, _: u32) Bound {
+        unreachable;
+    }
+    pub fn zeroRange(_: *NoData, _: Io, _: u64, _: u64, _: u64, _: u64) write_admit.Error!void {
+        unreachable;
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -4991,9 +5369,9 @@ test "KILLPRIV_V2 mode law: suid always; sgid iff group-exec" {
     try testing.expectEqual(@as(u32, 0o644), killSuidgidMode(0o644));
 }
 
-test "the must-implement set is bound; the rung-4 ops default to ENOSYS" {
+test "the must-implement set is bound, fallocate among it (charter §6.6); the rung-4 ops default to ENOSYS" {
     try testing.expect(filesystem.Filesystem.implementsMustSet(MemFs));
-    try testing.expect(!@hasDecl(MemFs, "fallocate"));
+    try testing.expect(@hasDecl(MemFs, "fallocate"));
     try testing.expect(!@hasDecl(MemFs, "access"));
 }
 
@@ -5144,6 +5522,10 @@ fn HarnessOf(comptime Data: type) type {
             return self.call(.{ .setattr = in }, ino);
         }
 
+        fn fallocate(self: *Self, ino: u64, mode: u32, offset: u64, length: u64) ?linux.E {
+            return self.call(.{ .fallocate = .{ .fh = 1, .offset = offset, .length = length, .mode = mode, .padding = 0 } }, ino).errno();
+        }
+
         fn release(self: *Self, ino: u64) void {
             _ = self.call(.{ .release = .{ .fh = 1, .flags = 0, .release_flags = 0, .lock_owner = 0 } }, ino);
         }
@@ -5292,6 +5674,23 @@ const SettlingData = struct {
     guards: ?*op_guard.Table = null,
     guard_nodeid: u64 = 0,
     shared_refused_at_flush: ?bool = null,
+    /// fallocate's block-level acts, recorded (what the handler asks IS the
+    /// contract): the RAM block map `bound` per `(ino, block)`, the calls,
+    /// and the refusals a test arms.
+    bound: std.AutoHashMapUnmanaged(u64, Bound) = .empty,
+    reservations: std.ArrayList(Fallocated) = .empty,
+    punches: std.ArrayList(Punched) = .empty,
+    shifts: std.ArrayList(Shifted) = .empty,
+    reserve_refuse: ?write_admit.Error = null,
+    shift_unsupported: bool = false,
+
+    pub const Reserved = write_admit.WritePath.Reserved;
+    pub const Shift = seams.MapSeam.Shift;
+    pub const ShiftError = Error || error{Unsupported};
+    pub const Bound = enum { hole, reserved, written };
+    pub const Fallocated = struct { ino: u64, first: u32, last: u32, zeroing: bool };
+    pub const Punched = struct { ino: u64, first: u32, last: u32 };
+    pub const Shifted = struct { ino: u64, s: Shift };
 
     pub const RamRing = struct {
         image: []u8,
@@ -5336,6 +5735,10 @@ const SettlingData = struct {
 
     fn deinit(self: *SettlingData) void {
         if (self.epochs) |*e| e.deinit();
+        self.bound.deinit(testing.allocator);
+        self.reservations.deinit(testing.allocator);
+        self.punches.deinit(testing.allocator);
+        self.shifts.deinit(testing.allocator);
         self.freed.deinit(testing.allocator);
         self.adds.deinit(testing.allocator);
         self.releases.deinit(testing.allocator);
@@ -5630,6 +6033,58 @@ const SettlingData = struct {
         unreachable;
     }
     pub fn drainKvmapSweep(_: *SettlingData, _: u64, _: u64) void {}
+
+    // ---- fallocate's block-level acts (recorded) ----
+    fn boundKey(ino: u64, block: u32) u64 {
+        return ino << 32 | block;
+    }
+    pub fn setBound(self: *SettlingData, ino: u64, block: u32, b: Bound) void {
+        self.bound.put(testing.allocator, boundKey(ino, block), b) catch unreachable;
+    }
+    pub fn reserveBlocks(self: *SettlingData, _: Io, ino: u64, first: u32, last: u32, zeroing: bool) write_admit.Error!Reserved {
+        if (self.reserve_refuse) |e| return e;
+        self.reservations.append(testing.allocator, .{ .ino = ino, .first = first, .last = last, .zeroing = zeroing }) catch return error.OutOfMemory;
+        var out: Reserved = .{};
+        var b = first;
+        while (b <= last) : (b += 1) {
+            switch (self.boundAt(ino, b)) {
+                .hole => {
+                    self.setBound(ino, b, .reserved);
+                    out.reserved += 1;
+                },
+                .written => if (zeroing) {
+                    self.setBound(ino, b, .reserved);
+                    out.zeroed += 1;
+                },
+                .reserved => {},
+            }
+        }
+        return out;
+    }
+    pub fn punchBlocks(self: *SettlingData, _: Io, ino: u64, first: u32, last: u32) Error!u64 {
+        self.punches.append(testing.allocator, .{ .ino = ino, .first = first, .last = last }) catch return error.OutOfMemory;
+        var freed: u64 = 0;
+        var b = first;
+        while (b <= last) : (b += 1) {
+            if (self.boundAt(ino, b) == .hole) continue;
+            self.setBound(ino, b, .hole);
+            freed += 1;
+        }
+        return freed;
+    }
+    pub fn shiftBlocks(self: *SettlingData, _: Io, ino: u64, s: Shift) ShiftError!u64 {
+        if (self.shift_unsupported) return error.Unsupported;
+        self.shifts.append(testing.allocator, .{ .ino = ino, .s = s }) catch return error.OutOfMemory;
+        return 0;
+    }
+    pub fn boundAt(self: *SettlingData, ino: u64, block: u32) Bound {
+        return self.bound.get(boundKey(ino, block)) orelse .hole;
+    }
+    /// A PUNCH/ZERO edge's zeros: the double's striped write records it.
+    pub fn zeroRange(self: *SettlingData, _: Io, _: u64, offset: u64, len: u64, size: u64) write_admit.Error!void {
+        if (self.write_refuse) |e| return e;
+        self.writes.append(testing.allocator, .{ .offset = offset, .len = len, .view_size = size }) catch return error.OutOfMemory;
+    }
 };
 
 test "the corpse destroy settles the write-side custody BEFORE it reads the layout it frees, under (3.7): the flush's merge moved the file onto a fresh block — the plan frees the fresh block once and the displaced one never again (repro-port: fstests generic/013, fsstress write+truncate+unlink — fsck C2/C8 `durable 1 vs derived 0`, block_untracked_free_refusals)" {
@@ -7072,6 +7527,186 @@ fn awaitCoarseTickAfter(stamp: u64) void {
     while (!economy.laterThan(@bitCast(clock.realtimeCoarseNs()), stamp)) std.atomic.spinLoopHint();
 }
 
+test "fallocate (charter §6.6) — the mode law and the inline arms on a volume-less set: a zero length is EINVAL, an unknown bit, PUNCH without KEEP_SIZE and PUNCH with ZERO are EOPNOTSUPP, COLLAPSE with any other bit is EINVAL, a directory EISDIR; mode 0 inside the inline bound reserves nothing and extends the size with mtime/ctime, KEEP_SIZE there changes nothing (no stamp); past the bound EFBIG (the set's largest file); PUNCH zeroes the record's bytes and keeps the size; ZERO_RANGE past EOF extends" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    const f = try h.create(1, "f", 0o644);
+    const d = try h.mkdir(1, "d");
+    const KEEP = Harness.Fs.FALLOC.KEEP_SIZE;
+    const PUNCH = Harness.Fs.FALLOC.PUNCH_HOLE;
+    const ZERO = Harness.Fs.FALLOC.ZERO_RANGE;
+    const COLLAPSE = Harness.Fs.FALLOC.COLLAPSE_RANGE;
+    // The mode law.
+    try testing.expectEqual(@as(?linux.E, .INVAL), h.fallocate(f, 0, 0, 0));
+    try testing.expectEqual(@as(?linux.E, .OPNOTSUPP), h.fallocate(f, 0x80, 0, 10));
+    try testing.expectEqual(@as(?linux.E, .OPNOTSUPP), h.fallocate(f, Harness.Fs.FALLOC.NO_HIDE_STALE, 0, 10));
+    try testing.expectEqual(@as(?linux.E, .OPNOTSUPP), h.fallocate(f, PUNCH, 0, 10));
+    try testing.expectEqual(@as(?linux.E, .OPNOTSUPP), h.fallocate(f, PUNCH | KEEP | ZERO, 0, 10));
+    try testing.expectEqual(@as(?linux.E, .INVAL), h.fallocate(f, COLLAPSE | KEEP, 0, 10));
+    try testing.expectEqual(@as(?linux.E, .ISDIR), h.fallocate(d, 0, 0, 10));
+    // mode 0 inside the inline bound: the size rises, the stamps move.
+    const a0 = try h.getattr(f);
+    try testing.expectEqual(@as(?linux.E, null), h.fallocate(f, 0, 0, 1000));
+    const a1 = try h.getattr(f);
+    try testing.expectEqual(@as(u64, 1000), a1.size);
+    try testing.expect(a1.mtime > a0.mtime or (a1.mtime == a0.mtime and a1.mtimensec >= a0.mtimensec));
+    // KEEP_SIZE inside the bound: nothing to reserve, nothing changes.
+    const commits = h.store.commits;
+    try testing.expectEqual(@as(?linux.E, null), h.fallocate(f, KEEP, 0, 2000));
+    try testing.expectEqual(commits, h.store.commits);
+    try testing.expectEqual(@as(u64, 1000), (try h.getattr(f)).size);
+    // Past the bound on a volume-less set: EFBIG (as a write is), counted.
+    const refused0 = fuse_write_no_data_volume_refused.load();
+    try testing.expectEqual(@as(?linux.E, .FBIG), h.fallocate(f, 0, 0, h.fs.inline_max + 1));
+    try testing.expectEqual(refused0 + 1, fuse_write_no_data_volume_refused.load());
+    // PUNCH_HOLE on an inline file: the bytes in range read zeros, the
+    // size stands, the rest is intact.
+    const payload: [600]u8 = @splat('P');
+    try testing.expectEqual(@as(?linux.E, null), h.write(f, 0, &payload, 0).errno());
+    try testing.expectEqual(@as(?linux.E, null), h.fallocate(f, PUNCH | KEEP, 100, 200));
+    const r = h.read(f, 0, 1000);
+    try testing.expectEqual(@as(usize, 1000), r.body.len);
+    try testing.expect(std.mem.allEqual(u8, r.body[0..100], 'P'));
+    try testing.expect(std.mem.allEqual(u8, r.body[100..300], 0));
+    try testing.expect(std.mem.allEqual(u8, r.body[300..600], 'P'));
+    try testing.expect(std.mem.allEqual(u8, r.body[600..1000], 0));
+    try testing.expectEqual(@as(u64, 1000), (try h.getattr(f)).size);
+    // ZERO_RANGE past EOF without KEEP_SIZE: the size rises to its end.
+    try testing.expectEqual(@as(?linux.E, null), h.fallocate(f, ZERO, 900, 300));
+    try testing.expectEqual(@as(u64, 1200), (try h.getattr(f)).size);
+    try testing.expectEqual(@as(?linux.E, null), h.fallocate(f, ZERO | KEEP, 1100, 300));
+    try testing.expectEqual(@as(u64, 1200), (try h.getattr(f)).size);
+    // A shift on a volume-less set: the block grain is unreachable.
+    try testing.expectEqual(@as(?linux.E, .INVAL), h.fallocate(f, COLLAPSE, 0, 100));
+    h.release(f);
+}
+
+test "fallocate (charter §6.6) — the striped arms through the plane's face: allocate reserves every block of the range (KEEP_SIZE: the size stands; without it the size rises through the truncate-up path with the extension law), an inline file past its bound promotes first; PUNCH settles the custody, zeroes a partial edge inside a WRITTEN block only (a hole or a reservation reads zeros already) and frees the whole blocks; ZERO_RANGE zeroes the edges and flips/reserves the whole blocks without freeing; COLLAPSE/INSERT need block alignment, shift the map after the custody landed and move the size; a shift the plane refuses is EOPNOTSUPP with the size standing; a refused reservation is ENOSPC" {
+    const H = HarnessOf(SettlingData);
+    var h: H = undefined;
+    try h.init();
+    defer h.deinit();
+    defer h.data.deinit();
+    h.data.store = &h.store;
+    const bs = layout.DEFAULT_CHUNK;
+    const KEEP = H.Fs.FALLOC.KEEP_SIZE;
+    const PUNCH = H.Fs.FALLOC.PUNCH_HOLE;
+    const ZERO = H.Fs.FALLOC.ZERO_RANGE;
+    const COLLAPSE = H.Fs.FALLOC.COLLAPSE_RANGE;
+    const INSERT = H.Fs.FALLOC.INSERT_RANGE;
+    const f = try h.create(1, "f", 0o644);
+    const local = try H.Fs.localOf(f);
+    // 1. allocate KEEP_SIZE on a fresh (inline, empty) file past the bound:
+    //    the file promotes (an empty striped map) and blocks 0..2 reserve;
+    //    the size stays 0; a reservation stamps the times.
+    const prom0 = fuse_fallocate_promotions.load();
+    const a0 = try h.getattr(f);
+    try testing.expectEqual(@as(?linux.E, null), h.fallocate(f, KEEP, 0, 3 * bs));
+    try testing.expectEqual(prom0 + 1, fuse_fallocate_promotions.load());
+    try testing.expectEqual(@as(usize, 1), h.data.reservations.items.len);
+    try testing.expectEqual(SettlingData.Fallocated{ .ino = local, .first = 0, .last = 2, .zeroing = false }, h.data.reservations.items[0]);
+    try testing.expectEqual(@as(u64, 0), (try h.getattr(f)).size);
+    {
+        const rec = try h.fs.readLayout(local);
+        defer h.fs.freeLayout(rec);
+        try testing.expectEqual(layout.Kind.striped, rec.?.layout.kind);
+    }
+    try testing.expectEqual(SettlingData.Bound.reserved, h.data.boundAt(local, 2));
+    const a1 = try h.getattr(f);
+    try testing.expect(a1.ctime > a0.ctime or (a1.ctime == a0.ctime and a1.ctimensec >= a0.ctimensec));
+    // An idempotent re-reservation changes nothing and commits nothing.
+    const commits = h.store.commits;
+    try testing.expectEqual(@as(?linux.E, null), h.fallocate(f, KEEP, 0, 3 * bs));
+    try testing.expectEqual(commits, h.store.commits);
+    // 2. allocate without KEEP_SIZE: blocks 3..4 reserve and the size rises
+    //    to the end through the truncate-up path (the extension law asked
+    //    over [0, end) — nothing mapped at EOF, so it writes nothing).
+    try testing.expectEqual(@as(?linux.E, null), h.fallocate(f, 0, 3 * bs + 10, 2 * bs));
+    try testing.expectEqual(@as(usize, 3), h.data.reservations.items.len); // the idempotent ask was asked too
+    try testing.expectEqual(SettlingData.Fallocated{ .ino = local, .first = 3, .last = 5, .zeroing = false }, h.data.reservations.items[2]);
+    try testing.expectEqual(@as(u64, 5 * bs + 10), (try h.getattr(f)).size);
+    try testing.expectEqual(@as(u64, 0), h.data.extension.?.old_size);
+    try testing.expectEqual(@as(u64, 5 * bs + 10), h.data.extension.?.new_size);
+    // 3. PUNCH_HOLE over [bs + 100, 4 bs + 100): blocks 1 and 2 written, 3
+    //    reserved, 4 a hole — the custody settles, the head edge inside
+    //    block 1 is zeroed through the write admission, the tail edge in
+    //    block 4 (a hole) is not, blocks 2..3 are punched (2 freed), the
+    //    size stands.
+    h.data.setBound(local, 0, .written);
+    h.data.setBound(local, 1, .written);
+    h.data.setBound(local, 2, .written);
+    h.data.setBound(local, 4, .hole);
+    const flushes0 = h.data.flushes;
+    const writes0 = h.data.writes.items.len;
+    const punched0 = fuse_fallocate_blocks_punched.load();
+    try testing.expectEqual(@as(?linux.E, null), h.fallocate(f, PUNCH | KEEP, bs + 100, 3 * bs));
+    try testing.expectEqual(flushes0 + 1, h.data.flushes);
+    try testing.expectEqual(writes0 + 1, h.data.writes.items.len);
+    try testing.expectEqual(@as(u64, bs + 100), h.data.writes.items[writes0].offset);
+    try testing.expectEqual(@as(u64, bs - 100), h.data.writes.items[writes0].len);
+    try testing.expectEqual(@as(usize, 1), h.data.punches.items.len);
+    try testing.expectEqual(SettlingData.Punched{ .ino = local, .first = 2, .last = 3 }, h.data.punches.items[0]);
+    try testing.expectEqual(punched0 + 2, fuse_fallocate_blocks_punched.load());
+    try testing.expectEqual(SettlingData.Bound.hole, h.data.boundAt(local, 2));
+    try testing.expectEqual(SettlingData.Bound.hole, h.data.boundAt(local, 3));
+    try testing.expectEqual(@as(u64, 5 * bs + 10), (try h.getattr(f)).size);
+    // A punch past EOF touches nothing.
+    try testing.expectEqual(@as(?linux.E, null), h.fallocate(f, PUNCH | KEEP, 10 * bs, bs));
+    try testing.expectEqual(@as(usize, 1), h.data.punches.items.len);
+    // 4. ZERO_RANGE | KEEP_SIZE over [100, 2 bs + 100): the head edge in
+    //    block 0 zeroed, block 1 flipped (zeroing), block 2 (a hole after
+    //    the punch) reserved, the tail edge in block 2 — a reservation now
+    //    — written nothing; the size stands.
+    const writes1 = h.data.writes.items.len;
+    try testing.expectEqual(@as(?linux.E, null), h.fallocate(f, ZERO | KEEP, 100, 2 * bs));
+    try testing.expectEqual(writes1 + 1, h.data.writes.items.len);
+    try testing.expectEqual(@as(u64, 100), h.data.writes.items[writes1].offset);
+    try testing.expectEqual(@as(u64, bs - 100), h.data.writes.items[writes1].len);
+    try testing.expectEqual(@as(usize, 4), h.data.reservations.items.len);
+    try testing.expectEqual(SettlingData.Fallocated{ .ino = local, .first = 1, .last = 1, .zeroing = true }, h.data.reservations.items[3]);
+    try testing.expectEqual(SettlingData.Bound.reserved, h.data.boundAt(local, 1));
+    try testing.expectEqual(@as(u64, 5 * bs + 10), (try h.getattr(f)).size);
+    // ZERO_RANGE without KEEP_SIZE past EOF: the whole blocks reserve, the size rises.
+    try testing.expectEqual(@as(?linux.E, null), h.fallocate(f, ZERO, 5 * bs, 2 * bs));
+    try testing.expectEqual(SettlingData.Fallocated{ .ino = local, .first = 5, .last = 6, .zeroing = true }, h.data.reservations.items[4]);
+    try testing.expectEqual(@as(u64, 7 * bs), (try h.getattr(f)).size);
+    // 5. COLLAPSE / INSERT: the block grain, the custody landed and
+    //    barriered, the shift, the size.
+    try testing.expectEqual(@as(?linux.E, .INVAL), h.fallocate(f, COLLAPSE, 100, bs));
+    try testing.expectEqual(@as(?linux.E, .INVAL), h.fallocate(f, COLLAPSE, bs, 100));
+    try testing.expectEqual(@as(?linux.E, .INVAL), h.fallocate(f, COLLAPSE, 6 * bs, bs)); // reaches EOF
+    try testing.expectEqual(@as(?linux.E, .INVAL), h.fallocate(f, INSERT, 7 * bs, bs)); // at EOF
+    const flushes1 = h.data.flushes;
+    const barriers0 = h.data.data_barriers;
+    try testing.expectEqual(@as(?linux.E, null), h.fallocate(f, COLLAPSE, bs, 2 * bs));
+    try testing.expectEqual(flushes1 + 1, h.data.flushes);
+    try testing.expectEqual(barriers0 + 1, h.data.data_barriers);
+    try testing.expectEqual(@as(usize, 1), h.data.shifts.items.len);
+    try testing.expectEqual(SettlingData.Shift{ .at = 1, .blocks = 2, .dir = .collapse }, h.data.shifts.items[0].s);
+    try testing.expectEqual(@as(u64, 5 * bs), (try h.getattr(f)).size);
+    try testing.expectEqual(@as(?linux.E, null), h.fallocate(f, INSERT, 0, bs));
+    try testing.expectEqual(SettlingData.Shift{ .at = 0, .blocks = 1, .dir = .insert }, h.data.shifts.items[1].s);
+    try testing.expectEqual(@as(u64, 6 * bs), (try h.getattr(f)).size);
+    // A shift the plane refuses: EOPNOTSUPP, counted, the size standing.
+    h.data.shift_unsupported = true;
+    const ref0 = fuse_fallocate_shift_refusals.load();
+    try testing.expectEqual(@as(?linux.E, .OPNOTSUPP), h.fallocate(f, COLLAPSE, bs, bs));
+    try testing.expectEqual(ref0 + 1, fuse_fallocate_shift_refusals.load());
+    try testing.expectEqual(@as(u64, 6 * bs), (try h.getattr(f)).size);
+    h.data.shift_unsupported = false;
+    // 6. A reservation the store cannot cover: ENOSPC, the size standing.
+    h.data.reserve_refuse = error.NoSpaceLeft;
+    try testing.expectEqual(@as(?linux.E, .NOSPC), h.fallocate(f, 0, 20 * bs, bs));
+    try testing.expectEqual(@as(u64, 6 * bs), (try h.getattr(f)).size);
+    h.data.reserve_refuse = null;
+    // The u32 block ceiling: EFBIG, counted.
+    const u32_0 = fuse_write_u32_index_refused.load();
+    try testing.expectEqual(@as(?linux.E, .FBIG), h.fallocate(f, KEEP, bs * @as(u64, std.math.maxInt(u32)), bs));
+    try testing.expectEqual(u32_0 + 1, fuse_write_u32_index_refused.load());
+    h.release(f);
+}
+
 test "POSIX: create → write → read → stat; an overlay write grows the file; a write past the inline bound on a volume-less set is EFBIG and counted; truncate clips, empties at 0 and zero-extends" {
     var h: Harness = undefined;
     try h.init();
@@ -8102,7 +8737,8 @@ test "POSIX: fsync reaches the store's barrier; statfs reports the heap in pages
     _ = h.call(.{ .releasedir = .{ .fh = 1, .flags = 0, .release_flags = 0, .lock_owner = 0 } }, 1);
     // ENOSYS for the rung-4 and never ops; access under default_permissions.
     try testing.expectEqual(linux.E.NOSYS, h.call(.{ .access = .{ .mask = 4 } }, 1).errno().?);
-    try testing.expectEqual(linux.E.NOSYS, h.call(.{ .fallocate = abi.zeroed(abi.fuse_fallocate_in) }, f).errno().?);
+    // fallocate is served (charter §6.6): a zero length is the VFS's EINVAL.
+    try testing.expectEqual(linux.E.INVAL, h.call(.{ .fallocate = abi.zeroed(abi.fuse_fallocate_in) }, f).errno().?);
     h.release(f);
 }
 

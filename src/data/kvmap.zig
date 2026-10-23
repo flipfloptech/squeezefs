@@ -152,6 +152,9 @@ pub const stats = struct {
     pub var map_sweep_chunks: counters.ShardedCounter = .{};
     pub var map_sweep_records: counters.ShardedCounter = .{};
     pub var map_sweep_resumed: counters.ShardedCounter = .{};
+    /// Records a punch of a tree-mapped file read and re-canonicalized
+    /// (`stagePunch`, charter §6.6).
+    pub var map_punch_records: counters.ShardedCounter = .{};
     /// Corpses (unlinked tree-mapped files) the sweep's terminal chunk destroyed.
     pub var kvmap_corpses_destroyed: counters.ShardedCounter = .{};
     /// The window store: resident bytes / its budget, fills, hits, LRU
@@ -178,7 +181,7 @@ pub const stats = struct {
 
 pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
     try w.writeAll("{");
-    inline for (.{ "meta_kv_block_map_puts", "meta_kv_block_map_run_puts", "meta_kv_block_map_deletes", "meta_kv_block_map_lookup_exact", "meta_kv_block_map_lookup_floor", "meta_kv_block_map_lookup_range", "meta_kv_block_map_range_records", "publish_map_record_bytes", "kvmap_crossings", "map_migrate_records", "map_migrate_resumed", "kvmap_window_saves", "map_sweep_jobs", "map_sweep_chunks", "map_sweep_records", "map_sweep_resumed", "kvmap_corpses_destroyed", "block_map_window_bytes", "kvmap_write_map_budget_bytes", "block_map_window_fills", "block_map_window_hits", "block_map_window_evictions", "kvmap_windows_shed", "fsck_map_orphan_records", "fsck_map_empty_heads", "fsck_map_run_foreign_shadows" }) |name| {
+    inline for (.{ "meta_kv_block_map_puts", "meta_kv_block_map_run_puts", "meta_kv_block_map_deletes", "meta_kv_block_map_lookup_exact", "meta_kv_block_map_lookup_floor", "meta_kv_block_map_lookup_range", "meta_kv_block_map_range_records", "publish_map_record_bytes", "kvmap_crossings", "map_migrate_records", "map_migrate_resumed", "kvmap_window_saves", "map_sweep_jobs", "map_sweep_chunks", "map_sweep_records", "map_sweep_resumed", "map_punch_records", "kvmap_corpses_destroyed", "block_map_window_bytes", "kvmap_write_map_budget_bytes", "block_map_window_fills", "block_map_window_hits", "block_map_window_evictions", "kvmap_windows_shed", "fsck_map_orphan_records", "fsck_map_empty_heads", "fsck_map_run_foreign_shadows" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, @field(stats, name).load() });
     }
     try w.print("\"meta_kv_block_map_leaf_reads\":{d},\"kvmap_owner_mismatch\":{d},\"kvmap_merge_displaced_overflow\":{d}}}", .{ node_cache.stats.meta_kv_block_map_leaf_reads.load(), counters.tripwireCount("kvmap_owner_mismatch"), counters.tripwireCount("kvmap_merge_displaced_overflow") });
@@ -541,6 +544,62 @@ pub fn stageWindow(store: Store, gpa: Allocator, t: *KvTx, ino: u64, inserts: []
 
 fn refOf(ino: u64, block: u32, m: Mapping, chunk: u64) block_refs.Reference {
     return .{ .vol_tag = m.vol_tag, .block_idx = m.blockIdx(chunk), .owner_ino = ino, .block_index = block };
+}
+
+/// PUNCH_HOLE's whole blocks on a tree-mapped file (charter §6.6): the
+/// records covering `[first, last]` and their straddling neighbours loaded
+/// as `stageWindow` loads a window, the bound indices of the range cleared
+/// — at most `MergeOutcome.max_displaced` per call, ascending; the rest is
+/// the caller's next call — the span re-canonicalized (a run keeps its
+/// head and its tail as records of their own; an index with a record of
+/// its own supersedes the run it lies in, as every read of the tree
+/// resolves it), the diff and the `−ref` of every cleared index staged.
+/// The cleared bindings come back in `out.displaced`.
+pub fn stagePunch(store: Store, gpa: Allocator, t: *KvTx, ino: u64, first: u32, last: u32, chunk: u64, out: *seams.MergeOutcome) Error!void {
+    var old: std.ArrayList(Rec) = .empty;
+    defer old.deinit(gpa);
+    if (first > 0) {
+        if (try lookupRecord(store, gpa, ino, first - 1, chunk)) |r| try old.append(gpa, r);
+    }
+    try rangeBounded(store, gpa, ino, first, last, @as(usize, last - first) + 1, chunk, &old);
+    if (old.items.len == 0) return;
+    var span_lo: u32 = first;
+    var span_hi: u64 = @as(u64, last) + 1;
+    for (old.items) |r| {
+        span_lo = @min(span_lo, r.index);
+        span_hi = @max(span_hi, r.end());
+    }
+    const n: usize = @intCast(span_hi - span_lo);
+    const cells = try gpa.alloc(?Mapping, n);
+    defer gpa.free(cells);
+    @memset(cells, null);
+    for (old.items) |r| {
+        var b: u32 = r.index;
+        while (b < r.end()) : (b += 1) cells[b - span_lo] = r.bindingAt(b, chunk);
+    }
+    var ref_ops: std.ArrayList(block_refs.RefOp) = .empty;
+    defer ref_ops.deinit(gpa);
+    var b: u32 = first;
+    while (b <= last) : (b += 1) {
+        const cell = &cells[b - span_lo];
+        const m = cell.* orelse continue;
+        if (out.n_displaced == seams.MergeOutcome.max_displaced) break;
+        out.displaced[out.n_displaced] = m;
+        out.n_displaced += 1;
+        try ref_ops.append(gpa, block_refs.released(refOf(ino, b, m, chunk)));
+        cell.* = null;
+    }
+    if (out.n_displaced == 0) return;
+    var fresh: std.ArrayList(Rec) = .empty;
+    defer fresh.deinit(gpa);
+    try fresh.ensureTotalCapacity(gpa, n);
+    for (cells, 0..) |c, i| {
+        if (c) |m| fresh.appendAssumeCapacity(Rec.point(@intCast(span_lo + i), m));
+    }
+    fresh.items.len = canonicalize(fresh.items, chunk);
+    try stageDiff(t, ino, old.items, fresh.items);
+    try block_refs.stageOps(t, ref_ops.items);
+    stats.map_punch_records.add(@intCast(old.items.len + fresh.items.len));
 }
 
 /// Stage `fresh` over `old` (both ascending by index): a Put for every
@@ -1424,6 +1483,91 @@ test "the window put: sequential per-block merges grow ONE run at the left edge 
     }
     try testing.expectEqual(exact0 + 1, stats.meta_kv_block_map_lookup_exact.load());
     try testing.expectEqual(range0 + 1, stats.meta_kv_block_map_lookup_range.load());
+}
+
+test "the punch of a tree-mapped file (charter §6.6): an interior range of a run frees exactly its bound indices with their −refs and leaves the run's head and tail as records of their own; a superseding point inside the range frees ITS binding, never the run's; a reservation in the range frees like any binding; nothing outside the range moves; a second punch of the range frees nothing and stages nothing; the save's width bounds one call" {
+    const gpa = testing.allocator;
+    var ts = TestStore.init(gpa);
+    defer ts.deinit();
+    const s = ts.store();
+    const S0: u64 = 1 << 40 | 1;
+    // One run [0, 16) on vol 1, a point at 5 on vol 2, a reservation at 8.
+    var b: u32 = 0;
+    while (b < 16) : (b += 1) {
+        var t = KvTx.init(gpa, @src());
+        var out: seams.MergeOutcome = .{};
+        try stageWindow(s, gpa, &t, INO, &.{.{ .block = b, .binding = wb(1, 500 + b, S0 + b) }}, CHUNK, &out);
+        try ts.commit(&t);
+    }
+    {
+        var t = KvTx.init(gpa, @src());
+        var out: seams.MergeOutcome = .{};
+        try stageWindow(s, gpa, &t, INO, &.{ .{ .block = 5, .binding = wb(2, 9, 1 << 40 | 700) }, .{ .block = 8, .binding = Mapping.unwrittenBlock(1, 9 * CHUNK, S0 + 99) } }, CHUNK, &out);
+        try testing.expectEqual(@as(u8, 2), out.n_displaced);
+        try ts.commit(&t);
+    }
+    const refs_before = ts.countKind(key.TREE_BLOCK_REFS);
+    try testing.expectEqual(@as(usize, 16), refs_before);
+    // Punch [3, 10]: 8 indices freed (3,4,5(the point),6,7,8(the reservation),9,10), the −refs staged.
+    {
+        var t = KvTx.init(gpa, @src());
+        var out: seams.MergeOutcome = .{};
+        const released0 = block_refs.stats.meta_kv_block_refs_released.load();
+        try stagePunch(s, gpa, &t, INO, 3, 10, CHUNK, &out);
+        try testing.expectEqual(@as(u8, 8), out.n_displaced);
+        try testing.expectEqual(released0 + 8, block_refs.stats.meta_kv_block_refs_released.load());
+        try testing.expect(out.displaced[2].eql(wb(2, 9, 1 << 40 | 700))); // index 5's own binding
+        try testing.expect(out.displaced[5].unwritten); // index 8's reservation
+        try ts.commit(&t);
+    }
+    try testing.expectEqual(refs_before - 8, ts.countKind(key.TREE_BLOCK_REFS));
+    b = 0;
+    while (b < 16) : (b += 1) {
+        const got = try lookup(s, gpa, INO, b, CHUNK);
+        if (b >= 3 and b <= 10) {
+            try testing.expect(got == null);
+        } else {
+            try testing.expect(got.?.eql(wb(1, 500 + b, S0 + b)));
+        }
+    }
+    // The head [0, 3) and the tail [11, 16) are records of their own.
+    try testing.expectEqual(@as(u32, 3), (try lookupExact(s, gpa, INO, 0, CHUNK)).?.len);
+    try testing.expectEqual(@as(u32, 5), (try lookupExact(s, gpa, INO, 11, CHUNK)).?.len);
+    try testing.expectEqual(@as(usize, 2), ts.countKind(key.TREE_BLOCK_MAP));
+    // Idempotent.
+    {
+        var t = KvTx.init(gpa, @src());
+        var out: seams.MergeOutcome = .{};
+        try stagePunch(s, gpa, &t, INO, 3, 10, CHUNK, &out);
+        try testing.expectEqual(@as(u8, 0), out.n_displaced);
+        try testing.expect(t.isEmpty());
+        try ts.commit(&t);
+    }
+    // The width: a range wider than the save frees the first
+    // `max_displaced` bound indices and leaves the rest for the next call.
+    const wide: u32 = @intCast(seams.MergeOutcome.max_displaced + 5);
+    b = 100;
+    while (b < 100 + wide) : (b += 1) {
+        var t = KvTx.init(gpa, @src());
+        var out: seams.MergeOutcome = .{};
+        try stageWindow(s, gpa, &t, INO, &.{.{ .block = b, .binding = wb(1, 1000 + b, S0 + 1000 + b) }}, CHUNK, &out);
+        try ts.commit(&t);
+    }
+    {
+        var t = KvTx.init(gpa, @src());
+        var out: seams.MergeOutcome = .{};
+        try stagePunch(s, gpa, &t, INO, 100, 100 + wide - 1, CHUNK, &out);
+        try testing.expectEqual(@as(u8, @intCast(seams.MergeOutcome.max_displaced)), out.n_displaced);
+        try ts.commit(&t);
+        try testing.expect((try lookup(s, gpa, INO, 100, CHUNK)) == null);
+        try testing.expect((try lookup(s, gpa, INO, 100 + wide - 1, CHUNK)) != null);
+        var t2 = KvTx.init(gpa, @src());
+        var out2: seams.MergeOutcome = .{};
+        try stagePunch(s, gpa, &t2, INO, 100, 100 + wide - 1, CHUNK, &out2);
+        try testing.expectEqual(@as(u8, 5), out2.n_displaced);
+        try ts.commit(&t2);
+        try testing.expect((try lookup(s, gpa, INO, 100 + wide - 1, CHUNK)) == null);
+    }
 }
 
 test "the crossing plan: a healthy first crossing is Puts only over an empty descent; an interrupted train's residue is reconciled — a changed binding is one same-key Put, a record beyond the final map is deleted, Puts lead and Deletes trail" {

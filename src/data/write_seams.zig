@@ -364,8 +364,28 @@ pub const MapSeam = struct {
         reserved: *const fn (ctx: *anyopaque, ino: u64, block: u32) ?Binding,
         view: *const fn (ctx: *anyopaque, ino: u64) ?FileView,
         merge: *const fn (ctx: *anyopaque, req: MergeRequest) MergeError!MergeOutcome,
+        punch: *const fn (ctx: *anyopaque, ino: u64, first: u32, last: u32) MergeError!MergeOutcome,
+        shift: *const fn (ctx: *anyopaque, ino: u64, s: Shift) ShiftError!MergeOutcome,
         current_fencing: *const fn (ctx: *anyopaque, ino: u64) u64,
         size_epoch: *const fn (ctx: *anyopaque, ino: u64) u64,
+    };
+
+    /// A COLLAPSE_RANGE / INSERT_RANGE at the block grain (charter §6.6;
+    /// decision 0003 §BH.5): `collapse` — the bindings of `[at, at +
+    /// blocks)` leave the map and every binding at `b ≥ at + blocks` moves
+    /// to `b − blocks`; `insert` — every binding at `b ≥ at` moves to
+    /// `b + blocks`. The data does not move: ONE transaction re-keys the
+    /// record and every moved reference.
+    pub const Shift = struct {
+        at: u32,
+        blocks: u32,
+        dir: enum { collapse, insert },
+    };
+
+    pub const ShiftError = MergeError || error{
+        /// A tree-mapped head, or a shift whose re-keyed references exceed
+        /// the one journal entry a shift is (the map stands; EOPNOTSUPP).
+        Unsupported,
     };
 
     /// The WRITTEN binding of `block` (null = a hole, or a reservation).
@@ -384,6 +404,21 @@ pub const MapSeam = struct {
 
     pub fn merge(self: MapSeam, req: MergeRequest) MergeError!MergeOutcome {
         return self.vtable.merge(self.ctx, req);
+    }
+
+    /// PUNCH_HOLE's whole blocks (charter §6.6): up to `MergeOutcome.
+    /// max_displaced` bindings of `[first, last]`, ascending, leave the map
+    /// in ONE transaction and come back `displaced` (held: the caller frees
+    /// them, then `dropHolds`); a call that displaces nothing ends the
+    /// range. The layout's size stands.
+    pub fn punch(self: MapSeam, ino: u64, first: u32, last: u32) MergeError!MergeOutcome {
+        return self.vtable.punch(self.ctx, ino, first, last);
+    }
+
+    /// The block-grain shift (`Shift`): a collapse's removed bindings come
+    /// back `displaced` (held) as `punch`'s do.
+    pub fn shift(self: MapSeam, ino: u64, s: Shift) ShiftError!MergeOutcome {
+        return self.vtable.shift(self.ctx, ino, s);
     }
 
     pub fn currentFencing(self: MapSeam, ino: u64) u64 {

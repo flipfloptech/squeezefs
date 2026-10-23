@@ -92,6 +92,7 @@ const tree = @import("../meta/tree.zig");
 const tx_mod = @import("../meta/tx.zig");
 const dlm = @import("../meta/dlm.zig");
 const jc = @import("../meta/journal_core.zig");
+const journal = @import("../meta/journal.zig");
 const inos = @import("../meta/inos.zig");
 const ino_witness = @import("../meta/ino_witness.zig");
 const sym_moves = @import("../meta/sym/slots/moves.zig");
@@ -216,6 +217,15 @@ pub const stats = struct {
     pub var layout_map_merge_clipped_blocks: counters.ShardedCounter = .{};
     /// `layout_republishes`: the ONE mover's republish transactions.
     pub var layout_republishes: counters.ShardedCounter = .{};
+    /// fallocate's map verbs (charter §6.6): `layout_map_punches` — inline
+    /// maps republished without a punched range's entries;
+    /// `layout_shifts` — COLLAPSE/INSERT re-indexings landed;
+    /// `layout_shift_refusals` — shifts refused `Unsupported` (a
+    /// tree-mapped head, a shift past the one-entry budget, a foreign-slot
+    /// file): EOPNOTSUPP at the handler.
+    pub var layout_map_punches: counters.ShardedCounter = .{};
+    pub var layout_shifts: counters.ShardedCounter = .{};
+    pub var layout_shift_refusals: counters.ShardedCounter = .{};
     /// `kvmap_resolve_failures`: a tree-mapped binding the read side could
     /// not resolve (a store error, an undecodable record) — answered as a
     /// miss to the caller, never a fabricated hole without this wire.
@@ -328,7 +338,7 @@ pub fn writeStatsJson(w: *Io.Writer) Io.Writer.Error!void {
     inline for (.{ "data_volumes", "data_staging_on", "block_refs_drift_rows" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, @field(stats, name).load() });
     }
-    inline for (.{ "layout_map_merges", "layout_map_merge_blocks", "layout_map_merge_failures", "layout_map_merge_clipped_blocks", "layout_map_merges_shipped", "foreign_publish_kvmap_refusals", "layout_publishes_served", "kvmap_sweep_spawn_refusals", "promotions_run", "promotions_stale", "promotions_failed", "promotions_enospc", "promotions_replaced", "promotions_restaged", "recall_promotions", "recall_promotion_failures", "own_block_dmas", "own_block_dma_bytes", "promotion_barriers", "staged_point_hits", "staged_point_misses", "promotion_barriers_coalesced", "promotion_barrier_write_through_skips", "held_stores", "held_store_bytes", "held_store_failures", "hold_gate_admits", "hold_gate_overlay_admits", "hold_gate_declines", "prefetch_fibers", "prefetch_fiber_refusals", "hold_ceremony_fibers", "bindings_freed", "device_read_bounces", "data_device_read_bytes", "write_side_read_dma_bytes", "compose_read_dma_bytes", "pack_read_dma_bytes" }) |name| {
+    inline for (.{ "layout_map_merges", "layout_map_merge_blocks", "layout_map_merge_failures", "layout_map_merge_clipped_blocks", "layout_map_merges_shipped", "foreign_publish_kvmap_refusals", "layout_publishes_served", "layout_map_punches", "layout_shifts", "layout_shift_refusals", "kvmap_sweep_spawn_refusals", "promotions_run", "promotions_stale", "promotions_failed", "promotions_enospc", "promotions_replaced", "promotions_restaged", "recall_promotions", "recall_promotion_failures", "own_block_dmas", "own_block_dma_bytes", "promotion_barriers", "staged_point_hits", "staged_point_misses", "promotion_barriers_coalesced", "promotion_barrier_write_through_skips", "held_stores", "held_store_bytes", "held_store_failures", "hold_gate_admits", "hold_gate_overlay_admits", "hold_gate_declines", "prefetch_fibers", "prefetch_fiber_refusals", "hold_ceremony_fibers", "bindings_freed", "device_read_bounces", "data_device_read_bytes", "write_side_read_dma_bytes", "compose_read_dma_bytes", "pack_read_dma_bytes" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, @field(stats, name).load() });
     }
     try w.print("\"data_unresolved_volume\":{d},\"kvmap_resolve_failures\":{d},\"kvmap_head_put_unlocked\":{d},\"release_free_unheld\":{d},\"layout_map_merge_displaced_overflow\":{d}}}", .{ counters.tripwireCount("data_unresolved_volume"), counters.tripwireCount("kvmap_resolve_failures"), counters.tripwireCount("kvmap_head_put_unlocked"), counters.tripwireCount("release_free_unheld"), counters.tripwireCount("layout_map_merge_displaced_overflow") });
@@ -1454,6 +1464,76 @@ pub const DataPlane = struct {
     /// caller's custody flush before its size commit.
     pub fn zeroExtension(self: *DataPlane, io: Io, ino: u64, old_size: u64, new_size: u64) write_admit.Error!void {
         return self.wp.zeroExtension(io, ino, .{ .kind = .striped, .size = old_size, .map_resident = true }, new_size);
+    }
+
+    // ---- fallocate's block-level acts (charter §6.6; decision 0003 §BH) ----
+
+    pub const Reserved = write_admit.WritePath.Reserved;
+
+    /// The reservation of `[first, last]` (`WritePath.reserveRange`): every
+    /// hole bound to a fresh UNWRITTEN block; with `zero_existing` every
+    /// written block flipped to its unwritten twin (ZERO_RANGE).
+    pub fn reserveBlocks(self: *DataPlane, io: Io, ino: u64, first: u32, last: u32, zero_existing: bool) write_admit.Error!Reserved {
+        return self.wp.reserveRange(io, ino, first, last, zero_existing);
+    }
+
+    /// PUNCH_HOLE's whole blocks: every binding of `[first, last]` leaves
+    /// the map (`MapSeam.punch`, one tx per `max_displaced` of them) and is
+    /// freed after its tx landed (RES-1); the blocks freed.
+    pub fn punchBlocks(self: *DataPlane, io: Io, ino: u64, first: u32, last: u32) Error!u64 {
+        var freed: u64 = 0;
+        while (true) {
+            var out = self.mapSeam().punch(ino, first, last) catch |e| return mapVerbError(e);
+            if (out.n_displaced == 0) return freed;
+            for (out.slice()) |d| self.purgeSeam().purge(d);
+            self.freeBindings(io, out.slice());
+            out.dropHolds();
+            freed += out.n_displaced;
+        }
+    }
+
+    pub const Shift = seams.MapSeam.Shift;
+    pub const ShiftError = Error || error{Unsupported};
+
+    /// COLLAPSE_RANGE / INSERT_RANGE at the block grain (`MapSeam.shift`):
+    /// the map re-indexed in one tx, a collapse's removed blocks freed
+    /// after it; `Unsupported` = EOPNOTSUPP (the map stands).
+    pub fn shiftBlocks(self: *DataPlane, io: Io, ino: u64, s: Shift) ShiftError!u64 {
+        var out = self.mapSeam().shift(ino, s) catch |e| return switch (e) {
+            error.Unsupported => error.Unsupported,
+            else => |m| mapVerbError(m),
+        };
+        for (out.slice()) |d| self.purgeSeam().purge(d);
+        self.freeBindings(io, out.slice());
+        out.dropHolds();
+        self.view.forget(ino);
+        self.windows.invalidate(ino);
+        return out.n_displaced;
+    }
+
+    fn mapVerbError(e: seams.MergeError) Error {
+        return switch (e) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.NotFound => error.FileNotFound,
+            error.WriterGuardFenced => error.WriterGuardFenced,
+            error.FencingTokenExpired, error.Transient => error.InputOutput,
+        };
+    }
+
+    /// What the map binds at `block` (the handler's edge law: a hole or a
+    /// reservation reads zeros already, so a PUNCH/ZERO edge inside one
+    /// writes nothing).
+    pub const Bound = enum { hole, reserved, written };
+
+    pub fn boundAt(self: *DataPlane, ino: u64, block: u32) Bound {
+        const m = self.rawBinding(ino, block) orelse return .hole;
+        return if (m.unwritten) .reserved else .written;
+    }
+
+    /// Zeros over `[offset, offset + len)` through the write admission
+    /// (`WritePath.writeZeros`): a PUNCH/ZERO edge inside a written block.
+    pub fn zeroRange(self: *DataPlane, io: Io, ino: u64, offset: u64, len: u64, size: u64) write_admit.Error!void {
+        return self.wp.writeZeros(io, ino, offset, len, .{ .kind = .striped, .size = size, .map_resident = true });
     }
 
     /// The ordered law's floor (decision 0003 §AL.5):
@@ -2824,7 +2904,7 @@ pub const DataPlane = struct {
         return .{ .ctx = self, .vtable = &map_vtable };
     }
 
-    const map_vtable: seams.MapSeam.VTable = .{ .lookup = &mapLookup, .reserved = &mapReserved, .view = &mapView, .merge = &mapMerge, .current_fencing = &mapFencing, .size_epoch = &mapSizeEpoch };
+    const map_vtable: seams.MapSeam.VTable = .{ .lookup = &mapLookup, .reserved = &mapReserved, .view = &mapView, .merge = &mapMerge, .punch = &mapPunch, .shift = &mapShift, .current_fencing = &mapFencing, .size_epoch = &mapSizeEpoch };
 
     /// The layout record of `ino`: the xattr chain at the layout name's
     /// hash, the record named `layout` (owned bytes) and its chain slot.
@@ -3328,6 +3408,218 @@ pub const DataPlane = struct {
         stats.layout_map_merges.inc();
         stats.layout_map_merges_shipped.inc();
         stats.layout_map_merge_blocks.add(req.inserts.len);
+    }
+
+    /// `MapSeam.punch` (charter §6.6, decision 0003 §BH.4): under the
+    /// layout lock, ONE tx — the inline map republished without up to
+    /// `max_displaced` of its entries in `[first, last]` (their `−ref` in
+    /// the diff), or a tree-mapped head's sweep page over the range (the
+    /// straddling runs split at both ends, `kvmap.planSweepPage`). The
+    /// removed bindings come back held; the caller frees them after the
+    /// lock dropped (RES-1). A foreign-slot file's record is the holder's:
+    /// the republished inline map ships as a publish.
+    fn mapPunch(ctx: *anyopaque, ino: u64, first: u32, last: u32) seams.MergeError!seams.MergeOutcome {
+        const self: *DataPlane = @ptrCast(@alignCast(ctx));
+        const io = self.io;
+        const gpa = self.gpa;
+        const lock = self.lockLayout(io, ino);
+        defer lock.release(io);
+        var foreign = false;
+        if (self.foreign_layout) |f| switch (f.lookup(f.ctx, gpa, ino) catch return error.Transient) {
+            .local => {},
+            .gone => return error.NotFound,
+            .foreign => |x| {
+                if (x.layout) |v| gpa.free(v);
+                foreign = true;
+            },
+        };
+        const rec = (self.layoutRecord(ino) catch return error.Transient) orelse return .{};
+        defer gpa.free(rec.value);
+        const prev = layout.XattrLayout.decode(rec.value, self.geo) catch return error.Transient;
+        if (prev.kind != .striped) return .{};
+        var out: seams.MergeOutcome = .{};
+        if (prev.isKvmap()) {
+            if (foreign) return self.refuseForeignKvmap(ino, "a tree-mapped head's punch");
+            // Past a live sweep cursor every index is a hole already.
+            const upto: u32 = if (prev.kvmapHead().?.sweep) |k| (if (k == 0) return .{} else @min(last, k - 1)) else last;
+            if (first > upto) return .{};
+            const t = self.backend.begin(@src()) catch return error.OutOfMemory;
+            kvmap.stagePunch(self.mapStore(), gpa, t, ino, first, upto, self.chunk, &out) catch |e| {
+                self.backend.abandon(t);
+                return mapKvErr(e);
+            };
+            if (out.n_displaced == 0) {
+                self.backend.abandon(t);
+                return .{};
+            }
+            const holds = self.releaseHolds();
+            holds.hold(out.slice());
+            self.backend.commit(t) catch |e| {
+                holds.drop(out.slice());
+                return switch (e) {
+                    error.OutOfMemory => error.OutOfMemory,
+                    error.VolumeFailed, error.VolumeClosed => error.WriterGuardFenced,
+                    else => error.Transient,
+                };
+            };
+            out.holds = holds;
+            stats.layout_map_punches.inc();
+            self.windows.invalidate(ino);
+            return out;
+        }
+        var kept: std.ArrayList(layout.MapEntryWire) = .empty;
+        defer kept.deinit(gpa);
+        kept.ensureTotalCapacity(gpa, prev.entries.len) catch return error.OutOfMemory;
+        for (prev.entries) |e| {
+            const b = e.block();
+            if (b >= first and b <= last and out.n_displaced < seams.MergeOutcome.max_displaced) {
+                out.displaced[out.n_displaced] = Mapping.decode(e.mapping, self.chunk) catch return error.Transient;
+                out.n_displaced += 1;
+                continue;
+            }
+            kept.appendAssumeCapacity(e);
+        }
+        if (out.n_displaced == 0) return .{};
+        const new = layout.Layout.stripedInline(prev.size, kept.items);
+        if (foreign) {
+            try self.shipMerge(.{ .ino = ino, .inserts = &.{}, .min_size = 0, .proofs = &.{}, .fencing = 1 }, new);
+            // The holder's commit landed: the displaced are the caller's to free.
+            return out;
+        }
+        const t = self.backend.begin(@src()) catch return error.OutOfMemory;
+        layout.publishLayout(t, .{ .ino = ino, .name_key = self.name_key, .coll_seq = rec.coll_seq, .prev = prev, .layout = new, .proofs = &.{} }, self.refsSeam(), self.geo) catch |e| {
+            self.backend.abandon(t);
+            stats.layout_map_merge_failures.inc();
+            return switch (e) {
+                error.OutOfMemory => error.OutOfMemory,
+                else => error.Transient,
+            };
+        };
+        const holds = self.releaseHolds();
+        holds.hold(out.slice());
+        self.backend.commit(t) catch |e| {
+            holds.drop(out.slice());
+            stats.layout_map_merge_failures.inc();
+            return switch (e) {
+                error.OutOfMemory => error.OutOfMemory,
+                error.VolumeFailed, error.VolumeClosed => error.WriterGuardFenced,
+                else => error.Transient,
+            };
+        };
+        out.holds = holds;
+        stats.layout_map_punches.inc();
+        return out;
+    }
+
+    /// `MapSeam.shift` (decision 0003 §BH.5): the inline map re-indexed in
+    /// ONE tx under the layout lock — the record and every moved reference
+    /// (`Publish.shift`: a reference the old map named needs no proof). A
+    /// tree-mapped head, a shift whose frames exceed the one entry
+    /// (`shiftFits`) and a foreign-slot file refuse `Unsupported` with the
+    /// map standing. A collapse's removed bindings come back held.
+    fn mapShift(ctx: *anyopaque, ino: u64, s: seams.MapSeam.Shift) seams.MapSeam.ShiftError!seams.MergeOutcome {
+        const self: *DataPlane = @ptrCast(@alignCast(ctx));
+        const io = self.io;
+        const gpa = self.gpa;
+        const lock = self.lockLayout(io, ino);
+        defer lock.release(io);
+        if (self.foreign_layout) |f| switch (f.lookup(f.ctx, gpa, ino) catch return error.Transient) {
+            .local => {},
+            .gone => return error.NotFound,
+            .foreign => |x| {
+                if (x.layout) |v| gpa.free(v);
+                stats.layout_shift_refusals.inc();
+                return error.Unsupported;
+            },
+        };
+        const rec = (self.layoutRecord(ino) catch return error.Transient) orelse return .{};
+        defer gpa.free(rec.value);
+        const prev = layout.XattrLayout.decode(rec.value, self.geo) catch return error.Transient;
+        if (prev.kind != .striped) return .{};
+        if (prev.isKvmap()) {
+            stats.layout_shift_refusals.inc();
+            return error.Unsupported;
+        }
+        var out: seams.MergeOutcome = .{};
+        var moved: std.ArrayList(layout.MapEntry) = .empty;
+        defer moved.deinit(gpa);
+        moved.ensureTotalCapacity(gpa, prev.entries.len) catch return error.OutOfMemory;
+        var n_moved: u64 = 0;
+        for (prev.entries) |e| {
+            const b = e.block();
+            const m = Mapping.decode(e.mapping, self.chunk) catch return error.Transient;
+            switch (s.dir) {
+                .collapse => {
+                    if (b >= s.at and b < s.at + s.blocks) {
+                        if (out.n_displaced == seams.MergeOutcome.max_displaced) {
+                            stats.layout_shift_refusals.inc();
+                            return error.Unsupported;
+                        }
+                        out.displaced[out.n_displaced] = m;
+                        out.n_displaced += 1;
+                        continue;
+                    }
+                    if (b >= s.at + s.blocks) {
+                        moved.appendAssumeCapacity(.{ .block = b - s.blocks, .mapping = m });
+                        n_moved += 1;
+                    } else moved.appendAssumeCapacity(.{ .block = b, .mapping = m });
+                },
+                .insert => {
+                    if (b >= s.at) {
+                        moved.appendAssumeCapacity(.{ .block = b + s.blocks, .mapping = m });
+                        n_moved += 1;
+                    } else moved.appendAssumeCapacity(.{ .block = b, .mapping = m });
+                },
+            }
+        }
+        if (!shiftFits(prev.entries.len, n_moved, out.n_displaced)) {
+            stats.layout_shift_refusals.inc();
+            return error.Unsupported;
+        }
+        const entries = layout.sortedEntries(gpa, moved.items) catch return error.OutOfMemory;
+        defer gpa.free(entries);
+        const delta = @as(u64, s.blocks) * self.block_size;
+        const size = switch (s.dir) {
+            .collapse => prev.size -| delta,
+            .insert => prev.size + delta,
+        };
+        const t = self.backend.begin(@src()) catch return error.OutOfMemory;
+        layout.publishLayout(t, .{ .ino = ino, .name_key = self.name_key, .coll_seq = rec.coll_seq, .prev = prev, .layout = layout.Layout.stripedInline(size, entries), .proofs = &.{}, .shift = true }, self.refsSeam(), self.geo) catch |e| {
+            self.backend.abandon(t);
+            stats.layout_map_merge_failures.inc();
+            return switch (e) {
+                error.OutOfMemory => error.OutOfMemory,
+                else => error.Transient,
+            };
+        };
+        const holds = self.releaseHolds();
+        holds.hold(out.slice());
+        self.backend.commit(t) catch |e| {
+            holds.drop(out.slice());
+            stats.layout_map_merge_failures.inc();
+            return switch (e) {
+                error.OutOfMemory => error.OutOfMemory,
+                error.VolumeFailed, error.VolumeClosed => error.WriterGuardFenced,
+                else => error.Transient,
+            };
+        };
+        out.holds = holds;
+        stats.layout_shifts.inc();
+        self.view.forget(ino);
+        return out;
+    }
+
+    /// Whether a shift of an `entries`-entry inline map moving `moved` of
+    /// them and removing `removed` fits ONE journal entry: the record at
+    /// its new length, a `−ref` Delete and a `+ref` Put per moved
+    /// reference, a Delete per removed one, under the whole-entry cap with
+    /// the conveyor's headroom (`MergeOutcome.max_displaced`'s arithmetic).
+    pub fn shiftFits(entries: usize, moved: u64, removed: u64) bool {
+        const record_frame = journal.recordFrameLen(key.XATTR_KEY_LEN, 1 + layout.LAYOUT_XATTR_NAME.len + layout.LAYOUT_HEADER_LEN + 4 + (entries - removed) * layout.MAP_ENTRY_WIRE_LEN);
+        const ref_put = journal.recordFrameLen(key.BLOCK_REF_KEY_LEN, record.BLOCK_REF_VALUE_LEN);
+        const ref_del = journal.recordFrameLen(key.BLOCK_REF_KEY_LEN, 0);
+        const total = journal.ENTRY_HDR_LEN + record_frame + moved * (ref_put + ref_del) + removed * ref_del;
+        return total <= journal.MAX_ENTRY_LEN - 4 * ref_put;
     }
 
     /// The filesystem's promotion of a FOREIGN-slot file (the inline /

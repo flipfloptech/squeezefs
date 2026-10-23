@@ -184,7 +184,8 @@ pub const MappingWire = extern struct {
     incarnation: u64,       // @16 0 = none
     rel_off: u32,           // @24 % GRAIN == 0 (checked)
     len: u32,               // @28 exact stored-image length; rel_off + ceil(len) ≤ CHUNK (checked); flag WHOLE_BLOCK ⇒ len ignored
-    flags: u8,              // @32 bit0 WHOLE_BLOCK (the undecorated binding), bit1 DAMAGED (fsck quarantine marker)
+    flags: u8,              // @32 bit0 WHOLE_BLOCK (the undecorated binding), bit1 DAMAGED (fsck quarantine marker),
+                            //     bit2 UNWRITTEN (a fallocate reservation: allocated, bytes not the file's — charter §6.6; whole-block only, never DAMAGED)
     reserved: [7]u8,        // @33 = 0
 };
 pub const MapEntryWire = extern struct { block: u32, reserved: u32 = 0, mapping: MappingWire }; // 48 B

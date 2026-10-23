@@ -481,7 +481,7 @@ point screens it: write (`:16165`), setattr size (`:28485`), copy_file_range des
 `u32::MAX` refuses EFBIG at admission with ZERO map-plane side effects — the codec's A5 refusal stays
 structurally unreachable from FUSE (`tests/kvmap_read_tests.rs:718`). Port: `BLOCK_INDEX_MAP_BLOB`
 already reserved in `key.zig:172-176`; the FUSE screen `end > block × u32::MAX ⇒ FileTooBig` belongs in
-`kv_fs.write/setattr/fallocate` beside the `std.math.add` overflow check (`P/kv_fs.zig:1378`).
+`kv_fs.write/setattr/fallocate` beside the `std.math.add` overflow check (`P/kv_fs.zig:1378`). PORTED: `kv_fs.fallocate` screens every mode that names blocks up to `end` (a `KEEP_SIZE` reservation included — its mints would index past u32) and INSERT's grown size (charter §6.6).
 
 ### 5.2 Tree-7 leaves on probation (A7, D:134-137, 273-276)
 

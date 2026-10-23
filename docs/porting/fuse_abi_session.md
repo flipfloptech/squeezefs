@@ -498,7 +498,7 @@ ReplyInit{max_write}` (filesystem.rs:21), `destroy` (:99), `getlk`/`setlk` (file
 | poll | inode, fh, kh: Option, flags, events, notify: &Notify | `ReplyPoll{revents}` | ENOSYS | |
 | notify_reply | inode, offset, data | `()` | ENOSYS | answer to our NOTIFY_RETRIEVE; error arm still sends a header (no-reply handle, :4559, 4607) |
 | batch_forget | `&[(inode, nlookup)]` | — | no-op | per-entry nlookup (FUSE-3k, :550–558) |
-| fallocate | inode, fh, offset, length, mode | `()` | ENOSYS | |
+| fallocate | inode, fh, offset, length, mode | `()` | ENOSYS | PORTED 2026-10-23 (charter §6.6, decision 0003 §BH): the reference reserved nothing (0002 row 554); ours reserves UNWRITTEN blocks, punches, zeroes, shifts at the block grain. The kernel's FUSE client forwards only KEEP_SIZE/PUNCH_HOLE/ZERO_RANGE (`fs/fuse/file.c`) |
 | readdirplus | parent, fh, offset: u64, lock_owner | `ReplyDirectoryPlus{entries: Stream<DirectoryEntryPlus{inode, generation, kind, name, offset, attr, entry_ttl, attr_ttl}>}` | ENOSYS | |
 | lseek | inode, fh, offset, whence | `ReplyLSeek{offset}` | ENOSYS | |
 | copy_file_range | inode, fh_in, off_in, inode_out, fh_out, off_out, length, flags | `ReplyCopyFileRange{copied}` → `fuse_write_out` | ENOSYS | `copied as u32` (reply.rs:534–541) |

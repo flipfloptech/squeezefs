@@ -156,6 +156,83 @@ next landing on top of it, and its model must include the fold's ordering invari
    (owner: Signed-off-by, 5 items), patches 0031–0033 still unmeasured, the smaller owed items of
    the 10-20 note (item 4 there) unchanged.
 
+## The release window on 7.3 (opened 2026-10-22 ~07:50 local, owner's go: "run the rest of the things we need to run for a release here, circle back to 9.33 after")
+
+Sequence run: gate 3/3 → pjdfstest ×3 → LTP → xfstests `-g auto` → mdtest ×3 → tarx ×3, fixing as
+each suite surfaced an item, every fix through its own gate, every affected suite re-run on the
+fixed head. **Every landing below went through a green gate (80–86) on this kernel.** The window's
+state at the time of this amendment is in the table at the end.
+
+| landed | finding → fix |
+|---|---|
+| `948ebbe` | **xfstests generic/029 — silent data loss across a remount.** Two mechanisms, neither the mainline posture: the staged-write shortcut judged "inside the image" by the INODE's size, so after a truncate-up the tail was re-staged under a record still saying the truncated-down length and `promoteInline` clipped it at promotion; and the dismount sweep flushed only inodes with a parked SIZE claim, so an overwrite under the write-back timer could leave RAM un-landed at an orderly unmount (charter §6.2: the unmount drains synchronously). Rows AN ORDERLY UNMOUNT LANDS EVERY ACKED WRITE ×2; `rung-10-unmount-owes.md` |
+| `94c36d0` | **LTP fs — tripwire `pack_pin_refcount_drift`** (ftest01's small-file storm): the seal raised `sealed` OUTSIDE the pin lock and censused after; a tenant release observing the flag between the two used the sealed ladder. Census + flag are one critical section, census first; model + weakening; external-suites defect 28 |
+| `b7e79a3` | **mdtest — one unlinked inode never destroyed** (`df` inodes 3 vs 2 for 120 s): the FORGET's try-only read met an SMO swap window; the store faces mapped the tree's `WouldBlock` to `Corrupt` and the handler judged any non-WouldBlock error "live" and dropped the corpse (fsck's own mount sweep reclaimed it, hence 0 findings). A try-only read answers `WouldBlock`; a FORGET defers on any refusal; row THE UNLINK STORM'S INODE LAW; mdtest 3/3 under load |
+| `a08fce3` | **the `syncfs: a leg failed (InputOutput)` storm** (1,407 lines in one LTP fs run, EIO to `sync(2)` callers): (a) a promotion leased the census's record BEFORE the locks; a sibling's re-stage moved the generation → `.kept` → EIO — now promotes the CURRENT resident under the locks; (b) a `truncate -s 0`'s commit-to-release window left a record the layout no longer names → `LiveVerdict.unnamed → .absent` (`fsync_promote_superseded`). **Harness:** `suite_daemon_alerts` matched `^(error|warn)\(` — anchored under the `--log-file` epoch prefix and `warn(` never occurs (`warning(`): 1,407 error lines had counted as 0 alerts; `SUITE_ALERT_RE` fixed, every suite now reports its count. Defects 29/30 |
+| `5e28397` | **LTP syscalls `kill11` broken (2 min)** — NOT the filesystem: `ltp.sh` launched kirk as a bash asynchronous list, which starts with SIGINT and SIGQUIT IGNORED; SIG_IGN survives exec down to every test, so the child never received the SIGQUIT (LTP restores SIGINT itself, hence `TPASS SIGINT`). Deterministic since the fail-early watcher (`eea8892`, 10-17); "passes by hand" because by hand is the foreground — and the harness's ext4 control ran in the foreground too, which mis-attributed it to us. `env --default-signal=INT,QUIT` + a SigIgn tripwire; `suite_umount` also detaches loop devices a killed test left. Kernel-buffer writes (coredump/sendfile/splice/loop) under zero-copy opens verified fine 10/10 × 3 postures |
+| `4af7a01`…`448b498` | **`directory nlink underflow guard fired` ×4 during generic/025 (RENAME_EXCHANGE)**: every cross-directory swap of a directory with a non-directory shifted NO parent count (the local `economy.stageRename` EXCHANGE branch staged Δtimes only; the cross-owner planner already had the shift). Law table (8 cells) on the line; unit + row (the renameat2 matrix, `st_nlink` judged after setup/swap/cleanup/remount); the guard's text corrected (it masks a missed +1, creates no deficit). **fsck has NO directory-nlink arm** (`ops_fsck.md` §3.10 "directories are never a count finding") — a surviving inflated directory is invisible to fsck; owed below |
+| `21a2308` `70ead87` | **generic/475's alert classes**: `the truncate's tail zero-complete failed (NoSpaceLeft) — bytes past the new end may read back` ×1,549 — the message was stale since §AL.1: the shrink's zero write was redundant (every grow lands its own zeros before the size moves), deleted (§AL.7); the set really was full (475's crash loop filled both volumes, the ring stopped draining). `staging ring full` ×5,790 — genuine refusals (first-fit at ~77 % fill), the latch cleared on ANY landing; now one warning per episode, closed by a quarter-ring drain (`staging_ring_full_episodes`); a 4,000-op placement-completeness oracle test says the hole search is sound |
+| `d848fb5` | **xfstests generic/604 — `umount &` then `mount` 10 ms later refused BUSY**: the exiting daemon still held the writer guard. `guard/proc.zig flockExclusive` judges the holder each round on kernel facts (pid gone → replay wait; alive + detached → wait; alive + `squeezefs umount <mnt>` in flight → wait; alive + attached + no verb → BUSY at once), ceiling 36 s (`DAEMON_EXIT_WAIT_NS` + 2 ticks); the symmetric join door rides the same wait; `mount.zig`'s mountpoint pre-check is `statx(AT_STATX_DONT_SYNC)`. Row A MOUNT THAT RACES THE PREVIOUS UNMOUNT WAITS, THEN SERVES 20/20 under load; the helper's `dmsetup remove` race fixed with a per-set flock |
+| `08a9aaa` `343a8d9` `7e0792a` | **xfstests generic/620 — the 17 TB dm-hugedisk**: the HARNESS refused any block device with no backing file (it keyed a set's log dir by the loop image's path) and carved fixed 1 + 2 × 8 GiB slices; also `check`'s bare `mount` could not type the device. Now any raw block device is a set device (the PRODUCTION shape — nvmet namespaces), slices follow the device, `mount.typed` types a bare mount. **The product at 17 TiB: format 0.29 s / 33.9 MB written, mount +107 MB RSS (24 B/block), 1 MiB write+fsync 23 ms, fsck 0.60 s over exactly the used blocks — everything O(structures)/O(used)**; tie test in `data_superblock.zig`; limits table in `rung-10-huge-volume.md` (volume_len/capacity u64; per-file EFBIG at 2³²−1 blocks = 16 PiB at 4 MiB; 2⁵⁶ inodes; the allocator table 6 MB RAM per TiB). Ten stale scsi_debug/loop-over-loop exclusions dropped: those tests judge the product now |
+| `4a7401e` `27b8ceb` | **tarx's wall law** read 0.86–1.54× within an hour: the laptop was ON BATTERY 12:29–13:05 (every daemon latency shifted uniformly with the clock; budget Green, no shedding). Three extractions per arm; the row refuses a battery run, pins the clock (boost off, restored), records the host posture per arm, calls a phase INVALID (re-run, never a pass) when the posture moves or a mount's two arms disagree past 1.20× |
+
+| `60b8242`…`f11cd41` (the audit), `d750a25` `c0da49d` | **The owner's rule (2026-10-22): never skip or adjudicate unless 100 % certain it is not a bug/defect/unsupported.** The audit re-ran every exclusion on this host (`rung-10-adjudication-audit.md`): ten container-era rows pass here (deleted); the exportfs five FAIL on the product (ESTALE: no `FUSE_EXPORT_SUPPORT`) and are now UNADJUDICATED; `proc01` deleted; the LTP ext4 control ran from the wrong cwd against modules built for 7.2.8 (fixed; "venue's" needs the SAME failing assertions); generic/460 had left the host at `dirty_ratio=100` (restored). The harness takes any device (raw or 64 MB: the layout scales to the product's floor — smallest set 36 MiB: 11.8 MB meta + 2 × 3 chunks; `rung-10-small-volume.md`). generic/563's cgroup charge is unsatisfiable under FUSE (the kernel charges a bio to the issuing task; the daemon is the issuer) — a proposed `by-design-fuse-io-charge` row awaits the owner |
+| `c3e53e2` (F4) | **the DEAD MANAGER row's hang** (`rung-10-recovery-live-member-evicted.md`): the gate's load stalled B's membership beat past `T_owner`; A evicted the LIVE B; B kept committing past `T_self` (its committers never judged the deadline); its reclaim met the closed grace → POISONED; the poisoned mount HELD every foreign op at the move gate for `T_park_max` per op (the unkillable storm child); its unmount ran a clean leave over A's recovered regions. Committers judge `T_self` on the member's own clock; `poison` closes the move epoch (EIO at once); a fenced leave writes nothing; a same-incarnation stale epoch re-points. Seam `SQUEEZEFS_TEST_MEMBERSHIP_BEAT_HOLD`; row A LIVE MEMBER EVICTED AT T_OWNER… 20/20 |
+| `4c7cf3e` (F8) | **a joiner's rename into the manager's directory EIO after 90 s** (generic/732 under the shipped symmetric posture): the intent of a rename whose every object the manager holds was written into "the mount's own rotor slot" — hard-wired to slot 0, the MANAGER's; the joiner's commit met its own door's foreign-lease refusal and the move gate re-issued it 513 times. The intent home is a slot the mount leases (`Resolver.ownHome`); row with 12 cross-owner renames ≤ 2 s each; generic/732 PASSES symmetric (`rung-10-joiner-rename-home.md`) |
+| `741615d` `b43167c` (F7) | **a full data store answered EIO** to fsync/syncfs and fired `alloc_trim_window_parks` (a counted regime misdeclared as a tripwire). Now: the park is a counter (+ a once-per-episode wall warning for a stalled device); **ENOSPC, never EIO**, at `write(2)` (the write cache's residents carry a CLAIM on the store; `admitWrite` judges reachable free bytes against it; `statfs` subtracts it) and at the sync point (`LiveVerdict.no_space`; bytes stay resident; one `data store FULL` line per episode; a `no_space` promotion retries once on another volume). Charter §6.1/§6.2 amended; `rung-10-full-store-enospc.md`; generic/750/475/476 pass with 0 tripwires |
+
+**Verdicts on the fixed heads:** pjdfstest 3/3 (3492203); LTP fs + syscalls **PASSED, 0 alerts**
+(d848fb5: 71/72 + 1 conf; 1,403 pass / 128 conf / 5 adjudicated + 15 venue); mdtest 3/3 (b7e79a3,
+under load); tarx 3/3 (27b8ceb: 0.87× / 0.84× / 0.90×); xfstests: 598 ran on d848fb5 to generic/620 (harness), 546 on 7e0792a to
+generic/563 (harness) — both fixed; 0 alerts on the test set in both; the run from the top on the
+final head waits on the rulings above.
+
+**OWNER RULINGS the window waits on (the next `-g auto` stops at generic/426 by the 100 % rule):**
+1. exportfs / `open_by_handle_at` (generic/426, 467, 477, 756, 777): unsupported by ruling, or feature
+   F3 (~1 day: advertise `FUSE_EXPORT_SUPPORT`, serve `LOOKUP(nodeid, ".")` for any inode, a durable
+   parent for `..`). Recommendation: implement.
+2. generic/563's cgroup io charge: approve the proposed `by-design-fuse-io-charge` row (certain).
+3. The suites' format posture: `--single-writer` (today) or the shipped symmetric default (then
+   409/410/411/589/732 judge joins; F8 landed; 409–411/589 still mismatch on the harness's bind/move
+   unmount path — F6). Recommendation: symmetric.
+4. fallocate (F1): every mode EOPNOTSUPP; the porting spec says MUST; 31 xfstests `_notrun` + LTP
+   `fallocate03`/`mremap06` behind it. In scope for the tag?
+5. Inode flags `FS_IOC_SETFLAGS` (F2; LTP `setxattr03`): in scope?
+6. Flake rows `-o ro READER` and `MOVE MATRIX` unseen in 61 train runs: retire? DEAD MANAGER leaves
+   the ledger after three green trains on `c3e53e2`.
+
+**Owed from the window (not blockers; in order of weight):**
+1. **fsck C10 has no directory-nlink arm** — a directory's nlink too high or too low is never a
+   finding (the ported spec's rule). Full tier: per-parent subdir census, the stripe fold, repair
+   semantics, a decision-0002 ledger row (diverges from the reference). The RENAME_EXCHANGE defect
+   was invisible to it.
+2. The pending-free wedge under `HARD BACKSTOP` → `VolumeFailed` (mdtest -np 64 with a 2.75 GB
+   fleet-divided budget under three agents' load): the checkpoint tail under memory starvation.
+3. The WRITER's open still projects a live foreign lessee's tree at the grant-time word (the reader
+   half landed in `2093e40`); fixing it moves the leak census (the KVDA row's inputs).
+4. `PromoteSink.onEvict` judges by a cache-entry generation an in-place append does not bump: such
+   an entry is dropped without promoting while the record stays resident and charged.
+5. Under dm-error crash loops: `staged payload unreachable … serving zeros` (a promotion released its
+   ring entry at commit, the journal window carrying the layout later lost); recovered unnamed
+   residents (generation 0) never destroyed on a live mount; per-op `fsync/syncfs … a leg failed`
+   lines on a FAILED volume want a once-per-episode latch; `TRIPWIRE alloc_trim_window_parks` in the
+   dm-error daemons (baseline too).
+6. Stripe migration vs cross-stripe moves of a migrated subdirectory (`parent_update = .none` then
+   old −1 / new +1 on the stripes); the holder census is blind to kernel-held mount references (loop
+   backing files, stacked mounts); a raw `kill -TERM` with the mount attached is still an at-once
+   BUSY for a racing mount; first-fit ring fragmentation (5 MB refused from ~77 % fill, no
+   compaction); a2 systematically slower than a1 in tarx (SMO retries grow with the set).
+7. New since the audit: `exec/cpu_class.zig:101 finishPass` panic (a departed thread's ledger entry
+   with class 170 of 13) killed KILL ROWS (c)'s daemon once under load; the manager accepts
+   `ReleaseSlot` from an appender whose region it recovered (sender fixed, serve-side screen owed);
+   a parked cross-directory rename holds the kernel's `s_vfs_rename_mutex`; the umount helper's
+   bind/move gap (F6); `fresh supply EXHAUSTED` info line per re-latch; `MetaBarrierFailed` per fsync
+   on a FAILED volume; a recovered-but-unnamed ring record judged only at a promotion point.
+8. Harness: the fail-early stop SIGKILLs kirk (no JSON report); subset runs end "ledger rc 3" on
+   stale rows by design; local-venue daemons inherit the desktop's cgroup (the budget's
+   unreclaimable arm would read Red at 33 GB of desktop memory); `/sbin/*.squeezefs` helper symlinks
+   and `/run/squeezefs-suites.env` are venue-global and repoint to whichever tree ran last.
+
 ## Method notes (added today)
 
 - **The gate is fast now** (4–7 min sharded; the 65 min figure is stale). A branch gets ONE gate

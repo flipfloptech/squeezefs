@@ -240,6 +240,9 @@ pub const stats = struct {
     /// from `promotions_failed`, the resource declines — the full-store
     /// episode's count.
     pub var promotions_enospc: counters.ShardedCounter = .{};
+    /// A promotion whose picked volume had no block retried on another
+    /// volume with supply in sight (`promoteLocked`'s one retry).
+    pub var promotions_replaced: counters.ShardedCounter = .{};
     /// `promotions_restaged`: a promotion handed its key by a census found
     /// the record re-staged by a newer write before it held the locks, and
     /// promoted the CURRENT resident (`promoteUnder`).
@@ -325,7 +328,7 @@ pub fn writeStatsJson(w: *Io.Writer) Io.Writer.Error!void {
     inline for (.{ "data_volumes", "data_staging_on", "block_refs_drift_rows" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, @field(stats, name).load() });
     }
-    inline for (.{ "layout_map_merges", "layout_map_merge_blocks", "layout_map_merge_failures", "layout_map_merge_clipped_blocks", "layout_map_merges_shipped", "foreign_publish_kvmap_refusals", "layout_publishes_served", "kvmap_sweep_spawn_refusals", "promotions_run", "promotions_stale", "promotions_failed", "promotions_enospc", "promotions_restaged", "recall_promotions", "recall_promotion_failures", "own_block_dmas", "own_block_dma_bytes", "promotion_barriers", "staged_point_hits", "staged_point_misses", "promotion_barriers_coalesced", "promotion_barrier_write_through_skips", "held_stores", "held_store_bytes", "held_store_failures", "hold_gate_admits", "hold_gate_overlay_admits", "hold_gate_declines", "prefetch_fibers", "prefetch_fiber_refusals", "hold_ceremony_fibers", "bindings_freed", "device_read_bounces", "data_device_read_bytes", "write_side_read_dma_bytes", "compose_read_dma_bytes", "pack_read_dma_bytes" }) |name| {
+    inline for (.{ "layout_map_merges", "layout_map_merge_blocks", "layout_map_merge_failures", "layout_map_merge_clipped_blocks", "layout_map_merges_shipped", "foreign_publish_kvmap_refusals", "layout_publishes_served", "kvmap_sweep_spawn_refusals", "promotions_run", "promotions_stale", "promotions_failed", "promotions_enospc", "promotions_replaced", "promotions_restaged", "recall_promotions", "recall_promotion_failures", "own_block_dmas", "own_block_dma_bytes", "promotion_barriers", "staged_point_hits", "staged_point_misses", "promotion_barriers_coalesced", "promotion_barrier_write_through_skips", "held_stores", "held_store_bytes", "held_store_failures", "hold_gate_admits", "hold_gate_overlay_admits", "hold_gate_declines", "prefetch_fibers", "prefetch_fiber_refusals", "hold_ceremony_fibers", "bindings_freed", "device_read_bounces", "data_device_read_bytes", "write_side_read_dma_bytes", "compose_read_dma_bytes", "pack_read_dma_bytes" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, @field(stats, name).load() });
     }
     try w.print("\"data_unresolved_volume\":{d},\"kvmap_resolve_failures\":{d},\"kvmap_head_put_unlocked\":{d},\"release_free_unheld\":{d},\"layout_map_merge_displaced_overflow\":{d}}}", .{ counters.tripwireCount("data_unresolved_volume"), counters.tripwireCount("kvmap_resolve_failures"), counters.tripwireCount("kvmap_head_put_unlocked"), counters.tripwireCount("release_free_unheld"), counters.tripwireCount("layout_map_merge_displaced_overflow") });
@@ -2325,13 +2328,51 @@ pub const DataPlane = struct {
             log.debug("promotion ino {d}: stale — resident generation {?d} vs leased {d}", .{ ino, st.seg.residentGeneration(k), generation });
             return .{ .ok = false };
         }
-        const policy = if (self.packer) |*p| p.policy else pack.Policy{ .enabled = false, .max_slot = self.chunk / 2 };
-        // ONE transform per promotion: the stored image decides the arm and
-        // is the image the own-block / packed arm lands.
-        const tag = (self.rt.pickVolume() catch return .{ .ok = false }) orelse {
+        const tag = (self.pickPromotionVolume() catch return .{ .ok = false }) orelse {
             log.debug("promotion ino {d}: no data volume to promote onto", .{ino});
             return .{ .ok = false };
         };
+        var out = self.promoteOnto(io, ino, k, generation, image, cur, cur_bytes.coll_seq, tag);
+        // The picked volume had no block (its latch landed on this mint):
+        // ONE retry on another volume with supply in sight, the write path's
+        // `allocatePlacedMint` law — else the store's refusal stands.
+        if (out.no_space) if (self.volumeWithSupplyOtherThan(tag)) |other| {
+            stats.promotions_replaced.inc();
+            out = self.promoteOnto(io, ino, k, generation, image, cur, cur_bytes.coll_seq, other);
+        };
+        if (out.no_space) stats.promotions_enospc.inc();
+        return out;
+    }
+
+    /// The router's placement (health- and fill-weighted), unless the
+    /// picked volume's fresh supply is LATCHED exhausted while another
+    /// active volume's is not — the write path's law (`write_admit.Picker`
+    /// skips a latched allocator while any other has supply). The placement
+    /// table is rebuilt on the health cadence, never per write, so a volume
+    /// that just filled keeps its band until then: a promotion placed on it
+    /// answered ENOSPC with the other volume half empty (generic/750:
+    /// "no free block … 520 MB free in sight").
+    fn pickPromotionVolume(self: *DataPlane) Allocator.Error!?u64 {
+        const tag = (try self.rt.pickVolume()) orelse return null;
+        const picked = self.vols.byTag(tag) orelse return tag;
+        if (!picked.alloc.freshSupplyLatched()) return tag;
+        return self.volumeWithSupplyOtherThan(tag) orelse tag;
+    }
+
+    /// An active volume other than `tag` whose fresh supply is not latched.
+    fn volumeWithSupplyOtherThan(self: *DataPlane, tag: u64) ?u64 {
+        for (self.vols.rows[0..self.vols.n()]) |*r| {
+            const v = &r.*.?;
+            if (v.vol_tag != tag and v.isActive() and !v.alloc.freshSupplyLatched()) return v.vol_tag;
+        }
+        return null;
+    }
+
+    /// The promotion onto `tag`: ONE transform (the stored image decides the
+    /// arm and is the image the own-block / packed arm lands), the dispatch,
+    /// the arm.
+    fn promoteOnto(self: *DataPlane, io: Io, ino: u64, k: staging.StagingKey, generation: u64, image: []const u8, cur: layout.Layout, coll_seq: u8, tag: u64) Promoted {
+        const policy = if (self.packer) |*p| p.policy else pack.Policy{ .enabled = false, .max_slot = self.chunk / 2 };
         const stored = self.transformWrite(tag, image) catch |e| {
             log.debug("promotion ino {d}: the transform refused ({t})", .{ ino, e });
             return .{ .ok = false };
@@ -2344,21 +2385,20 @@ pub const DataPlane = struct {
             return .{ .ok = false };
         };
         const out: Promoted = switch (d) {
-            .inline_ => .{ .ok = self.promoteInline(ino, cur, cur_bytes.coll_seq, image, k, generation) },
-            .own_block => self.promoteOwnBlock(io, ino, cur, cur_bytes.coll_seq, tag, stored.bytes, k, generation),
+            .inline_ => .{ .ok = self.promoteInline(ino, cur, coll_seq, image, k, generation) },
+            .own_block => self.promoteOwnBlock(io, ino, cur, coll_seq, tag, stored.bytes, k, generation),
             .packed_ => blk: {
                 // The durable copy the pack commit displaces is a live owner
                 // until `promoteStaged` releases it (decision 0003 §AH.1).
                 const copy = cur.durableCopy();
                 if (copy) |m| self.releaseHolds().hold(&.{m});
-                const p = self.promotePacked(io, ino, cur_bytes.coll_seq, tag, stored.bytes, k, generation);
+                const p = self.promotePacked(io, ino, coll_seq, tag, stored.bytes, k, generation);
                 if (copy) |m| if (p.displaced == null) self.releaseHolds().drop(&.{m});
                 break :blk p;
             },
         };
         if (out.ok) self.noteShape(ino, cur.size, if (d == .own_block) .striped else if (d == .inline_) .inline_ else .packed_) else if (out.no_space) {
-            stats.promotions_enospc.inc();
-            log.debug("promotion ino {d}: the {t} arm found no free block (size {d}, stored {d}) — ENOSPC at the sync point", .{ ino, d, cur.size, stored_len });
+            log.debug("promotion ino {d}: the {t} arm found no free block on vol {x:0>16} (size {d}, stored {d})", .{ ino, d, tag, cur.size, stored_len });
         } else {
             stats.promotions_failed.inc();
             log.debug("promotion ino {d}: the {t} arm declined (size {d}, stored {d})", .{ ino, d, cur.size, stored_len });

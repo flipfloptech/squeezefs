@@ -434,6 +434,10 @@ const Row = struct {
     key: PackKey = .{ .vol_tag = 0, .scope = 0 },
     used: bool = false,
     pack: std.atomic.Value(?*OpenPack) = .init(null),
+    /// OQ-1: a `StorageFull` refill stopped this row's VOLUME for the rest
+    /// of the promotion batch (every row of the volume; another volume's
+    /// packs go on — the promotion's one retry lands there).
+    stopped: std.atomic.Value(bool) = .init(false),
 };
 
 /// One refill in flight per key: every concurrent reserver for the same
@@ -457,12 +461,6 @@ pub const Packer = struct {
     /// 375 packs per 96,000 files makes the retention free).
     opened: std.ArrayList(*OpenPack) = .empty,
     refill: Flight = .init,
-    /// OQ-1: a `StorageFull` refill stops the arm for the rest of the
-    /// promotion batch (counted `pack_refill_storage_full` once per stop);
-    /// `beginPromotionBatch` re-arms — every batch's start calls it
-    /// (`staging.PromotionHooks.begin_batch`: an fsync, a syncfs pass, a
-    /// dismount pass, a drain pass, a recall).
-    stopped: std.atomic.Value(bool) = .init(false),
     seq: std.atomic.Value(u64) = .init(0),
 
     /// `capacity` rows: the data-volume count × the leased-slot bound.
@@ -486,12 +484,34 @@ pub const Packer = struct {
         self.* = undefined;
     }
 
+    /// OQ-1: a `StorageFull` refill stops the VOLUME's arm for the rest of
+    /// the promotion batch (counted `pack_refill_storage_full` once per
+    /// stop); every batch's start re-arms it (`staging.PromotionHooks.
+    /// begin_batch`: an fsync, a syncfs pass, a dismount pass, a drain pass,
+    /// a recall).
     pub fn beginPromotionBatch(self: *Packer) void {
-        self.stopped.store(false, .release);
+        self.rows_lock.lock();
+        defer self.rows_lock.unlock();
+        for (self.rows) |*r| if (r.used) r.stopped.store(false, .release);
     }
 
-    pub fn isStopped(self: *const Packer) bool {
-        return self.stopped.load(.acquire);
+    /// The arm of `k`'s volume is stopped for this batch.
+    pub fn isStopped(self: *Packer, k: PackKey) bool {
+        const row = self.rowFor(k) catch return false;
+        return row.stopped.load(.acquire);
+    }
+
+    /// The stop: every row of `vol_tag` (the refill's StorageFull is the
+    /// volume's); true iff this call stopped it (the one count).
+    fn stopVolume(self: *Packer, vol_tag: u64) bool {
+        self.rows_lock.lock();
+        defer self.rows_lock.unlock();
+        var first = false;
+        for (self.rows) |*r| {
+            if (!r.used or r.key.vol_tag != vol_tag) continue;
+            if (!r.stopped.swap(true, .acq_rel)) first = true;
+        }
+        return first;
     }
 
     fn rowFor(self: *Packer, k: PackKey) error{PackTableFull}!*Row {
@@ -523,11 +543,11 @@ pub const Packer = struct {
     pub fn reserve(self: *Packer, io: Io, k: PackKey, slot_len: u64) ReserveError!?Tenant {
         assert(slot_len > 0 and slot_len <= self.chunk);
         while (true) {
-            if (self.isStopped()) {
+            const row = try self.rowFor(k);
+            if (row.stopped.load(.acquire)) {
                 stats.pack_arm_stopped_promotions.inc();
                 return null;
             }
-            const row = try self.rowFor(k);
             if (row.pack.load(.acquire)) |pack| {
                 if (pack.isSealed()) {
                     _ = row.pack.cmpxchgStrong(pack, null, .acq_rel, .acquire);
@@ -555,9 +575,9 @@ pub const Packer = struct {
                     // episode's (`enospc.FullStoreEpisode`, one per
                     // episode): a batch is one fsync, so a line here was
                     // one per fsync on a full store (generic/475: ×41).
-                    if (!self.stopped.swap(true, .acq_rel)) {
+                    if (self.stopVolume(k.vol_tag)) {
                         stats.pack_refill_storage_full.inc();
-                        log.debug("pack refill: vol {x:0>16} has no free block for the open pack — the packed arm stops for the rest of this promotion batch", .{k.vol_tag});
+                        log.debug("pack refill: vol {x:0>16} has no free block for the open pack — the volume's packed arm stops for the rest of this promotion batch", .{k.vol_tag});
                     }
                     continue;
                 },
@@ -579,7 +599,7 @@ pub const Packer = struct {
         /// UNSEALED pack wins and the fresh block is abandoned unpublished.
         fn compute(c: *const RefillCtx, _: Io) anyerror!*OpenPack {
             const self = c.packer;
-            if (self.isStopped()) return error.StorageFull;
+            if (c.row.stopped.load(.acquire)) return error.StorageFull;
             if (c.row.pack.load(.acquire)) |existing| if (!existing.isSealed()) return existing;
             // The struct before the mint: an OOM leaves the allocator untouched.
             const p = try self.gpa.create(OpenPack);
@@ -1778,12 +1798,17 @@ test "a DMA error releases the tenant and errors (nothing published); a StorageF
     const sf0 = stats.pack_refill_storage_full.load();
     const k2: PackKey = .{ .vol_tag = 0x11, .scope = 1 };
     try testing.expectEqual(@as(?Prepared, null), try f.packer.prepare(io, k2, &fill(10, 'q'), 1));
-    try testing.expect(f.packer.isStopped());
+    try testing.expect(f.packer.isStopped(k2));
+    try testing.expect(f.packer.isStopped(k)); // the VOLUME's arm: every scope of it
     try testing.expectEqual(sf0 + 1, stats.pack_refill_storage_full.load());
     try testing.expectEqual(@as(?Prepared, null), try f.packer.prepare(io, k, &fill(10, 'q'), 1));
     try testing.expectEqual(stopped0 + 2, stats.pack_arm_stopped_promotions.load());
+    // Another volume's arm is not stopped (the promotion's retry lands there).
+    const k3: PackKey = .{ .vol_tag = 0x22, .scope = 0 };
+    try testing.expect(!f.packer.isStopped(k3));
     f.world.storage_full = false;
     f.packer.beginPromotionBatch();
+    try testing.expect(!f.packer.isStopped(k));
     try testing.expect((try f.packer.prepare(io, k, &fill(10, 'q'), 1)) != null);
 }
 

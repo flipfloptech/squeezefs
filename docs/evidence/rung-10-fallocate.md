@@ -86,7 +86,11 @@ test "the rung-4 ops default to ENOSYS" pinned `!@hasDecl(MemFs, "fallocate")`)
   `_notrun` on `origin/dev`), 127 `_notrun` for another capability (62 + 13 reflink, 21 FIEMAP, 10
   `_scratch_mkfs_sized`, 5 + 2 fcollapse/finsert at the kernel, 4 swapfiles, 3 shutdown, 2 dax, FITRIM,
   quotas, defrag, geometry), **1 FAILED: generic/703** — the finding below. Pass 2 (generic/703 and the
-  14 tests after it): RESULTS BELOW.
+  14 tests after it, on the sync law): **generic/703 PASSED**, 749 and 758 passed, 12 `_notrun`
+  (3 FIEMAP, exchangerange ×2, write-atomic ×2, reflink, quotas, shutdown, finsert at the kernel,
+  `fwzero`); 0 failures, 0 alert lines in every daemon log, fsck clean on both sets (the "did NOT
+  pass" is the ledger's stale-row rule: a subset exercises no ledger row — the full `-g auto` is where
+  it is judged). Net: **32 of the subset pass that were `_notrun` on `origin/dev`**, none fails.
 
 ## The finding: the sync law (generic/703; pre-existing, fixed here)
 
@@ -116,6 +120,17 @@ landing takes the reservation over, every later 64 KiB write is a W1 patch in pl
   (`fallocate`, `UNWRITTEN`, `punch of a tree-mapped`) **100/100**; the smoke row **20/20**.
 
 ## Seen, not fixed
+
+- **The ENOSPC stress rows' tripwires** (pass 1, both tests PASSED): generic/299 (aio-dio writers on
+  a filled scratch with falloc/fpunch) fired `parked_gate_wall_supply_visible` ×2 and logged ~3,600
+  `transport_lease_overlong` error lines (FUSE_WRITE payload leases of 2–6 s under the full-store
+  parks); generic/347 (dm-thin out of space) fired `parked_gate_wall_supply_visible` and
+  `upload_join_overlong`. Both rows need `falloc` and were `_notrun` on `origin/dev`: the write path's
+  parked-gate wall law under a full store (the F7 territory, `rung-10-full-store-enospc.md`) is what
+  they expose, not the reservation — the gate waited a whole wall for supply that stayed "visible" in
+  trim windows and in-flight frees while every flush was refused. OWNER-CALL: the same fence-class
+  question `alloc_trim_window_parks` had (a counted outcome of the full-store regime vs. a must-stay-0);
+  the lease-overlong lines are the same regime's symptom.
 
 - **FIEMAP** (`FS_IOC_FIEMAP`): 21 of the subset `_notrun` "xfs_io fiemap failed" — the ioctl is not
   served (a capability gap of the same family as fallocate was; the reservation would report

@@ -3449,7 +3449,9 @@ pub const DataPlane = struct {
         const gpa = self.gpa;
         const ino = req.ino;
         for (req.inserts) |ins| {
-            var covered = false;
+            // An UNWRITTEN binding names no bytes (`layout.publishLayout`'s
+            // exemption).
+            var covered = ins.binding.unwritten;
             for (req.proofs) |p| {
                 if (p.covers(ins.binding, self.chunk)) covered = true;
             }

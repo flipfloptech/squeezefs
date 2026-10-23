@@ -96,11 +96,15 @@ pub const stats = struct {
     /// (a DAMAGED quarantine marker, or a window law the decoder already
     /// enforces — reachable only through corruption). Must stay 0.
     pub var packed_mapping_refusals: counters.Tripwire = .init("packed_mapping_refusals");
+    /// `unwritten_mapping_served`: an UNWRITTEN binding (a fallocate
+    /// reservation) reached the read choke point — every resolve seam
+    /// hides one as a hole, so this is a missed seam. Must stay 0.
+    pub var unwritten_mapping_served: counters.Tripwire = .init("unwritten_mapping_served");
 };
 
 /// `.stats`-ready JSON object of this module's instruments.
 pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
-    try w.print("{{\"layout_inline_writes\":{d},\"layout_staged_writes\":{d},\"layout_striped_writes\":{d},\"layout_publish_batches\":{d},\"layout_publish_batched_blocks\":{d},\"layout_delta_rebases\":{d},\"inline_max_bytes\":{d},\"packed_mapping_refusals\":{d}}}", .{
+    try w.print("{{\"layout_inline_writes\":{d},\"layout_staged_writes\":{d},\"layout_striped_writes\":{d},\"layout_publish_batches\":{d},\"layout_publish_batched_blocks\":{d},\"layout_delta_rebases\":{d},\"inline_max_bytes\":{d},\"packed_mapping_refusals\":{d},\"unwritten_mapping_served\":{d}}}", .{
         stats.layout_inline_writes.load(),
         stats.layout_staged_writes.load(),
         stats.layout_striped_writes.load(),
@@ -109,6 +113,7 @@ pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
         stats.layout_delta_rebases.load(),
         stats.inline_max_bytes.load(),
         stats.packed_mapping_refusals.load(),
+        stats.unwritten_mapping_served.load(),
     });
 }
 
@@ -214,7 +219,15 @@ const F_KNOWN: u16 = F_HAS_FILE_ID | F_HAS_DURABLE_COPY | F_MAP_INLINE | F_MAP_K
 pub const M_WHOLE_BLOCK: u8 = 1 << 0;
 /// fsck's quarantine marker: decodes in a record, refuses at every read.
 pub const M_DAMAGED: u8 = 1 << 1;
-const M_KNOWN: u8 = M_WHOLE_BLOCK | M_DAMAGED;
+/// A RESERVED block (charter §6.6, decision 0003 §BH): allocated to the
+/// file — a durable reference like any other, charged to the volume —
+/// whose bytes are NOT the file's: every read serves zeros, every write
+/// arm sees a hole, and the write that lands in it writes the WHOLE block
+/// and flips the flag (the same reference: no `±ref`, no proof — the DMA
+/// law exists so a type flip cannot precede its bytes, and an unwritten
+/// binding names none). Whole-block only, never DAMAGED.
+pub const M_UNWRITTEN: u8 = 1 << 2;
+const M_KNOWN: u8 = M_WHOLE_BLOCK | M_DAMAGED | M_UNWRITTEN;
 
 /// The 16-byte file id of a staged/packed layout (the ring key's identity
 /// half; 0002 row: 16 bytes, not the uuid's 36 chars).
@@ -290,9 +303,25 @@ pub const Mapping = struct {
     len: u32 = 0,
     whole_block: bool = false,
     damaged: bool = false,
+    /// `M_UNWRITTEN`: a reserved block whose bytes are not the file's.
+    unwritten: bool = false,
 
     pub fn wholeBlock(vol_tag: u64, offset: u64, incarnation: u64) Mapping {
         return .{ .vol_tag = vol_tag, .offset = offset, .incarnation = incarnation, .whole_block = true };
+    }
+
+    /// A fallocate reservation: the whole block allocated, its bytes not
+    /// the file's.
+    pub fn unwrittenBlock(vol_tag: u64, offset: u64, incarnation: u64) Mapping {
+        return .{ .vol_tag = vol_tag, .offset = offset, .incarnation = incarnation, .whole_block = true, .unwritten = true };
+    }
+
+    /// The same reference with the UNWRITTEN flag set (ZERO_RANGE's flip)
+    /// or cleared (the landing that wrote the whole block).
+    pub fn withUnwritten(self: Mapping, unwritten: bool) Mapping {
+        var m = self;
+        m.unwritten = unwritten;
+        return m;
     }
 
     pub fn tenant(vol_tag: u64, offset: u64, incarnation: u64, rel_off: u32, len: u32) Mapping {
@@ -305,6 +334,10 @@ pub const Mapping = struct {
         // chunk is `block + 4 KiB` (`transform.chunkSizeFor`), and the
         // helper's assertion panicked the first striped publish there.
         if (chunk == 0 or self.offset % chunk != 0) return error.MappingRefused;
+        // UNWRITTEN is the whole-block reservation alone: a tenant window
+        // is a stored image, and a quarantine of bytes nobody reads is
+        // meaningless.
+        if (self.unwritten and (!self.whole_block or self.damaged)) return error.MappingRefused;
         if (self.whole_block) {
             if (self.rel_off != 0 or self.len != 0) return error.MappingRefused;
             return;
@@ -351,7 +384,7 @@ pub const Mapping = struct {
         std.mem.writeInt(u64, &w.incarnation_le, self.incarnation, .little);
         std.mem.writeInt(u32, &w.rel_off_le, self.rel_off, .little);
         std.mem.writeInt(u32, &w.len_le, self.len, .little);
-        w.flags = (if (self.whole_block) M_WHOLE_BLOCK else 0) | (if (self.damaged) M_DAMAGED else @as(u8, 0));
+        w.flags = (if (self.whole_block) M_WHOLE_BLOCK else 0) | (if (self.damaged) M_DAMAGED else @as(u8, 0)) | (if (self.unwritten) M_UNWRITTEN else @as(u8, 0));
         w.reserved = @splat(0);
         return w;
     }
@@ -369,6 +402,7 @@ pub const Mapping = struct {
             .len = std.mem.readInt(u32, &w.len_le, .little),
             .whole_block = w.flags & M_WHOLE_BLOCK != 0,
             .damaged = w.flags & M_DAMAGED != 0,
+            .unwritten = w.flags & M_UNWRITTEN != 0,
         };
         try m.check(chunk);
         return m;
@@ -385,6 +419,13 @@ pub const Mapping = struct {
         if (self.damaged) {
             stats.packed_mapping_refusals.fire("DAMAGED quarantine marker served to a read");
             return error.MappingDamaged;
+        }
+        // Every resolve seam hides an UNWRITTEN binding as a hole; one
+        // reaching the choke point is a missed seam, refused (EIO), never
+        // the block's recycled bytes.
+        if (self.unwritten) {
+            stats.unwritten_mapping_served.fire("an UNWRITTEN binding reached the read choke point");
+            return error.MappingRefused;
         }
         self.check(chunk) catch |e| {
             stats.packed_mapping_refusals.fire("a stored mapping failed the window law at read");
@@ -1566,6 +1607,11 @@ pub const Publish = struct {
     /// old one did not.
     proofs: []const DmaProof,
     arm: PublishArm = .diff,
+    /// A COLLAPSE/INSERT shift (decision 0003 §BH.5): the map's entries
+    /// re-indexed, the data unmoved — every reference the old layout
+    /// named at another index needs no proof (its bytes landed before
+    /// that earlier publish); the `±ref` diff re-keys them as usual.
+    shift: bool = false,
 };
 
 /// Stage the layout record (`Put` of `XattrValue{"layout", encoded}`) and
@@ -1594,9 +1640,30 @@ pub fn publishLayout(t: *tx.KvTx, p: Publish, refs: RefsSeam, geo: Geometry) Pub
     // a 768-block map paid 2,300 binary searches and 4,600 decodes per
     // publish (21 % of the handler lanes' samples on a streaming write).
     const old: ?*const Layout = if (p.arm == .diff) (if (p.prev) |*pl| pl else null) else null;
+    // The shift's exemption set: every reference the old layout names,
+    // sorted for the search (the shift path alone pays it).
+    const old_refs: ?[]RefId = if (p.shift and old != null) blk: {
+        var it = old.?.named(geo.chunk);
+        var n: usize = 0;
+        while (it.peek() != null) : (it.skip()) n += 1;
+        const ids = try t.arena.allocator().alloc(RefId, n);
+        it = old.?.named(geo.chunk);
+        var i: usize = 0;
+        while (it.peek()) |rk| : (it.skip()) {
+            ids[i] = .{ .vol_tag = rk.vol_tag, .offset = rk.offset };
+            i += 1;
+        }
+        std.mem.sort(RefId, ids, {}, RefId.lessThan);
+        break :blk ids;
+    } else null;
     var walk = RefDiff.init(&p.layout, old, geo.chunk);
     while (walk.next()) |d| {
         if (d != .added) continue;
+        // An UNWRITTEN binding names no bytes: nothing to precede its flip.
+        if (d.added.mapping.unwritten) continue;
+        // A shift re-keys references the old layout already named: their
+        // bytes landed before that earlier publish.
+        if (old_refs) |ids| if (std.sort.binarySearch(RefId, ids, RefId.of(d.added.mapping), RefId.order) != null) continue;
         var covered = false;
         for (p.proofs) |pr| {
             if (pr.covers(d.added.mapping, geo.chunk)) {
@@ -1629,6 +1696,26 @@ pub fn publishLayout(t: *tx.KvTx, p: Publish, refs: RefsSeam, geo: Geometry) Pub
 fn refOf(ino: u64, e: MapEntry, chunk: u64) RefOp {
     return .{ .vol_tag = e.mapping.vol_tag, .block_idx = e.mapping.blockIdx(chunk), .owner_ino = ino, .block_index = e.block };
 }
+
+/// A reference's identity for the shift's exemption set (`Mapping.sameRef`
+/// over a checked mapping: the volume and the block's offset).
+const RefId = struct {
+    vol_tag: u64,
+    offset: u64,
+
+    fn of(m: Mapping) RefId {
+        return .{ .vol_tag = m.vol_tag, .offset = m.offset };
+    }
+
+    fn order(a: RefId, b: RefId) std.math.Order {
+        if (a.vol_tag != b.vol_tag) return std.math.order(a.vol_tag, b.vol_tag);
+        return std.math.order(a.offset, b.offset);
+    }
+
+    fn lessThan(_: void, a: RefId, b: RefId) bool {
+        return order(a, b) == .lt;
+    }
+};
 
 /// The reference diff of a publish as ONE merge walk over the two ascending
 /// named sequences (`NamedIterator`): `added` = a `(block, reference)` the
@@ -1899,7 +1986,9 @@ test "per-kind flag admissibility, the ascending-map law, the inline ceiling and
     try testing.expectError(error.MappingRefused, (Mapping{ .vol_tag = 1, .whole_block = true, .rel_off = 4096 }).check(chunk));
     _ = try Mapping.tenant(1, 0, 0, @intCast(chunk - 4096), 4096).check(chunk);
     var w = Mapping.tenant(1, 0, 0, 0, 1).encode();
-    w.flags = 4;
+    w.flags = 8;
+    try testing.expectError(error.MappingRefused, Mapping.decode(w, chunk));
+    w.flags = M_UNWRITTEN; // a tenant window is never a reservation
     try testing.expectError(error.MappingRefused, Mapping.decode(w, chunk));
     w.flags = 0;
     w.reserved[3] = 1;
@@ -1915,6 +2004,119 @@ test "per-kind flag admissibility, the ascending-map law, the inline ceiling and
     defer gpa.free(denc);
     // DAMAGED decodes in a record (fsck wrote it) …
     try testing.expect((try Layout.decode(denc, tgeo)).durable_copy.damaged);
+}
+
+test "the UNWRITTEN binding (charter §6.6, decision 0003 §BH): flag bit 2 on the 40 B wire, whole-block only and never DAMAGED, encode ∘ decode = id, the same reference as its written twin (no ±ref on the flip), refused at the read choke point with the tripwire; a publish naming a fresh UNWRITTEN block needs no proof, naming its WRITTEN twin later needs none either (same reference), and a shift's re-keyed references need none" {
+    const gpa = testing.allocator;
+    const chunk = tgeo.chunk;
+    const u = Mapping.unwrittenBlock(0x11, 5 * chunk, 9);
+    const w = u.encode();
+    try testing.expectEqual(M_WHOLE_BLOCK | M_UNWRITTEN, w.flags);
+    const back = try Mapping.decode(w, chunk);
+    try testing.expect(back.unwritten and back.whole_block and !back.damaged);
+    try testing.expect(back.eql(u));
+    try testing.expect(u.sameRef(u.withUnwritten(false), chunk));
+    try testing.expect(u.withUnwritten(false).eql(Mapping.wholeBlock(0x11, 5 * chunk, 9)));
+    // The law: a tenant window is never unwritten; neither is a quarantine.
+    var t_ = Mapping.tenant(0x11, 0, 0, 0, 100);
+    t_.unwritten = true;
+    try testing.expectError(error.MappingRefused, t_.check(chunk));
+    var d = u;
+    d.damaged = true;
+    try testing.expectError(error.MappingRefused, d.check(chunk));
+    try testing.expectError(error.MappingRefused, Mapping.decode(d.encode(), chunk));
+    // The choke point refuses it, counted (the tripwire's one line).
+    const fired = stats.unwritten_mapping_served.load();
+    log.testing.expectErrorLogs(1);
+    try testing.expectError(error.MappingRefused, u.readWindow(chunk, null));
+    try log.testing.expectAllFired();
+    try testing.expectEqual(fired + 1, stats.unwritten_mapping_served.load());
+    // The kvmap's kind-2 form carries it (a flag the run forms cannot spell).
+    const kvmap = @import("kvmap.zig");
+    const rec = kvmap.Rec.point(3, u);
+    try testing.expect(rec.special != null);
+    var buf: [MAPPING_WIRE_LEN]u8 = undefined;
+    const rt = try kvmap.Rec.fromEntry(3, rec.entryInto(&buf), chunk);
+    try testing.expect(rt.bindingAt(3, chunk).eql(u));
+    // publishLayout: a reservation needs no proof; its +ref rides the tx.
+    var refs: TestRefs = .{};
+    defer refs.deinit();
+    const seed: key.NameKey = .init(0x5EED);
+    const ino: u64 = 42;
+    const reserved = try sortedEntries(gpa, &.{
+        .{ .block = 0, .mapping = Mapping.wholeBlock(0x11, 7 * chunk, 1) },
+        .{ .block = 2, .mapping = u },
+    });
+    defer gpa.free(reserved);
+    const base = try sortedEntries(gpa, &.{.{ .block = 0, .mapping = Mapping.wholeBlock(0x11, 7 * chunk, 1) }});
+    defer gpa.free(base);
+    const prev = Layout.stripedInline(chunk, base);
+    const with_res = Layout.stripedInline(chunk, reserved);
+    {
+        var t = tx.KvTx.init(gpa, @src());
+        defer t.deinit();
+        try publishLayout(&t, .{ .ino = ino, .name_key = &seed, .prev = prev, .layout = with_res, .proofs = &.{} }, refs.seam(), tgeo);
+        try testing.expectEqual(@as(usize, 1), refs.adds.items.len);
+        try testing.expectEqual(RefOp{ .vol_tag = 0x11, .block_idx = 5, .owner_ino = ino, .block_index = 2 }, refs.adds.items[0]);
+        try testing.expectEqual(@as(usize, 0), refs.releases.items.len);
+    }
+    // The landing's flip to WRITTEN: the same reference, no proof, no ref op.
+    const written = try sortedEntries(gpa, &.{
+        .{ .block = 0, .mapping = Mapping.wholeBlock(0x11, 7 * chunk, 1) },
+        .{ .block = 2, .mapping = u.withUnwritten(false) },
+    });
+    defer gpa.free(written);
+    {
+        var t = tx.KvTx.init(gpa, @src());
+        defer t.deinit();
+        refs.adds.clearRetainingCapacity();
+        try publishLayout(&t, .{ .ino = ino, .name_key = &seed, .prev = with_res, .layout = Layout.stripedInline(3 * chunk, written), .proofs = &.{} }, refs.seam(), tgeo);
+        try testing.expectEqual(@as(usize, 0), refs.adds.items.len);
+        try testing.expectEqual(@as(usize, 0), refs.releases.items.len);
+        try testing.expectEqual(@as(usize, 1), t.staged.items.len);
+    }
+    // ZERO_RANGE's flip back to UNWRITTEN: the same.
+    {
+        var t = tx.KvTx.init(gpa, @src());
+        defer t.deinit();
+        try publishLayout(&t, .{ .ino = ino, .name_key = &seed, .prev = Layout.stripedInline(3 * chunk, written), .layout = with_res, .proofs = &.{} }, refs.seam(), tgeo);
+        try testing.expectEqual(@as(usize, 0), refs.adds.items.len);
+        try testing.expectEqual(@as(usize, 0), refs.releases.items.len);
+    }
+    // A COLLAPSE of block 0 of {0, 1, 2}: {1, 2} become {0, 1} — without
+    // the shift arm every re-keyed reference wants a proof; with it none
+    // does, block 0's reference is released and the moved ones re-keyed.
+    const three = try sortedEntries(gpa, &.{
+        .{ .block = 0, .mapping = Mapping.wholeBlock(0x11, 7 * chunk, 1) },
+        .{ .block = 1, .mapping = Mapping.wholeBlock(0x11, 8 * chunk, 1) },
+        .{ .block = 2, .mapping = Mapping.wholeBlock(0x22, 1 * chunk, 1) },
+    });
+    defer gpa.free(three);
+    const shifted = try sortedEntries(gpa, &.{
+        .{ .block = 0, .mapping = Mapping.wholeBlock(0x11, 8 * chunk, 1) },
+        .{ .block = 1, .mapping = Mapping.wholeBlock(0x22, 1 * chunk, 1) },
+    });
+    defer gpa.free(shifted);
+    {
+        var t = tx.KvTx.init(gpa, @src());
+        defer t.deinit();
+        try testing.expectError(error.ProofMissing, publishLayout(&t, .{ .ino = ino, .name_key = &seed, .prev = Layout.stripedInline(3 * chunk, three), .layout = Layout.stripedInline(2 * chunk, shifted), .proofs = &.{} }, refs.seam(), tgeo));
+        refs.adds.clearRetainingCapacity();
+        refs.releases.clearRetainingCapacity();
+        try publishLayout(&t, .{ .ino = ino, .name_key = &seed, .prev = Layout.stripedInline(3 * chunk, three), .layout = Layout.stripedInline(2 * chunk, shifted), .proofs = &.{}, .shift = true }, refs.seam(), tgeo);
+        try testing.expectEqual(@as(usize, 2), refs.adds.items.len);
+        try testing.expectEqual(@as(usize, 3), refs.releases.items.len);
+        try testing.expectEqual(RefOp{ .vol_tag = 0x11, .block_idx = 8, .owner_ino = ino, .block_index = 0 }, refs.adds.items[0]);
+        try testing.expectEqual(RefOp{ .vol_tag = 0x22, .block_idx = 1, .owner_ino = ino, .block_index = 1 }, refs.adds.items[1]);
+        try testing.expectEqual(RefOp{ .vol_tag = 0x11, .block_idx = 7, .owner_ino = ino, .block_index = 0 }, refs.releases.items[0]);
+        // A reference the old layout never named still needs its proof under the shift arm.
+        const alien = try sortedEntries(gpa, &.{
+            .{ .block = 0, .mapping = Mapping.wholeBlock(0x11, 8 * chunk, 1) },
+            .{ .block = 1, .mapping = Mapping.wholeBlock(0x33, 1 * chunk, 1) },
+        });
+        defer gpa.free(alien);
+        try testing.expectError(error.ProofMissing, publishLayout(&t, .{ .ino = ino, .name_key = &seed, .prev = Layout.stripedInline(3 * chunk, three), .layout = Layout.stripedInline(2 * chunk, alien), .proofs = &.{}, .shift = true }, refs.seam(), tgeo));
+    }
 }
 
 test "mapping law ties: ceil(len) = pack slot — 1 → 4096, 4096 → 4096, 4097 → 8192; the window read is grain-outward on the mapping's own volume, never the block prefix" {

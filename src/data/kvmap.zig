@@ -244,9 +244,11 @@ pub const Rec = struct {
     incarnation: u64,
     special: ?Mapping = null,
 
-    /// A whole-block binding at one index.
+    /// A whole-block binding at one index (an UNWRITTEN reservation rides
+    /// the kind-2 form, as a quarantine marker does: a flag the run forms
+    /// cannot spell).
     pub fn point(index: u32, m: Mapping) Rec {
-        if (!m.whole_block or m.damaged) return .{ .index = index, .len = 1, .vol_tag = m.vol_tag, .offset = m.offset, .incarnation = m.incarnation, .special = m };
+        if (!m.whole_block or m.damaged or m.unwritten) return .{ .index = index, .len = 1, .vol_tag = m.vol_tag, .offset = m.offset, .incarnation = m.incarnation, .special = m };
         return .{ .index = index, .len = 1, .vol_tag = m.vol_tag, .offset = m.offset, .incarnation = m.incarnation };
     }
 
@@ -320,7 +322,7 @@ pub const Rec = struct {
             .string => |s| blk: {
                 if (s.len != layout.MAPPING_WIRE_LEN) return error.Corrupt;
                 const m = Mapping.decode(std.mem.bytesToValue(layout.MappingWire, s[0..layout.MAPPING_WIRE_LEN]), chunk) catch return error.Corrupt;
-                if (m.whole_block and !m.damaged) return error.Corrupt;
+                if (m.whole_block and !m.damaged and !m.unwritten) return error.Corrupt;
                 break :blk .{ .index = index, .len = 1, .vol_tag = m.vol_tag, .offset = m.offset, .incarnation = m.incarnation, .special = m };
             },
         };

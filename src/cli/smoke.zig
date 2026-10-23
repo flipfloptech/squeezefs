@@ -12956,3 +12956,248 @@ test "smoke: THE BLOCK-MAP TREE — a 1.5 GiB file at 1 MiB blocks crosses the i
         std.debug.print("smoke[kvmap]: {s}", .{report[std.mem.lastIndexOf(u8, report, "summary:").?..]});
     }
 }
+
+// ---------------------------------------------------------------------------
+// Export handles (charter §4 `FUSE_EXPORT_SUPPORT`; xfstests generic/426,
+// 467, 477, 756, 777): `name_to_handle_at` / `open_by_handle_at` across a
+// cache drop and a cycle-mount.
+// ---------------------------------------------------------------------------
+
+/// `struct file_handle` with the kernel's `MAX_HANDLE_SZ` body (a FUSE
+/// handle is 12 B: nodeid ‖ generation).
+const FileHandle = extern struct {
+    handle_bytes: u32 = 128,
+    handle_type: i32 = 0,
+    f_handle: [128]u8 = @splat(0),
+};
+
+fn handleOf(path: [:0]const u8) !FileHandle {
+    var h: FileHandle = .{};
+    var mount_id: i32 = 0;
+    const rc = linux.name_to_handle_at(linux.AT.FDCWD, path.ptr, @ptrCast(&h), &mount_id, 0);
+    if (linux.errno(rc) != .SUCCESS) {
+        std.debug.print("\nname_to_handle_at({s}): {t}\n", .{ path, linux.errno(rc) });
+        return error.NameToHandleFailed;
+    }
+    return h;
+}
+
+const ByHandle = union(enum) { fd: linux.fd_t, errno: linux.E };
+
+fn openByHandle(mount_fd: linux.fd_t, h: *const FileHandle, flags: linux.O) ByHandle {
+    const rc = linux.syscall3(.open_by_handle_at, @as(u32, @bitCast(mount_fd)), @intFromPtr(h), @as(u32, @bitCast(flags)));
+    const e = linux.errno(rc);
+    return if (e == .SUCCESS) .{ .fd = @intCast(rc) } else .{ .errno = e };
+}
+
+/// `open_by_handle_at` that must succeed: the fd (the caller closes it).
+fn openedByHandle(mount_fd: linux.fd_t, h: *const FileHandle, flags: linux.O, what: []const u8) !linux.fd_t {
+    return switch (openByHandle(mount_fd, h, flags)) {
+        .fd => |fd| fd,
+        .errno => |e| {
+            std.debug.print("\nopen_by_handle_at({s}): {t}\n", .{ what, e });
+            return error.OpenByHandleFailed;
+        },
+    };
+}
+
+fn inoOfFd(fd: linux.fd_t) !u64 {
+    var st: linux.Statx = undefined;
+    if (linux.errno(linux.statx(fd, "", linux.AT.EMPTY_PATH, .{ .INO = true }, &st)) != .SUCCESS) return error.StatxFailed;
+    return st.ino;
+}
+
+fn inoOfPath(path: [:0]const u8) !u64 {
+    var st: linux.Statx = undefined;
+    if (linux.errno(linux.statx(linux.AT.FDCWD, path.ptr, 0, .{ .INO = true }, &st)) != .SUCCESS) return error.StatxFailed;
+    return st.ino;
+}
+
+/// The fd's path as the kernel connected it (`/proc/self/fd/N`).
+fn pathOfFd(fd: linux.fd_t, buf: *[linux.PATH_MAX]u8) ![]const u8 {
+    var pb: [64:0]u8 = undefined;
+    const link = try std.fmt.bufPrintSentinel(&pb, "/proc/self/fd/{d}", .{fd}, 0);
+    const rc = linux.readlink(link.ptr, buf, buf.len);
+    if (linux.errno(rc) != .SUCCESS) return error.ReadlinkFailed;
+    return buf[0..rc];
+}
+
+fn readAllFd(fd: linux.fd_t, buf: []u8) ![]const u8 {
+    const rc = linux.pread(fd, buf.ptr, buf.len, 0);
+    if (linux.errno(rc) != .SUCCESS) return error.ReadFailed;
+    return buf[0..rc];
+}
+
+/// `echo 2 > /proc/sys/vm/drop_caches`: every unpinned dentry and inode
+/// of every mount leaves the kernel's caches (the page cache stays: the
+/// handle decode needs the INODE evicted, nothing else).
+fn dropInodeCaches(io: Io) !void {
+    const f = try Io.Dir.cwd().openFile(io, "/proc/sys/vm/drop_caches", .{ .mode = .write_only });
+    defer f.close(io);
+    try f.writeStreamingAll(io, "2\n");
+}
+
+test "smoke: FILE HANDLES SURVIVE A CACHE DROP AND A REMOUNT (FUSE_EXPORT_SUPPORT) — name_to_handle_at on a file, a hard-linked file, a symlink, a directory and a nested directory; `echo 2 > drop_caches` evicts every inode; open_by_handle_at opens each (fstat ino equal, the bytes read back, the directory fd's /proc path is its CONNECTED path through `..` to the root, faccessat through it); a renamed file and a renamed directory still open (the directory at its new path); an unlinked file with every name gone and a removed directory answer ESTALE; after `umount`/`mount` every surviving handle opens again, the nested directory's path resolves through its new parent, the removed ones stay stale" {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    try rig.formatSet(true);
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(0);
+
+    // The tree: d/{f, h (a hard link of f), l → f, sub/{g}}; the bytes.
+    {
+        const out = try rig.onMount("mkdir -p d/sub && printf 'aaaa-file' > d/f && ln d/f d/h && ln -s f d/l && printf 'bbbb-nested' > d/sub/g && sync");
+        gpa.free(out);
+    }
+    var pb: [6][192:0]u8 = undefined;
+    const p_d = try std.fmt.bufPrintSentinel(&pb[0], "{s}/d", .{rig.mp}, 0);
+    const p_f = try std.fmt.bufPrintSentinel(&pb[1], "{s}/d/f", .{rig.mp}, 0);
+    const p_h = try std.fmt.bufPrintSentinel(&pb[2], "{s}/d/h", .{rig.mp}, 0);
+    const p_l = try std.fmt.bufPrintSentinel(&pb[3], "{s}/d/l", .{rig.mp}, 0);
+    const p_sub = try std.fmt.bufPrintSentinel(&pb[4], "{s}/d/sub", .{rig.mp}, 0);
+    const p_g = try std.fmt.bufPrintSentinel(&pb[5], "{s}/d/sub/g", .{rig.mp}, 0);
+    const h_d = try handleOf(p_d);
+    const h_f = try handleOf(p_f);
+    const h_l = try handleOf(p_l);
+    const h_sub = try handleOf(p_sub);
+    const h_g = try handleOf(p_g);
+    const ino_d = try inoOfPath(p_d);
+    const ino_f = try inoOfPath(p_f);
+    try testing.expectEqual(ino_f, try inoOfPath(p_h));
+    const ino_sub = try inoOfPath(p_sub);
+    const ino_g = try inoOfPath(p_g);
+    // The mount fd for every decode (O_PATH would do; a directory fd is one).
+    const mount_fd: linux.fd_t = @intCast(linux.open(rig.mp.ptr, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true }, 0));
+    var mount_fd_open = true;
+    defer if (mount_fd_open) {
+        _ = linux.close(mount_fd);
+    };
+
+    const Expect = struct {
+        fn opens(mfd: linux.fd_t, h: *const FileHandle, ino: u64, bytes: ?[]const u8, path: ?[]const u8, what: []const u8) !void {
+            const flags: linux.O = if (path != null and bytes == null) .{ .ACCMODE = .RDONLY, .DIRECTORY = true } else .{ .ACCMODE = .RDONLY };
+            const fd = try openedByHandle(mfd, h, flags, what);
+            defer _ = linux.close(fd);
+            try testing.expectEqual(ino, try inoOfFd(fd));
+            if (bytes) |want| {
+                var buf: [64]u8 = undefined;
+                try testing.expectEqualStrings(want, try readAllFd(fd, &buf));
+            }
+            if (path) |want| {
+                var lb: [linux.PATH_MAX]u8 = undefined;
+                const got = try pathOfFd(fd, &lb);
+                if (!std.mem.eql(u8, want, got)) std.debug.print("\n{s}: connected path {s}, want {s}\n", .{ what, got, want });
+                try testing.expectEqualStrings(want, got);
+            }
+        }
+
+        fn stale(mfd: linux.fd_t, h: *const FileHandle, what: []const u8) !void {
+            switch (openByHandle(mfd, h, .{ .ACCMODE = .RDONLY })) {
+                .fd => |fd| {
+                    _ = linux.close(fd);
+                    std.debug.print("\nopen_by_handle_at({s}) opened a handle that must be stale\n", .{what});
+                    return error.HandleNotStale;
+                },
+                .errno => |e| if (e != .STALE and e != .NOENT) {
+                    std.debug.print("\nopen_by_handle_at({s}): {t}, want ESTALE\n", .{ what, e });
+                    return error.WrongErrno;
+                },
+            }
+        }
+    };
+
+    // 1. Before any eviction (the icache answers; no LOOKUP reaches us).
+    try Expect.opens(mount_fd, &h_f, ino_f, "aaaa-file", null, "f (cached)");
+    try Expect.opens(mount_fd, &h_sub, ino_sub, null, p_sub, "sub (cached)");
+
+    // 2. The cache drop: every inode evicted; the decode is LOOKUP(nodeid, ".")
+    //    and a directory's reconnect walks LOOKUP(nodeid, "..") to the root.
+    try dropInodeCaches(io);
+    try Expect.opens(mount_fd, &h_f, ino_f, "aaaa-file", null, "f after drop");
+    try Expect.opens(mount_fd, &h_g, ino_g, "bbbb-nested", null, "sub/g after drop");
+    try Expect.opens(mount_fd, &h_l, (try inoOfPath(p_l)), null, null, "l (the symlink itself) after drop");
+    try Expect.opens(mount_fd, &h_d, ino_d, null, p_d, "d after drop");
+    try Expect.opens(mount_fd, &h_sub, ino_sub, null, p_sub, "sub after drop");
+    {
+        // The directory fd is usable: a name resolves through it.
+        const fd = try openedByHandle(mount_fd, &h_sub, .{ .ACCMODE = .RDONLY, .DIRECTORY = true }, "sub for faccessat");
+        defer _ = linux.close(fd);
+        try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.faccessat(fd, "g", linux.F_OK, 0)));
+    }
+
+    // 3. Renames: a file's handle follows the inode, a directory's handle
+    //    reconnects at its NEW path.
+    {
+        const out = try rig.onMount("mv d/f d/f2 && mkdir -p e && mv d/sub e/sub2 && sync");
+        gpa.free(out);
+    }
+    var pb2: [2][192:0]u8 = undefined;
+    const p_sub2 = try std.fmt.bufPrintSentinel(&pb2[0], "{s}/e/sub2", .{rig.mp}, 0);
+    try dropInodeCaches(io);
+    try Expect.opens(mount_fd, &h_f, ino_f, "aaaa-file", null, "f renamed to f2");
+    try Expect.opens(mount_fd, &h_sub, ino_sub, null, p_sub2, "sub renamed into e/sub2");
+    try Expect.opens(mount_fd, &h_g, ino_g, "bbbb-nested", null, "g under the moved directory");
+
+    // 4. Unlink: a file whose every name went and a removed directory are
+    //    stale; a file with one name left (the hard link) is not.
+    const p_x = try std.fmt.bufPrintSentinel(&pb2[1], "{s}/d/x", .{rig.mp}, 0);
+    {
+        const out = try rig.onMount("printf 'x' > d/x && mkdir d/gone");
+        gpa.free(out);
+    }
+    const h_x = try handleOf(p_x);
+    var pb3: [192:0]u8 = undefined;
+    const h_gone = try handleOf(try std.fmt.bufPrintSentinel(&pb3, "{s}/d/gone", .{rig.mp}, 0));
+    {
+        const out = try rig.onMount("rm d/f2 && rm d/x && rmdir d/gone && sync");
+        gpa.free(out);
+    }
+    try dropInodeCaches(io);
+    try Expect.opens(mount_fd, &h_f, ino_f, "aaaa-file", null, "f through its hard link h");
+    try Expect.stale(mount_fd, &h_x, "x unlinked");
+    try Expect.stale(mount_fd, &h_gone, "gone rmdir'd");
+    {
+        const out = try rig.onMount("rm d/h && sync");
+        gpa.free(out);
+    }
+    try dropInodeCaches(io);
+    try Expect.stale(mount_fd, &h_f, "f with every name gone");
+
+    // 5. The cycle-mount: the kernel's state is gone; the handles are
+    //    nodeid + generation and must decode against the remounted set.
+    mount_fd_open = false;
+    _ = linux.close(mount_fd);
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+    const mark = try rig.logLen();
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(mark);
+    const mount_fd2: linux.fd_t = @intCast(linux.open(rig.mp.ptr, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true }, 0));
+    var mount_fd2_open = true;
+    defer if (mount_fd2_open) {
+        _ = linux.close(mount_fd2);
+    };
+    try Expect.opens(mount_fd2, &h_d, ino_d, null, p_d, "d after the remount");
+    try Expect.opens(mount_fd2, &h_sub, ino_sub, null, p_sub2, "e/sub2 after the remount");
+    try Expect.opens(mount_fd2, &h_g, ino_g, "bbbb-nested", null, "g after the remount");
+    try Expect.opens(mount_fd2, &h_l, (try inoOfPath(p_l)), null, null, "l after the remount");
+    try Expect.stale(mount_fd2, &h_x, "x after the remount");
+    try Expect.stale(mount_fd2, &h_gone, "gone after the remount");
+    try Expect.stale(mount_fd2, &h_f, "f after the remount");
+    {
+        // The reconnected directory fd walks: `..` of e/sub2 is e, whose
+        // `..` is the root.
+        const fd = try openedByHandle(mount_fd2, &h_sub, .{ .ACCMODE = .RDONLY, .DIRECTORY = true }, "sub2 for the .. walk");
+        defer _ = linux.close(fd);
+        try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.faccessat(fd, "../sub2/g", linux.F_OK, 0)));
+        try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.faccessat(fd, "../../d", linux.F_OK, 0)));
+    }
+    mount_fd2_open = false;
+    _ = linux.close(mount_fd2);
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+    std.debug.print("\nsmoke: export handles — file, hard link, symlink, directory, nested directory: open after a cache drop, after renames, after a remount; unlinked and removed stale\n", .{});
+}

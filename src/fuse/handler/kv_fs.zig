@@ -6961,6 +6961,81 @@ test "POSIX: mkdir/readdir/rmdir — dot entries, cookie continuation, ENOTEMPTY
     try testing.expectEqual(linux.E.EXIST, h.call(.{ .mkdir = .{ .name = "e", .mode = 0o755, .umask = 0 } }, 1).errno().?);
 }
 
+test "export handles (FUSE_EXPORT_SUPPORT): LOOKUP(nodeid, \".\") answers a file, a symlink and a directory by nodeid alone — the handle decode; a corpse at nlink 0 is ENOENT (the kernel's ESTALE); every entry carries the set's ONE generation and the root's is 0; LOOKUP(dir, \"..\") resolves from the DURABLE parent on a FRESH open of the same store (no memo) — after mkdir, after a rename across parents, after an exchange; the root's `..` is itself; a file's `..` is ENOTDIR" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    const d = try h.mkdir(1, "d");
+    const d2 = try h.mkdir(1, "d2");
+    const sub = try h.mkdir(d, "sub");
+    const f = try h.create(d, "f", 0o644);
+    h.release(f);
+    const l = (try h.entry(h.call(.{ .symlink = .{ .name = "l", .link = "f" } }, d))).nodeid;
+    // "." by nodeid alone, whatever the kind.
+    const ef = try h.entry(h.lookup(f, "."));
+    try testing.expectEqual(f, ef.nodeid);
+    try testing.expectEqual(S.IFREG, ef.attr.mode & S.IFMT);
+    const el = try h.entry(h.lookup(l, "."));
+    try testing.expectEqual(l, el.nodeid);
+    try testing.expectEqual(S.IFLNK, el.attr.mode & S.IFMT);
+    const es = try h.entry(h.lookup(sub, "."));
+    try testing.expectEqual(sub, es.nodeid);
+    try testing.expectEqual(S.IFDIR, es.attr.mode & S.IFMT);
+    // The generation law: one value per set (inos are never reused), never
+    // 0 — except the root's, which the kernel forces to 0.
+    try testing.expect(ef.generation != 0);
+    try testing.expectEqual(ef.generation, el.generation);
+    try testing.expectEqual(ef.generation, es.generation);
+    try testing.expectEqual(ef.generation, (try h.entry(h.lookup(d, "f"))).generation);
+    try testing.expectEqual(@as(u64, 0), (try h.entry(h.lookup(1, "."))).generation);
+    try testing.expectEqual(@as(u64, 0), (try h.entry(h.lookup(d, ".."))).generation);
+    // A corpse (unlinked, not yet forgotten) is no handle target.
+    try testing.expectEqual(@as(?linux.E, null), h.call(.{ .unlink = .{ .name = "f" } }, d).errno());
+    try testing.expectEqual(@as(u32, 0), (try h.getattr(f)).nlink);
+    try testing.expectEqual(linux.E.NOENT, h.lookup(f, ".").errno().?);
+    // A non-directory has no `..` (the kernel asks it of directories alone).
+    try testing.expectEqual(linux.E.NOTDIR, h.lookup(l, "..").errno().?);
+
+    // A FRESH filesystem over the same store: the memo is empty, the
+    // durable parent answers.
+    const Fresh = struct {
+        fn dotdot(store: *MemStore, data: *NoData, dir: u64) !?u64 {
+            var fs2 = try Harness.Fs.mount(testing.allocator, testing.io, store, data, .{ .dlm_stripes = 64 });
+            defer fs2.unmount();
+            var tr = @import("op_trace.zig").OpTrace.begin(1, .other);
+            defer tr.finish();
+            var win: [64]u8 = undefined;
+            var c: Ctx = .{ .unique = 1, .uid = 0, .gid = 0, .pid = 0, .io = testing.io, .trace = &tr, .wd_slot = null, .window = &win };
+            const e = fs2.lookup(&c, .{ .parent = dir, .name = ".." }) catch |e| switch (e) {
+                error.FileNotFound => return null,
+                else => return e,
+            };
+            return e.nodeid;
+        }
+    };
+    try testing.expectEqual(@as(?u64, d), try Fresh.dotdot(&h.store, &h.data, sub));
+    try testing.expectEqual(@as(?u64, 1), try Fresh.dotdot(&h.store, &h.data, d));
+    try testing.expectEqual(@as(?u64, 1), try Fresh.dotdot(&h.store, &h.data, 1));
+    // A rename across parents moves the durable parent with the name.
+    try testing.expectEqual(@as(?linux.E, null), h.call(.{ .rename = .{ .newdir = d2, .flags = 0, .name = "sub", .newname = "moved" } }, d).errno());
+    try testing.expectEqual(@as(?u64, d2), try Fresh.dotdot(&h.store, &h.data, sub));
+    // An exchange of a directory with a file across parents: the directory's
+    // durable parent follows it the other way.
+    const g = try h.create(d, "g", 0o644);
+    h.release(g);
+    try testing.expectEqual(@as(?linux.E, null), h.call(.{ .rename2 = .{ .newdir = d, .flags = RENAME_EXCHANGE, .name = "moved", .newname = "g" } }, d2).errno());
+    try testing.expectEqual(sub, (try h.entry(h.lookup(d, "g"))).nodeid);
+    try testing.expectEqual(@as(?u64, d), try Fresh.dotdot(&h.store, &h.data, sub));
+    // Two directories exchanged across parents: both follow.
+    const other = try h.mkdir(d2, "other");
+    try testing.expectEqual(@as(?linux.E, null), h.call(.{ .rename2 = .{ .newdir = d2, .flags = RENAME_EXCHANGE, .name = "g", .newname = "other" } }, d).errno());
+    try testing.expectEqual(@as(?u64, d2), try Fresh.dotdot(&h.store, &h.data, sub));
+    try testing.expectEqual(@as(?u64, d), try Fresh.dotdot(&h.store, &h.data, other));
+    // A removed directory's `..` is gone with it: the handle is stale.
+    try testing.expectEqual(@as(?linux.E, null), h.call(.{ .rmdir = .{ .name = "g" } }, d).errno());
+    try testing.expectEqual(@as(?u64, null), try Fresh.dotdot(&h.store, &h.data, other));
+}
+
 test "POSIX: rename — plain, replace, NOREPLACE → EEXIST, EXCHANGE, a directory move updates `..`, a name across directories" {
     var h: Harness = undefined;
     try h.init();

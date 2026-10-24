@@ -598,6 +598,10 @@ pub const stats = struct {
     pub var meta_kv_maintenance_items: counters.ShardedCounter = .{};
     /// Bounded heap-full sweep calls from the cycle's arm.
     pub var meta_kv_merge_sweeps: counters.ShardedCounter = .{};
+    /// Cadence/shutdown ticks and threshold maintenance passes that failed
+    /// (the task's lines; a FAILED volume logs each class once).
+    pub var meta_kv_checkpoint_tick_failures: counters.ShardedCounter = .{};
+    pub var meta_kv_maintenance_pass_failures: counters.ShardedCounter = .{};
     /// The wedge rung (`pending_free_stalled_cycles`) as the last barriered cycle left it.
     pub var pending_free_stalled_cycles: counters.Gauge = .{};
     /// A journal reservation still open at the shutdown tick: `close`

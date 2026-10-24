@@ -1478,8 +1478,8 @@ pub const JournalLane = struct {
         while (k < w.group.items.len) : (k += 1) {
             const c = &self.cells[w.group.items[k]];
             if (c.first_err) |e| {
-                log.warn("journal lane {d}: window [{d}, {d}) write failed: {s} — rolling back {d} entries", .{ self.index, c.window.start, c.window.end(), @errorName(e), c.entries });
                 stats.write_failures.inc();
+                if (self.latch.admitsLine(.window_write)) log.warn("journal lane {d}: window [{d}, {d}) write failed: {s} — rolling back {d} entries", .{ self.index, c.window.start, c.window.end(), @errorName(e), c.entries });
                 if (self.hooks.rollback) |f| {
                     f(self.hooks.ctx, SeqSpan.stamped(c.seq_base, c.window.len), c.window);
                     stats.rollbacks.inc();
@@ -1492,7 +1492,8 @@ pub const JournalLane = struct {
                 // The reserved range is a PERMANENT hole (same-page successors
                 // of a dead chain are undiscoverable): checkpoint past it.
                 if (!self.checkpointPast(c.window.paddedEnd())) {
-                    log.err("journal lane {d}: post-failure checkpoint could not drain the journal hole at {d} (volume escalating)", .{ self.index, c.window.paddedEnd() });
+                    journal.meta_kv_journal_hole_checkpoint_failures.inc();
+                    if (self.latch.admitsLine(.hole_checkpoint)) log.err("journal lane {d}: post-failure checkpoint could not drain the journal hole at {d} (volume escalating)", .{ self.index, c.window.paddedEnd() });
                     self.noteJournalFailure();
                 }
                 c.verdict = e;
@@ -1507,7 +1508,8 @@ pub const JournalLane = struct {
         w.group_hole_err = null;
         if (hole_end) |end| {
             if (!self.checkpointPast(end)) {
-                log.err("journal lane {d}: post-isolation checkpoint could not cover the batch hole at {d} (volume escalating; failing the survivors loud rather than acking unreachable entries)", .{ self.index, end });
+                journal.meta_kv_journal_hole_checkpoint_failures.inc();
+                if (self.latch.admitsLine(.hole_checkpoint)) log.err("journal lane {d}: post-isolation checkpoint could not cover the batch hole at {d} (volume escalating; failing the survivors loud rather than acking unreachable entries)", .{ self.index, end });
                 self.noteJournalFailure();
                 w.group_hole_err = error.HoleCheckpointFailed;
             }
@@ -2520,6 +2522,37 @@ test "three consecutive journal-write failures latch the volume FAILED; every la
     try testing.expectError(error.VolumeFailed, lane.submitStructural(ops));
     // The refused window's reservation is still the caller's to complete.
     h.reg.complete(&h.core, r.res);
+    lane.shutdown();
+    try testing.expectEqual(@as(usize, 1), lane.testErrorLogsFired());
+}
+
+test "a FAILED volume's in-flight windows: N windows admitted before the latch and failing after it are each rolled back, hole-covered and counted, and the lane logs ONE hole line for all N (the one-line law, `FailureLatch.admitsLine`; generic/753's dm-error logged ~50 per mount)" {
+    const h = try Harness.init(testing.allocator, "failed-lines");
+    defer h.deinit();
+    var rl: RollbackLog = .{ .gpa = testing.allocator, .checkpoint_ok = false };
+    defer rl.deinit();
+    // The lane thread's one error line: the first uncovered hole once FAILED.
+    try h.spawnLane(rl.hooks(), "600000", 1);
+    const lane = h.lane.?;
+    const n_windows = 16;
+    const failures0 = stats.write_failures.load();
+    const holes0 = journal.meta_kv_journal_hole_checkpoint_failures.load();
+    // Admitted while healthy, their writes owed (the device is slow)...
+    test_seams.delay_issue.store(1, .release);
+    defer test_seams.delay_issue.store(0, .release);
+    defer test_seams.fail_windows.store(0, .release);
+    var tickets: [n_windows]Ticket = undefined;
+    for (&tickets, 0..) |*t, i| t.* = (try h.append(i + 1, 300, 0xEE)).ticket;
+    // ...the volume latches FAILED (an acked window's failure), then every
+    // one of them fails at the device.
+    try testing.expect(lane.latch.failStop());
+    test_seams.fail_windows.store(n_windows, .release);
+    test_seams.delay_issue.store(0, .release);
+    for (tickets) |t| try testing.expectError(error.InputOutput, t.wait().result);
+    try testing.expectEqual(@as(usize, n_windows), rl.calls.items.len);
+    try testing.expectEqual(@as(usize, n_windows), rl.checkpoints.items.len);
+    try testing.expectEqual(failures0 + n_windows, stats.write_failures.load());
+    try testing.expectEqual(holes0 + n_windows, journal.meta_kv_journal_hole_checkpoint_failures.load());
     lane.shutdown();
     try testing.expectEqual(@as(usize, 1), lane.testErrorLogsFired());
 }

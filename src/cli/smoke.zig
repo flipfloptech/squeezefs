@@ -7850,7 +7850,47 @@ const xattr_storm_script =
 const dm_error_cycles: usize = 8;
 const dm_error_storm_workers: usize = 4;
 
-test "smoke: A FAILED VOLUME'S DAEMON SERVES EIO UNTIL ITS UNMOUNT AND NEVER DIES OF IT — ITS UNMOUNT ALWAYS COMPLETES AND NEVER LEAVES A SERVER-LESS MOUNT (xfstests generic/753; charter §1.8) — a set over a device-mapper device whose table flips to `error` without lockfs under an xattr storm, 8 cycles: the volume latches FAILED (a create answers EIO), the daemon stays alive with its mount in the table; the storm killed, `squeezefs umount` exits 0 without the `no squeezefs daemon serves it` fallback, the daemon exits 1 by itself naming the FAILED member (its supervisor: `exited (wait status 0x100)` — never a signal), no mount at the path, a second `squeezefs umount` answers `not mounted`; the working table back, the next mount serves the storm's tree, unmounts clean and the set fscks clean (red on 7a6e224: every failed node read freed its 256 KiB buffer twice — the second munmap took a FUSE worker's live listxattr array, SIGSEGV, wait status 0x8b, the test's unmount met a mount with no daemon)" {
+/// The per-operation failure lines of a metadata volume
+/// (`journal.FailureLatch.LogClass`): once the volume latched FAILED every
+/// operation behind it fails the same way, so each class logs at most one
+/// line from the latch to the daemon's exit (generic/753's scratch daemons
+/// logged ~50 of each per mount).
+const failed_volume_line_classes = [_]struct { name: []const u8, needle: []const u8 }{
+    .{ .name = "window write", .needle = ") write failed: " },
+    .{ .name = "hole checkpoint (drain)", .needle = "post-failure checkpoint could not drain" },
+    .{ .name = "hole checkpoint (isolation)", .needle = "post-isolation checkpoint could not cover" },
+    .{ .name = "hole cover under the SMO lock", .needle = "is not covered from the lane" },
+    .{ .name = "node read", .needle = ": node read at offset " },
+    .{ .name = "bset append", .needle = ": bset append at offset " },
+    .{ .name = "node image", .needle = ": node image at offset " },
+    .{ .name = "ledger slot", .needle = ": ledger slot at offset " },
+    .{ .name = "bitmap page", .needle = ": bitmap page at offset " },
+    .{ .name = "fdatasync", .needle = ": fdatasync at offset " },
+    .{ .name = "journal entry", .needle = ": journal entry at offset " },
+    .{ .name = "checkpoint tick", .needle = "kv checkpoint tick failed" },
+    .{ .name = "maintenance pass", .needle = "kv maintenance pass failed" },
+};
+
+/// The census of one cycle's daemon log `t` (its mount to its exit): each
+/// class's lines from the first latch line on. False when a class logged
+/// twice or more once FAILED (printed); true when no latch line is there.
+fn failedVolumeLinesOnce(t: []const u8, cycle: usize) bool {
+    const marked = std.mem.indexOf(u8, t, "volume marked FAILED");
+    const latching = std.mem.indexOf(u8, t, "latching the volume FAILED");
+    const at = @min(marked orelse t.len, latching orelse t.len);
+    if (at == t.len) return true;
+    const from = (std.mem.lastIndexOfScalar(u8, t[0..at], '\n') orelse 0);
+    var ok = true;
+    for (failed_volume_line_classes) |c| {
+        const before = std.mem.count(u8, t[0..from], c.needle);
+        const after = std.mem.count(u8, t[from..], c.needle);
+        if (before + after != 0) std.debug.print("\nsmoke[dm-error]: cycle {d}: {s}: {d} line(s) before the latch, {d} after", .{ cycle, c.name, before, after });
+        if (after > 1) ok = false;
+    }
+    return ok;
+}
+
+test "smoke: A FAILED VOLUME'S DAEMON SERVES EIO UNTIL ITS UNMOUNT AND NEVER DIES OF IT — ITS UNMOUNT ALWAYS COMPLETES AND NEVER LEAVES A SERVER-LESS MOUNT (xfstests generic/753; charter §1.8) — a set over a device-mapper device whose table flips to `error` without lockfs under an xattr storm, 8 cycles: the volume latches FAILED (a create answers EIO), the daemon stays alive with its mount in the table; the storm killed, `squeezefs umount` exits 0 without the `no squeezefs daemon serves it` fallback, the daemon exits 1 by itself naming the FAILED member (its supervisor: `exited (wait status 0x100)` — never a signal), no mount at the path, a second `squeezefs umount` answers `not mounted`; the working table back, the next mount serves the storm's tree, unmounts clean and the set fscks clean; once a volume latched FAILED each per-operation failure class (window write, hole cover, node read, bset append, checkpoint tick, …) logs at most ONE line until the exit, the rest counted (red on 517121d: up to 226 window-write, 231 hole and 210 bset-append lines after the latch in one cycle) (red on 7a6e224: every failed node read freed its 256 KiB buffer twice — the second munmap took a FUSE worker's live listxattr array, SIGSEGV, wait status 0x8b, the test's unmount met a mount with no daemon)" {
     const io = testing.io;
     if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
     if (DmErrorSet.venueMissing()) |why| return testkit.skipWhy(@src(), why);
@@ -7867,6 +7907,7 @@ test "smoke: A FAILED VOLUME'S DAEMON SERVES EIO UNTIL ITS UNMOUNT AND NEVER DIE
         try testing.expect(r.term.success());
     }
     var latched_cycles: usize = 0;
+    var lines_once = true;
     var cycle: usize = 0;
     while (cycle < dm_error_cycles) : (cycle += 1) {
         const mark = try rig.logLen();
@@ -7934,6 +7975,18 @@ test "smoke: A FAILED VOLUME'S DAEMON SERVES EIO UNTIL ITS UNMOUNT AND NEVER DIE
             _ = w.wait(io) catch {};
         }
         spawned = 0;
+        // What the FAILED volume counted instead of logging.
+        if (try rig.statsTry()) |st| {
+            defer gpa.free(st);
+            std.debug.print("\nsmoke[dm-error]: cycle {d}: counted {d} window write failure(s), {d} uncovered hole(s), {d} bset append failure(s), {d} node read failure(s); {d} line(s) quieted", .{
+                cycle,
+                numberAfter(st, "\"journal_lane_write_failures\":") orelse 0,
+                numberAfter(st, "\"meta_kv_journal_hole_checkpoint_failures\":") orelse 0,
+                numberAfter(st, "\"bset_append_failures\":") orelse 0,
+                numberAfter(st, "\"node_read_failures\":") orelse 0,
+                numberAfter(st, "\"meta_failed_volume_lines_quieted\":") orelse 0,
+            });
+        }
         {
             const r = try rig.squeezefs(&.{ "umount", rig.mp });
             defer rig.freeRun(r);
@@ -7957,6 +8010,7 @@ test "smoke: A FAILED VOLUME'S DAEMON SERVES EIO UNTIL ITS UNMOUNT AND NEVER DIE
                 return error.FailedDaemonNotOwnExit;
             }
             if (latched) latched_cycles += 1;
+            if (!failedVolumeLinesOnce(t[mark..exit_i], cycle)) lines_once = false;
         }
         try testing.expect(!alive(pid));
         try testing.expectEqual(@as(usize, 0), try fuseMountsOf(gpa, io, rig.mp));
@@ -8006,6 +8060,8 @@ test "smoke: A FAILED VOLUME'S DAEMON SERVES EIO UNTIL ITS UNMOUNT AND NEVER DIE
             return error.FsckNotClean;
         }
     }
+    // The one-line law: no failure class logged twice on a FAILED volume.
+    try testing.expect(lines_once);
 }
 
 /// A process whose cwd is the mount (the holder of the busy-umount rows):

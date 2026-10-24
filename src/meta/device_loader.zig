@@ -63,6 +63,65 @@ pub const Stats = struct {
     barriers: counters.ShardedCounter = .{},
     /// Device errors answered `error.Io` to the cache / the cycle.
     io_errors: counters.ShardedCounter = .{},
+    /// The same errors by site: the count behind each site's line, which a
+    /// FAILED volume logs once (`journal.FailureLatch.admitsLine`).
+    node_read_failures: counters.ShardedCounter = .{},
+    bset_append_failures: counters.ShardedCounter = .{},
+    node_image_failures: counters.ShardedCounter = .{},
+    ledger_slot_failures: counters.ShardedCounter = .{},
+    bitmap_page_failures: counters.ShardedCounter = .{},
+    fdatasync_failures: counters.ShardedCounter = .{},
+    journal_entry_failures: counters.ShardedCounter = .{},
+    range_read_failures: counters.ShardedCounter = .{},
+    format_step_failures: counters.ShardedCounter = .{},
+
+    fn failures(self: *Stats, site: Site) *counters.ShardedCounter {
+        return switch (site) {
+            .node_read => &self.node_read_failures,
+            .bset_append => &self.bset_append_failures,
+            .node_image => &self.node_image_failures,
+            .ledger_slot => &self.ledger_slot_failures,
+            .bitmap_page => &self.bitmap_page_failures,
+            .fdatasync => &self.fdatasync_failures,
+            .journal_entry => &self.journal_entry_failures,
+            .range_read => &self.range_read_failures,
+            .format_step => &self.format_step_failures,
+        };
+    }
+};
+
+/// The binding's device sites: each its line's label and its failure class
+/// on the volume's latch.
+pub const Site = enum {
+    node_read,
+    bset_append,
+    node_image,
+    ledger_slot,
+    bitmap_page,
+    fdatasync,
+    journal_entry,
+    range_read,
+    format_step,
+
+    fn label(self: Site) []const u8 {
+        return switch (self) {
+            .node_read => "node read",
+            .bset_append => "bset append",
+            .node_image => "node image",
+            .ledger_slot => "ledger slot",
+            .bitmap_page => "bitmap page",
+            .fdatasync => "fdatasync",
+            .journal_entry => "journal entry",
+            .range_read => "range read",
+            .format_step => "format step",
+        };
+    }
+
+    fn logClass(self: Site) journal.FailureLatch.LogClass {
+        return switch (self) {
+            inline else => |s| @field(journal.FailureLatch.LogClass, @tagName(s)),
+        };
+    }
 };
 
 pub var stats: Stats = .{};
@@ -121,11 +180,19 @@ pub const DeviceLoader = struct {
         return .{ .ctx = self, .writePage = writePageFn };
     }
 
-    fn ioFailed(self: *const DeviceLoader, what: []const u8, offset: u64, len: usize, e: uring_fs.Error) LoaderError {
+    fn ioFailed(self: *const DeviceLoader, site: Site, offset: u64, len: usize, e: uring_fs.Error) LoaderError {
         stats.io_errors.inc();
-        log.err("metadata device {s}: {s} at offset {d} ({d} B) failed: {s} ({s})", .{ self.path, what, offset, len, @errorName(e), @tagName(uring_fs.classOf(e)) });
-        if (self.latch) |l| _ = l.classifyFence(e, what);
+        stats.failures(site).inc();
+        if (self.admitsLine(site)) log.err("metadata device {s}: {s} at offset {d} ({d} B) failed: {s} ({s})", .{ self.path, site.label(), offset, len, @errorName(e), @tagName(uring_fs.classOf(e)) });
+        if (self.latch) |l| _ = l.classifyFence(e, site.label());
         return error.Io;
+    }
+
+    /// The one-line law of a FAILED volume over this site (no latch yet:
+    /// every line).
+    fn admitsLine(self: *const DeviceLoader, site: Site) bool {
+        const l = self.latch orelse return true;
+        return l.admitsLine(site.logClass());
     }
 
     // ---- the NodeLoader ----
@@ -134,12 +201,13 @@ pub const DeviceLoader = struct {
     /// copied into the cache's buffer.
     fn readExtent(ctx: *anyopaque, addr: u64, buf: []u8) LoaderError!void {
         const self: *DeviceLoader = @ptrCast(@alignCast(ctx));
-        var r = self.pool.readAt(self.path, addr, buf.len) catch |e| return self.ioFailed("node read", addr, buf.len, e);
+        var r = self.pool.readAt(self.path, addr, buf.len) catch |e| return self.ioFailed(.node_read, addr, buf.len, e);
         defer r.deinit();
         const got = r.bytes();
         if (got.len != buf.len) {
             stats.io_errors.inc();
-            log.err("metadata device {s}: node read at offset {d} returned {d} of {d} B (a short extent)", .{ self.path, addr, got.len, buf.len });
+            stats.node_read_failures.inc();
+            if (self.admitsLine(.node_read)) log.err("metadata device {s}: node read at offset {d} returned {d} of {d} B (a short extent)", .{ self.path, addr, got.len, buf.len });
             return error.Io;
         }
         @memcpy(buf, got);
@@ -152,21 +220,21 @@ pub const DeviceLoader = struct {
     /// counted on `meta_io_unaligned_refusals`).
     fn appendBset(ctx: *anyopaque, addr: u64, off: usize, bytes: []const u8) LoaderError!void {
         const self: *DeviceLoader = @ptrCast(@alignCast(ctx));
-        self.pool.writeAt(self.path, addr + off, bytes) catch |e| return self.ioFailed("bset append", addr + off, bytes.len, e);
+        self.pool.writeAt(self.path, addr + off, bytes) catch |e| return self.ioFailed(.bset_append, addr + off, bytes.len, e);
         stats.appends.inc();
     }
 
     fn writeImage(ctx: *anyopaque, addr: u64, bytes: []const u8) LoaderError!void {
         const self: *DeviceLoader = @ptrCast(@alignCast(ctx));
-        self.pool.writeAt(self.path, addr, bytes) catch |e| return self.ioFailed("node image", addr, bytes.len, e);
+        self.pool.writeAt(self.path, addr, bytes) catch |e| return self.ioFailed(.node_image, addr, bytes.len, e);
         stats.images.inc();
     }
 
     // ---- the checkpoint sinks ----
 
     pub fn barrier(self: *DeviceLoader) error{Io}!void {
-        if (takeInjectedBarrierFailure()) |e| return self.ioFailed("fdatasync", 0, 0, e);
-        self.pool.fdatasync(self.path) catch |e| return self.ioFailed("fdatasync", 0, 0, e);
+        if (takeInjectedBarrierFailure()) |e| return self.ioFailed(.fdatasync, 0, 0, e);
+        self.pool.fdatasync(self.path) catch |e| return self.ioFailed(.fdatasync, 0, 0, e);
         stats.barriers.inc();
     }
 
@@ -178,14 +246,14 @@ pub const DeviceLoader = struct {
     fn writeSlotFn(ctx: *anyopaque, slot: u64, image: *const [ledger.ROOT_LEDGER_SLOT_LEN]u8) checkpoint_cycle.IoError!void {
         const self: *DeviceLoader = @ptrCast(@alignCast(ctx));
         const off = ledger.slotOffset(self.ledger_base, slot);
-        self.pool.writeAt(self.path, off, image) catch |e| return self.ioFailed("ledger slot", off, image.len, e);
+        self.pool.writeAt(self.path, off, image) catch |e| return self.ioFailed(.ledger_slot, off, image.len, e);
         stats.ledger_slots.inc();
     }
 
     fn writePageFn(ctx: *anyopaque, offset: u64, image: *const [alloc_ext.page_len]u8) checkpoint_cycle.IoError!void {
         const self: *DeviceLoader = @ptrCast(@alignCast(ctx));
         const off = self.bitmap_base + offset;
-        self.pool.writeAt(self.path, off, image) catch |e| return self.ioFailed("bitmap page", off, image.len, e);
+        self.pool.writeAt(self.path, off, image) catch |e| return self.ioFailed(.bitmap_page, off, image.len, e);
         stats.bitmap_pages.inc();
     }
 
@@ -201,7 +269,7 @@ pub const DeviceLoader = struct {
         };
         defer if (ops.len > buf.len) self.gpa.free(converted);
         for (ops, converted) |op, *c| c.* = .{ .offset = op.offset, .data = op.bytes };
-        self.pool.writeAtBatch(self.path, converted) catch |e| return self.ioFailed("journal entry", if (ops.len > 0) ops[0].offset else 0, 0, e);
+        self.pool.writeAtBatch(self.path, converted) catch |e| return self.ioFailed(.journal_entry, if (ops.len > 0) ops[0].offset else 0, 0, e);
     }
 
     /// Read `[offset, offset + len)` into a fresh buffer (the mount's
@@ -212,7 +280,7 @@ pub const DeviceLoader = struct {
         errdefer gpa.free(out);
         @memset(out, 0);
         var r = self.pool.readAt(self.path, offset, len) catch |e| {
-            self.ioFailed("range read", offset, len, e) catch {};
+            self.ioFailed(.range_read, offset, len, e) catch {};
             return error.Io;
         };
         defer r.deinit();
@@ -226,7 +294,7 @@ pub const DeviceLoader = struct {
     /// sector 0 — three on a flat plan).
     pub fn writeSteps(self: *DeviceLoader, steps: []const format.Step) error{Io}!void {
         for (steps) |s| {
-            self.pool.writeAt(self.path, s.offset, s.bytes) catch |e| return self.ioFailed("format step", s.offset, s.bytes.len, e);
+            self.pool.writeAt(self.path, s.offset, s.bytes) catch |e| return self.ioFailed(.format_step, s.offset, s.bytes.len, e);
             if (s.barrier_after) try self.barrier();
         }
     }
@@ -359,6 +427,40 @@ test "the loader round-trips a node image and an appended bset through O_DIRECT;
     const tail = try d.dev.readRange(gpa, (8 << 20) - 4096, 8192);
     defer gpa.free(tail);
     try testing.expect(std.mem.allEqual(u8, tail[4096..], 0));
+}
+
+test "a FAILED volume's device lines: every failure is counted by its site, and once the volume latched FAILED each site logs at most one line until remount (none when it already logged while healthy)" {
+    const gpa = testing.allocator;
+    const d = try TestDevice.create(gpa, "failed-lines", 1 << 20);
+    defer d.destroy();
+    var latch: journal.FailureLatch = .{};
+    d.dev.latch = &latch;
+    const ld = d.dev.loader();
+    const buf = try gpa.alloc(u8, node.MIN_NODE_SIZE);
+    defer gpa.free(buf);
+    const reads0 = stats.node_read_failures.load();
+    const appends0 = stats.bset_append_failures.load();
+    const errors0 = stats.io_errors.load();
+    // Healthy: every failure logs (a read past the device's end is a short
+    // extent).
+    log.testing.expectErrorLogs(2);
+    try testing.expectError(error.Io, ld.readExtent(ld.ctx, 1 << 20, buf));
+    try testing.expectError(error.Io, ld.readExtent(ld.ctx, 1 << 20, buf));
+    try log.testing.expectAllFired();
+    try testing.expect(latch.failStop());
+    // FAILED under N operations per site: the node read already logged on
+    // this latch (quiet); the bset append logs its first line only.
+    const n_ops = 50;
+    log.testing.expectErrorLogs(1);
+    for (0..n_ops) |_| {
+        try testing.expectError(error.Io, ld.readExtent(ld.ctx, 1 << 20, buf));
+        try testing.expectEqual(error.Io, d.dev.ioFailed(.bset_append, 1 << 19, 4096, error.InputOutput));
+    }
+    try log.testing.expectAllFired();
+    try testing.expectEqual(@as(usize, 1), log.testing.capturedErrorLogs());
+    try testing.expectEqual(reads0 + 2 + n_ops, stats.node_read_failures.load());
+    try testing.expectEqual(appends0 + n_ops, stats.bset_append_failures.load());
+    try testing.expectEqual(errors0 + 2 + 2 * n_ops, stats.io_errors.load());
 }
 
 test "a format plan written through the device lands byte-identical to the in-RAM image, with its barriers in plan order" {

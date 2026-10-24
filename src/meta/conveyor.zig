@@ -3216,7 +3216,8 @@ pub const Conveyor = struct {
         self.rollbackFailedTx(w.span(), w.undo);
         _ = self.deps.latch.noteFailure(.journal_write);
         if (!self.deps.checkpoint.checkpointPast(self.deps.checkpoint.ctx, w.res.paddedEnd())) {
-            log.err("meta volume {s}: post-failure checkpoint could not drain the journal hole at {d} (volume escalating)", .{ self.deps.volume, w.res.paddedEnd() });
+            journal.meta_kv_journal_hole_checkpoint_failures.inc();
+            if (self.deps.latch.admitsLine(.hole_checkpoint)) log.err("meta volume {s}: post-failure checkpoint could not drain the journal hole at {d} (volume escalating)", .{ self.deps.volume, w.res.paddedEnd() });
             _ = self.deps.latch.noteFailure(.journal_write);
         }
         self.finishWindow(w, err);

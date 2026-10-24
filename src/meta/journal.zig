@@ -1179,6 +1179,12 @@ pub var meta_kv_journal_windows_pad_majority: counters.ShardedCounter = .{};
 /// designed; after a CLEAN unmount it is the corruption alert.
 pub var replay_dropped_torn: counters.Gauge = .{};
 pub var replay_dropped_after_clean_unmount: counters.Tripwire = .init("journal_replay_dropped_after_clean_unmount");
+/// Checkpoints past a journal hole that could not cover it (the lane's
+/// post-failure and post-isolation covers, the conveyor's abandon arm).
+pub var meta_kv_journal_hole_checkpoint_failures: counters.ShardedCounter = .{};
+/// Failure lines a FAILED volume kept out of the log (`FailureLatch.admitsLine`);
+/// each failure is still counted by its class's own counter.
+pub var meta_failed_volume_lines_quieted: counters.ShardedCounter = .{};
 
 /// Per-volume mirrors of the global accounting: the process-global counter
 /// cannot attribute journal traffic to a volume — the blindness that let a
@@ -1246,8 +1252,49 @@ pub const FailureLatch = struct {
     failed: std.atomic.Value(bool) = .init(false),
     /// The typed cause: FAILED by the fence (vs the generic rungs).
     fenced: std.atomic.Value(bool) = .init(false),
+    /// One bit per `LogClass` (a u5 tag: every class fits) that logged a
+    /// line on this latch (this mount).
+    logged: std.atomic.Value(u32) = .init(0),
 
     pub const Class = enum { journal_write, barrier };
+
+    /// The per-operation failure lines of a volume (the lane's windows and
+    /// hole covers, the device binding's sites, the checkpoint task's
+    /// passes). Once the volume is FAILED every operation behind it fails
+    /// the same way, so each class logs once per FAILED episode and counts
+    /// the rest on its own counter (`admitsLine`).
+    pub const LogClass = enum(u5) {
+        window_write,
+        hole_checkpoint,
+        hole_cover_smo_held,
+        node_read,
+        bset_append,
+        node_image,
+        ledger_slot,
+        bitmap_page,
+        fdatasync,
+        journal_entry,
+        range_read,
+        format_step,
+        checkpoint_tick,
+        maintenance_pass,
+    };
+
+    /// True iff a failure of `class` logs its line: always on a healthy
+    /// volume; on a FAILED one only when the class never logged on this
+    /// latch — every later failure until remount is counted, not logged
+    /// (`meta_failed_volume_lines_quieted`). A line logged while healthy
+    /// marks its class too, so the latch adds no second line after it.
+    pub fn admitsLine(self: *FailureLatch, class: LogClass) bool {
+        const bit = @as(u32, 1) << @backingInt(class);
+        // The AcqRel mark is taken BEFORE `isFailed`'s Acquire read (paired
+        // with the latch's AcqRel swap): a class that logged while healthy
+        // finds its bit set once FAILED.
+        const prior = self.logged.fetchOr(bit, .acq_rel);
+        if (!self.isFailed() or prior & bit == 0) return true;
+        meta_failed_volume_lines_quieted.inc();
+        return false;
+    }
 
     /// Why a volume is FAILED (the stats face and the teardown log).
     pub const Verdict = enum { healthy, failed, fenced };
@@ -2366,6 +2413,30 @@ test "the fence rung: ONE reservation conflict at any site latches FAILED at onc
     try testing.expectEqual(fenced0 + 1, guard.stats.fenced.load());
     // The generic rung on a fenced volume adds nothing new.
     try testing.expect(!latch.noteFailure(.barrier));
+}
+
+test "the one-line law of a FAILED volume: every failure line logs while healthy; once FAILED each class logs at most once per latch (none when it already logged while healthy) and the rest are counted, not logged; a remount's fresh latch logs again" {
+    var latch: FailureLatch = .{};
+    const quieted0 = meta_failed_volume_lines_quieted.load();
+    // Healthy: every line, however many.
+    for (0..5) |_| try testing.expect(latch.admitsLine(.node_read));
+    try testing.expect(latch.failStop());
+    // FAILED: node_read already logged on this latch — quiet from here on;
+    // bset_append and window_write log their first line, then quiet.
+    const n_ops = 64;
+    var lines: [3]usize = @splat(0);
+    for (0..n_ops) |_| {
+        if (latch.admitsLine(.node_read)) lines[0] += 1;
+        if (latch.admitsLine(.bset_append)) lines[1] += 1;
+        if (latch.admitsLine(.window_write)) lines[2] += 1;
+    }
+    try testing.expectEqualSlices(usize, &.{ 0, 1, 1 }, &lines);
+    try testing.expectEqual(quieted0 + 3 * n_ops - 2, meta_failed_volume_lines_quieted.load());
+    // The next mount's latch is a new episode.
+    var remount: FailureLatch = .{};
+    try testing.expect(remount.failStop());
+    try testing.expect(remount.admitsLine(.bset_append));
+    try testing.expect(!remount.admitsLine(.bset_append));
 }
 
 test "power-cut harness: unsynced writes revert in reverse order; synced writes survive" {

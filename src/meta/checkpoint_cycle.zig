@@ -1310,7 +1310,11 @@ pub const CheckpointTask = struct {
         const drain_deadline: ?u64 = if (shutting_down) null else now_ns + self.period_ns;
         if (cadence or shutting_down) {
             self.cp.tick(shutting_down, drain_deadline, park_kick, self.period_ns / ns_per_ms) catch |e| {
-                log.err("kv checkpoint tick failed on {s}: {s} (state stays RAM-consistent; retrying next tick — barrier failures additionally escalate through the fail-stop lattice)", .{ self.cp.cfg.volume, @errorName(e) });
+                ckpt.stats.meta_kv_checkpoint_tick_failures.inc();
+                // A FAILED volume's cadence stopped at the latch (above): only
+                // the shutdown tick still runs, and nothing retries it.
+                const next = if (self.cp.isFailed()) "the volume is FAILED: no tick retries it until remount" else "retrying next tick — barrier failures additionally escalate through the fail-stop lattice";
+                if (self.cp.deps.latch.admitsLine(.checkpoint_tick)) log.err("kv checkpoint tick failed on {s}: {s} (state stays RAM-consistent; {s})", .{ self.cp.cfg.volume, @errorName(e), next });
             };
             if (shutting_down) {
                 self.stopped.store(true, .release);
@@ -1319,7 +1323,8 @@ pub const CheckpointTask = struct {
             if (self.after_tick) |a| a.run(a.ctx);
         } else {
             self.cp.drainMaintenance(DrainBudget.bounded(drain_deadline.?)) catch |e| {
-                log.warn("kv maintenance pass failed on {s}: {s} (state stays RAM-consistent; the cadence tick retries)", .{ self.cp.cfg.volume, @errorName(e) });
+                ckpt.stats.meta_kv_maintenance_pass_failures.inc();
+                if (self.cp.deps.latch.admitsLine(.maintenance_pass)) log.warn("kv maintenance pass failed on {s}: {s} (state stays RAM-consistent; the cadence tick retries)", .{ self.cp.cfg.volume, @errorName(e) });
             };
         }
         // Work arrived while draining, or a shutdown landed mid-pass: re-arm
@@ -1922,6 +1927,37 @@ test "the task: a park-mark kick makes an immediate barriered cycle with a caden
     try testing.expectEqual(v.core.headPos(), v.core.reusableUpto());
     try testing.expect(!v.alloc.hasDirtyPages());
     try testing.expectEqual(node_cache.no_floor, a.dirtyFloor());
+}
+
+test "the task on a FAILED volume: the cadence stops at the latch (no tick, no line); the shutdown tick that fails logs ONE line saying nothing retries it, and every further failing tick of that volume is counted, not logged" {
+    const v = try TestVol.create(10_000, 1_000_000);
+    defer v.destroy();
+    try v.writeLeaf(0, 1);
+    const a = (try v.cache.load(TestVol.addrOf(0))).?;
+    defer a.release();
+    _ = try v.commit(a, &.{"a1"}, 100);
+    var task = CheckpointTask.init(&v.cp, testing.io);
+    const failures0 = ckpt.stats.meta_kv_checkpoint_tick_failures.load();
+    // The device is gone and the volume latched FAILED.
+    v.fail_barrier = true;
+    try testing.expect(v.latch.failStop());
+    // Due cadence ticks: none runs a cycle.
+    const seq0 = v.cp.checkpointSeq();
+    for (0..4) |_| try testing.expect(task.runOnce(false, task.next_tick_ns));
+    try testing.expectEqual(seq0, v.cp.checkpointSeq());
+    try testing.expectEqual(@as(u64, 0), v.barriers);
+    try testing.expectEqual(failures0, ckpt.stats.meta_kv_checkpoint_tick_failures.load());
+    // The shutdown tick still tries (the dismount's fixpoint) and fails:
+    // one line; a repeat of it on the same latch is counted only.
+    const n_ticks = 8;
+    task.stop();
+    log.testing.expectErrorLogs(1);
+    for (0..n_ticks) |_| try testing.expect(!task.runOnce(true, clock.monotonicNs()));
+    try log.testing.expectAllFired();
+    try testing.expectEqual(@as(usize, 1), log.testing.capturedErrorLogs());
+    try testing.expectEqual(failures0 + n_ticks, ckpt.stats.meta_kv_checkpoint_tick_failures.load());
+    try testing.expect(task.isStopped());
+    v.fail_barrier = false;
 }
 
 test "the task on its own thread under std.testing.io: the cadence fires off the clock, a kick wakes it, stop joins it with an empty replay window" {

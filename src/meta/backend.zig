@@ -204,6 +204,9 @@ pub const Stats = struct {
     /// page's root was already behind the lessee's live tree (the slot is
     /// read under a token from the lessee).
     reader_foreign_roots_skipped: counters.ShardedCounter = .{},
+    /// Journal holes the lane could not cover because the SMO lock was held
+    /// (`checkpointPast`): the holder's own cycle covers them.
+    hole_covers_smo_held: counters.ShardedCounter = .{},
 };
 
 pub var stats: Stats = .{};
@@ -2146,7 +2149,8 @@ pub const KvBackend = struct {
     /// cycle covers the hole; this cover fails loud and the lane escalates.
     fn checkpointPast(be: *KvBackend, pos: u64) bool {
         if (!be.smo_lock.tryLock()) {
-            log.warn("meta volume {s}: the journal hole ending at {d} is not covered from the lane — the SMO lock is held (a checkpoint cycle in flight, parked on this lane); its own cycle covers it", .{ be.path, pos });
+            stats.hole_covers_smo_held.inc();
+            if (be.lane.latch.admitsLine(.hole_cover_smo_held)) log.warn("meta volume {s}: the journal hole ending at {d} is not covered from the lane — the SMO lock is held (a checkpoint cycle in flight, parked on this lane); its own cycle covers it", .{ be.path, pos });
             return false;
         }
         defer be.smo_lock.unlock(be.io);

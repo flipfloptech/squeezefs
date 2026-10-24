@@ -604,6 +604,11 @@ word off `PARKED`, so a held ack is released OR failed, never both/neither.
    (terminal: the owner's own verdict says the lease is gone; a park would stand for nothing,
    M:3793-3799, 3689-3697); other ⇒ `Parked` (the park stands; paced at the renewal beat or the
    `SUCCESSOR_WAKE` notify — "never a 1 ms spin against the dead venue", M:3815-3818; T-ML:707).
+   **The port's beat makes no other wire call** (2026-10-24, `rung-10-recovery-double-park.md`): the
+   renewal and the reclaim are the beat's (`sqz-member`); the census pull, a reclaim's re-point and
+   re-publication, the set-config learn and a carried offer's accept are a follower's (`sqz-member-fol`)
+   — on the beat, one such call slow past `T_owner` evicted a LIVE member and its reclaim met
+   `UnknownLease` (the kill matrix's double park).
 4. **The successor** admits the reclaim in grace (§2.4), carries `slot_leases_ack{prior_epoch, slots}`
    (M:1649), treats a `Live` page whose owner reclaims as LIVE — no recovery, `g` unchanged, tree 0
    unchanged (D:560) — and ships `RecordDeath` only for NON-reclaimers at the grace deadline (§2.4).

@@ -402,7 +402,7 @@ pub const JoinedSet = struct {
     /// secret off the projection, the dial, `JoinAppender`. The region's
     /// words are read through `standing()`; the slots through
     /// `acquireRotor`. Nothing of the backend's ring exists yet.
-    pub fn open(be: *KvBackend, mountpoint: []const u8, explicit_ep: ?endpoint.EndpointWire, predecessor: ?u32) OpenError!*JoinedSet {
+    pub fn open(be: *KvBackend, mountpoint: []const u8, explicit_ep: ?endpoint.EndpointWire, predecessor: ?u32, set_secret: ?wire_auth.Secret) OpenError!*JoinedSet {
         const gpa = be.gpa;
         const self = try gpa.create(JoinedSet);
         errdefer gpa.destroy(self);
@@ -428,8 +428,10 @@ pub const JoinedSet = struct {
             log.err("meta volume {s}: appender 0's page is {s} — no live manager to join; the D0 ladder is this mount's", .{ be.path, @tagName(page0.state) });
             return error.ManagerUnreachable;
         }
-        // 2. The secret and the manager's endpoint off tree 0's projection.
-        const secret = (try readControl(gpa, be, wire_auth.ENROLL_KEY, wire_auth.Secret, wire_auth.decodeEnroll)) orelse {
+        // 2. The secret (the set's, off volume 0's tree 0: a member past
+        // volume 0 carries none of its own) and the manager's endpoint off
+        // this volume's projection.
+        const secret = set_secret orelse (try readControl(gpa, be, wire_auth.ENROLL_KEY, wire_auth.Secret, wire_auth.decodeEnroll)) orelse {
             log.err("meta volume {s}: tree 0 carries no decodable job:enroll record — formatted before the cluster wire existed; reformat", .{be.path});
             return error.Corrupt;
         };

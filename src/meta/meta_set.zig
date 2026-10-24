@@ -242,7 +242,12 @@ pub const MetaSet = struct {
                     log.info("metadata set: volume 0's writer lock is held by a live manager — joining the set as an equal writer over the cluster wire", .{});
                     break :blk try KvBackend.openJoined(gpa, io, paths[oi], be_opts, opts.join.?);
                 },
-                .joined => try KvBackend.openJoined(gpa, io, paths[oi], be_opts, opts.join.?),
+                .joined => jblk: {
+                    // A member past volume 0 joins with the set's secret.
+                    var j = opts.join.?;
+                    j.secret = volumes[0].joined.?.secret;
+                    break :jblk try KvBackend.openJoined(gpa, io, paths[oi], be_opts, j);
+                },
                 .reader => try KvBackend.openReader(gpa, io, paths[oi], be_opts),
             };
             opened += 1;
@@ -792,6 +797,7 @@ pub const MetaSet = struct {
             o.index = @intCast(i);
             var j = self.rejoin_join;
             j.predecessor = if (predecessors[i].joined) |js| js.appenderId() else null;
+            if (i > 0) j.secret = fresh[0].joined.?.secret;
             fresh[n] = try KvBackend.openJoined(gpa, self.io, p, o, j);
             n += 1;
         }

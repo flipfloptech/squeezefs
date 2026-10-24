@@ -322,6 +322,10 @@ pub const JoinOptions = struct {
     /// rows naming it are as stale as the joiner's own (`lease_table.
     /// joinedProjectionRow`).
     predecessor: ?u32 = null,
+    /// The set's `job:enroll` secret as volume 0's tree 0 carries it (the
+    /// set-wide records live on volume 0 alone, charter §5.5): a member past
+    /// volume 0 joins with it — null reads this volume's own record.
+    secret: ?@import("../wire/auth.zig").Secret = null,
 };
 
 pub const FormatOptions = struct {
@@ -1100,7 +1104,7 @@ pub const KvBackend = struct {
         // The projection may be re-read (and the cache re-created) while
         // the manager's endpoint is awaited, so the slot plane — whose
         // frame seam lives in the cache — arms after it.
-        const js = sym.joined.JoinedSet.open(be, jopts.mountpoint, jopts.endpoint, jopts.predecessor) catch |e| return switch (e) {
+        const js = sym.joined.JoinedSet.open(be, jopts.mountpoint, jopts.endpoint, jopts.predecessor, jopts.secret) catch |e| return switch (e) {
             error.ManagerUnreachable, error.PredecessorLive, error.Capacity => error.Busy,
             error.Rejected, error.Corrupt => error.Corrupt,
             error.Io => error.Io,

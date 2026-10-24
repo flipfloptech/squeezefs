@@ -56,8 +56,24 @@ const StableIdentity = records.StableIdentity;
 // The durable records on tree 0 of volume 0.
 // ---------------------------------------------------------------------------
 
+/// Volume 0 of the set as it stands NOW (decision 0003 §BS): a re-join in
+/// place replaces the incarnation, so a mounted node reads tree 0 through
+/// the set at every call (Acquire pairs with `MetaSet.publishSuccessors`'
+/// Release store); the in-process rigs bind a fixed backend.
+pub const Vol0 = union(enum) {
+    fixed: *KvBackend,
+    set: *meta_set.MetaSet,
+
+    pub fn get(self: Vol0) *KvBackend {
+        return switch (self) {
+            .fixed => |b| b,
+            .set => |s| @atomicLoad(*KvBackend, &s.volumes[0], .acquire),
+        };
+    }
+};
+
 pub const TreeStore = struct {
-    be: *KvBackend,
+    be: Vol0,
 
     pub fn store(self: *TreeStore) fabric_mod.Store {
         return .{ .ctx = self, .vtable = &vt };
@@ -68,12 +84,12 @@ pub const TreeStore = struct {
     fn put(ctx: *anyopaque, job_id: u64, bytes: *const [records.JobRecordV1.LEN]u8) fabric_mod.Store.Error!void {
         const self: *TreeStore = @ptrCast(@alignCast(ctx));
         const k = records.jobKey(job_id);
-        const t = self.be.begin(@src()) catch return error.OutOfMemory;
+        const t = self.be.get().begin(@src()) catch return error.OutOfMemory;
         t.stagePut(key.TREE_CONTROL, k.slice(), bytes) catch {
-            self.be.abandon(t);
+            self.be.get().abandon(t);
             return error.OutOfMemory;
         };
-        self.be.commit(t) catch |e| return switch (e) {
+        self.be.get().commit(t) catch |e| return switch (e) {
             error.OutOfMemory => error.OutOfMemory,
             else => error.Io,
         };
@@ -84,7 +100,7 @@ pub const TreeStore = struct {
         const r = records.rangeOf(.job);
         var kvs: std.ArrayList(tree.KeyValue) = .empty;
         defer tree.deinitKeyValues(gpa, &kvs);
-        self.be.range(gpa, key.TREE_CONTROL, r.start.slice(), r.end.slice(), fabric_mod.MAX_JOBS, &kvs) catch |e| return switch (e) {
+        self.be.get().range(gpa, key.TREE_CONTROL, r.start.slice(), r.end.slice(), fabric_mod.MAX_JOBS, &kvs) catch |e| return switch (e) {
             error.OutOfMemory => error.OutOfMemory,
             else => error.Io,
         };
@@ -473,7 +489,7 @@ pub const PlaneWalk = struct {
 /// gate, tree 0 of volume 0 holds the record, the plane's router is the
 /// placement runtime.
 pub const PlaneWorld = struct {
-    be: *KvBackend,
+    be: Vol0,
     plane: *plane_mod.DataPlane,
     fabric: *Fabric,
     io: Io,
@@ -493,13 +509,13 @@ pub const PlaneWorld = struct {
     }
     fn loadConfig(ctx: *anyopaque, gpa: Allocator) lattice.Error!set_config.Config {
         const self = self_(ctx);
-        const value = (self.be.lookup(gpa, key.TREE_CONTROL, set_config.CONTROL_KEY) catch return error.Io) orelse return error.ConfigUndecodable;
+        const value = (self.be.get().lookup(gpa, key.TREE_CONTROL, set_config.CONTROL_KEY) catch return error.Io) orelse return error.ConfigUndecodable;
         defer gpa.free(value);
         var diag: set_config.Refusal = undefined;
         return set_config.decode(gpa, value, &diag) catch return error.ConfigUndecodable;
     }
     fn stamp(ctx: *anyopaque) lattice.Error!void {
-        self_(ctx).be.stampVolumeLifecycle() catch return error.Io;
+        self_(ctx).be.get().stampVolumeLifecycle() catch return error.Io;
     }
     fn formatDevice(ctx: *anyopaque, dev: lattice.Device, vol_tag: u64) lattice.Error!void {
         // The online add formats the device BEFORE the record through the
@@ -515,7 +531,7 @@ pub const PlaneWorld = struct {
             .encryption = c.encryption,
             .volume_len = dev.volume_len,
             .vol_tag = vol_tag,
-            .set_uuid = self.be.setUuid(),
+            .set_uuid = self.be.get().setUuid(),
             .device_uuid = dev.uuid,
             .features_incompat = 0,
         };
@@ -524,23 +540,23 @@ pub const PlaneWorld = struct {
     fn commit(ctx: *anyopaque, cfg: *const set_config.Config, job: ?records.JobRecord) lattice.Error!void {
         const self = self_(ctx);
         const gpa = self.plane.gpa;
-        const bytes = set_config.encode(gpa, cfg, @intCast(geometry.recordValueCap(self.be.nodeSize()))) catch return error.Io;
+        const bytes = set_config.encode(gpa, cfg, @intCast(geometry.recordValueCap(self.be.get().nodeSize()))) catch return error.Io;
         defer gpa.free(bytes);
-        const t = self.be.begin(@src()) catch return error.OutOfMemory;
+        const t = self.be.get().begin(@src()) catch return error.OutOfMemory;
         t.stagePut(key.TREE_CONTROL, set_config.CONTROL_KEY, bytes) catch {
-            self.be.abandon(t);
+            self.be.get().abandon(t);
             return error.OutOfMemory;
         };
         if (job) |j| {
             const jk = records.jobKey(j.job_id);
             const jb = j.encode();
             t.stagePut(key.TREE_CONTROL, jk.slice(), &jb) catch {
-                self.be.abandon(t);
+                self.be.get().abandon(t);
                 return error.OutOfMemory;
             };
         }
-        self.be.commit(t) catch return error.Io;
-        self.be.fsync() catch return error.Io;
+        self.be.get().commit(t) catch return error.Io;
+        self.be.get().fsync() catch return error.Io;
     }
     /// Step 7: the router, then the record's generation becomes the word
     /// the membership grants carry (a joiner behind it pulls the record at
@@ -969,12 +985,12 @@ pub const PlaneMeta = struct {
 pub const PlaneRekey = struct {
     plane: *plane_mod.DataPlane,
     io: Io,
-    be: *KvBackend,
+    be: Vol0,
     mover_: *PlaneMover,
     /// The mover's table + `rewrite`.
     vt_: mover.Seam.VTable,
 
-    pub fn init(plane: *plane_mod.DataPlane, io: Io, be: *KvBackend, m: *PlaneMover) PlaneRekey {
+    pub fn init(plane: *plane_mod.DataPlane, io: Io, be: Vol0, m: *PlaneMover) PlaneRekey {
         var vt_ = PlaneMover.vt;
         vt_.rewrite = &rewrite;
         return .{ .plane = plane, .io = io, .be = be, .mover_ = m, .vt_ = vt_ };
@@ -1000,7 +1016,7 @@ pub const PlaneRekey = struct {
     }
     fn windowKeyId(ctx: *anyopaque) ?[transform.KEY_ID_LEN]u8 {
         const self = self_(ctx);
-        const value = (self.be.lookup(self.plane.gpa, key.TREE_CONTROL, set_config.CONTROL_KEY) catch return null) orelse return null;
+        const value = (self.be.get().lookup(self.plane.gpa, key.TREE_CONTROL, set_config.CONTROL_KEY) catch return null) orelse return null;
         defer self.plane.gpa.free(value);
         var diag: set_config.Refusal = undefined;
         var cfg = set_config.decode(self.plane.gpa, value, &diag) catch return null;
@@ -1048,22 +1064,22 @@ pub const PlaneRekey = struct {
     fn close(ctx: *anyopaque) error{Io}!void {
         const self = self_(ctx);
         const gpa = self.plane.gpa;
-        const value = (self.be.lookup(gpa, key.TREE_CONTROL, set_config.CONTROL_KEY) catch return error.Io) orelse return error.Io;
+        const value = (self.be.get().lookup(gpa, key.TREE_CONTROL, set_config.CONTROL_KEY) catch return error.Io) orelse return error.Io;
         defer gpa.free(value);
         var diag: set_config.Refusal = undefined;
         var cfg = set_config.decode(gpa, value, &diag) catch return error.Io;
         defer cfg.deinit(gpa);
         var m = set_config.closeRekey(gpa, &cfg) catch return error.Io;
         defer m.next.deinit(gpa);
-        const bytes = set_config.encode(gpa, &m.next, @intCast(geometry.recordValueCap(self.be.nodeSize()))) catch return error.Io;
+        const bytes = set_config.encode(gpa, &m.next, @intCast(geometry.recordValueCap(self.be.get().nodeSize()))) catch return error.Io;
         defer gpa.free(bytes);
-        const t = self.be.begin(@src()) catch return error.Io;
+        const t = self.be.get().begin(@src()) catch return error.Io;
         t.stagePut(key.TREE_CONTROL, set_config.CONTROL_KEY, bytes) catch {
-            self.be.abandon(t);
+            self.be.get().abandon(t);
             return error.Io;
         };
-        self.be.commit(t) catch return error.Io;
-        self.be.fsync() catch return error.Io;
+        self.be.get().commit(t) catch return error.Io;
+        self.be.get().fsync() catch return error.Io;
         self.plane.closeRekey(self.io) catch |e| log.err("defrag --rekey: the record flipped to key id {x} (generation {d}) but the plane's wrap did not close ({s}) — the previous key stays an unwrap arm until the next mount", .{ &m.next.key_id, m.next.config_generation, @errorName(e) });
         lifecycle_stats_mod.publishConfigGeneration(m.next.config_generation);
         log.info("defrag --rekey: the primary key is now id {x} (config generation {d})", .{ &m.next.key_id, m.next.config_generation });
@@ -1116,7 +1132,7 @@ pub const PlaneAdmin = struct {
         const self = self_(ctx);
         const node = self.node;
         const plane = node.plane;
-        const dev = volume_ops.probeDevice(gpa, node.io, uri, node.store.be.setUuid(), @intCast(plane.chunk)) catch |e| return e;
+        const dev = volume_ops.probeDevice(gpa, node.io, uri, node.store.be.get().setUuid(), @intCast(plane.chunk)) catch |e| return e;
         var online: OnlineAdd = .{ .admin = self, .dev = dev, .cfg_after = null };
         defer if (online.cfg_after) |*c| c.deinit(gpa);
         const out = try lattice.addData(gpa, online.world(), dev, false);
@@ -1383,13 +1399,14 @@ pub const Node = struct {
     };
 
     pub fn create(gpa: Allocator, io: Io, opts: Options, in: Init) Allocator.Error!*Node {
+        const vol0: Vol0 = if (in.meta_set) |s| .{ .set = s } else .{ .fixed = in.backend };
         const n = try gpa.create(Node);
         errdefer gpa.destroy(n);
         n.* = .{
             .gpa = gpa,
             .io = io,
             .opts = opts,
-            .store = .{ .be = in.backend },
+            .store = .{ .be = vol0 },
             .plane = in.plane,
             .fabric = undefined,
             .sink = .{ .vols = &in.plane.vols, .wero = in.wero },
@@ -1422,7 +1439,7 @@ pub const Node = struct {
         n.coord = wire_mod.Coordinator.init(gpa, io, &n.fabric, &n.table, .{ .verify = n.verify.vr(), .channel = wire_tls.posture().channel(), .configured_permille = opts.verify_permille, .wero = if (in.wero) |w| w.wero() else null });
         n.sink.coord = &n.coord;
         // The bodies over the plane (every job type this daemon can run).
-        n.world_ = .{ .be = in.backend, .plane = in.plane, .fabric = &n.fabric, .io = io, .random = in.random };
+        n.world_ = .{ .be = vol0, .plane = in.plane, .fabric = &n.fabric, .io = io, .random = in.random };
         n.drain_ = .{ .plane = in.plane, .io = io, .walk_ = n.walk_, .mover_ = n.mover_, .world_ = n.world_, .workers = opts.workers, .rate = .{ .ctx = n, .bps = &writeRateFn } };
         n.drain_body = .{ .gpa = gpa, .seam = n.drain_.seam() };
         n.rebalance_body = .{ .gpa = gpa, .seam = n.drain_.seam() };
@@ -1434,7 +1451,7 @@ pub const Node = struct {
         n.fabric.registerBody(.rebalance, n.rebalance_body.body());
         n.fabric.registerBody(.defrag_data, n.data_body.body());
         n.fabric.registerBody(.defrag_pack, n.pack_body.body());
-        n.rekey_ = PlaneRekey.init(in.plane, io, in.backend, &n.mover_);
+        n.rekey_ = PlaneRekey.init(in.plane, io, vol0, &n.mover_);
         n.rekey_body = .{ .gpa = gpa, .seam = n.rekey_.seam() };
         n.fabric.registerBody(.rekey, n.rekey_body.body());
         // D3 over the plane's write side; D4 over the meta set when bound.
@@ -1708,7 +1725,7 @@ test "linux: A JOINED MEMBER'S JOB FABRIC NEVER WRITES THE MANAGER'S TREE 0 — 
     defer plane.stop();
     const be0 = set.volumes[0];
     // A, the coordinator, mints a job: a QUEUED record in tree 0.
-    var store_a: TreeStore = .{ .be = be0 };
+    var store_a: TreeStore = .{ .be = .{ .fixed = be0 } };
     var fa = Fabric.init(gpa, store_a.store(), .{ .identity = .{ .node_token = 1, .mount_slot = 0 }, .pid = 1, .random = &joinedTree0Random });
     defer fa.deinit();
     const live_job = try fa.submit(io, .{ .job_type = .noop, .arg0 = 1 });
@@ -1764,7 +1781,7 @@ test "linux: A JOINED MEMBER'S JOB FABRIC NEVER WRITES THE MANAGER'S TREE 0 — 
     // B's fabric as `mount` builds a JOINED member's: not the coordinator.
     // It adopts nothing (A's live job is A's to run), so B's checkpoint
     // has nothing of tree 0 to flush.
-    var store_b: TreeStore = .{ .be = bj };
+    var store_b: TreeStore = .{ .be = .{ .fixed = bj } };
     var fb = Fabric.init(gpa, store_b.store(), .{ .identity = .{ .node_token = 2, .mount_slot = 0 }, .pid = 2, .random = &joinedTree0Random });
     defer fb.deinit();
     fb.setCoordinator(false);

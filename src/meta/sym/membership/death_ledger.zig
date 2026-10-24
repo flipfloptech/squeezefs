@@ -62,6 +62,9 @@ pub const stats = struct {
     /// A manager that released its role under the vol-0 rule.
     pub var manager_role_releases: counters.ShardedCounter = .{};
     pub var recovered_regions_released: counters.ShardedCounter = .{};
+    /// Death records retired because their member is live again
+    /// (`retireForJoin`: a new incarnation under the dead pair).
+    pub var dead_members_retired_rejoined: counters.ShardedCounter = .{};
     /// Open intents of recovered slots the poll handed to the cross-owner
     /// cadence (adopted into its register; its next pass completes them).
     pub var recovery_intents_adopted: counters.ShardedCounter = .{};
@@ -180,6 +183,7 @@ pub const Ledger = struct {
         alloc_lease.retireDeathRecords(self.store.control, self.gpa, identity, self.set_width) catch |e| return switch (e) {
             error.WindowFull, error.Io, error.OutOfMemory => error.Io,
         };
+        stats.dead_members_retired_rejoined.inc();
     }
 
     pub fn readDeath(self: *Ledger, identity: WriterIdentity) error{Io}!?DeadMember {

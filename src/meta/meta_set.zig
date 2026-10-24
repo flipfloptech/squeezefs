@@ -143,6 +143,8 @@ pub const MetaSet = struct {
     retired: std.ArrayList(*KvBackend) = .empty,
     /// Re-joins in place this mount made (`.stats` `meta_rejoins_in_place`).
     rejoins: u64 = 0,
+    /// `retired[0..retired_released]` have released their node caches.
+    retired_released: usize = 0,
     /// The bindings every member's planes carry, re-applied to a
     /// successor incarnation: the move epoch, the parent memo, the times
     /// drain, the kernel view and the token recall on its conveyor, the
@@ -802,6 +804,16 @@ pub const MetaSet = struct {
             n += 1;
         }
         return fresh;
+    }
+
+    /// Every retired incarnation's node cache not yet released (the beat,
+    /// once the ops in flight at the publication answered). Answers the
+    /// bytes released.
+    pub fn releaseRetiredCaches(self: *MetaSet) u64 {
+        var bytes: u64 = 0;
+        for (self.retired.items[self.retired_released..]) |be| bytes += be.releaseRetiredCache();
+        self.retired_released = self.retired.items.len;
+        return bytes;
     }
 
     /// Publish the successor incarnations (owned slice, freed here): each

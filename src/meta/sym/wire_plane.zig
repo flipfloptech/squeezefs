@@ -280,6 +280,9 @@ const JoinedHalf = struct {
     follow_stop: std.atomic.Value(bool) = .init(false),
     /// Re-joins in place this member made (`.stats` `member_rejoins_in_place`).
     rejoins_in_place: std.atomic.Value(u64) = .init(0),
+    /// A re-join published successors whose predecessors' node caches are
+    /// still to release (the beat's alone).
+    retired_caches_owed: bool = false,
     /// Reclaims the beat landed (monotone): the follower re-points and
     /// re-publishes once per count it has not handled. The beat's Release
     /// increment pairs with the follower's Acquire load, which then reads
@@ -348,6 +351,7 @@ const JoinedHalf = struct {
             }
             const t = clock.monotonicNs();
             const v = self.member.tick(t / std.time.ns_per_ms, t);
+            self.plane.releaseRetiredIfDrained(self);
             if (v == .evicted) {
                 // The home shard evicted this live member: re-join in
                 // place, or the fail-stop (`WirePlane.rejoinInPlace`).
@@ -566,6 +570,10 @@ pub const RejoinHost = struct {
     /// evicted one dropped (the kernel's whole view, the read cache) and
     /// its per-volume registrations made for the successor's members.
     rebound: *const fn (ctx: *anyopaque) void,
+    /// Mark every FUSE op in flight now; `opsDrained` answers once each
+    /// of them has answered (the retired incarnation's last readers).
+    opsMark: *const fn (ctx: *anyopaque) void,
+    opsDrained: *const fn (ctx: *anyopaque) bool,
 };
 
 pub const WirePlane = struct {
@@ -620,6 +628,9 @@ pub const WirePlane = struct {
     /// `SQUEEZEFS_TEST_ONLINE_ARM_HOLD`: the online arm parks on
     /// `unarmed_answered` (bounded by T_owner) before it arms.
     online_arm_hold: bool = false,
+    /// `SQUEEZEFS_TEST_REJOIN_MEMBER_REFUSED`: a re-join in place's
+    /// membership join under the successor is refused.
+    rejoin_member_refused: bool = false,
     /// A data-plane verb named a volume the holder has not armed (the
     /// hold's token; `tick.wake` from the wire thread).
     unarmed_answered: std.atomic.Value(u32) = .init(0),
@@ -707,6 +718,7 @@ pub const WirePlane = struct {
         self.divert.evict_after_serve = knobs.boolKnob("SQUEEZEFS_TEST_TOKEN_EVICT_AFTER_SERVE", env);
         self.leave_lost = knobs.boolKnob("SQUEEZEFS_TEST_MEMBERSHIP_LEAVE_LOST", env);
         self.online_arm_hold = knobs.boolKnob("SQUEEZEFS_TEST_ONLINE_ARM_HOLD", env);
+        self.rejoin_member_refused = knobs.boolKnob("SQUEEZEFS_TEST_REJOIN_MEMBER_REFUSED", env);
         if (self.joined) |j| {
             j.beat_hold = knobs.parseStr(env.get("SQUEEZEFS_TEST_MEMBERSHIP_BEAT_HOLD"));
             j.follow_hold = knobs.parseStr(env.get("SQUEEZEFS_TEST_MEMBERSHIP_FOLLOW_HOLD"));
@@ -1011,35 +1023,89 @@ pub const WirePlane = struct {
             const why = std.fmt.bufPrint(&why_buf, "the successor's join failed ({t})", .{e}) catch "the successor's join failed";
             return self.refuseRejoin(j, why);
         };
+        // The member joins under the successor BEFORE anything can reach
+        // it: a refusal closes the unpublished successors — each the clean
+        // leave of a fresh join (its rotor released, its page Free,
+        // `LeaveAppender`) — and poisons the mount over the retired
+        // predecessor, so a refused re-join leaves no region the manager
+        // would have to recover.
+        const pred_js = j.js;
+        const js = fresh[0].joined.?;
+        pointMember(j, js, fresh[0]);
+        const joined_member = if (self.rejoin_member_refused) seam: {
+            log.warn("cluster wire: SQUEEZEFS_TEST_REJOIN_MEMBER_REFUSED — the successor's membership join is refused", .{});
+            break :seam false;
+        } else self.publishEndpointOn(fresh) and self.joinMember(j, t0);
+        if (!joined_member) {
+            pointMember(j, pred_js, self.set.volumes[0]);
+            for (fresh) |be| be.close();
+            self.gpa.free(fresh);
+            return self.refuseRejoin(j, "the successor's membership join was refused (the successor left cleanly, never published)");
+        }
         // The evicted incarnation's tokens are void at every holder (the
-        // death fan-out swept them): none is served from here on.
+        // death fan-out swept them), and every grant this holder issued
+        // was over its slots: neither is served from here on.
         const planes = self.divert.dropAll(self.io);
+        const grants = self.holder.dropAll(self.io);
         self.set.publishSuccessors(fresh) catch {
             for (fresh) |be| be.close();
             self.gpa.free(fresh);
             return self.refuseRejoin(j, "out of memory publishing the successor incarnation");
         };
-        const js = self.set.volumes[0].joined.?;
-        // Release pairs with `selfLive`'s Acquire load.
-        @atomicStore(*joined.JoinedSet, &j.js, js, .release);
-        j.member.link = js.link.link();
-        j.member.gate = &js.park_gate;
-        j.member.mount = js.mountpoint;
-        j.member.epoch = 0;
-        j.slots_carriage = self.set.volumes[0].slots.carriageSink();
         self.pusher.identity = js.appenderId();
-        if (!self.publishToManager()) return self.refuseRejoin(j, "the successor's listener could not be published to the manager");
-        if (!self.joinMember(j, t0)) return self.refuseRejoin(j, "the successor's membership join was refused");
-        if (self.rejoin_host.load(.acquire)) |h| h.rebound(h.ctx);
+        self.steps.plane.rebindOwner(js.appenderId());
+        const host = self.rejoin_host.load(.acquire);
+        if (host) |h| h.rebound(h.ctx);
         // The posture word is the successor gate's (running).
         membership.park_reclaim.stats.appender_parked.set(@backingInt(membership.park_reclaim.Word.running));
         _ = j.rejoins_in_place.fetchAdd(1, .monotonic);
         stats.wire_rejoins_in_place.inc();
         if (self.set.bound_moves) |m| m.bump();
+        // The retired incarnations' node caches go once every FUSE op in
+        // flight now has answered (the beat polls `releaseRetiredIfDrained`).
+        if (host) |h| h.opsMark(h.ctx);
+        j.retired_caches_owed = true;
         j.follow_stop.store(false, .release);
         j.follower = std.Thread.spawn(.{}, JoinedHalf.follow, .{j}) catch return self.refuseRejoin(j, "the follower thread could not be re-spawned");
-        log.info("cluster wire: RE-JOINED IN PLACE as appender {d} (was {d}), member epoch {d} at {f} in {d} ms — nothing was un-landed; {d} token plane(s) dropped, the mount's views dropped, every parked op re-issued on the successor incarnation", .{ js.appenderId(), old_appender, j.member.epoch, js.managerEndpoint(), (clock.monotonicNs() - t0) / std.time.ns_per_ms, planes });
+        log.info("cluster wire: RE-JOINED IN PLACE as appender {d} (was {d}), member epoch {d} at {f} in {d} ms — nothing was un-landed; {d} token plane(s) and {d} holder grant(s) dropped, the mount's views dropped, every parked op re-issued on the successor incarnation", .{ js.appenderId(), old_appender, j.member.epoch, js.managerEndpoint(), (clock.monotonicNs() - t0) / std.time.ns_per_ms, planes, grants });
         return true;
+    }
+
+    /// The member's words over incarnation `js` (volume 0's backend `be0`
+    /// carries the slot plane its carriage lands on). Release on `js`
+    /// pairs with `selfLive`'s Acquire load.
+    fn pointMember(j: *JoinedHalf, js: *joined.JoinedSet, be0: *KvBackend) void {
+        @atomicStore(*joined.JoinedSet, &j.js, js, .release);
+        j.member.link = js.link.link();
+        j.member.gate = &js.park_gate;
+        j.member.mount = js.mountpoint;
+        j.member.epoch = 0;
+        j.slots_carriage = be0.slots.carriageSink();
+    }
+
+    /// The retired incarnations' node caches released once every FUSE op
+    /// in flight at the publication has answered (decision 0003 §BS): a
+    /// reader of a retired incarnation is an op that loaded it before the
+    /// pointer store; the nodes such a reader still holds die at its last
+    /// release (the node refcount), so the discard never frees under it.
+    fn releaseRetiredIfDrained(self: *WirePlane, j: *JoinedHalf) void {
+        if (!j.retired_caches_owed) return;
+        if (self.rejoin_host.load(.acquire)) |h| if (!h.opsDrained(h.ctx)) return;
+        j.retired_caches_owed = false;
+        const bytes = self.set.releaseRetiredCaches();
+        log.info("cluster wire: the retired incarnation's node cache released ({d} B) — every op in flight at the re-join has answered", .{bytes});
+    }
+
+    /// The manager session of the LIVE incarnation (volume 0's joined set
+    /// as `volumes` names it at every call; Acquire pairs with
+    /// `MetaSet.publishSuccessors`' Release store): the writer plane's
+    /// grant verbs and the job node's fleet worker call through it, so a
+    /// re-join in place re-binds them with the rest (decision 0003 §BS).
+    pub fn liveManagerCall(ctx: *anyopaque, req: verbs.Request) errors.Error!verbs.Reply {
+        const self: *WirePlane = @ptrCast(@alignCast(ctx));
+        const be0 = @atomicLoad(*KvBackend, &self.set.volumes[0], .acquire);
+        const js = be0.joined orelse return error.NotManager;
+        return js.link.call(req);
     }
 
     /// THE ELIGIBILITY (decision 0003 §BS), judged after the retirement:
@@ -1125,8 +1191,14 @@ pub const WirePlane = struct {
     /// A joiner's listener into the manager's RAM endpoint table (every
     /// joined volume's); false when any publication failed (logged).
     fn publishToManager(self: *WirePlane) bool {
+        return self.publishEndpointOn(self.set.volumes);
+    }
+
+    /// `publishToManager` over the incarnations `bes` (a re-join's
+    /// successors before their publication).
+    fn publishEndpointOn(self: *WirePlane, bes: []const *KvBackend) bool {
         var ok = true;
-        for (self.set.volumes) |be| {
+        for (bes) |be| {
             const js = be.joined orelse continue;
             _ = js.publishEndpoint(self.advertised) catch |e| {
                 log.err("cluster wire: PublishEndpoint to the manager failed ({s})", .{@errorName(e)});
@@ -1392,8 +1464,9 @@ pub const WirePlane = struct {
             self.set.volumes[0].installKvdaSink(.{ .ctx = hp, .writePages = &plane_arm.HolderPlane.writeKvdaPages });
             return;
         }
-        const js = self.set.volumes[0].joined.?;
-        self.writer_plane = try plane_arm.WriterPlane.create(gpa, self.io, dp, js.link.tokenLink(), self.identity);
+        // Through the LIVE incarnation's session: a re-join in place
+        // re-binds the grant verbs with the rest.
+        self.writer_plane = try plane_arm.WriterPlane.create(gpa, self.io, dp, .{ .ctx = self, .call = &liveManagerCall }, self.identity);
         // The member's renewals declare the writer's held windows from now
         // on (the beat thread reads the pointer with acquire).
         if (self.joined) |j| j.windows.store(self.writer_plane, .release);

@@ -1136,6 +1136,26 @@ test "an unacked recall completes at the reader's lease expiry (expired_with_lea
     try testing.expectEqual(@as(u64, 0), f.holder.outstandingGrants(io));
 }
 
+test "a re-join in place drops every grant its holder issued (decision 0003 §BS): both readers' grants over a directory and two files go at once, the count answered; a later first-touch serve registers afresh" {
+    const io = testing.io;
+    const f = try TwoMembers.init(testing.allocator, io, 2);
+    defer f.deinit();
+    for ([_]usize{ 0, 1 }) |r| for ([_]u64{ 2, 3 }) |o| {
+        var s = (try f.reader(r).serve(io, objectOf(o), .{})).?;
+        s.release(io);
+    };
+    var s = (try f.reader(0).serve(io, objectOf(4), .{})).?;
+    s.release(io);
+    try testing.expectEqual(@as(u64, 5), f.holder.outstandingGrants(io));
+    try testing.expectEqual(@as(u64, 5), f.holder.dropAll(io));
+    try testing.expectEqual(@as(u64, 0), f.holder.outstandingGrants(io));
+    for ([_]u64{ 2, 3, 4 }) |o| for ([_]table.ClientId{ 1, 2 }) |c| try testing.expect(!f.holder.holdsGrant(io, objectOf(o), c));
+    try testing.expectEqual(@as(u64, 0), f.holder.dropAll(io));
+    s = (try f.reader(1).serve(io, objectOf(4), .{})).?;
+    s.release(io);
+    try testing.expectEqual(@as(u64, 1), f.holder.outstandingGrants(io));
+}
+
 /// The joiner's lease face as `wire_plane.LeaseOracle` binds it: every
 /// member but the manager is judged by the owner's census as the beat
 /// last pulled it.

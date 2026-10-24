@@ -318,7 +318,11 @@ pub fn Plane(comptime Store: type) type {
         apply: Apply,
         locks: *dlm.Manager,
         parked: guards.ParkedScopes,
-        own_id: AppenderId,
+        /// This mount's appender id on the volume — the rank its local
+        /// table takes in the guards' order. A re-join in place re-binds
+        /// it to the successor's (`rebindOwner`; Release pairs with the
+        /// readers' Acquire).
+        own_id: std.atomic.Value(AppenderId),
         volume: u16,
         resolver: Resolver,
         witness: ?Witness = null,
@@ -352,7 +356,7 @@ pub fn Plane(comptime Store: type) type {
                 .apply = Apply.init(gpa, io, store),
                 .locks = locks,
                 .parked = guards.ParkedScopes.init(gpa, io, locks),
-                .own_id = own_id,
+                .own_id = .init(own_id),
                 .volume = volume,
                 .resolver = resolver,
                 .minter = intent.Minter.init(term),
@@ -422,6 +426,11 @@ pub fn Plane(comptime Store: type) type {
         }
 
         /// The travelling-guard tables for the op's keys.
+        /// A re-join in place: the successor incarnation's appender id.
+        pub fn rebindOwner(self: *Self, own_id: AppenderId) void {
+            self.own_id.store(own_id, .release);
+        }
+
         pub fn tables(self: *Self) guards.Tables {
             return .{ .ctx = self, .tableOf = &tableOf };
         }
@@ -467,7 +476,7 @@ pub fn Plane(comptime Store: type) type {
             // again only where the re-resolve names another holder.
             var tries: u32 = 0;
             while (true) : (tries += 1) {
-                if (guards.acquire(self.gpa, self.io, self.locks, self.tables(), .{ .own_id = self.own_id, .volume = self.volume, .scope = scope, .inodes = inodes[0..ni], .dentries = dents[0..nd], .discovery = discovery })) |t| return t else |e| {
+                if (guards.acquire(self.gpa, self.io, self.locks, self.tables(), .{ .own_id = self.own_id.load(.acquire), .volume = self.volume, .scope = scope, .inodes = inodes[0..ni], .dentries = dents[0..nd], .discovery = discovery })) |t| return t else |e| {
                     const given_up: Error = switch (e) {
                         error.OutOfMemory => return error.OutOfMemory,
                         error.PlanTooLarge => return error.PlanTooLarge,

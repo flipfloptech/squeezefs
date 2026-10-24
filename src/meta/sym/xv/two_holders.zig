@@ -523,7 +523,7 @@ test "a ship that fails leaves the intent OPEN (abandoned on the register, never
     try testing.expectEqual(@as(usize, 2), r.steps);
     try testing.expectEqual(@as(u16, 1), r.applied);
     try testing.expectEqual(route_table.slotOf(DIR_B), r.next_slot.?);
-    try testing.expectEqual(f.b.plane.own_id, r.next_home.foreign);
+    try testing.expectEqual(f.b.plane.own_id.load(.acquire), r.next_home.foreign);
     try testing.expectEqual(@as(u16, @intFromError(error.ShipFailed)), r.last_err);
     try testing.expect(!r.pass_running);
     try testing.expect(r.age_ms >= intent.STUCK_GRACE_NS / std.time.ns_per_ms);

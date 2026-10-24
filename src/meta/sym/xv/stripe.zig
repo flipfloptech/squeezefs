@@ -1066,13 +1066,14 @@ pub fn Striping(comptime Store: type) type {
             var stripes: [K_MAX]u64 = @splat(0);
             var supplied: [K_MAX]bool = @splat(false);
             var creators: usize = 0;
+            const own_id = self.plane.own_id.load(.acquire);
             for (suppliers) |c| {
-                if (c != self.plane.own_id) creators += 1;
+                if (c != own_id) creators += 1;
             }
             const share = supplyShare(k, creators);
             var next: u8 = 0;
             if (share > 0) for (suppliers) |c| {
-                if (c == self.plane.own_id) continue;
+                if (c == own_id) continue;
                 if (next + share > k) break;
                 var indices: [K_MAX]u8 = undefined;
                 for (0..share) |i| indices[i] = next + @as(u8, @intCast(i));
@@ -1311,7 +1312,7 @@ pub fn Striping(comptime Store: type) type {
             dents[nd] = .{ .parent = d.child, .name = STRIPED, .mode = .exclusive };
             nd += 1;
             const scope = self.plane.mintScope();
-            var held = @import("guards.zig").acquire(self.plane.gpa, self.plane.io, self.plane.locks, self.plane.tables(), .{ .own_id = self.plane.own_id, .volume = self.plane.volume, .scope = scope, .inodes = inodes[0..ni], .dentries = dents[0..nd] }) catch |e| return switch (e) {
+            var held = @import("guards.zig").acquire(self.plane.gpa, self.plane.io, self.plane.locks, self.plane.tables(), .{ .own_id = self.plane.own_id.load(.acquire), .volume = self.plane.volume, .scope = scope, .inodes = inodes[0..ni], .dentries = dents[0..nd] }) catch |e| return switch (e) {
                 error.OutOfMemory => error.OutOfMemory,
                 error.PlanTooLarge => error.PlanTooLarge,
                 error.HolderUnreachable => error.ShipFailed,

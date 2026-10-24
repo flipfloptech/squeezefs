@@ -3260,6 +3260,20 @@ pub const KvBackend = struct {
         return &be.cv.stats;
     }
 
+    /// THE RETIRED INCARNATION'S CACHE (decision 0003 §BS): every mapping
+    /// dropped, dirty ones included — their records landed in the ring the
+    /// successor manager's recovery replayed, and no cycle of a retired
+    /// incarnation ever writes them. A node a reader still holds dies at
+    /// its last release (the node refcount); a reader still inside a call
+    /// maps what it walks next until the unmount closes the incarnation.
+    /// Answers the bytes released.
+    pub fn releaseRetiredCache(be: *KvBackend) u64 {
+        std.debug.assert(be.lane.latch.isRetired());
+        const before = be.cache.cachedBytes();
+        _ = be.cache.discardAllNodes();
+        return before -| be.cache.cachedBytes();
+    }
+
     pub fn laneSnapshot(be: *const KvBackend) journal_lane.LaneSnapshot {
         return be.lane.snapshot();
     }

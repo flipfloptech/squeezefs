@@ -1098,6 +1098,28 @@ pub const Holder = struct {
         self.ack_wake.notifyWaiters(io);
     }
 
+    /// THE RE-JOIN IN PLACE (decision 0003 §BS): every grant this holder
+    /// issued was over the retired incarnation's slots, which its home
+    /// shard recovered — every client's swept (a recall in flight completes
+    /// `expired_with_lease`), so no later census or recall meets a grant
+    /// over a slot this mount no longer holds. Answers the grants dropped.
+    pub fn dropAll(self: *Holder, io: Io) u64 {
+        var n: u64 = 0;
+        {
+            self.lock.lockUncancelable(io);
+            defer self.lock.unlock(io);
+            var objs = self.objects.valueIterator();
+            while (objs.next()) |h| n += h.list.items.len;
+            // Each sweep removes its client.
+            while (self.clients.count() != 0) {
+                var it = self.clients.keyIterator();
+                self.sweepClientLocked(it.next().?.*, null);
+            }
+        }
+        self.ack_wake.notifyWaiters(io);
+        return n;
+    }
+
     /// The lease sweep at a NEW word from the owner (a joiner's census
     /// commit — a joiner hears no eviction, only the census that no longer
     /// lists the member): every client the oracle now calls expired

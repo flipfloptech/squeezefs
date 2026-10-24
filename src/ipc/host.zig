@@ -1014,6 +1014,35 @@ pub const IpcHost = struct {
         defer self.reg_lock.unlock(self.io);
         return self.live;
     }
+
+    /// A session that had ops in flight at a re-join's mark (decision 0003
+    /// §BS): its table slot and its identity there.
+    pub const InflightMark = struct { slot: u32, session: *const Session };
+
+    /// Every session with an op in flight now, appended to `out`.
+    pub fn markInflight(self: *IpcHost, gpa: Allocator, out: *std.ArrayList(InflightMark)) Allocator.Error!void {
+        self.reg_lock.lockUncancelable(self.io);
+        defer self.reg_lock.unlock(self.io);
+        for (self.sessions, 0..) |maybe, i| if (maybe) |s| {
+            if (s.inflight.load(.acquire) != 0) try out.append(gpa, .{ .slot = @intCast(i), .session = s });
+        };
+    }
+
+    /// Drops every mark whose session has since shown nothing in flight
+    /// (each op in flight at the mark answered) or left the table; true
+    /// once none remains. A session never idle between two polls holds
+    /// its mark.
+    pub fn inflightDrained(self: *IpcHost, marks: *std.ArrayList(InflightMark)) bool {
+        self.reg_lock.lockUncancelable(self.io);
+        defer self.reg_lock.unlock(self.io);
+        var i: usize = 0;
+        while (i < marks.items.len) {
+            const m = marks.items[i];
+            const held = if (self.sessions[m.slot]) |s| s == m.session and s.inflight.load(.acquire) != 0 else false;
+            if (held) i += 1 else _ = marks.swapRemove(i);
+        }
+        return marks.items.len == 0;
+    }
 };
 
 test {

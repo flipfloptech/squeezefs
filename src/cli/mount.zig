@@ -651,7 +651,9 @@ fn mountMain(ctx: *Ctx) u8 {
             .data_arm = if (wire != null) data_arm.arm() else null,
             .meta_set = be,
             // A joined member is a fleet READ worker over its own manager link.
-            .fleet_caller = if (be.volumes[0].joined) |js| jobs.wire.Caller{ .ctx = &js.link, .call = &sym_joined.SharedLink.callFn } else null,
+            // Through the LIVE incarnation's session (a re-join in place
+            // re-binds it with the rest, decision 0003 §BS).
+            .fleet_caller = if (be.volumes[0].joined != null) jobs.wire.Caller{ .ctx = wire.?, .call = &sym_wire.WirePlane.liveManagerCall } else null,
             .bitmaps = if (wire) |wp| fsck_runner.linux.BitmapFace{ .ctx = wp, .bitmapOf = &holderBitmapOf } else null,
         }) catch return ctx.failed("out of memory (job fabric)", .{});
         node = n;
@@ -802,7 +804,8 @@ fn mountMain(ctx: *Ctx) u8 {
     // is un-landed — the plane's and the filesystem's words are the
     // mount's to judge; the kernel's view and the read cache drop at the
     // successor. Unbound before the wire stops (LIFO).
-    var rejoin_host: RejoinHost = .{ .fs = &fs, .plane = plane, .set = be, .coherence = &coherence };
+    var rejoin_host: RejoinHost = .{ .fs = &fs, .plane = plane, .set = be, .coherence = &coherence, .registry = &registry, .gpa = gpa, .io = io };
+    defer rejoin_host.deinit();
     const rejoin_face = rejoin_host.face();
     if (wire) |wp| if (wp.joined != null) wp.bindRejoinHost(&rejoin_face);
     defer if (wire) |wp| wp.bindRejoinHost(null);
@@ -845,8 +848,10 @@ fn mountMain(ctx: *Ctx) u8 {
     } else if (ctx.opts.interception) {
         log.warn("mount: -o interception on a `-o ro` reader arms no session host (a reader serves no ring)", .{});
     }
+    rejoin_host.bindIpc(host);
     var host_live = true;
     defer if (host_live) if (host) |h| {
+        rejoin_host.bindIpc(null);
         h.disarm();
         h.deinit();
     };
@@ -991,6 +996,7 @@ fn mountMain(ctx: *Ctx) u8 {
     sampler_live = false;
     mem_budget.authority.stopSampler(ctx.p.io);
     if (host) |h| {
+        rejoin_host.bindIpc(null);
         h.disarm();
         h.deinit();
     }
@@ -1188,11 +1194,15 @@ fn holderHeld(ctx: *anyopaque, local: u64) bool {
 }
 
 fn stripeFloor(be: *meta_set.MetaSet) sym_xv.stripe.Floor {
-    return .{ .live = .{ .ctx = be.volumes[0], .read = &stripeFloorRead } };
+    return .{ .live = .{ .ctx = be, .read = &stripeFloorRead } };
 }
 
+/// Volume 0's judge as `volumes` names it at every read (a re-join in
+/// place publishes a successor; Acquire pairs with
+/// `MetaSet.publishSuccessors`' Release store).
 fn stripeFloorRead(ctx: *anyopaque) u32 {
-    const be0: *meta_set.KvBackend = @ptrCast(@alignCast(ctx));
+    const set: *meta_set.MetaSet = @ptrCast(@alignCast(ctx));
+    const be0 = @atomicLoad(*meta_set.KvBackend, &set.volumes[0], .acquire);
     return @intCast(@min(be0.slots.judge.nFloorNow(), std.math.maxInt(u32)));
 }
 
@@ -1921,9 +1931,91 @@ const RejoinHost = struct {
     plane: *plane_mod.DataPlane,
     set: *meta_set.MetaSet,
     coherence: *KernelCoherence,
+    registry: *watchdog.Registry,
+    gpa: Allocator,
+    io: Io,
+    /// Guards the drain's words: the beat marks and polls, the teardown
+    /// unbinds the interception host (before it disarms) and frees them.
+    lock: Io.Mutex = .init,
+    /// The interception host while it serves (its ops read the
+    /// incarnations exactly as FUSE ops do).
+    ipc: ?*ipc_host.IpcHost = null,
+    /// The FUSE ops in flight at the last mark (registry slot, request
+    /// unique) and the interception sessions with ops in flight then.
+    marked: std.ArrayList(Marked) = .empty,
+    ipc_marked: std.ArrayList(ipc_host.IpcHost.InflightMark) = .empty,
+    /// A mark ran out of memory: the next poll marks again (every op in
+    /// flight at the publication and still in flight is in flight then).
+    remark: bool = false,
+    closed: bool = false,
+
+    const Marked = struct { slot: u32, unique: u64 };
 
     fn face(self: *RejoinHost) sym_wire.RejoinHost {
-        return .{ .ctx = self, .unlanded = &unlanded, .rebound = &rebound };
+        return .{ .ctx = self, .unlanded = &unlanded, .rebound = &rebound, .opsMark = &opsMark, .opsDrained = &opsDrained };
+    }
+
+    fn bindIpc(self: *RejoinHost, h: ?*ipc_host.IpcHost) void {
+        self.lock.lockUncancelable(self.io);
+        defer self.lock.unlock(self.io);
+        self.ipc = h;
+        self.ipc_marked.clearRetainingCapacity();
+    }
+
+    fn deinit(self: *RejoinHost) void {
+        self.lock.lockUncancelable(self.io);
+        defer self.lock.unlock(self.io);
+        self.closed = true;
+        self.ipc = null;
+        self.marked.deinit(self.gpa);
+        self.ipc_marked.deinit(self.gpa);
+    }
+
+    fn opsMark(ctx: *anyopaque) void {
+        const self: *RejoinHost = @ptrCast(@alignCast(ctx));
+        self.lock.lockUncancelable(self.io);
+        defer self.lock.unlock(self.io);
+        if (!self.closed) self.markLocked();
+    }
+
+    /// Every FUSE op the registry holds now (acquire pairs with a claim's
+    /// acq_rel CAS: the slot's unique is the claimer's) and every
+    /// interception session with an op in flight.
+    fn markLocked(self: *RejoinHost) void {
+        self.marked.clearRetainingCapacity();
+        self.ipc_marked.clearRetainingCapacity();
+        self.remark = false;
+        for (self.registry.slots, 0..) |*s, i| {
+            if (s.state.load(.acquire) == 0) continue;
+            self.marked.append(self.gpa, .{ .slot = @intCast(i), .unique = s.unique }) catch {
+                self.remark = true;
+                return;
+            };
+        }
+        if (self.ipc) |h| h.markInflight(self.gpa, &self.ipc_marked) catch {
+            self.remark = true;
+        };
+    }
+
+    /// Every marked op answered: its slot freed or claimed by another
+    /// request (another unique), every marked session idle since.
+    fn opsDrained(ctx: *anyopaque) bool {
+        const self: *RejoinHost = @ptrCast(@alignCast(ctx));
+        self.lock.lockUncancelable(self.io);
+        defer self.lock.unlock(self.io);
+        if (self.closed) return true;
+        if (self.remark) {
+            self.markLocked();
+            return false;
+        }
+        var i: usize = 0;
+        while (i < self.marked.items.len) {
+            const m = self.marked.items[i];
+            const s = &self.registry.slots[m.slot];
+            if (s.state.load(.acquire) != 0 and s.unique == m.unique) i += 1 else _ = self.marked.swapRemove(i);
+        }
+        const ipc_drained = if (self.ipc) |h| h.inflightDrained(&self.ipc_marked) else true;
+        return self.marked.items.len == 0 and ipc_drained;
     }
 
     /// The data plane's words, then the filesystem's parked refinements

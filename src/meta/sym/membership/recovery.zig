@@ -386,6 +386,7 @@ pub const Driver = struct {
             // record: the record is written here, idempotent (`completed`).
             const vol_ordinal = self.vol.vt.vol(self.vol.ctx);
             const fresh = self.mount.ledger.recordRecovered(death.identity, vol_ordinal, p.recovered_by_term, @intCast(clock.realtimeCoarseNs())) catch return .failed;
+            self.retireRejoined(death.identity) catch return .failed;
             return if (fresh) .acted else .skipped;
         }
         self.step_reached = .decide;
@@ -394,6 +395,20 @@ pub const Driver = struct {
             log.warn("recovery: appender {d} (node 0x{x} mount slot {d}) on volume {d} failed with {s} after step {t} — the page stays Recovering, the next poll re-runs from the durable state", .{ p.appender_id, p.identity.node_token, p.identity.mount_slot, self.vol.vt.vol(self.vol.ctx), @errorName(e), self.step_reached });
             return .failed;
         };
+    }
+
+    /// A member live in the census again — a new incarnation under the
+    /// dead pair (a re-join in place, a remount; decision 0003 §BS) —
+    /// whose dead incarnation is recovered on every volume: its death
+    /// record retires. Standing, it named the successor's Live page under
+    /// the same pair: fsck's C15 judged the live member dead, and the
+    /// retirement sweep waited on a page no recovery would ever end.
+    fn retireRejoined(self: *Driver, identity: WriterIdentity) error{Io}!void {
+        const o = self.mount.census orelse return;
+        if (!o.memberIsLive(shard.writerMemberId(death_ledger.wireOf(identity)), 0)) return;
+        var v: u16 = 0;
+        while (v < self.mount.ledger.set_width) : (v += 1) if (!try self.mount.ledger.isRecovered(identity, v)) return;
+        try self.mount.ledger.retireForJoin(identity);
     }
 
     /// The non-Free page under the identity (a directory walk; the seam

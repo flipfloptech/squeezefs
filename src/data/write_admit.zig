@@ -3190,6 +3190,33 @@ test "fsync and the RELEASE drain land EVERY block the ino parked before them �
     try testing.expect(!w.wp.table.holdsIno(31));
 }
 
+// fsync's parked leg answered ENOSPC for ANY block left parked — a device
+// failing its DMAs (dm-error) too, so an application read "the disk is
+// full" off a dead disk. The leg answers the device's own class: ENOSPC
+// only for a space refusal (the store's, or the device's own ENOSPC — a
+// thin pool), EIO otherwise.
+test "fsync's parked leg answers the device's class: a device refusing every landing DMA with EIO is EIO (never ENOSPC); with ENOSPC (a thin pool) it is ENOSPC; the block stays parked either way" {
+    const io = testing.io;
+    const w = try World.init(testing.allocator, .sync_inline, false);
+    defer w.deinit(testing.allocator);
+    var tail: [1000]u8 = @splat(0x41);
+    _ = try w.wp.write(io, .{ .ino = 40, .offset = 0, .payload = .{ .bytes = &tail }, .class = .entire_op, .file = World.striped(0) });
+    try testing.expect(w.wp.table.holdsIno(40));
+    defer w.f.dev.setFailWrites(0, error.InputOutput);
+    w.f.dev.setFailWrites(std.math.maxInt(u32), error.InputOutput);
+    var prof = fsync_mod.Prof.start();
+    try testing.expectError(error.InputOutput, fsync_mod.fsync(w.wp.fsyncCtx(), io, 40, &prof));
+    try testing.expect(w.wp.table.holdsIno(40));
+    w.f.dev.setFailWrites(std.math.maxInt(u32), error.NoSpaceLeft);
+    var prof2 = fsync_mod.Prof.start();
+    try testing.expectError(error.NoSpaceLeft, fsync_mod.fsync(w.wp.fsyncCtx(), io, 40, &prof2));
+    try testing.expect(w.wp.table.holdsIno(40));
+    w.f.dev.setFailWrites(0, error.InputOutput);
+    var prof3 = fsync_mod.Prof.start();
+    try fsync_mod.fsync(w.wp.fsyncCtx(), io, 40, &prof3);
+    try testing.expect(!w.wp.table.holdsIno(40));
+}
+
 test "fsync through the write path: a parked block, an open overlay and a shadowed epoch all land; the phases sum exactly; nothing stays open" {
     const io = testing.io;
     const w = try World.init(testing.allocator, .sync_inline, true);

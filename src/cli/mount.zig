@@ -345,6 +345,16 @@ pub fn run(p: cli.Process, m: args.Mount) u8 {
     };
     defer wire_posture.deinit(p.gpa);
 
+    // No write cache without a supervisor (charter §6.1, decision 0003
+    // §BQ.6): the ring is acked unsynced custody only a supervisor keeps
+    // across a crash, so an unsupervised mount runs without it — and one
+    // that asks for it by name is refused here, on the caller's console. A
+    // `-o ro` reader holds no write cache either way.
+    if (!(m.daemon and m.supervise) and !opts.read_only) if (knobs.optIntKnob("SQUEEZEFS_WRITE_CACHE_PCT", u64, p.env)) |pct| if (pct > 0) {
+        p.stderr.print("squeezefs mount: SQUEEZEFS_WRITE_CACHE_PCT={d} asks for a write cache, and this mount has no supervisor to hold its ring across a crash (no write cache without a supervisor: a crash would lose its acked unsynced writes and leave their sizes ahead of their bytes) — mount with `--daemon --supervise --log-file <file>`, or unset it\n", .{pct}) catch {};
+        return cli.exit_usage;
+    };
+
     // `--daemon`: the log file first (its refusal reaches the terminal),
     // then the fork — before any thread exists.
     var reporter: ?daemon.Reporter = null;
@@ -381,7 +391,9 @@ pub fn run(p: cli.Process, m: args.Mount) u8 {
     const facts = derive.facts();
     const host: mem_budget.Host = .{ .io = p.io, .env = p.env, .facts = facts };
     const budget_bytes = mem_budget.authority.resolveBudgetNow(host);
-    const write_cache_bytes = cache_core.resolveBound(knobs.intKnob("SQUEEZEFS_WRITE_CACHE_PCT", u64, p.env), facts, budget_bytes);
+    // The write cache only where a supervisor holds its ring (the
+    // channel exists: `--supervise` and its socketpair).
+    const write_cache_bytes = if (journal_tail.hasSupervisor()) cache_core.resolveBound(knobs.intKnob("SQUEEZEFS_WRITE_CACHE_PCT", u64, p.env), facts, budget_bytes) else 0;
     // The pinned device pools follow the budget (before the first open).
     nvme_dev.sizePoolsForBudget(budget_bytes);
     const sqz = SqzIo.init(p.gpa, .{
@@ -479,7 +491,7 @@ fn mountMain(ctx: *Ctx) u8 {
     defer guards.deinit();
     var opens = open_table.OpenTable.init(gpa, open_table.derivedCapacity(facts.possible_cpus, fuse_geometry.Q_DEPTH_DESIRED)) catch return ctx.failed("out of memory (open table)", .{});
     defer opens.deinit();
-    const plane = plane_mod.DataPlane.open(gpa, io, ctx.sqz, be, &cfg, .{ .env = env, .facts = facts, .budget_bytes = ctx.budget_bytes, .write_cache_bytes = ctx.write_cache_bytes, .member_identity = ctx.fabric.memberIdentity(), .derived_key = ctx.derived_key, .derived_next = ctx.derived_next, .guards = &guards }) catch |e| return ctx.failed("the data plane could not open ({s}) — see the log", .{@errorName(e)});
+    const plane = plane_mod.DataPlane.open(gpa, io, ctx.sqz, be, &cfg, .{ .env = env, .facts = facts, .budget_bytes = ctx.budget_bytes, .write_cache_bytes = ctx.write_cache_bytes, .member_identity = ctx.fabric.memberIdentity(), .derived_key = ctx.derived_key, .derived_next = ctx.derived_next, .guards = &guards, .mount = .{ .unsupervised = !journal_tail.hasSupervisor() } }) catch |e| return ctx.failed("the data plane could not open ({s}) — see the log", .{@errorName(e)});
     // The write cache's memfd and claim to the supervisor (charter §6.1
     // "Staged"): from here a crash of this process keeps every resident
     // for the member's next mount.
@@ -1112,16 +1124,13 @@ fn announceTail(_: ?*anyopaque, index: u16, fd: std.os.linux.fd_t) bool {
 }
 
 /// The write cache's memfd and its claim over the supervisor's socket
-/// (two frames, one fd each — the discipline). Without a supervisor the
-/// posture is said once: a crash of this process loses the ring's
-/// unsynced residents (a power cut's exposure; synced bytes were promoted).
+/// (two frames, one fd each — the discipline). A mount without a
+/// supervisor binds no write cache (decision 0003 §BQ.6).
 fn announceWriteCache(plane: *plane_mod.DataPlane) void {
     const fds = plane.writeCacheFds() orelse return;
     const sock = journal_tail.supervisor_sock.load(.acquire);
-    if (sock < 0) {
-        log.info("write cache: no supervisor holds the ring — a crash of this process loses its unsynced residents (every fsync'd byte was promoted to the data volumes); `--daemon --supervise` keeps them for the next mount", .{});
-        return;
-    }
+    // A write cache is bound only under a supervisor (`run`).
+    std.debug.assert(sock >= 0);
     const claim_frame = (cli.supervisor.TailFrame{ .kind = .write_cache_claim, .index = 0 }).encode();
     const ring_frame = (cli.supervisor.TailFrame{ .kind = .write_cache, .index = 0 }).encode();
     ipc_rl.sendCtl(sock, &claim_frame, fds.claim) catch |e| {

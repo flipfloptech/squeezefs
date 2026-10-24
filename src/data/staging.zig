@@ -2555,6 +2555,24 @@ pub const Ring = if (builtin.os.tag == .linux) struct {
             return .{ .memfd = memfd, .claim = own_claim, .mapped = mapped, .verdict = verdict, .found = found };
         }
 
+        /// Whether another holds this member's claim (a supervisor of a
+        /// dead predecessor, or a live mount): a free name is bound and
+        /// dropped at once; a held one is retried for the handover's bound
+        /// (a supervisor discarding an empty ring frees it within it). Never
+        /// connects: a connect takes the ring from its holder.
+        pub fn claimHeld(ours: Marker) BindError!bool {
+            var tries: u32 = 0;
+            while (true) : (tries += 1) {
+                if (try tryClaim(ours)) |fd| {
+                    _ = linux.close(fd);
+                    return false;
+                }
+                if (tries == CLAIM_RETRIES) return true;
+                const ts: linux.timespec = .{ .sec = 0, .nsec = @intCast(CLAIM_RETRY_NS) };
+                _ = linux.nanosleep(&ts, null);
+            }
+        }
+
         /// The image: the memfd past the marker's grain.
         pub fn image(self: *Ram) []align(std.heap.page_size_min) u8 {
             return @alignCast(self.mapped.map[HEADER..]);

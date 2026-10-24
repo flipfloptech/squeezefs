@@ -207,6 +207,10 @@ pub const stats = struct {
     pub var data_volumes: counters.Gauge = .{};
     /// `data_staging_on`: 1 when the write cache is bound.
     pub var data_staging_on: counters.Gauge = .{};
+    /// `write_cache_off_unsupervised`: 1 on a mount no supervisor holds a
+    /// ring for — the write cache is off by law (charter §6.1, decision
+    /// 0003 §BQ.6).
+    pub var write_cache_off_unsupervised: counters.Gauge = .{};
     /// `layout_map_merges`: ONE transaction per `MapSeam.merge`.
     pub var layout_map_merges: counters.ShardedCounter = .{};
     pub var layout_map_merge_blocks: counters.ShardedCounter = .{};
@@ -338,7 +342,7 @@ pub const stats = struct {
 
 pub fn writeStatsJson(w: *Io.Writer) Io.Writer.Error!void {
     try w.writeAll("{");
-    inline for (.{ "data_volumes", "data_staging_on", "block_refs_drift_rows" }) |name| {
+    inline for (.{ "data_volumes", "data_staging_on", "write_cache_off_unsupervised", "block_refs_drift_rows" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, @field(stats, name).load() });
     }
     inline for (.{ "layout_map_merges", "layout_map_merge_blocks", "layout_map_merge_failures", "layout_map_commit_failures", "layout_map_merge_clipped_blocks", "layout_map_merges_shipped", "foreign_publish_kvmap_refusals", "layout_publishes_served", "layout_map_punches", "layout_shifts", "layout_shift_refusals", "kvmap_sweep_spawn_refusals", "promotions_run", "promotions_stale", "promotions_failed", "promotions_enospc", "promotions_replaced", "promotions_restaged", "recall_promotions", "recall_promotion_failures", "own_block_dmas", "own_block_dma_bytes", "promotion_barriers", "staged_point_hits", "staged_point_misses", "promotion_barriers_coalesced", "promotion_barrier_write_through_skips", "held_stores", "held_store_bytes", "held_store_failures", "hold_gate_admits", "hold_gate_overlay_admits", "hold_gate_declines", "prefetch_fibers", "prefetch_fiber_refusals", "hold_ceremony_fibers", "bindings_freed", "device_read_bounces", "data_device_read_bytes", "write_side_read_dma_bytes", "compose_read_dma_bytes", "pack_read_dma_bytes" }) |name| {
@@ -365,7 +369,7 @@ pub const HeldStoreFace = struct {
 };
 
 const Staging = struct {
-    /// The write cache's memfd (every mount, sized by
+    /// The write cache's memfd (every supervised mount, sized by
     /// `SQUEEZEFS_WRITE_CACHE_PCT`), the member's claim held for its life
     /// (0003 §T.1).
     ram: staging.Ring.Ram,
@@ -435,9 +439,17 @@ pub const Options = struct {
     derived_next: ?transform.DerivedKey = null,
     /// The level-1 guard table the warm ladder try-locks.
     guards: *op_guard.Table,
+    /// A MOUNT's plane (null: a verb's — fsck, a tool — which judges the
+    /// device alone). `unsupervised`: no supervisor would hold this
+    /// mount's ring across a crash, so the write cache is off by law
+    /// (charter §6.1, decision 0003 §BQ.6). A mount without a write cache
+    /// still meets this member's ring if a supervisor holds one from a
+    /// crashed predecessor: it refuses to open rather than serve those
+    /// residents' files without them.
+    mount: ?struct { unsupervised: bool } = null,
 };
 
-pub const OpenError = error{ OutOfMemory, DeviceRefused, IdentityMismatch, Io, StagingRefused, StagingOwnerLive, StagingForeignOwner, TransformRefused, ReclaimRefused, InlineMaxAboveFormatBound };
+pub const OpenError = error{ OutOfMemory, DeviceRefused, IdentityMismatch, Io, StagingRefused, StagingOwnerLive, StagingForeignOwner, StagingHeldForSuccessor, TransformRefused, ReclaimRefused, InlineMaxAboveFormatBound };
 
 pub const DataPlane = struct {
     /// The (3.7) guard kv_fs holds across a truncate / corpse transaction.
@@ -731,10 +743,17 @@ pub const DataPlane = struct {
         } else if (opts.write_cache_bytes >= WRITE_CACHE_FLOOR and opened > 0) {
             try self.openWriteCache(gpa, opts);
         } else {
-            log.info("data plane: no write cache (SQUEEZEFS_WRITE_CACHE_PCT yields {d} B, under the {d} MiB floor) — staging is OFF: a write ≤ inline_max ({d} B) stays inline, anything larger goes STRIPED (no packed layout, no promotion pass at dismount)", .{ opts.write_cache_bytes, WRITE_CACHE_FLOOR / derive.MiB, inline_max });
+            const unsupervised = if (opts.mount) |m| m.unsupervised and knobs.optIntKnob("SQUEEZEFS_WRITE_CACHE_PCT", u64, opts.env) == null else false;
+            if (unsupervised) {
+                log.info("data plane: no supervisor holds a write cache's ring: the write cache is off — staging is OFF: a write ≤ inline_max ({d} B) stays inline, anything larger goes STRIPED (no packed layout, no promotion pass at dismount); `--daemon --supervise` mounts with it", .{inline_max});
+            } else {
+                log.info("data plane: no write cache (SQUEEZEFS_WRITE_CACHE_PCT yields {d} B, under the {d} MiB floor) — staging is OFF: a write ≤ inline_max ({d} B) stays inline, anything larger goes STRIPED (no packed layout, no promotion pass at dismount)", .{ opts.write_cache_bytes, WRITE_CACHE_FLOOR / derive.MiB, inline_max });
+            }
+            if (opts.mount != null and opened > 0) try self.refuseHeldRing(opts);
         }
         errdefer self.closeStaging();
         stats.data_staging_on.set(@intFromBool(self.stage != null));
+        stats.write_cache_off_unsupervised.set(@intFromBool(if (opts.mount) |m| m.unsupervised else false));
 
         // 5. The read path over the plane's seams.
         var rcfg = read_path.Config.fromEnv(opts.env, cfg.block_size, self.passthrough, opts.facts, opts.budget_bytes);
@@ -1167,6 +1186,23 @@ pub const DataPlane = struct {
         budget.authority.register(staging.cellStateComponent());
         budget.authority.register(staging.tablesComponent());
         log.info("write cache: {d} MiB in a sealed memfd (SQUEEZEFS_WRITE_CACHE_PCT of system RAM under the budget; fsync promotes; LRU over {d} shard(s)), recovered {d} record(s) ({d} B), {d} torn, {d} superseded", .{ r.capacity() >> 20, shards, rep.adopted, rep.bytes, rep.torn, rep.superseded });
+    }
+
+    /// A mount without a write cache over this member's claim: a
+    /// supervisor holding the ring of a crashed predecessor (residents its
+    /// files' layouts name) refuses the open — its files would read zeros
+    /// without them, and the supervised successor that recovers them is
+    /// one mount away (decision 0003 §BQ.6). The probe binds and drops the
+    /// claim; it never connects (a connect takes the ring from its holder).
+    fn refuseHeldRing(self: *DataPlane, opts: Options) OpenError!void {
+        const ours = stagingOwnerMarker(self.backend, opts.member_identity);
+        const held = staging.Ring.Ram.claimHeld(ours) catch |e| {
+            log.err("write cache of mount slot {x:0>8}: cannot probe the member's claim ({s})", .{ ours.mount_slot, @errorName(e) });
+            return error.StagingRefused;
+        };
+        if (!held) return;
+        log.err("write cache of mount slot {x:0>8} member {x:0>16}: a supervisor holds this member's ring from a crashed mount — its residents are acked writes this mount, without a write cache, cannot serve; refusing: mount the set `--daemon --supervise` with the write cache on to recover them (or kill that supervisor to discard them)", .{ ours.mount_slot, ours.member });
+        return error.StagingHeldForSuccessor;
     }
 
     /// The smallest shard of the write cache: a shard must hold a few

@@ -43,6 +43,12 @@
 //! a thread. A window from another thread (the tests' submitters) reaches
 //! the fiber through the bounded inbound queue and one coalesced wake.
 //!
+//! An `fsync` takes no cell: it is a waiter on the lane's barrier sequence
+//! (`BarrierWaiter`, a node on its caller's frame, pushed on an unbounded
+//! inbox) — every fsync admitted between two barrier starts shares the one
+//! barrier that covers their landings, so an fsync storm waits and never
+//! meets a full lane (decision 0003 §BO.1).
+//!
 //! Two writer classes share the ONE reservation core: user windows (the
 //! conveyor's; stage B's groups, acks and barriers) and STRUCTURAL entries
 //! (the SMO task's and the rollback's compensation — `submitStructural`):
@@ -144,12 +150,12 @@ pub fn inboundCap(pages: u64) usize {
 /// The windows' share of the cells, on a free list of its own: the
 /// conveyor admits at most `windowCells − 1` windows in flight (one more
 /// cell sits between a window's terminal hook and its give-back), so a
-/// window's submit never meets an empty pool; barriers and structural
-/// entries take the other half and wait (or refuse, retryable) on their
-/// own — a storm of them can never take a window's cell (a window
-/// refused at its handoff is the `meta_conveyor_pass_panics` tripwire).
-/// Half: the 128-cell floor ring's user slice admits ≤ 61 windows, under
-/// the share's 63, and the requests keep 64 cells.
+/// window's submit never meets an empty pool; structural entries take the
+/// other half and wait on their own — never a window's cell (a window
+/// refused at its handoff is the `meta_conveyor_pass_panics` tripwire). A
+/// barrier takes no cell at all (`BarrierWaiter`). Half: the 128-cell
+/// floor ring's user slice admits ≤ 61 windows, under the share's 63, and
+/// the structural entries keep 64 cells.
 pub fn windowCells(pages: u64) usize {
     return inboundCap(pages) / 2;
 }
@@ -469,7 +475,6 @@ const Kind = enum(u8) {
     window,
     /// A structural entry: answered when its runs landed.
     structural,
-    barrier,
 };
 
 /// One request = one cell: the caller fills it, publishes it, parks on
@@ -496,12 +501,6 @@ const Cell = struct {
     landed: bool = false,
     landed_ns: u64 = 0,
     verdict: Error!void = {},
-    /// A barrier request: the ticket of the barrier that satisfies it.
-    need_barrier: u64 = 0,
-    /// A barrier request (§BB.4): the position every window admitted
-    /// before it ends by — the barrier that answers it must have started
-    /// with every pending window below this landed.
-    cover_upto: u64 = 0,
     /// The ONE completion cell (`sync/completion.zig`): pending until the
     /// lane publishes the outcome.
     done: completion.Completion(Outcome) = .{},
@@ -521,8 +520,6 @@ const Cell = struct {
         self.landed = false;
         self.landed_ns = 0;
         self.verdict = {};
-        self.need_barrier = 0;
-        self.cover_upto = 0;
     }
 };
 
@@ -542,21 +539,7 @@ pub const Ticket = struct {
     /// futex.
     pub fn wait(self: Ticket) Outcome {
         const c = &self.lane.cells[self.cell];
-        const o = if (self.lane.onLaneThread()) blk: {
-            const f = exec_lane.currentFiber().?;
-            c.waiter = f;
-            while (c.done.poll() == null) f.park();
-            c.waiter = null;
-            break :blk c.done.poll().?;
-        } else if (self.lane.wait_io) |io| blk: {
-            // The only route ever installed is `SqzIo`'s, whose futex face
-            // parks exactly the fibers `currentFiber` names.
-            if (exec_lane.currentFiber() != null) stats.wait_fiber_parks.inc() else stats.wait_raw_parks.inc();
-            break :blk c.done.waitIo(io);
-        } else blk: {
-            stats.wait_raw_parks.inc();
-            break :blk c.done.wait();
-        };
+        const o = awaitOutcome(self.lane, &c.done, &c.waiter);
         self.lane.freeCell(self.cell);
         return o;
     }
@@ -568,6 +551,71 @@ pub const Ticket = struct {
         return o;
     }
 };
+
+/// An fsync's place in the lane's barrier sequence (decision 0003 §BO.1):
+/// a node on the CALLER's frame, never a cell. `requestBarrier` pushes it
+/// on the lane's fsync inbox (one CAS); the lane's next scan stamps it
+/// with the next barrier's ticket and the cover of every window admitted
+/// so far and links it on the waiter list; the first barrier that started
+/// after it with that cover landed answers it. Every fsync admitted
+/// between two barrier starts shares that one barrier: an fsync needs a
+/// barrier that covers its landing, not a barrier of its own — so it takes
+/// nothing bounded and never meets a full lane. It waits; it never
+/// refuses (a refusal reached fsync(2) as EAGAIN, an errno POSIX fsync
+/// never answers and no application retries). The node must stay put
+/// from `requestBarrier` until `wait` returns or `poll` answers.
+pub const BarrierWaiter = struct {
+    lane: ?*JournalLane = null,
+    /// The inbox's link, then (lane thread only) the waiter list's.
+    next: ?*BarrierWaiter = null,
+    /// Lane thread only: the ticket of the barrier that satisfies it — a
+    /// barrier STARTED after the admission (one in flight may predate a
+    /// landing the fsync must cover).
+    need_barrier: u64 = 0,
+    /// Lane thread only (§BB.4): the position every window admitted before
+    /// it ends by — the barrier that answers it must have started with
+    /// every pending window below this landed.
+    cover_upto: u64 = 0,
+    /// A waiter that is a fiber on THIS lane (set by `wait` before it
+    /// parks, read by the lane's answer — one thread).
+    waiter: ?*Fiber = null,
+    done: completion.Completion(Outcome) = .{},
+
+    /// Park until the outcome, by the ticket's routes (`awaitOutcome`).
+    pub fn wait(self: *BarrierWaiter) Outcome {
+        return awaitOutcome(self.lane.?, &self.done, &self.waiter);
+    }
+
+    /// Non-blocking: null while the lane has not answered.
+    pub fn poll(self: *const BarrierWaiter) ?Outcome {
+        return self.done.poll();
+    }
+};
+
+/// Park until `done` is published: a fiber on the lane's own thread parks
+/// as a fiber (the lane keeps reaping — its own CQE is what answers it);
+/// any other caller parks through the lane's wait route
+/// (`JournalLane.wait_io`): a fiber on ANOTHER lane alone, in the
+/// executor's futex table (its lane thread runs the fibers homed there for
+/// the whole wait), a raw thread on the counted kernel wait; a lane
+/// without a route parks the caller thread on the raw futex.
+fn awaitOutcome(lane: *JournalLane, done: *completion.Completion(Outcome), waiter: *?*Fiber) Outcome {
+    if (lane.onLaneThread()) {
+        const f = exec_lane.currentFiber().?;
+        waiter.* = f;
+        while (done.poll() == null) f.park();
+        waiter.* = null;
+        return done.poll().?;
+    }
+    if (lane.wait_io) |io| {
+        // The only route ever installed is `SqzIo`'s, whose futex face
+        // parks exactly the fibers `currentFiber` names.
+        if (exec_lane.currentFiber() != null) stats.wait_fiber_parks.inc() else stats.wait_raw_parks.inc();
+        return done.waitIo(io);
+    }
+    stats.wait_raw_parks.inc();
+    return done.wait();
+}
 
 // ---------------------------------------------------------------------------
 // The lane.
@@ -610,12 +658,18 @@ pub const JournalLane = struct {
     /// The thread, the ring, the park, the timers.
     lane: *Lane,
     /// Cells `[0, window_cells)` serve windows (`free_windows`), the rest
-    /// barriers and structural entries (`free_cells`) — `windowCells`.
+    /// structural entries (`free_cells`) — `windowCells`; an fsync takes
+    /// none (`fsync_inbox`).
     cells: []Cell,
     window_cells: u32,
     free_windows: mpmc.BoundedMpmc(u32),
     free_cells: mpmc.BoundedMpmc(u32),
     inbound: mpmc.BoundedMpmc(u32),
+    /// Foreign fsyncs not yet admitted (`BarrierWaiter`): a Treiber stack
+    /// the callers push (release CAS) and the stage-B fiber's scan takes
+    /// whole (acquire swap) — push-only producers and a take-all consumer,
+    /// so no ABA. Unbounded by construction: the nodes are the callers'.
+    fsync_inbox: std.atomic.Value(?*BarrierWaiter) = .init(null),
     /// Refuses new submitters (SeqCst — Dekker with `inflight_submitters`).
     closing: std.atomic.Value(bool) = .init(false),
     /// Producers inside `publish`. The closer waits for 0 before sealing.
@@ -860,17 +914,33 @@ pub const JournalLane = struct {
         return self.publish(idx);
     }
 
-    /// `fsync`: the trailing coalesced barrier — answered once a barrier
-    /// that STARTED after this request completed (one already in flight may
-    /// predate a landing it must cover, so the request waits for the next).
-    pub fn requestBarrier(self: *JournalLane) Error!Ticket {
+    /// `fsync`: enlist `waiter` (`BarrierWaiter`, the caller's) for the
+    /// trailing coalesced barrier — answered once a barrier that STARTED
+    /// after the lane admitted it completed with every window admitted
+    /// before it landed (§BB.4); the outcome is `waiter.wait()`'s. Refusals
+    /// answer here: a FAILED volume, a stopped lane — never a full one.
+    pub fn requestBarrier(self: *JournalLane, waiter: *BarrierWaiter) Error!void {
         if (self.latch.isFailed()) return error.VolumeFailed;
-        const idx = self.acquireCell() orelse {
-            stats.queue_full.inc();
-            return error.LaneQueueFull;
-        };
-        self.cells[idx].resetAs(.barrier);
-        return self.publish(idx);
+        waiter.* = .{ .lane = self };
+        // SeqCst RMW: pairs with `shutdown`'s SeqCst `closing` store +
+        // `inflight_submitters` load (`publish`'s Dekker): a push the
+        // closer did not see precedes its seal.
+        _ = self.inflight_submitters.fetchAdd(1, .seq_cst);
+        defer _ = self.inflight_submitters.fetchSub(1, .release);
+        if (self.closing.load(.seq_cst)) return error.LaneStopped;
+        if (self.onLaneThread()) {
+            // The inbox is scanned only by the parked fiber: a lane-thread
+            // caller is admitted at once (`publish`'s reason).
+            self.admitBarriers(waiter);
+        } else {
+            // Release: the node's fill is visible to the scan's acquire swap.
+            var head = self.fsync_inbox.load(.monotonic);
+            while (true) {
+                waiter.next = head;
+                head = self.fsync_inbox.cmpxchgWeak(head, waiter, .release, .monotonic) orelse break;
+            }
+        }
+        self.wakeFiber();
     }
 
     /// Wake the stage-B fiber without a message: the contract of every
@@ -900,8 +970,7 @@ pub const JournalLane = struct {
         }
     }
 
-    /// A barrier's or a structural entry's cell: never one of the windows'
-    /// (`windowCells`).
+    /// A structural entry's cell: never one of the windows' (`windowCells`).
     fn acquireCell(self: *JournalLane) ?u32 {
         return self.free_cells.tryPop();
     }
@@ -1067,16 +1136,8 @@ pub const JournalLane = struct {
     // ---- admission (lane thread) ----
 
     fn admit(self: *JournalLane, idx: u32) void {
-        const w = &self.w;
         const c = &self.cells[idx];
         switch (c.kind) {
-            .barrier => {
-                c.need_barrier = w.barriers_started + 1;
-                c.cover_upto = self.coverNow();
-                w.fsync_waiters.appendAssumeCapacity(idx);
-                w.needs_flush = true;
-                w.flush_due_ns = 0;
-            },
             .window => {
                 stats.lane_writes.inc();
                 LaneStats.bump(&self.stats.lane_writes);
@@ -1278,7 +1339,12 @@ pub const JournalLane = struct {
             // Acquire pairs with `shutdown`'s release: every push ordered
             // before the seal is visible to this scan.
             const sealed = self.sealed.load(.acquire);
+            // The fsyncs taken BEFORE the inbound scan and admitted after
+            // it: a window its submitter pushed before its fsync is
+            // admitted first, so the fsync's cover names it (§BB.4).
+            const fsyncs = self.fsync_inbox.swap(null, .acquire);
             while (self.inbound.tryPop()) |idx| self.admit(idx);
+            self.admitBarriers(fsyncs);
             if (sealed) w.disconnected = true;
             if (test_seams.kill_ring.swap(0, .acq_rel) != 0) self.failAll(error.RingFailed);
             var now = clock.monotonicNs();
@@ -1513,10 +1579,48 @@ pub const JournalLane = struct {
 
     /// The oldest fsync request's cover (∞ with no waiter).
     fn firstCover(self: *JournalLane) u64 {
-        const w = &self.w;
         var cover: u64 = std.math.maxInt(u64);
-        for (w.fsync_waiters.items) |idx| cover = @min(cover, self.cells[idx].cover_upto);
+        var it = self.w.fsync_waiters;
+        while (it) |n| : (it = n.next) cover = @min(cover, n.cover_upto);
         return cover;
+    }
+
+    /// Admit the fsyncs of `list` (lane thread): each is stamped with the
+    /// next barrier's ticket and the cover of every window admitted so far
+    /// and linked on the waiter list; the coalesced barrier is pulled to
+    /// now. One stamp serves the whole list: the fsyncs admitted between
+    /// two barrier starts share one barrier.
+    fn admitBarriers(self: *JournalLane, list: ?*BarrierWaiter) void {
+        var it = list orelse return;
+        const w = &self.w;
+        const need = w.barriers_started + 1;
+        const cover = self.coverNow();
+        while (true) {
+            const next = it.next;
+            it.need_barrier = need;
+            it.cover_upto = cover;
+            it.next = w.fsync_waiters;
+            w.fsync_waiters = it;
+            w.fsync_count += 1;
+            it = next orelse break;
+        }
+        w.needs_flush = true;
+        w.flush_due_ns = 0;
+    }
+
+    /// Publish an fsync's outcome. The node lives on its waiter's frame, so
+    /// every read of it precedes the publish (a foreign waiter may return
+    /// the instant it sees the value); the wake after it names only the
+    /// futex word's address — a spurious wake of a reused frame at worst,
+    /// which every futex waiter re-checks.
+    fn answerBarrier(self: *JournalLane, n: *BarrierWaiter, result: Error!void, now: u64) void {
+        const w = &self.w;
+        w.ack_seq += 1;
+        LaneStats.bump(&self.stats.acks);
+        const fiber = n.waiter;
+        const outcome: Outcome = .{ .result = result, .ack_seq = w.ack_seq, .landed_ns = now, .acked_ns = now };
+        _ = if (self.wait_io) |io| n.done.completeIo(io, outcome) else n.done.complete(outcome);
+        if (fiber) |f| if (f.state.wake()) self.lane.enqueue(f);
     }
 
     fn maybeStartCoalescedBarrier(self: *JournalLane, now: u64) void {
@@ -1526,7 +1630,7 @@ pub const JournalLane = struct {
         // admitted before the request landed — the FSYNC must follow their
         // CQEs (the ring orders nothing between SQEs); the landing's CQE
         // wakes this fiber, so the hold is no tick's.
-        if (w.fsync_waiters.items.len != 0 and self.firstCover() > self.landedFloor()) {
+        if (w.fsync_waiters != null and self.firstCover() > self.landedFloor()) {
             w.flush_held_for_cover = true;
             return;
         }
@@ -1592,23 +1696,22 @@ pub const JournalLane = struct {
             w.group_barrier_out = result;
             w.phase = .ack;
         }
-        var i: usize = 0;
-        while (i < w.fsync_waiters.items.len) {
-            const idx = w.fsync_waiters.items[i];
-            const c = &self.cells[idx];
+        var link: *?*BarrierWaiter = &w.fsync_waiters;
+        while (link.*) |n| {
             // Started after the request AND after every window the request
             // covers landed (§BB.4); else the next barrier is its.
-            if (c.need_barrier > w.barriers_done or c.cover_upto > w.barrier_floor) {
-                i += 1;
+            if (n.need_barrier > w.barriers_done or n.cover_upto > w.barrier_floor) {
+                link = &n.next;
                 continue;
             }
-            _ = w.fsync_waiters.swapRemove(i);
+            link.* = n.next;
+            w.fsync_count -= 1;
             // A volume FAILED under the request (a write that failed after
             // its ack, §BB.5): the fsync hears it, as ext4's does after a
             // journal abort.
-            self.publishAck(c, if (self.latch.isFailed()) error.VolumeFailed else result, now);
+            self.answerBarrier(n, if (self.latch.isFailed()) error.VolumeFailed else result, now);
         }
-        if (w.fsync_waiters.items.len != 0) {
+        if (w.fsync_waiters != null) {
             w.needs_flush = true;
             w.flush_due_ns = 0;
         }
@@ -1664,8 +1767,10 @@ const Worker = struct {
     /// lane's start (so the first period is measured from spawn, never from
     /// the monotonic clock's zero).
     last_barrier_ns: u64,
-    /// Barrier-request cells awaiting their ticket.
-    fsync_waiters: std.ArrayList(u32),
+    /// Admitted fsyncs awaiting their barrier (`BarrierWaiter`, linked
+    /// through `next`; the callers' nodes) and their count.
+    fsync_waiters: ?*BarrierWaiter = null,
+    fsync_count: usize = 0,
     /// Cells admitted under the `delay_issue` seam, issued when it clears.
     delayed_issue: std.ArrayList(u32),
     disconnected: bool = false,
@@ -1685,10 +1790,8 @@ const Worker = struct {
         errdefer pending.deinit(gpa);
         var group = try std.ArrayList(u32).initCapacity(gpa, cells);
         errdefer group.deinit(gpa);
-        var fsync_waiters = try std.ArrayList(u32).initCapacity(gpa, cells);
-        errdefer fsync_waiters.deinit(gpa);
         const delayed_issue = try std.ArrayList(u32).initCapacity(gpa, cells);
-        return .{ .slots = slots, .free_slots = free_slots, .pending = pending, .group = group, .fsync_waiters = fsync_waiters, .delayed_issue = delayed_issue, .last_barrier_ns = clock.monotonicNs() };
+        return .{ .slots = slots, .free_slots = free_slots, .pending = pending, .group = group, .delayed_issue = delayed_issue, .last_barrier_ns = clock.monotonicNs() };
     }
 
     fn deinit(w: *Worker, gpa: Allocator) void {
@@ -1696,12 +1799,11 @@ const Worker = struct {
         w.free_slots.deinit(gpa);
         w.pending.deinit(gpa);
         w.group.deinit(gpa);
-        w.fsync_waiters.deinit(gpa);
         w.delayed_issue.deinit(gpa);
     }
 
     fn owesWork(w: *const Worker) bool {
-        return w.owesCompletion() or w.needs_flush or w.fsync_waiters.items.len != 0;
+        return w.owesCompletion() or w.needs_flush or w.fsync_waiters != null;
     }
 
     /// Everything a poll's scan + stage B can move: unequal keys across a
@@ -1728,7 +1830,7 @@ const Worker = struct {
             .group = w.group.items.len,
             .barrier_in_flight = w.barrier_in_flight != null,
             .barrier_landed = w.barrier_landed,
-            .fsync_waiters = w.fsync_waiters.items.len,
+            .fsync_waiters = w.fsync_count,
             .ack_seq = w.ack_seq,
             .barriers_done = w.barriers_done,
             .disconnected = w.disconnected,
@@ -2030,7 +2132,8 @@ test "the lane thread is sqz-jrnl<N> in /proc, an exec.Lane of the journal class
     lane.shutdown();
     try testing.expectEqual(live_before, stats.lanes_live.load());
     // Every op after the stop answers the stopped class.
-    try testing.expectError(error.LaneStopped, lane.requestBarrier());
+    var stopped: BarrierWaiter = .{};
+    try testing.expectError(error.LaneStopped, lane.requestBarrier(&stopped));
     try testing.expectEqual(@as(u64, 0), lane.snapshot().tick_rescues);
 }
 
@@ -2094,7 +2197,8 @@ test "strict cadence: ONE barrier per group before any ack; the k-th ack sees k 
     }
     try testing.expectEqual(strict_before + 5, stats.barriers_strict.load());
     // An fsync on the strict cadence is the trailing barrier: one more.
-    const t = try lane.requestBarrier();
+    var t: BarrierWaiter = .{};
+    try lane.requestBarrier(&t);
     try t.wait().result;
     try testing.expectEqual(@as(u64, 1), lane.snapshot().barriers_coalesced);
     try testing.expectEqual(@as(u64, 0), lane.snapshot().barrier_failures);
@@ -2114,11 +2218,13 @@ test "coalesced cadence: acks precede the barrier; an fsync request is answered 
         try testing.expectEqual(@as(u64, 0), lane.snapshot().barriers_strict);
         try testing.expectEqual(@as(u64, 0), lane.snapshot().barriers_coalesced);
     }
-    const t = try lane.requestBarrier();
+    var t: BarrierWaiter = .{};
+    try lane.requestBarrier(&t);
     try t.wait().result;
     try testing.expectEqual(@as(u64, 1), lane.snapshot().barriers_coalesced);
     // Nothing acked since: a second request still pays its own trailing barrier.
-    const t2 = try lane.requestBarrier();
+    var t2: BarrierWaiter = .{};
+    try lane.requestBarrier(&t2);
     try t2.wait().result;
     try testing.expectEqual(@as(u64, 2), lane.snapshot().barriers_coalesced);
     lane.shutdown();
@@ -2154,7 +2260,8 @@ test "§BB.4: a barrier an fsync pulls while a window admitted before it is stil
     const parks0 = lane.snapshot().parks;
     const win = try h.append(3, 400, 0xC0);
     // An fsync behind it: its barrier must wait.
-    const t = try lane.requestBarrier();
+    var t: BarrierWaiter = .{};
+    try lane.requestBarrier(&t);
     spinUntil(struct {
         l: *JournalLane,
         p0: u64,
@@ -2179,40 +2286,82 @@ test "§BB.4: a barrier an fsync pulls while a window admitted before it is stil
     try testing.expectEqual(@as(usize, 1), rec.entries.len);
 }
 
-test "the windows' cells are their own: barrier requests held behind an un-landed window take every request cell and the next is refused (retryable), yet windows still find a cell each up to the windows' share; the landing answers every one" {
-    const h = try Harness.init(testing.allocator, "window-cells");
+// The window gate's report (0003 §BN): a barrier past the request half of
+// the cells answered `LaneQueueFull`, which the backend mapped to EAGAIN
+// for the application's fsync(2) — an errno POSIX fsync never answers and
+// no application retries. A database's or a parallel build's fsyncs on
+// one floor-ring lane reach 65.
+test "THE FSYNC STORM: every request cell's worth of fsyncs and 64 more, each from its own thread, held behind an un-landed window (§BB.4) — none is refused (an fsync waits for a barrier that covers its landing, it never answers EAGAIN), the windows still find a cell each up to their share, and the landing answers every fsync Ok" {
+    const h = try Harness.init(testing.allocator, "fsync-storm");
     defer h.deinit();
     try h.spawnLane(.{}, "600000", 0);
     const lane = h.lane.?;
     test_seams.delay_issue.store(1, .release);
     defer test_seams.delay_issue.store(0, .release);
-    // A window un-landed: every barrier requested behind it waits (§BB.4).
+    // A window un-landed: every fsync requested behind it waits (§BB.4).
     const first = try h.append(1, 400, 0xA0);
-    var barriers: std.ArrayList(Ticket) = .empty;
-    defer barriers.deinit(testing.allocator);
-    // Every exit answers what it holds: the device first, then the tickets.
+    const n_fsyncs = lane.cells.len - lane.windowCellCount() + 64;
+    const Fsync = struct {
+        lane: *JournalLane,
+        issued: *std.atomic.Value(usize),
+        result: Error!void = {},
+
+        fn run(self: *@This()) void {
+            var t: BarrierWaiter = .{};
+            self.lane.requestBarrier(&t) catch |e| {
+                self.result = e;
+                _ = self.issued.fetchAdd(1, .acq_rel);
+                return;
+            };
+            _ = self.issued.fetchAdd(1, .acq_rel);
+            self.result = t.wait().result;
+        }
+    };
+    var issued: std.atomic.Value(usize) = .init(0);
+    const fsyncs = try testing.allocator.alloc(Fsync, n_fsyncs);
+    defer testing.allocator.free(fsyncs);
+    const threads = try testing.allocator.alloc(std.Thread, n_fsyncs);
+    defer testing.allocator.free(threads);
     var windows: std.ArrayList(Ticket) = .empty;
     defer windows.deinit(testing.allocator);
+    // Every exit answers what it holds: the device first, then the
+    // windows' tickets, then the fsync threads.
+    var spawned: usize = 0;
     var answered = false;
     defer if (!answered) {
         test_seams.delay_issue.store(0, .release);
         _ = first.ticket.wait();
         for (windows.items) |t| _ = t.wait();
-        for (barriers.items) |t| _ = t.wait();
+        for (threads[0..spawned]) |t| t.join();
     };
-    // The storm: barriers until the lane refuses one.
-    while (lane.requestBarrier()) |t| {
-        try barriers.append(testing.allocator, t);
-    } else |e| try testing.expectEqual(error.LaneQueueFull, e);
-    try testing.expectEqual(lane.cells.len - lane.windowCellCount(), barriers.items.len);
-    // Windows beside it: the share minus the one already held, every one
+    for (fsyncs, threads) |*f, *t| {
+        f.* = .{ .lane = lane, .issued = &issued };
+        t.* = try std.Thread.spawn(.{ .stack_size = 4 << 20 }, Fsync.run, .{f});
+        spawned += 1;
+    }
+    spinUntil(struct {
+        n: usize,
+        issued: *std.atomic.Value(usize),
+        fn ready(s: @This()) bool {
+            return s.issued.load(.acquire) == s.n;
+        }
+    }{ .n = n_fsyncs, .issued = &issued });
+    // Windows beside them: the share minus the one already held, every one
     // admitted.
     for (1..lane.windowCellCount()) |i| try windows.append(testing.allocator, (try h.append(1 + i, 400, 0xB0)).ticket);
     test_seams.delay_issue.store(0, .release);
     answered = true;
     try first.ticket.wait().result;
     for (windows.items) |t| try t.wait().result;
-    for (barriers.items) |t| try t.wait().result;
+    for (threads) |t| t.join();
+    var refused: usize = 0;
+    for (fsyncs, 0..) |f, i| f.result catch |e| {
+        if (refused == 0) std.debug.print("\nfsync storm: fsync {d} answered {t}\n", .{ i, e });
+        refused += 1;
+    };
+    try testing.expectEqual(@as(usize, 0), refused);
+    std.debug.print("\nfsync storm: {d} fsyncs behind {d} windows answered by {d} coalesced barriers\n", .{ n_fsyncs, lane.windowCellCount(), lane.snapshot().barriers_coalesced });
+    try testing.expect(lane.snapshot().barriers_coalesced >= 1);
 }
 
 /// The DUR-3 faces as a ticket counter: `started` hands out 1, 2, …;
@@ -2256,7 +2405,8 @@ test "DUR-3 hooks: every lane barrier (strict group, coalesced, fsync) takes a s
         try testing.expectEqual(k, d3.landed.load(.acquire));
         try testing.expectEqual(k, d3.last_landed.load(.acquire));
     }
-    const t = try lane.requestBarrier();
+    var t: BarrierWaiter = .{};
+    try lane.requestBarrier(&t);
     try t.wait().result;
     try testing.expectEqual(@as(u64, 4), d3.started.load(.acquire));
     try testing.expectEqual(@as(u64, 4), d3.landed.load(.acquire));
@@ -2349,7 +2499,8 @@ test "three consecutive journal-write failures latch the volume FAILED; every la
     const r = try h.reserve(300);
     const ops = try h.build(r, 99, 300, 0x99);
     try testing.expectError(error.VolumeFailed, h.submit(r, ops));
-    try testing.expectError(error.VolumeFailed, lane.requestBarrier());
+    var refused: BarrierWaiter = .{};
+    try testing.expectError(error.VolumeFailed, lane.requestBarrier(&refused));
     try testing.expectError(error.VolumeFailed, lane.submitStructural(ops));
     // The refused window's reservation is still the caller's to complete.
     h.reg.complete(&h.core, r.res);
@@ -2761,7 +2912,8 @@ test "a dead ring latches the volume FAILED at once (a device fence is terminal)
     try testing.expect(lane.isFailed());
     try testing.expectEqual(dead0 + 1, stats.rings_dead.load());
     try testing.expectEqual(failed0 + 1, stats.volumes_failed.load());
-    try testing.expectError(error.VolumeFailed, lane.requestBarrier());
+    var refused: BarrierWaiter = .{};
+    try testing.expectError(error.VolumeFailed, lane.requestBarrier(&refused));
     lane.shutdown();
     try testing.expectEqual(@as(usize, 2), lane.testErrorLogsFired());
     try testing.expect(!lane.execLane().alive.load(.acquire));
@@ -2794,7 +2946,8 @@ test "a same-lane fiber's ticket wait is a fiber park: a fiber on the journal la
             if (j.lane.submitStructural(j.ops)) |t| {
                 j.structural_ok = if (t.wait().result) |_| true else |_| false;
             } else |_| {}
-            if (j.lane.requestBarrier()) |t| {
+            var t: BarrierWaiter = .{};
+            if (j.lane.requestBarrier(&t)) {
                 j.barrier_ok = if (t.wait().result) |_| true else |_| false;
             } else |_| {}
             j.done.store(1, .release);
@@ -2847,7 +3000,7 @@ test "a fiber on ANOTHER lane waiting on a journal ticket parks only itself: a b
     }{ .f = lane.fiber.? });
 
     // Stage B held at the top of its next poll: the barrier request below
-    // is published, wakes the fiber, and sits in the inbound queue — no
+    // is published, wakes the fiber, and sits in the fsync inbox — no
     // barrier can start, so the fsync's ack is held without a sleep.
     test_seams.held.store(0, .release);
     test_seams.hold_before_scan.store(1, .release);
@@ -2859,7 +3012,8 @@ test "a fiber on ANOTHER lane waiting on a journal ticket parks only itself: a b
     const S = struct {
         /// A handler's fsync from a fiber on a meta lane.
         fn fsync(l: *JournalLane) Error!void {
-            const t = try l.requestBarrier();
+            var t: BarrierWaiter = .{};
+            try l.requestBarrier(&t);
             return t.wait().result;
         }
         /// The bystander on the same lane: runs iff the lane thread is free.

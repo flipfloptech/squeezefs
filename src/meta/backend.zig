@@ -2105,11 +2105,14 @@ pub const KvBackend = struct {
         w.finish(if (outcome.result) |_| {} else |e| mapVerdict(e));
     }
 
+    /// `fsync`: a waiter on the lane's barrier sequence, its node on this
+    /// frame (`journal_lane.BarrierWaiter`) — it waits, never refuses
+    /// (0003 §BO.1).
     fn laneBarrier(ctx: *anyopaque) Error!void {
         const be: *KvBackend = @ptrCast(@alignCast(ctx));
-        const t = be.lane.requestBarrier() catch |e| return mapSubmitError(e);
-        const o = t.wait();
-        o.result catch |e| return mapVerdict(e);
+        var waiter: journal_lane.BarrierWaiter = .{};
+        be.lane.requestBarrier(&waiter) catch |e| return mapSubmitError(e);
+        waiter.wait().result catch |e| return mapVerdict(e);
     }
 
     fn kickPark(ctx: *anyopaque) void {

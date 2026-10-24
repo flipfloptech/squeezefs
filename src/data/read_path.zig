@@ -3152,6 +3152,34 @@ test "inline and packed layouts: inline from the record zero-padded; a packed te
     try log.testing.expectAllFired();
 }
 
+// A file's read(2) has no EAGAIN (decision 0003 §BO's law, the data
+// plane's half): a bounce pool with every slot checked out — more reads in
+// their DMA at once than its headroom — is the module's counted exhaustion,
+// and the read rides an over-capacity backing it serves once.
+test "a packed tenant read while BOTH bounce pools are checked out to the last slot serves byte-exact from an over-capacity bounce — never QueueFull (EAGAIN to a file's read)" {
+    const io = testing.io;
+    const f = try Fixture.init(testing.allocator, .{});
+    defer f.deinit();
+    f.kind = .packed_;
+    f.size = 6000;
+    f.bindings[0] = Mapping.tenant(Fixture.vol_tag, 1 * Fixture.bs, 1, 8192, 6000);
+    f.mint(1);
+    var held: std.ArrayList(struct { pool: *fill_pool.Pool, slot: fill_pool.Slot }) = .empty;
+    defer {
+        for (held.items) |h| _ = h.pool.unpin(h.slot);
+        held.deinit(testing.allocator);
+    }
+    for ([_]*fill_pool.Pool{ f.rp.ranged_bounce, f.rp.pool }) |p| {
+        while (p.acquire()) |slot| try held.append(testing.allocator, .{ .pool = p, .slot = slot });
+    }
+    const exhausted0 = fill_pool.stats.read_fill_pool_exhausted.load();
+    var out: [1000]u8 = undefined;
+    const m = try f.rp.read(io, 7, 5000, 1000, .{ .buf = &out }, .{});
+    try testing.expectEqual(@as(usize, 1000), m);
+    try Fixture.expected(Fixture.bs + 8192 + 5000, &out);
+    try testing.expect(fill_pool.stats.read_fill_pool_exhausted.load() > exhausted0);
+}
+
 test "a framed image SHORTER than its block (a promoted sub-block image, a tail block's image trimmed to its live frames — decision 0003 §AK) reads zeros past its plaintext: a ranged read wholly past it DMAs the header page alone and serves zeros, one straddling its end serves the plaintext then zeros, one inside it is exact — never an EIO under the current binding" {
     const io = testing.io;
     const f = try Fixture.init(testing.allocator, .{ .compression = .lz4, .read_lane = false, .ranged_threshold = derivedRangedThreshold(Fixture.bs) });

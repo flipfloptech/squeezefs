@@ -3924,6 +3924,92 @@ test "the parked-buffer gate, the wall with supply VISIBLE and no space refusal 
     try testing.expect(w.wp.table.has(1, 8));
 }
 
+/// A placed-sever registry of ONE assembly (the interception host's face,
+/// `write_admit.PlacedSeam`): `take` seals it for adoption (once, under the
+/// pointer proof) and marks its token adopted.
+const OnePlacedAssembly = struct {
+    cell: *accumulate.Pool.Cell,
+    rel: u32,
+    len: u32,
+    token: u64,
+    adopted_token: ?u64 = null,
+
+    fn seam(self: *OnePlacedAssembly) PlacedSeam {
+        return .{ .ctx = self, .take = &take, .adopted = &adopted };
+    }
+
+    fn take(ctx: *anyopaque, _: u64, _: u32, rel: u32, ptr: [*]const u8, runs: *[cov.CoverageUnion.max_runs]cov.Run) ?Adoption {
+        const self: *OnePlacedAssembly = @ptrCast(@alignCast(ctx));
+        if (self.adopted_token != null or rel != self.rel or ptr != self.cell.data.ptr + rel) return null;
+        self.adopted_token = self.token;
+        runs[0] = .{ .start = self.rel, .end = self.rel + self.len };
+        return .{ .cell = self.cell.share(), .n_runs = 1 };
+    }
+
+    fn adopted(ctx: *anyopaque, _: u64, _: u32, token: u64) bool {
+        const self: *OnePlacedAssembly = @ptrCast(@alignCast(ctx));
+        return self.adopted_token == token;
+    }
+};
+
+// The interception host's finding: arm G sealed the assembly for adoption
+// (`take` marks its token adopted) BEFORE the adopting checkout, so a full
+// entry table — the `active_block_table_full` "cannot happen" — left the
+// write's retry to ack a no-op with NO entry: its bytes, and every later
+// placed write's of that assembly, lost. A tripwire site must still be safe.
+test "arm G at a full entry table (the active_block_table_full tripwire): a placed write is never acked without its bytes — the assembly is not sealed for an adoption that cannot land; the write lands through the copy path once an entry returns" {
+    const io = testing.io;
+    const w = try World.init(testing.allocator, .sync_inline, false);
+    defer w.deinit(testing.allocator);
+    try w.f.map.create(31, .striped, 0);
+    const cell = w.wp.table.pool.acquire().?;
+    defer w.wp.table.pool.release(cell);
+    fill(cell.data[0 .. wt.BS / 2], 0x3C);
+    var asm_: OnePlacedAssembly = .{ .cell = cell, .rel = 0, .len = wt.BS / 2, .token = 7 };
+    // Every entry slot taken while the pool still has cells: the tripwire's state.
+    var stolen: std.ArrayList(u32) = .empty;
+    defer stolen.deinit(testing.allocator);
+    {
+        w.wp.table.lock.lock();
+        defer w.wp.table.lock.unlock();
+        while (w.wp.table.free.pop()) |i| try stolen.append(testing.allocator, i);
+    }
+    var returned = false;
+    defer if (!returned) {
+        w.wp.table.lock.lock();
+        for (stolen.items) |i| w.wp.table.free.appendAssumeCapacity(i);
+        w.wp.table.lock.unlock();
+    };
+    accumulate.stats.active_block_table_full.resetLogBudgetForTest();
+    const fires0 = accumulate.stats.active_block_table_full.load();
+    const Writer = struct {
+        fn run(wp: *WritePath, io_: Io, payload: PlacedPayload, out: *?(Error!Outcome)) void {
+            // The writer's own thread declares its loud line (the tripwire).
+            log.testing.expectErrorLogs(1);
+            out.* = wp.write(io_, .{ .ino = 31, .offset = 0, .payload = .{ .placed = payload }, .class = .entire_op, .file = World.striped(0) });
+            log.testing.expectAllFired() catch {};
+        }
+    };
+    var result: ?(Error!Outcome) = null;
+    const th = try std.Thread.spawn(.{}, Writer.run, .{ w.wp, io, PlacedPayload{ .cell = cell, .rel = 0, .len = wt.BS / 2, .token = 7, .seam = asm_.seam() }, &result });
+    while (accumulate.stats.active_block_table_full.load() == fires0) try std.Thread.yield();
+    // An entry returns (the uploads' retirements, in the product).
+    {
+        w.wp.table.lock.lock();
+        defer w.wp.table.lock.unlock();
+        for (stolen.items) |i| w.wp.table.free.appendAssumeCapacity(i);
+    }
+    returned = true;
+    th.join();
+    // Acked ⇒ its bytes are custody: the entry holds the write's bytes.
+    const o = try result.?;
+    try testing.expectEqual(@as(u64, wt.BS / 2), o.written);
+    const e = w.wp.table.get(31, 0) orelse return error.AckedWithoutItsBytes;
+    var want: [wt.BS / 2]u8 = undefined;
+    fill(&want, 0x3C);
+    try testing.expectEqualSlices(u8, &want, e.repr.full.data[0 .. wt.BS / 2]);
+}
+
 /// A write of half a block of `seed` bytes at block `block` of `ino` (the
 /// gate's answer as the caller sees it).
 fn writeHalf(w: *World, io: Io, ino: u64, block: u32, seed: u8) Error!Outcome {

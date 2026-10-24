@@ -14766,7 +14766,7 @@ const reuse_row_read_passes: u32 = 8;
 /// the file.
 const reuse_row_window_read = "dd if=\"$2\" iflag=direct,skip_bytes skip=524288 bs=1048576 count=1 status=none | sha256sum";
 
-test "smoke: A MEMBER'S CACHED COPY OF ANOTHER MEMBER'S BLOCKS NEVER OUTLIVES THE BLOCKS' RE-USE (0003 §W.2) — two 192 MiB data volumes of 1 MiB blocks, no write cache (every write beyond inline striped) → mount A (the manager) + B JOINED (the dest lease off: its window reads are whole-block fills that deposit) → A writes `f` (two blocks, fsync'd) → A fills the set to ENOSPC → B reads `f` until its tiers hold its blocks (after the fill, whose recalls run the census) → A `rm f`: the delete recalls B's token and B purges the blocks' keys before it acks (scoped purges ≥ 1, purged keys ≥ 2 on B; the census when B's token cache shed its entry) → A writes `g` (two blocks, fsync'd) into the blocks the rm freed: B's tiers dropped `f`'s blocks before it landed → B reads `g`: sha-equal to A's, never `f`'s bytes" {
+test "smoke: A MEMBER'S CACHED COPY OF ANOTHER MEMBER'S BLOCKS NEVER OUTLIVES THE BLOCKS' RE-USE (0003 §W.2) — two 192 MiB data volumes of 1 MiB blocks, no write cache (every write beyond inline striped) → mount A (the manager) + B JOINED (the dest lease off: its window reads are whole-block fills that deposit) → A writes `f` (two blocks, fsync'd) → A fills the set to ENOSPC → B reads `f` until its tiers hold its blocks → A `rm f`: the delete recalls B's token and B purges the blocks' keys before it acks (scoped purges ≥ 1, purged keys ≥ 2 on B; when B's token cache shed its entry, the shed purged them at the drop) → A writes `g` (two blocks, fsync'd) into the blocks the rm freed: B's tiers dropped `f`'s blocks before it landed → B reads `g`: sha-equal to A's, never `f`'s bytes" {
     const io = testing.io;
     if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
     const gpa = testing.allocator;
@@ -14794,9 +14794,8 @@ test "smoke: A MEMBER'S CACHED COPY OF ANOTHER MEMBER'S BLOCKS NEVER OUTLIVES TH
     }
     // 2. A fills the set to ENOSPC one block per file: a refused one-block
     //    write allocated nothing, so no free lands later to give `g` a
-    //    block other than `f`'s. Before B's reads: each create recalls
-    //    objects B holds no entry for, and each such recall runs the
-    //    census, which drops every foreign key B's tiers hold.
+    //    block other than `f`'s. Before B's reads, so the row judges the
+    //    delete's recall alone.
     {
         const out = try rig.onMountTimed("j=0; while dd if=/dev/zero of=fill$j bs=1048576 count=1 conv=fsync status=none 2>/dev/null; do j=$((j+1)); done; rm -f fill$j; echo $j", 900);
         defer gpa.free(out);
@@ -14812,7 +14811,7 @@ test "smoke: A MEMBER'S CACHED COPY OF ANOTHER MEMBER'S BLOCKS NEVER OUTLIVES TH
         defer gpa.free(sb);
         break :blk numberAfter(sb, "\"dlm_token_sheds\":") orelse 0;
     };
-    const Base = struct { scoped: u64, keys: u64, census: u64, hits: u64, reds: u64 };
+    const Base = struct { scoped: u64, keys: u64, drop_keys: u64, hits: u64, reds: u64 };
     const base: Base = blk: {
         var pass: u32 = 0;
         while (pass < reuse_row_read_passes) : (pass += 1) {
@@ -14827,7 +14826,7 @@ test "smoke: A MEMBER'S CACHED COPY OF ANOTHER MEMBER'S BLOCKS NEVER OUTLIVES TH
             break :blk .{
                 .scoped = numberAfter(sb, "\"dlm_token_recall_scoped_purges\":") orelse 0,
                 .keys = numberAfter(sb, "\"dlm_token_recall_purged_keys\":") orelse 0,
-                .census = numberAfter(sb, "\"dlm_token_recall_census_purges\":") orelse 0,
+                .drop_keys = numberAfter(sb, "\"dlm_token_drop_purged_keys\":") orelse 0,
                 .hits = numberAfter(sb, "\"read_tier_purge_hits\":") orelse 0,
                 .reds = numberAfter(sb, "\"mem_budget_red_events\":") orelse 0,
             };
@@ -14847,22 +14846,22 @@ test "smoke: A MEMBER'S CACHED COPY OF ANOTHER MEMBER'S BLOCKS NEVER OUTLIVES TH
     }
     // 5. `g` landed in `f`'s blocks: B purged them first — before B reads
     //    `g`. The scoped purge names `f`'s two keys; a token cache that
-    //    shed its entries (the Red shed drops them without a release) had
-    //    no entry for the recall, which then runs the census. With no Red
-    //    episode on B the tiers dropped what they held (a shed could have
-    //    evicted it first).
+    //    shed its entry purged the same two keys at the drop (the recall
+    //    then finds none and purges nothing more). With no Red episode on B
+    //    the tiers dropped what they held (a shed could have evicted it
+    //    first).
     {
         const sb = try b.stats();
         defer gpa.free(sb);
         const scoped = numberAfter(sb, "\"dlm_token_recall_scoped_purges\":") orelse 0;
         const keys = numberAfter(sb, "\"dlm_token_recall_purged_keys\":") orelse 0;
-        const census = numberAfter(sb, "\"dlm_token_recall_census_purges\":") orelse 0;
+        const drop_keys = numberAfter(sb, "\"dlm_token_drop_purged_keys\":") orelse 0;
         const hits = numberAfter(sb, "\"read_tier_purge_hits\":") orelse 0;
         const reds = numberAfter(sb, "\"mem_budget_red_events\":") orelse 0;
         const shed = (numberAfter(sb, "\"dlm_token_sheds\":") orelse 0) > sheds0;
-        std.debug.print("smoke[reuse]: B's recall of `f`: scoped purges {d} → {d}, purged keys {d} → {d}, census purges {d} → {d}, tier purge hits {d} → {d}; token cache shed: {}, Red events {d} → {d}\n", .{ base.scoped, scoped, base.keys, keys, base.census, census, base.hits, hits, shed, base.reds, reds });
+        std.debug.print("smoke[reuse]: B's recall of `f`: scoped purges {d} → {d}, purged keys {d} → {d}, drop-purged keys {d} → {d}, tier purge hits {d} → {d}; token cache shed: {}, Red events {d} → {d}\n", .{ base.scoped, scoped, base.keys, keys, base.drop_keys, drop_keys, base.hits, hits, shed, base.reds, reds });
         if (shed) {
-            try testing.expect(keys >= base.keys + 2 or census >= base.census + 1);
+            try testing.expect(keys >= base.keys + 2 or drop_keys >= base.drop_keys + 2);
         } else {
             try testing.expect(scoped >= base.scoped + 1);
             try testing.expect(keys >= base.keys + 2);
@@ -14880,6 +14879,147 @@ test "smoke: A MEMBER'S CACHED COPY OF ANOTHER MEMBER'S BLOCKS NEVER OUTLIVES TH
     try rig.expectAlive("the re-use row");
     try b.umount();
     try b.expectCleanExit("B's unmount after the re-use row");
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+}
+
+/// The busy-writer row's file: 64 MiB over 1 MiB blocks (the re-use
+/// row's geometry: B's window reads below straddle two blocks each).
+const busy_writer_block: u64 = 1 << 20;
+const busy_writer_file_bytes: u64 = 64 * busy_writer_block;
+/// A pass "served from the tiers" reads at most an eighth of the file
+/// from the device (a straggler fits; a cold pass reads all 64 blocks).
+const busy_writer_warm_device_bytes: u64 = busy_writer_file_bytes / 8;
+/// B's warm-up passes: the first fills; the second is normally served.
+const busy_writer_warm_passes: u32 = 6;
+const busy_writer_creates: u32 = 1000;
+/// One pass over `r/big`: 63 O_DIRECT requests of 1 MiB, each straddling
+/// two blocks (`reuse_row_window_read`'s shape) — a multi-block request
+/// the queue thread's warm ladder demotes; on B, with the dest lease off
+/// (`SQUEEZEFS_READ_DEST_LEASE=0`), each half is the lane's whole-block
+/// fill, which deposits in B's tiers. Prints the window's sha (A runs the
+/// same read for the reference).
+const busy_writer_read = "dd if=r/big iflag=direct,skip_bytes skip=524288 bs=1048576 count=63 status=none | sha256sum | cut -d' ' -f1";
+
+test "smoke: A WRITER ON ONE MOUNT DOES NOT COLD THE OTHERS' READ CACHES — mount A (the manager) + B JOINED, no write cache → A writes `r/big` (64 MiB, fsync'd) and makes `w` → B reads `r/big` with O_DIRECT until a pass is served from its read tiers (≤ 1/8 of the file from the device) → B lists `w` (a peer watching the writer's directory: B holds its token) → A creates 1,000 files in `w`: every create inside the holder's kernel pin recalls `w` from B, which holds no entry for it, and NONE runs the census (`dlm_token_recall_census_purges` + 0: a recall purges exactly what the recalled object maps; `w` maps no block) → B's next pass of `r/big` is still served from its tiers, sha-equal → the coherence law stands: A overwrites `r/big`'s first block → B's next read sees the new bytes (red before: each create's no-entry recall ran the census and dropped every foreign key B held; B's pass after the creates was cold)" {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    try rig.env.put("SQUEEZEFS_MW_BIND", "127.0.0.1:0");
+    var t_owner_text: [8]u8 = undefined;
+    try rig.env.put("SQUEEZEFS_TEST_MEMBERSHIP_T_OWNER_MS", try std.fmt.bufPrint(&t_owner_text, "{d}", .{smoke_t_owner_ms}));
+    var bs_buf: [16]u8 = undefined;
+    try rig.formatSetWith(false, &.{ "--block-size", try std.fmt.bufPrint(&bs_buf, "{d}", .{busy_writer_block}) });
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(0);
+    // B's read tiers sized by hand, not by the derived budget: a loaded
+    // venue's co-tenant daemons divide the fleet share, and a hot tier
+    // whose shards hold a couple of blocks each evicts `r/big` by itself.
+    var env_b = try envWith(gpa, &rig.env, &.{ .{ "SQUEEZEFS_READ_DEST_LEASE", "0" }, .{ "SQUEEZEFS_TEST_FLEET_SHARE", "1" }, .{ "SQUEEZEFS_READ_HOT_BLOCK_CACHE_MB", "1024" } });
+    defer env_b.deinit();
+    const b = try Peer.init(rig, "b");
+    defer b.deinit();
+    b.env = &env_b;
+    try b.spawn(&.{});
+    _ = try b.awaitReady();
+    // 1. A's file and the directory it will write into.
+    var sha_buf: [64]u8 = undefined;
+    const sha = blk: {
+        const out = try rig.onMount("mkdir r w && dd if=/dev/urandom of=r/big bs=1048576 count=64 iflag=fullblock conv=fsync status=none && " ++ busy_writer_read);
+        defer gpa.free(out);
+        const s = std.mem.trimEnd(u8, out, "\n");
+        try testing.expectEqual(@as(usize, 64), s.len);
+        @memcpy(&sha_buf, s);
+        break :blk sha_buf[0..];
+    };
+    // 2. B reads `r/big` until a pass is served from its tiers.
+    const Snap = struct {
+        hits: u64,
+        dev: u64,
+        census: u64,
+        scoped: u64,
+        recalls: u64,
+        unheld: u64,
+        reds: u64,
+        fn of(text: []const u8) @This() {
+            return .{
+                .hits = (numberAfter(text, "\"cache_hits\":") orelse 0) + (numberAfter(text, "\"fast_dispatch_serves\":") orelse 0),
+                .dev = (numberAfter(text, "\"data_device_read_bytes\":") orelse 0) + (numberAfter(text, "\"transport_zc_direct_leg_dma_bytes\":") orelse 0),
+                .census = numberAfter(text, "\"dlm_token_recall_census_purges\":") orelse 0,
+                .scoped = numberAfter(text, "\"dlm_token_recall_scoped_purges\":") orelse 0,
+                .recalls = numberAfter(text, "\"dlm_token_recalls_received\":") orelse 0,
+                .unheld = numberAfter(text, "\"dlm_token_recall_unheld\":") orelse 0,
+                .reds = numberAfter(text, "\"mem_budget_red_events\":") orelse 0,
+            };
+        }
+        fn read(peer: *Peer) !@This() {
+            const sb = try peer.stats();
+            defer peer.rig.gpa.free(sb);
+            return of(sb);
+        }
+    };
+    const warm: Snap = blk: {
+        var prev = try Snap.read(b);
+        var pass: u32 = 0;
+        while (pass < busy_writer_warm_passes) : (pass += 1) {
+            const out = try b.onMount(busy_writer_read);
+            defer gpa.free(out);
+            try testing.expectEqualStrings(sha, std.mem.trimEnd(u8, out, "\n"));
+            const now = try Snap.read(b);
+            defer prev = now;
+            std.debug.print("smoke[busy-writer]: B's pass {d} of `r/big`: {d} tier hit(s), {d} B from the device\n", .{ pass + 1, now.hits - prev.hits, now.dev - prev.dev });
+            if (now.dev - prev.dev <= busy_writer_warm_device_bytes and now.hits > prev.hits) break :blk now;
+        }
+        std.debug.print("smoke[busy-writer]: B's tiers never served a pass of `r/big` in {d} passes\n", .{busy_writer_warm_passes});
+        return error.TestUnexpectedResult;
+    };
+    // 3. B watches the writer's directory (its token on `w`; the first
+    //    recall pins B at the holder for the kernel's TTL), then A's create
+    //    storm in `w`.
+    {
+        const out = try b.onMount("ls -la w > /dev/null && echo listed");
+        defer gpa.free(out);
+        try testing.expectEqualStrings("listed\n", out);
+    }
+    const t0 = clock.monotonicNs();
+    {
+        var script: [256]u8 = undefined;
+        const out = try rig.onMountTimed(try std.fmt.bufPrint(&script, "cd w && i=0; while [ $i -lt {d} ]; do : > f$i; i=$((i+1)); done; ls | wc -l", .{busy_writer_creates}), 600);
+        defer gpa.free(out);
+        try testing.expectEqual(@as(u64, busy_writer_creates), try std.fmt.parseInt(u64, std.mem.trim(u8, out, " \n"), 10));
+    }
+    const create_ms = (clock.monotonicNs() - t0) / std.time.ns_per_ms;
+    const storm = try Snap.read(b);
+    // 4. The creates recalled `w` from B, which held no entry for it, and
+    //    none ran the census; B's next pass is still its tiers' (unless a
+    //    Red episode on B shed them).
+    {
+        const out = try b.onMount(busy_writer_read);
+        defer gpa.free(out);
+        try testing.expectEqualStrings(sha, std.mem.trimEnd(u8, out, "\n"));
+    }
+    const after = try Snap.read(b);
+    std.debug.print("smoke[busy-writer]: A created {d} files in `w` in {d} ms; B took {d} recall(s) ({d} of objects it held no entry for), census purges {d} → {d}, scoped purges {d} → {d}; B's next pass: {d} tier hit(s), {d} B from the device; Red events {d} → {d}\n", .{ busy_writer_creates, create_ms, storm.recalls - warm.recalls, storm.unheld - warm.unheld, warm.census, storm.census, warm.scoped, storm.scoped, after.hits - storm.hits, after.dev - storm.dev, warm.reds, after.reds });
+    try testing.expectEqual(warm.census, storm.census);
+    try testing.expect(storm.unheld > warm.unheld);
+    if (after.reds == warm.reds) try testing.expect(after.dev - storm.dev <= busy_writer_warm_device_bytes);
+    // 5. The coherence law: A overwrites the first block; B reads it.
+    {
+        const out = try rig.onMount("dd if=/dev/urandom of=r/big bs=1048576 count=4 iflag=fullblock conv=notrunc,fsync status=none && " ++ busy_writer_read);
+        defer gpa.free(out);
+        const fresh = std.mem.trimEnd(u8, out, "\n");
+        try testing.expect(!std.mem.eql(u8, fresh, sha));
+        const got = try b.onMount(busy_writer_read);
+        defer gpa.free(got);
+        if (!std.mem.eql(u8, fresh, std.mem.trimEnd(u8, got, "\n"))) std.debug.print("smoke[busy-writer]: B read `r/big` after A's overwrite: {s} (A's {s}; before {s})\n", .{ std.mem.trimEnd(u8, got, "\n"), fresh, sha });
+        try testing.expectEqualStrings(fresh, std.mem.trimEnd(u8, got, "\n"));
+    }
+    try b.expectAlive("the busy-writer row");
+    try rig.expectAlive("the busy-writer row");
+    try b.umount();
+    try b.expectCleanExit("B's unmount after the busy-writer row");
     try rig.umount();
     try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
 }

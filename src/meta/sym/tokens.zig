@@ -302,6 +302,9 @@ const RecordingSink = struct {
     noted: u32 = 0,
     /// The object whose layout entry is DIRTY (the writer's acked bytes).
     dirty_object: u64 = 0,
+    /// The object whose entry's layout names its keys elsewhere (a
+    /// block-map tree head): the census.
+    unmapped_object: u64 = 0,
     keys_per_entry: u32 = 3,
     /// The revoked entry's carried `layout` value at the last discard
     /// (copied: the entry is unpinned after the call); null = no entry or
@@ -320,6 +323,7 @@ const RecordingSink = struct {
         self.last_layout = null;
         const e = entry orelse return .no_entry;
         self.entries_seen += 1;
+        if (object == self.unmapped_object) return .unmapped;
         if (e.xattr("layout")) |v| {
             var copy: [64]u8 = @splat(0);
             self.last_layout_len = @min(v.len, copy.len);
@@ -634,11 +638,16 @@ test "a reader whose kernel may still cache an answer served under a directory's
     plane.cache.budget_bytes = plane.cache.bytesHeld(io);
     const releases0 = table.stats.dlm_token_releases.load();
     const drops0 = cache.stats.dlm_token_kernel_pinned_drops.load();
+    const seen0 = f.sinks[0].entries_seen;
     s = (try b.serve(io, objectOf(3), .{})).?;
     s.release(io);
     try testing.expectEqual(drops0 + 1, cache.stats.dlm_token_kernel_pinned_drops.load());
     try testing.expectEqual(releases0, table.stats.dlm_token_releases.load());
     try testing.expect(plane.cache.describe(io, objectOf(2)) == null);
+    // The drop purged what the entry named (the purge law): the recalls
+    // below find no entry and purge nothing more.
+    try testing.expectEqual(seen0 + 1, f.sinks[0].entries_seen);
+    const census0 = f.sinks[0].census;
     // A creates "five": the recall reaches B, the name its kernel. The
     // holder pins the recalled grant too (the mount sets both pins from
     // the one TTL posture).
@@ -663,8 +672,14 @@ test "a reader whose kernel may still cache an answer served under a directory's
     try hook.recall(hook.ctx, &.{objectOf(2)}, .{ .notes = &gone });
     try testing.expect(f.sinks[0].sawName(objectOf(2), "four"));
     hook.settle(hook.ctx, &.{objectOf(2)});
+    try testing.expectEqual(census0, f.sinks[0].census);
     // Past the pin the grant leaves at the next pass: nobody recalled.
+    // (A re-recall keeps the first pin's end, so the short pin takes a
+    // live grant: B asks again, the recall pins it for 1 ns.)
     f.holder.setKernelPin(io, 1);
+    s = (try b.serve(io, objectOf(2), .{ .dentries = true })).?;
+    s.release(io);
+    try testing.expectEqual(@as(?u64, 0), f.holder.recalledUntil(io, objectOf(2), 1));
     try hook.recall(hook.ctx, &.{objectOf(2)}, .{});
     hook.settle(hook.ctx, &.{objectOf(2)});
     const expired0 = table.stats.dlm_token_recall_pins_expired.load();
@@ -803,7 +818,7 @@ test "a recall during an in-flight DMA read is acked only after it lands: the pu
     s.release(io);
 }
 
-test "the recall's purge reads the REVOKED entry's carried `layout` (held pinned through the sink's call): the inline ack, the drain lane's deferred ack and a voluntary release each hand it over; a recall of an object whose entry the reader shed answers the census once (0003 §W.2)" {
+test "the recall's purge reads the REVOKED entry's carried `layout` (held pinned through the sink's call): the inline ack, the drain lane's deferred ack and a voluntary release each hand it over; the shed purges each entry it drops at the drop, so a recall of a shed object owes the kernel its invalidation and the tiers nothing — no census (0003 §W.2)" {
     const gpa = testing.allocator;
     const io = testing.io;
     const f = try TwoMembers.init(gpa, io, 1);
@@ -849,15 +864,105 @@ test "the recall's purge reads the REVOKED entry's carried `layout` (held pinned
     try testing.expectEqual(@as(u32, 3), sink.entries_seen);
     try testing.expectEqualStrings(want, sink.last_layout.?[0..sink.last_layout_len]);
     // 4. An entry the reader shed (the holder still lists the grant): the
-    //    recall finds none and runs the census once.
+    //    shed purged it at the drop; the recall finds none, invalidates
+    //    the kernel's view and purges nothing more.
     s = (try b.serve(io, objectOf(4), .{})).?;
     s.release(io);
-    _ = plane.cache.shedAll(io);
+    try testing.expectEqual(@as(u32, 1), plane.shed(io));
+    try testing.expectEqual(@as(u32, 4), sink.entries_seen);
     const census0 = sink.census;
+    const noted0 = sink.noted;
+    const unheld0 = cache.stats.dlm_token_recall_unheld.load();
     sum = try f.commit(&.{objectOf(4)}, &bumpFour);
     try testing.expectEqual(@as(u32, 1), sum.acked);
-    try testing.expectEqual(census0 + 1, sink.census);
-    try testing.expectEqual(@as(u32, 3), sink.entries_seen);
+    try testing.expectEqual(census0, sink.census);
+    try testing.expectEqual(noted0 + 1, sink.noted);
+    try testing.expectEqual(unheld0 + 1, cache.stats.dlm_token_recall_unheld.load());
+    try testing.expectEqual(@as(u32, 4), sink.entries_seen);
+}
+
+test "the census is reserved for keys the reader cannot name: a recalled entry whose layout names its keys elsewhere runs it ONCE per call beside the scoped purge of the others; a recall that finds no entry while a drop's purge is still in flight runs it; a recall of an object the reader holds no entry for runs none" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    const f = try TwoMembers.init(gpa, io, 1);
+    defer f.deinit();
+    const b = f.reader(0);
+    const sink = &f.sinks[0];
+    sink.unmapped_object = objectOf(3);
+    var s = (try b.serve(io, objectOf(3), .{})).?;
+    s.release(io);
+    s = (try b.serve(io, objectOf(4), .{})).?;
+    s.release(io);
+    const census0 = cache.stats.dlm_token_recall_census_purges.load();
+    var sum = try f.commit(&.{ objectOf(3), objectOf(4) }, &bumpMtime);
+    try testing.expectEqual(@as(u32, 2), sum.acked);
+    try testing.expectEqual(@as(u32, 1), sink.census);
+    try testing.expectEqual(census0 + 1, cache.stats.dlm_token_recall_census_purges.load());
+    try testing.expectEqual(@as(u32, 1), sink.discards);
+    // A drop whose purge has not run yet (the shed took the entry; its
+    // dropper purges next): a recall that finds no entry meanwhile cannot
+    // tell — the census.
+    const plane = b.planeOf(io, A_ID).?;
+    s = (try b.serve(io, objectOf(4), .{})).?;
+    s.release(io);
+    var dropped: std.ArrayList(*cache.Entry) = .empty;
+    defer dropped.deinit(gpa);
+    try testing.expectEqual(@as(u32, 1), plane.cache.shedAll(io, &dropped));
+    sum = try f.commit(&.{objectOf(4)}, &bumpFour);
+    try testing.expectEqual(@as(u32, 1), sum.acked);
+    try testing.expectEqual(@as(u32, 2), sink.census);
+    plane.cache.dropsPurged(io, 1);
+    plane.cache.unpin(io, dropped.items[0]);
+    // Nothing held now: the holder recalls nobody, and a pinned grant
+    // re-recalled (below) finds no entry — no census.
+    f.holder.setKernelPin(io, 60 * std.time.ns_per_s);
+    defer f.holder.setKernelPin(io, 0);
+    s = (try b.serve(io, objectOf(4), .{})).?;
+    s.release(io);
+    sum = try f.commit(&.{objectOf(4)}, &bumpFour);
+    try testing.expectEqual(@as(u32, 1), sum.acked);
+    sum = try f.commit(&.{objectOf(4)}, &bumpFour);
+    try testing.expectEqual(@as(u32, 1), sum.acked);
+    try testing.expectEqual(@as(u32, 2), sink.census);
+}
+
+test "the holder's kernel pin ends one pin after the FIRST recall's ack (decision 0003 §AG.2): a re-recall of a pinned grant keeps its end — a reader that holds nothing is not recalled for as long as the directory keeps changing faster than the pin, one recall per create — and each such re-recall finds no entry on the reader, invalidates its kernel and runs no census; a fresh ask makes the grant live again and the next recall pins it anew" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    const f = try TwoMembers.init(gpa, io, 1);
+    defer f.deinit();
+    var binding: ConveyorBinding = .{ .io = io, .holder = &f.holder, .pusher = f.pusher.pusher() };
+    const hook = binding.hook();
+    const b = f.reader(0);
+    const sink = &f.sinks[0];
+    f.holder.setKernelPin(io, 60 * std.time.ns_per_s);
+    defer f.holder.setKernelPin(io, 0);
+    var s = (try b.serve(io, objectOf(2), .{ .dentries = true })).?;
+    s.release(io);
+    try hook.recall(hook.ctx, &.{objectOf(2)}, .{});
+    hook.settle(hook.ctx, &.{objectOf(2)});
+    const first = f.holder.recalledUntil(io, objectOf(2), 1).?;
+    try testing.expect(first != 0);
+    const census0 = sink.census;
+    const noted0 = sink.noted;
+    const unheld0 = cache.stats.dlm_token_recall_unheld.load();
+    // Four more changes inside the pin: each recalls the reader (its
+    // kernel hears them), none moves the pin's end, none runs the census.
+    for (0..4) |_| {
+        try hook.recall(hook.ctx, &.{objectOf(2)}, .{});
+        hook.settle(hook.ctx, &.{objectOf(2)});
+        try testing.expectEqual(@as(?u64, first), f.holder.recalledUntil(io, objectOf(2), 1));
+    }
+    try testing.expectEqual(noted0 + 4, sink.noted);
+    try testing.expectEqual(unheld0 + 4, cache.stats.dlm_token_recall_unheld.load());
+    try testing.expectEqual(census0, sink.census);
+    // A fresh ask: live again; the next recall pins from its own ack.
+    s = (try b.serve(io, objectOf(2), .{ .dentries = true })).?;
+    s.release(io);
+    try testing.expectEqual(@as(?u64, 0), f.holder.recalledUntil(io, objectOf(2), 1));
+    try hook.recall(hook.ctx, &.{objectOf(2)}, .{});
+    hook.settle(hook.ctx, &.{objectOf(2)});
+    try testing.expect(f.holder.recalledUntil(io, objectOf(2), 1).? > first);
 }
 
 test "a DIRTY local layout entry survives a recall: the writer's acked bytes are kept, only clean entries are discarded, the ack still travels" {

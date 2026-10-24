@@ -13,8 +13,20 @@
 //! shed, and the ACK CONDITIONS: a recall is acked only after a STEP on
 //! the reader's layout cache, the OBSERVED drain of every in-flight serve
 //! that may hold a pre-step binding (the per-thread `ServeStamp` Dekker —
-//! `serve_stamp_model.zig`), and the scoped block-key census purge where
-//! a DIRTY local layout entry is KEPT (the writer's acked bytes).
+//! `serve_stamp_model.zig`), and the scoped block-key purge where a DIRTY
+//! local layout entry is KEPT (the writer's acked bytes).
+//!
+//! THE PURGE LAW: every entry's exit purges exactly the keys its carried
+//! `layout` names — a recall's revoke, a voluntary release, room-making's
+//! kernel-pinned drop and the shed alike — so the read tiers hold a
+//! foreign key only under an entry that names it (a serve in flight under
+//! a gone entry re-grants at its binding recheck; the fresh entry names
+//! what it deposited). A recall of an object this reader holds no entry
+//! for (the holder's kernel pin, a drop without a release) owes the kernel
+//! its invalidation and the tiers nothing. The whole-foreign census is
+//! reserved for keys the reader cannot name: a held entry whose layout
+//! does not enumerate them (a block-map tree head), or a revoke that could
+//! keep no entries; it is counted, so a storm is visible.
 //! PORTABLE: the wire is a `Link`, the data plane a `RecallSink`.
 //!
 //! The recall is a PUSH (decision 0002 row 257): the holder's frame
@@ -122,10 +134,18 @@ pub const stats = struct {
     pub var dlm_token_holder_repoints: counters.ShardedCounter = .{};
     pub var dlm_token_grant_rtt_ns: counters.ShardedLatencyHistogram = .{};
     /// Block keys purged by the scoped purge; scoped purges; whole-census
-    /// fallbacks (no entry held — shed or never granted).
+    /// fallbacks (an entry whose keys its layout does not enumerate — at
+    /// its recall or its drop —, a revoke that kept no entries).
     pub var dlm_token_recall_purged_keys: counters.ShardedCounter = .{};
     pub var dlm_token_recall_scoped_purges: counters.ShardedCounter = .{};
     pub var dlm_token_recall_census_purges: counters.ShardedCounter = .{};
+    /// Recalled objects this reader held no entry for (the holder's kernel
+    /// pin after an earlier recall, a drop without a release): the kernel
+    /// heard the invalidation; the read tiers owed nothing.
+    pub var dlm_token_recall_unheld: counters.ShardedCounter = .{};
+    /// Block keys purged at a drop WITHOUT a release (room-making's
+    /// kernel-pinned drop, the shed): the entry's exit purges what it named.
+    pub var dlm_token_drop_purged_keys: counters.ShardedCounter = .{};
     /// A DIRTY local layout entry KEPT across a recall (the writer's acked
     /// bytes; 0 on a `-o ro` reader).
     pub var dlm_token_recall_dirty_kept: counters.ShardedCounter = .{};
@@ -281,9 +301,14 @@ pub const DiscardVerdict = union(enum) {
     /// The stripe is held: skipped — safe, the step made every clean entry
     /// pre-step already.
     held_skipped,
-    /// No entry held for the object (shed, never granted, an off-record
-    /// kvmap head): the whole census is purged ONCE per call.
+    /// No entry held for the object (recalled before and still pinned at
+    /// its holder, dropped without a release, never granted): nothing to
+    /// purge — the entry's exit purged what it named.
     no_entry,
+    /// An entry is held but its layout does not enumerate its keys (a
+    /// block-map tree head, a value that does not decode): the whole
+    /// census, ONCE per call.
+    unmapped,
 };
 
 pub const RecallSink = struct {
@@ -456,6 +481,11 @@ pub const Cache = struct {
     /// The whole-budget census for every plane in the process rides the
     /// module gauge; this instance's share is `bytes`.
     gone_markers: u64 = 0,
+    /// Entries dropped WITHOUT a release whose keys their dropper has not
+    /// purged yet (`Reader.purgeDropped`): a recall that finds no entry
+    /// while one is in flight cannot tell whether the tiers still hold its
+    /// object's keys.
+    drops_in_flight: u32 = 0,
 
     pub fn init(gpa: Allocator, budget_bytes: u64) Cache {
         return .{ .gpa = gpa, .budget_bytes = budget_bytes };
@@ -598,9 +628,9 @@ pub const Cache = struct {
     /// Voluntary room: second-chance `used` bit, then any; the retired
     /// objects go to `out` and their entries, pinned, to `kept` (the
     /// caller's drain + purge + `Release`, then the unpin). An entry the
-    /// kernel may still cache an answer from is dropped WITHOUT a release
-    /// (`dropOrRetireLocked`).
-    pub fn evictToBudget(self: *Cache, io: Io, need: u64, out: *std.ArrayList(Object), kept: *std.ArrayList(?*Entry)) Allocator.Error!void {
+    /// kernel may still cache an answer from is dropped WITHOUT a release,
+    /// pinned into `dropped` for the caller's purge (`dropOrRetireLocked`).
+    pub fn evictToBudget(self: *Cache, io: Io, need: u64, out: *std.ArrayList(Object), kept: *std.ArrayList(?*Entry), dropped: *std.ArrayList(*Entry)) Allocator.Error!void {
         self.lock.lockUncancelable(io);
         defer self.lock.unlock(io);
         const now = clock.monotonicNs();
@@ -619,7 +649,7 @@ pub const Cache = struct {
             }
             for (victims.items) |e| {
                 if (self.bytes + need <= self.budget_bytes) break;
-                try self.dropOrRetireLocked(e, now, out, kept);
+                try self.dropOrRetireLocked(e, now, out, kept, dropped);
             }
         }
     }
@@ -627,10 +657,15 @@ pub const Cache = struct {
     /// The room law for one victim (decision 0003 §AG.2): kernel-pinned ⇒
     /// dropped WITHOUT a release — the holder keeps this reader on the
     /// object, so a change still recalls it and its names reach the kernel
-    /// — else retired to `out`/`kept` for the caller's release.
-    fn dropOrRetireLocked(self: *Cache, e: *Entry, now_ns: u64, out: *std.ArrayList(Object), kept: *std.ArrayList(?*Entry)) Allocator.Error!void {
+    /// — pinned into `dropped` (the caller purges its keys); else retired
+    /// to `out`/`kept` for the caller's release.
+    fn dropOrRetireLocked(self: *Cache, e: *Entry, now_ns: u64, out: *std.ArrayList(Object), kept: *std.ArrayList(?*Entry), dropped: *std.ArrayList(*Entry)) Allocator.Error!void {
         if (kernelPinned(e, now_ns)) {
+            try dropped.ensureUnusedCapacity(self.gpa, 1);
             stats.dlm_token_kernel_pinned_drops.inc();
+            e.pins += 1;
+            dropped.appendAssumeCapacity(e);
+            self.drops_in_flight += 1;
             self.removeLocked(e);
             return;
         }
@@ -644,28 +679,43 @@ pub const Cache = struct {
 
     /// One object out under the room law (`SQUEEZEFS_TEST_TOKEN_EVICT_AFTER_SERVE`:
     /// the budget's eviction of exactly the entry a serve just used).
-    pub fn evictOne(self: *Cache, io: Io, object: Object, out: *std.ArrayList(Object), kept: *std.ArrayList(?*Entry)) Allocator.Error!void {
+    pub fn evictOne(self: *Cache, io: Io, object: Object, out: *std.ArrayList(Object), kept: *std.ArrayList(?*Entry), dropped: *std.ArrayList(*Entry)) Allocator.Error!void {
         self.lock.lockUncancelable(io);
         defer self.lock.unlock(io);
         const e = self.entries.get(object) orelse return;
-        try self.dropOrRetireLocked(e, clock.monotonicNs(), out, kept);
+        try self.dropOrRetireLocked(e, clock.monotonicNs(), out, kept, dropped);
     }
 
-    /// The authority's shed: every entry dropped WITHOUT a release.
-    pub fn shedAll(self: *Cache, io: Io) u32 {
+    /// The shed: every entry dropped WITHOUT a release, pinned into
+    /// `dropped` for the caller's purge (an entry the list has no room for
+    /// stays). Answers the entries dropped.
+    pub fn shedAll(self: *Cache, io: Io, dropped: *std.ArrayList(*Entry)) u32 {
         self.lock.lockUncancelable(io);
         defer self.lock.unlock(io);
-        var n: u32 = 0;
-        var victims: std.ArrayListUnmanaged(*Entry) = .empty;
-        defer victims.deinit(self.gpa);
+        const first = dropped.items.len;
         var it = self.entries.valueIterator();
-        while (it.next()) |ep| victims.append(self.gpa, ep.*) catch break;
-        for (victims.items) |e| {
+        while (it.next()) |ep| dropped.append(self.gpa, ep.*) catch break;
+        for (dropped.items[first..]) |e| {
+            e.pins += 1;
             self.removeLocked(e);
-            n += 1;
         }
+        const n: u32 = @intCast(dropped.items.len - first);
+        self.drops_in_flight += n;
         stats.dlm_token_sheds.add(n);
         return n;
+    }
+
+    /// `n` dropped entries' keys are purged (`drops_in_flight`).
+    pub fn dropsPurged(self: *Cache, io: Io, n: u32) void {
+        self.lock.lockUncancelable(io);
+        defer self.lock.unlock(io);
+        self.drops_in_flight -= n;
+    }
+
+    pub fn dropsInFlight(self: *Cache, io: Io) u32 {
+        self.lock.lockUncancelable(io);
+        defer self.lock.unlock(io);
+        return self.drops_in_flight;
     }
 
     pub fn count(self: *Cache, io: Io) usize {
@@ -730,7 +780,7 @@ pub const Wants = struct {
 };
 
 /// A frame handed to the drain lane: the ack travels once the serves
-/// below `gen` landed and the census is purged.
+/// below `gen` landed and the recalled objects are purged.
 const Deferred = struct {
     frame_id: u64,
     holder_volume: u16,
@@ -793,7 +843,17 @@ pub const Reader = struct {
 
     fn shedFn(ctx: *anyopaque, _: u64) void {
         const self: *Reader = @ptrCast(@alignCast(ctx));
-        _ = self.cache.shedAll(self.io);
+        _ = self.shed(self.io);
+    }
+
+    /// The shed (the authority's, the lease gate's): every entry dropped
+    /// WITHOUT a release, each one's keys purged at the drop.
+    pub fn shed(self: *Reader, io: Io) u32 {
+        var dropped: std.ArrayList(*Entry) = .empty;
+        defer dropped.deinit(self.gpa);
+        const n = self.cache.shedAll(io, &dropped);
+        self.purgeDropped(io, dropped.items);
+        return n;
     }
 
     // ---- the serve ----
@@ -803,7 +863,7 @@ pub const Reader = struct {
     pub fn serve(self: *Reader, io: Io, object: Object, wants: Wants) Error!Serve {
         if (!self.lease.live(self.lease.ctx, clock.monotonicNs())) {
             stats.dlm_token_serve_refusals.inc();
-            _ = self.cache.shedAll(io);
+            _ = self.shed(io);
             return error.MembershipPending;
         }
         // A cached token serves whatever the channel's posture (charter
@@ -978,7 +1038,11 @@ pub const Reader = struct {
             for (retired_kept.items) |k| if (k) |x| self.cache.unpin(io, x);
             retired_kept.deinit(self.gpa);
         }
-        self.cache.evictToBudget(io, e.bytes, &retired, &retired_kept) catch return error.OutOfMemory;
+        var dropped: std.ArrayList(*Entry) = .empty;
+        defer dropped.deinit(self.gpa);
+        const room = self.cache.evictToBudget(io, e.bytes, &retired, &retired_kept, &dropped);
+        self.purgeDropped(io, dropped.items);
+        room catch return error.OutOfMemory;
         if (retired.items.len != 0) self.releaseRetired(io, retired.items, retired_kept.items);
         consumed = true;
         return switch (self.cache.install(io, e, gen0)) {
@@ -1083,11 +1147,15 @@ pub const Reader = struct {
         self.gpa.free(kept);
     }
 
-    /// The scoped purge (spec §1.7 step 2): per recalled object the clean
-    /// layout entry discarded with its keys — the sink reads them off the
-    /// revoked entry (`kept[i]`; null `kept` = none known) — DIRTY kept, a
-    /// held stripe skipped; an object with no entry falls back to the
-    /// whole census ONCE per call.
+    /// The scoped purge (spec §1.7 step 2): per recalled object the
+    /// kernel's view invalidated, the clean layout entry discarded with its
+    /// keys — the sink reads them off the revoked entry (`kept[i]`) —
+    /// DIRTY kept, a held stripe skipped. An object with no entry owes the
+    /// tiers nothing (THE PURGE LAW); one whose entry names its keys
+    /// elsewhere, one with no entry while a drop's purge is in flight (it
+    /// may be that object's), or a call with no `kept` (the revoke could
+    /// keep nothing, so what was held is unknown), falls back to the census
+    /// ONCE per call.
     fn purge(self: *Reader, objects: []align(1) const Object, kept: ?[]const ?*Entry) void {
         if (kept) |ks| assert(ks.len == objects.len);
         var census_done = false;
@@ -1101,13 +1169,37 @@ pub const Reader = struct {
                 },
                 .dirty_kept => stats.dlm_token_recall_dirty_kept.inc(),
                 .held_skipped => stats.dlm_token_recall_discard_skipped.inc(),
-                .no_entry => if (!census_done) {
-                    census_done = true;
-                    stats.dlm_token_recall_census_purges.inc();
-                    self.sink.purgeCensus(self.sink.ctx);
-                },
+                .no_entry => if (kept == null or self.cache.dropsInFlight(self.io) != 0) {
+                    self.censusOnce(&census_done);
+                } else stats.dlm_token_recall_unheld.inc(),
+                .unmapped => self.censusOnce(&census_done),
             }
         }
+    }
+
+    fn censusOnce(self: *Reader, done: *bool) void {
+        if (done.*) return;
+        done.* = true;
+        stats.dlm_token_recall_census_purges.inc();
+        self.sink.purgeCensus(self.sink.ctx);
+    }
+
+    /// The keys of entries that left WITHOUT a release (room-making's
+    /// kernel-pinned drop, the shed), purged at the drop (THE PURGE LAW),
+    /// then unpinned. No kernel invalidation: nothing changed, and the
+    /// holder still lists this reader for the change that will.
+    fn purgeDropped(self: *Reader, io: Io, dropped: []const *Entry) void {
+        if (dropped.len == 0) return;
+        var census_done = false;
+        for (dropped) |e| {
+            switch (self.sink.discardLayout(self.sink.ctx, e.object, e)) {
+                .discarded => |n| stats.dlm_token_drop_purged_keys.add(n),
+                .unmapped => self.censusOnce(&census_done),
+                .dirty_kept, .held_skipped, .no_entry => {},
+            }
+        }
+        self.cache.dropsPurged(io, @intCast(dropped.len));
+        for (dropped) |e| self.cache.unpin(io, e);
     }
 
     // ---- release, stop, re-point ----
@@ -1138,7 +1230,11 @@ pub const Reader = struct {
             for (kept.items) |k| if (k) |x| self.cache.unpin(io, x);
             kept.deinit(self.gpa);
         }
-        self.cache.evictOne(io, object, &retired, &kept) catch return;
+        var dropped: std.ArrayList(*Entry) = .empty;
+        defer dropped.deinit(self.gpa);
+        const room = self.cache.evictOne(io, object, &retired, &kept, &dropped);
+        self.purgeDropped(io, dropped.items);
+        room catch return;
         if (retired.items.len != 0) self.releaseRetired(io, retired.items, kept.items);
     }
 
@@ -1317,7 +1413,7 @@ test "the cache: install under gen0 is refused by a bump the check sees and foun
     c.unpin(io, kept[0].?);
 }
 
-test "the budget: ONE oversize entry is refused loud; eviction gives the used bit a second chance; the shed drops everything" {
+test "the budget: ONE oversize entry is refused loud; eviction gives the used bit a second chance; the shed drops everything, each entry pinned for its purge" {
     const io = testing.io;
     const gpa = testing.allocator;
     var c = Cache.init(gpa, 3 * table.TOKEN_ENTRY_BYTES);
@@ -1350,7 +1446,10 @@ test "the budget: ONE oversize entry is refused loud; eviction gives the used bi
     defer out.deinit(gpa);
     var kept: std.ArrayList(?*Entry) = .empty;
     defer kept.deinit(gpa);
-    try c.evictToBudget(io, table.TOKEN_ENTRY_BYTES, &out, &kept);
+    var dropped: std.ArrayList(*Entry) = .empty;
+    defer dropped.deinit(gpa);
+    try c.evictToBudget(io, table.TOKEN_ENTRY_BYTES, &out, &kept, &dropped);
+    try testing.expectEqual(@as(usize, 0), dropped.items.len);
     try testing.expectEqual(@as(usize, 1), out.items.len);
     try testing.expect(out.items[0] != 2);
     // The victim's entry stays pinned (REVOKED) for the purge; the unpin
@@ -1361,9 +1460,14 @@ test "the budget: ONE oversize entry is refused loud; eviction gives the used bi
     c.unpin(io, kept.items[0].?);
     try testing.expectEqual(@as(usize, 2), c.count(io));
     const before = stats.dlm_token_sheds.load();
-    try testing.expectEqual(@as(u32, 2), c.shedAll(io));
+    try testing.expectEqual(@as(u32, 2), c.shedAll(io, &dropped));
     try testing.expectEqual(before + 2, stats.dlm_token_sheds.load());
     try testing.expectEqual(@as(u64, 0), c.bytesHeld(io));
+    try testing.expectEqual(@as(usize, 2), dropped.items.len);
+    for (dropped.items) |e| {
+        try testing.expectEqual(State.revoked, e.state);
+        c.unpin(io, e);
+    }
 }
 
 test "the kernel pin (decision 0003 §AG.2): room-making drops an entry the kernel may still cache an answer from WITHOUT a release (counted), and retires one past the pin for its release" {
@@ -1381,13 +1485,19 @@ test "the kernel pin (decision 0003 §AG.2): room-making drops an entry the kern
     defer out.deinit(gpa);
     var kept: std.ArrayList(?*Entry) = .empty;
     defer kept.deinit(gpa);
+    var dropped: std.ArrayList(*Entry) = .empty;
+    defer dropped.deinit(gpa);
     const drops0 = stats.dlm_token_kernel_pinned_drops.load();
-    // Room for both: object 1 (served under the pin) drops, object 2 (past
-    // its pin) is retired for the caller's release.
-    try c.evictToBudget(io, 2 * table.TOKEN_ENTRY_BYTES, &out, &kept);
+    // Room for both: object 1 (served under the pin) drops — pinned for
+    // the caller's purge, never released —, object 2 (past its pin) is
+    // retired for the caller's release.
+    try c.evictToBudget(io, 2 * table.TOKEN_ENTRY_BYTES, &out, &kept, &dropped);
     try testing.expectEqual(drops0 + 1, stats.dlm_token_kernel_pinned_drops.load());
     try testing.expectEqualSlices(Object, &.{2}, out.items);
+    try testing.expectEqual(@as(usize, 1), dropped.items.len);
+    try testing.expectEqual(@as(Object, 1), dropped.items[0].object);
     c.unpin(io, kept.items[0].?);
+    c.unpin(io, dropped.items[0]);
     try testing.expectEqual(@as(usize, 0), c.count(io));
 }
 

@@ -1013,9 +1013,10 @@ pub const ReadPath = struct {
         if (self.foreignKey(key)) _ = purge.purgeBlockKey(self.tiers, key);
     }
 
-    /// The token recall's scoped purge (charter §5.5; `docs/porting/
+    /// The token entry's scoped purge at its exit — a recall, a release,
+    /// a drop without a release (charter §5.5; `docs/porting/
     /// sym_tokens_intents_striping.md` §1.7 step 2): every block key the
-    /// recalled object's layout NAMES (its durable copy or tenant, every
+    /// entry's layout NAMES (its durable copy or tenant, every
     /// inline-map entry) through the ONE purge — before the reader acks,
     /// so the holder's free of those blocks follows it. Null when the
     /// layout names its references elsewhere (a block-map tree head): the
@@ -1031,10 +1032,10 @@ pub const ReadPath = struct {
         return n;
     }
 
-    /// The census fallback (a recalled object whose keys cannot be
-    /// enumerated: no entry held — shed, never granted — or a block-map
-    /// tree head): every FOREIGN key the tiers hold, through the ONE
-    /// purge. A key inside a local lifetime keeps its entry — its own free
+    /// The census fallback (a token entry whose keys cannot be enumerated —
+    /// a block-map tree head — at its recall or its drop, or a recall whose
+    /// revoke kept no entries): every FOREIGN key the tiers hold, through
+    /// the ONE purge. A key inside a local lifetime keeps its entry — its own free
     /// purges it and the incarnation guards it until then.
     pub fn purgeForeignCensus(self: *ReadPath) u32 {
         return purge.purgeCensus(self.tiers, .{ .ctx = self, .call = &selectForeign });

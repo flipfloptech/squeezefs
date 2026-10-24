@@ -675,12 +675,21 @@ pub const Holder = struct {
 
     /// Keep `(object, client)` registered until `until_ns`; false when it
     /// is not held (or the expiry list has no room: the grant leaves now).
+    /// A grant the recall found ALREADY pinned keeps its pin's end: the
+    /// reader was told nothing under the token since its first recall (a
+    /// new answer takes a fresh grant, which makes the grant live), so its
+    /// kernel's answers end by then — re-pinning from every ack kept a
+    /// reader that holds nothing on every change of a directory changed
+    /// faster than the pin, one recall per create.
     fn pinRecalledLocked(self: *Holder, object: Object, client: ClientId, until_ns: u64) bool {
         const h = self.objects.getPtr(object) orelse return false;
         const i = h.find(client) orelse return false;
-        self.recalled.append(self.gpa, .{ .object = object, .client = client, .until_ns = until_ns }) catch return false;
-        h.list.items[i].under_recall = false;
-        h.list.items[i].recalled_until_ns = until_ns;
+        const g = &h.list.items[i];
+        if (g.recalled_until_ns == 0) {
+            self.recalled.append(self.gpa, .{ .object = object, .client = client, .until_ns = until_ns }) catch return false;
+            g.recalled_until_ns = until_ns;
+        }
+        g.under_recall = false;
         stats.dlm_token_recall_pins.inc();
         return true;
     }
@@ -1223,6 +1232,16 @@ pub const Holder = struct {
         defer self.lock.unlock(io);
         const h = self.objects.getPtr(object) orelse return false;
         return h.find(client) != null;
+    }
+
+    /// The pin's end of `client`'s grant on `object` (0 = live, null = not
+    /// registered).
+    pub fn recalledUntil(self: *Holder, io: Io, object: Object, client: ClientId) ?u64 {
+        self.lock.lockUncancelable(io);
+        defer self.lock.unlock(io);
+        const h = self.objects.getPtr(object) orelse return null;
+        const i = h.find(client) orelse return null;
+        return h.list.items[i].recalled_until_ns;
     }
 
     pub fn outstandingGrants(self: *Holder, io: Io) u64 {

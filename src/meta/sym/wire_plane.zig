@@ -1766,11 +1766,13 @@ const RenameStore = struct {
 /// no kernel view), and the data plane's read tiers purged of every block
 /// key the recalled object's carried `layout` names — before the ack, so
 /// the holder's free (and any member's re-mint) of those blocks follows
-/// it (`DataPlane.recallPurgeLayout`). An object with no entry held, or a
-/// layout that names its references elsewhere, answers `no_entry`: the
-/// census over every foreign key, once per recall. This mount keeps no
-/// write-side state the recall could discard (a foreign file's publish
-/// ships to its holder), so nothing is ever `dirty_kept` here.
+/// it (`DataPlane.recallPurgeLayout`). An object with no entry held
+/// answers `no_entry` (its entry's exit already purged what it named —
+/// `token_cache`'s purge law); a layout that names its references
+/// elsewhere answers `unmapped`: the census over every foreign key, once
+/// per recall. This mount keeps no write-side state the recall could
+/// discard (a foreign file's publish ships to its holder), so nothing is
+/// ever `dirty_kept` here.
 pub const RecallSink = struct {
     notify: ?tokens.divert.NotifySeam = null,
     /// The data plane whose tiers a recall purges: bound once it is open
@@ -1797,7 +1799,7 @@ pub const RecallSink = struct {
         // No layout carried: a directory, a symlink, a never-written file —
         // it names no block.
         const value = e.xattr(@import("../../data/layout.zig").LAYOUT_XATTR_NAME) orelse return .{ .discarded = 0 };
-        return if (dp.recallPurgeLayout(value)) |n| .{ .discarded = n } else .no_entry;
+        return if (dp.recallPurgeLayout(value)) |n| .{ .discarded = n } else .unmapped;
     }
 
     fn purgeCensus(ctx: *anyopaque) void {

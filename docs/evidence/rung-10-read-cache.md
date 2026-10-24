@@ -89,3 +89,21 @@ deposit/hit and ghost/warm arms only below Red and says so otherwise.
 **Owed**: the leg that lands in the cache's own memfd slab and replies by `READ_FIXED` (no lane hop cold,
 zero-pass warm — the FUSE zero-copy row's path to warm); a lock-free tokened-inode predicate so a holder's
 W1 recalls readers at once (§BF.8); one order over the hot tier's slots and the grains (§BF.9).
+
+**The census storm** (`fix/recall-purges-scoped`, 2026-10-24). One busy writer kept every peer's read cache
+cold: the holder's kernel pin (0003 §AG.2) keeps a recalled reader registered for the kernel's longest TTL
+(1 s) past its ack and RE-PINNED it from every ack, so a directory changed faster than once a second recalled
+every member that ever looked at it on every change — each finding no entry (the first recall revoked it) and
+running the census, which drops every foreign key. Not the Red shed: the reader's R5 component is never
+registered, so `dlm_token_sheds` only moves at a lease loss. THE PURGE LAW now: every token entry's exit purges
+exactly the keys its `layout` names (recall, release, room-making's kernel-pinned drop and the shed alike), so a
+recall of an object a reader holds no entry for invalidates the kernel and purges nothing
+(`dlm_token_recall_unheld`); the census is reserved for keys the reader cannot name — an entry whose layout does
+not enumerate them (`unmapped`: a block-map head), a recall overlapping a drop whose purge is still in flight,
+a revoke that kept nothing — and stays counted (`dlm_token_recall_census_purges`). The holder's pin ends one
+TTL after the FIRST ack (a reader told nothing since holds no newer kernel answer). Row A WRITER ON ONE MOUNT
+DOES NOT COLD THE OTHERS' READ CACHES (B warm on a 64 MiB file, A creates 1,000 files in a directory B lists):
+origin/dev — 1,005 recalls on B, census purges 0 → 1,004, B's next pass 64 MiB from the device; branch — 1,003
+recalls (1,002 with no entry), census 0 → 0, next pass 0 B from the device, B reads A's overwrite. The re-use
+row's B now keeps `f` through A's fill (it judged a copy the fill's censuses had already dropped). **Owed**: the
+two-mount read-while-write fio A/B (the venue sat at load 20–30 with ~40 co-tenant daemons all session).

@@ -2903,6 +2903,143 @@ test "smoke: 300 CONCURRENT FSYNCS AND 300 CONCURRENT CREATES ON ONE MOUNT NEVER
     try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
 }
 
+/// THE DATA PLANE'S NO-EAGAIN ROW's width: past the transport's handler
+/// slots on this venue (32 queues × depth 32 = 1,024), so the kernel queues
+/// the rest and every slot holds a data op at once.
+const data_no_eagain_width: usize = 1100;
+
+/// One thread of the data-plane storm: its own file in `s`, then at each
+/// gate one data op — a 64 KiB write (into the write cache), its fsync (the
+/// promotion: a packed slot's DMA and the barrier, on the data lanes), an
+/// O_DIRECT read off the page grain (the packed tenant's window through the
+/// bounce pool). Every inode is the thread's own.
+const DataNoEagainThread = struct {
+    s_fd: linux.fd_t,
+    idx: usize,
+    payload: *const [64 << 10]u8,
+    gate: *std.atomic.Value(u32),
+    arrived: *std.atomic.Value(usize),
+    open_e: linux.E = .SUCCESS,
+    write_e: linux.E = .SUCCESS,
+    fsync_e: linux.E = .SUCCESS,
+    read_e: linux.E = .SUCCESS,
+
+    fn awaitGate(self: *DataNoEagainThread, phase: u32) void {
+        while (self.gate.load(.acquire) < phase) std.Thread.yield() catch std.atomic.spinLoopHint();
+    }
+
+    fn run(self: *DataNoEagainThread) void {
+        var nb: [16]u8 = undefined;
+        const name = std.fmt.bufPrintSentinel(&nb, "f{d}", .{self.idx}, 0) catch unreachable;
+        var fd: linux.fd_t = -1;
+        var rfd: linux.fd_t = -1;
+        const rc = linux.openat(self.s_fd, name, .{ .ACCMODE = .RDWR, .CREAT = true, .EXCL = true, .CLOEXEC = true }, 0o644);
+        self.open_e = linux.errno(rc);
+        if (self.open_e == .SUCCESS) fd = @intCast(rc);
+        _ = self.arrived.fetchAdd(1, .acq_rel);
+        self.awaitGate(1);
+        if (fd >= 0) {
+            const w = linux.pwrite(fd, self.payload, self.payload.len, 0);
+            self.write_e = linux.errno(w);
+            if (self.write_e == .SUCCESS and w != self.payload.len) self.write_e = .IO;
+        }
+        _ = self.arrived.fetchAdd(1, .acq_rel);
+        self.awaitGate(2);
+        if (fd >= 0) self.fsync_e = linux.errno(linux.fsync(fd));
+        if (fd >= 0) {
+            const r2 = linux.openat(self.s_fd, name, .{ .ACCMODE = .RDONLY, .DIRECT = true, .CLOEXEC = true }, 0);
+            if (linux.errno(r2) == .SUCCESS) rfd = @intCast(r2) else self.read_e = linux.errno(r2);
+        }
+        _ = self.arrived.fetchAdd(1, .acq_rel);
+        self.awaitGate(3);
+        if (rfd >= 0) {
+            var buf: [48 << 10]u8 = undefined;
+            const off: u64 = 100 + self.idx % 4000;
+            const r = linux.pread(rfd, &buf, buf.len, @intCast(off));
+            self.read_e = linux.errno(r);
+            if (self.read_e == .SUCCESS and (r != buf.len or !std.mem.eql(u8, buf[0..], self.payload[@intCast(off)..][0..buf.len]))) self.read_e = .IO;
+        }
+        if (rfd >= 0) _ = linux.close(rfd);
+        if (fd >= 0) _ = linux.close(fd);
+        _ = self.arrived.fetchAdd(1, .acq_rel);
+    }
+};
+
+test "smoke: 1,100 CONCURRENT WRITES, FSYNCS AND O_DIRECT READS ON ONE MOUNT OVER A SLOW DEVICE NEVER ANSWER EAGAIN (decision 0003 §BO's law, the data plane's half) — a set over device-mapper slices, every write and flush 5 ms late (dm-delay) → 1,100 threads (past the transport's 1,024 handler slots) each create a file, then at one gate write 64 KiB into it, at the next fsync it (1,100 promotions into packs at once: their DMAs and barriers on the data lanes), at the last read 48 KiB of it O_DIRECT off the page grain (the packed tenant's window through the bounce pool): every op answers 0 — never EAGAIN — and every read is byte-equal; the lanes' free-cell door and the bounce pools' exhaustion reported (their bounds keep this venue below them: the lane depth 4,096 > the handler slots; the ranged slab ≥ 2,048) → umount clean" {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    if (DmErrorSet.venueMissing()) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    if (DmErrorSet.delayMissing(rig)) |why| return testkit.skipWhy(@src(), why);
+    var dm = try DmErrorSet.up(rig);
+    defer dm.deinit();
+    {
+        const r = try rig.squeezefs(&.{ "format", dm.meta_uri, dm.data_uri });
+        defer rig.freeRun(r);
+        if (!r.term.success()) std.debug.print("\nformat: {s}\n", .{r.stderr});
+        try testing.expect(r.term.success());
+    }
+    try rig.spawnMountOf(dm.meta_uri, &.{});
+    _ = try rig.awaitReady(0);
+    gpa.free(try rig.onMount("mkdir s && echo made"));
+    const payload = try gpa.create([64 << 10]u8);
+    defer gpa.destroy(payload);
+    for (payload, 0..) |*b, i| b.* = @truncate(i *% 2654435761 >> 13);
+    var gate: std.atomic.Value(u32) = .init(0);
+    var arrived: std.atomic.Value(usize) = .init(0);
+    const storm = try gpa.alloc(DataNoEagainThread, data_no_eagain_width);
+    defer gpa.free(storm);
+    const threads = try gpa.alloc(std.Thread, data_no_eagain_width);
+    defer gpa.free(threads);
+    var phase_ms: [4]u64 = undefined;
+    {
+        var pb: [160]u8 = undefined;
+        const s_fd = try openRaw(try std.fmt.bufPrintSentinel(&pb, "{s}/s", .{rig.mp}, 0), .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true });
+        defer _ = linux.close(s_fd);
+        try dm.delayWrites(no_eagain_delay_ms);
+        var spawned: usize = 0;
+        defer {
+            gate.store(3, .release);
+            for (threads[0..spawned]) |t| t.join();
+            dm.delayWrites(0) catch {};
+        }
+        for (storm, threads, 0..) |*t, *th, i| {
+            t.* = .{ .s_fd = s_fd, .idx = i, .payload = payload, .gate = &gate, .arrived = &arrived };
+            th.* = try std.Thread.spawn(.{ .stack_size = 1 << 20 }, DataNoEagainThread.run, .{t});
+            spawned += 1;
+        }
+        for ([_]u32{ 0, 1, 2, 3 }, &phase_ms) |phase, *ms| {
+            const t0 = clock.monotonicNs();
+            gate.store(phase, .release);
+            if (!awaitArrived(&arrived, (phase + 1) * data_no_eagain_width)) {
+                std.debug.print("\nsmoke[data no-eagain]: phase {d} still owes {d} threads past {d} s — the daemon's kernel stacks:\n", .{ phase, (phase + 1) * data_no_eagain_width - arrived.load(.acquire), no_eagain_phase_ns / std.time.ns_per_s });
+                printKernelStacks(io, rig.child_pid);
+                abortFuseConnectionOf(io, rig.mp);
+                return error.StormWedged;
+            }
+            ms.* = (clock.monotonicNs() - t0) / std.time.ns_per_ms;
+        }
+    }
+    var again: usize = 0;
+    var failed: usize = 0;
+    for (storm) |t| for ([_]linux.E{ t.open_e, t.write_e, t.fsync_e, t.read_e }, [_][]const u8{ "create", "write", "fsync", "O_DIRECT read" }) |e, what| {
+        if (e == .SUCCESS) continue;
+        if (failed == 0) std.debug.print("\nsmoke[data no-eagain]: thread {d}'s {s} answered {t}\n", .{ t.idx, what, e });
+        failed += 1;
+        if (e == .AGAIN) again += 1;
+    };
+    const st = try rig.stats();
+    defer gpa.free(st);
+    std.debug.print("\nsmoke[data no-eagain]: writes and flushes {d} ms late: {d} creates in {d} ms, {d} concurrent 64 KiB writes in {d} ms, fsyncs in {d} ms, O_DIRECT reads in {d} ms; lane door waits {d}, bounce pool exhaustions {d}; failed {d} (EAGAIN {d})\n", .{ no_eagain_delay_ms, data_no_eagain_width, phase_ms[0], data_no_eagain_width, phase_ms[1], phase_ms[2], phase_ms[3], numberAfter(st, "\"dev_cell_waits\":") orelse 0, numberAfter(st, "\"read_fill_pool_exhausted\":") orelse 0, failed, again });
+    try testing.expectEqual(@as(usize, 0), again);
+    try testing.expectEqual(@as(usize, 0), failed);
+    try expectMustStayZero(st);
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+}
+
 /// The rejoin row's cycles: each one a clean umount of B and its remount
 /// under the same mount point while A stays up — the window the rejoin's
 /// stale projection needs is B's remount inside A's 1 s cadence, which a

@@ -843,7 +843,20 @@ pub const DataPlane = struct {
         budget.authority.register(budget.Component.init("parked_extents", 0, 0, .{ .gauge = &extent_overlay.stats.parked_extent_bytes }, null));
         budget.authority.register(self.wp.governor.component());
 
-        // 7. The packer (the promotion primitive's packed arm).
+        // 7. The packer (the promotion primitive's packed arm), bound with
+        //    the write cache alone. A cache-less mount writes a small file
+        //    STRIPED, a whole block per file, and its landing cannot flip
+        //    it to packed: a striped writer holds no (3.7) — its kind is
+        //    read once, before its bytes reach a parked buffer, and a
+        //    within-EOF writer drops the level-1 guard before its data
+        //    phase — so a flip published between that read and its record
+        //    leaves the write's buffer under a packed layout, whose landing
+        //    the merge discards as a dead generation (`mergeLocked`): an
+        //    acked write lost. The promotion's flip is safe because staged
+        //    writers hold (3.7) and the ring holds the whole image. A
+        //    cache-less pack arm owes a writer/flip exclusion on the ino
+        //    (register-then-check, model-checked) — decision 0003 §BR.11
+        //    (d), owed.
         if (self.stage != null) {
             self.packer = pack.Packer.init(gpa, cfg.chunk_size, pack.Policy.fromEnv(opts.env, cfg.chunk_size), self.packAllocSeam(), self.dmaSeam(), self.packReadSeam(), router.MAX_VOLUMES) catch return error.OutOfMemory;
         }

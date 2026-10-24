@@ -198,6 +198,14 @@ pub const KvTx = struct {
     /// caches follow the reply. Any other origin — a peer's served step or
     /// ship, a job, a tool — is invalidated in it (§AB.2).
     kernel_origin: bool = false,
+    /// The change's own channel tells this mount's kernel (a ring write's:
+    /// the IPC host's KD-11 invalidator announces its size before the ack):
+    /// the conveyor invalidates nothing of it unless its window fails. Its
+    /// ack posture stays its origin's. A second, late invalidation is not
+    /// harmless — one that lands while a kernel GETATTR of the inode is in
+    /// flight makes the kernel drop the fresh reply (attr_version) and read
+    /// against its stale size.
+    kernel_told: bool = false,
     names: NameNotes = .{},
 
     /// `site` is the committer's `@src()`.
@@ -451,6 +459,7 @@ pub const QueuedTx = struct {
     class: AdmissionClass,
     token_quiet: bool,
     kernel_origin: bool = false,
+    kernel_told: bool = false,
     names: NameNotes = .{},
     site: Site,
     /// Never read, only owned: the hold IS the same-key exclusion. Released
@@ -547,6 +556,7 @@ pub fn buildQueuedTx(tx: *KvTx, node_size: usize, diag: ?*BuildRefusal) BuildErr
     const class = tx.class;
     const token_quiet = tx.token_quiet;
     const kernel_origin = tx.kernel_origin;
+    const kernel_told = tx.kernel_told;
     const names = tx.names;
     const site = tx.site;
     const door_bypass = tx.door_bypass;
@@ -585,6 +595,7 @@ pub fn buildQueuedTx(tx: *KvTx, node_size: usize, diag: ?*BuildRefusal) BuildErr
         .class = class,
         .token_quiet = token_quiet,
         .kernel_origin = kernel_origin,
+        .kernel_told = kernel_told,
         .names = names,
         .site = site,
         .guards = guards,

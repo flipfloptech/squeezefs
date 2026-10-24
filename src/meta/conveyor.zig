@@ -1297,7 +1297,8 @@ fn unnamedDentries(q: *const tx.QueuedTx) bool {
 
 /// THIS mount's kernel as the conveyor sees it (decision 0003 §AB.2): a
 /// change the kernel did not ask for — a peer's served step or ship, a job,
-/// a tool (`!kernel_origin`) — and every member of a window that failed
+/// a tool (`!kernel_origin`), unless its own channel tells the kernel
+/// (`kernel_told`) — and every member of a window that failed
 /// (its records were readable in RAM until the rollback) is invalidated in
 /// it at the window's terminal outcome: after the RAM apply, so a lookup
 /// that follows reads the new records, and before the member's ack. The
@@ -3290,13 +3291,14 @@ pub const Conveyor = struct {
     }
 
     /// One member's invalidation in this mount's kernel (`KernelView`): a
-    /// change its kernel asked for and got is its reply's to tell; the
+    /// change its kernel asked for and got is its reply's to tell, one its
+    /// own channel tells (`kernel_told`) is that channel's; the
     /// migration engine's delta copy re-homes records without changing a
     /// name or an attribute; a `token_quiet` control record is no kernel's.
     fn noteKernel(view: *const KernelView, q: *const tx.QueuedTx, failed: bool) void {
         // `token_quiet`: a control record no kernel caches.
         if (q.door_bypass or q.token_quiet) return;
-        if (q.kernel_origin and !failed) return;
+        if ((q.kernel_origin or q.kernel_told) and !failed) return;
         // The objects in chunks through a stack buffer (no allocation on
         // the lane); adjacent duplicates folded (a member's records are
         // grouped by object).
@@ -4316,6 +4318,39 @@ test "the kernel view (decision 0003 §AB.2): a change this mount's kernel did n
     }
     try testing.expectEqual(@as(u32, 2), v.calls);
     try testing.expectEqual(@as(u32, 1), v.unnamed);
+}
+
+test "the kernel view: a change its own channel tells this mount's kernel (`kernel_told` — a ring write's commit, whose size the IPC host announced before the ack) is not invalidated back: the duplicate, landing after the ack inside a kernel GETATTR, made the kernel drop the fresh size (the IPC host's aio row read 0 of 32 KiB) — the same change from a tool is still invalidated" {
+    const h = try Harness.create(.{}, null, false);
+    defer h.destroy();
+    const View = struct {
+        calls: u32 = 0,
+        fn invalidate(ctx: *anyopaque, _: []const tx.NameNote, _: bool, _: []const u64) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.calls += 1;
+        }
+    };
+    var v: View = .{};
+    const kv: KernelView = .{ .ctx = &v, .invalidate = &View.invalidate };
+    h.cv.armKernel(&kv);
+    defer h.cv.disarmKernel();
+    {
+        const t = try h.gpa.create(tx.KvTx);
+        defer h.gpa.destroy(t);
+        t.* = tx.KvTx.init(h.gpa, @src());
+        _ = try h.stageCreate(t, "ring-told");
+        t.kernel_told = true;
+        try h.cv.commit(t);
+    }
+    try testing.expectEqual(@as(u32, 0), v.calls);
+    {
+        const t = try h.gpa.create(tx.KvTx);
+        defer h.gpa.destroy(t);
+        t.* = tx.KvTx.init(h.gpa, @src());
+        _ = try h.stageCreate(t, "tool-made");
+        try h.cv.commit(t);
+    }
+    try testing.expectEqual(@as(u32, 1), v.calls);
 }
 
 test "the ack spin's bound (decision 0003 §AB.4): no measured wake ⇒ no spin; 2·W when the ack's mean is within it; an ack predicted past 2·W ⇒ no spin (every spin would fall through)" {

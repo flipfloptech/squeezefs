@@ -67,6 +67,10 @@ pub const Ctx = struct {
     /// change is never invalidated back into it (decision 0003 §AB.2). A
     /// tool, a served verb, a test calling the filesystem directly: false.
     kernel: bool = false,
+    /// The caller tells this mount's kernel of its change itself — the IPC
+    /// host's handoffs (KD-11) — so its commits are `kernel_told`: never
+    /// invalidated back, with the ack posture of a non-kernel origin.
+    kernel_told: bool = false,
 
     /// Stamp a stage: the trace moves (a clock read only under profiling)
     /// and the watchdog station follows (one relaxed store).

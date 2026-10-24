@@ -692,7 +692,7 @@ pub const DataPlaneSink = struct {
     const HANDOFF_LANE_ATTEMPTS: u8 = 3;
 
     fn ctxFor(self: *DataPlaneSink, trace: *op_trace.OpTrace, window: []u8) filesystem.Ctx {
-        return .{ .unique = 0, .uid = self.uid, .gid = self.gid, .pid = self.pid, .io = self.io, .trace = trace, .wd_slot = null, .window = window };
+        return .{ .unique = 0, .uid = self.uid, .gid = self.gid, .pid = self.pid, .io = self.io, .trace = trace, .wd_slot = null, .window = window, .kernel_told = true };
     }
 
     fn readHandoff(self: *DataPlaneSink, op: DataOp, c: Completion) void {

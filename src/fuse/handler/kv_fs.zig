@@ -1519,6 +1519,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             // gate's presence — a flat mount arms no gate, and its kernel
             // asked all the same.
             t.kernel_origin = t.kernel_origin or c.kernel;
+            t.kernel_told = t.kernel_told or c.kernel_told;
             self.store.commit(t) catch |e| return storeErr(e);
         }
 
@@ -5336,8 +5337,10 @@ pub const MemStore = struct {
     /// Records the commits carried (Σ staged per commit: an op's record
     /// count is a law the tests pin, decision 0003 §AV).
     records_committed: u64 = 0,
-    /// The last commit's `kernel_origin` (the kernel view's law).
+    /// The last commit's `kernel_origin` / `kernel_told` (the kernel
+    /// view's law).
     last_kernel_origin: bool = false,
+    last_kernel_told: bool = false,
     fsyncs: u64 = 0,
     /// Value bytes `lookup` and `range` copied out (a view copies none).
     value_bytes_copied: u64 = 0,
@@ -5450,6 +5453,7 @@ pub const MemStore = struct {
         self.commits += 1;
         self.records_committed += t.staged.items.len;
         self.last_kernel_origin = t.kernel_origin;
+        self.last_kernel_told = t.kernel_told;
     }
 
     pub fn lookup(self: *MemStore, gpa: Allocator, kind: u8, k: []const u8) StoreError!?[]u8 {
@@ -5901,7 +5905,7 @@ fn HarnessOf(comptime Data: type) type {
 
 const Harness = HarnessOf(NoData);
 
-test "a request the kernel sent is kernel-origin WITHOUT a move gate (a flat mount arms none): its conveyor tells its kernel nothing of its own change — else every name it makes is INVAL_ENTRY'd back, d_invalidate throws a mount off a fresh directory and a cwd under it answers getcwd ENOENT (repro-port: LTP linkat02, fanotify13, dirtyc0w_shmem, msgget01 on a cache-path mount); a tool's direct call stays a change the kernel must hear" {
+test "a request the kernel sent is kernel-origin WITHOUT a move gate (a flat mount arms none): its conveyor tells its kernel nothing of its own change — else every name it makes is INVAL_ENTRY'd back, d_invalidate throws a mount off a fresh directory and a cwd under it answers getcwd ENOENT (repro-port: LTP linkat02, fanotify13, dirtyc0w_shmem, msgget01 on a cache-path mount); a tool's direct call stays a change the kernel must hear; a caller that tells the kernel itself (the IPC host's handoffs) commits `kernel_told`, its origin unchanged" {
     var h: Harness = undefined;
     try h.init();
     defer h.deinit();
@@ -5914,6 +5918,13 @@ test "a request the kernel sent is kernel-origin WITHOUT a move gate (a flat mou
     var win: [64]u8 = undefined;
     var c: Ctx = .{ .unique = 1, .uid = 0, .gid = 0, .pid = 0, .io = testing.io, .trace = &tr, .wd_slot = null, .window = &win };
     _ = try h.fs.mkdir(&c, .{ .parent = 1, .name = "tool-made", .mode = 0o755, .umask = 0 });
+    try testing.expect(!h.store.last_kernel_origin);
+    try testing.expect(!h.store.last_kernel_told);
+    // A caller that tells the kernel itself (the IPC host's handoffs): its
+    // commits are `kernel_told` and keep their non-kernel origin.
+    c.kernel_told = true;
+    _ = try h.fs.mkdir(&c, .{ .parent = 1, .name = "ring-told", .mode = 0o755, .umask = 0 });
+    try testing.expect(h.store.last_kernel_told);
     try testing.expect(!h.store.last_kernel_origin);
 }
 

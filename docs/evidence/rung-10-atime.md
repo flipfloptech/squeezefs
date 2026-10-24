@@ -158,3 +158,16 @@ default) and the strictatime open cannot drop it — the same gap there.
   served probe and direct leg, and the IPC fast path, one `localOf` and one relaxed load of a
   per-stripe read-mostly word (the hint) — the lock and its cache line only once per drain tick
   per file.
+
+## Throughput A-B-B-A (2026-10-24, quiet host, the RAM-NVMe set, dist builds, 20 s rows, `tctl_c` 49–74 °C)
+
+Base `c79ecb1` (before atime) against `dev` `9744d22` (atime `bbced72` + idle RSS `e2e3c94` + the
+conveyor window gate `9744d22`), legs A B B A:
+
+| row | A (base) | B (dev) | B (dev) | A (base) | Δ of the means |
+|---|---|---|---|---|---|
+| rr4k-q32j4 IOPS (p50 µs) | 1,299,998 (88.6) | 1,327,760 (87.6) | 1,316,173 (88.6) | 1,331,279 (87.6) | +0.5 % |
+| sw1m-q16j4 MB/s | 51,600 | 49,661 | 50,867 | 49,586 | −0.6 % |
+
+Inside the legs' own spread: the read cache's stripe spin lock, atime's per-read hint load and
+the window gate cost nothing measurable. Sessions `/build/perf/mx/ram-sqz-rabba-{base,dev}-{1,2}`.

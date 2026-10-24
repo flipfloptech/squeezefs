@@ -48,6 +48,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 const journal = @import("journal.zig");
+const ledger = @import("ledger.zig");
 const superblock = @import("superblock.zig");
 const knobs = @import("../core/knobs.zig");
 const testkit = @import("../core/testkit.zig");
@@ -203,8 +204,29 @@ pub const Replay = struct {
     bytes: u64 = 0,
     /// Slots skipped: free (landed) or still filling (never acked).
     skipped: u32 = 0,
-    /// Written slots below the replay's floor (`Image.replay`).
+};
+
+/// What a held copy's replay is judged against (decision 0003 §BQ.3, the
+/// prefix law): the device's own journal — its ledger's checkpoint tail and
+/// the confirmed drops its replay scan finds in a ring image (ring offsets,
+/// the mirror's).
+pub const Chain = struct {
+    ctx: *anyopaque,
+    ledger_tail: u64,
+    dropped: *const fn (ctx: *anyopaque, ring: []const u8) std.mem.Allocator.Error!u64,
+};
+
+/// `Image.planReplay`'s verdict: the slots to write, in seq order; the
+/// written slots behind the ledger's tail (landed, checkpointed); and the
+/// ones past a hole the copy does not hold (not written).
+pub const Plan = struct {
+    accepted: std.ArrayList(u32) = .empty,
     behind: u32 = 0,
+    past_hole: u32 = 0,
+
+    pub fn deinit(self: *Plan, gpa: std.mem.Allocator) void {
+        self.accepted.deinit(gpa);
+    }
 };
 
 /// The replay's device: one write of `bytes` at device offset `off`.
@@ -388,10 +410,7 @@ pub const Image = struct {
     /// Write every `written` slot's runs to `sink` in `seq_base` order,
     /// each run split at the ring's segment boundaries. Idempotent: the
     /// bytes are the lane's own image, a landed slot is free and skipped.
-    /// A slot whose reservation lies below `floor_pos` (the ledger's
-    /// checkpoint tail: landed and checkpointed, its ring space reusable)
-    /// is skipped and counted `behind`.
-    pub fn replay(self: Image, sink: Sink, floor_pos: u64) anyerror!Replay {
+    pub fn replay(self: Image, sink: Sink) anyerror!Replay {
         const h = self.header();
         const table = self.slots();
         var out: Replay = .{};
@@ -412,10 +431,6 @@ pub const Image = struct {
             const s = &table[i];
             first = false;
             last_seq = s.seq_base;
-            if (s.pos_base < floor_pos) {
-                out.behind += 1;
-                continue;
-            }
             for (s.runs[0..@min(s.n_runs, 2)]) |run| {
                 if (run.len == 0) continue;
                 if (run.ring_off + run.len > h.ringBytes()) return error.Corrupt;
@@ -427,6 +442,94 @@ pub const Image = struct {
         for (table) |*s| if (@atomicLoad(u32, &s.state, .acquire) != SLOT_WRITTEN) {
             out.skipped += 1;
         };
+        return out;
+    }
+
+    /// The written slots in seq order (allocated).
+    fn writtenInOrder(self: Image, gpa: std.mem.Allocator) std.mem.Allocator.Error![]u32 {
+        var order: std.ArrayList(u32) = .empty;
+        errdefer order.deinit(gpa);
+        for (self.slots(), 0..) |*s, i| {
+            // acquire pairs with `claim`'s release store.
+            if (@atomicLoad(u32, &s.state, .acquire) == SLOT_WRITTEN) try order.append(gpa, @intCast(i));
+        }
+        const table = self.slots();
+        std.mem.sort(u32, order.items, table, struct {
+            fn lt(t: []Slot, a: u32, b: u32) bool {
+                return t[a].seq_base < t[b].seq_base;
+            }
+        }.lt);
+        return order.toOwnedSlice(gpa);
+    }
+
+    /// Plan a held copy's replay against the device's own chain (decision
+    /// 0003 §BQ.3, the prefix law): in seq order, a slot behind the
+    /// ledger's tail is skipped (landed and checkpointed); every other is
+    /// overlaid on `ring` — the device's ring image, which carries the
+    /// accepted overlays on return — and kept while the scan confirms no
+    /// drop the device did not already have. The first slot that would
+    /// (it lies past a hole the copy does not hold: a window that failed
+    /// and was rolled back, or never claimed a slot) is taken back, and it
+    /// and every later slot are counted `past_hole`, never written: a
+    /// transaction applied past a missing one is a state no writer had.
+    pub fn planReplay(self: Image, gpa: std.mem.Allocator, ring: []u8, chain: Chain) (std.mem.Allocator.Error || error{Corrupt})!Plan {
+        const h = self.header();
+        if (ring.len != h.ringBytes()) return error.Corrupt;
+        const table = self.slots();
+        const m = self.mirror();
+        const order = try self.writtenInOrder(gpa);
+        defer gpa.free(order);
+        var plan: Plan = .{};
+        errdefer plan.deinit(gpa);
+        const base = try chain.dropped(chain.ctx, ring);
+        var saved: std.ArrayList(u8) = .empty;
+        defer saved.deinit(gpa);
+        for (order) |idx| {
+            const s = &table[idx];
+            if (s.pos_base < chain.ledger_tail) {
+                plan.behind += 1;
+                continue;
+            }
+            if (plan.past_hole != 0) {
+                plan.past_hole += 1;
+                continue;
+            }
+            saved.clearRetainingCapacity();
+            const runs = s.runs[0..@min(s.n_runs, 2)];
+            for (runs) |run| {
+                if (run.ring_off + run.len > ring.len) return error.Corrupt;
+                try saved.appendSlice(gpa, ring[run.ring_off..][0..run.len]);
+                @memcpy(ring[run.ring_off..][0..run.len], m[run.ring_off..][0..run.len]);
+            }
+            if (try chain.dropped(chain.ctx, ring) > base) {
+                var at: usize = 0;
+                for (runs) |run| {
+                    @memcpy(ring[run.ring_off..][0..run.len], saved.items[at..][0..run.len]);
+                    at += run.len;
+                }
+                plan.past_hole = 1;
+                continue;
+            }
+            try plan.accepted.append(gpa, idx);
+        }
+        return plan;
+    }
+
+    /// Write `slots`' runs to `sink`, in the order given (`planReplay`'s).
+    pub fn replaySlots(self: Image, sink: Sink, slot_ids: []const u32) anyerror!Replay {
+        const h = self.header();
+        const table = self.slots();
+        var out: Replay = .{};
+        for (slot_ids) |i| {
+            const s = &table[i];
+            for (s.runs[0..@min(s.n_runs, 2)]) |run| {
+                if (run.len == 0) continue;
+                if (run.ring_off + run.len > h.ringBytes()) return error.Corrupt;
+                try self.writeRun(h, sink, run);
+                out.bytes += run.len;
+            }
+            out.windows += 1;
+        }
         return out;
     }
 
@@ -582,28 +685,13 @@ pub const linux_tail = if (builtin.os.tag == .linux) struct {
         }
     };
 
-    pub const ReplayFdError = error{ StatFailed, MapFailed, DeviceOpenFailed, DeviceWriteFailed, BarrierFailed, DeviceReadFailed, Foreign, Stale } || ImageError;
+    pub const ReplayFdError = error{ StatFailed, MapFailed, DeviceOpenFailed, DeviceWriteFailed, BarrierFailed } || ImageError;
 
-    pub const ReplayOptions = struct {
-        /// The device to write (null: the header's path).
-        device_path: ?[]const u8 = null,
-        /// The volume the replayer opened (its superblock's): a header
-        /// naming another is refused `Foreign`.
-        expect: ?Identity = null,
-        /// Read the device's superblock and refuse `Foreign` when it names
-        /// another volume (the supervisor's retry: the path may now name
-        /// another device).
-        verify_device: bool = false,
-        /// The ledger's checkpoint tail (the successor's): a tail past it
-        /// is refused `Stale` (`Image.staleAgainst`).
-        ledger_tail: ?u64 = null,
-    };
-
-    /// One replay of a tail image held by `fd` (the memfd, or a held
-    /// file): map it read-only, judge it (`opts`), open the device, write
-    /// every written slot in seq order, `fsync`. `path_out` receives the
-    /// device path (for the log line).
-    pub fn replayFd(fd: linux.fd_t, opts: ReplayOptions, path_out: *[PATH_CAP]u8, path_len: *usize) ReplayFdError!Replay {
+    /// The supervisor's replay of one tail fd at its daemon's death: map it
+    /// read-only, open the header's device, write every written slot in seq
+    /// order, `fsync`. `path_out` receives the device path (for the log
+    /// line).
+    pub fn replayFd(fd: linux.fd_t, path_out: *[PATH_CAP]u8, path_len: *usize) ReplayFdError!Replay {
         var st: linux.Statx = undefined;
         if (linux.errno(linux.statx(fd, "", linux.AT.EMPTY_PATH, .{ .SIZE = true }, &st)) != .SUCCESS) return error.StatFailed;
         const len: usize = @intCast(st.size);
@@ -614,30 +702,16 @@ pub const linux_tail = if (builtin.os.tag == .linux) struct {
         defer _ = linux.munmap(@ptrCast(ptr), len);
         const image = try Image.open(ptr[0..len]);
         const h = image.header();
-        const dev_path = opts.device_path orelse h.pathSlice();
-        if (dev_path.len > PATH_CAP) return error.PathTooLong;
-        @memcpy(path_out[0..dev_path.len], dev_path);
-        path_len.* = dev_path.len;
-        if (opts.expect) |want| if (!want.eql(h.identity())) return error.Foreign;
-        if (opts.ledger_tail) |t| if (image.staleAgainst(t)) return error.Stale;
+        @memcpy(path_out[0..h.path_len], h.pathSlice());
+        path_len.* = h.path_len;
         var zbuf: [PATH_CAP + 1]u8 = undefined;
-        @memcpy(zbuf[0..dev_path.len], dev_path);
-        zbuf[dev_path.len] = 0;
-        const dev_rc = linux.open(zbuf[0..dev_path.len :0], .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);
+        @memcpy(zbuf[0..h.path_len], h.pathSlice());
+        zbuf[h.path_len] = 0;
+        const dev_rc = linux.open(zbuf[0..h.path_len :0], .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);
         if (linux.errno(dev_rc) != .SUCCESS) return error.DeviceOpenFailed;
         var sink: DeviceSink = .{ .fd = @intCast(dev_rc) };
         defer _ = linux.close(sink.fd);
-        if (opts.verify_device) {
-            var sector: [superblock.sector_len]u8 = undefined;
-            const n = linux.pread(sink.fd, &sector, sector.len, 0);
-            if (linux.errno(n) != .SUCCESS or n != sector.len) return error.DeviceReadFailed;
-            const on_dev: Identity = switch (superblock.classifySector0(&sector, null) catch return error.Foreign) {
-                .v5 => |sb| .{ .volume_uuid = sb.uuid, .set_uuid = sb.set_uuid },
-                .blank, .legacy => return error.Foreign,
-            };
-            if (!on_dev.eql(h.identity())) return error.Foreign;
-        }
-        // The replay's page cache leaves with the replayer on every
+        // The replay's page cache leaves with the supervisor on every
         // outcome: a refused write still `fsync`s what landed in the cache
         // before it, so their writeback error is consumed on THIS descriptor
         // and no dirty page is left for the flusher — a later writeback
@@ -646,12 +720,130 @@ pub const linux_tail = if (builtin.os.tag == .linux) struct {
         // healthy table), a later success lands old windows under its
         // O_DIRECT ring. Then the clean pages go.
         defer _ = linux.fadvise(sink.fd, 0, 0, linux.POSIX_FADV.DONTNEED);
-        const out = image.replay(.{ .ctx = &sink, .write = DeviceSink.write }, opts.ledger_tail orelse 0) catch {
+        const out = image.replay(.{ .ctx = &sink, .write = DeviceSink.write }) catch {
             _ = linux.fsync(sink.fd);
             return error.DeviceWriteFailed;
         };
         if (linux.errno(linux.fsync(sink.fd)) != .SUCCESS) return error.BarrierFailed;
         return out;
+    }
+
+    pub const JudgeError = error{ OutOfMemory, DeviceReadFailed, DeviceWriteFailed, BarrierFailed, Foreign, Stale, Segmented, Corrupt };
+
+    pub const Judged = struct { replay: Replay, held: Held, behind: u32, past_hole: u32 };
+
+    /// The device's chain as `Image.planReplay` reads it: the journal's own
+    /// replay scan (`journal.replayScanImage`) from the ledger's tail.
+    const DeviceChain = struct {
+        gpa: std.mem.Allocator,
+        geo: journal.CoreGeometry,
+        tail: u64,
+
+        fn dropped(ctx: *anyopaque, ring: []const u8) std.mem.Allocator.Error!u64 {
+            const self: *DeviceChain = @ptrCast(@alignCast(ctx));
+            var rec = try journal.replayScanImage(self.gpa, ring, self.geo, self.tail, journal.FIXED_RING_APPENDER);
+            defer rec.deinit();
+            return rec.dropped_torn;
+        }
+    };
+
+    fn preadAll(fd: linux.fd_t, buf: []u8, off: u64) JudgeError!void {
+        var done: usize = 0;
+        while (done < buf.len) {
+            const rc = linux.pread(fd, buf.ptr + done, buf.len - done, @intCast(off + done));
+            switch (linux.errno(rc)) {
+                .SUCCESS => {
+                    if (rc == 0) return error.DeviceReadFailed;
+                    done += rc;
+                },
+                .INTR => continue,
+                else => return error.DeviceReadFailed,
+            }
+        }
+    }
+
+    /// A held copy's replay onto `dev_fd` (the volume's device, opened by
+    /// the caller under the writer lock), JUDGED (decision 0003 §BQ.3):
+    /// the device's superblock names the copy's volume and set (`expect`,
+    /// when given, must too), the newest ledger record's tail is not past
+    /// every window (else `Stale`), and `Image.planReplay` keeps the prefix
+    /// law against the device's own ring; the accepted slots are written
+    /// and barriered, the page cache dropped after.
+    pub fn judgedReplay(gpa: std.mem.Allocator, image: Image, dev_fd: linux.fd_t, expect: ?Identity) JudgeError!Judged {
+        const h = image.header();
+        if (h.n_segments != 0 or h.ring != RING_FIXED) return error.Segmented;
+        // Every read below is the device's, not an earlier cached page.
+        _ = linux.fadvise(dev_fd, 0, 0, linux.POSIX_FADV.DONTNEED);
+        var sector: [superblock.sector_len]u8 = undefined;
+        try preadAll(dev_fd, &sector, 0);
+        const sb = switch (superblock.classifySector0(&sector, null) catch return error.Foreign) {
+            .v5 => |v| v,
+            .blank, .legacy => return error.Foreign,
+        };
+        const on_dev: Identity = .{ .volume_uuid = sb.uuid, .set_uuid = sb.set_uuid };
+        if (!on_dev.eql(h.identity())) return error.Foreign;
+        if (expect) |want| if (!want.eql(h.identity())) return error.Foreign;
+        const ledger_img = try gpa.alloc(u8, @intCast(sb.root_ledger.len));
+        defer gpa.free(ledger_img);
+        try preadAll(dev_fd, ledger_img, sb.root_ledger.start);
+        var rec = (try ledger.newestValid(gpa, ledger_img)) orelse return error.Corrupt;
+        const tail = rec.journal_tail_seq;
+        rec.deinit(gpa);
+        if (image.staleAgainst(tail)) return error.Stale;
+        const ring = try gpa.alloc(u8, @intCast(h.ringBytes()));
+        defer gpa.free(ring);
+        try preadAll(dev_fd, ring, h.base);
+        var chain: DeviceChain = .{ .gpa = gpa, .geo = journal.productionGeometry(h.pages, h.grain), .tail = tail };
+        var plan = image.planReplay(gpa, ring, .{ .ctx = &chain, .ledger_tail = tail, .dropped = DeviceChain.dropped }) catch |e| return switch (e) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.Corrupt => error.Corrupt,
+        };
+        defer plan.deinit(gpa);
+        var sink: DeviceSink = .{ .fd = dev_fd };
+        defer _ = linux.fadvise(dev_fd, 0, 0, linux.POSIX_FADV.DONTNEED);
+        const out = image.replaySlots(.{ .ctx = &sink, .write = DeviceSink.write }, plan.accepted.items) catch {
+            _ = linux.fsync(dev_fd);
+            return error.DeviceWriteFailed;
+        };
+        if (linux.errno(linux.fsync(dev_fd)) != .SUCCESS) return error.BarrierFailed;
+        return .{ .replay = out, .held = image.held(), .behind = plan.behind, .past_hole = plan.past_hole };
+    }
+
+    /// A tail image held by `fd` (a held copy or a kept memfd), mapped
+    /// read-only.
+    const Mapped = struct {
+        ptr: [*]align(MIRROR_ALIGN) u8,
+        len: usize,
+        image: Image,
+
+        fn map(fd: linux.fd_t) (ImageError || error{ StatFailed, MapFailed })!Mapped {
+            var st: linux.Statx = undefined;
+            if (linux.errno(linux.statx(fd, "", linux.AT.EMPTY_PATH, .{ .SIZE = true }, &st)) != .SUCCESS) return error.StatFailed;
+            const len: usize = @intCast(st.size);
+            if (len < @sizeOf(Header)) return error.Short;
+            const map_rc = linux.mmap(null, len, .{ .READ = true }, .{ .TYPE = .SHARED }, fd, 0);
+            if (linux.errno(map_rc) != .SUCCESS) return error.MapFailed;
+            const ptr: [*]align(MIRROR_ALIGN) u8 = @ptrFromInt(map_rc);
+            const image = Image.open(ptr[0..len]) catch |e| {
+                _ = linux.munmap(@ptrCast(ptr), len);
+                return e;
+            };
+            return .{ .ptr = ptr, .len = len, .image = image };
+        }
+
+        fn unmap(self: *Mapped) void {
+            _ = linux.munmap(@ptrCast(self.ptr), self.len);
+        }
+    };
+
+    fn openDevice(path: []const u8) ?linux.fd_t {
+        var zbuf: [PATH_CAP + 1]u8 = undefined;
+        if (path.len > PATH_CAP) return null;
+        @memcpy(zbuf[0..path.len], path);
+        zbuf[path.len] = 0;
+        const rc = linux.open(zbuf[0..path.len :0], .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);
+        if (linux.errno(rc) != .SUCCESS) return null;
+        return @intCast(rc);
     }
 
     pub const PersistError = error{ StatFailed, MapFailed, DirFailed, CreateFailed, WriteFailed, Exists, NothingHeld, PathTooLong } || ImageError;
@@ -743,28 +935,30 @@ pub const linux_tail = if (builtin.os.tag == .linux) struct {
     }
 
     pub const Retry = union(enum) {
-        /// Replayed and barriered: the held file is gone.
-        landed: Replay,
-        /// A writer of the volume holds its lock: it replays the file
+        /// Replayed (judged) and barriered: the held copy is gone.
+        landed: Judged,
+        /// A writer of the volume holds its lock: it replays the copy
         /// before it reads the ring (`consumeHeld`).
         busy,
-        /// The file is gone: a writer replayed it.
+        /// The copy is gone: a writer replayed it.
         gone,
         /// The device at the header's path names another volume (a
-        /// reformat, a re-stack): the file stays for that volume's next
+        /// reformat, a re-stack): the copy stays for that volume's next
         /// writer; retrying here is over.
         foreign,
+        /// The ledger's tail passed every window: removed, never written.
+        stale,
         /// Still refused by the device (or unreadable): retry later.
-        failed: ReplayFdError,
+        failed: anyerror,
     };
 
-    /// The supervisor's retry of a held file (`file`, its own path): under
-    /// the volume's writer lock taken NON-BLOCKING on a fresh descriptor
-    /// of the header's device (a live writer holds it: it is that writer's
-    /// to replay), the file re-checked present under the lock, the device
-    /// read for its identity, the replay, and the file unlinked on its
-    /// landing — before the lock drops.
-    pub fn retryHeld(file: [:0]const u8, path_out: *[PATH_CAP]u8, path_len: *usize) Retry {
+    /// The supervisor's retry of a held copy (`file`, its own path): under
+    /// the volume's writer lock taken NON-BLOCKING on a fresh descriptor of
+    /// the header's device (a live writer holds it: it is that writer's to
+    /// replay), the copy re-checked present under the lock, the judged
+    /// replay (`judgedReplay`), and the copy unlinked once it lands —
+    /// before the lock drops.
+    pub fn retryHeld(gpa: std.mem.Allocator, file: [:0]const u8) Retry {
         const rc = linux.open(file, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
         switch (linux.errno(rc)) {
             .SUCCESS => {},
@@ -773,18 +967,11 @@ pub const linux_tail = if (builtin.os.tag == .linux) struct {
         }
         const fd: linux.fd_t = @intCast(rc);
         defer _ = linux.close(fd);
-        var hdr: Header = undefined;
-        const n = linux.pread(fd, std.mem.asBytes(&hdr), @sizeOf(Header), 0);
-        if (linux.errno(n) != .SUCCESS or n != @sizeOf(Header)) return .{ .failed = error.Short };
-        if (!std.mem.eql(u8, &hdr.magic, &MAGIC) or hdr.version != VERSION or hdr.path_len > PATH_CAP) return .{ .failed = error.BadMagic };
-        var zbuf: [PATH_CAP + 1]u8 = undefined;
-        @memcpy(zbuf[0..hdr.path_len], hdr.path[0..hdr.path_len]);
-        zbuf[hdr.path_len] = 0;
-        const lock_rc = linux.open(zbuf[0..hdr.path_len :0], .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);
-        if (linux.errno(lock_rc) != .SUCCESS) return .{ .failed = error.DeviceOpenFailed };
-        const lock_fd: linux.fd_t = @intCast(lock_rc);
-        defer _ = linux.close(lock_fd);
-        switch (linux.errno(linux.flock(lock_fd, std.posix.LOCK.EX | std.posix.LOCK.NB))) {
+        var m = Mapped.map(fd) catch |e| return .{ .failed = e };
+        defer m.unmap();
+        const dev_fd = openDevice(m.image.header().pathSlice()) orelse return .{ .failed = error.DeviceOpenFailed };
+        defer _ = linux.close(dev_fd);
+        switch (linux.errno(linux.flock(dev_fd, std.posix.LOCK.EX | std.posix.LOCK.NB))) {
             .SUCCESS => {},
             .AGAIN => return .busy,
             else => return .{ .failed = error.DeviceOpenFailed },
@@ -793,34 +980,51 @@ pub const linux_tail = if (builtin.os.tag == .linux) struct {
         var st: linux.Statx = undefined;
         if (linux.errno(linux.statx(fd, "", linux.AT.EMPTY_PATH, .{ .NLINK = true }, &st)) != .SUCCESS) return .{ .failed = error.StatFailed };
         if (st.nlink == 0) return .gone;
-        const r = replayFd(fd, .{ .verify_device = true }, path_out, path_len) catch |e| return switch (e) {
+        const j = judgedReplay(gpa, m.image, dev_fd, null) catch |e| return switch (e) {
             error.Foreign => .foreign,
+            error.Stale => blk: {
+                _ = linux.unlink(file);
+                break :blk .stale;
+            },
             else => .{ .failed = e },
         };
         _ = linux.unlink(file);
-        return .{ .landed = r };
+        return .{ .landed = j };
+    }
+
+    /// The supervisor's retry of a tail it KEPT (no held copy could be
+    /// written: the writer guards are still its own, so no writer holds the
+    /// volume): the judged replay onto the header's device.
+    pub fn retryKept(gpa: std.mem.Allocator, fd: linux.fd_t) anyerror!Judged {
+        var m = try Mapped.map(fd);
+        defer m.unmap();
+        const dev_fd = openDevice(m.image.header().pathSlice()) orelse return error.DeviceOpenFailed;
+        defer _ = linux.close(dev_fd);
+        return judgedReplay(gpa, m.image, dev_fd, null);
     }
 
     pub const Consumed = union(enum) {
         /// No held copy of this volume's tail.
         none,
-        /// Replayed and barriered, the file removed.
-        landed: struct { replay: Replay, held: Held },
-        /// Refused: its first window is behind the ledger's checkpoint
-        /// tail (`Image.staleAgainst`) — written over by a writer that ran
+        /// Replayed (judged) and barriered, the copy removed.
+        landed: Judged,
+        /// Refused: the ledger's checkpoint tail passed every window it
+        /// holds (`Image.staleAgainst`) — written over by a writer that ran
         /// without it; removed, never written.
         stale: Held,
-        /// Refused: named for this volume, the header names another; left.
+        /// Refused: named for this volume, the copy (or the device at this
+        /// path) names another; left.
         foreign: Identity,
-        /// The device refused the replay (or the file is unreadable): the
+        /// The device refused the replay (or the copy is unreadable): the
         /// caller refuses to open.
-        failed: ReplayFdError,
+        failed: anyerror,
     };
 
-    /// The successor's consumption of its volume's held tail (`file`):
+    /// The successor's consumption of its volume's held copy (`file`):
     /// called under this writer's lock, after the superblock and the ledger
-    /// were read and before the ring is (`KvBackend.open`).
-    pub fn consumeHeld(file: [:0]const u8, device_path: []const u8, identity: Identity, ledger_tail: u64) Consumed {
+    /// were read and before the ring is (`KvBackend.open`); the judged
+    /// replay onto THIS writer's device path.
+    pub fn consumeHeld(gpa: std.mem.Allocator, file: [:0]const u8, device_path: []const u8, identity: Identity) Consumed {
         const rc = linux.open(file, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
         switch (linux.errno(rc)) {
             .SUCCESS => {},
@@ -829,36 +1033,21 @@ pub const linux_tail = if (builtin.os.tag == .linux) struct {
         }
         const fd: linux.fd_t = @intCast(rc);
         defer _ = linux.close(fd);
-        var held: Held = .{};
-        {
-            var st: linux.Statx = undefined;
-            if (linux.errno(linux.statx(fd, "", linux.AT.EMPTY_PATH, .{ .SIZE = true }, &st)) != .SUCCESS) return .{ .failed = error.StatFailed };
-            const len: usize = @intCast(st.size);
-            if (len < @sizeOf(Header)) return .{ .failed = error.Short };
-            const map_rc = linux.mmap(null, len, .{ .READ = true }, .{ .TYPE = .SHARED }, fd, 0);
-            if (linux.errno(map_rc) != .SUCCESS) return .{ .failed = error.MapFailed };
-            const ptr: [*]align(MIRROR_ALIGN) u8 = @ptrFromInt(map_rc);
-            defer _ = linux.munmap(@ptrCast(ptr), len);
-            const image = Image.open(ptr[0..len]) catch |e| return .{ .failed = e };
-            held = image.held();
-        }
-        var pbuf: [PATH_CAP]u8 = undefined;
-        var plen: usize = 0;
-        const r = replayFd(fd, .{ .device_path = device_path, .expect = identity, .ledger_tail = ledger_tail }, &pbuf, &plen) catch |e| switch (e) {
+        var m = Mapped.map(fd) catch |e| return .{ .failed = e };
+        defer m.unmap();
+        const held = m.image.held();
+        const dev_fd = openDevice(device_path) orelse return .{ .failed = error.DeviceOpenFailed };
+        defer _ = linux.close(dev_fd);
+        const j = judgedReplay(gpa, m.image, dev_fd, identity) catch |e| switch (e) {
             error.Stale => {
                 _ = linux.unlink(file);
                 return .{ .stale = held };
             },
-            error.Foreign => {
-                var hdr: Header = undefined;
-                const n = linux.pread(fd, std.mem.asBytes(&hdr), @sizeOf(Header), 0);
-                if (linux.errno(n) != .SUCCESS or n != @sizeOf(Header)) return .{ .failed = error.Short };
-                return .{ .foreign = hdr.identity() };
-            },
+            error.Foreign => return .{ .foreign = m.image.header().identity() },
             else => return .{ .failed = e },
         };
         _ = linux.unlink(file);
-        return .{ .landed = .{ .replay = r, .held = held } };
+        return .{ .landed = j };
     }
 } else struct {};
 
@@ -961,7 +1150,7 @@ test "claim + replay: a claimed window's bytes reach the device at the ops' offs
         }
     };
     var ord: Order = .{ .inner = &dev, .seen = &order };
-    const r1 = try img.replay(.{ .ctx = &ord, .write = Order.write }, 0);
+    const r1 = try img.replay(.{ .ctx = &ord, .write = Order.write });
     try testing.expectEqual(@as(u32, 2), r1.windows);
     try testing.expectEqual(@as(u64, 1024 + 24 + 512), r1.bytes);
     try testing.expectEqual(@as(u32, 2), r1.skipped);
@@ -978,7 +1167,7 @@ test "claim + replay: a claimed window's bytes reach the device at the ops' offs
     // device image is unchanged by the rewrite.
     img.release(sb);
     const before = dev_bytes;
-    const r2 = try img.replay(dev.sink(), 0);
+    const r2 = try img.replay(dev.sink());
     try testing.expectEqual(@as(u32, 1), r2.windows);
     try testing.expectEqual(@as(u64, 1024), r2.bytes);
     try testing.expectEqualSlices(u8, &before, &dev_bytes);
@@ -986,7 +1175,7 @@ test "claim + replay: a claimed window's bytes reach the device at the ops' offs
     // A slot mid-fill is not replayed.
     img.slots()[sb].state = SLOT_FILLING;
     img.slots()[sb].seq_base = 50;
-    const r3 = try img.replay(dev.sink(), 0);
+    const r3 = try img.replay(dev.sink());
     try testing.expectEqual(@as(u32, 1), r3.windows);
     img.slots()[sb].state = SLOT_FREE;
 
@@ -1022,7 +1211,7 @@ test "claim: a window across the ring's wrap records two runs (the high run to t
         try testing.expectEqual(@as(u64, 512), img.slots()[s].runs[1].len);
         var dev_bytes: [4 * 4096]u8 = @splat(0);
         var dev: MemDevice = .{ .bytes = &dev_bytes };
-        const r = try img.replay(dev.sink(), 0);
+        const r = try img.replay(dev.sink());
         try testing.expectEqual(@as(u32, 1), r.windows);
         try testing.expectEqual(@as(u64, 1024), r.bytes);
         try testing.expectEqualSlices(u8, &hi, dev_bytes[4 * 4096 - 512 ..]);
@@ -1044,7 +1233,7 @@ test "claim: a window across the ring's wrap records two runs (the high run to t
         _ = img.claim(&cursor, 1, 1, &.{ .{ .offset = 65536, .bytes = &p0 }, .{ .offset = 16384, .bytes = &p1 } }).?;
         var dev_bytes: [65536 + 4096]u8 = @splat(0);
         var dev: MemDevice = .{ .bytes = &dev_bytes };
-        const r = try img.replay(dev.sink(), 0);
+        const r = try img.replay(dev.sink());
         try testing.expectEqual(@as(u32, 1), r.windows);
         try testing.expectEqual(@as(u64, 4096 + 1024), r.bytes);
         try testing.expectEqual(@as(usize, 2), dev.writes);
@@ -1080,13 +1269,70 @@ test "held: the written slots' summary (windows, lowest position, stamp span); a
     try testing.expect(!img.staleAgainst(8192));
     // Past both: stale.
     try testing.expect(img.staleAgainst(8193));
-    var dev_bytes: [5 * 4096]u8 = @splat(0);
+}
+
+/// A stand-in for the journal scan (`Chain.dropped`): pages from the tail's
+/// page on, a zero page followed by a non-zero one is a confirmed drop.
+const PageChain = struct {
+    first_page: usize,
+
+    fn dropped(ctx: *anyopaque, ring: []const u8) std.mem.Allocator.Error!u64 {
+        const self: *PageChain = @ptrCast(@alignCast(ctx));
+        var n: u64 = 0;
+        var gap = false;
+        var p: usize = self.first_page;
+        while (p * journal.PAGE_LEN < ring.len) : (p += 1) {
+            const page = ring[p * journal.PAGE_LEN ..][0..journal.PAGE_LEN];
+            if (std.mem.allEqual(u8, page, 0)) {
+                gap = true;
+            } else if (gap) {
+                n += 1;
+                gap = false;
+            }
+        }
+        return n;
+    }
+};
+
+test "planReplay: the prefix law — a held slot behind the ledger's tail is skipped; the slots that extend the device's chain are kept and overlaid; the first slot past a hole the copy does not hold is taken back, and it and every later slot are past_hole, never written" {
+    const layout: journal.RingLayout = .{ .base = 0, .pages = 8 };
+    const facts = testFacts(layout, 8);
+    const bytes = try allocImage(facts);
+    defer testing.allocator.free(bytes);
+    const img = try Image.format(bytes, facts);
+    var cursor: std.atomic.Value(u32) = .init(0);
+    const page: [4096]u8 = @splat(0x5C);
+    // Held: pages 1 (behind the tail), 3, 4, then 6 — page 5 is a hole the
+    // copy does not hold (a window that failed and was rolled back).
+    for ([_]u64{ 1, 3, 4, 6 }) |pg| _ = img.claim(&cursor, 100 + pg, pg * 4096, &.{.{ .offset = pg * 4096, .bytes = &page }}).?;
+    // The device: pages 0..2 landed, the rest empty.
+    var ring: [8 * 4096]u8 = @splat(0);
+    @memset(ring[0 .. 3 * 4096], 0x11);
+    var chain_ctx: PageChain = .{ .first_page = 0 };
+    var plan = try img.planReplay(testing.allocator, &ring, .{ .ctx = &chain_ctx, .ledger_tail = 2 * 4096, .dropped = PageChain.dropped });
+    defer plan.deinit(testing.allocator);
+    try testing.expectEqual(@as(u32, 1), plan.behind);
+    try testing.expectEqual(@as(usize, 2), plan.accepted.items.len);
+    try testing.expectEqual(@as(u32, 1), plan.past_hole);
+    // The ring carries the accepted overlays only.
+    try testing.expectEqualSlices(u8, &page, ring[3 * 4096 ..][0..4096]);
+    try testing.expectEqualSlices(u8, &page, ring[4 * 4096 ..][0..4096]);
+    try testing.expect(std.mem.allEqual(u8, ring[6 * 4096 ..][0..4096], 0));
+    // replaySlots writes the plan's slots and nothing else.
+    var dev_bytes: [8 * 4096]u8 = @splat(0);
     var dev: MemDevice = .{ .bytes = &dev_bytes };
-    const r = try img.replay(dev.sink(), 8192);
-    try testing.expectEqual(@as(u32, 1), r.windows);
-    try testing.expectEqual(@as(u32, 1), r.behind);
-    try testing.expectEqualSlices(u8, &b, dev_bytes[4096 + 8192 ..][0..512]);
-    try testing.expectEqual(@as(u8, 0), dev_bytes[4096 + 4096]);
+    const r = try img.replaySlots(dev.sink(), plan.accepted.items);
+    try testing.expectEqual(@as(u32, 2), r.windows);
+    try testing.expectEqualSlices(u8, &page, dev_bytes[3 * 4096 ..][0..4096]);
+    try testing.expect(std.mem.allEqual(u8, dev_bytes[6 * 4096 ..][0..4096], 0));
+    try testing.expect(std.mem.allEqual(u8, dev_bytes[1 * 4096 ..][0..4096], 0));
+    // A hole at the device's head itself: nothing is replayable.
+    var ring2: [8 * 4096]u8 = @splat(0);
+    @memset(ring2[0..4096], 0x11);
+    var plan2 = try img.planReplay(testing.allocator, &ring2, .{ .ctx = &chain_ctx, .ledger_tail = 2 * 4096, .dropped = PageChain.dropped });
+    defer plan2.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 0), plan2.accepted.items.len);
+    try testing.expectEqual(@as(u32, 3), plan2.past_hole);
 }
 
 test "linux: the memfd tail is size-sealed, claims through the mapping, and replayFd writes the written slots to the header's device and barriers" {
@@ -1111,7 +1357,7 @@ test "linux: the memfd tail is size-sealed, claims through the mapping, and repl
     const slot = tail.claim(11, 11, &.{.{ .offset = 4096 + 4096, .bytes = &payload }}).?;
     var pbuf: [PATH_CAP]u8 = undefined;
     var plen: usize = 0;
-    const r = try linux_tail.replayFd(tail.fd, .{}, &pbuf, &plen);
+    const r = try linux_tail.replayFd(tail.fd, &pbuf, &plen);
     try testing.expectEqual(@as(u32, 1), r.windows);
     try testing.expectEqual(@as(u64, 2048), r.bytes);
     try testing.expectEqualStrings(dev_path, pbuf[0..plen]);
@@ -1122,13 +1368,17 @@ test "linux: the memfd tail is size-sealed, claims through the mapping, and repl
     try testing.expectEqualSlices(u8, &payload, got[0..2048]);
     try testing.expectEqual(@as(u8, 0), got[2048]);
     tail.release(slot);
-    const r2 = try linux_tail.replayFd(tail.fd, .{}, &pbuf, &plen);
+    const r2 = try linux_tail.replayFd(tail.fd, &pbuf, &plen);
     try testing.expectEqual(@as(u32, 0), r2.windows);
 }
 
-/// A scratch device file and a held dir under /build/tmp, pid-tagged.
+/// A scratch device file and a held dir under /build/tmp, pid-tagged, the
+/// device carrying a volume's outline: the superblock (sector 0), one
+/// ledger record at a chosen journal tail, and a ring at `ring_base`.
 const HeldRig = if (builtin.os.tag == .linux) struct {
     const linux = std.os.linux;
+    const ring_base: u64 = 1 << 20;
+    const ring_layout: journal.RingLayout = .{ .base = ring_base, .pages = 4 };
     dev_buf: [128]u8 = undefined,
     dir_buf: [128]u8 = undefined,
     dev_path: [:0]const u8 = undefined,
@@ -1142,7 +1392,7 @@ const HeldRig = if (builtin.os.tag == .linux) struct {
         const rc = linux.open(self.dev_path, .{ .ACCMODE = .RDWR, .CLOEXEC = true, .CREAT = true, .TRUNC = true }, 0o644);
         try testing.expectEqual(linux.E.SUCCESS, linux.errno(rc));
         self.dev_fd = @intCast(rc);
-        try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.ftruncate(self.dev_fd, 8 * 4096)));
+        try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.ftruncate(self.dev_fd, 2 << 20)));
     }
 
     fn deinit(self: *HeldRig) void {
@@ -1151,6 +1401,25 @@ const HeldRig = if (builtin.os.tag == .linux) struct {
         var b: [160]u8 = undefined;
         const top = std.fmt.bufPrint(&b, "{s}", .{self.dir[0 .. self.dir.len - "/a/b".len]}) catch return;
         std.Io.Dir.cwd().deleteTree(testing.io, top) catch {};
+    }
+
+    /// Sector 0 names `id`; the ledger's newest record carries `tail`.
+    fn outline(self: *HeldRig, id: Identity, tail: u64) !void {
+        var sb = superblock.testFixture();
+        sb.uuid = id.volume_uuid;
+        sb.set_uuid = id.set_uuid;
+        var sector: [superblock.sector_len]u8 = undefined;
+        try sb.encodeSector(1, &sector, null);
+        try self.writeAt(&sector, 0);
+        var run: [1]ledger.SlotRun = undefined;
+        var rec = ledger.bootstrapRecord(&.{}, 2, 1, ledger.MembershipStamp.member(id.set_uuid, 0, 1, &run));
+        rec.journal_tail_seq = tail;
+        const slot = try rec.encodeSlot();
+        try self.writeAt(&slot, ledger.slotOffset(sb.root_ledger.start, rec.slotIndex()));
+    }
+
+    fn writeAt(self: *HeldRig, bytes: []const u8, off: u64) !void {
+        try testing.expectEqual(bytes.len, linux.pwrite(self.dev_fd, bytes.ptr, bytes.len, @intCast(off)));
     }
 
     fn readAt(self: *HeldRig, buf: []u8, off: u64) !void {
@@ -1165,135 +1434,136 @@ const HeldRig = if (builtin.os.tag == .linux) struct {
     }
 } else struct {};
 
-test "linux: a failed replay's tail is HELD — persistHeld writes a sparse copy of the written slots under the held dir (0700, renamed in, never over an existing copy); the successor's consumeHeld replays it to ITS device path under the identity and the ledger's tail, barriers and removes it; a foreign copy is refused and left; a stale one removed unwritten; no copy is `none`" {
+test "linux: a failed replay's tail is HELD — persistHeld writes a sparse copy of the written slots under the held dir (0700, renamed in, never over an existing copy); the successor's consumeHeld replays it JUDGED to its own device path (the device's superblock and the copy name one volume, the ledger's tail below the windows), barriers and removes it; a foreign copy is refused and left; a stale one removed unwritten; no copy is `none`" {
     if (builtin.os.tag != .linux) return testkit.skip(@src(), .no_linux, "the held tail is Linux only");
     const linux = std.os.linux;
+    const gpa = testing.allocator;
     var rig: HeldRig = .{};
     try rig.init("held");
     defer rig.deinit();
-    const layout: journal.RingLayout = .{ .base = 4096, .pages = 4 };
+    try rig.outline(test_identity, 4096);
+    const base = HeldRig.ring_base;
     // The header names a path that no longer exists: the successor writes
     // its own (a re-stacked device under another name).
-    var tail = try linux_tail.Tail.create(.{ .layout = layout, .grain = 512, .path = "/nonexistent/sqz-old-name", .n_slots = 8, .identity = test_identity, .ring = RING_FIXED });
+    var tail = try linux_tail.Tail.create(.{ .layout = HeldRig.ring_layout, .grain = 512, .path = "/nonexistent/sqz-old-name", .n_slots = 8, .identity = test_identity, .ring = RING_FIXED });
     defer tail.deinit();
     var pbuf: [PATH_CAP]u8 = undefined;
     // Nothing written: nothing to hold.
     try testing.expectError(error.NothingHeld, linux_tail.persistHeld(tail.fd, rig.dir, &pbuf));
     const w1: [1024]u8 = @splat(0x61);
     const w2: [512]u8 = @splat(0x62);
-    _ = tail.claim(500, 4096, &.{.{ .offset = 4096 + 4096, .bytes = &w1 }}).?;
-    const landed = tail.claim(400, 2048, &.{.{ .offset = 4096 + 2048, .bytes = &w2 }}).?;
-    _ = tail.claim(600, 12288, &.{.{ .offset = 4096 + 12288, .bytes = &w2 }}).?;
+    _ = tail.claim(500, 4096, &.{.{ .offset = base + 4096, .bytes = &w1 }}).?;
+    const landed = tail.claim(400, 2048, &.{.{ .offset = base + 2048, .bytes = &w2 }}).?;
+    _ = tail.claim(600, 12288, &.{.{ .offset = base + 12288, .bytes = &w2 }}).?;
     tail.release(landed);
     const p = try linux_tail.persistHeld(tail.fd, rig.dir, &pbuf);
     try testing.expectEqual(@as(u32, 2), p.held.windows);
     try testing.expectEqual(@as(u64, 4096), p.held.pos_lo);
     var hb: [PATH_CAP]u8 = undefined;
     const file = heldPath(&hb, rig.dir, test_identity.volume_uuid).?;
-    try testing.expectEqualStrings(file, std.mem.sliceTo(&pbuf, 0)[0..file.len]);
+    try testing.expectEqualStrings(file, std.mem.sliceTo(&pbuf, 0));
     {
         var st: linux.Statx = undefined;
         try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.statx(linux.AT.FDCWD, rig.dir, 0, .{ .MODE = true }, &st)));
         try testing.expectEqual(@as(u16, 0o700), st.mode & 0o777);
-        try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.statx(linux.AT.FDCWD, file, 0, .{ .SIZE = true, .BLOCKS = true }, &st)));
-        try testing.expectEqual(imageLen(.{ .layout = layout, .grain = 512, .path = "", .n_slots = 8, .identity = test_identity, .ring = RING_FIXED }), st.size);
+        try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.statx(linux.AT.FDCWD, file, 0, .{ .SIZE = true }, &st)));
+        try testing.expectEqual(imageLen(.{ .layout = HeldRig.ring_layout, .grain = 512, .path = "", .n_slots = 8, .identity = test_identity, .ring = RING_FIXED }), st.size);
     }
     // One copy per volume: a second persist is refused, the first kept.
     try testing.expectError(error.Exists, linux_tail.persistHeld(tail.fd, rig.dir, &pbuf));
     try testing.expect(HeldRig.exists(file));
     // Foreign: the successor's volume is another — refused, left in place.
     const other: Identity = .{ .volume_uuid = test_identity.volume_uuid, .set_uuid = "another-set-uuid".* };
-    switch (linux_tail.consumeHeld(file, rig.dev_path, other, 0)) {
+    switch (linux_tail.consumeHeld(gpa, file, rig.dev_path, other)) {
         .foreign => |id| try testing.expect(id.eql(test_identity)),
         else => return error.TestUnexpectedResult,
     }
     try testing.expect(HeldRig.exists(file));
-    // The successor: its device path, its identity, the dead writer's
-    // ledger tail below the first window — both windows land; the copy goes.
-    switch (linux_tail.consumeHeld(file, rig.dev_path, test_identity, 4096)) {
+    // The successor: both windows land on ITS path; the copy goes.
+    switch (linux_tail.consumeHeld(gpa, file, rig.dev_path, test_identity)) {
         .landed => |l| {
             try testing.expectEqual(@as(u32, 2), l.replay.windows);
             try testing.expectEqual(@as(u32, 2), l.held.windows);
+            try testing.expectEqual(@as(u32, 0), l.past_hole);
         },
         else => return error.TestUnexpectedResult,
     }
     try testing.expect(!HeldRig.exists(file));
     var got1: [1024]u8 = undefined;
-    try rig.readAt(&got1, 4096 + 4096);
+    try rig.readAt(&got1, base + 4096);
     try testing.expectEqualSlices(u8, &w1, &got1);
     var got2: [512]u8 = undefined;
-    try rig.readAt(&got2, 4096 + 12288);
+    try rig.readAt(&got2, base + 12288);
     try testing.expectEqualSlices(u8, &w2, &got2);
     // The released (landed) window was not held: its bytes were never written.
-    try rig.readAt(&got2, 4096 + 2048);
+    try rig.readAt(&got2, base + 2048);
     try testing.expectEqual(@as(u8, 0), got2[0]);
     // No copy: none.
-    try testing.expect(linux_tail.consumeHeld(file, rig.dev_path, test_identity, 0) == .none);
+    try testing.expect(linux_tail.consumeHeld(gpa, file, rig.dev_path, test_identity) == .none);
     // Stale: the ledger's tail past every held window — removed, unwritten.
     const zero: [1024]u8 = @splat(0);
-    try testing.expectEqual(@as(usize, zero.len), linux.pwrite(rig.dev_fd, &zero, zero.len, 4096 + 4096));
+    try rig.writeAt(&zero, base + 4096);
     _ = try linux_tail.persistHeld(tail.fd, rig.dir, &pbuf);
-    switch (linux_tail.consumeHeld(file, rig.dev_path, test_identity, 12289)) {
+    try rig.outline(test_identity, 12289);
+    switch (linux_tail.consumeHeld(gpa, file, rig.dev_path, test_identity)) {
         .stale => |h| try testing.expectEqual(@as(u32, 2), h.windows),
         else => return error.TestUnexpectedResult,
     }
     try testing.expect(!HeldRig.exists(file));
-    try rig.readAt(&got1, 4096 + 4096);
+    try rig.readAt(&got1, base + 4096);
     try testing.expectEqual(@as(u8, 0), got1[0]);
 }
 
-test "linux: the supervisor's retry of a held copy — `busy` while a writer holds the volume's lock (that writer replays it), `failed` while the device refuses its superblock read, `foreign` when the device names another volume (the copy stays), `landed` once the device carries the volume's superblock (the copy removed under the lock), `gone` after" {
+test "linux: the supervisor's retry of a held copy — `failed` while the device's superblock cannot be read as a volume's, `foreign` when it names another volume (the copy stays), `busy` while a writer holds the volume's lock (that writer replays it), `landed` once the lock is free (judged, the copy removed under the lock), `gone` after; a kept memfd's retry is the same judged replay" {
     if (builtin.os.tag != .linux) return testkit.skip(@src(), .no_linux, "the held tail is Linux only");
     const linux = std.os.linux;
+    const gpa = testing.allocator;
     var rig: HeldRig = .{};
     try rig.init("retry");
     defer rig.deinit();
-    const sb = superblock.testFixture();
-    const identity: Identity = .{ .volume_uuid = sb.uuid, .set_uuid = sb.set_uuid };
-    // The ring past the superblock's sector.
-    const layout: journal.RingLayout = .{ .base = 4096, .pages = 4 };
-    var tail = try linux_tail.Tail.create(.{ .layout = layout, .grain = 512, .path = rig.dev_path, .n_slots = 4, .identity = identity, .ring = RING_FIXED });
+    const base = HeldRig.ring_base;
+    var tail = try linux_tail.Tail.create(.{ .layout = HeldRig.ring_layout, .grain = 512, .path = rig.dev_path, .n_slots = 4, .identity = test_identity, .ring = RING_FIXED });
     defer tail.deinit();
     const w: [2048]u8 = @splat(0x77);
-    _ = tail.claim(70, 8192, &.{.{ .offset = 4096 + 8192, .bytes = &w }}).?;
+    _ = tail.claim(70, 8192, &.{.{ .offset = base + 8192, .bytes = &w }}).?;
     var pbuf: [PATH_CAP]u8 = undefined;
     _ = try linux_tail.persistHeld(tail.fd, rig.dir, &pbuf);
     var hb: [PATH_CAP]u8 = undefined;
-    const file = heldPath(&hb, rig.dir, identity.volume_uuid).?;
-    var dbuf: [PATH_CAP]u8 = undefined;
-    var dlen: usize = 0;
+    const file = heldPath(&hb, rig.dir, test_identity.volume_uuid).?;
     // A blank device: no volume's superblock — foreign, the copy stays.
-    try testing.expect(linux_tail.retryHeld(file, &dbuf, &dlen) == .foreign);
+    try testing.expect(linux_tail.retryHeld(gpa, file) == .foreign);
     try testing.expect(HeldRig.exists(file));
-    // Another volume's superblock: foreign.
-    var other = sb;
-    other.uuid = "not-this-volume!".*;
-    var sector: [superblock.sector_len]u8 = undefined;
-    try other.encodeSector(1, &sector, null);
-    try testing.expectEqual(@as(usize, sector.len), linux.pwrite(rig.dev_fd, &sector, sector.len, 0));
-    try testing.expect(linux_tail.retryHeld(file, &dbuf, &dlen) == .foreign);
-    // This volume's superblock, a writer holding the lock: busy.
-    try sb.encodeSector(1, &sector, null);
-    try testing.expectEqual(@as(usize, sector.len), linux.pwrite(rig.dev_fd, &sector, sector.len, 0));
+    // Another volume's outline: foreign.
+    try rig.outline(.{ .volume_uuid = "not-this-volume!".*, .set_uuid = test_identity.set_uuid }, 0);
+    try testing.expect(linux_tail.retryHeld(gpa, file) == .foreign);
+    // This volume's outline, a writer holding the lock: busy.
+    try rig.outline(test_identity, 0);
     {
         const lock_rc = linux.open(rig.dev_path, .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);
         try testing.expectEqual(linux.E.SUCCESS, linux.errno(lock_rc));
         const lock_fd: linux.fd_t = @intCast(lock_rc);
         defer _ = linux.close(lock_fd);
         try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.flock(lock_fd, std.posix.LOCK.EX | std.posix.LOCK.NB)));
-        try testing.expect(linux_tail.retryHeld(file, &dbuf, &dlen) == .busy);
+        try testing.expect(linux_tail.retryHeld(gpa, file) == .busy);
     }
     try testing.expect(HeldRig.exists(file));
     // The lock free: landed, the copy removed.
-    switch (linux_tail.retryHeld(file, &dbuf, &dlen)) {
-        .landed => |r| try testing.expectEqual(@as(u32, 1), r.windows),
+    switch (linux_tail.retryHeld(gpa, file)) {
+        .landed => |j| try testing.expectEqual(@as(u32, 1), j.replay.windows),
         else => return error.TestUnexpectedResult,
     }
     try testing.expect(!HeldRig.exists(file));
     var got: [2048]u8 = undefined;
-    try rig.readAt(&got, 4096 + 8192);
+    try rig.readAt(&got, base + 8192);
     try testing.expectEqualSlices(u8, &w, &got);
-    try testing.expect(linux_tail.retryHeld(file, &dbuf, &dlen) == .gone);
+    try testing.expect(linux_tail.retryHeld(gpa, file) == .gone);
+    // The kept memfd (no copy could be written): the same judged replay.
+    const zero: [2048]u8 = @splat(0);
+    try rig.writeAt(&zero, base + 8192);
+    const j = try linux_tail.retryKept(gpa, tail.fd);
+    try testing.expectEqual(@as(u32, 1), j.replay.windows);
+    try rig.readAt(&got, base + 8192);
+    try testing.expectEqualSlices(u8, &w, &got);
 }
 
 test "the held dir: the seam names it; root's is /run/squeezefs/journal-tails; another uid's under /run/user/<uid>; the copy's name is the volume uuid in hex" {

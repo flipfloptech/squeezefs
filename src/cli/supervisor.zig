@@ -384,7 +384,7 @@ pub const linux_loop = if (builtin.os.tag == .linux) struct {
             for (self.tails.items) |t| {
                 var path: [journal_tail.PATH_CAP]u8 = undefined;
                 var path_len: usize = 0;
-                if (journal_tail.linux_tail.replayFd(t.fd, .{}, &path, &path_len)) |r| {
+                if (journal_tail.linux_tail.replayFd(t.fd, &path, &path_len)) |r| {
                     log.info("supervisor: journal tail of volume {d} ({s}): {d} un-landed window(s), {d} bytes replayed and barriered ({d} slot(s) landed or empty)", .{ t.index, path[0..path_len], r.windows, r.bytes, r.skipped });
                     _ = linux.close(t.fd);
                 } else |e| self.holdFailed(t.index, t.fd, path[0..path_len], e, dir.slice());
@@ -465,11 +465,10 @@ pub const linux_loop = if (builtin.os.tag == .linux) struct {
             while (i < self.held.items.len) {
                 const c = &self.held.items[i];
                 c.attempts += 1;
-                var dev: [journal_tail.PATH_CAP]u8 = undefined;
-                var dev_len: usize = 0;
-                switch (journal_tail.linux_tail.retryHeld(c.pathZ(), &dev, &dev_len)) {
-                    .landed => |r| {
-                        log.info("supervisor: the held journal tail of volume {d} ({s}) replayed on retry {d}: {d} window(s), {d} bytes, barriered; {s} removed", .{ c.index, dev[0..dev_len], c.attempts, r.windows, r.bytes, c.pathZ() });
+                switch (journal_tail.linux_tail.retryHeld(self.gpa, c.pathZ())) {
+                    .landed => |j| {
+                        log.info("supervisor: the held journal tail of volume {d} replayed on retry {d}: {d} window(s), {d} bytes, barriered ({d} behind the ledger's tail skipped); {s} removed", .{ c.index, c.attempts, j.replay.windows, j.replay.bytes, j.behind, c.pathZ() });
+                        if (j.past_hole != 0) log.err("supervisor: the held journal tail of volume {d}: {d} acked window(s) lay past a hole the tail does not hold (a window that failed and was rolled back, or never claimed a slot) — NOT replayed: applying them past a missing transaction would break the volume's consistency; that metadata is lost", .{ c.index, j.past_hole });
                         _ = self.held.swapRemove(i);
                         continue;
                     },
@@ -483,25 +482,29 @@ pub const linux_loop = if (builtin.os.tag == .linux) struct {
                         _ = self.held.swapRemove(i);
                         continue;
                     },
+                    .stale => {
+                        log.err("supervisor: the held journal tail of volume {d} is STALE (the ledger's checkpoint tail passed every window: a writer ran without it) — removed unwritten; the acked metadata it held is lost", .{c.index});
+                        _ = self.held.swapRemove(i);
+                        continue;
+                    },
                     .busy => {},
                     .failed => |e| if (std.math.isPowerOfTwo(c.attempts)) log.warn("supervisor: the held journal tail of volume {d} ({s}): retry {d} refused ({s}) — retrying every {d} ms", .{ c.index, c.pathZ(), c.attempts, @errorName(e), self.retry_ns / std.time.ns_per_ms }),
                 }
                 i += 1;
             }
-            var j: usize = 0;
-            while (j < self.held_memfds.items.len) {
-                const t = &self.held_memfds.items[j];
+            var k: usize = 0;
+            while (k < self.held_memfds.items.len) {
+                const t = &self.held_memfds.items[k];
                 t.attempts += 1;
-                var dev: [journal_tail.PATH_CAP]u8 = undefined;
-                var dev_len: usize = 0;
                 // The guards are still ours: no writer can hold the volume.
-                if (journal_tail.linux_tail.replayFd(t.fd, .{ .verify_device = true }, &dev, &dev_len)) |r| {
-                    log.info("supervisor: the kept journal tail of volume {d} ({s}) replayed on retry {d}: {d} window(s), {d} bytes, barriered", .{ t.index, dev[0..dev_len], t.attempts, r.windows, r.bytes });
+                if (journal_tail.linux_tail.retryKept(self.gpa, t.fd)) |j| {
+                    log.info("supervisor: the kept journal tail of volume {d} replayed on retry {d}: {d} window(s), {d} bytes, barriered ({d} behind the ledger's tail skipped)", .{ t.index, t.attempts, j.replay.windows, j.replay.bytes, j.behind });
+                    if (j.past_hole != 0) log.err("supervisor: the kept journal tail of volume {d}: {d} acked window(s) lay past a hole the tail does not hold — NOT replayed (the volume's consistency); that metadata is lost", .{ t.index, j.past_hole });
                     _ = linux.close(t.fd);
-                    _ = self.held_memfds.swapRemove(j);
+                    _ = self.held_memfds.swapRemove(k);
                     continue;
-                } else |e| if (std.math.isPowerOfTwo(t.attempts)) log.warn("supervisor: the kept journal tail of volume {d} ({s}): retry {d} refused ({s})", .{ t.index, dev[0..dev_len], t.attempts, @errorName(e) });
-                j += 1;
+                } else |e| if (std.math.isPowerOfTwo(t.attempts)) log.warn("supervisor: the kept journal tail of volume {d}: retry {d} refused ({s})", .{ t.index, t.attempts, @errorName(e) });
+                k += 1;
             }
             if (self.held_memfds.items.len == 0 and self.guards.items.len != 0) {
                 log.info("supervisor: writer guard released on {d} volume(s) after the kept tails replayed", .{self.guards.items.len});

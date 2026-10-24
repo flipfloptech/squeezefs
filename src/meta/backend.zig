@@ -213,6 +213,9 @@ pub const Stats = struct {
     /// A held tail refused STALE (the ledger's checkpoint tail passed every
     /// window it held): acked metadata lost to a writer that ran without it.
     held_tail_stale: counters.ShardedCounter = .{},
+    /// Acked windows of a held tail NOT replayed: they lay past a hole the
+    /// tail does not hold (the prefix law, decision 0003 §BQ.3).
+    held_tail_past_hole: counters.ShardedCounter = .{},
 };
 
 pub var stats: Stats = .{};
@@ -556,7 +559,7 @@ pub const KvBackend = struct {
         //     acked windows its supervisor could not replay, written under
         //     this mount's writer lock before the ring is read — or the
         //     volume is refused.
-        try replayHeldTail(path, opts.env, sb, mounted.journal_tail_seq);
+        try replayHeldTail(gpa, path, opts.env, sb);
 
         // 5. The ring: one read, the chain walk from the tail.
         const ring_ext = geometry.fixedRingExtent(sb);
@@ -2094,19 +2097,23 @@ pub const KvBackend = struct {
     /// a stale copy (the ledger's checkpoint tail past every window) is
     /// removed unwritten, a foreign one left; while the device refuses the
     /// replay the open is refused — never mounted over.
-    fn replayHeldTail(path: []const u8, env: *const std.process.Environ.Map, sb: superblock.Superblock, ledger_tail: u64) OpenError!void {
+    fn replayHeldTail(gpa: Allocator, path: []const u8, env: *const std.process.Environ.Map, sb: superblock.Superblock) OpenError!void {
         const dir = journal_tail.HeldDir.fromEnv(env);
         var fb: [journal_tail.PATH_CAP]u8 = undefined;
         const file = journal_tail.heldPath(&fb, dir.slice(), sb.uuid) orelse return;
-        switch (journal_tail.linux_tail.consumeHeld(file, path, tailIdentity(sb), ledger_tail)) {
+        switch (journal_tail.linux_tail.consumeHeld(gpa, file, path, tailIdentity(sb))) {
             .none => {},
             .landed => |l| {
                 stats.held_tail_replays.inc();
-                log.warn("meta volume {s}: replayed the HELD journal tail {s} — {d} acked window(s) of the previous mount's last flush (record stamps {d}..{d}, {d} bytes; {d} behind the ledger's tail skipped) its supervisor could not write; barriered, the copy removed", .{ path, file, l.replay.windows, l.held.seq_lo, l.held.seq_hi, l.replay.bytes, l.replay.behind });
+                log.warn("meta volume {s}: replayed the HELD journal tail {s} — {d} acked window(s) of the previous mount's last flush (record stamps {d}..{d}, {d} bytes; {d} behind the ledger's tail skipped) its supervisor could not write; barriered, the copy removed", .{ path, file, l.replay.windows, l.held.seq_lo, l.held.seq_hi, l.replay.bytes, l.behind });
+                if (l.past_hole != 0) {
+                    stats.held_tail_past_hole.add(l.past_hole);
+                    log.err("meta volume {s}: {d} acked window(s) of the held journal tail lay past a hole it does not hold (a window that failed and was rolled back, or never claimed a slot) — NOT replayed: applying them past a missing transaction would break the volume's consistency; that metadata is lost", .{ path, l.past_hole });
+                }
             },
             .stale => |h| {
                 stats.held_tail_stale.inc();
-                log.err("meta volume {s}: the held journal tail {s} is STALE — the ledger's checkpoint tail {d} passed all {d} of its window(s) (from position {d}): a writer ran without it and its bytes no longer describe this ring; removed unwritten — the acked metadata it held is lost", .{ path, file, ledger_tail, h.windows, h.pos_lo });
+                log.err("meta volume {s}: the held journal tail {s} is STALE — the ledger's checkpoint tail passed all {d} of its window(s) (from position {d}): a writer ran without it and its bytes no longer describe this ring; removed unwritten — the acked metadata it held is lost", .{ path, file, h.windows, h.pos_lo });
             },
             .foreign => |id| log.err("meta volume {s}: {s} is named for this volume but holds the tail of volume {s} (set {s}) — refused, left in place", .{ path, file, &std.fmt.bytesToHex(id.volume_uuid, .lower), &std.fmt.bytesToHex(id.set_uuid, .lower) }),
             .failed => |e| {

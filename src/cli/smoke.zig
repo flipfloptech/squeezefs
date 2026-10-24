@@ -3624,6 +3624,119 @@ test "smoke: TWO MOUNTS OF ONE SET ON ONE HOST — each member holds its OWN wri
     std.debug.print("smoke: member scope: B promoted its {d}, A its {d}; every file sha-equal after the remount; fsck clean\n", .{ scope_b_files, scope_a_files });
 }
 
+test "smoke: A JOINED MEMBER'S APPEND TO ANOTHER MEMBER'S FILE IS READ BACK BYTE-EXACT — supervised (the write cache): A (the manager) writes eight files in its own slot (a 1 MiB, a 1,000 B inline, a 5 MiB striped, a 3 MiB, a 1 MiB, a 4 MiB − 10 B — synced — and a 100 KiB and a 5 MiB + 2,616 B never synced) and reads them; B JOINED appends (`echo >>`, `cat >>` past the inline bound, across a block boundary, onto both unsynced files), writes past EOF (a gap), in the middle (unaligned and aligned) and after a truncate-up — every file byte-exact against a mirror through B and through A at once, and again after both remount; fsck --offline --scrub 0 findings" {
+    try foreignAppendRow(true);
+}
+
+test "smoke: A JOINED MEMBER'S APPEND TO ANOTHER MEMBER'S FILE IS READ BACK BYTE-EXACT — foreground (no write cache, decision 0003 §BR.6): the same eight files and the same writes from B — every file byte-exact against the mirror through B and through A at once, and again after both remount; fsck --offline --scrub 0 findings" {
+    try foreignAppendRow(false);
+}
+
+/// The foreign-write row (A JOINED MEMBER'S APPEND …) in one posture: A's
+/// files and their mirror in the work dir, B's writes applied to both, the
+/// mounts judged against the mirror before and after both remount.
+fn foreignAppendRow(write_cache: bool) !void {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    try rig.env.put("SQUEEZEFS_MW_BIND", "127.0.0.1:0");
+    try rig.formatSet(write_cache);
+    try rig.mountAsSet(&.{});
+    _ = try rig.awaitReady(0);
+    const b = try Peer.init(rig, "b");
+    defer b.deinit();
+    try b.spawnAsSet(&.{});
+    _ = try b.awaitReady();
+    {
+        const text = try b.readLog();
+        defer gpa.free(text);
+        try testing.expect(std.mem.indexOf(u8, text, "mounted JOINED as appender 1") != null);
+    }
+    // A's files in A's slot; f7 and f8 never synced (A's resident / A's
+    // striped custody with its size claim parked). A's reads leave every
+    // EOF page in A's page cache.
+    {
+        const out = try rig.onMount(
+            \\m="$1/m"; mkdir own "$m"; cd own
+            \\head -c 1048576 /dev/urandom > "$m/f1"; head -c 1000 /dev/urandom > "$m/f2"
+            \\head -c 5242880 /dev/urandom > "$m/f3"; head -c 3145728 /dev/urandom > "$m/f4"
+            \\head -c 1048576 /dev/urandom > "$m/f5"; head -c 4194294 /dev/urandom > "$m/f6"
+            \\head -c 102400 /dev/urandom > "$m/f7"; head -c 5245496 /dev/urandom > "$m/f8"
+            \\for f in f1 f2 f3 f4 f5 f6; do cp "$m/$f" $f; done; sync -d f1 f2 f3 f4 f5 f6
+            \\cp "$m/f7" f7; cp "$m/f8" f8; cat f1 f2 f3 f4 f5 f6 f7 f8 > /dev/null; echo ok
+        );
+        defer gpa.free(out);
+        try testing.expectEqualStrings("ok\n", out);
+    }
+    // B's writes, each applied to the mirror too.
+    {
+        const out = try b.onMount(
+            \\m="$1/m"; cd own
+            \\for p in 100 300 3000 5000 65536; do head -c $p /dev/urandom > "$1/p$p"; done
+            \\for t in . "$m"; do
+            \\  echo appended-by-b >> "$t/f1"
+            \\  cat "$1/p3000" >> "$t/f2"
+            \\  dd if="$1/p100" of="$t/f3" bs=100 count=1 seek=$((6 * 1048576 + 123)) oflag=seek_bytes conv=notrunc status=none
+            \\  dd if="$1/p5000" of="$t/f4" bs=5000 count=1 seek=$((1048576 + 7)) oflag=seek_bytes conv=notrunc status=none
+            \\  dd if="$1/p65536" of="$t/f4" bs=65536 count=1 seek=$((2 * 1048576)) oflag=seek_bytes conv=notrunc status=none
+            \\  truncate -s 3145728 "$t/f5"
+            \\  dd if="$1/p300" of="$t/f5" bs=300 count=1 seek=$((2 * 1048576 + 5)) oflag=seek_bytes conv=notrunc status=none
+            \\  cat "$1/p100" >> "$t/f6"
+            \\  echo appended-to-a-small-unsynced-file >> "$t/f7"
+            \\  cat "$1/p3000" >> "$t/f8"
+            \\done
+            \\echo ok
+        );
+        defer gpa.free(out);
+        try testing.expectEqualStrings("ok\n", out);
+    }
+    try expectForeignMirror(rig, b, "at once");
+    try b.umount();
+    try b.expectCleanExit("B's clean unmount after the foreign writes");
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+    _ = try fsckClean(rig, "the foreign-write row");
+    const mark_a = try rig.logLen();
+    try rig.mountAsSet(&.{});
+    _ = try rig.awaitReady(mark_a);
+    const mark_b = try b.logLen();
+    try b.spawnAsSet(&.{});
+    _ = try b.awaitLog("ready: ", mark_b, ready_wait_ns);
+    try expectForeignMirror(rig, b, "after both remount");
+    try b.umount();
+    try b.expectCleanExit("B's clean unmount after the remount");
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+    _ = try fsckClean(rig, "the foreign-write row's remount");
+    std.debug.print("smoke: foreign writes ({s}): B's appends, gap, middle and truncate-up writes to A's eight files byte-exact through both mounts at once and after both remount; fsck clean\n", .{if (write_cache) "supervised" else "foreground"});
+}
+
+/// Every file of the foreign-write row through B's mount and through A's,
+/// byte-exact against the mirror; then both mounts' must-stay-0 gauges.
+fn expectForeignMirror(rig: *Rig, b: *Peer, when: []const u8) !void {
+    const gpa = rig.gpa;
+    const judge =
+        \\for f in f1 f2 f3 f4 f5 f6 f7 f8; do cmp -s "own/$f" "$1/m/$f" || echo "$f: $(stat -c %s "own/$f") B vs the mirror's $(stat -c %s "$1/m/$f") B — $(cmp "own/$f" "$1/m/$f" 2>&1 | head -1)"; done
+        \\echo judged
+    ;
+    const ob = try b.onMount(judge);
+    defer gpa.free(ob);
+    const oa = try rig.onMount(judge);
+    defer gpa.free(oa);
+    if (!std.mem.eql(u8, ob, "judged\n") or !std.mem.eql(u8, oa, "judged\n")) {
+        std.debug.print("\n--- the foreign-write row {s}: B's mount ---\n{s}--- A's mount ---\n{s}", .{ when, ob, oa });
+        return error.ForeignWriteBytesLost;
+    }
+    const sb = try b.stats();
+    defer gpa.free(sb);
+    try expectMustStayZero(sb);
+    const sa = try rig.stats();
+    defer gpa.free(sa);
+    try expectMustStayZero(sa);
+}
+
 /// The bound on the daemon's exit once the kernel ends its connection, and
 /// on an orderly stop that finds the connection held by a bind: two lock
 /// plane ticks — the teardown's quantum twice (a drain, the dismount pass

@@ -120,6 +120,30 @@ fn ownerRefs(gpa: Allocator, cen: *const census.Census) Allocator.Error![]findin
     return out;
 }
 
+/// The merged arms' CONFIRMING round — the snapshot law: every side's
+/// references are read AFTER the first round's shields, the members' second
+/// census (`members`) and the holder's own view census'd again HERE; the
+/// allocators are re-read after both. A first-round suspect stands only
+/// when this round names it the same way. Confirming against the holder's
+/// pass-start census re-judged the holder's own churn since — a reference
+/// it released, a publish that ended a mint's registration — as the same
+/// suspect twice.
+pub fn confirmMerged(host: *const Host, first: []const finding.Finding, members: []const finding.OwnerRef, counters: *finding.Counters, out: *std.ArrayList(finding.Finding)) Error!void {
+    const gpa = host.gpa;
+    var tags_buf: [64]u64 = undefined;
+    var fresh = try census.run(gpa, host.store, host.censusOptions(host.knownTags(&tags_buf)));
+    defer fresh.deinit();
+    const local = try ownerRefs(gpa, &fresh);
+    defer {
+        for (local) |o| gpa.free(o.bindings);
+        gpa.free(local);
+    }
+    var second: std.ArrayList(finding.Finding) = .empty;
+    defer second.deinit(gpa);
+    try classes.crossMemberBlockPlane(gpa, host, local, members, counters, &second);
+    try classes.confirmCrossMember(gpa, first, second.items, counters, out);
+}
+
 /// The online submission seam the job fabric binds: the daemon's admin
 /// dispatcher runs the engine over its live host and answers the report.
 pub const Submit = struct {
@@ -829,9 +853,9 @@ pub const linux = if (builtin.os.tag == .linux) struct {
         /// manager's again after its recovery, a live-but-silent member's
         /// stay its own. The MERGED reference arms (`crossMemberBlockPlane`)
         /// run over the coordinator's owners and the members': a suspect
-        /// is CONFIRMED against a second census round from the members (the
-        /// ladder's re-check with their own fresh evidence) and lands as a
-        /// finding; an unconfirmable one (a member lost between the rounds)
+        /// is CONFIRMED against a second census round from the members AND
+        /// the coordinator's own view census'd again (`confirmMerged`) and
+        /// lands as a finding; an unconfirmable one (a member lost between the rounds)
         /// is cleared and counted. The shards retire at the pass end; the
         /// MERGED report publishes once, its census rows dropped.
         fn runFleet(self: *JobBody, io: Io, job: *fabric.JobCtl, opts: Options, n: u32) Error!finding.Report {
@@ -919,11 +943,8 @@ pub const linux = if (builtin.os.tag == .linux) struct {
                         };
                         if (!landed) whole = false;
                     }
-                    var second: std.ArrayList(finding.Finding) = .empty;
-                    defer second.deinit(gpa);
                     if (whole) {
-                        try classes.crossMemberBlockPlane(gpa, &self.bound.host, parts.items[0].owners, owners2.items, &cross, &second);
-                        try classes.confirmCrossMember(gpa, first.items, second.items, &cross, &confirmed);
+                        try confirmMerged(&self.bound.host, first.items, owners2.items, &cross, &confirmed);
                     } else {
                         // A member silent between the rounds: nothing to
                         // confirm against; its slots are the manager's once

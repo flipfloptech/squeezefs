@@ -209,6 +209,56 @@ test "the merged census's C3 passes the pack-open ledger (the ONLINE FSCK row's 
     set.setRefcount(VOL_A, 10, 2);
 }
 
+test "the merged arms' CONFIRMING round reads the holder's references fresh (the snapshot law): a block the holder shares with a member's custody, one holder-side reference released after the holder's pass-start census — the first round reads `refcount 2 vs 3` off that census; the confirming round re-derives the holder's view beside the member's second census and clears it (counted), while a genuine drift on the same block stands in both rounds" {
+    const gpa = testing.allocator;
+    const runner = @import("runner.zig");
+    const set = try RamSet.init(gpa);
+    defer set.deinit();
+    const p = try populate(set);
+    // Block 7 of A: two holder files and a member's tenant (slot 7, a live
+    // lessee: the holder's own view declines C3 and the merged arm judges).
+    _ = try set.mkfile(p.dir, "s1", VOL_A, &.{7});
+    const s2 = try set.mkfile(p.dir, "s2", VOL_A, &.{7});
+    try set.freezeEra();
+    try set.scope.foreign_live.put(gpa, 7, {});
+    const theirs_binds = [_]finding.BindingRef{.{ .vol_tag = VOL_A, .block_idx = 7, .block_index = 0 }};
+    const theirs = [_]finding.OwnerRef{.{ .ino = key.guestLocalIno(7, 5), .bindings = &theirs_binds }};
+    set.setRefcount(VOL_A, 7, 3);
+    var h = set.host(.online);
+    // The holder's whole-view run: its census at the pass's start.
+    var local = try ram.runHost(set, &h, .{ .ship_owners = true });
+    defer local.deinit(gpa);
+    try ram.expectClasses(local, &.{});
+    // After that census the holder releases s2's reference (layout, record, count).
+    try set.releaseLayout(s2, 0, VOL_A, 7);
+    set.setRefcount(VOL_A, 7, 2);
+    var c: finding.Counters = .{};
+    var first: std.ArrayList(Finding) = .empty;
+    defer first.deinit(gpa);
+    try classes.crossMemberBlockPlane(gpa, &h, local.owners, &theirs, &c, &first);
+    try testing.expectEqual(@as(usize, 1), first.items.len);
+    try testing.expectEqual(Finding{ .c3_refcount = .{ .vol_tag = VOL_A, .block_idx = 7, .expected = 3, .actual = 2 } }, first.items[0]);
+    var confirmed: std.ArrayList(Finding) = .empty;
+    defer confirmed.deinit(gpa);
+    try runner.confirmMerged(&h, first.items, &theirs, &c, &confirmed);
+    for (confirmed.items) |f| std.debug.print("  confirmed: {f}\n", .{f});
+    try testing.expectEqual(@as(usize, 0), confirmed.items.len);
+    try testing.expectEqual(@as(u64, 1), c.suspects_cleared);
+    // A genuine drift (one count above the referents now) stands twice.
+    set.setRefcount(VOL_A, 7, 3);
+    var local2 = try ram.runHost(set, &h, .{ .ship_owners = true });
+    defer local2.deinit(gpa);
+    var first2: std.ArrayList(Finding) = .empty;
+    defer first2.deinit(gpa);
+    try classes.crossMemberBlockPlane(gpa, &h, local2.owners, &theirs, &c, &first2);
+    try testing.expectEqual(@as(usize, 1), first2.items.len);
+    var confirmed2: std.ArrayList(Finding) = .empty;
+    defer confirmed2.deinit(gpa);
+    try runner.confirmMerged(&h, first2.items, &theirs, &c, &confirmed2);
+    try testing.expectEqual(@as(usize, 1), confirmed2.items.len);
+    try testing.expectEqual(Finding{ .c3_refcount = .{ .vol_tag = VOL_A, .block_idx = 7, .expected = 2, .actual = 3 } }, confirmed2.items[0]);
+}
+
 test "the block plane under a live lessee: a block a lessee's record references is the lessee's (its ring lags this census — the first N-daemon fleet run read every pack B shared as `refcount 64 vs 63`), so C2/C3/C8 scope it out and count it; the member's custody run judges no allocator arm at all (a non-holder's allocator is not the truth)" {
     const gpa = testing.allocator;
     const set = try RamSet.init(gpa);

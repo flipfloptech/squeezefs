@@ -219,6 +219,12 @@ pub const Host = struct {
         return null;
     }
 
+    /// The census this host's view takes (a pass's, and the merged arms'
+    /// confirming round's).
+    pub fn censusOptions(self: *const Host, tags: []const u64) census.Options {
+        return .{ .scope = self.scope, .shard = self.shard, .custody_only = self.custody_only, .mem_budget = self.mem_budget, .geo = self.geo, .known_vol_tags = tags, .hold = self.hold };
+    }
+
     pub fn knownTags(self: *const Host, buf: []u64) []u64 {
         for (self.volumes, 0..) |v, i| buf[i] = v.vol_tag;
         return buf[0..self.volumes.len];
@@ -426,10 +432,6 @@ pub const Pass = struct {
         self.* = undefined;
     }
 
-    fn censusOptions(self: *const Pass, tags: []const u64) census.Options {
-        return .{ .scope = self.host.scope, .shard = self.host.shard, .custody_only = self.host.custody_only, .mem_budget = self.host.mem_budget, .geo = self.host.geo, .known_vol_tags = tags, .hold = self.host.hold };
-    }
-
     /// Pass 1: latch the allocators' scan epochs, the census, the dentry pass.
     pub fn begin(host: *const Host) Error!Pass {
         const gpa = host.gpa;
@@ -444,7 +446,7 @@ pub const Pass = struct {
         var p: Pass = .{ .host = host, .gpa = gpa, .arena = std.heap.ArenaAllocator.init(gpa), .cen = undefined, .dentries = undefined, .scan_epoch = epochs, .ceiling = census.candidateCeiling(host.mem_budget) };
         errdefer p.arena.deinit();
         const t0 = clock.monotonicNs();
-        p.cen = try census.run(gpa, host.store, p.censusOptions(tags));
+        p.cen = try census.run(gpa, host.store, host.censusOptions(tags));
         errdefer p.cen.deinit();
         const t1 = clock.monotonicNs();
         p.dentries = try census.dentryPass(gpa, host.store, .{ .scope = host.scope, .shard = host.shard, .mem_budget = host.mem_budget, .ceiling = p.cen.rawCeiling(), .hold = host.hold });
@@ -488,7 +490,7 @@ pub const Pass = struct {
         if (self.fresh.cen == null) {
             var tags_buf: [64]u64 = undefined;
             const tags = self.host.knownTags(&tags_buf);
-            self.fresh.cen = try census.run(self.gpa, self.host.store, self.censusOptions(tags));
+            self.fresh.cen = try census.run(self.gpa, self.host.store, self.host.censusOptions(tags));
         }
         return &self.fresh.cen.?;
     }
@@ -1841,9 +1843,9 @@ fn liveOwnerShielded(host: *const Host, v: *const Volume, idx: u64, counters: *f
 /// tenants straddle the holder's view and a member's custody read
 /// `refcount 37 vs 36` without its ledger). The leaked arm and C8 stay the
 /// whole-view run's: a leak is space (a member's carve between two censuses
-/// would read as one), C8 compares durable refs the holder cannot read. The suspects
-/// are the caller's to CONFIRM against a second member census (the ladder's
-/// re-check with the member's own fresh evidence).
+/// would read as one), C8 compares durable refs the holder cannot read. The
+/// suspects are the caller's to CONFIRM on a round of fresh evidence from
+/// every side (`runner.confirmMerged`).
 pub fn crossMemberBlockPlane(gpa: Allocator, host: *const Host, local: []const finding.OwnerRef, members: []const finding.OwnerRef, counters: *finding.Counters, out: *std.ArrayList(Finding)) Allocator.Error!void {
     const Key = struct { vol_tag: u64, block_idx: u64 };
     const Row = struct { count: u32, member_ino: u64, member_block_index: u32, member_refs: u32 };

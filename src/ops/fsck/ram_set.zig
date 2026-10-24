@@ -422,6 +422,19 @@ pub const RamSet = struct {
         try self.commitTx(t);
     }
 
+    /// A holder's release between two censuses: the file's layout and its
+    /// reference record of `(vol_tag, blk)` at `index` leave in one tx (the
+    /// inode and its name stay; the count is the caller's to lower).
+    pub fn releaseLayout(self: *RamSet, child: u64, index: u32, vol_tag: u64, blk: u64) !void {
+        const t = try self.mem.begin(@src());
+        {
+            errdefer self.mem.abandon(t);
+            try t.stageDelete(key.TREE_XATTRS, &key.xattrKey(local(child), key.xattrNameHash56(layout.LAYOUT_XATTR_NAME, self.mem.nameKey()), 0));
+            try t.stageDelete(key.TREE_BLOCK_REFS, &key.blockRefKey(vol_tag, blk, local(child), index));
+        }
+        try self.commitTx(t);
+    }
+
     /// C8 (durable > derived): a stray reference record.
     pub fn strayRef(self: *RamSet, owner_local: u64, index: u32, vol_tag: u64, blk: u64) !void {
         const t = try self.mem.begin(@src());

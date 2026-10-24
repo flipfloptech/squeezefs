@@ -6888,6 +6888,14 @@ test "smoke: A LIVE MEMBER EVICTED WITH NOTHING UN-LANDED RE-JOINS IN PLACE (cha
             break;
         }
     }
+    // A reads B's file: a grant in B's holder table (B leases its slot).
+    {
+        const out = try rig.onMount("cat own/f > /dev/null");
+        gpa.free(out);
+        const tb = try b.stats();
+        defer gpa.free(tb);
+        try testing.expect((numberAfter(tb, "\"dlm_token_outstanding\":") orelse 0) >= 1);
+    }
     // Idle-clean: every refinement and resident landed (syncfs).
     {
         const out = try b.onMount("sync -f .");
@@ -6920,6 +6928,13 @@ test "smoke: A LIVE MEMBER EVICTED WITH NOTHING UN-LANDED RE-JOINS IN PLACE (cha
         defer gpa.free(tb);
         try testing.expect(std.mem.indexOf(u8, tb[b_mark..], "this joined mount is POISONED") == null);
         try testing.expect(std.mem.indexOf(u8, tb[b_mark..], "cannot re-join in place") == null);
+    }
+    // Every grant B's holder issued was over the retired incarnation's
+    // slots: none survives the re-join (red: A's grant on `own/f` stayed).
+    {
+        const tb = try b.stats();
+        defer gpa.free(tb);
+        try testing.expectEqual(@as(?u64, 0), numberAfter(tb, "\"dlm_token_outstanding\":"));
     }
     // The held fd writes on the successor incarnation; the bytes are whole.
     {
@@ -7071,6 +7086,218 @@ test "smoke: A LIVE MEMBER EVICTED WITH UN-LANDED STATE FAIL-STOPS (the re-join'
     try rig.umount();
     try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
     _ = try fsckClean(rig, "a live member evicted with un-landed state");
+}
+
+/// The re-join rows' rig: A (the manager) up, B (the kill rows' node) joined
+/// with `b_env`, the smoke's `T_owner`, the beat-hold FIFO named in `fb`.
+fn rejoinRig(rig: *Rig, b: *Peer, b_env: ?*std.process.Environ.Map, fb: *[linux.PATH_MAX]u8, meta_uri: ?[]const u8) ![:0]u8 {
+    const fifo = try std.fmt.bufPrintSentinel(fb, "{s}/beat.fifo", .{rig.work}, 0);
+    for ([_]*std.process.Environ.Map{ &rig.env, b_env orelse &rig.env }) |env| {
+        try env.put("SQUEEZEFS_MW_BIND", "127.0.0.1:0");
+        try env.put("SQUEEZEFS_TEST_MEMBERSHIP_T_OWNER_MS", std.fmt.comptimePrint("{d}", .{smoke_t_owner_ms}));
+        try env.put("SQUEEZEFS_TEST_MEMBERSHIP_BEAT_HOLD", fifo);
+    }
+    if (meta_uri) |u| try rig.spawnMountOf(u, &.{}) else try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(0);
+    if (b_env) |e| b.env = e;
+    b.meta_uri = meta_uri;
+    b.node = kill_peer_node;
+    try b.spawn(&.{});
+    _ = try b.awaitReady();
+    return fifo;
+}
+
+/// The re-join rows' middle: B's beat held, A's eviction awaited, the hold
+/// released — B's verdict and its log mark.
+fn holdEvictRelease(rig: *Rig, b: *Peer, fifo: [:0]const u8) !struct { verdict: EvictionVerdict, b_mark: usize } {
+    const mark = try rig.logLen();
+    const b_mark = try b.logLen();
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.mknodat(linux.AT.FDCWD, fifo.ptr, linux.S.IFIFO | 0o600, 0)));
+    errdefer releaseHold(fifo);
+    _ = try b.awaitLog("the member's beat holds", b_mark, kill_row_wait_ns);
+    try awaitEvictionOf(rig, b, mark);
+    releaseHold(fifo);
+    const v = try awaitEvictionVerdict(b, b_mark);
+    return .{ .verdict = v.verdict, .b_mark = b_mark };
+}
+
+/// `.stats`' `mem_budget_components.<name>.current`.
+fn budgetComponentBytes(stats_text: []const u8, comptime name: []const u8) ?u64 {
+    const at = std.mem.indexOf(u8, stats_text, "\"" ++ name ++ "\":{\"instances\":") orelse return null;
+    return numberAfter(stats_text[at..], "\"current\":");
+}
+
+test "smoke: A RE-JOINED MEMBER RELEASES ITS RETIRED INCARNATION'S NODE CACHE (decision 0003 §BS; the idle-RSS law) — B JOINED under SQUEEZEFS_MEM_BUDGET_MB=64 creates 10,000 files in its own directory (its node cache charged) and goes idle-clean → its beat held past T_owner, A evicts and recovers it → B re-joins in place → once every op in flight at the re-join answered, the retired incarnation's node cache is released (logged with its bytes; the `kv_node_cache` charge back below its pre-eviction level) and B's VmRSS is within the idle-RSS bound (budget + sizing.idleFloorBytes) → umount B, A, fsck clean (red: the retired cache held until the unmount)" {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    try rig.formatSetWith(false, &.{});
+    const b = try Peer.init(rig, "b");
+    defer b.deinit();
+    var b_env = try rig.env.clone(gpa);
+    defer b_env.deinit();
+    try b_env.put("SQUEEZEFS_MEM_BUDGET_MB", std.fmt.comptimePrint("{d}", .{idle_row_budget_mib}));
+    var fb: [linux.PATH_MAX]u8 = undefined;
+    const fifo = try rejoinRig(rig, b, &b_env, &fb, null);
+    {
+        const out = try b.onMountTimed("mkdir own && cd own && seq -f f%05g 1 10000 | xargs touch && cd .. && sync -f .", 300);
+        gpa.free(out);
+    }
+    const c0 = blk: {
+        const tb = try b.stats();
+        defer gpa.free(tb);
+        break :blk budgetComponentBytes(tb, "kv_node_cache") orelse return error.NoNodeCacheComponent;
+    };
+    const ev = try holdEvictRelease(rig, b, fifo);
+    try testing.expectEqual(EvictionVerdict.rejoined, ev.verdict);
+    const at = try b.awaitLog("the retired incarnation's node cache released (", ev.b_mark, kill_row_wait_ns);
+    const released = blk: {
+        const tb = try b.readLog();
+        defer gpa.free(tb);
+        break :blk std.fmt.parseInt(u64, tb[at .. std.mem.indexOfScalarPos(u8, tb, at, ' ') orelse at], 10) catch 0;
+    };
+    const c1 = blk: {
+        const tb = try b.stats();
+        defer gpa.free(tb);
+        break :blk budgetComponentBytes(tb, "kv_node_cache") orelse return error.NoNodeCacheComponent;
+    };
+    const rss = try procStatusBytes(b.pid, "VmRSS");
+    const threads = try userThreads(b.pid);
+    const bound = mem_sizing.idleRssBound(idle_row_budget_mib * derive.MiB, derive.facts().possible_cpus, threads);
+    std.debug.print("\nsmoke: re-join memory: kv_node_cache {d} KiB before the eviction, {d} KiB released, {d} KiB after; VmRSS {d} MiB over {d} threads, the bound {d} MiB\n", .{ c0 >> 10, released >> 10, c1 >> 10, rss >> 20, threads, bound >> 20 });
+    try testing.expect(released > 0);
+    try testing.expect(c1 < c0);
+    try testing.expect(rss <= bound);
+    try b.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try b.waitExit());
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+    _ = try fsckClean(rig, "a re-joined member's released cache");
+}
+
+test "smoke: A TWO-VOLUME SET'S JOINER RE-JOINS IN PLACE (decision 0003 §BS) — a 2-member meta set: A (the manager of both volumes) mkdirs `shared`; B JOINED to both volumes writes 64 directories × 4 files in its own tree (mints on both volumes) and goes idle-clean → its beat held past T_owner, A evicts and recovers its region on BOTH volumes → B re-joins in place: every volume's incarnation joined afresh and re-published (two JOINED lines, `meta_rejoins_in_place` 1) → B and A read every file byte-equal, B creates and renames in A's `shared` → umount B (exit 0), A → fsck --offline --scrub of the set 0 findings (red: a two-volume joiner was never re-joined)" {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    for ([_][:0]const u8{ rig.img, rig.img2, rig.d0, rig.d1 }, [_]u64{ volume_len, volume_len, data_len, data_len }) |p, len| {
+        const f = try Io.Dir.cwd().createFile(io, p, .{ .truncate = true });
+        defer f.close(io);
+        try f.setLength(io, len);
+    }
+    try rig.env.put("SQUEEZEFS_WRITE_CACHE_PCT", "0");
+    {
+        const r = try rig.squeezefs(&.{ "format", rig.set_uri, rig.data_uri });
+        defer rig.freeRun(r);
+        try testing.expect(r.term.success());
+        try testing.expect(std.mem.indexOf(u8, r.stdout, "2-member set") != null);
+    }
+    const b = try Peer.init(rig, "b");
+    defer b.deinit();
+    var fb: [linux.PATH_MAX]u8 = undefined;
+    const fifo = try rejoinRig(rig, b, null, &fb, rig.set_uri);
+    {
+        const out = try rig.onMount("mkdir shared");
+        gpa.free(out);
+    }
+    const tree_sum = "find own -type f | sort | xargs cat | sha256sum";
+    const sum_before = try b.onMountTimed("mkdir own && for d in $(seq -w 0 63); do mkdir own/d$d && for f in 1 2 3 4; do head -c 3000 /dev/urandom > own/d$d/f$f; done; done && sync -f . && " ++ tree_sum, 300);
+    defer gpa.free(sum_before);
+    const ev = try holdEvictRelease(rig, b, fifo);
+    try testing.expectEqual(EvictionVerdict.rejoined, ev.verdict);
+    {
+        const tb = try b.readLog();
+        defer gpa.free(tb);
+        try testing.expectEqual(@as(usize, 2), std.mem.count(u8, tb[ev.b_mark..], "mounted JOINED as appender"));
+        const st = try b.stats();
+        defer gpa.free(st);
+        try testing.expectEqual(@as(?u64, 1), numberAfter(st, "\"meta_rejoins_in_place\":"));
+        try testing.expectEqual(@as(?u64, 2), numberAfter(st, "\"routing_volumes\":"));
+    }
+    {
+        const on_b = try b.onMountTimed(tree_sum, 300);
+        defer gpa.free(on_b);
+        try testing.expectEqualStrings(sum_before, on_b);
+        const on_a = try rig.onMountTimed(tree_sum, 300);
+        defer gpa.free(on_a);
+        try testing.expectEqualStrings(sum_before, on_a);
+        const out = try b.onMount("echo b > shared/x && mv shared/x shared/y && ls shared");
+        defer gpa.free(out);
+        try testing.expectEqualStrings("y\n", out);
+    }
+    try b.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try b.waitExit());
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+    const r = try rig.squeezefs(&.{ "fsck", "--offline", "--scrub", rig.set_uri });
+    defer rig.freeRun(r);
+    if (std.mem.indexOf(u8, r.stdout, "findings: 0 (clean)") == null) std.debug.print("\nfsck of the two-volume set: {s}\n{s}\n", .{ r.stdout, r.stderr });
+    try testing.expect(r.term.success() and std.mem.indexOf(u8, r.stdout, "findings: 0 (clean)") != null);
+}
+
+test "smoke: A RE-JOIN WHOSE MEMBERSHIP JOIN IS REFUSED LEAVES ITS SUCCESSOR CLEANLY (decision 0003 §BS) — B JOINED idle-clean under SQUEEZEFS_TEST_REJOIN_MEMBER_REFUSED → its beat held past T_owner, A evicts and recovers it → released: B holds nothing un-landed, the successor joins (a new appender) but its membership join is refused ⇒ the successor closes UNPUBLISHED — the clean leave of a fresh join (rotor released, page Free) — and B fail-stops over the retired predecessor (EIO, exit 1 with nothing written) → after both unmounts no joiner's appender page is Live (the successor's Free, the predecessor's Recovered), fsck clean (red: the successor was published first and its leave ran against FAILED latches at the unmount)" {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    try rig.formatSetWith(false, &.{});
+    const b = try Peer.init(rig, "b");
+    defer b.deinit();
+    var b_env = try rig.env.clone(gpa);
+    defer b_env.deinit();
+    try b_env.put("SQUEEZEFS_TEST_REJOIN_MEMBER_REFUSED", "1");
+    var fb: [linux.PATH_MAX]u8 = undefined;
+    const fifo = try rejoinRig(rig, b, &b_env, &fb, null);
+    {
+        const out = try b.onMount("mkdir own && echo kept > own/f && sync -f .");
+        gpa.free(out);
+    }
+    const ev = try holdEvictRelease(rig, b, fifo);
+    try testing.expectEqual(EvictionVerdict.poisoned, ev.verdict);
+    {
+        const tb = try b.readLog();
+        defer gpa.free(tb);
+        const tail = tb[ev.b_mark..];
+        try testing.expect(std.mem.indexOf(u8, tail, "the successor's membership join was refused (the successor left cleanly, never published)") != null);
+        try testing.expect(std.mem.indexOf(u8, tail, "left (page Free)") != null);
+        try testing.expect(std.mem.indexOf(u8, tail, "RE-JOINED IN PLACE") == null);
+    }
+    {
+        var secs: [8]u8 = undefined;
+        const r = try std.process.run(gpa, io, .{ .argv = &.{ "timeout", "-s", "KILL", try std.fmt.bufPrint(&secs, "{d}", .{poison_fail_stop_bound_s}), "sh", "-c", "touch \"$0/own/after-poison\"", b.mp }, .environ_map = &rig.env });
+        defer rig.freeRun(r);
+        try testing.expect(r.term != .signal and !r.term.success());
+        try testing.expect(std.mem.indexOf(u8, r.stderr, "Input/output error") != null);
+    }
+    try b.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 1 }, try b.waitExit());
+    {
+        const out = try rig.onMount("cat own/f");
+        defer gpa.free(out);
+        try testing.expectEqualStrings("kept\n", out);
+    }
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+    {
+        const r = try rig.squeezefs(&.{ "appenders", "--json", rig.meta_uri });
+        defer rig.freeRun(r);
+        try testing.expect(r.term.success());
+        // Appender 0's page is the manager's fixed ring (Live by design
+        // after a clean unmount); every joiner page is Free or Recovered.
+        var it = std.mem.splitSequence(u8, r.stdout, "\"appender_id\":");
+        _ = it.next();
+        while (it.next()) |entry| {
+            const id = std.fmt.parseInt(u32, entry[0 .. std.mem.indexOfScalar(u8, entry, ',') orelse 0], 10) catch continue;
+            const live = std.mem.startsWith(u8, entry[(std.mem.indexOf(u8, entry, "\"state\":\"") orelse 0) + 9 ..], "live");
+            if (id != 0 and live) std.debug.print("\nsmoke: appender {d}'s page stayed Live: {s}\n", .{ id, r.stdout });
+            try testing.expect(id == 0 or !live);
+        }
+    }
+    _ = try fsckClean(rig, "a refused re-join");
 }
 
 /// The member's renew cadence its mount line names (`renew every N ms`).

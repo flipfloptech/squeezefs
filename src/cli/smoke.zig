@@ -7825,6 +7825,189 @@ const DmErrorSet = struct {
     }
 };
 
+/// A set whose DATA volumes are thin volumes of a dm-thin pool far smaller
+/// than they claim (xfstests generic/347's device): the metadata volume a
+/// linear slice of the same loop file, the pool's data device a linear
+/// slice the row can grow, the pool in `error_if_no_space` (a DMA past the
+/// pool's last block answers ENOSPC at once — 347's pool after its
+/// `no_space_timeout`). The allocator sees two whole virtual volumes: the
+/// device refuses DMAs while the allocator has free blocks in sight.
+const DmThinSet = struct {
+    rig: *Rig,
+    name: []u8,
+    loop: []u8 = &.{},
+    meta_uri: []u8,
+    data_uri: []u8,
+    up: bool = false,
+
+    const meta_sectors: u64 = (512 << 20) / 512;
+    const pool_meta_sectors: u64 = (16 << 20) / 512;
+    /// The pool's data device at setup, and the room the row grows it to.
+    const pool_data_sectors: u64 = (64 << 20) / 512;
+    const pool_data_max_sectors: u64 = (1024 << 20) / 512;
+    /// Each thin volume's virtual size: what the allocator believes.
+    const thin_sectors: u64 = (1024 << 20) / 512;
+    /// 64 KiB: the pool's smallest data block.
+    const pool_block_sectors: u64 = 128;
+
+    fn missing(rig: *Rig) ?testkit.Why {
+        const r = rig.sh(rig.work, "modprobe dm-thin-pool >/dev/null 2>&1; dmsetup targets | grep -q '^thin-pool ' && command -v losetup >/dev/null") catch return .{ .class = .no_kernel_feature, .detail = "dm-thin-pool" };
+        defer rig.freeRun(r);
+        return if (r.term.success()) null else .{ .class = .no_kernel_feature, .detail = "dm-thin-pool" };
+    }
+
+    fn init(rig: *Rig) !DmThinSet {
+        const gpa = rig.gpa;
+        const name = try std.fmt.allocPrint(gpa, "sqz-smoke-{d}-thin", .{linux.getpid()});
+        errdefer gpa.free(name);
+        const meta_uri = try std.fmt.allocPrint(gpa, "sqmeta:///dev/mapper/{s}-meta", .{name});
+        errdefer gpa.free(meta_uri);
+        const data_uri = try std.fmt.allocPrint(gpa, "sqdata:///dev/mapper/{s}-d0,/dev/mapper/{s}-d1", .{ name, name });
+        errdefer gpa.free(data_uri);
+        var self: DmThinSet = .{ .rig = rig, .name = name, .meta_uri = meta_uri, .data_uri = data_uri };
+        errdefer self.down();
+        var script: [2048]u8 = undefined;
+        const total = meta_sectors + pool_meta_sectors + pool_data_max_sectors;
+        const out = try rig.shOk(rig.work, try std.fmt.bufPrint(&script,
+            \\truncate -s {d} dmthin.img
+            \\losetup -f --show dmthin.img
+        , .{total * 512}));
+        defer gpa.free(out);
+        self.loop = try gpa.dupe(u8, std.mem.trim(u8, out, " \n"));
+        self.up = true;
+        gpa.free(try rig.shOk(rig.work, try std.fmt.bufPrint(&script,
+            \\dmsetup create {[n]s}-meta --table "0 {[ms]d} linear {[l]s} 0"
+            \\dmsetup create {[n]s}-tmeta --table "0 {[pms]d} linear {[l]s} {[ms]d}"
+            \\dmsetup create {[n]s}-tdata --table "0 {[pds]d} linear {[l]s} {[pdo]d}"
+            \\dd if=/dev/zero of=/dev/mapper/{[n]s}-tmeta bs=4096 count=1 conv=fsync status=none
+            \\dmsetup create {[n]s}-pool --table "0 {[pds]d} thin-pool /dev/mapper/{[n]s}-tmeta /dev/mapper/{[n]s}-tdata {[pb]d} 0 1 error_if_no_space"
+            \\dmsetup message /dev/mapper/{[n]s}-pool 0 "create_thin 0"
+            \\dmsetup message /dev/mapper/{[n]s}-pool 0 "create_thin 1"
+            \\dmsetup create {[n]s}-d0 --table "0 {[ts]d} thin /dev/mapper/{[n]s}-pool 0"
+            \\dmsetup create {[n]s}-d1 --table "0 {[ts]d} thin /dev/mapper/{[n]s}-pool 1"
+            \\dmsetup mknodes >/dev/null 2>&1 || true
+            \\echo up
+        , .{ .n = name, .l = self.loop, .ms = meta_sectors, .pms = pool_meta_sectors, .pds = pool_data_sectors, .pdo = meta_sectors + pool_meta_sectors, .pb = pool_block_sectors, .ts = thin_sectors })));
+        return self;
+    }
+
+    /// The pool's data device grown to its whole slice (`_dmthin_grow`):
+    /// the pool leaves its out-of-space mode and the refused DMAs land.
+    fn grow(self: *DmThinSet) !void {
+        var script: [1024]u8 = undefined;
+        self.rig.gpa.free(try self.rig.shOk(self.rig.work, try std.fmt.bufPrint(&script,
+            \\dmsetup suspend {[n]s}-tdata && dmsetup load {[n]s}-tdata --table "0 {[pds]d} linear {[l]s} {[pdo]d}" && dmsetup resume {[n]s}-tdata
+            \\dmsetup suspend {[n]s}-pool && dmsetup load {[n]s}-pool --table "0 {[pds]d} thin-pool /dev/mapper/{[n]s}-tmeta /dev/mapper/{[n]s}-tdata {[pb]d} 0 1 error_if_no_space" && dmsetup resume {[n]s}-pool
+            \\echo grown
+        , .{ .n = self.name, .l = self.loop, .pds = pool_data_max_sectors, .pdo = meta_sectors + pool_meta_sectors, .pb = pool_block_sectors })));
+    }
+
+    fn down(self: *DmThinSet) void {
+        if (!self.up) return;
+        self.up = false;
+        var script: [1024]u8 = undefined;
+        const cmd = std.fmt.bufPrint(&script, "pkill -KILL -f '[/]dev/mapper/{s}-meta' >/dev/null 2>&1 || true; umount -l {s} >/dev/null 2>&1 || true; for s in d1 d0 pool tdata tmeta meta; do dmsetup resume {s}-$s >/dev/null 2>&1 || true; dmsetup remove --retry {s}-$s >/dev/null 2>&1 || true; done; losetup -d {s} >/dev/null 2>&1 || true; rm -f dmthin.img", .{ self.name, self.rig.mp, self.name, self.name, self.loop }) catch "";
+        if (self.rig.sh(self.rig.work, cmd)) |r| self.rig.freeRun(r) else |_| {}
+        self.rig.gpa.free(self.loop);
+        self.loop = &.{};
+    }
+
+    fn deinit(self: *DmThinSet) void {
+        self.down();
+        const gpa = self.rig.gpa;
+        gpa.free(self.name);
+        gpa.free(self.meta_uri);
+        gpa.free(self.data_uri);
+    }
+};
+
+/// THE STALLED-PLANE ROW's request timeout (the frozen-daemon seam): the
+/// kernel aborts a request older than this at its next 15 s check, so a
+/// write the daemon held past it ends the mount within 30–45 s.
+const stalled_plane_request_timeout_s: u16 = 30;
+
+/// One timed fill of the stalled-plane mount (xfstests generic/347's
+/// shape): `files` files `<prefix><i>` preallocated (`fallocate -l 2M`, the
+/// blocks reserved, nothing written on the thin pool), then 1 MiB written
+/// into each at byte 512 (`dd conv=notrunc`: off the page grain, so neither
+/// the overlay nor the in-place patch takes it — the accumulation arm parks
+/// a partial block whose landing is the device's) until the first refusal, under a KILL
+/// bound past the kernel's abort; the refusal's exit code (0 = none), the
+/// file it met, the writes' wall time and dd's stderr.
+const TimedFill = struct { rc: u32, at: u32, ms: u64, err: []u8 };
+
+fn timedFill(rig: *Rig, prefix: []const u8, files: u32) !TimedFill {
+    var script: [768]u8 = undefined;
+    const r = try rig.sh(rig.mp, try std.fmt.bufPrint(&script, "err=$(mktemp); for i in $(seq 1 {[n]d}); do fallocate -l 2M {[p]s}$i; done; s=$(date +%s%N); rc=0; at=0; for i in $(seq 1 {[n]d}); do timeout -s KILL 120 dd if=/dev/urandom of={[p]s}$i bs=1M count=1 seek=512 oflag=seek_bytes conv=notrunc status=none 2>\"$err\" || {{ rc=$?; at=$i; break; }}; done; e=$(date +%s%N); echo $rc $at $(( (e - s) / 1000000 )); cat \"$err\" >&2; rm -f \"$err\"", .{ .p = prefix, .n = files }));
+    defer rig.gpa.free(r.stdout);
+    errdefer rig.gpa.free(r.stderr);
+    var it = std.mem.tokenizeAny(u8, r.stdout, " \n");
+    const rc = std.fmt.parseInt(u32, it.next() orelse return error.NoRc, 10) catch return error.NoRc;
+    const at = std.fmt.parseInt(u32, it.next() orelse return error.NoAt, 10) catch return error.NoAt;
+    const ms = std.fmt.parseInt(u64, it.next() orelse return error.NoMs, 10) catch return error.NoMs;
+    return .{ .rc = rc, .at = at, .ms = ms, .err = r.stderr };
+}
+
+test "smoke: A WRITE HELD BEHIND A DEVICE THAT REFUSES EVERY DMA ANSWERS BEFORE THE KERNEL'S REQUEST DEADLINE AND THE MOUNT KEEPS SERVING (the daemon answers, never holds — xfstests generic/347) — a set whose two data volumes are thin volumes of a 64 MiB dm-thin pool in error_if_no_space (the allocator sees 2 GiB free), the write cache off, 8 parked buffers, the FUSE request timeout 30 s → a 1 MiB file written and synced → 64 files preallocated and 1 MiB written into each off the page grain (generic/347's shape: the accumulation arm parks each): the pool fills, every later DMA answers ENOSPC, the parked set fills, the next write meets the parked-buffer gate behind a stalled plane and answers ENOSPC before the 30 s request deadline (red on dev: held at the gate until the kernel aborted the connection at 30.7 s — ENOTCONN, the daemon fail-stopped) → a second writer during the stall answers within two ticks → `stat` and a read of the synced file succeed, the daemon alive → the pool grown: the parked set lands, `sync -f` succeeds → umount clean → `fsck --offline --scrub` 0 findings" {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    if (DmErrorSet.venueMissing()) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    if (DmThinSet.missing(rig)) |why| return testkit.skipWhy(@src(), why);
+    var dm = try DmThinSet.init(rig);
+    defer dm.deinit();
+    var timeout_text: [8]u8 = undefined;
+    try rig.env.put("SQUEEZEFS_TEST_FUSE_REQUEST_TIMEOUT_S", try std.fmt.bufPrint(&timeout_text, "{d}", .{stalled_plane_request_timeout_s}));
+    try rig.env.put("SQUEEZEFS_WRITE_CACHE_PCT", "0");
+    try rig.env.put("SQUEEZEFS_PARKED_BUFFERS", "8");
+    {
+        const r = try rig.squeezefs(&.{ "format", dm.meta_uri, dm.data_uri });
+        defer rig.freeRun(r);
+        if (!r.term.success()) std.debug.print("\nformat: {s}\n", .{r.stderr});
+        try testing.expect(r.term.success());
+    }
+    try rig.spawnMountOf(dm.meta_uri, &.{});
+    _ = try rig.awaitReady(0);
+    const kept = try rig.onMount("dd if=/dev/urandom of=keep bs=1M count=1 conv=fsync status=none && sha256sum keep");
+    defer gpa.free(kept);
+    // The stall: the pool fills under the stream, the parked set behind it.
+    const big = try timedFill(rig, "f", 64);
+    defer gpa.free(big.err);
+    std.debug.print("\nsmoke[stalled plane]: 64 preallocated 1 MiB files written in place onto a 64 MiB pool: rc {d} at file {d} after {d} ms: {s}\n", .{ big.rc, big.at, big.ms, big.err });
+    try rig.expectAlive("the stalled write's answer");
+    try testing.expect(big.rc != 0);
+    try testing.expect(std.mem.indexOf(u8, big.err, "No space left on device") != null);
+    try testing.expect(big.ms < @as(u64, stalled_plane_request_timeout_s) * std.time.ms_per_s);
+    // A second writer meets the same stalled gate: answered at once.
+    const more = try timedFill(rig, "g", 4);
+    defer gpa.free(more.err);
+    std.debug.print("smoke[stalled plane]: a second writer during the stall: rc {d} at file {d} after {d} ms: {s}\n", .{ more.rc, more.at, more.ms, more.err });
+    try rig.expectAlive("the second writer's answer");
+    try testing.expect(more.rc != 0);
+    try testing.expect(more.ms < 2 * tick_law.tick_ns / std.time.ns_per_ms + 2 * std.time.ms_per_s);
+    // The mount serves everything else.
+    {
+        const back = try rig.onMount("stat -c %s keep && sha256sum keep");
+        defer gpa.free(back);
+        try testing.expect(std.mem.endsWith(u8, back, kept));
+        try testing.expect(std.mem.startsWith(u8, back, "1048576\n"));
+        const text = try rig.readLog();
+        defer gpa.free(text);
+        try testing.expect(std.mem.indexOf(u8, text, "the kernel ended the FUSE connection") == null);
+    }
+    // The pool grows: the refused custody lands and the sync point holds.
+    try dm.grow();
+    gpa.free(try rig.onMountTimed("sync -f . && echo synced", 120));
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+    const r = try rig.squeezefs(&.{ "fsck", "--offline", "--scrub", dm.meta_uri });
+    defer rig.freeRun(r);
+    if (!r.term.success() or std.mem.indexOf(u8, r.stdout, "findings: 0 (clean)") == null) std.debug.print("\n--- fsck --offline after the stalled plane ({f}) ---\n{s}\n--- stderr ---\n{s}\n", .{ r.term, r.stdout, r.stderr });
+    try testing.expect(std.mem.indexOf(u8, r.stdout, "findings: 0 (clean)") != null);
+}
+
 /// One worker of the xattr storm (generic/753's fsstress mix: unlink and
 /// rmdir heavy, xattr sets, lists and gets of up to 2,000 names per file —
 /// values mostly small so 64 files stay far below the metadata volume's

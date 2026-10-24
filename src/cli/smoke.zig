@@ -3753,6 +3753,18 @@ test "smoke: THE SIDEBAND NEVER inode_locks A DIRECTORY ITS DAEMON OWES A REPLY 
         }
     }
     try testing.expect(sampled > 0);
+    // The stat's grant parked on the held pass before the release (its
+    // walk starts on a loaded host whenever the shell gets there).
+    {
+        const deadline = clock.monotonicNs() + ready_wait_ns;
+        while (true) {
+            const sa = try rig.stats();
+            defer gpa.free(sa);
+            if ((numberAfter(sa, "\"dlm_token_grant_parks\":") orelse 0) >= 1) break;
+            if (clock.monotonicNs() >= deadline) return error.GrantNeverParked;
+            sleepMs(20);
+        }
+    }
     // The create is still in flight under the hold.
     try testing.expect(alive(touch.id.?));
     // Released: the pass proceeds, A applies the step, B's create completes.

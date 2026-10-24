@@ -542,6 +542,9 @@ pub const DataPlane = struct {
     crossing_kill_after: u32,
     /// `SQUEEZEFS_TEST_OWN_BLOCK_POISON`.
     test_own_block_poison: bool,
+    /// `SQUEEZEFS_TEST_FOREIGN_MAP_FAIL`: every foreign block-map window
+    /// resolve fails (`kvmapLookup`).
+    test_foreign_map_fail: bool,
     /// `SQUEEZEFS_TEST_PROMOTION_HOLD`: the FIFO the mount's first promotion
     /// parks on before its locks (null = no hold); `promotion_held` once it did.
     test_promotion_hold: ?[]const u8,
@@ -710,6 +713,7 @@ pub const DataPlane = struct {
             .windows = undefined,
             .crossing_kill_after = knobs.intKnob("SQUEEZEFS_TEST_KVMAP_CROSSING_KILL_AFTER", u32, opts.env),
             .test_own_block_poison = knobs.boolKnob("SQUEEZEFS_TEST_OWN_BLOCK_POISON", opts.env),
+            .test_foreign_map_fail = knobs.boolKnob("SQUEEZEFS_TEST_FOREIGN_MAP_FAIL", opts.env),
             .test_promotion_hold = holdPath(opts.env, "SQUEEZEFS_TEST_PROMOTION_HOLD"),
             .test_release_hold = holdPath(opts.env, "SQUEEZEFS_TEST_RING_RELEASE_HOLD"),
             .zcrx_registry = zcrx.steering.Registry.init(gpa),
@@ -3294,7 +3298,7 @@ pub const DataPlane = struct {
     /// (`kvmap_resolve_failures`), never a fabricated hole.
     fn kvmapLookup(self: *DataPlane, ino: u64, head: layout.Layout.KvmapHead, block: u32) ?Mapping {
         if (head.sweep) |k| if (block >= k) return null;
-        if (self.foreign_layout) |f| switch (f.mapRecord(f.ctx, self.gpa, ino, block) catch |e| {
+        if (self.foreign_layout) |f| switch ((if (self.test_foreign_map_fail) error.HolderUnreachable else f.mapRecord(f.ctx, self.gpa, ino, block)) catch |e| {
             // `rawBinding` has no error channel: a failed resolve reads as a
             // hole, as a failed head resolve does for every foreign file.
             stats.kvmap_foreign_resolve_failures.inc();

@@ -17258,6 +17258,54 @@ test "smoke: A JOINED MEMBER READS A HOLDER'S BLOCK-MAP FILE, AND ITS RECALL PUR
     try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
 }
 
+test "smoke: A FOREIGN BLOCK MAP THE TOKEN CANNOT SERVE ANSWERS EIO, NEVER ZEROS — mount A (the manager) + B JOINED under SQUEEZEFS_TEST_FOREIGN_MAP_FAIL (every block-map window B resolves off A's token fails), no write cache, 512 KiB blocks under 64 KiB nodes → A writes `k/big` (192 MiB: tree-mapped) → B's read of `big` answers EIO (red before: it read zeros, sha-unequal, rc 0) and B's write into the middle of `big` answers EIO with nothing published (red before: it seeded its block from the fabricated hole and A's file lost the block's other bytes) → A's `big` sha-equal to what A wrote; umount B, A → fsck --offline --scrub 0 findings" {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    try rig.env.put("SQUEEZEFS_MW_BIND", "127.0.0.1:0");
+    var bs_buf: [16]u8 = undefined;
+    try rig.formatSetWith(false, &.{ "--meta-node-kib", "64", "--block-size", try std.fmt.bufPrint(&bs_buf, "{d}", .{kvmap_peer_block}) });
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(0);
+    var env_b = try envWith(gpa, &rig.env, &.{.{ "SQUEEZEFS_TEST_FOREIGN_MAP_FAIL", "1" }});
+    defer env_b.deinit();
+    const b = try Peer.init(rig, "b");
+    defer b.deinit();
+    b.env = &env_b;
+    try b.spawn(&.{});
+    _ = try b.awaitReady();
+    const sha_a = try rig.onMount("mkdir k && dd if=/dev/urandom of=k/big bs=1048576 count=192 iflag=fullblock conv=fsync status=none && sha256sum < k/big | cut -d' ' -f1");
+    defer gpa.free(sha_a);
+    {
+        const sa = try rig.stats();
+        defer gpa.free(sa);
+        try testing.expectEqual(@as(?u64, 1), numberAfter(sa, "\"kvmap_crossings\":"));
+    }
+    // B's read: EIO, never A's file as zeros. B's write into the middle of
+    // a block: EIO, nothing published. A's file: A's bytes.
+    const read_out = try b.onMount("if sha256sum < k/big > \"$1/b.sha\" 2> \"$1/b.err\"; then echo read-ok; cat \"$1/b.sha\"; else cat \"$1/b.err\"; fi");
+    defer gpa.free(read_out);
+    const write_out = try b.onMount("if printf 'xyz' | dd of=k/big bs=3 seek=$((100 * 1048576 + 7)) oflag=seek_bytes conv=notrunc status=none 2> \"$1/w.err\"; then echo write-ok; else cat \"$1/w.err\"; fi");
+    defer gpa.free(write_out);
+    const sha_after = try rig.onMount("sha256sum < k/big | cut -d' ' -f1");
+    defer gpa.free(sha_after);
+    const read_eio = std.mem.indexOf(u8, read_out, "Input/output error") != null;
+    const write_eio = std.mem.indexOf(u8, write_out, "Input/output error") != null;
+    const intact = std.mem.eql(u8, sha_a, sha_after);
+    if (!read_eio or !write_eio or !intact) {
+        std.debug.print("\n--- B under unservable block-map windows: read {s}--- write {s}--- A's big {s}\n", .{ read_out, write_out, if (intact) "intact" else "CHANGED (B's write published a block seeded from a hole)" });
+        return error.ResolveFaultNotEio;
+    }
+    try b.umount();
+    try b.expectCleanExit("B's clean unmount after the refused resolves");
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+    _ = try fsckClean(rig, "the resolve-fault row");
+    std.debug.print("smoke: resolve faults: B's read and write of a block map its token could not serve answered EIO; A's file intact; fsck clean\n", .{});
+}
+
 test "smoke: THE FLEET READ SHARD — mount A (the coordinator) + B JOINED with the fleet on: B enrolls at A as a READ worker over its own manager link (job_remote_workers 1 on A) → 1 GiB of fsync'd files, 512 MiB written on each side → `scrub --online <A>` partitions 2 ways: shard 0 on A online, shard 1 LEASED to B, run by B's engine over B's own plane (B's scrub_blocks_scanned grows, job_fleet_worker_shards 1), PROPOSED as read_shard_result and merged on A (dispatched 1 = completed 1, relocal 0; every block scanned, 0 findings) → `scrub --online --throttle 5` again: B's residue stretched by the duty cycle, kill -9 B inside it → A's departure expires the lease (fencing +1), the residue is LOST and the local view re-run (relocal 1), the job completes whole, 0 findings; the engagement counters per side" {
     const io = testing.io;
     if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);

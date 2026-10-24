@@ -738,6 +738,11 @@ fn mountMain(ctx: *Ctx) u8 {
     };
     var session_live = true;
     defer if (session_live) session.deinit();
+    // THE STALL ANSWER (decision 0003 §BP): a write the parked-buffer gate
+    // holds behind refused flushes answers before the kernel's request
+    // deadline would end this mount — the timeout the kernel applies (the
+    // one asked for, seam included, when it applies none) less a check.
+    plane.wp.setStallAnswerNs(fuse_geometry.stallAnswerNs(fuse_geometry.resolveRequestTimeoutS(fuse_geometry.requestTimeoutOverride(env), fuse_geometry.requestTimeoutS(lattice_t_owner_ms, lattice_park_max_ms)), session.requestTimeoutS()));
     // The wedge census names the drain workers' state while the session stands.
     registry.setCensusHook(session.censusHook());
     defer registry.setCensusHook(null);

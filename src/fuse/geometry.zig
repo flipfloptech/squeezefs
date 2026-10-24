@@ -280,6 +280,21 @@ pub fn kernelRequestTimeoutS(requested: u16, max_sysctl: ?u32) u16 {
     return @intCast(@max(capped, REQUEST_TIMEOUT_CHECK_S));
 }
 
+/// THE STALL ANSWER's bound (charter §1.8: the daemon answers, never holds;
+/// decision 0003 §BP): how long the data plane holds a write behind a plane
+/// that refuses every flush before it answers ENOSPC/EIO. The kernel ends
+/// the WHOLE connection for one request older than its timeout, judged at
+/// its next check (`fuse_check_timeout`, every `REQUEST_TIMEOUT_CHECK_S`)
+/// from the request's creation — before the daemon saw it — so the answer
+/// lands one check period ahead of the earliest abort: `T − 15 s`. `T` is
+/// the timeout the kernel applies (`applied_s`), else — a kernel without
+/// FUSE_REQUEST_TIMEOUT — the one this mount asked for: the lattice's
+/// deadline binds the daemon either way.
+pub fn stallAnswerNs(asked_s: u16, applied_s: u16) u64 {
+    const t: u64 = if (applied_s != 0) applied_s else asked_s;
+    return (t -| REQUEST_TIMEOUT_CHECK_S) * std.time.ns_per_s;
+}
+
 pub const max_request_timeout_path = "/proc/sys/fs/fuse/max_request_timeout";
 
 /// The host's cap on every server's request timeout; null off-Linux or on a
@@ -834,6 +849,19 @@ test "request timeout (decision 0003 §Z): T_owner + T_park_max in whole seconds
     try testing.expectEqual(REQUEST_TIMEOUT_CHECK_S, kernelRequestTimeoutS(135, 5));
     try testing.expectEqual(REQUEST_TIMEOUT_CHECK_S, kernelRequestTimeoutS(1, null));
     try testing.expectEqual(@as(u16, 15), REQUEST_TIMEOUT_CHECK_S);
+}
+
+test "the stall answer's bound (decision 0003 §BP): the applied request timeout less one check period — 120 s at the lattice's 135 s; the asked one when the kernel applies none; a 15 s timeout (the kernel's floor) answers at once" {
+    // T − REQUEST_TIMEOUT_CHECK_S, T = applied else asked.
+    try testing.expectEqual(@as(u64, 120 * std.time.ns_per_s), stallAnswerNs(135, 135));
+    try testing.expectEqual(@as(u64, 45 * std.time.ns_per_s), stallAnswerNs(135, 60));
+    try testing.expectEqual(@as(u64, 120 * std.time.ns_per_s), stallAnswerNs(135, 0));
+    try testing.expectEqual(@as(u64, 15 * std.time.ns_per_s), stallAnswerNs(30, 30));
+    try testing.expectEqual(@as(u64, 0), stallAnswerNs(135, REQUEST_TIMEOUT_CHECK_S));
+    try testing.expectEqual(@as(u64, 0), stallAnswerNs(0, 0));
+    for ([_]u16{ 15, 16, 30, 135, 1000, std.math.maxInt(u16) }) |t| {
+        try testing.expectEqual(@as(u64, t - REQUEST_TIMEOUT_CHECK_S) * std.time.ns_per_s, stallAnswerNs(135, kernelRequestTimeoutS(t, null)));
+    }
 }
 
 test "page and sysctl inputs: a sub-512 page is floored, the sysctl fallback is 256 and clamps to [1, 65535]; the text parser is total" {

@@ -202,6 +202,11 @@ pub const stats = struct {
     /// failing its DMAs, a thin pool out of space, F17's grant ledger): a
     /// stall, ONE warning per episode (`WritePath.gate_stall_warned`).
     pub var parked_gate_wall_plane_stalls: counters.ShardedCounter = .{};
+    /// `parked_gate_stall_answers`: writes the gate held behind refused
+    /// flushes past the stall bound (the kernel's request timeout less one
+    /// check period), or during an answered episode, answered ENOSPC/EIO
+    /// before the kernel would end the mount (decision 0003 §BP).
+    pub var parked_gate_stall_answers: counters.ShardedCounter = .{};
     pub var write_shared_class_violation: counters.Tripwire = .init("write_shared_class_violation");
 
     pub fn ledgerSum() u64 {
@@ -217,7 +222,7 @@ pub fn noteInlineWrite(len: u64) void {
 
 pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
     try w.writeAll("{");
-    inline for (.{ "admit_write_overlay_bytes", "admit_write_inplace_bytes", "admit_write_accumulate_bytes", "admit_write_inline_bytes", "write_enospc_refusals", "write_pieces", "writes_admitted", "staging_sibling_probes", "restage_churn_removes", "restage_churn_bytes", "parked_gate_waits", "parked_gate_self_flushes", "parked_gate_cold_flushes", "parked_gate_wall_refusals", "parked_gate_wall_supply_visible", "parked_gate_wall_plane_stalls", "write_gap_zero_bytes", "fallocate_blocks_reserved", "fallocate_blocks_zeroed", "fallocate_custody_skips" }) |name| {
+    inline for (.{ "admit_write_overlay_bytes", "admit_write_inplace_bytes", "admit_write_accumulate_bytes", "admit_write_inline_bytes", "write_enospc_refusals", "write_pieces", "writes_admitted", "staging_sibling_probes", "restage_churn_removes", "restage_churn_bytes", "parked_gate_waits", "parked_gate_self_flushes", "parked_gate_cold_flushes", "parked_gate_wall_refusals", "parked_gate_wall_supply_visible", "parked_gate_wall_plane_stalls", "parked_gate_stall_answers", "write_gap_zero_bytes", "fallocate_blocks_reserved", "fallocate_blocks_zeroed", "fallocate_custody_skips" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, @field(stats, name).load() });
     }
     try w.print("\"write_shared_class_violation\":{d},", .{counters.tripwireCount("write_shared_class_violation")});
@@ -519,6 +524,16 @@ pub const WritePath = struct {
     /// stalls`): one warning per episode; the next gate visit that finds
     /// capacity (room, or a cold flush that retired its victim) closes it.
     gate_stall_warned: std.atomic.Value(bool) = .init(false),
+    /// THE STALL ANSWER's bound (`awaitParkedCapacity`): how long the gate
+    /// holds a write behind refused flushes, from its arrival, before it
+    /// answers — the kernel's request timeout less one check period, set by
+    /// the mount (`setStallAnswerNs`); never (maxInt) for a write path no
+    /// kernel request waits on (a tool, a test).
+    stall_answer_ns: std.atomic.Value(u64) = .init(std.math.maxInt(u64)),
+    /// A stall answer was given and no flush has landed since: the gate
+    /// answers every write it holds at its first refused flush, one loud
+    /// line per episode; the gate's next capacity closes it.
+    stall_answered: std.atomic.Value(bool) = .init(false),
 
     pub const RingClaim = struct {
         ctx: *anyopaque,
@@ -909,6 +924,7 @@ pub const WritePath = struct {
             stats.write_shared_class_violation.fire("a Shared-classified write extends the file or is not striped");
             log.err("write ino {d} [{d}, {d}): classified Shared against a {t} file of size {d}", .{ req.ino, req.offset, end, file.kind, file.size });
         }
+        const arrived_ns = clock.monotonicNs();
         const first: u32 = @intCast(req.offset / bs);
         const last: u32 = @intCast((end - 1) / bs);
         // §8: the ENOSPC terminal law, decided for the WHOLE write: the
@@ -948,7 +964,7 @@ pub const WritePath = struct {
         var out: Outcome = .{ .written = 0, .size_claim = end, .size_epoch = 0, .pieces = @intCast(pieces.len) };
         for (pieces) |pc| {
             stats.write_pieces.inc();
-            const arm = try self.admitPiece(io, req, file, pc, &bytes, try_patch and single, overlay_shape, stream_adjacent);
+            const arm = try self.admitPiece(io, req, file, pc, &bytes, try_patch and single, overlay_shape, stream_adjacent, arrived_ns);
             out.arms[@backingInt(arm)] += 1;
             out.written += pc.len;
         }
@@ -1029,7 +1045,7 @@ pub const WritePath = struct {
     /// on 100–128 per leg). The governor's in-flight permits belong to
     /// uploads that take (3) to publish: a park for one under (3) is the
     /// generic/551 cycle.
-    fn admitPiece(self: *WritePath, io: Io, req: Request, file: seams.FileView, pc: Piece, bytes: *?[]const u8, try_patch: bool, overlay_shape: bool, stream_adjacent: bool) Error!Arm {
+    fn admitPiece(self: *WritePath, io: Io, req: Request, file: seams.FileView, pc: Piece, bytes: *?[]const u8, try_patch: bool, overlay_shape: bool, stream_adjacent: bool, arrived_ns: u64) Error!Arm {
         const bs = self.cfg.block_size;
         var hint: enum { none, overlay_drain, upload, fold } = .none;
         var upload_permit: ?pipeline.Permit = null;
@@ -1038,7 +1054,7 @@ pub const WritePath = struct {
         var overlay_permit: ?pipeline.Permit = null;
         defer if (overlay_permit) |p| self.governor.returnUnused(io, p);
         var prof = pipeline.Prof.start();
-        var gate: GateWall = .{};
+        var gate: GateWall = .{ .arrived_ns = arrived_ns };
         const arm: Arm = blk: while (true) {
             const g = self.locks.acquire(io, req.ino, pc.block, .write_checkout);
             var held = true;
@@ -1312,16 +1328,26 @@ pub const WritePath = struct {
     /// One write's standing at the gate across its ladder rounds: when its
     /// first FAILED cold flush happened (the wall runs from there), and
     /// whether a flush inside this wall met the store out of space.
+    /// The gate's answers: the terminal wall's ENOSPC, the stall answer's
+    /// ENOSPC or EIO, a fenced writer.
+    const GateError = error{ NoSpaceLeft, InputOutput, WriterGuardFenced };
+
     const GateWall = struct {
         failed_since_ns: u64 = 0,
         space_refused: bool = false,
+        /// The write's arrival at the write path: the stall answer's clock.
+        arrived_ns: u64,
+        /// A flush since the arrival met the store out of space — the
+        /// allocator's `StorageFull` or the device's own ENOSPC (a thin
+        /// pool): the stall answer's class.
+        space_seen: bool = false,
     };
 
     /// An accumulation arm met the parked-buffer cap under (3): drop the
     /// guard, run the gate, and let the caller restart the ladder — or
     /// answer ENOSPC once the plane has refused the gate's flushes for a
     /// whole wall.
-    fn parkAtPoolCap(self: *WritePath, io: Io, g: seams.BlockLocks.Guard, held: *bool, req: Request, block: u32, gate: *GateWall) error{ NoSpaceLeft, WriterGuardFenced }!void {
+    fn parkAtPoolCap(self: *WritePath, io: Io, g: seams.BlockLocks.Guard, held: *bool, req: Request, block: u32, gate: *GateWall) GateError!void {
         held.* = false;
         g.release(io);
         return self.awaitParkedCapacity(io, req, block, gate);
@@ -1361,7 +1387,20 @@ pub const WritePath = struct {
     /// A wall whose flushes met NO space refusal anywhere in the set had
     /// supply in sight throughout and the plane refused them anyway: a
     /// stall (`parked_gate_wall_plane_stalls`, one warning per episode).
-    fn awaitParkedCapacity(self: *WritePath, io: Io, req: Request, block: u32, gate: *GateWall) error{ NoSpaceLeft, WriterGuardFenced }!void {
+    ///
+    /// THE STALL ANSWER (charter §1.8: the daemon answers, never holds;
+    /// decision 0003 §BP): a write held at the gate behind refused flushes
+    /// for `stall_answer_ns` since its arrival answers before the kernel's
+    /// request deadline would end the whole mount — ENOSPC when a flush
+    /// since its arrival met the store out of space (the allocator's
+    /// `StorageFull`, or the device's own ENOSPC: a thin pool), else EIO;
+    /// no byte of it recorded, the parked set left to its retries
+    /// (`parked_gate_stall_answers`, one loud line per episode). The
+    /// episode then stands (`stall_answered`): every write the gate holds
+    /// answers at its first refused flush, so one queued behind the held
+    /// ones in the kernel is never held a second bound; the gate's next
+    /// capacity closes it.
+    fn awaitParkedCapacity(self: *WritePath, io: Io, req: Request, block: u32, gate: *GateWall) GateError!void {
         stats.parked_gate_waits.inc();
         if (req.park_hook) |h| h.parked(h.ctx);
         var room = self.table.capacity.notified();
@@ -1390,8 +1429,17 @@ pub const WritePath = struct {
                     .stay_parked => {
                         var cand_buf: [router.MAX_VOLUMES]*block_alloc.BlockAllocator = undefined;
                         const cands = self.vols.candidates(&cand_buf);
-                        if (enospc.spaceRefusedSince(cands, flush_ns)) gate.space_refused = true;
+                        if (enospc.spaceRefusedSince(cands, flush_ns)) {
+                            gate.space_refused = true;
+                            gate.space_seen = true;
+                        }
+                        if (self.table.deviceSpaceRefusedSince(flush_ns)) gate.space_seen = true;
                         const now = clock.monotonicNs();
+                        // An answered stall stands: answered at this refusal.
+                        if (self.stall_answered.load(.acquire)) {
+                            room.cancel(io);
+                            return self.answerStall(req, block, gate, now);
+                        }
                         if (gate.failed_since_ns == 0) gate.failed_since_ns = now;
                         if (now - gate.failed_since_ns >= PARKED_GATE_WALL_NS) {
                             if (enospc.freshSupplyExhausted(cands)) {
@@ -1405,7 +1453,12 @@ pub const WritePath = struct {
                                 stats.parked_gate_wall_plane_stalls.inc();
                                 if (!self.gate_stall_warned.swap(true, .acq_rel)) log.warn("write ino {d} block {d}: the parked-buffer gate's cold flushes have been refused for {d} ms with fresh supply in sight and no volume out of space inside the wall ({d} parked, {d} B) — the plane refuses the flushes (a device failing its DMAs, a thin pool out of space), the store is not full; the write stays parked (one line per stall episode, `parked_gate_wall_plane_stalls` counts the walls)", .{ req.ino, block, (now - gate.failed_since_ns) / std.time.ns_per_ms, self.table.parkedCount(), accumulate.stats.parked_full_buffer_bytes.load() });
                             }
-                            gate.* = .{ .failed_since_ns = now };
+                            gate.failed_since_ns = now;
+                            gate.space_refused = false;
+                        }
+                        if (now -| gate.arrived_ns >= self.stall_answer_ns.load(.monotonic)) {
+                            room.cancel(io);
+                            return self.answerStall(req, block, gate, now);
                         }
                         if (req.park_hook) |h| if (h.refused) |f| f(h.ctx);
                     },
@@ -1416,11 +1469,29 @@ pub const WritePath = struct {
     }
 
     /// Capacity returned to a write at the gate: its wall is over, and so
-    /// is any stall episode the walls announced.
+    /// is any stall episode the walls announced or answered (its clock,
+    /// the arrival, stands).
     fn gateFoundCapacity(self: *WritePath, gate: *GateWall) void {
-        gate.* = .{};
+        gate.* = .{ .arrived_ns = gate.arrived_ns };
         // Acq_rel/release: pairs with the wall's `swap` (one warning per episode).
         if (self.gate_stall_warned.load(.monotonic)) self.gate_stall_warned.store(false, .release);
+        // Release: pairs with the answer's `swap` (one line per episode).
+        if (self.stall_answered.load(.monotonic)) self.stall_answered.store(false, .release);
+    }
+
+    /// The stall answer (`awaitParkedCapacity`): ENOSPC iff a flush since
+    /// the write's arrival met the store out of space, else EIO.
+    fn answerStall(self: *WritePath, req: Request, block: u32, gate: *const GateWall, now: u64) error{ NoSpaceLeft, InputOutput } {
+        stats.parked_gate_stall_answers.inc();
+        // Acq_rel: pairs with `gateFoundCapacity`'s release (one line per episode).
+        if (!self.stall_answered.swap(true, .acq_rel)) log.err("write ino {d} block {d}: held {d} ms at the parked-buffer gate behind refused flushes ({d} parked, {d} B{s}) — answering {s} before the kernel's request deadline would end the mount (bound {d} ms: the request timeout less one check period); the parked set stays and retries, and every write the gate holds until a flush lands answers at its first refused flush (`parked_gate_stall_answers`)", .{ req.ino, block, (now -| gate.arrived_ns) / std.time.ns_per_ms, self.table.parkedCount(), accumulate.stats.parked_full_buffer_bytes.load(), if (gate.space_seen) "; the store or the device out of space" else "; the device refusing its DMAs with supply in sight", if (gate.space_seen) "ENOSPC" else "EIO", self.stall_answer_ns.load(.monotonic) / std.time.ns_per_ms });
+        return if (gate.space_seen) error.NoSpaceLeft else error.InputOutput;
+    }
+
+    /// The stall answer's bound, from the mount once the FUSE INIT settled
+    /// the request timeout (`fuse/geometry.stallAnswerNs`).
+    pub fn setStallAnswerNs(self: *WritePath, ns: u64) void {
+        self.stall_answer_ns.store(ns, .monotonic);
     }
 
     fn spawnUpload(self: *WritePath, io: Io, ino: u64, block: u32, permit: ?pipeline.Permit, prof: pipeline.Prof) void {
@@ -3851,6 +3922,80 @@ test "the parked-buffer gate, the wall with supply VISIBLE and no space refusal 
     try testing.expectEqual(trips0, counters.invariantTripwires());
     try testing.expectEqual(@as(u32, 8), w.wp.table.parkedCount());
     try testing.expect(w.wp.table.has(1, 8));
+}
+
+/// A write of half a block of `seed` bytes at block `block` of `ino` (the
+/// gate's answer as the caller sees it).
+fn writeHalf(w: *World, io: Io, ino: u64, block: u32, seed: u8) Error!Outcome {
+    var half: [wt.BS / 2]u8 align(4096) = undefined;
+    fill(&half, seed);
+    if (w.f.map.files.get(ino) == null) w.f.map.create(ino, .striped, 0) catch return error.OutOfMemory;
+    return w.wp.write(io, .{ .ino = ino, .offset = @as(u64, block) * wt.BS, .payload = .{ .bytes = &half }, .class = .entire_op, .file = World.striped(@as(u64, block) * wt.BS) });
+}
+
+// generic/347 on dev: a write parked at the gate behind a thin pool refusing
+// every DMA sat there until the KERNEL's request timeout (135 s) aborted the
+// connection — the whole mount fail-stopped for one write never acked. The
+// daemon answers, never holds: past the stall bound (the request timeout
+// less one check period; the mount sets it) the write answers; the episode
+// then answers every write the gate holds at its first refused flush.
+test "THE STALL ANSWER (decision 0003 §BP; generic/347): a write held at the gate behind a device refusing every DMA with supply in sight answers EIO once the stall bound has passed since its arrival — a counted plane stall first, no byte of it recorded, the parked set intact, ONE error line; a second writer during the episode answers at its first refused flush; healed, the gate's capacity closes the episode and a write parks again" {
+    const io = testing.io;
+    const w = try World.init(testing.allocator, .sync_inline, false);
+    defer w.deinit(testing.allocator);
+    // One wall: the second refused round both counts the stall and answers.
+    w.wp.setStallAnswerNs(PARKED_GATE_WALL_NS);
+    const answers0 = stats.parked_gate_stall_answers.load();
+    const stalls0 = stats.parked_gate_wall_plane_stalls.load();
+    const refusals0 = stats.parked_gate_wall_refusals.load();
+    const trips0 = counters.invariantTripwires();
+    for (0..8) |b| try parkHalf(w, io, 1, @intCast(b), @intCast(b + 1));
+    w.f.dev.setFailWrites(std.math.maxInt(u32), error.InputOutput);
+    defer w.f.dev.setFailWrites(0, error.InputOutput);
+    log.testing.expectErrorLogs(1);
+    const t0 = clock.monotonicNs();
+    try testing.expectError(error.InputOutput, writeHalf(w, io, 1, 8, 9));
+    try testing.expect(clock.monotonicNs() - t0 >= PARKED_GATE_WALL_NS);
+    try testing.expectEqual(answers0 + 1, stats.parked_gate_stall_answers.load());
+    try testing.expectEqual(stalls0 + 1, stats.parked_gate_wall_plane_stalls.load());
+    try testing.expect(w.wp.stall_answered.load(.acquire));
+    try testing.expect(!w.wp.table.has(1, 8)); // no byte of it recorded
+    try testing.expectEqual(@as(u32, 8), w.wp.table.parkedCount());
+    // The episode stands: the next write answers at its first refused flush.
+    const t1 = clock.monotonicNs();
+    try testing.expectError(error.InputOutput, writeHalf(w, io, 1, 9, 10));
+    try testing.expect(clock.monotonicNs() - t1 < PARKED_COLD_NS);
+    try testing.expectEqual(answers0 + 2, stats.parked_gate_stall_answers.load());
+    try log.testing.expectAllFired(); // one line for the episode
+    // Healed: the gate's cold flush lands, the episode closes, the write parks.
+    w.f.dev.setFailWrites(0, error.InputOutput);
+    _ = try writeHalf(w, io, 1, 10, 11);
+    try testing.expect(!w.wp.stall_answered.load(.acquire));
+    try testing.expect(w.wp.table.has(1, 10));
+    try testing.expectEqual(refusals0, stats.parked_gate_wall_refusals.load());
+    try testing.expectEqual(trips0, counters.invariantTripwires());
+}
+
+test "THE STALL ANSWER's class: a device refusing every DMA with ENOSPC (a thin pool out of space) while the allocator has supply in sight answers ENOSPC, not EIO — never the terminal wall's refusal (the set is not exhausted)" {
+    const io = testing.io;
+    const w = try World.init(testing.allocator, .sync_inline, false);
+    defer w.deinit(testing.allocator);
+    w.wp.setStallAnswerNs(0);
+    const answers0 = stats.parked_gate_stall_answers.load();
+    const refusals0 = stats.parked_gate_wall_refusals.load();
+    for (0..8) |b| try parkHalf(w, io, 2, @intCast(b), @intCast(b + 1));
+    var cands: [router.MAX_VOLUMES]*block_alloc.BlockAllocator = undefined;
+    try testing.expect(!enospc.freshSupplyExhausted(w.f.vols.candidates(&cands)));
+    w.f.dev.setFailWrites(std.math.maxInt(u32), error.NoSpaceLeft);
+    defer w.f.dev.setFailWrites(0, error.InputOutput);
+    log.testing.expectErrorLogs(1);
+    const t0 = clock.monotonicNs();
+    try testing.expectError(error.NoSpaceLeft, writeHalf(w, io, 2, 8, 9));
+    try log.testing.expectAllFired();
+    try testing.expect(w.wp.table.deviceSpaceRefusedSince(t0));
+    try testing.expectEqual(answers0 + 1, stats.parked_gate_stall_answers.load());
+    try testing.expectEqual(refusals0, stats.parked_gate_wall_refusals.load());
+    try testing.expectEqual(@as(u32, 8), w.wp.table.parkedCount());
 }
 
 /// A data volume of the test World armed as the grant plane's HOLDER: the

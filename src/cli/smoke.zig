@@ -7987,6 +7987,18 @@ test "smoke: A WRITE HELD BEHIND A DEVICE THAT REFUSES EVERY DMA ANSWERS BEFORE 
     try rig.expectAlive("the second writer's answer");
     try testing.expect(more.rc != 0);
     try testing.expect(more.ms < 2 * tick_law.tick_ns / std.time.ns_per_ms + 2 * std.time.ms_per_s);
+    {
+        // Both answers were the gate's stall answer, after a counted stall.
+        const st = try rig.stats();
+        defer gpa.free(st);
+        std.debug.print("smoke[stalled plane]: stall answers {d}, plane stalls {d}, joined refusals taken {d}\n", .{ numberAfter(st, "\"parked_gate_stall_answers\":") orelse 0, numberAfter(st, "\"parked_gate_wall_plane_stalls\":") orelse 0, numberAfter(st, "\"upload_join_refusals_taken\":") orelse 0 });
+        try testing.expect((numberAfter(st, "\"parked_gate_stall_answers\":") orelse 0) >= 2);
+        try testing.expect((numberAfter(st, "\"parked_gate_wall_plane_stalls\":") orelse 0) >= 1);
+        // The held write is the op watchdog's overdue op by design (held
+        // up to the bound); no "cannot happen" fired, the volume is live.
+        try testing.expectEqual(@as(?u64, 0), numberAfter(st, "\"invariant_tripwires\":"));
+        try testing.expect(std.mem.indexOf(u8, st, "\"volume_failed\":false") != null);
+    }
     // The mount serves everything else.
     {
         const back = try rig.onMount("stat -c %s keep && sha256sum keep");

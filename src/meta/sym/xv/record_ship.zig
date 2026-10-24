@@ -59,6 +59,9 @@ pub const stats = struct {
     /// Served access stamps that advanced a record's atime (a non-holder's
     /// READ under the mount's atime posture; charter §4 "Access time").
     pub var record_atime_touches: counters.ShardedCounter = .{};
+    /// Served write size claims (`SETATTR_SIZE_CLAIM`: the size raised to
+    /// `max(size, claim)`, no size path run).
+    pub var record_size_claims: counters.ShardedCounter = .{};
     /// Shipped setattrs that carried KILLPRIV_V2's bit: the holder stripped
     /// the setid bits (and the caps xattr) in the verb's tx.
     pub var record_killpriv_strips: counters.ShardedCounter = .{};
@@ -108,11 +111,15 @@ pub const Setattr = struct {
     /// "Access time"): `atime` is journaled iff it advances the record,
     /// as a Δatime alone — no ctime, no other field.
     atime_touch: bool = false,
+    /// `size` is a non-holder WRITE's claim (`verbs.SETATTR_SIZE_CLAIM`):
+    /// the holder raises the record's size to it, never runs its size path.
+    size_claim: bool = false,
 
     pub fn toWire(self: Setattr) verbs.SetattrWire {
         var w: verbs.SetattrWire = .none;
         if (self.kill_suidgid) w.valid |= verbs.SETATTR_KILL_SUIDGID;
         if (self.atime_touch) w.valid |= verbs.SETATTR_ATIME_TOUCH;
+        if (self.size_claim and self.size != null) w.valid |= verbs.SETATTR_SIZE_CLAIM;
         if (self.mode) |v| {
             w.valid |= verbs.SETATTR_MODE;
             w.mode = v;
@@ -160,6 +167,7 @@ pub const Setattr = struct {
             .flags = if (w.valid & verbs.SETATTR_FLAGS != 0) w.flags else null,
             .kill_suidgid = w.valid & verbs.SETATTR_KILL_SUIDGID != 0,
             .atime_touch = w.valid & verbs.SETATTR_ATIME_TOUCH != 0,
+            .size_claim = w.valid & verbs.SETATTR_SIZE_CLAIM != 0,
         };
     }
 };
@@ -477,8 +485,9 @@ pub fn RecordShipService(comptime Store: type) type {
             if (!self.plane.isLocal(global)) return error.SlotMoved;
             // A size change runs the holder's own size path first (its
             // commit carries the size); the verb's other fields ride the
-            // entry below.
-            if (call == .setattr) if (call.setattr.size) |sz| {
+            // entry below. A WRITE's size claim is no size change: it rides
+            // the entry as `max(size, claim)` (below).
+            if (call == .setattr and !call.setattr.size_claim) if (call.setattr.size) |sz| {
                 const face = self.truncate.load(.acquire) orelse return error.Rejected;
                 face.truncate(face.ctx, global, sz) catch |e| return switch (e) {
                     error.OutOfMemory => error.OutOfMemory,
@@ -529,7 +538,15 @@ pub fn RecordShipService(comptime Store: type) type {
                     if (s.mode) |m| v.mode = (v.mode & S.IFMT) | (m & ~@as(u32, S.IFMT));
                     if (s.uid) |u| v.uid = u;
                     if (s.gid) |g| v.gid = g;
-                    if (s.size) |sz| v.size = sz;
+                    // THE CLAIM LAW: a non-holder write's bytes and their
+                    // binding reached this layout through its publish
+                    // before its claim, so the claim raises the size and
+                    // touches no byte — the truncate-up path's extension
+                    // zeros would land over [size, claim), the claimer's own
+                    // bytes (a joiner's `>>` read back zeros on both
+                    // mounts); a claim at or below the size moves nothing.
+                    if (s.size) |sz| v.size = if (s.size_claim) @max(v.size, sz) else sz;
+                    if (s.size_claim) stats.record_size_claims.inc();
                     if (s.atime) |x| v.atime = x;
                     if (s.mtime) |x| v.mtime = x;
                     // The attribute bits alone: STRIPE is the format's.

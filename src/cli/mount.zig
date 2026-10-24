@@ -588,9 +588,11 @@ fn mountMain(ctx: *Ctx) u8 {
     if (wire) |wp| {
         vs.renderer.sources.mount.wire_endpoint = wp.endpointText();
         vs.renderer.sources.wire = wp;
-        // The write cache's recall: a foreign reader's grant promotes this
-        // mount's residents of the object first (charter §6.1 coherence).
-        wp.holder.prepare = .{ .ctx = plane, .run = &recallResidentsForGrant };
+        // A foreign reader's grant lands this mount's custody of the object
+        // first: the write cache's residents promoted, every other write
+        // custody landed and its size claim journaled (charter §6.1
+        // coherence; `KvFs.landForGrant`).
+        wp.holder.prepare = .{ .ctx = &fs, .run = &landForGrant };
         // The read divert: a foreign slot's records come under a token or
         // answer the typed EAGAIN, never off this mount's cache; a token
         // whose records served the kernel stays this mount's at its holder
@@ -1160,10 +1162,11 @@ fn announceWriteCacheDrained() void {
     ipc_rl.sendCtl(sock, &frame, null) catch {};
 }
 
-/// `tokens.table.PrepareSeam` over the plane: the object is the ino.
-fn recallResidentsForGrant(ctx: *anyopaque, _: Io, object: u64) void {
-    const plane: *plane_mod.DataPlane = @ptrCast(@alignCast(ctx));
-    plane.recallResidents(object);
+/// `tokens.table.PrepareSeam` over the filesystem: the object is the ino.
+fn landForGrant(ctx: *anyopaque, _: Io, object: u64) void {
+    const fs: *BackendFs = @ptrCast(@alignCast(ctx));
+    fs.data.recallResidents(object);
+    fs.landForGrant(object);
 }
 
 fn stripeFloor(be: *meta_set.MetaSet) sym_xv.stripe.Floor {

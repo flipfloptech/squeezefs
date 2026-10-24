@@ -271,6 +271,12 @@ pub var fuse_atime_touches_dropped: counters.ShardedCounter = .{};
 /// claimed size as it stands, never the write's pre-truncate end
 /// (`DataPlane.sizeSetSince`; fstests generic/075, 112's class).
 pub var fuse_write_size_claims_dropped: counters.ShardedCounter = .{};
+/// `fuse_grant_landings`: foreign grants of an ino this holder kept write
+/// custody or a parked size claim of — landed and journaled before the
+/// page was built (`landForGrant`); `fuse_grant_landing_drain_failures`:
+/// the claim's journal refused there (the page carried the stored size).
+pub var fuse_grant_landings: counters.ShardedCounter = .{};
+pub var fuse_grant_landing_drain_failures: counters.ShardedCounter = .{};
 /// Durable promotions a write forced BEFORE its type flip (inline/staged/
 /// packed → striped: the resident payload landed on its own block).
 pub var fuse_write_promotions_to_striped: counters.ShardedCounter = .{};
@@ -4117,20 +4123,24 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         }
 
         /// A foreign-slot file's postlude: the size claim as ONE shipped
-        /// record verb after the pieces were acked. A move-class refusal
-        /// records the landed write in the op's attempt state, so the move
-        /// gate's re-issue re-runs this claim alone (decision 0003 §X.2).
+        /// record verb after the pieces were acked — a CLAIM
+        /// (`SETATTR_SIZE_CLAIM`: the holder raises its size to it), never
+        /// a size set: the holder's size path would land the extension
+        /// law's zeros over the bytes this write's publish just bound (a
+        /// joiner's `>>` read back zeros on both mounts). A move-class
+        /// refusal records the landed write in the op's attempt state, so
+        /// the move gate's re-issue re-runs this claim alone (decision 0003
+        /// §X.2).
         fn shipSizeClaim(self: *Self, c: *Ctx, local: u64, wl: filesystem.MoveAttempt.WriteLanded) Error!filesystem.Written {
             if (c.move) |m| m.write_landed = null;
-            const held = try self.readInode(local);
-            const size = @max(held.size, wl.size_claim);
             const stamp = now();
-            _ = self.shipRecord(globalOf(local), .{ .setattr = .{ .size = size, .mtime = stamp, .ctime = stamp } }) catch |e| {
+            const rep = self.shipRecord(globalOf(local), .{ .setattr = .{ .size = wl.size_claim, .size_claim = true, .mtime = stamp, .ctime = stamp } }) catch |e| {
                 if (errors.isMoveClass(e)) if (c.move) |m| {
                     m.write_landed = wl;
                 };
                 return e;
             };
+            const size = if (rep.inode) |v| v.size else @max((try self.readInode(local)).size, wl.size_claim);
             self.data.noteShape(local, size, .striped);
             fuse_write_striped.inc();
             return .{ .size = @intCast(wl.written) };
@@ -4523,6 +4533,36 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             defer trace.finish();
             var c: Ctx = .{ .unique = 0, .uid = 0, .gid = 0, .pid = 0, .io = self.io, .trace = &trace, .wd_slot = null, .window = &.{} };
             _ = try self.setattr(&c, .{ .ino = global, .attr = .{ .size = size } });
+        }
+
+        /// THE GRANT'S LANDING (charter §5.5 tokens, §6.1 coherence —
+        /// Lustre's "the writer flushes when another client reads", for
+        /// every custody, the write cache's residents being the plane's
+        /// `recallResidents`): before a foreign member's grant of `local` is
+        /// served, this holder's write custody of it lands (the parked
+        /// blocks, extents, overlay records, the rewrite epoch) and its
+        /// parked size claim and stamps journal behind their data barrier
+        /// (§AL.5's order), so the page carries the size this holder's
+        /// acked writes made AND a layout naming their bytes. Before this
+        /// law the page carried the stored record alone: a joiner's `>>`
+        /// took its offset from the size before the holder's un-journaled
+        /// claim and landed over the holder's bytes (a 100 KiB unsynced
+        /// file read back as the joiner's 17 bytes). An ino with neither
+        /// costs two probes. A drain that fails leaves the claim parked
+        /// for the cadence, said and counted; the grant serves what stands.
+        pub fn landForGrant(self: *Self, local: u64) void {
+            if (!self.data_live or !self.data.hasVolumes()) return;
+            const found = self.pending.claimOf(local);
+            if (found == 0 and !self.data.hasWriteCustody(local)) return;
+            fuse_grant_landings.inc();
+            self.data.flushCustody(self.io, local);
+            var trace = op_trace.OpTrace.begin(0, .other);
+            defer trace.finish();
+            var c: Ctx = .{ .unique = 0, .uid = 0, .gid = 0, .pid = 0, .io = self.io, .trace = &trace, .wd_slot = null, .window = &.{} };
+            _ = self.drainTimesOf(&c, local, found) catch |e| {
+                fuse_grant_landing_drain_failures.inc();
+                log.warn("kv_fs: ino {d}'s size claim did not journal before a foreign grant ({t}); the page carries the stored size, the cadence retries", .{ local, e });
+            };
         }
 
         /// The data plane's view of a parked size claim (§AL.5).

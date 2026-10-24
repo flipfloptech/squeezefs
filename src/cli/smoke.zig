@@ -3693,6 +3693,21 @@ fn foreignAppendRow(write_cache: bool) !void {
         try testing.expectEqualStrings("ok\n", out);
     }
     try expectForeignMirror(rig, b, "at once");
+    // Every write of B's was a foreign striped write whose publish landed
+    // at A and whose size went as a CLAIM (A raised its size, ran no size
+    // path); A landed its own custody of an unsynced file before B's grant.
+    {
+        const sb = try b.stats();
+        defer gpa.free(sb);
+        const sa = try rig.stats();
+        defer gpa.free(sa);
+        try testing.expect((numberAfter(sb, "\"fuse_write_foreign_striped\":") orelse 0) >= 9);
+        try testing.expectEqual(@as(?u64, 0), numberAfter(sb, "\"foreign_publish_refusals\":"));
+        try testing.expect((numberAfter(sa, "\"record_size_claims\":") orelse 0) >= 9);
+        try testing.expect((numberAfter(sa, "\"fuse_grant_landings\":") orelse 0) >= 1);
+        try testing.expectEqual(@as(?u64, 0), numberAfter(sa, "\"fuse_grant_landing_drain_failures\":"));
+        std.debug.print("\nsmoke: foreign writes: B's foreign striped writes {d}, publishes shipped {d}; A served size claims {d}, grant landings {d}\n", .{ numberAfter(sb, "\"fuse_write_foreign_striped\":") orelse 0, numberAfter(sb, "\"foreign_publish_ships\":") orelse 0, numberAfter(sa, "\"record_size_claims\":") orelse 0, numberAfter(sa, "\"fuse_grant_landings\":") orelse 0 });
+    }
     try b.umount();
     try b.expectCleanExit("B's clean unmount after the foreign writes");
     try rig.umount();

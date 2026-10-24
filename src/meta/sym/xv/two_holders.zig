@@ -1212,6 +1212,47 @@ test "decision 0003 §AL.6 — a shipped size change runs the HOLDER's own size 
     try testing.expectEqual(@as(u32, S.IFREG | 0o640), rep.inode.?.mode);
 }
 
+test "THE CLAIM LAW — a non-holder WRITE's shipped size claim (SETATTR_SIZE_CLAIM) raises the holder's size to max(size, claim) in the verb's entry and NEVER runs the holder's size path (its extension zeros landed over the claimer's published bytes: a joiner's `>>` read back zeros on both mounts); a claim at or below the size moves nothing (a shrink by a stale view is impossible); the stamps ride; a truncate still runs the face; counted" {
+    const gpa = testing.allocator;
+    const f = try TwoHolders.init(gpa, testing.io, .{}, .{});
+    defer f.deinit();
+    var view: HolderView = .{};
+    var rs_b: RecordShipService = .{ .plane = &f.b.plane, .sink = view.sink() };
+    rs_b.register(&f.b.svc);
+    const Rec = struct {
+        calls: u32 = 0,
+        fn run(ctx: *anyopaque, _: u64, _: u64) errors.Error!void {
+            @as(*@This(), @ptrCast(@alignCast(ctx))).calls += 1;
+        }
+    };
+    var rec: Rec = .{};
+    const face: record_ship.TruncateFace = .{ .ctx = &rec, .truncate = &Rec.run };
+    rs_b.armTruncate(&face);
+    const file = gino(50, 3);
+    try f.b.seedFile(file, 1);
+    const claims0 = record_ship.stats.record_size_claims.load();
+    // The wire keeps the word with its size, never without one.
+    try testing.expect(record_ship.Setattr.fromWire((record_ship.Setattr{ .size = 9, .size_claim = true }).toWire()).size_claim);
+    try testing.expect(!record_ship.Setattr.fromWire((record_ship.Setattr{ .size_claim = true }).toWire()).size_claim);
+    // An append's claim past the size: raised, the face never run.
+    const grown = (try record_ship.ship(f.a.plane.resolver, 0, file, .{ .setattr = .{ .size = 1_048_591, .size_claim = true, .mtime = 77, .ctime = 77 } }, 0)).?;
+    try testing.expectEqual(@as(u32, 0), rec.calls);
+    try testing.expectEqual(@as(u64, 1_048_591), grown.inode.?.size);
+    try testing.expectEqual(@as(u64, 1_048_591), (try f.b.inode(file)).?.size);
+    try testing.expectEqual(@as(u64, 77), (try f.b.inode(file)).?.mtime);
+    // A claim below the size (a write inside the file, or one judged on a
+    // view the holder has since grown past): the size stands.
+    const inside = (try record_ship.ship(f.a.plane.resolver, 0, file, .{ .setattr = .{ .size = 17, .size_claim = true, .mtime = 78, .ctime = 78 } }, 0)).?;
+    try testing.expectEqual(@as(u32, 0), rec.calls);
+    try testing.expectEqual(@as(u64, 1_048_591), inside.inode.?.size);
+    try testing.expectEqual(@as(u64, 78), (try f.b.inode(file)).?.mtime);
+    try testing.expectEqual(claims0 + 2, record_ship.stats.record_size_claims.load());
+    // A truncate (no claim word) is the holder's size path, as ever.
+    _ = (try record_ship.ship(f.a.plane.resolver, 0, file, .{ .setattr = .{ .size = 4096 } }, 0)).?;
+    try testing.expectEqual(@as(u32, 1), rec.calls);
+    try testing.expectEqual(claims0 + 2, record_ship.stats.record_size_claims.load());
+}
+
 test "a shipped setattr CARRIES the kernel's kill_suidgid (FATTR_KILL_SUIDGID; handoff 2026-10-21 create 7b's sibling defect) and the holder applies the local law: S_ISUID always, S_ISGID iff group-exec, `security.capability` deleted, counted — a truncate through the armed face over a 6666 file lands as 2666; a chown over a 6776 file lands as 776; the bit alone (no field) changes nothing else; without the bit a chown keeps every setid bit" {
     const gpa = testing.allocator;
     const f = try TwoHolders.init(gpa, testing.io, .{}, .{});

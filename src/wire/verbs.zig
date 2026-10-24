@@ -1607,7 +1607,14 @@ pub const SETATTR_KILL_SUIDGID: u32 = 1 << 8;
 /// moves NO ctime (an explicit utimes carries `SETATTR_ATIME` alone and is
 /// a status change). `atime` is the value; every other field is ignored.
 pub const SETATTR_ATIME_TOUCH: u32 = 1 << 9;
-pub const SETATTR_KNOWN: u32 = 0x3FF;
+/// A non-holder WRITE's size claim (with `SETATTR_SIZE`): the holder raises
+/// the record's size to `max(size, claim)` in the verb's entry and never
+/// runs its size path — the write's bytes, its gap's zeros included, are
+/// what its shipped publish bound already, and a truncate-up's extension
+/// zeros would land over them (a joiner's `>>` read back zeros on both
+/// mounts). Without `SETATTR_SIZE` the word is screened out.
+pub const SETATTR_SIZE_CLAIM: u32 = 1 << 10;
+pub const SETATTR_KNOWN: u32 = 0x7FF;
 
 pub const SetattrWire = extern struct {
     valid: u32,
@@ -1624,6 +1631,7 @@ pub const SetattrWire = extern struct {
     pub const none: SetattrWire = .{ .valid = 0, .mode = 0, .uid = 0, .gid = 0, .size = 0, .atime = 0, .mtime = 0, .ctime = 0, .flags = 0, .reserved = 0 };
 
     pub fn check(self: SetattrWire) bool {
+        if (self.valid & SETATTR_SIZE_CLAIM != 0 and self.valid & SETATTR_SIZE == 0) return false;
         return self.valid & ~SETATTR_KNOWN == 0 and self.reserved == 0;
     }
 };
@@ -1663,7 +1671,7 @@ pub const RecordShipHead = extern struct {
         if (self.kind < 1 or self.kind > 4) return false;
         if (self.name_len > record.NAME_MAX or self.value_len > RECORD_VALUE_MAX or self.n_proofs > PUBLISH_PROOFS_MAX) return false;
         return switch (@as(RecordShipKind, @fromBackingInt(@intCast(self.kind)))) {
-            .setattr => self.name_len == 0 and self.value_len == 0 and self.n_proofs == 0,
+            .setattr => self.name_len == 0 and self.value_len == 0 and self.n_proofs == 0 and self.setattr.check(),
             .setxattr => self.name_len != 0 and self.setattr.valid == 0 and self.n_proofs == 0,
             .publish_layout => self.name_len != 0 and self.setattr.valid == 0,
             .removexattr => self.name_len != 0 and self.value_len == 0 and self.setattr.valid == 0 and self.n_proofs == 0,
@@ -2286,7 +2294,13 @@ test "cross-owner payloads: a step with a name, the exact lookup, travelling gua
     const sa: SetattrWire = .{ .valid = SETATTR_MODE | SETATTR_MTIME | SETATTR_FLAGS | SETATTR_KILL_SUIDGID, .mode = 0o644, .uid = 0, .gid = 0, .size = 0, .atime = 0, .mtime = 123, .ctime = 0, .flags = 2, .reserved = 0 };
     try testing.expect(sa.check());
     try testing.expect((SetattrWire{ .valid = SETATTR_ATIME_TOUCH, .mode = 0, .uid = 0, .gid = 0, .size = 0, .atime = 77, .mtime = 0, .ctime = 0, .flags = 0, .reserved = 0 }).check());
-    try testing.expect(!(SetattrWire{ .valid = 1 << 10, .mode = 0, .uid = 0, .gid = 0, .size = 0, .atime = 0, .mtime = 0, .ctime = 0, .flags = 0, .reserved = 0 }).check());
+    // A write's size claim rides its size; the claim word alone, or an
+    // unknown bit, is screened out — at the head too.
+    try testing.expect((SetattrWire{ .valid = SETATTR_SIZE | SETATTR_SIZE_CLAIM | SETATTR_MTIME, .mode = 0, .uid = 0, .gid = 0, .size = 4096, .atime = 0, .mtime = 9, .ctime = 0, .flags = 0, .reserved = 0 }).check());
+    const claim_alone: SetattrWire = .{ .valid = SETATTR_SIZE_CLAIM, .mode = 0, .uid = 0, .gid = 0, .size = 4096, .atime = 0, .mtime = 0, .ctime = 0, .flags = 0, .reserved = 0 };
+    try testing.expect(!claim_alone.check());
+    try testing.expect(!(SetattrWire{ .valid = 1 << 11, .mode = 0, .uid = 0, .gid = 0, .size = 0, .atime = 0, .mtime = 0, .ctime = 0, .flags = 0, .reserved = 0 }).check());
+    try testing.expect(!(RecordShipHead{ .volume = 0, .kind = 1, .reserved = 0, .name_len = 0, .n_proofs = 0, .value_len = 0, .reserved3 = 0, .ino = 9, .lease_epoch = 2, .setattr = claim_alone }).check());
     _ = try roundTrip(RecordShipReq, .{ .head = .{ .volume = 0, .kind = 1, .reserved = 0, .name_len = 0, .n_proofs = 0, .value_len = 0, .reserved3 = 0, .ino = 9, .lease_epoch = 2, .setattr = sa }, .name = "", .value = "" });
     const rs = try roundTrip(RecordShipReq, .{ .head = .{ .volume = 0, .kind = 2, .reserved = 0, .name_len = 6, .n_proofs = 0, .value_len = 3, .reserved3 = 0, .ino = 9, .lease_epoch = 2, .setattr = .none }, .name = "user.a", .value = "xyz" });
     try testing.expectEqualStrings("xyz", rs.value);

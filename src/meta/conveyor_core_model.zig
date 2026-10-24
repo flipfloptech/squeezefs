@@ -27,6 +27,12 @@
 //!                                                 (the landing between the read and the park is
 //!                                                 lost: the pass parks on an empty flight), with
 //!                                                 one and with two windows in flight
+//!   9 window_gate_never_meets_a_full_lane         — the gate admits `window_cells` windows (the hook →
+//!                                                 give-back gap forgotten); no gate (the joined
+//!                                                 appender's pass panic); a barrier taking a window
+//!                                                 cell; the gate checking before it registers; the
+//!                                                 lane notifying before it untracks (both: the
+//!                                                 parked pass never wakes)
 
 const std = @import("std");
 const explorer = @import("../model/explorer.zig");
@@ -57,6 +63,19 @@ const Weakening = enum {
     /// two is a notify with no waiter, and the pass parks on a flight that
     /// is already empty.
     hold_check_before_register,
+    /// The window gate admits while fewer than `window_cells` windows are
+    /// tracked: the cell an untracked window still holds between its hook
+    /// and its give-back is not counted.
+    window_gate_at_cells,
+    /// No window gate: the ring's admission was trusted to bound the lane
+    /// (it does not — a sub-page grain, a grown joined ring).
+    no_window_gate,
+    /// A barrier request takes its cell from the windows' pool.
+    requests_share_window_cells,
+    /// The gate reads the flight BEFORE it registers on the landing notify.
+    window_gate_check_before_register,
+    /// The window's terminal outcome notifies BEFORE it untracks.
+    notify_before_untrack,
 };
 
 const Item = struct { id: u8, len: u8 };
@@ -1023,6 +1042,194 @@ fn HoldPark(comptime weakening: Weakening, comptime inflight0: u8) type {
     };
 }
 
+/// The window gate (`Conveyor.awaitWindowCell`, `journal_lane.windowCells`):
+/// a lane holding `W = 2` cells for windows, one more for requests; the
+/// pass issues three windows one at a time — gate (register on `landed`,
+/// read the tracked count, park while it is `≥ windowCap(W) = 1`), track,
+/// pop a window cell (an empty pool is the handoff's `LaneQueueFull`: the
+/// pass panic); the lane delivers each window in order — untrack, notify
+/// `landed`, give the cell back (the hook runs before the give-back); a
+/// barrier request takes a request cell, holds it, gives it back.
+///
+/// Holds: a window's pop never meets an empty pool, the pass is never
+/// left parked with nothing in flight, all three windows issue and every
+/// cell comes home. Weakenings: `.window_gate_at_cells` (the pass pops
+/// between the lane's notify and its give-back), `.no_window_gate` (the
+/// third window pops an empty pool), `.requests_share_window_cells` (the
+/// barrier holds the cell the gate counted on) meet a full lane;
+/// `.window_gate_check_before_register` and `.notify_before_untrack` park
+/// the pass on a landing already past, with room in the flight and
+/// nothing left to wake it.
+fn WindowCells(comptime weakening: Weakening) type {
+    return struct {
+        const Self = @This();
+        pub const thread_count: usize = 3;
+        const pass_t = 0;
+        const lane_t = 1;
+        const request_t = 2;
+        const window_cells: u8 = 2;
+        const request_cells: u8 = 1;
+        const windows: u8 = 3;
+        const gate_cap: u8 = switch (weakening) {
+            .window_gate_at_cells => window_cells,
+            .no_window_gate => windows + 1,
+            else => window_cells - 1,
+        };
+        const check_first = weakening == .window_gate_check_before_register;
+
+        const Ppc = enum(u8) { register, check, park, parked, track, pop, done };
+        const Lpc = enum(u8) { idle, untrack, notify, give_back };
+        const Rpc = enum(u8) { take, give_back, done };
+
+        free_windows: u8 = window_cells,
+        free_requests: u8 = request_cells,
+        /// Windows between `track` and their untrack.
+        tracked: u8 = 0,
+        /// Windows holding a cell, not yet delivered (FIFO).
+        in_lane: u8 = 0,
+        issued: u8 = 0,
+        /// `landed`: its epoch and the pass's registration.
+        epoch: u8 = 0,
+        pass_epoch: u8 = 0,
+        pass_registered: bool = false,
+        /// A window's pop found the pool empty (the pass panic).
+        met_full: bool = false,
+        /// The request's cell came from the windows' pool.
+        request_holds_window_cell: bool = false,
+        ppc: Ppc = if (check_first) .check else .register,
+        lpc: Lpc = .idle,
+        rpc: Rpc = .take,
+
+        pub fn init() Self {
+            return .{};
+        }
+
+        /// Parked with no wake owed and nobody left to deliver one.
+        fn stuck(self: *const Self) bool {
+            return self.ppc == .parked and self.epoch == self.pass_epoch and self.lpc == .idle and self.in_lane == 0;
+        }
+
+        pub fn done(self: *const Self, t: usize) bool {
+            return switch (t) {
+                pass_t => self.ppc == .done or self.stuck(),
+                lane_t => self.lpc == .idle and self.in_lane == 0 and (self.ppc == .done or self.stuck()),
+                request_t => self.rpc == .done,
+                else => unreachable,
+            };
+        }
+
+        fn gateStart() Ppc {
+            return if (check_first) .check else .register;
+        }
+
+        fn stepPass(self: *Self) void {
+            switch (self.ppc) {
+                .register => {
+                    // `n.enable(io)`: snapshot the epoch.
+                    self.pass_registered = true;
+                    self.pass_epoch = self.epoch;
+                    self.ppc = if (check_first) .park else .check;
+                },
+                .check => {
+                    if (self.tracked < gate_cap) {
+                        self.pass_registered = false;
+                        self.ppc = .track;
+                    } else self.ppc = if (check_first) .register else .park;
+                },
+                .park => self.ppc = if (self.epoch != self.pass_epoch) gateStart() else .parked,
+                .parked => if (self.epoch != self.pass_epoch) {
+                    self.ppc = gateStart();
+                },
+                .track => {
+                    self.tracked += 1;
+                    self.ppc = .pop;
+                },
+                .pop => {
+                    if (self.free_windows == 0) {
+                        self.met_full = true;
+                    } else {
+                        self.free_windows -= 1;
+                        self.in_lane += 1;
+                    }
+                    self.issued += 1;
+                    self.ppc = if (self.issued == windows) .done else gateStart();
+                },
+                .done => unreachable,
+            }
+        }
+
+        fn stepLane(self: *Self) void {
+            switch (self.lpc) {
+                .idle => if (self.in_lane > 0) {
+                    self.lpc = if (weakening == .notify_before_untrack) .notify else .untrack;
+                },
+                .untrack => {
+                    // `finishWindow` → `untrack`.
+                    self.tracked -= 1;
+                    self.in_lane -= 1;
+                    self.lpc = if (weakening == .notify_before_untrack) .give_back else .notify;
+                },
+                .notify => {
+                    // `landed.notifyWaiters`.
+                    self.epoch +%= 1;
+                    self.pass_registered = false;
+                    self.lpc = if (weakening == .notify_before_untrack) .untrack else .give_back;
+                },
+                .give_back => {
+                    // The hook returned: `freeCell`.
+                    self.free_windows += 1;
+                    self.lpc = .idle;
+                },
+            }
+        }
+
+        fn stepRequest(self: *Self) void {
+            switch (self.rpc) {
+                .take => {
+                    if (weakening == .requests_share_window_cells) {
+                        // A refused request leaves (retryable); a taken
+                        // cell is the window pool's.
+                        if (self.free_windows > 0) {
+                            self.free_windows -= 1;
+                            self.request_holds_window_cell = true;
+                            self.rpc = .give_back;
+                        } else self.rpc = .done;
+                    } else {
+                        self.free_requests -= 1;
+                        self.rpc = .give_back;
+                    }
+                },
+                .give_back => {
+                    if (self.request_holds_window_cell) self.free_windows += 1 else self.free_requests += 1;
+                    self.request_holds_window_cell = false;
+                    self.rpc = .done;
+                },
+                .done => unreachable,
+            }
+        }
+
+        pub fn step(self: *Self, t: usize) void {
+            switch (t) {
+                pass_t => self.stepPass(),
+                lane_t => self.stepLane(),
+                request_t => self.stepRequest(),
+                else => unreachable,
+            }
+        }
+
+        pub fn invariant(self: *const Self) !void {
+            if (self.met_full) return error.WindowMetAFullLane;
+            if (self.ppc == .parked and self.tracked < gate_cap and self.stuck()) return error.GateOutlivedTheLanding;
+        }
+
+        pub fn final(self: *const Self) !void {
+            if (self.ppc != .done) return error.WindowNeverIssued;
+            if (self.tracked != 0 or self.in_lane != 0) return error.WindowLeftInFlight;
+            if (self.free_windows != window_cells or self.free_requests != request_cells) return error.CellNotReturned;
+        }
+    };
+}
+
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
@@ -1070,9 +1277,18 @@ test "conveyor_hold_park_never_outlives_the_landing: holds with one and with two
     try explorer.expectFails(HoldPark(.hold_check_before_register, 2), .{}, error.InvariantViolated);
 }
 
+test "conveyor_window_gate_never_meets_a_full_lane: holds (a gate at window_cells − 1, registered before it reads, the lane untracking before it notifies, the requests on their own cells); a gate at window_cells, no gate and a barrier on a window cell meet a full lane; check-before-register and notify-before-untrack strand the parked pass" {
+    try explorer.expectHolds(WindowCells(.none), .{});
+    try explorer.expectFails(WindowCells(.window_gate_at_cells), .{}, error.InvariantViolated);
+    try explorer.expectFails(WindowCells(.no_window_gate), .{}, error.InvariantViolated);
+    try explorer.expectFails(WindowCells(.requests_share_window_cells), .{}, error.InvariantViolated);
+    try explorer.expectFails(WindowCells(.window_gate_check_before_register), .{}, error.InvariantViolated);
+    try explorer.expectFails(WindowCells(.notify_before_untrack), .{}, error.InvariantViolated);
+}
+
 // The state counts the evidence note records.
 test "conveyor models: exhaustive within the explorer's default limits" {
-    inline for (.{ LeaderUnique(.none), NoLostWakeup(.none), FifoUnderRace(.none), BudgetConserved(.none), GuardOutlives(.none), GroupAtomic(.none), PassFiber(.none), HoldPark(.none, 1), HoldPark(.none, 2) }) |Model| {
+    inline for (.{ LeaderUnique(.none), NoLostWakeup(.none), FifoUnderRace(.none), BudgetConserved(.none), GuardOutlives(.none), GroupAtomic(.none), PassFiber(.none), HoldPark(.none, 1), HoldPark(.none, 2), WindowCells(.none) }) |Model| {
         var report: explorer.Report = undefined;
         try explorer.explore(Model, testing.allocator, .{}, &report);
         try testing.expect(report.states > 1);

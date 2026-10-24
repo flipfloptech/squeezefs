@@ -130,14 +130,28 @@ const ud_barrier: u64 = exec_lane.resident_ud_max;
 const ud_slot_base: u64 = exec_lane.resident_ud_min;
 const max_slots: u64 = ud_barrier - ud_slot_base;
 
-/// Inbound cells (= requests the lane can hold): one per ring page — on a
-/// padded ring every window occupies at least a page, so the ring's own
-/// admission bounds windows in flight by `pages`; floored for tiny test
-/// rings, capped where a 32 MiB ring's 8192 pages already exceed any
-/// admissible in-flight population. A full queue is a counted retryable
-/// refusal, never a wedge.
+/// Inbound cells (= requests the lane can hold): one per ring page at spawn,
+/// floored for tiny test rings, capped where a 32 MiB ring's 8192 pages
+/// exceed any useful in-flight depth. The RING does not bound the windows
+/// in them: a sub-page grain packs several windows into a page (the
+/// buffered posture, a 512 B device) and a joined ring grows past the
+/// pages its lane was spawned for — the conveyor's window gate does
+/// (`windowCells`).
 pub fn inboundCap(pages: u64) usize {
     return @intCast(derive.clamp(derive.nextPow2(pages), 64, 8192));
+}
+
+/// The windows' share of the cells, on a free list of its own: the
+/// conveyor admits at most `windowCells − 1` windows in flight (one more
+/// cell sits between a window's terminal hook and its give-back), so a
+/// window's submit never meets an empty pool; barriers and structural
+/// entries take the other half and wait (or refuse, retryable) on their
+/// own — a storm of them can never take a window's cell (a window
+/// refused at its handoff is the `meta_conveyor_pass_panics` tripwire).
+/// Half: the 128-cell floor ring's user slice admits ≤ 61 windows, under
+/// the share's 63, and the requests keep 64 cells.
+pub fn windowCells(pages: u64) usize {
+    return inboundCap(pages) / 2;
 }
 
 // ---------------------------------------------------------------------------
@@ -595,7 +609,11 @@ pub const JournalLane = struct {
     fixed_file: bool = false,
     /// The thread, the ring, the park, the timers.
     lane: *Lane,
+    /// Cells `[0, window_cells)` serve windows (`free_windows`), the rest
+    /// barriers and structural entries (`free_cells`) — `windowCells`.
     cells: []Cell,
+    window_cells: u32,
+    free_windows: mpmc.BoundedMpmc(u32),
     free_cells: mpmc.BoundedMpmc(u32),
     inbound: mpmc.BoundedMpmc(u32),
     /// Refuses new submitters (SeqCst — Dekker with `inflight_submitters`).
@@ -650,15 +668,18 @@ pub const JournalLane = struct {
         errdefer _ = linux.close(fd);
 
         const cap = inboundCap(opts.core.geometry().pages);
+        const n_windows: u32 = @intCast(windowCells(opts.core.geometry().pages));
         const cells = try gpa.alloc(Cell, cap);
         errdefer gpa.free(cells);
         for (cells) |*c| c.* = .{};
-        var free_cells = try mpmc.BoundedMpmc(u32).init(gpa, cap);
+        var free_windows = try mpmc.BoundedMpmc(u32).init(gpa, n_windows);
+        errdefer free_windows.deinit(gpa);
+        var free_cells = try mpmc.BoundedMpmc(u32).init(gpa, cap - n_windows);
         errdefer free_cells.deinit(gpa);
         var inbound = try mpmc.BoundedMpmc(u32).init(gpa, cap);
         errdefer inbound.deinit(gpa);
         var i: u32 = 0;
-        while (i < cap) : (i += 1) std.debug.assert(free_cells.tryPush(i));
+        while (i < cap) : (i += 1) std.debug.assert(if (i < n_windows) free_windows.tryPush(i) else free_cells.tryPush(i));
         var w = try Worker.init(gpa, cap);
         errdefer w.deinit(gpa);
 
@@ -687,6 +708,8 @@ pub const JournalLane = struct {
             .fd = fd,
             .lane = lane,
             .cells = cells,
+            .window_cells = n_windows,
+            .free_windows = free_windows,
             .free_cells = free_cells,
             .inbound = inbound,
             .w = w,
@@ -737,6 +760,7 @@ pub const JournalLane = struct {
         self.w.deinit(self.gpa);
         self.inbound.deinit(self.gpa);
         self.free_cells.deinit(self.gpa);
+        self.free_windows.deinit(self.gpa);
         self.gpa.free(self.cells);
         self.gpa.free(self.path);
         self.gpa.destroy(self);
@@ -778,7 +802,7 @@ pub const JournalLane = struct {
     /// until the fiber's exit.
     pub fn routeWaits(self: *JournalLane, io: Io) void {
         std.debug.assert(self.inflight_submitters.load(.seq_cst) == 0);
-        std.debug.assert(self.free_cells.len() == self.cells.len);
+        std.debug.assert(self.free_windows.len() + self.free_cells.len() == self.cells.len);
         self.wait_io = io;
     }
 
@@ -801,7 +825,7 @@ pub const JournalLane = struct {
     fn submitWindow(self: *JournalLane, req: WriteRequest, done: ?DoneHook) Error!Ticket {
         try self.refuseMisaligned(req.ops);
         if (self.latch.isFailed()) return error.VolumeFailed;
-        const idx = self.acquireCell() orelse {
+        const idx = self.free_windows.tryPop() orelse {
             stats.queue_full.inc();
             return error.LaneQueueFull;
         };
@@ -876,15 +900,25 @@ pub const JournalLane = struct {
         }
     }
 
+    /// A barrier's or a structural entry's cell: never one of the windows'
+    /// (`windowCells`).
     fn acquireCell(self: *JournalLane) ?u32 {
         return self.free_cells.tryPop();
     }
 
+    /// The window's pool or the requests', by the cell's index.
     fn freeCell(self: *JournalLane, idx: u32) void {
         self.cells[idx].done.reset();
-        // Every cell lives in the ring and every caller takes: a refusal is a
+        const pool = if (idx < self.window_cells) &self.free_windows else &self.free_cells;
+        // Every cell lives in its ring and every caller takes: a refusal is a
         // taker mid-pop on the wrap cell, waited out (decision 0003 §AI.4).
-        if (!self.free_cells.pushSpinUnlessFull(idx)) stats.queue_push_with_cell.fire("a cell met a full free list (a double give-back)");
+        if (!pool.pushSpinUnlessFull(idx)) stats.queue_push_with_cell.fire("a cell met a full free list (a double give-back)");
+    }
+
+    /// The windows' share (`windowCells` at spawn): the conveyor's gate
+    /// admits at most one fewer windows in flight.
+    pub fn windowCellCount(self: *const JournalLane) usize {
+        return self.window_cells;
     }
 
     /// Publish a filled cell. A caller on the lane thread (the pass fiber,
@@ -1958,6 +1992,9 @@ test "the flush cadence: the checkpointer's derived default (50 ms) coalesced; 0
     try testing.expectEqual(@as(usize, 256), inboundCap(256));
     try testing.expectEqual(@as(usize, 8192), inboundCap(8192));
     try testing.expectEqual(@as(usize, 8192), inboundCap(100_000));
+    // The windows' share: half the cells, the floor ring's 126 pages → 64.
+    for ([_]u64{ 4, 126, 256, 8192, 100_000 }) |pages| try testing.expectEqual(inboundCap(pages) / 2, windowCells(pages));
+    try testing.expectEqual(@as(usize, 64), windowCells(126));
     try testing.expectEqual(ErrorClass.refusal, classOf(error.VolumeFailed));
     try testing.expectEqual(ErrorClass.retryable, classOf(error.LaneQueueFull));
     try testing.expectEqual(ErrorClass.terminal, classOf(error.HoleCheckpointFailed));
@@ -2140,6 +2177,42 @@ test "§BB.4: a barrier an fsync pulls while a window admitted before it is stil
     var rec = try h.replay(0);
     defer rec.deinit();
     try testing.expectEqual(@as(usize, 1), rec.entries.len);
+}
+
+test "the windows' cells are their own: barrier requests held behind an un-landed window take every request cell and the next is refused (retryable), yet windows still find a cell each up to the windows' share; the landing answers every one" {
+    const h = try Harness.init(testing.allocator, "window-cells");
+    defer h.deinit();
+    try h.spawnLane(.{}, "600000", 0);
+    const lane = h.lane.?;
+    test_seams.delay_issue.store(1, .release);
+    defer test_seams.delay_issue.store(0, .release);
+    // A window un-landed: every barrier requested behind it waits (§BB.4).
+    const first = try h.append(1, 400, 0xA0);
+    var barriers: std.ArrayList(Ticket) = .empty;
+    defer barriers.deinit(testing.allocator);
+    // Every exit answers what it holds: the device first, then the tickets.
+    var windows: std.ArrayList(Ticket) = .empty;
+    defer windows.deinit(testing.allocator);
+    var answered = false;
+    defer if (!answered) {
+        test_seams.delay_issue.store(0, .release);
+        _ = first.ticket.wait();
+        for (windows.items) |t| _ = t.wait();
+        for (barriers.items) |t| _ = t.wait();
+    };
+    // The storm: barriers until the lane refuses one.
+    while (lane.requestBarrier()) |t| {
+        try barriers.append(testing.allocator, t);
+    } else |e| try testing.expectEqual(error.LaneQueueFull, e);
+    try testing.expectEqual(lane.cells.len - lane.windowCellCount(), barriers.items.len);
+    // Windows beside it: the share minus the one already held, every one
+    // admitted.
+    for (1..lane.windowCellCount()) |i| try windows.append(testing.allocator, (try h.append(1 + i, 400, 0xB0)).ticket);
+    test_seams.delay_issue.store(0, .release);
+    answered = true;
+    try first.ticket.wait().result;
+    for (windows.items) |t| try t.wait().result;
+    for (barriers.items) |t| try t.wait().result;
 }
 
 /// The DUR-3 faces as a ticket counter: `started` hands out 1, 2, …;

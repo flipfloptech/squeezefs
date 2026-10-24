@@ -793,7 +793,7 @@ pub const KvBackend = struct {
             .geo = geo,
             .appender_id = journal.FIXED_RING_APPENDER,
             .latch = &be.lane.latch,
-            .lane = .{ .ctx = be, .submit = laneSubmit, .barrier = laneBarrier },
+            .lane = .{ .ctx = be, .submit = laneSubmit, .barrier = laneBarrier, .window_cells = be.lane.windowCellCount() },
             .pass = .{ .ctx = be, .wake = wakePass },
             .checkpoint = .{ .ctx = be, .kickPark = kickPark, .kickThreshold = kickThreshold, .checkpointNow = checkpointNowHook, .checkpointPast = checkpointPastHook, .space = &be.space_notify, .posture = &be.cp.posture, .space_retry = be.cp.spaceRetryHold() },
             .smo_journal = &be.smo_journal,
@@ -1179,7 +1179,7 @@ pub const KvBackend = struct {
             .geo = be.geo,
             .appender_id = standing.appender_id,
             .latch = &be.lane.latch,
-            .lane = .{ .ctx = be, .submit = laneSubmit, .barrier = laneBarrier },
+            .lane = .{ .ctx = be, .submit = laneSubmit, .barrier = laneBarrier, .window_cells = be.lane.windowCellCount() },
             .pass = .{ .ctx = be, .wake = wakePass },
             .checkpoint = .{ .ctx = be, .kickPark = kickPark, .kickThreshold = kickThreshold, .checkpointNow = checkpointNowHook, .checkpointPast = checkpointPastHook, .space = &be.space_notify, .posture = &be.cp.posture, .space_retry = be.cp.spaceRetryHold() },
             .smo_journal = &be.smo_journal,
@@ -3972,6 +3972,68 @@ test "§BB.1 the ack at the apply: under the coalesced cadence this mount's kern
         try testing.expectEqual(landing0 + 1, be2.conveyorStats().acks_at_landing.load());
         try testing.expectEqual(@as(u32, 0), be2.tail.?.image.writtenCount());
     }
+}
+
+test "THE WINDOW GATE on the device lane: a BUFFERED ring (grain 1: several windows to a page) admits more windows than the lane has cells; with nothing issued (the landing-hold seam) this mount's kernel's creates, each acked at its apply, fill the windows' share and the next pass PARKS at the gate — no window refused at its handoff (meta_conveyor_pass_panics 0); the device answers and every create lands" {
+    const gpa = testing.allocator;
+    const v = try TestVol.create(gpa, "window-gate", "600000");
+    defer v.destroy();
+    // The format registered the file O_DIRECT; the open registers it again,
+    // BUFFERED.
+    uring_fs.clearMetaDevices();
+    defer uring_fs.clearMetaDevices();
+    try v.env.put("SQUEEZEFS_TEST_META_BUFFERED", "1");
+    const be = try v.open();
+    defer be.close();
+    _ = try commitCreate(be, "base");
+    try testing.expectEqual(@as(u64, 1), be.geo.grain);
+    const cs = be.conveyorStats();
+    const cap = conveyor.windowCap(be.lane.windowCellCount());
+    const panics0 = cs.pass_panics.load();
+    const parks0 = cs.window_gate_parks.load();
+    journal_lane.test_seams.delay_issue.store(1, .release);
+    defer journal_lane.test_seams.delay_issue.store(0, .release);
+    // One more create than the lane has cells at all: past the gate's cap
+    // and past what the shared pool held before the windows had their own.
+    const n = journal_lane.inboundCap(be.geo.pages) + 1;
+    const Storm = struct {
+        fn run(b: *KvBackend, count: usize, err: *?anyerror, done: *std.atomic.Value(u32)) void {
+            for (0..count) |i| {
+                var nb: [16]u8 = undefined;
+                _ = commitCreateKernel(b, std.fmt.bufPrint(&nb, "gate-{d}", .{i}) catch unreachable) catch |e| {
+                    err.* = e;
+                    break;
+                };
+            }
+            done.store(1, .release);
+        }
+    };
+    var err: ?anyerror = null;
+    var done = std.atomic.Value(u32).init(0);
+    const t = try std.Thread.spawn(.{}, Storm.run, .{ be, n, &err, &done });
+    var joined = false;
+    defer if (!joined) {
+        journal_lane.test_seams.delay_issue.store(0, .release);
+        t.join();
+    };
+    const deadline = clock.monotonicNs() + 20 * std.time.ns_per_s;
+    while (cs.window_gate_parks.load() == parks0 and cs.pass_panics.load() == panics0 and done.load(.acquire) == 0 and clock.monotonicNs() < deadline) try testing.io.sleep(.fromMilliseconds(1), .awake);
+    // The gate held the flight at its cap with the lane's cells to spare;
+    // nothing was refused.
+    try testing.expectEqual(panics0, cs.pass_panics.load());
+    try testing.expectEqual(@as(?anyerror, null), err);
+    try testing.expectEqual(parks0 + 1, cs.window_gate_parks.load());
+    try testing.expectEqual(@as(u32, 0), done.load(.acquire));
+    try testing.expectEqual(@as(u64, cap), cs.windows_inflight.load());
+    // The device answers: the parked pass resumes; every create lands.
+    journal_lane.test_seams.delay_issue.store(0, .release);
+    t.join();
+    joined = true;
+    try testing.expectEqual(@as(?anyerror, null), err);
+    try testing.expectEqual(panics0, cs.pass_panics.load());
+    try be.fsync();
+    try testing.expectEqual(@as(u64, 0), cs.windows_inflight.load());
+    try testing.expect(cs.windows_inflight_hwm.load() <= cap);
 }
 
 test "§BD the leaf set of a create: on a volume with room a kernel create takes at most TWO leaf write locks (the child's inode leaf and the parent's dentry leaf — one leaf when both records share it) at the apply and NONE at the admission (the lock-free fast path owes no promise where the room guarantees the split's extents)" {

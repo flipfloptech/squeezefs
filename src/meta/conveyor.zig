@@ -479,6 +479,15 @@ pub fn queueCapacity(pages: u64) usize {
     return @intCast(derive.clamp(derive.nextPow2(pages), 64, 8192));
 }
 
+/// The windows the pass keeps in flight over a lane holding `window_cells`
+/// for them: one fewer — the lane runs a window's terminal hook (whose
+/// `finishWindow` untracks it) BEFORE it gives the cell back, so one
+/// untracked window may still hold its cell at the next handoff
+/// (`conveyor_core_model.WindowCells`: a cap of `window_cells` fails).
+pub fn windowCap(window_cells: usize) usize {
+    return window_cells - 1;
+}
+
 // ---------------------------------------------------------------------------
 // Errors: the typed classes (survey §2.19) with ONE errno each.
 // ---------------------------------------------------------------------------
@@ -651,6 +660,11 @@ pub const Stats = struct {
     /// `meta_kv_journal_full_stalls`: ring-admission parks (one per park
     /// entry); steady growth ⇒ the checkpoint lags.
     full_stalls: counters.ShardedCounter = .{},
+    /// `meta_conveyor_window_gate_parks`: passes parked on the lane's
+    /// window cells (`awaitWindowCell`: a flight of `window_cells − 1`) —
+    /// the lane, not the ring, was the bound; the next window batches what
+    /// queued meanwhile.
+    window_gate_parks: counters.ShardedCounter = .{},
     /// `meta_conveyor_park_tick_rescues`: a backstop tick that found the
     /// work already there with no wake delivered — the admission park's
     /// 10 ms tick finding ring room, or the pass VENUE's 2 s tick finding
@@ -839,7 +853,8 @@ pub const Stats = struct {
             self.holds_pacing.load(),
         });
         try w.print(",\"meta_conveyor_resolve_seeded\":{d},\"meta_conveyor_resolve_descended\":{d},\"meta_conveyor_acks_at_apply\":{d},\"meta_conveyor_acks_at_landing\":{d},\"meta_conveyor_acked_write_failures\":{d},\"meta_conveyor_tail_slot_misses\":{d},\"meta_conveyor_self_handoffs\":{d},\"meta_conveyor_self_applies\":{d},\"meta_conveyor_turn_spin_hits\":{d},\"meta_conveyor_turn_spin_falls\":{d},\"meta_conveyor_heap_admit_fast\":{d},\"meta_conveyor_heap_admit_locked\":{d}", .{ self.resolve_seeded.load(), self.resolve_descended.load(), self.acks_at_apply.load(), self.acks_at_landing.load(), self.acked_write_failures.load(), self.tail_slot_misses.load(), self.self_handoffs.load(), self.self_applies.load(), self.turn_spin_hits.load(), self.turn_spin_falls.load(), self.heap_admit_fast.load(), self.heap_admit_locked.load() });
-        try w.print(",\"meta_commit_ack_spin_hits\":{d},\"meta_commit_ack_spin_falls\":{d},\"meta_commit_ack_spin_skips\":{d},\"meta_commit_ack_spin_busy\":{d},\"meta_commit_ack_spin_bound_ns\":{d},\"meta_commit_ack_spin_wake_ns\":{d},\"meta_commit_ack_spin_ack_ns\":{d}}}", .{
+        try w.print(",\"meta_conveyor_window_gate_parks\":{d},\"meta_commit_ack_spin_hits\":{d},\"meta_commit_ack_spin_falls\":{d},\"meta_commit_ack_spin_skips\":{d},\"meta_commit_ack_spin_busy\":{d},\"meta_commit_ack_spin_bound_ns\":{d},\"meta_commit_ack_spin_wake_ns\":{d},\"meta_commit_ack_spin_ack_ns\":{d}}}", .{
+            self.window_gate_parks.load(),
             self.ack_spin_hits.load(),
             self.ack_spin_falls.load(),
             self.ack_spin_skips.load(),
@@ -1335,6 +1350,10 @@ pub const LaneSeam = struct {
     /// `fsync`: the trailing coalesced barrier, answered once a barrier
     /// that started after the request completed.
     barrier: *const fn (ctx: *anyopaque) Error!void,
+    /// The cells the lane holds for windows alone (`journal_lane.
+    /// windowCells`; never a barrier's or a structural entry's): the pass
+    /// keeps at most `window_cells − 1` windows in flight (`awaitWindowCell`).
+    window_cells: usize,
 };
 
 /// The checkpoint task's faces the pass needs (the backend binds them to
@@ -1463,12 +1482,11 @@ pub const Conveyor = struct {
     /// The drain buffer: one leader at a time, so one buffer.
     batch_buf: []Queued,
     closing: std.atomic.Value(bool) = .init(false),
-    /// Windows between handoff and terminal outcome, by reservation start
-    /// (the rollback hook addresses a window by its reservation). Sized
-    /// ONCE at init for `inflight_cap` entries: the lane holds at most
-    /// `queueCapacity(pages)` windows (its inbound cells follow the same
-    /// law) plus the one a pass tracks before the lane refuses it — so
-    /// `track` never allocates under the spin lock (charter §1.3).
+    /// Windows between reservation and terminal outcome, by reservation
+    /// start (the rollback hook addresses a window by its reservation).
+    /// Sized ONCE at init for `inflight_cap` entries — the window gate's
+    /// bound (`awaitWindowCell`), so `track` never allocates under the
+    /// spin lock (charter §1.3).
     inflight_lock: jc.SpinLock = .{},
     /// The end of the furthest window reserved (§BB.4 under §BC: what an
     /// fsync must see landed, read by the lane through `Hooks.cover_upto`).
@@ -1511,7 +1529,8 @@ pub const Conveyor = struct {
         errdefer gpa.free(slots);
         const batch_buf = try gpa.alloc(Queued, @max(deps.caps.max_txs, 1));
         errdefer gpa.free(batch_buf);
-        const inflight_cap = queueCapacity(deps.geo.pages) + 1;
+        std.debug.assert(deps.lane.window_cells >= 2);
+        const inflight_cap = windowCap(deps.lane.window_cells);
         self.* = .{ .deps = deps, .slots = slots, .core = undefined, .batch_buf = batch_buf, .inflight_cap = inflight_cap };
         errdefer self.inflight.deinit(gpa);
         try self.inflight.ensureTotalCapacity(gpa, @intCast(inflight_cap));
@@ -2080,6 +2099,40 @@ pub const Conveyor = struct {
         return .{ .batch = self.batch_buf[0 .. batch.len + more.len], .held = true };
     }
 
+    /// THE WINDOW GATE — why a pass never meets a full lane: the lane holds
+    /// `window_cells` cells for windows alone (barriers and structural
+    /// entries have their own), and the pass is the ONLY tracker of
+    /// windows, so a pass that sees fewer than `windowCap` in flight keeps
+    /// that true until its own `track` (the count only falls meanwhile);
+    /// every tracked window holds at most one cell and one untracked
+    /// window at most one more (`windowCap`), so its handoff always finds
+    /// a cell. The ring cannot be the bound: a sub-page grain packs several
+    /// windows into a page and a joined ring grows past the pages its lane
+    /// was spawned for. A full flight parks the pass holding nothing — no
+    /// union, no ring budget, no reservation — until a window's terminal
+    /// outcome: register on `landed`, then re-read the count (`finishWindow`
+    /// untracks, then notifies; `conveyor_core_model.WindowCells` proves
+    /// the reversed order loses the wake). Every tracked window reaches its
+    /// terminal outcome (the lane answers each, a FAILED volume and a
+    /// stopping lane included), so the park always ends — save on a pass
+    /// that runs on a committer whose own self-applied member is in flight
+    /// (the `committer` venue with `self` apply: 0003 §BN.6).
+    fn awaitWindowCell(self: *Conveyor) void {
+        const cap = windowCap(self.deps.lane.window_cells);
+        if (self.windowsInflight() < cap) return;
+        self.stats.window_gate_parks.inc();
+        const io = self.deps.io;
+        while (true) {
+            var n = self.landed.notified();
+            _ = n.enable(io);
+            if (self.windowsInflight() < cap) {
+                n.cancel(io);
+                return;
+            }
+            n.waitUncancelable(io);
+        }
+    }
+
     /// Resolve a record's tree by `tree.route` (the ONE routing law); a
     /// record no mounted tree takes is the batch's `Corrupt`.
     fn treeFor(self: *const Conveyor, tree_id: u8, k: []const u8) ?*KvTree {
@@ -2348,6 +2401,8 @@ pub const Conveyor = struct {
             self.failBatch(members.items, if (self.deps.latch.isFailed()) error.VolumeFailed else error.VolumeClosed);
             return;
         }
+        // A1¼: the window's lane cell, before the pass takes anything.
+        self.awaitWindowCell();
         // A1½: the token recall — the union of the batch's objects (every
         // record of every non-`token_quiet` member) taken in flight ONCE,
         // under the members' 4a guards, BEFORE ring admission and any node
@@ -2459,8 +2514,8 @@ pub const Conveyor = struct {
         }
         // From here every exit finishes the window: the union is its.
         union_settled = true;
-        // Tracked before the handoff: the hold law counts it in flight and
-        // the lane's rollback hook can name it.
+        // Tracked before the handoff: the hold law and the window gate
+        // count it in flight, and the lane's rollback hook can name it.
         self.track(w) catch {
             self.abandonWindow(w, error.OutOfMemory);
             return;
@@ -3485,11 +3540,16 @@ pub const RamLane = struct {
     /// its length mirrored for the device thread's lock-free poll.
     completed: std.ArrayList(Held) = .empty,
     completed_pending: std.atomic.Value(usize) = .init(0),
+    /// The lane's window cells (`journal_lane.windowCells`' law over the
+    /// ring's pages): a window submitted while that many are held or
+    /// awaiting their prefix is refused `ConveyorFull`, as the device
+    /// lane's empty window pool refuses `LaneQueueFull`.
+    window_cells: usize,
 
     pub const Held = struct { w: *Window, landed: bool = false, fail: bool = false, issued_ns: u64 = 0 };
 
     pub fn init(gpa: Allocator, io: Io, core: *jc.JournalCore, reg: *jc.InflightRegistry, latch: *journal.FailureLatch, ring_stats: *journal.RingStats, image: *journal.VolatileImage, strict: bool) RamLane {
-        return .{ .gpa = gpa, .io = io, .core = core, .reg = reg, .latch = latch, .ring_stats = ring_stats, .image = image, .strict = strict };
+        return .{ .gpa = gpa, .io = io, .core = core, .reg = reg, .latch = latch, .ring_stats = ring_stats, .image = image, .strict = strict, .window_cells = queueCapacity(core.geo.pages) / 2 };
     }
 
     pub fn deinit(self: *RamLane) void {
@@ -3501,7 +3561,7 @@ pub const RamLane = struct {
     }
 
     pub fn seam(self: *RamLane) LaneSeam {
-        return .{ .ctx = self, .submit = submit, .barrier = barrierFn };
+        return .{ .ctx = self, .submit = submit, .barrier = barrierFn, .window_cells = self.window_cells };
     }
 
     fn submit(ctx: *anyopaque, w: *Window) Error!void {
@@ -3509,6 +3569,7 @@ pub const RamLane = struct {
         if (self.latch.isFailed()) return error.VolumeFailed;
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
+        if (self.held.items.len + self.completed.items.len >= self.window_cells) return error.ConveyorFull;
         var h: Held = .{ .w = w, .issued_ns = clock.monotonicNs() };
         if (self.fail_next > 0) {
             self.fail_next -= 1;
@@ -4750,7 +4811,7 @@ test "the in-flight window map is sized at init: tracking a full population of w
     fa.fail_index = fa.alloc_index;
     defer fa.fail_index = std.math.maxInt(usize);
     const n = h.cv.inflight_cap;
-    try testing.expectEqual(queueCapacity(h.vol.journal.geo.pages) + 1, n);
+    try testing.expectEqual(windowCap(h.lane.window_cells), n);
     const windows = try testing.allocator.alloc(Window, n);
     defer testing.allocator.free(windows);
     for (windows, 0..) |*w, i| {
@@ -4764,6 +4825,99 @@ test "the in-flight window map is sized at init: tracking a full population of w
     try testing.expectError(error.OutOfMemory, h.cv.track(&extra));
     for (windows) |*w| h.cv.untrack(w);
     try testing.expectEqual(@as(u64, 0), h.cv.windowsInflight());
+}
+
+/// Yield until `cond.ready()` or 10 s (a bound against the hang only: the
+/// observables move in microseconds); false names the miss.
+fn awaitObservable(cond: anytype) bool {
+    const deadline = clock.monotonicNs() + 10 * std.time.ns_per_s;
+    while (!cond.ready()) {
+        if (clock.monotonicNs() >= deadline) return false;
+        std.Thread.yield() catch std.atomic.spinLoopHint();
+    }
+    return true;
+}
+
+// The joined appender's pass panic (TWO-DAEMON MATRIX, daemon B under the
+// 4-wide load): its lane's cells were sized by the 512 KiB floor ring and
+// its grown ring admitted more windows than them — `tar -x`'s chmod met a
+// full lane (`ConveyorFull`, 1 member). The ring never bounds the lane:
+// only the window gate does.
+test "THE WINDOW GATE: with the lane's window cells all but one held (nothing landed), the next pass parks holding nothing — no reservation, no ring budget — and hands its window a cell at the first landing; a full lane is never met (no pass panic, no refusal), every member acked" {
+    const h = try Harness.create(.{}, null, false);
+    defer h.destroy();
+    const io = testing.io;
+    const cells = 4;
+    h.lane.window_cells = cells;
+    h.cv.deps.lane.window_cells = cells;
+    h.lane.hold = true;
+    h.threaded_pass = true;
+    const pass_thread = try std.Thread.spawn(.{}, Harness.passThreadMain, .{h});
+    // Every exit lands what the lane holds before the quiesce (a red run
+    // leaves windows held) and joins the pass thread.
+    defer {
+        while (h.cv.windowsInflight() != 0) _ = h.lane.landDue(0);
+        h.cv.quiesce();
+        h.pass_stop.store(true, .release);
+        h.pass_wake.notifyOne(io);
+        pass_thread.join();
+    }
+    const panics0 = h.cv.stats.pass_panics.load();
+    const handoffs0 = h.cv.stats.lane_handoffs.load();
+    var txs: [cells + 1]tx.KvTx = undefined;
+    var dones: [cells + 1]Done = @splat(.init);
+    var inos: [cells + 1]u64 = undefined;
+    var head_before_park: u64 = 0;
+    var issued: usize = 0;
+    const Moved = struct {
+        cv: *Conveyor,
+        handoffs: u64,
+        fn ready(s: @This()) bool {
+            return s.cv.stats.lane_handoffs.load() >= s.handoffs or s.cv.stats.window_gate_parks.load() != 0 or s.cv.stats.pass_panics.load() != 0;
+        }
+    };
+    // One committer at a time, each its own pass and window, until a pass
+    // stops short of its handoff.
+    while (issued < txs.len) : (issued += 1) {
+        txs[issued] = tx.KvTx.init(h.gpa, @src());
+        var nb: [8]u8 = undefined;
+        inos[issued] = try h.stageCreate(&txs[issued], try std.fmt.bufPrint(&nb, "w{d}", .{issued}));
+        var e = try h.cv.build(&txs[issued], &dones[issued]);
+        head_before_park = h.vol.core.headPos();
+        try h.cv.enqueueOne(&e, e.q.len);
+        h.cv.leadIfElected();
+        if (!awaitObservable(Moved{ .cv = h.cv, .handoffs = handoffs0 + issued + 1 })) return error.PassNeverMoved;
+        if (h.cv.stats.lane_handoffs.load() < handoffs0 + issued + 1) {
+            issued += 1;
+            break;
+        }
+    }
+    // The gate, not the lane, stopped the flight: `cells − 1` windows held,
+    // the next pass parked BEFORE its reservation (the head unmoved, no
+    // ring budget admitted), nothing abandoned.
+    try testing.expectEqual(panics0, h.cv.stats.pass_panics.load());
+    try testing.expectEqual(@as(u64, 0), h.cv.stats.refusals.load());
+    try testing.expectEqual(@as(u64, 1), h.cv.stats.window_gate_parks.load());
+    try testing.expectEqual(@as(usize, cells), issued);
+    try testing.expectEqual(handoffs0 + cells - 1, h.cv.stats.lane_handoffs.load());
+    try testing.expectEqual(head_before_park, h.vol.core.headPos());
+    try testing.expectEqual(@as(u64, 0), h.vol.core.admitted());
+    // The first landing: the parked pass resumes and hands its window a cell.
+    try testing.expect(h.lane.landDue(0));
+    const Handed = struct {
+        cv: *Conveyor,
+        want: u64,
+        fn ready(s: @This()) bool {
+            return s.cv.stats.lane_handoffs.load() >= s.want;
+        }
+    };
+    if (!awaitObservable(Handed{ .cv = h.cv, .want = handoffs0 + cells })) return error.ParkedPassNeverResumed;
+    while (h.cv.windowsInflight() != 0) _ = h.lane.landDue(0);
+    for (dones[0..issued]) |*d| try try d.recvOutcome(io);
+    for (inos[0..issued]) |ino| try testing.expect(try h.present(ino));
+    try testing.expectEqual(panics0, h.cv.stats.pass_panics.load());
+    try testing.expectEqual(@as(u64, 0), h.cv.stats.refusals.load());
+    try testing.expect(h.cv.stats.windows_inflight_hwm.load() <= windowCap(cells));
 }
 
 test "the admission park: a ring too full for the batch parks the pass holding no node lock, kicks the checkpoint with the park mark, and resolves without a timer" {

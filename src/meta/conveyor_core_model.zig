@@ -33,6 +33,16 @@
 //!                                                 cell; the gate checking before it registers; the
 //!                                                 lane notifying before it untracks (both: the
 //!                                                 parked pass never wakes)
+//!  10 room_park_never_strands_a_committer         — the committer counts itself after its failed
+//!                                                 re-try; it re-tries before it registers on
+//!                                                 `room`; the pass reads the count before its
+//!                                                 drain frees the cell (each: parked, the room
+//!                                                 free, no wake owed)
+//!  11 fsync_inbox_loses_no_fsync_and_covers_its_window — the push as a load then a store (two
+//!                                                 pushers: one node lost); the lane scanning the
+//!                                                 inbound windows BEFORE it takes the inbox (an
+//!                                                 fsync admitted without its submitter's window
+//!                                                 in its cover)
 
 const std = @import("std");
 const explorer = @import("../model/explorer.zig");
@@ -76,6 +86,18 @@ const Weakening = enum {
     window_gate_check_before_register,
     /// The window's terminal outcome notifies BEFORE it untracks.
     notify_before_untrack,
+    /// A committer on a full queue counts itself in `room_waiters` only
+    /// after its failed re-try.
+    room_count_after_try,
+    /// The committer re-tries BEFORE it registers on `room`.
+    room_check_before_register,
+    /// The pass reads `room_waiters` BEFORE its drain frees the cell.
+    room_read_before_drain,
+    /// The fsync inbox push is a load of the head then a store.
+    inbox_push_not_cas,
+    /// The lane's scan drains the inbound windows BEFORE it takes the
+    /// fsync inbox.
+    fsyncs_after_inbound_scan,
 };
 
 const Item = struct { id: u8, len: u8 };
@@ -1230,6 +1252,280 @@ fn WindowCells(comptime weakening: Weakening) type {
     };
 }
 
+/// The committer's room park (`Conveyor.enqueueParking`, 0003 §BO.2): a
+/// queue of ONE cell, full, its entry the pass's; the committer found no
+/// room on its fast path, so it counts itself (`room_waiters`), registers
+/// on `room` (the epoch snapshot), re-tries under the queue mutex and
+/// parks; the pass drains under the mutex, then reads the count and
+/// notifies while it is non-zero.
+///
+/// Holds: the committer always enqueues — never parked with the cell free
+/// and no wake owed. Weakenings, each stranding it: `.room_count_after_try`
+/// (the pass's read between the failed re-try and the count sees no
+/// waiter), `.room_check_before_register` (the notify between the re-try
+/// and the registration is spent on nobody), `.room_read_before_drain`
+/// (the read precedes the committer's count, the drain its re-try).
+fn RoomPark(comptime weakening: Weakening) type {
+    return struct {
+        const Self = @This();
+        pub const thread_count: usize = 2;
+        const committer_t = 0;
+        const pass_t = 1;
+
+        const Cpc = enum(u8) { count, register, lock, attempt, unlock, park, parked, enqueued };
+        const Ppc = enum(u8) { early_read, lock, drain, unlock, read, notify, done };
+
+        /// Entries in the one-cell queue (starts full).
+        len: u8 = 1,
+        mutex: bool = false,
+        waiters: u8 = 0,
+        epoch: u8 = 0,
+        c_epoch: u8 = 0,
+        c_counted: bool = false,
+        c_got_room: bool = false,
+        p_read: u8 = 0,
+        cpc: Cpc = switch (weakening) {
+            .room_count_after_try => .register,
+            .room_check_before_register => .count,
+            else => .count,
+        },
+        ppc: Ppc = if (weakening == .room_read_before_drain) .early_read else .lock,
+
+        pub fn init() Self {
+            return .{};
+        }
+
+        /// Parked with no wake owed and nobody left to deliver one.
+        fn stranded(self: *const Self) bool {
+            return self.cpc == .parked and self.epoch == self.c_epoch and self.ppc == .done;
+        }
+
+        pub fn done(self: *const Self, t: usize) bool {
+            return switch (t) {
+                committer_t => self.cpc == .enqueued or self.stranded(),
+                pass_t => self.ppc == .done,
+                else => unreachable,
+            };
+        }
+
+        fn stepCommitter(self: *Self) void {
+            switch (self.cpc) {
+                .count => {
+                    self.waiters += 1;
+                    self.c_counted = true;
+                    self.cpc = switch (weakening) {
+                        .room_check_before_register => .lock,
+                        .room_count_after_try => .park,
+                        else => .register,
+                    };
+                },
+                .register => {
+                    // `n.enable(io)`: the epoch snapshot.
+                    self.c_epoch = self.epoch;
+                    self.cpc = if (weakening == .room_check_before_register) .park else .lock;
+                },
+                .lock => if (!self.mutex) {
+                    self.mutex = true;
+                    self.cpc = .attempt;
+                },
+                .attempt => {
+                    self.c_got_room = self.len == 0;
+                    if (self.c_got_room) self.len += 1;
+                    self.cpc = .unlock;
+                },
+                .unlock => {
+                    self.mutex = false;
+                    if (self.c_got_room) {
+                        self.cpc = .enqueued;
+                    } else if (weakening == .room_count_after_try and !self.c_counted) {
+                        self.cpc = .count;
+                    } else if (weakening == .room_check_before_register) {
+                        self.cpc = .register;
+                    } else self.cpc = .park;
+                },
+                .park => self.cpc = if (self.epoch != self.c_epoch) self.retry() else .parked,
+                .parked => if (self.epoch != self.c_epoch) {
+                    self.cpc = self.retry();
+                },
+                .enqueued => unreachable,
+            }
+        }
+
+        fn retry(_: *const Self) Cpc {
+            return if (weakening == .room_check_before_register) .lock else .register;
+        }
+
+        fn stepPass(self: *Self) void {
+            switch (self.ppc) {
+                .early_read => {
+                    self.p_read = self.waiters;
+                    self.ppc = .lock;
+                },
+                .lock => if (!self.mutex) {
+                    self.mutex = true;
+                    self.ppc = .drain;
+                },
+                .drain => {
+                    self.len = 0;
+                    self.ppc = .unlock;
+                },
+                .unlock => {
+                    self.mutex = false;
+                    self.ppc = if (weakening == .room_read_before_drain) .notify else .read;
+                },
+                .read => {
+                    self.p_read = self.waiters;
+                    self.ppc = .notify;
+                },
+                .notify => {
+                    // `room.notifyWaiters` while the count read non-zero.
+                    if (self.p_read != 0) self.epoch +%= 1;
+                    self.ppc = .done;
+                },
+                .done => unreachable,
+            }
+        }
+
+        pub fn step(self: *Self, t: usize) void {
+            switch (t) {
+                committer_t => self.stepCommitter(),
+                pass_t => self.stepPass(),
+                else => unreachable,
+            }
+        }
+
+        pub fn invariant(_: *const Self) !void {}
+
+        pub fn final(self: *const Self) !void {
+            if (self.cpc != .enqueued) return error.CommitterStrandedWithRoom;
+        }
+    };
+}
+
+/// The lane's fsync inbox (`JournalLane.requestBarrier` / the stage-B
+/// scan, 0003 §BO.1): a submitter pushes a window on the inbound queue,
+/// then its fsync on the inbox (a CAS push); a second submitter pushes an
+/// fsync of its own; the lane's scan takes the inbox whole (one swap),
+/// drains the inbound windows, then admits the fsyncs it took, each with
+/// the cover of the windows admitted so far, and scans again until it has
+/// both.
+///
+/// Holds: no fsync is lost and the first submitter's fsync is never
+/// admitted without its window in the cover (§BB.4). Weakenings:
+/// `.inbox_push_not_cas` (both pushers read the same head: one node is
+/// lost — the lane waits for it forever), `.fsyncs_after_inbound_scan` (the
+/// window lands in the inbound queue after the drain, its fsync in the
+/// inbox before the swap: admitted uncovered).
+fn FsyncInbox(comptime weakening: Weakening) type {
+    return struct {
+        const Self = @This();
+        pub const thread_count: usize = 3;
+        const first_t = 0;
+        const second_t = 1;
+        const lane_t = 2;
+        /// The fsync nodes as bits; the inbox head is the set it links.
+        const f1: u8 = 1;
+        const f2: u8 = 2;
+
+        const Spc = enum(u8) { push_window, load, publish, done };
+        const Lpc = enum(u8) { swap, drain, admit };
+
+        inbound: u8 = 0,
+        window_admitted: bool = false,
+        inbox: u8 = 0,
+        taken: u8 = 0,
+        admitted: u8 = 0,
+        uncovered: bool = false,
+        loaded: [2]u8 = @splat(0),
+        spc: [2]Spc = .{ .push_window, .load },
+        lpc: Lpc = if (weakening == .fsyncs_after_inbound_scan) .drain else .swap,
+
+        pub fn init() Self {
+            return .{};
+        }
+
+        /// Both submitters finished and nothing is left to take: an fsync
+        /// still unadmitted was lost.
+        fn starved(self: *const Self) bool {
+            return self.spc[0] == .done and self.spc[1] == .done and self.inbox == 0 and self.inbound == 0 and self.taken == 0 and self.lpc == self.scanStart();
+        }
+
+        fn scanStart(_: *const Self) Lpc {
+            return if (weakening == .fsyncs_after_inbound_scan) .drain else .swap;
+        }
+
+        pub fn done(self: *const Self, t: usize) bool {
+            return switch (t) {
+                first_t, second_t => self.spc[t] == .done,
+                lane_t => (self.admitted == f1 | f2 and self.window_admitted) or self.starved(),
+                else => unreachable,
+            };
+        }
+
+        fn stepSubmitter(self: *Self, t: usize) void {
+            const mine: u8 = if (t == first_t) f1 else f2;
+            switch (self.spc[t]) {
+                .push_window => {
+                    self.inbound += 1;
+                    self.spc[t] = .load;
+                },
+                .load => {
+                    self.loaded[t] = self.inbox;
+                    self.spc[t] = .publish;
+                },
+                .publish => {
+                    if (weakening == .inbox_push_not_cas) {
+                        self.inbox = self.loaded[t] | mine;
+                        self.spc[t] = .done;
+                    } else if (self.inbox == self.loaded[t]) {
+                        self.inbox |= mine;
+                        self.spc[t] = .done;
+                    } else self.spc[t] = .load;
+                },
+                .done => unreachable,
+            }
+        }
+
+        fn stepLane(self: *Self) void {
+            switch (self.lpc) {
+                .swap => {
+                    self.taken = self.inbox;
+                    self.inbox = 0;
+                    self.lpc = if (weakening == .fsyncs_after_inbound_scan) .admit else .drain;
+                },
+                .drain => {
+                    if (self.inbound != 0) self.window_admitted = true;
+                    self.inbound = 0;
+                    self.lpc = if (weakening == .fsyncs_after_inbound_scan) .swap else .admit;
+                },
+                .admit => {
+                    if (self.taken & f1 != 0 and !self.window_admitted) self.uncovered = true;
+                    self.admitted |= self.taken;
+                    self.taken = 0;
+                    self.lpc = self.scanStart();
+                },
+            }
+        }
+
+        pub fn step(self: *Self, t: usize) void {
+            switch (t) {
+                first_t, second_t => self.stepSubmitter(t),
+                lane_t => self.stepLane(),
+                else => unreachable,
+            }
+        }
+
+        pub fn invariant(self: *const Self) !void {
+            if (self.uncovered) return error.FsyncAdmittedWithoutItsWindow;
+        }
+
+        pub fn final(self: *const Self) !void {
+            if (self.admitted != f1 | f2) return error.FsyncLost;
+            if (!self.window_admitted) return error.WindowNeverAdmitted;
+        }
+    };
+}
+
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
@@ -1286,9 +1582,22 @@ test "conveyor_window_gate_never_meets_a_full_lane: holds (a gate at window_cell
     try explorer.expectFails(WindowCells(.notify_before_untrack), .{}, error.InvariantViolated);
 }
 
+test "conveyor_room_park_never_strands_a_committer: holds (count, register, re-try under the queue mutex, park; the pass drains, then reads the count and notifies); counting after the re-try, re-trying before registering and reading before the drain each strand the committer with the room free" {
+    try explorer.expectHolds(RoomPark(.none), .{});
+    try explorer.expectFails(RoomPark(.room_count_after_try), .{}, error.FinalViolated);
+    try explorer.expectFails(RoomPark(.room_check_before_register), .{}, error.FinalViolated);
+    try explorer.expectFails(RoomPark(.room_read_before_drain), .{}, error.FinalViolated);
+}
+
+test "conveyor_fsync_inbox_loses_no_fsync_and_covers_its_window: holds (CAS push; the scan takes the inbox, drains the inbound windows, admits); a load-then-store push loses an fsync; draining the windows before taking the inbox admits an fsync without its window" {
+    try explorer.expectHolds(FsyncInbox(.none), .{});
+    try explorer.expectFails(FsyncInbox(.inbox_push_not_cas), .{}, error.FinalViolated);
+    try explorer.expectFails(FsyncInbox(.fsyncs_after_inbound_scan), .{}, error.InvariantViolated);
+}
+
 // The state counts the evidence note records.
 test "conveyor models: exhaustive within the explorer's default limits" {
-    inline for (.{ LeaderUnique(.none), NoLostWakeup(.none), FifoUnderRace(.none), BudgetConserved(.none), GuardOutlives(.none), GroupAtomic(.none), PassFiber(.none), HoldPark(.none, 1), HoldPark(.none, 2), WindowCells(.none) }) |Model| {
+    inline for (.{ LeaderUnique(.none), NoLostWakeup(.none), FifoUnderRace(.none), BudgetConserved(.none), GuardOutlives(.none), GroupAtomic(.none), PassFiber(.none), HoldPark(.none, 1), HoldPark(.none, 2), WindowCells(.none), RoomPark(.none), FsyncInbox(.none) }) |Model| {
         var report: explorer.Report = undefined;
         try explorer.explore(Model, testing.allocator, .{}, &report);
         try testing.expect(report.states > 1);

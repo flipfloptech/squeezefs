@@ -290,6 +290,9 @@ pub var fuse_write_staged_store_full_refusals: counters.ShardedCounter = .{};
 pub var fuse_truncate_packed_clips: counters.ShardedCounter = .{};
 pub var fuse_truncate_striped_clips: counters.ShardedCounter = .{};
 pub var fuse_truncate_restages: counters.ShardedCounter = .{};
+/// Re-stages (a truncate's clip, a punch's zeros) whose commit did not land:
+/// the record the committed layout names got its pre-op image back.
+pub var fuse_restage_restores: counters.ShardedCounter = .{};
 /// fallocate by arm (charter §6.6): blocks reserved (holes bound
 /// UNWRITTEN) and zeroed (written blocks flipped) by allocate / ZERO_RANGE;
 /// whole blocks freed by PUNCH_HOLE and a COLLAPSE; edge bytes zeroed
@@ -531,6 +534,12 @@ pub const AfterCommit = struct {
     /// `bindings` are held in flight (decision 0003 §AH.1): set by
     /// `holdAfter` before the commit, cleared by `dropAfter` after the frees.
     held: bool = false,
+    /// A re-stage under the record the committed layout names (a truncate's
+    /// clip, a punch's zeros) ran BEFORE the commit: a commit that does not
+    /// land puts the pre-op state back (`restoreStaged`) — never the ring's
+    /// new image under the old layout (reads past the cut, or across the
+    /// punch, served zeros: generic/475's FAILED volume).
+    restore: ?RestoreStaged = null,
 
     fn push(self: *AfterCommit, block: u32, m: Mapping) void {
         assert(!self.held);
@@ -543,6 +552,15 @@ pub const AfterCommit = struct {
     fn slice(self: *const AfterCommit) []const layout.MapEntry {
         return self.bindings[0..self.n];
     }
+};
+
+/// The pre-op ring state of `key`: the image (owned, `alloc[0..len]`) the
+/// record held, re-staged on a failed commit; `alloc == null` = no record
+/// (a packed file's transformed re-stage), released on a failed commit.
+pub const RestoreStaged = struct {
+    key: staging.StagingKey,
+    alloc: ?[]u8,
+    len: usize,
 };
 
 /// PUNCH_HOLE's and ZERO_RANGE's in-bounds range `[off, upto)` on
@@ -1752,9 +1770,24 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         /// that leaves without them (a release that never freed is then a
         /// leak the census sees, never a shield).
         fn dropAfter(self: *Self, after: *AfterCommit) void {
+            if (after.restore) |r| if (r.alloc) |a| self.gpa.free(a);
+            after.restore = null;
             if (!after.held) return;
             self.data.dropReleases(after.slice());
             after.held = false;
+        }
+
+        /// A commit that did not land after a re-stage (`AfterCommit.restore`),
+        /// under the caller's (3.7): the record the committed layout names
+        /// gets its pre-op image back; a ring that cannot take it drops the
+        /// key (the read's lost arm: EIO on a FAILED volume — never the new
+        /// image's zeros).
+        fn restoreStaged(self: *Self, after: *AfterCommit) void {
+            const r = after.restore orelse return;
+            fuse_restage_restores.inc();
+            if (r.alloc) |a| {
+                _ = self.data.stageImage(r.key, a[0..r.len], .none) catch self.data.releaseStaged(r.key, null);
+            } else self.data.releaseStaged(r.key, null);
         }
 
         /// `min(i64::MAX, block × u32::MAX)`: the striped file ceiling
@@ -1817,13 +1850,17 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                         return;
                     }
                     if (size >= old_size) return;
-                    // Re-stage the clipped image under the same identity.
+                    // Re-stage the clipped image under the same identity;
+                    // the whole old image is the failed commit's restore.
                     const buf = try self.gpa.alloc(u8, @intCast(layout.ceilGrain(old_size)));
-                    defer self.gpa.free(buf);
+                    var buf_owned = true;
+                    defer if (buf_owned) self.gpa.free(buf);
                     const got = try self.residentImage(ino, rec, buf);
                     const clipped = buf[0..@intCast(@min(size, got))];
                     const k = stagingKeyOf(ino, r.layout);
                     _ = try self.data.stageImage(k, clipped, .none);
+                    after.restore = .{ .key = k, .alloc = buf, .len = got };
+                    buf_owned = false;
                     try self.publish(t, ino, rec, Layout.staged(size, r.layout.file_id, null), &.{});
                     if (r.layout.durableCopy()) |m| after.push(0, m);
                     fuse_truncate_restages.inc();
@@ -1849,6 +1886,8 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                     const got = try self.residentImage(ino, rec, buf);
                     const k = stagingKeyOf(ino, r.layout);
                     _ = try self.data.stageImage(k, buf[0..@intCast(@min(size, got))], .none);
+                    // A packed file held no record: a failed commit drops it.
+                    after.restore = .{ .key = k, .alloc = null, .len = 0 };
                     try self.publish(t, ino, rec, Layout.staged(size, r.layout.file_id, null), &.{});
                     after.push(0, m);
                     fuse_truncate_restages.inc();
@@ -2561,6 +2600,8 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 old_size = stored.size;
                 try self.stageTruncate(c, t, local, stored, sz, &after);
             }
+            // Under (3.7) still: a re-stage the commit never names is undone.
+            errdefer self.restoreStaged(&after);
             var req = a.attr.toEconomy();
             // chmod never changes the type: the S_IFMT bits are the record's.
             if (req.mode) |m| req.mode = (stored.mode & S.IFMT) | (m & ~@as(u32, S.IFMT));
@@ -2568,6 +2609,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             if (out.verdict == .absorbed) {
                 t_owned = false;
                 self.store.abandon(t);
+                self.restoreStaged(&after);
                 if (layout_lock) |g| g.release(self.io);
                 layout_lock = null;
                 return self.attrReply(a.ino, out.value);
@@ -2860,9 +2902,17 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                     const got = try self.residentImage(local, rec, buf);
                     const data_end = @min(upto, got);
                     if (off >= data_end) return;
+                    // The pre-op image is the failed commit's restore (a
+                    // staged record's), or nothing (a packed file's).
+                    const orig: ?[]u8 = if (kind == .staged) try self.gpa.dupe(u8, buf[0..got]) else null;
+                    var orig_owned = true;
+                    defer if (orig_owned) if (orig) |o| self.gpa.free(o);
                     @memset(buf[@intCast(off)..@intCast(data_end)], 0);
                     const k = stagingKeyOf(local, r.layout);
                     _ = try self.data.stageImage(k, buf[0..got], .none);
+                    after.restore = .{ .key = k, .alloc = orig, .len = got };
+                    orig_owned = false;
+                    errdefer self.restoreStaged(&after);
                     const t = try self.beginExclusive(local, @src());
                     var t_owned = true;
                     errdefer if (t_owned) self.store.abandon(t);

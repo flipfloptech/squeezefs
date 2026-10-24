@@ -8526,8 +8526,8 @@ test "smoke: THE TRANSFORMED APPEND on a cache-less mount (decision 0003 §AK) �
 /// the cache-less mount, 100 one-block 64 KiB files.
 const data_len: u64 = 2 << 30;
 /// The random image on ext4 every stage slices (`image_mib` ≥ 200 for the
-/// `dd`, 100 for the copy, 8 × 50 MiB at 25 MiB strides = 225, 1000 × 64 KiB
-/// = 62.5).
+/// `dd`, 100 for the copy, 8 × 50 MiB at 25 MiB strides = 225, the storm
+/// kill's 3 MiB resident at 240, 1000 × 64 KiB = 62.5).
 const image_mib: u64 = 256;
 const big_mib: u64 = 200;
 const copy_mib: u64 = 100;
@@ -10076,58 +10076,13 @@ test "smoke: THE KILL MATRIX — kill -9 at 50/100/150 MiB of a 200 MiB dd and m
             defer gpa.free(out);
         }
     }
-    // The storm kill.
-    {
-        var storm_cmd: [1024]u8 = undefined;
-        const cmd = try std.fmt.bufPrint(&storm_cmd, "i=0; while [ $i -lt 8 ]; do cp {s}/s$i {s}/storm$i & i=$((i + 1)); done; wait", .{ rig.work, rig.mp });
-        var storm = try std.process.spawn(io, .{ .argv = &.{ "sh", "-c", cmd }, .environ_map = &rig.env, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore });
-        var claimed: u64 = 0;
-        {
-            const deadline = clock.monotonicNs() + 60 * std.time.ns_per_s;
-            while (clock.monotonicNs() < deadline) {
-                claimed = 0;
-                for (0..storm_files) |i| {
-                    const p = try std.fmt.bufPrintSentinel(&pb, "{s}/storm{d}", .{ rig.mp, i }, 0);
-                    claimed += fileSize(p);
-                }
-                if (claimed >= storm_kill_mib << 20) break;
-                sleepMs(1);
-            }
-        }
-        try testing.expect(claimed >= storm_kill_mib << 20);
-        _ = linux.kill(rig.child_pid, .KILL);
-        try testing.expectEqual(std.process.Child.Term{ .signal = .KILL }, try rig.waitChild());
-        _ = try storm.wait(io);
-        try rig.umountAfterKill();
-        const recovered = try fsckClean(rig, "the storm kill");
-        const rec = try remountAfterKill(rig, recovered);
-        var dir = try Io.Dir.cwd().openDir(io, rig.mp, .{});
-        defer dir.close(io);
-        var present: usize = 0;
-        var exact: u64 = 0;
-        var holes: u64 = 0;
-        var sizes: u64 = 0;
-        for (0..storm_files) |i| {
-            var nb: [32]u8 = undefined;
-            const name = try std.fmt.bufPrint(&nb, "storm{d}", .{i});
-            const c = pageCensus(gpa, io, dir, name, image, (i * storm_stride_mib) << 20, storm_mib << 20) catch |e| switch (e) {
-                error.FileNotFound => continue,
-                else => return e,
-            };
-            present += 1;
-            exact += c.exact;
-            holes += c.holes;
-            sizes += c.size;
-        }
-        for (0..acked) |a| {
-            var nb: [32]u8 = undefined;
-            const name = try std.fmt.bufPrint(&nb, "acked{d}", .{a});
-            const c = try pageCensus(gpa, io, dir, name, image, (8 * a) << 20, acked_mib << 20);
-            try testing.expectEqual(acked_mib << 20, c.size);
-            try testing.expectEqual(@as(u64, 0), c.holes);
-        }
-        std.debug.print("smoke[kill]: storm killed at {d} MiB claimed: replayed {d} entries ({d} torn dropped), ring {d} record(s) ({d} torn); {d} of 8 files present claiming {d} MiB: {d} pages exact, {d} holes, 0 torn; {d} acked file(s) byte-exact; C8 0 drift, C2 0/0\n", .{ claimed >> 20, rec.replayed, rec.torn, rec.ring_records, rec.ring_torn, present, sizes >> 20, exact, holes, acked });
-    }
+    // The storm kill under both postures of the write cache across a kill
+    // -9 (charter §6.1 "Staged"): this foreground mount, then a `--daemon
+    // --supervise` one after a clean cycle.
+    try killMatrixStorm(rig, image, acked, .foreground);
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+    try killMatrixStorm(rig, image, acked, .supervised);
     // rm everything → the baseline; the gauges; a clean cycle; status.
     {
         const out = try rig.onMount("rm -f acked* storm* inflight* && echo ok");
@@ -10151,6 +10106,197 @@ test "smoke: THE KILL MATRIX — kill -9 at 50/100/150 MiB of a 200 MiB dd and m
         try testing.expect(std.mem.indexOf(u8, report, "not mounted") != null);
         std.debug.print("smoke[kill]: {s}", .{report[std.mem.lastIndexOf(u8, report, "summary:").?..]});
     }
+}
+
+/// Who holds the write cache across the kill matrix's storm kill (charter
+/// §6.1 "Staged"): `foreground` — nobody: a crash of the process loses its
+/// unsynced residents, a power cut's exposure (said once at mount: "no
+/// supervisor holds the ring"); `supervised` — the supervisor replays the
+/// journal tail and hands the ring to the member's next mount: no staged
+/// byte the daemon acked is lost (the kill -9 law).
+const StormPosture = enum { foreground, supervised };
+
+/// The reach the staged arm rings whole — the set's block (the format
+/// default, 4 MiB): a layout naming a ring record claims at most this.
+const staged_reach: u64 = 4 << 20;
+
+/// The resident the storm kill always finds in the ring: closed, never
+/// synced — nothing promotes it before the kill (no write past the block,
+/// no fsync, a ring far under its bound), so every run meets the posture's
+/// law, not only one whose kill lands before a cp's promotion. Its bytes
+/// are the image's past every storm source. 3 MiB: over half the block, so
+/// a stray promotion (a host-wide sync(2) reaches every FUSE mount as
+/// SYNCFS) takes its own block, never a packed slot whose open pack keeps
+/// its block until the dismount seal (the row's df baseline).
+const storm_resident_off_mib: u64 = 240;
+const storm_resident_mib: u64 = 3;
+comptime {
+    if (storm_resident_off_mib < (storm_files - 1) * storm_stride_mib + storm_mib or storm_resident_off_mib + storm_resident_mib > image_mib) @compileError("the storm kill's resident must lie past every storm source, inside the image");
+    if (storm_resident_mib << 20 <= staged_reach / 2 or storm_resident_mib << 20 > staged_reach) @compileError("the storm kill's resident must be staged whole and promote to its own block");
+}
+
+/// The 8-way `cp` storm, killed once `storm_kill_mib` are claimed — the
+/// KERNEL's sizes: its writeback cache runs them ahead of the daemon, which
+/// has acked only the storm's first ~100 ms at the kill (each cp's 4 MiB
+/// staged image, most of them already promoted to their own block) → fsck
+/// clean → remount → the census per file, judged by the posture. After a
+/// FOREGROUND kill a staged image whose layout landed (the staged layout
+/// and its size are one transaction) names a ring record that died with
+/// the process: the file is ABSENT WHOLE (charter §1 item 10: an
+/// acknowledged unsynced write is whole or absent) — at most one block,
+/// every page zero, its reads counted `staged_payload_lost_reads` (red
+/// before: the row asserted 0 after a foreground kill, the file-backed
+/// ring's posture; beside the full smoke 6 of 240 copies read one cp's 4
+/// MiB as zeros, its staged commit 4–23 ms before the kill, its promotion
+/// never begun). After a SUPERVISED kill no staged byte is lost: the
+/// remount recovers the ring, the counter stays 0. Every other page exact
+/// or a hole; the acked files byte-exact; the storm files and the resident
+/// are removed after.
+fn killMatrixStorm(rig: *Rig, image: Io.File, acked: usize, posture: StormPosture) !void {
+    const gpa = rig.gpa;
+    const io = rig.io;
+    var pb: [256:0]u8 = undefined;
+    var ready: usize = 0;
+    var pid: linux.pid_t = 0;
+    if (posture == .supervised) {
+        const mark = try rig.logLen();
+        const r = try rig.squeezefs(&.{ "mount", "--daemon", "--supervise", "--log-file", rig.log_path, rig.meta_uri, rig.mp });
+        defer rig.freeRun(r);
+        if (!r.term.success()) std.debug.print("\ndaemon mount: {s}\n", .{r.stderr});
+        try testing.expect(r.term.success());
+        ready = try rig.awaitReady(mark);
+        const text = try rig.readLog();
+        defer gpa.free(text);
+        pid = @intCast(numberAfter(text[ready..], "(pid ") orelse return error.NoPid);
+        try testing.expect(std.mem.indexOf(u8, text[mark..], "write cache: the memfd and its claim handed to the supervisor") != null);
+    }
+    // A failed step before the kill leaves no daemon behind (its supervisor
+    // replays the tail; the rig's teardown detaches the mount).
+    var daemon_live = posture == .supervised;
+    defer if (daemon_live) {
+        _ = linux.kill(pid, .KILL);
+    };
+    {
+        var script: [160]u8 = undefined;
+        const out = try rig.onMount(try std.fmt.bufPrint(&script, "dd if=\"$1/image\" of=resident bs=1M skip={d} count={d} status=none && echo ok", .{ storm_resident_off_mib, storm_resident_mib }));
+        defer gpa.free(out);
+    }
+    var storm_cmd: [1024]u8 = undefined;
+    const cmd = try std.fmt.bufPrint(&storm_cmd, "i=0; while [ $i -lt 8 ]; do cp {s}/s$i {s}/storm$i & i=$((i + 1)); done; wait", .{ rig.work, rig.mp });
+    var storm = try std.process.spawn(io, .{ .argv = &.{ "sh", "-c", cmd }, .environ_map = &rig.env, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore });
+    var claimed: u64 = 0;
+    {
+        const deadline = clock.monotonicNs() + 60 * std.time.ns_per_s;
+        while (clock.monotonicNs() < deadline) {
+            claimed = 0;
+            for (0..storm_files) |i| {
+                const p = try std.fmt.bufPrintSentinel(&pb, "{s}/storm{d}", .{ rig.mp, i }, 0);
+                claimed += fileSize(p);
+            }
+            if (claimed >= storm_kill_mib << 20) break;
+            sleepMs(1);
+        }
+    }
+    try testing.expect(claimed >= storm_kill_mib << 20);
+    switch (posture) {
+        .foreground => {
+            _ = linux.kill(rig.child_pid, .KILL);
+            try testing.expectEqual(std.process.Child.Term{ .signal = .KILL }, try rig.waitChild());
+        },
+        .supervised => {
+            daemon_live = false;
+            _ = linux.kill(pid, .KILL);
+        },
+    }
+    _ = try storm.wait(io);
+    // The supervisor's replay and guard release come before fsck's open;
+    // the ring waits for the remount.
+    if (posture == .supervised) _ = try rig.awaitLog("exited (wait status 0x9); done", ready, 30 * std.time.ns_per_s);
+    try rig.umountAfterKill();
+    const recovered = try fsckClean(rig, switch (posture) {
+        .foreground => "the storm kill (foreground)",
+        .supervised => "the storm kill (supervised)",
+    });
+    const mark = try rig.logLen();
+    const rec = try remountAfterKill(rig, recovered);
+    const ring_records = blk: {
+        const text = try rig.readLog();
+        defer gpa.free(text);
+        const at = mark + (std.mem.indexOf(u8, text[mark..], " in a sealed memfd ") orelse return error.NoWriteCacheLine);
+        break :blk numberAfter(text[at..], "recovered ") orelse return error.NoWriteCacheLine;
+    };
+    var dir = try Io.Dir.cwd().openDir(io, rig.mp, .{});
+    defer dir.close(io);
+    var judge: StormJudge = .{ .rig = rig, .dir = dir, .image = image, .posture = posture, .lost = try stagedLostReads(rig) };
+    try testing.expectEqual(@as(u64, 0), judge.lost);
+    var present: usize = 0;
+    var exact: u64 = 0;
+    var holes: u64 = 0;
+    var sizes: u64 = 0;
+    for (0..storm_files) |i| {
+        var nb: [32]u8 = undefined;
+        const name = try std.fmt.bufPrint(&nb, "storm{d}", .{i});
+        const c = (try judge.census(name, (i * storm_stride_mib) << 20, storm_mib << 20)) orelse continue;
+        present += 1;
+        exact += c.exact;
+        holes += c.holes;
+        sizes += c.size;
+    }
+    const resident = try judge.census("resident", storm_resident_off_mib << 20, storm_resident_mib << 20);
+    // dd's close flushed the resident to the daemon, which acked it: a
+    // supervised kill keeps it whole.
+    if (posture == .supervised) try testing.expectEqual(@as(?u64, (storm_resident_mib << 20) / census_grain), if (resident) |c| c.exact else null);
+    for (0..acked) |a| {
+        var nb: [32]u8 = undefined;
+        const name = try std.fmt.bufPrint(&nb, "acked{d}", .{a});
+        const c = try pageCensus(gpa, io, dir, name, image, (8 * a) << 20, acked_mib << 20);
+        try testing.expectEqual(acked_mib << 20, c.size);
+        try testing.expectEqual(@as(u64, 0), c.holes);
+    }
+    try testing.expectEqual(judge.lost, try stagedLostReads(rig));
+    std.debug.print("smoke[kill]: storm killed at {d} MiB claimed ({t}): replayed {d} entries ({d} torn dropped), the remount recovered {d} ring record(s); {d} of 8 files present claiming {d} MiB: {d} pages exact, {d} holes, 0 torn; the resident {s}; {d} staged image(s) absent whole, staged_payload_lost_reads {d}; {d} acked file(s) byte-exact; C8 0 drift, C2 0/0\n", .{ claimed >> 20, posture, rec.replayed, rec.torn, ring_records, present, sizes >> 20, exact, holes, if (resident) |c| (if (c.exact != 0) "exact" else "absent whole") else "absent", judge.absent, judge.lost, acked });
+    {
+        const out = try rig.onMount("rm -f storm* resident && echo ok");
+        defer gpa.free(out);
+    }
+}
+
+/// The storm census's per-file verdict: the file's reads moved
+/// `staged_payload_lost_reads` ⇔ a staged image the kill discarded —
+/// lawful only after a FOREGROUND kill, and only ABSENT WHOLE (at most one
+/// block, no page of it the image's); any other page exact or a hole.
+const StormJudge = struct {
+    rig: *Rig,
+    dir: Io.Dir,
+    image: Io.File,
+    posture: StormPosture,
+    lost: u64,
+    absent: usize = 0,
+
+    /// The census of `name` (null: the file is absent), judged.
+    fn census(self: *StormJudge, name: []const u8, src_off: u64, cap: u64) !?Census {
+        const c = pageCensus(self.rig.gpa, self.rig.io, self.dir, name, self.image, src_off, cap) catch |e| switch (e) {
+            error.FileNotFound => return null,
+            else => return e,
+        };
+        const now = try stagedLostReads(self.rig);
+        if (now != self.lost) {
+            if (self.posture == .supervised or c.size > staged_reach or c.exact != 0) {
+                std.debug.print("\n--- {s} after the {t} kill: {d} staged read(s) lost over {d} B claimed, {d} pages exact ---\n", .{ name, self.posture, now - self.lost, c.size, c.exact });
+                return error.StagedCustodyLost;
+            }
+            self.absent += 1;
+            self.lost = now;
+        }
+        return c;
+    }
+};
+
+/// The mount's `staged_payload_lost_reads`.
+fn stagedLostReads(rig: *Rig) !u64 {
+    const st = try rig.stats();
+    defer rig.gpa.free(st);
+    return numberAfter(st, "\"staged_payload_lost_reads\":") orelse error.NoLostReadsRow;
 }
 
 /// The staged-then-promoted file the dismount-residue row kills inside:

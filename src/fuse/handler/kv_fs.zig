@@ -545,6 +545,38 @@ pub const AfterCommit = struct {
     }
 };
 
+/// PUNCH_HOLE's and ZERO_RANGE's in-bounds range `[off, upto)` on
+/// blocks of `bs`, every byte in exactly one piece: the HEAD edge
+/// (the partial block holding an unaligned `off`), the WHOLE
+/// blocks `[first_whole, end_whole)`, the TAIL edge (the partial
+/// block holding an unaligned `upto`, unless it is the head's).
+/// A range inside one block is ONE edge: the head when `off` is
+/// unaligned, else the tail `[off, upto)` — generic/695's
+/// `fpunch 8M 2M` on 4 MiB blocks (the tail once asked for a block
+/// past `off`'s: no piece matched and the call answered 0 with the
+/// bytes standing).
+const RangeTiling = struct {
+    head: ?Span,
+    first_whole: u64,
+    end_whole: u64,
+    tail: ?Span,
+
+    pub const Span = struct { from: u64, to: u64 };
+
+    pub fn of(off: u64, upto: u64, bs: u64) RangeTiling {
+        assert(off < upto);
+        const first_whole = (off + bs - 1) / bs;
+        return .{
+            .head = if (off % bs != 0) .{ .from = off, .to = @min(upto, (off / bs + 1) * bs) } else null,
+            .first_whole = first_whole,
+            .end_whole = @max(first_whole, upto / bs),
+            // `upto`'s block is the head's iff it lies below the
+            // first whole block.
+            .tail = if (upto % bs != 0 and upto / bs >= first_whole) .{ .from = upto / bs * bs, .to = upto } else null,
+        };
+    }
+};
+
 pub fn KvFs(comptime Store: type, comptime Data: type) type {
     assertStore(Store);
     assertData(Data);
@@ -1822,7 +1854,13 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 },
                 .striped => {
                     const r = rec.?;
-                    if (size >= old_size) return;
+                    // A truncate AT or below the size clips every binding
+                    // past the new EOF — a KEEP_SIZE reservation there
+                    // included, at the same size too (ext4's law:
+                    // `ext4_setattr` truncates at `ia_size <= oldsize`
+                    // "to truncate possible preallocated blocks";
+                    // generic/092). A grow keeps them.
+                    if (size > old_size) return;
                     if (r.layout.isKvmap()) {
                         // SIZE-FLIP-FIRST (charter §5.6): one head Put
                         // {size, cursor}; the records past the cut are
@@ -1857,6 +1895,8 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                             after.push(e.block(), Mapping.decode(e.mapping, self.geo.chunk) catch return error.InputOutput);
                         }
                     }
+                    // The same size with nothing past EOF: the map stands.
+                    if (size == old_size and kept.items.len == r.layout.entries.len) return;
                     try self.publish(t, ino, rec, Layout.stripedInline(size, kept.items), &.{});
                     fuse_truncate_striped_clips.inc();
                 },
@@ -2850,21 +2890,11 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                     // real data (fsx on generic/127: zeros from the last
                     // truncate's size to the punch's edge).
                     const size = self.claimedSize(local, try self.readInode(local));
-                    const first_whole = (off + bs - 1) / bs;
-                    const end_whole = upto / bs; // exclusive
-                    // The head edge: [off, min(upto, its block end)) when
-                    // off is not block-aligned.
-                    if (off % bs != 0) {
-                        const edge_end = @min(upto, (off / bs + 1) * bs);
-                        try self.zeroEdge(local, off, edge_end, size, changed);
-                    }
-                    // The tail edge: [its block start, upto) when upto is
-                    // not block-aligned and lies in another block.
-                    if (upto % bs != 0 and upto / bs > off / bs) {
-                        try self.zeroEdge(local, (upto / bs) * bs, upto, size, changed);
-                    }
-                    if (!zeroing and first_whole < end_whole) {
-                        const freed = try self.data.punchBlocks(self.io, local, @intCast(first_whole), @intCast(end_whole - 1));
+                    const plan = RangeTiling.of(off, upto, bs);
+                    if (plan.head) |e| try self.zeroEdge(local, e.from, e.to, size, changed);
+                    if (plan.tail) |e| try self.zeroEdge(local, e.from, e.to, size, changed);
+                    if (!zeroing and plan.first_whole < plan.end_whole) {
+                        const freed = try self.data.punchBlocks(self.io, local, @intCast(plan.first_whole), @intCast(plan.end_whole - 1));
                         fuse_fallocate_blocks_punched.add(freed);
                         if (freed != 0) changed.* = true;
                     }
@@ -8227,6 +8257,29 @@ test "fallocate (charter §6.6) — the striped arms through the plane's face: a
     try testing.expectEqual(@as(?linux.E, .FBIG), h.fallocate(f, KEEP, bs * @as(u64, std.math.maxInt(u32)), bs));
     try testing.expectEqual(u32_0 + 1, fuse_write_u32_index_refused.load());
     h.release(f);
+}
+
+test "RangeTiling: every in-bounds PUNCH/ZERO range is tiled exactly once by its head edge, its whole blocks and its tail edge — each edge a partial block (never a whole one, never two blocks), the whole blocks whole — for every `[off, upto)` over five blocks of 8 and of 1 (the unit block has no edges)" {
+    for ([_]u64{ 8, 1 }) |bs| {
+        var off: u64 = 0;
+        while (off < 5 * bs) : (off += 1) {
+            var upto = off + 1;
+            while (upto <= 5 * bs) : (upto += 1) {
+                const p = RangeTiling.of(off, upto, bs);
+                var hits: [40]u8 = @splat(0);
+                for ([_]?RangeTiling.Span{ p.head, p.tail }) |edge| if (edge) |e| {
+                    try testing.expect(e.from < e.to);
+                    try testing.expectEqual(e.from / bs, (e.to - 1) / bs);
+                    try testing.expect(e.to - e.from < bs);
+                    for (e.from..e.to) |i| hits[i] += 1;
+                };
+                for (p.first_whole..p.end_whole) |b| for (b * bs..(b + 1) * bs) |i| {
+                    hits[i] += 1;
+                };
+                for (hits, 0..) |n, i| try testing.expectEqual(@as(u8, @intFromBool(i >= off and i < upto)), n);
+            }
+        }
+    }
 }
 
 test "fallocate (charter §6.6; fstests generic/695) — a PUNCH/ZERO range that STARTS on a block boundary and ends inside that block is the block's partial edge: `fpunch 8M 2M` and `fzero 8M 2M` on 4 MiB blocks zero [8M, 10M) through the write admission (red: the head edge needs an unaligned start, the tail edge a later block than the start's, no whole block fits — the call answered 0 with the bytes standing, and generic/695 read 0xab back at [8M, 10M) after its fsync and power cut); the range ending ON a later boundary is a head edge alone, and one from an unaligned start into a later block's middle is a head edge, the whole blocks and a tail edge" {

@@ -13474,6 +13474,116 @@ test "smoke: O_TRUNC UNDER SERVED OPENS TRUNCATES (the control open arm, SQUEEZE
     try oTruncRow(false);
 }
 
+/// `stat -c %s` of `path` on `peer`'s mount, read until it is no longer
+/// `old` (a recalled reader's kernel learns the change through the
+/// sideband's queued invalidation; bounded at 2 s) — the first other value
+/// is the verdict, so a size behind the holder's acked writes is caught at
+/// its first read, never waited out until the holder's drain lands it.
+fn sizeAfterChange(peer: *Peer, path: []const u8, old: u64) !u64 {
+    var buf: [256]u8 = undefined;
+    const out = try peer.onMount(try std.fmt.bufPrint(&buf, "i=0; while [ $i -lt 100 ]; do s=$(stat -c %s {s}); [ \"$s\" != {d} ] && break; i=$((i + 1)); sleep 0.02; done; echo $s", .{ path, old }));
+    defer peer.rig.gpa.free(out);
+    return std.fmt.parseInt(u64, std.mem.trim(u8, out, " \n"), 10);
+}
+
+test "smoke: A JOINED PEER READS THE HOLDER'S UNLANDED WRITES (charter §5.5 tokens, §6.2 the write-back drain, §AL.5; the cache-less posture of every unsupervised mount, decision 0003 §BR.6) — mount A (the manager) and B (joined), both FOREGROUND (no supervisor, so no write cache; every TTL class at 60 s): A writes 3 MB and closes ⇒ B stats it 3,000,000 and reads it byte-exact; A writes a second 3 MB file and HOLDS its fd open ⇒ B reads it exact; A truncates the second to 1 MB ⇒ B reads 1,000,000 exact; A rewrites the first with `>` (O_TRUNC) to 2 MB ⇒ B reads 2,000,000 exact; B writes 3 MB ⇒ A reads it exact. B's first read of each size is the verdict, never a value waited out until the holder's write-back drain lands it (red before: B stat'ed 0 for A's fresh 3 MB file — the grant carried the DURABLE size while A's parked write custody and its size claim had not landed)" {
+    if (venueMissing(testing.io)) |why| return testkit.skipWhy(@src(), why);
+    const io = testing.io;
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    try rig.env.put("SQUEEZEFS_MW_BIND", "127.0.0.1:0");
+    var t_owner_text: [8]u8 = undefined;
+    try rig.env.put("SQUEEZEFS_TEST_MEMBERSHIP_T_OWNER_MS", try std.fmt.bufPrint(&t_owner_text, "{d}", .{smoke_t_owner_ms}));
+    for ([_][]const u8{ "SQUEEZEFS_FUSE_ATTR_TTL_MS", "SQUEEZEFS_FUSE_ENTRY_TTL_MS", "SQUEEZEFS_FUSE_DIR_ENTRY_TTL_MS", "SQUEEZEFS_FUSE_NEGATIVE_TTL_MS" }) |k| try rig.env.put(k, "60000");
+    try rig.formatSet(false);
+    // The unsupervised default, not the knob's 0: the mount says it runs
+    // without the write cache (`write_cache_off_unsupervised`).
+    _ = rig.env.swapRemove("SQUEEZEFS_WRITE_CACHE_PCT");
+    try rig.createImage();
+    try rig.mountAsSet(&.{});
+    _ = try rig.awaitReady(0);
+    {
+        const out = try rig.onMount("mkdir d && echo ok");
+        defer gpa.free(out);
+        try testing.expectEqualStrings("ok\n", out);
+    }
+    const b = try Peer.init(rig, "b");
+    defer b.deinit();
+    try b.spawnAsSet(&.{});
+    _ = try b.awaitReady();
+    // 1. A writes and closes; B's first stat and read.
+    {
+        const w = try rig.onMount("head -c 3000000 \"$1/image\" > d/a && stat -c %s d/a");
+        defer gpa.free(w);
+        try testing.expectEqualStrings("3000000\n", w);
+        const seen = try b.onMount("stat -c %s d/a && head -c 3000000 \"$1/image\" | cmp - d/a && echo same");
+        defer gpa.free(seen);
+        try testing.expectEqualStrings("3000000\nsame\n", seen);
+    }
+    // 2. A holds the fd open: B reads what A's writes acked.
+    {
+        const w = try rig.onMount("(exec 3> d/b; head -c 3000000 \"$1/image\" >&3; : > \"$1/b-written\"; while [ ! -e \"$1/b-checked\" ]; do sleep 0.05; done; exec 3>&-; : > \"$1/b-closed\") </dev/null >/dev/null 2>&1 & while [ ! -e \"$1/b-written\" ]; do sleep 0.02; done; stat -c %s d/b");
+        defer gpa.free(w);
+        try testing.expectEqualStrings("3000000\n", w);
+        const seen = try b.onMount("stat -c %s d/b && head -c 3000000 \"$1/image\" | cmp - d/b && echo same");
+        defer gpa.free(seen);
+        const done = try rig.onMount(": > \"$1/b-checked\"; while [ ! -e \"$1/b-closed\" ]; do sleep 0.02; done; echo closed");
+        defer gpa.free(done);
+        try testing.expectEqualStrings("3000000\nsame\n", seen);
+        try testing.expectEqualStrings("closed\n", done);
+    }
+    // 3. A's truncate: B's token is recalled; its next read is the new size.
+    {
+        const w = try rig.onMount("truncate -s 1000000 d/b && stat -c %s d/b");
+        defer gpa.free(w);
+        try testing.expectEqualStrings("1000000\n", w);
+        try testing.expectEqual(@as(u64, 1000000), try sizeAfterChange(b, "d/b", 3000000));
+        const seen = try b.onMount("head -c 1000000 \"$1/image\" | cmp - d/b && echo same");
+        defer gpa.free(seen);
+        try testing.expectEqualStrings("same\n", seen);
+    }
+    // 4. A rewrites the first file (O_TRUNC, then 2 MB parked): the
+    //    truncate's commit recalls B; B's next grant must carry 2 MB.
+    {
+        const w = try rig.onMount("head -c 2000000 \"$1/image\" > d/a && stat -c %s d/a");
+        defer gpa.free(w);
+        try testing.expectEqualStrings("2000000\n", w);
+        try testing.expectEqual(@as(u64, 2000000), try sizeAfterChange(b, "d/a", 3000000));
+        const seen = try b.onMount("head -c 2000000 \"$1/image\" | cmp - d/a && echo same");
+        defer gpa.free(seen);
+        try testing.expectEqualStrings("same\n", seen);
+    }
+    // 5. The reverse direction: B's file, A's read.
+    {
+        const w = try b.onMount("head -c 3000000 \"$1/image\" > d/c && stat -c %s d/c");
+        defer gpa.free(w);
+        try testing.expectEqualStrings("3000000\n", w);
+        const seen = try rig.onMount("for i in $(seq 100); do [ -e d/c ] && break; sleep 0.02; done; stat -c %s d/c && head -c 3000000 \"$1/image\" | cmp - d/c && echo same");
+        defer gpa.free(seen);
+        try testing.expectEqualStrings("3000000\nsame\n", seen);
+    }
+    {
+        const ta = try rig.stats();
+        defer gpa.free(ta);
+        const tb = try b.stats();
+        defer gpa.free(tb);
+        try testing.expectEqual(@as(?u64, 1), numberAfter(ta, "\"write_cache_off_unsupervised\":"));
+        try testing.expectEqual(@as(?u64, 1), numberAfter(tb, "\"write_cache_off_unsupervised\":"));
+        const landed_a = numberAfter(ta, "\"fuse_grant_landings\":") orelse 0;
+        const landed_b = numberAfter(tb, "\"fuse_grant_landings\":") orelse 0;
+        std.debug.print("\nsmoke[cache-less coherence]: grants served after their custody landed: A {d}, B {d}; refused drains A {d}, B {d}\n", .{ landed_a, landed_b, numberAfter(ta, "\"fuse_grant_landing_drain_failures\":") orelse 0, numberAfter(tb, "\"fuse_grant_landing_drain_failures\":") orelse 0 });
+        // A's three fresh grants (phases 1, 2, 4) and B's one (phase 5)
+        // each found custody to land, unless the write-back timer won it.
+        try testing.expectEqual(@as(?u64, 0), numberAfter(ta, "\"fuse_grant_landing_drain_failures\":"));
+        try testing.expectEqual(@as(?u64, 0), numberAfter(tb, "\"fuse_grant_landing_drain_failures\":"));
+    }
+    try b.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try b.waitExit());
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+}
+
 /// `.stats` opened, fstat'ed and read whole through the same fd: the bytes
 /// and the size the kernel reported for that generation (owned).
 const VirtualRead = struct { ino: u64, size: u64, bytes: []u8 };

@@ -254,7 +254,6 @@ src/gates/fuzz_campaign.zig:376 | 20 | 0949442673dfca9d | a size — OWED: deriv
 src/gates/fuzz_campaign.zig:376 | 64 | 0949442673dfca9d | a size — OWED: derive from derive.Facts or document the physical/format reason
 src/gates/fuzz_campaign.zig:501 | 10 | 4d2a38cb53bd9b6c | OWED: derive it or document it on the line (charter §1.5)
 src/io/nvme_dev.zig:288 | 3 | a6399b6b309c0659 | OWED: derive it or document it on the line (charter §1.5)
-src/io/nvme_dev.zig:292 | 3 | a6399b6b309c0659 | OWED: derive it or document it on the line (charter §1.5)
 src/io/nvme_dev.zig:736 | 1000 | c984637d5a784cdf | a timing/retry constant — OWED: its measured WHY on the line or a derivation (charter §1.5)
 src/io/nvme_dev.zig:736 | 1000 | c984637d5a784cdf | a timing/retry constant — OWED: its measured WHY on the line or a derivation (charter §1.5)
 src/io/nvme_dev.zig:789 | 20 | b707a333622cff61 | a size — OWED: derive from derive.Facts or document the physical/format reason

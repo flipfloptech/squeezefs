@@ -127,7 +127,7 @@ fn unmapAdhoc(ptr: [*]u8, pages: u32) void {
     _ = linux.munmap(ptr, pages * @as(usize, derive.facts().page_size));
 }
 
-/// The ranged read-bounce slab: `rangedPoolCapacity(cpus)` × 64 KiB in ONE
+/// The ranged read-bounce slab: `rangedPoolCapacityFor(cpus, budget)` × 64 KiB in ONE
 /// mapping. Registered by every lane as fixed buffer 0 so slab-resident cold
 /// fills ride ReadFixed and skip the per-op page pin (gup).
 const RangedSlab = struct {
@@ -269,6 +269,16 @@ const Pools = struct {
 var pools_storage: Pools = undefined;
 /// 0 = uninitialised, 1 = initialising, 2 = ready, 3 = failed.
 var pools_state: std.atomic.Value(u8) = .init(0);
+/// The memory budget the process pools are sized under (0 = none: the
+/// cores' capacities), set by the mount before its first device opens.
+var pools_budget: std.atomic.Value(u64) = .init(0);
+
+/// Size the process pools under `budget_bytes` (`nd.rangedPoolCapacityFor`).
+/// Before the first `initPools` (the mount's first device open); a later
+/// call finds them built and changes nothing.
+pub fn sizePoolsForBudget(budget_bytes: u64) void {
+    pools_budget.store(budget_bytes, .release);
+}
 
 /// Build the process pools once, from the process CPU root in force
 /// (`derive.facts().cpus` — never the calling thread's affinity: whichever
@@ -288,7 +298,8 @@ pub fn initPools() Terminal!void {
         // Process-lifetime pool memory: never freed, so the page allocator
         // (not a test allocator that would report it as a leak).
         const gpa = std.heap.page_allocator;
-        const ranged = RangedSlab.init(gpa, nd.rangedPoolCapacity(cpus)) catch {
+        // Acquire pairs with the release in `sizePoolsForBudget`.
+        const ranged = RangedSlab.init(gpa, nd.rangedPoolCapacityFor(cpus, pools_budget.load(.acquire))) catch {
             pools_state.store(3, .release);
             return error.OutOfMemory;
         };

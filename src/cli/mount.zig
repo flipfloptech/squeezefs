@@ -113,6 +113,7 @@ const mount_options = @import("../fuse/mount_options.zig");
 const atime = @import("../fuse/atime.zig");
 const mountinfo = @import("../core/mountinfo.zig");
 const mem_budget = @import("../mem/budget.zig");
+const nvme_dev = @import("../io/nvme_dev.zig");
 const cache_core = @import("../mem/cache.zig");
 const key = @import("../meta/key.zig");
 const set_config = @import("../data/set_config.zig");
@@ -381,6 +382,8 @@ pub fn run(p: cli.Process, m: args.Mount) u8 {
     const host: mem_budget.Host = .{ .io = p.io, .env = p.env, .facts = facts };
     const budget_bytes = mem_budget.authority.resolveBudgetNow(host);
     const write_cache_bytes = cache_core.resolveBound(knobs.intKnob("SQUEEZEFS_WRITE_CACHE_PCT", u64, p.env), facts, budget_bytes);
+    // The pinned device pools follow the budget (before the first open).
+    nvme_dev.sizePoolsForBudget(budget_bytes);
     const sqz = SqzIo.init(p.gpa, .{
         .env = p.env,
         .facts = facts,

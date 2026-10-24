@@ -131,6 +131,28 @@ pub fn rangedPoolCapacity(cores: u32) u32 {
     return @max(cores *| 64, 512);
 }
 
+/// The ranged slab's share of the memory budget: 1/16. The slab is pinned
+/// (every lane registers it as a fixed buffer) for the process's life, so
+/// an idle daemon holds all of it; the cores' capacity above is the
+/// ceiling (≥ 2 GiB of budget on 32 cores leaves it whole), a smaller
+/// budget takes fewer slots (the idle-RSS law: 128 MiB pinned beside a
+/// 64 MiB budget).
+pub const RANGED_SLAB_BUDGET_DIVISOR: u64 = 16;
+/// The fewest slots a bounded budget keeps: 64 = 2 × fio's QD32, the
+/// miss path's one-job depth twice over (the IPC arena's 4 MiB grain of
+/// 64 slots, the same instrument fact); past the slab a read degrades to
+/// an ad-hoc bounce, never a refusal.
+pub const RANGED_SLAB_MIN_SLOTS: u32 = 64;
+
+/// `clamp(budget / 16 / 64 KiB, 64, rangedPoolCapacity(cores))`; a budget
+/// of 0 (none resolved: an offline tool) is the cores' capacity.
+pub fn rangedPoolCapacityFor(cores: u32, budget_bytes: u64) u32 {
+    const ceiling = rangedPoolCapacity(cores);
+    if (budget_bytes == 0) return ceiling;
+    const by_budget = budget_bytes / RANGED_SLAB_BUDGET_DIVISOR / ranged_buf_size;
+    return @intCast(@min(@max(by_budget, RANGED_SLAB_MIN_SLOTS), ceiling));
+}
+
 pub const BouncePool = enum { ranged, block };
 
 /// `read_bounce_pool(size)`: ≤ 64 KiB rides the registered ranged slab
@@ -616,6 +638,22 @@ test "pool capacities restate pool.rs: max(cores×16, 64) blocks, max(cores×64,
     try testing.expectEqual(@as(u32, 23 * 64), rangedPoolCapacity(23));
     // ≈ 92 MiB on a 23-CPU box (pool.rs:813).
     try testing.expectEqual(@as(u64, 23 * 64 * 64 * derive.KiB), @as(u64, rangedPoolCapacity(23)) * ranged_buf_size);
+}
+
+test "the ranged slab follows the budget: clamp(budget / 16 / 64 KiB, 64, max(cores × 64, 512)) — 32 cores keep 2,048 slots from a 2 GiB budget up, a 64 MiB budget pins 64 (4 MiB, not 128 MiB); no budget is the cores' capacity" {
+    try testing.expectEqual(@as(u32, 2048), rangedPoolCapacityFor(32, 76 * derive.GiB));
+    try testing.expectEqual(@as(u32, 2048), rangedPoolCapacityFor(32, 2 * derive.GiB));
+    try testing.expectEqual(@as(u32, 1024), rangedPoolCapacityFor(32, derive.GiB));
+    try testing.expectEqual(@as(u32, 64), rangedPoolCapacityFor(32, 64 * derive.MiB));
+    try testing.expectEqual(@as(u32, 64), rangedPoolCapacityFor(32, derive.MiB));
+    try testing.expectEqual(@as(u32, 512), rangedPoolCapacityFor(4, 76 * derive.GiB));
+    try testing.expectEqual(rangedPoolCapacity(32), rangedPoolCapacityFor(32, 0));
+    for ([_]u64{ 1, 64 * derive.MiB, 300 * derive.MiB, derive.GiB, 8 * derive.GiB }) |b| {
+        for ([_]u32{ 1, 8, 32, 192 }) |c| {
+            const want = @min(@max(b / RANGED_SLAB_BUDGET_DIVISOR / ranged_buf_size, RANGED_SLAB_MIN_SLOTS), @max(c * 64, 512));
+            try testing.expectEqual(@as(u32, @intCast(want)), rangedPoolCapacityFor(c, b));
+        }
+    }
 }
 
 test "read_bounce_pool_routing: ≤ 64 KiB ranged slab, above it the whole-block pool" {

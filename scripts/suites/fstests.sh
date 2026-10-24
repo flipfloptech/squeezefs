@@ -129,6 +129,10 @@ ENV
   # skipped by it: our FSTYP has no `_scratch_mkfs_sized` arm, the one path
   # that would.
   cat > "$SETS/local.config" <<CFG
+# Owned by the suite run of pid $$: a hand-run ./check here would format,
+# mount and unmount THIS run's sets under its tests (2026-10-23: a
+# \`check -n\` unmounted generic/366's scratch between its mount and fio).
+[ "\${SQZ_FSTESTS_RUN:-}" = "$$" ] || { echo "local.config: these sets belong to the squeezefs suite run of pid $$ — refusing a check it did not start" >&2; exit 1; }
 export FSTYP=fuse.squeezefs
 # _scratch_mkfs reformats a set the previous test formatted: mkfs(8)'s -f.
 export MKFS_OPTIONS="-f"
@@ -275,7 +279,7 @@ fstests_run() {
   # reconfigure": generic/294, 306, 452's `-o remount,ro`); the classic
   # mount(2) applies the flag and ignores the options, as the daemon's
   # contract says. Helpers run the same under either API.
-  (cd "$FSTESTS_DIR" && exec setsid env LIBMOUNT_FORCE_MOUNT2=always PATH="$SETS/bin:$PATH" timeout -s KILL "$FSTESTS_TIMEOUT_S" ./check -R xunit "${exclude[@]}" "${what[@]}") > "$RESULTS/check-run$n.out" 2>&1 &
+  (cd "$FSTESTS_DIR" && exec setsid env LIBMOUNT_FORCE_MOUNT2=always SQZ_FSTESTS_RUN=$$ PATH="$SETS/bin:$PATH" timeout -s KILL "$FSTESTS_TIMEOUT_S" ./check -R xunit "${exclude[@]}" "${what[@]}") > "$RESULTS/check-run$n.out" 2>&1 &
   CHECK_PGID=$!
   # FAIL EARLY (owner ruling 2026-10-17): the first failing test that is not
   # a ledger row ends the pass — that failure is the work; the hours of

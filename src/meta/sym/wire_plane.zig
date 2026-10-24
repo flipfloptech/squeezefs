@@ -2294,6 +2294,69 @@ test "linux: THE JOIN AFTER A MANAGER REMOUNT — incarnation 1 arms its listene
     try testing.expect(bj.joined.?.managerEndpoint().eql(plane.advertised));
 }
 
+/// The racing joiner's open on its own thread (the bring-up row below).
+const RacingJoin = struct {
+    s: *meta_set.TestSet,
+    result: meta_set.OpenError!*meta_set.MetaSet = error.OutOfMemory,
+    done: std.atomic.Value(bool) = .init(false),
+
+    fn run(self: *RacingJoin) void {
+        self.result = meta_set.MetaSet.open(testing.allocator, self.s.io(), self.s.pathList(), .{ .env = &self.s.env, .cache_budget_bytes = 64 << 20, .cpus = 4, .join = .{ .mountpoint = "/build/tmp/mnt-join-race-b" } });
+        // Release: pairs with the wait loop's acquire load (an open that
+        // returned early ends the wait; `result` is read after the join).
+        self.done.store(true, .release);
+    }
+};
+
+test "linux: A JOIN RACING THE MANAGER'S BRING-UP after a remount — incarnation 2 is open (appender 0's page Live under its term) but its plane is not yet armed, so the projection names incarnation 1's dead listener: the joiner's dial is refused, it re-reads the projection and redials (`joined_endpoint_polls` grows) until incarnation 2's plane arms and its publish lands, then joins as appender 1 dialling incarnation 2 (red: the first refused dial failed the open `Io`)" {
+    const gpa = testing.allocator;
+    const s = try meta_set.TestSet.create(gpa, "join-race", 1);
+    defer s.destroy();
+    try s.env.put("SQUEEZEFS_MW_BIND", "127.0.0.1:0");
+    try s.env.put("SQUEEZEFS_CHECKPOINT_MAX_AGE_MS", "600000");
+    var first: endpoint.EndpointWire = undefined;
+    {
+        const set = try s.open();
+        defer set.close();
+        var locks = try dlm.Manager.init(gpa, 64);
+        defer locks.deinit();
+        const bound = try xv.set_bind.Bound.create(gpa, s.io(), set, &locks, &s.env);
+        defer bound.destroy(gpa);
+        const plane = (try WirePlane.start(gpa, s.io(), set, &s.env, 4, 1 << 30, &bound.plane, false)).?;
+        first = plane.advertised;
+        plane.stop();
+    }
+    const set = try s.open();
+    defer set.close();
+    var locks = try dlm.Manager.init(gpa, 64);
+    defer locks.deinit();
+    const bound = try xv.set_bind.Bound.create(gpa, s.io(), set, &locks, &s.env);
+    defer bound.destroy(gpa);
+    const polls0 = joined.stats.joined_endpoint_polls.load();
+    var race: RacingJoin = .{ .s = s };
+    const th = try std.Thread.spawn(.{}, RacingJoin.run, .{&race});
+    var joined_thread = false;
+    defer if (!joined_thread) th.join();
+    // The joiner has met the dead listener once (or its open returned).
+    const deadline = clock.monotonicNs() + 30 * std.time.ns_per_s;
+    while (joined.stats.joined_endpoint_polls.load() == polls0 and !race.done.load(.acquire)) {
+        try testing.expect(clock.monotonicNs() < deadline);
+        std.Thread.yield() catch {};
+    }
+    const plane = (try WirePlane.start(gpa, s.io(), set, &s.env, 4, 1 << 30, &bound.plane, false)).?;
+    defer plane.stop();
+    try testing.expect(!plane.advertised.eql(first));
+    th.join();
+    joined_thread = true;
+    const b = try race.result;
+    defer b.close();
+    const bj = b.volumes[0];
+    try testing.expectEqual(backend.Posture.joined, bj.posture);
+    try testing.expectEqual(@as(u32, 1), bj.joined.?.appenderId());
+    try testing.expect(bj.joined.?.managerEndpoint().eql(plane.advertised));
+    try testing.expect(joined.stats.joined_endpoint_polls.load() > polls0);
+}
+
 test "linux: A JOINER'S CLEAN UNMOUNT AND REJOIN while the manager stays up — B joins over TCP (its rotor slot leased as appender 1) and writes into it, the manager checkpoints (tree 0's projection names B's lease), B unmounts clean (the lease released, the page Free: the live tree 0 Unleased, the projection on the device still Leased{1}), B mounts again under the same identity before the manager's next record: the hint hands it appender 1 again, the projection's row naming appender 1 is a previous incarnation's and loads unleased — the rejoin holds exactly its new grant, its first cycle publishes nothing the manager refuses, it mounts and writes" {
     const gpa = testing.allocator;
     const s = try meta_set.TestSet.create(gpa, "rejoin", 1);

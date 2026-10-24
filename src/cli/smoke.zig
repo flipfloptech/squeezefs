@@ -51,6 +51,7 @@ const log = @import("../core/log.zig");
 const counters = @import("../core/counters.zig");
 const derive = @import("../core/derive.zig");
 const knobs = @import("../core/knobs.zig");
+const mem_sizing = @import("../mem/sizing.zig");
 const json_scan = @import("../core/json_scan.zig");
 const mountinfo = @import("../core/mountinfo.zig");
 const tick_law = @import("../sync/tick.zig");
@@ -11546,6 +11547,81 @@ fn readVirtualWhole(gpa: std.mem.Allocator, path: [:0]const u8) !VirtualRead {
         try out.appendSlice(gpa, buf[0..n]);
     }
     return .{ .ino = st.ino, .size = st.size, .bytes = try out.toOwnedSlice(gpa) };
+}
+
+/// The idle row's budget (`SQUEEZEFS_MEM_BUDGET_MB`): the small budgets a
+/// shared host's fleet share hands every daemon.
+const idle_row_budget_mib: u64 = 64;
+
+/// `/proc/<pid>/status`'s `<key>` (a `kB` line) in bytes.
+fn procStatusBytes(pid: linux.pid_t, key: []const u8) !u64 {
+    var pb: [64]u8 = undefined;
+    var buf: [4096]u8 = undefined;
+    const text = try Io.Dir.cwd().readFile(testing.io, try std.fmt.bufPrint(&pb, "/proc/{d}/status", .{pid}), &buf);
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        if (!std.mem.startsWith(u8, line, key) or line.len <= key.len or line[key.len] != ':') continue;
+        var f = std.mem.tokenizeAny(u8, line[key.len + 1 ..], " \t");
+        return 1024 * try std.fmt.parseInt(u64, f.next() orelse return error.BadStatus, 10);
+    }
+    return error.BadStatus;
+}
+
+/// The daemon's USER threads: `/proc/<pid>/task`'s entries but the
+/// kernel's io_uring workers (`iou-wrk-*`: no user stack, no TLS).
+fn userThreads(pid: linux.pid_t) !u64 {
+    var pb: [64]u8 = undefined;
+    var dir = try Io.Dir.cwd().openDir(testing.io, try std.fmt.bufPrint(&pb, "/proc/{d}/task", .{pid}), .{ .iterate = true });
+    defer dir.close(testing.io);
+    var it = dir.iterate();
+    var n: u64 = 0;
+    while (try it.next(testing.io)) |e| {
+        var cb: [64]u8 = undefined;
+        const comm_path = try std.fmt.bufPrint(&cb, "{s}/comm", .{e.name});
+        var comm_buf: [64]u8 = undefined;
+        const comm = dir.readFile(testing.io, comm_path, &comm_buf) catch continue;
+        if (!std.mem.startsWith(u8, comm, "iou-wrk")) n += 1;
+    }
+    return n;
+}
+
+test "smoke: AN IDLE DAEMON'S RESIDENT MEMORY FOLLOWS ITS BUDGET (the idle-RSS law, docs/evidence/rung-10-idle-rss.md) — format the set → mount under SQUEEZEFS_MEM_BUDGET_MB=64 → ready and two sampler ticks (every mount-time sizer ran, every bound re-derived) → the daemon's VmRSS ≤ 64 MiB + sizing.idleFloorBytes(possible CPUs, its user threads): the pinned payload pool's floor, std's per-thread signal stack and idle stack, the image (red on dev: 2,035 MB on 32 CPUs — the read cache's item tables, index and slab arrays sized by 25 % of the MACHINE's RAM and written at birth, 1 MiB of thread-local reply buffer in each of 146 threads, a 128 MiB pinned ranged slab)" {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    try rig.env.put("SQUEEZEFS_MEM_BUDGET_MB", std.fmt.comptimePrint("{d}", .{idle_row_budget_mib}));
+    try rig.formatSet(true);
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(0);
+    const deadline = clock.monotonicNs() + 30 * std.time.ns_per_s;
+    while (true) {
+        const st = try rig.onMount("cat .stats");
+        defer gpa.free(st);
+        if ((numberAfter(st, "\"mem_budget_ticks\":") orelse 0) >= 2) break;
+        if (clock.monotonicNs() >= deadline) return error.Timeout;
+        sleepMs(100);
+    }
+    const pid = rig.child_pid;
+    const rss = try procStatusBytes(pid, "VmRSS");
+    const threads = try userThreads(pid);
+    const cpus = derive.facts().possible_cpus;
+    const bound = mem_sizing.idleRssBound(idle_row_budget_mib * derive.MiB, cpus, threads);
+    std.debug.print("\nsmoke: idle RSS {d} MiB (anon {d}, file {d}, shmem {d}) over {d} user threads on {d} possible CPUs; the bound {d} MiB = budget {d} + floor {d}\n", .{
+        rss >> 20,
+        (try procStatusBytes(pid, "RssAnon")) >> 20,
+        (try procStatusBytes(pid, "RssFile")) >> 20,
+        (try procStatusBytes(pid, "RssShmem")) >> 20,
+        threads,
+        cpus,
+        bound >> 20,
+        idle_row_budget_mib,
+        mem_sizing.idleFloorBytes(cpus, threads) >> 20,
+    });
+    try testing.expect(rss <= bound);
+    try rig.umount();
+    _ = try rig.waitChild();
 }
 
 test "smoke: THE VIRTUAL INODES WITHOUT AN OPEN (decision 0003 §AF) — under no-open `.stats` is read through the page cache with no generation pin and no FOPEN_DIRECT_IO: 200 reads while a create storm moves every counter are each ONE whole JSON document whose length is exactly the st_size the same fd's fstat reported; two sequential opens read two generations (different inos, different bytes, each exact); a truncating open and a write are EACCES" {

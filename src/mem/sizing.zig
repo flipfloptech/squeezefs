@@ -159,6 +159,54 @@ pub fn dirEntryCapacity(total_memory: u64) u64 {
     return @max(50_000, total_memory / 200_000);
 }
 
+// ---- the idle floor (the idle-RSS law) ----
+
+/// std's per-thread signal stack (`std.Options.signal_stack_size`'s
+/// default, which the product's root `src/main.zig` keeps): a
+/// `threadlocal` array, so every thread's spawn zero-fills it.
+pub const signal_stack_bytes: u64 = (std.Options{}).signal_stack_size orelse 0;
+
+/// The stack an idle thread has touched, measured on the venue: ≤ 50 KiB
+/// of a 16 MiB reservation for the FUSE ring workers and the lanes (every
+/// thread but one), 113 KiB for the budget's sampler (its census buffer);
+/// 64 KiB bounds the average with room.
+pub const idle_thread_stack_bytes: u64 = 64 * 1024;
+/// The image and the mount's fixed tables, measured on the venue (32 CPUs,
+/// x86_64, ReleaseSafe: 84 MiB): the text, rodata, loader and libc the
+/// daemon ran (14 MiB, file-backed), the counter and histogram tables in
+/// `.bss` (16 MiB of its 20 resident: THP maps a touched 2 MiB range
+/// whole), the fsck verifier's two 4 MiB windows, the sym planes' holder
+/// and token tables (11 MiB), the lanes' inboxes and the rings (10 MiB),
+/// the metadata engine's conveyor, journal lane, allocator and lease table
+/// (10 MiB) and ≈ 15 MiB of smaller tables; 96 leaves an eighth for the
+/// tables that grow with the CPU count.
+pub const idle_image_bytes: u64 = 96 * MiB;
+
+/// THE IDLE FLOOR — the resident bytes of an idle mounted daemon that do
+/// NOT follow its memory budget. The idle-RSS law (`docs/evidence/
+/// rung-10-idle-rss.md`): an idle daemon's RSS ≤ its budget + this floor;
+/// every other byte is a bound the budget derives, and a reservation sized
+/// from the machine's RAM (the read cache's) is touched lazily, resident
+/// only as far as its bound let it fill.
+///   (1) the FUSE payload pool's floor, `possible_cpus × Q_DEPTH_FLOOR ×
+///       1 MiB`: pinned by the rings' fixed-buffer registration at arm,
+///       one queue per possible CPU (the kernel's) — the never-divided
+///       floor the fleet-share refusal names;
+///   (2) per thread: std's signal stack (`signal_stack_bytes`, in the
+///       static TLS block the C runtime zero-fills at every spawn) and
+///       `idle_thread_stack_bytes`;
+///   (3) the image (`idle_image_bytes`).
+pub fn idleFloorBytes(possible_cpus: u32, threads: u64) u64 {
+    const transport = @as(u64, possible_cpus) * transport_q_depth_floor * transport_payload_base;
+    const per_thread = signal_stack_bytes + idle_thread_stack_bytes;
+    return transport + threads * per_thread + idle_image_bytes;
+}
+
+/// The idle-RSS bound: `budget + idleFloorBytes`.
+pub fn idleRssBound(budget: u64, possible_cpus: u32, threads: u64) u64 {
+    return budget +| idleFloorBytes(possible_cpus, threads);
+}
+
 const refusal_template = "fleet share {d} (squeezefs daemons in this cgroup): the divided derived memory budget {d} B cannot satisfy the never-divided transport payload floor {d} B (= {d} kernel possible CPUs × Q_DEPTH_FLOOR {d} × {d} B payload — kernel-mandated queue geometry, fleet-share EXEMPT). Floors hold per daemon regardless of share, so this many daemons oversubscribe the machine instead of dividing it: run fewer daemons in this cage, or set an explicit SQUEEZEFS_MEM_BUDGET_MB (absolute overrides win verbatim and own their own arithmetic)";
 /// Six `{d}` of at most 20 digits each on top of the template.
 pub const RefusalBuf = [refusal_template.len + 6 * 20]u8;
@@ -380,6 +428,18 @@ test "ipc per-uid session cap = clamp(cap / max(arena, 1), 64, 4096); monotone n
         try testing.expect(got <= last);
         last = got;
     }
+}
+
+test "tie: the idle floor = possible_cpus × Q_DEPTH_FLOOR × 1 MiB (the pinned payload pool) + threads × (std's signal stack + 64 KiB of idle stack) + 96 MiB of image — the venue's 32 CPUs and 146 threads: 128 MiB + 146 × 320 KiB + 96 MiB; the bound is the budget plus it" {
+    const per_thread: u64 = signal_stack_bytes + 64 * 1024;
+    try testing.expectEqual(@as(u64, 256 * 1024), signal_stack_bytes);
+    try testing.expectEqual(@as(u64, 32 * 4 * MiB + 146 * per_thread + 96 * MiB), idleFloorBytes(32, 146));
+    try testing.expectEqual(@as(u64, 128 * MiB + 146 * 320 * 1024 + 96 * MiB), idleFloorBytes(32, 146));
+    try testing.expectEqual(64 * MiB + idleFloorBytes(32, 146), idleRssBound(64 * MiB, 32, 146));
+    try testing.expectEqual(@as(u64, 4 * MiB + 96 * MiB), idleFloorBytes(1, 0));
+    for ([_]u32{ 1, 9, 32, 192 }) |c| for ([_]u64{ 0, 20, 146, 600 }) |t| {
+        try testing.expectEqual(@as(u64, c) * transport_q_depth_floor * transport_payload_base + t * per_thread + idle_image_bytes, idleFloorBytes(c, t));
+    };
 }
 
 test "fleet share unsatisfiable floor refuses naming the arithmetic; share 1 never refuses" {

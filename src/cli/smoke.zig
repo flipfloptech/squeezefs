@@ -6397,11 +6397,21 @@ test "smoke: A LIVE MEMBER EVICTED AT T_OWNER UNDER THE DEAD MANAGER'S STRIPED H
     b.node = kill_peer_node;
     try b.spawn(&.{});
     _ = try b.awaitReady();
+    // The custody's file lives in a directory B holds: a file B creates
+    // in a FOREIGN directory is witnessed at B by that directory's holder
+    // — a token grant, and a grant lands the holder's write custody before
+    // it is served (charter §5.5) — so in the root A's witness read raced
+    // the 64 KiB write and B re-joined in place holding nothing (2 runs in
+    // 3 with the hook). No peer asks about `own/`.
+    {
+        const out = try b.onMount("mkdir own && sync -f .");
+        gpa.free(out);
+    }
     var hb: [linux.PATH_MAX]u8 = undefined;
     const held = try std.fmt.bufPrint(&hb, "{s}/held", .{rig.work});
     var gb: [linux.PATH_MAX]u8 = undefined;
     const go = try std.fmt.bufPrint(&gb, "{s}/go", .{rig.work});
-    var holder = try std.process.spawn(io, .{ .argv = &.{ "sh", "-c", "exec 3>\"$0/custody\" && head -c 65536 /dev/urandom >&3 && : > \"$1\" && while [ ! -e \"$2\" ]; do sleep 0.05; done", b.mp, held, go }, .environ_map = &rig.env, .stdin = .ignore });
+    var holder = try std.process.spawn(io, .{ .argv = &.{ "sh", "-c", "exec 3>\"$0/own/custody\" && head -c 65536 /dev/urandom >&3 && : > \"$1\" && while [ ! -e \"$2\" ]; do sleep 0.05; done", b.mp, held, go }, .environ_map = &rig.env, .stdin = .ignore });
     var holder_done = false;
     defer if (!holder_done) {
         _ = linux.kill(holder.id.?, .KILL);

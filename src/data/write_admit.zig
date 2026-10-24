@@ -1208,19 +1208,23 @@ pub const WritePath = struct {
                         stats.admit_write_accumulate_bytes.add(pc.len);
                         break :blk .accumulate_park;
                     }
-                    var runs: [cov.CoverageUnion.max_runs]cov.Run = undefined;
-                    if (p.seam.take(p.seam.ctx, req.ino, pc.block, pc.rel, data.ptr, &runs)) |ad| {
-                        const adopted = self.table.checkoutAdopting(req.ino, pc.block, has_existing, live_binding, ad.cell, runs[0..ad.n_runs]) orelse {
-                            self.table.pool.release(ad.cell);
-                            try self.parkAtPoolCap(io, g, &held, req, pc.block, &gate);
-                            continue;
-                        };
-                        stats.admit_write_accumulate_bytes.add(pc.len);
-                        if (adopted.coverage.isFull(@intCast(bs))) {
-                            hint = .upload;
-                            break :blk .write_through;
+                    // The entry slot BEFORE the seal: a sealed assembly
+                    // answers every later write of it as a no-op ack, so
+                    // its adoption must land (never an ack without its
+                    // bytes); a full table (the tripwire) seals nothing and
+                    // takes the copy path's ladder below.
+                    if (self.table.reserveEntry()) |slot| {
+                        var runs: [cov.CoverageUnion.max_runs]cov.Run = undefined;
+                        if (p.seam.take(p.seam.ctx, req.ino, pc.block, pc.rel, data.ptr, &runs)) |ad| {
+                            const adopted = self.table.checkoutAdopting(req.ino, pc.block, has_existing, live_binding, slot, ad.cell, runs[0..ad.n_runs]);
+                            stats.admit_write_accumulate_bytes.add(pc.len);
+                            if (adopted.coverage.isFull(@intCast(bs))) {
+                                hint = .upload;
+                                break :blk .write_through;
+                            }
+                            break :blk .accumulate_park;
                         }
-                        break :blk .accumulate_park;
+                        self.table.unreserveEntry(slot);
                     }
                 }
                 break :blk_g self.table.checkout(req.ino, pc.block, has_existing, live_binding) orelse {

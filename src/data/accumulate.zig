@@ -682,20 +682,46 @@ pub const Table = struct {
     /// binding, else `fresh`). Null = the pool/table is at its cap (the
     /// caller stages the piece).
     pub fn checkout(self: *Table, ino: u64, block: u32, has_existing_bytes: bool, old_binding: ?Binding) ?*Entry {
-        return self.checkoutWith(ino, block, has_existing_bytes, old_binding, null);
+        return self.checkoutWith(ino, block, has_existing_bytes, old_binding, null, null);
+    }
+
+    /// An entry slot held for an adopting checkout (`reserveEntry`).
+    pub const EntrySlot = struct { idx: u32 };
+
+    /// Arm G's entry slot, taken BEFORE the placed assembly is sealed for
+    /// adoption: a sealed assembly's token answers every later placed write
+    /// of it as a no-op ack, so its adoption must land — an adopting
+    /// checkout that met a full table after the seal acked those writes with
+    /// no entry (their bytes lost). Null = the table is full below the pool
+    /// cap (the tripwire; nothing sealed, the copy path's ladder).
+    pub fn reserveEntry(self: *Table) ?EntrySlot {
+        self.lock.lock();
+        defer self.lock.unlock();
+        const idx = self.free.pop() orelse {
+            stats.active_block_table_full.fire("entry table full below the pool cap");
+            return null;
+        };
+        return .{ .idx = idx };
+    }
+
+    /// A reserved slot the adoption did not use (no assembly to take).
+    pub fn unreserveEntry(self: *Table, slot: EntrySlot) void {
+        self.lock.lock();
+        defer self.lock.unlock();
+        self.free.appendAssumeCapacity(slot.idx);
     }
 
     /// Arm G's ADOPTING checkout (charter §7 "placed sever … a shared
     /// assembly the first merge ADOPTS"): the entry's backing is `adopt` —
     /// a placed-sever assembly's cell whose share the caller hands over —
-    /// instead of a fresh pool cell. Adoption changes WHERE the backing
-    /// memory came from, never the coverage/seed law; the cell is non-
-    /// unique while placed payloads are out, so an in-place mutation copies
-    /// away (`uniqueOrCopy`). The caller holds (3) and saw no entry; an
-    /// entry present after all is a logic error (asserted). Null = the
-    /// entry table is full — the caller releases its share.
-    pub fn checkoutAdopting(self: *Table, ino: u64, block: u32, has_existing_bytes: bool, old_binding: ?Binding, adopt: *Pool.Cell, landed: []const cov.Run) ?*Entry {
-        const e = self.checkoutWith(ino, block, has_existing_bytes, old_binding, adopt) orelse return null;
+    /// instead of a fresh pool cell, in the slot `reserveEntry` held (so it
+    /// cannot fail). Adoption changes WHERE the backing memory came from,
+    /// never the coverage/seed law; the cell is non-unique while placed
+    /// payloads are out, so an in-place mutation copies away
+    /// (`uniqueOrCopy`). The caller holds (3) and saw no entry; an entry
+    /// present after all is a logic error (asserted).
+    pub fn checkoutAdopting(self: *Table, ino: u64, block: u32, has_existing_bytes: bool, old_binding: ?Binding, slot: EntrySlot, adopt: *Pool.Cell, landed: []const cov.Run) *Entry {
+        const e = self.checkoutWith(ino, block, has_existing_bytes, old_binding, adopt, slot).?;
         // The landed runs ARE coverage (the bytes are in the cell): at most
         // `max_runs` of them (the registry refused the adoption otherwise),
         // so the record cannot overflow.
@@ -713,19 +739,22 @@ pub const Table = struct {
         return e;
     }
 
-    fn checkoutWith(self: *Table, ino: u64, block: u32, has_existing_bytes: bool, old_binding: ?Binding, adopt: ?*Pool.Cell) ?*Entry {
+    /// `given`: the caller's cell (an adoption's share, a seeded image) —
+    /// on a refusal it stays the caller's; `slot`: a reserved entry slot
+    /// (the adoption's: no refusal past it).
+    fn checkoutWith(self: *Table, ino: u64, block: u32, has_existing_bytes: bool, old_binding: ?Binding, given: ?*Pool.Cell, slot: ?EntrySlot) ?*Entry {
         self.lock.lock();
         defer self.lock.unlock();
         const key: Key = .{ .ino = ino, .block = block };
         if (self.index.get(key)) |e| {
-            assert(adopt == null);
+            assert(given == null);
             stats.write_block_revisits.inc();
             return e;
         }
-        const cell = adopt orelse (self.pool.acquire() orelse return null);
-        const idx = self.free.pop() orelse {
+        const cell = given orelse (self.pool.acquire() orelse return null);
+        const idx = if (slot) |sl| sl.idx else self.free.pop() orelse {
             stats.active_block_table_full.fire("entry table full below the pool cap");
-            if (adopt == null) self.pool.release(cell);
+            if (given == null) self.pool.release(cell);
             return null;
         };
         const e = &self.entries[idx];
@@ -788,7 +817,7 @@ pub const Table = struct {
             self.pool.release(cell);
             return error.InputOutput;
         };
-        const e = self.checkoutWith(ino, block, false, old_binding, cell) orelse {
+        const e = self.checkoutWith(ino, block, false, old_binding, cell, null) orelse {
             self.pool.release(cell);
             return error.PoolExhausted;
         };

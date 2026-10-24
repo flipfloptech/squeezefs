@@ -840,3 +840,103 @@ test "shim smoke: THE DIRECT WRITE ARM — a `-o interception=direct` mount, a r
 
 /// The power-cut row's script (its header is the method).
 const direct_cut_script = @embedFile("direct_cut.sh");
+
+test "shim smoke: RING APPENDS ACROSS TWO MEMBERS LOSE NOTHING — A (the manager) and B JOINED, both `-o interception`: A writes `own/f` (1 MiB, synced) in its slot; under LD_PRELOAD, B appends through its ring (a `dd` at the file's end on a plain O_WRONLY fd — the shim refuses O_APPEND, so the end is the size B's `stat` saw), then six rounds alternate a ring append on A while B holds a fresh grant and a ring append on B — both mounts read `f` byte-exact against a mirror, at once and after both remount; both rings served writes (`ipc_ops_write`); fsck --offline --scrub 0 findings" {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    try rig.env.put("SQUEEZEFS_MW_BIND", "127.0.0.1:0");
+    try rig.formatSet();
+    try testing.expect(try rig.mount(&.{ "-o", "interception" }));
+    const mp_b = try std.fmt.allocPrintSentinel(gpa, "{s}-b", .{rig.mp}, 0);
+    defer gpa.free(mp_b);
+    _ = linux.mkdir(mp_b.ptr, 0o755);
+    defer _ = linux.rmdir(mp_b.ptr);
+    const log_b = try std.fmt.allocPrintSentinel(gpa, "{s}/daemon-b.log", .{rig.work}, 0);
+    defer gpa.free(log_b);
+    var b_child: ?std.process.Child = null;
+    defer if (b_child) |*c| {
+        _ = linux.kill(c.id.?, .KILL);
+        _ = c.wait(io) catch {};
+        _ = linux.umount2(mp_b.ptr, linux.MNT.DETACH);
+    };
+    const spawnB = struct {
+        fn run(r: *Rig, mp: [:0]const u8, log_path: [:0]const u8) !std.process.Child {
+            // A fresh log per spawn: the child writes at the description's
+            // offset, so a reused file would be overwritten from its start.
+            const f = try Io.Dir.cwd().createFile(r.io, log_path, .{ .truncate = true });
+            defer f.close(r.io);
+            const from: u64 = 0;
+            const c = try std.process.spawn(r.io, .{ .argv = &.{ r.bin, "mount", "-o", "interception", r.meta_uri, mp }, .environ_map = &r.env, .stdin = .ignore, .stdout = .{ .file = f }, .stderr = .{ .file = f } });
+            const deadline = clock.monotonicNs() + ready_wait_ns;
+            while (clock.monotonicNs() < deadline) {
+                const text = try Io.Dir.cwd().readFileAlloc(r.io, log_path, r.gpa, .limited(64 << 20));
+                defer r.gpa.free(text);
+                if (text.len > from and std.mem.indexOf(u8, text[@intCast(from)..], "ready: ") != null) return c;
+                sleepMs(20);
+            }
+            return error.Timeout;
+        }
+    }.run;
+    b_child = try spawnB(rig, mp_b, log_b);
+    var sb: [2048]u8 = undefined;
+    // A's file and its mirror; B's ring append at the end its stat saw.
+    {
+        const r = try rig.sh(rig.mp, try std.fmt.bufPrint(&sb, "m=\"{s}/m\"; mkdir -p \"$m\" own; head -c 1048576 /dev/urandom > \"$m/f\"; cp \"$m/f\" own/f; sync -d own/f", .{rig.work}));
+        rig.freeRun(r);
+    }
+    const ring_append =
+        \\ap() {{ n=$(stat -c %s "$1"); printf '%s\n' "$2" | dd of="$1" bs=64 seek=$n oflag=seek_bytes conv=notrunc status=none; printf '%s\n' "$2" >> "$3"; }}
+    ;
+    {
+        const r = try rig.preloadOk(mp_b, try std.fmt.bufPrint(&sb, ring_append ++ "\nap own/f b-first {s}/m/f\ni=1; while [ $i -le 6 ]; do stat -c %s own/f > /dev/null; ap {s}/own/f a-line-$i {s}/m/f; ap own/f b-line-$i {s}/m/f; i=$((i + 1)); done", .{ rig.work, rig.mp, rig.work, rig.work }));
+        rig.freeRun(r);
+    }
+    const judge = "cmp own/f \"$0/m/f\" && echo same";
+    for ([_][:0]const u8{ mp_b, rig.mp }) |mp| {
+        const r = try std.process.run(gpa, io, .{ .argv = &.{ "sh", "-c", judge, rig.work }, .cwd = .{ .path = mp }, .environ_map = &rig.env });
+        defer rig.freeRun(r);
+        if (!std.mem.eql(u8, r.stdout, "same\n")) {
+            std.debug.print("\n--- ring appends through {s}: {s}{s}\n", .{ mp, r.stdout, r.stderr });
+            return error.RingAppendBytesLost;
+        }
+    }
+    for ([_][:0]const u8{ mp_b, rig.mp }) |mp| {
+        const r = try std.process.run(gpa, io, .{ .argv = &.{ "cat", ".stats" }, .cwd = .{ .path = mp }, .environ_map = &rig.env });
+        defer rig.freeRun(r);
+        try testing.expect((numberAfter(r.stdout, "\"ipc_ops_write\":") orelse 0) >= 6);
+    }
+    // Both remount: B first, then A; fsck; then both again and the judge.
+    {
+        const r = try rig.squeezefs(&.{ "umount", mp_b });
+        rig.freeRun(r);
+        var c = b_child.?;
+        b_child = null;
+        _ = try c.wait(io);
+    }
+    try rig.umount();
+    {
+        const r = try rig.squeezefs(&.{ "fsck", "--offline", "--scrub", rig.meta_uri });
+        defer rig.freeRun(r);
+        if (std.mem.indexOf(u8, r.stdout, "findings: 0 (clean)") == null) std.debug.print("\n--- fsck: {s}{s}\n", .{ r.stdout, r.stderr });
+        try testing.expect(std.mem.indexOf(u8, r.stdout, "findings: 0 (clean)") != null);
+    }
+    try testing.expect(try rig.mount(&.{ "-o", "interception" }));
+    b_child = try spawnB(rig, mp_b, log_b);
+    for ([_][:0]const u8{ mp_b, rig.mp }) |mp| {
+        const r = try std.process.run(gpa, io, .{ .argv = &.{ "sh", "-c", judge, rig.work }, .cwd = .{ .path = mp }, .environ_map = &rig.env });
+        defer rig.freeRun(r);
+        try testing.expectEqualStrings("same\n", r.stdout);
+    }
+    {
+        const r = try rig.squeezefs(&.{ "umount", mp_b });
+        rig.freeRun(r);
+        var c = b_child.?;
+        b_child = null;
+        _ = try c.wait(io);
+    }
+    try rig.umount();
+    std.debug.print("shim smoke: ring appends across two members: B's and A's interposed appends byte-exact through both mounts at once and after both remount; fsck clean\n", .{});
+}

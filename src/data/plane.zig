@@ -490,6 +490,10 @@ pub const DataPlane = struct {
     rt: router.Router,
     reclaimer: *reclaim.Reclaimer,
     reclaim_free: seams.ReclaimFree,
+    /// The reclaimer's durability gate's ONE sealed slot: per metadata
+    /// member, the mark its sealed frees wait to see durable (charter §6.2;
+    /// written and read under the reclaimer's hold lock only).
+    durable_marks: []u64 = &.{},
     /// Levels (3.5) and (3.7) with the promotion's order (module doc).
     locks: layout.PublishLocks = .{},
     /// The staged fast path's per-ino cache (`stagedPoint`).
@@ -757,6 +761,10 @@ pub const DataPlane = struct {
         self.reclaimer.setTierPurge(.{ .ctx = self, .purge = &reclaimPurge });
         self.reclaimer.setFenceProbe(.{ .ctx = self, .poll = &fencePoll });
         self.reclaimer.setForegroundSignal(.{ .ctx = null, .read = &foregroundBytes });
+        self.durable_marks = gpa.alloc(u64, be.volumeCount()) catch return error.OutOfMemory;
+        errdefer gpa.free(self.durable_marks);
+        @memset(self.durable_marks, 0);
+        self.reclaimer.setDurableGate(.{ .ctx = self, .vtable = &durable_gate_vtable });
         for (self.vols.rows[0..self.vols.n()]) |r| r.?.alloc.space_pending = self.reclaimer.spacePending();
         self.reclaim_free = .{ .r = self.reclaimer, .vols = &self.vols };
         self.reclaimer.start(io) catch return error.ReclaimRefused;
@@ -1422,6 +1430,7 @@ pub const DataPlane = struct {
         self.closeVolumes(self.vols.n());
         self.zcrx_registry.deinit();
         self.reclaimer.deinit();
+        self.gpa.free(self.durable_marks);
         self.rt.deinit();
         self.windows.deinit();
         self.sweeps.deinit(self.gpa);
@@ -1884,6 +1893,29 @@ pub const DataPlane = struct {
             if (self.packer) |*p| if (p.releaseOpenTenant(b)) continue;
             _ = self.reclaim_free.seam().free(io, b);
         }
+    }
+
+    // ---- the reclaimer's durability gate (charter §6.2; `reclaim`'s hold) ----
+
+    const durable_gate_vtable: reclaim.DurableGate.VTable = .{ .seal = &durableSeal, .sealed = &durableSealed, .force = &durableForce };
+
+    /// Every member's reservation high-water mark now (under the hold lock).
+    fn durableSeal(ctx: *anyopaque) void {
+        const self: *DataPlane = @ptrCast(@alignCast(ctx));
+        self.backend.durabilityMarks(self.durable_marks);
+    }
+
+    fn durableSealed(ctx: *anyopaque) bool {
+        const self: *DataPlane = @ptrCast(@alignCast(ctx));
+        return self.backend.marksDurable(self.durable_marks);
+    }
+
+    /// An fsync of the metadata set: every member's barrier pulled now and
+    /// waited for (it waits, never refuses — 0003 §BO.1).
+    fn durableForce(ctx: *anyopaque) bool {
+        const self: *DataPlane = @ptrCast(@alignCast(ctx));
+        self.backend.fsync() catch return false;
+        return true;
     }
 
     /// The in-flight registrations of releases on this mount's volumes

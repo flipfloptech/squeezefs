@@ -683,6 +683,10 @@ pub const JournalLane = struct {
     /// Set only after every in-flight submitter left: the fiber's
     /// disconnect signal, after which the queue can only drain.
     sealed: std.atomic.Value(bool) = .init(false),
+    /// The landed floor of the last SUCCESSFUL barrier (`barrierDone`):
+    /// every journal position below it is on stable media. Monotone; read
+    /// off the lane by the freed-block hold (`durableFloor`).
+    durable_floor: std.atomic.Value(u64) = .init(0),
     /// The stage-B fiber and the group that joins it at shutdown.
     fiber: ?*Fiber = null,
     group: Io.Group = .init,
@@ -947,6 +951,13 @@ pub const JournalLane = struct {
             }
         }
         self.wakeFiber();
+    }
+
+    /// Every journal position below this is durable: windows that landed
+    /// before a barrier that then completed (charter §6.2: a freed block
+    /// returns to allocation only once the record that freed it is).
+    pub fn durableFloor(self: *const JournalLane) u64 {
+        return self.durable_floor.load(.acquire);
     }
 
     /// Wake the stage-B fiber without a message: the contract of every
@@ -1691,6 +1702,9 @@ pub const JournalLane = struct {
         w.last_barrier_ns = now;
         if (result) |_| {
             self.latch.noteSuccess(.barrier);
+            // Release: pairs with `durableFloor`'s acquire — a reader that
+            // sees the floor sees the barrier's completion before it.
+            _ = self.durable_floor.fetchMax(w.barrier_floor, .release);
             if (self.hooks.barrier_landed) |f| f(self.hooks.ctx, w.barrier_ticket);
         } else |e| {
             log.warn("journal lane {d}: barrier failed: {s}", .{ self.index, @errorName(e) });

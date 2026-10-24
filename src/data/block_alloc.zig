@@ -221,7 +221,8 @@ pub const State = enum(u8) {
     free = 1,
     allocated = 2,
     /// `beginFree` ran (incarnation retired, refcount 0), `finishFree` has
-    /// not: the queue, the elision path or the debt drainer owns it.
+    /// not: the reclaimer's durability hold, the queue, the elision path or
+    /// the debt drainer owns it.
     limbo = 3,
     /// Taken out of the free list by a trim claim window; pending supply,
     /// never a deficit.
@@ -627,6 +628,9 @@ pub const BlockAllocator = struct {
     epoch_map: ?[]Atomic(u64) = null,
     /// Rung 6: cells in `State.quarantined`; the two-line `finishFree` gate.
     quarantine_count: Atomic(u64) = .init(0),
+    /// Terminal frees in `limbo` the reclaimer's durability hold keeps
+    /// until their records are durable (`reachableFreeBlocks`).
+    durable_held: Atomic(u64) = .init(0),
     forensics: ?ForensicsTape = null,
     // ---- the seams (null = the unarmed, byte-identical path) ----
     plane_gate: ?PlaneGate = null,
@@ -1570,10 +1574,23 @@ pub const BlockAllocator = struct {
         return self.virginBlocks() + self.freeBlocksCount();
     }
 
-    /// `virgin + free-listed + inside trim windows`: a window is pending
-    /// supply, never a deficit.
+    /// `virgin + free-listed + inside trim windows + held for durability`:
+    /// a window is pending supply, never a deficit; a held free returns
+    /// within one barrier interval, or at once under the ENOSPC valve's
+    /// pulled barrier (`reclaim`'s durability hold) — `df` counts it free,
+    /// as ext4 counts the blocks its running transaction freed.
     pub fn reachableFreeBlocks(self: *const BlockAllocator) u64 {
-        return self.freeSupplyBlocks() + self.trim_windowed.load(.acquire);
+        return self.freeSupplyBlocks() + self.trim_windowed.load(.acquire) + self.durable_held.load(.acquire);
+    }
+
+    /// A terminal free in `limbo` waits for its record to be durable
+    /// (`reclaim`'s durability hold): counted as supply in sight.
+    pub fn holdForDurability(self: *BlockAllocator) void {
+        _ = self.durable_held.fetchAdd(1, .acq_rel);
+    }
+
+    pub fn releaseFromDurability(self: *BlockAllocator) void {
+        _ = self.durable_held.fetchSub(1, .acq_rel);
     }
 
     /// `highest − free` on a local allocator; on an armed one the bitmap

@@ -544,6 +544,24 @@ pub const MetaSet = struct {
         for (self.volumes) |be| try be.fsync();
     }
 
+    /// The freed-block hold's seal (charter §6.2): per member, the
+    /// reservation high-water mark NOW — every commit answered before this
+    /// call (its window reserved before its apply, its apply before its
+    /// answer) lies below it. `out.len == volumes.len`.
+    pub fn durabilityMarks(self: *MetaSet, out: []u64) void {
+        std.debug.assert(out.len == self.volumes.len);
+        if (self.posture == .reader) return @memset(out, 0);
+        for (self.volumes, out) |be, *m| m.* = be.cv.reservedHwm();
+    }
+
+    /// Every member's last completed barrier covers its mark: the records
+    /// below `marks` are on stable media. A reader writes nothing.
+    pub fn marksDurable(self: *MetaSet, marks: []const u64) bool {
+        if (self.posture == .reader) return true;
+        for (self.volumes, marks) |be, m| if (be.lane.durableFloor() < m) return false;
+        return true;
+    }
+
     /// One full cycle with an immediate barrier on every member.
     pub fn checkpointNow(self: *MetaSet) checkpoint_cycle.CycleError!void {
         if (self.posture == .reader) return;

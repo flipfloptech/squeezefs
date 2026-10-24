@@ -10,7 +10,8 @@
 //! The terminal-free ladder: `beginFree` (retire the incarnation) → tier
 //! purge (ONE helper over all four read tiers, after the retire, before
 //! reallocatable: a straggler validated fill either landed before the
-//! purge or fails its own `still`) → ELIDE on a block device while `debt ≤
+//! purge or fails its own `still`) → the DURABILITY HOLD (below) → ELIDE on
+//! a block device while `debt ≤
 //! virgin_bytes` (`recordElidedDebt` + `finishFree`, ZERO device commands)
 //! or ENQUEUE (the queue owns `finishFree`: a block becomes reallocatable
 //! only after its discard landed, so a new owner's DMA can never race it).
@@ -24,6 +25,35 @@
 //! the watermark `debt ≤ virgin`: while the virgin tail covers the debt the
 //! thin exposure is bounded by what fresh-minting would have consumed anyway
 //! (KD-4.6, no constants).
+//!
+//! THE DURABILITY HOLD (charter §6.2; decision 0003 §BT): a block freed by
+//! a metadata change returns to allocation — and to the device's discard —
+//! only once the record that freed it is DURABLE (landed AND covered by a
+//! completed barrier on every metadata member). Under the ack posture
+//! (§5.2) a truncate, a punch or an unlink is answered at its RAM apply and
+//! its window reaches stable media up to one flush interval later; a block
+//! handed on at the apply took another file's bytes while the old file's
+//! durable map still named it, and a power cut in between replayed that
+//! map over them (the smoke row `A FREED BLOCK IS NOT REUSED BEFORE THE
+//! RECORD THAT FREED IT IS DURABLE`: the truncated file read 4 MiB of the
+//! next writer's bytes). ext4 holds its freed blocks until the transaction
+//! that freed them commits; this is the same law. Mechanism: a terminal
+//! free (after the retire and the purge, so stale readers fail as before)
+//! is pushed on the OPEN list under the hold's lock; a release takes the
+//! lock, and when the SEALED list is empty moves the open list there and
+//! has the gate snapshot every member's reservation high-water mark — every
+//! commit answered before the snapshot lies below it, and every free on the
+//! sealed list was pushed after its commit's answer — then hands the sealed
+//! list to the ladder's device side once each member's durable floor (the
+//! landed floor of its last completed barrier) passes its mark. Releases
+//! ride the producer's own free, the worker's manners tick while frees are
+//! held, and the ENOSPC valve's drain, which FORCES a barrier first (a full
+//! store never answers ENOSPC while frees wait for one). A held free is
+//! supply in sight: `df` and the write admission count it free
+//! (`BlockAllocator.durable_held`), the valve's `pending` sees it. A
+//! non-holder's shipped free is held the same way before it ships. The
+//! model: `free_hold_model.zig` (the seal outside the lock, and a release
+//! on the LANDED floor, both fail).
 //!
 //! The queue: pop-ownership exactly-once (whoever pops processes — the
 //! worker, the valve drain, the unmount drain; nothing is ever re-queued);
@@ -396,6 +426,23 @@ pub const FreeTarget = struct {
     authorityActive: *const fn (*anyopaque) bool,
 };
 
+/// The metadata set's durability as the hold sees it (module doc). `seal`
+/// snapshots, into the gate's ONE sealed slot, every member's mark that
+/// each commit answered before the call lies below — called only under the
+/// hold's lock; `sealed` answers whether completed barriers cover that
+/// snapshot; `force` pulls a barrier on every member and waits for it
+/// (false: a member FAILED — nothing more becomes durable this mount).
+pub const DurableGate = struct {
+    ctx: *anyopaque,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        seal: *const fn (*anyopaque) void,
+        sealed: *const fn (*anyopaque) bool,
+        force: *const fn (*anyopaque) bool,
+    };
+};
+
 // ---------------------------------------------------------------------------
 // Stats (spec §7).
 // ---------------------------------------------------------------------------
@@ -438,14 +485,21 @@ pub const stats = struct {
     /// and the pace it derives from it under foreground load.
     pub var block_free_debt_drain_rate: counters.Gauge = .{};
     pub var block_free_debt_pace_ms: counters.Gauge = .{};
+    /// The durability hold: frees held until their records are durable,
+    /// released, forced (a barrier pulled by the ENOSPC valve or the
+    /// dismount drain), and the frees held now.
+    pub var block_free_durable_holds: counters.ShardedCounter = .{};
+    pub var block_free_durable_releases: counters.ShardedCounter = .{};
+    pub var block_free_durable_forced: counters.ShardedCounter = .{};
+    pub var block_free_durable_held: counters.Gauge = .{};
 };
 
 pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
     try w.writeAll("{");
-    inline for (.{ "terminal_frees", "block_free_reclaim_queued", "block_free_reclaim_elided", "block_free_discards", "block_free_discard_bytes", "block_free_file_punches", "block_free_punch_bytes", "block_free_reclaim_skipped", "block_free_reclaim_batches", "block_free_reclaim_commands", "block_free_reclaim_sync_drains", "block_free_reclaim_cap_parks", "block_free_reclaim_cap_overflow", "block_free_reclaim_supply_drains", "block_free_reclaim_deferred_ticks", "block_free_trim_discards", "block_free_trim_bytes", "block_free_debt_pressure_drains", "block_free_debt_drain_passes", "block_free_debt_fruitless_passes", "block_free_reclaim_fence_halts" }) |name| {
+    inline for (.{ "terminal_frees", "block_free_reclaim_queued", "block_free_reclaim_elided", "block_free_discards", "block_free_discard_bytes", "block_free_file_punches", "block_free_punch_bytes", "block_free_reclaim_skipped", "block_free_reclaim_batches", "block_free_reclaim_commands", "block_free_reclaim_sync_drains", "block_free_reclaim_cap_parks", "block_free_reclaim_cap_overflow", "block_free_reclaim_supply_drains", "block_free_reclaim_deferred_ticks", "block_free_trim_discards", "block_free_trim_bytes", "block_free_debt_pressure_drains", "block_free_debt_drain_passes", "block_free_debt_fruitless_passes", "block_free_reclaim_fence_halts", "block_free_durable_holds", "block_free_durable_releases", "block_free_durable_forced" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, @field(stats, name).load() });
     }
-    inline for (.{ "block_free_reclaim_queue_bytes", "block_free_elided_debt_bytes", "block_free_reclaim_drain_rate", "block_free_reclaim_arrival_rate", "block_free_reclaim_queue_cap", "block_free_reclaim_park_bound_ms", "block_free_debt_drain_rate", "block_free_debt_pace_ms" }) |name| {
+    inline for (.{ "block_free_reclaim_queue_bytes", "block_free_elided_debt_bytes", "block_free_reclaim_drain_rate", "block_free_reclaim_arrival_rate", "block_free_reclaim_queue_cap", "block_free_reclaim_park_bound_ms", "block_free_debt_drain_rate", "block_free_debt_pace_ms", "block_free_durable_held" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, @field(stats, name).load() });
     }
     inline for (.{ "block_key_incarnation_refusals", "block_free_reclaim_dismount_halts" }) |name| {
@@ -515,6 +569,14 @@ pub const Entry = struct {
     guard: InflightAllocGuard,
     size: u32,
     vol: u16,
+};
+
+/// A free the durability hold keeps: the ladder's device side, or a
+/// non-holder's ship, once its record is durable. The registration is
+/// fsck visibility for the hold's residency, as for the queue's.
+const Held = struct {
+    entry: Entry,
+    ship: bool,
 };
 
 const VolRow = struct {
@@ -593,6 +655,17 @@ pub const Reclaimer = struct {
     debt_fg_last: u64 = 0,
     /// The trim venue's completion rate (one pass's serial commands).
     debt_meter: RateMeter = .{},
+    // ---- the durability hold (module doc) ----
+    /// Null = every free is durable at its answer (no metadata set behind
+    /// this reclaimer: the portable contracts, the offline tools' scratch).
+    durable_gate: ?DurableGate = null,
+    hold_lock: jc.SpinLock = .{},
+    /// Frees pushed since the last seal (no mark covers them yet).
+    hold_open: std.ArrayList(Held) = .empty,
+    /// Frees the gate's sealed marks cover.
+    hold_sealed: std.ArrayList(Held) = .empty,
+    /// Both lists' population (the valve's and the parks' supply in sight).
+    held: Atomic(u64) = .init(0),
 
     pub fn init(gpa: Allocator, cfg: Config) Allocator.Error!*Reclaimer {
         const self = try gpa.create(Reclaimer);
@@ -620,6 +693,9 @@ pub const Reclaimer = struct {
     /// `stop` first (the tasks must have been joined).
     pub fn deinit(self: *Reclaimer) void {
         assert(self.worker == null and self.drainer == null);
+        assert(self.held.load(.acquire) == 0);
+        self.hold_open.deinit(self.gpa);
+        self.hold_sealed.deinit(self.gpa);
         self.overflow.deinit(self.gpa);
         self.q.deinit(self.gpa);
         self.free_cells.deinit(self.gpa);
@@ -641,6 +717,12 @@ pub const Reclaimer = struct {
     /// Rung 6: install (or clear) the free target of a data volume.
     pub fn setFreeTarget(self: *Reclaimer, vol: u16, t: ?FreeTarget) void {
         self.vols[vol].?.free_target = t;
+    }
+
+    /// Install the durability hold's gate (before `start`).
+    pub fn setDurableGate(self: *Reclaimer, g: DurableGate) void {
+        assert(self.worker == null);
+        self.durable_gate = g;
     }
 
     pub fn setTierPurge(self: *Reclaimer, p: TierPurge) void {
@@ -691,6 +773,12 @@ pub const Reclaimer = struct {
         // runs the ladder here.
         if (row.free_target) |t| if (!t.authorityActive(t.ctx)) {
             if (!self.cfg.test_ship_every_free and alloc.releaseUnlessLast(idx)) return .nonterminal;
+            // The holder reallocates what it is shipped at once: the ship
+            // waits here until this mount's freeing record is durable.
+            if (self.durable_gate != null) {
+                self.hold(io, .{ .entry = .{ .guard = InflightAllocGuard.register(alloc, idx), .size = @intCast(alloc.blockSize()), .vol = vol }, .ship = true });
+                return .nonterminal;
+            }
             return if (t.ship(t.ctx, alloc.volTag(), idx)) .nonterminal else .refused;
         };
         // Step 5: `begin_free` (the SHARED gate and the untracked gate
@@ -704,27 +792,178 @@ pub const Reclaimer = struct {
         stats.terminal_frees.inc();
         // Step 6: the tier purge — after the retire, before reallocatable.
         if (self.tier_purge) |p| p.purge(p.ctx, vol, idx);
-        // Step 7: elision. The drainer parks without a deadline once a pass
-        // finds no debt, so every 0 → > 0 transition of a volume's debt
-        // wakes it (the one-shot "first elided free of the volume" wake left
-        // it asleep for whole legs whenever reuse cancelled every debt block
-        // between two passes: 0 trim discards on the aging store's later
-        // legs). `notifyOne` keeps one permit, so a wake landing mid-pass
-        // is the next park's immediate return.
+        const e: Entry = .{ .guard = InflightAllocGuard.register(alloc, idx), .size = @intCast(alloc.blockSize()), .vol = vol };
+        // Step 6½: the durability hold — reallocatable (or discarded) only
+        // once the record that freed it is durable (module doc).
+        if (self.durable_gate != null) {
+            alloc.holdForDurability();
+            self.hold(io, .{ .entry = e, .ship = false });
+            return .terminal;
+        }
+        _ = self.deviceSide(io, e, true);
+        return .terminal;
+    }
+
+    /// Steps 7–8, the free's device side: ELIDED (debt + `finishFree`, zero
+    /// device commands) or QUEUED (the queue owns `finishFree`). The
+    /// drainer parks without a deadline once a pass finds no debt, so every
+    /// 0 → > 0 transition of a volume's debt wakes it (the one-shot "first
+    /// elided free of the volume" wake left it asleep for whole legs
+    /// whenever reuse cancelled every debt block between two passes: 0 trim
+    /// discards on the aging store's later legs). `notifyOne` keeps one
+    /// permit, so a wake landing mid-pass is the next park's immediate
+    /// return. `can_park` = an at-cap enqueue parks (the producer's form;
+    /// the worker and the synchronous drain would wait on themselves).
+    /// True = elided.
+    fn deviceSide(self: *Reclaimer, io: Io, entry: Entry, can_park: bool) bool {
+        const row = &self.vols[entry.vol].?;
+        const alloc = row.alloc;
         if (elideReclaimFor(self.cfg.elision, row.target.substrate, self.cfg.elision_class_all)) {
+            var g = entry.guard;
             const was_clear = alloc.elidedDebtBytes() == 0;
-            alloc.recordElidedDebt(idx);
-            alloc.finishFree(idx);
+            alloc.recordElidedDebt(g.idx);
+            alloc.finishFree(g.idx);
+            g.deinit();
             alloc.supply_edge.notifyWaiters(io);
             stats.block_free_reclaim_elided.inc();
             stats.block_free_elided_debt_bytes.set(self.totalDebtBytes());
             row.debt_target.store(true, .release);
             if (was_clear) self.debt_wake.notifyOne(io);
-            return .terminal;
+            return true;
         }
-        // Step 8: the queue owns `finishFree`.
-        self.enqueue(io, .{ .guard = InflightAllocGuard.register(alloc, idx), .size = @intCast(alloc.blockSize()), .vol = vol });
-        return .terminal;
+        self.enqueueParking(io, entry, can_park);
+        return false;
+    }
+
+    // ---- the durability hold (module doc) ----
+
+    /// Push a free on the open list; release what is durable already. An
+    /// allocator too dry to grow the list forces the barrier inline: the
+    /// free's record was answered, so a barrier pulled now covers it.
+    fn hold(self: *Reclaimer, io: Io, h: Held) void {
+        self.hold_lock.lock();
+        // Read under the lock `dropHeld` takes after the stop latched: a
+        // free arriving behind the teardown is dropped here, never left.
+        if (self.stop.load(.acquire)) {
+            self.hold_lock.unlock();
+            return self.dropOne(h);
+        }
+        const pushed = if (self.hold_open.append(self.gpa, h)) true else |_| false;
+        // Counted under the lock: a release that takes it sees the count.
+        if (pushed) _ = self.held.fetchAdd(1, .acq_rel);
+        self.hold_lock.unlock();
+        stats.block_free_durable_holds.inc();
+        if (!pushed) {
+            stats.block_free_durable_forced.inc();
+            if (self.durable_gate.?.vtable.force(self.durable_gate.?.ctx)) {
+                _ = self.held.fetchAdd(1, .acq_rel);
+                self.releaseOne(io, h, true);
+            } else self.dropOne(h);
+            return;
+        }
+        stats.block_free_durable_held.set(self.held.load(.acquire));
+        _ = self.releaseDurable(io, true);
+        // The worker ticks while frees are held (its idle park has none).
+        self.wake.notifyOne(io);
+    }
+
+    /// Hand every free whose record is durable to its device side; seal the
+    /// open list when the sealed one is empty. Returns the frees released.
+    fn releaseDurable(self: *Reclaimer, io: Io, can_park: bool) u64 {
+        const gate = self.durable_gate orelse return 0;
+        var released: u64 = 0;
+        var chunk: [64]Held = undefined;
+        while (self.held.load(.acquire) != 0) {
+            var n: usize = 0;
+            self.hold_lock.lock();
+            if (self.hold_sealed.items.len == 0 and self.hold_open.items.len != 0) {
+                // The swap and the snapshot under ONE hold of the lock: every
+                // free on the list was pushed (under it) after its commit's
+                // answer, so the marks taken now cover each one's record.
+                std.mem.swap(std.ArrayList(Held), &self.hold_open, &self.hold_sealed);
+                gate.vtable.seal(gate.ctx);
+            }
+            if (self.hold_sealed.items.len != 0 and gate.vtable.sealed(gate.ctx)) {
+                n = @min(chunk.len, self.hold_sealed.items.len);
+                const rest = self.hold_sealed.items.len - n;
+                @memcpy(chunk[0..n], self.hold_sealed.items[rest..]);
+                self.hold_sealed.shrinkRetainingCapacity(rest);
+            }
+            self.hold_lock.unlock();
+            if (n == 0) break;
+            for (chunk[0..n]) |h| self.releaseOne(io, h, can_park);
+            released += n;
+        }
+        if (released != 0) stats.block_free_durable_held.set(self.held.load(.acquire));
+        return released;
+    }
+
+    /// The ENOSPC valve's and the dismount's form: every free held now is
+    /// sealed under fresh marks, a barrier is pulled on every member and
+    /// waited for, and the sealed frees are released.
+    fn forceDurable(self: *Reclaimer, io: Io) u64 {
+        const gate = self.durable_gate orelse return 0;
+        if (self.held.load(.acquire) == 0) return 0;
+        self.hold_lock.lock();
+        // Fresh marks cover the sealed frees as well (marks only grow).
+        const merged = if (self.hold_sealed.appendSlice(self.gpa, self.hold_open.items)) true else |_| false;
+        if (merged) {
+            self.hold_open.clearRetainingCapacity();
+            gate.vtable.seal(gate.ctx);
+        }
+        self.hold_lock.unlock();
+        stats.block_free_durable_forced.inc();
+        if (!gate.vtable.force(gate.ctx)) return 0;
+        return self.releaseDurable(io, false);
+    }
+
+    fn releaseOne(self: *Reclaimer, io: Io, h: Held, can_park: bool) void {
+        _ = self.held.fetchSub(1, .acq_rel);
+        stats.block_free_durable_releases.inc();
+        const row = &self.vols[h.entry.vol].?;
+        if (h.ship) {
+            var g = h.entry.guard;
+            defer g.deinit();
+            // A writer plane torn down meanwhile ships nothing (it forced its
+            // held frees first, `forceHeld`): the block is durably
+            // unreferenced and the holder's next derivation returns it.
+            const t = row.free_target orelse return;
+            _ = t.ship(t.ctx, row.alloc.volTag(), g.idx);
+            return;
+        }
+        row.alloc.releaseFromDurability();
+        // An elided free returned its block now: the valve's progress.
+        if (self.deviceSide(io, h.entry, can_park)) _ = self.finished_total.fetchAdd(1, .acq_rel);
+    }
+
+    /// A free whose record never became durable this mount (a FAILED
+    /// member, the teardown): its block stays in limbo, unreallocated — the
+    /// next mount derives the free space from the durable refs.
+    fn dropOne(self: *Reclaimer, h: Held) void {
+        var g = h.entry.guard;
+        if (!h.ship) self.vols[h.entry.vol].?.alloc.releaseFromDurability();
+        g.deinit();
+    }
+
+    fn dropHeld(self: *Reclaimer) void {
+        self.hold_lock.lock();
+        defer self.hold_lock.unlock();
+        for ([_]*std.ArrayList(Held){ &self.hold_open, &self.hold_sealed }) |list| {
+            for (list.items) |h| self.dropOne(h);
+            _ = self.held.fetchSub(list.items.len, .acq_rel);
+            list.clearRetainingCapacity();
+        }
+        stats.block_free_durable_held.set(self.held.load(.acquire));
+    }
+
+    /// A writer plane's teardown: every held free made durable and shipped
+    /// before its free target goes.
+    pub fn forceHeld(self: *Reclaimer, io: Io) u64 {
+        return self.forceDurable(io);
+    }
+
+    pub fn heldFrees(self: *const Reclaimer) u64 {
+        return self.held.load(.acquire);
     }
 
     fn totalDebtBytes(self: *Reclaimer) u64 {
@@ -745,7 +984,7 @@ pub const Reclaimer = struct {
         return self.len.load(.acquire);
     }
 
-    fn enqueue(self: *Reclaimer, io: Io, entry: Entry) void {
+    fn enqueueParking(self: *Reclaimer, io: Io, entry: Entry, can_park: bool) void {
         var e = entry;
         if (self.cfg.read_only) {
             // A reader's discard is the one hazard that destroys data.
@@ -756,7 +995,7 @@ pub const Reclaimer = struct {
         }
         stats.block_free_reclaim_queued.inc();
         _ = self.arrivals.fetchAdd(1, .monotonic);
-        if (self.population() >= self.cap.load(.monotonic) and !self.fenceHalted()) self.parkAtCap(io);
+        if (can_park and self.population() >= self.cap.load(.monotonic) and !self.fenceHalted()) self.parkAtCap(io);
         stats.block_free_reclaim_queue_bytes.add(e.size);
         if (self.vols[e.vol]) |*row| _ = row.queued.fetchAdd(1, .monotonic);
         _ = self.len.fetchAdd(1, .acq_rel);
@@ -885,9 +1124,9 @@ pub const Reclaimer = struct {
         self.dismounted.store(true, .release);
     }
 
-    /// `!fence_halted ∧ (len > 0 ∨ processing > 0)`.
+    /// `!fence_halted ∧ (len > 0 ∨ processing > 0 ∨ held > 0)`.
     pub fn pending(self: *Reclaimer) bool {
-        return !self.fenceHalted() and (self.len.load(.acquire) > 0 or self.processing.load(.acquire) > 0);
+        return !self.fenceHalted() and (self.len.load(.acquire) > 0 or self.processing.load(.acquire) > 0 or self.held.load(.acquire) > 0);
     }
 
     pub fn finishedTotal(self: *const Reclaimer) u64 {
@@ -1116,6 +1355,10 @@ pub const Reclaimer = struct {
             d.await(io);
             self.drainer = null;
         }
+        // What the dismount's forced drain could not make durable (a FAILED
+        // member) stays unreallocated, its registrations dropped while the
+        // allocators are still open.
+        self.dropHeld();
     }
 
     fn foregroundActive(self: *Reclaimer) bool {
@@ -1147,13 +1390,20 @@ pub const Reclaimer = struct {
 
     fn workerMain(self: *Reclaimer, io: Io) void {
         while (!self.stop.load(.acquire)) {
-            // Park until an arrival (or a parked producer's cap-wake).
-            if (self.len.load(.acquire) == 0 and !self.parkWake(io, &self.wake, std.math.maxInt(u64))) return;
+            _ = self.releaseDurable(io, false);
+            // Park until an arrival (or a parked producer's cap-wake); a
+            // held free ticks the park until its record is durable.
+            if (self.len.load(.acquire) == 0) {
+                const deadline = if (self.held.load(.acquire) != 0) clock.monotonicNs() + MANNERS_TICK_MS * std.time.ns_per_ms else std.math.maxInt(u64);
+                if (!self.parkWake(io, &self.wake, deadline)) return;
+                if (self.len.load(.acquire) == 0) continue;
+            }
             // The accumulation window: displaced blocks of one stream arrive
             // back-to-back; a short wait lets them coalesce (only an at-cap
             // producer cuts it short).
             if (self.cfg.batch_ms != 0 and !self.parkWake(io, &self.cap_wake, clock.monotonicNs() + self.cfg.batch_ms * std.time.ns_per_ms)) return;
             while (!self.stop.load(.acquire)) {
+                _ = self.releaseDurable(io, false);
                 self.sampleArrivals(io);
                 const at_cap = self.population() >= self.cap.load(.monotonic);
                 const pressure = self.anySupplyPressure();
@@ -1243,7 +1493,9 @@ pub const Reclaimer = struct {
     /// no 30 s constant). Returns the entries THIS drain processed; counts
     /// `sync_drains` only when ≥ 1 (contract 8).
     pub fn drainSync(self: *Reclaimer, io: Io) u64 {
-        var processed: u64 = 0;
+        // Held frees first, under a pulled barrier: a full store never
+        // answers ENOSPC while frees wait for one (module doc).
+        var processed: u64 = self.forceDurable(io);
         var batch: [64]Entry = undefined;
         while (true) {
             const n = self.takeBatch(&batch);
@@ -1775,6 +2027,137 @@ test "elided_terminal_free_is_reallocatable_with_zero_device_commands; the lever
     try testing.expectEqual(@as(u64, 1), f.r.drainSync(io));
     try testing.expectEqual(@as(usize, 1), f.rec.commands.items.len);
     try testing.expectEqual(discards0 + 1, stats.block_free_discards.load());
+}
+
+/// The metadata set as the durability hold sees it: `hwm` is the mark
+/// every commit answered so far lies below, `durable` the floor completed
+/// barriers cover; `force` is a barrier pulled now.
+const FakeGate = struct {
+    hwm: u64 = 0,
+    durable: u64 = 0,
+    sealed_mark: u64 = 0,
+    seals: u64 = 0,
+    forces: u64 = 0,
+
+    fn gate(self: *FakeGate) DurableGate {
+        return .{ .ctx = self, .vtable = &vtable };
+    }
+
+    const vtable: DurableGate.VTable = .{ .seal = &seal, .sealed = &sealed, .force = &force };
+
+    fn seal(ctx: *anyopaque) void {
+        const g: *FakeGate = @ptrCast(@alignCast(ctx));
+        g.sealed_mark = g.hwm;
+        g.seals += 1;
+    }
+
+    fn sealed(ctx: *anyopaque) bool {
+        const g: *FakeGate = @ptrCast(@alignCast(ctx));
+        return g.durable >= g.sealed_mark;
+    }
+
+    fn force(ctx: *anyopaque) bool {
+        const g: *FakeGate = @ptrCast(@alignCast(ctx));
+        g.forces += 1;
+        g.durable = g.hwm;
+        return true;
+    }
+};
+
+test "the durability hold (charter §6.2, decision 0003 §BT): a terminal free stays in limbo — supply in sight, never reallocated — until the barrier covering its record completes; a later free rides the next seal; the release is the ladder's device side; the dismount/valve drain pulls the barrier; a non-holder's ship waits the same way" {
+    const io = testing.io;
+    var f = try Fixture.init(.{ .budget_bytes = test_budget, .batch_ms = 0 }, .bdev_discard, 16);
+    defer f.deinit();
+    var g: FakeGate = .{};
+    f.r.setDurableGate(g.gate());
+    try f.mintPublished(4);
+    const elided0 = stats.block_free_reclaim_elided.load();
+    const holds0 = stats.block_free_durable_holds.load();
+    const releases0 = stats.block_free_durable_releases.load();
+    const forced0 = stats.block_free_durable_forced.load();
+    const reachable0 = f.alloc.reachableFreeBlocks();
+    // The freeing commit's window was reserved (mark 1) and answered; its
+    // barrier has not completed.
+    g.hwm = 1;
+    try testing.expectEqual(FreeOutcome.terminal, f.r.freeBlock(io, 0, 1, f.alloc.stampOf(1)));
+    try testing.expectEqual(block_alloc.State.limbo, f.alloc.stateOf(1));
+    try testing.expect(f.alloc.inflightContains(1));
+    try testing.expectEqual(@as(u64, 1), f.r.heldFrees());
+    try testing.expectEqual(holds0 + 1, stats.block_free_durable_holds.load());
+    try testing.expectEqual(elided0, stats.block_free_reclaim_elided.load());
+    try testing.expectEqual(@as(u64, 0), f.alloc.elidedDebtBytes()); // nothing discards it either
+    // Supply in sight: `df` counts it free, the valve's predicate sees it.
+    try testing.expectEqual(reachable0 + 1, f.alloc.reachableFreeBlocks());
+    try testing.expect(f.r.pending());
+    // A mint meanwhile is never the held block.
+    try testing.expectEqual(@as(u64, 4), (try f.alloc.allocateBlock()).idx);
+    f.alloc.publishBlock(4);
+    // The barrier covering mark 1 completes; the next free (mark 2) releases
+    // the sealed one and is held itself.
+    g.durable = 1;
+    g.hwm = 2;
+    try testing.expectEqual(FreeOutcome.terminal, f.r.freeBlock(io, 0, 2, f.alloc.stampOf(2)));
+    try testing.expectEqual(block_alloc.State.free, f.alloc.stateOf(1));
+    try testing.expect(!f.alloc.inflightContains(1));
+    try testing.expectEqual(block_alloc.State.limbo, f.alloc.stateOf(2));
+    try testing.expectEqual(@as(u64, 1), f.r.heldFrees());
+    try testing.expectEqual(releases0 + 1, stats.block_free_durable_releases.load());
+    try testing.expectEqual(elided0 + 1, stats.block_free_reclaim_elided.load());
+    try testing.expectEqual(@as(u64, 1), (try f.alloc.allocateBlock()).idx);
+    f.alloc.publishBlock(1);
+    // The synchronous drain pulls the barrier: everything held is released.
+    _ = f.r.drainSync(io);
+    try testing.expectEqual(forced0 + 1, stats.block_free_durable_forced.load());
+    try testing.expectEqual(@as(u64, 1), g.forces);
+    try testing.expectEqual(block_alloc.State.free, f.alloc.stateOf(2));
+    try testing.expectEqual(@as(u64, 0), f.r.heldFrees());
+    try testing.expect(!f.r.pending());
+    try testing.expectEqual(reachable0, f.alloc.reachableFreeBlocks()); // block 4 minted, block 2 returned
+    // A non-holder's last reference ships only once its record is durable.
+    const Holder = struct {
+        n: usize = 0,
+        fn ship(ctx: *anyopaque, _: u64, _: u64) bool {
+            const h: *@This() = @ptrCast(@alignCast(ctx));
+            h.n += 1;
+            return true;
+        }
+        fn active(_: *anyopaque) bool {
+            return false;
+        }
+    };
+    var holder: Holder = .{};
+    f.r.setFreeTarget(0, .{ .ctx = &holder, .ship = &Holder.ship, .authorityActive = &Holder.active });
+    g.hwm = 3;
+    try testing.expectEqual(FreeOutcome.nonterminal, f.r.freeBlock(io, 0, 3, f.alloc.stampOf(3)));
+    try testing.expectEqual(@as(usize, 0), holder.n);
+    try testing.expectEqual(@as(u64, 1), f.r.heldFrees());
+    g.durable = 3;
+    _ = f.r.releaseDurable(io, false);
+    try testing.expectEqual(@as(usize, 1), holder.n);
+    try testing.expectEqual(@as(u64, 0), f.r.heldFrees());
+    try testing.expect(!f.alloc.inflightContains(3));
+}
+
+test "a full store whose frees wait for their records' barrier never answers ENOSPC: the valve's drain pulls the barrier and the mint lands on the released block (charter §6.2)" {
+    const io = testing.io;
+    const enospc = @import("enospc.zig");
+    var f = try Fixture.init(.{ .budget_bytes = test_budget, .batch_ms = 0 }, .bdev_discard, 8);
+    defer f.deinit();
+    var g: FakeGate = .{};
+    f.r.setDurableGate(g.gate());
+    try f.mintPublished(8);
+    try testing.expectError(error.StorageFull, f.alloc.allocateBlock());
+    g.hwm = 7;
+    try testing.expectEqual(FreeOutcome.terminal, f.r.freeBlock(io, 0, 5, f.alloc.stampOf(5)));
+    try testing.expectEqual(@as(u64, 1), f.r.heldFrees());
+    try testing.expectError(error.StorageFull, f.alloc.allocateBlock());
+    const m = try enospc.allocateWithValve(f.alloc, io, enospc.Valve.fromReclaimer(f.r));
+    try testing.expectEqual(@as(u64, 5), m.idx);
+    try testing.expectEqual(@as(u64, 1), g.forces);
+    f.alloc.publishBlock(5);
+    // With nothing held the valve's verdict stands: terminal, no barrier.
+    try testing.expectError(error.StorageFull, enospc.allocateWithValve(f.alloc, io, enospc.Valve.fromReclaimer(f.r)));
+    try testing.expectEqual(@as(u64, 1), g.forces);
 }
 
 test "trim_drains_debt_with_counted_commands_and_returns_offsets; stale debt never discards an owned block; a fenced daemon never trims" {

@@ -749,6 +749,9 @@ pub const WriterPlane = struct {
     }
 
     pub fn destroy(self: *WriterPlane) void {
+        // The frees the durability hold keeps ship first: their records made
+        // durable under one pulled barrier (charter §6.2).
+        _ = self.plane.reclaimer.forceHeld(self.io);
         for (self.armedVols()) |*v| {
             // The pending frees ship; every unconsumed run of the window
             // RETURNS to the holder (its bits clear again) — a leave never

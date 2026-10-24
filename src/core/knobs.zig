@@ -14,7 +14,8 @@
 //!   - a RETIRED knob with any present value refuses naming its successor
 //!     (forward-only — never a silent alias);
 //!   - a malformed knob refuses the PROCESS at startup, naming every offender
-//!     at once (`refusalReport`); no call site may panic on a knob value and
+//!     at once (`refusalReport`) — so does a pair of values that cannot hold
+//!     together (`exclusions`); no call site may panic on a knob value and
 //!     none may silently default one;
 //!   - an unregistered `SQUEEZEFS_*`/`SQZ_*` name is announced as a probable
 //!     typo, never refused (mixed-version fleets and the shim's client-side
@@ -108,9 +109,9 @@ pub const registry = [_]Knob{
     // ---- metadata commit pipeline (journal lane) ----
     .{ .key = "SQUEEZEFS_META_FLUSH_INTERVAL_MS", .kind = .{ .int = .{ .lo = 0, .hi = MS_MAX } }, .default = "50", .class = .ab_lever, .doc = "Coalesced journal barrier period, ms (the durability lane sets needs_flush and barriers at this cadence). A/B lever: 0 is the strict control arm — ONE barrier per group before any ack." },
     .{ .key = "SQUEEZEFS_META_APPLIERS", .kind = .{ .int = .{ .lo = 0, .hi = 64 } }, .default = "derived", .class = .ab_lever, .doc = "The conveyor's applier venue (decision 0003 §AW): how many handler lanes take a window's RAM apply, encode and submit off the journal lane, each window on the lane its parent-side tree hashes to; derived `clamp(cpus / 8, 2, 4)` (`conveyor.applierParallelism`). Shipped ON since the overlay became a persistent chunked run (rung-10-create-path, wave 2): on mdtest -np 32 -u against the inline arm, 4 lanes read file removal 1.33×, directory creation 1.05× and removal 1.22× with file creation and the shared-directory shapes inside their spread. A/B lever: 0 is the control arm — the pass applies on the journal lane before it submits, as the reference ran it." },
-    .{ .key = "SQUEEZEFS_META_PASS_VENUE", .kind = .{ .enumeration = .{ .allowed = &.{ "lane", "committer" } } }, .default = "lane", .class = .ab_lever, .doc = "Where the conveyor's PASS runs (charter §5.2; rung-10-create-path wave 3): `lane` — a fiber on the volume's journal lane, woken by the election winner, the batch's apply on the applier venue (SQUEEZEFS_META_APPLIERS); `committer` — the election winner runs the pass AND the apply on its own thread (the election already serializes passes; only the submit and the ack need the lane's ring), so a create's chain is the submit's handoff and the ack's wake. A/B lever: `lane` is the control arm." },
+    .{ .key = "SQUEEZEFS_META_PASS_VENUE", .kind = .{ .enumeration = .{ .allowed = &.{ "lane", "committer" } } }, .default = "lane", .class = .ab_lever, .doc = "Where the conveyor's PASS runs (charter §5.2; rung-10-create-path wave 3): `lane` — a fiber on the volume's journal lane, woken by the election winner, the batch's apply on the applier venue (SQUEEZEFS_META_APPLIERS); `committer` — the election winner runs the pass AND the apply on its own thread (the election already serializes passes; only the submit and the ack need the lane's ring), so a create's chain is the submit's handoff and the ack's wake. A/B lever: `lane` is the control arm. `committer` together with SQUEEZEFS_META_APPLY=self is refused at startup (`exclusions`)." },
     .{ .key = "SQUEEZEFS_META_ACK_POINT", .kind = .{ .enumeration = .{ .allowed = &.{ "apply", "landing" } } }, .default = "apply", .class = .ab_lever, .doc = "Where a metadata commit is ACKED under the coalesced flush cadence (charter §5.2 \"The ack point\", decision 0003 §BB — the owner's ruling of 2026-10-20): `apply` — once the window's RAM apply is published and its image is in the journal tail (the kernel-held mirror the supervisor replays at the daemon's death), durable at the next commit or at fsync/fsyncdir/syncfs; `landing` — after the journal write landed (the former law). Strict mode (SQUEEZEFS_META_FLUSH_INTERVAL_MS=0) acks after the barrier in both arms. A/B lever: `landing` is the control arm." },
-    .{ .key = "SQUEEZEFS_META_APPLY", .kind = .{ .enumeration = .{ .allowed = &.{ "self", "venue" } } }, .default = "venue", .class = .ab_lever, .doc = "Who applies a committed transaction to RAM (charter §5.2; decision 0003 §BC): `self` — the committer itself, on its own thread, once the conveyor pass reserved the batch and stamped its seq (per-transaction leaf locks, no applier hop; the last member of a window hands its image to the lane) — measured +22 % file creation / +38 % removal at 32 ranks on the RAM set and a convoy on the hot leaves at 64 ranks (0.6×/0.3×); `venue` — the pass hands the whole window to an applier fiber (§AW: the union lock, the window's apply on SQUEEZEFS_META_APPLIERS lanes). A/B lever: `venue` ships, the control arm." },
+    .{ .key = "SQUEEZEFS_META_APPLY", .kind = .{ .enumeration = .{ .allowed = &.{ "self", "venue" } } }, .default = "venue", .class = .ab_lever, .doc = "Who applies a committed transaction to RAM (charter §5.2; decision 0003 §BC): `self` — the committer itself, on its own thread, once the conveyor pass reserved the batch and stamped its seq (per-transaction leaf locks, no applier hop; the last member of a window hands its image to the lane) — measured +22 % file creation / +38 % removal at 32 ranks on the RAM set and a convoy on the hot leaves at 64 ranks (0.6×/0.3×); `venue` — the pass hands the whole window to an applier fiber (§AW: the union lock, the window's apply on SQUEEZEFS_META_APPLIERS lanes). A/B lever: `venue` ships, the control arm. `self` together with SQUEEZEFS_META_PASS_VENUE=committer is refused at startup (`exclusions`)." },
     .{ .key = "SQUEEZEFS_META_WINDOW_HOLD", .kind = .{ .enumeration = .{ .allowed = &.{ "derived", "both", "pacing", "none" } } }, .default = "derived", .class = .ab_lever, .doc = "The conveyor pass's holds on a drained batch (charter §5.2; decision 0003 §L, §AW.5, §BA): `both` — the §L pad-majority hold (a batch under the device grain waits for the next landing, bounded by the round-trip predictor and the worth gate) and the §AW pacing hold (the applier venue full); `pacing` — the pacing hold alone; `none` — the pass issues every batch at once; `derived` — `pacing` on a device grain under 4 KiB (the pad a hold saves there is bytes, the wait it costs is a create's queue: mdtest -np 32 -u on the 512-B RAM namespace read every row 1.09–1.13× with the pad hold off, the shared-directory shapes inside their spread, the ring +9 %), `both` at 4 KiB and up (a pad-majority window wastes a page). A/B lever: `both` is the control arm." },
 
     // ---- NVMe block device workers ----
@@ -410,6 +411,42 @@ pub fn lookup(key: []const u8) ?*const Knob {
     return null;
 }
 
+/// One enumeration row at one of its values.
+pub const Setting = struct { key: []const u8, value: []const u8 };
+
+/// A pair of values the startup gate refuses TOGETHER, each admissible
+/// alone: a combination whose mechanism cannot hold. The refusal names
+/// both settings and `why`; the in-process readers never meet the pair.
+pub const Exclusion = struct { a: Setting, b: Setting, why: []const u8 };
+
+pub const exclusions = [_]Exclusion{
+    .{
+        .a = .{ .key = "SQUEEZEFS_META_PASS_VENUE", .value = "committer" },
+        .b = .{ .key = "SQUEEZEFS_META_APPLY", .value = "self" },
+        .why = "a pass run on a committer's thread cannot take its own member's turn while it parks (the window gate, ring admission), and every later window's verdict waits behind that member's window — the volume wedges (decision 0003 §BO.3); keep one lever at its control arm",
+    },
+};
+
+comptime {
+    for (exclusions) |x| for ([_]Setting{ x.a, x.b }) |st| {
+        const r = row(st.key);
+        if (r.kind != .enumeration) @compileError(st.key ++ ": an exclusion names enumeration rows");
+        switch (parseEnum(st.key, st.value, r.kind.enumeration.allowed)) {
+            .value => |v| if (!std.mem.eql(u8, v, st.value)) @compileError(st.key ++ ": an exclusion names the canonical spelling"),
+            else => @compileError(st.key ++ "=" ++ st.value ++ " is not an allowed value"),
+        }
+    };
+}
+
+/// Whether `env` sets `st.key` to `st.value` (any case, trimmed).
+fn setsTo(env: *const std.process.Environ.Map, st: Setting) bool {
+    const r = lookup(st.key).?;
+    return switch (parseEnum(st.key, env.get(st.key), r.kind.enumeration.allowed)) {
+        .value => |v| std.mem.eql(u8, v, st.value),
+        .absent, .invalid => false,
+    };
+}
+
 /// The row of a key known at compile time: an unregistered key is a compile
 /// error, so a reader cannot exist without its row.
 pub fn row(comptime key: []const u8) *const Knob {
@@ -579,7 +616,8 @@ pub fn validateOne(gpa: std.mem.Allocator, knob: *const Knob, raw: []const u8) !
 
 /// Validate every `(key, value)` pair the iterator yields. Keys outside our
 /// namespace are skipped; registered keys validate; unregistered ours land in
-/// `unknown`. Both lists are sorted so the report is deterministic.
+/// `unknown`; every `exclusions` pair the environment sets is an error line.
+/// Both lists are sorted so the report is deterministic.
 pub fn validateVars(gpa: std.mem.Allocator, env: *const std.process.Environ.Map) !Validation {
     var v: Validation = .{};
     errdefer v.deinit(gpa);
@@ -593,6 +631,9 @@ pub fn validateVars(gpa: std.mem.Allocator, env: *const std.process.Environ.Map)
             try v.unknown.append(gpa, try gpa.dupe(u8, key));
         }
     }
+    for (exclusions) |x| if (setsTo(env, x.a) and setsTo(env, x.b)) {
+        try v.errors.append(gpa, try std.fmt.allocPrint(gpa, "{s}='{s}' together with {s}='{s}' is refused: {s}", .{ x.a.key, x.a.value, x.b.key, x.b.value, x.why }));
+    };
     std.mem.sort([]u8, v.errors.items, {}, lessThanBytes);
     std.mem.sort([]u8, v.unknown.items, {}, lessThanBytes);
     return v;
@@ -842,6 +883,29 @@ test "gate: every offender at once, sorted; unknown announced not refused" {
     try testing.expect(std.mem.startsWith(u8, report, "refusing to start: invalid SqueezeFS environment knob(s)\n  - SQUEEZEFS_TEST_META_BUFFERED="));
     try testing.expect(std.mem.endsWith(u8, report, "(a malformed knob is never silently defaulted — fix or unset it; empty means unset)"));
     try testing.expect(std.mem.indexOf(u8, warn.buffered(), "Warning: SQUEEZEFS_NOT_A_KNOB is not a SqueezeFS knob (typo?") != null);
+}
+
+test "gate: SQUEEZEFS_META_PASS_VENUE=committer together with SQUEEZEFS_META_APPLY=self refuses the process naming both knobs and why (a committer-run pass cannot take its own member's turn while it parks: 0003 §BN.6); either lever alone, the shipped pair and the other mixed pair start" {
+    const gpa = testing.allocator;
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    var warn_buf: [256]u8 = undefined;
+    var warn: std.Io.Writer = .fixed(&warn_buf);
+    try testing.expectEqual(@as(?[]u8, null), try refusalReport(gpa, &env, &warn));
+    try env.put("SQUEEZEFS_META_PASS_VENUE", "committer");
+    try testing.expectEqual(@as(?[]u8, null), try refusalReport(gpa, &env, &warn));
+    try env.put("SQUEEZEFS_META_APPLY", "Self");
+    const report = (try refusalReport(gpa, &env, &warn)).?;
+    defer gpa.free(report);
+    try testing.expect(std.mem.indexOf(u8, report, "SQUEEZEFS_META_PASS_VENUE='committer'") != null);
+    try testing.expect(std.mem.indexOf(u8, report, "SQUEEZEFS_META_APPLY='self'") != null);
+    try testing.expect(std.mem.indexOf(u8, report, "its own member's turn") != null);
+    try env.put("SQUEEZEFS_META_PASS_VENUE", "lane");
+    try testing.expectEqual(@as(?[]u8, null), try refusalReport(gpa, &env, &warn));
+    try env.put("SQUEEZEFS_META_APPLY", "venue");
+    try testing.expectEqual(@as(?[]u8, null), try refusalReport(gpa, &env, &warn));
+    try env.put("SQUEEZEFS_META_PASS_VENUE", "committer");
+    try testing.expectEqual(@as(?[]u8, null), try refusalReport(gpa, &env, &warn));
 }
 
 test "gate: a clean environment yields no report; an unknown alone is not a refusal" {

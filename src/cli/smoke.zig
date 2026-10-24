@@ -3005,7 +3005,7 @@ fn awaitExitWithin(rig: *Rig, bound_ns: u64, what: []const u8) !std.process.Chil
     return rig.waitChild();
 }
 
-test "smoke: A BIND OF THE MOUNT IS THE KERNEL'S, NEVER THE DAEMON'S TO STOP (xfstests generic/409–411, 589 under the symmetric default) — mount, `mount --bind` it elsewhere, a file written through the mount reads through the bind; (a) the kernel's `umount` of the original: the daemon is not signalled, the bind KEEPS SERVING (`.stats`, the file sha-equal), `umount` of the bind drops the superblock's last reference and the daemon exits within two ticks, exit 0; (b) `squeezefs umount <bind>`: the kernel's plain detach naming daemon and mount, nothing signalled, the mount serves on; (c) `squeezefs umount <mount>` with the bind alive: the orderly stop ends its connection AT ONCE naming the bind (red: 30 s of `residency backstop lapsed` ×N groups), the bind answers ENOTCONN and detaches plainly; (d) generic/410's breakage — a tmpfs stacked INSIDE the tree (on the manager's dentry `sub`) stands through a member's join and through the member's changes of the shared root (fsstress's `fss<pid>` temp names, a directory renamed into and removed): the walk through `sub` reads the tmpfs each time, the join's whole-view epoch withheld (red on dev: that INC_EPOCH made `sub` invalid at the next walk and the kernel's `d_invalidate` detached the tmpfs — `sub/x` ENOENT); fsck --offline --scrub 0 findings after each" {
+test "smoke: A BIND OF THE MOUNT IS THE KERNEL'S, NEVER THE DAEMON'S TO STOP (xfstests generic/409–411, 589 under the symmetric default) — mount, `mount --bind` it elsewhere, a file written through the mount reads through the bind; (a) the kernel's `umount` of the original: the daemon is not signalled, the bind KEEPS SERVING (`.stats`, the file sha-equal), `umount` of the bind drops the superblock's last reference and the daemon exits within two ticks, exit 0; (b) `squeezefs umount <bind>`: the kernel's plain detach naming daemon and mount, nothing signalled, the mount serves on; (c) `squeezefs umount <mount>` with the bind alive: the orderly stop ends its connection AT ONCE naming the bind (red: 30 s of `residency backstop lapsed` ×N groups), the bind answers ENOTCONN and detaches plainly; (d) generic/410's breakage — a tmpfs stacked INSIDE the tree (on the manager's dentry `sub`) stands through a member's join and through the member's changes of the shared root (fsstress's `fss<pid>` temp names, a directory renamed into and removed): the walk through `sub` reads the tmpfs each time, the join's whole-view epoch withheld (red on dev: that INC_EPOCH made `sub` invalid at the next walk and the kernel's `d_invalidate` detached the tmpfs — `sub/x` ENOENT); (e) a copy propagation made of the mount (its parent shared with a peer) goes WITH the orderly unmount — never another mount: no `other mount(s) of this superblock`, no abort, exit 0, nothing of ours left at the peer (red on dev: the verdict, read before the umount2, counted the copy and aborted under it); fsck --offline --scrub 0 findings after each" {
     const io = testing.io;
     if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
     const gpa = testing.allocator;
@@ -3170,6 +3170,42 @@ test "smoke: A BIND OF THE MOUNT IS THE KERNEL'S, NEVER THE DAEMON'S TO STOP (xf
     try rig.umount();
     try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try awaitExitWithin(rig, bind_exit_bound_ns, "(d) the orderly stop after the member left"));
     _ = try fsckClean(rig, "(d) a mount stacked inside the tree through a member's join and changes");
+    // ---- (e) a copy propagation made goes WITH the orderly unmount ----
+    // The mountpoint bound onto itself, its own peer group (private first:
+    // a bind under a shared parent joins the parent's group, and a copy
+    // propagated into the parent is tucked UNDER the bind), a peer of it
+    // beside: the daemon's mount(2) there propagates a copy to the peer.
+    const peer = try std.fmt.allocPrintSentinel(gpa, "{s}-peer", .{rig.mp}, 0);
+    defer gpa.free(peer);
+    try bindMount(rig.mp, rig.mp);
+    defer _ = linux.umount2(rig.mp.ptr, linux.MNT.DETACH);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.mount("none", rig.mp.ptr, null, linux.MS.PRIVATE, 0)));
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.mount("none", rig.mp.ptr, null, linux.MS.SHARED, 0)));
+    try bindMount(rig.mp, peer);
+    defer {
+        _ = linux.umount2(peer.ptr, linux.MNT.DETACH);
+        _ = linux.rmdir(peer.ptr);
+    }
+    const mark_e = try rig.logLen();
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(mark_e);
+    try testing.expectEqual(@as(usize, 1), try fuseMountsOf(gpa, io, peer));
+    {
+        const out = try rig.shOk(rig.work, try std.fmt.bufPrint(&cmd, "grep -q '\"pid\":' {s}/.stats && echo ok", .{peer}));
+        defer gpa.free(out);
+        try testing.expectEqualStrings("ok\n", out);
+    }
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try awaitExitWithin(rig, bind_exit_bound_ns, "(e) the orderly stop with a propagated copy"));
+    try testing.expectEqual(@as(usize, 0), try fuseMountsOf(gpa, io, peer));
+    {
+        const text = try rig.readLog();
+        defer gpa.free(text);
+        try testing.expect(std.mem.indexOf(u8, text[mark_e..], "other mount(s) of this superblock") == null);
+        try testing.expect(std.mem.indexOf(u8, text[mark_e..], "ended its own FUSE connection") == null);
+        try testing.expect(std.mem.indexOf(u8, text[mark_e..], "residency backstop lapsed") == null);
+    }
+    _ = try fsckClean(rig, "(e) the orderly stop with a propagated copy");
 }
 
 /// The `major:minor` of the mount at exactly `path` (the mount table, never

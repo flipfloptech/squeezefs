@@ -1907,11 +1907,12 @@ pub const Session = struct {
     /// (reaping the verdicts: a RELEASE after the unmount meets a stopped
     /// queue, and a retained ent the kernel reclaims pins the exit) and
     /// synthesize an error for every owed slot (the blocked callers return,
-    /// so the mount is not busy) → when another mount of the superblock
-    /// would keep the connection alive past our unmount, `endIfHeldElsewhere`
-    /// ends it loud NOW, while our own mount still proves the connection id
-    /// ours → `umount2` → the disconnect ends the workers' residency and the
-    /// sideband → join → the filesystem's `destroy` → close the fd. The one
+    /// so the mount is not busy) → the superblock HELD by a detached clone of
+    /// our mount (`holdSuperblock`) → `umount2` (its propagation takes the
+    /// copies it reaches) → when a mount of the superblock still stands,
+    /// `endIfHeldElsewhere` ends the connection loud → the hold's release
+    /// drops the superblock → the disconnect ends the workers' residency and
+    /// the sideband → join → the filesystem's `destroy` → close the fd. The one
     /// orderly path the drain cannot cover is an EXTERNAL `umount(8)`: a
     /// type-`fuse` mount gets no DESTROY, the kernel aborts the connection
     /// first.
@@ -1926,8 +1927,20 @@ pub const Session = struct {
             log.warn("transport: a drain group did not drain within {d} ms — ending the connection before the unmount (decision 0003 §AN)", .{DRAIN_WAIT_NS / std.time.ns_per_ms});
             self.failStop();
         }
-        self.endIfHeldElsewhere();
+        // THE HELD-ELSEWHERE LAW (decision 0003 §AN.6, §BL.4): the verdict
+        // counts what SURVIVES our umount2 — a propagated copy that umount's
+        // propagation takes with ours is never "another mount" — and the
+        // abort names a connection provably ours: the hold keeps the
+        // superblock, so its anonymous device cannot be reissued until the
+        // hold goes. Without a hold (no CAP_SYS_ADMIN: fusermount3) the
+        // verdict runs before the umount2, while our own mount keeps it.
+        const hold = self.holdSuperblock();
+        if (hold == null) self.endIfHeldElsewhere(.own_mount_attached);
         self.unmount();
+        if (hold) |fd| {
+            self.endIfHeldElsewhere(.superblock_held);
+            _ = linux.close(fd);
+        }
         self.holdAfterUnmount();
         for (self.groups) |g| g.join();
         if (self.have_sideband) self.sideband.join();
@@ -2038,8 +2051,9 @@ pub const Session = struct {
     }
 
     /// `SQUEEZEFS_TEST_FUSE_UNMOUNT_HOLD`: the teardown waits right after its
-    /// own unmount until a writer opens the FIFO — the window in which the
-    /// kernel has reissued this connection's id to whoever mounts next.
+    /// own unmount and the superblock hold's release until a writer opens the
+    /// FIFO — the window in which the kernel has reissued this connection's
+    /// id to whoever mounts next.
     fn holdAfterUnmount(self: *Session) void {
         const path = knobs.parseStr(self.env.get("SQUEEZEFS_TEST_FUSE_UNMOUNT_HOLD")) orelse return;
         log.warn("transport: SQUEEZEFS_TEST_FUSE_UNMOUNT_HOLD — the teardown of {s} holds after its unmount until a writer opens {s}", .{ self.mountpoint, path });
@@ -2134,29 +2148,52 @@ pub const Session = struct {
         return .{ .id = e.id, .dev_major = e.dev_major, .dev_minor = e.dev_minor };
     }
 
-    /// Before the daemon's own unmount: the kernel ends the connection inside
-    /// the `umount2` that drops the superblock's last reference, and the
-    /// workers' residency ends on that disconnect — unless another mount of
-    /// the superblock stands (a bind the operator left, a moved mountpoint,
-    /// a propagated copy a holder keeps). The session is drained and cannot
-    /// serve them; waiting out the residency backstop answered their
-    /// requests ENOTCONN for 30 s and then exited the same way. Name them
-    /// and end the connection NOW (decision 0003 §S's race-case law: a
-    /// prompt, loud end beats 30 s of ENOTCONN): fusectl's abort when
-    /// mounted, else the device fd's close at the end of `close` (the
-    /// workers exit at once on `detached`). A bind is the kernel's to
+    /// A detached clone of our mount (`open_tree(OPEN_TREE_CLONE)`): it
+    /// holds the superblock — and so the connection and its anonymous device
+    /// — across our own `umount2` without making our mount busy (another
+    /// vfsmount, in no namespace's table). Null when our path is no longer
+    /// our mount or the clone is refused (no CAP_SYS_ADMIN: the fusermount3
+    /// path).
+    fn holdSuperblock(self: *Session) ?linux.fd_t {
+        if (!self.mounted.load(.acquire) or self.unmounter != null) return null;
+        if (self.mount_id == null or self.mount_dev == null or !self.stillOurs()) return null;
+        const OPEN_TREE_CLONE: usize = 1;
+        const cloexec: usize = @as(u32, @bitCast(linux.O{ .CLOEXEC = true }));
+        const rc = linux.syscall3(.open_tree, @as(usize, @bitCast(@as(isize, linux.AT.FDCWD))), @intFromPtr(self.mountpoint.ptr), OPEN_TREE_CLONE | cloexec);
+        if (linux.errno(rc) != .SUCCESS) return null;
+        return @intCast(rc);
+    }
+
+    /// The kernel ends the connection inside the `umount2` that drops the
+    /// superblock's last reference, and the workers' residency ends on that
+    /// disconnect — unless another mount of the superblock stands (a bind
+    /// the operator left, a moved mountpoint, a copy propagation did not
+    /// take). The session is drained and cannot serve them; waiting out the
+    /// residency backstop answered their requests ENOTCONN for 30 s and then
+    /// exited the same way. Name them and end the connection NOW (decision
+    /// 0003 §S's race-case law: a prompt, loud end beats 30 s of ENOTCONN):
+    /// fusectl's abort, else the device fd's close at the end of `close`
+    /// (the workers exit at once on `detached`). A bind is the kernel's to
     /// detach, and `squeezefs umount` of one detaches it plainly without
     /// signalling the daemon.
     ///
-    /// THE LAW (decision 0003 §AN): a daemon ends only the connection it
-    /// owns, and the connection id proves ownership only while its own
-    /// mount holds the superblock — so the verdict is read and the abort
-    /// written BEFORE its `umount2`. After it the kernel has reissued the
-    /// `major:minor` to whoever mounted next, anywhere on the host (gate
-    /// 94: the verdict read after the unmount aborted another shard's fresh
-    /// connection inside its INIT).
-    fn endIfHeldElsewhere(self: *Session) void {
-        if (!self.mounted.load(.acquire)) return;
+    /// THE LAW (decision 0003 §AN.6, §BL.4): a daemon ends only the
+    /// connection it owns — the `major:minor` proves it only while something
+    /// of ours holds the superblock: the kernel reissues the number to
+    /// whoever mounts next, anywhere on the host, once the superblock dies
+    /// (gate 94: a verdict read after a bare unmount aborted another shard's
+    /// fresh connection inside its INIT). `.superblock_held`: after our
+    /// `umount2`, the hold keeping it — the survivors are exactly what keeps
+    /// the connection (generic/410: before the unmount the verdict counted
+    /// the propagated copies the same `umount2` removes, and aborted under
+    /// them). `.own_mount_attached`: before it, our mount keeping it (no
+    /// hold could be taken).
+    fn endIfHeldElsewhere(self: *Session, phase: enum { own_mount_attached, superblock_held }) void {
+        switch (phase) {
+            .own_mount_attached => if (!self.mounted.load(.acquire)) return,
+            // The lazy detach's fail-stop already ended it.
+            .superblock_held => if (self.abort_written) return,
+        }
         const id = self.mount_id orelse return;
         const dev = self.mount_dev orelse return;
         const buf = self.gpa.alloc(u8, mountinfo.READ_BYTES) catch return;

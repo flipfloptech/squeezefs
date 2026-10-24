@@ -1307,18 +1307,26 @@ pub const ReadPath = struct {
         return error.InputOutput;
     }
 
-    const Bounce = struct { bytes: []align(fill_pool.SLOT_ALIGN) u8, pool: *fill_pool.Pool, slot: u32 };
+    /// A pool slot, or (`pool == null`) an over-capacity backing of the
+    /// slot's size from the heap.
+    const Bounce = struct { bytes: []align(fill_pool.SLOT_ALIGN) u8, pool: ?*fill_pool.Pool, slot: u32 };
 
-    /// `read_bounce_pool(size)`: ≤ 64 KiB the ranged slab, else the fill pool.
+    /// `read_bounce_pool(size)`: ≤ 64 KiB the ranged slab, else the fill
+    /// pool. A pool with every slot checked out (more reads in their DMA at
+    /// once than its headroom) is the pool's counted exhaustion
+    /// (`read_fill_pool_exhausted`): the read rides an over-capacity backing
+    /// it serves once — a file's read has no EAGAIN, and the slots in use
+    /// come home at their DMAs' ends.
     fn acquireBounce(self: *ReadPath, len: u64) Error!Bounce {
         const p = if (len <= RANGED_BOUNCE_SLOT) self.ranged_bounce else self.pool;
         if (len > p.slot_size) return error.ReadSizeExceedsPool;
-        const slot = p.acquire() orelse return error.QueueFull;
-        return .{ .bytes = p.bytes(slot), .pool = p, .slot = slot };
+        if (p.acquire()) |slot| return .{ .bytes = p.bytes(slot), .pool = p, .slot = slot };
+        const b = self.gpa.alignedAlloc(u8, .fromByteUnits(fill_pool.SLOT_ALIGN), p.slot_size) catch return error.OutOfMemory;
+        return .{ .bytes = b, .pool = null, .slot = 0 };
     }
 
-    fn releaseBounce(_: *ReadPath, b: Bounce) void {
-        _ = b.pool.unpin(b.slot);
+    fn releaseBounce(self: *ReadPath, b: Bounce) void {
+        if (b.pool) |p| _ = p.unpin(b.slot) else self.gpa.free(b.bytes);
     }
 
     // ---- §1.4 striped ----

@@ -132,7 +132,7 @@ pub const MetaSet = struct {
     /// member is FAILED.
     line_marks: journal.FailureLatch.LineMarks = .{},
     /// THE RE-JOIN IN PLACE's inputs (charter §5.5 "A live member evicted
-    /// …"; decision 0003 §BO): the canonical member paths, the backend
+    /// …"; decision 0003 §BS): the canonical member paths, the backend
     /// options and the join door this open used — a successor incarnation
     /// opens through the same door. Empty on every posture but a joiner.
     rejoin_paths: [][]u8 = &.{},
@@ -730,7 +730,7 @@ pub const MetaSet = struct {
         for (self.volumes) |be| if (hook) |h| be.cv.armTokens(h) else be.cv.disarmTokens();
     }
 
-    // ---- the re-join in place (decision 0003 §BO) ----
+    // ---- the re-join in place (decision 0003 §BS) ----
 
     fn keepRejoinInputs(self: *MetaSet, paths: []const []const u8, order: []const usize, opts: OpenOptions) OpenError!void {
         const gpa = self.gpa;

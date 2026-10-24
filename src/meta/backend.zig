@@ -316,7 +316,7 @@ pub const JoinOptions = struct {
     /// `--join <endpoint>`: the manager's listener when the durable
     /// `endpoint:{0}` record is not to be trusted (or not yet written).
     endpoint: ?endpoint.EndpointWire = null,
-    /// A re-join in place (decision 0003 §BO): the evicted predecessor's
+    /// A re-join in place (decision 0003 §BS): the evicted predecessor's
     /// appender id on this volume. Its region is recovered — every slot it
     /// leased is the manager's to hand out again — so the projection's
     /// rows naming it are as stale as the joiner's own (`lease_table.
@@ -3280,7 +3280,7 @@ pub const KvBackend = struct {
         }
         if (!be.closed and be.lane.latch.isRetired()) {
             be.closed = true;
-            // A RETIRED incarnation (a re-join in place, decision 0003 §BO):
+            // A RETIRED incarnation (a re-join in place, decision 0003 §BS):
             // its region is the successor manager's — nothing is written
             // (no leave, no final tick); its threads join.
             be.cv.close();

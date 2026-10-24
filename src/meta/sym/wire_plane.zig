@@ -123,7 +123,7 @@ pub const stats = struct {
     /// Cadence ticks of the plane (eviction + grace reap + ledger poll).
     pub var wire_plane_ticks: counters.ShardedCounter = .{};
     /// Live members this process re-joined in place after its home shard
-    /// evicted them (decision 0003 §BO).
+    /// evicted them (decision 0003 §BS).
     pub var wire_rejoins_in_place: counters.ShardedCounter = .{};
 };
 
@@ -555,7 +555,7 @@ const Poison = struct {
 };
 
 /// The mount's half of a re-join in place (charter §5.5 "A live member
-/// evicted …"; decision 0003 §BO), bound by `mount` once its planes stand.
+/// evicted …"; decision 0003 §BS), bound by `mount` once its planes stand.
 pub const RejoinHost = struct {
     ctx: *anyopaque,
     /// The first thing the data plane or the filesystem holds un-landed —
@@ -924,7 +924,7 @@ pub const WirePlane = struct {
             .poison = j.poison.sink(),
             .carriage = j.carriageSink(),
             // A live member its home shard evicts re-joins in place when it
-            // holds nothing un-landed (decision 0003 §BO).
+            // holds nothing un-landed (decision 0003 §BS).
             .rejoin_armed = true,
         };
         self.joined = j;
@@ -980,7 +980,7 @@ pub const WirePlane = struct {
     }
 
     /// THE RE-JOIN IN PLACE (charter §5.5 "A live member evicted …";
-    /// decision 0003 §BO), on the beat that met the home shard's
+    /// decision 0003 §BS), on the beat that met the home shard's
     /// `UnknownLease`. The follower ends first (it reads the incarnation's
     /// words). Then: (1) the writer's block-grant windows forgotten (the
     /// holder revoked them: nothing more is minted from them) and every
@@ -1001,7 +1001,7 @@ pub const WirePlane = struct {
     fn rejoinInPlace(self: *WirePlane, j: *JoinedHalf) bool {
         const t0 = clock.monotonicNs();
         const old_appender = j.js.appenderId();
-        log.warn("cluster wire: the home shard answered UnknownLease — it evicted this LIVE member (appender {d}, epoch {d}); retiring the incarnation and judging what it holds un-landed (decision 0003 §BO)", .{ old_appender, j.member.epoch });
+        log.warn("cluster wire: the home shard answered UnknownLease — it evicted this LIVE member (appender {d}, epoch {d}); retiring the incarnation and judging what it holds un-landed (decision 0003 §BS)", .{ old_appender, j.member.epoch });
         j.follow_stop.store(true, .release);
         if (j.follower) |t| t.join();
         j.follower = null;
@@ -1042,7 +1042,7 @@ pub const WirePlane = struct {
         return true;
     }
 
-    /// THE ELIGIBILITY (decision 0003 §BO), judged after the retirement:
+    /// THE ELIGIBILITY (decision 0003 §BS), judged after the retirement:
     /// the first thing the evicted incarnation holds that its home shard's
     /// recovery could not have landed, or null.
     ///   - a window admitted before the eviction still in flight past one

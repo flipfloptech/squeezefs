@@ -507,7 +507,7 @@ pub const Owner = struct {
     /// An EXPECTED member's FIRST join while the re-assertion half stands
     /// is its re-assertion (no epoch needed). Once it re-asserted, or once
     /// the window closed, a join without an epoch is a FRESH join — the
-    /// member left, was evicted (a re-join in place, decision 0003 §BO) or
+    /// member left, was evicted (a re-join in place, decision 0003 §BS) or
     /// remounted: its predecessor's roster row expects nothing of it any
     /// more (a reclaim it could never hold answered `UnknownLease` for
     /// every later join of that identity under this owner).
@@ -1010,7 +1010,7 @@ pub const CarriageSink = struct {
 };
 
 /// `evicted`: the owner answered `UnknownLease` to a member armed to re-join
-/// in place (decision 0003 §BO) — nothing touched the gate or the words;
+/// in place (decision 0003 §BS) — nothing touched the gate or the words;
 /// the caller retires the incarnation and re-joins, or poisons.
 pub const TickVerdict = enum { idle, renewed, rejoined, parked, fenced, evicted };
 
@@ -1045,7 +1045,7 @@ pub const Member = struct {
     /// never carried): the beat compares it with the process's own word
     /// and pulls the record at a bump (`wire_plane.learnSetConfig`).
     config_generation: u64 = 0,
-    /// THE RE-JOIN IN PLACE (charter §5.5; decision 0003 §BO): the owner's
+    /// THE RE-JOIN IN PLACE (charter §5.5; decision 0003 §BS): the owner's
     /// `UnknownLease` — at a reclaim under the park or a renewal — is the
     /// verdict `evicted`, never the poison here: the caller judges what
     /// the incarnation holds un-landed and re-joins or poisons. Set before
@@ -1434,7 +1434,7 @@ test "grace, two halves on one deadline: a stranger is refused while the fresh h
     try testing.expectEqual(Liveness.dead, o2.liveness(a, 45_000));
 }
 
-test "a predecessor-roster member that re-asserted, then left or was evicted, joins FRESH under the same owner (a re-join in place, decision 0003 §BO): its join without an epoch is a re-assertion only while the window stands and it has not re-asserted; past the deadline, too, it is a fresh join, never UnknownLease" {
+test "a predecessor-roster member that re-asserted, then left or was evicted, joins FRESH under the same owner (a re-join in place, decision 0003 §BS): its join without an epoch is a re-assertion only while the window stands and it has not re-asserted; past the deadline, too, it is a fresh join, never UnknownLease" {
     const gpa = testing.allocator;
     const clocks = try LeaseClocks.derive(3_000, 0, 100);
     const a = writerMemberId(testIdentity(1));
@@ -1661,7 +1661,7 @@ test "UnknownLease before T_self fences terminally and never parks; a leave over
     try testing.expectError(error.ParkedLeaveRefused, m2.leave());
 }
 
-test "THE RE-JOIN IN PLACE's verdict (decision 0003 §BO): a member armed to re-join answers the owner's UnknownLease `evicted` — at a renewal before T_self and at the reclaim under the park — touching neither the gate nor the words nor the poison; an expired park stays the terminal fence; unarmed, the same answers fence and poison as before" {
+test "THE RE-JOIN IN PLACE's verdict (decision 0003 §BS): a member armed to re-join answers the owner's UnknownLease `evicted` — at a renewal before T_self and at the reclaim under the park — touching neither the gate nor the words nor the poison; an expired park stays the terminal fence; unarmed, the same answers fence and poison as before" {
     const gpa = testing.allocator;
     const clocks = try LeaseClocks.derive(45_000, 0, 100);
     var o = try Owner.arm(gpa, clocks, 0, 1, 0, &.{}, 0);

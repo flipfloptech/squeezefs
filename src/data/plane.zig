@@ -1294,7 +1294,7 @@ pub const DataPlane = struct {
     /// resident promoted or destroyed, every freed grain punched) — the
     /// supervisor may discard it. False with residents kept.
     /// THE RE-JOIN IN PLACE's data words (charter §5.5 "A live member
-    /// evicted …"; decision 0003 §BO): the first thing this plane holds
+    /// evicted …"; decision 0003 §BS): the first thing this plane holds
     /// that its home shard's recovery of the evicted incarnation could not
     /// have landed — acked bytes in RAM or the write cache whose layout
     /// was never published, a packed tenant between reserve and commit —

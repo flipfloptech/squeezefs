@@ -546,7 +546,7 @@ pub const Checkpointer = struct {
         return self.deps.latch.isFailed();
     }
 
-    /// A retired incarnation (a re-join in place, decision 0003 §BO): its
+    /// A retired incarnation (a re-join in place, decision 0003 §BS): its
     /// region is the successor manager's — not even the shutdown writes.
     pub fn isRetired(self: *const Checkpointer) bool {
         return self.deps.latch.isRetired();

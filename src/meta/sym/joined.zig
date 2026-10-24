@@ -972,7 +972,7 @@ pub const JoinedSet = struct {
     // ---- the retirement (a live member evicted re-joins in place) ----
 
     /// What the retirement leaves for the eligibility judgement (decision
-    /// 0003 §BO): the old ring's landed head and whether everything this
+    /// 0003 §BS): the old ring's landed head and whether everything this
     /// incarnation admitted landed inside the bound.
     pub const Retirement = struct {
         /// Every pass left and every window landed within one landing

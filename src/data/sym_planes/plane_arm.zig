@@ -721,7 +721,7 @@ pub const WriterPlane = struct {
         return false;
     }
 
-    /// THE RE-JOIN IN PLACE (decision 0003 §BO): the home shard evicted
+    /// THE RE-JOIN IN PLACE (decision 0003 §BS): the home shard evicted
     /// this member, and its holder revokes a dead writer's grants — every
     /// unconsumed run is dropped HERE, never returned (the holder's own
     /// derivation returns it; a return could clear a bit it re-granted).

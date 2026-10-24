@@ -18,7 +18,7 @@
 //!
 //! RETIRED (sticky, from RUNNING or PARKED) is the incarnation's end when
 //! the home shard evicted a live member and it re-joins IN PLACE (charter
-//! §5.5 "A live member evicted …"; decision 0003 §BO): the pre-admission
+//! §5.5 "A live member evicted …"; decision 0003 §BS): the pre-admission
 //! gate answers `Retired` — the conveyor's `Deferred`, nothing written, the
 //! op re-issued on the successor incarnation — and a failed re-join moves
 //! it on to EXPIRED (the poison).

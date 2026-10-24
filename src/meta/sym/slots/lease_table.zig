@@ -924,7 +924,7 @@ pub fn joinedProjectionRow(row: cr.SlotState, me: AppenderId) cr.SlotState {
 }
 
 /// The law over every id of this mount's identity on the volume: the
-/// joiner's own and, at a re-join in place (decision 0003 §BO), its
+/// joiner's own and, at a re-join in place (decision 0003 §BS), its
 /// evicted predecessor's — whose region the manager recovered, so every
 /// slot the projection still names it the lessee of is the manager's
 /// truth to ask.

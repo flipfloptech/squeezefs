@@ -1255,7 +1255,7 @@ pub const FailureLatch = struct {
     /// The classes that logged a line on this latch (this mount).
     marks: LineMarks = .{},
     /// A JOINED incarnation RETIRED because its home shard evicted it and
-    /// the mount re-joins in place (decision 0003 §BO): it admits no new
+    /// the mount re-joins in place (decision 0003 §BS): it admits no new
     /// mutation — every one it still meets answers `Retired` (the
     /// conveyor's `Deferred`: re-issued on the successor incarnation, never
     /// EIO) — and, once its last window landed, `failStop` ends its writes.
@@ -1430,7 +1430,7 @@ pub const FailureLatch = struct {
     }
 };
 
-test "the retired latch (a re-join in place, decision 0003 §BO): retirement refuses every new mutation `Retired` while the volume still writes; the later fail-stop ends the writes and the verdict stays `retired`" {
+test "the retired latch (a re-join in place, decision 0003 §BS): retirement refuses every new mutation `Retired` while the volume still writes; the later fail-stop ends the writes and the verdict stays `retired`" {
     var latch: FailureLatch = .{};
     try latch.admitMutation();
     latch.retire();

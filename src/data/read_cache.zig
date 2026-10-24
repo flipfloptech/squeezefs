@@ -427,7 +427,7 @@ pub const ReadCache = struct {
         return self;
     }
 
-    /// Every grain dropped (a re-join in place, decision 0003 §BO: a block
+    /// Every grain dropped (a re-join in place, decision 0003 §BS: a block
     /// the evicted incarnation cached may have been rewritten in place by
     /// the holder that recovered its files — no recall reached this mount).
     pub fn purgeAll(self: *ReadCache) void {

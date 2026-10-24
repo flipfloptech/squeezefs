@@ -246,7 +246,7 @@ pub const Divert = struct {
         return true;
     }
 
-    /// THE RE-JOIN IN PLACE (decision 0003 §BO): the home shard evicted
+    /// THE RE-JOIN IN PLACE (decision 0003 §BS): the home shard evicted
     /// this member and every holder swept its grants — every plane drops
     /// every token and re-probes its channel at the next serve (onto its
     /// own link: the holders' listeners did not move). Returns the planes

@@ -31,7 +31,7 @@
 //! lease the successor just granted.
 //!
 //! Invariant 4 — THE RETIREMENT's drain (a live member evicted re-joins in
-//! place, decision 0003 §BO): the conveyor's pass enters the growth gate
+//! place, decision 0003 §BS): the conveyor's pass enters the growth gate
 //! (`passes_inside += 1`, an RMW: the fence) and only then reads the park
 //! word at the pre-admission gate; a pass that read RUNNING reserves and
 //! TRACKS its window before it leaves the gate (`windows += 1` before

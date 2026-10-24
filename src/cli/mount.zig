@@ -790,7 +790,7 @@ fn mountMain(ctx: *Ctx) u8 {
         if (!reader) be.armKernel(null);
         coherence.detach();
     };
-    // THE RE-JOIN IN PLACE (decision 0003 §BO): a live member its home
+    // THE RE-JOIN IN PLACE (decision 0003 §BS): a live member its home
     // shard evicts re-joins under this live session when nothing it holds
     // is un-landed — the plane's and the filesystem's words are the
     // mount's to judge; the kernel's view and the read cache drop at the
@@ -1892,7 +1892,7 @@ const KernelCoherence = struct {
 };
 
 /// The mount's half of a re-join in place (`sym_wire.RejoinHost`; charter
-/// §5.5 "A live member evicted …"; decision 0003 §BO): what the data plane
+/// §5.5 "A live member evicted …"; decision 0003 §BS): what the data plane
 /// and the filesystem hold un-landed, and the mount's own re-bindings for
 /// the successor incarnation.
 const RejoinHost = struct {

@@ -48,6 +48,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 const journal = @import("journal.zig");
+const jc = @import("journal_core.zig");
 const ledger = @import("ledger.zig");
 const superblock = @import("superblock.zig");
 const knobs = @import("../core/knobs.zig");
@@ -685,13 +686,35 @@ pub const linux_tail = if (builtin.os.tag == .linux) struct {
         }
     };
 
-    pub const ReplayFdError = error{ StatFailed, MapFailed, DeviceOpenFailed, DeviceWriteFailed, BarrierFailed } || ImageError;
+    pub const ReplayFdError = error{ StatFailed, MapFailed, DeviceOpenFailed, DeviceReadFailed, DeviceWriteFailed, BarrierFailed, DeviceForeign, Corrupt, OutOfMemory } || ImageError;
+
+    /// The death replay's verdict (`replayFd`).
+    pub const Death = struct {
+        replay: Replay,
+        /// Written slots behind the ledger's checkpoint tail: landed and
+        /// checkpointed before the death freed them — skipped.
+        behind: u32 = 0,
+        /// Written slots past a hole the tail does not hold: never written
+        /// (the prefix law).
+        past_hole: u32 = 0,
+        /// Judged against the device's chain (a fixed, unsegmented ring);
+        /// false = written whole (a joined ring: no successor law yet,
+        /// decision 0003 §BR.5).
+        judged: bool,
+    };
 
     /// The supervisor's replay of one tail fd at its daemon's death: map it
-    /// read-only, open the header's device, write every written slot in seq
-    /// order, `fsync`. `path_out` receives the device path (for the log
-    /// line).
-    pub fn replayFd(fd: linux.fd_t, path_out: *[PATH_CAP]u8, path_len: *usize) ReplayFdError!Replay {
+    /// read-only, open the header's device, write the un-landed slots in
+    /// seq order, `fsync`. A fixed ring's replay is JUDGED as a held copy's
+    /// is (`judgedReplay`, decision 0003 §BR.3½): the device's superblock
+    /// must name the tail's volume (else `DeviceForeign`: the caller holds
+    /// the tail), and no slot past a hole the tail does not hold is written
+    /// — a window acked at its landing whose write failed was rolled back
+    /// after later windows had been applied on top of it in RAM, and those
+    /// written past it would have the journal's resync apply a transaction
+    /// after a missing one. `path_out` receives the device path (for the
+    /// log line).
+    pub fn replayFd(gpa: std.mem.Allocator, fd: linux.fd_t, path_out: *[PATH_CAP]u8, path_len: *usize) ReplayFdError!Death {
         var st: linux.Statx = undefined;
         if (linux.errno(linux.statx(fd, "", linux.AT.EMPTY_PATH, .{ .SIZE = true }, &st)) != .SUCCESS) return error.StatFailed;
         const len: usize = @intCast(st.size);
@@ -720,12 +743,31 @@ pub const linux_tail = if (builtin.os.tag == .linux) struct {
         // healthy table), a later success lands old windows under its
         // O_DIRECT ring. Then the clean pages go.
         defer _ = linux.fadvise(sink.fd, 0, 0, linux.POSIX_FADV.DONTNEED);
+        if (h.n_segments == 0 and h.ring == RING_FIXED) {
+            const held = image.held();
+            const free_slots: u32 = h.n_slots - held.windows;
+            const j = judgedReplay(gpa, image, sink.fd, null) catch |e| return switch (e) {
+                // Every window landed and was checkpointed before its slot
+                // was freed: nothing is the ring's to restore.
+                error.Stale => .{ .replay = .{ .skipped = h.n_slots }, .behind = held.windows, .judged = true },
+                error.Foreign => error.DeviceForeign,
+                error.Segmented => unreachable,
+                error.OutOfMemory => error.OutOfMemory,
+                error.DeviceReadFailed => error.DeviceReadFailed,
+                error.DeviceWriteFailed => error.DeviceWriteFailed,
+                error.BarrierFailed => error.BarrierFailed,
+                error.Corrupt => error.Corrupt,
+            };
+            var out = j.replay;
+            out.skipped = free_slots + j.behind;
+            return .{ .replay = out, .behind = j.behind, .past_hole = j.past_hole, .judged = true };
+        }
         const out = image.replay(.{ .ctx = &sink, .write = DeviceSink.write }) catch {
             _ = linux.fsync(sink.fd);
             return error.DeviceWriteFailed;
         };
         if (linux.errno(linux.fsync(sink.fd)) != .SUCCESS) return error.BarrierFailed;
-        return out;
+        return .{ .replay = out, .judged = false };
     }
 
     pub const JudgeError = error{ OutOfMemory, DeviceReadFailed, DeviceWriteFailed, BarrierFailed, Foreign, Stale, Segmented, Corrupt };
@@ -1335,7 +1377,7 @@ test "planReplay: the prefix law — a held slot behind the ledger's tail is ski
     try testing.expectEqual(@as(u32, 3), plan2.past_hole);
 }
 
-test "linux: the memfd tail is size-sealed, claims through the mapping, and replayFd writes the written slots to the header's device and barriers" {
+test "linux: the memfd tail is size-sealed, claims through the mapping, and replayFd writes a JOINED ring's written slots whole to the header's device and barriers (a joined ring has no successor law to judge against, decision 0003 §BR.5)" {
     if (builtin.os.tag != .linux) return testkit.skip(@src(), .no_linux, "the memfd tail is Linux only");
     const linux = std.os.linux;
     var dev_path_buf: [128]u8 = undefined;
@@ -1349,7 +1391,7 @@ test "linux: the memfd tail is size-sealed, claims through the mapping, and repl
     try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.ftruncate(dev_fd, 8 * 4096)));
 
     const layout: journal.RingLayout = .{ .base = 4096, .pages = 4 };
-    var tail = try linux_tail.Tail.create(.{ .layout = layout, .grain = 512, .path = dev_path, .n_slots = 8, .identity = test_identity, .ring = RING_FIXED });
+    var tail = try linux_tail.Tail.create(.{ .layout = layout, .grain = 512, .path = dev_path, .n_slots = 8, .identity = test_identity, .ring = RING_JOINED });
     defer tail.deinit();
     // Sealed: growing or shrinking is refused.
     try testing.expectEqual(linux.E.PERM, linux.errno(linux.ftruncate(tail.fd, 4096)));
@@ -1357,9 +1399,10 @@ test "linux: the memfd tail is size-sealed, claims through the mapping, and repl
     const slot = tail.claim(11, 11, &.{.{ .offset = 4096 + 4096, .bytes = &payload }}).?;
     var pbuf: [PATH_CAP]u8 = undefined;
     var plen: usize = 0;
-    const r = try linux_tail.replayFd(tail.fd, &pbuf, &plen);
-    try testing.expectEqual(@as(u32, 1), r.windows);
-    try testing.expectEqual(@as(u64, 2048), r.bytes);
+    const d = try linux_tail.replayFd(testing.allocator, tail.fd, &pbuf, &plen);
+    try testing.expect(!d.judged);
+    try testing.expectEqual(@as(u32, 1), d.replay.windows);
+    try testing.expectEqual(@as(u64, 2048), d.replay.bytes);
     try testing.expectEqualStrings(dev_path, pbuf[0..plen]);
     var got: [2048 + 1]u8 = undefined;
     const n = linux.pread(dev_fd, &got, got.len, 8192);
@@ -1368,8 +1411,8 @@ test "linux: the memfd tail is size-sealed, claims through the mapping, and repl
     try testing.expectEqualSlices(u8, &payload, got[0..2048]);
     try testing.expectEqual(@as(u8, 0), got[2048]);
     tail.release(slot);
-    const r2 = try linux_tail.replayFd(tail.fd, &pbuf, &plen);
-    try testing.expectEqual(@as(u32, 0), r2.windows);
+    const d2 = try linux_tail.replayFd(testing.allocator, tail.fd, &pbuf, &plen);
+    try testing.expectEqual(@as(u32, 0), d2.replay.windows);
 }
 
 /// A scratch device file and a held dir under /build/tmp, pid-tagged, the
@@ -1564,6 +1607,106 @@ test "linux: the supervisor's retry of a held copy — `failed` while the device
     try testing.expectEqual(@as(u32, 1), j.replay.windows);
     try rig.readAt(&got, base + 8192);
     try testing.expectEqualSlices(u8, &w, &got);
+}
+
+/// Four one-entry windows of `death_entry_len` bytes on `HeldRig`'s ring,
+/// written as the lane writes them (`journal.buildEntryWrite` over the
+/// production geometry): window `i`'s entry is one Put on inode `i + 1`.
+const death_entry_len: u64 = 1500;
+
+const DeathWindows = struct {
+    res: [4]journal.Reservation,
+    images: [4]journal.WriteImage,
+
+    fn build(gpa: std.mem.Allocator) !DeathWindows {
+        // The admission's checkpoint reserve exceeds a 4-page ring; the
+        // positions and the bytes are the production geometry's.
+        var geo = journal.productionGeometry(HeldRig.ring_layout.pages, 512);
+        geo.reserve_bytes = 0;
+        var core = jc.JournalCore.init(geo, 0, 0);
+        var out: DeathWindows = undefined;
+        var built: usize = 0;
+        errdefer for (out.images[0..built]) |*img| img.deinit();
+        var key: [9]u8 = undefined;
+        var value: [death_entry_len]u8 = undefined;
+        for (0..4) |i| {
+            std.mem.writeInt(u64, key[0..8], i + 1, .big);
+            key[8] = journal.TREE_INODES;
+            const value_len: usize = @intCast(death_entry_len - journal.ENTRY_HDR_LEN - journal.recordFrameLen(key.len, 0));
+            @memset(value[0..value_len], @intCast(0xD0 + i));
+            var records = [_]journal.RecordFrame{.{ .tag = journal.tagFor(journal.TREE_INODES, 0), .key = &key, .kind = .put, .seq = 0, .value = value[0..value_len] }};
+            try testing.expectEqual(death_entry_len, try journal.entryLenFor(&records));
+            out.res[i] = core.reserve(core.tryAdmit(death_entry_len, .user).?);
+            records[0].seq = out.res[i].start;
+            out.images[i] = try journal.buildEntryWrite(gpa, HeldRig.ring_layout, geo, journal.FIXED_RING_APPENDER, out.res[i], &records);
+            built += 1;
+        }
+        return out;
+    }
+
+    fn deinit(self: *DeathWindows) void {
+        for (&self.images) |*img| img.deinit();
+    }
+};
+
+test "linux: the death replay is JUDGED — the prefix law at a daemon's death (decision 0003 §BR.3½, §BR.10 (c)): window A landed, B was acked at its landing and its write FAILED (rolled back: never on the device, no slot), C and D were acked at apply on top of it (held in the tail); the supervisor's replay at the death never writes a window past B's hole — the device's chain stays a prefix (its scan confirms no drop and recovers A alone), the windows past it are counted, never written; without the hole every held window lands; a device that does not name the tail's volume is refused (the tail is then held)" {
+    if (builtin.os.tag != .linux) return testkit.skip(@src(), .no_linux, "the journal tail is Linux only");
+    const gpa = testing.allocator;
+    var rig: HeldRig = .{};
+    try rig.init("death");
+    defer rig.deinit();
+    var w = try DeathWindows.build(gpa);
+    defer w.deinit();
+    // D starts in page 1: a replay past the hole puts a verified page
+    // header and an entry behind it, which the scan resyncs to.
+    try testing.expect(w.res[3].start >= journal.PAGE_DATA_LEN);
+    var tail = try linux_tail.Tail.create(.{ .layout = HeldRig.ring_layout, .grain = 512, .path = rig.dev_path, .n_slots = 8, .identity = test_identity, .ring = RING_FIXED });
+    defer tail.deinit();
+    var pbuf: [PATH_CAP]u8 = undefined;
+    var plen: usize = 0;
+    for (w.images[0].ops) |op| try rig.writeAt(op.bytes, op.offset);
+    const c_slot = tail.claim(w.res[2].start, w.res[2].start, w.images[2].ops).?;
+    const d_slot = tail.claim(w.res[3].start, w.res[3].start, w.images[3].ops).?;
+    // A blank device: not the tail's volume — refused, nothing written.
+    try testing.expectError(error.DeviceForeign, linux_tail.replayFd(gpa, tail.fd, &pbuf, &plen));
+    try rig.outline(test_identity, 0);
+    const geo = journal.productionGeometry(HeldRig.ring_layout.pages, 512);
+    var ring: [4 * journal.PAGE_LEN]u8 = undefined;
+    {
+        const d = try linux_tail.replayFd(gpa, tail.fd, &pbuf, &plen);
+        try testing.expect(d.judged);
+        try testing.expectEqual(@as(u32, 0), d.replay.windows);
+        try testing.expectEqual(@as(u32, 2), d.past_hole);
+        try testing.expectEqual(@as(u32, 0), d.behind);
+        try rig.readAt(&ring, HeldRig.ring_layout.base);
+        var rec = try journal.replayScanImage(gpa, &ring, geo, 0, journal.FIXED_RING_APPENDER);
+        defer rec.deinit();
+        try testing.expectEqual(@as(u64, 0), rec.dropped_torn);
+        try testing.expectEqual(@as(usize, 1), rec.entries.len);
+    }
+    // No hole (B landed after all): every held window lands, the chain
+    // reads A through D.
+    for (w.images[1].ops) |op| try rig.writeAt(op.bytes, op.offset);
+    {
+        const d = try linux_tail.replayFd(gpa, tail.fd, &pbuf, &plen);
+        try testing.expectEqual(@as(u32, 2), d.replay.windows);
+        try testing.expectEqual(@as(u32, 0), d.past_hole);
+        try rig.readAt(&ring, HeldRig.ring_layout.base);
+        var rec = try journal.replayScanImage(gpa, &ring, geo, 0, journal.FIXED_RING_APPENDER);
+        defer rec.deinit();
+        try testing.expectEqual(@as(u64, 0), rec.dropped_torn);
+        try testing.expectEqual(@as(usize, 4), rec.entries.len);
+    }
+    // Every window behind the ledger's tail (landed and checkpointed before
+    // the death freed the slots): nothing written, counted behind.
+    try rig.outline(test_identity, w.res[3].paddedEnd());
+    {
+        const d = try linux_tail.replayFd(gpa, tail.fd, &pbuf, &plen);
+        try testing.expectEqual(@as(u32, 0), d.replay.windows);
+        try testing.expectEqual(@as(u32, 2), d.behind);
+    }
+    tail.release(c_slot);
+    tail.release(d_slot);
 }
 
 test "the held dir: the seam names it; root's is /run/squeezefs/journal-tails; another uid's under /run/user/<uid>; the copy's name is the volume uuid in hex" {

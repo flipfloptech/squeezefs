@@ -242,12 +242,32 @@ fstests_sysctl_restore() {
   FSTESTS_SYSCTL_SAVED=()
 }
 
+# check runs each test in a transient systemd scope (`fstests-<test>.scope`).
+# A fail-early stop kills check's group while the NEXT test's scope may
+# already stand, holding that test's daemons and devices; a pass started
+# before systemd retires it cannot create the scope again ("Unit
+# fstests-generic-742.scope was already loaded", 2026-10-23). Stop every
+# such scope and wait until none is loaded (bounded).
+fstests_scopes_down() {
+  local units=() waited=0
+  while :; do
+    mapfile -t units < <(systemctl list-units --all --plain --no-legend 'fstests-*.scope' 2>/dev/null | awk '{print $1}')
+    [ "${#units[@]}" -gt 0 ] || return 0
+    [ "$waited" -lt 60 ] || { suite_log "warning: test scope(s) still loaded after 60 s: ${units[*]}"; return 0; }
+    systemctl kill --signal=KILL "${units[@]}" 2>/dev/null || true
+    systemctl stop "${units[@]}" 2>/dev/null || true
+    systemctl reset-failed "${units[@]}" 2>/dev/null || true
+    sleep 1; waited=$((waited + 1))
+  done
+}
+
 # One `check` pass. Failure ids (`generic/NNN`) to $2.
 fstests_run() {
   local n=$1 failures=$2
   : > "$failures"
   fstests_sets "$n"
   fstests_sysctl_save
+  fstests_scopes_down
   local exclude=()
   if [ -s "$FSTESTS_VENUE_EXCLUDE" ]; then grep -v '^#' "$FSTESTS_VENUE_EXCLUDE" | awk '{print $1}' | grep . > "$RESULTS/venue-exclude.list" || true; [ -s "$RESULTS/venue-exclude.list" ] && exclude=(-E "$RESULTS/venue-exclude.list"); fi
   local what=()
@@ -304,6 +324,7 @@ fstests_run() {
   fi
   wait "$CHECK_PGID" || rc=$?
   CHECK_PGID=""
+  fstests_scopes_down
   fstests_sysctl_restore
   t1=$(date +%s)
   # The summary block: `Ran: …`, `Not run: …`, `Failures: …`, `Failed N of M tests`.

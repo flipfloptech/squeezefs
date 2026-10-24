@@ -208,13 +208,13 @@ pub const Stats = struct {
     /// (`checkpointPast`): the holder's own cycle covers them.
     hole_covers_smo_held: counters.ShardedCounter = .{},
     /// The previous writer's HELD journal tail replayed at this open
-    /// (decision 0003 §BQ.3): the custody law's engagement gauge.
+    /// (decision 0003 §BR.3): the custody law's engagement gauge.
     held_tail_replays: counters.ShardedCounter = .{},
     /// A held tail refused STALE (the ledger's checkpoint tail passed every
     /// window it held): acked metadata lost to a writer that ran without it.
     held_tail_stale: counters.ShardedCounter = .{},
     /// Acked windows of a held tail NOT replayed: they lay past a hole the
-    /// tail does not hold (the prefix law, decision 0003 §BQ.3).
+    /// tail does not hold (the prefix law, decision 0003 §BR.3).
     held_tail_past_hole: counters.ShardedCounter = .{},
 };
 
@@ -2092,7 +2092,7 @@ pub const KvBackend = struct {
         };
     }
 
-    /// The previous writer's held journal tail (decision 0003 §BQ.3): its
+    /// The previous writer's held journal tail (decision 0003 §BR.3): its
     /// acked windows written to THIS device path before the ring is read;
     /// a stale copy (the ledger's checkpoint tail past every window) is
     /// removed unwritten, a foreign one left; while the device refuses the
@@ -2123,7 +2123,7 @@ pub const KvBackend = struct {
         }
     }
 
-    /// The volume a tail names (decision 0003 §BQ.3): its superblock's.
+    /// The volume a tail names (decision 0003 §BR.3): its superblock's.
     fn tailIdentity(sb: superblock.Superblock) journal_tail.Identity {
         return .{ .volume_uuid = sb.uuid, .set_uuid = sb.set_uuid };
     }

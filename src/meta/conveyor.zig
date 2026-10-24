@@ -1345,7 +1345,7 @@ fn refuseSpawn(_: *anyopaque, _: *Window) bool {
 /// the kernel-held mirror before its members are acked ahead of the
 /// landing. `claim` returns the slot (null: the table refused), `release`
 /// frees it at the lane's verdict. `pos_base` is the reservation's start
-/// (the position a held tail is judged by against the ledger, §BQ.3).
+/// (the position a held tail is judged by against the ledger, §BR.3).
 pub const TailSeam = struct {
     ctx: *anyopaque,
     claim: *const fn (ctx: *anyopaque, seq_base: u64, pos_base: u64, ops: []const journal.WriteOp) ?u32,

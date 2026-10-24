@@ -385,7 +385,7 @@ pub const linux_loop = if (builtin.os.tag == .linux) struct {
                 var path: [journal_tail.PATH_CAP]u8 = undefined;
                 var path_len: usize = 0;
                 if (journal_tail.linux_tail.replayFd(self.gpa, t.fd, &path, &path_len)) |d| {
-                    log.info("supervisor: journal tail of volume {d} ({s}): {d} un-landed window(s), {d} bytes replayed and barriered ({d} slot(s) landed or empty, {d} behind the ledger's tail; {s})", .{ t.index, path[0..path_len], d.replay.windows, d.replay.bytes, d.replay.skipped, d.behind, if (d.judged) "judged against the device's chain" else "a joined ring, written whole" });
+                    log.info("supervisor: journal tail of volume {d} ({s}): {d} un-landed window(s), {d} bytes replayed and barriered ({d} slot(s) landed or empty, {d} behind the ledger's tail; {s})", .{ t.index, path[0..path_len], d.replay.windows, d.replay.bytes, d.replay.skipped, d.behind, if (d.judged) "judged against the device's chain" else if (d.replay.windows == 0) "nothing held" else "a joined ring, written whole" });
                     if (d.past_hole != 0) log.err("supervisor: journal tail of volume {d} ({s}): {d} acked window(s) lay past a hole the tail does not hold (a window acked at its landing whose write failed and was rolled back after they were applied) — NOT replayed: applying them past a missing transaction would break the volume's consistency; that metadata is lost", .{ t.index, path[0..path_len], d.past_hole });
                     _ = linux.close(t.fd);
                 } else |e| self.holdFailed(t.index, t.fd, path[0..path_len], e, dir.slice());

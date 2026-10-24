@@ -697,9 +697,9 @@ pub const linux_tail = if (builtin.os.tag == .linux) struct {
         /// Written slots past a hole the tail does not hold: never written
         /// (the prefix law).
         past_hole: u32 = 0,
-        /// Judged against the device's chain (a fixed, unsegmented ring);
-        /// false = written whole (a joined ring: no successor law yet,
-        /// decision 0003 §BR.5).
+        /// Judged against the device's chain (a fixed, unsegmented ring
+        /// holding a window); false = written whole — a joined ring (no
+        /// successor law yet, decision 0003 §BR.5), or nothing held.
         judged: bool,
     };
 
@@ -743,8 +743,13 @@ pub const linux_tail = if (builtin.os.tag == .linux) struct {
         // healthy table), a later success lands old windows under its
         // O_DIRECT ring. Then the clean pages go.
         defer _ = linux.fadvise(sink.fd, 0, 0, linux.POSIX_FADV.DONTNEED);
-        if (h.n_segments == 0 and h.ring == RING_FIXED) {
-            const held = image.held();
+        // A tail holding no window (every clean exit's) has nothing to
+        // judge: the chain is read only to keep windows — the superblock,
+        // the ledger and the whole ring read at every unmount delayed the
+        // supervisor's exit line behind the daemon's death (generic/753's
+        // row read the log at the death: gate 127).
+        const held = image.held();
+        if (held.windows != 0 and h.n_segments == 0 and h.ring == RING_FIXED) {
             const free_slots: u32 = h.n_slots - held.windows;
             const j = judgedReplay(gpa, image, sink.fd, null) catch |e| return switch (e) {
                 // Every window landed and was checkpointed before its slot
@@ -1713,7 +1718,7 @@ const DeathWindows = struct {
     }
 };
 
-test "linux: the death replay is JUDGED — the prefix law at a daemon's death (decision 0003 §BR.3½, §BR.10 (c)): window A landed, B was acked at its landing and its write FAILED (rolled back: never on the device, no slot), C and D were acked at apply on top of it (held in the tail); the supervisor's replay at the death never writes a window past B's hole — the device's chain stays a prefix (its scan confirms no drop and recovers A alone), the windows past it are counted, never written; without the hole every held window lands; a device that does not name the tail's volume is refused (the tail is then held)" {
+test "linux: the death replay is JUDGED — the prefix law at a daemon's death (decision 0003 §BR.3½, §BR.10 (c)): window A landed, B was acked at its landing and its write FAILED (rolled back: never on the device, no slot), C and D were acked at apply on top of it (held in the tail); the supervisor's replay at the death never writes a window past B's hole — the device's chain stays a prefix (its scan confirms no drop and recovers A alone), the windows past it are counted, never written; without the hole every held window lands; a device that does not name the tail's volume is refused (the tail is then held); a tail holding no window reads nothing of the device" {
     if (builtin.os.tag != .linux) return testkit.skip(@src(), .no_linux, "the journal tail is Linux only");
     const gpa = testing.allocator;
     var rig: HeldRig = .{};
@@ -1728,6 +1733,13 @@ test "linux: the death replay is JUDGED — the prefix law at a daemon's death (
     defer tail.deinit();
     var pbuf: [PATH_CAP]u8 = undefined;
     var plen: usize = 0;
+    // A tail holding no window (a clean exit's): nothing to judge, so the
+    // device is never read — even a blank one answers at once.
+    {
+        const d = try linux_tail.replayFd(gpa, tail.fd, &pbuf, &plen);
+        try testing.expect(!d.judged);
+        try testing.expectEqual(@as(u32, 0), d.replay.windows);
+    }
     for (w.images[0].ops) |op| try rig.writeAt(op.bytes, op.offset);
     const c_slot = tail.claim(w.res[2].start, w.res[2].start, w.images[2].ops).?;
     const d_slot = tail.claim(w.res[3].start, w.res[3].start, w.images[3].ops).?;

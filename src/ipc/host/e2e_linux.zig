@@ -63,6 +63,12 @@ const Rig = struct {
     /// Set by a test's last statement: a deinit before it is a failure's,
     /// and echoes the daemon's alert lines as the diagnostic.
     passed: bool = false,
+    /// Mount `--daemon --supervise` (a row that relies on the write cache:
+    /// no write cache without a supervisor, decision 0003 §BQ.6). The
+    /// daemon is then a grandchild: `child` stays null, `child_pid` is its
+    /// ready line's, its term its supervisor's line.
+    supervise: bool = false,
+    supervisor_pid: linux.pid_t = 0,
 
     fn init(gpa: std.mem.Allocator, io: Io) !*Rig {
         const self = try gpa.create(Rig);
@@ -105,6 +111,9 @@ const Rig = struct {
             _ = linux.kill(self.child_pid, .KILL);
             _ = c.wait(self.io) catch {};
         }
+        if (self.supervise) for ([_]linux.pid_t{ self.child_pid, self.supervisor_pid }) |p| if (p != 0 and alive(p)) {
+            _ = linux.kill(p, .KILL);
+        };
         if (!self.passed) self.printDaemonAlerts();
         _ = linux.umount2(self.mp.ptr, linux.MNT.DETACH);
         if (self.log_file) |f| f.close(self.io);
@@ -154,6 +163,20 @@ const Rig = struct {
     fn spawnMount(self: *Rig) !void {
         std.debug.assert(self.child == null);
         if (self.log_file == null) self.log_file = try Io.Dir.cwd().createFile(self.io, self.log_path, .{ .truncate = false });
+        if (self.supervise) {
+            const mark = try self.logLen();
+            const r = try std.process.run(self.gpa, self.io, .{ .argv = &.{ self.bin, "mount", "--daemon", "--supervise", "--log-file", self.log_path, "-o", self.mount_opts, self.meta_uri, self.mp }, .environ_map = &self.env });
+            defer self.gpa.free(r.stdout);
+            defer self.gpa.free(r.stderr);
+            if (!r.term.success()) std.debug.print("\nsupervised mount: {s}\n", .{r.stderr});
+            try testing.expect(r.term.success());
+            const at = try self.awaitLog("ready: ", mark, ready_wait_ns);
+            const text = try self.readLog();
+            defer self.gpa.free(text);
+            self.child_pid = @intCast(numberAfter(text[at..], "(pid ") orelse return error.NoPid);
+            self.supervisor_pid = parentOf(self.child_pid) orelse 0;
+            return;
+        }
         const argv = [_][]const u8{ self.bin, "mount", "-o", self.mount_opts, self.meta_uri, self.mp };
         self.child = try std.process.spawn(self.io, .{ .argv = &argv, .environ_map = &self.env, .stdin = .ignore, .stdout = .{ .file = self.log_file.? }, .stderr = .{ .file = self.log_file.? } });
         self.child_pid = self.child.?.id.?;
@@ -196,6 +219,22 @@ const Rig = struct {
     }
 
     fn waitChild(self: *Rig) !std.process.Child.Term {
+        if (self.supervise) {
+            const deadline = clock.monotonicNs() + exit_wait_ns;
+            while (alive(self.child_pid) and clock.monotonicNs() < deadline) sleepMs(20);
+            if (alive(self.child_pid)) {
+                std.debug.print("\n--- the daemon did not exit within {d} s; killing ---\n", .{exit_wait_ns / std.time.ns_per_s});
+                _ = linux.kill(self.child_pid, .KILL);
+            }
+            var nb: [64]u8 = undefined;
+            const at = try self.awaitLog(try std.fmt.bufPrint(&nb, "daemon {d} exited (wait status 0x", .{self.child_pid}), 0, 30 * std.time.ns_per_s);
+            const text = try self.readLog();
+            defer self.gpa.free(text);
+            const end = std.mem.indexOfScalarPos(u8, text, at, ')') orelse return error.NoWaitStatus;
+            const status = std.fmt.parseInt(u32, text[at..end], 16) catch return error.NoWaitStatus;
+            if (status & 0x7f == 0) return .{ .exited = @intCast((status >> 8) & 0xff) };
+            return .{ .signal = @fromBackingInt(@intCast(status & 0x7f)) };
+        }
         var c = self.child.?;
         self.child = null;
         const deadline = clock.monotonicNs() + exit_wait_ns;
@@ -276,6 +315,18 @@ fn numberAfter(text: []const u8, key: []const u8) ?u64 {
     while (end < text.len and std.ascii.isDigit(text[end])) end += 1;
     if (end == j) return null;
     return std.fmt.parseInt(u64, text[j..end], 10) catch null;
+}
+
+/// The parent of `pid` (`/proc/<pid>/stat`'s fourth field).
+fn parentOf(pid: linux.pid_t) ?linux.pid_t {
+    var pb: [64]u8 = undefined;
+    var buf: [512]u8 = undefined;
+    const path = std.fmt.bufPrint(&pb, "/proc/{d}/stat", .{pid}) catch return null;
+    const text = Io.Dir.cwd().readFile(testing.io, path, &buf) catch return null;
+    const close = std.mem.lastIndexOfScalar(u8, text, ')') orelse return null;
+    var it = std.mem.tokenizeScalar(u8, text[close + 1 ..], ' ');
+    _ = it.next() orelse return null;
+    return std.fmt.parseInt(linux.pid_t, it.next() orelse return null, 10) catch null;
 }
 
 fn alive(pid: linux.pid_t) bool {
@@ -406,6 +457,8 @@ test "smoke: THE INTERCEPTION HOST — format → mount -o interception → the 
     const rig = try Rig.init(gpa, io);
     defer rig.deinit();
     try rig.formatSet();
+    // The write cache's one record (below) needs a supervisor to hold it.
+    rig.supervise = true;
     try rig.spawnMount();
     _ = try rig.awaitLog("ready: ", 0, ready_wait_ns);
     _ = try rig.awaitLog("ipc: interception armed", 0, ready_wait_ns);

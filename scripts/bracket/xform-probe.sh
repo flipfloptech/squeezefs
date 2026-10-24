@@ -14,7 +14,7 @@ KEYARGS=()
 if printf '%s' "$FOPTS" | grep -q '@KEY'; then head -c 32 /dev/urandom > "$S/key"; chmod 0600 "$S/key"; FOPTS=${FOPTS//@KEY/$S/key}; KEYARGS=(--encrypt-key "$S/key"); fi
 # shellcheck disable=SC2086
 "$BIN" format $FOPTS "sqmeta://$S/meta.img" "sqdata://$S/data0.img" > "$S/format.log" 2>&1
-SQUEEZEFS_MEM_BUDGET_MB=6144 "$BIN" mount --daemon --log-file "$S/daemon.log" "${KEYARGS[@]}" "sqmeta://$S/meta.img" "$S/mnt" > "$S/mount.log" 2>&1
+SQUEEZEFS_MEM_BUDGET_MB=6144 "$BIN" mount --daemon --supervise --log-file "$S/daemon.log" "${KEYARGS[@]}" "sqmeta://$S/meta.img" "$S/mnt" > "$S/mount.log" 2>&1
 for i in $(seq 1 100); do grep -q 'ready: ' "$S/daemon.log" && break; sleep 0.2; done
 PID=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["mount"]["pid"])' "$S/mnt/.stats")
 cleanup() { "$BIN" umount "$S/mnt" > /dev/null 2>&1 || { kill -9 "$PID" 2>/dev/null; umount -l "$S/mnt" 2>/dev/null; }; }

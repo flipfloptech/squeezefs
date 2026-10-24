@@ -32,7 +32,7 @@ LEG_MNT=""
 leg_mount() {   # bin meta_uri mnt log opts [extra mount args…]
   local bin=$1 uri=$2 mnt=$3 dlog=$4 opts=$5
   shift 5
-  local argv=("$bin" mount --daemon --log-file "$dlog")
+  local argv=("$bin" mount --daemon --supervise --log-file "$dlog")
   [ -n "$opts" ] && argv+=(-o "$opts")
   argv+=("$@" "$uri" "$mnt")
   : > "$dlog"

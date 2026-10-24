@@ -138,6 +138,17 @@ const Rig = struct {
     log_file: ?Io.File = null,
     child: ?std.process.Child = null,
     child_pid: linux.pid_t = 0,
+    /// The current daemon is a `--daemon --supervise` mount's
+    /// (`spawnSupervised`): a grandchild its supervisor reaps; its log
+    /// offset at the spawn, where the supervisor's verdict is read from.
+    supervised: ?usize = null,
+    /// Every supervisor this rig started: one that outlives its row
+    /// holding a killed daemon's custody is killed at `deinit`.
+    supervisors: Supervisors = .{},
+    /// The set's write cache (`formatSet`'s word; a set formatted by hand
+    /// keeps the product's default, on): its mounts take the posture the
+    /// cache needs (`mountAsSet`).
+    write_cache: bool = true,
     /// The test sent `kill -9` to the current child (the kill rows): a
     /// SIGKILL death is then OURS; any other SIGKILL is a stray runner's.
     killed: bool = false,
@@ -235,6 +246,8 @@ const Rig = struct {
             _ = linux.kill(self.child_pid, .KILL);
             _ = c.wait(self.io) catch {};
         }
+        if (self.supervised != null and alive(self.child_pid)) _ = linux.kill(self.child_pid, .KILL);
+        self.supervisors.killAll();
         self.printDaemonAlerts();
         // Never leave a mount behind.
         _ = linux.umount2(self.mp.ptr, linux.MNT.DETACH);
@@ -282,6 +295,7 @@ const Rig = struct {
     /// fills the set to ENOSPC wants it small).
     fn formatSetSized(self: *Rig, write_cache: bool, extra: []const []const u8, data_bytes: u64) !void {
         if (!write_cache) try self.env.put("SQUEEZEFS_WRITE_CACHE_PCT", "0");
+        self.write_cache = write_cache;
         try self.createMetaVolume();
         for ([_][]const u8{ self.d0, self.d1 }) |dp| {
             const f = try Io.Dir.cwd().createFile(self.io, dp, .{ .truncate = true });
@@ -319,6 +333,10 @@ const Rig = struct {
     /// SIGUSR1 → every stats family lands in the log; the tail from the
     /// mark (owned by the caller).
     fn statsTail(self: *Rig) ![]u8 {
+        // A `--log-file` daemon's sink caps its lines (`log_sink.LINE_MAX`):
+        // the SIGUSR1 dump arrives cut, so a supervised daemon's families
+        // are its `.stats` document.
+        if (self.supervised != null) return self.stats();
         const mark = try self.logLen();
         _ = linux.kill(self.child_pid, .USR1);
         _ = try self.awaitLog("stats daemon: ", mark, 10 * std.time.ns_per_s);
@@ -489,12 +507,42 @@ const Rig = struct {
     }
 
     /// Spawn the foreground mount with its stderr appended to the log file.
+    /// A foreground mount has no supervisor, so no write cache (decision
+    /// 0003 §BQ.6): a row that needs it mounts with `spawnSupervised`.
     fn spawnMount(self: *Rig, extra: []const []const u8) !void {
         return self.spawnMountOf(self.meta_uri, extra);
     }
 
+    /// The `--daemon --supervise` mount (the posture the write cache needs:
+    /// no write cache without a supervisor, decision 0003 §BQ.6), returned
+    /// once ready and watched: its daemon is the rig's (`child_pid`, the
+    /// kill, `.stats`, the umount), a grandchild its supervisor reaps — the
+    /// rig waits for its death and reads its wait status off the
+    /// supervisor's line (`waitChild`).
+    fn spawnSupervised(self: *Rig, extra: []const []const u8) !void {
+        std.debug.assert(self.child == null and self.supervised == null);
+        if (self.log_file == null) self.log_file = try openLogAppend(self.log_path);
+        const mark = try self.logLen();
+        self.child_pid = try mountSupervised(self, self.log_path, &.{}, extra, self.meta_uri, self.mp, &self.env, mark);
+        self.supervisors.note(self.child_pid);
+        self.supervised = mark;
+        self.killed = false;
+        try writePidFile(self.io, self.work, "daemon", self.child_pid);
+    }
+
+    /// The set's posture: supervised when it was formatted for the write
+    /// cache (no write cache without a supervisor, decision 0003 §BQ.6),
+    /// foreground otherwise. Rows written for the write cache mount so.
+    fn mountAsSet(self: *Rig, extra: []const []const u8) !void {
+        return if (self.write_cache) self.spawnSupervised(extra) else self.spawnMount(extra);
+    }
+
+    fn posture(self: *const Rig) MountPosture {
+        return if (self.write_cache) .supervised else .foreground;
+    }
+
     fn spawnMountOf(self: *Rig, meta_uri: []const u8, extra: []const []const u8) !void {
-        std.debug.assert(self.child == null);
+        std.debug.assert(self.child == null and self.supervised == null);
         if (self.log_file == null) self.log_file = try openLogAppend(self.log_path);
         var argv: [16][]const u8 = undefined;
         var n: usize = 0;
@@ -526,8 +574,8 @@ const Rig = struct {
     /// test loud rather than failing a contract nobody tested; any other
     /// exit is the daemon's own and fails.
     fn expectAlive(self: *Rig, waiting_for: []const u8) !void {
-        const c = self.child orelse return;
-        if (alive(c.id.?)) return;
+        if (self.child == null and self.supervised == null) return;
+        if (alive(self.child_pid)) return;
         const term = try self.waitChild();
         return judgeDeath("A", term, self.killed, waiting_for, self.readLog() catch null, self.gpa);
     }
@@ -581,6 +629,12 @@ const Rig = struct {
 
     /// Wait for the mount child to exit; its term.
     fn waitChild(self: *Rig) !std.process.Child.Term {
+        if (self.supervised) |mark| {
+            self.supervised = null;
+            const term = try awaitSupervisedExit(self, self.log_path, "A", self.child_pid, mark);
+            if (!self.killed) printUncleanExit("A", term, self.readLog() catch null, self.gpa);
+            return term;
+        }
         var c = self.child.?;
         self.child = null;
         const deadline = clock.monotonicNs() + exit_wait_ns;
@@ -621,6 +675,102 @@ fn openLogAppend(path: [:0]const u8) !Io.File {
     const rc = linux.open(path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true, .CLOEXEC = true }, 0o644);
     if (linux.errno(rc) != .SUCCESS) return error.LogOpenFailed;
     return .{ .handle = @intCast(rc), .flags = .{ .nonblocking = false } };
+}
+
+/// The supervisors a rig started (the daemons' parents, noted at the
+/// spawn), killed when the rig goes: a supervisor holding a killed daemon's
+/// ring or held tail waits for a successor that never comes.
+const Supervisors = struct {
+    pids: [32]linux.pid_t = undefined,
+    n: usize = 0,
+
+    fn note(self: *Supervisors, daemon_pid: linux.pid_t) void {
+        const sup = ppidOf(daemon_pid) orelse return;
+        if (self.n == self.pids.len) return;
+        self.pids[self.n] = sup;
+        self.n += 1;
+    }
+
+    fn killAll(self: *Supervisors) void {
+        for (self.pids[0..self.n]) |p| if (alive(p)) {
+            _ = linux.kill(p, .KILL);
+        };
+        self.n = 0;
+    }
+};
+
+/// `mount --daemon --supervise --log-file <log> extra… <meta> <mp>` behind
+/// `prefix` (a peer's `unshare`): returns after ready; the daemon's pid off
+/// its ready line, once its supervisor watches it.
+fn mountSupervised(rig: *Rig, log_path: []const u8, prefix: []const []const u8, extra: []const []const u8, meta_uri: []const u8, mp: []const u8, env: *const std.process.Environ.Map, mark: usize) !linux.pid_t {
+    var argv: [32][]const u8 = undefined;
+    var n: usize = 0;
+    for (prefix) |a| {
+        argv[n] = a;
+        n += 1;
+    }
+    for ([_][]const u8{ rig.bin, "mount", "--daemon", "--supervise", "--log-file", log_path }) |a| {
+        argv[n] = a;
+        n += 1;
+    }
+    for (extra) |a| {
+        argv[n] = a;
+        n += 1;
+    }
+    argv[n] = meta_uri;
+    argv[n + 1] = mp;
+    n += 2;
+    const r = try std.process.run(rig.gpa, rig.io, .{ .argv = argv[0..n], .environ_map = env });
+    defer rig.freeRun(r);
+    if (!r.term.success()) {
+        const t = Io.Dir.cwd().readFileAlloc(rig.io, log_path, rig.gpa, .limited(16 << 20)) catch null;
+        defer if (t) |x| rig.gpa.free(x);
+        std.debug.print("\n--- supervised mount of {s} ({f}): {s}\n--- its log ---\n{s}\n", .{ mp, r.term, r.stderr, if (t) |x| x[@min(mark, x.len)..] else "" });
+        return error.MountFailed;
+    }
+    const ready_i = try awaitLogAt(rig, log_path, "ready: ", mark, ready_wait_ns);
+    const text = try Io.Dir.cwd().readFileAlloc(rig.io, log_path, rig.gpa, .limited(16 << 20));
+    defer rig.gpa.free(text);
+    const pid: linux.pid_t = @intCast(numberAfter(text[ready_i..], "(pid ") orelse return error.NoPid);
+    _ = try awaitLogAt(rig, log_path, "supervisor: watching daemon ", ready_i, ready_wait_ns);
+    return pid;
+}
+
+/// Bounded poll for `needle` in the log at `log_path` (from `from`).
+fn awaitLogAt(rig: *Rig, log_path: []const u8, needle: []const u8, from: usize, deadline_ns: u64) !usize {
+    const deadline = clock.monotonicNs() + deadline_ns;
+    while (true) {
+        const text = try Io.Dir.cwd().readFileAlloc(rig.io, log_path, rig.gpa, .limited(16 << 20));
+        defer rig.gpa.free(text);
+        if (text.len > from) if (std.mem.indexOf(u8, text[from..], needle)) |i| return from + i + needle.len;
+        if (clock.monotonicNs() >= deadline) {
+            std.debug.print("\n--- timed out waiting for '{s}' in {s} ---\n{s}\n", .{ needle, log_path, text[@min(from, text.len)..] });
+            return error.Timeout;
+        }
+        sleepMs(20);
+    }
+}
+
+/// A supervised daemon's end: its death awaited (a wedge past the exit
+/// bound is dumped and killed), then its supervisor's verdict line —
+/// `daemon <pid> exited (wait status 0x…)` — read as the term.
+fn awaitSupervisedExit(rig: *Rig, log_path: []const u8, name: []const u8, pid: linux.pid_t, mark: usize) !std.process.Child.Term {
+    const deadline = clock.monotonicNs() + exit_wait_ns;
+    while (alive(pid) and clock.monotonicNs() < deadline) sleepMs(20);
+    if (alive(pid)) {
+        std.debug.print("\n--- daemon {s} did not exit within {d} s; killing ---\n", .{ name, exit_wait_ns / std.time.ns_per_s });
+        printWedge(rig.io, name, pid, log_path, rig.gpa);
+        _ = linux.kill(pid, .KILL);
+    }
+    var nb: [64]u8 = undefined;
+    const needle = try std.fmt.bufPrint(&nb, "daemon {d} exited (wait status 0x", .{pid});
+    const at = try awaitLogAt(rig, log_path, needle, mark, 30 * std.time.ns_per_s);
+    const text = try Io.Dir.cwd().readFileAlloc(rig.io, log_path, rig.gpa, .limited(16 << 20));
+    defer rig.gpa.free(text);
+    const end = std.mem.indexOfScalarPos(u8, text, at, ')') orelse return error.NoWaitStatus;
+    const status = std.fmt.parseInt(u32, text[at..end], 16) catch return error.NoWaitStatus;
+    if (status & 0x7f == 0) return .{ .exited = @intCast((status >> 8) & 0xff) };
+    return .{ .signal = @fromBackingInt(@intCast(status & 0x7f)) };
 }
 
 fn alive(pid: linux.pid_t) bool {
@@ -1617,6 +1767,8 @@ const Peer = struct {
     log_file: ?Io.File = null,
     child: ?std.process.Child = null,
     pid: linux.pid_t = 0,
+    /// A `--daemon --supervise` daemon (`Rig.supervised`'s law).
+    supervised: ?usize = null,
     /// The test sent `kill -9` to the current child (`Rig.killed`'s law).
     killed: bool = false,
 
@@ -1640,6 +1792,7 @@ const Peer = struct {
             _ = linux.kill(self.pid, .KILL);
             _ = c.wait(self.rig.io) catch {};
         }
+        if (self.supervised != null and alive(self.pid)) _ = linux.kill(self.pid, .KILL);
         self.printAlerts();
         _ = linux.umount2(self.mp.ptr, linux.MNT.DETACH);
         if (self.log_file) |f| f.close(self.rig.io);
@@ -1664,8 +1817,39 @@ const Peer = struct {
         }
     }
 
+    /// `Rig.spawnSupervised` for the peer (its node's UTS namespace too).
+    fn spawnSupervised(self: *Peer, extra: []const []const u8) !void {
+        std.debug.assert(self.child == null and self.supervised == null);
+        const rig = self.rig;
+        if (self.log_file == null) self.log_file = try openLogAppend(self.log_path);
+        const mark = blk: {
+            const t = try self.readLog();
+            defer rig.gpa.free(t);
+            break :blk t.len;
+        };
+        var prefix: [6][]const u8 = undefined;
+        var n: usize = 0;
+        if (self.node) |node| {
+            for ([_][]const u8{ "unshare", "-u", "sh", "-c", "hostname \"$0\" && exec \"$@\"", node }) |a| {
+                prefix[n] = a;
+                n += 1;
+            }
+        }
+        self.pid = try mountSupervised(rig, self.log_path, prefix[0..n], extra, rig.meta_uri, self.mp, self.env orelse &rig.env, mark);
+        rig.supervisors.note(self.pid);
+        self.supervised = mark;
+        self.killed = false;
+        var tag_buf: [32]u8 = undefined;
+        try writePidFile(rig.io, rig.work, try std.fmt.bufPrint(&tag_buf, "daemon-{s}", .{self.name}), self.pid);
+    }
+
+    /// `Rig.mountAsSet` for the peer.
+    fn spawnAsSet(self: *Peer, extra: []const []const u8) !void {
+        return if (self.rig.write_cache) self.spawnSupervised(extra) else self.spawn(extra);
+    }
+
     fn spawn(self: *Peer, extra: []const []const u8) !void {
-        std.debug.assert(self.child == null);
+        std.debug.assert(self.child == null and self.supervised == null);
         const rig = self.rig;
         if (self.log_file == null) self.log_file = try openLogAppend(self.log_path);
         var argv: [24][]const u8 = undefined;
@@ -1718,7 +1902,7 @@ const Peer = struct {
 
     /// `Rig.expectAlive`'s law for the peer.
     fn expectAlive(self: *Peer, waiting_for: []const u8) !void {
-        if (self.child == null or alive(self.pid)) return;
+        if ((self.child == null and self.supervised == null) or alive(self.pid)) return;
         const term = try self.waitExit();
         return judgeDeath(self.name, term, self.killed, waiting_for, self.readLog() catch null, self.rig.gpa);
     }
@@ -1795,6 +1979,12 @@ const Peer = struct {
     }
 
     fn waitExit(self: *Peer) !std.process.Child.Term {
+        if (self.supervised) |mark| {
+            self.supervised = null;
+            const term = try awaitSupervisedExit(self.rig, self.log_path, self.name, self.pid, mark);
+            if (!self.killed) printUncleanExit(self.name, term, self.readLog() catch null, self.rig.gpa);
+            return term;
+        }
         var c = self.child.?;
         self.child = null;
         const deadline = clock.monotonicNs() + exit_wait_ns;
@@ -3084,11 +3274,11 @@ test "smoke: A JOINER'S CLEAN UNMOUNT AND REJOIN while the manager stays up — 
     try rig.env.put("SQUEEZEFS_TEST_MEMBERSHIP_T_OWNER_MS", try std.fmt.bufPrint(&t_owner_text, "{d}", .{smoke_t_owner_ms}));
     try rig.formatSet(true);
     try rig.createImage();
-    try rig.spawnMount(&.{});
+    try rig.mountAsSet(&.{});
     _ = try rig.awaitReady(0);
     const b = try Peer.init(rig, "b");
     defer b.deinit();
-    try b.spawn(&.{});
+    try b.spawnAsSet(&.{});
     _ = try b.awaitReady();
     {
         const text = try b.readLog();
@@ -3109,7 +3299,7 @@ test "smoke: A JOINER'S CLEAN UNMOUNT AND REJOIN while the manager stays up — 
         defer gpa.free(from_a);
         try testing.expectEqualStrings("ok\n", from_a);
         const mark = try b.logLen();
-        try b.spawn(&.{});
+        try b.spawnAsSet(&.{});
         const ready = try b.awaitLog("ready: ", mark, ready_wait_ns);
         const text = try b.readLog();
         defer gpa.free(text);
@@ -3195,7 +3385,7 @@ fn joinAfterManagerRemounts(ends: []const ManagerEnd) !void {
     try rig.env.put("SQUEEZEFS_TEST_MEMBERSHIP_T_OWNER_MS", try std.fmt.bufPrint(&t_owner_text, "{d}", .{smoke_t_owner_ms}));
     try rig.formatSet(true);
     try rig.createImage();
-    try rig.spawnMount(&.{});
+    try rig.mountAsSet(&.{});
     _ = try rig.awaitReady(0);
     var files: usize = 0;
     for (0..ends.len + 1) |k| {
@@ -3222,7 +3412,7 @@ fn joinAfterManagerRemounts(ends: []const ManagerEnd) !void {
         };
         if (k > 0) {
             const mark = try rig.logLen();
-            try rig.spawnMount(&.{});
+            try rig.mountAsSet(&.{});
             _ = try rig.awaitReady(mark);
             // Every earlier incarnation's file is whole on the new one.
             const back = try rig.onMount("sha256sum --quiet -c \"$1/remount.sha\" && echo ok");
@@ -3250,7 +3440,7 @@ fn joinAfterManagerRemounts(ends: []const ManagerEnd) !void {
     defer gpa.free(a_endpoint);
     const b = try Peer.init(rig, "b");
     defer b.deinit();
-    try b.spawn(&.{});
+    try b.spawnAsSet(&.{});
     _ = try b.awaitReady();
     {
         const text = try b.readLog();
@@ -3332,7 +3522,7 @@ test "smoke: TWO MOUNTS OF ONE SET ON ONE HOST — each member holds its OWN wri
     try rig.env.put("SQUEEZEFS_TEST_MEMBERSHIP_T_OWNER_MS", try std.fmt.bufPrint(&t_owner_text, "{d}", .{smoke_t_owner_ms}));
     try rig.formatSet(true);
     try rig.createImage();
-    try rig.spawnMount(&.{});
+    try rig.mountAsSet(&.{});
     _ = try rig.awaitReady(0);
     var script: std.Io.Writer.Allocating = .init(gpa);
     defer script.deinit();
@@ -3354,7 +3544,7 @@ test "smoke: TWO MOUNTS OF ONE SET ON ONE HOST — each member holds its OWN wri
     // B joins beside A's LIVE ring: its own root, nothing recovered.
     const b = try Peer.init(rig, "b");
     defer b.deinit();
-    try b.spawn(&.{});
+    try b.spawnAsSet(&.{});
     _ = try b.awaitReady();
     {
         const text = try b.readLog();
@@ -3414,7 +3604,7 @@ test "smoke: TWO MOUNTS OF ONE SET ON ONE HOST — each member holds its OWN wri
     _ = try fsckClean(rig, "the member-scope row");
     // Every file of both members after a remount.
     const mark_r = try rig.logLen();
-    try rig.spawnMount(&.{});
+    try rig.mountAsSet(&.{});
     _ = try rig.awaitReady(mark_r);
     {
         const out = try rig.onMount("sha256sum --quiet -c \"$1/scope.sha\" && echo ok");
@@ -3847,11 +4037,11 @@ test "smoke: A RENAME THROUGH A JOINED MOUNT INTO THE MANAGER'S DIRECTORY RESOLV
     try rig.env.put("SQUEEZEFS_TEST_MEMBERSHIP_T_OWNER_MS", try std.fmt.bufPrint(&t_owner_text, "{d}", .{smoke_t_owner_ms}));
     try rig.formatSet(true);
     try rig.createImage();
-    try rig.spawnMount(&.{});
+    try rig.mountAsSet(&.{});
     _ = try rig.awaitReady(0);
     const b = try Peer.init(rig, "b");
     defer b.deinit();
-    try b.spawn(&.{});
+    try b.spawnAsSet(&.{});
     _ = try b.awaitReady();
     {
         const text = try b.readLog();
@@ -4468,11 +4658,11 @@ test "smoke: THE WRITE CACHE'S RECALL (charter §6.1 coherence, 2026-10-21) — 
     try rig.env.put("SQUEEZEFS_TEST_MEMBERSHIP_T_OWNER_MS", try std.fmt.bufPrint(&t_owner_text, "{d}", .{smoke_t_owner_ms}));
     try rig.formatSet(true);
     try rig.createImage();
-    try rig.spawnMount(&.{});
+    try rig.mountAsSet(&.{});
     _ = try rig.awaitReady(0);
     const b = try Peer.init(rig, "b");
     defer b.deinit();
-    try b.spawn(&.{});
+    try b.spawnAsSet(&.{});
     _ = try b.awaitReady();
     // B's file: 64 KiB past the inline ceiling, under the block — staged
     // in B's write cache, no fsync, no promotion of its own.
@@ -8337,6 +8527,10 @@ test "smoke: A FAILED VOLUME'S DAEMON SERVES EIO UNTIL ITS UNMOUNT AND NEVER DIE
         if (!r.term.success()) std.debug.print("\nformat: {s}\n", .{r.stderr});
         try testing.expect(r.term.success());
     }
+    // A cycle's failed replay is held (decision 0003 §BQ) — here, in the
+    // rig's work dir — and the next cycle's mount replays it.
+    var held_buf: [linux.PATH_MAX]u8 = undefined;
+    try rig.env.put("SQUEEZEFS_TEST_JOURNAL_TAIL_DIR", try std.fmt.bufPrint(&held_buf, "{s}/held-tails", .{rig.work}));
     var latched_cycles: usize = 0;
     var lines_once = true;
     var cycle: usize = 0;
@@ -10021,7 +10215,7 @@ fn dataPlanePass(rig: *Rig, cache: bool) !void {
     if (cache) try rig.env.put("SQUEEZEFS_MEM_BUDGET_MB", std.fmt.comptimePrint("{d}", .{cache_row_budget_mib}));
     try rig.formatSet(cache);
     try rig.createImage();
-    try rig.spawnMount(&.{});
+    try rig.mountAsSet(&.{});
     const ready_at = try rig.awaitReady(0);
     var zc_legs = false;
     {
@@ -10215,7 +10409,7 @@ fn dataPlanePass(rig: *Rig, cache: bool) !void {
     // Remount: the small files intact (packed reads), rm → the baseline,
     // the reclaim ledger closed, a clean unmount.
     const mark2 = try rig.logLen();
-    try rig.spawnMount(&.{});
+    try rig.mountAsSet(&.{});
     _ = try rig.awaitReady(mark2);
     {
         const script = try smallFilesVerifyScript(gpa, small_n);
@@ -10800,7 +10994,7 @@ test "smoke: the cache-path overwrite and storm stages LOOPED — 0 lost overwri
     defer rig.deinit();
     try rig.formatSet(true);
     try rig.createImage();
-    try rig.spawnMount(&.{});
+    try rig.mountAsSet(&.{});
     _ = try rig.awaitReady(0);
     {
         const out = try rig.onMountTimed(stage_dd_script, stage_loop_timeout_s);
@@ -10943,9 +11137,15 @@ fn recoveryOf(seg: []const u8) !Recovery {
 /// or lost (C2) on both volumes. `recovered` = the replay fsck's guarded
 /// open already performed (its close checkpointed, so THIS open is clean
 /// by design); null = this open replays and its numbers are read here.
-fn remountAfterKill(rig: *Rig, recovered: ?Recovery) !Recovery {
+/// `posture` = the killed mount's: a supervised kill's ring waits for a
+/// supervised successor (a mount without a write cache refuses a held
+/// ring, decision 0003 §BQ.6).
+fn remountAfterKill(rig: *Rig, recovered: ?Recovery, posture: MountPosture) !Recovery {
     const mark = try rig.logLen();
-    try rig.spawnMount(&.{});
+    switch (posture) {
+        .foreground => try rig.spawnMount(&.{}),
+        .supervised => try rig.spawnSupervised(&.{}),
+    }
     const ready = try rig.awaitReady(mark);
     const text = try rig.readLog();
     defer rig.gpa.free(text);
@@ -11150,7 +11350,7 @@ test "smoke: THE KILL MATRIX — kill -9 at 50/100/150 MiB of a 200 MiB dd and m
         try testing.expect(!(try dd.wait(io)).success());
         try rig.umountAfterKill();
         const recovered = try fsckClean(rig, "the mid-dd kill");
-        const rec = try remountAfterKill(rig, recovered);
+        const rec = try remountAfterKill(rig, recovered, .foreground);
         // Every acked file byte-exact; the in-flight file exact or holes.
         var dir = try Io.Dir.cwd().openDir(io, rig.mp, .{});
         defer dir.close(io);
@@ -11210,26 +11410,27 @@ test "smoke: THE KILL MATRIX — kill -9 at 50/100/150 MiB of a 200 MiB dd and m
     }
 }
 
-/// Who holds the write cache across the kill matrix's storm kill (charter
-/// §6.1 "Staged"): `foreground` — nobody: a crash of the process loses its
-/// unsynced residents, a power cut's exposure (said once at mount: "no
-/// supervisor holds the ring"); `supervised` — the supervisor replays the
-/// journal tail and hands the ring to the member's next mount: no staged
-/// byte the daemon acked is lost (the kill -9 law).
-const StormPosture = enum { foreground, supervised };
+/// The mount's posture across a kill (charter §6.1 "Staged", decision
+/// 0003 §BQ.6): `foreground` — no supervisor, so no write cache: every
+/// write goes to the data volumes under the write-back bound, and a crash
+/// loses at most what had not landed — never a byte under a durable size
+/// (§AL.5); `supervised` — the write cache on, the supervisor replays the
+/// journal tail and hands the ring to the member's next (supervised)
+/// mount: no staged byte the daemon acked is lost (the kill -9 law).
+const MountPosture = enum { foreground, supervised };
 
 /// The reach the staged arm rings whole — the set's block (the format
 /// default, 4 MiB): a layout naming a ring record claims at most this.
 const staged_reach: u64 = 4 << 20;
 
-/// The resident the storm kill always finds in the ring: closed, never
-/// synced — nothing promotes it before the kill (no write past the block,
-/// no fsync, a ring far under its bound), so every run meets the posture's
-/// law, not only one whose kill lands before a cp's promotion. Its bytes
-/// are the image's past every storm source. 3 MiB: over half the block, so
-/// a stray promotion (a host-wide sync(2) reaches every FUSE mount as
-/// SYNCFS) takes its own block, never a packed slot whose open pack keeps
-/// its block until the dismount seal (the row's df baseline).
+/// The resident the storm kill always finds: closed, never synced —
+/// nothing promotes it before the kill (no write past the block, no fsync,
+/// a ring far under its bound), so every run meets the posture's law, not
+/// only one whose kill lands before a cp's promotion. Its bytes are the
+/// image's past every storm source. 3 MiB: over half the block, so a stray
+/// promotion (a host-wide sync(2) reaches every FUSE mount as SYNCFS)
+/// takes its own block, never a packed slot whose open pack keeps its
+/// block until the dismount seal (the row's df baseline).
 const storm_resident_off_mib: u64 = 240;
 const storm_resident_mib: u64 = 3;
 comptime {
@@ -11239,45 +11440,31 @@ comptime {
 
 /// The 8-way `cp` storm, killed once `storm_kill_mib` are claimed — the
 /// KERNEL's sizes: its writeback cache runs them ahead of the daemon, which
-/// has acked only the storm's first ~100 ms at the kill (each cp's 4 MiB
-/// staged image, most of them already promoted to their own block) → fsck
-/// clean → remount → the census per file, judged by the posture. After a
-/// FOREGROUND kill a staged image whose layout landed (the staged layout
-/// and its size are one transaction) names a ring record that died with
-/// the process: the file is ABSENT WHOLE (charter §1 item 10: an
-/// acknowledged unsynced write is whole or absent) — at most one block,
-/// every page zero, its reads counted `staged_payload_lost_reads` (red
-/// before: the row asserted 0 after a foreground kill, the file-backed
-/// ring's posture; beside the full smoke 6 of 240 copies read one cp's 4
-/// MiB as zeros, its staged commit 4–23 ms before the kill, its promotion
-/// never begun). After a SUPERVISED kill no staged byte is lost: the
-/// remount recovers the ring, the counter stays 0. Every other page exact
-/// or a hole; the acked files byte-exact; the storm files and the resident
-/// are removed after.
-fn killMatrixStorm(rig: *Rig, image: Io.File, acked: usize, posture: StormPosture) !void {
+/// has acked only the storm's first ~100 ms at the kill → fsck clean →
+/// remount (in the same posture: a supervised kill's ring waits for a
+/// supervised successor) → the census per file, judged by the posture. No
+/// posture loses a staged read (`staged_payload_lost_reads` 0): the
+/// foreground mount stages nothing, the supervised one hands its ring
+/// over. After a FOREGROUND kill no page under a file's durable size reads
+/// zeros (the size never ahead of its bytes — before the ruling, its ring
+/// died with it and a staged image read 4 MiB of zeros under its landed
+/// size, 6 of 240 copies beside the full smoke). After a SUPERVISED kill
+/// the closed resident is exact. The acked files byte-exact; the storm
+/// files and the resident are removed after.
+fn killMatrixStorm(rig: *Rig, image: Io.File, acked: usize, posture: MountPosture) !void {
     const gpa = rig.gpa;
     const io = rig.io;
     var pb: [256:0]u8 = undefined;
-    var ready: usize = 0;
-    var pid: linux.pid_t = 0;
-    if (posture == .supervised) {
-        const mark = try rig.logLen();
-        const r = try rig.squeezefs(&.{ "mount", "--daemon", "--supervise", "--log-file", rig.log_path, rig.meta_uri, rig.mp });
-        defer rig.freeRun(r);
-        if (!r.term.success()) std.debug.print("\ndaemon mount: {s}\n", .{r.stderr});
-        try testing.expect(r.term.success());
-        ready = try rig.awaitReady(mark);
-        const text = try rig.readLog();
-        defer gpa.free(text);
-        pid = @intCast(numberAfter(text[ready..], "(pid ") orelse return error.NoPid);
-        try testing.expect(std.mem.indexOf(u8, text[mark..], "write cache: the memfd and its claim handed to the supervisor") != null);
+    // The foreground storm runs on the rig's live mount; the supervised one
+    // mounts its own.
+    const ready_mark = try rig.logLen();
+    if (posture == .supervised) try rig.spawnSupervised(&.{});
+    const ready = if (posture == .supervised) try rig.awaitReady(ready_mark) else ready_mark;
+    {
+        const st = try rig.stats();
+        defer gpa.free(st);
+        try testing.expectEqual(@as(?u64, @intFromBool(posture == .supervised)), numberAfter(st, "\"data_staging_on\":"));
     }
-    // A failed step before the kill leaves no daemon behind (its supervisor
-    // replays the tail; the rig's teardown detaches the mount).
-    var daemon_live = posture == .supervised;
-    defer if (daemon_live) {
-        _ = linux.kill(pid, .KILL);
-    };
     {
         var script: [160]u8 = undefined;
         const out = try rig.onMount(try std.fmt.bufPrint(&script, "dd if=\"$1/image\" of=resident bs=1M skip={d} count={d} status=none && echo ok", .{ storm_resident_off_mib, storm_resident_mib }));
@@ -11300,19 +11487,13 @@ fn killMatrixStorm(rig: *Rig, image: Io.File, acked: usize, posture: StormPostur
         }
     }
     try testing.expect(claimed >= storm_kill_mib << 20);
-    switch (posture) {
-        .foreground => {
-            _ = linux.kill(rig.child_pid, .KILL);
-            try testing.expectEqual(std.process.Child.Term{ .signal = .KILL }, try rig.waitChild());
-        },
-        .supervised => {
-            daemon_live = false;
-            _ = linux.kill(pid, .KILL);
-        },
-    }
+    rig.killed = true;
+    _ = linux.kill(rig.child_pid, .KILL);
+    // A supervised daemon's term is its supervisor's line, logged after the
+    // replay and the guard release: both come before fsck's open; the ring
+    // waits for the remount.
+    try testing.expectEqual(std.process.Child.Term{ .signal = .KILL }, try rig.waitChild());
     _ = try storm.wait(io);
-    // The supervisor's replay and guard release come before fsck's open;
-    // the ring waits for the remount.
     if (posture == .supervised) _ = try rig.awaitLog("exited (wait status 0x9); done", ready, 30 * std.time.ns_per_s);
     try rig.umountAfterKill();
     const recovered = try fsckClean(rig, switch (posture) {
@@ -11320,12 +11501,15 @@ fn killMatrixStorm(rig: *Rig, image: Io.File, acked: usize, posture: StormPostur
         .supervised => "the storm kill (supervised)",
     });
     const mark = try rig.logLen();
-    const rec = try remountAfterKill(rig, recovered);
-    const ring_records = blk: {
-        const text = try rig.readLog();
-        defer gpa.free(text);
-        const at = mark + (std.mem.indexOf(u8, text[mark..], " in a sealed memfd ") orelse return error.NoWriteCacheLine);
-        break :blk numberAfter(text[at..], "recovered ") orelse return error.NoWriteCacheLine;
+    const rec = try remountAfterKill(rig, recovered, posture);
+    const ring_records = switch (posture) {
+        .foreground => 0,
+        .supervised => blk: {
+            const text = try rig.readLog();
+            defer gpa.free(text);
+            const at = mark + (std.mem.indexOf(u8, text[mark..], " in a sealed memfd ") orelse return error.NoWriteCacheLine);
+            break :blk numberAfter(text[at..], "recovered ") orelse return error.NoWriteCacheLine;
+        },
     };
     var dir = try Io.Dir.cwd().openDir(io, rig.mp, .{});
     defer dir.close(io);
@@ -11355,25 +11539,24 @@ fn killMatrixStorm(rig: *Rig, image: Io.File, acked: usize, posture: StormPostur
         try testing.expectEqual(acked_mib << 20, c.size);
         try testing.expectEqual(@as(u64, 0), c.holes);
     }
-    try testing.expectEqual(judge.lost, try stagedLostReads(rig));
-    std.debug.print("smoke[kill]: storm killed at {d} MiB claimed ({t}): replayed {d} entries ({d} torn dropped), the remount recovered {d} ring record(s); {d} of 8 files present claiming {d} MiB: {d} pages exact, {d} holes, 0 torn; the resident {s}; {d} staged image(s) absent whole, staged_payload_lost_reads {d}; {d} acked file(s) byte-exact; C8 0 drift, C2 0/0\n", .{ claimed >> 20, posture, rec.replayed, rec.torn, ring_records, present, sizes >> 20, exact, holes, if (resident) |c| (if (c.exact != 0) "exact" else "absent whole") else "absent", judge.absent, judge.lost, acked });
+    try testing.expectEqual(@as(u64, 0), try stagedLostReads(rig));
+    std.debug.print("smoke[kill]: storm killed at {d} MiB claimed ({t}): replayed {d} entries ({d} torn dropped), the remount recovered {d} ring record(s); {d} of 8 files present claiming {d} MiB: {d} pages exact, {d} holes, 0 torn; the resident {s}; staged_payload_lost_reads 0; {d} acked file(s) byte-exact; C8 0 drift, C2 0/0\n", .{ claimed >> 20, posture, rec.replayed, rec.torn, ring_records, present, sizes >> 20, exact, holes, if (resident) |c| (if (c.size == storm_resident_mib << 20) "whole" else if (c.size == 0) "empty" else "a prefix") else "absent", acked });
     {
         const out = try rig.onMount("rm -f storm* resident && echo ok");
         defer gpa.free(out);
     }
 }
 
-/// The storm census's per-file verdict: the file's reads moved
-/// `staged_payload_lost_reads` ⇔ a staged image the kill discarded —
-/// lawful only after a FOREGROUND kill, and only ABSENT WHOLE (at most one
-/// block, no page of it the image's); any other page exact or a hole.
+/// The storm census's per-file verdict: no posture loses a staged read
+/// (the counter moved: the custody law broken), and after a FOREGROUND
+/// kill no page under the durable size is a hole (the size never ahead of
+/// its bytes, §AL.5); a supervised kill's pages are exact or holes.
 const StormJudge = struct {
     rig: *Rig,
     dir: Io.Dir,
     image: Io.File,
-    posture: StormPosture,
+    posture: MountPosture,
     lost: u64,
-    absent: usize = 0,
 
     /// The census of `name` (null: the file is absent), judged.
     fn census(self: *StormJudge, name: []const u8, src_off: u64, cap: u64) !?Census {
@@ -11383,12 +11566,12 @@ const StormJudge = struct {
         };
         const now = try stagedLostReads(self.rig);
         if (now != self.lost) {
-            if (self.posture == .supervised or c.size > staged_reach or c.exact != 0) {
-                std.debug.print("\n--- {s} after the {t} kill: {d} staged read(s) lost over {d} B claimed, {d} pages exact ---\n", .{ name, self.posture, now - self.lost, c.size, c.exact });
-                return error.StagedCustodyLost;
-            }
-            self.absent += 1;
-            self.lost = now;
+            std.debug.print("\n--- {s} after the {t} kill: {d} staged read(s) lost over {d} B claimed, {d} pages exact ---\n", .{ name, self.posture, now - self.lost, c.size, c.exact });
+            return error.StagedCustodyLost;
+        }
+        if (self.posture == .foreground and c.holes != 0) {
+            std.debug.print("\n--- {s} after the foreground kill: {d} B durable, {d} pages exact, {d} zero pages under the size (the size ahead of its bytes) ---\n", .{ name, c.size, c.exact, c.holes });
+            return error.SizeAheadOfBytes;
         }
         return c;
     }
@@ -11476,8 +11659,7 @@ test "smoke: KILL -9 BETWEEN A PROMOTION'S COMMIT AND ITS RING RELEASE (the kill
     try rig.env.put("SQUEEZEFS_BLOCK_REFS_VERIFY", "1");
     const image = try Io.Dir.cwd().openFile(io, rig.image, .{});
     defer image.close(io);
-    try rig.spawnMount(&.{});
-    _ = try rig.awaitReady(0);
+    try rig.spawnSupervised(&.{});
     const baseline = try rig.usedKib();
     try rig.umount();
     try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
@@ -11487,7 +11669,7 @@ test "smoke: KILL -9 BETWEEN A PROMOTION'S COMMIT AND ITS RING RELEASE (the kill
     //     pass meets a record whose inode is gone.
     try killInsidePromotion(rig, "a");
     var mark = try rig.logLen();
-    _ = try remountAfterKill(rig, null);
+    _ = try remountAfterKill(rig, null, .supervised);
     {
         const text = try rig.readLog();
         defer gpa.free(text);
@@ -11534,7 +11716,7 @@ test "smoke: KILL -9 BETWEEN A PROMOTION'S COMMIT AND ITS RING RELEASE (the kill
     mark = try rig.logLen();
     // The fsck's guarded open replayed and checkpointed: this open is clean
     // by design (the explicit form); the ring record is read here.
-    _ = try remountAfterKill(rig, .{ .replayed = 0, .torn = 0, .ring_records = 1, .ring_torn = 0 });
+    _ = try remountAfterKill(rig, .{ .replayed = 0, .torn = 0, .ring_records = 1, .ring_torn = 0 }, .supervised);
     {
         const text = try rig.readLog();
         defer gpa.free(text);
@@ -11558,8 +11740,7 @@ test "smoke: KILL -9 BETWEEN A PROMOTION'S COMMIT AND ITS RING RELEASE (the kill
     }
     _ = try fsckClean(rig, "the clean unmount after the unnamed record");
     mark = try rig.logLen();
-    try rig.spawnMount(&.{});
-    _ = try rig.awaitReady(mark);
+    try rig.spawnSupervised(&.{});
     {
         const text = try rig.readLog();
         defer gpa.free(text);
@@ -11695,7 +11876,7 @@ test "smoke: `sync -f` IS A DURABILITY POINT FOR THE DAEMON'S WRITE CUSTODY — 
     }
     try rig.kill();
     const recovered = try fsckClean(rig, "the kill after sync -f");
-    _ = try remountAfterKill(rig, recovered);
+    _ = try remountAfterKill(rig, recovered, .foreground);
     var check: [768]u8 = undefined;
     const out = try rig.onMount(try std.fmt.bufPrint(&check, "if head -c {d} \"$1/image\" | cmp -s - f; then echo f-whole; else echo f-LOST; fi; if {{ tail -c {d} \"$1/image\"; head -c {d} \"$1/image\" | tail -c +{d}; }} | cmp -s - g; then echo g-whole; else echo g-LOST; fi", .{ syncfs_fresh_bytes, syncfs_patch_bytes, syncfs_base_bytes, syncfs_patch_bytes + 1 }));
     defer gpa.free(out);
@@ -11855,7 +12036,7 @@ fn closeDrainRow(no_open: bool) !void {
     }
     try rig.kill();
     const recovered = try fsckClean(rig, "the kill after the close");
-    _ = try remountAfterKill(rig, recovered);
+    _ = try remountAfterKill(rig, recovered, .foreground);
     const out = try rig.onMount(try std.fmt.bufPrint(&script, close_drain_check, .{ syncfs_fresh_bytes, syncfs_fresh_bytes }));
     defer gpa.free(out);
     std.debug.print("smoke[close drain, no_open={}]: after the kill and the remount: {s}\n", .{ no_open, std.mem.trimEnd(u8, out, "\n") });
@@ -11908,7 +12089,7 @@ fn unmountOwesRow(write_cache: bool) !void {
     defer rig.deinit();
     try rig.formatSet(write_cache);
     try rig.env.put("SQUEEZEFS_BLOCK_REFS_VERIFY", "1");
-    try rig.spawnMount(&.{});
+    try rig.mountAsSet(&.{});
     _ = try rig.awaitReady(0);
     {
         const out = try rig.onMount(unmount_owes_setup);
@@ -11922,7 +12103,7 @@ fn unmountOwesRow(write_cache: bool) !void {
     try rig.umount();
     try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
     var mark = try rig.logLen();
-    try rig.spawnMount(&.{});
+    try rig.mountAsSet(&.{});
     _ = try rig.awaitReady(mark);
     {
         const out = try rig.onMount(unmount_owes_check);
@@ -11941,7 +12122,7 @@ fn unmountOwesRow(write_cache: bool) !void {
     try rig.kill();
     const recovered = try fsckClean(rig, "the kill after the fsync'd dance");
     mark = try rig.logLen();
-    _ = try remountAfterKill(rig, recovered);
+    _ = try remountAfterKill(rig, recovered, rig.posture());
     {
         const out = try rig.onMount("if cmp -s v \"$1/exp-t\"; then echo v-whole; else echo v-LOST; fi");
         defer gpa.free(out);
@@ -12070,7 +12251,7 @@ test "smoke: THE ORDERED LAW'S KILL ROW (decision 0003 §AL.5 with §AJ.4) — f
         }
         try rig.kill();
         const recovered = try fsckClean(rig, "the ordered law's kill");
-        _ = try remountAfterKill(rig, recovered);
+        _ = try remountAfterKill(rig, recovered, .foreground);
         var dir = try Io.Dir.cwd().openDir(io, rig.mp, .{});
         defer dir.close(io);
         sizes[k] = try orderedCheck(io, dir, image, step, k);
@@ -12134,7 +12315,7 @@ test "smoke: CUSTODY NO CLOSE COVERS IS DRAINED ONCE IDLE (decision 0003 §AF) �
     }
     try rig.kill();
     const recovered = try fsckClean(rig, "the kill after the idle drain");
-    _ = try remountAfterKill(rig, recovered);
+    _ = try remountAfterKill(rig, recovered, .foreground);
     {
         const rfd = try openRaw(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true });
         defer _ = linux.close(rfd);
@@ -12207,7 +12388,7 @@ test "smoke: A CLOSE BURST COALESCES ITS DRAINS (decision 0003 §AF) — no-open
     }
     try rig.kill();
     const recovered = try fsckClean(rig, "the kill after the close burst");
-    _ = try remountAfterKill(rig, recovered);
+    _ = try remountAfterKill(rig, recovered, .foreground);
     {
         const out = try rig.onMount(try std.fmt.bufPrint(&script, "{{ head -c 8192 \"$1/image\"; i=0; while [ $i -lt {d} ]; do echo \"line $i of the close burst\"; i=$((i + 1)); done; }} | cmp -s - log && echo log-whole", .{burst_children}));
         defer gpa.free(out);
@@ -12382,7 +12563,7 @@ test "smoke: THE WRITE-BACK TIMER — CLOSE IS LOCAL, THE BOUND HOLDS (decision 
     for (0..late_files) |i| try wbWrite(gpa, try std.fmt.bufPrintSentinel(&pb, "{s}/g{d}", .{ rig.mp, i }, 0), 200 + i);
     try rig.kill();
     const recovered = try fsckClean(rig, "the kill right after the closes");
-    _ = try remountAfterKill(rig, recovered);
+    _ = try remountAfterKill(rig, recovered, .foreground);
     try testing.expect((try wbJudge(gpa, f, 7)).whole());
     for (0..census_files) |i| try testing.expect((try wbJudge(gpa, try std.fmt.bufPrintSentinel(&pb, "{s}/c{d}", .{ rig.mp, i }, 0), 100 + i)).whole());
     var present: usize = 0;
@@ -12442,7 +12623,7 @@ test "smoke: UNDER THE WRITE-BACK TIMER fsync, fdatasync AND syncfs ARE STILL DU
     }
     try rig.kill();
     const recovered = try fsckClean(rig, "the kill after the syncs");
-    _ = try remountAfterKill(rig, recovered);
+    _ = try remountAfterKill(rig, recovered, .foreground);
     for (1..4) |k| {
         const j = try wbJudge(gpa, try std.fmt.bufPrintSentinel(&pb, "{s}/s{d}", .{ rig.mp, k }, 0), 300 + k);
         // Without FUSE_HAS_SYNCFS the kernel never forwards syncfs(2): `s3`
@@ -12532,7 +12713,7 @@ test "smoke: THE WRITE-BACK TIMER UNDER A WRITER STORM — the memory bound (dec
     }
     try rig.kill();
     const recovered = try fsckClean(rig, "the kill after the storm");
-    _ = try remountAfterKill(rig, recovered);
+    _ = try remountAfterKill(rig, recovered, .foreground);
     var check_buf: [512]u8 = undefined;
     const out = try rig.onMount(try std.fmt.bufPrint(&check_buf, "bad=0; w=0; while [ $w -lt {d} ]; do i=0; while [ $i -lt {d} ]; do head -c {d} \"$1/image\" | cmp -s - w$w-$i || bad=$((bad + 1)); i=$((i + 1)); done; w=$((w + 1)); done; echo \"bad=$bad\"", .{ wb_storm_writers, wb_storm_files, wb_file_bytes }));
     defer gpa.free(out);
@@ -12559,7 +12740,7 @@ fn oTruncRow(no_open: bool) !void {
     for ([_][]const u8{ "SQUEEZEFS_FUSE_ATTR_TTL_MS", "SQUEEZEFS_FUSE_ENTRY_TTL_MS", "SQUEEZEFS_FUSE_DIR_ENTRY_TTL_MS", "SQUEEZEFS_FUSE_NEGATIVE_TTL_MS" }) |k| try rig.env.put(k, "60000");
     try rig.formatSet(true);
     try rig.createImage();
-    try rig.spawnMount(&.{});
+    try rig.mountAsSet(&.{});
     _ = try rig.awaitReady(0);
     // One daemon: a striped file and an inline one, each emptied by `: >`.
     {
@@ -12569,7 +12750,7 @@ fn oTruncRow(no_open: bool) !void {
     }
     const b = try Peer.init(rig, "b");
     defer b.deinit();
-    try b.spawn(&.{});
+    try b.spawnAsSet(&.{});
     _ = try b.awaitReady();
     // A's file, B's truncate (a cross-owner SETATTR).
     {
@@ -13492,7 +13673,7 @@ test "smoke: THE STAGED READ'S IDENTITY WINDOW — a 256 KiB staged file; an O_D
     try rig.env.put("SQUEEZEFS_DIRECT_DEVICE_TRUE", "1");
     try rig.env.put("SQUEEZEFS_TEST_STAGED_READ_HOLD", fifo);
     try rig.formatSet(true);
-    try rig.spawnMount(&.{});
+    try rig.mountAsSet(&.{});
     _ = try rig.awaitReady(0);
     var released = false;
     defer if (!released) releaseHold(fifo);
@@ -13546,7 +13727,7 @@ test "smoke: A SYNCFS THAT MEETS A RE-STAGE OF ONE OF ITS RESIDENTS LANDS THE CU
     // The C8 oracle at every mount (the remount after the kill judges it).
     try rig.env.put("SQUEEZEFS_BLOCK_REFS_VERIFY", "1");
     try rig.formatSet(true);
-    try rig.spawnMount(&.{});
+    try rig.mountAsSet(&.{});
     _ = try rig.awaitReady(0);
     // syncfs reaches a FUSE server only once INIT negotiated FUSE_HAS_SYNCFS.
     {
@@ -13601,7 +13782,7 @@ test "smoke: A SYNCFS THAT MEETS A RE-STAGE OF ONE OF ITS RESIDENTS LANDS THE CU
     try rig.kill();
     const recovered = try fsckClean(rig, "the kill after the raced sync -f");
     try rig.env.put("SQUEEZEFS_TEST_PROMOTION_HOLD", "off");
-    _ = try remountAfterKill(rig, recovered);
+    _ = try remountAfterKill(rig, recovered, rig.posture());
     gpa.free(try rig.onMount("cmp \"$1/want\" f && echo f-whole"));
     try rig.umount();
     try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
@@ -13619,7 +13800,7 @@ test "smoke: A SYNCFS THAT MEETS A RESIDENT ITS LAYOUT NO LONGER NAMES OWES IT N
     try rig.env.put("SQUEEZEFS_TEST_RING_RELEASE_HOLD", fifo);
     try rig.env.put("SQUEEZEFS_BLOCK_REFS_VERIFY", "1");
     try rig.formatSet(true);
-    try rig.spawnMount(&.{});
+    try rig.mountAsSet(&.{});
     _ = try rig.awaitReady(0);
     {
         const st = try rig.stats();
@@ -13684,7 +13865,7 @@ test "smoke: A SYNCFS THAT MEETS A RESIDENT ITS LAYOUT NO LONGER NAMES OWES IT N
     try rig.kill();
     const recovered = try fsckClean(rig, "the kill after the sync -f over an unnamed record");
     try rig.env.put("SQUEEZEFS_TEST_RING_RELEASE_HOLD", "off");
-    _ = try remountAfterKill(rig, recovered);
+    _ = try remountAfterKill(rig, recovered, rig.posture());
     const size = try rig.onMount("stat -c %s f");
     defer gpa.free(size);
     try testing.expectEqualStrings("0", std.mem.trim(u8, size, " \n"));
@@ -13712,7 +13893,7 @@ test "smoke: A FULL DATA STORE ANSWERS ENOSPC — NEVER EIO — AT write(2) AND 
     try rig.env.put("SQUEEZEFS_BLOCK_REFS_VERIFY", "1");
     var bs_buf: [16]u8 = undefined;
     try rig.formatSetSized(true, &.{ "--block-size", try std.fmt.bufPrint(&bs_buf, "{d}", .{reuse_row_block}) }, reuse_row_data_bytes);
-    try rig.spawnMount(&.{});
+    try rig.mountAsSet(&.{});
     _ = try rig.awaitReady(0);
     // syncfs reaches a FUSE server only once INIT negotiated FUSE_HAS_SYNCFS.
     {
@@ -13844,7 +14025,7 @@ test "smoke: A FULL DATA STORE ANSWERS ENOSPC — NEVER EIO — AT write(2) AND 
     //    the remount reads every survivor whole.
     try rig.kill();
     const recovered = try fsckClean(rig, "the kill after the full-store episode");
-    _ = try remountAfterKill(rig, recovered);
+    _ = try remountAfterKill(rig, recovered, rig.posture());
     {
         const out = try rig.onMountTimed("n=0; bad=0; for f in fill* fresh; do n=$((n+1)); cmp -s \"$1/pattern\" \"$f\" || { bad=$((bad+1)); echo \"DIFF $f\"; }; done; echo \"$n files, $bad differ\"", 900);
         defer gpa.free(out);
@@ -14013,7 +14194,7 @@ test "smoke: FALLOCATE — EVERY MODE'S LAW (charter §6.6; decision 0003 §BH) 
     //    reservation's space still charged.
     try rig.kill();
     const recovered = try fsckClean(rig, "the fallocate matrix");
-    _ = try remountAfterKill(rig, recovered);
+    _ = try remountAfterKill(rig, recovered, .foreground);
     {
         const out = try rig.onMountTimed(
             \\b() { xfs_io -c "pread -v $1 16" $2 | head -1 | tr -s ' ' | cut -d' ' -f2; }
@@ -14252,7 +14433,7 @@ test "smoke: FSCK AND SCRUB — format → fill (dirs, 200 packed small files, h
     try rig.createImage();
     const storm_sources = try rig.shOk(rig.work, "i=0; while [ $i -lt 8 ]; do dd if=image of=s$i bs=1M skip=$((i * 25)) count=50 status=none; i=$((i + 1)); done; echo ok");
     gpa.free(storm_sources);
-    try rig.spawnMount(&.{});
+    try rig.mountAsSet(&.{});
     _ = try rig.awaitReady(0);
     // The fill in ONE mount: 20 staged 64 KiB files FIRST, then three
     // 20 MiB striped files with fsync (the holder's own grant window
@@ -14328,7 +14509,7 @@ test "smoke: FSCK AND SCRUB — format → fill (dirs, 200 packed small files, h
     }
     // 2. The storm kill → fsck clean → remount → clean umount.
     const mark_storm = try rig.logLen();
-    try rig.spawnMount(&.{});
+    try rig.mountAsSet(&.{});
     _ = try rig.awaitReady(mark_storm);
     {
         var storm_cmd: [1024]u8 = undefined;
@@ -14354,7 +14535,7 @@ test "smoke: FSCK AND SCRUB — format → fill (dirs, 200 packed small files, h
     }
     _ = try fsckClean(rig, "the storm kill (fsck smoke)");
     const mark_after_kill = try rig.logLen();
-    try rig.spawnMount(&.{});
+    try rig.mountAsSet(&.{});
     _ = try rig.awaitReady(mark_after_kill);
     {
         const out = try rig.onMount("rm -f storm* && echo ok");
@@ -14548,7 +14729,7 @@ test "smoke: THE JOBS MATRIX — format (1 MiB blocks) → fill (packed, striped
     //    not a victim), three fsync'd 20 MiB striped files, the 1.5 GiB
     //    block-map file; umount (the staged files promote into packs), the
     //    offline clone (a shared block), remount.
-    try rig.spawnMount(&.{});
+    try rig.mountAsSet(&.{});
     _ = try rig.awaitReady(0);
     {
         const out = try rig.onMount("mkdir -p p && i=0; while [ $i -lt 80 ]; do dd if=\"$1/image\" of=p/small$i bs=64k skip=$i count=1 status=none; i=$((i + 1)); done; for n in 0 1 2; do dd if=\"$1/image\" of=big$n bs=1M skip=$((n * 20)) count=20 conv=fsync status=none; done; echo filled");
@@ -14579,7 +14760,7 @@ test "smoke: THE JOBS MATRIX — format (1 MiB blocks) → fill (packed, striped
     const v1 = (try volumeIdOfPath(rig, rig.d1)) orelse return error.NoVolumeId;
     defer gpa.free(v1);
     var mark = try rig.logLen();
-    try rig.spawnMount(&.{});
+    try rig.mountAsSet(&.{});
     _ = try rig.awaitReady(mark);
     const used_before = try rig.usedKib();
 
@@ -14773,7 +14954,7 @@ test "smoke: THE JOBS MATRIX — format (1 MiB blocks) → fill (packed, striped
     try testing.expectEqual(std.process.Child.Term{ .signal = .KILL }, try rig.waitChild());
     try rig.umountAfterKill();
     mark = try rig.logLen();
-    try rig.spawnMount(&.{});
+    try rig.mountAsSet(&.{});
     _ = try rig.awaitReady(mark);
     {
         const text = try rig.readLog();
@@ -15227,7 +15408,7 @@ test "smoke: ONLINE FSCK THROUGH THE ADMIN LANE — the fill (dirs, 200 packed f
     try rig.createImage();
     const storm_sources = try rig.shOk(rig.work, "i=0; while [ $i -lt 8 ]; do dd if=image of=s$i bs=1M skip=$((i * 25)) count=50 status=none; i=$((i + 1)); done; echo ok");
     gpa.free(storm_sources);
-    try rig.spawnMount(&.{});
+    try rig.mountAsSet(&.{});
     _ = try rig.awaitReady(0);
     // 1. The fill.
     {
@@ -15299,7 +15480,7 @@ test "smoke: ONLINE FSCK THROUGH THE ADMIN LANE — the fill (dirs, 200 packed f
     };
     const b = try Peer.init(rig, "b");
     defer b.deinit();
-    try b.spawn(&.{});
+    try b.spawnAsSet(&.{});
     _ = try b.awaitReady();
     {
         const sb = try b.stats();
@@ -15510,7 +15691,7 @@ test "smoke: THE FLEET'S MERGED BLOCK CENSUS — mount A + B JOINED with the fle
     try rig.env.put("SQUEEZEFS_FLEET_JOBS", "1");
     try rig.formatSet(true);
     try rig.createImage();
-    try rig.spawnMount(&.{});
+    try rig.mountAsSet(&.{});
     _ = try rig.awaitReady(0);
     // B: its staged files pack at the fsync (the write cache's law) and the seam.
     var env_seam = try envWith(gpa, &rig.env, &.{.{ "SQUEEZEFS_TEST_SHIP_EVERY_FREE", "1" }});
@@ -15520,7 +15701,7 @@ test "smoke: THE FLEET'S MERGED BLOCK CENSUS — mount A + B JOINED with the fle
     const b = try Peer.init(rig, "b");
     defer b.deinit();
     b.env = &env_seam;
-    try b.spawn(&.{});
+    try b.spawnAsSet(&.{});
     _ = try b.awaitReady();
     _ = try b.awaitLog("enrolled at the coordinator as a fleet READ worker", 0, 30 * std.time.ns_per_s);
     // 1. The seam ON: the pack, the rm, the punch.
@@ -15580,7 +15761,7 @@ test "smoke: THE FLEET'S MERGED BLOCK CENSUS — mount A + B JOINED with the fle
     try b.expectCleanExit("B's unmount after the seam arm");
     b.env = &env_fixed;
     var b_mark = try b.logLen();
-    try b.spawn(&.{});
+    try b.spawnAsSet(&.{});
     _ = try b.awaitLog("ready: ", b_mark, ready_wait_ns);
     _ = try b.awaitLog("enrolled at the coordinator as a fleet READ worker", b_mark, 30 * std.time.ns_per_s);
     {
@@ -15627,7 +15808,7 @@ test "smoke: THE FLEET'S MERGED BLOCK CENSUS — mount A + B JOINED with the fle
     try b.umount();
     try b.expectCleanExit("B's unmount after the fixed arm");
     b_mark = try b.logLen();
-    try b.spawn(&.{});
+    try b.spawnAsSet(&.{});
     _ = try b.awaitLog("ready: ", b_mark, ready_wait_ns);
     {
         const r = try std.process.run(gpa, io, .{ .argv = &.{ "sh", "-c", "grep -v '/f0$' \"$1/fixed.sha\" | sha256sum --quiet -c - && echo ok", "smoke", rig.work }, .cwd = .{ .path = b.mp }, .environ_map = &rig.env });
@@ -16093,7 +16274,7 @@ test "smoke: THE REKEY ROW — format (1 MiB blocks, lz4 + aes-256-gcm, key A) �
 
     // 1. The fill under A; umount (the staged files promote into packs);
     //    remount; the shas.
-    try rig.spawnMount(&.{});
+    try rig.mountAsSet(&.{});
     _ = try rig.awaitReady(0);
     {
         const out = try rig.onMount("mkdir -p p && i=0; while [ $i -lt 40 ]; do dd if=\"$1/image\" of=p/small$i bs=64k skip=$i count=1 status=none; i=$((i + 1)); done; for n in 0 1 2; do dd if=\"$1/image\" of=big$n bs=1M skip=$((n * 20)) count=20 conv=fsync status=none; done; yes compressible-rotation-row | head -c 8388608 > zeroish && sync -f .; echo filled");
@@ -16103,7 +16284,7 @@ test "smoke: THE REKEY ROW — format (1 MiB blocks, lz4 + aes-256-gcm, key A) �
     try rig.umount();
     try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
     var mark = try rig.logLen();
-    try rig.spawnMount(&.{});
+    try rig.mountAsSet(&.{});
     _ = try rig.awaitReady(mark);
     {
         const out = try rig.onMount("sha256sum big0 big1 big2 zeroish p/small* | sort -k2 > \"$1/before.sha\"; echo ok");
@@ -16182,7 +16363,7 @@ test "smoke: THE REKEY ROW — format (1 MiB blocks, lz4 + aes-256-gcm, key A) �
     }
     try rig.env.put("SQUEEZEFS_ENCRYPT_KEY_FILE", key_b);
     mark = try rig.logLen();
-    try rig.spawnMount(&.{});
+    try rig.mountAsSet(&.{});
     _ = try rig.awaitReady(mark);
     {
         const out = try rig.onMount("sha256sum big0 big1 big2 zeroish p/small* | sort -k2 | cmp - \"$1/before.sha\" && sha256sum during | cmp - \"$1/during.sha\" && echo all-exact-under-b");
@@ -16224,7 +16405,7 @@ test "smoke: THE REKEY ROW — format (1 MiB blocks, lz4 + aes-256-gcm, key A) �
     try testing.expectEqual(std.process.Child.Term{ .signal = .KILL }, try rig.waitChild());
     try rig.umountAfterKill();
     mark = try rig.logLen();
-    try rig.spawnMount(&.{});
+    try rig.mountAsSet(&.{});
     _ = try rig.awaitReady(mark);
     {
         const text = try rig.readLog();

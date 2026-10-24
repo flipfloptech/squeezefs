@@ -2053,33 +2053,10 @@ pub fn promoteAllAtSyncfs(gpa: Allocator, seg: *Segment, hooks: PromotionHooks) 
 // §3.7 The reader's view of an unpromoted entry.
 // ---------------------------------------------------------------------------
 
-pub const StagedRead = union(enum) {
-    /// This client's ring has the bytes.
-    resident: Segment.Lease,
-    /// Budget-counted but not resident: a stage or promotion is IN FLIGHT;
-    /// the caller backs off (bounded) and re-resolves.
-    in_flight,
-    /// STABLE lost identity (ring gone, no durable copy, nothing in
-    /// flight): serve this many ZEROS — `min(offset + size, meta_size) −
-    /// offset` — counted and warned.
-    lost: u64,
-};
-
 /// The zeros a lost staged payload reads as: size-consistent, never past
 /// the file.
 pub fn lostStagedRangeLen(offset: u64, size: u64, meta_size: u64) u64 {
     return @min(offset +| size, meta_size) -| offset;
-}
-
-/// Resolve a staged read on THIS client (the durable-copy leg is the
-/// caller's through `layout.Mapping.readWindow`).
-pub fn resolveStagedRead(pool: *Pool, seg: *Segment, key: StagingKey, offset: u64, size: u64, meta_size: u64) StagedRead {
-    if (seg.get(key)) |lease| return .{ .resident = lease };
-    if (pool.generationOf(key.file_id) != null) return .in_flight;
-    const zeros = lostStagedRangeLen(offset, size, meta_size);
-    stats.staged_payload_lost_reads.inc();
-    log.warn("staged payload unreachable for ino {d}: serving {d} zero bytes at offset {d} (another client's live staged custody, or a crash discarded it)", .{ key.ino(), zeros, offset });
-    return .{ .lost = zeros };
 }
 
 // ---------------------------------------------------------------------------
@@ -3758,32 +3735,8 @@ test "the residents census under stages landing: sized and filled under ONE lock
     try testing.expectEqual(@as(usize, 1500), final.len);
 }
 
-test "the reader's view: resident ⇒ the bytes; ledger-only ⇒ in flight; neither ⇒ size-consistent zeros, counted and warned" {
-    const gpa = testing.allocator;
-    var pool = Pool.init(gpa, .none);
-    defer pool.deinit();
-    var r = try ramSegment(gpa, 64 * 4096);
-    defer gpa.free(r.image);
-    defer r.seg.deinit();
-    const k = tkey(5, 55);
-    const v: [300]u8 = @splat(9);
-    _ = try stageWrite(&pool, &r.seg, null, k, &v, 0, .none);
-    switch (resolveStagedRead(&pool, &r.seg, k, 0, 100, 300)) {
-        .resident => |l| {
-            defer l.release();
-            try testing.expectEqualSlices(u8, &v, l.bytes());
-        },
-        else => return error.TestExpectedResident,
-    }
-    // A promotion consumed the ring entry but the ledger row is still live: in flight.
-    try testing.expect(r.seg.remove(k, null));
-    try testing.expectEqual(StagedRead.in_flight, resolveStagedRead(&pool, &r.seg, k, 0, 100, 300));
-    // Stable lost identity.
-    _ = pool.credit(k.file_id, null);
-    const lost0 = stats.staged_payload_lost_reads.load();
-    const out = resolveStagedRead(&pool, &r.seg, k, 100, 4096, 300);
-    try testing.expectEqual(StagedRead{ .lost = 200 }, out);
-    try testing.expectEqual(lost0 + 1, stats.staged_payload_lost_reads.load());
+test "a lost staged payload reads size-consistent zeros: never past the file (the read path's lost arm)" {
+    try testing.expectEqual(@as(u64, 200), lostStagedRangeLen(100, 4096, 300));
     try testing.expectEqual(@as(u64, 0), lostStagedRangeLen(500, 10, 300));
     try testing.expectEqual(@as(u64, 10), lostStagedRangeLen(0, 10, 300));
     try testing.expectEqual(@as(u64, 300), lostStagedRangeLen(0, std.math.maxInt(u64), 300));

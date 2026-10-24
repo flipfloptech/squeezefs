@@ -65,7 +65,6 @@ const counters = @import("../core/counters.zig");
 const clock = @import("../core/clock.zig");
 const log = @import("../core/log.zig");
 const knobs = @import("../core/knobs.zig");
-const errors = @import("../core/errors.zig");
 const derive = @import("../core/derive.zig");
 const budget = @import("../mem/budget.zig");
 const sync_notify = @import("../sync/notify.zig");
@@ -299,18 +298,6 @@ pub const AllocError = error{
     /// `allocateSpecificBlock` on a block that is not free.
     NotFree,
 };
-
-/// The ONE table's names: `StorageFull` is ENOSPC (terminal), a plane
-/// refusal is EAGAIN-class (an unreachable holder is retryable, charter
-/// §6.2), read-only is EROFS, a specific claim of a taken block EINVAL.
-pub fn coreError(e: AllocError) errors.Error {
-    return switch (e) {
-        error.StorageFull => error.NoSpaceLeft,
-        error.ReadOnly => error.ReadOnlyFileSystem,
-        error.PlaneRefused => error.WouldBlock,
-        error.NotFree => error.InvalidArgument,
-    };
-}
 
 // ---------------------------------------------------------------------------
 // Rung-6 seams (interfaces only; §11).
@@ -2469,13 +2456,10 @@ test "fsck seams: the epoch side map stamps mints under a latched scan; reconcil
     g.deinit();
 }
 
-test "seams: read-only refuses every ownership mutation; a plane gate refusal is retryable and never latches StorageFull" {
+test "seams: read-only refuses every ownership mutation; a plane gate refusal never latches StorageFull" {
     const ro = try BlockAllocator.init(testing.allocator, .{ .vol_tag = 1, .vol = 0, .block_size = 4096, .capacity_bytes = 4 * 4096, .read_only = true });
     defer ro.deinit();
     try testing.expectError(error.ReadOnly, ro.allocateBlock());
-    try testing.expectEqual(@as(errors.Error, error.ReadOnlyFileSystem), coreError(error.ReadOnly));
-    try testing.expectEqual(@as(errors.Error, error.NoSpaceLeft), coreError(error.StorageFull));
-    try testing.expectEqual(errors.Class.retryable, errors.classOf(coreError(error.PlaneRefused)));
     const a = try testAlloc(4);
     defer a.deinit();
     const Gate = struct {

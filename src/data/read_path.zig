@@ -439,7 +439,7 @@ pub const WriteSide = struct {
     /// of parking on its block lock, awaiting an overlay's pages or
     /// reading the device (charter §4 "the reap thread never blocks").
     staged_block: *const fn (ctx: *anyopaque, ino: u64, block: u64, rel_s: u64, rel_e: u64, dest: []u8, try_only: bool) StagedBlock,
-    /// This client's ring entry for a staged file (`resolveStagedRead`).
+    /// This client's ring entry for a staged file (the plane's ring lookup).
     staged_payload: *const fn (ctx: *anyopaque, ino: u64, file_id: layout.FileId, offset: u64, len: u64, dest: []u8) StagedVerdict,
     /// Retained extents on the ino (the warm ladder demotes).
     has_retained_extents: *const fn (ctx: *anyopaque, ino: u64) bool,

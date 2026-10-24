@@ -4237,7 +4237,6 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 error.WriterGuardFenced => error.WriterGuardFenced,
                 error.OutOfMemory => error.OutOfMemory,
                 error.WorkerShutdown => error.WorkerShutdown,
-                error.QueueFull => error.QueueFull,
                 error.ReadOnlyFileSystem => error.ReadOnlyFileSystem,
                 error.FileTooBig => error.FileTooBig,
             };

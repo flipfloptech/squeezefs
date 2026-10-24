@@ -17,9 +17,9 @@ const testing = std.testing;
 // Constants with their measured reasons (spec §9).
 // ---------------------------------------------------------------------------
 
-/// Requests a lane ADMITS (queued or in the ring) before it refuses
-/// (`QueueFull`, counted in `uring_queue_full`): the backpressure door, and
-/// the cell table's size, so a slot index (the SQE `user_data`) is always
+/// Requests a lane ADMITS (queued or in the ring) before a caller parks
+/// for a cell (`dev_cell_waits`; never a refusal — a file's write, read or
+/// fsync has no EAGAIN, decision 0003 §BO), and the cell table's size, so a slot index (the SQE `user_data`) is always
 /// `< uring_req_queue_cap`. WHY 4096: the reference's "P1-6: bound io_uring
 /// request queue to apply backpressure under overload" — a bound, not a
 /// measurement; rung 4's write-pipeline governor derives the device depth
@@ -250,8 +250,8 @@ pub fn finishRead(got: usize, size: usize) ReadVerdict {
 
 // Errors: the ONE typed set and the ONE errno table (`core/errors.zig`,
 // decision 0003 WP-C row 23). The device layer's classes are the shared
-// ones — a full or closing lane is `QueueFull` (backpressure: EAGAIN, never
-// EINVAL), the fence `WriterGuardFenced` (EIO), dismount `DismountRefused`
+// ones — a full lane parks its caller (no error at all), a closing one is
+// `WorkerShutdown` (EIO), the fence `WriterGuardFenced` (EIO), dismount `DismountRefused`
 // (EROFS), a short transfer `ShortRead`/`ShortWrite`, the lane's exit drain
 // `WorkerShutdown`, a dead ring `RingFailed`. No timeout class: an op the
 // device never answers is OVERDUE (`OverdueCensus`), the watchdog's business
@@ -359,9 +359,9 @@ pub const stats = struct {
     pub var get_obj: counters.ShardedCounter = .{};
     /// `writeBlock` completions after `classifyDmaOutcome` passed.
     pub var put_obj: counters.ShardedCounter = .{};
-    /// Lane queue refused (full or closed) on read, write or barrier submit.
-    /// Expected 0 in healthy rows.
-    pub var uring_queue_full: counters.ShardedCounter = .{};
+    /// Read, write, barrier or discard submits that met a FULL lane (every
+    /// cell held) and parked on its free-cell door until one came home.
+    pub var dev_cell_waits: counters.ShardedCounter = .{};
     /// Writes that took the bounce-copy branch. Must stay 0 on aligned
     /// full-block workloads; only non-4 KiB-multiple payloads may move it.
     pub var nvme_unaligned_write_fallbacks: counters.ShardedCounter = .{};
@@ -443,7 +443,7 @@ fn writeHistJson(w: *std.Io.Writer, name: []const u8, queue: *const counters.Sha
 /// Process-wide families (every device shares them).
 pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
     try w.writeAll("{");
-    inline for (.{ "get_obj", "put_obj", "uring_queue_full", "nvme_unaligned_write_fallbacks", "dev_fills", "dev_enters", "dev_submit_enters", "dev_wake_batches", "dev_wake_writes", "dev_wakes_elided", "dev_fixed_buf_fills", "data_device_sync_requests", "data_device_syncs", "data_dma_fence_refusals", "data_dma_dismount_refusals", "aligned_pool_hits", "aligned_pool_misses", "aligned_pool_trimmed_bytes", "dev_wait_fiber_parks", "dev_wait_raw_parks" }) |name| {
+    inline for (.{ "get_obj", "put_obj", "dev_cell_waits", "nvme_unaligned_write_fallbacks", "dev_fills", "dev_enters", "dev_submit_enters", "dev_wake_batches", "dev_wake_writes", "dev_wakes_elided", "dev_fixed_buf_fills", "data_device_sync_requests", "data_device_syncs", "data_dma_fence_refusals", "data_dma_dismount_refusals", "aligned_pool_hits", "aligned_pool_misses", "aligned_pool_trimmed_bytes", "dev_wait_fiber_parks", "dev_wait_raw_parks" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, @field(stats, name).load() });
     }
     try w.print("\"device_lock_waiters\":{d},\"dev_ring_dead_held_ops\":{d},\"dev_dma_inflight\":{d},", .{ stats.device_lock_waiters.load(), stats.dev_ring_dead_held_ops.load(), stats.dev_dma_inflight.load() });
@@ -857,7 +857,7 @@ test "stats JSON names every family the spec lists" {
     var w: std.Io.Writer = .fixed(&buf);
     try writeStatsJson(&w);
     const json = w.buffered();
-    for ([_][]const u8{ "get_obj", "put_obj", "uring_queue_full", "nvme_unaligned_write_fallbacks", "dev_fills", "dev_enters", "dev_submit_enters", "dev_wake_batches", "dev_wake_writes", "dev_wakes_elided", "dev_fixed_buf_fills", "data_device_sync_requests", "data_device_syncs", "data_dma_fence_refusals", "data_dma_dismount_refusals", "aligned_pool_hits", "aligned_pool_misses", "aligned_pool_trimmed_bytes", "dev_wait_fiber_parks", "dev_wait_raw_parks", "device_lock_waiters", "dev_dma_inflight", "read_fill_phase_ns", "write_pipeline_phase_ns", "dev_queue", "dev_service" }) |key| {
+    for ([_][]const u8{ "get_obj", "put_obj", "dev_cell_waits", "nvme_unaligned_write_fallbacks", "dev_fills", "dev_enters", "dev_submit_enters", "dev_wake_batches", "dev_wake_writes", "dev_wakes_elided", "dev_fixed_buf_fills", "data_device_sync_requests", "data_device_syncs", "data_dma_fence_refusals", "data_dma_dismount_refusals", "aligned_pool_hits", "aligned_pool_misses", "aligned_pool_trimmed_bytes", "dev_wait_fiber_parks", "dev_wait_raw_parks", "device_lock_waiters", "dev_dma_inflight", "read_fill_phase_ns", "write_pipeline_phase_ns", "dev_queue", "dev_service" }) |key| {
         if (std.mem.indexOf(u8, json, key) == null) {
             std.debug.print("missing stats key {s}\n", .{key});
             return error.TestExpectedEqual;

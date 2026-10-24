@@ -497,7 +497,7 @@ elision (`SQUEEZEFS_DISCARD_ELISION`, default on) is also reclaim-side.
 |---|---|---|
 | `get_obj` | counter | data device READ ops completed through `read_block*` (incl. zcrx-served). NOT probes. The churn detector. |
 | `put_obj` | counter | `write_block` completions (after `classify_dma_outcome` Ok). |
-| `uring_queue_full` | counter | `try_send` refused (channel Full or Disconnected) on read, write or barrier submit. Expected 0 in healthy rows (docs/design-random-small-writes.md:46). NOTE the worker's SQ-full refusal ("Submission queue full" errors) is NOT counted here — only logged. |
+| `dev_cell_waits` | counter | (Zig; replaces the reference's `uring_queue_full`, decision 0003 §BO) read, write, barrier or discard submits that met a FULL lane (every cell held) and PARKED on the lane's free-cell door until a cell came home — the reference REFUSED them (`try_send` Full → EAGAIN-class), which a file's write/read/fsync may not answer. A closing lane answers `WorkerShutdown` (EIO), uncounted here. NOTE the worker's SQ-full refusal ("Submission queue full" errors) is NOT counted here — only logged. |
 | `nvme_unaligned_write_fallbacks` | counter | writes that took the bounce-copy branch. **Must stay 0 on aligned full-block workloads**; only non-4 KiB-multiple payloads (compressed/encrypted/tail) may move it (L2497-2502). |
 | `dev_fills` | counter | SQEs pushed (read/write/fsync), counted before the push attempt. |
 | `dev_enters` | counter | `io_uring_enter` calls: one per pass (`submit_and_wait`) + each SQ-full `submit()`. `enters ÷ fills ≪ 1` under concurrency. |

@@ -5,8 +5,9 @@
 //! One `Device` = one O_DIRECT data volume (regular file or block device)
 //! served by N lanes; a lane is one OS thread (`sqz-nvme<N>`) owning one
 //! io_uring, one O_DIRECT fd, one bounded request queue, one write watermark
-//! and one eventfd wake. Callers never block on the queue (try-push) and the
-//! worker never blocks on it (try-pop): the single park is the ring's
+//! and one eventfd wake. Callers never block on the queue (a held cell has
+//! a queue slot; a caller meeting a FULL lane parks for a cell, never
+//! refused) and the worker never blocks on it (try-pop): its single park is the ring's
 //! (`ring_park.ParkedRing` — the ONE ring-park primitive, decision 0003
 //! WP-C), with the eventfd READ kept armed so an arrival wakes the lane
 //! THROUGH the ring (measured on the stock kernel before this shape:
@@ -490,6 +491,14 @@ const Lane = struct {
     queue: mpmc.BoundedMpmc(u32),
     cells: []Cell,
     free_cells: mpmc.BoundedMpmc(u32),
+    /// The free-cell door: callers parked for a cell while every cell is
+    /// held (a full lane parks its late caller, never refuses — a file's
+    /// write, read or fsync has no EAGAIN), and the futex word a give-back
+    /// bumps while one is parked. SeqCst: the Dekker pair between
+    /// `acquireCell`'s `cell_waiters++ ; re-pop` and `freeCell`'s
+    /// `push ; cell_waiters RMW`.
+    cell_waiters: std.atomic.Value(u32) = .init(0),
+    cell_epoch: futex.Word = .init(0),
     wm: WriteWatermark = .{},
     /// The ring, its eventfd wake and the park (`ring_park.ParkedRing`).
     /// Built ON the lane thread (`SINGLE_ISSUER`: the thread that sets the
@@ -561,12 +570,31 @@ const Lane = struct {
         return if (self.ready.poll()) |v| v == .armed else false;
     }
 
-    /// Caller side: a free cell or null (the backpressure door; the queue
-    /// shares this bound so a held cell always has a queue slot).
+    /// Caller side: a free cell (the queue shares the cells' bound, so a
+    /// held cell always has a queue slot). A full lane PARKS the caller on
+    /// the free-cell door until a cell comes home: every held cell belongs
+    /// to a request in flight that returns it at its CQE, so the wait is
+    /// the device's progress, and a device that stops answering is the
+    /// watchdog's (`overdueCensus` names the held cells) — never a refusal.
+    /// Null only for a closing lane.
     fn acquireCell(self: *Lane) ?u32 {
+        if (self.popCell()) |idx| return idx;
+        stats.dev_cell_waits.inc();
+        while (true) {
+            if (self.closing.load(.seq_cst)) return null;
+            const e = self.cell_epoch.load(.seq_cst);
+            _ = self.cell_waiters.fetchAdd(1, .seq_cst);
+            defer _ = self.cell_waiters.fetchSub(1, .seq_cst);
+            // Re-pop under the registered waiter (the Dekker half).
+            if (self.popCell()) |idx| return idx;
+            if (self.closing.load(.seq_cst)) return null;
+            if (self.dev.wait_io) |io| io.futexWaitUncancelable(u32, &self.cell_epoch.raw, e) else futex.wait(&self.cell_epoch, e);
+        }
+    }
+
+    fn popCell(self: *Lane) ?u32 {
         const idx = self.free_cells.tryPop() orelse return null;
-        const c = &self.cells[idx];
-        c.* = .{};
+        self.cells[idx] = .{};
         return idx;
     }
 
@@ -574,11 +602,22 @@ const Lane = struct {
         // A 4096-cell ring holding all 4096 cells with many allocating
         // threads: a refusal is a wrap cell mid-pop (`mpmc.pushSpin`).
         self.free_cells.pushSpin(idx);
+        // A SeqCst RMW after the push, paired with the waiter's SeqCst
+        // increment: either it reads the waiter's count (and wakes one) or
+        // the waiter's increment reads it and its re-pop sees this cell.
+        if (self.cell_waiters.fetchAdd(0, .seq_cst) != 0) self.wakeCellWaiters(1);
+    }
+
+    /// Bump the door's word and wake `n` parked callers through the route
+    /// they parked on (`Device.wait_io`, set before the first request).
+    fn wakeCellWaiters(self: *Lane, n: u32) void {
+        _ = self.cell_epoch.fetchAdd(1, .seq_cst);
+        if (self.dev.wait_io) |io| futex.ioWake(io, &self.cell_epoch, n) else futex.wake(&self.cell_epoch, n);
     }
 
     /// Publish a filled cell: queue push THEN wake (the coalescer orders
-    /// the two). False when the lane is closing (the caller counts
-    /// `uring_queue_full` and frees the cell).
+    /// the two). False when the lane is closing (the caller frees the cell
+    /// and answers `WorkerShutdown`).
     fn submit(self: *Lane, idx: u32) bool {
         // SeqCst RMW: pairs with the closer's SeqCst `closing` store +
         // `inflight_submitters` load so exactly one of us sees the other.
@@ -650,6 +689,8 @@ const Lane = struct {
     /// Worst case = device latency of in-flight SQEs.
     fn shutdown(self: *Lane) void {
         self.closing.store(true, .seq_cst);
+        // Callers parked on the door see `closing` and answer WorkerShutdown.
+        self.wakeCellWaiters(std.math.maxInt(u32));
         while (self.inflight_submitters.load(.seq_cst) != 0) std.Thread.yield() catch {};
         // Release: every push that preceded the seal is visible to the
         // worker's sealed-then-scan (acquire) pass.
@@ -686,6 +727,7 @@ fn workerMain(lane: *Lane) void {
     // EVERY exit path (normal drain, refused open, refused ring) marks the
     // watermark dead and drains the queue so no caller parks forever.
     lane.closing.store(true, .seq_cst);
+    lane.wakeCellWaiters(std.math.maxInt(u32));
     while (lane.inflight_submitters.load(.seq_cst) != 0) std.Thread.yield() catch {};
     lane.sealed.store(true, .release);
     drainQueueAtExit(lane);
@@ -1260,7 +1302,8 @@ pub const Device = struct {
     }
 
     /// Stop every lane (idempotent): close queues → wake → join. Callers
-    /// still parked get `WorkerShutdown`; later submits get `QueueFull`.
+    /// still parked (on a cell or at the door) and later submits get
+    /// `WorkerShutdown`.
     pub fn close(self: *Device) void {
         if (self.closed) return;
         self.closed = true;
@@ -1503,10 +1546,7 @@ pub const Device = struct {
         }
         errdefer bounce.release();
 
-        const idx = lane.acquireCell() orelse {
-            stats.uring_queue_full.inc();
-            return error.QueueFull;
-        };
+        const idx = lane.acquireCell() orelse return error.WorkerShutdown;
         const c = &lane.cells[idx];
         c.op = .write;
         c.offset = offset;
@@ -1520,8 +1560,7 @@ pub const Device = struct {
         if (!lane.submit(idx)) {
             lane.wm.noteCompleted(self.wait_io);
             lane.freeCell(idx);
-            stats.uring_queue_full.inc();
-            return error.QueueFull;
+            return error.WorkerShutdown;
         }
         // Ownership of `bounce` moved to the worker (released at the CQE).
         bounce = .empty;
@@ -1581,10 +1620,7 @@ pub const Device = struct {
         var buf = try acquireReadBuf(size);
         errdefer buf.release();
         const lane = self.readLanePick();
-        const idx = lane.acquireCell() orelse {
-            stats.uring_queue_full.inc();
-            return error.QueueFull;
-        };
+        const idx = lane.acquireCell() orelse return error.WorkerShutdown;
         const c = &lane.cells[idx];
         c.op = .read;
         c.offset = offset;
@@ -1594,8 +1630,7 @@ pub const Device = struct {
         c.enq_ns.store(clock.monotonicNs(), .monotonic);
         if (!lane.submit(idx)) {
             lane.freeCell(idx);
-            stats.uring_queue_full.inc();
-            return error.QueueFull;
+            return error.WorkerShutdown;
         }
         // The worker owns `buf` from here until the CQE.
         buf = .empty;
@@ -1652,10 +1687,7 @@ pub const Device = struct {
         if (dest.len == 0) return;
         if (!nd.isDmaAligned(dest) or !derive.isAligned(offset, nd.dma_align)) return error.UnalignedDirectWrite;
         const lane = self.readLanePick();
-        const idx = lane.acquireCell() orelse {
-            stats.uring_queue_full.inc();
-            return error.QueueFull;
-        };
+        const idx = lane.acquireCell() orelse return error.WorkerShutdown;
         const c = &lane.cells[idx];
         c.op = .read;
         c.offset = offset;
@@ -1665,8 +1697,7 @@ pub const Device = struct {
         c.enq_ns.store(clock.monotonicNs(), .monotonic);
         if (!lane.submit(idx)) {
             lane.freeCell(idx);
-            stats.uring_queue_full.inc();
-            return error.QueueFull;
+            return error.WorkerShutdown;
         }
         const outcome = lane.wait(idx);
         defer lane.freeCell(idx);
@@ -1703,18 +1734,14 @@ pub const Device = struct {
         try self.drainWriteLanes();
 
         const lane = self.lanes[0].?;
-        const idx = lane.acquireCell() orelse {
-            stats.uring_queue_full.inc();
-            return error.QueueFull;
-        };
+        const idx = lane.acquireCell() orelse return error.WorkerShutdown;
         const c = &lane.cells[idx];
         c.op = .fsync;
         lane.wm.noteSubmitted();
         if (!lane.submit(idx)) {
             lane.wm.noteCompleted(self.wait_io);
             lane.freeCell(idx);
-            stats.uring_queue_full.inc();
-            return error.QueueFull;
+            return error.WorkerShutdown;
         }
         stats.device_lock_waiters.add(1);
         defer stats.device_lock_waiters.sub(1);
@@ -1753,10 +1780,7 @@ pub const Device = struct {
         try self.fenceGate();
         if (len == 0) return;
         const lane = self.writeLanePick(offset);
-        const idx = lane.acquireCell() orelse {
-            stats.uring_queue_full.inc();
-            return error.QueueFull;
-        };
+        const idx = lane.acquireCell() orelse return error.WorkerShutdown;
         const c = &lane.cells[idx];
         c.op = .discard;
         c.offset = offset;
@@ -1766,8 +1790,7 @@ pub const Device = struct {
         if (!lane.submit(idx)) {
             lane.wm.noteCompleted(self.wait_io);
             lane.freeCell(idx);
-            stats.uring_queue_full.inc();
-            return error.QueueFull;
+            return error.WorkerShutdown;
         }
         stats.device_lock_waiters.add(1);
         defer stats.device_lock_waiters.sub(1);
@@ -2029,9 +2052,9 @@ test "test_drop_device_during_unaligned_writes_joins_cleanly: close while 8 thre
                     _ = ok.fetchAdd(1, .monotonic);
                 } else |e| {
                     _ = errs.fetchAdd(1, .monotonic);
-                    // The closing door (QueueFull: backpressure, EAGAIN-class)
-                    // or the exit drain (WorkerShutdown): nothing else.
-                    if (e != error.QueueFull and e != error.WorkerShutdown) _ = unexpected.fetchAdd(1, .monotonic);
+                    // The closing door or the exit drain (WorkerShutdown):
+                    // nothing else.
+                    if (e != error.WorkerShutdown) _ = unexpected.fetchAdd(1, .monotonic);
                 }
             }
         }
@@ -2048,11 +2071,12 @@ test "test_drop_device_during_unaligned_writes_joins_cleanly: close while 8 thre
     try testing.expectEqual(@as(u32, 64), ok.load(.monotonic) + errs.load(.monotonic));
     try testing.expectEqual(@as(u32, 0), unexpected.load(.monotonic));
     try testing.expect(elapsed_s < 30);
-    // After close every submit is a refusal, never a hang; the class is
-    // backpressure (the caller may retry elsewhere), not "bad argument".
+    // After close every submit is a refusal, never a hang; the class is a
+    // stopped lane (EIO), never backpressure: a closed lane has no room to
+    // come, and a file's write has no EAGAIN.
     var p: [16]u8 = undefined;
-    try testing.expectError(error.QueueFull, dev.writeBlock(0, &p));
-    try testing.expectEqual(nd.ErrorClass.retryable, nd.classOf(error.QueueFull));
+    try testing.expectError(error.WorkerShutdown, dev.writeBlock(0, &p));
+    try testing.expectEqual(std.os.linux.E.IO, nd.errnoFor(error.WorkerShutdown));
 }
 
 test "test_drop_after_unaligned_burst_does_not_hang: 32 sequential unaligned writes then close < 10 s" {
@@ -2417,6 +2441,7 @@ test "a lane past its depth: more concurrent writes, reads and barriers than the
     defer gpa.free(threads);
     var entered: std.atomic.Value(u32) = .init(0);
     var done: std.atomic.Value(u32) = .init(0);
+    const waits0 = stats.dev_cell_waits.load();
     // The lane holds on the pass that pumps the first request: every later
     // one queues with its cell taken, so the lane is full at `depth`.
     const seams = &dev.seams;
@@ -2444,9 +2469,12 @@ test "a lane past its depth: more concurrent writes, reads and barriers than the
         std.Thread.yield() catch {};
     }
     // Every cell is taken and every request was issued: the ones past the
-    // depth met the full lane before the hold lifts.
-    const t0 = clock.monotonicNs();
-    while (done.load(.acquire) < extra and clock.monotonicNs() - t0 < 2 * std.time.ns_per_s) std.Thread.yield() catch {};
+    // depth are parked on the free-cell door before the hold lifts.
+    while (lane.cell_waiters.load(.seq_cst) < extra) {
+        if (done.load(.acquire) != 0) break; // refused at the door: the check below names it
+        std.Thread.yield() catch {};
+    }
+    try testing.expect(stats.dev_cell_waits.load() - waits0 >= extra);
     seams.hold_before_park.store(0, .release);
     futex.wakeAll(&seams.hold_before_park);
     for (threads[0..spawned]) |t| t.join();

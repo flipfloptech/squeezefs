@@ -337,7 +337,7 @@ pub const AllocSeam = struct {
     refcount: *const fn (ctx: *anyopaque, vol_tag: u64, offset: u64) u32,
 };
 
-pub const ReadError = error{ InputOutput, StaleIncarnation, QueueFull, WorkerShutdown, OutOfMemory };
+pub const ReadError = error{ InputOutput, StaleIncarnation, WorkerShutdown, OutOfMemory };
 
 /// ONE ranged read `[device_off, device_off + out.len)` on `vol_tag` — the
 /// mapping's OWN volume (FIND-PK-0), never a prefix from the block start

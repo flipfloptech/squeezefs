@@ -813,7 +813,7 @@ pub const Claimed = struct {
     overwrite: bool,
 };
 
-pub const StoreError = error{ InputOutput, VolumeFailed, WriterGuardFenced, OutOfMemory, WorkerShutdown, QueueFull, NoSpaceLeft, ReadOnlyFileSystem };
+pub const StoreError = error{ InputOutput, VolumeFailed, WriterGuardFenced, OutOfMemory, WorkerShutdown, NoSpaceLeft, ReadOnlyFileSystem };
 
 pub const SettleOutcome = union(enum) {
     published,
@@ -1032,7 +1032,6 @@ pub const Overlay = struct {
         return switch (e) {
             error.InputOutput => error.InputOutput,
             error.NoSpaceLeft => error.NoSpaceLeft,
-            error.QueueFull => error.QueueFull,
             error.WorkerShutdown => error.WorkerShutdown,
             error.VolumeFailed => error.VolumeFailed,
             error.WriterGuardFenced => error.WriterGuardFenced,

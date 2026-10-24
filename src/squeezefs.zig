@@ -217,6 +217,7 @@ pub const uring_fs = if (builtin.os.tag == .linux) @import("io/uring_fs.zig") el
 
 // ---- I/O: NVMe block device workers (Linux only) ----
 pub const nvme_derive = @import("io/nvme_derive.zig");
+pub const lane_door_model = @import("io/lane_door_model.zig");
 pub const nvme_dev = if (builtin.os.tag == .linux) @import("io/nvme_dev.zig") else struct {};
 
 test {
@@ -364,5 +365,6 @@ test {
     if (builtin.os.tag == .linux) _ = ring_park;
     if (builtin.os.tag == .linux) _ = uring_fs;
     _ = nvme_derive;
+    _ = lane_door_model;
     if (builtin.os.tag == .linux) _ = nvme_dev;
 }

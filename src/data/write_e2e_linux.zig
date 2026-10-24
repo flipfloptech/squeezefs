@@ -58,7 +58,6 @@ const NvmeSeam = struct {
     fn mapErr(e: nvme_dev.DeviceError) seams.DmaError {
         return switch (e) {
             error.NoSpaceLeft => error.NoSpaceLeft,
-            error.QueueFull, error.LaneQueueFull => error.QueueFull,
             error.WorkerShutdown, error.WorkerClosed, error.LaneStopped => error.WorkerShutdown,
             error.VolumeFailed => error.VolumeFailed,
             error.WriterGuardFenced, error.ReservationConflict, error.DismountRefused => error.WriterGuardFenced,
@@ -76,7 +75,6 @@ const NvmeSeam = struct {
         const self: *NvmeSeam = @ptrCast(@alignCast(ctx));
         const buf = self.dev.readBlock(offset, out.len) catch |e| return switch (e) {
             error.ShortRead => error.ShortRead,
-            error.QueueFull, error.LaneQueueFull => error.QueueFull,
             error.WorkerShutdown, error.WorkerClosed, error.LaneStopped => error.WorkerShutdown,
             error.VolumeFailed => error.VolumeFailed,
             error.OutOfMemory => error.OutOfMemory,

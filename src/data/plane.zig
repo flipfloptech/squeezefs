@@ -2678,7 +2678,6 @@ pub const DataPlane = struct {
     fn packReadRange(ctx: *anyopaque, vol_tag: u64, device_off: u64, _: u64, out: []u8) pack.ReadError!void {
         const self: *DataPlane = @ptrCast(@alignCast(ctx));
         self.deviceRead(vol_tag, device_off, out, .pack) catch |e| return switch (e) {
-            error.QueueFull => error.QueueFull,
             error.WorkerShutdown => error.WorkerShutdown,
             error.OutOfMemory => error.OutOfMemory,
             else => error.InputOutput,
@@ -2704,7 +2703,6 @@ pub const DataPlane = struct {
     fn mapDma(e: nvme_dev.DeviceError) seams.DmaError {
         return switch (e) {
             error.NoSpaceLeft => error.NoSpaceLeft,
-            error.QueueFull, error.LaneQueueFull => error.QueueFull,
             error.WorkerShutdown, error.WorkerClosed, error.LaneStopped => error.WorkerShutdown,
             error.VolumeFailed => error.VolumeFailed,
             error.WriterGuardFenced, error.ReservationConflict, error.DismountRefused => error.WriterGuardFenced,
@@ -2775,7 +2773,6 @@ pub const DataPlane = struct {
     fn mapRead(e: nvme_dev.DeviceError) Error {
         return switch (e) {
             error.ShortRead => error.ShortRead,
-            error.QueueFull, error.LaneQueueFull => error.QueueFull,
             error.WorkerShutdown, error.WorkerClosed, error.LaneStopped => error.WorkerShutdown,
             error.VolumeFailed => error.VolumeFailed,
             error.OutOfMemory => error.OutOfMemory,
@@ -2787,7 +2784,6 @@ pub const DataPlane = struct {
         const self: *DataPlane = @ptrCast(@alignCast(ctx));
         self.deviceRead(vol_tag, offset, out, .write_side) catch |e| return switch (e) {
             error.ShortRead => error.ShortRead,
-            error.QueueFull => error.QueueFull,
             error.WorkerShutdown => error.WorkerShutdown,
             error.VolumeFailed => error.VolumeFailed,
             error.OutOfMemory => error.OutOfMemory,
@@ -2861,7 +2857,6 @@ pub const DataPlane = struct {
         const self: *DataPlane = @ptrCast(@alignCast(ctx.?));
         const plain = self.readMappingPlain(b, out) catch |e| return switch (e) {
             error.ShortRead => error.ShortRead,
-            error.QueueFull => error.QueueFull,
             error.WorkerShutdown => error.WorkerShutdown,
             error.VolumeFailed => error.VolumeFailed,
             error.OutOfMemory => error.OutOfMemory,

@@ -42,7 +42,7 @@ pub const HeldSource = slot.HeldSource;
 /// The LBA grain every piece, claim and seed is judged in.
 pub const PAGE: u32 = layout.GRAIN;
 
-pub const ReadError = error{ InputOutput, ShortRead, QueueFull, WorkerShutdown, VolumeFailed, OutOfMemory };
+pub const ReadError = error{ InputOutput, ShortRead, WorkerShutdown, VolumeFailed, OutOfMemory };
 
 // ---------------------------------------------------------------------------
 // The device.

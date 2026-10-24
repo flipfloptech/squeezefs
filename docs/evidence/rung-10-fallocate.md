@@ -140,7 +140,8 @@ landing takes the reservation over, every later 64 KiB write is a W1 patch in pl
   blocks (ext4 reports the allocated ones). xfstests rows that judge `du` after `falloc -k` would see
   it; none of the auto-group rows run so far do.
 - A `KEEP_SIZE` reservation past EOF is clipped by a later truncate down exactly as data blocks are
-  (ext4's law too); a truncate UP over a reservation exposes zeros (the hide), never the block's bytes.
+  — and at the SAME size too since 2026-10-24 (ext4's `ia_size <= oldsize`; `rung-10-punch-edge.md`); a
+  truncate UP over a reservation exposes zeros (the hide), never the block's bytes.
 - A punch's or zero's partial edge inside a written block on a TRANSFORMED volume cannot land in place
   (no W1 there): it CoWs through accumulation and can ENOSPC on a full store, as a write there would.
 - The writeback worker (`writeback.flushOne`, the file-backed ring's spill path) still mints fresh for

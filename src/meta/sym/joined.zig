@@ -959,8 +959,123 @@ pub const JoinedSet = struct {
         self.growRingIfDue();
     }
 
+    /// The pass count FIRST, then the window count: a pass tracks its
+    /// window before it leaves the gate (`park_core_model.RetireModel`).
     fn windowEmpty(self: *JoinedSet) bool {
         return self.gate.passesInside() == 0 and self.be.cv.windowsInflight() == 0;
+    }
+
+    // ---- the retirement (a live member evicted re-joins in place) ----
+
+    /// What the retirement leaves for the eligibility judgement (decision
+    /// 0003 §BO): the old ring's landed head and whether everything this
+    /// incarnation admitted landed inside the bound.
+    pub const Retirement = struct {
+        /// Every pass left and every window landed within one landing
+        /// ceiling.
+        drained: bool,
+        /// The ring's head after the drain: past it nothing is written.
+        head: u64,
+        /// Reservations still open (a range never landed).
+        open: usize,
+    };
+
+    /// THE RETIREMENT of this incarnation (charter §5.5 "A live member
+    /// evicted …"): the home shard evicted it and recovered (or is
+    /// recovering) its region, so nothing more may be admitted or written
+    /// through it. In order: the latch refuses every new mutation
+    /// (`Retired`: the conveyor's `Deferred`, nothing written, re-issued on
+    /// the successor), the park gate RETIRED (a parked pass wakes and
+    /// refuses its batch), the growth gate closed and drained — a pass
+    /// that read RUNNING is inside it until its window is tracked
+    /// (`park_core_model.RetireModel`) — bounded by one landing ceiling;
+    /// then, under the SMO lock (a cycle in flight finishes first), the
+    /// latch FAILED: no cycle, page or landing writes again. The growth
+    /// gate re-opens onto the latch (later passes refuse at once).
+    pub fn retireIncarnation(self: *JoinedSet) Retirement {
+        const be = self.be;
+        be.lane.latch.retire();
+        _ = self.park_gate.retire();
+        _ = self.gate.close();
+        const ceiling_ns = checkpoint.checkpointLandingCeilingMs(be.cp.cfg.max_age_ms, be.cp.cfg.flush_interval_ms) * std.time.ns_per_ms;
+        const drained = self.gate.awaitDrained(clock.monotonicNs() + ceiling_ns, self, windowEmpty);
+        be.smo_lock.lockUncancelable(be.io);
+        _ = be.lane.latch.failStop();
+        be.smo_lock.unlock(be.io);
+        self.gate.open();
+        return .{ .drained = drained, .head = be.core.headPos(), .open = be.reg.openCount() };
+    }
+
+    /// This appender's page as the device holds it NOW: the newest valid
+    /// image over its directory pair and — once a directory image names a
+    /// first segment — the two ring-side slots (what the successor's
+    /// recovery writes through). Null when the directory does not reach
+    /// the id.
+    pub fn readOwnPage(self: *JoinedSet) OpenError!?page.Page {
+        const be = self.be;
+        var links: std.ArrayList(dir.Link) = .empty;
+        defer links.deinit(be.gpa);
+        var reader_ctx: DevicePages = .{ .be = be };
+        const reader: dir.PageReader = .{ .ctx = &reader_ctx, .read = &DevicePages.read };
+        dir.walkChain(be.gpa, reader, .{ .start = be.sb.appender_dir.start, .len = be.sb.appender_dir.len }, be.sb.node_size, .{ .start = be.sb.heap.start, .len = be.sb.heap.len }, be.sb.totalExtents(), &links) catch |e| return switch (e) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.Io => error.Io,
+            error.Corrupt => error.Corrupt,
+        };
+        const loc = dir.locate(self.appenderId(), dir.pairCount(be.sb.node_size));
+        if (loc.chain_index >= links.items.len) return null;
+        const dir_slots = dir.pairOffsets(links.items[loc.chain_index].extent, loc.pair);
+        var bufs: [page.PAGE_SLOTS][page.PAGE_LEN]u8 = undefined;
+        var imgs: [page.PAGE_SLOTS]?[]const u8 = .{ null, null, null, null };
+        for (dir_slots, 0..) |off, i| {
+            DevicePages.read(&reader_ctx, off, &bufs[i]) catch return error.Io;
+            imgs[i] = &bufs[i];
+        }
+        const dir_best = page.newestValid(.{ imgs[0], imgs[1], null, null }) catch return error.Corrupt;
+        if (dir_best) |p| if (p.segments.len > 0) {
+            for (page.ringSideOffsets(p.segments.items[0]), 2..) |off, i| {
+                DevicePages.read(&reader_ctx, off, &bufs[i]) catch return error.Io;
+                imgs[i] = &bufs[i];
+            }
+        };
+        return page.newestValid(imgs) catch error.Corrupt;
+    }
+
+    /// The successor's recovery of this (retired) region as the device
+    /// shows it: the page `Recovered` under this identity, and the head
+    /// its ring scan reached.
+    pub const RecoveredPage = union(enum) {
+        /// `Recovered{ledger_tail_seq = head}` (recovery step 8).
+        recovered: struct { head: u64, term: u64 },
+        /// Not (yet) recovered: the state the page shows.
+        pending: page.State,
+        /// The page names another identity: the region is not ours.
+        foreign,
+        unreadable,
+    };
+
+    /// Poll the page until the successor's recovery wrote it `Recovered`
+    /// or `deadline_ns` passed (every `ENDPOINT_POLL_STEP_MS`): the
+    /// manager's death-ledger poll recovers the region within its cadence
+    /// after the eviction, and nothing of this incarnation is written
+    /// meanwhile (it is retired).
+    pub fn awaitRecovered(self: *JoinedSet, deadline_ns: u64) RecoveredPage {
+        while (true) {
+            const verdict: RecoveredPage = if (self.readOwnPage()) |maybe| blk: {
+                const p = maybe orelse break :blk .unreadable;
+                if (!p.identity.sameMount(self.identity)) break :blk .foreign;
+                if (p.state == .recovered) break :blk .{ .recovered = .{ .head = p.ledger_tail_seq, .term = p.recovered_by_term } };
+                break :blk .{ .pending = p.state };
+            } else |_| .unreadable;
+            switch (verdict) {
+                .pending, .unreadable => if (clock.monotonicNs() < deadline_ns) {
+                    self.be.io.sleep(.fromMilliseconds(ENDPOINT_POLL_STEP_MS), .awake) catch {};
+                    continue;
+                },
+                else => {},
+            }
+            return verdict;
+        }
     }
 
     /// `joined_grow_ring_if_due` (spec §3.3), on the checkpoint task after
@@ -981,7 +1096,7 @@ pub const JoinedSet = struct {
     /// cycle's error: the tick landed before growth was decided.
     pub fn growRingIfDue(self: *JoinedSet) void {
         const be = self.be;
-        if (self.left or be.cv.isClosing() or be.lane.latch.isFailed() or self.park_gate.isParked()) return;
+        if (self.left or be.cv.isClosing() or be.lane.latch.isFailed() or self.park_gate.word() != .running) return;
         const r = self.core();
         const current = r.ringBytes();
         const stalls = be.cv.stats.full_stalls.load();
@@ -1163,7 +1278,11 @@ pub const JoinedSet = struct {
         // manager had recovered, and re-wrote the page the manager had set
         // Recovered). The same for a park that stands: nothing durable.
         if (!self.park_gate.leaveAllowed()) {
-            log.warn("meta volume {s}: appender {d} stops {s} — the leave writes nothing (the crash shape: its region is the manager's to recover; the page stays as the manager left it)", .{ be.path, self.appenderId(), if (self.park_gate.isExpired()) "FENCED (poisoned)" else "PARKED" });
+            log.warn("meta volume {s}: appender {d} stops {s} — the leave writes nothing (the crash shape: its region is the manager's to recover; the page stays as the manager left it)", .{ be.path, self.appenderId(), switch (self.park_gate.word()) {
+                .expired => "FENCED (poisoned)",
+                .retired => "RETIRED (re-joined in place)",
+                else => "PARKED",
+            } });
             return;
         }
         // No refill lands under the leave (the pool's word is read below).

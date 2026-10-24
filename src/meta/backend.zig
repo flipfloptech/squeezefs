@@ -1514,7 +1514,7 @@ pub const KvBackend = struct {
         return be.joined.?.onCheckpoint(rec);
     }
 
-    fn joinedPreAdmission(ctx: *anyopaque) error{Expired}!void {
+    fn joinedPreAdmission(ctx: *anyopaque) error{ Expired, Retired }!void {
         const gate: *sym.membership.park_reclaim.ParkGate = @ptrCast(@alignCast(ctx));
         return gate.preAdmission();
     }
@@ -3271,6 +3271,27 @@ pub const KvBackend = struct {
             gpa.free(be.path);
             gpa.destroy(be);
             return;
+        }
+        if (!be.closed and be.lane.latch.isRetired()) {
+            be.closed = true;
+            // A RETIRED incarnation (a re-join in place, decision 0003 §BO):
+            // its region is the successor manager's — nothing is written
+            // (no leave, no final tick); its threads join.
+            be.cv.close();
+            be.cv.quiesce();
+            be.stopPass();
+            exec.group.awaitGroup(&be.apply_group, exec.lane.currentFiber(), &.{}) catch {};
+            be.slots.quiesce();
+            // The leave refuses over the retired (or expired) gate and
+            // says so: the crash shape, nothing written.
+            if (be.joined) |js| js.leave();
+            be.task.stop();
+            if (be.ckpt_thread) |th| {
+                th.join();
+                be.ckpt_thread = null;
+            }
+            be.lane.shutdown();
+            log.info("meta volume {s}: the retired incarnation (appender {d}, head {d}) closed — it wrote nothing past its retirement", .{ be.path, if (be.joined) |js| js.appenderId() else 0, be.core.headPos() });
         }
         if (!be.closed) {
             be.closed = true;

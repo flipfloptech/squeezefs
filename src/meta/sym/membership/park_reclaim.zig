@@ -16,9 +16,18 @@
 //! loop reclaims against the successor the home volume's rendezvous names
 //! (`join{prior_epoch}`); `T_park_max = failover_bound + grace`.
 //!
-//! The two invariants are `park_core_model.zig`'s: the Dekker pair
-//! (`tryEnter` vs `park`, SeqCst on both sides) and the exclusive exit (one
-//! CAS off PARKED). Every registry is a field of the gate (0002 row 259).
+//! RETIRED (sticky, from RUNNING or PARKED) is the incarnation's end when
+//! the home shard evicted a live member and it re-joins IN PLACE (charter
+//! §5.5 "A live member evicted …"; decision 0003 §BO): the pre-admission
+//! gate answers `Retired` — the conveyor's `Deferred`, nothing written, the
+//! op re-issued on the successor incarnation — and a failed re-join moves
+//! it on to EXPIRED (the poison).
+//!
+//! The invariants are `park_core_model.zig`'s: the Dekker pair (`tryEnter`
+//! vs `park`, SeqCst on both sides), the exclusive exit (one CAS off
+//! PARKED — release, expiry and retirement), the re-arm and the
+//! retirement's drain. Every registry is a field of the gate (0002 row
+//! 259).
 
 const std = @import("std");
 const Io = std.Io;
@@ -31,7 +40,7 @@ const lease_clock = @import("../../guard/lease_clock.zig");
 pub const model = @import("park_core_model.zig");
 
 pub const stats = struct {
-    /// The posture word: 0 running, 1 parked, 2 expired.
+    /// The posture word: 0 running, 1 parked, 2 expired, 3 retired.
     pub var appender_parked: counters.Gauge = .{};
     pub var appender_parks: counters.ShardedCounter = .{};
     /// Exact-sum `wait_successor / reclaim_rtt / total` per reclaim.
@@ -55,7 +64,7 @@ pub const Phase = enum(u8) {
     pub const count = @typeInfo(Phase).@"enum".field_names.len;
 };
 
-pub const Word = enum(u32) { running = 0, parked = 1, expired = 2 };
+pub const Word = enum(u32) { running = 0, parked = 1, expired = 2, retired = 3 };
 
 /// `T_park_max = manager_failover_bound_ms + grace_ms`: the longest a live
 /// successor can take to arm (the TTL the D0 ladder waits out + its ladder
@@ -131,6 +140,10 @@ pub const ParkGate = struct {
         return self.word() == .expired;
     }
 
+    pub fn isRetired(self: *const ParkGate) bool {
+        return self.word() == .retired;
+    }
+
     /// A parked lessee is still the lock master: grants and recalls go on
     /// until the poison.
     pub fn admitsTokenService(self: *const ParkGate) bool {
@@ -163,7 +176,8 @@ pub const ParkGate = struct {
     /// never feeds the journal-failure escalation. EXPIRED fails it. A
     /// RUNNING gate judges `T_self` first (`SelfFence`): a committer past
     /// the member's deadline parks the gate itself and waits like the rest.
-    pub fn preAdmission(self: *ParkGate) error{Expired}!void {
+    /// RETIRED answers `Retired`: this incarnation admits nothing more.
+    pub fn preAdmission(self: *ParkGate) error{ Expired, Retired }!void {
         while (true) {
             switch (self.word()) {
                 .running => {
@@ -175,6 +189,7 @@ pub const ParkGate = struct {
                     return;
                 },
                 .expired => return error.Expired,
+                .retired => return error.Retired,
                 .parked => {},
             }
             var n = self.admission_wake.notified();
@@ -218,7 +233,7 @@ pub const ParkGate = struct {
         while (true) {
             switch (self.word()) {
                 .running => return .ok,
-                .expired => return .eio,
+                .expired, .retired => return .eio,
                 .parked => {},
             }
             var n = self.ack_wake.notified();
@@ -262,12 +277,32 @@ pub const ParkGate = struct {
     }
 
     /// The owner's own verdict says the lease is gone (`UnknownLease`): a
-    /// park would stand for nothing.
+    /// park would stand for nothing. A RETIRED gate whose re-join in place
+    /// was refused (something un-landed, or the join failed) expires too.
     pub fn expireNow(self: *ParkGate, sink: PoisonSink, reason: []const u8) bool {
-        if (self.state.cmpxchgStrong(@backingInt(Word.parked), @backingInt(Word.expired), .seq_cst, .seq_cst) != null) return false;
+        if (self.state.cmpxchgStrong(@backingInt(Word.parked), @backingInt(Word.expired), .seq_cst, .seq_cst) != null and
+            self.state.cmpxchgStrong(@backingInt(Word.retired), @backingInt(Word.expired), .seq_cst, .seq_cst) != null) return false;
         stats.appender_parked.set(@backingInt(Word.expired));
         stats.appender_park_expiries.fire(reason);
         sink.poison(sink.ctx, reason);
+        self.wakeAll();
+        return true;
+    }
+
+    /// The home shard evicted this live member: ONE CAS off RUNNING or
+    /// PARKED to RETIRED (exclusive with `release` and `expire*`), every
+    /// parker woken — a parked pass answers its batch `Retired` (the
+    /// conveyor's `Deferred`: nothing written) and later passes refuse at
+    /// once. True iff THIS call retired the word. The caller then drains
+    /// the incarnation (`park_core_model.RetireModel`: a pass that read
+    /// RUNNING is inside the growth gate until its window is tracked).
+    pub fn retire(self: *ParkGate) bool {
+        while (true) {
+            const w = self.word();
+            if (w != .running and w != .parked) return false;
+            if (self.state.cmpxchgStrong(@backingInt(w), @backingInt(Word.retired), .seq_cst, .seq_cst) == null) break;
+        }
+        stats.appender_parked.set(@backingInt(Word.retired));
         self.wakeAll();
         return true;
     }
@@ -437,6 +472,53 @@ test "step 5 / the terminal poison: a park past T_park_max expires exactly once 
     try log.testing.expectAllFired();
     try testing.expect(g2.isExpired());
     try testing.expectEqual(@as(u32, 2), p.count);
+}
+
+test "THE RETIREMENT (a live member evicted re-joins in place): retire moves RUNNING or PARKED to RETIRED exactly once, exclusive with release and expiry; a parked committer wakes and refuses Retired, a later one at once; the leave writes nothing; a refused re-join expires the retired word into the poison" {
+    var p: Poison = .{};
+    // From PARKED, with a committer waiting at the pre-admission gate.
+    var g = ParkGate.arm(testing.io, 0, 1 << 40);
+    _ = g.park(1);
+    const Waiter = struct {
+        fn run(gate: *ParkGate, out: *?anyerror) void {
+            gate.preAdmission() catch |e| {
+                out.* = e;
+                return;
+            };
+            out.* = null;
+        }
+    };
+    var answered: ?anyerror = error.Unexpected;
+    const th = try std.Thread.spawn(.{}, Waiter.run, .{ &g, &answered });
+    var spins: u32 = 0;
+    while (g.admission_wake.waiters(testing.io) == 0 and spins < 1_000_000) : (spins += 1) std.Thread.yield() catch {};
+    try testing.expect(g.retire());
+    th.join();
+    try testing.expectEqual(@as(?anyerror, error.Retired), answered);
+    try testing.expect(g.isRetired() and !g.isParked() and !g.isExpired());
+    try testing.expectEqual(@as(u64, 3), stats.appender_parked.load());
+    // Exclusive: a second retire, a release and a T_park_max expiry move nothing.
+    try testing.expect(!g.retire());
+    try testing.expect(!g.release(0, 0));
+    try testing.expect(!g.expireIfDue(std.math.maxInt(u64), p.sink()));
+    try testing.expectError(error.Retired, g.preAdmission());
+    try testing.expect(g.tryEnter() == null);
+    try testing.expectEqual(AckVerdict.eio, g.holdAck());
+    // The retired incarnation's dismount is the crash shape.
+    try testing.expect(!g.leaveAllowed());
+    // A refused re-join: RETIRED → EXPIRED, the poison once.
+    stats.appender_park_expiries.resetLogBudgetForTest();
+    log.testing.expectErrorLogs(1);
+    try testing.expect(g.expireNow(p.sink(), "the re-join in place was refused"));
+    try log.testing.expectAllFired();
+    try testing.expect(g.isExpired());
+    try testing.expectEqual(@as(u32, 1), p.count);
+    try testing.expect(!g.retire());
+    // From RUNNING (UnknownLease before T_self).
+    var g2 = ParkGate.arm(testing.io, 0, 1 << 40);
+    try testing.expect(g2.retire());
+    try testing.expectError(error.Retired, g2.preAdmission());
+    stats.appender_parked.set(@backingInt(Word.running));
 }
 
 /// A committer through the gate (the pre-admission, the entry, the held

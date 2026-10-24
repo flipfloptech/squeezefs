@@ -1468,7 +1468,7 @@ pub const CallerSeam = struct {
 /// The pre-admission gate's seam (`park_reclaim.ParkGate.preAdmission`).
 pub const PreAdmission = struct {
     ctx: *anyopaque,
-    wait: *const fn (ctx: *anyopaque) error{Expired}!void,
+    wait: *const fn (ctx: *anyopaque) error{ Expired, Retired }!void,
 };
 
 /// The ring-growth gate's seam (`sym/ring_growth.zig` `Gate`).
@@ -1733,9 +1733,14 @@ pub const Conveyor = struct {
             t.deinit();
             return error.VolumeClosed;
         }
-        self.deps.latch.admitMutation() catch {
+        self.deps.latch.admitMutation() catch |e| {
             t.deinit();
-            return error.VolumeFailed;
+            return switch (e) {
+                // A retired incarnation (a re-join in place): nothing
+                // written, the op re-issued on the successor.
+                error.Retired => error.Deferred,
+                error.VolumeFailed => error.VolumeFailed,
+            };
         };
         var q = tx.buildQueuedTx(t, self.deps.cache.cfg.layout.node_size, null) catch |e| return mapBuildError(e);
         // Step 0: the commit door — tokens per slot BEFORE the enqueue,
@@ -2331,9 +2336,14 @@ pub const Conveyor = struct {
         const core = self.deps.core;
         // The park gate first (charter §5.5 PARK-AND-RECLAIM: "acks held
         // at a pre-admission gate"): a parked joiner admits nothing until
-        // the reclaim lands; an expired park is the terminal poison.
-        if (self.deps.pre_admission) |g| g.wait(g.ctx) catch {
-            err.* = error.VolumeFailed;
+        // the reclaim lands; an expired park is the terminal poison; a
+        // retired incarnation (a re-join in place) admits nothing more —
+        // `Deferred`, nothing written, the op re-issued on its successor.
+        if (self.deps.pre_admission) |g| g.wait(g.ctx) catch |e| {
+            err.* = switch (e) {
+                error.Retired => error.Deferred,
+                error.Expired => error.VolumeFailed,
+            };
             return null;
         };
         if (core.tryAdmit(len, .user)) |a| return a;
@@ -2356,9 +2366,9 @@ pub const Conveyor = struct {
                 if (ticked and !woken) self.stats.park_tick_rescues.inc();
                 return a;
             }
-            if (self.isClosing() or self.deps.latch.isFailed()) {
+            if (self.isClosing() or self.deps.latch.isFailed() or self.deps.latch.isRetired()) {
                 n.cancel(io);
-                err.* = if (self.deps.latch.isFailed()) error.VolumeFailed else error.VolumeClosed;
+                err.* = if (self.deps.latch.isRetired()) error.Deferred else if (self.deps.latch.isFailed()) error.VolumeFailed else error.VolumeClosed;
                 return null;
             }
             self.deps.checkpoint.kickPark(self.deps.checkpoint.ctx);
@@ -2462,8 +2472,8 @@ pub const Conveyor = struct {
         };
 
         // A1.
-        if (self.isClosing() or self.deps.latch.isFailed()) {
-            self.failBatch(members.items, if (self.deps.latch.isFailed()) error.VolumeFailed else error.VolumeClosed);
+        if (self.isClosing() or self.deps.latch.isFailed() or self.deps.latch.isRetired()) {
+            self.failBatch(members.items, if (self.deps.latch.isRetired()) error.Deferred else if (self.deps.latch.isFailed()) error.VolumeFailed else error.VolumeClosed);
             return;
         }
         // A1¼: the window's lane cell, before the pass takes anything.

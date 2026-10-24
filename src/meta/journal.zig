@@ -1254,6 +1254,12 @@ pub const FailureLatch = struct {
     fenced: std.atomic.Value(bool) = .init(false),
     /// The classes that logged a line on this latch (this mount).
     marks: LineMarks = .{},
+    /// A JOINED incarnation RETIRED because its home shard evicted it and
+    /// the mount re-joins in place (decision 0003 §BO): it admits no new
+    /// mutation — every one it still meets answers `Retired` (the
+    /// conveyor's `Deferred`: re-issued on the successor incarnation, never
+    /// EIO) — and, once its last window landed, `failStop` ends its writes.
+    retired: std.atomic.Value(bool) = .init(false),
 
     pub const Class = enum { journal_write, barrier };
 
@@ -1333,7 +1339,7 @@ pub const FailureLatch = struct {
     };
 
     /// Why a volume is FAILED (the stats face and the teardown log).
-    pub const Verdict = enum { healthy, failed, fenced };
+    pub const Verdict = enum { healthy, failed, fenced, retired };
 
     /// The fence rung: FAILED at once; true iff THIS call latched (the one
     /// guard log line and `writer_guard_fenced` are paid here). `site`
@@ -1364,8 +1370,20 @@ pub const FailureLatch = struct {
     }
 
     pub fn verdict(self: *const FailureLatch) Verdict {
+        if (self.isRetired()) return .retired;
         if (!self.isFailed()) return .healthy;
         return if (self.isFenced()) .fenced else .failed;
+    }
+
+    /// The incarnation's end (a re-join in place): no new mutation is
+    /// admitted. Release pairs with `isRetired`'s Acquire; the writes stop
+    /// at the later `failStop`, which the refusals read as retired too.
+    pub fn retire(self: *FailureLatch) void {
+        self.retired.store(true, .release);
+    }
+
+    pub fn isRetired(self: *const FailureLatch) bool {
+        return self.retired.load(.acquire);
     }
 
     fn counter(self: *FailureLatch, class: Class) *std.atomic.Value(u32) {
@@ -1404,11 +1422,26 @@ pub const FailureLatch = struct {
     }
 
     /// The mutation path's classifier: a latched volume refuses every
-    /// mutation (EIO at the FUSE edge).
-    pub fn admitMutation(self: *const FailureLatch) error{VolumeFailed}!void {
+    /// mutation (EIO at the FUSE edge); a retired incarnation refuses it
+    /// `Retired` (re-issued on its successor).
+    pub fn admitMutation(self: *const FailureLatch) error{ VolumeFailed, Retired }!void {
+        if (self.isRetired()) return error.Retired;
         if (self.isFailed()) return error.VolumeFailed;
     }
 };
+
+test "the retired latch (a re-join in place, decision 0003 §BO): retirement refuses every new mutation `Retired` while the volume still writes; the later fail-stop ends the writes and the verdict stays `retired`" {
+    var latch: FailureLatch = .{};
+    try latch.admitMutation();
+    latch.retire();
+    try testing.expectError(error.Retired, latch.admitMutation());
+    try testing.expect(!latch.isFailed());
+    try testing.expectEqual(FailureLatch.Verdict.retired, latch.verdict());
+    try testing.expect(latch.failStop());
+    try testing.expect(latch.isFailed() and latch.isRetired());
+    try testing.expectError(error.Retired, latch.admitMutation());
+    try testing.expectEqual(FailureLatch.Verdict.retired, latch.verdict());
+}
 
 // ---------------------------------------------------------------------------
 // Torn-write / power-cut harness as pure image mutations (§7 "HARNESS

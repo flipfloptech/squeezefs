@@ -546,6 +546,12 @@ pub const Checkpointer = struct {
         return self.deps.latch.isFailed();
     }
 
+    /// A retired incarnation (a re-join in place, decision 0003 §BO): its
+    /// region is the successor manager's — not even the shutdown writes.
+    pub fn isRetired(self: *const Checkpointer) bool {
+        return self.deps.latch.isRetired();
+    }
+
     pub fn lastCycle(self: *Checkpointer) CycleTape {
         self.tape_lock.lock();
         defer self.tape_lock.unlock();
@@ -1307,6 +1313,10 @@ pub const CheckpointTask = struct {
         }
         const shutting_down = self.stop_requested.load(.acquire);
         if (self.cp.isFailed() and !shutting_down) return true;
+        if (self.cp.isFailed() and self.cp.isRetired()) {
+            self.stopped.store(true, .release);
+            return false;
+        }
         const drain_deadline: ?u64 = if (shutting_down) null else now_ns + self.period_ns;
         if (cadence or shutting_down) {
             self.cp.tick(shutting_down, drain_deadline, park_kick, self.period_ns / ns_per_ms) catch |e| {

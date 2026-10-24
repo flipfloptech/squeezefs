@@ -570,8 +570,9 @@ pub const RejoinHost = struct {
     /// evicted one dropped (the kernel's whole view, the read cache) and
     /// its per-volume registrations made for the successor's members.
     rebound: *const fn (ctx: *anyopaque) void,
-    /// Mark every FUSE op in flight now; `opsDrained` answers once each
-    /// of them has answered (the retired incarnation's last readers).
+    /// Mark every FUSE and interception op in flight now; `opsDrained`
+    /// answers once each of them has answered (the retired incarnation's
+    /// last readers).
     opsMark: *const fn (ctx: *anyopaque) void,
     opsDrained: *const fn (ctx: *anyopaque) bool,
 };
@@ -1061,8 +1062,8 @@ pub const WirePlane = struct {
         _ = j.rejoins_in_place.fetchAdd(1, .monotonic);
         stats.wire_rejoins_in_place.inc();
         if (self.set.bound_moves) |m| m.bump();
-        // The retired incarnations' node caches go once every FUSE op in
-        // flight now has answered (the beat polls `releaseRetiredIfDrained`).
+        // The retired incarnations' node caches go once every op in flight
+        // now has answered (the beat polls `releaseRetiredIfDrained`).
         if (host) |h| h.opsMark(h.ctx);
         j.retired_caches_owed = true;
         j.follow_stop.store(false, .release);
@@ -1083,11 +1084,12 @@ pub const WirePlane = struct {
         j.slots_carriage = be0.slots.carriageSink();
     }
 
-    /// The retired incarnations' node caches released once every FUSE op
-    /// in flight at the publication has answered (decision 0003 §BS): a
-    /// reader of a retired incarnation is an op that loaded it before the
-    /// pointer store; the nodes such a reader still holds die at its last
-    /// release (the node refcount), so the discard never frees under it.
+    /// The retired incarnations' node caches released once every FUSE and
+    /// interception op in flight at the publication has answered (decision
+    /// 0003 BS.12): a reader of a retired incarnation is an op that loaded
+    /// it before the pointer store; the nodes such a reader still holds
+    /// die at its last release (the node refcount), so the discard never
+    /// frees under it.
     fn releaseRetiredIfDrained(self: *WirePlane, j: *JoinedHalf) void {
         if (!j.retired_caches_owed) return;
         if (self.rejoin_host.load(.acquire)) |h| if (!h.opsDrained(h.ctx)) return;

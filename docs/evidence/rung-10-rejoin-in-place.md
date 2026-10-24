@@ -83,17 +83,59 @@ its verdict is the fail-stop deterministically (its storm alone left B eligible 
 - Rebased onto dev `eeec3e8` (the data-plane answers, §BO–§BQ): the three eviction rows 11/11
   (2 × 5 + 1), unit filters with `journal`/`conveyor`/`lease_table` 442/472 (30 skipped), rails 32/32.
 
+## Follow-ups (branch `fix/rejoin-followups`, 0003 BS.10–BS.15)
+
+- **The member joins before the publication.** A refused join closes the unpublished successors (a
+  fresh join's clean leave, page `Free`) and poisons over the predecessor — no leave against `FAILED`
+  latches at the unmount (seam `SQUEEZEFS_TEST_REJOIN_MEMBER_REFUSED`).
+- **The holder's grants** over the retired slots dropped (`Holder.dropAll`).
+- **The retired node cache, released** once every FUSE op (registry slot + unique) and every
+  interception session in flight at the publication answered; a held node dies at its last release; a
+  background reader past the drain re-reads seq-checked children (typed mismatch, never wrong
+  content). Measured: `kv_node_cache` 17,735 KiB → 17,641 KiB released → 262 KiB; VmRSS 295 MiB ≤
+  the idle-RSS bound 336 MiB (64 MiB budget, 156 threads).
+- **Every binding re-applied:** the writer plane's grant verbs and the fleet worker through
+  `WirePlane.liveManagerCall`; the job node's store/world/rekey, the stripe floor and the xv plane's
+  `own_id` follow `volumes[0]`. A joiner's job fabric is never the coordinator (submit refuses
+  `NotCoordinator`, adopt is a no-op), so "a job reads a frozen tree 0" has no joiner path; the
+  observable red was elsewhere (next item).
+- **The death record of a member live again retires** (`Driver.retireRejoined`; counted
+  `dead_members_retired_rejoined`). Standing, it named the successor's Live page: A's `scrub --online`
+  after the re-join reported `[C15] … appender 2 — dead` (the job after the re-join, red).
+- **Two-volume joiners:** members past volume 0 join with volume 0's `job:enroll` secret (a joiner of
+  a two-member meta set could not mount at all).
+- **The interposer:** a `dd` writer and reader keep their ring sessions across the re-join (sessions
+  2 → 2; after it the ring served 8 writes and 15 reads), no error reaching the app, A byte-equal.
+
+| Test | dev `23db6c2` (+ the refusal seam on its ordering) | branch |
+|---|---|---|
+| main re-join row (+ holder grants, held-fd and fresh appends, the scrub job) | `dlm_token_outstanding` 2 | 0; appends equal; scrub 0 findings (before the retirement: C15) |
+| "A RE-JOINED MEMBER RELEASES ITS RETIRED INCARNATION'S NODE CACHE" | no release (timeout) | released, RSS in bound |
+| "A TWO-VOLUME SET'S JOINER RE-JOINS IN PLACE" | B's mount refused (no `job:enroll` on vol2) | 2 incarnations re-published, fsck clean |
+| "A RE-JOIN WHOSE MEMBERSHIP JOIN IS REFUSED …" | best-effort leave (page check passed this run; no clean-leave line) | successor left at once, page `Free` |
+| shim "A RE-JOIN IN PLACE UNDER THE INTERPOSER" | green with overwrites (a guard) | green |
+| unit "a re-join in place drops every grant its holder issued" | — | green |
+
+Counts (on `c678245`, dev `9b081ae`): the re-join rows (the main row, its negative arm, the memory,
+two-volume and refused rows, both dead-manager eviction rows) **20/20** — two loops in parallel × 10
+beside the membership batch and a unit loop, one of them with the shim smoke (its interposer row
+10/10); re-joined 161–182 ms after the beat's release. The membership/recovery/fleet/jobs batch (68
+rows) **3/3**. Unit filters (`re-join`, `recovery`, `death`, `xv`, `token`, `membership`, `reclaim`,
+`lattice`, `joined`, `stripe`, `ipc`, `job`, `retire`, `journal`, `conveyor`, `lease_table`) 803 pass,
+62 skipped, 4/5 runs — the fifth failed `data.reclaim` "drain_defers_under_foreground…" (a supply-drain
+counter under load; untouched here). `zig build rails` 32/32; `zig fmt --check` clean.
+
 ## Seen, not fixed
 
-- **A joiner's APPEND to a foreign-slot file reads back zeros on both mounts** — dev, no eviction:
-  A writes `own/f` (1 MiB), B appends (`echo x >> own/f`, or through a held `exec 3>>`): size right,
-  appended bytes zero on A and B (B's stats: `drain_inplace_write_bytes` 4096, `record_ships` 1;
-  A's: `layout_map_merge_failures`, `slot_door_coherence_refusals`). Repro in
-  `~/tmp/rejoin/smoke-with-control.zig` (TEMPCONTROL). The re-join row overwrites through its held fd
-  instead. Owed to the data plane's owner.
-- The retired incarnation stays mapped until the unmount (its node cache is budget-counted memory).
-- A refused membership join after the successor was published poisons the mount; the successor's
-  dismount runs its leave against FAILED latches — best effort (the next open's recovery ladder).
+- **A joiner's APPEND to a foreign-slot file reads back zeros on both mounts** — dev, no eviction
+  (repro `~/tmp/rejoin/smoke-with-control.zig`). After a re-join the class reaches B's OWN
+  pre-re-join files through the interposer: an append through a ring session lands zeros on A and B
+  (A: `slot_door_coherence_refusals` 780); through FUSE (a held `O_APPEND` fd, a fresh open) the bytes
+  are whole. Owed to `fix/foreign-append-bytes` (the claim law); the interposer row overwrites.
+- An online fsck within one ledger poll (1.1 s) of a re-join can still read the predecessor's death
+  record (C15); the main row waits for the retirement.
+- The predecessor's `Recovered` page is not released while an allocation lease names the pair — the
+  successor's own leases name it too (one identity per member pair).
 - Between the eviction and the beat's verdict the evicted member serves reads off its stale RAM
   (bounded by `T_owner − T_self` plus the hold); B's checkpoint task may still write its page in that
   window on a non-PR substrate (a zombie page write would read Live and refuse the re-join: safe).

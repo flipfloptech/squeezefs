@@ -8463,6 +8463,18 @@ const DmErrorSet = struct {
         self.rig.gpa.free(try self.rig.shOk(self.rig.work, try std.fmt.bufPrint(script[0..256], "dmsetup suspend --nolockfs {s} && dmsetup load {s} --table \"{s}\" && dmsetup resume {s} && echo ok", .{ self.name, self.name, table, self.name })));
     }
 
+    /// Every write and flush of the METADATA slice `ms` slower (dm-delay
+    /// over the slice alone; the data slices and every read untouched): a
+    /// journal window issued now reaches the device `ms` later, so a cut
+    /// inside that span loses it while data DMAs issued after it land. 0
+    /// swaps the linear slice back (dm-delay's suspend issues what it
+    /// holds to the device underneath).
+    fn delayMeta(self: *DmErrorSet, ms: u32) !void {
+        var script: [768]u8 = undefined;
+        const table = if (ms == 0) try std.fmt.bufPrint(script[512..], "0 {d} linear /dev/mapper/{s} 0", .{ meta_sectors, self.name }) else try std.fmt.bufPrint(script[512..], "0 {d} delay /dev/mapper/{s} 0 0 /dev/mapper/{s} 0 {d}", .{ meta_sectors, self.name, self.name, ms });
+        self.rig.gpa.free(try self.rig.shOk(self.rig.work, try std.fmt.bufPrint(script[0..512], "dmsetup suspend --nolockfs {s}-meta && dmsetup load {s}-meta --table \"{s}\" && dmsetup resume {s}-meta && echo ok", .{ self.name, self.name, table, self.name })));
+    }
+
     fn down(self: *DmErrorSet) void {
         const gpa = self.rig.gpa;
         var script: [1024]u8 = undefined;
@@ -9289,6 +9301,188 @@ test "smoke: A SUPERVISOR HOLDING CUSTODY IS NEVER THE DAEMON (charter §4, deci
             return error.FsckNotClean;
         }
     }
+}
+
+/// Every 4 MiB block of the named devices whose first 4 KiB is ONE repeated
+/// non-zero byte, as `<device#> <block#> <byte hex>` lines (O_DIRECT: the
+/// device's bytes, never a page cache the daemon's DMAs bypassed).
+const uniform_blocks_script =
+    \\import mmap, os, sys
+    \\BS = 4 << 20
+    \\buf = mmap.mmap(-1, 4096)
+    \\for d, dev in enumerate(sys.argv[1:]):
+    \\    fd = os.open(dev, os.O_RDONLY | os.O_DIRECT)
+    \\    size = os.lseek(fd, 0, os.SEEK_END)
+    \\    for b in range(size // BS):
+    \\        os.preadv(fd, [buf], b * BS)
+    \\        v = buf[0]
+    \\        if v != 0 and buf[:] == bytes([v]) * 4096:
+    \\            print(d, b, '%02x' % v)
+    \\    os.close(fd)
+;
+
+/// The metadata slice's delay in the free-durability row: the span inside
+/// which the cut lands — the truncate and the unlink follow the punch's
+/// landing (one delay), the writers and the 3 s watch follow them, and the
+/// truncate's window must still be in flight at the cut.
+const free_cut_delay_ms: u32 = 12_000;
+
+/// Where each 4 MiB block holding ONE repeated byte sits on the two data
+/// slices (`uniform_blocks_script`).
+const UniformBlocks = struct {
+    const Loc = struct { dev: u8, block: u64, byte: u8 };
+    locs: [256]Loc = undefined,
+    n: usize = 0,
+
+    fn scan(rig: *Rig, dm: *const DmErrorSet) !UniformBlocks {
+        var d0: [128]u8 = undefined;
+        var d1: [128]u8 = undefined;
+        const r = try std.process.run(rig.gpa, rig.io, .{ .argv = &.{ "python3", "-c", uniform_blocks_script, try std.fmt.bufPrint(&d0, "/dev/mapper/{s}-d0", .{dm.name}), try std.fmt.bufPrint(&d1, "/dev/mapper/{s}-d1", .{dm.name}) }, .environ_map = &rig.env });
+        defer rig.freeRun(r);
+        if (!r.term.success()) {
+            std.debug.print("\n--- the device scan failed ({f}) ---\n{s}\n", .{ r.term, r.stderr });
+            return error.ScriptFailed;
+        }
+        var out: UniformBlocks = .{};
+        var lines = std.mem.tokenizeScalar(u8, r.stdout, '\n');
+        while (lines.next()) |line| {
+            var f = std.mem.tokenizeScalar(u8, line, ' ');
+            const dev = try std.fmt.parseInt(u8, f.next() orelse return error.ScanUnparsed, 10);
+            const block = try std.fmt.parseInt(u64, f.next() orelse return error.ScanUnparsed, 10);
+            const byte = try std.fmt.parseInt(u8, f.next() orelse return error.ScanUnparsed, 16);
+            if (out.n == out.locs.len) return error.ScanUnparsed;
+            out.locs[out.n] = .{ .dev = dev, .block = block, .byte = byte };
+            out.n += 1;
+        }
+        return out;
+    }
+
+    /// The ONE block holding `byte`, else null (none, or more than one).
+    fn only(self: *const UniformBlocks, byte: u8) ?Loc {
+        var hit: ?Loc = null;
+        for (self.locs[0..self.n]) |l| if (l.byte == byte) {
+            if (hit != null) return null;
+            hit = l;
+        };
+        return hit;
+    }
+
+    /// The byte `loc` holds now (0 = not one repeated non-zero byte).
+    fn at(self: *const UniformBlocks, loc: Loc) u8 {
+        for (self.locs[0..self.n]) |l| if (l.dev == loc.dev and l.block == loc.block) return l.byte;
+        return 0;
+    }
+};
+
+test "smoke: A FREED BLOCK IS NOT REUSED BEFORE THE RECORD THAT FREED IT IS DURABLE (charter §6.2 block reclaim, §5.2 the ack point; decision 0003 §BT) — a --single-writer set (the flat allocator: a mint takes the free list first) over device-mapper slices, cache-less: three one-block files of 0xa1, 0xa2, 0xa3 written O_DIRECT, fsync'd and synced, eight empty files beside them; the metadata slice slowed 12 s (dm-delay on writes and flushes: every journal window and barrier issued from here is in flight, as one inside the ≤ 50 ms flush span is); `fpunch 0 4m` of the second (answered once its window landed — its barrier still in flight), then `truncate 0` of the first and `rm` of the third (each answered at its RAM apply), then eight O_DIRECT one-block writes of 0xbb; the power cut inside the delay (dm-flakey drop_writes, kill -9 of the foreground daemon: no supervisor, no tail replay), the slices back: the three freed blocks still hold 0xa1, 0xa2, 0xa3 on the device — none was written, nor discarded, before its record was durable; fsck --offline --scrub clean; after the remount the truncate and the unlink were never durable and the two files read their OWN bytes, the landed punch reads its hole (red on 2d44c33: the frees ran right after the answer, the writers' mints took the freed blocks off the free list — the truncated file read 4 MiB of 0xbb, the unlinked one zeros: its block discarded by the debt drainer; fsck found nothing)" {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    if (DmErrorSet.venueMissing()) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    if (DmErrorSet.delayMissing(rig)) |why| return testkit.skipWhy(@src(), why);
+    if (DmErrorSet.flakeyMissing(rig)) |why| return testkit.skipWhy(@src(), why);
+    // Cache-less: a write's bytes go straight to the data slices. No §L
+    // hold: a batch never waits for the slowed landing before it is issued
+    // (THE REPLAY PROOF's posture), so every commit after the frees is
+    // answered at its apply as it would be inside the flush span.
+    try rig.env.put("SQUEEZEFS_WRITE_CACHE_PCT", "0");
+    try rig.env.put("SQUEEZEFS_META_WINDOW_HOLD", "none");
+    var dm = try DmErrorSet.up(rig);
+    defer dm.deinit();
+    {
+        const r = try rig.squeezefs(&.{ "format", "--single-writer", dm.meta_uri, dm.data_uri });
+        defer rig.freeRun(r);
+        if (!r.term.success()) std.debug.print("\nformat: {s}\n", .{r.stderr});
+        try testing.expect(r.term.success());
+    }
+    try rig.spawnMountOf(dm.meta_uri, &.{});
+    _ = try rig.awaitReady(0);
+    // 1. Three one-block files, durable, and the writers' empty files (a
+    //    create after the slowdown would wait for its directory's landing);
+    //    where the three blocks sit.
+    gpa.free(try rig.onMountTimed(
+        \\for p in a1 a2 a3; do xfs_io -f -d -c "pwrite -S 0x$p -b 4m 0 4m" -c fsync f$p >/dev/null; done
+        \\for i in 1 2 3 4 5 6 7 8; do : > b$i; done
+        \\sync -f .
+        \\echo ok
+    , 120));
+    const before = try UniformBlocks.scan(rig, &dm);
+    var freed: [3]UniformBlocks.Loc = undefined;
+    for ([_]u8{ 0xa1, 0xa2, 0xa3 }, &freed) |p, *loc| loc.* = before.only(p) orelse {
+        std.debug.print("\nsmoke[free-durable]: no single block of 0x{x:0>2} on the data slices ({d} uniform blocks)\n", .{ p, before.n });
+        return error.BlockNotFound;
+    };
+    // 2. The journal slowed; the three frees answered; the writers started
+    //    (their block-map commits wait for a landing behind the frees'
+    //    windows, so they run detached and the row watches the device).
+    try dm.delayMeta(free_cut_delay_ms);
+    gpa.free(try rig.onMountTimed(
+        \\xfs_io -c "fpunch 0 4m" fa2
+        \\xfs_io -c "truncate 0" fa1
+        \\rm fa3
+        \\: > "$1/writers.pid"
+        \\for i in 1 2 3 4 5 6 7 8; do
+        \\  xfs_io -d -c "pwrite -S 0xbb -b 4m 0 4m" b$i >/dev/null 2>&1 </dev/null &
+        \\  echo $! >> "$1/writers.pid"
+        \\done
+        \\echo ok
+    , 60));
+    // 3. The writers' bytes on the device; a freed block taking them is the
+    //    reuse (bounded: past it the freed blocks are held).
+    var reused: [3]bool = @splat(false);
+    var landed_b: usize = 0;
+    {
+        const deadline = clock.monotonicNs() + 3 * std.time.ns_per_s;
+        while (true) {
+            const now = try UniformBlocks.scan(rig, &dm);
+            landed_b = 0;
+            for (now.locs[0..now.n]) |l| landed_b += @intFromBool(l.byte == 0xbb);
+            for (freed, &reused) |loc, *r| r.* = now.at(loc) == 0xbb;
+            if ((reused[0] and reused[1] and reused[2]) or clock.monotonicNs() >= deadline) break;
+            sleepMs(50);
+        }
+    }
+    std.debug.print("\nsmoke[free-durable]: before the cut: {d} block(s) of the writers' 0xbb on the device; freed blocks reused: truncate {}, punch {}, unlink {}\n", .{ landed_b, reused[0], reused[1], reused[2] });
+    // 4. The power cut inside the delay: every write from here dropped (the
+    //    slowed windows and barriers with them, released by the delay's
+    //    suspend), the daemon dead without a supervisor.
+    try dm.dropWrites(true);
+    try rig.kill();
+    gpa.free(try rig.shOk(rig.work, "for p in $(cat writers.pid); do kill -9 $p 2>/dev/null || true; done; echo ok"));
+    try dm.delayMeta(0);
+    try dm.dropWrites(false);
+    const after = try UniformBlocks.scan(rig, &dm);
+    std.debug.print("smoke[free-durable]: after the cut the freed blocks hold {x:0>2} {x:0>2} {x:0>2}\n", .{ after.at(freed[0]), after.at(freed[1]), after.at(freed[2]) });
+    {
+        const r = try rig.squeezefs(&.{ "fsck", "--offline", "--scrub", dm.meta_uri });
+        defer rig.freeRun(r);
+        if (!r.term.success() or std.mem.indexOf(u8, r.stdout, "findings: 0 (clean)") == null) {
+            std.debug.print("\n--- fsck --offline after the cut ({f}) ---\n{s}\n--- stderr ---\n{s}\n", .{ r.term, r.stdout, r.stderr });
+            return error.FsckNotClean;
+        }
+    }
+    // 5. The remount: the truncate and the unlink never durable, both files
+    //    their own bytes; the landed punch a hole.
+    const mark = try rig.logLen();
+    try rig.spawnMountOf(dm.meta_uri, &.{});
+    _ = try rig.awaitReady(mark);
+    {
+        const out = try rig.onMountTimed(
+            \\for p in a1 a2 a3; do
+            \\  if test -e f$p; then echo "f$p $(stat -c %s f$p) $(od -An -tx1 -v f$p | tr -s ' ' '\n' | grep . | sort -u | tr '\n' ',')"; else echo "f$p gone"; fi
+            \\done
+        , 120);
+        defer gpa.free(out);
+        std.debug.print("smoke[free-durable]: after the remount:\n{s}", .{out});
+        try testing.expectEqualStrings("fa1 4194304 a1,\nfa2 4194304 00,\nfa3 4194304 a3,\n", out);
+    }
+    // The device: no freed block was written, nor discarded, before the
+    // record that freed it was durable.
+    for (freed, [_]u8{ 0xa1, 0xa2, 0xa3 }) |loc, p| try testing.expectEqual(p, after.at(loc));
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
 }
 
 /// A process whose cwd is the mount (the holder of the busy-umount rows):

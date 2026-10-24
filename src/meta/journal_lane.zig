@@ -251,6 +251,11 @@ pub const Stats = struct {
     /// fiber park; a same-lane fiber's wait is neither (its own park).
     wait_fiber_parks: counters.ShardedCounter = .{},
     wait_raw_parks: counters.ShardedCounter = .{},
+    /// `journal_lane_fsync_waiters_hwm`: the most fsyncs one lane held
+    /// admitted at once (`BarrierWaiter`s awaiting their barrier) — past
+    /// the request cells (64 on a floor ring) is the storm that answered
+    /// EAGAIN before §BO.1.
+    fsync_waiters_hwm: counters.Gauge = .{},
     queue_full: counters.ShardedCounter = .{},
     volumes_failed: counters.ShardedCounter = .{},
     /// Rings that died under a lane (`io_uring_enter` / the CQE read
@@ -267,7 +272,7 @@ pub var stats: Stats = .{};
 
 /// `{"journal_lanes_spawned":n,…}`
 pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
-    try w.print("{{\"journal_lanes_spawned\":{d},\"journal_lanes_live\":{d},\"journal_ring_lane_writes\":{d},\"journal_lane_structural_writes\":{d},\"journal_lane_write_bytes\":{d},\"journal_lane_write_failures\":{d},\"journal_lane_rollbacks\":{d},\"journal_lane_barriers_strict\":{d},\"journal_lane_barriers_coalesced\":{d},\"journal_lane_barrier_failures\":{d},\"journal_lane_wake_writes\":{d},\"journal_lane_wake_elided\":{d},\"journal_lane_parks\":{d},\"journal_lane_park_tick_rescues\":{d},\"journal_lane_park_backstop_ticks\":{d},\"journal_lane_prefix_waits\":{d},\"journal_lane_wait_fiber_parks\":{d},\"journal_lane_wait_raw_parks\":{d},\"journal_lane_queue_full\":{d},\"journal_lane_volumes_failed\":{d},\"journal_lane_rings_dead\":{d},\"journal_lane_cqe_orphan\":{d},\"journal_lane_ack_out_of_order\":{d}}}", .{
+    try w.print("{{\"journal_lanes_spawned\":{d},\"journal_lanes_live\":{d},\"journal_ring_lane_writes\":{d},\"journal_lane_structural_writes\":{d},\"journal_lane_write_bytes\":{d},\"journal_lane_write_failures\":{d},\"journal_lane_rollbacks\":{d},\"journal_lane_barriers_strict\":{d},\"journal_lane_barriers_coalesced\":{d},\"journal_lane_barrier_failures\":{d},\"journal_lane_wake_writes\":{d},\"journal_lane_wake_elided\":{d},\"journal_lane_parks\":{d},\"journal_lane_park_tick_rescues\":{d},\"journal_lane_park_backstop_ticks\":{d},\"journal_lane_prefix_waits\":{d},\"journal_lane_wait_fiber_parks\":{d},\"journal_lane_wait_raw_parks\":{d},\"journal_lane_fsync_waiters_hwm\":{d},\"journal_lane_queue_full\":{d},\"journal_lane_volumes_failed\":{d},\"journal_lane_rings_dead\":{d},\"journal_lane_cqe_orphan\":{d},\"journal_lane_ack_out_of_order\":{d}}}", .{
         stats.lanes_spawned.load(),
         stats.lanes_live.load(),
         stats.lane_writes.load(),
@@ -286,6 +291,7 @@ pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
         stats.prefix_waits.load(),
         stats.wait_fiber_parks.load(),
         stats.wait_raw_parks.load(),
+        stats.fsync_waiters_hwm.load(),
         stats.queue_full.load(),
         stats.volumes_failed.load(),
         stats.rings_dead.load(),
@@ -1604,6 +1610,7 @@ pub const JournalLane = struct {
             w.fsync_count += 1;
             it = next orelse break;
         }
+        stats.fsync_waiters_hwm.raise(w.fsync_count);
         w.needs_flush = true;
         w.flush_due_ns = 0;
     }
@@ -2318,6 +2325,7 @@ test "THE FSYNC STORM: every request cell's worth of fsyncs and 64 more, each fr
         }
     };
     var issued: std.atomic.Value(usize) = .init(0);
+    stats.fsync_waiters_hwm.set(0);
     const fsyncs = try testing.allocator.alloc(Fsync, n_fsyncs);
     defer testing.allocator.free(fsyncs);
     const threads = try testing.allocator.alloc(std.Thread, n_fsyncs);
@@ -2346,6 +2354,14 @@ test "THE FSYNC STORM: every request cell's worth of fsyncs and 64 more, each fr
             return s.issued.load(.acquire) == s.n;
         }
     }{ .n = n_fsyncs, .issued = &issued });
+    // The lane holds every one at once: none can be answered before the
+    // window lands.
+    spinUntil(struct {
+        n: usize,
+        fn ready(s: @This()) bool {
+            return stats.fsync_waiters_hwm.load() >= s.n;
+        }
+    }{ .n = n_fsyncs });
     // Windows beside them: the share minus the one already held, every one
     // admitted.
     for (1..lane.windowCellCount()) |i| try windows.append(testing.allocator, (try h.append(1 + i, 400, 0xB0)).ticket);
@@ -3060,7 +3076,7 @@ test "the stats JSON names every lane counter" {
     var w: std.Io.Writer = .fixed(&buf);
     try writeStatsJson(&w);
     const s = w.buffered();
-    for ([_][]const u8{ "\"journal_lanes_spawned\":", "\"journal_lanes_live\":", "\"journal_ring_lane_writes\":", "\"journal_lane_structural_writes\":", "\"journal_lane_write_failures\":", "\"journal_lane_rollbacks\":", "\"journal_lane_barriers_strict\":", "\"journal_lane_barriers_coalesced\":", "\"journal_lane_barrier_failures\":", "\"journal_lane_wake_writes\":", "\"journal_lane_wake_elided\":", "\"journal_lane_parks\":", "\"journal_lane_park_tick_rescues\":", "\"journal_lane_park_backstop_ticks\":", "\"journal_lane_prefix_waits\":", "\"journal_lane_wait_fiber_parks\":", "\"journal_lane_wait_raw_parks\":", "\"journal_lane_queue_full\":", "\"journal_lane_volumes_failed\":", "\"journal_lane_rings_dead\":", "\"journal_lane_cqe_orphan\":", "\"journal_lane_ack_out_of_order\":" }) |needle| {
+    for ([_][]const u8{ "\"journal_lanes_spawned\":", "\"journal_lanes_live\":", "\"journal_ring_lane_writes\":", "\"journal_lane_structural_writes\":", "\"journal_lane_write_failures\":", "\"journal_lane_rollbacks\":", "\"journal_lane_barriers_strict\":", "\"journal_lane_barriers_coalesced\":", "\"journal_lane_barrier_failures\":", "\"journal_lane_wake_writes\":", "\"journal_lane_wake_elided\":", "\"journal_lane_parks\":", "\"journal_lane_park_tick_rescues\":", "\"journal_lane_park_backstop_ticks\":", "\"journal_lane_prefix_waits\":", "\"journal_lane_wait_fiber_parks\":", "\"journal_lane_wait_raw_parks\":", "\"journal_lane_fsync_waiters_hwm\":", "\"journal_lane_queue_full\":", "\"journal_lane_volumes_failed\":", "\"journal_lane_rings_dead\":", "\"journal_lane_cqe_orphan\":", "\"journal_lane_ack_out_of_order\":" }) |needle| {
         try testing.expect(std.mem.indexOf(u8, s, needle) != null);
     }
 }

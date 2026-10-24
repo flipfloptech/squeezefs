@@ -957,6 +957,12 @@ pub const PendingTimes = struct {
     const Stripe = struct {
         lock: jc.SpinLock = .{},
         map: std.AutoHashMapUnmanaged(u64, Times) = .empty,
+        /// The record-less parkers' filter (`parkAtimeIfAbsent`): a bit
+        /// per ino hash set when a stamp parks, the word cleared at every
+        /// drain snapshot — a hot file's reads cost one relaxed load of a
+        /// read-mostly word, never the lock (a set bit says "a stamp
+        /// stands or did this tick": the candidate waits a tick at most).
+        atime_hint: std.atomic.Value(u64) = .init(0),
     };
 
     pub fn init(gpa: Allocator) Allocator.Error!PendingTimes {
@@ -975,6 +981,11 @@ pub const PendingTimes = struct {
     fn stripeOf(self: *PendingTimes, ino: u64) *Stripe {
         // Fibonacci hashing: consecutive mints spread over the stripes.
         return &self.stripes[@intCast((ino *% 0x9E3779B97F4A7C15) >> 60)];
+    }
+
+    /// The hint bit of `ino` within its stripe (the next 6 hash bits).
+    fn hintBit(ino: u64) u64 {
+        return @as(u64, 1) << @intCast(((ino *% 0x9E3779B97F4A7C15) >> 54) & 63);
     }
 
     /// Live refinements (the `meta_kv_times_echo_pending` gauge's input and
@@ -1066,8 +1077,11 @@ pub const PendingTimes = struct {
     /// again). Null = a stamp stands or the stripe was busy; nothing done.
     pub fn parkAtimeIfAbsent(self: *PendingTimes, ino: u64, now: u64, rule: AtimeRule) Allocator.Error!?Park {
         const s = self.stripeOf(ino);
+        const bit = hintBit(ino);
+        if (s.atime_hint.load(.monotonic) & bit != 0) return null;
         if (!s.lock.tryLock()) return null;
         defer s.lock.unlock();
+        _ = s.atime_hint.fetchOr(bit, .monotonic);
         const gop = try s.map.getOrPut(self.gpa, ino);
         if (gop.found_existing) {
             if (gop.value_ptr.atime != 0) return null;
@@ -1191,6 +1205,9 @@ pub const PendingTimes = struct {
         for (&self.stripes) |*s| {
             s.lock.lock();
             defer s.lock.unlock();
+            // The tick's filter opens for the stamps this drain retires (a
+            // park during the drain sets its bit again).
+            s.atime_hint.store(0, .monotonic);
             var it = s.map.keyIterator();
             while (it.next()) |k| try out.append(gpa, k.*);
         }

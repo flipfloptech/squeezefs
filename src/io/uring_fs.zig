@@ -1209,8 +1209,15 @@ pub const Pool = struct {
         if (span.widened) stats.read_widened.inc();
         var buf = try AlignedBuf.zeroed(self.gpa, @intCast(span.len), mode.memAlign());
         if (size == 0) return .{ .buf = buf, .lo = 0, .hi = 0 };
-        errdefer buf.deinit();
-        const idx = try self.send(.{ .read_at = .{ .path = path, .start = span.start, .skip = span.skip, .want = size, .grain = mode.grain(), .direct = mode.isDirect(), .buf = buf } });
+        // The request owns `buf` from the send on: the arm that fails it
+        // (the open, the CQE, a dead ring, the queue's close) frees it there,
+        // so the caller frees it only for a refused send (a second free of a
+        // page-backed buffer unmaps whatever was mapped there meanwhile:
+        // xfstests generic/753).
+        const idx = self.send(.{ .read_at = .{ .path = path, .start = span.start, .skip = span.skip, .want = size, .grain = mode.grain(), .direct = mode.isDirect(), .buf = buf } }) catch |e| {
+            buf.deinit();
+            return e;
+        };
         return self.waitCell(idx).read;
     }
 
@@ -1967,6 +1974,54 @@ test "write_at_batch propagates an open failure as the batch's error" {
     const ops = [_]WriteOp{.{ .offset = 0, .data = "x" }};
     try testing.expectError(Error.FileNotFound, pool.writeAtBatch("/proc/definitely/not/here/file", &ops));
     try testing.expectError(Error.FileNotFound, pool.fdatasync("/proc/definitely/not/here/file"));
+}
+
+/// Counts the frees of the allocations of exactly `len` bytes (a test's
+/// read buffer) and forwards only the first: a second free of the block is
+/// the defect the test pins, never handed to `inner`.
+const FreeCensus = struct {
+    inner: Allocator,
+    len: usize,
+    frees: std.atomic.Value(u32) = .init(0),
+
+    const vtable: Allocator.VTable = .{ .alloc = alloc, .resize = resize, .remap = remap, .free = free };
+
+    fn allocator(self: *FreeCensus) Allocator {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *FreeCensus = @ptrCast(@alignCast(ctx));
+        return self.inner.rawAlloc(len, alignment, ret_addr);
+    }
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *FreeCensus = @ptrCast(@alignCast(ctx));
+        return self.inner.rawResize(memory, alignment, new_len, ret_addr);
+    }
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *FreeCensus = @ptrCast(@alignCast(ctx));
+        return self.inner.rawRemap(memory, alignment, new_len, ret_addr);
+    }
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *FreeCensus = @ptrCast(@alignCast(ctx));
+        // acq_rel: the reactor's free and the caller's are on two threads.
+        if (memory.len == self.len and self.frees.fetchAdd(1, .acq_rel) != 0) return;
+        self.inner.rawFree(memory, alignment, ret_addr);
+    }
+};
+
+test "a failed positional read frees its buffer ONCE — the request owns it from the send, and the arm that fails it frees it there: an open refusal, a CQE error (xfstests generic/753 under dm-error: the caller freed the 256 KiB node buffer a second time, the second munmap took a FUSE worker's live allocation mapped there meanwhile, SIGSEGV, the mount left with no daemon)" {
+    // 12,347 B: no other allocation of the pool has this length.
+    var census: FreeCensus = .{ .inner = testing.allocator, .len = 12_347 };
+    const pool = try Pool.init(census.allocator(), Config.fixed(1, 1024));
+    defer pool.deinit();
+    // The open refusal: the reactor's `cachedOpen` fails before any SQE.
+    try testing.expectError(Error.FileNotFound, pool.readAt("/proc/definitely/not/here/file", 0, census.len));
+    try testing.expectEqual(@as(u32, 1), census.frees.load(.acquire));
+    // The CQE error: the open succeeds, the read answers EIO (address 0 of
+    // this process is never mapped: `vm.mmap_min_addr` ≥ one page).
+    census.frees.store(0, .release);
+    try testing.expectError(Error.InputOutput, pool.readAt("/proc/self/mem", 0, census.len));
+    try testing.expectEqual(@as(u32, 1), census.frees.load(.acquire));
 }
 
 test "ONE batch of 600 x 4 KiB sectors (more entries than the 512-deep SQ) completes; the SQ flushes and retries" {

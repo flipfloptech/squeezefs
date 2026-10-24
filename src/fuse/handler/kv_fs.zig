@@ -4019,10 +4019,16 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             self.holdAfter(&after);
             t_owned = false;
             self.commit(c, t) catch |e| {
-                // A whole image that will never be named leaves; an in-place
-                // append stays (the longer image is the file's, its tail
-                // past the durable size invisible).
-                if (!in_place) self.data.releaseStaged(k, generation);
+                // A whole image under a FRESH identity will never be named:
+                // it leaves. Under the file's own identity the re-stage
+                // REPLACED the record the committed layout names (the ring
+                // retired the old copy), so it stays — the old bytes with
+                // this unacked write overlaid, never the ring empty under a
+                // staged layout (the read's lost arm: zeros; generic/475 on
+                // a FAILED volume). An in-place append stays too (the longer
+                // image is the file's, its tail past the durable size
+                // invisible).
+                if (!in_place and !keep_identity) self.data.releaseStaged(k, generation);
                 return e;
             };
             self.dropLayoutLock(layout_lock);

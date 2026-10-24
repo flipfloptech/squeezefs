@@ -538,6 +538,10 @@ pub const WritePath = struct {
     /// answers every write it holds at its first refused flush, one loud
     /// line per episode; the gate's next capacity closes it.
     stall_answered: std.atomic.Value(bool) = .init(false),
+    /// The full-store wall answered ENOSPC and no capacity has come back
+    /// since: one loud line per episode, every refusal counted
+    /// (`parked_gate_wall_refusals`); the gate's next capacity closes it.
+    full_wall_said: std.atomic.Value(bool) = .init(false),
 
     pub const RingClaim = struct {
         ctx: *anyopaque,
@@ -1464,7 +1468,8 @@ pub const WritePath = struct {
                             if (enospc.freshSupplyExhausted(cands)) {
                                 room.cancel(io);
                                 stats.parked_gate_wall_refusals.inc();
-                                log.err("write ino {d} block {d}: the parked-buffer gate's cold flushes have been refused for {d} ms (wall {d} ms; {d} parked, {d} B) and every data volume's fresh supply is latched exhausted — answering ENOSPC", .{ req.ino, block, (now - gate.failed_since_ns) / std.time.ns_per_ms, PARKED_GATE_WALL_NS / std.time.ns_per_ms, self.table.parkedCount(), accumulate.stats.parked_full_buffer_bytes.load() });
+                                // Acq_rel: pairs with `gateFoundCapacity`'s release (one line per episode).
+                                if (!self.full_wall_said.swap(true, .acq_rel)) log.err("write ino {d} block {d}: the parked-buffer gate's cold flushes have been refused for {d} ms (wall {d} ms; {d} parked, {d} B) and every data volume's fresh supply is latched exhausted — answering ENOSPC; every write the wall refuses until capacity returns answers the same, counted (`parked_gate_wall_refusals`), one line per episode", .{ req.ino, block, (now - gate.failed_since_ns) / std.time.ns_per_ms, PARKED_GATE_WALL_NS / std.time.ns_per_ms, self.table.parkedCount(), accumulate.stats.parked_full_buffer_bytes.load() });
                                 return error.NoSpaceLeft;
                             }
                             stats.parked_gate_wall_supply_visible.inc();
@@ -1496,6 +1501,8 @@ pub const WritePath = struct {
         if (self.gate_stall_warned.load(.monotonic)) self.gate_stall_warned.store(false, .release);
         // Release: pairs with the answer's `swap` (one line per episode).
         if (self.stall_answered.load(.monotonic)) self.stall_answered.store(false, .release);
+        // Release: pairs with the full wall's `swap` (one line per episode).
+        if (self.full_wall_said.load(.monotonic)) self.full_wall_said.store(false, .release);
     }
 
     /// The stall answer (`awaitParkedCapacity`): ENOSPC iff a flush since

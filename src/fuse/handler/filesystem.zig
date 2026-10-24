@@ -345,12 +345,21 @@ pub const VTable = struct {
     /// park or a lock a pass holds; any error sends the FLUSH to the data
     /// lane, which drains.
     probe_flush: Op(FlushArgs, void) = &defaults.enosys(FlushArgs, void),
+    /// Not an opcode: a READ of `ino` served by a path that never reaches
+    /// `read` (the interception host's ring fast path, charter §7) tells
+    /// the filesystem so the mount's atime posture applies to it too
+    /// (charter §4 "Access time": the law is the file's, not the path's).
+    /// Never blocks, never fails; the default notes nothing.
+    note_read: *const fn (*anyopaque, *Ctx, NoteReadArgs) void = &defaults.note_read,
 };
+
+pub const NoteReadArgs = struct { ino: u64 };
 
 const defaults = struct {
     fn init(_: *anyopaque, _: *Ctx, _: InitArgs) Error!void {}
     fn destroy(_: *anyopaque, _: *Ctx, _: DestroyArgs) void {}
     fn forget(_: *anyopaque, _: *Ctx, _: ForgetArgs) void {}
+    fn note_read(_: *anyopaque, _: *Ctx, _: NoteReadArgs) void {}
     fn enosys(comptime Args: type, comptime Reply: type) fn (*anyopaque, *Ctx, Args) Error!Reply {
         return struct {
             fn f(_: *anyopaque, _: *Ctx, _: Args) Error!Reply {

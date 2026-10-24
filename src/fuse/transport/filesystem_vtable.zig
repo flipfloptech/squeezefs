@@ -263,6 +263,12 @@ pub const Filesystem = struct {
         /// request then takes the lane). Null = every metadata request
         /// takes the lane.
         probe_meta: ?*const fn (ctx: *anyopaque, req: Request, out: *codec.OutBuf) ?codec.Reply = null,
+        /// A READ arm (a) served, or a direct device leg armed — ON THE
+        /// WORKER THREAD, after the bytes' path is decided without the
+        /// handler: the filesystem notes the read for the mount's atime
+        /// posture (charter §4 "Access time": the law is the file's, not
+        /// the path's). Non-blocking; null = nothing to note.
+        note_read: ?*const fn (ctx: *anyopaque, req: Request) void = null,
     };
 
     pub fn init(self: Filesystem, caps: InitCaps) void {
@@ -289,6 +295,10 @@ pub const Filesystem = struct {
     }
     pub fn directLeg(self: Filesystem, req: Request) ?DirectLeg {
         return self.vtable.direct_leg(self.ctx, req);
+    }
+    pub fn noteRead(self: Filesystem, req: Request) void {
+        const f = self.vtable.note_read orelse return;
+        f(self.ctx, req);
     }
 };
 

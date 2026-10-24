@@ -111,6 +111,7 @@ pub const ring = struct {
             .write_hold_eligible = fsWriteHoldEligible,
             .direct_leg = fsDirectLeg,
             .probe_meta = fsProbeMeta,
+            .note_read = fsNoteRead,
         };
 
         /// The metadata reads' arm (a) (decision 0003 §AB.1): the
@@ -179,6 +180,16 @@ pub const ring = struct {
             var routed = hint;
             routed.ino = keyIno(hint.ino) orelse return false;
             return arms.plane.writeHoldEligible(routed);
+        }
+
+        /// A READ the warm ladder served or the direct leg carried (no
+        /// handler ran): the mount's atime posture still judges it, on this
+        /// thread, without a record read (`KvFs.note_read`).
+        fn fsNoteRead(ctx: *anyopaque, req: fsv.Request) void {
+            const b = of(ctx);
+            var quiet: op_trace.OpTrace = .{ .unique = 0, .class = .other, .profiling = false, .t_entry = 0 };
+            var c: Ctx = .{ .unique = req.header.unique, .uid = req.header.uid, .gid = req.header.gid, .pid = req.header.pid, .io = b.d.io, .trace = &quiet, .wd_slot = null, .window = &.{}, .kernel = true };
+            b.d.fs.vtable.note_read(b.d.fs.impl, &c, .{ .ino = req.nodeid() });
         }
 
         /// The direct device leg with its post-DMA recheck hook.

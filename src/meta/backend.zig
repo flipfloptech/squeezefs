@@ -96,6 +96,8 @@ const sync = @import("../sync/sync.zig");
 const exec = @import("../exec/exec.zig");
 const key = @import("key.zig");
 const record = @import("record.zig");
+const ino_witness = @import("ino_witness.zig");
+const lease_epoch = @import("../data/lease_epoch.zig");
 const node = @import("node.zig");
 const builder = @import("builder.zig");
 const node_cache = @import("node_cache.zig");
@@ -3581,6 +3583,46 @@ test "format (device path) → open → N creates (singles + a group of 8) → l
         try testing.expect(be.mounted.root(.native_slot) != null);
         try testing.expectEqualSlices(u8, &test_set.set_uuid, &be.mounted.membership_stamp.set_uuid);
     }
+}
+
+test "an access stamp alone (a Δatime: the atime posture's drain, charter §4 'Access time') lands without moving the ino's witness or its layout lease epoch — the read view and a direct client's lease name no byte it changes; a Δtimes (mtime) of the same ino moves both, as every other record of the ino does" {
+    const gpa = testing.allocator;
+    const v = try TestVol.create(gpa, "atime-delta", null);
+    defer v.destroy();
+    const be = try v.open();
+    defer be.close();
+    const ino = try commitCreate(be, "f");
+    const gen0 = ino_witness.genOf(ino);
+    const lease0 = lease_epoch.load(ino);
+    // The drain's Δatime: fold-applied, the record carries it, nothing else moved.
+    {
+        const t = try be.begin(@src());
+        try t.stageDelta(key.TREE_INODES, &key.inodeKey(ino), .{ .mask = record.DELTA_ATIME, .fields = .{ .atime = 777 } });
+        try be.commit(t);
+    }
+    const got = (try be.lookup(gpa, key.TREE_INODES, &key.inodeKey(ino))) orelse return error.TestExpectedLive;
+    defer gpa.free(got);
+    try testing.expectEqual(@as(u64, 777), (try record.InodeValue.decode(got)).atime);
+    try testing.expectEqual(gen0, ino_witness.genOf(ino));
+    try testing.expectEqual(lease0, lease_epoch.load(ino));
+    // A write's stamp (mtime, ctime) is a change every cache judges by: both move.
+    {
+        const t = try be.begin(@src());
+        try t.stageDelta(key.TREE_INODES, &key.inodeKey(ino), record.InodeDelta.times(800, 800));
+        try be.commit(t);
+    }
+    try testing.expect(ino_witness.genOf(ino) != gen0);
+    try testing.expect(lease_epoch.load(ino) != lease0);
+    // A Δ carrying atime BESIDE a size moves them too (the drain's merged shape).
+    const gen1 = ino_witness.genOf(ino);
+    const lease1 = lease_epoch.load(ino);
+    {
+        const t = try be.begin(@src());
+        try t.stageDelta(key.TREE_INODES, &key.inodeKey(ino), .{ .mask = record.DELTA_ATIME | record.DELTA_SIZE, .fields = .{ .atime = 900, .size = 4096 } });
+        try be.commit(t);
+    }
+    try testing.expect(ino_witness.genOf(ino) != gen1);
+    try testing.expect(lease_epoch.load(ino) != lease1);
 }
 
 test "the single-writer guard: a second open of a held volume refuses Busy loud; a closed volume opens again" {

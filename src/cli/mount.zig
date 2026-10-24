@@ -110,6 +110,8 @@ const handler = @import("../fuse/handler.zig");
 const transport = @import("../fuse/transport.zig");
 const fuse_geometry = @import("../fuse/geometry.zig");
 const mount_options = @import("../fuse/mount_options.zig");
+const atime = @import("../fuse/atime.zig");
+const mountinfo = @import("../core/mountinfo.zig");
 const mem_budget = @import("../mem/budget.zig");
 const cache_core = @import("../mem/cache.zig");
 const key = @import("../meta/key.zig");
@@ -892,6 +894,31 @@ fn mountMain(ctx: *Ctx) u8 {
     if (writeback == .timer) {
         log.info("write-back timer: custody lands once {d} ms old, a pass every {d} ms — T_wb = {d} ms + the pass's drain; close is no durability point", .{ wb_timer.age_ns / std.time.ns_per_ms, wb_period_ns / std.time.ns_per_ms, open_table.writeback_bound_ns.load() / std.time.ns_per_ms });
     } else log.info("write-back: the close posture — custody drains at the close the kernel reports", .{});
+    // The atime posture (charter §4 "Access time"): the kernel mount's
+    // flags, read now and at every mount-table change.
+    const atime_buf = gpa.alloc(u8, mountinfo.READ_BYTES) catch return ctx.failed("out of memory (the mount table's buffer)", .{});
+    defer gpa.free(atime_buf);
+    var atime_watch: AtimeWatch = .{ .fs = &fs, .io = io, .mount_id = session.mount_id, .mountpoint = ctx.mountpoint, .knob = knobs.enumKnob("SQUEEZEFS_ATIME", env), .buf = atime_buf };
+    atime_watch.refresh();
+    var atime_fut = ctx.sqz.spawnMeta(AtimeWatch.run, .{&atime_watch}) catch {
+        wd.requestStop();
+        wd_fut.cancel(io);
+        reclaim.requestStop();
+        reclaim_fut.cancel(io);
+        if (membership_fut) |*f| {
+            membership.?.requestStop();
+            f.cancel(io);
+        }
+        if (times_drain_fut) |*f| {
+            times_drain.requestStop();
+            f.cancel(io);
+        }
+        if (wb_timer_fut) |*f| {
+            wb_timer.requestStop();
+            f.await(io);
+        }
+        return ctx.failed("cannot spawn the atime watch", .{});
+    };
 
     // 6. Ready. The heartbeat's first stamp lands HERE, before the
     //    supervisor's first probe can read it (the watchdog's first tick is
@@ -942,6 +969,8 @@ fn mountMain(ctx: *Ctx) u8 {
         times_drain.requestStop();
         f.cancel(io);
     }
+    atime_watch.requestStop();
+    atime_fut.cancel(io);
     // The write-back timer finishes its pass (never cancelled mid-drain);
     // the dismount pass below lands whatever it leaves.
     if (wb_timer_fut) |*f| {
@@ -1554,6 +1583,63 @@ const WritebackTimer = struct {
             if (self.stop.load(.acquire)) return;
             self.opens.timerPass(clock.monotonicNs(), self.age_ns, .{ .ctx = self, .call = &drain });
             self.fs.afterTimerPass();
+        }
+    }
+};
+
+/// THE ATIME WATCH (charter §4 "Access time"; `fuse/atime.zig`): the
+/// mount's atime law is the KERNEL MOUNT's flags, read from the daemon's
+/// own entry in `/proc/self/mountinfo` (by the mount id `mount(2)` gave,
+/// else the path) once before ready and again at every change of the
+/// mount table — a `POLL_ADD(POLLPRI)` on an open fd of mountinfo
+/// (`exec/fdwatch.exceptional`) parks this fiber until the kernel's
+/// `touch_mnt_namespace` wakes it, which `-o remount,strictatime`
+/// (`do_reconfigure_mnt` → `set_mount_attributes`) does; the kernel sends
+/// a FUSE daemon nothing else on a flag remount. Nothing per op, nothing
+/// per tick: one table read per mount-table change on the host.
+/// `SQUEEZEFS_ATIME` overrides the posture word. An entry that is gone
+/// (the unmount in flight) leaves the standing law alone.
+const AtimeWatch = struct {
+    fs: *BackendFs,
+    io: Io,
+    mount_id: ?u64,
+    mountpoint: []const u8,
+    /// The knob's word (`auto` = the mount's).
+    knob: []const u8,
+    buf: []u8,
+    stop: std.atomic.Value(bool) = .init(false),
+    /// The law was said once (the mount's line; a change says it again).
+    said: bool = false,
+
+    fn requestStop(self: *AtimeWatch) void {
+        self.stop.store(true, .release);
+    }
+
+    /// Read the law once (the mount's bring-up calls it before ready).
+    fn refresh(self: *AtimeWatch) void {
+        const text = mountinfo.read(self.io, self.buf);
+        const e = (if (self.mount_id) |id| mountinfo.entryOf(text, id) else null) orelse mountinfo.entryAt(text, self.mountpoint) orelse return;
+        const law = atime.override(atime.lawOf(e.options, e.super_options), self.knob);
+        const changed = self.fs.atime_law.set(law);
+        if (changed or !self.said) log.info("atime: {s}{s}{s} ({s})", .{ law.posture.name(), if (law.nodiratime) ",nodiratime" else "", if (law.read_only) ",ro" else "", if (std.mem.eql(u8, self.knob, "auto")) "the kernel mount's flags" else "SQUEEZEFS_ATIME over the kernel mount's flags" });
+        self.said = true;
+    }
+
+    fn run(self: *AtimeWatch) void {
+        const fd_rc = linux.open(mountinfo.path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+        if (linux.errno(fd_rc) != .SUCCESS) {
+            log.warn("atime: {s} cannot be opened ({t}); the posture stays as read at mount — a flag remount is not seen", .{ mountinfo.path, linux.errno(fd_rc) });
+            return;
+        }
+        const fd: linux.fd_t = @intCast(fd_rc);
+        defer _ = linux.close(fd);
+        while (!self.stop.load(.acquire)) {
+            _ = exec.fdwatch.exceptional(fd) catch |e| {
+                if (e != error.Canceled) log.warn("atime: the mount-table watch ended ({t}); the posture stays as it stands — a flag remount is not seen", .{e});
+                return;
+            };
+            if (self.stop.load(.acquire)) return;
+            self.refresh();
         }
     }
 };

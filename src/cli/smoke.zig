@@ -6067,6 +6067,195 @@ test "smoke: RENAME_EXCHANGE AND THE PARENTS' NLINK (fstests generic/025: the ma
     std.debug.print("\nsmoke: rename exchange — the 50-cell matrix judged at every step, keep/p1..p7 at {s}", .{exchange_keep_nlinks});
 }
 
+/// The atime row's shell: POSIX sh, `stat -c %.9X` (nanoseconds), every
+/// judgement a named line; `access_delay` is generic/003's (1 s; the
+/// stamps are nanoseconds, the sleeps keep the row honest about a
+/// coarse clock). `$1` = the mountpoint (for the kernel's flag remounts:
+/// the classic `mount(2)` — libmount's new-API `fsconfig` reconfigure of
+/// a FUSE superblock is refused by `fuse_parse_param`, as xfstests'
+/// `LIBMOUNT_FORCE_MOUNT2=always` knows).
+const atime_sh_lib =
+    \\mp=$1
+    \\export LIBMOUNT_FORCE_MOUNT2=always
+    \\at() { stat -c %.9X "$1"; }
+    \\mt() { stat -c %.9Y "$1"; }
+    \\ct() { stat -c %.9Z "$1"; }
+    \\same() { [ "$1" = "$2" ] || { echo "FAIL $3: $1 != $2"; exit 1; }; }
+    \\moved() { [ "$1" != "$2" ] || { echo "FAIL $3: $1 == $2"; exit 1; }; }
+    \\later() { awk -v a="$1" -v b="$2" 'BEGIN { exit !(b > a) }' || { echo "FAIL $3: $2 is not later than $1"; exit 1; }; }
+    \\# read FILE and judge: Y the atime moved past the sample, N it did not; mtime and ctime never move on a read.
+    \\# `cat` is generic/003's read; `direct` reads O_DIRECT — a read the kernel serves from its page cache
+    \\# never reaches a FUSE daemon (the kernel's own in-core stamp is overwritten by the next GETATTR).
+    \\readj() { f=$1; want=$2; tag=$3; how=${4:-cat}; a0=$(at "$f"); m0=$(mt "$f"); c0=$(ct "$f"); sleep 1.1; if [ "$how" = direct ]; then dd if="$f" of=/dev/null iflag=direct bs=4k count=1 status=none; else cat "$f" > /dev/null; fi; a1=$(at "$f"); if [ "$want" = Y ]; then later "$a0" "$a1" "$tag atime"; else same "$a0" "$a1" "$tag atime"; fi; same "$m0" "$(mt "$f")" "$tag mtime"; same "$c0" "$(ct "$f")" "$tag ctime"; }
+    \\listj() { d=$1; want=$2; tag=$3; a0=$(at "$d"); m0=$(mt "$d"); sleep 1.1; ls "$d" > /dev/null; a1=$(at "$d"); if [ "$want" = Y ]; then later "$a0" "$a1" "$tag atime"; else same "$a0" "$a1" "$tag atime"; fi; same "$m0" "$(mt "$d")" "$tag mtime"; }
+    \\posture() { awk -v mp="$mp" '$5 == mp { o = $6 } END { print o }' /proc/self/mountinfo; }
+    \\
+;
+
+/// Phase 1 (the mount is the kernel's default, relatime): generic/003's
+/// first arm — the first read after the write moves atime alone, the
+/// second does not, a directory's first listing does, its second does
+/// not, a symlink's readlink does.
+const atime_sh_relatime = atime_sh_lib ++
+    \\mkdir dir1; echo aaa > dir1/file1; ln -s file1 dir1/link1
+    \\readj dir1/file1 Y "relatime first read"
+    \\readj dir1/file1 N "relatime second read"
+    \\listj dir1 Y "relatime first listing"
+    \\listj dir1 N "relatime second listing"
+    \\l0=$(at dir1/link1); sleep 1.1; readlink dir1/link1 > /dev/null; later "$l0" "$(at dir1/link1)" "relatime readlink"
+    \\echo "relatime ok $(posture)"
+    \\
+;
+
+/// Phase 2: `-o remount,relatime,nodiratime` (the kernel's flag remount;
+/// the daemon learns it from the mount table) — a directory a file was
+/// just made in stays put under its listing, the file's read moves.
+/// (mount(8) merges the standing flags into a remount, so every remount
+/// below names its whole atime set.)
+const atime_sh_nodiratime = atime_sh_lib ++
+    \\mount -i -o remount,relatime,nodiratime "$mp"
+    \\case ",$(posture)," in *,nodiratime,*) ;; *) echo "FAIL posture: $(posture)"; exit 1 ;; esac
+    \\mkdir dir2; echo bbb > dir2/file2
+    \\listj dir2 N "nodiratime listing"
+    \\readj dir2/file2 Y "nodiratime file read"
+    \\echo "nodiratime ok $(posture)"
+    \\
+;
+
+/// Phase 3: `-o remount,strictatime` — two reads of a file read already
+/// (relatime would move neither) both move; `-o remount,noatime` — a new
+/// file's first read does not, a write still moves mtime and ctime;
+/// `-o remount,ro,strictatime` — nothing moves; back to `rw,relatime`
+/// — the written file's first read moves again.
+const atime_sh_strict_noatime_ro = atime_sh_lib ++
+    \\mount -i -o remount,strictatime,diratime "$mp"
+    \\case ",$(posture)," in *,relatime,*|*,noatime,*|*,nodiratime,*) echo "FAIL posture: $(posture)"; exit 1 ;; esac
+    \\readj dir1/file1 Y "strictatime first read"
+    \\readj dir1/file1 Y "strictatime second read" direct
+    \\readj dir1/file1 Y "strictatime third read" direct
+    \\mount -i -o remount,noatime,diratime "$mp"
+    \\case ",$(posture)," in *,noatime,*) ;; *) echo "FAIL posture: $(posture)"; exit 1 ;; esac
+    \\echo ccc > dir2/file3
+    \\readj dir2/file3 N "noatime first read"
+    \\a0=$(at dir1/file1); m0=$(mt dir1/file1); c0=$(ct dir1/file1); sleep 1.1; echo xyz > dir1/file1
+    \\same "$a0" "$(at dir1/file1)" "noatime write atime"; later "$m0" "$(mt dir1/file1)" "noatime write mtime"; later "$c0" "$(ct dir1/file1)" "noatime write ctime"
+    \\mount -i -o remount,ro,strictatime,diratime "$mp"
+    \\readj dir2/file3 N "ro,strictatime read"
+    \\listj dir2 N "ro,strictatime listing"
+    \\mount -i -o remount,rw,relatime,diratime "$mp"
+    \\case ",$(posture)," in *,relatime,*) ;; *) echo "FAIL posture: $(posture)"; exit 1 ;; esac
+    \\readj dir1/file1 Y "relatime after the write"
+    \\readj dir1/file1 N "relatime after the write, second"
+    \\stat -c '%n %.9X %.9Y %.9Z' dir1 dir1/file1 dir1/link1 dir2 dir2/file2 dir2/file3 > "$2/atime-before"
+    \\echo "strict/noatime/ro ok"
+    \\
+;
+
+/// Phase 4 (a fresh mount of the same set): every stamp as the previous
+/// mount showed it — the parked stamps were journaled by the drain and the
+/// dismount (charter §5.2: acked in RAM, durable at the next commit).
+const atime_sh_remounted = atime_sh_lib ++
+    \\stat -c '%n %.9X %.9Y %.9Z' dir1 dir1/file1 dir1/link1 dir2 dir2/file2 dir2/file3 > "$2/atime-after"
+    \\cmp "$2/atime-before" "$2/atime-after" || { echo "FAIL remount: the stamps moved"; diff "$2/atime-before" "$2/atime-after"; exit 1; }
+    \\echo "remount ok"
+    \\
+;
+
+/// Phase 5: `SQUEEZEFS_ATIME=noatime` over a relatime kernel mount — a
+/// written file's first read moves nothing; `=strictatime` — two reads both
+/// move (nodiratime stays the mount's: the listing does not).
+const atime_sh_knob_noatime = atime_sh_lib ++
+    \\case ",$(posture)," in *,relatime,*) ;; *) echo "FAIL posture: $(posture)"; exit 1 ;; esac
+    \\echo ddd > dir1/file4
+    \\readj dir1/file4 N "knob noatime read"
+    \\echo "knob noatime ok"
+    \\
+;
+const atime_sh_knob_strict = atime_sh_lib ++
+    \\mount -i -o remount,relatime,nodiratime "$mp"
+    \\readj dir1/file4 Y "knob strictatime first read"
+    \\readj dir1/file4 Y "knob strictatime second read" direct
+    \\listj dir1 N "knob strictatime under the mount's nodiratime"
+    \\echo "knob strictatime ok"
+    \\
+;
+
+test "smoke: ATIME — RELATIME, STRICTATIME, NOATIME ARE THE KERNEL MOUNT'S (fstests generic/003 and 192; charter §4 'Access time') — format → mount (the kernel's relatime): the first read after a write moves atime alone (mtime, ctime unmoved), the second does not, a directory's first listing does, a readlink does → `mount -o remount,nodiratime` (the daemon learns the flag from the mount table, nothing from the kernel): a fresh directory's listing stays, its file's read moves → `-o remount,strictatime`: two reads of a read file both move → `-o remount,noatime`: a new file's read moves nothing, a write still moves mtime/ctime → `-o remount,ro,strictatime`: nothing → `rw,relatime` again: the written file's read moves → umount, remount: every stamp as shown (durable at the cadence and the dismount) → SQUEEZEFS_ATIME=noatime over the kernel's relatime: a read moves nothing; =strictatime: two reads move, the mount's nodiratime stands → fsck --offline --scrub 0 findings, the must-stay-0 set clean" {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    try rig.formatSet(true);
+    try rig.spawnMount(&.{});
+    var mark = try rig.awaitReady(0);
+    const Phase = struct {
+        fn run(r: *Rig, script: []const u8, expect_tail: []const u8) !void {
+            const argv = [_][]const u8{ "sh", "-e", "-c", script, "atime", r.mp, r.work };
+            const out = try r.onMountArgv(script, &argv);
+            defer r.gpa.free(out);
+            if (!std.mem.endsWith(u8, out, expect_tail)) {
+                std.debug.print("\n--- atime phase output ---\n{s}\n", .{out});
+                return error.AtimePhaseFailed;
+            }
+        }
+    };
+    try Phase.run(rig, atime_sh_relatime, "relatime ok rw,relatime\n");
+    // The kernel's flag remount reaches the daemon through the mount table
+    // (its watcher's line names the new law) — before the phase judges it.
+    try Phase.run(rig, atime_sh_nodiratime, "nodiratime ok rw,nodiratime,relatime\n");
+    mark = try rig.awaitLog("atime: relatime,nodiratime (the kernel mount's flags)", mark, 5 * std.time.ns_per_s);
+    try Phase.run(rig, atime_sh_strict_noatime_ro, "strict/noatime/ro ok\n");
+    mark = try rig.awaitLog("atime: strictatime (the kernel mount's flags)", mark, 5 * std.time.ns_per_s);
+    mark = try rig.awaitLog("atime: noatime (the kernel mount's flags)", mark, 5 * std.time.ns_per_s);
+    mark = try rig.awaitLog("atime: strictatime,ro (the kernel mount's flags)", mark, 5 * std.time.ns_per_s);
+    mark = try rig.awaitLog("atime: relatime (the kernel mount's flags)", mark, 5 * std.time.ns_per_s);
+    {
+        const ta = try rig.stats();
+        defer gpa.free(ta);
+        // Every Y above is one touch: 1 + 1 (dir) + 1 (link) + 1 (file2) + 3 (strict) + 1 (after the write) = 8.
+        try testing.expectEqual(@as(?u64, 8), numberAfter(ta, "\"fuse_atime_touches\":"));
+        try testing.expectEqual(@as(?u64, 0), numberAfter(ta, "\"fuse_atime_touches_dropped\":"));
+        try expectMustStayZero(ta);
+    }
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+    // The remount: every stamp as it was shown (the drain and the dismount
+    // journaled the parked stamps).
+    mark = try rig.logLen();
+    try rig.spawnMount(&.{});
+    mark = try rig.awaitReady(mark);
+    try Phase.run(rig, atime_sh_remounted, "remount ok\n");
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+    // The knob over the kernel's relatime (its line precedes ready).
+    try rig.env.put("SQUEEZEFS_ATIME", "noatime");
+    mark = try rig.logLen();
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(mark);
+    _ = try rig.awaitLog("atime: noatime (SQUEEZEFS_ATIME over the kernel mount's flags)", mark, 5 * std.time.ns_per_s);
+    try Phase.run(rig, atime_sh_knob_noatime, "knob noatime ok\n");
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+    try rig.env.put("SQUEEZEFS_ATIME", "strictatime");
+    mark = try rig.logLen();
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(mark);
+    try Phase.run(rig, atime_sh_knob_strict, "knob strictatime ok\n");
+    _ = try rig.awaitLog("atime: strictatime,nodiratime (SQUEEZEFS_ATIME over the kernel mount's flags)", mark, 5 * std.time.ns_per_s);
+    _ = rig.env.swapRemove("SQUEEZEFS_ATIME");
+    {
+        const ta = try rig.stats();
+        defer gpa.free(ta);
+        try testing.expectEqual(@as(?u64, 2), numberAfter(ta, "\"fuse_atime_touches\":"));
+        try expectMustStayZero(ta);
+    }
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+    _ = try fsckClean(rig, "the atime row");
+    std.debug.print("\nsmoke: atime — relatime/nodiratime/strictatime/noatime/ro as the kernel mount's flags through four flag remounts, the stamps durable across a remount, the knob over the mount", .{});
+}
+
 test "smoke: THE `-o ro` READER OF A LIVE SET — C mounts `-o ro` beside A (the manager) and B (joined): no flock, no claim, no region; a member-reader + token client (TTLs 0, reader_staleness_bound_ms 0) reading B's 2,000 files and A's tree under tokens (0 local reads) → B writes ⇒ C's next read is fresh → A and B leave ⇒ C becomes the QUIESCENT reader of their last checkpoint → A mounts again ⇒ C fail-stops ESTALE at its next op (`.stats` still readable) → remount C ⇒ a token reader again — B's membership leave is LOST (`SQUEEZEFS_TEST_MEMBERSHIP_LEAVE_LOST`): its row outlives it, and A's successor must not expect a member whose pid is proven dead (decision 0003 §AG.5), or its grace refuses C's remount" {
     const io = testing.io;
     if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);

@@ -1022,6 +1022,11 @@ pub const CachedNode = struct {
             var s: WitnessSet = .{};
             for (records) |*r| {
                 const ino = ino_witness.inoOfViewedKey(r.key.slice()) orelse continue;
+                // An access stamp alone (the atime posture's Δ, charter §4
+                // "Access time") moves nothing a view carries: size, kind,
+                // layout, flags stand — a hot file read under strictatime
+                // would otherwise stale its view every drain tick.
+                if (r.kind == .delta and r.key.slice()[key.INO_MAJOR_KIND_OFF] == key.TREE_INODES and rec.inodeDeltaMask(r.value.slice()) == rec.DELTA_ATIME) continue;
                 if (s.n == s.inos.len) {
                     s.overflow = true;
                     break;

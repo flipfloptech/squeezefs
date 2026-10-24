@@ -94,6 +94,7 @@ const linux = std.os.linux;
 const assert = std.debug.assert;
 
 const abi = @import("../abi.zig");
+const atime = @import("../atime.zig");
 const codec = @import("../codec.zig");
 const mount_options = @import("../mount_options.zig");
 const filesystem = @import("filesystem.zig");
@@ -245,6 +246,25 @@ pub var fuse_write_staged_fast: counters.ShardedCounter = .{};
 /// for the rest of the mount — the first tick says so once, the rest count
 /// here (`cli/mount.TimesDrainCadence`).
 pub var fuse_write_times_drain_failed_ticks: counters.ShardedCounter = .{};
+/// `fuse_atime_touches`: read-class ops (READ, READDIR/READDIRPLUS,
+/// READLINK, the interception host's reads) whose access stamp the mount's
+/// atime posture said to move (charter §4 "Access time": the relatime rule
+/// as `fs/inode.c` `relatime_need_update`, strictatime always, noatime and
+/// nodiratime never): PARKED as the ino's pending refinement — fold-
+/// visible to the GETATTR the kernel's `fuse_invalidate_atime` makes the
+/// next `stat` ask, journaled by the times drain as a Δatime (never a
+/// ctime, never an entry per read). The rest of the reads cost one byte
+/// load and three compares over the record already in hand.
+pub var fuse_atime_touches: counters.ShardedCounter = .{};
+/// `fuse_atime_touches_shipped`: access stamps of FOREIGN-slot inodes the
+/// times drain shipped to their holder (`SETATTR_ATIME_TOUCH`, one per
+/// ino per tick at most; charter §5.5's record-level ship).
+pub var fuse_atime_touches_shipped: counters.ShardedCounter = .{};
+/// `fuse_atime_touches_dropped`: shipped access stamps the holder could
+/// not take (unreachable, moved, refused): dropped — an access stamp is
+/// lazy by law and never a failed read; the next read under the rule
+/// stamps again.
+pub var fuse_atime_touches_dropped: counters.ShardedCounter = .{};
 /// `fuse_write_size_claims_dropped`: striped writes whose size claim a
 /// size-setting commit (a truncate, an O_TRUNC open) that landed between
 /// the bytes' landing and the postlude made stale — the postlude parked the
@@ -554,6 +574,11 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         geo: layout.Geometry,
         blksize: u32,
         pending: economy.PendingTimes,
+        /// The mount's live atime law (charter §4 "Access time"): the
+        /// kernel mount's flags as the daemon's mountinfo watcher reads
+        /// them (`cli/mount.AtimeWatch`), the kernel's relatime until it
+        /// does; `SQUEEZEFS_ATIME` overrides the posture word.
+        atime_law: atime.Live = .init(atime.Law.kernel_default),
         /// `Options.times_park`.
         times_park: bool,
         /// `Options.write_postlude_hold` (`holdPostlude`).
@@ -1104,10 +1129,15 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         pub fn readInodeOpt(self: *Self, ino: u64) Error!?InodeValue {
             if (try self.tokenServe(ino, .{})) |served| {
                 // A foreign object: the holder's folded record (its pending
-                // times are the holder's business).
+                // times are the holder's business) under THIS mount's
+                // parked access stamp, if a read here left one the drain
+                // has not shipped yet (the only refinement a foreign ino
+                // ever parks).
                 defer served.release(self.io);
                 const e = served.entry orelse return null;
-                return e.attrs;
+                var v = e.attrs;
+                self.pending.fold(ino, &v);
+                return v;
             }
             const bytes = (self.store.lookup(self.gpa, key.TREE_INODES, &key.inodeKey(ino)) catch |e| return storeErr(e)) orelse return null;
             defer self.gpa.free(bytes);
@@ -1124,6 +1154,56 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             const v = try self.readInode(ino);
             if (!economy.isDirMode(v.mode)) return error.NotDir;
             return v;
+        }
+
+        /// THE ACCESS TIME (charter §4 "Access time"; `fuse/atime.zig`): a
+        /// read-class op judges the mount's live law over the record it
+        /// already holds — one byte load and three compares when nothing
+        /// is due, the relatime common case — and a due stamp PARKS `now`
+        /// as the ino's pending refinement: fold-visible to the GETATTR the
+        /// kernel's `fuse_invalidate_atime` makes the next `stat` ask,
+        /// journaled by the times drain as a Δatime (the §5.2 ack posture:
+        /// RAM at once, durable at the next cadence; never a barrier, never
+        /// an entry per read, never a ctime). A foreign-slot inode's stamp
+        /// parks the same way and the drain ships it to the holder. Strict
+        /// mode (no cadence) journals it at fsync, fsyncdir and the
+        /// dismount. The record in hand leaves carrying the stamp. Never
+        /// an error: an allocation refusal loses a lazy stamp, counted.
+        fn touchAtime(self: *Self, local: u64, v: *InodeValue) void {
+            const law = self.atime_law.current();
+            const stamp = now();
+            if (!atime.needsUpdate(law, economy.isDirMode(v.mode), .{ .atime = v.atime, .mtime = v.mtime, .ctime = v.ctime }, stamp)) return;
+            switch (self.pending.parkAtime(local, stamp) catch {
+                fuse_atime_touches_dropped.inc();
+                return;
+            }) {
+                .parked => {},
+                .parked_wake_drain => self.times_drain_wake.notifyOne(self.io),
+            }
+            v.atime = stamp;
+            fuse_atime_touches.inc();
+        }
+
+        /// A READ served off the interception host's ring fast path
+        /// (`ipc/host/service.zig` `serveRead`: the arena copy, no handler,
+        /// no record) under the mount's atime posture — on the service
+        /// thread, so NO record read and no wait: under strictatime the
+        /// stamp parks judged; under relatime it parks as a CANDIDATE the
+        /// fold and the drain judge against the record by the relatime
+        /// rule (`economy.AtimeRule`); a standing stamp takes no second one
+        /// (a hot file: one park per drain tick). The ring binds regular
+        /// files alone, so nodiratime never applies here.
+        pub fn note_read(self: *Self, _: *Ctx, a: filesystem.NoteReadArgs) void {
+            const law = self.atime_law.current();
+            if (law.read_only or law.posture == .noatime) return;
+            const local = localOf(a.ino) catch return;
+            const rule: economy.AtimeRule = if (law.posture == .strictatime) .judged else .relatime;
+            const parked = self.pending.parkAtimeIfAbsent(local, now(), rule) catch {
+                fuse_atime_touches_dropped.inc();
+                return;
+            } orelse return;
+            if (parked == .parked_wake_drain) self.times_drain_wake.notifyOne(self.io);
+            fuse_atime_touches.inc();
         }
 
         // ---- inode flags: the law's checks (`inode_flags.zig`) ----
@@ -2881,8 +2961,9 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
 
         pub fn readlink(self: *Self, c: *Ctx, a: filesystem.ReadlinkArgs) Error!filesystem.Data {
             const local = try localOf(a.ino);
-            const v = try self.readInode(local);
+            var v = try self.readInode(local);
             if (v.mode & S.IFMT != S.IFLNK) return error.InvalidArgument;
+            self.touchAtime(local, &v);
             const target = (try self.xattrValue(local, economy.SYMLINK_XATTR)) orelse return error.InputOutput;
             defer self.gpa.free(target);
             if (target.len > c.window.len) return error.NameTooLong;
@@ -3582,6 +3663,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             const local = try localOf(a.ino);
             c.stage(.meta_backend_start);
             var v = try self.readInode(local);
+            self.touchAtime(local, &v);
             v.size = self.claimedSize(local, v);
             if (a.offset >= v.size) {
                 c.stage(.meta_backend_done);
@@ -4274,7 +4356,19 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             var parked: std.ArrayList(u64) = .empty;
             defer parked.deinit(self.gpa);
             try self.pending.snapshotParked(self.gpa, &parked);
-            var rest_all: []u64 = parked.items;
+            // A foreign-slot ino's refinement is its holder's to journal:
+            // the only one a read here parks is an access stamp, shipped
+            // (the batches below are this mount's own records).
+            var n_local: usize = 0;
+            for (parked.items) |ino| {
+                if (self.foreignSlot(globalOf(ino))) {
+                    self.shipAtimeTouch(ino);
+                    continue;
+                }
+                parked.items[n_local] = ino;
+                n_local += 1;
+            }
+            var rest_all: []u64 = parked.items[0..n_local];
             while (rest_all.len != 0) {
                 var rest = rest_all[0..@min(rest_all.len, economy.PENDING_TIMES_DRAIN_BATCH)];
                 rest_all = rest_all[rest.len..];
@@ -4360,7 +4454,44 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         /// `drainTimesBatch`'s.
         fn drainTimesOf(self: *Self, c: *Ctx, local: u64, landed: u64) Error!u64 {
             if (self.pending.parked(local) == null) return 0;
+            if (self.foreignSlot(globalOf(local))) {
+                self.shipAtimeTouch(local);
+                return 0;
+            }
             return self.drainTimesBatch(c, &.{local}, landed);
+        }
+
+        /// The drain's foreign arm (charter §4 "Access time", §5.5): a READ
+        /// of a foreign-slot file parked its access stamp here; the record
+        /// is the holder's, so the stamp travels as ONE shipped setattr
+        /// carrying `SETATTR_ATIME_TOUCH` — the holder journals a Δatime
+        /// iff it advances and moves no ctime — batched by the cadence (one
+        /// ship per ino per tick at most, whatever the posture). Whatever
+        /// the holder answers, the stamp leaves the map: an access stamp is
+        /// lazy by law and never a failed read (a refusal is counted; the
+        /// next read under the rule stamps again). A stamp parked anew
+        /// while the ship was out stays for the next tick.
+        fn shipAtimeTouch(self: *Self, local: u64) void {
+            const parked = self.pending.parked(local) orelse return;
+            if (parked.atime != 0 and self.foreignAtimeDue(local, parked)) {
+                if (self.shipRecord(globalOf(local), .{ .setattr = .{ .atime = parked.atime, .atime_touch = true } })) |_| {
+                    fuse_atime_touches_shipped.inc();
+                } else |_| fuse_atime_touches_dropped.inc();
+            }
+            _ = self.pending.retireIfStill(local, parked);
+        }
+
+        /// A judged stamp ships as it is; a relatime CANDIDATE (a path that
+        /// held no record) is judged here against the holder's record as
+        /// the token serves it — the wire carries a stamp the holder
+        /// applies, never the rule. A record the token cannot serve now
+        /// drops the candidate (the next read under the rule stamps again).
+        fn foreignAtimeDue(self: *Self, local: u64, parked: economy.Times) bool {
+            if (parked.atime_rule == .judged) return true;
+            const served = (self.tokenServe(local, .{}) catch return false) orelse return false;
+            defer served.release(self.io);
+            const e = served.entry orelse return false;
+            return parked.atimeApplies(e.attrs);
         }
 
         /// The resident payload to its own block, the striped layout
@@ -4600,10 +4731,13 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
 
         fn listDir(self: *Self, c: *Ctx, a: filesystem.ReaddirArgs, plus: bool) Error!filesystem.Data {
             const dir = try localOf(a.ino);
-            const dv = try self.readDir(dir);
+            var dv = try self.readDir(dir);
             // The virtual control inodes are LOOKUP-ONLY: never listed; their
             // reserved cookies (never emitted) resume as the end of the stream.
             if (virtual_inodes.isReservedCookie(a.offset)) return .{ .len = 0 };
+            // The directory was read (every page of a listing is a read;
+            // nodiratime spares it).
+            self.touchAtime(dir, &dv);
             const pos = key.decodeReaddirCookie(a.offset) catch return error.InvalidArgument;
             var plain = codec.DirentWriter.init(c.window, a.size);
             var rich = codec.DirentPlusWriter.init(c.window, a.size);
@@ -9320,6 +9454,185 @@ test "POSIX utimensat: an explicit atime/mtime set (no ctime on the wire — the
     ex.ctime = past + 21;
     const x = try h.attr(h.setattr(f, ex));
     try testing.expectEqual(past + 21, x.ctime);
+}
+
+test "charter §4 'Access time' — the handler applies the mount's atime law on READ, READDIR and READLINK: under relatime (the kernel's default) the first read after a modification moves atime (the GETATTR after it shows the stamp, ctime and mtime unmoved), a second read does not, a write makes the next read move it again, a chmod (ctime) too; nodiratime spares the directory's listing and not the file's read; strictatime moves it on every read; noatime and ro never; the drain journals the stamp as a Δatime (the stored record carries it, nothing else moved)" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    var trace = op_trace.OpTrace.begin(0, .other);
+    defer trace.finish();
+    var ctx: filesystem.Ctx = .{ .unique = 0, .uid = 0, .gid = 0, .pid = 0, .io = testing.io, .trace = &trace, .wd_slot = null, .window = &.{} };
+    const touches0 = fuse_atime_touches.load();
+    const d = try h.mkdir(1, "d");
+    const f = try h.create(d, "f", 0o644);
+    try testing.expectEqual(@as(?linux.E, null), h.write(f, 0, "aaa\n", 0).errno());
+    h.release(f);
+    const l = (try h.entry(h.call(.{ .symlink = .{ .name = "l", .link = "f" } }, d))).nodeid;
+    // Backdate every stamp so a read's "now" is observable inside one tick.
+    const past: u64 = 1_000_000_000;
+    var back = abi.zeroed(abi.fuse_setattr_in);
+    back.valid = abi.FATTR_ATIME | abi.FATTR_MTIME | abi.FATTR_CTIME;
+    back.atime = past;
+    back.mtime = past;
+    back.ctime = past;
+    for ([_]u64{ f, d, l }) |ino| _ = try h.attr(h.setattr(ino, back));
+    // relatime: atime = mtime = ctime ⇒ the first read moves atime alone.
+    try testing.expectEqual(@as(?linux.E, null), h.read(f, 0, 4).errno());
+    const a1 = try h.getattr(f);
+    try testing.expect(a1.atime > past);
+    try testing.expectEqual(past, a1.mtime);
+    try testing.expectEqual(past, a1.ctime);
+    try testing.expectEqual(touches0 + 1, fuse_atime_touches.load());
+    // A second read: atime ahead of mtime and ctime ⇒ nothing.
+    try testing.expectEqual(@as(?linux.E, null), h.read(f, 0, 4).errno());
+    try testing.expectEqual(a1.atime, (try h.getattr(f)).atime);
+    try testing.expectEqual(touches0 + 1, fuse_atime_touches.load());
+    // A write moves mtime past atime ⇒ the next read stamps again (every
+    // stamp backdated: the coarse clock need not tick between two steps).
+    var later = back;
+    later.atime = past;
+    later.mtime = past + 5;
+    later.ctime = past;
+    _ = try h.attr(h.setattr(f, later));
+    try testing.expectEqual(@as(?linux.E, null), h.read(f, 0, 4).errno());
+    const a2 = try h.getattr(f);
+    try testing.expect(a2.atime > past + 5);
+    try testing.expectEqual(past + 5, a2.mtime);
+    try testing.expectEqual(touches0 + 2, fuse_atime_touches.load());
+    // The drain: the STORED record carries the stamp (a Δatime), mtime and
+    // ctime as they were.
+    _ = try h.fs.drainPendingTimes(&ctx);
+    const stored = (try h.fs.readInodeStored(try Harness.Fs.localOf(f))).?;
+    try testing.expectEqual(a2.atime * std.time.ns_per_s + a2.atimensec, stored.atime);
+    try testing.expectEqual((past + 5) * std.time.ns_per_s, stored.mtime);
+    try testing.expectEqual(past * std.time.ns_per_s, stored.ctime);
+    try testing.expectEqual(@as(u64, 0), h.fs.pending.len());
+    // READDIR under relatime: the directory's first listing moves its atime
+    // (created = all equal); a listing under nodiratime does not, while the
+    // file's read beside it does.
+    var names: [512]u8 = undefined;
+    _ = try h.readdirNames(d, 0, &names);
+    const d1 = try h.getattr(d);
+    try testing.expect(d1.atime > past);
+    try testing.expectEqual(touches0 + 3, fuse_atime_touches.load());
+    _ = try h.attr(h.setattr(d, back));
+    _ = try h.attr(h.setattr(f, back));
+    try testing.expect(h.fs.atime_law.set(.{ .posture = .relatime, .nodiratime = true }));
+    _ = try h.readdirNames(d, 0, &names);
+    try testing.expectEqual(past, (try h.getattr(d)).atime);
+    try testing.expectEqual(@as(?linux.E, null), h.read(f, 0, 4).errno());
+    try testing.expect((try h.getattr(f)).atime > past);
+    try testing.expectEqual(touches0 + 4, fuse_atime_touches.load());
+    // READLINK under relatime: the link's first read moves its atime.
+    _ = h.fs.atime_law.set(.{ .posture = .relatime });
+    try testing.expectEqual(@as(?linux.E, null), h.call(.readlink, l).errno());
+    try testing.expect((try h.getattr(l)).atime > past);
+    try testing.expectEqual(touches0 + 5, fuse_atime_touches.load());
+    // strictatime: every read moves it — a backdated atime ahead of mtime
+    // and ctime (relatime would say no) moves on the first read, and on the
+    // next after another backdate.
+    _ = h.fs.atime_law.set(.{ .posture = .strictatime });
+    var ahead = abi.zeroed(abi.fuse_setattr_in);
+    ahead.valid = abi.FATTR_ATIME | abi.FATTR_MTIME | abi.FATTR_CTIME;
+    ahead.atime = past + 10;
+    ahead.mtime = past;
+    ahead.ctime = past;
+    _ = try h.attr(h.setattr(f, ahead));
+    try testing.expectEqual(@as(?linux.E, null), h.read(f, 0, 4).errno());
+    try testing.expect((try h.getattr(f)).atime > past + 10);
+    _ = try h.attr(h.setattr(f, ahead));
+    try testing.expectEqual(@as(?linux.E, null), h.read(f, 0, 4).errno());
+    try testing.expect((try h.getattr(f)).atime > past + 10);
+    try testing.expectEqual(touches0 + 7, fuse_atime_touches.load());
+    // noatime: never; a read-only law: never (strictatime notwithstanding).
+    _ = try h.attr(h.setattr(f, back));
+    _ = try h.attr(h.setattr(d, back));
+    _ = h.fs.atime_law.set(.{ .posture = .noatime });
+    try testing.expectEqual(@as(?linux.E, null), h.read(f, 0, 4).errno());
+    _ = try h.readdirNames(d, 0, &names);
+    try testing.expectEqual(past, (try h.getattr(f)).atime);
+    try testing.expectEqual(past, (try h.getattr(d)).atime);
+    _ = h.fs.atime_law.set(.{ .posture = .strictatime, .read_only = true });
+    try testing.expectEqual(@as(?linux.E, null), h.read(f, 0, 4).errno());
+    try testing.expectEqual(past, (try h.getattr(f)).atime);
+    try testing.expectEqual(touches0 + 7, fuse_atime_touches.load());
+    // Back to relatime: a chmod moved ctime past atime ⇒ the read stamps.
+    _ = h.fs.atime_law.set(.{ .posture = .relatime });
+    var mode = abi.zeroed(abi.fuse_setattr_in);
+    mode.valid = abi.FATTR_MODE;
+    mode.mode = 0o600;
+    const m = try h.attr(h.setattr(f, mode));
+    try testing.expect(m.ctime > m.atime);
+    try testing.expectEqual(@as(?linux.E, null), h.read(f, 0, 4).errno());
+    try testing.expect((try h.getattr(f)).atime >= m.ctime);
+    try testing.expectEqual(touches0 + 8, fuse_atime_touches.load());
+    _ = try h.fs.drainPendingTimes(&ctx);
+    try testing.expectEqual(@as(u64, 0), h.fs.pending.len());
+}
+
+test "charter §4 'Access time' — a read the handler never sees (the interception host's ring fast path, `note_read`) parks a relatime CANDIDATE without the record: it shows and drains only where relatime_need_update holds (a settled file: dropped by the drain, no Δ; a file written since: the stamp lands), a hot file parks once per drain, strictatime parks judged, noatime parks nothing" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    var trace = op_trace.OpTrace.begin(0, .other);
+    defer trace.finish();
+    var ctx: filesystem.Ctx = .{ .unique = 0, .uid = 0, .gid = 0, .pid = 0, .io = testing.io, .trace = &trace, .wd_slot = null, .window = &.{} };
+    const f = try h.create(1, "f", 0o644);
+    try testing.expectEqual(@as(?linux.E, null), h.write(f, 0, "aaa\n", 0).errno());
+    h.release(f);
+    const local = try Harness.Fs.localOf(f);
+    // A settled file: atime ahead of mtime and ctime, and RECENT (a stamp
+    // a day old is relatime's third clause; the wire's seconds).
+    const past: u64 = clock.realtimeCoarseS() - 100;
+    var settled = abi.zeroed(abi.fuse_setattr_in);
+    settled.valid = abi.FATTR_ATIME | abi.FATTR_MTIME | abi.FATTR_CTIME;
+    settled.atime = past + 10;
+    settled.mtime = past;
+    settled.ctime = past;
+    _ = try h.attr(h.setattr(f, settled));
+    // The create's parent stamp (§AV) out of the way: the map starts empty.
+    _ = try h.fs.drainPendingTimes(&ctx);
+    try testing.expectEqual(@as(u64, 0), h.fs.pending.len());
+    const t0 = fuse_atime_touches.load();
+    h.fs.note_read(&ctx, .{ .ino = f });
+    try testing.expectEqual(t0 + 1, fuse_atime_touches.load());
+    try testing.expectEqual(@as(u64, 1), h.fs.pending.len());
+    // The candidate does not show over a settled record...
+    try testing.expectEqual(past + 10, (try h.getattr(f)).atime);
+    // ...a second note parks nothing (one per drain tick)...
+    h.fs.note_read(&ctx, .{ .ino = f });
+    try testing.expectEqual(t0 + 1, fuse_atime_touches.load());
+    // ...and the drain drops it: no Δ, the stored record unmoved.
+    try testing.expectEqual(@as(u64, 0), try h.fs.drainPendingTimes(&ctx));
+    try testing.expectEqual(@as(u64, 0), h.fs.pending.len());
+    try testing.expectEqual((past + 10) * std.time.ns_per_s, (try h.fs.readInodeStored(local)).?.atime);
+    // A file written since (mtime past atime): the candidate shows and lands.
+    var written = settled;
+    written.mtime = past + 20;
+    written.ctime = past + 20;
+    _ = try h.attr(h.setattr(f, written));
+    h.fs.note_read(&ctx, .{ .ino = f });
+    const shown = try h.getattr(f);
+    try testing.expect(shown.atime >= past + 20);
+    try testing.expectEqual(past + 20, shown.mtime);
+    try testing.expectEqual(past + 20, shown.ctime);
+    try testing.expectEqual(@as(u64, 1), try h.fs.drainPendingTimes(&ctx));
+    const stored = (try h.fs.readInodeStored(local)).?;
+    try testing.expectEqual(shown.atime * std.time.ns_per_s + shown.atimensec, stored.atime);
+    try testing.expectEqual((past + 20) * std.time.ns_per_s, stored.ctime);
+    // strictatime: the candidate is judged — it lands over a settled record.
+    _ = try h.attr(h.setattr(f, settled));
+    _ = h.fs.atime_law.set(.{ .posture = .strictatime });
+    h.fs.note_read(&ctx, .{ .ino = f });
+    try testing.expect((try h.getattr(f)).atime > past + 10);
+    try testing.expectEqual(@as(u64, 1), try h.fs.drainPendingTimes(&ctx));
+    // noatime: nothing parks.
+    _ = h.fs.atime_law.set(.{ .posture = .noatime });
+    const t1 = fuse_atime_touches.load();
+    h.fs.note_read(&ctx, .{ .ino = f });
+    try testing.expectEqual(t1, fuse_atime_touches.load());
+    try testing.expectEqual(@as(u64, 0), h.fs.pending.len());
 }
 
 test "KILLPRIV_V2: a flagged write clears suid (and sgid only with group-exec) and drops security.capability in the write's commit; an unflagged write clears nothing; a flagged truncate and an O_TRUNC open fold the strip too" {

@@ -3210,6 +3210,9 @@ pub const Conveyor = struct {
         var last: u64 = 0;
         for (q.recs) |r| {
             if (r.tree_id != key.TREE_INODES and r.tree_id != key.TREE_XATTRS) continue;
+            // An access stamp alone (the atime posture's drain, charter §4
+            // "Access time") changes no byte a cached layout could name.
+            if (r.tree_id == key.TREE_INODES and r.kind == .delta and record.inodeDeltaMask(r.value) == record.DELTA_ATIME) continue;
             const o = token_table.recordObjectIno(r.tree_id, r.key) orelse continue;
             if (o == last) continue;
             last = o;

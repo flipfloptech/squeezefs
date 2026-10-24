@@ -188,6 +188,14 @@ pub const MountOptions = struct {
     noexec: bool = false,
     noatime: bool = false,
     nodiratime: bool = false,
+    /// `MS_STRICTATIME`: every read moves atime (the kernel's default is
+    /// relatime, which `relatime` names by clearing this). The daemon
+    /// reads the posture back from the kernel's mount table, so the word
+    /// here only has to reach `mount(2)` (charter §4 "Access time").
+    strictatime: bool = false,
+    /// `MS_LAZYTIME`: a superblock flag the kernel keeps for its own
+    /// in-core times; the daemon's apply is lazy regardless.
+    lazytime: bool = false,
     dirsync: bool = false,
     sync: bool = false,
     // ---- daemon-level (INIT-reply overrides, TTLs, postures) ----
@@ -239,8 +247,9 @@ pub const MountOptions = struct {
 
     /// The `fusermount3 -o` string: `fsname=F[,subtype=S][,allow_other]
     /// [,default_permissions][,max_read=N][,ro][,nosuid][,nodev][,noexec]
-    /// [,noatime][,nodiratime][,dirsync][,sync]`. fusermount3 supplies
-    /// `fd/rootmode/user_id/group_id` itself and strips them if passed.
+    /// [,noatime][,nodiratime][,strictatime][,lazytime][,dirsync][,sync]`.
+    /// fusermount3 supplies `fd/rootmode/user_id/group_id` itself and
+    /// strips them if passed.
     pub fn writeFusermountOptions(self: MountOptions, w: *std.Io.Writer) std.Io.Writer.Error!void {
         try w.print("fsname={s}", .{self.fsName()});
         if (self.subtype) |s| try w.print(",subtype={s}", .{s});
@@ -251,6 +260,8 @@ pub const MountOptions = struct {
         if (self.noexec) try w.writeAll(",noexec");
         if (self.noatime) try w.writeAll(",noatime");
         if (self.nodiratime) try w.writeAll(",nodiratime");
+        if (self.strictatime) try w.writeAll(",strictatime");
+        if (self.lazytime) try w.writeAll(",lazytime");
         if (self.dirsync) try w.writeAll(",dirsync");
         if (self.sync) try w.writeAll(",sync");
     }
@@ -269,6 +280,8 @@ pub const MountOptions = struct {
             linux.MS.RDONLY * @as(u32, @intFromBool(self.read_only)) |
             linux.MS.NOATIME * @as(u32, @intFromBool(self.noatime)) |
             linux.MS.NODIRATIME * @as(u32, @intFromBool(self.nodiratime)) |
+            linux.MS.STRICTATIME * @as(u32, @intFromBool(self.strictatime)) |
+            linux.MS.LAZYTIME * @as(u32, @intFromBool(self.lazytime)) |
             linux.MS.DIRSYNC * @as(u32, @intFromBool(self.dirsync));
         if (self.sync) f |= linux.MS.SYNCHRONOUS;
         return f;
@@ -350,7 +363,18 @@ const flags = [_]Flag{
     .{ .name = "nodev", .field = "nodev" },
     .{ .name = "noexec", .field = "noexec" },
     .{ .name = "noatime", .field = "noatime" },
+    .{ .name = "atime", .field = "noatime", .value = false },
     .{ .name = "nodiratime", .field = "nodiratime" },
+    .{ .name = "diratime", .field = "nodiratime", .value = false },
+    // mount(8)'s atime vocabulary (charter §4 "Access time"): `relatime`
+    // is the kernel's default (no flag; it clears `strictatime` here as
+    // `MS_STRICTATIME` would otherwise clear it), `strictatime` /
+    // `nostrictatime`, `lazytime` / `nolazytime`.
+    .{ .name = "relatime", .field = "strictatime", .value = false },
+    .{ .name = "strictatime", .field = "strictatime" },
+    .{ .name = "nostrictatime", .field = "strictatime", .value = false },
+    .{ .name = "lazytime", .field = "lazytime" },
+    .{ .name = "nolazytime", .field = "lazytime", .value = false },
     .{ .name = "dirsync", .field = "dirsync" },
     .{ .name = "sync", .field = "sync" },
     .{ .name = "allow_other", .field = "allow_other" },
@@ -569,6 +593,14 @@ test "flags and names: ro/rw/nosuid/nodev/noexec/noatime/nodiratime/dirsync/sync
     try testing.expectEqualStrings("sqz", o.subtype.?);
     try testing.expectEqual(Outcome.ok, parseOptionString(&o, "rw,writeback_cache"));
     try testing.expect(!o.read_only);
+    // mount(8)'s atime vocabulary: the last word wins per flag; relatime
+    // (the kernel's default) is the absence of strictatime.
+    try testing.expectEqual(Outcome.ok, parseOptionString(&o, "strictatime,lazytime"));
+    try testing.expect(o.strictatime and o.lazytime);
+    try testing.expectEqual(Outcome.ok, parseOptionString(&o, "relatime,nolazytime,atime,diratime"));
+    try testing.expect(!o.strictatime and !o.lazytime and !o.noatime and !o.nodiratime);
+    try testing.expectEqual(Outcome.ok, parseOptionString(&o, "strictatime,nostrictatime"));
+    try testing.expect(!o.strictatime);
     var buf: [256]u8 = undefined;
     try testing.expectEqualStrings("-o ro='1' is invalid: takes no value", try fmtDiag(&buf, parseOptionString(&o, "ro=1")));
     try testing.expectEqualStrings("-o fsname: requires =<value>", try fmtDiag(&buf, parseOptionString(&o, "fsname=")));
@@ -627,6 +659,11 @@ test "root mount(2) data: fd, octal rootmode, uid/gid, subtype, the shared kerne
     o.dirsync = true;
     o.sync = true;
     try testing.expectEqual(@as(u32, linux.MS.RDONLY | linux.MS.NOSUID | linux.MS.NODEV | linux.MS.NOEXEC | linux.MS.NOATIME | linux.MS.NODIRATIME | linux.MS.DIRSYNC | linux.MS.SYNCHRONOUS), o.msFlags());
+    o.strictatime = true;
+    o.lazytime = true;
+    try testing.expectEqual(@as(u32, linux.MS.RDONLY | linux.MS.NOSUID | linux.MS.NODEV | linux.MS.NOEXEC | linux.MS.NOATIME | linux.MS.NODIRATIME | linux.MS.STRICTATIME | linux.MS.LAZYTIME | linux.MS.DIRSYNC | linux.MS.SYNCHRONOUS), o.msFlags());
+    o.strictatime = false;
+    o.lazytime = false;
     // MS_* never appear in the data string.
     w = .fixed(&buf);
     try o.writeKernelData(7, &w);

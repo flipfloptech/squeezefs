@@ -50,6 +50,7 @@ const record = @import("record.zig");
 const tx = @import("tx.zig");
 const dlm = @import("dlm.zig");
 const jc = @import("journal_core.zig");
+const atime_law = @import("../fuse/atime.zig");
 
 const assert = std.debug.assert;
 const InodeValue = record.InodeValue;
@@ -854,13 +855,41 @@ pub const PENDING_TIMES_DRAIN_BATCH: usize = 128;
 /// cadence tick still drains everything within its 50 ms.
 pub const PENDING_TIMES_DRAIN_CAP: u64 = 4096;
 
-/// A parked refinement: the kernel's post-op times for one ino.
 /// A parked refinement: the stamp, and an extending striped write's size
 /// claim (0 = none) — the ordered law (decision 0003 §AL.5): the claim is
 /// fold-visible at once and journaled only once the bytes it covers are
 /// durable (`kv_fs.drainTimesBatch` commits `min(claim, the ino's custody
-/// floor)`).
-pub const Times = struct { mtime: u64, ctime: u64, size: u64 = 0 };
+/// floor)`) — and a READ's access stamp (`atime`, 0 = none; charter §4
+/// "Access time"): the mount's atime posture, fold-visible at once,
+/// journaled by the same drain as a `DELTA_ATIME` and never a ctime
+/// change. A stamp of 0 is no stamp: a read stamps `now`, never the epoch.
+pub const Times = struct {
+    mtime: u64 = 0,
+    ctime: u64 = 0,
+    size: u64 = 0,
+    atime: u64 = 0,
+    atime_rule: AtimeRule = .none,
+
+    /// Does the parked access stamp apply over the record `v`?
+    pub fn atimeApplies(self: Times, v: InodeValue) bool {
+        if (self.atime == 0 or !laterThan(self.atime, v.atime)) return false;
+        return switch (self.atime_rule) {
+            .none => false,
+            .judged => true,
+            .relatime => atime_law.relatimeNeedsUpdate(.{ .atime = v.atime, .mtime = v.mtime, .ctime = v.ctime }, self.atime),
+        };
+    }
+};
+
+/// How a parked access stamp meets the record it folds over. `judged`: the
+/// parker held the record and the posture said the stamp is due (or the
+/// posture is strictatime) — it applies as a monotone max. `relatime`: a
+/// CANDIDATE from a path that reads no record (the interception host's
+/// ring fast path) — it applies iff the relatime rule holds over the
+/// record at the fold (`fs/inode.c` `relatime_need_update`, evaluated
+/// lazily and exactly), else it is dropped by the drain. Ordered: a merge
+/// keeps the stronger rule.
+pub const AtimeRule = enum(u2) { none = 0, relatime = 1, judged = 2 };
 
 /// What `park` answers: whether the population just crossed the cap (the
 /// drain's early wake).
@@ -969,8 +998,15 @@ pub const PendingTimes = struct {
     pub fn fold(self: *PendingTimes, ino: u64, v: *InodeValue) void {
         if (self.count.load(.monotonic) == 0) return;
         const p = self.parked(ino) orelse return;
+        foldTimes(p, v);
+    }
+
+    /// The fold of one refinement over a record (the token-served foreign
+    /// record folds the same way).
+    pub fn foldTimes(p: Times, v: *InodeValue) void {
         if (laterThan(p.mtime, v.mtime)) v.mtime = p.mtime;
         if (laterThan(p.ctime, v.ctime)) v.ctime = p.ctime;
+        if (p.atimeApplies(v.*)) v.atime = p.atime;
     }
 
     /// `ino`'s parked size claim (0 = none). NOT folded by `fold`: a
@@ -1001,8 +1037,42 @@ pub const PendingTimes = struct {
             if (laterThan(t.mtime, gop.value_ptr.mtime)) gop.value_ptr.mtime = t.mtime;
             if (laterThan(t.ctime, gop.value_ptr.ctime)) gop.value_ptr.ctime = t.ctime;
             gop.value_ptr.size = @max(gop.value_ptr.size, t.size);
+            if (t.atime != 0 and (gop.value_ptr.atime == 0 or laterThan(t.atime, gop.value_ptr.atime))) gop.value_ptr.atime = t.atime;
+            if (@backingInt(t.atime_rule) > @backingInt(gop.value_ptr.atime_rule)) gop.value_ptr.atime_rule = t.atime_rule;
         } else {
             gop.value_ptr.* = t;
+            _ = self.count.fetchAdd(1, .monotonic);
+            stats.meta_kv_times_echo_pending.add(1);
+        }
+        return if (self.count.load(.monotonic) >= PENDING_TIMES_DRAIN_CAP) .parked_wake_drain else .parked;
+    }
+
+    /// A READ's access stamp (charter §4 "Access time") the handler JUDGED
+    /// due over the record in hand: parked as the ino's refinement (merged
+    /// as a max with a stamp already there), fold-visible at once,
+    /// journaled by the drain as a Δatime alone. Under the op's SHARED
+    /// `I{ino}` guard or none at all: parks commute. Answers the cap
+    /// crossing like `park`.
+    pub fn parkAtime(self: *PendingTimes, ino: u64, now: u64) Allocator.Error!Park {
+        return self.parkClaim(ino, .{ .atime = now, .atime_rule = .judged });
+    }
+
+    /// A READ's access stamp from a path that holds no record (the
+    /// interception host's ring fast path): parked under `rule` ONLY when
+    /// the ino parks no stamp yet — a hot file costs one park per drain
+    /// tick, the rest of its reads one lock and one lookup. Null = a stamp
+    /// stands; nothing was done.
+    pub fn parkAtimeIfAbsent(self: *PendingTimes, ino: u64, now: u64, rule: AtimeRule) Allocator.Error!?Park {
+        const s = self.stripeOf(ino);
+        s.lock.lock();
+        defer s.lock.unlock();
+        const gop = try s.map.getOrPut(self.gpa, ino);
+        if (gop.found_existing) {
+            if (gop.value_ptr.atime != 0) return null;
+            gop.value_ptr.atime = now;
+            gop.value_ptr.atime_rule = rule;
+        } else {
+            gop.value_ptr.* = .{ .atime = now, .atime_rule = rule };
             _ = self.count.fetchAdd(1, .monotonic);
             stats.meta_kv_times_echo_pending.add(1);
         }
@@ -1024,6 +1094,8 @@ pub const PendingTimes = struct {
         if (p.size != 0) {
             p.mtime = 0;
             p.ctime = 0;
+            p.atime = 0;
+            p.atime_rule = .none;
             return true;
         }
         _ = s.map.remove(ino);
@@ -1061,7 +1133,7 @@ pub const PendingTimes = struct {
         s.lock.lock();
         defer s.lock.unlock();
         const cur = s.map.get(ino) orelse return false;
-        if (cur.mtime != drained.mtime or cur.ctime != drained.ctime or cur.size != drained.size) return false;
+        if (cur.mtime != drained.mtime or cur.ctime != drained.ctime or cur.size != drained.size or cur.atime != drained.atime or cur.atime_rule != drained.atime_rule) return false;
         _ = s.map.remove(ino);
         _ = self.count.fetchSub(1, .monotonic);
         stats.meta_kv_times_echo_pending.sub(1);
@@ -1129,16 +1201,30 @@ pub const PendingTimes = struct {
 /// null when the stored record already carries it (a fresher committed
 /// write superseded the refinement — the drain must not regress it).
 /// `size` is the claim the drain may journal now (`min(claim, custody
-/// floor)`): a size advance rides the same Δ.
+/// floor)`): a size advance rides the same Δ. A READ's access stamp that
+/// advances the stored atime rides it too (`DELTA_ATIME`; alone when
+/// nothing else advances — a read moves no ctime).
 pub fn drainDelta(parked_times: Times, stored: InodeValue) ?InodeDelta {
     const adv_m = laterThan(parked_times.mtime, stored.mtime);
     const adv_c = laterThan(parked_times.ctime, stored.ctime);
     const adv_s = parked_times.size > stored.size;
-    if (!adv_m and !adv_c and !adv_s) return null;
+    const adv_a = parked_times.atimeApplies(stored);
+    if (!adv_m and !adv_c and !adv_s and !adv_a) return null;
     const m = if (adv_m) parked_times.mtime else stored.mtime;
     const c = if (adv_c) parked_times.ctime else stored.ctime;
-    if (adv_s) return .{ .mask = record.DELTA_SIZE | record.DELTA_TIMES, .fields = .{ .size = parked_times.size, .mtime = m, .ctime = c } };
-    return if (adv_m) InodeDelta.times(m, c) else InodeDelta.ctime(c);
+    var d: InodeDelta = if (adv_s)
+        .{ .mask = record.DELTA_SIZE | record.DELTA_TIMES, .fields = .{ .size = parked_times.size, .mtime = m, .ctime = c } }
+    else if (adv_m)
+        InodeDelta.times(m, c)
+    else if (adv_c)
+        InodeDelta.ctime(c)
+    else
+        .{ .mask = 0, .fields = .{} };
+    if (adv_a) {
+        d.mask |= record.DELTA_ATIME;
+        d.fields.atime = parked_times.atime;
+    }
+    return d;
 }
 
 pub const DrainMember = enum {
@@ -2232,6 +2318,99 @@ test "drain: batches of ≤ 128 inos, ONE tx each; the advance only (times vs ct
     try testing.expect(drainDelta(.{ .mtime = 0, .ctime = 0 }, stored) == null);
     // 300 absorbed echoes cost 3 drain entries: the amortized residual.
     try testing.expect(renameEntriesPerOp(300, 3) <= RENAME_ENTRIES_PER_OP_GATE);
+}
+
+test "a READ's access stamp rides the pending map (charter §4 'Access time'): a JUDGED stamp folds as a max over the record's atime and nothing else, merges with a write's stamp in either order, drains as a Δatime alone (no ctime), beside a Δtimes when both advance, and never when the stored record is already there; retire drops it, a claim survives it; 0 is no stamp" {
+    var pending = try PendingTimes.init(testing.allocator);
+    defer pending.deinit();
+    var stored: InodeValue = .{ .mode = S.IFREG | 0o644, .nlink = 1, .atime = 100, .mtime = 100, .ctime = 100 };
+    // The stamp alone: fold moves atime, the drain's Δ names atime alone.
+    try testing.expectEqual(Park.parked, try pending.parkAtime(7, 500));
+    var v = stored;
+    pending.fold(7, &v);
+    try testing.expectEqual(@as(u64, 500), v.atime);
+    try testing.expectEqual(@as(u64, 100), v.mtime);
+    try testing.expectEqual(@as(u64, 100), v.ctime);
+    const d = drainDelta(pending.parked(7).?, stored).?;
+    try testing.expectEqual(record.DELTA_ATIME, d.mask);
+    try testing.expectEqual(@as(u64, 500), d.fields.atime);
+    // An older stamp never regresses the parked one; a newer one advances it.
+    _ = try pending.parkAtime(7, 400);
+    try testing.expectEqual(@as(u64, 500), pending.parked(7).?.atime);
+    _ = try pending.parkAtime(7, 600);
+    try testing.expectEqual(@as(u64, 600), pending.parked(7).?.atime);
+    // A write's stamp merges beside it (either order) and both ride ONE Δ.
+    _ = try pending.park(7, 700, 700);
+    try testing.expectEqual(Times{ .mtime = 700, .ctime = 700, .atime = 600, .atime_rule = .judged }, pending.parked(7).?);
+    const both = drainDelta(pending.parked(7).?, stored).?;
+    try testing.expectEqual(record.DELTA_TIMES | record.DELTA_ATIME, both.mask);
+    try testing.expectEqual(@as(u64, 600), both.fields.atime);
+    try testing.expectEqual(@as(u64, 700), both.fields.mtime);
+    try testing.expect(pending.retire(7));
+    try testing.expect(pending.parked(7) == null);
+    _ = try pending.park(8, 700, 700);
+    _ = try pending.parkAtime(8, 600);
+    try testing.expectEqual(Times{ .mtime = 700, .ctime = 700, .atime = 600, .atime_rule = .judged }, pending.parked(8).?);
+    try testing.expect(pending.retire(8));
+    // A stored record already carrying the stamp (a commit folded it): no Δ.
+    stored.atime = 900;
+    _ = try pending.parkAtime(9, 900);
+    try testing.expect(drainDelta(pending.parked(9).?, stored) == null);
+    _ = try pending.parkAtime(9, 800);
+    try testing.expect(drainDelta(pending.parked(9).?, stored) == null);
+    v = stored;
+    pending.fold(9, &v);
+    try testing.expectEqual(@as(u64, 900), v.atime);
+    try testing.expect(pending.retire(9));
+    // A size claim outlives the retire; the stamps (atime too) are dropped.
+    _ = try pending.parkClaim(10, .{ .mtime = 700, .ctime = 700, .size = 4096, .atime = 650, .atime_rule = .judged });
+    try testing.expect(pending.retire(10));
+    try testing.expectEqual(Times{ .mtime = 0, .ctime = 0, .size = 4096, .atime = 0 }, pending.parked(10).?);
+    // retireIfStill judges the atime too: a read's newer stamp keeps the entry.
+    _ = try pending.parkAtime(10, 660);
+    try testing.expect(!pending.retireIfStill(10, .{ .mtime = 0, .ctime = 0, .size = 4096, .atime = 650, .atime_rule = .judged }));
+    try testing.expect(pending.retireIfStill(10, .{ .mtime = 0, .ctime = 0, .size = 4096, .atime = 660, .atime_rule = .judged }));
+    try testing.expectEqual(@as(u64, 0), pending.len());
+    // A 0 stamp is no stamp: the fold leaves the record alone.
+    v = .{ .atime = 100 };
+    PendingTimes.foldTimes(.{ .mtime = 0, .ctime = 0 }, &v);
+    try testing.expectEqual(@as(u64, 100), v.atime);
+}
+
+test "a relatime CANDIDATE (the ring fast path's stamp, parked without the record) applies at the fold and the drain only where relatime_need_update holds over the record — a fresh file yes, a file read since its last change no, a day-old atime yes; a second candidate on a standing stamp parks nothing; a judged stamp merging in wins the rule" {
+    var pending = try PendingTimes.init(testing.allocator);
+    defer pending.deinit();
+    const sec: u64 = std.time.ns_per_s;
+    // Read since its last change: atime ahead of mtime and ctime.
+    const settled: InodeValue = .{ .mode = S.IFREG | 0o644, .nlink = 1, .atime = 200 * sec, .mtime = 100 * sec, .ctime = 100 * sec };
+    try testing.expectEqual(@as(?Park, .parked), try pending.parkAtimeIfAbsent(1, 300 * sec, .relatime));
+    var v = settled;
+    pending.fold(1, &v);
+    try testing.expectEqual(@as(u64, 200 * sec), v.atime);
+    try testing.expect(drainDelta(pending.parked(1).?, settled) == null);
+    // The same candidate over a record a write just changed: it applies.
+    const written: InodeValue = .{ .mode = S.IFREG | 0o644, .nlink = 1, .atime = 200 * sec, .mtime = 250 * sec, .ctime = 250 * sec };
+    v = written;
+    pending.fold(1, &v);
+    try testing.expectEqual(@as(u64, 300 * sec), v.atime);
+    try testing.expectEqual(record.DELTA_ATIME, drainDelta(pending.parked(1).?, written).?.mask);
+    // A day old: the candidate at atime + 24 h applies over the settled record.
+    _ = try pending.parkAtimeIfAbsent(2, 200 * sec + 86400 * sec, .relatime);
+    try testing.expectEqual(record.DELTA_ATIME, drainDelta(pending.parked(2).?, settled).?.mask);
+    // A standing stamp takes no second candidate (one park per tick for a hot file).
+    try testing.expectEqual(@as(?Park, null), try pending.parkAtimeIfAbsent(1, 400 * sec, .relatime));
+    try testing.expectEqual(@as(u64, 300 * sec), pending.parked(1).?.atime);
+    // A judged stamp merging in: the stronger rule and the later stamp.
+    _ = try pending.parkAtime(1, 350 * sec);
+    try testing.expectEqual(Times{ .atime = 350 * sec, .atime_rule = .judged }, pending.parked(1).?);
+    v = settled;
+    pending.fold(1, &v);
+    try testing.expectEqual(@as(u64, 350 * sec), v.atime);
+    // A write's stamp standing first (no atime): the candidate joins it.
+    _ = try pending.park(3, 500 * sec, 500 * sec);
+    try testing.expectEqual(@as(?Park, .parked), try pending.parkAtimeIfAbsent(3, 510 * sec, .judged));
+    try testing.expectEqual(Times{ .mtime = 500 * sec, .ctime = 500 * sec, .atime = 510 * sec, .atime_rule = .judged }, pending.parked(3).?);
+    try testing.expectEqual(@as(u64, 3), pending.len());
 }
 
 // ---- SharedTimes: order-independence under the shared parent guard ----

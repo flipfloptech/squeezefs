@@ -615,11 +615,13 @@ pub const DataPlaneSink = struct {
                 stats.ipc_read_arena_copy_bytes.add(sv.n);
                 stats.ipc_ops_read.inc();
                 stats.ipc_bytes_out.add(sv.n);
+                self.noteRead(op.binding.ino);
                 c.complete(@intCast(sv.n));
             },
             .eof => {
                 stats.ipc_fast_path_serves.inc();
                 stats.ipc_ops_read.inc();
+                self.noteRead(op.binding.ino);
                 c.complete(0);
             },
             .demote => |why| {
@@ -641,6 +643,17 @@ pub const DataPlaneSink = struct {
                 self.readHandoffOn(s, op, c);
             },
         }
+    }
+
+    /// A read the fast path served without the handler: the mount's atime
+    /// posture still applies to it (charter §4 "Access time") — the
+    /// filesystem's `note_read` parks what it must and never waits (the
+    /// handler arms stamp inside `read` itself).
+    fn noteRead(self: *DataPlaneSink, ino: u64) void {
+        // No op trace: this is not an op (no clock read, no latency row).
+        var quiet: op_trace.OpTrace = .{ .unique = 0, .class = .other, .profiling = false, .t_entry = 0 };
+        var ctx = self.ctxFor(&quiet, &.{});
+        self.fs.vtable.note_read(self.fs.impl, &ctx, .{ .ino = ino });
     }
 
     /// The read handoff: the FULL handler on a lane homed on the session's

@@ -56,6 +56,9 @@ pub const stats = struct {
     pub var record_ships: counters.ShardedCounter = .{};
     /// Verbs served at this holder.
     pub var record_served: counters.ShardedCounter = .{};
+    /// Served access stamps that advanced a record's atime (a non-holder's
+    /// READ under the mount's atime posture; charter §4 "Access time").
+    pub var record_atime_touches: counters.ShardedCounter = .{};
     /// Shipped setattrs that carried KILLPRIV_V2's bit: the holder stripped
     /// the setid bits (and the caps xattr) in the verb's tx.
     pub var record_killpriv_strips: counters.ShardedCounter = .{};
@@ -101,10 +104,15 @@ pub const Setattr = struct {
     /// KILLPRIV_V2 (`verbs.SETATTR_KILL_SUIDGID`): the holder strips the
     /// setid bits and drops `security.capability` in the same tx.
     kill_suidgid: bool = false,
+    /// A READ's access stamp (`verbs.SETATTR_ATIME_TOUCH`; charter §4
+    /// "Access time"): `atime` is journaled iff it advances the record,
+    /// as a Δatime alone — no ctime, no other field.
+    atime_touch: bool = false,
 
     pub fn toWire(self: Setattr) verbs.SetattrWire {
         var w: verbs.SetattrWire = .none;
         if (self.kill_suidgid) w.valid |= verbs.SETATTR_KILL_SUIDGID;
+        if (self.atime_touch) w.valid |= verbs.SETATTR_ATIME_TOUCH;
         if (self.mode) |v| {
             w.valid |= verbs.SETATTR_MODE;
             w.mode = v;
@@ -151,6 +159,7 @@ pub const Setattr = struct {
             .ctime = if (w.valid & verbs.SETATTR_CTIME != 0) @bitCast(w.ctime) else null,
             .flags = if (w.valid & verbs.SETATTR_FLAGS != 0) w.flags else null,
             .kill_suidgid = w.valid & verbs.SETATTR_KILL_SUIDGID != 0,
+            .atime_touch = w.valid & verbs.SETATTR_ATIME_TOUCH != 0,
         };
     }
 };
@@ -501,7 +510,22 @@ pub fn RecordShipService(comptime Store: type) type {
             errdefer if (owned) a.store.abandon(t);
             const now: u64 = @bitCast(clock.realtimeCoarseNs());
             switch (call) {
-                .setattr => |s| {
+                .setattr => |s| if (s.atime_touch) {
+                    // A non-holder's READ (charter §4 "Access time"): the
+                    // stamp advances the record's atime or does nothing —
+                    // a Δatime alone, no ctime (a read is no status
+                    // change), nothing else of the verb read.
+                    const x = s.atime orelse return error.Rejected;
+                    if (!economy.laterThan(x, v.atime)) {
+                        owned = false;
+                        a.store.abandon(t);
+                        stats.record_served.inc();
+                        return .{ .inode = v };
+                    }
+                    t.stageDelta(key.TREE_INODES, &key.inodeKey(k), .{ .mask = record.DELTA_ATIME, .fields = .{ .atime = x } }) catch return error.OutOfMemory;
+                    v.atime = x;
+                    stats.record_atime_touches.inc();
+                } else {
                     if (s.mode) |m| v.mode = (v.mode & S.IFMT) | (m & ~@as(u32, S.IFMT));
                     if (s.uid) |u| v.uid = u;
                     if (s.gid) |g| v.gid = g;

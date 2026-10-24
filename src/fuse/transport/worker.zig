@@ -3749,6 +3749,8 @@ pub const Group = struct {
         const win = self.window(gent);
         if (self.shared.fs.probeRead(req, win)) |pr| {
             fast_dispatch_serves.inc();
+            // A read the handler never sees: the atime posture notes it.
+            self.shared.fs.noteRead(req);
             switch (pr) {
                 .reply => |reply| self.commitRead(gent, req, in, reply),
                 .fd_source => |fs| self.commitReadFdSource(gent, req, in, fs),
@@ -3760,6 +3762,7 @@ pub const Group = struct {
                 // A leg without its recheck hook is never bridged (THE LAW).
                 if (leg.hook != null and leg.len > 0 and leg.len <= self.payload_len and self.pushBridge(gent, .{ .kind = .direct_leg, .len = leg.len, .hook = leg.hook }, leg.fd, leg.off, true)) {
                     fast_dispatch_demotes.inc();
+                    self.shared.fs.noteRead(req);
                     return;
                 }
                 zc_direct_leg_fallbacks.inc();

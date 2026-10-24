@@ -596,6 +596,14 @@ comptime {
 
 /// A fixed-capacity encoded inode delta (≤ 58 B), returned without
 /// allocating.
+/// The mask an encoded inode Δ names (its first word); null for a payload
+/// too short to be one. A peek for the hooks that judge a committed Δ by
+/// its fields alone (the lease epochs: an access stamp names no byte).
+pub fn inodeDeltaMask(payload: []const u8) ?u16 {
+    if (payload.len < 2) return null;
+    return std.mem.readInt(u16, payload[0..2], .little);
+}
+
 pub const InodeDeltaBuf = struct {
     buf: [INODE_DELTA_MAX_LEN]u8 = undefined,
     len: u8 = 0,

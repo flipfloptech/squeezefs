@@ -29,7 +29,12 @@ pub const Entry = struct {
     dev_major: u32,
     dev_minor: u32,
     mountpoint: []const u8,
+    /// The per-mount options (`rw,nosuid,relatime`: the vfsmount's
+    /// `MNT_*` flags — the atime posture lives here).
+    options: []const u8,
     fstype: []const u8,
+    /// The superblock's options (the last field; `ro` here is `SB_RDONLY`).
+    super_options: []const u8,
 
     /// `fuse` or `fuse.<subtype>`.
     pub fn isFuse(self: Entry) bool {
@@ -48,12 +53,14 @@ pub fn parseLine(line: []const u8) ?Entry {
     const minor = std.fmt.parseInt(u32, majmin[colon + 1 ..], 10) catch return null;
     _ = it.next() orelse return null;
     const mp = it.next() orelse return null;
-    // Skip the options and the optional fields up to the separator.
+    const options = it.next() orelse return null;
+    // Skip the optional fields up to the separator.
     while (it.next()) |tok| {
         if (std.mem.eql(u8, tok, "-")) break;
     } else return null;
     const fstype = it.next() orelse return null;
-    return .{ .id = id, .parent_id = parent, .dev_major = major, .dev_minor = minor, .mountpoint = mp, .fstype = fstype };
+    const super_options = if (it.next() != null) (it.next() orelse "") else "";
+    return .{ .id = id, .parent_id = parent, .dev_major = major, .dev_minor = minor, .mountpoint = mp, .options = options, .fstype = fstype, .super_options = super_options };
 }
 
 /// The entry mounted at exactly `mountpoint` (the last line wins).
@@ -212,10 +219,24 @@ test "parseLine: id, parent, major:minor, mountpoint and fstype past the optiona
     try testing.expectEqualStrings("/build/tmp/mnt-7", e.mountpoint);
     try testing.expectEqualStrings("fuse", e.fstype);
     try testing.expect(e.isFuse());
+    try testing.expectEqualStrings("rw,nosuid,nodev,relatime", e.options);
+    try testing.expectEqualStrings("rw,user_id=0", e.super_options);
     try testing.expect(parseLine("") == null);
     try testing.expect(parseLine("not a record") == null);
     try testing.expect(parseLine("90 22 0:45 / /m rw") == null);
     try testing.expect(parseLine("90 22 045 / /m rw - fuse x y") == null);
+}
+
+test "parseLine: the two options fields — the per-mount flags (ro, noatime, nodiratime; no relatime word = strictatime) and the superblock's; a line ending at the fstype has empty super options" {
+    const strict = parseLine("95 22 0:50 / /build/tmp/mnt-9 rw,nodiratime - fuse.squeezefs sqmeta rw,user_id=0,group_id=0,default_permissions,allow_other").?;
+    try testing.expectEqualStrings("rw,nodiratime", strict.options);
+    try testing.expectEqualStrings("rw,user_id=0,group_id=0,default_permissions,allow_other", strict.super_options);
+    const ro = parseLine("96 22 0:51 / /build/tmp/mnt-10 ro,noatime shared:40 master:3 - fuse.squeezefs sqmeta ro,user_id=0").?;
+    try testing.expectEqualStrings("ro,noatime", ro.options);
+    try testing.expectEqualStrings("ro,user_id=0", ro.super_options);
+    const bare = parseLine("97 22 0:52 / /m rw,relatime - fuse").?;
+    try testing.expectEqualStrings("rw,relatime", bare.options);
+    try testing.expectEqualStrings("", bare.super_options);
 }
 
 test "entryAt: the exact mountpoint, the last line wins, a prefix is not a match; fuse and fuse.<subtype> are FUSE, tmpfs is not" {

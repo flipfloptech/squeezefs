@@ -40,7 +40,20 @@ pub const Error = error{ Canceled, SubmissionQueueOverflow, RingFailed, Unexpect
 
 /// Wait until `fd` is readable.
 pub fn readable(fd: linux.fd_t) Error!Readiness {
-    const f = lane_mod.currentFiber() orelse return readableBlocking(fd);
+    return awaitEvents(fd, linux.POLL.IN);
+}
+
+/// Wait until `fd` reports an exceptional condition (`POLLPRI`): what
+/// `/proc/self/mountinfo` raises at every change of the mount table
+/// (`fs/proc_namespace.c` `mounts_poll`: `EPOLLERR | EPOLLPRI` once per
+/// `ns->event` move — a `POLLIN` wait on it never blocks, the table is
+/// always readable).
+pub fn exceptional(fd: linux.fd_t) Error!Readiness {
+    return awaitEvents(fd, linux.POLL.PRI);
+}
+
+fn awaitEvents(fd: linux.fd_t, events: u32) Error!Readiness {
+    const f = lane_mod.currentFiber() orelse return awaitBlocking(fd, events);
     const lane = f.lane;
     // One awaiter per fd per lane: displace a standing one. It is parked on
     // its POLL_ADD (only one fiber runs on a lane), so the lane's
@@ -54,7 +67,7 @@ pub fn readable(fd: linux.fd_t) Error!Readiness {
         lane.postCancelOp(other);
     }
     try f.checkCancel();
-    if (!lane.armRingOp(f, linux.io_uring_sqe.prep_poll_add, .{ fd, @as(u32, linux.POLL.IN) })) return if (lane.ring.isDead()) error.RingFailed else error.SubmissionQueueOverflow;
+    if (!lane.armRingOp(f, linux.io_uring_sqe.prep_poll_add, .{ fd, events })) return if (lane.ring.isDead()) error.RingFailed else error.SubmissionQueueOverflow;
     f.watched_fd = fd;
     f.watch_replaced = false;
     _ = f.changeAwaiting(.nothing, .ring_op);
@@ -81,8 +94,8 @@ pub fn readable(fd: linux.fd_t) Error!Readiness {
     return .ready;
 }
 
-fn readableBlocking(fd: linux.fd_t) Error!Readiness {
-    var pfd = [_]linux.pollfd{.{ .fd = fd, .events = linux.POLL.IN, .revents = 0 }};
+fn awaitBlocking(fd: linux.fd_t, events: u32) Error!Readiness {
+    var pfd = [_]linux.pollfd{.{ .fd = fd, .events = @intCast(events), .revents = 0 }};
     while (true) {
         const rc = linux.poll(&pfd, 1, -1);
         switch (linux.errno(rc)) {

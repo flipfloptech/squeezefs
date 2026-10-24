@@ -42,6 +42,7 @@ const mem_sizing = @import("../mem/sizing.zig");
 const placement = @import("../exec/placement.zig");
 const sqz_io = @import("../exec/sqz_io.zig");
 const filesystem = @import("../fuse/handler/filesystem.zig");
+const op_trace = @import("../fuse/handler/op_trace.zig");
 const op_guard = @import("../fuse/handler/op_guard.zig");
 const open_table = @import("../fuse/handler/open_table.zig");
 const kv_fs = @import("../fuse/handler/kv_fs.zig");
@@ -829,7 +830,16 @@ pub const IpcHost = struct {
                     break :blk direct_lease.buildLease(self.d.plane, b.ino, want_write, &self.write_leases, s, &out);
                 };
                 switch (verdict) {
-                    .ok => |n| rl.sendCtl(s.ctl, out[0..n], null) catch {},
+                    .ok => |n| {
+                        rl.sendCtl(s.ctl, out[0..n], null) catch {};
+                        // The arm's reads under this lease are the device's
+                        // alone (the daemon never sees them): the grant is
+                        // the one read the mount's atime posture can judge
+                        // (charter §4 "Access time").
+                        var quiet: op_trace.OpTrace = .{ .unique = 0, .class = .other, .profiling = false, .t_entry = 0 };
+                        var ctx: filesystem.Ctx = .{ .unique = 0, .uid = linux.geteuid(), .gid = linux.getegid(), .pid = @intCast(linux.getpid()), .io = self.d.io, .trace = &quiet, .wd_slot = null, .window = &.{} };
+                        self.d.fs.vtable.note_read(self.d.fs.impl, &ctx, .{ .ino = s.binding(req.binding_id).?.ino });
+                    },
                     .refused => |class| {
                         direct_lease.countRefusal(class);
                         const reply: wire.LeaseRefused = .{ .class = @backingInt(class) };

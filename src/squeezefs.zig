@@ -110,6 +110,7 @@ pub const exec = @import("exec/exec.zig");
 // ---- the FUSE library (charter §4) ----
 pub const fuse = struct {
     pub const abi = @import("fuse/abi.zig");
+    pub const atime = @import("fuse/atime.zig");
     pub const codec = @import("fuse/codec.zig");
     pub const geometry = @import("fuse/geometry.zig");
     pub const mount_options = @import("fuse/mount_options.zig");
@@ -307,6 +308,7 @@ test {
     _ = data.plane_locks_model;
     _ = exec;
     _ = fuse.abi;
+    _ = fuse.atime;
     _ = fuse.codec;
     _ = fuse.geometry;
     _ = fuse.mount_options;

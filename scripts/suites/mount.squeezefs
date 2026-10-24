@@ -130,9 +130,12 @@ for it in "${items[@]}"; do
   case "$it" in
     ""|rw|defaults|auto|noauto|user|nouser|owner|group|_netdev|nofail|loop) ;;
     # mount(8)'s atime family reaches a helper as words (util-linux 2.42:
-    # generic/338's `-o strictatime`); the daemon stamps no atime on a read
-    # (the ledger's `noatime` class), so none of them changes anything.
-    atime|noatime|diratime|nodiratime|relatime|norelatime|strictatime|nostrictatime|lazytime|nolazytime) ;;
+    # generic/003's `-o relatime`, `nodiratime`, `noatime`, `strictatime`):
+    # they are the KERNEL MOUNT's flags and the daemon reads its posture
+    # back from them (charter §4 "Access time"), so they pass through to
+    # `squeezefs mount` — except `norelatime`, a word the kernel has no
+    # flag for (MS_RELATIME is the default it ignores).
+    norelatime) ;;
     *) pass+=("$it") ;;
   esac
 done

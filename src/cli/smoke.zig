@@ -3633,6 +3633,84 @@ test "smoke: A JOINED MEMBER'S APPEND TO ANOTHER MEMBER'S FILE IS READ BACK BYTE
     try foreignAppendRow(false);
 }
 
+test "smoke: ALTERNATING APPENDS FROM TWO MEMBERS TO ONE FILE LOSE NOTHING — supervised (the write cache): A (the manager) holds `own/log` (5 MiB, synced: striped) and `own/small` (6 B, unsynced); eight rounds of B `stat` + `echo >>` + `stat` (a fresh grant) then A `stat` + `echo >>` on both — B's grant stands across A's appends, so A's parked claim must land before A's ack (never B at a stale EOF); both files byte-exact against a mirror through both mounts at once and after both remount; A landed its watched extensions; fsck --offline --scrub 0 findings; no tripwire on either member" {
+    try alternatingAppendRow(true);
+}
+
+test "smoke: ALTERNATING APPENDS FROM TWO MEMBERS TO ONE FILE LOSE NOTHING — foreground (no write cache, decision 0003 §BR.6): the same eight rounds on both files — byte-exact through both mounts at once and after both remount; fsck --offline --scrub 0 findings; no tripwire on either member" {
+    try alternatingAppendRow(false);
+}
+
+/// The alternating-append row in one posture (`window.sh`'s shape: B's
+/// grant stands while A's own append parks its claim).
+fn alternatingAppendRow(write_cache: bool) !void {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    try rig.env.put("SQUEEZEFS_MW_BIND", "127.0.0.1:0");
+    try rig.formatSet(write_cache);
+    try rig.mountAsSet(&.{});
+    _ = try rig.awaitReady(0);
+    const b = try Peer.init(rig, "b");
+    defer b.deinit();
+    try b.spawnAsSet(&.{});
+    _ = try b.awaitReady();
+    {
+        var sb: [1024]u8 = undefined;
+        const script = try std.fmt.bufPrint(&sb,
+            \\m="$1/m"; b="{s}"; mkdir own "$m"
+            \\head -c 5242880 /dev/urandom > "$m/log"; cp "$m/log" own/log; sync -d own/log
+            \\printf 'start\n' > "$m/small"; cp "$m/small" own/small
+            \\i=1; while [ $i -le 8 ]; do
+            \\  for f in log small; do
+            \\    stat -c %s "$b/own/$f" > /dev/null; echo "b-line-$i" >> "$b/own/$f"; echo "b-line-$i" >> "$m/$f"; stat -c %s "$b/own/$f" > /dev/null
+            \\    stat -c %s "own/$f" > /dev/null; echo "a-line-$i" >> "own/$f"; echo "a-line-$i" >> "$m/$f"
+            \\  done
+            \\  i=$((i + 1))
+            \\done
+            \\echo ok
+        , .{b.mp});
+        const out = try rig.onMount(script);
+        defer gpa.free(out);
+        try testing.expectEqualStrings("ok\n", out);
+    }
+    try expectMirrorOf(rig, b, "log small", "at once");
+    const landings = blk: {
+        const sa = try rig.stats();
+        defer gpa.free(sa);
+        break :blk numberAfter(sa, "\"fuse_write_watched_landings\":") orelse 0;
+    };
+    try testing.expect(landings >= 1);
+    try b.umount();
+    try b.expectCleanExit("B's clean unmount after the alternating appends");
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+    _ = try fsckClean(rig, "the alternating-append row");
+    const mark_a = try rig.logLen();
+    try rig.mountAsSet(&.{});
+    _ = try rig.awaitReady(mark_a);
+    const mark_b = try b.logLen();
+    try b.spawnAsSet(&.{});
+    _ = try b.awaitLog("ready: ", mark_b, ready_wait_ns);
+    try expectMirrorOf(rig, b, "log small", "after both remount");
+    try b.umount();
+    try b.expectCleanExit("B's clean unmount after the remount");
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+    _ = try fsckClean(rig, "the alternating-append row's remount");
+    {
+        const ta = try rig.readLog();
+        defer gpa.free(ta);
+        const tb = try b.readLog();
+        defer gpa.free(tb);
+        try testing.expect(std.mem.indexOf(u8, ta, "TRIPWIRE") == null);
+        try testing.expect(std.mem.indexOf(u8, tb, "TRIPWIRE") == null);
+    }
+    std.debug.print("smoke: alternating appends ({s}): eight rounds of B then A on both files byte-exact through both mounts at once and after both remount; A's watched landings {d}; fsck clean; no tripwire\n", .{ if (write_cache) "supervised" else "foreground", landings });
+}
+
 /// The foreign-write row (A JOINED MEMBER'S APPEND …) in one posture: A's
 /// files and their mirror in the work dir, B's writes applied to both, the
 /// mounts judged against the mirror before and after both remount.
@@ -3742,11 +3820,18 @@ fn foreignAppendRow(write_cache: bool) !void {
 /// Every file of the foreign-write row through B's mount and through A's,
 /// byte-exact against the mirror; then both mounts' must-stay-0 gauges.
 fn expectForeignMirror(rig: *Rig, b: *Peer, when: []const u8) !void {
+    return expectMirrorOf(rig, b, "f1 f2 f3 f4 f5 f6 f7 f8", when);
+}
+
+/// `files` (names under `own/`) through B's mount and through A's,
+/// byte-exact against the mirror in `$1/m`; then both must-stay-0 sets.
+fn expectMirrorOf(rig: *Rig, b: *Peer, files: []const u8, when: []const u8) !void {
     const gpa = rig.gpa;
-    const judge =
-        \\for f in f1 f2 f3 f4 f5 f6 f7 f8; do cmp -s "own/$f" "$1/m/$f" || echo "$f: $(stat -c %s "own/$f") B vs the mirror's $(stat -c %s "$1/m/$f") B — $(cmp "own/$f" "$1/m/$f" 2>&1 | head -1)"; done
+    var jb: [512]u8 = undefined;
+    const judge = try std.fmt.bufPrint(&jb,
+        \\for f in {s}; do cmp -s "own/$f" "$1/m/$f" || echo "$f: $(stat -c %s "own/$f") B vs the mirror's $(stat -c %s "$1/m/$f") B — $(cmp "own/$f" "$1/m/$f" 2>&1 | head -1)"; done
         \\echo judged
-    ;
+    , .{files});
     const ob = try b.onMount(judge);
     defer gpa.free(ob);
     const oa = try rig.onMount(judge);

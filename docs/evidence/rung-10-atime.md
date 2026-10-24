@@ -127,12 +127,34 @@ daemon as a touch, not a utimes; or a FUSE `update_time` op): an owner-call for
 the kernel keeps the cache on its own (`fuse_file_open`: `FOPEN_KEEP_CACHE` is the no-open
 default) and the strictatime open cannot drop it — the same gap there.
 
-## Counts
+## Counts (this box, 7.3.0-1.7-mainline-sqz, under the venue's other agents' load)
 
-- Unit filters: `atime` (incl. the new economy/kv_fs/mountinfo tests), `kv_fs`, `read_view`,
-  `times`, `mount option`, `verbs`: see the report.
-- The ATIME row: 10/10 (the loop's log `~/tmp/atime-loop.out`).
-- The read rows (`THE READ VIEW`, `RANGED READ`, `DIRECT ARM`), `zig build rails`, `zig fmt
-  --check`: see the report.
-- xfstests subset `generic/003 generic/192 generic/001 generic/013 generic/127`: see the
-  report (the harness admits one run per venue).
+- The ATIME row: red on `dev` `9d9e3ce` (`FAIL relatime first read atime: … is not later than …`);
+  10/10 on the branch at `3840749` (`~/tmp/atime-loop.out`), then 1/1 after each later
+  amendment (`7c9af55`, `ff150a3`, `85e4520`).
+- Unit filters, all green: `atime` 53, `Access time` 44, `relatime CANDIDATE` 41, `access stamp
+  alone` 41 (the backend test of the two exemptions), `kv_fs` 114, `read_view` 46, `times` 85,
+  `pending` 73, `mountinfo` 48, `mount option` 39, `flags and names` 40, `SetattrWire` 39,
+  `record_ship` 40, `two_holders` 62, `economy` 71, `verbs` 66, `conveyor` 93, `node_cache` 76,
+  `witness` 53, `lease` 365, `service` 54, `worker` 106, `fdwatch` 40, `readable` 58,
+  `journal_core` 64; the whole unit set once: `23/23 steps succeeded; 2945/3076 tests passed
+  (131 skipped)`, 0 failed. `zig build rails` 18/18; `zig fmt --check` clean.
+- The read rows: THE READ VIEW, THE DIRECT ARM, THE INTERCEPTION HOST, THE STAGED READ'S
+  IDENTITY WINDOW, KERNEL AIO, O_TRUNC UNDER SERVED OPENS — pass. THE READ VIEW and THE DIRECT
+  ARM each caught a defect of the first cut (a landed Δatime staled the view and bumped the
+  layout lease epoch: `hits 1023 < 1024`, `il_lease_asks` 3 ≠ 2) — the two exemptions above.
+- xfstests subset `generic/003 generic/192 generic/001 generic/013 generic/127`: run 1 on
+  `3840749` stopped at generic/003's one line (`access time has not been updated after accessing
+  file3 third time` — the strictatime open, above); run 2 on `ff150a3`+the hint:
+  `check rc=0, ran 5, not run 0, failed 0, 72 s wall (Passed all 5 tests)`
+  (`/build/tmp/suites-fstests-20261023-233447-690333`; the `ledger rc 3` after it is the
+  subset's stale-row artifact, every ledger row being absent from a 5-test run). The two
+  ledger rows had left `docs/gates/fstests-exceptions.md` on `dev` already (`f25fe2b`).
+- `rr4k-q32j4` before/after: NOT measured — the venue carried a full gate, three agents' smoke
+  loops and the harness (load 28, Tctl 82 °C) throughout; owed on a cooled, quiet host:
+  `sudo MX_RUNTIME=20 MX_ROWS='rr4k-q32j4' scripts/perf/quiet.sh ram-sqz atime-a` on `dev`,
+  then on this branch, A-B-B-A. The per-op addition on the hot read path: in `kv_fs.read` one
+  byte load and three compares beside the record the handler already read; on the worker's
+  served probe and direct leg, and the IPC fast path, one `localOf` and one relaxed load of a
+  per-stripe read-mostly word (the hint) — the lock and its cache line only once per drain tick
+  per file.

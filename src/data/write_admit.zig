@@ -3955,6 +3955,35 @@ test "the parked-buffer gate, the wall with supply VISIBLE and no space refusal 
     try testing.expect(w.wp.table.has(1, 8));
 }
 
+// Linux's rule for a regular file: a write that transferred some bytes
+// returns the count transferred, and the error surfaces on the next call —
+// and the kernel's FUSE write honours it (`fuse_perform_write` adds the
+// reply's `size` and returns the bytes so far on a short reply). A write
+// whose second piece met the gate's answer had already recorded its first:
+// answering the error lied about bytes that are the file's.
+test "a write whose later piece is answered at the gate (the stall answer) after an earlier piece landed returns the SHORT count — the landed prefix is the write's, its size claim ends there; the error is the next call's" {
+    const io = testing.io;
+    const w = try World.init(testing.allocator, .sync_inline, false);
+    defer w.deinit(testing.allocator);
+    w.wp.setStallAnswerNs(0);
+    // Seven parked partials: the eighth parked piece fills the cap.
+    for (0..7) |b| try parkHalf(w, io, 50, @intCast(b), @intCast(b + 1));
+    w.f.dev.setFailWrites(std.math.maxInt(u32), error.InputOutput);
+    defer w.f.dev.setFailWrites(0, error.InputOutput);
+    var payload: [wt.BS]u8 align(4096) = undefined;
+    fill(&payload, 0x77);
+    const off: u64 = 7 * wt.BS + wt.BS / 2;
+    log.testing.expectErrorLogs(1);
+    const o = try w.wp.write(io, .{ .ino = 50, .offset = off, .payload = .{ .bytes = &payload }, .class = .entire_op, .file = World.striped(7 * wt.BS) });
+    try log.testing.expectAllFired();
+    try testing.expectEqual(@as(u64, wt.BS / 2), o.written);
+    try testing.expectEqual(off + wt.BS / 2, o.size_claim);
+    try testing.expect(w.wp.table.has(50, 7));
+    try testing.expect(!w.wp.table.has(50, 8));
+    // The next call (the rest) meets the same answer: the error is its.
+    try testing.expectError(error.InputOutput, w.wp.write(io, .{ .ino = 50, .offset = off + wt.BS / 2, .payload = .{ .bytes = payload[wt.BS / 2 ..] }, .class = .entire_op, .file = World.striped(off + wt.BS / 2) }));
+}
+
 /// A placed-sever registry of ONE assembly (the interception host's face,
 /// `write_admit.PlacedSeam`): `take` seals it for adoption (once, under the
 /// pointer proof) and marks its token adopted.

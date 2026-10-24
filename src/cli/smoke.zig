@@ -7351,7 +7351,7 @@ test "smoke: A MOUNT THAT RACES THE PREVIOUS UNMOUNT WAITS, THEN SERVES (xfstest
     _ = try fsckClean(rig, "the raced unmount cycle (symmetric)");
 }
 
-test "smoke: THE REPLAY PROOF (charter §5.2 the ack point, decision 0003 §BB) — a `--daemon --supervise` mount under the landing-hold seam acks creates whose journal writes are never issued; kill -9 the daemon: the supervisor replays the journal tail to the device, barriers, and only then releases the writer guard; fsck clean; after the remount every acked create is present; the same creates on a FOREGROUND mount (no supervisor) are gone after its kill — the power-cut window; fsck clean" {
+test "smoke: THE REPLAY PROOF (charter §5.2 the ack point, decision 0003 §BB) — a `--daemon --supervise` mount under the landing-hold seam acks creates whose journal writes are never issued; kill -9 the daemon: the supervisor replays the journal tail to the device, barriers, and only then releases the writer guard; fsck clean; after the remount every acked create is present; the same creates on a FOREGROUND mount (no supervisor) are gone after its kill — the power-cut window; fsck clean; the cadence's times drain of the directory's parked stamp answers under the held landing (a commit of this mount's own, acked at its apply: drain commits ≥ 1, nothing parked), the directory's next create is served, and the remount reads the drained mtime (red on dev: the drain held the directory's exclusive guard until a landing that never came — under load its 50 ms tick fell between `touch d/x d/y`'s creates and the second parked for good, HUNG TEST)" {
     const io = testing.io;
     if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
     const gpa = testing.allocator;
@@ -7373,13 +7373,43 @@ test "smoke: THE REPLAY PROOF (charter §5.2 the ack point, decision 0003 §BB) 
     defer gpa.free(text);
     const ready_i = std.mem.indexOf(u8, text, "ready: ") orelse return error.NoReadyLine;
     const pid: linux.pid_t = @intCast(numberAfter(text[ready_i..], "(pid ") orelse return error.NoPid);
+    // A failed step before the kill leaves no daemon behind (its supervisor
+    // replays and exits on the death).
+    var daemon_live = true;
+    defer if (daemon_live) {
+        _ = linux.kill(pid, .KILL);
+    };
     try testing.expect(std.mem.indexOf(u8, text, "journal tails: 1 volume(s) handed to the supervisor") != null);
     _ = try rig.awaitLog("supervisor: watching daemon ", ready_i, ready_wait_ns);
     {
-        const out = try rig.shOk(rig.mp, "mkdir d && touch d/x d/y && echo hello > d/z && test -e d/x && echo ok");
+        // d's stamps in the past: the create's parked stamp advances the
+        // stored record, so the drain has a delta to commit.
+        const out = try rig.shOk(rig.mp, "mkdir d && touch -d @1000000000 d && touch d/x && echo ok");
+        defer gpa.free(out);
+    }
+    // The cadence's drain of d's parked stamp (one flush interval later):
+    // answered under the held landing, the stamp retired.
+    {
+        const deadline = clock.monotonicNs() + 20 * std.time.ns_per_s;
+        while (true) {
+            const st = try rig.stats();
+            defer gpa.free(st);
+            const drains = numberAfter(st, "\"meta_kv_times_echo_drain_commits\":") orelse 0;
+            const parked = numberAfter(st, "\"meta_kv_times_echo_pending\":") orelse 1;
+            if (drains >= 1 and parked == 0) break;
+            if (clock.monotonicNs() >= deadline) {
+                std.debug.print("\nsmoke[replay]: the times drain never answered under the held landing (drain commits {d}, parked {d}): its window waits for a landing that never comes, d's exclusive guard with it\n", .{ drains, parked });
+                return error.TimesDrainParkedOnLanding;
+            }
+            sleepMs(20);
+        }
+    }
+    {
+        const out = try rig.shOk(rig.mp, "touch d/y && echo hello > d/z && test -e d/x && echo ok");
         defer gpa.free(out);
     }
     // Acked, never landed: the tail holds them.
+    daemon_live = false;
     _ = linux.kill(pid, .KILL);
     const replay_i = try rig.awaitLog("supervisor: journal tail of volume 0 (", ready_i, 20 * std.time.ns_per_s);
     const released_i = try rig.awaitLog("supervisor: writer guard released on 1 volume(s) after the replay", ready_i, 20 * std.time.ns_per_s);
@@ -7403,7 +7433,7 @@ test "smoke: THE REPLAY PROOF (charter §5.2 the ack point, decision 0003 §BB) 
         _ = try rig.awaitReady(mark);
     }
     {
-        const out = try rig.shOk(rig.mp, "test -d d && test -e d/x && test -e d/y && test \"$(cat d/z)\" = hello && echo present");
+        const out = try rig.shOk(rig.mp, "test -d d && test -e d/x && test -e d/y && test \"$(cat d/z)\" = hello && test \"$(stat -c %Y d)\" -gt 1000000000 && echo present");
         defer gpa.free(out);
         try testing.expect(std.mem.indexOf(u8, out, "present") != null);
     }

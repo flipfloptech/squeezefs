@@ -2003,3 +2003,28 @@ test "the times drain cadence on a FAILED store (fstests generic/475 under dm-er
     cadence.tick();
     try testing.expectEqual(failed0 + 100, kv_fs.fuse_write_times_drain_failed_ticks.load());
 }
+
+// THE REPLAY PROOF under load: the cadence's drain of a directory's parked
+// stamp held the directory's exclusive inode guard until its window
+// LANDED (a tool's commit is acked at the landing); under the landing-hold
+// seam that is never, and the next create in the directory parked 115 s on
+// the guard. The stamps are the ones this mount's kernel already holds
+// through the fold — the drain the fsync/syncfs paths run over the same
+// stamps is a kernel-origin commit, acked at its apply.
+test "the times drain cadence commits as this mount's kernel's own op — acked at its apply like the syncfs drain of the same stamps, never its exclusive inode guards held across a journal landing (red: a tool's commit, acked at the landing — under the landing-hold seam a create into the drained directory parked on its guard for good)" {
+    const kv_fs = handler.kv_fs;
+    var store = try kv_fs.MemStore.init(testing.allocator);
+    defer store.deinit();
+    var nodata: kv_fs.NoData = .{};
+    var fs = try kv_fs.MemFs.mount(testing.allocator, testing.io, &store, &nodata, .{ .dlm_stripes = 64 });
+    defer fs.unmount();
+    var cadence: TimesDrainCadenceOf(kv_fs.MemFs) = .{ .fs = &fs, .io = testing.io, .interval_ns = 0, .meta_uri = "sqmeta:///dev/null" };
+    const root = try kv_fs.MemFs.localOf(1);
+    const stamp: u64 = @bitCast(clock.realtimeCoarseNs());
+    _ = try fs.pending.park(root, stamp, stamp);
+    const commits0 = store.commits;
+    cadence.tick();
+    try testing.expectEqual(commits0 + 1, store.commits);
+    try testing.expectEqual(@as(u64, 0), fs.pending.len());
+    try testing.expect(store.last_kernel_origin);
+}

@@ -636,6 +636,19 @@ fn alive(pid: linux.pid_t) bool {
     return text[close + 2] != 'Z' and text[close + 2] != 'X';
 }
 
+/// The parent of `pid` (`/proc/<pid>/stat`'s fourth field): a supervised
+/// daemon's supervisor.
+fn ppidOf(pid: linux.pid_t) ?linux.pid_t {
+    var pb: [64]u8 = undefined;
+    var buf: [512]u8 = undefined;
+    const path = std.fmt.bufPrint(&pb, "/proc/{d}/stat", .{pid}) catch return null;
+    const text = Io.Dir.cwd().readFile(testing.io, path, &buf) catch return null;
+    const close = std.mem.lastIndexOfScalar(u8, text, ')') orelse return null;
+    var it = std.mem.tokenizeScalar(u8, text[close + 1 ..], ' ');
+    _ = it.next() orelse return null;
+    return std.fmt.parseInt(linux.pid_t, it.next() orelse return null, 10) catch null;
+}
+
 /// A daemon the test did not kill ended by a signal: the signal's name and
 /// the log's tail — a panic's trace starts no `error(` line and the log
 /// dies with the work dir, so this is the only record a failing row keeps
@@ -8487,6 +8500,144 @@ test "smoke: A FAILED VOLUME'S DAEMON SERVES EIO UNTIL ITS UNMOUNT AND NEVER DIE
     try testing.expect(lines_once);
 }
 
+/// Who replays a held journal tail once the device answers again: the
+/// supervisor's own retry, or — the supervisor gone — the volume's next
+/// mount, from the held copy.
+const HeldTailArm = enum { supervisor_retry, successor };
+
+test "smoke: A FAILED REPLAY'S JOURNAL TAIL IS HELD, NEVER DISCARDED (charter §5.2, decision 0003 §BQ) — a `--daemon --supervise` set over one device-mapper device, under the landing-hold seam, acks creates whose journal writes never issue; the table flips to `error`; kill -9: the supervisor's replay FAILS and the tail is HELD (its copy under the held dir before the guard drops); (a) the supervisor alive, the table restored: its retry lands the tail, removes the copy and exits — the next mount reads every acked create; (b) the supervisor KILLED with the tail held: the copy stays, the table restored, the next mount replays it before it admits writes (`held_tail_replays` 1) — every acked create present, the copy gone; fsck clean after each (red on 885727b: `replay FAILED (…) — acked metadata of the flush window may be lost`, the tail discarded, the creates gone after the device recovered)" {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    if (DmErrorSet.venueMissing()) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    var dm = try DmErrorSet.up(rig);
+    defer dm.deinit();
+    if (rig.log_file == null) rig.log_file = try openLogAppend(rig.log_path);
+    {
+        const r = try rig.squeezefs(&.{ "format", dm.meta_uri, dm.data_uri });
+        defer rig.freeRun(r);
+        if (!r.term.success()) std.debug.print("\nformat: {s}\n", .{r.stderr});
+        try testing.expect(r.term.success());
+    }
+    var dir_buf: [linux.PATH_MAX]u8 = undefined;
+    const held_dir = try std.fmt.bufPrint(&dir_buf, "{s}/held-tails", .{rig.work});
+    try rig.env.put("SQUEEZEFS_TEST_JOURNAL_TAIL_DIR", held_dir);
+    // The retry's cadence: a quarter second, not a watchdog tick.
+    try rig.env.put("SQUEEZEFS_TEST_SUPERVISOR_PROBE_MS", "250");
+    // Nothing ever lands to end a §L hold.
+    try rig.env.put("SQUEEZEFS_META_WINDOW_HOLD", "none");
+    for ([_]HeldTailArm{ .supervisor_retry, .successor }) |arm| {
+        try rig.env.put("SQUEEZEFS_TEST_JOURNAL_HOLD_LANDING", "1");
+        const mark = try rig.logLen();
+        const pid = blk: {
+            const r = try rig.squeezefs(&.{ "mount", "--daemon", "--supervise", "--log-file", rig.log_path, dm.meta_uri, rig.mp });
+            defer rig.freeRun(r);
+            if (!r.term.success()) std.debug.print("\n{t}: daemon mount: {s}\n", .{ arm, r.stderr });
+            try testing.expect(r.term.success());
+            const ready_i = try rig.awaitLog("ready: ", mark, ready_wait_ns);
+            const text = try rig.readLog();
+            defer gpa.free(text);
+            break :blk @as(linux.pid_t, @intCast(numberAfter(text[ready_i..], "(pid ") orelse return error.NoPid));
+        };
+        const sup = ppidOf(pid) orelse return error.NoSupervisor;
+        var daemon_live = true;
+        defer if (daemon_live) {
+            _ = linux.kill(pid, .KILL);
+        };
+        _ = try rig.awaitLog("supervisor: watching daemon ", mark, ready_wait_ns);
+        var script: [256]u8 = undefined;
+        {
+            const out = try rig.shOk(rig.mp, try std.fmt.bufPrint(&script, "mkdir {t} && touch {t}/a {t}/b && echo hello > {t}/c && test -e {t}/a && echo ok", .{ arm, arm, arm, arm, arm }));
+            defer gpa.free(out);
+        }
+        // Acked, never landed; the device fails; the daemon dies.
+        try dm.load(true);
+        daemon_live = false;
+        _ = linux.kill(pid, .KILL);
+        const failed_i = try rig.awaitLog("replay FAILED", mark, 20 * std.time.ns_per_s);
+        _ = try rig.awaitLog("); done", failed_i, 20 * std.time.ns_per_s);
+        try rig.umountAfterKill();
+        _ = rig.env.swapRemove("SQUEEZEFS_TEST_JOURNAL_HOLD_LANDING");
+        var copy_held = false;
+        switch (arm) {
+            .supervisor_retry => {
+                try dm.load(false);
+                const deadline = clock.monotonicNs() + 30 * std.time.ns_per_s;
+                while (alive(sup) and clock.monotonicNs() < deadline) sleepMs(20);
+                try testing.expect(!alive(sup));
+            },
+            .successor => {
+                _ = linux.kill(sup, .KILL);
+                const deadline = clock.monotonicNs() + 10 * std.time.ns_per_s;
+                while (alive(sup) and clock.monotonicNs() < deadline) sleepMs(20);
+                try testing.expect(!alive(sup));
+                const ls = try rig.shOk(rig.work, try std.fmt.bufPrint(&script, "ls {s} 2>/dev/null | grep -c '\\.jtail$' || true", .{held_dir}));
+                defer gpa.free(ls);
+                copy_held = std.mem.eql(u8, std.mem.trim(u8, ls, " \n"), "1");
+                try dm.load(false);
+            },
+        }
+        // The next mount: every acked create present.
+        const mark2 = try rig.logLen();
+        const pid2 = blk: {
+            const r = try rig.squeezefs(&.{ "mount", "--daemon", "--supervise", "--log-file", rig.log_path, dm.meta_uri, rig.mp });
+            defer rig.freeRun(r);
+            if (!r.term.success()) {
+                const t = try rig.readLog();
+                defer gpa.free(t);
+                std.debug.print("\n{t}: the next mount: {s}\n--- its log ---\n{s}\n", .{ arm, r.stderr, t[@min(mark, t.len)..] });
+                return error.MountFailed;
+            }
+            const ready_i = try rig.awaitLog("ready: ", mark2, ready_wait_ns);
+            const text = try rig.readLog();
+            defer gpa.free(text);
+            break :blk @as(linux.pid_t, @intCast(numberAfter(text[ready_i..], "(pid ") orelse return error.NoPid));
+        };
+        {
+            const out = try rig.shOk(rig.mp, try std.fmt.bufPrint(&script, "if test -e {t}/a && test -e {t}/b && test \"$(cat {t}/c 2>/dev/null)\" = hello; then echo present; else echo lost; fi", .{ arm, arm, arm }));
+            defer gpa.free(out);
+            const t = try rig.readLog();
+            defer gpa.free(t);
+            const line_at = std.mem.indexOf(u8, t[mark..], "replay FAILED").? + mark;
+            const line = t[line_at..];
+            std.debug.print("\nsmoke[held tail, {t}]: …{s}\nsmoke[held tail, {t}]: the acked creates after the device recovered: {s}", .{ arm, line[0 .. std.mem.indexOfScalar(u8, line, '\n') orelse line.len], arm, out });
+            if (std.mem.indexOf(u8, out, "present") == null) {
+                std.debug.print("--- the log since the arm's mount ---\n{s}\n", .{t[mark..]});
+                return error.AckedMetadataLost;
+            }
+        }
+        switch (arm) {
+            .supervisor_retry => {
+                const t = try rig.readLog();
+                defer gpa.free(t);
+                try testing.expect(std.mem.indexOf(u8, t[mark..mark2], "replayed on retry") != null);
+            },
+            .successor => {
+                try testing.expect(copy_held);
+                const st = try rig.stats();
+                defer gpa.free(st);
+                try testing.expectEqual(@as(?u64, 1), numberAfter(st, "\"held_tail_replays\":"));
+            },
+        }
+        {
+            const ls = try rig.shOk(rig.work, try std.fmt.bufPrint(&script, "ls {s} 2>/dev/null | grep -c '\\.jtail$' || true", .{held_dir}));
+            defer gpa.free(ls);
+            try testing.expectEqualStrings("0", std.mem.trim(u8, ls, " \n"));
+        }
+        try umountDaemon(rig, pid2);
+        {
+            const r = try rig.squeezefs(&.{ "fsck", "--offline", "--scrub", dm.meta_uri });
+            defer rig.freeRun(r);
+            if (!r.term.success() or std.mem.indexOf(u8, r.stdout, "findings: 0 (clean)") == null) {
+                std.debug.print("\n--- fsck --offline after the held tail ({t}) ({f}) ---\n{s}\n--- stderr ---\n{s}\n", .{ arm, r.term, r.stdout, r.stderr });
+                return error.FsckNotClean;
+            }
+        }
+    }
+}
+
 /// A process whose cwd is the mount (the holder of the busy-umount rows):
 /// `sleep` parks with the mount root as its cwd until killed.
 const Holder = struct {
@@ -10668,6 +10819,144 @@ fn remountAfterKill(rig: *Rig, recovered: ?Recovery) !Recovery {
         return error.DriftAfterKill;
     }
     return recovered orelse try recoveryOf(seg);
+}
+
+/// The unsupervised row's files: `unsup_files` × `unsup_mib` MiB, each a
+/// slice of the image, written and closed, never synced — 3 MiB, so the
+/// old posture staged each whole (a block's worth at most).
+const unsup_files: usize = 8;
+const unsup_mib: u64 = 3;
+
+/// One `mount` of the rig's set under `env_pct` (null: the knob unset) with
+/// `argv_head` before the URI, bounded by `timeout` (a foreground mount
+/// that is NOT refused would serve forever): its result.
+fn mountUnderKnob(rig: *Rig, argv_head: []const []const u8, env_pct: ?[]const u8) !std.process.RunResult {
+    var argv: [16][]const u8 = undefined;
+    var n: usize = 0;
+    for ([_][]const u8{ "timeout", "-s", "KILL", "20", rig.bin, "mount" }) |a| {
+        argv[n] = a;
+        n += 1;
+    }
+    for (argv_head) |a| {
+        argv[n] = a;
+        n += 1;
+    }
+    argv[n] = rig.meta_uri;
+    argv[n + 1] = rig.mp;
+    n += 2;
+    if (env_pct) |v| try rig.env.put("SQUEEZEFS_WRITE_CACHE_PCT", v) else _ = rig.env.swapRemove("SQUEEZEFS_WRITE_CACHE_PCT");
+    defer _ = rig.env.swapRemove("SQUEEZEFS_WRITE_CACHE_PCT");
+    return std.process.run(rig.gpa, rig.io, .{ .argv = argv[0..n], .environ_map = &rig.env });
+}
+
+test "smoke: NO WRITE CACHE WITHOUT A SUPERVISOR (charter §6.1, decision 0003 §BQ.6) — a FOREGROUND mount of a set in the write cache's default posture runs with the write cache OFF, said once at mount (`.stats`: data_staging_on 0, write_cache_off_unsupervised 1); 8 files of 3 MiB written and closed, never synced, their write-back custody drained and the directory fsync'd (every size durable) → kill -9 → fsck clean → remount: every file whole, byte for byte — no size ahead of its bytes; `SQUEEZEFS_WRITE_CACHE_PCT=25` on a foreground mount and on `--daemon` without `--supervise` is REFUSED at startup naming the reason, nothing mounted; the same knob under `--daemon --supervise` mounts with the write cache ON (red on 885727b: the foreground mount staged every file in a ring that died with it — the files read zeros under their durable 3 MiB sizes — and both unsupervised mounts with the knob came up)" {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    try rig.formatSet(true);
+    try rig.createImage();
+    const image = try Io.Dir.cwd().openFile(io, rig.image, .{});
+    defer image.close(io);
+    // Every arm is judged at the end (each red names itself first).
+    // 1. The foreground mount: the write cache off, said once.
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(0);
+    const posture = blk: {
+        const st = try rig.stats();
+        defer gpa.free(st);
+        const text = try rig.readLog();
+        defer gpa.free(text);
+        break :blk .{ .on = numberAfter(st, "\"data_staging_on\":"), .off = numberAfter(st, "\"write_cache_off_unsupervised\":"), .said = std.mem.count(u8, text, "no supervisor holds a write cache's ring: the write cache is off") };
+    };
+    std.debug.print("\nsmoke[unsupervised]: data_staging_on {?d}, write_cache_off_unsupervised {?d}, said {d} time(s)\n", .{ posture.on, posture.off, posture.said });
+    {
+        var script: [256]u8 = undefined;
+        const out = try rig.onMount(try std.fmt.bufPrint(&script, "i=0; while [ $i -lt {d} ]; do dd if=\"$1/image\" of=f$i bs=1M skip=$((i * {d})) count={d} status=none; i=$((i + 1)); done; echo ok", .{ unsup_files, unsup_mib, unsup_mib }));
+        defer gpa.free(out);
+    }
+    // The write-back custody lands within its bound and the extensions'
+    // size claims drain after their bytes (§AL.5): wait for the
+    // observables, then make every committed size durable with the
+    // directory's fsync (no file is synced: no promotion, no sync point).
+    {
+        const deadline = clock.monotonicNs() + 30 * std.time.ns_per_s;
+        while (true) {
+            const st = try rig.stats();
+            defer gpa.free(st);
+            const parked = (numberAfter(st, "\"parked_buffers\":") orelse 0) + (numberAfter(st, "\"parked_extent_bytes\":") orelse 0) + (numberAfter(st, "\"overlay_open\":") orelse 0);
+            const pending = numberAfter(st, "\"meta_kv_times_echo_pending\":") orelse 0;
+            if (parked == 0 and pending == 0) break;
+            if (clock.monotonicNs() >= deadline) {
+                std.debug.print("\nsmoke[unsupervised]: the write-back custody never drained (parked {d}, pending {d})\n", .{ parked, pending });
+                return error.CustodyNotDrained;
+            }
+            sleepMs(20);
+        }
+        const out = try rig.onMount("python3 -c 'import os; fd = os.open(\".\", os.O_RDONLY); os.fsync(fd)' && echo ok");
+        defer gpa.free(out);
+    }
+    rig.killed = true;
+    _ = linux.kill(rig.child_pid, .KILL);
+    try testing.expectEqual(std.process.Child.Term{ .signal = .KILL }, try rig.waitChild());
+    try rig.umountAfterKill();
+    _ = try fsckClean(rig, "the unsupervised kill");
+    {
+        const mark = try rig.logLen();
+        try rig.spawnMount(&.{});
+        _ = try rig.awaitReady(mark);
+    }
+    const whole = census: {
+        var dir = try Io.Dir.cwd().openDir(io, rig.mp, .{});
+        defer dir.close(io);
+        var whole: usize = 0;
+        for (0..unsup_files) |i| {
+            var nb: [16]u8 = undefined;
+            const name = try std.fmt.bufPrint(&nb, "f{d}", .{i});
+            const c = try pageCensus(gpa, io, dir, name, image, (i * unsup_mib) << 20, unsup_mib << 20);
+            if (c.size == unsup_mib << 20 and c.holes == 0) whole += 1 else std.debug.print("\nsmoke[unsupervised]: {s} after the kill: {d} B, {d} pages exact, {d} zero pages under its size\n", .{ name, c.size, c.exact, c.holes });
+        }
+        std.debug.print("smoke[unsupervised]: after kill -9 of the foreground mount: {d} of {d} acked, closed files whole\n", .{ whole, unsup_files });
+        break :census whole;
+    };
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+    _ = try fsckClean(rig, "the unsupervised arm's clean unmount");
+    // 2. The knob by name without a supervisor: refused, nothing mounted.
+    var refused: usize = 0;
+    for ([_][]const []const u8{ &.{}, &.{ "--daemon", "--log-file", rig.log_path } }) |head| {
+        const r = try mountUnderKnob(rig, head, "25");
+        defer rig.freeRun(r);
+        const mounted = try fuseMountsOf(gpa, io, rig.mp);
+        std.debug.print("smoke[unsupervised]: SQUEEZEFS_WRITE_CACHE_PCT=25 `mount{s}`: {f}, {d} mount(s): {s}\n", .{ if (head.len == 0) "" else " --daemon", r.term, mounted, r.stderr });
+        if (mounted != 0) {
+            const u = try rig.squeezefs(&.{ "umount", rig.mp });
+            rig.freeRun(u);
+            _ = linux.umount2(rig.mp.ptr, linux.MNT.DETACH);
+        }
+        if (!r.term.success() and mounted == 0 and std.mem.indexOf(u8, r.stderr, "no supervisor to hold its ring") != null) refused += 1;
+    }
+    try testing.expectEqual(@as(?u64, 0), posture.on);
+    try testing.expectEqual(@as(?u64, 1), posture.off);
+    try testing.expectEqual(@as(usize, 1), posture.said);
+    try testing.expectEqual(unsup_files, whole);
+    try testing.expectEqual(@as(usize, 2), refused);
+    // 3. Under a supervisor the same knob mounts with the write cache on.
+    {
+        try rig.env.put("SQUEEZEFS_WRITE_CACHE_PCT", "25");
+        defer _ = rig.env.swapRemove("SQUEEZEFS_WRITE_CACHE_PCT");
+        const mark = try rig.logLen();
+        const pid = try daemonMountReady(rig, mark);
+        {
+            const st = try rig.stats();
+            defer gpa.free(st);
+            try testing.expectEqual(@as(?u64, 1), numberAfter(st, "\"data_staging_on\":"));
+            try testing.expectEqual(@as(?u64, 0), numberAfter(st, "\"write_cache_off_unsupervised\":"));
+        }
+        try umountDaemon(rig, pid);
+    }
+    _ = try fsckClean(rig, "the supervised arm");
 }
 
 test "smoke: THE KILL MATRIX — kill -9 at 50/100/150 MiB of a 200 MiB dd and mid 8-way cp storm → fsck --offline clean → remount → every fsync'd file byte-exact, every page of an in-flight file exact or a hole, C8 zero drift, C2 nothing leaked or lost, rm → df baseline → fsck clean → status" {

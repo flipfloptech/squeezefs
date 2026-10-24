@@ -61,7 +61,12 @@
 //! windows to the device, in seq order, then `fsync`) and only then closes
 //! the guard fds: the `flock`'s open file description is shared, so the
 //! dead daemon's claim holds until the device is complete, and a successor
-//! waits it out (`guard.proc.flockExclusive`'s bound).
+//! waits it out (`guard.proc.flockExclusive`'s bound). A replay the device
+//! REFUSES is held, never discarded (decision 0003 §BQ): the tail's written
+//! slots are copied to its held file (`journal_tail.persistHeld`) before
+//! the guards drop, the volume's next writer replays that copy before it
+//! reads its ring, and this process retries it every tick under a
+//! non-blocking writer lock until it lands — then exits.
 
 const std = @import("std");
 const fuzzkit = @import("../core/fuzzkit.zig");
@@ -72,6 +77,12 @@ const knobs = @import("../core/knobs.zig");
 const mountinfo = @import("../core/mountinfo.zig");
 const journal_tail = @import("../meta/journal_tail.zig");
 const staging = @import("../data/staging.zig");
+
+/// The supervisor's thread name: the observability contract's, and how a
+/// process census tells it from the daemon it shares the argv with (it
+/// outlives its daemon while it holds custody, childless —
+/// `umount.daemonByProcess`).
+pub const thread_comm = "sqz-supervise";
 
 pub const PROBE_INTERVAL_NS: u64 = 5 * std.time.ns_per_s;
 pub const HEARTBEAT_STALE_NS: u64 = 2 * PROBE_INTERVAL_NS;
@@ -87,12 +98,16 @@ pub const Policy = struct {
     unresponsive_after_ns: u64 = UNRESPONSIVE_NS,
     heartbeat_stale_ns: u64 = HEARTBEAT_STALE_NS,
     write_abort: bool = true,
+    /// Where a failed replay's tail is held (`journal_tail.HeldDir`;
+    /// empty = the host's runtime dir).
+    held_dir: journal_tail.HeldDir = .{},
 
     /// The policy a `--supervise` mount runs: the constants, the probe
-    /// cadence `SQUEEZEFS_TEST_SUPERVISOR_PROBE_MS` when a suite sets it.
+    /// cadence `SQUEEZEFS_TEST_SUPERVISOR_PROBE_MS` when a suite sets it,
+    /// the held tails' directory the mount's successor will read.
     pub fn fromEnv(env: *const std.process.Environ.Map) Policy {
         const ms = knobs.intKnob("SQUEEZEFS_TEST_SUPERVISOR_PROBE_MS", u64, env);
-        return .{ .probe_interval_ns = if (ms == 0) PROBE_INTERVAL_NS else ms * std.time.ns_per_ms };
+        return .{ .probe_interval_ns = if (ms == 0) PROBE_INTERVAL_NS else ms * std.time.ns_per_ms, .held_dir = journal_tail.HeldDir.fromEnv(env) };
     }
 };
 
@@ -234,8 +249,20 @@ pub const linux_loop = if (builtin.os.tag == .linux) struct {
     pub const Tails = struct {
         gpa: std.mem.Allocator,
         sock: ?linux.fd_t,
+        /// Where a failed replay's tail is held (the policy's; empty = the
+        /// host's runtime dir).
+        held_dir: journal_tail.HeldDir = .{},
         tails: std.ArrayList(struct { index: u16, fd: linux.fd_t }) = .empty,
         guards: std.ArrayList(linux.fd_t) = .empty,
+        /// Failed replays held as files (`journal_tail.persistHeld`): this
+        /// supervisor retries each under a non-blocking writer lock; the
+        /// volume's next writer replays what is left before it reads its
+        /// ring (decision 0003 §BQ).
+        held: std.ArrayList(HeldCopy) = .empty,
+        /// Failed replays that could not be held as files: the memfd kept
+        /// and the writer guards with it (no successor may open the volume
+        /// over them), retried here.
+        held_memfds: std.ArrayList(struct { index: u16, fd: linux.fd_t, attempts: u32 = 0 }) = .empty,
         write_cache: ?linux.fd_t = null,
         write_cache_claim: ?linux.fd_t = null,
         write_cache_drained: bool = false,
@@ -243,10 +270,27 @@ pub const linux_loop = if (builtin.os.tag == .linux) struct {
         /// The daemon's end closed (its death, or its exit): nothing more
         /// arrives; the queued frames were drained first.
         hup: bool = false,
+        /// The retry cadence of a held tail: the policy's probe interval
+        /// (one watchdog tick; a suite's seam may shorten it).
+        retry_ns: u64 = PROBE_INTERVAL_NS,
+
+        pub const HeldCopy = struct {
+            index: u16,
+            path: [journal_tail.PATH_CAP]u8,
+            len: usize,
+            attempts: u32 = 0,
+
+            fn pathZ(self: *HeldCopy) [:0]const u8 {
+                return self.path[0..self.len :0];
+            }
+        };
 
         pub fn deinit(self: *Tails) void {
             for (self.tails.items) |t| _ = linux.close(t.fd);
             self.tails.deinit(self.gpa);
+            for (self.held_memfds.items) |t| _ = linux.close(t.fd);
+            self.held_memfds.deinit(self.gpa);
+            self.held.deinit(self.gpa);
             self.releaseGuards();
             self.guards.deinit(self.gpa);
             self.dropWriteCache();
@@ -328,21 +372,141 @@ pub const linux_loop = if (builtin.os.tag == .linux) struct {
         }
 
         /// The daemon is dead: every tail to the device, in order, then the
-        /// guards released. Idempotent; logged per tail.
+        /// guards released. A tail whose replay FAILS is held, never
+        /// discarded (decision 0003 §BQ): copied into its held file BEFORE
+        /// the guards drop (so the volume's next writer, whose lock waits
+        /// for them, finds it), or — when it cannot be — kept here with the
+        /// guards. Idempotent; logged per tail.
         pub fn replayAndRelease(self: *Tails) void {
             self.drain();
             self.listenWriteCacheClaim();
+            const dir = self.heldDir();
             for (self.tails.items) |t| {
                 var path: [journal_tail.PATH_CAP]u8 = undefined;
                 var path_len: usize = 0;
-                if (journal_tail.linux_tail.replayFd(t.fd, &path, &path_len)) |r| {
+                if (journal_tail.linux_tail.replayFd(t.fd, .{}, &path, &path_len)) |r| {
                     log.info("supervisor: journal tail of volume {d} ({s}): {d} un-landed window(s), {d} bytes replayed and barriered ({d} slot(s) landed or empty)", .{ t.index, path[0..path_len], r.windows, r.bytes, r.skipped });
-                } else |e| {
-                    log.err("supervisor: journal tail of volume {d} ({s}): replay FAILED ({s}) — acked metadata of the flush window may be lost; fsck the volume before the next mount", .{ t.index, path[0..path_len], @errorName(e) });
-                }
+                    _ = linux.close(t.fd);
+                } else |e| self.holdFailed(t.index, t.fd, path[0..path_len], e, dir.slice());
+            }
+            self.tails.clearRetainingCapacity();
+            if (self.held_memfds.items.len != 0) {
+                log.err("supervisor: writer guard KEPT on {d} volume(s): {d} journal tail(s) that failed to replay could not be held as files — no mount may open those volumes over them; retrying every {d} ms (kill this process, pid {d}, to give them up and lose that metadata)", .{ self.guards.items.len, self.held_memfds.items.len, self.retry_ns / std.time.ns_per_ms, linux.getpid() });
+                return;
             }
             if (self.guards.items.len != 0) log.info("supervisor: writer guard released on {d} volume(s) after the replay", .{self.guards.items.len});
             self.releaseGuards();
+        }
+
+        /// A failed replay of `fd` (volume `index`, its device `dev`): held.
+        fn holdFailed(self: *Tails, index: u16, fd: linux.fd_t, dev: []const u8, e: anyerror, dir: []const u8) void {
+            if (!isFixedRing(fd)) {
+                // A joined ring has no lock of its own and its ring may be
+                // re-leased by the manager's ladder: no copy can be replayed
+                // safely later (decision 0003 §BQ.5, owed).
+                log.err("supervisor: journal tail of volume {d} ({s}): replay FAILED ({s}) — a JOINED ring's tail is not held (no successor law yet): acked metadata of the flush window may be lost; fsck the volume before the next mount", .{ index, dev, @errorName(e) });
+                _ = linux.close(fd);
+                return;
+            }
+            var hp: [journal_tail.PATH_CAP]u8 = undefined;
+            if (journal_tail.linux_tail.persistHeld(fd, dir, &hp)) |p| {
+                const copy_path = std.mem.sliceTo(&hp, 0);
+                log.err("supervisor: journal tail of volume {d} ({s}): replay FAILED ({s}) — HELD: {d} acked window(s) (record stamps {d}..{d}) copied to {s}; the volume's next mount replays it before it admits writes (and refuses to open while it cannot), and this supervisor retries every {d} ms until the device answers", .{ index, dev, @errorName(e), p.held.windows, p.held.seq_lo, p.held.seq_hi, copy_path, self.retry_ns / std.time.ns_per_ms });
+                var copy: HeldCopy = .{ .index = index, .path = undefined, .len = copy_path.len };
+                @memcpy(copy.path[0..copy_path.len], copy_path);
+                copy.path[copy_path.len] = 0;
+                if (self.held.append(self.gpa, copy)) {
+                    _ = linux.close(fd);
+                    return;
+                } else |_| {}
+                // Out of memory for the list: the copy stands for the next
+                // mount; this supervisor's retries of it are given up.
+                log.warn("supervisor: out of memory tracking {s} — no retries from here; the next mount replays it", .{copy_path});
+                _ = linux.close(fd);
+                return;
+            } else |pe| switch (pe) {
+                error.NothingHeld => {
+                    log.info("supervisor: journal tail of volume {d} ({s}): replay failed ({s}) with no window held — nothing acked to keep", .{ index, dev, @errorName(e) });
+                    _ = linux.close(fd);
+                    return;
+                },
+                else => {
+                    if (self.held_memfds.append(self.gpa, .{ .index = index, .fd = fd })) {
+                        log.err("supervisor: journal tail of volume {d} ({s}): replay FAILED ({s}) and the held copy under {s} could not be written ({s}) — kept in this supervisor with the volume's writer guard", .{ index, dev, @errorName(e), dir, @errorName(pe) });
+                    } else |_| {
+                        log.err("supervisor: journal tail of volume {d} ({s}): replay FAILED ({s}), no held copy ({s}), out of memory — acked metadata of the flush window is lost", .{ index, dev, @errorName(e), @errorName(pe) });
+                        _ = linux.close(fd);
+                    }
+                },
+            }
+        }
+
+        fn isFixedRing(fd: linux.fd_t) bool {
+            var hdr: journal_tail.Header = undefined;
+            const n = linux.pread(fd, std.mem.asBytes(&hdr), @sizeOf(journal_tail.Header), 0);
+            if (linux.errno(n) != .SUCCESS or n != @sizeOf(journal_tail.Header)) return true;
+            return hdr.ring != journal_tail.RING_JOINED;
+        }
+
+        fn heldDir(self: *const Tails) journal_tail.HeldDir {
+            return if (self.held_dir.len != 0) self.held_dir else journal_tail.HeldDir.runtime();
+        }
+
+        /// Anything still held for a successor or a retry.
+        pub fn holding(self: *const Tails) bool {
+            return self.held.items.len != 0 or self.held_memfds.items.len != 0 or self.write_cache != null;
+        }
+
+        /// One retry round over every held tail (decision 0003 §BQ.4).
+        /// Logged on the first failure of each and at every doubling of
+        /// its attempts.
+        pub fn retryHeld(self: *Tails) void {
+            var i: usize = 0;
+            while (i < self.held.items.len) {
+                const c = &self.held.items[i];
+                c.attempts += 1;
+                var dev: [journal_tail.PATH_CAP]u8 = undefined;
+                var dev_len: usize = 0;
+                switch (journal_tail.linux_tail.retryHeld(c.pathZ(), &dev, &dev_len)) {
+                    .landed => |r| {
+                        log.info("supervisor: the held journal tail of volume {d} ({s}) replayed on retry {d}: {d} window(s), {d} bytes, barriered; {s} removed", .{ c.index, dev[0..dev_len], c.attempts, r.windows, r.bytes, c.pathZ() });
+                        _ = self.held.swapRemove(i);
+                        continue;
+                    },
+                    .gone => {
+                        log.info("supervisor: the held journal tail of volume {d} ({s}) was replayed by the volume's next mount", .{ c.index, c.pathZ() });
+                        _ = self.held.swapRemove(i);
+                        continue;
+                    },
+                    .foreign => {
+                        log.err("supervisor: the device of volume {d}'s held journal tail now names another volume (reformatted or re-stacked) — retries end; {s} stays for that volume's next mount", .{ c.index, c.pathZ() });
+                        _ = self.held.swapRemove(i);
+                        continue;
+                    },
+                    .busy => {},
+                    .failed => |e| if (std.math.isPowerOfTwo(c.attempts)) log.warn("supervisor: the held journal tail of volume {d} ({s}): retry {d} refused ({s}) — retrying every {d} ms", .{ c.index, c.pathZ(), c.attempts, @errorName(e), self.retry_ns / std.time.ns_per_ms }),
+                }
+                i += 1;
+            }
+            var j: usize = 0;
+            while (j < self.held_memfds.items.len) {
+                const t = &self.held_memfds.items[j];
+                t.attempts += 1;
+                var dev: [journal_tail.PATH_CAP]u8 = undefined;
+                var dev_len: usize = 0;
+                // The guards are still ours: no writer can hold the volume.
+                if (journal_tail.linux_tail.replayFd(t.fd, .{ .verify_device = true }, &dev, &dev_len)) |r| {
+                    log.info("supervisor: the kept journal tail of volume {d} ({s}) replayed on retry {d}: {d} window(s), {d} bytes, barriered", .{ t.index, dev[0..dev_len], t.attempts, r.windows, r.bytes });
+                    _ = linux.close(t.fd);
+                    _ = self.held_memfds.swapRemove(j);
+                    continue;
+                } else |e| if (std.math.isPowerOfTwo(t.attempts)) log.warn("supervisor: the kept journal tail of volume {d} ({s}): retry {d} refused ({s})", .{ t.index, dev[0..dev_len], t.attempts, @errorName(e) });
+                j += 1;
+            }
+            if (self.held_memfds.items.len == 0 and self.guards.items.len != 0) {
+                log.info("supervisor: writer guard released on {d} volume(s) after the kept tails replayed", .{self.guards.items.len});
+                self.releaseGuards();
+            }
         }
 
         fn releaseGuards(self: *Tails) void {
@@ -350,22 +514,54 @@ pub const linux_loop = if (builtin.os.tag == .linux) struct {
             self.guards.clearRetainingCapacity();
         }
 
-        /// The daemon is dead and its write cache holds residents (not
-        /// drained by a dismount, data past the marker): LISTEN on the claim
-        /// the daemon bound — the name is still ours — and hand the memfd to
-        /// the member's next mount (`staging.Ring.Ram.bind` connects, takes
-        /// ONE frame, then binds the claim itself); then exit. A drained or
-        /// empty ring is discarded at once. The hold has no deadline: the
-        /// ring is acked custody (the kill -9 law), and the operator who
-        /// wants it gone kills this process — every fsync'd byte is on the
-        /// data volumes already.
-        pub fn holdWriteCacheForSuccessor(self: *Tails) void {
+        /// The daemon is dead: hold what it left until it lands or a
+        /// successor takes it, then exit. The write cache (residents, not
+        /// drained by a dismount): LISTEN on the claim the daemon bound —
+        /// the name is still ours — and hand the memfd to the member's next
+        /// mount (`staging.Ring.Ram.bind` connects, takes ONE frame, then
+        /// binds the claim itself); a drained or empty ring is discarded at
+        /// once. A failed replay's tails: retried every tick (`retryHeld`).
+        /// The hold has no deadline: both are acked custody (the kill -9
+        /// law), and the operator who wants them gone kills this process —
+        /// every fsync'd byte is on the data volumes already, and a held
+        /// tail's copy stays for the volume's next mount.
+        pub fn holdForSuccessor(self: *Tails) void {
+            self.prepareWriteCacheHold();
+            if (!self.holding()) return;
+            if (self.held.items.len != 0 or self.held_memfds.items.len != 0) log.warn("supervisor: holding {d} journal tail(s) that failed to replay (pid {d}) — retried every {d} ms; the volume's next mount replays them before it admits writes", .{ self.held.items.len + self.held_memfds.items.len, linux.getpid(), self.retry_ns / std.time.ns_per_ms });
+            var next_retry = clock.monotonicNs() + self.retry_ns;
+            while (self.holding()) {
+                const now = clock.monotonicNs();
+                if (now >= next_retry) {
+                    self.retryHeld();
+                    next_retry = clock.monotonicNs() + self.retry_ns;
+                    continue;
+                }
+                const claim = self.write_cache_claim orelse {
+                    sleepNs(next_retry - now);
+                    continue;
+                };
+                var pfd = [_]linux.pollfd{.{ .fd = claim, .events = linux.POLL.IN, .revents = 0 }};
+                const ms: i32 = @intCast(@min((next_retry - now + std.time.ns_per_ms - 1) / std.time.ns_per_ms, std.math.maxInt(i32)));
+                const rc = linux.poll(&pfd, 1, ms);
+                switch (linux.errno(rc)) {
+                    .SUCCESS => if (rc != 0) self.acceptSuccessor(),
+                    .INTR => {},
+                    else => sleepNs(next_retry -| clock.monotonicNs()),
+                }
+            }
+            log.info("supervisor: nothing left to hold; done", .{});
+        }
+
+        /// The write cache's half of the hold: a drained or empty ring (or
+        /// one the claim cannot serve) discarded, else listened on and said.
+        fn prepareWriteCacheHold(self: *Tails) void {
             const memfd = self.write_cache orelse return;
-            const claim = self.write_cache_claim orelse {
+            if (self.write_cache_claim == null) {
                 log.err("supervisor: the write cache's memfd arrived without its claim — {d} B of acked unsynced custody cannot be handed over; discarded", .{memfdLen(memfd)});
                 self.dropWriteCache();
                 return;
-            };
+            }
             if (self.write_cache_drained or !staging.Ring.Ram.holdsData(memfd)) {
                 self.dropWriteCache();
                 return;
@@ -373,26 +569,30 @@ pub const linux_loop = if (builtin.os.tag == .linux) struct {
             self.listenWriteCacheClaim();
             if (self.write_cache == null) return;
             log.warn("supervisor: holding the dead daemon's write cache ({d} MiB of memfd, residents unpromoted) for this member's next mount — mount the set at this mount point to recover them; kill this process (pid {d}) to discard them (every fsync'd byte is on the data volumes)", .{ memfdLen(memfd) >> 20, linux.getpid() });
-            while (true) {
-                const rc = linux.accept4(claim, null, null, linux.SOCK.CLOEXEC);
-                switch (linux.errno(rc)) {
-                    .SUCCESS => {},
-                    .INTR, .AGAIN, .CONNABORTED => continue,
-                    else => {
-                        log.err("supervisor: accept on the write cache's claim failed — discarding {d} B of unsynced custody", .{memfdLen(memfd)});
-                        self.dropWriteCache();
-                        return;
-                    },
-                }
-                const conn: linux.fd_t = @intCast(rc);
-                const frame = (TailFrame{ .kind = .write_cache, .index = 0 }).encode();
-                const sent = if (rendezvous.sendCtl(conn, &frame, memfd)) true else |_| false;
-                _ = linux.close(conn);
-                if (sent) {
-                    log.info("supervisor: the write cache handed to the successor mount; done", .{});
+        }
+
+        /// A successor connected to the write cache's claim: one frame with
+        /// the memfd; sent, the ring is the successor's.
+        fn acceptSuccessor(self: *Tails) void {
+            const memfd = self.write_cache orelse return;
+            const claim = self.write_cache_claim orelse return;
+            const rc = linux.accept4(claim, null, null, linux.SOCK.CLOEXEC);
+            switch (linux.errno(rc)) {
+                .SUCCESS => {},
+                .INTR, .AGAIN, .CONNABORTED => return,
+                else => {
+                    log.err("supervisor: accept on the write cache's claim failed — discarding {d} B of unsynced custody", .{memfdLen(memfd)});
                     self.dropWriteCache();
                     return;
-                }
+                },
+            }
+            const conn: linux.fd_t = @intCast(rc);
+            const frame = (TailFrame{ .kind = .write_cache, .index = 0 }).encode();
+            const sent = if (rendezvous.sendCtl(conn, &frame, memfd)) true else |_| false;
+            _ = linux.close(conn);
+            if (sent) {
+                log.info("supervisor: the write cache handed to the successor mount", .{});
+                self.dropWriteCache();
             }
         }
 
@@ -610,8 +810,8 @@ pub const linux_loop = if (builtin.os.tag == .linux) struct {
     /// said so at start).
     pub fn run(gpa: std.mem.Allocator, io: Io, pid: linux.pid_t, mountpoint: [:0]const u8, policy: Policy, heartbeat: ?*const Heartbeat, tail_sock: ?linux.fd_t) u8 {
         var name_buf: thread_name.CommBuf = undefined;
-        _ = thread_name.nameCurrentThread(&name_buf, "sqz-supervise");
-        var tails: Tails = .{ .gpa = gpa, .sock = tail_sock };
+        _ = thread_name.nameCurrentThread(&name_buf, thread_comm);
+        var tails: Tails = .{ .gpa = gpa, .sock = tail_sock, .held_dir = policy.held_dir, .retry_ns = policy.probe_interval_ns };
         defer tails.deinit();
         if (tail_sock == null) log.warn("supervisor: no tail socket — a daemon crash has the flush-window exposure (no journal tail replay)", .{});
         const conn = connectionId(mountpoint);
@@ -634,12 +834,12 @@ pub const linux_loop = if (builtin.os.tag == .linux) struct {
             if (reaped) {
                 tails.replayAndRelease();
                 log.info("supervisor: daemon {d} exited (wait status 0x{x}); done", .{ pid, @as(u32, @bitCast(status)) });
-                tails.holdWriteCacheForSuccessor();
+                tails.holdForSuccessor();
                 return if (escalated) 1 else 0;
             }
             if (!alive(pid)) {
                 tails.replayAndRelease();
-                tails.holdWriteCacheForSuccessor();
+                tails.holdForSuccessor();
                 return if (escalated) 1 else 0;
             }
             var is_attached = attached(gpa, io, mountpoint, mount_id);
@@ -672,7 +872,7 @@ pub const linux_loop = if (builtin.os.tag == .linux) struct {
                 .escalate => |for_ns| {
                     escalated = true;
                     escalate(io, pid, conn, for_ns, kind, policy, &tails);
-                    tails.holdWriteCacheForSuccessor();
+                    tails.holdForSuccessor();
                     return 1;
                 },
             }

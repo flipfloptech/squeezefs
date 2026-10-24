@@ -67,6 +67,7 @@ const cli = @import("cli.zig");
 const args = @import("args.zig");
 const fusermount = @import("fusermount.zig");
 const holders = @import("holders.zig");
+const supervisor = @import("supervisor.zig");
 const errors = @import("../core/errors.zig");
 const clock = @import("../core/clock.zig");
 const json_scan = @import("../core/json_scan.zig");
@@ -234,7 +235,15 @@ pub fn locateDaemon(gpa: std.mem.Allocator, io: Io, mountpoint: []const u8) Loca
 /// its parent, and whether it has a child of its own (the supervisor's
 /// seat has the daemon — alive, or a zombie it has not reaped yet; a daemon
 /// keeps no child).
-const Candidate = struct { pid: linux.pid_t, ppid: linux.pid_t, has_children: bool = false };
+const Candidate = struct {
+    pid: linux.pid_t,
+    ppid: linux.pid_t,
+    has_children: bool = false,
+    /// Its comm is the supervisor's (`supervisor.thread_comm`): a seat that
+    /// outlived its daemon holding its custody (a failed replay's tail, a
+    /// write cache for the successor) — childless, yet never the daemon.
+    supervisor: bool = false,
+};
 
 /// At most this many `squeezefs mount` processes naming ONE path are
 /// looked at: the daemon and its supervisor's seat are two; more is a
@@ -272,7 +281,7 @@ pub fn cmdlineMounts(cmdline: []const u8, mountpoint: []const u8) bool {
 pub fn pickDaemon(cands: []const Candidate) ?linux.pid_t {
     var picked: ?linux.pid_t = null;
     for (cands) |c| {
-        if (c.has_children or parentAmong(cands, c.pid)) continue;
+        if (c.supervisor or c.has_children or parentAmong(cands, c.pid)) continue;
         if (picked != null) return null;
         picked = c.pid;
     }
@@ -330,7 +339,10 @@ pub fn daemonByProcess(io: Io, mountpoint: []const u8) ?linux.pid_t {
         const children_path = std.fmt.bufPrint(&pb, "/proc/{d}/task/{d}/children", .{ pid, pid }) catch continue;
         var cb: [64]u8 = undefined;
         const children = Io.Dir.cwd().readFile(io, children_path, &cb) catch "";
-        cands[n] = .{ .pid = pid, .ppid = parseStatusPpid(status) orelse 0, .has_children = std.mem.trim(u8, children, " \n").len != 0 };
+        const comm_path = std.fmt.bufPrint(&pb, "/proc/{d}/comm", .{pid}) catch continue;
+        var commb: [32]u8 = undefined;
+        const comm = Io.Dir.cwd().readFile(io, comm_path, &commb) catch "";
+        cands[n] = .{ .pid = pid, .ppid = parseStatusPpid(status) orelse 0, .has_children = std.mem.trim(u8, children, " \n").len != 0, .supervisor = std.mem.eql(u8, std.mem.trim(u8, comm, " \n"), supervisor.thread_comm) };
         n += 1;
     }
     return pickDaemon(cands[0..n]);
@@ -715,6 +727,11 @@ test "the process census: a cmdline is the daemon's iff the mount verb's parser 
     // The seat alone — its daemon exited and sits unreaped as its zombie
     // child (no argv of its own): nobody to signal, never the seat.
     try testing.expectEqual(@as(?linux.pid_t, null), pickDaemon(&.{.{ .pid = 41, .ppid = 1, .has_children = true }}));
+    // The seat alone after it reaped its daemon, holding its custody (a
+    // failed replay's tail, a write cache): childless, named by its comm —
+    // never the daemon (a TERM would end its hold).
+    try testing.expectEqual(@as(?linux.pid_t, null), pickDaemon(&.{.{ .pid = 41, .ppid = 1, .supervisor = true }}));
+    try testing.expectEqual(@as(?linux.pid_t, 52), pickDaemon(&.{ .{ .pid = 41, .ppid = 1, .supervisor = true }, .{ .pid = 52, .ppid = 51 }, .{ .pid = 51, .ppid = 1, .has_children = true } }));
     // Two daemons naming one path (a bring-up racing the stop): no guess.
     try testing.expectEqual(@as(?linux.pid_t, null), pickDaemon(&.{ .{ .pid = 42, .ppid = 1 }, .{ .pid = 52, .ppid = 1 } }));
     try testing.expectEqual(@as(?linux.pid_t, null), pickDaemon(&.{ .{ .pid = 41, .ppid = 1 }, .{ .pid = 42, .ppid = 41 }, .{ .pid = 52, .ppid = 41 } }));

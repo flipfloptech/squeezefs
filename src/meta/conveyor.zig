@@ -1344,10 +1344,11 @@ fn refuseSpawn(_: *anyopaque, _: *Window) bool {
 /// The journal tail (decision 0003 §BB.2): the window's image copied into
 /// the kernel-held mirror before its members are acked ahead of the
 /// landing. `claim` returns the slot (null: the table refused), `release`
-/// frees it at the lane's verdict.
+/// frees it at the lane's verdict. `pos_base` is the reservation's start
+/// (the position a held tail is judged by against the ledger, §BQ.3).
 pub const TailSeam = struct {
     ctx: *anyopaque,
-    claim: *const fn (ctx: *anyopaque, seq_base: u64, ops: []const journal.WriteOp) ?u32,
+    claim: *const fn (ctx: *anyopaque, seq_base: u64, pos_base: u64, ops: []const journal.WriteOp) ?u32,
     release: *const fn (ctx: *anyopaque, slot: u32) void,
 };
 
@@ -2751,7 +2752,7 @@ pub const Conveyor = struct {
         const outcome: Outcome = if (failed[0]) |e| e else {};
         var early = kernel_origin and (self.deps.ack_at_apply or failed[0] != null);
         if (early and failed[0] == null) if (self.deps.tail) |t| {
-            p.tail_slot = t.claim(t.ctx, p.seq, p.ops);
+            p.tail_slot = t.claim(t.ctx, p.seq, p.start, p.ops);
             if (p.tail_slot == null) {
                 self.stats.tail_slot_misses.fire("the journal tail's slot table refused a member; acked at the landing");
                 early = false;
@@ -2980,7 +2981,7 @@ pub const Conveyor = struct {
         // falls back to the landing (counted).
         var ack_now = self.deps.ack_at_apply and !window.applyHoles() and kernelOriginOnly(window.members);
         if (ack_now) if (self.deps.tail) |t| {
-            window.tail_slot = t.claim(t.ctx, window.seq_base, window.ops());
+            window.tail_slot = t.claim(t.ctx, window.seq_base, window.res.start, window.ops());
             if (window.tail_slot == null) {
                 self.stats.tail_slot_misses.fire("the journal tail's slot table refused a window; acked at the landing");
                 ack_now = false;

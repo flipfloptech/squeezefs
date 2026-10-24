@@ -104,6 +104,7 @@ pub const registry = [_]Knob{
     // ---- io_uring file layer / metadata device posture ----
     .{ .key = "SQUEEZEFS_URING_FS_WORKERS", .kind = .{ .int = .{ .lo = 1, .hi = 64 } }, .default = "derived", .class = .derived_override, .doc = "io_uring file-layer worker count for ad-hoc local file I/O (derived clamp(cpus/4, 4, 64))." },
     .{ .key = "SQUEEZEFS_TEST_META_BUFFERED", .kind = .bool, .default = "0", .class = .test_seam, .doc = "Test seam: keep every registered metadata device on BUFFERED I/O (the shared-LUN coherence repro's control arm)." },
+    .{ .key = "SQUEEZEFS_TEST_JOURNAL_TAIL_DIR", .kind = .str, .default = "off", .class = .test_seam, .doc = "Test seam: the directory a supervisor holds a journal tail whose replay FAILED in, and every writer of a volume looks for its held copy in before it reads the ring (charter §5.2, decision 0003 §BQ) — a rig's work dir, so a row's held copies die with it. `off` = the host's runtime dir (`/run/squeezefs/journal-tails` for root, `/run/user/<uid>/squeezefs/journal-tails` otherwise)." },
     .{ .key = "SQUEEZEFS_TEST_JOURNAL_HOLD_LANDING", .kind = .bool, .default = "0", .class = .test_seam, .doc = "Test seam: from the mount's ready line on, the journal lane admits windows but never issues their writes — every acked commit lives in the journal tail alone (the replay rows: kill -9, the supervisor's replay, the remount)." },
 
     // ---- metadata commit pipeline (journal lane) ----

@@ -207,6 +207,12 @@ pub const Stats = struct {
     /// Journal holes the lane could not cover because the SMO lock was held
     /// (`checkpointPast`): the holder's own cycle covers them.
     hole_covers_smo_held: counters.ShardedCounter = .{},
+    /// The previous writer's HELD journal tail replayed at this open
+    /// (decision 0003 §BQ.3): the custody law's engagement gauge.
+    held_tail_replays: counters.ShardedCounter = .{},
+    /// A held tail refused STALE (the ledger's checkpoint tail passed every
+    /// window it held): acked metadata lost to a writer that ran without it.
+    held_tail_stale: counters.ShardedCounter = .{},
 };
 
 pub var stats: Stats = .{};
@@ -546,6 +552,12 @@ pub const KvBackend = struct {
         var mounted = try readNewestLedger(gpa, &dev, path, sb);
         errdefer mounted.deinit(gpa);
 
+        // 4b. The previous writer's HELD journal tail (charter §5.2): the
+        //     acked windows its supervisor could not replay, written under
+        //     this mount's writer lock before the ring is read — or the
+        //     volume is refused.
+        try replayHeldTail(path, opts.env, sb, mounted.journal_tail_seq);
+
         // 5. The ring: one read, the chain walk from the tail.
         const ring_ext = geometry.fixedRingExtent(sb);
         const ring_layout = journal.RingLayout.fromExtent(.{ .start = ring_ext.start, .len = ring_ext.len });
@@ -744,7 +756,7 @@ pub const KvBackend = struct {
         errdefer be.lane.deinit();
         // Before the first request: a handler fiber's fsync parks alone.
         be.lane.routeWaits(io);
-        be.tail = try openTail(be.path, ring_layout, geo);
+        be.tail = try openTail(be.path, ring_layout, geo, tailIdentity(be.sb), journal_tail.RING_FIXED);
         errdefer if (be.tail) |*t| t.deinit();
         // Every checkpoint-side device error now classifies for the fence.
         be.dev.latch = &be.lane.latch;
@@ -1125,7 +1137,7 @@ pub const KvBackend = struct {
         };
         errdefer be.lane.deinit();
         be.lane.routeWaits(io);
-        be.tail = try openTail(be.path, be.ring_layout, be.geo);
+        be.tail = try openTail(be.path, be.ring_layout, be.geo, tailIdentity(be.sb), journal_tail.RING_JOINED);
         errdefer if (be.tail) |*t| t.deinit();
         be.dev.latch = &be.lane.latch;
         be.smo_journal = .{ .gpa = gpa, .layout = be.ring_layout, .geo = be.geo, .core = &be.core, .reg = &be.reg, .image = &.{}, .barrier_hook = be.dev.barrierSink(), .latch = &be.lane.latch, .device = .{ .ctx = be, .write = smoWriteHook, .completed = smoCompletedHook }, .appender_id = standing.appender_id };
@@ -2063,16 +2075,50 @@ pub const KvBackend = struct {
     /// The tail: a memfd of the ring's size plus a slot table of twice the
     /// lane's cells. A refusal is the open's (a box that cannot give the
     /// tail its memory cannot keep the crash law).
-    fn openTail(path: []const u8, layout: journal.RingLayout, geo: jc.CoreGeometry) OpenError!journal_tail.linux_tail.Tail {
+    fn openTail(path: []const u8, layout: journal.RingLayout, geo: jc.CoreGeometry, identity: journal_tail.Identity, ring: u32) OpenError!journal_tail.linux_tail.Tail {
         return journal_tail.linux_tail.Tail.create(.{
             .layout = layout,
             .grain = geo.grain,
             .path = path,
             .n_slots = @intCast(2 * journal_lane.inboundCap(layout.pages)),
+            .identity = identity,
+            .ring = ring,
         }) catch |e| {
             log.err("meta volume {s}: cannot create the journal tail ({s})", .{ path, @errorName(e) });
             return error.DeviceRefused;
         };
+    }
+
+    /// The previous writer's held journal tail (decision 0003 §BQ.3): its
+    /// acked windows written to THIS device path before the ring is read;
+    /// a stale copy (the ledger's checkpoint tail past every window) is
+    /// removed unwritten, a foreign one left; while the device refuses the
+    /// replay the open is refused — never mounted over.
+    fn replayHeldTail(path: []const u8, env: *const std.process.Environ.Map, sb: superblock.Superblock, ledger_tail: u64) OpenError!void {
+        const dir = journal_tail.HeldDir.fromEnv(env);
+        var fb: [journal_tail.PATH_CAP]u8 = undefined;
+        const file = journal_tail.heldPath(&fb, dir.slice(), sb.uuid) orelse return;
+        switch (journal_tail.linux_tail.consumeHeld(file, path, tailIdentity(sb), ledger_tail)) {
+            .none => {},
+            .landed => |l| {
+                stats.held_tail_replays.inc();
+                log.warn("meta volume {s}: replayed the HELD journal tail {s} — {d} acked window(s) of the previous mount's last flush (record stamps {d}..{d}, {d} bytes; {d} behind the ledger's tail skipped) its supervisor could not write; barriered, the copy removed", .{ path, file, l.replay.windows, l.held.seq_lo, l.held.seq_hi, l.replay.bytes, l.replay.behind });
+            },
+            .stale => |h| {
+                stats.held_tail_stale.inc();
+                log.err("meta volume {s}: the held journal tail {s} is STALE — the ledger's checkpoint tail {d} passed all {d} of its window(s) (from position {d}): a writer ran without it and its bytes no longer describe this ring; removed unwritten — the acked metadata it held is lost", .{ path, file, ledger_tail, h.windows, h.pos_lo });
+            },
+            .foreign => |id| log.err("meta volume {s}: {s} is named for this volume but holds the tail of volume {s} (set {s}) — refused, left in place", .{ path, file, &std.fmt.bytesToHex(id.volume_uuid, .lower), &std.fmt.bytesToHex(id.set_uuid, .lower) }),
+            .failed => |e| {
+                log.err("meta volume {s}: the held journal tail {s} could not be replayed ({s}) — it holds acked metadata of the previous mount's last flush, so the volume is refused until it lands: restore the device and mount again (removing the file mounts without it and loses that metadata)", .{ path, file, @errorName(e) });
+                return error.DeviceRefused;
+            },
+        }
+    }
+
+    /// The volume a tail names (decision 0003 §BQ.3): its superblock's.
+    fn tailIdentity(sb: superblock.Superblock) journal_tail.Identity {
+        return .{ .volume_uuid = sb.uuid, .set_uuid = sb.set_uuid };
     }
 
     fn tailSeam(be: *KvBackend) ?conveyor.TailSeam {
@@ -2080,9 +2126,9 @@ pub const KvBackend = struct {
         return .{ .ctx = be, .claim = tailClaim, .release = tailRelease };
     }
 
-    fn tailClaim(ctx: *anyopaque, seq_base: u64, ops: []const journal.WriteOp) ?u32 {
+    fn tailClaim(ctx: *anyopaque, seq_base: u64, pos_base: u64, ops: []const journal.WriteOp) ?u32 {
         const be: *KvBackend = @ptrCast(@alignCast(ctx));
-        return be.tail.?.claim(seq_base, ops);
+        return be.tail.?.claim(seq_base, pos_base, ops);
     }
 
     fn tailRelease(ctx: *anyopaque, slot: u32) void {
@@ -2969,7 +3015,8 @@ pub const KvBackend = struct {
         be.smo_journal.geo = geo;
         be.cv.swapRing(be.env, layout, geo);
         if (be.tail != null) {
-            if (openTail(be.path, layout, geo)) |t| {
+            const was = be.tail.?.image.header();
+            if (openTail(be.path, layout, geo, was.identity(), was.ring)) |t| {
                 be.tail.?.deinit();
                 be.tail = t;
                 if (be.tail_announce) |a| {

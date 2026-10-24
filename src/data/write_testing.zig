@@ -256,6 +256,12 @@ pub const RamMap = struct {
     /// The size epochs (`size_epoch.SizeEpochs`): `truncate` bumps, the
     /// merge applies the product's stale rule over `RamFile.size`.
     epochs: size_epoch.SizeEpochs,
+    /// The resolve-fault epoch (`MapSeam.resolve_fault`, one for every
+    /// ino); `fault_lookups` makes the next lookups of `fault_ino` fail as
+    /// an unserved foreign window does: the epoch bumps, null comes back.
+    resolve_faults: u64 = 0,
+    fault_ino: u64 = 0,
+    fault_lookups: u32 = 0,
 
     pub fn init(gpa: Allocator) Allocator.Error!RamMap {
         return .{ .gpa = gpa, .epochs = try size_epoch.SizeEpochs.init(gpa, 16) };
@@ -274,7 +280,7 @@ pub const RamMap = struct {
         return .{ .ctx = self, .vtable = &vtable };
     }
 
-    const vtable: seams.MapSeam.VTable = .{ .lookup = &lookup, .reserved = &reserved, .view = &view, .merge = &merge, .punch = &punch, .shift = &shift, .current_fencing = &currentFencing, .size_epoch = &sizeEpoch };
+    const vtable: seams.MapSeam.VTable = .{ .lookup = &lookup, .reserved = &reserved, .view = &view, .merge = &merge, .punch = &punch, .shift = &shift, .current_fencing = &currentFencing, .size_epoch = &sizeEpoch, .resolve_fault = &resolveFault };
 
     pub fn create(self: *RamMap, ino: u64, kind: seams.FileKind, size: u64) !void {
         try self.files.put(self.gpa, ino, .{ .kind = kind, .size = size });
@@ -321,6 +327,11 @@ pub const RamMap = struct {
         const self: *RamMap = @ptrCast(@alignCast(ctx));
         self.lock.lockUncancelable(std.testing.io);
         defer self.lock.unlock(std.testing.io);
+        if (self.fault_lookups != 0 and ino == self.fault_ino) {
+            self.fault_lookups -= 1;
+            self.resolve_faults += 1;
+            return null;
+        }
         const f = self.files.get(ino) orelse return null;
         const m = f.map.get(block) orelse return null;
         return if (m.unwritten) null else m;
@@ -494,6 +505,13 @@ pub const RamMap = struct {
     fn sizeEpoch(ctx: *anyopaque, ino: u64) u64 {
         const self: *RamMap = @ptrCast(@alignCast(ctx));
         return self.epochs.current(ino);
+    }
+
+    fn resolveFault(ctx: *anyopaque, _: u64) u64 {
+        const self: *RamMap = @ptrCast(@alignCast(ctx));
+        self.lock.lockUncancelable(std.testing.io);
+        defer self.lock.unlock(std.testing.io);
+        return self.resolve_faults;
     }
 };
 

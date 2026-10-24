@@ -378,6 +378,12 @@ pub const MapSeam = struct {
         shift: *const fn (ctx: *anyopaque, ino: u64, s: Shift) ShiftError!MergeOutcome,
         current_fencing: *const fn (ctx: *anyopaque, ino: u64) u64,
         size_epoch: *const fn (ctx: *anyopaque, ino: u64) u64,
+        /// The ino's RESOLVE FAULT epoch: bumped by every binding resolve
+        /// the authority could not answer (a foreign layout or block-map
+        /// window its holder's token could not serve) — `lookup` has no
+        /// error channel and returns null (a hole) for one, so a caller
+        /// that resolved under a moved epoch never trusts that hole.
+        resolve_fault: *const fn (ctx: *anyopaque, ino: u64) u64,
     };
 
     /// A COLLAPSE_RANGE / INSERT_RANGE at the block grain (charter §6.6;
@@ -437,6 +443,10 @@ pub const MapSeam = struct {
 
     pub fn sizeEpoch(self: MapSeam, ino: u64) u64 {
         return self.vtable.size_epoch(self.ctx, ino);
+    }
+
+    pub fn resolveFault(self: MapSeam, ino: u64) u64 {
+        return self.vtable.resolve_fault(self.ctx, ino);
     }
 };
 

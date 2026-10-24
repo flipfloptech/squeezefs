@@ -241,6 +241,13 @@ pub const stats = struct {
     /// block-map window its holder's token could not serve (the channel,
     /// the lease, a redirect) — the block read as a hole.
     pub var kvmap_foreign_resolve_failures: counters.ShardedCounter = .{};
+    /// `foreign_resolve_faults`: every foreign layout or block-map window
+    /// the holder's token could not serve (the head's and the window's
+    /// alike) — the ino's resolve-fault epoch bumped;
+    /// `foreign_resolve_eio_reads`: reads that resolved under a moved epoch
+    /// and answered EIO instead of the hole the seams returned.
+    pub var foreign_resolve_faults: counters.ShardedCounter = .{};
+    pub var foreign_resolve_eio_reads: counters.ShardedCounter = .{};
     /// `kvmap_sweep_spawn_refusals`: a background sweep the executor could
     /// not spawn (it resumes at the next mount from its durable cursor).
     pub var kvmap_sweep_spawn_refusals: counters.ShardedCounter = .{};
@@ -349,7 +356,7 @@ pub fn writeStatsJson(w: *Io.Writer) Io.Writer.Error!void {
     inline for (.{ "data_volumes", "data_staging_on", "write_cache_off_unsupervised", "block_refs_drift_rows" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, @field(stats, name).load() });
     }
-    inline for (.{ "layout_map_merges", "layout_map_merge_blocks", "layout_map_merge_failures", "layout_map_commit_failures", "layout_map_merge_clipped_blocks", "layout_map_merges_shipped", "foreign_publish_kvmap_refusals", "layout_publishes_served", "layout_map_punches", "layout_shifts", "layout_shift_refusals", "kvmap_sweep_spawn_refusals", "kvmap_foreign_resolve_failures", "promotions_run", "promotions_stale", "promotions_failed", "promotions_enospc", "promotions_replaced", "promotions_restaged", "recall_promotions", "recall_promotion_failures", "own_block_dmas", "own_block_dma_bytes", "promotion_barriers", "staged_point_hits", "staged_point_misses", "promotion_barriers_coalesced", "promotion_barrier_write_through_skips", "held_stores", "held_store_bytes", "held_store_failures", "hold_gate_admits", "hold_gate_overlay_admits", "hold_gate_declines", "prefetch_fibers", "prefetch_fiber_refusals", "hold_ceremony_fibers", "bindings_freed", "device_read_bounces", "data_device_read_bytes", "write_side_read_dma_bytes", "compose_read_dma_bytes", "pack_read_dma_bytes" }) |name| {
+    inline for (.{ "layout_map_merges", "layout_map_merge_blocks", "layout_map_merge_failures", "layout_map_commit_failures", "layout_map_merge_clipped_blocks", "layout_map_merges_shipped", "foreign_publish_kvmap_refusals", "layout_publishes_served", "layout_map_punches", "layout_shifts", "layout_shift_refusals", "kvmap_sweep_spawn_refusals", "kvmap_foreign_resolve_failures", "foreign_resolve_faults", "foreign_resolve_eio_reads", "promotions_run", "promotions_stale", "promotions_failed", "promotions_enospc", "promotions_replaced", "promotions_restaged", "recall_promotions", "recall_promotion_failures", "own_block_dmas", "own_block_dma_bytes", "promotion_barriers", "staged_point_hits", "staged_point_misses", "promotion_barriers_coalesced", "promotion_barrier_write_through_skips", "held_stores", "held_store_bytes", "held_store_failures", "hold_gate_admits", "hold_gate_overlay_admits", "hold_gate_declines", "prefetch_fibers", "prefetch_fiber_refusals", "hold_ceremony_fibers", "bindings_freed", "device_read_bounces", "data_device_read_bytes", "write_side_read_dma_bytes", "compose_read_dma_bytes", "pack_read_dma_bytes" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, @field(stats, name).load() });
     }
     try w.print("\"data_unresolved_volume\":{d},\"kvmap_resolve_failures\":{d},\"kvmap_head_put_unlocked\":{d},\"release_free_unheld\":{d},\"layout_map_merge_displaced_overflow\":{d}}}", .{ counters.tripwireCount("data_unresolved_volume"), counters.tripwireCount("kvmap_resolve_failures"), counters.tripwireCount("kvmap_head_put_unlocked"), counters.tripwireCount("release_free_unheld"), counters.tripwireCount("layout_map_merge_displaced_overflow") });
@@ -455,6 +462,11 @@ pub const Options = struct {
 
 pub const OpenError = error{ OutOfMemory, DeviceRefused, IdentityMismatch, Io, StagingRefused, StagingOwnerLive, StagingForeignOwner, StagingHeldForSuccessor, TransformRefused, ReclaimRefused, InlineMaxAboveFormatBound };
 
+/// The resolve-fault table's rows (`DataPlane.resolve_faults`): 256 × 8 B;
+/// a fault is a holder the token could not reach, so a collision is an op
+/// in flight on another ino of the row answering one retryable EIO.
+const RESOLVE_FAULT_ROWS: usize = 256;
+
 pub const DataPlane = struct {
     /// The (3.7) guard kv_fs holds across a truncate / corpse transaction.
     pub const LayoutGuard = layout.LayoutLocks.Guard;
@@ -559,6 +571,16 @@ pub const DataPlane = struct {
     /// The token divert's layout face (bound by the daemon once the wire
     /// plane is up; null = a flat mount: every slot local).
     foreign_layout: ?ForeignLayout = null,
+    /// THE RESOLVE-FAULT EPOCHS (the binding resolver's error channel): a
+    /// row per ino hash, bumped by every foreign layout or block-map window
+    /// the holder's token could not serve (`noteResolveFault`). The seams
+    /// return such a binding as null — a HOLE — so the read (`read`) and
+    /// the write's admission (`MapSeam.resolveFault`) that resolved while
+    /// their row moved answer EIO, never zeros: a member read a holder's
+    /// unservable block map as zeros, and a write seeded its block from the
+    /// fabricated hole. A colliding ino's fault in flight costs an EIO the
+    /// caller retries (faults are a holder unreachable: rare).
+    resolve_faults: [RESOLVE_FAULT_ROWS]Atomic(u64) = @splat(.init(0)),
     /// The foreign-slot layout PUBLISH's ship (charter §5.5 "Record-level
     /// mutations of a foreign-slot file — the layout publish"): bound with
     /// the layout face; null = a merge on a foreign record is refused.
@@ -1678,7 +1700,40 @@ pub const DataPlane = struct {
     /// THE read of any layout kind into `dest` (the reply window;
     /// `registered` = the device may DMA straight into it).
     pub fn read(self: *DataPlane, io: Io, ino: u64, offset: u64, dest: []u8, registered: bool, odirect: bool) Error!usize {
-        return self.rp.read(io, ino, offset, dest.len, .{ .buf = dest, .registered = registered }, .{ .odirect = odirect });
+        const fault0 = self.resolveFaultEpoch(ino);
+        const n = self.rp.read(io, ino, offset, dest.len, .{ .buf = dest, .registered = registered }, .{ .odirect = odirect }) catch |e| {
+            return if (self.resolveFaultEpoch(ino) != fault0) self.faultedRead() else e;
+        };
+        // A binding resolved while the row moved may be a fabricated hole.
+        if (self.resolveFaultEpoch(ino) != fault0) return self.faultedRead();
+        return n;
+    }
+
+    fn faultedRead(_: *DataPlane) Error {
+        stats.foreign_resolve_eio_reads.inc();
+        return error.InputOutput;
+    }
+
+    fn faultRow(self: *DataPlane, ino: u64) *Atomic(u64) {
+        return &self.resolve_faults[@intCast(dlm.splitmix64(ino) % RESOLVE_FAULT_ROWS)];
+    }
+
+    /// The ino's resolve-fault epoch (`resolve_faults`).
+    pub fn resolveFaultEpoch(self: *DataPlane, ino: u64) u64 {
+        return self.faultRow(ino).load(.monotonic);
+    }
+
+    /// A foreign binding the holder's token could not serve: the row moves
+    /// BEFORE the seam returns its hole (program order in the resolving op;
+    /// the bump's relaxed RMW is all a same-op reader needs). Returns `e`.
+    fn noteResolveFault(self: *DataPlane, ino: u64, e: Error) Error {
+        self.bumpResolveFault(ino);
+        return e;
+    }
+
+    fn bumpResolveFault(self: *DataPlane, ino: u64) void {
+        _ = self.faultRow(ino).fetchAdd(1, .monotonic);
+        stats.foreign_resolve_faults.inc();
     }
 
     /// ONE whole-block image landed on a fresh block (the promotion to
@@ -3060,7 +3115,7 @@ pub const DataPlane = struct {
         return .{ .ctx = self, .vtable = &map_vtable };
     }
 
-    const map_vtable: seams.MapSeam.VTable = .{ .lookup = &mapLookup, .reserved = &mapReserved, .view = &mapView, .merge = &mapMerge, .punch = &mapPunch, .shift = &mapShift, .current_fencing = &mapFencing, .size_epoch = &mapSizeEpoch };
+    const map_vtable: seams.MapSeam.VTable = .{ .lookup = &mapLookup, .reserved = &mapReserved, .view = &mapView, .merge = &mapMerge, .punch = &mapPunch, .shift = &mapShift, .current_fencing = &mapFencing, .size_epoch = &mapSizeEpoch, .resolve_fault = &mapResolveFault };
 
     /// The layout record of `ino`: the xattr chain at the layout name's
     /// hash, the record named `layout` (owned bytes) and its chain slot.
@@ -3159,11 +3214,11 @@ pub const DataPlane = struct {
 
     fn resolveAt(self: *DataPlane, ino: u64, block: ?u32) Error!?Resolved {
         if (self.view.lookup(ino, block)) |v| return .{ .size = v.size, .flags = v.flags, .point = v.point };
-        if (self.foreign_layout) |f| switch (try f.lookup(f.ctx, self.gpa, ino)) {
+        if (self.foreign_layout) |f| switch (f.lookup(f.ctx, self.gpa, ino) catch |e| return self.noteResolveFault(ino, e)) {
             .local => {},
             .gone => return null,
             // A foreign record is the holder's, owned (`layoutRecord`): never cached here.
-            .foreign => |x| return .{ .size = x.size, .flags = x.flags, .point = if (x.layout) |v| try self.foreignPoint(v, block) else null },
+            .foreign => |x| return .{ .size = x.size, .flags = x.flags, .point = if (x.layout) |v| self.foreignPoint(v, block) catch |e| return self.noteResolveFault(ino, e) else null },
         };
         const gen = ino_witness.genOf(ino);
         const moves = self.view.movesNow();
@@ -3299,10 +3354,11 @@ pub const DataPlane = struct {
     fn kvmapLookup(self: *DataPlane, ino: u64, head: layout.Layout.KvmapHead, block: u32) ?Mapping {
         if (head.sweep) |k| if (block >= k) return null;
         if (self.foreign_layout) |f| switch ((if (self.test_foreign_map_fail) error.HolderUnreachable else f.mapRecord(f.ctx, self.gpa, ino, block)) catch |e| {
-            // `rawBinding` has no error channel: a failed resolve reads as a
-            // hole, as a failed head resolve does for every foreign file.
+            // `rawBinding` has no error channel: the fault epoch is it (the
+            // op that resolved this null answers EIO, never the hole).
             stats.kvmap_foreign_resolve_failures.inc();
-            log.warn("ino {d} block {d}: the holder's block map could not be served ({t}) — answered as a hole", .{ ino, block, e });
+            log.warn("ino {d} block {d}: the holder's block map could not be served ({t}) — the op answers EIO", .{ ino, block, e });
+            self.bumpResolveFault(ino);
             return null;
         }) {
             .local => {},
@@ -3379,6 +3435,11 @@ pub const DataPlane = struct {
     fn mapSizeEpoch(ctx: *anyopaque, ino: u64) u64 {
         const self: *DataPlane = @ptrCast(@alignCast(ctx));
         return self.size_epochs.current(ino);
+    }
+
+    fn mapResolveFault(ctx: *anyopaque, ino: u64) u64 {
+        const self: *DataPlane = @ptrCast(@alignCast(ctx));
+        return self.resolveFaultEpoch(ino);
     }
 
     /// The inline map fold (pure): the current ascending entries and the

@@ -174,6 +174,10 @@ pub const stats = struct {
     /// returned AND every data volume's fresh supply latched exhausted (the
     /// set is full). Must stay 0 on a set with free blocks.
     pub var parked_gate_wall_refusals: counters.ShardedCounter = .{};
+    /// `write_resolve_fault_refusals`: write pieces refused EIO because a
+    /// binding they resolved came back as the hole a foreign resolve fault
+    /// leaves (`MapSeam.resolveFault` moved) — before any custody.
+    pub var write_resolve_fault_refusals: counters.ShardedCounter = .{};
     /// `write_gap_zero_bytes`: the zeros the extension law admitted
     /// (`WritePath.zeroExtension`, decision 0003 §AL) — bytes the
     /// filesystem itself wrote, so the admission ledger ≡ WRITE payload
@@ -226,7 +230,7 @@ pub fn noteInlineWrite(len: u64) void {
 
 pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
     try w.writeAll("{");
-    inline for (.{ "admit_write_overlay_bytes", "admit_write_inplace_bytes", "admit_write_accumulate_bytes", "admit_write_inline_bytes", "write_enospc_refusals", "write_pieces", "writes_admitted", "staging_sibling_probes", "restage_churn_removes", "restage_churn_bytes", "parked_gate_waits", "parked_gate_self_flushes", "parked_gate_cold_flushes", "parked_gate_wall_refusals", "parked_gate_wall_supply_visible", "parked_gate_wall_plane_stalls", "parked_gate_stall_answers", "write_short_counts", "write_gap_zero_bytes", "fallocate_blocks_reserved", "fallocate_blocks_zeroed", "fallocate_custody_skips" }) |name| {
+    inline for (.{ "admit_write_overlay_bytes", "admit_write_inplace_bytes", "admit_write_accumulate_bytes", "admit_write_inline_bytes", "write_enospc_refusals", "write_pieces", "writes_admitted", "staging_sibling_probes", "restage_churn_removes", "restage_churn_bytes", "parked_gate_waits", "parked_gate_self_flushes", "parked_gate_cold_flushes", "parked_gate_wall_refusals", "write_resolve_fault_refusals", "parked_gate_wall_supply_visible", "parked_gate_wall_plane_stalls", "parked_gate_stall_answers", "write_short_counts", "write_gap_zero_bytes", "fallocate_blocks_reserved", "fallocate_blocks_zeroed", "fallocate_custody_skips" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, @field(stats, name).load() });
     }
     try w.print("\"write_shared_class_violation\":{d},", .{counters.tripwireCount("write_shared_class_violation")});
@@ -919,6 +923,9 @@ pub const WritePath = struct {
         const len = req.payload.len();
         const bs = self.cfg.block_size;
         if (len == 0) return .{ .written = 0, .size_claim = 0, .size_epoch = 0, .pieces = 0 };
+        // The resolve-fault epoch BEFORE any lookup of this write: a
+        // binding resolved while it moves may be a fabricated hole.
+        const fault0 = self.map.resolveFault(req.ino);
         const end = std.math.add(u64, req.offset, len) catch return error.FileTooBig;
         if (end / bs >= std.math.maxInt(u32)) return error.FileTooBig;
         const file = req.file orelse seams.FileView{ .kind = .striped, .size = 0, .map_resident = false };
@@ -972,7 +979,7 @@ pub const WritePath = struct {
         var out: Outcome = .{ .written = 0, .size_claim = end, .size_epoch = 0, .pieces = @intCast(pieces.len) };
         for (pieces) |pc| {
             stats.write_pieces.inc();
-            const arm = self.admitPiece(io, req, file, pc, &bytes, try_patch and single, overlay_shape, stream_adjacent, arrived_ns) catch |e| {
+            const arm = self.admitPiece(io, req, file, pc, &bytes, try_patch and single, overlay_shape, stream_adjacent, arrived_ns, fault0) catch |e| {
                 // Linux's regular-file write: bytes transferred are the
                 // count returned, the error the next call's — and the
                 // kernel's FUSE write honours a short reply
@@ -1064,7 +1071,17 @@ pub const WritePath = struct {
     /// on 100–128 per leg). The governor's in-flight permits belong to
     /// uploads that take (3) to publish: a park for one under (3) is the
     /// generic/551 cycle.
-    fn admitPiece(self: *WritePath, io: Io, req: Request, file: seams.FileView, pc: Piece, bytes: *?[]const u8, try_patch: bool, overlay_shape: bool, stream_adjacent: bool, arrived_ns: u64) Error!Arm {
+    /// A binding the authority could not resolve came back as a hole: the
+    /// piece refuses EIO before any custody exists — never seeds a block
+    /// from the fabricated hole (a write into a holder's unservable block
+    /// map published the block's other bytes as zeros).
+    fn refuseFaulted(self: *WritePath, ino: u64, fault0: u64) Error!void {
+        if (self.map.resolveFault(ino) == fault0) return;
+        stats.write_resolve_fault_refusals.inc();
+        return error.InputOutput;
+    }
+
+    fn admitPiece(self: *WritePath, io: Io, req: Request, file: seams.FileView, pc: Piece, bytes: *?[]const u8, try_patch: bool, overlay_shape: bool, stream_adjacent: bool, arrived_ns: u64, fault0: u64) Error!Arm {
         const bs = self.cfg.block_size;
         var hint: enum { none, overlay_drain, upload, fold } = .none;
         var upload_permit: ?pipeline.Permit = null;
@@ -1091,6 +1108,7 @@ pub const WritePath = struct {
             if (overlay_shape and device_overlay.Overlay.pieceEligible(pc.rel, pc.len)) {
                 const vehicle: device_overlay.Vehicle = if (bytes.*) |b| .{ .bytes = b[pc.off .. pc.off + pc.len] } else .{ .slot = req.payload.slot };
                 const overwrite = self.map.lookup(req.ino, pc.block) != null;
+                try self.refuseFaulted(req.ino, fault0);
                 const handed = overlay_permit;
                 overlay_permit = null;
                 const stored = switch (try self.overlay.claim(io, .{ .ino = req.ino, .block = pc.block, .rel = pc.rel, .vehicle = vehicle, .file = file, .overwrite = overwrite, .permit = handed })) {
@@ -1138,6 +1156,7 @@ pub const WritePath = struct {
             const live_binding = self.epochs.baseBinding(self.map, req.ino, pc.block);
             const b_start = @as(u64, pc.block) * bs;
             const live_size = if (self.map.view(req.ino)) |v| v.size else file.size;
+            try self.refuseFaulted(req.ino, fault0);
             const has_existing = live_binding != null or @min(live_size, b_start + bs) > b_start;
             // E. Deferred-slot materialize.
             if (bytes.* == null) bytes.* = self.materialize(io, req.payload) catch return error.InputOutput;
@@ -2030,6 +2049,30 @@ test "the admission ledger identity: Σ admit_write_* ≡ user bytes at ACK acro
     try testing.expectEqualSlices(u8, &half, got[0..half.len]);
     try testing.expectEqualSlices(u8, &rest, got[half.len..]);
     try testing.expectEqual(viol0, counters.tripwireCount("write_shared_class_violation"));
+}
+
+test "THE RESOLVE FAULT: a write piece whose binding lookup came back as the hole an unservable foreign window leaves (the map's resolve-fault epoch moved) answers EIO before any custody — the block keeps its bytes; once the binding resolves, the same write seeds from the real block" {
+    const io = testing.io;
+    const w = try World.init(testing.allocator, .sync_inline, true);
+    defer w.deinit(testing.allocator);
+    _ = try w.f.publishBlock(20, 0, 0xAB);
+    const refusals0 = stats.write_resolve_fault_refusals.load();
+    w.f.map.fault_ino = 20;
+    w.f.map.fault_lookups = 64;
+    var small: [100]u8 = @splat(0x5C);
+    try testing.expectError(error.InputOutput, w.wp.write(io, .{ .ino = 20, .offset = 1000, .payload = .{ .bytes = &small }, .class = .entire_op, .file = World.striped(wt.BS) }));
+    try testing.expectEqual(refusals0 + 1, stats.write_resolve_fault_refusals.load());
+    try testing.expect(w.wp.table.get(20, 0) == null);
+    w.f.map.fault_lookups = 0;
+    _ = try w.wp.write(io, .{ .ino = 20, .offset = 1000, .payload = .{ .bytes = &small }, .class = .entire_op, .file = World.striped(wt.BS) });
+    w.wp.quiesce(io);
+    w.wp.flushAll(io);
+    var got: [wt.BS]u8 = undefined;
+    const b = w.f.map.seam().lookup(20, 0).?;
+    w.f.dev.peek(b.vol_tag, b.offset, &got);
+    try testing.expect(std.mem.allEqual(u8, got[0..1000], 0xAB));
+    try testing.expect(std.mem.allEqual(u8, got[1000..1100], 0x5C));
+    try testing.expect(std.mem.allEqual(u8, got[1100..], 0xAB));
 }
 
 test "the ENOSPC terminal law: a write that would CREATE custody against an exhausted set is refused BEFORE any byte is recorded; custody already held (a parked block's sibling, a brim rewrite of a sole-owned mapped block) keeps the ladder; the latch clears when supply returns" {

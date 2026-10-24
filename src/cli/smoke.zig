@@ -12413,19 +12413,27 @@ test "smoke: A FULL DATA STORE ANSWERS ENOSPC — NEVER EIO — AT write(2) AND 
         const eio = try std.fmt.parseInt(u64, lines.next() orelse return error.FillUnparsed, 10);
         const avail_kib = try std.fmt.parseInt(u64, lines.next() orelse return error.FillUnparsed, 10);
         std.debug.print("\nsmoke[full store]: {d} × 100 KiB files admitted unsynced; the refusal: {d} × ENOSPC, {d} × EIO; df avail {d} KiB\n", .{ n, enospc, eio, avail_kib });
+        if (n < 3800 or avail_kib >= reuse_row_block / 1024) {
+            const t = try rig.stats();
+            defer gpa.free(t);
+            std.debug.print("smoke[full store]: the refusal's words: staged_store_full {?d}, claim_enospc {?d}, over_cap {?d}, budget_sheds {?d}, evict_promotions {?d}, bound {?d} B, resident {?d} B, mem level {?d}, hard backstops {?d}\n", .{ numberAfter(t, "\"fuse_write_staged_store_full_refusals\":"), numberAfter(t, "\"write_cache_claim_enospc_refusals\":"), numberAfter(t, "\"staging_over_cap_refusals\":"), numberAfter(t, "\"write_cache_budget_sheds\":"), numberAfter(t, "\"write_cache_evict_promotions\":"), numberAfter(t, "\"write_cache_bound_bytes\":"), numberAfter(t, "\"current_staged_write_bytes\":"), numberAfter(t, "\"mem_budget_level\":"), numberAfter(t, "\"mem_budget_hard_backstops\":") });
+        }
         try testing.expect(n >= 3800 and n <= 3911);
         try testing.expectEqual(@as(u64, 1), enospc);
         try testing.expectEqual(@as(u64, 0), eio);
         try testing.expect(avail_kib < reuse_row_block / 1024);
         break :blk n;
     };
-    {
+    // The sync points the counters below span: the row's `sync -f` and any
+    // host-wide sync(2) beside it (every FUSE mount gets its SYNCFS).
+    const syncfs0: u64, const enospc0: u64 = blk: {
         const t = try rig.stats();
         defer gpa.free(t);
         try testing.expect((numberAfter(t, "\"fuse_write_staged_store_full_refusals\":") orelse 0) >= 1);
         try testing.expect((numberAfter(t, "\"write_cache_claim_enospc_refusals\":") orelse 0) >= 1);
         try testing.expectEqual(@as(?u64, 0), numberAfter(t, "\"full_store_episodes\":"));
-    }
+        break :blk .{ numberAfter(t, "\"syncfs_calls\":") orelse 0, numberAfter(t, "\"fsync_promote_enospc\":") orelse 0 };
+    };
     // 2. The sync point: the residents promote into packs until the store
     //    has no block for the rest — ENOSPC, never EIO; ONE warning.
     const mark = try rig.logLen();
@@ -12440,8 +12448,15 @@ test "smoke: A FULL DATA STORE ANSWERS ENOSPC — NEVER EIO — AT write(2) AND 
     const kept_after_syncfs: u64 = blk: {
         const t = try rig.stats();
         defer gpa.free(t);
-        const kept = numberAfter(t, "\"fsync_promote_enospc\":") orelse 0;
-        std.debug.print("smoke[full store]: fsync_promote_enospc {d}, promotions_enospc {d}, fsync_promoted_files {d}, full_store_episodes {d}, pack_refill_storage_full {d}\n", .{ kept, numberAfter(t, "\"promotions_enospc\":") orelse 0, numberAfter(t, "\"fsync_promoted_files\":") orelse 0, numberAfter(t, "\"full_store_episodes\":") orelse 0, numberAfter(t, "\"pack_refill_storage_full\":") orelse 0 });
+        // `fsync_promote_enospc` counts one per resident per sync point: a
+        // host-wide sync(2) beside the row met the same kept set again (the
+        // 4-wide load: 182 for 91 kept, all four copies at once).
+        const points = (numberAfter(t, "\"syncfs_calls\":") orelse 0) - syncfs0;
+        const met = (numberAfter(t, "\"fsync_promote_enospc\":") orelse 0) - enospc0;
+        std.debug.print("smoke[full store]: fsync_promote_enospc {d} over {d} sync point(s), promotions_enospc {d}, fsync_promoted_files {d}, full_store_episodes {d}, pack_refill_storage_full {d}\n", .{ met, points, numberAfter(t, "\"promotions_enospc\":") orelse 0, numberAfter(t, "\"fsync_promoted_files\":") orelse 0, numberAfter(t, "\"full_store_episodes\":") orelse 0, numberAfter(t, "\"pack_refill_storage_full\":") orelse 0 });
+        try testing.expect(points >= 1);
+        try testing.expectEqual(@as(u64, 0), met % points);
+        const kept = met / points;
         try testing.expect(kept >= 1);
         try testing.expect(kept < admitted / 4); // the estimate's gap, not the fill
         try testing.expectEqual(@as(?u64, 0), numberAfter(t, "\"fsync_promote_refusals\":"));

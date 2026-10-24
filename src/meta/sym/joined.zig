@@ -97,7 +97,8 @@ pub const stats = struct {
     /// refill ahead of the checkpoint clock).
     pub var extent_grant_refill_kicks: counters.ShardedCounter = .{};
     /// The manager's endpoint was not yet published when the joiner read
-    /// tree 0: one bounded re-read of the projection per poll.
+    /// tree 0, or the published one answered no dial (a previous
+    /// incarnation's): one bounded re-read of the projection per poll.
     pub var joined_endpoint_polls: counters.ShardedCounter = .{};
     /// Leases released over the wire at the clean leave.
     pub var joined_leave_releases: counters.ShardedCounter = .{};
@@ -241,6 +242,12 @@ pub const SharedLink = struct {
         self.lock.lockUncancelable(self.io);
         defer self.lock.unlock(self.io);
         return self.ep;
+    }
+
+    /// Dial now (re-resolving first) without a verb: the session stands
+    /// for the next call.
+    pub fn dial(self: *SharedLink) errors.Error!void {
+        _ = try self.ensure();
     }
 
     fn ensure(self: *SharedLink) errors.Error!*dialer.Mux {
@@ -449,6 +456,7 @@ pub const JoinedSet = struct {
         self.wire = .{ .gpa = gpa, .link = self.link.link(), .volume = be.index, .identity = wire_identity, .pages = .{ .ctx = self, .read = &readPageFn } };
         self.joiner = join_ladder.Joiner.init(gpa, &self.wire);
         errdefer self.joiner.deinit();
+        try self.awaitManagerListener(page0);
         // 3. Rung 5: the region over the wire.
         self.joiner.joinRegion(.{
             .identity = identity,
@@ -476,6 +484,39 @@ pub const JoinedSet = struct {
         sym.stats.appenders_live.add(1);
         log.info("meta volume {s}: JOINED as appender {d} (term {d}, node 0x{x}, mount slot 0x{x}) at {f}: ring {d} B in {d} segment(s), head {d}, grant {d} extent(s), incarnation base {x}; {d} writer(s) known", .{ be.path, jr.appenderId(), jr.core.page.term, identity.node_token, identity.mount_slot, ep, jr.core.ringBytes(), jr.core.table.len, jr.core.core.headPos(), self.granted, jr.seq.load(), writers_known });
         return self;
+    }
+
+    /// What a joiner may rely on from the manager across its incarnations:
+    /// appender 0's page names WHO manages (rewritten at every incarnation's
+    /// bind — term + 1, its writer id — before its listener exists), never
+    /// WHERE it listens. `endpoint:{0}` is read off the projection, which
+    /// names the listener whose publish the newest checkpoint covers; the
+    /// manager lands a moved listener's publish before its plane arms
+    /// (`wire_plane.publishEndpoints`), but a join racing the manager's
+    /// bring-up (its page Live under the new term, its publish not yet
+    /// checkpointed) reads the previous incarnation's dead port. So the
+    /// projected endpoint is a HINT until a dial proves it: a dial nobody
+    /// answers re-resolves (the resolver re-reads `endpoint:{0}` at every
+    /// newer checkpoint) and redials, bounded by the endpoint poll; past
+    /// it the manager is unreachable, never a device error.
+    fn awaitManagerListener(self: *JoinedSet, page0: page.Page) OpenError!void {
+        const deadline = clock.monotonicNs() + ENDPOINT_POLL_MAX_MS * std.time.ns_per_ms;
+        while (true) {
+            self.link.dial() catch |e| switch (e) {
+                error.HolderUnreachable, error.ListenerRefused => {
+                    if (clock.monotonicNs() >= deadline) {
+                        log.err("meta volume {s}: the manager's listener {f} (endpoint:{{0}} at the newest checkpoint) answered no dial within {d} ms — appender 0's page is Live under term {d}, but no checkpoint names a listener that answers", .{ self.be.path, self.link.endpointNow(), ENDPOINT_POLL_MAX_MS, page0.term });
+                        return error.ManagerUnreachable;
+                    }
+                    stats.joined_endpoint_polls.inc();
+                    self.be.io.sleep(.fromMilliseconds(ENDPOINT_POLL_STEP_MS), .awake) catch {};
+                    continue;
+                },
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.Io,
+            };
+            return;
+        }
     }
 
     pub fn deinit(self: *JoinedSet) void {

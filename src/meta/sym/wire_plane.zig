@@ -1429,6 +1429,14 @@ pub const WirePlane = struct {
             }
             controlEntry(s, &.{.{ .put = .{ .key = k.slice(), .value = &value } }}, .parking) catch return error.Io;
             stats.wire_endpoint_publications.inc();
+            // A joiner, a reader and the job CLI read `endpoint:{0}` off the
+            // PROJECTION (they never replay ring 0), and appender 0's page —
+            // rewritten at this incarnation's bind — says only that SOME
+            // incarnation is live: until a checkpoint covers this put the
+            // newest record names the previous incarnation's dead listener.
+            // So a moved listener lands in a checkpoint before the plane
+            // arms: from `ready` on, the projection names the live one.
+            _ = s.volume().vt.cycleCheckpoint(s.volume().ctx) catch return error.Io;
         }
     }
 

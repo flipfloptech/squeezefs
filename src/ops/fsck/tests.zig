@@ -168,6 +168,47 @@ test "the fleet's MERGED block census: a member's proposal carries its custody's
     try testing.expectEqual(@as(u64, 1), c.suspects_cleared);
 }
 
+test "the merged census's C3 passes the pack-open ledger (the ONLINE FSCK row's `[C3] refcount 37 vs 36`: 200 × 64 KiB promoted over two volumes = a sealed 64-tenant pack and an OPEN 36-tenant pack each, a member's custody holding one tenant): an open pack whose tenants straddle the holder's view and a member's custody reads `refcount = tenants + 1` (the packer's pin) — exempt and counted, never a suspect; sealed, the same block is judged and a count one above its referents is still the finding" {
+    const gpa = testing.allocator;
+    const set = try RamSet.init(gpa);
+    defer set.deinit();
+    _ = try populate(set);
+    var h = set.host(.online);
+    var local = try ram.runHost(set, &h, .{ .ship_owners = true });
+    defer local.deinit(gpa);
+    try ram.expectClasses(local, &.{});
+    // The packed pair's block 10 of A carries a third tenant in a member's
+    // custody (slot 7): three references.
+    const theirs_binds = [_]finding.BindingRef{.{ .vol_tag = VOL_A, .block_idx = 10, .block_index = 0 }};
+    const theirs = [_]finding.OwnerRef{.{ .ino = key.guestLocalIno(7, 5), .bindings = &theirs_binds }};
+    // Open: three tenants + the pin.
+    set.setRefcount(VOL_A, 10, 4);
+    try set.open_packs.put(gpa, VOL_A ^ (10 << 8), {});
+    var c: finding.Counters = .{};
+    var open: std.ArrayList(Finding) = .empty;
+    defer open.deinit(gpa);
+    try classes.crossMemberBlockPlane(gpa, &h, local.owners, &theirs, &c, &open);
+    for (open.items) |f| std.debug.print("  open pack: {f}\n", .{f});
+    try testing.expectEqual(@as(usize, 0), open.items.len);
+    try testing.expectEqual(@as(u64, 1), c.pack_ledger_exempted);
+    // Sealed, the pin released: three tenants, three references.
+    set.open_packs.clearRetainingCapacity();
+    set.setRefcount(VOL_A, 10, 3);
+    var sealed: std.ArrayList(Finding) = .empty;
+    defer sealed.deinit(gpa);
+    try classes.crossMemberBlockPlane(gpa, &h, local.owners, &theirs, &c, &sealed);
+    try testing.expectEqual(@as(usize, 0), sealed.items.len);
+    // Sealed and one above its referents: the drift is judged.
+    set.setRefcount(VOL_A, 10, 4);
+    var drift: std.ArrayList(Finding) = .empty;
+    defer drift.deinit(gpa);
+    try classes.crossMemberBlockPlane(gpa, &h, local.owners, &theirs, &c, &drift);
+    try testing.expectEqual(@as(usize, 1), drift.items.len);
+    try testing.expectEqual(Finding{ .c3_refcount = .{ .vol_tag = VOL_A, .block_idx = 10, .expected = 3, .actual = 4 } }, drift.items[0]);
+    try testing.expectEqual(@as(u64, 1), c.pack_ledger_exempted);
+    set.setRefcount(VOL_A, 10, 2);
+}
+
 test "the block plane under a live lessee: a block a lessee's record references is the lessee's (its ring lags this census — the first N-daemon fleet run read every pack B shared as `refcount 64 vs 63`), so C2/C3/C8 scope it out and count it; the member's custody run judges no allocator arm at all (a non-holder's allocator is not the truth)" {
     const gpa = testing.allocator;
     const set = try RamSet.init(gpa);

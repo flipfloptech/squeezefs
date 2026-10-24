@@ -1317,12 +1317,7 @@ pub const Pass = struct {
         if (b.idx >= v.alloc.capacityBlocks()) return true;
         if (self.mintedUnderScan(b.vol_tag, b.idx)) return false;
         if (self.host.recheck_hook) |h| h.fire(.phase_a_registry, b.idx);
-        if (self.inFlight(b.vol_tag, b.idx)) return false;
-        if (self.host.pack) |p| if (p.isOpenPack(p.ctx, b.vol_tag, b.idx)) {
-            self.counters.pack_ledger_exempted += 1;
-            return false;
-        };
-        return true;
+        return !liveOwnerShielded(self.host, v, b.idx, &self.counters);
     }
 
     /// The epoch side map: a block minted while this pass's scan latch
@@ -1816,16 +1811,37 @@ pub fn recordSatisfiesSchema(kind: u8, k: []const u8, v: []const u8, geo: layout
     return true;
 }
 
+/// The live-owner shields every allocator verdict passes, registry-absence
+/// FIRST (§1.3): an owner in flight on the block (a mint before its
+/// publish, a release before its free), then the pack-open ledger (an open
+/// pack holds `refcount = committed + in-flight tenants + 1` until its seal,
+/// whose census checks that arithmetic itself — `pack_pin_refcount_drift` —
+/// and the next run judges the sealed count). ONE law for the whole-view
+/// ladder's Phase A and the fleet's merged arms. True = shielded, counted.
+fn liveOwnerShielded(host: *const Host, v: *const Volume, idx: u64, counters: *finding.Counters) bool {
+    if (v.alloc.inflightContains(idx)) {
+        counters.inflight_exempted += 1;
+        return true;
+    }
+    if (host.pack) |p| if (p.isOpenPack(p.ctx, v.vol_tag, idx)) {
+        counters.pack_ledger_exempted += 1;
+        return true;
+    };
+    return false;
+}
+
 /// §8's merged reference arms over a LIVE set: the coordinator's own
 /// derived census and every member's (its custody's owners, shipped in its
 /// proposal) against THIS mount's allocators — the lost arm (a block a
 /// member's layout binds that the holder tracks no more: the data-loss
 /// shape, a nonterminal free the holder executed under live tenants) and
 /// C3 (the holder's count ≠ the merged references). The bitmap's SET bit
-/// exempts a lessee's fresh carve (its reference follows), the in-flight
-/// registry a mint mid-publish. The leaked arm and C8 stay the whole-view
-/// run's: a leak is space (a member's carve between two censuses would read
-/// as one), C8 compares durable refs the holder cannot read. The suspects
+/// exempts a lessee's fresh carve (its reference follows); the live-owner
+/// shields are the ladder's own (`liveOwnerShielded`: an open pack whose
+/// tenants straddle the holder's view and a member's custody read
+/// `refcount 37 vs 36` without its ledger). The leaked arm and C8 stay the
+/// whole-view run's: a leak is space (a member's carve between two censuses
+/// would read as one), C8 compares durable refs the holder cannot read. The suspects
 /// are the caller's to CONFIRM against a second member census (the ladder's
 /// re-check with the member's own fresh evidence).
 pub fn crossMemberBlockPlane(gpa: Allocator, host: *const Host, local: []const finding.OwnerRef, members: []const finding.OwnerRef, counters: *finding.Counters, out: *std.ArrayList(Finding)) Allocator.Error!void {
@@ -1858,10 +1874,7 @@ pub fn crossMemberBlockPlane(gpa: Allocator, host: *const Host, local: []const f
             continue;
         };
         const out_of_range = k.block_idx >= v.alloc.capacityBlocks();
-        if (!out_of_range and v.alloc.inflightContains(k.block_idx)) {
-            counters.inflight_exempted += 1;
-            continue;
-        }
+        if (!out_of_range and liveOwnerShielded(host, v, k.block_idx, counters)) continue;
         if (!out_of_range) if (v.alloc.refcount(k.block_idx)) |rc| {
             counters.refcounts_checked += 1;
             if (rc != e.value_ptr.count) try out.append(gpa, .{ .c3_refcount = .{ .vol_tag = k.vol_tag, .block_idx = k.block_idx, .expected = e.value_ptr.count, .actual = rc } });

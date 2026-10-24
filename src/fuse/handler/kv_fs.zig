@@ -4596,7 +4596,27 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         /// settle, the clip, the extension zeros — on the wire service's
         /// own op context.
         pub fn servedTruncateFace(self: *Self) sym_xv.record_ship.TruncateFace {
-            return .{ .ctx = self, .truncate = &servedTruncate };
+            return .{ .ctx = self, .truncate = &servedTruncate, .stale_claim = &servedStaleClaim };
+        }
+
+        /// THE CLAIM'S EPOCH (the holder's half): a non-holder's write
+        /// claimed under size epoch `epoch` — if a size-setting commit
+        /// landed here since, the truncate wins ("write, then truncate"):
+        /// the claim is refused and THIS mount's size path runs at the
+        /// current size, clipping any block the claimer's publish bound
+        /// past the cut after it (`max(size, claim)` regrew the file over
+        /// clipped blocks). True = refused.
+        fn servedStaleClaim(ctx: *anyopaque, global: u64, epoch: u64) errors.Error!bool {
+            const self: *Self = @ptrCast(@alignCast(ctx));
+            const local = try localOf(global);
+            // The wire's epoch is biased by one (`GrantPageHead.size_epoch`).
+            if (epoch == 0 or !self.data.hasVolumes() or !self.data.sizeSetSince(local, epoch - 1)) return false;
+            var trace = op_trace.OpTrace.begin(0, .other);
+            defer trace.finish();
+            var c: Ctx = .{ .unique = 0, .uid = 0, .gid = 0, .pid = 0, .io = self.io, .trace = &trace, .wd_slot = null, .window = &.{} };
+            const v = try self.readInode(local);
+            _ = try self.setattr(&c, .{ .ino = global, .attr = .{ .size = self.claimedSize(local, v) } });
+            return true;
         }
 
         /// The holder's size epoch a foreign-slot file's token page carried

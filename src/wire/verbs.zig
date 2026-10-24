@@ -1061,10 +1061,11 @@ pub const GrantPageHead = extern struct {
     holder: u32,
     attrs: InodeValueWire,
     reserved2: [4]u8,
-    /// The holder's size epoch of the object (`DataPlane.sizeEpoch`), read
-    /// BEFORE the records: a joiner's write carries it on its size claim
-    /// (`SetattrWire.claim_epoch`) and the holder refuses a claim under an
-    /// older epoch — a truncate crossed the write. 0 = none.
+    /// The holder's size epoch of the object PLUS ONE (0 = none; a fresh
+    /// set's epochs start at 0), read BEFORE the records: a joiner's write
+    /// carries it on its size claim (`SetattrWire.claim_epoch`) and the
+    /// holder refuses a claim under an older epoch — a truncate crossed the
+    /// write.
     size_epoch: u64 = 0,
 
     pub fn check(self: GrantPageHead) bool {
@@ -1632,9 +1633,10 @@ pub const SetattrWire = extern struct {
     ctime: i64,
     flags: u32,
     reserved: u32,
-    /// With `SETATTR_SIZE_CLAIM`: the holder's size epoch the claimer's
-    /// token page carried when its write read the size (0 = none, never
-    /// judged); the holder refuses a claim under an older epoch.
+    /// With `SETATTR_SIZE_CLAIM`: the size epoch the claimer's token page
+    /// carried (`GrantPageHead.size_epoch`, biased by one; 0 = none, never
+    /// judged) when its write read the size; the holder refuses a claim
+    /// under an older epoch.
     claim_epoch: u64 = 0,
 
     pub const none: SetattrWire = .{ .valid = 0, .mode = 0, .uid = 0, .gid = 0, .size = 0, .atime = 0, .mtime = 0, .ctime = 0, .flags = 0, .reserved = 0, .claim_epoch = 0 };

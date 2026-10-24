@@ -1304,6 +1304,49 @@ test "a shipped setattr CARRIES the kernel's kill_suidgid (FATTR_KILL_SUIDGID; h
     try testing.expectEqual(strips0 + 3, record_ship.stats.record_killpriv_strips.load());
 }
 
+test "THE CLAIM'S EPOCH — a write's claim made under an older size epoch than a size set the holder landed since is REFUSED (the size stands; the face clipped at the current size), a claim under the current epoch raises the size, a claim without an epoch is never judged; the epoch rides the wire only with the claim word" {
+    const gpa = testing.allocator;
+    const f = try TwoHolders.init(gpa, testing.io, .{}, .{});
+    defer f.deinit();
+    var view: HolderView = .{};
+    var rs_b: RecordShipService = .{ .plane = &f.b.plane, .sink = view.sink() };
+    rs_b.register(&f.b.svc);
+    const Rec = struct {
+        /// The holder's last size set's epoch.
+        set_at: u64 = 5,
+        clips: u32 = 0,
+        fn run(_: *anyopaque, _: u64, _: u64) errors.Error!void {}
+        fn stale(ctx: *anyopaque, _: u64, epoch: u64) errors.Error!bool {
+            const r: *@This() = @ptrCast(@alignCast(ctx));
+            if (epoch >= r.set_at) return false;
+            r.clips += 1;
+            return true;
+        }
+    };
+    var rec: Rec = .{};
+    const face: record_ship.TruncateFace = .{ .ctx = &rec, .truncate = &Rec.run, .stale_claim = &Rec.stale };
+    rs_b.armTruncate(&face);
+    const file = gino(50, 3);
+    try f.b.seedFile(file, 1);
+    // The epoch rides only with the claim word; an epoch without it is
+    // screened out at the head.
+    try testing.expectEqual(@as(u64, 0), (record_ship.Setattr{ .claim_epoch = 7 }).toWire().claim_epoch);
+    var bare = (record_ship.Setattr{ .size = 1 }).toWire();
+    bare.claim_epoch = 7;
+    try testing.expect(!bare.check());
+    try testing.expectEqual(@as(u64, 7), record_ship.Setattr.fromWire((record_ship.Setattr{ .size = 1, .size_claim = true, .claim_epoch = 7 }).toWire()).claim_epoch);
+    const refused0 = record_ship.stats.record_size_claims_refused.load();
+    const stale = (try record_ship.ship(f.a.plane.resolver, 0, file, .{ .setattr = .{ .size = 9000, .size_claim = true, .claim_epoch = 4 } }, 0)).?;
+    try testing.expectEqual(@as(u64, 0), stale.inode.?.size);
+    try testing.expectEqual(@as(u32, 1), rec.clips);
+    try testing.expectEqual(refused0 + 1, record_ship.stats.record_size_claims_refused.load());
+    const current = (try record_ship.ship(f.a.plane.resolver, 0, file, .{ .setattr = .{ .size = 9000, .size_claim = true, .claim_epoch = 5 } }, 0)).?;
+    try testing.expectEqual(@as(u64, 9000), current.inode.?.size);
+    const unjudged = (try record_ship.ship(f.a.plane.resolver, 0, file, .{ .setattr = .{ .size = 9500, .size_claim = true } }, 0)).?;
+    try testing.expectEqual(@as(u64, 9500), unjudged.inode.?.size);
+    try testing.expectEqual(@as(u32, 1), rec.clips);
+}
+
 test "record ship: a chmod/setxattr/removexattr/layout publish of a FOREIGN-slot file lands at its holder as ONE verb each, under the holder's door, and the holder invalidates its own attr cache and kernel view (INVAL_INODE then PRUNE); the publish carries its DMA proofs to the holder's face and is REJECTED where no face is armed; a local file ships nothing; a slot-moved answer redirects once; ships ≡ served" {
     const gpa = testing.allocator;
     const f = try TwoHolders.init(gpa, testing.io, .{}, .{});

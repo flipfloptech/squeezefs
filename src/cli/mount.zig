@@ -1182,10 +1182,11 @@ fn landForGrant(ctx: *anyopaque, _: Io, object: u64) void {
     fs.landForGrant(object);
 }
 
-/// `PrepareSeam.size_epoch`: the holder's size epoch of the object.
+/// `PrepareSeam.size_epoch`: the holder's size epoch of the object, biased
+/// by one on the wire (0 = none: a fresh set's epochs start at 0).
 fn grantSizeEpoch(ctx: *anyopaque, object: u64) u64 {
     const fs: *BackendFs = @ptrCast(@alignCast(ctx));
-    return fs.data.size_epochs.current(object);
+    return fs.data.size_epochs.current(object) + 1;
 }
 
 /// `SQUEEZEFS_TEST_FOREIGN_CLAIM_HOLD` (a FIFO path; unset or `off` = none).

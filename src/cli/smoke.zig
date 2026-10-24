@@ -3725,7 +3725,17 @@ fn foreignAppendRow(write_cache: bool) !void {
     try rig.umount();
     try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
     _ = try fsckClean(rig, "the foreign-write row's remount");
-    std.debug.print("smoke: foreign writes ({s}): B's appends, gap, middle and truncate-up writes to A's eight files byte-exact through both mounts at once and after both remount; fsck clean\n", .{if (write_cache) "supervised" else "foreground"});
+    // No invariant fired on either member, the dismount seals included (a
+    // displaced open-pack tenant's shipped free once drifted A's pin).
+    {
+        const ta = try rig.readLog();
+        defer gpa.free(ta);
+        const tb = try b.readLog();
+        defer gpa.free(tb);
+        try testing.expect(std.mem.indexOf(u8, ta, "TRIPWIRE") == null);
+        try testing.expect(std.mem.indexOf(u8, tb, "TRIPWIRE") == null);
+    }
+    std.debug.print("smoke: foreign writes ({s}): B's appends, gap, middle and truncate-up writes to A's eight files byte-exact through both mounts at once and after both remount; fsck clean; no tripwire on either member\n", .{if (write_cache) "supervised" else "foreground"});
 }
 
 /// Every file of the foreign-write row through B's mount and through A's,

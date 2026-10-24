@@ -1547,7 +1547,16 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         }
 
         fn regularOpenFlags(self: *const Self) u32 {
-            var f: u32 = abi.FOPEN_KEEP_CACHE;
+            // Under strictatime an open drops the kernel's cached pages
+            // (no FOPEN_KEEP_CACHE): a read the kernel served from its page
+            // cache reaches no daemon, and its own in-core stamp dies at
+            // the next GETATTR — so every open-read cycle reads through the
+            // daemon and is stamped, as ext4's strictatime stamps it
+            // (charter §4 "Access time"; xfstests generic/003's third
+            // access). relatime keeps the cache: its rule makes the first
+            // read after a change a daemon read whenever the write left no
+            // whole page behind.
+            var f: u32 = if (self.atime_law.current().posture == .strictatime) 0 else abi.FOPEN_KEEP_CACHE;
             // FOPEN_NOFLUSH: fuse ≥ 7.35 — the control open arm's, and the
             // write-back timer's in either arm (close is no durability
             // point); a no-open CREATE's file under the close posture gets

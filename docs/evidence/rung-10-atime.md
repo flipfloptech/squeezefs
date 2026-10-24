@@ -105,19 +105,27 @@ of a FUSE superblock is refused by `fuse_parse_param` — "No changes allowed in
 as xfstests already knows; mount(8) merges the standing flags into a remount, so every remount
 names its whole atime set.)
 
-## The gap that stays (a kernel one)
+## The gap that stays (a kernel one), and the strictatime open
 
-A read the kernel serves from its own page cache under `FOPEN_KEEP_CACHE` reaches no FUSE
-daemon: the kernel's in-core `touch_atime` stands until the next GETATTR replaces it with the
-daemon's (`fuse_invalidate_atime` is not called for a cache hit, so the replacement waits for
-the attr TTL or the next real read). The row's strictatime second read showed it (`cat` twice:
-the second was a page-cache hit, `stat` after the 1 s TTL showed the daemon's older stamp);
-every FUSE filesystem shares it. A partial-page write leaves no uptodate folio
-(`fuse_fill_write_pages` marks a folio uptodate only when the copy filled it), so generic/003
-(`echo aaa`) and generic/192 (`echo test`) read through the daemon and are exact; a full-page
-write followed by a `cat` is the shape that misses under relatime. The fix is the kernel's:
-`fuse_flush_times` carrying `FATTR_ATIME` (the daemon would take it as a touch, not a utimes),
-or a FUSE `update_time` op — an owner-call for `scripts/kernel/patches-mainline/`.
+A read the kernel serves from its own page cache reaches no FUSE daemon: the kernel's in-core
+`touch_atime` stands until the next GETATTR replaces it with the daemon's (`fuse_invalidate_atime`
+is not called for a cache hit, so the replacement waits for the attr TTL or the next real read).
+The first subset run showed it as generic/003's one failure — "access time has not been updated
+after accessing file3 third time": the strictatime arm's second `cat` of a 4-byte file on one
+mount was a page-cache hit (`transport_fast_dispatch_serves` flat, `fuse_atime_touches` flat,
+`stat` after the 1 s TTL showed the daemon's older stamp). Every FUSE filesystem shares it. So
+under **strictatime** a regular file's open carries no `FOPEN_KEEP_CACHE` (`regularOpenFlags`):
+the open drops the cached pages and every open-read cycle reads through the daemon and is stamped
+(the three `cat`s of the row and generic/003 all move); the posture's own cost, as ext4's journal
+write per read is. **relatime** keeps the cache: a partial-page write marks no folio uptodate
+(`fuse_fill_write_pages`), so the first read after `echo aaa > f` is a daemon read (generic/003,
+generic/192), and a full-page write followed by a `cat` while the pages stay cached is the shape
+that misses. What stays: repeated reads on ONE open descriptor under strictatime, and that
+relatime shape — the fix is the kernel's (`fuse_flush_times` carrying `FATTR_ATIME`, taken by the
+daemon as a touch, not a utimes; or a FUSE `update_time` op): an owner-call for
+`scripts/kernel/patches-mainline/`. Under zero-message opens (the 9.33 kernel's no-open posture)
+the kernel keeps the cache on its own (`fuse_file_open`: `FOPEN_KEEP_CACHE` is the no-open
+default) and the strictatime open cannot drop it — the same gap there.
 
 ## Counts
 

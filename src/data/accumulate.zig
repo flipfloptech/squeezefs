@@ -151,6 +151,10 @@ pub const stats = struct {
     /// Counted per bark, ONE warning per episode
     /// (`Table.join_overlong_warned`); never a tripwire.
     pub var upload_join_overlong: counters.ShardedCounter = .{};
+    /// `upload_join_refusals_taken`: a flush that joined an upload the
+    /// plane then refused answered that refusal — one device wait, never a
+    /// re-drive into a second.
+    pub var upload_join_refusals_taken: counters.ShardedCounter = .{};
     /// THE one userspace copy's bytes.
     pub var nt_copy_bytes: counters.ShardedCounter = .{};
     pub var active_block_cow_copies: counters.ShardedCounter = .{};
@@ -207,7 +211,7 @@ pub const stats = struct {
 
 pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
     try w.writeAll("{");
-    inline for (.{ "write_through_blocks", "write_through_bytes", "write_through_fallbacks", "nt_copy_bytes", "active_block_cow_copies", "active_block_memset_elided_bytes", "active_block_ooo_runs", "active_block_run_table_completions", "overwrite_seed_deferred", "overwrite_seed_materialized", "overwrite_seed_skipped", "write_block_revisits", "parked_pool_refusals", "parked_pool_trimmed_cells", "durable_upload_bytes_escalation", "placed_merge_elides", "drain_inplace_drains", "drain_inplace_pages", "drain_inplace_dmas", "drain_inplace_write_bytes", "drain_inplace_seed_bytes", "drain_inplace_declines", "drain_inplace_dma_errors", "drain_inplace_seed_read_errors", "drain_inplace_dirty_drains", "extent_cap_fallbacks", "parked_ino_scans", "reserved_landings", "reserved_landing_declines", "upload_join_overlong" }) |name| {
+    inline for (.{ "write_through_blocks", "write_through_bytes", "write_through_fallbacks", "nt_copy_bytes", "active_block_cow_copies", "active_block_memset_elided_bytes", "active_block_ooo_runs", "active_block_run_table_completions", "overwrite_seed_deferred", "overwrite_seed_materialized", "overwrite_seed_skipped", "write_block_revisits", "parked_pool_refusals", "parked_pool_trimmed_cells", "durable_upload_bytes_escalation", "placed_merge_elides", "drain_inplace_drains", "drain_inplace_pages", "drain_inplace_dmas", "drain_inplace_write_bytes", "drain_inplace_seed_bytes", "drain_inplace_declines", "drain_inplace_dma_errors", "drain_inplace_seed_read_errors", "drain_inplace_dirty_drains", "extent_cap_fallbacks", "parked_ino_scans", "reserved_landings", "reserved_landing_declines", "upload_join_overlong", "upload_join_refusals_taken" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, @field(stats, name).load() });
     }
     try w.print("\"parked_full_buffer_bytes\":{d},\"parked_buffers\":{d},", .{ stats.parked_full_buffer_bytes.load(), stats.parked_buffers.load() });
@@ -416,6 +420,13 @@ pub const Entry = struct {
     last_touch_ns: u64,
     /// An upload task holds a snapshot (the entry is being written through).
     upload_inflight: bool = false,
+    /// The in-flight (or last) upload's stamp (`nextWriteEpoch`: unique in
+    /// the process, so a stamp never names another entry's upload), and
+    /// the stamp of the last upload that left the block parked unpublished
+    /// with its verdict: what every joiner of that upload answers.
+    upload_seq: u64 = 0,
+    refused_seq: u64 = 0,
+    refused_fenced: bool = false,
     in_use: bool = false,
     /// The binding whose bytes a content-valid cell's clean pages equal:
     /// the seed's base, or the key a superseded upload's snapshot published
@@ -537,6 +548,11 @@ pub const Table = struct {
     /// A join barked (`upload_join_overlong`): one warning per episode,
     /// closed when a barked joiner's upload settles.
     join_overlong_warned: Atomic(bool) = .init(false),
+    /// The last upload DMA the device refused with ENOSPC (0 = never; a
+    /// thin pool out of space): the parked-buffer gate's stall answer
+    /// says ENOSPC, not EIO, when one landed inside its wait
+    /// (`deviceSpaceRefusedSince`).
+    device_space_refused_ns: Atomic(u64) = .init(0),
 
     pub fn init(gpa: Allocator, block_size: u32, cap_buffers: u64) Allocator.Error!Table {
         const cap: usize = @intCast(activeBlockEntries(cap_buffers));
@@ -618,6 +634,20 @@ pub const Table = struct {
     fn poolBytesFn(ctx: *anyopaque) u64 {
         const self: *Table = @ptrCast(@alignCast(ctx));
         return self.pool.liveBytes();
+    }
+
+    /// An upload's DMA met the device's ENOSPC (`device_space_refused_ns`).
+    pub fn noteDeviceSpaceRefusal(self: *Table) void {
+        // Monotonic: a census hint read against the reader's own clock, no
+        // paired fence (the gate's verdict is its own flush's).
+        self.device_space_refused_ns.store(@max(clock.monotonicNs(), 1), .monotonic);
+    }
+
+    /// PURE: the device refused an upload's DMA with ENOSPC at or after
+    /// `since_ns` (monotonic).
+    pub fn deviceSpaceRefusedSince(self: *const Table, since_ns: u64) bool {
+        const at = self.device_space_refused_ns.load(.monotonic);
+        return at != 0 and at >= since_ns;
     }
 
     fn trimFn(ctx: *anyopaque, min_idle_ticks: u64) void {
@@ -1274,9 +1304,16 @@ pub fn uploadParkedBlock(table: *Table, deps: UploadDeps, io: Io, ino: u64, bloc
     // settle notify — instead of minting a second block for the same image
     // and abandoning it at the publish (`unpublished_mint_abandons`).
     var joined = false;
-    // `upload_inflight` is cleared on EVERY exit that leaves the entry
-    // parked, and the settle is notified on every exit.
+    // The upload this task joined (its stamp), if any.
+    var joined_seq: ?u64 = null;
+    // `upload_inflight` is cleared by the task that SET it on every exit
+    // that leaves the entry parked (`owns_inflight`; a joiner never clears
+    // another task's flag), stamping a refusal unless its upload landed;
+    // the settle is notified on every exit.
     var retired_by_us = false;
+    var owns_inflight = false;
+    var upload_seq: u64 = 0;
+    var fenced = false;
     var join_since_ns: u64 = 0;
     var barked = false;
     // A barked joiner's wait is over when it leaves: the episode closes
@@ -1285,9 +1322,13 @@ pub fn uploadParkedBlock(table: *Table, deps: UploadDeps, io: Io, ino: u64, bloc
     defer {
         if (retired_by_us) {
             table.capacity.notifyWaiters(io);
-        } else {
+        } else if (owns_inflight) {
             const g = deps.locks.acquire(io, ino, block, .pipeline_upload);
-            if (table.get(ino, block)) |e| e.upload_inflight = false;
+            if (table.get(ino, block)) |e| {
+                e.upload_inflight = false;
+                e.refused_seq = upload_seq;
+                e.refused_fenced = fenced;
+            }
             g.release(io);
         }
         table.upload_settled.notifyWaiters(io);
@@ -1309,12 +1350,25 @@ pub fn uploadParkedBlock(table: *Table, deps: UploadDeps, io: Io, ino: u64, bloc
                     settle.cancel(io);
                     return if (joined) .joined else .discarded;
                 };
+                // The upload this task waited on left the block parked: its
+                // refusal IS the verdict (no second device wait).
+                if (joined_seq) |js| if (e.refused_seq == js) {
+                    settle.cancel(io);
+                    stats.upload_join_refusals_taken.inc();
+                    return if (e.refused_fenced) .fence_drop else .stay_parked;
+                };
                 if (e.upload_inflight) {
                     inflight_elsewhere = true;
+                    joined_seq = e.upload_seq;
                 } else {
                     settle.cancel(io);
                     if (e.repr != .full or !e.content_valid or e.seed == .deferred) return .stay_parked;
                     e.upload_inflight = true;
+                    upload_seq = nextWriteEpoch();
+                    e.upload_seq = upload_seq;
+                    owns_inflight = true;
+                    fenced = false;
+                    joined_seq = null;
                     snap = table.snapshot(e);
                     app_end = e.app_end;
                     e.dirty_since_snap = .empty;
@@ -1322,13 +1376,16 @@ pub fn uploadParkedBlock(table: *Table, deps: UploadDeps, io: Io, ino: u64, bloc
                 }
             }
             // THE JOINER'S LAW: its verdict is the in-flight upload's — a
-            // publish retires the entry (`.joined`), a refusal leaves it
-            // parked and the joiner re-drives at once and answers the
-            // plane's own refusal. It waits only on that upload's device
-            // phase; a device holding its DMA bounds the wait (dm-thin's
-            // `no_space_timeout`; one that never answers is the fail-stop
-            // lattice's, the kernel's request timeout), so a bark is a
-            // count and one line per episode, never a "cannot happen".
+            // publish retires the entry (`.joined`); a refusal leaves it
+            // parked and the joiner answers that refusal (`refused_seq`),
+            // never re-driving into a second device wait (generic/347: a
+            // thin pool holds a DMA for its `no_space_timeout`, then
+            // refuses it); a superseded publish leaves newer writes and the
+            // joiner re-drives for them. It waits only on that upload's
+            // device phase; a device holding its DMA bounds the wait (one
+            // that never answers is the fail-stop lattice's, the kernel's
+            // request timeout), so a bark is a count and one line per
+            // episode, never a "cannot happen".
             if (inflight_elsewhere) {
                 joined = true;
                 pipeline.stats.write_pipeline_join_waits.inc();
@@ -1356,6 +1413,7 @@ pub fn uploadParkedBlock(table: *Table, deps: UploadDeps, io: Io, ino: u64, bloc
                 if (deps.epochs.closeAllForSpace(io, .{ .map = deps.map, .free = deps.free, .purge = deps.purge })) {
                     epoch_mod.stats.rewrite_shadow_fallbacks.inc();
                     clearInflight(table, deps, io, ino, block);
+                    owns_inflight = false;
                     continue; // re-drive: the re-check above would otherwise join OUR OWN flag
                 }
                 stats.write_through_fallbacks.inc();
@@ -1402,10 +1460,9 @@ pub fn uploadParkedBlock(table: *Table, deps: UploadDeps, io: Io, ino: u64, bloc
                 fsck_guard.deinit();
                 dest.abandon();
                 stats.write_through_fallbacks.inc();
-                return switch (e) {
-                    error.WriterGuardFenced, error.VolumeFailed => .fence_drop,
-                    else => .stay_parked,
-                };
+                if (e == error.NoSpaceLeft) table.noteDeviceSpaceRefusal();
+                fenced = e == error.WriterGuardFenced or e == error.VolumeFailed;
+                return if (fenced) .fence_drop else .stay_parked;
             };
         };
         prof.mark(.dma);
@@ -1481,6 +1538,7 @@ pub fn uploadParkedBlock(table: *Table, deps: UploadDeps, io: Io, ino: u64, bloc
                         error.WriterGuardFenced => {
                             fsck_guard.deinit();
                             dest.disarm(); // W5: free nothing
+                            fenced = true;
                             return .fence_drop;
                         },
                         error.NotFound => {
@@ -1494,6 +1552,9 @@ pub fn uploadParkedBlock(table: *Table, deps: UploadDeps, io: Io, ino: u64, bloc
                             fsck_guard.deinit();
                             dest.abandon();
                             e.upload_inflight = false;
+                            e.refused_seq = upload_seq;
+                            e.refused_fenced = false;
+                            owns_inflight = false;
                             stats.write_through_fallbacks.inc();
                             return .stay_parked;
                         },
@@ -1514,6 +1575,7 @@ pub fn uploadParkedBlock(table: *Table, deps: UploadDeps, io: Io, ino: u64, bloc
             if (superseded) {
                 // The newer writes stay parked over the published image.
                 e.upload_inflight = false;
+                owns_inflight = false;
                 e.dirty = e.dirty_since_snap;
                 e.clean_base = new_key;
                 e.old_binding = new_key;
@@ -2669,6 +2731,7 @@ test "a joiner whose upload the device HOLDS and then REFUSES takes the refusal 
         }
     };
     const joins0 = pipeline.stats.write_pipeline_join_waits.load();
+    const taken0 = stats.upload_join_refusals_taken.load();
     var first: Disposition = .published;
     var second: Disposition = .published;
     const th = try std.Thread.spawn(.{}, Flush.run, .{ io, &w.table, w.deps(), &first });
@@ -2694,6 +2757,8 @@ test "a joiner whose upload the device HOLDS and then REFUSES takes the refusal 
     try testing.expectEqual(Disposition.stay_parked, first);
     try testing.expectEqual(Disposition.stay_parked, second);
     try testing.expectEqual(@as(u32, 1), gate.in_dma.load(.acquire));
+    try testing.expectEqual(taken0 + 1, stats.upload_join_refusals_taken.load());
+    try testing.expect(w.table.deviceSpaceRefusedSince(1));
     try testing.expect(w.table.has(14, 0));
     try testing.expect(!w.table.get(14, 0).?.upload_inflight);
 }

@@ -4407,7 +4407,7 @@ pub const DataPlane = struct {
     /// This client's ring entry for a staged file.
     fn wsStagedPayload(ctx: *anyopaque, ino: u64, file_id: layout.FileId, offset: u64, len: u64, dest: []u8) read_path.StagedVerdict {
         const self: *DataPlane = @ptrCast(@alignCast(ctx));
-        const st = &(self.stage orelse return .absent);
+        const st = &(self.stage orelse return .{ .absent = .{} });
         const k = staging.StagingKey.init(file_id, ino);
         if (st.seg.get(k)) |lease| {
             defer lease.release();
@@ -4419,7 +4419,7 @@ pub const DataPlane = struct {
             return .{ .served = want };
         }
         if (st.pool.generationOf(file_id) != null) return .in_flight;
-        return .absent;
+        return .{ .absent = .{ .volume_failed = fencePoll(self) } };
     }
 
     /// The warm ladder's pre-screen, per read on the uring worker: the

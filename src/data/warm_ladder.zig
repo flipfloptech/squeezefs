@@ -569,7 +569,7 @@ test "the warm ladder asks the write side TRY-ONLY: a `busy` custody station is 
             return mode;
         }
         fn stagedPayload(_: *anyopaque, _: u64, _: layout.FileId, _: u64, _: u64, _: []u8) read_path.StagedVerdict {
-            return .absent;
+            return .{ .absent = .{} };
         }
         fn retained(_: *anyopaque, _: u64) bool {
             return false;

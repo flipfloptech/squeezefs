@@ -166,6 +166,10 @@ pub const stats = struct {
     pub var stale_binding_rebinds: counters.ShardedCounter = .{};
     pub var stale_binding_escalations: counters.ShardedCounter = .{};
     pub var staged_identity_retries: counters.ShardedCounter = .{};
+    /// `staged_failed_reads`: staged reads answered EIO — the ring holds no
+    /// copy of a stable identity with no durable copy, on a FAILED (or
+    /// fenced) volume: bytes it cannot find are never served as zeros.
+    pub var staged_failed_reads: counters.ShardedCounter = .{};
     pub var read_settle_lost_serialized: counters.Tripwire = .init("read_settle_lost_serialized");
     pub var read_dest_overruns: counters.Tripwire = .init("read_dest_overruns");
     pub var mem_budget_dehydrate_paused: counters.ShardedCounter = .{};
@@ -215,7 +219,7 @@ pub const stats = struct {
 };
 
 pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
-    try w.print("{{\"cache_hits\":{d},\"cache_misses\":{d},\"read_fill_reprobe_hits\":{d},\"read_lane_serves\":{d},\"read_lane_serve_bytes\":{d},\"hold_serve_admissions\":{d},\"read_odirect_requests\":{d},\"read_odirect_tier_serves\":{d},\"read_device_true_reads\":{d},\"direct_device_true\":{d},\"ranged_reads\":{d},\"ranged_read_bytes\":{d},\"ranged_read_unaligned_bounces\":{d},\"ranged_read_rebinds\":{d},\"stale_binding_rebinds\":{d},\"stale_binding_escalations\":{d},\"staged_identity_retries\":{d},\"read_settle_lost_serialized\":{d},\"read_dest_overruns\":{d},\"mem_budget_dehydrate_paused\":{d},", .{
+    try w.print("{{\"cache_hits\":{d},\"cache_misses\":{d},\"read_fill_reprobe_hits\":{d},\"read_lane_serves\":{d},\"read_lane_serve_bytes\":{d},\"hold_serve_admissions\":{d},\"read_odirect_requests\":{d},\"read_odirect_tier_serves\":{d},\"read_device_true_reads\":{d},\"direct_device_true\":{d},\"ranged_reads\":{d},\"ranged_read_bytes\":{d},\"ranged_read_unaligned_bounces\":{d},\"ranged_read_rebinds\":{d},\"stale_binding_rebinds\":{d},\"stale_binding_escalations\":{d},\"staged_identity_retries\":{d},\"staged_failed_reads\":{d},\"read_settle_lost_serialized\":{d},\"read_dest_overruns\":{d},\"mem_budget_dehydrate_paused\":{d},", .{
         stats.cache_hits.load(),
         stats.cache_misses.load(),
         stats.read_fill_reprobe_hits.load(),
@@ -233,6 +237,7 @@ pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
         stats.stale_binding_rebinds.load(),
         stats.stale_binding_escalations.load(),
         stats.staged_identity_retries.load(),
+        stats.staged_failed_reads.load(),
         stats.read_settle_lost_serialized.load(),
         stats.read_dest_overruns.load(),
         stats.mem_budget_dehydrate_paused.load(),
@@ -470,7 +475,7 @@ pub const WriteSide = struct {
         return .none;
     }
     fn noneStagedPayload(_: *anyopaque, _: u64, _: layout.FileId, _: u64, _: u64, _: []u8) StagedVerdict {
-        return .absent;
+        return .{ .absent = .{} };
     }
     fn noneRetained(_: *anyopaque, _: u64) bool {
         return false;
@@ -489,7 +494,13 @@ pub const StagedVerdict = union(enum) {
     /// A stage/promotion is in flight: back off and re-resolve.
     in_flight,
     /// No ring entry here (the durable copy or the lost arm decides).
-    absent,
+    absent: Absent,
+
+    pub const Absent = struct {
+        /// The volume is FAILED (or the writer fenced) as the lookup missed:
+        /// the lost arm answers EIO, never zeros.
+        volume_failed: bool = false,
+    };
 };
 
 /// The caller's destination: the reply window. `registered` = a kernel
@@ -1144,6 +1155,7 @@ pub const ReadPath = struct {
     fn readStaged(self: *ReadPath, io: Io, ino: u64, info: FileInfo, offset: u64, out: []u8) Error!usize {
         var attempt: u32 = 0;
         var cur = info;
+        var volume_failed = false;
         if (self.cfg.staged_read_hold) |path| holdStagedRead(io, ino, path);
         while (attempt < IDENTITY_LOOP) : (attempt += 1) {
             switch (self.write_side.staged_payload(self.write_side.ctx, ino, cur.file_id, offset, out.len, out)) {
@@ -1159,7 +1171,8 @@ pub const ReadPath = struct {
                     if (cur.kind != .staged) return self.read(io, ino, offset, out.len, .{ .buf = out }, .{});
                     continue;
                 },
-                .absent => {
+                .absent => |a| {
+                    volume_failed = a.volume_failed;
                     const fresh = self.meta.file(self.meta.ctx, ino) orelse return error.FileNotFound;
                     if (fresh.kind != .staged) {
                         stats.staged_identity_retries.inc();
@@ -1187,6 +1200,13 @@ pub const ReadPath = struct {
                 cur = fresh;
                 if (cur.kind != .staged) return self.read(io, ino, offset, out.len, .{ .buf = out }, .{});
                 continue;
+            }
+            // STABLE lost identity on a FAILED volume: the bytes are not
+            // found and no posture says they are a hole — EIO, never zeros.
+            if (volume_failed) {
+                stats.staged_failed_reads.inc();
+                log.warn("staged payload unreachable for ino {d} on a FAILED volume: answering EIO for [{d}, {d}) (never zeros for bytes this mount cannot find)", .{ ino, offset, offset + out.len });
+                return error.InputOutput;
             }
             // STABLE lost identity: size-consistent zeros, counted and warned.
             const zeros = staging.lostStagedRangeLen(offset, out.len, cur.size);
@@ -3660,7 +3680,7 @@ test "the write side outranks every tier: an overlay serve returns its bytes; fu
             return .{ .served = 100 };
         }
         fn stagedPayload(_: *anyopaque, _: u64, _: layout.FileId, _: u64, _: u64, _: []u8) StagedVerdict {
-            return .absent;
+            return .{ .absent = .{} };
         }
         fn retained(_: *anyopaque, _: u64) bool {
             return false;
@@ -3704,7 +3724,7 @@ test "the write side outranks every tier: an overlay serve returns its bytes; fu
 /// The double applies the move at the lookup itself: that is the window.
 const StagedRing = struct {
     var lookups: u32 = 0;
-    var mode: enum { promoted, restaged, lost } = .promoted;
+    var mode: enum { promoted, restaged, lost, lost_failed } = .promoted;
     const next_id: layout.FileId = @splat(0x5A);
 
     fn stagedPayload(ctx: *anyopaque, _: u64, file_id: layout.FileId, _: u64, len: u64, dest: []u8) StagedVerdict {
@@ -3726,8 +3746,9 @@ const StagedRing = struct {
                 fx.file_id = next_id;
             },
             .lost => {},
+            .lost_failed => return .{ .absent = .{ .volume_failed = true } },
         }
-        return .absent;
+        return .{ .absent = .{} };
     }
     fn none(_: *anyopaque, _: u64, _: u64, _: u64, _: []u8) OverlayVerdict {
         return .none;
@@ -3820,6 +3841,14 @@ test "a staged read whose identity moved between its resolve and its ring lookup
     try testing.expectEqual(lost0 + 1, staging.stats.staged_payload_lost_reads.load());
     // The verdict followed a resolve taken AFTER the lookup.
     try testing.expectEqual(calls0 + 2, f.file_calls.load(.monotonic));
+    // 4. The same stable lost identity on a FAILED volume (generic/475: the
+    //    latch, then reads of a staged file whose ring record had gone):
+    //    EIO — bytes this mount cannot find are never served as zeros.
+    StagedRing.mode = .lost_failed;
+    const failed0 = stats.staged_failed_reads.load();
+    try testing.expectError(error.InputOutput, f.rp.read(io, 7, 0, 4096, .{ .buf = buf[0..4096] }, .{}));
+    try testing.expectEqual(failed0 + 1, stats.staged_failed_reads.load());
+    try testing.expectEqual(lost0 + 1, staging.stats.staged_payload_lost_reads.load());
 }
 
 test "writeStatsJson emits one object naming every family" {

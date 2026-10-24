@@ -3805,6 +3805,28 @@ test "the parked-buffer gate, the wall on an EXHAUSTED set: cold flushes the ful
     try testing.expect(w.wp.table.has(1, 7)); // the first half stays parked (never a lost byte)
 }
 
+// A full store refuses every write the gate holds, each at its own wall:
+// the episode is said ONCE, every refusal counted (an xfstests subset's
+// filled scratch logged 844 identical error lines).
+test "the parked-buffer gate, the wall on an EXHAUSTED set says ENOSPC ONCE per episode: a second write refused at the wall answers ENOSPC silently, both counted" {
+    const io = testing.io;
+    const w = try World.init(testing.allocator, .sync_inline, false);
+    defer w.deinit(testing.allocator);
+    const refusals0 = stats.parked_gate_wall_refusals.load();
+    for (0..8) |b| try parkHalf(w, io, 1, @intCast(b), @intCast(b + 1));
+    var snap = w.wp.table.snapshot(w.wp.table.get(1, 7).?);
+    defer snap.release(&w.wp.table.pool);
+    while (w.f.alloc_a.allocateBlock()) |_| {} else |_| {}
+    while (w.f.alloc_b.allocateBlock()) |_| {} else |_| {}
+    log.testing.expectErrorLogs(1);
+    var half: [wt.BS / 2]u8 align(4096) = undefined;
+    fill(&half, 9);
+    for (0..2) |_| try testing.expectError(error.NoSpaceLeft, w.wp.write(io, .{ .ino = 1, .offset = 7 * wt.BS + wt.BS / 2, .payload = .{ .bytes = &half }, .class = .entire_op, .file = World.striped(7 * wt.BS + wt.BS / 2) }));
+    try log.testing.expectAllFired();
+    try testing.expectEqual(refusals0 + 2, stats.parked_gate_wall_refusals.load());
+    try testing.expectEqual(@as(u32, 8), w.wp.table.parkedCount());
+}
+
 // xfstests generic/299 on `d46dd83` (aio-dio writers + a falloc/truncate
 // loop on a filled scratch): ~1,900 writes answered ENOSPC at the wall on a
 // latched-exhausted set, and ONE wall in the same millisecond read supply

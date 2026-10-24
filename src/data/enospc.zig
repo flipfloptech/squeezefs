@@ -145,6 +145,15 @@ pub fn freshSupplyExhausted(candidates: []const *BlockAllocator) bool {
     return candidates.len != 0 and exhausted == candidates.len;
 }
 
+/// Some candidate's mint met `StorageFull` at or after `since_ns`: the
+/// store ran out inside that span (the parked-buffer gate's wall tells
+/// supply RETURNED to a full store from a plane refusing its flushes with
+/// supply in sight).
+pub fn spaceRefusedSince(candidates: []const *BlockAllocator, since_ns: u64) bool {
+    for (candidates) |a| if (a.storageFullSince(since_ns)) return true;
+    return false;
+}
+
 pub const WriteAdmission = enum {
     admit,
     /// `ENOSPC` before any byte is recorded; acked custody is unaffected.

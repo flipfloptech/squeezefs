@@ -188,13 +188,21 @@ pub const stats = struct {
     /// side's custody (a parked buffer, an overlay record, an epoch's
     /// shadow binds them at its landing).
     pub var fallocate_custody_skips: counters.ShardedCounter = .{};
+    /// `parked_gate_wall_supply_visible`: walls of refused cold flushes
+    /// that ended with fresh supply in sight on some volume — the write
+    /// stays parked and the wall restarts, never ENOSPC on a store with
+    /// supply (rung 9 F17). A full store under rewrite's ordinary outcome:
+    /// the census is one instant, and a free, a truncate, a trim return or
+    /// a drain landing after the store refused the flushes shows supply
+    /// (generic/299's falloc/truncate loop, 750, 475 on a filled scratch).
+    pub var parked_gate_wall_supply_visible: counters.ShardedCounter = .{};
+    /// `parked_gate_wall_plane_stalls`: of those, the walls whose flushes
+    /// met no space refusal anywhere in the set — supply in sight the
+    /// whole wall and the plane refused the flushes anyway (a device
+    /// failing its DMAs, a thin pool out of space, F17's grant ledger): a
+    /// stall, ONE warning per episode (`WritePath.gate_stall_warned`).
+    pub var parked_gate_wall_plane_stalls: counters.ShardedCounter = .{};
     pub var write_shared_class_violation: counters.Tripwire = .init("write_shared_class_violation");
-    /// The gate's cold flushes failed for a whole wall while fresh supply
-    /// was VISIBLE on some volume: the plane is wrong, not full — the
-    /// write stays parked (loud at the op watchdog's station), never
-    /// ENOSPC (rung 9 F17: the holder's grant ledger refused every top-up
-    /// at 25 % fill and 96 writes per leg were answered ENOSPC).
-    pub var parked_gate_wall_supply_visible: counters.Tripwire = .init("parked_gate_wall_supply_visible");
 
     pub fn ledgerSum() u64 {
         return admit_write_overlay_bytes.load() + admit_write_inplace_bytes.load() + admit_write_accumulate_bytes.load() + admit_write_inline_bytes.load();
@@ -209,10 +217,10 @@ pub fn noteInlineWrite(len: u64) void {
 
 pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
     try w.writeAll("{");
-    inline for (.{ "admit_write_overlay_bytes", "admit_write_inplace_bytes", "admit_write_accumulate_bytes", "admit_write_inline_bytes", "write_enospc_refusals", "write_pieces", "writes_admitted", "staging_sibling_probes", "restage_churn_removes", "restage_churn_bytes", "parked_gate_waits", "parked_gate_self_flushes", "parked_gate_cold_flushes", "parked_gate_wall_refusals", "write_gap_zero_bytes", "fallocate_blocks_reserved", "fallocate_blocks_zeroed", "fallocate_custody_skips" }) |name| {
+    inline for (.{ "admit_write_overlay_bytes", "admit_write_inplace_bytes", "admit_write_accumulate_bytes", "admit_write_inline_bytes", "write_enospc_refusals", "write_pieces", "writes_admitted", "staging_sibling_probes", "restage_churn_removes", "restage_churn_bytes", "parked_gate_waits", "parked_gate_self_flushes", "parked_gate_cold_flushes", "parked_gate_wall_refusals", "parked_gate_wall_supply_visible", "parked_gate_wall_plane_stalls", "write_gap_zero_bytes", "fallocate_blocks_reserved", "fallocate_blocks_zeroed", "fallocate_custody_skips" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, @field(stats, name).load() });
     }
-    try w.print("\"write_shared_class_violation\":{d},\"parked_gate_wall_supply_visible\":{d},", .{ counters.tripwireCount("write_shared_class_violation"), counters.tripwireCount("parked_gate_wall_supply_visible") });
+    try w.print("\"write_shared_class_violation\":{d},", .{counters.tripwireCount("write_shared_class_violation")});
     try w.writeAll("\"overlay\":");
     try device_overlay.writeStatsJson(w);
     try w.writeAll(",\"patch\":");
@@ -507,6 +515,10 @@ pub const WritePath = struct {
     /// free bytes ahead of every fresh custody (`enospc.storeCoversRing`);
     /// the plane installs it with its staging ring, null = no write cache.
     ring_claim: ?RingClaim = null,
+    /// A gate wall said the plane is stalled (`parked_gate_wall_plane_
+    /// stalls`): one warning per episode; the next gate visit that finds
+    /// capacity (room, or a cold flush that retired its victim) closes it.
+    gate_stall_warned: std.atomic.Value(bool) = .init(false),
 
     pub const RingClaim = struct {
         ctx: *anyopaque,
@@ -1298,9 +1310,11 @@ pub const WritePath = struct {
     }
 
     /// One write's standing at the gate across its ladder rounds: when its
-    /// first FAILED cold flush happened. The wall runs from there.
+    /// first FAILED cold flush happened (the wall runs from there), and
+    /// whether a flush inside this wall met the store out of space.
     const GateWall = struct {
         failed_since_ns: u64 = 0,
+        space_refused: bool = false,
     };
 
     /// An accumulation arm met the parked-buffer cap under (3): drop the
@@ -1337,11 +1351,16 @@ pub const WritePath = struct {
     /// ENOSPC iff the SET is exhausted — every data volume's allocator
     /// latched `StorageFull` with no supply in sight (the charter's
     /// terminal law; `parked_gate_wall_refusals`, one loud line). With
-    /// supply visible on any volume the plane is wrong, not full: the
-    /// tripwire `parked_gate_wall_supply_visible` fires, the wall restarts
-    /// and the write stays parked — never ENOSPC on a store with free
-    /// blocks (rung 9 F17: the venue's aging store answered 96 per leg at
-    /// 25 % fill when the holder's grant ledger refused every top-up).
+    /// supply in sight on any volume the write stays parked and the wall
+    /// restarts — never ENOSPC on a store with free blocks (rung 9 F17: the
+    /// venue's aging store answered 96 per leg at 25 % fill when the
+    /// holder's grant ledger refused every top-up) — counted
+    /// `parked_gate_wall_supply_visible`, never a tripwire: the census is
+    /// one instant, and on a full store under rewrite a free landing after
+    /// the store refused the flushes is the regime working (generic/299).
+    /// A wall whose flushes met NO space refusal anywhere in the set had
+    /// supply in sight throughout and the plane refused them anyway: a
+    /// stall (`parked_gate_wall_plane_stalls`, one warning per episode).
     fn awaitParkedCapacity(self: *WritePath, io: Io, req: Request, block: u32, gate: *GateWall) error{ NoSpaceLeft, WriterGuardFenced }!void {
         stats.parked_gate_waits.inc();
         if (req.park_hook) |h| h.parked(h.ctx);
@@ -1349,17 +1368,18 @@ pub const WritePath = struct {
         _ = room.enable(io);
         if (self.table.hasRoom()) {
             room.cancel(io);
-            gate.failed_since_ns = 0;
+            self.gateFoundCapacity(gate);
             return;
         }
         var until = PARKED_COLD_NS;
         if (self.table.coldestParked(req.ino, block, clock.monotonicNs())) |v| {
             if (v.age_ns >= PARKED_COLD_NS or !self.table.anyUploadInflight()) {
                 stats.parked_gate_cold_flushes.inc();
+                const flush_ns = clock.monotonicNs();
                 switch (accumulate.flushParkedBlock(&self.table, self.uploadDeps(), io, v.ino, v.block)) {
                     .published, .discarded, .joined => {
                         room.cancel(io);
-                        gate.failed_since_ns = 0;
+                        self.gateFoundCapacity(gate);
                         return;
                     },
                     // The writer is fenced: nothing of this mount lands again.
@@ -1368,18 +1388,24 @@ pub const WritePath = struct {
                         return error.WriterGuardFenced;
                     },
                     .stay_parked => {
+                        var cand_buf: [router.MAX_VOLUMES]*block_alloc.BlockAllocator = undefined;
+                        const cands = self.vols.candidates(&cand_buf);
+                        if (enospc.spaceRefusedSince(cands, flush_ns)) gate.space_refused = true;
                         const now = clock.monotonicNs();
                         if (gate.failed_since_ns == 0) gate.failed_since_ns = now;
                         if (now - gate.failed_since_ns >= PARKED_GATE_WALL_NS) {
-                            var cands: [router.MAX_VOLUMES]*block_alloc.BlockAllocator = undefined;
-                            if (enospc.freshSupplyExhausted(self.vols.candidates(&cands))) {
+                            if (enospc.freshSupplyExhausted(cands)) {
                                 room.cancel(io);
                                 stats.parked_gate_wall_refusals.inc();
                                 log.err("write ino {d} block {d}: the parked-buffer gate's cold flushes have been refused for {d} ms (wall {d} ms; {d} parked, {d} B) and every data volume's fresh supply is latched exhausted — answering ENOSPC", .{ req.ino, block, (now - gate.failed_since_ns) / std.time.ns_per_ms, PARKED_GATE_WALL_NS / std.time.ns_per_ms, self.table.parkedCount(), accumulate.stats.parked_full_buffer_bytes.load() });
                                 return error.NoSpaceLeft;
                             }
-                            stats.parked_gate_wall_supply_visible.fire("the parked-buffer gate's cold flushes were refused for a whole wall while fresh supply was visible");
-                            gate.failed_since_ns = now;
+                            stats.parked_gate_wall_supply_visible.inc();
+                            if (!gate.space_refused) {
+                                stats.parked_gate_wall_plane_stalls.inc();
+                                if (!self.gate_stall_warned.swap(true, .acq_rel)) log.warn("write ino {d} block {d}: the parked-buffer gate's cold flushes have been refused for {d} ms with fresh supply in sight and no volume out of space inside the wall ({d} parked, {d} B) — the plane refuses the flushes (a device failing its DMAs, a thin pool out of space), the store is not full; the write stays parked (one line per stall episode, `parked_gate_wall_plane_stalls` counts the walls)", .{ req.ino, block, (now - gate.failed_since_ns) / std.time.ns_per_ms, self.table.parkedCount(), accumulate.stats.parked_full_buffer_bytes.load() });
+                            }
+                            gate.* = .{ .failed_since_ns = now };
                         }
                         if (req.park_hook) |h| if (h.refused) |f| f(h.ctx);
                     },
@@ -1387,6 +1413,14 @@ pub const WritePath = struct {
             } else until = PARKED_COLD_NS - v.age_ns;
         }
         _ = room.waitUntilUncancelable(io, clock.monotonicNs() + until);
+    }
+
+    /// Capacity returned to a write at the gate: its wall is over, and so
+    /// is any stall episode the walls announced.
+    fn gateFoundCapacity(self: *WritePath, gate: *GateWall) void {
+        gate.* = .{};
+        // Acq_rel/release: pairs with the wall's `swap` (one warning per episode).
+        if (self.gate_stall_warned.load(.monotonic)) self.gate_stall_warned.store(false, .release);
     }
 
     fn spawnUpload(self: *WritePath, io: Io, ino: u64, block: u32, permit: ?pipeline.Permit, prof: pipeline.Prof) void {
@@ -3629,7 +3663,7 @@ test "the parked-buffer gate, the wall on an EXHAUSTED set: cold flushes the ful
     const w = try World.init(testing.allocator, .sync_inline, false);
     defer w.deinit(testing.allocator);
     const refusals0 = stats.parked_gate_wall_refusals.load();
-    const visible0 = counters.tripwireCount("parked_gate_wall_supply_visible");
+    const visible0 = stats.parked_gate_wall_supply_visible.load();
     const admission0 = stats.write_enospc_refusals.load();
     for (0..8) |b| try parkHalf(w, io, 1, @intCast(b), @intCast(b + 1));
     // A reader's snapshot shares block 7's cell: the sibling piece below
@@ -3649,53 +3683,172 @@ test "the parked-buffer gate, the wall on an EXHAUSTED set: cold flushes the ful
     try log.testing.expectAllFired();
     try testing.expectEqual(admission0, stats.write_enospc_refusals.load()); // the gate's wall, not the admission
     try testing.expectEqual(refusals0 + 1, stats.parked_gate_wall_refusals.load());
-    try testing.expectEqual(visible0, counters.tripwireCount("parked_gate_wall_supply_visible"));
+    try testing.expectEqual(visible0, stats.parked_gate_wall_supply_visible.load());
     try testing.expectEqual(@as(u32, 8), w.wp.table.parkedCount());
     try testing.expect(w.wp.table.has(1, 7)); // the first half stays parked (never a lost byte)
 }
 
+// xfstests generic/299 on `d46dd83` (aio-dio writers + a falloc/truncate
+// loop on a filled scratch): ~1,900 writes answered ENOSPC at the wall on a
+// latched-exhausted set, and ONE wall in the same millisecond read supply
+// in sight — a truncate's free landed between the full store's refusal and
+// the census — and fired the must-stay-0 `parked_gate_wall_supply_visible`.
+// The regime's ordinary outcome: the wall is counted, the write stays
+// parked, the next flush lands on the returned block. The write reaches
+// the gate past the admission's terminal law as the EXHAUSTED row's does
+// (custody held: block 7's sibling half, its cell shared with a reader).
+// The refused station drives it: round 1's flush meets the full store; a
+// block is freed and the device refuses the next DMA (the mint is
+// abandoned, the block stays in sight); round 2 crosses the wall with the
+// store's space refusal inside it; round 3 lands.
+test "the parked-buffer gate, the wall on a FULL store whose supply RETURNS inside it (generic/299's falloc/truncate loop): counted parked_gate_wall_supply_visible, not a plane stall — no tripwire, no error line, no ENOSPC — and the write lands on the returned block" {
+    const w = try World.init(testing.allocator, .sync_inline, false);
+    defer w.deinit(testing.allocator);
+    for (0..8) |b| try parkHalf(w, testing.io, 1, @intCast(b), @intCast(b + 1));
+    var snap = w.wp.table.snapshot(w.wp.table.get(1, 7).?);
+    defer snap.release(&w.wp.table.pool);
+    var freed: u64 = 0;
+    while (w.f.alloc_a.allocateBlock()) |m| freed = m.idx else |_| {}
+    while (w.f.alloc_b.allocateBlock()) |_| {} else |_| {}
+    var cands: [router.MAX_VOLUMES]*block_alloc.BlockAllocator = undefined;
+    try testing.expect(enospc.freshSupplyExhausted(w.f.vols.candidates(&cands)));
+    const trips0 = counters.invariantTripwires();
+    const site0 = counters.tripwireCount("parked_gate_wall_supply_visible");
+    const refusals0 = stats.parked_gate_wall_refusals.load();
+    const admission0 = stats.write_enospc_refusals.load();
+    const visible0 = stats.parked_gate_wall_supply_visible.load();
+    const stalls0 = stats.parked_gate_wall_plane_stalls.load();
+    const Writer = struct {
+        w: *World,
+        freed: u64,
+        rounds: u32 = 0,
+        free_result: anyerror!void = {},
+        result: anyerror!void = error.NotRun,
+        fn noStation(_: *anyopaque) void {}
+        fn refused(ctx: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.rounds += 1;
+            switch (self.rounds) {
+                1 => {
+                    _ = self.w.f.alloc_a.freeBlock(self.freed) catch |e| {
+                        self.free_result = e;
+                    };
+                    self.w.f.dev.setFailWrites(1, error.InputOutput);
+                },
+                // Past the wall: the next round need not wait out its tick.
+                2 => self.w.wp.table.capacity.notifyWaiters(testing.io),
+                else => {},
+            }
+        }
+        fn run(self: *@This()) void {
+            var half: [wt.BS / 2]u8 align(4096) = undefined;
+            fill(&half, 9);
+            const off = 7 * wt.BS + wt.BS / 2;
+            const o = self.w.wp.write(testing.io, .{ .ino = 1, .offset = off, .payload = .{ .bytes = &half }, .class = .entire_op, .file = World.striped(off), .park_hook = .{ .ctx = self, .parked = &noStation, .refused = &refused } }) catch |e| {
+                self.result = e;
+                return;
+            };
+            self.result = if (o.written == half.len) {} else error.ShortWrite;
+        }
+    };
+    var wr: Writer = .{ .w = w, .freed = freed };
+    const t = try std.Thread.spawn(.{}, Writer.run, .{&wr});
+    t.join();
+    try wr.free_result;
+    wr.result catch |e| {
+        std.debug.print("the write: {t} after {d} refused round(s)\n", .{ e, wr.rounds });
+        return e;
+    };
+    try testing.expectEqual(@as(u32, 2), wr.rounds);
+    try testing.expectEqual(trips0, counters.invariantTripwires());
+    try testing.expectEqual(site0, counters.tripwireCount("parked_gate_wall_supply_visible"));
+    try testing.expectEqual(refusals0, stats.parked_gate_wall_refusals.load());
+    try testing.expectEqual(admission0, stats.write_enospc_refusals.load());
+    try testing.expectEqual(visible0 + 1, stats.parked_gate_wall_supply_visible.load());
+    try testing.expectEqual(stalls0, stats.parked_gate_wall_plane_stalls.load());
+    try testing.expect(!w.wp.gate_stall_warned.load(.acquire));
+    // The victim landed on the returned block; the write's piece parked.
+    const b0 = w.f.map.seam().lookup(1, 0) orelse return error.VictimNotPublished;
+    try testing.expectEqual(wt.VOL_A, b0.vol_tag);
+    try testing.expectEqual(w.f.alloc_a.offsetOf(freed), b0.offset);
+    try testing.expect(!w.wp.table.has(1, 0));
+    try testing.expect(w.wp.table.has(1, 7));
+    try testing.expectEqual(@as(u32, 7), w.wp.table.parkedCount());
+}
+
 // Rung 9 F17: the venue's aging store answered ENOSPC 96 times per leg at
 // 25 % fill — the gate's wall fired on a plane that was WRONG (the holder's
-// grant ledger refused every top-up), not FULL. With fresh supply visible
-// on any volume the wall is a tripwire and a restart, never a refusal: the
-// write stays parked and completes when the plane heals.
-test "the parked-buffer gate, the wall with supply VISIBLE: a plane refusing the cold flushes past the wall fires `parked_gate_wall_supply_visible`, answers no ENOSPC, and the write completes when the plane heals" {
+// grant ledger refused every top-up), not FULL. With fresh supply in sight
+// on any volume the wall restarts, never a refusal: the write stays parked
+// and completes when the plane heals. No flush inside the wall met the
+// store out of space, so the wall is a PLANE STALL (a device failing every
+// DMA here; dm-error or a thin pool out of space in the suites): counted,
+// one warning for the episode, never a tripwire — a refusing device is the
+// world's event, not a "cannot happen". The writer holds at the wall
+// round's refused station so the counts are read exactly.
+test "the parked-buffer gate, the wall with supply VISIBLE and no space refusal inside it: a plane refusing the cold flushes is a counted stall (parked_gate_wall_plane_stalls, one warning per episode), no tripwire, no error line, no ENOSPC; the write completes when the plane heals and the episode closes" {
     const io = testing.io;
     const w = try World.init(testing.allocator, .sync_inline, false);
     defer w.deinit(testing.allocator);
     const refusals0 = stats.parked_gate_wall_refusals.load();
-    const visible0 = counters.tripwireCount("parked_gate_wall_supply_visible");
+    const visible0 = stats.parked_gate_wall_supply_visible.load();
+    const stalls0 = stats.parked_gate_wall_plane_stalls.load();
+    const trips0 = counters.invariantTripwires();
     for (0..8) |b| try parkHalf(w, io, 1, @intCast(b), @intCast(b + 1));
     var cands: [router.MAX_VOLUMES]*block_alloc.BlockAllocator = undefined;
     try testing.expect(!enospc.freshSupplyExhausted(w.f.vols.candidates(&cands)));
     // Every DMA fails until the test heals the device: the flushes are
     // refused, the mints abandoned — the free blocks stay in sight.
     w.f.dev.setFailWrites(std.math.maxInt(u32), error.InputOutput);
-    // The log seam is per thread: the writer's thread declares the ONE
-    // loud line (the tripwire's) and checks it fired.
+    const Station = struct {
+        rounds: Atomic(u32) = .init(0),
+        hold: RefusedHold = .{},
+        fn noStation(_: *anyopaque) void {}
+        fn refused(ctx: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            // Round 2 is the wall's: count in and hold there.
+            if (self.rounds.fetchAdd(1, .acq_rel) == 1) RefusedHold.refused(&self.hold);
+        }
+    };
     const Writer = struct {
         w: *World,
+        station: Station = .{},
         result: anyerror!void = error.NotRun,
-        fired: anyerror!void = error.NotRun,
         fn run(self: *@This()) void {
-            log.testing.expectErrorLogs(1);
-            const r = parkHalf(self.w, testing.io, 1, 8, 9);
-            self.fired = log.testing.expectAllFired();
-            self.result = r;
+            self.result = parkHalfHooked(self.w, testing.io, 1, 8, 9, .{ .ctx = &self.station, .parked = &Station.noStation, .refused = &Station.refused });
         }
     };
     var wr: Writer = .{ .w = w };
-    stats.parked_gate_wall_supply_visible.resetLogBudgetForTest();
     const t = try std.Thread.spawn(.{}, Writer.run, .{&wr});
-    // Past the wall: the tripwire fired, no refusal, the write still parked.
-    while (counters.tripwireCount("parked_gate_wall_supply_visible") == visible0) std.Thread.yield() catch {};
+    var joined = false;
+    defer if (!joined) {
+        w.f.dev.setFailWrites(0, error.InputOutput);
+        wr.station.hold.release(io);
+        t.join();
+    };
+    try wr.station.hold.awaitCount(io, &wr.station.hold.reached, 1, clock.monotonicNs() + 4 * PARKED_COLD_NS);
+    // Past the wall: counted as a stall, the episode's line said, no
+    // refusal, no tripwire, the write still at the gate.
+    try testing.expectEqual(visible0 + 1, stats.parked_gate_wall_supply_visible.load());
+    try testing.expectEqual(stalls0 + 1, stats.parked_gate_wall_plane_stalls.load());
+    try testing.expect(w.wp.gate_stall_warned.load(.acquire));
     try testing.expectEqual(refusals0, stats.parked_gate_wall_refusals.load());
+    try testing.expectEqual(trips0, counters.invariantTripwires());
     try testing.expect(!w.wp.table.has(1, 8)); // still at the gate: no byte of it recorded
+    // The heal; the writer is registered on the capacity notify since its
+    // visit began, so the wake below ends its tick at once.
     w.f.dev.setFailWrites(0, error.InputOutput);
+    wr.station.hold.release(io);
+    w.wp.table.capacity.notifyWaiters(io);
     t.join();
+    joined = true;
     try wr.result;
-    try wr.fired;
+    try testing.expectEqual(@as(u32, 2), wr.station.rounds.load(.acquire));
+    try testing.expectEqual(visible0 + 1, stats.parked_gate_wall_supply_visible.load());
+    try testing.expectEqual(stalls0 + 1, stats.parked_gate_wall_plane_stalls.load());
+    try testing.expect(!w.wp.gate_stall_warned.load(.acquire)); // capacity returned: the episode closed
     try testing.expectEqual(refusals0, stats.parked_gate_wall_refusals.load());
+    try testing.expectEqual(trips0, counters.invariantTripwires());
     try testing.expectEqual(@as(u32, 8), w.wp.table.parkedCount());
     try testing.expect(w.wp.table.has(1, 8));
 }
@@ -3749,7 +3902,7 @@ test "the aging store through the write path (rung 9 F17): grant-armed volumes u
     try vb.arm_(gpa, w.f.alloc_b, 16);
     defer vb.disarm(w.f.alloc_b);
     const wall0 = stats.parked_gate_wall_refusals.load();
-    const visible0 = counters.tripwireCount("parked_gate_wall_supply_visible");
+    const visible0 = stats.parked_gate_wall_supply_visible.load();
     const refusals0 = stats.write_enospc_refusals.load();
     const deferred0 = block_grant.stats.block_grant_deferred.load();
     const exhausted0 = block_grant.stats.block_grant_exhausted.load();
@@ -3781,7 +3934,7 @@ test "the aging store through the write path (rung 9 F17): grant-armed volumes u
         w.wp.quiesce(io);
     }
     try testing.expectEqual(wall0, stats.parked_gate_wall_refusals.load());
-    try testing.expectEqual(visible0, counters.tripwireCount("parked_gate_wall_supply_visible"));
+    try testing.expectEqual(visible0, stats.parked_gate_wall_supply_visible.load());
     try testing.expectEqual(refusals0, stats.write_enospc_refusals.load());
     try testing.expectEqual(deferred0, block_grant.stats.block_grant_deferred.load());
     try testing.expectEqual(exhausted0, block_grant.stats.block_grant_exhausted.load());

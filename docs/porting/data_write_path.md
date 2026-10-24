@@ -1236,6 +1236,8 @@ assembly_bytes}`, `active_block_{cow_copies,memset_elided_bytes,ooo_runs}`,
 `overwrite_seed_{deferred,materialized,skipped}`, `write_block_revisits`,
 `staging_sibling_{probes,hops_elided}`, `restage_churn_{removes,bytes}`,
 `parked_full_buffer_bytes` (gauge), `parked_gate_{waits,self_flushes,timeouts}`,
+`parked_gate_wall_{refusals,supply_visible,plane_stalls}` (port: counters, never a tripwire —
+`rung-10-parked-gate-wall-supply.md`),
 `durable_upload_bytes_{writeback,escalation,self_flush}`, `staging_put_bytes_
 {wt_fallback,drain,flush,teardown}`; tripwires `coverage_complete_buffer_not_content_
 valid`, `complete_union_with_extra_runs`, `zero_complete_on_deferred_seed`.

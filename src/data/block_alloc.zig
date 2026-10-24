@@ -614,6 +614,10 @@ pub const BlockAllocator = struct {
     elided_debt_bytes: counters.Gauge = .{},
     /// The latched `StorageFull` word (0 = clear).
     fresh_supply_exhausted_since_ns: Atomic(u64) = .init(0),
+    /// The last `StorageFull` a mint met (0 = never), latched or not: the
+    /// parked-buffer gate's wall asks whether the store ran out INSIDE it
+    /// (`storageFullSince`).
+    last_storage_full_ns: Atomic(u64) = .init(0),
     /// `era << 40 | seq`, seq from 1 (Q11: a plain cursor, no lane stride).
     stamp_seq: Atomic(u64) = .init(0),
     /// `allocEpoch` side map, allocated at the first `fsckBeginScan`
@@ -1824,6 +1828,9 @@ pub const BlockAllocator = struct {
     /// INFO only when no supply is visible (otherwise the latch is inert).
     fn noteFreshSupplyExhausted(self: *BlockAllocator) void {
         const now = @max(clock.monotonicNs(), 1);
+        // Monotonic: a census hint read against the reader's own clock, no
+        // paired fence (the wall's verdict is the latch census, not this).
+        self.last_storage_full_ns.store(now, .monotonic);
         if (self.fresh_supply_exhausted_since_ns.cmpxchgStrong(0, now, .acq_rel, .monotonic) == null) {
             _ = fresh_supply_latched.fetchAdd(1, .acq_rel);
             if (!self.freshSupplyVisible()) log.info("data volume {d}: fresh supply EXHAUSTED (StorageFull latched; writes that would create custody are refused ENOSPC until an allocation lands)", .{self.cfg.vol});
@@ -1846,6 +1853,12 @@ pub const BlockAllocator = struct {
         if (self.trim_claimed.load(.seq_cst) > 0) return true;
         if (self.space_pending) |p| if (p.pending(p.ctx)) return true;
         return false;
+    }
+
+    /// PURE: a mint met `StorageFull` at or after `since_ns` (monotonic).
+    pub fn storageFullSince(self: *const BlockAllocator, since_ns: u64) bool {
+        const at = self.last_storage_full_ns.load(.monotonic);
+        return at != 0 and at >= since_ns;
     }
 
     /// PURE: latched ∧ !visible.

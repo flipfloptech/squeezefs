@@ -68,9 +68,11 @@ const transform = @import("transform.zig");
 pub const Binding = seams.Binding;
 pub const CoverageUnion = cov.CoverageUnion;
 pub const PAGE: u32 = seams.PAGE;
-/// The join's bark bound: an upload is one bounded DMA plus one
-/// transaction; 30 s is the overlay settle's own bound (`SETTLE_BARK_NS`)
-/// — loud, never a hang.
+/// The join's bark bound: an upload is one DMA plus one transaction; 30 s
+/// is the overlay settle's own bound (`SETTLE_BARK_NS`). A device may hold
+/// the DMA past it — a thin pool out of space queues for its
+/// `no_space_timeout` (60 s; generic/347) — so a bark is counted and said
+/// once per episode, and the joiner keeps waiting for the upload's verdict.
 pub const UPLOAD_JOIN_BARK_NS: u64 = 30 * std.time.ns_per_s;
 
 // ---------------------------------------------------------------------------
@@ -143,9 +145,12 @@ pub const stats = struct {
     /// path displaced the reservation instead.
     pub var reserved_landings: counters.ShardedCounter = .{};
     pub var reserved_landing_declines: counters.ShardedCounter = .{};
-    /// A flush waited the bark bound on another task's upload (must-stay-0:
-    /// an upload is a bounded DMA + one transaction).
-    pub var upload_join_overlong: counters.Tripwire = .init("upload_join_overlong");
+    /// `upload_join_overlong`: a flush waited a bark bound on another
+    /// task's upload of the same block — the device holding that upload's
+    /// DMA or its transaction (a thin pool out of space, generic/347).
+    /// Counted per bark, ONE warning per episode
+    /// (`Table.join_overlong_warned`); never a tripwire.
+    pub var upload_join_overlong: counters.ShardedCounter = .{};
     /// THE one userspace copy's bytes.
     pub var nt_copy_bytes: counters.ShardedCounter = .{};
     pub var active_block_cow_copies: counters.ShardedCounter = .{};
@@ -200,11 +205,11 @@ pub const stats = struct {
 
 pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
     try w.writeAll("{");
-    inline for (.{ "write_through_blocks", "write_through_bytes", "write_through_fallbacks", "nt_copy_bytes", "active_block_cow_copies", "active_block_memset_elided_bytes", "active_block_ooo_runs", "active_block_run_table_completions", "overwrite_seed_deferred", "overwrite_seed_materialized", "overwrite_seed_skipped", "write_block_revisits", "parked_pool_refusals", "parked_pool_trimmed_cells", "durable_upload_bytes_escalation", "placed_merge_elides", "drain_inplace_drains", "drain_inplace_pages", "drain_inplace_dmas", "drain_inplace_write_bytes", "drain_inplace_seed_bytes", "drain_inplace_declines", "drain_inplace_dma_errors", "drain_inplace_dirty_drains", "extent_cap_fallbacks", "parked_ino_scans", "reserved_landings", "reserved_landing_declines" }) |name| {
+    inline for (.{ "write_through_blocks", "write_through_bytes", "write_through_fallbacks", "nt_copy_bytes", "active_block_cow_copies", "active_block_memset_elided_bytes", "active_block_ooo_runs", "active_block_run_table_completions", "overwrite_seed_deferred", "overwrite_seed_materialized", "overwrite_seed_skipped", "write_block_revisits", "parked_pool_refusals", "parked_pool_trimmed_cells", "durable_upload_bytes_escalation", "placed_merge_elides", "drain_inplace_drains", "drain_inplace_pages", "drain_inplace_dmas", "drain_inplace_write_bytes", "drain_inplace_seed_bytes", "drain_inplace_declines", "drain_inplace_dma_errors", "drain_inplace_dirty_drains", "extent_cap_fallbacks", "parked_ino_scans", "reserved_landings", "reserved_landing_declines", "upload_join_overlong" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, @field(stats, name).load() });
     }
     try w.print("\"parked_full_buffer_bytes\":{d},\"parked_buffers\":{d},", .{ stats.parked_full_buffer_bytes.load(), stats.parked_buffers.load() });
-    inline for (.{ "coverage_complete_buffer_not_content_valid", "complete_union_with_extra_runs", "zero_complete_on_deferred_seed", "active_block_table_full", "upload_join_overlong" }, 0..) |name, i| {
+    inline for (.{ "coverage_complete_buffer_not_content_valid", "complete_union_with_extra_runs", "zero_complete_on_deferred_seed", "active_block_table_full" }, 0..) |name, i| {
         if (i != 0) try w.writeByte(',');
         try w.print("\"{s}\":{d}", .{ name, counters.tripwireCount(name) });
     }
@@ -525,6 +530,11 @@ pub const Table = struct {
     /// cold flushes all fail would wake one another forever (the 3.75 M
     /// gate rounds of 2026-10-10).
     capacity: sync_notify.Notify = .init,
+    /// The join's bark (`UPLOAD_JOIN_BARK_NS`; a test shortens it).
+    join_bark_ns: u64 = UPLOAD_JOIN_BARK_NS,
+    /// A join barked (`upload_join_overlong`): one warning per episode,
+    /// closed when a barked joiner's upload settles.
+    join_overlong_warned: Atomic(bool) = .init(false),
 
     pub fn init(gpa: Allocator, block_size: u32, cap_buffers: u64) Allocator.Error!Table {
         const cap: usize = @intCast(activeBlockEntries(cap_buffers));
@@ -1265,6 +1275,11 @@ pub fn uploadParkedBlock(table: *Table, deps: UploadDeps, io: Io, ino: u64, bloc
     // `upload_inflight` is cleared on EVERY exit that leaves the entry
     // parked, and the settle is notified on every exit.
     var retired_by_us = false;
+    var join_since_ns: u64 = 0;
+    var barked = false;
+    // A barked joiner's wait is over when it leaves: the episode closes
+    // (release: pairs with the bark's `swap`, one line per episode).
+    defer if (barked) table.join_overlong_warned.store(false, .release);
     defer {
         if (retired_by_us) {
             table.capacity.notifyWaiters(io);
@@ -1304,12 +1319,22 @@ pub fn uploadParkedBlock(table: *Table, deps: UploadDeps, io: Io, ino: u64, bloc
                     snap_ns = clock.monotonicNs();
                 }
             }
+            // THE JOINER'S LAW: its verdict is the in-flight upload's — a
+            // publish retires the entry (`.joined`), a refusal leaves it
+            // parked and the joiner re-drives at once and answers the
+            // plane's own refusal. It waits only on that upload's device
+            // phase; a device holding its DMA bounds the wait (dm-thin's
+            // `no_space_timeout`; one that never answers is the fail-stop
+            // lattice's, the kernel's request timeout), so a bark is a
+            // count and one line per episode, never a "cannot happen".
             if (inflight_elsewhere) {
                 joined = true;
                 pipeline.stats.write_pipeline_join_waits.inc();
-                if (settle.waitUntilUncancelable(io, clock.monotonicNs() + UPLOAD_JOIN_BARK_NS) == .deadline) {
-                    stats.upload_join_overlong.fire("a flush waited 30 s on another task's upload of the same block");
-                    log.err("ino {d} block {d}: an upload has been in flight for 30 s while a second flush waits on it", .{ ino, block });
+                if (join_since_ns == 0) join_since_ns = clock.monotonicNs();
+                if (settle.waitUntilUncancelable(io, clock.monotonicNs() + table.join_bark_ns) == .deadline) {
+                    stats.upload_join_overlong.inc();
+                    barked = true;
+                    if (!table.join_overlong_warned.swap(true, .acq_rel)) log.warn("ino {d} block {d}: a flush has waited {d} ms on another task's upload of the same block — the device is holding that upload's DMA or its transaction (a thin pool out of space queues for its no_space_timeout); the flush waits for the upload's verdict (one line per episode, `upload_join_overlong` counts each bark)", .{ ino, block, (clock.monotonicNs() - join_since_ns) / std.time.ns_per_ms });
                 }
                 continue;
             }
@@ -2541,6 +2566,70 @@ test "two flushes of one parked block (a RELEASE racing an fsync): the second JO
     try testing.expectEqual(abandons0, block_alloc.stats.unpublished_mint_abandons.load());
     try testing.expectEqual(joins0 + 1, pipeline.stats.write_pipeline_joins.load());
     try testing.expect(!w.table.has(12, 0));
+}
+
+// xfstests generic/347 on `d46dd83` (a thin pool queueing writes once out
+// of space, `no_space_timeout` 60 s): an fsync joined an upload whose DMA
+// the device held 60 s and fired the must-stay-0 `upload_join_overlong`
+// twice (30 s, 60 s). A device holding its DMA is the world's event: the
+// joiner keeps waiting for the upload's verdict, each bark counts, the
+// episode says one line, and the joiner answers `joined` when the device
+// answers. The bark is shortened (`join_bark_ns`) to see several.
+test "a joiner whose upload the device HOLDS past the bark (generic/347: a thin pool out of space queues the DMA): counted upload_join_overlong per bark, one warning for the episode, no tripwire, no error line — the joiner answers `joined` when the device answers" {
+    const io = testing.io;
+    const w = try UploadWorld.init(testing.allocator);
+    defer w.deinit(testing.allocator);
+    w.table.join_bark_ns = 10 * std.time.ns_per_ms;
+    try w.f.map.create(13, .striped, 0);
+    const e = w.table.checkout(13, 0, false, null).?;
+    var data: [wt.BS]u8 = @splat(0x66);
+    _ = try w.table.recordWrite(e, 0, &data);
+    const Gate = struct {
+        var hold: std.atomic.Value(bool) = .init(true);
+        var in_dma: std.atomic.Value(bool) = .init(false);
+        fn hook(_: *anyopaque, _: *wt.FakeDevice, _: u64, _: u64, _: u64) void {
+            in_dma.store(true, .release);
+            while (hold.load(.acquire)) std.Thread.yield() catch {};
+        }
+    };
+    Gate.hold.store(true, .release);
+    Gate.in_dma.store(false, .release);
+    var dummy: u8 = 0;
+    w.f.dev.hook = .{ .ctx = &dummy, .call = &Gate.hook };
+    defer w.f.dev.hook = null;
+    const Flush = struct {
+        fn run(io_: Io, table: *Table, deps: UploadDeps, out: *Disposition) void {
+            out.* = flushParkedBlock(table, deps, io_, 13, 0);
+        }
+    };
+    const trips0 = counters.invariantTripwires();
+    const barks0 = stats.upload_join_overlong.load();
+    var first: Disposition = .stay_parked;
+    const th = try std.Thread.spawn(.{}, Flush.run, .{ io, &w.table, w.deps(), &first });
+    var second: Disposition = .stay_parked;
+    var tj: ?std.Thread = null;
+    var joined = false;
+    defer if (!joined) {
+        Gate.hold.store(false, .release);
+        th.join();
+        if (tj) |t| t.join();
+    };
+    while (!Gate.in_dma.load(.acquire)) try std.Thread.yield();
+    tj = try std.Thread.spawn(.{}, Flush.run, .{ io, &w.table, w.deps(), &second });
+    // The device holds the DMA across three barks: one line, three counts.
+    while (stats.upload_join_overlong.load() < barks0 + 3) try std.Thread.yield();
+    try testing.expect(w.table.join_overlong_warned.load(.acquire));
+    try testing.expectEqual(trips0, counters.invariantTripwires());
+    Gate.hold.store(false, .release);
+    th.join();
+    tj.?.join();
+    joined = true;
+    try testing.expectEqual(Disposition.published, first);
+    try testing.expectEqual(Disposition.joined, second);
+    try testing.expect(!w.table.join_overlong_warned.load(.acquire)); // the episode closed with the joiner
+    try testing.expectEqual(trips0, counters.invariantTripwires());
+    try testing.expectEqual(@as(u64, 0), counters.tripwireCount("upload_join_overlong"));
+    try testing.expect(!w.table.has(13, 0));
 }
 
 /// A pseudo-transform for the scratch-pool law: the image is the plaintext

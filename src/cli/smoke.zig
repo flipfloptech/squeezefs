@@ -14426,6 +14426,11 @@ test "smoke: THE FLEET'S MERGED BLOCK CENSUS — mount A + B JOINED with the fle
 const reuse_row_block: u64 = 1 << 20;
 const reuse_row_data_bytes: u64 = 3 * 64 * reuse_row_block;
 
+/// B's reads of `f` until its tiers hold both blocks: a cold block's
+/// first fill is on probation (the second touch publishes it), and a
+/// recall of `f` between two reads purges what the first deposited.
+const reuse_row_read_passes: u32 = 8;
+
 /// The re-use row's read: ONE 1 MiB O_DIRECT request straddling the two
 /// blocks of a two-block file — a multi-block request the queue thread's
 /// warm ladder demotes (its direct device leg serves single blocks and
@@ -14436,7 +14441,7 @@ const reuse_row_data_bytes: u64 = 3 * 64 * reuse_row_block;
 /// the file.
 const reuse_row_window_read = "dd if=\"$2\" iflag=direct,skip_bytes skip=524288 bs=1048576 count=1 status=none | sha256sum";
 
-test "smoke: A MEMBER'S CACHED COPY OF ANOTHER MEMBER'S BLOCKS NEVER OUTLIVES THE BLOCKS' RE-USE (0003 §W.2) — two 192 MiB data volumes of 1 MiB blocks, no write cache (every write beyond inline striped) → mount A (the manager) + B JOINED (the dest lease off: its window reads are whole-block fills that deposit) → A writes `f` (two blocks, fsync'd) → B reads it until its tiers hold its blocks → A fills the set to ENOSPC → A `rm f`: the delete recalls B's token and B purges the blocks' keys before it acks (scoped purges ≥ 1 on B) → A writes `g` (two blocks, fsync'd) into the blocks the rm freed → B reads `g`: sha-equal to A's, never `f`'s bytes" {
+test "smoke: A MEMBER'S CACHED COPY OF ANOTHER MEMBER'S BLOCKS NEVER OUTLIVES THE BLOCKS' RE-USE (0003 §W.2) — two 192 MiB data volumes of 1 MiB blocks, no write cache (every write beyond inline striped) → mount A (the manager) + B JOINED (the dest lease off: its window reads are whole-block fills that deposit) → A writes `f` (two blocks, fsync'd) → A fills the set to ENOSPC → B reads `f` until its tiers hold its blocks (after the fill, whose recalls run the census) → A `rm f`: the delete recalls B's token and B purges the blocks' keys before it acks (scoped purges ≥ 1, purged keys ≥ 2 on B; the census when B's token cache shed its entry) → A writes `g` (two blocks, fsync'd) into the blocks the rm freed: B's tiers dropped `f`'s blocks before it landed → B reads `g`: sha-equal to A's, never `f`'s bytes" {
     const io = testing.io;
     if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
     const gpa = testing.allocator;
@@ -14462,35 +14467,49 @@ test "smoke: A MEMBER'S CACHED COPY OF ANOTHER MEMBER'S BLOCKS NEVER OUTLIVES TH
         defer gpa.free(out);
         try testing.expectEqualStrings("written\n", out);
     }
-    // 2. B reads the window (under A's token) until its tiers hold both
-    //    blocks.
-    {
-        var deposited = false;
-        var pass: u32 = 0;
-        while (pass < 4 and !deposited) : (pass += 1) {
-            const out = try b.onMount("set -- \"$1\" f && " ++ reuse_row_window_read ++ " > \"$1/f.b.sha\"; if cmp -s \"$1/f.b.sha\" \"$1/f.sha\"; then echo equal; else cat \"$1/f.b.sha\" \"$1/f.sha\"; fi");
-            defer gpa.free(out);
-            if (!std.mem.eql(u8, out, "equal\n")) std.debug.print("smoke[reuse]: B's read of `f` differs:\n{s}", .{out});
-            try testing.expectEqualStrings("equal\n", out);
-            const sb = try b.stats();
-            defer gpa.free(sb);
-            deposited = (numberAfter(sb, "\"hot_block_current_bytes\":") orelse 0) + (numberAfter(sb, "\"read_lane_hold_bytes\":") orelse 0) >= 2 * reuse_row_block;
-        }
-        std.debug.print("smoke[reuse]: B read A's `f` {d} time(s); its tiers hold both blocks: {}\n", .{ pass, deposited });
-        try testing.expect(deposited);
-    }
-    // 3. A fills the set to ENOSPC one block per file (B's tiers keep
-    //    `f`'s blocks): a refused one-block write allocated nothing, so no
-    //    free lands later to give `g` a block other than `f`'s.
+    // 2. A fills the set to ENOSPC one block per file: a refused one-block
+    //    write allocated nothing, so no free lands later to give `g` a
+    //    block other than `f`'s. Before B's reads: each create recalls
+    //    objects B holds no entry for, and each such recall runs the
+    //    census, which drops every foreign key B's tiers hold.
     {
         const out = try rig.onMountTimed("j=0; while dd if=/dev/zero of=fill$j bs=1048576 count=1 conv=fsync status=none 2>/dev/null; do j=$((j+1)); done; rm -f fill$j; echo $j", 900);
         defer gpa.free(out);
         std.debug.print("smoke[reuse]: A filled the set with {s} MiB to ENOSPC\n", .{std.mem.trimEnd(u8, out, "\n")});
     }
-    const sb0 = try b.stats();
-    const scoped0 = numberAfter(sb0, "\"dlm_token_recall_scoped_purges\":") orelse 0;
-    const keys0 = numberAfter(sb0, "\"dlm_token_recall_purged_keys\":") orelse 0;
-    gpa.free(sb0);
+    // 3. B reads the window (under A's token) until its tiers hold both
+    //    blocks; the stats read that sees them is the baseline, so any
+    //    recall of `f` landing after it (the delete's or an earlier one)
+    //    is the purge the row judges. The read writes nothing on the full
+    //    set.
+    const sheds0 = blk: {
+        const sb = try b.stats();
+        defer gpa.free(sb);
+        break :blk numberAfter(sb, "\"dlm_token_sheds\":") orelse 0;
+    };
+    const Base = struct { scoped: u64, keys: u64, census: u64, hits: u64, reds: u64 };
+    const base: Base = blk: {
+        var pass: u32 = 0;
+        while (pass < reuse_row_read_passes) : (pass += 1) {
+            const out = try b.onMount("set -- \"$1\" f && s=$(" ++ reuse_row_window_read ++ ") && if [ \"$s\" = \"$(cat \"$1/f.sha\")\" ]; then echo equal; else echo \"$s\"; cat \"$1/f.sha\"; fi");
+            defer gpa.free(out);
+            if (!std.mem.eql(u8, out, "equal\n")) std.debug.print("smoke[reuse]: B's read of `f` differs:\n{s}", .{out});
+            try testing.expectEqualStrings("equal\n", out);
+            const sb = try b.stats();
+            defer gpa.free(sb);
+            if ((numberAfter(sb, "\"hot_block_current_bytes\":") orelse 0) + (numberAfter(sb, "\"read_lane_hold_bytes\":") orelse 0) < 2 * reuse_row_block) continue;
+            std.debug.print("smoke[reuse]: B read A's `f` {d} time(s); its tiers hold both blocks\n", .{pass + 1});
+            break :blk .{
+                .scoped = numberAfter(sb, "\"dlm_token_recall_scoped_purges\":") orelse 0,
+                .keys = numberAfter(sb, "\"dlm_token_recall_purged_keys\":") orelse 0,
+                .census = numberAfter(sb, "\"dlm_token_recall_census_purges\":") orelse 0,
+                .hits = numberAfter(sb, "\"read_tier_purge_hits\":") orelse 0,
+                .reds = numberAfter(sb, "\"mem_budget_red_events\":") orelse 0,
+            };
+        }
+        std.debug.print("smoke[reuse]: B's tiers never held both of `f`'s blocks in {d} reads\n", .{reuse_row_read_passes});
+        return error.TestUnexpectedResult;
+    };
     // 4. A deletes `f` (B holds its token: the recall), then writes `g`:
     //    the only clear blocks are the ones `f` held. The delete's frees
     //    land asynchronously (seconds on the venue) and a write on a
@@ -14501,22 +14520,36 @@ test "smoke: A MEMBER'S CACHED COPY OF ANOTHER MEMBER'S BLOCKS NEVER OUTLIVES TH
         defer gpa.free(out);
         try testing.expectEqualStrings("written\n", out);
     }
-    // 5. B reads `g`'s window: A's bytes, never the cached `f` — then the
-    //    recall's purge on B, the counters that name it.
-    {
-        const out = try b.onMount("set -- \"$1\" g && " ++ reuse_row_window_read ++ " > \"$1/g.b.sha\"; if cmp -s \"$1/g.b.sha\" \"$1/g.sha\"; then echo equal; elif cmp -s \"$1/g.b.sha\" \"$1/f.sha\"; then echo stale-f; else echo other; fi");
-        defer gpa.free(out);
-        std.debug.print("smoke[reuse]: B reads A's `g` (the re-used blocks): {s}", .{out});
-        try testing.expectEqualStrings("equal\n", out);
-    }
+    // 5. `g` landed in `f`'s blocks: B purged them first — before B reads
+    //    `g`. The scoped purge names `f`'s two keys; a token cache that
+    //    shed its entries (the Red shed drops them without a release) had
+    //    no entry for the recall, which then runs the census. With no Red
+    //    episode on B the tiers dropped what they held (a shed could have
+    //    evicted it first).
     {
         const sb = try b.stats();
         defer gpa.free(sb);
         const scoped = numberAfter(sb, "\"dlm_token_recall_scoped_purges\":") orelse 0;
         const keys = numberAfter(sb, "\"dlm_token_recall_purged_keys\":") orelse 0;
-        std.debug.print("smoke[reuse]: B's recall of `f`: scoped purges {d} → {d}, purged keys {d} → {d}, census purges {d}\n", .{ scoped0, scoped, keys0, keys, numberAfter(sb, "\"dlm_token_recall_census_purges\":") orelse 0 });
-        try testing.expect(scoped >= scoped0 + 1);
-        try testing.expect(keys >= keys0 + 2);
+        const census = numberAfter(sb, "\"dlm_token_recall_census_purges\":") orelse 0;
+        const hits = numberAfter(sb, "\"read_tier_purge_hits\":") orelse 0;
+        const reds = numberAfter(sb, "\"mem_budget_red_events\":") orelse 0;
+        const shed = (numberAfter(sb, "\"dlm_token_sheds\":") orelse 0) > sheds0;
+        std.debug.print("smoke[reuse]: B's recall of `f`: scoped purges {d} → {d}, purged keys {d} → {d}, census purges {d} → {d}, tier purge hits {d} → {d}; token cache shed: {}, Red events {d} → {d}\n", .{ base.scoped, scoped, base.keys, keys, base.census, census, base.hits, hits, shed, base.reds, reds });
+        if (shed) {
+            try testing.expect(keys >= base.keys + 2 or census >= base.census + 1);
+        } else {
+            try testing.expect(scoped >= base.scoped + 1);
+            try testing.expect(keys >= base.keys + 2);
+        }
+        if (reds == base.reds) try testing.expect(hits >= base.hits + 2);
+    }
+    // 6. B reads `g`'s window: A's bytes, never the cached `f`.
+    {
+        const out = try b.onMount("set -- \"$1\" g && s=$(" ++ reuse_row_window_read ++ ") && if [ \"$s\" = \"$(cat \"$1/g.sha\")\" ]; then echo equal; elif [ \"$s\" = \"$(cat \"$1/f.sha\")\" ]; then echo stale-f; else echo other; fi");
+        defer gpa.free(out);
+        std.debug.print("smoke[reuse]: B reads A's `g` (the re-used blocks): {s}", .{out});
+        try testing.expectEqualStrings("equal\n", out);
     }
     try b.expectAlive("the re-use row");
     try rig.expectAlive("the re-use row");

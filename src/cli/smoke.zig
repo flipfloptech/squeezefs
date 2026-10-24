@@ -2849,6 +2849,160 @@ test "smoke: A JOINER'S CLEAN UNMOUNT AND REJOIN while the manager stays up — 
     std.debug.print("smoke: rejoin: {d} cycles, {d} files, {d} stale projection row(s) loaded unleased in all\n", .{ rejoin_cycles, (rejoin_cycles + 1) * 49, stale_rows });
 }
 
+/// How the manager's previous incarnation ended before the next one
+/// mounted: an orderly `umount`, or `kill -9` of a `--daemon --supervise`
+/// daemon (its supervisor replays the journal tail and only then releases
+/// the writer guard).
+const ManagerEnd = enum { umount, kill9 };
+
+/// One incarnation's fill under `<who><k>/`: 1 KiB inline files (acked,
+/// never fsync'd — the replay's custody on a kill), 64 KiB files and an
+/// 8 MiB file fsync'd (promoted, striped), each cut from the rig's image at
+/// its own offset; every path's sha256 appended to `$1/remount.sha`.
+fn remountFillScript(gpa: std.mem.Allocator, who: u8, k: usize) ![]u8 {
+    var w: std.Io.Writer.Allocating = .init(gpa);
+    defer w.deinit();
+    const off: usize = @as(usize, if (who == 'a') 0 else 8) + k;
+    try w.writer.print("mkdir {[w]c}{[k]d} && i=0; while [ $i -lt 8 ]; do dd if=\"$1/image\" of={[w]c}{[k]d}/s$i bs=1k skip=$(({[o]d} * 64 + i)) count=1 status=none; i=$((i + 1)); done; i=0; while [ $i -lt 4 ]; do dd if=\"$1/image\" of={[w]c}{[k]d}/p$i bs=64k skip=$(({[o]d} * 16 + i)) count=1 conv=fsync status=none; i=$((i + 1)); done; dd if=\"$1/image\" of={[w]c}{[k]d}/big bs=1M skip={[o]d} count=8 conv=fsync status=none; sha256sum {[w]c}{[k]d}/* >> \"$1/remount.sha\"; ls {[w]c}{[k]d} | wc -l", .{ .w = who, .k = k, .o = off });
+    return w.toOwnedSlice();
+}
+
+/// The string value of `"key":"…"` in a JSON document (the first).
+fn quotedAfter(text: []const u8, key: []const u8) ?[]const u8 {
+    const i = std.mem.indexOf(u8, text, key) orelse return null;
+    const rest = text[i + key.len ..];
+    if (rest.len == 0 or rest[0] != '"') return null;
+    const end = std.mem.indexOfScalarPos(u8, rest, 1, '"') orelse return null;
+    return rest[1..end];
+}
+
+/// THE JOIN AFTER A MANAGER REMOUNT: format → A (the manager) mounts and
+/// writes → for every `ends` entry A's incarnation ends that way and A
+/// mounts again (every incarnation listening at a fresh ephemeral port) and
+/// writes → B mounts the set and JOINS as appender 1, dialling A's CURRENT
+/// listener (`manager_endpoint` on B is A's `wire_endpoint`) → B reads
+/// every file A wrote and writes its own → umount B (A reads B's files) →
+/// umount A → `fsck --offline --scrub` 0 findings. The red: B's join dialled
+/// the PREVIOUS incarnation's listener off tree 0's projection (the moved
+/// listener's publish not yet checkpointed) and the mount failed
+/// `device I/O failed (IO, terminal)`.
+fn joinAfterManagerRemounts(ends: []const ManagerEnd) !void {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    try rig.env.put("SQUEEZEFS_MW_BIND", "127.0.0.1:0");
+    var t_owner_text: [8]u8 = undefined;
+    try rig.env.put("SQUEEZEFS_TEST_MEMBERSHIP_T_OWNER_MS", try std.fmt.bufPrint(&t_owner_text, "{d}", .{smoke_t_owner_ms}));
+    try rig.formatSet(true);
+    try rig.createImage();
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(0);
+    var files: usize = 0;
+    for (0..ends.len + 1) |k| {
+        if (k > 0) switch (ends[k - 1]) {
+            .umount => {
+                try rig.umount();
+                try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+            },
+            .kill9 => {
+                // The incarnation the kill ends: a supervised daemon.
+                const pid = try daemonMountReady(rig, try rig.logLen());
+                const script = try remountFillScript(gpa, 'a', 100 + k);
+                defer gpa.free(script);
+                const out = try rig.onMount(script);
+                defer gpa.free(out);
+                try testing.expectEqualStrings("13\n", out);
+                files += 13;
+                const mark = try rig.logLen();
+                _ = linux.kill(pid, .KILL);
+                _ = try rig.awaitLog("supervisor: writer guard released on 1 volume(s) after the replay", mark, 30 * std.time.ns_per_s);
+                _ = try rig.awaitLog("); done", mark, 30 * std.time.ns_per_s);
+                try rig.umountAfterKill();
+            },
+        };
+        if (k > 0) {
+            const mark = try rig.logLen();
+            try rig.spawnMount(&.{});
+            _ = try rig.awaitReady(mark);
+            // Every earlier incarnation's file is whole on the new one.
+            const back = try rig.onMount("sha256sum --quiet -c \"$1/remount.sha\" && echo ok");
+            defer gpa.free(back);
+            try testing.expectEqualStrings("ok\n", back);
+        }
+        const script = try remountFillScript(gpa, 'a', k);
+        defer gpa.free(script);
+        const out = try rig.onMount(script);
+        defer gpa.free(out);
+        try testing.expectEqualStrings("13\n", out);
+        files += 13;
+        // The kill arm's daemon is the next incarnation, mounted at the
+        // top of the next pass: this one ends first.
+        if (k < ends.len and ends[k] == .kill9) {
+            try rig.umount();
+            try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+        }
+    }
+    const a_endpoint = blk: {
+        const ta = try rig.stats();
+        defer gpa.free(ta);
+        break :blk try gpa.dupe(u8, quotedAfter(ta, "\"wire_endpoint\":") orelse return error.NoWireEndpoint);
+    };
+    defer gpa.free(a_endpoint);
+    const b = try Peer.init(rig, "b");
+    defer b.deinit();
+    try b.spawn(&.{});
+    _ = try b.awaitReady();
+    {
+        const text = try b.readLog();
+        defer gpa.free(text);
+        try testing.expect(std.mem.indexOf(u8, text, "mounted JOINED as appender 1") != null);
+        const tb = try b.stats();
+        defer gpa.free(tb);
+        try testing.expectEqualStrings(a_endpoint, quotedAfter(tb, "\"manager_endpoint\":") orelse return error.NoManagerEndpoint);
+        // B reads every byte every incarnation of A wrote, then its own.
+        const from_b = try b.onMount("sha256sum --quiet -c \"$1/remount.sha\" && echo ok");
+        defer gpa.free(from_b);
+        try testing.expectEqualStrings("ok\n", from_b);
+        const script = try remountFillScript(gpa, 'b', 0);
+        defer gpa.free(script);
+        const out = try b.onMount(script);
+        defer gpa.free(out);
+        try testing.expectEqualStrings("13\n", out);
+        files += 13;
+        const tb2 = try b.stats();
+        defer gpa.free(tb2);
+        try expectMustStayZero(tb2);
+    }
+    try b.umount();
+    try b.expectCleanExit("B's unmount after its join");
+    {
+        const from_a = try rig.onMount("sha256sum --quiet -c \"$1/remount.sha\" && echo ok");
+        defer gpa.free(from_a);
+        try testing.expectEqualStrings("ok\n", from_a);
+        const ta = try rig.stats();
+        defer gpa.free(ta);
+        try expectMustStayZero(ta);
+    }
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+    _ = try fsckClean(rig, "the join after the manager's remounts");
+    std.debug.print("smoke: join after {d} manager incarnation end(s) ({any}): B dialled A's live listener {s}; {d} files sha-equal on both\n", .{ ends.len, ends, a_endpoint, files });
+}
+
+test "smoke: A MEMBER JOINS A SET WHOSE MANAGER HAS REMOUNTED — format → A (the manager) mounts and writes → `umount` A → A mounts again (a fresh ephemeral listener) and writes → B mounts and JOINS as appender 1, dialling A's LIVE listener (B's `manager_endpoint` is A's `wire_endpoint`) → B reads every byte A wrote and writes its own → umount B (A reads B's files) → umount A → `fsck --offline --scrub` 0 findings (red: B dialled the first incarnation's listener off tree 0's projection — `device I/O failed (IO, terminal)`)" {
+    try joinAfterManagerRemounts(&.{.umount});
+}
+
+test "smoke: A MEMBER JOINS A SET WHOSE MANAGER HAS REMOUNTED TWICE — format → A mounts and writes → umount, mount, write → umount, mount, write (three incarnations, three listeners) → B JOINS dialling the third → B reads every byte of all three and writes its own → umount B, A → `fsck --offline --scrub` 0 findings" {
+    try joinAfterManagerRemounts(&.{ .umount, .umount });
+}
+
+test "smoke: A MEMBER JOINS A SET WHOSE MANAGER WAS KILLED — format → A mounts and writes → umount → A as a `--daemon --supervise` daemon writes (inline files acked, never fsync'd) → `kill -9`: the supervisor replays the journal tail and releases the guard → A mounts again (every acked file whole) and writes → B JOINS dialling the successor's listener → B reads every byte and writes its own → umount B, A → `fsck --offline --scrub` 0 findings" {
+    try joinAfterManagerRemounts(&.{.kill9});
+}
+
 /// The member-scope row's residents: A's 64 KiB files (staged in A's ring,
 /// one block each well under it) and B's.
 const scope_a_files: usize = 200;

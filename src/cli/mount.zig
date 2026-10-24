@@ -738,7 +738,7 @@ fn mountMain(ctx: *Ctx) u8 {
     };
     var session_live = true;
     defer if (session_live) session.deinit();
-    // THE STALL ANSWER (decision 0003 §BP): a write the parked-buffer gate
+    // THE STALL ANSWER (decision 0003 §BQ): a write the parked-buffer gate
     // holds behind refused flushes answers before the kernel's request
     // deadline would end this mount — the timeout the kernel applies (the
     // one asked for, seam included, when it applies none) less a check.

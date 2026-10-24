@@ -281,7 +281,7 @@ pub fn kernelRequestTimeoutS(requested: u16, max_sysctl: ?u32) u16 {
 }
 
 /// THE STALL ANSWER's bound (charter §1.8: the daemon answers, never holds;
-/// decision 0003 §BP): how long the data plane holds a write behind a plane
+/// decision 0003 §BQ): how long the data plane holds a write behind a plane
 /// that refuses every flush before it answers ENOSPC/EIO. The kernel ends
 /// the WHOLE connection for one request older than its timeout, judged at
 /// its next check (`fuse_check_timeout`, every `REQUEST_TIMEOUT_CHECK_S`)
@@ -851,7 +851,7 @@ test "request timeout (decision 0003 §Z): T_owner + T_park_max in whole seconds
     try testing.expectEqual(@as(u16, 15), REQUEST_TIMEOUT_CHECK_S);
 }
 
-test "the stall answer's bound (decision 0003 §BP): the applied request timeout less one check period — 120 s at the lattice's 135 s; the asked one when the kernel applies none; a 15 s timeout (the kernel's floor) answers at once" {
+test "the stall answer's bound (decision 0003 §BQ): the applied request timeout less one check period — 120 s at the lattice's 135 s; the asked one when the kernel applies none; a 15 s timeout (the kernel's floor) answers at once" {
     // T − REQUEST_TIMEOUT_CHECK_S, T = applied else asked.
     try testing.expectEqual(@as(u64, 120 * std.time.ns_per_s), stallAnswerNs(135, 135));
     try testing.expectEqual(@as(u64, 45 * std.time.ns_per_s), stallAnswerNs(135, 60));

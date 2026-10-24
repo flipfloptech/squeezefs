@@ -205,7 +205,7 @@ pub const stats = struct {
     /// `parked_gate_stall_answers`: writes the gate held behind refused
     /// flushes past the stall bound (the kernel's request timeout less one
     /// check period), or during an answered episode, answered ENOSPC/EIO
-    /// before the kernel would end the mount (decision 0003 §BP).
+    /// before the kernel would end the mount (decision 0003 §BQ).
     pub var parked_gate_stall_answers: counters.ShardedCounter = .{};
     pub var write_shared_class_violation: counters.Tripwire = .init("write_shared_class_violation");
 
@@ -1393,7 +1393,7 @@ pub const WritePath = struct {
     /// stall (`parked_gate_wall_plane_stalls`, one warning per episode).
     ///
     /// THE STALL ANSWER (charter §1.8: the daemon answers, never holds;
-    /// decision 0003 §BP): a write held at the gate behind refused flushes
+    /// decision 0003 §BQ): a write held at the gate behind refused flushes
     /// for `stall_answer_ns` since its arrival answers before the kernel's
     /// request deadline would end the whole mount — ENOSPC when a flush
     /// since its arrival met the store out of space (the allocator's
@@ -4029,7 +4029,7 @@ fn writeHalf(w: *World, io: Io, ino: u64, block: u32, seed: u8) Error!Outcome {
 // daemon answers, never holds: past the stall bound (the request timeout
 // less one check period; the mount sets it) the write answers; the episode
 // then answers every write the gate holds at its first refused flush.
-test "THE STALL ANSWER (decision 0003 §BP; generic/347): a write held at the gate behind a device refusing every DMA with supply in sight answers EIO once the stall bound has passed since its arrival — a counted plane stall first, no byte of it recorded, the parked set intact, ONE error line; a second writer during the episode answers at its first refused flush; healed, the gate's capacity closes the episode and a write parks again" {
+test "THE STALL ANSWER (decision 0003 §BQ; generic/347): a write held at the gate behind a device refusing every DMA with supply in sight answers EIO once the stall bound has passed since its arrival — a counted plane stall first, no byte of it recorded, the parked set intact, ONE error line; a second writer during the episode answers at its first refused flush; healed, the gate's capacity closes the episode and a write parks again" {
     const io = testing.io;
     const w = try World.init(testing.allocator, .sync_inline, false);
     defer w.deinit(testing.allocator);

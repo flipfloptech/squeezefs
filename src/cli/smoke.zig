@@ -6370,7 +6370,7 @@ fn abortFuseConnectionOf(io: Io, mp: []const u8) void {
     std.debug.print("smoke: aborted the FUSE connection of {s} (minor {d}) so the row ends instead of hanging the shard\n", .{ mp, minor });
 }
 
-test "smoke: A LIVE MEMBER EVICTED AT T_OWNER UNDER THE DEAD MANAGER'S STRIPED HOT DIRECTORY (the flakes ledger's second shape, 2026-10-22) — A (the manager) holds `hot` striped over K = 64; B JOINED storms creates into it → kill -9 A ⇒ B PARKS at T_self → remount A (term 2) → B's reclaim lands in the grace window → B's member beat is HELD (SQUEEZEFS_TEST_MEMBERSHIP_BEAT_HOLD: no renewal, no reclaim beat, every other thread serving the storm) past T_owner ⇒ B's COMMITTERS park the gate at T_self on the member's own clock (its second park, with the beat still held: no commit past T_self), A evicts the silent B at T_owner (`tick — 1 evicted`) and recovers its region → released: the beat's reclaim meets the closed grace ⇒ UnknownLease ⇒ B POISONED (every volume FAILED, the move epoch closed) → the fail-stop: the storm's parked create and a fresh one answer EIO at once (never held), the storm child ends when told, `umount B` completes with the crash shape (no release, no page write; exit 1), A serves `hot` on (ls = find), no tripwire on A → fsck --offline --scrub 0 findings (red: a create held at the move gate for T_park_max per op, the storm child unkillable, the shard hung in wait4; B committed through the hold and its stop released 61 recovered slots: A's lookup wedged past the 51 s request timeout)" {
+test "smoke: A LIVE MEMBER EVICTED AT T_OWNER UNDER THE DEAD MANAGER'S STRIPED HOT DIRECTORY (the flakes ledger's second shape, 2026-10-22) — A (the manager) holds `hot` striped over K = 64; B JOINED storms creates into it → kill -9 A ⇒ B PARKS at T_self → remount A (term 2) → B's reclaim lands in the grace window → B's member beat is HELD (SQUEEZEFS_TEST_MEMBERSHIP_BEAT_HOLD: no renewal, no reclaim beat, every other thread serving the storm) past T_owner ⇒ B's COMMITTERS park the gate at T_self on the member's own clock (its second park, with the beat still held: no commit past T_self), A evicts the silent B at T_owner (`tick — 1 evicted`) and recovers its region → released: the beat's reclaim meets the closed grace ⇒ UnknownLease ⇒ B holds acked bytes no layout names (64 KiB written through an fd a process holds open under the close write-back posture: write-side custody) ⇒ no re-join in place (decision 0003 §BO) ⇒ B POISONED (every volume FAILED, the move epoch closed) → the fail-stop: the storm's parked create and a fresh one answer EIO at once (never held), the storm child ends when told, `umount B` completes with the crash shape (no release, no page write; exit 1), A serves `hot` on (ls = find), no tripwire on A → fsck --offline --scrub 0 findings (red: a create held at the move gate for T_park_max per op, the storm child unkillable, the shard hung in wait4; B committed through the hold and its stop released 61 recovered slots: A's lookup wedged past the 51 s request timeout)" {
     const io = testing.io;
     if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
     const gpa = testing.allocator;
@@ -6388,9 +6388,36 @@ test "smoke: A LIVE MEMBER EVICTED AT T_OWNER UNDER THE DEAD MANAGER'S STRIPED H
     _ = try rig.awaitReady(0);
     const b = try Peer.init(rig, "b");
     defer b.deinit();
+    // B holds un-landed state at the eviction, deterministically: the
+    // close write-back posture keeps a held fd's written bytes in custody.
+    var close_env = try rig.env.clone(gpa);
+    defer close_env.deinit();
+    try close_env.put("SQUEEZEFS_WRITEBACK_POSTURE", "close");
+    b.env = &close_env;
     b.node = kill_peer_node;
     try b.spawn(&.{});
     _ = try b.awaitReady();
+    var hb: [linux.PATH_MAX]u8 = undefined;
+    const held = try std.fmt.bufPrint(&hb, "{s}/held", .{rig.work});
+    var gb: [linux.PATH_MAX]u8 = undefined;
+    const go = try std.fmt.bufPrint(&gb, "{s}/go", .{rig.work});
+    var holder = try std.process.spawn(io, .{ .argv = &.{ "sh", "-c", "exec 3>\"$0/custody\" && head -c 65536 /dev/urandom >&3 && : > \"$1\" && while [ ! -e \"$2\" ]; do sleep 0.05; done", b.mp, held, go }, .environ_map = &rig.env, .stdin = .ignore });
+    var holder_done = false;
+    defer if (!holder_done) {
+        _ = linux.kill(holder.id.?, .KILL);
+        _ = holder.wait(io) catch {};
+    };
+    {
+        const deadline = clock.monotonicNs() + kill_row_wait_ns;
+        while (true) {
+            Io.Dir.cwd().access(io, held, .{}) catch {
+                if (clock.monotonicNs() >= deadline) return error.Timeout;
+                sleepMs(20);
+                continue;
+            };
+            break;
+        }
+    }
     {
         const mk = try rig.onMount("mkdir hot");
         gpa.free(mk);
@@ -6453,6 +6480,12 @@ test "smoke: A LIVE MEMBER EVICTED AT T_OWNER UNDER THE DEAD MANAGER'S STRIPED H
     releaseHold(fifo);
     released = true;
     const poisoned_at = try b.awaitLog("this joined mount is POISONED", second_park, kill_row_wait_ns);
+    {
+        const tb = try b.readLog();
+        defer gpa.free(tb);
+        try testing.expect(std.mem.indexOf(u8, tb[second_park..], "cannot re-join in place") != null);
+        try testing.expect(std.mem.indexOf(u8, tb[second_park..], "RE-JOINED IN PLACE") == null);
+    }
     const t_poison = clock.monotonicNs();
     // THE FAIL-STOP. (1) An op arriving on the poisoned mount answers EIO
     // within the bound (a separate process: the storm's shell may be held).
@@ -6499,6 +6532,14 @@ test "smoke: A LIVE MEMBER EVICTED AT T_OWNER UNDER THE DEAD MANAGER'S STRIPED H
     storm_b.err_file.close(io);
     gpa.free(storm_b.stop);
     gpa.free(storm_b.count);
+    // The custody's holder lets go (its close answers EIO on the poisoned
+    // mount): the unmount meets no holder.
+    {
+        const f = try Io.Dir.cwd().createFile(io, go, .{ .truncate = true });
+        f.close(io);
+        _ = try holder.wait(io);
+        holder_done = true;
+    }
     // (3) `umount B` completes (the fenced member's dismount is the crash
     // shape: it writes nothing — the exit says FAILED, 1); A serves on;
     // the volume is sound.

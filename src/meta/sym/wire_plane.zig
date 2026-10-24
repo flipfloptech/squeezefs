@@ -1103,11 +1103,13 @@ pub const WirePlane = struct {
         while (true) {
             switch (j.member.join(nowMs(), null)) {
                 .granted => break,
-                .grace_refused, .failed => if (clock.monotonicNs() < deadline) {
+                // Every refusal but a collision is the owner's for now (its
+                // grace window, its reap, a lost reply): retried to the bound.
+                .grace_refused, .failed, .unknown_lease => if (clock.monotonicNs() < deadline) {
                     JoinedHalf.sleepTick();
                     continue;
                 },
-                .collision, .unknown_lease => {},
+                .collision => {},
             }
             return false;
         }

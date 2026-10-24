@@ -504,9 +504,16 @@ pub const Owner = struct {
         return now_ms < g.until_ms;
     }
 
-    fn graceExpects(self: *const Owner, id: MemberId) bool {
+    /// An EXPECTED member's FIRST join while the re-assertion half stands
+    /// is its re-assertion (no epoch needed). Once it re-asserted, or once
+    /// the window closed, a join without an epoch is a FRESH join — the
+    /// member left, was evicted (a re-join in place, decision 0003 §BO) or
+    /// remounted: its predecessor's roster row expects nothing of it any
+    /// more (a reclaim it could never hold answered `UnknownLease` for
+    /// every later join of that identity under this owner).
+    fn graceAwaitsReassertion(self: *const Owner, id: MemberId, now_ms: u64) bool {
         const g = self.grace orelse return false;
-        return g.expects(id);
+        return now_ms < g.until_ms and g.expects(id) and !g.hasReasserted(id);
     }
 
     fn noteReasserted(self: *Owner, id: MemberId) Allocator.Error!void {
@@ -526,7 +533,7 @@ pub const Owner = struct {
     pub fn join(self: *Owner, req: JoinRequest, now_ms: u64) JoinVerdict {
         if (std.mem.allEqual(u8, &req.id, 0)) return .rejected;
         const existing = self.indexOf(req.id);
-        const reclaim = req.prior_epoch != null or self.graceExpects(req.id);
+        const reclaim = req.prior_epoch != null or self.graceAwaitsReassertion(req.id, now_ms);
         if (!reclaim) {
             if (self.graceOpenForFresh(now_ms)) |remaining| {
                 stats.membership_grace_refusals.inc();
@@ -1425,6 +1432,30 @@ test "grace, two halves on one deadline: a stranger is refused while the fresh h
     try testing.expectEqual(@as(u64, 0), deaths.list.items[0].epoch);
     try testing.expectEqual(@as(u64, 0x9999), deaths.list.items[0].pr_key);
     try testing.expectEqual(Liveness.dead, o2.liveness(a, 45_000));
+}
+
+test "a predecessor-roster member that re-asserted, then left or was evicted, joins FRESH under the same owner (a re-join in place, decision 0003 §BO): its join without an epoch is a re-assertion only while the window stands and it has not re-asserted; past the deadline, too, it is a fresh join, never UnknownLease" {
+    const gpa = testing.allocator;
+    const clocks = try LeaseClocks.derive(3_000, 0, 100);
+    const a = writerMemberId(testIdentity(1));
+    var o = try Owner.arm(gpa, clocks, 0, 2, 1, &.{a}, 0);
+    defer o.deinit();
+    // The re-assertion (expected, no epoch) inside the window.
+    const g1 = o.join(joinReqOf(1, null, "/m1"), 100).granted;
+    // Evicted at T_owner (silent), then its re-join in place: a fresh join.
+    try testing.expectEqual(@as(u32, 1), o.expireDue(100 + clocks.t_owner_ms));
+    try testing.expect(o.find(a) == null);
+    const g2 = o.join(joinReqOf(1, null, "/m1"), 200 + clocks.t_owner_ms).granted;
+    try testing.expect(g2.epoch > g1.epoch);
+    try testing.expectEqual(@as(u64, 0), g2.ack_prior_epoch);
+    // A clean leave inside the window, then a fresh join: granted too.
+    _ = o.leave(a, 300 + clocks.t_owner_ms);
+    try testing.expect(o.join(joinReqOf(1, null, "/m1"), 400 + clocks.t_owner_ms) == .granted);
+    // An expected member that never re-asserted joins past the deadline: fresh.
+    const b = writerMemberId(testIdentity(2));
+    var o2 = try Owner.arm(gpa, clocks, 1, 2, 1, &.{b}, 0);
+    defer o2.deinit();
+    try testing.expect(o2.join(joinReqOf(2, null, "/m2"), clocks.grace_ms + 1) == .granted);
 }
 
 test "OQ-5: the same (node, mount_slot) LIVE at another mount point refuses naming the other; the same mount point replaces the prior state; the census pages in join order with a cursor; the push carriage rides the next grant once" {

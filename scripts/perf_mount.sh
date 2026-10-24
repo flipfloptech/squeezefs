@@ -32,8 +32,10 @@
 #     scripts/perf_mount.sh --ram …          # the RAM namespaces of scripts/perf/ramnvme.sh up
 #   Format refuses a device carrying another filesystem unless --fresh (which
 #   formats with --force). The write cache (the staging ring) is RAM:
-#   SQUEEZEFS_WRITE_CACHE_PCT of the machine, no directory. fio/ior/mdtest
-#   come from PATH.
+#   SQUEEZEFS_WRITE_CACHE_PCT of the machine, no directory — and it needs the
+#   `--daemon --supervise` mount below (no write cache without a supervisor,
+#   decision 0003 §BQ): keep it, or the session measures the cache-less
+#   posture. fio/ior/mdtest come from PATH.
 #
 # One mount at a time per host: macOS `/mnt/sqz` inside sqz-bench; Linux
 # `/mnt/sqz-perf`. Exit = orderly `squeezefs umount`, wait for the daemon's

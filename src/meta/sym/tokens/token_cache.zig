@@ -10,11 +10,18 @@
 //! BEFORE it removes the entry; the install checks `gen == gen0` UNDER the
 //! cache lock), single-flight per object, the R5 component
 //! `dlm_token_records_bytes` with voluntary releases and the authority's
-//! shed, and the ACK CONDITIONS: a recall is acked only after a STEP on
-//! the reader's layout cache, the OBSERVED drain of every in-flight serve
-//! that may hold a pre-step binding (the per-thread `ServeStamp` Dekker —
-//! `serve_stamp_model.zig`), and the scoped block-key purge where a DIRTY
-//! local layout entry is KEPT (the writer's acked bytes).
+//! shed, and the ACK CONDITIONS: a recall is acked once its entries are
+//! revoked, the kernel told and the scoped block-key purge ran (a DIRTY
+//! local layout entry is KEPT: the writer's acked bytes). No drain of the
+//! serves in flight: what such a serve hands on is ordered by the read it
+//! feeds — a block deposited or served under a revoked binding meets the
+//! read path's binding recheck AFTER its bytes are in hand (a revoked token
+//! misses and re-grants; a lost binding purges the key and retries), and
+//! the kernel orders its own caches behind the invalidations (an
+//! `INVAL_ENTRY` takes the parent's `i_rwsem`, which a lookup or readdir in
+//! flight holds; an `INVAL_INODE` bumps the inode's `attr_version`, which
+//! drops a GETATTR reply already in flight, and waits out the locked folios
+//! of reads in flight).
 //!
 //! THE PURGE LAW: every entry's exit purges exactly the keys its carried
 //! `layout` names — a recall's revoke, a voluntary release, room-making's
@@ -30,9 +37,7 @@
 //! PORTABLE: the wire is a `Link`, the data plane a `RecallSink`.
 //!
 //! The recall is a PUSH (decision 0002 row 257): the holder's frame
-//! arrives on this reader's listener; when the ack conditions already
-//! hold the push's reply IS the ack, else the frame is handed to the
-//! drain lane, which acks with `RecallAck` once the last serve landed.
+//! arrives on this reader's listener and the push's reply IS the ack.
 //! The "fresh channel" law of the long-poll design becomes the posture
 //! word `channel_ok`: a holder whose last round (grant or push) failed
 //! serves NOTHING from this reader until a round completes (fail-closed).
@@ -78,12 +83,6 @@ pub fn recordsBudgetBytes(mem_budget_bytes: u64) u64 {
 pub fn dirWindowBytes(records_budget_bytes: u64) u64 {
     return @max(records_budget_bytes / 4, @as(u64, frame.CONTROL_CAP));
 }
-/// 64 generation slots = `u64::BITS`, the poison mask's width — a
-/// representation bound; ≥ 64 s at one step per second per volume.
-pub const SERVE_GEN_SLOTS: usize = 64;
-/// The drain's ticked backstop: a lost wake costs one tick, never a wedge;
-/// 10 ms is the reference's and sits two orders under the recall deadline.
-pub const DRAIN_TICK_NS: u64 = 10 * ns_per_ms;
 
 comptime {
     assert(recordsBudgetBytes(16 << 30) == 64 << 20);
@@ -103,8 +102,6 @@ pub const stats = struct {
     pub var dlm_token_hits: counters.ShardedCounter = .{};
     pub var dlm_token_recalls_received: counters.ShardedCounter = .{};
     pub var dlm_token_recalls_acked: counters.ShardedCounter = .{};
-    /// Acks the drain lane carried (a serve was in flight at the push).
-    pub var dlm_token_recall_acks_deferred: counters.ShardedCounter = .{};
     pub var dlm_token_reader_releases: counters.ShardedCounter = .{};
     /// The R5 component `dlm_token_records_bytes` (gauge).
     pub var dlm_token_cached_bytes: counters.Gauge = .{};
@@ -152,131 +149,6 @@ pub const stats = struct {
     /// A held (3.7) stripe skipped the discard (every clean entry is
     /// already pre-step).
     pub var dlm_token_recall_discard_skipped: counters.ShardedCounter = .{};
-    /// The serve ledger: serves in flight (gauge), a serve that observed a
-    /// step between its generation load and its stamp (counted one slot
-    /// early — conservative), a slot re-stamped while occupied (poisoned;
-    /// must-stay-0), drain wakes.
-    pub var reader_serves_inflight: counters.Gauge = .{};
-    pub var reader_serve_step_races: counters.ShardedCounter = .{};
-    pub var reader_serve_slot_overruns: counters.Tripwire = .init("reader_serve_slot_overruns");
-    pub var reader_drain_wakes: counters.ShardedCounter = .{};
-};
-
-// ---------------------------------------------------------------------------
-// ServeStamp — the per-thread serve ledger and the observed drain.
-// ---------------------------------------------------------------------------
-
-/// Per-thread serve stamps over 64 generation slots. `begin` at a read
-/// serve's START (before it resolves any binding): `fetchAdd(1, seq_cst)`
-/// on `shard[thread].slot[gen % 64]`, then a `seq_cst` re-read of the
-/// generation — the Dekker re-read: a step between the load and the
-/// increment is observed and the serve counted one slot early
-/// (conservative). `end`: `fetchSub` + a wake when a drain waits.
-/// `drainBelow(gen)`: `drain_wait_gen` stored seq_cst BEFORE the slot loads
-/// ⇒ no lost wake by construction. Shards never share a line; a thread's
-/// shard is `counters.stripeIndex()` (`next_pow2(cpus) ∈ [1, 64]`).
-pub const ServeStamps = struct {
-    const Shard = struct {
-        slots: [SERVE_GEN_SLOTS]std.atomic.Value(u32) align(std.atomic.cache_line) = @splat(.init(0)),
-    };
-
-    gen: std.atomic.Value(u64) = .init(1),
-    shards: [counters.max_stripes]Shard = @splat(.{}),
-    /// Slots re-stamped while occupied: the drain includes them until they
-    /// empty (the reference's poison mask).
-    poison: std.atomic.Value(u64) = .init(0),
-    /// The generation a drain waits below (0 = none): stored seq_cst
-    /// BEFORE the drain's slot loads.
-    drain_wait_gen: std.atomic.Value(u64) = .init(0),
-    drain_wake: sync.Notify = .init,
-
-    pub const Stamp = struct { shard: usize, slot: usize };
-
-    /// A read serve begins: the stamp, then the Dekker re-read.
-    pub fn begin(self: *ServeStamps) Stamp {
-        const g = self.gen.load(.seq_cst);
-        const shard = counters.stripeIndex();
-        const slot: usize = @intCast(g % SERVE_GEN_SLOTS);
-        _ = self.shards[shard].slots[slot].fetchAdd(1, .seq_cst);
-        stats.reader_serves_inflight.add(1);
-        if (self.gen.load(.seq_cst) != g) stats.reader_serve_step_races.inc();
-        return .{ .shard = shard, .slot = slot };
-    }
-
-    /// The serve landed: wake the drain if this completion may have
-    /// emptied a slot it waits on.
-    pub fn end(self: *ServeStamps, io: Io, s: Stamp) void {
-        _ = self.shards[s.shard].slots[s.slot].fetchSub(1, .seq_cst);
-        stats.reader_serves_inflight.sub(1);
-        if (self.drain_wait_gen.load(.seq_cst) != 0) {
-            stats.reader_drain_wakes.inc();
-            self.drain_wake.notifyWaiters(io);
-        }
-    }
-
-    /// A STEP on the reader's layout cache: every entry stamped before it
-    /// is pre-step; serves from here on stamp the new slot. A new slot
-    /// still occupied (a serve from 64 generations ago) is POISONED.
-    pub fn step(self: *ServeStamps) u64 {
-        const g = self.gen.fetchAdd(1, .seq_cst) + 1;
-        const slot: usize = @intCast(g % SERVE_GEN_SLOTS);
-        if (self.slotTotal(slot) != 0) {
-            _ = self.poison.fetchOr(@as(u64, 1) << @intCast(slot), .seq_cst);
-            stats.reader_serve_slot_overruns.fire("a serve generation slot was re-stamped while a serve 64 steps old still occupied it");
-        }
-        return g;
-    }
-
-    pub fn generation(self: *const ServeStamps) u64 {
-        return self.gen.load(.seq_cst);
-    }
-
-    fn slotTotal(self: *const ServeStamps, slot: usize) u64 {
-        var n: u64 = 0;
-        for (&self.shards) |*sh| n += sh.slots[slot].load(.seq_cst);
-        return n;
-    }
-
-    /// Serves in flight stamped BELOW `gen` (every slot but the current
-    /// one, plus the poisoned ones).
-    pub fn inflightBelow(self: *ServeStamps, gen: u64) u64 {
-        const cur: usize = @intCast(gen % SERVE_GEN_SLOTS);
-        var n: u64 = 0;
-        var poison = self.poison.load(.seq_cst);
-        for (0..SERVE_GEN_SLOTS) |slot| {
-            const t = self.slotTotal(slot);
-            if (slot != cur) {
-                n += t;
-            } else if (poison & (@as(u64, 1) << @intCast(slot)) != 0) {
-                n += t;
-            }
-            if (t == 0 and poison & (@as(u64, 1) << @intCast(slot)) != 0) {
-                poison &= ~(@as(u64, 1) << @intCast(slot));
-                _ = self.poison.fetchAnd(~(@as(u64, 1) << @intCast(slot)), .seq_cst);
-            }
-        }
-        return n;
-    }
-
-    /// The OBSERVED drain: park (register-then-check on `drain_wake`, the
-    /// 10 ms ticked backstop) until no serve below `gen` is in flight.
-    pub fn drainBelow(self: *ServeStamps, io: Io, gen: u64) void {
-        self.drain_wait_gen.store(gen, .seq_cst);
-        defer self.drain_wait_gen.store(0, .seq_cst);
-        while (true) {
-            var n = self.drain_wake.notified();
-            const pre = n.enable(io);
-            if (self.inflightBelow(gen) == 0) {
-                n.cancel(io);
-                return;
-            }
-            if (pre) {
-                n.cancel(io);
-                continue;
-            }
-            _ = n.waitUntilUncancelable(io, clock.monotonicNs() + DRAIN_TICK_NS);
-        }
-    }
 };
 
 // ---------------------------------------------------------------------------
@@ -794,17 +666,6 @@ pub const Wants = struct {
     }
 };
 
-/// A frame handed to the drain lane: the ack travels once the serves
-/// below `gen` landed and the recalled objects are purged.
-const Deferred = struct {
-    frame_id: u64,
-    holder_volume: u16,
-    objects: []Object,
-    /// The revoked entries, pinned until the drain lane's purge read them.
-    kept: []?*Entry,
-    gen: u64,
-};
-
 pub const Reader = struct {
     gpa: Allocator,
     io: Io,
@@ -816,7 +677,6 @@ pub const Reader = struct {
     sink: RecallSink,
     lease: SelfLease,
     cache: Cache,
-    stamps: ServeStamps = .{},
     /// The channel posture: false after a failed round until one
     /// completes (fail-closed).
     channel_ok: std.atomic.Value(bool) = .init(true),
@@ -827,10 +687,6 @@ pub const Reader = struct {
     fetch_lock: sync.Mutex = .init,
     fetching: std.AutoHashMapUnmanaged(Object, void) = .empty,
     fetch_done: sync.Notify = .init,
-    /// The drain lane's queue.
-    deferred_lock: sync.Mutex = .init,
-    deferred: std.ArrayListUnmanaged(Deferred) = .empty,
-    deferred_wake: sync.Notify = .init,
     /// The last holder redirect the wire named (`NotHolder` / `HolderDead`).
     last_redirect_holder: std.atomic.Value(u32) = .init(0),
     /// The dentry window's byte bound (`dirWindowBytes`; a test lowers it).
@@ -843,12 +699,6 @@ pub const Reader = struct {
     pub fn deinit(self: *Reader) void {
         self.cache.deinit();
         self.fetching.deinit(self.gpa);
-        for (self.deferred.items) |d| {
-            for (d.kept) |e| if (e) |x| x.destroy();
-            self.gpa.free(d.kept);
-            self.gpa.free(d.objects);
-        }
-        self.deferred.deinit(self.gpa);
     }
 
     /// The R5 component: floor 0, weight 1, the shed drops everything.
@@ -1058,7 +908,7 @@ pub const Reader = struct {
         const room = self.cache.evictToBudget(io, e.bytes, &retired, &retired_kept, &dropped);
         self.purgeDropped(io, dropped.items);
         room catch return error.OutOfMemory;
-        if (retired.items.len != 0) self.releaseRetired(io, retired.items, retired_kept.items);
+        if (retired.items.len != 0) self.releaseRetired(retired.items, retired_kept.items);
         consumed = true;
         return switch (self.cache.install(io, e, gen0)) {
             .installed => |served| .{ .installed = served },
@@ -1082,67 +932,16 @@ pub const Reader = struct {
 
     // ---- the recall (push) ----
 
-    pub const RecallVerdict = enum { acked, deferred };
-
-    /// The pushed frame: per object the generation bump THEN the removal;
-    /// then the ack conditions — a step, the drain, the scoped purge. When
-    /// no serve below the step is in flight the reply is the ack; else the
-    /// frame goes to the drain lane.
-    pub fn handleRecall(self: *Reader, io: Io, frame_id: u64, objects: []align(1) const Object) Allocator.Error!RecallVerdict {
+    /// The pushed frame: per object the generation bump THEN the removal
+    /// (`revokeKeeping`), then the purge — the kernel told, the scoped
+    /// block-key purge run; the reply is the ack.
+    pub fn handleRecall(self: *Reader, io: Io, objects: []align(1) const Object) Allocator.Error!void {
         const kept = try self.revokeKeeping(io, objects);
-        var kept_owned = true;
-        defer if (kept_owned) self.releaseKept(io, kept);
+        defer self.releaseKept(io, kept);
         stats.dlm_token_recalls_received.add(@intCast(objects.len));
         self.noteRound();
-        const gen = self.stamps.step();
-        if (self.stamps.inflightBelow(gen) == 0) {
-            self.purge(objects, kept);
-            stats.dlm_token_recalls_acked.add(@intCast(objects.len));
-            return .acked;
-        }
-        const owned = try self.gpa.alloc(Object, objects.len);
-        errdefer self.gpa.free(owned);
-        for (owned, objects) |*o, src| o.* = src;
-        {
-            self.deferred_lock.lockUncancelable(io);
-            defer self.deferred_lock.unlock(io);
-            try self.deferred.append(self.gpa, .{ .frame_id = frame_id, .holder_volume = self.volume, .objects = owned, .kept = kept, .gen = gen });
-        }
-        kept_owned = false;
-        self.deferred_wake.notifyWaiters(io);
-        return .deferred;
-    }
-
-    /// The drain lane's work: every deferred frame drained, purged, acked.
-    /// Answers the frames acked.
-    pub fn pumpDeferred(self: *Reader, io: Io) u32 {
-        var acked: u32 = 0;
-        while (true) {
-            const d = blk: {
-                self.deferred_lock.lockUncancelable(io);
-                defer self.deferred_lock.unlock(io);
-                if (self.deferred.items.len == 0) break :blk null;
-                break :blk self.deferred.orderedRemove(0);
-            } orelse return acked;
-            defer self.gpa.free(d.objects);
-            defer self.releaseKept(io, d.kept);
-            self.stamps.drainBelow(io, d.gen);
-            self.purge(d.objects, d.kept);
-            _ = self.link.call(self.link.ctx, .{ .token_recall_ack = .{ .volume = d.holder_volume, .reserved = 0, .reserved2 = 0, .client_id = self.client_id, .frame_id = d.frame_id } }) catch {
-                self.noteRoundFailed();
-                continue;
-            };
-            stats.dlm_token_recalls_acked.add(@intCast(d.objects.len));
-            stats.dlm_token_recall_acks_deferred.inc();
-            acked += 1;
-        }
-    }
-
-    /// Frames waiting on the drain lane.
-    pub fn deferredCount(self: *Reader, io: Io) usize {
-        self.deferred_lock.lockUncancelable(io);
-        defer self.deferred_lock.unlock(io);
-        return self.deferred.items.len;
+        self.purge(objects, kept);
+        stats.dlm_token_recalls_acked.add(@intCast(objects.len));
     }
 
     /// The revoke that keeps each revoked entry pinned for the purge
@@ -1219,11 +1018,9 @@ pub const Reader = struct {
 
     // ---- release, stop, re-point ----
 
-    /// Voluntary: drained + purged first, then `Release` (best effort — a
-    /// lost release costs the holder one needless recall).
-    fn releaseRetired(self: *Reader, io: Io, objects: []const Object, kept: []const ?*Entry) void {
-        const gen = self.stamps.step();
-        self.stamps.drainBelow(io, gen);
+    /// Voluntary: purged first, then `Release` (best effort — a lost
+    /// release costs the holder one needless recall).
+    fn releaseRetired(self: *Reader, objects: []const Object, kept: []const ?*Entry) void {
         self.purge(objects, kept);
         var off: usize = 0;
         while (off < objects.len) {
@@ -1250,7 +1047,7 @@ pub const Reader = struct {
         const room = self.cache.evictOne(io, object, &retired, &kept, &dropped);
         self.purgeDropped(io, dropped.items);
         room catch return;
-        if (retired.items.len != 0) self.releaseRetired(io, retired.items, kept.items);
+        if (retired.items.len != 0) self.releaseRetired(retired.items, kept.items);
     }
 
     /// Release ONE object the caller is done with (a test's voluntary
@@ -1259,7 +1056,7 @@ pub const Reader = struct {
         const objs = [_]Object{object};
         const kept = self.revokeKeeping(io, &objs) catch return;
         defer self.releaseKept(io, kept);
-        self.releaseRetired(io, &objs, kept);
+        self.releaseRetired(&objs, kept);
     }
 
     /// The clean leave: every held token released when the channel is ok.
@@ -1275,7 +1072,7 @@ pub const Reader = struct {
         if (held.items.len == 0 or !self.channel_ok.load(.acquire)) return;
         const kept = self.revokeKeeping(io, held.items) catch return;
         defer self.releaseKept(io, kept);
-        self.releaseRetired(io, held.items, kept);
+        self.releaseRetired(held.items, kept);
     }
 
     /// A holder that MOVED its listener: the link re-pointed in place, the
@@ -1298,8 +1095,6 @@ pub const Reader = struct {
         // over no entries — the census, the fail-safe direction.
         const kept = self.revokeKeeping(io, held.items) catch null;
         defer if (kept) |k| self.releaseKept(io, k);
-        const gen = self.stamps.step();
-        self.stamps.drainBelow(io, gen);
         self.purge(held.items, kept);
         self.channel_ok.store(false, .release);
         stats.dlm_token_holder_repoints.inc();
@@ -1334,8 +1129,6 @@ pub const Reader = struct {
         // over no entries — the census, the fail-safe direction.
         const kept = self.revokeKeeping(io, held.items) catch null;
         defer if (kept) |k| self.releaseKept(io, k);
-        const gen = self.stamps.step();
-        self.stamps.drainBelow(io, gen);
         self.purge(held.items, kept);
         self.noteRound();
         return true;
@@ -1351,38 +1144,6 @@ pub const Reader = struct {
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
-
-test "ServeStamps: a serve in flight below the step is counted; its end wakes the drain; a serve that begins after the step is not below it" {
-    const io = testing.io;
-    var st: ServeStamps = .{};
-    const s = st.begin();
-    const g = st.step();
-    try testing.expectEqual(@as(u64, 1), st.inflightBelow(g));
-    const s2 = st.begin();
-    try testing.expectEqual(@as(u64, 1), st.inflightBelow(g));
-    st.end(io, s);
-    try testing.expectEqual(@as(u64, 0), st.inflightBelow(g));
-    st.drainBelow(io, g);
-    st.end(io, s2);
-    try testing.expectEqual(@as(u64, 0), stats.reader_serve_slot_overruns.load());
-}
-
-test "ServeStamps: a serve 64 steps old poisons its re-stamped slot and the drain still counts it" {
-    const io = testing.io;
-    var st: ServeStamps = .{};
-    const s = st.begin();
-    var g: u64 = 0;
-    const before = stats.reader_serve_slot_overruns.load();
-    stats.reader_serve_slot_overruns.resetLogBudgetForTest();
-    log.testing.expectErrorLogs(1);
-    for (0..SERVE_GEN_SLOTS) |_| g = st.step();
-    try log.testing.expectAllFired();
-    try testing.expectEqual(before + 1, stats.reader_serve_slot_overruns.load());
-    try testing.expectEqual(@as(u64, 1), st.inflightBelow(g));
-    st.end(io, s);
-    try testing.expectEqual(@as(u64, 0), st.inflightBelow(g));
-    try testing.expectEqual(@as(u64, 0), st.poison.load(.seq_cst));
-}
 
 test "the cache: install under gen0 is refused by a bump the check sees and found by a bump after it; a dentry-bearing entry is never displaced by a bare one; pins keep a revoked entry alive until the last release" {
     const io = testing.io;

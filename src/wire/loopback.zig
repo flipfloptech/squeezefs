@@ -223,7 +223,6 @@ const FamilyEcho = struct {
             },
             .token_grant => .{ .ok = .{ .token_grant = .{ .head = .{ .kind = 0, .flags = verbs.PAGE_XATTRS_COMPLETE, .reserved = 0, .n_xattrs = 0, .n_dir = 0, .holder = 0, .attrs = attrs, .reserved2 = @splat(0) }, .xattrs_bytes = "", .dir_bytes = "" } } },
             .token_recall => .{ .ok = .{ .token_recall = .acked } },
-            .token_recall_ack => .{ .ok = .{ .token_recall_ack = .fresh } },
             .token_release => |r| .{ .ok = .{ .token_release = .{ .count = @intCast(r.items.len), .reserved = 0 } } },
             .custody_grant => .{ .ok = .{ .custody_grant = .{ .head = .{ .kind = 1, .reserved = @splat(0), .status = 3, .grant_epoch = 0, .page_len = 0, .reserved2 = 0 }, .page_bytes = "" } } },
             .xv_step => .{ .ok = .{ .xv_step = .{ .status = 0, .has_inode = 0, .reserved = @splat(0), .inode = attrs, .reserved2 = @splat(0) } } },
@@ -341,7 +340,6 @@ test "four in-process daemons exchange every verb family's shape over the hub: e
     const recalled = [_]u64{9};
     const rv = try c.call(.{ .token_recall = .{ .head = .{ .volume = 0, .n_names = 0, .n = 1, .frame_id = 1, .holder = 1, .unnamed = 0, .reserved = @splat(0) }, .items = &recalled } });
     try testing.expectEqual(@as(u8, 0), rv.token_recall.kind);
-    _ = try c.call(.{ .token_recall_ack = .{ .volume = 0, .reserved = 0, .reserved2 = 0, .client_id = 1, .frame_id = 0 } });
     const objs = [_]u64{ 9, 10 };
     const tr = try c.call(.{ .token_release = .{ .head = .{ .volume = 0, .n = 2, .reserved = 0, .client_id = 1 }, .items = &objs } });
     try testing.expectEqual(@as(u32, 2), tr.token_release.count);

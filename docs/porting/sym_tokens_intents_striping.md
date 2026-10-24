@@ -365,7 +365,13 @@ pages install after the recall removed the old entry.
    `reader_serve_slot_overruns` (must-stay-0, :212–216). Per-op cost unarmed: one relaxed load
    (:218–222). Z/: `counters.ShardedCounter`-class shards with the two `SeqCst` points kept and
    a model (`serve_stamp_model.zig`) whose weakening (the re-read relaxed) lets a serve escape the
-   drain.
+   drain. **Port: DELETED (decision 0002 row 560)** — no production serve ever stamped (the drain
+   was vacuous), and the hazards it guarded are closed elsewhere: a block deposited or served under
+   a revoked binding meets the read path's binding recheck AFTER its bytes are in hand, and the
+   kernel orders its caches behind the invalidations (`INVAL_ENTRY` takes the parent's `i_rwsem`
+   an in-flight lookup/readdir holds; `INVAL_INODE` bumps `attr_version`, dropping an in-flight
+   GETATTR reply, and waits out in-flight reads' locked folios). The push's reply IS the ack;
+   `RecallAck` and the deferred verdict are gone.
 2. **The scoped purge** (`purge_scoped` :3883–3925): for each recalled object with an entry, the block
    keys its `layout` names (`layout_block_keys` :3798–3822 — v4: the bindings off `data/layout.zig`'s
    `MappingWire`, never strings — 0002 row 105), `router.discard_clean_layout_entry(global)` → one of

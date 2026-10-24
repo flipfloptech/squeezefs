@@ -2,9 +2,9 @@
 //! "Tokens"; `docs/porting/sym_tokens_intents_striping.md` §1): the
 //! holder's grant table with the register-then-check gate and the recall
 //! the conveyor pass runs at A1½ (`token_table`), the reader's cache with
-//! the DMA-drain acks (`token_cache`), the read divert and the wire
+//! the purge-then-ack recall (`token_cache`), the read divert and the wire
 //! binding (`read_divert`), `-o ro` and the epoch-poll control plane
-//! (`ro_mount`), the models (`grant_gate_model`, `serve_stamp_model`).
+//! (`ro_mount`), the models (`grant_gate_model`, `install_gen_model`).
 //! Every registry is a field of the mount's objects (decision 0002 row
 //! 259) — never a process static; the instruments alone are module
 //! globals, folded over every plane as the reference's stats did.
@@ -27,7 +27,7 @@ pub const cache = @import("tokens/token_cache.zig");
 pub const divert = @import("tokens/read_divert.zig");
 pub const ro = @import("tokens/ro_mount.zig");
 pub const grant_gate_model = @import("tokens/grant_gate_model.zig");
-pub const serve_stamp_model = @import("tokens/serve_stamp_model.zig");
+pub const install_gen_model = @import("tokens/install_gen_model.zig");
 pub const recall_notify_model = @import("tokens/recall_notify_model.zig");
 pub const smoke = if (builtin.os.tag == .linux) @import("tokens/smoke_linux.zig") else struct {};
 
@@ -101,7 +101,7 @@ test {
     _ = divert;
     _ = ro;
     _ = grant_gate_model;
-    _ = serve_stamp_model;
+    _ = install_gen_model;
     _ = recall_notify_model;
     if (builtin.os.tag == .linux) _ = smoke;
 }
@@ -111,7 +111,7 @@ test "the stats family names every instrument of the four namespaces" {
     var w: std.Io.Writer = .fixed(&buf);
     try writeStatsJson(&w);
     const s = w.buffered();
-    for ([_][]const u8{ "\"holder\":{", "\"dlm_token_recall_timeouts_live\":", "\"dlm_token_recall_rtt_total\":", "\"reader\":{", "\"dlm_token_cached_bytes\":", "\"reader_serve_slot_overruns\":", "\"divert\":{", "\"dlm_token_reader_holder_planes\":", "\"ro\":{", "\"reader_staleness_bound_ms\":", "\"meta_kv_revalidate_gap_scans\":" }) |k| {
+    for ([_][]const u8{ "\"holder\":{", "\"dlm_token_recall_timeouts_live\":", "\"dlm_token_recall_rtt_total\":", "\"reader\":{", "\"dlm_token_cached_bytes\":", "\"divert\":{", "\"dlm_token_reader_holder_planes\":", "\"ro\":{", "\"reader_staleness_bound_ms\":", "\"meta_kv_revalidate_gap_scans\":" }) |k| {
         try testing.expect(std.mem.indexOf(u8, s, k) != null);
     }
 }
@@ -772,53 +772,7 @@ test "the paged-resident dentry set (rung 10 item 5c, spec Q13): a directory lar
     try testing.expectEqual(oversize0, cache.stats.dlm_token_oversize_refusals.load());
 }
 
-/// A recall pushed while a DMA read is in flight on the reader.
-const InFlightRig = struct {
-    f: *TwoMembers,
-    summary: table.RecallSummary = .{},
-    fn run(self: *InFlightRig) void {
-        self.summary = self.f.commit(&.{objectOf(3)}, &bumpMtime) catch unreachable;
-    }
-};
-
-test "a recall during an in-flight DMA read is acked only after it lands: the push is DEFERRED, the holder waits, the drain lane acks after the last serve ends" {
-    const gpa = testing.allocator;
-    const io = testing.io;
-    const f = try TwoMembers.init(gpa, io, 1);
-    defer f.deinit();
-    const b = f.reader(0);
-    var s = (try b.serve(io, objectOf(3), .{})).?;
-    s.release(io);
-    const plane = b.planeOf(io, A_ID).?;
-    // A read serve in flight on the ino (its stamp held).
-    const stamp = plane.stamps.begin();
-    var rig: InFlightRig = .{ .f = f };
-    const t = try std.Thread.spawn(.{}, InFlightRig.run, .{&rig});
-    // The push arrives, the entry is revoked, the frame is deferred: the
-    // holder's grant stands under recall until the ack.
-    var spins: u32 = 0;
-    while (plane.deferredCount(io) == 0) : (spins += 1) {
-        try testing.expect(spins < 1_000_000);
-        std.Thread.yield() catch {};
-    }
-    try testing.expect(f.holder.holdsGrant(io, objectOf(3), 1));
-    try testing.expectEqual(@as(usize, 0), plane.cache.count(io));
-    // The DMA lands: the drain completes, the lane purges and acks.
-    plane.stamps.end(io, stamp);
-    const deferred0 = cache.stats.dlm_token_recall_acks_deferred.load();
-    try testing.expectEqual(@as(u32, 1), plane.pumpDeferred(io));
-    try testing.expectEqual(deferred0 + 1, cache.stats.dlm_token_recall_acks_deferred.load());
-    t.join();
-    try testing.expectEqual(@as(u32, 1), rig.summary.recalled);
-    try testing.expectEqual(@as(u32, 1), rig.summary.acked);
-    try testing.expect(!f.holder.holdsGrant(io, objectOf(3), 1));
-    try testing.expectEqual(@as(u32, 1), f.sinks[0].discards);
-    s = (try b.serve(io, objectOf(3), .{})).?;
-    try testing.expectEqual(@as(u64, 200), s.entry.?.attrs.mtime);
-    s.release(io);
-}
-
-test "the recall's purge reads the REVOKED entry's carried `layout` (held pinned through the sink's call): the inline ack, the drain lane's deferred ack and a voluntary release each hand it over; the shed purges each entry it drops at the drop, so a recall of a shed object owes the kernel its invalidation and the tiers nothing — no census (0003 §W.2)" {
+test "the recall's purge reads the REVOKED entry's carried `layout` (held pinned through the sink's call): the ack and a voluntary release each hand it over; the shed purges each entry it drops at the drop, so a recall of a shed object owes the kernel its invalidation and the tiers nothing — no census (0003 §W.2)" {
     const gpa = testing.allocator;
     const io = testing.io;
     const f = try TwoMembers.init(gpa, io, 1);
@@ -839,37 +793,19 @@ test "the recall's purge reads the REVOKED entry's carried `layout` (held pinned
     try testing.expectEqual(@as(u32, 1), sum.acked);
     try testing.expectEqual(@as(u32, 1), sink.entries_seen);
     try testing.expectEqualStrings(want, sink.last_layout.?[0..sink.last_layout_len]);
-    // 2. The drain lane's deferred ack: a serve in flight below the step.
-    s = (try b.serve(io, objectOf(3), .{})).?;
-    s.release(io);
-    const stamp = plane.stamps.begin();
-    var rig: InFlightRig = .{ .f = f };
-    const t = try std.Thread.spawn(.{}, InFlightRig.run, .{&rig});
-    var spins: u32 = 0;
-    while (plane.deferredCount(io) == 0) : (spins += 1) {
-        try testing.expect(spins < 1_000_000);
-        std.Thread.yield() catch {};
-    }
-    try testing.expectEqual(@as(u32, 1), sink.entries_seen);
-    plane.stamps.end(io, stamp);
-    try testing.expectEqual(@as(u32, 1), plane.pumpDeferred(io));
-    t.join();
-    try testing.expectEqual(@as(u32, 1), rig.summary.acked);
-    try testing.expectEqual(@as(u32, 2), sink.entries_seen);
-    try testing.expectEqualStrings(want, sink.last_layout.?[0..sink.last_layout_len]);
-    // 3. A voluntary release: drained and purged over the entry it drops.
+    // 2. A voluntary release: purged over the entry it drops.
     s = (try b.serve(io, objectOf(3), .{})).?;
     s.release(io);
     plane.release(io, objectOf(3));
-    try testing.expectEqual(@as(u32, 3), sink.entries_seen);
+    try testing.expectEqual(@as(u32, 2), sink.entries_seen);
     try testing.expectEqualStrings(want, sink.last_layout.?[0..sink.last_layout_len]);
-    // 4. An entry the reader shed (the holder still lists the grant): the
+    // 3. An entry the reader shed (the holder still lists the grant): the
     //    shed purged it at the drop; the recall finds none, invalidates
     //    the kernel's view and purges nothing more.
     s = (try b.serve(io, objectOf(4), .{})).?;
     s.release(io);
     try testing.expectEqual(@as(u32, 1), plane.shed(io));
-    try testing.expectEqual(@as(u32, 4), sink.entries_seen);
+    try testing.expectEqual(@as(u32, 3), sink.entries_seen);
     const census0 = sink.census;
     const noted0 = sink.noted;
     const unheld0 = cache.stats.dlm_token_recall_unheld.load();
@@ -878,7 +814,7 @@ test "the recall's purge reads the REVOKED entry's carried `layout` (held pinned
     try testing.expectEqual(census0, sink.census);
     try testing.expectEqual(noted0 + 1, sink.noted);
     try testing.expectEqual(unheld0 + 1, cache.stats.dlm_token_recall_unheld.load());
-    try testing.expectEqual(@as(u32, 4), sink.entries_seen);
+    try testing.expectEqual(@as(u32, 3), sink.entries_seen);
 }
 
 test "the census is reserved for keys the reader cannot name: a recalled entry whose layout names its keys elsewhere runs it ONCE per call beside the scoped purge of the others; a recall that finds no entry while a drop's purge is still in flight runs it; a recall of an object the reader holds no entry for runs none" {

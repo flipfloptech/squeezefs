@@ -203,10 +203,8 @@ pub const LeaseOracle = struct {
 
 /// What a pushed frame came back as (the reader's reply, or its absence).
 pub const PushVerdict = enum {
-    /// The push's reply carried the ack (no serve was in flight).
+    /// The push's reply carried the ack.
     acked,
-    /// The reader's drain lane acks later with `RecallAck`.
-    deferred,
     /// No session to the reader (unbound endpoint, a dead dial): the frame
     /// stays pending until the reader's lease expiry retires it.
     unreachable_,
@@ -946,9 +944,9 @@ pub const Holder = struct {
         self.gate.settle(io, objects);
     }
 
-    /// `RecallAck{frame_id}` from `client`: the frame's grants retire; a
-    /// stale ack matches nothing (debug, never a refusal). Answers the
-    /// grants retired.
+    /// The ack of `client`'s frame `frame_id` (its push's reply): the
+    /// frame's grants retire; a stale ack matches nothing (debug, never a
+    /// refusal). Answers the grants retired.
     pub fn serveAck(self: *Holder, io: Io, client: ClientId, frame_id: u64) u32 {
         var n: u32 = 0;
         {

@@ -104,7 +104,6 @@ pub const Verb = enum(u16) {
     // ---- tokens 0x0400 ----
     token_grant = 0x0400,
     token_recall = 0x0401,
-    token_recall_ack = 0x0402,
     token_release = 0x0403,
     custody_grant = 0x0404,
     // ---- manager 0x0500 (low byte = the reference's documented code) ----
@@ -1253,28 +1252,18 @@ pub const TokenRecallReq = RecallFrame;
 /// `batch_max`, derived from the frame cap alone — decision 0002 row 258).
 pub const RECALL_BATCH_MAX: u32 = (1 << 20) / 2 / 32;
 
-pub const RecallVerdictKind = enum(u8) {
-    /// The ack conditions already held (no serve in flight on the recalled
-    /// inos): the push's reply IS the ack.
-    acked = 0,
-    /// A serve is in flight: the reader's drain lane acks with
-    /// `token_recall_ack` once it landed and the census is purged.
-    deferred = 1,
-};
-
+/// The push's reply IS the ack: the reader revoked, told its kernel and
+/// purged before it answered (`token_cache.Reader.handleRecall`).
 pub const RecallVerdict = extern struct {
     kind: u8,
     reserved: [7]u8,
 
     pub const acked: RecallVerdict = .{ .kind = 0, .reserved = @splat(0) };
-    pub const deferred: RecallVerdict = .{ .kind = 1, .reserved = @splat(0) };
 
     pub fn check(self: RecallVerdict) bool {
-        return self.kind <= 1;
+        return self.kind == 0;
     }
 };
-
-pub const TokenRecallAckReq = extern struct { volume: u16, reserved: u16, reserved2: u32, client_id: u64, frame_id: u64 };
 
 pub const TokenReleaseHead = extern struct { volume: u16, n: u16, reserved: u32, client_id: u64 };
 pub const TokenReleaseReq = HeadWithArray(TokenReleaseHead, u64, "n", OBJECTS_MAX);
@@ -1799,7 +1788,6 @@ pub fn ReqType(comptime v: Verb) type {
         .supply_stripe_inos => SupplyStripeInosReq,
         .token_grant => TokenGrantReq,
         .token_recall => TokenRecallReq,
-        .token_recall_ack => TokenRecallAckReq,
         .token_release => TokenReleaseReq,
         .custody_grant => CustodyGrantReq,
         .join_appender => JoinAppenderReq,
@@ -1861,7 +1849,6 @@ pub fn RepType(comptime v: Verb) type {
         .supply_stripe_inos => StripeInosSupplied,
         .token_grant => GrantPage,
         .token_recall => RecallVerdict,
-        .token_recall_ack => Ack,
         .token_release => Released,
         .custody_grant => CustodyReply,
         .join_appender => Joined,
@@ -2182,8 +2169,7 @@ test "token payloads: the grant ask, a page with xattrs and a dentry page, recal
     var fbb: Builder = .init(&fb);
     try codec.encodePayload(RecallFrame, .{ .head = .{ .volume = 0, .n_names = 0, .n = 0, .frame_id = 1, .holder = 1, .unnamed = 0, .reserved = @splat(0) }, .items = &.{} }, &fbb);
     try testing.expectError(error.Malformed, codec.decodePayload(RecallFrame, fbb.written()));
-    _ = try roundTrip(RecallVerdict, RecallVerdict.deferred);
-    _ = try roundTrip(TokenRecallAckReq, .{ .volume = 0, .reserved = 0, .reserved2 = 0, .client_id = 77, .frame_id = 3 });
+    _ = try roundTrip(RecallVerdict, RecallVerdict.acked);
     _ = try roundTrip(TokenReleaseReq, .{ .head = .{ .volume = 0, .n = 2, .reserved = 0, .client_id = 77 }, .items = &objs });
     _ = try roundTrip(Released, .{ .count = 2, .reserved = 0 });
     _ = try roundTrip(CustodyGrantReq, .{ .volume = 0, .concurrent_write = 1, .reserved = 0, .wait_ms = 100, .client_id = 77, .object = 1000, .span_start = 0, .span_len = 1 << 22, .lease_epoch = 5, .reserved2 = 0 });

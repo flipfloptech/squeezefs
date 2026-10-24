@@ -12,7 +12,7 @@
 //! and never dials a holder the owner lists DEAD.
 //!
 //! The wire binding: `HolderService` registers the holder's verbs
-//! (`Grant`, `RecallAck`, `Release`, `CustodyGrant`) on the mount's ONE
+//! (`Grant`, `Release`, `CustodyGrant`) on the mount's ONE
 //! service under the frame law — the lessee check, the membership lease
 //! FIRST, then dispatch; `ReaderService` registers the PUSHED `Recall` on
 //! the reader's service; `LinkPusher` is the holder's push over the
@@ -414,14 +414,12 @@ pub const HolderService = struct {
 
     pub fn register(self: *HolderService, svc: *service.Service) void {
         svc.register(.token_grant, .{ .ctx = self, .serve = &serveGrant });
-        svc.register(.token_recall_ack, .{ .ctx = self, .serve = &serveAck });
         svc.register(.token_release, .{ .ctx = self, .serve = &serveRelease });
         svc.register(.custody_grant, .{ .ctx = self, .serve = &serveCustody });
     }
 
     pub fn unregister(_: *HolderService, svc: *service.Service) void {
         svc.unregister(.token_grant);
-        svc.unregister(.token_recall_ack);
         svc.unregister(.token_release);
         svc.unregister(.custody_grant);
     }
@@ -466,13 +464,6 @@ pub const HolderService = struct {
         }
         if (self.redirect(r.head.object)) |page| return .{ .ok = .{ .token_grant = page } };
         return grantAnswer(self.holder.serveGrant(self.io, .{ .client = r.head.client_id, .object = r.head.object, .wants_dentries = r.head.wants & verbs.WANT_DENTRIES != 0, .wants_records = r.head.wants & verbs.WANT_RECORDS != 0, .after = r.head.after, .xattr_after = r.bytes }, self.source, scratch));
-    }
-
-    fn serveAck(ctx: *anyopaque, req: *const service.Request, _: []u8) Answer {
-        const self: *HolderService = @ptrCast(@alignCast(ctx));
-        const r = req.payload.token_recall_ack;
-        const n = self.holder.serveAck(self.io, r.client_id, r.frame_id);
-        return .{ .ok = .{ .token_recall_ack = if (n != 0) verbs.Ack.fresh else verbs.Ack.replay } };
     }
 
     fn serveRelease(ctx: *anyopaque, req: *const service.Request, _: []u8) Answer {
@@ -575,11 +566,8 @@ pub const ReaderService = struct {
         // flight on a parent holds the parent's `i_rwsem`, so its dentry is
         // installed before the invalidation takes it — never after.
         self.divert.noteRecallNames(r);
-        const verdict = plane.handleRecall(self.io, r.head.frame_id, r.items) catch return Answer.refused(error.OutOfMemory, "out of memory queueing the recall frame");
-        return .{ .ok = .{ .token_recall = switch (verdict) {
-            .acked => verbs.RecallVerdict.acked,
-            .deferred => verbs.RecallVerdict.deferred,
-        } } };
+        plane.handleRecall(self.io, r.items) catch return Answer.refused(error.OutOfMemory, "out of memory revoking the recalled entries");
+        return .{ .ok = .{ .token_recall = .acked } };
     }
 };
 
@@ -612,19 +600,17 @@ pub const LinkPusher = struct {
         var name_list: []const verbs.RecallName = if (fits) names.notes else &.{};
         var unnamed = names.unnamed or !fits;
         var off: usize = 0;
-        var verdict: table.PushVerdict = .acked;
         // A union wider than one frame's cap goes in several pushes under
         // ONE frame id; the ack covers them all.
         while (off < objects.len) {
             const n = @min(objects.len - off, verbs.RECALL_BATCH_MAX);
             const head: verbs.RecallFrameHead = .{ .volume = self.volume, .n_names = @intCast(name_list.len), .n = @intCast(n), .frame_id = frame_id, .holder = self.identity, .unnamed = @intFromBool(unnamed), .reserved = @splat(0) };
-            const rep = link.call(link.ctx, .{ .token_recall = .{ .head = head, .items = objects[off .. off + n], .name_list = name_list } }) catch return .unreachable_;
-            if (rep.token_recall.kind == @backingInt(verbs.RecallVerdictKind.deferred)) verdict = .deferred;
+            _ = link.call(link.ctx, .{ .token_recall = .{ .head = head, .items = objects[off .. off + n], .name_list = name_list } }) catch return .unreachable_;
             off += n;
             name_list = &.{};
             unnamed = false;
         }
-        return verdict;
+        return .acked;
     }
 };
 

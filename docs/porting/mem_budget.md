@@ -79,6 +79,14 @@ tick_inputs(budget, rss, raw_unreclaimable, share) -> (budget, rss, fleet_shared
 Why: N co-located daemons read ONE `memory.stat`; comparing the cage's collective residue against a 1/N budget over-fires
 Red/backstop ~N× ("the rung-7 S6-a N=32 row caught it live: all 32 daemons in Red with hard backstops at 0.5 GB of own ledger each", `:992-993`).
 
+**Divergence (Zig, 2026-10-24, decision 0002 row 556; `rung-10-idle-rss.md`): the arm reads the cage only when the cage is the
+fleet's.** The census that counts the share also counts the cage's FOREIGN live processes — neither this process's comm nor a
+supervisor's (`sqz-supervise`). With none (a systemd service: the daemon and its supervisor; a pod of daemons) the arm reads
+`memory.stat` as above; with any (a desktop session's scope, a CI runner's, the container's root cgroup) the sample is 0 — the
+cage's set is THEIRS, and the daemon answers for its own: its gauges and its RSS (`statm`, kept over PSS: the two differ by the
+shared text, ≤ 14 MiB, and PSS walks every VMA). An unreadable census is off too. The cage's `memory.max`/`memory.high` still bound
+the budget in both cases. The edge is one info line.
+
 ---
 
 ## 2. Component model

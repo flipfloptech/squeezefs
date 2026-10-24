@@ -7,6 +7,12 @@
 //! unreclaimable set into two 5-slot max-of-window buffers, computes
 //! `pressure = max(Σ non-reclaimable gauges, rss_max, unreclaim_max)`, runs
 //! the hysteresis level machine, and on Red ticks sheds ∝ weight over floors.
+//! The unreclaimable arm reads the cage only when the cage is the fleet's
+//! (`Census.owned`: no process in it but squeezefs daemons and their
+//! supervisors — a systemd service's): a cage shared with foreign processes
+//! (a desktop session's scope, a CI runner's) reports THEIR memory, so the
+//! arm is off there and the daemon answers for its own — its gauges and its
+//! RSS (`docs/evidence/rung-10-idle-rss.md`).
 //! Enforcement is advisory-at-admission: growth paths call `level()` (one
 //! relaxed load) and apply their own response.
 
@@ -153,8 +159,11 @@ pub fn effectiveParkedCap(cap: u64, level_now: Level) u64 {
 /// present, else the per-tick census of squeezefs daemons sharing this
 /// process's cgroup (`readFleetShare` over `roots`); 1 off-cgroup/off-Linux.
 pub fn fleetShare(io: std.Io, env: *const std.process.Environ.Map, roots: CensusRoots) u32 {
-    if (knobs.optIntKnob("SQUEEZEFS_TEST_FLEET_SHARE", u32, env)) |pinned| return pinned;
-    return readFleetShare(io, roots);
+    return pinnedShare(env) orelse readFleetShare(io, roots);
+}
+
+fn pinnedShare(env: *const std.process.Environ.Map) ?u32 {
+    return knobs.optIntKnob("SQUEEZEFS_TEST_FLEET_SHARE", u32, env);
 }
 
 /// `SQUEEZEFS_MEM_BUDGET_MB` × 1 MiB; null when absent.
@@ -336,14 +345,33 @@ pub fn parseProcStat(text: []const u8) ?ProcStat {
     return .{ .pid = text[0..open], .comm = text[open + 2 .. close], .state = text[close + 2] };
 }
 
-/// The fleet share census of the cage at `path`: the pids of its
-/// `cgroup.procs` whose stat names a live process with this process's comm
-/// — a zombie (exited, unreaped, listed in the window between the two
-/// reads) holds no memory and never counts. Pure over `roots`. Null when the
-/// list is unreadable or does not list this process (a view of another cage
-/// or pid namespace, whose count means nothing here; the caller falls back
-/// to 1, loudly) — so a census is ≥ 1 by construction.
-pub fn censusFleetShare(io: std.Io, roots: CensusRoots, path: []const u8) ?u32 {
+/// A daemon's supervisor's comm (`cli/supervisor.zig` names its thread
+/// so): it shares the daemon's service cage and holds no memory of its own
+/// worth a census.
+pub const supervisor_comm = "sqz-supervise";
+
+/// What one walk of a cage's `cgroup.procs` saw.
+pub const Census = struct {
+    /// Live squeezefs daemons (this process's comm), this one included.
+    share: u32,
+    /// Live processes that are neither a daemon nor a daemon's supervisor.
+    foreign: u32,
+
+    /// The cage is the fleet's own: its `memory.stat` is the daemons'.
+    pub fn owned(self: Census) bool {
+        return self.foreign == 0;
+    }
+};
+
+/// The census of the cage at `path`: the pids of its `cgroup.procs` whose
+/// stat names a live process — with this process's comm (the share) or
+/// with any other but a supervisor's (foreign); a zombie (exited, unreaped,
+/// listed in the window between the two reads) holds no memory and never
+/// counts. Pure over `roots`. Null when the list is unreadable or does not
+/// list this process (a view of another cage or pid namespace, whose count
+/// means nothing here; the caller falls back to 1, loudly) — so a share is
+/// ≥ 1 by construction.
+pub fn censusCage(io: std.Io, roots: CensusRoots, path: []const u8) ?Census {
     var file_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     var self_buf: [proc_stat_head_bytes]u8 = undefined;
     const self_path = std.fmt.bufPrint(&file_buf, "{s}/self/stat", .{roots.proc}) catch return null;
@@ -353,41 +381,64 @@ pub fn censusFleetShare(io: std.Io, roots: CensusRoots, path: []const u8) ?u32 {
     // (~8k entries) is the most this census needs to see.
     var procs_buf: [64 * 1024]u8 = undefined;
     const procs = readSmallFile(io, procs_path, &procs_buf) orelse return null;
-    var n: u32 = 0;
+    var c: Census = .{ .share = 0, .foreign = 0 };
     var self_listed = false;
     var pids = std.mem.tokenizeAny(u8, procs, " \t\r\n");
     while (pids.next()) |pid| {
         if (std.mem.eql(u8, pid, me.pid)) {
             self_listed = true;
-            n += 1;
+            c.share += 1;
             continue;
         }
         const stat_path = std.fmt.bufPrint(&file_buf, "{s}/{s}/stat", .{ roots.proc, pid }) catch continue;
         var stat_buf: [proc_stat_head_bytes]u8 = undefined;
         const st = parseProcStat(readSmallFile(io, stat_path, &stat_buf) orelse continue) orelse continue;
-        if (st.state != 'Z' and st.state != 'X' and std.mem.eql(u8, st.comm, me.comm)) n += 1;
+        if (st.state == 'Z' or st.state == 'X') continue;
+        if (std.mem.eql(u8, st.comm, me.comm)) {
+            c.share += 1;
+        } else if (!std.mem.eql(u8, st.comm, supervisor_comm)) {
+            c.foreign += 1;
+        }
     }
-    return if (self_listed) n else null;
+    return if (self_listed) c else null;
+}
+
+/// `censusCage`'s share.
+pub fn censusFleetShare(io: std.Io, roots: CensusRoots, path: []const u8) ?u32 {
+    return (censusCage(io, roots, path) orelse return null).share;
 }
 
 var fleet_census_warned: std.atomic.Value(bool) = .init(false);
 
-/// This process's fleet share from the census of its own cgroup over
-/// `roots`; 1 off-cgroup (no `0::` line in `<proc>/self/cgroup`, as
-/// off-Linux: the cage, if any, already divides); 1 with ONE warning when
-/// the census is null.
-pub fn readFleetShare(io: std.Io, roots: CensusRoots) u32 {
+/// The census of this process's own cgroup over `roots`; null off-cgroup
+/// (no `0::` line in `<proc>/self/cgroup`, as off-Linux) and, with ONE
+/// warning, when the list is unreadable or does not list this process.
+pub fn readCensus(io: std.Io, roots: CensusRoots) ?Census {
     var file_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const cg_path = std.fmt.bufPrint(&file_buf, "{s}/self/cgroup", .{roots.proc}) catch return 1;
+    const cg_path = std.fmt.bufPrint(&file_buf, "{s}/self/cgroup", .{roots.proc}) catch return null;
     var cg_buf: [4096]u8 = undefined;
-    const cg = readSmallFile(io, cg_path, &cg_buf) orelse return 1;
-    const path = parseCgroupV2Path(cg) orelse return 1;
-    return censusFleetShare(io, roots, path) orelse {
+    const cg = readSmallFile(io, cg_path, &cg_buf) orelse return null;
+    const path = parseCgroupV2Path(cg) orelse return null;
+    return censusCage(io, roots, path) orelse {
         if (!fleet_census_warned.swap(true, .monotonic)) {
-            log.warn("mem_budget: {s}{s}/cgroup.procs is unreadable or does not list this process — fleet share falls back to 1 (the whole-machine posture; co-located daemons will not divide the roots)", .{ roots.cgroup, path });
+            log.warn("mem_budget: {s}{s}/cgroup.procs is unreadable or does not list this process — fleet share falls back to 1 (the whole-machine posture; co-located daemons will not divide the roots) and the cage's unreclaimable arm is off", .{ roots.cgroup, path });
         }
-        return 1;
+        return null;
     };
+}
+
+/// This process's fleet share (`readCensus`); 1 when there is no census
+/// (off-cgroup: the cage, if any, already divides).
+pub fn readFleetShare(io: std.Io, roots: CensusRoots) u32 {
+    return if (readCensus(io, roots)) |c| c.share else 1;
+}
+
+/// The unreclaimable sample a tick judges: the cage's `memory.stat` when
+/// the census says the cage is the fleet's, else none (0: the arm is off).
+/// Pure over the census and the sample.
+pub fn cageUnreclaimable(census: ?Census, cage_sample: ?u64) u64 {
+    const c = census orelse return 0;
+    return if (c.owned()) cage_sample orelse 0 else 0;
 }
 
 /// `/proc/self/statm` resident pages × the page size; 0 off-Linux or on a
@@ -560,6 +611,8 @@ pub const MemBudget = struct {
     tier_paused: std.atomic.Value(bool) = .init(false),
     backstop_on: std.atomic.Value(bool) = .init(false),
 
+    /// The cage arm's last state (2 = never judged, 1 = on, 0 = off).
+    cage_arm: std.atomic.Value(u8) = .init(2),
     sampler_started: std.atomic.Value(bool) = .init(false),
     sampler_stop: std.Io.Event = .unset,
     sampler_thread: ?std.Thread = null,
@@ -882,11 +935,31 @@ pub const MemBudget = struct {
         return sizing.fleetShareFloorRefusal(share, divided, host.facts.possible_cpus, buf);
     }
 
-    /// Production tick: census + resolve + probe + `tickInputs` + `tickInner`.
+    /// Production tick: census + resolve + probe + `tickInputs` +
+    /// `tickInner`. The cage's unreclaimable sample is read only when the
+    /// census finds the cage the fleet's own (`cageUnreclaimable`).
     pub fn tick(self: *MemBudget, host: Host) void {
-        const share = fleetShare(host.io, host.env, host.census);
-        const in = tickInputs(self.resolveBudgetShared(host, share), readRssBytes(host.io, host.facts.page_size), readCgroupUnreclaimable(host.io) orelse 0, share);
+        const census = readCensus(host.io, host.census);
+        const share = pinnedShare(host.env) orelse if (census) |c| c.share else 1;
+        self.noteCageArm(census);
+        const owned = if (census) |c| c.owned() else false;
+        const sample = if (owned) readCgroupUnreclaimable(host.io) else null;
+        const in = tickInputs(self.resolveBudgetShared(host, share), readRssBytes(host.io, host.facts.page_size), cageUnreclaimable(census, sample), share);
         self.tickInner(in.budget, in.rss, in.unreclaimable);
+    }
+
+    /// Log the arm's edges (never per tick): a cage that turned foreign or
+    /// the fleet's own again.
+    fn noteCageArm(self: *MemBudget, census: ?Census) void {
+        const c = census orelse return;
+        const on = c.owned();
+        const was = self.cage_arm.swap(@intFromBool(on), .monotonic);
+        if (was == @intFromBool(on)) return;
+        if (on) {
+            log.info("mem_budget: the cgroup cage holds only squeezefs daemons and supervisors — its unreclaimable set judges the pressure", .{});
+        } else {
+            log.info("mem_budget: the cgroup cage holds {d} foreign process(es) — its memory.stat is theirs: the unreclaimable arm is off, the pressure is this daemon's gauges and RSS", .{c.foreign});
+        }
     }
 
     // ---- §3.5 the sampler thread ----
@@ -1866,6 +1939,31 @@ test "fleet census over a fixture: a zombie, a reaped pid, another comm and our 
     try testing.expectEqual(@as(u32, 3), readFleetShare(testing.io, fx.roots()));
 }
 
+test "the unreclaimable arm judges the cage only when it is the fleet's: daemons and their supervisors alone ⇒ the cage's sample; one foreign live process (a shell in a desktop scope) ⇒ off (0), the share unchanged; no census ⇒ off" {
+    {
+        var fx: CensusFixture = undefined;
+        try fx.init(&.{ .{ .pid = 100 }, .{ .pid = 101, .comm = supervisor_comm }, .{ .pid = 102, .comm = "bash", .state = 'Z' } });
+        defer fx.deinit();
+        const c = censusCage(testing.io, fx.roots(), CensusFixture.cage).?;
+        try testing.expectEqual(Census{ .share = 2, .foreign = 0 }, c);
+        try testing.expect(c.owned());
+        try testing.expectEqual(@as(u64, 9 << 30), cageUnreclaimable(c, 9 << 30));
+        try testing.expectEqual(@as(u64, 0), cageUnreclaimable(c, null));
+        try testing.expectEqual(c, readCensus(testing.io, fx.roots()).?);
+    }
+    {
+        var fx: CensusFixture = undefined;
+        try fx.init(&.{ .{ .pid = 100 }, .{ .pid = 103, .comm = "bash" }, .{ .pid = 104, .comm = "zig" } });
+        defer fx.deinit();
+        const c = censusCage(testing.io, fx.roots(), CensusFixture.cage).?;
+        try testing.expectEqual(Census{ .share = 2, .foreign = 2 }, c);
+        try testing.expect(!c.owned());
+        try testing.expectEqual(@as(u64, 0), cageUnreclaimable(c, 9 << 30));
+        try testing.expectEqual(@as(u32, 2), readFleetShare(testing.io, fx.roots()));
+    }
+    try testing.expectEqual(@as(u64, 0), cageUnreclaimable(null, 9 << 30));
+}
+
 test "fleet census over a fixture: a list that is unreadable or does not list this process is null (share 1, warned); off-cgroup is 1" {
     var fx: CensusFixture = undefined;
     try fx.init(&.{ .{ .pid = 100 }, .{ .pid = 101 } });
@@ -2009,7 +2107,10 @@ test "linux: cgroup/proc readers return plausible values" {
     try testing.expect(b.budgetBytes() > 0);
     // The tick re-samples RSS; it cannot have halved between two reads.
     try testing.expect(b.pressureBytes() >= rss / 2);
-    try testing.expect(b.unreclaimableBytes() > 0);
+    // The cage arm: on in a cage of daemons alone, off in a shared one
+    // (the venue runs the unit set from a shell's cage: off there).
+    const census = readCensus(testing.io, .{}).?;
+    if (census.owned()) try testing.expect(b.unreclaimableBytes() > 0) else try testing.expectEqual(@as(u64, 0), b.unreclaimableBytes());
 }
 
 test "sampler thread: idempotent spawn, ticks on its period, stops" {

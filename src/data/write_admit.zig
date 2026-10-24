@@ -207,6 +207,10 @@ pub const stats = struct {
     /// check period), or during an answered episode, answered ENOSPC/EIO
     /// before the kernel would end the mount (decision 0003 §BQ).
     pub var parked_gate_stall_answers: counters.ShardedCounter = .{};
+    /// `write_short_counts`: writes answered with the count of the pieces
+    /// that landed before a later piece's error (the error is the next
+    /// call's: Linux's regular-file write).
+    pub var write_short_counts: counters.ShardedCounter = .{};
     pub var write_shared_class_violation: counters.Tripwire = .init("write_shared_class_violation");
 
     pub fn ledgerSum() u64 {
@@ -222,7 +226,7 @@ pub fn noteInlineWrite(len: u64) void {
 
 pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
     try w.writeAll("{");
-    inline for (.{ "admit_write_overlay_bytes", "admit_write_inplace_bytes", "admit_write_accumulate_bytes", "admit_write_inline_bytes", "write_enospc_refusals", "write_pieces", "writes_admitted", "staging_sibling_probes", "restage_churn_removes", "restage_churn_bytes", "parked_gate_waits", "parked_gate_self_flushes", "parked_gate_cold_flushes", "parked_gate_wall_refusals", "parked_gate_wall_supply_visible", "parked_gate_wall_plane_stalls", "parked_gate_stall_answers", "write_gap_zero_bytes", "fallocate_blocks_reserved", "fallocate_blocks_zeroed", "fallocate_custody_skips" }) |name| {
+    inline for (.{ "admit_write_overlay_bytes", "admit_write_inplace_bytes", "admit_write_accumulate_bytes", "admit_write_inline_bytes", "write_enospc_refusals", "write_pieces", "writes_admitted", "staging_sibling_probes", "restage_churn_removes", "restage_churn_bytes", "parked_gate_waits", "parked_gate_self_flushes", "parked_gate_cold_flushes", "parked_gate_wall_refusals", "parked_gate_wall_supply_visible", "parked_gate_wall_plane_stalls", "parked_gate_stall_answers", "write_short_counts", "write_gap_zero_bytes", "fallocate_blocks_reserved", "fallocate_blocks_zeroed", "fallocate_custody_skips" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, @field(stats, name).load() });
     }
     try w.print("\"write_shared_class_violation\":{d},", .{counters.tripwireCount("write_shared_class_violation")});
@@ -964,7 +968,18 @@ pub const WritePath = struct {
         var out: Outcome = .{ .written = 0, .size_claim = end, .size_epoch = 0, .pieces = @intCast(pieces.len) };
         for (pieces) |pc| {
             stats.write_pieces.inc();
-            const arm = try self.admitPiece(io, req, file, pc, &bytes, try_patch and single, overlay_shape, stream_adjacent, arrived_ns);
+            const arm = self.admitPiece(io, req, file, pc, &bytes, try_patch and single, overlay_shape, stream_adjacent, arrived_ns) catch |e| {
+                // Linux's regular-file write: bytes transferred are the
+                // count returned, the error the next call's — and the
+                // kernel's FUSE write honours a short reply
+                // (`fuse_perform_write` adds `out.size`, ends at a short
+                // one, returns the bytes so far). The pieces ascend, so
+                // the landed bytes are the prefix `[offset, offset + written)`.
+                if (out.written == 0) return e;
+                stats.write_short_counts.inc();
+                out.size_claim = req.offset + out.written;
+                break;
+            };
             out.arms[@backingInt(arm)] += 1;
             out.written += pc.len;
         }

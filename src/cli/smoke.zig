@@ -5986,6 +5986,175 @@ test "smoke: A LIVE MEMBER EVICTED AT T_OWNER UNDER THE DEAD MANAGER'S STRIPED H
     _ = try fsckClean(rig, "a live member evicted at T_owner");
 }
 
+/// The member's renew cadence its mount line names (`renew every N ms`).
+fn renewMsOf(text: []const u8) ?u64 {
+    return numberAfter(text, "renew every ");
+}
+
+test "smoke: A LIVE MEMBER'S SLOW FOLLOW-UP NEVER COSTS ITS LEASE — THE DEAD MANAGER'S DOUBLE PARK UNDER LOAD (the kill matrix's second park, 2026-10-24) — A (the manager) holds `hot` striped over K = 64; B JOINED storms creates into it → kill -9 A ⇒ B PARKS at T_self → remount A (term 2) → B's reclaim lands in the grace window → B's FOLLOW-UP (its wire duties besides the renewal: the census pull, the re-point, the re-publication, the set-config learn) is HELD (SQUEEZEFS_TEST_MEMBERSHIP_FOLLOW_HOLD: a call to the freshly remounted manager slow past T_owner, what the gate's load did) while the storm goes on ⇒ B's renewals go on at their cadence through 2 × T_owner (the beat waits on nothing else): A evicts nobody, B never parks a second time, no UnknownLease, no poison → released: the follow-up completes, the storm ends, `ls` = `find` and the stat digest equal from A and B, no open intent → umount B (exit 0), A → fsck --offline --scrub 0 findings (red: the follow-up ran on the beat — B's committers parked the gate at T_self, A evicted the live B at T_owner, the reclaim met UnknownLease, B POISONED: the double park)" {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    try rig.env.put("SQUEEZEFS_MW_BIND", "127.0.0.1:0");
+    var t_owner_text: [8]u8 = undefined;
+    try rig.env.put("SQUEEZEFS_TEST_MEMBERSHIP_T_OWNER_MS", try std.fmt.bufPrint(&t_owner_text, "{d}", .{smoke_t_owner_ms}));
+    // The hold's FIFO is NAMED now and CREATED when the hold should begin.
+    var fb: [linux.PATH_MAX]u8 = undefined;
+    const fifo = try std.fmt.bufPrintSentinel(&fb, "{s}/follow.fifo", .{rig.work}, 0);
+    try rig.env.put("SQUEEZEFS_TEST_MEMBERSHIP_FOLLOW_HOLD", fifo);
+    try rig.formatSetWith(false, &.{});
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(0);
+    const b = try Peer.init(rig, "b");
+    defer b.deinit();
+    b.node = kill_peer_node;
+    try b.spawn(&.{});
+    _ = try b.awaitReady();
+    const renew_ms = blk: {
+        const tb = try b.readLog();
+        defer gpa.free(tb);
+        break :blk renewMsOf(tb) orelse return error.RenewCadenceUnlogged;
+    };
+    {
+        const mk = try rig.onMount("mkdir hot");
+        gpa.free(mk);
+        var sbuf: [256]u8 = undefined;
+        const out = try rig.onMount(try setStripesScript(&sbuf, "hot", 64));
+        gpa.free(out);
+    }
+    var storm_b = try Storm.start(rig, b.mp, "b", "b");
+    var storm_done = false;
+    defer if (!storm_done) storm_b.deinit(rig);
+    var released = false;
+    defer if (!released) releaseHold(fifo);
+    {
+        const warm = try awaitAtLeast(b, "\"dir_stripe_routed_mutations\":", stripe_matrix_phase_floor, kill_row_wait_ns);
+        gpa.free(warm);
+    }
+    // The first park and the reclaim: the DEAD MANAGER row's shape.
+    try rig.kill();
+    _ = try b.awaitLog("appender park: T_self reached with the home volume 0's manager unreachable — parked", 0, kill_row_wait_ns);
+    var mark = try rig.logLen();
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(mark);
+    {
+        const reclaimed = try awaitStats(b, &.{.{ .key = "\"appender_parked\":", .want = 0 }}, kill_row_wait_ns);
+        defer gpa.free(reclaimed);
+        try testing.expectEqual(@as(?u64, 0), numberAfter(reclaimed, "\"appender_park_expiries\":"));
+    }
+    const first_park_end = try b.awaitLog("admitted the reclaim", 0, kill_row_wait_ns);
+    // The hold: B's follow-up parks at its next duty; the storm goes on.
+    mark = try rig.logLen();
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.mknodat(linux.AT.FDCWD, fifo.ptr, linux.S.IFIFO | 0o600, 0)));
+    _ = try b.awaitLog("the member's follow-up holds", first_park_end, kill_row_wait_ns);
+    const t_hold = clock.monotonicNs();
+    // Through 2 × T_owner of the hold B's renewals advance at their
+    // cadence: consecutive renewals are at least one renew interval apart,
+    // so this many of them span 2 × T_owner of wall time.
+    const renewals_want_delta = (2 * smoke_t_owner_ms + renew_ms - 1) / renew_ms + 1;
+    const renewals0 = blk: {
+        const tb = try b.stats();
+        defer gpa.free(tb);
+        break :blk numberAfter(tb, "\"member_renewals\":") orelse return error.MemberRenewalsUnread;
+    };
+    var renewals = renewals0;
+    {
+        const deadline = clock.monotonicNs() + kill_row_wait_ns;
+        // The red path watches the whole chain before it fails: B's second
+        // park (its committers at T_self), A's eviction at T_owner, then —
+        // the hold released — the reclaim's answer.
+        var second_park_ms: ?u64 = null;
+        var evicted_ms: ?u64 = null;
+        while (renewals < renewals0 + renewals_want_delta) {
+            const in_hold_ms = (clock.monotonicNs() - t_hold) / std.time.ns_per_ms;
+            if (evicted_ms == null) {
+                const ta = try rig.readLog();
+                defer gpa.free(ta);
+                if (ta.len > mark and evictedAtTOwner(ta[mark..]) >= 1) evicted_ms = in_hold_ms;
+            }
+            if (second_park_ms == null) {
+                const tb = try b.readLog();
+                defer gpa.free(tb);
+                if (std.mem.indexOf(u8, tb[first_park_end..], "appender park: T_self reached") != null) second_park_ms = in_hold_ms;
+            }
+            if (evicted_ms != null or (second_park_ms != null and in_hold_ms >= 3 * smoke_t_owner_ms)) {
+                releaseHold(fifo);
+                released = true;
+                const poisoned = if (b.awaitLog("this joined mount is POISONED", first_park_end, 10 * std.time.ns_per_s)) |_| true else |_| false;
+                std.debug.print("\nsmoke: the DOUBLE PARK behind B's follow-up: B renewed {d} time(s) through the hold; its committers parked the gate at T_self {?d} ms into it; A evicted the live B at T_owner {?d} ms into it; released, the reclaim {s}\n", .{ renewals - renewals0, second_park_ms, evicted_ms, if (poisoned) "met UnknownLease — B POISONED" else "landed" });
+                return error.LiveMemberEvictedBehindItsFollowUp;
+            }
+            try rig.expectAlive("B's renewals through the follow-up's hold");
+            try b.expectAlive("B's renewals through the follow-up's hold");
+            if (clock.monotonicNs() >= deadline) return error.Timeout;
+            sleepMs(50);
+            const tb = try b.stats();
+            defer gpa.free(tb);
+            renewals = numberAfter(tb, "\"member_renewals\":") orelse renewals;
+        }
+        try testing.expectEqual(@as(?u64, null), second_park_ms);
+    }
+    const held_ms = (clock.monotonicNs() - t_hold) / std.time.ns_per_ms;
+    try testing.expect(held_ms >= 2 * smoke_t_owner_ms);
+    {
+        const tb = try b.readLog();
+        defer gpa.free(tb);
+        try testing.expect(std.mem.indexOf(u8, tb, "FOLLOW_HOLD released") == null);
+        try testing.expect(std.mem.indexOf(u8, tb, "POISONED") == null);
+        const sb = try b.stats();
+        defer gpa.free(sb);
+        try testing.expectEqual(@as(?u64, 0), numberAfter(sb, "\"appender_parked\":"));
+        const sa = try rig.stats();
+        defer gpa.free(sa);
+        try testing.expectEqual(@as(?u64, 0), numberAfter(sa, "\"membership_evictions\":"));
+    }
+    // Released: the follow-up completes, the storm settles.
+    releaseHold(fifo);
+    released = true;
+    _ = try b.awaitLog("FOLLOW_HOLD released", first_park_end, kill_row_wait_ns);
+    {
+        const now_b = try b.stats();
+        defer gpa.free(now_b);
+        const settled = try awaitAtLeast(b, "\"dir_stripe_routed_mutations\":", (numberAfter(now_b, "\"dir_stripe_routed_mutations\":") orelse 0) + 50, kill_row_wait_ns);
+        gpa.free(settled);
+    }
+    const nb = try storm_b.finish(rig);
+    storm_done = true;
+    storm_b.err_file.close(io);
+    gpa.free(storm_b.stop);
+    gpa.free(storm_b.count);
+    {
+        const ob = try awaitExactly(b, "\"xv_cross_owner_intents_open\":", 0, 2 * kill_row_wait_ns);
+        defer gpa.free(ob);
+        try testing.expectEqual(@as(?u64, 0), numberAfter(ob, "\"xv_cross_owner_intents_stuck\":"));
+        try testing.expectEqual(@as(?u64, 0), numberAfter(ob, "\"appender_park_expiries\":"));
+        const va = try hotView(rig, "a");
+        defer gpa.free(va);
+        const vb = try hotView(b, "b");
+        defer gpa.free(vb);
+        if (!std.mem.eql(u8, va, vb) or !lsEqualsFind(va)) reportHotViews(rig, &.{ .{ .tag = "a", .mp = rig.mp }, .{ .tag = "b", .mp = b.mp } });
+        try testing.expectEqualStrings(va, vb);
+        var lines = std.mem.splitScalar(u8, va, '\n');
+        const listed = try std.fmt.parseInt(u64, std.mem.trim(u8, lines.next().?, " "), 10);
+        // Every counted name; at most one more (a create whose reply the
+        // death lost, counted only when its retry met it).
+        try testing.expect(listed >= nb and listed <= nb + 1);
+        const ta = try rig.stats();
+        defer gpa.free(ta);
+        try testing.expectEqual(@as(?u64, 0), numberAfter(ta, "\"membership_evictions\":"));
+        try testing.expectEqual(@as(?u64, 0), numberAfter(ta, "\"xv_cross_owner_steps_rejected\":"));
+        try testing.expectEqual(@as(?u64, 0), numberAfter(ta, "\"invariant_tripwires\":"));
+        std.debug.print("\nsmoke: slow follow-up: B's follow-up held {d} ms (2 × T_owner = {d} ms) — B renewed {d} time(s) through it at {d} ms, A evicted nobody, B parked once (A's death); B created {d} across the death; {d} entries listed (ls = find), the digest equal from A and B\n", .{ held_ms, 2 * smoke_t_owner_ms, renewals - renewals0, renew_ms, nb, listed });
+    }
+    try b.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try b.waitExit());
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+    _ = try fsckClean(rig, "a live member's slow follow-up");
+}
+
 /// The striped directory's population: 10,000 names over K = 64 stripes
 /// (≈ 156 per stripe — the readdir merge reads every stripe's page set
 /// several times over; the rename storm's 1,000 moves cross stripes with

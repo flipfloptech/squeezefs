@@ -250,6 +250,12 @@ const JoinedHalf = struct {
     /// serves). Null = no hold.
     beat_hold: ?[]const u8 = null,
     beat_held: bool = false,
+    /// `SQUEEZEFS_TEST_MEMBERSHIP_FOLLOW_HOLD`: the FIFO path the member's
+    /// follow-up (its wire duties besides the renewal) parks on ONCE.
+    /// Null = no hold. `follow_held` is the unit rig's word that the hold
+    /// began (Release here, its Acquire there).
+    follow_hold: ?[]const u8 = null,
+    follow_held: std.atomic.Value(bool) = .init(false),
 
     /// A tenth of the shipped `T_self` floor (the smoke's `T_owner` of
     /// 3 s derives a 797 ms `T_self`; a tick every 80 ms meets a 265 ms
@@ -262,6 +268,7 @@ const JoinedHalf = struct {
         _ = @import("../../core/thread_name.zig").nameCurrentThread(&name_buf, "sqz-member");
         while (!self.stop.load(.acquire)) {
             self.holdBeatIfArmed();
+            self.holdFollowIfArmed();
             self.pullCensusIfDue();
             // The windows this writer holds ride the renewal (charter §5.5):
             // refreshed every beat from the writer plane once it is armed.
@@ -323,6 +330,23 @@ const JoinedHalf = struct {
         };
         f.close(self.plane.io);
         log.warn("cluster wire: SQUEEZEFS_TEST_MEMBERSHIP_BEAT_HOLD released — the beat resumes", .{});
+    }
+
+    /// `SQUEEZEFS_TEST_MEMBERSHIP_FOLLOW_HOLD`: the follow-up parks, once,
+    /// at the first duty that finds the FIFO present, until a writer opens
+    /// it.
+    fn holdFollowIfArmed(self: *JoinedHalf) void {
+        const path = self.follow_hold orelse return;
+        if (self.follow_held.load(.monotonic)) return;
+        Io.Dir.cwd().access(self.plane.io, path, .{}) catch return;
+        self.follow_held.store(true, .release);
+        log.warn("cluster wire: SQUEEZEFS_TEST_MEMBERSHIP_FOLLOW_HOLD — the member's follow-up holds until a writer opens {s}", .{path});
+        const f = Io.Dir.cwd().openFile(self.plane.io, path, .{}) catch |e| {
+            log.warn("cluster wire: the follow-up hold could not open {s} ({t}); not holding", .{ path, e });
+            return;
+        };
+        f.close(self.plane.io);
+        log.warn("cluster wire: SQUEEZEFS_TEST_MEMBERSHIP_FOLLOW_HOLD released — the follow-up resumes", .{});
     }
 
     /// One census walk per renew interval (the renewal's own cadence; the
@@ -529,7 +553,10 @@ pub const WirePlane = struct {
         self.divert.evict_after_serve = knobs.boolKnob("SQUEEZEFS_TEST_TOKEN_EVICT_AFTER_SERVE", env);
         self.leave_lost = knobs.boolKnob("SQUEEZEFS_TEST_MEMBERSHIP_LEAVE_LOST", env);
         self.online_arm_hold = knobs.boolKnob("SQUEEZEFS_TEST_ONLINE_ARM_HOLD", env);
-        if (self.joined) |j| j.beat_hold = knobs.parseStr(env.get("SQUEEZEFS_TEST_MEMBERSHIP_BEAT_HOLD"));
+        if (self.joined) |j| {
+            j.beat_hold = knobs.parseStr(env.get("SQUEEZEFS_TEST_MEMBERSHIP_BEAT_HOLD"));
+            j.follow_hold = knobs.parseStr(env.get("SQUEEZEFS_TEST_MEMBERSHIP_FOLLOW_HOLD"));
+        }
         // The token holder over this daemon's trees; the pusher over the
         // peers' dialled links.
         self.holder = tokens.table.Holder.init(gpa, io, identity.writer_id, self.oracle.oracle(), TOKEN_OBJECTS_CAP, listener.deriveMaxConnections(raw_cpus, listener.raiseNofile())) catch return error.OutOfMemory;
@@ -2681,6 +2708,82 @@ test "linux: THE SAME-NODE SUCCESSOR IS REACHED — a member joins at a dead inc
     try testing.expectEqual(@as(usize, 2), plane.peers.count());
     try testing.expect(plane.peers.by_client.get(client).?.link.endpointNow().eql(plane.advertised));
     try testing.expect(plane.peers.by_holder.get(r1.appenderId()).?.link.endpointNow().eql(plane.advertised));
+}
+
+/// Opens a hold's FIFO read-write — never blocks, and wakes the held
+/// thread's blocked open.
+fn releaseFifo(fifo: [:0]const u8) void {
+    const rc = linux.open(fifo.ptr, .{ .ACCMODE = .RDWR, .NONBLOCK = true, .CLOEXEC = true }, 0);
+    if (linux.errno(rc) == .SUCCESS) _ = linux.close(@intCast(rc));
+}
+
+fn sleepTestMs(ms: u64) void {
+    const ts: linux.timespec = .{ .sec = @intCast(ms / 1000), .nsec = @intCast((ms % 1000) * std.time.ns_per_ms) };
+    _ = linux.nanosleep(&ts, null);
+}
+
+test "linux: THE MEMBER'S BEAT WAITS ON NOTHING ELSE (the kill matrix's double park, 2026-10-24) — a joiner's follow-up held past 2 × T_owner (SQUEEZEFS_TEST_MEMBERSHIP_FOLLOW_HOLD: a census pull to its manager slow past T_owner) while the manager's sweep runs: the member's renewals go on at their cadence, it never parks, the manager evicts nobody and lists it live; released, the follow-up resumes and the member leaves clean (red: the follow-up rode the beat — no renewal through the hold, the manager evicted the live member at T_owner)" {
+    const gpa = testing.allocator;
+    const s = try meta_set.TestSet.create(gpa, "follow-hold", 1);
+    defer s.destroy();
+    try s.env.put("SQUEEZEFS_MW_BIND", "127.0.0.1:0");
+    // The smoke's T_owner: T_self stays positive over the checkpoint
+    // ceiling's purge term (797 ms; a renewal every 265 ms).
+    const t_owner_ms: u64 = 3000;
+    try s.env.put("SQUEEZEFS_TEST_MEMBERSHIP_T_OWNER_MS", "3000");
+    var fb: [96]u8 = undefined;
+    const fifo = try std.fmt.bufPrintSentinel(&fb, "/build/tmp/sqz-follow-hold-{d}.fifo", .{linux.getpid()}, 0);
+    _ = linux.unlink(fifo.ptr);
+    defer _ = linux.unlink(fifo.ptr);
+    try s.env.put("SQUEEZEFS_TEST_MEMBERSHIP_FOLLOW_HOLD", fifo);
+    const set = try s.open();
+    defer set.close();
+    var locks = try dlm.Manager.init(gpa, 64);
+    defer locks.deinit();
+    const bound = try xv.set_bind.Bound.create(gpa, s.io(), set, &locks, &s.env);
+    defer bound.destroy(gpa);
+    const plane = (try WirePlane.start(gpa, s.io(), set, &s.env, 4, 1 << 30, &bound.plane, false)).?;
+    defer plane.stop();
+    // B: a joined set and its own plane — the member's beat on its thread.
+    const b = try meta_set.MetaSet.open(gpa, s.io(), s.pathList(), .{ .env = &s.env, .cache_budget_bytes = 64 << 20, .cpus = 4, .join = .{ .mountpoint = "/build/tmp/mnt-follow-hold-b", .endpoint = plane.advertised } });
+    defer b.close();
+    var locks_b = try dlm.Manager.init(gpa, 64);
+    defer locks_b.deinit();
+    const bound_b = try xv.set_bind.Bound.create(gpa, s.io(), b, &locks_b, &s.env);
+    defer bound_b.destroy(gpa);
+    const pb = (try WirePlane.start(gpa, s.io(), b, &s.env, 4, 1 << 30, &bound_b.plane, false)).?;
+    defer pb.stop();
+    const j = pb.joined.?;
+    const renew_ms = j.member.words.renew_ms.load(.acquire);
+    try testing.expect(renew_ms != 0);
+    var released = false;
+    defer if (!released) releaseFifo(fifo);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.mknodat(linux.AT.FDCWD, fifo.ptr, linux.S.IFIFO | 0o600, 0)));
+    // The hold begins at the follow-up's next round.
+    const t_arm = clock.monotonicNs();
+    while (!j.follow_held.load(.acquire)) {
+        if (clock.monotonicNs() - t_arm > 30 * std.time.ns_per_s) return error.Timeout;
+        plane.tick();
+        sleepTestMs(10);
+    }
+    // Through 2 × T_owner of the hold, under the manager's sweep: the
+    // renewals advance (consecutive ones are a renew interval apart, so
+    // this many span 2 × T_owner), nothing parks, nothing is evicted.
+    const evictions0 = shard.stats.membership_evictions.load();
+    const renewals0 = j.renewals.load(.monotonic);
+    const want = (2 * t_owner_ms + renew_ms - 1) / renew_ms + 1;
+    const t0 = clock.monotonicNs();
+    while (j.renewals.load(.monotonic) < renewals0 + want) {
+        plane.tick();
+        if (shard.stats.membership_evictions.load() != evictions0) return error.LiveMemberEvictedBehindItsFollowUp;
+        if (j.js.park_gate.word() != .running) return error.LiveMemberParkedBehindItsFollowUp;
+        if (clock.monotonicNs() - t0 > 60 * std.time.ns_per_s) return error.Timeout;
+        sleepTestMs(20);
+    }
+    try testing.expect((clock.monotonicNs() - t0) / std.time.ns_per_ms >= 2 * t_owner_ms);
+    try testing.expectEqual(shard.Liveness.live, plane.mgr.?.owner.liveness(j.member.id, clock.monotonicNs() / std.time.ns_per_ms));
+    releaseFifo(fifo);
+    released = true;
 }
 
 test "the reader's recall sink bumps the recalled object's lease epoch BEFORE any kernel invalidation and whether or not a session is bound — a foreign write reaches the read cache's epoch law and a direct client's lease the way a local admission does" {

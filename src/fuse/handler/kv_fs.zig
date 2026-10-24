@@ -7310,6 +7310,55 @@ test "a same-identity re-stage whose commit FAILS keeps the record the committed
     h.release(f);
 }
 
+// The same law for a truncate's and a punch's re-stage: both replace the
+// staged record under the file's own identity BEFORE their commit, so a
+// failed commit (a FAILED volume: every commit refuses) left the clipped or
+// zeroed image under a layout that still names the old bytes — reads past
+// the cut, or across the punched range, served zeros.
+test "a staged truncate's and a staged punch's failed commit restore the record the committed layout names: the ring still holds the file's old bytes (never the clipped image under the old size, never zeros across the punched range)" {
+    const H = HarnessOf(SettlingData);
+    var h: H = undefined;
+    try h.init();
+    defer h.deinit();
+    defer h.data.deinit();
+    h.data.store = &h.store;
+    h.data.staging = true;
+    h.data.ring = try SettlingData.RamRing.init(64 << 20);
+    defer h.data.ring.?.deinit();
+    const f = try h.create(1, "victim", 0o644);
+    const lf = try H.Fs.localOf(f);
+    var image: [16384]u8 = @splat('A');
+    try testing.expectEqual(@as(?linux.E, null), h.write(f, 0, &image, 0).errno());
+    const rec = (try h.fs.readLayout(lf)).?;
+    defer h.fs.freeLayout(rec);
+    try testing.expectEqual(layout.Kind.staged, rec.layout.kind);
+    const k = staging.StagingKey.init(rec.layout.file_id, lf);
+    h.store.failed = true;
+    defer h.store.failed = false;
+    // The truncate to 8 KiB: its commit answers EIO.
+    var in = abi.zeroed(abi.fuse_setattr_in);
+    in.valid = abi.FATTR_SIZE;
+    in.size = 8192;
+    try testing.expectEqual(@as(?linux.E, .IO), h.setattr(f, in).errno());
+    {
+        const lease = h.data.ring.?.seg.get(k) orelse return error.RingEmptyUnderAStagedLayout;
+        defer lease.release();
+        try testing.expectEqual(@as(usize, image.len), lease.bytes().len);
+        try testing.expectEqualSlices(u8, &image, lease.bytes());
+    }
+    // The punch of [4 KiB, 12 KiB): its commit answers EIO.
+    try testing.expectEqual(@as(?linux.E, .IO), h.fallocate(f, H.Fs.FALLOC.PUNCH_HOLE | H.Fs.FALLOC.KEEP_SIZE, 4096, 8192));
+    {
+        const lease = h.data.ring.?.seg.get(k) orelse return error.RingEmptyUnderAStagedLayout;
+        defer lease.release();
+        try testing.expectEqualSlices(u8, &image, lease.bytes());
+    }
+    const now = (try h.fs.readLayout(lf)).?;
+    defer h.fs.freeLayout(now);
+    try testing.expectEqual(@as(u64, image.len), now.layout.size);
+    h.release(f);
+}
+
 test "the staged arm's rebuilt image ZEROES the gap between the resident bytes and an extending write past the slack (repro-port: fstests generic/075 fsx — a packed file truncated to an unaligned size, then written beyond EOF, read a dead write's bytes back from the gap; the rebuild buffer is recycled memory: never zeros by luck, never another file's bytes)" {
     const H = HarnessOf(SettlingData);
     var h: H = undefined;

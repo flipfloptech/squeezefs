@@ -74,9 +74,14 @@ pub const stats = struct {
     /// Handoffs onto the FUSE handler lanes, by direction.
     pub var ipc_read_handoffs: counters.ShardedCounter = .{};
     pub var ipc_write_handoffs: counters.ShardedCounter = .{};
-    /// Handoffs every FUSE-class lane refused (at capacity): EAGAIN to the
-    /// client — honest backpressure, never a strand.
-    pub var ipc_handoff_refusals: counters.ShardedCounter = .{};
+    /// Handoffs every FUSE-class lane refused (every fiber slot busy): the
+    /// op WAITS in its owner's queue and runs at a later flush — a read or
+    /// write on a regular file never answers EAGAIN (decision 0003 §BR).
+    pub var ipc_handoff_waits: counters.ShardedCounter = .{};
+    /// Waiting handoffs answered without running: past the fail-stop
+    /// lattice's bound (EIO), or their session torn down (EIO, nobody
+    /// listening).
+    pub var ipc_handoff_wait_answers: counters.ShardedCounter = .{};
     /// Handoff replies landed IN PLACE (the handler's window IS the arena;
     /// the port has no bounce arm: every handoff reply is one).
     pub var ipc_read_dest_serves: counters.ShardedCounter = .{};

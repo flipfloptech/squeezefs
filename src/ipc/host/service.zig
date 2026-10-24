@@ -60,6 +60,7 @@ const log = @import("../../core/log.zig");
 const errors = @import("../../core/errors.zig");
 const thread_name = @import("../../core/thread_name.zig");
 const futex = @import("../../sync/futex.zig");
+const jc = @import("../../meta/journal_core.zig");
 const placement = @import("../../exec/placement.zig");
 const sqz_io = @import("../../exec/sqz_io.zig");
 const layout = @import("../layout.zig");
@@ -473,13 +474,45 @@ pub const DataPlaneSink = struct {
     gid: u32,
     pid: u32,
     per_owner: []PerOwner,
+    /// The fail-stop lattice's bound on a waiting handoff (the write path's
+    /// stall bound: the kernel's request timeout less one check period, set
+    /// by the mount); null = never (a lab sink).
+    wait_bound_ns: ?*const Atomic(u64) = null,
 
     /// The deferral queue of one owner: a pass defers at most its budget of
     /// placed handoffs (decision 0002 quirk 10: a fixed array, no boxed
-    /// future, no thread-local).
+    /// future, no thread-local) — and the handoffs every lane refused.
     pub const PerOwner = struct {
         pending: []Pending,
         n: usize = 0,
+        waiting: Waiting = .{},
+    };
+
+    /// The handoffs every lane refused (decision 0003 §BR): they WAIT here
+    /// for a fiber slot and are re-offered at each of the owner's flushes
+    /// (its park is bounded, `SERVICE_PARK_MAX_NS`, while its sessions
+    /// live; a teardown kicks it). Pushed from any thread — a direct-drive
+    /// read's fallback runs on its shard's reaper — drained by the owner.
+    /// Grows only under saturation; its capacity is kept.
+    pub const Waiting = struct {
+        lock: jc.SpinLock = .{},
+        items: std.ArrayList(Waiter) = .empty,
+        /// The owner's drain buffer (swapped with `items` under the lock).
+        spare: std.ArrayList(Waiter) = .empty,
+
+        fn deinit(self: *Waiting, gpa: Allocator) void {
+            self.items.deinit(gpa);
+            self.spare.deinit(gpa);
+        }
+    };
+
+    const Waiter = struct {
+        s: *Session,
+        op: DataOp,
+        c: Completion,
+        /// A write's severed payload (null: a read).
+        sev: ?Severed,
+        since_ns: u64,
     };
 
     const Pending = struct {
@@ -508,6 +541,8 @@ pub const DataPlaneSink = struct {
         owners: u16,
         /// The deferral depth per owner (= the geometry's slots).
         drain_budget: u32,
+        /// `wait_bound_ns` (the write path's stall bound).
+        wait_bound_ns: ?*const Atomic(u64) = null,
     };
 
     pub fn init(gpa: Allocator, d: Deps) Allocator.Error!*DataPlaneSink {
@@ -542,12 +577,22 @@ pub const DataPlaneSink = struct {
             .gid = linux.getegid(),
             .pid = @intCast(linux.getpid()),
             .per_owner = per_owner,
+            .wait_bound_ns = d.wait_bound_ns,
         };
         return self;
     }
 
     pub fn deinit(self: *DataPlaneSink) void {
-        for (self.per_owner) |po| self.gpa.free(po.pending);
+        for (self.per_owner) |*po| {
+            self.gpa.free(po.pending);
+            // The host stops under waiting handoffs: each is answered (EIO).
+            for (po.waiting.items.items) |q| {
+                stats.ipc_handoff_wait_answers.inc();
+                if (q.sev) |sev| self.dropSevered(sev);
+                q.c.fail(.IO);
+            }
+            po.waiting.deinit(self.gpa);
+        }
         self.gpa.free(self.per_owner);
         self.gpa.destroy(self);
     }
@@ -591,7 +636,44 @@ pub const DataPlaneSink = struct {
             self.spawnWriteHandoff(p.s, p.op, p.c, p.sev);
         }
         po.n = 0;
+        self.reofferWaiting(po);
         if (self.dd) |dd| dd.flushLane(owner);
+    }
+
+    /// The waiting handoffs, re-offered in arrival order: a free slot runs
+    /// one; a refused one waits on — unless its session is gone (EIO:
+    /// nobody listens) or it outlived the lattice's bound (EIO, loud by
+    /// count: the lanes held it as long as the kernel would hold a request).
+    fn reofferWaiting(self: *DataPlaneSink, po: *PerOwner) void {
+        const w = &po.waiting;
+        w.lock.lock();
+        std.mem.swap(std.ArrayList(Waiter), &w.items, &w.spare);
+        w.lock.unlock();
+        if (w.spare.items.len == 0) return;
+        const now = clock.monotonicNs();
+        const bound = if (self.wait_bound_ns) |b| b.load(.monotonic) else std.math.maxInt(u64);
+        for (w.spare.items) |q| {
+            if (q.s.torn_down.load(.acquire) or now -| q.since_ns >= bound) {
+                stats.ipc_handoff_wait_answers.inc();
+                if (q.sev) |sev| self.dropSevered(sev);
+                q.c.fail(.IO);
+                continue;
+            }
+            const ran = if (q.sev) |sev| self.tryHandoff(q.s, writeHandoff, .{ self, q.op, q.c, sev }) else self.tryHandoff(q.s, readHandoff, .{ self, q.op, q.c });
+            if (!ran) self.wait(po, q);
+        }
+        w.spare.clearRetainingCapacity();
+    }
+
+    /// A handoff every lane refused waits for a fiber slot (`Waiting`); a
+    /// queue that cannot grow answers ENOMEM — never EAGAIN.
+    fn wait(self: *DataPlaneSink, po: *PerOwner, q: Waiter) void {
+        po.waiting.lock.lock();
+        defer po.waiting.lock.unlock();
+        po.waiting.items.append(self.gpa, q) catch {
+            if (q.sev) |sev| self.dropSevered(sev);
+            q.c.fail(.NOMEM);
+        };
     }
 
     // ---- the sync READ fast path (§2) ----
@@ -660,7 +742,9 @@ pub const DataPlaneSink = struct {
     /// node (the demote path, and the dd read's post-DMA fallback).
     fn readHandoffOn(self: *DataPlaneSink, s: *Session, op: DataOp, c: Completion) void {
         stats.ipc_read_handoffs.inc();
-        self.spawnOnLane(s, c, readHandoff, .{ self, op, c });
+        if (self.tryHandoff(s, readHandoff, .{ self, op, c })) return;
+        stats.ipc_handoff_waits.inc();
+        self.wait(&self.per_owner[s.owner], .{ .s = s, .op = op, .c = c, .sev = null, .since_ns = clock.monotonicNs() });
     }
 
     fn readFallbackFn(ctx: *anyopaque, s: *Session, op: DataOp, c: Completion) void {
@@ -674,21 +758,20 @@ pub const DataPlaneSink = struct {
     }
 
     /// A handoff onto a FUSE-class lane homed on the session's node; a lane
-    /// at capacity walks the rotation; every lane refusing is EAGAIN to the
-    /// client (honest backpressure, counted).
-    fn spawnOnLane(self: *DataPlaneSink, s: *Session, c: Completion, comptime function: anytype, args: std.meta.ArgsTuple(@TypeOf(function))) void {
+    /// at capacity walks the rotation. False = every lane refused: the
+    /// caller's op waits (`wait`), never EAGAIN.
+    fn tryHandoff(self: *DataPlaneSink, s: *Session, comptime function: anytype, args: std.meta.ArgsTuple(@TypeOf(function))) bool {
         var attempt: u8 = 0;
         while (attempt < HANDOFF_LANE_ATTEMPTS) : (attempt += 1) {
             const lane = self.sqz.homeLane(null, if (attempt == 0) s.node else null);
             self.sqz.spawnGroupOn(lane, &s.group, function, args) catch continue;
-            return;
+            return true;
         }
-        stats.ipc_handoff_refusals.inc();
-        c.fail(.AGAIN);
+        return false;
     }
 
-    /// Lanes tried before a handoff answers EAGAIN: the node's home, then
-    /// two of the rotation (a third refusal is a saturated lane class).
+    /// Lanes tried before a handoff waits: the node's home, then two of the
+    /// rotation (a third refusal is a saturated lane class).
     const HANDOFF_LANE_ATTEMPTS: u8 = 3;
 
     fn ctxFor(self: *DataPlaneSink, trace: *op_trace.OpTrace, window: []u8) filesystem.Ctx {
@@ -753,15 +836,9 @@ pub const DataPlaneSink = struct {
 
     fn spawnWriteHandoff(self: *DataPlaneSink, s: *Session, op: DataOp, c: Completion, sev: Severed) void {
         stats.ipc_write_handoffs.inc();
-        var attempt: u8 = 0;
-        while (attempt < HANDOFF_LANE_ATTEMPTS) : (attempt += 1) {
-            const lane = self.sqz.homeLane(null, if (attempt == 0) s.node else null);
-            self.sqz.spawnGroupOn(lane, &s.group, writeHandoff, .{ self, op, c, sev }) catch continue;
-            return;
-        }
-        stats.ipc_handoff_refusals.inc();
-        self.dropSevered(sev);
-        c.fail(.AGAIN);
+        if (self.tryHandoff(s, writeHandoff, .{ self, op, c, sev })) return;
+        stats.ipc_handoff_waits.inc();
+        self.wait(&self.per_owner[s.owner], .{ .s = s, .op = op, .c = c, .sev = sev, .since_ns = clock.monotonicNs() });
     }
 
     fn dropSevered(self: *DataPlaneSink, sev: Severed) void {
@@ -1260,6 +1337,7 @@ const SaturatedSink = struct {
     fn deinit(self: *SaturatedSink) void {
         self.unhold();
         self.holders.await(self.io) catch {};
+        self.per_owner[0].waiting.deinit(testing.allocator);
         self.ts.deinit();
         self.sqz.deinit();
     }
@@ -1283,7 +1361,7 @@ const SaturatedSink = struct {
 // regular file never answers EAGAIN, and the host's handoff onto a lane
 // that every lane refuses (every fiber slot busy) is the same saturation
 // the kernel path waits out.
-test "a handoff every lane refuses WAITS: an interposed read with the executor's lanes saturated never answers EAGAIN — it runs once a fiber slot frees, byte-exact" {
+test "a handoff every lane refuses WAITS: an interposed read with the executor's lanes saturated never answers EAGAIN — it runs once a fiber slot frees, byte-exact; one that outlives the lattice's bound answers EIO" {
     var x: SaturatedSink = undefined;
     try x.init();
     defer x.deinit();
@@ -1311,6 +1389,20 @@ test "a handoff every lane refuses WAITS: an interposed read with the executor's
     try testing.expectEqual(@as(i64, 2048), try cl.awaitDone(3, d.gen));
     const window = s.m.slotWindow(3) catch unreachable;
     try testing.expect(std.mem.allEqual(u8, window[0..2048], 0x5A));
+    try testing.expectEqual(@as(u32, 1), x.fs.reads.load(.monotonic));
+    // The lattice's bound: a handoff still waiting past it answers EIO.
+    x.holders.await(x.io) catch {};
+    x.hold.store(0, .release);
+    x.held = 0;
+    x.saturate();
+    var bound: Atomic(u64) = .init(0);
+    x.sink.wait_bound_ns = &bound;
+    const answers0 = stats.ipc_handoff_wait_answers.load();
+    const d2 = try x.dequeueRead(cl, 5, 1024);
+    x.sink.readHandoffOn(s, d2.op, d2.c);
+    DataPlaneSink.flushFn(&x.sink, 0);
+    try testing.expectEqual(-@as(i64, @backingInt(linux.E.IO)), try cl.awaitDone(5, d2.gen));
+    try testing.expectEqual(answers0 + 1, stats.ipc_handoff_wait_answers.load());
     try testing.expectEqual(@as(u32, 1), x.fs.reads.load(.monotonic));
 }
 

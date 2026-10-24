@@ -300,6 +300,7 @@ pub const IpcHost = struct {
             .max_file_size = d.max_file_size,
             .owners = ceiling,
             .drain_budget = geometry.slots,
+            .wait_bound_ns = &d.plane.wp.stall_answer_ns,
         });
         errdefer self.sink.deinit();
         if (self.dd) |dd| dd.read_fallback = self.sink.readFallback();

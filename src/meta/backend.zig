@@ -208,6 +208,10 @@ pub const Stats = struct {
 
 pub var stats: Stats = .{};
 
+/// A JOINED mount asked to write tree 0 (`KvBackend.refusesControlWrite`):
+/// refused before the ring, must stay 0.
+pub var joined_tree0_refusals: counters.Tripwire = .init("meta_kv_joined_tree0_refusals");
+
 /// The mount's replay verdict (`meta_kv_replay_*`).
 pub const ReplayStats = struct {
     entries: u64,
@@ -1351,9 +1355,8 @@ pub const KvBackend = struct {
     /// `checkpoint_ceiling_ms`, the quiescent poll's cadence) — AND 64
     /// re-points (the former law's count): on a saturated device an
     /// attempt's wall stretches with the manager's cycle (measured ~58 ms
-    /// an attempt beside a full smoke, ~2 ms idle: a leaf the manager
-    /// appends to every flush read torn 19 times in 1.1 s), so the count
-    /// outlasts a loaded manager where the clock alone refused early.
+    /// an attempt beside a full smoke, ~2 ms idle), so the count outlasts
+    /// a loaded manager where the clock alone refused early.
     const READER_REPOINT_CEILING_MS: u64 = sym.membership.shard.CHECKPOINT_LANDING_CEILING_MS;
     const READER_REPOINTS_MIN: u32 = 64;
     const READER_REPOINT_STEP_MS: u64 = 2;
@@ -1371,6 +1374,19 @@ pub const KvBackend = struct {
     /// until a record's roots all load, or the bound: a record whose roots
     /// are gone with no newer record behind it for a whole landing ceiling
     /// and 64 re-points is corruption.
+    ///
+    /// What the open may trust: a node is ONE writer's in-place log (tree
+    /// 0's leaves the manager's — `refusesControlWrite` keeps a joiner
+    /// out; a slot tree's its lessee's), frames landing in append order,
+    /// one in flight per node, each landed before the next is planned. A
+    /// racing whole-extent read can only miss the TAIL frame, which the
+    /// load drops quietly. A frame the record covers BEHIND a hole is no
+    /// race of that writer: the extent's next owner mid-write over a
+    /// retired image (the next record renames the root — a re-point), or a
+    /// write by a process that does not own the leaf, or damage. So the
+    /// loop ends in a projection whose every root loaded at ONE record, or
+    /// in a refusal that names the stale root and, for a torn image, the
+    /// hole (`describeTornRoot`) — never a spliced leaf, never unbounded.
     fn openProjectionTreesRepointing(be: *KvBackend) OpenError!void {
         var repoints: u32 = 0;
         const t0 = clock.monotonicNs();
@@ -1380,7 +1396,12 @@ pub const KvBackend = struct {
                     if (readerRepointExhausted(t0, repoints)) {
                         const waited_ms = (clock.monotonicNs() - t0) / std.time.ns_per_ms;
                         const st = be.reader_stale orelse ReaderStale{ .what = .ledger_root };
-                        log.err("meta volume {s}: reader: the projection's roots stayed stale through {d} re-points over {d} ms (record {d}; last: {t}, slot/root id {d}, root 0x{x} seq {d}, lessee {?d}: {?f}) — refusing", .{ be.path, repoints, waited_ms, be.mounted.seq, st.what, st.slot, st.root.addr, st.root.seq, st.lessee, st.why });
+                        var torn_buf: [320]u8 = undefined;
+                        const torn: []const u8 = if (st.why) |w| switch (w) {
+                            .load => be.describeTornRoot(st.root.addr, &torn_buf),
+                            else => "",
+                        } else "";
+                        log.err("meta volume {s}: reader: the projection's roots stayed stale through {d} re-points over {d} ms (record {d}; last: {t}, slot/root id {d}, root 0x{x} seq {d}, lessee {?d}: {?f}{s}{s}) — refusing", .{ be.path, repoints, waited_ms, be.mounted.seq, st.what, st.slot, st.root.addr, st.root.seq, st.lessee, st.why, if (torn.len > 0) " — " else "", torn });
                         return error.Corrupt;
                     }
                     repoints += 1;
@@ -1394,6 +1415,14 @@ pub const KvBackend = struct {
             };
             return;
         }
+    }
+
+    /// The torn root's image as a refusal names it: re-read once and
+    /// described (`node.describeRefusal`); empty when it does not read.
+    fn describeTornRoot(be: *KvBackend, addr: u64, buf: []u8) []const u8 {
+        const img = be.dev.readRange(be.gpa, addr, be.layout.node_size) catch return "";
+        defer be.gpa.free(img);
+        return node.describeRefusal(be.gpa, img, be.layout, addr, be.cache.durableTail(), buf);
     }
 
     /// Every cached node and every opened tree of the projection dropped
@@ -2592,6 +2621,11 @@ pub const KvBackend = struct {
             else => error.Io,
         };
         for (be.trees.load()) |t| {
+            // A joiner's leased roots went over the wire above; an unleased
+            // tree it still holds (a release between the table word and
+            // `forgetTree`) is the manager's custody, and tree 0 is not the
+            // joiner's to write (`refusesControlWrite`).
+            if (be.posture == .joined) continue;
             const fs = t.forest_slot orelse continue;
             if (t.identity.rootId() != null) continue;
             const slot = routing.route_table.slotOfForestSlot(fs);
@@ -2624,6 +2658,7 @@ pub const KvBackend = struct {
         const be: *KvBackend = @ptrCast(@alignCast(ctx));
         var floor: u64 = node_cache.no_floor;
         for (be.trees.load()) |t| {
+            if (be.posture == .joined) continue;
             const fs = t.forest_slot orelse continue;
             if (t.identity.rootId() != null) continue;
             const slot = routing.route_table.slotOfForestSlot(fs);
@@ -2666,6 +2701,10 @@ pub const KvBackend = struct {
     /// The lease plane's form: the record verbatim (`Leased`/`Unleased` at
     /// the plane's words) or its `Delete`.
     pub fn writeSlotStateRecord(be: *KvBackend, slot: u16, state: ?slot_state.SlotState) Error!u64 {
+        if (be.posture == .joined) {
+            joined_tree0_refusals.fire("a joined mount wrote a slot_state record into the manager's tree 0");
+            return error.PartitionRefused;
+        }
         const control = be.trees.find(.control) orelse return error.Corrupt;
         const ck = slot_state.keyOf(slot);
         const k = ck.slice();
@@ -2746,7 +2785,7 @@ pub const KvBackend = struct {
 
     pub fn commit(be: *KvBackend, t: *KvTx) Error!void {
         defer be.gpa.destroy(t);
-        if (be.posture == .reader) {
+        if (be.posture == .reader or be.refusesControlWrite(t)) {
             t.deinit();
             return error.PartitionRefused;
         }
@@ -2754,7 +2793,9 @@ pub const KvBackend = struct {
     }
 
     pub fn commitGroup(be: *KvBackend, txs: []const *KvTx, results: []Outcome) void {
-        if (be.posture == .reader) {
+        var refused = be.posture == .reader;
+        for (txs) |t| refused = refused or be.refusesControlWrite(t);
+        if (refused) {
             for (txs, results) |t, *r| {
                 t.deinit();
                 be.gpa.destroy(t);
@@ -2764,6 +2805,23 @@ pub const KvBackend = struct {
         }
         be.cv.commitGroup(txs, results);
         for (txs) |t| be.gpa.destroy(t);
+    }
+
+    /// Tree 0 has ONE writer, the volume's manager. A JOINED mount opens it
+    /// as a read-only projection at the newest record (every control write
+    /// is a wire verb) and caches its leaves at the tails it read; a record
+    /// committed there would dirty such a leaf, and the joiner's flush
+    /// would append it at the projection's STALE tail over frames the
+    /// manager wrote since — a hole in the manager's live leaf with frames
+    /// its records cover behind it, or the manager's frames replaced
+    /// whole. Refused here, before the ring, so nothing reaches the leaf.
+    fn refusesControlWrite(be: *KvBackend, t: *const KvTx) bool {
+        if (be.posture != .joined) return false;
+        for (t.staged.items) |s| if (s.tree_id == key.TREE_CONTROL) {
+            joined_tree0_refusals.fire("a joined mount committed a record into the manager's tree 0");
+            return true;
+        };
+        return false;
     }
 
     pub fn treeOf(be: *KvBackend, identity: tree.TreeIdentity) ?*KvTree {

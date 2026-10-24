@@ -1664,3 +1664,164 @@ test "the quarantine sink returns an expired lease's cohort to the free list at 
     // The block never admitted keeps its owner.
     try testing.expectEqual(block_alloc.State.allocated, a.stateOf(mints[2].idx));
 }
+
+var joined_tree0_ids: std.atomic.Value(u64) = .init(0x5100);
+
+fn joinedTree0Random() u64 {
+    return joined_tree0_ids.fetchAdd(1, .monotonic);
+}
+
+/// A finished job record of A's (the coordinator's): never adopted.
+fn finishedJob(id: u64) [records.JobRecordV1.LEN]u8 {
+    const r: records.JobRecord = .{ .job_id = id, .job_type = .noop, .state = .completed, .throttle_pct = 100, .created_realtime_s = 1, .created_by = .{ .node_token = 1, .mount_slot = 0 }, .created_pid = 1, .updated_realtime_s = 1 };
+    return r.encode();
+}
+
+/// The flushed tail of `be`'s cached tree-0 leaf holding `k`.
+fn controlLeafTail(be: *KvBackend, io: Io, k: []const u8) !usize {
+    const leaf = try be.trees.find(.control).?.resolveLeaf(k);
+    defer leaf.release();
+    leaf.lock.lockSharedUncancelable(io);
+    defer leaf.lock.unlockShared(io);
+    return leaf.dirty.tailOffset();
+}
+
+test "linux: A JOINED MEMBER'S JOB FABRIC NEVER WRITES THE MANAGER'S TREE 0 — adoption is the coordinator's act, a joined commit into tree 0 is refused — and a read-only open of the set reads the manager's tree-0 leaf whole (charter §8 'the coordinator is volume 0's manager'; found by the online fsck row — `fsck`'s storage-trust open refused 'the projection's roots stayed stale through 64 re-points (… ledger_root, slot/root id 8 …: the image does not decode (CheckpointCoveredBsetAfterTear))'): B's fabric adopted A's live job off its tree-0 PROJECTION and committed it there; B's checkpoint appended that leaf at the projection's stale tail INTO A's live leaf, splitting A's 8 KiB frame — a hole, then a frame A's record covers" {
+    const gpa = testing.allocator;
+    const meta_node = @import("../../meta/node.zig");
+    const dlm = @import("../../meta/dlm.zig");
+    const xv = @import("../../meta/sym/xv.zig");
+    const wire_plane = @import("../../meta/sym/wire_plane.zig");
+    const s = try meta_set.TestSet.create(gpa, "joined-tree0", 1);
+    defer s.destroy();
+    const io = s.io();
+    try s.env.put("SQUEEZEFS_MW_BIND", "127.0.0.1:0");
+    // No cycle by age: tree 0's image moves only with the test's cycles.
+    try s.env.put("SQUEEZEFS_CHECKPOINT_MAX_AGE_MS", "60000");
+    const set = try s.open();
+    defer set.close();
+    var locks = try dlm.Manager.init(gpa, 64);
+    defer locks.deinit();
+    const bound = try xv.set_bind.Bound.create(gpa, io, set, &locks, &s.env);
+    defer bound.destroy(gpa);
+    const plane = (try wire_plane.WirePlane.start(gpa, io, set, &s.env, 4, 1 << 30, &bound.plane, false)).?;
+    defer plane.stop();
+    const be0 = set.volumes[0];
+    // A, the coordinator, mints a job: a QUEUED record in tree 0.
+    var store_a: TreeStore = .{ .be = be0 };
+    var fa = Fabric.init(gpa, store_a.store(), .{ .identity = .{ .node_token = 1, .mount_slot = 0 }, .pid = 1, .random = &joinedTree0Random });
+    defer fa.deinit();
+    const live_job = try fa.submit(io, .{ .job_type = .noop, .arg0 = 1 });
+    const live_key = records.jobKey(live_job);
+    try be0.checkpointNow();
+    const b = try meta_set.MetaSet.open(gpa, io, s.pathList(), .{ .env = &s.env, .cache_budget_bytes = 64 << 20, .cpus = 4, .join = .{ .mountpoint = "/build/tmp/mnt-joined-tree0-b", .endpoint = plane.advertised } });
+    defer b.close();
+    const bj = b.volumes[0];
+    // Both quiescent (A's leaf tail still across two cycles); B's
+    // projection re-reads tree 0's leaf NOW, so its in-RAM tail is A's
+    // (the join-time tail is wherever A's join verbs left it).
+    try bj.checkpointNow();
+    var settled: u32 = 0;
+    var prev_tail: usize = 0;
+    while (settled < 2) {
+        try be0.checkpointNow();
+        const t = try controlLeafTail(be0, io, live_key.slice());
+        settled = if (t == prev_tail) settled + 1 else 0;
+        prev_tail = t;
+    }
+    _ = bj.cache.discardAllNodes();
+    const seen = (try bj.lookup(gpa, key.TREE_CONTROL, live_key.slice())) orelse return error.TestJobNotProjected;
+    gpa.free(seen);
+    const root = be0.trees.find(.control).?.rootPtr();
+    const tail = try controlLeafTail(be0, io, live_key.slice());
+    try testing.expectEqual(tail, try controlLeafTail(bj, io, live_key.slice()));
+    // A moves on: one 8 KiB frame of finished jobs (one entry, so one
+    // freeze) at that tail, then one 4 KiB frame, both covered by A's
+    // newest record. B's copy of the leaf still ends at `tail`.
+    {
+        const t = try be0.begin(@src());
+        var id: u64 = 0x9000;
+        while (id < 0x9000 + 56) : (id += 1) try t.stagePut(key.TREE_CONTROL, records.jobKey(id).slice(), &finishedJob(id));
+        try be0.commit(t);
+    }
+    try be0.checkpointNow();
+    try store_a.store().put(0xA000, &finishedJob(0xA000));
+    try be0.checkpointNow();
+    try testing.expectEqual(root, be0.trees.find(.control).?.rootPtr());
+    const node_size = be0.layout.node_size;
+    const before = try be0.dev.readRange(gpa, root.addr, node_size);
+    defer gpa.free(before);
+    {
+        var loaded = try meta_node.verifyNodeExtent(gpa, before, be0.layout, root.addr, be0.cache.durableTail(), null);
+        defer loaded.deinit(gpa);
+        try testing.expectEqual(@as(u8, 0), loaded.header.level);
+        var spans_two_pages = false;
+        for (loaded.bset_ranges, 0..) |r, i| if (r.start == tail + meta_node.FRAME_LEN) {
+            spans_two_pages = i + 1 < loaded.bset_ranges.len and loaded.bset_ranges[i + 1].start >= tail + 2 * meta_node.NODE_PAGE + meta_node.FRAME_LEN;
+        };
+        try testing.expect(spans_two_pages);
+    }
+    // B's fabric as `mount` builds a JOINED member's: not the coordinator.
+    // It adopts nothing (A's live job is A's to run), so B's checkpoint
+    // has nothing of tree 0 to flush.
+    var store_b: TreeStore = .{ .be = bj };
+    var fb = Fabric.init(gpa, store_b.store(), .{ .identity = .{ .node_token = 2, .mount_slot = 0 }, .pid = 2, .random = &joinedTree0Random });
+    defer fb.deinit();
+    fb.setCoordinator(false);
+    const adopted = try fb.adopt(io);
+    try bj.checkpointNow();
+    // The read-only open beside both (the storage-trust proof's): A's
+    // tree 0 whole — the live job queued, every finished one present.
+    {
+        const reader = try meta_set.MetaSet.open(gpa, io, s.pathList(), .{ .env = &s.env, .cache_budget_bytes = 64 << 20, .cpus = 4, .read_only = true });
+        defer reader.close();
+        for ([_]u64{ live_job, 0x9000, 0x9000 + 55, 0xA000 }) |j| {
+            const k = records.jobKey(j);
+            const v = (try reader.lookup(gpa, key.TREE_CONTROL, k.slice())) orelse return error.TestJobLost;
+            defer gpa.free(v);
+            try testing.expectEqual(j, (try records.JobRecordV1.decode(v)).job_id);
+        }
+    }
+    // A's leaf is byte-for-byte A's; B adopted nothing.
+    {
+        const after = try be0.dev.readRange(gpa, root.addr, node_size);
+        defer gpa.free(after);
+        try testing.expectEqualSlices(u8, before, after);
+    }
+    try testing.expectEqual(@as(usize, 0), adopted);
+    // The backstop: a commit at B staging a tree-0 record is refused
+    // before the ring, the tripwire counts it, nothing reaches A's leaf.
+    {
+        const fired = backend_mod.joined_tree0_refusals.load();
+        backend_mod.joined_tree0_refusals.resetLogBudgetForTest();
+        log.testing.expectErrorLogs(1);
+        const t = try bj.begin(@src());
+        try t.stagePut(key.TREE_CONTROL, records.jobKey(0xB000).slice(), &finishedJob(0xB000));
+        try testing.expectError(error.PartitionRefused, bj.commit(t));
+        try log.testing.expectAllFired();
+        try testing.expectEqual(fired + 1, backend_mod.joined_tree0_refusals.load());
+        try bj.checkpointNow();
+        const after = try be0.dev.readRange(gpa, root.addr, node_size);
+        defer gpa.free(after);
+        try testing.expectEqualSlices(u8, before, after);
+    }
+    // The reader's half, the mechanism replayed on a copy of A's image:
+    // one frame of the leaf's incarnation at the stale tail (B's flush on
+    // dev) leaves the second page of A's 8 KiB frame a hole with A's
+    // covered frame behind it — what the refusal names.
+    {
+        const k = records.jobKey(0xC000);
+        const refs = [_]@import("../../meta/record.zig").RecordRef{.{ .key = k.slice(), .seq = std.math.maxInt(u64) - 1, .kind = .put, .value = &finishedJob(0xC000) }};
+        var f = try meta_node.appendBset(gpa, be0.layout, .{ .node_addr = root.addr, .node_seq = root.seq, .tail_offset = tail }, &refs, std.math.maxInt(u64) - 1, null);
+        defer f.deinit(gpa);
+        try testing.expectEqual(tail + meta_node.NODE_PAGE, f.new_tail);
+        const torn = try gpa.dupe(u8, before);
+        defer gpa.free(torn);
+        @memcpy(torn[tail..][0..f.frame.len], f.frame);
+        var buf: [320]u8 = undefined;
+        var want: [64]u8 = undefined;
+        const detail = meta_node.describeRefusal(gpa, torn, be0.layout, root.addr, be0.cache.durableTail(), &buf);
+        try testing.expect(std.mem.indexOf(u8, detail, try std.fmt.bufPrint(&want, "a verifying bset at offset {d} ", .{tail + 2 * meta_node.NODE_PAGE})) != null);
+        try testing.expectEqualStrings("", meta_node.describeRefusal(gpa, before, be0.layout, root.addr, be0.cache.durableTail(), &buf));
+    }
+}

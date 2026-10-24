@@ -606,9 +606,10 @@ fn mountMain(ctx: *Ctx) u8 {
         wp.bindDataPlanes(plane) catch |e| return ctx.failed("the data planes could not arm over the wire ({s}) — see the log", .{@errorName(e)});
     }
     // THE JOB FABRIC (charter §8 "the coordinator is volume 0's manager"):
-    // every writer runs a node (adoption, the local pool, the bodies over
-    // the plane); volume 0's MANAGER is the coordinator — it serves the
-    // job block and the admin lane on the ONE listener and alone submits.
+    // every writer runs a node (the local pool, the bodies over the plane);
+    // volume 0's MANAGER is the coordinator — it serves the job block and
+    // the admin lane on the ONE listener and alone submits and adopts (a
+    // joiner's `job:` records are its projection of the manager's tree 0).
     // Admission opens once the allocation lease armed (the grant plane is
     // the mover's mint source); a reader runs no fabric.
     var node: ?*jobs.coordinator.Node = null;

@@ -413,7 +413,17 @@ pub const Fabric = struct {
     /// Adoption at start: every non-terminal durable record is adopted;
     /// Running/Queued re-queue, Paused/PausedCapacity stay paused. An
     /// undecodable record is counted, logged by key and SKIPPED.
+    ///
+    /// Adoption is the COORDINATOR's act, as minting is (charter §8 "the
+    /// coordinator is volume 0's manager"; a remote worker proposes
+    /// results only): a joined member's store is its read-only projection
+    /// of the manager's tree 0, so adopting there re-ran the coordinator's
+    /// live jobs and committed their records into a leaf the member does
+    /// not own — its checkpoint appended them at the projection's stale
+    /// tail over the manager's frames (the online fsck row's stale tree-0
+    /// root). A non-coordinator adopts nothing.
     pub fn adopt(self: *Fabric, io: Io) Store.Error!usize {
+        if (!self.is_coordinator.load(.acquire)) return 0;
         var list: std.ArrayList([]u8) = .empty;
         defer {
             for (list.items) |v| self.gpa.free(v);

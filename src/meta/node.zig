@@ -753,6 +753,22 @@ pub fn verifyNodeExtentScreened(gpa: Allocator, buf: []const u8, layout: NodeLay
     };
 }
 
+/// An extent image's load verdict as text — the refusal's own words (for
+/// a covered frame behind a hole: its offset, its horizon, the tail) —
+/// written into `out`; empty when the image verifies (or the verification
+/// ran out of memory).
+pub fn describeRefusal(gpa: Allocator, buf: []const u8, layout: NodeLayout, node_addr: u64, durable_tail: u64, out: []u8) []const u8 {
+    var diag: Refusal = undefined;
+    var loaded = verifyNodeExtent(gpa, buf, layout, node_addr, durable_tail, &diag) catch |e| {
+        if (e == error.OutOfMemory) return "";
+        var w: std.Io.Writer = .fixed(out);
+        diag.write(&w) catch {};
+        return w.buffered();
+    };
+    loaded.deinit(gpa);
+    return "";
+}
+
 /// §2.6 The highest node-seq stamp the RESIDUE of one extent carries: the
 /// header's `node_seq` if the page decodes, and `node_seq_at_write` of every
 /// frame header at any 4 KiB slot whose magic is KBSF and whose checksum

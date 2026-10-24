@@ -107,3 +107,22 @@ origin/dev — 1,005 recalls on B, census purges 0 → 1,004, B's next pass 64 M
 recalls (1,002 with no entry), census 0 → 0, next pass 0 B from the device, B reads A's overwrite. The re-use
 row's B now keeps `f` through A's fill (it judged a copy the fill's censuses had already dropped). **Owed**: the
 two-mount read-while-write fio A/B (the venue sat at load 20–30 with ~40 co-tenant daemons all session).
+
+**The census follow-ups** (`fix/census-followups`, 2026-10-24). (1) An access stamp recalled every reader: a
+joiner's `readdir` shipped a `Δatime` that recalled its OWN token on the directory, and a holder's own reads
+recalled every reader of the file. An inode Δ naming the atime alone now leaves the recall union (readers keep
+the pre-stamp atime until the next real change; the toucher folds its own applied stamp — without it, B's
+`stat` after the ship showed the pre-read atime). AN ACCESS STAMP RECALLS NO READER: origin/dev — 10 rounds of
+both mounts reading under strictatime, recalls 5 → 55 on each side; branch — 0 → 0, a create still recalls.
+(2) A joined member read a holder's TREE-MAPPED file as ZEROS (its view of the holder's slot tree holds none
+of the block-map records; a buffered read hung until the kernel aborted the connection), and every recall of
+such a file censused. The block map now rides the token as a window (`WANT_MAP`, paged and bounded like a
+directory's dentries); the reader resolves foreign tree-mapped bindings off it, and the recall purges exactly
+the keys its window names. A JOINED MEMBER READS A HOLDER'S BLOCK-MAP FILE (192 MiB at 512 KiB blocks):
+origin/dev — B's sha differs from A's; branch — A's bytes, and A's append purges 384 keys with census 0 → 0
+while B's other file stays warm. (3) The serve-stamp drain, the deferred verdict and `RecallAck` were never
+wired (no production serve stamped): deleted — the binding recheck after the bytes are in hand guards the
+tiers, and the kernel orders its caches behind the invalidations (`INVAL_ENTRY` takes the parent's `i_rwsem`,
+`INVAL_INODE` bumps `attr_version` and waits out locked folios). Runs: the two new rows 100/100, the new unit
+tests 100/100 (fresh), the census row and seven coherence rows 10/10 at load 7–15. **Owed**: the two-mount
+read-while-write fio A/B (the venue never fell below load 4).

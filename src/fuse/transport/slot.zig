@@ -891,6 +891,31 @@ test "failEnt synthesizes exactly once for an owing or parked slot (the second c
     try testing.expect(!t.ent(3).lease.release());
 }
 
+// The filled scratch of xfstests generic/299 and 750: 6,349 lines of
+// "a FUSE_WRITE payload lease lived 2000 ms" — every write the parked-buffer
+// gate held one tick before its wall's ENOSPC. A lease held ≥ 1 s is not an
+// escape (the constant's own doc: admission backpressure exceeds it): the
+// handler holds the payload it has not yet admitted. Every one counts; the
+// episode says one line.
+test "overlong payload leases: every lease held ≥ 1 s counts transport_lease_overlong, and a run of them is ONE loud line per episode, never one per lease" {
+    const Fake = struct {
+        fn wake(_: ?*anyopaque) bool {
+            return false;
+        }
+    };
+    const waker: Waker = .{ .ctx = null, .wake = Fake.wake };
+    const overlong0 = lease_overlong.load();
+    log.testing.expectErrorLogs(1);
+    for (0..8) |_| {
+        var st: LeaseState = .{};
+        var l = PayloadLease.acquire(&st, &.{}, waker);
+        l.born_ns -|= 2 * LEASE_OVERLONG_NS;
+        l.release();
+    }
+    try log.testing.expectAllFired();
+    try testing.expectEqual(overlong0 + 8, lease_overlong.load());
+}
+
 test "a second delivery on an owing slot reports the displaced request and is accepted; a REGISTER over an owing slot and a failed push are abandonments (the tripwire)" {
     log.testing.expectErrorLogs(4);
     var t = try freshTable();

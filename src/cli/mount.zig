@@ -784,12 +784,21 @@ fn mountMain(ctx: *Ctx) u8 {
     // disarmed and detached before the session goes (LIFO: this `defer`
     // runs before `session.deinit`).
     coherence.attach(session) catch return ctx.failed("the kernel view's notifier thread could not start", .{});
-    if (!reader) for (be.volumes) |vol| vol.cv.armKernel(&coherence.view);
+    if (!reader) be.armKernel(&coherence.view);
     var kernel_view_live = true;
     defer if (kernel_view_live) {
-        if (!reader) for (be.volumes) |vol| vol.cv.disarmKernel();
+        if (!reader) be.armKernel(null);
         coherence.detach();
     };
+    // THE RE-JOIN IN PLACE (decision 0003 §BO): a live member its home
+    // shard evicts re-joins under this live session when nothing it holds
+    // is un-landed — the plane's and the filesystem's words are the
+    // mount's to judge; the kernel's view and the read cache drop at the
+    // successor. Unbound before the wire stops (LIFO).
+    var rejoin_host: RejoinHost = .{ .fs = &fs, .plane = plane, .set = be, .coherence = &coherence };
+    const rejoin_face = rejoin_host.face();
+    if (wire) |wp| if (wp.joined != null) wp.bindRejoinHost(&rejoin_face);
+    defer if (wire) |wp| wp.bindRejoinHost(null);
     // The zc legs: the held-slot direct store on a zero-copy session, the
     // direct device leg, the fd-source probe serve.
     var held_store: HeldStore = .{ .session = session };
@@ -1041,7 +1050,7 @@ fn mountMain(ctx: *Ctx) u8 {
     const stranded = counters.tripwireCount("open_count_stranded");
     const abandoned = transport.slot.requests_abandoned.load();
     log.info("teardown: session closed; open_count_stranded={d} transport_requests_abandoned={d} tick_commit_lost_wakes={d} tick_cqe_lost_wakes={d} tick_late_commits={d} tick_late_cqes={d}", .{ stranded, abandoned, transport.worker.park_tick_commit_lost_wakes.load(), transport.worker.park_tick_cqe_lost_wakes.load(), transport.worker.park_tick_late_commits.load(), transport.worker.park_tick_late_cqes.load() });
-    if (!reader) for (be.volumes) |vol| vol.cv.disarmKernel();
+    if (!reader) be.armKernel(null);
     coherence.detach();
     kernel_view_live = false;
     session_live = false;
@@ -1811,6 +1820,14 @@ const KernelCoherence = struct {
         if (!self.queue.tryPush(it)) self.flush_owed.store(true, .release);
     }
 
+    /// A whole-view flush owed, without waiting for it (a re-join in
+    /// place: the evicted incarnation's view may be stale).
+    fn flushWholeView(self: *KernelCoherence) void {
+        if (self.thread == null) return;
+        self.flush_owed.store(true, .release);
+        self.wakeNotifier();
+    }
+
     fn wakeNotifier(self: *KernelCoherence) void {
         // release pairs with the notifier's acquire of `kick`: the pushes
         // (and an owed flush) are visible when it wakes.
@@ -1871,6 +1888,42 @@ const KernelCoherence = struct {
         }
         _ = self.flushes.fetchAdd(1, .release);
         futex.wakeAll(&self.flushes);
+    }
+};
+
+/// The mount's half of a re-join in place (`sym_wire.RejoinHost`; charter
+/// §5.5 "A live member evicted …"; decision 0003 §BO): what the data plane
+/// and the filesystem hold un-landed, and the mount's own re-bindings for
+/// the successor incarnation.
+const RejoinHost = struct {
+    fs: *BackendFs,
+    plane: *plane_mod.DataPlane,
+    set: *meta_set.MetaSet,
+    coherence: *KernelCoherence,
+
+    fn face(self: *RejoinHost) sym_wire.RejoinHost {
+        return .{ .ctx = self, .unlanded = &unlanded, .rebound = &rebound };
+    }
+
+    /// The data plane's words, then the filesystem's parked refinements
+    /// (journaled within one flush interval; parked past the eviction they
+    /// were never journaled into the recovered region).
+    fn unlanded(ctx: *anyopaque, buf: []u8) ?[]const u8 {
+        const self: *RejoinHost = @ptrCast(@alignCast(ctx));
+        if (self.plane.unlandedWord(buf)) |w| return w;
+        const parked = self.fs.pending.len();
+        if (parked != 0) return std.fmt.bufPrint(buf, "{d} parked time refinement(s) never journaled", .{parked}) catch "parked time refinements";
+        return null;
+    }
+
+    /// The successor is published: its node caches join the budget, the
+    /// read cache and the kernel's whole view drop what the evicted
+    /// incarnation served.
+    fn rebound(ctx: *anyopaque) void {
+        const self: *RejoinHost = @ptrCast(@alignCast(ctx));
+        for (self.set.volumes) |vol| mem_budget.authority.register(vol.budgetComponent());
+        self.plane.dropIncarnationViews();
+        self.coherence.flushWholeView();
     }
 };
 

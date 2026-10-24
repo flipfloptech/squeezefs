@@ -1002,7 +1002,10 @@ pub const CarriageSink = struct {
     released: *const fn (ctx: ?*anyopaque, slot: u16) void,
 };
 
-pub const TickVerdict = enum { idle, renewed, rejoined, parked, fenced };
+/// `evicted`: the owner answered `UnknownLease` to a member armed to re-join
+/// in place (decision 0003 §BO) — nothing touched the gate or the words;
+/// the caller retires the incarnation and re-joins, or poisons.
+pub const TickVerdict = enum { idle, renewed, rejoined, parked, fenced, evicted };
 
 /// The carriage a member acts on per grant: the rotor cap (`2M` ≤ 128).
 pub const CARRIAGE_MAX: usize = 128;
@@ -1035,6 +1038,12 @@ pub const Member = struct {
     /// never carried): the beat compares it with the process's own word
     /// and pulls the record at a bump (`wire_plane.learnSetConfig`).
     config_generation: u64 = 0,
+    /// THE RE-JOIN IN PLACE (charter §5.5; decision 0003 §BO): the owner's
+    /// `UnknownLease` — at a reclaim under the park or a renewal — is the
+    /// verdict `evicted`, never the poison here: the caller judges what
+    /// the incarnation holds un-landed and re-joins or poisons. Set before
+    /// the beat starts (read on the beat alone).
+    rejoin_armed: bool = false,
 
     fn joinReq(self: *const Member, prior_epoch: ?u64) verbs.Request {
         var flags: u8 = 0;
@@ -1153,6 +1162,9 @@ pub const Member = struct {
                     .unknown_lease => .unknown_lease,
                     else => .not_now,
                 };
+                // Expiry judged first (`reclaimUnderPark`'s order): a park
+                // past `T_park_max` is the lattice's terminal verdict.
+                if (answer == .unknown_lease and self.rejoin_armed and !g.expireIfDue(now_mono_ns, self.poison) and !g.isExpired()) return .evicted;
                 return switch (park.reclaimUnderPark(g, answer, now_mono_ns, clock.monotonicNs() - t0, self.poison)) {
                     .rejoined => .rejoined,
                     .fenced => blk: {
@@ -1173,6 +1185,7 @@ pub const Member = struct {
                 return .renewed;
             },
             .unknown_lease => {
+                if (self.rejoin_armed) return .evicted;
                 // The owner's own verdict: the lease is gone — terminal
                 // whatever the class (a park would stand for nothing).
                 _ = self.words.fence();
@@ -1615,6 +1628,54 @@ test "UnknownLease before T_self fences terminally and never parks; a leave over
     var m2: Member = .{ .gpa = gpa, .id = writerMemberId(testIdentity(3)), .role = .writer, .link = dl.link(), .pid = 7, .boot = "boot-boot-boot-0".*, .endpoint = .none, .pr_key = 0, .mount = "/mnt/n", .gate = &gate, .poison = p.sink() };
     _ = gate.park(1);
     try testing.expectError(error.ParkedLeaveRefused, m2.leave());
+}
+
+test "THE RE-JOIN IN PLACE's verdict (decision 0003 §BO): a member armed to re-join answers the owner's UnknownLease `evicted` — at a renewal before T_self and at the reclaim under the park — touching neither the gate nor the words nor the poison; an expired park stays the terminal fence; unarmed, the same answers fence and poison as before" {
+    const gpa = testing.allocator;
+    const clocks = try LeaseClocks.derive(45_000, 0, 100);
+    var o = try Owner.arm(gpa, clocks, 0, 1, 0, &.{}, 0);
+    defer o.deinit();
+    manual_now_ms = 0;
+    var osvc: OwnerService = .{ .owner = &o, .now = &manualNow };
+    var dl: DirectLink = .{ .owner_svc = &osvc, .peer = testIdentity(5) };
+    osvc.register(&dl.svc);
+    var p: Poison = .{};
+    // At a renewal (the gate running).
+    var gate = park.ParkGate.arm(testing.io, 0, 1 << 40);
+    var m: Member = .{ .gpa = gpa, .id = writerMemberId(testIdentity(5)), .role = .writer, .link = dl.link(), .pid = 7, .boot = "boot-boot-boot-0".*, .endpoint = .none, .pr_key = 0, .mount = "/mnt/m", .gate = &gate, .poison = p.sink(), .rejoin_armed = true };
+    try testing.expectEqual(Member.JoinOutcome.granted, m.join(0, null));
+    _ = o.leave(m.id, 0);
+    manual_now_ms = 10_000;
+    try testing.expectEqual(TickVerdict.evicted, m.tick(10_000, 0));
+    try testing.expect(gate.word() == .running and !m.words.fenced.load(.acquire));
+    try testing.expectEqual(@as(u32, 0), p.count);
+    // At the reclaim under the park.
+    var gate2 = park.ParkGate.arm(testing.io, 0, 1 << 40);
+    var dl2: DirectLink = .{ .owner_svc = &osvc, .peer = testIdentity(6) };
+    osvc.register(&dl2.svc);
+    var m2: Member = .{ .gpa = gpa, .id = writerMemberId(testIdentity(6)), .role = .writer, .link = dl2.link(), .pid = 7, .boot = "boot-boot-boot-0".*, .endpoint = .none, .pr_key = 0, .mount = "/mnt/n", .gate = &gate2, .poison = p.sink(), .rejoin_armed = true };
+    manual_now_ms = 10_000;
+    try testing.expectEqual(Member.JoinOutcome.granted, m2.join(10_000, null));
+    _ = o.leave(m2.id, 10_000);
+    _ = gate2.park(1);
+    try testing.expectEqual(TickVerdict.evicted, m2.tick(10_001, 2));
+    try testing.expect(gate2.isParked() and !m2.words.fenced.load(.acquire));
+    try testing.expectEqual(@as(u32, 0), p.count);
+    // A park past T_park_max is the lattice's terminal verdict, armed or not.
+    var gate3 = park.ParkGate.arm(testing.io, 0, 100);
+    var dl3: DirectLink = .{ .owner_svc = &osvc, .peer = testIdentity(7) };
+    osvc.register(&dl3.svc);
+    var m3: Member = .{ .gpa = gpa, .id = writerMemberId(testIdentity(7)), .role = .writer, .link = dl3.link(), .pid = 7, .boot = "boot-boot-boot-0".*, .endpoint = .none, .pr_key = 0, .mount = "/mnt/o", .gate = &gate3, .poison = p.sink(), .rejoin_armed = true };
+    try testing.expectEqual(Member.JoinOutcome.granted, m3.join(10_000, null));
+    _ = o.leave(m3.id, 10_000);
+    _ = gate3.park(1);
+    park.stats.appender_park_expiries.resetLogBudgetForTest();
+    log.testing.expectErrorLogs(1);
+    try testing.expectEqual(TickVerdict.fenced, m3.tick(10_002, 1 + 200 * std.time.ns_per_ms));
+    try log.testing.expectAllFired();
+    try testing.expect(gate3.isExpired());
+    try testing.expectEqual(@as(u32, 1), p.count);
+    park.stats.appender_parked.set(@backingInt(park.Word.running));
 }
 
 test "T_self is the member's clock, never its beat's liveness: with the beat stalled, a committer at the pre-admission gate past the deadline PARKS the gate itself (one park, one self-fence, acks held), the committer waits, the beat's next tick runs the reclaim beat and the re-point releases it; before the first grant nothing fences; a renewal in time fences nothing" {

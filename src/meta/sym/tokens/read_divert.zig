@@ -246,6 +246,29 @@ pub const Divert = struct {
         return true;
     }
 
+    /// THE RE-JOIN IN PLACE (decision 0003 §BO): the home shard evicted
+    /// this member and every holder swept its grants — every plane drops
+    /// every token and re-probes its channel at the next serve (onto its
+    /// own link: the holders' listeners did not move). Returns the planes
+    /// dropped.
+    pub fn dropAll(self: *Divert, io: Io) usize {
+        var readers: std.ArrayList(*cache.Reader) = .empty;
+        defer readers.deinit(self.gpa);
+        {
+            self.last_root_lock.lockUncancelable(io);
+            defer self.last_root_lock.unlock(io);
+            self.last_root = null;
+        }
+        {
+            self.lock.lockUncancelable(io);
+            defer self.lock.unlock(io);
+            var it = self.planes.valueIterator();
+            while (it.next()) |r| readers.append(self.gpa, r.*) catch break;
+        }
+        for (readers.items) |r| r.repoint(io, r.link);
+        return readers.items.len;
+    }
+
     /// A fail-closed channel re-probed inside the serve that needs a
     /// fetch: re-dialled through the resolver, the probe round deciding
     /// (`cache.Reader.redial`). Returns whether the channel re-opened.

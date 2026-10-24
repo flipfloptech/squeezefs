@@ -316,6 +316,12 @@ pub const JoinOptions = struct {
     /// `--join <endpoint>`: the manager's listener when the durable
     /// `endpoint:{0}` record is not to be trusted (or not yet written).
     endpoint: ?endpoint.EndpointWire = null,
+    /// A re-join in place (decision 0003 §BO): the evicted predecessor's
+    /// appender id on this volume. Its region is recovered — every slot it
+    /// leased is the manager's to hand out again — so the projection's
+    /// rows naming it are as stale as the joiner's own (`lease_table.
+    /// joinedProjectionRow`).
+    predecessor: ?u32 = null,
 };
 
 pub const FormatOptions = struct {
@@ -1094,7 +1100,7 @@ pub const KvBackend = struct {
         // The projection may be re-read (and the cache re-created) while
         // the manager's endpoint is awaited, so the slot plane — whose
         // frame seam lives in the cache — arms after it.
-        const js = sym.joined.JoinedSet.open(be, jopts.mountpoint, jopts.endpoint) catch |e| return switch (e) {
+        const js = sym.joined.JoinedSet.open(be, jopts.mountpoint, jopts.endpoint, jopts.predecessor) catch |e| return switch (e) {
             error.ManagerUnreachable, error.PredecessorLive, error.Capacity => error.Busy,
             error.Rejected, error.Corrupt => error.Corrupt,
             error.Io => error.Io,

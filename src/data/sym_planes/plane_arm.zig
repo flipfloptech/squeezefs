@@ -721,6 +721,33 @@ pub const WriterPlane = struct {
         return false;
     }
 
+    /// THE RE-JOIN IN PLACE (decision 0003 §BO): the home shard evicted
+    /// this member, and its holder revokes a dead writer's grants — every
+    /// unconsumed run is dropped HERE, never returned (the holder's own
+    /// derivation returns it; a return could clear a bit it re-granted).
+    /// The next mint pulls a fresh grant under the successor's membership.
+    pub fn forgetWindows(self: *WriterPlane) u64 {
+        var n: u64 = 0;
+        for (self.armedVols()) |*v| {
+            var runs: block_grant.Grants = .{};
+            v.arm.window.drain(&runs);
+            n += runs.slice().len;
+        }
+        return n;
+    }
+
+    /// A block of this writer's in the in-flight registry — minted and not
+    /// yet published, or released and not yet freed: un-landed state the
+    /// holder's recovery of the evicted incarnation did not see.
+    pub fn holdsInflight(self: *WriterPlane) bool {
+        for (self.armedVols()) |*v| {
+            var idx: u64 = 0;
+            const cap = v.alloc.capacityBlocks();
+            while (idx < cap) : (idx += 1) if (v.alloc.inflightContains(idx)) return true;
+        }
+        return false;
+    }
+
     pub fn destroy(self: *WriterPlane) void {
         for (self.armedVols()) |*v| {
             // The pending frees ship; every unconsumed run of the window

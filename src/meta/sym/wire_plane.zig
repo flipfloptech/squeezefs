@@ -97,6 +97,7 @@ const set_config = @import("../../data/set_config.zig");
 const lifecycle_stats = @import("../../ops/lifecycle/stats.zig").stats;
 const lattice = @import("../../ops/lifecycle/lattice.zig");
 const joined = @import("joined.zig");
+const route_table = @import("../routing/route_table.zig");
 const wire_auth = @import("../../wire/auth.zig");
 const listener = @import("../../wire/listener.zig");
 const endpoint = @import("../../wire/endpoint.zig");
@@ -121,6 +122,9 @@ pub const stats = struct {
     pub var wire_endpoint_publications: counters.ShardedCounter = .{};
     /// Cadence ticks of the plane (eviction + grace reap + ledger poll).
     pub var wire_plane_ticks: counters.ShardedCounter = .{};
+    /// Live members this process re-joined in place after its home shard
+    /// evicted them (decision 0003 §BO).
+    pub var wire_rejoins_in_place: counters.ShardedCounter = .{};
 };
 
 /// Why the plane refused to arm (each reported by name at the mount).
@@ -267,8 +271,15 @@ const JoinedHalf = struct {
     member: shard.Member,
     poison: Poison,
     beat: std.Thread = undefined,
-    follower: std.Thread = undefined,
+    /// Null between a re-join's stop of the follower and its re-spawn (a
+    /// refused re-join leaves none).
+    follower: ?std.Thread = null,
     stop: std.atomic.Value(bool) = .init(false),
+    /// The follower ends while the beat re-joins in place (it reads the
+    /// incarnation's words); the beat re-spawns it after.
+    follow_stop: std.atomic.Value(bool) = .init(false),
+    /// Re-joins in place this member made (`.stats` `member_rejoins_in_place`).
+    rejoins_in_place: std.atomic.Value(u64) = .init(0),
     /// Reclaims the beat landed (monotone): the follower re-points and
     /// re-publishes once per count it has not handled. The beat's Release
     /// increment pairs with the follower's Acquire load, which then reads
@@ -286,7 +297,7 @@ const JoinedHalf = struct {
     slots_carriage: shard.CarriageSink,
     offers: OfferQueue = .{},
     /// The last tick's verdict class for `.stats` (0 idle, 1 renewed, 2
-    /// parked, 3 fenced, 4 rejoined).
+    /// parked, 3 fenced, 4 rejoined, 5 re-joined in place).
     last_verdict: std.atomic.Value(u8) = .init(0),
     renewals: std.atomic.Value(u64) = .init(0),
     /// The writer plane whose windows every renewal declares (published
@@ -337,12 +348,21 @@ const JoinedHalf = struct {
             }
             const t = clock.monotonicNs();
             const v = self.member.tick(t / std.time.ns_per_ms, t);
+            if (v == .evicted) {
+                // The home shard evicted this live member: re-join in
+                // place, or the fail-stop (`WirePlane.rejoinInPlace`).
+                if (!self.plane.rejoinInPlace(self)) return;
+                self.last_verdict.store(5, .release);
+                sleepTick();
+                continue;
+            }
             self.last_verdict.store(switch (v) {
                 .idle => 0,
                 .renewed => 1,
                 .parked => 2,
                 .fenced => 3,
                 .rejoined => 4,
+                .evicted => unreachable,
             }, .release);
             if (v == .renewed) _ = self.renewals.fetchAdd(1, .monotonic);
             if (v == .fenced) {
@@ -378,7 +398,7 @@ const JoinedHalf = struct {
         var rejoins_handled: u64 = 0;
         var grants_handled: u64 = 0;
         var offers: [OfferQueue.CAP]OfferQueue.Offer = undefined;
-        while (!self.stop.load(.acquire)) {
+        while (!self.stop.load(.acquire) and !self.follow_stop.load(.acquire)) {
             if (self.member.words.fenced.load(.acquire) or self.js.park_gate.isExpired()) return;
             self.holdFollowIfArmed();
             const rejoins = self.rejoins.load(.acquire);
@@ -505,7 +525,9 @@ const JoinedHalf = struct {
 
     fn selfLive(ctx: ?*anyopaque, _: u64) bool {
         const self: *JoinedHalf = @ptrCast(@alignCast(ctx.?));
-        return !self.member.words.fenced.load(.acquire) and !self.js.park_gate.isExpired();
+        // Acquire pairs with the re-join's Release store of `js`.
+        const js = @atomicLoad(*joined.JoinedSet, &self.js, .acquire);
+        return !self.member.words.fenced.load(.acquire) and !js.park_gate.isExpired();
     }
 
     fn selfLease(self: *JoinedHalf) tokens.cache.SelfLease {
@@ -530,6 +552,20 @@ const Poison = struct {
     fn sink(self: *Poison) membership.park_reclaim.PoisonSink {
         return .{ .ctx = self, .poison = &poison };
     }
+};
+
+/// The mount's half of a re-join in place (charter §5.5 "A live member
+/// evicted …"; decision 0003 §BO), bound by `mount` once its planes stand.
+pub const RejoinHost = struct {
+    ctx: *anyopaque,
+    /// The first thing the data plane or the filesystem holds un-landed —
+    /// staged residents, write-side custody, a packed tenant in flight,
+    /// parked refinements — written into the buffer; null = nothing.
+    unlanded: *const fn (ctx: *anyopaque, buf: []u8) ?[]const u8,
+    /// The successor incarnation is published: the mount's views of the
+    /// evicted one dropped (the kernel's whole view, the read cache) and
+    /// its per-volume registrations made for the successor's members.
+    rebound: *const fn (ctx: *anyopaque) void,
 };
 
 pub const WirePlane = struct {
@@ -604,6 +640,9 @@ pub const WirePlane = struct {
     heaps: []data_bitmap.HeapGeometry = &.{},
     /// The data volumes the renewal's declarations are screened by.
     decl_bounds: []screen_mod.DataVolumeBounds = &.{},
+    /// The mount's half of a re-join in place (`bindRejoinHost`; Release
+    /// there, Acquire on the beat that re-joins).
+    rejoin_host: std.atomic.Value(?*const RejoinHost) = .init(null),
 
     /// Arm the plane (module doc); null on a set whose volume 0 carries no
     /// symmetric plane (the `--single-writer` class: no wire). The posture
@@ -723,8 +762,9 @@ pub const WirePlane = struct {
         // durable record per managed volume; a joiner to the manager's
         // table over the wire, then its membership join with it.
         if (self.mgr != null) try self.publishEndpoints() else try self.startJoinedHalfPost();
-        // The recall hook on every volume's pass.
-        for (set.volumes) |be| be.cv.armTokens(&self.hook);
+        // The recall hook on every volume's pass (kept for a successor
+        // incarnation).
+        set.armTokens(&self.hook);
         if (self.mgr) |m| {
             log.info("cluster wire: manager of {d} volume(s) listening at {s}; membership owner term {d} (T_owner {d} ms, grace {s})", .{ m.faces.len, self.endpointText(), m.owner.term, t_owner_ms, if (m.owner.grace != null) "open" else "closed" });
         } else {
@@ -883,6 +923,9 @@ pub const WirePlane = struct {
             .gate = &js.park_gate,
             .poison = j.poison.sink(),
             .carriage = j.carriageSink(),
+            // A live member its home shard evicts re-joins in place when it
+            // holds nothing un-landed (decision 0003 §BO).
+            .rejoin_armed = true,
         };
         self.joined = j;
     }
@@ -929,6 +972,154 @@ pub const WirePlane = struct {
         };
     }
 
+    /// Bind the mount's half of a re-join in place (`RejoinHost`; the host
+    /// outlives the plane). Without one an eviction is the fail-stop.
+    pub fn bindRejoinHost(self: *WirePlane, host: ?*const RejoinHost) void {
+        // Release pairs with the beat's Acquire loads in `rejoinInPlace`.
+        self.rejoin_host.store(host, .release);
+    }
+
+    /// THE RE-JOIN IN PLACE (charter §5.5 "A live member evicted …";
+    /// decision 0003 §BO), on the beat that met the home shard's
+    /// `UnknownLease`. The follower ends first (it reads the incarnation's
+    /// words). Then: (1) the writer's block-grant windows forgotten (the
+    /// holder revoked them: nothing more is minted from them) and every
+    /// member's incarnation RETIRED (`JoinedSet.retireIncarnation`: no
+    /// admission, the drain, no write past it); (2) THE ELIGIBILITY — the
+    /// evicted incarnation holds nothing un-landed (`judgeUnlanded`); (3)
+    /// the successor incarnations joined through the mount's own door
+    /// (`MetaSet.openSuccessors`); (4) every token of the evicted
+    /// incarnation dropped and the successors published
+    /// (`MetaSet.publishSuccessors`); (5) the member joined afresh under
+    /// the successor (a new membership epoch, the listener re-published to
+    /// the manager under the successor's appender id); (6) the mount's
+    /// views dropped and the move epoch bumped — every op parked on a
+    /// move-class refusal (the retired incarnation's `Deferred`) re-issues
+    /// on the successor. A refusal at any step is the fail-stop as before
+    /// the re-join existed: the park's expiry, the poison. True = re-joined
+    /// (the beat goes on).
+    fn rejoinInPlace(self: *WirePlane, j: *JoinedHalf) bool {
+        const t0 = clock.monotonicNs();
+        const old_appender = j.js.appenderId();
+        log.warn("cluster wire: the home shard answered UnknownLease — it evicted this LIVE member (appender {d}, epoch {d}); retiring the incarnation and judging what it holds un-landed (decision 0003 §BO)", .{ old_appender, j.member.epoch });
+        j.follow_stop.store(true, .release);
+        if (j.follower) |t| t.join();
+        j.follower = null;
+        var why_buf: [256]u8 = undefined;
+        if (self.judgeUnlanded(&why_buf)) |why| return self.refuseRejoin(j, why);
+        const fresh = self.set.openSuccessors() catch |e| {
+            const why = std.fmt.bufPrint(&why_buf, "the successor's join failed ({t})", .{e}) catch "the successor's join failed";
+            return self.refuseRejoin(j, why);
+        };
+        // The evicted incarnation's tokens are void at every holder (the
+        // death fan-out swept them): none is served from here on.
+        const planes = self.divert.dropAll(self.io);
+        self.set.publishSuccessors(fresh) catch {
+            for (fresh) |be| be.close();
+            self.gpa.free(fresh);
+            return self.refuseRejoin(j, "out of memory publishing the successor incarnation");
+        };
+        const js = self.set.volumes[0].joined.?;
+        // Release pairs with `selfLive`'s Acquire load.
+        @atomicStore(*joined.JoinedSet, &j.js, js, .release);
+        j.member.link = js.link.link();
+        j.member.gate = &js.park_gate;
+        j.member.mount = js.mountpoint;
+        j.member.epoch = 0;
+        j.slots_carriage = self.set.volumes[0].slots.carriageSink();
+        self.pusher.identity = js.appenderId();
+        if (!self.publishToManager()) return self.refuseRejoin(j, "the successor's listener could not be published to the manager");
+        if (!self.joinMember(j, t0)) return self.refuseRejoin(j, "the successor's membership join was refused");
+        if (self.rejoin_host.load(.acquire)) |h| h.rebound(h.ctx);
+        // The posture word is the successor gate's (running).
+        membership.park_reclaim.stats.appender_parked.set(@backingInt(membership.park_reclaim.Word.running));
+        _ = j.rejoins_in_place.fetchAdd(1, .monotonic);
+        stats.wire_rejoins_in_place.inc();
+        if (self.set.bound_moves) |m| m.bump();
+        j.follow_stop.store(false, .release);
+        j.follower = std.Thread.spawn(.{}, JoinedHalf.follow, .{j}) catch return self.refuseRejoin(j, "the follower thread could not be re-spawned");
+        log.info("cluster wire: RE-JOINED IN PLACE as appender {d} (was {d}), member epoch {d} at {f} in {d} ms — nothing was un-landed; {d} token plane(s) dropped, the mount's views dropped, every parked op re-issued on the successor incarnation", .{ js.appenderId(), old_appender, j.member.epoch, js.managerEndpoint(), (clock.monotonicNs() - t0) / std.time.ns_per_ms, planes });
+        return true;
+    }
+
+    /// THE ELIGIBILITY (decision 0003 §BO), judged after the retirement:
+    /// the first thing the evicted incarnation holds that its home shard's
+    /// recovery could not have landed, or null.
+    ///   - a window admitted before the eviction still in flight past one
+    ///     landing ceiling, or a reservation open (acked, never landed);
+    ///   - a ring head past the head the successor's recovery read (its
+    ///     page `Recovered{ledger_tail_seq}`): entries landed after the
+    ///     scan, which no one replays — or no recovery within `T_park_max`;
+    ///   - a cross-owner intent open (the op that opened it would re-issue
+    ///     against a successor while the recovery rolls it forward);
+    ///   - a data block minted and not yet published, or released and not
+    ///     yet freed (the writer's in-flight registry);
+    ///   - the mount's words (`RejoinHost.unlanded`): staged residents,
+    ///     write-side custody, a packed tenant in flight, parked
+    ///     refinements.
+    fn judgeUnlanded(self: *WirePlane, buf: []u8) ?[]const u8 {
+        if (self.writer_plane) |w| _ = w.forgetWindows();
+        var heads: [route_table.MAX_VOLUMES]u64 = undefined;
+        for (self.set.volumes, 0..) |be, i| {
+            const r = be.joined.?.retireIncarnation();
+            if (!r.drained) return std.fmt.bufPrint(buf, "volume {d}: a window admitted before the eviction did not land within one landing ceiling", .{i}) catch "a window did not land";
+            if (r.open != 0) return std.fmt.bufPrint(buf, "volume {d}: {d} reservation(s) open on the ring (acked, never landed)", .{ i, r.open }) catch "a reservation open";
+            heads[i] = r.head;
+        }
+        const deadline = clock.monotonicNs() + self.joined.?.js.park_gate.t_park_max_ms * std.time.ns_per_ms;
+        for (self.set.volumes, 0..) |be, i| {
+            switch (be.joined.?.awaitRecovered(deadline)) {
+                .recovered => |rec| if (rec.head != heads[i]) return std.fmt.bufPrint(buf, "volume {d}: the ring's head {d} is past the head {d} the successor's recovery read — entries landed after its scan, which no one replays", .{ i, heads[i], rec.head }) catch "the ring landed past the recovery",
+                .pending => |st| return std.fmt.bufPrint(buf, "volume {d}: the region was not recovered within T_park_max (its page {t})", .{ i, st }) catch "the region was not recovered",
+                .foreign => return std.fmt.bufPrint(buf, "volume {d}: the appender's page names another identity", .{i}) catch "the page is not ours",
+                .unreadable => return std.fmt.bufPrint(buf, "volume {d}: the appender's page could not be read", .{i}) catch "the page is unreadable",
+            }
+        }
+        const open = xv.intent.stats.xv_cross_owner_intents_open.load();
+        if (open != 0) return std.fmt.bufPrint(buf, "{d} cross-owner intent(s) open", .{open}) catch "a cross-owner intent open";
+        if (self.writer_plane) |w| if (w.holdsInflight()) return "a data block minted and not yet published (or released and not yet freed)";
+        const h = self.rejoin_host.load(.acquire) orelse return "no re-join host is bound (the mount's data words cannot be judged)";
+        return h.unlanded(h.ctx, buf);
+    }
+
+    /// The fail-stop as before the re-join existed: the park's expiry off
+    /// the retired (or parked) word — the poison.
+    fn refuseRejoin(_: *WirePlane, j: *JoinedHalf, why: []const u8) bool {
+        log.err("cluster wire: this joined mount cannot re-join in place — {s}; the fail-stop", .{why});
+        _ = j.member.words.fence();
+        shard.stats.membership_self_fenced.set(1);
+        const reason = "the home shard evicted this member and it could not re-join in place";
+        if (!j.js.park_gate.expireNow(j.poison.sink(), reason)) Poison.poison(&j.poison, reason);
+        return false;
+    }
+
+    /// The successor's membership join (the mount's own: the listener's
+    /// endpoint, no prior epoch), retried while the owner refuses it for
+    /// now, bounded by the park's `T_park_max`; then the gate's clocks and
+    /// the committers' `T_self` from its grant.
+    fn joinMember(self: *WirePlane, j: *JoinedHalf, t0: u64) bool {
+        const deadline = t0 + j.js.park_gate.t_park_max_ms * std.time.ns_per_ms;
+        j.member.endpoint = self.advertised;
+        while (true) {
+            switch (j.member.join(nowMs(), null)) {
+                .granted => break,
+                .grace_refused, .failed => if (clock.monotonicNs() < deadline) {
+                    JoinedHalf.sleepTick();
+                    continue;
+                },
+                .collision, .unknown_lease => {},
+            }
+            return false;
+        }
+        const clocks = j.member.clocks.?;
+        j.js.park_gate.t_park_max_ms = membership.park_reclaim.tParkMaxMs(@import("extent_grant.zig").failoverBoundMs(0, 0), clocks.grace_ms);
+        j.js.park_gate.bindSelfFence(j.member.selfFenceSeam());
+        j.census.setRenewInterval(clocks.renew_ms * std.time.ns_per_ms);
+        j.granted_generation.store(j.member.config_generation, .monotonic);
+        _ = j.grants.fetchAdd(1, .release);
+        return true;
+    }
+
     /// A joiner's listener into the manager's RAM endpoint table (every
     /// joined volume's); false when any publication failed (logged).
     fn publishToManager(self: *WirePlane) bool {
@@ -966,7 +1157,7 @@ pub const WirePlane = struct {
     }
 
     pub fn stop(self: *WirePlane) void {
-        for (self.set.volumes) |be| be.cv.disarmTokens();
+        self.set.armTokens(null);
         // A joiner's pending shipped frees reach the holder while its link
         // and membership stand; then its clean leave of the shard FIRST
         // (the manager's owner deletes the member row; a leave over a park
@@ -979,7 +1170,8 @@ pub const WirePlane = struct {
         if (self.joined) |j| {
             j.stop.store(true, .release);
             j.beat.join();
-            j.follower.join();
+            if (j.follower) |t| t.join();
+            j.follower = null;
             j.windows.store(null, .release);
         }
         if (self.writer_plane) |w| {
@@ -1543,7 +1735,7 @@ pub const WirePlane = struct {
             try w.print("{{\"wire_posture\":\"manager\",\"wire_endpoint\":\"{s}\",\"wire_listener_connections\":{d},\"wire_managed_volumes\":{d},\"membership_members\":{d},\"membership_term\":{d},\"membership_grace_remaining_ms\":{d},\"wire_peer_links\":{d}", .{ self.endpointText(), self.listener.liveConnections(), m.faces.len, m.owner.members.items.len, m.owner.term, m.owner.graceRemainingMs(nowMs()), self.peers.count() });
         } else {
             const j = self.joined.?;
-            try w.print("{{\"wire_posture\":\"joined\",\"wire_endpoint\":\"{s}\",\"wire_listener_connections\":{d},\"wire_managed_volumes\":0,\"membership_members\":0,\"membership_term\":0,\"membership_grace_remaining_ms\":0,\"wire_peer_links\":{d},\"member_epoch\":{d},\"member_renewals\":{d},\"member_last_verdict\":{d},\"appender_parked\":{d}", .{ self.endpointText(), self.listener.liveConnections(), self.peers.count(), j.member.epoch, j.renewals.load(.monotonic), j.last_verdict.load(.acquire), @intFromBool(j.js.park_gate.isParked()) });
+            try w.print("{{\"wire_posture\":\"joined\",\"wire_endpoint\":\"{s}\",\"wire_listener_connections\":{d},\"wire_managed_volumes\":0,\"membership_members\":0,\"membership_term\":0,\"membership_grace_remaining_ms\":0,\"wire_peer_links\":{d},\"member_epoch\":{d},\"member_renewals\":{d},\"member_last_verdict\":{d},\"appender_parked\":{d},\"member_rejoins_in_place\":{d},\"member_appender\":{d}", .{ self.endpointText(), self.listener.liveConnections(), self.peers.count(), j.member.epoch, j.renewals.load(.monotonic), j.last_verdict.load(.acquire), @intFromBool(j.js.park_gate.isParked()), j.rejoins_in_place.load(.monotonic), j.js.appenderId() });
         }
         // The data planes' arm: the holder's per-volume words or the
         // writer's windows (`df` per the rule reads these).

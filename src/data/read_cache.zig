@@ -427,6 +427,13 @@ pub const ReadCache = struct {
         return self;
     }
 
+    /// Every grain dropped (a re-join in place, decision 0003 §BO: a block
+    /// the evicted incarnation cached may have been rewritten in place by
+    /// the holder that recovered its files — no recall reached this mount).
+    pub fn purgeAll(self: *ReadCache) void {
+        _ = self.core.evictUntil(0);
+    }
+
     /// The live bound for the authority's budget `budget_now`: the
     /// percentage of `budget ÷ 0.7` (= the machine's RAM over the live
     /// share, or the cage's 0.8 scaled), capped by the reservation.

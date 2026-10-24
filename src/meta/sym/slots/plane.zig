@@ -508,7 +508,7 @@ pub const Plane = struct {
             }
             kvs.deinit(gpa);
         }
-        _ = try self.loadTree0Population(&kvs, null);
+        _ = try self.loadTree0Population(&kvs, &.{});
         // 2. Region 0's page settled against tree 0 (the backend adopted
         // the live entries' roots at open; here rows 5/6 and the stale
         // drops take their durable effect).
@@ -617,10 +617,11 @@ pub const Plane = struct {
     /// Tree 0's `slot_state` population into the table (the manager's
     /// live truth; a joiner's checkpointed projection — fresher words
     /// arrive through the wire's replies and redirects, learnt into the
-    /// holder cache). `projection_self` is the joined arm's own appender
-    /// id: its rows go through `lt.joinedProjectionRow`; the count of rows
-    /// that law demoted is returned.
-    fn loadTree0Population(self: *Plane, kvs: *std.ArrayList(manager.KeyValue), projection_self: ?AppenderId) ArmError!u64 {
+    /// holder cache). `projection_selves` are the joined arm's own appender
+    /// id and a re-join's predecessor's: their rows go through
+    /// `lt.joinedProjectionRowOf`; the count of rows that law demoted is
+    /// returned.
+    fn loadTree0Population(self: *Plane, kvs: *std.ArrayList(manager.KeyValue), projection_selves: []const AppenderId) ArmError!u64 {
         const gpa = self.gpa;
         const r = cr.rangeOf(.slot_state);
         var raw: std.ArrayList(tree.KeyValue) = .empty;
@@ -637,7 +638,7 @@ pub const Plane = struct {
         for (kvs.items) |kv| {
             const slot = cr.slotOfKey(kv.key) orelse continue;
             const row = cr.SlotStateWire.decode(kv.value) catch return error.Corrupt;
-            const s = if (projection_self) |me| lt.joinedProjectionRow(row, me) else row;
+            const s = lt.joinedProjectionRowOf(row, projection_selves);
             demoted += @intFromBool(s.variant != row.variant);
             try self.table.load(slot, s);
             if (s.variant == .leased) try self.cache.learn(slot, .{ .appender_id = s.appender_id, .g = s.g });
@@ -674,7 +675,8 @@ pub const Plane = struct {
             }
             kvs.deinit(gpa);
         }
-        const stale_self = try self.loadTree0Population(&kvs, self.me);
+        const selves: [2]AppenderId = .{ self.me, j.predecessor orelse self.me };
+        const stale_self = try self.loadTree0Population(&kvs, &selves);
         if (stale_self != 0) log.info("meta volume {s}: {d} row(s) of tree 0's projection name appender {d} — a previous incarnation's leases (the rejoin's id is the hint's); loaded unleased, a first touch asks the manager", .{ be.path, stale_self, self.me });
         // The manager's slots resolve to its listener (the native slot
         // among them: `/`'s dentries are read under its tokens); any other

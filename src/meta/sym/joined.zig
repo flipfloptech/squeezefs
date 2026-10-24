@@ -335,6 +335,9 @@ pub const JoinedSet = struct {
     writers_known: u64,
     /// The mint-slot count the arm granted (`M`).
     m: u64 = 0,
+    /// A re-join in place: the evicted predecessor's appender id (its
+    /// projection rows load unleased, as this appender's own).
+    predecessor: ?u32 = null,
     /// Extent indices granted since the join (every run absorbed) and
     /// returned to the manager — the closure's two census words; `held`
     /// and `unclaimed` are read off the mirror.
@@ -399,7 +402,7 @@ pub const JoinedSet = struct {
     /// secret off the projection, the dial, `JoinAppender`. The region's
     /// words are read through `standing()`; the slots through
     /// `acquireRotor`. Nothing of the backend's ring exists yet.
-    pub fn open(be: *KvBackend, mountpoint: []const u8, explicit_ep: ?endpoint.EndpointWire) OpenError!*JoinedSet {
+    pub fn open(be: *KvBackend, mountpoint: []const u8, explicit_ep: ?endpoint.EndpointWire, predecessor: ?u32) OpenError!*JoinedSet {
         const gpa = be.gpa;
         const self = try gpa.create(JoinedSet);
         errdefer gpa.destroy(self);
@@ -446,6 +449,7 @@ pub const JoinedSet = struct {
             .wire = undefined,
             .joiner = undefined,
             .writers_known = writers_known,
+            .predecessor = predecessor,
             .granted_bits = .{},
             .park_gate = park.ParkGate.arm(be.io, be.stamp.member_position, park.tParkMaxMs(grant.failoverBoundMs(0, 0), park.graceMs(shard.tOwnerMsFromEnv(be.env)))),
             .gate = ring_growth.Gate.init(be.io),

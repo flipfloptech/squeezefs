@@ -1293,6 +1293,30 @@ pub const DataPlane = struct {
     /// After the dismount pass: the write cache holds no record (every
     /// resident promoted or destroyed, every freed grain punched) — the
     /// supervisor may discard it. False with residents kept.
+    /// THE RE-JOIN IN PLACE's data words (charter §5.5 "A live member
+    /// evicted …"; decision 0003 §BO): the first thing this plane holds
+    /// that its home shard's recovery of the evicted incarnation could not
+    /// have landed — acked bytes in RAM or the write cache whose layout
+    /// was never published, a packed tenant between reserve and commit —
+    /// written into `buf`; null = nothing.
+    pub fn unlandedWord(self: *DataPlane, buf: []u8) ?[]const u8 {
+        if (!self.writeCacheDrained()) return "staged residents in the write cache (acked bytes never promoted)";
+        var held: std.ArrayList(u64) = .empty;
+        defer held.deinit(self.gpa);
+        const holders = self.wp.custodyInos(self.gpa, &held) catch return "the write-side custody census could not be listed (out of memory)";
+        if (holders.len != 0) return std.fmt.bufPrint(buf, "write-side custody on {d} ino(s) (acked bytes whose layout was never published)", .{holders.len}) catch "write-side custody";
+        if (self.packer) |*p| if (p.tenantsInFlight() != 0) return "a packed tenant between its reserve and its commit";
+        return null;
+    }
+
+    /// The evicted incarnation's cached views dropped at a re-join in
+    /// place: the read cache's grains (their blocks may have been patched
+    /// in place by the holder that recovered the files; no recall reached
+    /// this mount meanwhile).
+    pub fn dropIncarnationViews(self: *DataPlane) void {
+        self.rp.grains.purgeAll();
+    }
+
     pub fn writeCacheDrained(self: *DataPlane) bool {
         const st = &(self.stage orelse return true);
         return st.seg.live() == 0;

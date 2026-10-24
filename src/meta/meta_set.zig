@@ -131,6 +131,27 @@ pub const MetaSet = struct {
     /// The data path's failure lines (`lineSeam`): one per class once any
     /// member is FAILED.
     line_marks: journal.FailureLatch.LineMarks = .{},
+    /// THE RE-JOIN IN PLACE's inputs (charter §5.5 "A live member evicted
+    /// …"; decision 0003 §BO): the canonical member paths, the backend
+    /// options and the join door this open used — a successor incarnation
+    /// opens through the same door. Empty on every posture but a joiner.
+    rejoin_paths: [][]u8 = &.{},
+    rejoin_opts: backend.OpenOptions = undefined,
+    rejoin_join: backend.JoinOptions = .{ .mountpoint = "" },
+    /// Incarnations a re-join in place retired: closed after the live
+    /// members (a reader that loaded one before the swap reads it still).
+    retired: std.ArrayList(*KvBackend) = .empty,
+    /// Re-joins in place this mount made (`.stats` `meta_rejoins_in_place`).
+    rejoins: u64 = 0,
+    /// The bindings every member's planes carry, re-applied to a
+    /// successor incarnation: the move epoch, the parent memo, the times
+    /// drain, the kernel view and the token recall on its conveyor, the
+    /// supervisor's tail hand-off.
+    bound_moves: ?*routing_slots.moves.Moves = null,
+    bound_memo: ?routing_slots.handover.ParentMemo = null,
+    bound_times_drain: ?routing_slots.handover.TimesDrain = null,
+    bound_kernel: ?*const conveyor.KernelView = null,
+    bound_tokens: ?*const conveyor.TokenHook = null,
 
     // ---- open / close ----
 
@@ -251,6 +272,7 @@ pub const MetaSet = struct {
         errdefer self.route.deinit();
         // A joiner converges nothing: the stamps are the manager's.
         if (!opts.read_only and posture == .manager) try self.convergeDualClaims(disc.dual_claims);
+        if (posture == .joined) try self.keepRejoinInputs(paths, disc.order, opts);
         log.info("metadata set {x:0>2}{x:0>2}{x:0>2}{x:0>2}…: {d} member(s) mounted in canonical order as {s}, epoch {d}, {d} dual claim(s) converged, native keyspace on member {d}", .{ disc.set_uuid[0], disc.set_uuid[1], disc.set_uuid[2], disc.set_uuid[3], paths.len, @tagName(posture), disc.set_epoch, if (posture == .manager) disc.dual_claims.len else 0, disc.native_volume });
         return self;
     }
@@ -291,6 +313,13 @@ pub const MetaSet = struct {
         if (!self.closed) {
             self.closed = true;
             for (self.volumes) |be| be.close();
+            for (self.retired.items) |be| be.close();
+        }
+        self.retired.deinit(gpa);
+        for (self.rejoin_paths) |p| gpa.free(p);
+        if (self.rejoin_paths.len != 0) {
+            gpa.free(self.rejoin_paths);
+            gpa.free(self.rejoin_join.mountpoint);
         }
         if (self.tee) |t| t.deinit();
         self.route.deinit();
@@ -649,6 +678,7 @@ pub const MetaSet = struct {
     /// the slot's SUBTREE"): bound on every member's plane.
     pub fn bindParentMemo(self: *MetaSet, memo: routing_slots.handover.ParentMemo) void {
         if (self.posture == .reader) return;
+        self.bound_memo = memo;
         for (self.volumes) |be| be.slots.bindMemo(memo);
     }
 
@@ -657,6 +687,7 @@ pub const MetaSet = struct {
     /// it holds moves, its move gate re-polls.
     pub fn bindMoves(self: *MetaSet, m: *routing_slots.moves.Moves) void {
         if (self.posture == .reader) return;
+        self.bound_moves = m;
         for (self.volumes) |be| be.slots.table.bindMoves(m);
     }
 
@@ -680,7 +711,104 @@ pub const MetaSet = struct {
     pub fn bindTimesDrain(self: *MetaSet, drain: routing_slots.handover.TimesDrain) void {
         // A `-o ro` reader has no slot plane (nothing it holds moves).
         if (self.posture == .reader) return;
+        self.bound_times_drain = drain;
         for (self.volumes) |be| be.slots.bindTimesDrain(drain);
+    }
+
+    /// The kernel view on every writer's conveyor (decision 0003 §AB.2),
+    /// kept for a successor incarnation; null disarms.
+    pub fn armKernel(self: *MetaSet, view: ?*const conveyor.KernelView) void {
+        if (self.posture == .reader) return;
+        self.bound_kernel = view;
+        for (self.volumes) |be| if (view) |v| be.cv.armKernel(v) else be.cv.disarmKernel();
+    }
+
+    /// The token recall on every member's pass (the wire plane's hook),
+    /// kept for a successor incarnation; null disarms.
+    pub fn armTokens(self: *MetaSet, hook: ?*const conveyor.TokenHook) void {
+        self.bound_tokens = hook;
+        for (self.volumes) |be| if (hook) |h| be.cv.armTokens(h) else be.cv.disarmTokens();
+    }
+
+    // ---- the re-join in place (decision 0003 §BO) ----
+
+    fn keepRejoinInputs(self: *MetaSet, paths: []const []const u8, order: []const usize, opts: OpenOptions) OpenError!void {
+        const gpa = self.gpa;
+        const join = opts.join orelse return;
+        const owned = try gpa.alloc([]u8, paths.len);
+        var n: usize = 0;
+        errdefer {
+            for (owned[0..n]) |p| gpa.free(p);
+            gpa.free(owned);
+        }
+        for (order) |oi| {
+            owned[n] = try gpa.dupe(u8, paths[oi]);
+            n += 1;
+        }
+        const mp = try gpa.dupe(u8, join.mountpoint);
+        self.rejoin_paths = owned;
+        self.rejoin_join = .{ .mountpoint = mp, .endpoint = join.endpoint };
+        self.rejoin_opts = .{ .env = opts.env, .pool = self.pool, .cache_budget_bytes = opts.cache_budget_bytes, .cpus = opts.cpus, .test_error_logs = opts.test_error_logs, .guard = opts.guard };
+    }
+
+    /// The successor incarnations of every member: each volume JOINED
+    /// afresh through the mount's own door (`KvBackend.openJoined` — the
+    /// census, the endpoint poll, `awaitManagerListener`, `JoinAppender`,
+    /// the rotor, the first checkpoint). All or none: a failed open closes
+    /// the ones already opened (a fresh join's clean leave) and answers.
+    pub fn openSuccessors(self: *MetaSet) OpenError![]*KvBackend {
+        return self.openSuccessorsOf(self.volumes);
+    }
+
+    fn openSuccessorsOf(self: *MetaSet, predecessors: []const *KvBackend) OpenError![]*KvBackend {
+        const gpa = self.gpa;
+        if (self.posture != .joined or self.rejoin_paths.len != self.volumes.len) return error.SetRefused;
+        const fresh = try gpa.alloc(*KvBackend, self.volumes.len);
+        var n: usize = 0;
+        errdefer {
+            for (fresh[0..n]) |be| be.close();
+            gpa.free(fresh);
+        }
+        for (self.rejoin_paths, 0..) |p, i| {
+            var o = self.rejoin_opts;
+            o.index = @intCast(i);
+            var j = self.rejoin_join;
+            j.predecessor = if (predecessors[i].joined) |js| js.appenderId() else null;
+            fresh[n] = try KvBackend.openJoined(gpa, self.io, p, o, j);
+            n += 1;
+        }
+        return fresh;
+    }
+
+    /// Publish the successor incarnations (owned slice, freed here): each
+    /// carries every binding its predecessor carried, then replaces it in
+    /// `volumes` — ONE pointer store per member (Release). A reader that
+    /// loaded the predecessor before the store keeps a live object: the
+    /// retired incarnation stays mapped until `close` (it refuses every
+    /// mutation `Deferred` and serves reads off the state its home shard
+    /// recovered).
+    pub fn publishSuccessors(self: *MetaSet, fresh: []*KvBackend) Allocator.Error!void {
+        const gpa = self.gpa;
+        defer gpa.free(fresh);
+        try self.retired.ensureUnusedCapacity(gpa, fresh.len);
+        for (fresh, 0..) |be, i| {
+            const old = self.volumes[i];
+            if (self.bound_moves) |m| be.slots.table.bindMoves(m);
+            if (self.bound_memo) |m| be.slots.bindMemo(m);
+            if (self.bound_times_drain) |d| be.slots.bindTimesDrain(d);
+            if (self.bound_kernel) |v| be.cv.armKernel(v);
+            if (self.bound_tokens) |h| be.cv.armTokens(h);
+            be.tail_announce = old.tail_announce;
+            if (be.tail_announce) |a| if (be.tail) |t| {
+                if (!a.announce(a.ctx, be.index, t.fd)) log.warn("meta volume {s}: the successor incarnation's journal tail could not be handed to the supervisor — a crash of this process has the flush-window exposure on it", .{be.path});
+            };
+            // The token recall leaves the predecessor's pass (its batches
+            // refuse at the latch before they recall anything).
+            old.cv.disarmTokens();
+            @atomicStore(*KvBackend, &self.volumes[i], be, .release);
+            self.retired.appendAssumeCapacity(old);
+        }
+        self.rejoins += 1;
     }
 
     /// The one closed cutover slot across the members, if any.
@@ -736,7 +864,7 @@ pub const MetaSet = struct {
 
     /// The set-level words + every member's per-volume families.
     pub fn writeStatsJson(self: *MetaSet, w: *Io.Writer) Io.Writer.Error!void {
-        try w.print("{{\"routing_volumes\":{d},\"routing_width\":{d},\"routing_set_epoch\":{d},\"routing_closed_slot\":{?d},\"mount_posture\":\"{s}\",\"volumes\":[", .{ self.volumes.len, route_table.W, self.setEpoch(), self.closedSlot(), @tagName(self.posture) });
+        try w.print("{{\"routing_volumes\":{d},\"routing_width\":{d},\"routing_set_epoch\":{d},\"routing_closed_slot\":{?d},\"mount_posture\":\"{s}\",\"meta_rejoins_in_place\":{d},\"volumes\":[", .{ self.volumes.len, route_table.W, self.setEpoch(), self.closedSlot(), @tagName(self.posture), self.rejoins });
         for (self.volumes, 0..) |be, i| {
             if (i != 0) try w.writeByte(',');
             try w.print("{{\"index\":{d},\"epoch\":{d},\"hosted_slots\":{d},\"trees\":{d},\"native\":{},\"failed\":{},\"conveyor\":", .{ i, be.setEpoch(), be.stamp.hostedCount(), be.trees.load().len, be.stamp.native_slot != null, be.isFailed() });

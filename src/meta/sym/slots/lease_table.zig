@@ -920,7 +920,16 @@ pub fn settleEntry(tree0: ?cr.SlotState, entry: page.SlotEntry, page_owner: Appe
 /// row loads `unleased` (its words the cold floor): a first touch asks the
 /// manager, the live truth. Every other row is the projection verbatim.
 pub fn joinedProjectionRow(row: cr.SlotState, me: AppenderId) cr.SlotState {
-    if (row.variant == .unleased or row.appender_id != me) return row;
+    return joinedProjectionRowOf(row, &.{me});
+}
+
+/// The law over every id of this mount's identity on the volume: the
+/// joiner's own and, at a re-join in place (decision 0003 §BO), its
+/// evicted predecessor's — whose region the manager recovered, so every
+/// slot the projection still names it the lessee of is the manager's
+/// truth to ask.
+pub fn joinedProjectionRowOf(row: cr.SlotState, selves: []const AppenderId) cr.SlotState {
+    if (row.variant == .unleased or std.mem.indexOfScalar(AppenderId, selves, row.appender_id) == null) return row;
     var s = row;
     s.variant = .unleased;
     s.appender_id = MANAGER;

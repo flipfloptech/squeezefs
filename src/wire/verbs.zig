@@ -1061,6 +1061,11 @@ pub const GrantPageHead = extern struct {
     holder: u32,
     attrs: InodeValueWire,
     reserved2: [4]u8,
+    /// The holder's size epoch of the object (`DataPlane.sizeEpoch`), read
+    /// BEFORE the records: a joiner's write carries it on its size claim
+    /// (`SetattrWire.claim_epoch`) and the holder refuses a claim under an
+    /// older epoch — a truncate crossed the write. 0 = none.
+    size_epoch: u64 = 0,
 
     pub fn check(self: GrantPageHead) bool {
         if (self.flags & PAGE_HAS_DIR != 0 and self.flags & PAGE_HAS_MAP != 0) return false;
@@ -1627,11 +1632,16 @@ pub const SetattrWire = extern struct {
     ctime: i64,
     flags: u32,
     reserved: u32,
+    /// With `SETATTR_SIZE_CLAIM`: the holder's size epoch the claimer's
+    /// token page carried when its write read the size (0 = none, never
+    /// judged); the holder refuses a claim under an older epoch.
+    claim_epoch: u64 = 0,
 
-    pub const none: SetattrWire = .{ .valid = 0, .mode = 0, .uid = 0, .gid = 0, .size = 0, .atime = 0, .mtime = 0, .ctime = 0, .flags = 0, .reserved = 0 };
+    pub const none: SetattrWire = .{ .valid = 0, .mode = 0, .uid = 0, .gid = 0, .size = 0, .atime = 0, .mtime = 0, .ctime = 0, .flags = 0, .reserved = 0, .claim_epoch = 0 };
 
     pub fn check(self: SetattrWire) bool {
         if (self.valid & SETATTR_SIZE_CLAIM != 0 and self.valid & SETATTR_SIZE == 0) return false;
+        if (self.claim_epoch != 0 and self.valid & SETATTR_SIZE_CLAIM == 0) return false;
         return self.valid & ~SETATTR_KNOWN == 0 and self.reserved == 0;
     }
 };

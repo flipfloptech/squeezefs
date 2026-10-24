@@ -98,7 +98,9 @@ pub const MoveAttempt = struct {
     /// re-runs the claim alone — the payload is never admitted twice.
     write_landed: ?WriteLanded = null,
 
-    pub const WriteLanded = struct { size_claim: u64, written: u64 };
+    /// `size_epoch`: a foreign-slot write's holder size epoch, read off its
+    /// token before its size (the claim carries it; 0 = none).
+    pub const WriteLanded = struct { size_claim: u64, written: u64, size_epoch: u64 = 0 };
 
     pub const OpenIntent = struct {
         home: u64,

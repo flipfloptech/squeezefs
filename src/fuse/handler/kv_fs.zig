@@ -442,6 +442,10 @@ pub const Options = struct {
     /// `SQUEEZEFS_TEST_WRITE_POSTLUDE_HOLD`: a striped write parks inside
     /// its postlude's `I{ino}` section until `write_hold_release` fires.
     write_postlude_hold: bool = false,
+    /// `SQUEEZEFS_TEST_FOREIGN_CLAIM_HOLD`: the mount's first foreign-slot
+    /// write parks between its publish and its claim until a writer opens
+    /// this FIFO (null = no hold).
+    foreign_claim_hold: ?[]const u8 = null,
     /// `SQUEEZEFS_TEST_PROMOTE_KILL_AFTER_COMMIT`: the daemon SIGKILLs
     /// itself between a staged file's promotion commit and its ring release.
     promote_kill_after_commit: bool = false,
@@ -647,6 +651,9 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         /// BEFORE its postlude's `I{ino}` guard until `write_hold_release`
         /// fires (the window a size-setting commit crosses whole).
         write_hold_pre_guard: bool = false,
+        /// `Options.foreign_claim_hold`; `foreign_claim_held` once it held.
+        foreign_claim_hold: ?[]const u8 = null,
+        foreign_claim_held: std.atomic.Value(bool) = .init(false),
         /// `Options.promote_kill_after_commit` (`promoteToStriped`).
         promote_kill_after_commit: bool,
         /// Test seam: the times drain parks between its claims snapshot and
@@ -756,6 +763,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 .pending = try economy.PendingTimes.init(gpa),
                 .times_park = opts.times_park,
                 .write_hold = opts.write_postlude_hold,
+                .foreign_claim_hold = opts.foreign_claim_hold,
                 .promote_kill_after_commit = opts.promote_kill_after_commit,
                 .locks = undefined,
                 .uid = opts.uid,
@@ -4155,7 +4163,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         fn shipSizeClaim(self: *Self, c: *Ctx, local: u64, wl: filesystem.MoveAttempt.WriteLanded) Error!filesystem.Written {
             if (c.move) |m| m.write_landed = null;
             const stamp = now();
-            const rep = self.shipRecord(globalOf(local), .{ .setattr = .{ .size = wl.size_claim, .size_claim = true, .mtime = stamp, .ctime = stamp } }) catch |e| {
+            const rep = self.shipRecord(globalOf(local), .{ .setattr = .{ .size = wl.size_claim, .size_claim = true, .claim_epoch = wl.size_epoch, .mtime = stamp, .ctime = stamp } }) catch |e| {
                 if (errors.isMoveClass(e)) if (c.move) |m| {
                     m.write_landed = wl;
                 };
@@ -4223,6 +4231,11 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 fuse_write_u32_index_refused.inc();
                 return error.FileTooBig;
             }
+            // A foreign-slot file's holder size epoch, off the token BEFORE
+            // the size below: the claim carries it, and the holder refuses
+            // the claim if a size set landed there since (a truncate crossed
+            // this write).
+            const claim_epoch = if (self.foreignSlot(globalOf(local))) try self.foreignSizeEpoch(local) else 0;
             const probe = try self.readInode(local);
             try self.refuseWriteOn(probe, local, a);
             if (probe.mode & S.IFMT != S.IFREG) return error.InvalidArgument;
@@ -4248,7 +4261,8 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             if (self.foreignSlot(globalOf(local))) {
                 self.data.flushCustody(self.io, local);
                 try self.data.barrierData(self.io, &.{local});
-                return self.shipSizeClaim(c, local, .{ .size_claim = outcome.size_claim, .written = outcome.written });
+                if (self.foreign_claim_hold) |path| if (!self.foreign_claim_held.swap(true, .acq_rel)) holdClaimOnFifo(self.io, local, path);
+                return self.shipSizeClaim(c, local, .{ .size_claim = outcome.size_claim, .written = outcome.written, .size_epoch = claim_epoch });
             }
             // The claim this write parked (0 = none): a foreign member's
             // grant must see it before the ack (`landIfWatched`).
@@ -4583,6 +4597,26 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         /// own op context.
         pub fn servedTruncateFace(self: *Self) sym_xv.record_ship.TruncateFace {
             return .{ .ctx = self, .truncate = &servedTruncate };
+        }
+
+        /// The holder's size epoch a foreign-slot file's token page carried
+        /// (0 = no page: the claim is never judged).
+        fn foreignSizeEpoch(self: *Self, local: u64) Error!u64 {
+            const served = (try self.tokenServe(local, .{})) orelse return 0;
+            defer served.release(self.io);
+            const e = served.entry orelse return 0;
+            return e.size_epoch;
+        }
+
+        /// `SQUEEZEFS_TEST_FOREIGN_CLAIM_HOLD`: park until a writer opens
+        /// `path` (the test's release).
+        fn holdClaimOnFifo(io: Io, local: u64, path: []const u8) void {
+            log.info("foreign write of ino {d}: SQUEEZEFS_TEST_FOREIGN_CLAIM_HOLD — holding between its publish and its claim until a writer opens {s}", .{ local, path });
+            const f = Io.Dir.cwd().openFile(io, path, .{}) catch |e| {
+                log.warn("foreign write of ino {d}: the claim hold could not open {s} ({t}); not holding", .{ local, path, e });
+                return;
+            };
+            f.close(io);
         }
 
         fn servedTruncate(ctx: *anyopaque, global: u64, size: u64) errors.Error!void {

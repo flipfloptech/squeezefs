@@ -61,6 +61,10 @@ pub const PrepareSeam = struct {
     /// then runs `run` again, registered. Read under the state's own lock
     /// (the pairing), never off a racy fast path.
     pending: ?*const fn (ctx: *anyopaque, object: Object) bool = null,
+    /// The holder's size epoch of the object, read BEFORE the page's
+    /// records (`GrantPageHead.size_epoch`): a truncate after the read
+    /// makes a claim under it stale, never the reverse.
+    size_epoch: ?*const fn (ctx: *anyopaque, object: Object) u64 = null,
 };
 
 // ---------------------------------------------------------------------------
@@ -1277,6 +1281,9 @@ pub const Holder = struct {
     /// xattr set is complete — the dentries strictly after cookie `after`.
     /// Null = the object is absent.
     fn buildPage(self: *Holder, ask: GrantAsk, source: RecordSource, scratch: []u8) Error!?Page {
+        // The size epoch FIRST: a size set between it and the records only
+        // makes a claim under it look stale (refused, never a regrowth).
+        const size_epoch: u64 = if (self.prepare) |p| (if (p.size_epoch) |f| f(p.ctx, ask.object) else 0) else 0;
         const v = (try source.inode(source.ctx, ask.object)) orelse return null;
         var arena_state = std.heap.ArenaAllocator.init(self.gpa);
         defer arena_state.deinit();
@@ -1347,7 +1354,7 @@ pub const Holder = struct {
         }
         const attrs: verbs.InodeValueWire = std.mem.bytesToValue(verbs.InodeValueWire, &v.encode());
         return .{
-            .head = .{ .kind = @backingInt(verbs.GrantPageKind.granted), .flags = flags, .reserved = 0, .n_xattrs = n_xattrs, .n_dir = n_dir, .holder = 0, .attrs = attrs, .reserved2 = @splat(0) },
+            .head = .{ .kind = @backingInt(verbs.GrantPageKind.granted), .flags = flags, .reserved = 0, .n_xattrs = n_xattrs, .n_dir = n_dir, .holder = 0, .attrs = attrs, .reserved2 = @splat(0), .size_epoch = size_epoch },
             .xattrs_bytes = xb.written(),
             .dir_bytes = db.written(),
         };

@@ -3711,6 +3711,65 @@ fn alternatingAppendRow(write_cache: bool) !void {
     std.debug.print("smoke: alternating appends ({s}): eight rounds of B then A on both files byte-exact through both mounts at once and after both remount; A's watched landings {d}; fsck clean; no tripwire\n", .{ if (write_cache) "supervised" else "foreground", landings });
 }
 
+test "smoke: A HOLDER'S TRUNCATE BETWEEN A JOINER'S PUBLISH AND ITS CLAIM WINS — A (the manager) + B JOINED under SQUEEZEFS_TEST_FOREIGN_CLAIM_HOLD, no write cache: A holds `own/f` (6 MiB, synced); B writes 4 KiB at 5 MiB and parks between its publish and its size claim; A truncates `f` to 1 MiB; B's claim then lands — the truncate wins: `f` is 1 MiB on both mounts and A's first MiB byte-exact (red before: `max(size, claim)` regrew it to 5 MiB + 4 KiB over the clipped block and A's truncated tail); a truncate-up to 6 MiB reads zeros past the cut; fsck --offline --scrub 0 findings" {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    try rig.env.put("SQUEEZEFS_MW_BIND", "127.0.0.1:0");
+    try rig.formatSet(false);
+    try rig.mountAsSet(&.{});
+    _ = try rig.awaitReady(0);
+    var fb: [256]u8 = undefined;
+    const fifo = try std.fmt.bufPrint(&fb, "{s}/claim.fifo", .{rig.work});
+    rig.freeRunOk(try rig.sh(rig.work, "mkfifo claim.fifo"));
+    var env_b = try envWith(gpa, &rig.env, &.{.{ "SQUEEZEFS_TEST_FOREIGN_CLAIM_HOLD", fifo }});
+    defer env_b.deinit();
+    const b = try Peer.init(rig, "b");
+    defer b.deinit();
+    b.env = &env_b;
+    try b.spawnAsSet(&.{});
+    _ = try b.awaitReady();
+    {
+        const out = try rig.onMount("m=\"$1/m\"; mkdir own \"$m\"; head -c 6291456 /dev/urandom > \"$m/f\"; cp \"$m/f\" own/f; sync -d own/f; head -c 1048576 \"$m/f\" > \"$m/cut\"; cp \"$m/cut\" \"$m/grown\"; truncate -s 6291456 \"$m/grown\"; echo ok");
+        defer gpa.free(out);
+        try testing.expectEqualStrings("ok\n", out);
+    }
+    const mark = try b.logLen();
+    var writer = try std.process.spawn(io, .{ .argv = &.{ "sh", "-e", "-c", "head -c 4096 /dev/urandom | dd of=own/f bs=4096 seek=$((5 * 1048576)) oflag=seek_bytes conv=notrunc status=none" }, .cwd = .{ .path = b.mp }, .environ_map = &rig.env, .stdin = .ignore });
+    _ = try b.awaitLog("SQUEEZEFS_TEST_FOREIGN_CLAIM_HOLD — holding", mark, ready_wait_ns);
+    {
+        const out = try rig.onMount("truncate -s 1048576 own/f && echo ok");
+        defer gpa.free(out);
+        try testing.expectEqualStrings("ok\n", out);
+    }
+    {
+        const f = try Io.Dir.cwd().openFile(io, fifo, .{ .mode = .write_only });
+        f.close(io);
+    }
+    _ = try writer.wait(io);
+    var jb: [512]u8 = undefined;
+    const script = try std.fmt.bufPrint(&jb, "for d in . \"{s}\"; do echo \"$(stat -c %s \"$d/own/f\") $(cmp -s \"$d/own/f\" \"$1/m/cut\" && echo same || echo differs)\"; done", .{b.mp});
+    const out = try rig.onMount(script);
+    defer gpa.free(out);
+    if (!std.mem.eql(u8, out, "1048576 same\n1048576 same\n")) {
+        std.debug.print("\n--- after the truncate crossed B's claim (size, content per mount A, B):\n{s}", .{out});
+        return error.StaleClaimRegrewTheFile;
+    }
+    {
+        const grown = try rig.onMount("truncate -s 6291456 own/f && cmp own/f \"$1/m/grown\" && echo zeros");
+        defer gpa.free(grown);
+        try testing.expectEqualStrings("zeros\n", grown);
+    }
+    try b.umount();
+    try b.expectCleanExit("B's clean unmount after the refused claim");
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+    _ = try fsckClean(rig, "the claim-epoch row");
+    std.debug.print("smoke: claim epoch: A's truncate crossed B's claim and won (1 MiB on both mounts, zeros past the cut after a grow); fsck clean\n", .{});
+}
+
 /// The foreign-write row (A JOINED MEMBER'S APPEND …) in one posture: A's
 /// files and their mirror in the work dir, B's writes applied to both, the
 /// mounts judged against the mirror before and after both remount.

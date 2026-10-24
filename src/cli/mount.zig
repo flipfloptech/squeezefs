@@ -525,6 +525,7 @@ fn mountMain(ctx: *Ctx) u8 {
         .gid = ctx.opts.gid,
         .times_park = flush_interval_ms != 0,
         .write_postlude_hold = knobs.boolKnob("SQUEEZEFS_TEST_WRITE_POSTLUDE_HOLD", env),
+        .foreign_claim_hold = claimHoldPath(env),
         .promote_kill_after_commit = knobs.boolKnob("SQUEEZEFS_TEST_PROMOTE_KILL_AFTER_COMMIT", env),
     }) catch return ctx.failed("out of memory mounting the filesystem", .{});
     defer fs.unmount();
@@ -593,7 +594,7 @@ fn mountMain(ctx: *Ctx) u8 {
         // first: the write cache's residents promoted, every other write
         // custody landed and its size claim journaled (charter §6.1
         // coherence; `KvFs.landForGrant`).
-        wp.holder.prepare = .{ .ctx = &fs, .run = &landForGrant, .pending = &grantPending };
+        wp.holder.prepare = .{ .ctx = &fs, .run = &landForGrant, .pending = &grantPending, .size_epoch = &grantSizeEpoch };
         // ... and this mount's own extending write on an object a member
         // holds a grant on lands before its ack (register-then-check's
         // writer half, `KvFs.landIfWatched`).
@@ -1179,6 +1180,18 @@ fn landForGrant(ctx: *anyopaque, _: Io, object: u64) void {
     const fs: *BackendFs = @ptrCast(@alignCast(ctx));
     fs.data.recallResidents(object);
     fs.landForGrant(object);
+}
+
+/// `PrepareSeam.size_epoch`: the holder's size epoch of the object.
+fn grantSizeEpoch(ctx: *anyopaque, object: u64) u64 {
+    const fs: *BackendFs = @ptrCast(@alignCast(ctx));
+    return fs.data.size_epochs.current(object);
+}
+
+/// `SQUEEZEFS_TEST_FOREIGN_CLAIM_HOLD` (a FIFO path; unset or `off` = none).
+fn claimHoldPath(env: *const std.process.Environ.Map) ?[]const u8 {
+    const raw = knobs.parseStr(env.get("SQUEEZEFS_TEST_FOREIGN_CLAIM_HOLD")) orelse return null;
+    return if (std.mem.eql(u8, raw, "off")) null else raw;
 }
 
 /// `PrepareSeam.pending`: a claim parked since the landing above.

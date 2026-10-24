@@ -62,6 +62,9 @@ pub const stats = struct {
     /// Served write size claims (`SETATTR_SIZE_CLAIM`: the size raised to
     /// `max(size, claim)`, no size path run).
     pub var record_size_claims: counters.ShardedCounter = .{};
+    /// Served claims refused: made under an older size epoch than a size
+    /// set that landed here since (`TruncateFace.stale_claim`).
+    pub var record_size_claims_refused: counters.ShardedCounter = .{};
     /// Shipped setattrs that carried KILLPRIV_V2's bit: the holder stripped
     /// the setid bits (and the caps xattr) in the verb's tx.
     pub var record_killpriv_strips: counters.ShardedCounter = .{};
@@ -114,12 +117,18 @@ pub const Setattr = struct {
     /// `size` is a non-holder WRITE's claim (`verbs.SETATTR_SIZE_CLAIM`):
     /// the holder raises the record's size to it, never runs its size path.
     size_claim: bool = false,
+    /// With `size_claim`: the holder's size epoch the claimer's write read
+    /// its size under (0 = none).
+    claim_epoch: u64 = 0,
 
     pub fn toWire(self: Setattr) verbs.SetattrWire {
         var w: verbs.SetattrWire = .none;
         if (self.kill_suidgid) w.valid |= verbs.SETATTR_KILL_SUIDGID;
         if (self.atime_touch) w.valid |= verbs.SETATTR_ATIME_TOUCH;
-        if (self.size_claim and self.size != null) w.valid |= verbs.SETATTR_SIZE_CLAIM;
+        if (self.size_claim and self.size != null) {
+            w.valid |= verbs.SETATTR_SIZE_CLAIM;
+            w.claim_epoch = self.claim_epoch;
+        }
         if (self.mode) |v| {
             w.valid |= verbs.SETATTR_MODE;
             w.mode = v;
@@ -168,6 +177,7 @@ pub const Setattr = struct {
             .kill_suidgid = w.valid & verbs.SETATTR_KILL_SUIDGID != 0,
             .atime_touch = w.valid & verbs.SETATTR_ATIME_TOUCH != 0,
             .size_claim = w.valid & verbs.SETATTR_SIZE_CLAIM != 0,
+            .claim_epoch = w.claim_epoch,
         };
     }
 };
@@ -213,6 +223,12 @@ pub const Reply = struct {
 pub const TruncateFace = struct {
     ctx: *anyopaque,
     truncate: *const fn (ctx: *anyopaque, global: u64, size: u64) errors.Error!void,
+    /// A write's claim made under the holder's size epoch `epoch`: true
+    /// iff a size-setting commit landed here since — the claim is REFUSED,
+    /// and the face has run its size path at the current size, clipping
+    /// any block the claimer's late publish bound past it (the truncate
+    /// wins: "write, then truncate"). Null = no claim is judged.
+    stale_claim: ?*const fn (ctx: *anyopaque, global: u64, epoch: u64) errors.Error!bool = null,
 };
 
 pub const ShipError = error{ OutOfMemory, SlotMoved, HolderUnreachable, Deferred, Io, Rejected, ValueTooLarge, NoAttribute };
@@ -495,6 +511,17 @@ pub fn RecordShipService(comptime Store: type) type {
                     else => error.Io,
                 };
             };
+            // A claim under an older epoch than the holder's last size set
+            // is refused (the face clipped at the current size).
+            var claim_refused = false;
+            if (call == .setattr and call.setattr.size_claim and call.setattr.claim_epoch != 0) {
+                const face = self.truncate.load(.acquire) orelse return error.Rejected;
+                if (face.stale_claim) |stale| claim_refused = stale(face.ctx, global, call.setattr.claim_epoch) catch |e| return switch (e) {
+                    error.OutOfMemory => error.OutOfMemory,
+                    error.SlotMoved => error.SlotMoved,
+                    else => error.Io,
+                };
+            }
             const a = &self.plane.apply;
             const k = route_table.effectiveIno(global);
             var v = (a.readInode(global) catch return error.Io) orelse return error.Io;
@@ -545,8 +572,9 @@ pub fn RecordShipService(comptime Store: type) type {
                     // zeros would land over [size, claim), the claimer's own
                     // bytes (a joiner's `>>` read back zeros on both
                     // mounts); a claim at or below the size moves nothing.
-                    if (s.size) |sz| v.size = if (s.size_claim) @max(v.size, sz) else sz;
+                    if (s.size) |sz| v.size = if (!s.size_claim) sz else if (claim_refused) v.size else @max(v.size, sz);
                     if (s.size_claim) stats.record_size_claims.inc();
+                    if (claim_refused) stats.record_size_claims_refused.inc();
                     if (s.atime) |x| v.atime = x;
                     if (s.mtime) |x| v.mtime = x;
                     // The attribute bits alone: STRIPE is the format's.

@@ -241,6 +241,8 @@ pub const Entry = struct {
     arena: std.heap.ArenaAllocator,
     object: Object,
     attrs: record.InodeValue,
+    /// The holder's size epoch the page carried (`GrantPageHead.size_epoch`).
+    size_epoch: u64 = 0,
     /// Sorted by name (the holder pages them in name order).
     xattrs: []Xattr,
     xattrs_complete: bool,
@@ -912,6 +914,7 @@ pub const Reader = struct {
             stats.dlm_token_grants.inc();
             if (first) {
                 e.attrs = record.InodeValue.decode(&std.mem.toBytes(page.head.attrs)) catch return error.Wire;
+                e.size_epoch = page.head.size_epoch;
                 first = false;
             }
             var carried: usize = 0;

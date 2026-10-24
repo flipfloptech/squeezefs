@@ -3273,9 +3273,7 @@ test "smoke: A BIND OF THE MOUNT IS THE KERNEL'S, NEVER THE DAEMON'S TO STOP (xf
     try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.umount2(bind.ptr, 0)));
     _ = try fsckClean(rig, "(c) the orderly stop with the bind alive");
     // ---- (d) a mount stacked INSIDE the tree survives a member's join and its changes ----
-    // A fresh set: a member cannot join a set whose manager has remounted
-    // (`cannot open metadata set … device I/O failed`, open on dev; not this row's law).
-    try rig.formatSet(true);
+    // The manager's fourth incarnation: B joins it (the join after a remount).
     const sub = try std.fmt.allocPrintSentinel(gpa, "{s}/sub", .{rig.mp}, 0);
     defer gpa.free(sub);
     const mark_d = try rig.logLen();

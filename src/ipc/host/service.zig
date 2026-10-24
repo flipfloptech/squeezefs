@@ -488,7 +488,7 @@ pub const DataPlaneSink = struct {
         waiting: Waiting = .{},
     };
 
-    /// The handoffs every lane refused (decision 0003 §BR): they WAIT here
+    /// The handoffs every lane refused (decision 0003 §BU): they WAIT here
     /// for a fiber slot and are re-offered at each of the owner's flushes
     /// (its park is bounded, `SERVICE_PARK_MAX_NS`, while its sessions
     /// live; a teardown kicks it). Pushed from any thread — a direct-drive

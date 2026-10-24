@@ -76,7 +76,7 @@ pub const stats = struct {
     pub var ipc_write_handoffs: counters.ShardedCounter = .{};
     /// Handoffs every FUSE-class lane refused (every fiber slot busy): the
     /// op WAITS in its owner's queue and runs at a later flush — a read or
-    /// write on a regular file never answers EAGAIN (decision 0003 §BR).
+    /// write on a regular file never answers EAGAIN (decision 0003 §BU).
     pub var ipc_handoff_waits: counters.ShardedCounter = .{};
     /// Waiting handoffs answered without running: past the fail-stop
     /// lattice's bound (EIO), or their session torn down (EIO, nobody

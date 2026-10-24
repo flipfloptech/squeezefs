@@ -60,6 +60,7 @@ const counters = @import("../../core/counters.zig");
 const knobs = @import("../../core/knobs.zig");
 const clock = @import("../../core/clock.zig");
 const log = @import("../../core/log.zig");
+const thread_name = @import("../../core/thread_name.zig");
 const sync_tick = @import("../../sync/tick.zig");
 const errors = @import("../../core/errors.zig");
 const checksum = @import("../../core/checksum.zig");
@@ -214,19 +215,76 @@ const DeathFanout = struct {
     }
 };
 
+/// The offers a grant carried, held for the follower: accepting one is
+/// `AcquireSlot` over the wire and the slot's install — never the beat's.
+const OfferQueue = struct {
+    lock: Io.Mutex = .init,
+    items: [CAP]Offer = undefined,
+    len: usize = 0,
+
+    /// Two grants' worth of the carriage's cap.
+    const CAP = 2 * shard.CARRIAGE_MAX;
+    const Offer = struct { slot: u16, holder: u32 };
+
+    /// False when full (the offer is dropped, as a failed accept is).
+    fn push(self: *OfferQueue, io: Io, o: Offer) bool {
+        self.lock.lockUncancelable(io);
+        defer self.lock.unlock(io);
+        if (self.len == CAP) return false;
+        self.items[self.len] = o;
+        self.len += 1;
+        return true;
+    }
+
+    /// Every queued offer moved into `out`, in grant order.
+    fn take(self: *OfferQueue, io: Io, out: *[CAP]Offer) []const Offer {
+        self.lock.lockUncancelable(io);
+        defer self.lock.unlock(io);
+        const n = self.len;
+        @memcpy(out[0..n], self.items[0..n]);
+        self.len = 0;
+        return out[0..n];
+    }
+};
+
 /// The joined half's state (charter §5.7 "a later RW mount JOINS it"):
 /// this mount as a MEMBER of its home shard — the join with its own
-/// endpoint, the heartbeat thread at the renew cadence (`T_self` is the
-/// member's own clock: the ticks never wait on anything else), the park
-/// gate's clocks from the grant, the endpoint published to the manager's
-/// RAM table, the self-lease the divert reads.
+/// endpoint, the park gate's clocks from the grant, the endpoint published
+/// to the manager's RAM table, the self-lease the divert reads, and two
+/// threads. The BEAT renews at the cadence (parked, it reclaims) and waits
+/// on nothing else: `T_self` is the member's own clock, and its home shard
+/// evicts at `T_owner` only a member that stopped renewing. The FOLLOWER
+/// owns every other wire duty — the census pull, a reclaim's re-point and
+/// re-publication, the set-config learn, a carried offer's accept — each
+/// bounded only by the dialer's reply bound (10 s, against the smoke's 3 s
+/// `T_owner`): on the beat, one slow call to a freshly remounted manager
+/// cost the LIVE member its lease (its committers parked at `T_self`, the
+/// manager evicted it at `T_owner`, the reclaim met `UnknownLease`: the
+/// kill matrix's double park, 2026-10-24).
 const JoinedHalf = struct {
     plane: *WirePlane,
     js: *joined.JoinedSet,
     member: shard.Member,
     poison: Poison,
     beat: std.Thread = undefined,
+    follower: std.Thread = undefined,
     stop: std.atomic.Value(bool) = .init(false),
+    /// Reclaims the beat landed (monotone): the follower re-points and
+    /// re-publishes once per count it has not handled. The beat's Release
+    /// increment pairs with the follower's Acquire load, which then reads
+    /// `rejoin_epoch`.
+    rejoins: std.atomic.Value(u64) = .init(0),
+    rejoin_epoch: std.atomic.Value(u64) = .init(0),
+    /// Grants the beat learnt (renewals and reclaims; monotone) and the
+    /// set-config generation the last one carried: the follower compares
+    /// once per grant (the cadence of a pull's retry). Release on the
+    /// count pairs with the follower's Acquire, which then reads the word.
+    grants: std.atomic.Value(u64) = .init(0),
+    granted_generation: std.atomic.Value(u64) = .init(0),
+    /// The slot plane's carriage: release notices land on the beat (a
+    /// local cache eviction), offers through `offers` on the follower.
+    slots_carriage: shard.CarriageSink,
+    offers: OfferQueue = .{},
     /// The last tick's verdict class for `.stats` (0 idle, 1 renewed, 2
     /// parked, 3 fenced, 4 rejoined).
     last_verdict: std.atomic.Value(u8) = .init(0),
@@ -237,12 +295,12 @@ const JoinedHalf = struct {
     /// The declaration's frame bytes for the member's next renewal (the
     /// member borrows them for the call on this thread).
     decl_buf: []u8,
-    /// The owner's census as this member sees it: pulled by the beat once
-    /// per renew interval, read by the token lease oracle and the parked
-    /// guard scopes' sweep for every member but the manager (whose word is
-    /// this member's own lease).
+    /// The owner's census as this member sees it: pulled by the follower
+    /// once per renew interval, read by the token lease oracle and the
+    /// parked guard scopes' sweep for every member but the manager (whose
+    /// word is this member's own lease).
     census: membership.census_view.CensusView,
-    /// The members the last census commit retired (the beat's buffer).
+    /// The members the last census commit retired (the follower's buffer).
     departed: std.ArrayList(membership.census_view.Departure) = .empty,
     /// `SQUEEZEFS_TEST_MEMBERSHIP_BEAT_HOLD`: the FIFO path the beat parks
     /// on ONCE — at the first tick that finds the path present — until a
@@ -250,10 +308,9 @@ const JoinedHalf = struct {
     /// serves). Null = no hold.
     beat_hold: ?[]const u8 = null,
     beat_held: bool = false,
-    /// `SQUEEZEFS_TEST_MEMBERSHIP_FOLLOW_HOLD`: the FIFO path the member's
-    /// follow-up (its wire duties besides the renewal) parks on ONCE.
-    /// Null = no hold. `follow_held` is the unit rig's word that the hold
-    /// began (Release here, its Acquire there).
+    /// `SQUEEZEFS_TEST_MEMBERSHIP_FOLLOW_HOLD`: the FIFO path the follower
+    /// parks on ONCE. Null = no hold. `follow_held` is the unit rig's word
+    /// that the hold began (Release here, its Acquire there).
     follow_hold: ?[]const u8 = null,
     follow_held: std.atomic.Value(bool) = .init(false),
 
@@ -263,13 +320,14 @@ const JoinedHalf = struct {
     /// the daemon's slower cadences.
     const TICK_MS: u64 = 80;
 
+    /// The beat: the renewal (parked, the reclaim) and the park's expiry —
+    /// no other wire call, so nothing but the renewal's own round trip
+    /// stands between two renewals.
     fn run(self: *JoinedHalf) void {
-        var name_buf: @import("../../core/thread_name.zig").CommBuf = undefined;
-        _ = @import("../../core/thread_name.zig").nameCurrentThread(&name_buf, "sqz-member");
+        var name_buf: thread_name.CommBuf = undefined;
+        _ = thread_name.nameCurrentThread(&name_buf, "sqz-member");
         while (!self.stop.load(.acquire)) {
             self.holdBeatIfArmed();
-            self.holdFollowIfArmed();
-            self.pullCensusIfDue();
             // The windows this writer holds ride the renewal (charter §5.5):
             // refreshed every beat from the writer plane once it is armed.
             if (self.windows.load(.acquire)) |wp| {
@@ -291,28 +349,83 @@ const JoinedHalf = struct {
                 // Terminal: the poison latched the volumes FAILED.
                 return;
             }
-            // A reclaim admitted by a SUCCESSOR manager: its grant table
-            // is fresh, so every token this mount holds from holder 0 is
-            // unproven — the plane re-points (every token dropped, the
-            // channel fail-closed until a round completes) before the held
-            // acks drain into writes the successor never recalled.
-            if (v == .rejoined) {
-                _ = self.plane.divert.repoint(self.plane.io, MANAGER_HOLDER, MANAGER_HOLDER);
-                // The successor's RAM endpoint table is fresh: this
-                // listener is published again under the same appender id
-                // (what the successor's divert and step sessions dial).
-                _ = self.plane.publishToManager();
-                log.info("cluster wire: the home shard's successor at {f} admitted the reclaim (epoch {d}) — the manager's token plane re-pointed, this listener re-published", .{ self.js.managerEndpoint(), self.member.epoch });
+            if (v == .renewed or v == .rejoined) {
+                self.granted_generation.store(self.member.config_generation, .monotonic);
+                _ = self.grants.fetchAdd(1, .release);
             }
+            if (v == .rejoined) {
+                self.rejoin_epoch.store(self.member.epoch, .monotonic);
+                _ = self.rejoins.fetchAdd(1, .release);
+            }
+            _ = self.js.park_gate.expireIfDue(clock.monotonicNs(), self.poison.sink());
+            sleepTick();
+        }
+    }
+
+    /// A plain OS thread of the daemon's own: the kernel's sleep, never an
+    /// `Io` handle (the lanes' timers are the lanes').
+    fn sleepTick() void {
+        const ts: linux.timespec = .{ .sec = 0, .nsec = @intCast(TICK_MS * std.time.ns_per_ms) };
+        _ = linux.nanosleep(&ts, null);
+    }
+
+    /// The follower: the member's wire duties besides the renewal, in the
+    /// beat's order — a reclaim's follow-up, the carried offers, the
+    /// census, the set-config learn. Ends with the beat, or at the poison.
+    fn follow(self: *JoinedHalf) void {
+        var name_buf: thread_name.CommBuf = undefined;
+        _ = thread_name.nameCurrentThread(&name_buf, "sqz-member-fol");
+        var rejoins_handled: u64 = 0;
+        var grants_handled: u64 = 0;
+        var offers: [OfferQueue.CAP]OfferQueue.Offer = undefined;
+        while (!self.stop.load(.acquire)) {
+            if (self.member.words.fenced.load(.acquire) or self.js.park_gate.isExpired()) return;
+            self.holdFollowIfArmed();
+            const rejoins = self.rejoins.load(.acquire);
+            if (rejoins != rejoins_handled) {
+                rejoins_handled = rejoins;
+                self.followReclaim(self.rejoin_epoch.load(.monotonic));
+            }
+            for (self.offers.take(self.plane.io, &offers)) |o| self.slots_carriage.offered(self.slots_carriage.ctx, o.slot, o.holder);
+            self.pullCensusIfDue();
             // The grant's set-config generation ahead of this daemon's
             // word: the manager added or removed a data volume online.
-            if ((v == .renewed or v == .rejoined) and self.member.config_generation > lifecycle_stats.volume_config_generation.load()) self.plane.learnSetConfig(self.member.config_generation);
-            _ = self.js.park_gate.expireIfDue(clock.monotonicNs(), self.poison.sink());
-            // A plain OS thread of the daemon's own: the kernel's sleep,
-            // never an `Io` handle (the lanes' timers are the lanes').
-            const ts: linux.timespec = .{ .sec = 0, .nsec = @intCast(TICK_MS * std.time.ns_per_ms) };
-            _ = linux.nanosleep(&ts, null);
+            const grants = self.grants.load(.acquire);
+            if (grants != grants_handled) {
+                grants_handled = grants;
+                const g = self.granted_generation.load(.monotonic);
+                if (g > lifecycle_stats.volume_config_generation.load()) self.plane.learnSetConfig(g);
+            }
+            sleepTick();
         }
+    }
+
+    /// A reclaim admitted by a SUCCESSOR manager: its grant table is fresh,
+    /// so every token this mount holds from holder 0 is unproven — the
+    /// plane re-points (every token dropped, the channel fail-closed until
+    /// a round completes); its RAM endpoint table is fresh, so this
+    /// listener is published again under the same appender id (what the
+    /// successor's divert and step sessions dial).
+    fn followReclaim(self: *JoinedHalf, epoch: u64) void {
+        _ = self.plane.divert.repoint(self.plane.io, MANAGER_HOLDER, MANAGER_HOLDER);
+        _ = self.plane.publishToManager();
+        log.info("cluster wire: the home shard's successor at {f} admitted the reclaim (epoch {d}) — the manager's token plane re-pointed, this listener re-published", .{ self.js.managerEndpoint(), epoch });
+    }
+
+    /// The member's carriage: an offer queued for the follower, a release
+    /// notice applied here (a local cache eviction).
+    fn carriageSink(self: *JoinedHalf) shard.CarriageSink {
+        return .{ .ctx = self, .offered = &carriageOffered, .released = &carriageReleased };
+    }
+
+    fn carriageOffered(ctx: ?*anyopaque, slot: u16, holder: u32) void {
+        const self: *JoinedHalf = @ptrCast(@alignCast(ctx.?));
+        if (!self.offers.push(self.plane.io, .{ .slot = slot, .holder = holder })) log.warn("cluster wire: the offer of slot {d} is dropped — {d} offers wait on the member's follower", .{ slot, OfferQueue.CAP });
+    }
+
+    fn carriageReleased(ctx: ?*anyopaque, slot: u16) void {
+        const self: *JoinedHalf = @ptrCast(@alignCast(ctx.?));
+        self.slots_carriage.released(self.slots_carriage.ctx, slot);
     }
 
     /// `SQUEEZEFS_TEST_MEMBERSHIP_BEAT_HOLD`: the beat parks, once, at the
@@ -332,9 +445,9 @@ const JoinedHalf = struct {
         log.warn("cluster wire: SQUEEZEFS_TEST_MEMBERSHIP_BEAT_HOLD released — the beat resumes", .{});
     }
 
-    /// `SQUEEZEFS_TEST_MEMBERSHIP_FOLLOW_HOLD`: the follow-up parks, once,
-    /// at the first duty that finds the FIFO present, until a writer opens
-    /// it.
+    /// `SQUEEZEFS_TEST_MEMBERSHIP_FOLLOW_HOLD`: the follower parks, once,
+    /// at the first round that finds the FIFO present, until a writer
+    /// opens it — every follow-up duty waits, the beat renews on.
     fn holdFollowIfArmed(self: *JoinedHalf) void {
         const path = self.follow_hold orelse return;
         if (self.follow_held.load(.monotonic)) return;
@@ -350,10 +463,12 @@ const JoinedHalf = struct {
     }
 
     /// One census walk per renew interval (the renewal's own cadence; the
-    /// pages ride the manager link on this thread, never a sweep's): the
+    /// pages ride the manager link on the follower, never a sweep's): the
     /// view the sweeps read for every other member's lease.
     fn pullCensusIfDue(self: *JoinedHalf) void {
-        const renew_ns = (self.member.clocks orelse return).renew_ms * std.time.ns_per_ms;
+        const renew_ms = self.member.words.renew_ms.load(.acquire);
+        if (renew_ms == 0) return;
+        const renew_ns = renew_ms * std.time.ns_per_ms;
         const now = clock.monotonicNs();
         if (!self.census.due(now, renew_ns)) return;
         var cursor: u64 = 0;
@@ -751,6 +866,7 @@ pub const WirePlane = struct {
             .js = js,
             .member = undefined,
             .poison = .{ .set = self.set },
+            .slots_carriage = self.set.volumes[0].slots.carriageSink(),
             .decl_buf = decl_buf,
             .census = membership.census_view.CensusView.init(gpa, self.io),
         };
@@ -766,7 +882,7 @@ pub const WirePlane = struct {
             .mount = js.mountpoint,
             .gate = &js.park_gate,
             .poison = j.poison.sink(),
-            .carriage = self.set.volumes[0].slots.carriageSink(),
+            .carriage = j.carriageSink(),
         };
         self.joined = j;
     }
@@ -806,6 +922,11 @@ pub const WirePlane = struct {
         // The parked guard scopes' grace belt is the grant's `T_owner`.
         self.steps.plane.parked.bindLiveness(self.oracle.guardLiveness(), clocks.t_owner_ms * std.time.ns_per_ms);
         j.beat = std.Thread.spawn(.{}, JoinedHalf.run, .{j}) catch return error.OutOfMemory;
+        j.follower = std.Thread.spawn(.{}, JoinedHalf.follow, .{j}) catch {
+            j.stop.store(true, .release);
+            j.beat.join();
+            return error.OutOfMemory;
+        };
     }
 
     /// A joiner's listener into the manager's RAM endpoint table (every
@@ -849,14 +970,16 @@ pub const WirePlane = struct {
         // A joiner's pending shipped frees reach the holder while its link
         // and membership stand; then its clean leave of the shard FIRST
         // (the manager's owner deletes the member row; a leave over a park
-        // is refused — the crash shape, the ledger's to judge). The beat is
-        // joined BEFORE the writer plane goes: every tick declares that
-        // plane's windows (`declareWindows` on a destroyed plane was the
-        // joiner's SIGSEGV at umount); the membership stands until the
+        // is refused — the crash shape, the ledger's to judge). The beat and
+        // the follower are joined BEFORE the writer plane goes: every tick
+        // declares that plane's windows (`declareWindows` on a destroyed
+        // plane was the joiner's SIGSEGV at umount), the follower's
+        // set-config learn reads it; the membership stands until the
         // leave — a few wire calls without a renewal sit far inside T_self.
         if (self.joined) |j| {
             j.stop.store(true, .release);
             j.beat.join();
+            j.follower.join();
             j.windows.store(null, .release);
         }
         if (self.writer_plane) |w| {

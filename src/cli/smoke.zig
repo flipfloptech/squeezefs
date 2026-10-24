@@ -3005,7 +3005,7 @@ fn awaitExitWithin(rig: *Rig, bound_ns: u64, what: []const u8) !std.process.Chil
     return rig.waitChild();
 }
 
-test "smoke: A BIND OF THE MOUNT IS THE KERNEL'S, NEVER THE DAEMON'S TO STOP (xfstests generic/409–411, 589 under the symmetric default) — mount, `mount --bind` it elsewhere, a file written through the mount reads through the bind; (a) the kernel's `umount` of the original: the daemon is not signalled, the bind KEEPS SERVING (`.stats`, the file sha-equal), `umount` of the bind drops the superblock's last reference and the daemon exits within two ticks, exit 0; (b) `squeezefs umount <bind>`: the kernel's plain detach naming daemon and mount, nothing signalled, the mount serves on; (c) `squeezefs umount <mount>` with the bind alive: the orderly stop ends its connection AT ONCE naming the bind (red: 30 s of `residency backstop lapsed` ×N groups), the bind answers ENOTCONN and detaches plainly; fsck --offline --scrub 0 findings after each" {
+test "smoke: A BIND OF THE MOUNT IS THE KERNEL'S, NEVER THE DAEMON'S TO STOP (xfstests generic/409–411, 589 under the symmetric default) — mount, `mount --bind` it elsewhere, a file written through the mount reads through the bind; (a) the kernel's `umount` of the original: the daemon is not signalled, the bind KEEPS SERVING (`.stats`, the file sha-equal), `umount` of the bind drops the superblock's last reference and the daemon exits within two ticks, exit 0; (b) `squeezefs umount <bind>`: the kernel's plain detach naming daemon and mount, nothing signalled, the mount serves on; (c) `squeezefs umount <mount>` with the bind alive: the orderly stop ends its connection AT ONCE naming the bind (red: 30 s of `residency backstop lapsed` ×N groups), the bind answers ENOTCONN and detaches plainly; (d) generic/410's breakage — a tmpfs stacked INSIDE the tree (on the manager's dentry `sub`) stands through a member's join and through the member's changes of the shared root (fsstress's `fss<pid>` temp names, a directory renamed into and removed): the walk through `sub` reads the tmpfs each time, the join's whole-view epoch withheld (red on dev: that INC_EPOCH made `sub` invalid at the next walk and the kernel's `d_invalidate` detached the tmpfs — `sub/x` ENOENT); fsck --offline --scrub 0 findings after each" {
     const io = testing.io;
     if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
     const gpa = testing.allocator;
@@ -3118,6 +3118,58 @@ test "smoke: A BIND OF THE MOUNT IS THE KERNEL'S, NEVER THE DAEMON'S TO STOP (xf
     }
     try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.umount2(bind.ptr, 0)));
     _ = try fsckClean(rig, "(c) the orderly stop with the bind alive");
+    // ---- (d) a mount stacked INSIDE the tree survives a member's join and its changes ----
+    // A fresh set: a member cannot join a set whose manager has remounted
+    // (`cannot open metadata set … device I/O failed`, open on dev; not this row's law).
+    try rig.formatSet(true);
+    const sub = try std.fmt.allocPrintSentinel(gpa, "{s}/sub", .{rig.mp}, 0);
+    defer gpa.free(sub);
+    const mark_d = try rig.logLen();
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(mark_d);
+    gpa.free(try rig.onMount("mkdir sub"));
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.mount("tmpfs", sub.ptr, "tmpfs", 0, 0)));
+    var sub_mounted = true;
+    defer if (sub_mounted) {
+        _ = linux.umount2(sub.ptr, linux.MNT.DETACH);
+    };
+    gpa.free(try rig.onMount("echo stacked > sub/x"));
+    const verify_sub = "test \"$(cat sub/x)\" = stacked && echo ok";
+    {
+        // B's join flips the manager's TTL law: A owes its kernel a
+        // whole-view flush, answered before the join is.
+        const b = try Peer.init(rig, "b");
+        defer b.deinit();
+        try b.spawn(&.{});
+        _ = try b.awaitReady();
+        {
+            const out = try rig.onMount(verify_sub);
+            defer gpa.free(out);
+            try testing.expectEqualStrings("ok\n", out);
+        }
+        try testing.expect(try mountedAt(gpa, io, sub));
+        // B changes A's root the way fsstress does at its start and in its
+        // tree: each name A's kernel hears of expires, never invalidates.
+        gpa.free(try b.onMount("for i in 1 2 3 4 5 6 7 8; do touch fss$i && mv fss$i gss$i && rm gss$i; done && mkdir p0 && touch p0/f && mv p0/f p0/g && rm -r p0"));
+        {
+            const out = try rig.onMount(verify_sub);
+            defer gpa.free(out);
+            try testing.expectEqualStrings("ok\n", out);
+        }
+        try testing.expect(try mountedAt(gpa, io, sub));
+        {
+            const st = try rig.stats();
+            defer gpa.free(st);
+            try testing.expect((numberAfter(st, "\"transport_notify_epochs_withheld\":") orelse 0) >= 1);
+        }
+        try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.umount2(sub.ptr, 0)));
+        sub_mounted = false;
+        try b.umount();
+        try b.expectCleanExit("(d) B's unmount");
+    }
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try awaitExitWithin(rig, bind_exit_bound_ns, "(d) the orderly stop after the member left"));
+    _ = try fsckClean(rig, "(d) a mount stacked inside the tree through a member's join and changes");
 }
 
 /// The `major:minor` of the mount at exactly `path` (the mount table, never
@@ -3461,7 +3513,7 @@ fn threadWchan(io: Io, pid: linux.pid_t, comm: []const u8, out: []u8) !?[]const 
     return null;
 }
 
-test "smoke: THE SIDEBAND NEVER inode_locks A DIRECTORY ITS DAEMON OWES A REPLY ON (decision 0003 §AB.2; generic/589 under joins) — A (the manager) + B JOINED; B lists the root (its token on the root with the dentries) and creates INTO the root: the create's step ships to A, A's pass recalls the root from B — B acks at once and queues the name's INVAL_ENTRY — and HOLDS after the acks (the seam), B's create in flight with its kernel holding the root's i_rwsem the whole hold: B's sideband thread is never in `fuse_reverse_inval_entry` (red on dev: it sat there until the create completed — in generic/589 39 s, then an uninterruptible exit), B's INVAL_ENTRY was written as an INC_EPOCH (substituted ≥ 1); released: the create completes ≤ 2 s, B's next walk of the root sees the file (the epoch's revalidation), no grant of A's served slow; umount B, A → fsck 0 findings" {
+test "smoke: THE SIDEBAND NEVER inode_locks A DIRECTORY ITS DAEMON OWES A REPLY ON (decision 0003 §AB.2; generic/589 under joins) — A (the manager) + B JOINED; B lists the root (its token on the root with the dentries) and creates INTO the root: the create's step ships to A, A's pass recalls the root from B — B acks at once and queues the name's INVAL_ENTRY — and HOLDS after the acks (the seam), B's create in flight with its kernel holding the root's i_rwsem the whole hold: B's sideband thread is never in `fuse_reverse_inval_entry` (red on dev: it sat there until the create completed — in generic/589 39 s, then an uninterruptible exit), B's INVAL_ENTRY WAITED for the create's answer (deferred ≥ 1, decision 0003 §BL.2); released: the create completes ≤ 2 s, B's next walk of the root sees the file (the expired name's revalidation), no grant of A's served slow; umount B, A → fsck 0 findings" {
     const io = testing.io;
     if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
     const gpa = testing.allocator;
@@ -3535,15 +3587,15 @@ test "smoke: THE SIDEBAND NEVER inode_locks A DIRECTORY ITS DAEMON OWES A REPLY 
     try testing.expect(create_ms <= cross_owner_rename_bound_s * std.time.ms_per_s);
     const touch_wall = try Io.Dir.cwd().readFileAlloc(io, touch_out_path, gpa, .limited(64));
     defer gpa.free(touch_wall);
-    // The file through both mounts; B's next walk revalidates under the
-    // moved epoch and finds it.
+    // The file through both mounts; B's next walk revalidates the expired
+    // name and finds it.
     gpa.free(try b.onMount("test -f f && test \"$(ls | tr '\\n' ' ')\" = \"f \""));
     gpa.free(try rig.onMount("test -f f"));
-    var substituted: u64 = 0;
+    var deferred: u64 = 0;
     {
         const sb = try b.stats();
         defer gpa.free(sb);
-        substituted = numberAfter(sb, "\"transport_notify_entry_epochs_substituted\":") orelse 0;
+        deferred = numberAfter(sb, "\"transport_notify_entries_deferred\":") orelse 0;
         try expectIntentsAtRest(sb);
         const sa = try rig.stats();
         defer gpa.free(sa);
@@ -3556,13 +3608,13 @@ test "smoke: THE SIDEBAND NEVER inode_locks A DIRECTORY ITS DAEMON OWES A REPLY 
         try testing.expect(std.mem.indexOf(u8, text[mark_a..], "token_grant served in") == null);
     }
     try testing.expectEqual(@as(u32, 0), in_kernel);
-    try testing.expect(substituted >= 1);
+    try testing.expect(deferred >= 1);
     try b.umount();
     try b.expectCleanExit("B's unmount");
     try rig.umount();
     try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
     _ = try fsckClean(rig, "the sideband law");
-    std.debug.print("smoke: sideband law: B's sideband sampled {d}× across the hold, {d} in fuse_reverse_inval_entry (last wchan {s}); INVAL_ENTRY → INC_EPOCH substituted {d}; the create completed {d} ms after the release ({s} ms wall); fsck clean\n", .{ sampled, in_kernel, last_wchan, substituted, create_ms, std.mem.trimEnd(u8, touch_wall, "\n") });
+    std.debug.print("smoke: sideband law: B's sideband sampled {d}× across the hold, {d} in fuse_reverse_inval_entry (last wchan {s}); INVAL_ENTRY deferred behind the create {d}; the create completed {d} ms after the release ({s} ms wall); fsck clean\n", .{ sampled, in_kernel, last_wchan, deferred, create_ms, std.mem.trimEnd(u8, touch_wall, "\n") });
 }
 
 // ---------------------------------------------------------------------------

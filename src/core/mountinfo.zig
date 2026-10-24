@@ -133,6 +133,44 @@ pub fn othersOfSuperblock(text: []const u8, own_id: u64, own_path: []const u8, m
     return out;
 }
 
+/// How many mounts stand on a dentry of the superblock `major:minor`: every
+/// entry whose PARENT is a mount of that superblock — a bind or another
+/// filesystem mounted inside its tree (under any of its mounts: a bind of
+/// it elsewhere carries its dentries too), a propagated copy of one. The
+/// FUSE daemon's whole-view invalidation would detach each at its next walk
+/// (decision 0003 §BL.3). A mount of the superblock itself is not counted
+/// by being one — only by standing on another.
+pub fn mountsOnSuperblock(text: []const u8, major: u32, minor: u32) usize {
+    var ids: [64]u64 = undefined;
+    var n_ids: usize = 0;
+    var overflow = false;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        const e = parseLine(line) orelse continue;
+        if (e.dev_major != major or e.dev_minor != minor) continue;
+        if (n_ids == ids.len) {
+            overflow = true;
+            break;
+        }
+        ids[n_ids] = e.id;
+        n_ids += 1;
+    }
+    var count: usize = 0;
+    lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        const e = parseLine(line) orelse continue;
+        if (std.mem.indexOfScalar(u64, ids[0..n_ids], e.parent_id) != null) {
+            count += 1;
+            continue;
+        }
+        // Past the id buffer the rest are judged by the parent's device.
+        if (overflow) if (entryOf(text, e.parent_id)) |p| {
+            if (p.dev_major == major and p.dev_minor == minor) count += 1;
+        };
+    }
+    return count;
+}
+
 /// The first mount whose parent is `id` (a mount stacked inside it makes
 /// the plain `umount2` of `id` EBUSY).
 pub fn firstChildOf(text: []const u8, id: u64) ?Entry {
@@ -244,6 +282,36 @@ test "othersOfSuperblock: the daemon's own entry (its id AT its path) is exclude
     try testing.expectEqual(@as(usize, 1), othersOfSuperblock(reissued, 90, "/build/tmp/mnt-7", 0, 45).count);
 }
 
+test "mountsOnSuperblock: a mount whose parent is a mount of the superblock — on its own mount, on a bind of it elsewhere — counts; the superblock's own mounts, a mount beside it and one on another superblock do not; past the id buffer the parent's device judges" {
+    // 0:45 at mnt-7 (id 90) carries the tmpfs 93 at mnt-7/sub.
+    try testing.expectEqual(@as(usize, 1), mountsOnSuperblock(sample, 0, 45));
+    try testing.expectEqual(@as(usize, 0), mountsOnSuperblock(sample, 0, 46));
+    try testing.expectEqual(@as(usize, 0), mountsOnSuperblock(sample, 0, 48));
+    // generic/410's shape: the head 0:45 at H; A (0:50) at H/mpA on it and
+    // its bind at H/mpB; B (0:51) at H/mpA/dir and its propagated copy at
+    // H/mpB/dir — on A's dentry `dir` through both of A's mounts.
+    const g410 =
+        \\22 1 0:21 / / rw - ext4 /dev/root rw
+        \\90 22 0:45 / /H rw - fuse squeezefs rw
+        \\100 90 0:50 / /H/mpA rw shared:1 - fuse squeezefs rw
+        \\101 90 0:50 / /H/mpB rw shared:1 - fuse squeezefs rw
+        \\102 100 0:51 / /H/mpA/dir rw shared:2 - fuse squeezefs rw
+        \\103 101 0:51 / /H/mpB/dir rw shared:2 - fuse squeezefs rw
+        \\
+    ;
+    try testing.expectEqual(@as(usize, 2), mountsOnSuperblock(g410, 0, 45));
+    try testing.expectEqual(@as(usize, 2), mountsOnSuperblock(g410, 0, 50));
+    try testing.expectEqual(@as(usize, 0), mountsOnSuperblock(g410, 0, 51));
+    // More mounts of the superblock than the id buffer holds: the ones past
+    // it still carry what stands on them.
+    var many: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer many.deinit();
+    try many.writer.writeAll("22 1 0:21 / / rw - ext4 /dev/root rw\n");
+    for (0..70) |i| try many.writer.print("{d} 22 0:45 / /b{d} rw - fuse squeezefs rw\n", .{ 100 + i, i });
+    try many.writer.writeAll("500 169 0:60 / /b69/sub rw - tmpfs tmpfs rw\n");
+    try testing.expectEqual(@as(usize, 1), mountsOnSuperblock(many.written(), 0, 45));
+}
+
 fn lineFuzz(_: void, smith: *std.testing.Smith) !void {
     var buf: [512]u8 = undefined;
     const len = smith.slice(&buf);
@@ -253,6 +321,7 @@ fn lineFuzz(_: void, smith: *std.testing.Smith) !void {
     _ = hasId(text, 1);
     _ = hasDev(text, 0, 1);
     _ = othersOfSuperblock(text, 1, "/m", 0, 1);
+    _ = mountsOnSuperblock(text, 0, 1);
     _ = firstChildOf(text, 1);
 }
 

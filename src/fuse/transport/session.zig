@@ -81,6 +81,12 @@ pub const DRAIN_WAIT_NS: u64 = 10 * worker.DRAIN_LEASE_BUDGET_NS;
 /// two seconds is the lock plane's tick (`sync/tick.zig`) — past it the
 /// mount is detached lazily and the warn names it.
 pub const UMOUNT_RETRY_NS: u64 = tick_law.tick_ns;
+/// How often the sideband re-judges an `INVAL_ENTRY` deferred behind its
+/// parent's in-flight request (decision 0003 §BL.2): nothing wakes it when
+/// that request is answered, and the request is this daemon's own to answer
+/// (µs to ms), so 1 ms keeps the name's delay three orders below the 1 s
+/// peered TTL class at ≤ 1,000 wakes/s, and only while a name waits.
+pub const ENTRY_DEFER_RECHECK_NS: u64 = std.time.ns_per_ms;
 /// The fusectl tree: `max_background` per connection is the per-queue
 /// background accounting's only userspace-readable fact (the kernel
 /// exposes no per-queue counters; patch 0026 changes the LOCKING, not the
@@ -150,13 +156,17 @@ pub var notify_epochs_sent: counters.ShardedCounter = .{};
 /// `transport_notify_nb_waits`: a caller of a non-blocking notify waited
 /// for a reserved cell.
 pub var notify_nb_waits: counters.ShardedCounter = .{};
-/// `transport_notify_entry_epochs_substituted`: an `INVAL_ENTRY` whose
-/// parent this daemon owes a reply on was written as an `INC_EPOCH`
-/// instead (decision 0003 §AB.2): the kernel's `fuse_reverse_inval_entry`
-/// takes the parent's `i_rwsem`, which the in-flight request holds, so
-/// the sideband would park behind its own daemon's op; the epoch bump is
-/// an atomic increment and every dentry revalidates at its next walk.
-pub var notify_entry_epochs_substituted: counters.ShardedCounter = .{};
+/// `transport_notify_entries_deferred`: an `INVAL_ENTRY` whose parent this
+/// daemon owes a reply on waited until that request was answered (decision
+/// 0003 §AB.2, §BL.2): the kernel's `fuse_reverse_inval_entry` takes the
+/// parent's `i_rwsem`, which the in-flight request holds, so writing it
+/// then parks the sideband behind its own daemon's op.
+pub var notify_entries_deferred: counters.ShardedCounter = .{};
+/// `transport_notify_epochs_withheld`: an owed `INC_EPOCH` NOT written
+/// because a mount stands on a dentry of this connection (decision 0003
+/// §BL.3): the epoch makes every older dentry invalid at its next walk, and
+/// the kernel's `d_invalidate` of a mountpoint detaches every mount on it.
+pub var notify_epochs_withheld: counters.ShardedCounter = .{};
 /// `transport_sideband_recycle_respins`: a sideband cell given back met its
 /// free list's cell still held by a taker between its dequeue CAS and its
 /// sequence store (the ring holds the pool's whole population, so the
@@ -328,7 +338,7 @@ const SbCell = struct {
     /// Nobody waits: the sideband recycles the cell at the CQE.
     fire_and_forget: bool = true,
     /// An `INVAL_ENTRY` frame's parent (0 = another frame): judged against
-    /// the in-flight registry at the write (`writeEntryOrEpoch`).
+    /// the in-flight registry at the write (`entryWaits`).
     entry_parent: u64 = 0,
 };
 
@@ -386,6 +396,12 @@ const Sideband = struct {
     nb_pool: CellPool,
     /// An `INVAL_ENTRY` found no cell: the loop writes an `INC_EPOCH`.
     epoch_owed: std.atomic.Value(bool) = .init(false),
+    /// `INVAL_ENTRY` cells waiting for their parent's in-flight request
+    /// (the loop's own; a cell waits here at most once at a time).
+    deferred: []u32,
+    deferred_len: usize = 0,
+    /// The withheld-epoch warning is said once per session.
+    withheld_said: bool = false,
     read_armed: bool = false,
     stop: std.atomic.Value(bool) = .init(false),
     disconnected: bool = false,
@@ -406,13 +422,16 @@ const Sideband = struct {
         errdefer pool.deinit(gpa);
         var nb_pool = try CellPool.init(gpa, ncells, SIDEBAND_NB_CELLS);
         errdefer nb_pool.deinit(gpa);
-        const ready = try mpmc.BoundedMpmc(u32).init(gpa, total);
-        return .{ .session = session, .ring = ring, .fuse_fd = fuse_fd, .fixed = fixed, .buf = buf, .cells = cells, .pool = pool, .ready = ready, .nb_base = @intCast(ncells), .nb_pool = nb_pool };
+        var ready = try mpmc.BoundedMpmc(u32).init(gpa, total);
+        errdefer ready.deinit(gpa);
+        const deferred = try gpa.alloc(u32, total);
+        return .{ .session = session, .ring = ring, .fuse_fd = fuse_fd, .fixed = fixed, .buf = buf, .cells = cells, .pool = pool, .ready = ready, .nb_base = @intCast(ncells), .nb_pool = nb_pool, .deferred = deferred };
     }
 
     fn deinit(self: *Sideband, gpa: std.mem.Allocator) void {
         assert(self.thread == null);
         self.ring.deinit();
+        gpa.free(self.deferred);
         self.ready.deinit(gpa);
         self.nb_pool.deinit(gpa);
         self.pool.deinit(gpa);
@@ -562,7 +581,7 @@ const Sideband = struct {
     fn notifyEntryOrEpoch(self: *Sideband, parent: u64, name: []const u8) void {
         if (self.disconnected or self.stop.load(.acquire)) return;
         if (self.takeCell(false)) |idx| {
-            if (self.fillNotify(idx, codec.notifyInvalEntry, .{ parent, name, @as(u32, 0) })) |_| {
+            if (self.fillNotify(idx, codec.notifyInvalEntry, .{ parent, name, self.session.entry_flags })) |_| {
                 self.cells[idx].entry_parent = parent;
                 self.publish(idx);
                 return;
@@ -572,30 +591,41 @@ const Sideband = struct {
         self.oweEpoch();
     }
 
-    /// The loop's half of an `INVAL_ENTRY` (decision 0003 §AB.2): a parent
-    /// this daemon owes a reply on is NEVER `inode_lock`ed by this thread —
-    /// the kernel's `fuse_reverse_inval_entry` would park on the `i_rwsem`
-    /// the request holds (`lookup_open`, mkdir, unlink, rename hold it
-    /// exclusively; a lookup or readdir shared) for the op's whole life,
-    /// with every FORGET, classical reply and awaited notify behind it and
-    /// the daemon's own exit after them. The frame is rewritten in place
-    /// as an `INC_EPOCH`: an atomic increment the kernel takes with no
-    /// lock, after which every dentry revalidates at its next walk (its
-    /// coverage contains the name's). An op that arrives between this
-    /// check and the kernel's lock parks the write for that op's duration
-    /// alone — nothing of the op's depends on this thread.
-    fn writeEntryOrEpoch(self: *Sideband, idx: u32) void {
+    /// The loop's half of an `INVAL_ENTRY` (decision 0003 §AB.2, §BL.2): a
+    /// parent this daemon owes a reply on is NEVER `inode_lock`ed by this
+    /// thread — the kernel's `fuse_reverse_inval_entry` would park on the
+    /// `i_rwsem` the request holds (`lookup_open`, mkdir, unlink, rename
+    /// hold it exclusively; a lookup or readdir shared) for the op's whole
+    /// life, with every FORGET, classical reply and awaited notify behind it
+    /// and the daemon's own exit after them. The name WAITS (true) until
+    /// that request is answered, re-judged every `ENTRY_DEFER_RECHECK_NS`;
+    /// never an `INC_EPOCH` in its place — the epoch invalidates every
+    /// dentry of the connection and the kernel's `d_invalidate` of a
+    /// mountpoint detaches the mounts on it (xfstests generic/410). An op
+    /// that arrives between this check and the kernel's lock parks the
+    /// write for that op's duration alone — nothing of the op's depends on
+    /// this thread.
+    fn entryWaits(self: *Sideband, idx: u32) bool {
         const c = &self.cells[idx];
         const parent = c.entry_parent;
+        if (parent == 0) return false;
+        if (self.session.in_flight.load(.acquire)) |probe| {
+            if (probe.hasOpOn(probe.ctx, parent)) return true;
+        }
         c.entry_parent = 0;
-        if (parent == 0) return;
-        const probe = self.session.in_flight.load(.acquire) orelse return;
-        if (!probe.hasOpOn(probe.ctx, parent)) return;
-        const frame = codec.notifyIncEpoch(&c.buf) catch return;
-        c.head_len = frame.head.len;
-        c.body = frame.body;
-        notify_entry_epochs_substituted.inc();
-        notify_epochs_sent.inc();
+        return false;
+    }
+
+    /// The deferred names whose parents were answered meanwhile: written.
+    fn retryDeferred(self: *Sideband) void {
+        var kept: usize = 0;
+        for (self.deferred[0..self.deferred_len]) |idx| {
+            if (self.entryWaits(idx)) {
+                self.deferred[kept] = idx;
+                kept += 1;
+            } else self.submitWrite(idx);
+        }
+        self.deferred_len = kept;
     }
 
     /// The loop writes an `INC_EPOCH` at its next turn.
@@ -607,9 +637,25 @@ const Sideband = struct {
 
     /// The loop's half of an owed epoch: a reserved cell without waiting
     /// (the loop recycles them itself); none free ⇒ owed still, retried at
-    /// the next CQE.
+    /// the next CQE. WITHHELD while a mount stands on a dentry of this
+    /// connection (decision 0003 §BL.3): the epoch makes every older dentry
+    /// invalid at its next walk, and the kernel's `d_invalidate` of a
+    /// mountpoint detaches every mount on it — the operator's, or a
+    /// propagated copy (xfstests generic/410: a member's epoch threw
+    /// `mpB`, `mpC` and `mpA` off the test's tree one walk at a time). The
+    /// kernel's view of this mount then ages out within its TTL classes;
+    /// every named change still reaches it as an expired name.
     fn writeOwedEpoch(self: *Sideband) void {
         if (!self.epoch_owed.load(.acquire)) return;
+        if (self.session.mountsStandOnTree()) {
+            self.epoch_owed.store(false, .release);
+            notify_epochs_withheld.inc();
+            if (!self.withheld_said) {
+                self.withheld_said = true;
+                log.warn("transport: a mount stands on a dentry of {s}: a whole-view INC_EPOCH is withheld (it would detach that mount at its next walk); this mount's kernel view ages out within its TTL classes and named changes reach it as expired names (decision 0003 §BL.3)", .{self.session.mountpoint});
+            }
+            return;
+        }
         const idx = self.takeNbCell(false) orelse return;
         self.epoch_owed.store(false, .release);
         self.fillNotify(idx, codec.notifyIncEpoch, .{}) catch return self.recycle(idx);
@@ -721,11 +767,12 @@ const Sideband = struct {
         if (builtin.is_test) log.testing.expectErrorLogs(self.session.test_error_logs);
         while (!self.stop.load(.acquire) and !self.disconnected and !self.ring.isDead()) {
             _ = self.ring.service();
+            self.retryDeferred();
             while (self.ready.tryPop()) |idx| self.pushWrite(idx);
             self.writeOwedEpoch();
             if (!self.read_armed) self.armRead();
             _ = self.ring.armWake();
-            _ = self.ring.park(null);
+            _ = self.ring.park(if (self.deferred_len != 0) ENTRY_DEFER_RECHECK_NS else null);
             self.reap();
         }
         // A connection gone without DESTROY (a lazy umount, a sysfs abort,
@@ -749,7 +796,16 @@ const Sideband = struct {
     }
 
     fn pushWrite(self: *Sideband, idx: u32) void {
-        self.writeEntryOrEpoch(idx);
+        if (self.entryWaits(idx)) {
+            notify_entries_deferred.inc();
+            self.deferred[self.deferred_len] = idx;
+            self.deferred_len += 1;
+            return;
+        }
+        self.submitWrite(idx);
+    }
+
+    fn submitWrite(self: *Sideband, idx: u32) void {
         const c = &self.cells[idx];
         const sqe = self.ring.getSqe() orelse {
             self.completeCell(idx, -@as(i32, @intCast(@backingInt(linux.E.AGAIN))));
@@ -888,10 +944,28 @@ const Sideband = struct {
             self.read_armed = false;
         }
         self.disconnected = true;
+        for (self.deferred[0..self.deferred_len]) |idx| self.completeCell(idx, -@as(i32, @intCast(@backingInt(linux.E.NOTCONN))));
+        self.deferred_len = 0;
         while (self.ready.tryPop()) |idx| self.completeCell(idx, -@as(i32, @intCast(@backingInt(linux.E.NOTCONN))));
         self.ring.quiesce();
     }
 };
+
+/// `/proc/self/mountinfo` into `buf` by raw syscalls (procfs reports size 0:
+/// read until EOF or the buffer is full); empty when unreadable.
+fn readMountinfoRaw(buf: []u8) []const u8 {
+    const rc = linux.open(mountinfo.path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(rc) != .SUCCESS) return "";
+    const fd: linux.fd_t = @intCast(rc);
+    defer _ = linux.close(fd);
+    var n: usize = 0;
+    while (n < buf.len) {
+        const r = linux.read(fd, buf[n..].ptr, buf.len - n);
+        if (linux.errno(r) != .SUCCESS or r == 0) break;
+        n += r;
+    }
+    return buf[0..n];
+}
 
 fn handlerMain(fs: fsv.Filesystem, req: fsv.Request, handle: fsv.Handle) void {
     fs.dispatch(req, handle, null);
@@ -924,6 +998,15 @@ pub const Session = struct {
     /// the minor is the fusectl connection id): what every other mount of
     /// this connection — a bind, a moved mountpoint — carries in the table.
     mount_dev: ?struct { major: u32, minor: u32 } = null,
+    /// The flags every `INVAL_ENTRY` carries (decision 0003 §BL.1):
+    /// `FUSE_EXPIRE_ONLY` when the kernel offers it at INIT (uapi 7.38) — the
+    /// name EXPIRES and its next walk revalidates by LOOKUP: one that still
+    /// names the same node keeps every mount stacked on its dentry, one that
+    /// changed is invalidated by the kernel then. Without it the kernel's
+    /// `d_invalidate` runs at once and detaches every mount on the dentry
+    /// whatever the name now resolves to. Written at INIT, before the
+    /// session is ready (no notify precedes it).
+    entry_flags: u32 = 0,
     unmounter: ?Unmounter = null,
     on_shutdown: ?Hook = null,
     init_reply: codec.InitReply = undefined,
@@ -1383,6 +1466,7 @@ pub const Session = struct {
         geometry.gauges.publish(self.plan, init_in.max_readahead);
         geometry.gauges.publishDrainGroups(&self.drain_groups);
         self.time_limits = probes.timeLimitsVerdict(init_in.folded());
+        self.entry_flags = if (init_in.folded() & abi.FUSE_HAS_EXPIRE_ONLY != 0) abi.FUSE_EXPIRE_ONLY else 0;
         time_limits_gauge.set(@intFromBool(self.init_reply.timeLimits()));
         self.request_timeout_s = if (self.init_reply.requestTimeoutS() != 0) geometry.kernelRequestTimeoutS(self.init_reply.requestTimeoutS(), geometry.readMaxRequestTimeout(self.io)) else 0;
         request_timeout_gauge.set(self.request_timeout_s);
@@ -2091,6 +2175,19 @@ pub const Session = struct {
         self.shared.detached.store(true, .release);
     }
 
+    /// Does a mount stand on a dentry of this connection — something mounted
+    /// INSIDE its tree (a bind stacked on one of its directories or files, a
+    /// propagated copy of a mount made under it, another filesystem)? Read
+    /// from the table by raw syscalls on the caller's thread (the sideband
+    /// asks at an owed epoch); an unreadable table answers no (the epoch is
+    /// written, as before the law).
+    fn mountsStandOnTree(self: *Session) bool {
+        const dev = self.mount_dev orelse return false;
+        const buf = self.gpa.alloc(u8, mountinfo.READ_BYTES) catch return false;
+        defer self.gpa.free(buf);
+        return mountinfo.mountsOnSuperblock(readMountinfoRaw(buf), dev.major, dev.minor) != 0;
+    }
+
     /// Is the mount at our path still the one we made? An unreadable table
     /// (no procfs, no buffer for it) answers yes: the path is then the only
     /// fact there is — a "no" here skips the daemon's own unmount and
@@ -2379,7 +2476,8 @@ pub const Session = struct {
         try field(w, "transport_notify_epochs_owed", notify_epochs_owed.load());
         try field(w, "transport_notify_epochs_sent", notify_epochs_sent.load());
         try field(w, "transport_notify_nb_waits", notify_nb_waits.load());
-        try field(w, "transport_notify_entry_epochs_substituted", notify_entry_epochs_substituted.load());
+        try field(w, "transport_notify_entries_deferred", notify_entries_deferred.load());
+        try field(w, "transport_notify_epochs_withheld", notify_epochs_withheld.load());
         try field(w, "transport_sideband_recycle_respins", sideband_recycle_respins.load());
         try field(w, "transport_notify_pending", notify_pending.load());
         try w.print("\"transport_notify_dropped\":{d}", .{notify_dropped.load()});
@@ -3551,64 +3649,144 @@ test "e2e: notify frames ride the sideband — INVAL_INODE on a held inode succe
     try testing.expect(notify_enoent.load() - enoent >= 1);
 }
 
-test "e2e: the sideband never inode_locks a directory this daemon owes a reply on (decision 0003 §AB.2) — an INVAL_ENTRY whose parent the in-flight registry names is written as an INC_EPOCH (substituted +1, epochs_sent +1, the dentry still revalidates: the next stat is a LOOKUP); one whose parent is free, or with no registry bound, is written as itself" {
+test "e2e: the sideband never inode_locks a directory this daemon owes a reply on (decision 0003 §AB.2, §BL.2) — an INVAL_ENTRY whose parent the in-flight registry names WAITS (deferred +1, nothing written, never an INC_EPOCH) until that request is answered, then is written as itself; one whose parent is free, or with no registry bound, is written at once" {
     if (venueMissing()) |why| return testkit.skipWhy(@src(), why);
     const rig = try Rig.init(testing.allocator, 8, &.{});
     defer rig.deinit();
     const s = try rig.mountIt(.{ .mem_budget_bytes = 0 });
     var pb: [256]u8 = undefined;
     _ = try statSize(rig.child(&pb, "hello"));
-    const Probe = struct {
-        busy: u64,
-        fn hasOpOn(ctx: *anyopaque, ino: u64) bool {
-            const self: *@This() = @ptrCast(@alignCast(ctx));
-            return ino == self.busy;
-        }
-    };
-    var probe: Probe = .{ .busy = EchoFs.ino_root };
-    const seam: watchdog.InFlightProbe = .{ .ctx = &probe, .hasOpOn = &Probe.hasOpOn };
-    const Count = struct {
-        fn settled() u64 {
-            return notify_sent.load() + notify_enoent.load() + notify_failed.load();
-        }
-        fn waitSettled(n: u64) void {
-            const deadline = clock.monotonicNs() + 5 * std.time.ns_per_s;
-            while (settled() < n and clock.monotonicNs() < deadline) std.Thread.yield() catch {};
-        }
-    };
-    // The parent has a request in flight: the epoch, never the lock.
+    var probe: BusyProbe = .{ .busy = .init(EchoFs.ino_root) };
+    const seam = probe.seam();
+    // The parent has a request in flight: the name waits, never the lock.
     s.setInFlightProbe(&seam);
-    const sub0 = notify_entry_epochs_substituted.load();
+    const def0 = notify_entries_deferred.load();
     const ep0 = notify_epochs_sent.load();
-    const sent0 = notify_sent.load();
-    const settled0 = Count.settled();
-    const forgets0 = rig.fs.forgets.load(.monotonic);
+    const settled0 = notifySettled();
     s.notifyInvalEntryOwed(EchoFs.ino_root, "hello");
-    Count.waitSettled(settled0 + 1);
-    try testing.expectEqual(sub0 + 1, notify_entry_epochs_substituted.load());
-    try testing.expectEqual(ep0 + 1, notify_epochs_sent.load());
-    try testing.expectEqual(sent0 + 1, notify_sent.load());
-    // The epoch moved under the kernel: the next walk finds the cached
-    // dentry invalid (`fuse_dentry_revalidate`'s epoch arm), drops it —
-    // its inode's FORGET follows — and looks the name up anew.
-    _ = try statSize(rig.child(&pb, "hello"));
-    const forget_deadline = clock.monotonicNs() + 5 * std.time.ns_per_s;
-    while (rig.fs.forgets.load(.monotonic) == forgets0 and clock.monotonicNs() < forget_deadline) std.Thread.yield() catch {};
-    try testing.expect(rig.fs.forgets.load(.monotonic) > forgets0);
-    // Another parent is free: the name itself.
-    probe.busy = EchoFs.ino_hello;
-    const settled1 = Count.settled();
+    const deadline = clock.monotonicNs() + 5 * std.time.ns_per_s;
+    while (notify_entries_deferred.load() == def0 and clock.monotonicNs() < deadline) std.Thread.yield() catch {};
+    try testing.expectEqual(def0 + 1, notify_entries_deferred.load());
+    // Held for several re-judgements: still nothing written.
+    const held = clock.monotonicNs() + 20 * ENTRY_DEFER_RECHECK_NS;
+    while (clock.monotonicNs() < held) std.Thread.yield() catch {};
+    try testing.expectEqual(settled0, notifySettled());
+    // Answered: the name itself, within a re-judgement or so.
+    probe.busy.store(0, .release);
+    awaitNotifySettled(settled0 + 1);
+    try testing.expectEqual(settled0 + 1, notifySettled());
+    try testing.expectEqual(ep0, notify_epochs_sent.load());
+    // Another parent is busy: the name at once.
+    probe.busy.store(EchoFs.ino_hello, .release);
+    const settled1 = notifySettled();
     s.notifyInvalEntryOwed(EchoFs.ino_root, "hello");
-    Count.waitSettled(settled1 + 1);
-    try testing.expectEqual(sub0 + 1, notify_entry_epochs_substituted.load());
-    try testing.expectEqual(ep0 + 1, notify_epochs_sent.load());
-    // No registry bound: the name itself.
+    awaitNotifySettled(settled1 + 1);
+    try testing.expectEqual(def0 + 1, notify_entries_deferred.load());
+    // No registry bound: the name at once.
     s.setInFlightProbe(null);
-    const settled2 = Count.settled();
+    const settled2 = notifySettled();
     s.notifyInvalEntryOwed(EchoFs.ino_root, "hello");
-    Count.waitSettled(settled2 + 1);
-    try testing.expectEqual(sub0 + 1, notify_entry_epochs_substituted.load());
-    try testing.expectEqual(settled2 + 1, Count.settled());
+    awaitNotifySettled(settled2 + 1);
+    try testing.expectEqual(def0 + 1, notify_entries_deferred.load());
+    try testing.expectEqual(ep0, notify_epochs_sent.load());
+}
+
+test "e2e: A COHERENCE NOTIFY NEVER UNMOUNTS (xfstests generic/410; decision 0003 §BL) — a file bind-mounted onto /hello stands through an INVAL_ENTRY of `hello` (EXPIRED: its next walk revalidates by LOOKUP, the same node, the bind still reads), through one deferred behind its parent's in-flight request, and through an owed INC_EPOCH (withheld +1 while the bind stands, nothing written); with the bind gone the epoch is written (sent +1) and the next walk looks the name up anew (red on dev: the INVAL_ENTRY's `d_invalidate`, and the epoch at the next walk, detached the bind — the walk read EchoFs's own `hello`)" {
+    if (venueMissing()) |why| return testkit.skipWhy(@src(), why);
+    const rig = try Rig.init(testing.allocator, 21, &.{});
+    defer rig.deinit();
+    const s = try rig.mountIt(.{ .mem_budget_bytes = 0 });
+    var pb: [256]u8 = undefined;
+    var src_buf: [128]u8 = undefined;
+    const src = try std.fmt.bufPrintSentinel(&src_buf, "/build/tmp/bindsrc-{d}-21", .{linux.getpid()}, 0);
+    {
+        const rc = linux.open(src.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .CLOEXEC = true }, 0o644);
+        try testing.expectEqual(linux.E.SUCCESS, linux.errno(rc));
+        defer _ = linux.close(@intCast(rc));
+        try testing.expectEqual(bound_text.len, linux.write(@intCast(rc), bound_text.ptr, bound_text.len));
+    }
+    defer _ = linux.unlink(src.ptr);
+    const target = rig.child(&pb, "hello");
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.mount(src.ptr, target.ptr, null, linux.MS.BIND, 0)));
+    var bound = true;
+    defer if (bound) {
+        _ = linux.umount2(target.ptr, linux.MNT.DETACH);
+    };
+    try expectReads(target, bound_text);
+    // (1) The name, its parent free: expired, revalidated, the bind stands.
+    const looked0 = rig.fs.lookups[EchoFs.ino_hello].load(.monotonic);
+    const settled0 = notifySettled();
+    s.notifyInvalEntryOwed(EchoFs.ino_root, "hello");
+    awaitNotifySettled(settled0 + 1);
+    try expectReads(target, bound_text);
+    try testing.expect(rig.fs.lookups[EchoFs.ino_hello].load(.monotonic) > looked0);
+    // (2) Its parent in flight: deferred, then written; the bind stands.
+    var probe: BusyProbe = .{ .busy = .init(EchoFs.ino_root) };
+    const seam = probe.seam();
+    s.setInFlightProbe(&seam);
+    const def0 = notify_entries_deferred.load();
+    const settled1 = notifySettled();
+    s.notifyInvalEntryOwed(EchoFs.ino_root, "hello");
+    const deadline = clock.monotonicNs() + 5 * std.time.ns_per_s;
+    while (notify_entries_deferred.load() == def0 and clock.monotonicNs() < deadline) std.Thread.yield() catch {};
+    try testing.expectEqual(def0 + 1, notify_entries_deferred.load());
+    try expectReads(target, bound_text);
+    probe.busy.store(0, .release);
+    awaitNotifySettled(settled1 + 1);
+    try expectReads(target, bound_text);
+    s.setInFlightProbe(null);
+    // (3) An owed whole-view epoch with the bind standing: withheld.
+    const wh0 = notify_epochs_withheld.load();
+    const ep0 = notify_epochs_sent.load();
+    s.notifyIncEpoch();
+    while (notify_epochs_withheld.load() == wh0 and clock.monotonicNs() < deadline) std.Thread.yield() catch {};
+    try testing.expectEqual(wh0 + 1, notify_epochs_withheld.load());
+    try testing.expectEqual(ep0, notify_epochs_sent.load());
+    try expectReads(target, bound_text);
+    // With nothing mounted inside the tree the epoch is the kernel's again.
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.umount2(target.ptr, 0)));
+    bound = false;
+    const settled2 = notifySettled();
+    s.notifyIncEpoch();
+    awaitNotifySettled(settled2 + 1);
+    try testing.expectEqual(ep0 + 1, notify_epochs_sent.load());
+    try testing.expectEqual(wh0 + 1, notify_epochs_withheld.load());
+    try expectReads(target, EchoFs.hello_text);
+}
+
+/// The text the coherence row's bind source holds.
+const bound_text = "the bind on hello\n";
+
+/// A test in-flight registry: `busy` is the one nodeid with a request in
+/// flight (0 = none), flipped by the test while the sideband re-judges.
+const BusyProbe = struct {
+    busy: std.atomic.Value(u64),
+
+    fn hasOpOn(ctx: *anyopaque, ino: u64) bool {
+        const self: *BusyProbe = @ptrCast(@alignCast(ctx));
+        return ino != 0 and ino == self.busy.load(.acquire);
+    }
+
+    fn seam(self: *BusyProbe) watchdog.InFlightProbe {
+        return .{ .ctx = self, .hasOpOn = &hasOpOn };
+    }
+};
+
+/// Every notify the kernel has answered (sent, ENOENT or failed).
+fn notifySettled() u64 {
+    return notify_sent.load() + notify_enoent.load() + notify_failed.load();
+}
+
+/// A bounded poll until `n` notifies were answered.
+fn awaitNotifySettled(n: u64) void {
+    const deadline = clock.monotonicNs() + 5 * std.time.ns_per_s;
+    while (notifySettled() < n and clock.monotonicNs() < deadline) std.Thread.yield() catch {};
+}
+
+fn expectReads(path: [:0]const u8, want: []const u8) !void {
+    var buf: [64]u8 = undefined;
+    const n = try readWhole(path.ptr, &buf);
+    try testing.expectEqualStrings(want, buf[0..n]);
 }
 
 test "e2e lattice: every probe verdict on this kernel (kmbuf present with its pair, zc present with CapEff, retention present, TIME_LIMITS present); auto mounts ZeroCopy with width 1, retention armed, no user arena; the gauges publish" {

@@ -3713,6 +3713,16 @@ test "smoke: THE SIDEBAND NEVER inode_locks A DIRECTORY ITS DAEMON OWES A REPLY 
     // after every ack) with the name's INVAL_ENTRY queued on its sideband,
     // and B's create stays in flight, its kernel holding the root's lock.
     _ = try rig.awaitLog("SQUEEZEFS_TEST_TOKEN_RECALL_HOLD — holding until a writer opens", mark_a, ready_wait_ns);
+    // A grant asked across the hold: B's stat of the root misses the
+    // token the recall took, and A parks the grant on the object its held
+    // pass has in flight (the gate's law) — served at the release.
+    var stat_out_buf: [192]u8 = undefined;
+    const stat_out_path = try std.fmt.bufPrint(&stat_out_buf, "{s}/stat.out", .{rig.work});
+    const stat_out = try Io.Dir.cwd().createFile(io, stat_out_path, .{ .truncate = true });
+    defer stat_out.close(io);
+    // Through a shell from the work dir: the spawn returns at the shell's
+    // exec, never on the parked walk into B's root.
+    var stat_root = try std.process.spawn(io, .{ .argv = &.{ "sh", "-c", "exec stat -c %i \"$1\"", "sh", b.mp }, .cwd = .{ .path = rig.work }, .environ_map = &rig.env, .stdin = .ignore, .stdout = .{ .file = stat_out }, .stderr = .{ .file = stat_out } });
     // The law's observable, sampled across the hold: B's sideband thread
     // is never parked in the kernel's `fuse_reverse_inval_entry`.
     var sampled: u32 = 0;
@@ -3740,6 +3750,7 @@ test "smoke: THE SIDEBAND NEVER inode_locks A DIRECTORY ITS DAEMON OWES A REPLY 
     const touch_term = try touch.wait(io);
     const create_ms = (clock.monotonicNs() - t_release) / std.time.ns_per_ms;
     try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, touch_term);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try stat_root.wait(io));
     try testing.expect(create_ms <= cross_owner_rename_bound_s * std.time.ms_per_s);
     const touch_wall = try Io.Dir.cwd().readFileAlloc(io, touch_out_path, gpa, .limited(64));
     defer gpa.free(touch_wall);

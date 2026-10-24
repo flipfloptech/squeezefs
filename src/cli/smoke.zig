@@ -3669,7 +3669,7 @@ fn threadWchan(io: Io, pid: linux.pid_t, comm: []const u8, out: []u8) !?[]const 
     return null;
 }
 
-test "smoke: THE SIDEBAND NEVER inode_locks A DIRECTORY ITS DAEMON OWES A REPLY ON (decision 0003 §AB.2; generic/589 under joins) — A (the manager) + B JOINED; B lists the root (its token on the root with the dentries) and creates INTO the root: the create's step ships to A, A's pass recalls the root from B — B acks at once and queues the name's INVAL_ENTRY — and HOLDS after the acks (the seam), B's create in flight with its kernel holding the root's i_rwsem the whole hold: B's sideband thread is never in `fuse_reverse_inval_entry` (red on dev: it sat there until the create completed — in generic/589 39 s, then an uninterruptible exit), B's INVAL_ENTRY WAITED for the create's answer (deferred ≥ 1, decision 0003 §BL.2); released: the create completes ≤ 2 s, B's next walk of the root sees the file (the expired name's revalidation), no grant of A's served slow; umount B, A → fsck 0 findings" {
+test "smoke: THE SIDEBAND NEVER inode_locks A DIRECTORY ITS DAEMON OWES A REPLY ON (decision 0003 §AB.2; generic/589 under joins) — A (the manager) + B JOINED; B lists the root (its token on the root with the dentries) and creates INTO the root: the create's step ships to A, A's pass recalls the root from B — B acks at once and queues the name's INVAL_ENTRY — and HOLDS after the acks (the seam), B's create in flight with its kernel holding the root's i_rwsem the whole hold: B's sideband thread is never in `fuse_reverse_inval_entry` (red on dev: it sat there until the create completed — in generic/589 39 s, then an uninterruptible exit), B's INVAL_ENTRY WAITED for the create's answer (deferred ≥ 1, decision 0003 §BL.2); released: the create completes ≤ 2 s, B's next walk of the root sees the file (the expired name's revalidation); B's ack came at once — the pass's recall closed on acks alone, every recall of A's acked (none retired at a lease's expiry or the deadline), while a grant B asked across the hold (its stat of the root) PARKED on the held pass and was served at the release (red: the row judged A's 'token_grant served in' line, which a grant parked behind its own hold writes — under load C3's 1511 ms); umount B, A → fsck 0 findings" {
     const io = testing.io;
     if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
     const gpa = testing.allocator;
@@ -3712,7 +3712,19 @@ test "smoke: THE SIDEBAND NEVER inode_locks A DIRECTORY ITS DAEMON OWES A REPLY 
     // A's pass recalled the root from B and holds: B acked (the hold runs
     // after every ack) with the name's INVAL_ENTRY queued on its sideband,
     // and B's create stays in flight, its kernel holding the root's lock.
-    _ = try rig.awaitLog("SQUEEZEFS_TEST_TOKEN_RECALL_HOLD — holding until a writer opens", mark_a, ready_wait_ns);
+    const hold_i = try rig.awaitLog("SQUEEZEFS_TEST_TOKEN_RECALL_HOLD — holding until a writer opens", mark_a, ready_wait_ns);
+    // B's ack came at once: the pass's recall closed on acks alone — a
+    // recall B did not ack retires only at its lease's expiry or the
+    // deadline, and the hold line counts those out of `acked`.
+    {
+        const text = try rig.readLog();
+        defer gpa.free(text);
+        const line_i = std.mem.lastIndexOf(u8, text[0..hold_i], "the pass recalled ") orelse return error.NoRecallSummary;
+        const recalled = numberAfter(text[line_i..hold_i], "recalled ") orelse return error.NoRecallSummary;
+        const acked = numberAfter(text[line_i..hold_i], "frame(s), ") orelse return error.NoRecallSummary;
+        try testing.expect(recalled >= 1);
+        try testing.expectEqual(recalled, acked);
+    }
     // A grant asked across the hold: B's stat of the root misses the
     // token the recall took, and A parks the grant on the object its held
     // pass has in flight (the gate's law) — served at the release.
@@ -3767,12 +3779,15 @@ test "smoke: THE SIDEBAND NEVER inode_locks A DIRECTORY ITS DAEMON OWES A REPLY 
         const sa = try rig.stats();
         defer gpa.free(sa);
         try expectIntentsAtRest(sa);
-        try testing.expect((numberAfter(sa, "\"dlm_token_recalls\":") orelse 0) >= 1);
-        const text = try rig.readLog();
-        defer gpa.free(text);
-        // The hold held the STEP (its serve is logged past 1 s, inside the
-        // reply bound); no grant of A's was ever slow — B's ack came at once.
-        try testing.expect(std.mem.indexOf(u8, text[mark_a..], "token_grant served in") == null);
+        // Every recall of A's acked (the closure `recalls ≡ acks + expired
+        // + timeouts`), and the grant B asked across the hold parked on the
+        // held pass: its serve, logged past 1 s, is the hold's, never an
+        // ack's.
+        const recalls = numberAfter(sa, "\"dlm_token_recalls\":") orelse 0;
+        try testing.expect(recalls >= 1);
+        try testing.expectEqual(@as(?u64, recalls), numberAfter(sa, "\"dlm_token_recall_acks\":"));
+        try testing.expectEqual(@as(?u64, 0), numberAfter(sa, "\"dlm_token_recall_expired_with_lease\":"));
+        try testing.expect((numberAfter(sa, "\"dlm_token_grant_parks\":") orelse 0) >= 1);
     }
     try testing.expectEqual(@as(u32, 0), in_kernel);
     try testing.expect(deferred >= 1);

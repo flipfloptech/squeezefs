@@ -23,6 +23,7 @@
 #   scripts/venue scripts/suites/fstests.sh                     # -g auto, SUITE_RUNS
 #   SUITE_RUNS=1 FSTESTS_GROUPS="-g quick" scripts/venue scripts/suites/fstests.sh
 #   FSTESTS_TESTS="generic/001 generic/003" …                   # a subset (triage)
+#   FSTESTS_AFTER=generic/683 …                                   # resume discovery after a failure (never the release verdict)
 set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 source "$SUITES_DIR/setpaths.sh"
@@ -254,6 +255,21 @@ fstests_run() {
   # that outlived one stop kept running its list against the loop devices
   # the next run re-created, and the two runs fought over one set.
   cp "$SETS/local.config" "$FSTESTS_DIR/local.config"
+  # FSTESTS_AFTER=generic/NNN: resume DISCOVERY after a failure while its fix
+  # is made — the pass runs the tests the list would run after NNN, in
+  # check's order. A discovery pass is never the release verdict: that is one
+  # clean run from the top on the final head.
+  if [ -n "${FSTESTS_AFTER:-}" ]; then
+    # The list from the generated group files (`check -n` is no dry run: it
+    # formats SCRATCH). Groups are FSTESTS_GROUPS' `-g` words; this venue runs
+    # tests/generic only (fuse.squeezefs has no fs-specific directory).
+    local groups listed=()
+    groups=$(sed -E 's/-g[[:space:]]+//g' <<< "$FSTESTS_GROUPS")
+    mapfile -t listed < <(grep -v '^#' "$FSTESTS_DIR/tests/generic/group.list" | awk -v want="$groups" 'BEGIN {n = split(want, w, /[ ,]+/)} {for (i = 2; i <= NF; i++) for (j = 1; j <= n; j++) if ($i == w[j]) {print "generic/" $1; next}}' | sort -u | awk -v after="$FSTESTS_AFTER" 'seen {print} $1 == after {seen = 1}')
+    [ "${#listed[@]}" -gt 0 ] || suite_die "FSTESTS_AFTER=$FSTESTS_AFTER: no test of the groups ($groups) follows it"
+    suite_log "run $n: resuming discovery after $FSTESTS_AFTER — ${#listed[@]} test(s) left in the list"
+    what=("${listed[@]}")
+  fi
   # util-linux 2.39+ remounts through the new mount API, and FUSE refuses
   # every option on a reconfigure there ("No changes allowed in
   # reconfigure": generic/294, 306, 452's `-o remount,ro`); the classic

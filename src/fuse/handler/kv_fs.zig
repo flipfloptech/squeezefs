@@ -6940,6 +6940,76 @@ test "a striped shrink asks the plane for NO write of its own: the kept block's 
     h.release(f);
 }
 
+test "a truncate to the SAME size clips every binding past EOF: a KEEP_SIZE reservation there leaves the map, its reference released in the truncate's tx and its block freed after it (ext4's law — `ext4_setattr` runs `ext4_truncate` at `ia_size <= oldsize`, \"even if i_size didn't change to truncate possible preallocated blocks\"; fstests generic/092's purpose); a same-size truncate with nothing past EOF publishes no layout; a truncate UP keeps the reservation past its new EOF (red: the striped arm returned at `size >= old size`, the reservation stayed charged)" {
+    const H = HarnessOf(SettlingData);
+    var h: H = undefined;
+    try h.init();
+    defer h.deinit();
+    defer h.data.deinit();
+    h.data.store = &h.store;
+    const bs = layout.DEFAULT_CHUNK;
+    const f = try h.create(1, "f", 0o644);
+    const local = try H.Fs.localOf(f);
+    // generic/092 on 4 MiB blocks: `falloc -k 0 10M` + `pwrite 0 5M` leave
+    // blocks 0 and 1 written and block 2 reserved past the EOF.
+    const Map3 = struct {
+        fn publish(hp: *H, ino: u64, size: u64) !void {
+            const ms = [_]Mapping{ Mapping.wholeBlock(0x11, 0, 1), Mapping.wholeBlock(0x11, layout.DEFAULT_CHUNK, 1), Mapping.unwrittenBlock(0x11, 2 * layout.DEFAULT_CHUNK, 1) };
+            var wire: [3]layout.MapEntryWire = undefined;
+            for (ms, &wire, 0..) |m, *e, b| e.* = (layout.MapEntry{ .block = @intCast(b), .mapping = m }).encode();
+            const proofs = [_]layout.DmaProof{
+                .{ .vol_tag = 0x11, .offset = 0, .len = layout.DEFAULT_CHUNK, .completed_ns = 1 },
+                .{ .vol_tag = 0x11, .offset = layout.DEFAULT_CHUNK, .len = layout.DEFAULT_CHUNK, .completed_ns = 1 },
+            };
+            const rec = try hp.fs.readLayout(ino);
+            defer hp.fs.freeLayout(rec);
+            const t = try hp.store.begin(@src());
+            {
+                errdefer hp.store.abandon(t);
+                try layout.publishLayout(t, .{ .ino = ino, .name_key = hp.store.nameKey(), .coll_seq = if (rec) |r| r.coll_seq else 0, .prev = if (rec) |r| r.layout else null, .layout = Layout.stripedInline(size, &wire), .proofs = &proofs }, hp.data.refsSeam(), .default);
+            }
+            try hp.store.commit(t);
+        }
+        fn count(hp: *H, ino: u64) !usize {
+            const rec = try hp.fs.readLayout(ino);
+            defer hp.fs.freeLayout(rec);
+            return rec.?.layout.entries.len;
+        }
+    };
+    var in = abi.zeroed(abi.fuse_setattr_in);
+    in.valid = abi.FATTR_SIZE;
+    in.size = bs + bs / 4;
+    try testing.expectEqual(@as(?linux.E, null), h.setattr(f, in).errno());
+    try Map3.publish(&h, local, in.size);
+    try testing.expectEqual(@as(usize, 3), try Map3.count(&h, local));
+    // `truncate 5M` at 5M: block 2 leaves the map, released and freed.
+    const clips0 = fuse_truncate_striped_clips.load();
+    const rel0 = h.data.releases.items.len;
+    const freed0 = h.data.freed.items.len;
+    try testing.expectEqual(@as(?linux.E, null), h.setattr(f, in).errno());
+    try testing.expectEqual(@as(usize, 2), try Map3.count(&h, local));
+    try testing.expectEqual(clips0 + 1, fuse_truncate_striped_clips.load());
+    try testing.expectEqual(rel0 + 1, h.data.releases.items.len);
+    try testing.expectEqual(@as(u32, 2), h.data.releases.items[rel0].block_index);
+    try testing.expectEqual(freed0 + 1, h.data.freed.items.len);
+    try testing.expectEqual(@as(u64, 2 * bs), h.data.freed.items[freed0].offset);
+    try testing.expectEqual(@as(u32, 0), h.data.unheld_frees);
+    try testing.expectEqual(in.size, (try h.getattr(f)).size);
+    // Nothing past EOF: the same-size truncate stamps and clips nothing.
+    try testing.expectEqual(@as(?linux.E, null), h.setattr(f, in).errno());
+    try testing.expectEqual(clips0 + 1, fuse_truncate_striped_clips.load());
+    try testing.expectEqual(freed0 + 1, h.data.freed.items.len);
+    // `falloc -k 5M 5M` + `truncate 7M`: a truncate UP keeps the reservation.
+    try Map3.publish(&h, local, in.size);
+    in.size = 2 * bs + bs / 4;
+    try testing.expectEqual(@as(?linux.E, null), h.setattr(f, in).errno());
+    try testing.expectEqual(@as(usize, 3), try Map3.count(&h, local));
+    try testing.expectEqual(clips0 + 1, fuse_truncate_striped_clips.load());
+    try testing.expectEqual(freed0 + 1, h.data.freed.items.len);
+    try testing.expectEqual(in.size, (try h.getattr(f)).size);
+    h.release(f);
+}
+
 // Rung 9 (the external suites' fsstress rounds): a 20-writer burst of 3–4 MiB
 // files outran the ring's promotion — `staging ring full: a 3.5 MB record
 // found no hole in a 343 MB segment with 155 live entries` — and the
@@ -8156,6 +8226,59 @@ test "fallocate (charter §6.6) — the striped arms through the plane's face: a
     const u32_0 = fuse_write_u32_index_refused.load();
     try testing.expectEqual(@as(?linux.E, .FBIG), h.fallocate(f, KEEP, bs * @as(u64, std.math.maxInt(u32)), bs));
     try testing.expectEqual(u32_0 + 1, fuse_write_u32_index_refused.load());
+    h.release(f);
+}
+
+test "fallocate (charter §6.6; fstests generic/695) — a PUNCH/ZERO range that STARTS on a block boundary and ends inside that block is the block's partial edge: `fpunch 8M 2M` and `fzero 8M 2M` on 4 MiB blocks zero [8M, 10M) through the write admission (red: the head edge needs an unaligned start, the tail edge a later block than the start's, no whole block fits — the call answered 0 with the bytes standing, and generic/695 read 0xab back at [8M, 10M) after its fsync and power cut); the range ending ON a later boundary is a head edge alone, and one from an unaligned start into a later block's middle is a head edge, the whole blocks and a tail edge" {
+    const H = HarnessOf(SettlingData);
+    var h: H = undefined;
+    try h.init();
+    defer h.deinit();
+    defer h.data.deinit();
+    h.data.store = &h.store;
+    const bs = layout.DEFAULT_CHUNK;
+    const KEEP = H.Fs.FALLOC.KEEP_SIZE;
+    const PUNCH = H.Fs.FALLOC.PUNCH_HOLE;
+    const ZERO = H.Fs.FALLOC.ZERO_RANGE;
+    const f = try h.create(1, "f", 0o644);
+    const local = try H.Fs.localOf(f);
+    // generic/695's file: three blocks, every one written, sized 3 bs.
+    try testing.expectEqual(@as(?linux.E, null), h.fallocate(f, 0, 0, 3 * bs));
+    for (0..3) |b| h.data.setBound(local, @intCast(b), .written);
+    const w0 = h.data.writes.items.len;
+    const res0 = h.data.reservations.items.len;
+    // `fpunch 2M 2M` (a head edge ending on the boundary), then `fpunch 8M 2M`.
+    try testing.expectEqual(@as(?linux.E, null), h.fallocate(f, PUNCH | KEEP, bs / 2, bs / 2));
+    try testing.expectEqual(@as(?linux.E, null), h.fallocate(f, PUNCH | KEEP, 2 * bs, bs / 2));
+    // `fzero 4M 2M` and, without KEEP_SIZE inside the size, `fzero 8M 1M`.
+    try testing.expectEqual(@as(?linux.E, null), h.fallocate(f, ZERO | KEEP, bs, bs / 2));
+    try testing.expectEqual(@as(?linux.E, null), h.fallocate(f, ZERO, 2 * bs, bs / 4));
+    const want = [_]struct { offset: u64, len: u64 }{
+        .{ .offset = bs / 2, .len = bs / 2 },
+        .{ .offset = 2 * bs, .len = bs / 2 },
+        .{ .offset = bs, .len = bs / 2 },
+        .{ .offset = 2 * bs, .len = bs / 4 },
+    };
+    try testing.expectEqual(w0 + want.len, h.data.writes.items.len);
+    for (want, h.data.writes.items[w0..]) |w, got| {
+        try testing.expectEqual(w.offset, got.offset);
+        try testing.expectEqual(w.len, got.len);
+        try testing.expectEqual(3 * bs, got.view_size);
+    }
+    // Nothing whole inside any of them: no punch, no flip, the size stands.
+    try testing.expectEqual(@as(usize, 0), h.data.punches.items.len);
+    try testing.expectEqual(res0, h.data.reservations.items.len);
+    try testing.expectEqual(@as(u64, 3 * bs), (try h.getattr(f)).size);
+    // [100, 2 bs + 100): the head [100, bs), block 1 whole, the tail [2 bs, 2 bs + 100).
+    const w1 = h.data.writes.items.len;
+    try testing.expectEqual(@as(?linux.E, null), h.fallocate(f, PUNCH | KEEP, 100, 2 * bs));
+    try testing.expectEqual(w1 + 2, h.data.writes.items.len);
+    try testing.expectEqual(@as(u64, 100), h.data.writes.items[w1].offset);
+    try testing.expectEqual(@as(u64, bs - 100), h.data.writes.items[w1].len);
+    try testing.expectEqual(@as(u64, 2 * bs), h.data.writes.items[w1 + 1].offset);
+    try testing.expectEqual(@as(u64, 100), h.data.writes.items[w1 + 1].len);
+    try testing.expectEqual(@as(usize, 1), h.data.punches.items.len);
+    try testing.expectEqual(SettlingData.Punched{ .ino = local, .first = 1, .last = 1 }, h.data.punches.items[0]);
     h.release(f);
 }
 

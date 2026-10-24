@@ -7775,6 +7775,24 @@ const DmErrorSet = struct {
         self.rig.gpa.free(try self.rig.shOk(self.rig.work, try std.fmt.bufPrint(script[0..256], "dmsetup suspend --nolockfs {s} && dmsetup load {s} --table \"{s}\" && dmsetup resume {s} && echo ok", .{ self.name, self.name, table, self.name })));
     }
 
+    /// The venue's dm-flakey target (loaded on demand), else the skip's
+    /// reason.
+    fn flakeyMissing(rig: *Rig) ?testkit.Why {
+        const r = rig.sh(rig.work, "modprobe dm-flakey >/dev/null 2>&1; dmsetup targets | grep -q '^flakey '") catch return .{ .class = .no_kernel_feature, .detail = "dm-flakey" };
+        defer rig.freeRun(r);
+        return if (r.term.success()) null else .{ .class = .no_kernel_feature, .detail = "dm-flakey" };
+    }
+
+    /// A POWER CUT from this instant (xfstests `_load_flakey_table
+    /// $FLAKEY_DROP_WRITES`): every write and flush of the set is
+    /// acknowledged and dropped, reads served; false swaps the working
+    /// table back. Suspended without lockfs, as `load`.
+    fn dropWrites(self: *DmErrorSet, drop: bool) !void {
+        var script: [512]u8 = undefined;
+        const table = if (drop) try std.fmt.bufPrint(script[256..], "0 {d} flakey {s} 0 0 180 1 drop_writes", .{ self.sectors, self.loop }) else try std.fmt.bufPrint(script[256..], "0 {d} linear {s} 0", .{ self.sectors, self.loop });
+        self.rig.gpa.free(try self.rig.shOk(self.rig.work, try std.fmt.bufPrint(script[0..256], "dmsetup suspend --nolockfs {s} && dmsetup load {s} --table \"{s}\" && dmsetup resume {s} && echo ok", .{ self.name, self.name, table, self.name })));
+    }
+
     /// The table swap without lockfs (`_dmerror_load_error_table`'s
     /// sudden disk failure; `_dmerror_load_working_table`).
     fn load(self: *DmErrorSet, failing: bool) !void {
@@ -13269,6 +13287,129 @@ test "smoke: FALLOCATE — EVERY MODE'S LAW (charter §6.6; decision 0003 §BH) 
     try rig.umount();
     try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
     _ = try fsckClean(rig, "the clean unmount after the fallocate matrix");
+}
+
+test "smoke: A PUNCH, A ZERO RANGE AND A SAME-SIZE TRUNCATE SURVIVE A POWER CUT (fstests generic/695, 092; charter §6.6) — a set over device-mapper slices of 4 MiB blocks: generic/092's `falloc -k 0 12m` + `pwrite 0 5m` + `truncate 5m` returns the reservation past EOF (`df` 12 → 8 MiB) and `falloc -k 5m 5m` + `truncate 7m` keeps it (12 MiB); generic/695's `truncate 12M` + `pwrite -S 0xab 2M 8M` + sync, then `fpunch 2M 2M` + `fpunch 8M 2M` + fsync (and the same with `fzero`) reads zeros at [2M, 4M) and [8M, 10M) around the 0xab of [4M, 8M) → dm-flakey drops every write (the power cut) → unmount → the working table → fsck --offline --scrub clean → remount: every file byte-exact as fsync'd → clean unmount; no error line, no tripwire (red on dev: `fpunch 8M 2M` and `fzero 8M 2M` — a range starting ON a block boundary and ending inside it — zeroed nothing, read 0xab before and after the cut; the same-size truncate kept the reservation, `df` 12)" {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    if (DmErrorSet.venueMissing()) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    if (DmErrorSet.flakeyMissing(rig)) |why| return testkit.skipWhy(@src(), why);
+    var dm = try DmErrorSet.up(rig);
+    defer dm.deinit();
+    {
+        const r = try rig.squeezefs(&.{ "format", dm.meta_uri, dm.data_uri });
+        defer rig.freeRun(r);
+        if (!r.term.success()) std.debug.print("\nformat: {s}\n", .{r.stderr});
+        try testing.expect(r.term.success());
+    }
+    try rig.spawnMountOf(dm.meta_uri, &.{});
+    _ = try rig.awaitReady(0);
+    const mark = try rig.logLen();
+    // The expected images, off the mount.
+    rig.gpa.free(try rig.shOk(rig.work,
+        \\xfs_io -f -c "truncate 12M" -c "pwrite -S 0xab 4M 4M" expect695 >/dev/null
+        \\xfs_io -f -c "truncate 7m" -c "pwrite -S 0xcd 0 5m" expect092 >/dev/null
+        \\echo ok
+    ));
+    const same =
+        \\same() { if cmp -s "$1" "$2"; then echo "$1 whole"; else echo "$1 differs: $(cmp "$1" "$2" 2>&1 | sed 's/.*differ: //')"; fi; }
+        \\
+    ;
+    // 1. generic/092: the same-size truncate returns the reservation past
+    //    EOF; the truncate up keeps it.
+    {
+        const out = try rig.onMountTimed(
+            \\used() { df -kP . | tail -1 | awk '{print $3}'; }
+            \\u0=$(used)
+            \\xfs_io -f -c "falloc -k 0 12m" -c "pwrite -S 0xcd 0 5m" -c fsync t >/dev/null
+            \\u1=$(used)
+            \\xfs_io -c "truncate 5m" -c fsync t
+            \\i=0; while [ $i -lt 100 ]; do u2=$(used); [ $(( (u2 - u0) / 1024 )) -le 8 ] && break; i=$((i+1)); sleep 0.1; done
+            \\echo "falloc $(( (u1 - u0) / 1024 )) same-size $(( (u2 - u0) / 1024 )) size $(stat -c %s t)"
+            \\xfs_io -c "falloc -k 5m 5m" -c "truncate 7m" -c fsync t
+            \\u3=$(used)
+            \\echo "up $(( (u3 - u0) / 1024 )) size $(stat -c %s t)"
+        , 120);
+        defer gpa.free(out);
+        std.debug.print("\nsmoke[punch-cut]: generic/092:\n{s}", .{out});
+        try testing.expect(std.mem.indexOf(u8, out, "falloc 12 same-size 8 size 5242880\n") != null);
+        try testing.expect(std.mem.endsWith(u8, out, "up 12 size 7340032\n"));
+    }
+    // 2. generic/695 with fpunch and with fzero: zeros at both ranges
+    //    before the cut.
+    const script695 = same ++
+        \\xfs_io -f -c "truncate 12M" -c "pwrite -S 0xab 2M 8M" p >/dev/null
+        \\xfs_io -f -c "truncate 12M" -c "pwrite -S 0xab 2M 8M" z >/dev/null
+        \\sync -f .
+        \\xfs_io -c "fpunch 2M 2M" -c "fpunch 8M 2M" -c fsync p
+        \\xfs_io -c "fzero 2M 2M" -c "fzero 8M 2M" -c fsync z
+        \\same p "$1/expect695"
+        \\same z "$1/expect695"
+        \\same t "$1/expect092"
+    ;
+    const reread = same ++
+        \\same p "$1/expect695"
+        \\same z "$1/expect695"
+        \\same t "$1/expect092"
+    ;
+    const want = "p whole\nz whole\nt whole\n";
+    {
+        const out = try rig.onMountTimed(script695, 120);
+        defer gpa.free(out);
+        std.debug.print("smoke[punch-cut]: generic/695 before the cut:\n{s}", .{out});
+        try testing.expectEqualStrings(want, out);
+    }
+    // 3. The power cut: every write dropped from here, the unmount's
+    //    included; the working table back; the set as the device holds it.
+    try dm.dropWrites(true);
+    {
+        errdefer dm.dropWrites(false) catch {};
+        try rig.umount();
+        try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+    }
+    try dm.dropWrites(false);
+    {
+        const r = try rig.squeezefs(&.{ "fsck", "--offline", "--scrub", dm.meta_uri });
+        defer rig.freeRun(r);
+        if (!r.term.success() or std.mem.indexOf(u8, r.stdout, "findings: 0 (clean)") == null) {
+            std.debug.print("\n--- fsck --offline after the power cut ({f}) ---\n{s}\n--- stderr ---\n{s}\n", .{ r.term, r.stdout, r.stderr });
+            return error.FsckNotClean;
+        }
+        // The cut is real: the unmount's clean mark never reached the
+        // device, so fsck's guarded open replayed the journal.
+        const rec = try recoveryOf(r.stderr);
+        std.debug.print("smoke[punch-cut]: fsck after the cut: findings 0, replayed {d} entries\n", .{rec.replayed});
+        try testing.expect(std.mem.indexOf(u8, r.stderr, ", clean unmount") == null);
+        try testing.expect(rec.replayed > 0);
+    }
+    const mark2 = try rig.logLen();
+    try rig.spawnMountOf(dm.meta_uri, &.{});
+    _ = try rig.awaitReady(mark2);
+    {
+        const out = try rig.onMountTimed(reread, 120);
+        defer gpa.free(out);
+        std.debug.print("smoke[punch-cut]: after the power cut:\n{s}", .{out});
+        try testing.expectEqualStrings(want, out);
+    }
+    {
+        const t = try rig.stats();
+        defer gpa.free(t);
+        try expectMustStayZero(t);
+    }
+    {
+        const text = try rig.readLog();
+        defer gpa.free(text);
+        const seg = text[mark..];
+        const errors = std.mem.count(u8, seg, "error(");
+        if (errors != 0) std.debug.print("--- the daemon's alert lines ---\n{s}\n", .{seg});
+        try testing.expectEqual(@as(usize, 0), errors);
+        try testing.expectEqual(@as(usize, 0), std.mem.count(u8, seg, "TRIPWIRE"));
+    }
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
 }
 
 test "smoke: FALLOCATE STRIPS THE SETID BITS (fstests generic/683; decision 0003 §BK: the kernel strips nothing around FUSE_FALLOCATE — the daemon owns `should_remove_suid` + the group rule) — mounted allow_other: over root's 192 KiB files `fallocate -o 64k -l 64k` by a non-owner outside the group without CAP_FSETID (setpriv) ⇒ 6666→666, 6676→676, 6766→766, 6777→777, 2676→676, 2777→777, 2666→666 (a non-member's sgid goes without group-exec); by root every mode kept; `.stats` fuse_fallocate_setid_strips = 7; B JOINS and the non-owner's `truncate -s 0` through B's mount over A's 6666 and 6676 files (the SHIPPED setattr's kill bit — FATTR_KILL_SUIDGID's law: suid always, sgid iff group-exec; handoff 2026-10-21 create 7b) lands 2666 and 676 at the holder, record_killpriv_strips = 2 on A, both views agree; no alert line" {

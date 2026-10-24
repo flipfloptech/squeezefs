@@ -13500,7 +13500,10 @@ test "smoke: ONLINE FSCK THROUGH THE ADMIN LANE — the fill (dirs, 200 packed f
         var got = try verbJsonTarget(rig, "scrub", rig.mp, &.{"--online"});
         defer got.report.deinit(gpa);
         const c = got.report.counters;
-        std.debug.print("smoke[fsck-online]: the two-daemon set from A: scrub --online read {d} block(s) ({d} B), {d} failure(s), {d} finding(s); fleet dispatched {d}\n", .{ c.scrub_blocks_scanned, c.scrub_bytes_scanned, c.scrub_failures, got.report.findings.len, blk: {
+        // A's open pack whose tenants straddle A's view and B's custody
+        // (the fill promoted by a syncfs) holds its pin: the merged arm's
+        // pack-open ledger exempts it (`[C3] refcount 37 vs 36` without).
+        std.debug.print("smoke[fsck-online]: the two-daemon set from A: scrub --online read {d} block(s) ({d} B), {d} failure(s), {d} finding(s); pack-ledger exempted {d}, merged suspects cleared {d}; fleet dispatched {d}\n", .{ c.scrub_blocks_scanned, c.scrub_bytes_scanned, c.scrub_failures, got.report.findings.len, c.pack_ledger_exempted, c.suspects_cleared, blk: {
             const sa = try rig.stats();
             defer gpa.free(sa);
             break :blk numberAfter(sa, "\"job_fleet_shards_dispatched\":") orelse 0;

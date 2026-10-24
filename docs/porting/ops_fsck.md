@@ -127,6 +127,12 @@ post-settle, `L2127-2143`) → sort + dedup findings → `publish_metrics` (`L21
    that ended the next one's mint) — and the C2-leaked / C3 re-checks read the allocator again
    AFTER their fresh derivation (still tracked, at the judged count for C3, no live owner in
    flight, no mint under this scan): registry-absence, then the references, then the tracking.
+   The fleet's MERGED arms (lost + C3 over the holder's census and the members' custodies,
+   decision 0003 "The merged block census") pass the same live-owner shields (`liveOwnerShielded`:
+   the registry, then the pack-open ledger — an open pack straddling the holder's view and a
+   member's custody read `refcount 37 vs 36` without it) and confirm on a round whose references
+   are ALL fresh — the members' second census and the holder's view census'd again
+   (`runner.confirmMerged`).
 3. **The inode plane (C9, C10)**: the era floor (C9) / the `(nlink, ctime)` record witness (C10)
    + the open cross-volume intent exemption (the registry's role here, `open_intent_inos`,
    `L7006-7042`) + ONE fresh dentry pass + the exclusive 4a re-check (§3.9, §3.10).

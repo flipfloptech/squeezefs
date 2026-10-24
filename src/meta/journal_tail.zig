@@ -458,7 +458,19 @@ pub const linux_tail = if (builtin.os.tag == .linux) struct {
         if (linux.errno(dev_rc) != .SUCCESS) return error.DeviceOpenFailed;
         var sink: DeviceSink = .{ .fd = @intCast(dev_rc) };
         defer _ = linux.close(sink.fd);
-        const out = image.replay(.{ .ctx = &sink, .write = DeviceSink.write }) catch return error.DeviceWriteFailed;
+        // The replay's page cache leaves with the supervisor on every
+        // outcome: a refused write still `fsync`s what landed in the cache
+        // before it, so their writeback error is consumed on THIS descriptor
+        // and no dirty page is left for the flusher — a later writeback
+        // error is handed to the successor's first barrier as a stale EIO
+        // (xfstests generic/753: the next mount's fdatasync failed on a
+        // healthy table), a later success lands old windows under its
+        // O_DIRECT ring. Then the clean pages go.
+        defer _ = linux.fadvise(sink.fd, 0, 0, linux.POSIX_FADV.DONTNEED);
+        const out = image.replay(.{ .ctx = &sink, .write = DeviceSink.write }) catch {
+            _ = linux.fsync(sink.fd);
+            return error.DeviceWriteFailed;
+        };
         if (linux.errno(linux.fsync(sink.fd)) != .SUCCESS) return error.BarrierFailed;
         return out;
     }

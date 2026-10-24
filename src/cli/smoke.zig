@@ -7037,8 +7037,12 @@ test "smoke: A FAILED VOLUME'S DAEMON SERVES EIO UNTIL ITS UNMOUNT AND NEVER DIE
         const pid = blk: {
             const r = try rig.squeezefs(&.{ "mount", "--daemon", "--supervise", "--log-file", rig.log_path, "-o", "default_permissions,allow_other", dm.meta_uri, rig.mp });
             defer rig.freeRun(r);
-            if (!r.term.success()) std.debug.print("\ncycle {d}: daemon mount: {s}\n", .{ cycle, r.stderr });
-            try testing.expect(r.term.success());
+            if (!r.term.success()) {
+                const t = try rig.readLog();
+                defer gpa.free(t);
+                std.debug.print("\ncycle {d}: daemon mount: {s}\n--- its log ---\n{s}\n", .{ cycle, r.stderr, t[@min(mark, t.len)..] });
+                return error.MountFailed;
+            }
             const ready_i = try rig.awaitLog("ready: ", mark, ready_wait_ns);
             const text = try rig.readLog();
             defer gpa.free(text);

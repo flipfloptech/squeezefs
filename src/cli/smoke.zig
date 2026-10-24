@@ -9161,9 +9161,16 @@ test "smoke: A FAILED VOLUME'S DAEMON SERVES EIO UNTIL ITS UNMOUNT AND NEVER DIE
     }
     try umountDaemon(rig, pid);
     {
+        // The supervisor names the exit after its replay of the tail at the
+        // death (`Tails.replayAndRelease`): the line trails the daemon's
+        // exit, so it is awaited, never read off the snapshot at the death.
+        const exit_i = try rig.awaitLog("exited (wait status 0x", mark, exit_wait_ns);
         const t = try rig.readLog();
         defer gpa.free(t);
-        try testing.expect(std.mem.indexOf(u8, t[mark..], "exited (wait status 0x0); done") != null);
+        if (!std.mem.startsWith(u8, t[exit_i..], "0); done")) {
+            std.debug.print("\n--- the working table's daemon: its exit was not its own ---\n{s}\n", .{t[mark..]});
+            return error.WorkingDaemonNotOwnExit;
+        }
     }
     {
         const r = try rig.squeezefs(&.{ "fsck", "--offline", "--scrub", dm.meta_uri });

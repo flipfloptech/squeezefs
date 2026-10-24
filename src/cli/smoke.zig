@@ -6880,6 +6880,294 @@ test "smoke: THE REPLAY PROOF (charter §5.2 the ack point, decision 0003 §BB) 
     _ = try fsckClean(rig, "the foreground arm's clean unmount");
 }
 
+/// A set over ONE device-mapper device whose table flips between `linear`
+/// and `error` (xfstests `common/dmerror`): a loop device over a sparse
+/// file under the rig's work dir, the switchable device over it, and the
+/// set's three slices over that (the suites' layout, `setpaths.sh`). Names
+/// are pid-tagged; `down` is idempotent and runs on every exit.
+const DmErrorSet = struct {
+    rig: *Rig,
+    name: []u8,
+    loop: []u8 = &.{},
+    sectors: u64 = 0,
+    meta_uri: []u8,
+    data_uri: []u8,
+    up_count: u8 = 0,
+
+    const meta_sectors: u64 = (512 << 20) / 512;
+    const data_sectors: u64 = (128 << 20) / 512;
+
+    /// The venue's device-mapper and loop driver (root, `dmsetup`,
+    /// `losetup`), else the skip's reason.
+    fn venueMissing() ?testkit.Why {
+        for ([_][:0]const u8{ "/dev/mapper/control", "/dev/loop-control" }) |node| {
+            const rc = linux.open(node.ptr, .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);
+            if (linux.errno(rc) != .SUCCESS) return .{ .class = .no_device, .detail = node };
+            _ = linux.close(@intCast(rc));
+        }
+        return null;
+    }
+
+    fn up(rig: *Rig) !DmErrorSet {
+        const gpa = rig.gpa;
+        const pid = linux.getpid();
+        const name = try std.fmt.allocPrint(gpa, "sqz-smoke-{d}-err", .{pid});
+        errdefer gpa.free(name);
+        const meta_uri = try std.fmt.allocPrint(gpa, "sqmeta:///dev/mapper/{s}-meta", .{name});
+        errdefer gpa.free(meta_uri);
+        const data_uri = try std.fmt.allocPrint(gpa, "sqdata:///dev/mapper/{s}-d0,/dev/mapper/{s}-d1", .{ name, name });
+        errdefer gpa.free(data_uri);
+        var self: DmErrorSet = .{ .rig = rig, .name = name, .meta_uri = meta_uri, .data_uri = data_uri, .sectors = meta_sectors + 2 * data_sectors };
+        errdefer self.down();
+        var script: [1024]u8 = undefined;
+        const out = try rig.shOk(rig.work, try std.fmt.bufPrint(&script,
+            \\truncate -s {d} dmerr.img
+            \\losetup -f --show dmerr.img
+        , .{self.sectors * 512}));
+        defer gpa.free(out);
+        self.loop = try gpa.dupe(u8, std.mem.trim(u8, out, " \n"));
+        self.up_count = 1;
+        gpa.free(try rig.shOk(rig.work, try std.fmt.bufPrint(&script,
+            \\dmsetup create {s} --table "0 {d} linear {s} 0"
+            \\dmsetup create {s}-meta --table "0 {d} linear /dev/mapper/{s} 0"
+            \\dmsetup create {s}-d0 --table "0 {d} linear /dev/mapper/{s} {d}"
+            \\dmsetup create {s}-d1 --table "0 {d} linear /dev/mapper/{s} {d}"
+            \\dmsetup mknodes >/dev/null 2>&1 || true
+            \\echo up
+        , .{ name, self.sectors, self.loop, name, meta_sectors, name, name, data_sectors, name, meta_sectors, name, data_sectors, name, meta_sectors + data_sectors })));
+        self.up_count = 2;
+        return self;
+    }
+
+    /// The table swap without lockfs (`_dmerror_load_error_table`'s
+    /// sudden disk failure; `_dmerror_load_working_table`).
+    fn load(self: *DmErrorSet, failing: bool) !void {
+        var script: [512]u8 = undefined;
+        const table = if (failing) try std.fmt.bufPrint(script[256..], "0 {d} error", .{self.sectors}) else try std.fmt.bufPrint(script[256..], "0 {d} linear {s} 0", .{ self.sectors, self.loop });
+        self.rig.gpa.free(try self.rig.shOk(self.rig.work, try std.fmt.bufPrint(script[0..256], "dmsetup suspend --nolockfs {s} && dmsetup load {s} --table \"{s}\" && dmsetup resume {s} && echo ok", .{ self.name, self.name, table, self.name })));
+    }
+
+    fn down(self: *DmErrorSet) void {
+        const gpa = self.rig.gpa;
+        var script: [1024]u8 = undefined;
+        if (self.up_count >= 1) {
+            // A row that failed mid-cycle leaves its daemon (and supervisor)
+            // holding the slices: killed and detached first (`[/]` keeps the
+            // pattern from matching this shell's own command line).
+            const cmd = std.fmt.bufPrint(&script, "pkill -KILL -f '[/]dev/mapper/{s}-meta' >/dev/null 2>&1 || true; umount -l {s} >/dev/null 2>&1 || true; dmsetup resume {s} >/dev/null 2>&1 || true; for s in -d1 -d0 -meta ''; do dmsetup remove --retry {s}$s >/dev/null 2>&1 || true; done; losetup -d {s} >/dev/null 2>&1 || true; rm -f dmerr.img", .{ self.name, self.rig.mp, self.name, self.name, self.loop }) catch "";
+            if (self.rig.sh(self.rig.work, cmd)) |r| self.rig.freeRun(r) else |_| {}
+        }
+        self.up_count = 0;
+        if (self.loop.len != 0) gpa.free(self.loop);
+        self.loop = &.{};
+    }
+
+    fn deinit(self: *DmErrorSet) void {
+        self.down();
+        const gpa = self.rig.gpa;
+        gpa.free(self.name);
+        gpa.free(self.meta_uri);
+        gpa.free(self.data_uri);
+    }
+};
+
+/// One worker of the xattr storm (generic/753's fsstress mix: unlink and
+/// rmdir heavy, xattr sets, lists and gets of up to 2,000 names per file —
+/// values mostly small so 64 files stay far below the metadata volume's
+/// capacity: a full volume answers ENOSPC, never the FAILED path) under
+/// `<mp>/w<N>`; every refusal (EIO on the FAILED volume) is swallowed — the
+/// storm runs until killed.
+const xattr_storm_script =
+    \\import os, random, sys
+    \\mp, w = sys.argv[1], sys.argv[2]
+    \\d = os.path.join(mp, "w" + w)
+    \\r = random.Random(int(w))
+    \\sizes = (8, 32, 256, 256, 4000)
+    \\while True:
+    \\    try:
+    \\        os.makedirs(d, exist_ok=True)
+    \\        f = os.path.join(d, "f%d" % r.randrange(16))
+    \\        op = r.randrange(100)
+    \\        if op < 3:
+    \\            os.unlink(f)
+    \\        elif op < 6:
+    \\            s = os.path.join(d, "s%d" % r.randrange(4))
+    \\            os.mkdir(s)
+    \\            os.rmdir(s)
+    \\        else:
+    \\            if not os.path.exists(f):
+    \\                open(f, "a").close()
+    \\            if op < 60:
+    \\                os.setxattr(f, "user.a%d" % r.randrange(2000), b"x" * r.choice(sizes))
+    \\            elif op < 70:
+    \\                os.removexattr(f, "user.a%d" % r.randrange(2000))
+    \\            elif op < 90:
+    \\                os.listxattr(f)
+    \\            else:
+    \\                names = os.listxattr(f)
+    \\                if names:
+    \\                    os.getxattr(f, r.choice(names))
+    \\    except OSError:
+    \\        pass
+;
+
+const dm_error_cycles: usize = 8;
+const dm_error_storm_workers: usize = 4;
+
+test "smoke: A FAILED VOLUME'S DAEMON SERVES EIO UNTIL ITS UNMOUNT AND NEVER DIES OF IT — ITS UNMOUNT ALWAYS COMPLETES AND NEVER LEAVES A SERVER-LESS MOUNT (xfstests generic/753; charter §1.8) — a set over a device-mapper device whose table flips to `error` without lockfs under an xattr storm, 8 cycles: the volume latches FAILED (a create answers EIO), the daemon stays alive with its mount in the table; the storm killed, `squeezefs umount` exits 0 without the `no squeezefs daemon serves it` fallback, the daemon exits 1 by itself naming the FAILED member (its supervisor: `exited (wait status 0x100)` — never a signal), no mount at the path, a second `squeezefs umount` answers `not mounted`; the working table back, the next mount serves the storm's tree, unmounts clean and the set fscks clean (red on 7a6e224: every failed node read freed its 256 KiB buffer twice — the second munmap took a FUSE worker's live listxattr array, SIGSEGV, wait status 0x8b, the test's unmount met a mount with no daemon)" {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    if (DmErrorSet.venueMissing()) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    var dm = try DmErrorSet.up(rig);
+    defer dm.deinit();
+    if (rig.log_file == null) rig.log_file = try openLogAppend(rig.log_path);
+    {
+        const r = try rig.squeezefs(&.{ "format", dm.meta_uri, dm.data_uri });
+        defer rig.freeRun(r);
+        if (!r.term.success()) std.debug.print("\nformat: {s}\n", .{r.stderr});
+        try testing.expect(r.term.success());
+    }
+    var latched_cycles: usize = 0;
+    var cycle: usize = 0;
+    while (cycle < dm_error_cycles) : (cycle += 1) {
+        const mark = try rig.logLen();
+        const pid = blk: {
+            const r = try rig.squeezefs(&.{ "mount", "--daemon", "--supervise", "--log-file", rig.log_path, "-o", "default_permissions,allow_other", dm.meta_uri, rig.mp });
+            defer rig.freeRun(r);
+            if (!r.term.success()) std.debug.print("\ncycle {d}: daemon mount: {s}\n", .{ cycle, r.stderr });
+            try testing.expect(r.term.success());
+            const ready_i = try rig.awaitLog("ready: ", mark, ready_wait_ns);
+            const text = try rig.readLog();
+            defer gpa.free(text);
+            break :blk @as(linux.pid_t, @intCast(numberAfter(text[ready_i..], "(pid ") orelse return error.NoPid));
+        };
+        var workers: [dm_error_storm_workers]std.process.Child = undefined;
+        var spawned: usize = 0;
+        defer for (workers[0..spawned]) |*w| {
+            if (w.id) |wp| _ = linux.kill(-wp, .KILL);
+            w.kill(io);
+        };
+        while (spawned < dm_error_storm_workers) : (spawned += 1) {
+            var nb: [8]u8 = undefined;
+            workers[spawned] = try std.process.spawn(io, .{ .argv = &.{ "python3", "-c", xattr_storm_script, rig.mp, try std.fmt.bufPrint(&nb, "{d}", .{spawned}) }, .environ_map = &rig.env, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore, .pgid = 0 });
+        }
+        // generic/753's `sleep $((RANDOM % 3))`, 0 included: the failure
+        // lands right after the bring-up too.
+        sleepMs(400 * (cycle % 3));
+        try dm.load(true);
+        // FAILED: a create answers EIO (the first may still be acked in RAM;
+        // its journal write fails and latches the volume).
+        {
+            const deadline = clock.monotonicNs() + 20 * std.time.ns_per_s;
+            var probe: usize = 0;
+            while (true) : (probe += 1) {
+                var script: [160]u8 = undefined;
+                const r = try rig.sh(rig.work, try std.fmt.bufPrint(&script, "touch {s}/probe-{d}-{d} 2>&1 || true", .{ rig.mp, cycle, probe }));
+                defer rig.freeRun(r);
+                if (std.mem.indexOf(u8, r.stdout, "Input/output error") != null) break;
+                if (!alive(pid) or clock.monotonicNs() >= deadline) {
+                    const t = try rig.readLog();
+                    defer gpa.free(t);
+                    std.debug.print("\n--- cycle {d}: no EIO from a create under the error table (daemon alive: {}) — last answer: {s} ---\n{s}\n", .{ cycle, alive(pid), r.stdout, t[mark..] });
+                    return error.NoFailStop;
+                }
+                sleepMs(20);
+            }
+        }
+        // The storm keeps running against the FAILED volume (the window the
+        // daemon died in): served, EIO, the mount standing.
+        for (0..10) |_| {
+            sleepMs(100);
+            if (!alive(pid)) {
+                const t = try rig.readLog();
+                defer gpa.free(t);
+                std.debug.print("\n--- cycle {d}: the daemon of a FAILED volume died with its mount in the table ---\n{s}\n", .{ cycle, t[mark..] });
+                return error.FailedDaemonDied;
+            }
+            try testing.expectEqual(@as(usize, 1), try fuseMountsOf(gpa, io, rig.mp));
+        }
+        for (workers[0..spawned]) |*w| {
+            if (w.id) |wp| _ = linux.kill(-wp, .KILL);
+            _ = w.wait(io) catch {};
+        }
+        spawned = 0;
+        {
+            const r = try rig.squeezefs(&.{ "umount", rig.mp });
+            defer rig.freeRun(r);
+            if (!r.term.success() or std.mem.indexOf(u8, r.stderr, "no squeezefs daemon serves it") != null or std.mem.indexOf(u8, r.stderr, "died without unmounting") != null) {
+                const t = try rig.readLog();
+                defer gpa.free(t);
+                std.debug.print("\n--- cycle {d}: umount of the FAILED mount ({f}): {s} ---\n{s}\n", .{ cycle, r.term, r.stderr, t[mark..] });
+                return error.FailedUnmountNotOrderly;
+            }
+        }
+        // The daemon's own exit, never a signal: 1 when a member latched
+        // FAILED (named in its log), 0 when the cycle's failures were reads
+        // and checkpoint writes alone (those retry; they never latch).
+        const exit_i = try rig.awaitLog("exited (wait status 0x", mark, exit_wait_ns);
+        {
+            const t = try rig.readLog();
+            defer gpa.free(t);
+            const latched = std.mem.indexOf(u8, t[mark..exit_i], "latched FAILED during this mount (EIO until remount) — exiting 1") != null;
+            if (!std.mem.startsWith(u8, t[exit_i..], if (latched) "100); done" else "0); done")) {
+                std.debug.print("\n--- cycle {d}: the daemon's exit was not its own (latched FAILED: {}) ---\n{s}\n", .{ cycle, latched, t[mark..] });
+                return error.FailedDaemonNotOwnExit;
+            }
+            if (latched) latched_cycles += 1;
+        }
+        try testing.expect(!alive(pid));
+        try testing.expectEqual(@as(usize, 0), try fuseMountsOf(gpa, io, rig.mp));
+        {
+            const r = try rig.squeezefs(&.{ "umount", rig.mp });
+            defer rig.freeRun(r);
+            try testing.expect(!r.term.success());
+            if (std.mem.indexOf(u8, r.stderr, "not mounted") == null or std.mem.indexOf(u8, r.stderr, "no squeezefs daemon serves it") != null) {
+                std.debug.print("\n--- cycle {d}: the second umount: {s} ---\n", .{ cycle, r.stderr });
+                return error.SecondUmountMisjudged;
+            }
+        }
+        try dm.load(false);
+    }
+    // The storm's acked mutations meet the error table in most cycles: the
+    // row exercises the FAILED latch, not only failed reads.
+    try testing.expect(latched_cycles >= 1);
+    // The working table: the next mount replays what landed and serves the
+    // storm's tree; a clean unmount; fsck clean.
+    const mark = try rig.logLen();
+    const pid = blk: {
+        const r = try rig.squeezefs(&.{ "mount", "--daemon", "--supervise", "--log-file", rig.log_path, dm.meta_uri, rig.mp });
+        defer rig.freeRun(r);
+        if (!r.term.success()) std.debug.print("\nthe final mount: {s}\n", .{r.stderr});
+        try testing.expect(r.term.success());
+        const ready_i = try rig.awaitLog("ready: ", mark, ready_wait_ns);
+        const text = try rig.readLog();
+        defer gpa.free(text);
+        break :blk @as(linux.pid_t, @intCast(numberAfter(text[ready_i..], "(pid ") orelse return error.NoPid));
+    };
+    {
+        const out = try rig.onMount("n=$(find ./w* -type f | wc -l); test \"$n\" -gt 0; for f in w*/f*; do if test -e \"$f\"; then getfattr -d -m - \"$f\" >/dev/null; fi; done; echo \"$n files\"");
+        defer gpa.free(out);
+        std.debug.print("\nsmoke[dm-error]: {d} error-table cycles ({d} latched FAILED), each unmounted in order by the daemon's own exit; the working table's mount serves the tree: {s}", .{ dm_error_cycles, latched_cycles, out });
+    }
+    try umountDaemon(rig, pid);
+    {
+        const t = try rig.readLog();
+        defer gpa.free(t);
+        try testing.expect(std.mem.indexOf(u8, t[mark..], "exited (wait status 0x0); done") != null);
+    }
+    {
+        const r = try rig.squeezefs(&.{ "fsck", "--offline", "--scrub", dm.meta_uri });
+        defer rig.freeRun(r);
+        if (!r.term.success() or std.mem.indexOf(u8, r.stdout, "findings: 0 (clean)") == null) {
+            std.debug.print("\n--- fsck --offline after the dm-error cycles ({f}) ---\n{s}\n--- stderr ---\n{s}\n", .{ r.term, r.stdout, r.stderr });
+            return error.FsckNotClean;
+        }
+    }
+}
+
 /// A process whose cwd is the mount (the holder of the busy-umount rows):
 /// `sleep` parks with the mount root as its cwd until killed.
 const Holder = struct {

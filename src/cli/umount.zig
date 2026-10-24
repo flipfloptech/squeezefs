@@ -569,6 +569,13 @@ pub fn run(p: cli.Process, u: args.Umount) u8 {
         if (c.busy()) return refuseBusy(p, path, c);
     }
     const located = locateDaemon(p.gpa, p.io, path);
+    // No entry at the path in a table that was read, and no daemon names
+    // it: nothing to unmount (a second umount of one path, generic/753's
+    // `_cleanup`) — never the dead-daemon fallback's external detach.
+    if (located == .fallback and watched.target == null and watched.text.len != 0) {
+        p.stderr.print("squeezefs umount: {s}: not mounted\n", .{path}) catch {};
+        return cli.exit_failed;
+    }
     if (located == .process) p.stderr.print("squeezefs umount: {s}: its .stats inode is unreadable (its volume is FAILED, or the kernel ended its connection) but daemon {d} still serves it — signalling it and waiting for its exit\n", .{ path, located.process }) catch {};
     // Another mountpoint of the daemon's superblock (`isOwnMount`): the
     // kernel's detach, nothing signalled; the daemon serves what remains.

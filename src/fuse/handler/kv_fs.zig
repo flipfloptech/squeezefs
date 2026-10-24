@@ -7247,6 +7247,52 @@ test "a size-neutral overwrite inside a staged image commits NOTHING (§L.6 for 
     h.release(f);
 }
 
+// generic/475 on a FAILED volume (the latch agent's logs): `staged payload
+// unreachable … serving N zero bytes` milliseconds after the latch, reads
+// answering ZEROS for a staged file's acked bytes. A write that re-stages
+// the whole image under the file's OWN identity replaces the resident
+// record (`Segment.put` retires the old copy), and its failed commit then
+// released the key — the only copy — while the committed layout still named
+// it: every later read of the file met the ring empty under a staged layout.
+test "a same-identity re-stage whose commit FAILS keeps the record the committed layout names: the ring still holds the file's bytes under its key, never empty under a staged layout (the lost arm's zeros)" {
+    const H = HarnessOf(SettlingData);
+    var h: H = undefined;
+    try h.init();
+    defer h.deinit();
+    defer h.data.deinit();
+    h.data.store = &h.store;
+    h.data.staging = true;
+    h.data.ring = try SettlingData.RamRing.init(64 << 20);
+    defer h.data.ring.?.deinit();
+    const f = try h.create(1, "victim", 0o644);
+    const lf = try H.Fs.localOf(f);
+    var image: [16384]u8 = @splat('A');
+    try testing.expectEqual(@as(?linux.E, null), h.write(f, 0, &image, 0).errno());
+    const rec = (try h.fs.readLayout(lf)).?;
+    defer h.fs.freeLayout(rec);
+    try testing.expectEqual(layout.Kind.staged, rec.layout.kind);
+    const k = staging.StagingKey.init(rec.layout.file_id, lf);
+    // The volume latches FAILED: every commit refuses. A straddling write
+    // (inside the image, past its end) re-stages the whole image under the
+    // same identity, then its commit answers EIO.
+    h.store.failed = true;
+    defer h.store.failed = false;
+    var patch: [4096]u8 = @splat('B');
+    try testing.expectEqual(@as(?linux.E, .IO), h.write(f, 14336, &patch, 0).errno());
+    // The committed layout is unchanged — and the ring still holds its record.
+    {
+        const now = (try h.fs.readLayout(lf)).?;
+        defer h.fs.freeLayout(now);
+        try testing.expectEqual(layout.Kind.staged, now.layout.kind);
+        try testing.expectEqualSlices(u8, &rec.layout.file_id, &now.layout.file_id);
+        try testing.expectEqual(@as(u64, image.len), now.layout.size);
+    }
+    const lease = h.data.ring.?.seg.get(k) orelse return error.RingEmptyUnderAStagedLayout;
+    defer lease.release();
+    try testing.expectEqualSlices(u8, image[0..14336], lease.bytes()[0..14336]);
+    h.release(f);
+}
+
 test "the staged arm's rebuilt image ZEROES the gap between the resident bytes and an extending write past the slack (repro-port: fstests generic/075 fsx — a packed file truncated to an unaligned size, then written beyond EOF, read a dead write's bytes back from the gap; the rebuild buffer is recycled memory: never zeros by luck, never another file's bytes)" {
     const H = HarnessOf(SettlingData);
     var h: H = undefined;

@@ -261,12 +261,7 @@ pub const linux = if (builtin.os.tag == .linux) struct {
         b.host = .{
             .gpa = gpa,
             .io = io,
-            .store = blk: {
-                var st = census.Store.from(meta_set.MetaSet, be);
-                st.merged_kinds = true;
-                st.tally = &b.tally;
-                break :blk st;
-            },
+            .store = storeFace(b),
             .geo = if (plane) |pl| pl.geo else .{},
             .name_key = be.nameKey(),
             .volumes = b.vols,
@@ -283,6 +278,15 @@ pub const linux = if (builtin.os.tag == .linux) struct {
             .cancel = opts.cancel,
         };
         return b;
+    }
+
+    /// The census's face over the set: the host's store, and the live
+    /// scope's lookups, which `bind` runs before the host exists.
+    fn storeFace(b: *Bound) census.Store {
+        var st = census.Store.from(meta_set.MetaSet, b.be);
+        st.merged_kinds = true;
+        st.tally = &b.tally;
+        return st;
     }
 
     pub fn destroy(b: *Bound) void {
@@ -482,7 +486,7 @@ pub const linux = if (builtin.os.tag == .linux) struct {
                         const dv = record.DentryValue.decode(f.value) catch break :blk null;
                         break :blk dv.child_ino;
                     }
-                    const v = (b.host.store.lookup(gpa, key.TREE_DENTRIES, f.key) catch break :blk null) orelse break :blk null;
+                    const v = (storeFace(b).lookup(gpa, key.TREE_DENTRIES, f.key) catch break :blk null) orelse break :blk null;
                     defer gpa.free(v);
                     const dv = record.DentryValue.decode(v) catch break :blk null;
                     break :blk dv.child_ino;

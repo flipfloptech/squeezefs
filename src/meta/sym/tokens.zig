@@ -4,7 +4,8 @@
 //! the conveyor pass runs at A1½ (`token_table`), the reader's cache with
 //! the purge-then-ack recall (`token_cache`), the read divert and the wire
 //! binding (`read_divert`), `-o ro` and the epoch-poll control plane
-//! (`ro_mount`), the models (`grant_gate_model`, `install_gen_model`).
+//! (`ro_mount`), the models (`grant_gate_model`, `install_gen_model`,
+//! `extension_watch_model`).
 //! Every registry is a field of the mount's objects (decision 0002 row
 //! 259) — never a process static; the instruments alone are module
 //! globals, folded over every plane as the reference's stats did.
@@ -28,6 +29,7 @@ pub const divert = @import("tokens/read_divert.zig");
 pub const ro = @import("tokens/ro_mount.zig");
 pub const grant_gate_model = @import("tokens/grant_gate_model.zig");
 pub const install_gen_model = @import("tokens/install_gen_model.zig");
+pub const extension_watch_model = @import("tokens/extension_watch_model.zig");
 pub const recall_notify_model = @import("tokens/recall_notify_model.zig");
 pub const smoke = if (builtin.os.tag == .linux) @import("tokens/smoke_linux.zig") else struct {};
 
@@ -103,6 +105,7 @@ test {
     _ = ro;
     _ = grant_gate_model;
     _ = install_gen_model;
+    _ = extension_watch_model;
     _ = recall_notify_model;
     if (builtin.os.tag == .linux) _ = smoke;
 }

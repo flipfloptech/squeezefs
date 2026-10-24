@@ -53,6 +53,14 @@ pub const ClientId = u64;
 pub const PrepareSeam = struct {
     ctx: *anyopaque,
     run: *const fn (ctx: *anyopaque, io: Io, object: Object) void,
+    /// The check AFTER the registration (register-then-check,
+    /// `extension_watch_model.zig`): true when the object holds holder
+    /// state the page must not miss that `run` has not landed — a size
+    /// claim parked since `run` ran, by a write whose look at the
+    /// registration filter preceded this grant's registration. The grant
+    /// then runs `run` again, registered. Read under the state's own lock
+    /// (the pairing), never off a racy fast path.
+    pending: ?*const fn (ctx: *anyopaque, object: Object) bool = null,
 };
 
 // ---------------------------------------------------------------------------
@@ -136,6 +144,10 @@ pub const stats = struct {
     pub var dlm_token_recall_batches: counters.ShardedCounter = .{};
     /// Grants parked on an object a pass had in flight.
     pub var dlm_token_grant_parks: counters.ShardedCounter = .{};
+    /// Grants whose post-registration check found holder state a write
+    /// parked after the pre-registration landing (`PrepareSeam.pending`):
+    /// landed again, registered.
+    pub var dlm_token_grant_late_landings: counters.ShardedCounter = .{};
     /// Grants that waited out a pending recall of their own `(client,
     /// object)` before registering afresh.
     pub var dlm_token_regrant_under_recall_waits: counters.ShardedCounter = .{};
@@ -635,16 +647,50 @@ pub const Holder = struct {
     /// nothing — the portable contracts' default).
     kernel_pin_ns: u64 = 0,
     recalled: std.ArrayListUnmanaged(Recalled) = .empty,
+    /// THE REGISTRATION FILTER: per cell, the registered objects hashing
+    /// there (an object counts once while it has a grant, live or pinned —
+    /// `registerLocked` / `unregisterLocked` keep it under `lock`). Its
+    /// reader is the holder's own extending write (`mayHold`): one relaxed
+    /// load, exact when 0. A cell per object of the cap (a power of two):
+    /// the false positives a write meets are at most the table's fill, and
+    /// each costs one exact look under `lock` (`held`).
+    watch: []std.atomic.Value(u32) = &.{},
 
     pub fn init(gpa: Allocator, io: Io, identity: ClientId, oracle: LeaseOracle, cap_objects: u32, cap_clients: u32) Allocator.Error!Holder {
         var self: Holder = .{ .gpa = gpa, .io = io, .identity = identity, .oracle = oracle, .gate = GrantPassGate.init(gpa), .cap_objects = cap_objects, .cap_clients = cap_clients };
         errdefer self.deinit();
         try self.objects.ensureTotalCapacity(gpa, cap_objects);
         try self.clients.ensureTotalCapacity(gpa, cap_clients);
+        self.watch = try gpa.alloc(std.atomic.Value(u32), std.math.ceilPowerOfTwoAssert(u32, @max(cap_objects, 2)));
+        @memset(self.watch, .init(0));
         return self;
     }
 
+    fn watchCell(self: *const Holder, object: Object) *std.atomic.Value(u32) {
+        // Fibonacci hashing: the top bits index a power-of-two table.
+        const shift: u6 = @intCast(@as(u32, 64) - std.math.log2_int(usize, self.watch.len));
+        return &self.watch[@intCast((object *% 0x9E3779B97F4A7C15) >> shift)];
+    }
+
+    /// May a foreign member hold a grant on `object`? One relaxed load;
+    /// false is exact. The writer half of register-then-check: read AFTER
+    /// its claim's park released the pending stripe's lock, which a grant's
+    /// post-registration check takes after its registration counted here
+    /// (`extension_watch_model.zig`; the lock's release/acquire is the
+    /// pairing, so neither side needs a fence of its own).
+    pub fn mayHold(self: *const Holder, object: Object) bool {
+        if (self.watch.len == 0) return false;
+        return self.watchCell(object).load(.monotonic) != 0;
+    }
+
+    /// `mayHold` made exact (the filter's positive confirmed under `lock`).
+    pub fn held(self: *Holder, object: Object) bool {
+        if (!self.mayHold(object)) return false;
+        return self.grantsOf(self.io, object) != 0;
+    }
+
     pub fn deinit(self: *Holder) void {
+        if (self.watch.len != 0) self.gpa.free(self.watch);
         var it = self.objects.valueIterator();
         while (it.next()) |h| h.list.deinit(self.gpa);
         self.objects.deinit(self.gpa);
@@ -685,6 +731,7 @@ pub const Holder = struct {
         const h = self.objects.getPtr(object) orelse blk: {
             if (self.objects.count() >= self.cap_objects) return error.TableFull;
             self.objects.putAssumeCapacity(object, .{});
+            _ = self.watchCell(object).fetchAdd(1, .monotonic);
             break :blk self.objects.getPtr(object).?;
         };
         if (h.find(client)) |i| {
@@ -706,6 +753,7 @@ pub const Holder = struct {
         if (h.list.items.len == 0) {
             h.list.deinit(self.gpa);
             _ = self.objects.remove(object);
+            _ = self.watchCell(object).fetchSub(1, .monotonic);
         }
         if (self.clients.getPtr(client)) |c| c.grants -= 1;
         stats.dlm_token_outstanding.sub(1);
@@ -1124,6 +1172,16 @@ pub const Holder = struct {
                 defer self.lock.unlock(io);
                 _ = try self.registerLocked(ask.object, ask.client, now);
             }
+            // THEN the holder state a write parked after `prepare` ran: that
+            // write's look at the filter may have preceded the registration
+            // above, so it landed nothing — this check, after the
+            // registration, sees its park (`extension_watch_model.zig`).
+            // The landing's own pass recalls this registration; the reader
+            // installs nothing under it (the generation law) and re-asks.
+            if (self.prepare) |p| if (p.pending) |pending| if (pending(p.ctx, ask.object)) {
+                stats.dlm_token_grant_late_landings.inc();
+                p.run(p.ctx, io, ask.object);
+            };
             if (!try self.awaitSettled(io, ask.object, park_deadline)) {
                 self.retract(io, ask.object, ask.client);
                 stats.dlm_token_grant_park_refusals.inc();

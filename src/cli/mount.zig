@@ -105,6 +105,7 @@ const sym_park = @import("../meta/sym/membership/park_reclaim.zig");
 const extent_grant = @import("../meta/sym/extent_grant.zig");
 const lease_clock = @import("../meta/guard/lease_clock.zig");
 const ro_mount = @import("../meta/sym/tokens/ro_mount.zig");
+const token_table = @import("../meta/sym/tokens/token_table.zig");
 const wire_endpoint = @import("../wire/endpoint.zig");
 const handler = @import("../fuse/handler.zig");
 const transport = @import("../fuse/transport.zig");
@@ -592,7 +593,11 @@ fn mountMain(ctx: *Ctx) u8 {
         // first: the write cache's residents promoted, every other write
         // custody landed and its size claim journaled (charter §6.1
         // coherence; `KvFs.landForGrant`).
-        wp.holder.prepare = .{ .ctx = &fs, .run = &landForGrant };
+        wp.holder.prepare = .{ .ctx = &fs, .run = &landForGrant, .pending = &grantPending };
+        // ... and this mount's own extending write on an object a member
+        // holds a grant on lands before its ack (register-then-check's
+        // writer half, `KvFs.landIfWatched`).
+        fs.bindForeignWatch(.{ .ctx = &wp.holder, .held = &holderHeld });
         // The read divert: a foreign slot's records come under a token or
         // answer the typed EAGAIN, never off this mount's cache; a token
         // whose records served the kernel stays this mount's at its holder
@@ -1034,6 +1039,7 @@ fn mountMain(ctx: *Ctx) u8 {
     // every seam the planes hold INTO it unbound first (nothing may reach
     // a stopped plane).
     if (wire) |wp| {
+        fs.bindForeignWatch(null);
         plane.bindForeignLayout(null);
         plane.bindForeignPublish(null);
         xv_bound.?.bindDialer(null);
@@ -1167,6 +1173,18 @@ fn landForGrant(ctx: *anyopaque, _: Io, object: u64) void {
     const fs: *BackendFs = @ptrCast(@alignCast(ctx));
     fs.data.recallResidents(object);
     fs.landForGrant(object);
+}
+
+/// `PrepareSeam.pending`: a claim parked since the landing above.
+fn grantPending(ctx: *anyopaque, object: u64) bool {
+    const fs: *BackendFs = @ptrCast(@alignCast(ctx));
+    return fs.claimParked(object);
+}
+
+/// `KvFs.ForeignWatch` over the wire's token holder.
+fn holderHeld(ctx: *anyopaque, local: u64) bool {
+    const h: *token_table.Holder = @ptrCast(@alignCast(ctx));
+    return h.held(local);
 }
 
 fn stripeFloor(be: *meta_set.MetaSet) sym_xv.stripe.Floor {

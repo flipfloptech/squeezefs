@@ -276,6 +276,10 @@ pub var fuse_write_size_claims_dropped: counters.ShardedCounter = .{};
 /// page was built (`landForGrant`); `fuse_grant_landing_drain_failures`:
 /// the claim's journal refused there (the page carried the stored size).
 pub var fuse_grant_landings: counters.ShardedCounter = .{};
+/// `fuse_write_watched_landings`: extending writes whose parked claim a
+/// foreign member's grant stood on — landed and journaled before the ack
+/// (`landIfWatched`).
+pub var fuse_write_watched_landings: counters.ShardedCounter = .{};
 pub var fuse_grant_landing_drain_failures: counters.ShardedCounter = .{};
 /// Durable promotions a write forced BEFORE its type flip (inline/staged/
 /// packed → striped: the resident payload landed on its own block).
@@ -716,6 +720,9 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         /// mount (two probes, read locally). Bound by the daemon after
         /// `mount`, BELOW the level-1 op guard and before any (3) guard.
         divert: ?*read_divert.Divert = null,
+        /// The token holder's registration filter (`ForeignWatch`); null =
+        /// no wire (a flat mount: no member can hold a grant).
+        foreign_watch: ?ForeignWatch = null,
         /// The cross-owner plane (charter §5.5): an op whose objects span
         /// two members or two holders is ONE intent through it; null = a
         /// one-member mount (every op is the single entry). Bound by the
@@ -782,6 +789,20 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         /// arms).
         pub fn bindDivert(self: *Self, d: *read_divert.Divert) void {
             self.divert = d;
+        }
+
+        /// May a foreign member hold a grant on this holder's `local`? The
+        /// wire's token holder answers (`tokens.table.Holder.held`: one
+        /// relaxed load when no member holds one).
+        pub const ForeignWatch = struct {
+            ctx: *anyopaque,
+            held: *const fn (ctx: *anyopaque, local: u64) bool,
+        };
+
+        /// Bind the token holder's filter (after `mount`, before the session
+        /// arms; null unbinds it before the wire stops).
+        pub fn bindForeignWatch(self: *Self, w: ?ForeignWatch) void {
+            self.foreign_watch = w;
         }
 
         /// Arm the `il0` rendezvous blob (an interception mount's session
@@ -4229,6 +4250,9 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 try self.data.barrierData(self.io, &.{local});
                 return self.shipSizeClaim(c, local, .{ .size_claim = outcome.size_claim, .written = outcome.written });
             }
+            // The claim this write parked (0 = none): a foreign member's
+            // grant must see it before the ack (`landIfWatched`).
+            var parked_claim: u64 = 0;
             const size = if (self.times_park and a.write_flags & abi.FUSE_WRITE_KILL_SUIDGID == 0) park: {
                 // §L.6: a size-neutral write's only record would be the
                 // 76 B Δ(mtime, ctime) — park the stamp (fold-visible; the
@@ -4243,7 +4267,8 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 if (self.write_hold) self.holdPostlude();
                 const v = try self.readInode(local);
                 const size = @max(self.claimedSize(local, v), self.sizeClaimOf(local, outcome));
-                try self.parkWriteTimes(local, if (size > v.size) size else 0);
+                parked_claim = if (size > v.size) size else 0;
+                try self.parkWriteTimes(local, parked_claim);
                 break :park size;
             } else commit: {
                 const t = try self.beginExclusive(local, @src());
@@ -4261,12 +4286,45 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 t_owned = false;
                 try self.commit(c, t);
                 _ = self.pending.retire(local);
-                if (self.times_park and claim != 0) try self.parkWriteTimes(local, claim);
+                if (self.times_park and claim != 0) {
+                    try self.parkWriteTimes(local, claim);
+                    parked_claim = claim;
+                }
                 break :commit size;
             };
+            if (parked_claim != 0) try self.landIfWatched(c, local, parked_claim);
             self.data.noteShape(local, size, .striped);
             fuse_write_striped.inc();
             return .{ .size = @intCast(outcome.written) };
+        }
+
+        /// THE WATCHED EXTENSION (the writer half of register-then-check,
+        /// `tokens/extension_watch_model.zig`): a size claim parked on a
+        /// file a foreign member holds a grant on lands — its custody, then
+        /// the claim journaled behind the data barrier (§AL.5) — before the
+        /// write is acked, and the journal's pass recalls the grant, so the
+        /// member's next append re-grants and takes THIS end of file. A
+        /// parked claim commits nothing, so nothing else recalls the
+        /// member: alternating appends from two members overwrote each
+        /// other at a stale EOF (45 of 54 bytes lost). The filter is read
+        /// AFTER the park released the pending stripe's lock — the pairing
+        /// with the grant's post-registration check under that lock. No
+        /// member holding a grant costs one relaxed load.
+        fn landIfWatched(self: *Self, c: *Ctx, local: u64, claim: u64) Error!void {
+            const w = self.foreign_watch orelse return;
+            if (!w.held(w.ctx, local)) return;
+            fuse_write_watched_landings.inc();
+            self.data.flushCustody(self.io, local);
+            _ = try self.drainTimesOf(c, local, claim);
+        }
+
+        /// The grant's post-registration check (`tokens.table.PrepareSeam.
+        /// pending`): a size claim parked on `local`, read UNDER the
+        /// pending stripe's lock — never the map's relaxed count, which
+        /// pairs with nothing.
+        pub fn claimParked(self: *Self, local: u64) bool {
+            const t = self.pending.parked(local) orelse return false;
+            return t.size != 0;
         }
 
         /// The postlude-hold seam's park: registered on the release BEFORE

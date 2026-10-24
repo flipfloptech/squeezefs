@@ -51,6 +51,8 @@ const journal = @import("journal.zig");
 const jc = @import("journal_core.zig");
 const ledger = @import("ledger.zig");
 const superblock = @import("superblock.zig");
+const page_mod = @import("sym/appender_page.zig");
+const dir_mod = @import("sym/appender_dir.zig");
 const knobs = @import("../core/knobs.zig");
 const testkit = @import("../core/testkit.zig");
 
@@ -68,8 +70,9 @@ pub const Segment = extern struct { start: u64, pages: u64 };
 
 /// Whose ring the tail mirrors: the volume's fixed ring (its D0 writer's,
 /// opened under the writer lock — the ring a held tail's successor owns)
-/// or an appender's ring on a joined volume (no lock of its own; a held
-/// copy has no successor law yet, decision 0003 §BR.5).
+/// or an appender's ring on a joined volume (no lock of its own: its death
+/// replay is judged against its own page's chain, and a failed one is not
+/// held — its successor is the manager's recovery, decision 0003 BS.16).
 pub const RING_FIXED: u32 = 1;
 pub const RING_JOINED: u32 = 2;
 
@@ -99,7 +102,8 @@ pub const Header = extern struct {
     set_uuid: [16]u8,
     /// `RING_FIXED` or `RING_JOINED`.
     ring: u32,
-    reserved: u32,
+    /// The ring's appender id (a joined ring's page names its chain).
+    appender: u32,
     segments: [journal.RING_SEGMENTS_MAX]Segment,
     path: [PATH_CAP]u8,
 
@@ -173,6 +177,8 @@ pub const Facts = struct {
     n_slots: u32,
     identity: Identity,
     ring: u32,
+    /// The ring's appender (`FIXED_RING_APPENDER` for the fixed ring).
+    appender: u32 = journal.FIXED_RING_APPENDER,
 };
 
 /// What a tail still holds: its written slots, their lowest position and
@@ -260,7 +266,7 @@ pub const Image = struct {
             .volume_uuid = facts.identity.volume_uuid,
             .set_uuid = facts.identity.set_uuid,
             .ring = facts.ring,
-            .reserved = 0,
+            .appender = facts.appender,
             .segments = undefined,
             .path = undefined,
         };
@@ -406,44 +412,6 @@ pub const Image = struct {
             written += 1;
         }
         return written != 0;
-    }
-
-    /// Write every `written` slot's runs to `sink` in `seq_base` order,
-    /// each run split at the ring's segment boundaries. Idempotent: the
-    /// bytes are the lane's own image, a landed slot is free and skipped.
-    pub fn replay(self: Image, sink: Sink) anyerror!Replay {
-        const h = self.header();
-        const table = self.slots();
-        var out: Replay = .{};
-        // Selection in seq order without allocation: the smallest unvisited
-        // `seq_base` each round (the table is the lane's in-flight bound —
-        // a few thousand at most — and a replay runs once).
-        var last_seq: u64 = 0;
-        var first = true;
-        while (true) {
-            var best: ?usize = null;
-            for (table, 0..) |*s, i| {
-                // acquire pairs with `claim`'s release store.
-                if (@atomicLoad(u32, &s.state, .acquire) != SLOT_WRITTEN) continue;
-                if (!first and s.seq_base <= last_seq) continue;
-                if (best == null or s.seq_base < table[best.?].seq_base) best = i;
-            }
-            const i = best orelse break;
-            const s = &table[i];
-            first = false;
-            last_seq = s.seq_base;
-            for (s.runs[0..@min(s.n_runs, 2)]) |run| {
-                if (run.len == 0) continue;
-                if (run.ring_off + run.len > h.ringBytes()) return error.Corrupt;
-                try self.writeRun(h, sink, run);
-                out.bytes += run.len;
-            }
-            out.windows += 1;
-        }
-        for (table) |*s| if (@atomicLoad(u32, &s.state, .acquire) != SLOT_WRITTEN) {
-            out.skipped += 1;
-        };
-        return out;
     }
 
     /// The written slots in seq order (allocated).
@@ -732,7 +700,7 @@ pub const linux_tail = if (builtin.os.tag == .linux) struct {
         zbuf[h.path_len] = 0;
         const dev_rc = linux.open(zbuf[0..h.path_len :0], .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);
         if (linux.errno(dev_rc) != .SUCCESS) return error.DeviceOpenFailed;
-        var sink: DeviceSink = .{ .fd = @intCast(dev_rc) };
+        const sink: DeviceSink = .{ .fd = @intCast(dev_rc) };
         defer _ = linux.close(sink.fd);
         // The replay's page cache leaves with the supervisor on every
         // outcome: a refused write still `fsync`s what landed in the cache
@@ -749,33 +717,27 @@ pub const linux_tail = if (builtin.os.tag == .linux) struct {
         // supervisor's exit line behind the daemon's death (generic/753's
         // row read the log at the death: gate 127).
         const held = image.held();
-        if (held.windows != 0 and h.n_segments == 0 and h.ring == RING_FIXED) {
-            const free_slots: u32 = h.n_slots - held.windows;
-            const j = judgedReplay(gpa, image, sink.fd, null) catch |e| return switch (e) {
-                // Every window landed and was checkpointed before its slot
-                // was freed: nothing is the ring's to restore.
-                error.Stale => .{ .replay = .{ .skipped = h.n_slots }, .behind = held.windows, .judged = true },
-                error.Foreign => error.DeviceForeign,
-                error.Segmented => unreachable,
-                error.OutOfMemory => error.OutOfMemory,
-                error.DeviceReadFailed => error.DeviceReadFailed,
-                error.DeviceWriteFailed => error.DeviceWriteFailed,
-                error.BarrierFailed => error.BarrierFailed,
-                error.Corrupt => error.Corrupt,
-            };
-            var out = j.replay;
-            out.skipped = free_slots + j.behind;
-            return .{ .replay = out, .behind = j.behind, .past_hole = j.past_hole, .judged = true };
-        }
-        const out = image.replay(.{ .ctx = &sink, .write = DeviceSink.write }) catch {
-            _ = linux.fsync(sink.fd);
-            return error.DeviceWriteFailed;
+        if (held.windows == 0) return .{ .replay = .{ .skipped = h.n_slots }, .judged = false };
+        const free_slots: u32 = h.n_slots - held.windows;
+        const j = judgedReplay(gpa, image, sink.fd, null) catch |e| return switch (e) {
+            // Every window landed and was checkpointed before its slot was
+            // freed — or a joined ring is no longer this appender's (the
+            // manager recovered its region): nothing is the ring's to
+            // restore.
+            error.Stale => .{ .replay = .{ .skipped = h.n_slots }, .behind = held.windows, .judged = true },
+            error.Foreign => error.DeviceForeign,
+            error.OutOfMemory => error.OutOfMemory,
+            error.DeviceReadFailed => error.DeviceReadFailed,
+            error.DeviceWriteFailed => error.DeviceWriteFailed,
+            error.BarrierFailed => error.BarrierFailed,
+            error.Corrupt => error.Corrupt,
         };
-        if (linux.errno(linux.fsync(sink.fd)) != .SUCCESS) return error.BarrierFailed;
-        return .{ .replay = out, .judged = false };
+        var out = j.replay;
+        out.skipped = free_slots + j.behind;
+        return .{ .replay = out, .behind = j.behind, .past_hole = j.past_hole, .judged = true };
     }
 
-    pub const JudgeError = error{ OutOfMemory, DeviceReadFailed, DeviceWriteFailed, BarrierFailed, Foreign, Stale, Segmented, Corrupt };
+    pub const JudgeError = error{ OutOfMemory, DeviceReadFailed, DeviceWriteFailed, BarrierFailed, Foreign, Stale, Corrupt };
 
     pub const Judged = struct { replay: Replay, held: Held, behind: u32, past_hole: u32 };
 
@@ -783,12 +745,13 @@ pub const linux_tail = if (builtin.os.tag == .linux) struct {
     /// replay scan (`journal.replayScanImage`) from the ledger's tail.
     const DeviceChain = struct {
         gpa: std.mem.Allocator,
+        appender: u32,
         geo: journal.CoreGeometry,
         tail: u64,
 
         fn dropped(ctx: *anyopaque, ring: []const u8) std.mem.Allocator.Error!u64 {
             const self: *DeviceChain = @ptrCast(@alignCast(ctx));
-            var rec = try journal.replayScanImage(self.gpa, ring, self.geo, self.tail, journal.FIXED_RING_APPENDER);
+            var rec = try journal.replayScanImage(self.gpa, ring, self.geo, self.tail, self.appender);
             defer rec.deinit();
             return rec.dropped_torn;
         }
@@ -809,6 +772,63 @@ pub const linux_tail = if (builtin.os.tag == .linux) struct {
         }
     }
 
+    /// The ring's extents as the header maps it (the fixed ring's one at
+    /// `base` when it names no segment).
+    fn headerSegments(h: *const Header) page_mod.SegmentTable {
+        var out: page_mod.SegmentTable = .{};
+        if (h.n_segments == 0) {
+            out.push(.{ .start = h.base, .len = h.ringBytes() }) catch unreachable;
+        } else for (h.segments[0..h.n_segments]) |seg| out.push(.{ .start = seg.start, .len = seg.pages * journal.PAGE_LEN }) catch unreachable;
+        return out;
+    }
+
+    const RingOwner = struct { tail: u64, appender: u32 };
+
+    /// Whose chain the ring is and the tail it replays from: the fixed
+    /// ring's is the newest ledger record's; a JOINED ring's is its own
+    /// appender page's, off the device's appender directory (decision 0003
+    /// BS.16) — the page must be Live and name exactly this ring, else the
+    /// ring is no longer this appender's (the manager recovered the region,
+    /// or re-leased the segment): `Stale`, nothing written.
+    fn ringChainOf(gpa: std.mem.Allocator, dev_fd: linux.fd_t, sb: superblock.Superblock, h: *const Header) JudgeError!RingOwner {
+        if (h.ring == RING_FIXED) {
+            const ledger_img = try gpa.alloc(u8, @intCast(sb.root_ledger.len));
+            defer gpa.free(ledger_img);
+            try preadAll(dev_fd, ledger_img, sb.root_ledger.start);
+            var rec = (try ledger.newestValid(gpa, ledger_img)) orelse return error.Corrupt;
+            defer rec.deinit(gpa);
+            return .{ .tail = rec.journal_tail_seq, .appender = journal.FIXED_RING_APPENDER };
+        }
+        var pages: DevicePages = .{ .fd = dev_fd };
+        const reader: dir_mod.PageReader = .{ .ctx = &pages, .read = &DevicePages.read };
+        var links: std.ArrayList(dir_mod.Link) = .empty;
+        defer links.deinit(gpa);
+        dir_mod.walkChain(gpa, reader, .{ .start = sb.appender_dir.start, .len = sb.appender_dir.len }, sb.node_size, .{ .start = sb.heap.start, .len = sb.heap.len }, sb.totalExtents(), &links) catch |e| return switch (e) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.Io => error.DeviceReadFailed,
+            error.Corrupt => error.Corrupt,
+        };
+        const p = (dir_mod.readPageOf(reader, links.items, h.appender) catch |e| return switch (e) {
+            error.Io => error.DeviceReadFailed,
+            error.Corrupt => error.Corrupt,
+        }) orelse return error.Stale;
+        if (p.state != .live or p.segments.len == 0) return error.Stale;
+        const part = page_mod.ringPartOf(p.appender_id, &p.segments);
+        const mine = headerSegments(h);
+        if (!part.eql(&mine)) return error.Stale;
+        return .{ .tail = p.ledger_tail_seq, .appender = p.appender_id };
+    }
+
+    /// The appender directory's pages read off the device.
+    const DevicePages = struct {
+        fd: linux.fd_t,
+
+        fn read(ctx: *anyopaque, off: u64, out: *[dir_mod.PAGE_LEN]u8) error{Io}!void {
+            const self: *DevicePages = @ptrCast(@alignCast(ctx));
+            preadAll(self.fd, out, off) catch return error.Io;
+        }
+    };
+
     /// A held copy's replay onto `dev_fd` (the volume's device, opened by
     /// the caller under the writer lock), JUDGED (decision 0003 §BR.3):
     /// the device's superblock names the copy's volume and set (`expect`,
@@ -818,7 +838,6 @@ pub const linux_tail = if (builtin.os.tag == .linux) struct {
     /// and barriered, the page cache dropped after.
     pub fn judgedReplay(gpa: std.mem.Allocator, image: Image, dev_fd: linux.fd_t, expect: ?Identity) JudgeError!Judged {
         const h = image.header();
-        if (h.n_segments != 0 or h.ring != RING_FIXED) return error.Segmented;
         // Every read below is the device's, not an earlier cached page.
         _ = linux.fadvise(dev_fd, 0, 0, linux.POSIX_FADV.DONTNEED);
         var sector: [superblock.sector_len]u8 = undefined;
@@ -830,17 +849,17 @@ pub const linux_tail = if (builtin.os.tag == .linux) struct {
         const on_dev: Identity = .{ .volume_uuid = sb.uuid, .set_uuid = sb.set_uuid };
         if (!on_dev.eql(h.identity())) return error.Foreign;
         if (expect) |want| if (!want.eql(h.identity())) return error.Foreign;
-        const ledger_img = try gpa.alloc(u8, @intCast(sb.root_ledger.len));
-        defer gpa.free(ledger_img);
-        try preadAll(dev_fd, ledger_img, sb.root_ledger.start);
-        var rec = (try ledger.newestValid(gpa, ledger_img)) orelse return error.Corrupt;
-        const tail = rec.journal_tail_seq;
-        rec.deinit(gpa);
+        const owner = try ringChainOf(gpa, dev_fd, sb, h);
+        const tail = owner.tail;
         if (image.staleAgainst(tail)) return error.Stale;
         const ring = try gpa.alloc(u8, @intCast(h.ringBytes()));
         defer gpa.free(ring);
-        try preadAll(dev_fd, ring, h.base);
-        var chain: DeviceChain = .{ .gpa = gpa, .geo = journal.productionGeometry(h.pages, h.grain), .tail = tail };
+        var at: usize = 0;
+        for (headerSegments(h).slice()) |seg| {
+            try preadAll(dev_fd, ring[at..][0..seg.len], seg.start);
+            at += @intCast(seg.len);
+        }
+        var chain: DeviceChain = .{ .gpa = gpa, .appender = owner.appender, .geo = journal.productionGeometry(h.pages, h.grain), .tail = tail };
         var plan = image.planReplay(gpa, ring, .{ .ctx = &chain, .ledger_tail = tail, .dropped = DeviceChain.dropped }) catch |e| return switch (e) {
             error.OutOfMemory => error.OutOfMemory,
             error.Corrupt => error.Corrupt,
@@ -1140,6 +1159,45 @@ pub const linux_tail = if (builtin.os.tag == .linux) struct {
 
 const testing = std.testing;
 
+/// Every `written` slot's runs to `sink` in `seq_base` order, each run split
+/// at the ring's segment boundaries (the unjudged write the rows below
+/// check bytes and order with). Idempotent: a landed slot is free and
+/// skipped.
+fn replayAll(self: Image, sink: Sink) anyerror!Replay {
+    const h = self.header();
+    const table = self.slots();
+    var out: Replay = .{};
+    // Selection in seq order without allocation: the smallest unvisited
+    // `seq_base` each round (the table is the lane's in-flight bound —
+    // a few thousand at most — and a replay runs once).
+    var last_seq: u64 = 0;
+    var first = true;
+    while (true) {
+        var best: ?usize = null;
+        for (table, 0..) |*s, i| {
+            // acquire pairs with `claim`'s release store.
+            if (@atomicLoad(u32, &s.state, .acquire) != SLOT_WRITTEN) continue;
+            if (!first and s.seq_base <= last_seq) continue;
+            if (best == null or s.seq_base < table[best.?].seq_base) best = i;
+        }
+        const i = best orelse break;
+        const s = &table[i];
+        first = false;
+        last_seq = s.seq_base;
+        for (s.runs[0..@min(s.n_runs, 2)]) |run| {
+            if (run.len == 0) continue;
+            if (run.ring_off + run.len > h.ringBytes()) return error.Corrupt;
+            try self.writeRun(h, sink, run);
+            out.bytes += run.len;
+        }
+        out.windows += 1;
+    }
+    for (table) |*s| if (@atomicLoad(u32, &s.state, .acquire) != SLOT_WRITTEN) {
+        out.skipped += 1;
+    };
+    return out;
+}
+
 const MemDevice = struct {
     bytes: []u8,
     writes: usize = 0,
@@ -1233,7 +1291,7 @@ test "claim + replay: a claimed window's bytes reach the device at the ops' offs
         }
     };
     var ord: Order = .{ .inner = &dev, .seen = &order };
-    const r1 = try img.replay(.{ .ctx = &ord, .write = Order.write });
+    const r1 = try replayAll(img, .{ .ctx = &ord, .write = Order.write });
     try testing.expectEqual(@as(u32, 2), r1.windows);
     try testing.expectEqual(@as(u64, 1024 + 24 + 512), r1.bytes);
     try testing.expectEqual(@as(u32, 2), r1.skipped);
@@ -1250,7 +1308,7 @@ test "claim + replay: a claimed window's bytes reach the device at the ops' offs
     // device image is unchanged by the rewrite.
     img.release(sb);
     const before = dev_bytes;
-    const r2 = try img.replay(dev.sink());
+    const r2 = try replayAll(img, dev.sink());
     try testing.expectEqual(@as(u32, 1), r2.windows);
     try testing.expectEqual(@as(u64, 1024), r2.bytes);
     try testing.expectEqualSlices(u8, &before, &dev_bytes);
@@ -1258,7 +1316,7 @@ test "claim + replay: a claimed window's bytes reach the device at the ops' offs
     // A slot mid-fill is not replayed.
     img.slots()[sb].state = SLOT_FILLING;
     img.slots()[sb].seq_base = 50;
-    const r3 = try img.replay(dev.sink());
+    const r3 = try replayAll(img, dev.sink());
     try testing.expectEqual(@as(u32, 1), r3.windows);
     img.slots()[sb].state = SLOT_FREE;
 
@@ -1294,7 +1352,7 @@ test "claim: a window across the ring's wrap records two runs (the high run to t
         try testing.expectEqual(@as(u64, 512), img.slots()[s].runs[1].len);
         var dev_bytes: [4 * 4096]u8 = @splat(0);
         var dev: MemDevice = .{ .bytes = &dev_bytes };
-        const r = try img.replay(dev.sink());
+        const r = try replayAll(img, dev.sink());
         try testing.expectEqual(@as(u32, 1), r.windows);
         try testing.expectEqual(@as(u64, 1024), r.bytes);
         try testing.expectEqualSlices(u8, &hi, dev_bytes[4 * 4096 - 512 ..]);
@@ -1316,7 +1374,7 @@ test "claim: a window across the ring's wrap records two runs (the high run to t
         _ = img.claim(&cursor, 1, 1, &.{ .{ .offset = 65536, .bytes = &p0 }, .{ .offset = 16384, .bytes = &p1 } }).?;
         var dev_bytes: [65536 + 4096]u8 = @splat(0);
         var dev: MemDevice = .{ .bytes = &dev_bytes };
-        const r = try img.replay(dev.sink());
+        const r = try replayAll(img, dev.sink());
         try testing.expectEqual(@as(u32, 1), r.windows);
         try testing.expectEqual(@as(u64, 4096 + 1024), r.bytes);
         try testing.expectEqual(@as(usize, 2), dev.writes);
@@ -1418,7 +1476,7 @@ test "planReplay: the prefix law — a held slot behind the ledger's tail is ski
     try testing.expectEqual(@as(u32, 3), plan2.past_hole);
 }
 
-test "linux: the memfd tail is size-sealed, claims through the mapping, and replayFd writes a JOINED ring's written slots whole to the header's device and barriers (a joined ring has no successor law to judge against, decision 0003 §BR.5)" {
+test "linux: the memfd tail is size-sealed and claims through the mapping; a JOINED ring's replay is judged like the fixed ring's (decision 0003 BS.16): a device that names no volume is refused and nothing is written; a tail holding no window answers at once" {
     if (builtin.os.tag != .linux) return testkit.skip(@src(), .no_linux, "the memfd tail is Linux only");
     const linux = std.os.linux;
     var dev_path_buf: [128]u8 = undefined;
@@ -1440,19 +1498,16 @@ test "linux: the memfd tail is size-sealed, claims through the mapping, and repl
     const slot = tail.claim(11, 11, &.{.{ .offset = 4096 + 4096, .bytes = &payload }}).?;
     var pbuf: [PATH_CAP]u8 = undefined;
     var plen: usize = 0;
-    const d = try linux_tail.replayFd(testing.allocator, tail.fd, &pbuf, &plen);
-    try testing.expect(!d.judged);
-    try testing.expectEqual(@as(u32, 1), d.replay.windows);
-    try testing.expectEqual(@as(u64, 2048), d.replay.bytes);
+    try testing.expectError(error.DeviceForeign, linux_tail.replayFd(testing.allocator, tail.fd, &pbuf, &plen));
     try testing.expectEqualStrings(dev_path, pbuf[0..plen]);
-    var got: [2048 + 1]u8 = undefined;
+    var got: [2048]u8 = undefined;
     const n = linux.pread(dev_fd, &got, got.len, 8192);
     try testing.expectEqual(linux.E.SUCCESS, linux.errno(n));
     try testing.expectEqual(got.len, n);
-    try testing.expectEqualSlices(u8, &payload, got[0..2048]);
-    try testing.expectEqual(@as(u8, 0), got[2048]);
+    try testing.expect(std.mem.allEqual(u8, &got, 0));
     tail.release(slot);
     const d2 = try linux_tail.replayFd(testing.allocator, tail.fd, &pbuf, &plen);
+    try testing.expect(!d2.judged);
     try testing.expectEqual(@as(u32, 0), d2.replay.windows);
 }
 
@@ -1500,6 +1555,21 @@ const HeldRig = if (builtin.os.tag == .linux) struct {
         rec.journal_tail_seq = tail;
         const slot = try rec.encodeSlot();
         try self.writeAt(&slot, ledger.slotOffset(sb.root_ledger.start, rec.slotIndex()));
+    }
+
+    /// The appender directory's first link and appender `id`'s page in
+    /// its pair's first directory slot: `state`, the one segment `seg`
+    /// (its two ring-side pages first), its ring's replay tail `tail`.
+    fn appenderPage(self: *HeldRig, id: u32, generation: u64, state: page_mod.State, seg: page_mod.Extent, tail: u64) !void {
+        const sb = superblock.testFixture();
+        var buf: [dir_mod.PAGE_LEN]u8 = undefined;
+        dir_mod.formatHeader(sb.node_size, &buf);
+        try self.writeAt(&buf, sb.appender_dir.start);
+        var p: page_mod.Page = .{ .appender_id = id, .generation = generation, .identity = .{ .node_token = 0xA11, .mount_slot = 7, .writer_id = 0xB22 }, .term = 1, .state = state, .ledger_tail_seq = tail };
+        try p.segments.push(seg);
+        try page_mod.encodePage(&p, &buf);
+        const loc = dir_mod.locate(id, dir_mod.pairCount(sb.node_size));
+        try self.writeAt(&buf, dir_mod.pairOffsets(.{ .start = sb.appender_dir.start, .len = sb.appender_dir.len }, loc.pair)[0]);
     }
 
     fn writeAt(self: *HeldRig, bytes: []const u8, off: u64) !void {
@@ -1687,10 +1757,10 @@ const DeathWindows = struct {
     res: [4]journal.Reservation,
     images: [4]journal.WriteImage,
 
-    fn build(gpa: std.mem.Allocator) !DeathWindows {
+    fn build(gpa: std.mem.Allocator, layout: journal.RingLayout, appender: u32) !DeathWindows {
         // The admission's checkpoint reserve exceeds a 4-page ring; the
         // positions and the bytes are the production geometry's.
-        var geo = journal.productionGeometry(HeldRig.ring_layout.pages, 512);
+        var geo = journal.productionGeometry(layout.pages, 512);
         geo.reserve_bytes = 0;
         var core = jc.JournalCore.init(geo, 0, 0);
         var out: DeathWindows = undefined;
@@ -1707,7 +1777,7 @@ const DeathWindows = struct {
             try testing.expectEqual(death_entry_len, try journal.entryLenFor(&records));
             out.res[i] = core.reserve(core.tryAdmit(death_entry_len, .user).?);
             records[0].seq = out.res[i].start;
-            out.images[i] = try journal.buildEntryWrite(gpa, HeldRig.ring_layout, geo, journal.FIXED_RING_APPENDER, out.res[i], &records);
+            out.images[i] = try journal.buildEntryWrite(gpa, layout, geo, appender, out.res[i], &records);
             built += 1;
         }
         return out;
@@ -1724,7 +1794,7 @@ test "linux: the death replay is JUDGED — the prefix law at a daemon's death (
     var rig: HeldRig = .{};
     try rig.init("death");
     defer rig.deinit();
-    var w = try DeathWindows.build(gpa);
+    var w = try DeathWindows.build(gpa, HeldRig.ring_layout, journal.FIXED_RING_APPENDER);
     defer w.deinit();
     // D starts in page 1: a replay past the hole puts a verified page
     // header and an entry behind it, which the scan resyncs to.
@@ -1780,6 +1850,79 @@ test "linux: the death replay is JUDGED — the prefix law at a daemon's death (
         const d = try linux_tail.replayFd(gpa, tail.fd, &pbuf, &plen);
         try testing.expectEqual(@as(u32, 0), d.replay.windows);
         try testing.expectEqual(@as(u32, 2), d.behind);
+    }
+    tail.release(c_slot);
+    tail.release(d_slot);
+}
+
+test "linux: a JOINED ring's death replay is JUDGED too (decision 0003 BS.16) — against the appender's OWN chain: its page off the device's appender directory names the ring (its segments) and the ring's replay tail; window A landed, B's write failed (a hole), C and D held: nothing past the hole is written (the scan reads A alone, no drop), without the hole C and D land; a page that no longer names this ring Live (the manager recovered the region — a re-join's predecessor — or another appender leases the segment) writes nothing" {
+    if (builtin.os.tag != .linux) return testkit.skip(@src(), .no_linux, "the journal tail is Linux only");
+    const gpa = testing.allocator;
+    var rig: HeldRig = .{};
+    try rig.init("jdeath");
+    defer rig.deinit();
+    const sb = superblock.testFixture();
+    // One segment past the directory's link: two ring-side pages, then a
+    // 4-page ring.
+    const seg: page_mod.Extent = .{ .start = sb.appender_dir.start + sb.appender_dir.len, .len = 2 * dir_mod.PAGE_LEN + 4 * journal.PAGE_LEN };
+    var table: page_mod.SegmentTable = .{};
+    try table.push(seg);
+    const part = page_mod.ringPartOf(3, &table).items[0];
+    const layout = try journal.RingLayout.fromSegments(&.{.{ .start = part.start, .len = part.len }});
+    var w = try DeathWindows.build(gpa, layout, 3);
+    defer w.deinit();
+    try rig.outline(test_identity, 0);
+    try rig.appenderPage(3, 1, .live, seg, 0);
+    var tail = try linux_tail.Tail.create(.{ .layout = layout, .grain = 512, .path = rig.dev_path, .n_slots = 8, .identity = test_identity, .ring = RING_JOINED, .appender = 3 });
+    defer tail.deinit();
+    for (w.images[0].ops) |op| try rig.writeAt(op.bytes, op.offset);
+    const c_slot = tail.claim(w.res[2].start, w.res[2].start, w.images[2].ops).?;
+    const d_slot = tail.claim(w.res[3].start, w.res[3].start, w.images[3].ops).?;
+    var pbuf: [PATH_CAP]u8 = undefined;
+    var plen: usize = 0;
+    const geo = journal.productionGeometry(layout.pages, 512);
+    var ring: [4 * journal.PAGE_LEN]u8 = undefined;
+    {
+        const d = try linux_tail.replayFd(gpa, tail.fd, &pbuf, &plen);
+        try testing.expect(d.judged);
+        try testing.expectEqual(@as(u32, 0), d.replay.windows);
+        try testing.expectEqual(@as(u32, 2), d.past_hole);
+        try rig.readAt(&ring, part.start);
+        var rec = try journal.replayScanImage(gpa, &ring, geo, 0, 3);
+        defer rec.deinit();
+        try testing.expectEqual(@as(u64, 0), rec.dropped_torn);
+        try testing.expectEqual(@as(usize, 1), rec.entries.len);
+    }
+    for (w.images[1].ops) |op| try rig.writeAt(op.bytes, op.offset);
+    {
+        const d = try linux_tail.replayFd(gpa, tail.fd, &pbuf, &plen);
+        try testing.expect(d.judged);
+        try testing.expectEqual(@as(u32, 2), d.replay.windows);
+        try testing.expectEqual(@as(u32, 0), d.past_hole);
+        try rig.readAt(&ring, part.start);
+        var rec = try journal.replayScanImage(gpa, &ring, geo, 0, 3);
+        defer rec.deinit();
+        try testing.expectEqual(@as(usize, 4), rec.entries.len);
+    }
+    // The region recovered by the manager (its page Recovered): the ring
+    // is not this tail's to restore — the device is not touched.
+    const zeros: [4 * journal.PAGE_LEN]u8 = @splat(0);
+    try rig.writeAt(&zeros, part.start);
+    try rig.appenderPage(3, 2, .recovered, seg, 0);
+    {
+        const d = try linux_tail.replayFd(gpa, tail.fd, &pbuf, &plen);
+        try testing.expectEqual(@as(u32, 0), d.replay.windows);
+        try rig.readAt(&ring, part.start);
+        try testing.expectEqualSlices(u8, &zeros, &ring);
+    }
+    // Another appender's page names the segment Live: not this ring.
+    try rig.appenderPage(3, 3, .free, seg, 0);
+    try rig.appenderPage(4, 1, .live, seg, 0);
+    {
+        const d = try linux_tail.replayFd(gpa, tail.fd, &pbuf, &plen);
+        try testing.expectEqual(@as(u32, 0), d.replay.windows);
+        try rig.readAt(&ring, part.start);
+        try testing.expectEqualSlices(u8, &zeros, &ring);
     }
     tail.release(c_slot);
     tail.release(d_slot);

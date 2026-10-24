@@ -385,7 +385,7 @@ pub const linux_loop = if (builtin.os.tag == .linux) struct {
                 var path: [journal_tail.PATH_CAP]u8 = undefined;
                 var path_len: usize = 0;
                 if (journal_tail.linux_tail.replayFd(self.gpa, t.fd, &path, &path_len)) |d| {
-                    log.info("supervisor: journal tail of volume {d} ({s}): {d} un-landed window(s), {d} bytes replayed and barriered ({d} slot(s) landed or empty, {d} behind the ledger's tail; {s})", .{ t.index, path[0..path_len], d.replay.windows, d.replay.bytes, d.replay.skipped, d.behind, if (d.judged) "judged against the device's chain" else if (d.replay.windows == 0) "nothing held" else "a joined ring, written whole" });
+                    log.info("supervisor: journal tail of volume {d} ({s}): {d} un-landed window(s), {d} bytes replayed and barriered ({d} slot(s) landed or empty, {d} behind the ledger's tail; {s})", .{ t.index, path[0..path_len], d.replay.windows, d.replay.bytes, d.replay.skipped, d.behind, if (d.judged) "judged against the device's chain" else "nothing held" });
                     if (d.past_hole != 0) log.err("supervisor: journal tail of volume {d} ({s}): {d} acked window(s) lay past a hole the tail does not hold (a window acked at its landing whose write failed and was rolled back after they were applied) — NOT replayed: applying them past a missing transaction would break the volume's consistency; that metadata is lost", .{ t.index, path[0..path_len], d.past_hole });
                     _ = linux.close(t.fd);
                 } else |e| self.holdFailed(t.index, t.fd, path[0..path_len], e, dir.slice());
@@ -402,10 +402,12 @@ pub const linux_loop = if (builtin.os.tag == .linux) struct {
         /// A failed replay of `fd` (volume `index`, its device `dev`): held.
         fn holdFailed(self: *Tails, index: u16, fd: linux.fd_t, dev: []const u8, e: anyerror, dir: []const u8) void {
             if (!isFixedRing(fd)) {
-                // A joined ring has no lock of its own and its ring may be
-                // re-leased by the manager's ladder: no copy can be replayed
-                // safely later (decision 0003 §BR.5, owed).
-                log.err("supervisor: journal tail of volume {d} ({s}): replay FAILED ({s}) — a JOINED ring's tail is not held (no successor law yet): acked metadata of the flush window may be lost; fsck the volume before the next mount", .{ index, dev, @errorName(e) });
+                // A joined ring's successor is the MANAGER's recovery of the
+                // region (another process, often another node), which reads
+                // the ring off the device at `T_owner`; the ring has no lock
+                // of its own to hold, and the manager may re-lease it — a
+                // copy held here reaches neither (decision 0003 BS.16).
+                log.err("supervisor: journal tail of volume {d} ({s}): replay FAILED ({s}) — a JOINED ring's tail is not held (its successor is the manager's recovery off the device): acked metadata of the flush window may be lost; fsck the volume before the next mount", .{ index, dev, @errorName(e) });
                 _ = linux.close(fd);
                 return;
             }

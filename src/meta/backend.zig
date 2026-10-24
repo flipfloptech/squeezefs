@@ -769,7 +769,7 @@ pub const KvBackend = struct {
         errdefer be.lane.deinit();
         // Before the first request: a handler fiber's fsync parks alone.
         be.lane.routeWaits(io);
-        be.tail = try openTail(be.path, ring_layout, geo, tailIdentity(be.sb), journal_tail.RING_FIXED);
+        be.tail = try openTail(be.path, ring_layout, geo, tailIdentity(be.sb), journal_tail.RING_FIXED, journal.FIXED_RING_APPENDER);
         errdefer if (be.tail) |*t| t.deinit();
         // Every checkpoint-side device error now classifies for the fence.
         be.dev.latch = &be.lane.latch;
@@ -1150,7 +1150,7 @@ pub const KvBackend = struct {
         };
         errdefer be.lane.deinit();
         be.lane.routeWaits(io);
-        be.tail = try openTail(be.path, be.ring_layout, be.geo, tailIdentity(be.sb), journal_tail.RING_JOINED);
+        be.tail = try openTail(be.path, be.ring_layout, be.geo, tailIdentity(be.sb), journal_tail.RING_JOINED, standing.appender_id);
         errdefer if (be.tail) |*t| t.deinit();
         be.dev.latch = &be.lane.latch;
         be.smo_journal = .{ .gpa = gpa, .layout = be.ring_layout, .geo = be.geo, .core = &be.core, .reg = &be.reg, .image = &.{}, .barrier_hook = be.dev.barrierSink(), .latch = &be.lane.latch, .device = .{ .ctx = be, .write = smoWriteHook, .completed = smoCompletedHook }, .appender_id = standing.appender_id };
@@ -2088,7 +2088,7 @@ pub const KvBackend = struct {
     /// The tail: a memfd of the ring's size plus a slot table of twice the
     /// lane's cells. A refusal is the open's (a box that cannot give the
     /// tail its memory cannot keep the crash law).
-    fn openTail(path: []const u8, layout: journal.RingLayout, geo: jc.CoreGeometry, identity: journal_tail.Identity, ring: u32) OpenError!journal_tail.linux_tail.Tail {
+    fn openTail(path: []const u8, layout: journal.RingLayout, geo: jc.CoreGeometry, identity: journal_tail.Identity, ring: u32, appender: u32) OpenError!journal_tail.linux_tail.Tail {
         return journal_tail.linux_tail.Tail.create(.{
             .layout = layout,
             .grain = geo.grain,
@@ -2096,6 +2096,7 @@ pub const KvBackend = struct {
             .n_slots = @intCast(2 * journal_lane.inboundCap(layout.pages)),
             .identity = identity,
             .ring = ring,
+            .appender = appender,
         }) catch |e| {
             log.err("meta volume {s}: cannot create the journal tail ({s})", .{ path, @errorName(e) });
             return error.DeviceRefused;
@@ -3033,7 +3034,7 @@ pub const KvBackend = struct {
         be.cv.swapRing(be.env, layout, geo);
         if (be.tail != null) {
             const was = be.tail.?.image.header();
-            if (openTail(be.path, layout, geo, was.identity(), was.ring)) |t| {
+            if (openTail(be.path, layout, geo, was.identity(), was.ring, was.appender)) |t| {
                 be.tail.?.deinit();
                 be.tail = t;
                 if (be.tail_announce) |a| {

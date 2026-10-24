@@ -6525,6 +6525,279 @@ test "smoke: A LIVE MEMBER EVICTED AT T_OWNER UNDER THE DEAD MANAGER'S STRIPED H
     _ = try fsckClean(rig, "a live member evicted at T_owner");
 }
 
+/// A's eviction of the silent B at `T_owner` (`tick — N evicted`), read off
+/// A's log from `mark`; both daemons must live meanwhile.
+fn awaitEvictionOf(rig: *Rig, b: *Peer, mark: usize) !void {
+    const deadline = clock.monotonicNs() + kill_row_wait_ns;
+    while (true) {
+        const text = try rig.readLog();
+        defer rig.gpa.free(text);
+        if (text.len > mark and evictedAtTOwner(text[mark..]) >= 1) return;
+        try rig.expectAlive("evicted at T_owner");
+        try b.expectAlive("evicted at T_owner");
+        if (clock.monotonicNs() >= deadline) return error.Timeout;
+        sleepMs(20);
+    }
+}
+
+/// B's verdict on its eviction, off its log from `mark`: the re-join in
+/// place's line or the poison's — whichever lands first (the red path ends
+/// at once instead of waiting out the row's bound).
+const EvictionVerdict = enum { rejoined, poisoned };
+
+fn awaitEvictionVerdict(b: *Peer, mark: usize) !struct { verdict: EvictionVerdict, at: usize } {
+    const deadline = clock.monotonicNs() + kill_row_wait_ns;
+    while (true) {
+        const text = try b.readLog();
+        defer b.rig.gpa.free(text);
+        if (text.len > mark) {
+            const tail = text[mark..];
+            if (std.mem.indexOf(u8, tail, "RE-JOINED IN PLACE")) |i| return .{ .verdict = .rejoined, .at = mark + i };
+            if (std.mem.indexOf(u8, tail, "this joined mount is POISONED")) |i| return .{ .verdict = .poisoned, .at = mark + i };
+        }
+        try b.expectAlive("the eviction's verdict");
+        if (clock.monotonicNs() >= deadline) return error.Timeout;
+        sleepMs(20);
+    }
+}
+
+test "smoke: A LIVE MEMBER EVICTED WITH NOTHING UN-LANDED RE-JOINS IN PLACE (charter §5.5, decision 0003 §BO; the owner's ruling (b), 2026-10-24) — A (the manager) mkdirs `shared`; B JOINED writes `own/f` (1 MiB, fsync'd) and a process holds it OPEN read-write; B goes idle-clean → B's member beat is HELD (SQUEEZEFS_TEST_MEMBERSHIP_BEAT_HOLD) past T_owner ⇒ A evicts the silent B at T_owner and recovers its region → released: B parks at T_self, its reclaim meets UnknownLease ⇒ B holds nothing un-landed (the ring's head = the head A's recovery read; no custody, no resident, no parked refinement, no intent) ⇒ B RE-JOINS IN PLACE under the same live FUSE mount (a fresh JoinAppender, a new membership epoch; no poison, no park expiry) → the held fd overwrites the file's head after the re-join and B and A read `own/f` byte-equal; B creates and renames in A's `shared`, both list the same; no tripwire on either → umount B (exit 0: the successor's clean leave), umount A (exit 0) → fsck --offline --scrub 0 findings (red: UnknownLease poisoned B — every volume FAILED, EIO until remount)" {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    try rig.env.put("SQUEEZEFS_MW_BIND", "127.0.0.1:0");
+    var t_owner_text: [8]u8 = undefined;
+    try rig.env.put("SQUEEZEFS_TEST_MEMBERSHIP_T_OWNER_MS", try std.fmt.bufPrint(&t_owner_text, "{d}", .{smoke_t_owner_ms}));
+    // The hold's FIFO is NAMED now and CREATED when the hold should begin.
+    var fb: [linux.PATH_MAX]u8 = undefined;
+    const fifo = try std.fmt.bufPrintSentinel(&fb, "{s}/beat.fifo", .{rig.work}, 0);
+    try rig.env.put("SQUEEZEFS_TEST_MEMBERSHIP_BEAT_HOLD", fifo);
+    try rig.formatSetWith(false, &.{});
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(0);
+    const b = try Peer.init(rig, "b");
+    defer b.deinit();
+    b.node = kill_peer_node;
+    try b.spawn(&.{});
+    _ = try b.awaitReady();
+    {
+        const out = try rig.onMount("mkdir shared");
+        gpa.free(out);
+    }
+    // B's own file, fsync'd: its bytes promoted, its records landed.
+    const sha_before = try b.onMount("mkdir own && head -c 1048576 /dev/urandom > own/f && sync -d own/f && tail -c +19 own/f | sha256sum");
+    defer gpa.free(sha_before);
+    // A process holds `own/f` OPEN (read-write) across the eviction and the
+    // re-join; it overwrites the file's first 18 bytes through that fd once
+    // the row says go.
+    var hb: [linux.PATH_MAX]u8 = undefined;
+    const held = try std.fmt.bufPrint(&hb, "{s}/held", .{rig.work});
+    var gb: [linux.PATH_MAX]u8 = undefined;
+    const go = try std.fmt.bufPrint(&gb, "{s}/go", .{rig.work});
+    var holder = try std.process.spawn(io, .{ .argv = &.{ "sh", "-e", "-c", "exec 3<>\"$0/own/f\"; : > \"$1\"; while [ ! -e \"$2\" ]; do sleep 0.05; done; printf 'after the re-join\\n' >&3; exec 3>&-", b.mp, held, go }, .environ_map = &rig.env, .stdin = .ignore });
+    var holder_done = false;
+    defer if (!holder_done) {
+        _ = linux.kill(holder.id.?, .KILL);
+        _ = holder.wait(io) catch {};
+    };
+    {
+        const deadline = clock.monotonicNs() + kill_row_wait_ns;
+        while (true) {
+            Io.Dir.cwd().access(io, held, .{}) catch {
+                if (clock.monotonicNs() >= deadline) return error.Timeout;
+                sleepMs(20);
+                continue;
+            };
+            break;
+        }
+    }
+    // Idle-clean: every refinement and resident landed (syncfs).
+    {
+        const out = try b.onMount("sync -f .");
+        gpa.free(out);
+    }
+    var released = false;
+    defer if (!released) releaseHold(fifo);
+    var mark = try rig.logLen();
+    const b_mark = try b.logLen();
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.mknodat(linux.AT.FDCWD, fifo.ptr, linux.S.IFIFO | 0o600, 0)));
+    _ = try b.awaitLog("the member's beat holds", b_mark, kill_row_wait_ns);
+    const t_hold = clock.monotonicNs();
+    // A evicts the silent B at T_owner and records its death.
+    try awaitEvictionOf(rig, b, mark);
+    const evicted_ms = (clock.monotonicNs() - t_hold) / std.time.ns_per_ms;
+    mark = try rig.logLen();
+    // Released: B parks, its reclaim meets UnknownLease — the verdict.
+    releaseHold(fifo);
+    released = true;
+    const t_release = clock.monotonicNs();
+    const v = try awaitEvictionVerdict(b, b_mark);
+    if (v.verdict == .poisoned) {
+        std.debug.print("\nsmoke: the evicted B was POISONED instead of re-joining in place\n", .{});
+        return error.PoisonedInsteadOfRejoined;
+    }
+    const rejoin_ms = (clock.monotonicNs() - t_release) / std.time.ns_per_ms;
+    std.debug.print("\nsmoke: live member re-joined in place: A evicted B {d} ms into the hold; B re-joined {d} ms after the release\n", .{ evicted_ms, rejoin_ms });
+    {
+        const tb = try b.readLog();
+        defer gpa.free(tb);
+        try testing.expect(std.mem.indexOf(u8, tb[b_mark..], "this joined mount is POISONED") == null);
+        try testing.expect(std.mem.indexOf(u8, tb[b_mark..], "cannot re-join in place") == null);
+    }
+    // The held fd writes on the successor incarnation; the bytes are whole.
+    {
+        const f = try Io.Dir.cwd().createFile(io, go, .{ .truncate = true });
+        f.close(io);
+        const term = try holder.wait(io);
+        holder_done = true;
+        try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
+    }
+    {
+        const out = try b.onMount("sync -d own/f && tail -c +19 own/f | sha256sum && head -c 18 own/f && stat -c %s own/f");
+        defer gpa.free(out);
+        try testing.expect(std.mem.startsWith(u8, out, sha_before));
+        try testing.expect(std.mem.endsWith(u8, out, "after the re-join\n1048576\n"));
+        const on_a = try rig.onMount("tail -c +19 own/f | sha256sum && head -c 18 own/f && stat -c %s own/f");
+        defer gpa.free(on_a);
+        try testing.expectEqualStrings(out, on_a);
+    }
+    // B creates and renames in A's directory (every step shipped to A).
+    {
+        const out = try b.onMount("echo b > shared/x && mv shared/x shared/y && ls shared");
+        defer gpa.free(out);
+        try testing.expectEqualStrings("y\n", out);
+        const on_a = try rig.onMount("ls shared && cat shared/y");
+        defer gpa.free(on_a);
+        try testing.expectEqualStrings("y\nb\n", on_a);
+    }
+    {
+        const tb = try b.stats();
+        defer gpa.free(tb);
+        try testing.expectEqual(@as(?u64, 1), numberAfter(tb, "\"member_rejoins_in_place\":"));
+        try testing.expectEqual(@as(?u64, 1), numberAfter(tb, "\"meta_rejoins_in_place\":"));
+        try testing.expectEqual(@as(?u64, 0), numberAfter(tb, "\"appender_park_expiries\":"));
+        try testing.expectEqual(@as(?u64, 0), numberAfter(tb, "\"invariant_tripwires\":"));
+        try testing.expectEqual(@as(?u64, 0), numberAfter(tb, "\"appender_parked\":"));
+        const ta = try rig.stats();
+        defer gpa.free(ta);
+        try testing.expect((numberAfter(ta, "\"membership_evictions\":") orelse 0) >= 1);
+        try testing.expectEqual(@as(?u64, 0), numberAfter(ta, "\"xv_cross_owner_steps_rejected\":"));
+        try testing.expectEqual(@as(?u64, 0), numberAfter(ta, "\"invariant_tripwires\":"));
+    }
+    try b.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try b.waitExit());
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+    _ = try fsckClean(rig, "a live member re-joined in place");
+}
+
+test "smoke: A LIVE MEMBER EVICTED WITH UN-LANDED STATE FAIL-STOPS (the re-join's negative arm, decision 0003 §BO) — B JOINED under the close write-back posture (SQUEEZEFS_WRITEBACK_POSTURE=close: custody lands at the close) writes 64 KiB into `own/g` through an fd a process holds OPEN (acked, never published: write-side custody) → B's beat is HELD past T_owner ⇒ A evicts B and recovers its region → released: UnknownLease ⇒ B holds acked bytes no layout names ⇒ NO re-join: B fail-stops exactly as before (the park's expiry, POISONED, every volume FAILED) — a fresh op answers EIO within the bound (no fork: the custody is never published under a successor), umount B (exit 1, the crash shape: nothing written), A serves on with no tripwire → fsck --offline --scrub 0 findings" {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    try rig.env.put("SQUEEZEFS_MW_BIND", "127.0.0.1:0");
+    var t_owner_text: [8]u8 = undefined;
+    try rig.env.put("SQUEEZEFS_TEST_MEMBERSHIP_T_OWNER_MS", try std.fmt.bufPrint(&t_owner_text, "{d}", .{smoke_t_owner_ms}));
+    var fb: [linux.PATH_MAX]u8 = undefined;
+    const fifo = try std.fmt.bufPrintSentinel(&fb, "{s}/beat.fifo", .{rig.work}, 0);
+    try rig.env.put("SQUEEZEFS_TEST_MEMBERSHIP_BEAT_HOLD", fifo);
+    try rig.formatSetWith(false, &.{});
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(0);
+    const b = try Peer.init(rig, "b");
+    defer b.deinit();
+    var close_env = try rig.env.clone(gpa);
+    defer close_env.deinit();
+    try close_env.put("SQUEEZEFS_WRITEBACK_POSTURE", "close");
+    b.env = &close_env;
+    b.node = kill_peer_node;
+    try b.spawn(&.{});
+    _ = try b.awaitReady();
+    {
+        const out = try b.onMount("mkdir own && sync -f .");
+        gpa.free(out);
+    }
+    // The custody: 64 KiB written through an fd held open (never closed,
+    // never synced) — acked, its layout never published.
+    var hb: [linux.PATH_MAX]u8 = undefined;
+    const held = try std.fmt.bufPrint(&hb, "{s}/held", .{rig.work});
+    var gb: [linux.PATH_MAX]u8 = undefined;
+    const go = try std.fmt.bufPrint(&gb, "{s}/go", .{rig.work});
+    var holder = try std.process.spawn(io, .{ .argv = &.{ "sh", "-c", "exec 3>\"$0/own/g\" && head -c 65536 /dev/urandom >&3 && : > \"$1\" && while [ ! -e \"$2\" ]; do sleep 0.05; done", b.mp, held, go }, .environ_map = &rig.env, .stdin = .ignore });
+    var holder_done = false;
+    defer if (!holder_done) {
+        _ = linux.kill(holder.id.?, .KILL);
+        _ = holder.wait(io) catch {};
+    };
+    {
+        const deadline = clock.monotonicNs() + kill_row_wait_ns;
+        while (true) {
+            Io.Dir.cwd().access(io, held, .{}) catch {
+                if (clock.monotonicNs() >= deadline) return error.Timeout;
+                sleepMs(20);
+                continue;
+            };
+            break;
+        }
+    }
+    var released = false;
+    defer if (!released) releaseHold(fifo);
+    const mark = try rig.logLen();
+    const b_mark = try b.logLen();
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.mknodat(linux.AT.FDCWD, fifo.ptr, linux.S.IFIFO | 0o600, 0)));
+    _ = try b.awaitLog("the member's beat holds", b_mark, kill_row_wait_ns);
+    try awaitEvictionOf(rig, b, mark);
+    releaseHold(fifo);
+    released = true;
+    const v = try awaitEvictionVerdict(b, b_mark);
+    try testing.expectEqual(EvictionVerdict.poisoned, v.verdict);
+    {
+        const tb = try b.readLog();
+        defer gpa.free(tb);
+        try testing.expect(std.mem.indexOf(u8, tb[b_mark..], "cannot re-join in place — write-side custody on 1 ino(s)") != null);
+        try testing.expect(std.mem.indexOf(u8, tb[b_mark..], "RE-JOINED IN PLACE") == null);
+    }
+    // The fail-stop: an op answers EIO within the bound.
+    {
+        var secs: [8]u8 = undefined;
+        const r = try std.process.run(gpa, io, .{ .argv = &.{ "timeout", "-s", "KILL", try std.fmt.bufPrint(&secs, "{d}", .{poison_fail_stop_bound_s}), "sh", "-c", "touch \"$0/own/after-poison\"", b.mp }, .environ_map = &rig.env });
+        defer rig.freeRun(r);
+        if (r.term == .signal) {
+            printWedge(io, "b", b.pid, b.log_path, gpa);
+            abortFuseConnectionOf(io, b.mp);
+            return error.PoisonedMountHeldArrivingOp;
+        }
+        try testing.expect(!r.term.success());
+        try testing.expect(std.mem.indexOf(u8, r.stderr, "Input/output error") != null);
+    }
+    {
+        const f = try Io.Dir.cwd().createFile(io, go, .{ .truncate = true });
+        f.close(io);
+        _ = try holder.wait(io);
+        holder_done = true;
+    }
+    {
+        const ta = try rig.stats();
+        defer gpa.free(ta);
+        try testing.expect((numberAfter(ta, "\"membership_evictions\":") orelse 0) >= 1);
+        try testing.expectEqual(@as(?u64, 0), numberAfter(ta, "\"invariant_tripwires\":"));
+    }
+    try b.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 1 }, try b.waitExit());
+    {
+        const tb = try b.readLog();
+        defer gpa.free(tb);
+        try testing.expect(std.mem.indexOf(u8, tb[b_mark..], "the leave writes nothing (the crash shape") != null);
+    }
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+    _ = try fsckClean(rig, "a live member evicted with un-landed state");
+}
+
 /// The member's renew cadence its mount line names (`renew every N ms`).
 fn renewMsOf(text: []const u8) ?u64 {
     return numberAfter(text, "renew every ");

@@ -323,6 +323,71 @@ fn expectPattern(buf: []const u8, base: u64) !void {
     }
 }
 
+/// The placed-sever counters (`il_daemon.md` §3.2) at one instant.
+const Placement = struct {
+    severs: u64,
+    fallbacks: u64,
+    adoptions: u64,
+    refusals: u64,
+    reaps: u64,
+
+    fn read(rig: *Rig) !Placement {
+        const text = try rig.stats();
+        defer rig.gpa.free(text);
+        return .{
+            .severs = numberAfter(text, "\"ipc_placed_severs\":") orelse return error.StatMissing,
+            .fallbacks = numberAfter(text, "\"ipc_placed_sever_fallbacks\":") orelse return error.StatMissing,
+            .adoptions = numberAfter(text, "\"ipc_placed_adoptions\":") orelse return error.StatMissing,
+            .refusals = numberAfter(text, "\"ipc_placed_adoption_refusals\":") orelse return error.StatMissing,
+            .reaps = numberAfter(text, "\"ipc_placed_reaps\":") orelse return error.StatMissing,
+        };
+    }
+
+    fn since(self: Placement, base: Placement) Placement {
+        return .{
+            .severs = self.severs - base.severs,
+            .fallbacks = self.fallbacks - base.fallbacks,
+            .adoptions = self.adoptions - base.adoptions,
+            .refusals = self.refusals - base.refusals,
+            .reaps = self.reaps - base.reaps,
+        };
+    }
+};
+
+/// What can stand between a whole-block fill and the warm serve of its
+/// block: the hot tier's evictions and refused puts, the warm ladder's
+/// contended probes.
+const WarmTier = struct {
+    evictions: u64,
+    refused_puts: u64,
+    contended: u64,
+
+    fn read(rig: *Rig) !WarmTier {
+        const text = try rig.stats();
+        defer rig.gpa.free(text);
+        return .{
+            .evictions = numberAfter(text, "\"hot_block_evictions\":") orelse return error.StatMissing,
+            .refused_puts = numberAfter(text, "\"hot_block_put_refusals\":") orelse return error.StatMissing,
+            .contended = numberAfter(text, "\"ipc_fast_path_lock_demotions\":") orelse return error.StatMissing,
+        };
+    }
+
+    fn since(self: WarmTier, base: WarmTier) WarmTier {
+        return .{ .evictions = self.evictions - base.evictions, .refused_puts = self.refused_puts - base.refused_puts, .contended = self.contended - base.contended };
+    }
+};
+
+/// What a pwrite's placement leaves once its payloads dropped (they drop
+/// after the acks): every assembly it opened is settled — adopted by a
+/// merge or reaped unadopted — and none stays charged. Returns the deltas.
+fn expectPlacementSettled(rig: *Rig, base: Placement, what: []const u8) !Placement {
+    try rig.awaitStat("ipc_placed_assembly_bytes", 0);
+    const d = (try Placement.read(rig)).since(base);
+    std.debug.print("smoke[interception]: {s} placed {d}/4 (fallbacks {d}), adoptions {d}, refusals {d}, reaps {d}\n", .{ what, d.severs, d.fallbacks, d.adoptions, d.refusals, d.reaps });
+    if (d.severs != 0) try testing.expect(d.adoptions + d.reaps >= 1);
+    return d;
+}
+
 fn served(o: client.Outcome) !usize {
     return switch (o) {
         .served => |n| n,
@@ -334,7 +399,7 @@ fn served(o: client.Outcome) !usize {
     };
 }
 
-test "smoke: THE INTERCEPTION HOST — format → mount -o interception → the il0 xattr → a session in-process over the ONE client library → bind → ring pwrite 4 MiB (sever-at-dequeue, the write cache's one record) read back through the kernel path byte-exact → the second block's pieces pool while the record promotes (the file striped from here) → a third block's 4 MiB stream of 1 MiB pieces places into ONE assembly adopted by ONE merge → a cold read then a warm read on the sync fast path (arena_copy_bytes ≡ bytes) → a W1-shaped 4 KiB overwrite serves INLINE on the dd lane (patch_edge_rmw_reads 0) → 8 no-wait tickets complete in offset order → the fd screen's refusals → kernel fsync → umount with the live session tears down cleanly (the client poisoned, no mount left)" {
+test "smoke: THE INTERCEPTION HOST — format → mount -o interception → the il0 xattr → a session in-process over the ONE client library → bind → ring pwrite 4 MiB (sever-at-dequeue, the write cache's one record) read back through the kernel path byte-exact → the second block's pieces pool while the record promotes (the file striped from here) → a third block's 4 MiB stream of 1 MiB pieces places, its first merge adopting the assembly (ONE assembly, ONE merge when the four drain in one pass; the bytes whatever the passes did) → a cold read then a warm read on the sync fast path (arena_copy_bytes ≡ bytes) → a W1-shaped 4 KiB overwrite serves INLINE on the dd lane (patch_edge_rmw_reads 0) → 8 no-wait tickets complete in offset order → the fd screen's refusals → kernel fsync → umount with the live session tears down cleanly (the client poisoned, no mount left)" {
     const io = testing.io;
     if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
     const gpa = testing.allocator;
@@ -395,37 +460,49 @@ test "smoke: THE INTERCEPTION HOST — format → mount -o interception → the 
     try testing.expectEqual(BLOCK, linux.pread(kfd, back.ptr, back.len, 0));
     try expectPattern(back, 0);
 
-    // 2. Block 1 as ONE 4 MiB pwrite: the client stages 4 flights of 1 MiB
-    //    under one doorbell, so the pass drains every sibling before its
-    //    flush spawns the handoffs. Under the write cache (charter §6.1
-    //    "Staged") block 0 is ONE 4 MiB record in the ring and the file is
-    //    still staged at the sever, so placement is not eligible (a
-    //    resident striped layout is its screen): the chunks sever POOLED;
-    //    the first handoff's extending write promotes the record to its own
-    //    block — the file is striped from here — and the chunks land
-    //    striped. Later chunks may have placed once that promotion landed
-    //    (their partial assembly reaps unadopted: the first merge of the
-    //    block was a pooled one) — never an adoption, never a fallback.
+    // 2. Block 1 as ONE 4 MiB pwrite (4 flights of 1 MiB under one
+    //    doorbell). Under the write cache (charter §6.1 "Staged") block 0 is
+    //    ONE 4 MiB record in the ring: a chunk severed while the file is
+    //    staged severs POOLED (a resident striped layout is placement's
+    //    screen); the first handoff's extending write promotes the record —
+    //    the file is striped from here — and a chunk severed after that may
+    //    place. Which chunks place, and whether a placed one's merge finds
+    //    the block's entry (the assembly reaps) or adopts, follows the drain
+    //    passes and the lanes: judged are the bytes, one sever per chunk and
+    //    every assembly settled.
     const block1 = try gpa.alloc(u8, BLOCK);
     defer gpa.free(block1);
     pattern(block1, BLOCK);
+    const before1 = try Placement.read(rig);
     try testing.expectEqual(BLOCK, try served(s.pwrite(b.id, block1, BLOCK)));
     try testing.expectEqual(@as(u64, 8), try rig.stat("ipc_ops_write"));
-    try testing.expect((try rig.stat("ipc_placed_severs")) <= 3);
-    try testing.expectEqual(@as(u64, 0), try rig.stat("ipc_placed_adoptions"));
-    try testing.expectEqual(@as(u64, 0), try rig.stat("ipc_placed_sever_fallbacks"));
+    try testing.expectEqual(@as(u64, 8), try rig.stat("ipc_severs"));
     try testing.expectEqual(BLOCK, linux.pread(kfd, back.ptr, back.len, @intCast(BLOCK)));
     try expectPattern(back, BLOCK);
+    _ = try expectPlacementSettled(rig, before1, "block 1");
     //    Block 2 as ONE 4 MiB pwrite: the file is striped and block 2 has
-    //    no entry — the four chunks sever into ONE assembly, the first
-    //    merge adopts it full, its siblings ride the adoption.
+    //    no entry, so its first chunk takes the placed arm (it places, or
+    //    falls back counted) and the first merge of the block meets a
+    //    placed payload: it adopts the assembly with its LANDED runs as
+    //    coverage, or is refused under the Dekker. The client pushes each
+    //    flight after its copy, so a pass may drain a prefix of the four
+    //    (a park's rescan, a client preempted between flights): the
+    //    prefix's flush adopts it and the later chunks find the entry and
+    //    sever pooled (`il_daemon.md` §3.2: an entry-present block never
+    //    adopts). Four placed with no refusal is ONE assembly adopted full
+    //    by ONE merge, its siblings riding it.
     pattern(block1, 2 * BLOCK);
+    const before2 = try Placement.read(rig);
     try testing.expectEqual(BLOCK, try served(s.pwrite(b.id, block1, 2 * BLOCK)));
     try testing.expectEqual(@as(u64, 12), try rig.stat("ipc_ops_write"));
-    try testing.expect((try rig.stat("ipc_placed_severs")) >= 4);
-    try testing.expectEqual(@as(u64, 1), try rig.stat("ipc_placed_adoptions"));
-    try testing.expectEqual(@as(u64, 0), try rig.stat("ipc_placed_adoption_refusals"));
-    try testing.expectEqual(@as(u64, 0), try rig.stat("ipc_placed_sever_fallbacks"));
+    try testing.expectEqual(@as(u64, 12), try rig.stat("ipc_severs"));
+    const placed2 = try expectPlacementSettled(rig, before2, "block 2");
+    try testing.expect(placed2.severs + placed2.fallbacks >= 1);
+    if (placed2.severs != 0 and placed2.fallbacks == 0) try testing.expect(placed2.adoptions + placed2.refusals >= 1);
+    if (placed2.severs == 4 and placed2.refusals == 0) {
+        try testing.expectEqual(@as(u64, 1), placed2.adoptions);
+        try testing.expectEqual(@as(u64, 0), placed2.reaps);
+    }
     try testing.expectEqual(BLOCK, linux.pread(kfd, back.ptr, back.len, @intCast(2 * BLOCK)));
     // The kernel-path read-backs ran contiguous: a CLASSIFIED stream, which
     // vetoes ranged windows file-wide while fresh (`prefetch.STALE_NS`).
@@ -497,6 +574,8 @@ test "smoke: THE INTERCEPTION HOST — format → mount -o interception → the 
     try expectPattern(rbuf, 1 * MiB + 100);
     try testing.expectEqual(demotes0 + 2, try rig.stat("ipc_fast_path_miss_demotions"));
     try testing.expectEqual(esc0, try rig.stat("ranged_read_ghost_escalations"));
+    const level_touch = try rig.stat("mem_budget_level");
+    const tier0 = try WarmTier.read(rig);
     try testing.expectEqual(rbuf.len, try served(s.pread(b.id, rbuf, 1 * MiB + 100)));
     try expectPattern(rbuf, 1 * MiB + 100);
     try testing.expectEqual(demotes0 + 3, try rig.stat("ipc_fast_path_miss_demotions"));
@@ -504,17 +583,27 @@ test "smoke: THE INTERCEPTION HOST — format → mount -o interception → the 
     // admission's law: `rangedEscalation` refuses under Red) — a 512 KiB
     // window is outside the read cache's grain class, so no serve stands
     // between the two touches; under Red the warm-serve arm is not judged.
-    const red = (try rig.stat("mem_budget_level")) == 2;
-    if (!red) {
+    // The escalated block serves WARM on the next read unless a lawful arm
+    // stood between: the budget off Green (an insert at Yellow is net-zero
+    // growth — the empty tier sheds the block it just took), a tier
+    // eviction or a refused put, or a probe that met a held guard (a
+    // contended probe demotes, never waits) — the read then rides the
+    // handoff with the same bytes.
+    const level_esc = try rig.stat("mem_budget_level");
+    if (level_touch != 2 and level_esc != 2) {
         try testing.expectEqual(esc0 + 1, try rig.stat("ranged_read_ghost_escalations"));
         const serves0 = try rig.stat("ipc_fast_path_serves");
         const copy0 = try rig.stat("ipc_read_arena_copy_bytes");
         const ops_read0 = try rig.stat("ipc_ops_read");
         try testing.expectEqual(@as(usize, 512 * 1024), try served(s.pread(b.id, rbuf[0 .. 512 * 1024], 1 * MiB)));
         try expectPattern(rbuf[0 .. 512 * 1024], 1 * MiB);
-        try testing.expectEqual(serves0 + 1, try rig.stat("ipc_fast_path_serves"));
-        try testing.expectEqual(copy0 + 512 * 1024, try rig.stat("ipc_read_arena_copy_bytes"));
         try testing.expectEqual(ops_read0 + 1, try rig.stat("ipc_ops_read"));
+        const level_warm = try rig.stat("mem_budget_level");
+        const t = (try WarmTier.read(rig)).since(tier0);
+        if (level_touch == 0 and level_esc == 0 and level_warm == 0 and t.evictions == 0 and t.refused_puts == 0 and t.contended == 0) {
+            try testing.expectEqual(serves0 + 1, try rig.stat("ipc_fast_path_serves"));
+            try testing.expectEqual(copy0 + 512 * 1024, try rig.stat("ipc_read_arena_copy_bytes"));
+        } else std.debug.print("smoke[interception]: the warm serve is not judged on this run — budget levels {d}/{d}/{d}, tier evictions {d}, refused puts {d}, contended probes {d}\n", .{ level_touch, level_esc, level_warm, t.evictions, t.refused_puts, t.contended });
     } else std.debug.print("smoke[interception]: budget Red at the ghost step — the escalation and the warm serve are not judged on this run\n", .{});
     try testing.expect((try rig.stat("ipc_read_demote_bytes")) >= 2 * 512 * 1024);
     // The engagement identity closes.

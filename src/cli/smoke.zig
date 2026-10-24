@@ -520,10 +520,15 @@ const Rig = struct {
     /// rig waits for its death and reads its wait status off the
     /// supervisor's line (`waitChild`).
     fn spawnSupervised(self: *Rig, extra: []const []const u8) !void {
+        return self.spawnSupervisedOf(self.meta_uri, extra);
+    }
+
+    /// `spawnSupervised` over another set (a device-mapper rig's).
+    fn spawnSupervisedOf(self: *Rig, meta_uri: []const u8, extra: []const []const u8) !void {
         std.debug.assert(self.child == null and self.supervised == null);
         if (self.log_file == null) self.log_file = try openLogAppend(self.log_path);
         const mark = try self.logLen();
-        self.child_pid = try mountSupervised(self, self.log_path, &.{}, extra, self.meta_uri, self.mp, &self.env, mark);
+        self.child_pid = try mountSupervised(self, self.log_path, &.{}, extra, meta_uri, self.mp, &self.env, mark);
         self.supervisors.note(self.child_pid);
         self.supervised = mark;
         self.killed = false;
@@ -3184,7 +3189,10 @@ test "smoke: 1,100 CONCURRENT WRITES, FSYNCS AND O_DIRECT READS ON ONE MOUNT OVE
         if (!r.term.success()) std.debug.print("\nformat: {s}\n", .{r.stderr});
         try testing.expect(r.term.success());
     }
-    try rig.spawnMountOf(dm.meta_uri, &.{});
+    // Supervised: the small writes ride the write cache, which a mount
+    // without a supervisor does not run (decision 0003 §BR.6) — cache-less,
+    // each 64 KiB file takes a whole block and the small set runs out.
+    try rig.spawnSupervisedOf(dm.meta_uri, &.{});
     _ = try rig.awaitReady(0);
     gpa.free(try rig.onMount("mkdir s && echo made"));
     const payload = try gpa.create([64 << 10]u8);

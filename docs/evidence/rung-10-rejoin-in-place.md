@@ -104,6 +104,9 @@ its verdict is the fail-stop deterministically (its storm alone left B eligible 
   after the re-join reported `[C15] … appender 2 — dead` (the job after the re-join, red).
 - **Two-volume joiners:** members past volume 0 join with volume 0's `job:enroll` secret (a joiner of
   a two-member meta set could not mount at all).
+- **A joined ring's death replay is judged** (BS.16): the chain is the appender's own page off the
+  device's directory, which must be Live and name the ring. A failed joined replay is still not held:
+  the region's successor is the manager's recovery off the device.
 - **The interposer:** a `dd` writer and reader keep their ring sessions across the re-join (sessions
   2 → 2; after it the ring served 8 writes and 15 reads), no error reaching the app, A byte-equal.
 
@@ -115,6 +118,7 @@ its verdict is the fail-stop deterministically (its storm alone left B eligible 
 | "A RE-JOIN WHOSE MEMBERSHIP JOIN IS REFUSED …" | best-effort leave (page check passed this run; no clean-leave line) | successor left at once, page `Free` |
 | shim "A RE-JOIN IN PLACE UNDER THE INTERPOSER" | green with overwrites (a guard) | green |
 | unit "a re-join in place drops every grant its holder issued" | — | green |
+| unit "a JOINED ring's death replay is JUDGED too" (BS.16, after the custody follow-ups) | judged false: C and D written past B's hole | nothing past the hole; a page not Live naming the ring writes nothing |
 
 Counts (on `c678245`, dev `9b081ae`): the re-join rows (the main row, its negative arm, the memory,
 two-volume and refused rows, both dead-manager eviction rows) **20/20** — two loops in parallel × 10
@@ -131,7 +135,7 @@ counter under load; untouched here). `zig build rails` 32/32; `zig fmt --check` 
   (repro `~/tmp/rejoin/smoke-with-control.zig`). After a re-join the class reaches B's OWN
   pre-re-join files through the interposer: an append through a ring session lands zeros on A and B
   (A: `slot_door_coherence_refusals` 780); through FUSE (a held `O_APPEND` fd, a fresh open) the bytes
-  are whole. Owed to `fix/foreign-append-bytes` (the claim law); the interposer row overwrites.
+  are whole. Seen on bases `23db6c2` and `9b081ae`, before the foreign-append fix (`8bb2f94`) landed; a re-check on it is owed. The interposer row overwrites.
 - An online fsck within one ledger poll (1.1 s) of a re-join can still read the predecessor's death
   record (C15); the main row waits for the retirement.
 - The predecessor's `Recovered` page is not released while an allocation lease names the pair — the

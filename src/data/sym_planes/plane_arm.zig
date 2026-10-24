@@ -597,6 +597,9 @@ pub const HolderPlane = struct {
     /// the marker): the reclaimer's own free under the block's live stamp.
     fn ladderFree(ctx: *anyopaque, idx: u64) reclaim.FreeOutcome {
         const v: *Vol = @ptrCast(@alignCast(ctx));
+        // An open pack's tenant leaves through the packer (the pin keeps it
+        // nonterminal).
+        if (v.holder.plane.releaseShippedOpenTenant(v.vol_tag, v.alloc.offsetOf(idx))) return .nonterminal;
         return v.holder.plane.reclaimer.freeBlock(v.holder.io, v.ordinal, idx, v.alloc.stampOf(idx));
     }
 

@@ -1918,6 +1918,17 @@ pub const DataPlane = struct {
         return true;
     }
 
+    /// A non-holder's SHIPPED free of a tenant of one of this holder's OPEN
+    /// packs (its write displaced the tenant: the foreign promotion of a
+    /// packed file) leaves through the packer as a local free does
+    /// (`freeBindings`), so the pin arithmetic counts it; the ladder alone
+    /// lowered the refcount the seal's census reads (`pack_pin_refcount_
+    /// drift` at the dismount seal). True iff the block is an open pack's.
+    pub fn releaseShippedOpenTenant(self: *DataPlane, vol_tag: u64, offset: u64) bool {
+        if (self.packer) |*p| return p.releaseOpenTenant(.{ .vol_tag = vol_tag, .offset = offset });
+        return false;
+    }
+
     /// The in-flight registrations of releases on this mount's volumes
     /// (decision 0003 §AH.1): taken before a releasing commit, dropped after
     /// the frees (`dropReleases`) or on the path that abandons the release.

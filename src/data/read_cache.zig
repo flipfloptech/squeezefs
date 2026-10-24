@@ -1053,3 +1053,100 @@ test "the read cache: a sharded instance keeps every grain of a block in one sha
     try testing.expect(!rc.contains(victim_blk, 0, GRAIN));
     try testing.expect(rc.contains(victim_blk, GRAIN, 2 * GRAIN));
 }
+
+test "the read cache: a block's purge (by key and through the census) leaves none of its grains while depositors on other blocks double the shards' indexes; at rest every live grain holds exactly one slab reference (the stripes and the index agree) and a full purge returns every slot" {
+    const bs: u64 = 64 * GRAIN;
+    const reservation: u64 = 8192 * GRAIN;
+    const ino: u64 = 0x5ead_c0de_0001;
+    const purge_vol: u64 = 9;
+    const per_depositor: u64 = 32;
+    const Race = struct {
+        rc: *ReadCache,
+        go: Atomic(bool) = .init(false),
+        done: Atomic(u32) = .init(0),
+        violations: Atomic(u32) = .init(0),
+        rounds_in_growth: Atomic(u64) = .init(0),
+
+        fn fail(r: *@This()) void {
+            _ = r.violations.fetchAdd(1, .monotonic);
+        }
+
+        fn depositor(r: *@This(), vol: u64) void {
+            var win: [WINDOW_MAX]u8 = undefined;
+            fillGrain(&win, @truncate(vol));
+            while (!r.go.load(.acquire)) std.atomic.spinLoopHint();
+            for (0..per_depositor) |k| {
+                const blk = BlockKey.init(vol, k * bs);
+                if (r.rc.putValidated(blk, 0, &win, ino, lease_epoch.load(ino), .always, false) != .inserted) r.fail();
+                if (r.rc.putValidated(blk, 32 * GRAIN, &win, ino, lease_epoch.load(ino), .always, false) != .inserted) r.fail();
+            }
+            _ = r.done.fetchAdd(1, .release);
+        }
+
+        fn mine(_: *anyopaque, key: BlockKey) bool {
+            return key.vol_tag == purge_vol;
+        }
+
+        fn purger(r: *@This()) void {
+            var win: [WINDOW_MAX]u8 = undefined;
+            fillGrain(&win, 0x99);
+            r.go.store(true, .release);
+            var round: u64 = 0;
+            while (round == 0 or r.done.load(.acquire) < 2) : (round += 1) {
+                if (r.done.load(.acquire) < 2) _ = r.rounds_in_growth.fetchAdd(1, .monotonic);
+                for (0..4) |k| {
+                    const blk = BlockKey.init(purge_vol, (round * 4 + k) * bs);
+                    if (r.rc.putValidated(blk, 16 * GRAIN, &win, ino, lease_epoch.load(ino), .always, false) != .inserted) r.fail();
+                    if (!r.rc.contains(blk, 16 * GRAIN, 32 * GRAIN)) r.fail();
+                }
+                if (round % 2 == 0) {
+                    for (0..4) |k| if (!r.rc.purge(BlockKey.init(purge_vol, (round * 4 + k) * bs))) r.fail();
+                } else {
+                    // The recall's census: one grain names its block, the
+                    // block's purge drops the rest.
+                    var cursor: u64 = 0;
+                    var n: u32 = 0;
+                    while (r.rc.nextKey(&cursor, .{ .ctx = r, .call = &mine })) |b| {
+                        if (!r.rc.purge(b)) r.fail();
+                        n += 1;
+                    }
+                    if (n != 4) r.fail();
+                }
+                for (0..4) |k| {
+                    const blk = BlockKey.init(purge_vol, (round * 4 + k) * bs);
+                    var off: u64 = 0;
+                    while (off < bs) : (off += GRAIN) if (r.rc.core.contains(ReadCache.grainKey(blk, off))) r.fail();
+                }
+            }
+        }
+    };
+    for (0..10) |_| {
+        // A bound of 64 grains seeds each of the 16 shards' indexes at
+        // 4 + 17 entries; the reservation's bound lets them double on
+        // demand.
+        const rc = try ReadCache.init(testing.allocator, bs, DEFAULT_PCT, 64 * GRAIN, reservation, 2);
+        defer rc.deinit();
+        try testing.expectEqual(@as(usize, 16), rc.shardCount());
+        try testing.expectEqual(@as(usize, 4 + 17), rc.core.indexItems(0));
+        rc.core.setBound(reservation);
+        var r: Race = .{ .rc = rc };
+        const d0 = try std.Thread.spawn(.{}, Race.depositor, .{ &r, 1 });
+        const d1 = try std.Thread.spawn(.{}, Race.depositor, .{ &r, 2 });
+        r.purger();
+        d0.join();
+        d1.join();
+        try testing.expectEqual(@as(u32, 0), r.violations.load(.monotonic));
+        try testing.expect(rc.core.stats.index_growths.load() > 0);
+        try testing.expect(r.rounds_in_growth.load(.monotonic) > 0);
+        // Every depositor grain survived (the bound evicts nothing here).
+        for ([_]u64{ 1, 2 }) |vol| for (0..per_depositor) |k| {
+            const blk = BlockKey.init(vol, k * bs);
+            try testing.expect(rc.contains(blk, 0, 16 * GRAIN) and rc.contains(blk, 32 * GRAIN, 48 * GRAIN));
+        };
+        try testing.expectEqual(@as(u64, 2 * per_depositor * 32 * GRAIN), rc.currentBytes());
+        try testing.expectEqual(rc.currentBytes(), rc.slab.checkedOutBytes());
+        for ([_]u64{ 1, 2 }) |vol| for (0..per_depositor) |k| try testing.expect(rc.purge(BlockKey.init(vol, k * bs)));
+        try testing.expectEqual(@as(u64, 0), rc.currentBytes());
+        try testing.expectEqual(@as(usize, rc.slab.capacity), rc.slab.freeSlots());
+    }
+}

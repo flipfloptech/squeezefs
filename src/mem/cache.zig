@@ -485,18 +485,19 @@ pub fn Cache(comptime Entry: type, comptime Sink: type) type {
         /// Grow `s`'s index to `next` entries: the new maps allocated
         /// outside the shard lock, the live entries moved under it (O(live)
         /// — at most log2 times a shard) and the maps swapped. A concurrent
-        /// grower that got there first wins (the work is dropped); an
-        /// allocation failure keeps the index (the insert refuses, counted).
-        fn growShard(self: *Self, s: *Shard, next: usize) void {
+        /// grower that got there first wins (the work is dropped). True
+        /// when the index holds `next` entries (grown here or by that
+        /// grower); false on an allocation failure, which keeps the index.
+        fn growShard(self: *Self, s: *Shard, next: usize) bool {
             var map: KeyMap = .empty;
-            map.ensureTotalCapacity(self.gpa, @intCast(next)) catch return;
+            map.ensureTotalCapacity(self.gpa, @intCast(next)) catch return false;
             defer map.deinit(self.gpa);
             var inos: InoMap = .empty;
-            inos.ensureTotalCapacity(self.gpa, @intCast(next)) catch return;
+            inos.ensureTotalCapacity(self.gpa, @intCast(next)) catch return false;
             defer inos.deinit(self.gpa);
             s.lock.lock();
             defer s.lock.unlock();
-            if (s.index_items >= next) return;
+            if (s.index_items >= next) return true;
             var it = s.map.iterator();
             while (it.next()) |e| map.putAssumeCapacityNoClobber(e.key_ptr.*, e.value_ptr.*);
             var ino_it = s.inos.iterator();
@@ -505,6 +506,7 @@ pub fn Cache(comptime Entry: type, comptime Sink: type) type {
             std.mem.swap(InoMap, &s.inos, &inos);
             s.index_items = next;
             self.stats.index_growths.inc();
+            return true;
         }
 
         /// The entries a shard's index holds room for (tests).
@@ -672,8 +674,8 @@ pub fn Cache(comptime Entry: type, comptime Sink: type) type {
             // keeps its victim backs the insert off: one refusal, never a
             // storm of failing promotions down the tail.
             var attempts: u32 = 0;
-            var grown = false;
-            while (attempts < 2) : (attempts += 1) {
+            var allowed: u32 = 2;
+            while (attempts < allowed) : (attempts += 1) {
                 if (self.evictShardTo(s, @max(bound, entry.bytes), entry.bytes).kept > 0) break;
                 s.lock.lock();
                 if (s.map.contains(entry.key)) {
@@ -681,16 +683,18 @@ pub fn Cache(comptime Entry: type, comptime Sink: type) type {
                     return .exists;
                 }
                 if (!s.hasRoom() or s.bytes.load(.monotonic) + entry.bytes > @max(bound, entry.bytes)) {
-                    // A full index doubles (once per insert, outside the
-                    // lock, an attempt of its own); a concurrent insert
-                    // that took the room: once more, then refuse.
-                    const grow = if (grown) 0 else self.indexGrowthLocked(s);
+                    // A full index below the bound's doubles outside the
+                    // lock, and a doubling that landed (this insert's or a
+                    // concurrent grower's) gives the attempt back: an
+                    // insert never refuses for an index that may still
+                    // grow (a concurrent insert can fill the doubled index
+                    // before this one relocks), and the refunds are bounded
+                    // by the doublings to the cap (each one strictly grows
+                    // it). A concurrent insert that took the bytes or the
+                    // table's room: once more, then refuse.
+                    const grow = self.indexGrowthLocked(s);
                     s.lock.unlock();
-                    if (grow != 0) {
-                        grown = true;
-                        self.growShard(s, grow);
-                        attempts -= @intFromBool(attempts > 0);
-                    }
+                    if (grow != 0 and self.growShard(s, grow)) allowed += 1;
                     continue;
                 }
                 defer s.lock.unlock();
@@ -1333,4 +1337,119 @@ test "the core: invalidateKey and invalidateKeys drop held keys through the sink
     try testing.expectEqual(InsertOutcome.refused, off.insert(mk(1, 0, 0, 1, 1), .{}));
     try testing.expect(!off.contains(.{ .ino = 1, .off = 0 }));
     try testing.expect(!off.invalidateKey(.{ .ino = 1, .off = 0 }));
+}
+
+/// The race tests' sink: releases from any shard, counted.
+const CountSink = struct {
+    pub const runs_under_lock = true;
+    released: Atomic(u64) = .init(0),
+
+    pub fn onEvict(self: *CountSink, _: *const TestEntry, _: Why) Outcome {
+        _ = self.released.fetchAdd(1, .monotonic);
+        return .released;
+    }
+};
+
+test "the core: a purge sees every live key across index doublings — two growers double two shards' indexes (16 → 2048) while a purger inserts keys into the same shards and drops them by key, by inode and through the census; every purged key is gone when its purge returns, every insert is indexed when it returns, no grower's key is lost from either map, the sink releases every insert once" {
+    const C = Cache(TestEntry, CountSink);
+    const per_grower: u64 = 1500;
+    const Race = struct {
+        c: *C,
+        grow_ino: [2]u64,
+        purge_ino: [2]u64,
+        go: Atomic(bool) = .init(false),
+        growers_done: Atomic(u32) = .init(0),
+        violations: Atomic(u32) = .init(0),
+        purger_inserts: Atomic(u64) = .init(0),
+        rounds_in_growth: Atomic(u64) = .init(0),
+
+        fn fail(r: *@This()) void {
+            _ = r.violations.fetchAdd(1, .monotonic);
+        }
+
+        fn grower(r: *@This(), ino: u64) void {
+            while (!r.go.load(.acquire)) std.atomic.spinLoopHint();
+            for (0..per_grower) |i| if (r.c.insert(mk(ino, i, 0, 1, @intCast(i)), .{}) != .inserted) r.fail();
+            _ = r.growers_done.fetchAdd(1, .release);
+        }
+
+        fn census(ino: *const u64, e: *const TestEntry) bool {
+            return e.ino == ino.*;
+        }
+
+        fn purger(r: *@This()) void {
+            r.go.store(true, .release);
+            var round: u64 = 0;
+            // Rounds until both growers are done (and at least one).
+            while (round == 0 or r.growers_done.load(.acquire) < 2) : (round += 1) {
+                if (r.growers_done.load(.acquire) < 2) _ = r.rounds_in_growth.fetchAdd(1, .monotonic);
+                for (r.purge_ino) |ino| {
+                    const base = round * 8;
+                    for (0..8) |j| {
+                        const e = mk(ino, base + j, 0, 1, 0);
+                        if (r.c.insert(e, .{}) != .inserted) r.fail();
+                        _ = r.purger_inserts.fetchAdd(1, .monotonic);
+                        if (!r.c.contains(e.key)) r.fail();
+                    }
+                    switch (round % 3) {
+                        // By key, one at a time.
+                        0 => for (0..8) |j| {
+                            const k: TestKey = .{ .ino = ino, .off = base + j };
+                            if (!r.c.invalidateKey(k)) r.fail();
+                            if (r.c.contains(k)) r.fail();
+                        },
+                        // By inode.
+                        1 => if (r.c.invalidateIno(ino, {}, null).released != 8) r.fail(),
+                        // Through the census (the recall's fallback).
+                        else => {
+                            var cursor: u64 = 0;
+                            while (r.c.censusNext(&cursor, &ino, census)) |e| {
+                                if (!r.c.invalidateKey(e.key)) r.fail();
+                            }
+                        },
+                    }
+                    for (0..8) |j| if (r.c.contains(.{ .ino = ino, .off = base + j })) r.fail();
+                }
+            }
+        }
+    };
+    for (0..20) |_| {
+        var sink: CountSink = .{};
+        // Seeded at 16 entries a shard (bound 32 over 2 shards), then a
+        // bound whose index is the whole table: every doubling on demand.
+        const c = try C.init(testing.allocator, &sink, 32, 2, .{ .max = 4096, .entry_floor = 1, .slack = 0 }, null);
+        defer c.deinit();
+        try testing.expectEqual(@as(usize, 16), c.indexItems(0));
+        c.setBound(1 << 30);
+        var r: Race = .{ .c = c, .grow_ino = undefined, .purge_ino = undefined };
+        // One grower and one purger inode per shard.
+        var found: [2][2]u64 = .{ .{ 0, 0 }, .{ 0, 0 } };
+        var have: [2]u8 = .{ 0, 0 };
+        var ino: u64 = 1 << 32;
+        while (have[0] < 2 or have[1] < 2) : (ino += 1) {
+            const s = c.shardIndex(.{ .ino = ino, .off = 0 });
+            if (have[s] < 2) {
+                found[s][have[s]] = ino;
+                have[s] += 1;
+            }
+        }
+        r.grow_ino = .{ found[0][0], found[1][0] };
+        r.purge_ino = .{ found[0][1], found[1][1] };
+        const g0 = try std.Thread.spawn(.{}, Race.grower, .{ &r, r.grow_ino[0] });
+        const g1 = try std.Thread.spawn(.{}, Race.grower, .{ &r, r.grow_ino[1] });
+        r.purger();
+        g0.join();
+        g1.join();
+        try testing.expectEqual(@as(u32, 0), r.violations.load(.monotonic));
+        // 16 → 2048 in each shard: 7 doublings, all of them under the race.
+        try testing.expectEqual(@as(u64, 14), c.stats.index_growths.load());
+        try testing.expect(r.rounds_in_growth.load(.monotonic) > 0);
+        // Every grower key indexed by key AND by inode.
+        for (r.grow_ino) |g| {
+            for (0..per_grower) |i| try testing.expect(c.contains(.{ .ino = g, .off = i }));
+            try testing.expectEqual(@as(u32, @intCast(per_grower)), c.invalidateIno(g, {}, null).released);
+        }
+        try testing.expectEqual(@as(u64, 0), c.currentBytes());
+        try testing.expectEqual(2 * per_grower + r.purger_inserts.load(.monotonic), sink.released.load(.monotonic));
+    }
 }

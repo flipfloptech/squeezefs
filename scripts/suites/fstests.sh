@@ -25,6 +25,16 @@
 #   FSTESTS_TESTS="generic/001 generic/003" …                   # a subset (triage)
 #   FSTESTS_AFTER=generic/683 …                                   # resume discovery after a failure (never the release verdict)
 set -euo pipefail
+# xfstests' sets and results live on the DISK: its fill/fallocate/reflink
+# tests (generic/299, 302, 303, …) write tens of GiB, and the venue's
+# /build/tmp is a RAM disk (zram) the other suites fit in — a full RAM disk
+# failed tests with the HARNESS's ENOSPC, never the product's (2026-10-24).
+# No-CoW on btrfs so the loop images take in-place writes as on ext4; the
+# attribute does not exist elsewhere and is not needed there.
+SUITES_TMP=${SUITES_TMP:-${SQZ_BUILD_ROOT:-/build}/suites-disk}
+mkdir -p "$SUITES_TMP"
+if [ "$(stat -f -c %T "$SUITES_TMP")" = btrfs ]; then chattr +C "$SUITES_TMP"; fi
+export SUITES_TMP
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 source "$SUITES_DIR/setpaths.sh"
 

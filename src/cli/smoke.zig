@@ -8638,6 +8638,143 @@ test "smoke: A FAILED REPLAY'S JOURNAL TAIL IS HELD, NEVER DISCARDED (charter §
     }
 }
 
+/// The custody row's residents: `custody_files` × 256 KiB, staged whole.
+const custody_files: usize = 4;
+const custody_file_bytes: usize = 256 << 10;
+
+test "smoke: A SUPERVISOR HOLDING CUSTODY IS NEVER THE DAEMON (charter §4, decision 0003 §BQ.7) — a `--daemon --supervise` set over one device-mapper device: 4 files of 256 KiB staged in the write cache (closed, never synced; the directory fsync'd, so their staged layouts are durable), the table flips to `error`, a create answers EIO (FAILED); `squeezefs umount` exits 0 and the daemon exits 1 by itself — its supervisor holds the ring (residents unpromoted); a SECOND `squeezefs umount` of the path answers `not mounted` and signals nobody, the supervisor still holding; the working table back, the next supervised mount takes the ring and every file reads byte-exact (staged_payload_lost_reads 0); the supervisor exits; fsck clean (red on origin/dev: the second umount took the childless supervisor for the daemon and signalled it — the ring died with it)" {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    if (DmErrorSet.venueMissing()) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    var dm = try DmErrorSet.up(rig);
+    defer dm.deinit();
+    if (rig.log_file == null) rig.log_file = try openLogAppend(rig.log_path);
+    {
+        const r = try rig.squeezefs(&.{ "format", dm.meta_uri, dm.data_uri });
+        defer rig.freeRun(r);
+        if (!r.term.success()) std.debug.print("\nformat: {s}\n", .{r.stderr});
+        try testing.expect(r.term.success());
+    }
+    var dir_buf: [linux.PATH_MAX]u8 = undefined;
+    try rig.env.put("SQUEEZEFS_TEST_JOURNAL_TAIL_DIR", try std.fmt.bufPrint(&dir_buf, "{s}/held-tails", .{rig.work}));
+    var script: [512]u8 = undefined;
+    gpa.free(try rig.shOk(rig.work, try std.fmt.bufPrint(&script, "i=0; while [ $i -lt {d} ]; do head -c {d} /dev/urandom > src$i; i=$((i + 1)); done; echo ok", .{ custody_files, custody_file_bytes })));
+    const mark = try rig.logLen();
+    const pid = blk: {
+        const r = try rig.squeezefs(&.{ "mount", "--daemon", "--supervise", "--log-file", rig.log_path, dm.meta_uri, rig.mp });
+        defer rig.freeRun(r);
+        if (!r.term.success()) std.debug.print("\ndaemon mount: {s}\n", .{r.stderr});
+        try testing.expect(r.term.success());
+        const ready_i = try rig.awaitLog("ready: ", mark, ready_wait_ns);
+        const text = try rig.readLog();
+        defer gpa.free(text);
+        break :blk @as(linux.pid_t, @intCast(numberAfter(text[ready_i..], "(pid ") orelse return error.NoPid));
+    };
+    const sup = ppidOf(pid) orelse return error.NoSupervisor;
+    defer if (alive(sup)) {
+        _ = linux.kill(sup, .KILL);
+    };
+    var daemon_live = true;
+    defer if (daemon_live) {
+        _ = linux.kill(pid, .KILL);
+    };
+    _ = try rig.awaitLog("supervisor: watching daemon ", mark, ready_wait_ns);
+    // Staged whole, the layouts durable (the directory's fsync), the
+    // residents in the ring: no file is synced.
+    gpa.free(try rig.onMount(try std.fmt.bufPrint(&script, "i=0; while [ $i -lt {d} ]; do cp \"$1/src$i\" f$i; i=$((i + 1)); done; python3 -c 'import os; fd = os.open(\".\", os.O_RDONLY); os.fsync(fd)' && echo ok", .{custody_files})));
+    {
+        const st = try rig.stats();
+        defer gpa.free(st);
+        try testing.expectEqual(@as(?u64, 1), numberAfter(st, "\"data_staging_on\":"));
+    }
+    // The device fails; a create latches the volume FAILED.
+    try dm.load(true);
+    {
+        const deadline = clock.monotonicNs() + 20 * std.time.ns_per_s;
+        var probe: usize = 0;
+        while (true) : (probe += 1) {
+            var pb: [160]u8 = undefined;
+            const r = try rig.sh(rig.work, try std.fmt.bufPrint(&pb, "touch {s}/probe-{d} 2>&1 || true", .{ rig.mp, probe }));
+            defer rig.freeRun(r);
+            if (std.mem.indexOf(u8, r.stdout, "Input/output error") != null) break;
+            if (!alive(pid) or clock.monotonicNs() >= deadline) return error.NoFailStop;
+            sleepMs(20);
+        }
+    }
+    // The first umount: the daemon's own exit, 1 (FAILED).
+    {
+        const r = try rig.squeezefs(&.{ "umount", rig.mp });
+        defer rig.freeRun(r);
+        if (!r.term.success()) std.debug.print("\nthe first umount ({f}): {s}\n", .{ r.term, r.stderr });
+        try testing.expect(r.term.success());
+    }
+    var nb: [64]u8 = undefined;
+    const exit_i = try rig.awaitLog(try std.fmt.bufPrint(&nb, "daemon {d} exited (wait status 0x", .{pid}), mark, exit_wait_ns);
+    daemon_live = false;
+    const hold_i = try rig.awaitLog("supervisor: holding the dead daemon's write cache", exit_i, 30 * std.time.ns_per_s);
+    // The second umount: no daemon serves the path.
+    const second = blk: {
+        const r = try rig.squeezefs(&.{ "umount", rig.mp });
+        defer rig.freeRun(r);
+        std.debug.print("\nsmoke[custody]: the second umount: {f}: {s}", .{ r.term, r.stderr });
+        break :blk !r.term.success() and std.mem.indexOf(u8, r.stderr, "not mounted") != null;
+    };
+    // A TERM the verb sent would end the seat within its own exit wait.
+    sleepMs(200);
+    const held_after = alive(sup);
+    try dm.load(false);
+    // The next supervised mount takes the ring.
+    const mark2 = try rig.logLen();
+    const pid2 = blk: {
+        const r = try rig.squeezefs(&.{ "mount", "--daemon", "--supervise", "--log-file", rig.log_path, dm.meta_uri, rig.mp });
+        defer rig.freeRun(r);
+        if (!r.term.success()) {
+            const t = try rig.readLog();
+            defer gpa.free(t);
+            std.debug.print("\nthe next mount: {s}\n--- its log ---\n{s}\n", .{ r.stderr, t[@min(mark2, t.len)..] });
+            return error.MountFailed;
+        }
+        const ready_i = try rig.awaitLog("ready: ", mark2, ready_wait_ns);
+        const text = try rig.readLog();
+        defer gpa.free(text);
+        break :blk @as(linux.pid_t, @intCast(numberAfter(text[ready_i..], "(pid ") orelse return error.NoPid));
+    };
+    const exact = blk: {
+        const out = try rig.onMount(try std.fmt.bufPrint(&script, "n=0; i=0; while [ $i -lt {d} ]; do if cmp -s \"$1/src$i\" f$i; then n=$((n + 1)); fi; i=$((i + 1)); done; echo $n", .{custody_files}));
+        defer gpa.free(out);
+        break :blk std.fmt.parseInt(usize, std.mem.trim(u8, out, " \n"), 10) catch 0;
+    };
+    const lost = try stagedLostReads(rig);
+    {
+        const t = try rig.readLog();
+        defer gpa.free(t);
+        const wc_at = std.mem.indexOf(u8, t[mark2..], " in a sealed memfd ");
+        std.debug.print("smoke[custody]: the supervisor {s} after the second umount; the next mount's write cache recovered {?d} record(s); {d} of {d} files byte-exact, staged_payload_lost_reads {d}\n", .{ if (held_after) "still holding" else "GONE", if (wc_at) |a| numberAfter(t[mark2 + a ..], "recovered ") else null, exact, custody_files, lost });
+        _ = hold_i;
+    }
+    try testing.expect(second);
+    try testing.expect(held_after);
+    try testing.expectEqual(custody_files, exact);
+    try testing.expectEqual(@as(u64, 0), lost);
+    {
+        const deadline = clock.monotonicNs() + 30 * std.time.ns_per_s;
+        while (alive(sup) and clock.monotonicNs() < deadline) sleepMs(20);
+        try testing.expect(!alive(sup));
+    }
+    try umountDaemon(rig, pid2);
+    {
+        const r = try rig.squeezefs(&.{ "fsck", "--offline", "--scrub", dm.meta_uri });
+        defer rig.freeRun(r);
+        if (!r.term.success() or std.mem.indexOf(u8, r.stdout, "findings: 0 (clean)") == null) {
+            std.debug.print("\n--- fsck --offline after the custody row ({f}) ---\n{s}\n--- stderr ---\n{s}\n", .{ r.term, r.stdout, r.stderr });
+            return error.FsckNotClean;
+        }
+    }
+}
+
 /// A process whose cwd is the mount (the holder of the busy-umount rows):
 /// `sleep` parks with the mount root as its cwd until killed.
 const Holder = struct {

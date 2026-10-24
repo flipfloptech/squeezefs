@@ -2592,16 +2592,19 @@ pub const DataPlane = struct {
     /// The packer's "current layout" (borrowed until the next call on this
     /// thread — the record bytes live in a per-thread buffer sized to the
     /// record cap).
+    const PackLookupBuf = @import("../mem/lazy.zig").PerThread(record.RECORD_VALUE_CAP_CEILING);
+
     fn packLookupCurrent(ctx: *anyopaque, ino: u64) ?layout.Layout {
         const self: *DataPlane = @ptrCast(@alignCast(ctx));
-        const S = struct {
-            threadlocal var buf: [record.RECORD_VALUE_CAP_CEILING]u8 = undefined;
-        };
+        // The decoded layout borrows the bytes until this thread's next
+        // call: a per-thread buffer mapped at first use, never a
+        // `threadlocal` array every thread's spawn would zero-fill.
+        const buf = PackLookupBuf.get() catch return null;
         const rec = (self.layoutRecord(ino) catch return null) orelse return null;
         defer self.gpa.free(rec.value);
-        if (rec.value.len > S.buf.len) return null;
-        @memcpy(S.buf[0..rec.value.len], rec.value);
-        return layout.XattrLayout.decode(S.buf[0..rec.value.len], self.geo) catch null;
+        if (rec.value.len > buf.len) return null;
+        @memcpy(buf[0..rec.value.len], rec.value);
+        return layout.XattrLayout.decode(buf[0..rec.value.len], self.geo) catch null;
     }
 
     fn packCommit(ctx: *anyopaque, t: *tx_mod.KvTx) pack.CommitError!void {

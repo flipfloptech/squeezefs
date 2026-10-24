@@ -36,6 +36,53 @@ pub fn free(comptime T: type, s: []T) void {
     std.heap.page_allocator.rawFree(bytes[0 .. s.len * @sizeOf(T)], .fromByteUnits(@alignOf(T)), @returnAddress());
 }
 
+/// A per-thread buffer of `len` bytes, mapped lazily at the thread's first
+/// `get` and unmapped at its exit (a pthread key's destructor) — for the
+/// borrow-until-the-next-call buffers a `threadlocal` array would hold:
+/// the C runtime zero-fills the static TLS block at EVERY thread's spawn,
+/// so a 1 MiB thread-local reply buffer was 1 MiB resident in each of an
+/// idle daemon's 146 threads, called or not. A thread that never calls
+/// holds nothing; one that does holds the pages its largest use touched.
+pub fn PerThread(comptime len: usize) type {
+    return struct {
+        threadlocal var buf: ?*[len]u8 = null;
+        var key: std.c.pthread_key_t = undefined;
+        /// 0 = no key yet, 1 = being made, 2 = made, 3 = refused.
+        var key_state: std.atomic.Value(u8) = .init(0);
+
+        fn haveKey() bool {
+            while (true) switch (key_state.load(.acquire)) {
+                2 => return true,
+                3 => return false,
+                0 => if (key_state.cmpxchgStrong(0, 1, .monotonic, .monotonic) == null) {
+                    const ok = std.c.pthread_key_create(&key, destroy) == .SUCCESS;
+                    // Release pairs with the acquire load above: `key` is
+                    // published before any thread reads state 2.
+                    key_state.store(if (ok) 2 else 3, .release);
+                    return ok;
+                },
+                else => std.atomic.spinLoopHint(),
+            };
+        }
+
+        fn destroy(p: *anyopaque) callconv(.c) void {
+            const ptr: [*]u8 = @ptrCast(p);
+            free(u8, ptr[0..len]);
+        }
+
+        /// This thread's buffer (its contents survive until its next use).
+        pub fn get() error{OutOfMemory}!*[len]u8 {
+            if (buf) |b| return b;
+            const b = try alloc(u8, len);
+            // Without a key (the process ran out of them) the mapping
+            // outlives the thread: `len` of address space, never a fault.
+            if (haveKey()) _ = std.c.pthread_setspecific(key, b.ptr);
+            buf = b[0..len];
+            return buf.?;
+        }
+    };
+}
+
 const testing = std.testing;
 
 test "a lazy table is zero-filled and unbacked until touched: 64 MiB reserved, one page written, one page resident" {
@@ -65,4 +112,23 @@ test "zero entries is the empty slice; free of it is a no-op" {
     const t = try alloc(u32, 0);
     try testing.expectEqual(@as(usize, 0), t.len);
     free(u32, t);
+}
+
+test "a per-thread buffer: one per thread, stable across calls, unmapped at the thread's exit" {
+    const B = PerThread(1 << 20);
+    const a = try B.get();
+    try testing.expectEqual(a, try B.get());
+    a[0] = 0x5a;
+    const Other = struct {
+        fn run(out: *?*[1 << 20]u8) void {
+            const b = B.get() catch return;
+            b[0] = 0x11;
+            out.* = b;
+        }
+    };
+    var theirs: ?*[1 << 20]u8 = null;
+    const t = try std.Thread.spawn(.{}, Other.run, .{&theirs});
+    t.join();
+    try testing.expect(theirs != null and theirs.? != a);
+    try testing.expectEqual(@as(u8, 0x5a), a[0]);
 }

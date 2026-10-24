@@ -213,7 +213,11 @@ pub const SharedLink = struct {
     mux: ?*dialer.Mux = null,
     retired: std.ArrayList(*dialer.Mux) = .empty,
 
-    threadlocal var reply_buf: [REPLY_CAP]u8 = undefined;
+    /// The reply a call decodes into (borrowed until this thread's next
+    /// call): per thread, mapped at its first call (`mem/lazy.zig` — a
+    /// `threadlocal` array was 1 MiB resident in every thread of the
+    /// process).
+    const ReplyBuf = @import("../../mem/lazy.zig").PerThread(REPLY_CAP);
 
     pub fn init(gpa: Allocator, io: Io, ep: endpoint.EndpointWire, secret: wire_auth.Secret, identity: verbs.WireIdentity) SharedLink {
         return .{ .gpa = gpa, .io = io, .ep = ep, .secret = secret, .identity = identity };
@@ -274,7 +278,8 @@ pub const SharedLink = struct {
 
     pub fn call(self: *SharedLink, req: verbs.Request) errors.Error!verbs.Reply {
         const m = try self.ensure();
-        return m.callTyped(req, &reply_buf);
+        const reply_buf = ReplyBuf.get() catch return error.OutOfMemory;
+        return m.callTyped(req, reply_buf);
     }
 
     pub fn callFn(ctx: *anyopaque, req: verbs.Request) errors.Error!verbs.Reply {

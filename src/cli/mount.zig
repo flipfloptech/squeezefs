@@ -346,7 +346,7 @@ pub fn run(p: cli.Process, m: args.Mount) u8 {
     defer wire_posture.deinit(p.gpa);
 
     // No write cache without a supervisor (charter §6.1, decision 0003
-    // §BQ.6): the ring is acked unsynced custody only a supervisor keeps
+    // §BR.6): the ring is acked unsynced custody only a supervisor keeps
     // across a crash, so an unsupervised mount runs without it — and one
     // that asks for it by name is refused here, on the caller's console. A
     // `-o ro` reader holds no write cache either way.
@@ -1125,7 +1125,7 @@ fn announceTail(_: ?*anyopaque, index: u16, fd: std.os.linux.fd_t) bool {
 
 /// The write cache's memfd and its claim over the supervisor's socket
 /// (two frames, one fd each — the discipline). A mount without a
-/// supervisor binds no write cache (decision 0003 §BQ.6).
+/// supervisor binds no write cache (decision 0003 §BR.6).
 fn announceWriteCache(plane: *plane_mod.DataPlane) void {
     const fds = plane.writeCacheFds() orelse return;
     const sock = journal_tail.supervisor_sock.load(.acquire);

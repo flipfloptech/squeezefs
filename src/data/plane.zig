@@ -209,7 +209,7 @@ pub const stats = struct {
     pub var data_staging_on: counters.Gauge = .{};
     /// `write_cache_off_unsupervised`: 1 on a mount no supervisor holds a
     /// ring for — the write cache is off by law (charter §6.1, decision
-    /// 0003 §BQ.6).
+    /// 0003 §BR.6).
     pub var write_cache_off_unsupervised: counters.Gauge = .{};
     /// `layout_map_merges`: ONE transaction per `MapSeam.merge`.
     pub var layout_map_merges: counters.ShardedCounter = .{};
@@ -442,7 +442,7 @@ pub const Options = struct {
     /// A MOUNT's plane (null: a verb's — fsck, a tool — which judges the
     /// device alone). `unsupervised`: no supervisor would hold this
     /// mount's ring across a crash, so the write cache is off by law
-    /// (charter §6.1, decision 0003 §BQ.6). A mount without a write cache
+    /// (charter §6.1, decision 0003 §BR.6). A mount without a write cache
     /// still meets this member's ring if a supervisor holds one from a
     /// crashed predecessor: it refuses to open rather than serve those
     /// residents' files without them.
@@ -1192,7 +1192,7 @@ pub const DataPlane = struct {
     /// supervisor holding the ring of a crashed predecessor (residents its
     /// files' layouts name) refuses the open — its files would read zeros
     /// without them, and the supervised successor that recovers them is
-    /// one mount away (decision 0003 §BQ.6). The probe binds and drops the
+    /// one mount away (decision 0003 §BR.6). The probe binds and drops the
     /// claim; it never connects (a connect takes the ring from its holder).
     fn refuseHeldRing(self: *DataPlane, opts: Options) OpenError!void {
         const ours = stagingOwnerMarker(self.backend, opts.member_identity);

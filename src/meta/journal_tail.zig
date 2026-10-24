@@ -28,7 +28,7 @@
 //! are never ahead of an acked survivor.
 //!
 //! A tail whose replay FAILED is HELD, never discarded (charter §5.2,
-//! decision 0003 §BQ): the supervisor copies its written slots into a file
+//! decision 0003 §BR): the supervisor copies its written slots into a file
 //! of the same image under the host's RAM runtime directory (`HeldDir`,
 //! named by the volume's uuid), releases the writer guard, and retries the
 //! replay under a non-blocking writer lock until the device answers; the
@@ -55,7 +55,7 @@ const testkit = @import("../core/testkit.zig");
 
 pub const MAGIC: [8]u8 = "SQZJTAIL".*;
 /// v2: the volume's identity and the ring's kind in the header, the
-/// reservation's position in every slot (decision 0003 §BQ).
+/// reservation's position in every slot (decision 0003 §BR).
 pub const VERSION: u32 = 2;
 /// The device path in the header: the kernel's own bound.
 pub const PATH_CAP: usize = std.os.linux.PATH_MAX;
@@ -68,7 +68,7 @@ pub const Segment = extern struct { start: u64, pages: u64 };
 /// Whose ring the tail mirrors: the volume's fixed ring (its D0 writer's,
 /// opened under the writer lock — the ring a held tail's successor owns)
 /// or an appender's ring on a joined volume (no lock of its own; a held
-/// copy has no successor law yet, decision 0003 §BQ.5).
+/// copy has no successor law yet, decision 0003 §BR.5).
 pub const RING_FIXED: u32 = 1;
 pub const RING_JOINED: u32 = 2;
 
@@ -206,7 +206,7 @@ pub const Replay = struct {
     skipped: u32 = 0,
 };
 
-/// What a held copy's replay is judged against (decision 0003 §BQ.3, the
+/// What a held copy's replay is judged against (decision 0003 §BR.3, the
 /// prefix law): the device's own journal — its ledger's checkpoint tail and
 /// the confirmed drops its replay scan finds in a ring image (ring offsets,
 /// the mirror's).
@@ -463,7 +463,7 @@ pub const Image = struct {
     }
 
     /// Plan a held copy's replay against the device's own chain (decision
-    /// 0003 §BQ.3, the prefix law): in seq order, a slot behind the
+    /// 0003 §BR.3, the prefix law): in seq order, a slot behind the
     /// ledger's tail is skipped (landed and checkpointed); every other is
     /// overlaid on `ring` — the device's ring image, which carries the
     /// accepted overlays on return — and kept while the scan confirms no
@@ -576,7 +576,7 @@ pub fn hasSupervisor() bool {
     return supervisor_sock.load(.acquire) >= 0;
 }
 
-/// Where a held tail lives (decision 0003 §BQ.2): the host's RAM runtime
+/// Where a held tail lives (decision 0003 §BR.2): the host's RAM runtime
 /// directory. `/run` is a tmpfs on every systemd host, so the copy outlives
 /// the supervisor (its SIGKILL included) and dies with the host, whose
 /// power cut is §5.2's window. Root's `/run/squeezefs/journal-tails`,
@@ -763,7 +763,7 @@ pub const linux_tail = if (builtin.os.tag == .linux) struct {
     }
 
     /// A held copy's replay onto `dev_fd` (the volume's device, opened by
-    /// the caller under the writer lock), JUDGED (decision 0003 §BQ.3):
+    /// the caller under the writer lock), JUDGED (decision 0003 §BR.3):
     /// the device's superblock names the copy's volume and set (`expect`,
     /// when given, must too), the newest ledger record's tail is not past
     /// every window (else `Stale`), and `Image.planReplay` keeps the prefix

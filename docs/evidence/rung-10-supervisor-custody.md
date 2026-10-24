@@ -1,6 +1,6 @@
 # Rung 10 — the supervisor's custody: a failed replay's tail is held; no write cache without a supervisor
 
-**What changed (decision 0003 §BQ, the owner's rulings 4 and 6 of 2026-10-24).**
+**What changed (decision 0003 §BR, the owner's rulings 4 and 6 of 2026-10-24).**
 - *Ruling 4.* When the metadata device refuses the supervisor's replay of a journal tail, the
   tail is HELD, never discarded. Before the writer guards drop, the supervisor copies the tail's
   written slots into a sparse file of the same image at `/run/squeezefs/journal-tails/<volume uuid>.jtail`
@@ -13,6 +13,14 @@
   is refused. A copy whose windows are all behind the ledger's checkpoint tail is stale: it is
   removed unwritten, logged as an error and counted (`held_tail_stale`). A joined ring is not held
   (owed). If the copy cannot be written, the memfd and the guards stay with the supervisor.
+- *The prefix law* (found by the first xfstests subset: generic/475 on `d6aff77` ended with fsck
+  C10 `nlink 1 BELOW 2 name(s)`). Every replay of a held copy is judged against the device's own
+  journal (`judgedReplay`): the superblock, the newest ledger record and the ring.
+  `Image.planReplay` overlays the held windows in seq order and keeps each only while
+  `journal.replayScanImage` confirms no new drop. A window past a hole the copy does not hold is
+  never written, but counted (`held_tail_past_hole`) and logged as lost. Such a hole is a
+  landing-acked window whose write failed and was rolled back after later windows had been
+  applied on top of it in RAM.
 - *Ruling 6 (c).* A mount without a supervisor runs no write cache. It says so once, sets the
   `write_cache_off_unsupervised` gauge to 1, and writes through the cache-less path.
   `SQUEEZEFS_WRITE_CACHE_PCT` > 0 named on such a mount is refused before the fork (exit 2). A
@@ -44,11 +52,12 @@
 | held-tail row, both arms | the supervisor's retry: `replayed on retry`, then present; the successor: the copy held after the supervisor's SIGKILL, then `held_tail_replays` 1, present, the copy gone; fsck clean |
 | unsupervised row | off, said once; 8 of 8 whole after kill -9; both knob mounts refused (exit 2); supervised with the knob: the cache on |
 | custody row | the second umount: `not mounted`; the supervisor still holding; the next mount recovered 4 records; 4 of 4 exact; lost 0 |
-| the three rows, two loops side by side under the venue's load (other agents' builds, suites and smokes) | 20/20 each (10/10 + 10/10) |
-| full smoke tier (rebased on afd1649) | 138/142 pass, 4 skip (kmbuf absent, the loop seam unset, the shim's two other-step rows), 0 fail |
-| unit filters `journal_tail` / `supervisor` / `staging` / `umount` | 47/47; 58 pass 11 skip; 70 pass 2 skip; 58 pass 44 skip |
+| the three rows, two loops side by side under the venue's load (other agents' builds, suites and smokes) | first cut: 20/20 each; final code: 20/20 each, run beside the xfstests subset |
+| full smoke tier, final code rebased on `2d44c33` | 140/144 pass, 4 skip (kmbuf absent, the loop seam unset, the shim's two other-step rows), 0 fail |
+| unit filters `journal_tail` / `supervisor` / `staging` / `umount` | 48/48; 58 pass 11 skip; 70 pass 2 skip; 58 pass 44 skip |
 | `zig build rails`, `zig fmt --check` | 18/18 steps, 32/32 tests; clean |
-| xfstests `generic/753 475 388` | SUBSET |
+| xfstests `generic/753 475 388`, first cut (`d6aff77`) | 475 failed: fsck C10 `nlink 1 BELOW 2 name(s)` after the dm-error loop (5 earlier 475 runs that day, base `afd1649` included, were clean); the prefix law above is the fix |
+| xfstests `generic/753 475 388` (`0715e5e`) | Passed all 3 (388 not run: no shutdown); both sets fsck 0 findings. The scratch daemons left 95 held copies, each replayed by the next mount (3,117 windows). The supervisors' retries landed 5. The prefix law refused 205 windows in 15 copies, each lying past a hole of an un-held window |
 
 **Seen, not fixed.**
 - (a) Cache-less coherence. A joined peer reads the holder's durable size while the holder's
@@ -56,5 +65,8 @@
   file on B. A foreign read recalls staged residents but not parked blocks. This was latent under
   `SQUEEZEFS_WRITE_CACHE_PCT=0` and is now the posture of every unsupervised multi-mount set.
 - (b) `format` leaves a stale copy of the volume it overwrites in `/run` until reboot.
-- (c) THE WRITE-BACK TIMER row failed in two full smoke runs with `fuse_syncfs 1`. A host-wide
+- (c) The death replay (§BB.3) is still unjudged, so the same hole hazard exists whenever the
+  device answers at the death. The root cause is the rollback of a landing-acked window under
+  later windows acked at apply (0003 §BR.10 (c)).
+- (d) THE WRITE-BACK TIMER row failed in two full smoke runs with `fuse_syncfs 1`. A host-wide
   `sync(2)` from another runner on the venue landed its custody; the row passes alone.

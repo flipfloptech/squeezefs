@@ -62,7 +62,7 @@
 //! the guard fds: the `flock`'s open file description is shared, so the
 //! dead daemon's claim holds until the device is complete, and a successor
 //! waits it out (`guard.proc.flockExclusive`'s bound). A replay the device
-//! REFUSES is held, never discarded (decision 0003 §BQ): the tail's written
+//! REFUSES is held, never discarded (decision 0003 §BR): the tail's written
 //! slots are copied to its held file (`journal_tail.persistHeld`) before
 //! the guards drop, the volume's next writer replays that copy before it
 //! reads its ring, and this process retries it every tick under a
@@ -257,7 +257,7 @@ pub const linux_loop = if (builtin.os.tag == .linux) struct {
         /// Failed replays held as files (`journal_tail.persistHeld`): this
         /// supervisor retries each under a non-blocking writer lock; the
         /// volume's next writer replays what is left before it reads its
-        /// ring (decision 0003 §BQ).
+        /// ring (decision 0003 §BR).
         held: std.ArrayList(HeldCopy) = .empty,
         /// Failed replays that could not be held as files: the memfd kept
         /// and the writer guards with it (no successor may open the volume
@@ -373,7 +373,7 @@ pub const linux_loop = if (builtin.os.tag == .linux) struct {
 
         /// The daemon is dead: every tail to the device, in order, then the
         /// guards released. A tail whose replay FAILS is held, never
-        /// discarded (decision 0003 §BQ): copied into its held file BEFORE
+        /// discarded (decision 0003 §BR): copied into its held file BEFORE
         /// the guards drop (so the volume's next writer, whose lock waits
         /// for them, finds it), or — when it cannot be — kept here with the
         /// guards. Idempotent; logged per tail.
@@ -403,7 +403,7 @@ pub const linux_loop = if (builtin.os.tag == .linux) struct {
             if (!isFixedRing(fd)) {
                 // A joined ring has no lock of its own and its ring may be
                 // re-leased by the manager's ladder: no copy can be replayed
-                // safely later (decision 0003 §BQ.5, owed).
+                // safely later (decision 0003 §BR.5, owed).
                 log.err("supervisor: journal tail of volume {d} ({s}): replay FAILED ({s}) — a JOINED ring's tail is not held (no successor law yet): acked metadata of the flush window may be lost; fsck the volume before the next mount", .{ index, dev, @errorName(e) });
                 _ = linux.close(fd);
                 return;
@@ -457,7 +457,7 @@ pub const linux_loop = if (builtin.os.tag == .linux) struct {
             return self.held.items.len != 0 or self.held_memfds.items.len != 0 or self.write_cache != null;
         }
 
-        /// One retry round over every held tail (decision 0003 §BQ.4).
+        /// One retry round over every held tail (decision 0003 §BR.4).
         /// Logged on the first failure of each and at every doubling of
         /// its attempts.
         pub fn retryHeld(self: *Tails) void {

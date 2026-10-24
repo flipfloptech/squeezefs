@@ -64,7 +64,7 @@ const Rig = struct {
     /// and echoes the daemon's alert lines as the diagnostic.
     passed: bool = false,
     /// Mount `--daemon --supervise` (a row that relies on the write cache:
-    /// no write cache without a supervisor, decision 0003 §BQ.6). The
+    /// no write cache without a supervisor, decision 0003 §BR.6). The
     /// daemon is then a grandchild: `child` stays null, `child_pid` is its
     /// ready line's, its term its supervisor's line.
     supervise: bool = false,

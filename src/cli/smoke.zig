@@ -508,13 +508,13 @@ const Rig = struct {
 
     /// Spawn the foreground mount with its stderr appended to the log file.
     /// A foreground mount has no supervisor, so no write cache (decision
-    /// 0003 §BQ.6): a row that needs it mounts with `spawnSupervised`.
+    /// 0003 §BR.6): a row that needs it mounts with `spawnSupervised`.
     fn spawnMount(self: *Rig, extra: []const []const u8) !void {
         return self.spawnMountOf(self.meta_uri, extra);
     }
 
     /// The `--daemon --supervise` mount (the posture the write cache needs:
-    /// no write cache without a supervisor, decision 0003 §BQ.6), returned
+    /// no write cache without a supervisor, decision 0003 §BR.6), returned
     /// once ready and watched: its daemon is the rig's (`child_pid`, the
     /// kill, `.stats`, the umount), a grandchild its supervisor reaps — the
     /// rig waits for its death and reads its wait status off the
@@ -531,7 +531,7 @@ const Rig = struct {
     }
 
     /// The set's posture: supervised when it was formatted for the write
-    /// cache (no write cache without a supervisor, decision 0003 §BQ.6),
+    /// cache (no write cache without a supervisor, decision 0003 §BR.6),
     /// foreground otherwise. Rows written for the write cache mount so.
     fn mountAsSet(self: *Rig, extra: []const []const u8) !void {
         return if (self.write_cache) self.spawnSupervised(extra) else self.spawnMount(extra);
@@ -8527,7 +8527,7 @@ test "smoke: A FAILED VOLUME'S DAEMON SERVES EIO UNTIL ITS UNMOUNT AND NEVER DIE
         if (!r.term.success()) std.debug.print("\nformat: {s}\n", .{r.stderr});
         try testing.expect(r.term.success());
     }
-    // A cycle's failed replay is held (decision 0003 §BQ) — here, in the
+    // A cycle's failed replay is held (decision 0003 §BR) — here, in the
     // rig's work dir — and the next cycle's mount replays it.
     var held_buf: [linux.PATH_MAX]u8 = undefined;
     try rig.env.put("SQUEEZEFS_TEST_JOURNAL_TAIL_DIR", try std.fmt.bufPrint(&held_buf, "{s}/held-tails", .{rig.work}));
@@ -8699,7 +8699,7 @@ test "smoke: A FAILED VOLUME'S DAEMON SERVES EIO UNTIL ITS UNMOUNT AND NEVER DIE
 /// mount, from the held copy.
 const HeldTailArm = enum { supervisor_retry, successor };
 
-test "smoke: A FAILED REPLAY'S JOURNAL TAIL IS HELD, NEVER DISCARDED (charter §5.2, decision 0003 §BQ) — a `--daemon --supervise` set over one device-mapper device, under the landing-hold seam, acks creates whose journal writes never issue; the table flips to `error`; kill -9: the supervisor's replay FAILS and the tail is HELD (its copy under the held dir before the guard drops); (a) the supervisor alive, the table restored: its retry lands the tail, removes the copy and exits — the next mount reads every acked create; (b) the supervisor KILLED with the tail held: the copy stays, the table restored, the next mount replays it before it admits writes (`held_tail_replays` 1) — every acked create present, the copy gone; fsck clean after each (red on 885727b: `replay FAILED (…) — acked metadata of the flush window may be lost`, the tail discarded, the creates gone after the device recovered)" {
+test "smoke: A FAILED REPLAY'S JOURNAL TAIL IS HELD, NEVER DISCARDED (charter §5.2, decision 0003 §BR) — a `--daemon --supervise` set over one device-mapper device, under the landing-hold seam, acks creates whose journal writes never issue; the table flips to `error`; kill -9: the supervisor's replay FAILS and the tail is HELD (its copy under the held dir before the guard drops); (a) the supervisor alive, the table restored: its retry lands the tail, removes the copy and exits — the next mount reads every acked create; (b) the supervisor KILLED with the tail held: the copy stays, the table restored, the next mount replays it before it admits writes (`held_tail_replays` 1) — every acked create present, the copy gone; fsck clean after each (red on 885727b: `replay FAILED (…) — acked metadata of the flush window may be lost`, the tail discarded, the creates gone after the device recovered)" {
     const io = testing.io;
     if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
     if (DmErrorSet.venueMissing()) |why| return testkit.skipWhy(@src(), why);
@@ -8836,7 +8836,7 @@ test "smoke: A FAILED REPLAY'S JOURNAL TAIL IS HELD, NEVER DISCARDED (charter §
 const custody_files: usize = 4;
 const custody_file_bytes: usize = 256 << 10;
 
-test "smoke: A SUPERVISOR HOLDING CUSTODY IS NEVER THE DAEMON (charter §4, decision 0003 §BQ.7) — a `--daemon --supervise` set over one device-mapper device: 4 files of 256 KiB staged in the write cache (closed, never synced; the directory fsync'd, so their staged layouts are durable), the table flips to `error`, a create answers EIO (FAILED); `squeezefs umount` exits 0 and the daemon exits 1 by itself — its supervisor holds the ring (residents unpromoted); a SECOND `squeezefs umount` of the path answers `not mounted` and signals nobody, the supervisor still holding; the working table back, the next supervised mount takes the ring and every file reads byte-exact (staged_payload_lost_reads 0); the supervisor exits; fsck clean (red on origin/dev: the second umount took the childless supervisor for the daemon and signalled it — the ring died with it)" {
+test "smoke: A SUPERVISOR HOLDING CUSTODY IS NEVER THE DAEMON (charter §4, decision 0003 §BR.7) — a `--daemon --supervise` set over one device-mapper device: 4 files of 256 KiB staged in the write cache (closed, never synced; the directory fsync'd, so their staged layouts are durable), the table flips to `error`, a create answers EIO (FAILED); `squeezefs umount` exits 0 and the daemon exits 1 by itself — its supervisor holds the ring (residents unpromoted); a SECOND `squeezefs umount` of the path answers `not mounted` and signals nobody, the supervisor still holding; the working table back, the next supervised mount takes the ring and every file reads byte-exact (staged_payload_lost_reads 0); the supervisor exits; fsck clean (red on origin/dev: the second umount took the childless supervisor for the daemon and signalled it — the ring died with it)" {
     const io = testing.io;
     if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
     if (DmErrorSet.venueMissing()) |why| return testkit.skipWhy(@src(), why);
@@ -11139,7 +11139,7 @@ fn recoveryOf(seg: []const u8) !Recovery {
 /// by design); null = this open replays and its numbers are read here.
 /// `posture` = the killed mount's: a supervised kill's ring waits for a
 /// supervised successor (a mount without a write cache refuses a held
-/// ring, decision 0003 §BQ.6).
+/// ring, decision 0003 §BR.6).
 fn remountAfterKill(rig: *Rig, recovered: ?Recovery, posture: MountPosture) !Recovery {
     const mark = try rig.logLen();
     switch (posture) {
@@ -11186,7 +11186,7 @@ fn mountUnderKnob(rig: *Rig, argv_head: []const []const u8, env_pct: ?[]const u8
     return std.process.run(rig.gpa, rig.io, .{ .argv = argv[0..n], .environ_map = &rig.env });
 }
 
-test "smoke: NO WRITE CACHE WITHOUT A SUPERVISOR (charter §6.1, decision 0003 §BQ.6) — a FOREGROUND mount of a set in the write cache's default posture runs with the write cache OFF, said once at mount (`.stats`: data_staging_on 0, write_cache_off_unsupervised 1); 8 files of 3 MiB written and closed, never synced, their write-back custody drained and the directory fsync'd (every size durable) → kill -9 → fsck clean → remount: every file whole, byte for byte — no size ahead of its bytes; `SQUEEZEFS_WRITE_CACHE_PCT=25` on a foreground mount and on `--daemon` without `--supervise` is REFUSED at startup naming the reason, nothing mounted; the same knob under `--daemon --supervise` mounts with the write cache ON (red on 885727b: the foreground mount staged every file in a ring that died with it — the files read zeros under their durable 3 MiB sizes — and both unsupervised mounts with the knob came up)" {
+test "smoke: NO WRITE CACHE WITHOUT A SUPERVISOR (charter §6.1, decision 0003 §BR.6) — a FOREGROUND mount of a set in the write cache's default posture runs with the write cache OFF, said once at mount (`.stats`: data_staging_on 0, write_cache_off_unsupervised 1); 8 files of 3 MiB written and closed, never synced, their write-back custody drained and the directory fsync'd (every size durable) → kill -9 → fsck clean → remount: every file whole, byte for byte — no size ahead of its bytes; `SQUEEZEFS_WRITE_CACHE_PCT=25` on a foreground mount and on `--daemon` without `--supervise` is REFUSED at startup naming the reason, nothing mounted; the same knob under `--daemon --supervise` mounts with the write cache ON (red on 885727b: the foreground mount staged every file in a ring that died with it — the files read zeros under their durable 3 MiB sizes — and both unsupervised mounts with the knob came up)" {
     const io = testing.io;
     if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
     const gpa = testing.allocator;
@@ -11411,7 +11411,7 @@ test "smoke: THE KILL MATRIX — kill -9 at 50/100/150 MiB of a 200 MiB dd and m
 }
 
 /// The mount's posture across a kill (charter §6.1 "Staged", decision
-/// 0003 §BQ.6): `foreground` — no supervisor, so no write cache: every
+/// 0003 §BR.6): `foreground` — no supervisor, so no write cache: every
 /// write goes to the data volumes under the write-back bound, and a crash
 /// loses at most what had not landed — never a byte under a durable size
 /// (§AL.5); `supervised` — the write cache on, the supervisor replays the

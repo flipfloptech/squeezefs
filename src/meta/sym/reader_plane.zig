@@ -448,12 +448,17 @@ pub const ReaderPlane = struct {
     /// A foreign file's layout record off its holder's token (the data
     /// plane's face); local on the quiescent reader.
     pub fn foreignLayout(self: *ReaderPlane) @import("../../data/plane.zig").DataPlane.ForeignLayout {
-        return .{ .ctx = self, .lookup = &foreignLayoutFn };
+        return .{ .ctx = self, .lookup = &foreignLayoutFn, .mapRecord = &foreignMapRecordFn };
     }
 
     fn foreignLayoutFn(ctx: *anyopaque, gpa: Allocator, ino: u64) errors.Error!@import("../../data/plane.zig").DataPlane.ForeignLayout.Verdict {
         const self: *ReaderPlane = @ptrCast(@alignCast(ctx));
         return wire_plane.foreignLayoutOf(&self.divert, self.io, gpa, ino);
+    }
+
+    fn foreignMapRecordFn(ctx: *anyopaque, gpa: Allocator, ino: u64, block: u32) errors.Error!@import("../../data/plane.zig").DataPlane.ForeignLayout.MapVerdict {
+        const self: *ReaderPlane = @ptrCast(@alignCast(ctx));
+        return wire_plane.foreignMapRecordOf(&self.divert, self.io, gpa, ino, block);
     }
 
     pub fn stop(self: *ReaderPlane) void {

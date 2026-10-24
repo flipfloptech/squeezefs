@@ -90,6 +90,7 @@ const loopback = @import("../../wire/loopback.zig");
 const auth = @import("../../wire/auth.zig");
 const record = @import("../record.zig");
 const key = @import("../key.zig");
+const tree = @import("../tree.zig");
 const inos = @import("../inos.zig");
 const route_table = @import("../routing/route_table.zig");
 const jc = @import("../journal_core.zig");
@@ -123,6 +124,8 @@ const RamRecords = struct {
     inodes: std.AutoHashMapUnmanaged(u64, record.InodeValue) = .empty,
     xattrs: std.AutoHashMapUnmanaged(u64, std.ArrayListUnmanaged(Pair)) = .empty,
     dentries: std.AutoHashMapUnmanaged(u64, std.ArrayListUnmanaged(Dent)) = .empty,
+    /// The block-map tree's raw records, ascending by key.
+    maps: std.ArrayListUnmanaged(struct { k: [key.BLOCK_MAP_KEY_LEN]u8, v: []const u8 }) = .empty,
 
     const Pair = struct { name: []const u8, value: []const u8 };
     const Dent = struct { cookie: u64, child: u64, name: []const u8 };
@@ -135,7 +138,39 @@ const RamRecords = struct {
         var di = self.dentries.valueIterator();
         while (di.next()) |l| l.deinit(self.gpa);
         self.dentries.deinit(self.gpa);
+        self.maps.deinit(self.gpa);
     }
+
+    /// A block-map record of `ino` at `index` (value borrowed).
+    fn putMap(self: *RamRecords, ino: u64, index: u32, value: []const u8) !void {
+        self.lock.lock();
+        defer self.lock.unlock();
+        const k = try key.blockMapKey(ino, index);
+        for (self.maps.items) |*m| if (std.mem.eql(u8, &m.k, &k)) {
+            m.v = value;
+            return;
+        };
+        try self.maps.append(self.gpa, .{ .k = k, .v = value });
+        std.mem.sort(@TypeOf(self.maps.items[0]), self.maps.items, {}, struct {
+            fn lt(_: void, a: @TypeOf(self.maps.items[0]), b: @TypeOf(self.maps.items[0])) bool {
+                return std.mem.lessThan(u8, &a.k, &b.k);
+            }
+        }.lt);
+    }
+
+    /// The store face `table.blockMapWindow` ranges over (the lock held by
+    /// the caller).
+    const MapStore = struct {
+        r: *RamRecords,
+        pub fn range(self: MapStore, gpa: Allocator, tree_id: u8, start: []const u8, end: []const u8, max: usize, out: *std.ArrayList(tree.KeyValue)) !void {
+            std.debug.assert(tree_id == key.TREE_BLOCK_MAP);
+            for (self.r.maps.items) |m| {
+                if (out.items.len == max) return;
+                if (std.mem.order(u8, &m.k, start) == .lt or std.mem.order(u8, &m.k, end) == .gt) continue;
+                try out.append(gpa, .{ .key = try gpa.dupe(u8, &m.k), .value = try gpa.dupe(u8, m.v) });
+            }
+        }
+    };
 
     fn putInode(self: *RamRecords, ino: u64, v: record.InodeValue) !void {
         self.lock.lock();
@@ -209,8 +244,15 @@ const RamRecords = struct {
         return false;
     }
 
+    fn blockMapOf(ctx: *anyopaque, arena: Allocator, object: u64, from: u32, max: usize, out: *std.ArrayList(record.MapRecordView)) table.SourceError!bool {
+        const self: *RamRecords = @ptrCast(@alignCast(ctx));
+        self.lock.lock();
+        defer self.lock.unlock();
+        return table.blockMapWindow(self.gpa, arena, MapStore{ .r = self }, object, from, max, out);
+    }
+
     fn source(self: *RamRecords) table.RecordSource {
-        return .{ .ctx = self, .inode = &inode, .xattrs = &xattrsOf, .dentries = &dentriesOf };
+        return .{ .ctx = self, .inode = &inode, .xattrs = &xattrsOf, .dentries = &dentriesOf, .blockMap = &blockMapOf };
     }
 };
 
@@ -306,6 +348,9 @@ const RecordingSink = struct {
     /// block-map tree head): the census.
     unmapped_object: u64 = 0,
     keys_per_entry: u32 = 3,
+    /// The revoked or dropped entry's map window at the last discard
+    /// (null = it carried none).
+    last_map: ?[2]u64 = null,
     /// The revoked entry's carried `layout` value at the last discard
     /// (copied: the entry is unpinned after the call); null = no entry or
     /// no layout carried.
@@ -323,6 +368,7 @@ const RecordingSink = struct {
         self.last_layout = null;
         const e = entry orelse return .no_entry;
         self.entries_seen += 1;
+        self.last_map = if (e.map) |m| .{ m.len, if (m.len == 0) 0 else m[m.len - 1].index } else null;
         if (object == self.unmapped_object) return .unmapped;
         if (e.xattr("layout")) |v| {
             var copy: [64]u8 = @splat(0);
@@ -899,6 +945,75 @@ test "the holder's kernel pin ends one pin after the FIRST recall's ack (decisio
     try hook.recall(hook.ctx, &.{objectOf(2)}, .{});
     hook.settle(hook.ctx, &.{objectOf(2)});
     try testing.expect(f.holder.recalledUntil(io, objectOf(2), 1).? > first);
+}
+
+/// A block-map record of the test file: a whole-block point at device
+/// block `b`, or a run of `len` from it.
+fn mapValue(buf: *[64]u8, b: u64, len: u32) []const u8 {
+    const e: record.MapEntry = if (len == 1) .{ .point = .{ .vol_tag = 0xD0, .offset = b << 20 } } else .{ .run = .{ .vol_tag = 0xD0, .start_offset = b << 20, .len = len } };
+    return e.encodeInto(buf);
+}
+
+test "a foreign tree-mapped file's block map rides its token as a WINDOW (the reader never resolves it off its own view of the holder's tree): the floor's covering run then the records keyed at or above the block, the read law (an exact record supersedes a covering run) answered off it, a block past an incomplete window fetches the next and the displaced window leaves through the purge, and the recall hands the entry's window to the purge — the keys it names, no census" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    const f = try TwoMembers.init(gpa, io, 1);
+    defer f.deinit();
+    const file = objectOf(5);
+    try f.records.putInode(file, .{ .mode = 0o100644, .nlink = 1, .size = 6000 << 20, .mtime = 100 });
+    try f.records.putXattr(file, "layout", "KVMAP-HEAD");
+    var v: [5][64]u8 = undefined;
+    try f.records.putMap(file, 0, mapValue(&v[0], 1000, 100));
+    try f.records.putMap(file, 50, mapValue(&v[1], 7, 1));
+    try f.records.putMap(file, 200, mapValue(&v[2], 9, 1));
+    try f.records.putMap(file, 300, mapValue(&v[3], 11, 1));
+    try f.records.putMap(file, 5000, mapValue(&v[4], 13, 1));
+    const b = f.reader(0);
+    const sink = &f.sinks[0];
+    // From block 60: the run keyed at 0 (it covers 60), then every record
+    // keyed at or above it; the POINT at 50 covers nothing at or past 60.
+    var s = (try b.serve(io, file, .{ .map = true, .after = 60 })).?;
+    var e = s.entry.?;
+    try testing.expect(e.map_complete and e.coversBlock(60) and e.coversBlock(4999) and !e.coversBlock(59));
+    try testing.expectEqual(@as(usize, 4), e.map.?.len);
+    try testing.expectEqual(@as(u32, 0), e.mapRecordFor(60).?.index);
+    try testing.expectEqual(@as(?record.MapRecordView, null), e.mapRecordFor(150));
+    try testing.expectEqual(@as(u32, 5000), e.mapRecordFor(5000).?.index);
+    s.release(io);
+    // A hit: no grant.
+    const g0 = cache.stats.dlm_token_grants.load();
+    s = (try b.serve(io, file, .{ .map = true, .after = 200 })).?;
+    s.release(io);
+    try testing.expectEqual(g0, cache.stats.dlm_token_grants.load());
+    // From block 50: the exact POINT supersedes the run that covers it.
+    s = (try b.serve(io, file, .{ .map = true, .after = 50 })).?;
+    e = s.entry.?;
+    try testing.expectEqual(@as(u32, 50), e.mapRecordFor(50).?.index);
+    try testing.expectEqual(@as(u32, 0), e.mapRecordFor(51).?.index);
+    s.release(io);
+    // A window bound of two records (the run's 22 B value, a point's 18 B):
+    // block 250 lies past it — the next window is fetched and the
+    // displaced one leaves through the purge.
+    const plane = b.planeOf(io, A_ID).?;
+    plane.release(io, file);
+    plane.dir_window_bytes = table.TOKEN_ENTRY_BYTES + "KVMAP-HEAD".len + "layout".len + (table.MAP_RECORD_BYTES + 22) + (table.MAP_RECORD_BYTES + 18);
+    s = (try b.serve(io, file, .{ .map = true, .after = 60 })).?;
+    e = s.entry.?;
+    try testing.expect(!e.map_complete and e.coversBlock(200) and !e.coversBlock(250));
+    s.release(io);
+    const seen0 = sink.entries_seen;
+    const census0 = sink.census;
+    s = (try b.serve(io, file, .{ .map = true, .after = 250 })).?;
+    try testing.expectEqual(@as(u32, 300), s.entry.?.mapRecordFor(300).?.index);
+    s.release(io);
+    try testing.expectEqual(seen0 + 1, sink.entries_seen);
+    try testing.expectEqual(@as(u64, 200), sink.last_map.?[1]);
+    // The recall: the purge reads the revoked entry's window.
+    const sum = try f.commit(&.{file}, &bumpMtime);
+    try testing.expectEqual(@as(u32, 1), sum.acked);
+    try testing.expectEqual(seen0 + 2, sink.entries_seen);
+    try testing.expectEqual(@as(u64, 5000), sink.last_map.?[1]);
+    try testing.expectEqual(census0, sink.census);
 }
 
 test "a DIRTY local layout entry survives a recall: the writer's acked bytes are kept, only clean entries are discarded, the ack still travels" {

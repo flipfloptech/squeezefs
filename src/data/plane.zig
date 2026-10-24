@@ -237,6 +237,10 @@ pub const stats = struct {
     /// not resolve (a store error, an undecodable record) — answered as a
     /// miss to the caller, never a fabricated hole without this wire.
     pub var kvmap_resolve_failures: counters.Tripwire = .init("kvmap_resolve_failures");
+    /// `kvmap_foreign_resolve_failures`: a foreign tree-mapped file's
+    /// block-map window its holder's token could not serve (the channel,
+    /// the lease, a redirect) — the block read as a hole.
+    pub var kvmap_foreign_resolve_failures: counters.ShardedCounter = .{};
     /// `kvmap_sweep_spawn_refusals`: a background sweep the executor could
     /// not spawn (it resumes at the next mount from its durable cursor).
     pub var kvmap_sweep_spawn_refusals: counters.ShardedCounter = .{};
@@ -345,7 +349,7 @@ pub fn writeStatsJson(w: *Io.Writer) Io.Writer.Error!void {
     inline for (.{ "data_volumes", "data_staging_on", "write_cache_off_unsupervised", "block_refs_drift_rows" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, @field(stats, name).load() });
     }
-    inline for (.{ "layout_map_merges", "layout_map_merge_blocks", "layout_map_merge_failures", "layout_map_commit_failures", "layout_map_merge_clipped_blocks", "layout_map_merges_shipped", "foreign_publish_kvmap_refusals", "layout_publishes_served", "layout_map_punches", "layout_shifts", "layout_shift_refusals", "kvmap_sweep_spawn_refusals", "promotions_run", "promotions_stale", "promotions_failed", "promotions_enospc", "promotions_replaced", "promotions_restaged", "recall_promotions", "recall_promotion_failures", "own_block_dmas", "own_block_dma_bytes", "promotion_barriers", "staged_point_hits", "staged_point_misses", "promotion_barriers_coalesced", "promotion_barrier_write_through_skips", "held_stores", "held_store_bytes", "held_store_failures", "hold_gate_admits", "hold_gate_overlay_admits", "hold_gate_declines", "prefetch_fibers", "prefetch_fiber_refusals", "hold_ceremony_fibers", "bindings_freed", "device_read_bounces", "data_device_read_bytes", "write_side_read_dma_bytes", "compose_read_dma_bytes", "pack_read_dma_bytes" }) |name| {
+    inline for (.{ "layout_map_merges", "layout_map_merge_blocks", "layout_map_merge_failures", "layout_map_commit_failures", "layout_map_merge_clipped_blocks", "layout_map_merges_shipped", "foreign_publish_kvmap_refusals", "layout_publishes_served", "layout_map_punches", "layout_shifts", "layout_shift_refusals", "kvmap_sweep_spawn_refusals", "kvmap_foreign_resolve_failures", "promotions_run", "promotions_stale", "promotions_failed", "promotions_enospc", "promotions_replaced", "promotions_restaged", "recall_promotions", "recall_promotion_failures", "own_block_dmas", "own_block_dma_bytes", "promotion_barriers", "staged_point_hits", "staged_point_misses", "promotion_barriers_coalesced", "promotion_barrier_write_through_skips", "held_stores", "held_store_bytes", "held_store_failures", "hold_gate_admits", "hold_gate_overlay_admits", "hold_gate_declines", "prefetch_fibers", "prefetch_fiber_refusals", "hold_ceremony_fibers", "bindings_freed", "device_read_bounces", "data_device_read_bytes", "write_side_read_dma_bytes", "compose_read_dma_bytes", "pack_read_dma_bytes" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, @field(stats, name).load() });
     }
     try w.print("\"data_unresolved_volume\":{d},\"kvmap_resolve_failures\":{d},\"kvmap_head_put_unlocked\":{d},\"release_free_unheld\":{d},\"layout_map_merge_displaced_overflow\":{d}}}", .{ counters.tripwireCount("data_unresolved_volume"), counters.tripwireCount("kvmap_resolve_failures"), counters.tripwireCount("kvmap_head_put_unlocked"), counters.tripwireCount("release_free_unheld"), counters.tripwireCount("layout_map_merge_displaced_overflow") });
@@ -563,6 +567,20 @@ pub const DataPlane = struct {
     pub const ForeignLayout = struct {
         ctx: *anyopaque,
         lookup: *const fn (ctx: *anyopaque, gpa: Allocator, ino: u64) Error!Verdict,
+        /// A foreign tree-mapped file's record resolving `block`, off its
+        /// holder's token (the map window: `token_cache.Entry.map`) — never
+        /// off this mount's view of the holder's tree, which it does not
+        /// maintain (a joiner read 32 MiB of zeros off it).
+        mapRecord: *const fn (ctx: *anyopaque, gpa: Allocator, ino: u64, block: u32) Error!MapVerdict,
+
+        pub const MapVerdict = union(enum) {
+            /// This mount's slot: read the tree.
+            local,
+            /// No record resolves the block.
+            hole,
+            /// The record (its value owned by `gpa`).
+            record: struct { index: u32, value: []u8 },
+        };
 
         pub const Verdict = union(enum) {
             /// This mount's slot: read the store.
@@ -587,12 +605,25 @@ pub const DataPlane = struct {
     /// `sym_tokens_intents_striping.md` §1.7 step 2): the recalled
     /// object's carried `layout` value (the raw layout, as the token
     /// carries it) — every block key it names leaves the read tiers through
-    /// the ONE purge. Null when it cannot be enumerated (it does not
-    /// decode, or a block-map tree head names its references elsewhere):
-    /// the caller runs the census.
-    pub fn recallPurgeLayout(self: *DataPlane, value: []const u8) ?u32 {
+    /// the ONE purge; a block-map tree head names its keys elsewhere, so
+    /// the keys are the ones the entry's map window resolves (`map`: every
+    /// binding this mount resolved under the entry — none when it resolved
+    /// none). Null when the value does not decode: the caller runs the
+    /// census.
+    pub fn recallPurgeLayout(self: *DataPlane, value: []const u8, map: []const record.MapRecordView) ?u32 {
         const l = layout.Layout.decode(value, self.geo) catch return null;
-        return self.rp.purgeRecalledLayout(&l);
+        if (!l.isKvmap()) return self.rp.purgeRecalledLayout(&l);
+        var n: u32 = 0;
+        for (map) |m| {
+            const e = record.MapEntry.decode(m.value) catch return null;
+            const r = kvmap.Rec.fromEntry(m.index, e, self.chunk) catch return null;
+            var i: u64 = r.index;
+            while (i < r.end()) : (i += 1) {
+                _ = purge.purgeBlockKey(self.rp.tiers, purge.BlockKey.fromMapping(r.bindingAt(@intCast(i), self.chunk)));
+                n += 1;
+            }
+        }
+        return n;
     }
 
     /// The recall's census fallback: every FOREIGN key the tiers hold
@@ -3207,6 +3238,27 @@ pub const DataPlane = struct {
     /// (`kvmap_resolve_failures`), never a fabricated hole.
     fn kvmapLookup(self: *DataPlane, ino: u64, head: layout.Layout.KvmapHead, block: u32) ?Mapping {
         if (head.sweep) |k| if (block >= k) return null;
+        if (self.foreign_layout) |f| switch (f.mapRecord(f.ctx, self.gpa, ino, block) catch |e| {
+            // `rawBinding` has no error channel: a failed resolve reads as a
+            // hole, as a failed head resolve does for every foreign file.
+            stats.kvmap_foreign_resolve_failures.inc();
+            log.warn("ino {d} block {d}: the holder's block map could not be served ({t}) — answered as a hole", .{ ino, block, e });
+            return null;
+        }) {
+            .local => {},
+            .hole => return null,
+            .record => |r| {
+                defer self.gpa.free(r.value);
+                const rec = kvmap.Rec.fromEntry(r.index, record.MapEntry.decode(r.value) catch {
+                    stats.kvmap_resolve_failures.fire("a tree-mapped binding the holder's token carried does not decode");
+                    return null;
+                }, self.chunk) catch {
+                    stats.kvmap_resolve_failures.fire("a tree-mapped binding the holder's token carried does not decode");
+                    return null;
+                };
+                return if (rec.covers(block)) rec.bindingAt(block, self.chunk) else null;
+            },
+        };
         if (self.windows.probe(ino, block)) |p| return switch (p) {
             .hole => null,
             .mapping => |m| m,

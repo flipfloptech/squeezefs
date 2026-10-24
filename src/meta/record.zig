@@ -435,6 +435,21 @@ pub const RUN_LEN_MAX: u32 = 4096;
 /// A 1-run is a point; the encoder emits `2..=RUN_LEN_MAX` only.
 pub const RUN_LEN_MIN: u32 = 2;
 
+/// One block-map record as a token carries it (a foreign reader's map
+/// window): its index, the indices it resolves, and the encoded VALUE
+/// (`MapEntry`), borrowed. The reader's data plane decodes the binding
+/// with its own stride.
+pub const MapRecordView = struct {
+    index: u32,
+    len: u32,
+    value: []const u8,
+
+    /// Covers `block` (`[index, index + len)`).
+    pub fn covers(self: MapRecordView, block: u32) bool {
+        return self.index <= block and @as(u64, block) < @as(u64, self.index) + self.len;
+    }
+};
+
 pub const MapEntry = union(enum) {
     point: struct { vol_tag: u64, offset: u64 },
     /// A decorated block key stored verbatim (`damaged:` markers etc.).

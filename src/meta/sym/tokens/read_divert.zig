@@ -463,7 +463,7 @@ pub const HolderService = struct {
             .rejected => |why| return Answer.rejected(@tagName(why)),
         }
         if (self.redirect(r.head.object)) |page| return .{ .ok = .{ .token_grant = page } };
-        return grantAnswer(self.holder.serveGrant(self.io, .{ .client = r.head.client_id, .object = r.head.object, .wants_dentries = r.head.wants & verbs.WANT_DENTRIES != 0, .wants_records = r.head.wants & verbs.WANT_RECORDS != 0, .after = r.head.after, .xattr_after = r.bytes }, self.source, scratch));
+        return grantAnswer(self.holder.serveGrant(self.io, .{ .client = r.head.client_id, .object = r.head.object, .wants_dentries = r.head.wants & verbs.WANT_DENTRIES != 0, .wants_records = r.head.wants & verbs.WANT_RECORDS != 0, .wants_map = r.head.wants & verbs.WANT_MAP != 0, .after = r.head.after, .xattr_after = r.bytes }, self.source, scratch));
     }
 
     fn serveRelease(ctx: *anyopaque, req: *const service.Request, _: []u8) Answer {

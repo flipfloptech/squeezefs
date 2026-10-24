@@ -40,6 +40,7 @@ const frame = @import("../../../wire/frame.zig");
 const record = @import("../../record.zig");
 const key = @import("../../key.zig");
 const tx = @import("../../tx.zig");
+const tree = @import("../../tree.zig");
 
 const assert = std.debug.assert;
 const ns_per_ms: u64 = std.time.ns_per_ms;
@@ -75,6 +76,9 @@ pub const GRANT_PAGE_BUDGET: usize = frame.CONTROL_CAP / 2;
 /// the reader will account for it.
 pub const TOKEN_ENTRY_BYTES: u64 = 128;
 pub const DIR_RECORD_BYTES: u64 = 24;
+/// A block-map record the same way: 16 B (index + len + the value's
+/// length) beside its value (≤ `verbs.MAP_VALUE_MAX`).
+pub const MAP_RECORD_BYTES: u64 = 16;
 /// The expiry tick floor: below 1 ms a re-read of an UNKNOWN-remaining
 /// lease degenerates into a spin; acks and the earliest live expiry wake
 /// the pass earlier.
@@ -259,7 +263,60 @@ pub const RecordSource = struct {
     /// Up to `max` dentries of directory `object` in cookie order STRICTLY
     /// after cookie `after` (0 = start); true when more remain past them.
     dentries: *const fn (ctx: *anyopaque, arena: Allocator, object: Object, after: u64, max: usize, out: *std.ArrayList(DirRec)) SourceError!bool,
+    /// Block `from`'s neighbourhood of tree-mapped file `object`'s block
+    /// map in index order: the record covering `from` from strictly before
+    /// it (the last such coverer — the read law's floor), then up to `max`
+    /// records keyed at or above `from` (values owned by `arena`); true
+    /// when more remain past them. A file with no tree records answers
+    /// none.
+    blockMap: *const fn (ctx: *anyopaque, arena: Allocator, object: Object, from: u32, max: usize, out: *std.ArrayList(record.MapRecordView)) SourceError!bool,
 };
+
+/// `RecordSource.blockMap` over any store answering
+/// `range(gpa, tree_id, start, end, max, out)` with the block-map tree's
+/// raw records: the floor (the last record keyed in `[from − (RUN_LEN_MAX
+/// − 1), from)` covering `from` — a run never spans more, the format's
+/// floor law) then up to `max` records keyed at or above `from`.
+pub fn blockMapWindow(gpa: Allocator, arena: Allocator, store: anytype, object: Object, from: u32, max: usize, out: *std.ArrayList(record.MapRecordView)) SourceError!bool {
+    if (from > 0) {
+        var kvs: std.ArrayList(tree.KeyValue) = .empty;
+        defer tree.deinitKeyValues(gpa, &kvs);
+        const lo = key.blockMapKey(object, from -| (record.RUN_LEN_MAX - 1)) catch return error.Corrupt;
+        const hi = key.blockMapKey(object, from - 1) catch return error.Corrupt;
+        store.range(gpa, key.TREE_BLOCK_MAP, &lo, &hi, record.RUN_LEN_MAX, &kvs) catch |e| return sourceErr(e);
+        var floor: ?record.MapRecordView = null;
+        for (kvs.items) |kv| {
+            const m = try mapView(object, kv);
+            if (m.covers(from)) floor = m;
+        }
+        if (floor) |m| try out.append(arena, .{ .index = m.index, .len = m.len, .value = try arena.dupe(u8, m.value) });
+    }
+    var kvs: std.ArrayList(tree.KeyValue) = .empty;
+    defer tree.deinitKeyValues(gpa, &kvs);
+    const range = key.indexRangeFrom(object, from);
+    store.range(gpa, key.TREE_BLOCK_MAP, &range.lo, &range.hi, max + 1, &kvs) catch |e| return sourceErr(e);
+    for (kvs.items, 0..) |kv, i| {
+        if (i == max) return true;
+        const m = try mapView(object, kv);
+        try out.append(arena, .{ .index = m.index, .len = m.len, .value = try arena.dupe(u8, m.value) });
+    }
+    return false;
+}
+
+fn mapView(object: Object, kv: tree.KeyValue) SourceError!record.MapRecordView {
+    const k = key.BlockMapKey.decode(kv.key) catch return error.Corrupt;
+    if (k.ownerIno() != object) return error.Corrupt;
+    const e = record.MapEntry.decode(kv.value) catch return error.Corrupt;
+    return .{ .index = k.blockIndex(), .len = e.runLen(), .value = kv.value };
+}
+
+fn sourceErr(e: anyerror) SourceError {
+    return switch (e) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.Corrupt => error.Corrupt,
+        else => error.Io,
+    };
+}
 
 /// `token_carried_xattr(name)`: the user-visible allowlist ∪ `layout` ∪
 /// `system.symlink`. Every other internal record (`writer_claim`,
@@ -498,7 +555,9 @@ pub const GrantAsk = struct {
     object: Object,
     wants_dentries: bool,
     wants_records: bool,
-    /// The last cookie carried (0 = start).
+    wants_map: bool = false,
+    /// The last cookie carried (0 = start); with `wants_map`, the block
+    /// index the map window starts at.
     after: u64,
     /// The last xattr name carried ("" = start).
     xattr_after: []const u8,
@@ -1187,6 +1246,24 @@ pub const Holder = struct {
                 n_dir += 1;
             }
             if (complete) flags |= verbs.PAGE_DIR_COMPLETE;
+        } else if (ask.wants_map and xattrs_complete) {
+            flags |= verbs.PAGE_HAS_MAP;
+            var ms: std.ArrayList(record.MapRecordView) = .empty;
+            // Ask for one page's worth at the smallest record's cost.
+            const max = @max(budget / @as(usize, MAP_RECORD_BYTES + codec.TAIL_ALIGN), 1);
+            const more = try source.blockMap(source.ctx, arena, ask.object, @intCast(ask.after), max, &ms);
+            var complete = !more;
+            for (ms.items) |m| {
+                const cost = @as(usize, MAP_RECORD_BYTES) + codec.padTo(m.value.len, codec.TAIL_ALIGN);
+                if (cost > budget or m.value.len > verbs.MAP_VALUE_MAX) {
+                    complete = false;
+                    break;
+                }
+                verbs.GrantPage.encodeMap(&db, .{ .head = .{ .index = m.index, .len = m.len, .value_len = @intCast(m.value.len), .reserved = @splat(0) }, .value = m.value }) catch return error.Corrupt;
+                budget -= cost;
+                n_dir += 1;
+            }
+            if (complete) flags |= verbs.PAGE_MAP_COMPLETE;
         }
         const attrs: verbs.InodeValueWire = std.mem.bytesToValue(verbs.InodeValueWire, &v.encode());
         return .{

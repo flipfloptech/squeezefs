@@ -118,6 +118,9 @@ pub const stats = struct {
     /// Dentry fetches cut at the window bound (the set is larger than one
     /// resident window; the rest pages in on demand).
     pub var dlm_token_dir_windows: counters.ShardedCounter = .{};
+    /// Block-map fetches cut at the window bound (the map is larger than
+    /// one resident window; the rest pages in on demand).
+    pub var dlm_token_map_windows: counters.ShardedCounter = .{};
     /// Serves refused by the gate (lease past T_self, channel not ok).
     pub var dlm_token_serve_refusals: counters.ShardedCounter = .{};
     /// Rounds completed on a holder's channel (grants + pushes).
@@ -247,6 +250,16 @@ pub const Entry = struct {
     dir: ?[]DirRecord,
     dir_from: u64 = 0,
     dir_complete: bool = true,
+    /// A tree-mapped file's block-map WINDOW (null when the fetch did not
+    /// ask for it): every record resolving a block at or above `map_from`
+    /// in index order (the floor's coverer first), up to the file's last
+    /// record (`map_complete`) or the window's byte bound. The data plane
+    /// resolves this mount's bindings of a foreign tree-mapped file off it
+    /// — and only off it, so the keys a recall must purge are exactly the
+    /// keys its records name (THE PURGE LAW).
+    map: ?[]record.MapRecordView = null,
+    map_from: u64 = 0,
+    map_complete: bool = true,
     /// `128 + Σ xattr bytes + Σ (24 + name) per dentry`.
     bytes: u64,
     state: State = .live,
@@ -294,6 +307,28 @@ pub const Entry = struct {
         const d = self.dir orelse return false;
         if (cookie < self.dir_from) return false;
         return self.dir_complete or (d.len > 0 and cookie < d[d.len - 1].cookie);
+    }
+
+    /// Does the map window resolve `block`: it starts at or before it and
+    /// either reaches the map's end or holds a record keyed at or past it
+    /// (every record keyed at or below `block` is then resident).
+    pub fn coversBlock(self: *const Entry, block: u64) bool {
+        const m = self.map orelse return false;
+        if (block < self.map_from) return false;
+        return self.map_complete or (m.len > 0 and block <= m[m.len - 1].index);
+    }
+
+    /// The record `block` resolves to under the read law (the LAST record
+    /// keyed at or below it that covers it — an exact record supersedes a
+    /// covering run); null = a hole. The window must cover `block`.
+    pub fn mapRecordFor(self: *const Entry, block: u32) ?record.MapRecordView {
+        const m = self.map orelse return null;
+        var found: ?record.MapRecordView = null;
+        for (m) |r| {
+            if (r.index > block) break;
+            if (r.covers(block)) found = r;
+        }
+        return found;
     }
 
     /// Is a name's absence from the window DEFINITIVE: every cookie a
@@ -373,6 +408,11 @@ pub const Cache = struct {
     /// while one is in flight cannot tell whether the tiers still hold its
     /// object's keys.
     drops_in_flight: u32 = 0,
+    /// Entries an install displaced that carried a map window: they leave
+    /// like a drop (pinned, counted in `drops_in_flight`) for the
+    /// installer's purge (`Reader.purgeDisplaced`) — the window's keys may
+    /// sit in the tiers and the new entry need not name them.
+    displaced: std.ArrayListUnmanaged(*Entry) = .empty,
 
     pub fn init(gpa: Allocator, budget_bytes: u64) Cache {
         return .{ .gpa = gpa, .budget_bytes = budget_bytes };
@@ -383,6 +423,8 @@ pub const Cache = struct {
         while (it.next()) |e| e.*.destroy();
         self.entries.deinit(self.gpa);
         self.revoke_gens.deinit(self.gpa);
+        for (self.displaced.items) |e| e.destroy();
+        self.displaced.deinit(self.gpa);
     }
 
     pub fn revokeGen(self: *Cache, io: Io, object: Object) u64 {
@@ -396,7 +438,7 @@ pub const Cache = struct {
         self.lock.lockUncancelable(io);
         defer self.lock.unlock(io);
         const e = self.entries.get(object) orelse return null;
-        if (e.state != .live or (wants.dentries and !e.coversAfter(wants.after))) return null;
+        if (e.state != .live or (wants.dentries and !e.coversAfter(wants.after)) or (wants.map and !e.coversBlock(wants.after))) return null;
         e.pins += 1;
         e.used = true;
         self.pinForKernelLocked(e);
@@ -456,13 +498,22 @@ pub const Cache = struct {
             return .recalled_mid_fetch;
         }
         if (self.entries.get(e.object)) |old| {
-            if (old.dir != null and e.dir == null) {
+            if ((old.dir != null and e.dir == null) or (old.map != null and e.map == null)) {
                 // Keep the richer entry; the caller serves it.
                 e.destroy();
                 old.pins += 1;
                 old.used = true;
                 self.pinForKernelLocked(old);
                 return .{ .installed = old };
+            }
+            if (old.map != null) {
+                self.displaced.ensureUnusedCapacity(self.gpa, 1) catch {
+                    e.destroy();
+                    return .oversize;
+                };
+                old.pins += 1;
+                self.displaced.appendAssumeCapacity(old);
+                self.drops_in_flight += 1;
             }
             self.removeLocked(old);
         }
@@ -592,6 +643,14 @@ pub const Cache = struct {
         return n;
     }
 
+    /// The entries installs displaced (moved into `out`, pinned).
+    pub fn takeDisplaced(self: *Cache, io: Io, out: *std.ArrayList(*Entry)) Allocator.Error!void {
+        self.lock.lockUncancelable(io);
+        defer self.lock.unlock(io);
+        try out.appendSlice(self.gpa, self.displaced.items);
+        self.displaced.clearRetainingCapacity();
+    }
+
     /// `n` dropped entries' keys are purged (`drops_in_flight`).
     pub fn dropsPurged(self: *Cache, io: Io, n: u32) void {
         self.lock.lockUncancelable(io);
@@ -654,6 +713,9 @@ pub fn coreError(e: Error) errors.Error {
 pub const Wants = struct {
     dentries: bool = false,
     records: bool = true,
+    /// The block-map window (never with `dentries`): `after` is the block
+    /// the resident window must resolve, else the fetch starts there.
+    map: bool = false,
     /// With `dentries`: the cookie the caller's page or lookup starts
     /// STRICTLY after (0 = the set's start); the resident window must
     /// cover it, else the fetch starts there.
@@ -809,12 +871,18 @@ pub const Reader = struct {
         var dir_after: u64 = wants.after;
         var dir_done = !wants.dentries;
         var dir_complete = true;
+        var map: std.ArrayList(record.MapRecordView) = .empty;
+        var map_after: u64 = wants.after;
+        var map_done = !wants.map;
+        var map_complete = true;
         var first = true;
-        while (!(records_done and dir_done)) {
+        while (!(records_done and dir_done and map_done)) {
             var want_bits: u8 = 0;
             if (!records_done) want_bits |= verbs.WANT_RECORDS;
             if (wants.dentries) want_bits |= verbs.WANT_DENTRIES;
-            const rep = self.link.call(self.link.ctx, .{ .token_grant = .{ .head = .{ .volume = self.volume, .wants = want_bits, .mode = 0, .xattr_after_len = @intCast(xattr_after.len), .client_id = self.client_id, .object = object, .after = dir_after }, .bytes = xattr_after } }) catch |err| {
+            if (wants.map) want_bits |= verbs.WANT_MAP;
+            const after = if (wants.map) map_after else dir_after;
+            const rep = self.link.call(self.link.ctx, .{ .token_grant = .{ .head = .{ .volume = self.volume, .wants = want_bits, .mode = 0, .xattr_after_len = @intCast(xattr_after.len), .client_id = self.client_id, .object = object, .after = after }, .bytes = xattr_after } }) catch |err| {
                 self.noteRoundFailed();
                 return switch (err) {
                     error.StaleHolderView => error.StaleHolderView,
@@ -873,19 +941,44 @@ pub const Reader = struct {
                 dir_after = d.head.cookie;
                 carried += 1;
             }
+            var ms = page.map();
+            var map_cut = false;
+            while (ms.next()) |m| {
+                // A later page's floor is a record this window carries.
+                if (map.items.len > 0 and m.head.index <= map.items[map.items.len - 1].index) continue;
+                // The window's bound, as the dentries' (at least one
+                // record per window; the rest pages in from its end).
+                if (map.items.len > 0 and e.bytes + table.MAP_RECORD_BYTES + m.value.len > self.dir_window_bytes) {
+                    map_cut = true;
+                    break;
+                }
+                const value = arena.dupe(u8, m.value) catch return error.OutOfMemory;
+                map.append(arena, .{ .index = m.head.index, .len = m.head.len, .value = value }) catch return error.OutOfMemory;
+                e.bytes += table.MAP_RECORD_BYTES + value.len;
+                carried += 1;
+            }
             records_done = page.head.flags & verbs.PAGE_XATTRS_COMPLETE != 0;
             if (page.head.flags & verbs.PAGE_HAS_DIR != 0) dir_done = page.head.flags & verbs.PAGE_DIR_COMPLETE != 0;
+            if (page.head.flags & verbs.PAGE_HAS_MAP != 0) {
+                map_done = page.head.flags & verbs.PAGE_MAP_COMPLETE != 0;
+                if (!map_done and map.items.len > 0) map_after = @as(u64, map.items[map.items.len - 1].index) + 1;
+            }
             if (cut) {
                 dir_done = true;
                 dir_complete = false;
                 stats.dlm_token_dir_windows.inc();
+            }
+            if (map_cut) {
+                map_done = true;
+                map_complete = false;
+                stats.dlm_token_map_windows.inc();
             }
             if (e.bytes > self.cache.budget_bytes) {
                 stats.dlm_token_oversize_refusals.inc();
                 return error.Oversize;
             }
             // An EMPTY incomplete page: never spun on.
-            if (carried == 0 and !(records_done and dir_done)) return error.Wire;
+            if (carried == 0 and !(records_done and dir_done and map_done)) return error.Wire;
         }
         stats.dlm_token_grant_rtt_ns.record(clock.monotonicNs() -| t0);
         e.xattrs = xattrs.items;
@@ -894,6 +987,11 @@ pub const Reader = struct {
             e.dir = dir.items;
             e.dir_from = wants.after;
             e.dir_complete = dir_complete;
+        }
+        if (wants.map) {
+            e.map = map.items;
+            e.map_from = wants.after;
+            e.map_complete = map_complete;
         }
         // Room by voluntary releases, drained + purged THEN released.
         var retired: std.ArrayList(Object) = .empty;
@@ -910,11 +1008,23 @@ pub const Reader = struct {
         room catch return error.OutOfMemory;
         if (retired.items.len != 0) self.releaseRetired(retired.items, retired_kept.items);
         consumed = true;
-        return switch (self.cache.install(io, e, gen0)) {
+        const outcome = self.cache.install(io, e, gen0);
+        self.purgeDisplaced(io);
+        return switch (outcome) {
             .installed => |served| .{ .installed = served },
             .recalled_mid_fetch => .recalled_mid_fetch,
             .oversize => error.Oversize,
         };
+    }
+
+    /// The map-bearing entries installs displaced leave as drops do: their
+    /// window's keys purged (THE PURGE LAW). One that cannot be listed now
+    /// stays counted in flight (a recall meanwhile censuses) for the next.
+    fn purgeDisplaced(self: *Reader, io: Io) void {
+        var displaced: std.ArrayList(*Entry) = .empty;
+        defer displaced.deinit(self.gpa);
+        self.cache.takeDisplaced(io, &displaced) catch return;
+        self.purgeDropped(io, displaced.items);
     }
 
     fn noteRound(self: *Reader) void {

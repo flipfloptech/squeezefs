@@ -1658,7 +1658,12 @@ pub const WirePlane = struct {
     /// xattr off the holder's token page (the divert's serve; a `local`
     /// verdict reads the store).
     pub fn foreignLayout(self: *WirePlane) @import("../../data/plane.zig").DataPlane.ForeignLayout {
-        return .{ .ctx = self, .lookup = &foreignLayoutFn };
+        return .{ .ctx = self, .lookup = &foreignLayoutFn, .mapRecord = &foreignMapRecordFn };
+    }
+
+    fn foreignMapRecordFn(ctx: *anyopaque, gpa: Allocator, ino: u64, block: u32) errors.Error!@import("../../data/plane.zig").DataPlane.ForeignLayout.MapVerdict {
+        const self: *WirePlane = @ptrCast(@alignCast(ctx));
+        return foreignMapRecordOf(&self.divert, self.io, gpa, ino, block);
     }
 
     /// The data plane's publish SHIP (charter §5.5 "the layout publish"
@@ -1960,11 +1965,12 @@ const RenameStore = struct {
 /// no kernel view), and the data plane's read tiers purged of every block
 /// key the recalled object's carried `layout` names — before the ack, so
 /// the holder's free (and any member's re-mint) of those blocks follows
-/// it (`DataPlane.recallPurgeLayout`). An object with no entry held
-/// answers `no_entry` (its entry's exit already purged what it named —
-/// `token_cache`'s purge law); a layout that names its references
-/// elsewhere answers `unmapped`: the census over every foreign key, once
-/// per recall. This mount keeps no write-side state the recall could
+/// it (`DataPlane.recallPurgeLayout`) — a tree-mapped head's keys are the
+/// ones the entry's map window resolves (every binding this mount resolved
+/// under the entry). An object with no entry held answers `no_entry` (its
+/// entry's exit already purged what it named — `token_cache`'s purge
+/// law); a layout that does not decode answers `unmapped`: the census over
+/// every foreign key, once per recall. This mount keeps no write-side state the recall could
 /// discard (a foreign file's publish ships to its holder), so nothing is
 /// ever `dirty_kept` here.
 pub const RecallSink = struct {
@@ -1993,7 +1999,7 @@ pub const RecallSink = struct {
         // No layout carried: a directory, a symlink, a never-written file —
         // it names no block.
         const value = e.xattr(@import("../../data/layout.zig").LAYOUT_XATTR_NAME) orelse return .{ .discarded = 0 };
-        return if (dp.recallPurgeLayout(value)) |n| .{ .discarded = n } else .unmapped;
+        return if (dp.recallPurgeLayout(value, e.map orelse &.{})) |n| .{ .discarded = n } else .unmapped;
     }
 
     fn purgeCensus(ctx: *anyopaque) void {
@@ -2036,7 +2042,12 @@ pub const SetRecordSource = struct {
     set: *MetaSet,
 
     pub fn source(self: *SetRecordSource) tokens.table.RecordSource {
-        return .{ .ctx = self, .inode = &inode, .xattrs = &xattrs, .dentries = &dentries };
+        return .{ .ctx = self, .inode = &inode, .xattrs = &xattrs, .dentries = &dentries, .blockMap = &blockMap };
+    }
+
+    fn blockMap(ctx: *anyopaque, arena: Allocator, object: u64, from: u32, max: usize, out: *std.ArrayList(record.MapRecordView)) tokens.table.SourceError!bool {
+        const self: *SetRecordSource = @ptrCast(@alignCast(ctx));
+        return tokens.table.blockMapWindow(self.set.gpa, arena, self.set, object, from, max, out);
     }
 
     fn mapErr(e: meta_set.Error) tokens.table.SourceError {
@@ -2401,6 +2412,16 @@ pub fn foreignLayoutOf(divert: *tokens.Divert, io: Io, gpa: Allocator, ino: u64)
         break;
     };
     return .{ .foreign = .{ .size = e.attrs.size, .flags = e.attrs.flags, .layout = layout_rec } };
+}
+
+/// The record resolving `block` of foreign tree-mapped file `ino`, off the
+/// map window its holder's token carries (fetched from `block` on a miss).
+pub fn foreignMapRecordOf(divert: *tokens.Divert, io: Io, gpa: Allocator, ino: u64, block: u32) errors.Error!@import("../../data/plane.zig").DataPlane.ForeignLayout.MapVerdict {
+    const served = (divert.serve(io, ino, .{ .records = true, .map = true, .after = block }) catch |e| return tokens.divert.coreError(e)) orelse return .local;
+    defer served.release(io);
+    const e = served.entry orelse return .hole;
+    const r = e.mapRecordFor(block) orelse return .hole;
+    return .{ .record = .{ .index = r.index, .value = gpa.dupe(u8, r.value) catch return error.OutOfMemory } };
 }
 
 /// The token service's resolver over the set: a slot this process leases

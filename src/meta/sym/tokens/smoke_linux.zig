@@ -98,6 +98,11 @@ const BackendSource = struct {
         return false;
     }
 
+    fn blockMap(ctx: *anyopaque, arena: Allocator, object: u64, from: u32, max: usize, out: *std.ArrayList(record.MapRecordView)) table.SourceError!bool {
+        const self: *BackendSource = @ptrCast(@alignCast(ctx));
+        return table.blockMapWindow(self.be.gpa, arena, self.be, object, from, max, out);
+    }
+
     fn mapErr(e: backend.Error) table.SourceError {
         return switch (e) {
             error.OutOfMemory => error.OutOfMemory,
@@ -107,7 +112,7 @@ const BackendSource = struct {
     }
 
     fn source(self: *BackendSource) table.RecordSource {
-        return .{ .ctx = self, .inode = &inode, .xattrs = &xattrs, .dentries = &dentries };
+        return .{ .ctx = self, .inode = &inode, .xattrs = &xattrs, .dentries = &dentries, .blockMap = &blockMap };
     }
 };
 

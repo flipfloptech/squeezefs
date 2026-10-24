@@ -16525,6 +16525,136 @@ test "smoke: AN ACCESS STAMP RECALLS NO READER — mount A (the manager) + B JOI
     try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
 }
 
+/// The block-map row's geometry: 512 KiB blocks under 64 KiB metadata
+/// nodes put the inline map's cap at 341 entries (a 16 KiB value of 48 B
+/// entries), so a 192 MiB file (384 blocks) is tree-mapped; B's 1 MiB
+/// O_DIRECT reads start 256 KiB into the file, so each straddles blocks
+/// (multi-block: the lane's whole-block fills, which deposit in the hot
+/// tier — a block ≤ 256 KiB fills the read LRU instead).
+const kvmap_peer_block: u64 = 512 << 10;
+const kvmap_peer_big_mib: u64 = 192;
+/// A pass served from the tiers reads at most an eighth of `big` (and
+/// nothing of `x` past its first fill).
+const kvmap_peer_warm_device_bytes: u64 = (kvmap_peer_big_mib << 20) / 8;
+const kvmap_peer_passes: u32 = 6;
+/// The reads (O_DIRECT, 1 MiB, 256 KiB in): `big`'s whole window, `x`'s,
+/// and `big` grown by the appended MiB. Each prints its sha.
+const kvmap_peer_read_big = "dd if=k/big iflag=direct,skip_bytes skip=262144 bs=1048576 count=191 status=none | sha256sum | cut -d' ' -f1";
+const kvmap_peer_read_x = "dd if=k/x iflag=direct,skip_bytes skip=262144 bs=1048576 count=3 status=none | sha256sum | cut -d' ' -f1";
+const kvmap_peer_read_grown = "dd if=k/big iflag=direct,skip_bytes skip=262144 bs=1048576 count=192 status=none | sha256sum | cut -d' ' -f1";
+
+test "smoke: A JOINED MEMBER READS A HOLDER'S BLOCK-MAP FILE, AND ITS RECALL PURGES THE BLOCKS THAT FILE MAPS, NEVER THE PEER'S WHOLE CACHE — mount A (the manager) + B JOINED, no write cache, 512 KiB blocks under 64 KiB nodes → A writes `k/big` (192 MiB: tree-mapped, `kvmap_crossings` 1) and `k/x` (4 MiB) → B reads `big` sha-equal to A's (its bindings off the map window A's token carries — red before: B resolved them off its own view of A's tree and read ZEROS) and reads both until its tiers serve them → A appends 1 MiB to `big` → B's recall of `big` purges the blocks it resolved under the token and runs no census (`dlm_token_recall_census_purges` + 0, purged keys ≥ 384): B's next read of `x` is served from its tiers, its next read of `big` reads from the device and is A's bytes, the appended MiB included" {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    try rig.env.put("SQUEEZEFS_MW_BIND", "127.0.0.1:0");
+    var t_owner_text: [8]u8 = undefined;
+    try rig.env.put("SQUEEZEFS_TEST_MEMBERSHIP_T_OWNER_MS", try std.fmt.bufPrint(&t_owner_text, "{d}", .{smoke_t_owner_ms}));
+    var bs_buf: [16]u8 = undefined;
+    try rig.formatSetWith(false, &.{ "--meta-node-kib", "64", "--block-size", try std.fmt.bufPrint(&bs_buf, "{d}", .{kvmap_peer_block}) });
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(0);
+    // B's read tiers sized by hand (the busy-writer row's reason).
+    var env_b = try envWith(gpa, &rig.env, &.{ .{ "SQUEEZEFS_READ_DEST_LEASE", "0" }, .{ "SQUEEZEFS_TEST_FLEET_SHARE", "1" }, .{ "SQUEEZEFS_READ_HOT_BLOCK_CACHE_MB", "1024" } });
+    defer env_b.deinit();
+    const b = try Peer.init(rig, "b");
+    defer b.deinit();
+    b.env = &env_b;
+    try b.spawn(&.{});
+    _ = try b.awaitReady();
+    var sha_buf: [2][64]u8 = undefined;
+    {
+        const out = try rig.onMount("mkdir k && dd if=/dev/urandom of=k/x bs=1048576 count=4 iflag=fullblock conv=fsync status=none && dd if=/dev/urandom of=k/big bs=1048576 count=192 iflag=fullblock conv=fsync status=none && " ++ kvmap_peer_read_big ++ " && " ++ kvmap_peer_read_x);
+        defer gpa.free(out);
+        var it = std.mem.tokenizeScalar(u8, out, '\n');
+        @memcpy(&sha_buf[0], it.next().?);
+        @memcpy(&sha_buf[1], it.next().?);
+        const sa = try rig.stats();
+        defer gpa.free(sa);
+        try testing.expectEqual(@as(?u64, 1), numberAfter(sa, "\"kvmap_crossings\":"));
+    }
+    const read_big = kvmap_peer_read_big;
+    const read_x = kvmap_peer_read_x;
+    const Snap = struct {
+        hits: u64,
+        dev: u64,
+        census: u64,
+        keys: u64,
+        fn read(peer: *Peer) !@This() {
+            const text = try peer.stats();
+            defer peer.rig.gpa.free(text);
+            return .{
+                .hits = (numberAfter(text, "\"cache_hits\":") orelse 0) + (numberAfter(text, "\"fast_dispatch_serves\":") orelse 0),
+                .dev = (numberAfter(text, "\"data_device_read_bytes\":") orelse 0) + (numberAfter(text, "\"transport_zc_direct_leg_dma_bytes\":") orelse 0),
+                .census = numberAfter(text, "\"dlm_token_recall_census_purges\":") orelse 0,
+                .keys = numberAfter(text, "\"dlm_token_recall_purged_keys\":") orelse 0,
+            };
+        }
+    };
+    // 1. B reads A's tree-mapped file: A's bytes.
+    {
+        const out = try b.onMount(read_big);
+        defer gpa.free(out);
+        try testing.expectEqualStrings(&sha_buf[0], std.mem.trimEnd(u8, out, "\n"));
+    }
+    // 2. B reads both until a pass of `big` is served from its tiers and
+    //    `x`'s passes are steady (the windows' sub-block edges are ranged
+    //    reads that deposit nothing — a steady pass is the cache's best).
+    var x_warm: struct { hits: u64 = 0, dev: u64 = 0 } = .{};
+    var pass: u32 = 0;
+    while (true) : (pass += 1) {
+        if (pass == kvmap_peer_passes) {
+            std.debug.print("smoke[kvmap-peer]: B's tiers never served a pass of `x` and `big` in {d} passes\n", .{kvmap_peer_passes});
+            return error.TestUnexpectedResult;
+        }
+        const s0 = try Snap.read(b);
+        const ob = try b.onMount(read_big);
+        defer gpa.free(ob);
+        try testing.expectEqualStrings(&sha_buf[0], std.mem.trimEnd(u8, ob, "\n"));
+        const s1 = try Snap.read(b);
+        const ox = try b.onMount(read_x);
+        defer gpa.free(ox);
+        try testing.expectEqualStrings(&sha_buf[1], std.mem.trimEnd(u8, ox, "\n"));
+        const s2 = try Snap.read(b);
+        std.debug.print("smoke[kvmap-peer]: B's pass {d}: `big` {d} hit(s) {d} B from the device, `x` {d} hit(s) {d} B\n", .{ pass + 1, s1.hits - s0.hits, s1.dev - s0.dev, s2.hits - s1.hits, s2.dev - s1.dev });
+        const steady = s2.hits - s1.hits == x_warm.hits and x_warm.hits > 0;
+        x_warm = .{ .hits = s2.hits - s1.hits, .dev = s2.dev - s1.dev };
+        if (s1.dev - s0.dev <= kvmap_peer_warm_device_bytes and steady) break;
+    }
+    // 3. A appends a MiB to `big`: B's token on it is recalled.
+    const base = try Snap.read(b);
+    {
+        const out = try rig.onMount("dd if=/dev/urandom of=k/big bs=1048576 count=1 iflag=fullblock oflag=append conv=notrunc,fsync status=none && " ++ kvmap_peer_read_grown);
+        defer gpa.free(out);
+        @memcpy(&sha_buf[0], std.mem.trimEnd(u8, out, "\n"));
+    }
+    const recalled = try Snap.read(b);
+    {
+        const out = try b.onMount(read_x);
+        defer gpa.free(out);
+        try testing.expectEqualStrings(&sha_buf[1], std.mem.trimEnd(u8, out, "\n"));
+    }
+    const after_x = try Snap.read(b);
+    const got = try b.onMount(kvmap_peer_read_grown);
+    defer gpa.free(got);
+    const after_big = try Snap.read(b);
+    std.debug.print("smoke[kvmap-peer]: A's append recalled `big` from B: census purges {d} → {d}, purged keys {d} → {d}; B's next `x`: {d} hit(s) {d} B from the device; next `big`: {d} B from the device\n", .{ base.census, recalled.census, base.keys, recalled.keys, after_x.hits - recalled.hits, after_x.dev - recalled.dev, after_big.dev - after_x.dev });
+    try testing.expectEqual(base.census, recalled.census);
+    try testing.expect(recalled.keys - base.keys >= kvmap_peer_big_mib * 2);
+    try testing.expect(after_x.hits - recalled.hits >= x_warm.hits);
+    try testing.expect(after_x.dev - recalled.dev <= x_warm.dev);
+    try testing.expect(after_big.dev - after_x.dev >= (kvmap_peer_big_mib - 1) << 20);
+    try testing.expectEqualStrings(&sha_buf[0], std.mem.trimEnd(u8, got, "\n"));
+    try b.expectAlive("the block-map peer row");
+    try rig.expectAlive("the block-map peer row");
+    try b.umount();
+    try b.expectCleanExit("B's unmount after the block-map peer row");
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+}
+
 test "smoke: THE FLEET READ SHARD — mount A (the coordinator) + B JOINED with the fleet on: B enrolls at A as a READ worker over its own manager link (job_remote_workers 1 on A) → 1 GiB of fsync'd files, 512 MiB written on each side → `scrub --online <A>` partitions 2 ways: shard 0 on A online, shard 1 LEASED to B, run by B's engine over B's own plane (B's scrub_blocks_scanned grows, job_fleet_worker_shards 1), PROPOSED as read_shard_result and merged on A (dispatched 1 = completed 1, relocal 0; every block scanned, 0 findings) → `scrub --online --throttle 5` again: B's residue stretched by the duty cycle, kill -9 B inside it → A's departure expires the lease (fencing +1), the residue is LOST and the local view re-run (relocal 1), the job completes whole, 0 findings; the engagement counters per side" {
     const io = testing.io;
     if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);

@@ -1016,6 +1016,12 @@ pub const CensusPage = struct {
 
 pub const WANT_DENTRIES: u8 = 1 << 0;
 pub const WANT_RECORDS: u8 = 1 << 1;
+/// A tree-mapped file's block map from block `after` (the record covering
+/// it from before, then the records keyed at or above it): a foreign
+/// reader resolves its bindings off the token, never off its own view of
+/// the holder's tree. Never with `WANT_DENTRIES` (one object is a file or
+/// a directory).
+pub const WANT_MAP: u8 = 1 << 2;
 
 pub const TokenGrantHead = extern struct {
     volume: u16,
@@ -1028,7 +1034,9 @@ pub const TokenGrantHead = extern struct {
     after: u64,
 
     pub fn check(self: TokenGrantHead) bool {
-        return self.wants & ~(WANT_DENTRIES | WANT_RECORDS) == 0 and self.mode == 0 and self.xattr_after_len <= record.NAME_MAX;
+        if (self.wants & WANT_DENTRIES != 0 and self.wants & WANT_MAP != 0) return false;
+        if (self.wants & WANT_MAP != 0 and self.after >= std.math.maxInt(u32)) return false;
+        return self.wants & ~(WANT_DENTRIES | WANT_RECORDS | WANT_MAP) == 0 and self.mode == 0 and self.xattr_after_len <= record.NAME_MAX;
     }
 };
 pub const TokenGrantReq = HeadWithBytes(TokenGrantHead, "xattr_after_len", record.NAME_MAX);
@@ -1038,6 +1046,10 @@ pub const PAGE_XATTRS_COMPLETE: u8 = 1 << 0;
 pub const PAGE_HAS_DIR: u8 = 1 << 1;
 pub const PAGE_DIR_COMPLETE: u8 = 1 << 2;
 pub const PAGE_ALREADY: u8 = 1 << 3;
+/// The page's record section carries block-map records (`n_dir` counts
+/// them), never dentries.
+pub const PAGE_HAS_MAP: u8 = 1 << 4;
+pub const PAGE_MAP_COMPLETE: u8 = 1 << 5;
 
 pub const GrantPageHead = extern struct {
     kind: u8,
@@ -1051,7 +1063,8 @@ pub const GrantPageHead = extern struct {
     reserved2: [4]u8,
 
     pub fn check(self: GrantPageHead) bool {
-        return self.kind <= 3 and self.flags & ~(PAGE_XATTRS_COMPLETE | PAGE_HAS_DIR | PAGE_DIR_COMPLETE | PAGE_ALREADY) == 0;
+        if (self.flags & PAGE_HAS_DIR != 0 and self.flags & PAGE_HAS_MAP != 0) return false;
+        return self.kind <= @backingInt(GrantPageKind.holder_dead) and self.flags & ~(PAGE_XATTRS_COMPLETE | PAGE_HAS_DIR | PAGE_DIR_COMPLETE | PAGE_ALREADY | PAGE_HAS_MAP | PAGE_MAP_COMPLETE) == 0;
     }
 };
 
@@ -1075,6 +1088,21 @@ pub const DirRecordHead = extern struct {
 };
 pub const DirEntry = struct { head: DirRecordHead, name: []const u8 };
 
+pub const MapRecordHead = extern struct {
+    index: u32,
+    /// The indices the record resolves (a run's length, else 1).
+    len: u32,
+    value_len: u16,
+    reserved: [6]u8,
+
+    pub fn check(self: MapRecordHead) bool {
+        return self.len >= 1 and self.len <= record.RUN_LEN_MAX and self.value_len >= 2 and self.value_len <= MAP_VALUE_MAX;
+    }
+};
+/// The widest block-map value: a kind-2 string carrying a 40 B mapping.
+pub const MAP_VALUE_MAX: u16 = 64;
+pub const MapEntryWire = struct { head: MapRecordHead, value: []const u8 };
+
 pub const XattrIterator = struct {
     c: Cursor,
     left: usize,
@@ -1086,6 +1114,19 @@ pub const XattrIterator = struct {
         const value = self.c.takeBytes(h.value_len) catch unreachable;
         self.c.takePadding(@as(usize, h.name_len) + h.value_len, codec.TAIL_ALIGN) catch unreachable;
         return .{ .name = name, .value = value };
+    }
+};
+
+pub const MapIterator = struct {
+    c: Cursor,
+    left: usize,
+    pub fn next(self: *MapIterator) ?MapEntryWire {
+        if (self.left == 0) return null;
+        self.left -= 1;
+        const h = self.c.take(MapRecordHead) catch unreachable;
+        const value = self.c.takeBytes(h.value_len) catch unreachable;
+        self.c.takePadding(h.value_len, codec.TAIL_ALIGN) catch unreachable;
+        return .{ .head = h, .value = value };
     }
 };
 
@@ -1123,6 +1164,13 @@ pub const GrantPage = struct {
         try b.putPadding(e.name.len, codec.TAIL_ALIGN);
     }
 
+    pub fn encodeMap(b: *Builder, e: MapEntryWire) codec.BuildError!void {
+        std.debug.assert(e.head.value_len == e.value.len);
+        try b.put(MapRecordHead, e.head);
+        try b.putBytes(e.value);
+        try b.putPadding(e.value.len, codec.TAIL_ALIGN);
+    }
+
     pub fn encode(self: GrantPage, b: *Builder) codec.BuildError!void {
         try b.put(GrantPageHead, self.head);
         try b.putBytes(self.xattrs_bytes);
@@ -1141,6 +1189,12 @@ pub const GrantPage = struct {
         const ds = c.pos;
         i = 0;
         while (i < head.n_dir) : (i += 1) {
+            if (head.flags & PAGE_HAS_MAP != 0) {
+                const h = try c.take(MapRecordHead);
+                _ = try c.takeBytes(h.value_len);
+                try c.takePadding(h.value_len, codec.TAIL_ALIGN);
+                continue;
+            }
             const h = try c.take(DirRecordHead);
             _ = try c.takeBytes(h.name_len);
             try c.takePadding(h.name_len, codec.TAIL_ALIGN);
@@ -1152,7 +1206,10 @@ pub const GrantPage = struct {
         return .{ .c = .init(self.xattrs_bytes), .left = self.head.n_xattrs };
     }
     pub fn dir(self: GrantPage) DirIterator {
-        return .{ .c = .init(self.dir_bytes), .left = self.head.n_dir };
+        return .{ .c = .init(self.dir_bytes), .left = if (self.head.flags & PAGE_HAS_MAP != 0) 0 else self.head.n_dir };
+    }
+    pub fn map(self: GrantPage) MapIterator {
+        return .{ .c = .init(self.dir_bytes), .left = if (self.head.flags & PAGE_HAS_MAP != 0) self.head.n_dir else 0 };
     }
 };
 
@@ -2120,6 +2177,29 @@ test "membership payloads: join with a mount path, the grant's three carriages, 
     var lb: Builder = .init(&buf);
     try (CensusPage{ .head = .{ .n = 0, .has_next = 0, .grace_open = 2, .reserved = @splat(0), .next = 0 }, .rows_bytes = &.{} }).encode(&lb);
     try testing.expectError(error.Malformed, codec.decodePayload(CensusPage, lb.written()));
+}
+
+test "token payloads: a block-map window page — WANT_MAP asks from a block, PAGE_HAS_MAP pages carry index/len/value records the map iterator walks (and the dentry iterator never sees); a map ask with dentries, a page with both sections, a record of zero length are malformed" {
+    _ = try roundTrip(TokenGrantReq, .{ .head = .{ .volume = 0, .wants = WANT_RECORDS | WANT_MAP, .mode = 0, .xattr_after_len = 0, .client_id = 77, .object = 1000, .after = 4096 }, .bytes = "" });
+    try testing.expect(!(TokenGrantHead{ .volume = 0, .wants = WANT_DENTRIES | WANT_MAP, .mode = 0, .xattr_after_len = 0, .client_id = 1, .object = 1, .after = 0 }).check());
+    var mb: [256]u8 = undefined;
+    var mbb: Builder = .init(&mb);
+    const run = [_]u8{ 1, 2 } ++ @as([20]u8, @splat(0xAA));
+    try GrantPage.encodeMap(&mbb, .{ .head = .{ .index = 0, .len = 100, .value_len = run.len, .reserved = @splat(0) }, .value = &run });
+    try GrantPage.encodeMap(&mbb, .{ .head = .{ .index = 4096, .len = 1, .value_len = 2, .reserved = @splat(0) }, .value = "\x01\x00" });
+    const attrs: InodeValueWire = std.mem.zeroes(InodeValueWire);
+    const page_v: GrantPage = .{ .head = .{ .kind = 0, .flags = PAGE_XATTRS_COMPLETE | PAGE_HAS_MAP | PAGE_MAP_COMPLETE, .reserved = 0, .n_xattrs = 0, .n_dir = 2, .holder = 0, .attrs = attrs, .reserved2 = @splat(0) }, .xattrs_bytes = "", .dir_bytes = mbb.written() };
+    const pg = try roundTrip(GrantPage, page_v);
+    var ms = pg.map();
+    const m0 = ms.next().?;
+    try testing.expectEqual(@as(u32, 100), m0.head.len);
+    try testing.expectEqualSlices(u8, &run, m0.value);
+    try testing.expectEqual(@as(u32, 4096), ms.next().?.head.index);
+    try testing.expectEqual(@as(?MapEntryWire, null), ms.next());
+    var ds = pg.dir();
+    try testing.expectEqual(@as(?DirEntry, null), ds.next());
+    try testing.expect(!(GrantPageHead{ .kind = 0, .flags = PAGE_HAS_DIR | PAGE_HAS_MAP, .reserved = 0, .n_xattrs = 0, .n_dir = 0, .holder = 0, .attrs = attrs, .reserved2 = @splat(0) }).check());
+    try testing.expect(!(MapRecordHead{ .index = 0, .len = 0, .value_len = 2, .reserved = @splat(0) }).check());
 }
 
 test "token payloads: the grant ask, a page with xattrs and a dentry page, recall/ack/release, the custody reply carrying a page" {

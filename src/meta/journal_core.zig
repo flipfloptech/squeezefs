@@ -544,6 +544,12 @@ pub const SpinLock = struct {
         }
     }
 
+    /// One attempt, no spin: true iff this call took the lock (the same
+    /// acquire pairing as `lock`).
+    pub fn tryLock(self: *SpinLock) bool {
+        return !self.locked.swap(true, .acquire);
+    }
+
     pub fn unlock(self: *SpinLock) void {
         self.locked.store(false, .release);
     }

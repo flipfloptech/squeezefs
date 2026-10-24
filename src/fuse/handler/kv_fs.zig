@@ -1191,7 +1191,8 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         /// stamp parks judged; under relatime it parks as a CANDIDATE the
         /// fold and the drain judge against the record by the relatime
         /// rule (`economy.AtimeRule`); a standing stamp takes no second one
-        /// (a hot file: one park per drain tick). The ring binds regular
+        /// (a hot file: one park per drain tick), a busy stripe parks
+        /// nothing (never a spin on those threads). The ring binds regular
         /// files alone, so nodiratime never applies here.
         pub fn note_read(self: *Self, _: *Ctx, a: filesystem.NoteReadArgs) void {
             const law = self.atime_law.current();

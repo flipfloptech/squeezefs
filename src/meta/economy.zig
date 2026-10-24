@@ -1058,13 +1058,15 @@ pub const PendingTimes = struct {
     }
 
     /// A READ's access stamp from a path that holds no record (the
-    /// interception host's ring fast path): parked under `rule` ONLY when
-    /// the ino parks no stamp yet — a hot file costs one park per drain
-    /// tick, the rest of its reads one lock and one lookup. Null = a stamp
-    /// stands; nothing was done.
+    /// transport worker's served probe and direct leg, the interception
+    /// host's ring fast path): parked under `rule` ONLY when the ino parks
+    /// no stamp yet — a hot file costs one park per drain tick, the rest
+    /// of its reads one lock and one lookup. TRY-ONLY: a contended stripe
+    /// parks nothing (those threads never spin; the next read tries
+    /// again). Null = a stamp stands or the stripe was busy; nothing done.
     pub fn parkAtimeIfAbsent(self: *PendingTimes, ino: u64, now: u64, rule: AtimeRule) Allocator.Error!?Park {
         const s = self.stripeOf(ino);
-        s.lock.lock();
+        if (!s.lock.tryLock()) return null;
         defer s.lock.unlock();
         const gop = try s.map.getOrPut(self.gpa, ino);
         if (gop.found_existing) {

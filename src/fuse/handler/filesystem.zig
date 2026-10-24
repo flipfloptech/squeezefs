@@ -61,10 +61,11 @@ pub const Ctx = struct {
     /// The op's state across the move gate's re-issues (null outside a
     /// gate: a tool, a test calling the filesystem directly).
     move: ?*MoveAttempt = null,
-    /// The request is this mount's kernel's (the lifecycle's dispatch):
-    /// its caches follow the reply, so its own change is never
-    /// invalidated back into it (decision 0003 §AB.2). A tool, a served
-    /// verb, a test calling the filesystem directly: false.
+    /// The request is this mount's kernel's (the lifecycle's dispatch) —
+    /// or the times drain cadence's, whose stamps that kernel already
+    /// holds through the fold: its caches follow the reply, so its own
+    /// change is never invalidated back into it (decision 0003 §AB.2). A
+    /// tool, a served verb, a test calling the filesystem directly: false.
     kernel: bool = false,
 
     /// Stamp a stage: the trace moves (a clock read only under profiling)

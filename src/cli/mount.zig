@@ -1528,7 +1528,14 @@ fn TimesDrainCadenceOf(comptime Fs: type) type {
             if (self.fs.store.isFailed()) return self.failedTick();
             var trace = op_trace.OpTrace.begin(0, .other);
             defer trace.finish();
-            var ctx: filesystem.Ctx = .{ .unique = 0, .uid = 0, .gid = 0, .pid = 0, .io = self.io, .trace = &trace, .wd_slot = null, .window = &.{} };
+            // `kernel`: the stamps are the ones this mount's kernel already
+            // holds through the fold (nothing to invalidate back into it),
+            // so the drain is acked at its apply like the syncfs drain of
+            // the same stamps — a commit acked at the landing held its
+            // batch's exclusive inode guards across the device, and every
+            // op on those inodes waited for it (for good under a held
+            // landing: THE REPLAY PROOF's 115 s create).
+            var ctx: filesystem.Ctx = .{ .unique = 0, .uid = 0, .gid = 0, .pid = 0, .io = self.io, .trace = &trace, .wd_slot = null, .window = &.{}, .kernel = true };
             _ = self.fs.drainPendingTimes(&ctx) catch |e| {
                 // The latch can trip under the drain (the lane's thread).
                 if (self.fs.store.isFailed()) return self.failedTick();

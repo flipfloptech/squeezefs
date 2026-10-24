@@ -16426,6 +16426,105 @@ test "smoke: A WRITER ON ONE MOUNT DOES NOT COLD THE OTHERS' READ CACHES — mou
     try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
 }
 
+/// The access-stamp row's rounds: each moves atime on both mounts (B's
+/// stamps shipped to A, A's own journaled) under strictatime.
+const access_stamp_rounds: u32 = 10;
+
+test "smoke: AN ACCESS STAMP RECALLS NO READER — mount A (the manager) + B JOINED, both under strictatime (every read stamps) → A fills `d` → B lists `d` and reads its files (B holds the tokens) → 10 rounds: B lists `d`, stats it, reads f1 and f2, `sync -d d` (its stamps SHIP to A); A reads f3 and lists `d`, `sync -d d` (its own stamps journal) → atime moved on both (B's shipped touches ≥ 10, A's applied ≥ 10, A's own ≥ 10) and NO token recall on either side (`dlm_token_recalls` on A, `dlm_token_recalls_received` on B flat) → B's own atime never steps back: after its read ships, B's `stat` shows the read's stamp → a real change still recalls: A creates `d/new` → B's recalls +1 and B lists `new` (red before: every applied stamp recalled B's token)" {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    try rig.env.put("SQUEEZEFS_MW_BIND", "127.0.0.1:0");
+    try rig.env.put("SQUEEZEFS_ATIME", "strictatime");
+    var t_owner_text: [8]u8 = undefined;
+    try rig.env.put("SQUEEZEFS_TEST_MEMBERSHIP_T_OWNER_MS", try std.fmt.bufPrint(&t_owner_text, "{d}", .{smoke_t_owner_ms}));
+    try rig.formatSet(false);
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(0);
+    const b = try Peer.init(rig, "b");
+    defer b.deinit();
+    try b.spawn(&.{});
+    _ = try b.awaitReady();
+    {
+        const out = try rig.onMount("mkdir d && for i in 1 2 3 4; do echo x$i > d/f$i; done && sync -d d && echo filled");
+        defer gpa.free(out);
+        try testing.expectEqualStrings("filled\n", out);
+    }
+    {
+        const out = try b.onMount("ls -la d > /dev/null && cat d/f1 d/f2 d/f3 d/f4 > /dev/null && sync -d d && echo held");
+        defer gpa.free(out);
+        try testing.expectEqualStrings("held\n", out);
+    }
+    const Counts = struct {
+        a_recalls: u64,
+        a_applied: u64,
+        a_own: u64,
+        b_received: u64,
+        b_shipped: u64,
+        fn read(r: *Rig, peer: *Peer) !@This() {
+            const sa = try r.stats();
+            defer r.gpa.free(sa);
+            const sb = try peer.stats();
+            defer r.gpa.free(sb);
+            return .{
+                .a_recalls = numberAfter(sa, "\"dlm_token_recalls\":") orelse 0,
+                .a_applied = numberAfter(sa, "\"record_atime_touches\":") orelse 0,
+                .a_own = numberAfter(sa, "\"fuse_atime_touches\":") orelse 0,
+                .b_received = numberAfter(sb, "\"dlm_token_recalls_received\":") orelse 0,
+                .b_shipped = numberAfter(sb, "\"fuse_atime_touches_shipped\":") orelse 0,
+            };
+        }
+    };
+    const c0 = try Counts.read(rig, b);
+    var round: u32 = 0;
+    while (round < access_stamp_rounds) : (round += 1) {
+        const ob = try b.onMount("ls -la d > /dev/null && stat d > /dev/null && cat d/f1 d/f2 > /dev/null && sync -d d && echo ok");
+        defer gpa.free(ob);
+        try testing.expectEqualStrings("ok\n", ob);
+        const oa = try rig.onMount("cat d/f3 > /dev/null && ls d > /dev/null && sync -d d && echo ok");
+        defer gpa.free(oa);
+        try testing.expectEqualStrings("ok\n", oa);
+    }
+    const c1 = try Counts.read(rig, b);
+    std.debug.print("smoke[access-stamp]: {d} rounds — B shipped {d} touch(es), A applied {d} and stamped {d} of its own; token recalls on A {d} → {d}, received on B {d} → {d}\n", .{ access_stamp_rounds, c1.b_shipped - c0.b_shipped, c1.a_applied - c0.a_applied, c1.a_own - c0.a_own, c0.a_recalls, c1.a_recalls, c0.b_received, c1.b_received });
+    try testing.expect(c1.b_shipped - c0.b_shipped >= access_stamp_rounds);
+    try testing.expect(c1.a_applied - c0.a_applied >= access_stamp_rounds);
+    try testing.expect(c1.a_own - c0.a_own >= access_stamp_rounds);
+    try testing.expectEqual(c0.a_recalls, c1.a_recalls);
+    try testing.expectEqual(c0.b_received, c1.b_received);
+    // B's own stamp outlives its ship: the stat after `sync -d d` shows the
+    // read's atime, never the pre-read one the token still carries. (The
+    // daemon stamps off the coarse realtime clock: the pause lets it pass
+    // the previous stamp's tick.)
+    {
+        const out = try b.onMount("a0=$(stat -c %.9X d/f1) && sleep 0.05 && cat d/f1 > /dev/null && sync -d d && a1=$(stat -c %.9X d/f1) && awk -v a0=\"$a0\" -v a1=\"$a1\" 'BEGIN { if (a1 + 0 > a0 + 0) print \"later\"; else print \"stepped back \" a1 \" <= \" a0 }'");
+        defer gpa.free(out);
+        try testing.expectEqualStrings("later\n", out);
+    }
+    // A real change in the directory still recalls B's token.
+    const c2 = try Counts.read(rig, b);
+    {
+        const out = try rig.onMount("touch d/new && echo made");
+        defer gpa.free(out);
+        try testing.expectEqualStrings("made\n", out);
+    }
+    const c3 = try Counts.read(rig, b);
+    try testing.expect(c3.b_received > c2.b_received);
+    {
+        const out = try b.onMount("ls d | grep -c '^new$'");
+        defer gpa.free(out);
+        try testing.expectEqualStrings("1\n", out);
+    }
+    try b.expectAlive("the access-stamp row");
+    try rig.expectAlive("the access-stamp row");
+    try b.umount();
+    try b.expectCleanExit("B's unmount after the access-stamp row");
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+}
+
 test "smoke: THE FLEET READ SHARD — mount A (the coordinator) + B JOINED with the fleet on: B enrolls at A as a READ worker over its own manager link (job_remote_workers 1 on A) → 1 GiB of fsync'd files, 512 MiB written on each side → `scrub --online <A>` partitions 2 ways: shard 0 on A online, shard 1 LEASED to B, run by B's engine over B's own plane (B's scrub_blocks_scanned grows, job_fleet_worker_shards 1), PROPOSED as read_shard_result and merged on A (dispatched 1 = completed 1, relocal 0; every block scanned, 0 findings) → `scrub --online --throttle 5` again: B's residue stretched by the duty cycle, kill -9 B inside it → A's departure expires the lease (fencing +1), the residue is LOST and the local view re-run (relocal 1), the job completes whole, 0 findings; the engagement counters per side" {
     const io = testing.io;
     if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);

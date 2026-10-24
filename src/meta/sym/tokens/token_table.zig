@@ -286,13 +286,27 @@ pub fn recordObjectIno(tree_id: u8, k: []const u8) ?Object {
 }
 
 /// The UNION of a batch's token objects: every record of every member
-/// that is not `token_quiet`, sorted and deduped at `finish`.
+/// that is not `token_quiet`, sorted and deduped at `finish` — but an
+/// ACCESS STAMP (an inode Δ naming the atime alone: a read's touch, shipped
+/// or this mount's own) recalls no reader: it changes no name, no byte and
+/// no other attribute, and the kernel re-asks a read's atime at its attr
+/// TTL anyway (`fuse_invalidate_atime`). A reader's token keeps the
+/// pre-stamp atime until the object's next real change (lazy, as every
+/// cluster filesystem's atime); the toucher keeps its own stamp
+/// (`token_cache.Entry.raiseAtime`).
 pub const ObjectUnion = struct {
     list: std.ArrayList(Object) = .empty,
 
     pub fn addMember(self: *ObjectUnion, gpa: Allocator, q: *const tx.QueuedTx) Allocator.Error!void {
         if (q.token_quiet) return;
-        for (q.recs) |r| if (recordObjectIno(r.tree_id, r.key)) |o| try self.list.append(gpa, o);
+        for (q.recs) |r| {
+            if (isAccessStamp(r)) continue;
+            if (recordObjectIno(r.tree_id, r.key)) |o| try self.list.append(gpa, o);
+        }
+    }
+
+    fn isAccessStamp(r: tx.Rec) bool {
+        return r.tree_id == key.TREE_INODES and r.kind == .delta and record.inodeDeltaMask(r.value) == record.DELTA_ATIME;
     }
 
     /// Sort + dedupe in place; the slice is the union.
@@ -1284,6 +1298,21 @@ test "recordObjectIno: every ino-major kind names the leading ino, refs their ow
     try u.addMember(gpa, &qa);
     try u.addMember(gpa, &qb);
     try testing.expectEqualSlices(Object, &.{ 5, 9 }, u.finish());
+}
+
+test "an access stamp recalls no reader: a Δ naming the atime alone leaves its object out of the union; a Δ that moves the atime beside mtime/ctime, a size Δ and a whole inode put still recall" {
+    const gpa = testing.allocator;
+    var a = tx.KvTx.init(gpa, @src());
+    try a.stageDelta(key.TREE_INODES, &key.inodeKey(3), .{ .mask = record.DELTA_ATIME, .fields = .{ .atime = 7 } });
+    try a.stageDelta(key.TREE_INODES, &key.inodeKey(4), .{ .mask = record.DELTA_ATIME | record.DELTA_TIMES, .fields = .{ .atime = 7, .mtime = 7, .ctime = 7 } });
+    try a.stageDelta(key.TREE_INODES, &key.inodeKey(5), .{ .mask = record.DELTA_SIZE, .fields = .{ .size = 9 } });
+    try a.stagePut(key.TREE_INODES, &key.inodeKey(6), "v");
+    var qa = try tx.buildQueuedTx(&a, 65536, null);
+    defer qa.deinit();
+    var u: ObjectUnion = .{};
+    defer u.deinit(gpa);
+    try u.addMember(gpa, &qa);
+    try testing.expectEqualSlices(Object, &.{ 4, 5, 6 }, u.finish());
 }
 
 test "the carried-xattr law: the allowlist, layout and the symlink target are tokened; the control plane's names are not" {

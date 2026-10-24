@@ -385,6 +385,21 @@ pub const Entry = struct {
     /// this entry (decision 0003 §AG.2): the last serve + the mount's
     /// longest kernel TTL. A token is RELEASED only past it.
     kernel_pin_until_ns: u64 = 0,
+    /// THIS mount's access stamp the holder applied after the grant (an
+    /// access stamp recalls no reader — `token_table.ObjectUnion`): the
+    /// records stay immutable; the toucher's own reads fold it so its
+    /// atime never steps back. Monotone; 0 = none.
+    atime_floor: std.atomic.Value(u64) = .init(0),
+
+    /// The holder applied this mount's access stamp `stamp`.
+    pub fn raiseAtime(self: *Entry, stamp: u64) void {
+        _ = self.atime_floor.fetchMax(stamp, .monotonic);
+    }
+
+    /// The record's atime under this mount's own applied stamps.
+    pub fn atime(self: *const Entry) u64 {
+        return @max(self.attrs.atime, self.atime_floor.load(.monotonic));
+    }
 
     pub fn xattr(self: *const Entry, name: []const u8) ?[]const u8 {
         for (self.xattrs) |x| if (std.mem.eql(u8, x.name, name)) return x.value;

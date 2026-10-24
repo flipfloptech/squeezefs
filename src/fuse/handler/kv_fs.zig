@@ -1168,6 +1168,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 defer served.release(self.io);
                 const e = served.entry orelse return null;
                 var v = e.attrs;
+                v.atime = e.atime();
                 self.pending.fold(ino, &v);
                 return v;
             }
@@ -4511,17 +4512,25 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         /// of a foreign-slot file parked its access stamp here; the record
         /// is the holder's, so the stamp travels as ONE shipped setattr
         /// carrying `SETATTR_ATIME_TOUCH` — the holder journals a Δatime
-        /// iff it advances and moves no ctime — batched by the cadence (one
-        /// ship per ino per tick at most, whatever the posture). Whatever
-        /// the holder answers, the stamp leaves the map: an access stamp is
-        /// lazy by law and never a failed read (a refusal is counted; the
-        /// next read under the rule stamps again). A stamp parked anew
-        /// while the ship was out stays for the next tick.
+        /// iff it advances and moves no ctime, and recalls NO reader (an
+        /// access stamp is no change a token answers for), so the applied
+        /// stamp is raised on this mount's cached entry: its atime never
+        /// steps back when the stamp leaves the map — batched by the
+        /// cadence (one ship per ino per tick at most, whatever the
+        /// posture). Whatever the holder answers, the stamp leaves the
+        /// map: an access stamp is lazy by law and never a failed read (a
+        /// refusal is counted; the next read under the rule stamps again).
+        /// A stamp parked anew while the ship was out stays for the next
+        /// tick.
         fn shipAtimeTouch(self: *Self, local: u64) void {
             const parked = self.pending.parked(local) orelse return;
             if (parked.atime != 0 and self.foreignAtimeDue(local, parked)) {
                 if (self.shipRecord(globalOf(local), .{ .setattr = .{ .atime = parked.atime, .atime_touch = true } })) |_| {
                     fuse_atime_touches_shipped.inc();
+                    if (self.tokenServe(local, .{}) catch null) |served| {
+                        defer served.release(self.io);
+                        if (served.entry) |e| e.raiseAtime(parked.atime);
+                    }
                 } else |_| fuse_atime_touches_dropped.inc();
             }
             _ = self.pending.retireIfStill(local, parked);
@@ -4537,7 +4546,9 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             const served = (self.tokenServe(local, .{}) catch return false) orelse return false;
             defer served.release(self.io);
             const e = served.entry orelse return false;
-            return parked.atimeApplies(e.attrs);
+            var v = e.attrs;
+            v.atime = e.atime();
+            return parked.atimeApplies(v);
         }
 
         /// The resident payload to its own block, the striped layout

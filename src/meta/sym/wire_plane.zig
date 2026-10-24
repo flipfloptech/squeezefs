@@ -2259,6 +2259,41 @@ test "linux: the daemon's wire plane over a real symmetric set — the listener 
     }
 }
 
+test "linux: THE JOIN AFTER A MANAGER REMOUNT — incarnation 1 arms its listener and unmounts; incarnation 2 arms at a fresh ephemeral port with the checkpoint cadence held past the row (no cycle lands on its own): the newest checkpoint ALREADY names incarnation 2's listener when its plane is up, so a joiner reading `endpoint:{0}` off the projection (no `--join`) dials it and joins as appender 1 (red: the projection named incarnation 1's dead port — the dial refused, the open failed `Io`)" {
+    const gpa = testing.allocator;
+    const s = try meta_set.TestSet.create(gpa, "join-remount", 1);
+    defer s.destroy();
+    try s.env.put("SQUEEZEFS_MW_BIND", "127.0.0.1:0");
+    try s.env.put("SQUEEZEFS_CHECKPOINT_MAX_AGE_MS", "600000");
+    var first: endpoint.EndpointWire = undefined;
+    {
+        const set = try s.open();
+        defer set.close();
+        var locks = try dlm.Manager.init(gpa, 64);
+        defer locks.deinit();
+        const bound = try xv.set_bind.Bound.create(gpa, s.io(), set, &locks, &s.env);
+        defer bound.destroy(gpa);
+        const plane = (try WirePlane.start(gpa, s.io(), set, &s.env, 4, 1 << 30, &bound.plane, false)).?;
+        first = plane.advertised;
+        plane.stop();
+    }
+    const set = try s.open();
+    defer set.close();
+    var locks = try dlm.Manager.init(gpa, 64);
+    defer locks.deinit();
+    const bound = try xv.set_bind.Bound.create(gpa, s.io(), set, &locks, &s.env);
+    defer bound.destroy(gpa);
+    const plane = (try WirePlane.start(gpa, s.io(), set, &s.env, 4, 1 << 30, &bound.plane, false)).?;
+    defer plane.stop();
+    try testing.expect(!plane.advertised.eql(first));
+    const b = try meta_set.MetaSet.open(gpa, s.io(), s.pathList(), .{ .env = &s.env, .cache_budget_bytes = 64 << 20, .cpus = 4, .join = .{ .mountpoint = "/build/tmp/mnt-join-remount-b" } });
+    defer b.close();
+    const bj = b.volumes[0];
+    try testing.expectEqual(backend.Posture.joined, bj.posture);
+    try testing.expectEqual(@as(u32, 1), bj.joined.?.appenderId());
+    try testing.expect(bj.joined.?.managerEndpoint().eql(plane.advertised));
+}
+
 test "linux: A JOINER'S CLEAN UNMOUNT AND REJOIN while the manager stays up — B joins over TCP (its rotor slot leased as appender 1) and writes into it, the manager checkpoints (tree 0's projection names B's lease), B unmounts clean (the lease released, the page Free: the live tree 0 Unleased, the projection on the device still Leased{1}), B mounts again under the same identity before the manager's next record: the hint hands it appender 1 again, the projection's row naming appender 1 is a previous incarnation's and loads unleased — the rejoin holds exactly its new grant, its first cycle publishes nothing the manager refuses, it mounts and writes" {
     const gpa = testing.allocator;
     const s = try meta_set.TestSet.create(gpa, "rejoin", 1);

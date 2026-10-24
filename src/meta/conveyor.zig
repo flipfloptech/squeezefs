@@ -471,10 +471,12 @@ pub fn resolveCaps(env: *const std.process.Environ.Map, cpus: u32, geo: jc.CoreG
     };
 }
 
-/// Queue cells: one per ring page (on a padded ring every window occupies
-/// at least a page, so the ring's own admission bounds the population);
-/// floored for tiny rings, capped where a 32 MiB ring's 8192 pages exceed
-/// any admissible committer population. The same law as the lane's inbound.
+/// Queue cells: one per ring page, floored for tiny rings, capped at a
+/// 32 MiB ring's 8192 pages. NOT a bound on committers: a committer
+/// queues BEFORE ring admission, so nothing upstream bounds how many
+/// arrive at once (FUSE requests in flight, IPC sessions, tools). A
+/// committer that finds every cell taken PARKS for room (`enqueueOne`,
+/// 0003 §BO.2) — the queue's size is a batching depth, never an errno.
 pub fn queueCapacity(pages: u64) usize {
     return @intCast(derive.clamp(derive.nextPow2(pages), 64, 8192));
 }
@@ -505,7 +507,10 @@ pub const Error = error{
     PartitionRefused,
     /// The volume is closing: nothing new is admitted.
     VolumeClosed,
-    /// The queue is at capacity (backpressure; retry).
+    /// A bounded resource refused an INTERNAL caller: a window's handoff
+    /// met a full lane (the pass panic), a checkpoint-class admission (a
+    /// deferred root publish), a group wider than the whole queue. Never a
+    /// committer's or an fsync's answer under load — they wait (0003 §BO).
     ConveyorFull,
     OutOfMemory,
     /// The FAILED latch: `JOURNAL_FAILURE_LATCH` consecutive journal
@@ -657,6 +662,10 @@ pub const Stats = struct {
     drained_txs: counters.ShardedCounter = .{},
     acks: counters.ShardedCounter = .{},
     refusals: counters.ShardedCounter = .{},
+    /// `meta_conveyor_room_parks`: committers that found every queue cell
+    /// taken and parked for room (one per committer, however many wakes
+    /// its wait spans) — a burst past `queueCapacity`, never a refusal.
+    commit_room_parks: counters.ShardedCounter = .{},
     /// `meta_kv_journal_full_stalls`: ring-admission parks (one per park
     /// entry); steady growth ⇒ the checkpoint lags.
     full_stalls: counters.ShardedCounter = .{},
@@ -853,8 +862,9 @@ pub const Stats = struct {
             self.holds_pacing.load(),
         });
         try w.print(",\"meta_conveyor_resolve_seeded\":{d},\"meta_conveyor_resolve_descended\":{d},\"meta_conveyor_acks_at_apply\":{d},\"meta_conveyor_acks_at_landing\":{d},\"meta_conveyor_acked_write_failures\":{d},\"meta_conveyor_tail_slot_misses\":{d},\"meta_conveyor_self_handoffs\":{d},\"meta_conveyor_self_applies\":{d},\"meta_conveyor_turn_spin_hits\":{d},\"meta_conveyor_turn_spin_falls\":{d},\"meta_conveyor_heap_admit_fast\":{d},\"meta_conveyor_heap_admit_locked\":{d}", .{ self.resolve_seeded.load(), self.resolve_descended.load(), self.acks_at_apply.load(), self.acks_at_landing.load(), self.acked_write_failures.load(), self.tail_slot_misses.load(), self.self_handoffs.load(), self.self_applies.load(), self.turn_spin_hits.load(), self.turn_spin_falls.load(), self.heap_admit_fast.load(), self.heap_admit_locked.load() });
-        try w.print(",\"meta_conveyor_window_gate_parks\":{d},\"meta_commit_ack_spin_hits\":{d},\"meta_commit_ack_spin_falls\":{d},\"meta_commit_ack_spin_skips\":{d},\"meta_commit_ack_spin_busy\":{d},\"meta_commit_ack_spin_bound_ns\":{d},\"meta_commit_ack_spin_wake_ns\":{d},\"meta_commit_ack_spin_ack_ns\":{d}}}", .{
+        try w.print(",\"meta_conveyor_window_gate_parks\":{d},\"meta_conveyor_room_parks\":{d},\"meta_commit_ack_spin_hits\":{d},\"meta_commit_ack_spin_falls\":{d},\"meta_commit_ack_spin_skips\":{d},\"meta_commit_ack_spin_busy\":{d},\"meta_commit_ack_spin_bound_ns\":{d},\"meta_commit_ack_spin_wake_ns\":{d},\"meta_commit_ack_spin_ack_ns\":{d}}}", .{
             self.window_gate_parks.load(),
+            self.commit_room_parks.load(),
             self.ack_spin_hits.load(),
             self.ack_spin_falls.load(),
             self.ack_spin_skips.load(),
@@ -1520,6 +1530,11 @@ pub const Conveyor = struct {
     /// pass's pacing input; `applied` notifies every leave.
     in_apply: std.atomic.Value(u32) = .init(0),
     applied: sync.Notify = .init,
+    /// Committers parked for queue room (`enqueueParking`) and their wake:
+    /// a drain notifies `room` only while the count is non-zero (one
+    /// relaxed load per drain otherwise).
+    room_waiters: std.atomic.Value(u32) = .init(0),
+    room: sync.Notify = .init,
     stats: Stats = .{},
 
     pub fn init(gpa: Allocator, deps: Deps) Allocator.Error!*Conveyor {
@@ -1581,10 +1596,11 @@ pub const Conveyor = struct {
         self.deps.caps.max_bytes = resolveBatchBytes(knobs.optIntKnob("SQUEEZEFS_META_COMMIT_BATCH_BYTES", u64, env), ringUserCapacity(geo));
     }
 
-    /// Yield until nothing is queued, nobody leads and no window is in
-    /// flight (the close path, the quiesce assertions).
+    /// Yield until nothing is queued, no committer waits for room, nobody
+    /// leads and no window is in flight (the close path, the quiesce
+    /// assertions).
     pub fn quiesce(self: *Conveyor) void {
-        while (self.core.pending() != 0 or self.core.leader.load(.seq_cst) or self.windowsInflight() != 0) std.Thread.yield() catch std.atomic.spinLoopHint();
+        while (self.core.pending() != 0 or self.room_waiters.load(.monotonic) != 0 or self.core.leader.load(.seq_cst) or self.windowsInflight() != 0) std.Thread.yield() catch std.atomic.spinLoopHint();
     }
 
     /// `fsync`: the trailing coalesced barrier.
@@ -1697,10 +1713,10 @@ pub const Conveyor = struct {
             n += 1;
         }
         if (n == 0) return;
-        _ = self.core.enqueueMany(scratch.entries[0..n]) catch {
+        self.enqueueParking(scratch.entries[0..n]) catch |err| {
             for (scratch.entries[0..n], scratch.tx_of[0..n]) |*e, i| {
                 e.item.deinit();
-                results[i] = error.ConveyorFull;
+                results[i] = err;
             }
             return;
         };
@@ -1851,7 +1867,53 @@ pub const Conveyor = struct {
     }
 
     fn enqueueOne(self: *Conveyor, entry: *Queued, len: u64) Error!void {
-        self.core.enqueue(entry.*, len) catch return error.ConveyorFull;
+        return self.enqueueParking(&.{.{ .item = entry.*, .len = len }});
+    }
+
+    /// Enqueue `entries` (all or nothing), PARKING for room while every
+    /// cell is taken — never a refusal (0003 §BO.2: a full queue reached a
+    /// create, an mkdir, an unlink as EAGAIN). The wait ends: a full queue
+    /// holds entries, so a leader owns them (`conveyor_core`'s theorem)
+    /// and its next drain frees room and notifies (`drain`) — the wait is
+    /// the pass's progress, which already bounds every queued committer's
+    /// (the window gate ends at a landing, ring admission escalates to
+    /// FAILED after `park_escalation_ns`). A closing or FAILED volume
+    /// answers its own error. Registration precedes the re-try
+    /// (`sync/notify.zig`'s law). A group wider than the whole queue can
+    /// never fit: refused — no product path commits one.
+    fn enqueueParking(self: *Conveyor, entries: []const Core.Entry) Error!void {
+        if (entries.len > self.slots.len) return error.ConveyorFull;
+        if (self.core.enqueueMany(entries)) |_| return else |_| {}
+        self.stats.commit_room_parks.inc();
+        const io = self.deps.io;
+        // Monotonic: the queue mutex orders it — this RMW precedes the
+        // failed attempts' unlocks, and the drain that frees the room
+        // locks before it reads the count (`drain`).
+        _ = self.room_waiters.fetchAdd(1, .monotonic);
+        defer _ = self.room_waiters.fetchSub(1, .monotonic);
+        while (true) {
+            var n = self.room.notified();
+            _ = n.enable(io);
+            if (self.core.enqueueMany(entries)) |_| {
+                n.cancel(io);
+                return;
+            } else |_| {}
+            if (self.isClosing() or self.deps.latch.isFailed()) {
+                n.cancel(io);
+                return if (self.deps.latch.isFailed()) error.VolumeFailed else error.VolumeClosed;
+            }
+            n.waitUncancelable(io);
+        }
+    }
+
+    /// Drain a batch, then announce the room it freed to the committers
+    /// parked on a full queue (`enqueueParking`).
+    fn drain(self: *Conveyor, caps: Caps, out: []Queued) []Queued {
+        const batch = self.core.drainBatch(caps, out);
+        // Monotonic: paired with `enqueueParking`'s RMW through the queue
+        // mutex (its attempt unlocked before this drain locked).
+        if (batch.len != 0 and self.room_waiters.load(.monotonic) != 0) self.room.notifyWaiters(self.deps.io);
+        return batch;
     }
 
     /// Enqueue + elect — no suspension point between: a committer that
@@ -1970,7 +2032,7 @@ pub const Conveyor = struct {
             // growth swaps them only while no pass is inside.
             if (self.deps.growth_gate) |g| g.enter(g.ctx);
             defer if (self.deps.growth_gate) |g| g.leave(g.ctx);
-            const batch = self.core.drainBatch(self.deps.caps, self.batch_buf);
+            const batch = self.drain(self.deps.caps, self.batch_buf);
             if (batch.len == 0) {
                 if (!self.core.unleadAndRecheck()) return;
                 continue;
@@ -2095,7 +2157,7 @@ pub const Conveyor = struct {
         for (batch) |m| sum += m.q.len;
         const rest: Caps = .{ .max_txs = self.deps.caps.max_txs -| batch.len, .max_bytes = self.deps.caps.max_bytes -| sum };
         if (rest.max_txs == 0 or batch.len >= self.batch_buf.len) return .{ .batch = batch, .held = true };
-        const more = self.core.drainBatch(rest, self.batch_buf[batch.len..]);
+        const more = self.drain(rest, self.batch_buf[batch.len..]);
         return .{ .batch = self.batch_buf[0 .. batch.len + more.len], .held = true };
     }
 
@@ -2116,7 +2178,8 @@ pub const Conveyor = struct {
     /// terminal outcome (the lane answers each, a FAILED volume and a
     /// stopping lane included), so the park always ends — save on a pass
     /// that runs on a committer whose own self-applied member is in flight
-    /// (the `committer` venue with `self` apply: 0003 §BN.6).
+    /// (the `committer` venue with `self` apply, which the startup gate
+    /// refuses: `knobs.exclusions`, 0003 §BO.3).
     fn awaitWindowCell(self: *Conveyor) void {
         const cap = windowCap(self.deps.lane.window_cells);
         if (self.windowsInflight() < cap) return;
@@ -4918,6 +4981,112 @@ test "THE WINDOW GATE: with the lane's window cells all but one held (nothing la
     try testing.expectEqual(panics0, h.cv.stats.pass_panics.load());
     try testing.expectEqual(@as(u64, 0), h.cv.stats.refusals.load());
     try testing.expect(h.cv.stats.windows_inflight_hwm.load() <= windowCap(cells));
+}
+
+// The window gate's report (0003 §BN): `queueCapacity(pages)` said the
+// ring bounds the committer queue, but a committer queues BEFORE ring
+// admission — the 129th simultaneous committer of a floor ring got
+// `ConveyorFull`, EAGAIN to a create, an mkdir, an unlink.
+test "THE COMMITTER BURST: with the pass parked at the window gate (the one window it may fly held un-landed, the next batch drained) and every queue cell taken, 16 committers more are none of them refused — each parks for room (never ConveyorFull, never EAGAIN) and the drain that frees room wakes it; every create acked and present" {
+    const h = try Harness.create(.{ .ring_pages = 120 }, null, false);
+    defer h.destroy();
+    const io = testing.io;
+    const cells = 2;
+    h.lane.window_cells = cells;
+    h.cv.deps.lane.window_cells = cells;
+    h.lane.hold = true;
+    h.threaded_pass = true;
+    const cap = h.cv.slots.len;
+    const extra = 16;
+    const n = 2 + cap + extra;
+    const Committer = struct {
+        h: *Harness,
+        idx: usize,
+        finished: *std.atomic.Value(usize),
+        ino: u64 = 0,
+        result: anyerror!void = {},
+
+        fn run(self: *@This()) void {
+            var nb: [16]u8 = undefined;
+            const name = std.fmt.bufPrint(&nb, "burst{d}", .{self.idx}) catch unreachable;
+            if (self.h.commitCreate(name)) |ino| self.ino = ino else |e| self.result = e;
+            _ = self.finished.fetchAdd(1, .acq_rel);
+        }
+    };
+    var finished: std.atomic.Value(usize) = .init(0);
+    const committers = try testing.allocator.alloc(Committer, n);
+    defer testing.allocator.free(committers);
+    const threads = try testing.allocator.alloc(std.Thread, n);
+    defer testing.allocator.free(threads);
+    const pass_thread = try std.Thread.spawn(.{}, Harness.passThreadMain, .{h});
+    var spawned: usize = 0;
+    // Every exit lands what the lane holds until every committer finished
+    // (a red run leaves windows held), joins them, then the pass thread.
+    defer {
+        while (finished.load(.acquire) < spawned) {
+            if (!h.lane.landDue(0)) std.Thread.yield() catch {};
+        }
+        for (threads[0..spawned]) |t| t.join();
+        while (h.cv.windowsInflight() != 0) _ = h.lane.landDue(0);
+        h.cv.quiesce();
+        h.pass_stop.store(true, .release);
+        h.pass_wake.notifyOne(io);
+        pass_thread.join();
+    }
+    const S = struct {
+        fn spawn(hh: *Harness, cs: []Committer, ts: []std.Thread, at: *usize, upto: usize, fin: *std.atomic.Value(usize)) !void {
+            while (at.* < upto) : (at.* += 1) {
+                cs[at.*] = .{ .h = hh, .idx = at.*, .finished = fin };
+                ts[at.*] = try std.Thread.spawn(.{ .stack_size = 4 << 20 }, Committer.run, .{&cs[at.*]});
+            }
+        }
+    };
+    const Reached = struct {
+        cv: *Conveyor,
+        handoffs: u64,
+        gate_parks: u64,
+        pending: usize,
+        fn ready(s: @This()) bool {
+            return s.cv.stats.lane_handoffs.load() >= s.handoffs and s.cv.stats.window_gate_parks.load() >= s.gate_parks and s.cv.pending() >= s.pending;
+        }
+    };
+    const handoffs0 = h.cv.stats.lane_handoffs.load();
+    // The flight's one window, held; then the pass parked at the gate with
+    // the next batch; then every queue cell.
+    try S.spawn(h, committers, threads, &spawned, 1, &finished);
+    if (!awaitObservable(Reached{ .cv = h.cv, .handoffs = handoffs0 + 1, .gate_parks = 0, .pending = 0 })) return error.FirstWindowNeverHanded;
+    try S.spawn(h, committers, threads, &spawned, 2, &finished);
+    if (!awaitObservable(Reached{ .cv = h.cv, .handoffs = handoffs0 + 1, .gate_parks = 1, .pending = 0 })) return error.PassNeverParkedAtTheGate;
+    try S.spawn(h, committers, threads, &spawned, 2 + cap, &finished);
+    if (!awaitObservable(Reached{ .cv = h.cv, .handoffs = handoffs0 + 1, .gate_parks = 1, .pending = cap })) return error.QueueNeverFilled;
+    // The burst past the queue: each extra either answered (a refusal: no
+    // window can land, so nothing else answers it) or parked for room.
+    const room0 = h.cv.stats.commit_room_parks.load();
+    try S.spawn(h, committers, threads, &spawned, n, &finished);
+    const Burst = struct {
+        cv: *Conveyor,
+        finished: *std.atomic.Value(usize),
+        room0: u64,
+        fn ready(s: @This()) bool {
+            return s.finished.load(.acquire) + (s.cv.stats.commit_room_parks.load() - s.room0) >= extra;
+        }
+    };
+    if (!awaitObservable(Burst{ .cv = h.cv, .finished = &finished, .room0 = room0 })) return error.BurstNeverArrived;
+    try testing.expectEqual(cap, h.cv.pending());
+    // The landings: the gate opens, every drain frees room, every parked
+    // committer enqueues and is acked.
+    while (finished.load(.acquire) < n) {
+        if (!h.lane.landDue(0)) std.Thread.yield() catch {};
+    }
+    var refused: usize = 0;
+    for (committers) |c| c.result catch |e| {
+        if (refused == 0) std.debug.print("\ncommitter burst: committer {d} answered {t}\n", .{ c.idx, e });
+        refused += 1;
+    };
+    try testing.expectEqual(@as(usize, 0), refused);
+    for (committers) |c| try testing.expect(try h.present(c.ino));
+    try testing.expectEqual(room0 + extra, h.cv.stats.commit_room_parks.load());
+    try testing.expectEqual(@as(u64, 0), h.cv.stats.refusals.load());
 }
 
 test "the admission park: a ring too full for the batch parks the pass holding no node lock, kicks the checkpoint with the park mark, and resolves without a timer" {

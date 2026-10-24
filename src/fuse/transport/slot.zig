@@ -47,6 +47,7 @@ const zc = @import("zc.zig");
 const counters = @import("../../core/counters.zig");
 const clock = @import("../../core/clock.zig");
 const log = @import("../../core/log.zig");
+const watchdog = @import("../handler/watchdog.zig");
 
 // ---------------------------------------------------------------------------
 // Constants with their reasons.
@@ -69,6 +70,12 @@ pub const REGISTER_BACKOFF_MAX_NS: u64 = 128 * std.time.ns_per_ms;
 /// substrates; a genuine escape shows as unbounded ages plus a growing
 /// `transport_parked_commits` gap.
 pub const LEASE_OVERLONG_NS: u64 = 1 * std.time.ns_per_s;
+
+/// An overlong episode closes after two op-watchdog ticks with no overlong
+/// release: a writer the parked-buffer gate holds (its leases end one gate
+/// tick apart, generic/299's and 750's filled scratch) stays ONE episode,
+/// one line; every lease is counted all the same.
+pub const LEASE_EPISODE_QUIET_NS: u64 = 2 * watchdog.TICK_NS;
 
 // ---------------------------------------------------------------------------
 // Counters (the stats-inode keys are the field docs).
@@ -105,8 +112,16 @@ pub var dest_dma_leases: counters.ShardedCounter = .{};
 pub var leases_outstanding: counters.Gauge = .{};
 /// `transport_lease_max_age_ms`: the high-water lease age.
 pub var lease_max_age_ms: std.atomic.Value(u64) = .init(0);
-/// `transport_lease_overlong`: leases ≥ 1 s (loud, never fatal).
+/// `transport_lease_overlong`: leases ≥ 1 s (loud once per episode, never
+/// fatal).
 pub var lease_overlong: counters.ShardedCounter = .{};
+/// The last overlong release (0 = none): the episode's clock.
+var lease_overlong_last_ns: std.atomic.Value(u64) = .init(0);
+
+/// Test seam: the next overlong release opens an episode.
+pub fn resetOverlongEpisodeForTest() void {
+    lease_overlong_last_ns.store(0, .release);
+}
 /// `transport_requests_displaced`: a second delivery landed on an owing
 /// slot (`fuse_resend`'s double delivery); counted beside the abandonment
 /// it implies.
@@ -402,14 +417,18 @@ pub const PayloadLease = struct {
 
     /// The drop (any thread): the 1 s rule, the gauges, then the wake law.
     pub fn release(self: PayloadLease) void {
-        const age_ns = clock.monotonicNs() -| self.born_ns;
+        const now = clock.monotonicNs();
+        const age_ns = now -| self.born_ns;
         const age_ms = age_ns / std.time.ns_per_ms;
         _ = lease_max_age_ms.fetchMax(age_ms, .monotonic);
         if (self.held) zc_write_hold_ns.record(age_ns);
         leases_outstanding.sub(1);
         if (age_ns >= LEASE_OVERLONG_NS) {
             lease_overlong.inc();
-            log.err("transport: a FUSE_WRITE payload lease lived {d} ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap", .{age_ms});
+            // Acq_rel: pairs with the previous overlong release's swap (one
+            // line per episode).
+            const last = lease_overlong_last_ns.swap(@max(now, 1), .acq_rel);
+            if (last == 0 or now -| last >= LEASE_EPISODE_QUIET_NS) log.err("transport: a FUSE_WRITE payload lease lived {d} ms (≥ 1 s) — an overlong episode: every one is counted (transport_lease_overlong, {d} so far), this line once until {d} s pass without one; never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap", .{ age_ms, lease_overlong.load(), LEASE_EPISODE_QUIET_NS / std.time.ns_per_s });
         }
         releaseAndWake(self.state, self.waker);
     }
@@ -905,6 +924,7 @@ test "overlong payload leases: every lease held ≥ 1 s counts transport_lease_o
     };
     const waker: Waker = .{ .ctx = null, .wake = Fake.wake };
     const overlong0 = lease_overlong.load();
+    resetOverlongEpisodeForTest();
     log.testing.expectErrorLogs(1);
     for (0..8) |_| {
         var st: LeaseState = .{};

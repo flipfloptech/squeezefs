@@ -240,6 +240,12 @@ strings byte-for-byte so a future interop oracle is cheap; nothing else is owed 
   joiner's claim-set entry on every volume it appends to (`PublishEndpoint`, MGR:297-311) and read by
   `resolve_holder_endpoint(page, claim_set)` (SJ:543-557, 614-624): page identity → member id → that
   member's `endpoint`. Charter §5.5: "endpoints published into each writer's claim-set entry".
+  The MANAGER's own listener is tree 0's `endpoint:{0}`, which a joiner reads off the projection
+  (the newest checkpoint; it never replays ring 0). Two rules follow (Zig, decision 0003 §BM). A
+  manager whose listener moved, as every ephemeral bind does at a remount, cycles one checkpoint
+  after the put, before its plane arms. A joiner treats the projected endpoint as a hint until a dial
+  proves it: a refused dial re-resolves and redials within the endpoint poll's bound. Appender 0's
+  page names WHO manages, never where it listens.
 
 **Port shape.** `wire/listener.zig`: one `std.Thread` `sqz-wire-acc` (12 chars) on `accept(2)` + the
 `sync` stop latch; one `exec.Lane{.class = .wire}` thread `sqz-wire-conn` per admitted connection whose

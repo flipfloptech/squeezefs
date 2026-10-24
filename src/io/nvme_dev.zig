@@ -2363,6 +2363,106 @@ test "fill-issue economy: 64 queued fills behind a stalled lane ride ≤ 4 submi
     try testing.expect(stats.dev_submit_enters.load() - enters_before <= 4);
 }
 
+/// One request of the lane-depth storm: a write, a read or a barrier, all
+/// on lane 0 (one read lane, one write lane).
+const DepthStormOp = struct {
+    dev: *Device,
+    kind: enum { write, read, flush },
+    offset: u64,
+    payload: *const [4096]u8,
+    entered: *std.atomic.Value(u32),
+    done: *std.atomic.Value(u32),
+    err: ?anyerror = null,
+
+    fn run(self: *DepthStormOp) void {
+        _ = self.entered.fetchAdd(1, .acq_rel);
+        defer _ = self.done.fetchAdd(1, .acq_rel);
+        switch (self.kind) {
+            .write => self.dev.writeBlock(self.offset, self.payload) catch |e| {
+                self.err = e;
+            },
+            .read => if (self.dev.readBlock(self.offset, 4096)) |b| b.release() else |e| {
+                self.err = e;
+            },
+            .flush => self.dev.flush() catch |e| {
+                self.err = e;
+            },
+        }
+    }
+};
+
+// 0003 §BO's law for the data plane: a write(2), read(2) or fsync(2) on a
+// regular file never answers EAGAIN, so the device lane under them never
+// refuses a request for want of room — a full lane PARKS the late caller
+// until a cell comes home.
+test "a lane past its depth: more concurrent writes, reads and barriers than the lane has cells, behind a held lane, all complete — none answers QueueFull (EAGAIN to a file's write, read or fsync)" {
+    var tf: TestFile = .{};
+    try tf.create(16 * derive.MiB);
+    defer tf.destroy();
+    const dev = try Device.open(testing.allocator, tf.path);
+    defer dev.deinit();
+    const warm = try dev.readBlock(0, 4096);
+    warm.release();
+    var payload: [4096]u8 align(4096) = undefined;
+    fillPattern(&payload, 17);
+    const depth: usize = nd.uring_req_queue_cap;
+    const extra: usize = 64;
+    // A barrier takes its cell only after its drain (the held writes), so
+    // the barriers ride on top of the writes and reads that fill the lane.
+    const barriers: usize = 16;
+    const gpa = testing.allocator;
+    const ops = try gpa.alloc(DepthStormOp, depth + extra + barriers);
+    defer gpa.free(ops);
+    const threads = try gpa.alloc(std.Thread, ops.len);
+    defer gpa.free(threads);
+    var entered: std.atomic.Value(u32) = .init(0);
+    var done: std.atomic.Value(u32) = .init(0);
+    // The lane holds on the pass that pumps the first request: every later
+    // one queues with its cell taken, so the lane is full at `depth`.
+    const seams = &dev.seams;
+    seams.held.store(0, .release);
+    seams.hold_before_park.store(1, .release);
+    var spawned: usize = 0;
+    defer {
+        seams.hold_before_park.store(0, .release);
+        futex.wakeAll(&seams.hold_before_park);
+        for (threads[0..spawned]) |t| t.join();
+    }
+    for (ops, threads, 0..) |*op, *t, i| {
+        op.* = .{ .dev = dev, .kind = if (i >= depth + extra) .flush else if (i % 2 == 0) .write else .read, .offset = (i % 4096) * 4096, .payload = &payload, .entered = &entered, .done = &done };
+        t.* = try std.Thread.spawn(.{ .stack_size = 1 << 20 }, DepthStormOp.run, .{op});
+        spawned += 1;
+        if (i == 0) while (seams.held.load(.acquire) == 0) futex.wait(&seams.held, 0);
+    }
+    const lane = dev.lanes[0].?;
+    const fill0 = clock.monotonicNs();
+    while (entered.load(.acquire) < ops.len or lane.free_cells.len() != 0) {
+        if (clock.monotonicNs() - fill0 > 120 * std.time.ns_per_s) {
+            std.debug.print("\nthe lane never filled: {d}/{d} entered, {d} cells free\n", .{ entered.load(.acquire), ops.len, lane.free_cells.len() });
+            return error.LaneNeverFilled;
+        }
+        std.Thread.yield() catch {};
+    }
+    // Every cell is taken and every request was issued: the ones past the
+    // depth met the full lane before the hold lifts.
+    const t0 = clock.monotonicNs();
+    while (done.load(.acquire) < extra and clock.monotonicNs() - t0 < 2 * std.time.ns_per_s) std.Thread.yield() catch {};
+    seams.hold_before_park.store(0, .release);
+    futex.wakeAll(&seams.hold_before_park);
+    for (threads[0..spawned]) |t| t.join();
+    spawned = 0;
+    var refused: usize = 0;
+    var failed: usize = 0;
+    for (ops) |op| if (op.err) |e| {
+        if (failed == 0) std.debug.print("\na {t} past a full lane answered {t}\n", .{ op.kind, e });
+        failed += 1;
+        if (e == error.QueueFull) refused += 1;
+    };
+    std.debug.print("\nlane depth storm: {d} requests on a {d}-cell lane: {d} failed ({d} QueueFull)\n", .{ ops.len, depth, failed, refused });
+    try testing.expectEqual(@as(usize, 0), refused);
+    try testing.expectEqual(@as(usize, 0), failed);
+}
+
 test "wake coalescing: N publishes between two lane passes cost ONE eventfd write — elision ≥ N−1" {
     var tf: TestFile = .{};
     try tf.create(1 * derive.MiB);

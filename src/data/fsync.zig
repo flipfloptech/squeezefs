@@ -52,6 +52,7 @@ const accumulate = @import("accumulate.zig");
 const epoch_mod = @import("write_epoch.zig");
 const writeback = @import("writeback.zig");
 const pipeline = @import("write_pipeline.zig");
+const router = @import("router.zig");
 
 // ---------------------------------------------------------------------------
 // §10.1 The exact-sum phase family.
@@ -495,7 +496,7 @@ pub fn fsync(ctx: Ctx, io: Io, ino: u64, prof: *Prof) Error!void {
     // more; a second wall is the honest ENOSPC.
     const left = ctx.overlay.drainForIno(io, ctx.locks, ino, std.math.maxInt(u64), true, ctx.close_seams);
     if (left != 0) device_overlay.stats.overlay_unpublished_at_fsync.fire("overlay records left open after the fsync drain");
-    try flushParked(ctx, io, ino, false);
+    try flushParked(ctx, io, ino, null);
     if (ctx.worker) |w| if (ctx.wb_deps) |d| {
         _ = w.drainOnce(io, d);
     };
@@ -641,11 +642,22 @@ pub fn dedupeSorted(xs: []u64) []u64 {
     return xs[0..n];
 }
 
+/// The parked leg's wall, in the device's own class: ENOSPC iff a landing
+/// since the leg began met a space refusal — the store's (`StorageFull`)
+/// or the device's own ENOSPC (a thin pool) — else EIO (a device failing
+/// its DMAs is never "the disk is full").
+fn parkedWall(ctx: Ctx, since_ns: u64) Error {
+    var cands: [router.MAX_VOLUMES]*block_alloc.BlockAllocator = undefined;
+    if (enospc.spaceRefusedSince(ctx.vols.candidates(&cands), since_ns) or ctx.table.deviceSpaceRefusedSince(since_ns)) return error.NoSpaceLeft;
+    return error.InputOutput;
+}
+
 /// `flushParked`'s ladder over census keys: each key one durable upload; a
-/// key left parked (the pool's ENOSPC) gets the ladder once — flush the
-/// data devices, close every epoch for its supply — then one retry; a
-/// second wall is the honest ENOSPC.
+/// key left parked gets the ladder once — flush the data devices, close
+/// every epoch for its supply — then one retry; a second wall is answered
+/// in its class (`parkedWall`).
 fn flushParkedKeys(ctx: Ctx, io: Io, keys: []const accumulate.Key) Error!void {
+    const since_ns = clock.monotonicNs();
     var parked_after: usize = 0;
     for (keys) |k| {
         switch (accumulate.flushParkedBlock(ctx.table, ctx.upload, io, k.ino, k.block)) {
@@ -667,7 +679,7 @@ fn flushParkedKeys(ctx: Ctx, io: Io, keys: []const accumulate.Key) Error!void {
             .published => stats.syncfs_parked_blocks.inc(),
             .discarded, .joined => {},
             .fence_drop => return error.WriterGuardFenced,
-            .stay_parked => return error.NoSpaceLeft,
+            .stay_parked => return parkedWall(ctx, since_ns),
         }
     }
 }
@@ -675,11 +687,12 @@ fn flushParkedKeys(ctx: Ctx, io: Io, keys: []const accumulate.Key) Error!void {
 /// Every block the ino parked before this fsync began (`flushBornBy`: all
 /// of them, not one buffer's worth — the ordered law journals the claim
 /// the fsync found on the strength of this leg).
-fn flushParked(ctx: Ctx, io: Io, ino: u64, retried: bool) Error!void {
-    const left = accumulate.flushBornBy(ctx.table, ctx.upload, io, ino, clock.monotonicNs());
+fn flushParked(ctx: Ctx, io: Io, ino: u64, since_ns: ?u64) Error!void {
+    const now = clock.monotonicNs();
+    const left = accumulate.flushBornBy(ctx.table, ctx.upload, io, ino, now);
     if (left.fenced) return error.WriterGuardFenced;
     if (left.stay_parked == 0) return;
-    if (retried) return error.NoSpaceLeft;
+    if (since_ns) |since| return parkedWall(ctx, since);
     // The ENOSPC ladder: a data barrier releases nothing by itself but
     // orders the parked supply's close; the parking close of THIS ino's
     // epoch frees its displaced keys; then ONE retry.
@@ -690,7 +703,7 @@ fn flushParked(ctx: Ctx, io: Io, ino: u64, retried: bool) Error!void {
     }
     _ = ctx.epochs.close(io, ino, ctx.close_seams);
     _ = ctx.epochs.closeAllForSpace(io, ctx.close_seams);
-    return flushParked(ctx, io, ino, true);
+    return flushParked(ctx, io, ino, now);
 }
 
 const LegResult = struct { err: ?Error = null };

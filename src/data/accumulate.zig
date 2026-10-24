@@ -636,8 +636,12 @@ pub const Table = struct {
         return self.pool.liveBytes();
     }
 
-    /// An upload's DMA met the device's ENOSPC (`device_space_refused_ns`).
-    pub fn noteDeviceSpaceRefusal(self: *Table) void {
+    /// A landing's DMA outcome: the device's ENOSPC (a thin pool) is
+    /// noted (`device_space_refused_ns`) — the parked set's answers (the
+    /// gate's stall answer, fsync's wall) say ENOSPC for it, EIO otherwise.
+    pub fn noteDmaRefusal(self: *Table, outcome: seams.DmaError!void) void {
+        const refused = if (outcome) |_| return else |e| e;
+        if (refused != error.NoSpaceLeft) return;
         // Monotonic: a census hint read against the reader's own clock, no
         // paired fence (the gate's verdict is its own flush's).
         self.device_space_refused_ns.store(@max(clock.monotonicNs(), 1), .monotonic);
@@ -1489,7 +1493,7 @@ pub fn uploadParkedBlock(table: *Table, deps: UploadDeps, io: Io, ino: u64, bloc
                 fsck_guard.deinit();
                 dest.abandon();
                 stats.write_through_fallbacks.inc();
-                if (e == error.NoSpaceLeft) table.noteDeviceSpaceRefusal();
+                table.noteDmaRefusal(e);
                 fenced = e == error.WriterGuardFenced or e == error.VolumeFailed;
                 return if (fenced) .fence_drop else .stay_parked;
             };
@@ -1865,6 +1869,7 @@ fn foldInPlaceLocked(table: *Table, deps: UploadDeps, e: *Entry) ?Disposition {
         } else |_| break;
     }
     sole_owner_patch.finishInPlace(pdeps, begun, bs, dma, "W2 in-place fold") catch {
+        table.noteDmaRefusal(dma);
         extent.stats.fold_inplace_dma_errors.inc();
         extent.stats.fold_inplace_write_bytes.add(written);
         return .stay_parked;
@@ -1967,6 +1972,7 @@ fn drainInPlaceLocked(table: *Table, deps: UploadDeps, e: *Entry) ?Disposition {
     }
     stats.drain_inplace_write_bytes.add(written);
     sole_owner_patch.finishInPlace(pdeps, begun, table.block_size, dma, "in-place drain") catch {
+        table.noteDmaRefusal(dma);
         stats.drain_inplace_dma_errors.inc();
         return .stay_parked;
     };
@@ -2035,6 +2041,7 @@ fn drainDirtyInPlaceLocked(table: *Table, deps: UploadDeps, e: *Entry) ?Disposit
     }
     stats.drain_inplace_write_bytes.add(written);
     sole_owner_patch.finishInPlace(pdeps, begun, table.block_size, dma, "in-place dirty drain") catch {
+        table.noteDmaRefusal(dma);
         stats.drain_inplace_dma_errors.inc();
         return .stay_parked;
     };

@@ -63,6 +63,7 @@ const cli_supervisor = @import("supervisor.zig");
 const uring_fs = @import("../io/uring_fs.zig");
 const superblock = @import("../meta/superblock.zig");
 const ledger = @import("../meta/ledger.zig");
+const journal_tail = @import("../meta/journal_tail.zig");
 const device_loader = @import("../meta/device_loader.zig");
 const node_seq = @import("../meta/node_seq.zig");
 const proc = @import("../meta/guard/proc.zig");
@@ -9312,6 +9313,64 @@ test "smoke: A FAILED REPLAY'S JOURNAL TAIL IS HELD, NEVER DISCARDED (charter §
             }
         }
     }
+}
+
+/// The volume `img`'s identity as its superblock names it (sector 0).
+fn volumeIdentity(io: Io, img: [:0]const u8) !journal_tail.Identity {
+    const f = try Io.Dir.cwd().openFile(io, img, .{});
+    defer f.close(io);
+    var sector: [superblock.sector_len]u8 = undefined;
+    const n = try f.readPositionalAll(io, &sector, 0);
+    try testing.expectEqual(sector.len, n);
+    return switch (try superblock.classifySector0(&sector, null)) {
+        .v5 => |sb| .{ .volume_uuid = sb.uuid, .set_uuid = sb.set_uuid },
+        .blank, .legacy => error.NotAVolume,
+    };
+}
+
+/// A held copy of `id`'s journal tail under `dir` (`journal_tail.heldPath`):
+/// the image's header naming the volume, no window written — what the
+/// format's sweep reads before it removes a copy. Returns its path.
+fn plantHeldCopy(io: Io, dir: []const u8, id: journal_tail.Identity, path_buf: *[journal_tail.PATH_CAP]u8) ![:0]const u8 {
+    const facts: journal_tail.Facts = .{ .layout = .{ .base = 1 << 20, .pages = 4 }, .grain = 512, .path = "/dev/sqz-planted", .n_slots = 4, .identity = id, .ring = journal_tail.RING_FIXED };
+    const bytes = try testing.allocator.alignedAlloc(u8, .fromByteUnits(4096), @intCast(journal_tail.imageLen(facts)));
+    defer testing.allocator.free(bytes);
+    @memset(bytes, 0);
+    _ = try journal_tail.Image.format(bytes, facts);
+    try Io.Dir.cwd().createDirPath(io, dir);
+    const path = journal_tail.heldPath(path_buf, dir, id.volume_uuid) orelse return error.PathTooLong;
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = bytes });
+    return path;
+}
+
+test "smoke: FORMAT REMOVES THE HELD JOURNAL TAIL OF THE VOLUME IT OVERWRITES (decision 0003 §BR.10 (b)) — a formatted set; a held copy of its metadata volume's tail planted in the held dir (named by the volume's uuid, its header naming the volume and its set) beside another volume's copy; `squeezefs format --force` over the set ⇒ the overwritten volume's copy is gone and the format says so, the other volume's copy stays, the new volume names a new uuid (red before: the copy stayed — its uuid never recurs, so it leaked in /run until the host rebooted)" {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    try rig.formatSet(false);
+    var dir_buf: [linux.PATH_MAX]u8 = undefined;
+    const held_dir = try std.fmt.bufPrint(&dir_buf, "{s}/held-tails", .{rig.work});
+    try rig.env.put("SQUEEZEFS_TEST_JOURNAL_TAIL_DIR", held_dir);
+    const old = try volumeIdentity(io, rig.img);
+    var own_buf: [journal_tail.PATH_CAP]u8 = undefined;
+    const own = try plantHeldCopy(io, held_dir, old, &own_buf);
+    var other_buf: [journal_tail.PATH_CAP]u8 = undefined;
+    const other = try plantHeldCopy(io, held_dir, .{ .volume_uuid = "another-volume!!".*, .set_uuid = old.set_uuid }, &other_buf);
+    const r = try rig.squeezefs(&.{ "format", "--force", rig.meta_uri, rig.data_uri });
+    defer rig.freeRun(r);
+    if (!r.term.success()) std.debug.print("\nformat --force: {s}\n", .{r.stderr});
+    try testing.expect(r.term.success());
+    const fresh = try volumeIdentity(io, rig.img);
+    try testing.expect(!std.mem.eql(u8, &fresh.volume_uuid, &old.volume_uuid));
+    const own_left = if (Io.Dir.cwd().access(io, own, .{})) true else |_| false;
+    const other_left = if (Io.Dir.cwd().access(io, other, .{})) true else |_| false;
+    const said = std.mem.indexOf(u8, r.stderr, "removed the held journal tail") != null;
+    std.debug.print("\nsmoke[format sweep]: the overwritten volume's held copy {s}, another volume's {s}; the format said so: {}\n", .{ if (own_left) "LEFT" else "removed", if (other_left) "kept" else "REMOVED", said });
+    try testing.expect(!own_left);
+    try testing.expect(other_left);
+    try testing.expect(said);
 }
 
 /// The custody row's residents: `custody_files` × 256 KiB, staged whole.

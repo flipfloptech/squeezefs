@@ -1045,6 +1045,42 @@ pub const linux_tail = if (builtin.os.tag == .linux) struct {
         return judgedReplay(gpa, m.image, dev_fd, null);
     }
 
+    pub const Removed = union(enum) {
+        /// No held copy of that volume.
+        none,
+        /// The copy named the volume: removed (the windows it held).
+        removed: Held,
+        /// Named for the volume, the copy names another identity: left.
+        foreign: Identity,
+        /// Unreadable, or the unlink refused: left.
+        failed: anyerror,
+    };
+
+    /// `squeezefs format`'s sweep (decision 0003 §BR.10 (b)): the held copy
+    /// of the volume `identity` names — the volume the format overwrites —
+    /// is removed. A re-format mints a new volume uuid, so no writer would
+    /// ever consume that copy again: it would sit in `/run` until the host
+    /// rebooted, and its windows describe a ring the format destroyed.
+    pub fn removeHeld(dir: []const u8, identity: Identity) Removed {
+        var pbuf: [PATH_CAP]u8 = undefined;
+        const file = heldPath(&pbuf, dir, identity.volume_uuid) orelse return .{ .failed = error.PathTooLong };
+        const rc = linux.open(file, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+        switch (linux.errno(rc)) {
+            .SUCCESS => {},
+            .NOENT => return .none,
+            else => return .{ .failed = error.StatFailed },
+        }
+        const fd: linux.fd_t = @intCast(rc);
+        defer _ = linux.close(fd);
+        var m = Mapped.map(fd) catch |e| return .{ .failed = e };
+        defer m.unmap();
+        const named = m.image.header().identity();
+        if (!named.eql(identity)) return .{ .foreign = named };
+        const held = m.image.held();
+        if (linux.errno(linux.unlink(file)) != .SUCCESS) return .{ .failed = error.UnlinkFailed };
+        return .{ .removed = held };
+    }
+
     pub const Consumed = union(enum) {
         /// No held copy of this volume's tail.
         none,
@@ -1607,6 +1643,34 @@ test "linux: the supervisor's retry of a held copy — `failed` while the device
     try testing.expectEqual(@as(u32, 1), j.replay.windows);
     try rig.readAt(&got, base + 8192);
     try testing.expectEqualSlices(u8, &w, &got);
+}
+
+test "linux: the format's sweep of a held copy — the copy of the volume it overwrites is removed (the windows it held reported); a copy named for that volume whose header names another is left; no copy is `none`" {
+    if (builtin.os.tag != .linux) return testkit.skip(@src(), .no_linux, "the held tail is Linux only");
+    var rig: HeldRig = .{};
+    try rig.init("sweep");
+    defer rig.deinit();
+    var tail = try linux_tail.Tail.create(.{ .layout = HeldRig.ring_layout, .grain = 512, .path = rig.dev_path, .n_slots = 4, .identity = test_identity, .ring = RING_FIXED });
+    defer tail.deinit();
+    const w: [512]u8 = @splat(0x33);
+    _ = tail.claim(10, 4096, &.{.{ .offset = HeldRig.ring_base + 4096, .bytes = &w }}).?;
+    var pbuf: [PATH_CAP]u8 = undefined;
+    _ = try linux_tail.persistHeld(tail.fd, rig.dir, &pbuf);
+    var hb: [PATH_CAP]u8 = undefined;
+    const file = heldPath(&hb, rig.dir, test_identity.volume_uuid).?;
+    // The same volume uuid, another set: not this copy's volume — left.
+    const other: Identity = .{ .volume_uuid = test_identity.volume_uuid, .set_uuid = "another-set-uuid".* };
+    switch (linux_tail.removeHeld(rig.dir, other)) {
+        .foreign => |id| try testing.expect(id.eql(test_identity)),
+        else => return error.TestUnexpectedResult,
+    }
+    try testing.expect(HeldRig.exists(file));
+    switch (linux_tail.removeHeld(rig.dir, test_identity)) {
+        .removed => |h| try testing.expectEqual(@as(u32, 1), h.windows),
+        else => return error.TestUnexpectedResult,
+    }
+    try testing.expect(!HeldRig.exists(file));
+    try testing.expect(linux_tail.removeHeld(rig.dir, test_identity) == .none);
 }
 
 /// Four one-entry windows of `death_entry_len` bytes on `HeldRig`'s ring,

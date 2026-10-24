@@ -49,6 +49,7 @@ const set_config = @import("../data/set_config.zig");
 const wire_auth = @import("../wire/auth.zig");
 const data_superblock = @import("../data/data_superblock.zig");
 const foreign_signature = @import("../meta/foreign_signature.zig");
+const journal_tail = @import("../meta/journal_tail.zig");
 
 comptime {
     if (builtin.os.tag != .linux) @compileError("cli/format is Linux only (charter §1.2); gate the import on builtin.os.tag");
@@ -214,8 +215,11 @@ pub fn run(p: cli.Process, f: args.Format) u8 {
     };
     defer pool.deinit();
 
-    // The metadata preflight, every member.
-    for (meta.paths) |mp| {
+    // The metadata preflight, every member. A member that was a volume
+    // names its identity: the held journal tail of that volume (if any) is
+    // swept once the member is overwritten.
+    var overwritten: [uri.MAX_MEMBERS]?journal_tail.Identity = @splat(null);
+    for (meta.paths, 0..) |mp, mi| {
         if (status.writerGuardHeld(p.io, mp)) {
             p.stderr.print("squeezefs format: cannot format {s}: a live daemon holds its single-writer guard (umount it first; --force does not override a live mount)\n", .{mp}) catch {};
             return cli.exit_failed;
@@ -232,6 +236,7 @@ pub fn run(p: cli.Process, f: args.Format) u8 {
             p.stderr.print("squeezefs format: {s}: {s}\n", .{ mp, gw.buffered() }) catch {};
             return cli.exit_failed;
         }
+        if (prior.sb) |sb| overwritten[mi] = .{ .volume_uuid = sb.uuid, .set_uuid = sb.set_uuid };
     }
 
     // Every data device: read, classified, gated, sized.
@@ -370,6 +375,7 @@ pub fn run(p: cli.Process, f: args.Format) u8 {
             p.stderr.print("squeezefs format: {s}: {s}\n", .{ mp, formatErrorText(e) }) catch {};
             return cli.exit_failed;
         };
+        if (overwritten[i]) |old| sweepHeldTail(p.env, mp, old);
     }
 
     // The summary.
@@ -388,6 +394,22 @@ pub fn run(p: cli.Process, f: args.Format) u8 {
     if (n_data == 0) p.stdout.writeAll("  (no data volumes: the set_config record lists none; `squeezefs volume add-data` adds them at rung 8)\n") catch {};
     p.stdout.flush() catch {};
     return cli.exit_ok;
+}
+
+/// The held journal tail of the volume `mp` was (decision 0003 §BR.10 (b)),
+/// removed once the format overwrote it: the new volume names a new uuid,
+/// so no writer would ever consume that copy — it would stay in the host's
+/// runtime directory until reboot, describing a ring that is gone.
+fn sweepHeldTail(env: *const std.process.Environ.Map, mp: []const u8, old: journal_tail.Identity) void {
+    const dir = journal_tail.HeldDir.fromEnv(env);
+    var pbuf: [journal_tail.PATH_CAP]u8 = undefined;
+    const path = journal_tail.heldPath(&pbuf, dir.slice(), old.volume_uuid) orelse dir.slice();
+    switch (journal_tail.linux_tail.removeHeld(dir.slice(), old)) {
+        .none => {},
+        .removed => |h| log.info("format: {s}: removed the held journal tail of the volume it overwrote ({s}: {d} acked window(s) of a failed replay, that volume's metadata — destroyed with it)", .{ mp, path, h.windows }),
+        .foreign => log.warn("format: {s}: the held journal tail named for the volume it overwrote ({s}) names another volume — left in place", .{ mp, path }),
+        .failed => |e| log.warn("format: {s}: the held journal tail of the volume it overwrote ({s}) could not be removed ({s}) — it stays until the host reboots (its uuid never recurs)", .{ mp, path, @errorName(e) }),
+    }
 }
 
 /// The metadata format this binary writes, named from the superblock's
